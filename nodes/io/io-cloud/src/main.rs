@@ -37,6 +37,7 @@ use std::time::Duration;
 use fluxbee_sdk::protocol::{
     Destination, Message, Meta, Routing, MSG_TTL_EXCEEDED, MSG_UNREACHABLE, SYSTEM_KIND,
 };
+use fluxbee_sdk::cloud::{cloud_action_catalog, is_cloud_local_op};
 use fluxbee_sdk::rpc::AdminCommandRequest;
 use fluxbee_sdk::{
     managed_node_config_path, try_handle_default_node_status, NodeConfig, NodeSender, NodeUuidMode,
@@ -368,10 +369,11 @@ async fn run_loop(
         );
 
         let mut response = match authorize_cloud_message(&msg, &state.own_ich, cloud_edge_node) {
-            // `register_human` is NOT an admin relay: io.cloud mints a temporary human ilk and
-            // Unicasts the Cloud handoff to the configured frontdesk, then relays the verdict. Every
-            // other op is the bounded SY.admin relay set.
-            Ok(()) if op == "register_human" => handle_register_human(sender, state, &msg).await,
+            // io.cloud-LOCAL ops (CLOUD_LOCAL_OPS: register_human, list_cloud_actions) are handled
+            // here — io.cloud does the work itself and NEVER touches SY.admin. The local-vs-relay
+            // decision comes from the declared SDK set, not a magic string. Everything else is the
+            // bounded SY.admin relay (dispatch_cloud_op, which also errors on an unknown op).
+            Ok(()) if is_cloud_local_op(&op) => handle_local_cloud_op(sender, state, &msg, &op).await,
             Ok(()) => dispatch_cloud_op(&state.dispatcher, &state.config.admin_target, &msg.payload).await,
             Err(detail) => {
                 tracing::warn!(
@@ -988,6 +990,28 @@ async fn dispatch_cloud_op(
     }
 }
 
+/// Dispatch an io.cloud-LOCAL Cloud op (one of `CLOUD_LOCAL_OPS`) — io.cloud does the work itself;
+/// these NEVER relay to SY.admin. `op` was already confirmed local by `is_cloud_local_op` upstream.
+async fn handle_local_cloud_op(
+    sender: &NodeSender,
+    state: &Arc<RuntimeState>,
+    msg: &Message,
+    op: &str,
+) -> Value {
+    match op {
+        "register_human" => handle_register_human(sender, state, msg).await,
+        // Discovery: return the shared catalog (relay + local, with help) so Cloud knows its surface.
+        "list_cloud_actions" => json!({
+            "status": "ok",
+            "op": "list_cloud_actions",
+            "result": { "actions": cloud_action_catalog() },
+        }),
+        // Unreachable while CLOUD_LOCAL_OPS and this match stay in lock-step; fail-closed if a new
+        // local op is declared without a handler here.
+        other => cloud_error_code("INVALID_REQUEST", &format!("no handler for local op '{other}'")),
+    }
+}
+
 /// The two fields io.cloud must read off the Cloud request to relay a human registration: the
 /// verbatim `frontdesk_handoff` payload it forwards, plus the tenant + email it provisions on.
 #[derive(Debug)]
@@ -1003,7 +1027,7 @@ struct RegisterHumanRequest {
 /// (`type == frontdesk_handoff`) and carries the tenant + email required to provision. On failure it
 /// returns the JSON error to relay straight back to Cloud (the flow dies there).
 fn parse_register_human_request(payload: &Value) -> Result<RegisterHumanRequest, Value> {
-    let Some(handoff) = payload.get("params").filter(|v| v.is_object()).cloned() else {
+    let Some(mut handoff) = payload.get("params").filter(|v| v.is_object()).cloned() else {
         return Err(cloud_error_code(
             "INVALID_REQUEST",
             "register_human requires an object 'params' (the frontdesk_handoff payload)",
@@ -1033,10 +1057,11 @@ fn parse_register_human_request(payload: &Value) -> Result<RegisterHumanRequest,
             "params.operation must be \"complete_registration\"",
         ));
     }
-    // tenant_id: canonical tnt:<uuid>, validated BEFORE any provisioning (like put_token/provision_node)
-    // so a malformed/unknown tenant never mints an orphan ilk.
+    // tenant_id lives in the ROOT of the envelope, like the relay ops (io-cloud-api.md §4) — NOT in
+    // params — and is validated (canonical tnt:<uuid>) BEFORE any provisioning so a bad tenant never
+    // mints an orphan ilk. io.cloud injects it into the handoff below so the frontdesk gets it.
     let tenant_id = require_tenant_id(
-        handoff.get("tenant_id").and_then(Value::as_str),
+        payload.get("tenant_id").and_then(Value::as_str),
         "register_human",
     )?;
     // Email is the human's stable unique key; identity owns idempotency on (cloud, email, tenant).
@@ -1060,6 +1085,12 @@ fn parse_register_human_request(payload: &Value) -> Result<RegisterHumanRequest,
         .map(str::trim)
         .filter(|v| !v.is_empty())
         .map(ToString::to_string);
+    // Inject the root tenant_id into the handoff so the frontdesk (which reads handoff.tenant_id) gets
+    // it: the Cloud envelope carries tenant_id at the root; the frontdesk_handoff contract carries it
+    // inside. This is the same "root tenant → injected downstream" pattern the relay ops use.
+    if let Some(obj) = handoff.as_object_mut() {
+        obj.insert("tenant_id".to_string(), Value::String(tenant_id.clone()));
+    }
     Ok(RegisterHumanRequest {
         handoff,
         tenant_id,
@@ -1356,47 +1387,54 @@ mod tests {
     }
 
     #[test]
-    fn register_human_gate_matches_the_full_frontdesk_contract() {
+    fn register_human_gate_uses_root_tenant_and_injects_it() {
         let tnt = "tnt:11111111-1111-4111-8111-111111111111";
-        let subject = json!({"display_name": "Juan Perez", "email": "juan@acme.com"});
-        // Every field the deterministic frontdesk path needs must be present, or io.cloud rejects up
-        // front (rather than minting an ilk that then strands on the conversational path).
-        let full = |extra: Value| {
-            let mut params = serde_json::Map::new();
-            params.insert("type".into(), json!("frontdesk_handoff"));
-            params.insert("schema_version".into(), json!(1));
-            params.insert("operation".into(), json!("complete_registration"));
-            params.insert("tenant_id".into(), json!(tnt));
-            params.insert("subject".into(), subject.clone());
-            if let Value::Object(o) = extra {
+        // The frontdesk_handoff params (tenant_id is NOT here — it lives at the envelope ROOT).
+        let params = |over: Value| {
+            let mut p = serde_json::Map::new();
+            p.insert("type".into(), json!("frontdesk_handoff"));
+            p.insert("schema_version".into(), json!(1));
+            p.insert("operation".into(), json!("complete_registration"));
+            p.insert(
+                "subject".into(),
+                json!({"display_name": "Juan Perez", "email": "juan@acme.com"}),
+            );
+            if let Value::Object(o) = over {
                 for (k, v) in o {
-                    params.insert(k, v);
+                    p.insert(k, v);
                 }
             }
-            json!({"op": "register_human", "params": Value::Object(params)})
+            Value::Object(p)
+        };
+        let env = |tenant: Value, over: Value| {
+            json!({"op": "register_human", "tenant_id": tenant, "params": params(over)})
         };
 
         // Non-object params.
-        assert!(parse_register_human_request(&json!({"op": "register_human"})).is_err());
-        // Wrong type would fall to the conversational path.
-        assert!(parse_register_human_request(&full(json!({"type": "text"}))).is_err());
-        // Missing / wrong schema_version + operation (no serde defaults at the frontdesk).
-        assert!(parse_register_human_request(&full(json!({"schema_version": 2}))).is_err());
-        assert!(parse_register_human_request(&full(json!({"operation": "other"}))).is_err());
-        // Non-canonical tenant (must be tnt:<uuid>, validated before provisioning).
-        assert!(parse_register_human_request(&full(json!({"tenant_id": "tnt:acme"}))).is_err());
-        // subject.email must be a real address (a bare token could collide with io.cloud's channel).
-        assert!(parse_register_human_request(&full(json!({"subject": {"email": "demo"}}))).is_err());
+        assert!(
+            parse_register_human_request(&json!({"op": "register_human", "tenant_id": tnt})).is_err()
+        );
+        // Wrong type / schema_version / operation → rejected up front (frontdesk has no serde defaults).
+        assert!(parse_register_human_request(&env(json!(tnt), json!({"type": "text"}))).is_err());
+        assert!(parse_register_human_request(&env(json!(tnt), json!({"schema_version": 2}))).is_err());
+        assert!(parse_register_human_request(&env(json!(tnt), json!({"operation": "x"}))).is_err());
+        // tenant_id at the ROOT: missing or non-canonical is rejected before provisioning.
+        assert!(
+            parse_register_human_request(&json!({"op": "register_human", "params": params(json!({}))}))
+                .is_err()
+        );
+        assert!(parse_register_human_request(&env(json!("tnt:acme"), json!({}))).is_err());
+        // subject.email must be a real address.
+        assert!(
+            parse_register_human_request(&env(json!(tnt), json!({"subject": {"email": "demo"}})))
+                .is_err()
+        );
 
-        // Well-formed: extracts what io.cloud provisions on, forwards the handoff verbatim.
+        // Well-formed: tenant from the root, extracted + INJECTED into the forwarded handoff.
         let ok = parse_register_human_request(&json!({
-            "op": "register_human",
-            "request_id": "req-1",
+            "op": "register_human", "request_id": "req-1", "tenant_id": tnt,
             "params": {
-                "type": "frontdesk_handoff",
-                "schema_version": 1,
-                "operation": "complete_registration",
-                "tenant_id": tnt,
+                "type": "frontdesk_handoff", "schema_version": 1, "operation": "complete_registration",
                 "subject": {"display_name": "Juan Perez", "email": "  juan@acme.com  "}
             }
         }))
@@ -1404,6 +1442,8 @@ mod tests {
         assert_eq!(ok.tenant_id, tnt);
         assert_eq!(ok.email, "juan@acme.com"); // trimmed
         assert_eq!(ok.request_id.as_deref(), Some("req-1"));
+        // The root tenant_id is injected into the handoff io.cloud forwards to the frontdesk.
+        assert_eq!(ok.handoff.get("tenant_id").and_then(Value::as_str), Some(tnt));
         assert_eq!(
             ok.handoff.get("operation").and_then(Value::as_str),
             Some("complete_registration")
