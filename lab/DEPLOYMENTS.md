@@ -16,6 +16,7 @@
 
 | Versión | Fecha (ART) | Commit | Alcance | Estado | Rollback |
 |---|---|---|---|---|---|
+| **0.1.21** | 2026-08-20 | `2f60403` | motherbee | ✅ live | snap `pre-register-human-0-1-21` · `apt install fluxbee=0.1.20` |
 | **0.1.20** | 2026-08-20 | `1297ba7` | motherbee | ✅ live | snap `pre-router-0-1-20` · `apt install fluxbee=0.1.19` |
 | ≤ 0.1.19 | (pre-ledger) | — | motherbee | histórico, sin registrar | repo apt conserva 0.1.0 … 0.1.19 |
 
@@ -24,6 +25,35 @@
 > (`dpkg-scanpackages -m`) para rollback, pero su detalle vive en la bitácora, no acá.
 
 ---
+
+## 0.1.21 — io.cloud `register_human`: registro automático de humanos Cloud→frontdesk
+
+- **Fecha:** 2026-08-20 (ART) · **Versión anterior:** 0.1.20 · **Commit:** `2f60403` (branch `daily_onworking_coa`)
+- **Alcance:** **motherbee** (VM100). io.cloud es un runtime managed motherbee-only; los spokes no lo corren.
+- **Qué cambió (impacto operativo):**
+  - Nuevo op inbound `register_human` en io.cloud (NO es relay a SY.admin): Fluxbee Cloud manda la data
+    del humano como `frontdesk_handoff` JSON; io.cloud **provisiona** un ilk temporary humano (mismo
+    `strict_provision_ilk` que io.api) y **Unicastea** el handoff **verbatim** al frontdesk configurado
+    (`government.identity_frontdesk`). El frontdesk (path determinista) registra (temporary→complete) y
+    responde; io.cloud **relaya el veredicto estructurado** a Cloud, estampado con el `ilk_id` que minteó.
+  - **Unicast, no el force rule del router**: un handoff explícito llega al frontdesk con CUALQUIER estado
+    del ilk, así que un re-registro de un humano ya `complete` igual aterriza (`ILK_REGISTER` idempotente).
+    io.cloud no elige target (usa el frontdesk de config); el force 0.1.20 queda como red de contención de
+    emisores implícitos (io.slack/io.wapp).
+  - Gate estricto (type + schema_version + operation + tenant `tnt:<uuid>` canónico + email real) y
+    `response_envelope` (para que el frontdesk emita el veredicto estructurado, no texto plano).
+  - De-diverge: `frontdesk_response_contract` compartido en io_common; io.api de-divergido.
+- **Build:** fb-build (VM110), `build-deb.sh 0.1.21` → 245 MB, 118 entradas.
+- **Publish:** `apt-repo-publish.sh` → repo :8900 (21 versiones indexadas).
+- **Verificación en vivo:** `fluxbee 0.1.21` instalado; runtime **io.cloud movido 0.1.20→0.1.21 + reiniciado
+  + sano** (conectado al router como `IO.cloud@motherbee`, self-ilk, ICH habilitado); rt-gateway ruteando;
+  13 `sy-*` + rt-gateway `active`; **0 nodos `failed`**. Pre-deploy: io workspace verde (rust 1.92) +
+  **doble revisión adversarial** (10 hallazgos 1ra pasada, todos arreglados en la fuente; re-review limpia).
+- **Rollback:** snapshot VM100 `pre-register-human-0-1-21`, o `apt-get install -y fluxbee=0.1.20`.
+- **Pendiente / known:** (a) **test E2E funcional** de `register_human` (que Cloud lo llame de verdad) —
+  el binario corre sano, falta el disparo desde Fluxbee Cloud. (b) 🔖 bug del path conversacional del
+  frontdesk (reporta REGISTERED sin registrar). (c) 🔖 `company_name`/`attributes` que el determinista tira
+  hoy (extensión del schema del ilk humano). (b)+(c) son el próximo paso.
 
 ## 0.1.20 — router: ruteo al frontdesk como política OPA (sin fallback Rust)
 
