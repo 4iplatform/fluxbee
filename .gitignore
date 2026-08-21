@@ -22,3 +22,6 @@ sslcert/
 # Python bytecode cache (lab/pve.py y utilidades)
 __pycache__/
 *.pyc
+
+# Scratchpad de sesión (throwaway: dumps, patches, borradores) — nunca va al repo
+scratchpad/
