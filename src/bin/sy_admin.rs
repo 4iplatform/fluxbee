@@ -5918,6 +5918,17 @@ fn enforce_cloud_relay_content(
             }
             // translate reads owner_node from params OR metadata — check the top-level too.
             owner_node_ok(params.get("owner_node"))?;
+            // Reserved infra namespaces: the Cloud relay stores PROVIDER tokens, never the keys that
+            // protect the mesh itself (endpoint bearers `edge_channel_secret:*`, `edge_tls`, spoke
+            // recovery keys `ssh:*`). Reject so a semi-trusted/compromised relay cannot overwrite an
+            // externalized endpoint's OWN bearer (DoS/takeover) or another infra secret. Single
+            // source: fluxbee_sdk::vault (io.cloud mirrors it for a clean early error).
+            let key = params.get("key").and_then(|v| v.as_str()).unwrap_or_default();
+            if fluxbee_sdk::vault::is_cloud_reserved_vault_key(key) {
+                return Err(format!(
+                    "IO.cloud vault_put may not write the reserved infrastructure key '{key}'"
+                ));
+            }
         }
         _ => {}
     }
@@ -15164,9 +15175,20 @@ mod tests {
             &serde_json::json!({"key":"k","metadata":{"owner_node":"SY.identity@motherbee"}})).is_err());
         assert!(enforce_cloud_relay_content(io, "vault_put", "motherbee",
             &serde_json::json!({"key":"k","owner_node":"AI.x@motherbee"})).is_err());
+        // vault_put: reserved INFRA key namespaces (endpoint bearers, edge TLS, spoke recovery keys)
+        // must be rejected — a Cloud relay stores provider tokens, never the keys that guard the mesh.
+        for reserved in [
+            "edge_channel_secret:ich:14b66389-d425-531c-a140-a591d25e8f39",
+            "edge_tls",
+            "ssh:motherbee",
+        ] {
+            assert!(enforce_cloud_relay_content(io, "vault_put", "motherbee",
+                &serde_json::json!({"key":reserved,"metadata":{"resource_type":"bearer_token"}})).is_err(),
+                "vault_put must reject reserved infra key {reserved} from io.cloud");
+        }
         // Legit: clean metadata + IO.* owner_node + tenant_id (translate sets tenant_id) is fine.
         assert!(enforce_cloud_relay_content(io, "vault_put", "motherbee",
-            &serde_json::json!({"key":"k","metadata":{"resource_type":"openai","tenant_id":"tnt:x","owner_node":"IO.api.x@motherbee"}})).is_ok());
+            &serde_json::json!({"key":"slack:auth:bot","metadata":{"resource_type":"openai","tenant_id":"tnt:x","owner_node":"IO.api.x@motherbee"}})).is_ok());
         // Not enforced for the operator path or other callers.
         assert!(enforce_cloud_relay_content(None, "run_node", "motherbee",
             &serde_json::json!({"node_name":"AI.worker@motherbee"})).is_ok());

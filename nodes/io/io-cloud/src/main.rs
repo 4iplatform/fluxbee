@@ -38,6 +38,7 @@ use fluxbee_sdk::protocol::{
     Destination, Message, Meta, Routing, MSG_TTL_EXCEEDED, MSG_UNREACHABLE, SYSTEM_KIND,
 };
 use fluxbee_sdk::cloud::{cloud_action_catalog, is_cloud_local_op};
+use fluxbee_sdk::vault::is_cloud_reserved_vault_key;
 use fluxbee_sdk::rpc::AdminCommandRequest;
 use fluxbee_sdk::{
     managed_node_config_path, try_handle_default_node_status, NodeConfig, NodeSender, NodeUuidMode,
@@ -845,6 +846,14 @@ fn translate_cloud_op(
         "put_token" => {
             let tenant_id = require_tenant_id(tenant_id, "put_token")?;
             let key = required_string(params, "key")?;
+            // put_token stores PROVIDER tokens; the keys that protect the mesh itself (endpoint
+            // bearers, edge TLS, spoke recovery keys) are reserved for SY.* internals. Reject early
+            // with a clear error — SY.admin re-enforces this server-side (single source in the SDK).
+            if is_cloud_reserved_vault_key(&key) {
+                return Err(cloud_error(
+                    "put_token may not write a reserved infrastructure key (edge_channel_secret:*, edge_tls, ssh:*)",
+                ));
+            }
             let value = params
                 .get("value")
                 .filter(|value| !value.is_null())
@@ -1508,6 +1517,38 @@ mod tests {
         assert_eq!(p["name"], "Acme");
         assert_eq!(p["status"], "active");
         assert_eq!(p["domain"], "acme.example");
+    }
+
+    #[test]
+    fn translate_put_token_rejects_reserved_infra_keys() {
+        // A Cloud relay must not be able to overwrite an endpoint's own bearer via put_token.
+        for reserved in [
+            "edge_channel_secret:ich:14b66389-d425-531c-a140-a591d25e8f39",
+            "edge_tls",
+            "ssh:motherbee",
+        ] {
+            let err = translate_cloud_op(
+                "put_token",
+                Some("tnt:00000000-0000-0000-0000-000000000001"),
+                &json!({"key": reserved, "value": {"secret": "x"}, "resource_type": "bearer_token"}),
+            )
+            .unwrap_err();
+            assert!(
+                err["error_detail"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .contains("reserved infrastructure key"),
+                "expected reserved-key rejection for {reserved:?}, got {err}"
+            );
+        }
+        // A normal provider token still translates fine.
+        let (action, _p) = translate_cloud_op(
+            "put_token",
+            Some("tnt:00000000-0000-0000-0000-000000000001"),
+            &json!({"key": "slack:auth:bot", "value": {"token": "xoxb"}, "resource_type": "slack"}),
+        )
+        .unwrap();
+        assert_eq!(action, "vault_put");
     }
 
     #[test]

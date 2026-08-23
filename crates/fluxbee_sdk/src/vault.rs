@@ -554,6 +554,33 @@ pub fn vault_key_is_valid(key: &str) -> bool {
         .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || matches!(*b, b':' | b'_' | b'-'))
 }
 
+/// Vault key namespaces RESERVED for hive infrastructure — the Fluxbee Cloud provisioning relay
+/// (io.cloud `put_token` -> `vault_put`) must NEVER write one. These keys protect the mesh itself,
+/// so letting a semi-trusted (or compromised) Cloud caller overwrite one is a DoS/takeover surface,
+/// not the "store a provider token" operation put_token is for (io.cloud audit, MEDIUM):
+/// - `edge_channel_secret:<ich>` — the shared-secret bearer guarding each externalized endpoint,
+///   INCLUDING io.cloud's own Cloud endpoint; overwriting it breaks/hijacks the very door the
+///   request came through.
+/// - `edge_tls` — the edge's TLS material.
+/// - `ssh:<hive_id>` — the per-spoke recovery SSH private key stored during add_hive.
+///
+/// This is NOT a general vault ACL: only the Cloud-relay origin is bound (enforced SERVER-SIDE in
+/// SY.admin's `enforce_cloud_relay_content`, mirrored in io.cloud for a clean early error). SY.*
+/// internals still write these keys normally. Lives here because both sides ship in different cargo
+/// workspaces and must agree — same reason as [`vault_key_is_valid`].
+pub const CLOUD_RESERVED_VAULT_KEY_PREFIXES: &[&str] =
+    &["edge_channel_secret:", "edge_tls", "ssh:"];
+
+/// True when `key` falls in a hive-infrastructure namespace the Cloud relay may never write
+/// ([`CLOUD_RESERVED_VAULT_KEY_PREFIXES`]). Prefix match (so `edge_tls` also covers `edge_tls:*`),
+/// case- and whitespace-insensitive so a stray-cased variant cannot slip past the guard.
+pub fn is_cloud_reserved_vault_key(key: &str) -> bool {
+    let key = key.trim().to_ascii_lowercase();
+    CLOUD_RESERVED_VAULT_KEY_PREFIXES
+        .iter()
+        .any(|prefix| key.starts_with(prefix))
+}
+
 /// True when nothing came back, as opposed to the vault answering.
 ///
 /// Only these are worth retrying. Keep this the single definition of that split: SY.edge's TLS
@@ -970,6 +997,36 @@ fn map_rpc_error(err: RpcError) -> VaultError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cloud_reserved_vault_keys_are_blocked_but_provider_tokens_pass() {
+        // The concrete exploit surface: an endpoint's own bearer, edge TLS, and spoke recovery keys.
+        for reserved in [
+            "edge_channel_secret:ich:14b66389-d425-531c-a140-a591d25e8f39",
+            "edge_tls",
+            "edge_tls:motherbee",
+            "ssh:motherbee",
+            "  EDGE_CHANNEL_SECRET:ich:abc  ", // stray case/whitespace must not slip past
+        ] {
+            assert!(
+                is_cloud_reserved_vault_key(reserved),
+                "expected {reserved:?} to be reserved"
+            );
+        }
+        // Legitimate provider tokens the Cloud relay is MEANT to store must still pass.
+        for ok in [
+            "slack:auth:bot",
+            "openai",
+            "bearer_token",
+            "acme:stripe:key",
+            "sshkey_for_tenant", // does not start with the reserved `ssh:` namespace
+        ] {
+            assert!(
+                !is_cloud_reserved_vault_key(ok),
+                "expected {ok:?} to be allowed"
+            );
+        }
+    }
 
     #[test]
     fn resource_type_known_values_round_trip_as_wire_strings() {
