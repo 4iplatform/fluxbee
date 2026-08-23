@@ -16,6 +16,7 @@
 
 | Versión | Fecha (ART) | Commit | Alcance | Estado | Rollback |
 |---|---|---|---|---|---|
+| **0.1.24** | 2026-08-23 | `35349ef` | motherbee | ✅ live | snap `pre-vault-guard-0-1-24` · `apt install fluxbee=0.1.23` |
 | **0.1.23** | 2026-08-21 | `4abad1b` | motherbee | ✅ live | snap `pre-cloud-actions-0-1-23` · `apt install fluxbee=0.1.22` |
 | **0.1.22** | 2026-08-20 | `15fc77f` | motherbee | ✅ live | snap `pre-frontdesk-0-1-22` · `apt install fluxbee=0.1.21` |
 | **0.1.21** | 2026-08-20 | `2f60403` | motherbee | ✅ live | snap `pre-register-human-0-1-21` · `apt install fluxbee=0.1.20` |
@@ -25,6 +26,31 @@
 > Este ledger arranca en **0.1.20** (primera vez que se registra formalmente). Las versiones
 > anteriores (0.1.0–0.1.19) se desplegaron sin ledger; el repo apt en fb-build las conserva
 > (`dpkg-scanpackages -m`) para rollback, pero su detalle vive en la bitácora, no acá.
+
+---
+
+## 0.1.24 — seguridad: reservar los namespaces de infra del vault frente al relay `put_token` de Cloud
+
+- **Fecha:** 2026-08-23 (ART) · **Versión anterior:** 0.1.23 · **Commit:** `35349ef` (branch `daily_onworking_coa`)
+- **Alcance:** **motherbee** (VM100). Toca `fluxbee_sdk::vault` + el nodo core `SY.admin` (systemd) + el nodo runtime `IO.cloud`.
+- **Qué cambió (impacto operativo):** cierra el **MEDIUM** de la auditoría de superficie externa de io.cloud.
+  `put_token`→`vault_put` no tenía guarda de namespace de key: un relay de Cloud semi-confiable (o comprometido)
+  podía **sobrescribir cualquier key** del vault por charset — incluido `edge_channel_secret:<ich>` (el bearer
+  que protege un endpoint externalizado, el suyo propio incluido), `edge_tls`, o `ssh:<hive_id>` (la recovery key
+  del spoke). Eso es una superficie de **DoS/takeover**, no "guardar un token de provider".
+  - Fix single-source + defense-in-depth: `fluxbee_sdk::vault::CLOUD_RESERVED_VAULT_KEY_PREFIXES`
+    (`edge_channel_secret:`, `edge_tls`, `ssh:`) + `is_cloud_reserved_vault_key`. Las keys de peer-auth
+    (mesh-HMAC / WAN-mTLS) viven en el **filesystem**, no en el vault, así que ya estaban fuera de alcance.
+  - Enforce **server-side autoritativo** en `SY.admin::enforce_cloud_relay_content` (sólo origen `IO.cloud@hive`,
+    justo tras `authorize_cloud_relay`, sin bypass) + espejo en `io.cloud::translate_cloud_op` (error temprano
+    limpio). Sólo se ata el origen del relay Cloud; los internos SY.* siguen escribiendo esas keys normal.
+- **Build:** fb-build (VM110), `build-deb.sh 0.1.24` → 245 MB. **Publish:** `apt-repo-publish.sh` → repo :8900.
+- **Verificación en vivo:** `fluxbee 0.1.24` instalado; **io.cloud + sy-admin + sy-identity + sy-vault `active`**,
+  io.cloud `NRestarts=0`, **0 units `failed`**. Pre-deploy: tests en las 3 capas verdes (SDK vault, io.cloud
+  translate, admin enforce) + verificación de wiring (enforce corre siempre tras authorize, sin bypass).
+- **Pendiente (no de este deploy):** el diagnóstico del error de `create_tenant` desde Cloud (se ve **mañana con
+  el dev** — el alta funciona backend-side; el error está en el round-trip de respuesta cross-hive edge↔io.cloud).
+- **Rollback:** snapshot VM100 `pre-vault-guard-0-1-24`, o `apt-get install -y --allow-downgrades fluxbee=0.1.23`.
 
 ---
 
