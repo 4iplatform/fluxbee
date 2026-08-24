@@ -861,6 +861,32 @@ impl AiNode for GenericAiNode {
         if is_control_plane(&msg) {
             return self.handle_control_plane(msg).await;
         }
+        let behavior_ctx = BehaviorContext {
+            thread_id: extract_thread_id(&msg),
+            src_ilk: extract_src_ilk(&msg),
+        };
+        // The human-registration flow has TWO methods, distinguished by the METHOD (not by being a
+        // human): the "auto" method arrives as a structured JSON `frontdesk_handoff` and runs
+        // DETERMINISTICALLY (ILK_REGISTER, no LLM); the conversational method is a human chatting so
+        // the frontdesk's LLM collects the data. The deterministic method must run even when the node
+        // has no behavior configured — a Cloud register_human cannot depend on an LLM being set up —
+        // so it is handled HERE, BEFORE the Configured/behavior gate that guards the LLM path.
+        if msg.meta.msg_type.eq_ignore_ascii_case("user") && self.mode == RunnerMode::Gov {
+            if let Some(handoff) = parse_frontdesk_handoff_payload(&msg.payload) {
+                tracing::info!(
+                    node_name = %self.node_name,
+                    trace_id = %msg.routing.trace_id,
+                    operation = %handoff.operation,
+                    "frontdesk: structured handoff → deterministic path (no LLM required)"
+                );
+                return Ok(Some(
+                    self.handle_frontdesk_handoff(&msg, &behavior_ctx, handoff)
+                        .await?,
+                ));
+            }
+        }
+        // Everything past here is the conversational/LLM method, which DOES require the node
+        // Configured (a behavior/LLM) and a thread_id to track the data-collection dialogue.
         if msg.meta.msg_type.eq_ignore_ascii_case("user") {
             let state = self.control_plane.read().await.current_state;
             if state != NodeLifecycleState::Configured {
@@ -871,53 +897,29 @@ impl AiNode for GenericAiNode {
                 let payload = invalid_payload_missing_thread_id();
                 return Ok(Some(build_reply_message_runtime_src(&msg, payload)));
             }
-        }
-        let behavior_ctx = BehaviorContext {
-            thread_id: extract_thread_id(&msg),
-            src_ilk: extract_src_ilk(&msg),
-        };
-        if msg.meta.msg_type.eq_ignore_ascii_case("user") {
+            // A Gov user message that LOOKS like a handoff (type/subject/operation) but did NOT parse
+            // fell through to the conversational path — surface it loudly, else a Cloud register_human
+            // whose shape is off would be silently chatted at by the LLM instead of registered.
             if self.mode == RunnerMode::Gov {
-                match parse_frontdesk_handoff_payload(&msg.payload) {
-                    Some(handoff) => {
-                        tracing::info!(
-                            node_name = %self.node_name,
-                            trace_id = %msg.routing.trace_id,
-                            operation = %handoff.operation,
-                            "frontdesk: parsed a structured handoff → deterministic path"
-                        );
-                        return Ok(Some(
-                            self.handle_frontdesk_handoff(&msg, &behavior_ctx, handoff)
-                                .await?,
-                        ));
-                    }
-                    None => {
-                        // A Gov user message that is NOT a structured handoff goes to the
-                        // conversational (LLM) path. If it LOOKS like a handoff attempt (has
-                        // type/subject/operation) but did not parse, surface it loudly — a Cloud
-                        // register_human whose shape is off would otherwise be silently chatted at by
-                        // the LLM instead of registered, exactly the failure we are hunting.
-                        let looks_like_handoff = msg
+                let looks_like_handoff = msg
+                    .payload
+                    .as_object()
+                    .map(|o| {
+                        o.contains_key("type")
+                            || o.contains_key("subject")
+                            || o.contains_key("operation")
+                    })
+                    .unwrap_or(false);
+                if looks_like_handoff {
+                    tracing::warn!(
+                        node_name = %self.node_name,
+                        trace_id = %msg.routing.trace_id,
+                        payload_keys = ?msg
                             .payload
                             .as_object()
-                            .map(|o| {
-                                o.contains_key("type")
-                                    || o.contains_key("subject")
-                                    || o.contains_key("operation")
-                            })
-                            .unwrap_or(false);
-                        if looks_like_handoff {
-                            tracing::warn!(
-                                node_name = %self.node_name,
-                                trace_id = %msg.routing.trace_id,
-                                payload_keys = ?msg
-                                    .payload
-                                    .as_object()
-                                    .map(|o| o.keys().cloned().collect::<Vec<_>>()),
-                                "frontdesk: payload looks like a handoff but did NOT parse → conversational path (check the handoff shape)"
-                            );
-                        }
-                    }
+                            .map(|o| o.keys().cloned().collect::<Vec<_>>()),
+                        "frontdesk: payload looks like a handoff but did NOT parse → conversational path (check the handoff shape)"
+                    );
                 }
             }
             let src_ilk_source = src_ilk_source(&msg);
@@ -4486,6 +4488,60 @@ mod tests {
         assert_eq!(
             extract_text(&response.payload).as_deref(),
             Some("Necesito tu email para continuar con el registro.")
+        );
+    }
+
+    #[tokio::test]
+    async fn frontdesk_handoff_runs_deterministically_even_when_unconfigured() {
+        // The deterministic (JSON handoff) method must NOT require the node Configured — a Cloud
+        // register_human cannot depend on the frontdesk having an LLM behavior. test_node() is
+        // UNCONFIGURED by default; the handoff must still reach handle_frontdesk_handoff (here it is
+        // incomplete → needs_input) rather than being rejected with node_not_configured.
+        let node = test_node();
+        // NOTE: intentionally NOT setting Configured.
+        let mut msg = sample_user_request_with_context(
+            json!({
+                "thread_id": "frontdesk-thread-unconfigured-1",
+                "response_envelope": {
+                    "kind": "json_object_v1",
+                    "required": ["success", "human_message"],
+                    "properties": {
+                        "success": { "type": "boolean" },
+                        "human_message": { "type": "string" },
+                        "error_code": { "type": "string" }
+                    }
+                }
+            }),
+            Some("ilk:11111111-1111-4111-8111-111111111111"),
+        );
+        msg.payload = json!({
+            "type": "frontdesk_handoff",
+            "schema_version": 1,
+            "operation": "complete_registration",
+            "subject": { "display_name": "Juan Perez" }
+        });
+
+        let response = node
+            .on_message(msg)
+            .await
+            .expect("handoff should not fail")
+            .expect("response should exist");
+        // Must NOT be the node-not-configured rejection: the deterministic path ran despite no config.
+        assert_ne!(
+            response.payload.get("code").and_then(Value::as_str),
+            Some("node_not_configured"),
+            "unconfigured node must still handle the deterministic handoff, not reject it"
+        );
+        // It reached handle_frontdesk_handoff → structured needs_input (success:false, email missing).
+        assert_eq!(
+            response.payload.get("type").and_then(Value::as_str),
+            Some("text")
+        );
+        let content = extract_text(&response.payload).expect("structured text");
+        let structured: Value = serde_json::from_str(&content).expect("valid structured json");
+        assert_eq!(
+            structured.get("success").and_then(Value::as_bool),
+            Some(false)
         );
     }
 
