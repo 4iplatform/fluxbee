@@ -16,6 +16,7 @@
 
 | Versión | Fecha (ART) | Commit | Alcance | Estado | Rollback |
 |---|---|---|---|---|---|
+| **0.1.25** | 2026-08-24 | `69b1c46` | motherbee | ✅ live | snap `pre-observability-0-1-25` · `apt install fluxbee=0.1.24` |
 | **0.1.24** | 2026-08-23 | `35349ef` | motherbee | ✅ live | snap `pre-vault-guard-0-1-24` · `apt install fluxbee=0.1.23` |
 | **0.1.23** | 2026-08-21 | `4abad1b` | motherbee | ✅ live | snap `pre-cloud-actions-0-1-23` · `apt install fluxbee=0.1.22` |
 | **0.1.22** | 2026-08-20 | `15fc77f` | motherbee | ✅ live | snap `pre-frontdesk-0-1-22` · `apt install fluxbee=0.1.21` |
@@ -26,6 +27,20 @@
 > Este ledger arranca en **0.1.20** (primera vez que se registra formalmente). Las versiones
 > anteriores (0.1.0–0.1.19) se desplegaron sin ledger; el repo apt en fb-build las conserva
 > (`dpkg-scanpackages -m`) para rollback, pero su detalle vive en la bitácora, no acá.
+
+---
+
+## 0.1.25 — observabilidad: outcome de cada op de Cloud + veredicto del frontdesk (fase 1 consolidación tenant/ILK)
+
+- **Fecha:** 2026-08-24 (ART) · **Versión anterior:** 0.1.24 · **Commit:** `69b1c46` (branch `daily_onworking_coa`)
+- **Alcance:** **motherbee** (VM100). Toca el nodo runtime `IO.cloud` + el nodo core `SY.frontdesk.gov` (`ai_node_runner`). **Solo logging, cero cambio de comportamiento.**
+- **Qué cambió (impacto operativo):** hacer visible el round-trip para diagnosticar por qué un `register_human` no completa (hoy el frontdesk procesa+responde pero no logea nada a INFO → el veredicto es invisible).
+  - **io.cloud:** la línea de **egreso/outcome** que faltaba — cada op de Cloud logea `{status, error_code, registration_status, ilk_id, tenant_id, elapsed_ms}` a INFO, con el **mismo `trace_id`** que el ingreso → el round-trip completo edge→io.cloud→admin/identity/frontdesk queda greppable por `trace_id`. (Detalle: dentro de los macros `tracing::*` un `Value` pelado resuelve a `tracing::Value`, así que las lecturas serde usan closures.)
+  - **frontdesk (Gov):** promover a INFO/WARN la **decisión del handoff** en cada salida: parseó-como-handoff vs cayó-a-conversacional (**WARN** cuando un payload con forma de handoff NO parsea — la falla silenciosa que estamos cazando), operación no soportada, incompleto→needs_input (ilk NO registrado), REGISTERED (complete), o register FAILED.
+- **Build:** fb-build (VM110), `build-deb.sh 0.1.25` → 245 MB. **Publish:** `apt-repo-publish.sh` → repo :8900.
+- **Verificación en vivo:** `fluxbee 0.1.25` instalado; **io.cloud + sy-frontdesk-gov + sy-admin + sy-identity `active`**, io.cloud `NRestarts=0`, **0 units `failed`**. Pre-deploy: io-cloud 8/0 + sy-frontdesk-gov 26/0 tests verdes.
+- **Siguiente:** reproducir `register_human` desde la pantalla de Cloud → los nuevos logs muestran EN VIVO por qué no completa (parseo del handoff o campos faltantes) → fix al source. Después, fase 2 = lecturas (SHM E/!E + `get_ilk_details` relay).
+- **Rollback:** snapshot VM100 `pre-observability-0-1-25`, o `apt-get install -y --allow-downgrades fluxbee=0.1.24`.
 
 ---
 
