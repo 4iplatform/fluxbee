@@ -16,6 +16,7 @@
 
 | Versión | Fecha (ART) | Commit | Alcance | Estado | Rollback |
 |---|---|---|---|---|---|
+| **0.1.26** | 2026-08-24 | `cb2d192` | motherbee | ✅ live | snap `pre-frontdesk-handoff-0-1-26` · `apt install fluxbee=0.1.25` |
 | **0.1.25** | 2026-08-24 | `69b1c46` | motherbee | ✅ live | snap `pre-observability-0-1-25` · `apt install fluxbee=0.1.24` |
 | **0.1.24** | 2026-08-23 | `35349ef` | motherbee | ✅ live | snap `pre-vault-guard-0-1-24` · `apt install fluxbee=0.1.23` |
 | **0.1.23** | 2026-08-21 | `4abad1b` | motherbee | ✅ live | snap `pre-cloud-actions-0-1-23` · `apt install fluxbee=0.1.22` |
@@ -27,6 +28,29 @@
 > Este ledger arranca en **0.1.20** (primera vez que se registra formalmente). Las versiones
 > anteriores (0.1.0–0.1.19) se desplegaron sin ledger; el repo apt en fb-build las conserva
 > (`dpkg-scanpackages -m`) para rollback, pero su detalle vive en la bitácora, no acá.
+
+---
+
+## 0.1.26 — frontdesk: el handoff determinista (JSON) corre sin el gate de Configured/LLM (fix register_human)
+
+- **Fecha:** 2026-08-24 (ART) · **Versión anterior:** 0.1.25 · **Commit:** `cb2d192` (branch `daily_onworking_coa`)
+- **Alcance:** **motherbee** (VM100). Toca el nodo core `SY.frontdesk.gov` (`ai_node_runner`).
+- **Root cause (hallado con la observabilidad de 0.1.25):** `register_human` nunca completaba porque el frontdesk
+  **está UNCONFIGURED en todos los boots** (nunca fue seedeado ni recibió CONFIG_SET) y `on_message` rechazaba
+  **TODO** mensaje `user` con `node_not_configured` **antes** de mirar el payload → io.cloud lo veía como
+  `FRONTDESK_REJECTED` → el ilk quedaba `temporary`. (Confirmado por la línea `Cloud op completed error_code=FRONTDESK_REJECTED` + el frontdesk sin logs de handoff.)
+- **Qué cambió:** el alta de humano tiene DOS métodos distinguidos por el **método**, no por ser humano: **auto**
+  (llega un JSON `frontdesk_handoff` → determinista, ILK_REGISTER, sin LLM) y **conversacional** (el humano charla
+  y el LLM junta los datos). El método determinista se maneja **antes** del gate de Configured → `register_human`
+  registra aunque el frontdesk no tenga LLM. El path conversacional/LLM sigue requiriendo Configured.
+  `handle_frontdesk_handoff` es config-independiente. Test nuevo `frontdesk_handoff_runs_deterministically_even_when_unconfigured`.
+- **Build:** fb-build (VM110), `build-deb.sh 0.1.26` → 245 MB. **Publish:** `apt-repo-publish.sh` → repo :8900.
+- **Verificación en vivo:** `fluxbee 0.1.26` instalado; **frontdesk reinició (18:40) + `active`**, io.cloud `active`
+  `NRestarts=0`, **0 units `failed`**. Pre-deploy: sy-frontdesk-gov 27/0 tests verdes. **Pendiente:** E2E del
+  register_human desde la pantalla (debería registrar ahora → ilk `complete`).
+- **Tema 2 (separado):** el secret openai NO se perdió; el frontdesk está UNCONFIGURED sólo porque nunca fue
+  configurado (peer AI.chat tiene config v2). El path conversacional/LLM necesita configurar el frontdesk — aparte.
+- **Rollback:** snapshot VM100 `pre-frontdesk-handoff-0-1-26`, o `apt-get install -y --allow-downgrades fluxbee=0.1.25`.
 
 ---
 
