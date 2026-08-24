@@ -361,6 +361,7 @@ async fn run_loop(
             .and_then(|v| v.as_str())
             .unwrap_or("")
             .to_string();
+        let started = std::time::Instant::now();
         tracing::info!(
             trace_id = %msg.routing.trace_id,
             ich = %ich,
@@ -405,6 +406,26 @@ async fn run_loop(
             obj.insert("handled_by".to_string(), json!(full_name));
             obj.insert("ich".to_string(), json!(ich));
         }
+
+        // Egress/outcome line — the half the ingress log was missing. Every Cloud op now logs its
+        // result (status, error, the id it touched, elapsed) at INFO, keyed by the SAME trace_id, so
+        // the whole round-trip is greppable end-to-end (family tracing convention, cf. SY.identity).
+        // NOTE: inside `tracing::*!`, a bare `Value` resolves to `tracing::Value` (a trait), so use
+        // closures rather than `Value::as_str` for the serde_json reads here.
+        tracing::info!(
+            trace_id = %msg.routing.trace_id,
+            op = %op,
+            status = response.get("status").and_then(|v| v.as_str()).unwrap_or("unknown"),
+            error_code = ?response.get("error_code").and_then(|v| v.as_str()),
+            registration_status = ?response.get("registration_status").and_then(|v| v.as_str()),
+            ilk_id = ?response.get("ilk_id").and_then(|v| v.as_str()),
+            tenant_id = ?response
+                .get("result")
+                .and_then(|r| r.get("tenant_id"))
+                .and_then(|v| v.as_str()),
+            elapsed_ms = %started.elapsed().as_millis(),
+            "IO.cloud Cloud op completed"
+        );
 
         let reply = Message {
             routing: Routing {

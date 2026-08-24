@@ -878,11 +878,46 @@ impl AiNode for GenericAiNode {
         };
         if msg.meta.msg_type.eq_ignore_ascii_case("user") {
             if self.mode == RunnerMode::Gov {
-                if let Some(handoff) = parse_frontdesk_handoff_payload(&msg.payload) {
-                    return Ok(Some(
-                        self.handle_frontdesk_handoff(&msg, &behavior_ctx, handoff)
-                            .await?,
-                    ));
+                match parse_frontdesk_handoff_payload(&msg.payload) {
+                    Some(handoff) => {
+                        tracing::info!(
+                            node_name = %self.node_name,
+                            trace_id = %msg.routing.trace_id,
+                            operation = %handoff.operation,
+                            "frontdesk: parsed a structured handoff → deterministic path"
+                        );
+                        return Ok(Some(
+                            self.handle_frontdesk_handoff(&msg, &behavior_ctx, handoff)
+                                .await?,
+                        ));
+                    }
+                    None => {
+                        // A Gov user message that is NOT a structured handoff goes to the
+                        // conversational (LLM) path. If it LOOKS like a handoff attempt (has
+                        // type/subject/operation) but did not parse, surface it loudly — a Cloud
+                        // register_human whose shape is off would otherwise be silently chatted at by
+                        // the LLM instead of registered, exactly the failure we are hunting.
+                        let looks_like_handoff = msg
+                            .payload
+                            .as_object()
+                            .map(|o| {
+                                o.contains_key("type")
+                                    || o.contains_key("subject")
+                                    || o.contains_key("operation")
+                            })
+                            .unwrap_or(false);
+                        if looks_like_handoff {
+                            tracing::warn!(
+                                node_name = %self.node_name,
+                                trace_id = %msg.routing.trace_id,
+                                payload_keys = ?msg
+                                    .payload
+                                    .as_object()
+                                    .map(|o| o.keys().cloned().collect::<Vec<_>>()),
+                                "frontdesk: payload looks like a handoff but did NOT parse → conversational path (check the handoff shape)"
+                            );
+                        }
+                    }
                 }
             }
             let src_ilk_source = src_ilk_source(&msg);
@@ -1406,6 +1441,12 @@ impl GenericAiNode {
                 "Unsupported frontdesk handoff operation: {}",
                 handoff.operation
             ));
+            tracing::warn!(
+                node_name = %self.node_name,
+                trace_id = %msg.routing.trace_id,
+                operation = %handoff.operation,
+                "frontdesk handoff: unsupported operation (not registered)"
+            );
             return build_frontdesk_result_reply(msg, result);
         }
 
@@ -1480,6 +1521,15 @@ impl GenericAiNode {
 
         let missing_fields = frontdesk_missing_fields(name.as_deref(), email.as_deref());
         if !missing_fields.is_empty() {
+            tracing::info!(
+                node_name = %self.node_name,
+                trace_id = %msg.routing.trace_id,
+                tenant_id = ?tenant_id,
+                missing = ?missing_fields,
+                has_name = name.is_some(),
+                has_email = email.is_some(),
+                "frontdesk handoff incomplete → needs_input (ilk NOT registered)"
+            );
             let state = FrontdeskThreadState {
                 status: Some("collecting".to_string()),
                 collected: FrontdeskCollectedState {
@@ -1539,8 +1589,24 @@ impl GenericAiNode {
         let result =
             build_frontdesk_result_from_register_response(&register_payload, ctx.src_ilk.clone());
         if result.status == "ok" {
+            tracing::info!(
+                node_name = %self.node_name,
+                trace_id = %msg.routing.trace_id,
+                ilk_id = ?result.ilk_id,
+                tenant_id = ?result.tenant_id,
+                registration_status = ?result.registration_status,
+                "frontdesk handoff REGISTERED (ILK_REGISTER complete)"
+            );
             self.delete_frontdesk_thread_state(ctx).await?;
         } else {
+            tracing::warn!(
+                node_name = %self.node_name,
+                trace_id = %msg.routing.trace_id,
+                error_code = ?result.error_code,
+                error_detail = ?result.error_detail,
+                tenant_id = ?result.tenant_id,
+                "frontdesk handoff register FAILED (ilk stays temporary)"
+            );
             let state = FrontdeskThreadState {
                 status: Some("completed_error".to_string()),
                 collected: FrontdeskCollectedState {
