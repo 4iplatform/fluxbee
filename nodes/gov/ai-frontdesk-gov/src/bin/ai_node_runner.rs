@@ -1763,6 +1763,25 @@ impl GenericAiNode {
     /// baked ai_chat behavior is already live, only the token decides the LLM gate. No token => stay
     /// Unconfigured (degraded: the deterministic JSON handoff still works; the LLM path enables when a
     /// VAULT_SECRET_CHANGED carries the token).
+    /// Re-resolve the AI token from SY.vault (Model D', root tenant) and set the LLM gate live —
+    /// Configured when the token resolves, Unconfigured when it does not; returns whether it resolved.
+    /// A no-behavior FAILED_CONFIG node (broken hive.yaml) is left untouched — a token cannot help it.
+    /// This is the frontdesk analog of `refresh_architect_ai_runtime`: the ONE resolve+set-state seam
+    /// used at boot, on VAULT_SECRET_CHANGED, and on the CONFIG_SET refresh knob.
+    async fn refresh_ai_gate(&self) -> bool {
+        if self.behavior.read().await.is_none() {
+            return false;
+        }
+        let provider = self.configured_ai_provider().await;
+        let resolved = self.resolve_ai_api_key(provider).await.is_some();
+        self.control_plane.write().await.current_state = if resolved {
+            NodeLifecycleState::Configured
+        } else {
+            NodeLifecycleState::Unconfigured
+        };
+        resolved
+    }
+
     async fn boot_self_configure(&self) {
         // No baked behavior (FAILED_CONFIG — e.g. hive.yaml broken) → a token cannot enable the LLM
         // path; leave the state (the deterministic handoff still works).
@@ -1770,9 +1789,7 @@ impl GenericAiNode {
             return;
         }
         let provider = self.configured_ai_provider().await;
-        let resolved = self.resolve_ai_api_key(provider).await.is_some();
-        if resolved {
-            self.control_plane.write().await.current_state = NodeLifecycleState::Configured;
+        if self.refresh_ai_gate().await {
             tracing::info!(
                 node_name = %self.node_name,
                 provider = %provider,
@@ -1844,15 +1861,9 @@ impl GenericAiNode {
             return;
         }
 
-        let resolved = self.resolve_ai_api_key(provider).await.is_some();
-        // Autonomous refresh (cf. refresh_architect_ai_runtime): ACT on the broadcast — flip the LLM
-        // gate live. The baked behavior is already present; only the token toggles Configured vs degraded.
-        self.control_plane.write().await.current_state = if resolved {
-            NodeLifecycleState::Configured
-        } else {
-            NodeLifecycleState::Unconfigured
-        };
-        if resolved {
+        // Autonomous refresh (cf. refresh_architect_ai_runtime): ACT on the broadcast — re-resolve the
+        // token and flip the LLM gate live via the shared seam.
+        if self.refresh_ai_gate().await {
             tracing::info!(
                 node_name = %self.node_name,
                 trace_id = %msg.routing.trace_id,
@@ -2018,127 +2029,29 @@ impl GenericAiNode {
             );
         }
 
-        let config = match msg.payload.get("config") {
-            Some(Value::Object(_)) => msg.payload.get("config").cloned().unwrap_or(Value::Null),
-            Some(_) => {
-                return self.invalid_config_response(
-                    Some(schema_version),
-                    Some(config_version),
-                    "Invalid payload.config: must be an object".to_string(),
-                );
-            }
-            None => {
-                return self.invalid_config_response(
-                    Some(schema_version),
-                    Some(config_version),
-                    "Missing required field: payload.config".to_string(),
-                );
-            }
-        };
-        if let Some(field) = first_secret_bearing_config_field(&config) {
-            return self.invalid_config_response(
-                Some(schema_version),
-                Some(config_version),
-                format!(
-                    "{field} is not accepted; load OpenAI credentials via SY.vault with resource_type=openai"
-                ),
-            );
-        }
-        let mut config_doc = match parse_effective_config_doc(&config) {
-            Ok(v) => v,
-            Err(err) => {
-                return self.invalid_config_response(
-                    Some(schema_version),
-                    Some(config_version),
-                    format!("Invalid payload.config schema: {err}"),
-                );
-            }
-        };
-        config_doc = materialize_effective_defaults(&self.node_name, config_doc);
-        let next_behavior = match build_behavior_from_effective_config(&config_doc) {
-            Ok(v) => v,
-            Err(err) => {
-                return self.invalid_config_response(
-                    Some(schema_version),
-                    Some(config_version),
-                    format!("Invalid payload.config behavior: {err}"),
-                );
-            }
-        };
-        let materialized_config = match serde_json::to_value(&config_doc) {
-            Ok(v) => v,
-            Err(err) => {
-                return self.invalid_config_response(
-                    Some(schema_version),
-                    Some(config_version),
-                    format!("Failed to serialize effective config: {err}"),
-                );
-            }
-        };
-
-        let mut state = self.control_plane.write().await;
-        if config_version < state.config_version {
+        let _ = subsystem;
+        // Autonomous node (Model D', like SY.architect's CONFIG_SET): the AI runtime is baked and
+        // driven by the SY.vault token — NOTHING on the CONFIG_SET surface is settable. Reject any
+        // config/secret/behavior field, then treat CONFIG_SET as a manual VAULT-REFRESH trigger:
+        // re-resolve the token via the shared seam and report the resulting state. Nothing is persisted.
+        if let Some(field) = frontdesk_rejected_config_field(&msg.payload) {
             return self.error_response(
-                "stale_config_version",
+                "config_not_accepted",
                 format!(
-                    "Stale config_version: received {}, current {}",
-                    config_version, state.config_version
+                    "{field} is not accepted: SY.frontdesk.gov is autonomous — AI provider/model are hive-wide (hive.yaml) and the credential lives in SY.vault (resource_type=openai); CONFIG_SET only re-resolves the vault token."
                 ),
-                state.schema_version,
-                state.config_version,
-                state.current_state.as_str(),
+                schema_version,
+                config_version,
+                self.control_plane.read().await.current_state.as_str(),
             );
         }
-        if config_version == state.config_version && state.effective_config.is_some() {
-            return self.ok_response(
-                subsystem,
-                state.schema_version,
-                state.config_version,
-                state.current_state.as_str(),
-                state.effective_config.as_ref(),
-            );
-        }
-
-        let prev_state = state.current_state;
-        let prev_source = state.config_source;
-        let prev_effective = state.effective_config.clone();
-        let prev_schema = state.schema_version;
-        let prev_version = state.config_version;
-
-        state.current_state = NodeLifecycleState::Configured;
-        state.config_source = "persisted";
-        state.effective_config = Some(materialized_config);
-        state.schema_version = schema_version;
-        state.config_version = config_version;
-        if let Err(err) = persist_dynamic_config(
-            &self.dynamic_config_dir,
-            &self.node_name,
-            state.schema_version,
-            state.config_version,
-            &config_doc,
-        ) {
-            state.current_state = prev_state;
-            state.config_source = prev_source;
-            state.effective_config = prev_effective;
-            state.schema_version = prev_schema;
-            state.config_version = prev_version;
-            return self.error_response(
-                "config_persist_error",
-                format!("Failed to persist dynamic config: {err}"),
-                prev_schema,
-                prev_version,
-                prev_state.as_str(),
-            );
-        }
-        *self.behavior.write().await = Some(next_behavior);
-
-        self.ok_response(
-            subsystem,
-            state.schema_version,
-            state.config_version,
-            state.current_state.as_str(),
-            state.effective_config.as_ref(),
-        )
+        let resolved = self.refresh_ai_gate().await;
+        tracing::info!(
+            node_name = %self.node_name,
+            resolved,
+            "frontdesk-gov CONFIG_SET: Model D' vault re-resolve (no config accepted, nothing persisted)"
+        );
+        self.build_config_get_response().await
     }
 
     fn invalid_config_response(
@@ -2154,26 +2067,6 @@ impl GenericAiNode {
             config_version.unwrap_or(0),
             NodeLifecycleState::Unconfigured.as_str(),
         )
-    }
-
-    fn ok_response(
-        &self,
-        subsystem: &str,
-        schema_version: u32,
-        config_version: u64,
-        state: &str,
-        effective_config: Option<&Value>,
-    ) -> Value {
-        json!({
-            "subsystem": subsystem,
-            "node_name": self.node_name.as_str(),
-            "ok": true,
-            "state": state,
-            "schema_version": schema_version,
-            "config_version": config_version,
-            "error": Value::Null,
-            "effective_config": effective_config.map(redact_secrets),
-        })
     }
 
     fn error_response(
@@ -2208,62 +2101,61 @@ impl GenericAiNode {
     }
 
     async fn build_config_get_response(&self) -> Value {
-        let (ok, config_source, state_name, schema_version, config_version, effective_config) = {
+        let (state_name, config_source, schema_version, config_version, effective_config) = {
             let state = self.control_plane.read().await;
-            let ok = state.effective_config.is_some();
             (
-                ok,
-                if ok { state.config_source } else { "none" },
                 state.current_state.as_str().to_string(),
+                state.config_source,
                 state.schema_version,
                 state.config_version,
                 state.effective_config.clone(),
             )
         };
+        // `ok` reflects the LLM gate (token resolved), NOT config presence: effective_config is always
+        // Some (baked), so the truthful diagnostic is whether the node is Configured (token live).
+        let configured = state_name == NodeLifecycleState::Configured.as_str();
         let provider = self.configured_ai_provider().await;
-        let api_key_source = if ok {
-            self.resolve_ai_api_key_with_source(provider).await.1
-        } else {
-            OpenAiApiKeySource::Missing
+        let api_key_source = self.resolve_ai_api_key_with_source(provider).await.1;
+        // Baked engine (hive-wide provider/model from hive.yaml) — reported for diagnostics, mirroring
+        // architect's config.ai block.
+        let (engine_provider, engine_model) = match self.behavior.read().await.as_ref() {
+            Some(NodeBehavior::OpenAiChat(rt)) => (rt.provider.to_string(), rt.model.clone()),
+            _ => (provider.to_string(), String::new()),
         };
-        let error = if ok {
+        let error = if configured {
             Value::Null
         } else {
-            json!({"code":"node_not_configured","message":"No effective config available"})
+            json!({"code":"missing_secret","message":"AI token not resolved from SY.vault; degraded (the deterministic handoff still works). Load resource_type=openai in SY.vault."})
         };
         json!({
             "subsystem": "ai_node",
             "node_name": self.node_name.as_str(),
-            "ok": ok,
+            "ok": configured,
             "state": state_name,
             "config_source": config_source,
             "api_key_source": api_key_source.as_str(),
             "schema_version": schema_version,
             "config_version": config_version,
+            "config": {
+                "ai": { "default_provider": engine_provider, "model": engine_model }
+            },
             "contract": {
                 "node_family": "SY",
                 "node_kind": "SY.frontdesk.gov",
                 "supports": ["CONFIG_GET", "CONFIG_SET"],
-                "required_fields": [
-                    "config.behavior.kind"
-                ],
-                "optional_fields": [
-                    "config.behavior.instructions",
-                    "config.behavior.model_settings",
-                    "config.behavior.base_url",
-                    "config.behavior.capabilities.multimodal"
-                ],
-                "secrets": [{
+                "required_fields": [],
+                "optional_fields": [],
+                "resources": [{
                     "resource_type": provider.to_string(),
+                    "required": true,
                     "source": "SY.vault",
                     "tenant_id": fluxbee_sdk::DEFAULT_ROOT_TENANT_ID,
                     "configured": api_key_source == OpenAiApiKeySource::Vault
                 }],
                 "notes": [
-                    "SY.frontdesk.gov ships a runtime-owned default prompt when behavior.instructions is omitted.",
-                    "The AI provider/model are hive-wide and configured in hive.yaml.",
-                    "Credentials are resolved from SY.vault using the selected provider resource_type.",
-                    "SY.frontdesk.gov defaults behavior.capabilities.multimodal=false unless explicitly overridden.",
+                    "SY.frontdesk.gov is autonomous: its behavior is a baked ai_chat frontdesk (runtime-owned prompt) and is NOT settable via CONFIG_SET.",
+                    "The AI provider/model are hive-wide and configured only in hive.yaml (a baked fallback applies otherwise).",
+                    "The AI credential is resolved from SY.vault (resource_type=openai) at boot and on VAULT_SECRET_CHANGED; CONFIG_SET only RE-RESOLVES it — no config accepted, nothing persisted.",
                     "Secret plaintext is never persisted in node-local config or returned by CONFIG_GET."
                 ]
             },
@@ -3342,65 +3234,6 @@ fn load_persisted_dynamic_config(
     serde_json::from_str::<EffectiveStateFile>(&raw).ok()
 }
 
-fn persist_dynamic_config(
-    base_dir: &std::path::Path,
-    node_name: &str,
-    schema_version: u32,
-    config_version: u64,
-    config: &EffectiveConfigDocument,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    fs::create_dir_all(base_dir)?;
-    let path = dynamic_config_path(base_dir, node_name);
-    let payload = EffectiveStateFile {
-        schema_version,
-        config_version,
-        node_name: node_name.to_string(),
-        config: config.clone(),
-        updated_at: chrono::Utc::now().to_rfc3339(),
-    };
-    let json = serde_json::to_string_pretty(&payload)?;
-    write_json_atomic(&path, &json)?;
-    Ok(())
-}
-
-fn write_json_atomic(
-    path: &std::path::Path,
-    content: &str,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let parent = path
-        .parent()
-        .ok_or_else(|| "target path has no parent directory".to_string())?;
-    fs::create_dir_all(parent)?;
-
-    let tmp_name = format!(
-        ".{}.tmp.{}.{}",
-        path.file_name().and_then(|s| s.to_str()).unwrap_or("state"),
-        std::process::id(),
-        chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
-    );
-    let tmp_path = parent.join(tmp_name);
-
-    let mut file = OpenOptions::new()
-        .create_new(true)
-        .write(true)
-        .open(&tmp_path)?;
-    file.write_all(content.as_bytes())?;
-    file.flush()?;
-    file.sync_all()?;
-    drop(file);
-
-    if path.exists() {
-        fs::remove_file(path)?;
-    }
-    fs::rename(&tmp_path, path)?;
-
-    if let Ok(dir_file) = OpenOptions::new().read(true).open(parent) {
-        let _ = dir_file.sync_all();
-    }
-
-    Ok(())
-}
-
 fn format_instructions_snapshot(cfg: &Option<InstructionsSourceConfig>) -> Value {
     match cfg {
         None => Value::Null,
@@ -3435,31 +3268,21 @@ fn extract_openai_api_key_from_value(value: &Value) -> Option<String> {
         .map(ToString::to_string)
 }
 
-fn first_secret_bearing_config_field(config: &Value) -> Option<&'static str> {
-    if config.pointer("/secrets/openai/api_key").is_some() {
-        return Some("config.secrets.openai.api_key");
+/// Model D' (cf. `reject_architect_secret_fields`): SY.frontdesk.gov accepts NO config on CONFIG_SET —
+/// its behavior is baked (ai_chat + the frontdesk prompt), its provider/model are hive-wide (hive.yaml),
+/// and its credential lives in SY.vault. Returns the first offending config field, if any.
+fn frontdesk_rejected_config_field(payload: &Value) -> Option<&'static str> {
+    let config = payload.get("config").unwrap_or(payload);
+    if config.get("ai").is_some() || config.get("ai_providers").is_some() {
+        return Some("config.ai / config.ai_providers");
     }
-    if config.pointer("/secrets/openai/api_key_env").is_some() {
-        return Some("config.secrets.openai.api_key_env");
+    if config.get("behavior").is_some() {
+        return Some("config.behavior");
     }
-    if config.pointer("/behavior/openai/api_key").is_some() {
-        return Some("config.behavior.openai.api_key");
-    }
-    if config.pointer("/behavior/api_key").is_some() {
-        return Some("config.behavior.api_key");
-    }
-    if config.pointer("/behavior/api_key_env").is_some() {
-        return Some("config.behavior.api_key_env");
+    if config.get("api_key").is_some() || config.get("api_key_ref").is_some() {
+        return Some("config.api_key");
     }
     None
-}
-
-fn parse_effective_config_doc(
-    config: &Value,
-) -> Result<EffectiveConfigDocument, Box<dyn std::error::Error + Send + Sync>> {
-    Ok(serde_json::from_value::<EffectiveConfigDocument>(
-        config.clone(),
-    )?)
 }
 
 fn materialize_effective_defaults(
@@ -4813,32 +4636,25 @@ mod tests {
     }
 
     #[test]
-    fn frontdesk_rejects_secret_bearing_config_fields() {
-        let config = json!({
-            "behavior": {
-                "kind": "ai_chat",
-                "openai": {
-                    "api_key": "sk-test"
-                }
-            }
-        });
-
+    fn frontdesk_config_set_rejects_all_config_fields() {
+        // Autonomous node (Model D'): CONFIG_SET accepts NO config — the behavior is baked and the
+        // credential lives in SY.vault. Any config/secret/behavior field is rejected; an empty config
+        // (a bare vault re-resolve trigger) is accepted.
         assert_eq!(
-            first_secret_bearing_config_field(&config),
-            Some("config.behavior.openai.api_key")
+            frontdesk_rejected_config_field(&json!({"config": {"behavior": {"kind": "ai_chat"}}})),
+            Some("config.behavior")
         );
-
-        let config = json!({
-            "secrets": {
-                "openai": {
-                    "api_key": "sk-test"
-                }
-            }
-        });
-
         assert_eq!(
-            first_secret_bearing_config_field(&config),
-            Some("config.secrets.openai.api_key")
+            frontdesk_rejected_config_field(&json!({"config": {"ai": {"model": "gpt-5.5"}}})),
+            Some("config.ai / config.ai_providers")
+        );
+        assert_eq!(
+            frontdesk_rejected_config_field(&json!({"config": {"api_key": "sk-x"}})),
+            Some("config.api_key")
+        );
+        assert_eq!(
+            frontdesk_rejected_config_field(&json!({"config": {}})),
+            None
         );
     }
 
