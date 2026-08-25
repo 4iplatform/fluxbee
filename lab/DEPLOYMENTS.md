@@ -16,6 +16,7 @@
 
 | Versión | Fecha (ART) | Commit | Alcance | Estado | Rollback |
 |---|---|---|---|---|---|
+| **0.1.29** | 2026-08-25 | `a0bc25d` | motherbee | ✅ live | snap `pre-cloud-readpath-0-1-29` · `apt install fluxbee=0.1.28` |
 | **0.1.28** | 2026-08-25 | `1438737` | motherbee | ✅ live | snap `pre-frontdesk-configplane-0-1-28` · `apt install fluxbee=0.1.27` |
 | **0.1.27** | 2026-08-25 | `000de90` | motherbee | ✅ live | snap `pre-frontdesk-autonomous-0-1-27` · `apt install fluxbee=0.1.26` |
 | **0.1.26** | 2026-08-24 | `cb2d192` | motherbee | ✅ live | snap `pre-frontdesk-handoff-0-1-26` · `apt install fluxbee=0.1.25` |
@@ -30,6 +31,30 @@
 > Este ledger arranca en **0.1.20** (primera vez que se registra formalmente). Las versiones
 > anteriores (0.1.0–0.1.19) se desplegaron sin ledger; el repo apt en fb-build las conserva
 > (`dpkg-scanpackages -m`) para rollback, pero su detalle vive en la bitácora, no acá.
+
+---
+
+## 0.1.29 — io.cloud: camino de LECTURA de Cloud (fase 2) — reads rápidos SHM + get_ilk_details relay
+
+- **Fecha:** 2026-08-25 (ART) · **Versión anterior:** 0.1.28 · **Commit:** `a0bc25d` (branch `daily_onworking_coa`)
+- **Alcance:** **motherbee** (VM100). Toca `fluxbee_sdk::cloud` + el nodo runtime `IO.cloud` + el nodo core `SY.admin`.
+- **Qué cambió:** le da a Fluxbee Cloud una forma de **leer** lo que creó (patrón io.api: existencia/subset desde la
+  SHM local sin round-trip; data completa por relay a admin).
+  - **SDK (single source):** `CLOUD_LOCAL_OPS += get_ilk/get_tenant/list_ilks` (reads SHM que io.cloud sirve solo);
+    `CLOUD_OP_ACTIONS += get_ilk_details → get_ilk` (relay). `CLOUD_EXPOSED_ACTIONS` gana `get_ilk` → admin
+    `authorize_cloud_relay` + el catálogo Cloud lo auto-permiten/publican (advertised==enforced). `cloud_action_catalog` documenta las 4.
+  - **io.cloud:** `handle_shm_read` lee la SHM de identidad vía `fluxbee_sdk::identity` (`list_ilks_from_hive_id`/
+    `tenant_exists_in_hive_id`, por `config.hive_id`) — los mismos readers de io.api, **sin round-trip**. Subset
+    `{ilk_id, ilk_type, registration_status, tenant_id, display_name}`. `get_ilk_details` → admin `get_ilk` (identification PII + canales + tenant).
+- **Build:** fb-build (VM110), `build-deb.sh 0.1.29` → 245 MB. **Publish:** `apt-repo-publish.sh` → repo :8900.
+- **Verificación en vivo (E2E desde ingress):** las **4 ops OK** — `get_ilk` `{exists,ilk:subset}`; `get_tenant`
+  `{exists,ilk_count:4}`; `list_ilks` `{count:4, ilks:[…pepito…]}`; `get_ilk_details` registro completo
+  (`identification{email,phone,company,attributes}` + `channels` + `tenant{pepito}`). SDK 5/0 · io.cloud 9/0 ·
+  admin catalog test actualizado. **0 units failed**, io.cloud `NRestarts=0` (un 502 transitorio inicial por el ICH
+  re-registrándose tras el restart). **Contrato para Cloud dev en `docs/io-cloud-api.md` §4.6–4.9.**
+- **Nota (owner-deferred):** ownership de tenant sigue MVP-trusted — un holder del bearer puede leer cualquier id
+  que nombre (misma postura que las escrituras).
+- **Rollback:** snapshot VM100 `pre-cloud-readpath-0-1-29`, o `apt-get install -y --allow-downgrades fluxbee=0.1.28`.
 
 ---
 
