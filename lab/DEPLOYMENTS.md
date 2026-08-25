@@ -16,6 +16,7 @@
 
 | Versión | Fecha (ART) | Commit | Alcance | Estado | Rollback |
 |---|---|---|---|---|---|
+| **0.1.28** | 2026-08-25 | `1438737` | motherbee | ✅ live | snap `pre-frontdesk-configplane-0-1-28` · `apt install fluxbee=0.1.27` |
 | **0.1.27** | 2026-08-25 | `000de90` | motherbee | ✅ live | snap `pre-frontdesk-autonomous-0-1-27` · `apt install fluxbee=0.1.26` |
 | **0.1.26** | 2026-08-24 | `cb2d192` | motherbee | ✅ live | snap `pre-frontdesk-handoff-0-1-26` · `apt install fluxbee=0.1.25` |
 | **0.1.25** | 2026-08-24 | `69b1c46` | motherbee | ✅ live | snap `pre-observability-0-1-25` · `apt install fluxbee=0.1.24` |
@@ -29,6 +30,34 @@
 > Este ledger arranca en **0.1.20** (primera vez que se registra formalmente). Las versiones
 > anteriores (0.1.0–0.1.19) se desplegaron sin ledger; el repo apt en fb-build las conserva
 > (`dpkg-scanpackages -m`) para rollback, pero su detalle vive en la bitácora, no acá.
+
+---
+
+## 0.1.28 — frontdesk: reconciliar CONFIG_GET/CONFIG_SET con el modelo autónomo (Model D', como architect)
+
+- **Fecha:** 2026-08-25 (ART) · **Versión anterior:** 0.1.27 · **Commit:** `1438737` (branch `daily_onworking_coa`)
+- **Alcance:** **motherbee** (VM100). Toca el nodo core `SY.frontdesk.gov` (`ai_node_runner`).
+- **Qué cambió:** un panel de 4 agentes confirmó que architect Y el executor de admin son autónomos **y
+  MANTIENEN** un CONFIG_GET/CONFIG_SET reconciliado — así que conformar = **reconciliar, no borrar** el plano.
+  - **`refresh_ai_gate()`**: el seam único de resolve-token-y-setear-gate (análogo a `refresh_architect_ai_runtime`),
+    ahora usado por `boot_self_configure`, `handle_vault_secret_changed` **y** CONFIG_SET.
+  - **CONFIG_SET (Fork B, owner-confirmado):** era inyector de config; ahora modelo architect — **rechaza TODO**
+    campo config/secret/behavior (`frontdesk_rejected_config_field`) y es un **disparador de re-resolve del token
+    del vault**; no persiste nada.
+  - **CONFIG_GET reconciliado:** `ok` ahora refleja el gate del token (Configured), no la presencia de config;
+    `required_fields`/`optional_fields` → `[]`; agrega `config.ai {default_provider, model}` (hive-wide); renombra
+    `secrets[]` → `resources[]` (+required) espejando architect; notas autónomas.
+  - Removidas las 5 huérfanas de inyección (`ok_response`, `persist_dynamic_config`, `write_json_atomic`,
+    `first_secret_bearing_config_field`, `parse_effective_config_doc`; su test re-apuntado). 27/0 tests.
+- **Build:** fb-build (VM110), `build-deb.sh 0.1.28` → 245 MB. **Publish:** `apt-repo-publish.sh` → repo :8900.
+- **Verificación en vivo:** `0.1.28`; **boot autónomo sigue OK** (degraded → VAULT_SECRET_CHANGED → Configured);
+  **regresión handoff determinista** → HTTP 200 `success:true complete`; **0 units failed**. (Nota: la ruta operador
+  `GET /nodes/.../config` da `NODE_CONFIG_NOT_FOUND` porque lee un ARCHIVO de config persistido que el nodo autónomo
+  ya no tiene — igual que architect; el CONFIG_GET vivo se sirve por el canal mesh, verificado en código + tests.)
+- **DIFERIDO (pasada de limpieza catalogada, marcado por el panel):** la ruta `--config`/`run_one_config` (YAML,
+  MUERTA en prod — el unit systemd no pasa `--config`) + sus helpers + los tipos de input YAML + los pre-existentes
+  `with_jitter`/`parse`.
+- **Rollback:** snapshot VM100 `pre-frontdesk-configplane-0-1-28`, o `apt-get install -y --allow-downgrades fluxbee=0.1.27`.
 
 ---
 
