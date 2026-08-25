@@ -1758,6 +1758,35 @@ impl GenericAiNode {
         }
     }
 
+    /// Autonomous boot self-configure (SY.* pattern, cf. build_architect_ai_runtime): resolve the AI
+    /// token from SY.vault (Model D', root tenant) and flip to Configured when it is present — the
+    /// baked ai_chat behavior is already live, only the token decides the LLM gate. No token => stay
+    /// Unconfigured (degraded: the deterministic JSON handoff still works; the LLM path enables when a
+    /// VAULT_SECRET_CHANGED carries the token).
+    async fn boot_self_configure(&self) {
+        // No baked behavior (FAILED_CONFIG — e.g. hive.yaml broken) → a token cannot enable the LLM
+        // path; leave the state (the deterministic handoff still works).
+        if self.behavior.read().await.is_none() {
+            return;
+        }
+        let provider = self.configured_ai_provider().await;
+        let resolved = self.resolve_ai_api_key(provider).await.is_some();
+        if resolved {
+            self.control_plane.write().await.current_state = NodeLifecycleState::Configured;
+            tracing::info!(
+                node_name = %self.node_name,
+                provider = %provider,
+                "frontdesk-gov autonomous bootstrap: AI token resolved from vault → Configured (LLM conversational path enabled)"
+            );
+        } else {
+            tracing::warn!(
+                node_name = %self.node_name,
+                provider = %provider,
+                "frontdesk-gov autonomous bootstrap: no AI token in vault → degraded (Unconfigured); deterministic handoff works, LLM path enables on VAULT_SECRET_CHANGED"
+            );
+        }
+    }
+
     async fn handle_vault_secret_changed(&self, msg: &Message) {
         let payload: VaultSecretChangedPayload = match serde_json::from_value(msg.payload.clone()) {
             Ok(payload) => payload,
@@ -1793,18 +1822,36 @@ impl GenericAiNode {
             return;
         }
 
+        // No baked behavior (FAILED_CONFIG) → a token change/delete cannot enable the LLM path; leave
+        // the state (the deterministic handoff still works regardless).
+        if self.behavior.read().await.is_none() {
+            tracing::warn!(
+                node_name = %self.node_name,
+                trace_id = %msg.routing.trace_id,
+                "frontdesk-gov AI vault secret changed but no baked behavior (FAILED_CONFIG); LLM path stays disabled"
+            );
+            return;
+        }
         if matches!(payload.op, fluxbee_sdk::protocol::VaultSecretOp::Delete) {
+            self.control_plane.write().await.current_state = NodeLifecycleState::Unconfigured;
             tracing::warn!(
                 node_name = %self.node_name,
                 trace_id = %msg.routing.trace_id,
                 key = %payload.key,
                 version = payload.version,
-                "frontdesk-gov OpenAI vault secret delete matched; next OpenAI call will fail until secret is restored"
+                "frontdesk-gov AI vault secret deleted → degraded (Unconfigured); deterministic handoff still works, LLM path re-enables when the secret is restored"
             );
             return;
         }
 
         let resolved = self.resolve_ai_api_key(provider).await.is_some();
+        // Autonomous refresh (cf. refresh_architect_ai_runtime): ACT on the broadcast — flip the LLM
+        // gate live. The baked behavior is already present; only the token toggles Configured vs degraded.
+        self.control_plane.write().await.current_state = if resolved {
+            NodeLifecycleState::Configured
+        } else {
+            NodeLifecycleState::Unconfigured
+        };
         if resolved {
             tracing::info!(
                 node_name = %self.node_name,
@@ -1812,7 +1859,7 @@ impl GenericAiNode {
                 op = %payload.op.as_str(),
                 key = %payload.key,
                 version = payload.version,
-                "frontdesk-gov OpenAI vault secret changed; vault probe succeeded"
+                "frontdesk-gov AI vault secret changed → resolved → Configured (LLM conversational path live)"
             );
         } else {
             tracing::warn!(
@@ -1821,7 +1868,7 @@ impl GenericAiNode {
                 op = %payload.op.as_str(),
                 key = %payload.key,
                 version = payload.version,
-                "frontdesk-gov OpenAI vault secret changed but vault probe did not resolve a usable api_key"
+                "frontdesk-gov AI vault secret changed but no usable api_key → degraded (Unconfigured)"
             );
         }
     }
@@ -2749,126 +2796,50 @@ async fn run_unconfigured_bootstrap(
     let dynamic_dir = PathBuf::from(node.dynamic_config_dir.clone());
     let thread_state_store = init_thread_state_store(&node_name, &dynamic_dir).await;
     let immediate_memory_store = init_immediate_memory_store(&node_name, &dynamic_dir).await;
-    let persisted_dynamic = load_persisted_dynamic_config(&dynamic_dir, &node_name);
-    let spawn_effective = if persisted_dynamic.is_none() {
-        load_effective_config_from_spawn(&node_name)
-    } else {
-        None
+    // SY.frontdesk.gov is an AUTONOMOUS system node — same pattern as SY.architect and SY.admin's
+    // executor (build_architect_ai_runtime / refresh_architect_ai_runtime): its AI runtime is BAKED
+    // (it is ALWAYS an ai_chat frontdesk — prompt via frontdesk_default_instructions, engine via
+    // load_hive_ai_engine's hive.yaml-or-baked-fallback), and the ONLY external input is the AI token
+    // in SY.vault. It reads NO spawn/persisted/CONFIG_SET config for the AI runtime. The token is
+    // resolved after the dispatcher exists (boot_self_configure) and decides Configured (LLM
+    // conversational path) vs Unconfigured (degraded — the deterministic JSON-handoff path still works
+    // with no LLM). The baked behavior is Some in BOTH states; only the token toggles the gate.
+    let baked_doc = materialize_effective_defaults(
+        &node_name,
+        EffectiveConfigDocument {
+            node: Some(EffectiveNodeSection {
+                config_dir: Some(node.config_dir.clone()),
+                ..EffectiveNodeSection::default()
+            }),
+            behavior: EffectiveBehaviorSection {
+                kind: "ai_chat".to_string(),
+                ..EffectiveBehaviorSection::default()
+            },
+            ..EffectiveConfigDocument::default()
+        },
+    );
+    let (behavior, boot_state) = match build_behavior_from_effective_config(&baked_doc) {
+        // Behavior baked OK — boot Unconfigured; boot_self_configure flips to Configured when the vault
+        // token is present, else stays Unconfigured (degraded: the deterministic handoff still works).
+        Ok(behavior) => (Some(behavior), NodeLifecycleState::Unconfigured),
+        // The baked behavior could not be built (e.g. hive.yaml missing/invalid) — a real
+        // misconfiguration, so boot FAILED_CONFIG. The deterministic handoff still runs (it is gated
+        // before the behavior); the LLM conversational path stays disabled.
+        Err(err) => {
+            tracing::warn!(
+                node_name = %node_name,
+                error = %err,
+                "frontdesk-gov: baked ai_chat behavior could not be built (hive.yaml/engine?); booting FAILED_CONFIG (deterministic handoff still works, LLM path disabled)"
+            );
+            (None, NodeLifecycleState::FailedConfig)
+        }
     };
-    let (behavior, state) = match persisted_dynamic.as_ref() {
-        Some(stored) => {
-            let materialized = materialize_effective_defaults(&node_name, stored.config.clone());
-            match build_behavior_from_effective_config(&materialized) {
-                Ok(behavior) => {
-                    tracing::info!(
-                        node_name = %node_name,
-                        config_version = stored.config_version,
-                        "loaded effective JSON config at bootstrap"
-                    );
-                    (
-                        Some(behavior),
-                        ControlPlaneState {
-                            current_state: NodeLifecycleState::Configured,
-                            config_source: "persisted",
-                            effective_config: Some(
-                                serde_json::to_value(materialized).unwrap_or(Value::Null),
-                            ),
-                            schema_version: stored.schema_version,
-                            config_version: stored.config_version,
-                        },
-                    )
-                }
-                Err(err) => {
-                    tracing::warn!(
-                        node_name = %node_name,
-                        error = %err,
-                        "persisted JSON config is invalid; booting FAILED_CONFIG"
-                    );
-                    (
-                        None,
-                        ControlPlaneState {
-                            current_state: NodeLifecycleState::FailedConfig,
-                            config_source: "persisted",
-                            effective_config: Some(
-                                serde_json::to_value(materialized).unwrap_or(Value::Null),
-                            ),
-                            schema_version: stored.schema_version,
-                            config_version: stored.config_version,
-                        },
-                    )
-                }
-            }
-        }
-        None => {
-            if let Some(spawn_cfg) = spawn_effective {
-                let spawn_config = spawn_cfg.config.clone();
-                match build_behavior_from_effective_config(&spawn_config) {
-                    Ok(behavior) => {
-                        tracing::info!(
-                            node_name = %node_name,
-                            path = %spawn_cfg.path.display(),
-                            "loaded spawn config at bootstrap"
-                        );
-                        if let Err(err) = persist_dynamic_config(
-                            &dynamic_dir,
-                            &node_name,
-                            spawn_cfg.schema_version,
-                            spawn_cfg.config_version,
-                            &spawn_config,
-                        ) {
-                            tracing::warn!(
-                                node_name = %node_name,
-                                error = %err,
-                                "failed to persist bootstrap config from spawn file"
-                            );
-                        }
-                        (
-                            Some(behavior),
-                            ControlPlaneState {
-                                current_state: NodeLifecycleState::Configured,
-                                config_source: "spawn",
-                                effective_config: Some(
-                                    serde_json::to_value(spawn_config).unwrap_or(Value::Null),
-                                ),
-                                schema_version: spawn_cfg.schema_version,
-                                config_version: spawn_cfg.config_version,
-                            },
-                        )
-                    }
-                    Err(err) => {
-                        tracing::warn!(
-                            node_name = %node_name,
-                            path = %spawn_cfg.path.display(),
-                            error = %err,
-                            "spawn config exists but is invalid for AI effective config"
-                        );
-                        (
-                            None,
-                            ControlPlaneState {
-                                current_state: NodeLifecycleState::FailedConfig,
-                                config_source: "spawn",
-                                effective_config: Some(
-                                    serde_json::to_value(spawn_config).unwrap_or(Value::Null),
-                                ),
-                                schema_version: spawn_cfg.schema_version,
-                                config_version: spawn_cfg.config_version,
-                            },
-                        )
-                    }
-                }
-            } else {
-                (
-                    None,
-                    ControlPlaneState {
-                        current_state: NodeLifecycleState::Unconfigured,
-                        config_source: "none",
-                        effective_config: None,
-                        schema_version: 0,
-                        config_version: 0,
-                    },
-                )
-            }
-        }
+    let state = ControlPlaneState {
+        current_state: boot_state,
+        config_source: "baked",
+        effective_config: Some(serde_json::to_value(&baked_doc).unwrap_or(Value::Null)),
+        schema_version: 0,
+        config_version: 0,
     };
 
     let runner_node_name = node.name.clone();
@@ -2921,6 +2892,10 @@ async fn run_unconfigured_bootstrap(
         vault,
         control_plane: Arc::new(RwLock::new(state)),
     };
+    // Now that the dispatcher/vault exist, resolve the AI token from SY.vault and flip to Configured
+    // when present (autonomous SY.* pattern, cf. build_architect_ai_runtime). No token => stay
+    // Unconfigured (degraded — the deterministic handoff still works).
+    ai_node.boot_self_configure().await;
     let runtime = NodeRuntime::new(dispatcher, ai_node);
     runtime.run_with_config(RuntimeConfig::default()).await?;
     Ok(())
@@ -3485,43 +3460,6 @@ fn parse_effective_config_doc(
     Ok(serde_json::from_value::<EffectiveConfigDocument>(
         config.clone(),
     )?)
-}
-
-#[derive(Debug)]
-struct SpawnEffectiveConfig {
-    path: PathBuf,
-    schema_version: u32,
-    config_version: u64,
-    config: EffectiveConfigDocument,
-}
-
-fn load_effective_config_from_spawn(node_name: &str) -> Option<SpawnEffectiveConfig> {
-    let path = managed_node_config_path(node_name).ok()?;
-    let raw = fs::read_to_string(&path).ok()?;
-    let root: Value = serde_json::from_str(&raw).ok()?;
-    let schema_version = root
-        .get("_system")
-        .and_then(|v| v.get("config_version"))
-        .and_then(Value::as_u64)
-        .and_then(|v| u32::try_from(v).ok())
-        .unwrap_or(1);
-    let config_version = root
-        .get("_system")
-        .and_then(|v| v.get("updated_at_ms"))
-        .and_then(Value::as_u64)
-        .unwrap_or(1);
-    let mut candidate = root.get("config").cloned().unwrap_or(root);
-    if let Some(obj) = candidate.as_object_mut() {
-        obj.remove("_system");
-    }
-    let parsed = parse_effective_config_doc(&candidate).ok()?;
-    let config = materialize_effective_defaults(node_name, parsed);
-    Some(SpawnEffectiveConfig {
-        path,
-        schema_version,
-        config_version,
-        config,
-    })
 }
 
 fn materialize_effective_defaults(
