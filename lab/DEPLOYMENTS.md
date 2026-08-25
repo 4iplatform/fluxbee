@@ -16,6 +16,7 @@
 
 | Versión | Fecha (ART) | Commit | Alcance | Estado | Rollback |
 |---|---|---|---|---|---|
+| **0.1.27** | 2026-08-25 | `000de90` | motherbee | ✅ live | snap `pre-frontdesk-autonomous-0-1-27` · `apt install fluxbee=0.1.26` |
 | **0.1.26** | 2026-08-24 | `cb2d192` | motherbee | ✅ live | snap `pre-frontdesk-handoff-0-1-26` · `apt install fluxbee=0.1.25` |
 | **0.1.25** | 2026-08-24 | `69b1c46` | motherbee | ✅ live | snap `pre-observability-0-1-25` · `apt install fluxbee=0.1.24` |
 | **0.1.24** | 2026-08-23 | `35349ef` | motherbee | ✅ live | snap `pre-vault-guard-0-1-24` · `apt install fluxbee=0.1.23` |
@@ -28,6 +29,35 @@
 > Este ledger arranca en **0.1.20** (primera vez que se registra formalmente). Las versiones
 > anteriores (0.1.0–0.1.19) se desplegaron sin ledger; el repo apt en fb-build las conserva
 > (`dpkg-scanpackages -m`) para rollback, pero su detalle vive en la bitácora, no acá.
+
+---
+
+## 0.1.27 — frontdesk: bootstrap AUTÓNOMO (resuelve el token del vault al boot + actúa en el broadcast)
+
+- **Fecha:** 2026-08-25 (ART) · **Versión anterior:** 0.1.26 · **Commit:** `000de90` (branch `daily_onworking_coa`)
+- **Alcance:** **motherbee** (VM100). Toca el nodo core `SY.frontdesk.gov` (`ai_node_runner`).
+- **Qué cambió:** el frontdesk se conforma al patrón canónico de nodo system SY.* (verificado con un panel contra
+  `SY.architect` `build_architect_ai_runtime`/`refresh_architect_ai_runtime` y el executor de `SY.admin` — mismo
+  mecanismo, mismo seam). Es un nodo **autónomo**: su runtime AI es **baked** (siempre ai_chat — prompt
+  `frontdesk_default_instructions` + engine `load_hive_ai_engine` hive.yaml/fallback), y el **único input externo
+  es el token del vault**.
+  - **Boot:** arma el behavior baked, `boot_self_configure` resuelve el token (`resolve_ai_api_key`, Model D' root)
+    → `Configured` si está, sino `Unconfigured` (degradado — el handoff determinista igual anda). Build baked
+    falla (hive.yaml roto) → `FAILED_CONFIG`.
+  - **Broadcast:** `handle_vault_secret_changed` era un no-op probe+log (EL bug — nunca cambiaba estado); ahora
+    **actúa** como `refresh_architect_ai_runtime` — re-resuelve y setea `Configured`/`Unconfigured` en vivo.
+  - Reusa solo seams existentes (sin builder ni vault-path nuevos). 27/0 tests.
+- **Build:** fb-build (VM110), `build-deb.sh 0.1.27` → 245 MB. **Publish:** `apt-repo-publish.sh` → repo :8900.
+- **Verificación en vivo:** `0.1.27` instalado; **el frontdesk pasó a `Configured` desde el token del vault** en el
+  arranque (boot degradado 00:52:19 → `VAULT_SECRET_CHANGED` op=put openai_api_key 00:52:20 → **Configured, LLM
+  path live**) — sin CONFIG_SET. **Regresión handoff determinista OK** (register_human desde ingress → HTTP 200
+  `success:true registration_status:complete`; un 502 transitorio inicial por io.cloud re-registrando su ICH tras
+  el restart). frontdesk + io.cloud `active`, `NRestarts=0`, **0 units failed**.
+- **DIFERIDO (EDIT 3, owner-confirmado, a pasada de limpieza catalogada):** sacar el plano CONFIG_SET/spawn
+  (`apply_config_set` + `load_persisted_dynamic_config` en AMBAS rutas de boot + ~6 helpers) — cascada enredada;
+  por la regla "no borrar a ciegas" queda para una pasada dedicada. `apply_config_set` sigue funcional (nadie le
+  manda CONFIG_SET al frontdesk en la práctica). Warnings pre-existentes `with_jitter`/`parse` también a esa pasada.
+- **Rollback:** snapshot VM100 `pre-frontdesk-autonomous-0-1-27`, o `apt-get install -y --allow-downgrades fluxbee=0.1.26`.
 
 ---
 
