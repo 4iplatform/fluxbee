@@ -20,13 +20,17 @@ pub const CLOUD_OP_ACTIONS: &[(&str, &str)] = &[
     ("create_tenant", "create_tenant"),
     ("put_token", "vault_put"),
     ("provision_node", "run_node"),
+    // Full identity read (all `identification` PII + channels + tenant) — relayed to SY.admin's
+    // `get_ilk`. The FAST existence/subset reads live in CLOUD_LOCAL_OPS (io.cloud reads the identity
+    // SHM directly, no round-trip); this is the "give me everything" path that pays for the DB read.
+    ("get_ilk_details", "get_ilk"),
 ];
 
 /// The admin actions IO.cloud may relay over the mesh — the security allowlist SY.admin enforces in
 /// `authorize_cloud_relay`. Kept as a `&[&str]` const for ergonomic `.contains()` at the gate; a
 /// unit test pins it to be exactly the dedup range of [`CLOUD_OP_ACTIONS`], so the two SDK constants
 /// (and therefore SY.admin's enforcement and IO.cloud's translation) can never diverge.
-pub const CLOUD_EXPOSED_ACTIONS: &[&str] = &["create_tenant", "vault_put", "run_node"];
+pub const CLOUD_EXPOSED_ACTIONS: &[&str] = &["create_tenant", "vault_put", "run_node", "get_ilk"];
 
 /// The [`CLOUD_EXPOSED_ACTIONS`] set computed from [`CLOUD_OP_ACTIONS`] (deduped, first-seen order).
 pub fn cloud_exposed_actions() -> Vec<&'static str> {
@@ -53,7 +57,17 @@ pub fn admin_action_for_cloud_op(op: &str) -> Option<&'static str> {
 /// - `register_human`: provisions a temporary human ilk (`ILK_PROVISION`, IO-only) and hands the
 ///   frontdesk_handoff to `SY.frontdesk.gov` — admin can do neither the provision nor the register.
 /// - `list_cloud_actions`: IO.cloud answers Cloud's discovery query from `cloud_action_catalog()`.
-pub const CLOUD_LOCAL_OPS: &[&str] = &["register_human", "list_cloud_actions"];
+pub const CLOUD_LOCAL_OPS: &[&str] = &[
+    "register_human",
+    "list_cloud_actions",
+    // FAST identity reads served straight from the local identity SHM (io.cloud co-resides with
+    // SY.identity on motherbee) — NO mesh round-trip, the io.api read pattern. They return the SHM
+    // subset (identity + tenant + status + name); the full `identification` PII lives behind the
+    // `get_ilk_details` relay.
+    "get_ilk",
+    "get_tenant",
+    "list_ilks",
+];
 
 /// Whether `op` is an io.cloud-local op (dispatched by IO.cloud itself, not relayed to admin).
 pub fn is_cloud_local_op(op: &str) -> bool {
@@ -74,7 +88,15 @@ pub fn cloud_action_catalog() -> Value {
         { "op": "register_human", "category": "local",
           "summary": "Register a human's identity (mint the human ilk). Needs tenant_id (root) + params = a frontdesk_handoff {type:'frontdesk_handoff', schema_version:1, operation:'complete_registration', subject:{display_name,email,phone?,company_name?,attributes?}}. IO.cloud provisions the temporary human ilk and hands it to SY.frontdesk.gov; returns the frontdesk verdict + ilk_id." },
         { "op": "list_cloud_actions", "category": "local",
-          "summary": "Return this catalog (the actions IO.cloud offers: relay + local) so Cloud can discover its surface." }
+          "summary": "Return this catalog (the actions IO.cloud offers: relay + local) so Cloud can discover its surface." },
+        { "op": "get_ilk", "category": "local",
+          "summary": "FAST existence+subset read of one ilk from the identity SHM (no round-trip). Needs params.ilk_id (ilk:<uuid>). Returns {exists, ilk?:{ilk_id, ilk_type, registration_status, tenant_id, display_name}}. For the full identification (phone/company/attributes) + channels use get_ilk_details." },
+        { "op": "get_tenant", "category": "local",
+          "summary": "FAST existence read of one tenant from the identity SHM. Needs params.tenant_id (tnt:<uuid>). Returns {exists, tenant_id, ilk_count}." },
+        { "op": "list_ilks", "category": "local",
+          "summary": "List the ilks of ONE tenant from the identity SHM (subset each). Needs params.tenant_id (tnt:<uuid>). Returns {tenant_id, count, ilks:[{ilk_id, ilk_type, registration_status, display_name}]}." },
+        { "op": "get_ilk_details", "category": "relay",
+          "summary": "FULL identity read (all identification PII + channels + tenant) — relayed to SY.admin. Needs params.ilk_id (ilk:<uuid>). Slower than get_ilk (a DB read); use it when you need everything." }
     ])
 }
 
@@ -87,7 +109,7 @@ mod tests {
         // The allowlist SY.admin enforces is exactly the set of actions io.cloud can produce.
         assert_eq!(
             cloud_exposed_actions(),
-            vec!["create_tenant", "vault_put", "run_node"]
+            vec!["create_tenant", "vault_put", "run_node", "get_ilk"]
         );
     }
 

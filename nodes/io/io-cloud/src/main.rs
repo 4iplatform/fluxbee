@@ -953,6 +953,18 @@ fn translate_cloud_op(
             }
             Ok(("run_node", serde_json::Value::Object(provision)))
         }
+        "get_ilk_details" => {
+            // FULL identity read — relayed to SY.admin's `get_ilk` (reads the DB record: all
+            // identification PII + channels + tenant). The FAST existence/subset read is the LOCAL
+            // `get_ilk` (SHM); this is the "give me everything" path.
+            let ilk_id = required_string(params, "ilk_id")?;
+            if !ilk_id.starts_with("ilk:") {
+                return Err(cloud_error(
+                    "get_ilk_details requires params.ilk_id as a canonical ilk:<uuid>",
+                ));
+            }
+            Ok(("get_ilk", json!({ "ilk_id": ilk_id })))
+        }
         "" => Err(cloud_error("missing 'op'")),
         other => Err(cloud_error(&format!("unknown op '{other}'"))),
     }
@@ -1030,6 +1042,8 @@ async fn handle_local_cloud_op(
 ) -> Value {
     match op {
         "register_human" => handle_register_human(sender, state, msg).await,
+        // FAST identity reads straight from the local identity SHM — NO mesh round-trip.
+        "get_ilk" | "get_tenant" | "list_ilks" => handle_shm_read(state, msg, op),
         // Discovery: return the shared catalog (relay + local, with help) so Cloud knows its surface.
         "list_cloud_actions" => json!({
             "status": "ok",
@@ -1039,6 +1053,91 @@ async fn handle_local_cloud_op(
         // Unreachable while CLOUD_LOCAL_OPS and this match stay in lock-step; fail-closed if a new
         // local op is declared without a handler here.
         other => cloud_error_code("INVALID_REQUEST", &format!("no handler for local op '{other}'")),
+    }
+}
+
+/// The SHM subset of one ilk returned by the fast reads (get_ilk / list_ilks). The full
+/// `identification` PII + channels live behind the `get_ilk_details` relay, not in this SHM view.
+fn ilk_shm_subset(i: &fluxbee_sdk::identity::IdentityIlkOption) -> Value {
+    json!({
+        "ilk_id": i.ilk_id,
+        "ilk_type": i.ilk_type,
+        "registration_status": i.registration_status,
+        "tenant_id": i.tenant_id,
+        "display_name": i.display_name,
+    })
+}
+
+/// FAST io.cloud-LOCAL identity reads served straight from the local identity SHM (io.cloud
+/// co-resides with SY.identity on motherbee) — the io.api read pattern, NO mesh round-trip. They
+/// return the SHM subset (identity + tenant + status + name); the full `identification` PII lives
+/// behind the `get_ilk_details` relay.
+fn handle_shm_read(state: &Arc<RuntimeState>, msg: &Message, op: &str) -> Value {
+    use fluxbee_sdk::identity::{list_ilks_from_hive_id, tenant_exists_in_hive_id};
+    let params = msg.payload.get("params").cloned().unwrap_or_else(|| json!({}));
+    let hive = state.config.hive_id.as_str();
+    match op {
+        "get_ilk" => {
+            let ilk_id = match required_string(&params, "ilk_id") {
+                Ok(v) => v,
+                Err(e) => return e,
+            };
+            match list_ilks_from_hive_id(hive) {
+                Ok(snap) => {
+                    let found = snap.ilks.iter().find(|i| i.ilk_id == ilk_id);
+                    json!({
+                        "status": "ok",
+                        "op": "get_ilk",
+                        "result": { "exists": found.is_some(), "ilk": found.map(ilk_shm_subset) },
+                    })
+                }
+                Err(err) => cloud_error_code(
+                    "IDENTITY_SHM_UNAVAILABLE",
+                    &format!("identity SHM read failed: {err}"),
+                ),
+            }
+        }
+        "get_tenant" => {
+            let tenant_id = match required_string(&params, "tenant_id") {
+                Ok(v) => v,
+                Err(e) => return e,
+            };
+            let exists = tenant_exists_in_hive_id(hive, &tenant_id).unwrap_or(false);
+            let ilk_count = list_ilks_from_hive_id(hive)
+                .map(|snap| snap.ilks.iter().filter(|i| i.tenant_id == tenant_id).count())
+                .unwrap_or(0);
+            json!({
+                "status": "ok",
+                "op": "get_tenant",
+                "result": { "exists": exists, "tenant_id": tenant_id, "ilk_count": ilk_count },
+            })
+        }
+        "list_ilks" => {
+            let tenant_id = match required_string(&params, "tenant_id") {
+                Ok(v) => v,
+                Err(e) => return e,
+            };
+            match list_ilks_from_hive_id(hive) {
+                Ok(snap) => {
+                    let ilks: Vec<Value> = snap
+                        .ilks
+                        .iter()
+                        .filter(|i| i.tenant_id == tenant_id)
+                        .map(ilk_shm_subset)
+                        .collect();
+                    json!({
+                        "status": "ok",
+                        "op": "list_ilks",
+                        "result": { "tenant_id": tenant_id, "count": ilks.len(), "ilks": ilks },
+                    })
+                }
+                Err(err) => cloud_error_code(
+                    "IDENTITY_SHM_UNAVAILABLE",
+                    &format!("identity SHM read failed: {err}"),
+                ),
+            }
+        }
+        other => cloud_error_code("INVALID_REQUEST", &format!("no SHM handler for '{other}'")),
     }
 }
 
@@ -1404,6 +1503,7 @@ mod tests {
             "name": "acme",
             "key": "k", "value": {"t": "1"}, "resource_type": "bearer_token",
             "node_name": "IO.wapp@motherbee",
+            "ilk_id": "ilk:22222222-2222-4222-8222-222222222222",
         });
         for (op, expected_action) in CLOUD_OP_ACTIONS {
             let (action, _) = translate_cloud_op(op, Some(tenant), &params)
@@ -1538,6 +1638,21 @@ mod tests {
         assert_eq!(p["name"], "Acme");
         assert_eq!(p["status"], "active");
         assert_eq!(p["domain"], "acme.example");
+    }
+
+    #[test]
+    fn translate_get_ilk_details_relays_to_admin_get_ilk() {
+        let (action, p) = translate_cloud_op(
+            "get_ilk_details",
+            None,
+            &json!({"ilk_id": "ilk:22222222-2222-4222-8222-222222222222"}),
+        )
+        .unwrap();
+        assert_eq!(action, "get_ilk");
+        assert_eq!(p["ilk_id"], "ilk:22222222-2222-4222-8222-222222222222");
+        // Needs a canonical ilk:<uuid>.
+        assert!(translate_cloud_op("get_ilk_details", None, &json!({"ilk_id": "nope"})).is_err());
+        assert!(translate_cloud_op("get_ilk_details", None, &json!({})).is_err());
     }
 
     #[test]

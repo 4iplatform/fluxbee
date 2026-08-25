@@ -15209,7 +15209,7 @@ mod tests {
     #[test]
     fn cloud_actions_catalog_is_the_exposed_registry_subset() {
         let expected_surface: std::collections::HashSet<&str> =
-            ["create_tenant", "vault_put", "run_node"]
+            ["create_tenant", "vault_put", "run_node", "get_ilk"]
                 .into_iter()
                 .collect();
         let configured_surface: std::collections::HashSet<&str> =
