@@ -640,6 +640,66 @@ post '{"op":"list_cloud_actions","request_id":"55555555-…"}'
 
 ---
 
+## 4bis. Lectura de identidad (fase 2)
+
+🔵 código, **NUEVO (0.1.29), no re-ejecutado en vivo** (sin bearer). Dos velocidades: las **rápidas**
+(`get_ilk`, `get_tenant`, `list_ilks`) las resuelve IO.cloud **desde la memoria compartida (SHM) del
+hive, sin round-trip** — devuelven existencia + un **subset**; la **completa** (`get_ilk_details`) va
+por relay a `SY.admin` y trae **todo** (identification: phone/company/attributes + canales + tenant).
+
+> ⚠️ Igual que las escrituras: **el tenant es aseverado por el caller y no se chequea ownership**
+> (MVP). Un holder del bearer puede leer cualquier id que nombre.
+
+### 4.6 `get_ilk` — ¿existe el ilk? + subset (rápido, SHM)
+
+| campo | oblig. | |
+|---|---|---|
+| `params.ilk_id` | ✅ | `ilk:<uuid>` |
+
+```bash
+post '{"op":"get_ilk","request_id":"66666666-…","params":{"ilk_id":"ilk:a6c7d60d-…"}}'
+```
+```json
+{"status":"ok","op":"get_ilk","result":{
+  "exists":true,
+  "ilk":{"ilk_id":"ilk:a6c7d60d-…","ilk_type":"human","registration_status":"complete",
+         "tenant_id":"tnt:560fcb25-…","display_name":"Juan Perez"}}}
+```
+Si no existe: `result:{"exists":false,"ilk":null}`. Para phone/company/attributes/canales → `get_ilk_details`.
+
+### 4.7 `list_ilks` — los ilks de un tenant (rápido, SHM)
+
+| campo | oblig. | |
+|---|---|---|
+| `params.tenant_id` | ✅ | `tnt:<uuid>` |
+
+```json
+{"status":"ok","op":"list_ilks","result":{"tenant_id":"tnt:560fcb25-…","count":2,
+  "ilks":[{"ilk_id":"ilk:…","ilk_type":"human","registration_status":"complete","display_name":"…"}]}}
+```
+
+### 4.8 `get_tenant` — ¿existe el tenant? (rápido, SHM)
+
+| campo | oblig. | |
+|---|---|---|
+| `params.tenant_id` | ✅ | `tnt:<uuid>` |
+
+```json
+{"status":"ok","op":"get_tenant","result":{"exists":true,"tenant_id":"tnt:560fcb25-…","ilk_count":2}}
+```
+
+### 4.9 `get_ilk_details` — TODA la data del ilk (relay a admin)
+
+| campo | oblig. | |
+|---|---|---|
+| `params.ilk_id` | ✅ | `ilk:<uuid>` |
+
+Relay a `SY.admin get_ilk` → el registro completo desde la DB: `identification` (name/email/phone/
+company/attributes) + `channels` + el `tenant`. Más lento que `get_ilk` (lee la DB). La respuesta va
+en `result` con la forma que devuelve admin (`{ilk:{…, identification:{…}, channels:[…]}, tenant:{…}}`).
+
+---
+
 ## 5. Errores comunes y qué significan
 
 ### 5.1 De la puerta (SY.edge) — HTTP real, forma `{"ok":false,…}`
