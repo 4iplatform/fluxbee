@@ -90,7 +90,7 @@ stage_bin sy-frontdesk-gov "target/release/sy-frontdesk-gov"
 for pair in "${GO_BINS[@]}"; do
   stage_bin "${pair%%:*}" "${pair##*:}/$(basename "${pair##*:}")"
 done
-# Singletons (motherbee-only infra nodes, e.g. IO.blob/IO.cloud) install to /usr/bin ONLY
+# Singletons (motherbee-only infra nodes with a baked systemd unit; the list is EMPTY today) install to /usr/bin ONLY
 # (not dist/core/bin): they are not role-synced core components, so they must not enter the
 # core manifest the orchestrator ships to workers. Their systemd units are defined below.
 # Driven by packaging/base-nodes.json.

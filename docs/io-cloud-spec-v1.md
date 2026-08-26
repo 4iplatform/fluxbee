@@ -21,19 +21,19 @@ todavía, se marca explícito.
 ## 1. Rol y posición
 
 `IO.cloud` es **el representante interno de Fluxbee Cloud dentro de la malla**: un nodo IO que vive
-en **motherbee** (singleton), recibe lo que el edge le reenvía desde internet, y **provisiona recursos de backend**
+en **motherbee** (runtime managed motherbee-only), recibe lo que el edge le reenvía desde internet, y **provisiona recursos de backend**
 (tenant, ilk, secretos, spawn de nodos IO, externalize) en nombre de Cloud, hablándole a `SY.admin`.
 Cada nodo IO que provisiona (p.ej. `IO.wapp@<tenant>`) después **tiene su propia vida** — su propio
 adaptador, canal y seguridad.
 
-- Es un **singleton baked en el `.deb` core** (binario + `io-cloud.service` con `ExecCondition`
+- Es un **runtime MANAGED** publicado en el `.deb` core (boot=true; el orquestador lo instancia por `run_node`, configurado por CONFIG_SET/GET — ya no hay `io-cloud.service`
   gateado a `role: motherbee`), a diferencia de los adaptadores per-tenant (`io-api`/`io-slack`) que
   son runtime packages publicados y spawneados por instancia. (`docs/edge-ingress-spec-v6.md` §10)
 
 ### 1.1 El EDGE es la puerta, no la autoridad
 - Diseño invariante: **el edge es la única puerta de entrada**. Está en un hive `ingress`
   (red física separada), resuelve el **perímetro** (TLS, verificación del token/código, límites,
-  filtrado de headers). `IO.cloud` vive en **motherbee** —es un singleton con `ExecCondition` de rol, no un nodo instanciable en un worker— y **nunca sale directo a internet**.
+  filtrado de headers). `IO.cloud` vive en **motherbee** —runtime managed motherbee-only (self-check fail-closed), no un nodo instanciable en un worker— y **nunca sale directo a internet**.
 - El edge es un **firewall**, no una autoridad: autentica *que el caller es válido* y transporta,
   pero **no** decide *qué puede hacer* (no conoce tenants ni acciones). La **autorización por-tenant**
   vive downstream (`IO.cloud`/`SY.admin`). Esto **no implica tocar el edge** — ya está endurecido

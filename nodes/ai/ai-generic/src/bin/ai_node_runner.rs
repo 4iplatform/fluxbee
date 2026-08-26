@@ -3924,7 +3924,7 @@ impl FunctionTool for PublishHtmlTool {
         }
         // Publish via SY.admin over the mesh socket. Admin resolves THIS node's tenant from its
         // router-stamped identity (never asserted here), curates the bytes, and pushes the edge row.
-        // SY.admin + the io.blob curator are a motherbee singleton, so the target defaults to
+        // SY.admin + the io.blob curator are motherbee-local, so the target defaults to
         // SY.admin@motherbee (overridable via AI_ADMIN_TARGET) — NOT this node's own hive, which may
         // be a spoke with no admin/curator (mirrors io-api's admin_target default).
         let admin_target = std::env::var("AI_ADMIN_TARGET")

@@ -471,7 +471,7 @@ mod tests {
     #[test]
     fn config_control_denies_non_sy_origins_and_admits_orchestrator() {
         // Lock-in for the CONFIG_SET/CONFIG_GET origin-authz gate (the io.api revamp
-        // moved these into node_control_actions). Only the singleton motherbee Admin and
+        // moved these into node_control_actions). Only the motherbee Admin and
         // an SY.orchestrator may drive node config; any non-SY origin (a compromised or
         // rogue application node on the same VPN) MUST be denied at the delivery gate,
         // and the router remains the authority regardless of msg_type letter-case.

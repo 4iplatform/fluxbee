@@ -7315,7 +7315,7 @@ mod tests {
 
     #[test]
     fn io_blob_is_no_longer_an_allowlisted_hive_yaml_lifecycle_node() {
-        // IO.blob was promoted from a packaged singleton to a managed runtime, so it is no longer
+        // IO.blob was promoted from a packaged systemd unit to a managed runtime, so it is no longer
         // allowed in hive.yaml system_nodes — Identity rejects the hive config, same as io.cloud.
         let mut hive = test_hive(Some("SY.frontdesk.gov@motherbee"));
         hive.system_nodes

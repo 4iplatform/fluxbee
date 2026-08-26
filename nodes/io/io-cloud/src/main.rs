@@ -25,7 +25,7 @@
 //!
 //! Two decisions that separate io.cloud from io.api:
 //! - **Motherbee-only, fail-closed in the binary.** io.cloud used to be a packaged systemd
-//!   singleton gated by an `ExecCondition`; as a managed runtime that gate is gone, so the binary
+//!   unit gated by an `ExecCondition`; as a managed runtime that gate is gone, so the binary
 //!   itself refuses to start on a non-motherbee hive.
 //! - **Externalize is admin-driven.** io.cloud registers its own ICH at boot but does NOT
 //!   self-externalize — `publish_cloud_endpoint` owns opening the public door on `SY.edge`.
@@ -144,7 +144,7 @@ async fn main() -> Result<(), DynError> {
         }))
         .init();
 
-    // Motherbee-only backstop (fail-closed). io.cloud used to be a packaged systemd singleton gated
+    // Motherbee-only backstop (fail-closed). io.cloud used to be a packaged systemd unit gated
     // by an ExecCondition; as a managed runtime that gate is gone, so the binary refuses to run on
     // any other hive rather than trusting the deploy to place it correctly.
     if config.hive_id != MOTHERBEE_HIVE {
@@ -222,7 +222,7 @@ async fn main() -> Result<(), DynError> {
     // Boot self-externalize is intentionally GONE — publishing is now an admin action, not a boot
     // side effect. As an enabled boot node, io.cloud may come up before the mesh (SY.identity) is
     // ready, so the registration retries; if it can't land, exit non-zero so the orchestrator
-    // restarts us for a fresh attempt (a singleton with no ICH is useless anyway).
+    // restarts us for a fresh attempt (io.cloud with no ICH is useless anyway).
     let self_tenant =
         fluxbee_sdk::read_self_tenant_from_env().unwrap_or_else(|| DEFAULT_SELF_TENANT.to_string());
     let own_ich = match ensure_own_channel_with_retry(

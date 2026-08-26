@@ -38,7 +38,7 @@ Cada entrada de `base-nodes.json` declara su clase:
 
 | Clase | Qué es | Cómo arranca |
 |-------|--------|--------------|
-| **singleton** | nodo de infra motherbee-only (1 por hive), ej. `IO.blob`, `IO.cloud` | unit systemd horneada; corre al boot (`role_gate` restringe al rol) |
+| **singleton** | (clase vacia hoy) nodo de infra motherbee-only con unit systemd horneada — IO.blob/IO.cloud pasaron a runtime managed | — |
 | **runtime** | nodo instanciado, spawneable por-tenant vía `run_node` desde `dist/runtimes/<runtime>/<ver>` | si `boot: true`, `fluxbee-firstboot` auto-spawnea una instancia default al boot; si `false`, queda horneado y spawneable a demanda |
 
 ---
@@ -49,8 +49,8 @@ Definido en `packaging/base-nodes.json`:
 
 | Nodo | Clase | Al boot |
 |------|-------|---------|
-| IO.blob | singleton | corriendo |
-| IO.cloud | singleton (role: motherbee) | corriendo (degradado si no hay Fluxbee Cloud — la Cloud es otro repo) |
+| IO.blob | runtime (boot=true) | corriendo |
+| IO.cloud | runtime (boot=true, role: motherbee) | corriendo (degradado si no hay Fluxbee Cloud — la Cloud es otro repo) |
 | io.api | runtime | instancia default `IO.api@motherbee` corriendo + spawnable |
 | io.slack | runtime | instancia default `IO.slack.default@motherbee` corriendo + spawnable |
 | ai.generic | runtime | instancia default `AI.chat@motherbee` corriendo + spawnable |
@@ -194,7 +194,7 @@ sudo fluxbee-firstboot
 
 `fluxbee-firstboot` (idempotente): bootea PostgreSQL + crea rol/DBs, arranca el orchestrator,
 hace el `vault_put` del secreto de postgres (la **conexión a la DB queda resuelta sola en el
-vault**), reconecta los consumidores, arranca los singletons (IO.blob/IO.cloud), y **auto-spawnea
+vault**), reconecta los consumidores, auto-spawnea los runtimes managed de boot (IO.blob/IO.cloud), y **auto-spawnea
 las instancias default de los boot-runtimes** (io.api/io.slack/ai.generic). Al terminar
 imprime los **próximos pasos**.
 

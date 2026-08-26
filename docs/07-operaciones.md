@@ -24,7 +24,7 @@ ingress) son cajas Linux limpias (solo SSH) que la motherbee **empuja** ("vendor
    apt-get install  │  (único nodo instalado con el .deb)        │
    ./fluxbee.deb ──▶ │  PostgreSQL (Depends del paquete)          │
    sudo fluxbee-    │  SY.* core + SY.vault + SY.admin           │
-   firstboot        │  IO.cloud / IO.blob (singletons)           │
+   firstboot        │  IO.cloud / IO.blob (runtimes managed)           │
                     │  RT.gateway :9000 (WAN, mtls=required)     │
                     │  /var/lib/fluxbee/ssh/motherbee.key        │
                     └──────────────────────────────────────────┘
@@ -65,7 +65,7 @@ packaging/build-deb.sh 0.1.0
 `build-deb.sh` separa BUILD (aquí) de INSTALL (en el target). Compila el core Rust
 (`rt-gateway`, `sy-admin`, `sy-config-routes`, `sy-architect`, `sy-vault`, `sy-orchestrator`,
 `sy-storage`, `sy-identity`, `sy-cognition`, `sy-policy`, `sy-edge`), los binarios Go
-(`sy-opa-rules`, `sy-timer`, `sy-wf-rules`, `wf-generic`), `sy-frontdesk-gov`, los singletons
+(`sy-opa-rules`, `sy-timer`, `sy-wf-rules`, `wf-generic`), `sy-frontdesk-gov`, los runtimes managed
 `io-cloud`/`io-blob`, y siembra el runtime instanciado `io.api` bajo `dist/runtimes`. **Hornea los
 hashes del manifiesto `dist/core` en build-time** (evita el crash-loop de "manifest hash
 mismatch" que causaba una copia manual de binarios).
@@ -105,7 +105,7 @@ orchestrator arriba para recibirlo). Pasos (idempotente):
 4. **Reconecta los consumidores de DB** — reinicia `sy-vault` PRIMERO (arranca con el secreto ya
    persistido), luego `sy-storage`/`sy-identity` (cada uno hace *pull* del secreto del vault vivo
    al arrancar), y re-patea el orchestrator hasta que el hive quede ready.
-5. **Espera hive ready y arranca los singletons** `io-cloud`, `io-blob`.
+5. **Espera hive ready y auto-spawnea los runtimes managed de boot** `io-cloud`, `io-blob`.
 
 Variables de entorno del firstboot: `FLUXBEE_DB_USER`/`FLUXBEE_DB_PASSWORD` (default
 `fluxbee`/`fluxbee`), `FLUXBEE_ADMIN` (default `127.0.0.1:8080`).
@@ -314,7 +314,7 @@ para que el retry siga siendo key-first en vez de dejar el spoke a medio-hacer.
 sudo apt-get install ./fluxbee_<nueva-version>_amd64.deb
 ```
 
-- `prerm` para y deshabilita el orchestrator + singletons + todos los `sy-*` en orden inverso.
+- `prerm` para y deshabilita el orchestrator + todos los `sy-*` en orden inverso.
 - `postinst` instala binarios + units nuevos y, **como es upgrade** (dpkg pasa la versión previa),
   arranca de nuevo `sy-orchestrator`, `io-cloud`, `io-blob`.
 - Los units tienen `TimeoutStopSec=15`, así que un stop/restart/upgrade no cuelga 90 s hasta el
@@ -341,7 +341,7 @@ Categorías de update: `runtime`, `core`, `vendor`. El único contrato de update
 
 ### 6.3 Recuperación por reboot (sin re-firstboot)
 
-- **Motherbee:** el postinst deja `enabled` **solo** `sy-orchestrator` (+ los singletons
+- **Motherbee:** el postinst deja `enabled` **solo** `sy-orchestrator` (io-cloud/io-blob son runtimes managed que el orchestrator auto-spawnea al boot
   `io-cloud`/`io-blob`); al bootear, `sy-orchestrator` arranca solo y **levanta el resto del core**
   (`systemctl start`) en orden Model D'. El vault ya tiene el secreto de postgres persistido,
   storage/identity hacen pull. **No** hace falta re-correr `fluxbee-firstboot`.

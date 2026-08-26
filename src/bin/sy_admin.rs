@@ -5803,7 +5803,7 @@ fn authorize_channel_command(
 
 /// Relay gate for the Fluxbee Cloud provisioning actions (`IO_CLOUD_EXPOSED_ACTIONS`). These are
 /// reachable from the internet (Cloud -> edge -> IO.cloud -> here), so over the MESH they may ONLY
-/// originate from the singleton IO.cloud in this admin's hive — the internal relay. `caller==None`
+/// originate from IO.cloud in this admin's hive — the internal relay. `caller==None`
 /// is a trusted internal path (the operator HTTP server / the executor) and is allowed. Non-exposed actions are untouched. This
 /// closes the EDGE-06 confused-deputy for the relay: the SAME `IO_CLOUD_EXPOSED_ACTIONS` the
 /// `list_cloud_actions` capability query advertises is what this gate enforces (advertised ==
@@ -5860,7 +5860,7 @@ fn authorize_cloud_relay(
         return Ok(());
     };
     // The primary orchestrator persists per-spoke recovery SSH keys during add_hive
-    // (ssh_access=key_only_persist) via vault_put. It is a trusted system singleton on the
+    // (ssh_access=key_only_persist) via vault_put. It is a trusted system node on the
     // primary hive, co-resident with admin — allow it, but ONLY for vault_put (never the other
     // Fluxbee Cloud provisioning relay actions create_tenant / run_node).
     if action == "vault_put" && caller == format!("SY.orchestrator@{admin_hive}") {
@@ -15121,7 +15121,7 @@ mod tests {
         for action in IO_CLOUD_EXPOSED_ACTIONS {
             // Trusted internal path (caller==None: HTTP operator / executor) — allowed.
             assert!(authorize_cloud_relay(None, action, "motherbee").is_ok());
-            // Over the mesh, ONLY the singleton IO.cloud in the admin's hive may relay it.
+            // Over the mesh, ONLY IO.cloud in the admin's hive may relay it.
             assert!(authorize_cloud_relay(Some("IO.cloud@motherbee"), action, "motherbee").is_ok());
             assert!(authorize_cloud_relay(Some("IO.cloud@worker1"), action, "motherbee").is_err());
             // Any other mesh caller is denied — this is the EDGE-06 close for the relay.

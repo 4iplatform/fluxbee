@@ -282,7 +282,7 @@ sin bindings, pero Fases 2-4 no cumplen el modelo de seguridad de esta spec.
 
 ### 6.1 Rol y lifecycle
 
-Beta define `IO.web@motherbee` como singleton empaquetado, similar operacionalmente a `IO.blob` e
+Beta define `IO.web@motherbee` como runtime managed motherbee-only (boot=true), similar operacionalmente a `IO.blob` e
 `IO.cloud`, pero con un listener privado adicional.
 
 - binario: `/usr/bin/io-web`;

@@ -222,7 +222,7 @@ HTML+JS arbitrario sigue permitido dentro del sandbox; no obtiene APIs Fluxbee.
 
 ## 7. IO.blob worker
 
-`IO.blob` es singleton motherbee y no externaliza ICH. Config:
+`IO.blob` es un runtime managed motherbee-only y no externaliza ICH. Config:
 
 - `IO_BLOB_NODE_NAME` default `IO.blob`;
 - `IO_BLOB_ADMIN_HIVE` default hive local;
@@ -309,7 +309,7 @@ stream. HTML recibe la CSP fija de la seccion 6; ningun header viene del produce
 ## 11. Orden de implementacion
 
 1. **[IMPLEMENTADO LOCAL]** `IO.blob` curator worker: RPC admin-only, full SHA-256, atomic public copy,
-   ledger/refcount, unidad singleton y packaging.
+   ledger/refcount, y packaging como runtime managed.
 2. **[IMPLEMENTADO LOCAL]** `SY.admin publish_artifact/unpublish_artifact`: direct producer gate,
    Identity tenant resolve, command a IO.blob, durable publication ledger y help mesh-only en el
    catalogo Admin (fuera del executor HTTP).

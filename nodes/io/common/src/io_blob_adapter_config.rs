@@ -2,7 +2,7 @@
 //!
 //! # Por que existe
 //!
-//! io.blob era, como io.cloud, un singleton empaquetado que se configuraba por variables de entorno
+//! io.blob era, como io.cloud, un nodo systemd empaquetado que se configuraba por variables de entorno
 //! y no participaba del plano de control. La regla del operador es: **todo lo que se setea en un nodo
 //! va por CONFIG_SET/GET, y nada por ENV**. Esto es esa regla aplicada a io.blob, para que sea un
 //! ciudadano de primera como los demas nodos IO (io.api/io.slack/io.wapp).
