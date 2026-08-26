@@ -689,6 +689,24 @@ impl OrchestratorState {
         };
         lock.lock_owned().await
     }
+
+    /// Non-blocking variant of `lock_node`: returns the guard if the per-node
+    /// lifecycle lock is free, or `None` if another op holds it. The periodic
+    /// managed-runtime reconcile uses this so it never blocks self-heal of other
+    /// nodes on one an admin op is already managing — it retries that node next cycle.
+    fn try_lock_node(&self, node_name: &str) -> Option<tokio::sync::OwnedMutexGuard<()>> {
+        let lock = {
+            let mut registry = self
+                .node_lifecycle_locks
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            registry
+                .entry(node_name.to_string())
+                .or_insert_with(|| Arc::new(Mutex::new(())))
+                .clone()
+        };
+        lock.try_lock_owned().ok()
+    }
 }
 
 fn build_orchestrator_rpc_profile() -> Result<OperationalRouteProfile, RpcError> {
@@ -932,6 +950,14 @@ async fn main() -> Result<(), OrchestratorError> {
         tokio::spawn(async move {
             run_system_worker(state, client, system_rx).await;
         });
+    }
+    {
+        // Periodic managed-runtime liveness reconcile in its OWN task (see
+        // run_managed_runtime_reconcile_loop): respawns a dead IO./AI./WF. runtime within ~60s
+        // instead of only on the next orchestrator boot, without ever stalling the 5s watchdog.
+        // This is the fix for io.cloud being found dead in prod and never respawned.
+        let state = Arc::clone(&state);
+        tokio::spawn(run_managed_runtime_reconcile_loop(state));
     }
 
     let mut sigterm = signal(SignalKind::terminate())?;
@@ -1695,6 +1721,30 @@ async fn wait_for_storage_db_ready(
     }
 }
 
+/// Interval between periodic managed-runtime liveness reconciles. Managed runtimes
+/// (IO./AI./WF.) run as transient `systemd-run` units with `Restart=always`, but if one
+/// exhausts systemd's start limit or its unit is otherwise collected, only this loop
+/// re-creates it: the boot-time reconcile has already run and the 5s watchdog merely LOGS
+/// managed runtimes as disconnected (it restarts SY.*/rt-gateway). io.cloud was found dead
+/// in production for exactly this reason. Runs in its OWN task — NOT the 5s watchdog critical
+/// path — so a slow systemctl on a wedged unit never stalls rt-gateway/SY.* self-heal; and
+/// reconcile uses try_lock per node so a held admin lock never blocks it.
+const MANAGED_RECONCILE_INTERVAL_SECS: u64 = 60;
+
+async fn run_managed_runtime_reconcile_loop(state: Arc<OrchestratorState>) {
+    let mut ticker = time::interval(Duration::from_secs(MANAGED_RECONCILE_INTERVAL_SECS));
+    ticker.set_missed_tick_behavior(time::MissedTickBehavior::Delay);
+    // Consume the immediate first tick: the boot-time reconcile already covered t=0, and
+    // firing again seconds later could bounce a node still exec'ing from boot.
+    ticker.tick().await;
+    loop {
+        ticker.tick().await;
+        if let Err(err) = reconcile_persisted_custom_nodes(&state).await {
+            tracing::warn!(error = %err, "managed-runtime liveness reconcile failed");
+        }
+    }
+}
+
 async fn reconcile_persisted_custom_nodes(
     state: &OrchestratorState,
 ) -> Result<(), OrchestratorError> {
@@ -1718,6 +1768,15 @@ async fn reconcile_persisted_custom_nodes(
 
     for node in nodes {
         let unit = unit_from_node_name(&node.node_name);
+        // SO-04: hold the per-node lifecycle lock across this node's liveness check AND its
+        // respawn — exactly like run/kill/restart/remove/config_set — so a reconcile never races
+        // a concurrent admin op on the same node (identity/config/systemd drift). try_lock, NOT
+        // block: if an admin op holds this node's lock it is already managing it, so skip and
+        // retry next cycle rather than stalling the reconcile of every OTHER node behind it.
+        let Some(_node_guard) = state.try_lock_node(&node.node_name) else {
+            skipped = skipped.saturating_add(1);
+            continue;
+        };
         let unit_active = systemd_unit_is_active(&unit).unwrap_or(false);
         let visible_in_router = local_inventory_has_node(state, &node.node_name);
         if unit_active || visible_in_router {
@@ -1911,7 +1970,7 @@ async fn reconcile_persisted_custom_nodes(
                     relaunch_on_boot = node.relaunch_on_boot,
                     config_path = %node.config_path.display(),
                     unit = unit,
-                    "persisted custom node relaunched during bootstrap reconcile"
+                    "persisted custom node relaunched during reconcile"
                 );
             }
             Err(err) => {
@@ -1922,7 +1981,7 @@ async fn reconcile_persisted_custom_nodes(
                     runtime_version = version,
                     unit = unit,
                     error = %err,
-                    "failed to relaunch persisted custom node during bootstrap reconcile"
+                    "failed to relaunch persisted custom node during reconcile"
                 );
             }
         }
@@ -1998,7 +2057,7 @@ async fn wait_for_lifecycle_nodes(
 ) -> Result<(), OrchestratorError> {
     // Only router-connected nodes are visible in router SHM. The declarative
     // lifecycle includes SY authorities plus explicitly allowlisted packaged
-    // workers such as the motherbee IO.blob singleton.
+    // workers such as the motherbee IO.blob managed runtime.
     let required: Vec<String> = state
         .system_nodes
         .wait_for
@@ -9983,17 +10042,6 @@ fn node_kind_from_name(name: &str) -> String {
 
 fn managed_spawn_disallowed_reason(node_name: &str) -> Option<&'static str> {
     let local = node_name.split('@').next().unwrap_or(node_name).trim();
-    // Guard de doble-dueño para singletons empaquetados: un nodo con unit propia de systemd no puede
-    // ser adoptado ademas como instancia gestionada (serian dos duenos del mismo proceso, dos L2 con
-    // el mismo nombre, y un CONFIG_SET caeria en uno u otro sin determinismo). El mecanismo se
-    // conserva, pero `PACKAGED_SINGLETON_NODES` quedo VACIO: io.blob e io.cloud —los ultimos
-    // singletons— pasaron a runtimes managed, asi que hoy este branch nunca se toma (no hay ninguna
-    // unit que pueda competir). Queda listo por si algun dia vuelve a existir un singleton.
-    if fluxbee_sdk::is_packaged_singleton(local) {
-        return Some(
-            "managed spawn does not support packaged singletons; systemd owns their lifecycle",
-        );
-    }
     let kind = node_kind_from_name(node_name);
     match kind.as_str() {
         "SY" => Some("managed spawn does not support SY.* nodes"),
@@ -16440,7 +16488,7 @@ fn take_test_ilk_delete_result() -> Option<serde_json::Value> {
         .take()
 }
 
-/// Routes vault list+delete through the singleton primary Admin to purge every
+/// Routes vault list+delete through the primary Admin to purge every
 /// secret whose metadata is dedicated to `ilk_id`. List is open in vault, but
 /// delete requires admin-class privileges (the doomed ILK no longer exists at
 /// teardown time and cannot self-delete), so this helper consistently uses the
@@ -24768,7 +24816,7 @@ mod tests {
     #[test]
     fn io_runtimes_are_never_hive_yaml_lifecycle_nodes() {
         // Neither IO.blob nor IO.cloud may appear in hive.yaml system_nodes on ANY role: they are
-        // managed runtimes, not lifecycle authorities (the old singleton allowlist is now empty).
+        // managed runtimes, not lifecycle authorities.
         let blob_mb = RoleSystemNodes {
             nodes: vec!["SY.config.routes".to_string(), "IO.blob".to_string()],
             wait_for: vec![],
@@ -25837,14 +25885,13 @@ blob:
         );
     }
 
-    /// IO.blob e IO.cloud fueron promovidos de singletons empaquetados a runtimes MANAGED.
+    /// IO.blob e IO.cloud son runtimes MANAGED, sin unit propia de systemd.
     ///
     /// Ya no tienen unit propia de systemd: el orquestador es su unico dueño (los instancia por
     /// `run_node` y los relanza en `reconcile`), y se configuran por CONFIG_SET/GET. Por eso el
     /// barrido de adopcion TIENE que relanzarlos — es su unico camino de arranque, como cualquier
-    /// runtime. El guard de doble-dueño (`managed_spawn_disallowed_reason` +
-    /// `PACKAGED_SINGLETON_NODES`) sigue existiendo, pero su lista quedo vacia: ya no hay ninguna
-    /// unit de systemd que pueda competir por el proceso.
+    /// runtime. El guard de doble-dueño (`managed_spawn_disallowed_reason`) bloquea SY.* y
+    /// RT.gateway; ningun runtime managed tiene unit de systemd que compita por el proceso.
     #[test]
     fn io_blob_y_io_cloud_ahora_se_adoptan_como_runtimes_gestionados() {
         for nombre in [

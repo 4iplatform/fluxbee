@@ -42,29 +42,11 @@ pub fn managed_node_instance_dir_with_root(
     Ok(root.into().join(kind).join(node_name))
 }
 
-/// Singletons que arranca el PAQUETE con su propia unit de systemd.
-///
-/// **VACÍO a proposito.** `IO.blob` e `IO.cloud` — los ultimos dos singletons — fueron promovidos a
-/// runtimes MANAGED (`base-nodes.json` runtimes[], boot=true): el orquestador los instancia por
-/// `run_node` y los relanza en `reconcile`, y se configuran por CONFIG_SET/GET en vez de ENV, como
-/// todos los nodos IO. Ya no hay ningun nodo cuyo ciclo de vida sea de systemd en vez del
-/// orquestador, asi que el barrido de adopcion los adopta sin peligro de doble-dueno: no queda unit
-/// de systemd que compita por el proceso.
-///
-/// Se conserva el mecanismo (`is_packaged_singleton` + el gate de adopcion) por si en el futuro
-/// volviera a existir un singleton empaquetado.
-pub const PACKAGED_SINGLETON_NODES: &[&str] = &[];
-
 /// Los unicos nodos NO-`SY.*` que `hive.yaml` acepta en su lista de nodos de ciclo de vida.
 ///
 /// **VACÍO a proposito.** Los runtimes managed (io.api, io.blob, io.cloud, io.slack, ...) NO se
 /// declaran en `hive.yaml` `system_nodes`: nacen por `run_node` y el orquestador los reconcilia.
 pub const HIVE_YAML_NON_SY_LIFECYCLE_NODES: &[&str] = &[];
-
-/// True cuando el nombre L2 (con o sin `@hive`) es un singleton empaquetado.
-pub fn is_packaged_singleton(node_name: &str) -> bool {
-    node_matches(node_name, PACKAGED_SINGLETON_NODES)
-}
 
 /// True cuando `hive.yaml` puede listarlo como nodo de ciclo de vida sin ser `SY.*`.
 pub fn is_allowed_non_sy_lifecycle_node(node_name: &str) -> bool {
