@@ -1010,10 +1010,23 @@ impl RouterDispatcher {
                         }
                     }
                 }
-                RouteMatch::AnyMsgOfType(msg_type) => {
-                    if !self.post_pending_declares_observational_family(msg_type) {
-                        registry.insert(rule.clone());
-                    }
+                RouteMatch::AnyMsgOfType(_) => {
+                    // NEVER registered — same reason as the `Any` skip below, scoped to a
+                    // family: registering an entire msg_type family as "never a command"
+                    // permanently poisons any node whose OWN inbound commands live in that
+                    // family. io.cloud awaits the frontdesk verdict with
+                    // `any_msg_type(USER_KIND)` (the verdict is a `user` frame with NO msg
+                    // name, so no narrower matcher exists) while ALL its Cloud requests also
+                    // arrive as `user` frames through its `Any -> Command` catch-all: one
+                    // register_human then silently dropped EVERY subsequent edge request
+                    // until restart (prod outage 2026-08-26; io.api's handoff path carried
+                    // the identical bomb). Late family-wide replies stay covered by the
+                    // trace-keyed pending map and the recent-stale table; only EXACT response
+                    // shapes — which cannot collide with a whole family of commands — earn a
+                    // permanent registry entry.
+                    tracing::debug!(
+                        "rpc response-only registry skipped AnyMsgOfType success matcher to avoid family-wide drops"
+                    );
                 }
                 RouteMatch::Any => {
                     tracing::debug!(
@@ -1051,18 +1064,6 @@ impl RouterDispatcher {
                     RouteMatch::AnyMsgOfType(rule_type) => rule_type == msg_type,
                     RouteMatch::Any => false,
                 }
-            })
-    }
-
-    /// AF-P2b: same as `post_pending_declares_observational_exact` but for
-    /// `AnyMsgOfType` matchers. Only exempts if the target is broadcast.
-    fn post_pending_declares_observational_family(&self, msg_type: &str) -> bool {
-        self.profile
-            .post_pending_rules
-            .iter()
-            .any(|(rule, target)| {
-                matches!(rule, RouteMatch::AnyMsgOfType(rule_type) if rule_type == msg_type)
-                    && matches!(target, RouteTarget::Broadcast(_))
             })
     }
 
@@ -2238,26 +2239,32 @@ mod tests {
         assert!(sys_rx.try_recv().is_none());
     }
 
+    /// Regression for the io.cloud edge-poisoning outage (2026-08-26): a
+    /// family-wide (`AnyMsgOfType`) success matcher must NEVER land in the
+    /// response-only registry. io.cloud awaits the frontdesk verdict with
+    /// `any_msg_type("user")` while ALL its Cloud requests also arrive as
+    /// `user` frames through its `Any -> Command` catch-all — registering the
+    /// family silently dropped every subsequent edge request until restart.
+    /// After the fix, a fresh-trace `user` frame injected AFTER such an RPC
+    /// still reaches the command channel.
     #[tokio::test]
-    async fn response_only_wildcard_success_shape_dropped_before_post_rules() {
+    async fn family_wide_success_matcher_never_poisons_command_traffic() {
+        // io.cloud's exact profile shape: one catch-all command channel.
         let profile = OperationalRouteProfile::builder()
-            .command_channel("catch_all")
-            .post_pending_rule(RouteMatch::Any, RouteTarget::Command("catch_all"))
+            .command_channel("incoming")
+            .post_pending_rule(RouteMatch::Any, RouteTarget::Command("incoming"))
             .build()
             .unwrap();
-        let (client, mut harness) = RouterDispatcherTestHarness::new("SY.test@hive", profile);
-        let mut cmd_rx = client.take_command_receiver("catch_all").await.unwrap();
-        let matcher = PendingMatcher::new(
-            vec![RouteMatch::any_msg_type("command_response")],
-            vec![],
-            vec![],
-        );
+        let (client, mut harness) = RouterDispatcherTestHarness::new("IO.cloud@hive", profile);
+        let mut cmd_rx = client.take_command_receiver("incoming").await.unwrap();
+        // io.cloud's frontdesk_reply_matcher shape: success = whole user family.
+        let matcher = PendingMatcher::new(vec![RouteMatch::any_msg_type("user")], vec![], vec![]);
         let c = Arc::clone(&client);
         let waiter = tokio::spawn(async move {
             c.send_with_matcher(
-                make_outgoing("command", "DO_WORK"),
+                make_outgoing("user", "FRONTDESK_HANDOFF"),
                 matcher,
-                RpcRequestLabels::new("SY.target@hive", "DO_WORK", "command_response"),
+                RpcRequestLabels::new("SY.frontdesk.gov@hive", "FRONTDESK_HANDOFF", "FRONTDESK_REPLY"),
                 Duration::from_millis(50),
             )
             .await
@@ -2266,20 +2273,25 @@ mod tests {
         let err = waiter.await.unwrap().unwrap_err();
         assert!(matches!(err, RpcError::Timeout { .. }));
 
+        // A brand-new edge-forwarded Cloud request: user family, fresh trace.
         harness
-            .inject(make_loose(
-                "unrelated-trace",
-                "command_response",
-                "ANY_RESPONSE_NAME",
-                json!({}),
-            ))
+            .inject(make_loose("fresh-edge-trace", "user", "user", json!({})))
             .await
             .unwrap();
-        sleep(Duration::from_millis(50)).await;
-        assert_eq!(client.metric_unknown_responses(), 1);
-        assert!(cmd_rx.try_recv().is_none());
+        let routed = time::timeout(Duration::from_secs(1), cmd_rx.recv())
+            .await
+            .expect("edge request must not be silently dropped")
+            .expect("command channel open");
+        assert_eq!(routed.routing.trace_id, "fresh-edge-trace");
+        assert_eq!(client.metric_unknown_responses(), 0);
     }
 
+    /// NOTE post-2026-08-26: family (`AnyMsgOfType`) success shapes are now NEVER
+    /// registered response-only (see the AnyMsgOfType arm in `register_response_only`
+    /// — the io.cloud edge-poisoning fix), so this passes regardless of the Broadcast
+    /// rule. Kept as a behavioral regression test: an observational family reply must
+    /// keep fanning out to its subscribers. Re-introducing conditional family
+    /// registration is guarded by `family_wide_success_matcher_never_poisons_command_traffic`.
     #[tokio::test]
     async fn response_only_skips_profile_declared_observational_family() {
         let profile = OperationalRouteProfile::builder()
