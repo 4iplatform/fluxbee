@@ -16,6 +16,7 @@
 
 | Versión | Fecha (ART) | Commit | Alcance | Estado | Rollback |
 |---|---|---|---|---|---|
+| **0.1.32** | 2026-08-27 | `90fd64a` | motherbee | ✅ live | `apt install fluxbee=0.1.31` |
 | **0.1.31** | 2026-08-26 | `862c5e4` | motherbee | ✅ live | snap `pre-rpc-poison-fix-0-1-31` · `apt install fluxbee=0.1.30` |
 | **0.1.30** | 2026-08-26 | `af1166a` | motherbee | ✅ live | snap `pre-liveness-fix-0-1-30` · `apt install fluxbee=0.1.29` |
 | **0.1.29** | 2026-08-25 | `a0bc25d` | motherbee | ✅ live | snap `pre-cloud-readpath-0-1-29` · `apt install fluxbee=0.1.28` |
@@ -35,6 +36,32 @@
 > (`dpkg-scanpackages -m`) para rollback, pero su detalle vive en la bitácora, no acá.
 
 ---
+
+## 0.1.32 — io.cloud: selector por EMAIL en get_ilk / get_ilk_details
+
+- **Fecha:** 2026-08-27 (ART) · **Versión anterior:** 0.1.31 · **Commit:** `90fd64a` (branch `daily_onworking_coa`)
+- **Alcance:** **motherbee** (VM100). Toca `io.cloud` + `fluxbee_sdk` (identity readers + catálogo cloud) + docs.
+- **Qué cambió:** el Cloud tiene el email del humano (login Google) pero no el `ilk_id`; ambos reads aceptan
+  `params.email` + `params.tenant_id` como selector alternativo a `params.ilk_id` (exactly-one, en ambos ops).
+  El email ES la dirección del canal `cloud` del ilk (register_human lo provisiona así) → el `get_ilk` local
+  resuelve con un probe O(1) del índice SHM `(canal, dirección, tenant)` — patrón io.api inbound; más barato que
+  el propio path por id (O(n)). `get_ilk_details` pre-resuelve email→ilk_id local y relaya el `get_ilk` de admin
+  sin cambios (admin/identity no ganan selector email; `ILK_NOT_FOUND` sin tocar admin si no matchea).
+  `tenant_id` OBLIGATORIO con email (unicidad por `(canal, dirección, tenant)` — el mismo email puede ser dos
+  ilks en dos empresas) y validado canónico `tnt:<uuid>` fail-loud. SDK: variantes
+  `resolve_identity_option_*_strict` (SHM ilegible = `Err`, nunca miss silencioso — el laundering F-09 es para
+  el degrade de io.api, no para un read API autoritativo).
+- **Review adversarial (2 lentes) pre-ship:** ambos MEDIUM corregidos ANTES del deploy (semántica strict de SHM;
+  exactly-one en el op con PII); oráculo cross-tenant descartado (el tenant integra la key del índice); el LOW de
+  request_id era falso positivo (el wrapper del run_loop lo inyecta). Tests: SDK 6/6+6/6, io-cloud 9/9, admin 3/3.
+- **Build:** fb-build (VM110), `build-deb.sh 0.1.32` → 245 MB · publish repo :8900 (32 paquetes).
+- **Deploy:** reboot (qga caído, patrón conocido) → `apt install fluxbee=0.1.32` → el restart manual de io.cloud
+  llegó antes de que el unit existiera, y **el liveness-reconcile de 0.1.30 lo respawneó solo con el binario
+  nuevo** (~60s) — el fix anterior auto-desplegó este feature.
+- **Verificación E2E (10/10 desde internet):** hit por email (`exists:true` + subset), case-insensitive, miss,
+  tenant equivocado → `exists:false` (aislamiento), exactly-one en ambos ops, email-sin-tenant error claro,
+  details por email → ficha completa, `ILK_NOT_FOUND` con request_id, y regresión por `ilk_id` OK.
+- **Rollback:** `apt install fluxbee=0.1.31` (feature aditivo; el selector por id no cambió).
 
 ## 0.1.31 — SDK/rpc: fix del veneno del edge (response_only familia-completa) — el bug real de crearPersona
 
