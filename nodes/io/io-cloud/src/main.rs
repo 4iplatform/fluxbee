@@ -376,7 +376,15 @@ async fn run_loop(
             // decision comes from the declared SDK set, not a magic string. Everything else is the
             // bounded SY.admin relay (dispatch_cloud_op, which also errors on an unknown op).
             Ok(()) if is_cloud_local_op(&op) => handle_local_cloud_op(sender, state, &msg, &op).await,
-            Ok(()) => dispatch_cloud_op(&state.dispatcher, &state.config.admin_target, &msg.payload).await,
+            Ok(()) => {
+                dispatch_cloud_op(
+                    &state.dispatcher,
+                    &state.config.admin_target,
+                    &state.config.hive_id,
+                    &msg.payload,
+                )
+                .await
+            }
             Err(detail) => {
                 tracing::warn!(
                     trace_id = %msg.routing.trace_id,
@@ -808,6 +816,16 @@ fn required_string(params: &serde_json::Value, field: &str) -> Result<String, se
         .ok_or_else(|| cloud_error(&format!("missing or invalid params.{field}")))
 }
 
+/// `params.{field}` as a trimmed non-empty string, or `None` (absent/empty/not-a-string).
+fn optional_trimmed(params: &serde_json::Value, field: &str) -> Option<String> {
+    params
+        .get(field)
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+}
+
 fn require_tenant_id(tenant_id: Option<&str>, op: &str) -> Result<String, serde_json::Value> {
     let tenant_id = tenant_id
         .map(str::trim)
@@ -956,8 +974,18 @@ fn translate_cloud_op(
         "get_ilk_details" => {
             // FULL identity read — relayed to SY.admin's `get_ilk` (reads the DB record: all
             // identification PII + channels + tenant). The FAST existence/subset read is the LOCAL
-            // `get_ilk` (SHM); this is the "give me everything" path.
-            let ilk_id = required_string(params, "ilk_id")?;
+            // `get_ilk` (SHM); this is the "give me everything" path. An email selector is
+            // accepted too: `dispatch_cloud_op` pre-resolves email -> ilk_id from the SHM BEFORE
+            // this translation runs, so by the time we get here a valid request always carries
+            // ilk_id (translation stays pure; admin/identity need no email selector).
+            let ilk_id = match required_string(params, "ilk_id") {
+                Ok(v) => v,
+                Err(_) => {
+                    return Err(cloud_error(
+                        "get_ilk_details requires params.ilk_id (ilk:<uuid>) or params.email + params.tenant_id",
+                    ))
+                }
+            };
             if !ilk_id.starts_with("ilk:") {
                 return Err(cloud_error(
                     "get_ilk_details requires params.ilk_id as a canonical ilk:<uuid>",
@@ -984,11 +1012,64 @@ fn translate_cloud_op(
 async fn dispatch_cloud_op(
     dispatcher: &Arc<RouterDispatcher>,
     admin_target: &str,
+    hive_id: &str,
     request: &serde_json::Value,
 ) -> serde_json::Value {
     let op = request.get("op").and_then(|v| v.as_str()).unwrap_or("");
     let tenant_id = request.get("tenant_id").and_then(|v| v.as_str());
-    let params = request.get("params").cloned().unwrap_or_else(|| json!({}));
+    let mut params = request.get("params").cloned().unwrap_or_else(|| json!({}));
+
+    // get_ilk_details accepts an email selector: pre-resolve email -> canonical ilk_id from the
+    // local identity SHM (O(1) probe of the (cloud, email, tenant) index — the same resolve the
+    // LOCAL `get_ilk` email path uses), then relay by ilk_id exactly as before. Admin/identity
+    // never learn about the email selector; the translation below stays pure.
+    if op == "get_ilk_details" {
+        // Exactly-one selector, mirroring the local get_ilk arm: both present is ambiguous
+        // (a stale ilk_id next to a fresh email would silently win) — fail loud instead.
+        if optional_trimmed(&params, "ilk_id").is_some() && optional_trimmed(&params, "email").is_some() {
+            return cloud_error(
+                "get_ilk_details requires exactly one of params.ilk_id (ilk:<uuid>) or params.email (+ params.tenant_id)",
+            );
+        }
+        if let Some(email) = optional_trimmed(&params, "email") {
+            // Canonical-format check (see the local get_ilk email arm): fail loud on a
+            // malformed tenant instead of a silent hash-miss.
+            let tenant = match require_tenant_id(
+                optional_trimmed(&params, "tenant_id").as_deref(),
+                "get_ilk_details by email",
+            ) {
+                Ok(v) => v,
+                Err(e) => return e,
+            };
+            if !email.contains('@') || email.len() < 3 {
+                return cloud_error("params.email must be a valid email address");
+            }
+            match fluxbee_sdk::identity::resolve_identity_option_from_hive_id_strict(
+                hive_id,
+                CLOUD_CHANNEL_TYPE,
+                &email,
+                &tenant,
+            ) {
+                Ok(Some(resolved)) => {
+                    params["ilk_id"] = json!(resolved.ilk.ilk_id);
+                }
+                Ok(None) => {
+                    return json!({
+                        "status": "error",
+                        "op": op,
+                        "error_code": "ILK_NOT_FOUND",
+                        "error_detail": "no ilk with a cloud channel for that email in that tenant",
+                    })
+                }
+                Err(err) => {
+                    return cloud_error_code(
+                        "IDENTITY_SHM_UNAVAILABLE",
+                        &format!("identity SHM read failed: {err}"),
+                    )
+                }
+            }
+        }
+    }
     let request_id = request
         .get("request_id")
         .and_then(|value| value.as_str())
@@ -1078,22 +1159,66 @@ fn handle_shm_read(state: &Arc<RuntimeState>, msg: &Message, op: &str) -> Value 
     let hive = state.config.hive_id.as_str();
     match op {
         "get_ilk" => {
-            let ilk_id = match required_string(&params, "ilk_id") {
-                Ok(v) => v,
-                Err(e) => return e,
-            };
-            match list_ilks_from_hive_id(hive) {
-                Ok(snap) => {
-                    let found = snap.ilks.iter().find(|i| i.ilk_id == ilk_id);
-                    json!({
-                        "status": "ok",
-                        "op": "get_ilk",
-                        "result": { "exists": found.is_some(), "ilk": found.map(ilk_shm_subset) },
-                    })
+            // Two selectors, exactly one: params.ilk_id (canonical id), or params.email +
+            // params.tenant_id. The email IS the address of the ilk's `cloud` channel
+            // (register_human provisions it that way), so the email path is an O(1) probe of the
+            // SHM (channel_type, address, tenant) hash index — the io.api inbound-resolve pattern.
+            // tenant_id is REQUIRED for email: the same email can exist as different ilks in two
+            // tenants (identity uniqueness is per (channel, address, tenant), never global).
+            let ilk_id = optional_trimmed(&params, "ilk_id");
+            let email = optional_trimmed(&params, "email");
+            match (ilk_id, email) {
+                (Some(ilk_id), None) => match list_ilks_from_hive_id(hive) {
+                    Ok(snap) => {
+                        let found = snap.ilks.iter().find(|i| i.ilk_id == ilk_id);
+                        json!({
+                            "status": "ok",
+                            "op": "get_ilk",
+                            "result": { "exists": found.is_some(), "ilk": found.map(ilk_shm_subset) },
+                        })
+                    }
+                    Err(err) => cloud_error_code(
+                        "IDENTITY_SHM_UNAVAILABLE",
+                        &format!("identity SHM read failed: {err}"),
+                    ),
+                },
+                (None, Some(email)) => {
+                    // Canonical-format check (not just non-empty): a typo'd tenant would
+                    // silently hash-miss and report exists:false — fail loud instead.
+                    let tenant_id = match require_tenant_id(
+                        optional_trimmed(&params, "tenant_id").as_deref(),
+                        "get_ilk by email",
+                    ) {
+                        Ok(v) => v,
+                        Err(e) => return e,
+                    };
+                    if !email.contains('@') || email.len() < 3 {
+                        return cloud_error("params.email must be a valid email address");
+                    }
+                    // The resolver trims + lowercases internally — same normalization the
+                    // provision path applied when the channel was written.
+                    match fluxbee_sdk::identity::resolve_identity_option_from_hive_id_strict(
+                        hive,
+                        CLOUD_CHANNEL_TYPE,
+                        &email,
+                        &tenant_id,
+                    ) {
+                        Ok(resolved) => json!({
+                            "status": "ok",
+                            "op": "get_ilk",
+                            "result": {
+                                "exists": resolved.is_some(),
+                                "ilk": resolved.map(|r| ilk_shm_subset(&r.ilk)),
+                            },
+                        }),
+                        Err(err) => cloud_error_code(
+                            "IDENTITY_SHM_UNAVAILABLE",
+                            &format!("identity SHM read failed: {err}"),
+                        ),
+                    }
                 }
-                Err(err) => cloud_error_code(
-                    "IDENTITY_SHM_UNAVAILABLE",
-                    &format!("identity SHM read failed: {err}"),
+                _ => cloud_error(
+                    "get_ilk requires exactly one of params.ilk_id (ilk:<uuid>) or params.email (+ params.tenant_id)",
                 ),
             }
         }

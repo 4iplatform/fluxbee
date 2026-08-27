@@ -491,11 +491,38 @@ pub fn resolve_ilk_from_hive_config(
 
 /// Resolve the full identity option from identity SHM by `(channel_type, address, tenant_id)`.
 /// Returns the matched ICH plus canonical ILK metadata when found.
+///
+/// LENIENT permission semantics (F-09): a present-but-unreadable SHM (EACCES/EPERM misinstall)
+/// degrades to `Ok(None)` — built for io.api's inbound path, where a miss falls through to
+/// provisioning. An AUTHORITATIVE read API must NOT report "does not exist" for a permission
+/// fault: use the `_strict` variant, which surfaces those errors as `Err`.
 pub fn resolve_identity_option_from_shm_name(
     identity_shm_name: &str,
     channel_type: &str,
     address: &str,
     tenant_id: &str,
+) -> Result<Option<ResolvedIdentityOption>, IdentityShmError> {
+    resolve_identity_option_from_shm_name_impl(identity_shm_name, channel_type, address, tenant_id, true)
+}
+
+/// [`resolve_identity_option_from_shm_name`] with STRICT permission semantics: an unreadable
+/// SHM is an `Err`, never a silent miss. For authoritative read APIs (io.cloud's Cloud
+/// `get_ilk`-by-email) where `Ok(None)` means "this identity genuinely does not exist".
+pub fn resolve_identity_option_from_shm_name_strict(
+    identity_shm_name: &str,
+    channel_type: &str,
+    address: &str,
+    tenant_id: &str,
+) -> Result<Option<ResolvedIdentityOption>, IdentityShmError> {
+    resolve_identity_option_from_shm_name_impl(identity_shm_name, channel_type, address, tenant_id, false)
+}
+
+fn resolve_identity_option_from_shm_name_impl(
+    identity_shm_name: &str,
+    channel_type: &str,
+    address: &str,
+    tenant_id: &str,
+    lenient_permissions: bool,
 ) -> Result<Option<ResolvedIdentityOption>, IdentityShmError> {
     let normalized_channel = channel_type.trim().to_ascii_lowercase();
     let normalized_address = address.trim().to_ascii_lowercase();
@@ -505,7 +532,9 @@ pub fn resolve_identity_option_from_shm_name(
     }
     let reader = match open_identity_shm_reader(identity_shm_name) {
         Ok(reader) => reader,
-        Err(err) if is_permission_lookup_unavailable(&err) => return Ok(None),
+        Err(err) if lenient_permissions && is_permission_lookup_unavailable(&err) => {
+            return Ok(None)
+        }
         Err(err) => return Err(err),
     };
     let resolved = match reader.resolve_identity_option(
@@ -514,14 +543,17 @@ pub fn resolve_identity_option_from_shm_name(
         &normalized_tenant,
     ) {
         Ok(value) => value,
-        Err(err) if is_permission_lookup_unavailable(&err) => return Ok(None),
+        Err(err) if lenient_permissions && is_permission_lookup_unavailable(&err) => {
+            return Ok(None)
+        }
         Err(err) => return Err(err),
     };
     Ok(resolved)
 }
 
 /// Resolve the full identity option via explicit hive id (`/jsr-identity-<hive_id>`)
-/// using tenant-aware ICH lookup.
+/// using tenant-aware ICH lookup. Lenient permission semantics — see
+/// [`resolve_identity_option_from_shm_name`]; authoritative readers use the `_strict` variant.
 pub fn resolve_identity_option_from_hive_id(
     hive_id: &str,
     channel_type: &str,
@@ -530,6 +562,18 @@ pub fn resolve_identity_option_from_hive_id(
 ) -> Result<Option<ResolvedIdentityOption>, IdentityShmError> {
     let shm_name = identity_shm_name_for_hive(hive_id)?;
     resolve_identity_option_from_shm_name(&shm_name, channel_type, address, tenant_id)
+}
+
+/// [`resolve_identity_option_from_hive_id`] with STRICT permission semantics (unreadable SHM
+/// = `Err`, never a silent miss). For authoritative read APIs.
+pub fn resolve_identity_option_from_hive_id_strict(
+    hive_id: &str,
+    channel_type: &str,
+    address: &str,
+    tenant_id: &str,
+) -> Result<Option<ResolvedIdentityOption>, IdentityShmError> {
+    let shm_name = identity_shm_name_for_hive(hive_id)?;
+    resolve_identity_option_from_shm_name_strict(&shm_name, channel_type, address, tenant_id)
 }
 
 /// Resolve the full identity option using `hive.yaml` from config dir

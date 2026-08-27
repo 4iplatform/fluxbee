@@ -652,12 +652,17 @@ por relay a `SY.admin` y trae **todo** (identification: phone/company/attributes
 
 ### 4.6 `get_ilk` — ¿existe el ilk? + subset (rápido, SHM)
 
+**Dos selectores, exactamente uno:**
+
 | campo | oblig. | |
 |---|---|---|
-| `params.ilk_id` | ✅ | `ilk:<uuid>` |
+| `params.ilk_id` | ✅ (opción A) | `ilk:<uuid>` |
+| `params.email` + `params.tenant_id` | ✅ (opción B) | el email del humano + `tnt:<uuid>` |
 
 ```bash
 post '{"op":"get_ilk","request_id":"66666666-…","params":{"ilk_id":"ilk:a6c7d60d-…"}}'
+# — o por email (el que Cloud tiene de Google) —
+post '{"op":"get_ilk","request_id":"66666667-…","params":{"email":"juan@acme.com","tenant_id":"tnt:560fcb25-…"}}'
 ```
 ```json
 {"status":"ok","op":"get_ilk","result":{
@@ -666,6 +671,13 @@ post '{"op":"get_ilk","request_id":"66666666-…","params":{"ilk_id":"ilk:a6c7d6
          "tenant_id":"tnt:560fcb25-…","display_name":"Juan Perez"}}}
 ```
 Si no existe: `result:{"exists":false,"ilk":null}`. Para phone/company/attributes/canales → `get_ilk_details`.
+
+> **Por qué `tenant_id` es obligatorio con `email`:** el mismo email puede existir como ilks
+> distintos en dos tenants (la unicidad de identidad es por `(canal, dirección, tenant)`, nunca
+> global). El match es case-insensitive **ASCII** (se normaliza igual que al registrar; un email
+> con mayúsculas no-ASCII, p.ej. `JOSÉ@…`, solo matchea con el mismo casing) y resuelve por el
+> canal `cloud` del ilk — el que `register_human` provisiona con el email como dirección. Es un
+> probe O(1) del índice de la SHM: más rápido incluso que buscar por `ilk_id`.
 
 ### 4.7 `list_ilks` — los ilks de un tenant (rápido, SHM)
 
@@ -690,13 +702,20 @@ Si no existe: `result:{"exists":false,"ilk":null}`. Para phone/company/attribute
 
 ### 4.9 `get_ilk_details` — TODA la data del ilk (relay a admin)
 
+**Dos selectores, exactamente uno (los mismos de `get_ilk`):**
+
 | campo | oblig. | |
 |---|---|---|
-| `params.ilk_id` | ✅ | `ilk:<uuid>` |
+| `params.ilk_id` | ✅ (opción A) | `ilk:<uuid>` |
+| `params.email` + `params.tenant_id` | ✅ (opción B) | el email del humano + `tnt:<uuid>` |
 
 Relay a `SY.admin get_ilk` → el registro completo desde la DB: `identification` (name/email/phone/
 company/attributes) + `channels` + el `tenant`. Más lento que `get_ilk` (lee la DB). La respuesta va
 en `result` con la forma que devuelve admin (`{ilk:{…, identification:{…}, channels:[…]}, tenant:{…}}`).
+
+Con `email`, io.cloud resuelve primero email→`ilk_id` localmente (mismo índice SHM que `get_ilk`)
+y relaya por el id canónico — admin/identity no ven el email como selector. Si el email no existe
+en ese tenant: `{"status":"error","error_code":"ILK_NOT_FOUND",…}` sin tocar admin.
 
 ---
 

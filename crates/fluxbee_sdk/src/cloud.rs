@@ -90,13 +90,13 @@ pub fn cloud_action_catalog() -> Value {
         { "op": "list_cloud_actions", "category": "local",
           "summary": "Return this catalog (the actions IO.cloud offers: relay + local) so Cloud can discover its surface." },
         { "op": "get_ilk", "category": "local",
-          "summary": "FAST existence+subset read of one ilk from the identity SHM (no round-trip). Needs params.ilk_id (ilk:<uuid>). Returns {exists, ilk?:{ilk_id, ilk_type, registration_status, tenant_id, display_name}}. For the full identification (phone/company/attributes) + channels use get_ilk_details." },
+          "summary": "FAST existence+subset read of one ilk from the identity SHM (no round-trip). Selector: params.ilk_id (ilk:<uuid>) OR params.email + params.tenant_id (tnt:<uuid> — required: the same email can exist in more than one tenant; matches the ilk's cloud channel, case-insensitive). Returns {exists, ilk?:{ilk_id, ilk_type, registration_status, tenant_id, display_name}}. For the full identification (phone/company/attributes) + channels use get_ilk_details." },
         { "op": "get_tenant", "category": "local",
           "summary": "FAST existence read of one tenant from the identity SHM. Needs params.tenant_id (tnt:<uuid>). Returns {exists, tenant_id, ilk_count}." },
         { "op": "list_ilks", "category": "local",
           "summary": "List the ilks of ONE tenant from the identity SHM (subset each). Needs params.tenant_id (tnt:<uuid>). Returns {tenant_id, count, ilks:[{ilk_id, ilk_type, registration_status, display_name}]}." },
         { "op": "get_ilk_details", "category": "relay",
-          "summary": "FULL identity read (all identification PII + channels + tenant) — relayed to SY.admin. Needs params.ilk_id (ilk:<uuid>). Slower than get_ilk (a DB read); use it when you need everything." }
+          "summary": "FULL identity read (all identification PII + channels + tenant) — relayed to SY.admin. Selector: params.ilk_id (ilk:<uuid>) OR params.email + params.tenant_id (pre-resolved locally to the canonical ilk_id, then relayed). Slower than get_ilk (a DB read); use it when you need everything." }
     ])
 }
 
