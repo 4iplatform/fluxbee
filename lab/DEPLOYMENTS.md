@@ -16,6 +16,8 @@
 
 | Versión | Fecha (ART) | Commit | Alcance | Estado | Rollback |
 |---|---|---|---|---|---|
+| **0.1.31** | 2026-08-26 | `862c5e4` | motherbee | ✅ live | snap `pre-rpc-poison-fix-0-1-31` · `apt install fluxbee=0.1.30` |
+| **0.1.30** | 2026-08-26 | `af1166a` | motherbee | ✅ live | snap `pre-liveness-fix-0-1-30` · `apt install fluxbee=0.1.29` |
 | **0.1.29** | 2026-08-25 | `a0bc25d` | motherbee | ✅ live | snap `pre-cloud-readpath-0-1-29` · `apt install fluxbee=0.1.28` |
 | **0.1.28** | 2026-08-25 | `1438737` | motherbee | ✅ live | snap `pre-frontdesk-configplane-0-1-28` · `apt install fluxbee=0.1.27` |
 | **0.1.27** | 2026-08-25 | `000de90` | motherbee | ✅ live | snap `pre-frontdesk-autonomous-0-1-27` · `apt install fluxbee=0.1.26` |
@@ -33,6 +35,58 @@
 > (`dpkg-scanpackages -m`) para rollback, pero su detalle vive en la bitácora, no acá.
 
 ---
+
+## 0.1.31 — SDK/rpc: fix del veneno del edge (response_only familia-completa) — el bug real de crearPersona
+
+- **Fecha:** 2026-08-26 (ART) · **Versión anterior:** 0.1.30 · **Commit:** `862c5e4` (branch `daily_onworking_coa`)
+- **Alcance:** **motherbee** (VM100). Toca `crates/fluxbee_sdk/src/rpc.rs` — linkeado estático en TODOS los binarios (rebuild integral del .deb; hicieron falta reboot para respawnear los runtimes con el SDK nuevo).
+- **El bug (prod, determinístico):** `register_human` en io.cloud espera el veredicto del frontdesk con
+  `send_with_matcher(frontdesk_reply_matcher())` cuyo success matcher es `any_msg_type(user)` (inevitable: el
+  veredicto es un frame `user` con `meta.msg=None`). `send_with_matcher` registraba los success shapes en el
+  registro **PERMANENTE** `response_only` (solo-insert, se arma AL ENVIAR). `classify` consulta ese registro por
+  FORMA (sin trace) ANTES del catch-all `Any→Command` de io.cloud → tras UN `register_human` (éxito O timeout),
+  TODO frame user-kind entrante (todos los Cloud requests del edge) se descartaba como "orphaned response" en
+  silencio (debug-level) → edge 504 → Cloud "crearPersona falló (FRONTDESK_REJECTED)". Solo un restart curaba.
+  **Probado por 3 vías:** código, panel de 4 mappers, y experimento controlado en prod (baseline 200×3 →
+  1 register SUCCESS → probe 6s después timeout permanente). Refuta el framing "presence decay ~6min":
+  monitor 12min solo-lists = 36/36 OK; VM100 sana en pleno fallo (cpu 0%, mem 15%) — NO era Proxmox/memoria.
+- **El fix:** `register_response_only` saltea `AnyMsgOfType` (misma razón que el skip de `Any`: global drops).
+  Exact/OneOf siguen registrándose — protecciones AF-P2b del orquestador intactas. Late replies familia-completa
+  quedan cubiertas por pending (trace) + stale table (30s TTL) + gates propios de cada nodo (io.cloud ignora
+  src≠edge fail-closed). **Desactiva 3 bombas: io.cloud (detonada), io.api (handoff idéntico) y
+  `sy_admin::send_admin_request` (`any_msg_type(admin)`).** Helper muerto removido; test venenoso invertido en
+  regresión `family_wide_success_matcher_never_poisons_command_traffic`; doc RPC multiplexing actualizado.
+- **Review:** 39/39 tests SDK verdes · adversarial 3 lentes (blast-radius de todos los callers, ventanas de
+  protección, coherencia de tests): **0 HIGH / 0 MEDIUM**, solo LOW de corrimiento de métricas/logs.
+- **Build:** fb-build (VM110), `build-deb.sh 0.1.31` → 234 MB. **Publish:** `apt-repo-publish.sh` → repo :8900
+  (ojo: el server `:8900` es un unit transient `systemd-run` que NO sobrevive reboots de VM110 — hubo que relevantarlo).
+- **Verificación en vivo (E2E desde internet, post-reboot):** **4 `register_human` consecutivos** (3 frescos +
+  1 repetido idempotente, incluido el flujo real del operador) todos `status=ok success=True reg=complete`, con
+  `list_cloud_actions` 200 intercalado tras CADA uno + estabilidad 200×3 — con 0.1.30 el primer register mataba
+  todo el tráfico posterior del edge.
+- **Rollback:** snapshot `pre-rpc-poison-fix-0-1-31` (VM100) o `apt install fluxbee=0.1.30` + reboot (re-introduce el veneno).
+
+## 0.1.30 — orquestador: self-heal de runtimes managed muertos + adiós `is_packaged_singleton`
+
+- **Fecha:** 2026-08-26 (ART) · **Versión anterior:** 0.1.29 · **Commit:** `af1166a` (branch `daily_onworking_coa`)
+  (+ `9e81687` reword docs "singleton"→"managed runtime").
+- **Alcance:** **motherbee** (VM100). Toca `sy_orchestrator` + `fluxbee_sdk::managed_node`.
+- **El bug (prod):** `IO.cloud@motherbee` fue hallado MUERTO (unit transient inactive) con la MB 19.8 días up y
+  nada lo resucitaba: los runtimes managed corren con `systemd-run --property Restart=always`, pero si agotan el
+  start-limit nadie los recrea — `reconcile_persisted_custom_nodes` corría SOLO en el bootstrap, y el watchdog de
+  5s solo los LOGUEABA ("node disconnected") mientras SÍ reinicia SY.*/rt-gateway → edge 504 hasta el próximo boot.
+- **El fix:** `run_managed_runtime_reconcile_loop` — task PROPIA de 60s (NO el hot-path del watchdog de 5s: un
+  systemctl lento jamás frena el self-heal de SY.*) que re-corre el reconcile persistido; el reconcile ahora hace
+  `try_lock_node` (SO-04) por nodo — si un admin-op tiene el lock, saltea y reintenta el ciclo siguiente. Solo
+  revive nodos `relaunch_on_boot=true`. **Nota operativa:** `kill_node` sin purge de un nodo boot ahora revive en
+  ≤60s (consistente con SY.*; bajar durable = purge). Además: borrado el mecanismo muerto
+  `is_packaged_singleton`/`PACKAGED_SINGLETON_NODES` (lista vacía; el guard de doble-dueño lo sostiene `kind=="SY"`/RT.gateway).
+- **Review:** adversarial 3 lentes — el hallazgo mayor (reconcile inline bloqueaba el watchdog) se corrigió
+  ANTES del deploy (task propia + try_lock).
+- **Build:** fb-build (VM110), `build-deb.sh 0.1.30` → 234 MB. **Publish:** repo :8900.
+- **Verificación en vivo:** boot-reconcile relanzó los 9 runtimes (`started=9 skipped=0 failed=0`); el loop
+  periódico corre cada 60s exacto (`reconcile completed started=0 skipped=9`); endpoint Cloud 200 post-boot.
+- **Rollback:** snapshot `pre-liveness-fix-0-1-30` (VM100) o `apt install fluxbee=0.1.29`.
 
 ## 0.1.29 — io.cloud: camino de LECTURA de Cloud (fase 2) — reads rápidos SHM + get_ilk_details relay
 
