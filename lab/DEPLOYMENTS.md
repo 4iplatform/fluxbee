@@ -16,6 +16,7 @@
 
 | Versión | Fecha (ART) | Commit | Alcance | Estado | Rollback |
 |---|---|---|---|---|---|
+| **0.1.33** | 2026-08-28 | `01b6266` | motherbee | ✅ live | `apt install fluxbee=0.1.32` |
 | **0.1.32** | 2026-08-27 | `90fd64a` | motherbee | ✅ live | `apt install fluxbee=0.1.31` |
 | **0.1.31** | 2026-08-26 | `862c5e4` | motherbee | ✅ live | snap `pre-rpc-poison-fix-0-1-31` · `apt install fluxbee=0.1.30` |
 | **0.1.30** | 2026-08-26 | `af1166a` | motherbee | ✅ live | snap `pre-liveness-fix-0-1-30` · `apt install fluxbee=0.1.29` |
@@ -36,6 +37,31 @@
 > (`dpkg-scanpackages -m`) para rollback, pero su detalle vive en la bitácora, no acá.
 
 ---
+
+## 0.1.33 — io.cloud: get_ilk email-SOLO (cross-tenant) — el login del website
+
+- **Fecha:** 2026-08-28 (ART) · **Versión anterior:** 0.1.32 · **Commit:** `01b6266`
+- **Alcance:** **motherbee** (VM100). io.cloud + fluxbee_sdk (warn seqlock en el reader de listado) + docs.
+- **Qué cambió:** el website (OAuth Google) tiene SOLO el email en el primer login; `params.tenant_id` ahora es
+  OPCIONAL con `params.email`. Con tenant: probe O(1) 0.1.32 sin cambios. SIN tenant: scan cross-tenant de los
+  canales `cloud` (`list_ich_options_from_hive_id`, propaga errores) → `{exists, ilk: solo si match único,
+  matches:[UN subset POR tenant donde existe el email — cada uno con su tenant_id]}`. De `matches` el website
+  saca el tenant; 0 matches → create_tenant+register_human; N matches → selector de empresa.
+- **Hardening de la review (2 MEDIUM pre-ship):** (1) `tenant_id` PRESENTE pero malformado (número, vacío,
+  formato inválido) = error fuerte — nunca ensancha silenciosamente un probe con tenant a scan global (branch
+  por presencia de key, no por parse); (2) `matches` garantiza uno-por-tenant: estados transitorios de identity
+  (ventana de merge-alias, address takeover) pueden dejar 2 ilks activos en un mismo (cloud,email,tenant) — los
+  tenants ambiguos se re-prueban con el resolver O(1) autoritativo (misma respuesta que el probe con tenant).
+  + LOW: warn en seqlock-timeout del reader de listado (outages de first-login diagnósticables).
+- **Semántica aceptada (documentada):** canales disabled matchean (register_human los crea enabled:false — un
+  filtro estricto rompería el first-login); el scan es O(hive) por request (aceptado al tamaño actual; list_ilks
+  ya escanea igual). Oráculo email→tenants expuesto SOLO a la clase de caller ya confiada (bearer del edge,
+  default-deny sin edge configurado).
+- **Build:** VM110 `build-deb.sh 0.1.33` → publish repo :8900 (33 paquetes).
+- **Verificación E2E (7/7 desde internet):** login 1-empresa (`ilk` poblado con tenant), register en 2ª empresa,
+  login 2-empresas (`ilk:null, matches:[2]` uno por tenant), email desconocido (`exists:false`), `tenant_id:42`
+  → error fuerte (no scan), y regresiones email+tenant / ilk_id intactas.
+- **Rollback:** `apt install fluxbee=0.1.32` (aditivo; los selectores 0.1.32 no cambiaron).
 
 ## 0.1.32 — io.cloud: selector por EMAIL en get_ilk / get_ilk_details
 
