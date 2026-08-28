@@ -90,7 +90,7 @@ pub fn cloud_action_catalog() -> Value {
         { "op": "list_cloud_actions", "category": "local",
           "summary": "Return this catalog (the actions IO.cloud offers: relay + local) so Cloud can discover its surface." },
         { "op": "get_ilk", "category": "local",
-          "summary": "FAST existence+subset read of one ilk from the identity SHM (no round-trip). Selector: params.ilk_id (ilk:<uuid>) OR params.email + params.tenant_id (tnt:<uuid> — required: the same email can exist in more than one tenant; matches the ilk's cloud channel, case-insensitive). Returns {exists, ilk?:{ilk_id, ilk_type, registration_status, tenant_id, display_name}}. For the full identification (phone/company/attributes) + channels use get_ilk_details." },
+          "summary": "FAST existence+subset read from the identity SHM (no round-trip). Selector: params.ilk_id (ilk:<uuid>) OR params.email (matches the ilk's cloud channel, ASCII case-insensitive). With params.tenant_id (tnt:<uuid>): O(1) tenant-scoped probe -> {exists, ilk?}. WITHOUT tenant_id (first-login flow: the email is all you have): cross-tenant search -> {exists, ilk?: set only when exactly one match, matches:[subset...] — every tenant's ilk for that email; each subset carries its tenant_id}. Subset = {ilk_id, ilk_type, registration_status, tenant_id, display_name}. For full identification + channels use get_ilk_details." },
         { "op": "get_tenant", "category": "local",
           "summary": "FAST existence read of one tenant from the identity SHM. Needs params.tenant_id (tnt:<uuid>). Returns {exists, tenant_id, ilk_count}." },
         { "op": "list_ilks", "category": "local",

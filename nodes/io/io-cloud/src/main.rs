@@ -1159,12 +1159,14 @@ fn handle_shm_read(state: &Arc<RuntimeState>, msg: &Message, op: &str) -> Value 
     let hive = state.config.hive_id.as_str();
     match op {
         "get_ilk" => {
-            // Two selectors, exactly one: params.ilk_id (canonical id), or params.email +
-            // params.tenant_id. The email IS the address of the ilk's `cloud` channel
-            // (register_human provisions it that way), so the email path is an O(1) probe of the
-            // SHM (channel_type, address, tenant) hash index — the io.api inbound-resolve pattern.
-            // tenant_id is REQUIRED for email: the same email can exist as different ilks in two
-            // tenants (identity uniqueness is per (channel, address, tenant), never global).
+            // Two selectors, exactly one: params.ilk_id (canonical id), or params.email. The
+            // email IS the address of the ilk's `cloud` channel (register_human provisions it
+            // that way). With params.tenant_id the email path is an O(1) probe of the SHM
+            // (channel_type, address, tenant) hash index — the io.api inbound-resolve pattern;
+            // WITHOUT tenant_id it is a cross-tenant scan (the website's first-login case: the
+            // email is the only datum) answering one match per tenant. The same email can exist
+            // as different ilks in two tenants (identity uniqueness is per (channel, address,
+            // tenant), never global) — that is what `matches` is for.
             let ilk_id = optional_trimmed(&params, "ilk_id");
             let email = optional_trimmed(&params, "email");
             match (ilk_id, email) {
@@ -1183,42 +1185,137 @@ fn handle_shm_read(state: &Arc<RuntimeState>, msg: &Message, op: &str) -> Value 
                     ),
                 },
                 (None, Some(email)) => {
-                    // Canonical-format check (not just non-empty): a typo'd tenant would
-                    // silently hash-miss and report exists:false — fail loud instead.
-                    let tenant_id = match require_tenant_id(
-                        optional_trimmed(&params, "tenant_id").as_deref(),
-                        "get_ilk by email",
-                    ) {
-                        Ok(v) => v,
-                        Err(e) => return e,
-                    };
                     if !email.contains('@') || email.len() < 3 {
                         return cloud_error("params.email must be a valid email address");
                     }
-                    // The resolver trims + lowercases internally — same normalization the
-                    // provision path applied when the channel was written.
-                    match fluxbee_sdk::identity::resolve_identity_option_from_hive_id_strict(
-                        hive,
-                        CLOUD_CHANNEL_TYPE,
-                        &email,
-                        &tenant_id,
-                    ) {
-                        Ok(resolved) => json!({
-                            "status": "ok",
-                            "op": "get_ilk",
-                            "result": {
-                                "exists": resolved.is_some(),
-                                "ilk": resolved.map(|r| ilk_shm_subset(&r.ilk)),
-                            },
-                        }),
-                        Err(err) => cloud_error_code(
-                            "IDENTITY_SHM_UNAVAILABLE",
-                            &format!("identity SHM read failed: {err}"),
-                        ),
+                    // Branch on KEY PRESENCE, not on parse success: a PRESENT-but-malformed
+                    // tenant_id (a number, an empty string, an object) must fail loud via
+                    // require_tenant_id — never silently widen a tenant-scoped probe into the
+                    // hive-wide scan (the caller meant to scope it). Only a truly absent (or
+                    // null) tenant_id selects the cross-tenant mode.
+                    let tenant_key_present = params
+                        .get("tenant_id")
+                        .is_some_and(|value| !value.is_null());
+                    match tenant_key_present {
+                        // TENANT-SCOPED (0.1.32): O(1) probe of the (cloud, email, tenant) SHM
+                        // index. Canonical-format check first — a typo'd tenant would silently
+                        // hash-miss and report exists:false; fail loud instead.
+                        true => {
+                            let tenant_id = match require_tenant_id(
+                                optional_trimmed(&params, "tenant_id").as_deref(),
+                                "get_ilk by email",
+                            ) {
+                                Ok(v) => v,
+                                Err(e) => return e,
+                            };
+                            // The resolver trims + lowercases internally — same normalization
+                            // the provision path applied when the channel was written.
+                            match fluxbee_sdk::identity::resolve_identity_option_from_hive_id_strict(
+                                hive,
+                                CLOUD_CHANNEL_TYPE,
+                                &email,
+                                &tenant_id,
+                            ) {
+                                Ok(resolved) => json!({
+                                    "status": "ok",
+                                    "op": "get_ilk",
+                                    "result": {
+                                        "exists": resolved.is_some(),
+                                        "ilk": resolved.map(|r| ilk_shm_subset(&r.ilk)),
+                                    },
+                                }),
+                                Err(err) => cloud_error_code(
+                                    "IDENTITY_SHM_UNAVAILABLE",
+                                    &format!("identity SHM read failed: {err}"),
+                                ),
+                            }
+                        }
+                        // EMAIL-ONLY (the website's first-login case: the email is the ONLY
+                        // datum it has). Cross-tenant scan of the cloud channels — the tenant
+                        // is part of the SHM index key, so no O(1) probe exists without it.
+                        // Shape: `matches` lists ONE ilk per tenant where that email exists
+                        // (the same person can be an ilk in two companies); `ilk` is populated
+                        // only when the match is unambiguous (exactly one), the common case.
+                        // list_ich_options propagates SHM errors (no EACCES laundering) —
+                        // fail-loud like the rest of this authoritative read API.
+                        false => match fluxbee_sdk::identity::list_ich_options_from_hive_id(hive) {
+                            Ok(options) => {
+                                let needle = email.to_ascii_lowercase();
+                                let mut candidates: Vec<fluxbee_sdk::identity::IdentityIlkOption> =
+                                    Vec::new();
+                                for opt in &options {
+                                    if opt.channel_type != CLOUD_CHANNEL_TYPE
+                                        || opt.address != needle
+                                    {
+                                        continue;
+                                    }
+                                    for ilk in &opt.ilks {
+                                        if !candidates.iter().any(|c| c.ilk_id == ilk.ilk_id) {
+                                            candidates.push(ilk.clone());
+                                        }
+                                    }
+                                }
+                                // ONE match per tenant, always. Transient identity states (a
+                                // channel-merge alias window, an address takeover) can leave
+                                // TWO active ilks on the same (cloud, email, tenant); the scan
+                                // would surface both, but the tenant-scoped probe answers only
+                                // the mapping winner — so re-probe each ambiguous tenant and
+                                // keep the winner, making this mode return exactly what the
+                                // tenant-scoped call would for every tenant listed.
+                                let mut matches: Vec<Value> = Vec::new();
+                                let mut tenants_done: Vec<String> = Vec::new();
+                                for cand in &candidates {
+                                    if tenants_done.iter().any(|t| t == &cand.tenant_id) {
+                                        continue;
+                                    }
+                                    tenants_done.push(cand.tenant_id.clone());
+                                    let dup = candidates
+                                        .iter()
+                                        .filter(|c| c.tenant_id == cand.tenant_id)
+                                        .count()
+                                        > 1;
+                                    if !dup {
+                                        matches.push(ilk_shm_subset(cand));
+                                        continue;
+                                    }
+                                    match fluxbee_sdk::identity::resolve_identity_option_from_hive_id_strict(
+                                        hive,
+                                        CLOUD_CHANNEL_TYPE,
+                                        &email,
+                                        &cand.tenant_id,
+                                    ) {
+                                        Ok(Some(winner)) => matches.push(ilk_shm_subset(&winner.ilk)),
+                                        // Mapping probe missed mid-transition: fall back to the
+                                        // first scanned candidate rather than dropping the tenant.
+                                        Ok(None) => matches.push(ilk_shm_subset(cand)),
+                                        Err(err) => {
+                                            return cloud_error_code(
+                                                "IDENTITY_SHM_UNAVAILABLE",
+                                                &format!("identity SHM read failed: {err}"),
+                                            )
+                                        }
+                                    }
+                                }
+                                let single = (matches.len() == 1).then(|| matches[0].clone());
+                                json!({
+                                    "status": "ok",
+                                    "op": "get_ilk",
+                                    "result": {
+                                        "exists": !matches.is_empty(),
+                                        "ilk": single,
+                                        "matches": matches,
+                                    },
+                                })
+                            }
+                            Err(err) => cloud_error_code(
+                                "IDENTITY_SHM_UNAVAILABLE",
+                                &format!("identity SHM read failed: {err}"),
+                            ),
+                        },
                     }
                 }
                 _ => cloud_error(
-                    "get_ilk requires exactly one of params.ilk_id (ilk:<uuid>) or params.email (+ params.tenant_id)",
+                    "get_ilk requires exactly one of params.ilk_id (ilk:<uuid>) or params.email (params.tenant_id optional: omit it to search across tenants)",
                 ),
             }
         }

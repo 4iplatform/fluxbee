@@ -1067,6 +1067,15 @@ fn read_ich_options_from_region(
     let start = StdInstant::now();
     loop {
         if start.elapsed() > StdDuration::from_millis(SEQLOCK_READ_TIMEOUT_MS) {
+            // Same loud timeout its sibling reader (resolve_ich_mapping) emits — this listing
+            // backs io.cloud's email-only first-login lookup, and a silent SeqLockTimeout there
+            // reads as an undiagnosable outage during identity write churn.
+            tracing::warn!(
+                elapsed_us = start.elapsed().as_micros() as u64,
+                ilk_count = header.ilk_count,
+                ich_count = header.ich_count,
+                "sdk identity shm ich-options read timed out under seqlock"
+            );
             return Err(IdentityShmError::SeqLockTimeout);
         }
         let s1 = header.seq.load(Ordering::Acquire);

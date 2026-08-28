@@ -657,12 +657,30 @@ por relay a `SY.admin` y trae **todo** (identification: phone/company/attributes
 | campo | oblig. | |
 |---|---|---|
 | `params.ilk_id` | ✅ (opción A) | `ilk:<uuid>` |
-| `params.email` + `params.tenant_id` | ✅ (opción B) | el email del humano + `tnt:<uuid>` |
+| `params.email` | ✅ (opción B) | el email del humano; `params.tenant_id` **opcional** (ver abajo) |
 
 ```bash
 post '{"op":"get_ilk","request_id":"66666666-…","params":{"ilk_id":"ilk:a6c7d60d-…"}}'
-# — o por email (el que Cloud tiene de Google) —
+# — por email dentro de un tenant (probe O(1)) —
 post '{"op":"get_ilk","request_id":"66666667-…","params":{"email":"juan@acme.com","tenant_id":"tnt:560fcb25-…"}}'
+# — por email SOLO (primer login del website: el email es lo único que hay) —
+post '{"op":"get_ilk","request_id":"66666668-…","params":{"email":"juan@acme.com"}}'
+```
+
+**Email SIN `tenant_id` — búsqueda cross-tenant.** La respuesta agrega `matches`: **un** ilk por
+cada tenant donde ese email existe (cada subset trae su `tenant_id` — de acá el website saca el
+tenant; si un estado transitorio de identity dejara dos ilks con el mismo email en un tenant, se
+devuelve el que respondería el probe con tenant, nunca dos entradas del mismo tenant). `ilk`
+viene poblado **solo si el match es único** (el caso común). Ojo: `tenant_id` **presente pero
+inválido** (número, string vacío, formato no `tnt:<uuid>`) es **error fuerte**, no un scan:
+
+```json
+// 1 match (caso común):
+{"result":{"exists":true, "ilk":{…subset…}, "matches":[{…subset…}]}}
+// N matches (misma persona en 2 empresas → selector de empresa en el website):
+{"result":{"exists":true, "ilk":null, "matches":[{…}, {…}]}}
+// 0 matches (primera vez → create_tenant + register_human):
+{"result":{"exists":false, "ilk":null, "matches":[]}}
 ```
 ```json
 {"status":"ok","op":"get_ilk","result":{
