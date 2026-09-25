@@ -27,7 +27,9 @@ Examples:
   pve.py exec 201 -- 'fluxbee-firstboot'
   pve.py exec 201 -- 'curl -s localhost:8080/hives'
   pve.py push 201 ./packaging/fluxbee-firstboot /usr/local/bin/x
-  pve.py snapshot 201 clean-install
+  pve.py snapshots 201                        # oldest first, with dates
+  pve.py snapshot 201 clean-install           # refuses a 4th (rule: max 3 per VM)
+  pve.py delsnapshot 201 <oldest>             # irreversible: always on purpose
   pve.py rollback 201 clean-install
   pve.py ip 201
   pve.py destroy 201
@@ -58,6 +60,13 @@ def _need_env():
                  "\nexport PVE_HOST=... PVE_TOKEN='user@realm!tokenid=secret'")
 
 
+# pveproxy sometimes closes a connection without answering (2026-09-25, polling exec-status and
+# tasks/status: http.client.RemoteDisconnected, a ConnectionResetError). A GET is idempotent, so it
+# is retried. Anything else may already have been APPLIED (a DELETE of a snapshot did), so it fails
+# loud and the caller looks at the state before trying again.
+_GET_RETRIES = 3
+
+
 def api(method, path, data=None, timeout=30, quiet_errors=False):
     """One API call. Returns parsed 'data', or raises SystemExit with the body."""
     _need_env()
@@ -66,20 +75,32 @@ def api(method, path, data=None, timeout=30, quiet_errors=False):
     if data is not None:
         body = urllib.parse.urlencode(data, doseq=True).encode()
         headers["Content-Type"] = "application/x-www-form-urlencoded"
-    req = urllib.request.Request(url, data=body, headers=headers, method=method)
-    try:
-        with urllib.request.urlopen(req, context=_ctx, timeout=timeout) as r:
-            return json.loads(r.read().decode()).get("data")
-    except urllib.error.HTTPError as e:
-        if quiet_errors:
-            raise
-        sys.exit("API %s %s -> HTTP %s: %s" % (method, path, e.code, e.read().decode("utf-8", "replace")))
-    except urllib.error.URLError as e:
-        sys.exit("API %s %s -> connection error: %s\n"
-                 "Is %s:%s reachable from here? If Proxmox is on a LAN this sandbox "
-                 "cannot reach, tunnel it from your machine:\n"
-                 "  ssh -N -L %s:%s:%s <jump-host>\n"
-                 "then set PVE_HOST=127.0.0.1." % (method, path, e.reason, HOST, PORT, PORT, HOST, PORT))
+    attempts = 1 + (_GET_RETRIES if method == "GET" else 0)
+    for attempt in range(attempts):
+        req = urllib.request.Request(url, data=body, headers=headers, method=method)
+        try:
+            with urllib.request.urlopen(req, context=_ctx, timeout=timeout) as r:
+                return json.loads(r.read().decode()).get("data")
+        except urllib.error.HTTPError as e:
+            if quiet_errors:
+                raise
+            sys.exit("API %s %s -> HTTP %s: %s" % (method, path, e.code, e.read().decode("utf-8", "replace")))
+        except (ConnectionResetError, urllib.error.URLError) as e:
+            dropped = isinstance(e, ConnectionResetError) or isinstance(getattr(e, "reason", None), ConnectionResetError)
+            if dropped and attempt + 1 < attempts:
+                time.sleep(1 + attempt)
+                continue
+            if quiet_errors:
+                raise
+            if dropped:
+                sys.exit("API %s %s -> connection dropped without a response (%s). %s" % (
+                    method, path, e, "Gave up after %d retries." % _GET_RETRIES if method == "GET"
+                    else "It may have been APPLIED: check the state before retrying."))
+            sys.exit("API %s %s -> connection error: %s\n"
+                     "Is %s:%s reachable from here? If Proxmox is on a LAN this sandbox "
+                     "cannot reach, tunnel it from your machine:\n"
+                     "  ssh -N -L %s:%s:%s <jump-host>\n"
+                     "then set PVE_HOST=127.0.0.1." % (method, path, e.reason, HOST, PORT, PORT, HOST, PORT))
 
 
 def node():
@@ -200,13 +221,37 @@ def cmd_destroy(a):
     print("  destroyed %s" % a.id)
 
 
+# Operator rule (2026-09-25): never more than 3 snapshots per VM. On LVM-thin each snapshot keeps
+# every block the VM has changed since it was taken, in the pool that ALL the VMs share (fb-mb had
+# 14, one per release: deleting 11 freed 19 GiB). So `snapshot` refuses a 4th. Deleting the oldest
+# is irreversible, so it stays an explicit step (`delsnapshot`), never a side effect of creating.
+MAX_SNAPSHOTS = 3
+
+
+def _snapshots_by_age(n, vmid):
+    snaps = [s for s in (api("GET", "/nodes/%s/qemu/%s/snapshot" % (n, vmid)) or [])
+             if s.get("name") != "current"]
+    return sorted(snaps, key=lambda s: s.get("snaptime", 0))
+
+
 def cmd_snapshot(a):
     n = node()
+    have = _snapshots_by_age(n, a.id)
+    if len(have) >= MAX_SNAPSHOTS:
+        sys.exit("  vm%s already has %d snapshots (rule: max %d). Delete the oldest first, on purpose:\n"
+                 "    pve.py delsnapshot %s %s"
+                 % (a.id, len(have), MAX_SNAPSHOTS, a.id, have[0]["name"]))
     name = a.name or ("snap-%d" % int(time.time()))
     upid = api("POST", "/nodes/%s/qemu/%s/snapshot" % (n, a.id),
                {"snapname": name, "vmstate": 1 if a.vmstate else 0})
     wait_task(upid)
     print("  snapshot %s of %s" % (name, a.id))
+
+
+def cmd_delsnapshot(a):
+    n = node()
+    wait_task(api("DELETE", "/nodes/%s/qemu/%s/snapshot/%s" % (n, a.id, a.name)))
+    print("  deleted snapshot %s of %s" % (a.name, a.id))
 
 
 def cmd_rollback(a):
@@ -218,8 +263,9 @@ def cmd_rollback(a):
 
 def cmd_snapshots(a):
     n = node()
-    for s in api("GET", "/nodes/%s/qemu/%s/snapshot" % (n, a.id)) or []:
-        print("%-24s %s" % (s.get("name", ""), s.get("description", "")))
+    for s in _snapshots_by_age(n, a.id):
+        print("%s  %-34s %s" % (time.strftime("%Y-%m-%d %H:%M", time.localtime(s.get("snaptime", 0))),
+                                s.get("name", ""), s.get("description", "")))
 
 
 def cmd_ip(a):
@@ -242,7 +288,7 @@ def cmd_wait_agent(a):
             api("POST", "/nodes/%s/qemu/%s/agent/ping" % (n, a.id), {}, timeout=8, quiet_errors=True)
             print("  agent up on %s" % a.id)
             return
-        except (urllib.error.HTTPError, urllib.error.URLError):
+        except (urllib.error.HTTPError, urllib.error.URLError, ConnectionResetError, TimeoutError):
             pass
         if time.time() - t0 > a.timeout:
             sys.exit("  agent did not come up within %ss" % a.timeout)
@@ -365,6 +411,7 @@ def main():
 
     s = sub.add_parser("snapshot"); s.add_argument("id"); s.add_argument("name", nargs="?")
     s.add_argument("--vmstate", action="store_true"); s.set_defaults(fn=cmd_snapshot)
+    s = sub.add_parser("delsnapshot"); s.add_argument("id"); s.add_argument("name"); s.set_defaults(fn=cmd_delsnapshot)
     s = sub.add_parser("rollback"); s.add_argument("id"); s.add_argument("name"); s.set_defaults(fn=cmd_rollback)
     s = sub.add_parser("snapshots"); s.add_argument("id"); s.set_defaults(fn=cmd_snapshots)
 
