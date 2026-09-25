@@ -259,13 +259,63 @@
   (`env HOME=/root`), que no estaba en el helper. Validado en vivo: acentos/`—`/`✓`, exit codes
   propagados, el agente sobrevive.
 
-### B-12 🟡 Todas las VMs de PROD tienen reboot pendiente por kernel + libc6
+### B-12 🟢 Todas las VMs de PROD tenían reboot pendiente por kernel + libc6 — aplicado
 
 - **Qué se observó:** `unattended-upgrades` instaló kernels 6.8.0-137…142 y libc6 en las VMs; hasta
   que reinician siguen con el kernel viejo (fb-egress: corre 6.8.0-136, `reboot-required`). El
   reboot de VM110 de hoy activó **6.8.0-142** sin problemas (guest-agent, red y repo OK).
-- **Pendiente:** decidir con el operador cuándo reiniciar mb/worker/ingress/egress (ventana de
-  mantenimiento) para aplicar las actualizaciones de seguridad.
+- **Resolución (2026-09-25; el operador delegó la infra: "hacé lo que creas conveniente"):**
+  - Reboot de a una VM, con snapshot previo `pre-kernel-reboot-20260925`, en el orden egress →
+    worker1 → ingress → mb.
+  - Las 4 quedaron en **6.8.0-142**, sin `reboot-required`, con IPs y rutas idénticas y 0 units
+    `failed`. Mesh 4/4, 9/9 runtimes, público 200.
+  - Los spokes aguantaron la caída del hub sin reiniciar nada.
+  - Quedó validada en PROD la carga al boot del NAT del egress (F17): el ruleset volvió idéntico.
+  - Detalle en la bitácora 2026-09-25.
+
+### B-13 🟡 Las VMs de PROD no arrancan solas después de un reboot del host (`onboot` sin definir)
+
+- **Qué pasa:** `onboot` no está definido en fb-mb, fb-worker1, fb-ingress, fb-egress ni fb-build.
+  Si el host reinicia (corte de luz, actualización), **PROD queda apagado** hasta que alguien
+  arranque las VMs a mano.
+- **Evidencia:** pasó el 2026-07-30 ("las 4 VMs quedaron apagadas. Arranqué las 4 VMs"). El HANDBOOK
+  lo registró como "reboot del hipervisor: validado", pero lo validado fue que el mesh se rearma,
+  no que las VMs arranquen solas.
+- **Solución propuesta:** `onboot=1` en 100, 101, 102, 103 y 110 (fb-build, por la decisión de
+  dejarla siempre encendida). Sin orden de arranque, porque el arranque simultáneo de las 4 es lo
+  que se validó el 30/07. `PUT /nodes/pve/qemu/<id>/config onboot=1`, o en la GUI: VM → Options →
+  *Start at boot*.
+- **Estado:** pendiente. **Lo aplica el operador**: el cambio de config del host no pasó el control
+  de permisos del agente.
+
+### B-14 🟡 Arranque lento de las VMs de PROD (userspace de 53 s a 1 min 48 s)
+
+- **Qué se observó (reboots del 2026-09-25):** userspace de ingress 53 s, egress 60 s, worker1
+  89 s, mb 108 s (fb-build: 31 s).
+- **Qué no es:**
+  - No es el flush del journal, aunque `systemd-analyze blame` pone arriba a
+    `systemd-journal-flush.service` (mb 74 s, worker1 58 s): journald reporta que el flush en sí
+    tardó ~1 s (mb: 1,4 s para 752 entradas).
+  - Tampoco el tamaño del journal: mb 1,8 G; egress 109 M y tardó 27 s; fb-build 112 M y 0,6 s.
+- **Pista:** en el log de mb, jobs sin relación entre sí (flush, apparmor, binfmt) terminan en el
+  mismo instante (94,6 s). Algo común los retiene.
+- **Impacto:** suma de 1 a 1,5 min a cada recuperación. Con mb son ~3 min 20 s desde el reboot hasta
+  los 9 runtimes; no diagnosticar antes de eso.
+- **Candidato no probado:** la consola serie (`console=ttyS0` con `serial0=socket` y
+  `vga=serial0`).
+- **Pendiente:** diagnóstico (`systemd-analyze plot`, qué retiene esos jobs) antes de tocar nada.
+
+### B-15 🟡 Margen de memoria del host de PROD con fb-build siempre encendida
+
+- **Qué se observó:** 26,0 G configurados en las VMs encendidas sobre 27,4 G físicos, sin
+  ballooning. Uso real estable en ~22 G (pico de 81 % en la semana, 0 swap). mb llega a 5,8 G de
+  sus 10 G; fb-build, a 7,6 G de 8 G.
+- **Riesgo:** si mb llegara a usar sus 10 G mientras fb-build compila, el host se queda sin margen,
+  y lo primero que cae es un proceso QEMU.
+- **Opciones (decisión del operador):**
+  - Ballooning con mínimo en fb-build (p. ej. `balloon=2048`): Proxmox le recupera memoria cuando
+    el host pasa del 80 %.
+  - Bajarle la RAM fuera de los builds.
 
 ---
 

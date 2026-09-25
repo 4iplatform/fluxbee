@@ -77,7 +77,7 @@ No son opcionales: la mitad no se puede cambiar cómodamente después.
 Tres redes, y la interna es la única que fluxbee necesita:
 
 ```text
-vmbr0   nic0   192.168.8.0/24     administracion (compartida, sin internet)
+vmbr0   nic0   192.168.8.0/24     administracion (compartida; su router .1 SI sale a internet)
 fbint    —     10.10.10.0/24      INTERNA fluxbee — SDN zona simple + SNAT
 vmbr1   nic1   x.x.x.0/24         PUBLICA (el host NO tiene IP en ella)
 ```
@@ -247,9 +247,19 @@ Esto importa **directamente** para `add_hive`, que tiene un timeout de 180 s.
 
 Si trabajás contra las VMs por la API de Proxmox (`agent/exec`), esto te va a pasar:
 
-**El agente se muere bajo carga de I/O.** Un upgrade del `.deb`, un arranque en frío, una
-compilación: el `qemu-guest-agent` deja de responder y la API contesta
-`QEMU guest agent is not running` con la VM **perfectamente viva**. No es la VM: es el agente.
+**Un carácter "ancho" en el comando traba el agente** → [B-11](FINDINGS.md). Un solo carácter por
+encima de U+00FF (`—`, `→`, `✓`) en los argumentos de `agent/exec`, y el `qemu-guest-agent` queda
+trabado: la API contesta `QEMU guest agent is not running` con la VM **perfectamente viva**, y no
+vuelve hasta que el agente se reinicia. Los acentos Latin-1 (`é`, `ñ`, `¿`) pasan.
+
+> **No es la carga.** Durante agosto esto se diagnosticó como "el agente se muere bajo carga de
+> I/O" y costó reboots de VMs de prod. Se probó A/B (2026-09-25): con la VM ociosa, `—` lo traba y
+> `é` no. Los comandos que lo trababan tenían `—`/`→`/`✓` en sus `echo`.
+
+`lab/pve.py` ya se protege (el argv no-ASCII viaja en base64). **Si le hablás a la API por otro
+lado (curl, otro script): argumentos solo ASCII, o codificados.**
+
+Si igual te pasa:
 
 ```bash
 # 1. antes de asustarte, confirmá que la VM esta viva DESDE OTRA VM tuya
@@ -257,18 +267,21 @@ compilación: el `qemu-guest-agent` deja de responder y la API contesta
 ping -c2 10.10.10.10
 for p in 9000 9100; do timeout 3 bash -c "echo > /dev/tcp/10.10.10.10/$p" && echo "$p ok"; done
 
-# 2. recuperar el agente: reboot ACPI primero
+# 2. recuperar el agente: reboot ACPI primero (no usa el agente)
 POST /nodes/pve/qemu/<id>/status/reboot
-# vuelve en ~70s... y si la VM sigue con carga se puede volver a morir.
-# 3. si se muere de nuevo: reset duro. Ahi aguanta.
+# vuelve en ~70s. Si el primer exec que mandes tiene otra vez un caracter ancho, se vuelve a trabar.
+# 3. si el reboot ACPI no toma: reset duro.
 POST /nodes/pve/qemu/<id>/status/reset
 ```
+
+Si se traba con un comando **solo ASCII**, es otra cosa: no la tapes con un reset, anotala como
+hallazgo.
 
 > Un reboot/reset de motherbee **no es gratis pero tampoco es grave**: los 4 hives vuelven solos.
 > Es, de hecho, la prueba más dura del arranque en frío. Pero decidilo a propósito, no por pánico.
 
-**Todo lo que dure más de unos segundos va con `setsid nohup` a un log.** Si el agente se muere a
-mitad, el comando sobrevive y leés el log después. Sin esto, perdés el trabajo Y no sabés si corrió:
+**Todo lo que dure más de unos segundos va con `setsid nohup` a un log.** Si la llamada vence o se
+corta a mitad, el comando sobrevive y leés el log después. Sin esto, perdés el trabajo Y no sabés si corrió:
 
 ```bash
 setsid nohup /root/loquesea.sh > /root/loquesea.log 2>&1 < /dev/null &
@@ -314,7 +327,9 @@ Si clonás como un usuario y compilás como `root`, git marca *dubious ownership
 con `error obtaining VCS status: exit status 128` — **después de que Rust ya compiló 55 minutos**.
 
 ```bash
-git config --global --add safe.directory /opt/fluxbee
+# idempotente: correrlo N veces deja UNA sola entrada (y limpia duplicados viejos).
+# Con --add suma una linea por corrida: en fb-build llegaron a haber 23 copias (2026-09-25).
+git config --global --replace-all safe.directory /opt/fluxbee '^/opt/fluxbee$'
 ```
 
 > El propio error sugiere `-buildvcs=false`. **No lo uses**: apaga el estampado de versión en los
@@ -636,11 +651,15 @@ echo | openssl s_client -connect hive-xxx.dominio:443 -servername hive-xxx.domin
 #    (desde un worker) curl -s https://ifconfig.me  -> IP del egress
 ```
 
-**Reboot del hipervisor:** validado. Las 4 VMs arrancaron en frío a la vez y **el mesh se rearmó
-solo**, sin intervención. Dos advertencias:
+**Reboot del hipervisor:** validado **el rearmado del mesh**: con las 4 VMs arrancadas en frío a la
+vez, **se rearmó solo**, sin intervención. Pero las VMs **no arrancan solas** si no tienen
+`onboot=1`: el 30/07 hubo que arrancarlas a mano → [B-13](FINDINGS.md). Advertencias:
 
-- **Esperá la convergencia antes de diagnosticar.** Los primeros 30 s muestran servicios inactivos y
-  `NODE_NOT_FOUND`. No es una falla: es el arranque.
+- **Esperá la convergencia antes de diagnosticar.** Mientras arranca vas a ver servicios inactivos y
+  `NODE_NOT_FOUND`. No es una falla: es el arranque, y es **lento** ([B-14](FINDINGS.md)). Medido
+  en un reboot de motherbee (2026-09-25): el agente vuelve a los ~2,5 min, los 9 runtimes a los
+  ~3 min 20 s, y el endpoint público puede dar **502** unos segundos mientras levanta `io.cloud`.
+  Los spokes no necesitan nada: aguantan la caída del hub sin reiniciar.
 - `sy-edge` puede llegar a `restart counter is at 9` antes de estabilizar → [PB-4](PENDING-BUGS.md#pb-4).
 
 ---
@@ -656,7 +675,7 @@ solo**, sin intervención. Dos advertencias:
 | 5 | `cicustom` vs `ciuser` | El usuario nunca se crea | O uno o el otro; borrar `cicustom` del template |
 | 6 | Clon recién booteado | Reinicia solo, el agente desaparece | Esperar el ciclo + **reiniciar** |
 | 7 | `apt update` filtrado | `Depends: postgresql but it is not installable` | `apt-get update` **completo** |
-| 8 | Clonar y compilar con usuarios distintos | `VCS status: exit status 128` tras 55 min | `git config --global --add safe.directory` |
+| 8 | Clonar y compilar con usuarios distintos | `VCS status: exit status 128` tras 55 min | `git config --global --replace-all safe.directory /opt/fluxbee '^/opt/fluxbee$'` |
 | 9 | `.deb` truncado | `dpkg-deb` sale 0 con 2 KB de paquete | Verificar tamaño y entradas (ya hay preflight) |
 | 10 | `harden_ssh` en `false` | La caja queda abierta | Pasarlo `true` explícito |
 | 11 | `nftables` ausente | `add_hive` egress falla cerrado | Instalarlo antes |
@@ -668,8 +687,8 @@ solo**, sin intervención. Dos advertencias:
 | 17 | `dpkg-scanpackages` sin `-m` | El índice queda con una sola versión · **te quedás sin rollback** | El script ya trae `-m`. No lo rehagas a mano |
 | 18 | `dpkg-deb` "colgado" | El `.deb` sigue en 3 KB y `dpkg-deb -c` dice *unexpected end of file* | Está comprimiendo con `xz`. Esperá el `BUILD END`; termina en ~240 MB |
 | 19 | Toolchain y `$HOME` | `rustup` dice *no installed toolchains* con la toolchain ahí | `rustup` lee `$HOME/.rustup`: en `fb-build` compilá con `HOME=/root` |
-| 20 | Guest-agent muerto | `QEMU guest agent is not running` con la VM viva | Sondear desde otra VM tuya; recuperar con reboot y si no, `reset` |
-| 21 | Comando largo por agente | El agente muere a mitad y perdés el trabajo | `setsid nohup ... > log` y leer el log |
+| 20 | Carácter > U+00FF en un `exec` (`—` `→` `✓`) | `QEMU guest agent is not running` con la VM viva — **no es la carga** (B-11) | `lab/pve.py` (codifica el argv); si ya pasó: reboot y si no, `reset` |
+| 21 | Comando largo por agente | La llamada vence a mitad y perdés el trabajo | `setsid nohup ... > log` y leer el log |
 | 22 | Puerto/unit equivocados | "se cayó el edge / el router / el admin" | `SY.edge` va en **:443**; en un spoke no hay `sy-router`; el admin es **loopback** |
 | 23 | `payload` de la API | Un `while` que gira sobre una operación exitosa | El `status` de arriba es el del sobre; lo real está bajo `payload.` |
 | 24 | `verify=19` en TLS local | "la cadena está rota" | Es falta de SNI. Probá con `--resolve` y un host que matchee el wildcard |
