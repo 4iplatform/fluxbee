@@ -113,6 +113,8 @@ mecanismo de acceso.
    privilegiada del agente. Motivo: las recetas deben ser **portables** (el próximo prod puede ser
    bare-metal, sin Proxmox ni guest-agent) y deben ejercitar **el camino que está testeado**.
 1. **Snapshot antes de todo cambio destructivo o dudoso.** Nombre: `pre-<accion>-YYYYMMDD`.
+   **Nunca más de 3 por VM:** si ya hay 3, se borra el más viejo antes. `lab/pve.py` lo hace
+   cumplir (HANDBOOK §12).
 2. **Un cambio por vez**, verificado antes del siguiente. Nada de lotes a ciegas.
 3. **Todo cambio va a la bitácora** del día (§5), incluido el que sale mal.
 4. **Lo irreversible se pregunta primero** (§4). Aunque el token pueda hacerlo.

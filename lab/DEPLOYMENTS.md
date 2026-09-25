@@ -7,6 +7,11 @@
 > **Regla (HANDBOOK §12): ningún `apt install` en prod — ni core-update a un spoke — sin una
 > entrada acá.** Sin entrada, el deploy no está hecho.
 >
+> **Snapshots: nunca más de 3 por VM (HANDBOOK §12, desde 2026-09-25).** El rollback "por snapshot"
+> de las entradas viejas puede ya no existir: el 2026-09-25 se borraron los de 0.1.19 a 0.1.29.
+> El camino que siempre queda es `apt install fluxbee=<anterior>`, porque el repo conserva todas
+> las versiones.
+>
 > Hermanos: [`logbook/HANDBOOK.md`](logbook/HANDBOOK.md) (recetas de deploy), [`logbook/METHOD.md`](logbook/METHOD.md)
 > (cómo se opera la infra), `logbook/YYYY-MM-DD.md` (bitácora narrativa), [`logbook/FINDINGS.md`](logbook/FINDINGS.md)
 > (hallazgos/bugs). Este doc es SÓLO el ledger de versiones en prod. Fechas en **ART (−03)**;

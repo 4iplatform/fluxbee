@@ -741,7 +741,10 @@ auditoría. Aplica al `apt install` en motherbee **y** a cada core-update de un 
 el deploy no está hecho.** Flujo:
 
 ```bash
-# ANTES del apt install: snapshoteá motherbee (el nombre va en la fila del ledger)
+# ANTES del apt install: snapshoteá motherbee (el nombre va en la fila del ledger).
+# Nunca más de 3 por VM (ver abajo): si ya hay 3, borrá el más viejo primero.
+python3 lab/pve.py snapshots 100                       # el más viejo sale primero
+python3 lab/pve.py delsnapshot 100 <el-más-viejo>      # solo si ya hay 3
 python3 lab/pve.py snapshot 100 pre-<algo>-<version>
 # ... build + publish + apt install ...
 # DESPUÉS: agregá al ledger una fila en la tabla + una entrada con:
@@ -752,6 +755,26 @@ python3 lab/pve.py snapshot 100 pre-<algo>-<version>
 La entrada de auditoría **no** reemplaza a la bitácora (`YYYY-MM-DD.md`, el viaje) ni a
 `FINDINGS.md` (los bugs): el ledger es sólo "qué versión quedó en prod y por qué se puede confiar
 en ella". Hay una plantilla lista al final de `DEPLOYMENTS.md`.
+
+### Snapshots: nunca más de 3 por VM · regla del operador (2026-09-25)
+
+**Ninguna VM tiene más de 3 snapshots, nunca.** Antes de tomar uno nuevo, si ya hay 3, se borra
+el más viejo. `lab/pve.py snapshot` **se niega** a crear el cuarto y te dice cuál borrar. El
+borrado queda como paso explícito (`delsnapshot`) porque es irreversible.
+
+- **Por qué:** en LVM-thin cada snapshot retiene todos los bloques que la VM cambió desde que se
+  tomó, y crece con el uso dentro del pool que comparten **todas** las VMs. Si el pool se llena,
+  se congelan todas. El 2026-09-25 fb-mb tenía 14, uno por release desde 0.1.19, y el primero con
+  RAM. Borrar 11 liberó **19 GiB** (el pool pasó de 64 % a 54 %).
+- **El snapshot es para volver atrás lo inmediato,** no para archivar versiones. Para bajar a una
+  versión vieja, el camino es el repo apt, que conserva todas: `apt install fluxbee=<anterior>`.
+  Por eso los rollbacks "por snapshot" de las entradas viejas de `DEPLOYMENTS.md` ya no existen.
+- **Borrar es irreversible:** se borra el más viejo, nombrado explícitamente, nunca en lote a ciegas.
+
+```bash
+python3 lab/pve.py snapshots <id>                  # por fecha, el más viejo primero
+python3 lab/pve.py delsnapshot <id> <el-más-viejo>
+```
 
 ### Commits y versiones · regla del operador (2026-09-25)
 
@@ -906,8 +929,10 @@ con tokens cargados es una pérdida real.
 
 No existe rollback de core como comando ([U-5](PENDING-BUGS.md#u-5)). Los dos caminos reales:
 
-1. **Snapshot en frío de las VMs** — ver §1 sobre por qué en frío.
-2. **Conservar el `.deb` anterior publicado** en el repo apt y bajar de versión con `apt`.
+1. **Snapshot en frío de las VMs** — ver §1 sobre por qué en frío. Con el máximo de 3 por VM
+   (§12), cubre solo lo reciente.
+2. **Conservar el `.deb` anterior publicado** en el repo apt y bajar de versión con `apt`. Es el
+   camino para cualquier versión vieja.
 
 ---
 
