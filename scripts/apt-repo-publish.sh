@@ -51,23 +51,73 @@ fi
 
 echo "== publish $(basename "$DEB") -> $REPO =="
 $SUDO mkdir -p "$REPO"
-$SUDO cp -f "$DEB" "$REPO/"
-# Flat repo: index every .deb in the dir, then Packages.gz + Release at the root.
-( cd "$REPO" && $SUDO sh -c 'dpkg-scanpackages -m . > Packages && gzip -kf Packages && apt-ftparchive release . > Release' )
+# Copy under a hidden temp name, then rename: a client downloading the same version (re-publish)
+# never reads a half-written .deb (rename is atomic; an in-flight download keeps the old inode).
+# The temp name ends in .partial, so dpkg-scanpackages never indexes it.
+TMP_DEB="$REPO/.$(basename "$DEB").partial"
+$SUDO cp -f "$DEB" "$TMP_DEB"
+$SUDO mv -f "$TMP_DEB" "$REPO/$(basename "$DEB")"
+# Flat repo: rebuild the index into temp files, then swap them in with atomic renames. Writing
+# `> Packages` in place truncated the LIVE index for the whole scan (~5 min with dozens of
+# ~240 MB .debs, all re-hashed), so a client running `apt-get update` meanwhile saw an EMPTY
+# repo. Release goes last, so it always describes the Packages already in place.
+( cd "$REPO" && $SUDO sh -c '
+    dpkg-scanpackages -m . > Packages.new &&
+    gzip -c Packages.new > Packages.gz.new &&
+    mv -f Packages.new Packages &&
+    mv -f Packages.gz.new Packages.gz &&
+    apt-ftparchive release . > Release.new &&
+    mv -f Release.new Release' )
 echo "   $(cd "$REPO" && grep -c '^Package:' Packages) package(s) indexed"
 
 if [[ "$SERVE" == "1" ]]; then
-  # Idempotent HTTP server for the repo (systemd-run unit; survives this shell).
+  # PERSISTENT HTTP server for the repo: a real ENABLED unit, so it survives reboots of the build
+  # box. It used to be a transient `systemd-run` unit: it died with every reboot, and its errors
+  # were swallowed (`>/dev/null 2>&1 || true`), so a re-run could leave the repo down silently.
+  # Idempotent: rewrites the unit only when its content changes, and restarts only then.
   if command -v systemctl >/dev/null 2>&1; then
-    $SUDO systemctl is-active fluxbee-apt >/dev/null 2>&1 || \
-      $SUDO systemd-run --unit=fluxbee-apt --working-directory="$REPO" \
-        python3 -m http.server "$PORT" >/dev/null 2>&1 || true
-    echo "   serving $REPO on :$PORT (systemd unit fluxbee-apt)"
+    UNIT=/etc/systemd/system/fluxbee-apt.service
+    WANT="[Unit]
+Description=Fluxbee flat apt repo ($REPO on :$PORT)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=$REPO
+ExecStart=/usr/bin/python3 -m http.server $PORT --bind 0.0.0.0
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target"
+    CHANGED=0
+    if [[ "$($SUDO cat "$UNIT" 2>/dev/null || true)" != "$WANT" ]]; then
+      printf '%s\n' "$WANT" | $SUDO tee "$UNIT" >/dev/null
+      CHANGED=1
+    fi
+    # A leftover TRANSIENT unit of the same name (pre-fix) lives in /run/systemd/transient, which
+    # outranks /etc in the unit search path: stop it so the persistent file takes over.
+    if [[ "$($SUDO systemctl show fluxbee-apt -p Transient --value 2>/dev/null || true)" == "yes" ]]; then
+      $SUDO systemctl stop fluxbee-apt
+      $SUDO systemctl reset-failed fluxbee-apt 2>/dev/null || true
+      CHANGED=1
+    fi
+    $SUDO systemctl daemon-reload
+    $SUDO systemctl enable --now fluxbee-apt >/dev/null 2>&1
+    if [[ "$CHANGED" == "1" ]]; then
+      $SUDO systemctl restart fluxbee-apt
+    fi
+    $SUDO systemctl is-active --quiet fluxbee-apt \
+      || { echo "Error: fluxbee-apt did not start — see: journalctl -u fluxbee-apt" >&2; exit 1; }
+    echo "   serving $REPO on :$PORT (persistent systemd unit fluxbee-apt, enabled at boot)"
   else
     echo "   (no systemd; serve manually: cd $REPO && python3 -m http.server $PORT)"
   fi
-  IP="$(hostname -I 2>/dev/null | awk '{print $1}')"
   echo
-  echo "Client one-liner:"
-  echo "  echo 'deb [trusted=yes] http://${IP:-<build-host>}:$PORT ./' | sudo tee /etc/apt/sources.list.d/fluxbee.list && sudo apt-get update && sudo apt-get install -y fluxbee"
+  echo "Client one-liner (use the address of the network the client is on):"
+  for IP in $(hostname -I 2>/dev/null); do
+    [[ "$IP" == *:* ]] && continue   # IPv4 only
+    echo "  echo 'deb [trusted=yes] http://$IP:$PORT ./' | sudo tee /etc/apt/sources.list.d/fluxbee.list && sudo apt-get update && sudo apt-get install -y fluxbee"
+  done
 fi
