@@ -235,7 +235,9 @@ ssh -o BatchMode=yes -o PreferredAuthentications=password -o PubkeyAuthenticatio
 
 La cloud image de Ubuntu dispara `unattended-upgrades` en el primer boot: baja ~15 MB, escribe
 ~2.5 GB, **reinicia sola**, y el guest-agent puede no volver (se está actualizando a sí mismo).
-Observado en cada clon, sin excepción.
+Observado en cada clon. Variante vista el 2026-09-25 (clon del template 250 en DEV): cloud-init
+actualizó paquetes, kernel incluido, y dejó `reboot-required` **sin reiniciarse**. La receta de
+abajo cubre los dos casos.
 
 **Receta:** después de clonar, esperá a que termine el ciclo y **reiniciá la VM** antes de
 considerarla operativa. Confirmá con: cloud-init `done`, agente `active`, `dpkg --audit` limpio, sin
@@ -434,6 +436,13 @@ sudo apt-get update && sudo apt-get install -y fluxbee    # o fluxbee=<versión>
 - **Validado 2026-09-25:** `apt-get install -s fluxbee` desde un Ubuntu 24.04 limpio en la 8.x
   (resuelve 13 paquetes) y descarga desde una máquina por VPN (origen `10.100.0.2`). La pata 8.x
   del box responde a clientes de **cualquier** subred por policy routing (tabla 108, ver bitácora).
+- **Validado de punta a punta en DEV (2026-09-25):**
+  - Punto de partida: una VM limpia en la LAN 4.x (VM 270 `fbdev-mb`, PC-004-156). **Llega al repo
+    sin VPN**, vía 192.168.4.1.
+  - `apt install` 0.1.33: el `.deb` de 245 MB tarda ~3 min por el enlace 4.x ↔ 8.x.
+  - `fluxbee-firstboot`: rc=0 en 28 s, sin editar el `hive.yaml`.
+  - Resultado: `motherbee alive`, 21 units, 0 failed, y los nodos base en `UNCONFIGURED`.
+  - Archi, `http://<ip>:3000`, responde desde la VPN.
 
 `fluxbee-firstboot` es **idempotente-ish pero irreversible en la práctica**: bootstrapea el hive.
 Su log cuenta exactamente qué hace:

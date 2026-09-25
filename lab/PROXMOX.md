@@ -22,6 +22,7 @@ Guía operativa del lab de VMs. Complementa (no duplica):
 | 242 | PC-004-157 | fbi-ingress | Ingress (DMZ). |
 | 243 | PC-004-157 | fbi-egress | Egress. |
 | 250/9000 | — | templates | No tocar (clonar, no arrancar). |
+| 270 | PC-004-156 | fbdev-mb | Motherbee **instalado con `apt install`** desde el repo de PROD (`192.168.8.180:8900`), `192.168.4.84`. Snapshot `pre-apt-install-20260925` = base limpia para repetir la prueba. |
 
 Los 3 hosts (`PC-004-165/156/157`) forman un cluster: cualquier `PVE_HOST` responde por todos,
 pero **`PVE_NODE` es obligatorio** para operar VMs (indica en qué host vive la VM).
