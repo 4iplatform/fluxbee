@@ -24,7 +24,7 @@
 |---|---|---|
 | Proxmox | `192.168.4.165` (PC-004-165), `192.168.4.157` (PC-004-157) | **`192.168.8.207`** (nodo `pve`) |
 | Uso | experimentar, romper, validar | servicio real |
-| Build box | fb-build VM210 @165 · repo apt `192.168.4.200:8900` | *(no tiene: los binarios se traen del lab)* |
+| Build box | fb-build VM210 @165 · repo apt `192.168.4.200:8900` | fb-build VM110 (fuera del cluster) · `10.10.10.50` (fbint) + `192.168.8.180` (vmbr0, DHCP) · repo apt `:8900` — devs: `http://192.168.8.180:8900` |
 | Hives | 240–243 @157 | *(a construir)* |
 | Red | 192.168.4.0/24 | 192.168.8.0/24, gw `192.168.8.1`, bridge `vmbr0` |
 | Timezone del host | — | `America/New_York` (**el journal del host va en EDT, la bitácora en ART −03**) |

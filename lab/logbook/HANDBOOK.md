@@ -53,7 +53,7 @@ No son opcionales: la mitad no se puede cambiar cómodamente después.
 | `fb-worker1` | 4G / 2 / 30G | `10.10.10.20` | — |
 | `fb-ingress` | 2G / 2 / 20G | `10.10.10.30` | pública `x.x.x.80/24` |
 | `fb-egress` | 2G / 2 / 20G | `10.10.10.40` | admin `192.168.8.240/24` |
-| `fb-build` | 8G / 4 / 80G | `10.10.10.50` | — *(fuera del cluster)* |
+| `fb-build` | 8G / 4 / 80G | `10.10.10.50` | admin `192.168.8.180/24` (DHCP, repo para los devs) *(fuera del cluster)* |
 
 > **La VM de build va FUERA del cluster, a propósito.** El plan ante una falla de integración es
 > *borrar el cluster y empezar de nuevo*. Si el `.deb` y el repo apt viven adentro, cada wipe cuesta
@@ -61,7 +61,14 @@ No son opcionales: la mitad no se puede cambiar cómodamente después.
 
 > **Sumá la RAM antes, no después.** Planifiqué 18 G para el cluster y después agregué la build de
 > 8 G sin re-sumar: 27.9 G asignados sobre 23 G físicos. KVM asigna a demanda y no dolió, pero es
-> riesgo latente. Política: **la build queda apagada salvo cuando compila.**
+> riesgo latente. ~~Política: la build queda apagada salvo cuando compila.~~
+>
+> **Política desde 2026-09-25 (decisión del operador): fb-build queda SIEMPRE ENCENDIDA** — sirve
+> el repo apt a los devs (`192.168.8.180:8900`). Holgura medida ese día: host 15.9/29.4 GB usados.
+>
+> **Su IP 8.x es DHCP, atada a la MAC** (`net1 = BC:24:11:EF:96:80`): el router mantiene la
+> asignación mientras la MAC no cambie (decisión del operador; no se reserva ni se fija). **No
+> recrees `net1`** — una placa nueva trae otra MAC, otra IP, y rompe el `sources.list` de cada dev.
 
 ---
 
@@ -344,7 +351,7 @@ dpkg-deb -c dist/fluxbee_*.deb | grep -E "ai_node_runner|wf-generic|io-"
 ### Publicarlo como repo apt
 
 ```bash
-scripts/apt-repo-publish.sh --serve     # sirve en :8900 (unit fluxbee-apt)
+scripts/apt-repo-publish.sh --serve     # sirve en :8900 (unit PERSISTENTE fluxbee-apt: sobrevive reboots)
 ```
 
 **Instalá siempre por `apt`, nunca con `dpkg -i`** — el paquete depende de `postgresql` y `apt` es el
@@ -397,6 +404,21 @@ apt-get update            # COMPLETO (ver 3.4)
 apt-get install -y fluxbee
 fluxbee-firstboot
 ```
+
+**Devs de la infra interna** (8.x directo, o 4.x por la VPN interna) — misma receta, otra IP:
+
+```bash
+echo "deb [trusted=yes] http://192.168.8.180:8900 ./" | sudo tee /etc/apt/sources.list.d/fluxbee.list
+sudo apt-get update && sudo apt-get install -y fluxbee    # o fluxbee=<versión>
+```
+
+- **Requisito:** Ubuntu **24.04+ amd64** — el `.deb` declara `libc6 (>= 2.39)`; en una distro más
+  vieja apt lo rechaza con error claro. `postgresql` y demás Depends salen del archive de Ubuntu.
+- **`[trusted=yes]` es obligatorio** mientras el repo no esté firmado (apt rechaza repos sin firma).
+- Instala un **backend completo** (motherbee): después va `hive.yaml` + `fluxbee-firstboot`.
+- **Validado 2026-09-25:** `apt-get install -s fluxbee` desde un Ubuntu 24.04 limpio en la 8.x
+  (resuelve 13 paquetes) y descarga desde una máquina por VPN (origen `10.100.0.2`). La pata 8.x
+  del box responde a clientes de **cualquier** subred por policy routing (tabla 108, ver bitácora).
 
 `fluxbee-firstboot` es **idempotente-ish pero irreversible en la práctica**: bootstrapea el hive.
 Su log cuenta exactamente qué hace:
@@ -711,6 +733,30 @@ python3 lab/pve.py snapshot 100 pre-<algo>-<version>
 La entrada de auditoría **no** reemplaza a la bitácora (`YYYY-MM-DD.md`, el viaje) ni a
 `FINDINGS.md` (los bugs): el ledger es sólo "qué versión quedó en prod y por qué se puede confiar
 en ella". Hay una plantilla lista al final de `DEPLOYMENTS.md`.
+
+### Commits y versiones · regla del operador (2026-09-25)
+
+Para seguir los cambios **por versión**:
+
+1. **Todo commit referencia la versión ACTUAL de fluxbee** en el asunto:
+   `[<versión>] <tipo>(<alcance>): <qué cambió>`. La versión actual es la última **en producción**
+   según [`../DEPLOYMENTS.md`](../DEPLOYMENTS.md) (la fila ✅ live más nueva) — no la que se está por
+   construir. Ejemplo: `[0.1.33] fix(apt-repo): persistent server unit + atomic index swap`.
+2. **El cuerpo referencia los cambios:** qué cambió y por qué, más las referencias que correspondan
+   (hallazgo `FINDINGS B-n`, bitácora `YYYY-MM-DD`, entrada del ledger).
+3. **Todo install en PROD cambia la versión** — mayor o menor, nunca se re-instala el mismo número.
+   En la etapa alfa se sube el último componente (`0.1.N → 0.1.N+1`) con `build-deb.sh <nueva>`,
+   y se registra en el ledger (sección anterior).
+
+Consecuencia útil: todo lo commiteado desde el último install lleva la versión base, así que el
+**delta que entra en la próxima versión** sale solo:
+
+```bash
+git log --oneline --grep='^\[0\.1\.33\]'     # lo que va a entrar en 0.1.34
+```
+
+El commit que registra un install en el ledger ya lleva la versión **nueva** (porque en ese momento
+es la que está en producción): `[0.1.34] docs(lab): ledger entry for 0.1.34 (…)`.
 
 ### Cómo saber si el update fue REAL y no fantasma
 

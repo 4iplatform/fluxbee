@@ -221,6 +221,52 @@
   `data.tar`. **Ya corregido** (commit `01db2cc`): preflight de espacio + verificación de integridad
   del `.deb` con fallo ruidoso.
 
+### B-10 🟢 El repo apt moría con cada reboot y se veía vacío durante cada publish
+
+- **Qué pasaba (dos defectos en `scripts/apt-repo-publish.sh`):**
+  1. `--serve` levantaba el server con `systemd-run` → unit **transitoria**: moría con cada reboot
+     del build box, y sus errores se tragaban (`>/dev/null 2>&1 || true`), así que un re-run podía
+     dejar el repo caído **sin avisar** (pasó en agosto, tras un reboot de VM110).
+  2. El índice se regeneraba *in place* (`dpkg-scanpackages > Packages`): durante el re-hash de
+     todos los `.deb` (~5,5 min con 33 × ~240 MB) el repo servía **0 paquetes** — un cliente que
+     hiciera `apt-get update` en esa ventana veía el repo vacío.
+- **Evidencia:** `FragmentPath=/run/systemd/transient/fluxbee-apt.service`; polls durante un publish:
+  0 paquetes de 14:47 a 14:52 (bitácora 2026-09-25).
+- **Solución:** `--serve` escribe una unit **persistente y habilitada** (idempotente, reemplaza una
+  transitoria vieja, falla ruidoso si no arranca); el índice se arma en `.new` y entra por renames
+  atómicos (`Release` último); el `.deb` se copia como `.partial` + `mv`. El one-liner imprime
+  todas las IPs del box.
+- **Validado en prod:** reboot de VM110 → repo arriba solo; publish real con 32 muestras desde un
+  cliente → mínimo 33 paquetes.
+
+### B-11 🟢 Un carácter por encima de U+00FF en `agent/exec` traba el guest-agent — era la "flakiness bajo carga"
+
+- **Qué pasa:** la API de Proxmox (Perl) no codifica los argumentos de `guest-exec` con caracteres
+  anchos: un solo `—` (U+2014), `→` o `✓` en el comando deja al **qemu-guest-agent trabado** —
+  hasta `guest-ping` da timeout ("QEMU guest agent is not running") hasta que el agente se
+  reinicia. Los caracteres Latin-1 (`é`, `ñ`, `¿`) pasan. `agent/file-write` con `encode=1` falla
+  por lo mismo (`Wide character in subroutine entry`, sin trabar nada). Además, la salida vuelve
+  con mojibake (bytes UTF-8 leídos como Latin-1: `—` → `â€”`).
+- **Evidencia (A/B controlado, VM110):** con el agente sano, `exec echo acento-é` → OK y el agente
+  sigue vivo; `exec echo guion—largo` → `guest-exec failed - got timeout` y el `ping` siguiente
+  muere. Se descartaron carga (host cpu 0 %), disco (34 %) y kernel (6.8.0-142 ejecuta bien).
+- **Impacto:** explica los episodios de "qga flaky" de toda la campaña de agosto (los comandos del
+  agente llevaban `—`, `→`, `✓` en los `echo`) — **la causa no era la carga**. Cada uno costó
+  reboots/resets de VMs de prod.
+- **Solución (en `lab/pve.py`):** argv no-ASCII viaja en base64 y un bootstrap ASCII lo decodifica
+  y ejecuta el argv original exacto; `push` codifica los bytes localmente (`encode=0`, también
+  sirve para binarios); la salida se des-mojibakea. De paso se aplicó la solución de **B-7**
+  (`env HOME=/root`), que no estaba en el helper. Validado en vivo: acentos/`—`/`✓`, exit codes
+  propagados, el agente sobrevive.
+
+### B-12 🟡 Todas las VMs de PROD tienen reboot pendiente por kernel + libc6
+
+- **Qué se observó:** `unattended-upgrades` instaló kernels 6.8.0-137…142 y libc6 en las VMs; hasta
+  que reinician siguen con el kernel viejo (fb-egress: corre 6.8.0-136, `reboot-required`). El
+  reboot de VM110 de hoy activó **6.8.0-142** sin problemas (guest-agent, red y repo OK).
+- **Pendiente:** decidir con el operador cuándo reiniciar mb/worker/ingress/egress (ventana de
+  mantenimiento) para aplicar las actualizaciones de seguridad.
+
 ---
 
 ## Cómo se usa este documento
