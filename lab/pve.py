@@ -116,7 +116,11 @@ def node():
 def wait_task(upid, timeout=600):
     if not upid:
         return
-    n, t0 = node(), time.time()
+    # A task runs on the node written in its UPID ("UPID:<node>:..."), which is not always
+    # PVE_NODE: a migration runs on the SOURCE node. Ask that node, and don't demand PVE_NODE.
+    parts = upid.split(":")
+    n = parts[1] if len(parts) > 2 and parts[0] == "UPID" and parts[1] else node()
+    t0 = time.time()
     sys.stderr.write("  task %s\n" % upid)
     while True:
         st = api("GET", "/nodes/%s/tasks/%s/status" % (n, urllib.parse.quote(upid, safe="")))
