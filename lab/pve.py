@@ -249,9 +249,39 @@ def cmd_wait_agent(a):
         time.sleep(3)
 
 
+# Proxmox's Perl API writes the guest-exec arguments to the agent channel without encoding
+# characters above U+00FF: a single one (an em-dash in a comment, a "→" in an echo) leaves the
+# QEMU guest agent WEDGED — every later call, even guest-ping, times out ("QEMU guest agent is
+# not running") until the agent restarts. Proven A/B on VM110, 2026-09-25: "é" (Latin-1) passes,
+# "—" (U+2014) wedges it. This was the real cause of the "qga flaky under load" episodes. So
+# non-ASCII argv never travels raw: each arg is base64-encoded (pure ASCII) and decoded back in
+# the guest by a tiny ASCII-only bootstrap that execs the ORIGINAL argv exactly (the `.`
+# sentinel keeps trailing newlines that `$(...)` would strip). ASCII argv is sent unchanged.
+_EXEC_B64_BOOTSTRAP = (
+    'a=(); for b in "$@"; do x="$(printf %s "$b" | base64 -d; printf .)"; a+=("${x%.}"); done; '
+    'exec "${a[@]}"'
+)
+
+
+def _ascii_safe_argv(argv):
+    if all(arg.isascii() for arg in argv):
+        return argv
+    encoded = [base64.b64encode(arg.encode("utf-8")).decode("ascii") for arg in argv]
+    return ["/bin/bash", "-c", _EXEC_B64_BOOTSTRAP, "pve-exec"] + encoded
+
+
+def _undo_latin1_mojibake(s):
+    """Proxmox hands back the guest's UTF-8 output bytes as Latin-1 characters ("—" arrives as
+    "â€”", "é" as "Ã©"). Round-trip them; leave text alone if it was not such a mis-decode."""
+    try:
+        return s.encode("latin-1").decode("utf-8")
+    except (UnicodeEncodeError, UnicodeDecodeError):
+        return s
+
+
 def _agent_exec(n, vmid, argv, input_data=None):
     """Run argv (list) in the VM via guest agent (as root). Returns (exitcode, out, err)."""
-    data = {"command": argv}
+    data = {"command": _ascii_safe_argv(argv)}
     if input_data is not None:
         data["input-data"] = input_data
     started = api("POST", "/nodes/%s/qemu/%s/agent/exec" % (n, vmid), data)
@@ -259,15 +289,19 @@ def _agent_exec(n, vmid, argv, input_data=None):
     while True:
         st = api("GET", "/nodes/%s/qemu/%s/agent/exec-status?pid=%s" % (n, vmid, pid))
         if st.get("exited"):
-            return st.get("exitcode", 0), st.get("out-data", ""), st.get("err-data", "")
+            return (st.get("exitcode", 0),
+                    _undo_latin1_mojibake(st.get("out-data", "")),
+                    _undo_latin1_mojibake(st.get("err-data", "")))
         time.sleep(1)
 
 
 def cmd_exec(a):
     n = node()
-    # everything after `--` is the command; wrap in bash -lc unless --raw
+    # everything after `--` is the command; wrap in bash -lc unless --raw. The guest agent runs
+    # without HOME (FINDINGS B-7): /root/.profile then sources "/.cargo/env" and every command
+    # carries that error on stderr (it broke pollers). Set HOME explicitly, as B-7 prescribes.
     cmdline = " ".join(a.cmd)
-    argv = a.cmd if a.raw else ["/bin/bash", "-lc", cmdline]
+    argv = a.cmd if a.raw else ["/usr/bin/env", "HOME=/root", "/bin/bash", "-lc", cmdline]
     code, out, err = _agent_exec(n, a.id, argv, a.input)
     if out:
         sys.stdout.write(out if out.endswith("\n") else out + "\n")
@@ -279,22 +313,21 @@ def cmd_exec(a):
 def cmd_push(a):
     """Write a local file into the VM via agent file-write (small files only).
 
-    Proxmox's `encode=1` means *Proxmox* base64-encodes the content we send
-    before handing it to the QEMU guest agent (which decodes it). So we send the
-    RAW text content, not pre-encoded — pre-encoding would double-encode and the
-    file would land as a literal base64 blob.
+    The QEMU guest agent takes base64. We base64-encode the RAW BYTES here and
+    pass `encode=0` ("content is already encoded"). Letting Proxmox encode it
+    (`encode=1`) breaks on any non-Latin-1 character: its Perl `encode_base64`
+    dies with "Wide character in subroutine entry" (hit pushing a script whose
+    comments contain an em-dash). Encoding the bytes ourselves also makes binary
+    files work, and never double-encodes (Proxmox only encodes when encode=1).
     """
     n = node()
     raw = open(a.local, "rb").read()
     if len(raw) > 900_000:
         sys.exit("  file too big for agent file-write (%d bytes). Serve it over HTTP "
                  "and `exec <id> -- curl -o %s <url>` instead." % (len(raw), a.remote))
-    try:
-        content = raw.decode("utf-8")
-    except UnicodeDecodeError:
-        sys.exit("  binary file — agent file-write here only supports text. Use an HTTP fetch.")
+    content = base64.b64encode(raw).decode("ascii")
     api("POST", "/nodes/%s/qemu/%s/agent/file-write" % (n, a.id),
-        {"file": a.remote, "content": content, "encode": 1})
+        {"file": a.remote, "content": content, "encode": 0})
     print("  wrote %s (%d bytes) -> %s:%s" % (a.local, len(raw), a.id, a.remote))
 
 
