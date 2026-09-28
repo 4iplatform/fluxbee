@@ -1000,6 +1000,15 @@ func (s *Service) handleOpaAction(src string, action string, version uint64, cfg
 			s.sendConfigResponse(src, action, version, "ok", PolicyMetadata{Version: version}, 0)
 		}
 		return true, nil
+	case "clear":
+		if err := s.clearPolicy(); err != nil {
+			code, detail := classifyOpaError(err)
+			return s.respondConfigError(src, action, 0, code, detail, broadcast)
+		}
+		if broadcast {
+			s.sendConfigResponse(src, action, 0, "ok", PolicyMetadata{Version: 0}, 0)
+		}
+		return true, nil
 	case "check":
 		if cfg == nil || cfg.Rego == "" {
 			return s.respondConfigError(src, action, version, "COMPILE_ERROR", "rego missing", broadcast)
@@ -1200,6 +1209,34 @@ func (s *Service) sendSystemMessage(dst, msg string, payload map[string]any) {
 		return
 	}
 	s.sendSDK(resp)
+}
+
+// clearPolicy removes the USER policy entirely -- current, staged and backup -- and goes back to
+// the state of a fresh install (no user policy; the router's SYSTEM policy is baked in and not
+// touched). Operator decision 2026-09-28 (factory reset): a clear is final, there is no rollback
+// of it. The region drops to version 0 / no wasm and the OPA_RELOAD carries the zero hash, which
+// makes every router unload what it still holds in memory.
+func (s *Service) clearPolicy() error {
+	for _, dir := range []string{"current", "staged", "backup"} {
+		path := filepath.Join(stateDir, dir)
+		entries, err := os.ReadDir(path)
+		if err != nil {
+			if os.IsNotExist(err) {
+				continue
+			}
+			return OpaError{Code: "SHM_ERROR", Detail: err.Error()}
+		}
+		for _, entry := range entries {
+			if err := os.RemoveAll(filepath.Join(path, entry.Name())); err != nil {
+				return OpaError{Code: "SHM_ERROR", Detail: err.Error()}
+			}
+		}
+	}
+	s.opaRegion.writePolicy(0, nil, "")
+	s.lastError = ""
+	s.broadcastOpaReload(0, "sha256:"+strings.Repeat("0", 64))
+	log.Printf("cleared user opa policy (current, staged, backup)")
+	return nil
 }
 
 func (s *Service) broadcastOpaReload(version uint64, hash string) {

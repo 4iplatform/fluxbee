@@ -3818,6 +3818,12 @@ const INTERNAL_ACTION_REGISTRY: &[InternalActionSpec] = &[
         allow_legacy_hive_id: false,
     },
     InternalActionSpec {
+        action: "opa_clear",
+        route: InternalActionRoute::OpaHttp(OpaAction::Clear),
+        requires_target: false,
+        allow_legacy_hive_id: false,
+    },
+    InternalActionSpec {
         action: "opa_check",
         route: InternalActionRoute::OpaHttp(OpaAction::Check),
         requires_target: false,
@@ -5995,6 +6001,9 @@ enum OpaAction {
     Apply,
     Rollback,
     Check,
+    /// Remove the USER policy on the target hive(s) -- current, staged and backup -- back to the
+    /// state of a fresh install; routers unload it. Final: there is no rollback of a clear.
+    Clear,
 }
 
 #[derive(Clone, Copy)]
@@ -6043,6 +6052,7 @@ impl OpaAction {
             OpaAction::Apply => "apply",
             OpaAction::Rollback => "rollback",
             OpaAction::Check => "compile",
+            OpaAction::Clear => "clear",
         }
     }
 
@@ -6671,6 +6681,11 @@ async fn handle_http(
         ("POST", "/opa/policy/rollback") => {
             let req: OpaRequest = serde_json::from_slice(&body)?;
             let (status, resp) = handle_opa_http(ctx, client, req, OpaAction::Rollback).await?;
+            respond_json(stream, status, &resp).await?;
+        }
+        ("POST", "/opa/policy/clear") => {
+            let req: OpaRequest = serde_json::from_slice(&body)?;
+            let (status, resp) = handle_opa_http(ctx, client, req, OpaAction::Clear).await?;
             respond_json(stream, status, &resp).await?;
         }
         ("POST", "/opa/policy/check") => {
@@ -7589,6 +7604,13 @@ async fn handle_hive_paths(
             let mut req = req;
             req.hive = Some(hive);
             let (status, resp) = handle_opa_http(ctx, client, req, OpaAction::Rollback).await?;
+            Ok(Some((status, resp)))
+        }
+        ("POST", ["opa", "policy", "clear"]) => {
+            let req: OpaRequest = serde_json::from_slice(body)?;
+            let mut req = req;
+            req.hive = Some(hive);
+            let (status, resp) = handle_opa_http(ctx, client, req, OpaAction::Clear).await?;
             Ok(Some((status, resp)))
         }
         ("POST", ["opa", "policy", "check"]) => {
@@ -8569,6 +8591,7 @@ async fn handle_opa_http(
             version
         }
         OpaAction::Rollback => req.version.unwrap_or(0),
+        OpaAction::Clear => 0,
         _ => next_opa_version(req.version)?,
     };
     let entrypoint = req
@@ -8629,7 +8652,7 @@ async fn handle_opa_http(
             ));
         }
         responses.extend(apply_responses);
-    } else if matches!(action, OpaAction::Apply | OpaAction::Rollback) {
+    } else if matches!(action, OpaAction::Apply | OpaAction::Rollback | OpaAction::Clear) {
         let apply_action = action.as_str();
         responses = send_opa_action(
             ctx,
@@ -9443,6 +9466,7 @@ fn admin_action_is_read_only(action: &str) -> bool {
             | "opa_compile"
             | "opa_apply"
             | "opa_rollback"
+            | "opa_clear"
             | "wf_rules_compile_apply"
             | "wf_rules_compile"
             | "wf_rules_apply"
@@ -9487,6 +9511,7 @@ fn admin_action_requires_confirmation(action: &str) -> bool {
             | "opa_compile"
             | "opa_apply"
             | "opa_rollback"
+            | "opa_clear"
     )
 }
 
@@ -9613,6 +9638,7 @@ fn admin_action_summary(action: &str) -> &'static str {
         "opa_compile" => "Compile OPA policy.",
         "opa_apply" => "Apply OPA policy.",
         "opa_rollback" => "Rollback OPA policy.",
+        "opa_clear" => "Remove the user OPA policy (current, staged, backup): back to a fresh install; routers unload it.",
         "wf_rules_compile_apply" => "Compile and apply a workflow definition through SY.wf-rules.",
         "wf_rules_compile" => "Compile a workflow definition without applying it.",
         "wf_rules_apply" => "Apply the staged workflow definition.",
@@ -9832,6 +9858,10 @@ fn admin_action_path_patterns(action: &str) -> Vec<&'static str> {
         "opa_compile" => vec!["POST /hives/{hive}/opa/policy/compile"],
         "opa_apply" => vec!["POST /hives/{hive}/opa/policy/apply"],
         "opa_rollback" => vec!["POST /hives/{hive}/opa/policy/rollback"],
+        "opa_clear" => vec![
+            "POST /hives/{hive}/opa/policy/clear",
+            "POST /opa/policy/clear",
+        ],
         "wf_rules_compile_apply" => vec!["POST /hives/{hive}/wf-rules"],
         "wf_rules_compile" => vec!["POST /hives/{hive}/wf-rules/compile"],
         "wf_rules_apply" => vec!["POST /hives/{hive}/wf-rules/apply"],
@@ -9922,7 +9952,7 @@ fn admin_action_path_params(action: &str) -> Vec<serde_json::Value> {
         | "wf_rules_list_workflows" | "timer_help" | "timer_list" | "timer_now"
         | "timer_now_in" | "timer_convert" | "timer_parse" | "timer_format" | "update"
         | "sync_hint" | "opa_compile_apply" | "opa_compile" | "opa_apply"
-        | "opa_rollback" | "opa_check" | "wf_rules_compile_apply" | "wf_rules_compile"
+        | "opa_rollback" | "opa_clear" | "opa_check" | "wf_rules_compile_apply" | "wf_rules_compile"
         | "wf_rules_apply" | "wf_rules_rollback" | "wf_rules_delete" => vec![
             admin_action_path_param(
             "hive",
@@ -10641,7 +10671,7 @@ fn admin_action_body_optional_fields(action: &str) -> Vec<serde_json::Value> {
                 "Optional explicit version. Otherwise a new version is assigned.",
             ),
         ],
-        "opa_apply" | "opa_rollback" => vec![admin_action_body_field(
+        "opa_apply" | "opa_rollback" | "opa_clear" => vec![admin_action_body_field(
             "hive",
             "string",
             "Optional explicit hive override for OPA broadcast targeting.",
@@ -10902,6 +10932,7 @@ fn admin_action_example_payload(action: &str) -> serde_json::Value {
         "opa_rollback" => serde_json::json!({
             "version": 11
         }),
+        "opa_clear" => serde_json::json!({}),
         "wf_rules_compile_apply" => serde_json::json!({
             "workflow_name": "invoice",
             "definition": {
@@ -11212,6 +11243,7 @@ fn admin_action_example_scmd(action: &str) -> Option<String> {
         "opa_rollback" => {
             r#"curl -X POST /hives/motherbee/opa/policy/rollback -d '{"version":11}'"#
         }
+        "opa_clear" => r#"curl -X POST /opa/policy/clear -d '{}'"#,
         "opa_check" => {
             r#"curl -X POST /hives/motherbee/opa/policy/check -d '{"rego":"package router\n\ndefault target = null\n","entrypoint":"router/target"}'"#
         }
@@ -11502,6 +11534,11 @@ fn admin_action_request_notes(action: &str) -> Vec<&'static str> {
         ],
         "opa_rollback" => vec![
             "If version is omitted, rollback uses the implementation default (currently 0).",
+        ],
+        "opa_clear" => vec![
+            "Removes the USER policy on the target hive(s) -- without a hive in the path/body, on EVERY hive.",
+            "Final: current, staged AND backup are removed, so there is no rollback of a clear.",
+            "Routers unload the policy they hold in memory (the SYSTEM authority policy is baked into the router and untouched).",
         ],
         "wf_rules_compile_apply" => vec![
             "workflow_name and definition are required.",

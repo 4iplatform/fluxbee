@@ -27,7 +27,7 @@ use crate::shm::{
     OpaSnapshot, RemoteHiveEntry, RemoteNodeEntry, RemoteRouteEntry, RemoteTapEntry,
     RemoteVpnEntry, RouterRegionReader, RouterRegionWriter, TapEntry, VpnAssignment, ACTION_DROP,
     ACTION_FORWARD, FLAG_ACTIVE, FLAG_DELETED, FLAG_FROZEN, FLAG_STALE, HEARTBEAT_STALE_MS,
-    HIVE_FLAG_SELF, MATCH_EXACT, MATCH_GLOB, MATCH_PREFIX, OPA_STATUS_ERROR, OPA_STATUS_LOADING,
+    HIVE_FLAG_SELF, MATCH_EXACT, MATCH_GLOB, MATCH_PREFIX, OPA_STATUS_ERROR, OPA_STATUS_LOADING, OPA_STATUS_OK,
 };
 use fluxbee_sdk::protocol::{
     build_announce, build_lsa, build_router_hello, build_ttl_exceeded, build_unreachable,
@@ -4668,6 +4668,15 @@ async fn read_config_snapshot_for_routing(
     guard.as_ref().and_then(|reader| reader.read_snapshot())
 }
 
+async fn unload_opa_user_policy(
+    opa: &Arc<Mutex<OpaResolver>>,
+    shm: &Arc<Mutex<RouterRegionWriter>>,
+) {
+    opa.lock().await.unload();
+    let mut shm_guard = shm.lock().await;
+    shm_guard.update_opa_status(0, OPA_STATUS_OK);
+}
+
 async fn apply_opa_reload(
     opa: &Arc<Mutex<OpaResolver>>,
     opa_reader: &Arc<Mutex<Option<OpaRegionReader>>>,
@@ -4742,6 +4751,14 @@ async fn maybe_refresh_opa_from_shm(
     let Some(header) = header else {
         return;
     };
+    if header.policy_version == 0 && header.wasm_size == 0 && header.status == OPA_STATUS_OK {
+        // Cleared (opa_clear) -- also caught here if the OPA_RELOAD broadcast was missed.
+        let holds_policy = opa.lock().await.has_policy();
+        if holds_policy {
+            unload_opa_user_policy(opa, shm).await;
+        }
+        return;
+    }
     if header.policy_version == 0 || header.wasm_size == 0 {
         return;
     }
@@ -4845,6 +4862,13 @@ async fn apply_opa_snapshot(
     snapshot: &OpaSnapshot,
 ) {
     if snapshot.wasm.is_empty() {
+        // Version 0 + no wasm is SY.opa.rules saying "no user policy" (opa_clear): unload what
+        // this router still holds in memory. Before this, an empty region was ignored and the
+        // router kept enforcing the old policy until restarted.
+        if snapshot.header.policy_version == 0 {
+            unload_opa_user_policy(opa, shm).await;
+            return;
+        }
         tracing::warn!(
             version = snapshot.header.policy_version,
             "opa reload skipped: empty policy"

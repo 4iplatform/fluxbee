@@ -107,6 +107,7 @@ pub fn classify_admin_action(action: &str) -> Option<ActionClass> {
         | "opa_apply"
         | "opa_compile_apply"
         | "opa_rollback"
+        | "opa_clear"
         | "update_policy_matrix"
         | "clear_override"
         | "sync_hint"

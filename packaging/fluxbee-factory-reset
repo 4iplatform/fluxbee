@@ -21,15 +21,18 @@ REMOVED (operator decisions, 2026-09-28):
     + SY.cognition's local cache/SHM + the conversation state of the base AI nodes and of the
     frontdesk (thread-state/, immediate-memory/) + the Architect chat sessions;
   - every vault secret except infrastructure (INFRA_KEYS / INFRA_PREFIXES below) -- including
-    AI provider keys: the hive ends up as freshly installed, AI degraded until they are reloaded.
+    AI provider keys: the hive ends up as freshly installed, AI degraded until they are reloaded;
+  - the user OPA policy on every hive (opa_clear: current, staged, backup; routers unload it --
+    the SYSTEM policy is baked into the router and untouched).
 
 KEPT: the installation (package, /etc/fluxbee, vault master key, TLS, mesh and spokes), what
 starts as SYSTEM (SY.* nodes and ILKs, the base nodes of base-nodes.json with their ILK, ICH and
 config -- e.g. the Cloud door stays published), routes/VPNs/taps and the operational history
 (admin command log, deploy history, vault audit).
 
-NOT covered yet (never touched): the user OPA policy (needs an opa_clear action + router support
-to unload it), blobs/publications. Everything goes through the product's own admin API except the message log,
+NOT covered yet (never touched): blobs/publications.
+
+Everything goes through the product's own admin API except the message log,
 which has no API: its tables are truncated with the storage consumers stopped.
 """
 import argparse
@@ -298,6 +301,24 @@ def cognition_paths(hive):
 ROOT_TENANT = "tnt:00000000-0000-0000-0000-000000000001"
 
 
+def opa_user_policy_versions():
+    """{hive: current user-policy version} from SY.opa.rules on every hive (0 = none)."""
+    status, resp = api("GET", "/opa/status")
+    found = {}
+    def walk(node):
+        if isinstance(node, dict):
+            inner = node.get("payload") if isinstance(node.get("payload"), dict) else {}
+            if node.get("hive") and "current_version" in inner:
+                found[node["hive"]] = inner.get("current_version") or 0
+            for value in node.values():
+                walk(value)
+        elif isinstance(node, list):
+            for value in node:
+                walk(value)
+    walk(resp)
+    return found
+
+
 def user_tenants(hive):
     status, resp = api("GET", "/hives/%s/identity/tenants?include_deleted=true" % q(hive))
     if not ok(status, resp):
@@ -403,6 +424,7 @@ def main():
     conv = conversation_dirs()
     cog = cognition_paths(hive_id)
     tenants = user_tenants(hive_id)
+    opa_versions = opa_user_policy_versions()
 
     print("fluxbee-factory-reset -- hive %s (%s)" % (hive_id, "EXECUTE" if execute else "DRY-RUN"))
     print("hives: %s" % ", ".join("%s=%s" % h for h in hives))
@@ -423,12 +445,14 @@ def main():
     print("[4] tenants to purge (all but the root; mark + purge): %d" % len(tenants))
     for t in tenants:
         print("    %s  %s%s" % (t.get("tenant_id"), t.get("name") or "", "  [already marked]" if t.get("deleted_at_ms") else ""))
+    print("[5] user OPA policy -- opa_clear on every hive (current, staged, backup; routers unload it): %s"
+          % (", ".join("%s=v%s" % kv for kv in sorted(opa_versions.items())) or "status unavailable"))
     if can_db:
-        print("[5] message log (%s), rows per table -- all truncated:" % STORAGE_DB)
+        print("[6] message log (%s), rows per table -- all truncated:" % STORAGE_DB)
         for t in tables:
             print("    %-36s %d" % (t, counts.get(t, 0)))
     else:
-        print("[5] message log (%s): run as root to see the row counts" % STORAGE_DB)
+        print("[6] message log (%s): run as root to see the row counts" % STORAGE_DB)
     print("    + SY.cognition cache: %s" % (", ".join(cog) or "none"))
     print("    + conversation state of the nodes that stay: %d dirs" % len(conv))
     for d in conv:
@@ -447,7 +471,7 @@ def main():
         die("confirmation does not match the hive_id -- nothing changed")
 
     t0 = time.time()
-    print("\n== [0/6] delete workflows")
+    print("\n== [0/7] delete workflows")
     wf_fail = []
     for hive, wf in workflows:
         status, resp = api("POST", "/hives/%s/wf-rules/delete" % q(hive),
@@ -457,10 +481,10 @@ def main():
         if not good:
             wf_fail.append((wf, status, str(resp)[:200]))
             print("    %s %s" % (status, str(resp)[:200]))
-    print("== [1/6] kill+purge user nodes")
+    print("== [1/7] kill+purge user nodes")
     node_fail = kill_user_nodes(user_nodes)
 
-    print("== [2/6] purge user ILKs")
+    print("== [2/7] purge user ILKs")
     # Keep the ILK of EVERY node still alive -- a kill that failed must not lose its identity.
     surviving_now = all_node_names(list_hives())
     ilk_fail = delete_until_empty(
@@ -468,13 +492,13 @@ def main():
         lambda i: purge_identity("ilks", hive_id, i["ilk_id"]),
         lambda i: i["ilk_id"])
 
-    print("== [3/6] delete user vault secrets")
+    print("== [3/7] delete user vault secrets")
     vault_fail = delete_until_empty(
         "secrets", lambda: user_secrets(hive_id),
         lambda s: api("DELETE", "/hives/%s/vault/secrets/%s" % (q(hive_id), q(s["key"]))),
         lambda s: s["key"])
 
-    print("== [4/6] delete tenants (all but the root)")
+    print("== [4/7] delete tenants (all but the root)")
     # Passes: a sponsor can only be marked/purged once its sponsored tenants are gone, so the
     # children fall on the first pass and their sponsors on the next.
     tenant_fail = delete_until_empty(
@@ -482,7 +506,11 @@ def main():
         lambda t: purge_identity("tenants", hive_id, t["tenant_id"]),
         lambda t: t["tenant_id"])
 
-    print("== [5/6] message log")
+    print("== [5/7] clear the user OPA policy (every hive)")
+    status, resp = api("POST", "/opa/policy/clear", {}, timeout=120)
+    opa_fail = [] if ok(status, resp) else [("opa_clear", status, str(resp)[:200])]
+    print("  %s" % ("cleared" if not opa_fail else "FAIL %s %s" % (status, str(resp)[:200])))
+    print("== [6/7] message log")
     # SY.* are real systemd units. The base AI nodes are orchestrator-managed TRANSIENT units: a
     # `systemctl stop` makes them vanish (a later start finds nothing), so their lifecycle goes
     # through the orchestrator -- kill_node WITHOUT purge (keeps config + ILK) / start_node.
@@ -511,7 +539,7 @@ def main():
     status, resp = api("DELETE", "/api/sessions", host=ARCHITECT)
     print("  Architect sessions: %s" % ("cleared" if 200 <= status < 300 else "FAIL %s %s" % (status, str(resp)[:160])))
 
-    print("== [6/6] verify")
+    print("== [7/7] verify")
     for _ in range(40):
         hives = list_hives()
         if all(st in ("alive", "connected") for _, st in hives):
@@ -520,7 +548,7 @@ def main():
     failed_units = sh(["systemctl", "--failed", "--no-legend", "--plain"], check=False).stdout.split()
     print("  hives: %s" % ", ".join("%s=%s" % h for h in hives))
     print("  failed units: %s" % (" ".join(u for u in failed_units if u.endswith(".service")) or "none"))
-    problems = len(wf_fail) + len(node_fail) + len(ilk_fail) + len(vault_fail) + len(tenant_fail) + len(left)
+    problems = len(wf_fail) + len(node_fail) + len(ilk_fail) + len(vault_fail) + len(tenant_fail) + len(opa_fail) + len(left)
     summary = "%s factory-reset hive=%s workflows=%d nodes=%d ilks=%d secrets=%d tables=%d problems=%d (%.0fs)" % (
         time.strftime("%Y-%m-%dT%H:%M:%S%z"), hive_id, len(workflows), len(user_nodes), len(ilks_now), len(secrets_now),
         len(tables), problems, time.time() - t0)

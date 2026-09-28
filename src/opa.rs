@@ -167,6 +167,25 @@ impl OpaResolver {
         (self.policy_version, self.opa_load_status)
     }
 
+    /// Drop the USER policy (SY.opa.rules cleared it with `opa_clear`): back to the state of a
+    /// fresh install, where routing runs without user OPA. Never used for the SYSTEM authority
+    /// policy, which lives in its own resolver (router/system_policy.rs).
+    pub fn unload(&mut self) {
+        self.module = None;
+        self.wasm = None;
+        self.policy_loaded = false;
+        self.policy_version = 0;
+        self.entrypoint = None;
+        self.base_data_bundle = None;
+        self.opa_load_status = OPA_STATUS_OK;
+        self.logged_missing = false;
+        tracing::info!("opa user policy unloaded (cleared by SY.opa.rules)");
+    }
+
+    pub fn has_policy(&self) -> bool {
+        self.policy_loaded
+    }
+
     /// Run the loaded policy for `input` and return the raw result JSON + its dump source.
     /// Shared by the USER routing path (`eval_target`) and the SYSTEM authority path
     /// (`evaluate_allow`) — same eval loop, different result parse.
@@ -1379,6 +1398,14 @@ fn json_to_opa_value(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn unload_returns_to_the_no_user_policy_state() {
+        let mut resolver = super::OpaResolver::new();
+        resolver.unload();
+        assert!(!resolver.has_policy());
+        assert_eq!(resolver.status(), (0, crate::shm::OPA_STATUS_OK));
+    }
+
     use super::{
         build_opa_input, merge_opa_data, parse_target_from_result, OpaDumpSource, OpaError,
     };
