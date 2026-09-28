@@ -993,6 +993,25 @@ fn translate_cloud_op(
             }
             Ok(("get_ilk", json!({ "ilk_id": ilk_id })))
         }
+        // Lifecycle: mark / restore only (purge is operator-only). ALWAYS scoped to the tenant
+        // Cloud claims: identity refuses an ilk of another tenant (ILK_TENANT_MISMATCH), and a
+        // tenant op can only name the claimed tenant itself.
+        "delete_ilk" | "restore_ilk" => {
+            let tenant_id = require_tenant_id(tenant_id, op)?;
+            let ilk_id = required_string(params, "ilk_id")?;
+            if !ilk_id.starts_with("ilk:") {
+                return Err(cloud_error(&format!(
+                    "{op} requires params.ilk_id as a canonical ilk:<uuid>"
+                )));
+            }
+            let action = if op == "delete_ilk" { "delete_ilk" } else { "restore_ilk" };
+            Ok((action, json!({ "ilk_id": ilk_id, "tenant_id": tenant_id })))
+        }
+        "delete_tenant" | "restore_tenant" => {
+            let tenant_id = require_tenant_id(tenant_id, op)?;
+            let action = if op == "delete_tenant" { "delete_tenant" } else { "restore_tenant" };
+            Ok((action, json!({ "tenant_id": tenant_id })))
+        }
         "" => Err(cloud_error("missing 'op'")),
         other => Err(cloud_error(&format!("unknown op '{other}'"))),
     }
@@ -1736,6 +1755,24 @@ mod tests {
         }
         // An op outside the vocabulary is rejected, not silently relayed.
         assert!(translate_cloud_op("kill_node", Some(tenant), &params).is_err());
+        // Purge is operator-only: never translatable from Cloud.
+        assert!(translate_cloud_op("purge_ilk", Some(tenant), &params).is_err());
+        assert!(translate_cloud_op("purge_tenant", Some(tenant), &params).is_err());
+    }
+
+    #[test]
+    fn translate_lifecycle_ops_are_scoped_to_the_claimed_tenant() {
+        let tenant = "tnt:11111111-1111-4111-8111-111111111111";
+        let params = json!({"ilk_id": "ilk:22222222-2222-4222-8222-222222222222",
+                            "tenant_id": "tnt:99999999-9999-4999-8999-999999999999"});
+        let (action, payload) = translate_cloud_op("delete_ilk", Some(tenant), &params).unwrap();
+        assert_eq!(action, "delete_ilk");
+        // the claim wins over any tenant in params
+        assert_eq!(payload["tenant_id"], json!(tenant));
+        let (action, payload) = translate_cloud_op("delete_tenant", Some(tenant), &params).unwrap();
+        assert_eq!(action, "delete_tenant");
+        assert_eq!(payload, json!({"tenant_id": tenant}));
+        assert!(translate_cloud_op("delete_tenant", None, &params).is_err());
     }
 
     #[test]

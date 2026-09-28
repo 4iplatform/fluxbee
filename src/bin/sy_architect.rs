@@ -11442,6 +11442,10 @@ fn admin_action_allows_ai_write(action: &str) -> bool {
             | "remove_runtime_version"
             | "set_ilk_definition"
             | "delete_ilk"
+            // reversible lifecycle only: purge_ilk / purge_tenant are operator-only
+            | "restore_ilk"
+            | "delete_tenant"
+            | "restore_tenant"
             | "set_node_config"
             | "node_control_config_set"
             | "send_node_message"

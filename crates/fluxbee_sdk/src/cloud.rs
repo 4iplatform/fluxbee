@@ -24,13 +24,29 @@ pub const CLOUD_OP_ACTIONS: &[(&str, &str)] = &[
     // `get_ilk`. The FAST existence/subset reads live in CLOUD_LOCAL_OPS (io.cloud reads the identity
     // SHM directly, no round-trip); this is the "give me everything" path that pays for the DB read.
     ("get_ilk_details", "get_ilk"),
+    // Lifecycle (operator decision 2026-09-28): Cloud may MARK deleted and RESTORE -- reversible --
+    // but never purge (purge_ilk / purge_tenant stay operator-only, outside this allowlist).
+    // io.cloud always scopes them to the tenant Cloud claims.
+    ("delete_ilk", "delete_ilk"),
+    ("restore_ilk", "restore_ilk"),
+    ("delete_tenant", "delete_tenant"),
+    ("restore_tenant", "restore_tenant"),
 ];
 
 /// The admin actions IO.cloud may relay over the mesh — the security allowlist SY.admin enforces in
 /// `authorize_cloud_relay`. Kept as a `&[&str]` const for ergonomic `.contains()` at the gate; a
 /// unit test pins it to be exactly the dedup range of [`CLOUD_OP_ACTIONS`], so the two SDK constants
 /// (and therefore SY.admin's enforcement and IO.cloud's translation) can never diverge.
-pub const CLOUD_EXPOSED_ACTIONS: &[&str] = &["create_tenant", "vault_put", "run_node", "get_ilk"];
+pub const CLOUD_EXPOSED_ACTIONS: &[&str] = &[
+    "create_tenant",
+    "vault_put",
+    "run_node",
+    "get_ilk",
+    "delete_ilk",
+    "restore_ilk",
+    "delete_tenant",
+    "restore_tenant",
+];
 
 /// The [`CLOUD_EXPOSED_ACTIONS`] set computed from [`CLOUD_OP_ACTIONS`] (deduped, first-seen order).
 pub fn cloud_exposed_actions() -> Vec<&'static str> {
@@ -95,6 +111,14 @@ pub fn cloud_action_catalog() -> Value {
           "summary": "FAST existence read of one tenant from the identity SHM. Needs params.tenant_id (tnt:<uuid>). Returns {exists, tenant_id, ilk_count}." },
         { "op": "list_ilks", "category": "local",
           "summary": "List the ilks of ONE tenant from the identity SHM (subset each). Needs params.tenant_id (tnt:<uuid>). Returns {tenant_id, count, ilks:[{ilk_id, ilk_type, registration_status, display_name}]}." },
+        { "op": "delete_ilk", "category": "relay",
+          "summary": "Mark one ilk of YOUR tenant deleted (reversible: hidden, its email/channels stay reserved until the operator purges it). Needs tenant_id + params.ilk_id. Idempotent." },
+        { "op": "restore_ilk", "category": "relay",
+          "summary": "Undo delete_ilk for one ilk of YOUR tenant. Needs tenant_id + params.ilk_id. Refused while the tenant itself is deleted (restore the tenant)." },
+        { "op": "delete_tenant", "category": "relay",
+          "summary": "Mark YOUR tenant (the tenant_id you claim) deleted and, in cascade, its ilks (reversible; name/domain stay reserved). Refused while node identities live in it or it sponsors tenants." },
+        { "op": "restore_tenant", "category": "relay",
+          "summary": "Undo delete_tenant for YOUR tenant: it and the ilks its cascade marked come back." },
         { "op": "get_ilk_details", "category": "relay",
           "summary": "FULL identity read (all identification PII + channels + tenant) — relayed to SY.admin. Selector: params.ilk_id (ilk:<uuid>) OR params.email + params.tenant_id (pre-resolved locally to the canonical ilk_id, then relayed). Slower than get_ilk (a DB read); use it when you need everything." }
     ])
@@ -109,7 +133,16 @@ mod tests {
         // The allowlist SY.admin enforces is exactly the set of actions io.cloud can produce.
         assert_eq!(
             cloud_exposed_actions(),
-            vec!["create_tenant", "vault_put", "run_node", "get_ilk"]
+            vec![
+                "create_tenant",
+                "vault_put",
+                "run_node",
+                "get_ilk",
+                "delete_ilk",
+                "restore_ilk",
+                "delete_tenant",
+                "restore_tenant"
+            ]
         );
     }
 

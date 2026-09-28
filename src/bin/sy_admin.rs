@@ -99,6 +99,9 @@ const ADMIN_EXECUTOR_PILOT_ACTIONS: &[&str] = &[
     "vault_rollback",
     "set_ilk_definition",
     "delete_ilk",
+    "restore_ilk",
+    "delete_tenant",
+    "restore_tenant",
     "publish_runtime_package",
     "publish_cloud_endpoint",
     "sync_hint",
@@ -3629,6 +3632,36 @@ const INTERNAL_ACTION_REGISTRY: &[InternalActionSpec] = &[
         allow_legacy_hive_id: false,
     },
     InternalActionSpec {
+        action: "restore_ilk",
+        route: InternalActionRoute::Command("restore_ilk"),
+        requires_target: true,
+        allow_legacy_hive_id: false,
+    },
+    InternalActionSpec {
+        action: "purge_ilk",
+        route: InternalActionRoute::Command("purge_ilk"),
+        requires_target: true,
+        allow_legacy_hive_id: false,
+    },
+    InternalActionSpec {
+        action: "delete_tenant",
+        route: InternalActionRoute::Command("delete_tenant"),
+        requires_target: true,
+        allow_legacy_hive_id: false,
+    },
+    InternalActionSpec {
+        action: "restore_tenant",
+        route: InternalActionRoute::Command("restore_tenant"),
+        requires_target: true,
+        allow_legacy_hive_id: false,
+    },
+    InternalActionSpec {
+        action: "purge_tenant",
+        route: InternalActionRoute::Command("purge_tenant"),
+        requires_target: true,
+        allow_legacy_hive_id: false,
+    },
+    InternalActionSpec {
         action: "list_tenants",
         route: InternalActionRoute::Query("list_tenants"),
         requires_target: true,
@@ -5895,6 +5928,26 @@ fn enforce_cloud_relay_content(
         Ok(())
     };
     match action {
+        // Lifecycle over the Cloud relay (mark / restore only; purge is not in the allowlist):
+        // the request MUST carry the claimed tenant. For ilks, SY.identity refuses an ilk of
+        // another tenant (ILK_TENANT_MISMATCH); without this check a compromised relay could drop
+        // the tenant and mark ANY ilk.
+        "delete_ilk" | "restore_ilk" | "delete_tenant" | "restore_tenant" => {
+            let tenant_id = params
+                .get("tenant_id")
+                .and_then(|v| v.as_str())
+                .map(str::trim)
+                .unwrap_or("");
+            let valid = tenant_id
+                .strip_prefix("tnt:")
+                .and_then(|raw| uuid::Uuid::parse_str(raw).ok())
+                .is_some();
+            if !valid {
+                return Err(format!(
+                    "IO.cloud {action} must be scoped to the claimed tenant (tenant_id tnt:<uuid>)"
+                ));
+            }
+        }
         "run_node" => {
             let node_name = params.get("node_name").and_then(|v| v.as_str()).unwrap_or("");
             if !node_name.starts_with("IO.") {
@@ -7101,6 +7154,17 @@ async fn handle_hive_paths(
             Ok(Some((status, resp)))
         }
         ("GET", ["identity", "ilks"]) => {
+            if query_flag(query, "include_deleted") {
+                let (status, resp) = handle_identity_query(
+                    ctx,
+                    client,
+                    "list_ilks",
+                    serde_json::json!({"include_deleted": true}),
+                    Some(hive),
+                )
+                .await?;
+                return Ok(Some((status, resp)));
+            }
             let (status, resp) = handle_admin_query(ctx, client, "list_ilks", Some(hive)).await?;
             Ok(Some((status, resp)))
         }
@@ -7145,7 +7209,48 @@ async fn handle_hive_paths(
                 handle_admin_command(ctx, client, "delete_ilk", payload, Some(hive)).await?;
             Ok(Some((status, resp)))
         }
+        ("POST", ["identity", "ilks", ilk_id, "restore"]) => {
+            let payload = serde_json::json!({ "ilk_id": decode_percent(ilk_id) });
+            let (status, resp) =
+                handle_admin_command(ctx, client, "restore_ilk", payload, Some(hive)).await?;
+            Ok(Some((status, resp)))
+        }
+        ("POST", ["identity", "ilks", ilk_id, "purge"]) => {
+            let payload = serde_json::json!({ "ilk_id": decode_percent(ilk_id) });
+            let (status, resp) =
+                handle_admin_command(ctx, client, "purge_ilk", payload, Some(hive)).await?;
+            Ok(Some((status, resp)))
+        }
+        ("DELETE", ["identity", "tenants", tenant_id]) => {
+            let payload = serde_json::json!({ "tenant_id": decode_percent(tenant_id) });
+            let (status, resp) =
+                handle_admin_command(ctx, client, "delete_tenant", payload, Some(hive)).await?;
+            Ok(Some((status, resp)))
+        }
+        ("POST", ["identity", "tenants", tenant_id, "restore"]) => {
+            let payload = serde_json::json!({ "tenant_id": decode_percent(tenant_id) });
+            let (status, resp) =
+                handle_admin_command(ctx, client, "restore_tenant", payload, Some(hive)).await?;
+            Ok(Some((status, resp)))
+        }
+        ("POST", ["identity", "tenants", tenant_id, "purge"]) => {
+            let payload = serde_json::json!({ "tenant_id": decode_percent(tenant_id) });
+            let (status, resp) =
+                handle_admin_command(ctx, client, "purge_tenant", payload, Some(hive)).await?;
+            Ok(Some((status, resp)))
+        }
         ("GET", ["identity", "tenants"]) => {
+            if query_flag(query, "include_deleted") {
+                let (status, resp) = handle_identity_query(
+                    ctx,
+                    client,
+                    "list_tenants",
+                    serde_json::json!({"include_deleted": true}),
+                    Some(hive),
+                )
+                .await?;
+                return Ok(Some((status, resp)));
+            }
             let (status, resp) =
                 handle_admin_query(ctx, client, "list_tenants", Some(hive)).await?;
             Ok(Some((status, resp)))
@@ -8775,7 +8880,7 @@ async fn handle_admin_query(
         return Ok(build_cloud_actions_catalog_response());
     }
     if matches!(action, "list_ilks" | "list_tenants") {
-        return handle_identity_query(ctx, client, action, hive).await;
+        return handle_identity_query(ctx, client, action, serde_json::json!({}), hive).await;
     }
     let payload = normalize_admin_payload(action, serde_json::json!({}), hive.as_deref());
     let request = build_admin_request(ctx, action, payload, hive);
@@ -9359,6 +9464,11 @@ fn admin_action_requires_confirmation(action: &str) -> bool {
             | "remove_runtime_version"
             | "set_ilk_definition"
             | "delete_ilk"
+            | "restore_ilk"
+            | "purge_ilk"
+            | "delete_tenant"
+            | "restore_tenant"
+            | "purge_tenant"
             | "set_node_config"
             | "node_control_config_set"
             | "set_storage"
@@ -9416,7 +9526,18 @@ fn admin_action_summary(action: &str) -> &'static str {
             "Set the cognitive definition hashes for one identity agent ILK."
         }
         "delete_ilk" => {
-            "Delete one identity ILK and its ICH mappings. Refuses well-known SY system ILKs (SYSTEM_ILK_PROTECTED)."
+            "Mark one identity ILK deleted (reversible: hidden, its keys stay reserved until purge). Refuses well-known SY system ILKs (SYSTEM_ILK_PROTECTED)."
+        }
+        "restore_ilk" => "Undo the deleted mark of one identity ILK (refused while its tenant is marked).",
+        "purge_ilk" => {
+            "Physically and finally remove one identity ILK that is ALREADY marked deleted (ILK_NOT_DELETED otherwise)."
+        }
+        "delete_tenant" => {
+            "Mark one identity tenant deleted and, in cascade, its active ILKs (reversible; name/domain stay reserved)."
+        }
+        "restore_tenant" => "Undo the deleted mark of one tenant and of the ILKs its cascade marked.",
+        "purge_tenant" => {
+            "Physically and finally remove one tenant ALREADY marked deleted and every ILK in it. Refused while it has vault secrets, node identities or sponsored tenants."
         }
         "list_tenants" => "List identity tenants in a hive.",
         "get_tenant" => "Read one identity tenant in a hive.",
@@ -9632,6 +9753,11 @@ fn admin_action_path_patterns(action: &str) -> Vec<&'static str> {
             vec!["POST /hives/{hive}/identity/ilks/{ilk_id}/definition"]
         }
         "delete_ilk" => vec!["DELETE /hives/{hive}/identity/ilks/{ilk_id}"],
+        "restore_ilk" => vec!["POST /hives/{hive}/identity/ilks/{ilk_id}/restore"],
+        "purge_ilk" => vec!["POST /hives/{hive}/identity/ilks/{ilk_id}/purge"],
+        "delete_tenant" => vec!["DELETE /hives/{hive}/identity/tenants/{tenant_id}"],
+        "restore_tenant" => vec!["POST /hives/{hive}/identity/tenants/{tenant_id}/restore"],
+        "purge_tenant" => vec!["POST /hives/{hive}/identity/tenants/{tenant_id}/purge"],
         "list_tenants" => vec!["GET /hives/{hive}/identity/tenants"],
         "get_tenant" => vec!["GET /hives/{hive}/identity/tenants/{tenant_id}"],
         "create_tenant" => vec!["POST /hives/{hive}/identity/tenants"],
@@ -9844,7 +9970,7 @@ fn admin_action_path_params(action: &str) -> Vec<serde_json::Value> {
             admin_action_path_param("runtime", "string", "Runtime name, for example ai.chat."),
             admin_action_path_param("version", "string", "Runtime version to delete."),
         ],
-        "get_ilk" | "set_ilk_definition" | "delete_ilk" => vec![
+        "get_ilk" | "set_ilk_definition" | "delete_ilk" | "restore_ilk" | "purge_ilk" => vec![
             admin_action_path_param("hive", "string", "Target hive id in the URL path."),
             admin_action_path_param(
                 "ilk_id",
@@ -10976,6 +11102,21 @@ fn admin_action_example_scmd(action: &str) -> Option<String> {
         "delete_ilk" => {
             "curl -X DELETE /hives/motherbee/identity/ilks/ilk:550e8400-e29b-41d4-a716-446655440000"
         }
+        "restore_ilk" => {
+            "curl -X POST /hives/motherbee/identity/ilks/ilk:550e8400-e29b-41d4-a716-446655440000/restore"
+        }
+        "purge_ilk" => {
+            "curl -X POST /hives/motherbee/identity/ilks/ilk:550e8400-e29b-41d4-a716-446655440000/purge"
+        }
+        "delete_tenant" => {
+            "curl -X DELETE /hives/motherbee/identity/tenants/tnt:550e8400-e29b-41d4-a716-446655440000"
+        }
+        "restore_tenant" => {
+            "curl -X POST /hives/motherbee/identity/tenants/tnt:550e8400-e29b-41d4-a716-446655440000/restore"
+        }
+        "purge_tenant" => {
+            "curl -X POST /hives/motherbee/identity/tenants/tnt:550e8400-e29b-41d4-a716-446655440000/purge"
+        }
         "list_tenants" => "curl -X GET /hives/motherbee/identity/tenants",
         "get_tenant" => {
             "curl -X GET /hives/motherbee/identity/tenants/tnt:550e8400-e29b-41d4-a716-446655440000"
@@ -11243,9 +11384,29 @@ fn admin_action_request_notes(action: &str) -> Vec<&'static str> {
             "This does not create the blob assets; Archi must write canonical role/skill/handbook/personality assets to blob before applying the hashes.",
         ],
         "delete_ilk" => vec![
-            "Hard-deletes one ILK record and its ICH mappings; the SHM update propagates to all SY.identity replicas via delta broadcast.",
-            "Refuses to delete a well-known SY system ILK (identification.source == hive.system_nodes) with SYSTEM_ILK_PROTECTED.",
-            "Primary use case: orchestrator-driven tabula-rasa of a node instance during purge teardown.",
+            "MARKS one ILK deleted: hidden from lookups/SHM/listings (list with ?include_deleted=true), reversible with restore_ilk.",
+            "Its keys (channels, node_name, email) stay RESERVED until purge: provisioning/registering them answers ILK_DELETED.",
+            "Idempotent (already_deleted:true). Refuses a well-known SY system ILK with SYSTEM_ILK_PROTECTED.",
+            "Physical removal is purge_ilk, which requires this mark first (the orchestrator's purge teardown does both).",
+        ],
+        "restore_ilk" => vec![
+            "Undoes delete_ilk: the ILK resolves again with the same keys.",
+            "Refused with TENANT_DELETED while its tenant is marked (restore the tenant instead), ILK_NOT_DELETED if it is not marked.",
+        ],
+        "purge_ilk" => vec![
+            "Final: removes the ILK row, its ICHs and aliases; replicas get IlkDelete deltas.",
+            "Requires the ILK to be marked first (ILK_NOT_DELETED otherwise). Operator-only: not offered to Archi's executor nor to Fluxbee Cloud.",
+        ],
+        "delete_tenant" => vec![
+            "MARKS the tenant deleted and, in cascade, its active ILKs (reason tenant). Its name/domain stay reserved: create_tenant answers TENANT_DELETED.",
+            "Refused for the root tenant (TENANT_ROOT_PROTECTED), while node identities live in it (TENANT_HAS_NODES) or while it sponsors active tenants (TENANT_HAS_CHILDREN).",
+        ],
+        "restore_tenant" => vec![
+            "Undoes delete_tenant: the tenant and ONLY the ILKs its cascade marked come back; ILKs deleted on their own stay deleted.",
+        ],
+        "purge_tenant" => vec![
+            "Final: removes the tenant and every ILK in it. Requires the tenant to be marked first (TENANT_NOT_DELETED otherwise).",
+            "Refused while SY.vault still holds secrets of the tenant (TENANT_HAS_SECRETS, keys listed), node identities remain or it sponsors tenants. Operator-only.",
         ],
         "list_tenants" => vec![
             "Lists the identity tenants currently known by SY.identity for one hive.",
@@ -13059,10 +13220,15 @@ async fn handle_admin_command_inner(
         "get_ilk"
             | "set_ilk_definition"
             | "delete_ilk"
+            | "restore_ilk"
+            | "purge_ilk"
             | "get_tenant"
             | "create_tenant"
             | "update_tenant"
             | "set_tenant_sponsor"
+            | "delete_tenant"
+            | "restore_tenant"
+            | "purge_tenant"
     ) {
         return handle_identity_command(ctx, client, action, payload, hive).await;
     }
@@ -13440,6 +13606,7 @@ async fn handle_identity_query(
     ctx: &AdminContext,
     client: &RouterDispatcher,
     action: &str,
+    payload: serde_json::Value,
     hive: Option<String>,
 ) -> Result<(u16, String), AdminError> {
     let target_hive = hive.unwrap_or_else(|| ctx.hive_id.clone());
@@ -13454,11 +13621,89 @@ async fn handle_identity_query(
         &target,
         request_msg,
         response_msg,
-        serde_json::json!({}),
+        payload,
         admin_action_timeout(action),
     )
     .await;
     Ok(build_admin_http_response(action, response))
+}
+
+/// `?key=true` / `?key=1` on an admin GET.
+fn query_flag(query: &HashMap<String, String>, key: &str) -> bool {
+    query
+        .get(key)
+        .map(|value| matches!(value.trim().to_ascii_lowercase().as_str(), "true" | "1" | "yes"))
+        .unwrap_or(false)
+}
+
+/// purge_tenant is refused while SY.vault still holds secrets of that tenant (operator
+/// decision 2026-09-28: purge never cascades into other stores; clean them first). Identity
+/// cannot see the vault, so SY.admin checks it before forwarding TNT_PURGE. Fail closed: if the
+/// vault cannot be listed, the purge does not go through.
+async fn purge_tenant_vault_block(
+    client: &RouterDispatcher,
+    target_hive: &str,
+    payload: &serde_json::Value,
+) -> Option<(u16, String)> {
+    let tenant_id = payload
+        .get("tenant_id")
+        .and_then(|value| value.as_str())
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+    let blocked = |code: &str, detail: String| {
+        Some((
+            409,
+            serde_json::json!({
+                "status": "error",
+                "action": "purge_tenant",
+                "payload": serde_json::Value::Null,
+                "error_code": code,
+                "error_detail": detail,
+            })
+            .to_string(),
+        ))
+    };
+    let response = send_system_request(
+        client,
+        &format!("SY.vault@{}", target_hive),
+        MSG_VAULT_LIST,
+        MSG_VAULT_LIST_RESPONSE,
+        serde_json::json!({"filter": {"tenant_id": tenant_id, "limit": 1000}}),
+        Duration::from_secs(15),
+    )
+    .await;
+    match response {
+        Ok(listing) => {
+            let keys: Vec<String> = listing
+                .get("secrets")
+                .and_then(|value| value.as_array())
+                .map(|secrets| {
+                    secrets
+                        .iter()
+                        .filter_map(|secret| secret.get("key").and_then(|k| k.as_str()))
+                        .map(str::to_string)
+                        .collect()
+                })
+                .unwrap_or_default();
+            if keys.is_empty() {
+                None
+            } else {
+                blocked(
+                    "TENANT_HAS_SECRETS",
+                    format!(
+                        "SY.vault still holds {} secret(s) of {tenant_id}; delete them first: {}",
+                        keys.len(),
+                        keys.join(", ")
+                    ),
+                )
+            }
+        }
+        Err(err) => blocked(
+            "VAULT_CHECK_FAILED",
+            format!("could not list SY.vault secrets of {tenant_id} (refusing to purge): {err}"),
+        ),
+    }
 }
 
 async fn handle_identity_command(
@@ -13469,11 +13714,23 @@ async fn handle_identity_command(
     hive: Option<String>,
 ) -> Result<(u16, String), AdminError> {
     let target_hive = hive.unwrap_or_else(|| ctx.hive_id.clone());
+    if action == "purge_tenant" {
+        if let Some(blocked) =
+            purge_tenant_vault_block(client, &target_hive, &payload).await
+        {
+            return Ok(blocked);
+        }
+    }
     let target = format!("SY.identity@{}", target_hive);
     let (request_msg, response_msg) = match action {
         "get_ilk" => ("ILK_GET", "ILK_GET_RESPONSE"),
         "set_ilk_definition" => ("ILK_SET_DEFINITION", "ILK_SET_DEFINITION_RESPONSE"),
         "delete_ilk" => ("ILK_DELETE", "ILK_DELETE_RESPONSE"),
+        "restore_ilk" => ("ILK_RESTORE", "ILK_RESTORE_RESPONSE"),
+        "purge_ilk" => ("ILK_PURGE", "ILK_PURGE_RESPONSE"),
+        "delete_tenant" => ("TNT_DELETE", "TNT_DELETE_RESPONSE"),
+        "restore_tenant" => ("TNT_RESTORE", "TNT_RESTORE_RESPONSE"),
+        "purge_tenant" => ("TNT_PURGE", "TNT_PURGE_RESPONSE"),
         "get_tenant" => ("TNT_GET", "TNT_GET_RESPONSE"),
         "create_tenant" => ("TNT_CREATE", "TNT_CREATE_RESPONSE"),
         "update_tenant" => ("TNT_UPDATE", "TNT_UPDATE_RESPONSE"),
@@ -15068,17 +15325,38 @@ mod tests {
     use zip::write::FileOptions;
 
     #[test]
+    fn cloud_relay_lifecycle_requires_the_claimed_tenant_server_side() {
+        let relay = Some("IO.cloud@motherbee");
+        let ilk = serde_json::json!({"ilk_id": "ilk:22222222-2222-4222-8222-222222222222"});
+        for action in ["delete_ilk", "restore_ilk", "delete_tenant", "restore_tenant"] {
+            assert!(
+                enforce_cloud_relay_content(relay, action, "motherbee", &ilk).is_err(),
+                "{action} without tenant_id must be refused for IO.cloud"
+            );
+        }
+        let scoped = serde_json::json!({
+            "ilk_id": "ilk:22222222-2222-4222-8222-222222222222",
+            "tenant_id": "tnt:11111111-1111-4111-8111-111111111111",
+        });
+        assert!(enforce_cloud_relay_content(relay, "delete_ilk", "motherbee", &scoped).is_ok());
+        // the operator (caller None) is not scoped
+        assert!(enforce_cloud_relay_content(None, "delete_ilk", "motherbee", &ilk).is_ok());
+    }
+
+    #[test]
     fn cloud_relay_gate_allows_only_iocloud_over_mesh() {
         // A non-exposed action is untouched for a NON-io.cloud caller.
         assert!(
             authorize_cloud_relay(Some("AI.worker@motherbee"), "list_nodes", "motherbee").is_ok()
         );
-        // FIX-1 (HIGH): IO.cloud is DEFAULT-DENY beyond the exposed 3 — a compromised relay cannot
-        // be a confused deputy for these privileged actions.
+        // FIX-1 (HIGH): IO.cloud is DEFAULT-DENY beyond the exposed set — a compromised relay
+        // cannot be a confused deputy for these privileged actions. (delete_ilk left this list on
+        // 2026-09-28: it now only MARKS and is tenant-scoped; the physical purges stay denied.)
         for evil in [
             "vault_get",
             "vault_list",
-            "delete_ilk",
+            "purge_ilk",
+            "purge_tenant",
             "add_route",
             "add_vpn",
             "kill_node",
@@ -15209,9 +15487,18 @@ mod tests {
     #[test]
     fn cloud_actions_catalog_is_the_exposed_registry_subset() {
         let expected_surface: std::collections::HashSet<&str> =
-            ["create_tenant", "vault_put", "run_node", "get_ilk"]
-                .into_iter()
-                .collect();
+            [
+                "create_tenant",
+                "vault_put",
+                "run_node",
+                "get_ilk",
+                "delete_ilk",
+                "restore_ilk",
+                "delete_tenant",
+                "restore_tenant",
+            ]
+            .into_iter()
+            .collect();
         let configured_surface: std::collections::HashSet<&str> =
             IO_CLOUD_EXPOSED_ACTIONS.iter().copied().collect();
         assert_eq!(configured_surface, expected_surface);

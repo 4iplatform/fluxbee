@@ -124,6 +124,11 @@ pub fn classify_admin_action(action: &str) -> Option<ActionClass> {
         | "list_ilks"
         | "get_ilk"
         | "delete_ilk"
+        | "restore_ilk"
+        | "purge_ilk"
+        | "delete_tenant"
+        | "restore_tenant"
+        | "purge_tenant"
         | "list_vocabulary"
         | "add_vocabulary"
         | "deprecate_vocabulary" => Some(ActionClass::IdentityChange),

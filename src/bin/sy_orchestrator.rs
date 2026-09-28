@@ -75,6 +75,10 @@ const RPC_CH_SYSTEM: &str = "system";
 const MSG_ILK_REGISTER: &str = "ILK_REGISTER";
 const MSG_ILK_UPDATE: &str = "ILK_UPDATE";
 const MSG_ILK_DELETE: &str = "ILK_DELETE";
+/// Since 2026-09-28 ILK_DELETE only MARKS (reversible, keys reserved); tearing a node down for
+/// good needs the purge too -- otherwise its node_name stays reserved and a re-spawn under the
+/// same name would be refused with ILK_DELETED.
+const MSG_ILK_PURGE: &str = "ILK_PURGE";
 const LIFECYCLE_NODES_BOOTSTRAP_TIMEOUT_SECS: u64 = 60;
 const ADD_HIVE_SOCKET_READY_PROBE_TIMEOUT_SECS: u64 = 10;
 const SYNCTHING_SERVICE_NAME: &str = "fluxbee-syncthing";
@@ -13828,7 +13832,7 @@ async fn delete_node_ilk_for_spawn_rollback(
     ilk_id: &str,
 ) -> serde_json::Value {
     let identity_target = format!("SY.identity@{}", identity_primary_hive_id);
-    let response = orchestrator_identity_system_call_ok(
+    let mark = orchestrator_identity_system_call_ok(
         state,
         &identity_target,
         MSG_ILK_DELETE,
@@ -13836,6 +13840,19 @@ async fn delete_node_ilk_for_spawn_rollback(
         system_forward_timeout(),
     )
     .await;
+    let response = match mark {
+        Ok(_) => {
+            orchestrator_identity_system_call_ok(
+                state,
+                &identity_target,
+                MSG_ILK_PURGE,
+                serde_json::json!({ "ilk_id": ilk_id }),
+                system_forward_timeout(),
+            )
+            .await
+        }
+        Err(err) => Err(err),
+    };
     match response {
         Ok(payload) => serde_json::json!({
             "status": "ok",
@@ -16398,18 +16415,25 @@ async fn delete_ilk_for_teardown(
     _target_hive: &str,
 ) -> serde_json::Value {
     let admin_target = teardown_admin_target();
-    let response = orchestrator_admin_command(
-        state,
-        AdminCommandRequest {
-            admin_target: &admin_target,
-            action: "delete_ilk",
-            target: Some(PRIMARY_HIVE_ID),
-            params: serde_json::json!({ "ilk_id": ilk_id }),
-            request_id: None,
-            timeout: Duration::from_secs(15),
-        },
-    )
-    .await;
+    let admin_ilk_call = |action: &'static str| {
+        orchestrator_admin_command(
+            state,
+            AdminCommandRequest {
+                admin_target: &admin_target,
+                action,
+                target: Some(PRIMARY_HIVE_ID),
+                params: serde_json::json!({ "ilk_id": ilk_id }),
+                request_id: None,
+                timeout: Duration::from_secs(15),
+            },
+        )
+    };
+    // Mark first (idempotent), then purge: a node torn down with purge_instance must not leave
+    // its identity behind with its node_name reserved.
+    let response = match admin_ilk_call("delete_ilk").await {
+        Ok(resp) if resp.status == "ok" => admin_ilk_call("purge_ilk").await,
+        other => other,
+    };
 
     match response {
         Ok(resp) if resp.status == "ok" => serde_json::json!({

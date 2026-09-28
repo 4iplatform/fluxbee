@@ -944,6 +944,37 @@ No existe rollback de core como comando ([U-5](PENDING-BUGS.md#u-5)). Los dos ca
 2. **Conservar el `.deb` anterior publicado** en el repo apt y bajar de versión con `apt`. Es el
    camino para cualquier versión vieja.
 
+### Identidades: marcar, restaurar, purgar (desde 0.1.34)
+
+Decisión del operador (2026-09-28): los ILKs y tenants son datos únicos, así que **borrar solo
+marca** y **purgar** es un paso aparte y deliberado.
+
+```bash
+A=127.0.0.1:8080; H=motherbee
+curl -X DELETE $A/hives/$H/identity/ilks/<ilk_id>                # marcar (reversible, idempotente)
+curl -X POST   $A/hives/$H/identity/ilks/<ilk_id>/restore        # deshacer la marca
+curl -X POST   $A/hives/$H/identity/ilks/<ilk_id>/purge          # físico: exige la marca previa
+curl -X DELETE $A/hives/$H/identity/tenants/<tenant_id>          # marca el tenant y, en cascada, sus ILKs
+curl -X POST   $A/hives/$H/identity/tenants/<tenant_id>/restore  # vuelve con lo que se llevó la cascada
+curl -X POST   $A/hives/$H/identity/tenants/<tenant_id>/purge    # físico: el tenant y todos sus ILKs
+curl "$A/hives/$H/identity/ilks?include_deleted=true"            # los marcados solo aparecen así
+```
+
+- **Marcado = oculto pero reservado.** No resuelve (ni en la SHM, ni en los routers, ni en el
+  `get_ilk` de Cloud). Su email, sus canales y su `node_name`, o el nombre y dominio del tenant,
+  **quedan tomados** hasta la purga: reusarlos da `ILK_DELETED` o `TENANT_DELETED`.
+- **Restaurar un tenant** trae solo los ILKs que marcó su cascada; los que se borraron sueltos
+  antes siguen borrados.
+- **Protecciones:**
+  - no se toca el tenant raíz ni los ILKs de sistema;
+  - un tenant con identidades de nodo (`TENANT_HAS_NODES`) o con tenants apadrinados
+    (`TENANT_HAS_CHILDREN`) no se marca ni se purga;
+  - purgar un tenant que todavía tiene secretos en el vault da `TENANT_HAS_SECRETS`.
+- **Fluxbee Cloud** puede marcar y restaurar, siempre acotado al tenant que reclama. **Purgar es
+  solo del operador**, y Archi tampoco puede.
+- **El kill con `purge_instance`** marca y purga el ILK del nodo, para que el nombre del nodo
+  quede libre.
+
 ### Reset a fábrica — `fluxbee-factory-reset` (2026-09-28)
 
 Borra **lo que crearon los usuarios** y deja el hive como lo dejó `fluxbee-firstboot`, sin
@@ -959,7 +990,7 @@ sudo fluxbee-factory-reset --yes --confirm-hive motherbee   # ejecuta sin pregun
 | Se borra | Se conserva |
 |---|---|
 | Nodos lanzados por usuarios, en todos los hives (kill + purge: se van con su ILK, sus secretos y sus timers) | La instalación: paquete, `/etc/fluxbee`, master key del vault, TLS, mesh y spokes |
-| ILKs de usuario: humanos, agentes y temporales creados por mensajes o por Cloud | Lo que arranca como sistema: nodos `SY.*` y sus ILKs, y los nodos base de `base-nodes.json` con su ILK, ICH y config (la puerta de Cloud sigue publicada) |
+| ILKs de usuario (humanos, agentes y temporales creados por mensajes o por Cloud), **purgados**, incluidos los que un borrado previo solo marcó, y **todos los tenants salvo el raíz** | Lo que arranca como sistema: nodos `SY.*` y sus ILKs, y los nodos base de `base-nodes.json` con su ILK, ICH y config (la puerta de Cloud sigue publicada) |
 | El log de mensajes: todas las tablas de `fluxbee_storage`, la caché de SY.cognition, el estado de conversación (`thread-state/`, `immediate-memory/`) y las sesiones de Archi | Rutas, VPNs y taps |
 | Todos los secretos del vault salvo los de infraestructura (`storage_postgres_url`, `ssh:*`, `edge_tls*`, `edge_channel_secret:*`). **Incluye las claves de IA**: el AI queda degradado hasta recargarlas | El historial operativo: audit log de admin, historial de deploys y audit del vault |
 
@@ -967,8 +998,12 @@ sudo fluxbee-factory-reset --yes --confirm-hive motherbee   # ejecuta sin pregun
   workers) se llama a `wf_rules_delete` con `force`, que borra la regla, el nodo `WF.*`, su estado
   y sus paquetes, incluidas las instancias en curso. Un nodo `WF.*` huérfano, sin workflow, se mata
   como cualquier nodo de usuario.
-- **Solo reporta, no toca:** los tenants (fluxbee todavía no tiene borrado de tenants), la política
-  OPA de usuario (falta la acción `opa_clear` y que el router la descargue) y los blobs.
+- **Identity:** desde 0.1.34, borrar un ILK o un tenant solo lo **marca**. La marca es
+  reversible, lo oculta y deja sus claves reservadas. La **purga** es física y exige la marca
+  previa. El reset hace las dos cosas: marca y purga. Los tenants van después del vault, porque
+  purgar uno que tiene secretos se rechaza, y en pasadas: primero los hijos y después sus sponsors.
+- **No toca todavía:** la política OPA de usuario (falta la acción `opa_clear` y que el router la
+  descargue) y los blobs.
 - **Usa la API del producto** para todo, salvo el log de mensajes, que no tiene API: sus tablas se
   truncan con los consumidores frenados.
 - **Es seguro re-correrlo** si algo falla a mitad: cada paso borra solo lo que todavía está. Deja

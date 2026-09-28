@@ -14,7 +14,9 @@ REMOVED (operator decisions, 2026-09-28):
     state and its packages, running instances included);
   - nodes launched by users, on every hive: kill_node + purge_instance, which also deletes the
     node's ILK, its dedicated vault secrets and its timers;
-  - the remaining user ILKs (humans/agents/temporaries created by messages or by Cloud);
+  - the remaining user ILKs (humans/agents/temporaries created by messages or by Cloud), and
+    every tenant but the root -- PURGED: identity's delete only marks (reversible, keys reserved),
+    so the reset marks and then purges; ilks/tenants some earlier delete left marked go too;
   - the message log: every table of the fluxbee_storage DB (turns, events, inbox, cognition...)
     + SY.cognition's local cache/SHM + the conversation state of the base AI nodes and of the
     frontdesk (thread-state/, immediate-memory/) + the Architect chat sessions;
@@ -26,8 +28,8 @@ starts as SYSTEM (SY.* nodes and ILKs, the base nodes of base-nodes.json with th
 config -- e.g. the Cloud door stays published), routes/VPNs/taps and the operational history
 (admin command log, deploy history, vault audit).
 
-NOT covered yet (reported, never touched): tenants (fluxbee has no tenant delete yet), the user
-OPA policy (needs an opa_clear action + router support to unload it), blobs/publications. Everything goes through the product's own admin API except the message log,
+NOT covered yet (never touched): the user OPA policy (needs an opa_clear action + router support
+to unload it), blobs/publications. Everything goes through the product's own admin API except the message log,
 which has no API: its tables are truncated with the storage consumers stopped.
 """
 import argparse
@@ -225,19 +227,20 @@ def classify_nodes(hives, base, local_hive, workflows):
 
 
 def list_ilks(hive):
-    status, resp = api("GET", "/hives/%s/identity/ilks" % q(hive))
+    # include_deleted: a reset also PURGES ilks some earlier normal delete only marked.
+    status, resp = api("GET", "/hives/%s/identity/ilks?include_deleted=true" % q(hive))
     if not ok(status, resp):
         die("GET identity/ilks failed (%s): %s" % (status, str(resp)[:200]))
     return payload(resp).get("ilks", [])
 
 
 def user_ilks(hive, surviving, base):
-    """Everything that is not SYSTEM, not already deleted and not the ILK of a node that stays.
-    System/base node ILKs are protected BY NAME too: a base node that happens to be down (not in
-    the inventory) must never lose its identity."""
+    """Everything that is not SYSTEM and not the ILK of a node that stays -- marked ones included
+    (the reset purges them). System/base node ILKs are protected BY NAME too: a base node that
+    happens to be down (not in the inventory) must never lose its identity."""
     out = []
     for i in list_ilks(hive):
-        if i.get("ilk_type") == "system" or i.get("deleted_at_ms"):
+        if i.get("ilk_type") == "system":
             continue
         node = i.get("node_name")
         if node and (node in surviving or is_system_name(node, base)):
@@ -292,11 +295,24 @@ def cognition_paths(hive):
     return [p for p in paths if os.path.exists(p)]
 
 
-def list_tenants(hive):
-    status, resp = api("GET", "/hives/%s/identity/tenants" % q(hive))
-    if not ok(status, resp) or "tenants" not in payload(resp):
-        return None
-    return payload(resp)["tenants"]
+ROOT_TENANT = "tnt:00000000-0000-0000-0000-000000000001"
+
+
+def user_tenants(hive):
+    status, resp = api("GET", "/hives/%s/identity/tenants?include_deleted=true" % q(hive))
+    if not ok(status, resp):
+        die("GET identity/tenants failed (%s): %s" % (status, str(resp)[:200]))
+    return [t for t in payload(resp).get("tenants", []) if t.get("tenant_id") != ROOT_TENANT]
+
+
+def purge_identity(kind, hive, record):
+    """The identity model (2026-09-28): delete only MARKS; purge is physical and needs the mark.
+    A reset does both. Marking is idempotent (already_deleted), so it is always sent first."""
+    base = "/hives/%s/identity/%s/%s" % (q(hive), kind, q(record))
+    status, resp = api("DELETE", base)
+    if not ok(status, resp):
+        return status, resp
+    return api("POST", base + "/purge", {})
 
 
 # ---------------------------------------------------------------- actions
@@ -321,18 +337,25 @@ def kill_user_nodes(nodes):
 
 
 def delete_until_empty(label, lister, deleter, ident):
-    """Delete, re-list, repeat: lists are paged (vault: 200) and a pass may race a late write."""
-    failed, done = {}, 0
+    """Delete, re-list, repeat. Lists are paged (vault: 200), a pass may race a late write, and
+    some deletes depend on others (a sponsor tenant goes only after its sponsored ones): failures
+    are RETRIED while a pass makes progress; it stops when a whole pass deletes nothing."""
+    done, failed = 0, {}
     for _ in range(10):
-        pending = [x for x in lister() if ident(x) not in failed]
+        pending = lister()
+        failed = {}
         if not pending:
             break
+        progress = 0
         for item in pending:
             status, resp = deleter(item)
             if ok(status, resp):
                 done += 1
+                progress += 1
             else:
                 failed[ident(item)] = "%s %s" % (status, str(resp)[:160])
+        if not progress:
+            break
     print("  %s: %d deleted, %d failed" % (label, done, len(failed)))
     for k, why in failed.items():
         print("    FAIL %s: %s" % (k, why))
@@ -379,7 +402,7 @@ def main():
     counts = storage_counts(tables) if can_db else {}
     conv = conversation_dirs()
     cog = cognition_paths(hive_id)
-    tenants = list_tenants(hive_id)
+    tenants = user_tenants(hive_id)
 
     print("fluxbee-factory-reset -- hive %s (%s)" % (hive_id, "EXECUTE" if execute else "DRY-RUN"))
     print("hives: %s" % ", ".join("%s=%s" % h for h in hives))
@@ -389,28 +412,29 @@ def main():
     print("[1] user nodes to kill+purge (ILK, node secrets and timers go with them): %d" % len(user_nodes))
     for hive, name in user_nodes:
         print("    %s  (on %s)" % (name, hive))
-    print("[2] user ILKs to delete: %d  (plus the ILKs of the nodes above)" % len(ilks_now))
+    print("[2] user ILKs to purge (mark + purge; already-marked ones too): %d  (plus the ILKs of the nodes above)" % len(ilks_now))
     for i in ilks_now:
-        print("    %s  %-8s %s" % (i.get("ilk_id"), i.get("ilk_type"), i.get("display_name") or i.get("node_name") or ""))
+        print("    %s  %-8s %s%s" % (i.get("ilk_id"), i.get("ilk_type"), i.get("display_name") or i.get("node_name") or "",
+                                   "  [already marked]" if i.get("deleted_at_ms") else ""))
     print("[3] vault secrets to delete (everything but infra): %d" % len(secrets_now))
     for s in secrets_now:
         md = s.get("metadata") or {}
         print("    %-40s %s" % (s.get("key"), md.get("resource_type") or ""))
+    print("[4] tenants to purge (all but the root; mark + purge): %d" % len(tenants))
+    for t in tenants:
+        print("    %s  %s%s" % (t.get("tenant_id"), t.get("name") or "", "  [already marked]" if t.get("deleted_at_ms") else ""))
     if can_db:
-        print("[4] message log (%s), rows per table -- all truncated:" % STORAGE_DB)
+        print("[5] message log (%s), rows per table -- all truncated:" % STORAGE_DB)
         for t in tables:
             print("    %-36s %d" % (t, counts.get(t, 0)))
     else:
-        print("[4] message log (%s): run as root to see the row counts" % STORAGE_DB)
+        print("[5] message log (%s): run as root to see the row counts" % STORAGE_DB)
     print("    + SY.cognition cache: %s" % (", ".join(cog) or "none"))
     print("    + conversation state of the nodes that stay: %d dirs" % len(conv))
     for d in conv:
         print("      %s" % d)
     print("    + Architect chat sessions (DELETE /api/sessions)")
     print("\nNOT touched: routes/VPNs/taps, history, system + base nodes (%s)." % ", ".join(sorted(base)))
-    if tenants is not None:
-        extra = [t for t in tenants if t.get("tenant_id") != "tnt:00000000-0000-0000-0000-000000000001"]
-        print("Out of scope (reported only): %d non-root tenants -- fluxbee has no tenant delete yet" % len(extra))
 
     if not execute:
         print("\nDRY-RUN: nothing was changed. Execute with --yes.")
@@ -423,7 +447,7 @@ def main():
         die("confirmation does not match the hive_id -- nothing changed")
 
     t0 = time.time()
-    print("\n== [0/5] delete workflows")
+    print("\n== [0/6] delete workflows")
     wf_fail = []
     for hive, wf in workflows:
         status, resp = api("POST", "/hives/%s/wf-rules/delete" % q(hive),
@@ -433,24 +457,32 @@ def main():
         if not good:
             wf_fail.append((wf, status, str(resp)[:200]))
             print("    %s %s" % (status, str(resp)[:200]))
-    print("== [1/5] kill+purge user nodes")
+    print("== [1/6] kill+purge user nodes")
     node_fail = kill_user_nodes(user_nodes)
 
-    print("== [2/5] delete user ILKs")
+    print("== [2/6] purge user ILKs")
     # Keep the ILK of EVERY node still alive -- a kill that failed must not lose its identity.
     surviving_now = all_node_names(list_hives())
     ilk_fail = delete_until_empty(
-        "ILKs", lambda: user_ilks(hive_id, surviving_now, base),
-        lambda i: api("DELETE", "/hives/%s/identity/ilks/%s" % (q(hive_id), q(i["ilk_id"]))),
+        "ILKs (mark + purge)", lambda: user_ilks(hive_id, surviving_now, base),
+        lambda i: purge_identity("ilks", hive_id, i["ilk_id"]),
         lambda i: i["ilk_id"])
 
-    print("== [3/5] delete user vault secrets")
+    print("== [3/6] delete user vault secrets")
     vault_fail = delete_until_empty(
         "secrets", lambda: user_secrets(hive_id),
         lambda s: api("DELETE", "/hives/%s/vault/secrets/%s" % (q(hive_id), q(s["key"]))),
         lambda s: s["key"])
 
-    print("== [4/5] message log")
+    print("== [4/6] delete tenants (all but the root)")
+    # Passes: a sponsor can only be marked/purged once its sponsored tenants are gone, so the
+    # children fall on the first pass and their sponsors on the next.
+    tenant_fail = delete_until_empty(
+        "tenants (mark + purge)", lambda: user_tenants(hive_id),
+        lambda t: purge_identity("tenants", hive_id, t["tenant_id"]),
+        lambda t: t["tenant_id"])
+
+    print("== [5/6] message log")
     # SY.* are real systemd units. The base AI nodes are orchestrator-managed TRANSIENT units: a
     # `systemctl stop` makes them vanish (a later start finds nothing), so their lifecycle goes
     # through the orchestrator -- kill_node WITHOUT purge (keeps config + ILK) / start_node.
@@ -479,7 +511,7 @@ def main():
     status, resp = api("DELETE", "/api/sessions", host=ARCHITECT)
     print("  Architect sessions: %s" % ("cleared" if 200 <= status < 300 else "FAIL %s %s" % (status, str(resp)[:160])))
 
-    print("== [5/5] verify")
+    print("== [6/6] verify")
     for _ in range(40):
         hives = list_hives()
         if all(st in ("alive", "connected") for _, st in hives):
@@ -488,7 +520,7 @@ def main():
     failed_units = sh(["systemctl", "--failed", "--no-legend", "--plain"], check=False).stdout.split()
     print("  hives: %s" % ", ".join("%s=%s" % h for h in hives))
     print("  failed units: %s" % (" ".join(u for u in failed_units if u.endswith(".service")) or "none"))
-    problems = len(wf_fail) + len(node_fail) + len(ilk_fail) + len(vault_fail) + len(left)
+    problems = len(wf_fail) + len(node_fail) + len(ilk_fail) + len(vault_fail) + len(tenant_fail) + len(left)
     summary = "%s factory-reset hive=%s workflows=%d nodes=%d ilks=%d secrets=%d tables=%d problems=%d (%.0fs)" % (
         time.strftime("%Y-%m-%dT%H:%M:%S%z"), hive_id, len(workflows), len(user_nodes), len(ilks_now), len(secrets_now),
         len(tables), problems, time.time() - t0)
