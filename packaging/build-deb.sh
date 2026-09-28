@@ -232,6 +232,10 @@ ln -sf ../share/fluxbee/fluxbee-firstboot "$DEST/usr/bin/fluxbee-firstboot"
 # The base-node manifest travels to the target too: fluxbee-firstboot reads it to know which
 # runtimes to auto-spawn as default instances at boot (boot=true) and under which names.
 install -m0644 packaging/base-nodes.json "$DEST/usr/share/fluxbee/base-nodes.json"
+# The factory reset reads that same manifest to know which nodes are SYSTEM (kept) and which
+# were launched by users (removed). Dry-run by default: `sudo fluxbee-factory-reset`.
+install -m0755 packaging/fluxbee-factory-reset "$DEST/usr/share/fluxbee/fluxbee-factory-reset"
+ln -sf ../share/fluxbee/fluxbee-factory-reset "$DEST/usr/bin/fluxbee-factory-reset"
 # U-3: the install-time runtime registrar and the merger it calls. Same shape as
 # fluxbee-firstboot above (shipped under /usr/share/fluxbee with a /usr/bin symlink) — it is
 # also the operator's repair surface: `sudo fluxbee-seed-runtimes`.

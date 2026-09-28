@@ -1,0 +1,431 @@
+#!/usr/bin/env python3
+"""fluxbee-factory-reset -- remove what USERS created and leave the hive as fluxbee-firstboot left it.
+
+    sudo fluxbee-factory-reset                                 # DRY-RUN: lists what it would remove
+    sudo fluxbee-factory-reset --yes                           # executes; asks you to type the hive_id
+    sudo fluxbee-factory-reset --yes --confirm-hive motherbee  # executes, non-interactive
+
+Runs on the MOTHERBEE and covers the whole hive: user nodes on the spokes are killed through
+their own orchestrator (kill_node is forwarded), identity deletes replicate as deltas.
+
+REMOVED (operator decision, 2026-09-28):
+  - nodes launched by users, on every hive: kill_node + purge_instance, which also deletes the
+    node's ILK, its dedicated vault secrets and its timers;
+  - the remaining user ILKs (humans/agents/temporaries created by messages or by Cloud);
+  - the message log: every table of the fluxbee_storage DB (turns, events, inbox, cognition...)
+    + SY.cognition's local cache/SHM + the conversation state of the base AI nodes and of the
+    frontdesk (thread-state/, immediate-memory/) + the Architect chat sessions;
+  - every vault secret except infrastructure (INFRA_KEYS / INFRA_PREFIXES below) -- including
+    AI provider keys: the hive ends up as freshly installed, AI degraded until they are reloaded.
+
+KEPT: the installation (package, /etc/fluxbee, vault master key, TLS, mesh and spokes), what
+starts as SYSTEM (SY.* nodes and ILKs, the base nodes of base-nodes.json with their ILK, ICH and
+config -- e.g. the Cloud door stays published), routes/VPNs/taps and the operational history
+(admin command log, deploy history, vault audit).
+
+NOT covered yet (reported, never touched): WF.* nodes (their rules live in SY.wf-rules and have
+their own teardown: wf_rules_delete), tenants (fluxbee has no tenant delete yet), OPA policy,
+blobs/publications. Everything goes through the product's own admin API except the message log,
+which has no API: its tables are truncated with the storage consumers stopped.
+"""
+import argparse
+import json
+import os
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+
+ADMIN = os.environ.get("FLUXBEE_ADMIN", "127.0.0.1:8080")
+ARCHITECT = os.environ.get("FLUXBEE_ARCHITECT", "127.0.0.1:3000")
+STATE_DIR = os.environ.get("FLUXBEE_STATE_DIR", "/var/lib/fluxbee")
+HIVE_YAML = os.environ.get("FLUXBEE_HIVE_YAML", "/etc/fluxbee/hive.yaml")
+MANIFEST = os.environ.get("FLUXBEE_BASE_NODES", "/usr/share/fluxbee/base-nodes.json")
+STORAGE_DB = "fluxbee_storage"
+LOG_PATH = os.path.join(STATE_DIR, "state", "factory-reset.log")
+
+# Vault infrastructure that survives. The prefixes are fluxbee_sdk's
+# CLOUD_RESERVED_VAULT_KEY_PREFIXES (edge bearers, edge TLS, spoke SSH recovery keys); the key is
+# the postgres secret fluxbee-firstboot writes. Anything else -- AI keys included -- is user data.
+INFRA_PREFIXES = ("edge_channel_secret:", "edge_tls", "ssh:")
+INFRA_KEYS = ("storage_postgres_url",)
+SYSTEM_NODE_PREFIXES = ("SY.", "RT.")
+OUT_OF_SCOPE_NODE_PREFIXES = ("WF.",)
+CONVERSATION_DIRS = ("thread-state", "immediate-memory")
+
+
+def die(msg):
+    sys.exit("factory-reset: " + msg)
+
+
+def api(method, path, body=None, host=None, timeout=60):
+    """One admin/architect HTTP call. Returns (http_status, parsed_json_or_text)."""
+    url = "http://%s%s" % (host or ADMIN, path)
+    data = json.dumps(body).encode() if body is not None else None
+    req = urllib.request.Request(url, data=data, method=method,
+                                 headers={"content-type": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            raw, status = r.read().decode("utf-8", "replace"), r.status
+    except urllib.error.HTTPError as e:
+        raw, status = e.read().decode("utf-8", "replace"), e.code
+    except (urllib.error.URLError, OSError) as e:
+        return 0, "connection error: %s" % e
+    try:
+        return status, json.loads(raw)
+    except ValueError:
+        return status, raw
+
+
+def payload(resp):
+    return resp.get("payload", resp) if isinstance(resp, dict) else {}
+
+
+def ok(status, resp):
+    return 200 <= status < 300 and isinstance(resp, dict) and resp.get("status", "ok") == "ok"
+
+
+def q(segment):
+    return urllib.parse.quote(segment, safe=":@")
+
+
+def hive_yaml_value(key):
+    try:
+        for line in open(HIVE_YAML):
+            if line.startswith(key + ":"):
+                return line.split(":", 1)[1].strip().strip('"')
+    except OSError:
+        pass
+    return None
+
+
+def base_nodes():
+    try:
+        m = json.load(open(MANIFEST))
+    except (OSError, ValueError) as e:
+        die("cannot read the base-node manifest %s (%s) -- refusing to guess what is system" % (MANIFEST, e))
+    return {e["instance"] for e in m.get("runtimes", []) if e.get("boot") and e.get("instance")}
+
+
+def sh(cmd, check=True):
+    r = subprocess.run(cmd, capture_output=True, text=True)
+    if check and r.returncode != 0:
+        die("%s failed (rc=%s): %s" % (" ".join(cmd), r.returncode, (r.stderr or r.stdout).strip()[:300]))
+    return r
+
+
+def psql(sql):
+    r = sh(["runuser", "-u", "postgres", "--", "psql", "-v", "ON_ERROR_STOP=1", "-d", STORAGE_DB,
+            "-At", "-c", sql], check=False)
+    if r.returncode != 0:
+        die("psql on %s failed: %s" % (STORAGE_DB, (r.stderr or r.stdout).strip()[:300]))
+    return [line for line in r.stdout.splitlines() if line.strip()]
+
+
+def unit_for(node_name):
+    return "fluxbee-node-%s.service" % node_name.replace("@", "-")
+
+
+# ---------------------------------------------------------------- inventory
+
+def list_hives():
+    status, resp = api("GET", "/hives")
+    if not ok(status, resp):
+        die("GET /hives failed (%s): %s" % (status, str(resp)[:200]))
+    hives = payload(resp).get("hives", [])
+    return [(h.get("hive_id") or h.get("name"), h.get("status") or h.get("state")) for h in hives]
+
+
+def list_nodes(hive):
+    status, resp = api("GET", "/hives/%s/nodes" % q(hive))
+    if not ok(status, resp):
+        die("GET /hives/%s/nodes failed (%s): %s" % (hive, status, str(resp)[:200]))
+    names = []
+    for n in payload(resp).get("nodes", []):
+        name = n.get("node_name") or n.get("name") if isinstance(n, dict) else n
+        if name:
+            names.append(name)
+    return sorted(set(names))
+
+
+def all_node_names(hives):
+    names = set()
+    for hive, _ in hives:
+        names.update(list_nodes(hive))
+    return names
+
+
+def classify_nodes(hives, base):
+    """-> (user_nodes [(hive, name)], surviving node names, out_of_scope [(hive, name)])."""
+    user, surviving, skipped = [], set(), []
+    for hive, _ in hives:
+        for name in list_nodes(hive):
+            if name.startswith(SYSTEM_NODE_PREFIXES) or name in base:
+                surviving.add(name)
+            elif name.startswith(OUT_OF_SCOPE_NODE_PREFIXES):
+                surviving.add(name)
+                skipped.append((hive, name))
+            else:
+                user.append((hive, name))
+    return user, surviving, skipped
+
+
+def list_ilks(hive):
+    status, resp = api("GET", "/hives/%s/identity/ilks" % q(hive))
+    if not ok(status, resp):
+        die("GET identity/ilks failed (%s): %s" % (status, str(resp)[:200]))
+    return payload(resp).get("ilks", [])
+
+
+def user_ilks(hive, surviving):
+    """Everything that is not SYSTEM, not already deleted and not the ILK of a node that stays."""
+    out = []
+    for i in list_ilks(hive):
+        if i.get("ilk_type") == "system" or i.get("deleted_at_ms"):
+            continue
+        if i.get("node_name") and i["node_name"] in surviving:
+            continue
+        out.append(i)
+    return out
+
+
+def user_secrets(hive):
+    status, resp = api("GET", "/hives/%s/vault/secrets" % q(hive))
+    if not ok(status, resp):
+        die("GET vault/secrets failed (%s): %s" % (status, str(resp)[:200]))
+    out = []
+    for s in payload(resp).get("secrets", []):
+        key = s.get("key", "")
+        if key in INFRA_KEYS or key.startswith(INFRA_PREFIXES):
+            continue
+        out.append(s)
+    return out
+
+
+def storage_tables():
+    rows = psql("SELECT tablename FROM pg_tables WHERE schemaname='public' ORDER BY tablename")
+    return [t for t in rows if "schema_migrations" not in t]
+
+
+def storage_counts(tables):
+    if not tables:
+        return {}
+    sql = " UNION ALL ".join("SELECT '%s', count(*) FROM \"%s\"" % (t, t) for t in tables)
+    return {row.split("|")[0]: int(row.split("|")[1]) for row in psql(sql)}
+
+
+def conversation_dirs():
+    found = []
+    for root in (os.path.join(STATE_DIR, "nodes"), os.path.join(STATE_DIR, "state")):
+        for dirpath, dirnames, _ in os.walk(root):
+            if dirpath.count(os.sep) - root.count(os.sep) > 5:
+                dirnames[:] = []
+                continue
+            for d in list(dirnames):
+                if d in CONVERSATION_DIRS:
+                    found.append(os.path.join(dirpath, d))
+                    dirnames.remove(d)
+    return sorted(found)
+
+
+def cognition_paths(hive):
+    node_dir = os.path.join(STATE_DIR, "nodes", "SY", "SY.cognition@%s" % hive)
+    paths = [os.path.join(node_dir, p) for p in ("memory.lance", "cache", "shm")]
+    paths.append("/dev/shm/jsr-memory-%s" % hive)
+    return [p for p in paths if os.path.exists(p)]
+
+
+def list_tenants(hive):
+    status, resp = api("GET", "/hives/%s/identity/tenants" % q(hive))
+    if not ok(status, resp) or "tenants" not in payload(resp):
+        return None
+    return payload(resp)["tenants"]
+
+
+# ---------------------------------------------------------------- actions
+
+def rm_path(path):
+    if os.path.isdir(path) and not os.path.islink(path):
+        sh(["rm", "-rf", "--one-file-system", path])
+    elif os.path.lexists(path):
+        os.remove(path)
+
+
+def kill_user_nodes(nodes):
+    failed = []
+    for hive, name in nodes:
+        status, resp = api("DELETE", "/hives/%s/nodes/%s" % (q(hive), q(name)),
+                           {"force": False, "purge_instance": True}, timeout=120)
+        good = ok(status, resp)
+        print("  %-5s kill+purge %s (on %s)" % ("OK" if good else "FAIL", name, hive))
+        if not good:
+            failed.append((name, status, str(resp)[:200]))
+    return failed
+
+
+def delete_until_empty(label, lister, deleter, ident):
+    """Delete, re-list, repeat: lists are paged (vault: 200) and a pass may race a late write."""
+    failed, done = {}, 0
+    for _ in range(10):
+        pending = [x for x in lister() if ident(x) not in failed]
+        if not pending:
+            break
+        for item in pending:
+            status, resp = deleter(item)
+            if ok(status, resp):
+                done += 1
+            else:
+                failed[ident(item)] = "%s %s" % (status, str(resp)[:160])
+    print("  %s: %d deleted, %d failed" % (label, done, len(failed)))
+    for k, why in failed.items():
+        print("    FAIL %s: %s" % (k, why))
+    return failed
+
+
+def systemctl(action, units):
+    units = [u for u in units if sh(["systemctl", "cat", u], check=False).returncode == 0]
+    if units:
+        sh(["systemctl", action] + units)
+    return units
+
+
+# ---------------------------------------------------------------- main
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
+    ap.add_argument("--yes", action="store_true", help="execute (default is a dry-run)")
+    ap.add_argument("--confirm-hive", help="hive_id, to skip the interactive confirmation")
+    a = ap.parse_args()
+
+    execute = a.yes
+    if execute and os.geteuid() != 0:
+        die("run it as root (sudo) -- it stops units, truncates the message DB and removes state")
+    if hive_yaml_value("role") != "motherbee":
+        die("this is not a motherbee (%s: role=%s) -- run it on the motherbee" % (HIVE_YAML, hive_yaml_value("role")))
+    hive_id = hive_yaml_value("hive_id") or "motherbee"
+    base = base_nodes()
+
+    hives = list_hives()
+    not_ready = [h for h, st in hives if st not in ("alive", "connected")]
+    if not_ready:
+        die("hives not alive/connected: %s -- a reset needs every hive up (spoke nodes are killed there)"
+            % ", ".join("%s=%s" % (h, st) for h, st in hives if h in not_ready))
+
+    user_nodes, surviving, skipped_nodes = classify_nodes(hives, base)
+    # The listing counts the ILKs that go on their own (not those of the nodes killed in [1]).
+    ilks_now = user_ilks(hive_id, surviving | {name for _, name in user_nodes})
+    secrets_now = user_secrets(hive_id)
+    can_db = os.geteuid() == 0
+    tables = storage_tables() if can_db else []
+    counts = storage_counts(tables) if can_db else {}
+    conv = conversation_dirs()
+    cog = cognition_paths(hive_id)
+    tenants = list_tenants(hive_id)
+
+    print("fluxbee-factory-reset -- hive %s (%s)" % (hive_id, "EXECUTE" if execute else "DRY-RUN"))
+    print("hives: %s" % ", ".join("%s=%s" % h for h in hives))
+    print("\n[1] user nodes to kill+purge (ILK, node secrets and timers go with them): %d" % len(user_nodes))
+    for hive, name in user_nodes:
+        print("    %s  (on %s)" % (name, hive))
+    print("[2] user ILKs to delete: %d  (plus the ILKs of the nodes above)" % len(ilks_now))
+    for i in ilks_now:
+        print("    %s  %-8s %s" % (i.get("ilk_id"), i.get("ilk_type"), i.get("display_name") or i.get("node_name") or ""))
+    print("[3] vault secrets to delete (everything but infra): %d" % len(secrets_now))
+    for s in secrets_now:
+        md = s.get("metadata") or {}
+        print("    %-40s %s" % (s.get("key"), md.get("resource_type") or ""))
+    if can_db:
+        print("[4] message log (%s), rows per table -- all truncated:" % STORAGE_DB)
+        for t in tables:
+            print("    %-36s %d" % (t, counts.get(t, 0)))
+    else:
+        print("[4] message log (%s): run as root to see the row counts" % STORAGE_DB)
+    print("    + SY.cognition cache: %s" % (", ".join(cog) or "none"))
+    print("    + conversation state of the nodes that stay: %d dirs" % len(conv))
+    for d in conv:
+        print("      %s" % d)
+    print("    + Architect chat sessions (DELETE /api/sessions)")
+    print("\nNOT touched: routes/VPNs/taps, history, system + base nodes (%s)." % ", ".join(sorted(base)))
+    if skipped_nodes:
+        print("Out of scope (reported only): WF nodes %s" % ", ".join(n for _, n in skipped_nodes))
+    if tenants is not None:
+        extra = [t for t in tenants if t.get("tenant_id") != "tnt:00000000-0000-0000-0000-000000000001"]
+        print("Out of scope (reported only): %d non-root tenants -- fluxbee has no tenant delete yet" % len(extra))
+
+    if not execute:
+        print("\nDRY-RUN: nothing was changed. Execute with --yes.")
+        return 0
+
+    confirm = a.confirm_hive
+    if confirm is None:
+        confirm = input("\nThis REMOVES the data above and cannot be undone. Type the hive_id (%s) to go on: " % hive_id).strip()
+    if confirm != hive_id:
+        die("confirmation does not match the hive_id -- nothing changed")
+
+    t0 = time.time()
+    print("\n== [1/5] kill+purge user nodes")
+    node_fail = kill_user_nodes(user_nodes)
+
+    print("== [2/5] delete user ILKs")
+    # Keep the ILK of EVERY node still alive -- a kill that failed must not lose its identity.
+    surviving_now = all_node_names(list_hives())
+    ilk_fail = delete_until_empty(
+        "ILKs", lambda: user_ilks(hive_id, surviving_now),
+        lambda i: api("DELETE", "/hives/%s/identity/ilks/%s" % (q(hive_id), q(i["ilk_id"]))),
+        lambda i: i["ilk_id"])
+
+    print("== [3/5] delete user vault secrets")
+    vault_fail = delete_until_empty(
+        "secrets", lambda: user_secrets(hive_id),
+        lambda s: api("DELETE", "/hives/%s/vault/secrets/%s" % (q(hive_id), q(s["key"]))),
+        lambda s: s["key"])
+
+    print("== [4/5] message log")
+    stop = ["sy-cognition.service", "sy-storage.service", "sy-frontdesk-gov.service"]
+    stop += [unit_for(n) for n in sorted(base) if n.startswith("AI.")]
+    stopped = systemctl("stop", stop)
+    try:
+        tables = storage_tables()
+        if tables:
+            psql("TRUNCATE %s RESTART IDENTITY CASCADE" % ", ".join('"%s"' % t for t in tables))
+        for p in cognition_paths(hive_id) + conversation_dirs():
+            rm_path(p)
+    finally:
+        systemctl("start", stopped)
+    left = {t: c for t, c in storage_counts(storage_tables()).items() if c}
+    print("  %d tables truncated%s; cognition cache and %d conversation dirs removed"
+          % (len(tables), (" -- NOT EMPTY: %s" % left) if left else "", len(conv)))
+    status, resp = api("DELETE", "/api/sessions", host=ARCHITECT)
+    print("  Architect sessions: %s" % ("cleared" if 200 <= status < 300 else "FAIL %s %s" % (status, str(resp)[:160])))
+
+    print("== [5/5] verify")
+    for _ in range(40):
+        hives = list_hives()
+        if all(st in ("alive", "connected") for _, st in hives):
+            break
+        time.sleep(3)
+    failed_units = sh(["systemctl", "--failed", "--no-legend", "--plain"], check=False).stdout.split()
+    print("  hives: %s" % ", ".join("%s=%s" % h for h in hives))
+    print("  failed units: %s" % (" ".join(u for u in failed_units if u.endswith(".service")) or "none"))
+    problems = len(node_fail) + len(ilk_fail) + len(vault_fail) + len(left)
+    summary = "%s factory-reset hive=%s nodes=%d ilks=%d secrets=%d tables=%d problems=%d (%.0fs)" % (
+        time.strftime("%Y-%m-%dT%H:%M:%S%z"), hive_id, len(user_nodes), len(ilks_now), len(secrets_now),
+        len(tables), problems, time.time() - t0)
+    try:
+        os.makedirs(os.path.dirname(LOG_PATH), exist_ok=True)
+        with open(LOG_PATH, "a") as f:
+            f.write(summary + "\n")
+    except OSError:
+        pass
+    print("\n" + summary)
+    if problems:
+        print("Some steps failed (see above). Re-running is safe: every step only removes what is still there.")
+        return 1
+    print("Done. AI nodes stay degraded until a provider key is loaded again (see fluxbee-firstboot's hint).")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
