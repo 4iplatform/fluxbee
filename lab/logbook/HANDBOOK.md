@@ -943,6 +943,34 @@ No existe rollback de core como comando ([U-5](PENDING-BUGS.md#u-5)). Los dos ca
 2. **Conservar el `.deb` anterior publicado** en el repo apt y bajar de versión con `apt`. Es el
    camino para cualquier versión vieja.
 
+### Reset a fábrica — `fluxbee-factory-reset` (2026-09-28)
+
+Borra **lo que crearon los usuarios** y deja el hive como lo dejó `fluxbee-firstboot`, sin
+reinstalar. Pensado sobre todo para DEV y pruebas; en PROD, solo a propósito y con snapshot previo.
+Viene en el `.deb` y se corre **en el motherbee**; cubre **todo el hive**.
+
+```bash
+sudo fluxbee-factory-reset                                  # DRY-RUN: lista lo que borraría (default)
+sudo fluxbee-factory-reset --yes                            # ejecuta; pide escribir el hive_id
+sudo fluxbee-factory-reset --yes --confirm-hive motherbee   # ejecuta sin preguntar
+```
+
+| Se borra | Se conserva |
+|---|---|
+| Nodos lanzados por usuarios, en todos los hives (kill + purge: se van con su ILK, sus secretos y sus timers) | La instalación: paquete, `/etc/fluxbee`, master key del vault, TLS, mesh y spokes |
+| ILKs de usuario: humanos, agentes y temporales creados por mensajes o por Cloud | Lo que arranca como sistema: nodos `SY.*` y sus ILKs, y los nodos base de `base-nodes.json` con su ILK, ICH y config (la puerta de Cloud sigue publicada) |
+| El log de mensajes: todas las tablas de `fluxbee_storage`, la caché de SY.cognition, el estado de conversación (`thread-state/`, `immediate-memory/`) y las sesiones de Archi | Rutas, VPNs y taps |
+| Todos los secretos del vault salvo los de infraestructura (`storage_postgres_url`, `ssh:*`, `edge_tls*`, `edge_channel_secret:*`). **Incluye las claves de IA**: el AI queda degradado hasta recargarlas | El historial operativo: audit log de admin, historial de deploys y audit del vault |
+
+- **Solo reporta, no toca:** nodos `WF.*` (tienen su propio teardown, `wf_rules_delete`),
+  tenants (fluxbee todavía no tiene borrado de tenants), política OPA y blobs.
+- **Usa la API del producto** para todo, salvo el log de mensajes, que no tiene API: sus tablas se
+  truncan con los consumidores frenados.
+- **Es seguro re-correrlo** si algo falla a mitad: cada paso borra solo lo que todavía está. Deja
+  una línea en `/var/lib/fluxbee/state/factory-reset.log`.
+- No es `scripts/fluxbee_cleanall.sh`: ese es el borrado **nuclear** del flujo viejo de
+  instalación desde fuentes, que se lleva también la instalación.
+
 ---
 
 ## 13. Lo que este handbook todavía NO cubre
