@@ -5905,6 +5905,14 @@ fn authorize_cloud_relay(
     if action == "vault_put" && caller == format!("SY.orchestrator@{admin_hive}") {
         return Ok(());
     }
+    // Node teardown (kill_node / remove_node_instance with purge_instance) marks the node's ILK
+    // through delete_ilk and then purges it. delete_ilk joined the Cloud surface on 2026-09-28 (mark
+    // only), and without this exemption the gate silently refused the orchestrators' teardown,
+    // leaving orphan node identities behind. ANY hive's orchestrator: a spoke tears down its own
+    // nodes. Router-stamped name, never params; ONLY delete_ilk (purge_ilk is not a relay action).
+    if action == "delete_ilk" && caller.starts_with("SY.orchestrator@") {
+        return Ok(());
+    }
     Err(format!(
         "only {expected} may relay '{action}' over the mesh (Fluxbee Cloud provisioning gate); caller={caller}"
     ))
@@ -15362,6 +15370,17 @@ mod tests {
     use zip::write::FileOptions;
 
     #[test]
+    fn cloud_relay_gate_lets_every_orchestrator_mark_node_ilks_for_teardown() {
+        for caller in ["SY.orchestrator@motherbee", "SY.orchestrator@worker1"] {
+            assert!(authorize_cloud_relay(Some(caller), "delete_ilk", "motherbee").is_ok(), "{caller}");
+            // ...but nothing else from the Cloud surface
+            assert!(authorize_cloud_relay(Some(caller), "delete_tenant", "motherbee").is_err());
+            assert!(authorize_cloud_relay(Some(caller), "create_tenant", "motherbee").is_err());
+        }
+        assert!(authorize_cloud_relay(Some("AI.chat@motherbee"), "delete_ilk", "motherbee").is_err());
+    }
+
+    #[test]
     fn cloud_relay_lifecycle_requires_the_claimed_tenant_server_side() {
         let relay = Some("IO.cloud@motherbee");
         let ilk = serde_json::json!({"ilk_id": "ilk:22222222-2222-4222-8222-222222222222"});
@@ -15448,7 +15467,7 @@ mod tests {
             );
             // The primary orchestrator may relay ONLY vault_put (per-spoke recovery key during
             // add_hive); it is denied the other exposed actions (create_tenant / run_node).
-            if *action == "vault_put" {
+            if *action == "vault_put" || *action == "delete_ilk" {
                 assert!(authorize_cloud_relay(
                     Some("SY.orchestrator@motherbee"),
                     action,
@@ -15463,10 +15482,11 @@ mod tests {
                 )
                 .is_err());
             }
-            // A spoke orchestrator is never allowed, even for vault_put.
-            assert!(
-                authorize_cloud_relay(Some("SY.orchestrator@worker1"), action, "motherbee")
-                    .is_err()
+            // A spoke orchestrator only for its node teardown (delete_ilk); never vault_put.
+            assert_eq!(
+                authorize_cloud_relay(Some("SY.orchestrator@worker1"), action, "motherbee").is_ok(),
+                *action == "delete_ilk",
+                "spoke orchestrator on '{action}'"
             );
         }
     }

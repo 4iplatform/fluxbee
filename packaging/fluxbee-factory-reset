@@ -302,20 +302,19 @@ ROOT_TENANT = "tnt:00000000-0000-0000-0000-000000000001"
 
 
 def opa_user_policy_versions():
-    """{hive: current user-policy version} from SY.opa.rules on every hive (0 = none)."""
-    status, resp = api("GET", "/opa/status")
+    """{hive: current user-policy version} (0 = none), asked hive by hive with a UNICAST query --
+    which reaches the spokes. (The OPA write actions travel as a CONFIG_CHANGED broadcast that,
+    as of 0.1.34, only the motherbee's SY.opa.rules acts on: see logbook 2026-09-28.)"""
     found = {}
-    def walk(node):
-        if isinstance(node, dict):
-            inner = node.get("payload") if isinstance(node.get("payload"), dict) else {}
-            if node.get("hive") and "current_version" in inner:
-                found[node["hive"]] = inner.get("current_version") or 0
-            for value in node.values():
-                walk(value)
-        elif isinstance(node, list):
-            for value in node:
-                walk(value)
-    walk(resp)
+    for h in hives_raw():
+        hive = h.get("hive_id") or h.get("name")
+        if (h.get("role") or "") not in WF_HIVE_ROLES:  # the roles that run SY.opa.rules too
+            continue
+        status, resp = api("GET", "/hives/%s/opa/status" % q(hive))
+        for entry in (resp.get("responses") or []) if isinstance(resp, dict) else []:
+            inner = entry.get("payload") or {}
+            if entry.get("hive") == hive and "current_version" in inner:
+                found[hive] = inner.get("current_version") or 0
     return found
 
 
@@ -507,9 +506,13 @@ def main():
         lambda t: t["tenant_id"])
 
     print("== [5/7] clear the user OPA policy (every hive)")
-    status, resp = api("POST", "/opa/policy/clear", {}, timeout=120)
-    opa_fail = [] if ok(status, resp) else [("opa_clear", status, str(resp)[:200])]
-    print("  %s" % ("cleared" if not opa_fail else "FAIL %s %s" % (status, str(resp)[:200])))
+    api("POST", "/opa/policy/clear", {}, timeout=120)
+    # Judge by the RESULT, asked hive by hive: the broadcast answer times out on hives that do not
+    # act on it, which is not a failure as long as no hive is left with a user policy.
+    left_opa = {h: v for h, v in opa_user_policy_versions().items() if v}
+    opa_fail = [("opa", h, v) for h, v in sorted(left_opa.items())]
+    print("  %s" % ("no user policy left on any hive" if not opa_fail
+                    else "FAIL user policy still loaded: %s" % left_opa))
     print("== [6/7] message log")
     # SY.* are real systemd units. The base AI nodes are orchestrator-managed TRANSIENT units: a
     # `systemctl stop` makes them vanish (a later start finds nothing), so their lifecycle goes
