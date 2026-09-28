@@ -21,6 +21,8 @@
 
 | Versión | Fecha (ART) | Commit | Alcance | Estado | Rollback |
 |---|---|---|---|---|---|
+| **0.1.35** | 2026-09-28 | `5f1cd71` | motherbee | ✅ live | snap `pre-teardown-fix-0-1-35` · `apt install fluxbee=0.1.34` |
+| **0.1.34** | 2026-09-28 | `60331c5` | motherbee + spokes (core) | ⚠️ superada (regresión teardown) | snap `pre-lifecycle-0-1-34` (las 4 VMs) · `apt install fluxbee=0.1.33` |
 | **0.1.33** | 2026-08-28 | `01b6266` | motherbee | ✅ live | `apt install fluxbee=0.1.32` |
 | **0.1.32** | 2026-08-27 | `90fd64a` | motherbee | ✅ live | `apt install fluxbee=0.1.31` |
 | **0.1.31** | 2026-08-26 | `862c5e4` | motherbee | ✅ live | snap `pre-rpc-poison-fix-0-1-31` · `apt install fluxbee=0.1.30` |
@@ -42,6 +44,55 @@
 > (`dpkg-scanpackages -m`) para rollback, pero su detalle vive en la bitácora, no acá.
 
 ---
+
+## 0.1.35 — admin: los orquestadores vuelven a poder marcar el ILK de un nodo (fix de 0.1.34)
+
+- **Fecha:** 2026-09-28 (ART) · **Versión anterior:** 0.1.34 · **Commit:** `5f1cd71`
+- **Alcance:** **motherbee** (VM100). Solo cambian SY.admin y el script de reset; los spokes siguen
+  con el core de 0.1.34 (el admin no corre en ellos).
+- **Qué cambió:** la **regresión de 0.1.34**. Al sumar `delete_ilk` a la superficie de Cloud, el
+  gate de relay (EDGE-06) empezó a rechazar el teardown del **orquestador**. El kill con
+  `purge_instance` respondía ok pero dejaba el ILK del nodo **activo y huérfano**. Fix: cualquier
+  `SY.orchestrator@*` puede usar `delete_ilk` (y solo eso), siguiendo la regla hermana de
+  `vault_put`. Además, el reset verifica OPA por resultado, hive por hive.
+- **Build:** VM110 `build-deb.sh 0.1.35` (7 min) → publish (35 paquetes).
+- **Verificación en vivo:**
+  - e2e 27/31. Los 4 FAIL son hallazgos previos y explicados: la réplica rechaza el listado del
+    admin y la escritura de OPA no llega a los spokes.
+  - Se verificó el kill+purge: el ILK del nodo queda purgado y el nombre libre.
+  - **Reset instalado por el `.deb`** con datos reales: 1 nodo, 2 ILKs, 2 secretos, **8 tenants**
+    y la política OPA v5, con RC=0 y 0 problemas. El segundo dry-run da vacío.
+  - Puerta de Cloud en 200, con 13 acciones.
+- **Rollback:** snapshot `pre-teardown-fix-0-1-35` (VM100) o `apt install fluxbee=0.1.34`, que
+  re-introduce la regresión.
+
+## 0.1.34 — identity: marcar / restaurar / purgar · `opa_clear` · reset a fábrica completo
+
+- **Fecha:** 2026-09-28 (ART) · **Versión anterior:** 0.1.33 · **Commits:** `13f426f`, `60331c5`
+  (más `f47dcb2` y `c1fee0d` del reset).
+- **Alcance:** **motherbee + los 3 spokes**, con core update, porque cambian el router,
+  SY.identity y SY.opa.rules, que también corren en los spokes.
+- **Qué cambió:**
+  - **Identity:** borrar un ILK o un tenant solo **marca**. La marca es reversible, oculta el
+    registro y deja sus claves reservadas; la **purga** es física y exige la marca. El tenant
+    marca en cascada a sus ILKs.
+  - **Migración de DB v2.**
+  - **Cloud:** marca y restaura, siempre acotado al tenant que reclama; **no puede purgar**.
+  - **`opa_clear`:** los routers descargan la política de usuario (antes la ignoraban hasta
+    reiniciarse).
+  - **`fluxbee-factory-reset`:** viaja en el `.deb`.
+- **Build:** VM110 `build-deb.sh 0.1.34` (24 min) → publish (34 paquetes). Snapshots
+  `pre-lifecycle-0-1-34` en las 4 VMs.
+- **Verificación en vivo:**
+  - la migración v2 se aplicó;
+  - los spokes hicieron el core update (hash `e67a8815…`) y sus servicios reiniciaron;
+  - e2e 26/30 por la puerta pública real: marcar, ocultar, reservar, scope por tenant, cascada,
+    restaurar y purgar;
+  - el router descargó la política OPA (visto en su log).
+- **Regresión encontrada en el e2e:** el teardown del orquestador quedó bloqueado. Se corrigió en
+  0.1.35.
+- **Rollback:** snapshot `pre-lifecycle-0-1-34` (las 4 VMs) o `apt install fluxbee=0.1.33`. Ojo:
+  la migración v2 solo **agrega** columnas, así que 0.1.33 las ignora sin problema.
 
 ## 0.1.33 — io.cloud: get_ilk email-SOLO (cross-tenant) — el login del website
 
