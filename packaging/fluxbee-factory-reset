@@ -8,7 +8,10 @@
 Runs on the MOTHERBEE and covers the whole hive: user nodes on the spokes are killed through
 their own orchestrator (kill_node is forwarded), identity deletes replicate as deltas.
 
-REMOVED (operator decision, 2026-09-28):
+REMOVED (operator decisions, 2026-09-28):
+  - workflows, on every hive that runs SY.wf-rules: wf_rules_delete with force (a workflow is not
+    a normal node -- the rule is the source of truth; this removes the rule, the WF node, its
+    state and its packages, running instances included);
   - nodes launched by users, on every hive: kill_node + purge_instance, which also deletes the
     node's ILK, its dedicated vault secrets and its timers;
   - the remaining user ILKs (humans/agents/temporaries created by messages or by Cloud);
@@ -23,9 +26,8 @@ starts as SYSTEM (SY.* nodes and ILKs, the base nodes of base-nodes.json with th
 config -- e.g. the Cloud door stays published), routes/VPNs/taps and the operational history
 (admin command log, deploy history, vault audit).
 
-NOT covered yet (reported, never touched): WF.* nodes (their rules live in SY.wf-rules and have
-their own teardown: wf_rules_delete), tenants (fluxbee has no tenant delete yet), OPA policy,
-blobs/publications. Everything goes through the product's own admin API except the message log,
+NOT covered yet (reported, never touched): tenants (fluxbee has no tenant delete yet), the user
+OPA policy (needs an opa_clear action + router support to unload it), blobs/publications. Everything goes through the product's own admin API except the message log,
 which has no API: its tables are truncated with the storage consumers stopped.
 """
 import argparse
@@ -52,7 +54,8 @@ LOG_PATH = os.path.join(STATE_DIR, "state", "factory-reset.log")
 INFRA_PREFIXES = ("edge_channel_secret:", "edge_tls", "ssh:")
 INFRA_KEYS = ("storage_postgres_url",)
 SYSTEM_NODE_PREFIXES = ("SY.", "RT.")
-OUT_OF_SCOPE_NODE_PREFIXES = ("WF.",)
+WF_NODE_PREFIX = "WF."
+WF_HIVE_ROLES = ("motherbee", "worker")  # the roles that run SY.wf-rules (hive.yaml system_nodes)
 CONVERSATION_DIRS = ("thread-state", "immediate-memory")
 
 
@@ -126,12 +129,33 @@ def psql(sql):
 
 # ---------------------------------------------------------------- inventory
 
-def list_hives():
+def hives_raw():
     status, resp = api("GET", "/hives")
     if not ok(status, resp):
         die("GET /hives failed (%s): %s" % (status, str(resp)[:200]))
-    hives = payload(resp).get("hives", [])
-    return [(h.get("hive_id") or h.get("name"), h.get("status") or h.get("state")) for h in hives]
+    return payload(resp).get("hives", [])
+
+
+def list_hives():
+    return [(h.get("hive_id") or h.get("name"), h.get("status") or h.get("state")) for h in hives_raw()]
+
+
+def list_workflows():
+    """-> [(hive, workflow_name)] on every hive that runs SY.wf-rules. A workflow is not a normal
+    node: the RULE is the source of truth and WF.<workflow>@<hive> is derived from it, so it is
+    removed through wf_rules_delete (kills+purges the node, its state and its packages)."""
+    out = []
+    for h in hives_raw():
+        hive = h.get("hive_id") or h.get("name")
+        if (h.get("role") or "") not in WF_HIVE_ROLES:
+            continue
+        status, resp = api("GET", "/hives/%s/wf-rules" % q(hive))
+        if not ok(status, resp):
+            die("GET /hives/%s/wf-rules failed (%s): %s" % (hive, status, str(resp)[:200]))
+        for w in payload(resp).get("workflows", []):
+            if w.get("workflow_name"):
+                out.append((hive, w["workflow_name"]))
+    return out
 
 
 def list_nodes(hive):
@@ -178,8 +202,11 @@ def is_system_name(name, base):
     return name.startswith(SYSTEM_NODE_PREFIXES) or name in base
 
 
-def classify_nodes(hives, base, local_hive):
-    """-> (user_nodes [(hive, name)], surviving node names, out_of_scope [(hive, name)])."""
+def classify_nodes(hives, base, local_hive, workflows):
+    """-> (user_nodes [(hive, name)], surviving node names, workflow_nodes [(hive, name)]).
+    WF.<workflow>@<hive> of a listed workflow goes with its workflow (wf_rules_delete), not with
+    kill_node; an orphan WF.* node (no workflow behind it) is killed like any user node."""
+    wf_names = {"%s%s@%s" % (WF_NODE_PREFIX, wf, hive) for hive, wf in workflows}
     user, surviving, skipped = [], set(base), []
     listed = {hive: list_nodes(hive) for hive, _ in hives}
     # Down-but-persisted user nodes on the motherbee get purged too (kill_node purges inactive
@@ -190,8 +217,7 @@ def classify_nodes(hives, base, local_hive):
         for name in names:
             if is_system_name(name, base):
                 surviving.add(name)
-            elif name.startswith(OUT_OF_SCOPE_NODE_PREFIXES):
-                surviving.add(name)
+            elif name in wf_names:
                 skipped.append((hive, name))
             else:
                 user.append((hive, name))
@@ -342,9 +368,11 @@ def main():
         die("hives not alive/connected: %s -- a reset needs every hive up (spoke nodes are killed there)"
             % ", ".join("%s=%s" % (h, st) for h, st in hives if h in not_ready))
 
-    user_nodes, surviving, skipped_nodes = classify_nodes(hives, base, hive_id)
-    # The listing counts the ILKs that go on their own (not those of the nodes killed in [1]).
-    ilks_now = user_ilks(hive_id, surviving | {name for _, name in user_nodes}, base)
+    workflows = list_workflows()
+    user_nodes, surviving, wf_nodes = classify_nodes(hives, base, hive_id, workflows)
+    # The listing counts the ILKs that go on their own (not those of the nodes removed in [0]/[1]).
+    going = {name for _, name in user_nodes} | {name for _, name in wf_nodes}
+    ilks_now = user_ilks(hive_id, surviving | going, base)
     secrets_now = user_secrets(hive_id)
     can_db = os.geteuid() == 0
     tables = storage_tables() if can_db else []
@@ -355,7 +383,10 @@ def main():
 
     print("fluxbee-factory-reset -- hive %s (%s)" % (hive_id, "EXECUTE" if execute else "DRY-RUN"))
     print("hives: %s" % ", ".join("%s=%s" % h for h in hives))
-    print("\n[1] user nodes to kill+purge (ILK, node secrets and timers go with them): %d" % len(user_nodes))
+    print("\n[0] workflows to delete (wf_rules_delete force: rule, WF node, state, packages): %d" % len(workflows))
+    for hive, wf in workflows:
+        print("    %s  (on %s)" % (wf, hive))
+    print("[1] user nodes to kill+purge (ILK, node secrets and timers go with them): %d" % len(user_nodes))
     for hive, name in user_nodes:
         print("    %s  (on %s)" % (name, hive))
     print("[2] user ILKs to delete: %d  (plus the ILKs of the nodes above)" % len(ilks_now))
@@ -377,8 +408,6 @@ def main():
         print("      %s" % d)
     print("    + Architect chat sessions (DELETE /api/sessions)")
     print("\nNOT touched: routes/VPNs/taps, history, system + base nodes (%s)." % ", ".join(sorted(base)))
-    if skipped_nodes:
-        print("Out of scope (reported only): WF nodes %s" % ", ".join(n for _, n in skipped_nodes))
     if tenants is not None:
         extra = [t for t in tenants if t.get("tenant_id") != "tnt:00000000-0000-0000-0000-000000000001"]
         print("Out of scope (reported only): %d non-root tenants -- fluxbee has no tenant delete yet" % len(extra))
@@ -394,7 +423,17 @@ def main():
         die("confirmation does not match the hive_id -- nothing changed")
 
     t0 = time.time()
-    print("\n== [1/5] kill+purge user nodes")
+    print("\n== [0/5] delete workflows")
+    wf_fail = []
+    for hive, wf in workflows:
+        status, resp = api("POST", "/hives/%s/wf-rules/delete" % q(hive),
+                           {"workflow_name": wf, "force": True}, timeout=180)
+        good = ok(status, resp)
+        print("  %-5s %s (on %s)" % ("OK" if good else "FAIL", wf, hive))
+        if not good:
+            wf_fail.append((wf, status, str(resp)[:200]))
+            print("    %s %s" % (status, str(resp)[:200]))
+    print("== [1/5] kill+purge user nodes")
     node_fail = kill_user_nodes(user_nodes)
 
     print("== [2/5] delete user ILKs")
@@ -449,9 +488,9 @@ def main():
     failed_units = sh(["systemctl", "--failed", "--no-legend", "--plain"], check=False).stdout.split()
     print("  hives: %s" % ", ".join("%s=%s" % h for h in hives))
     print("  failed units: %s" % (" ".join(u for u in failed_units if u.endswith(".service")) or "none"))
-    problems = len(node_fail) + len(ilk_fail) + len(vault_fail) + len(left)
-    summary = "%s factory-reset hive=%s nodes=%d ilks=%d secrets=%d tables=%d problems=%d (%.0fs)" % (
-        time.strftime("%Y-%m-%dT%H:%M:%S%z"), hive_id, len(user_nodes), len(ilks_now), len(secrets_now),
+    problems = len(wf_fail) + len(node_fail) + len(ilk_fail) + len(vault_fail) + len(left)
+    summary = "%s factory-reset hive=%s workflows=%d nodes=%d ilks=%d secrets=%d tables=%d problems=%d (%.0fs)" % (
+        time.strftime("%Y-%m-%dT%H:%M:%S%z"), hive_id, len(workflows), len(user_nodes), len(ilks_now), len(secrets_now),
         len(tables), problems, time.time() - t0)
     try:
         os.makedirs(os.path.dirname(LOG_PATH), exist_ok=True)

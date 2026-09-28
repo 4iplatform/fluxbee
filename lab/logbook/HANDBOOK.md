@@ -963,8 +963,12 @@ sudo fluxbee-factory-reset --yes --confirm-hive motherbee   # ejecuta sin pregun
 | El log de mensajes: todas las tablas de `fluxbee_storage`, la caché de SY.cognition, el estado de conversación (`thread-state/`, `immediate-memory/`) y las sesiones de Archi | Rutas, VPNs y taps |
 | Todos los secretos del vault salvo los de infraestructura (`storage_postgres_url`, `ssh:*`, `edge_tls*`, `edge_channel_secret:*`). **Incluye las claves de IA**: el AI queda degradado hasta recargarlas | El historial operativo: audit log de admin, historial de deploys y audit del vault |
 
-- **Solo reporta, no toca:** nodos `WF.*` (tienen su propio teardown, `wf_rules_delete`),
-  tenants (fluxbee todavía no tiene borrado de tenants), política OPA y blobs.
+- **Workflows:** se borran por su propio camino. En cada hive con SY.wf-rules (motherbee y
+  workers) se llama a `wf_rules_delete` con `force`, que borra la regla, el nodo `WF.*`, su estado
+  y sus paquetes, incluidas las instancias en curso. Un nodo `WF.*` huérfano, sin workflow, se mata
+  como cualquier nodo de usuario.
+- **Solo reporta, no toca:** los tenants (fluxbee todavía no tiene borrado de tenants), la política
+  OPA de usuario (falta la acción `opa_clear` y que el router la descargue) y los blobs.
 - **Usa la API del producto** para todo, salvo el log de mensajes, que no tiene API: sus tablas se
   truncan con los consumidores frenados.
 - **Es seguro re-correrlo** si algo falla a mitad: cada paso borra solo lo que todavía está. Deja
