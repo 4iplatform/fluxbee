@@ -124,10 +124,6 @@ def psql(sql):
     return [line for line in r.stdout.splitlines() if line.strip()]
 
 
-def unit_for(node_name):
-    return "fluxbee-node-%s.service" % node_name.replace("@", "-")
-
-
 # ---------------------------------------------------------------- inventory
 
 def list_hives():
@@ -150,19 +146,49 @@ def list_nodes(hive):
     return sorted(set(names))
 
 
+def persisted_node_names():
+    """Managed instances persisted on THIS box (nodes/<KIND>/<name>/config.json). The inventory
+    only lists what is RUNNING: a node that is down right now still owns its ILK and its config
+    (the orchestrator's reconcile relaunches it), so it must be seen too."""
+    out, root = set(), os.path.join(STATE_DIR, "nodes")
+    try:
+        kinds = os.listdir(root)
+    except OSError:
+        return out
+    for kind in kinds:
+        if kind == "SY":
+            continue
+        try:
+            for name in os.listdir(os.path.join(root, kind)):
+                if "@" in name and os.path.isfile(os.path.join(root, kind, name, "config.json")):
+                    out.add(name)
+        except OSError:
+            pass
+    return out
+
+
 def all_node_names(hives):
-    names = set()
+    names = persisted_node_names()
     for hive, _ in hives:
         names.update(list_nodes(hive))
     return names
 
 
-def classify_nodes(hives, base):
+def is_system_name(name, base):
+    return name.startswith(SYSTEM_NODE_PREFIXES) or name in base
+
+
+def classify_nodes(hives, base, local_hive):
     """-> (user_nodes [(hive, name)], surviving node names, out_of_scope [(hive, name)])."""
-    user, surviving, skipped = [], set(), []
-    for hive, _ in hives:
-        for name in list_nodes(hive):
-            if name.startswith(SYSTEM_NODE_PREFIXES) or name in base:
+    user, surviving, skipped = [], set(base), []
+    listed = {hive: list_nodes(hive) for hive, _ in hives}
+    # Down-but-persisted user nodes on the motherbee get purged too (kill_node purges inactive
+    # targets); otherwise their ILK would be removed and reconcile would relaunch them headless.
+    listed.setdefault(local_hive, [])
+    listed[local_hive] = sorted(set(listed[local_hive]) | persisted_node_names())
+    for hive, names in listed.items():
+        for name in names:
+            if is_system_name(name, base):
                 surviving.add(name)
             elif name.startswith(OUT_OF_SCOPE_NODE_PREFIXES):
                 surviving.add(name)
@@ -179,13 +205,16 @@ def list_ilks(hive):
     return payload(resp).get("ilks", [])
 
 
-def user_ilks(hive, surviving):
-    """Everything that is not SYSTEM, not already deleted and not the ILK of a node that stays."""
+def user_ilks(hive, surviving, base):
+    """Everything that is not SYSTEM, not already deleted and not the ILK of a node that stays.
+    System/base node ILKs are protected BY NAME too: a base node that happens to be down (not in
+    the inventory) must never lose its identity."""
     out = []
     for i in list_ilks(hive):
         if i.get("ilk_type") == "system" or i.get("deleted_at_ms"):
             continue
-        if i.get("node_name") and i["node_name"] in surviving:
+        node = i.get("node_name")
+        if node and (node in surviving or is_system_name(node, base)):
             continue
         out.append(i)
     return out
@@ -313,9 +342,9 @@ def main():
         die("hives not alive/connected: %s -- a reset needs every hive up (spoke nodes are killed there)"
             % ", ".join("%s=%s" % (h, st) for h, st in hives if h in not_ready))
 
-    user_nodes, surviving, skipped_nodes = classify_nodes(hives, base)
+    user_nodes, surviving, skipped_nodes = classify_nodes(hives, base, hive_id)
     # The listing counts the ILKs that go on their own (not those of the nodes killed in [1]).
-    ilks_now = user_ilks(hive_id, surviving | {name for _, name in user_nodes})
+    ilks_now = user_ilks(hive_id, surviving | {name for _, name in user_nodes}, base)
     secrets_now = user_secrets(hive_id)
     can_db = os.geteuid() == 0
     tables = storage_tables() if can_db else []
@@ -372,7 +401,7 @@ def main():
     # Keep the ILK of EVERY node still alive -- a kill that failed must not lose its identity.
     surviving_now = all_node_names(list_hives())
     ilk_fail = delete_until_empty(
-        "ILKs", lambda: user_ilks(hive_id, surviving_now),
+        "ILKs", lambda: user_ilks(hive_id, surviving_now, base),
         lambda i: api("DELETE", "/hives/%s/identity/ilks/%s" % (q(hive_id), q(i["ilk_id"]))),
         lambda i: i["ilk_id"])
 
@@ -383,9 +412,16 @@ def main():
         lambda s: s["key"])
 
     print("== [4/5] message log")
-    stop = ["sy-cognition.service", "sy-storage.service", "sy-frontdesk-gov.service"]
-    stop += [unit_for(n) for n in sorted(base) if n.startswith("AI.")]
-    stopped = systemctl("stop", stop)
+    # SY.* are real systemd units. The base AI nodes are orchestrator-managed TRANSIENT units: a
+    # `systemctl stop` makes them vanish (a later start finds nothing), so their lifecycle goes
+    # through the orchestrator -- kill_node WITHOUT purge (keeps config + ILK) / start_node.
+    stopped = systemctl("stop", ["sy-cognition.service", "sy-storage.service", "sy-frontdesk-gov.service"])
+    ai_nodes = [n for n in sorted(base) if n.startswith("AI.")]
+    for n in ai_nodes:
+        status, resp = api("DELETE", "/hives/%s/nodes/%s" % (q(hive_id), q(n)),
+                           {"force": False, "purge_instance": False}, timeout=120)
+        if not ok(status, resp):
+            print("  WARN could not stop %s (%s): %s" % (n, status, str(resp)[:160]))
     try:
         tables = storage_tables()
         if tables:
@@ -394,6 +430,10 @@ def main():
             rm_path(p)
     finally:
         systemctl("start", stopped)
+        for n in ai_nodes:
+            status, resp = api("POST", "/hives/%s/nodes/%s/start" % (q(hive_id), q(n)), {}, timeout=120)
+            if not ok(status, resp):
+                print("  WARN could not start %s (%s): %s" % (n, status, str(resp)[:160]))
     left = {t: c for t, c in storage_counts(storage_tables()).items() if c}
     print("  %d tables truncated%s; cognition cache and %d conversation dirs removed"
           % (len(tables), (" -- NOT EMPTY: %s" % left) if left else "", len(conv)))

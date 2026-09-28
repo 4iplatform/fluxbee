@@ -702,6 +702,7 @@ vez, **se rearmó solo**, sin intervención. Pero las VMs **no arrancan solas** 
 | 23 | `payload` de la API | Un `while` que gira sobre una operación exitosa | El `status` de arriba es el del sobre; lo real está bajo `payload.` |
 | 24 | `verify=19` en TLS local | "la cadena está rota" | Es falta de SNI. Probá con `--resolve` y un host que matchee el wildcard |
 | 25 | Runtime hot-publicado | El `.deb` sube y ese nodo queda en la versión vieja, **sin aviso** | El seed respeta tu `current` a propósito. Promovelo con `publish-runtime.sh --set-current` |
+| 26 | `systemctl stop` a un nodo managed (`fluxbee-node-*`) | La unit **desaparece** (es transitoria, de `systemd-run`); el `systemctl start` no encuentra nada y el nodo vuelve recién cuando lo relanza el reconcile (~45 s) | Usá el orquestador: `kill_node` **sin** `purge_instance` para frenarlo (conserva config e ILK) y `POST /hives/<h>/nodes/<n>/start` |
 
 ---
 
