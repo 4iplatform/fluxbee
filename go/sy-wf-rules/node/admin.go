@@ -80,7 +80,7 @@ func (c *l2AdminClient) PublishRuntimePackage(ctx context.Context, packageFiles 
 		},
 		"set_current": true,
 	}
-	response, err := c.request(ctx, publishRuntimePackageAction, params)
+	response, err := c.request(ctx, publishRuntimePackageAction, "", params)
 	if err != nil {
 		return nil, err
 	}
@@ -108,17 +108,19 @@ func (c *l2AdminClient) RemoveRuntimeVersion(ctx context.Context, runtimeName, v
 	if c == nil || c.dispatcher == nil {
 		return fmt.Errorf("admin client unavailable")
 	}
-	_, err := c.request(ctx, removeRuntimeVersionAction, map[string]any{
+	// The admin runs this on a hive's orchestrator: the dist being purged is the motherbee's.
+	_, err := c.request(ctx, removeRuntimeVersionAction, fluxbeesdk.PrimaryHiveID, map[string]any{
 		"runtime":         runtimeName,
 		"runtime_version": version,
 	})
 	return err
 }
 
-func (c *l2AdminClient) request(ctx context.Context, action string, params map[string]any) (map[string]any, error) {
+func (c *l2AdminClient) request(ctx context.Context, action, target string, params map[string]any) (map[string]any, error) {
 	msg, err := c.dispatcher.SendAdminRPC(ctx, fluxbeesdk.AdminRpcRequest{
 		AdminTarget: c.targetNode,
 		Action:      action,
+		Target:      target,
 		Params:      params,
 		Timeout:     adminRPCTimeout,
 	})
