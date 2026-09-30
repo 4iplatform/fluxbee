@@ -3666,12 +3666,19 @@ async fn main() -> Result<(), IdentityError> {
     } else {
         None
     };
+    // A replica's store only speaks for this hive once it holds the primary's state. Its periodic
+    // self-owned snapshot is AUTHORITATIVE upstream (the primary drops this hive's ILKs missing
+    // from it), so publishing before any baseline — a boot while the primary was unreachable,
+    // with only the seeded system ILKs in memory — deleted every node ILK of this hive on the
+    // primary (lab 2026-09-30). Set by the boot full sync or by the first subscription snapshot.
+    let mut replica_has_baseline = is_primary;
     if !is_primary {
         if let Some(upstream) = sync_upstream.as_deref() {
             match fetch_full_sync_from_primary(upstream, self_auth_key.as_ref(), &self_hive).await {
                 Ok(store) => {
                     let metrics = store.metrics();
                     runtime.store = store;
+                    replica_has_baseline = true;
                     tracing::info!(upstream = %upstream, metrics = %metrics, "identity full sync bootstrap applied");
                 }
                 Err(err) => {
@@ -3792,9 +3799,11 @@ async fn main() -> Result<(), IdentityError> {
                 // Replica: push the full self-owned ilk set upstream so the
                 // primary reconciles to it (additive across hives; recovers
                 // upserts + hard-deletes). No-op on the primary.
-                if !is_primary {
+                if !is_primary && replica_has_baseline {
                     let snapshot = runtime.store.self_owned_ilks(&hive.hive_id);
                     let _ = upstream_tx.send(UpstreamFrame::Snapshot(snapshot));
+                } else if !is_primary {
+                    tracing::warn!("identity replica has no baseline from the primary yet; holding its self-owned snapshot");
                 }
             }
             maybe_ingest = ingest_rx.recv() => {
@@ -3916,6 +3925,7 @@ async fn main() -> Result<(), IdentityError> {
                             // re-seed this hive's deterministic system ILKs on top of it.
                             let metrics = store.metrics();
                             runtime.store = *store;
+                            replica_has_baseline = true;
                             if let Err(err) = runtime.store.ensure_system_ilks_from_hive(&hive) {
                                 tracing::warn!(error = %err, "failed to re-seed system ILKs after identity resync");
                             }
