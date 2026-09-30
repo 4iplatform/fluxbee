@@ -21,6 +21,11 @@
 
 | Versión | Fecha (ART) | Commit | Alcance | Estado | Rollback |
 |---|---|---|---|---|---|
+| **0.1.40** | 2026-09-30 | `43dd174` | motherbee + spokes (core) | ✅ live | snap `pre-purge-order-0-1-40` (las 4 VMs) · `apt install fluxbee=0.1.39` |
+| **0.1.39** | 2026-09-30 | `85c3244` | motherbee + spokes (core) | ✅ live | snap `pre-identity-baseline-0-1-39` (las 4 VMs) · `apt install fluxbee=0.1.38` |
+| **0.1.38** | 2026-09-30 | `20baec3` | motherbee + spokes (core) | ✅ live | snap `pre-wf-mirror-0-1-38` (las 4 VMs) · `apt install fluxbee=0.1.37` |
+| **0.1.37** | 2026-09-30 | `c09f9af` | motherbee + spokes (core) | ✅ live | snap `pre-followups-0-1-37` (las 4 VMs) · `apt install fluxbee=0.1.36` |
+| **0.1.36** | 2026-09-30 | `d24e3aa` | motherbee + spokes (core) | ✅ live | snap `pre-config-scope-0-1-36` (las 4 VMs) · `apt install fluxbee=0.1.35` |
 | **0.1.35** | 2026-09-28 | `5f1cd71` | motherbee | ✅ live | snap `pre-teardown-fix-0-1-35` · `apt install fluxbee=0.1.34` |
 | **0.1.34** | 2026-09-28 | `60331c5` | motherbee + spokes (core) | ⚠️ superada (regresión teardown) | snap `pre-lifecycle-0-1-34` (las 4 VMs) · `apt install fluxbee=0.1.33` |
 | **0.1.33** | 2026-08-28 | `01b6266` | motherbee | ✅ live | `apt install fluxbee=0.1.32` |
@@ -44,6 +49,112 @@
 > (`dpkg-scanpackages -m`) para rollback, pero su detalle vive en la bitácora, no acá.
 
 ---
+
+## 0.1.40 — purga de WF en el motherbee en orden y tolerante a "ya no existe"
+
+- **Fecha:** 2026-09-30 (ART) · **Versión anterior:** 0.1.39 · **Commit:** `43dd174` (FINDINGS A-15)
+- **Qué cambió:** en un worker, wf-rules purga en el motherbee dejando la versión current al final
+  (el admin no deja borrarla mientras haya otras) y toma `RUNTIME_NOT_FOUND` /
+  `RUNTIME_VERSION_NOT_FOUND` como hecho.
+- **Build:** 7 min. **Install:** motherbee 23:03 UTC; spokes 23:05 (solo cambió wf-rules).
+- **Verificación en vivo — ciclo completo de un WF en worker1:**
+  - crear → nodo HEALTHY en 0.0.1 (18 s: publica, espera la sync, spawnea);
+  - re-aplicar con cambio → HEALTHY en 0.0.2 (18 s);
+  - borrar → OK; el motherbee queda sin versiones ni entrada en el manifest; el espejo de worker1
+    con 0 cambios locales (19/19).
+  - Limpieza: `AI.vaultprobe@worker1` borrado con su ILK purgado (el primario vuelve a 24 ILKs,
+    como al empezar el día); sin nodos ni scripts de prueba en las VMs.
+- **Rollback:** snapshot `pre-purge-order-0-1-40` o `apt install fluxbee=0.1.39`.
+
+## 0.1.39 — identity no borra los ILK de un hive que arrancó sin primario; purga de WF dirigida
+
+- **Fecha:** 2026-09-30 (ART) · **Versión anterior:** 0.1.38 · **Commits:** `2248612`, `85c3244`
+  (FINDINGS A-15, A-17). Un primer build de 0.1.39 sin `85c3244` se rehízo antes de publicarse.
+- **Qué cambió:** la réplica de identity no publica su conjunto de ILK propios hasta tener una base
+  del primario; wf-rules dirige `remove_runtime_version` al motherbee (`target`).
+- **Install:** motherbee 22:38 UTC; spokes 22:41 (solo se reiniciaron identity y wf-rules, que eran
+  los binarios cambiados).
+- **Verificación en vivo:**
+  - Réplica de worker1 arrancada con el primario bloqueado (nft temporal): logueó
+    `holding its self-owned snapshot` mientras estuvo sin base; al volver, snapshot de 25 ILKs. El
+    primario **siguió en 25, con el ILK de `AI.vaultprobe@worker1`** (con 0.1.38 había pasado de
+    25 a 24).
+  - Workflow en worker1: creado en 3 s, nodo HEALTHY. Delete: el motherbee borró la 0.0.1 y la
+    sync limpió worker1 sin cambios locales, pero la purga cortó en la 0.0.2 (`RUNTIME_NOT_FOUND`:
+    directorio huérfano) → se arregla en 0.1.40.
+- **Rollback:** snapshot `pre-identity-baseline-0-1-39` o `apt install fluxbee=0.1.38`.
+
+## 0.1.38 — wf-rules no toca el espejo `dist/` de un worker; el orquestador no spawnea sin archivos
+
+- **Fecha:** 2026-09-30 (ART) · **Versión anterior:** 0.1.37 · **Commits:** `676732d`, `20baec3`
+  (FINDINGS A-15)
+- **Qué cambió:** en un hive que no es el motherbee, wf-rules purga pidiéndole
+  `remove_runtime_version` al admin en vez de borrar su espejo; el orquestador responde
+  `RUNTIME_NOT_PRESENT` hasta que el `package.json` del paquete está en el hive.
+- **Build:** 4 min (incremental). **Install:** motherbee 22:07 UTC; spokes 22:10–22:12.
+- **Reparación puntual:** espejo `dist-runtimes` de worker1 restaurado con `POST /rest/db/revert`
+  de Syncthing (15 → 0 cambios locales). Después `WF.w1probe@worker1` quedó HEALTHY: **el primer WF
+  corriendo en un worker**.
+- **Verificación en vivo:** el delete dejó el espejo limpio (0 cambios locales), pero el pedido al
+  admin salía sin `target` (`INVALID_REQUEST`) → se arregla en 0.1.39.
+- **Rollback:** snapshot `pre-wf-mirror-0-1-38` o `apt install fluxbee=0.1.37`.
+
+## 0.1.37 — lo que salió de validar 0.1.36: spawn de WF en workers, veredicto del vault, permisos de OPA
+
+- **Fecha:** 2026-09-30 (ART) · **Versión anterior:** 0.1.36 · **Commits:** `3055a40`, `6c708a6`,
+  `c09f9af` (FINDINGS A-12 a A-14)
+- **Alcance:** motherbee + los tres spokes (core-update).
+- **Qué cambió:**
+  - wf-rules espera (hasta 20 s) a que el paquete recién publicado llegue al hive antes de spawnear.
+  - SDK: `VaultClient::get`/`list` conservan el veredicto del vault (`KEY_NOT_FOUND` ya no llega
+    como error JSON).
+  - SY.opa.rules: SHM `0600` (era `0666`), policy `0600`, dirs `0700`.
+- **Build:** VM110 `build-deb.sh 0.1.37` (22 min) → publish (37 paquetes). Snapshots
+  `pre-followups-0-1-37` en las 4 VMs (se borró antes el más viejo de cada una).
+- **Install:** motherbee 21:37 UTC; spokes 21:40–21:42 (TIMEOUT como siempre; `rt-gateway` con el
+  mismo hash en los 4 hives).
+- **Verificación en vivo:**
+  - `/dev/shm/jsr-opa-motherbee` y `…-worker1` → `rw-------`; `/var/lib/fluxbee/opa` → `700`.
+  - Workflow en worker1: `RUNTIME_NOT_AVAILABLE` a las 21:43:39/40/42/46 y spawn OK a las 21:43:51,
+    cuando llegó el manifest. **El nodo quedó en crash-loop** por archivos del paquete faltantes:
+    wf-rules los había borrado del espejo local (A-15) → se arregla en 0.1.38.
+- **Rollback:** snapshot `pre-followups-0-1-37` o `apt install fluxbee=0.1.36` + core-update.
+
+## 0.1.36 — config con alcance de hive, control de origen, vault/admin desde workers, identity se pone al día
+
+- **Fecha:** 2026-09-30 (ART) · **Versión anterior:** 0.1.35 · **Commits:** `ad48ecb`, `15d53cc`,
+  `d24e3aa`
+- **Alcance:** **motherbee + los tres spokes** (core-update a worker1, ingress1 y egress1: cambian
+  el router, SY.config.routes, identity, cognition y los nodos Go).
+- **Qué cambió** (bitácora 2026-09-30; FINDINGS A-8 a A-11). Los cuatro bugs se confirmaron en
+  vivo con 0.1.35 antes de tocar nada:
+  - `ConfigChangedPayload.hive`: un `add_route` en worker1 ya no pisa las rutas del motherbee, y
+    una operación OPA dirigida a worker1 ya no se ejecuta en el motherbee.
+  - CONFIG_CHANGED pasa a ser acción protegida (gate en el router). SY.config.routes y
+    SY.opa.rules solo aceptan mutaciones y comandos de `SY.admin@motherbee`.
+  - `VaultClient::for_primary` y wf-rules → `SY.admin@motherbee`: AI, cognition, IO y WF en un
+    worker llegan al vault y al admin.
+  - La réplica de identity se resincroniza con un snapshot en cada suscripción.
+- **Build:** VM110 `build-deb.sh 0.1.36` (22 min: cambió el SDK) → publish (36 paquetes).
+  Snapshots `pre-config-scope-0-1-36` en las 4 VMs (la más vieja de VM100 se borró antes).
+- **Install:** motherbee 20:42→20:43 UTC; core-update de los spokes → `TIMEOUT` como siempre, pero
+  aplicado: `rt-gateway` con el mismo hash en los 4 hives y servicios reiniciados 20:44–20:46.
+- **Verificación en vivo** (los mismos pasos que confirmaron cada bug):
+  - Dos altas en worker1 → el motherbee sigue en 0 rutas; su SY.config.routes loguea
+    `config changed addressed to another hive; ignoring`.
+  - Nodo falso: CONFIG_CHANGED → `router dropped CONFIG_CHANGED from unauthorized origin`;
+    `add_route` directo → `FORBIDDEN`; `rollback_policy` → `UNAUTHORIZED`. Rutas intactas.
+  - `node_config` legítimo del orquestador en worker1 → pasa el gate.
+  - AI y cognition en worker1 consultan `SY.vault@motherbee` (antes `NODE_NOT_FOUND` contra
+    `SY.vault@worker1`).
+  - Workflow en worker1 → **publica** (antes `PACKAGE_PUBLISH_FAILED: UNREACHABLE`). El primer
+    spawn todavía choca con la sincronización de Syncthing (~11 s): se arregla en 0.1.37.
+  - Réplica de worker1 arrancada con el primario inalcanzable (regla nft temporal) → DEGRADED →
+    al volver la conexión, `identity full sync applied (delta stream subscribed)` sola.
+  - Clear de OPA dirigido a worker1 → el motherbee lo ignora; el admin informa `pending worker1`
+    (que llegue a los spokes es el diseño pendiente, A-7).
+- **Rollback:** snapshot `pre-config-scope-0-1-36` (las 4 VMs) o `apt install fluxbee=0.1.35` +
+  core-update de los spokes.
 
 ## 0.1.35 — admin: los orquestadores vuelven a poder marcar el ILK de un nodo (fix de 0.1.34)
 

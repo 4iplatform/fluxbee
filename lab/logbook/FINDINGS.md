@@ -117,6 +117,114 @@
   compilar el binario a mano — ambas cosas habrían hecho pasar el build **ocultando el problema** y
   dejando la próxima caja limpia rota igual.
 
+### A-7 🔴 OPA de usuario no llega a los spokes (CONFIG_CHANGED nunca sale del motherbee)
+
+- **Qué pasa:** el admin manda las escrituras OPA como CONFIG_CHANGED; el router lo intercepta
+  antes de rutear, ignora el destino y solo lo reparte dentro del host. Un clear dirigido a worker1
+  lo ejecutó el motherbee (2026-09-28). Ningún spoke tiene de dónde sacar la policy; ingress y
+  egress ni siquiera corren SY.opa.rules. Y el wasm compilado (140–155 KB) no entra en un mensaje
+  (tope de 128 KiB).
+- **Estado:** diseño **decidido por el operador** (bitácora 2026-09-30), falta construirlo:
+  SY.opa.rules en todos los hives; el motherbee compila y publica el compilado en una carpeta
+  Syncthing; un CONFIG_CHANGED con `{version, sha256}` avisa; cada hive lo carga si el hash
+  coincide; una sola policy global; convergencia eventual. Sin cifrado por ahora. En 0.1.36, la
+  parte de "se ejecuta en el hive equivocado" quedó cerrada (A-8).
+
+### A-8 ✅ RESUELTO (0.1.36) — Config de un hive aplicada en otro: `add_route` en un spoke pisaba las rutas del motherbee
+
+- **Confirmado en vivo** en 8.x (bitácora 2026-09-30): dos altas en worker1 y el motherbee quedó
+  con esas rutas. El broadcast posterior a cada alta/baja llevaba la lista del spoke, y el contador
+  del admin iba uno adelante del de SY.config.routes.
+- **Arreglo:** `ConfigChangedPayload.hive`; el admin lo completa y SY.config.routes / SY.opa.rules
+  ignoran la config de otro hive.
+
+### A-9 ✅ RESUELTO (0.1.36) — Cualquier nodo podía reescribir rutas, taps u OPA de su hive
+
+- **Qué pasaba:** CONFIG_CHANGED no era acción protegida y el intercept del router lo repartía sin
+  mirar el origen; SY.config.routes aceptaba `add_route`/`add_tap` de cualquiera (el tipo `admin`
+  no pasa por el gate del router); SY.opa.rules aceptaba `compile/apply/rollback_policy` de
+  cualquiera. Un nodo de usuario podía, por ejemplo, agregarse un tap y espejar tráfico.
+- **Arreglo:** CONFIG_CHANGED protegido (router + `system.rego`, reglas vigentes, sin recompilar);
+  mutaciones de SY.config.routes y comandos de SY.opa.rules solo desde `SY.admin@motherbee`.
+
+### A-10 ✅ RESUELTO (0.1.36) — Nodos fuera del motherbee apuntaban a `SY.vault@<su hive>` / `SY.admin@<su hive>`
+
+- **Qué pasaba:** vault y admin corren solo en el motherbee. Cognition, los runners AI y los IO
+  derivaban el destino del vault de su propio hive; SY.wf-rules publicaba vía `SY.admin@<su hive>`.
+  En un worker, nada de eso existe. SY.edge ya lo había resuelto con `vault_hive`.
+- **Arreglo:** `VaultClient::for_primary` y `PRIMARY_HIVE_ID` en el SDK (el router la re-exporta);
+  `PrimaryAdminNode` en el Go SDK para SY.wf-rules.
+
+### A-11 ✅ RESUELTO (0.1.36) — La réplica de identity no se ponía al día al reconectar
+
+- **Qué pasaba:** el full sync corría solo al arrancar. Si el stream de deltas se cortaba, o el
+  worker arrancaba con el motherbee caído, la réplica quedaba con datos viejos (o solo los ILK de
+  sistema) hasta el próximo reinicio, aunque el log decía que iba a converger al reconectar.
+- **Arreglo:** cada suscripción empieza con un snapshot completo; un gap de secuencia reconecta y
+  resincroniza en vez de `exit(0)`.
+
+### A-12 ✅ RESUELTO (0.1.37) — El primer spawn de un WF en un worker corría antes que Syncthing
+
+- **Qué pasaba:** con el publish arreglado (A-10), el deploy llegaba al spawn antes de que el
+  paquete sincronizara a worker1 (~11 s medidos) → `RUNTIME_NOT_AVAILABLE`, un solo intento.
+- **Arreglo:** wf-rules reintenta (backoff 1→4 s, hasta 20 s) mientras el orquestador conteste
+  `RUNTIME_NOT_AVAILABLE` / `RUNTIME_NOT_PRESENT` / `BASE_RUNTIME_NOT_AVAILABLE`.
+
+### A-13 ✅ RESUELTO (0.1.37) — El SDK tapaba el veredicto del vault
+
+- **Qué pasaba:** `VaultClient::get`/`list` parseaban la respuesta como éxito antes de mirar el
+  `status`; un `KEY_NOT_FOUND` llegaba como `json error: missing field key` y las ramas
+  `KEY_NOT_FOUND` de io-slack e io-wapp nunca corrían.
+- **Arreglo:** leer el veredicto del JSON crudo antes de parsear.
+
+### A-14 ✅ RESUELTO (0.1.37) — La SHM de OPA era `0666`
+
+- **Qué pasaba:** SY.opa.rules creaba `/dev/shm/jsr-opa-<hive>` `rw-rw-rw-` (y la volvía a poner
+  así si existía): cualquier proceso podía leer la policy o escribir una para el router. Sus pares
+  Rust usan `0600`. Archivos de policy `0644` en dirs `0755`.
+- **Arreglo:** región `0600` (se corrige al arrancar), archivos `0600`, dirs `0700`.
+
+### A-15 ✅ RESUELTO (0.1.38–0.1.40) — wf-rules borraba paquetes del espejo `dist/` de un worker
+
+- **Qué pasaba:** tras apply/rollback/delete, wf-rules purgaba versiones y reescribía el manifest
+  en su `dist/runtimes` **local**. En un worker eso es un espejo Syncthing receive-only: el borrado
+  local no se restaura nunca. En worker1 quedaron 15 cambios locales (13 borrados); el paquete
+  `wf.w1probe` desapareció del espejo y el nodo WF entró en crash-loop por
+  `flow/definition.json` faltante. Además el orquestador aceptaba el spawn con el manifest ya
+  sincronizado pero sin los archivos del paquete.
+- **Arreglo:** en un hive que no es el motherbee, la purga pide `remove_runtime_version` al admin
+  (se borra en el origen y la sync lo lleva); el orquestador responde `RUNTIME_NOT_PRESENT` hasta
+  que el `package.json` del paquete esté en el hive. En 0.1.38 el pedido salía sin `target`
+  (`INVALID_REQUEST: missing target`); 0.1.39 lo dirige al motherbee; 0.1.40 purga dejando la
+  versión current al final y toma `RUNTIME_NOT_FOUND`/`RUNTIME_VERSION_NOT_FOUND` como hecho.
+- **Validado (0.1.40):** crear → re-aplicar → borrar un WF en worker1: nodo HEALTHY en 0.0.1 y
+  0.0.2 (18 s cada uno), delete OK, motherbee sin versiones ni entrada en el manifest, espejo de
+  worker1 con 0 cambios locales.
+- **Reparación puntual:** el espejo de worker1 se restauró con `POST /rest/db/revert` de Syncthing
+  (15 → 0 cambios locales); después de eso `WF.w1probe@worker1` quedó HEALTHY: el primer WF
+  corriendo en un worker.
+
+### A-17 ✅ RESUELTO (0.1.39) — Una réplica de identity que arranca sin primario borra los ILK de su hive
+
+- **Qué pasaba:** la réplica re-publica cada 30 s su conjunto de ILK propios y el primario lo toma
+  como autoritativo (borra los ILK del hive que no vienen). Si el worker arranca con el primario
+  inalcanzable, en memoria solo tiene sus ILK de sistema: al volver la conexión publicaba eso y el
+  primario **borraba los ILK de los nodos del hive**. Visto en 8.x: el primario pasó de 25 a 24
+  ILKs y `AI.vaultprobe@worker1` quedó sin identidad (`ILK_NOT_FOUND` al matarlo). Es el caso de
+  un reboot completo en el que un worker levanta antes que el motherbee.
+- **Arreglo:** el conjunto propio no se publica hasta tener una base del primario (full sync de
+  arranque o el primer snapshot de la suscripción). Los deltas locales sueltos siguen saliendo.
+- **Validado:** mismo arranque degradado → la réplica loguea `holding its self-owned snapshot`; el
+  primario sigue en 25 ILKs, con el del probe.
+
+### A-16 🔴 Los espejos receive-only acumulan cambios locales en silencio
+
+- **Qué pasa:** en una carpeta receive-only, Syncthing no propaga ni revierte los cambios locales.
+  Si algo toca el espejo en un spoke, diverge del motherbee para siempre y nadie se entera. El
+  orquestador administra Syncthing pero no mira ni revierte estos cambios.
+- **A discutir:** que el orquestador revierta (`/rest/db/revert`) los cambios locales de las
+  carpetas receive-only y lo loguee, para que el espejo converja solo al origen.
+
 ---
 
 ## B. Infraestructura y herramientas — no requieren cambio de código del producto
