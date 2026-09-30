@@ -50,6 +50,7 @@ const IDENTITY_SYNC_VERSION: u32 = 1;
 const SYNC_OP_FULL_SYNC_REQUEST: &str = "IDENTITY_FULL_SYNC_REQUEST";
 const SYNC_OP_FULL_SYNC: &str = "full_sync";
 const SYNC_OP_DELTA_SUBSCRIBE: &str = "IDENTITY_DELTA_SUBSCRIBE";
+const SYNC_OP_DELTA_SUBSCRIBED: &str = "IDENTITY_DELTA_SUBSCRIBED";
 const SYNC_OP_DELTA: &str = "IDENTITY_DELTA";
 const SYNC_OP_DELTA_ACK: &str = "IDENTITY_DELTA_ACK";
 // Upstream push (replica → primary): a replica publishes its own `@hive` ilks so
@@ -3532,9 +3533,8 @@ async fn main() -> Result<(), IdentityError> {
     let sender = dispatcher.sender_snapshot();
     tracing::info!(node_name = %sender.full_name(), "sy.identity connected to router");
 
-    let vault_client = VaultClient::new(
+    let vault_client = VaultClient::for_primary(
         dispatcher.clone(),
-        hive.hive_id.clone(),
         VaultCallerOwned::new(self_ilk_id.clone(), node_name.clone()),
     );
 
@@ -3722,7 +3722,7 @@ async fn main() -> Result<(), IdentityError> {
     // Identity is the SHM writer; it derives its own ILK locally rather than
     // waiting on the SHM read path it just populated.
     tracing::info!(self_ilk_id = %self_ilk_id, "resolved self system ILK");
-    let (delta_event_tx, mut delta_event_rx) = mpsc::unbounded_channel::<IdentityDeltaEnvelope>();
+    let (delta_event_tx, mut delta_event_rx) = mpsc::unbounded_channel::<ReplicaSyncEvent>();
     // Upstream publish (replica → primary): local ilk deltas a replica pushes up.
     let (upstream_tx, upstream_rx) = mpsc::unbounded_channel::<UpstreamFrame>();
     // Ingest (primary): frames received from replicas' publish connections.
@@ -3908,12 +3908,24 @@ async fn main() -> Result<(), IdentityError> {
                     }
                 }
             }
-            maybe_delta = delta_event_rx.recv() => {
-                if let Some(envelope) = maybe_delta {
-                    runtime.store.apply_delta(envelope.delta);
+            maybe_event = delta_event_rx.recv() => {
+                if let Some(event) = maybe_event {
+                    match event {
+                        ReplicaSyncEvent::Snapshot(store) => {
+                            // Same as the boot bootstrap: adopt the primary's state, then
+                            // re-seed this hive's deterministic system ILKs on top of it.
+                            let metrics = store.metrics();
+                            runtime.store = *store;
+                            if let Err(err) = runtime.store.ensure_system_ilks_from_hive(&hive) {
+                                tracing::warn!(error = %err, "failed to re-seed system ILKs after identity resync");
+                            }
+                            tracing::info!(metrics = %metrics, "identity full sync applied (delta stream subscribed)");
+                        }
+                        ReplicaSyncEvent::Delta(envelope) => runtime.store.apply_delta(envelope.delta),
+                    }
                     if let Some(writer) = identity_shm.as_mut() {
                         if let Err(err) = sync_identity_shm_mappings(writer, &runtime.store) {
-                            tracing::warn!(error = %err, "identity shm sync failed after delta apply");
+                            tracing::warn!(error = %err, "identity shm sync failed after replica sync");
                         }
                     }
                 }
@@ -5049,7 +5061,7 @@ async fn handle_sync_connection(
                 mpsc::channel::<IdentityDeltaEnvelope>(IDENTITY_SUBSCRIBER_CHANNEL_CAP);
             let ack = json!({
                 "status": "ok",
-                "operation": "IDENTITY_DELTA_SUBSCRIBED"
+                "operation": SYNC_OP_DELTA_SUBSCRIBED
             });
             write_timed(&mut write_half, serde_json::to_string(&ack)?.as_bytes()).await?;
             write_timed(&mut write_half, b"\n").await?;
@@ -5340,9 +5352,16 @@ fn broadcast_deltas(
     });
 }
 
+/// What a replica's delta-subscription task hands the main loop, IN ORDER on one channel: a
+/// full snapshot at the start of every subscription, then that subscription's deltas.
+enum ReplicaSyncEvent {
+    Snapshot(Box<IdentityStore>),
+    Delta(IdentityDeltaEnvelope),
+}
+
 async fn run_delta_subscription_loop(
     upstream: String,
-    sink: mpsc::UnboundedSender<IdentityDeltaEnvelope>,
+    sink: mpsc::UnboundedSender<ReplicaSyncEvent>,
     auth_key: Option<json_router::mesh_hmac::MeshHmacKey>,
     self_hive: String,
 ) {
@@ -5361,7 +5380,7 @@ async fn run_delta_subscription_loop(
 
 async fn stream_deltas_from_primary(
     upstream: &str,
-    sink: &mpsc::UnboundedSender<IdentityDeltaEnvelope>,
+    sink: &mpsc::UnboundedSender<ReplicaSyncEvent>,
     auth_key: Option<&json_router::mesh_hmac::MeshHmacKey>,
     self_hive: &str,
 ) -> Result<(), IdentityError> {
@@ -5376,6 +5395,32 @@ async fn stream_deltas_from_primary(
     write_half.flush().await?;
 
     let mut line = String::new();
+    read_sync_line(
+        &mut reader,
+        &mut line,
+        MAX_SYNC_LINE_BYTES,
+        Some(Duration::from_secs(IDENTITY_SYNC_READ_IDLE_SECS)),
+    )
+    .await?;
+    let ack: serde_json::Value = serde_json::from_str(line.trim())
+        .map_err(|err| format!("delta subscribe: unreadable reply: {err}"))?;
+    if ack.get("operation").and_then(|v| v.as_str()) != Some(SYNC_OP_DELTA_SUBSCRIBED) {
+        return Err(format!("delta subscribe rejected: {}", line.trim()).into());
+    }
+
+    // Subscribed: every change from now on arrives on this stream. The primary keeps no backlog,
+    // so whatever happened while we were NOT subscribed (a dropped stream, a boot while the
+    // primary was down) is only recoverable from a full snapshot — take one now, before the
+    // stream's deltas. Replaying a delta the snapshot already contains is harmless: deltas carry
+    // whole records and arrive in order, so the store still ends at the primary's state.
+    let snapshot = fetch_full_sync_from_primary(upstream, auth_key, self_hive).await?;
+    if sink
+        .send(ReplicaSyncEvent::Snapshot(Box::new(snapshot)))
+        .is_err()
+    {
+        return Err("delta sink dropped".into());
+    }
+
     let mut last_seq: Option<u64> = None;
     loop {
         line.clear();
@@ -5411,26 +5456,20 @@ async fn stream_deltas_from_primary(
                         continue;
                     }
                     if envelope.seq != last.saturating_add(1) {
-                        // F-05: a sequence gap means we missed one or more deltas
-                        // — possibly a revocation/demotion, which vault trusts
-                        // (lost => privilege RETENTION on this replica). The
-                        // replica store lives on the main loop and cannot be
-                        // swapped from this task, so recover the same way the
-                        // vault-secret path does: exit(0) and let systemd restart
-                        // us, which re-runs the boot full-sync and rebuilds a
-                        // consistent store. Silently re-subscribing (the old
-                        // behavior) would adopt the gap as a fresh baseline and
-                        // keep serving stale identity indefinitely.
-                        tracing::error!(
-                            prev = last,
-                            current = envelope.seq,
-                            "identity delta stream sequence gap; exiting for a clean full-sync \
-                             re-bootstrap on systemd-managed restart"
-                        );
-                        std::process::exit(0);
+                        // F-05: a sequence gap means we missed one or more deltas — possibly
+                        // a revocation/demotion, which vault trusts (lost => privilege
+                        // RETENTION on this replica). Drop the stream: the next subscription
+                        // starts from a full snapshot, so the gap is never adopted as a
+                        // baseline.
+                        return Err(format!(
+                            "identity delta stream sequence gap (prev={last}, current={}); \
+                             resubscribing from a full snapshot",
+                            envelope.seq
+                        )
+                        .into());
                     }
                 }
-                if sink.send(envelope.clone()).is_err() {
+                if sink.send(ReplicaSyncEvent::Delta(envelope.clone())).is_err() {
                     return Err("delta sink dropped".into());
                 }
                 last_seq = Some(envelope.seq);
