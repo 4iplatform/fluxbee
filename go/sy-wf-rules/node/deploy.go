@@ -2,9 +2,47 @@ package node
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"time"
 )
+
+// runtimeSyncBudget bounds how long a deploy waits for the package it just published to reach this
+// hive. Publishing happens on the motherbee; a worker gets the package through Syncthing (~11 s
+// measured on the 8.x hive), while on the motherbee it is there at once. Stays inside SY.admin's
+// 30 s request timeout.
+const runtimeSyncBudget = 20 * time.Second
+
+// runtimeNotSyncedYet reports an orchestrator refusal that only means the package published on the
+// motherbee has not reached this hive's dist tree yet.
+func runtimeNotSyncedYet(err error) bool {
+	var actionErr *orchestratorActionError
+	if !errors.As(err, &actionErr) {
+		return false
+	}
+	switch actionErr.Code {
+	case "RUNTIME_NOT_AVAILABLE", "RUNTIME_NOT_PRESENT", "BASE_RUNTIME_NOT_AVAILABLE":
+		return true
+	}
+	return false
+}
+
+// untilRuntimeSynced runs call, and runs it again while the orchestrator answers that the runtime
+// has not reached this hive yet — until it succeeds, fails for another reason, or budget runs out.
+func untilRuntimeSynced(budget time.Duration, call func() error) error {
+	deadline := time.Now().Add(budget)
+	delay := time.Second
+	for {
+		err := call()
+		if err == nil || !runtimeNotSyncedYet(err) || time.Now().Add(delay).After(deadline) {
+			return err
+		}
+		time.Sleep(delay)
+		if delay < 4*time.Second {
+			delay *= 2
+		}
+	}
+}
 
 type WFNodeActionResult struct {
 	NodeName string `json:"node_name"`
@@ -73,9 +111,13 @@ func (s *Service) deployPublishedWorkflow(workflowName string, autoSpawn bool, t
 		existingConfig := configMapFromNodeConfigPayload(existingConfigPayload)
 		config := s.buildManagedWFConfig(existingConfig, tenantID)
 		binding := buildManagedRuntimeBinding(pkg)
-		rpcCtx, cancel = context.WithTimeout(context.Background(), orchestratorRPCTimeout)
-		defer cancel()
-		if _, err := s.orchestrator.SetNodeConfig(rpcCtx, s.cfg.OrchestratorTarget, nodeName, config, &binding, false); err != nil {
+		rebind := func() error {
+			rpcCtx, cancel := context.WithTimeout(context.Background(), orchestratorRPCTimeout)
+			defer cancel()
+			_, err := s.orchestrator.SetNodeConfig(rpcCtx, s.cfg.OrchestratorTarget, nodeName, config, &binding, false)
+			return err
+		}
+		if err := untilRuntimeSynced(runtimeSyncBudget, rebind); err != nil {
 			return WFNodeActionResult{
 					NodeName: nodeName,
 					Action:   "restart_failed",
@@ -83,13 +125,15 @@ func (s *Service) deployPublishedWorkflow(workflowName string, autoSpawn bool, t
 				},
 				"Package published, but sy.wf-rules could not rebind the existing node config."
 		}
-		rpcCtx, cancel = context.WithTimeout(context.Background(), orchestratorRPCTimeout)
-		defer cancel()
-		if _, err := s.orchestrator.RestartNode(rpcCtx, s.cfg.OrchestratorTarget, nodeName); err != nil {
-			time.Sleep(1 * time.Second)
-			rpcCtx, cancel = context.WithTimeout(context.Background(), orchestratorRPCTimeout)
+		restart := func() error {
+			rpcCtx, cancel := context.WithTimeout(context.Background(), orchestratorRPCTimeout)
 			defer cancel()
-			if _, retryErr := s.orchestrator.RestartNode(rpcCtx, s.cfg.OrchestratorTarget, nodeName); retryErr != nil {
+			_, err := s.orchestrator.RestartNode(rpcCtx, s.cfg.OrchestratorTarget, nodeName)
+			return err
+		}
+		if err := untilRuntimeSynced(runtimeSyncBudget, restart); err != nil {
+			time.Sleep(1 * time.Second)
+			if retryErr := restart(); retryErr != nil {
 				return WFNodeActionResult{
 						NodeName: nodeName,
 						Action:   "restart_failed",
@@ -141,11 +185,14 @@ func (s *Service) deployPublishedWorkflow(workflowName string, autoSpawn bool, t
 			"Package published, but first deploy was skipped because tenant_id is required."
 	}
 
-	rpcCtx, cancel = context.WithTimeout(context.Background(), orchestratorRPCTimeout)
-	defer cancel()
 	runtimeName := pkg.RuntimeName
 	config := s.buildManagedWFConfig(nil, tenantID)
-	_, err = s.orchestrator.RunNode(rpcCtx, s.cfg.OrchestratorTarget, nodeName, runtimeName, pkg.Version, config)
+	err = untilRuntimeSynced(runtimeSyncBudget, func() error {
+		rpcCtx, cancel := context.WithTimeout(context.Background(), orchestratorRPCTimeout)
+		defer cancel()
+		_, err := s.orchestrator.RunNode(rpcCtx, s.cfg.OrchestratorTarget, nodeName, runtimeName, pkg.Version, config)
+		return err
+	})
 	if err != nil {
 		return WFNodeActionResult{
 				NodeName: nodeName,
