@@ -165,14 +165,34 @@ func TestPurgeWorkflowPackagesOnAMirrorHiveGoesThroughTheAdmin(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read manifest: %v", err)
 	}
+	// The motherbee refuses to remove the current version while others remain: make 0.0.1 the
+	// current one and expect it last. And 0.0.2 is already gone there (a directory the manifest
+	// no longer lists): that counts as removed.
+	manifest, err := loadRuntimeManifest(manifestPath)
+	if err != nil {
+		t.Fatalf("load manifest: %v", err)
+	}
+	entry := manifest.Runtimes["wf.invoice"]
+	entry.Current = "0.0.1"
+	manifest.Runtimes["wf.invoice"] = entry
+	if err := writeRuntimeManifest(manifestPath, manifest); err != nil {
+		t.Fatalf("write manifest: %v", err)
+	}
+	manifestBefore, err = os.ReadFile(manifestPath)
+	if err != nil {
+		t.Fatalf("read manifest: %v", err)
+	}
 	svc.cfg.HiveID = "worker1"
 	admin := svc.admin.(*fakeAdminClient)
+	admin.removeErr = map[string]error{
+		"0.0.2": &adminActionError{Status: "error", Code: "RUNTIME_VERSION_NOT_FOUND", Message: "gone"},
+	}
 
 	if err := svc.PurgeWorkflowPackages("invoice", false); err != nil {
 		t.Fatalf("PurgeWorkflowPackages: %v", err)
 	}
 
-	want := []string{"wf.invoice@0.0.1", "wf.invoice@0.0.2", "wf.invoice@0.0.3"}
+	want := []string{"wf.invoice@0.0.2", "wf.invoice@0.0.3", "wf.invoice@0.0.1"}
 	if strings.Join(admin.removedVersions, ",") != strings.Join(want, ",") {
 		t.Fatalf("want removals %v through the admin, got %v", want, admin.removedVersions)
 	}
@@ -191,11 +211,12 @@ type fakeAdminClient struct {
 	publishCalls              int
 	lastPackageFiles          map[string]string
 	removedVersions           []string
+	removeErr                 map[string]error
 }
 
 func (f *fakeAdminClient) RemoveRuntimeVersion(_ context.Context, runtimeName, version string) error {
 	f.removedVersions = append(f.removedVersions, runtimeName+"@"+version)
-	return nil
+	return f.removeErr[version]
 }
 
 func (f *fakeAdminClient) PublishRuntimePackage(ctx context.Context, packageFiles map[string]string) (*PackagePublishResult, error) {

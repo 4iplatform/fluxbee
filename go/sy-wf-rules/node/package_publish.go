@@ -3,6 +3,7 @@ package node
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -155,6 +156,7 @@ func (s *Service) PurgeWorkflowPackages(workflowName string, preserveBoundVersio
 	// manifest edit only diverges from the source. There, obsolete versions are removed through
 	// SY.admin from the motherbee's dist, and the sync carries the removal here.
 	mirror := s.cfg.HiveID != fluxbeesdk.PrimaryHiveID
+	var obsolete []string
 	for _, entry := range entries {
 		if !entry.IsDir() {
 			continue
@@ -164,9 +166,7 @@ func (s *Service) PurgeWorkflowPackages(workflowName string, preserveBoundVersio
 			continue
 		}
 		if mirror {
-			if err := s.removeRuntimeVersionOnPrimary(runtimeName, version); err != nil {
-				return err
-			}
+			obsolete = append(obsolete, version)
 			continue
 		}
 		if err := os.RemoveAll(filepath.Join(runtimeDir, version)); err != nil {
@@ -174,7 +174,7 @@ func (s *Service) PurgeWorkflowPackages(workflowName string, preserveBoundVersio
 		}
 	}
 	if mirror {
-		return nil
+		return s.purgeOnPrimary(runtimeName, obsolete)
 	}
 
 	remaining, err := runtimeVersionsOnDisk(runtimeDir)
@@ -187,6 +187,25 @@ func (s *Service) PurgeWorkflowPackages(workflowName string, preserveBoundVersio
 	return s.updateRuntimeManifestAfterPurge(runtimeName, remaining, preferredCurrentVersion(keep))
 }
 
+// purgeOnPrimary removes versions from the motherbee's dist. The admin refuses to remove a
+// runtime's current version while other versions remain, so the current one (per this hive's copy
+// of the manifest) goes last.
+func (s *Service) purgeOnPrimary(runtimeName string, versions []string) error {
+	current := ""
+	if manifest, err := loadRuntimeManifest(filepath.Join(s.cfg.DistRuntimeRoot, "manifest.json")); err == nil {
+		current = manifest.Runtimes[runtimeName].Current
+	}
+	sort.SliceStable(versions, func(i, j int) bool {
+		return versions[i] != current && versions[j] == current
+	})
+	for _, version := range versions {
+		if err := s.removeRuntimeVersionOnPrimary(runtimeName, version); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 func (s *Service) removeRuntimeVersionOnPrimary(runtimeName, version string) error {
 	if s.admin == nil {
 		return fmt.Errorf("admin client unavailable")
@@ -194,6 +213,13 @@ func (s *Service) removeRuntimeVersionOnPrimary(runtimeName, version string) err
 	ctx, cancel := context.WithTimeout(context.Background(), adminRPCTimeout)
 	defer cancel()
 	if err := s.admin.RemoveRuntimeVersion(ctx, runtimeName, version); err != nil {
+		var actionErr *adminActionError
+		if errors.As(err, &actionErr) &&
+			(actionErr.Code == "RUNTIME_NOT_FOUND" || actionErr.Code == "RUNTIME_VERSION_NOT_FOUND") {
+			// Already gone from the motherbee (e.g. a directory the manifest no longer lists):
+			// exactly the state the purge wants.
+			return nil
+		}
 		return fmt.Errorf("remove %s %s on %s: %w", runtimeName, version, fluxbeesdk.PrimaryAdminNode, err)
 	}
 	return nil
