@@ -642,6 +642,19 @@ fn ensure_ok(
     })
 }
 
+/// The vault's verdict, read from the raw reply BEFORE it is parsed as a success. An error reply
+/// carries only `status` / `error_code` / `message`, so parsing it first as a value or list
+/// response failed on the missing `key` / `count` and turned KEY_NOT_FOUND (or FORBIDDEN) into a
+/// JSON error — callers matching on the code never saw it.
+fn ensure_raw_ok(raw: &Value) -> Result<(), VaultError> {
+    let field = |name: &str| raw.get(name).and_then(Value::as_str);
+    ensure_ok(
+        field("status").unwrap_or_default(),
+        field("error_code"),
+        field("message"),
+    )
+}
+
 /// Owned variant of [`VaultCaller`]. The dispatcher-backed [`VaultClient`]
 /// stores it so callers don't need to keep the original `&str` slices alive
 /// for the lifetime of the client.
@@ -807,12 +820,8 @@ impl VaultClient {
         let raw = self
             .send_vault_action(MSG_VAULT_GET, MSG_VAULT_GET_RESPONSE, payload, timeout)
             .await?;
+        ensure_raw_ok(&raw)?;
         let parsed: VaultGetResponse = serde_json::from_value(raw)?;
-        ensure_ok(
-            &parsed.status,
-            parsed.error_code.as_deref(),
-            parsed.message.as_deref(),
-        )?;
         Ok(parsed)
     }
 
@@ -826,12 +835,8 @@ impl VaultClient {
         let raw = self
             .send_vault_action(MSG_VAULT_LIST, MSG_VAULT_LIST_RESPONSE, payload, timeout)
             .await?;
+        ensure_raw_ok(&raw)?;
         let parsed: VaultListResponse = serde_json::from_value(raw)?;
-        ensure_ok(
-            &parsed.status,
-            parsed.error_code.as_deref(),
-            parsed.message.as_deref(),
-        )?;
         Ok(parsed)
     }
 
@@ -1255,6 +1260,69 @@ mod tests {
                 assert_eq!(code, "VAULT_RPC_ERROR");
             }
             other => panic!("expected VaultError::Service{{VAULT_RPC_ERROR}}, got {other:?}"),
+        }
+    }
+
+    /// SY.vault's real error reply (`error_payload` in sy_vault.rs): status, error_code, message —
+    /// no key, no count. Seen live on 2026-09-30 as "json error: missing field `key`", which hid
+    /// KEY_NOT_FOUND from io-slack / io-wapp.
+    #[tokio::test]
+    async fn vault_error_reply_keeps_the_verdict() {
+        let (dispatcher, mut harness) =
+            crate::rpc::RouterDispatcherTestHarness::new("SY.test@motherbee", vault_test_profile());
+        let client = VaultClient::new(dispatcher.clone(), "motherbee".to_string(), caller());
+        let error_reply = |trace_id: &str, msg: &str| Message {
+            routing: Routing {
+                src: "vault-uuid".to_string(),
+                src_l2_name: Some("SY.vault@motherbee".to_string()),
+                dst: Destination::Unicast("SY.test@motherbee".to_string()),
+                ttl: 16,
+                trace_id: trace_id.to_string(),
+            },
+            meta: Meta {
+                msg_type: SYSTEM_KIND.to_string(),
+                msg: Some(msg.to_string()),
+                ..Meta::default()
+            },
+            payload: json!({
+                "status": "error",
+                "error_code": "KEY_NOT_FOUND",
+                "message": "key not found",
+            }),
+        };
+
+        let get = tokio::spawn({
+            let client = client.clone();
+            async move { client.get("openai_api_key", Duration::from_secs(2)).await }
+        });
+        let out = harness
+            .next_outgoing_within(Duration::from_secs(2))
+            .await
+            .expect("get reaches the wire");
+        harness
+            .inject(error_reply(&out.routing.trace_id, MSG_VAULT_GET_RESPONSE))
+            .await
+            .expect("inject get reply");
+        match get.await.expect("get task") {
+            Err(VaultError::Service { code, .. }) => assert_eq!(code, "KEY_NOT_FOUND"),
+            other => panic!("expected the vault's KEY_NOT_FOUND, got {other:?}"),
+        }
+
+        let list = tokio::spawn({
+            let client = client.clone();
+            async move { client.list(None, Duration::from_secs(2)).await }
+        });
+        let out = harness
+            .next_outgoing_within(Duration::from_secs(2))
+            .await
+            .expect("list reaches the wire");
+        harness
+            .inject(error_reply(&out.routing.trace_id, MSG_VAULT_LIST_RESPONSE))
+            .await
+            .expect("inject list reply");
+        match list.await.expect("list task") {
+            Err(VaultError::Service { code, .. }) => assert_eq!(code, "KEY_NOT_FOUND"),
+            other => panic!("expected the vault's verdict, got {other:?}"),
         }
     }
 
