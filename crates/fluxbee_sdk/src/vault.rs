@@ -6,7 +6,8 @@ use serde_json::{json, Value};
 use std::sync::Arc;
 
 use crate::protocol::{
-    Destination, Message, Meta, Routing, MSG_TTL_EXCEEDED, MSG_UNREACHABLE, SYSTEM_KIND,
+    Destination, Message, Meta, Routing, MSG_TTL_EXCEEDED, MSG_UNREACHABLE, PRIMARY_HIVE_ID,
+    SYSTEM_KIND,
 };
 use crate::rpc::{PendingMatcher, RouteMatch, RouterDispatcher, RpcError, RpcRequestLabels};
 use crate::NodeError;
@@ -710,6 +711,13 @@ impl VaultClient {
             hive_id: hive_id.into(),
             caller,
         }
+    }
+
+    /// Client for THE vault: `SY.vault@<primary hive>`. SY.vault runs only on the motherbee, so
+    /// a node on a worker/ingress/egress must not derive the target from its own hive (there is
+    /// no `SY.vault@worker1`; every lookup would go UNREACHABLE).
+    pub fn for_primary(dispatcher: Arc<RouterDispatcher>, caller: VaultCallerOwned) -> Self {
+        Self::new(dispatcher, PRIMARY_HIVE_ID, caller)
     }
 
     pub fn caller(&self) -> VaultCaller<'_> {

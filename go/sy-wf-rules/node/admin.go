@@ -60,7 +60,8 @@ func newAdminClient(cfg NodeConfig, dispatcher *fluxbeesdk.RouterDispatcher) adm
 	}
 	return &l2AdminClient{
 		dispatcher: dispatcher,
-		targetNode: fmt.Sprintf("SY.admin@%s", cfg.HiveID),
+		// SY.admin runs only on the motherbee; a worker's SY.wf-rules publishes there too.
+		targetNode: fluxbeesdk.PrimaryAdminNode,
 		distRoot:   cfg.DistRuntimeRoot,
 	}
 }

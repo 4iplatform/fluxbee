@@ -518,9 +518,9 @@ async fn main() -> Result<()> {
             .map(str::trim)
             .filter(|value| !value.is_empty()),
     ) {
-        (Some(self_ilk), Some(hive_id)) => Some(Arc::new(VaultClient::new(
+        // The hive only validates the L2 name: the vault is the motherbee's wherever we run.
+        (Some(self_ilk), Some(_hive)) => Some(Arc::new(VaultClient::for_primary(
             dispatcher.clone(),
-            hive_id.to_string(),
             VaultCallerOwned::new(self_ilk.to_string(), config.node_name.clone()),
         ))),
         _ => None,

@@ -2671,10 +2671,11 @@ fn vault_client_for(
     self_ilk_id: Option<&str>,
 ) -> Option<VaultClient> {
     let ilk = self_ilk_id.map(str::trim).filter(|v| !v.is_empty())?;
-    let hive = node_name.split('@').nth(1).filter(|v| !v.is_empty())?;
-    Some(VaultClient::new(
+    // The name must still be a full L2 name, but the vault is the motherbee's, whatever hive
+    // this node runs on.
+    node_name.split('@').nth(1).filter(|v| !v.is_empty())?;
+    Some(VaultClient::for_primary(
         dispatcher,
-        hive.to_string(),
         VaultCallerOwned::new(ilk.to_string(), node_name.to_string()),
     ))
 }

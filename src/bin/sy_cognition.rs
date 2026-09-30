@@ -535,9 +535,9 @@ async fn main() -> Result<(), CognitionError> {
     let sender = dispatcher.sender_snapshot();
     tracing::info!(node_name = %sender.full_name(), "sy.cognition connected to router");
 
-    let vault_client = VaultClient::new(
+    // SY.cognition also runs on workers; the vault only on the motherbee.
+    let vault_client = VaultClient::for_primary(
         dispatcher.clone(),
-        hive.hive_id.clone(),
         VaultCallerOwned::new(self_ilk_id.clone(), node_name.clone()),
     );
 

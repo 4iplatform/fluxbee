@@ -160,9 +160,9 @@ async fn main() -> Result<()> {
         self_ilk_id.as_deref().filter(|v| !v.is_empty()),
         config.node_name.split('@').nth(1).filter(|v| !v.is_empty()),
     ) {
-        (Some(self_ilk_id_ref), Some(hive_id)) => Some(VaultClient::new(
+        // The hive only validates the L2 name: the vault is the motherbee's wherever we run.
+        (Some(self_ilk_id_ref), Some(_hive)) => Some(VaultClient::for_primary(
             dispatcher.clone(),
-            hive_id.to_string(),
             VaultCallerOwned::new(self_ilk_id_ref.to_string(), config.node_name.clone()),
         )),
         _ => None,
