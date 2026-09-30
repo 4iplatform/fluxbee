@@ -73,6 +73,9 @@ type ConfigChangedPayload struct {
 	AutoApply *bool             `json:"auto_apply,omitempty"`
 	Version   uint64            `json:"version"`
 	Config    *OpaConfigPayload `json:"config,omitempty"`
+	// Hive the change is addressed to; empty = every hive. A change addressed to another
+	// hive must not run here.
+	Hive string `json:"hive,omitempty"`
 }
 
 type CompileRequest struct {
@@ -620,6 +623,10 @@ func (s *Service) handleMessage(msg fluxbeesdk.Message) {
 			if payload.Subsystem != "opa" {
 				return
 			}
+			if hive := strings.TrimSpace(payload.Hive); hive != "" && hive != s.hiveID {
+				log.Printf("opa config change addressed to hive %s; ignoring (local hive %s)", hive, s.hiveID)
+				return
+			}
 			autoApply := false
 			if payload.AutoApply != nil {
 				autoApply = *payload.AutoApply
@@ -869,6 +876,17 @@ func derefString(value *string) string {
 
 func (s *Service) handleCommand(msg fluxbeesdk.Message) {
 	action := strings.ToLower(derefString(msg.Meta.Action))
+	// Policy commands change what every router on this hive enforces: only the primary
+	// SY.admin may issue them. src_l2_name is stamped by the router, never the sender.
+	if origin := derefString(msg.Routing.SrcL2Name); origin != fluxbeesdk.PrimaryAdminNode {
+		log.Printf("policy command %s refused from origin %q", action, origin)
+		s.sendCommandResponse(msg, action, map[string]any{
+			"status":       "error",
+			"error_code":   "UNAUTHORIZED",
+			"error_detail": "policy commands are accepted only from " + fluxbeesdk.PrimaryAdminNode,
+		})
+		return
+	}
 	switch action {
 	case "compile_policy":
 		var req CompileRequest

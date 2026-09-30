@@ -17,6 +17,7 @@ use fluxbee_sdk::{
     OperationalRouteProfile, RouteMatch, RouteTarget, RouterDispatcher, ADMIN_KIND,
     NODE_CONFIG_APPLY_MODE_REPLACE, NODE_CONFIG_CONTROL_TARGET,
 };
+use json_router::router::system_policy::PRIMARY_HIVE_ID;
 use json_router::shm::{
     copy_bytes_with_len, now_epoch_ms, ConfigRegionWriter, StaticRouteEntry, TapEntry,
     VpnAssignment, ACTION_DROP, ACTION_FORWARD, FLAG_ACTIVE, FLAG_FROZEN, MATCH_EXACT, MATCH_GLOB,
@@ -250,6 +251,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     current_version = sy_config.version,
                     "config changed received"
                 );
+                if !payload.addressed_to(&hive_id) {
+                    tracing::info!(
+                        subsystem = %payload.subsystem,
+                        payload_hive = ?payload.hive,
+                        "config changed addressed to another hive; ignoring"
+                    );
+                    continue;
+                }
                 if payload.version != 0 && payload.version <= sy_config.version {
                     tracing::info!(
                         payload_version = payload.version,
@@ -651,6 +660,24 @@ async fn handle_admin_action(
     writer: &mut ConfigRegionWriter,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let action = msg.meta.action.as_deref().unwrap_or("");
+    // A mutation rewrites what this hive's router enforces (routes, VPNs, taps): accept it
+    // only from the primary SY.admin, which reaches every hive's SY.config.routes directly.
+    // src_l2_name is router-stamped. Same gate as the orchestrator's F8.
+    if admin_action_mutates(action) && !is_primary_admin_origin(msg.routing.src_l2_name.as_deref())
+    {
+        tracing::warn!(
+            action = action,
+            src_uuid = %msg.routing.src,
+            src_l2_name = ?msg.routing.src_l2_name,
+            "blocked admin action from unauthorized origin"
+        );
+        let payload = admin_error_payload(
+            action,
+            "FORBIDDEN",
+            "admin action origin not allowed".to_string(),
+        );
+        return send_admin_reply(sender, msg, action, payload).await;
+    }
     let reply_payload = match action {
         "list_routes" => admin_success_payload(
             action,
@@ -846,7 +873,26 @@ async fn handle_admin_action(
             format!("Unsupported admin action '{}'", action),
         ),
     };
+    send_admin_reply(sender, msg, action, reply_payload).await
+}
 
+fn admin_action_mutates(action: &str) -> bool {
+    matches!(
+        action,
+        "add_route" | "delete_route" | "add_vpn" | "delete_vpn" | "add_tap" | "delete_tap"
+    )
+}
+
+fn is_primary_admin_origin(src_l2_name: Option<&str>) -> bool {
+    src_l2_name.map(str::trim) == Some(format!("SY.admin@{PRIMARY_HIVE_ID}").as_str())
+}
+
+async fn send_admin_reply(
+    sender: &NodeSender,
+    msg: &Message,
+    action: &str,
+    reply_payload: serde_json::Value,
+) -> Result<(), Box<dyn std::error::Error>> {
     let reply = Message {
         routing: Routing {
             src: sender.uuid().to_string(),
@@ -1403,6 +1449,35 @@ mod tests {
         };
         let err = apply_node_config_set_request(&current, &request).unwrap_err();
         assert!(err.to_string().contains("JSON object"));
+    }
+
+    #[test]
+    fn config_mutations_require_the_primary_admin() {
+        for action in [
+            "add_route",
+            "delete_route",
+            "add_vpn",
+            "delete_vpn",
+            "add_tap",
+            "delete_tap",
+        ] {
+            assert!(admin_action_mutates(action), "{action}");
+        }
+        for action in ["list_routes", "list_vpns", "list_taps", ""] {
+            assert!(!admin_action_mutates(action), "{action}");
+        }
+        assert!(is_primary_admin_origin(Some("SY.admin@motherbee")));
+        assert!(is_primary_admin_origin(Some(" SY.admin@motherbee ")));
+        for bad in [
+            None,
+            Some(""),
+            Some("SY.admin@worker1"),
+            Some("SY.orchestrator@motherbee"),
+            Some("AI.chat@motherbee"),
+            Some("SY.admin"),
+        ] {
+            assert!(!is_primary_admin_origin(bad), "{bad:?}");
+        }
     }
 
     #[test]

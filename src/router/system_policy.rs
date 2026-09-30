@@ -61,11 +61,14 @@ pub const PROTECTED_SYSTEM_ACTIONS: &[&str] = &[
     "INVENTORY_REQUEST",
     "ADD_HIVE_FINALIZE",
     "REMOVE_HIVE_CLEANUP",
+    // Its receivers (SY.config.routes, SY.opa.rules, managed nodes) APPLY the config it carries:
+    // routes, VPNs, taps, the user OPA policy. Only the Admin and the orchestrators may send it.
+    "CONFIG_CHANGED",
 ];
 
-/// The primary hive — the single motherbee. Canonical source for the whole system; the bins
-/// import THIS one instead of each redefining it, so the value cannot drift.
-pub const PRIMARY_HIVE_ID: &str = "motherbee";
+/// The primary hive — the single motherbee. The bins import THIS one instead of each redefining
+/// it; it is the SDK's value, so nodes outside this crate cannot drift from it either.
+pub const PRIMARY_HIVE_ID: &str = fluxbee_sdk::protocol::PRIMARY_HIVE_ID;
 
 /// The single node authorized to COMMAND an edge (open/close/list URLs) and to receive its
 /// control responses: `SY.admin` on the primary hive. Canonical name — the router's
@@ -533,16 +536,45 @@ mod tests {
             "REMOVE_HIVE_CLEANUP",
             // Swaps /usr/bin binaries and restarts the core on the TARGET hive.
             "SYSTEM_CORE_ROLLBACK",
+            // Carries config its receivers apply (routes, VPNs, taps, OPA).
+            "CONFIG_CHANGED",
         ] {
             assert!(
                 is_protected_system_action(action),
                 "{action} must be protected"
             );
         }
-        assert_eq!(PROTECTED_SYSTEM_ACTIONS.len(), 26);
+        assert_eq!(PROTECTED_SYSTEM_ACTIONS.len(), 27);
         for action in ["RUNTIME_UPDATE", "HELLO", "LSA", "", "TOTALLY_UNKNOWN"] {
             assert!(!is_protected_system_action(action));
         }
+    }
+
+    #[test]
+    fn config_changed_only_from_admin_and_orchestrators() {
+        // Any local node used to be able to rewrite its hive's routes/VPNs/taps/OPA policy by
+        // sending CONFIG_CHANGED (lab 2026-09-30). The baked rules already admit the two real
+        // emitters: SY.admin (same hive, rule 4) and SY.orchestrator (node_config, rule 3).
+        let act = "CONFIG_CHANGED";
+        assert!(authorize_system(act, Some("SY.admin@motherbee"), "motherbee"));
+        assert!(authorize_system(act, Some("SY.orchestrator@motherbee"), "motherbee"));
+        assert!(authorize_system(act, Some("SY.orchestrator@worker1"), "worker1"));
+        for rogue in [
+            Some("AI.chat@motherbee"),
+            Some("IO.slack@motherbee"),
+            Some("WF.invoice@motherbee"),
+            Some("SY.opa.rules@motherbee"),
+            Some("SY.config.routes@motherbee"),
+            Some("SY.identity@motherbee"),
+            None,
+        ] {
+            assert!(
+                !authorize_system(act, rogue, "motherbee"),
+                "{rogue:?} must not send CONFIG_CHANGED"
+            );
+        }
+        // Not cross-hive yet: no rule lets the Admin reach another hive's config receivers.
+        assert!(!authorize_system(act, Some("SY.admin@motherbee"), "worker1"));
     }
 
     #[test]

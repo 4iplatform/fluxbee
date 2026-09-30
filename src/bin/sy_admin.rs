@@ -2053,9 +2053,12 @@ async fn broadcast_config_changed(
     target_hive: Option<String>,
 ) -> Result<(), AdminError> {
     let sender = client.sender_snapshot();
-    let dst = match target_hive {
-        Some(hive) => Destination::Unicast(format!("SY.opa.rules@{}", hive)),
-        None => Destination::Broadcast,
+    // `target_hive` scopes the change to one hive. A hive-scoped OPA op goes to that hive's
+    // SY.opa.rules; everything else is a broadcast, and the payload names the hive so the
+    // receivers on every other hive ignore it (they must never apply another hive's config).
+    let dst = match (subsystem, target_hive.as_deref()) {
+        ("opa", Some(hive)) => Destination::Unicast(format!("SY.opa.rules@{}", hive)),
+        _ => Destination::Broadcast,
     };
     let msg = Message {
         routing: Routing {
@@ -2082,6 +2085,7 @@ async fn broadcast_config_changed(
             auto_apply,
             version,
             config,
+            hive: target_hive,
         })?,
     };
     sender.send(msg).await?;
@@ -14820,7 +14824,18 @@ async fn broadcast_full_config(
     let config = serde_json::json!({ item_key: payload });
 
     let version = next_config_changed_version(&ctx.state_dir, subsystem, None)?;
-    broadcast_config_changed(client, subsystem, None, None, version, config, None).await?;
+    // The list belongs to `target_hive` only: scope the broadcast to it. Unscoped, the
+    // motherbee's SY.config.routes applied a spoke's list over its own (lab 2026-09-30).
+    broadcast_config_changed(
+        client,
+        subsystem,
+        None,
+        None,
+        version,
+        config,
+        target_hive.map(str::to_string),
+    )
+    .await?;
     Ok(())
 }
 

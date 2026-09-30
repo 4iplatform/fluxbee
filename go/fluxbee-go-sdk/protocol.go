@@ -5,6 +5,13 @@ import (
 	"fmt"
 )
 
+// PrimaryHiveID is the single motherbee: home of the singleton SY.admin and SY.vault.
+// Mirrors Rust `system_policy::PRIMARY_HIVE_ID`.
+const PrimaryHiveID = "motherbee"
+
+// PrimaryAdminNode is the only SY.admin in the mesh.
+const PrimaryAdminNode = "SY.admin@" + PrimaryHiveID
+
 type Message struct {
 	Routing Routing         `json:"routing"`
 	Meta    Meta            `json:"meta"`

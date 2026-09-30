@@ -12008,6 +12008,7 @@ async fn send_node_config_changed_signal(
                 "node_name": node_name,
                 "patch": patch,
             }),
+            hive: None,
         })?,
     };
     sender.send(msg).await?;

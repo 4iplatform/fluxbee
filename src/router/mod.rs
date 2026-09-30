@@ -730,6 +730,8 @@ async fn handle_node(
     }
 
     tracing::info!(node = %node_uuid, name = %node_name, "node registered");
+    // The name this socket registered with: the authenticated origin of everything it sends.
+    let conn_node_name = node_name.clone();
     let announce = build_announce(
         &router_uuid.to_string(),
         &msg.routing.src,
@@ -780,6 +782,21 @@ async fn handle_node(
                         break;
                     }
                     if msg.meta.msg.as_deref() == Some(MSG_CONFIG_CHANGED) {
+                        // This fan-out bypasses the delivery gate, and the receivers APPLY what
+                        // the message carries: stamp the socket's authenticated name and admit
+                        // only the origins the SYSTEM policy allows (the Admin, orchestrators).
+                        msg.routing.src_l2_name = Some(conn_node_name.clone());
+                        if !system_policy::authorize_system(
+                            MSG_CONFIG_CHANGED,
+                            Some(conn_node_name.as_str()),
+                            hive_id,
+                        ) {
+                            tracing::warn!(
+                                src_l2_name = %conn_node_name,
+                                "router dropped CONFIG_CHANGED from unauthorized origin"
+                            );
+                            continue;
+                        }
                         let _ = refresh_config(
                             &config_reader,
                             &static_routes,

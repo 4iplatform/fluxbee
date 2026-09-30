@@ -271,6 +271,22 @@ pub struct ConfigChangedPayload {
     pub version: u64,
     #[serde(default)]
     pub config: Value,
+    /// The hive this config belongs to. `None` = every hive (global config). `Some(h)` =
+    /// hive-scoped config (e.g. the route list of hive `h` after `add_route?hive=h`): a
+    /// receiver on any other hive MUST ignore it, or it would overwrite its own config
+    /// with another hive's.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hive: Option<String>,
+}
+
+impl ConfigChangedPayload {
+    /// True when this payload may be applied by a receiver on `local_hive`.
+    pub fn addressed_to(&self, local_hive: &str) -> bool {
+        match self.hive.as_deref().map(str::trim) {
+            None | Some("") => true,
+            Some(hive) => hive == local_hive,
+        }
+    }
 }
 
 /// Broadcast payload emitted by SY.vault whenever a secret changes
@@ -499,6 +515,10 @@ pub const MSG_WAN_REJECT: &str = "WAN_REJECT";
 pub const MSG_TIME_SYNC: &str = "TIME_SYNC";
 pub const MSG_WITHDRAW: &str = "WITHDRAW";
 pub const MSG_CONFIG_CHANGED: &str = "CONFIG_CHANGED";
+
+/// The primary hive — the single motherbee, home of the singleton SY.admin and SY.vault.
+/// Nodes on any other hive reach those services here, never at their own hive.
+pub const PRIMARY_HIVE_ID: &str = "motherbee";
 /// Protocol version advertised in the WAN `HELLO` between hives.
 ///
 /// TELEMETRY, NOT A GATE. In fluxbee the HASH is the gate and the VERSION is a report — the same
@@ -810,6 +830,28 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn config_changed_payload_hive_scope() {
+        let global: ConfigChangedPayload =
+            serde_json::from_value(json!({"subsystem": "routes", "version": 3})).expect("parse");
+        assert_eq!(global.hive, None);
+        assert!(global.addressed_to("motherbee"));
+        assert!(global.addressed_to("worker1"));
+        assert!(serde_json::to_value(&global).expect("encode").get("hive").is_none());
+
+        let scoped: ConfigChangedPayload = serde_json::from_value(
+            json!({"subsystem": "routes", "version": 3, "hive": "worker1"}),
+        )
+        .expect("parse");
+        assert!(scoped.addressed_to("worker1"));
+        assert!(!scoped.addressed_to("motherbee"));
+
+        let blank: ConfigChangedPayload =
+            serde_json::from_value(json!({"subsystem": "routes", "version": 3, "hive": " "}))
+                .expect("parse");
+        assert!(blank.addressed_to("motherbee"));
+    }
 
     #[test]
     fn build_system_message_omits_src_l2_name_on_outbound_messages() {
