@@ -12559,6 +12559,14 @@ fn runtime_spawn_preflight_with_manifest_and_root(
             Some(&entrypoint.script_version),
         );
 
+        let package_version = match requested_version.trim() {
+            "" | "current" => requested_entry
+                .current
+                .as_deref()
+                .unwrap_or(requested_version),
+            version => version,
+        };
+        let package_materialization = requested_materialization.clone();
         runtime_base_start_script_preflight(
             requested_runtime,
             requested_version,
@@ -12585,7 +12593,15 @@ fn runtime_spawn_preflight_with_manifest_and_root(
                 obj.insert("global_runtime_health".to_string(), global_runtime_health);
             }
             payload
-        })
+        })?;
+        runtime_package_files_preflight(
+            runtimes_root,
+            requested_runtime,
+            package_version,
+            target_hive,
+            node_name,
+            package_materialization,
+        )
     } else {
         runtime_start_script_preflight(
             &entrypoint.script_runtime,
@@ -12609,6 +12625,39 @@ fn runtime_spawn_preflight_with_manifest_and_root(
             payload
         })
     }
+}
+
+/// A package published on the motherbee reaches this hive through Syncthing, and the runtimes
+/// manifest can land before the package's own files (lab 2026-09-30: a WF node crash-looped on a
+/// missing flow/definition.json). Until the package's package.json is here, refuse the spawn as
+/// RUNTIME_NOT_PRESENT — callers retry — instead of starting a node that dies on a missing file.
+fn runtime_package_files_preflight(
+    runtimes_root: &Path,
+    runtime: &str,
+    version: &str,
+    target_hive: &str,
+    node_name: &str,
+    materialization: serde_json::Value,
+) -> Result<(), serde_json::Value> {
+    let package_json = runtimes_root.join(runtime).join(version).join("package.json");
+    if package_json.is_file() {
+        return Ok(());
+    }
+    Err(serde_json::json!({
+        "status": "error",
+        "error_code": "RUNTIME_NOT_PRESENT",
+        "message": format!(
+            "runtime package {runtime} {version} is not on this hive yet (no {})",
+            package_json.display()
+        ),
+        "runtime": runtime,
+        "version": version,
+        "expected_path": package_json.display().to_string(),
+        "hint": "The package syncs from the motherbee; retry once it has arrived",
+        "target": target_hive,
+        "node_name": node_name,
+        "requested_runtime_materialization": materialization,
+    }))
 }
 
 fn runtime_versions_from_manifest_entry(entry: &RuntimeManifestEntry) -> Vec<String> {
@@ -28090,6 +28139,36 @@ blob:
             serde_json::json!("missing_package_dir")
         );
 
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn runtime_package_files_preflight_waits_for_the_package_json() {
+        let root = std::env::temp_dir().join(format!("fluxbee-pkg-files-{}", Uuid::new_v4()));
+        let package_dir = root.join("wf.w1probe").join("0.0.1");
+        // The directory can land before its files: that is not "present" yet.
+        fs::create_dir_all(package_dir.join("flow")).expect("package dir");
+        let out = runtime_package_files_preflight(
+            &root,
+            "wf.w1probe",
+            "0.0.1",
+            "worker1",
+            "WF.w1probe@worker1",
+            serde_json::json!({}),
+        )
+        .expect_err("no package.json yet must refuse the spawn");
+        assert_eq!(out["error_code"], "RUNTIME_NOT_PRESENT");
+
+        fs::write(package_dir.join("package.json"), "{}").expect("package.json");
+        runtime_package_files_preflight(
+            &root,
+            "wf.w1probe",
+            "0.0.1",
+            "worker1",
+            "WF.w1probe@worker1",
+            serde_json::json!({}),
+        )
+        .expect("with its package.json the package is here");
         let _ = fs::remove_dir_all(root);
     }
 
