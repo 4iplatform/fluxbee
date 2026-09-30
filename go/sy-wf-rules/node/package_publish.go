@@ -9,6 +9,8 @@ import (
 	"sort"
 	"strings"
 	"time"
+
+	fluxbeesdk "github.com/4iplatform/json-router/fluxbee-go-sdk"
 )
 
 const workflowRuntimeBase = "wf.engine"
@@ -148,6 +150,11 @@ func (s *Service) PurgeWorkflowPackages(workflowName string, preserveBoundVersio
 		}
 	}
 
+	// The dist tree is the motherbee's. On any other hive it is a Syncthing receive-only mirror:
+	// a local delete is never restored (the next deploy of that version finds no files) and a
+	// manifest edit only diverges from the source. There, obsolete versions are removed through
+	// SY.admin from the motherbee's dist, and the sync carries the removal here.
+	mirror := s.cfg.HiveID != fluxbeesdk.PrimaryHiveID
 	for _, entry := range entries {
 		if !entry.IsDir() {
 			continue
@@ -156,9 +163,18 @@ func (s *Service) PurgeWorkflowPackages(workflowName string, preserveBoundVersio
 		if _, ok := keep[version]; ok {
 			continue
 		}
+		if mirror {
+			if err := s.removeRuntimeVersionOnPrimary(runtimeName, version); err != nil {
+				return err
+			}
+			continue
+		}
 		if err := os.RemoveAll(filepath.Join(runtimeDir, version)); err != nil {
 			return err
 		}
+	}
+	if mirror {
+		return nil
 	}
 
 	remaining, err := runtimeVersionsOnDisk(runtimeDir)
@@ -169,6 +185,18 @@ func (s *Service) PurgeWorkflowPackages(workflowName string, preserveBoundVersio
 		_ = os.Remove(runtimeDir)
 	}
 	return s.updateRuntimeManifestAfterPurge(runtimeName, remaining, preferredCurrentVersion(keep))
+}
+
+func (s *Service) removeRuntimeVersionOnPrimary(runtimeName, version string) error {
+	if s.admin == nil {
+		return fmt.Errorf("admin client unavailable")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), adminRPCTimeout)
+	defer cancel()
+	if err := s.admin.RemoveRuntimeVersion(ctx, runtimeName, version); err != nil {
+		return fmt.Errorf("remove %s %s on %s: %w", runtimeName, version, fluxbeesdk.PrimaryAdminNode, err)
+	}
+	return nil
 }
 
 func (s *Service) updateRuntimeManifest(runtimeName, version string) error {

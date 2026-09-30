@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -137,10 +138,64 @@ func TestPurgeWorkflowPackagesKeepsCurrentBackupAndBoundVersion(t *testing.T) {
 	}
 }
 
+// On a worker the dist tree is a receive-only mirror of the motherbee's: purging must ask SY.admin
+// to remove the obsolete versions there and leave the local copy alone (lab 2026-09-30: a local
+// delete on worker1 was never restored, and the next deploy of that version found no files).
+func TestPurgeWorkflowPackagesOnAMirrorHiveGoesThroughTheAdmin(t *testing.T) {
+	svc := newTestService(t)
+	definitionBytes, err := normalizeDefinitionBytes(validWorkflowDefinition())
+	if err != nil {
+		t.Fatalf("normalizeDefinitionBytes: %v", err)
+	}
+	for version := uint64(1); version <= 3; version++ {
+		meta := WfRulesMetadata{
+			Version:         version,
+			Hash:            HashDefinition(definitionBytes),
+			WorkflowName:    "invoice",
+			WorkflowType:    "invoice",
+			WFSchemaVersion: "1",
+			CompiledAt:      "2026-04-16T12:00:00Z",
+		}
+		if _, err := svc.PublishWorkflowPackage("invoice", meta, definitionBytes); err != nil {
+			t.Fatalf("PublishWorkflowPackage(%d): %v", version, err)
+		}
+	}
+	manifestPath := filepath.Join(svc.cfg.DistRuntimeRoot, "manifest.json")
+	manifestBefore, err := os.ReadFile(manifestPath)
+	if err != nil {
+		t.Fatalf("read manifest: %v", err)
+	}
+	svc.cfg.HiveID = "worker1"
+	admin := svc.admin.(*fakeAdminClient)
+
+	if err := svc.PurgeWorkflowPackages("invoice", false); err != nil {
+		t.Fatalf("PurgeWorkflowPackages: %v", err)
+	}
+
+	want := []string{"wf.invoice@0.0.1", "wf.invoice@0.0.2", "wf.invoice@0.0.3"}
+	if strings.Join(admin.removedVersions, ",") != strings.Join(want, ",") {
+		t.Fatalf("want removals %v through the admin, got %v", want, admin.removedVersions)
+	}
+	for _, version := range []string{"0.0.1", "0.0.2", "0.0.3"} {
+		if _, err := os.Stat(filepath.Join(svc.cfg.DistRuntimeRoot, "wf.invoice", version)); err != nil {
+			t.Fatalf("the local mirror must be left alone, %s gone: %v", version, err)
+		}
+	}
+	if manifestAfter, _ := os.ReadFile(manifestPath); string(manifestAfter) != string(manifestBefore) {
+		t.Fatal("the local manifest must be left alone on a mirror hive")
+	}
+}
+
 type fakeAdminClient struct {
 	publishRuntimePackageFunc func(ctx context.Context, packageFiles map[string]string) (*PackagePublishResult, error)
 	publishCalls              int
 	lastPackageFiles          map[string]string
+	removedVersions           []string
+}
+
+func (f *fakeAdminClient) RemoveRuntimeVersion(_ context.Context, runtimeName, version string) error {
+	f.removedVersions = append(f.removedVersions, runtimeName+"@"+version)
+	return nil
 }
 
 func (f *fakeAdminClient) PublishRuntimePackage(ctx context.Context, packageFiles map[string]string) (*PackagePublishResult, error) {

@@ -16,10 +16,13 @@ const (
 	adminCommandMsg             = "ADMIN_COMMAND"
 	adminCommandResponseMsg     = "ADMIN_COMMAND_RESPONSE"
 	publishRuntimePackageAction = "publish_runtime_package"
+	removeRuntimeVersionAction  = "remove_runtime_version"
 )
 
 type adminClient interface {
 	PublishRuntimePackage(ctx context.Context, packageFiles map[string]string) (*PackagePublishResult, error)
+	// RemoveRuntimeVersion deletes one published version from the motherbee's dist and manifest.
+	RemoveRuntimeVersion(ctx context.Context, runtimeName, version string) error
 }
 
 type adminActionError struct {
@@ -77,7 +80,7 @@ func (c *l2AdminClient) PublishRuntimePackage(ctx context.Context, packageFiles 
 		},
 		"set_current": true,
 	}
-	response, err := c.request(ctx, params)
+	response, err := c.request(ctx, publishRuntimePackageAction, params)
 	if err != nil {
 		return nil, err
 	}
@@ -101,10 +104,21 @@ func (c *l2AdminClient) PublishRuntimePackage(ctx context.Context, packageFiles 
 	}, nil
 }
 
-func (c *l2AdminClient) request(ctx context.Context, params map[string]any) (map[string]any, error) {
+func (c *l2AdminClient) RemoveRuntimeVersion(ctx context.Context, runtimeName, version string) error {
+	if c == nil || c.dispatcher == nil {
+		return fmt.Errorf("admin client unavailable")
+	}
+	_, err := c.request(ctx, removeRuntimeVersionAction, map[string]any{
+		"runtime":         runtimeName,
+		"runtime_version": version,
+	})
+	return err
+}
+
+func (c *l2AdminClient) request(ctx context.Context, action string, params map[string]any) (map[string]any, error) {
 	msg, err := c.dispatcher.SendAdminRPC(ctx, fluxbeesdk.AdminRpcRequest{
 		AdminTarget: c.targetNode,
-		Action:      publishRuntimePackageAction,
+		Action:      action,
 		Params:      params,
 		Timeout:     adminRPCTimeout,
 	})
