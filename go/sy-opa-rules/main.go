@@ -259,21 +259,46 @@ func main() {
 	select {}
 }
 
+// The policy (rego and compiled wasm) is what every router on this hive enforces: readable and
+// writable by root only, like the SY.* SHM regions written from Rust (0600).
+const (
+	opaPrivateDirMode  = 0o700
+	opaPrivateFileMode = 0o600
+)
+
 func ensureDirs() error {
-	paths := []string{
+	for _, path := range []string{
+		stateDir,
 		filepath.Join(stateDir, "current"),
 		filepath.Join(stateDir, "staged"),
 		filepath.Join(stateDir, "backup"),
-		nodesDir,
-		"/var/run/fluxbee",
-		routerSockDir,
+	} {
+		if err := ensurePrivateDir(path); err != nil {
+			return err
+		}
 	}
-	for _, path := range paths {
+	for _, path := range []string{nodesDir, "/var/run/fluxbee", routerSockDir} {
 		if err := os.MkdirAll(path, 0o755); err != nil {
 			return err
 		}
 	}
 	return nil
+}
+
+// ensurePrivateDir creates dir 0700, and tightens it if an older build left it 0755.
+func ensurePrivateDir(dir string) error {
+	if err := os.MkdirAll(dir, opaPrivateDirMode); err != nil {
+		return err
+	}
+	return os.Chmod(dir, opaPrivateDirMode)
+}
+
+// writePrivateFile writes path 0600, and tightens it if an older build left it 0644.
+func writePrivateFile(path string, data []byte) error {
+	if err := os.WriteFile(path, data, opaPrivateFileMode); err != nil {
+		return err
+	}
+	return os.Chmod(path, opaPrivateFileMode)
 }
 
 func loadHiveID() (string, error) {
@@ -309,9 +334,11 @@ func loadOrCreateUUID(dir, base string) (uuid.UUID, error) {
 
 func openOrCreateOpaRegion(name string, owner uuid.UUID) (*OpaRegion, error) {
 	filePath := filepath.Join("/dev/shm", strings.TrimPrefix(name, "/"))
-	fd, err := openFileFd(filePath, unix.O_RDWR, 0o666)
+	fd, err := openFileFd(filePath, unix.O_RDWR, opaPrivateFileMode)
 	if err == nil {
-		_ = unix.Fchmod(fd, 0o666)
+		// Older builds created this region 0666: any local process could read the policy or
+		// write one for the router to load.
+		_ = unix.Fchmod(fd, opaPrivateFileMode)
 		if err := ensureShmSize(fd, opaHeaderSize+opaMaxWasmSize); err == nil {
 			mmap, err := unix.Mmap(fd, 0, opaHeaderSize+opaMaxWasmSize, unix.PROT_READ|unix.PROT_WRITE, unix.MAP_SHARED)
 			if err == nil {
@@ -332,11 +359,11 @@ func openOrCreateOpaRegion(name string, owner uuid.UUID) (*OpaRegion, error) {
 		_ = os.Remove(filePath)
 	}
 
-	fd, err = openFileFd(filePath, unix.O_RDWR|unix.O_CREAT|unix.O_EXCL, 0o666)
+	fd, err = openFileFd(filePath, unix.O_RDWR|unix.O_CREAT|unix.O_EXCL, opaPrivateFileMode)
 	if err != nil {
 		return nil, err
 	}
-	_ = unix.Fchmod(fd, 0o666)
+	_ = unix.Fchmod(fd, opaPrivateFileMode)
 	if err := ensureShmSize(fd, opaHeaderSize+opaMaxWasmSize); err != nil {
 		_ = unix.Close(fd)
 		_ = os.Remove(filePath)
@@ -1570,14 +1597,14 @@ func validateWasm(wasm []byte) error {
 }
 
 func writePolicyFiles(dir string, wasm []byte, meta PolicyMetadata, rego string) error {
-	if err := os.MkdirAll(dir, 0o755); err != nil {
+	if err := ensurePrivateDir(dir); err != nil {
 		return err
 	}
-	if err := os.WriteFile(filepath.Join(dir, "policy.wasm"), wasm, 0o644); err != nil {
+	if err := writePrivateFile(filepath.Join(dir, "policy.wasm"), wasm); err != nil {
 		return err
 	}
 	if rego != "" {
-		if err := os.WriteFile(filepath.Join(dir, "policy.rego"), []byte(rego), 0o644); err != nil {
+		if err := writePrivateFile(filepath.Join(dir, "policy.rego"), []byte(rego)); err != nil {
 			return err
 		}
 	}
@@ -1589,7 +1616,7 @@ func writeMetadata(path string, meta PolicyMetadata) error {
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(path, data, 0o644)
+	return writePrivateFile(path, data)
 }
 
 func readMetadata(path string) (PolicyMetadata, error) {
@@ -1612,7 +1639,7 @@ func copyDir(src, dst string) error {
 	if _, err := os.Stat(src); err != nil {
 		return nil
 	}
-	if err := os.MkdirAll(dst, 0o755); err != nil {
+	if err := ensurePrivateDir(dst); err != nil {
 		return err
 	}
 	entries, err := os.ReadDir(src)
@@ -1629,7 +1656,7 @@ func copyDir(src, dst string) error {
 		if err != nil {
 			return err
 		}
-		if err := os.WriteFile(to, data, 0o644); err != nil {
+		if err := writePrivateFile(to, data); err != nil {
 			return err
 		}
 	}
