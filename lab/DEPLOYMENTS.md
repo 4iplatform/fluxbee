@@ -21,6 +21,7 @@
 
 | Versión | Fecha (ART) | Commit | Alcance | Estado | Rollback |
 |---|---|---|---|---|---|
+| **0.1.47** | 2026-10-01 | `652a9c9` | motherbee + spokes (core) | ✅ live | snap `pre-opa-blockB-0-1-47` (las 4 VMs) · `apt install fluxbee=0.1.46` |
 | **0.1.46** | 2026-10-01 | `7371ca1` | motherbee + spokes (core) | ✅ live | snap `pre-opa-blockA-0-1-46` (las 4 VMs) · `apt install fluxbee=0.1.45` |
 | **0.1.45** | 2026-10-01 | `d6505ff` | motherbee + spokes (core) | ✅ live | snap `pre-rule3-0-1-45` (las 4 VMs) · `apt install fluxbee=0.1.44` |
 | **0.1.44** | 2026-10-01 | `005d0ad` | motherbee + spokes (core) | ✅ live | snap `pre-src-binding-0-1-44` (las 4 VMs) · `apt install fluxbee=0.1.43` |
@@ -55,6 +56,45 @@
 > (`dpkg-scanpackages -m`) para rollback, pero su detalle vive en la bitácora, no acá.
 
 ---
+
+## 0.1.47 — OPA, bloque B del panel DTAP: un hive trabado dice por qué, se reparan instalaciones a medias, sin carrera en el estado, sin rego viejo
+
+- **Fecha:** 2026-10-01 (ART) · **Versión anterior:** 0.1.46 · **Commit:** `652a9c9` (panel DTAP
+  2026-10-01: P-6, P-7, P-13, P-15, D-9, D-10). Solo cambia `sy-opa-rules` (Go).
+- **Alcance:** motherbee + los tres spokes (core-update).
+- **Qué cambió:**
+  - `get_status` de SY.opa.rules dice qué corre el hive, qué le llegó publicado
+    (`published_version`/`published_hash`), qué tiene cargado el router (`region_hash`), si está
+    `in_sync`, y si espera algo: `waiting {version, hash, since, reason}`. Al minuto de estar
+    trabado lo loguea una vez.
+  - Cada chequeo de 5 s (motherbee incluido) reescribe la región del router si no tiene la policy
+    instalada (instalación cortada a mitad de camino).
+  - El estado tiene su propio lock (antes, `lastError` sin lock entre dos goroutines).
+  - Instalar sin rego borra el `policy.rego` que había dejado una policy anterior.
+  - Los archivos publicados quedan con el dueño de `dist/policy`, no con un `fluxbee` fijo.
+- **Build:** 7 min. **Publish:** 47 paquetes. Snapshots `pre-opa-blockB-0-1-47` en las 4 VMs (se
+  borró antes `pre-src-binding-0-1-44`).
+- **Install:** motherbee 19:55 UTC; spokes 19:56–19:57.
+- **Verificación en vivo:**
+  - Los 4 hives con los mismos binarios; 0 `failed`.
+  - Sin policy: los 4 con `in_sync: true` y la región en ceros. Apply global: 4,7 s, los 4 con
+    `in_sync: true` y la región igual al hash publicado.
+  - En el motherbee, `dist/policy/opa/*` es `fluxbee:fluxbee` y solo queda el wasm vigente. Las
+    réplicas no tienen `policy.rego`.
+  - Hive trabado, forzado en egress1: Syncthing cortado (nft en :22000), apply de la v18 (12 s,
+    `pending: [egress1]`, `unreachable: []`) y el manifest del motherbee copiado a mano en la copia
+    local (llega el manifest y no el wasm). Estado: `in_sync: false`,
+    `waiting {version: 18, reason: "the wasm the manifest names has not arrived"}`; el log a
+    1m0s; al desbloquear, Syncthing reconectó en ~1:40 y egress1 instaló solo
+    (`installed after waiting 2m51s`). Revert de la carpeta (`/rest/db/revert`) →
+    `receiveOnlyTotalItems: 0`.
+  - Con el sync cortado del todo (sin la copia a mano), egress1 se ve `in_sync: true`: compara con
+    lo que le llegó. Lo que dice que está atrasado es el `pending` del reporte del admin.
+  - Clear final: 5,3 s, los 4 sin policy. 0 rechazos del gate y 0 descartes por `routing.src` (los
+    únicos "matches" del journal eran el log del guest-agent con el propio comando de conteo).
+  - No probado en vivo (cubierto por tests): la reparación de la región a medias y la carrera
+    (`-race`).
+- **Rollback:** snapshot `pre-opa-blockB-0-1-47` o `apt install fluxbee=0.1.46`.
 
 ## 0.1.46 — OPA, bloque A del panel DTAP: arquitecto, reporte honesto, esperas acotadas, re-publicación, una sola vía de escritura
 
