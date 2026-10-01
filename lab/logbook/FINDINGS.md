@@ -374,25 +374,47 @@
 - **Validado:** mismo arranque degradado → la réplica loguea `holding its self-owned snapshot`; el
   primario sigue en 25 ILKs, con el del probe.
 
-### A-18 🔴 BACKLOG (decidido, después de OPA) — config-routes: VPN global vía LSA + limpieza
+### A-18 🔴 BACKLOG (estacionado 2026-10-01) — config-routes: rutas estáticas, VPN y taps
 
-- **Verificado (2026-09-30):** rutas y taps ya son globales en efecto — se cargan en un hive y
-  LSA los reparte (los taps se aplican una sola vez, en el router de origen, con los locales + los
-  de LSA). **VPN no:** LSA transporta las reglas pero el router asigna la VPN solo con las reglas
-  de su propio hive (`assign_vpn` lee el snapshot local; `reassign_vpns` solo reacciona a cambios
-  locales).
-- **Decisión del operador:** VPN global **vía LSA** (asignar con reglas locales + de LSA, como los
-  taps). Cuidado al construirlo: si caducan las reglas de un hive aislado, los nodos vuelven a
-  VPN 0 y el aislamiento falla abierto → conservar las últimas reglas conocidas; orden
-  determinístico si dos hives definen lo mismo; un cambio por LSA dispara `reassign_vpns`.
-- **Limpieza del mismo paquete:** endpoints duplicados (`/routes?hive=` vs `/hives/{h}/routes`),
-  el broadcast post-alta que lleva la lista entera. Visto con 0.1.43: ni el aviso hacía falta (el
-  router del hive toma el cambio de su SHM al instante) → **borrado en 0.1.44**, junto con el trato
-  especial del router a CONFIG_CHANGED. Los cambios llegan a los otros hives con el próximo LSA
-  (≤10 s). `PUT /config/*` y el
-  broadcast de storage salen con el trabajo de OPA (prerrequisito para que CONFIG_CHANGED cruce
-  hives).
-- **Aceptado:** si se borra un hive, se pierden sus rutas.
+- **La necesidad (operador, 2026-09-30):** las rutas estáticas se usan poco y pueden quedar
+  locales. La VPN va a usarse de forma global (separar tenants, seguridad: un nodo de worker1
+  habla con uno de worker2). Los taps son la herramienta más usada (echo a otros nodos) y tienen
+  que ser globales. Decidido no meterlas en OPA: se arreglan en config-routes.
+- **Cómo está hoy (verificado en código, 2026-10-01):**
+
+  | Herramienta | Se carga | Llega al resto | ¿Global? |
+  |---|---|---|---|
+  | Rutas estáticas | en un hive | LSA → FIB de todos los routers | sí |
+  | Taps | en un hive | LSA; el router de origen aplica los locales y los de LSA, una sola vez | sí |
+  | VPN | en un hive | LSA las transporta, pero `assign_vpn` usa solo la config local | **no** |
+
+- **Abierto:**
+  1. **VPN no es global.** Decisión: vía LSA (asignar con las reglas locales y las de LSA, como
+     los taps). Al construirlo: conservar las últimas reglas conocidas, porque si caducan las de
+     un hive aislado los nodos vuelven a VPN 0 y el aislamiento falla abierto; orden
+     determinístico si dos hives definen lo mismo; reasignar cuando cambia el LSA
+     (`reassign_vpns` hoy solo reacciona a cambios locales).
+  2. **Lo cargado en un hive desaparece del resto si ese hive queda aislado** y su LSA caduca:
+     los taps dejan de copiar durante el corte, y una ruta que apunta a otro hive vivo se pierde.
+  3. **Endpoints duplicados:** `/routes`, `/vpns` y `/taps` con `?hive=`, y además
+     `/hives/{h}/routes|vpns|taps`. Dejar una sola superficie.
+  4. **Regla 5 de `system.rego`** nombra `SY.config-routes`; el nodo es `SY.config.routes`.
+     Habilita un chequeo de salud (`NODE_STATUS_GET`) que config.routes nunca manda: está muerta
+     y no bloquea nada. Borrar esa entrada (o corregir el nombre) con el próximo cambio de rego.
+  5. **Hives con varios routers** (panel DTAP D-12): un router sin nodos locales no relee la
+     config, porque solo la relee con frames de sus nodos. No afecta a las instalaciones de hoy
+     (un router por hive). Arreglo chico: releerla, con control de versión, en el tick de LSA.
+  6. **Taps:** el match es exacto por nombre L2, sin patrones (v1). En un host con varios routers,
+     el router par no hace el fanout (bajo, mismo caso que el punto 5).
+- **Ya resuelto:**
+  - `PUT /config/*`: 0.1.40–0.1.41.
+  - Broadcast posterior a cada alta y trato especial del router a CONFIG_CHANGED: 0.1.44.
+  - Broadcast de storage: 0.1.41; su CONFIG_RESPONSE: 0.1.45.
+  - Config con alcance de hive y control de origen: 0.1.36 (A-8, A-9).
+  - Taps cross-hive con destino por UUID: julio (`18c4dd8`).
+- **Aceptado:** si se borra o se reconstruye un hive, se pierden sus rutas, taps y VPN (nadie
+  guarda copia).
+- **Estado:** estacionado por el operador (2026-10-01): *"hay otras cosas importantes"*.
 
 ### A-16 🔴 Los espejos receive-only acumulan cambios locales en silencio
 
