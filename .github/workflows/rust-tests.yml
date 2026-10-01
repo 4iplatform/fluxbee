@@ -1,0 +1,63 @@
+name: rust-tests
+
+# cargo test for both Rust workspaces (the root one and nodes/io) on each push or pull request that
+# touches Rust code, the baked system policy, or the contract fixtures shared with the Go tests.
+# Toolchain pinned to the one fb-build builds the .deb with.
+
+on:
+  pull_request:
+    paths:
+      - "src/**"
+      - "crates/**"
+      - "nodes/**"
+      - "policy/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "go/fluxbee-go-sdk/testdata/**"
+      - "go/sy-opa-rules/testdata/**"
+      - ".github/workflows/rust-tests.yml"
+  push:
+    branches: ["**"]
+    paths:
+      - "src/**"
+      - "crates/**"
+      - "nodes/**"
+      - "policy/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "go/fluxbee-go-sdk/testdata/**"
+      - "go/sy-opa-rules/testdata/**"
+      - ".github/workflows/rust-tests.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  cargo-test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        workspace:
+          - "."
+          - "nodes/io"
+    defaults:
+      run:
+        working-directory: ${{ matrix.workspace }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install protoc
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@1.92.0
+
+      - name: Cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: "${{ matrix.workspace }} -> target"
+
+      - name: Test
+        run: cargo test --workspace --locked
