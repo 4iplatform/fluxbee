@@ -935,6 +935,26 @@ relanza desde el config persistido. El nombre va **calificado** (`<node>@<hive>`
 ⚠️ **Esta recuperación pierde la configuración del nodo.** Con nodos `UNCONFIGURED` no cuesta nada;
 con tokens cargados es una pérdida real.
 
+### Un nodo de sistema nuevo en un rol, con hives ya unidos (0.1.41: SY.opa.rules en ingress/egress)
+
+El `hive.yaml` de un spoke se escribe una sola vez, en el join, y no se re-emite
+([U-6](PENDING-BUGS.md#u-6)). El spoke arranca los nodos de **su** `system_nodes.<rol>` y los valida
+contra el manifest core que le manda el motherbee. Por eso el orden importa:
+
+1. **Motherbee, antes del `apt install`:** agregar el nodo a `system_nodes.<rol>.nodes` de
+   `/etc/fluxbee/hive.yaml` (conffile: el `.deb` no lo toca). Al reiniciar, el orquestador arma
+   `dist/core/<rol>` con el binario nuevo y Syncthing lo lleva al spoke.
+2. **Esperar que el binario llegue al spoke:** `dist/core/bin/<binario>` presente y con el sha256
+   que dice `dist/core/manifest.json`. Si el `hive.yaml` del spoke lo nombra antes, el orquestador
+   del spoke no arranca: valida cada binario de su rol contra el manifest y ese falta.
+3. **Spoke:** agregar el nodo a `system_nodes.<rol>.nodes` de su `/etc/fluxbee/hive.yaml`.
+4. **`update category=core` al spoke:** instala el binario; el orquestador nuevo regenera las units
+   (crea la del nodo) y lo arranca.
+
+Un hive que se une después no necesita nada de esto: el join copia el `system_nodes.<rol>` del
+motherbee. Las carpetas Syncthing nuevas de todos los roles (como `fluxbee-dist-policy`) tampoco:
+heredan los peers de `fluxbee-dist-vendor` en el próximo arranque del orquestador de cada lado.
+
 ### El rollback
 
 No existe rollback de core como comando ([U-5](PENDING-BUGS.md#u-5)). Los dos caminos reales:

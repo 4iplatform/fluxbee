@@ -21,6 +21,7 @@
 
 | Versión | Fecha (ART) | Commit | Alcance | Estado | Rollback |
 |---|---|---|---|---|---|
+| **0.1.41** | 2026-09-30 | `72891be` | motherbee + spokes (core) + `hive.yaml` | ✅ live | snap `pre-opa-global-0-1-41` (las 4 VMs) · `apt install fluxbee=0.1.40` + `hive.yaml.pre-opa-0-1-41` |
 | **0.1.40** | 2026-09-30 | `43dd174` | motherbee + spokes (core) | ✅ live | snap `pre-purge-order-0-1-40` (las 4 VMs) · `apt install fluxbee=0.1.39` |
 | **0.1.39** | 2026-09-30 | `85c3244` | motherbee + spokes (core) | ✅ live | snap `pre-identity-baseline-0-1-39` (las 4 VMs) · `apt install fluxbee=0.1.38` |
 | **0.1.38** | 2026-09-30 | `20baec3` | motherbee + spokes (core) | ✅ live | snap `pre-wf-mirror-0-1-38` (las 4 VMs) · `apt install fluxbee=0.1.37` |
@@ -49,6 +50,42 @@
 > (`dpkg-scanpackages -m`) para rollback, pero su detalle vive en la bitácora, no acá.
 
 ---
+
+## 0.1.41 — una sola policy OPA de usuario en todos los hives, distribuida por Syncthing
+
+- **Fecha:** 2026-09-30 (ART) · **Versión anterior:** 0.1.40 · **Commit:** `72891be` (FINDINGS A-7;
+  bitácora 2026-09-30; [`docs/opa-distribution.md`](../docs/opa-distribution.md))
+- **Alcance:** motherbee + los tres spokes (core-update) + `hive.yaml` de motherbee, ingress1 y
+  egress1 (SY.opa.rules en ingress/egress; receta en HANDBOOK §12).
+- **Qué cambió:**
+  - SY.opa.rules corre en los 4 hives. Solo el motherbee compila: aplica y publica el wasm en la
+    carpeta Syncthing `fluxbee-dist-policy`; los demás hives lo instalan si el sha256 coincide.
+  - Las escrituras OPA son globales (`/opa/policy*`); las de un hive puntual se rechazan. La
+    respuesta dice qué hives ya la corren y cuáles siguen pendientes.
+  - CONFIG_CHANGED viaja por el ruteo normal y cruza hives; se eliminaron
+    `PUT /config/routes|vpns|taps`.
+- **Build:** 17 min. **Publish:** ~9 min (`dpkg-scanpackages` sobre 41 paquetes). Snapshots
+  `pre-opa-global-0-1-41` en las 4 VMs (se borró antes `pre-wf-mirror-0-1-38`).
+- **Migración (00:25–00:39 UTC):** `hive.yaml` del motherbee editado antes del `apt install` (backup
+  `hive.yaml.pre-opa-0-1-41`); el orquestador armó `dist/core/ingress` con 5 componentes y
+  `dist/core/egress` con 4, y el binario llegó a ingress1/egress1 en menos de un minuto; después
+  `hive.yaml` de esos dos spokes y core-update a los tres (TIMEOUT como siempre; los binarios
+  quedaron con el mismo hash que en el motherbee).
+- **Verificación en vivo:**
+  - SY.opa.rules `running` en los 4 hives (en ingress1/egress1 la unit la creó el orquestador al
+    arrancar). Carpeta `fluxbee-dist-policy`: `sendonly` con 4 devices en el motherbee (heredados
+    de vendor) y `receiveonly` con 2 en cada spoke. 0 servicios `failed`.
+  - `POST /opa/policy` (v6): `converged: true` en 16 s; los 4 routers con v6 cargada.
+  - Ponerse al día: con Syncthing de egress1 cortado (nft temporal en :22000), la v7 respondió
+    `pending: [egress1]` y egress1 siguió con su v6; al desbloquear instaló la v7 solo, en 27 s.
+  - Clear: el motherbee limpió al instante, pero los spokes tardaron ~63 s (el watcher de Syncthing
+    retiene 60 s un cambio hecho solo de renames y borrados) y la respuesta salió con los tres
+    pendientes → se arregla en 0.1.42.
+  - Escritura para un hive puntual → 400; ruta vieja `/hives/{h}/opa/policy/clear` → 404. En
+    ingress1/egress1: `/var/lib/fluxbee/opa` `700`, SHM `600`.
+  - Factory reset en dry-run: ahora lista la policy de los 4 hives.
+- **Rollback:** snapshot `pre-opa-global-0-1-41`, o `apt install fluxbee=0.1.40` + restaurar
+  `hive.yaml.pre-opa-0-1-41` en motherbee, ingress1 y egress1.
 
 ## 0.1.40 — purga de WF en el motherbee en orden y tolerante a "ya no existe"
 
