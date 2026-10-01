@@ -47,9 +47,10 @@ node_control_actions := {"CONFIG_GET", "CONFIG_SET", "SYSTEM_UPDATE", "SYSTEM_SY
 
 # What an orchestrator sends to another hive's orchestrator: the node lifecycle and inspection it
 # forwards for the Admin, and the hive join/leave handshake (verified in sy_orchestrator,
-# 2026-10-01). Nothing else — no node live config (CONFIG_SET/GET), no CONFIG_CHANGED, no
-# SYSTEM_UPDATE: a compromised orchestrator (e.g. on the DMZ ingress) must not be able to write
-# another hive's config or the global policy.
+# 2026-10-01). Nothing else: no node live config (CONFIG_SET/GET), no CONFIG_CHANGED, no
+# SYSTEM_UPDATE. The list has no direction: an orchestrator of any hive, the DMZ ingress included,
+# may still send every action here to any hive, the mutating ones too (NODE_CONFIG_SET, SPAWN/KILL,
+# SYSTEM_CORE_ROLLBACK). Limiting that is part of the postponed security work (FINDINGS A-22).
 orchestrator_actions := {
 	"SPAWN_NODE", "KILL_NODE", "START_NODE", "RESTART_NODE", "REMOVE_NODE_INSTANCE",
 	"NODE_CONFIG_GET", "NODE_CONFIG_SET", "NODE_STATE_GET", "NODE_STATUS_GET", "LIST_NODES",

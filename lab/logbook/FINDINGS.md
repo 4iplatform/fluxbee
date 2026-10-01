@@ -206,7 +206,7 @@
   (15 → 0 cambios locales); después de eso `WF.w1probe@worker1` quedó HEALTHY: el primer WF
   corriendo en un worker.
 
-### A-22 ✅ RESUELTO (0.1.44) — Un nodo local podía mandar mensajes como otro nodo
+### A-22 🟡 PARCIAL (0.1.44) · resto POSTERGADO — Un nodo local podía mandar mensajes como otro nodo
 
 - **Qué pasaba:** el router buscaba al emisor de un frame por el `routing.src` que el frame declaraba
   y estampaba desde ahí su nombre L2, que es con lo que el gate decide las acciones protegidas.
@@ -220,6 +220,15 @@
   autenticada"). Revisados los emisores Rust, Go e IO: todos usan su propio UUID.
 - **Validado:** el mismo probe ahora cae (`routing.src is not the sending node`); ningún descarte de
   tráfico legítimo en los 4 hives.
+- **Lo que sigue abierto (panel DTAP 2026-10-01, P-1):** 0.1.44 cerró que un nodo use el UUID de otro
+  dentro de su conexión, pero el **nombre** lo declara el propio proceso en el HELLO y el router lo
+  acepta: socket `0666`, sin nombres reservados, sin rechazo de duplicados ni de un `@hive` ajeno.
+  Cualquier proceso local puede conectarse con un UUID nuevo como `SY.admin` y escribir la policy
+  global, o como `SY.orchestrator` en un spoke.
+- **Decisión del operador (2026-10-01): POSTERGAR** el paquete de seguridad (hoy cuesta más de lo
+  que rinde). Incluye: autenticar el nombre en el HELLO (P-1), dirección de la regla 3 (A-20 / D-2),
+  firma del manifest publicado (P-8), `get_policy` que expone el rego (P-16) y el cifrado de la copia
+  sincronizada (ya postergado en el diseño).
 
 ### A-19 ✅ RESUELTO (0.1.43) — La policy publicada esperaba hasta 60 s al watcher de Syncthing
 
@@ -235,7 +244,7 @@
   (`folder_id` inválido para el canal `dist`: solo aceptaba `fluxbee-dist`, aunque el handler ya
   sabía honrar una carpeta puntual) → 0.1.43 acepta cualquier `fluxbee-dist*`.
 
-### A-20 ✅ RESUELTO (0.1.42 + 0.1.45) — Con CONFIG_CHANGED cruzando hives, sus receptores aplicaban cualquier origen que el router admitiera
+### A-20 🟡 PARCIAL (0.1.42 + 0.1.45) · dirección POSTERGADA — Con CONFIG_CHANGED cruzando hives, sus receptores aplicaban cualquier origen que el router admitiera
 
 - **Qué pasaba:** el gate del router para CONFIG_CHANGED admite al admin primario **y a los
   orquestadores** (regla 3 de la policy de sistema). SY.opa.rules aplicaba un compile/apply/clear de
@@ -247,11 +256,16 @@
   cualquier hive por `CONFIG_SET`. El orquestador no lo usa: `CONFIG_SET`/`CONFIG_GET` los manda
   solo SY.admin; el orquestador reenvía entre hives SPAWN/KILL/NODE_CONFIG_*/NODE_STATUS/LIST_NODES/
   GET_*/ROLLBACK/ADD_HIVE_FINALIZE/REMOVE_HIVE_CLEANUP y manda CONFIG_CHANGED `node_config` solo a
-  nodos de su hive. Con A-22 cerrado, el riesgo que queda es un orquestador comprometido (root en
-  ese hive). **Decidido (operador, 2026-10-01): achicarla** → 0.1.45: la regla 3 es la lista de
-  las 16 acciones que el orquestador reenvía, y se borraron las señales de config que nadie usaba
-  (`node_config` + `notify`, el `CONFIG_RESPONSE` de storage, el handler de sy-wf-rules, la rama de
-  io-slack). Validado: ciclo de WF en worker1 y lecturas entre hives sin un solo rechazo del gate.
+  nodos de su hive. **Decidido (operador, 2026-10-01): achicarla** → 0.1.45: la regla 3 es la
+  lista de las 16 acciones que el orquestador reenvía, y se borraron las señales de config que nadie
+  usaba (`node_config` + `notify`, el `CONFIG_RESPONSE` de storage, el handler de sy-wf-rules, la
+  rama de io-slack). Validado: ciclo de WF en worker1 y lecturas entre hives sin un solo rechazo del
+  gate.
+- **Lo que NO cierra (panel DTAP, D-2):** la lista no tiene dirección. El orquestador de cualquier
+  hive, incluido el del ingress, todavía puede mandarle a otro hive las mutaciones de la lista
+  (`NODE_CONFIG_SET`, `SPAWN`/`KILL`/`RESTART`/`REMOVE`, `SYSTEM_CORE_ROLLBACK`, finalize/cleanup). Y
+  mientras el nombre del HELLO no se autentique (A-22), cualquier proceso local puede presentarse
+  como orquestador. Postergado con el paquete de seguridad (A-22).
 - **Arreglo:** SY.opa.rules toma CONFIG_CHANGED solo de `SY.admin@motherbee`, igual que su camino de
   comandos y que el protocolo; SY.config.routes ya no aplica listas que lleguen por CONFIG_CHANGED.
 
