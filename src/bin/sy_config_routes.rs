@@ -226,10 +226,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
                 if is_system_kind(&msg.meta.msg_type) && msg.meta.msg.as_deref() == Some(MSG_CONFIG_CHANGED) {
                     // Routes, VPNs and taps change only through the admin actions on THIS hive
-                    // (handled above, origin-gated). The admin's CONFIG_CHANGED after one of them is
-                    // a notice for the routers on its path; there is nothing here to apply. The old
-                    // global list broadcast (PUT /config/routes|vpns|taps) is gone: now that
-                    // CONFIG_CHANGED crosses hives it would overwrite every hive's config with one list.
+                    // (handled above, origin-gated); this hive's routers take the change from the
+                    // config region. The admin's CONFIG_CHANGED after one of them is only a notice,
+                    // with nothing to apply here. The old global list broadcast
+                    // (PUT /config/routes|vpns|taps) is gone: now that CONFIG_CHANGED crosses hives
+                    // it would overwrite every hive's config with one list.
                     tracing::debug!("config changed notice; nothing to apply here");
                     continue;
                 }

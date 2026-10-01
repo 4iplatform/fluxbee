@@ -21,7 +21,8 @@
 
 | Versión | Fecha (ART) | Commit | Alcance | Estado | Rollback |
 |---|---|---|---|---|---|
-| **0.1.42** | 2026-09-30 | `ac301d9` | motherbee + spokes (core) | ✅ live (el escaneo forzado no anda: 0.1.43) | snap `pre-opa-fixes-0-1-42` (las 4 VMs) · `apt install fluxbee=0.1.41` |
+| **0.1.43** | 2026-09-30 | `2b3abb2` | motherbee + spokes (core) | ✅ live | snap `pre-sync-hint-0-1-43` (las 4 VMs) · `apt install fluxbee=0.1.42` |
+| **0.1.42** | 2026-09-30 | `ac301d9` | motherbee + spokes (core) | ⚠️ superada (escaneo rechazado: 0.1.43) | snap `pre-opa-fixes-0-1-42` (las 4 VMs) · `apt install fluxbee=0.1.41` |
 | **0.1.41** | 2026-09-30 | `72891be` | motherbee + spokes (core) + `hive.yaml` | ✅ live | snap `pre-opa-global-0-1-41` (las 4 VMs) · `apt install fluxbee=0.1.40` + `hive.yaml.pre-opa-0-1-41` |
 | **0.1.40** | 2026-09-30 | `43dd174` | motherbee + spokes (core) | ✅ live | snap `pre-purge-order-0-1-40` (las 4 VMs) · `apt install fluxbee=0.1.39` |
 | **0.1.39** | 2026-09-30 | `85c3244` | motherbee + spokes (core) | ✅ live | snap `pre-identity-baseline-0-1-39` (las 4 VMs) · `apt install fluxbee=0.1.38` |
@@ -51,6 +52,26 @@
 > (`dpkg-scanpackages -m`) para rollback, pero su detalle vive en la bitácora, no acá.
 
 ---
+
+## 0.1.43 — el sync hint acepta una carpeta dist puntual (cierra el escaneo de la policy)
+
+- **Fecha:** 2026-09-30 (ART) · **Versión anterior:** 0.1.42 · **Commit:** `2b3abb2` (FINDINGS A-19)
+- **Alcance:** motherbee + los tres spokes (core-update).
+- **Qué cambió:** el canal `dist` del sync hint acepta cualquier `fluxbee-dist*`; así anda el
+  escaneo de `fluxbee-dist-policy` que pide el admin justo después de publicar una policy.
+- **Build:** 9 min. **Publish:** ~6 min (43 paquetes). Snapshots `pre-sync-hint-0-1-43` en las 4 VMs
+  (se borró antes `pre-purge-order-0-1-40`).
+- **Install:** motherbee 01:43 UTC; esta vez se esperó a que el admin respondiera antes de los
+  spokes (01:45–01:48).
+- **Verificación en vivo:**
+  - Los 4 hives con los mismos binarios; 0 `failed`.
+  - apply A (v9) 8,4 s · apply B (v10) 10,5 s · rollback (vuelve a A) 8,4 s · clear 8,3 s: los
+    cuatro `converged: true`, con la policy correcta en los 4 hives y sus routers. El motherbee
+    escanea ~0,5 s después de aplicar; el resto es la transferencia y el chequeo de 5 s de cada hive.
+  - config-routes: alta y baja de una ruta en worker1 (v12, v13) con el motherbee intacto (v8); el
+    router de worker1 toma el cambio de su SHM al instante.
+  - Estado final: ningún hive con policy de usuario.
+- **Rollback:** snapshot `pre-sync-hint-0-1-43` o `apt install fluxbee=0.1.42`.
 
 ## 0.1.42 — OPA: escanear al publicar; solo el admin primario escribe
 

@@ -513,9 +513,11 @@ socket.on('data', (chunk) => {
 > **Desde 0.1.41:** CONFIG_CHANGED viaja por el ruteo normal (respeta `dst` y `meta.target`, cruza
 > hives) y es una acción SYSTEM protegida: solo `SY.admin@motherbee` (a cualquier hive) y los
 > `SY.orchestrator` (`node_config`) pueden enviarlo. Las rutas/VPN/taps son config de cada hive: se
-> cambian con las acciones admin de ese hive, y el CONFIG_CHANGED que sigue (a
-> `SY.config.routes@<hive>`) es solo un aviso para los routers — SY.config.routes no aplica listas
-> que lleguen por CONFIG_CHANGED. OPA de usuario es una sola policy global y SY.opa.rules solo
+> cambian con las acciones admin de ese hive y los routers de ese hive las toman de su región de
+> config (SHM). El CONFIG_CHANGED que manda el admin después (a `SY.config.routes@<hive>`) es solo
+> un aviso: SY.config.routes no aplica listas que lleguen por CONFIG_CHANGED, y del lado WAN el
+> router no lo intercepta (solo el router de origen refresca y re-anuncia LSA). OPA de usuario es
+> una sola policy global y SY.opa.rules solo
 > acepta CONFIG_CHANGED de `SY.admin@motherbee` — ver [`opa-distribution.md`](opa-distribution.md).
 
 #### 7.4.1 Formato

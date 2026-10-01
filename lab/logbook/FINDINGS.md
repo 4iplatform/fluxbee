@@ -117,18 +117,20 @@
   compilar el binario a mano — ambas cosas habrían hecho pasar el build **ocultando el problema** y
   dejando la próxima caja limpia rota igual.
 
-### A-7 🔴 OPA de usuario no llega a los spokes (CONFIG_CHANGED nunca sale del motherbee)
+### A-7 ✅ RESUELTO (0.1.41–0.1.42) — OPA de usuario no llegaba a los spokes (CONFIG_CHANGED nunca salía del motherbee)
 
 - **Qué pasa:** el admin manda las escrituras OPA como CONFIG_CHANGED; el router lo intercepta
   antes de rutear, ignora el destino y solo lo reparte dentro del host. Un clear dirigido a worker1
   lo ejecutó el motherbee (2026-09-28). Ningún spoke tiene de dónde sacar la policy; ingress y
   egress ni siquiera corren SY.opa.rules. Y el wasm compilado (140–155 KB) no entra en un mensaje
   (tope de 128 KiB).
-- **Estado:** diseño **decidido por el operador** (bitácora 2026-09-30), falta construirlo:
-  SY.opa.rules en todos los hives; el motherbee compila y publica el compilado en una carpeta
-  Syncthing; un CONFIG_CHANGED con `{version, sha256}` avisa; cada hive lo carga si el hash
-  coincide; una sola policy global; convergencia eventual. Sin cifrado por ahora. En 0.1.36, la
-  parte de "se ejecuta en el hive equivocado" quedó cerrada (A-8).
+- **Arreglo (diseño del operador, bitácora 2026-09-30; `docs/opa-distribution.md`):** SY.opa.rules
+  en todos los hives; solo el motherbee compila y publica el wasm en la carpeta Syncthing
+  `fluxbee-dist-policy`; un CONFIG_CHANGED `{opa, sync}` avisa; cada hive lo instala si el sha256
+  coincide; una sola policy global; convergencia eventual; sin cifrado. CONFIG_CHANGED pasa a
+  viajar por el ruteo normal (cruza hives).
+- **Validado en 8.x:** apply en los 4 hives en 16 s; un hive cortado de Syncthing se puso al día
+  solo, 27 s después de reconectar; clear global (lento hasta 0.1.43: A-19).
 
 ### A-8 ✅ RESUELTO (0.1.36) — Config de un hive aplicada en otro: `add_route` en un spoke pisaba las rutas del motherbee
 
@@ -204,6 +206,42 @@
   (15 → 0 cambios locales); después de eso `WF.w1probe@worker1` quedó HEALTHY: el primer WF
   corriendo en un worker.
 
+### A-19 ✅ RESUELTO (0.1.43) — La policy publicada esperaba hasta 60 s al watcher de Syncthing
+
+- **Qué pasaba:** con 0.1.41 el apply llegaba a los 4 hives en 16 s, pero el clear tardó 63 s y el
+  admin respondió con los tres spokes pendientes. Los eventos de Syncthing del motherbee lo
+  muestran: los dos applies se escanearon 10 s después de publicar (`fsWatcherDelayS`), el clear
+  60 s después. El watcher retiene hasta su timeout (6 × 10 s) los cambios que son renames y
+  borrados, y la publicación escribe por rename. Con 0.1.42 retuvo también un apply: a los 33 s
+  solo el motherbee corría la v8.
+- **Arreglo:** después de aplicar en el motherbee, el admin le manda al orquestador del motherbee
+  un sync hint de `fluxbee-dist-policy`, que escanea la carpeta en el momento (el mismo paso que el
+  publish de un runtime), y recién entonces el aviso (0.1.42). En 0.1.42 el orquestador lo rechazaba
+  (`folder_id` inválido para el canal `dist`: solo aceptaba `fluxbee-dist`, aunque el handler ya
+  sabía honrar una carpeta puntual) → 0.1.43 acepta cualquier `fluxbee-dist*`.
+
+### A-20 ✅ RESUELTO (0.1.42) — Con CONFIG_CHANGED cruzando hives, sus receptores aplicaban cualquier origen que el router admitiera
+
+- **Qué pasaba:** el gate del router para CONFIG_CHANGED admite al admin primario **y a los
+  orquestadores** (regla 3 de la policy de sistema). SY.opa.rules aplicaba un compile/apply/clear de
+  cualquiera de ellos, y lo que se aplica en el motherbee ahora se publica a todos los hives.
+  SY.config.routes aplicaba la lista de rutas/VPN/taps de un CONFIG_CHANGED global, cuyo único
+  emisor era `PUT /config/*` (eliminado en 0.1.41): ahora llegaría a todos los hives y les pisaría
+  la config.
+- **No es capacidad nueva:** la regla 3 ya deja a un orquestador escribir la policy o las rutas de
+  cualquier hive por `CONFIG_SET`. Abierto para charlar: si los orquestadores tienen que poder
+  hacerlo (hoy son "system-final").
+- **Arreglo:** SY.opa.rules toma CONFIG_CHANGED solo de `SY.admin@motherbee`, igual que su camino de
+  comandos y que el protocolo; SY.config.routes ya no aplica listas que lleguen por CONFIG_CHANGED.
+
+### A-21 🟡 Estado del router sin policy de usuario: `error` al arrancar, `ok` después de un clear
+
+- **Qué se ve:** en `/hives/{h}/opa/status`, un router que arrancó sin policy reporta
+  `load_status=1, error`; después de un clear, `load_status=0, ok`. En los dos casos no hay policy
+  y el ruteo es el mismo (un mensaje sin destino que no va al frontdesk sale `OPA_ERROR`).
+- **Causa:** el resolver nace en `OPA_STATUS_ERROR` y `unload()` lo deja en `OPA_STATUS_OK`. Es solo
+  informativo; no se tocó.
+
 ### A-17 ✅ RESUELTO (0.1.39) — Una réplica de identity que arranca sin primario borra los ILK de su hive
 
 - **Qué pasaba:** la réplica re-publica cada 30 s su conjunto de ILK propios y el primario lo toma
@@ -229,7 +267,9 @@
   VPN 0 y el aislamiento falla abierto → conservar las últimas reglas conocidas; orden
   determinístico si dos hives definen lo mismo; un cambio por LSA dispara `reassign_vpns`.
 - **Limpieza del mismo paquete:** endpoints duplicados (`/routes?hive=` vs `/hives/{h}/routes`),
-  el broadcast post-alta que lleva la lista entera (solo hace falta el aviso). `PUT /config/*` y el
+  el broadcast post-alta que lleva la lista entera. Visto con 0.1.43: ni el aviso hace falta — el
+  router del hive toma el cambio de su SHM al instante, SY.config.routes ignora el aviso y del lado
+  WAN el router no intercepta CONFIG_CHANGED. `PUT /config/*` y el
   broadcast de storage salen con el trabajo de OPA (prerrequisito para que CONFIG_CHANGED cruce
   hives).
 - **Aceptado:** si se borra un hive, se pierden sus rutas.
