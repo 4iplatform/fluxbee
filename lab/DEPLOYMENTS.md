@@ -21,6 +21,7 @@
 
 | Versión | Fecha (ART) | Commit | Alcance | Estado | Rollback |
 |---|---|---|---|---|---|
+| **0.1.44** | 2026-10-01 | `005d0ad` | motherbee + spokes (core) | ✅ live | snap `pre-src-binding-0-1-44` (las 4 VMs) · `apt install fluxbee=0.1.43` |
 | **0.1.43** | 2026-09-30 | `2b3abb2` | motherbee + spokes (core) | ✅ live | snap `pre-sync-hint-0-1-43` (las 4 VMs) · `apt install fluxbee=0.1.42` |
 | **0.1.42** | 2026-09-30 | `ac301d9` | motherbee + spokes (core) | ⚠️ superada (escaneo rechazado: 0.1.43) | snap `pre-opa-fixes-0-1-42` (las 4 VMs) · `apt install fluxbee=0.1.41` |
 | **0.1.41** | 2026-09-30 | `72891be` | motherbee + spokes (core) + `hive.yaml` | ✅ live | snap `pre-opa-global-0-1-41` (las 4 VMs) · `apt install fluxbee=0.1.40` + `hive.yaml.pre-opa-0-1-41` |
@@ -52,6 +53,32 @@
 > (`dpkg-scanpackages -m`) para rollback, pero su detalle vive en la bitácora, no acá.
 
 ---
+
+## 0.1.44 — un nodo solo manda como sí mismo; fuera el aviso de rutas; OPA más rápido
+
+- **Fecha:** 2026-10-01 (ART) · **Versión anterior:** 0.1.43 · **Commit:** `005d0ad` (FINDINGS A-22,
+  A-18; bitácora 2026-09-30)
+- **Alcance:** motherbee + los tres spokes (core-update).
+- **Qué cambió:**
+  - Seguridad: el router descarta un frame cuyo `routing.src` no es el UUID con el que ese socket
+    hizo HELLO. Antes un nodo que conociera el UUID de otro podía mandar como él (A-22).
+  - Se borró el CONFIG_CHANGED que el admin mandaba después de cada alta/baja de ruta, VPN o tap
+    (no lo usaba nadie) y el trato especial del router a CONFIG_CHANGED.
+  - Después de un aviso de OPA, cada hive re-chequea su copia cada 1 s durante 30 s.
+- **Build:** 17 min. **Publish:** ~6 min (44 paquetes). Snapshots `pre-src-binding-0-1-44` en las 4
+  VMs (se borró antes `pre-opa-global-0-1-41`).
+- **Install:** motherbee 03:03 UTC; spokes 03:05–03:08.
+- **Verificación en vivo:**
+  - Los 4 hives con los mismos binarios; 0 `failed`; 0 nodos caídos.
+  - Probe de suplantación en el motherbee: con el UUID del admin, ahora el router lo descarta
+    (`routing.src is not the sending node`) y SY.config.routes no responde nada; con 0.1.43 respondía.
+    Ningún descarte de tráfico legítimo en los 4 hives.
+  - OPA: apply A, apply B, rollback y clear en ~5 s cada uno (antes 8–10 s), todos `converged`.
+  - Rutas sin el aviso: una del motherbee aparece en la región LSA de worker1 a los ~11 s y se va a
+    los ~7 s; una de worker1 llega al LSA del motherbee a los ~6 s, sin tocar la config del
+    motherbee.
+  - Estado final: sin policy de usuario ni rutas de prueba.
+- **Rollback:** snapshot `pre-src-binding-0-1-44` o `apt install fluxbee=0.1.43`.
 
 ## 0.1.43 — el sync hint acepta una carpeta dist puntual (cierra el escaneo de la policy)
 

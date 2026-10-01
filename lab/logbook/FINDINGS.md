@@ -206,6 +206,21 @@
   (15 → 0 cambios locales); después de eso `WF.w1probe@worker1` quedó HEALTHY: el primer WF
   corriendo en un worker.
 
+### A-22 ✅ RESUELTO (0.1.44) — Un nodo local podía mandar mensajes como otro nodo
+
+- **Qué pasaba:** el router buscaba al emisor de un frame por el `routing.src` que el frame declaraba
+  y estampaba desde ahí su nombre L2, que es con lo que el gate decide las acciones protegidas.
+  Confirmado en vivo en 8.x: un nodo de prueba en el motherbee mandó `NODE_STATUS_GET` (protegida)
+  con el UUID de SY.admin y SY.config.routes le respondió al admin; con su propio UUID, el gate lo
+  descartó. Los UUID viajan en todos los mensajes (un nodo de tenant ve el de su orquestador en cada
+  señal `node_config`), así que cualquier nodo local podía actuar como el admin del motherbee o como
+  el orquestador de su hive, que por la regla 3 puede todas las acciones protegidas en cualquier hive.
+- **Arreglo:** el router descarta el frame si `routing.src` no es el UUID con el que ese socket hizo
+  HELLO, que es lo que `02-protocolo.md` ya exigía ("el router estampa `src_l2_name` desde la sesión
+  autenticada"). Revisados los emisores Rust, Go e IO: todos usan su propio UUID.
+- **Validado:** el mismo probe ahora cae (`routing.src is not the sending node`); ningún descarte de
+  tráfico legítimo en los 4 hives.
+
 ### A-19 ✅ RESUELTO (0.1.43) — La policy publicada esperaba hasta 60 s al watcher de Syncthing
 
 - **Qué pasaba:** con 0.1.41 el apply llegaba a los 4 hives en 16 s, pero el clear tardó 63 s y el
@@ -229,8 +244,11 @@
   emisor era `PUT /config/*` (eliminado en 0.1.41): ahora llegaría a todos los hives y les pisaría
   la config.
 - **No es capacidad nueva:** la regla 3 ya deja a un orquestador escribir la policy o las rutas de
-  cualquier hive por `CONFIG_SET`. Abierto para charlar: si los orquestadores tienen que poder
-  hacerlo (hoy son "system-final").
+  cualquier hive por `CONFIG_SET`. El orquestador no lo usa: `CONFIG_SET`/`CONFIG_GET` los manda
+  solo SY.admin; el orquestador reenvía entre hives SPAWN/KILL/NODE_CONFIG_*/NODE_STATUS/LIST_NODES/
+  GET_*/ROLLBACK/ADD_HIVE_FINALIZE/REMOVE_HIVE_CLEANUP y manda CONFIG_CHANGED `node_config` solo a
+  nodos de su hive. Con A-22 cerrado, el riesgo que queda es un orquestador comprometido (root en
+  ese hive). **Para decidir (operador):** achicar la regla 3 a lo que usa.
 - **Arreglo:** SY.opa.rules toma CONFIG_CHANGED solo de `SY.admin@motherbee`, igual que su camino de
   comandos y que el protocolo; SY.config.routes ya no aplica listas que lleguen por CONFIG_CHANGED.
 
@@ -267,9 +285,10 @@
   VPN 0 y el aislamiento falla abierto → conservar las últimas reglas conocidas; orden
   determinístico si dos hives definen lo mismo; un cambio por LSA dispara `reassign_vpns`.
 - **Limpieza del mismo paquete:** endpoints duplicados (`/routes?hive=` vs `/hives/{h}/routes`),
-  el broadcast post-alta que lleva la lista entera. Visto con 0.1.43: ni el aviso hace falta — el
-  router del hive toma el cambio de su SHM al instante, SY.config.routes ignora el aviso y del lado
-  WAN el router no intercepta CONFIG_CHANGED. `PUT /config/*` y el
+  el broadcast post-alta que lleva la lista entera. Visto con 0.1.43: ni el aviso hacía falta (el
+  router del hive toma el cambio de su SHM al instante) → **borrado en 0.1.44**, junto con el trato
+  especial del router a CONFIG_CHANGED. Los cambios llegan a los otros hives con el próximo LSA
+  (≤10 s). `PUT /config/*` y el
   broadcast de storage salen con el trabajo de OPA (prerrequisito para que CONFIG_CHANGED cruce
   hives).
 - **Aceptado:** si se borra un hive, se pierden sus rutas.
