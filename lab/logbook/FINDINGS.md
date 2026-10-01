@@ -230,6 +230,59 @@
   firma del manifest publicado (P-8), `get_policy` que expone el rego (P-16) y el cifrado de la copia
   sincronizada (ya postergado en el diseño).
 
+### A-23 🟡 RESUELTO (0.1.48) · varias soluciones SIMPLIFICADO, revisar — El arquitecto modelaba OPA por hive; hay una sola policy global
+
+- **Qué pasa (visto en código, 2026-10-01):** una solución declara `opa_deployments` por hive
+  (`hive`, `policy_id`, `rego_source`) y el plan emite un `opa_compile_apply` por cada uno.
+  - Si el hive no es el motherbee, el admin lo rechaza con 400.
+  - Si es el motherbee, la policy pasa a ser la de todos los hives. Dos despliegues se pisan.
+  - El snapshot busca `policy_id`/`rego_hash` en el estado, que no los tiene: el reconciliador
+    nunca ve la policy que corre y la re-aplica en cada corrida.
+  - Quitarla está bloqueado (no hay acción de remove).
+  - El plan compiler (IA) recibe solo el `delta_report`: nadie le pasa el rego declarado.
+- **Decisión del operador (2026-10-01):**
+  1. La solución declara una sola policy global, sin hive.
+  2. Se compara con el rego que corre en el motherbee; si es igual, no se hace nada.
+  3. Se aplica con un solo `opa_compile_apply`; un hive `pending` no es una falla.
+  4. Cuando la solución dueña deja de declararla, `opa_clear`.
+
+  Si dos soluciones declaran OPA, **gana la última**. "Dueño" es la solución cuya policy corre
+  ahora; se reconoce comparando el rego con los manifests guardados. Una solución solo hace clear
+  si la policy que corre es la suya, y el plan dice de quién es la policy que reemplaza.
+- **Arreglo (0.1.48, `1486807`):** `desired_state.opa` (una policy, sin hive); el snapshot lee la
+  policy del motherbee con `opa_get_policy` y el dueño de los manifests guardados; un solo
+  `opa_compile_apply`, y `OPA_REMOVE` = `opa_clear`; el plan compiler recibe el rego y los pasos OPA
+  del plan quedan fijados a él; la confirmación dice de quién es la policy que se reemplaza.
+- **Validado:** tests (177 del arquitecto, incluida la respuesta real del admin de 8.x). El
+  pipeline completo no se corrió en vivo: necesita la IA del arquitecto (A-26).
+- **Pendiente de revisar (simplificación consciente, como el paquete de seguridad):** componer las
+  reglas de varias soluciones en una sola policy, en vez de que gane la última; y un dueño
+  registrado junto con la policy, en vez de deducirlo comparando el rego.
+
+### A-24 🔴 El snapshot del arquitecto le pide el estado de cada hive a un admin que no existe
+
+- **Qué pasa (visto en código, 2026-10-01; no reproducido en vivo):** `build_actual_state_snapshot`
+  manda cada lectura a `SY.admin@<hive>`. Solo el motherbee tiene admin (en worker1,
+  `sy-admin` está inactivo), así que en una solución con más de un hive esas lecturas fallan, el
+  snapshot queda incompleto y el reconciliador bloquea toda la corrida.
+- **Relacionado:** el plan compiler tampoco recibe la definición de los workflows declarados
+  (`wf_deployments`): el mismo hueco que A-23 tenía con el rego.
+
+### A-25 🔴 El `.deb` no instala el handbook del arquitecto (`install.sh` sí)
+
+- **Qué pasa (2026-10-01):** el arquitecto agrega a sus prompts `/etc/fluxbee/handbook_fluxbee.md`
+  si existe. `install.sh` lo copia, `build-deb.sh` no: en el motherbee de 8.x no está, así que el
+  arquitecto de PROD trabaja sin handbook. Misma clase de divergencia que A-6.
+
+### A-26 🔴 El arquitecto queda sin IA después de un upgrade
+
+- **Qué se vio (2026-10-01, al instalar 0.1.47 y otra vez con 0.1.48):** al arrancar, el arquitecto
+  no pudo leer su clave del vault (`AI vault resource lookup failed ... vault unreachable`) porque el
+  vault todavía no estaba arriba, y quedó escuchando con `ai_configured=false`. Según el código,
+  solo vuelve a intentarlo con un `VAULT_SECRET_CHANGED` de su proveedor o con un `CONFIG_SET`;
+  hasta entonces el chat y el pipeline no tienen IA. No se confirmó si en 8.x hay una clave
+  cargada.
+
 ### A-19 ✅ RESUELTO (0.1.43) — La policy publicada esperaba hasta 60 s al watcher de Syncthing
 
 - **Qué pasaba:** con 0.1.41 el apply llegaba a los 4 hives en 16 s, pero el clear tardó 63 s y el

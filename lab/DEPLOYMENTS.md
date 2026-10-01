@@ -21,6 +21,7 @@
 
 | Versión | Fecha (ART) | Commit | Alcance | Estado | Rollback |
 |---|---|---|---|---|---|
+| **0.1.48** | 2026-10-01 | `1486807` | motherbee + spokes (core) | ✅ live | snap `pre-architect-opa-0-1-48` (las 4 VMs) · `apt install fluxbee=0.1.47` |
 | **0.1.47** | 2026-10-01 | `652a9c9` | motherbee + spokes (core) | ✅ live | snap `pre-opa-blockB-0-1-47` (las 4 VMs) · `apt install fluxbee=0.1.46` |
 | **0.1.46** | 2026-10-01 | `7371ca1` | motherbee + spokes (core) | ✅ live | snap `pre-opa-blockA-0-1-46` (las 4 VMs) · `apt install fluxbee=0.1.45` |
 | **0.1.45** | 2026-10-01 | `d6505ff` | motherbee + spokes (core) | ✅ live | snap `pre-rule3-0-1-45` (las 4 VMs) · `apt install fluxbee=0.1.44` |
@@ -56,6 +57,37 @@
 > (`dpkg-scanpackages -m`) para rollback, pero su detalle vive en la bitácora, no acá.
 
 ---
+
+## 0.1.48 — el arquitecto declara la policy OPA global (una por sistema, gana la última)
+
+- **Fecha:** 2026-10-01 (ART) · **Versión anterior:** 0.1.47 · **Commit:** `1486807`
+  (FINDINGS A-23). Solo cambia `sy-architect`.
+- **Alcance:** motherbee + los tres spokes (core-update; el arquitecto corre solo en el motherbee).
+- **Qué cambió:**
+  - Una solución declara `desired_state.opa` (una policy, sin hive) en lugar de `opa_deployments`
+    por hive. Una policy con `hive` no pasa la validación.
+  - El snapshot lee la policy que corre una sola vez, del motherbee. Si el rego es el mismo, no hay
+    cambio.
+  - Un solo `opa_compile_apply`. `OPA_REMOVE` ahora es `opa_clear`.
+  - Si dos soluciones declaran OPA, gana la última. El dueño de la policy que corre es la solución
+    cuyo manifest guardado la declaró más recientemente. Una solución solo hace clear si la policy
+    sigue siendo suya, y el plan (`user_policy` en la confirmación) dice de quién es la que
+    reemplaza.
+  - El plan compiler recibe el rego declarado y los pasos OPA del plan quedan fijados a él (rego y
+    entrypoint exactos, sin hive).
+- **Build:** 12 min. **Publish:** 48 paquetes. Snapshots `pre-architect-opa-0-1-48` en las 4 VMs
+  (se borró antes `pre-rule3-0-1-45`).
+- **Install:** motherbee 21:19 UTC; spokes 21:19–21:21.
+- **Verificación en vivo:**
+  - Los 4 hives con los mismos binarios; 0 `failed`; el arquitecto activo y `/api/status` ok.
+  - La respuesta real de `opa_get_policy` del motherbee, con y sin policy, se capturó y quedó como
+    test del parser del snapshot.
+  - Apply y clear globales: 6,2 s y 4,9 s, los 4 hives. 0 rechazos del gate y 0 descartes por
+    `routing.src`; sin policy de usuario al terminar.
+  - **No probado en vivo:** el pipeline completo (el diseñador y el plan compiler son IA, y el
+    arquitecto arrancó sin IA: A-26). Cubierto por tests: validación, snapshot, reglas de dueño,
+    fijado de pasos y confirmación.
+- **Rollback:** snapshot `pre-architect-opa-0-1-48` o `apt install fluxbee=0.1.47`.
 
 ## 0.1.47 — OPA, bloque B del panel DTAP: un hive trabado dice por qué, se reparan instalaciones a medias, sin carrera en el estado, sin rego viejo
 
