@@ -47,7 +47,12 @@ actions; frontdesk routing) is baked into the router binary (`policy/system.rego
   orchestrator a sync hint for `fluxbee-dist-policy` (the step a runtime publish takes), which
   scans the folder at once. Left to Syncthing's filesystem watcher, a change made only of renames
   and deletes — a clear — waits the watcher's full timeout (measured: 60 s, against 10 s when a new
-  wasm is written).
+  wasm is written). The hint is waited for 5 s at most: it speeds the transfer up, it never holds a
+  write.
+- **The motherbee keeps the publication in step:** every 5 s it checks that the published
+  manifest names the policy it runs, and publishes again if not — e.g. after a publish that failed
+  once the policy was applied (the write then answers `PUBLISH_FAILED`: applied on the motherbee,
+  publishing retried).
 
 ## Installing on a hive (not the motherbee)
 
@@ -69,11 +74,17 @@ soon as Syncthing brings the folder up to date — no notice needed.
 
 - Writes are global: `POST /opa/policy` (compile + apply), `/opa/policy/compile`,
   `/opa/policy/apply`, `/opa/policy/rollback`, `/opa/policy/clear`, `/opa/policy/check`, and the
-  `opa_*` internal actions. A per-hive write (`hive` other than the motherbee) is rejected; the
-  `/hives/{hive}/opa/policy*` write routes no longer exist.
+  `opa_*` internal actions (SY.architect sends them as these paths). A per-hive write (`hive` other
+  than the motherbee) is rejected; the `/hives/{hive}/opa/policy*` write routes no longer exist.
+  This is the only write path: CONFIG_SET on SY.opa.rules is read-only.
 - The response of a change reports `hash`, the motherbee's answer (`responses`), the hives that
-  answered the notice (`hives`, `running_hives`), those still converging (`pending`) and
-  `converged`. It waits up to 30 s for the notices; a reachable hive answers within seconds.
+  answered the notice (`hives`, `running_hives`), those still converging (`pending`), the pending
+  ones the motherbee cannot reach now (`unreachable`) and `converged`. The hives it expects are
+  every hive the registry lists as `connected`, reachable now or not; a hive counts as running only
+  when its SY.opa.rules (the name the router stamped) reports the announced hash. It waits 10 s for
+  the notices — a reachable hive answers within seconds; the others converge on their own later.
+- If the motherbee does not answer the step that changes the policy, the write answers `TIMEOUT`
+  (504): the policy may or may not have changed — check `GET /hives/motherbee/opa/status`.
 - Reads stay per hive: `GET /hives/{hive}/opa/status` and `/opa/policy`.
 
 ## Security

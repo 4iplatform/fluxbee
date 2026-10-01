@@ -170,6 +170,8 @@ type Service struct {
 	opaRegion          *OpaRegion
 
 	lastError string
+	// The last failure to re-publish (motherbee): logged only when it changes.
+	lastPublishErr string
 
 	// policyMu serializes every change to the running policy: the message loop and the
 	// published-policy sync loop both make them.
@@ -757,12 +759,12 @@ func (s *Service) handleNodeConfigGet(msg fluxbeesdk.Message) {
 			},
 		},
 		"contract": map[string]any{
-			"supports":              []string{fluxbeesdk.MSGConfigGet, fluxbeesdk.MSGConfigSet},
+			"supports":              []string{fluxbeesdk.MSGConfigGet},
 			"target":                fluxbeesdk.NodeConfigControlTarget,
 			"schema_version":        1,
-			"apply_modes":           []string{fluxbeesdk.NodeConfigApplyModeReplace},
 			"config_schema":         "opa_control_v1",
-			"supported_operations":  []string{"check", "compile", "compile_apply", "apply", "rollback"},
+			"supported_operations":  []string{},
+			"policy_writes":         "SY.admin: POST /opa/policy[/compile|/apply|/rollback|/clear|/check]",
 			"requested_node_name":   req.NodeName,
 			"preserves_opa_actions": true,
 			"preserves_opa_queries": true,
@@ -799,8 +801,7 @@ func (s *Service) handleNodeConfigSet(msg fluxbeesdk.Message) {
 		return
 	}
 
-	configMap, ok := req.Config.(map[string]any)
-	if !ok {
+	if _, ok := req.Config.(map[string]any); !ok {
 		s.sendNodeConfigResponse(msg, map[string]any{
 			"ok":        false,
 			"node_name": s.nodeName,
@@ -812,82 +813,17 @@ func (s *Service) handleNodeConfigSet(msg fluxbeesdk.Message) {
 		})
 		return
 	}
-
-	operation, _ := configMap["operation"].(string)
-	operation = strings.TrimSpace(strings.ToLower(operation))
-	if operation == "" {
-		operation = "check"
-	}
-	version := req.ConfigVersion
-	if rawVersion, ok := configMap["version"].(float64); ok && uint64(rawVersion) != 0 {
-		version = uint64(rawVersion)
-	}
-	rego, _ := configMap["rego"].(string)
-	entrypoint, _ := configMap["entrypoint"].(string)
-	autoApply, _ := configMap["auto_apply"].(bool)
-
-	var opaCfg *OpaConfigPayload
-	if rego != "" || entrypoint != "" {
-		opaCfg = &OpaConfigPayload{
-			Rego:       rego,
-			Entrypoint: entrypoint,
-		}
-	}
-
-	handled, err := s.handleOpaAction(msg.Routing.Src, operation, version, opaCfg, autoApply, false)
-	if err != nil {
-		s.sendNodeConfigResponse(msg, map[string]any{
-			"ok":             false,
-			"node_name":      s.nodeName,
-			"state":          "error",
-			"schema_version": req.SchemaVersion,
-			"config_version": version,
-			"error": map[string]any{
-				"code":   inferOpaErrorCode(err),
-				"detail": err.Error(),
-			},
-		})
-		return
-	}
-	if !handled {
-		s.sendNodeConfigResponse(msg, map[string]any{
-			"ok":             false,
-			"node_name":      s.nodeName,
-			"state":          "error",
-			"schema_version": req.SchemaVersion,
-			"config_version": version,
-			"error": map[string]any{
-				"code":   "UNSUPPORTED_OPERATION",
-				"detail": fmt.Sprintf("unsupported OPA config operation: %s", operation),
-			},
-		})
-		return
-	}
-
-	currentMeta, _ := readMetadata(filepath.Join(stateDir, "current", "metadata.json"))
-	if operation == "check" || operation == "compile" || operation == "compile_apply" {
-		stagedMeta, _ := readMetadata(filepath.Join(stateDir, "staged", "metadata.json"))
-		s.sendNodeConfigResponse(msg, map[string]any{
-			"ok":             true,
-			"node_name":      s.nodeName,
-			"state":          "configured",
-			"schema_version": req.SchemaVersion,
-			"config_version": stagedMeta.Version,
-			"effective_config": map[string]any{
-				"staged": buildPolicySnapshot(stagedMeta),
-			},
-		})
-		return
-	}
-
+	// One write path for the one global policy: SY.admin's /opa/policy*, which applies it on the
+	// motherbee, publishes it and tells every hive. CONFIG_SET here would change and publish the
+	// policy with none of that — and even a "check" stages a policy a later apply would install.
 	s.sendNodeConfigResponse(msg, map[string]any{
-		"ok":             true,
+		"ok":             false,
 		"node_name":      s.nodeName,
-		"state":          "configured",
+		"state":          "error",
 		"schema_version": req.SchemaVersion,
-		"config_version": currentMeta.Version,
-		"effective_config": map[string]any{
-			"current": buildPolicySnapshot(currentMeta),
+		"error": map[string]any{
+			"code":   "UNSUPPORTED_OPERATION",
+			"detail": "the user policy is written only through SY.admin (POST /opa/policy*); CONFIG_SET on SY.opa.rules is read-only",
 		},
 	})
 }
@@ -910,21 +846,6 @@ func buildPolicySnapshot(meta PolicyMetadata) map[string]any {
 		"wasm_size_bytes": meta.WasmSize,
 		"error_detail":    meta.ErrorDetail,
 	}
-}
-
-func inferOpaErrorCode(err error) string {
-	if err == nil {
-		return ""
-	}
-	var oe OpaError
-	if errors.As(err, &oe) {
-		return oe.Code
-	}
-	var oePtr *OpaError
-	if errors.As(err, &oePtr) && oePtr != nil {
-		return oePtr.Code
-	}
-	return "OPA_CONFIG_ERROR"
 }
 
 func errorString(err error, fallback string) string {
@@ -1071,7 +992,7 @@ func (s *Service) handleOpaAction(src string, action string, version uint64, cfg
 				return s.respondConfigError(src, "apply", version, code, detail, broadcast)
 			}
 			if err := s.publishPolicy(); err != nil {
-				return s.respondConfigError(src, action, version, "PUBLISH_FAILED", err.Error(), broadcast)
+				return s.respondConfigError(src, action, version, "PUBLISH_FAILED", publishFailedDetail(err), broadcast)
 			}
 		}
 		if broadcast {
@@ -1094,7 +1015,7 @@ func (s *Service) handleOpaAction(src string, action string, version uint64, cfg
 			return s.respondConfigError(src, action, version, code, detail, broadcast)
 		}
 		if err := s.publishPolicy(); err != nil {
-			return s.respondConfigError(src, action, version, "PUBLISH_FAILED", err.Error(), broadcast)
+			return s.respondConfigError(src, action, version, "PUBLISH_FAILED", publishFailedDetail(err), broadcast)
 		}
 		if broadcast {
 			// "version" echoes the request (the admin correlates on it); the hash names the

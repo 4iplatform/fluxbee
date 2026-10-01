@@ -4073,15 +4073,55 @@ fn resolve_artifact_publisher(
     Ok((option.tenant_id, caller.to_string()))
 }
 
+/// The hives this motherbee joined: one `<hive>/info.yaml` each, written by the orchestrator.
+fn hives_registry_root(ctx: &AdminContext) -> PathBuf {
+    ctx.state_dir
+        .parent()
+        .unwrap_or(ctx.state_dir.as_path())
+        .join("hives")
+}
+
+/// Every hive a global write must reach: the motherbee plus each joined hive the registry calls
+/// `connected`, reachable right now or not. The LSA only says who is reachable now; a hive cut off
+/// keeps enforcing its last policy, so it has to show up as pending, not drop out of the report.
+fn opa_rollout_hives(ctx: &AdminContext) -> Vec<String> {
+    connected_hives_with(&ctx.hive_id, &hives_registry_root(ctx))
+}
+
+fn connected_hives_with(self_hive: &str, registry_root: &Path) -> Vec<String> {
+    let mut hives = vec![self_hive.to_string()];
+    if let Ok(entries) = fs::read_dir(registry_root) {
+        for entry in entries.flatten() {
+            let Ok(raw) = fs::read_to_string(entry.path().join("info.yaml")) else {
+                continue;
+            };
+            let Ok(info) = serde_yaml::from_str::<serde_json::Value>(&raw) else {
+                continue;
+            };
+            if info.get("status").and_then(|value| value.as_str()) != Some("connected") {
+                continue;
+            }
+            if let Some(hive) = info
+                .get("hive_id")
+                .and_then(|value| value.as_str())
+                .map(str::trim)
+                .filter(|hive| !hive.is_empty())
+            {
+                if !hives.iter().any(|known| known == hive) {
+                    hives.push(hive.to_string());
+                }
+            }
+        }
+    }
+    hives.sort();
+    hives
+}
+
 fn resolve_public_edge_node(ctx: &AdminContext) -> Result<String, String> {
     if let Some(edge) = ctx.public_edge_node.as_deref() {
         return validate_public_edge_node(edge).map(str::to_string);
     }
-    let hives_root = ctx
-        .state_dir
-        .parent()
-        .unwrap_or(ctx.state_dir.as_path())
-        .join("hives");
+    let hives_root = hives_registry_root(ctx);
     let mut candidates = Vec::new();
     let entries = fs::read_dir(&hives_root).map_err(|err| {
         format!(
@@ -5819,6 +5859,16 @@ impl WfRulesAction {
 }
 
 impl OpaAction {
+    /// The write the caller asked for, as reported back. as_str() is the step sent to
+    /// SY.opa.rules ("compile" for compile + apply and for check).
+    fn write_name(&self) -> &'static str {
+        match self {
+            OpaAction::CompileApply => "compile_apply",
+            OpaAction::Check => "check",
+            other => other.as_str(),
+        }
+    }
+
     fn as_str(&self) -> &'static str {
         match self {
             OpaAction::Compile => "compile",
@@ -5864,8 +5914,7 @@ struct ConfigResponsePayload {
     version: Option<u64>,
     #[serde(default)]
     status: Option<String>,
-    #[serde(default)]
-    hive: Option<String>,
+    // The answering hive is taken from the router-stamped sender, never from the payload.
     #[serde(default)]
     compile_time_ms: Option<u64>,
     #[serde(default)]
@@ -8187,12 +8236,30 @@ async fn handle_opa_http(
         action.as_str()
     };
     let step_responses = send_opa_action(ctx, client, step, version, None, None, None).await?;
+    let step_answered = !step_responses.is_empty();
     let applied = step_responses
         .iter()
         .find(|r| r.hive == PRIMARY_HIVE_ID && r.status.eq_ignore_ascii_case("ok"))
         .cloned();
     responses.extend(step_responses);
     let Some(applied) = applied else {
+        if !step_answered {
+            // The compile answer must not make this look like a success: the step that changes
+            // the running policy got no answer, so nobody knows whether it changed.
+            let body = serde_json::json!({
+                "status": "error",
+                "version": version,
+                "action": action.write_name(),
+                "responses": responses,
+                "error_code": "TIMEOUT",
+                "error_detail": format!(
+                    "SY.opa.rules@{PRIMARY_HIVE_ID} did not answer the {step} within {OPA_PRIMARY_WAIT_SECS} s; \
+                     the policy may or may not have changed (check GET /hives/{PRIMARY_HIVE_ID}/opa/status)"
+                ),
+            })
+            .to_string();
+            return Ok((error_code_to_http_status("TIMEOUT"), body));
+        }
         return Ok(build_opa_http_response(
             ctx, action, version, responses, primary,
         ));
@@ -8201,53 +8268,71 @@ async fn handle_opa_http(
     // Applied and published on the motherbee: tell every hive, and report who runs it already.
     // The others are pending, not failed — they install it when the published file reaches them.
     let hash = applied.hash.clone().unwrap_or_default();
-    scan_published_opa_policy(ctx, client).await;
-    let expected = expected_hive_sets(ctx, None).effective;
+    scan_published_opa_policy(client).await;
+    let expected = opa_rollout_hives(ctx);
+    let reachable = topology_hives_from_lsa(ctx);
     let mut receiver = client.subscribe(RPC_BC_CONFIG_RESPONSE)?;
     send_opa_sync_notice(client, version, &hash).await?;
     let synced = collect_opa_responses(
         &mut receiver,
         "sync",
         version,
+        Some(&hash),
         &expected,
         Duration::from_secs(OPA_SYNC_WAIT_SECS),
     )
     .await;
     Ok(build_opa_rollout_response(
-        action, version, &hash, responses, synced, &expected,
+        action, version, &hash, responses, synced, &expected, &reachable,
     ))
 }
 
 /// How long a write waits for the motherbee's SY.opa.rules, and then for the other hives to report
-/// they run the published policy (the file travels by Syncthing in a few seconds once scanned).
+/// they run the published policy. A reachable hive answers in a few seconds (it re-checks every
+/// second after the notice); one that does not is reported pending — it converges later on its
+/// own — instead of holding the caller past its own timeout.
 const OPA_PRIMARY_WAIT_SECS: u64 = 30;
-const OPA_SYNC_WAIT_SECS: u64 = 30;
-/// The Syncthing folder that carries the published policy, and how long its scan may take.
+const OPA_SYNC_WAIT_SECS: u64 = 10;
+/// The Syncthing folder that carries the published policy, how long the orchestrator may spend on
+/// its scan, and how long a write waits for that answer (a hint, never a gate).
 const OPA_POLICY_SYNC_FOLDER: &str = "fluxbee-dist-policy";
-const OPA_POLICY_SCAN_TIMEOUT_MS: u64 = 10_000;
+const OPA_POLICY_SCAN_TIMEOUT_MS: u64 = 3_000;
+const OPA_POLICY_SCAN_WAIT_SECS: u64 = 5;
 
 /// Have the motherbee's Syncthing pick up the policy just published now, not when its filesystem
 /// watcher gets to it: a clear only renames and deletes files, which the watcher holds for its
 /// full timeout (measured: 60 s, against 10 s when a new wasm is written). The orchestrator owns
 /// Syncthing; its sync hint scans the folder and waits until it is idle — the same step a runtime
 /// publish takes. Best effort: without it the hives still converge, later.
-async fn scan_published_opa_policy(ctx: &AdminContext, client: &RouterDispatcher) {
+async fn scan_published_opa_policy(client: &RouterDispatcher) {
     let request = serde_json::json!({
         "channel": "dist",
         "folder_id": OPA_POLICY_SYNC_FOLDER,
         "wait_for_idle": true,
         "timeout_ms": OPA_POLICY_SCAN_TIMEOUT_MS,
     });
-    match handle_hive_sync_hint_command(ctx, client, PRIMARY_HIVE_ID.to_string(), request).await {
-        Ok((200, _)) => tracing::info!("opa: published policy scanned on the motherbee"),
-        Ok((status, body)) => tracing::warn!(
-            status,
-            body = %body,
+    // Bounded: with Syncthing unhealthy the orchestrator may take long on this hint, and the
+    // write must not wait for it — the hives still find the file on their own checks.
+    match send_system_request(
+        client,
+        &format!("SY.orchestrator@{PRIMARY_HIVE_ID}"),
+        "SYSTEM_SYNC_HINT",
+        "SYSTEM_SYNC_HINT_RESPONSE",
+        request,
+        Duration::from_secs(OPA_POLICY_SCAN_WAIT_SECS),
+    )
+    .await
+    {
+        Ok(payload) if payload.get("status").and_then(|v| v.as_str()) == Some("ok") => {
+            tracing::info!("opa: published policy scanned on the motherbee")
+        }
+        Ok(payload) => tracing::warn!(
+            payload = %payload,
             "opa: scan of the published policy did not complete; the hives get it on the next scan"
         ),
         Err(err) => tracing::warn!(
             error = %err,
-            "opa: scan of the published policy failed; the hives get it on the next scan"
+            "opa: no answer to the scan of the published policy; the hives get it on the next scan"
         ),
     }
 }
@@ -8259,6 +8344,7 @@ fn build_opa_rollout_response(
     responses: Vec<OpaResponseEntry>,
     synced: Vec<OpaResponseEntry>,
     expected: &[String],
+    reachable: &[String],
 ) -> (u16, String) {
     let running: Vec<String> = synced
         .iter()
@@ -8270,20 +8356,23 @@ fn build_opa_rollout_response(
         .filter(|hive| !running.contains(hive))
         .cloned()
         .collect();
-    // as_str() is the step sent to SY.opa.rules ("compile" for compile + apply); report the write.
-    let action_name = match action {
-        OpaAction::CompileApply => "compile_apply",
-        other => other.as_str(),
-    };
+    // Pending hives the motherbee cannot reach now: they keep their last policy until they
+    // reconnect and Syncthing catches up.
+    let unreachable: Vec<String> = pending
+        .iter()
+        .filter(|hive| !reachable.contains(hive))
+        .cloned()
+        .collect();
     let body = serde_json::json!({
         "status": "ok",
         "version": version,
-        "action": action_name,
+        "action": action.write_name(),
         "hash": hash,
         "responses": responses,
         "hives": synced,
         "running_hives": running,
         "pending": pending,
+        "unreachable": unreachable,
         "converged": pending.is_empty(),
     })
     .to_string();
@@ -14380,6 +14469,7 @@ async fn send_opa_action(
         &mut receiver,
         action,
         version,
+        None,
         &expected,
         Duration::from_secs(OPA_PRIMARY_WAIT_SECS),
     )
@@ -14565,10 +14655,15 @@ fn expected_hive_sets(ctx: &AdminContext, target: Option<&str>) -> OpaExpectedHi
     }
 }
 
+/// Collects SY.opa.rules answers for `action`/`version` until every expected hive answered or
+/// `wait` passed. The hive is the one the router stamped on the sender (`SY.opa.rules@<hive>`),
+/// never the payload's own claim. With `hash`, only answers reporting that policy count — a late
+/// answer to an earlier notice of the same version (clear and rollback are both version 0) does not.
 async fn collect_opa_responses(
     receiver: &mut broadcast::Receiver<Message>,
     action: &str,
     version: u64,
+    hash: Option<&str>,
     expected: &[String],
     wait: Duration,
 ) -> Vec<OpaResponseEntry> {
@@ -14607,10 +14702,20 @@ async fn collect_opa_responses(
         if payload.version.unwrap_or(version) != version {
             continue;
         }
-        let hive = payload
-            .hive
-            .clone()
-            .unwrap_or_else(|| "unknown".to_string());
+        let Some(hive) = msg
+            .routing
+            .src_l2_name
+            .as_deref()
+            .and_then(|name| name.strip_prefix("SY.opa.rules@"))
+            .map(str::to_string)
+        else {
+            continue;
+        };
+        if let Some(hash) = hash {
+            if payload.hash.as_deref().unwrap_or("") != hash {
+                continue;
+            }
+        }
         let entry = OpaResponseEntry {
             hive: hive.clone(),
             status: payload.status.unwrap_or_else(|| "error".to_string()),
@@ -14742,7 +14847,7 @@ fn build_opa_http_response(
     let body = serde_json::json!({
         "status": if status == 200 { "ok" } else { "error" },
         "version": version,
-        "action": action.as_str(),
+        "action": action.write_name(),
         "check_only": action.check_only(),
         "responses": responses,
         "pending": pending,
@@ -15339,6 +15444,7 @@ mod tests {
             &mut rx,
             "compile",
             7,
+            None,
             &["motherbee".to_string()],
             Duration::from_secs(30),
         )
@@ -15348,6 +15454,103 @@ mod tests {
         assert_eq!(responses[0].status, "ok");
         assert_eq!(responses[0].version, Some(7));
         assert_eq!(responses[0].hash.as_deref(), Some("sha256:test"));
+    }
+
+    fn opa_sync_answer(src_l2_name: &str, payload_hive: &str, hash: &str) -> Message {
+        Message {
+            routing: Routing {
+                src: Uuid::new_v4().to_string(),
+                src_l2_name: Some(src_l2_name.to_string()),
+                dst: Destination::Unicast("SY.admin@motherbee".to_string()),
+                ttl: 16,
+                trace_id: Uuid::new_v4().to_string(),
+            },
+            meta: Meta {
+                msg_type: SYSTEM_KIND.to_string(),
+                msg: Some("CONFIG_RESPONSE".to_string()),
+                ..Meta::default()
+            },
+            payload: json!({
+                "subsystem": "opa",
+                "action": "sync",
+                "version": 0,
+                "status": "ok",
+                "hive": payload_hive,
+                "hash": hash
+            }),
+        }
+    }
+
+    /// The rollout counts a hive only when SY.opa.rules of that hive (the name the router stamped)
+    /// reports the announced policy: a node claiming another hive in its payload, or a late answer
+    /// to an earlier version-0 notice (a clear right after a rollback), does not count.
+    #[tokio::test]
+    async fn sync_answers_count_only_from_that_hives_opa_rules_with_the_announced_hash() {
+        let (tx, mut rx) = broadcast::channel(8);
+        // forged: any node can send a CONFIG_RESPONSE claiming to be worker1
+        tx.send(opa_sync_answer("AI.rogue@motherbee", "worker1", ""))
+            .unwrap();
+        // late answer to the previous notice (a rollback, also version 0)
+        tx.send(opa_sync_answer(
+            "SY.opa.rules@egress1",
+            "egress1",
+            "sha256:old",
+        ))
+        .unwrap();
+        // real answers to this notice (a clear: hash "")
+        tx.send(opa_sync_answer("SY.opa.rules@worker1", "anything", ""))
+            .unwrap();
+        tx.send(opa_sync_answer("SY.opa.rules@motherbee", "motherbee", ""))
+            .unwrap();
+        let expected = vec![
+            "egress1".to_string(),
+            "motherbee".to_string(),
+            "worker1".to_string(),
+        ];
+        let responses = collect_opa_responses(
+            &mut rx,
+            "sync",
+            0,
+            Some(""),
+            &expected,
+            Duration::from_millis(200),
+        )
+        .await;
+        let mut hives: Vec<String> = responses.into_iter().map(|r| r.hive).collect();
+        hives.sort();
+        assert_eq!(hives, vec!["motherbee".to_string(), "worker1".to_string()]);
+    }
+
+    /// A joined hive is expected by a rollout whether or not it is reachable now.
+    #[test]
+    fn opa_rollout_expects_every_connected_hive_in_the_registry() {
+        let root = std::env::temp_dir().join(format!("opa-rollout-hives-{}", Uuid::new_v4()));
+        for (dir, info) in [
+            (
+                "worker1",
+                "hive_id: worker1\nrole: worker\nstatus: connected\n",
+            ),
+            (
+                "egress1",
+                "hive_id: egress1\nrole: egress\nstatus: connected\n",
+            ),
+            (
+                "half",
+                "hive_id: half\nrole: worker\nstatus: provisioning\n",
+            ),
+        ] {
+            fs::create_dir_all(root.join(dir)).unwrap();
+            fs::write(root.join(dir).join("info.yaml"), info).unwrap();
+        }
+        assert_eq!(
+            connected_hives_with("motherbee", &root),
+            vec![
+                "egress1".to_string(),
+                "motherbee".to_string(),
+                "worker1".to_string()
+            ]
+        );
+        let _ = fs::remove_dir_all(root);
     }
 
     /// One global policy, eventual convergence: the motherbee applied it, a hive still syncing is
@@ -15376,20 +15579,30 @@ mod tests {
             vec![entry("motherbee")],
             vec![entry("motherbee"), entry("worker1")],
             &expected,
+            &["motherbee".to_string(), "worker1".to_string()],
         );
         assert_eq!(status, 200);
         let body: serde_json::Value = serde_json::from_str(&body).unwrap();
         assert_eq!(body["status"], json!("ok"));
         assert_eq!(body["hash"], json!("sha256:x"));
         assert_eq!(body["pending"], json!(["egress1"]));
+        // egress1 is not in the LSA right now: pending because it cannot be reached.
+        assert_eq!(body["unreachable"], json!(["egress1"]));
         assert_eq!(body["converged"], json!(false));
     }
 
     /// POST /opa/policy sends a "compile" step with apply after it; the rollout reports the write.
     #[test]
     fn opa_rollout_names_the_write_not_the_step() {
-        let (_, body) =
-            build_opa_rollout_response(OpaAction::CompileApply, 7, "sha256:x", vec![], vec![], &[]);
+        let (_, body) = build_opa_rollout_response(
+            OpaAction::CompileApply,
+            7,
+            "sha256:x",
+            vec![],
+            vec![],
+            &[],
+            &[],
+        );
         let body: serde_json::Value = serde_json::from_str(&body).unwrap();
         assert_eq!(body["action"], json!("compile_apply"));
         assert_eq!(body["converged"], json!(true));

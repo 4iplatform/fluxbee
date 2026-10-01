@@ -51,7 +51,7 @@ use fluxbee_sdk::blob::{BlobConfig, BlobRef, BlobToolkit};
 use fluxbee_sdk::payload::TextV1Payload;
 use fluxbee_sdk::protocol::{
     is_system_kind, Destination, Message, Meta, Routing, VaultSecretChangedPayload,
-    VaultSecretInterest, MSG_VAULT_SECRET_CHANGED, SYSTEM_KIND,
+    VaultSecretInterest, MSG_VAULT_SECRET_CHANGED, PRIMARY_HIVE_ID, SYSTEM_KIND,
 };
 use fluxbee_sdk::rpc::{
     AdminCommandRequest, OperationalRouteProfile, RouterDispatcher, RpcError,
@@ -983,7 +983,7 @@ impl FunctionTool for ArchitectSystemGetTool {
                     },
                     "body": {
                         "type": "object",
-                        "description": "Optional JSON object for safe POST checks such as /hives/{hive}/opa/policy/check or /hives/{hive}/nodes/{node_name}/control/config-get"
+                        "description": "Optional JSON object for safe POST checks such as /opa/policy/check or /hives/{hive}/nodes/{node_name}/control/config-get"
                     }
                 },
                 "required": ["path"]
@@ -11769,6 +11769,13 @@ fn architect_admin_action_timeout(action: &str) -> Duration {
         "sync_hint" => {
             Duration::from_secs(env_timeout_secs("JSR_ADMIN_SYNC_HINT_TIMEOUT_SECS").unwrap_or(45))
         }
+        // A global OPA write waits for the motherbee's compile and apply (up to 30 s each when it
+        // does not answer) and then for the other hives (10 s): wait longer than the admin does,
+        // or a write that succeeded is reported as a timeout.
+        "opa_compile_apply" | "opa_compile" | "opa_apply" | "opa_rollback" | "opa_clear"
+        | "opa_check" => {
+            Duration::from_secs(env_timeout_secs("JSR_ADMIN_OPA_TIMEOUT_SECS").unwrap_or(80))
+        }
         "list_admin_actions" | "get_admin_action_help" | "hive_status" => {
             Duration::from_secs(env_timeout_secs("JSR_ADMIN_TIMEOUT_SECS").unwrap_or(5))
         }
@@ -12671,63 +12678,30 @@ fn translate_scmd(
                 params,
             })
         }
-        ("POST", ["hives", hive_id, "opa", "policy", "check"]) => {
+        // One global user policy: every write goes to the motherbee's SY.opa.rules (the admin
+        // refuses any other hive). Reads stay per hive (GET /hives/{hive}/opa/...).
+        ("POST", ["opa", "policy", rest @ ..]) => {
+            let action = match rest {
+                [] => "opa_compile_apply",
+                ["compile"] => "opa_compile",
+                ["apply"] => "opa_apply",
+                ["rollback"] => "opa_rollback",
+                ["clear"] => "opa_clear",
+                ["check"] => "opa_check",
+                _ => {
+                    return Err(
+                        format!("unsupported SCMD path: {} {}", parsed.method, parsed.path).into(),
+                    )
+                }
+            };
             let params = parsed.body.unwrap_or_else(|| json!({}));
             if !params.is_object() {
-                return Err("SCMD body for opa check must be a JSON object".into());
+                return Err(format!("SCMD body for {action} must be a JSON object").into());
             }
             Ok(AdminTranslation {
                 admin_target,
-                action: "opa_check".to_string(),
-                target_hive: (*hive_id).to_string(),
-                params,
-            })
-        }
-        ("POST", ["hives", hive_id, "opa", "policy"]) => {
-            let params = parsed.body.unwrap_or_else(|| json!({}));
-            if !params.is_object() {
-                return Err("SCMD body for opa compile_apply must be a JSON object".into());
-            }
-            Ok(AdminTranslation {
-                admin_target,
-                action: "opa_compile_apply".to_string(),
-                target_hive: (*hive_id).to_string(),
-                params,
-            })
-        }
-        ("POST", ["hives", hive_id, "opa", "policy", "compile"]) => {
-            let params = parsed.body.unwrap_or_else(|| json!({}));
-            if !params.is_object() {
-                return Err("SCMD body for opa compile must be a JSON object".into());
-            }
-            Ok(AdminTranslation {
-                admin_target,
-                action: "opa_compile".to_string(),
-                target_hive: (*hive_id).to_string(),
-                params,
-            })
-        }
-        ("POST", ["hives", hive_id, "opa", "policy", "apply"]) => {
-            let params = parsed.body.unwrap_or_else(|| json!({}));
-            if !params.is_object() {
-                return Err("SCMD body for opa apply must be a JSON object".into());
-            }
-            Ok(AdminTranslation {
-                admin_target,
-                action: "opa_apply".to_string(),
-                target_hive: (*hive_id).to_string(),
-                params,
-            })
-        }
-        ("POST", ["hives", hive_id, "opa", "policy", "rollback"]) => {
-            let params = parsed.body.unwrap_or_else(|| json!({}));
-            if !params.is_object() {
-                return Err("SCMD body for opa rollback must be a JSON object".into());
-            }
-            Ok(AdminTranslation {
-                admin_target,
-                action: "opa_rollback".to_string(),
-                target_hive: (*hive_id).to_string(),
+                action: action.to_string(),
+                target_hive: PRIMARY_HIVE_ID.to_string(),
                 params,
             })
         }
@@ -25707,6 +25681,52 @@ mod tests {
                 "blob_path": "packages/incoming/demo.zip"
             })
         );
+    }
+
+    #[test]
+    fn opa_writes_translate_to_the_global_policy_on_the_primary() {
+        for (path, action) in [
+            ("/opa/policy", "opa_compile_apply"),
+            ("/opa/policy/compile", "opa_compile"),
+            ("/opa/policy/apply", "opa_apply"),
+            ("/opa/policy/rollback", "opa_rollback"),
+            ("/opa/policy/clear", "opa_clear"),
+            ("/opa/policy/check", "opa_check"),
+        ] {
+            let translated = translate_scmd(
+                "motherbee",
+                parse(&format!("curl -X POST {path} -d '{{\"version\":3}}'")),
+            )
+            .unwrap_or_else(|err| panic!("{path}: {err}"));
+            assert_eq!(translated.action, action, "{path}");
+            assert_eq!(translated.target_hive, PRIMARY_HIVE_ID, "{path}");
+            assert_eq!(translated.params, json!({"version": 3}), "{path}");
+        }
+        // Per-hive writes are gone: there is one policy for every hive.
+        assert!(
+            translate_scmd("motherbee", parse("curl -X POST /hives/worker1/opa/policy")).is_err()
+        );
+        // Reads stay per hive.
+        let read =
+            translate_scmd("motherbee", parse("curl -X GET /hives/worker1/opa/status")).unwrap();
+        assert_eq!(read.target_hive, "worker1");
+    }
+
+    /// Contract: every OPA example the admin's catalog advertises must be one the architect can
+    /// run (they drifted apart once: the catalog moved to /opa/policy* and this translator did not).
+    #[test]
+    fn every_opa_example_in_the_admin_catalog_translates() {
+        let admin_src = include_str!("sy_admin.rs");
+        let mut checked = 0;
+        for (idx, _) in admin_src.match_indices("r#\"curl -X POST /opa/policy") {
+            let raw = &admin_src[idx + 3..];
+            let example = &raw[..raw.find("\"#").expect("raw string end")];
+            let translated = translate_scmd("motherbee", parse(example))
+                .unwrap_or_else(|err| panic!("{example}: {err}"));
+            assert!(translated.action.starts_with("opa_"), "{example}");
+            checked += 1;
+        }
+        assert_eq!(checked, 6, "the admin catalog has six OPA write examples");
     }
 
     #[test]

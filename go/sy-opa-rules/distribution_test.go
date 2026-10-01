@@ -217,6 +217,118 @@ func TestUnsatisfiedNoticeIsDroppedAfterItsTTL(t *testing.T) {
 	}
 }
 
+// A publish that fails after the apply leaves the motherbee ahead of every other hive; the
+// motherbee's own sync check publishes again once the cause is gone.
+func TestPrimaryRepublishesAfterAFailedPublish(t *testing.T) {
+	oldDist := policyDistDir
+	defer func() { policyDistDir = oldDist }()
+	base := t.TempDir()
+	blocker := filepath.Join(base, "not-a-dir")
+	if err := os.WriteFile(blocker, []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	policyDistDir = filepath.Join(blocker, "opa") // a file is in the way: publishing fails
+
+	primary, router, state := newTestHive(t, fluxbeesdk.PrimaryHiveID)
+	on(state, func() {
+		if err := ensureDirs(); err != nil {
+			t.Fatalf("dirs: %v", err)
+		}
+		if ok, err := primary.handleOpaAction("admin", "compile_apply", 4, &OpaConfigPayload{Rego: testRego}, false, true); ok || err == nil {
+			t.Fatalf("the publish should have failed: ok=%v err=%v", ok, err)
+		}
+		current, _ := currentPolicy()
+		if current.Hash == "" {
+			t.Fatal("the motherbee should run the policy it applied")
+		}
+		if !sentErrorCode(t, router, "PUBLISH_FAILED") {
+			t.Fatalf("no PUBLISH_FAILED answer: %+v", router.sent)
+		}
+
+		policyDistDir = filepath.Join(base, "opa") // the cause is gone
+		primary.syncOnce()
+		manifest, err := readPolicyManifest()
+		if err != nil || manifest.Hash != current.Hash {
+			t.Fatalf("not re-published: manifest %+v err=%v, want %s", manifest, err, current.Hash)
+		}
+	})
+}
+
+// One write path for the one global policy (SY.admin's /opa/policy*): CONFIG_SET cannot install,
+// stage or publish a policy, whatever the operation.
+func TestConfigSetCannotWriteThePolicy(t *testing.T) {
+	oldDist := policyDistDir
+	policyDistDir = t.TempDir()
+	defer func() { policyDistDir = oldDist }()
+
+	primary, router, state := newTestHive(t, fluxbeesdk.PrimaryHiveID)
+	ops := []string{"compile_apply", "apply", "rollback", "clear", "compile", "check"}
+	on(state, func() {
+		if err := ensureDirs(); err != nil {
+			t.Fatalf("dirs: %v", err)
+		}
+		for _, op := range ops {
+			req, err := fluxbeesdk.BuildNodeConfigSetMessage(
+				"22222222-2222-2222-2222-222222222222",
+				primary.nodeName,
+				fluxbeesdk.NodeConfigSetPayload{
+					NodeName:      primary.nodeName,
+					SchemaVersion: 1,
+					ConfigVersion: 3,
+					ApplyMode:     fluxbeesdk.NodeConfigApplyModeReplace,
+					Config:        map[string]any{"operation": op, "rego": testRego},
+				},
+				fluxbeesdk.NodeConfigEnvelopeOptions{},
+				"trace-config-set-"+op,
+			)
+			if err != nil {
+				t.Fatalf("build config set: %v", err)
+			}
+			origin := fluxbeesdk.PrimaryAdminNode
+			req.Routing.SrcL2Name = &origin
+			primary.handleNodeConfigSet(req)
+		}
+		if current, _ := currentPolicy(); current.Hash != "" {
+			t.Fatal("CONFIG_SET installed a policy")
+		}
+		if staged, _ := readMetadata(filepath.Join(stateDir, "staged", "metadata.json")); staged.Version != 0 || staged.Hash != "" {
+			t.Fatalf("CONFIG_SET staged a policy: %+v", staged)
+		}
+		if _, err := readPolicyManifest(); err == nil {
+			t.Fatal("CONFIG_SET published a policy")
+		}
+	})
+	if len(router.sent) != len(ops) {
+		t.Fatalf("want %d refusals, got %d messages", len(ops), len(router.sent))
+	}
+	for _, msg := range router.sent {
+		var payload struct {
+			OK    bool `json:"ok"`
+			Error struct {
+				Code string `json:"code"`
+			} `json:"error"`
+		}
+		_ = json.Unmarshal(msg.Payload, &payload)
+		if payload.OK || payload.Error.Code != "UNSUPPORTED_OPERATION" {
+			t.Fatalf("want UNSUPPORTED_OPERATION, got %s", string(msg.Payload))
+		}
+	}
+}
+
+func sentErrorCode(t *testing.T, router *stubRouterTransport, code string) bool {
+	t.Helper()
+	for _, msg := range router.sent {
+		var payload map[string]any
+		if err := json.Unmarshal(msg.Payload, &payload); err != nil {
+			continue
+		}
+		if payload["error_code"] == code {
+			return true
+		}
+	}
+	return false
+}
+
 func sentSyncOK(t *testing.T, router *stubRouterTransport, hash string) bool {
 	t.Helper()
 	for _, msg := range router.sent {

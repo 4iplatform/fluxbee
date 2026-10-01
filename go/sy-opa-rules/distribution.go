@@ -188,18 +188,49 @@ func (s *Service) syncFromPublishedPolicy() (bool, error) {
 func (s *Service) syncOnce() {
 	s.policyMu.Lock()
 	defer s.policyMu.Unlock()
-	if !s.isPrimary() {
-		if _, err := s.syncFromPublishedPolicy(); err != nil && !errors.Is(err, errPolicyNotArrived) {
-			s.lastError = err.Error()
-			log.Printf("opa policy sync failed: %v", err)
-		}
+	if s.isPrimary() {
+		s.republishIfStale()
+	} else if _, err := s.syncFromPublishedPolicy(); err != nil && !errors.Is(err, errPolicyNotArrived) {
+		s.lastError = err.Error()
+		log.Printf("opa policy sync failed: %v", err)
 	}
 	s.answerPendingSyncs()
 }
 
-// policySyncLoop keeps a replica on the published policy: at start, on every notice and every
-// policySyncInterval (local check of the synced folder) — every policyNoticeRecheck while a fresh
-// notice waits for its policy.
+// republishIfStale (motherbee) publishes again when the published manifest does not name the
+// policy that runs here — a publish that failed after the apply (disk full, permissions), or a
+// changed synced copy. Must be called with policyMu held.
+func (s *Service) republishIfStale() {
+	current, _ := currentPolicy()
+	if manifest, err := readPolicyManifest(); err == nil && manifest.Hash == current.Hash {
+		s.lastPublishErr = ""
+		return
+	}
+	if err := s.publishPolicy(); err != nil {
+		if err.Error() != s.lastPublishErr {
+			log.Printf("opa policy re-publish failed (retrying every %s): %v", policySyncInterval, err)
+		}
+		s.lastPublishErr = err.Error()
+		s.lastError = publishFailedDetail(err)
+		return
+	}
+	if s.lastPublishErr != "" {
+		log.Printf("opa policy re-published after an earlier failure hash=%s", current.Hash)
+		s.lastError = ""
+	}
+	s.lastPublishErr = ""
+}
+
+// publishFailedDetail says what a failed publish leaves behind: the motherbee already runs the
+// policy; the other hives get it once a retry publishes it.
+func publishFailedDetail(err error) string {
+	return fmt.Sprintf("applied on this hive but not published to the others: %v; "+
+		"publishing is retried every %s", err, policySyncInterval)
+}
+
+// policySyncLoop keeps a replica on the published policy, and the motherbee's publication on what
+// it runs: at start, on every notice and every policySyncInterval (local check of the synced
+// folder) — every policyNoticeRecheck while a fresh notice waits for its policy.
 func (s *Service) policySyncLoop() {
 	timer := time.NewTimer(0)
 	defer timer.Stop()
