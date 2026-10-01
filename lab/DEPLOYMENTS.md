@@ -21,6 +21,7 @@
 
 | Versión | Fecha (ART) | Commit | Alcance | Estado | Rollback |
 |---|---|---|---|---|---|
+| **0.1.42** | 2026-09-30 | `ac301d9` | motherbee + spokes (core) | ✅ live (el escaneo forzado no anda: 0.1.43) | snap `pre-opa-fixes-0-1-42` (las 4 VMs) · `apt install fluxbee=0.1.41` |
 | **0.1.41** | 2026-09-30 | `72891be` | motherbee + spokes (core) + `hive.yaml` | ✅ live | snap `pre-opa-global-0-1-41` (las 4 VMs) · `apt install fluxbee=0.1.40` + `hive.yaml.pre-opa-0-1-41` |
 | **0.1.40** | 2026-09-30 | `43dd174` | motherbee + spokes (core) | ✅ live | snap `pre-purge-order-0-1-40` (las 4 VMs) · `apt install fluxbee=0.1.39` |
 | **0.1.39** | 2026-09-30 | `85c3244` | motherbee + spokes (core) | ✅ live | snap `pre-identity-baseline-0-1-39` (las 4 VMs) · `apt install fluxbee=0.1.38` |
@@ -50,6 +51,26 @@
 > (`dpkg-scanpackages -m`) para rollback, pero su detalle vive en la bitácora, no acá.
 
 ---
+
+## 0.1.42 — OPA: escanear al publicar; solo el admin primario escribe
+
+- **Fecha:** 2026-09-30 (ART) · **Versión anterior:** 0.1.41 · **Commit:** `ac301d9` (FINDINGS
+  A-19, A-20)
+- **Alcance:** motherbee + los tres spokes (core-update).
+- **Qué cambió:** el admin le pide al orquestador del motherbee que escanee `fluxbee-dist-policy`
+  antes del aviso; SY.opa.rules toma CONFIG_CHANGED solo de `SY.admin@motherbee`;
+  SY.config.routes ya no aplica listas que lleguen por CONFIG_CHANGED; la respuesta de
+  `POST /opa/policy` dice `compile_apply`.
+- **Build:** 8 min. **Publish:** ~9 min (42 paquetes). Snapshots `pre-opa-fixes-0-1-42` en las 4 VMs
+  (se borró antes `pre-identity-baseline-0-1-39`).
+- **Install:** motherbee 01:16 UTC; spokes 01:18–01:21. Un primer core-update salió sin hash porque
+  el admin todavía arrancaba: lo rechazaron, sin efecto.
+- **Verificación en vivo:** binarios iguales en los 4 hives, 0 `failed`. **El escaneo no anduvo:** el
+  orquestador rechaza `folder_id: fluxbee-dist-policy` (`INVALID_REQUEST`, solo acepta
+  `fluxbee-dist`) y sin escaneo el watcher retuvo también el apply: a los 33 s solo el motherbee
+  corría la v8, y el clear siguiente se fusionó con él en un único escaneo a los 64 s → se arregla
+  en 0.1.43.
+- **Rollback:** snapshot `pre-opa-fixes-0-1-42` o `apt install fluxbee=0.1.41`.
 
 ## 0.1.41 — una sola policy OPA de usuario en todos los hives, distribuida por Syncthing
 
