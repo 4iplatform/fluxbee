@@ -65,6 +65,8 @@ type HiveConfig struct {
 type OpaConfigPayload struct {
 	Rego       string `json:"rego"`
 	Entrypoint string `json:"entrypoint"`
+	// Hash of the published policy, on a "sync" notice ("" = cleared).
+	Hash string `json:"hash,omitempty"`
 }
 
 type ConfigChangedPayload struct {
@@ -168,6 +170,15 @@ type Service struct {
 	opaRegion          *OpaRegion
 
 	lastError string
+
+	// policyMu serializes every change to the running policy: the message loop and the
+	// published-policy sync loop both make them.
+	policyMu     sync.Mutex
+	pendingSyncs []pendingSync
+	syncKick     chan struct{}
+
+	// testSend captures outgoing messages in unit tests, which run without a router.
+	testSend func(fluxbeesdk.Message)
 }
 
 type RouterStatus struct {
@@ -206,16 +217,10 @@ func main() {
 	if err != nil {
 		log.Fatalf("failed to load hive.yaml: %v", err)
 	}
-	selfIlkID, err := fluxbeesdk.WaitForSelfSystemIlkID(
-		hiveID,
-		defaultNodeBaseName,
-		30*time.Second,
-		250*time.Millisecond,
-	)
-	if err != nil {
-		log.Fatalf("failed to resolve self system ILK from identity SHM: %v", err)
-	}
-	log.Printf("resolved self system ILK from identity SHM: %s", selfIlkID)
+	// Model D' (as the Rust SY nodes): the self ILK is derived from the L2 name, so this node also
+	// starts on hives without SY.identity (ingress, egress), where the identity SHM never appears.
+	selfIlkID := fluxbeesdk.DeterministicSystemIlkID(fmt.Sprintf("%s@%s", defaultNodeBaseName, hiveID))
+	log.Printf("self system ILK computed deterministically: %s", selfIlkID)
 	_ = selfIlkID // cached for future outgoing meta.src_ilk use
 
 	if err := ensureDirs(); err != nil {
@@ -246,11 +251,20 @@ func main() {
 		nodeUUID:  nodeUUID,
 		nodeName:  nodeName,
 		opaRegion: opaRegion,
+		syncKick:  make(chan struct{}, 1),
 	}
 
+	// Every hive starts on its own last policy, whether or not the motherbee is reachable.
 	if err := service.loadCurrentPolicy(); err != nil {
 		log.Printf("failed to load current policy: %v", err)
 	}
+	if service.isPrimary() {
+		// Keep the hand-off in step with what runs here (e.g. first start after an upgrade).
+		if err := service.publishPolicy(); err != nil {
+			log.Printf("failed to publish the current policy: %v", err)
+		}
+	}
+	go service.policySyncLoop()
 
 	go service.runRouter()
 
@@ -654,6 +668,14 @@ func (s *Service) handleMessage(msg fluxbeesdk.Message) {
 				log.Printf("opa config change addressed to hive %s; ignoring (local hive %s)", hive, s.hiveID)
 				return
 			}
+			if strings.EqualFold(payload.Action, "sync") {
+				hash := ""
+				if payload.Config != nil {
+					hash = payload.Config.Hash
+				}
+				s.handleSyncNotice(msg.Routing.Src, payload.Version, hash)
+				return
+			}
 			autoApply := false
 			if payload.AutoApply != nil {
 				autoApply = *payload.AutoApply
@@ -994,8 +1016,16 @@ func (s *Service) handleQuery(msg fluxbeesdk.Message) {
 
 func (s *Service) handleOpaAction(src string, action string, version uint64, cfg *OpaConfigPayload, autoApply bool, broadcast bool) (bool, error) {
 	action = strings.ToLower(action)
+	// One user policy for every hive: the motherbee compiles, applies and publishes it; the other
+	// hives only install what it publishes (syncFromPublishedPolicy) and never compile.
+	if !s.isPrimary() {
+		return s.respondConfigError(src, action, version, "NOT_PRIMARY",
+			"the user policy is compiled and published by "+fluxbeesdk.PrimaryHiveID+" only", broadcast)
+	}
+	s.policyMu.Lock()
+	defer s.policyMu.Unlock()
 	switch action {
-	case "compile", "compile_apply":
+	case "compile", "compile_apply", "check":
 		if cfg == nil || cfg.Rego == "" {
 			return s.respondConfigError(src, action, version, "COMPILE_ERROR", "rego missing", broadcast)
 		}
@@ -1017,67 +1047,42 @@ func (s *Service) handleOpaAction(src string, action string, version uint64, cfg
 		if err := writePolicyFiles(filepath.Join(stateDir, "staged"), wasm, meta, cfg.Rego); err != nil {
 			return s.respondConfigError(src, action, version, "SHM_ERROR", err.Error(), broadcast)
 		}
-		if action == "compile_apply" || autoApply {
+		if action != "check" && (action == "compile_apply" || autoApply) {
 			if err := s.applyPolicy(version); err != nil {
 				code, detail := classifyOpaError(err)
 				return s.respondConfigError(src, "apply", version, code, detail, broadcast)
+			}
+			if err := s.publishPolicy(); err != nil {
+				return s.respondConfigError(src, action, version, "PUBLISH_FAILED", err.Error(), broadcast)
 			}
 		}
 		if broadcast {
 			s.sendConfigResponse(src, action, version, "ok", meta, compileMs)
 		}
 		return true, nil
-	case "apply":
-		if err := s.applyPolicy(version); err != nil {
-			code, detail := classifyOpaError(err)
-			return s.respondConfigError(src, action, version, code, detail, broadcast)
+	case "apply", "rollback", "clear":
+		var err error
+		switch action {
+		case "apply":
+			err = s.applyPolicy(version)
+		case "rollback":
+			err = s.rollbackPolicy()
+		default:
+			err = s.clearPolicy()
+			version = 0
 		}
-		if broadcast {
-			s.sendConfigResponse(src, action, version, "ok", PolicyMetadata{Version: version}, 0)
-		}
-		return true, nil
-	case "rollback":
-		if err := s.rollbackPolicy(); err != nil {
-			code, detail := classifyOpaError(err)
-			return s.respondConfigError(src, action, version, code, detail, broadcast)
-		}
-		if broadcast {
-			s.sendConfigResponse(src, action, version, "ok", PolicyMetadata{Version: version}, 0)
-		}
-		return true, nil
-	case "clear":
-		if err := s.clearPolicy(); err != nil {
-			code, detail := classifyOpaError(err)
-			return s.respondConfigError(src, action, 0, code, detail, broadcast)
-		}
-		if broadcast {
-			s.sendConfigResponse(src, action, 0, "ok", PolicyMetadata{Version: 0}, 0)
-		}
-		return true, nil
-	case "check":
-		if cfg == nil || cfg.Rego == "" {
-			return s.respondConfigError(src, action, version, "COMPILE_ERROR", "rego missing", broadcast)
-		}
-		entrypoint := cfg.Entrypoint
-		if entrypoint == "" {
-			entrypoint = defaultEntrypoint
-		}
-		wasm, hash, compileMs, err := compileRego(cfg.Rego, entrypoint)
 		if err != nil {
-			return s.respondConfigError(src, action, version, "COMPILE_ERROR", err.Error(), broadcast)
+			code, detail := classifyOpaError(err)
+			return s.respondConfigError(src, action, version, code, detail, broadcast)
 		}
-		meta := PolicyMetadata{
-			Version:    version,
-			Hash:       hash,
-			Entrypoint: entrypoint,
-			CompiledAt: time.Now().UTC().Format(time.RFC3339),
-			WasmSize:   len(wasm),
-		}
-		if err := writePolicyFiles(filepath.Join(stateDir, "staged"), wasm, meta, cfg.Rego); err != nil {
-			return s.respondConfigError(src, action, version, "SHM_ERROR", err.Error(), broadcast)
+		if err := s.publishPolicy(); err != nil {
+			return s.respondConfigError(src, action, version, "PUBLISH_FAILED", err.Error(), broadcast)
 		}
 		if broadcast {
-			s.sendConfigResponse(src, action, version, "ok", meta, compileMs)
+			// "version" echoes the request (the admin correlates on it); the hash names the
+			// policy now running ("" after a clear).
+			current, _ := currentPolicy()
+			s.sendConfigResponse(src, action, version, "ok", current, 0)
 		}
 		return true, nil
 	}
@@ -1356,6 +1361,10 @@ func (s *Service) lastRouterPeer() string {
 }
 
 func (s *Service) sendSDK(msg fluxbeesdk.Message) {
+	if s.testSend != nil {
+		s.testSend(msg)
+		return
+	}
 	s.routerDispatcherMu.RLock()
 	dispatcher := s.routerDispatcher
 	s.routerDispatcherMu.RUnlock()

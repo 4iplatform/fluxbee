@@ -45,10 +45,10 @@ func TestHandleNodeConfigGetReturnsContractAndSnapshots(t *testing.T) {
 
 	router := &stubRouterTransport{}
 	service := &Service{
-		hiveID:     "motherbee",
-		nodeUUID:   uuid.MustParse("11111111-1111-1111-1111-111111111111"),
-		nodeName:   "SY.opa.rules@motherbee",
-		routerConn: router,
+		hiveID:   "motherbee",
+		nodeUUID: uuid.MustParse("11111111-1111-1111-1111-111111111111"),
+		nodeName: "SY.opa.rules@motherbee",
+		testSend: router.SendSDK,
 	}
 
 	req, err := fluxbeesdk.BuildNodeConfigGetMessage(
@@ -82,10 +82,10 @@ func TestHandleNodeConfigGetReturnsContractAndSnapshots(t *testing.T) {
 func TestHandleNodeConfigSetRejectsNonObjectConfig(t *testing.T) {
 	router := &stubRouterTransport{}
 	service := &Service{
-		hiveID:     "motherbee",
-		nodeUUID:   uuid.MustParse("11111111-1111-1111-1111-111111111111"),
-		nodeName:   "SY.opa.rules@motherbee",
-		routerConn: router,
+		hiveID:   "motherbee",
+		nodeUUID: uuid.MustParse("11111111-1111-1111-1111-111111111111"),
+		nodeName: "SY.opa.rules@motherbee",
+		testSend: router.SendSDK,
 	}
 
 	req, err := fluxbeesdk.BuildNodeConfigSetMessage(
@@ -130,10 +130,10 @@ func TestHandleNodeConfigSetRejectsNonObjectConfig(t *testing.T) {
 func TestBroadcastOpaReloadUsesSystemBroadcastEnvelope(t *testing.T) {
 	router := &stubRouterTransport{}
 	service := &Service{
-		hiveID:     "motherbee",
-		nodeUUID:   uuid.MustParse("11111111-1111-1111-1111-111111111111"),
-		nodeName:   "SY.opa.rules@motherbee",
-		routerConn: router,
+		hiveID:   "motherbee",
+		nodeUUID: uuid.MustParse("11111111-1111-1111-1111-111111111111"),
+		nodeName: "SY.opa.rules@motherbee",
+		testSend: router.SendSDK,
 	}
 
 	service.broadcastOpaReload(9, "sha256:test")
@@ -180,10 +180,10 @@ func TestHandleQueryGetStatusPreservesQueryResponseShape(t *testing.T) {
 
 	router := &stubRouterTransport{}
 	service := &Service{
-		hiveID:     "motherbee",
-		nodeUUID:   uuid.MustParse("11111111-1111-1111-1111-111111111111"),
-		nodeName:   "SY.opa.rules@motherbee",
-		routerConn: router,
+		hiveID:   "motherbee",
+		nodeUUID: uuid.MustParse("11111111-1111-1111-1111-111111111111"),
+		nodeName: "SY.opa.rules@motherbee",
+		testSend: router.SendSDK,
 	}
 
 	request, err := fluxbeesdk.BuildMessageEnvelope(
@@ -242,10 +242,10 @@ func TestHandleQueryGetPolicyPreservesQueryResponseShape(t *testing.T) {
 
 	router := &stubRouterTransport{}
 	service := &Service{
-		hiveID:     "motherbee",
-		nodeUUID:   uuid.MustParse("11111111-1111-1111-1111-111111111111"),
-		nodeName:   "SY.opa.rules@motherbee",
-		routerConn: router,
+		hiveID:   "motherbee",
+		nodeUUID: uuid.MustParse("11111111-1111-1111-1111-111111111111"),
+		nodeName: "SY.opa.rules@motherbee",
+		testSend: router.SendSDK,
 	}
 
 	request, err := fluxbeesdk.BuildMessageEnvelope(
@@ -286,10 +286,10 @@ func TestHandleQueryGetPolicyPreservesQueryResponseShape(t *testing.T) {
 func TestHandleCommandCompilePolicyInvalidPayloadReturnsCommandResponseError(t *testing.T) {
 	router := &stubRouterTransport{}
 	service := &Service{
-		hiveID:     "motherbee",
-		nodeUUID:   uuid.MustParse("11111111-1111-1111-1111-111111111111"),
-		nodeName:   "SY.opa.rules@motherbee",
-		routerConn: router,
+		hiveID:   "motherbee",
+		nodeUUID: uuid.MustParse("11111111-1111-1111-1111-111111111111"),
+		nodeName: "SY.opa.rules@motherbee",
+		testSend: router.SendSDK,
 	}
 
 	request, err := fluxbeesdk.BuildMessageEnvelope(
@@ -310,6 +310,9 @@ func TestHandleCommandCompilePolicyInvalidPayloadReturnsCommandResponseError(t *
 	if err != nil {
 		t.Fatalf("build command request: %v", err)
 	}
+	// The router stamps the authenticated origin; only the primary admin may command policy.
+	admin := fluxbeesdk.PrimaryAdminNode
+	request.Routing.SrcL2Name = &admin
 
 	service.handleCommand(request)
 
@@ -326,5 +329,33 @@ func TestHandleCommandCompilePolicyInvalidPayloadReturnsCommandResponseError(t *
 	}
 	if payload["status"] != "error" || payload["error_code"] != "COMPILE_ERROR" {
 		t.Fatalf("unexpected command error payload: %+v", payload)
+	}
+}
+
+func TestHandleCommandRefusesOriginsOtherThanThePrimaryAdmin(t *testing.T) {
+	for _, origin := range []string{"", "AI.rogue@motherbee", "SY.admin@worker1"} {
+		router := &stubRouterTransport{}
+		service := &Service{hiveID: "motherbee", nodeName: "SY.opa.rules@motherbee", testSend: router.SendSDK}
+		action := "rollback_policy"
+		request, err := fluxbeesdk.BuildMessageEnvelope(
+			"22222222-2222-2222-2222-222222222222",
+			fluxbeesdk.UnicastDestination(service.nodeName),
+			16, "trace-command", "command", nil, &action, map[string]any{},
+		)
+		if err != nil {
+			t.Fatalf("build command request: %v", err)
+		}
+		if origin != "" {
+			request.Routing.SrcL2Name = &origin
+		}
+		service.handleCommand(request)
+		if len(router.sent) != 1 {
+			t.Fatalf("%q: expected 1 response, got %d", origin, len(router.sent))
+		}
+		var payload map[string]any
+		_ = json.Unmarshal(router.sent[0].Payload, &payload)
+		if payload["error_code"] != "UNAUTHORIZED" {
+			t.Fatalf("%q: want UNAUTHORIZED, got %+v", origin, payload)
+		}
 	}
 }

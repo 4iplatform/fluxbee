@@ -302,14 +302,12 @@ ROOT_TENANT = "tnt:00000000-0000-0000-0000-000000000001"
 
 
 def opa_user_policy_versions():
-    """{hive: current user-policy version} (0 = none), asked hive by hive with a UNICAST query --
-    which reaches the spokes. (The OPA write actions travel as a CONFIG_CHANGED broadcast that,
-    as of 0.1.34, only the motherbee's SY.opa.rules acts on: see logbook 2026-09-28.)"""
+    """{hive: current user-policy version} (0 = none), asked hive by hive. SY.opa.rules runs on
+    EVERY hive: the motherbee compiles the one global policy and the others install it from the
+    synced dist/policy folder (logbook 2026-09-30)."""
     found = {}
     for h in hives_raw():
         hive = h.get("hive_id") or h.get("name")
-        if (h.get("role") or "") not in WF_HIVE_ROLES:  # the roles that run SY.opa.rules too
-            continue
         status, resp = api("GET", "/hives/%s/opa/status" % q(hive))
         for entry in (resp.get("responses") or []) if isinstance(resp, dict) else []:
             inner = entry.get("payload") or {}
@@ -507,9 +505,14 @@ def main():
 
     print("== [5/7] clear the user OPA policy (every hive)")
     api("POST", "/opa/policy/clear", {}, timeout=120)
-    # Judge by the RESULT, asked hive by hive: the broadcast answer times out on hives that do not
-    # act on it, which is not a failure as long as no hive is left with a user policy.
-    left_opa = {h: v for h, v in opa_user_policy_versions().items() if v}
+    # Judge by the RESULT, asked hive by hive. The motherbee clears at once; the other hives clear
+    # when the published (empty) policy reaches them by Syncthing, so give them a moment.
+    deadline = time.time() + 60
+    while True:
+        left_opa = {h: v for h, v in opa_user_policy_versions().items() if v}
+        if not left_opa or time.time() >= deadline:
+            break
+        time.sleep(5)
     opa_fail = [("opa", h, v) for h, v in sorted(left_opa.items())]
     print("  %s" % ("no user policy left on any hive" if not opa_fail
                     else "FAIL user policy still loaded: %s" % left_opa))

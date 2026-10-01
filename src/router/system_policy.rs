@@ -507,7 +507,7 @@ mod tests {
     }
 
     #[test]
-    fn protected_set_is_the_26_actions() {
+    fn protected_set_is_the_27_actions() {
         for action in [
             "SYSTEM_UPDATE",
             "SYSTEM_SYNC_HINT",
@@ -553,10 +553,13 @@ mod tests {
     #[test]
     fn config_changed_only_from_admin_and_orchestrators() {
         // Any local node used to be able to rewrite its hive's routes/VPNs/taps/OPA policy by
-        // sending CONFIG_CHANGED (lab 2026-09-30). The baked rules already admit the two real
-        // emitters: SY.admin (same hive, rule 4) and SY.orchestrator (node_config, rule 3).
+        // sending CONFIG_CHANGED (lab 2026-09-30). Only the primary Admin (to every hive, rule 2 —
+        // e.g. the notice of a newly published user OPA policy) and the orchestrators
+        // (node_config, rule 3) may send it.
         let act = "CONFIG_CHANGED";
-        assert!(authorize_system(act, Some("SY.admin@motherbee"), "motherbee"));
+        for hive in ["motherbee", "worker1", "ingress1", "egress1"] {
+            assert!(authorize_system(act, Some("SY.admin@motherbee"), hive), "{hive}");
+        }
         assert!(authorize_system(act, Some("SY.orchestrator@motherbee"), "motherbee"));
         assert!(authorize_system(act, Some("SY.orchestrator@worker1"), "worker1"));
         for rogue in [
@@ -566,6 +569,8 @@ mod tests {
             Some("SY.opa.rules@motherbee"),
             Some("SY.config.routes@motherbee"),
             Some("SY.identity@motherbee"),
+            Some("SY.wf-rules@motherbee"),
+            Some("SY.admin@worker1"),
             None,
         ] {
             assert!(
@@ -573,8 +578,6 @@ mod tests {
                 "{rogue:?} must not send CONFIG_CHANGED"
             );
         }
-        // Not cross-hive yet: no rule lets the Admin reach another hive's config receivers.
-        assert!(!authorize_system(act, Some("SY.admin@motherbee"), "worker1"));
     }
 
     #[test]

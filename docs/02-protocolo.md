@@ -510,6 +510,12 @@ socket.on('data', (chunk) => {
 
 **CONFIG_CHANGED** es el mensaje unificado para todos los cambios de configuración del sistema. SY.admin (único, en mother hive) es el único que lo emite.
 
+> **Desde 0.1.41:** CONFIG_CHANGED viaja por el ruteo normal (respeta `dst` y `meta.target`, cruza
+> hives) y es una acción SYSTEM protegida: solo `SY.admin@motherbee` (a cualquier hive) y los
+> `SY.orchestrator` (`node_config`) pueden enviarlo. Las rutas/VPN/taps son config de cada hive (el
+> aviso va a `SY.config.routes@<hive>`); OPA de usuario es una sola policy global — ver
+> [`opa-distribution.md`](opa-distribution.md).
+
 #### 7.4.1 Formato
 
 ```json

@@ -259,6 +259,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     );
                     continue;
                 }
+                if payload.hive.is_some() {
+                    // The admin's notice after an add/delete on THIS hive: that action already
+                    // changed this node's config. Re-applying the list it carries could only
+                    // undo a later change that raced it (CONFIG_CHANGED now crosses hives).
+                    tracing::info!(
+                        subsystem = %payload.subsystem,
+                        payload_version = payload.version,
+                        "config changed notice for this hive; already applied"
+                    );
+                    continue;
+                }
                 if payload.version != 0 && payload.version <= sy_config.version {
                     tracing::info!(
                         payload_version = payload.version,

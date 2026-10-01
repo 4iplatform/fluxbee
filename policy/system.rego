@@ -41,8 +41,10 @@ default allow := false
 edge_service_actions := {"EDGE_OPEN_URL", "EDGE_CLOSE_URL", "EDGE_LIST_URLS", "EDGE_PUBLISH_BLOB", "EDGE_UNPUBLISH_BLOB"}
 
 # Live node config and runtime distribution are forwarded directly by the singleton Admin to
-# managed nodes or orchestrators on workers.
-node_control_actions := {"CONFIG_GET", "CONFIG_SET", "SYSTEM_UPDATE", "SYSTEM_SYNC_HINT"}
+# managed nodes or orchestrators on workers. CONFIG_CHANGED carries config its receivers apply
+# (a hive's routes/VPNs/taps, the notice of a newly published user OPA policy): the Admin sends
+# it to every hive (rule 2); orchestrators send node_config ones (rule 3).
+node_control_actions := {"CONFIG_GET", "CONFIG_SET", "SYSTEM_UPDATE", "SYSTEM_SYNC_HINT", "CONFIG_CHANGED"}
 
 # Option B (WAN multi-hop reachability): router-internal vouch action, decided ONLY by rule (6)
 # below. Excluded from the broad control-plane grants (3)/(4) so it is never granted to

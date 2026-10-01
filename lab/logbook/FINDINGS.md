@@ -217,6 +217,23 @@
 - **Validado:** mismo arranque degradado → la réplica loguea `holding its self-owned snapshot`; el
   primario sigue en 25 ILKs, con el del probe.
 
+### A-18 🔴 BACKLOG (decidido, después de OPA) — config-routes: VPN global vía LSA + limpieza
+
+- **Verificado (2026-09-30):** rutas y taps ya son globales en efecto — se cargan en un hive y
+  LSA los reparte (los taps se aplican una sola vez, en el router de origen, con los locales + los
+  de LSA). **VPN no:** LSA transporta las reglas pero el router asigna la VPN solo con las reglas
+  de su propio hive (`assign_vpn` lee el snapshot local; `reassign_vpns` solo reacciona a cambios
+  locales).
+- **Decisión del operador:** VPN global **vía LSA** (asignar con reglas locales + de LSA, como los
+  taps). Cuidado al construirlo: si caducan las reglas de un hive aislado, los nodos vuelven a
+  VPN 0 y el aislamiento falla abierto → conservar las últimas reglas conocidas; orden
+  determinístico si dos hives definen lo mismo; un cambio por LSA dispara `reassign_vpns`.
+- **Limpieza del mismo paquete:** endpoints duplicados (`/routes?hive=` vs `/hives/{h}/routes`),
+  el broadcast post-alta que lleva la lista entera (solo hace falta el aviso). `PUT /config/*` y el
+  broadcast de storage salen con el trabajo de OPA (prerrequisito para que CONFIG_CHANGED cruce
+  hives).
+- **Aceptado:** si se borra un hive, se pierden sus rutas.
+
 ### A-16 🔴 Los espejos receive-only acumulan cambios locales en silencio
 
 - **Qué pasa:** en una carpeta receive-only, Syncthing no propaga ni revierte los cambios locales.

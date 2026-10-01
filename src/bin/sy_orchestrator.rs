@@ -116,6 +116,10 @@ const SYNCTHING_FOLDER_DIST_VENDOR_ID: &str = "fluxbee-dist-vendor";
 /// delivery path for them: there is no `sync_runtime_to_worker` SSH push, so a worker without
 /// this folder can never receive a published package.
 const SYNCTHING_FOLDER_DIST_RUNTIMES_ID: &str = "fluxbee-dist-runtimes";
+/// The global user OPA policy, compiled once on the motherbee (SY.opa.rules publishes the wasm and
+/// a manifest under `dist/policy/opa/`). EVERY hive: each one's SY.opa.rules installs it from its
+/// local copy, so a hive that was down or cut off catches up as soon as the folder syncs.
+const SYNCTHING_FOLDER_DIST_POLICY_ID: &str = "fluxbee-dist-policy";
 const SYNCTHING_FOLDER_TYPE_SEND_RECEIVE: &str = "sendreceive";
 const SYNCTHING_FOLDER_TYPE_SEND_ONLY: &str = "sendonly";
 const SYNCTHING_FOLDER_TYPE_RECEIVE_ONLY: &str = "receiveonly";
@@ -5043,6 +5047,8 @@ fn ensure_dirs(
     fs::create_dir_all(dist.path.join("runtimes"))?;
     fs::create_dir_all(dist.path.join("core").join("bin"))?;
     fs::create_dir_all(dist.path.join("vendor"))?;
+    // Before the ownership pass: on a spoke it is a receive-only folder syncthing must write.
+    fs::create_dir_all(dist.path.join("policy"))?;
     if dist.sync_enabled && dist_sync_tool_is_syncthing(dist) {
         let service_user = resolve_syncthing_service_user(blob)?;
         ensure_owned_tree(&dist.path, &service_user)?;
@@ -7148,6 +7154,11 @@ fn dist_sync_folders_for_role(
         path: dist.path.join("vendor"),
         label: "Fluxbee Dist Vendor",
     });
+    out.push(DistSyncFolder {
+        id: SYNCTHING_FOLDER_DIST_POLICY_ID.to_string(),
+        path: dist.path.join("policy"),
+        label: "Fluxbee Dist Policy",
+    });
     if spoke_role == HiveRole::Worker {
         out.push(DistSyncFolder {
             id: SYNCTHING_FOLDER_DIST_RUNTIMES_ID.to_string(),
@@ -7635,6 +7646,23 @@ fn reconcile_syncthing_folders_xml(
                 updated = next;
             }
         }
+        // Policy goes to every role, like vendor, so it is shared with exactly vendor's peers.
+        // Peer links are written only when a hive joins (add_hive / finalize); without this a
+        // folder added by a later release would stay local on the hives that joined before it.
+        for device_id in syncthing_folder_device_ids(&updated, SYNCTHING_FOLDER_DIST_VENDOR_ID)? {
+            if !valid_syncthing_device_id(&device_id) {
+                continue;
+            }
+            let (next, changed) = ensure_syncthing_folder_has_device(
+                &updated,
+                SYNCTHING_FOLDER_DIST_POLICY_ID,
+                &device_id,
+            )?;
+            if changed && !changed_folders.iter().any(|id| id == SYNCTHING_FOLDER_DIST_POLICY_ID) {
+                changed_folders.push(SYNCTHING_FOLDER_DIST_POLICY_ID.to_string());
+            }
+            updated = next;
+        }
         let (next, legacy_removed) =
             remove_syncthing_folder_from_config_xml(&updated, SYNCTHING_FOLDER_DIST_LEGACY_ID)?;
         if legacy_removed {
@@ -7644,6 +7672,32 @@ fn reconcile_syncthing_folders_xml(
     }
 
     Ok((updated, changed_folders))
+}
+
+/// The devices a folder is shared with (this device included), in document order.
+fn syncthing_folder_device_ids(
+    config_xml: &str,
+    folder_id: &str,
+) -> Result<Vec<String>, OrchestratorError> {
+    let folder_re = Regex::new(r#"(?s)<folder\b[^>]*\bid="([^"]+)"[^>]*>.*?</folder>"#)?;
+    let device_re = Regex::new(r#"<device\b[^>]*\bid="([^"]+)""#)?;
+    for caps in folder_re.captures_iter(config_xml) {
+        if caps.get(1).map(|m| m.as_str()) != Some(folder_id) {
+            continue;
+        }
+        let Some(full) = caps.get(0) else {
+            continue;
+        };
+        let mut out: Vec<String> = Vec::new();
+        for device in device_re.captures_iter(full.as_str()) {
+            let id = device[1].to_string();
+            if !out.contains(&id) {
+                out.push(id);
+            }
+        }
+        return Ok(out);
+    }
+    Ok(Vec::new())
 }
 
 fn reconcile_local_syncthing_folders(
@@ -24862,6 +24916,29 @@ mod tests {
         assert!(validate_system_nodes(&section, HiveRole::Egress).is_ok());
     }
 
+    /// The packaged hive.yaml: every role's system_nodes validates, and every role runs
+    /// SY.opa.rules — the one global user policy is enforced by the router of every hive.
+    #[test]
+    fn packaged_hive_yaml_runs_opa_rules_on_every_role() {
+        let hive: HiveFile =
+            serde_yaml::from_str(include_str!("../../packaging/hive.yaml.example"))
+                .expect("packaged hive.yaml parses");
+        for role in [
+            HiveRole::Motherbee,
+            HiveRole::Worker,
+            HiveRole::Ingress,
+            HiveRole::Egress,
+        ] {
+            let section = system_nodes_for_role(&hive, role)
+                .unwrap_or_else(|err| panic!("{}: {err}", role.as_str()));
+            assert!(
+                section.nodes.iter().any(|node| node == "SY.opa.rules"),
+                "{} must run SY.opa.rules",
+                role.as_str()
+            );
+        }
+    }
+
     #[test]
     fn ingress_role_accepts_sy_edge() {
         let section = RoleSystemNodes {
@@ -25758,6 +25835,69 @@ blob:
             .map(|f| f.id)
             .collect();
         assert!(worker_ids.contains(&SYNCTHING_FOLDER_DIST_RUNTIMES_ID.to_string()));
+    }
+
+    /// The global user OPA policy reaches EVERY hive (ingress and egress route with it too), on
+    /// the same `dist/policy` path at both ends: motherbee sends, the spoke receives.
+    #[test]
+    fn every_role_gets_the_policy_folder() {
+        let dist = sample_dist_config();
+        for role in [HiveRole::Worker, HiveRole::Ingress, HiveRole::Egress] {
+            for is_motherbee in [true, false] {
+                let policy: Vec<DistSyncFolder> = dist_sync_folders_for_role(&dist, role, is_motherbee)
+                    .into_iter()
+                    .filter(|f| f.id == SYNCTHING_FOLDER_DIST_POLICY_ID)
+                    .collect();
+                assert_eq!(policy.len(), 1, "{} (motherbee side: {is_motherbee})", role.as_str());
+                assert_eq!(policy[0].path, dist.path.join("policy"));
+            }
+        }
+    }
+
+    /// A hive that joined before the policy folder existed gets it shared with the peers it
+    /// already shares vendor with — both ends, on the next local reconcile, without a re-join.
+    /// Only policy follows vendor: runtimes stays off a peer that never had it (the ingress).
+    #[test]
+    fn policy_folder_reaches_the_peers_that_joined_before_it() {
+        let dist = sample_dist_config();
+        let mut blob = sample_blob_config();
+        blob.public_sync_enabled = false;
+        let joined_before = format!(
+            "<configuration version=\"37\">
+  <device id=\"{local}\" name=\"sandbox\"></device>
+  <device id=\"{peer}\" name=\"ingress-1\"></device>
+  <folder id=\"{vendor}\" label=\"Fluxbee Dist Vendor\" path=\"/var/lib/fluxbee/dist/vendor\" type=\"sendonly\">
+    <device id=\"{local}\" introducedBy=\"\"/>
+    <device id=\"{peer}\" introducedBy=\"\"/>
+  </folder>
+</configuration>",
+            local = LOCAL_DEVICE_ID,
+            peer = PEER_DEVICE_ID,
+            vendor = SYNCTHING_FOLDER_DIST_VENDOR_ID,
+        );
+        for (is_motherbee, role) in [(true, HiveRole::Motherbee), (false, HiveRole::Ingress)] {
+            let (updated, changed) =
+                reconcile_syncthing_folders_xml(&joined_before, &blob, &dist, is_motherbee, role)
+                    .expect("folder reconcile must succeed");
+            assert!(changed.contains(&SYNCTHING_FOLDER_DIST_POLICY_ID.to_string()));
+            assert_eq!(
+                syncthing_folder_device_ids(&updated, SYNCTHING_FOLDER_DIST_POLICY_ID).unwrap(),
+                vec![LOCAL_DEVICE_ID.to_string(), PEER_DEVICE_ID.to_string()],
+                "motherbee side: {is_motherbee}"
+            );
+            if is_motherbee {
+                assert_eq!(
+                    syncthing_folder_device_ids(&updated, SYNCTHING_FOLDER_DIST_RUNTIMES_ID)
+                        .unwrap(),
+                    vec![LOCAL_DEVICE_ID.to_string()]
+                );
+            }
+            let (again, changed_again) =
+                reconcile_syncthing_folders_xml(&updated, &blob, &dist, is_motherbee, role)
+                    .expect("second reconcile must succeed");
+            assert!(changed_again.is_empty(), "not idempotent: {changed_again:?}");
+            assert_eq!(again, updated);
+        }
     }
 
     /// Migration: the legacy whole-`dist/` folder must be REMOVED, never re-pointed. Re-pointing

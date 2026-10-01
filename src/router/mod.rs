@@ -782,9 +782,9 @@ async fn handle_node(
                         break;
                     }
                     if msg.meta.msg.as_deref() == Some(MSG_CONFIG_CHANGED) {
-                        // This fan-out bypasses the delivery gate, and the receivers APPLY what
-                        // the message carries: stamp the socket's authenticated name and admit
-                        // only the origins the SYSTEM policy allows (the Admin, orchestrators).
+                        // Its receivers APPLY what it carries: stamp the socket's authenticated
+                        // name and admit only the origins the SYSTEM policy allows (the primary
+                        // Admin, orchestrators) before anything else happens.
                         msg.routing.src_l2_name = Some(conn_node_name.clone());
                         if !system_policy::authorize_system(
                             MSG_CONFIG_CHANGED,
@@ -797,6 +797,9 @@ async fn handle_node(
                             );
                             continue;
                         }
+                        // Side effects on this router only: re-read its config SHM and, as the
+                        // gateway, re-advertise at once (a change of this hive's routes/VPNs/taps
+                        // reaches the other hives without waiting for the next LSA).
                         let _ = refresh_config(
                             &config_reader,
                             &static_routes,
@@ -813,49 +816,6 @@ async fn handle_node(
                             true,
                         )
                         .await;
-                        tracing::info!("config changed applied");
-                        if msg
-                            .meta
-                            .action
-                            .as_deref()
-                            .is_some_and(|v| v == "compile" || v == "apply" || v == "rollback")
-                        {
-                            let version = msg
-                                .payload
-                                .get("version")
-                                .and_then(|v| v.as_u64())
-                                .unwrap_or(0);
-                            tracing::info!(
-                                action = ?msg.meta.action,
-                                version = version,
-                                "opa config changed received"
-                            );
-                        }
-                        let src_uuid = Uuid::parse_str(&msg.routing.src).ok();
-                        let local_senders: Vec<mpsc::UnboundedSender<Vec<u8>>> = {
-                            let nodes_guard = nodes.lock().await;
-                            nodes_guard
-                                .iter()
-                                .filter_map(|(uuid, handle)| {
-                                    if src_uuid.is_some_and(|value| value == *uuid) {
-                                        None
-                                    } else {
-                                        Some(handle.sender.clone())
-                                    }
-                                })
-                                .collect()
-                        };
-                        if !local_senders.is_empty() {
-                            let data = serde_json::to_vec(&msg)?;
-                            for sender in local_senders {
-                                let _ = sender.send(data.clone());
-                            }
-                            tracing::info!("config changed forwarded to local nodes");
-                        }
-                        if msg.routing.ttl >= 2 {
-                            broadcast_to_peers(&peers, &msg).await?;
-                            tracing::info!("config changed forwarded to peers");
-                        }
                         if is_gateway {
                             let _ = broadcast_lsa_direct(
                                 router_uuid,
@@ -871,7 +831,15 @@ async fn handle_node(
                             )
                             .await;
                         }
-                        continue;
+                        // Delivery is the normal routing below: it honors dst (a unicast reaches
+                        // only its node, on any hive), meta.target, the VPN rules and the delivery
+                        // gate, and it crosses hives. It used to be a fan-out to every local node
+                        // that ignored dst and never left this hive.
+                        tracing::info!(
+                            dst = ?msg.routing.dst,
+                            target = ?msg.meta.target,
+                            "config changed: local config refreshed, routing it"
+                        );
                     }
                     if msg.meta.msg.as_deref() == Some(MSG_OPA_RELOAD) {
                         let payload: OpaReloadPayload =
@@ -3874,6 +3842,8 @@ async fn handle_peer_message(
         Err(_) => return Ok(()),
     };
     if is_system_kind(&msg.meta.msg_type) && msg.meta.msg.as_deref() == Some(MSG_CONFIG_CHANGED) {
+        // Refresh this router's config, then deliver it like any message from a peer router
+        // (the origin router already admitted it; the delivery gate checks it again).
         let _ = refresh_config(
             config_reader,
             static_routes,
@@ -3890,8 +3860,7 @@ async fn handle_peer_message(
             true,
         )
         .await;
-        tracing::info!("config changed applied (peer)");
-        return Ok(());
+        tracing::info!("config changed: local config refreshed (peer), routing it");
     }
     if is_system_kind(&msg.meta.msg_type) && msg.meta.msg.as_deref() == Some(MSG_OPA_RELOAD) {
         let payload: OpaReloadPayload = serde_json::from_value(msg.payload.clone())?;

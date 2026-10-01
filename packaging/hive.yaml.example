@@ -132,9 +132,13 @@ system_nodes:
       - SY.cognition
       - SY.policy
       - SY.timer
+  # SY.opa.rules runs on EVERY role: the router of each hive enforces the one global user
+  # policy, compiled on the motherbee and synced to all hives (dist/policy). It needs no
+  # SY.identity (its ILK is deterministic), and it is not a readiness gate here.
   egress:
     nodes:
       - SY.config.routes
+      - SY.opa.rules
     wait_for:
       - SY.config.routes
   # ingress hive: the public HTTP(S) door. SY.edge binds :443 (fail-closed on
@@ -143,6 +147,7 @@ system_nodes:
   ingress:
     nodes:
       - SY.config.routes
+      - SY.opa.rules
       - SY.edge
     wait_for:
       - SY.config.routes

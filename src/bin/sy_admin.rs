@@ -14,7 +14,7 @@ use std::future;
 use tar::{Archive, Builder};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
-use tokio::sync::{broadcast, mpsc, oneshot, Mutex};
+use tokio::sync::{broadcast, Mutex};
 use tokio::time;
 use tracing_subscriber::EnvFilter;
 use uuid::Uuid;
@@ -448,25 +448,6 @@ struct VpnConfig {
     priority: Option<u16>,
 }
 
-#[derive(Debug, Deserialize, Serialize, Clone, PartialEq)]
-struct TapConfig {
-    match_src: String,
-    match_dst: String,
-    target: String,
-    #[serde(default = "default_tap_mode")]
-    mode: String,
-    #[serde(default = "default_true")]
-    enabled: bool,
-}
-
-fn default_tap_mode() -> String {
-    "best_effort".to_string()
-}
-
-fn default_true() -> bool {
-    true
-}
-
 fn default_debug_msg_type() -> String {
     "user".to_string()
 }
@@ -595,8 +576,6 @@ async fn main() -> Result<(), AdminError> {
                 err
             })?;
 
-    let (broadcast_tx, broadcast_rx) = mpsc::unbounded_channel::<BroadcastRequest>();
-    let http_tx = broadcast_tx.clone();
     let nats_client = Arc::new(NatsClient::from_client_config(&client_config)?);
     let node_name = admin_node_name(&hive.hive_id);
     // Model D': self-ILK is deterministic from L2 name (no SHM wait).
@@ -663,14 +642,9 @@ async fn main() -> Result<(), AdminError> {
     let sweep_ctx = http_ctx.clone();
     let http_client = router_client.clone();
     tokio::spawn(async move {
-        if let Err(err) = run_http_server(&admin_listen, &http_tx, http_ctx, http_client).await {
+        if let Err(err) = run_http_server(&admin_listen, http_ctx, http_client).await {
             tracing::error!("http server error: {err}");
         }
-    });
-
-    let loop_client = router_client.clone();
-    tokio::spawn(async move {
-        run_broadcast_loop(broadcast_rx, loop_client).await;
     });
 
     let status_client = router_client.clone();
@@ -710,24 +684,6 @@ async fn main() -> Result<(), AdminError> {
     Ok(())
 }
 
-enum BroadcastRequest {
-    Routes {
-        routes: Vec<RouteConfig>,
-        version: u64,
-        ack: oneshot::Sender<Result<(), String>>,
-    },
-    Vpns {
-        vpns: Vec<VpnConfig>,
-        version: u64,
-        ack: oneshot::Sender<Result<(), String>>,
-    },
-    Taps {
-        taps: Vec<TapConfig>,
-        version: u64,
-        ack: oneshot::Sender<Result<(), String>>,
-    },
-}
-
 #[derive(Debug, Deserialize)]
 struct OpaRequest {
     #[serde(default)]
@@ -748,116 +704,6 @@ struct WfRulesRequest {
     payload: serde_json::Map<String, serde_json::Value>,
     #[serde(default, alias = "target")]
     hive: Option<String>,
-}
-
-async fn run_broadcast_loop(
-    mut rx: mpsc::UnboundedReceiver<BroadcastRequest>,
-    client: Arc<RouterDispatcher>,
-) {
-    while let Some(req) = rx.recv().await {
-        let result = match req {
-            BroadcastRequest::Routes {
-                routes,
-                version,
-                ack,
-            } => {
-                match broadcast_config_changed(
-                    &client,
-                    "routes",
-                    None,
-                    None,
-                    version,
-                    serde_json::json!({ "routes": routes }),
-                    None,
-                )
-                .await
-                {
-                    Ok(()) => {
-                        let _ = ack.send(Ok(()));
-                        Ok(())
-                    }
-                    Err(err) => {
-                        let err_msg = err.to_string();
-                        let _ = ack.send(Err(err_msg.clone()));
-                        tracing::warn!(error = %err, "broadcast failed");
-                        Err(err_msg)
-                    }
-                }
-            }
-            BroadcastRequest::Vpns { vpns, version, ack } => {
-                match broadcast_config_changed(
-                    &client,
-                    "vpn",
-                    None,
-                    None,
-                    version,
-                    serde_json::json!({ "vpns": vpns }),
-                    None,
-                )
-                .await
-                {
-                    Ok(()) => {
-                        let _ = ack.send(Ok(()));
-                        Ok(())
-                    }
-                    Err(err) => {
-                        let err_msg = err.to_string();
-                        let _ = ack.send(Err(err_msg.clone()));
-                        tracing::warn!(error = %err, "broadcast failed");
-                        Err(err_msg)
-                    }
-                }
-            }
-            BroadcastRequest::Taps { taps, version, ack } => {
-                match broadcast_config_changed(
-                    &client,
-                    "taps",
-                    None,
-                    None,
-                    version,
-                    serde_json::json!({ "taps": taps }),
-                    None,
-                )
-                .await
-                {
-                    Ok(()) => {
-                        let _ = ack.send(Ok(()));
-                        Ok(())
-                    }
-                    Err(err) => {
-                        let err_msg = err.to_string();
-                        let _ = ack.send(Err(err_msg.clone()));
-                        tracing::warn!(error = %err, "broadcast failed");
-                        Err(err_msg)
-                    }
-                }
-            }
-        };
-        if let Err(err) = result {
-            tracing::warn!(error = %err, "broadcast failed; message dropped");
-        }
-    }
-}
-
-async fn send_broadcast_request<F>(
-    tx: &mpsc::UnboundedSender<BroadcastRequest>,
-    build: F,
-    label: &str,
-) -> Result<(), AdminError>
-where
-    F: FnOnce(oneshot::Sender<Result<(), String>>) -> BroadcastRequest,
-{
-    let (ack_tx, ack_rx) = oneshot::channel::<Result<(), String>>();
-    tx.send(build(ack_tx))
-        .map_err(|_| format!("broadcast queue closed for {label}"))?;
-
-    let timeout_secs = env_timeout_secs("JSR_ADMIN_BROADCAST_TIMEOUT_SECS").unwrap_or(5);
-    match time::timeout(Duration::from_secs(timeout_secs), ack_rx).await {
-        Ok(Ok(Ok(()))) => Ok(()),
-        Ok(Ok(Err(err))) => Err(format!("broadcast failed for {label}: {err}").into()),
-        Ok(Err(_)) => Err(format!("broadcast ack channel closed for {label}").into()),
-        Err(_) => Err(format!("broadcast ack timeout for {label} ({timeout_secs}s)").into()),
-    }
 }
 
 fn load_hive(config_dir: &Path) -> Result<HiveFile, AdminError> {
@@ -2053,11 +1899,12 @@ async fn broadcast_config_changed(
     target_hive: Option<String>,
 ) -> Result<(), AdminError> {
     let sender = client.sender_snapshot();
-    // `target_hive` scopes the change to one hive. A hive-scoped OPA op goes to that hive's
-    // SY.opa.rules; everything else is a broadcast, and the payload names the hive so the
-    // receivers on every other hive ignore it (they must never apply another hive's config).
+    // `target_hive` scopes the change to one hive: it goes to that hive's SY.opa.rules or
+    // SY.config.routes only, and the payload names the hive so no other hive applies it. CONFIG_CHANGED
+    // crosses hives through the normal routing, so an unscoped one is a broadcast to every hive.
     let dst = match (subsystem, target_hive.as_deref()) {
         ("opa", Some(hive)) => Destination::Unicast(format!("SY.opa.rules@{}", hive)),
+        (_, Some(hive)) => Destination::Unicast(format!("SY.config.routes@{}", hive)),
         _ => Destination::Broadcast,
     };
     let msg = Message {
@@ -2099,22 +1946,8 @@ async fn broadcast_config_changed(
 }
 
 #[derive(Debug, Deserialize)]
-struct ConfigUpdate {
-    #[serde(default)]
-    routes: Option<Vec<RouteConfig>>,
-    #[serde(default)]
-    vpns: Option<Vec<VpnConfig>>,
-    #[serde(default)]
-    taps: Option<Vec<TapConfig>>,
-    #[serde(default)]
-    version: Option<u64>,
-}
-
-#[derive(Debug, Deserialize)]
 struct StorageUpdate {
     path: String,
-    #[serde(default)]
-    version: Option<u64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -6116,7 +5949,7 @@ struct ConfigResponsePayload {
     error_detail: Option<String>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 struct OpaResponseEntry {
     hive: String,
     status: String,
@@ -6155,7 +5988,6 @@ const STORAGE_METRICS_NATS_TIMEOUT_SECS: u64 = 8;
 
 async fn run_http_server(
     listen: &str,
-    tx: &mpsc::UnboundedSender<BroadcastRequest>,
     ctx: AdminContext,
     client: Arc<RouterDispatcher>,
 ) -> Result<(), AdminError> {
@@ -6163,11 +5995,10 @@ async fn run_http_server(
     tracing::info!(addr = %listen, "sy.admin http listening");
     loop {
         let (mut stream, _) = listener.accept().await?;
-        let tx = tx.clone();
         let ctx = ctx.clone();
         let client = client.clone();
         tokio::spawn(async move {
-            if let Err(err) = handle_http(&mut stream, &tx, &ctx, &client).await {
+            if let Err(err) = handle_http(&mut stream, &ctx, &client).await {
                 tracing::warn!("http handler error: {err}");
             }
         });
@@ -6176,7 +6007,6 @@ async fn run_http_server(
 
 async fn handle_http(
     stream: &mut tokio::net::TcpStream,
-    tx: &mpsc::UnboundedSender<BroadcastRequest>,
     ctx: &AdminContext,
     // &Arc so the localhost REST layer can call dispatch_internal_admin_command directly (F4a:
     // /channels/* verbs). handle_admin_command/handle_admin_query calls below still work via Deref
@@ -6465,167 +6295,6 @@ async fn handle_http(
                 handle_admin_command(ctx, client, "delete_tap", payload, hive).await?;
             respond_json(stream, status, &resp).await?;
         }
-        ("PUT", "/config/routes") => {
-            let update: ConfigUpdate = serde_json::from_slice(&body)?;
-            let mut broadcasts = usize::from(update.routes.is_some());
-            broadcasts += usize::from(update.vpns.is_some());
-            broadcasts += usize::from(update.taps.is_some());
-            let mut versions = match allocate_config_changed_versions(
-                &ctx.state_dir,
-                "routes",
-                broadcasts,
-                update.version,
-            ) {
-                Ok(versions) => versions,
-                Err(err) => {
-                    let body = serde_json::json!({
-                        "status": "error",
-                        "error_code": "VERSION_MISMATCH",
-                        "error_detail": err.to_string(),
-                    })
-                    .to_string();
-                    respond_json(stream, 409, &body).await?;
-                    return Ok(());
-                }
-            };
-            if let Some(routes) = update.routes {
-                let version = versions.remove(0);
-                if let Err(err) = send_broadcast_request(
-                    tx,
-                    |ack| BroadcastRequest::Routes {
-                        routes,
-                        version,
-                        ack,
-                    },
-                    "routes",
-                )
-                .await
-                {
-                    let body = serde_json::json!({
-                        "status": "error",
-                        "error_code": "CONFIG_BROADCAST_FAILED",
-                        "error_detail": err.to_string(),
-                    })
-                    .to_string();
-                    respond_json(stream, 502, &body).await?;
-                    return Ok(());
-                }
-            }
-            if let Some(vpns) = update.vpns {
-                let version = versions.remove(0);
-                if let Err(err) = send_broadcast_request(
-                    tx,
-                    |ack| BroadcastRequest::Vpns { vpns, version, ack },
-                    "vpns",
-                )
-                .await
-                {
-                    let body = serde_json::json!({
-                        "status": "error",
-                        "error_code": "CONFIG_BROADCAST_FAILED",
-                        "error_detail": err.to_string(),
-                    })
-                    .to_string();
-                    respond_json(stream, 502, &body).await?;
-                    return Ok(());
-                }
-            }
-            if let Some(taps) = update.taps {
-                let version = versions.remove(0);
-                if let Err(err) = send_broadcast_request(
-                    tx,
-                    |ack| BroadcastRequest::Taps { taps, version, ack },
-                    "taps",
-                )
-                .await
-                {
-                    let body = serde_json::json!({
-                        "status": "error",
-                        "error_code": "CONFIG_BROADCAST_FAILED",
-                        "error_detail": err.to_string(),
-                    })
-                    .to_string();
-                    respond_json(stream, 502, &body).await?;
-                    return Ok(());
-                }
-            }
-            tracing::info!("config routes update received");
-            respond_json(stream, 200, r#"{"status":"ok"}"#).await?;
-        }
-        ("PUT", "/config/vpns") => {
-            let update: ConfigUpdate = serde_json::from_slice(&body)?;
-            if let Some(vpns) = update.vpns {
-                let version =
-                    match next_config_changed_version(&ctx.state_dir, "vpn", update.version) {
-                        Ok(version) => version,
-                        Err(err) => {
-                            let body = serde_json::json!({
-                                "status": "error",
-                                "error_code": "VERSION_MISMATCH",
-                                "error_detail": err.to_string(),
-                            })
-                            .to_string();
-                            respond_json(stream, 409, &body).await?;
-                            return Ok(());
-                        }
-                    };
-                if let Err(err) = send_broadcast_request(
-                    tx,
-                    |ack| BroadcastRequest::Vpns { vpns, version, ack },
-                    "vpns",
-                )
-                .await
-                {
-                    let body = serde_json::json!({
-                        "status": "error",
-                        "error_code": "CONFIG_BROADCAST_FAILED",
-                        "error_detail": err.to_string(),
-                    })
-                    .to_string();
-                    respond_json(stream, 502, &body).await?;
-                    return Ok(());
-                }
-            }
-            tracing::info!("config vpns update received");
-            respond_json(stream, 200, r#"{"status":"ok"}"#).await?;
-        }
-        ("PUT", "/config/taps") => {
-            let update: ConfigUpdate = serde_json::from_slice(&body)?;
-            if let Some(taps) = update.taps {
-                let version =
-                    match next_config_changed_version(&ctx.state_dir, "taps", update.version) {
-                        Ok(version) => version,
-                        Err(err) => {
-                            let body = serde_json::json!({
-                                "status": "error",
-                                "error_code": "VERSION_MISMATCH",
-                                "error_detail": err.to_string(),
-                            })
-                            .to_string();
-                            respond_json(stream, 409, &body).await?;
-                            return Ok(());
-                        }
-                    };
-                if let Err(err) = send_broadcast_request(
-                    tx,
-                    |ack| BroadcastRequest::Taps { taps, version, ack },
-                    "taps",
-                )
-                .await
-                {
-                    let body = serde_json::json!({
-                        "status": "error",
-                        "error_code": "CONFIG_BROADCAST_FAILED",
-                        "error_detail": err.to_string(),
-                    })
-                    .to_string();
-                    respond_json(stream, 502, &body).await?;
-                    return Ok(());
-                }
-            }
-            tracing::info!("config taps update received");
-            respond_json(stream, 200, r#"{"status":"ok"}"#).await?;
-        }
         ("GET", "/config/storage") => {
             let (status, resp) = handle_admin_query(ctx, client, "get_storage", None).await?;
             respond_json(stream, status, &resp).await?;
@@ -6636,41 +6305,12 @@ async fn handle_http(
         }
         ("PUT", "/config/storage") => {
             let update: StorageUpdate = serde_json::from_slice(&body)?;
-            let version =
-                match next_config_changed_version(&ctx.state_dir, "storage", update.version) {
-                    Ok(version) => version,
-                    Err(err) => {
-                        let body = serde_json::json!({
-                            "status": "error",
-                            "error_code": "VERSION_MISMATCH",
-                            "error_detail": err.to_string(),
-                        })
-                        .to_string();
-                        respond_json(stream, 409, &body).await?;
-                        return Ok(());
-                    }
-                };
             let storage_payload = serde_json::json!({ "path": update.path });
             let (status, resp) =
-                handle_admin_command(ctx, client, "set_storage", storage_payload.clone(), None)
-                    .await?;
+                handle_admin_command(ctx, client, "set_storage", storage_payload, None).await?;
             if status != 200 {
                 respond_json(stream, status, &resp).await?;
                 return Ok(());
-            }
-
-            if let Err(err) = broadcast_config_changed(
-                client,
-                "storage",
-                None,
-                None,
-                version,
-                storage_payload,
-                None,
-            )
-            .await
-            {
-                tracing::warn!("config storage broadcast failed after set_storage: {err}");
             }
             tracing::info!("config storage update received");
             respond_json(stream, 200, &resp).await?;
@@ -7580,27 +7220,6 @@ async fn handle_hive_paths(
             let (status, resp) = handle_hive_sync_hint_command(ctx, client, hive, payload).await?;
             Ok(Some((status, resp)))
         }
-        ("POST", ["opa", "policy"]) => {
-            let req: OpaRequest = serde_json::from_slice(body)?;
-            let mut req = req;
-            req.hive = Some(hive);
-            let (status, resp) = handle_opa_http(ctx, client, req, OpaAction::CompileApply).await?;
-            Ok(Some((status, resp)))
-        }
-        ("POST", ["opa", "policy", "compile"]) => {
-            let req: OpaRequest = serde_json::from_slice(body)?;
-            let mut req = req;
-            req.hive = Some(hive);
-            let (status, resp) = handle_opa_http(ctx, client, req, OpaAction::Compile).await?;
-            Ok(Some((status, resp)))
-        }
-        ("POST", ["opa", "policy", "apply"]) => {
-            let req: OpaRequest = serde_json::from_slice(body)?;
-            let mut req = req;
-            req.hive = Some(hive);
-            let (status, resp) = handle_opa_http(ctx, client, req, OpaAction::Apply).await?;
-            Ok(Some((status, resp)))
-        }
         ("POST", ["core", "rollback"]) => {
             let payload: serde_json::Value = if body.is_empty() {
                 serde_json::json!({})
@@ -7609,27 +7228,6 @@ async fn handle_hive_paths(
             };
             let (status, resp) =
                 handle_admin_command(ctx, client, "core_rollback", payload, Some(hive)).await?;
-            Ok(Some((status, resp)))
-        }
-        ("POST", ["opa", "policy", "rollback"]) => {
-            let req: OpaRequest = serde_json::from_slice(body)?;
-            let mut req = req;
-            req.hive = Some(hive);
-            let (status, resp) = handle_opa_http(ctx, client, req, OpaAction::Rollback).await?;
-            Ok(Some((status, resp)))
-        }
-        ("POST", ["opa", "policy", "clear"]) => {
-            let req: OpaRequest = serde_json::from_slice(body)?;
-            let mut req = req;
-            req.hive = Some(hive);
-            let (status, resp) = handle_opa_http(ctx, client, req, OpaAction::Clear).await?;
-            Ok(Some((status, resp)))
-        }
-        ("POST", ["opa", "policy", "check"]) => {
-            let req: OpaRequest = serde_json::from_slice(body)?;
-            let mut req = req;
-            req.hive = Some(hive);
-            let (status, resp) = handle_opa_http(ctx, client, req, OpaAction::Check).await?;
             Ok(Some((status, resp)))
         }
         ("GET", ["opa", "policy"]) => {
@@ -8590,6 +8188,22 @@ async fn handle_opa_http(
     mut req: OpaRequest,
     action: OpaAction,
 ) -> Result<(u16, String), AdminError> {
+    // One user policy for every hive (decided 2026-09-30): the motherbee's SY.opa.rules compiles,
+    // applies and publishes it; every other hive installs what it publishes. There is no
+    // per-hive policy to write.
+    if let Some(hive) = normalize_opa_target(req.hive.take()) {
+        if hive != PRIMARY_HIVE_ID {
+            let resp = serde_json::json!({
+                "status": "error",
+                "error_code": "INVALID_REQUEST",
+                "error_detail": format!(
+                    "there is one user policy for every hive; '{hive}' cannot have its own (use /opa/policy)"
+                ),
+            });
+            return Ok((400, resp.to_string()));
+        }
+    }
+    let primary = Some(PRIMARY_HIVE_ID.to_string());
     let version = match action {
         OpaAction::Apply => {
             let Some(version) = req.version else {
@@ -8610,7 +8224,6 @@ async fn handle_opa_http(
         .entrypoint
         .clone()
         .unwrap_or_else(|| "router/target".to_string());
-    let target = normalize_opa_target(req.hive.take());
 
     if action.needs_rego() && req.rego.as_deref().unwrap_or("").is_empty() {
         let resp = serde_json::json!({
@@ -8634,54 +8247,100 @@ async fn handle_opa_http(
             req.rego.clone(),
             Some(entrypoint.clone()),
             action.auto_apply_flag(),
-            target.clone(),
+            primary.clone(),
         )
         .await?;
-        if responses.is_empty() || responses.iter().any(|r| r.status != "ok") {
+        let compiled = !responses.is_empty() && responses.iter().all(|r| r.status == "ok");
+        if !compiled || !action.apply_after() {
             return Ok(build_opa_http_response(
-                ctx, action, version, responses, target,
+                ctx, action, version, responses, primary,
             ));
         }
     }
 
-    if action.apply_after() {
-        let apply_responses = send_opa_action(
-            ctx,
-            client,
-            "apply",
-            version,
-            None,
-            None,
-            None,
-            target.clone(),
-        )
-        .await?;
-        if apply_responses.is_empty() || apply_responses.iter().any(|r| r.status != "ok") {
-            let mut combined = responses;
-            combined.extend(apply_responses);
-            return Ok(build_opa_http_response(
-                ctx, action, version, combined, target,
-            ));
-        }
-        responses.extend(apply_responses);
-    } else if matches!(action, OpaAction::Apply | OpaAction::Rollback | OpaAction::Clear) {
-        let apply_action = action.as_str();
-        responses = send_opa_action(
-            ctx,
-            client,
-            apply_action,
-            version,
-            None,
-            None,
-            None,
-            target.clone(),
-        )
-        .await?;
-    }
+    // The step that changes the running policy, on the motherbee.
+    let step = if action.apply_after() {
+        "apply"
+    } else {
+        action.as_str()
+    };
+    let step_responses = send_opa_action(
+        ctx,
+        client,
+        step,
+        version,
+        None,
+        None,
+        None,
+        primary.clone(),
+    )
+    .await?;
+    let applied = step_responses
+        .iter()
+        .find(|r| r.hive == PRIMARY_HIVE_ID && r.status.eq_ignore_ascii_case("ok"))
+        .cloned();
+    responses.extend(step_responses);
+    let Some(applied) = applied else {
+        return Ok(build_opa_http_response(
+            ctx, action, version, responses, primary,
+        ));
+    };
 
-    Ok(build_opa_http_response(
-        ctx, action, version, responses, target,
+    // Applied and published on the motherbee: tell every hive, and report who runs it already.
+    // The others are pending, not failed — they install it when the published file reaches them.
+    let hash = applied.hash.clone().unwrap_or_default();
+    let expected = expected_hive_sets(ctx, None).effective;
+    let mut receiver = client.subscribe(RPC_BC_CONFIG_RESPONSE)?;
+    send_opa_sync_notice(client, version, &hash).await?;
+    let synced = collect_opa_responses(
+        &mut receiver,
+        "sync",
+        version,
+        &expected,
+        Duration::from_secs(OPA_SYNC_WAIT_SECS),
+    )
+    .await;
+    Ok(build_opa_rollout_response(
+        action, version, &hash, responses, synced, &expected,
     ))
+}
+
+/// How long a write waits for the motherbee's SY.opa.rules, and then for the other hives to report
+/// they run the published policy (the file travels by Syncthing: ~11 s measured).
+const OPA_PRIMARY_WAIT_SECS: u64 = 30;
+const OPA_SYNC_WAIT_SECS: u64 = 30;
+
+fn build_opa_rollout_response(
+    action: OpaAction,
+    version: u64,
+    hash: &str,
+    responses: Vec<OpaResponseEntry>,
+    synced: Vec<OpaResponseEntry>,
+    expected: &[String],
+) -> (u16, String) {
+    let running: Vec<String> = synced
+        .iter()
+        .filter(|entry| entry.status.eq_ignore_ascii_case("ok"))
+        .map(|entry| entry.hive.clone())
+        .collect();
+    let pending: Vec<String> = expected
+        .iter()
+        .filter(|hive| !running.contains(hive))
+        .cloned()
+        .collect();
+    let body = serde_json::json!({
+        "status": "ok",
+        "version": version,
+        "action": action.as_str(),
+        "hash": hash,
+        "responses": responses,
+        "hives": synced,
+        "running_hives": running,
+        "pending": pending,
+        "converged": pending.is_empty(),
+    })
+    .to_string();
+    (200, body)
 }
 
 async fn handle_opa_query(
@@ -9646,11 +9305,11 @@ fn admin_action_summary(action: &str) -> &'static str {
         "delete_tap" => "Delete an installed router-level tap by its (match_src, match_dst, target) natural key.",
         "update" => "Run hive update workflow.",
         "sync_hint" => "Trigger a sync hint workflow.",
-        "opa_compile_apply" => "Compile and apply OPA policy.",
+        "opa_compile_apply" => "Compile the user OPA policy on the motherbee and apply it on every hive (one global policy).",
         "opa_compile" => "Compile OPA policy.",
-        "opa_apply" => "Apply OPA policy.",
-        "opa_rollback" => "Rollback OPA policy.",
-        "opa_clear" => "Remove the user OPA policy (current, staged, backup): back to a fresh install; routers unload it.",
+        "opa_apply" => "Apply the staged user OPA policy on every hive.",
+        "opa_rollback" => "Roll every hive back to the previous user OPA policy.",
+        "opa_clear" => "Remove the user OPA policy on every hive (current, staged, backup): back to a fresh install; routers unload it.",
         "wf_rules_compile_apply" => "Compile and apply a workflow definition through SY.wf-rules.",
         "wf_rules_compile" => "Compile a workflow definition without applying it.",
         "wf_rules_apply" => "Apply the staged workflow definition.",
@@ -9845,7 +9504,7 @@ fn admin_action_path_patterns(action: &str) -> Vec<&'static str> {
         "timer_convert" => vec!["POST /hives/{hive}/timer/convert"],
         "timer_parse" => vec!["POST /hives/{hive}/timer/parse"],
         "timer_format" => vec!["POST /hives/{hive}/timer/format"],
-        "opa_check" => vec!["POST /hives/{hive}/opa/policy/check"],
+        "opa_check" => vec!["POST /opa/policy/check"],
         "run_node" => vec!["POST /hives/{hive}/nodes"],
         "start_node" => vec!["POST /hives/{hive}/nodes/{node_name}/start"],
         "restart_node" => vec!["POST /hives/{hive}/nodes/{node_name}/restart"],
@@ -9866,14 +9525,11 @@ fn admin_action_path_patterns(action: &str) -> Vec<&'static str> {
         "delete_vpn" => vec!["DELETE /hives/{hive}/vpns/{pattern}"],
         "update" => vec!["POST /hives/{hive}/update"],
         "sync_hint" => vec!["POST /hives/{hive}/sync-hint"],
-        "opa_compile_apply" => vec!["POST /hives/{hive}/opa/policy"],
-        "opa_compile" => vec!["POST /hives/{hive}/opa/policy/compile"],
-        "opa_apply" => vec!["POST /hives/{hive}/opa/policy/apply"],
-        "opa_rollback" => vec!["POST /hives/{hive}/opa/policy/rollback"],
-        "opa_clear" => vec![
-            "POST /hives/{hive}/opa/policy/clear",
-            "POST /opa/policy/clear",
-        ],
+        "opa_compile_apply" => vec!["POST /opa/policy"],
+        "opa_compile" => vec!["POST /opa/policy/compile"],
+        "opa_apply" => vec!["POST /opa/policy/apply"],
+        "opa_rollback" => vec!["POST /opa/policy/rollback"],
+        "opa_clear" => vec!["POST /opa/policy/clear"],
         "wf_rules_compile_apply" => vec!["POST /hives/{hive}/wf-rules"],
         "wf_rules_compile" => vec!["POST /hives/{hive}/wf-rules/compile"],
         "wf_rules_apply" => vec!["POST /hives/{hive}/wf-rules/apply"],
@@ -9963,8 +9619,7 @@ fn admin_action_path_params(action: &str) -> Vec<serde_json::Value> {
         | "opa_get_status" | "wf_rules_get_workflow" | "wf_rules_get_status"
         | "wf_rules_list_workflows" | "timer_help" | "timer_list" | "timer_now"
         | "timer_now_in" | "timer_convert" | "timer_parse" | "timer_format" | "update"
-        | "sync_hint" | "opa_compile_apply" | "opa_compile" | "opa_apply"
-        | "opa_rollback" | "opa_clear" | "opa_check" | "wf_rules_compile_apply" | "wf_rules_compile"
+        | "sync_hint" | "wf_rules_compile_apply" | "wf_rules_compile"
         | "wf_rules_apply" | "wf_rules_rollback" | "wf_rules_delete" => vec![
             admin_action_path_param(
             "hive",
@@ -10683,11 +10338,6 @@ fn admin_action_body_optional_fields(action: &str) -> Vec<serde_json::Value> {
                 "Optional explicit version. Otherwise a new version is assigned.",
             ),
         ],
-        "opa_apply" | "opa_rollback" | "opa_clear" => vec![admin_action_body_field(
-            "hive",
-            "string",
-            "Optional explicit hive override for OPA broadcast targeting.",
-        )],
         "wf_rules_compile_apply" => vec![
             admin_action_body_field(
                 "auto_spawn",
@@ -11246,18 +10896,18 @@ fn admin_action_example_scmd(action: &str) -> Option<String> {
             r#"curl -X POST /hives/motherbee/timer/format -d '{"instant_utc_ms":1775771100000,"layout":"2006-01-02 15:04 MST","tz":"America/Argentina/Buenos_Aires"}'"#
         }
         "opa_compile_apply" => {
-            r#"curl -X POST /hives/motherbee/opa/policy -d '{"rego":"package router\n\ndefault target = null\n","entrypoint":"router/target"}'"#
+            r#"curl -X POST /opa/policy -d '{"rego":"package router\n\ndefault target = null\n","entrypoint":"router/target"}'"#
         }
         "opa_compile" => {
-            r#"curl -X POST /hives/motherbee/opa/policy/compile -d '{"rego":"package router\n\ndefault target = null\n","entrypoint":"router/target"}'"#
+            r#"curl -X POST /opa/policy/compile -d '{"rego":"package router\n\ndefault target = null\n","entrypoint":"router/target"}'"#
         }
-        "opa_apply" => r#"curl -X POST /hives/motherbee/opa/policy/apply -d '{"version":12}'"#,
+        "opa_apply" => r#"curl -X POST /opa/policy/apply -d '{"version":12}'"#,
         "opa_rollback" => {
-            r#"curl -X POST /hives/motherbee/opa/policy/rollback -d '{"version":11}'"#
+            r#"curl -X POST /opa/policy/rollback -d '{"version":11}'"#
         }
         "opa_clear" => r#"curl -X POST /opa/policy/clear -d '{}'"#,
         "opa_check" => {
-            r#"curl -X POST /hives/motherbee/opa/policy/check -d '{"rego":"package router\n\ndefault target = null\n","entrypoint":"router/target"}'"#
+            r#"curl -X POST /opa/policy/check -d '{"rego":"package router\n\ndefault target = null\n","entrypoint":"router/target"}'"#
         }
         "wf_rules_get_workflow" => {
             "curl -X GET '/hives/motherbee/wf-rules?workflow_name=invoice'"
@@ -11548,7 +11198,7 @@ fn admin_action_request_notes(action: &str) -> Vec<&'static str> {
             "If version is omitted, rollback uses the implementation default (currently 0).",
         ],
         "opa_clear" => vec![
-            "Removes the USER policy on the target hive(s) -- without a hive in the path/body, on EVERY hive.",
+            "Removes the USER policy on EVERY hive: there is one global policy.",
             "Final: current, staged AND backup are removed, so there is no rollback of a clear.",
             "Routers unload the policy they hold in memory (the SYSTEM authority policy is baked into the router and untouched).",
         ],
@@ -14889,8 +14539,52 @@ async fn send_opa_action(
     )
     .await?;
 
-    let responses = collect_opa_responses(&mut receiver, action, version, &expected).await;
+    let responses = collect_opa_responses(
+        &mut receiver,
+        action,
+        version,
+        &expected,
+        Duration::from_secs(OPA_PRIMARY_WAIT_SECS),
+    )
+    .await;
     Ok(responses)
+}
+
+/// Announce a newly published user policy to every hive's SY.opa.rules — one broadcast that only
+/// they receive (meta.target). Each answers once it runs `hash` ("" = no user policy).
+async fn send_opa_sync_notice(
+    client: &RouterDispatcher,
+    version: u64,
+    hash: &str,
+) -> Result<(), AdminError> {
+    let sender = client.sender_snapshot();
+    let msg = Message {
+        routing: Routing {
+            src: sender.uuid().to_string(),
+            src_l2_name: None,
+            dst: Destination::Broadcast,
+            ttl: 16,
+            trace_id: Uuid::new_v4().to_string(),
+        },
+        meta: Meta {
+            msg_type: SYSTEM_KIND.to_string(),
+            msg: Some(MSG_CONFIG_CHANGED.to_string()),
+            scope: Some(SCOPE_GLOBAL.to_string()),
+            target: Some("SY.opa.rules@*".to_string()),
+            ..Meta::default()
+        },
+        payload: serde_json::to_value(ConfigChangedPayload {
+            subsystem: "opa".to_string(),
+            action: Some("sync".to_string()),
+            auto_apply: None,
+            version,
+            config: serde_json::json!({ "hash": hash }),
+            hive: None,
+        })?,
+    };
+    sender.send(msg).await?;
+    tracing::info!(version, hash, "opa sync notice sent to every hive");
+    Ok(())
 }
 
 async fn send_opa_query(
@@ -15039,10 +14733,11 @@ async fn collect_opa_responses(
     action: &str,
     version: u64,
     expected: &[String],
+    wait: Duration,
 ) -> Vec<OpaResponseEntry> {
     use tokio::time::{timeout, Instant};
 
-    let deadline = Instant::now() + Duration::from_secs(30);
+    let deadline = Instant::now() + wait;
     let mut responses: HashMap<String, OpaResponseEntry> = HashMap::new();
 
     while responses.len() < expected.len() && Instant::now() < deadline {
@@ -15804,12 +15499,47 @@ mod tests {
         .unwrap();
 
         let responses =
-            collect_opa_responses(&mut rx, "compile", 7, &["motherbee".to_string()]).await;
+            collect_opa_responses(&mut rx, "compile", 7, &["motherbee".to_string()], Duration::from_secs(30)).await;
         assert_eq!(responses.len(), 1);
         assert_eq!(responses[0].hive, "motherbee");
         assert_eq!(responses[0].status, "ok");
         assert_eq!(responses[0].version, Some(7));
         assert_eq!(responses[0].hash.as_deref(), Some("sha256:test"));
+    }
+
+    /// One global policy, eventual convergence: the motherbee applied it, a hive still syncing is
+    /// pending — reported, not an error.
+    #[test]
+    fn opa_rollout_reports_pending_hives_without_failing() {
+        let entry = |hive: &str| OpaResponseEntry {
+            hive: hive.to_string(),
+            status: "ok".to_string(),
+            version: Some(7),
+            compile_time_ms: None,
+            wasm_size_bytes: None,
+            hash: Some("sha256:x".to_string()),
+            error_code: None,
+            error_detail: None,
+        };
+        let expected = vec![
+            "egress1".to_string(),
+            "motherbee".to_string(),
+            "worker1".to_string(),
+        ];
+        let (status, body) = build_opa_rollout_response(
+            OpaAction::Apply,
+            7,
+            "sha256:x",
+            vec![entry("motherbee")],
+            vec![entry("motherbee"), entry("worker1")],
+            &expected,
+        );
+        assert_eq!(status, 200);
+        let body: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(body["status"], json!("ok"));
+        assert_eq!(body["hash"], json!("sha256:x"));
+        assert_eq!(body["pending"], json!(["egress1"]));
+        assert_eq!(body["converged"], json!(false));
     }
 
     #[tokio::test]

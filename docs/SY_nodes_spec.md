@@ -307,6 +307,12 @@ fn handle_config_changed(&mut self, msg: &Message) {
 
 ## 3. SY.opa.rules
 
+> **Reemplazado en parte (0.1.41):** hay **una sola policy de usuario para todos los hives**. Solo
+> el SY.opa.rules del motherbee compila, aplica y publica el wasm compilado; los demás hives
+> (ingress y egress incluidos) lo instalan desde la carpeta Syncthing `fluxbee-dist-policy`. Lo que
+> esta sección dice sobre compilar en cada isla, broadcast de compile/apply y operaciones por isla
+> ya no aplica. Ver [`opa-distribution.md`](opa-distribution.md).
+
 Responsable de la compilación, distribución y gestión de policies OPA para routing dinámico.
 
 ### 3.1 Resumen
