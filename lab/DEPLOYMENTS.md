@@ -21,6 +21,7 @@
 
 | Versión | Fecha (ART) | Commit | Alcance | Estado | Rollback |
 |---|---|---|---|---|---|
+| **0.1.45** | 2026-10-01 | `d6505ff` | motherbee + spokes (core) | ✅ live | snap `pre-rule3-0-1-45` (las 4 VMs) · `apt install fluxbee=0.1.44` |
 | **0.1.44** | 2026-10-01 | `005d0ad` | motherbee + spokes (core) | ✅ live | snap `pre-src-binding-0-1-44` (las 4 VMs) · `apt install fluxbee=0.1.43` |
 | **0.1.43** | 2026-09-30 | `2b3abb2` | motherbee + spokes (core) | ✅ live | snap `pre-sync-hint-0-1-43` (las 4 VMs) · `apt install fluxbee=0.1.42` |
 | **0.1.42** | 2026-09-30 | `ac301d9` | motherbee + spokes (core) | ⚠️ superada (escaneo rechazado: 0.1.43) | snap `pre-opa-fixes-0-1-42` (las 4 VMs) · `apt install fluxbee=0.1.41` |
@@ -53,6 +54,30 @@
 > (`dpkg-scanpackages -m`) para rollback, pero su detalle vive en la bitácora, no acá.
 
 ---
+
+## 0.1.45 — el orquestador solo puede mandar lo que reenvía; fuera las señales de config muertas
+
+- **Fecha:** 2026-10-01 (ART) · **Versión anterior:** 0.1.44 · **Commit:** `d6505ff` (FINDINGS A-20)
+- **Alcance:** motherbee + los tres spokes (core-update).
+- **Qué cambió:**
+  - Regla 3 de la policy de sistema: un `SY.orchestrator` solo puede mandar las 16 acciones que de
+    verdad reenvía a otro hive (antes, todas las protegidas salvo edge). Fuera quedan `CONFIG_SET`,
+    `CONFIG_GET`, `CONFIG_CHANGED`, `SYSTEM_UPDATE`, `SYSTEM_SYNC_HINT` e `INVENTORY_REQUEST`.
+  - Borrado lo que nadie usaba: el `CONFIG_CHANGED {node_config}` del orquestador y el flag
+    `notify`; el `CONFIG_RESPONSE` extra después de `set_storage`; el handler de CONFIG_CHANGED de
+    sy-wf-rules (aplicaba workflows sin chequear origen); la rama de io-slack. CONFIG_CHANGED queda
+    con un emisor (SY.admin) y un receptor (SY.opa.rules).
+- **Build:** 17 min. **Publish:** 45 paquetes. Snapshots `pre-rule3-0-1-45` en las 4 VMs (se borró
+  antes `pre-opa-fixes-0-1-42`).
+- **Install:** motherbee 15:22 UTC; spokes 15:25–15:28.
+- **Verificación en vivo:**
+  - Los 4 hives con los mismos binarios; 0 `failed`.
+  - WF en worker1 (lo que más reenvíos entre orquestadores ejercita): creado en 15 s, nodo HEALTHY;
+    borrado limpio en motherbee y worker1 (sin directorio, sin entrada en el manifest, sin unit).
+  - Lecturas entre hives (`nodes`, `versions`) en worker1, ingress1 y egress1: OK.
+  - **0 rechazos del gate y 0 descartes por `routing.src`** en los 4 routers desde el deploy.
+  - OPA: apply, apply y clear `converged` (10 / 6 / 4 s).
+- **Rollback:** snapshot `pre-rule3-0-1-45` o `apt install fluxbee=0.1.44`.
 
 ## 0.1.44 — un nodo solo manda como sí mismo; fuera el aviso de rutas; OPA más rápido
 

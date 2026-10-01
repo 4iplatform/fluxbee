@@ -235,7 +235,7 @@
   (`folder_id` inválido para el canal `dist`: solo aceptaba `fluxbee-dist`, aunque el handler ya
   sabía honrar una carpeta puntual) → 0.1.43 acepta cualquier `fluxbee-dist*`.
 
-### A-20 ✅ RESUELTO (0.1.42) — Con CONFIG_CHANGED cruzando hives, sus receptores aplicaban cualquier origen que el router admitiera
+### A-20 ✅ RESUELTO (0.1.42 + 0.1.45) — Con CONFIG_CHANGED cruzando hives, sus receptores aplicaban cualquier origen que el router admitiera
 
 - **Qué pasaba:** el gate del router para CONFIG_CHANGED admite al admin primario **y a los
   orquestadores** (regla 3 de la policy de sistema). SY.opa.rules aplicaba un compile/apply/clear de
@@ -248,7 +248,10 @@
   solo SY.admin; el orquestador reenvía entre hives SPAWN/KILL/NODE_CONFIG_*/NODE_STATUS/LIST_NODES/
   GET_*/ROLLBACK/ADD_HIVE_FINALIZE/REMOVE_HIVE_CLEANUP y manda CONFIG_CHANGED `node_config` solo a
   nodos de su hive. Con A-22 cerrado, el riesgo que queda es un orquestador comprometido (root en
-  ese hive). **Para decidir (operador):** achicar la regla 3 a lo que usa.
+  ese hive). **Decidido (operador, 2026-10-01): achicarla** → 0.1.45: la regla 3 es la lista de
+  las 16 acciones que el orquestador reenvía, y se borraron las señales de config que nadie usaba
+  (`node_config` + `notify`, el `CONFIG_RESPONSE` de storage, el handler de sy-wf-rules, la rama de
+  io-slack). Validado: ciclo de WF en worker1 y lecturas entre hives sin un solo rechazo del gate.
 - **Arreglo:** SY.opa.rules toma CONFIG_CHANGED solo de `SY.admin@motherbee`, igual que su camino de
   comandos y que el protocolo; SY.config.routes ya no aplica listas que lleguen por CONFIG_CHANGED.
 
