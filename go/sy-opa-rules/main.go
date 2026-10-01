@@ -169,8 +169,11 @@ type Service struct {
 	lastPeer           string
 	opaRegion          *OpaRegion
 
-	lastError string
-	// The last failure to re-publish (motherbee): logged only when it changes.
+	// What get_status reports about this hive's sync. statusMu guards it and is never held across
+	// I/O, so a status query never waits behind a compile or an install.
+	statusMu   sync.Mutex
+	syncStatus syncStatus
+	// The last failure to re-publish (motherbee): logged only when it changes. Under policyMu.
 	lastPublishErr string
 
 	// policyMu serializes every change to the running policy: the message loop and the
@@ -614,16 +617,17 @@ func (s *Service) loadCurrentPolicy() error {
 		return nil
 	}
 	if err := validateWasm(wasm); err != nil {
-		s.lastError = err.Error()
+		s.setLastError(err.Error())
 		s.opaRegion.writeStatus(opaStatusError)
 		log.Printf("opa wasm error: %v", err)
 		return err
 	}
 	if !wasmHasExport(wasm, "opa_eval") {
-		s.lastError = "opa wasm missing export: opa_eval"
+		const detail = "opa wasm missing export: opa_eval"
+		s.setLastError(detail)
 		s.opaRegion.writeStatus(opaStatusError)
-		log.Printf("opa wasm error: %s", s.lastError)
-		return errors.New(s.lastError)
+		log.Printf("opa wasm error: %s", detail)
+		return errors.New(detail)
 	}
 	entrypoint := meta.Entrypoint
 	if entrypoint == "" {
@@ -937,19 +941,7 @@ func (s *Service) handleQuery(msg fluxbeesdk.Message) {
 		}
 		s.sendQueryResponse(msg, action, resp)
 	case "get_status":
-		current, _ := readMetadata(filepath.Join(stateDir, "current", "metadata.json"))
-		staged, _ := readMetadata(filepath.Join(stateDir, "staged", "metadata.json"))
-		resp := map[string]any{
-			"hive":            s.hiveID,
-			"current_version": current.Version,
-			"current_hash":    current.Hash,
-			"staged_version":  staged.Version,
-			"status":          "ok",
-			"last_error":      s.lastError,
-			"wasm_size_bytes": current.WasmSize,
-			"routers":         listRouterStatuses(),
-		}
-		s.sendQueryResponse(msg, action, resp)
+		s.sendQueryResponse(msg, action, s.statusView())
 	}
 }
 
@@ -1116,7 +1108,7 @@ func (s *Service) rollbackPolicy() error {
 }
 
 func (s *Service) respondConfigError(src, action string, version uint64, code, detail string, broadcast bool) (bool, error) {
-	s.lastError = detail
+	s.setLastError(detail)
 	if broadcast {
 		payload := map[string]any{
 			"subsystem":    "opa",
@@ -1222,8 +1214,8 @@ func (s *Service) clearPolicy() error {
 		}
 	}
 	s.opaRegion.writePolicy(0, nil, "")
-	s.lastError = ""
-	s.broadcastOpaReload(0, "sha256:"+strings.Repeat("0", 64))
+	s.setLastError("")
+	s.broadcastOpaReload(0, noPolicyRegionHash)
 	log.Printf("cleared user opa policy (current, staged, backup)")
 	return nil
 }
@@ -1551,10 +1543,15 @@ func writePolicyFiles(dir string, wasm []byte, meta PolicyMetadata, rego string)
 	if err := writePrivateFile(filepath.Join(dir, "policy.wasm"), wasm); err != nil {
 		return err
 	}
+	regoPath := filepath.Join(dir, "policy.rego")
 	if rego != "" {
-		if err := writePrivateFile(filepath.Join(dir, "policy.rego"), []byte(rego)); err != nil {
+		if err := writePrivateFile(regoPath, []byte(rego)); err != nil {
 			return err
 		}
+	} else if err := os.Remove(regoPath); err != nil && !os.IsNotExist(err) {
+		// A policy installed from the motherbee carries no rego: drop one left by an earlier
+		// policy, or it would be served (get_policy) as this policy's source.
+		return err
 	}
 	return writeMetadata(filepath.Join(dir, "metadata.json"), meta)
 }

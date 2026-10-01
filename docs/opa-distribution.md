@@ -70,6 +70,12 @@ network). When the manifest names a policy that is not the one running:
 A manifest with `hash: ""` clears the policy. A hive that was down or partitioned catches up as
 soon as Syncthing brings the folder up to date — no notice needed.
 
+Every check (on every hive, the motherbee included) also verifies that the routers' region holds
+the installed policy, and rewrites it if not — an install cut short after writing the files but
+before the region (disk full) would otherwise leave the routers on the old policy for good. A hive
+that cannot install the published policy (wasm missing or not matching the manifest) says so in its
+status from the first check, and in its log once it has waited a minute.
+
 ## Admin
 
 - Writes are global: `POST /opa/policy` (compile + apply), `/opa/policy/compile`,
@@ -85,7 +91,10 @@ soon as Syncthing brings the folder up to date — no notice needed.
   the notices — a reachable hive answers within seconds; the others converge on their own later.
 - If the motherbee does not answer the step that changes the policy, the write answers `TIMEOUT`
   (504): the policy may or may not have changed — check `GET /hives/motherbee/opa/status`.
-- Reads stay per hive: `GET /hives/{hive}/opa/status` and `/opa/policy`.
+- Reads stay per hive: `GET /hives/{hive}/opa/status` and `/opa/policy`. The status reports what
+  the hive runs (`current_version`, `current_hash`), what was published to it (`published_version`,
+  `published_hash`), what its routers load (`region_hash`), `in_sync` (all three agree), `last_error`
+  and, when it is behind, `waiting: {version, hash, since, reason}`.
 
 ## Security
 
@@ -98,6 +107,7 @@ soon as Syncthing brings the folder up to date — no notice needed.
   local change to the synced copy on a hive (it needs root or the Syncthing user) affects that
   hive only and is never sent back.
 - **Confidentiality:** only the compiled wasm leaves the motherbee. On each hive the installed
-  policy is root-only; the synced copy is readable by the Syncthing service user (`fluxbee`).
+  policy is root-only; the synced copy is readable by the Syncthing service user (the owner of
+  `dist/policy`, set by the orchestrator from `hive.yaml`; published files are handed to it).
   Encrypting the synced copy with a key held in SY.vault is a possible later step (not done).
 - Root on a running hive can always read the policy its routers enforce.

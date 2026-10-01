@@ -7,6 +7,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"syscall"
 	"testing"
 	"time"
 
@@ -313,6 +314,181 @@ func TestConfigSetCannotWriteThePolicy(t *testing.T) {
 			t.Fatalf("want UNSUPPORTED_OPERATION, got %s", string(msg.Payload))
 		}
 	}
+}
+
+// publishOnPrimary compiles and applies testRego (plus extra) on a fresh motherbee and returns
+// the manifest it published.
+func publishOnPrimary(t *testing.T, version uint64, extra string) PolicyManifest {
+	t.Helper()
+	primary, _, state := newTestHive(t, fluxbeesdk.PrimaryHiveID)
+	var published PolicyManifest
+	on(state, func() {
+		if err := ensureDirs(); err != nil {
+			t.Fatalf("dirs: %v", err)
+		}
+		if ok, err := primary.handleOpaAction("admin", "compile_apply", version, &OpaConfigPayload{Rego: testRego + extra}, false, false); !ok || err != nil {
+			t.Fatalf("compile_apply: ok=%v err=%v", ok, err)
+		}
+		var err error
+		if published, err = readPolicyManifest(); err != nil {
+			t.Fatalf("manifest: %v", err)
+		}
+	})
+	return published
+}
+
+// A hive that cannot install the published policy says what it waits for and why, and is back
+// in sync once the file is right.
+func TestAStuckHiveSaysWhyInItsStatus(t *testing.T) {
+	oldDist := policyDistDir
+	policyDistDir = t.TempDir()
+	defer func() { policyDistDir = oldDist }()
+
+	published := publishOnPrimary(t, 5, "")
+	wasmPath := filepath.Join(policyDistDir, published.WasmFile)
+	good, err := os.ReadFile(wasmPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(wasmPath, []byte("not the published wasm"), 0o640); err != nil {
+		t.Fatal(err)
+	}
+
+	replica, _, state := newTestHive(t, "worker1")
+	on(state, func() {
+		if err := ensureDirs(); err != nil {
+			t.Fatalf("dirs: %v", err)
+		}
+		replica.syncOnce()
+		view := replica.statusView()
+		waiting, ok := view["waiting"].(map[string]any)
+		if view["in_sync"] != false || !ok || waiting["hash"] != published.Hash ||
+			waiting["reason"] != "the wasm does not match the manifest's sha256" {
+			t.Fatalf("status while stuck: %+v", view)
+		}
+		if err := os.WriteFile(wasmPath, good, 0o640); err != nil {
+			t.Fatal(err)
+		}
+		replica.syncOnce()
+		view = replica.statusView()
+		if view["in_sync"] != true || view["waiting"] != nil || view["current_hash"] != published.Hash {
+			t.Fatalf("status after the file arrived: %+v", view)
+		}
+	})
+}
+
+// An install that stopped after writing current/ but before the routers' region left the hive
+// reporting a policy its routers did not run; the next check repairs the region.
+func TestTheRoutersRegionIsRepairedAfterAHalfInstall(t *testing.T) {
+	oldDist := policyDistDir
+	policyDistDir = t.TempDir()
+	defer func() { policyDistDir = oldDist }()
+
+	published := publishOnPrimary(t, 6, "")
+	replica, _, state := newTestHive(t, "worker1")
+	on(state, func() {
+		if err := ensureDirs(); err != nil {
+			t.Fatalf("dirs: %v", err)
+		}
+		replica.syncOnce()
+		replica.opaRegion.writePolicy(0, nil, "") // the region never got the new policy
+		if replica.statusView()["in_sync"] != false {
+			t.Fatal("a region behind the installed policy must not report in_sync")
+		}
+		replica.syncOnce()
+		if got := replica.opaRegion.policyHash(); got != published.Hash {
+			t.Fatalf("region holds %s, want %s", got, published.Hash)
+		}
+		if replica.statusView()["in_sync"] != true {
+			t.Fatal("not in sync after the repair")
+		}
+	})
+}
+
+// A policy installed from the motherbee carries no rego: one left by an earlier policy must not
+// survive next to it.
+func TestAnInstallLeavesNoStaleRego(t *testing.T) {
+	oldDist := policyDistDir
+	policyDistDir = t.TempDir()
+	defer func() { policyDistDir = oldDist }()
+
+	publishOnPrimary(t, 7, "")
+	replica, _, state := newTestHive(t, "worker1")
+	on(state, func() {
+		if err := ensureDirs(); err != nil {
+			t.Fatalf("dirs: %v", err)
+		}
+		for _, dir := range []string{"current", "staged"} {
+			if err := os.WriteFile(filepath.Join(stateDir, dir, "policy.rego"), []byte("package old"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+		}
+		replica.syncOnce()
+		if _, err := os.Stat(filepath.Join(stateDir, "current", "policy.rego")); !os.IsNotExist(err) {
+			t.Fatalf("a stale rego survived the install: %v", err)
+		}
+	})
+}
+
+// Published files go to whoever owns the synced folder (the orchestrator gives it to the
+// Syncthing user configured in hive.yaml), not to a fixed user.
+func TestPublishedFilesBelongToTheFolderOwner(t *testing.T) {
+	if os.Geteuid() != 0 {
+		t.Skip("needs root to chown")
+	}
+	oldDist := policyDistDir
+	defer func() { policyDistDir = oldDist }()
+	base := t.TempDir()
+	folder := filepath.Join(base, "policy")
+	if err := os.MkdirAll(folder, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chown(folder, 65534, 65534); err != nil {
+		t.Fatal(err)
+	}
+	policyDistDir = filepath.Join(folder, "opa")
+
+	published := publishOnPrimary(t, 8, "")
+	for _, name := range []string{policyManifestName, published.WasmFile} {
+		info, err := os.Stat(filepath.Join(policyDistDir, name))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if st := info.Sys().(*syscall.Stat_t); st.Uid != 65534 || st.Gid != 65534 {
+			t.Fatalf("%s belongs to %d:%d, want the folder owner 65534:65534", name, st.Uid, st.Gid)
+		}
+	}
+}
+
+// get_status runs on the message goroutine while the sync loop runs on its own: run under -race.
+func TestStatusIsSafeWhileSyncing(t *testing.T) {
+	oldDist := policyDistDir
+	policyDistDir = t.TempDir()
+	defer func() { policyDistDir = oldDist }()
+
+	publishOnPrimary(t, 9, "")
+	replica, _, state := newTestHive(t, "worker1")
+	on(state, func() {
+		if err := ensureDirs(); err != nil {
+			t.Fatalf("dirs: %v", err)
+		}
+		done := make(chan struct{})
+		go func() {
+			defer close(done)
+			for i := 0; i < 50; i++ {
+				replica.syncOnce()
+				replica.setLastError("")
+			}
+		}()
+		for {
+			select {
+			case <-done:
+				return
+			default:
+				_ = replica.statusView()
+			}
+		}
+	})
 }
 
 func sentErrorCode(t *testing.T, router *stubRouterTransport, code string) bool {
