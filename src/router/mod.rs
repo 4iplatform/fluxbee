@@ -35,7 +35,7 @@ use fluxbee_sdk::protocol::{
     LsaNode, LsaPayload, LsaRoute, LsaTap, LsaVpn, Message, Meta, NodeAnnouncePayload,
     NodeHelloPayload, OpaReloadPayload, RouterHelloPayload, WanAcceptPayload, WanHelloPayload,
     WanNegotiated, WanReachabilityEntry, WanReachabilityPayload, WanRejectPayload, WanTimers,
-    MESH_PROTOCOL_VERSION, MSG_CONFIG_CHANGED, MSG_EDGE_CLOSE_URL, MSG_EDGE_CLOSE_URL_RESPONSE, MSG_EDGE_LIST_URLS,
+    MESH_PROTOCOL_VERSION, MSG_EDGE_CLOSE_URL, MSG_EDGE_CLOSE_URL_RESPONSE, MSG_EDGE_LIST_URLS,
     MSG_EDGE_LIST_URLS_RESPONSE, MSG_EDGE_OPEN_URL, MSG_EDGE_OPEN_URL_RESPONSE,
     MSG_EDGE_PUBLISH_BLOB, MSG_EDGE_PUBLISH_BLOB_RESPONSE, MSG_EDGE_UNPUBLISH_BLOB,
     MSG_EDGE_UNPUBLISH_BLOB_RESPONSE, MSG_HELLO, MSG_LSA, MSG_OPA_RELOAD, MSG_TTL_EXCEEDED,
@@ -225,14 +225,10 @@ impl Router {
         let nodes_pd = Arc::clone(&self.nodes);
         let wan_peers_pd = Arc::clone(&self.wan_peers);
         let static_routes_pd = Arc::clone(&self.static_routes);
-        let vpn_rules_pd = Arc::clone(&self.vpn_rules);
-        let tap_rules_pd = Arc::clone(&self.tap_rules);
         let lsa_snapshot_pd = Arc::clone(&self.lsa_snapshot);
         let reachability_pd = Arc::clone(&self.reachability);
         let fib_pd = Arc::clone(&self.fib);
-        let config_reader_pd = Arc::clone(&self.config_reader);
         let lsa_reader_pd = Arc::clone(&self.lsa_reader);
-        let config_version_pd = Arc::clone(&self.config_version);
         let shm_pd = Arc::clone(&self.shm);
         let opa_pd = Arc::clone(&self.opa);
         let opa_reader_pd = Arc::clone(&self.opa_reader);
@@ -258,12 +254,8 @@ impl Router {
                 peer_routers_pd,
                 nodes_pd,
                 wan_peers_pd,
-                config_reader_pd,
                 lsa_reader_pd,
                 static_routes_pd,
-                vpn_rules_pd,
-                tap_rules_pd,
-                config_version_pd,
                 shm_pd,
                 opa_pd,
                 opa_reader_pd,
@@ -304,12 +296,8 @@ impl Router {
         let peer_routers = Arc::clone(&self.peer_routers);
         let nodes = Arc::clone(&self.nodes);
         let fib = Arc::clone(&self.fib);
-        let config_reader = Arc::clone(&self.config_reader);
         let lsa_reader = Arc::clone(&self.lsa_reader);
         let static_routes = Arc::clone(&self.static_routes);
-        let vpn_rules = Arc::clone(&self.vpn_rules);
-        let tap_rules = Arc::clone(&self.tap_rules);
-        let config_version = Arc::clone(&self.config_version);
         let shm = Arc::clone(&self.shm);
         let opa = Arc::clone(&self.opa);
         let opa_reader = Arc::clone(&self.opa_reader);
@@ -336,11 +324,7 @@ impl Router {
                 let peer_routers = Arc::clone(&peer_routers);
                 let nodes = Arc::clone(&nodes);
                 let fib = Arc::clone(&fib);
-                let config_reader = Arc::clone(&config_reader);
                 let static_routes = Arc::clone(&static_routes);
-                let vpn_rules = Arc::clone(&vpn_rules);
-                let tap_rules = Arc::clone(&tap_rules);
-                let config_version = Arc::clone(&config_version);
                 let shm = Arc::clone(&shm);
                 let opa = Arc::clone(&opa);
                 let opa_reader = Arc::clone(&opa_reader);
@@ -362,12 +346,8 @@ impl Router {
                         peer_routers,
                         nodes,
                         fib,
-                        config_reader,
                         lsa_reader,
                         static_routes,
-                        vpn_rules,
-                        tap_rules,
-                        config_version,
                         shm,
                         opa,
                         opa_reader,
@@ -768,6 +748,14 @@ async fn handle_node(
         {
             let frame = frame;
             if let Ok(mut msg) = serde_json::from_slice::<Message>(&frame) {
+                if !frame_is_from_connection(&msg, node_uuid) {
+                    tracing::warn!(
+                        node = %conn_node_name,
+                        claimed_src = %msg.routing.src,
+                        "router dropped a message whose routing.src is not the sending node"
+                    );
+                    continue;
+                }
                 assign_thread_seq_if_missing(&mut msg, &thread_sequences).await;
                 tracing::info!(
                     src = %msg.routing.src,
@@ -780,66 +768,6 @@ async fn handle_node(
                 if is_system_kind(&msg.meta.msg_type) {
                     if msg.meta.msg.as_deref() == Some(MSG_WITHDRAW) {
                         break;
-                    }
-                    if msg.meta.msg.as_deref() == Some(MSG_CONFIG_CHANGED) {
-                        // Its receivers APPLY what it carries: stamp the socket's authenticated
-                        // name and admit only the origins the SYSTEM policy allows (the primary
-                        // Admin, orchestrators) before anything else happens.
-                        msg.routing.src_l2_name = Some(conn_node_name.clone());
-                        if !system_policy::authorize_system(
-                            MSG_CONFIG_CHANGED,
-                            Some(conn_node_name.as_str()),
-                            hive_id,
-                        ) {
-                            tracing::warn!(
-                                src_l2_name = %conn_node_name,
-                                "router dropped CONFIG_CHANGED from unauthorized origin"
-                            );
-                            continue;
-                        }
-                        // Side effects on this router only: re-read its config SHM and, as the
-                        // gateway, re-advertise at once (a change of this hive's routes/VPNs/taps
-                        // reaches the other hives without waiting for the next LSA).
-                        let _ = refresh_config(
-                            &config_reader,
-                            &static_routes,
-                            &vpn_rules,
-                            &tap_rules,
-                            &config_version,
-                            hive_id,
-                            &nodes,
-                            &peer_nodes,
-                            &shm,
-                            &fib,
-                            &lsa_snapshot,
-                            &reachability,
-                            true,
-                        )
-                        .await;
-                        if is_gateway {
-                            let _ = broadcast_lsa_direct(
-                                router_uuid,
-                                router_name,
-                                hive_id,
-                                &nodes,
-                                &peer_nodes,
-                                &static_routes,
-                                &vpn_rules,
-                                &tap_rules,
-                                &wan_peers,
-                                &lsa_seq,
-                            )
-                            .await;
-                        }
-                        // Delivery is the normal routing below: it honors dst (a unicast reaches
-                        // only its node, on any hive), meta.target, the VPN rules and the delivery
-                        // gate, and it crosses hives. It used to be a fan-out to every local node
-                        // that ignored dst and never left this hive.
-                        tracing::info!(
-                            dst = ?msg.routing.dst,
-                            target = ?msg.meta.target,
-                            "config changed: local config refreshed, routing it"
-                        );
                     }
                     if msg.meta.msg.as_deref() == Some(MSG_OPA_RELOAD) {
                         let payload: OpaReloadPayload =
@@ -966,6 +894,15 @@ async fn handle_node(
     writer_task.abort();
     tracing::info!(node = %node_uuid, "node disconnected");
     Ok(())
+}
+
+/// A node speaks only as itself. `handle_message` takes the sender's authoritative L2 name from
+/// `routing.src`, and the delivery gate decides protected SYSTEM actions on that name, so a frame
+/// read from a node's socket must carry that node's own UUID. UUIDs travel in every message: a node
+/// that could set another's would send as it (as the Admin on the motherbee, as the orchestrator on
+/// a worker — seen live on 8.x, 2026-09-30).
+fn frame_is_from_connection(msg: &Message, node_uuid: Uuid) -> bool {
+    Uuid::parse_str(&msg.routing.src).ok() == Some(node_uuid)
 }
 
 async fn handle_message(
@@ -3410,12 +3347,8 @@ async fn peer_discovery_loop(
     peer_routers: Arc<Mutex<std::collections::HashMap<Uuid, PeerRouter>>>,
     nodes: Arc<Mutex<std::collections::HashMap<Uuid, NodeHandle>>>,
     wan_peers: Arc<Mutex<std::collections::HashMap<String, WanPeer>>>,
-    config_reader: Arc<Mutex<Option<ConfigRegionReader>>>,
     lsa_reader: Arc<Mutex<Option<LsaRegionReader>>>,
     static_routes: Arc<Mutex<Vec<StaticRoute>>>,
-    vpn_rules: Arc<Mutex<Vec<VpnAssignment>>>,
-    tap_rules: Arc<Mutex<Vec<TapEntry>>>,
-    config_version: Arc<Mutex<u64>>,
     shm: Arc<Mutex<RouterRegionWriter>>,
     opa: Arc<Mutex<OpaResolver>>,
     opa_reader: Arc<Mutex<Option<OpaRegionReader>>>,
@@ -3477,10 +3410,8 @@ async fn peer_discovery_loop(
                     let nodes = Arc::clone(&nodes);
                     let wan_peers = Arc::clone(&wan_peers);
                     let fib = Arc::clone(&fib);
-                    let config_reader = Arc::clone(&config_reader);
                     let lsa_reader = Arc::clone(&lsa_reader);
                     let static_routes = Arc::clone(&static_routes);
-                    let config_version = Arc::clone(&config_version);
                     let shm = Arc::clone(&shm);
                     let opa = Arc::clone(&opa);
                     let opa_reader = Arc::clone(&opa_reader);
@@ -3488,8 +3419,6 @@ async fn peer_discovery_loop(
                     let hive_id = hive_id.to_string();
                     let self_router_name = self_router_name.to_string();
                     let self_shm_name = self_shm_name.to_string();
-                    let vpn_rules = Arc::clone(&vpn_rules);
-                    let tap_rules = Arc::clone(&tap_rules);
                     let lsa_snapshot = Arc::clone(&lsa_snapshot);
                     let reachability = Arc::clone(&reachability);
                     let thread_sequences = Arc::clone(&thread_sequences);
@@ -3508,12 +3437,8 @@ async fn peer_discovery_loop(
                             peer_routers,
                             nodes,
                             wan_peers,
-                            config_reader,
                             lsa_reader,
                             static_routes,
-                            vpn_rules,
-                            tap_rules,
-                            config_version,
                             shm,
                             opa,
                             opa_reader,
@@ -3612,12 +3537,8 @@ async fn connect_to_peer(
     peer_routers: Arc<Mutex<std::collections::HashMap<Uuid, PeerRouter>>>,
     nodes: Arc<Mutex<std::collections::HashMap<Uuid, NodeHandle>>>,
     wan_peers: Arc<Mutex<std::collections::HashMap<String, WanPeer>>>,
-    config_reader: Arc<Mutex<Option<ConfigRegionReader>>>,
     lsa_reader: Arc<Mutex<Option<LsaRegionReader>>>,
     static_routes: Arc<Mutex<Vec<StaticRoute>>>,
-    vpn_rules: Arc<Mutex<Vec<VpnAssignment>>>,
-    tap_rules: Arc<Mutex<Vec<TapEntry>>>,
-    config_version: Arc<Mutex<u64>>,
     shm: Arc<Mutex<RouterRegionWriter>>,
     opa: Arc<Mutex<OpaResolver>>,
     opa_reader: Arc<Mutex<Option<OpaRegionReader>>>,
@@ -3674,12 +3595,8 @@ async fn connect_to_peer(
                         &peer_routers,
                         &nodes,
                         &wan_peers,
-                        &config_reader,
                         &lsa_reader,
                         &static_routes,
-                        &vpn_rules,
-                        &tap_rules,
-                        &config_version,
                         &shm,
                         &opa,
                         &opa_reader,
@@ -3715,12 +3632,8 @@ async fn handle_peer_incoming(
     peer_routers: Arc<Mutex<std::collections::HashMap<Uuid, PeerRouter>>>,
     nodes: Arc<Mutex<std::collections::HashMap<Uuid, NodeHandle>>>,
     fib: Arc<Mutex<Vec<FibEntry>>>,
-    config_reader: Arc<Mutex<Option<ConfigRegionReader>>>,
     lsa_reader: Arc<Mutex<Option<LsaRegionReader>>>,
     static_routes: Arc<Mutex<Vec<StaticRoute>>>,
-    vpn_rules: Arc<Mutex<Vec<VpnAssignment>>>,
-    tap_rules: Arc<Mutex<Vec<TapEntry>>>,
-    config_version: Arc<Mutex<u64>>,
     shm: Arc<Mutex<RouterRegionWriter>>,
     opa: Arc<Mutex<OpaResolver>>,
     opa_reader: Arc<Mutex<Option<OpaRegionReader>>>,
@@ -3775,12 +3688,8 @@ async fn handle_peer_incoming(
                         &peer_routers,
                         &nodes,
                         &wan_peers,
-                        &config_reader,
                         &lsa_reader,
                         &static_routes,
-                        &vpn_rules,
-                        &tap_rules,
-                        &config_version,
                         &shm,
                         &opa,
                         &opa_reader,
@@ -3816,12 +3725,8 @@ async fn handle_peer_message(
     peer_routers: &Arc<Mutex<std::collections::HashMap<Uuid, PeerRouter>>>,
     nodes: &Arc<Mutex<std::collections::HashMap<Uuid, NodeHandle>>>,
     wan_peers: &Arc<Mutex<std::collections::HashMap<String, WanPeer>>>,
-    config_reader: &Arc<Mutex<Option<ConfigRegionReader>>>,
     lsa_reader: &Arc<Mutex<Option<LsaRegionReader>>>,
     static_routes: &Arc<Mutex<Vec<StaticRoute>>>,
-    vpn_rules: &Arc<Mutex<Vec<VpnAssignment>>>,
-    tap_rules: &Arc<Mutex<Vec<TapEntry>>>,
-    config_version: &Arc<Mutex<u64>>,
     shm: &Arc<Mutex<RouterRegionWriter>>,
     opa: &Arc<Mutex<OpaResolver>>,
     opa_reader: &Arc<Mutex<Option<OpaRegionReader>>>,
@@ -3841,27 +3746,6 @@ async fn handle_peer_message(
         Ok(uuid) => uuid,
         Err(_) => return Ok(()),
     };
-    if is_system_kind(&msg.meta.msg_type) && msg.meta.msg.as_deref() == Some(MSG_CONFIG_CHANGED) {
-        // Refresh this router's config, then deliver it like any message from a peer router
-        // (the origin router already admitted it; the delivery gate checks it again).
-        let _ = refresh_config(
-            config_reader,
-            static_routes,
-            vpn_rules,
-            tap_rules,
-            config_version,
-            hive_id,
-            nodes,
-            peer_nodes,
-            shm,
-            fib,
-            lsa_snapshot,
-            reachability,
-            true,
-        )
-        .await;
-        tracing::info!("config changed: local config refreshed (peer), routing it");
-    }
     if is_system_kind(&msg.meta.msg_type) && msg.meta.msg.as_deref() == Some(MSG_OPA_RELOAD) {
         let payload: OpaReloadPayload = serde_json::from_value(msg.payload.clone())?;
         apply_opa_reload(opa, opa_reader, shm, hive_id, &payload).await;
@@ -7410,6 +7294,59 @@ mod tests {
         );
     }
 
+    /// The stamped src_l2_name is only as good as the UUID it is looked up by: a node's socket may
+    /// only carry that node's own `routing.src`. Seen live on 8.x (2026-09-30): a probe node sent a
+    /// protected NODE_STATUS_GET with the Admin's UUID and SY.config.routes answered it.
+    #[test]
+    fn a_node_cannot_send_as_another_node() {
+        let node = Uuid::new_v4();
+        let mut msg = Message {
+            routing: Routing {
+                src: node.to_string(),
+                src_l2_name: None,
+                dst: Destination::Unicast("SY.config.routes@motherbee".to_string()),
+                ttl: 16,
+                trace_id: Uuid::new_v4().to_string(),
+            },
+            meta: Meta {
+                msg_type: SYSTEM_KIND.to_string(),
+                ..Meta::default()
+            },
+            payload: serde_json::json!({}),
+        };
+        assert!(frame_is_from_connection(&msg, node));
+        msg.routing.src = node.to_string().to_uppercase();
+        assert!(
+            frame_is_from_connection(&msg, node),
+            "same UUID, other spelling"
+        );
+        for claimed in [
+            Uuid::new_v4().to_string(),
+            "SY.admin@motherbee".to_string(),
+            String::new(),
+        ] {
+            msg.routing.src = claimed.clone();
+            assert!(
+                !frame_is_from_connection(&msg, node),
+                "{claimed:?} must be refused"
+            );
+        }
+    }
+
+    /// Pins the CALLER: the node loop must check the frame before anything routes it.
+    #[test]
+    fn the_node_loop_checks_the_sender_before_routing() {
+        let src = include_str!("mod.rs");
+        let start = src.find("async fn handle_node(").expect("handle_node");
+        let end = start + src[start..].find("\n}\n").expect("end of handle_node");
+        let body = &src[start..end];
+        let check = body
+            .find("frame_is_from_connection(&msg, node_uuid)")
+            .expect("handle_node checks routing.src against its connection");
+        let route = body.find("handle_message(").expect("handle_node routes");
+        assert!(check < route, "the check must come before routing");
+    }
+
     // L2-LOOKUP-21: Spoof test — sender-supplied src_l2_name is overwritten by the router.
     #[tokio::test]
     async fn router_overwrites_spoofed_src_l2_name() {
@@ -7668,12 +7605,8 @@ mod tests {
             &Arc::new(Mutex::new(HashMap::<Uuid, PeerRouter>::new())),
             &nodes,
             &Arc::new(Mutex::new(HashMap::<String, WanPeer>::new())),
-            &Arc::new(Mutex::new(None::<ConfigRegionReader>)),
             &Arc::new(Mutex::new(None::<LsaRegionReader>)),
             &Arc::new(Mutex::new(Vec::<StaticRoute>::new())),
-            &Arc::new(Mutex::new(Vec::<VpnAssignment>::new())),
-            &Arc::new(Mutex::new(Vec::<TapEntry>::new())),
-            &Arc::new(Mutex::new(0u64)),
             &shm,
             &Arc::new(Mutex::new(OpaResolver::new())),
             &Arc::new(Mutex::new(None::<OpaRegionReader>)),

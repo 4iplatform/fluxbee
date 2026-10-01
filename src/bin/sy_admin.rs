@@ -1831,87 +1831,21 @@ fn executor_dispatch_target_and_params(
     Ok((target, serde_json::Value::Object(params)))
 }
 
-fn config_changed_version_channel(subsystem: &str) -> &'static str {
-    match subsystem {
-        // routes + vpn share version stream because SY.config.routes keeps one config version.
-        "routes" | "vpn" | "vpns" => "routes-vpns",
-        "storage" => "storage",
-        _ => "general",
-    }
-}
-
-fn config_changed_version_path(state_dir: &Path, subsystem: &str) -> PathBuf {
-    state_dir
-        .join("config_versions")
-        .join(format!("{}.txt", config_changed_version_channel(subsystem)))
-}
-
-fn allocate_config_changed_versions(
-    state_dir: &Path,
-    subsystem: &str,
-    count: usize,
-    requested_start: Option<u64>,
-) -> Result<Vec<u64>, AdminError> {
-    if count == 0 {
-        return Ok(Vec::new());
-    }
-    let path = config_changed_version_path(state_dir, subsystem);
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    let current = fs::read_to_string(&path)
-        .ok()
-        .and_then(|data| data.trim().parse::<u64>().ok())
-        .unwrap_or(0);
-
-    let start = match requested_start {
-        Some(requested) => {
-            if requested <= current {
-                return Err(
-                    format!("version must be greater than current (current={current})").into(),
-                );
-            }
-            requested
-        }
-        None => current.saturating_add(1),
-    };
-    let end = start.saturating_add(count as u64 - 1);
-    fs::write(&path, end.to_string())?;
-    Ok((start..=end).collect())
-}
-
-fn next_config_changed_version(
-    state_dir: &Path,
-    subsystem: &str,
-    requested: Option<u64>,
-) -> Result<u64, AdminError> {
-    let mut versions = allocate_config_changed_versions(state_dir, subsystem, 1, requested)?;
-    Ok(versions.remove(0))
-}
-
-async fn broadcast_config_changed(
+/// Hand a user-policy write to the motherbee's SY.opa.rules, the only one that compiles and applies
+/// (one global policy; the other hives install what it publishes).
+async fn send_opa_config_changed(
     client: &RouterDispatcher,
-    subsystem: &str,
-    action: Option<String>,
+    action: &str,
     auto_apply: Option<bool>,
     version: u64,
     config: serde_json::Value,
-    target_hive: Option<String>,
 ) -> Result<(), AdminError> {
     let sender = client.sender_snapshot();
-    // `target_hive` scopes the change to one hive: it goes to that hive's SY.opa.rules or
-    // SY.config.routes only, and the payload names the hive so no other hive applies it. CONFIG_CHANGED
-    // crosses hives through the normal routing, so an unscoped one is a broadcast to every hive.
-    let dst = match (subsystem, target_hive.as_deref()) {
-        ("opa", Some(hive)) => Destination::Unicast(format!("SY.opa.rules@{}", hive)),
-        (_, Some(hive)) => Destination::Unicast(format!("SY.config.routes@{}", hive)),
-        _ => Destination::Broadcast,
-    };
     let msg = Message {
         routing: Routing {
             src: sender.uuid().to_string(),
             src_l2_name: None,
-            dst,
+            dst: Destination::Unicast(format!("SY.opa.rules@{PRIMARY_HIVE_ID}")),
             ttl: 16,
             trace_id: Uuid::new_v4().to_string(),
         },
@@ -1927,21 +1861,16 @@ async fn broadcast_config_changed(
             ..Meta::default()
         },
         payload: serde_json::to_value(ConfigChangedPayload {
-            subsystem: subsystem.to_string(),
-            action: action.clone(),
+            subsystem: "opa".to_string(),
+            action: Some(action.to_string()),
             auto_apply,
             version,
             config,
-            hive: target_hive,
+            hive: Some(PRIMARY_HIVE_ID.to_string()),
         })?,
     };
     sender.send(msg).await?;
-    tracing::info!(
-        subsystem = subsystem,
-        action = action.as_deref().unwrap_or(""),
-        version = version,
-        "config changed broadcast sent"
-    );
+    tracing::info!(action, version, "opa write sent to the motherbee");
     Ok(())
 }
 
@@ -7757,7 +7686,6 @@ fn error_code_to_http_status(error_code: &str) -> u16 {
         | "REMOVE_FAILED"
         | "COPY_FAILED"
         | "CONFIG_FAILED"
-        | "CONFIG_BROADCAST_FAILED"
         | "RUNTIME_ERROR"
         | "RUNTIME_COMMAND_FAILED"
         | "RUNTIME_UNAVAILABLE"
@@ -8247,7 +8175,6 @@ async fn handle_opa_http(
             req.rego.clone(),
             Some(entrypoint.clone()),
             action.auto_apply_flag(),
-            primary.clone(),
         )
         .await?;
         let compiled = !responses.is_empty() && responses.iter().all(|r| r.status == "ok");
@@ -8264,17 +8191,7 @@ async fn handle_opa_http(
     } else {
         action.as_str()
     };
-    let step_responses = send_opa_action(
-        ctx,
-        client,
-        step,
-        version,
-        None,
-        None,
-        None,
-        primary.clone(),
-    )
-    .await?;
+    let step_responses = send_opa_action(ctx, client, step, version, None, None, None).await?;
     let applied = step_responses
         .iter()
         .find(|r| r.hive == PRIMARY_HIVE_ID && r.status.eq_ignore_ascii_case("ok"))
@@ -12995,41 +12912,15 @@ async fn handle_admin_command_inner(
 
     let payload = normalize_admin_payload(action, payload, hive.as_deref());
     let request = build_admin_request(ctx, action, payload, hive);
-    let target_hive = extract_hive_from_target(&request.target);
-    let mut response = send_admin_request(
+    // Routes, VPNs and taps: SY.config.routes of that hive applies the change and writes its config
+    // region, which the routers of that hive read on the next message. Nothing else to tell anyone.
+    let response = send_admin_request(
         client,
         request,
         admin_action_timeout(action),
         &admin_node_name(&ctx.hive_id),
     )
     .await;
-    if let Ok(ref payload) = response {
-        if let Some(status) = payload.get("status").and_then(|v| v.as_str()) {
-            if status == "ok" {
-                if matches!(
-                    action,
-                    "add_route"
-                        | "delete_route"
-                        | "add_vpn"
-                        | "delete_vpn"
-                        | "add_tap"
-                        | "delete_tap"
-                ) {
-                    if let Err(err) =
-                        broadcast_full_config(ctx, client, action, target_hive.as_deref()).await
-                    {
-                        let detail = format!("action applied but broadcast failed: {err}");
-                        tracing::warn!(error = %detail, "broadcast after admin action failed");
-                        response = Ok(serde_json::json!({
-                            "status": "error",
-                            "error_code": "CONFIG_BROADCAST_FAILED",
-                            "message": detail,
-                        }));
-                    }
-                }
-            }
-        }
-    }
     Ok(build_admin_http_response(action, response))
 }
 
@@ -14339,10 +14230,6 @@ fn build_admin_http_response(
     }
 }
 
-fn extract_hive_from_target(target: &str) -> Option<String> {
-    target.split_once('@').map(|(_, hive)| hive.to_string())
-}
-
 fn action_routes_via_local_orchestrator(action: &str) -> bool {
     matches!(
         action,
@@ -14479,70 +14366,6 @@ fn admin_payload_contract_error(action: &str, payload: &serde_json::Value) -> Op
     })
 }
 
-async fn broadcast_full_config(
-    ctx: &AdminContext,
-    client: &RouterDispatcher,
-    action: &str,
-    target_hive: Option<&str>,
-) -> Result<(), AdminError> {
-    let (list_action, item_key, subsystem) = config_domain_for_mutation(action)
-        .ok_or_else(|| format!("unsupported config mutation action '{action}'"))?;
-    let list_req = build_admin_request(
-        ctx,
-        list_action,
-        serde_json::json!({}),
-        target_hive.map(|s| s.to_string()),
-    );
-    let response = send_admin_request(
-        client,
-        list_req,
-        admin_action_timeout(list_action),
-        &admin_node_name(&ctx.hive_id),
-    )
-    .await?;
-    let payload = response
-        .get("status")
-        .and_then(|v| v.as_str())
-        .filter(|v| *v == "ok")
-        .and_then(|_| list_config_items_payload(&response, item_key))
-        .ok_or_else(|| format!("list response missing {item_key}"))?;
-    let config = serde_json::json!({ item_key: payload });
-
-    let version = next_config_changed_version(&ctx.state_dir, subsystem, None)?;
-    // The list belongs to `target_hive` only: scope the broadcast to it. Unscoped, the
-    // motherbee's SY.config.routes applied a spoke's list over its own (lab 2026-09-30).
-    broadcast_config_changed(
-        client,
-        subsystem,
-        None,
-        None,
-        version,
-        config,
-        target_hive.map(str::to_string),
-    )
-    .await?;
-    Ok(())
-}
-
-fn config_domain_for_mutation(action: &str) -> Option<(&'static str, &'static str, &'static str)> {
-    match action {
-        "add_route" | "delete_route" => Some(("list_routes", "routes", "routes")),
-        "add_vpn" | "delete_vpn" => Some(("list_vpns", "vpns", "vpn")),
-        "add_tap" | "delete_tap" => Some(("list_taps", "taps", "taps")),
-        _ => None,
-    }
-}
-
-fn list_config_items_payload<'a>(
-    response: &'a serde_json::Value,
-    item_key: &str,
-) -> Option<&'a serde_json::Value> {
-    response
-        .get("payload")
-        .and_then(|payload| payload.get(item_key))
-        .or_else(|| response.get(item_key))
-}
-
 async fn send_opa_action(
     ctx: &AdminContext,
     client: &RouterDispatcher,
@@ -14551,7 +14374,6 @@ async fn send_opa_action(
     rego: Option<String>,
     entrypoint: Option<String>,
     auto_apply: Option<bool>,
-    target: Option<String>,
 ) -> Result<Vec<OpaResponseEntry>, AdminError> {
     let mut cfg = serde_json::json!({});
     if let Some(rego) = rego {
@@ -14560,19 +14382,10 @@ async fn send_opa_action(
             "entrypoint": entrypoint.unwrap_or_else(|| "router/target".to_string()),
         });
     }
-    let expected = expected_hive_sets(ctx, target.as_deref()).effective;
+    let expected = expected_hive_sets(ctx, Some(PRIMARY_HIVE_ID)).effective;
     let mut receiver = client.subscribe(RPC_BC_CONFIG_RESPONSE)?;
 
-    broadcast_config_changed(
-        client,
-        "opa",
-        Some(action.to_string()),
-        auto_apply,
-        version,
-        cfg,
-        target.clone(),
-    )
-    .await?;
+    send_opa_config_changed(client, action, auto_apply, version, cfg).await?;
 
     let responses = collect_opa_responses(
         &mut receiver,
@@ -15624,38 +15437,6 @@ mod tests {
         assert_eq!(responses[0].hive, "motherbee");
         assert_eq!(responses[0].status, "ok");
         assert_eq!(responses[0].payload["current_version"], json!(4));
-    }
-
-    #[test]
-    fn list_config_items_payload_prefers_nested_payload_shape() {
-        let response = json!({
-            "status": "ok",
-            "action": "list_routes",
-            "payload": {
-                "config_version": 7,
-                "routes": [{ "prefix": "alpha/**" }]
-            },
-            "config_version": 7,
-            "routes": [{ "prefix": "legacy/**" }]
-        });
-
-        assert_eq!(
-            list_config_items_payload(&response, "routes"),
-            Some(&json!([{ "prefix": "alpha/**" }]))
-        );
-    }
-
-    #[test]
-    fn list_config_items_payload_falls_back_to_legacy_top_level_shape() {
-        let response = json!({
-            "status": "ok",
-            "vpns": [{ "pattern": "ops/*" }]
-        });
-
-        assert_eq!(
-            list_config_items_payload(&response, "vpns"),
-            Some(&json!([{ "pattern": "ops/*" }]))
-        );
     }
 
     #[test]

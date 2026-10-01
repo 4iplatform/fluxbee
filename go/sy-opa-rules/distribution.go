@@ -33,6 +33,10 @@ const (
 	// notice (a hive that was down or cut off when the policy changed). Local only: no one is
 	// asked anything.
 	policySyncInterval = 5 * time.Second
+	// After a notice, the file is usually a second or two behind it: re-check this often while a
+	// notice waits, for at most this long, then back to policySyncInterval.
+	policyNoticeRecheck    = 1 * time.Second
+	policyNoticeRecheckFor = 30 * time.Second
 	// A notice not satisfied by then is dropped: the admin stopped waiting long before, and a
 	// notice for a policy superseded before it arrived would otherwise be kept forever.
 	policyNoticeTTL = 5 * time.Minute
@@ -194,18 +198,38 @@ func (s *Service) syncOnce() {
 }
 
 // policySyncLoop keeps a replica on the published policy: at start, on every notice and every
-// policySyncInterval (local check of the synced folder).
+// policySyncInterval (local check of the synced folder) — every policyNoticeRecheck while a fresh
+// notice waits for its policy.
 func (s *Service) policySyncLoop() {
-	ticker := time.NewTicker(policySyncInterval)
-	defer ticker.Stop()
-	s.syncOnce()
+	timer := time.NewTimer(0)
+	defer timer.Stop()
 	for {
 		select {
-		case <-ticker.C:
+		case <-timer.C:
 		case <-s.syncKick:
+			if !timer.Stop() {
+				select {
+				case <-timer.C:
+				default:
+				}
+			}
 		}
 		s.syncOnce()
+		timer.Reset(s.nextSyncCheck(time.Now()))
 	}
+}
+
+// nextSyncCheck: soon while a notice younger than policyNoticeRecheckFor waits for its policy,
+// otherwise the regular interval.
+func (s *Service) nextSyncCheck(now time.Time) time.Duration {
+	s.policyMu.Lock()
+	defer s.policyMu.Unlock()
+	for _, notice := range s.pendingSyncs {
+		if now.Sub(notice.received) < policyNoticeRecheckFor {
+			return policyNoticeRecheck
+		}
+	}
+	return policySyncInterval
 }
 
 // handleSyncNotice: the admin announced a newly published policy. Answer at once if this hive

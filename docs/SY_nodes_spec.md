@@ -47,6 +47,10 @@ Los nodos SY (System) son componentes de infraestructura que proveen servicios e
 
 ### 1.4 Patrón CONFIG_CHANGED / CONFIG_RESPONSE
 
+> **Desde 0.1.44:** solo lo usa la policy OPA de usuario (`SY.admin@motherbee` → SY.opa.rules; ver
+> [`opa-distribution.md`](opa-distribution.md)) y el `node_config` del orquestador. Rutas, VPN y taps
+> ya no viajan por CONFIG_CHANGED (§2).
+
 Todo nodo SY que reciba configuración via broadcast CONFIG_CHANGED **DEBE** responder con CONFIG_RESPONSE. Este patrón permite a SY.admin:
 
 1. Confirmar que la configuración fue aplicada
@@ -155,6 +159,12 @@ Responsable de la configuración de rutas estáticas y tabla VPN.
 | Subsystems | `routes`, `vpn` |
 
 ### 2.2 Mensajes: CONFIG_CHANGED
+
+> **Reemplazado (0.1.41–0.1.44):** SY.config.routes ya no recibe ni aplica CONFIG_CHANGED. La config
+> de rutas/VPN/taps es de cada hive: entra por las acciones admin de ese hive (`add_route`,
+> `delete_route`, `add_vpn`, …, `CONFIG_SET`), SY.config.routes escribe su región `jsr-config-<hive>`
+> y los routers del hive la releen. Lo que sigue en §2.2–§2.5 (CONFIG_CHANGED/CONFIG_RESPONSE) es
+> historia.
 
 **Agregar ruta (broadcast):**
 

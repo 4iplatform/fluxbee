@@ -178,6 +178,22 @@ func TestConfigChangedIsTakenOnlyFromThePrimaryAdmin(t *testing.T) {
 	})
 }
 
+// A fresh notice whose policy has not arrived makes the hive re-check every second, not every 5 s.
+func TestAWaitingNoticeShortensTheNextCheck(t *testing.T) {
+	replica, _, _ := newTestHive(t, "worker1")
+	now := time.Now()
+	if got := replica.nextSyncCheck(now); got != policySyncInterval {
+		t.Fatalf("no notice: want %v, got %v", policySyncInterval, got)
+	}
+	replica.pendingSyncs = []pendingSync{{src: "admin", version: 3, hash: "sha256:x", received: now.Add(-2 * time.Second)}}
+	if got := replica.nextSyncCheck(now); got != policyNoticeRecheck {
+		t.Fatalf("fresh notice: want %v, got %v", policyNoticeRecheck, got)
+	}
+	if got := replica.nextSyncCheck(now.Add(policyNoticeRecheckFor)); got != policySyncInterval {
+		t.Fatalf("old notice: want %v, got %v", policySyncInterval, got)
+	}
+}
+
 // A notice for a policy that never arrives here (superseded before it synced) is not kept forever.
 func TestUnsatisfiedNoticeIsDroppedAfterItsTTL(t *testing.T) {
 	replica, router, state := newTestHive(t, "worker1")

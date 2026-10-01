@@ -75,7 +75,8 @@ fn assign_vpn(&self, node_name: &str) -> u32 {
 
 **Cuándo se evalúa:**
 - Al conectar (HELLO → ANNOUNCE)
-- Cuando llega CONFIG_CHANGED (re-evalúa todos los nodos)
+- Cuando cambia la región de config del hive (el router la relee con cada mensaje y re-evalúa
+  todos los nodos)
 
 **Los cambios de VPN se aplican en tiempo real.** No es necesario reconectar nodos. El router actualiza el `vpn_id` de los nodos en su región `jsr-<uuid>`.
 

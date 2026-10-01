@@ -136,6 +136,11 @@ vpns:
 
 ### 2.5 Flujo de Actualización
 
+> **Reemplazado (0.1.41–0.1.44):** no hay broadcast de rutas. El admin manda la acción
+> (`add_route`, …) al SY.config.routes **de ese hive**, que escribe su región; los routers del hive
+> la releen con el próximo mensaje y la anuncian a los demás hives por LSA. El flujo de abajo es
+> historia.
+
 ```
 1. SY.admin recibe request HTTP (ej: POST /routes)
 2. SY.admin valida formato básico

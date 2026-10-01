@@ -8,8 +8,8 @@ use tracing_subscriber::EnvFilter;
 use uuid::Uuid;
 
 use fluxbee_sdk::protocol::{
-    is_system_kind, Destination, Message, Meta, Routing, MSG_CONFIG_CHANGED, MSG_CONFIG_GET,
-    MSG_CONFIG_SET, SYSTEM_KIND,
+    is_system_kind, Destination, Message, Meta, Routing, MSG_CONFIG_GET, MSG_CONFIG_SET,
+    SYSTEM_KIND,
 };
 use fluxbee_sdk::{
     build_node_config_response_message, parse_node_config_request, try_handle_default_node_status,
@@ -224,16 +224,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                     continue;
                 }
-                if is_system_kind(&msg.meta.msg_type) && msg.meta.msg.as_deref() == Some(MSG_CONFIG_CHANGED) {
-                    // Routes, VPNs and taps change only through the admin actions on THIS hive
-                    // (handled above, origin-gated); this hive's routers take the change from the
-                    // config region. The admin's CONFIG_CHANGED after one of them is only a notice,
-                    // with nothing to apply here. The old global list broadcast
-                    // (PUT /config/routes|vpns|taps) is gone: now that CONFIG_CHANGED crosses hives
-                    // it would overwrite every hive's config with one list.
-                    tracing::debug!("config changed notice; nothing to apply here");
-                    continue;
-                }
+                // Routes, VPNs and taps change only through the admin actions above (this hive,
+                // origin-gated); the routers of this hive read the config region they write.
             }
         }
     }
@@ -1104,8 +1096,6 @@ fn empty_tap_entry() -> TapEntry {
         _reserved: [0u8; 32],
     }
 }
-
-// CONFIG_CHANGED lo emite SY.admin (motherbee).
 
 #[cfg(test)]
 mod tests {

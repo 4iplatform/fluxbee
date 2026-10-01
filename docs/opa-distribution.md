@@ -51,9 +51,9 @@ actions; frontdesk routing) is baked into the router binary (`policy/system.rego
 
 ## Installing on a hive (not the motherbee)
 
-SY.opa.rules checks its local copy of the folder **at start, on every notice, and every 5 s**
-(a local file check — nothing is asked over the network). When the manifest names a policy that
-is not the one running:
+SY.opa.rules checks its local copy of the folder **at start, on every notice, every second for
+30 s after a notice, and every 5 s otherwise** (a local file check — nothing is asked over the
+network). When the manifest names a policy that is not the one running:
 
 1. read the wasm the manifest names; if it is missing or its sha256 differs from the manifest,
    the sync is still carrying it — try again on the next check;
@@ -81,8 +81,9 @@ soon as Syncthing brings the folder up to date — no notice needed.
 - **Integrity:** a hive installs only a wasm whose sha256 matches the manifest. Syncthing is
   receive-only on the spokes, so a spoke cannot publish.
 - **Who may write:** SY.opa.rules acts on CONFIG_CHANGED and on commands only from
-  `SY.admin@motherbee`. The router's gate for CONFIG_CHANGED (system policy) also admits the
-  orchestrators, and a policy the motherbee applies is published to every hive. The check guards against a partial transfer, not against a local writer: a
+  `SY.admin@motherbee` (the name the router stamps from the sending socket). The router's gate
+  for CONFIG_CHANGED (system policy) also admits the orchestrators, and a policy the motherbee
+  applies is published to every hive. The check guards against a partial transfer, not against a local writer: a
   local change to the synced copy on a hive (it needs root or the Syncthing user) affects that
   hive only and is never sent back.
 - **Confidentiality:** only the compiled wasm leaves the motherbee. On each hive the installed

@@ -47,6 +47,9 @@ Usado por el router para decisiones de capa 1. El router DEBE poder tomar decisi
 Reglas:
 - el sender no controla `routing.src_l2_name`
 - el router DEBE ignorar o sobrescribir cualquier `src_l2_name` provisto por el sender
+- un nodo solo emite con su propio `routing.src` (el UUID con el que hizo HELLO en ese socket): el
+  router descarta el frame si no coincide (desde 0.1.44; antes un nodo que conociera el UUID de
+  otro podía emitir como él)
 - en mensajes emitidos por un nodo hacia el router, `src_l2_name` puede omitirse
 - en mensajes entregados por el router a un nodo, `src_l2_name` debe reflejar el L2 canónico del origen real
 
@@ -510,15 +513,13 @@ socket.on('data', (chunk) => {
 
 **CONFIG_CHANGED** es el mensaje unificado para todos los cambios de configuración del sistema. SY.admin (único, en mother hive) es el único que lo emite.
 
-> **Desde 0.1.41:** CONFIG_CHANGED viaja por el ruteo normal (respeta `dst` y `meta.target`, cruza
-> hives) y es una acción SYSTEM protegida: solo `SY.admin@motherbee` (a cualquier hive) y los
-> `SY.orchestrator` (`node_config`) pueden enviarlo. Las rutas/VPN/taps son config de cada hive: se
-> cambian con las acciones admin de ese hive y los routers de ese hive las toman de su región de
-> config (SHM). El CONFIG_CHANGED que manda el admin después (a `SY.config.routes@<hive>`) es solo
-> un aviso: SY.config.routes no aplica listas que lleguen por CONFIG_CHANGED, y del lado WAN el
-> router no lo intercepta (solo el router de origen refresca y re-anuncia LSA). OPA de usuario es
-> una sola policy global y SY.opa.rules solo
-> acepta CONFIG_CHANGED de `SY.admin@motherbee` — ver [`opa-distribution.md`](opa-distribution.md).
+> **Desde 0.1.41 (0.1.44):** CONFIG_CHANGED viaja por el ruteo normal (respeta `dst` y
+> `meta.target`, cruza hives) y es una acción SYSTEM protegida más: el router no le da trato
+> especial. Lo mandan `SY.admin@motherbee` (OPA de usuario) y los `SY.orchestrator`
+> (`node_config`, a nodos de su hive). Rutas/VPN/taps no usan CONFIG_CHANGED: se cambian con las
+> acciones admin de cada hive y los routers de ese hive leen su región de config (SHM). OPA de
+> usuario es una sola policy global y SY.opa.rules solo acepta CONFIG_CHANGED de
+> `SY.admin@motherbee` — ver [`opa-distribution.md`](opa-distribution.md).
 
 #### 7.4.1 Formato
 
