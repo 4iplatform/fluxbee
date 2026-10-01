@@ -227,6 +227,9 @@ gen_unit sy-edge "network.target rt-gateway.service" \
 # fresh-motherbee config (no lab uplink; wan.mtls set) — distinct from the dev
 # config/hive.yaml the lab uses.
 install -m0644 packaging/hive.yaml.example "$DEST/etc/fluxbee/hive.yaml.example"
+# SY.architect adds this handbook to its prompts, from where install.sh puts it. A static doc,
+# not config: replaced on every upgrade, so it is not a conffile.
+install -m0644 "docs/onworking COA/archi/handbook_fluxbee.md" "$DEST/etc/fluxbee/handbook_fluxbee.md"
 install -m0755 packaging/fluxbee-firstboot "$DEST/usr/share/fluxbee/fluxbee-firstboot"
 ln -sf ../share/fluxbee/fluxbee-firstboot "$DEST/usr/bin/fluxbee-firstboot"
 # The base-node manifest travels to the target too: fluxbee-firstboot reads it to know which

@@ -5819,9 +5819,10 @@ impl FunctionTool for PlanCompilerLiveQueryTool {
             .cloned()
             .unwrap_or_else(|| json!({}));
 
+        // There is one SY.admin, on the motherbee; the hive is the target (FINDINGS A-24).
         execute_admin_action_with_context(
             &self.context,
-            &format!("SY.admin@{hive}"),
+            &format!("SY.admin@{PRIMARY_HIVE_ID}"),
             &action,
             Some(&hive),
             params,
@@ -5948,8 +5949,25 @@ async fn main() -> Result<(), ArchitectError> {
     let incoming_rx = rpc.take_command_receiver("incoming").await?;
     tracing::info!(node = %node_name, "sy.architect canonical RouterDispatcher connected");
 
-    let ai_runtime =
-        build_architect_ai_runtime(Arc::clone(&rpc), &node_name, &self_ilk_id, &hive).await;
+    // On an upgrade the whole hive restarts at once and the vault may not answer yet. Pull until
+    // it does (the SDK's `resolve_resource_awaiting_vault`, as SY.storage and SY.identity do;
+    // FINDINGS A-26), both secrets at once; VAULT_SECRET_CHANGED still covers later changes.
+    let (ai_runtime, initial_messages_db_url) = tokio::join!(
+        build_architect_ai_runtime(
+            Arc::clone(&rpc),
+            &node_name,
+            &self_ilk_id,
+            &hive,
+            VaultWait::UntilReachable,
+        ),
+        resolve_messages_db_url_from_vault(
+            Arc::clone(&rpc),
+            &hive.hive_id,
+            &node_name,
+            &self_ilk_id,
+            VaultWait::UntilReachable,
+        ),
+    );
     let agent_asset_catalog = bootstrap_agent_asset_catalog_from_config_dir(&config_dir)
         .unwrap_or_else(|err| {
             tracing::warn!(error = %err, "failed to bootstrap agent asset catalog");
@@ -5981,13 +5999,6 @@ async fn main() -> Result<(), ArchitectError> {
         components: default_component_statuses(),
         error: None,
     };
-    let initial_messages_db_url = resolve_messages_db_url_from_vault(
-        Arc::clone(&rpc),
-        &hive.hive_id,
-        &node_name,
-        &self_ilk_id,
-    )
-    .await;
     let initial_messages_db_configured = initial_messages_db_url.is_some();
     let initial_messages_db = match initial_messages_db_url.as_deref() {
         Some(url) => {
@@ -6103,11 +6114,49 @@ fn architect_node_name(hive_id: &str) -> String {
     format!("SY.architect@{hive_id}")
 }
 
+/// Whether a vault lookup waits out a vault that is not reachable yet.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum VaultWait {
+    /// At boot: retry transport failures for up to `VAULT_BOOT_WAIT`.
+    UntilReachable,
+    /// On a refresh (a VAULT_SECRET_CHANGED or a CONFIG_SET): the vault is up, ask once.
+    Once,
+}
+
+async fn resolve_architect_vault_resource(
+    vault_client: &fluxbee_sdk::VaultClient,
+    resource: fluxbee_sdk::ResourceType,
+    node_name: &str,
+    wait: VaultWait,
+) -> Result<Option<Value>, fluxbee_sdk::VaultError> {
+    let tenant = fluxbee_sdk::DEFAULT_ROOT_TENANT_ID;
+    let timeout = Duration::from_secs(5);
+    match wait {
+        VaultWait::UntilReachable => {
+            vault_client
+                .resolve_resource_awaiting_vault(
+                    resource,
+                    tenant,
+                    timeout,
+                    fluxbee_sdk::VAULT_BOOT_WAIT,
+                    node_name,
+                )
+                .await
+        }
+        VaultWait::Once => {
+            vault_client
+                .resolve_resource(resource, tenant, timeout)
+                .await
+        }
+    }
+}
+
 async fn build_architect_ai_runtime(
     rpc: Arc<RouterDispatcher>,
     node_name: &str,
     self_ilk_id: &str,
     hive: &HiveFile,
+    wait: VaultWait,
 ) -> Option<ArchitectAiRuntime> {
     let engine = match hive.ai.as_ref().map(HiveAiConfig::effective).transpose() {
         Ok(Some(engine)) => engine,
@@ -6123,6 +6172,7 @@ async fn build_architect_ai_runtime(
         node_name,
         self_ilk_id,
         engine.provider,
+        wait,
     )
     .await
     {
@@ -6152,15 +6202,12 @@ async fn resolve_architect_ai_api_key_from_vault(
     node_name: &str,
     self_ilk_id: &str,
     provider: AiProvider,
+    wait: VaultWait,
 ) -> Result<Option<String>, ArchitectError> {
     let vault_client = architect_vault_client(rpc, &hive.hive_id, node_name, self_ilk_id);
-    let value = vault_client
-        .resolve_resource(
-            provider.resource_type(),
-            fluxbee_sdk::DEFAULT_ROOT_TENANT_ID,
-            Duration::from_secs(5),
-        )
-        .await;
+    let value =
+        resolve_architect_vault_resource(&vault_client, provider.resource_type(), node_name, wait)
+            .await;
     let Some(value) = value? else {
         return Ok(None);
     };
@@ -6206,6 +6253,7 @@ async fn refresh_architect_ai_runtime(state: &ArchitectState) -> Result<bool, Ar
         &state.node_name,
         &state.self_ilk_id,
         &hive,
+        VaultWait::Once,
     )
     .await;
     state
@@ -6225,15 +6273,16 @@ async fn resolve_messages_db_url_from_vault(
     hive_id: &str,
     node_name: &str,
     self_ilk_id: &str,
+    wait: VaultWait,
 ) -> Option<String> {
     let vault_client = architect_vault_client(rpc, hive_id, node_name, self_ilk_id);
-    let result = vault_client
-        .resolve_resource(
-            fluxbee_sdk::ResourceType::Postgres,
-            fluxbee_sdk::DEFAULT_ROOT_TENANT_ID,
-            Duration::from_secs(5),
-        )
-        .await;
+    let result = resolve_architect_vault_resource(
+        &vault_client,
+        fluxbee_sdk::ResourceType::Postgres,
+        node_name,
+        wait,
+    )
+    .await;
     match result {
         Ok(Some(value)) => extract_messages_db_url_from_vault_value(&value),
         Ok(None) => None,
@@ -6263,6 +6312,7 @@ async fn refresh_architect_messages_db_url(state: &ArchitectState) -> (bool, boo
         &state.hive_id,
         &state.node_name,
         &state.self_ilk_id,
+        VaultWait::Once,
     )
     .await;
     let url_present = url.is_some();
@@ -24159,8 +24209,10 @@ async fn build_actual_state_snapshot(
     )
     .await;
 
+    // There is one SY.admin, on the motherbee; each read names its hive as the target (FINDINGS
+    // A-24: asking SY.admin@<hive> failed for every hive but the motherbee).
+    let admin_target = format!("SY.admin@{PRIMARY_HIVE_ID}");
     for hive in hives {
-        let admin_target = format!("SY.admin@{hive}");
         let mut hive_res = HiveResources::default();
         let mut section_failed = false;
 
@@ -24952,6 +25004,22 @@ mod tests {
 
         assert!(pipeline_plan_compiler_context(&run_state).contains("router/target"));
         assert!(pipeline_plan_compiler_context(&json!({})).is_empty());
+    }
+
+    #[test]
+    fn the_admin_is_always_asked_on_the_motherbee() {
+        // There is one SY.admin, on the motherbee; a read about another hive names that hive as
+        // the target (FINDINGS A-24). Built with concat! so this test does not match itself.
+        let source = include_str!("sy_architect.rs");
+        for addressed_by_hive in [
+            concat!("SY.admin@", "{hive}"),
+            concat!("SY.admin@{}\", ", "hive)"),
+        ] {
+            assert!(
+                !source.contains(addressed_by_hive),
+                "found {addressed_by_hive}"
+            );
+        }
     }
 
     #[test]
