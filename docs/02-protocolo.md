@@ -509,9 +509,9 @@ socket.on('data', (chunk) => {
 
 | Mensaje | Origen | Destino | Propósito |
 |---------|--------|---------|-----------|
-| `CONFIG_CHANGED` | SY.admin | Broadcast (todos) | Notificar cambio de configuración |
+| `CONFIG_CHANGED` | SY.admin@motherbee | SY.opa.rules (unicast al motherbee; el aviso `sync` con `meta.target SY.opa.rules@*`) | Policy OPA de usuario |
 
-**CONFIG_CHANGED** es el mensaje unificado para todos los cambios de configuración del sistema. SY.admin (único, en mother hive) es el único que lo emite.
+**CONFIG_CHANGED** era el mensaje unificado para todos los cambios de configuración del sistema; hoy queda solo para la policy OPA de usuario (nota de abajo). SY.admin (único, en mother hive) es el único que lo emite.
 
 > **Desde 0.1.41 (0.1.44):** CONFIG_CHANGED viaja por el ruteo normal (respeta `dst` y
 > `meta.target`, cruza hives) y es una acción SYSTEM protegida más: el router no le da trato
@@ -545,13 +545,17 @@ socket.on('data', (chunk) => {
 
 #### 7.4.2 Subsystems
 
+> **Hoy solo existe `opa`.** `routes` y `vpn` se cambian con acciones admin por hive (0.1.41–0.1.44);
+> el broadcast de `storage` se borró en 0.1.41 y su CONFIG_RESPONSE en 0.1.45; `hives` no tiene
+> emisor. La tabla y los ejemplos de abajo, salvo `opa`, son historia.
+
 | Subsystem | Quién actúa | Contenido de `config` |
 |-----------|-------------|----------------------|
-| `routes` | SY.config.routes, RT.* | Rutas estáticas |
-| `vpn` | SY.config.routes, RT.* | Tabla VPN |
-| `opa` | SY.opa.rules, RT.* | Policies OPA |
-| `storage` | SY.orchestrator | Path del storage |
-| `hives` | SY.orchestrator | Lista de islas |
+| `routes` | (historia) | Rutas estáticas |
+| `vpn` | (historia) | Tabla VPN |
+| `opa` | SY.opa.rules | Policy OPA de usuario (ver `opa-distribution.md`) |
+| `storage` | (historia; borrado en 0.1.41) | Path del storage |
+| `hives` | (historia) | Lista de islas |
 
 #### 7.4.3 Ejemplos
 

@@ -670,9 +670,9 @@ func (s *Service) handleMessage(msg fluxbeesdk.Message) {
 			if payload.Subsystem != "opa" {
 				return
 			}
-			// Only the primary admin emits CONFIG_CHANGED (protocol). The router's gate also lets
-			// orchestrators through, and a policy written here is published to every hive. Same
-			// rule as the command path.
+			// Only the primary admin emits CONFIG_CHANGED (protocol), and a policy written here is
+			// published to every hive. The router's gate checks the same (system policy rule 2);
+			// this second check is the command path's rule.
 			if origin := derefString(msg.Routing.SrcL2Name); origin != fluxbeesdk.PrimaryAdminNode {
 				log.Printf("opa config change from %q refused: accepted only from %s", origin, fluxbeesdk.PrimaryAdminNode)
 				if !strings.EqualFold(payload.Action, "sync") {

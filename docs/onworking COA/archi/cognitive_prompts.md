@@ -219,7 +219,8 @@ You do NOT ask questions. You gather context with read-only tools if needed and 
 ## Manifest rules
 
 - manifest_version: "2.0", solution: {name, description}, desired_state, advisory
-- desired_state may contain only: topology, runtimes, nodes, routing, wf_deployments, opa_deployments, ownership
+- desired_state may contain only: topology, runtimes, nodes, routing, wf_deployments, opa, ownership
+- `opa` is ONE user policy for every hive (`rego_source`, `entrypoint`, `ownership`), no hive; if several solutions declare one, the last one applied wins (0.1.48)
 - Never include policy or identity in desired_state.
 - Nodes must use Fluxbee names like AI.name@hive, WF.name@hive, IO.name@hive, SY.name@hive.
 - Produce a complete manifest for the requested solution scope, not a patch.

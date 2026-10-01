@@ -845,12 +845,10 @@ Useful status fields:
 ```bash
 curl -sS "$BASE/config/storage"
 
-curl -sS -X PUT "$BASE/config/vpns" \
+# routes and VPN rules are per hive: one rule per call (?hive=, default the motherbee)
+curl -sS -X POST "$BASE/vpns?hive=motherbee" \
   -H "Content-Type: application/json" \
-  -d '{"vpns":[
-    {"pattern":"WF.echo","match_kind":"PREFIX","vpn_id":20},
-    {"pattern":"WF.listen","match_kind":"PREFIX","vpn_id":20}
-  ]}'
+  -d '{"pattern":"WF.echo","match_kind":"PREFIX","vpn_id":20}'
 ```
 
 For a larger command matrix and error smoke checks, see:
@@ -927,22 +925,21 @@ Current HTTP surface exposed by `SY.admin`.
 | `GET` | `/versions` | Effective versions (local or `?hive=`) |
 | `GET` | `/deployments` | Historical deployment entries (`?hive=`, `?category=`, `?limit=`) |
 | `GET` | `/drift-alerts` | Historical drift alert entries (`?hive=`, `?category=`, `?limit=`) |
-| `GET` | `/routes` | Read global routes |
-| `POST` | `/routes` | Add/update route entry |
-| `DELETE` | `/routes` | Delete route entry |
-| `GET` | `/vpns` | Read global VPN rules |
-| `POST` | `/vpns` | Add/update VPN rule |
-| `DELETE` | `/vpns` | Delete VPN rule |
-| `PUT` | `/config/routes` | Replace routes config |
-| `PUT` | `/config/vpns` | Replace VPN config |
+| `GET` | `/routes` | Read a hive's routes (`?hive=`, default the motherbee) |
+| `POST` | `/routes` | Add/update a route entry on a hive (`?hive=`) |
+| `DELETE` | `/routes` | Delete a route entry on a hive (`?hive=`, `?prefix=`) |
+| `GET` | `/vpns` | Read a hive's VPN rules (`?hive=`) |
+| `POST` | `/vpns` | Add/update a VPN rule on a hive (`?hive=`) |
+| `DELETE` | `/vpns` | Delete a VPN rule on a hive (`?hive=`, `?pattern=`) |
 | `GET` | `/config/storage` | Read storage config |
 | `PUT` | `/config/storage` | Update storage config |
 | `GET` | `/config/storage/metrics` | Storage metrics passthrough |
-| `POST` | `/opa/policy` | Upload policy bundle |
-| `POST` | `/opa/policy/compile` | Compile policy |
-| `POST` | `/opa/policy/apply` | Apply compiled policy |
-| `POST` | `/opa/policy/rollback` | Roll back policy |
-| `POST` | `/opa/policy/check` | Validate policy inputs |
+| `POST` | `/opa/policy` | Compile the user OPA policy on the motherbee and apply it on every hive |
+| `POST` | `/opa/policy/compile` | Compile the user policy (motherbee) |
+| `POST` | `/opa/policy/apply` | Apply a compiled version on every hive |
+| `POST` | `/opa/policy/rollback` | Roll the user policy back on every hive |
+| `POST` | `/opa/policy/clear` | Remove the user policy from every hive |
+| `POST` | `/opa/policy/check` | Validate a policy without applying it |
 | `GET` | `/opa/policy` | Read current policy state |
 | `GET` | `/opa/status` | OPA runtime status |
 | `GET` | `/modules` | List modules |
@@ -985,13 +982,8 @@ Current HTTP surface exposed by `SY.admin`.
 | `GET` | `/hives/{hive}/versions` | Effective versions for hive |
 | `GET` | `/hives/{hive}/deployments` | Historical deployment entries targeting hive |
 | `GET` | `/hives/{hive}/drift-alerts` | Historical drift alert entries for hive |
-| `POST` | `/hives/{hive}/opa/policy` | Upload policy for hive |
-| `POST` | `/hives/{hive}/opa/policy/compile` | Compile policy for hive |
-| `POST` | `/hives/{hive}/opa/policy/apply` | Apply policy on hive |
-| `POST` | `/hives/{hive}/opa/policy/rollback` | Roll back policy on hive |
-| `POST` | `/hives/{hive}/opa/policy/check` | Validate policy on hive |
-| `GET` | `/hives/{hive}/opa/policy` | Read policy state on hive |
-| `GET` | `/hives/{hive}/opa/status` | OPA status on hive |
+| `GET` | `/hives/{hive}/opa/policy` | User policy the hive runs: version and hash (the rego on the motherbee only) |
+| `GET` | `/hives/{hive}/opa/status` | User policy status on the hive (`in_sync`, `waiting`, …; see `docs/opa-distribution.md`) |
 
 Notes:
 

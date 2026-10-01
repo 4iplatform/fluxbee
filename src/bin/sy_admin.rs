@@ -4783,8 +4783,8 @@ async fn handle_externalize(
     // Build the endpoint row (the EDGE_OPEN_URL payload IS one row) and OPEN the URL on
     // the edge via a verified service command (§7) — NOT a config push. We BLOCK on the
     // edge's ack: the URL is "published" only once the edge confirms it holds the row.
-    // As an addressed request/response it routes cross-hive like any node RPC (no router
-    // special-casing, unlike CONFIG_CHANGED which the peer router swallows).
+    // As an addressed request/response it routes cross-hive like any node RPC (the router
+    // special-cases no config message since 0.1.44).
     // For a shared-secret channel: the entry token (§8). Admin MINTS a strong random token when
     // the caller did not supply one (a caller-chosen `secret` is honored as an explicit opt-out).
     // Either way the token is stored in VAULT owned by the edge (so the edge re-fetches it by ref
@@ -9303,7 +9303,7 @@ fn admin_action_summary(action: &str) -> &'static str {
         "get_deployments" => "List historical deployments targeting one hive.",
         "list_drift_alerts" => "List historical drift alerts globally.",
         "get_drift_alerts" => "List historical drift alerts for one hive.",
-        "opa_get_policy" => "Read current OPA policy text for a hive.",
+        "opa_get_policy" => "Read the user OPA policy a hive runs: version and hash, and the rego on the motherbee only (the other hives receive just the wasm).",
         "opa_get_status" => "Read OPA status for a hive.",
         "wf_rules_get_workflow" => "Read the current workflow definition managed by SY.wf-rules for a hive.",
         "wf_rules_get_status" => "Read workflow status from SY.wf-rules for a hive.",

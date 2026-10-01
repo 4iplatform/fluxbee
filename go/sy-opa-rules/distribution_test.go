@@ -127,8 +127,8 @@ func TestPublishedPolicyReachesAReplica(t *testing.T) {
 	})
 }
 
-// CONFIG_CHANGED passes the router's gate for orchestrators too, and the motherbee publishes what
-// it applies to every hive: only the primary admin's are acted on.
+// The motherbee publishes what it applies to every hive, so SY.opa.rules acts only on the primary
+// admin's CONFIG_CHANGED, as the router's gate does (system policy rule 2).
 func TestConfigChangedIsTakenOnlyFromThePrimaryAdmin(t *testing.T) {
 	oldDist := policyDistDir
 	policyDistDir = t.TempDir()

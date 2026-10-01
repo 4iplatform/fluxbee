@@ -546,7 +546,8 @@ target = "{node}" {{
 print(json.dumps({"rego": rego, "entrypoint": "router/target"}, separators=(",", ":")))
 PY
 )"
-  opa_http="$(http_call "POST" "$BASE/hives/$HIVE_ID/opa/policy/check" "$opa_body" "$opa_payload")"
+  # One user policy for every hive: the check is global (the per-hive OPA routes are gone).
+  opa_http="$(http_call "POST" "$BASE/opa/policy/check" "$opa_body" "$opa_payload")"
   opa_status="$(json_get "$opa_body" "status")"
   if [[ "$opa_http" != "200" || "$opa_status" != "ok" ]]; then
     echo "FAIL: OPA hash route policy check failed http=$opa_http status=$opa_status" >&2

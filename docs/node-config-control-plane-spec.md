@@ -10,9 +10,9 @@ Define one common control-plane contract for node runtime configuration without 
 This spec does **not** replace the current orchestrator-owned per-node config path:
 - `set_node_config`
 - `NODE_CONFIG_SET`
-- `CONFIG_CHANGED`
 
 That path remains unchanged and is responsible for infrastructure/bootstrap config persistence.
+(It used to end with a `CONFIG_CHANGED` to the node; removed in 0.1.45, no node acted on it.)
 
 This spec defines a second, node-facing contract for runtime/business configuration:
 - `CONFIG_GET`
@@ -358,7 +358,6 @@ This contract is intentionally separate from:
 
 - `PUT /hives/{hive}/nodes/{node_name}/config`
 - orchestrator `config.json`
-- `CONFIG_CHANGED`
 
 Recommended mental model:
 

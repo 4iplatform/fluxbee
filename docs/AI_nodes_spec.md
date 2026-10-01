@@ -1264,7 +1264,7 @@ behavior:
 ### 5.1 Alineación con normas generales de Fluxbee
 
 Fluxbee mantiene dos capas:
-- capa core/orchestrator (`set_node_config`/`NODE_CONFIG_SET` + señal `CONFIG_CHANGED`)
+- capa core/orchestrator (`set_node_config`/`NODE_CONFIG_SET`; la señal `CONFIG_CHANGED` que la seguía se borró en 0.1.45: ningún nodo la aplicaba)
 - capa node control-plane (`CONFIG_GET`/`CONFIG_SET` + `CONFIG_RESPONSE`)
 
 Para AI Nodes, el hot-reload operativo actual se realiza por `CONFIG_SET`.

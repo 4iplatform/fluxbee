@@ -21,7 +21,7 @@ When orchestrator spawns a business node (AI, WF, IO), the node needs configurat
    - `state.json` (writer: node)
 3. **Fixed canonical base path:** `/var/lib/fluxbee/nodes`.
 4. **Spawn is fail-closed on existing config:** if `config.json` already exists, spawn returns `NODE_ALREADY_EXISTS`.
-5. **Post-spawn config updates are orchestrator-driven:** `PUT .../config` updates `config.json` atomically, then orchestrator sends `CONFIG_CHANGED`.
+5. **Post-spawn config updates are orchestrator-driven:** `PUT .../config` updates `config.json` atomically. Since 0.1.45 the orchestrator sends no `CONFIG_CHANGED` afterwards (no node acted on it): a node picks up `config.json` on its next start, and runtime changes go through `CONFIG_SET` (`node-config-control-plane-spec.md`).
 6. **Node state is read-only for control plane:** `GET .../state` reads `state.json`; if missing, returns `payload.state = null`.
 7. **System nodes (`SY.*`, `RT.*`) are out of scope.** This model applies to business nodes (`AI`, `WF`, `IO`).
 
@@ -118,7 +118,7 @@ Behavior:
 
 `PUT /hives/{hive}/nodes/{node_name}/config`
 
-- orchestrator reads existing `config.json`, merges patch, writes atomically, increments config version metadata, and sends `CONFIG_CHANGED` to node.
+- orchestrator reads existing `config.json`, merges patch, writes atomically and increments config version metadata. (Until 0.1.44 it also sent `CONFIG_CHANGED` to the node; removed in 0.1.45, no node acted on it.)
 
 ### 5.4 Read State (diagnostic)
 

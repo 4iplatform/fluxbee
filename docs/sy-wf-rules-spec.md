@@ -150,7 +150,7 @@ system:
   NODE_STATUS_GET    → handleNodeStatusGet
   CONFIG_GET         → handleNodeConfigGet
   CONFIG_SET         → handleNodeConfigSet  (routes to handleWfAction by operation)
-  CONFIG_CHANGED     → handleWfAction       (from admin broadcast)
+  (CONFIG_CHANGED: no handler since 0.1.45; it compiled and applied workflows without checking the origin)
 
 command:
   compile_workflow   → handleWfAction("compile", ...)

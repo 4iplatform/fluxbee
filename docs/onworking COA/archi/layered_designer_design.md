@@ -116,7 +116,7 @@ Each `assess_layer(layer, outcome=work, manifest_fragment=...)` carries only the
 | identity_secrets | `desired_state.identity` (when allowed in V2.1+), `desired_state.tenants`, vault-put hints in `advisory`, `advisory[*]` |
 | nodes | `desired_state.nodes`, `advisory[*]` |
 | routing | `desired_state.routing`, `advisory[*]` |
-| logic | `desired_state.wf_deployments`, `desired_state.opa_deployments`, `advisory[*]` |
+| logic | `desired_state.wf_deployments`, `desired_state.opa` (one user policy for every hive; was `opa_deployments` per hive until 0.1.48), `advisory[*]` |
 | (any) | `solution`, `ownership` may appear in any fragment; merged by host |
 
 `solution` and `ownership` are cross-cutting; the host expects them to be consistent across fragments and merges accordingly.

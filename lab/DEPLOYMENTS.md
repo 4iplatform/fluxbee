@@ -310,6 +310,9 @@
   - Factory reset en dry-run: ahora lista la policy de los 4 hives.
 - **Rollback:** snapshot `pre-opa-global-0-1-41`, o `apt install fluxbee=0.1.40` + restaurar
   `hive.yaml.pre-opa-0-1-41` en motherbee, ingress1 y egress1.
+  - **Nota (2026-10-01, panel DTAP P-9):** antes del `apt install`, `POST /opa/policy/clear` y
+    esperar `converged: true`; si no, la última policy global queda aplicada en los workers y en
+    memoria en los routers de ingress/egress. Ver HANDBOOK §12, "El rollback".
 
 ## 0.1.40 — purga de WF en el motherbee en orden y tolerante a "ya no existe"
 

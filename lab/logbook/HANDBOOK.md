@@ -952,8 +952,9 @@ contra el manifest core que le manda el motherbee. Por eso el orden importa:
    (crea la del nodo) y lo arranca.
 
 Un hive que se une después no necesita nada de esto: el join copia el `system_nodes.<rol>` del
-motherbee. Las carpetas Syncthing nuevas de todos los roles (como `fluxbee-dist-policy`) tampoco:
-heredan los peers de `fluxbee-dist-vendor` en el próximo arranque del orquestador de cada lado.
+motherbee. La carpeta `fluxbee-dist-policy` tampoco: hereda los peers de `fluxbee-dist-vendor` en
+el próximo arranque del orquestador de cada lado. **Solo esa:** el orquestador lo hace con su
+nombre fijo; una carpeta nueva de todos los roles necesita el mismo código (o generalizarlo).
 
 ### El rollback
 
@@ -963,6 +964,13 @@ No existe rollback de core como comando ([U-5](PENDING-BUGS.md#u-5)). Los dos ca
    (§12), cubre solo lo reciente.
 2. **Conservar el `.deb` anterior publicado** en el repo apt y bajar de versión con `apt`. Es el
    camino para cualquier versión vieja.
+
+**Bajar de 0.1.41 o más a una anterior** (antes de la policy OPA global): primero
+`POST /opa/policy/clear` y esperar `converged: true`. Si no, los workers siguen aplicando la última
+policy global (la versión vieja carga `current/` al arrancar y sus escrituras por hive no llegan a
+los spokes) y los routers de ingress/egress la mantienen en memoria hasta un reboot. Después de
+bajar, sacar la carpeta `fluxbee-dist-policy` de Syncthing y restaurar el `hive.yaml` previo
+(`hive.yaml.pre-opa-0-1-41`).
 
 ### Identidades: marcar, restaurar, purgar (desde 0.1.34)
 

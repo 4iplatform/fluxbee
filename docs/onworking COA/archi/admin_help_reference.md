@@ -221,7 +221,7 @@ ser pasos del Admin executor. Las invoca directamente el nodo productor mediante
 - **Descripción:** Persiste cambios de config de un nodo.
 - **Read-only:** no | **Requiere CONFIRM:** sí
 - **Campos requeridos:** `config` (object)
-- **Campos opcionales:** `replace` (bool): reemplazar config completa vs patch; `notify` (bool): notificar runtime
+- **Campos opcionales:** `replace` (bool): reemplazar config completa vs patch (`notify` se borró en 0.1.45: ningún nodo aplicaba la señal)
 
 ---
 
@@ -497,8 +497,12 @@ POST /hives/motherbee/identity/ilks/ilk:ai-support/definition
 
 ## Categoría 9 — OPA Policy (7 acciones)
 
+> **Una sola policy OPA de usuario para todos los hives (0.1.41):** las escrituras son globales
+> (`/opa/policy*`, sin hive) y las lecturas siguen por hive. Ver `docs/opa-distribution.md`.
+
 ### `opa_get_policy`
 - **Path:** `GET /hives/{hive}/opa/policy`
+- **Descripción:** Versión y hash de la policy que corre ese hive; el rego solo en el motherbee.
 - **Read-only:** sí
 
 ### `opa_get_status`
@@ -506,30 +510,35 @@ POST /hives/motherbee/identity/ilks/ilk:ai-support/definition
 - **Read-only:** sí
 
 ### `opa_check`
-- **Path:** `POST /hives/{hive}/opa/policy/check`
+- **Path:** `POST /opa/policy/check`
 - **Descripción:** Valida un texto Rego sin aplicarlo.
 - **Read-only:** sí
 - **Campos requeridos:** `rego` (string)
 - **Campos opcionales:** `entrypoint` (default `router/target`), `version`
 
 ### `opa_compile`
-- **Path:** `POST /hives/{hive}/opa/policy/compile`
+- **Path:** `POST /opa/policy/compile`
 - **Read-only:** no | **Requiere CONFIRM:** sí
 - **Campos requeridos:** `rego` (string)
 
 ### `opa_compile_apply`
-- **Path:** `POST /hives/{hive}/opa/policy`
-- **Descripción:** Compila y aplica política OPA.
+- **Path:** `POST /opa/policy`
+- **Descripción:** Compila la policy en el motherbee y la aplica en todos los hives.
 - **Read-only:** no | **Requiere CONFIRM:** sí
 - **Campos requeridos:** `rego` (string)
 
 ### `opa_apply`
-- **Path:** `POST /hives/{hive}/opa/policy/apply`
+- **Path:** `POST /opa/policy/apply`
 - **Read-only:** no | **Requiere CONFIRM:** sí
 - **Campos requeridos:** `version` (u64): versión compilada a aplicar
 
 ### `opa_rollback`
-- **Path:** `POST /hives/{hive}/opa/policy/rollback`
+- **Path:** `POST /opa/policy/rollback`
+- **Read-only:** no | **Requiere CONFIRM:** sí
+
+### `opa_clear`
+- **Path:** `POST /opa/policy/clear`
+- **Descripción:** Quita la policy de usuario de todos los hives.
 - **Read-only:** no | **Requiere CONFIRM:** sí
 
 ---

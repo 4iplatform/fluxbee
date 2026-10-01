@@ -268,7 +268,7 @@ Precedencia efectiva actual del runner AI (flujo managed-node):
 
 Hot reload actual:
 - confiable/canónico: `POST .../control/config-set` (`CONFIG_SET`).
-- `CONFIG_CHANGED` (enviado por core después de `PUT .../config`) todavía no está cerrado end-to-end como hot reload AI.
+- `PUT .../config` ya no manda `CONFIG_CHANGED` (borrado en 0.1.45): el `config.json` del orchestrator se toma en el próximo arranque.
 
 Conclusión operativa:
 - para código: `publish -> update -> spawn` (canónico) ya sirve.

@@ -136,10 +136,12 @@ vpns:
 
 ### 2.5 Flujo de Actualización
 
-> **Reemplazado (0.1.41–0.1.44):** no hay broadcast de rutas. El admin manda la acción
-> (`add_route`, …) al SY.config.routes **de ese hive**, que escribe su región; los routers del hive
-> la releen con el próximo mensaje y la anuncian a los demás hives por LSA. El flujo de abajo es
-> historia.
+> **Reemplazado (0.1.41–0.1.45), §2.5 a §2.7:** no hay broadcast de rutas. El admin manda la
+> acción (`add_route`, …) al SY.config.routes **de ese hive**, que escribe su región; los routers
+> del hive la releen con el próximo mensaje y la anuncian a los demás hives por LSA.
+> SY.config.routes ya no atiende CONFIG_CHANGED, y CONFIG_CHANGED quedó solo para la policy OPA de
+> usuario (`SY.admin@motherbee` → SY.opa.rules; ver `opa-distribution.md`). El flujo de abajo, el
+> mensaje de §2.6 y el CONFIG_RESPONSE obligatorio de §2.7 son historia.
 
 ```
 1. SY.admin recibe request HTTP (ej: POST /routes)
@@ -157,6 +159,8 @@ vpns:
 **IMPORTANTE:** No hay trato especial para el local. El mismo broadcast llega a todas las islas y cada SY.config.routes actúa igual.
 
 ### 2.6 Notificación y Aplicación de Cambios
+
+> **Historia:** ver la nota de §2.5.
 
 **Mensaje CONFIG_CHANGED (emitido por SY.admin):**
 
@@ -226,6 +230,9 @@ fn handle_config_changed(&mut self, payload: &ConfigChangedPayload, trace_id: &s
 ```
 
 ### 2.7 CONFIG_RESPONSE (confirmación/error)
+
+> **Historia:** ver la nota de §2.5. Hoy solo SY.opa.rules responde CONFIG_RESPONSE, a los
+> CONFIG_CHANGED de OPA.
 
 Todo proceso que recibe CONFIG_CHANGED **DEBE** responder con CONFIG_RESPONSE para confirmar aplicación o reportar errores.
 

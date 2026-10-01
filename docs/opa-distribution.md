@@ -1,6 +1,6 @@
 # User OPA policy — one global policy on every hive
 
-**Status:** implemented (0.1.41). Supersedes the "compile on every hive" description in
+**Status:** implemented (0.1.41–0.1.48). Supersedes the "compile on every hive" description in
 `SY_nodes_spec.md` §3 and the OPA part of `02-protocolo.md` §CONFIG_CHANGED.
 Decisions: operator, 2026-09-30 (lab logbook of that day).
 
@@ -94,20 +94,39 @@ status from the first check, and in its log once it has waited a minute.
 - Reads stay per hive: `GET /hives/{hive}/opa/status` and `/opa/policy`. The status reports what
   the hive runs (`current_version`, `current_hash`), what was published to it (`published_version`,
   `published_hash`), what its routers load (`region_hash`), `in_sync` (all three agree), `last_error`
-  and, when it is behind, `waiting: {version, hash, since, reason}`.
+  and, when it is behind, `waiting: {version, hash, since, reason}`. `in_sync` compares with the
+  files that reached the hive: with its sync cut entirely, a hive that is behind still reads
+  `in_sync: true` — the write's `pending` is what says it. `/opa/policy` returns the rego only on
+  the motherbee; the other hives receive just the wasm, so they answer version and hash with
+  `rego: ""`.
+
+## SY.architect
+
+A solution declares the policy in `desired_state.opa`: one policy (`rego_source`, `entrypoint`,
+`ownership`) and no hive. The architect reads the running policy from the motherbee
+(`opa_get_policy`), does nothing when the rego is the same, applies with one `opa_compile_apply`,
+and clears with `opa_clear` only while the running policy is still the solution's own. When several
+solutions declare one, the last one applied wins, and the plan says whose policy it replaces. The
+owner is the solution whose saved manifest most recently declared that exact rego (operator,
+2026-10-01; composing several solutions' rules is pending review — `lab/logbook/FINDINGS.md` A-23).
 
 ## Security
 
-- **Integrity:** a hive installs only a wasm whose sha256 matches the manifest. Syncthing is
-  receive-only on the spokes, so a spoke cannot publish.
+- **Integrity:** a hive installs only a wasm whose sha256 matches the manifest. That guards
+  against a partial transfer, not against a writer: whoever can write the synced copy can write a
+  matching pair. On a spoke the folder is receive-only, so a local change there affects that hive
+  only and is never sent back. On the motherbee the folder is send-only and **its copy is the
+  publication**: whoever can write it (root or the Syncthing service user) publishes to every
+  hive, while the motherbee's own status keeps showing the policy it applied. Signing the
+  manifest is postponed with the security package (`lab/logbook/FINDINGS.md` A-22).
 - **Who may write:** only `SY.admin@motherbee`. The router admits CONFIG_CHANGED only from it
   (system policy rule 2; since 0.1.45 orchestrators are limited to the actions they forward), and
   SY.opa.rules checks it again on CONFIG_CHANGED and on commands (the name the router stamps from
-  the sending socket). A policy the motherbee applies is published to every hive. The check guards against a partial transfer, not against a local writer: a
-  local change to the synced copy on a hive (it needs root or the Syncthing user) affects that
-  hive only and is never sent back.
-- **Confidentiality:** only the compiled wasm leaves the motherbee. On each hive the installed
-  policy is root-only; the synced copy is readable by the Syncthing service user (the owner of
+  the sending socket). A policy the motherbee applies is published to every hive.
+- **Confidentiality:** only the compiled wasm is published; the rego stays on the motherbee. But
+  SY.opa.rules on the motherbee answers `get_policy`, rego included, to any node that asks (no
+  origin check; postponed with the security package, A-22). On each hive the installed policy is
+  root-only; the synced copy is readable by the Syncthing service user (the owner of
   `dist/policy`, set by the orchestrator from `hive.yaml`; published files are handed to it).
   Encrypting the synced copy with a key held in SY.vault is a possible later step (not done).
 - Root on a running hive can always read the policy its routers enforce.
