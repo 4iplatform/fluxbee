@@ -259,29 +259,44 @@
   reglas de varias soluciones en una sola policy, en vez de que gane la última; y un dueño
   registrado junto con la policy, en vez de deducirlo comparando el rego.
 
-### A-24 🔴 El snapshot del arquitecto le pide el estado de cada hive a un admin que no existe
+### A-24 🟡 RESUELTO (0.1.49) · WF pendiente — El snapshot del arquitecto le pedía el estado de cada hive a un admin que no existe
 
 - **Qué pasa (visto en código, 2026-10-01; no reproducido en vivo):** `build_actual_state_snapshot`
   manda cada lectura a `SY.admin@<hive>`. Solo el motherbee tiene admin (en worker1,
   `sy-admin` está inactivo), así que en una solución con más de un hive esas lecturas fallan, el
   snapshot queda incompleto y el reconciliador bloquea toda la corrida.
-- **Relacionado:** el plan compiler tampoco recibe la definición de los workflows declarados
-  (`wf_deployments`): el mismo hueco que A-23 tenía con el rego.
+- **Arreglo (0.1.49):** el snapshot y la consulta `query_hive` del plan compiler le preguntan a
+  `SY.admin@motherbee`, con el hive como destino (el admin está y va a estar solo en el motherbee;
+  operador, 2026-10-01). Un test del código fuente impide volver a nombrar un admin por hive.
+- **Sigue abierto:**
+  - El plan compiler tampoco recibe la definición de los workflows declarados
+    (`wf_deployments`): el mismo hueco que A-23 tenía con el rego.
+  - En ingress y egress, `list_runtimes` responde `RUNTIME_MANIFEST_MISSING` y no hay SY.wf-rules
+    (es así por rol). Una solución que nombra un hive DMZ igual queda con el snapshot incompleto,
+    y eso bloquea la corrida. En worker1 las cinco lecturas dan ok.
 
-### A-25 🔴 El `.deb` no instala el handbook del arquitecto (`install.sh` sí)
+### A-25 🟡 RESUELTO (0.1.49) — El `.deb` no instalaba el handbook del arquitecto (`install.sh` sí)
 
 - **Qué pasa (2026-10-01):** el arquitecto agrega a sus prompts `/etc/fluxbee/handbook_fluxbee.md`
   si existe. `install.sh` lo copia, `build-deb.sh` no: en el motherbee de 8.x no está, así que el
   arquitecto de PROD trabaja sin handbook. Misma clase de divergencia que A-6.
+- **Arreglo (0.1.49):** `build-deb.sh` lo instala en el mismo lugar (documento estático: se
+  reemplaza en cada upgrade, no es conffile).
 
-### A-26 🔴 El arquitecto queda sin IA después de un upgrade
+### A-26 🟡 RESUELTO (0.1.49) — El arquitecto leía sus secretos del vault una sola vez al arrancar
 
-- **Qué se vio (2026-10-01, al instalar 0.1.47 y otra vez con 0.1.48):** al arrancar, el arquitecto
-  no pudo leer su clave del vault (`AI vault resource lookup failed ... vault unreachable`) porque el
-  vault todavía no estaba arriba, y quedó escuchando con `ai_configured=false`. Según el código,
-  solo vuelve a intentarlo con un `VAULT_SECRET_CHANGED` de su proveedor o con un `CONFIG_SET`;
-  hasta entonces el chat y el pipeline no tienen IA. No se confirmó si en 8.x hay una clave
-  cargada.
+- **Qué se vio (2026-10-01, al instalar 0.1.47 y 0.1.48):** al arrancar, el arquitecto no pudo leer
+  su clave de IA ni la URL de su base de mensajes (`vault unreachable`): en un upgrade se reinicia
+  todo el hive y el vault todavía no contestaba. Quedó escuchando con `ai_configured=false` y
+  `messages_db_configured=false`.
+- **Corrección del diagnóstico:** el aviso de arranque del vault (`VAULT_SECRET_CHANGED`, uno por
+  secreto) **sí** llegó: la base de mensajes se reconectó 0,4 s después. La IA sigue apagada porque
+  el vault de 8.x no tiene clave de IA (tiene 3 secretos: edge, TLS y postgres). Aun así, ese aviso
+  sale una sola vez, y el SDK documenta que un nodo que no lo escucha a tiempo queda degradado
+  (así le pasó a SY.storage).
+- **Arreglo:** como SY.storage y SY.identity, las dos lecturas de arranque reintentan hasta que el
+  vault conteste (`resolve_resource_awaiting_vault`, hasta `VAULT_BOOT_WAIT`, las dos a la vez).
+  Las relecturas por aviso o por `CONFIG_SET` siguen siendo de una vez.
 
 ### A-19 ✅ RESUELTO (0.1.43) — La policy publicada esperaba hasta 60 s al watcher de Syncthing
 

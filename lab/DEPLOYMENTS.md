@@ -21,6 +21,7 @@
 
 | Versión | Fecha (ART) | Commit | Alcance | Estado | Rollback |
 |---|---|---|---|---|---|
+| **0.1.49** | 2026-10-01 | `c921d1a` | motherbee + spokes (core) | ✅ live | snap `pre-architect-fixes-0-1-49` (las 4 VMs) · `apt install fluxbee=0.1.48` |
 | **0.1.48** | 2026-10-01 | `1486807` | motherbee + spokes (core) | ✅ live | snap `pre-architect-opa-0-1-48` (las 4 VMs) · `apt install fluxbee=0.1.47` |
 | **0.1.47** | 2026-10-01 | `652a9c9` | motherbee + spokes (core) | ✅ live | snap `pre-opa-blockB-0-1-47` (las 4 VMs) · `apt install fluxbee=0.1.46` |
 | **0.1.46** | 2026-10-01 | `7371ca1` | motherbee + spokes (core) | ✅ live | snap `pre-opa-blockA-0-1-46` (las 4 VMs) · `apt install fluxbee=0.1.45` |
@@ -57,6 +58,33 @@
 > (`dpkg-scanpackages -m`) para rollback, pero su detalle vive en la bitácora, no acá.
 
 ---
+
+## 0.1.49 — arquitecto: un solo admin, el handbook en el `.deb`, el vault esperado al arrancar
+
+- **Fecha:** 2026-10-01 (ART) · **Versión anterior:** 0.1.48 · **Commit:** `c921d1a`
+  (FINDINGS A-24, A-25, A-26). Cambian `sy-architect` y `build-deb.sh`.
+- **Alcance:** motherbee + los tres spokes (core-update).
+- **Qué cambió:**
+  - El snapshot y la consulta `query_hive` del plan compiler le preguntan a `SY.admin@motherbee`
+    con el hive como destino (antes, a `SY.admin@<hive>`, que solo existe en el motherbee).
+  - El `.deb` instala `/etc/fluxbee/handbook_fluxbee.md`, como `install.sh`.
+  - Al arrancar, el arquitecto reintenta leer su clave de IA y la URL de su base de mensajes hasta
+    que el vault conteste (como SY.storage y SY.identity), las dos a la vez.
+- **Build:** 10 min. **Publish:** 49 paquetes (la espera de `pve.py` cortó por conexión; el repo
+  quedó con 0.1.49). Snapshots `pre-architect-fixes-0-1-49` en las 4 VMs (se borró antes
+  `pre-opa-blockA-0-1-46`).
+- **Install:** motherbee 21:59 UTC; spokes 21:59–22:01.
+- **Verificación en vivo:**
+  - Los 4 hives con los mismos binarios; 0 `failed`.
+  - Handbook en `/etc/fluxbee/handbook_fluxbee.md` (30940 bytes).
+  - Arranque del arquitecto: las dos lecturas del vault dieron `vault not reachable yet; retrying` y
+    1,2 s después escuchaba con `messages_db_configured=true` (en 0.1.48 arrancaba en `false` y lo
+    rescataba el aviso del vault). `ai_configured=false`: el vault de 8.x no tiene clave de IA.
+  - El admin del motherbee contesta las cinco lecturas del snapshot para worker1. En ingress1 y
+    egress1 fallan `runtimes` y `wf-rules` (por rol): queda anotado en A-24.
+  - Apply y clear globales: 5,1 s y 5,3 s, los 4 hives. 0 rechazos del gate y 0 descartes por
+    `routing.src`; sin policy de usuario al terminar.
+- **Rollback:** snapshot `pre-architect-fixes-0-1-49` o `apt install fluxbee=0.1.48`.
 
 ## 0.1.48 — el arquitecto declara la policy OPA global (una por sistema, gana la última)
 
