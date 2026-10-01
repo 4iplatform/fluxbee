@@ -11,12 +11,13 @@ mod reconciler;
 use failure_classifier::{classify_failure_deterministic, route_failure, FailureContext};
 use pipeline_types::{
     compiler_class_admin_steps, compiler_class_risk, cookbook_paths,
-    desired_state_unknown_sections, is_valid_ownership_label, manifest_path, ActualStateSnapshot,
-    ArtifactBundle, AuditSeverity, BuildTaskPacket, ChangeType, CookbookEntryV2, CookbookLayer,
-    DeltaReport, DeltaReportStatus, DesiredHive, DesiredNode, DesiredOpaDeployment, DesiredRoute,
-    DesiredRuntime, DesiredVpn, DesiredWfDeployment, FailureClass, PipelineRunRecord,
-    PipelineRunStatus, PipelineStage, RepairPacket, RiskClass, SolutionManifestV2,
-    MAX_DESIGN_ITERATIONS, MIN_DESIGN_SCORE_IMPROVEMENT, UNSUPPORTED_DESIRED_STATE_SECTIONS,
+    desired_state_unknown_sections, is_valid_ownership_label, manifest_path, ActualOpaPolicy,
+    ActualStateSnapshot, ArtifactBundle, AuditSeverity, BuildTaskPacket, ChangeType,
+    CookbookEntryV2, CookbookLayer, DeltaReport, DeltaReportStatus, DesiredHive, DesiredNode,
+    DesiredOpaPolicy, DesiredRoute, DesiredRuntime, DesiredVpn, DesiredWfDeployment, FailureClass,
+    PipelineRunRecord, PipelineRunStatus, PipelineStage, RepairPacket, RiskClass,
+    SolutionManifestV2, MAX_DESIGN_ITERATIONS, MIN_DESIGN_SCORE_IMPROVEMENT,
+    UNSUPPORTED_DESIRED_STATE_SECTIONS,
 };
 
 use std::collections::{hash_map::DefaultHasher, BTreeMap, HashMap};
@@ -2328,6 +2329,7 @@ Use these facts only to select and validate planning intent. Do not treat them a
 - If the operator describes message fan-out, mirroring, relay, echo, or branching between known nodes, first consider routing/workflow tools before inventing new intermediate nodes.
 - OPA is for policy-based target resolution and enforcement when the destination is not explicit. It is not the primary tool for deterministic business-process orchestration between named nodes.
 - If the target nodes are already explicitly named, prefer routes/workflows over OPA unless the operator explicitly asks for policy-driven routing.
+- There is ONE user OPA policy for every hive: the motherbee compiles and publishes it and every hive installs it. `opa_*` steps take no hive; `opa_clear` removes it from every hive.
 
 ### IO and SY node boundaries
 
@@ -2445,7 +2447,7 @@ After all six `assess_layer` calls, call `submit_solution_manifest` once with th
   - nodes
   - routing
   - wf_deployments
-  - opa_deployments
+  - opa
   - ownership
 - Never include policy or identity in desired_state.
 - Nodes must use Fluxbee names like AI.name@hive, WF.name@hive, IO.name@hive, SY.name@hive.
@@ -2457,6 +2459,12 @@ Every resource you declare must include an `ownership` field:
 - `"ownership": "solution"` — for resources this solution owns. The reconciler will create, update, and delete these to match desired_state.
 - `"ownership": "external"` — for pre-existing resources that must not be touched. The reconciler will not delete or modify these.
 - Default when omitted: `"external"` (conservative — never use the omission for resources you intend to manage).
+
+## OPA rules
+
+- `desired_state.opa` is ONE user policy for every hive: `{"rego_source": "<rego>", "entrypoint": "router/target", "ownership": "solution"}`. It takes no hive: the motherbee compiles it and every hive installs it.
+- There is one user policy in the whole system. If another solution already declares one, the last one applied replaces it on every hive.
+- Omit `opa` when the solution does not need policy-based routing.
 
 ## Runtime package_source rules
 
@@ -2646,7 +2654,7 @@ fn designer_manifest_section_count(manifest: &SolutionManifestV2) -> usize {
         desired.nodes.as_ref().map(|_| ()),
         desired.routing.as_ref().map(|_| ()),
         desired.wf_deployments.as_ref().map(|_| ()),
-        desired.opa_deployments.as_ref().map(|_| ()),
+        desired.opa.as_ref().map(|_| ()),
         desired.ownership.as_ref().map(|_| ()),
     ];
     sections.into_iter().flatten().count()
@@ -20042,23 +20050,22 @@ fn validate_manifest_v2(manifest: &SolutionManifestV2) -> Result<(), String> {
         }
     }
 
-    if let Some(policies) = &manifest.desired_state.opa_deployments {
-        for (idx, item) in policies.iter().enumerate() {
-            let opa: DesiredOpaDeployment = serde_json::from_value(item.clone())
-                .map_err(|err| format!("desired_state.opa_deployments[{idx}] invalid: {err}"))?;
-            if opa.hive.trim().is_empty()
-                || opa.policy_id.trim().is_empty()
-                || opa.rego_source.trim().is_empty()
-            {
-                return Err(format!(
-                    "desired_state.opa_deployments[{idx}] requires non-empty hive, policy_id, and rego_source"
-                ));
-            }
-            if !is_valid_ownership_label(&opa.ownership) {
-                return Err(format!(
-                    "desired_state.opa_deployments[{idx}].ownership must be one of solution/system/external"
-                ));
-            }
+    if let Some(opa) = &manifest.desired_state.opa {
+        if opa.get("hive").is_some() {
+            return Err(
+                "desired_state.opa is the one user policy for every hive; it takes no 'hive'"
+                    .to_string(),
+            );
+        }
+        let policy: DesiredOpaPolicy = serde_json::from_value(opa.clone())
+            .map_err(|err| format!("desired_state.opa invalid: {err}"))?;
+        if policy.rego_source.trim().is_empty() {
+            return Err("desired_state.opa requires a non-empty rego_source".to_string());
+        }
+        if !is_valid_ownership_label(&policy.ownership) {
+            return Err(
+                "desired_state.opa.ownership must be one of solution/system/external".to_string(),
+            );
         }
     }
 
@@ -21108,6 +21115,65 @@ fn pipeline_state_from_run(run: &PipelineRunRecord) -> serde_json::Value {
     serde_json::from_str(&run.state_json).unwrap_or_else(|_| json!({}))
 }
 
+/// The plan compiler's context for a pipeline run: the declared user policy, which an
+/// `opa_compile_apply` step must carry exactly (`pin_opa_plan_steps` enforces it afterwards).
+fn pipeline_plan_compiler_context(run_state: &Value) -> String {
+    let Some(policy) = run_state
+        .get("desired_opa")
+        .and_then(|value| serde_json::from_value::<DesiredOpaPolicy>(value.clone()).ok())
+    else {
+        return String::new();
+    };
+    format!(
+        "desired_state.opa is the user policy for every hive. An opa_compile_apply step takes exactly these args, and no hive: {}",
+        json!({ "rego": policy.rego_source, "entrypoint": policy.entrypoint })
+    )
+}
+
+/// Pins the plan's OPA steps to what the manifest declares: `opa_compile_apply` carries exactly the
+/// declared rego and entrypoint, `opa_clear` nothing, and neither names a hive (there is one user
+/// policy for every hive). Steps follow the delta's operations in order (validate_plan_against_delta).
+fn pin_opa_plan_steps(
+    plan: &mut Value,
+    delta: &DeltaReport,
+    run_state: &Value,
+) -> Result<(), String> {
+    let desired = run_state
+        .get("desired_opa")
+        .filter(|value| !value.is_null())
+        .map(|value| serde_json::from_value::<DesiredOpaPolicy>(value.clone()))
+        .transpose()
+        .map_err(|err| format!("desired_state.opa invalid: {err}"))?;
+    let steps = plan
+        .pointer_mut("/execution/steps")
+        .and_then(Value::as_array_mut)
+        .ok_or("executor plan execution.steps must be an array")?;
+    let mut next = 0;
+    for op in &delta.operations {
+        if op.change_type == ChangeType::Noop {
+            continue;
+        }
+        let count = compiler_class_admin_steps(&op.compiler_class).map_or(0, |steps| steps.len());
+        let args = match op.compiler_class {
+            pipeline_types::CompilerClass::OpaApply => {
+                let policy = desired.as_ref().ok_or(
+                    "the plan applies a user policy the manifest does not declare (desired_state.opa)",
+                )?;
+                Some(json!({ "rego": policy.rego_source, "entrypoint": policy.entrypoint }))
+            }
+            pipeline_types::CompilerClass::OpaRemove => Some(json!({})),
+            _ => None,
+        };
+        if let Some(args) = args {
+            for step in steps.iter_mut().skip(next).take(count) {
+                step["args"] = args.clone();
+            }
+        }
+        next += count;
+    }
+    Ok(())
+}
+
 fn pipeline_task_summary(
     run_state: &Value,
     solution_id: Option<&str>,
@@ -21341,6 +21407,12 @@ fn build_confirm2_payload(
 ) -> Value {
     let (destructive_actions, restarting_actions, blocked_actions) =
         summarize_delta_operations_by_risk(delta_report);
+    // One user policy for every hive: what the plan does to it, and whose policy it replaces.
+    let user_policy = delta_report
+        .operations
+        .iter()
+        .find(|op| op.resource_type == reconciler::OPA_POLICY_RESOURCE_TYPE)
+        .map(|op| json!({ "change_type": op.change_type, "notes": op.notes }));
     json!({
         "message": "Plan compiled and validated. Reply CONFIRM to execute or CANCEL to discard.",
         "pipeline_run_id": pipeline_run_id,
@@ -21355,6 +21427,7 @@ fn build_confirm2_payload(
         "destructive_actions": destructive_actions,
         "restarting_actions": restarting_actions,
         "blocked_actions": blocked_actions,
+        "user_policy": user_policy,
     })
 }
 
@@ -22463,7 +22536,7 @@ async fn handle_pipeline_plan_compile(
         &tool_ctx,
         &task,
         &state.hive_id,
-        "",
+        &pipeline_plan_compiler_context(&run_state),
         Some(&delta_report),
         expanded_approved_artifacts.as_ref(),
         plan_initial_tokens,
@@ -22611,10 +22684,30 @@ async fn handle_pipeline_plan_compile(
     }
     let human_summary = output.human_summary.clone();
     let plan_compile_tokens = output.tokens_used;
-    let plan = output
+    let mut plan = output
         .plan
         .clone()
         .expect("plan_ready pipeline output must include a plan");
+    if let Err(err) = pin_opa_plan_steps(&mut plan, &delta_report, &run_state) {
+        let _ = block_pipeline_run(
+            state,
+            &pipeline_run.pipeline_run_id,
+            &format!("plan OPA steps could not be pinned: {err}"),
+            &FailureClass::PlanContractInvalid,
+        )
+        .await;
+        return ChatResponse {
+            status: "blocked".to_string(),
+            mode: "pipeline".to_string(),
+            output: json!({
+                "message": format!("Pipeline blocked: {err}"),
+                "pipeline_run_id": pipeline_run.pipeline_run_id,
+                "stage": "blocked",
+            }),
+            session_id: Some(session.session_id.clone()),
+            session_title: Some(session.title.clone()),
+        };
+    }
     let confirm2_payload = build_confirm2_payload(
         &pipeline_run.pipeline_run_id,
         &delta_report,
@@ -22817,7 +22910,7 @@ async fn compile_pipeline_plan_with_context(
         context,
         &task,
         &context.hive_id,
-        "",
+        &pipeline_plan_compiler_context(&run_state),
         Some(&delta_report),
         expanded_approved_artifacts.as_ref(),
         design_tokens_used.saturating_add(artifact_tokens_used),
@@ -22955,10 +23048,25 @@ async fn compile_pipeline_plan_with_context(
     }
     let human_summary = output.human_summary.clone();
     let plan_compile_tokens = output.tokens_used;
-    let plan = output
+    let mut plan = output
         .plan
         .clone()
         .expect("plan_ready pipeline output must include a plan");
+    if let Err(err) = pin_opa_plan_steps(&mut plan, &delta_report, &run_state) {
+        let _ = block_pipeline_run_with_context(
+            context,
+            &pipeline_run.pipeline_run_id,
+            &format!("plan OPA steps could not be pinned: {err}"),
+            &FailureClass::PlanContractInvalid,
+        )
+        .await;
+        return Ok(json!({
+            "status": "blocked",
+            "message": format!("Pipeline blocked: {err}"),
+            "pipeline_run_id": pipeline_run.pipeline_run_id,
+            "stage": "blocked",
+        }));
+    }
     let total_tokens = design_tokens_used
         .saturating_add(artifact_tokens_used)
         .saturating_add(plan_compile_tokens);
@@ -23097,14 +23205,11 @@ async fn continue_pipeline_after_design_with_context(
         .as_ref()
         .map(|items| !items.is_empty())
         .unwrap_or(false);
-    let include_opa = manifest
-        .desired_state
-        .opa_deployments
-        .as_ref()
-        .map(|items| !items.is_empty())
-        .unwrap_or(false);
+    let opa_declarations = saved_opa_declarations(&context.state_dir);
+    let opa_scope = opa_in_scope(&manifest, &solution_id, &opa_declarations)
+        .then_some(opa_declarations.as_slice());
     let snapshot =
-        match build_actual_state_snapshot(context, &target_hives, include_wf, include_opa).await {
+        match build_actual_state_snapshot(context, &target_hives, include_wf, opa_scope).await {
             Ok(snapshot) => snapshot,
             Err(err) => {
                 let _ = block_pipeline_run_with_context(
@@ -23124,24 +23229,25 @@ async fn continue_pipeline_after_design_with_context(
         };
 
     let manifest_ref = format!("manifest://{solution_id}/current");
-    let reconciler_output = match reconciler::run_reconciler(&manifest, &snapshot, &manifest_ref) {
-        Ok(output) => output,
-        Err(err) => {
-            let _ = block_pipeline_run_with_context(
-                context,
-                &pipeline_run.pipeline_run_id,
-                &format!("reconciler failed: {err}"),
-                &FailureClass::DeltaUnsupported,
-            )
-            .await;
-            return Ok(json!({
-                "status": "blocked",
-                "message": format!("Pipeline blocked during reconcile: {err}"),
-                "pipeline_run_id": pipeline_run.pipeline_run_id,
-                "stage": "blocked",
-            }));
-        }
-    };
+    let reconciler_output =
+        match reconciler::run_reconciler(&manifest, &snapshot, &manifest_ref, &solution_id) {
+            Ok(output) => output,
+            Err(err) => {
+                let _ = block_pipeline_run_with_context(
+                    context,
+                    &pipeline_run.pipeline_run_id,
+                    &format!("reconciler failed: {err}"),
+                    &FailureClass::DeltaUnsupported,
+                )
+                .await;
+                return Ok(json!({
+                    "status": "blocked",
+                    "message": format!("Pipeline blocked during reconcile: {err}"),
+                    "pipeline_run_id": pipeline_run.pipeline_run_id,
+                    "stage": "blocked",
+                }));
+            }
+        };
 
     let next_stage = if reconciler_output.delta_report.status != DeltaReportStatus::Ready {
         PipelineStage::Blocked
@@ -23158,6 +23264,8 @@ async fn continue_pipeline_after_design_with_context(
         "delta_report": reconciler_output.delta_report,
         "build_task_packets": reconciler_output.build_task_packets,
         "reconciler_diagnostics": reconciler_output.diagnostics,
+        // The plan compiler gets the declared rego from here and its steps are pinned to it.
+        "desired_opa": manifest.desired_state.opa,
     });
     let mut current_run = advance_pipeline_run_with_context(
         context,
@@ -23337,68 +23445,60 @@ async fn handle_pipeline_confirm1(
         .as_ref()
         .map(|items| !items.is_empty())
         .unwrap_or(false);
-    let include_opa = manifest
-        .desired_state
-        .opa_deployments
-        .as_ref()
-        .map(|items| !items.is_empty())
-        .unwrap_or(false);
+    let opa_declarations = saved_opa_declarations(&state.state_dir);
+    let opa_scope = opa_in_scope(&manifest, &solution_id, &opa_declarations)
+        .then_some(opa_declarations.as_slice());
     let tool_ctx = admin_tool_context(state, Some(&session.session_id));
-    let snapshot = match build_actual_state_snapshot(
-        &tool_ctx,
-        &target_hives,
-        include_wf,
-        include_opa,
-    )
-    .await
-    {
-        Ok(snapshot) => snapshot,
-        Err(err) => {
-            let _ = block_pipeline_run(
-                state,
-                &pipeline_run.pipeline_run_id,
-                &format!("snapshot build failed: {err}"),
-                &FailureClass::SnapshotPartialBlocking,
-            )
-            .await;
-            return ChatResponse {
-                status: "error".to_string(),
-                mode: "pipeline".to_string(),
-                output: json!({
-                    "message": format!("Pipeline blocked during snapshot build: {err}"),
-                    "pipeline_run_id": pipeline_run.pipeline_run_id,
-                    "stage": "reconcile",
-                }),
-                session_id: Some(session.session_id.clone()),
-                session_title: Some(session.title.clone()),
-            };
-        }
-    };
+    let snapshot =
+        match build_actual_state_snapshot(&tool_ctx, &target_hives, include_wf, opa_scope).await {
+            Ok(snapshot) => snapshot,
+            Err(err) => {
+                let _ = block_pipeline_run(
+                    state,
+                    &pipeline_run.pipeline_run_id,
+                    &format!("snapshot build failed: {err}"),
+                    &FailureClass::SnapshotPartialBlocking,
+                )
+                .await;
+                return ChatResponse {
+                    status: "error".to_string(),
+                    mode: "pipeline".to_string(),
+                    output: json!({
+                        "message": format!("Pipeline blocked during snapshot build: {err}"),
+                        "pipeline_run_id": pipeline_run.pipeline_run_id,
+                        "stage": "reconcile",
+                    }),
+                    session_id: Some(session.session_id.clone()),
+                    session_title: Some(session.title.clone()),
+                };
+            }
+        };
 
     let manifest_ref = format!("manifest://{solution_id}/current");
-    let reconciler_output = match reconciler::run_reconciler(&manifest, &snapshot, &manifest_ref) {
-        Ok(output) => output,
-        Err(err) => {
-            let _ = block_pipeline_run(
-                state,
-                &pipeline_run.pipeline_run_id,
-                &format!("reconciler failed: {err}"),
-                &FailureClass::DeltaUnsupported,
-            )
-            .await;
-            return ChatResponse {
-                status: "error".to_string(),
-                mode: "pipeline".to_string(),
-                output: json!({
-                    "message": format!("Pipeline blocked during reconcile: {err}"),
-                    "pipeline_run_id": pipeline_run.pipeline_run_id,
-                    "stage": "reconcile",
-                }),
-                session_id: Some(session.session_id.clone()),
-                session_title: Some(session.title.clone()),
-            };
-        }
-    };
+    let reconciler_output =
+        match reconciler::run_reconciler(&manifest, &snapshot, &manifest_ref, &solution_id) {
+            Ok(output) => output,
+            Err(err) => {
+                let _ = block_pipeline_run(
+                    state,
+                    &pipeline_run.pipeline_run_id,
+                    &format!("reconciler failed: {err}"),
+                    &FailureClass::DeltaUnsupported,
+                )
+                .await;
+                return ChatResponse {
+                    status: "error".to_string(),
+                    mode: "pipeline".to_string(),
+                    output: json!({
+                        "message": format!("Pipeline blocked during reconcile: {err}"),
+                        "pipeline_run_id": pipeline_run.pipeline_run_id,
+                        "stage": "reconcile",
+                    }),
+                    session_id: Some(session.session_id.clone()),
+                    session_title: Some(session.title.clone()),
+                };
+            }
+        };
 
     let next_stage = if reconciler_output.delta_report.status != DeltaReportStatus::Ready {
         PipelineStage::Blocked
@@ -23415,6 +23515,8 @@ async fn handle_pipeline_confirm1(
         "delta_report": reconciler_output.delta_report,
         "build_task_packets": reconciler_output.build_task_packets,
         "reconciler_diagnostics": reconciler_output.diagnostics,
+        // The plan compiler gets the declared rego from here and its steps are pinned to it.
+        "desired_opa": manifest.desired_state.opa,
     });
     if let Err(err) = advance_pipeline_run(
         state,
@@ -23909,11 +24011,119 @@ async fn handle_pipeline_confirm2(
 
 // ── TB-1/TB-2: snapshot builder ───────────────────────────────────────────
 
+/// One saved manifest's declaration of the user policy.
+#[derive(Debug, Clone, PartialEq)]
+struct OpaDeclaration {
+    solution_id: String,
+    version: String,
+    rego: String,
+}
+
+/// Every user-policy declaration in the saved manifests (`manifests/<solution>/<version>.json`).
+/// Read as raw JSON so one manifest saved under an older schema does not hide the others.
+fn saved_opa_declarations(state_dir: &Path) -> Vec<OpaDeclaration> {
+    let mut found = Vec::new();
+    let Ok(solutions) = fs::read_dir(state_dir.join("manifests")) else {
+        return found;
+    };
+    for solution in solutions.flatten() {
+        let solution_id = solution.file_name().to_string_lossy().into_owned();
+        let Ok(versions) = fs::read_dir(solution.path()) else {
+            continue;
+        };
+        for entry in versions.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|ext| ext.to_str()) != Some("json") {
+                continue;
+            }
+            let Some(version) = path.file_stem().and_then(|stem| stem.to_str()) else {
+                continue;
+            };
+            let Some(manifest) = fs::read_to_string(&path)
+                .ok()
+                .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
+            else {
+                continue;
+            };
+            if let Some(rego) = manifest
+                .pointer("/desired_state/opa/rego_source")
+                .and_then(Value::as_str)
+            {
+                found.push(OpaDeclaration {
+                    solution_id: solution_id.clone(),
+                    version: version.to_string(),
+                    rego: rego.to_string(),
+                });
+            }
+        }
+    }
+    found
+}
+
+/// The solution whose saved manifest most recently declared exactly `rego` (versions are
+/// `v<epoch ms>`). That solution owns the running policy: the last one applied wins.
+fn opa_policy_declared_by(declarations: &[OpaDeclaration], rego: &str) -> Option<String> {
+    let saved_at = |version: &str| version.trim_start_matches('v').parse::<u64>().unwrap_or(0);
+    declarations
+        .iter()
+        .filter(|declaration| !rego.is_empty() && declaration.rego == rego)
+        .max_by_key(|declaration| saved_at(&declaration.version))
+        .map(|declaration| declaration.solution_id.clone())
+}
+
+/// OPA is in scope when the manifest declares a policy, or when a saved version of this solution
+/// did: then the reconciler may have to clear the policy the solution no longer declares.
+fn opa_in_scope(
+    manifest: &SolutionManifestV2,
+    solution_id: &str,
+    declarations: &[OpaDeclaration],
+) -> bool {
+    manifest.desired_state.opa.is_some()
+        || declarations
+            .iter()
+            .any(|declaration| declaration.solution_id == solution_id)
+}
+
+/// The motherbee's `opa_get_policy` answer as the running user policy, with the solution that
+/// declared it.
+fn running_opa_policy(
+    response: &Value,
+    declarations: &[OpaDeclaration],
+) -> Option<ActualOpaPolicy> {
+    let entry = response
+        .pointer("/payload/responses")?
+        .as_array()?
+        .iter()
+        .find(|entry| entry.get("hive").and_then(Value::as_str) == Some(PRIMARY_HIVE_ID))?;
+    let policy = entry.get("payload")?;
+    let text = |key: &str| {
+        policy
+            .get(key)
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string()
+    };
+    let (hash, rego) = (text("hash"), text("rego"));
+    let declared_by = if hash.is_empty() {
+        None
+    } else {
+        opa_policy_declared_by(declarations, &rego)
+    };
+    Some(ActualOpaPolicy {
+        version: policy.get("version").and_then(Value::as_u64).unwrap_or(0),
+        hash,
+        rego,
+        entrypoint: text("entrypoint"),
+        declared_by,
+    })
+}
+
+/// `opa_declarations`: Some when OPA is in scope (see `opa_in_scope`).
 async fn build_actual_state_snapshot(
     context: &ArchitectAdminToolContext,
     hives: &[String],
     include_wf: bool,
-    include_opa: bool,
+    opa_declarations: Option<&[OpaDeclaration]>,
 ) -> Result<ActualStateSnapshot, ArchitectError> {
     use pipeline_types::{
         HiveResources, HiveSnapshotStatus, SnapshotAtomicity, SnapshotCompleteness, SnapshotScope,
@@ -24056,28 +24266,6 @@ async fn build_actual_state_snapshot(
             }
         }
 
-        // opa_get_status (required when opa is in scope)
-        if include_opa {
-            match execute_admin_action_with_context(
-                context,
-                &admin_target,
-                "opa_get_status",
-                Some(hive),
-                serde_json::json!({}),
-                "snapshot.opa",
-            )
-            .await
-            {
-                Ok(v) if v.get("status").and_then(|s| s.as_str()) == Some("ok") => {
-                    hive_res.opa_state = v.get("payload").cloned();
-                }
-                _ => {
-                    missing_sections.push(format!("{hive}.opa_state"));
-                    section_failed = true;
-                }
-            }
-        }
-
         hive_status.insert(
             hive.clone(),
             HiveSnapshotStatus {
@@ -24090,6 +24278,29 @@ async fn build_actual_state_snapshot(
             },
         );
         resources.insert(hive.clone(), hive_res);
+    }
+
+    // The user policy is the same on every hive: read it once, from the motherbee.
+    let mut opa = None;
+    if let Some(declarations) = opa_declarations {
+        let response = execute_admin_action_with_context(
+            context,
+            &format!("SY.admin@{PRIMARY_HIVE_ID}"),
+            "opa_get_policy",
+            Some(PRIMARY_HIVE_ID),
+            serde_json::json!({}),
+            "snapshot.opa",
+        )
+        .await;
+        opa = match response {
+            Ok(v) if v.get("status").and_then(|s| s.as_str()) == Some("ok") => {
+                running_opa_policy(&v, declarations)
+            }
+            _ => None,
+        };
+        if opa.is_none() {
+            missing_sections.push("global.opa".to_string());
+        }
     }
 
     let is_partial = !missing_sections.is_empty();
@@ -24108,7 +24319,7 @@ async fn build_actual_state_snapshot(
                 if include_wf {
                     s.push("wf");
                 }
-                if include_opa {
+                if opa_declarations.is_some() {
                     s.push("opa");
                 }
                 s.iter().map(|r| r.to_string()).collect()
@@ -24120,6 +24331,7 @@ async fn build_actual_state_snapshot(
         },
         hive_status,
         resources,
+        opa,
         completeness: SnapshotCompleteness {
             is_partial,
             missing_sections,
@@ -24496,6 +24708,283 @@ mod tests {
         .expect("manifest parses");
         let err = validate_manifest_v2(&manifest).expect_err("runtime is required");
         assert!(err.contains("requires non-empty node_name, hive, and runtime"));
+    }
+
+    fn manifest_with_opa(opa: Value) -> SolutionManifestV2 {
+        serde_json::from_value(json!({
+            "manifest_version": "2.0",
+            "solution": { "name": "demo" },
+            "desired_state": { "opa": opa },
+            "advisory": {}
+        }))
+        .expect("manifest parses")
+    }
+
+    #[test]
+    fn a_solution_declares_one_user_policy_without_a_hive() {
+        let rego = "package router\n\ndefault target = null\n";
+        assert!(validate_manifest_v2(&manifest_with_opa(json!({ "rego_source": rego }))).is_ok());
+
+        let err = validate_manifest_v2(&manifest_with_opa(
+            json!({ "hive": "worker1", "rego_source": rego }),
+        ))
+        .expect_err("a hive is refused");
+        assert!(err.contains("takes no 'hive'"), "{err}");
+        let err = validate_manifest_v2(&manifest_with_opa(json!({ "rego_source": " " })))
+            .expect_err("an empty rego is refused");
+        assert!(err.contains("non-empty rego_source"), "{err}");
+
+        // The per-hive list is gone: it is an unknown section now.
+        let old: SolutionManifestV2 = serde_json::from_value(json!({
+            "manifest_version": "2.0",
+            "solution": { "name": "demo" },
+            "desired_state": { "opa_deployments": [] },
+            "advisory": {}
+        }))
+        .expect("manifest parses");
+        assert!(validate_manifest_v2(&old).is_err());
+    }
+
+    fn write_saved_manifest(state_dir: &Path, solution: &str, version: &str, desired: Value) {
+        let dir = state_dir.join("manifests").join(solution);
+        std::fs::create_dir_all(&dir).expect("manifest dir");
+        let manifest = json!({ "manifest_version": "2.0", "solution": {}, "desired_state": desired, "advisory": {} });
+        std::fs::write(dir.join(format!("{version}.json")), manifest.to_string()).expect("write");
+    }
+
+    #[test]
+    fn the_running_policy_belongs_to_the_solution_that_declared_it_last() {
+        let state_dir = test_temp_dir("opa-owner");
+        let first = "package router\n\ndefault target = null\n";
+        let second = "package router\n\ndefault target = \"AI.b@motherbee\"\n";
+        write_saved_manifest(
+            &state_dir,
+            "sol-a",
+            "v1000000000100",
+            json!({ "opa": { "rego_source": first } }),
+        );
+        write_saved_manifest(
+            &state_dir,
+            "sol-a",
+            "v1000000000300",
+            json!({ "nodes": [] }),
+        );
+        write_saved_manifest(
+            &state_dir,
+            "sol-b",
+            "v1000000000200",
+            json!({ "opa": { "rego_source": first } }),
+        );
+        write_saved_manifest(
+            &state_dir,
+            "sol-b",
+            "v1000000000400",
+            json!({ "opa": { "rego_source": second } }),
+        );
+        write_saved_manifest(
+            &state_dir,
+            "sol-old",
+            "v1000000000500",
+            json!({ "opa_deployments": [{ "hive": "motherbee" }] }),
+        );
+        std::fs::write(
+            state_dir.join("manifests/sol-a/notes.txt"),
+            "not a manifest",
+        )
+        .expect("write");
+
+        let declarations = saved_opa_declarations(&state_dir);
+        assert_eq!(declarations.len(), 3);
+        assert_eq!(
+            opa_policy_declared_by(&declarations, first),
+            Some("sol-b".to_string())
+        );
+        assert_eq!(
+            opa_policy_declared_by(&declarations, second),
+            Some("sol-b".to_string())
+        );
+        assert_eq!(
+            opa_policy_declared_by(&declarations, "package router\n"),
+            None
+        );
+        assert_eq!(opa_policy_declared_by(&declarations, ""), None);
+
+        // In scope when the manifest declares a policy or the solution declared one before.
+        let without = manifest_with_opa(Value::Null);
+        assert!(!opa_in_scope(&without, "sol-c", &declarations));
+        assert!(opa_in_scope(&without, "sol-a", &declarations));
+        assert!(opa_in_scope(
+            &manifest_with_opa(json!({ "rego_source": first })),
+            "sol-c",
+            &declarations
+        ));
+        assert!(saved_opa_declarations(&state_dir.join("missing")).is_empty());
+        let _ = std::fs::remove_dir_all(&state_dir);
+    }
+
+    #[test]
+    fn the_snapshot_reads_the_running_policy_from_the_motherbee() {
+        let rego = "package router\n\ndefault target = null\n";
+        let declarations = vec![OpaDeclaration {
+            solution_id: "sol-a".to_string(),
+            version: "v1".to_string(),
+            rego: rego.to_string(),
+        }];
+        let answer = |payload: Value| {
+            json!({ "status": "ok", "payload": { "responses": [
+                { "hive": "motherbee", "status": "ok", "payload": payload }
+            ] } })
+        };
+        let running = running_opa_policy(
+            &answer(json!({ "version": 7, "hash": "sha256:ab", "rego": rego, "entrypoint": "router/target" })),
+            &declarations,
+        )
+        .expect("policy");
+        assert_eq!(
+            running,
+            ActualOpaPolicy {
+                version: 7,
+                hash: "sha256:ab".to_string(),
+                rego: rego.to_string(),
+                entrypoint: "router/target".to_string(),
+                declared_by: Some("sol-a".to_string()),
+            }
+        );
+        let none = running_opa_policy(
+            &answer(json!({ "version": 0, "hash": "", "rego": "" })),
+            &declarations,
+        )
+        .expect("no policy is an answer too");
+        assert_eq!(none, ActualOpaPolicy::default());
+        assert!(
+            running_opa_policy(&json!({ "status": "ok", "payload": {} }), &declarations).is_none()
+        );
+    }
+
+    #[test]
+    fn the_snapshot_parses_the_admin_reply_as_it_arrives_from_the_motherbee() {
+        // GET /hives/motherbee/opa/policy on 8.x (0.1.47, 2026-10-01): the body the admin returns
+        // for opa_get_policy, which reaches the architect through the SDK's admin reply parser.
+        let body = json!({
+            "action": "get_policy", "error_code": null, "error_detail": null,
+            "expected_hives_policy": ["motherbee"], "expected_hives_topology": ["motherbee"],
+            "pending": [], "pending_hives_policy": [], "pending_hives_topology": [],
+            "responses": [{ "hive": "motherbee", "status": "ok", "payload": {
+                "compiled_at": "2026-10-01T20:53:03Z", "entrypoint": "router/target",
+                "hash": "sha256:88cd27963b1daf93e2ed7ff3bd47cdcaaf9e775edbf1b602b97e2704c49205bc",
+                "hive": "motherbee", "rego": "package router\n\ndefault target = null\n",
+                "status": "ok", "version": 19
+            } }],
+            "status": "ok"
+        });
+        let reply = json!({
+            "status": "ok",
+            "payload": fluxbee_sdk::admin_response_payload_value(&body),
+        });
+        let running = running_opa_policy(&reply, &[]).expect("policy");
+        assert_eq!(running.version, 19);
+        assert_eq!(running.rego, "package router\n\ndefault target = null\n");
+        assert_eq!(running.entrypoint, "router/target");
+        assert!(running.hash.starts_with("sha256:88cd"));
+        assert_eq!(running.declared_by, None);
+    }
+
+    fn opa_delta(classes: &[pipeline_types::CompilerClass]) -> DeltaReport {
+        DeltaReport {
+            delta_report_version: "0.1".to_string(),
+            status: DeltaReportStatus::Ready,
+            manifest_ref: "manifest://sol-a/current".to_string(),
+            snapshot_ref: "snap".to_string(),
+            summary: DeltaSummary::default(),
+            operations: classes
+                .iter()
+                .map(|class| DeltaOperation {
+                    op_id: format!("op-{class:?}"),
+                    resource_type: "x".to_string(),
+                    resource_id: "x".to_string(),
+                    change_type: ChangeType::Update,
+                    ownership: "solution".to_string(),
+                    compiler_class: class.clone(),
+                    desired_ref: None,
+                    actual_ref: None,
+                    blocking: false,
+                    payload_ref: None,
+                    notes: vec![],
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn opa_steps_carry_exactly_the_declared_policy_and_no_hive() {
+        let rego = "package router\n\ndefault target = null\n";
+        let run_state = json!({ "desired_opa": { "rego_source": rego } });
+        let mut plan = json!({ "execution": { "steps": [
+            { "id": "s1", "action": "add_route", "args": { "prefix": "AI.a" } },
+            { "id": "s2", "action": "opa_compile_apply", "args": { "rego": "package router", "hive": "worker1" } }
+        ] } });
+        let delta = opa_delta(&[
+            pipeline_types::CompilerClass::RouteAdd,
+            pipeline_types::CompilerClass::OpaApply,
+        ]);
+        pin_opa_plan_steps(&mut plan, &delta, &run_state).expect("pinned");
+        assert_eq!(
+            plan["execution"]["steps"][0]["args"],
+            json!({ "prefix": "AI.a" })
+        );
+        assert_eq!(
+            plan["execution"]["steps"][1]["args"],
+            json!({ "rego": rego, "entrypoint": "router/target" })
+        );
+
+        let mut clear = json!({ "execution": { "steps": [
+            { "id": "s1", "action": "opa_clear", "args": { "hive": "worker1" } }
+        ] } });
+        let delta = opa_delta(&[pipeline_types::CompilerClass::OpaRemove]);
+        pin_opa_plan_steps(&mut clear, &delta, &json!({})).expect("pinned");
+        assert_eq!(clear["execution"]["steps"][0]["args"], json!({}));
+
+        let mut plan = json!({ "execution": { "steps": [
+            { "id": "s1", "action": "opa_compile_apply", "args": { "rego": "x" } }
+        ] } });
+        let delta = opa_delta(&[pipeline_types::CompilerClass::OpaApply]);
+        assert!(pin_opa_plan_steps(&mut plan, &delta, &json!({})).is_err());
+
+        assert!(pipeline_plan_compiler_context(&run_state).contains("router/target"));
+        assert!(pipeline_plan_compiler_context(&json!({})).is_empty());
+    }
+
+    #[test]
+    fn the_confirmation_says_whose_policy_the_plan_replaces() {
+        let trace = build_plan_compile_trace(
+            "task",
+            "motherbee",
+            None,
+            "ok",
+            None,
+            None,
+            vec![],
+            None,
+            vec![],
+            0,
+            0,
+            None,
+            0,
+        );
+        let mut delta = opa_delta(&[pipeline_types::CompilerClass::OpaApply]);
+        delta.operations[0].resource_type = reconciler::OPA_POLICY_RESOURCE_TYPE.to_string();
+        delta.operations[0].notes =
+            vec!["replaces the user policy declared by solution 'sol-b'".to_string()];
+        let payload = build_confirm2_payload("run-1", &delta, "summary", &trace);
+        assert_eq!(payload["user_policy"]["change_type"], json!("update"));
+        assert!(payload["user_policy"]["notes"][0]
+            .as_str()
+            .unwrap()
+            .contains("'sol-b'"));
+
+        let delta = opa_delta(&[pipeline_types::CompilerClass::RouteAdd]);
+        let payload = build_confirm2_payload("run-1", &delta, "summary", &trace);
+        assert!(payload["user_policy"].is_null());
     }
 
     #[test]
@@ -26506,6 +26995,7 @@ mod tests {
             },
             hive_status,
             resources,
+            opa: None,
             completeness: SnapshotCompleteness {
                 is_partial: true,
                 missing_sections: vec!["worker-220".to_string()],
@@ -26513,7 +27003,7 @@ mod tests {
             },
         };
 
-        let output = run_reconciler(&manifest, &snapshot, "manifest-tg7")
+        let output = run_reconciler(&manifest, &snapshot, "manifest-tg7", "tg7")
             .expect("reconciler must not error on partial snapshot");
 
         assert_eq!(

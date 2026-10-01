@@ -38,7 +38,8 @@ pub struct DesiredStateV2 {
     pub nodes: Option<Vec<serde_json::Value>>,
     pub routing: Option<Vec<serde_json::Value>>,
     pub wf_deployments: Option<Vec<serde_json::Value>>,
-    pub opa_deployments: Option<Vec<serde_json::Value>>,
+    /// The solution's user OPA policy (`DesiredOpaPolicy`): one policy for every hive.
+    pub opa: Option<serde_json::Value>,
     pub ownership: Option<serde_json::Value>,
     #[serde(flatten, default)]
     pub extra_sections: HashMap<String, serde_json::Value>,
@@ -68,7 +69,23 @@ pub struct ActualStateSnapshot {
     pub atomicity: SnapshotAtomicity,
     pub hive_status: HashMap<String, HiveSnapshotStatus>,
     pub resources: HashMap<String, HiveResources>,
+    /// The user OPA policy, read once from the motherbee (it is the same on every hive). None when
+    /// OPA is not in scope for this run.
+    #[serde(default)]
+    pub opa: Option<ActualOpaPolicy>,
     pub completeness: SnapshotCompleteness,
+}
+
+/// The user policy running on every hive. Empty `hash` when there is none.
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
+pub struct ActualOpaPolicy {
+    pub version: u64,
+    pub hash: String,
+    pub rego: String,
+    pub entrypoint: String,
+    /// The solution whose saved manifest most recently declared exactly this rego. None when no
+    /// solution did (the policy was written by hand) or none is running.
+    pub declared_by: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -97,7 +114,6 @@ pub struct HiveResources {
     pub routes: Option<serde_json::Value>,
     pub vpns: Option<serde_json::Value>,
     pub wf_state: Option<serde_json::Value>,
-    pub opa_state: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -199,9 +215,9 @@ pub enum CompilerClass {
     WfDeployRestart,
     /// Blocked until canonical WF remove action is defined in admin surface.
     WfRemove,
-    // OPA
+    // OPA (one user policy for every hive)
     OpaApply,
-    /// Blocked until canonical OPA remove action is defined in admin surface.
+    /// Clears the user policy when the solution whose policy runs stops declaring it.
     OpaRemove,
     // Meta
     Noop,
@@ -284,8 +300,9 @@ pub fn compiler_class_admin_steps(class: &CompilerClass) -> Option<Vec<&'static 
         CompilerClass::WfDeployApply => Some(vec!["wf_rules_compile_apply"]),
         CompilerClass::WfDeployRestart => Some(vec!["wf_rules_compile_apply", "restart_node"]),
         CompilerClass::OpaApply => Some(vec!["opa_compile_apply"]),
-        // Blocked — no steps to emit until admin surface defines remove actions
-        CompilerClass::WfRemove | CompilerClass::OpaRemove => None,
+        CompilerClass::OpaRemove => Some(vec!["opa_clear"]),
+        // Blocked — no steps to emit until admin surface defines a remove action
+        CompilerClass::WfRemove => None,
         // Meta / blocked — no steps
         CompilerClass::Noop
         | CompilerClass::BlockedImmutableChange
@@ -570,23 +587,21 @@ impl DesiredWfDeployment {
     }
 }
 
+/// `desired_state.opa`: the solution's user OPA policy. There is one user policy for every hive
+/// (the motherbee compiles and publishes it, every hive installs it), so it names no hive. When
+/// several solutions declare one, the last one applied wins (operator decision 2026-10-01,
+/// FINDINGS A-23).
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct DesiredOpaDeployment {
-    pub hive: String,
-    pub policy_id: String,
+pub struct DesiredOpaPolicy {
     pub rego_source: String,
+    #[serde(default = "default_opa_entrypoint")]
+    pub entrypoint: String,
     #[serde(default = "default_solution_ownership")]
     pub ownership: String,
 }
 
-impl DesiredOpaDeployment {
-    pub fn rego_hash(&self) -> String {
-        use std::collections::hash_map::DefaultHasher;
-        use std::hash::{Hash, Hasher};
-        let mut h = DefaultHasher::new();
-        self.rego_source.hash(&mut h);
-        format!("{:016x}", h.finish())
-    }
+fn default_opa_entrypoint() -> String {
+    "router/target".to_string()
 }
 
 // ── BuildTaskPacket (TC-1, used by reconciler artifact gap detection) ───────

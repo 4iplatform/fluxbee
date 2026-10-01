@@ -25,7 +25,7 @@ Use this section first. If the task is clear here, do not overcomplicate it.
 | Deterministic choreography between known nodes | `wf_deployments` / `wf_rules_compile_apply` |
 | Prefix- or hive-based forwarding between known destinations | `routing` / `add_route` |
 | Secondary copy of unicast traffic to an additional node | `router taps` / `add_tap` |
-| Policy-based target resolution when destination is not explicit | `opa_deployments` / OPA |
+| Policy-based target resolution when destination is not explicit | `opa` (one user policy for every hive) / `opa_compile_apply` |
 
 Rules:
 - If the operator already names the participating nodes, do **not** default to OPA.
@@ -339,7 +339,7 @@ Valid `desired_state` sections:
 - `nodes`
 - `routing`
 - `wf_deployments`
-- `opa_deployments`
+- `opa`: one user OPA policy for every hive (`rego_source`, `entrypoint`, `ownership`), no hive. If several solutions declare one, the last one applied wins.
 
 Not supported here:
 - `policy`
