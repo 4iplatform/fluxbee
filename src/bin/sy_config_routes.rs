@@ -8,7 +8,7 @@ use tracing_subscriber::EnvFilter;
 use uuid::Uuid;
 
 use fluxbee_sdk::protocol::{
-    Destination, Message, Meta, Routing, MSG_CONFIG_CHANGED, MSG_CONFIG_GET, is_system_kind,
+    is_system_kind, Destination, Message, Meta, Routing, MSG_CONFIG_CHANGED, MSG_CONFIG_GET,
     MSG_CONFIG_SET, SYSTEM_KIND,
 };
 use fluxbee_sdk::{

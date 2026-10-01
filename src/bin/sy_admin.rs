@@ -15533,8 +15533,14 @@ mod tests {
         })
         .unwrap();
 
-        let responses =
-            collect_opa_responses(&mut rx, "compile", 7, &["motherbee".to_string()], Duration::from_secs(30)).await;
+        let responses = collect_opa_responses(
+            &mut rx,
+            "compile",
+            7,
+            &["motherbee".to_string()],
+            Duration::from_secs(30),
+        )
+        .await;
         assert_eq!(responses.len(), 1);
         assert_eq!(responses[0].hive, "motherbee");
         assert_eq!(responses[0].status, "ok");

@@ -2992,7 +2992,12 @@ fn parse_system_sync_hint_payload(
         .unwrap_or(default_folder_id.as_str())
         .to_string();
 
-    if folder_id != default_folder_id {
+    // A dist caller may name one dist folder (SY.admin scans `fluxbee-dist-policy` right after
+    // publishing a policy); `handle_system_sync_hint_message` honours it if this hive has it and
+    // settles the whole channel otherwise.
+    let folder_ok = folder_id == default_folder_id
+        || (channel == "dist" && folder_id.starts_with(SYNCTHING_FOLDER_DIST_LEGACY_ID));
+    if !folder_ok {
         return Err(format!(
             "folder_id '{}' is invalid for channel '{}'; expected '{}'",
             folder_id, channel, default_folder_id
@@ -7658,7 +7663,11 @@ fn reconcile_syncthing_folders_xml(
                 SYNCTHING_FOLDER_DIST_POLICY_ID,
                 &device_id,
             )?;
-            if changed && !changed_folders.iter().any(|id| id == SYNCTHING_FOLDER_DIST_POLICY_ID) {
+            if changed
+                && !changed_folders
+                    .iter()
+                    .any(|id| id == SYNCTHING_FOLDER_DIST_POLICY_ID)
+            {
                 changed_folders.push(SYNCTHING_FOLDER_DIST_POLICY_ID.to_string());
             }
             updated = next;
@@ -25844,11 +25853,17 @@ blob:
         let dist = sample_dist_config();
         for role in [HiveRole::Worker, HiveRole::Ingress, HiveRole::Egress] {
             for is_motherbee in [true, false] {
-                let policy: Vec<DistSyncFolder> = dist_sync_folders_for_role(&dist, role, is_motherbee)
-                    .into_iter()
-                    .filter(|f| f.id == SYNCTHING_FOLDER_DIST_POLICY_ID)
-                    .collect();
-                assert_eq!(policy.len(), 1, "{} (motherbee side: {is_motherbee})", role.as_str());
+                let policy: Vec<DistSyncFolder> =
+                    dist_sync_folders_for_role(&dist, role, is_motherbee)
+                        .into_iter()
+                        .filter(|f| f.id == SYNCTHING_FOLDER_DIST_POLICY_ID)
+                        .collect();
+                assert_eq!(
+                    policy.len(),
+                    1,
+                    "{} (motherbee side: {is_motherbee})",
+                    role.as_str()
+                );
                 assert_eq!(policy[0].path, dist.path.join("policy"));
             }
         }
@@ -25895,7 +25910,10 @@ blob:
             let (again, changed_again) =
                 reconcile_syncthing_folders_xml(&updated, &blob, &dist, is_motherbee, role)
                     .expect("second reconcile must succeed");
-            assert!(changed_again.is_empty(), "not idempotent: {changed_again:?}");
+            assert!(
+                changed_again.is_empty(),
+                "not idempotent: {changed_again:?}"
+            );
             assert_eq!(again, updated);
         }
     }
@@ -25981,6 +25999,34 @@ blob:
         let err = scope_core_manifest_to_components(&full, &["sy-nonexistent".to_string()])
             .expect_err("must reject a component absent from the manifest");
         assert!(err.to_string().contains("sy-nonexistent"));
+    }
+
+    /// SY.admin names the policy folder to have it scanned at once after a publish; a folder of
+    /// another channel is still refused.
+    #[test]
+    fn a_dist_sync_hint_may_name_one_dist_folder() {
+        let request = parse_system_sync_hint_payload(&serde_json::json!({
+            "channel": "dist",
+            "folder_id": SYNCTHING_FOLDER_DIST_POLICY_ID,
+        }))
+        .expect("a dist folder is valid for the dist channel");
+        assert_eq!(request.folder_id, SYNCTHING_FOLDER_DIST_POLICY_ID);
+        let channel_default =
+            parse_system_sync_hint_payload(&serde_json::json!({"channel": "dist"}))
+                .expect("the channel default stays valid");
+        assert_eq!(channel_default.folder_id, SYNCTHING_FOLDER_DIST_LEGACY_ID);
+        for (channel, folder) in [
+            ("dist", SYNCTHING_FOLDER_BLOB_ID),
+            ("blob", SYNCTHING_FOLDER_DIST_POLICY_ID),
+        ] {
+            assert!(
+                parse_system_sync_hint_payload(
+                    &serde_json::json!({"channel": channel, "folder_id": folder})
+                )
+                .is_err(),
+                "{folder} must be refused for channel {channel}"
+            );
+        }
     }
 
     /// Pins the CALLER, not the helper.
