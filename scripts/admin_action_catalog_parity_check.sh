@@ -72,6 +72,7 @@ opa_http_map = {
     "Apply": "opa_apply",
     "Rollback": "opa_rollback",
     "Check": "opa_check",
+    "Clear": "opa_clear",
 }
 for variant, action in opa_http_map.items():
     pat = rf'handle_opa_http\([\s\S]*?OpaAction::{variant}\)'

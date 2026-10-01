@@ -296,7 +296,7 @@ func ensureDirs() error {
 			return err
 		}
 	}
-	for _, path := range []string{nodesDir, "/var/run/fluxbee", routerSockDir} {
+	for _, path := range []string{nodesDir, routerSockDir} { // MkdirAll creates /var/run/fluxbee too
 		if err := os.MkdirAll(path, 0o755); err != nil {
 			return err
 		}

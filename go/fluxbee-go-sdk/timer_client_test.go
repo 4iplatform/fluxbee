@@ -7,6 +7,10 @@ import (
 	"time"
 )
 
+// testTimeAttempt is one attempt that the goroutine standing in for SY.timer can answer even under
+// -race on a slow runner (1 ms per attempt failed there); each test's context still bounds it.
+const testTimeAttempt = 500 * time.Millisecond
+
 func TestNewTimerClientDerivesLocalTimerNodeName(t *testing.T) {
 	client, err := newTestTimerClientWithChannels(
 		&NodeSender{uuid: "src-1", fullName: "WF.demo@motherbee", tx: make(chan []byte, 1), state: &connectionState{connected: true}},
@@ -46,7 +50,7 @@ func TestTimerClientNowUsesTimerResponse(t *testing.T) {
 	client, err := newTestTimerClientWithChannels(
 		&NodeSender{uuid: "src-1", fullName: "WF.demo@motherbee", tx: tx, state: &connectionState{connected: true}},
 		&NodeReceiver{rx: rx, state: &connectionState{connected: true}},
-		TimerClientConfig{TimeRetrySchedule: []time.Duration{time.Millisecond}},
+		TimerClientConfig{TimeRetrySchedule: []time.Duration{testTimeAttempt}},
 	)
 	if err != nil {
 		t.Fatalf("new timer client: %v", err)
@@ -100,7 +104,7 @@ func TestTimerClientConvertUsesTimerResponse(t *testing.T) {
 	client, err := newTestTimerClientWithChannels(
 		&NodeSender{uuid: "src-1", fullName: "WF.demo@motherbee", tx: tx, state: &connectionState{connected: true}},
 		&NodeReceiver{rx: rx, state: &connectionState{connected: true}},
-		TimerClientConfig{TimeRetrySchedule: []time.Duration{time.Millisecond}},
+		TimerClientConfig{TimeRetrySchedule: []time.Duration{testTimeAttempt}},
 	)
 	if err != nil {
 		t.Fatalf("new timer client: %v", err)
@@ -156,7 +160,7 @@ func TestTimerClientParseUsesTimerResponse(t *testing.T) {
 	client, err := newTestTimerClientWithChannels(
 		&NodeSender{uuid: "src-1", fullName: "WF.demo@motherbee", tx: tx, state: &connectionState{connected: true}},
 		&NodeReceiver{rx: rx, state: &connectionState{connected: true}},
-		TimerClientConfig{TimeRetrySchedule: []time.Duration{time.Millisecond}},
+		TimerClientConfig{TimeRetrySchedule: []time.Duration{testTimeAttempt}},
 	)
 	if err != nil {
 		t.Fatalf("new timer client: %v", err)
@@ -210,7 +214,7 @@ func TestTimerClientFormatUsesTimerResponse(t *testing.T) {
 	client, err := newTestTimerClientWithChannels(
 		&NodeSender{uuid: "src-1", fullName: "WF.demo@motherbee", tx: tx, state: &connectionState{connected: true}},
 		&NodeReceiver{rx: rx, state: &connectionState{connected: true}},
-		TimerClientConfig{TimeRetrySchedule: []time.Duration{time.Millisecond}},
+		TimerClientConfig{TimeRetrySchedule: []time.Duration{testTimeAttempt}},
 	)
 	if err != nil {
 		t.Fatalf("new timer client: %v", err)

@@ -1,16 +1,34 @@
 package sdk
 
-import "testing"
+import (
+	"encoding/json"
+	"os"
+	"path/filepath"
+	"testing"
+)
 
-// Values seen live on the 8.x hive (SY.identity's seeds and the Rust nodes' own derivation).
-func TestDeterministicSystemIlkIDMatchesIdentitySeeds(t *testing.T) {
-	for name, want := range map[string]string{
-		"SY.opa.rules@motherbee": "ilk:895382ab-e4de-5cb5-88d7-c79b33e0578f",
-		"SY.opa.rules@worker1":   "ilk:04f477b8-1569-5010-9095-9a71cdc68fc8",
-		"SY.cognition@worker1":   "ilk:4689af11-6103-5cf7-a46f-700ab1ac8c6b",
-	} {
-		if got := DeterministicSystemIlkID(name); got != want {
-			t.Fatalf("%s: got %s, want %s", name, got, want)
+// The vectors are shared with the Rust SDK (crates/fluxbee_sdk/src/identity.rs), which seeds these
+// ILKs in SY.identity: the same name must give the same ILK on both sides, untrimmed.
+func TestDeterministicSystemIlkIDMatchesTheVectorsSharedWithRust(t *testing.T) {
+	raw, err := os.ReadFile(filepath.Join("testdata", "system_ilk", "vectors.json"))
+	if err != nil {
+		t.Fatalf("read vectors: %v", err)
+	}
+	var fixture struct {
+		Vectors []struct {
+			NodeName string `json:"node_name"`
+			Ilk      string `json:"ilk"`
+		} `json:"vectors"`
+	}
+	if err := json.Unmarshal(raw, &fixture); err != nil {
+		t.Fatalf("decode vectors: %v", err)
+	}
+	if len(fixture.Vectors) == 0 {
+		t.Fatal("no vectors")
+	}
+	for _, v := range fixture.Vectors {
+		if got := DeterministicSystemIlkID(v.NodeName); got != v.Ilk {
+			t.Fatalf("%q: got %s, want %s", v.NodeName, got, v.Ilk)
 		}
 	}
 }

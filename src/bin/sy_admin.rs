@@ -14485,9 +14485,18 @@ async fn send_opa_sync_notice(
     hash: &str,
 ) -> Result<(), AdminError> {
     let sender = client.sender_snapshot();
-    let msg = Message {
+    let msg = opa_sync_notice(&sender.uuid().to_string(), version, hash)?;
+    sender.send(msg).await?;
+    tracing::info!(version, hash, "opa sync notice sent to every hive");
+    Ok(())
+}
+
+/// The notice every hive's SY.opa.rules acts on: a contract with the Go side, pinned by
+/// `go/sy-opa-rules/testdata/opa_sync_notice.json` (both suites read it).
+fn opa_sync_notice(src: &str, version: u64, hash: &str) -> Result<Message, AdminError> {
+    Ok(Message {
         routing: Routing {
-            src: sender.uuid().to_string(),
+            src: src.to_string(),
             src_l2_name: None,
             dst: Destination::Broadcast,
             ttl: 16,
@@ -14508,10 +14517,7 @@ async fn send_opa_sync_notice(
             config: serde_json::json!({ "hash": hash }),
             hive: None,
         })?,
-    };
-    sender.send(msg).await?;
-    tracing::info!(version, hash, "opa sync notice sent to every hive");
-    Ok(())
+    })
 }
 
 async fn send_opa_query(
@@ -15479,6 +15485,215 @@ mod tests {
                 "hash": hash
             }),
         }
+    }
+
+    const OPA_SYNC_NOTICE_FIXTURE: &str =
+        include_str!("../../go/sy-opa-rules/testdata/opa_sync_notice.json");
+
+    /// The sync notice as it reaches a hive (the router stamps src_l2_name): the Go suite feeds this
+    /// same file to SY.opa.rules, so a key moved on either side fails one of the two.
+    #[test]
+    fn the_opa_sync_notice_matches_the_contract_shared_with_go() {
+        let mut delivered = opa_sync_notice(
+            "admin-uuid",
+            0,
+            "sha256:5f1d8b7c0e2a4d6f8b0c2e4a6d8f0b2c4e6a8d0f2b4c6e8a0d2f4b6c8e0a2d4f",
+        )
+        .expect("notice");
+        delivered.routing.src_l2_name = Some(format!("SY.admin@{PRIMARY_HIVE_ID}"));
+        delivered.routing.trace_id = "trace-opa-sync".to_string();
+        let fixture: Value = serde_json::from_str(OPA_SYNC_NOTICE_FIXTURE).expect("fixture json");
+        assert_eq!(
+            serde_json::to_value(&delivered).expect("serialize"),
+            fixture,
+            "actual: {}",
+            serde_json::to_string_pretty(&delivered).unwrap()
+        );
+    }
+
+    /// An admin wired to the in-process test dispatcher, with an empty hives registry (so a write
+    /// expects the motherbee only).
+    fn opa_test_admin(prefix: &str) -> (AdminContext, fluxbee_sdk::RouterDispatcherTestHarness) {
+        let profile = build_admin_rpc_profile().expect("admin rpc profile");
+        let (client, harness) = fluxbee_sdk::RouterDispatcherTestHarness::new_with_uuid(
+            "admin-test-uuid",
+            &format!("SY.admin@{PRIMARY_HIVE_ID}"),
+            profile,
+        );
+        let root = test_temp_dir(prefix);
+        let state_dir = root.join("state");
+        let ctx = AdminContext {
+            config_dir: root.join("config"),
+            state_dir: state_dir.clone(),
+            socket_dir: root.join("run"),
+            blob_root: root.join("blob"),
+            node_name: format!("SY.admin@{PRIMARY_HIVE_ID}"),
+            hive_id: PRIMARY_HIVE_ID.to_string(),
+            self_ilk_id: String::new(),
+            authorized_hives: Vec::new(),
+            nats_endpoint: "nats://127.0.0.1:4222".to_string(),
+            nats_client: Arc::new(NatsClient::new("nats://127.0.0.1:4222")),
+            executor_runtime: Arc::new(Mutex::new(None)),
+            executor_configured: Arc::new(AtomicBool::new(false)),
+            rpc: client,
+            public_edge_node: None,
+            public_base_url: None,
+            publication_ledger_path: state_dir.join("sy-admin/publications.json"),
+            publication_lock: Arc::new(Mutex::new(())),
+            command_log_lock: Arc::new(std::sync::Mutex::new(())),
+        };
+        (ctx, harness)
+    }
+
+    fn opa_rules_answer(action: &str, version: u64, status: &str, hash: &str) -> Message {
+        let mut answer = opa_sync_answer(
+            &format!("SY.opa.rules@{PRIMARY_HIVE_ID}"),
+            PRIMARY_HIVE_ID,
+            hash,
+        );
+        answer.payload["action"] = json!(action);
+        answer.payload["version"] = json!(version);
+        answer.payload["status"] = json!(status);
+        answer
+    }
+
+    fn reply_to(request: &Message, msg: &str, payload: Value) -> Message {
+        Message {
+            routing: Routing {
+                src: Uuid::new_v4().to_string(),
+                src_l2_name: None,
+                dst: Destination::Unicast(format!("SY.admin@{PRIMARY_HIVE_ID}")),
+                ttl: 16,
+                trace_id: request.routing.trace_id.clone(),
+            },
+            meta: Meta {
+                msg_type: SYSTEM_KIND.to_string(),
+                msg: Some(msg.to_string()),
+                ..Meta::default()
+            },
+            payload,
+        }
+    }
+
+    fn dst_of(msg: &Message) -> Value {
+        serde_json::to_value(&msg.routing.dst).expect("dst")
+    }
+
+    fn no_opa_request() -> OpaRequest {
+        OpaRequest {
+            rego: None,
+            entrypoint: None,
+            version: None,
+            action: None,
+            hive: None,
+        }
+    }
+
+    /// A global write: the change goes to the motherbee's SY.opa.rules; once it applied, the
+    /// motherbee's Syncthing scans the policy folder, and only then every hive gets the notice
+    /// (listening for the answers before it goes out).
+    #[tokio::test]
+    async fn a_global_write_changes_the_motherbee_then_scans_then_tells_every_hive() {
+        let (ctx, mut harness) = opa_test_admin("opa-write-sequence");
+        let write = handle_opa_http(&ctx, &ctx.rpc, no_opa_request(), OpaAction::Clear);
+        let drive = async {
+            let wait = Duration::from_secs(5);
+            let step = harness.next_outgoing_within(wait).await.expect("the clear");
+            assert_eq!(step.meta.msg.as_deref(), Some("CONFIG_CHANGED"));
+            assert_eq!(
+                dst_of(&step),
+                json!(format!("SY.opa.rules@{PRIMARY_HIVE_ID}"))
+            );
+            assert_eq!(step.payload["action"], json!("clear"));
+            harness
+                .inject(opa_rules_answer("clear", 0, "ok", ""))
+                .await
+                .unwrap();
+
+            let scan = harness.next_outgoing_within(wait).await.expect("the scan");
+            assert_eq!(scan.meta.msg.as_deref(), Some("SYSTEM_SYNC_HINT"));
+            assert_eq!(
+                dst_of(&scan),
+                json!(format!("SY.orchestrator@{PRIMARY_HIVE_ID}"))
+            );
+            assert_eq!(scan.payload["channel"], json!("dist"));
+            assert_eq!(scan.payload["folder_id"], json!(OPA_POLICY_SYNC_FOLDER));
+            let done = reply_to(
+                &scan,
+                "SYSTEM_SYNC_HINT_RESPONSE",
+                json!({ "status": "ok" }),
+            );
+            harness.inject(done).await.unwrap();
+
+            let notice = harness
+                .next_outgoing_within(wait)
+                .await
+                .expect("the notice");
+            assert_eq!(notice.meta.msg.as_deref(), Some("CONFIG_CHANGED"));
+            assert_eq!(dst_of(&notice), json!("broadcast"));
+            assert_eq!(notice.meta.target.as_deref(), Some("SY.opa.rules@*"));
+            assert_eq!(notice.payload["action"], json!("sync"));
+            assert_eq!(notice.payload["config"]["hash"], json!(""));
+            harness
+                .inject(opa_sync_answer(
+                    &format!("SY.opa.rules@{PRIMARY_HIVE_ID}"),
+                    PRIMARY_HIVE_ID,
+                    "",
+                ))
+                .await
+                .unwrap();
+        };
+        let (result, ()) = tokio::join!(write, drive);
+        let (status, body) = result.expect("write");
+        let body: Value = serde_json::from_str(&body).expect("body");
+        assert_eq!(status, 200, "{body}");
+        assert_eq!(body["converged"], json!(true), "{body}");
+        assert_eq!(body["running_hives"], json!([PRIMARY_HIVE_ID]), "{body}");
+    }
+
+    /// If the motherbee did not apply the change, nothing is scanned and no hive is told.
+    #[tokio::test]
+    async fn a_change_the_motherbee_refused_is_not_announced() {
+        let (ctx, mut harness) = opa_test_admin("opa-write-refused");
+        let write = handle_opa_http(&ctx, &ctx.rpc, no_opa_request(), OpaAction::Clear);
+        let drive = async {
+            let step = harness
+                .next_outgoing_within(Duration::from_secs(5))
+                .await
+                .expect("the clear");
+            assert_eq!(step.payload["action"], json!("clear"));
+            harness
+                .inject(opa_rules_answer("clear", 0, "error", ""))
+                .await
+                .unwrap();
+        };
+        let (result, ()) = tokio::join!(write, drive);
+        let (status, _) = result.expect("write");
+        assert_ne!(status, 200);
+        assert!(
+            harness
+                .next_outgoing_within(Duration::from_millis(300))
+                .await
+                .is_none(),
+            "nothing may follow a change the motherbee refused"
+        );
+    }
+
+    /// There is one user policy for every hive: a write that names another hive is refused before
+    /// anything is sent.
+    #[tokio::test]
+    async fn a_policy_write_for_one_hive_is_refused_before_anything_is_sent() {
+        let (ctx, mut harness) = opa_test_admin("opa-write-per-hive");
+        let mut req = no_opa_request();
+        req.hive = Some("worker1".to_string());
+        let (status, body) = handle_opa_http(&ctx, &ctx.rpc, req, OpaAction::Clear)
+            .await
+            .expect("write");
+        assert_eq!(status, 400, "{body}");
+        assert!(harness
+            .next_outgoing_within(Duration::from_millis(200))
+            .await
+            .is_none());
     }
 
     /// The rollout counts a hive only when SY.opa.rules of that hive (the name the router stamped)

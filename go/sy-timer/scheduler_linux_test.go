@@ -32,7 +32,7 @@ func TestReplayPendingFiresMissedOneShotWithFirePolicy(t *testing.T) {
 		t.Fatalf("replay pending: %v", err)
 	}
 
-	frame := <-tx
+	frame := mustReadSentFrame(t, tx)
 	var msg fluxbeesdk.Message
 	if err := json.Unmarshal(frame, &msg); err != nil {
 		t.Fatalf("decode fired event: %v", err)

@@ -1,0 +1,51 @@
+name: go-tests
+
+# Vet and test every Go module (race detector on) on each push or pull request that touches Go
+# code. The suites run as a normal user: they keep their state in temp dirs, and the one test that
+# needs root to chown skips itself.
+
+on:
+  pull_request:
+    paths:
+      - "go/**"
+      - ".github/workflows/go-tests.yml"
+  push:
+    branches: ["**"]
+    paths:
+      - "go/**"
+      - ".github/workflows/go-tests.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  go-test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        module:
+          - fluxbee-go-sdk
+          - sy-opa-rules
+          - sy-timer
+          - sy-wf-rules
+          - pkg/wfcel
+          - nodes/wf/wf-generic
+    defaults:
+      run:
+        working-directory: go/${{ matrix.module }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go/${{ matrix.module }}/go.mod
+          cache-dependency-path: go/${{ matrix.module }}/go.sum
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: Test
+        run: go test -race -count=1 ./...

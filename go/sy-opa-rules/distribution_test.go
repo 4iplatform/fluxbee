@@ -38,11 +38,14 @@ func newTestHive(t *testing.T, hiveID string) (*Service, *stubRouterTransport, s
 	}, router, state
 }
 
-// on runs fn with the package-level state dir pointed at state (the services share globals).
+// on runs fn with the package-level dirs pointed under state (the services share globals), so the
+// suite needs no root and touches nothing outside its temp dirs.
 func on(state string, fn func()) {
-	old := stateDir
+	oldState, oldNodes, oldSocks := stateDir, nodesDir, routerSockDir
 	stateDir = state
-	defer func() { stateDir = old }()
+	nodesDir = filepath.Join(state, "nodes")
+	routerSockDir = filepath.Join(state, "routers")
+	defer func() { stateDir, nodesDir, routerSockDir = oldState, oldNodes, oldSocks }()
 	fn()
 }
 
@@ -489,6 +492,142 @@ func TestStatusIsSafeWhileSyncing(t *testing.T) {
 			}
 		}
 	})
+}
+
+// The sha256 is the only integrity check on the synced copy: a valid wasm of another policy under
+// the published name is refused (nothing installed, routers not reloaded) until the right file is
+// there.
+func TestAReplicaRefusesAValidWasmThatIsNotThePublishedOne(t *testing.T) {
+	oldDist := policyDistDir
+	policyDistDir = t.TempDir()
+	defer func() { policyDistDir = oldDist }()
+
+	other := publishOnPrimary(t, 4, "\nrefused_probe := true\n")
+	otherWasm, err := os.ReadFile(filepath.Join(policyDistDir, other.WasmFile))
+	if err != nil {
+		t.Fatal(err)
+	}
+	published := publishOnPrimary(t, 5, "")
+	wasmPath := filepath.Join(policyDistDir, published.WasmFile)
+	good, err := os.ReadFile(wasmPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(wasmPath, otherWasm, 0o640); err != nil {
+		t.Fatal(err)
+	}
+
+	replica, router, state := newTestHive(t, "worker1")
+	on(state, func() {
+		if err := ensureDirs(); err != nil {
+			t.Fatalf("dirs: %v", err)
+		}
+		if _, err := replica.syncFromPublishedPolicy(); !errors.Is(err, errPolicyNotArrived) {
+			t.Fatalf("want errPolicyNotArrived for another policy's wasm, got %v", err)
+		}
+		if current, _ := currentPolicy(); current.Hash != "" {
+			t.Fatalf("installed %s from a wasm that is not the published one", current.Hash)
+		}
+		for _, msg := range router.sent {
+			if derefString(msg.Meta.Msg) == fluxbeesdk.MSGOPAReload {
+				t.Fatal("the routers were reloaded for a refused wasm")
+			}
+		}
+		if err := os.WriteFile(wasmPath, good, 0o640); err != nil {
+			t.Fatal(err)
+		}
+		if installed, err := replica.syncFromPublishedPolicy(); !installed || err != nil {
+			t.Fatalf("the published wasm: installed=%v err=%v", installed, err)
+		}
+		if current, _ := currentPolicy(); current.Hash != published.Hash {
+			t.Fatalf("replica runs %q, want %q", current.Hash, published.Hash)
+		}
+	})
+}
+
+// loadSyncNotice is the admin's sync notice as a hive receives it (testdata/opa_sync_notice.json,
+// the contract sy_admin's test pins with the same file), announcing hash.
+func loadSyncNotice(t *testing.T, hash string) fluxbeesdk.Message {
+	t.Helper()
+	raw, err := os.ReadFile(filepath.Join("testdata", "opa_sync_notice.json"))
+	if err != nil {
+		t.Fatalf("read notice: %v", err)
+	}
+	var msg fluxbeesdk.Message
+	if err := json.Unmarshal(raw, &msg); err != nil {
+		t.Fatalf("decode notice: %v", err)
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(msg.Payload, &payload); err != nil {
+		t.Fatalf("decode notice payload: %v", err)
+	}
+	config, ok := payload["config"].(map[string]any)
+	if !ok {
+		t.Fatalf("notice without config: %s", msg.Payload)
+	}
+	config["hash"] = hash
+	if msg.Payload, err = json.Marshal(payload); err != nil {
+		t.Fatal(err)
+	}
+	return msg
+}
+
+// The notice is answered with its own version (a rollback announces 0 while the hive runs 6) and
+// the hash the hive runs; the same notice from any origin but the primary admin is ignored.
+func TestTheAdminsSyncNoticeIsAnsweredWithItsOwnVersion(t *testing.T) {
+	oldDist := policyDistDir
+	policyDistDir = t.TempDir()
+	defer func() { policyDistDir = oldDist }()
+
+	published := publishOnPrimary(t, 6, "")
+	notice := loadSyncNotice(t, published.Hash)
+	if derefString(notice.Routing.SrcL2Name) != fluxbeesdk.PrimaryAdminNode {
+		t.Fatalf("the contract notice comes from %q", derefString(notice.Routing.SrcL2Name))
+	}
+
+	replica, router, state := newTestHive(t, "worker1")
+	on(state, func() {
+		if err := ensureDirs(); err != nil {
+			t.Fatalf("dirs: %v", err)
+		}
+		replica.syncOnce()
+		if current, _ := currentPolicy(); current.Version != 6 {
+			t.Fatalf("replica runs version %d, want 6", current.Version)
+		}
+
+		router.sent = nil
+		forged := notice
+		other := "SY.orchestrator@worker1"
+		forged.Routing.SrcL2Name = &other
+		replica.handleMessage(forged)
+		replica.syncOnce()
+		if len(router.sent) != 0 || len(replica.pendingSyncs) != 0 {
+			t.Fatalf("a notice from %s must be ignored: sent=%+v pending=%d", other, router.sent, len(replica.pendingSyncs))
+		}
+
+		replica.handleMessage(notice)
+		replica.syncOnce()
+	})
+	answered := false
+	for _, msg := range router.sent {
+		if derefString(msg.Meta.Msg) != "CONFIG_RESPONSE" {
+			continue
+		}
+		var payload map[string]any
+		if err := json.Unmarshal(msg.Payload, &payload); err != nil {
+			continue
+		}
+		if payload["action"] != "sync" || payload["status"] != "ok" || payload["hash"] != published.Hash {
+			continue
+		}
+		if payload["version"] != float64(0) {
+			t.Fatalf("answered version %v, want the notice's 0", payload["version"])
+		}
+		answered = true
+	}
+	if !answered {
+		t.Fatalf("the notice was not answered: %+v", router.sent)
+	}
 }
 
 func sentErrorCode(t *testing.T, router *stubRouterTransport, code string) bool {

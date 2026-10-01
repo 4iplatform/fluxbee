@@ -1640,6 +1640,23 @@ fn parse_prefixed_uuid(value: &str, prefix: &str) -> Result<Uuid, IdentityShmErr
 mod tests {
     use super::*;
 
+    /// Shared with the Go SDK (go/fluxbee-go-sdk/testdata/system_ilk): a node that derives its own
+    /// ILK in Go must get the one SY.identity seeds here, untrimmed.
+    #[test]
+    fn deterministic_system_ilk_id_matches_the_vectors_shared_with_go() {
+        let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../go/fluxbee-go-sdk/testdata/system_ilk/vectors.json");
+        let raw = std::fs::read_to_string(path).expect("read vectors");
+        let fixture: serde_json::Value = serde_json::from_str(&raw).expect("decode vectors");
+        let vectors = fixture["vectors"].as_array().expect("vectors");
+        assert!(!vectors.is_empty());
+        for vector in vectors {
+            let name = vector["node_name"].as_str().expect("node_name");
+            let ilk = vector["ilk"].as_str().expect("ilk");
+            assert_eq!(deterministic_system_ilk_id(name), ilk, "{name:?}");
+        }
+    }
+
     #[test]
     fn permission_denied_lookup_is_treated_as_not_found() {
         let out =

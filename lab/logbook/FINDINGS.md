@@ -298,6 +298,22 @@
   vault conteste (`resolve_resource_awaiting_vault`, hasta `VAULT_BOOT_WAIT`, las dos a la vez).
   Las relecturas por aviso o por `CONFIG_SET` siguen siendo de una vez.
 
+### A-27 🔴 El guardián de paridad del catálogo del admin (CI) está en rojo desde antes
+
+- **Qué pasa (2026-10-01):** `scripts/admin_action_catalog_parity_check.sh` corre en GitHub Actions
+  en cada push que toca `sy_admin.rs` y falla: sus expresiones no reconocen cómo se despachan
+  hoy 20 acciones que sí tienen ruta HTTP o son solo internas: `get_runtime`,
+  `list_cloud_actions`, `publish_artifact`, `publish_cloud_endpoint`, `unpublish_artifact`, los 8
+  `timer_*` y los 8 `wf_rules_*`. Cada push del tramo OPA que tocó el admin lo disparó en rojo.
+- **Hecho:** se agregó `opa_clear` (panel DTAP, T-12). El resto queda para arreglar el script
+  (mapear esos despachos y declarar las acciones solo internas).
+
+### A-28 🟡 Tres binarios compilados de Go están versionados en git
+
+- `go/sy-opa-rules/sy-opa-rules`, `go/sy-timer/sy-timer` y `go/nodes/wf/wf-generic/wf-generic`.
+  Ensucian cada `git status` después de un build local. Va a la pasada de limpieza (catálogo y
+  aprobación antes de borrar).
+
 ### A-19 ✅ RESUELTO (0.1.43) — La policy publicada esperaba hasta 60 s al watcher de Syncthing
 
 - **Qué pasaba:** con 0.1.41 el apply llegaba a los 4 hives en 16 s, pero el clear tardó 63 s y el

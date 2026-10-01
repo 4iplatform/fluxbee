@@ -1,0 +1,10 @@
+{
+  "_doc": "ILKs of system nodes (Model D'): sha256(\"fluxbee:identity:system-ilk:v1:\" + node_name), first 16 bytes, UUID v5 bits. Read by the Go SDK (system_ilk_test.go) and the Rust SDK (identity.rs tests). The first three were seen live on 8.x; the last two pin that neither side trims the name.",
+  "vectors": [
+    { "node_name": "SY.opa.rules@motherbee", "ilk": "ilk:895382ab-e4de-5cb5-88d7-c79b33e0578f" },
+    { "node_name": "SY.opa.rules@worker1", "ilk": "ilk:04f477b8-1569-5010-9095-9a71cdc68fc8" },
+    { "node_name": "SY.cognition@worker1", "ilk": "ilk:4689af11-6103-5cf7-a46f-700ab1ac8c6b" },
+    { "node_name": " SY.opa.rules@motherbee", "ilk": "ilk:653437ce-b8d8-5d6d-9449-c2c6c499032a" },
+    { "node_name": "SY.opa.rules@motherbee\n", "ilk": "ilk:f002b2e1-cc22-5bbb-8223-ed6a6acf589b" }
+  ]
+}
