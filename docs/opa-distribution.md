@@ -43,7 +43,11 @@ actions; frontdesk routing) is baked into the router binary (`policy/system.rego
 - **The notice travels by the mesh:** after the motherbee applied and published, SY.admin
   broadcasts `CONFIG_CHANGED {subsystem: "opa", action: "sync", version, config: {hash}}` with
   `meta.target = "SY.opa.rules@*"` — one broadcast, delivered only to those nodes, on every hive.
-  Only `SY.admin@motherbee` may send CONFIG_CHANGED across hives (system policy rule 2).
+- **The admin has the folder scanned first:** before the notice it sends the motherbee's
+  orchestrator a sync hint for `fluxbee-dist-policy` (the step a runtime publish takes), which
+  scans the folder at once. Left to Syncthing's filesystem watcher, a change made only of renames
+  and deletes — a clear — waits the watcher's full timeout (measured: 60 s, against 10 s when a new
+  wasm is written).
 
 ## Installing on a hive (not the motherbee)
 
@@ -69,14 +73,16 @@ soon as Syncthing brings the folder up to date — no notice needed.
   `/hives/{hive}/opa/policy*` write routes no longer exist.
 - The response of a change reports `hash`, the motherbee's answer (`responses`), the hives that
   answered the notice (`hives`, `running_hives`), those still converging (`pending`) and
-  `converged`. It waits up to 30 s for the notices (the file takes ~11 s to sync).
+  `converged`. It waits up to 30 s for the notices; a reachable hive answers within seconds.
 - Reads stay per hive: `GET /hives/{hive}/opa/status` and `/opa/policy`.
 
 ## Security
 
 - **Integrity:** a hive installs only a wasm whose sha256 matches the manifest. Syncthing is
-  receive-only on the spokes, so a spoke cannot publish; the notice is origin-gated to the
-  primary admin. The check guards against a partial transfer, not against a local writer: a
+  receive-only on the spokes, so a spoke cannot publish.
+- **Who may write:** SY.opa.rules acts on CONFIG_CHANGED and on commands only from
+  `SY.admin@motherbee`. The router's gate for CONFIG_CHANGED (system policy) also admits the
+  orchestrators, and a policy the motherbee applies is published to every hive. The check guards against a partial transfer, not against a local writer: a
   local change to the synced copy on a hive (it needs root or the Syncthing user) affects that
   hive only and is never sent back.
 - **Confidentiality:** only the compiled wasm leaves the motherbee. On each hive the installed

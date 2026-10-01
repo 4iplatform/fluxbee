@@ -8289,6 +8289,7 @@ async fn handle_opa_http(
     // Applied and published on the motherbee: tell every hive, and report who runs it already.
     // The others are pending, not failed — they install it when the published file reaches them.
     let hash = applied.hash.clone().unwrap_or_default();
+    scan_published_opa_policy(ctx, client).await;
     let expected = expected_hive_sets(ctx, None).effective;
     let mut receiver = client.subscribe(RPC_BC_CONFIG_RESPONSE)?;
     send_opa_sync_notice(client, version, &hash).await?;
@@ -8306,9 +8307,38 @@ async fn handle_opa_http(
 }
 
 /// How long a write waits for the motherbee's SY.opa.rules, and then for the other hives to report
-/// they run the published policy (the file travels by Syncthing: ~11 s measured).
+/// they run the published policy (the file travels by Syncthing in a few seconds once scanned).
 const OPA_PRIMARY_WAIT_SECS: u64 = 30;
 const OPA_SYNC_WAIT_SECS: u64 = 30;
+/// The Syncthing folder that carries the published policy, and how long its scan may take.
+const OPA_POLICY_SYNC_FOLDER: &str = "fluxbee-dist-policy";
+const OPA_POLICY_SCAN_TIMEOUT_MS: u64 = 10_000;
+
+/// Have the motherbee's Syncthing pick up the policy just published now, not when its filesystem
+/// watcher gets to it: a clear only renames and deletes files, which the watcher holds for its
+/// full timeout (measured: 60 s, against 10 s when a new wasm is written). The orchestrator owns
+/// Syncthing; its sync hint scans the folder and waits until it is idle — the same step a runtime
+/// publish takes. Best effort: without it the hives still converge, later.
+async fn scan_published_opa_policy(ctx: &AdminContext, client: &RouterDispatcher) {
+    let request = serde_json::json!({
+        "channel": "dist",
+        "folder_id": OPA_POLICY_SYNC_FOLDER,
+        "wait_for_idle": true,
+        "timeout_ms": OPA_POLICY_SCAN_TIMEOUT_MS,
+    });
+    match handle_hive_sync_hint_command(ctx, client, PRIMARY_HIVE_ID.to_string(), request).await {
+        Ok((200, _)) => tracing::info!("opa: published policy scanned on the motherbee"),
+        Ok((status, body)) => tracing::warn!(
+            status,
+            body = %body,
+            "opa: scan of the published policy did not complete; the hives get it on the next scan"
+        ),
+        Err(err) => tracing::warn!(
+            error = %err,
+            "opa: scan of the published policy failed; the hives get it on the next scan"
+        ),
+    }
+}
 
 fn build_opa_rollout_response(
     action: OpaAction,
@@ -8328,10 +8358,15 @@ fn build_opa_rollout_response(
         .filter(|hive| !running.contains(hive))
         .cloned()
         .collect();
+    // as_str() is the step sent to SY.opa.rules ("compile" for compile + apply); report the write.
+    let action_name = match action {
+        OpaAction::CompileApply => "compile_apply",
+        other => other.as_str(),
+    };
     let body = serde_json::json!({
         "status": "ok",
         "version": version,
-        "action": action.as_str(),
+        "action": action_name,
         "hash": hash,
         "responses": responses,
         "hives": synced,
@@ -15540,6 +15575,16 @@ mod tests {
         assert_eq!(body["hash"], json!("sha256:x"));
         assert_eq!(body["pending"], json!(["egress1"]));
         assert_eq!(body["converged"], json!(false));
+    }
+
+    /// POST /opa/policy sends a "compile" step with apply after it; the rollout reports the write.
+    #[test]
+    fn opa_rollout_names_the_write_not_the_step() {
+        let (_, body) =
+            build_opa_rollout_response(OpaAction::CompileApply, 7, "sha256:x", vec![], vec![], &[]);
+        let body: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(body["action"], json!("compile_apply"));
+        assert_eq!(body["converged"], json!(true));
     }
 
     #[tokio::test]

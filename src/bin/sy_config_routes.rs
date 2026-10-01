@@ -8,8 +8,8 @@ use tracing_subscriber::EnvFilter;
 use uuid::Uuid;
 
 use fluxbee_sdk::protocol::{
-    ConfigChangedPayload, Destination, Message, Meta, Routing, MSG_CONFIG_CHANGED, MSG_CONFIG_GET,
-    is_system_kind, MSG_CONFIG_SET, SYSTEM_KIND,
+    Destination, Message, Meta, Routing, MSG_CONFIG_CHANGED, MSG_CONFIG_GET, is_system_kind,
+    MSG_CONFIG_SET, SYSTEM_KIND,
 };
 use fluxbee_sdk::{
     build_node_config_response_message, parse_node_config_request, try_handle_default_node_status,
@@ -224,195 +224,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                     continue;
                 }
-                if !is_system_kind(&msg.meta.msg_type) || msg.meta.msg.as_deref() != Some(MSG_CONFIG_CHANGED) {
+                if is_system_kind(&msg.meta.msg_type) && msg.meta.msg.as_deref() == Some(MSG_CONFIG_CHANGED) {
+                    // Routes, VPNs and taps change only through the admin actions on THIS hive
+                    // (handled above, origin-gated). The admin's CONFIG_CHANGED after one of them is
+                    // a notice for the routers on its path; there is nothing here to apply. The old
+                    // global list broadcast (PUT /config/routes|vpns|taps) is gone: now that
+                    // CONFIG_CHANGED crosses hives it would overwrite every hive's config with one list.
+                    tracing::debug!("config changed notice; nothing to apply here");
                     continue;
                 }
-                let payload_value = msg.payload.clone();
-                let payload: ConfigChangedPayload = match serde_json::from_value(payload_value) {
-                    Ok(payload) => payload,
-                    Err(err) => {
-                        tracing::warn!("invalid config changed payload: {err}");
-                        let _ = send_config_response(
-                            &sender,
-                            &msg,
-                            "unknown",
-                            0,
-                            "error",
-                            Some("INVALID_PAYLOAD".to_string()),
-                            Some(err.to_string()),
-                            &hive_id,
-                        ).await;
-                        continue;
-                    }
-                };
-                tracing::info!(
-                    subsystem = %payload.subsystem,
-                    payload_version = payload.version,
-                    current_version = sy_config.version,
-                    "config changed received"
-                );
-                if !payload.addressed_to(&hive_id) {
-                    tracing::info!(
-                        subsystem = %payload.subsystem,
-                        payload_hive = ?payload.hive,
-                        "config changed addressed to another hive; ignoring"
-                    );
-                    continue;
-                }
-                if payload.hive.is_some() {
-                    // The admin's notice after an add/delete on THIS hive: that action already
-                    // changed this node's config. Re-applying the list it carries could only
-                    // undo a later change that raced it (CONFIG_CHANGED now crosses hives).
-                    tracing::info!(
-                        subsystem = %payload.subsystem,
-                        payload_version = payload.version,
-                        "config changed notice for this hive; already applied"
-                    );
-                    continue;
-                }
-                if payload.version != 0 && payload.version <= sy_config.version {
-                    tracing::info!(
-                        payload_version = payload.version,
-                        current_version = sy_config.version,
-                        "config version not newer; skipping"
-                    );
-                    continue;
-                }
-                let mut next_config = sy_config.clone();
-                match payload.subsystem.as_str() {
-                    "routes" => {
-                        let routes = match parse_routes(&payload.config) {
-                            Ok(routes) => routes,
-                            Err(err) => {
-                                tracing::warn!("invalid routes payload: {err}");
-                                let _ = send_config_response(
-                                    &sender,
-                                    &msg,
-                                    "routes",
-                                    payload.version,
-                                    "error",
-                                    Some("INVALID_CONFIG".to_string()),
-                                    Some(err.to_string()),
-                                    &hive_id,
-                                ).await;
-                                continue;
-                            }
-                        };
-                        if let Some(routes) = routes {
-                            next_config.routes = routes;
-                        }
-                    }
-                    "vpn" | "vpns" => {
-                        let vpns = match parse_vpns(&payload.config) {
-                            Ok(vpns) => vpns,
-                            Err(err) => {
-                                tracing::warn!("invalid vpns payload: {err}");
-                                let _ = send_config_response(
-                                    &sender,
-                                    &msg,
-                                    "vpn",
-                                    payload.version,
-                                    "error",
-                                    Some("INVALID_CONFIG".to_string()),
-                                    Some(err.to_string()),
-                                    &hive_id,
-                                ).await;
-                                continue;
-                            }
-                        };
-                        if let Some(vpns) = vpns {
-                            next_config.vpns = vpns;
-                        }
-                    }
-                    "tap" | "taps" => {
-                        let taps = match parse_taps(&payload.config) {
-                            Ok(taps) => taps,
-                            Err(err) => {
-                                tracing::warn!("invalid taps payload: {err}");
-                                let _ = send_config_response(
-                                    &sender,
-                                    &msg,
-                                    "tap",
-                                    payload.version,
-                                    "error",
-                                    Some("INVALID_CONFIG".to_string()),
-                                    Some(err.to_string()),
-                                    &hive_id,
-                                )
-                                .await;
-                                continue;
-                            }
-                        };
-                        if let Some(taps) = taps {
-                            next_config.taps = taps;
-                        }
-                    }
-                    _ => {
-                        continue;
-                    }
-                }
-                if next_config.routes == sy_config.routes
-                    && next_config.vpns == sy_config.vpns
-                    && next_config.taps == sy_config.taps
-                {
-                    tracing::info!(
-                        subsystem = %payload.subsystem,
-                        version = payload.version,
-                        "config unchanged; skipping apply"
-                    );
-                    continue;
-                }
-                if payload.version == 0 {
-                    next_config.version = sy_config.version.saturating_add(1);
-                } else {
-                    next_config.version = payload.version;
-                }
-                next_config.updated_at = now_epoch_ms().to_string();
-                if let Err(err) = apply_config(&mut writer, &hive_id, &next_config) {
-                    tracing::warn!("apply config failed: {err}");
-                    let _ = send_config_response(
-                        &sender,
-                        &msg,
-                        payload.subsystem.as_str(),
-                        next_config.version,
-                        "error",
-                        Some("APPLY_FAILED".to_string()),
-                        Some(err.to_string()),
-                        &hive_id,
-                    ).await;
-                    continue;
-                }
-                if let Err(err) = write_config(&config_dir, &next_config) {
-                    tracing::warn!("persist config failed: {err}");
-                    let _ = send_config_response(
-                        &sender,
-                        &msg,
-                        payload.subsystem.as_str(),
-                        next_config.version,
-                        "error",
-                        Some("PERSIST_FAILED".to_string()),
-                        Some(err.to_string()),
-                        &hive_id,
-                    ).await;
-                    continue;
-                }
-                sy_config = next_config;
-                tracing::info!(
-                    subsystem = %payload.subsystem,
-                    payload_version = payload.version,
-                    applied_version = sy_config.version,
-                    "config changed applied"
-                );
-                let _ = send_config_response(
-                    &sender,
-                    &msg,
-                    payload.subsystem.as_str(),
-                    sy_config.version,
-                    "ok",
-                    None,
-                    None,
-                    &hive_id,
-                ).await;
             }
         }
     }
@@ -575,53 +395,6 @@ async fn send_node_config_control_response(
     payload: serde_json::Value,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let reply = build_node_config_response_message(request, sender.uuid(), payload);
-    sender.send(reply).await?;
-    Ok(())
-}
-
-async fn send_config_response(
-    sender: &NodeSender,
-    request: &Message,
-    subsystem: &str,
-    version: u64,
-    status: &str,
-    error_code: Option<String>,
-    error_detail: Option<String>,
-    hive: &str,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let mut payload = serde_json::json!({
-        "subsystem": subsystem,
-        "version": version,
-        "status": status,
-        "hive": hive,
-    });
-    if let Some(code) = error_code {
-        payload["error_code"] = serde_json::Value::String(code);
-    }
-    if let Some(detail) = error_detail {
-        payload["error_detail"] = serde_json::Value::String(detail);
-    }
-    let reply = Message {
-        routing: Routing {
-            src: sender.uuid().to_string(),
-            src_l2_name: None,
-            dst: Destination::Unicast(request.routing.src.clone()),
-            ttl: 16,
-            trace_id: request.routing.trace_id.clone(),
-        },
-        meta: Meta {
-            msg_type: SYSTEM_KIND.to_string(),
-            msg: Some("CONFIG_RESPONSE".to_string()),
-            src_ilk: None,
-            scope: None,
-            target: None,
-            action: None,
-            priority: None,
-            context: None,
-            ..Meta::default()
-        },
-        payload,
-    };
     sender.send(reply).await?;
     Ok(())
 }

@@ -126,6 +126,58 @@ func TestPublishedPolicyReachesAReplica(t *testing.T) {
 	})
 }
 
+// CONFIG_CHANGED passes the router's gate for orchestrators too, and the motherbee publishes what
+// it applies to every hive: only the primary admin's are acted on.
+func TestConfigChangedIsTakenOnlyFromThePrimaryAdmin(t *testing.T) {
+	oldDist := policyDistDir
+	policyDistDir = t.TempDir()
+	defer func() { policyDistDir = oldDist }()
+
+	primary, router, state := newTestHive(t, fluxbeesdk.PrimaryHiveID)
+	changed := "CONFIG_CHANGED"
+	send := func(origin string) {
+		msg, err := fluxbeesdk.BuildMessageEnvelope(
+			"33333333-3333-3333-3333-333333333333",
+			fluxbeesdk.UnicastDestination(primary.nodeName),
+			16, "trace-changed", "system", &changed, nil,
+			map[string]any{"subsystem": "opa", "action": "compile_apply", "version": 9,
+				"config": map[string]any{"rego": testRego}},
+		)
+		if err != nil {
+			t.Fatalf("build: %v", err)
+		}
+		if origin != "" {
+			msg.Routing.SrcL2Name = &origin
+		}
+		primary.handleMessage(msg)
+	}
+	on(state, func() {
+		if err := ensureDirs(); err != nil {
+			t.Fatalf("dirs: %v", err)
+		}
+		for _, origin := range []string{"SY.orchestrator@ingress1", "SY.admin@worker1", ""} {
+			send(origin)
+			if current, _ := currentPolicy(); current.Hash != "" {
+				t.Fatalf("%q: a policy was installed from a refused origin", origin)
+			}
+		}
+		if len(router.sent) != 3 {
+			t.Fatalf("want 3 refusals, got %d messages", len(router.sent))
+		}
+		for _, msg := range router.sent {
+			var payload map[string]any
+			_ = json.Unmarshal(msg.Payload, &payload)
+			if payload["error_code"] != "UNAUTHORIZED" {
+				t.Fatalf("want UNAUTHORIZED, got %+v", payload)
+			}
+		}
+		send(fluxbeesdk.PrimaryAdminNode)
+		if current, _ := currentPolicy(); current.Hash == "" {
+			t.Fatal("the primary admin's compile_apply was not applied")
+		}
+	})
+}
+
 // A notice for a policy that never arrives here (superseded before it synced) is not kept forever.
 func TestUnsatisfiedNoticeIsDroppedAfterItsTTL(t *testing.T) {
 	replica, router, state := newTestHive(t, "worker1")
