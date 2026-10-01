@@ -7436,6 +7436,258 @@ mod tests {
         );
     }
 
+    /// The A-22 check driven through a real socket (panel DTAP T-1): after its HELLO, a node that
+    /// sends a frame claiming another node's UUID as routing.src has it dropped; its frames with
+    /// its own UUID are delivered, stamped with the name it registered.
+    #[tokio::test]
+    async fn a_node_frame_claiming_another_nodes_uuid_is_dropped_at_the_socket() {
+        use nix::sys::mman::shm_unlink;
+        use std::ffi::CString;
+
+        let id = Uuid::new_v4().simple().to_string();
+        let shm_name = format!("/rt-a22-{}", &id[..8]);
+        let cleanup = |name: &str| {
+            if let Ok(cstr) = CString::new(name) {
+                let _ = shm_unlink(cstr.as_c_str());
+            }
+        };
+        cleanup(&shm_name);
+        let router_uuid = Uuid::new_v4();
+        let shm = Arc::new(Mutex::new(
+            RouterRegionWriter::open_or_create(
+                &shm_name,
+                router_uuid,
+                "motherbee",
+                "RT.gateway@motherbee",
+                false,
+            )
+            .expect("create test shm"),
+        ));
+
+        // The node it targets, and the node whose UUID it claims.
+        let receiver_uuid = Uuid::new_v4();
+        let victim_uuid = Uuid::new_v4();
+        let (receiver_tx, mut receiver_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+        let (victim_tx, _victim_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+        let nodes: Arc<Mutex<HashMap<Uuid, NodeHandle>>> = Arc::new(Mutex::new(HashMap::new()));
+        {
+            let mut g = nodes.lock().await;
+            for (uuid, name, sender) in [
+                (receiver_uuid, "SY.timer@motherbee", receiver_tx),
+                (victim_uuid, "SY.admin@motherbee", victim_tx),
+            ] {
+                g.insert(
+                    uuid,
+                    NodeHandle {
+                        name: name.to_string(),
+                        vpn_id: 0,
+                        sender,
+                        connected_at: 0,
+                    },
+                );
+            }
+        }
+
+        let (mut client, server) = UnixStream::pair().expect("socket pair");
+        let router = tokio::spawn(handle_node(
+            server,
+            shm,
+            Arc::clone(&nodes),
+            Arc::new(Mutex::new(HashMap::new())),
+            Arc::new(Mutex::new(HashMap::new())),
+            Arc::new(Mutex::new(HashMap::new())),
+            Arc::new(Mutex::new(HashMap::new())),
+            Arc::new(Mutex::new(None)),
+            Arc::new(Mutex::new(None)),
+            Arc::new(Mutex::new(None)),
+            Arc::new(Mutex::new(HashMap::new())),
+            Arc::new(Mutex::new(Vec::new())),
+            Arc::new(Mutex::new(Vec::new())),
+            Arc::new(Mutex::new(Vec::new())),
+            Arc::new(Mutex::new(Vec::new())),
+            Arc::new(Mutex::new(0)),
+            Arc::new(Mutex::new(OpaResolver::new())),
+            Arc::new(Mutex::new(None)),
+            Arc::new(Mutex::new(BroadcastCache::new())),
+            Arc::new(Mutex::new(0)),
+            Arc::new(Mutex::new(None)),
+            Arc::new(Mutex::new(HashMap::new())),
+            None,
+            Arc::new(AtomicU64::new(0)),
+            router_uuid,
+            "RT.gateway@motherbee",
+            "motherbee",
+            "SY.frontdesk.gov@motherbee",
+            false,
+        ));
+
+        let probe_uuid = Uuid::new_v4();
+        let frame = |src: Uuid, msg_type: &str, msg: Option<&str>, payload: serde_json::Value| {
+            serde_json::to_vec(&Message {
+                routing: Routing {
+                    src: src.to_string(),
+                    src_l2_name: None,
+                    dst: if msg == Some(MSG_HELLO) {
+                        Destination::Broadcast
+                    } else {
+                        Destination::Unicast(receiver_uuid.to_string())
+                    },
+                    ttl: 16,
+                    trace_id: Uuid::new_v4().to_string(),
+                },
+                meta: Meta {
+                    msg_type: msg_type.to_string(),
+                    msg: msg.map(str::to_string),
+                    ..Meta::default()
+                },
+                payload,
+            })
+            .expect("frame")
+        };
+        let hello = frame(
+            probe_uuid,
+            SYSTEM_KIND,
+            Some(MSG_HELLO),
+            serde_json::json!({ "uuid": probe_uuid.to_string(), "name": "AI.probe", "version": "1" }),
+        );
+        write_frame(&mut client, &hello).await.expect("hello");
+        let announce = time::timeout(Duration::from_secs(5), read_frame(&mut client))
+            .await
+            .expect("announce in time")
+            .expect("read")
+            .expect("announce");
+        assert!(!announce.is_empty());
+
+        let claimed = frame(
+            victim_uuid,
+            "user",
+            None,
+            serde_json::json!({ "n": "claimed" }),
+        );
+        let own = frame(probe_uuid, "user", None, serde_json::json!({ "n": "own" }));
+        write_frame(&mut client, &claimed)
+            .await
+            .expect("claimed frame");
+        write_frame(&mut client, &own).await.expect("own frame");
+
+        let delivered = time::timeout(Duration::from_secs(5), receiver_rx.recv())
+            .await
+            .expect("delivery in time")
+            .expect("delivered");
+        let delivered: Message = serde_json::from_slice(&delivered).expect("message");
+        assert_eq!(
+            delivered.payload["n"], "own",
+            "the claimed frame must not be routed"
+        );
+        assert_eq!(delivered.routing.src, probe_uuid.to_string());
+        assert_eq!(
+            delivered.routing.src_l2_name.as_deref(),
+            Some("AI.probe@motherbee")
+        );
+        assert!(
+            time::timeout(Duration::from_millis(200), receiver_rx.recv())
+                .await
+                .is_err(),
+            "nothing else may arrive"
+        );
+
+        drop(client);
+        let _ = time::timeout(Duration::from_secs(5), router).await;
+        cleanup(&shm_name);
+    }
+
+    /// The admin's OPA sync notice (panel DTAP T-8): a broadcast with meta.target
+    /// `SY.opa.rules@*` reaches SY.opa.rules and no other local node; the same notice from any
+    /// sender but the primary admin reaches nobody (CONFIG_CHANGED is protected).
+    #[tokio::test]
+    async fn the_opa_sync_notice_reaches_only_opa_rules_and_only_from_the_primary_admin() {
+        for (sender_name, reaches_opa_rules) in [
+            ("SY.admin@motherbee", true),
+            ("SY.orchestrator@motherbee", false),
+        ] {
+            let sender_uuid = Uuid::new_v4();
+            let (sender_tx, _sender_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+            let nodes: Arc<Mutex<HashMap<Uuid, NodeHandle>>> = Arc::new(Mutex::new(HashMap::new()));
+            let mut inboxes = Vec::new();
+            {
+                let mut g = nodes.lock().await;
+                g.insert(
+                    sender_uuid,
+                    NodeHandle {
+                        name: sender_name.to_string(),
+                        vpn_id: 0,
+                        sender: sender_tx,
+                        connected_at: 0,
+                    },
+                );
+                for name in [
+                    "SY.opa.rules@motherbee",
+                    "AI.chat@motherbee",
+                    "SY.timer@motherbee",
+                ] {
+                    let (tx, rx) = mpsc::unbounded_channel::<Vec<u8>>();
+                    g.insert(
+                        Uuid::new_v4(),
+                        NodeHandle {
+                            name: name.to_string(),
+                            vpn_id: 0,
+                            sender: tx,
+                            connected_at: 0,
+                        },
+                    );
+                    inboxes.push((name, rx));
+                }
+            }
+            let notice = Message {
+                routing: Routing {
+                    src: sender_uuid.to_string(),
+                    src_l2_name: None,
+                    dst: Destination::Broadcast,
+                    ttl: 16,
+                    trace_id: Uuid::new_v4().to_string(),
+                },
+                meta: Meta {
+                    msg_type: SYSTEM_KIND.to_string(),
+                    msg: Some("CONFIG_CHANGED".to_string()),
+                    scope: Some("global".to_string()),
+                    target: Some("SY.opa.rules@*".to_string()),
+                    ..Meta::default()
+                },
+                payload: serde_json::json!({
+                    "subsystem": "opa", "action": "sync", "version": 0,
+                    "config": { "hash": "" }
+                }),
+            };
+            handle_message(
+                &notice,
+                &nodes,
+                &Arc::new(Mutex::new(Vec::<FibEntry>::new())),
+                &Arc::new(Mutex::new(HashMap::<Uuid, PeerNode>::new())),
+                &Arc::new(Mutex::new(HashMap::<Uuid, PeerRouter>::new())),
+                &Arc::new(Mutex::new(HashMap::<Uuid, PeerHandle>::new())),
+                &Arc::new(Mutex::new(HashMap::<String, WanPeer>::new())),
+                &Arc::new(Mutex::new(OpaResolver::new())),
+                &Arc::new(Mutex::new(BroadcastCache::new())),
+                &Arc::new(Mutex::new(None::<MemoryRegionReader>)),
+                &Arc::new(Mutex::new(HashMap::<String, u64>::new())),
+                "motherbee",
+                "SY.frontdesk.gov@motherbee",
+                Uuid::new_v4(),
+                false,
+                &Arc::new(Mutex::new(None)),
+                &Arc::new(Mutex::new(HashMap::<Uuid, ReachabilityEntry>::new())),
+                None,
+            )
+            .await
+            .unwrap();
+            for (name, mut inbox) in inboxes {
+                let delivered = inbox.try_recv().is_ok();
+                let want = reaches_opa_rules && name == "SY.opa.rules@motherbee";
+                assert_eq!(delivered, want, "{sender_name} -> {name}");
+            }
+        }
+    }
+
     // L2-LOOKUP-22: Local end-to-end — receiver observes correct src UUID and src_l2_name.
     #[tokio::test]
     async fn local_delivery_stamps_correct_src_uuid_and_l2_name() {

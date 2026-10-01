@@ -545,6 +545,52 @@ func TestAReplicaRefusesAValidWasmThatIsNotThePublishedOne(t *testing.T) {
 	})
 }
 
+// Only the motherbee writes the policy, whatever the action; what it publishes is the wasm and the
+// manifest, never the rego, and an older wasm does not stay behind (panel DTAP T-6).
+func TestOnlyThePrimaryWritesAndThePublicationIsJustTheWasm(t *testing.T) {
+	oldDist := policyDistDir
+	policyDistDir = t.TempDir()
+	defer func() { policyDistDir = oldDist }()
+
+	publishOnPrimary(t, 3, "\nfirst := true\n")
+	published := publishOnPrimary(t, 4, "")
+	entries, err := os.ReadDir(policyDistDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var names []string
+	for _, entry := range entries {
+		names = append(names, entry.Name())
+	}
+	if len(names) != 2 || !containsName(names, policyManifestName) || !containsName(names, published.WasmFile) {
+		t.Fatalf("published folder holds %v, want only %s and %s", names, policyManifestName, published.WasmFile)
+	}
+
+	replica, router, state := newTestHive(t, "worker1")
+	on(state, func() {
+		if err := ensureDirs(); err != nil {
+			t.Fatalf("dirs: %v", err)
+		}
+		for _, action := range []string{"compile", "compile_apply", "check", "apply", "rollback", "clear"} {
+			router.sent = nil
+			// As the admin's writes arrive: CONFIG_CHANGED, answered with CONFIG_RESPONSE.
+			ok, _ := replica.handleOpaAction("admin", action, 9, &OpaConfigPayload{Rego: testRego}, false, true)
+			if ok || !sentErrorCode(t, router, "NOT_PRIMARY") {
+				t.Fatalf("a replica must refuse %s with NOT_PRIMARY: ok=%v sent=%+v", action, ok, router.sent)
+			}
+		}
+	})
+}
+
+func containsName(names []string, want string) bool {
+	for _, name := range names {
+		if name == want {
+			return true
+		}
+	}
+	return false
+}
+
 // loadSyncNotice is the admin's sync notice as a hive receives it (testdata/opa_sync_notice.json,
 // the contract sy_admin's test pins with the same file), announcing hash.
 func loadSyncNotice(t *testing.T, hash string) fluxbeesdk.Message {
