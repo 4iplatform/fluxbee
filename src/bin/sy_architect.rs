@@ -12827,7 +12827,6 @@ fn translate_scmd(
                     "node_name": node_name,
                     "config": config,
                     "replace": false,
-                    "notify": true,
                 }),
             })
         }

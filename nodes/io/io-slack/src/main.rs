@@ -2712,20 +2712,6 @@ async fn run_outbound_loop(
             continue;
         }
 
-        if is_control_plane_msg_type(&msg.meta.msg_type)
-            && msg
-                .meta
-                .msg
-                .as_deref()
-                .is_some_and(|m| m.eq_ignore_ascii_case("CONFIG_CHANGED"))
-        {
-            tracing::info!(
-                trace_id = %msg.routing.trace_id,
-                "received CONFIG_CHANGED (informative); runtime apply remains CONFIG_SET-owned"
-            );
-            continue;
-        }
-
         // Fast path for the "tokens flow Fluxbee Cloud -> vault -> broadcast" model (Slack token
         // rotation disabled): a VAULT_SECRET_CHANGED for the slack resource wakes the refresh loop to
         // reload THIS node's slack.auth.key immediately, instead of waiting for the poll tick. Filter

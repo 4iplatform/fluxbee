@@ -6622,10 +6622,6 @@ async fn handle_hive_paths(
                 .get("replace")
                 .map(|value| value == "1" || value.eq_ignore_ascii_case("true"))
                 .unwrap_or(false);
-            let notify = query
-                .get("notify")
-                .map(|value| !(value == "0" || value.eq_ignore_ascii_case("false")))
-                .unwrap_or(true);
             // Lift the `_system` binding fields out of the body.
             //
             // The body is otherwise the node's config patch, and `set_node_config` reads these
@@ -6639,7 +6635,6 @@ async fn handle_hive_paths(
             let mut payload = serde_json::json!({
                 "node_name": decode_percent(name),
                 "replace": replace,
-                "notify": notify,
             });
             let mut lifted: Vec<&str> = Vec::new();
             if let (Some(config_obj), Some(payload_obj)) =
@@ -10177,11 +10172,6 @@ fn admin_action_body_optional_fields(action: &str) -> Vec<serde_json::Value> {
                 "bool",
                 "Replace full config instead of patch/merge.",
             ),
-            admin_action_body_field(
-                "notify",
-                "bool",
-                "Notify runtime after persisting the config.",
-            ),
         ],
         "node_control_config_get" | "node_control_config_set" => vec![
             admin_action_body_field(
@@ -10479,8 +10469,7 @@ fn admin_action_example_payload(action: &str) -> serde_json::Value {
                     "model": "gpt-5.5"
                 }
             },
-            "replace": false,
-            "notify": true
+            "replace": false
         }),
         "node_control_config_get" => serde_json::json!({
             "requested_by": "archi"

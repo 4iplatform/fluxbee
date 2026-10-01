@@ -27,10 +27,7 @@ use fluxbee_sdk::blob::{
 };
 use fluxbee_sdk::identity::IdentityError;
 use fluxbee_sdk::nats::{request_local, NatsRequestEnvelope, NatsResponseEnvelope};
-use fluxbee_sdk::protocol::{
-    ConfigChangedPayload, Destination, Message, Meta, Routing, MSG_CONFIG_CHANGED, SCOPE_GLOBAL,
-    SYSTEM_KIND,
-};
+use fluxbee_sdk::protocol::{Destination, Message, Meta, Routing, SYSTEM_KIND};
 #[cfg(not(test))]
 use fluxbee_sdk::rpc::{AdminCommandRequest, AdminCommandResult};
 use fluxbee_sdk::rpc::{
@@ -2437,30 +2434,6 @@ async fn handle_admin(
                     *guard = path.to_string();
                 }
             }
-            let error_code = payload
-                .get("error_code")
-                .and_then(|value| value.as_str())
-                .map(|value| value.to_string());
-            let error_detail = payload
-                .get("message")
-                .and_then(|value| value.as_str())
-                .map(|value| value.to_string());
-            let version = msg
-                .payload
-                .get("version")
-                .and_then(|value| value.as_u64())
-                .unwrap_or(0);
-            let _ = send_config_response(
-                sender,
-                msg,
-                "storage",
-                version,
-                status,
-                error_code,
-                error_detail,
-                &state.hive_id,
-            )
-            .await;
             payload
         }
         "list_nodes" => list_nodes_flow(state, &msg.payload).await,
@@ -2476,7 +2449,7 @@ async fn handle_admin(
         "get_node_config" => get_node_config_flow(state, &msg.payload).await,
         "get_node_state" => get_node_state_flow(state, &msg.payload).await,
         "get_node_status" => get_node_status_flow(state, &msg.payload).await,
-        "set_node_config" => set_node_config_flow(sender, state, &msg.payload).await,
+        "set_node_config" => set_node_config_flow(state, &msg.payload).await,
         "start_node" => start_node_flow(state, &msg.payload).await,
         "restart_node" => restart_node_flow(state, &msg.payload).await,
         "run_node" => run_node_flow(state, &msg.payload).await,
@@ -2730,7 +2703,7 @@ async fn handle_system_message(
                     .await;
         }
         Some("NODE_CONFIG_SET") => {
-            let result = set_node_config_flow(sender, state, &msg.payload).await;
+            let result = set_node_config_flow(state, &msg.payload).await;
             tracing::info!(result = %result, "NODE_CONFIG_SET processed");
             let _ =
                 send_system_action_response(sender, msg, "NODE_CONFIG_SET_RESPONSE", result).await;
@@ -10222,59 +10195,6 @@ fn remote_node_to_json(
     }))
 }
 
-async fn send_config_response(
-    sender: &NodeSender,
-    request: &Message,
-    subsystem: &str,
-    version: u64,
-    status: &str,
-    error_code: Option<String>,
-    error_detail: Option<String>,
-    hive: &str,
-) -> Result<(), OrchestratorError> {
-    let action_class = classify_system_message("CONFIG_SET");
-    let (action_result, result_origin) =
-        derive_action_outcome(action_class, Some(status), error_code.as_deref());
-    let mut payload = serde_json::json!({
-        "subsystem": subsystem,
-        "version": version,
-        "status": status,
-        "hive": hive,
-    });
-    if let Some(code) = error_code {
-        payload["error_code"] = serde_json::Value::String(code);
-    }
-    if let Some(detail) = error_detail {
-        payload["error_detail"] = serde_json::Value::String(detail);
-    }
-    let reply = Message {
-        routing: Routing {
-            src: sender.uuid().to_string(),
-            src_l2_name: None,
-            dst: Destination::Unicast(request.routing.src.clone()),
-            ttl: 16,
-            trace_id: request.routing.trace_id.clone(),
-        },
-        meta: Meta {
-            msg_type: SYSTEM_KIND.to_string(),
-            msg: Some("CONFIG_RESPONSE".to_string()),
-            src_ilk: None,
-            scope: None,
-            target: None,
-            action: Some("CONFIG_SET".to_string()),
-            action_class,
-            action_result,
-            result_origin: result_origin.map(str::to_string),
-            priority: None,
-            context: None,
-            ..Meta::default()
-        },
-        payload,
-    };
-    sender.send(reply).await?;
-    Ok(())
-}
-
 fn list_hives(state: &OrchestratorState) -> Result<Vec<serde_json::Value>, OrchestratorError> {
     let root = hives_root();
     let mut out = Vec::new();
@@ -12035,47 +11955,6 @@ fn assemble_spawn_config_map(
         config.insert("_system".to_string(), system);
     }
     config
-}
-
-async fn send_node_config_changed_signal(
-    sender: &NodeSender,
-    node_name: &str,
-    config_version: u64,
-    patch: serde_json::Value,
-) -> Result<(), OrchestratorError> {
-    let msg = Message {
-        routing: Routing {
-            src: sender.uuid().to_string(),
-            src_l2_name: None,
-            dst: Destination::Unicast(node_name.to_string()),
-            ttl: 16,
-            trace_id: Uuid::new_v4().to_string(),
-        },
-        meta: Meta {
-            msg_type: SYSTEM_KIND.to_string(),
-            msg: Some(MSG_CONFIG_CHANGED.to_string()),
-            src_ilk: None,
-            scope: Some(SCOPE_GLOBAL.to_string()),
-            target: Some(node_name.to_string()),
-            action: None,
-            priority: None,
-            context: None,
-            ..Meta::default()
-        },
-        payload: serde_json::to_value(ConfigChangedPayload {
-            subsystem: "node_config".to_string(),
-            action: Some("set".to_string()),
-            auto_apply: Some(true),
-            version: config_version,
-            config: serde_json::json!({
-                "node_name": node_name,
-                "patch": patch,
-            }),
-            hive: None,
-        })?,
-    };
-    sender.send(msg).await?;
-    Ok(())
 }
 
 fn unit_from_node_name(node_name: &str) -> String {
@@ -14801,7 +14680,6 @@ async fn get_node_status_flow(
 }
 
 async fn set_node_config_flow(
-    sender: &NodeSender,
     state: &OrchestratorState,
     payload: &serde_json::Value,
 ) -> serde_json::Value {
@@ -14896,10 +14774,6 @@ async fn set_node_config_flow(
         .get("replace")
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
-    let notify = payload
-        .get("notify")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(true);
     let runtime_patch = match parse_optional_string_field("runtime") {
         Ok(value) => value,
         Err(err) => {
@@ -15119,27 +14993,6 @@ async fn set_node_config_flow(
         });
     }
 
-    let notify_status = if notify {
-        let patch_payload = payload
-            .get("config")
-            .cloned()
-            .unwrap_or_else(|| serde_json::json!({}));
-        match send_node_config_changed_signal(sender, &node_name, next_version, patch_payload).await
-        {
-            Ok(()) => "sent".to_string(),
-            Err(err) => {
-                tracing::warn!(
-                    node_name = node_name,
-                    error = %err,
-                    "failed to dispatch node CONFIG_CHANGED signal"
-                );
-                format!("dispatch_failed: {}", err)
-            }
-        }
-    } else {
-        "skipped".to_string()
-    };
-
     serde_json::json!({
         "status": "ok",
         "target": target_hive,
@@ -15147,7 +15000,6 @@ async fn set_node_config_flow(
         "node_name": node_name,
         "path": path.display().to_string(),
         "config_version": next_version,
-        "notify_status": notify_status,
     })
 }
 

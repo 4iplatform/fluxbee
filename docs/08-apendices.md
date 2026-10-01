@@ -34,7 +34,7 @@
 
 ### Mensajes de Sistema
 
-- **CONFIG_CHANGED**: mensaje SYSTEM protegido con `subsystem`, `version` y `config`. Hoy lo usan SY.admin para la policy OPA de usuario (ver `opa-distribution.md`) y los orquestadores para `node_config`; rutas/VPN/taps ya no (desde 0.1.44).
+- **CONFIG_CHANGED**: mensaje SYSTEM protegido con `subsystem`, `version` y `config`. Hoy lo usa solo SY.admin, para la policy OPA de usuario (ver `opa-distribution.md`); rutas/VPN/taps ya no (desde 0.1.44) y el `node_config` de los orquestadores se eliminó en 0.1.45.
 
 - **CONFIG_RESPONSE**: Unicast de respuesta a CONFIG_CHANGED. Confirma aplicación (`status: ok`) o reporta error (`status: error`). Obligatorio para todos los nodos SY que reciben configuración.
 

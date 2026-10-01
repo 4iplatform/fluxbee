@@ -17,7 +17,7 @@ type orchestratorClient interface {
 	RunNode(ctx context.Context, targetNode, nodeName, runtimeName, version string, config map[string]any) (map[string]any, error)
 	StartNode(ctx context.Context, targetNode, nodeName string) (map[string]any, error)
 	RestartNode(ctx context.Context, targetNode, nodeName string) (map[string]any, error)
-	SetNodeConfig(ctx context.Context, targetNode, nodeName string, config map[string]any, binding *managedRuntimeBinding, notify bool) (map[string]any, error)
+	SetNodeConfig(ctx context.Context, targetNode, nodeName string, config map[string]any, binding *managedRuntimeBinding) (map[string]any, error)
 	KillNode(ctx context.Context, targetNode, nodeName string, force, purgeInstance bool) (map[string]any, error)
 }
 
@@ -88,11 +88,10 @@ func (c *l2OrchestratorClient) RestartNode(rpcCtx context.Context, targetNode, n
 	})
 }
 
-func (c *l2OrchestratorClient) SetNodeConfig(rpcCtx context.Context, targetNode, nodeName string, config map[string]any, binding *managedRuntimeBinding, notify bool) (map[string]any, error) {
+func (c *l2OrchestratorClient) SetNodeConfig(rpcCtx context.Context, targetNode, nodeName string, config map[string]any, binding *managedRuntimeBinding) (map[string]any, error) {
 	payload := map[string]any{
 		"node_name": nodeName,
 		"config":    config,
-		"notify":    notify,
 		"replace":   false,
 	}
 	if binding != nil {

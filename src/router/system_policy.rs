@@ -61,8 +61,8 @@ pub const PROTECTED_SYSTEM_ACTIONS: &[&str] = &[
     "INVENTORY_REQUEST",
     "ADD_HIVE_FINALIZE",
     "REMOVE_HIVE_CLEANUP",
-    // Its receivers (SY.config.routes, SY.opa.rules, managed nodes) APPLY the config it carries:
-    // routes, VPNs, taps, the user OPA policy. Only the Admin and the orchestrators may send it.
+    // Its receiver (SY.opa.rules) APPLIES the user OPA policy it carries. Only the primary Admin
+    // sends it (system policy rule 2).
     "CONFIG_CHANGED",
 ];
 
@@ -472,25 +472,20 @@ mod tests {
     }
 
     #[test]
-    fn config_control_denies_non_sy_origins_and_admits_orchestrator() {
-        // Lock-in for the CONFIG_SET/CONFIG_GET origin-authz gate (the io.api revamp
-        // moved these into node_control_actions). Only the motherbee Admin and
-        // an SY.orchestrator may drive node config; any non-SY origin (a compromised or
-        // rogue application node on the same VPN) MUST be denied at the delivery gate,
-        // and the router remains the authority regardless of msg_type letter-case.
+    fn config_control_only_from_the_primary_admin() {
+        // CONFIG_SET/CONFIG_GET (a node's live config) come only from the motherbee Admin. The
+        // orchestrators never send them (verified 2026-10-01), so they are not admitted either:
+        // a compromised orchestrator must not rewrite another hive's node config. Any non-SY
+        // origin (a rogue application node on the same VPN) is denied at the delivery gate.
         let hive = "worker-220";
         for action in ["CONFIG_GET", "CONFIG_SET"] {
-            // Admitted authorities.
             assert!(
                 authorize_system(action, Some("SY.admin@motherbee"), hive),
                 "{action}: SY.admin@motherbee must be admitted"
             );
-            assert!(
-                authorize_system(action, Some("SY.orchestrator@worker-220"), hive),
-                "{action}: SY.orchestrator@<hive> must be admitted"
-            );
-            // Denied: non-SY application origins on the same VPN.
             for rogue in [
+                Some("SY.orchestrator@worker-220"),
+                Some("SY.orchestrator@motherbee"),
                 Some("IO.api@worker-220"),
                 Some("AI.evil@motherbee"),
                 Some("IO.slack@worker-220"),
@@ -504,6 +499,82 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// Rule (3) grants an orchestrator exactly what it forwards to another hive's orchestrator
+    /// (node lifecycle and inspection, the hive join/leave handshake) — verified against
+    /// sy_orchestrator on 2026-10-01 — and nothing else.
+    #[test]
+    fn orchestrators_get_exactly_what_they_forward() {
+        let forwarded = [
+            "SPAWN_NODE",
+            "KILL_NODE",
+            "START_NODE",
+            "RESTART_NODE",
+            "REMOVE_NODE_INSTANCE",
+            "NODE_CONFIG_GET",
+            "NODE_CONFIG_SET",
+            "NODE_STATE_GET",
+            "NODE_STATUS_GET",
+            "LIST_NODES",
+            "GET_VERSIONS",
+            "GET_RUNTIMES",
+            "GET_RUNTIME",
+            "SYSTEM_CORE_ROLLBACK",
+            "ADD_HIVE_FINALIZE",
+            "REMOVE_HIVE_CLEANUP",
+        ];
+        for action in forwarded {
+            for (orchestrator, receiving_hive) in [
+                ("SY.orchestrator@motherbee", "worker1"),
+                ("SY.orchestrator@worker1", "motherbee"),
+                ("SY.orchestrator@ingress1", "ingress1"),
+            ] {
+                assert!(
+                    authorize_system(action, Some(orchestrator), receiving_hive),
+                    "{orchestrator} must be admitted for {action} on {receiving_hive}"
+                );
+            }
+        }
+        let never_sent = [
+            "CONFIG_SET",
+            "CONFIG_GET",
+            "CONFIG_CHANGED",
+            "SYSTEM_UPDATE",
+            "SYSTEM_SYNC_HINT",
+            "INVENTORY_REQUEST",
+        ];
+        let edge = [
+            "EDGE_OPEN_URL",
+            "EDGE_CLOSE_URL",
+            "EDGE_LIST_URLS",
+            "EDGE_PUBLISH_BLOB",
+            "EDGE_UNPUBLISH_BLOB",
+        ];
+        for action in never_sent
+            .iter()
+            .chain(edge.iter())
+            .chain(["WAN_REACHABILITY_VOUCH"].iter())
+        {
+            for receiving_hive in ["motherbee", "worker1", "ingress1"] {
+                assert!(
+                    !authorize_system(action, Some("SY.orchestrator@ingress1"), receiving_hive),
+                    "an orchestrator must not be admitted for {action} on {receiving_hive}"
+                );
+            }
+        }
+        // Completeness: every protected action is placed on purpose — forwarded by orchestrators,
+        // never sent by them, or Admin-only edge. A new protected action must be placed here.
+        let mut placed: Vec<&str> = forwarded
+            .iter()
+            .chain(never_sent.iter())
+            .chain(edge.iter())
+            .copied()
+            .collect();
+        placed.sort_unstable();
+        let mut all = PROTECTED_SYSTEM_ACTIONS.to_vec();
+        all.sort_unstable();
+        assert_eq!(placed, all);
     }
 
     #[test]
@@ -536,7 +607,7 @@ mod tests {
             "REMOVE_HIVE_CLEANUP",
             // Swaps /usr/bin binaries and restarts the core on the TARGET hive.
             "SYSTEM_CORE_ROLLBACK",
-            // Carries config its receivers apply (routes, VPNs, taps, OPA).
+            // Carries the user OPA policy its receiver applies.
             "CONFIG_CHANGED",
         ] {
             assert!(
@@ -551,18 +622,21 @@ mod tests {
     }
 
     #[test]
-    fn config_changed_only_from_admin_and_orchestrators() {
+    fn config_changed_only_from_the_primary_admin() {
         // Any local node used to be able to rewrite its hive's routes/VPNs/taps/OPA policy by
-        // sending CONFIG_CHANGED (lab 2026-09-30). Only the primary Admin (to every hive, rule 2 —
-        // e.g. the notice of a newly published user OPA policy) and the orchestrators
-        // (node_config, rule 3) may send it.
+        // sending CONFIG_CHANGED (lab 2026-09-30). Today it carries only the user OPA policy, and
+        // only the primary Admin sends it (to every hive, rule 2). Orchestrators no longer send
+        // any (the node_config signal nobody applied was removed in 0.1.45).
         let act = "CONFIG_CHANGED";
         for hive in ["motherbee", "worker1", "ingress1", "egress1"] {
-            assert!(authorize_system(act, Some("SY.admin@motherbee"), hive), "{hive}");
+            assert!(
+                authorize_system(act, Some("SY.admin@motherbee"), hive),
+                "{hive}"
+            );
         }
-        assert!(authorize_system(act, Some("SY.orchestrator@motherbee"), "motherbee"));
-        assert!(authorize_system(act, Some("SY.orchestrator@worker1"), "worker1"));
         for rogue in [
+            Some("SY.orchestrator@motherbee"),
+            Some("SY.orchestrator@worker1"),
             Some("AI.chat@motherbee"),
             Some("IO.slack@motherbee"),
             Some("WF.invoice@motherbee"),

@@ -114,7 +114,7 @@ func (s *Service) deployPublishedWorkflow(workflowName string, autoSpawn bool, t
 		rebind := func() error {
 			rpcCtx, cancel := context.WithTimeout(context.Background(), orchestratorRPCTimeout)
 			defer cancel()
-			_, err := s.orchestrator.SetNodeConfig(rpcCtx, s.cfg.OrchestratorTarget, nodeName, config, &binding, false)
+			_, err := s.orchestrator.SetNodeConfig(rpcCtx, s.cfg.OrchestratorTarget, nodeName, config, &binding)
 			return err
 		}
 		if err := untilRuntimeSynced(runtimeSyncBudget, rebind); err != nil {

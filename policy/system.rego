@@ -41,14 +41,25 @@ default allow := false
 edge_service_actions := {"EDGE_OPEN_URL", "EDGE_CLOSE_URL", "EDGE_LIST_URLS", "EDGE_PUBLISH_BLOB", "EDGE_UNPUBLISH_BLOB"}
 
 # Live node config and runtime distribution are forwarded directly by the singleton Admin to
-# managed nodes or orchestrators on workers. CONFIG_CHANGED carries config its receivers apply
-# (a hive's routes/VPNs/taps, the notice of a newly published user OPA policy): the Admin sends
-# it to every hive (rule 2); orchestrators send node_config ones (rule 3).
+# managed nodes or orchestrators on workers. CONFIG_CHANGED carries the user OPA policy (writes to
+# the motherbee's SY.opa.rules, the notice of a newly published one to every hive): Admin only.
 node_control_actions := {"CONFIG_GET", "CONFIG_SET", "SYSTEM_UPDATE", "SYSTEM_SYNC_HINT", "CONFIG_CHANGED"}
 
+# What an orchestrator sends to another hive's orchestrator: the node lifecycle and inspection it
+# forwards for the Admin, and the hive join/leave handshake (verified in sy_orchestrator,
+# 2026-10-01). Nothing else — no node live config (CONFIG_SET/GET), no CONFIG_CHANGED, no
+# SYSTEM_UPDATE: a compromised orchestrator (e.g. on the DMZ ingress) must not be able to write
+# another hive's config or the global policy.
+orchestrator_actions := {
+	"SPAWN_NODE", "KILL_NODE", "START_NODE", "RESTART_NODE", "REMOVE_NODE_INSTANCE",
+	"NODE_CONFIG_GET", "NODE_CONFIG_SET", "NODE_STATE_GET", "NODE_STATUS_GET", "LIST_NODES",
+	"GET_VERSIONS", "GET_RUNTIMES", "GET_RUNTIME", "SYSTEM_CORE_ROLLBACK",
+	"ADD_HIVE_FINALIZE", "REMOVE_HIVE_CLEANUP",
+}
+
 # Option B (WAN multi-hop reachability): router-internal vouch action, decided ONLY by rule (6)
-# below. Excluded from the broad control-plane grants (3)/(4) so it is never granted to
-# SY.orchestrator/SY.admin — only the primary hub's gateway router may vouch.
+# below. Never granted to SY.orchestrator (not in orchestrator_actions) nor by rule (4) — only
+# the primary hub's gateway router may vouch.
 reachability_actions := {"WAN_REACHABILITY_VOUCH"}
 
 # Parse "<role>@<hive>" from the router-authoritative (already-stamped) src_l2_name, splitting
@@ -83,10 +94,10 @@ allow if {
 	parsed.hive == "motherbee"
 }
 
-# (3) SY.orchestrator@<any non-empty hive> — the cross-hive control plane (system-final).
+# (3) SY.orchestrator@<any non-empty hive> — the cross-hive control plane, limited to what it
+# forwards (orchestrator_actions).
 allow if {
-	not input.action in edge_service_actions
-	not input.action in reachability_actions
+	input.action in orchestrator_actions
 	parsed.role == "SY.orchestrator"
 	parsed.hive != ""
 }

@@ -3,7 +3,6 @@ package node
 import (
 	"encoding/json"
 	"fmt"
-	"log"
 	"strings"
 
 	fluxbeesdk "github.com/4iplatform/json-router/fluxbee-go-sdk"
@@ -17,71 +16,6 @@ func (s *Service) handleSystemMessage(msg fluxbeesdk.Message) {
 		s.handleNodeConfigGet(msg)
 	case fluxbeesdk.MSGConfigSet:
 		s.handleNodeConfigSet(msg)
-	case fluxbeesdk.MSGConfigChanged:
-		s.handleConfigChanged(msg)
-	}
-}
-
-func (s *Service) handleConfigChanged(msg fluxbeesdk.Message) {
-	var payload WFConfigChangedPayload
-	if err := json.Unmarshal(msg.Payload, &payload); err != nil {
-		log.Printf("sy-wf-rules: invalid CONFIG_CHANGED payload: %v", err)
-		return
-	}
-	if payload.Subsystem != "wf-rules" {
-		return
-	}
-	action := strings.ToLower(strings.TrimSpace(payload.Action))
-	if action == "check" {
-		action = "compile"
-	}
-	wfName := payload.WorkflowName
-	switch action {
-	case "compile":
-		if _, err := s.CompileWorkflow(CompileRequest{
-			WorkflowName: wfName,
-			Definition:   payload.Definition,
-			Version:      payload.Version,
-		}); err != nil {
-			log.Printf("sy-wf-rules: CONFIG_CHANGED compile failed for %q: %v", wfName, err)
-		}
-	case "compile_apply":
-		meta, err := s.CompileWorkflow(CompileRequest{
-			WorkflowName: wfName,
-			Definition:   payload.Definition,
-			Version:      payload.Version,
-			AutoSpawn:    payload.AutoSpawn,
-		})
-		if err != nil {
-			log.Printf("sy-wf-rules: CONFIG_CHANGED compile_apply failed (compile) for %q: %v", wfName, err)
-			return
-		}
-		if _, err := s.ApplyWorkflowAndDeploy(ApplyRequest{
-			WorkflowName: wfName,
-			Version:      meta.Version,
-			AutoSpawn:    payload.AutoSpawn,
-			TenantID:     payload.TenantID,
-		}); err != nil {
-			log.Printf("sy-wf-rules: CONFIG_CHANGED compile_apply failed (apply) for %q: %v", wfName, err)
-		}
-	case "apply":
-		if _, err := s.ApplyWorkflowAndDeploy(ApplyRequest{
-			WorkflowName: wfName,
-			Version:      payload.Version,
-			AutoSpawn:    payload.AutoSpawn,
-			TenantID:     payload.TenantID,
-		}); err != nil {
-			log.Printf("sy-wf-rules: CONFIG_CHANGED apply failed for %q: %v", wfName, err)
-		}
-	case "rollback":
-		if _, err := s.RollbackWorkflowAndDeploy(RollbackRequest{
-			WorkflowName: wfName,
-			TenantID:     payload.TenantID,
-		}); err != nil {
-			log.Printf("sy-wf-rules: CONFIG_CHANGED rollback failed for %q: %v", wfName, err)
-		}
-	default:
-		log.Printf("sy-wf-rules: CONFIG_CHANGED unknown action %q for %q, ignoring", payload.Action, wfName)
 	}
 }
 
@@ -270,13 +204,13 @@ func (s *Service) handleQuery(msg fluxbeesdk.Message) {
 			"last_error":        statusView.LastError,
 			"published_version": statusView.PublishedVersion,
 			"wf_node": map[string]any{
-				"node_name":         statusView.WFNode.NodeName,
-				"running":           statusView.WFNode.Running,
-				"status_reachable":  statusView.WFNode.StatusReachable,
-				"health_state":      statusView.WFNode.HealthState,
-				"active_instances":  formatOptionalInt(statusView.WFNode.ActiveInstances),
-				"wf_node_timeout":   statusView.WFNode.Timeout,
-				"deployed_version":  statusView.WFNode.RuntimeVersion,
+				"node_name":        statusView.WFNode.NodeName,
+				"running":          statusView.WFNode.Running,
+				"status_reachable": statusView.WFNode.StatusReachable,
+				"health_state":     statusView.WFNode.HealthState,
+				"active_instances": formatOptionalInt(statusView.WFNode.ActiveInstances),
+				"wf_node_timeout":  statusView.WFNode.Timeout,
+				"deployed_version": statusView.WFNode.RuntimeVersion,
 			},
 		}
 		s.sendQueryResponse(msg, action, payload)

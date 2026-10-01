@@ -47,9 +47,9 @@ Los nodos SY (System) son componentes de infraestructura que proveen servicios e
 
 ### 1.4 Patrón CONFIG_CHANGED / CONFIG_RESPONSE
 
-> **Desde 0.1.44:** solo lo usa la policy OPA de usuario (`SY.admin@motherbee` → SY.opa.rules; ver
-> [`opa-distribution.md`](opa-distribution.md)) y el `node_config` del orquestador. Rutas, VPN y taps
-> ya no viajan por CONFIG_CHANGED (§2).
+> **Desde 0.1.44–0.1.45:** solo lo usa la policy OPA de usuario (`SY.admin@motherbee` → SY.opa.rules;
+> ver [`opa-distribution.md`](opa-distribution.md)). Rutas, VPN y taps ya no viajan por CONFIG_CHANGED
+> (§2), y el `node_config` del orquestador (que nadie aplicaba) se eliminó en 0.1.45.
 
 Todo nodo SY que reciba configuración via broadcast CONFIG_CHANGED **DEBE** responder con CONFIG_RESPONSE. Este patrón permite a SY.admin:
 

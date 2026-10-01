@@ -13,7 +13,7 @@ type fakeOrchestratorClient struct {
 	runNodeFunc       func(ctx context.Context, targetNode, nodeName, runtimeName, version string, config map[string]any) (map[string]any, error)
 	startNodeFunc     func(ctx context.Context, targetNode, nodeName string) (map[string]any, error)
 	restartNodeFunc   func(ctx context.Context, targetNode, nodeName string) (map[string]any, error)
-	setNodeConfigFunc func(ctx context.Context, targetNode, nodeName string, config map[string]any, binding *managedRuntimeBinding, notify bool) (map[string]any, error)
+	setNodeConfigFunc func(ctx context.Context, targetNode, nodeName string, config map[string]any, binding *managedRuntimeBinding) (map[string]any, error)
 	killNodeFunc      func(ctx context.Context, targetNode, nodeName string, force, purgeInstance bool) (map[string]any, error)
 	runCalls          int
 	restartCalls      int
@@ -50,10 +50,10 @@ func (f *fakeOrchestratorClient) RestartNode(ctx context.Context, targetNode, no
 	return map[string]any{"status": "ok"}, nil
 }
 
-func (f *fakeOrchestratorClient) SetNodeConfig(ctx context.Context, targetNode, nodeName string, config map[string]any, binding *managedRuntimeBinding, notify bool) (map[string]any, error) {
+func (f *fakeOrchestratorClient) SetNodeConfig(ctx context.Context, targetNode, nodeName string, config map[string]any, binding *managedRuntimeBinding) (map[string]any, error) {
 	f.setConfigCalls++
 	if f.setNodeConfigFunc != nil {
-		return f.setNodeConfigFunc(ctx, targetNode, nodeName, config, binding, notify)
+		return f.setNodeConfigFunc(ctx, targetNode, nodeName, config, binding)
 	}
 	return map[string]any{"status": "ok"}, nil
 }
@@ -252,12 +252,9 @@ func TestApplyWorkflowAndDeployExistingNodeLeavesDeploymentDeferred(t *testing.T
 			},
 		}, nil
 	}
-	fake.setNodeConfigFunc = func(ctx context.Context, targetNode, nodeName string, config map[string]any, binding *managedRuntimeBinding, notify bool) (map[string]any, error) {
+	fake.setNodeConfigFunc = func(ctx context.Context, targetNode, nodeName string, config map[string]any, binding *managedRuntimeBinding) (map[string]any, error) {
 		gotPatch = config
 		gotBinding = binding
-		if notify {
-			t.Fatalf("expected notify=false")
-		}
 		return map[string]any{"status": "ok"}, nil
 	}
 	fake.restartNodeFunc = func(ctx context.Context, targetNode, nodeName string) (map[string]any, error) {
@@ -411,7 +408,7 @@ func TestExistingNodeApplyPreservesTimerL2Name(t *testing.T) {
 			},
 		}, nil
 	}
-	fake.setNodeConfigFunc = func(ctx context.Context, targetNode, nodeName string, config map[string]any, binding *managedRuntimeBinding, notify bool) (map[string]any, error) {
+	fake.setNodeConfigFunc = func(ctx context.Context, targetNode, nodeName string, config map[string]any, binding *managedRuntimeBinding) (map[string]any, error) {
 		gotPatch = config
 		return map[string]any{"status": "ok"}, nil
 	}
@@ -450,7 +447,7 @@ func TestExistingNodeApplyBindsConcretePackagePath(t *testing.T) {
 	fake.getNodeConfigFunc = func(ctx context.Context, targetNode, nodeName string) (map[string]any, error) {
 		return map[string]any{"status": "ok", "config": map[string]any{}}, nil
 	}
-	fake.setNodeConfigFunc = func(ctx context.Context, targetNode, nodeName string, config map[string]any, binding *managedRuntimeBinding, notify bool) (map[string]any, error) {
+	fake.setNodeConfigFunc = func(ctx context.Context, targetNode, nodeName string, config map[string]any, binding *managedRuntimeBinding) (map[string]any, error) {
 		gotBinding = binding
 		return map[string]any{"status": "ok"}, nil
 	}
