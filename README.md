@@ -845,8 +845,8 @@ Useful status fields:
 ```bash
 curl -sS "$BASE/config/storage"
 
-# routes and VPN rules are per hive: one rule per call (?hive=, default the motherbee)
-curl -sS -X POST "$BASE/vpns?hive=motherbee" \
+# routes, VPN rules and taps are per hive: one rule per call
+curl -sS -X POST "$BASE/hives/motherbee/vpns" \
   -H "Content-Type: application/json" \
   -d '{"pattern":"WF.echo","match_kind":"PREFIX","vpn_id":20}'
 ```
@@ -925,12 +925,6 @@ Current HTTP surface exposed by `SY.admin`.
 | `GET` | `/versions` | Effective versions (local or `?hive=`) |
 | `GET` | `/deployments` | Historical deployment entries (`?hive=`, `?category=`, `?limit=`) |
 | `GET` | `/drift-alerts` | Historical drift alert entries (`?hive=`, `?category=`, `?limit=`) |
-| `GET` | `/routes` | Read a hive's routes (`?hive=`, default the motherbee) |
-| `POST` | `/routes` | Add/update a route entry on a hive (`?hive=`) |
-| `DELETE` | `/routes` | Delete a route entry on a hive (`?hive=`, `?prefix=`) |
-| `GET` | `/vpns` | Read a hive's VPN rules (`?hive=`) |
-| `POST` | `/vpns` | Add/update a VPN rule on a hive (`?hive=`) |
-| `DELETE` | `/vpns` | Delete a VPN rule on a hive (`?hive=`, `?pattern=`) |
 | `GET` | `/config/storage` | Read storage config |
 | `PUT` | `/config/storage` | Update storage config |
 | `GET` | `/config/storage/metrics` | Storage metrics passthrough |
@@ -959,6 +953,9 @@ Current HTTP surface exposed by `SY.admin`.
 | `GET` | `/hives/{hive}/vpns` | List VPN rules for hive |
 | `POST` | `/hives/{hive}/vpns` | Add/update VPN rule on hive |
 | `DELETE` | `/hives/{hive}/vpns/{pattern}` | Delete VPN rule by pattern |
+| `GET` | `/hives/{hive}/taps` | List taps for hive |
+| `POST` | `/hives/{hive}/taps` | Add a tap on hive |
+| `DELETE` | `/hives/{hive}/taps` | Delete a tap (`?match_src=&match_dst=&target=`) |
 | `GET` | `/hives/{hive}/nodes` | List nodes on hive |
 | `POST` | `/hives/{hive}/nodes` | Spawn node on hive |
 | `DELETE` | `/hives/{hive}/nodes/{name}` | Kill node on hive |

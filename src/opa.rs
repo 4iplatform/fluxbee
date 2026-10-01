@@ -81,11 +81,13 @@ impl OpaDumpSource {
 }
 
 impl OpaResolver {
+    /// No user policy: the state a fresh install and a clear (`unload`) share, so a router reports
+    /// the same `ok` for both (it used to start in `error`; FINDINGS A-21).
     pub fn new() -> Self {
         Self {
             policy_loaded: false,
             policy_version: 0,
-            opa_load_status: OPA_STATUS_ERROR,
+            opa_load_status: OPA_STATUS_OK,
             logged_missing: false,
             entrypoint: None,
             base_data_bundle: None,
@@ -1404,6 +1406,16 @@ mod tests {
         resolver.unload();
         assert!(!resolver.has_policy());
         assert_eq!(resolver.status(), (0, crate::shm::OPA_STATUS_OK));
+    }
+
+    /// A router that starts without a user policy reports what one does after a clear.
+    #[test]
+    fn a_new_resolver_reports_no_policy_like_a_cleared_one() {
+        let fresh = super::OpaResolver::new();
+        let mut cleared = super::OpaResolver::new();
+        cleared.unload();
+        assert!(!fresh.has_policy());
+        assert_eq!(fresh.status(), cleared.status());
     }
 
     use super::{

@@ -113,13 +113,15 @@ allow if {
 	parsed.role in {"SY.admin", "SY.wf-rules", "WF.orch.diag"}
 }
 
-# (5) Read-only health probe opened to config/vault, same hive only (never mutations).
+# (5) Read-only health probe opened to the vault, same hive only (never mutations). It also named
+# "SY.config-routes", which no node is called (the node is SY.config.routes) and which never sends
+# this probe: removed in 0.1.50 (FINDINGS A-18).
 allow if {
 	not input.action in edge_service_actions
 	parsed.role != "SY.orchestrator"
 	parsed.hive == input.hive_id
 	input.action == "NODE_STATUS_GET"
-	parsed.role in {"SY.config-routes", "SY.vault"}
+	parsed.role == "SY.vault"
 }
 
 # (6) Option B (WAN multi-hop reachability, edge-multihop-reachability-spec-v1): only the primary

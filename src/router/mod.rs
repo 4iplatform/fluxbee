@@ -204,11 +204,40 @@ impl Router {
         let opa_reader = Arc::clone(&self.opa_reader);
         let hive_id = self.cfg.hive_id.clone();
         let heartbeat_interval = self.cfg.heartbeat_interval_ms;
+        let config_reader = Arc::clone(&self.config_reader);
+        let static_routes = Arc::clone(&self.static_routes);
+        let vpn_rules = Arc::clone(&self.vpn_rules);
+        let tap_rules = Arc::clone(&self.tap_rules);
+        let config_version = Arc::clone(&self.config_version);
+        let nodes_hb = Arc::clone(&self.nodes);
+        let peer_nodes_hb = Arc::clone(&self.peer_nodes);
+        let fib_hb = Arc::clone(&self.fib);
+        let lsa_snapshot_hb = Arc::clone(&self.lsa_snapshot);
+        let reachability_hb = Arc::clone(&self.reachability);
         tokio::spawn(async move {
             let mut ticker = time::interval(Duration::from_millis(heartbeat_interval));
             loop {
                 ticker.tick().await;
                 maybe_refresh_opa_from_shm(&opa_reader, &opa, &shm, &hive_id).await;
+                // Routes, VPNs and taps are otherwise re-read only on frames from this router's
+                // own nodes: a router with none (a pure gateway on a hive with several routers)
+                // would route and advertise stale config. Version-gated: a no-op when unchanged.
+                let _ = refresh_config(
+                    &config_reader,
+                    &static_routes,
+                    &vpn_rules,
+                    &tap_rules,
+                    &config_version,
+                    &hive_id,
+                    &nodes_hb,
+                    &peer_nodes_hb,
+                    &shm,
+                    &fib_hb,
+                    &lsa_snapshot_hb,
+                    &reachability_hb,
+                    false,
+                )
+                .await;
                 let (policy_version, load_status) = {
                     let opa = opa.lock().await;
                     opa.status()
@@ -770,30 +799,11 @@ async fn handle_node(
                         break;
                     }
                     if msg.meta.msg.as_deref() == Some(MSG_OPA_RELOAD) {
+                        // SY.opa.rules installed a policy: load it now, and tell the other routers
+                        // of this hive. No node consumes OPA_RELOAD, so it goes to none of them.
                         let payload: OpaReloadPayload =
                             serde_json::from_value(msg.payload.clone())?;
                         apply_opa_reload(&opa, &opa_reader, &shm, hive_id, &payload).await;
-                        let src_uuid = Uuid::parse_str(&msg.routing.src).ok();
-                        let local_senders: Vec<mpsc::UnboundedSender<Vec<u8>>> = {
-                            let nodes_guard = nodes.lock().await;
-                            nodes_guard
-                                .iter()
-                                .filter_map(|(uuid, handle)| {
-                                    if src_uuid.is_some_and(|value| value == *uuid) {
-                                        None
-                                    } else {
-                                        Some(handle.sender.clone())
-                                    }
-                                })
-                                .collect()
-                        };
-                        if !local_senders.is_empty() {
-                            let data = serde_json::to_vec(&msg)?;
-                            for sender in local_senders {
-                                let _ = sender.send(data.clone());
-                            }
-                            tracing::info!("opa reload forwarded to local nodes");
-                        }
                         if msg.routing.ttl >= 2 {
                             broadcast_to_peers(&peers, &msg).await?;
                             tracing::info!("opa reload forwarded to peers");

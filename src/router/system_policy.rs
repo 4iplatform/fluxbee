@@ -343,7 +343,7 @@ mod tests {
 
     #[test]
     fn same_hive_role_allowed_requires_same_hive_and_allowlist() {
-        let allow = ["SY.architect", "SY.config-routes", "SY.vault"];
+        let allow = ["SY.architect", "SY.config.routes", "SY.vault"];
         // in-allowlist + same hive -> allowed
         assert!(same_hive_role_allowed(
             "motherbee",
@@ -412,7 +412,7 @@ mod tests {
             Some("motherbee"),
             Some("AI.evil@motherbee"),
             Some("SY.vault@motherbee"),
-            Some("SY.config-routes@motherbee"),
+            Some("SY.config.routes@motherbee"),
             Some("SY.identity@motherbee"),
         ] {
             assert!(
@@ -420,12 +420,7 @@ mod tests {
                 "{bad:?} must be rejected for {act}"
             );
         }
-        // NODE_STATUS_GET read-probe opens to config-routes/vault same-hive only.
-        assert!(authorize_system(
-            "NODE_STATUS_GET",
-            Some("SY.config-routes@motherbee"),
-            hive
-        ));
+        // NODE_STATUS_GET read-probe opens to the vault, same hive only.
         assert!(authorize_system(
             "NODE_STATUS_GET",
             Some("SY.vault@motherbee"),
@@ -433,12 +428,17 @@ mod tests {
         ));
         assert!(!authorize_system(
             "NODE_STATUS_GET",
-            Some("SY.config-routes@worker1"),
+            Some("SY.vault@worker1"),
+            hive
+        ));
+        assert!(!authorize_system(
+            "NODE_STATUS_GET",
+            Some("SY.config.routes@motherbee"),
             hive
         ));
         assert!(!authorize_system(
             "SPAWN_NODE",
-            Some("SY.config-routes@motherbee"),
+            Some("SY.vault@motherbee"),
             hive
         ));
         assert!(!authorize_system(
