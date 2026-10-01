@@ -21,6 +21,7 @@
 
 | Versión | Fecha (ART) | Commit | Alcance | Estado | Rollback |
 |---|---|---|---|---|---|
+| **0.1.46** | 2026-10-01 | `7371ca1` | motherbee + spokes (core) | ✅ live | snap `pre-opa-blockA-0-1-46` (las 4 VMs) · `apt install fluxbee=0.1.45` |
 | **0.1.45** | 2026-10-01 | `d6505ff` | motherbee + spokes (core) | ✅ live | snap `pre-rule3-0-1-45` (las 4 VMs) · `apt install fluxbee=0.1.44` |
 | **0.1.44** | 2026-10-01 | `005d0ad` | motherbee + spokes (core) | ✅ live | snap `pre-src-binding-0-1-44` (las 4 VMs) · `apt install fluxbee=0.1.43` |
 | **0.1.43** | 2026-09-30 | `2b3abb2` | motherbee + spokes (core) | ✅ live | snap `pre-sync-hint-0-1-43` (las 4 VMs) · `apt install fluxbee=0.1.42` |
@@ -54,6 +55,35 @@
 > (`dpkg-scanpackages -m`) para rollback, pero su detalle vive en la bitácora, no acá.
 
 ---
+
+## 0.1.46 — OPA, bloque A del panel DTAP: arquitecto, reporte honesto, esperas acotadas, re-publicación, una sola vía de escritura
+
+- **Fecha:** 2026-10-01 (ART) · **Versión anterior:** 0.1.45 · **Commit:** `7371ca1` (panel DTAP
+  2026-10-01: D-1…D-8, P-4, P-5, P-12, P-14, A-1…A-3, T-5, T-11, T-13)
+- **Alcance:** motherbee + los tres spokes (core-update).
+- **Qué cambió:**
+  - El arquitecto traduce las escrituras OPA globales (`/opa/policy*`, incluido clear) y les da 80 s.
+  - El admin espera 10 s las respuestas de los hives (antes 30) y como mucho 5 s el escaneo; si el
+    motherbee no contesta el paso que cambia la policy, responde `TIMEOUT` (antes `200 ok`).
+  - El reporte espera a todos los hives `connected` del registro (alcanzables o no), marca
+    `unreachable` y solo cuenta la respuesta de `SY.opa.rules@<hive>` con el hash anunciado.
+  - El motherbee re-publica si el manifest no nombra la policy que corre.
+  - `CONFIG_SET` sobre SY.opa.rules es de solo lectura.
+- **Build:** 11 min. **Publish:** 46 paquetes. Snapshots `pre-opa-blockA-0-1-46` en las 4 VMs (se
+  borró antes `pre-sync-hint-0-1-43`).
+- **Install:** motherbee 18:47 UTC; spokes 18:48–18:52.
+- **Verificación en vivo:**
+  - Los 4 hives con los mismos binarios; 0 `failed`.
+  - `CONFIG_SET` con `compile_apply` → `UNSUPPORTED_OPERATION`; la policy no cambió.
+  - Apply y clear globales: ~5 s, los 4 hives del registro en `running_hives`, `unreachable` vacío.
+  - Con Syncthing de egress1 cortado (nft en :22000): la escritura volvió en 13,6 s (antes ≥32 s)
+    con `pending: [egress1]` y `unreachable: []`; al desbloquear, egress1 se puso al día en 7 s.
+  - Manifest del motherbee alterado a mano (hash falso): re-publicado en 5,0 s.
+  - 0 rechazos del gate y 0 descartes por `routing.src` en los 4 routers; sin policy de usuario al
+    terminar.
+  - No probado en vivo (cubierto por tests): la traducción del arquitecto, el `TIMEOUT` del paso de
+    cambio y la respuesta `PUBLISH_FAILED`.
+- **Rollback:** snapshot `pre-opa-blockA-0-1-46` o `apt install fluxbee=0.1.45`.
 
 ## 0.1.45 — el orquestador solo puede mandar lo que reenvía; fuera las señales de config muertas
 
