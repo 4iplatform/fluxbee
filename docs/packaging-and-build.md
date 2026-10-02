@@ -52,7 +52,7 @@ Definido en `packaging/base-nodes.json`:
 | IO.blob | runtime (boot=true) | corriendo |
 | IO.cloud | runtime (boot=true, role: motherbee) | corriendo (degradado si no hay Fluxbee Cloud — la Cloud es otro repo) |
 | io.api | runtime | instancia default `IO.api@motherbee` corriendo + spawnable |
-| io.slack | runtime | instancia default `IO.slack.default@motherbee` corriendo + spawnable |
+| io.slack | runtime | horneado, NO al boot: cada binding de Slack lo lanza el tenant que lo necesita, con su tenant |
 | ai.generic | runtime | horneado, NO al boot: las instancias `AI.*` se crean con `run_node` cuando hacen falta |
 | wf.engine | runtime | horneado, NO al boot — los nodos WF.* se spawnean desde un **workflow package** que corre sobre este runtime, no por `run_node` sobre el runtime pelado (da `WF_RUNTIME_PACKAGE_REQUIRED`) |
 | io.linkedhelper | runtime | horneado, NO al boot (spawnable a demanda) |
@@ -195,11 +195,11 @@ sudo fluxbee-firstboot
 `fluxbee-firstboot` (idempotente): bootea PostgreSQL + crea rol/DBs, arranca el orchestrator,
 hace el `vault_put` del secreto de postgres (la **conexión a la DB queda resuelta sola en el
 vault**), reconecta los consumidores, auto-spawnea los runtimes managed de boot (IO.blob/IO.cloud), y **auto-spawnea
-las instancias default de los boot-runtimes** (io.api/io.slack/io.wapp). Al terminar
+las instancias default de los boot-runtimes** (io.api/io.wapp). Al terminar
 imprime los **próximos pasos**.
 
 Después del firstboot quedan **corriendo**: el core `SY.*` + IO.blob + IO.cloud +
-`IO.api@motherbee` + `IO.slack.default@motherbee` + `IO.wapp.default@motherbee` — varios
+`IO.api@motherbee` + `IO.wapp.default@motherbee` — varios
 **degradados** hasta cargar sus secretos. (`ai.generic` y `wf.engine` quedan **horneados pero NO
 al boot** — `boot:false` en `base-nodes.json`; sus instancias se crean a demanda.)
 
@@ -216,7 +216,7 @@ curl -sS -X POST http://127.0.0.1:8080/hives/motherbee/vault/secrets \
 #  si cargás una key de Anthropic, poné además `ai.default_provider: anthropic` en
 #  /etc/fluxbee/hive.yaml y reiniciá los nodos AI, o siguen resolviendo el pool de openai.)
 
-# Tokens de Slack para IO.slack: resource_type "slack", value {app_token, bot_token}.
+# Tokens de Slack para un binding IO.slack (lo lanza su tenant): resource_type "slack", value {app_token, bot_token}.
 ```
 
 **Architect (Archi):** `http://<motherbee>:3000` · **Admin API:** `http://127.0.0.1:8080`.

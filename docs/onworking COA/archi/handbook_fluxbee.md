@@ -558,11 +558,10 @@ Rules:
 
 ### 8.2 IO tenant naming
 
-Single-tenant IO node:
-- `IO.slack.default@motherbee`
+An IO channel node is launched by the tenant that needs it and runs with that tenant. There is no
+default Slack node in the base install: every Slack binding is its own instance of `io.slack`.
 
-One IO node per tenant:
-- `IO.slack.T126@motherbee`
+- `IO.slack.T126@motherbee` — one binding, named after its tenant or workspace token
 
 Use the same short tenant token consistently across related nodes.
 

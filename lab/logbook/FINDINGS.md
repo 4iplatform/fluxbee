@@ -531,16 +531,18 @@ Respuesta del operador (2026-10-02): *"sí a todo"*.
     al orchestrator (verificado contra el código de `needrestart`).
 
 
-### A-40 🟡 IO.slack.default no tiene su ILK en identity (PROD)
+### A-40 ✅ RESUELTO (0.1.55) — IO.slack.default no tenía su ILK en identity (PROD)
 
-- **Qué pasa:** su config apunta a `ilk:9cd1bb44…`, pero SY.identity responde `NOT_FOUND`. Por eso
-  cada `CONFIG_SET` termina en `own_ich_registration_failed` (`ILK_ADD_CHANNEL rejected:
-  ILK_NOT_FOUND`) y el nodo queda en FAILED_CONFIG. Los otros cinco nodos administrados tienen su ILK.
-- **Causa probable:** la primera corrida del factory reset del 28/09, que borraba ILKs de nodos base
-  antes de su arreglo.
-- **Pendiente:** recrear el nodo, para que el orchestrator le registre un ILK nuevo, y volver a
-  cargarle su config. Al quitar AI.chat se le sacó `io.dst_node` (que apuntaba a AI.chat): la config
-  v4 quedó persistida.
+- **Qué pasaba:** su config apuntaba a `ilk:9cd1bb44…`, pero SY.identity respondía `NOT_FOUND`, así
+  que cada `CONFIG_SET` fallaba al registrar su propio canal y el nodo quedaba en FAILED_CONFIG.
+  Probablemente lo borró la primera corrida del factory reset del 28/09.
+- **Decisión del operador (2026-10-02):** *"io.slack es parte del sistema pero funciona
+  instanciándose, no corre solo… corre con su propio tenant que lo lanza"*.
+- **Cómo se cerró:**
+  - `io.slack` queda horneado y sin instancia de arranque en `base-nodes.json`;
+  - cada binding lo lanza su tenant;
+  - la instancia de PROD, que corría en el tenant raíz, se borró con purga. Su config quedó guardada
+    fuera del repo para recrear el binding desde un tenant.
 
 ### A-41 ✅ RESUELTO (0.1.54) — Purgar un nodo dejaba su UUID persistido
 
@@ -549,6 +551,27 @@ Respuesta del operador (2026-10-02): *"sí a todo"*.
   factory reset y bindings viejos de Slack. Un nodo nuevo con el mismo nombre heredaba el UUID viejo.
 - **Arreglo (`7c9f781`):** las dos rutas de purga lo borran y lo informan (`uuid_file_removed`). Se
   borraron los 12 de PROD.
+
+
+### A-42 🔴 POSTERGADO (paquete de seguridad) — El merge por email no verifica que el email sea de quien lo escribe
+
+- **Qué pasa (desde 0.1.54, A-37):** si alguien escribe el email de otra persona del mismo tenant,
+  SY.identity hace el merge y su canal queda asociado al ILK de esa persona. Lo enrutan como si fuera
+  ella y puede completar los campos que estén vacíos.
+- **Decisión del operador (2026-10-02):** *"levántalo y dejamos para después"*. Va con el paquete de
+  seguridad (A-22).
+- **Arreglo previsto:** una prueba de pertenencia antes del merge, por ejemplo un código de un solo
+  uso al email.
+
+### A-43 🟡 PARA VER — Nodos IO lanzados desde el tenant raíz
+
+- **Qué pasa:** la instalación base levanta nodos IO en el tenant raíz: `IO.api@motherbee`,
+  `IO.wapp.default@motherbee`, y además `IO.blob` e `IO.cloud`, que son de sistema. Una persona que
+  llegue por uno de ellos queda temporal: desde 0.1.55 nadie se registra en el tenant raíz.
+- **Operador (2026-10-02):** *"este tema del IO lanzado por tenant raíz es algo que no está del
+  todo bien. Para verlo."*
+- **Ya resuelto:** `io.slack` ya no tiene instancia de base (A-40).
+- **Falta decidir:** cuáles de los otros quedan como base y cuáles pasan a lanzarse por tenant.
 
 ### A-19 ✅ RESUELTO (0.1.43) — La policy publicada esperaba hasta 60 s al watcher de Syncthing
 
