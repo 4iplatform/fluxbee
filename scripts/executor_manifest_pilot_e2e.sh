@@ -106,7 +106,7 @@ plan_read_only() {
           "action": "get_runtime",
           "args": {
             "hive": "$HIVE_ID",
-            "runtime": "ai.chat"
+            "runtime": "ai.generic"
           }
         },
         {
@@ -208,7 +208,7 @@ plan_invalid() {
           "action": "get_runtime",
           "args": {
             "target": "$HIVE_ID",
-            "runtime_name": "ai.chat"
+            "runtime_name": "ai.generic"
           }
         }
       ]
