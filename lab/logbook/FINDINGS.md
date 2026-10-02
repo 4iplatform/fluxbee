@@ -317,6 +317,26 @@
   Ensucian cada `git status` después de un build local. Va a la pasada de limpieza (catálogo y
   aprobación antes de borrar).
 
+### A-29 ✅ RESUELTO (0.1.51) — sy-timer y wf-generic: SQLite esperaba el lock en una sola conexión
+
+- **Qué pasaba:** el primer CI de Go mostró un test de sy-timer inestable (20 `TIMER_SCHEDULE`
+  concurrentes con el mismo `client_ref`): fallaba 10 de 15 veces en fb-build con
+  `TIMER_STORAGE_ERROR: database is locked (SQLITE_BUSY)`. La causa era del producto:
+  `busy_timeout` (y `synchronous` en wf-generic) es un pragma **por conexión**, y se aplicaba con
+  `db.Exec` sobre el pool de `database/sql`. Solo una conexión esperaba el lock; las demás fallaban
+  al instante. En sy-timer el scheduler escribe mientras se atienden pedidos, así que un agendado o
+  un disparo podía fallar de forma intermitente en producción.
+- **Arreglo:** los pragmas van en el DSN (`ruta?_pragma=...`), que modernc.org/sqlite aplica a
+  cada conexión que abre. Tests nuevos verifican tres conexiones a la vez; la suite de sy-timer
+  pasó 15 veces seguidas con `-race`.
+
+### A-30 ✅ RESUELTO (0.1.51) — El admin no decodificaba los `%xx` de la query
+
+- **Qué pasaba (al validar 0.1.50):** un `DELETE /hives/{h}/taps` con `@` enviado como `%40` (como
+  lo manda `urlencode` de Python) respondía `NOT_FOUND`: el admin comparaba el valor sin decodificar.
+- **Arreglo:** claves y valores de la query se decodifican; `+` queda literal (aquí son más comunes
+  los `+` crudos, como `Etc/GMT+3`) y un `%` suelto se conserva.
+
 ### A-19 ✅ RESUELTO (0.1.43) — La policy publicada esperaba hasta 60 s al watcher de Syncthing
 
 - **Qué pasaba:** con 0.1.41 el apply llegaba a los 4 hives en 16 s, pero el clear tardó 63 s y el

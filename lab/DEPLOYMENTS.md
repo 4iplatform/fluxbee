@@ -21,6 +21,7 @@
 
 | Versión | Fecha (ART) | Commit | Alcance | Estado | Rollback |
 |---|---|---|---|---|---|
+| **0.1.51** | 2026-10-01 | `f7c2520` | motherbee + spokes (core) | ✅ live | snap `pre-query-decode-0-1-51` (las 4 VMs) · `apt install fluxbee=0.1.50` |
 | **0.1.50** | 2026-10-01 | `aa206ac` | motherbee + spokes (core) | ✅ live | snap `pre-config-routes-0-1-50` (las 4 VMs) · `apt install fluxbee=0.1.49` |
 | **0.1.49** | 2026-10-01 | `c921d1a` | motherbee + spokes (core) | ✅ live | snap `pre-architect-fixes-0-1-49` (las 4 VMs) · `apt install fluxbee=0.1.48` |
 | **0.1.48** | 2026-10-01 | `1486807` | motherbee + spokes (core) | ✅ live | snap `pre-architect-opa-0-1-48` (las 4 VMs) · `apt install fluxbee=0.1.47` |
@@ -59,6 +60,33 @@
 > (`dpkg-scanpackages -m`) para rollback, pero su detalle vive en la bitácora, no acá.
 
 ---
+
+## 0.1.51 — el admin decodifica la query; SQLite espera el lock en todas las conexiones
+
+- **Fecha:** 2026-10-01 (ART) · **Versión anterior:** 0.1.50 · **Commits:** `9f9982a` (admin) y
+  `f7c2520` (sy-timer, wf-generic) (FINDINGS A-30, A-29). La primera build de 0.1.51 (solo con el
+  admin) se rehízo antes de publicarla para sumar el arreglo de SQLite.
+- **Alcance:** motherbee + los tres spokes (core-update); wf-generic llega como runtime
+  `wf.engine/0.1.51`.
+- **Qué cambió:**
+  - El admin decodifica `%xx` en la query (`+` queda literal).
+  - sy-timer y wf-generic aplican sus pragmas de SQLite en cada conexión (en el DSN), no solo en la
+    primera del pool.
+- **Build:** 6 min. **Publish:** 51 paquetes. Snapshots `pre-query-decode-0-1-51` en las 4 VMs (se
+  borró antes `pre-architect-opa-0-1-48`).
+- **Install:** motherbee 00:48 UTC del 02/10; spokes a continuación.
+- **Verificación en vivo:**
+  - Los 4 hives con los mismos binarios; 0 `failed`.
+  - Tap creado y borrado con `match_src=IO.pct-a%40motherbee...` → `ok`, el tap ya no está (en
+    0.1.50 respondía `NOT_FOUND`).
+  - sy-timer activo en motherbee y worker1; `TIMER_LIST` por el admin responde; 0 errores,
+    `locked` o `busy` en sus logs.
+  - WF de prueba en worker1: creado, el nodo arranca desde `wf.engine/0.1.51` en ~10 s, abre su
+    base y recupera 0 instancias sin errores; borrado y el nodo desaparece.
+  - 0 rechazos del gate y 0 descartes por `routing.src`.
+  - CI: `go-tests` (con la suite de sy-timer), `rust-tests`, `admin-catalog-guard` y
+    `router-dispatcher-guards` en verde en los commits de esta versión.
+- **Rollback:** snapshot `pre-query-decode-0-1-51` o `apt install fluxbee=0.1.50`.
 
 ## 0.1.50 — config-routes cerrado (VPN por hive) y lo que quedaba de OPA
 
