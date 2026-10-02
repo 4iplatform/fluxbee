@@ -17191,6 +17191,53 @@ mod tests {
         assert_eq!(entry["available"], serde_json::json!(["1.0.0"]));
     }
 
+    // The guard behind remove_runtime_version's 409 RUNTIME_HAS_DEPENDENTS.
+    #[test]
+    fn runtime_dependents_summary_local_lists_packages_built_on_the_runtime() {
+        let manifest = RuntimeManifest {
+            schema_version: 1,
+            version: 1710000000000,
+            updated_at: Some("2026-03-16T00:00:00Z".to_string()),
+            runtimes: serde_json::json!({
+                "ai.base": {
+                    "available": ["1.0.0"],
+                    "current": "1.0.0",
+                    "type": "full_runtime"
+                },
+                "ai.child.config": {
+                    "available": ["2.0.0"],
+                    "current": "2.0.0",
+                    "type": "config_only",
+                    "runtime_base": "ai.base"
+                },
+                "wf.child.flow": {
+                    "available": ["3.0.0"],
+                    "current": "3.0.0",
+                    "type": "workflow",
+                    "runtime_base": "AI.Base"
+                },
+                "io.other": {
+                    "available": ["1.0.0"],
+                    "current": "1.0.0",
+                    "type": "full_runtime"
+                }
+            }),
+            hash: None,
+        };
+
+        let dependents =
+            runtime_dependents_summary_local(&manifest, "ai.base").expect("dependents");
+        let names: Vec<&str> = dependents
+            .iter()
+            .filter_map(|dependent| dependent["runtime"].as_str())
+            .collect();
+        assert_eq!(names, vec!["ai.child.config", "wf.child.flow"]);
+        assert_eq!(dependents[1]["type"], serde_json::json!("workflow"));
+        assert!(runtime_dependents_summary_local(&manifest, "io.other")
+            .expect("dependents")
+            .is_empty());
+    }
+
     #[test]
     fn materialize_inline_runtime_package_rejects_parent_dir_component() {
         let staging_root = test_temp_dir("sy-admin-inline-bad-path");

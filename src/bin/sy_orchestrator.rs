@@ -45,9 +45,9 @@ use json_router::{
     },
     shm::{
         now_epoch_ms, ConfigRegionReader, ConfigSnapshot, LsaRegionReader, LsaSnapshot, NodeEntry,
-        RemoteHiveEntry, RemoteNodeEntry, RouterRegionReader, ShmSnapshot, StaticRouteEntry,
-        TapEntry, VpnAssignment, ACTION_DROP, ACTION_FORWARD, FLAG_ACTIVE, FLAG_DELETED,
-        FLAG_STALE, HEARTBEAT_STALE_MS, HIVE_FLAG_SELF, MATCH_EXACT, MATCH_GLOB, MATCH_PREFIX,
+        RemoteHiveEntry, RouterRegionReader, ShmSnapshot, StaticRouteEntry, TapEntry,
+        VpnAssignment, ACTION_DROP, ACTION_FORWARD, FLAG_ACTIVE, FLAG_DELETED, FLAG_STALE,
+        HEARTBEAT_STALE_MS, HIVE_FLAG_SELF, MATCH_EXACT, MATCH_GLOB, MATCH_PREFIX,
     },
 };
 
@@ -9055,49 +9055,6 @@ async fn global_visible_runtime_usage_summary(
     })
 }
 
-fn runtime_dependents_summary(
-    manifest: &RuntimeManifest,
-    runtime: &str,
-) -> Result<Vec<serde_json::Value>, OrchestratorError> {
-    let runtimes = runtime_manifest_entry_map(manifest)?;
-    let mut dependents = Vec::new();
-    for (dependent_runtime, entry) in runtimes {
-        if !matches!(runtime_package_type(&entry), "config_only" | "workflow") {
-            continue;
-        }
-        let Some(runtime_base) = entry
-            .runtime_base
-            .as_deref()
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-        else {
-            continue;
-        };
-        if runtime_base != runtime {
-            continue;
-        }
-        dependents.push(serde_json::json!({
-            "runtime": dependent_runtime,
-            "type": runtime_package_type(&entry),
-            "runtime_base": runtime_base,
-            "current": entry.current,
-            "available": runtime_versions_from_manifest_entry(&entry),
-        }));
-    }
-    dependents.sort_by(|a, b| {
-        let a_runtime = a
-            .get("runtime")
-            .and_then(|value| value.as_str())
-            .unwrap_or("");
-        let b_runtime = b
-            .get("runtime")
-            .and_then(|value| value.as_str())
-            .unwrap_or("");
-        a_runtime.cmp(b_runtime)
-    });
-    Ok(dependents)
-}
-
 async fn get_versions_flow(
     state: &OrchestratorState,
     payload: &serde_json::Value,
@@ -10108,25 +10065,6 @@ fn node_l2_and_hive(name: &str, default_hive: &str) -> (String, String) {
     (l2, default_hive.to_string())
 }
 
-fn node_entry_to_json(entry: &NodeEntry, local_hive: &str) -> Option<serde_json::Value> {
-    if entry.name_len == 0 {
-        return None;
-    }
-    let name = node_name(entry);
-    let (node_name_l2, hive) = node_l2_and_hive(&name, local_hive);
-    let uuid = Uuid::from_slice(&entry.uuid).ok()?;
-    Some(serde_json::json!({
-        "uuid": uuid.to_string(),
-        "name": name,
-        "node_name": node_name_l2,
-        "hive": hive,
-        "kind": node_kind_from_name(&name),
-        "vpn_id": entry.vpn_id,
-        "connected_at": entry.connected_at,
-        "status": "active",
-    }))
-}
-
 /// Decodes a fixed-capacity SHM name buffer to a String, clamping the recorded
 /// length to the buffer size. name_len is a u16, so a torn/corrupt/buggy SHM
 /// writer can report a length past the buffer; without the clamp the slice
@@ -10139,60 +10077,6 @@ fn shm_name_to_string(name: &[u8], name_len: u16) -> String {
 
 fn node_name(entry: &NodeEntry) -> String {
     shm_name_to_string(&entry.name, entry.name_len)
-}
-
-fn remote_nodes_for_hive(snapshot: &LsaSnapshot, target_hive: &str) -> Vec<serde_json::Value> {
-    let now = now_epoch_ms();
-    let mut out = Vec::new();
-    for node in &snapshot.nodes {
-        let hive_idx = node.hive_index as usize;
-        let Some(hive_entry) = snapshot.hives.get(hive_idx) else {
-            continue;
-        };
-        let Some(hive_id) = remote_hive_name(hive_entry) else {
-            continue;
-        };
-        if hive_id != target_hive {
-            continue;
-        }
-        if remote_hive_is_stale(hive_entry, now) {
-            continue;
-        }
-        if node.flags & (FLAG_DELETED | FLAG_STALE) != 0 {
-            continue;
-        }
-        let Some(node_json) =
-            remote_node_to_json(node, hive_entry.last_updated, node.flags, target_hive)
-        else {
-            continue;
-        };
-        out.push(node_json);
-    }
-    out
-}
-
-fn remote_node_to_json(
-    entry: &RemoteNodeEntry,
-    connected_at: u64,
-    flags: u16,
-    remote_hive: &str,
-) -> Option<serde_json::Value> {
-    if entry.name_len == 0 {
-        return None;
-    }
-    let name = shm_name_to_string(&entry.name, entry.name_len);
-    let (node_name_l2, hive) = node_l2_and_hive(&name, remote_hive);
-    let uuid = Uuid::from_slice(&entry.uuid).ok()?;
-    Some(serde_json::json!({
-        "uuid": uuid.to_string(),
-        "name": name,
-        "node_name": node_name_l2,
-        "hive": hive,
-        "kind": node_kind_from_name(&name),
-        "vpn_id": entry.vpn_id,
-        "connected_at": connected_at,
-        "status": remote_flags_status(flags),
-    }))
 }
 
 fn list_hives(state: &OrchestratorState) -> Result<Vec<serde_json::Value>, OrchestratorError> {
@@ -10995,19 +10879,6 @@ fn verify_runtime_current_artifacts_with_root(
     verify_runtime_artifacts_for_scope(manifest, runtimes_root, None, None)
 }
 
-fn apply_runtime_retention_with_roots(
-    manifest: &RuntimeManifest,
-    runtimes_root: &Path,
-    nodes_root: &Path,
-) -> Result<RuntimeRetentionStats, OrchestratorError> {
-    apply_runtime_retention_with_roots_and_protection(
-        manifest,
-        runtimes_root,
-        nodes_root,
-        &HashMap::new(),
-    )
-}
-
 fn apply_runtime_retention_with_roots_and_protection(
     manifest: &RuntimeManifest,
     runtimes_root: &Path,
@@ -11094,12 +10965,6 @@ fn apply_runtime_retention_with_roots_and_protection(
     Ok(stats)
 }
 
-fn apply_runtime_retention(
-    manifest: &RuntimeManifest,
-) -> Result<RuntimeRetentionStats, OrchestratorError> {
-    apply_runtime_retention_with_roots(manifest, &runtimes_root(), &node_files_root())
-}
-
 fn runtimes_root() -> PathBuf {
     PathBuf::from(DIST_RUNTIME_ROOT_DIR)
 }
@@ -11178,20 +11043,6 @@ fn local_runtime_manifest_ready_for_spawn() -> bool {
     load_runtime_manifest()
         .as_ref()
         .is_some_and(runtime_manifest_has_current_versions)
-}
-
-async fn wait_for_local_runtime_manifest_ready(timeout: Duration) -> bool {
-    if local_runtime_manifest_ready_for_spawn() {
-        return true;
-    }
-    let start = Instant::now();
-    while start.elapsed() < timeout {
-        time::sleep(Duration::from_millis(1000)).await;
-        if local_runtime_manifest_ready_for_spawn() {
-            return true;
-        }
-    }
-    false
 }
 
 async fn should_verify_runtimes(state: &OrchestratorState) -> bool {
@@ -11480,33 +11331,6 @@ fn normalize_node_name_for_target(
     Ok(format!("{raw}@{target_hive}"))
 }
 
-fn validate_existing_node_name_literal(raw_node_name: &str) -> Result<String, OrchestratorError> {
-    let raw = raw_node_name.trim();
-    if raw.is_empty() {
-        return Err("missing node_name".into());
-    }
-
-    if let Some((local, hive)) = raw.rsplit_once('@') {
-        let local = local.trim();
-        let hive = hive.trim();
-        if local.is_empty() || hive.is_empty() {
-            return Err("invalid node_name".into());
-        }
-        if !valid_node_local_name(local) {
-            return Err("invalid node_name".into());
-        }
-        if !valid_hive_id(hive) {
-            return Err("invalid node_name hive".into());
-        }
-        return Ok(format!("{local}@{hive}"));
-    }
-
-    if !valid_node_local_name(raw) {
-        return Err("invalid node_name".into());
-    }
-    Ok(raw.to_string())
-}
-
 fn node_runtime_from_name(node_name: &str) -> Option<String> {
     let local = node_name.split('@').next().unwrap_or(node_name);
     let mut parts = local.split('.');
@@ -11712,17 +11536,6 @@ fn load_runtime_config_template_with_root(
         )
     })?;
     Ok(Some(object.clone()))
-}
-
-fn load_runtime_config_template(
-    runtime: &str,
-    runtime_version: &str,
-) -> Result<Option<serde_json::Map<String, serde_json::Value>>, OrchestratorError> {
-    load_runtime_config_template_with_root(
-        runtime,
-        runtime_version,
-        Path::new(DIST_RUNTIME_ROOT_DIR),
-    )
 }
 
 fn node_state_path(
@@ -25197,13 +25010,6 @@ mod tests {
         assert!(resolve_add_hive_egress_section(&serde_json::json!({})).is_err());
     }
 
-    fn write_name(buf: &mut [u8], value: &str) -> u16 {
-        let bytes = value.as_bytes();
-        let len = bytes.len().min(buf.len());
-        buf[..len].copy_from_slice(&bytes[..len]);
-        len as u16
-    }
-
     fn sample_syncthing_config_with_peer() -> String {
         format!(
             "<configuration version=\"37\">
@@ -25517,27 +25323,11 @@ blob:
     }
 
     #[test]
-    fn remote_node_projection_reports_status_from_flags() {
-        let mut node = RemoteNodeEntry {
-            uuid: *Uuid::new_v4().as_bytes(),
-            name: [0u8; 256],
-            name_len: 0,
-            vpn_id: 20,
-            hive_index: 0,
-            flags: 0,
-            _reserved: [0u8; 6],
-        };
-        node.name_len = write_name(&mut node.name, "WF.echo@worker-220");
-
-        let active = remote_node_to_json(&node, 1000, 0, "worker-220").expect("active node");
-        assert_eq!(active["status"], "active");
-
-        let stale = remote_node_to_json(&node, 1000, FLAG_STALE, "worker-220").expect("stale node");
-        assert_eq!(stale["status"], "stale");
-
-        let deleted =
-            remote_node_to_json(&node, 1000, FLAG_DELETED, "worker-220").expect("deleted node");
-        assert_eq!(deleted["status"], "deleted");
+    fn remote_flags_status_reports_deleted_over_stale_over_active() {
+        assert_eq!(remote_flags_status(0), "active");
+        assert_eq!(remote_flags_status(FLAG_STALE), "stale");
+        assert_eq!(remote_flags_status(FLAG_DELETED), "deleted");
+        assert_eq!(remote_flags_status(FLAG_DELETED | FLAG_STALE), "deleted");
     }
 
     #[test]
@@ -26348,8 +26138,13 @@ blob:
             hash: None,
         };
 
-        let stats = apply_runtime_retention_with_roots(&manifest, &runtimes_root, &nodes_root)
-            .expect("retention should succeed");
+        let stats = apply_runtime_retention_with_roots_and_protection(
+            &manifest,
+            &runtimes_root,
+            &nodes_root,
+            &HashMap::new(),
+        )
+        .expect("retention should succeed");
 
         assert!(
             kept_runtime_dir.exists(),
@@ -26412,43 +26207,6 @@ blob:
         assert_eq!(stats.removed_version_dirs, 1);
 
         let _ = fs::remove_dir_all(&root);
-    }
-
-    #[test]
-    fn runtime_dependents_summary_detects_published_dependents() {
-        let manifest = RuntimeManifest {
-            schema_version: 1,
-            version: 1710000000000,
-            updated_at: Some("2026-03-16T00:00:00Z".to_string()),
-            runtimes: serde_json::json!({
-                "ai.base": {
-                    "available": ["1.0.0"],
-                    "current": "1.0.0",
-                    "type": "full_runtime"
-                },
-                "ai.child.config": {
-                    "available": ["2.0.0"],
-                    "current": "2.0.0",
-                    "type": "config_only",
-                    "runtime_base": "ai.base"
-                },
-                "wf.child.flow": {
-                    "available": ["3.0.0"],
-                    "current": "3.0.0",
-                    "type": "workflow",
-                    "runtime_base": "ai.base"
-                }
-            }),
-            hash: None,
-        };
-
-        let dependents = runtime_dependents_summary(&manifest, "ai.base").expect("dependents");
-        assert_eq!(dependents.len(), 2);
-        assert_eq!(
-            dependents[0]["runtime"],
-            serde_json::json!("ai.child.config")
-        );
-        assert_eq!(dependents[1]["runtime"], serde_json::json!("wf.child.flow"));
     }
 
     #[test]
