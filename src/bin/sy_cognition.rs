@@ -63,8 +63,8 @@ const COGNITION_CONFIG_SCHEMA_VERSION: u32 = 1;
 const STORAGE_DB_NAME: &str = "fluxbee_storage";
 const COGNITION_TURNS_SID: u32 = 27;
 const DURABLE_QUEUE_TURNS: &str = "durable.sy-cognition.turns";
-const COGNITION_DEFAULT_CONTEXT_OPEN_THRESHOLD: f64 = 0.5;
-const COGNITION_DEFAULT_REASON_OPEN_THRESHOLD: f64 = 0.5;
+const COGNITION_DEFAULT_CONTEXT_CLOSE_THRESHOLD: f64 = 0.25;
+const COGNITION_DEFAULT_REASON_CLOSE_THRESHOLD: f64 = 0.25;
 const COGNITION_DEFAULT_SEMANTIC_TAGGER_TIMEOUT_MS: u64 = 8_000;
 const COGNITION_CONTEXT_DECAY_FACTOR: f64 = 0.85;
 const COGNITION_REASON_DECAY_FACTOR: f64 = 0.75;
@@ -152,17 +152,22 @@ impl CognitionAiSecretSource {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// `config.thresholds`. An open context or reason that a turn does not reinforce decays, and
+/// closes once its weight is under its close threshold; a co-occurrence closes under the
+/// average of the two. Nothing gates opening: every candidate the tagger names opens (score
+/// 1.0). The keys were `context_open`/`reason_open` until 2026-10-02, and their value, halved,
+/// was the close threshold: the 0.25 defaults keep what their 0.5 defaults did.
+#[derive(Debug, Clone)]
 struct CognitionThresholds {
-    context_open: f64,
-    reason_open: f64,
+    context_close: f64,
+    reason_close: f64,
 }
 
 impl Default for CognitionThresholds {
     fn default() -> Self {
         Self {
-            context_open: COGNITION_DEFAULT_CONTEXT_OPEN_THRESHOLD,
-            reason_open: COGNITION_DEFAULT_REASON_OPEN_THRESHOLD,
+            context_close: COGNITION_DEFAULT_CONTEXT_CLOSE_THRESHOLD,
+            reason_close: COGNITION_DEFAULT_REASON_CLOSE_THRESHOLD,
         }
     }
 }
@@ -444,6 +449,7 @@ struct MemoryHotSetBuild {
 struct MemoryHotThreadCandidate {
     entry: MemoryShmThreadEntry,
     serialized_bytes: usize,
+    updated_by_this_turn: bool,
     has_active_scope: bool,
     live_entities_total: usize,
     last_seen_epoch_ms: i64,
@@ -863,7 +869,7 @@ async fn handle_turn_payload(
         }
     }
 
-    if let Err(err) = sync_memory_shm(&app_state).await {
+    if let Err(err) = sync_memory_shm(&app_state, Some(thread_id.as_str())).await {
         tracing::warn!(
             error = %err,
             trace_id = %msg.routing.trace_id,
@@ -972,10 +978,14 @@ async fn handle_turn_payload(
     Ok(())
 }
 
-async fn sync_memory_shm(app_state: &CognitionAppState) -> Result<(), json_router::shm::ShmError> {
+/// `turn_thread_id`: the thread the current turn updated, which the hot set always keeps.
+async fn sync_memory_shm(
+    app_state: &CognitionAppState,
+    turn_thread_id: Option<&str>,
+) -> Result<(), json_router::shm::ShmError> {
     let hot_set = {
         let mut threads = app_state.thread_states.lock().await;
-        retain_memory_hot_set(&mut threads)?
+        retain_memory_hot_set(&mut threads, turn_thread_id)?
     };
 
     let sync_status = if hot_set.stats.pruned_threads_total > 0 {
@@ -1002,8 +1012,15 @@ async fn sync_memory_shm(app_state: &CognitionAppState) -> Result<(), json_route
     Ok(())
 }
 
+/// Ranks the threads and keeps, in rank order, each one whose entry still fits the region.
+/// The thread the current turn updated goes first, so it is never the one dropped. Then
+/// recency (`last_seen_at`), an active scope, live entities, `latest_thread_seq`,
+/// `turn_count` and the thread id. Ranked by live entities ahead of recency, a new thread in
+/// a full region was dropped right after its own turn and started over, with a new scope
+/// written to storage, on every turn.
 fn build_memory_hot_set_snapshot(
     threads: &HashMap<String, ThreadCognitionState>,
+    turn_thread_id: Option<&str>,
 ) -> Result<MemoryHotSetBuild, json_router::shm::ShmError> {
     let updated_at = json_router::shm::now_epoch_ms();
     let base_snapshot = MemoryShmSnapshot {
@@ -1022,6 +1039,7 @@ fn build_memory_hot_set_snapshot(
         candidates.push(MemoryHotThreadCandidate {
             entry,
             serialized_bytes,
+            updated_by_this_turn: turn_thread_id == Some(thread_id.as_str()),
             has_active_scope: thread_state.active_scope.is_some(),
             live_entities_total: thread_live_entities_total(thread_state),
             last_seen_epoch_ms: thread_last_seen_epoch_ms(thread_state),
@@ -1032,10 +1050,11 @@ fn build_memory_hot_set_snapshot(
 
     candidates.sort_by(|left, right| {
         right
-            .has_active_scope
-            .cmp(&left.has_active_scope)
-            .then_with(|| right.live_entities_total.cmp(&left.live_entities_total))
+            .updated_by_this_turn
+            .cmp(&left.updated_by_this_turn)
             .then_with(|| right.last_seen_epoch_ms.cmp(&left.last_seen_epoch_ms))
+            .then_with(|| right.has_active_scope.cmp(&left.has_active_scope))
+            .then_with(|| right.live_entities_total.cmp(&left.live_entities_total))
             .then_with(|| right.latest_thread_seq.cmp(&left.latest_thread_seq))
             .then_with(|| right.turn_count.cmp(&left.turn_count))
             .then_with(|| left.entry.thread_id.cmp(&right.entry.thread_id))
@@ -1072,13 +1091,15 @@ fn build_memory_hot_set_snapshot(
 }
 
 /// The one retention rule for local cognition state: build the jsr-memory hot set and drop
-/// every thread that did not make it. Applied after every live turn (`sync_memory_shm`) and
-/// to the cold-start snapshot, so memory stays bounded by the SHM capacity. A dropped thread
-/// starts over if it comes back, as it would after a restart.
+/// every thread that did not make it. Applied after every live turn (`sync_memory_shm`, with
+/// the turn's thread, which always stays) and to the cold-start snapshot, so memory stays
+/// bounded by the SHM capacity. A dropped thread starts over if it comes back, as it would
+/// after a restart.
 fn retain_memory_hot_set(
     threads: &mut HashMap<String, ThreadCognitionState>,
+    turn_thread_id: Option<&str>,
 ) -> Result<MemoryHotSetBuild, json_router::shm::ShmError> {
-    let hot_set = build_memory_hot_set_snapshot(threads)?;
+    let hot_set = build_memory_hot_set_snapshot(threads, turn_thread_id)?;
     threads.retain(|thread_id, _| hot_set.selected_thread_ids.contains(thread_id));
     Ok(hot_set)
 }
@@ -1086,7 +1107,7 @@ fn retain_memory_hot_set(
 fn apply_memory_hot_set_to_rebuild_snapshot(
     snapshot: &mut RebuildSnapshot,
 ) -> Result<MemoryHotSetStats, json_router::shm::ShmError> {
-    let hot_set = retain_memory_hot_set(&mut snapshot.threads)?;
+    let hot_set = retain_memory_hot_set(&mut snapshot.threads, None)?;
     recount_rebuild_snapshot_totals(snapshot);
     Ok(hot_set.stats)
 }
@@ -1250,7 +1271,7 @@ async fn rebuild_from_durable(
         state.last_rebuild_source = Some(trigger.to_string());
         return false;
     }
-    if let Err(err) = sync_memory_shm(app_state).await {
+    if let Err(err) = sync_memory_shm(app_state, None).await {
         tracing::warn!(
             node_name = %app_state.node_name,
             error = %err,
@@ -2498,6 +2519,10 @@ fn build_cognition_config_get_payload(
             "config.storage.db_configured reports whether storage's postgres resolved from the vault at the last lookup (null: not looked up yet); derived entities are published to storage.cognition.* either way."
                 .to_string(),
         ),
+        Value::String(
+            "config.thresholds.context_close / reason_close (0 to 1, default 0.25) are the weights under which an open context / reason closes once turns stop reinforcing it; a co-occurrence closes under their average. Nothing gates opening: every tag the tagger returns opens a context, every canonical signal a reason. They replace context_open / reason_open, which only ever set this, at half their value."
+                .to_string(),
+        ),
     ];
     if let Some(note) = note.filter(|value| !value.trim().is_empty()) {
         notes.push(Value::String(note.to_string()));
@@ -2541,8 +2566,8 @@ fn build_cognition_config_get_payload(
             "turn_behavior_on_narrative_summarizer_failure": "skip_narrative_update_fail_open"
         },
         "thresholds": {
-            "context_open": control_state.thresholds.context_open,
-            "reason_open": control_state.thresholds.reason_open
+            "context_close": control_state.thresholds.context_close,
+            "reason_close": control_state.thresholds.reason_close
         },
         "paths": {
             "state_dir": runtime_paths.state_dir,
@@ -2600,8 +2625,8 @@ fn build_cognition_config_get_payload(
             "config.semantic_tagger.timeout_ms",
             "config.semantic_tagger.max_tags",
             "config.semantic_tagger.max_reason_signals",
-            "config.thresholds.context_open",
-            "config.thresholds.reason_open"
+            "config.thresholds.context_close",
+            "config.thresholds.reason_close"
         ],
         "resources": resources,
         "notes": notes
@@ -2731,8 +2756,8 @@ fn apply_cognition_config_set(
                 "implementation_status": "provider_neutral_sdk"
             },
             "thresholds": {
-                "context_open": control_state.thresholds.context_open,
-                "reason_open": control_state.thresholds.reason_open
+                "context_close": control_state.thresholds.context_close,
+                "reason_close": control_state.thresholds.reason_close
             }
         },
         "message": "SY.cognition non-secret config persisted (Model D': openai + postgres credentials live in vault under resource_type=<openai|postgres>)."
@@ -2810,16 +2835,22 @@ fn bootstrap_cognition_control_state(
         .as_ref()
         .map(|value| value.config_version)
         .unwrap_or(0);
-    let thresholds = persisted
+    // Read like a CONFIG_SET, so persisted thresholds the parser refuses (keys from before
+    // a rename) are reported instead of silently replaced by the defaults.
+    let thresholds = match persisted
         .as_ref()
-        .and_then(|value| {
-            value
-                .config
-                .get("thresholds")
-                .cloned()
-                .and_then(|value| serde_json::from_value::<CognitionThresholds>(value).ok())
-        })
-        .unwrap_or_default();
+        .and_then(|value| value.config.get("thresholds"))
+    {
+        Some(value) => parse_cognition_thresholds(value).unwrap_or_else(|err| {
+            tracing::warn!(
+                node_name = %node_name,
+                error = %err,
+                "sy.cognition persisted thresholds refused; the defaults apply"
+            );
+            CognitionThresholds::default()
+        }),
+        None => CognitionThresholds::default(),
+    };
     let semantic_tagger = persisted
         .as_ref()
         .and_then(|value| {
@@ -2867,8 +2898,8 @@ fn persist_cognition_config_state(
                 "max_reason_signals": state.semantic_tagger.max_reason_signals
             },
             "thresholds": {
-                "context_open": state.thresholds.context_open,
-                "reason_open": state.thresholds.reason_open
+                "context_close": state.thresholds.context_close,
+                "reason_close": state.thresholds.reason_close
             }
         }),
         updated_at: chrono::Utc::now().to_rfc3339(),
@@ -2928,29 +2959,65 @@ fn reject_cognition_secret_fields(body: &Value) -> Result<(), CognitionError> {
 fn extract_cognition_thresholds(
     body: &Value,
 ) -> Result<Option<CognitionThresholds>, CognitionError> {
-    let Some(thresholds) = body.get("config").and_then(|value| value.get("thresholds")) else {
-        return Ok(None);
+    body.get("config")
+        .and_then(|value| value.get("thresholds"))
+        .map(parse_cognition_thresholds)
+        .transpose()
+}
+
+/// `config.thresholds`, from a CONFIG_SET or the persisted config: `context_close` and
+/// `reason_close`, a key left out takes its default. Any other key is refused, the retired
+/// `context_open`/`reason_open` by name: they never gated opening, they only set the close
+/// threshold, at half their value.
+fn parse_cognition_thresholds(thresholds: &Value) -> Result<CognitionThresholds, CognitionError> {
+    let Some(fields) = thresholds.as_object() else {
+        return Err("config.thresholds must be an object (context_close, reason_close)".into());
     };
-    let context_open = thresholds
-        .get("context_open")
-        .and_then(Value::as_f64)
-        .unwrap_or(COGNITION_DEFAULT_CONTEXT_OPEN_THRESHOLD);
-    let reason_open = thresholds
-        .get("reason_open")
-        .and_then(Value::as_f64)
-        .unwrap_or(COGNITION_DEFAULT_REASON_OPEN_THRESHOLD);
-    if !context_open.is_finite() || !(0.0..=1.0).contains(&context_open) {
-        return Err(
-            "config.thresholds.context_open must be a finite number between 0 and 1".into(),
-        );
+    if let Some(key) = fields
+        .keys()
+        .find(|key| !matches!(key.as_str(), "context_close" | "reason_close"))
+    {
+        let message = match key.as_str() {
+            "context_open" | "reason_open" => {
+                let entity = key.trim_end_matches("_open");
+                format!(
+                    "config.thresholds.{key} is no longer accepted: it never gated opening, and half its value was the weight under which an open {entity} closes. Set that weight as config.thresholds.{entity}_close"
+                )
+            }
+            _ => format!(
+                "config.thresholds.{key} is not a cognition threshold; the keys are context_close and reason_close"
+            ),
+        };
+        return Err(message.into());
     }
-    if !reason_open.is_finite() || !(0.0..=1.0).contains(&reason_open) {
-        return Err("config.thresholds.reason_open must be a finite number between 0 and 1".into());
-    }
-    Ok(Some(CognitionThresholds {
-        context_open,
-        reason_open,
-    }))
+    Ok(CognitionThresholds {
+        context_close: close_threshold(
+            fields,
+            "context_close",
+            COGNITION_DEFAULT_CONTEXT_CLOSE_THRESHOLD,
+        )?,
+        reason_close: close_threshold(
+            fields,
+            "reason_close",
+            COGNITION_DEFAULT_REASON_CLOSE_THRESHOLD,
+        )?,
+    })
+}
+
+fn close_threshold(
+    fields: &serde_json::Map<String, Value>,
+    key: &str,
+    default: f64,
+) -> Result<f64, CognitionError> {
+    let Some(value) = fields.get(key) else {
+        return Ok(default);
+    };
+    value
+        .as_f64()
+        .filter(|value| value.is_finite() && (0.0..=1.0).contains(value))
+        .ok_or_else(|| {
+            format!("config.thresholds.{key} must be a finite number between 0 and 1").into()
+        })
 }
 
 fn extract_cognition_semantic_tagger_config(
@@ -3046,7 +3113,7 @@ async fn update_thread_state_and_build_envelopes<S: NarrativeSummarizer>(
         ts,
         src_ilk,
         dst_ilk,
-        thresholds.context_open,
+        thresholds.context_close,
         &context_candidates,
         &mut thread_state.contexts,
     ));
@@ -3057,16 +3124,17 @@ async fn update_thread_state_and_build_envelopes<S: NarrativeSummarizer>(
         ts,
         src_ilk,
         dst_ilk,
-        thresholds.reason_open,
+        thresholds.reason_close,
         &reason_candidates,
         &mut thread_state.reasons,
     ));
+    // A co-occurrence pairs a context with a reason, so it closes under the average of the two.
     out.extend(update_cooccurrences_for_thread(
         hive_id,
         writer,
         thread_id,
         ts,
-        (thresholds.context_open + thresholds.reason_open) * 0.5,
+        (thresholds.context_close + thresholds.reason_close) * 0.5,
         &context_candidates,
         &reason_candidates,
         &thread_state.contexts,
@@ -3224,7 +3292,7 @@ fn update_contexts_for_thread(
     ts: &str,
     src_ilk: Option<&str>,
     dst_ilk: Option<&str>,
-    open_threshold: f64,
+    close_threshold: f64,
     candidates: &[ContextCandidate],
     contexts: &mut HashMap<String, ContextState>,
 ) -> Vec<(&'static str, Vec<u8>)> {
@@ -3311,7 +3379,7 @@ fn update_contexts_for_thread(
         }
         context.weight *= COGNITION_CONTEXT_DECAY_FACTOR;
         context.last_seen_at = ts.to_string();
-        if context.weight < (open_threshold * 0.5) {
+        if context.weight < close_threshold {
             context.status = "closed".to_string();
             context.closed_at = Some(ts.to_string());
             let data = CognitionContextData {
@@ -3354,7 +3422,7 @@ fn update_reasons_for_thread(
     ts: &str,
     src_ilk: Option<&str>,
     dst_ilk: Option<&str>,
-    open_threshold: f64,
+    close_threshold: f64,
     candidates: &[ReasonCandidate],
     reasons: &mut HashMap<String, ReasonState>,
 ) -> Vec<(&'static str, Vec<u8>)> {
@@ -3444,7 +3512,7 @@ fn update_reasons_for_thread(
         }
         reason.weight *= COGNITION_REASON_DECAY_FACTOR;
         reason.last_seen_at = ts.to_string();
-        if reason.weight < (open_threshold * 0.5) {
+        if reason.weight < close_threshold {
             reason.status = "closed".to_string();
             reason.closed_at = Some(ts.to_string());
             let data = CognitionReasonData {
@@ -3486,7 +3554,7 @@ fn update_cooccurrences_for_thread(
     writer: &str,
     thread_id: &str,
     ts: &str,
-    open_threshold: f64,
+    close_threshold: f64,
     context_candidates: &[ContextCandidate],
     reason_candidates: &[ReasonCandidate],
     contexts: &HashMap<String, ContextState>,
@@ -3593,7 +3661,7 @@ fn update_cooccurrences_for_thread(
         }
         cooccurrence.weight *= COGNITION_COOCCURRENCE_DECAY_FACTOR;
         cooccurrence.last_seen_at = ts.to_string();
-        if cooccurrence.weight < (open_threshold * 0.5) {
+        if cooccurrence.weight < close_threshold {
             cooccurrence.status = "closed".to_string();
             cooccurrence.closed_at = Some(ts.to_string());
             let data = CognitionCooccurrenceData {
@@ -4505,6 +4573,25 @@ mod tests {
         canonical: &[&str],
         extra: &[&str],
     ) -> Vec<(&'static str, Vec<u8>)> {
+        live_turn_with(
+            &CognitionThresholds::default(),
+            thread,
+            seq,
+            tags,
+            canonical,
+            extra,
+        )
+        .await
+    }
+
+    async fn live_turn_with(
+        thresholds: &CognitionThresholds,
+        thread: &mut ThreadCognitionState,
+        seq: u64,
+        tags: &[&str],
+        canonical: &[&str],
+        extra: &[&str],
+    ) -> Vec<(&'static str, Vec<u8>)> {
         let tagger = SemanticTaggerOutput {
             tags: strings(tags),
             reason_signals_canonical: strings(canonical),
@@ -4520,7 +4607,7 @@ mod tests {
             Some("ilk:agent"),
             Some("ich:test"),
             &tagger,
-            &CognitionThresholds::default(),
+            thresholds,
             "test-key",
             &CognitionSemanticTaggerConfig::default(),
             &ts,
@@ -4617,6 +4704,54 @@ mod tests {
             last_seen_at: "2026-01-01T00:00:00Z".to_string(),
             closed_at: None,
             status: "open".to_string(),
+        }
+    }
+
+    /// A thread after one turn on `tags` at `seq`, with a memory summary of a fifth of the
+    /// jsr-memory region: four such threads fill it, the JSON framing leaves no room for a fifth.
+    async fn thread_of_a_fifth_of_the_region(seq: u64, tags: &[&str]) -> ThreadCognitionState {
+        let mut thread = ThreadCognitionState::default();
+        live_turn(&mut thread, seq, tags, &["inform"], &[]).await;
+        for memory in thread.memories.values_mut() {
+            memory.summary = "x".repeat(MEMORY_MAX_DATA_SIZE / 5);
+        }
+        thread
+    }
+
+    fn test_control_state() -> CognitionControlState {
+        CognitionControlState {
+            schema_version: COGNITION_CONFIG_SCHEMA_VERSION,
+            config_version: 1,
+            ai_secret_source: CognitionAiSecretSource::Missing,
+            thresholds: CognitionThresholds::default(),
+            semantic_tagger: CognitionSemanticTaggerConfig::default(),
+        }
+    }
+
+    fn test_runtime_paths() -> RuntimePaths {
+        RuntimePaths {
+            state_dir: PathBuf::from("/var/lib/fluxbee/test"),
+            shm_dir: PathBuf::from("/var/lib/fluxbee/test/shm"),
+            cache_dir: PathBuf::from("/var/lib/fluxbee/test/cache"),
+            memory_lance_path: PathBuf::from("/var/lib/fluxbee/test/memory.lance"),
+        }
+    }
+
+    fn config_set_message(config: Value) -> Message {
+        Message {
+            routing: Routing {
+                src: "SY.admin@motherbee".to_string(),
+                src_l2_name: None,
+                dst: Destination::Unicast("SY.cognition@motherbee".to_string()),
+                ttl: 1,
+                trace_id: "trace:test".to_string(),
+            },
+            meta: Meta {
+                msg_type: SYSTEM_KIND.to_string(),
+                msg: Some("CONFIG_SET".to_string()),
+                ..Meta::default()
+            },
+            payload: json!({ "node_name": "SY.cognition@motherbee", "config": config }),
         }
     }
 
@@ -4762,47 +4897,105 @@ mod tests {
             threads.insert(format!("thread:{index}"), thread);
         }
 
-        let hot_set = retain_memory_hot_set(&mut threads).expect("hot set");
+        let hot_set = retain_memory_hot_set(&mut threads, None).expect("hot set");
         assert_eq!(hot_set.stats.pruned_threads_total, 1);
         assert_eq!(threads.len() as u64, hot_set.stats.selected_threads_total);
-        // Same live entities everywhere, so recency decides: the oldest thread goes.
+        // The oldest thread goes.
         assert!(!threads.contains_key("thread:0"));
         assert!(threads
             .keys()
             .all(|thread_id| hot_set.selected_thread_ids.contains(thread_id)));
     }
 
-    /// §3.2/§7.2: a lasting change of topic and drive cuts the scope once the shift is
-    /// sustained. The scope used to adopt the new topic on the first divergent turn, which
-    /// reset the unbind streak, so it was renamed instead of cut.
+    /// With the region full, recency ranks ahead of live entities: a new thread with one
+    /// topic stays and the oldest goes, however much more state the older threads carry.
+    /// Ranked by live entities first, a new thread was dropped right after its own turn and
+    /// started over, with a new scope written to storage, on every turn.
+    #[tokio::test]
+    async fn a_full_region_keeps_the_newest_thread() {
+        let topics = ["billing", "refund", "invoice", "charge", "card", "bank"];
+        let mut threads = HashMap::new();
+        for seq in 1..=4u64 {
+            threads.insert(
+                format!("thread:old:{seq}"),
+                thread_of_a_fifth_of_the_region(seq, &topics).await,
+            );
+        }
+        let full = retain_memory_hot_set(&mut threads, None).expect("hot set");
+        assert_eq!(full.stats.pruned_threads_total, 0);
+
+        threads.insert(
+            "thread:new".to_string(),
+            thread_of_a_fifth_of_the_region(5, &["shipping"]).await,
+        );
+        assert!(
+            thread_live_entities_total(&threads["thread:new"])
+                < thread_live_entities_total(&threads["thread:old:1"])
+        );
+        // No turn thread: the ranking alone keeps it, as in the cold-start rebuild.
+        let hot_set = retain_memory_hot_set(&mut threads, None).expect("hot set");
+        assert_eq!(hot_set.stats.pruned_threads_total, 1);
+        assert!(threads.contains_key("thread:new"));
+        assert!(!threads.contains_key("thread:old:1"));
+    }
+
+    /// The thread the current turn updated is never the one dropped, even when it does not
+    /// rank as the most recent: here its turn is dated before the others (the clock stepped
+    /// back).
+    #[tokio::test]
+    async fn the_thread_of_the_turn_is_never_dropped() {
+        let mut threads = HashMap::new();
+        for seq in 2..=5u64 {
+            threads.insert(
+                format!("thread:{seq}"),
+                thread_of_a_fifth_of_the_region(seq, &["billing"]).await,
+            );
+        }
+        threads.insert(
+            "thread:turn".to_string(),
+            thread_of_a_fifth_of_the_region(1, &["shipping"]).await,
+        );
+        let hot_set = retain_memory_hot_set(&mut threads, Some("thread:turn")).expect("hot set");
+        assert_eq!(hot_set.stats.pruned_threads_total, 1);
+        assert!(threads.contains_key("thread:turn"));
+        assert!(!threads.contains_key("thread:2"));
+    }
+
+    /// §3.2/§7.2/§8.3: a lasting change of topic and drive cuts the scope once the shift is
+    /// sustained: on the fifth turn after the dominant pair changes, which for a scope two to
+    /// five turns old is the 6th divergent message (a scope one turn old cuts on the 5th, a
+    /// long-reinforced one on the 7th). The scope used to adopt the new topic on the first
+    /// divergent turn, which reset the unbind streak, so it was renamed instead of cut.
     #[tokio::test]
     async fn a_sustained_topic_change_cuts_the_scope() {
-        let mut thread = ThreadCognitionState::default();
-        for seq in 1..=3 {
-            live_turn(&mut thread, seq, &["billing"], &["inform"], &[]).await;
-        }
-        let first = thread.active_scope.clone().expect("scope opened");
-        assert_eq!(first.dominant_context_label, "billing");
-
-        let mut cut_at = None;
-        for seq in 4..=20 {
-            let out = live_turn(&mut thread, seq, &["shipping"], &["protect"], &[]).await;
-            let scope = thread.active_scope.as_ref().expect("scope");
-            if closed_scope_ids(&out).contains(&first.scope_id) {
-                assert_ne!(scope.scope_id, first.scope_id);
-                assert_eq!(scope.dominant_context_label, "shipping");
-                assert_eq!(scope.dominant_reason_label, "risk containment");
-                cut_at = Some(seq);
-                break;
+        // (turns on the first topic, the divergent message that cuts)
+        for (history, cut_on) in [(1u64, 5u64), (3, 6), (12, 7)] {
+            let mut thread = ThreadCognitionState::default();
+            for seq in 1..=history {
+                live_turn(&mut thread, seq, &["billing"], &["inform"], &[]).await;
             }
-            // Until the cut the scope keeps its identity and its anchor.
-            assert_eq!(scope.scope_id, first.scope_id);
-            assert_eq!(scope.dominant_context_label, "billing");
-            assert_eq!(scope.dominant_reason_label, "information exchange");
+            let first = thread.active_scope.clone().expect("scope opened");
+            assert_eq!(first.dominant_context_label, "billing");
+
+            let mut cut = None;
+            for divergent in 1..=20 {
+                let seq = history + divergent;
+                let out = live_turn(&mut thread, seq, &["shipping"], &["protect"], &[]).await;
+                let scope = thread.active_scope.as_ref().expect("scope");
+                if closed_scope_ids(&out).contains(&first.scope_id) {
+                    assert_ne!(scope.scope_id, first.scope_id);
+                    assert_eq!(scope.dominant_context_label, "shipping");
+                    assert_eq!(scope.dominant_reason_label, "risk containment");
+                    cut = Some(divergent);
+                    break;
+                }
+                // Until the cut the scope keeps its identity and its anchor.
+                assert_eq!(scope.scope_id, first.scope_id);
+                assert_eq!(scope.dominant_context_label, "billing");
+                assert_eq!(scope.dominant_reason_label, "information exchange");
+            }
+            assert_eq!(cut, Some(cut_on), "turns on the first topic: {history}");
         }
-        let cut_at = cut_at.expect("a sustained topic change must cut the scope");
-        // Not on the first divergent turns: the shift has to be sustained.
-        assert!(cut_at > 4 + u64::from(COGNITION_SCOPE_SUSTAIN_COUNT));
     }
 
     /// Tags told together tie on weight. The scope's own context keeps a tie, so a tag
@@ -4890,22 +5083,120 @@ mod tests {
         assert_eq!(candidate.evidence_strength, 8.0);
     }
 
+    /// A close threshold is the weight under which an open entity closes, taken as set; a
+    /// co-occurrence closes under the average of the two. Counted in turns that leave a
+    /// one-turn topic unreinforced, from weight 1.0 decaying by 0.85 (context), 0.75 (reason)
+    /// and 0.80 (co-occurrence). The defaults close where `*_open` at 0.5, halved, did.
+    #[tokio::test]
+    async fn a_close_threshold_applies_as_set() {
+        async fn misses_until_closed(thresholds: CognitionThresholds) -> [Option<u64>; 3] {
+            let mut thread = ThreadCognitionState::default();
+            live_turn_with(&thresholds, &mut thread, 1, &["billing"], &["inform"], &[]).await;
+            let mut closed = [None; 3];
+            for miss in 1..=20u64 {
+                live_turn_with(
+                    &thresholds,
+                    &mut thread,
+                    1 + miss,
+                    &["shipping"],
+                    &["protect"],
+                    &[],
+                )
+                .await;
+                let statuses = [
+                    &thread.contexts["billing"].status,
+                    &thread.reasons["information exchange"].status,
+                    &thread.cooccurrences["billing|information exchange"].status,
+                ];
+                for (slot, status) in closed.iter_mut().zip(statuses) {
+                    if slot.is_none() && status == "closed" {
+                        *slot = Some(miss);
+                    }
+                }
+            }
+            closed
+        }
+
+        // 0.85 < 0.9; 0.5625 >= 0.5 > 0.4219; 0.8 >= (0.9 + 0.5) / 2 > 0.64.
+        let set = CognitionThresholds {
+            context_close: 0.9,
+            reason_close: 0.5,
+        };
+        assert_eq!(misses_until_closed(set).await, [Some(1), Some(3), Some(2)]);
+        // 0.85^9, 0.75^5 and 0.8^7 are the first powers under 0.25.
+        assert_eq!(
+            misses_until_closed(CognitionThresholds::default()).await,
+            [Some(9), Some(5), Some(7)]
+        );
+    }
+
+    /// The thresholds are named for what they do. CONFIG_GET shows `context_close` and
+    /// `reason_close`; CONFIG_SET refuses the retired `*_open` keys by name, pointing at the
+    /// close key, and takes the close keys as set (a key left out takes its default).
+    #[test]
+    fn the_thresholds_are_named_for_what_they_do() {
+        let payload = build_cognition_config_get_payload(
+            "SY.cognition@motherbee",
+            &test_control_state(),
+            &CognitionRuntimeState::default(),
+            &test_runtime_paths(),
+            true,
+            0,
+            None,
+        );
+        assert_eq!(
+            payload["config"]["thresholds"],
+            json!({ "context_close": 0.25, "reason_close": 0.25 })
+        );
+        let optional_fields = payload["contract"]["optional_fields"].to_string();
+        assert!(optional_fields.contains("config.thresholds.context_close"));
+        assert!(optional_fields.contains("config.thresholds.reason_close"));
+        assert!(!optional_fields.contains("_open"));
+
+        for (retired, current) in [
+            ("context_open", "context_close"),
+            ("reason_open", "reason_close"),
+        ] {
+            let mut control = test_control_state();
+            let response = apply_cognition_config_set(
+                &config_set_message(json!({ "thresholds": { retired: 0.5 } })),
+                "SY.cognition@motherbee",
+                &mut control,
+                &test_runtime_paths(),
+                true,
+            )
+            .expect("CONFIG_SET answers");
+            assert_eq!(response["ok"], json!(false));
+            assert_eq!(response["error"]["code"], json!("invalid_config"));
+            let message = response["error"]["message"].as_str().expect("message");
+            assert!(
+                message.contains(&format!("config.thresholds.{retired} ")),
+                "{message}"
+            );
+            assert!(
+                message.contains(&format!("config.thresholds.{current}")),
+                "{message}"
+            );
+            assert_eq!(control.config_version, 1, "nothing applied");
+        }
+
+        let thresholds = extract_cognition_thresholds(&json!({
+            "config": { "thresholds": { "context_close": 0.4 } }
+        }))
+        .expect("valid")
+        .expect("present");
+        assert_eq!(thresholds.context_close, 0.4);
+        assert_eq!(
+            thresholds.reason_close,
+            COGNITION_DEFAULT_REASON_CLOSE_THRESHOLD
+        );
+    }
+
     /// CONFIG_GET reports whether storage's postgres resolved, not a fixed `enabled: true`.
     #[test]
     fn config_get_reports_the_storage_db_state() {
-        let control = CognitionControlState {
-            schema_version: COGNITION_CONFIG_SCHEMA_VERSION,
-            config_version: 1,
-            ai_secret_source: CognitionAiSecretSource::Missing,
-            thresholds: CognitionThresholds::default(),
-            semantic_tagger: CognitionSemanticTaggerConfig::default(),
-        };
-        let paths = RuntimePaths {
-            state_dir: PathBuf::from("/var/lib/fluxbee/test"),
-            shm_dir: PathBuf::from("/var/lib/fluxbee/test/shm"),
-            cache_dir: PathBuf::from("/var/lib/fluxbee/test/cache"),
-            memory_lance_path: PathBuf::from("/var/lib/fluxbee/test/memory.lance"),
-        };
+        let control = test_control_state();
+        let paths = test_runtime_paths();
         for (looked_up, expected) in [
             (None, Value::Null),
             (Some(false), json!(false)),

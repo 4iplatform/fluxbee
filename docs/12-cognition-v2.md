@@ -681,6 +681,12 @@ Same structural algorithm as Context Update, but using **reason-specific paramet
 
 Context update and reason update run concurrently on the same message but do not influence each other. They share no state — only the originating message.
 
+Current implementation (per thread; contexts, reasons and their co-occurrences):
+
+- Nothing gates opening: there is no evaluator score yet (§6.2, §6.3). Every tag the tagger returns opens or reinforces its context, every reason its canonical signals map to opens or reinforces that reason, each with score 1.0, and each context/reason pair of the turn does the same for its co-occurrence.
+- A reinforced entity's weight becomes `weight × decay + 1.0`. An open one the turn does not reinforce decays (`× decay`: 0.85 contexts, 0.75 reasons, 0.80 co-occurrences) and closes once its weight is under its close threshold: `config.thresholds.context_close` / `config.thresholds.reason_close` (CONFIG_SET, 0 to 1, default 0.25). A co-occurrence closes under the average of the two. With the defaults, a context told once closes on the 9th turn without it, a reason on the 5th, a co-occurrence on the 7th.
+- Until 2026-10-02 the keys were `context_open` / `reason_open`. They never gated opening: their value, halved, was the close threshold, so the 0.25 defaults keep what their 0.5 defaults did. CONFIG_SET refuses them by name.
+
 ### 8.3 Scope Binding Energy
 
 Extended with reason similarity as described in section 7.
@@ -691,6 +697,7 @@ Current implementation (anchor-based, per thread):
 - A shift is a different dominant pair. The unbind streak grows while a shift persists with the EMA under the threshold. The scope instance cuts when the streak reaches `SCOPE_ENERGY_SUSTAIN_COUNT`.
 - While a shift whose binding is under the threshold is pending, the scope keeps its anchor, so the following turns keep measuring the divergence until the cut. A candidate that still binds (at or over the threshold) is drift inside the scope and becomes the new anchor. Before 2026-10-02 the anchor was always replaced at once, which reset the streak: a lasting topic change renamed the scope and never cut it.
 - On a weight tie the anchor stays dominant (otherwise the smaller label wins), so tags reinforced together never count as a shift.
+- Cut sensitivity (`SCOPE_ENERGY_ALPHA` 0.25, threshold 0.35, `SCOPE_ENERGY_SUSTAIN_COUNT` 2; kept as is by the operator on 2026-10-02): a complete change of topic and drive cuts on the **6th divergent message** for a scope two to five turns old. The cut comes on the fifth turn after the dominant pair changes: from a scope that bound fully, the EMA goes 0.75, 0.56, 0.42, then 0.32 (under the threshold, streak 1) and 0.24 (streak 2, the cut). The pair changes once the new reason outweighs the anchor's, which takes longer the longer the anchor was reinforced: a scope one turn old cuts on the 5th divergent message, a long-reinforced one on the 7th (reasons decay by 0.75 per turn, so a new one overtakes any anchor by the 3rd). A change of topic alone takes longer, because contexts decay slower (0.85). The test `a_sustained_topic_change_cuts_the_scope` pins the 5th, 6th and 7th.
 
 ### 8.4 Period Detection
 
@@ -1214,11 +1221,13 @@ Validation note:
 - Current bounded hot-set note:
   - `jsr-memory` is now emitted as a bounded hot set sized to `MEMORY_MAX_DATA_SIZE`
   - selection priority is:
+    - the thread the current turn updated, which is therefore never the one dropped
+    - recency by `last_seen_at`
     - `active_scope`
     - count of live cognitive entities
-    - recency by `last_seen_at`
     - `latest_thread_seq`
-  - `turn_count`
+    - `turn_count`
+  - recency ranks ahead of live entities since 2026-10-02: ranked by entity count first, a new thread in a full region was dropped right after its own turn and started over, writing a new scope to storage, on every turn
   - startup rebuild from durable now rehydrates only that selected hot set into local cognition memory before resuming live processing
   - live processing applies the same rule after every turn: a thread that leaves the hot set leaves local memory too, and starts over if it comes back
   - if the snapshot exceeds SHM capacity, lower-priority threads are pruned before the write

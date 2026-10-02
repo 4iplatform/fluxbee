@@ -455,16 +455,21 @@
 - **Estado:** esperando decisiones del operador. El detalle (G1–G8, con archivos y líneas) está en la
   bitácora 2026-10-02.
 
-### A-38 🟡 Cognition: preguntas de diseño abiertas
+### A-38 ✅ RESUELTO (0.1.54) — Cognition: preguntas de diseño
 
-- `thresholds.context_open` / `reason_open` solo ajustan el cierre: abrir siempre abre, porque todo
-  candidato vale 1.0. ¿Se renombran o se esperan al evaluador de contextos con IA?
-- Con la región de 4 MB llena, un hilo nuevo puede quedar afuera justo después de su turno.
-  ¿Prioridad a lo reciente?
-- Un cambio de tema sostenido corta el scope a los 6 mensajes. ¿Se ajustan las constantes?
-- Lo no ensamblado: memoria entre hilos, LanceDB, lo de los workers al motherbee, y lectores de las
-  tablas.
+Respuesta del operador (2026-10-02): *"sí a todo"*.
 
+- **Umbrales:** `context_open`/`reason_open` pasan a llamarse por lo que hacen,
+  `config.thresholds.context_close` / `reason_close`, con default 0,25 (el mismo efecto que antes).
+  CONFIG_SET rechaza las claves viejas por nombre y cualquier otra clave desconocida. La config
+  persistida de PROD con las viejas arranca con los defaults, que dan el mismo comportamiento, y
+  deja un warning.
+- **Región llena:** gana lo reciente. El hilo del turno actual nunca se descarta y después va el
+  visto más recientemente.
+- **Corte de scope:** se mantiene en el 6.º mensaje divergente sostenido (5.º si el scope tiene un
+  turno, 7.º si está muy reforzado), escrito en la spec §8.3 y fijado por test.
+- **Sigue sin ensamblar** (capítulo aparte): memoria entre hilos, LanceDB, que lo de los workers
+  llegue al motherbee, y lectores de las tablas.
 
 ### A-39 ✅ RESUELTO (0.1.54, a validar en el deploy) — En cada release, los nodos administrados de motherbee caían entre 20 y 80 s (`203/EXEC`)
 
