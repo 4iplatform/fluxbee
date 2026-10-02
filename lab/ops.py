@@ -199,18 +199,26 @@ def cmd_health(a):
 
 def cmd_build(a):
     v = a.version
+    log = "/root/build-%s.log" % v
+    # The pull runs in the foreground: a failed pull stops here instead of leaving no log behind
+    # (with `pull && nohup ... &` the whole list went to the background, pull included).
     script = (
-        "cd /opt/fluxbee && sudo -u fluxops git pull --ff-only -q && "
+        "set -e; cd /opt/fluxbee; sudo -u fluxops git pull --ff-only -q; "
         "nohup bash -c 'export PATH=/root/.cargo/bin:$PATH; cd /opt/fluxbee; "
         "echo \"=== BUILD START $(date -Is) commit $(git rev-parse --short HEAD)\"; "
         "bash packaging/build-deb.sh %s; echo \"=== BUILD END rc=$? $(date -Is)\"' "
-        "> /root/build-%s.log 2>&1 < /dev/null & sleep 2; head -1 /root/build-%s.log" % (v, v, v))
-    _, out, _ = vm_bash(build_vm(), script)
+        "> %s 2>&1 < /dev/null & sleep 2; head -1 %s" % (v, log, log))
+    code, out, _ = vm_bash(build_vm(), script)
     print(out.strip())
+    if code:
+        sys.exit("the build did not start (git pull or launch failed)")
     if not a.wait:
         return
     while True:
-        _, out, _ = vm_bash(build_vm(), "grep '=== BUILD END' /root/build-%s.log || true" % v, quiet=True)
+        _, out, _ = vm_bash(build_vm(), "test -f %s || echo NO-LOG; grep '=== BUILD END' %s || true"
+                            % (log, log), quiet=True)
+        if "NO-LOG" in out:
+            sys.exit("%s is gone: the build is not running" % log)
         if out.strip():
             print(out.strip())
             sys.exit(0 if "rc=0" in out else 1)
@@ -327,6 +335,8 @@ def main():
     s.add_argument("--drop", help="the oldest snapshot to delete where a VM already has 3")
     s.set_defaults(fn=cmd_deploy)
     a = p.parse_args()
+    # Progress shows as it happens even when the output goes to a pipe or a file.
+    sys.stdout.reconfigure(line_buffering=True)
     load_env(a.env, a.pve_host)
     a.fn(a)
 
