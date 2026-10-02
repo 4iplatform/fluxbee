@@ -21,6 +21,7 @@
 
 | Versión | Fecha (ART) | Commit | Alcance | Estado | Rollback |
 |---|---|---|---|---|---|
+| **0.1.54** | 2026-10-02 | `6aa4ee4` | motherbee + spokes (core) | ✅ live | snap `pre-gov-0-1-54` (las 4 VMs) · `apt install fluxbee=0.1.53` |
 | **0.1.53** | 2026-10-02 | `26edcd5` | motherbee + spokes (core) | ✅ live | snap `pre-ai-generic-0-1-53` (las 4 VMs) · `apt install fluxbee=0.1.52` |
 | **0.1.52** | 2026-10-02 | `0670184` | motherbee + spokes (core) | ✅ live | snap `pre-cleanup-0-1-52` (las 4 VMs) · `apt install fluxbee=0.1.51` |
 | **0.1.51** | 2026-10-01 | `f7c2520` | motherbee + spokes (core) | ✅ live | snap `pre-query-decode-0-1-51` (las 4 VMs) · `apt install fluxbee=0.1.50` |
@@ -62,6 +63,40 @@
 > (`dpkg-scanpackages -m`) para rollback, pero su detalle vive en la bitácora, no acá.
 
 ---
+
+## 0.1.54 — upgrades sin caída de los nodos administrados, el camino .gov cerrado, cognition A-38
+
+- **Fecha:** 2026-10-02 (ART) · **Versión anterior:** 0.1.53 · **Commits:** `7c9f781`..`6aa4ee4`
+  (FINDINGS A-37, A-38, A-39, A-41; bitácora `2026-10-02`).
+- **Alcance:** motherbee + los tres spokes (core-update).
+- **Antes del deploy, a mano en PROD (pedido del operador):**
+  - se borró `AI.chat@motherbee` con purga (instancia e ILK);
+  - se le quitó a IO.slack.default su `io.dst_node`, que apuntaba a AI.chat (config v4);
+  - se borraron 12 archivos `.uuid` de nodos ya borrados.
+- **Qué cambió:**
+  - **A-39:** el arranque del orchestrator relanza en la versión nueva a los nodos que siguen a
+    `current`, y `needrestart` ya no reinicia las units `fluxbee-node-*`.
+  - **A-41:** la purga de un nodo borra su UUID.
+  - **A-37, .gov:**
+    - el registro va al tenant del caso y el frontdesk no crea tenants;
+    - merge por email: completa solo campos vacíos y mueve los canales;
+    - `TENANT_SUSPENDED`;
+    - `register_human` informa el ILK final.
+  - **A-38, cognition:** `context_close`/`reason_close` y lo reciente primero en la región de memoria.
+- **Build:** 13,5 min. **Publish:** 11 s, 54 paquetes. **Deploy:** 231 s con `ops deploy`; snapshots
+  `pre-gov-0-1-54` en las 4 VMs (se borró antes `pre-query-decode-0-1-51`).
+- **Verificación en vivo:**
+  - Los 4 hives en 0.1.54 con el mismo manifest (`7b87d5c1…`). Ningún binario `(deleted)`, 0 líneas
+    ERROR desde el install y 0 rechazos del gate y descartes por `routing.src`.
+  - **A-39 validado:**
+    - los cinco nodos administrados arrancaron una sola vez, en 0.1.54, con cero `203/EXEC`;
+    - el orchestrator los reapuntó ("running node follows 'current' and the pointer moved");
+    - `/etc/needrestart/conf.d/fluxbee.conf` quedó instalado.
+  - **Cognition:** rechazó los umbrales viejos de su config persistida (warning) y aplica los
+    defaults; CONFIG_GET informa `context_close`/`reason_close` 0,25, el mismo efecto que antes.
+  - **Identity y frontdesk:** 0 errores desde el install.
+  - **CI:** `rust-tests` y los guardianes en verde en `6aa4ee4`.
+- **Rollback:** snapshot `pre-gov-0-1-54` o `apt install fluxbee=0.1.53`.
 
 ## 0.1.53 — limpieza de código muerto: la clave general de IA, sin instancia AI de base, privacidad y cognition
 
