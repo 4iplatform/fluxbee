@@ -948,7 +948,23 @@ Se cierra junto con [PB-7](#pb-7) opción 2 — son el mismo hueco visto por dos
 mismo: el código **lo evita explícitamente** — se auto-excluye y **difiere su restart a un timer de
 2 s justamente para no matar su propia respuesta**.
 
-**Las causas reales, ambas en código:** (1) el destino reinicia **primero** su propio bus
+**Actualización 2026-10-02 (medido en el deploy de 0.1.53, worker1):**
+
+- **La causa 2 no aplica:** el update completo, con los reinicios, tardó ~2 s.
+- **Lo que pasa:** la respuesta (922 bytes) se escribe por la conexión vieja al router recién
+  reiniciado (`tx_loop write_frame failed: Broken pipe`) y el SDK reconecta un milisegundo después.
+- **Por qué el SDK no se entera antes:** el `rx_loop` no lee el EOF mientras el orchestrator procesa
+  el update, porque no consume lo recibido y la cola llega al tope.
+- **No es un bug del SDK:** el protocolo (§10.6) define que al reconectar la cola TX se vacía y que
+  reenviar es responsabilidad del nodo.
+- **Caminos:**
+  1. responder después de aplicar binarios y units, y antes de reiniciar; los reinicios, con su
+     health gate y rollback, corren después y su resultado queda registrado para `/versions`;
+  2. mantener la respuesta sincrónica, esperando la reconexión sin bloquear la recepción.
+- **Recomendado:** 1, el mismo patrón que ya usa el orchestrator para su propio reinicio. Es decisión
+  del operador, porque cambia lo que significa el `ok` de la respuesta.
+
+**El análisis de antes:** (1) el destino reinicia **primero** su propio bus
 `rt-gateway`, que es por donde la respuesta debe volver, **y el fallo de envío se traga** (`let _ =`);
 (2) el restart **en serie** con health-gate de 30 s por servicio sobre 8 servicios puede exceder los
 60 s por sí solo. *(Aparte: si el target es motherbee, el que se reinicia a mitad del request es

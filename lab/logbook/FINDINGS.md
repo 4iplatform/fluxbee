@@ -466,7 +466,7 @@
   tablas.
 
 
-### A-39 🔴 En cada release, los nodos administrados de motherbee caen entre 20 y 80 s (`203/EXEC`)
+### A-39 ✅ RESUELTO (0.1.54, a validar en el deploy) — En cada release, los nodos administrados de motherbee caían entre 20 y 80 s (`203/EXEC`)
 
 - **Qué pasa (visto al validar 0.1.53, y preexistente: AI.chat sumó 104 fallas en 30 días):**
   1. Al desempaquetar la versión nueva, dpkg borra los archivos del paquete viejo, y los directorios
@@ -479,11 +479,38 @@
     Reapuntadas a las 20:32:34 ("runtime 'current' pointer moved; rebinding node").
   - IO.wapp.default: 17 fallas, hasta las 20:33:33; el reconcile la había salteado como "visible".
 - **Impacto:** IO.api e IO.cloud, lo que da la cara al público, quedan sin servicio en cada upgrade.
-- **Arreglo posible (a decidir):**
-  - que los directorios de runtime no sean archivos del paquete: se siembran en el postinst y la
-    retención borra los viejos;
-  - o que las units apunten a una ruta estable (`current`).
-  - Va con U-8b (la familia del flujo de update).
+- **Quién los reiniciaba:** `needrestart`, el hook de apt de Ubuntu. Después de dpkg reinicia los
+  servicios que corren binarios borrados, y su `ExecStart` viejo apunta al directorio que ya no
+  existe.
+- **El otro lado del bug:** el reconcile de arranque salteaba los nodos que estaban corriendo.
+  Uno que nadie reiniciaba quedaba en el binario viejo indefinidamente; los reparaba solo porque
+  `needrestart` los había hecho caer.
+- **Arreglo (`779df4c`):**
+  - El reconcile de arranque, que corre después de cada upgrade y cada core-update, relanza en la
+    versión nueva al nodo que sigue a `current` cuando el puntero se movió: un reinicio controlado.
+    El loop de 60 s no lo hace, así que una publicación en caliente se comporta como antes.
+  - El paquete instala `/etc/needrestart/conf.d/fluxbee.conf`, que deja las units `fluxbee-node-*`
+    al orchestrator (verificado contra el código de `needrestart`).
+
+
+### A-40 🟡 IO.slack.default no tiene su ILK en identity (PROD)
+
+- **Qué pasa:** su config apunta a `ilk:9cd1bb44…`, pero SY.identity responde `NOT_FOUND`. Por eso
+  cada `CONFIG_SET` termina en `own_ich_registration_failed` (`ILK_ADD_CHANNEL rejected:
+  ILK_NOT_FOUND`) y el nodo queda en FAILED_CONFIG. Los otros cinco nodos administrados tienen su ILK.
+- **Causa probable:** la primera corrida del factory reset del 28/09, que borraba ILKs de nodos base
+  antes de su arreglo.
+- **Pendiente:** recrear el nodo, para que el orchestrator le registre un ILK nuevo, y volver a
+  cargarle su config. Al quitar AI.chat se le sacó `io.dst_node` (que apuntaba a AI.chat): la config
+  v4 quedó persistida.
+
+### A-41 ✅ RESUELTO (0.1.54) — Purgar un nodo dejaba su UUID persistido
+
+- **Qué pasaba:** `purge_instance` borraba el directorio, el ILK y el mapeo, pero no
+  `state/nodes/<nombre>.uuid`. En PROD había 12, de nodos ya borrados: AI.chat, los de prueba del
+  factory reset y bindings viejos de Slack. Un nodo nuevo con el mismo nombre heredaba el UUID viejo.
+- **Arreglo (`7c9f781`):** las dos rutas de purga lo borran y lo informan (`uuid_file_removed`). Se
+  borraron los 12 de PROD.
 
 ### A-19 ✅ RESUELTO (0.1.43) — La policy publicada esperaba hasta 60 s al watcher de Syncthing
 
