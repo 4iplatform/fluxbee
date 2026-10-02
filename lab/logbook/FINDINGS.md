@@ -438,22 +438,55 @@
 - **PROD:** la instancia `AI.chat@motherbee` que ya existe queda en FAILED_CONFIG, porque su config
   tiene `vault_key`. Se borra o se reconfigura a pedido del operador.
 
-### A-37 🟡 SY.frontdesk.gov: el camino de tenants no cierra con lo que dicen los documentos
+### A-37 ✅ RESUELTO (0.1.54) — SY.frontdesk.gov: el camino de tenants y el merge por email
 
-- **G1:** el registro conversacional no puede terminar bien. El tenant no sale de ningún lado y
-  termina en `missing_tenant_id`.
-  - Propuesta: lo decide el runner, no el LLM, a partir del tenant del ILK temporal.
-- **G2:** crear un tenant hoy lo deja `active` y puede unirse a uno existente por nombre.
-  - Los documentos dicen que nace `pending` y que lo aprueba SY.admin.
-- **G3:** el merge por email (`ILK_ADD_CHANNEL` con `merge_from_ilk_id`) no está implementado.
-  - Antes hace falta probar que la persona es dueña del email; si no, cualquiera toma la identidad
-    de otro.
-- **G4–G8:** vocabulario superado (solo docs), la §11 de la spec vieja, faltan contadores, el
-  handoff fallido pierde su tenant, y los reintentos conversacionales.
-- **Además, los dos documentos se contradicen:** la spec dice "no inventa tenants"; identity v2
-  dice que crea tenants `pending`.
-- **Estado:** esperando decisiones del operador. El detalle (G1–G8, con archivos y líneas) está en la
-  bitácora 2026-10-02.
+**Decisiones del operador (2026-10-02):**
+
+- Sobre tenants: *"no da para crear un tenant por un mensaje que llegue de un humano que no esté
+  registrado; ahora el tenant se crea desde el cloud y tiene un proceso"*.
+- Sobre el merge: *"haría merge sobre datos que no están… si no coinciden los datos y mandan un update
+  queda lo último"*.
+
+**Tenant del caso:**
+
+- Es el del ILK temporal, que SY.identity registró al provisionarlo bajo el tenant del nodo IO. El
+  frontdesk lo lee del SHM de identity.
+- El `tenant_id` de un handoff solo tiene que coincidir; si no, `INVALID_REQUEST`.
+- Sin tenant legible responde `TENANT_UNRESOLVED` y no registra.
+- El frontdesk ya no crea tenants: SY.identity le quitó el permiso de `TNT_CREATE`, `TNT_UPDATE` y
+  `TNT_SET_SPONSOR`.
+- Ni la persona ni el LLM eligen el tenant.
+
+**Estado del tenant:** `ILK_REGISTER` en un tenant suspendido ahora se rechaza (`TENANT_SUSPENDED`),
+igual que en uno pendiente.
+
+**Merge por email**, dentro de `ILK_REGISTER` de SY.identity:
+
+- **Cuándo:** el email ya es de otro humano activo del mismo tenant y el que se registra es un
+  temporal de ese tenant.
+- **Qué hace:** los canales se mueven (antes se copiaban, un bug) y el temporal queda como alias.
+- **Los datos:** solo se completan los campos vacíos; nunca se pisa un valor.
+- **La respuesta:** `merged:true`; el frontdesk responde `MERGED`.
+- **Gana lo último:** un `ILK_REGISTER` del propio ILK, por ejemplo un `register_human` repetido,
+  reemplaza la identificación.
+- **io.cloud:** `register_human` informa el ILK final, `merged` y el temporal de origen.
+
+**Además:**
+
+- Las búsquedas por email son por tenant, como el índice de la base.
+- Un handoff fallido conserva el tenant del caso (G7).
+- Los tests de logs sin datos personales eran inestables; quedaron estables.
+
+**Quedan abiertos:**
+
+- 🔴 **Seguridad:** no hay prueba de que el email sea de quien lo escribe. Quien escribe el email de
+  otro asocia su canal al ILK de esa persona. Ya está escrito en los dos documentos.
+- **Decisión:** los temporales de nodos IO del tenant raíz se registran en ese tenant. Se puede
+  bloquear con una línea.
+- **G6 y G8:** los contadores de §12 y los reintentos conversacionales.
+- **Dos e2e de laboratorio:** `identity_merge_alias_e2e.sh` e `identity_negative_e2e.sh` crean
+  tenants con el nombre del frontdesk y ahora reciben `UNAUTHORIZED_REGISTRAR`. Van a la pasada de
+  limpieza de scripts.
 
 ### A-38 ✅ RESUELTO (0.1.54) — Cognition: preguntas de diseño
 

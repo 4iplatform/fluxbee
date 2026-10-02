@@ -6,6 +6,8 @@
 **Replaces:** `10-identity-layer3.md` (v1.15)
 
 > **2026-05-06 update:** Agent identity definition is being consolidated by `identity-v2.1-agent-definition-addendum.md`. The older `roles/capabilities/degrees` model in this document is superseded for AI agents by hash-based role/skill/handbook references stored in `identity_ilks.definition` and projected through SHM/router. Treat examples that route by `data.identity[ilk].capabilities` as historical design notes until this document is fully rewritten.
+>
+> **2026-10-02 update (operator decisions):** the frontdesk (`SY.frontdesk.gov`) never creates a tenant: a person is registered into the tenant the case already has, the one SY.identity holds for the temporary ILK (§6.2, §6.4). An `ILK_REGISTER` whose email already belongs to another human ILK of the tenant merges into that ILK instead of failing (§6.5). Only an active tenant takes registrations. The controlled vocabulary (§8) is superseded.
 
 ---
 
@@ -71,9 +73,9 @@ A tenant is an organization, company, or account. It is the top-level partition 
 
 **Rules:**
 
-- `status`: `pending | active | suspended`.
+- `status`: `pending | active | suspended`. Only an `active` tenant takes registrations (`ILK_REGISTER` answers `TENANT_PENDING` / `TENANT_SUSPENDED`, and `TENANT_DELETED` for a marked one).
 - A default tenant (`fluxbee`) is created automatically during motherbee bootstrap. All system nodes (SY.*, RT.*) are registered under this tenant.
-- Subsequent tenants are created via SY.admin (initial setup) or via AI.frontdesk with approval.
+- Subsequent tenants are created by the operator through SY.admin, by Fluxbee Cloud with its own process (io.cloud `create_tenant`, relayed by SY.admin), or by SY.architect. The frontdesk never creates one (§6.4).
 - Without at least one active tenant, no ILK can be registered and no node can be spawned.
 
 ### 3.2 ILK (Interlocutor Key)
@@ -86,7 +88,7 @@ An ILK is the unique identity of any entity that participates in messaging: huma
 
 | Type | Description | Registered by | Has ICH |
 |------|-------------|---------------|---------|
-| `human` | Person (operator, customer, admin) | AI.frontdesk | Yes |
+| `human` | Person (operator, customer, admin) | SY.frontdesk.gov | Yes |
 | `agent` | AI node that processes messages | SY.orchestrator | Optional |
 | `system` | Workflow, bot, integration, sensor | SY.orchestrator | Optional |
 
@@ -97,7 +99,7 @@ An ILK is the unique identity of any entity that participates in messaging: huma
 - ILK persists across node restarts — same node_name = same ILK.
 - ILKs can be created through two actions:
   - `ILK_PROVISION` (IO nodes only): creates temporary ILKs for unknown channels.
-  - `ILK_REGISTER` (SY.orchestrator and AI.frontdesk only): creates node ILKs or upgrades temporary human ILKs.
+  - `ILK_REGISTER` (SY.orchestrator and SY.frontdesk.gov only): creates node ILKs or upgrades temporary human ILKs.
 - Temporary ILKs (registration_status=temporary) are real ILKs with valid UUIDs, not pseudo-identifiers.
 
 ### 3.3 ICH (Interlocutor Channel)
@@ -333,7 +335,7 @@ The complete identity dataset (all tenants, all ILKs with full metadata) is load
 | 500K | 250 MB | 8 GB |
 | 1M | 500 MB | 16 GB |
 
-SY.identity enforces `MAX_ILKS` (configurable per deployment, default 1M). When the limit is reached, registration is rejected with `IDENTITY_LIMIT_REACHED`. Identity exposes the current count and limit as a metric for capacity planning.
+SY.identity sizes the SHM region from `identity.max_ilks` in `hive.yaml` (default 8192 in the code today). It does not refuse a registration at that limit — there is no `IDENTITY_LIMIT_REACHED`: an ILK beyond the region's capacity is persisted and replicated, but its SHM write fails and is logged. Identity exposes the current counts as a metric for capacity planning.
 
 ### 5.4 Synchronization
 
@@ -364,50 +366,60 @@ When an ILK or TNT is created, updated, or deleted, motherbee SY.identity propag
 2. SY.identity auto-creates default tenant "fluxbee" (status: active).
 3. SY.orchestrator registers ILKs for system nodes (SY.*, RT.*) under "fluxbee" tenant.
 4. System nodes start with identity.
-5. AI.frontdesk is spawned (if configured).
+5. SY.frontdesk.gov starts (a system node of the motherbee).
 6. Humans can now register via frontdesk.
 ```
 
-### 6.2 Human Registration (via AI.frontdesk)
+### 6.2 Human Registration (via SY.frontdesk.gov)
 
 ```
 1. Unknown person sends message via WhatsApp.
 2. IO.whatsapp generates ICH (first contact, no local retention found).
 3. IO.whatsapp checks SHM: no ILK for this ICH.
 4. IO.whatsapp requests a temporary ILK from SY.identity:
-   - sends ILK_PROVISION with ich_id + channel_type + address.
-   - SY.identity creates a real ILK (UUID v4, registration_status=temporary),
-     associates the ICH, assigns `tenant_id=default_tenant` (bootstrap default: `fluxbee`),
-     persists in DB, propagates to SHM.
+   - sends ILK_PROVISION with ich_id + channel_type + address + tenant_id: its own tenant
+     (io.api / io.cloud: the tenant they were called for).
+   - SY.identity creates a real ILK (UUID v4, registration_status=temporary) in that tenant
+     (the default tenant `fluxbee` when the IO node sends none), associates the ICH,
+     persists in DB, propagates to SHM, then answers.
    - IO.whatsapp receives the ILK UUID back.
 5. IO.whatsapp sends message with the real (temporary) ILK as meta.src_ilk.
-6. OPA sees registration_status=temporary → routes to AI.frontdesk.
-7. AI.frontdesk converses with the person, collects minimum data:
-   - email (required, uniqueness key within tenant)
+6. The router sees registration_status=temporary → routes to SY.frontdesk.gov
+   (or the IO node hands the case over as a structured `frontdesk_handoff`).
+7. SY.frontdesk.gov collects the minimum data:
+   - email (required; it identifies the person within the tenant)
    - name (required)
-   - tenant association (code, domain match, or new tenant request)
-8. AI.frontdesk sends ILK_REGISTER to SY.identity@motherbee:
+   It never asks for a tenant.
+8. SY.frontdesk.gov sends ILK_REGISTER to SY.identity@motherbee:
    - ilk_id (the temporary ILK already created)
    - identification data
-   - tenant_id
-9. SY.identity validates and upgrades ILK:
-   - status: `temporary` → `complete`
-   - tenant reassignment: from default_tenant to the resolved tenant (allowed only while status=temporary)
-   - persists and propagates.
-10. IO.whatsapp continues using the same ILK — it was always a real UUID.
-11. Subsequent messages route normally based on tenant/capabilities.
+   - tenant_id: the tenant of the case, the one SY.identity holds for the temporary ILK
+     (read from SHM). A `frontdesk_handoff.tenant_id` must be that same tenant. When it cannot
+     be read, nothing is registered (`TENANT_UNRESOLVED`) and no tenant is created.
+9. SY.identity validates and upgrades the ILK:
+   - the tenant must be active (TENANT_PENDING / TENANT_SUSPENDED / TENANT_DELETED otherwise);
+   - if the email already belongs to another human ILK of the tenant, the person is already
+     registered: merge into that ILK (§6.5);
+   - otherwise status `temporary` → `complete`; persists and propagates.
+10. IO.whatsapp continues using the same ILK — it was always a real UUID (after a merge, its
+    channel resolves to the registered ILK).
+11. Subsequent messages route normally based on tenant.
 ```
 
 **Key design decision:** The temporary ILK is a real `ilk:<uuid-v4>` from the start. There are no pseudo-identifiers, no special format, no format inconsistencies. The only difference is `registration_status=temporary` which OPA uses to route to frontdesk.
 
+**Tenant of a registration:** the frontdesk takes it from the case, never from the person, the LLM, its own config or its environment, and never creates one (§6.4). SY.identity itself still accepts an `ILK_REGISTER` that moves a *temporary* ILK to another active tenant (a complete one answers `INVALID_TENANT_TRANSITION`); the frontdesk never asks for that.
+
 **Authorized registrars:** SY.identity validates source authorization at two levels:
 
 1. **Router/OPA level:** OPA can reject ILK_REGISTER/ILK_PROVISION from unauthorized sources before they reach identity.
-2. **SY.identity level (authoritative):** action-scoped allowlists:
+2. **SY.identity level (authoritative):** action-scoped allowlists (`SY.admin`, `SY.architect` and `SY.frontdesk.gov` only from SY.identity's own hive):
    - `ILK_PROVISION`: `IO.*@*`
-   - `ILK_REGISTER`: `SY.frontdesk.gov@*`, `SY.orchestrator@*`
-   - `ILK_ADD_CHANNEL`: `SY.frontdesk.gov@*`
+   - `ILK_REGISTER`: `SY.frontdesk.gov@<hive>`, `SY.orchestrator@*`
+   - `ILK_ADD_CHANNEL`: `IO.*@*`, `SY.frontdesk.gov@<hive>`
    - `ILK_UPDATE` (node/system metadata): `SY.orchestrator@*`
+   - `TNT_CREATE`, `TNT_UPDATE`, `TNT_SET_SPONSOR`: `SY.admin@<hive>`, `SY.architect@<hive>` (never the frontdesk)
+   - `TNT_APPROVE`: `SY.admin@<hive>`
    Requests outside allowlist are rejected with `UNAUTHORIZED_REGISTRAR`.
    This is the definitive enforcement — OPA is defense in depth.
 
@@ -442,38 +454,51 @@ When an ILK or TNT is created, updated, or deleted, motherbee SY.identity propag
 
 **During bootstrap:** Automatic, no approval needed (default "fluxbee" tenant).
 
-**Via SY.admin:** Direct creation for initial setup, no approval flow.
+**Via SY.admin:** The operator creates tenants directly (`TNT_CREATE`; `status` defaults to `pending`, and a name or domain that matches an existing tenant returns that tenant with `created: false`). Fluxbee Cloud creates its tenants with its own process through io.cloud `create_tenant`, which SY.admin relays. SY.architect may create them too. A `pending` tenant is activated by SY.admin (`TNT_APPROVE`).
 
-**Via AI.frontdesk:** When a person claims to belong to a tenant that doesn't exist, frontdesk can initiate a TNT_CREATE request. This creates the tenant in `pending` status. An admin must approve it before any ILKs can be registered under it. Until approved, the requesting person remains in `temporary` ILK status.
+**Never via the frontdesk** (operator decision 2026-10-02): a message from a person who is not registered cannot create a tenant. SY.frontdesk.gov registers the person into the tenant the case already has (§6.2), and SY.identity does not authorize it for `TNT_CREATE`, `TNT_UPDATE` or `TNT_SET_SPONSOR`. A case without a readable tenant is not registered (`TENANT_UNRESOLVED`).
 
-### 6.5 ICH Discovery and Association
+### 6.5 Known Person on a New Channel: Merge by Email
 
-When a known person appears on a new channel:
+The email identifies a person within a tenant. When a registered person appears on a new channel:
 
 ```
-1. Juan (registered via WhatsApp) writes from Slack.
+1. Juan (registered via WhatsApp, juan@acme.com, tenant Acme) writes from Slack.
 2. IO.slack generates new ICH, checks SHM: no ILK for this ICH.
-3. IO.slack requests ILK_PROVISION → new temporary ILK created.
-4. Message routed to AI.frontdesk (temporary ILK flow).
-5. AI.frontdesk asks for identification → Juan provides email.
-6. AI.frontdesk matches email to existing ILK.
-7. AI.frontdesk sends ILK_ADD_CHANNEL to SY.identity:
-   - existing ilk_id (Juan's real ILK)
-   - new ICH from Slack
-   - old temporary ILK to be merged
-8. SY.identity adds ICH to Juan's ILK channel list and creates alias old_ilk -> existing_ilk.
-9. Old temporary ILK is kept as alias for a grace window (`merge_alias_ttl_secs`) and then soft-deleted.
-10. IO.slack sees updated SHM: this ICH now resolves to Juan's real ILK.
+3. IO.slack requests ILK_PROVISION → new temporary ILK in Acme.
+4. Message routed to SY.frontdesk.gov (temporary ILK flow).
+5. SY.frontdesk.gov asks for identification → Juan provides name and email.
+6. SY.frontdesk.gov sends ILK_REGISTER for the temporary ILK, as for anyone else.
+7. SY.identity finds juan@acme.com on another human ILK of Acme and merges, inside the same
+   ILK_REGISTER:
+   - Juan's ILK keeps its id, its tenant and its `complete` status;
+   - the temporary ILK's channels MOVE to Juan's ILK (lookups follow; the temporary keeps none);
+   - alias temporary_ilk -> Juan's ILK until `merge_alias_ttl_secs` (§6.6);
+   - identification fields Juan's ILK has empty are filled from the registration; a field that
+     already has a value is kept;
+   - reply: `merged: true`, `ilk_id` = Juan's ILK, `merged_from_ilk_id` = the temporary ILK.
+8. SY.frontdesk.gov answers `MERGED`. IO.slack sees updated SHM: this ICH now resolves to
+   Juan's ILK.
 ```
+
+Rules:
+
+- Email is unique per tenant, like its DB index `(email, tenant_id)`: the same email in another tenant is another person, and a marked (deleted) ILK reserves its email only in its own tenant.
+- Only a temporary ILK of the same tenant, registered as `human`, merges, and only into a human ILK. When the email belongs to another ILK and the registration cannot merge (the registering ILK is already complete, belongs to another tenant or does not exist, or the registration or the email's holder is not human), the answer is `DUPLICATE_EMAIL` and nothing changes.
+- Fill-only is the merge's rule. An explicit update overwrites: an `ILK_REGISTER` of the registered ILK itself (for example a repeated Cloud `register_human` for the same email) replaces its identification whole — last write wins. `ILK_UPDATE` does not touch identification (§12.4).
+- Node ILKs (SY.orchestrator) carry `node_name`, not email, and never merge: the same `node_name` keeps resolving to the same ILK.
+- There is no proof of email ownership yet: whoever types another person's email gets their channel attached to that person's ILK. Verification (for example a one-time code) is a later item.
+- `ILK_ADD_CHANNEL` with `merge_from_ilk_id` (§12.3) is the same merge, addressed explicitly.
 
 ### 6.6 Temporary ILK Merge Semantics
 
 When identity merges a temporary ILK into an existing ILK (same person, new channel), it must preserve in-flight safety:
 
-1. Create alias mapping `old_ilk_id -> canonical_ilk_id`.
-2. Keep alias active for grace window (`merge_alias_ttl_secs`, default 3600).
-3. During grace window, routing/OPA canonicalizes `src_ilk` through alias map before policy evaluation.
-4. After grace window, mark old temporary ILK as soft-deleted and remove alias entry.
+1. Move the temporary ILK's channels to the canonical ILK. The DB moves their ICH rows, the alias and both ILK rows in one transaction; replicas receive both ILKs and the alias.
+2. Create alias mapping `old_ilk_id -> canonical_ilk_id`.
+3. Keep alias active for grace window (`merge_alias_ttl_secs`, default 3600).
+4. During grace window, routing/OPA canonicalizes `src_ilk` through alias map before policy evaluation.
+5. After grace window, mark old temporary ILK as soft-deleted and remove alias entry.
 
 This avoids message loss or inconsistent routing for in-flight messages carrying the old temporary ILK.
 
@@ -495,7 +520,9 @@ When SY.identity updates an ILK (e.g., frontdesk completes registration), the ch
 
 ---
 
-## 8. Controlled Vocabulary
+## 8. Controlled Vocabulary (superseded)
+
+> **Superseded** by `identity-v2.1-agent-definition-addendum.md` §2.4: roles and capabilities are retired, and nothing in this section is implemented. SY.identity keeps no vocabulary (the SHM vocabulary table stays empty) and has no vocabulary action, SY.admin exposes no `/identity/vocabulary` API (§13.3), `ILK_REGISTER` / `ILK_UPDATE` reject `roles` and `capabilities` as unknown fields, and the frontdesk translates nothing into tags. Kept as history only.
 
 ### 8.1 Concept
 
@@ -892,7 +919,7 @@ The IO node can now use this real ILK UUID for `meta.src_ilk`.
 
 ### 12.2 ILK_REGISTER (unicast to SY.identity@motherbee)
 
-Upgrades a temporary ILK to complete, or creates a new ILK for a node. Sent by AI.frontdesk (for humans) or SY.orchestrator (for nodes).
+Upgrades a temporary ILK to complete, or creates a new ILK for a node. Sent by SY.frontdesk.gov (for humans) or SY.orchestrator (for nodes).
 
 ```json
 {
@@ -913,12 +940,12 @@ Upgrades a temporary ILK to complete, or creates a new ILK for a node. Sent by A
     "identification": {
       "display_name": "Juan Pérez",
       "email": "juan@acme.com"
-    },
-    "roles": ["operator"],
-    "capabilities": ["billing"]
+    }
   }
 }
 ```
+
+The payload takes exactly these four fields (`ilk_type`: `human` or `agent`); any other field, such as the legacy `roles` / `capabilities`, is rejected with `INVALID_REQUEST`.
 
 **Response: ILK_REGISTER_RESPONSE**
 
@@ -927,8 +954,24 @@ Upgrades a temporary ILK to complete, or creates a new ILK for a node. Sent by A
   "meta": { "type": "system", "msg": "ILK_REGISTER_RESPONSE" },
   "payload": {
     "status": "ok",
-    "ilk_id": "ilk:550e8400-e29b-41d4-a716-446655440000"
+    "ilk_id": "ilk:550e8400-e29b-41d4-a716-446655440000",
+    "tenant_id": "tnt:uuid-of-tenant",
+    "registration_status": "complete",
+    "merged": false
   }
+}
+```
+
+After a merge by email (§6.5), `ilk_id` is the ILK that already had the email (the person ended on it) and the reply adds where the registration came from:
+
+```json
+{
+  "status": "ok",
+  "ilk_id": "ilk:<registered-ilk>",
+  "tenant_id": "tnt:uuid-of-tenant",
+  "registration_status": "complete",
+  "merged": true,
+  "merged_from_ilk_id": "ilk:<temporary-ilk>"
 }
 ```
 
@@ -937,11 +980,27 @@ For node spawn flows (`SY.orchestrator -> ILK_REGISTER`), this response is a har
 - any other outcome must abort spawn with `IDENTITY_REGISTER_FAILED`.
 - In implementation, orchestrator sends this action through the SDK helper (`identity_system_call_ok`) and maps `IdentityError` to orchestrator/admin-facing errors without changing external error contracts.
 
-**Error codes:** `INVALID_TENANT`, `TENANT_PENDING`, `DUPLICATE_EMAIL`, `DUPLICATE_NODE_NAME`, `VOCABULARY_INVALID`, `IDENTITY_LIMIT_REACHED`, `UNAUTHORIZED_REGISTRAR`.
+**Error codes** (`status: "error"` with `error_code`):
+
+| `error_code` | When |
+| --- | --- |
+| `INVALID_REQUEST` | malformed payload or ids, an unknown field, or an `ilk_type` other than `human` / `agent` |
+| `INVALID_TENANT` | the tenant does not exist |
+| `TENANT_PENDING`, `TENANT_SUSPENDED` | the tenant is not active |
+| `TENANT_DELETED` | the tenant is marked deleted |
+| `ILK_DELETED` | a marked ILK keeps that `node_name` (across the mesh) or email (in the tenant) reserved |
+| `ILK_NOT_FOUND` | the ILK being registered is marked deleted |
+| `SYSTEM_ILK_PROTECTED` | the ILK being registered is a system ILK |
+| `INVALID_TENANT_TRANSITION` | a complete ILK cannot change tenant |
+| `DUPLICATE_EMAIL` | the email belongs to another ILK of the tenant and the registration cannot merge (§6.5); also the DB unique index |
+| `DUPLICATE_NODE_NAME`, `DUPLICATE_ICH`, `DUPLICATE_CONSTRAINT` | a DB unique index |
+| `UNAUTHORIZED_REGISTRAR` | the sender is not allowed (§6.2) |
+| `NOT_PRIMARY` | sent to a replica |
+| `DB_NOT_READY`, `DB_WRITE_FAILED` | the primary's DB is not configured, or the write failed |
 
 ### 12.3 ILK_ADD_CHANNEL (unicast to SY.identity@motherbee)
 
-Associates a newly discovered ICH with an existing ILK and optionally merges a temporary ILK into the canonical ILK.
+Associates a newly discovered ICH with an existing ILK and optionally merges a temporary ILK into the canonical ILK. Sent by IO nodes (their own ICH) and SY.frontdesk.gov.
 
 ```json
 {
@@ -959,9 +1018,11 @@ Associates a newly discovered ICH with an existing ILK and optionally merges a t
 }
 ```
 
+With `merge_from_ilk_id` it is the merge of §6.5 and §6.6: the temporary ILK's channels move to `ilk_id` and it becomes an alias. Everything is validated before anything changes. Response: `status`, `ilk_id`, `ich_id`, `owner_l2_name`, `enabled`, `change_reason`. Error codes: `INVALID_REQUEST`, `ILK_NOT_FOUND` (missing or marked target), `ILK_DELETED` (a marked ILK keeps that channel reserved), `INVALID_MERGE_SOURCE` (the merge source is not another active temporary ILK), `UNAUTHORIZED_REGISTRAR`, `NOT_PRIMARY`, and the DB codes of §12.2.
+
 ### 12.4 ILK_UPDATE (unicast to SY.identity@motherbee)
 
-Update metadata of an existing ILK (add channel, change roles, write degree data, etc.).
+Adds channels to an existing ILK. Sent by SY.orchestrator (node ILKs).
 
 ```json
 {
@@ -969,18 +1030,18 @@ Update metadata of an existing ILK (add channel, change roles, write degree data
   "payload": {
     "ilk_id": "ilk:550e8400-...",
     "add_channels": [
-      { "ich_id": "ich:uuid", "type": "slack", "handle": "@juan" }
+      { "ich_id": "ich:uuid", "type": "slack", "address": "@juan" }
     ],
-    "add_roles": ["supervisor"],
-    "remove_roles": [],
-    "add_capabilities": ["escalation"],
-    "remove_capabilities": [],
-    "change_reason": "promoted to supervisor"
+    "change_reason": "node channel added"
   }
 }
 ```
 
+It changes nothing else: any other field (identification, the legacy `add_roles` / `add_capabilities`, degrees) is rejected with `INVALID_REQUEST`. Identification changes only through `ILK_REGISTER` of the ILK itself, which replaces it whole (last write wins); a merge only fills empty fields (§6.5). An agent's cognitive definition is written with `ILK_SET_DEFINITION` (addendum).
+
 ### 12.5 TNT_CREATE (unicast to SY.identity@motherbee)
+
+Sent by SY.admin (the operator, and Fluxbee Cloud through io.cloud `create_tenant`) and SY.architect; never by the frontdesk (§6.4). `status` defaults to `pending`; a `name` or `domain` that matches an existing tenant returns that tenant (`created: false`, `matched_by`).
 
 ```json
 {
@@ -1004,7 +1065,10 @@ Update metadata of an existing ILK (add channel, change roles, write degree data
   "meta": { "type": "system", "msg": "TNT_CREATE_RESPONSE" },
   "payload": {
     "status": "ok",
-    "tenant_id": "tnt:550e8400-e29b-41d4-a716-446655440000"
+    "tenant_id": "tnt:550e8400-e29b-41d4-a716-446655440000",
+    "created": true,
+    "matched_by": null,
+    "sponsor_tenant_id": null
   }
 }
 ```
@@ -1075,9 +1139,9 @@ GET    /identity/ilks/{id}                — get ILK with full metadata
 DELETE /identity/ilks/{id}                — soft-delete ILK
 ```
 
-Note: ILK creation is NOT exposed via HTTP API. ILKs are created only via message protocol: `ILK_PROVISION` (IO nodes, temporary ILK) and `ILK_REGISTER` (AI.frontdesk / SY.orchestrator).
+Note: ILK creation is NOT exposed via HTTP API. ILKs are created only via message protocol: `ILK_PROVISION` (IO nodes, temporary ILK) and `ILK_REGISTER` (SY.frontdesk.gov / SY.orchestrator).
 
-### 13.3 Vocabulary Management
+### 13.3 Vocabulary Management (superseded, not implemented — §8)
 
 ```
 GET    /identity/vocabulary               — list all valid tags
@@ -1296,10 +1360,10 @@ identity:
    status=complete  status=temporary
         │               │
         ▼               ▼
-   Normal routing   Route to AI.frontdesk
+   Normal routing   Route to SY.frontdesk.gov
         │               │
         ▼               ▼
-6. AI node processes    AI.frontdesk starts registration
+6. AI node processes    SY.frontdesk.gov starts registration
                         │
                         ▼
 7.                 Collects data, sends ILK_REGISTER

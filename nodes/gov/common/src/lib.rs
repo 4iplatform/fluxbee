@@ -98,8 +98,8 @@ pub fn identity_error_code(err: &IdentityError) -> String {
 
 /// Whether retrying the same identity request may succeed: SY.identity did not answer, or answered
 /// with a transient condition (not the primary, DB not ready, DB write failed). Every other code it
-/// answers with — TENANT_PENDING, TENANT_DELETED, ILK_DELETED, ILK_NOT_FOUND, SYSTEM_ILK_PROTECTED,
-/// DUPLICATE_*, INVALID_*, UNAUTHORIZED_REGISTRAR, ... — is a final verdict on the request.
+/// answers with — TENANT_PENDING, TENANT_SUSPENDED, TENANT_DELETED, ILK_DELETED, ILK_NOT_FOUND,
+/// SYSTEM_ILK_PROTECTED, DUPLICATE_*, INVALID_*, UNAUTHORIZED_REGISTRAR, ... — is a final verdict.
 pub fn identity_error_is_transient(error_code: &str) -> bool {
     matches!(
         error_code,
@@ -138,8 +138,6 @@ pub fn identity_error_log_summary(err: &IdentityError) -> String {
     }
 }
 
-pub const GOV_IDENTITY_TENANT_ID_ENV: &str = "GOV_IDENTITY_TENANT_ID";
-
 pub fn looks_like_tenant_id(raw: &str) -> bool {
     let Some(rest) = raw.strip_prefix("tnt:") else {
         return false;
@@ -147,78 +145,33 @@ pub fn looks_like_tenant_id(raw: &str) -> bool {
     uuid::Uuid::parse_str(rest.trim()).is_ok()
 }
 
-pub fn resolve_tenant_id_for_register(
-    explicit_tenant_id: Option<&str>,
-    tenant_hint: Option<&str>,
-    default_tenant_id: Option<&str>,
-) -> Option<String> {
-    let explicit = explicit_tenant_id
+/// The tenant of the case cannot be read: nothing is registered, and no tenant is created.
+pub const CASE_TENANT_MISSING: &str = "missing_tenant_id";
+/// The tenant the producer informed is not the tenant of the case's ILK: nothing is registered.
+pub const CASE_TENANT_MISMATCH: &str = "tenant_mismatch";
+
+/// The tenant a registration goes into: the one SY.identity holds for the case's temporary ILK.
+/// The IO node that provisioned it gave it its own tenant (io.api and io.cloud, the tenant they
+/// were called for). A tenant the producer informed (`frontdesk_handoff.tenant_id`) must be that
+/// same one. There is no other source: the frontdesk takes no tenant from the person, the LLM,
+/// its config or its environment, and never creates one. The error is the tool error code.
+pub fn resolve_case_tenant(
+    ilk_tenant: Option<&str>,
+    informed_tenant: Option<&str>,
+) -> Result<String, &'static str> {
+    let Some(ilk_tenant) = ilk_tenant
         .map(str::trim)
-        .filter(|v| !v.is_empty())
-        .filter(|v| looks_like_tenant_id(v))
-        .map(ToString::to_string);
-    if explicit.is_some() {
-        return explicit;
-    }
-
-    let hint = tenant_hint
+        .filter(|tenant| looks_like_tenant_id(tenant))
+    else {
+        return Err(CASE_TENANT_MISSING);
+    };
+    let informed = informed_tenant
         .map(str::trim)
-        .filter(|v| !v.is_empty())
-        .filter(|v| looks_like_tenant_id(v))
-        .map(ToString::to_string);
-    if hint.is_some() {
-        return hint;
+        .filter(|tenant| !tenant.is_empty());
+    if informed.is_some_and(|informed| informed != ilk_tenant) {
+        return Err(CASE_TENANT_MISMATCH);
     }
-
-    let cfg_default = default_tenant_id
-        .map(str::trim)
-        .filter(|v| !v.is_empty())
-        .filter(|v| looks_like_tenant_id(v))
-        .map(ToString::to_string);
-    if cfg_default.is_some() {
-        return cfg_default;
-    }
-
-    env_opt(GOV_IDENTITY_TENANT_ID_ENV).filter(|v| looks_like_tenant_id(v))
-}
-
-pub fn tenant_resolution_source(
-    explicit_tenant_id: Option<&str>,
-    tenant_hint: Option<&str>,
-    default_tenant_id: Option<&str>,
-) -> &'static str {
-    let explicit_ok = explicit_tenant_id
-        .map(str::trim)
-        .filter(|v| !v.is_empty())
-        .is_some_and(looks_like_tenant_id);
-    if explicit_ok {
-        return "args.tenant_id";
-    }
-
-    let hint_ok = tenant_hint
-        .map(str::trim)
-        .filter(|v| !v.is_empty())
-        .is_some_and(looks_like_tenant_id);
-    if hint_ok {
-        return "identity_candidate.tenant_hint";
-    }
-
-    let cfg_ok = default_tenant_id
-        .map(str::trim)
-        .filter(|v| !v.is_empty())
-        .is_some_and(looks_like_tenant_id);
-    if cfg_ok {
-        return "effective_config.tenant_id";
-    }
-
-    let env_ok = env_opt(GOV_IDENTITY_TENANT_ID_ENV)
-        .as_deref()
-        .is_some_and(looks_like_tenant_id);
-    if env_ok {
-        return GOV_IDENTITY_TENANT_ID_ENV;
-    }
-
-    "missing"
+    Ok(ilk_tenant.to_string())
 }
 
 #[cfg(test)]
@@ -237,6 +190,7 @@ mod tests {
     fn final_identity_rejections_keep_their_code_and_are_not_retryable() {
         for code in [
             "TENANT_PENDING",
+            "TENANT_SUSPENDED",
             "TENANT_DELETED",
             "ILK_DELETED",
             "ILK_NOT_FOUND",
@@ -295,6 +249,45 @@ mod tests {
             assert_eq!(payload["error_code"], code);
             assert_eq!(payload["retryable"], true, "{code} is transient");
         }
+    }
+
+    const CASE_TENANT: &str = "tnt:11111111-1111-4111-8111-111111111111";
+    const OTHER_TENANT: &str = "tnt:22222222-2222-4222-8222-222222222222";
+
+    #[test]
+    fn the_case_tenant_is_the_tenant_of_its_ilk() {
+        assert_eq!(
+            resolve_case_tenant(Some(CASE_TENANT), None).as_deref(),
+            Ok(CASE_TENANT)
+        );
+        // A producer that informs the same tenant agrees with the ilk.
+        assert_eq!(
+            resolve_case_tenant(Some(CASE_TENANT), Some(&format!(" {CASE_TENANT} "))).as_deref(),
+            Ok(CASE_TENANT)
+        );
+        // One that informs another is refused, never followed.
+        assert_eq!(
+            resolve_case_tenant(Some(CASE_TENANT), Some(OTHER_TENANT)),
+            Err(CASE_TENANT_MISMATCH)
+        );
+        assert_eq!(
+            resolve_case_tenant(Some(CASE_TENANT), Some("Acme SA")),
+            Err(CASE_TENANT_MISMATCH)
+        );
+    }
+
+    #[test]
+    fn without_the_ilk_tenant_there_is_no_tenant() {
+        // An informed tenant alone does not make one: it only checks the ilk's.
+        assert_eq!(
+            resolve_case_tenant(None, Some(CASE_TENANT)),
+            Err(CASE_TENANT_MISSING)
+        );
+        assert_eq!(resolve_case_tenant(None, None), Err(CASE_TENANT_MISSING));
+        assert_eq!(
+            resolve_case_tenant(Some("acme"), None),
+            Err(CASE_TENANT_MISSING)
+        );
     }
 
     #[test]

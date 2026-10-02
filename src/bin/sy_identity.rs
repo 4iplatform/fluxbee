@@ -802,6 +802,23 @@ impl IdentityStore {
         })
     }
 
+    /// The ilk of `tenant_id` that holds `email`, which is unique within a tenant (the scope of
+    /// its DB index): the active one, or with `deleted` a marked one that keeps it reserved.
+    fn ilk_holding_email(&self, tenant_id: &str, email: &str, deleted: bool) -> Option<String> {
+        let email = email.trim();
+        if email.is_empty() {
+            return None;
+        }
+        self.ilks
+            .values()
+            .find(|ilk| {
+                ilk.deleted_at_ms.is_some() == deleted
+                    && ilk.tenant_id == tenant_id
+                    && identification_str(&ilk.identification, "email") == Some(email)
+            })
+            .map(|ilk| ilk.ilk_id.clone())
+    }
+
     fn with_default_tenant() -> Self {
         let mut out = Self::default();
         out.ensure_default_root_tenant();
@@ -974,7 +991,11 @@ impl IdentityStore {
         }))
     }
 
-    fn register_ilk(&mut self, req: IlkRegisterRequest) -> Result<Value, String> {
+    fn register_ilk(
+        &mut self,
+        req: IlkRegisterRequest,
+        merge_alias_ttl_secs: u64,
+    ) -> Result<Value, String> {
         let _ = parse_prefixed_uuid(&req.ilk_id, "ilk")?;
         let _ = parse_prefixed_uuid(&req.tenant_id, "tnt")?;
         validate_ilk_type(&req.ilk_type)?;
@@ -984,16 +1005,40 @@ impl IdentityStore {
         if target_tenant.deleted_at_ms.is_some() {
             return Err("TENANT_DELETED".to_string());
         }
+        // Only an active tenant takes registrations.
         if target_tenant.status.eq_ignore_ascii_case("pending") {
             return Err("TENANT_PENDING".to_string());
         }
-        // Keys of a marked ilk stay reserved until purge.
-        for key in ["node_name", "email"] {
-            if let Some(value) = identification_str(&req.identification, key) {
-                if self.find_active_ilk_by_identification_key(key, value).is_none()
-                    && self.deleted_ilk_holding_identification(key, value).is_some()
-                {
-                    return Err("ILK_DELETED".to_string());
+        if target_tenant.status.eq_ignore_ascii_case("suspended") {
+            return Err("TENANT_SUSPENDED".to_string());
+        }
+        // Keys of a marked ilk stay reserved until purge, in the scope of their unique index:
+        // node_name across the mesh, email within its tenant.
+        if let Some(node_name) = identification_str(&req.identification, "node_name") {
+            if self
+                .find_active_ilk_by_identification_key("node_name", node_name)
+                .is_none()
+                && self
+                    .deleted_ilk_holding_identification("node_name", node_name)
+                    .is_some()
+            {
+                return Err("ILK_DELETED".to_string());
+            }
+        }
+        if let Some(email) = identification_str(&req.identification, "email").map(str::to_string) {
+            match self.ilk_holding_email(&req.tenant_id, &email, false) {
+                // The email is already registered in this tenant: the person is known.
+                Some(holder) if holder != req.ilk_id => {
+                    return self.merge_registration(req, holder, merge_alias_ttl_secs);
+                }
+                Some(_) => {}
+                None => {
+                    if self
+                        .ilk_holding_email(&req.tenant_id, &email, true)
+                        .is_some()
+                    {
+                        return Err("ILK_DELETED".to_string());
+                    }
                 }
             }
         }
@@ -1028,8 +1073,10 @@ impl IdentityStore {
                     return Err("INVALID_TENANT_TRANSITION".to_string());
                 }
                 existing.ilk_type = req.ilk_type;
-                existing.tenant_id = req.tenant_id;
+                existing.tenant_id = req.tenant_id.clone();
                 existing.registration_status = "complete".to_string();
+                // A registration of the ilk itself is an update: its identification is replaced
+                // whole (last write wins).
                 existing.identification = req.identification;
             }
             None => {
@@ -1039,7 +1086,7 @@ impl IdentityStore {
                         ilk_id: canonical_ilk_id.clone(),
                         ilk_type: req.ilk_type,
                         registration_status: "complete".to_string(),
-                        tenant_id: req.tenant_id,
+                        tenant_id: req.tenant_id.clone(),
                         identification: req.identification,
                         definition: json!({}),
                         channels: Vec::new(),
@@ -1053,7 +1100,133 @@ impl IdentityStore {
         Ok(json!({
             "status": "ok",
             "ilk_id": canonical_ilk_id,
+            "tenant_id": req.tenant_id,
+            "registration_status": "complete",
+            "merged": false,
         }))
+    }
+
+    /// ILK_REGISTER with an email that `holder_id` already has in the same tenant: the person is
+    /// already registered. Their temporary ilk merges into `holder_id` (the same merge as
+    /// ILK_ADD_CHANNEL `merge_from_ilk_id`), and the registration only fills the identification
+    /// fields `holder_id` has empty: a value already there is kept. Validates before it mutates.
+    fn merge_registration(
+        &mut self,
+        req: IlkRegisterRequest,
+        holder_id: String,
+        merge_alias_ttl_secs: u64,
+    ) -> Result<Value, String> {
+        let Some(source) = self.ilks.get(&req.ilk_id) else {
+            // A new ilk cannot take an email someone in the tenant already has.
+            return Err("DUPLICATE_EMAIL".to_string());
+        };
+        if source.deleted_at_ms.is_some() {
+            return Err("ILK_NOT_FOUND".to_string());
+        }
+        if source.ilk_type.trim() == "system" {
+            return Err("SYSTEM_ILK_PROTECTED".to_string());
+        }
+        // Only a temporary human of this same tenant merges: a complete ilk keeps its channels,
+        // and a merge never moves a channel to another tenant.
+        let holder_is_human = self
+            .ilks
+            .get(&holder_id)
+            .is_some_and(|holder| holder.ilk_type == "human");
+        if req.ilk_type.trim() != "human"
+            || !holder_is_human
+            || source.registration_status != "temporary"
+            || source.tenant_id != req.tenant_id
+        {
+            return Err("DUPLICATE_EMAIL".to_string());
+        }
+        self.merge_temporary_ilk(&req.ilk_id, &holder_id, merge_alias_ttl_secs)?;
+        let holder = self
+            .ilks
+            .get_mut(&holder_id)
+            .ok_or_else(|| "ILK_NOT_FOUND".to_string())?;
+        fill_missing_identification(&mut holder.identification, &req.identification);
+        Ok(json!({
+            "status": "ok",
+            "ilk_id": holder_id,
+            "tenant_id": holder.tenant_id,
+            "registration_status": holder.registration_status,
+            "merged": true,
+            "merged_from_ilk_id": req.ilk_id,
+        }))
+    }
+
+    /// Can the temporary `old_ilk_id` merge into `canonical_ilk_id`?
+    fn check_merge_source(&self, old_ilk_id: &str, canonical_ilk_id: &str) -> Result<(), String> {
+        let _ = parse_prefixed_uuid(old_ilk_id, "ilk")?;
+        if old_ilk_id == canonical_ilk_id {
+            return Err("INVALID_MERGE_SOURCE".to_string());
+        }
+        let source = self
+            .ilks
+            .get(old_ilk_id)
+            .ok_or_else(|| "INVALID_MERGE_SOURCE".to_string())?;
+        if source.deleted_at_ms.is_some() || source.registration_status != "temporary" {
+            return Err("INVALID_MERGE_SOURCE".to_string());
+        }
+        match self.ilks.get(canonical_ilk_id) {
+            Some(canonical) if canonical.deleted_at_ms.is_none() => Ok(()),
+            _ => Err("ILK_NOT_FOUND".to_string()),
+        }
+    }
+
+    /// Merge the temporary `old_ilk_id` into `canonical_ilk_id`: its channels MOVE to the
+    /// canonical ilk (their lookups follow), and it stays as an alias of it for
+    /// `merge_alias_ttl_secs`, after which the alias GC marks it deleted. Validates before it
+    /// mutates.
+    fn merge_temporary_ilk(
+        &mut self,
+        old_ilk_id: &str,
+        canonical_ilk_id: &str,
+        merge_alias_ttl_secs: u64,
+    ) -> Result<(), String> {
+        self.check_merge_source(old_ilk_id, canonical_ilk_id)?;
+        let Some(source) = self.ilks.get_mut(old_ilk_id) else {
+            return Err("INVALID_MERGE_SOURCE".to_string());
+        };
+        let source_tenant_id = source.tenant_id.clone();
+        let moved = std::mem::take(&mut source.channels);
+        for channel in &moved {
+            let key = canonical_ich_key(&channel.channel_type, &channel.address, &source_tenant_id);
+            self.ich_lookup.insert(key, canonical_ilk_id.to_string());
+        }
+        if let Some(canonical) = self.ilks.get_mut(canonical_ilk_id) {
+            for channel in moved {
+                if !canonical
+                    .channels
+                    .iter()
+                    .any(|existing| existing.ich_id == channel.ich_id)
+                {
+                    canonical.channels.push(channel);
+                }
+            }
+        }
+
+        let ttl_ms = merge_alias_ttl_secs.saturating_mul(1000);
+        let expires_at_ms = now_epoch_ms().saturating_add(ttl_ms);
+        self.aliases.insert(
+            old_ilk_id.to_string(),
+            AliasRecord {
+                canonical_ilk_id: canonical_ilk_id.to_string(),
+                expires_at_ms,
+            },
+        );
+        Ok(())
+    }
+
+    /// The alias a merge left for `old_ilk_id`, as it is persisted and replicated.
+    fn alias_snapshot(&self, old_ilk_id: &str) -> Option<AliasSnapshotRecord> {
+        self.aliases
+            .get(old_ilk_id)
+            .map(|alias| AliasSnapshotRecord {
+                old_ilk_id: old_ilk_id.to_string(),
+                canonical_ilk_id: alias.canonical_ilk_id.clone(),
+                expires_at_ms: alias.expires_at_ms,
+            })
     }
 
     fn add_channel(
@@ -1080,13 +1253,17 @@ impl IdentityStore {
 
         let canonical_ilk_id = req.ilk_id.clone();
         let response_ich_id = req.channel.ich_id.clone();
+        match self.ilks.get(&canonical_ilk_id) {
+            Some(target) if target.deleted_at_ms.is_none() => {}
+            _ => return Err("ILK_NOT_FOUND".to_string()),
+        }
+        if let Some(old_ilk) = req.merge_from_ilk_id.as_deref() {
+            self.check_merge_source(old_ilk, &canonical_ilk_id)?;
+        }
         let target = self
             .ilks
             .get_mut(&canonical_ilk_id)
             .ok_or_else(|| "ILK_NOT_FOUND".to_string())?;
-        if target.deleted_at_ms.is_some() {
-            return Err("ILK_NOT_FOUND".to_string());
-        }
 
         let key = canonical_ich_key(
             &req.channel.channel_type,
@@ -1109,52 +1286,8 @@ impl IdentityStore {
             });
         }
 
-        if let Some(old_ilk) = req.merge_from_ilk_id {
-            let _ = parse_prefixed_uuid(&old_ilk, "ilk")?;
-            if old_ilk == canonical_ilk_id {
-                return Err("INVALID_MERGE_SOURCE".to_string());
-            }
-            let source = self
-                .ilks
-                .get(&old_ilk)
-                .ok_or_else(|| "INVALID_MERGE_SOURCE".to_string())?;
-            if source.deleted_at_ms.is_some() || source.registration_status != "temporary" {
-                return Err("INVALID_MERGE_SOURCE".to_string());
-            }
-
-            let source_tenant_id = source.tenant_id.clone();
-            let source_channels = source.channels.clone();
-            let source_keys: Vec<(String, String, String)> = source_channels
-                .iter()
-                .map(|ch| canonical_ich_key(&ch.channel_type, &ch.address, &source_tenant_id))
-                .collect();
-
-            let canonical = self
-                .ilks
-                .get_mut(&canonical_ilk_id)
-                .ok_or_else(|| "ILK_NOT_FOUND".to_string())?;
-            for ch in source_channels {
-                if !canonical
-                    .channels
-                    .iter()
-                    .any(|existing| existing.ich_id == ch.ich_id)
-                {
-                    canonical.channels.push(ch);
-                }
-            }
-            for key in source_keys {
-                self.ich_lookup.insert(key, canonical_ilk_id.clone());
-            }
-
-            let ttl_ms = merge_alias_ttl_secs.saturating_mul(1000);
-            let expires_at_ms = now_epoch_ms().saturating_add(ttl_ms);
-            self.aliases.insert(
-                old_ilk.clone(),
-                AliasRecord {
-                    canonical_ilk_id: canonical_ilk_id.clone(),
-                    expires_at_ms,
-                },
-            );
+        if let Some(old_ilk) = req.merge_from_ilk_id.as_deref() {
+            self.merge_temporary_ilk(old_ilk, &canonical_ilk_id, merge_alias_ttl_secs)?;
         }
 
         Ok(json!({
@@ -2298,18 +2431,12 @@ impl IdentityRuntime {
             MSG_ICH_SET_ENABLED,
             vec!["IO.", "SY.admin@", "SY.architect@", "SY.frontdesk.gov@"],
         );
-        allowed_prefixes.insert(
-            MSG_TNT_CREATE,
-            vec!["SY.admin@", "SY.architect@", "SY.frontdesk.gov@"],
-        );
-        allowed_prefixes.insert(
-            MSG_TNT_UPDATE,
-            vec!["SY.admin@", "SY.architect@", "SY.frontdesk.gov@"],
-        );
-        allowed_prefixes.insert(
-            MSG_TNT_SET_SPONSOR,
-            vec!["SY.admin@", "SY.architect@", "SY.frontdesk.gov@"],
-        );
+        // Tenants come from the operator (SY.admin, which also relays Fluxbee Cloud) and from
+        // Archi. The frontdesk never creates or changes one: a registration goes into the tenant
+        // its case already has (operator decision 2026-10-02).
+        allowed_prefixes.insert(MSG_TNT_CREATE, vec!["SY.admin@", "SY.architect@"]);
+        allowed_prefixes.insert(MSG_TNT_UPDATE, vec!["SY.admin@", "SY.architect@"]);
+        allowed_prefixes.insert(MSG_TNT_SET_SPONSOR, vec!["SY.admin@", "SY.architect@"]);
         allowed_prefixes.insert(MSG_TNT_APPROVE, vec!["SY.admin@"]);
         allowed_prefixes.insert(MSG_ILK_RESTORE, vec!["SY.admin@"]);
         // The orchestrator purges the ilk of a node it kills with purge_instance.
@@ -2338,18 +2465,6 @@ impl IdentityRuntime {
                 .insert(frontdesk_node.clone());
             allowed_exacts
                 .entry(MSG_ICH_SET_ENABLED)
-                .or_default()
-                .insert(frontdesk_node.clone());
-            allowed_exacts
-                .entry(MSG_TNT_CREATE)
-                .or_default()
-                .insert(frontdesk_node.clone());
-            allowed_exacts
-                .entry(MSG_TNT_UPDATE)
-                .or_default()
-                .insert(frontdesk_node.clone());
-            allowed_exacts
-                .entry(MSG_TNT_SET_SPONSOR)
                 .or_default()
                 .insert(frontdesk_node);
         }
@@ -2410,6 +2525,46 @@ impl IdentityRuntime {
         }
         for tenant_id in changes.purged_tenants {
             deltas.push(delta_envelope(IdentityDelta::TenantDelete { tenant_id }));
+        }
+        ok
+    }
+
+    /// Persist (on the primary) the ilks one action changed, with the alias a merge left, in ONE
+    /// transaction, then queue their deltas. A DB error restores `snapshot` and answers the error
+    /// instead of `ok`.
+    async fn commit_ilk_changes(
+        &mut self,
+        deltas: &mut Vec<IdentityDeltaEnvelope>,
+        snapshot: Option<IdentityStore>,
+        ilk_ids: &[String],
+        alias: Option<AliasSnapshotRecord>,
+        context: &str,
+        ok: Value,
+    ) -> Value {
+        let ilks: Vec<IlkRecord> = ilk_ids
+            .iter()
+            .filter_map(|ilk_id| self.store.ilks.get(ilk_id).cloned())
+            .collect();
+        if ilks.is_empty() {
+            return ok;
+        }
+        if self.is_primary {
+            if let Some(database_config) = self.db_config.as_ref() {
+                if let Err(err) =
+                    persist_ilks_state_in_db(database_config, &ilks, alias.as_ref()).await
+                {
+                    if let Some(snapshot) = snapshot {
+                        self.store = snapshot;
+                    }
+                    return db_write_error_payload(context, err.as_ref());
+                }
+            }
+        }
+        for ilk in ilks {
+            deltas.push(delta_envelope(IdentityDelta::IlkUpsert { ilk }));
+        }
+        if let Some(alias) = alias {
+            deltas.push(delta_envelope(IdentityDelta::AliasUpsert { alias }));
         }
         ok
     }
@@ -2644,50 +2799,32 @@ impl IdentityRuntime {
                         } else {
                             None
                         };
-                        match self.store.register_ilk(req) {
+                        match self.store.register_ilk(req, self.merge_alias_ttl_secs) {
                             Ok(ok) => {
-                                if let Some(ilk_id) = ok.get("ilk_id").and_then(Value::as_str) {
-                                    if let Some(ilk) = self.store.ilks.get(ilk_id).cloned() {
-                                        if self.is_primary {
-                                            if let Some(database_config) = self.db_config.as_ref() {
-                                                if let Err(err) = persist_ilk_state_in_db(
-                                                    database_config,
-                                                    &ilk,
-                                                    None,
-                                                )
-                                                .await
-                                                {
-                                                    if let Some(snapshot) = snapshot {
-                                                        self.store = snapshot;
-                                                    }
-                                                    db_write_error_payload(
-                                                        "failed to persist registered ilk",
-                                                        err.as_ref(),
-                                                    )
-                                                } else {
-                                                    deltas.push(delta_envelope(
-                                                        IdentityDelta::IlkUpsert { ilk },
-                                                    ));
-                                                    ok
-                                                }
-                                            } else {
-                                                deltas.push(delta_envelope(
-                                                    IdentityDelta::IlkUpsert { ilk },
-                                                ));
-                                                ok
-                                            }
-                                        } else {
-                                            deltas.push(delta_envelope(IdentityDelta::IlkUpsert {
-                                                ilk,
-                                            }));
-                                            ok
-                                        }
-                                    } else {
-                                        ok
-                                    }
-                                } else {
-                                    ok
-                                }
+                                // A merge by email also changed the temporary ilk it absorbed.
+                                let merged_from = ok
+                                    .get("merged_from_ilk_id")
+                                    .and_then(Value::as_str)
+                                    .map(str::to_string);
+                                let changed: Vec<String> = ok
+                                    .get("ilk_id")
+                                    .and_then(Value::as_str)
+                                    .map(str::to_string)
+                                    .into_iter()
+                                    .chain(merged_from.clone())
+                                    .collect();
+                                let alias = merged_from
+                                    .as_deref()
+                                    .and_then(|old_ilk_id| self.store.alias_snapshot(old_ilk_id));
+                                self.commit_ilk_changes(
+                                    &mut deltas,
+                                    snapshot,
+                                    &changed,
+                                    alias,
+                                    "failed to persist registered ilk",
+                                    ok,
+                                )
+                                .await
                             }
                             Err(code) => error_payload(&code, "failed to register ilk"),
                         }
@@ -2709,73 +2846,27 @@ impl IdentityRuntime {
                             self.merge_alias_ttl_secs,
                         ) {
                             Ok(ok) => {
-                                let alias_delta =
-                                    req.merge_from_ilk_id.as_ref().and_then(|old_ilk_id| {
-                                        self.store.aliases.get(old_ilk_id).map(|alias| {
-                                            AliasSnapshotRecord {
-                                                old_ilk_id: old_ilk_id.clone(),
-                                                canonical_ilk_id: alias.canonical_ilk_id.clone(),
-                                                expires_at_ms: alias.expires_at_ms,
-                                            }
-                                        })
-                                    });
-                                if let Some(ilk_id) = ok.get("ilk_id").and_then(Value::as_str) {
-                                    if let Some(ilk) = self.store.ilks.get(ilk_id).cloned() {
-                                        if self.is_primary {
-                                            if let Some(database_config) = self.db_config.as_ref() {
-                                                if let Err(err) = persist_ilk_state_in_db(
-                                                    database_config,
-                                                    &ilk,
-                                                    alias_delta.as_ref(),
-                                                )
-                                                .await
-                                                {
-                                                    if let Some(snapshot) = snapshot {
-                                                        self.store = snapshot;
-                                                    }
-                                                    db_write_error_payload(
-                                                        "failed to persist channel/merge update",
-                                                        err.as_ref(),
-                                                    )
-                                                } else {
-                                                    deltas.push(delta_envelope(
-                                                        IdentityDelta::IlkUpsert { ilk },
-                                                    ));
-                                                    if let Some(alias) = alias_delta {
-                                                        deltas.push(delta_envelope(
-                                                            IdentityDelta::AliasUpsert { alias },
-                                                        ));
-                                                    }
-                                                    ok
-                                                }
-                                            } else {
-                                                deltas.push(delta_envelope(
-                                                    IdentityDelta::IlkUpsert { ilk },
-                                                ));
-                                                if let Some(alias) = alias_delta {
-                                                    deltas.push(delta_envelope(
-                                                        IdentityDelta::AliasUpsert { alias },
-                                                    ));
-                                                }
-                                                ok
-                                            }
-                                        } else {
-                                            deltas.push(delta_envelope(IdentityDelta::IlkUpsert {
-                                                ilk,
-                                            }));
-                                            if let Some(alias) = alias_delta {
-                                                deltas.push(delta_envelope(
-                                                    IdentityDelta::AliasUpsert { alias },
-                                                ));
-                                            }
-                                            ok
-                                        }
-                                    } else {
-                                        ok
-                                    }
-                                } else {
-                                    ok
-                                }
+                                // A merge also changed the temporary ilk it absorbed.
+                                let changed: Vec<String> = ok
+                                    .get("ilk_id")
+                                    .and_then(Value::as_str)
+                                    .map(str::to_string)
+                                    .into_iter()
+                                    .chain(req.merge_from_ilk_id.clone())
+                                    .collect();
+                                let alias = req
+                                    .merge_from_ilk_id
+                                    .as_deref()
+                                    .and_then(|old_ilk_id| self.store.alias_snapshot(old_ilk_id));
+                                self.commit_ilk_changes(
+                                    &mut deltas,
+                                    snapshot,
+                                    &changed,
+                                    alias,
+                                    "failed to persist channel/merge update",
+                                    ok,
+                                )
+                                .await
                             }
                             Err(code) => error_payload(&code, "failed to add channel"),
                         }
@@ -4189,6 +4280,43 @@ fn identification_str<'a>(identification: &'a Value, key: &str) -> Option<&'a st
         .and_then(Value::as_str)
         .map(str::trim)
         .filter(|value| !value.is_empty())
+}
+
+/// Merge of a registration into an ilk that already has identification data: fill what `target`
+/// lacks from `incoming` and never overwrite a value already there. Objects merge key by key; a
+/// value is missing when it is absent, null, a blank string or an empty object or list.
+fn fill_missing_identification(target: &mut Value, incoming: &Value) {
+    if target.is_null() {
+        *target = json!({});
+    }
+    let (Some(target), Some(incoming)) = (target.as_object_mut(), incoming.as_object()) else {
+        return;
+    };
+    for (key, value) in incoming {
+        if identification_value_is_empty(value) {
+            continue;
+        }
+        match target.get_mut(key) {
+            Some(existing) if !identification_value_is_empty(existing) => {
+                if existing.is_object() && value.is_object() {
+                    fill_missing_identification(existing, value);
+                }
+            }
+            _ => {
+                target.insert(key.clone(), value.clone());
+            }
+        }
+    }
+}
+
+fn identification_value_is_empty(value: &Value) -> bool {
+    match value {
+        Value::Null => true,
+        Value::String(text) => text.trim().is_empty(),
+        Value::Object(map) => map.is_empty(),
+        Value::Array(items) => items.is_empty(),
+        _ => false,
+    }
 }
 
 fn sync_identity_shm_mappings(
@@ -6576,6 +6704,61 @@ async fn persist_ilk_state_in_db(
     ilk: &IlkRecord,
     alias: Option<&AliasSnapshotRecord>,
 ) -> Result<(), IdentityError> {
+    persist_ilks_state_in_db(database_config, std::slice::from_ref(ilk), alias).await
+}
+
+/// Upsert ilks (their row and ICH rows) and the alias a merge left, in ONE transaction: a merge
+/// moves ICH rows from the temporary ilk to the canonical one, so it lands whole or not at all.
+async fn persist_ilks_state_in_db(
+    database_config: &PgConfig,
+    ilks: &[IlkRecord],
+    alias: Option<&AliasSnapshotRecord>,
+) -> Result<(), IdentityError> {
+    let (mut client, connection) = database_config.connect(NoTls).await?;
+    tokio::spawn(async move {
+        if let Err(err) = connection.await {
+            tracing::warn!(error = %err, "identity ilk persist postgres connection closed");
+        }
+    });
+
+    let tx = client.transaction().await?;
+    for ilk in ilks {
+        upsert_ilk_rows(&tx, ilk).await?;
+    }
+
+    if let Some(alias_record) = alias {
+        let old_uuid = parse_prefixed_uuid(&alias_record.old_ilk_id, "ilk")?.to_string();
+        let canonical_uuid =
+            parse_prefixed_uuid(&alias_record.canonical_ilk_id, "ilk")?.to_string();
+        let expires_at_ms = i64::try_from(alias_record.expires_at_ms)
+            .map_err(|_| "alias expires_at_ms overflow")?;
+        tx.execute(
+            r#"
+INSERT INTO identity_ilk_aliases (old_ilk_id, canonical_ilk_id, expires_at)
+VALUES (
+    $1::text::uuid,
+    $2::text::uuid,
+    to_timestamp(($3::BIGINT)::DOUBLE PRECISION / 1000.0)
+)
+ON CONFLICT (old_ilk_id) DO UPDATE
+SET
+    canonical_ilk_id = EXCLUDED.canonical_ilk_id,
+    expires_at = EXCLUDED.expires_at
+"#,
+            &[&old_uuid, &canonical_uuid, &expires_at_ms],
+        )
+        .await?;
+    }
+
+    tx.commit().await?;
+    Ok(())
+}
+
+/// One ilk's row and its ICH rows (an ICH row follows its channel to whichever ilk holds it now).
+async fn upsert_ilk_rows(
+    tx: &tokio_postgres::Transaction<'_>,
+    ilk: &IlkRecord,
+) -> Result<(), IdentityError> {
     let ilk_uuid = parse_prefixed_uuid(&ilk.ilk_id, "ilk")?.to_string();
     let tenant_uuid = parse_prefixed_uuid(&ilk.tenant_id, "tnt")?.to_string();
     let email = optional_identification_string(&ilk.identification, "email", 256)?;
@@ -6587,14 +6770,6 @@ async fn persist_ilk_state_in_db(
         .and_then(|value| i64::try_from(value).ok());
     let registered_by: Option<String> = None;
 
-    let (mut client, connection) = database_config.connect(NoTls).await?;
-    tokio::spawn(async move {
-        if let Err(err) = connection.await {
-            tracing::warn!(error = %err, "identity ilk persist postgres connection closed");
-        }
-    });
-
-    let tx = client.transaction().await?;
     tx.execute(
         r#"
 INSERT INTO identity_ilks (
@@ -6707,32 +6882,6 @@ SET
             .await?;
         }
     }
-
-    if let Some(alias_record) = alias {
-        let old_uuid = parse_prefixed_uuid(&alias_record.old_ilk_id, "ilk")?.to_string();
-        let canonical_uuid =
-            parse_prefixed_uuid(&alias_record.canonical_ilk_id, "ilk")?.to_string();
-        let expires_at_ms = i64::try_from(alias_record.expires_at_ms)
-            .map_err(|_| "alias expires_at_ms overflow")?;
-        tx.execute(
-            r#"
-INSERT INTO identity_ilk_aliases (old_ilk_id, canonical_ilk_id, expires_at)
-VALUES (
-    $1::text::uuid,
-    $2::text::uuid,
-    to_timestamp(($3::BIGINT)::DOUBLE PRECISION / 1000.0)
-)
-ON CONFLICT (old_ilk_id) DO UPDATE
-SET
-    canonical_ilk_id = EXCLUDED.canonical_ilk_id,
-    expires_at = EXCLUDED.expires_at
-"#,
-            &[&old_uuid, &canonical_uuid, &expires_at_ms],
-        )
-        .await?;
-    }
-
-    tx.commit().await?;
     Ok(())
 }
 
@@ -7666,9 +7815,21 @@ mod tests {
 
         assert!(runtime.is_authorized(MSG_ILK_REGISTER, Some("SY.frontdesk.gov@motherbee")));
         assert!(runtime.is_authorized(MSG_ILK_ADD_CHANNEL, Some("SY.frontdesk.gov@motherbee")));
-        assert!(runtime.is_authorized(MSG_TNT_CREATE, Some("SY.frontdesk.gov@motherbee")));
         assert!(runtime.is_authorized(MSG_TNT_CREATE, Some("SY.admin@motherbee")));
         assert!(runtime.is_authorized(MSG_TNT_CREATE, Some("SY.architect@motherbee")));
+    }
+
+    #[test]
+    fn identity_runtime_never_lets_the_frontdesk_create_or_change_a_tenant() {
+        let hive = test_hive(Some("SY.frontdesk.gov@motherbee"));
+        let runtime = IdentityRuntime::new(&hive, PathBuf::from("/tmp"), true, None);
+
+        for action in [MSG_TNT_CREATE, MSG_TNT_UPDATE, MSG_TNT_SET_SPONSOR] {
+            assert!(
+                !runtime.is_authorized(action, Some("SY.frontdesk.gov@motherbee")),
+                "{action}"
+            );
+        }
     }
 
     #[test]
@@ -9324,12 +9485,15 @@ mod tests {
             },
         );
         let err = store
-            .register_ilk(IlkRegisterRequest {
-                ilk_id: "ilk:33333333-3333-3333-3333-333333333333".to_string(),
-                ilk_type: "agent".to_string(),
-                tenant_id: LC_TENANT.to_string(),
-                identification: json!({"node_name": "AI.bot@motherbee"}),
-            })
+            .register_ilk(
+                IlkRegisterRequest {
+                    ilk_id: "ilk:33333333-3333-3333-3333-333333333333".to_string(),
+                    ilk_type: "agent".to_string(),
+                    tenant_id: LC_TENANT.to_string(),
+                    identification: json!({"node_name": "AI.bot@motherbee"}),
+                },
+                MERGE_TTL_SECS,
+            )
             .expect_err("node_name reserved");
         assert_eq!(err, "ILK_DELETED");
     }
@@ -9465,5 +9629,382 @@ mod tests {
         assert!(!delta_authorized_for_hive(&delta, "worker1", &store));
         store.apply_delta(delta);
         assert!(!store.tenants.contains_key(LC_TENANT));
+    }
+
+    // ---- ILK_REGISTER: active tenants only, and merge by email (operator, 2026-10-02) ----
+
+    const MERGE_TTL_SECS: u64 = 3600;
+    const OTHER_TENANT: &str = "tnt:22222222-2222-2222-2222-222222222222";
+
+    fn rg_store() -> IdentityStore {
+        let mut store = lc_store_with_tenant();
+        store.tenants.insert(
+            OTHER_TENANT.to_string(),
+            TenantRecord {
+                tenant_id: OTHER_TENANT.to_string(),
+                name: "Other".to_string(),
+                domain: None,
+                status: "active".to_string(),
+                settings: json!({}),
+                sponsor_tenant_id: None,
+                deleted_at_ms: None,
+            },
+        );
+        store
+    }
+
+    fn rg_provision(
+        store: &mut IdentityStore,
+        tenant_id: &str,
+        channel: &str,
+        address: &str,
+    ) -> String {
+        let out = store
+            .provision_temporary_ilk(IlkProvisionRequest {
+                ich_id: format!("ich:{}", Uuid::new_v4()),
+                channel_type: channel.to_string(),
+                address: address.to_string(),
+                tenant_id: Some(tenant_id.to_string()),
+                ilk_type: None,
+            })
+            .expect("provision");
+        out["ilk_id"].as_str().expect("ilk_id").to_string()
+    }
+
+    fn rg_register(
+        store: &mut IdentityStore,
+        ilk_id: &str,
+        tenant_id: &str,
+        identification: Value,
+    ) -> Result<Value, String> {
+        store.register_ilk(
+            IlkRegisterRequest {
+                ilk_id: ilk_id.to_string(),
+                ilk_type: "human".to_string(),
+                tenant_id: tenant_id.to_string(),
+                identification,
+            },
+            MERGE_TTL_SECS,
+        )
+    }
+
+    /// Ana, registered through the cloud channel of LC_TENANT.
+    fn rg_with_ana(store: &mut IdentityStore) -> String {
+        let ana = rg_provision(store, LC_TENANT, "cloud", "ana@acme.com");
+        let reply = rg_register(
+            store,
+            &ana,
+            LC_TENANT,
+            json!({"display_name": "Ana Perez", "email": "ana@acme.com", "phone": "",
+                   "attributes": {"crm_id": "c-1"}}),
+        )
+        .expect("first registration");
+        assert_eq!(reply["merged"], false);
+        ana
+    }
+
+    #[test]
+    fn register_refuses_a_tenant_that_is_not_active() {
+        for (status, code) in [
+            ("pending", "TENANT_PENDING"),
+            ("suspended", "TENANT_SUSPENDED"),
+        ] {
+            let mut store = rg_store();
+            let temp = rg_provision(&mut store, LC_TENANT, "slack", "U1");
+            store.tenants.get_mut(LC_TENANT).unwrap().status = status.to_string();
+            let err = rg_register(&mut store, &temp, LC_TENANT, json!({"email": "a@acme.com"}))
+                .expect_err(status);
+            assert_eq!(err, code);
+            assert_eq!(store.ilks[&temp].registration_status, "temporary");
+        }
+        let mut store = rg_store();
+        let temp = rg_provision(&mut store, LC_TENANT, "slack", "U1");
+        store.tenants.get_mut(LC_TENANT).unwrap().deleted_at_ms = Some(1);
+        let err = rg_register(&mut store, &temp, LC_TENANT, json!({"email": "a@acme.com"}))
+            .expect_err("deleted");
+        assert_eq!(err, "TENANT_DELETED");
+    }
+
+    #[test]
+    fn register_with_a_registered_email_merges_into_that_ilk() {
+        let mut store = rg_store();
+        let ana = rg_with_ana(&mut store);
+        // Ana writes from WhatsApp: a new temporary ilk, registered with the same email.
+        let temp = rg_provision(&mut store, LC_TENANT, "whatsapp", "+5491100000001");
+        let reply = rg_register(
+            &mut store,
+            &temp,
+            LC_TENANT,
+            json!({"display_name": "Ana P", "email": "ana@acme.com", "phone": "+5491100000001",
+                   "company_name": "Acme", "attributes": {"crm_id": "c-2", "plan": "pro"}}),
+        )
+        .expect("merge");
+        assert_eq!(reply["status"], "ok");
+        assert_eq!(reply["ilk_id"], ana.as_str());
+        assert_eq!(reply["tenant_id"], LC_TENANT);
+        assert_eq!(reply["registration_status"], "complete");
+        assert_eq!(reply["merged"], true);
+        assert_eq!(reply["merged_from_ilk_id"], temp.as_str());
+
+        // The registered ilk keeps its id and its data, and only gains what it lacked.
+        let registered = &store.ilks[&ana];
+        assert_eq!(registered.registration_status, "complete");
+        assert_eq!(registered.identification["display_name"], "Ana Perez");
+        assert_eq!(registered.identification["phone"], "+5491100000001");
+        assert_eq!(registered.identification["company_name"], "Acme");
+        assert_eq!(
+            registered.identification["attributes"],
+            json!({"crm_id": "c-1", "plan": "pro"})
+        );
+        // The WhatsApp channel moved to her and resolves to her.
+        assert!(registered
+            .channels
+            .iter()
+            .any(|ch| ch.address == "+5491100000001"));
+        assert!(store.ilks[&temp].channels.is_empty());
+        let key = canonical_ich_key("whatsapp", "+5491100000001", LC_TENANT);
+        assert_eq!(store.ich_lookup[&key], ana);
+        // The temporary ilk stays, empty, as an alias of hers until the alias GC.
+        assert_eq!(store.ilks[&temp].registration_status, "temporary");
+        assert_eq!(store.ilks[&temp].identification, json!({}));
+        assert_eq!(store.aliases[&temp].canonical_ilk_id, ana);
+    }
+
+    #[test]
+    fn a_merge_reaches_replicas_and_full_syncs_with_the_channel_on_the_registered_ilk() {
+        let mut primary = rg_store();
+        let ana = rg_with_ana(&mut primary);
+        let temp = rg_provision(&mut primary, LC_TENANT, "slack", "U777");
+        let mut replica = primary.clone();
+        rg_register(
+            &mut primary,
+            &temp,
+            LC_TENANT,
+            json!({"email": "ana@acme.com"}),
+        )
+        .expect("merge");
+
+        // What the ILK_REGISTER handler replicates: both ilks, then the alias.
+        for delta in [
+            IdentityDelta::IlkUpsert {
+                ilk: primary.ilks[&ana].clone(),
+            },
+            IdentityDelta::IlkUpsert {
+                ilk: primary.ilks[&temp].clone(),
+            },
+            IdentityDelta::AliasUpsert {
+                alias: primary.alias_snapshot(&temp).expect("alias"),
+            },
+        ] {
+            replica.apply_delta(delta);
+        }
+        let key = canonical_ich_key("slack", "U777", LC_TENANT);
+        assert_eq!(replica.ich_lookup[&key], ana);
+        assert_eq!(replica.aliases[&temp].canonical_ilk_id, ana);
+
+        // A cold replica rebuilds its lookup from the ilks: only Ana holds the channel.
+        let rebuilt = IdentityStore::from_full_sync_chunks(&primary.build_full_sync_chunks(2))
+            .expect("full sync");
+        assert_eq!(rebuilt.ich_lookup[&key], ana);
+        let holders = rebuilt
+            .ilks
+            .values()
+            .filter(|ilk| ilk.channels.iter().any(|ch| ch.address == "U777"))
+            .count();
+        assert_eq!(holders, 1);
+    }
+
+    #[test]
+    fn a_registered_email_that_cannot_merge_is_a_duplicate_and_changes_nothing() {
+        let mut store = rg_store();
+        let ana = rg_with_ana(&mut store);
+        // A complete ilk does not give up its channels.
+        let bob = rg_provision(&mut store, LC_TENANT, "slack", "UBOB");
+        rg_register(
+            &mut store,
+            &bob,
+            LC_TENANT,
+            json!({"email": "bob@acme.com"}),
+        )
+        .expect("bob");
+        // A merge never moves a channel to another tenant.
+        let foreign = rg_provision(&mut store, OTHER_TENANT, "slack", "UFOREIGN");
+        let ilks = store.ilks.clone();
+        let lookup = store.ich_lookup.clone();
+
+        for (ilk_id, why) in [
+            (bob.as_str(), "complete ilk"),
+            (foreign.as_str(), "temporary ilk of another tenant"),
+            ("ilk:99999999-9999-4999-8999-999999999999", "new ilk"),
+        ] {
+            let err = rg_register(
+                &mut store,
+                ilk_id,
+                LC_TENANT,
+                json!({"email": "ana@acme.com"}),
+            )
+            .expect_err(why);
+            assert_eq!(err, "DUPLICATE_EMAIL", "{why}");
+        }
+        assert_eq!(store.ilks, ilks);
+        assert_eq!(store.ich_lookup, lookup);
+        assert!(store.aliases.is_empty());
+        assert_eq!(store.ilks[&ana].channels.len(), 1);
+    }
+
+    #[test]
+    fn the_same_email_in_another_tenant_is_another_person() {
+        let mut store = rg_store();
+        let ana = rg_with_ana(&mut store);
+        let other = rg_provision(&mut store, OTHER_TENANT, "slack", "U2");
+        let reply = rg_register(
+            &mut store,
+            &other,
+            OTHER_TENANT,
+            json!({"email": "ana@acme.com"}),
+        )
+        .expect("other tenant");
+        assert_eq!(reply["ilk_id"], other.as_str());
+        assert_eq!(reply["merged"], false);
+        assert_eq!(store.ilks[&other].registration_status, "complete");
+        assert_eq!(store.ilks[&ana].channels.len(), 1);
+    }
+
+    #[test]
+    fn a_marked_ilk_reserves_its_email_only_in_its_tenant() {
+        let mut store = rg_store();
+        let gone = rg_provision(&mut store, OTHER_TENANT, "slack", "UGONE");
+        rg_register(
+            &mut store,
+            &gone,
+            OTHER_TENANT,
+            json!({"email": "zoe@acme.com"}),
+        )
+        .expect("register");
+        store.delete_ilk(lc_ilk(&gone), 5).expect("mark");
+
+        // Reserved in its own tenant...
+        let again = rg_provision(&mut store, OTHER_TENANT, "slack", "UAGAIN");
+        let err = rg_register(
+            &mut store,
+            &again,
+            OTHER_TENANT,
+            json!({"email": "zoe@acme.com"}),
+        )
+        .expect_err("reserved");
+        assert_eq!(err, "ILK_DELETED");
+        // ...and free in any other.
+        let temp = rg_provision(&mut store, LC_TENANT, "slack", "UZOE");
+        let reply = rg_register(
+            &mut store,
+            &temp,
+            LC_TENANT,
+            json!({"email": "zoe@acme.com"}),
+        )
+        .expect("free in another tenant");
+        assert_eq!(reply["ilk_id"], temp.as_str());
+    }
+
+    #[test]
+    fn registering_the_ilk_itself_replaces_its_identification() {
+        // The explicit update: last write wins, unlike the merge, which only fills gaps.
+        let mut store = rg_store();
+        let ana = rg_with_ana(&mut store);
+        let reply = rg_register(
+            &mut store,
+            &ana,
+            LC_TENANT,
+            json!({"display_name": "Ana Maria", "email": "ana@acme.com"}),
+        )
+        .expect("update");
+        assert_eq!(reply["ilk_id"], ana.as_str());
+        assert_eq!(reply["merged"], false);
+        assert_eq!(
+            store.ilks[&ana].identification,
+            json!({"display_name": "Ana Maria", "email": "ana@acme.com"})
+        );
+    }
+
+    #[test]
+    fn node_registration_is_untouched_by_the_email_merge() {
+        let mut store = rg_store();
+        let node = "ilk:33333333-3333-4333-8333-333333333333";
+        let request = |ilk_id: &str| IlkRegisterRequest {
+            ilk_id: ilk_id.to_string(),
+            ilk_type: "agent".to_string(),
+            tenant_id: LC_TENANT.to_string(),
+            identification: json!({"display_name": "AI.bot@motherbee", "node_name": "AI.bot@motherbee"}),
+        };
+        let first = store
+            .register_ilk(request(node), MERGE_TTL_SECS)
+            .expect("node");
+        assert_eq!(first["ilk_id"], node);
+        assert_eq!(first["merged"], false);
+        // A respawn under another requested id keeps the node's ilk (node_name match).
+        let again = store
+            .register_ilk(
+                request("ilk:44444444-4444-4444-8444-444444444444"),
+                MERGE_TTL_SECS,
+            )
+            .expect("respawn");
+        assert_eq!(again["ilk_id"], node);
+        assert_eq!(again["merged"], false);
+        assert!(store.aliases.is_empty());
+    }
+
+    #[test]
+    fn add_channel_merge_moves_the_channels_and_validates_before_it_mutates() {
+        let mut store = rg_store();
+        let ana = rg_with_ana(&mut store);
+        let temp = rg_provision(&mut store, LC_TENANT, "slack", "U9");
+        let request = |merge_from: &str| IlkAddChannelRequest {
+            ilk_id: ana.clone(),
+            channel: ChannelInput {
+                ich_id: "ich:55555555-5555-4555-8555-555555555555".to_string(),
+                channel_type: "email".to_string(),
+                address: "ana@mail.com".to_string(),
+            },
+            merge_from_ilk_id: Some(merge_from.to_string()),
+            change_reason: None,
+        };
+
+        // A bad merge source leaves everything as it was.
+        let ilks = store.ilks.clone();
+        let lookup = store.ich_lookup.clone();
+        let err = store
+            .add_channel(request(&ana), None, MERGE_TTL_SECS)
+            .expect_err("an ilk cannot merge into itself");
+        assert_eq!(err, "INVALID_MERGE_SOURCE");
+        assert_eq!(store.ilks, ilks);
+        assert_eq!(store.ich_lookup, lookup);
+
+        // A good one moves the temporary ilk's channels.
+        store
+            .add_channel(request(&temp), None, MERGE_TTL_SECS)
+            .expect("merge");
+        assert!(store.ilks[&temp].channels.is_empty());
+        let channels = &store.ilks[&ana].channels;
+        assert!(channels.iter().any(|ch| ch.address == "U9"));
+        assert!(channels.iter().any(|ch| ch.address == "ana@mail.com"));
+        assert_eq!(store.aliases[&temp].canonical_ilk_id, ana);
+    }
+
+    #[test]
+    fn fill_missing_identification_never_overwrites_a_value() {
+        let mut target = json!({"display_name": "Ana", "phone": null, "company_name": "  ",
+                                "attributes": {"crm_id": "c-1"}, "tags": []});
+        fill_missing_identification(
+            &mut target,
+            &json!({"display_name": "Other", "phone": "+54", "company_name": "Acme",
+                    "attributes": {"crm_id": "c-2", "plan": "pro"}, "tags": ["vip"], "email": ""}),
+        );
+        assert_eq!(
+            target,
+            json!({"display_name": "Ana", "phone": "+54", "company_name": "Acme",
+                   "attributes": {"crm_id": "c-1", "plan": "pro"}, "tags": ["vip"]})
+        );
+        let mut empty = Value::Null;
+        fill_missing_identification(&mut empty, &json!({"email": "ana@acme.com"}));
+        assert_eq!(empty, json!({"email": "ana@acme.com"}));
     }
 }

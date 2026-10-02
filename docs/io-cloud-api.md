@@ -593,13 +593,18 @@ post '{"op":"register_human","tenant_id":"tnt:94cd37b8-…",
 ```json
 {"status":"ok","op":"register_human","request_id":"44444444-…",
  "handled_by":"IO.cloud@motherbee","ich":"ich:14b66389-…",
- "ilk_id":"ilk:<el ilk humano creado>","registration_status":"complete",
- "success":true,"human_message":"…"}
+ "ilk_id":"ilk:<el ilk humano>","registration_status":"complete",
+ "success":true,"merged":false,"human_message":"…"}
 ```
 
-Si el frontdesk no puede registrar → `status:"error"`, `success:false`, `error_code` + `human_message`,
-y el ilk queda `temporary`. **Es idempotente:** repetir el mismo `register_human` de un humano ya
-registrado vuelve a dar éxito (no duplica el ilk).
+- **`ilk_id` es el ILK donde quedó la persona.** Si el email ya era de otra persona del mismo
+  tenant, SY.identity hace el merge: el canal pasa a ese ILK y se completan solo los datos que le
+  faltaban. Entonces `ilk_id` es ese ILK existente, `merged:true`, y `merged_from_ilk_id` trae el
+  temporal que provisionó io.cloud, que queda como alias.
+- **Si el frontdesk no puede registrar:** `status:"error"`, `success:false`, `error_code` y
+  `human_message`. El ilk queda `temporary`.
+- **Es idempotente:** repetir el mismo `register_human` de un humano ya registrado vuelve a dar
+  éxito y no duplica el ilk. La identificación que manda reemplaza a la anterior: gana lo último.
 
 **Errores — `register_human`:**
 

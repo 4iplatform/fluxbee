@@ -21,16 +21,16 @@ use fluxbee_sdk::protocol::{
 use fluxbee_sdk::{
     managed_node_name, IdentityError, NodeConfig, NodeUuidMode, OperationalRouteProfile,
     RouteMatch, RouteTarget, RouterDispatcher, RpcError, VaultCallerOwned, VaultClient,
+    MSG_ILK_REGISTER,
 };
-use fluxbee_sdk::{MSG_ILK_REGISTER, MSG_TNT_CREATE};
 use gov_common::{
     frontdesk_contract::{
         frontdesk_result_payload, parse_frontdesk_handoff_payload, FrontdeskHandoffPayload,
         FrontdeskResultPayload,
     },
     gov_identity_config_from_env, identity_error_is_transient, identity_error_log_summary,
-    identity_error_to_tool_payload, looks_like_tenant_id, resolve_tenant_id_for_register,
-    tenant_resolution_source, GovIdentityConfig, GOV_IDENTITY_TENANT_ID_ENV,
+    identity_error_to_tool_payload, resolve_case_tenant, GovIdentityConfig, CASE_TENANT_MISMATCH,
+    CASE_TENANT_MISSING,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -94,7 +94,7 @@ STRICT NO-LOOP RULE:
     b) If tool returns status=ok:
        - set status=completed
        - call thread_state_put
-       - send final success message
+       - send final success message (if merged=true: the person was already registered with that email, and this channel is now linked to that registration)
        - stop (do not ask confirmation again)
     c) If tool returns status=error:
        - set status=completed_error
@@ -215,8 +215,6 @@ struct RunnerModelSettings {
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 struct EffectiveConfigDocument {
-    #[serde(default)]
-    tenant_id: Option<String>,
     #[serde(default)]
     node: Option<EffectiveNodeSection>,
     #[serde(default)]
@@ -379,10 +377,84 @@ struct GenericAiNode {
     immediate_memory_store: Option<Arc<ImmediateMemoryStore>>,
     gov_identity: GovIdentityConfig,
     gov_identity_bridge: Option<Arc<GovIdentityBridge>>,
+    /// Where the tenant of a case comes from: the tenant SY.identity holds for its ILK.
+    ilk_tenant: IlkTenantLookup,
     /// Vault accessor over the canonical `Arc<RouterDispatcher>`.
     /// `None` when `self_ilk_id` / hive suffix is missing (degraded boot).
     vault: Option<VaultClient>,
     control_plane: Arc<RwLock<ControlPlaneState>>,
+}
+
+/// The tenant SY.identity holds for an ILK, `None` when it cannot be read. Production reads the
+/// identity SHM (`identity_shm_ilk_tenant`); tests stub it.
+type IlkTenantLookup = Arc<dyn Fn(&str) -> Option<String> + Send + Sync>;
+
+/// Reads the identity SHM of this node's hive, which SY.identity writes before it answers the
+/// ILK_PROVISION that created the temporary ILK.
+fn identity_shm_ilk_tenant(node_name: &str) -> IlkTenantLookup {
+    let hive_id = node_name
+        .split('@')
+        .nth(1)
+        .map(str::trim)
+        .filter(|hive_id| !hive_id.is_empty())
+        .map(ToString::to_string);
+    Arc::new(move |ilk_id: &str| {
+        let hive_id = hive_id.as_deref()?;
+        match fluxbee_sdk::identity::list_ilks_from_hive_id(hive_id) {
+            Ok(snapshot) => snapshot
+                .ilks
+                .into_iter()
+                .find(|ilk| ilk.ilk_id == ilk_id)
+                .map(|ilk| ilk.tenant_id),
+            Err(err) => {
+                tracing::warn!(
+                    ilk_id,
+                    error = %err,
+                    "identity SHM unreadable: the tenant of the case is unknown"
+                );
+                None
+            }
+        }
+    })
+}
+
+/// The tenant of a case (`resolve_case_tenant`): the one its ILK has, checked against the tenant a
+/// handoff informed.
+fn case_tenant_of(
+    ilk_tenant: &IlkTenantLookup,
+    src_ilk: Option<&str>,
+    informed_tenant: Option<&str>,
+) -> Result<String, &'static str> {
+    let tenant = src_ilk
+        .map(str::trim)
+        .filter(|ilk_id| !ilk_id.is_empty())
+        .and_then(|ilk_id| ilk_tenant(ilk_id));
+    resolve_case_tenant(tenant.as_deref(), informed_tenant)
+}
+
+/// The tool's answer when the tenant of the case is unknown or contradicted: no ILK_REGISTER is
+/// sent and no tenant is created.
+fn case_tenant_error_payload(error_code: &str) -> Value {
+    let message = if error_code == CASE_TENANT_MISMATCH {
+        "the tenant informed with the case is not the tenant of its ILK; nothing was registered"
+    } else {
+        "the tenant of the case is unknown (its ILK's tenant could not be read); nothing was registered and no tenant was created"
+    };
+    json!({
+        "status": "error",
+        "error_code": error_code,
+        "message": message,
+        "retryable": false
+    })
+}
+
+fn missing_src_ilk_payload() -> Value {
+    json!({
+        "status": "error",
+        "error_code": "missing_src_ilk",
+        "message": "src_ilk is required",
+        "retryable": false
+    })
 }
 
 struct GovIdentityBridge {
@@ -596,22 +668,22 @@ struct IlkRegisterIdentityCandidate {
     /// ilk's free-form JSONB `identification.attributes` — future ad-hoc fields go here.
     #[serde(default)]
     attributes: Option<Value>,
-    #[serde(default)]
-    tenant_hint: Option<String>,
 }
 
+/// What the LLM (or the handoff path) passes. No tenant: it is the case's, never the person's.
 #[derive(Debug, Clone, Deserialize)]
 struct IlkRegisterArgs {
     src_ilk: String,
     identity_candidate: IlkRegisterIdentityCandidate,
-    #[serde(default)]
-    tenant_id: Option<String>,
 }
 
 #[derive(Clone)]
 struct IlkRegisterTool {
     scoped_src_ilk: Option<String>,
-    default_tenant_id: Option<String>,
+    /// The tenant a `frontdesk_handoff` informed; it only has to agree with the ILK's tenant.
+    /// `None` on the conversational path.
+    informed_tenant_id: Option<String>,
+    ilk_tenant: IlkTenantLookup,
     identity: GovIdentityConfig,
     bridge: Option<Arc<GovIdentityBridge>>,
 }
@@ -1316,9 +1388,11 @@ impl GenericAiNode {
         registry: &mut FunctionToolRegistry,
         ctx: &BehaviorContext,
     ) -> fluxbee_ai_sdk::Result<()> {
+        // Conversational: the tenant is only the ILK's (the thread state is the LLM's to write).
         let tool = IlkRegisterTool {
             scoped_src_ilk: ctx.src_ilk.clone(),
-            default_tenant_id: self.resolve_effective_tenant_id(),
+            informed_tenant_id: None,
+            ilk_tenant: self.ilk_tenant.clone(),
             identity: self.gov_identity.clone(),
             bridge: self.gov_identity_bridge.clone(),
         };
@@ -1453,17 +1527,40 @@ impl GenericAiNode {
                     .as_ref()
                     .and_then(|state| state.collected.company_name.clone())
             });
-        let tenant_id = handoff
+        // The tenant of the case is the one SY.identity holds for its ILK; the handoff's tenant_id
+        // only has to agree with it. Without one, nothing is registered and no tenant is created.
+        let informed_tenant_id = handoff
             .tenant_id
             .as_deref()
             .map(str::trim)
             .filter(|value| !value.is_empty())
-            .map(ToString::to_string)
-            .or_else(|| {
-                previous_state
-                    .as_ref()
-                    .and_then(|state| state.tenant_id.clone())
-            });
+            .map(ToString::to_string);
+        let tenant_id = match case_tenant_of(
+            &self.ilk_tenant,
+            ctx.src_ilk.as_deref(),
+            informed_tenant_id.as_deref(),
+        ) {
+            Ok(tenant_id) => tenant_id,
+            Err(error_code) => {
+                // Without src_ilk there is no case at all: that is an invalid request.
+                let error = if ctx.src_ilk.is_some() {
+                    case_tenant_error_payload(error_code)
+                } else {
+                    missing_src_ilk_payload()
+                };
+                tracing::warn!(
+                    node_name = %self.node_name,
+                    trace_id = %msg.routing.trace_id,
+                    src_ilk = ?ctx.src_ilk,
+                    informed_tenant_id = ?informed_tenant_id,
+                    error_code = error["error_code"].as_str().unwrap_or_default(),
+                    "frontdesk handoff: no tenant for the case (ilk NOT registered, no tenant created)"
+                );
+                let result =
+                    build_frontdesk_result_from_register_response(&error, ctx.src_ilk.clone());
+                return build_frontdesk_result_reply(msg, result);
+            }
+        };
 
         // Merge free-form attributes across turns, symmetric with company_name: current handoff
         // wins, else recover from the partial state collected on an earlier (incomplete) turn.
@@ -1478,7 +1575,7 @@ impl GenericAiNode {
             tracing::info!(
                 node_name = %self.node_name,
                 trace_id = %msg.routing.trace_id,
-                tenant_id = ?tenant_id,
+                tenant_id = %tenant_id,
                 missing = ?missing_fields,
                 has_name = name.is_some(),
                 has_email = email.is_some(),
@@ -1493,7 +1590,7 @@ impl GenericAiNode {
                     company_name,
                     attributes,
                 },
-                tenant_id: tenant_id.clone(),
+                tenant_id: Some(tenant_id.clone()),
                 registration_status: previous_state
                     .as_ref()
                     .and_then(|state| state.registration_status.clone())
@@ -1509,14 +1606,15 @@ impl GenericAiNode {
             );
             payload.missing_fields = missing_fields;
             payload.ilk_id = ctx.src_ilk.clone();
-            payload.tenant_id = tenant_id;
+            payload.tenant_id = Some(tenant_id);
             payload.registration_status = Some("temporary".to_string());
             return build_frontdesk_result_reply(msg, payload);
         }
 
         let tool = IlkRegisterTool {
             scoped_src_ilk: ctx.src_ilk.clone(),
-            default_tenant_id: self.resolve_effective_tenant_id(),
+            informed_tenant_id,
+            ilk_tenant: self.ilk_tenant.clone(),
             identity: self.gov_identity.clone(),
             bridge: self.gov_identity_bridge.clone(),
         };
@@ -1533,18 +1631,18 @@ impl GenericAiNode {
                 "email": registered_email,
                 "phone": phone,
                 "company_name": company_name,
-                "attributes": attributes,
-                "tenant_hint": Value::Null
-            },
-            "tenant_id": tenant_id
+                "attributes": attributes
+            }
         });
         let register_payload = tool.call(register_arguments).await?;
-        let result =
+        let mut result =
             build_frontdesk_result_from_register_response(&register_payload, ctx.src_ilk.clone());
         if result.status == "ok" {
             tracing::info!(
                 node_name = %self.node_name,
                 trace_id = %msg.routing.trace_id,
+                result_code = %result.result_code,
+                src_ilk = ?ctx.src_ilk,
                 ilk_id = ?result.ilk_id,
                 tenant_id = ?result.tenant_id,
                 registration_status = ?result.registration_status,
@@ -1552,6 +1650,7 @@ impl GenericAiNode {
             );
             self.delete_frontdesk_thread_state(ctx).await?;
         } else {
+            result.tenant_id.get_or_insert_with(|| tenant_id.clone());
             // error_detail is not logged: it carries SY.identity's message, which can echo the
             // submitted identification.
             tracing::warn!(
@@ -1571,7 +1670,8 @@ impl GenericAiNode {
                     company_name,
                     attributes,
                 },
-                tenant_id: result.tenant_id.clone(),
+                // The case keeps its tenant, so a retried handoff still reports it.
+                tenant_id: Some(tenant_id),
                 registration_status: result.registration_status.clone(),
                 register_attempted: true,
                 register_error: Some(FrontdeskRegisterErrorState {
@@ -1835,20 +1935,6 @@ impl GenericAiNode {
                 "frontdesk-gov AI vault secret changed but no usable api_key → degraded (Unconfigured)"
             );
         }
-    }
-
-    fn resolve_effective_tenant_id(&self) -> Option<String> {
-        let Ok(state) = self.control_plane.try_read() else {
-            return None;
-        };
-        state
-            .effective_config
-            .as_ref()
-            .and_then(|v| v.get("tenant_id"))
-            .and_then(Value::as_str)
-            .map(str::trim)
-            .filter(|v| looks_like_tenant_id(v))
-            .map(ToString::to_string)
     }
 
     async fn handle_control_plane(&self, msg: Message) -> fluxbee_ai_sdk::Result<Option<Message>> {
@@ -2180,19 +2266,13 @@ fn env_bool(key: &str, default: bool) -> bool {
         .unwrap_or(default)
 }
 
-fn env_nonempty(key: &str) -> Option<String> {
-    std::env::var(key)
-        .ok()
-        .map(|v| v.trim().to_string())
-        .filter(|v| !v.is_empty())
-}
-
 #[async_trait]
 impl FunctionTool for IlkRegisterTool {
     fn definition(&self) -> FunctionToolDefinition {
         FunctionToolDefinition {
             name: "ilk_register".to_string(),
-            description: "Register identity completion for a temporary ILK.".to_string(),
+            description: "Register the person of this conversation (its temporary ILK) in SY.identity. The organization (tenant) comes with the case: never ask for one."
+                .to_string(),
             parameters_json_schema: json!({
                 "type": "object",
                 "properties": {
@@ -2204,13 +2284,11 @@ impl FunctionTool for IlkRegisterTool {
                             "email": { "type": "string", "minLength": 3 },
                             "phone": { "type": "string" },
                             "company_name": { "type": "string" },
-                            "attributes": { "type": "object" },
-                            "tenant_hint": { "type": "string" }
+                            "attributes": { "type": "object" }
                         },
                         "required": ["name", "email"],
-                        "additionalProperties": true
-                    },
-                    "tenant_id": { "type": "string" }
+                        "additionalProperties": false
+                    }
                 },
                 "required": ["src_ilk", "identity_candidate"],
                 "additionalProperties": false
@@ -2228,12 +2306,7 @@ impl FunctionTool for IlkRegisterTool {
         let src_ilk_owned = self.scoped_src_ilk.clone().unwrap_or(args.src_ilk);
         let src_ilk = src_ilk_owned.trim();
         if src_ilk.is_empty() {
-            return Ok(json!({
-                "status": "error",
-                "error_code": "missing_src_ilk",
-                "message": "src_ilk is required",
-                "retryable": false
-            }));
+            return Ok(missing_src_ilk_payload());
         }
 
         if args.identity_candidate.name.trim().is_empty()
@@ -2247,115 +2320,29 @@ impl FunctionTool for IlkRegisterTool {
             }));
         }
 
-        let explicit_tenant = args.tenant_id.as_deref().map(str::trim);
-        let tenant_hint = args
-            .identity_candidate
-            .tenant_hint
-            .as_deref()
-            .map(str::trim);
-        let cfg_tenant = self.default_tenant_id.as_deref().map(str::trim);
-        let env_tenant = env_nonempty(GOV_IDENTITY_TENANT_ID_ENV);
-        let mut tenant_source = tenant_resolution_source(explicit_tenant, tenant_hint, cfg_tenant);
-        let mut resolved_tenant_id =
-            resolve_tenant_id_for_register(explicit_tenant, tenant_hint, cfg_tenant);
-
-        if resolved_tenant_id.is_none() {
-            if let Some(tenant_name) = tenant_hint.filter(|value| !value.is_empty()) {
-                // The hint is what the person typed as their company: not logged.
-                tracing::info!(
-                    op = "tenant_resolve",
+        // The tenant of the case, never one the person or the LLM gives, and never a new one.
+        let tenant_id = match case_tenant_of(
+            &self.ilk_tenant,
+            Some(src_ilk),
+            self.informed_tenant_id.as_deref(),
+        ) {
+            Ok(tenant_id) => tenant_id,
+            Err(error_code) => {
+                tracing::warn!(
+                    op = "ilk_register",
                     src_ilk = %src_ilk,
-                    target = %self.identity.target,
-                    "tenant_id missing; attempting TNT_CREATE from tenant_hint"
+                    informed_tenant_id = ?self.informed_tenant_id,
+                    error_code,
+                    "the tenant of the case is not known: ILK_REGISTER not sent, no tenant created"
                 );
-                let create_payload = json!({
-                    "name": tenant_name,
-                    "status": "active"
-                });
-                tracing::info!(
-                    op = "tenant_resolve",
-                    target = %self.identity.target,
-                    msg = %MSG_TNT_CREATE,
-                    "sending TNT_CREATE to identity"
-                );
-                let create_result = if let Some(bridge) = &self.bridge {
-                    bridge
-                        .call_ok(&self.identity, MSG_TNT_CREATE, create_payload)
-                        .await
-                } else {
-                    Err(identity_bridge_missing())
-                };
-
-                match create_result {
-                    Ok(out) => {
-                        let created_tenant_id = out
-                            .payload
-                            .get("tenant_id")
-                            .and_then(Value::as_str)
-                            .map(str::trim)
-                            .filter(|value| looks_like_tenant_id(value))
-                            .map(ToString::to_string);
-                        tracing::info!(
-                            op = "tenant_resolve",
-                            trace_id = %out.trace_id,
-                            effective_target = %out.effective_target,
-                            response_payload = %out.payload,
-                            "received TNT_CREATE response from identity"
-                        );
-                        if created_tenant_id.is_none() {
-                            tracing::warn!(
-                                op = "tenant_resolve",
-                                target = %self.identity.target,
-                                response_payload = %out.payload,
-                                "TNT_CREATE response missing valid tenant_id"
-                            );
-                            return Ok(json!({
-                                "status": "error",
-                                "error_code": "invalid_tnt_create_response",
-                                "message": "TNT_CREATE response did not include a valid tenant_id",
-                                "retryable": false
-                            }));
-                        }
-                        resolved_tenant_id = created_tenant_id;
-                        tenant_source = "tnt_create";
-                    }
-                    Err(err) => {
-                        tracing::warn!(
-                            op = "tenant_resolve",
-                            target = %self.identity.target,
-                            error = %identity_error_log_summary(&err),
-                            "TNT_CREATE failed"
-                        );
-                        return Ok(identity_error_to_tool_payload(&err));
-                    }
-                }
+                return Ok(case_tenant_error_payload(error_code));
             }
-        }
-
-        let Some(tenant_id) = resolved_tenant_id else {
-            tracing::warn!(
-                op = "ilk_register",
-                src_ilk = %src_ilk,
-                target = %self.identity.target,
-                explicit_tenant_id = ?explicit_tenant,
-                has_tenant_hint = tenant_hint.is_some_and(|value| !value.is_empty()),
-                effective_config_tenant_id = ?cfg_tenant,
-                env_tenant_id = ?env_tenant,
-                "missing tenant_id for ILK_REGISTER"
-            );
-            return Ok(json!({
-                "status": "error",
-                "error_code": "missing_tenant_id",
-                "message": "tenant_id is required for ILK_REGISTER (set tenant_id as tnt:<uuid>, use identity_candidate.tenant_hint=tnt:<uuid>, or set GOV_IDENTITY_TENANT_ID)",
-                "retryable": false
-            }));
         };
 
         tracing::info!(
             op = "ilk_register",
             src_ilk = %src_ilk,
             tenant_id = %tenant_id,
-            tenant_source = %tenant_source,
             target = %self.identity.target,
             has_fallback = self.identity.fallback_target.is_some(),
             "dispatching identity registration request"
@@ -2371,7 +2358,6 @@ impl FunctionTool for IlkRegisterTool {
                 "phone": args.identity_candidate.phone,
                 "company_name": args.identity_candidate.company_name,
                 "attributes": args.identity_candidate.attributes,
-                "tenant_hint": args.identity_candidate.tenant_hint,
             }
         });
         // Only non-personal fields: the identification VALUES (name, email, phone, company,
@@ -2395,16 +2381,34 @@ impl FunctionTool for IlkRegisterTool {
 
         match result {
             Ok(out) => {
+                // The ilk the person ended on: this one, or after a merge by email the one that
+                // already had that email.
+                let ilk_id = out
+                    .payload
+                    .get("ilk_id")
+                    .and_then(Value::as_str)
+                    .unwrap_or(src_ilk)
+                    .to_string();
+                let merged = out
+                    .payload
+                    .get("merged")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
                 tracing::info!(
                     op = "ilk_register",
                     trace_id = %out.trace_id,
                     effective_target = %out.effective_target,
+                    ilk_id = %ilk_id,
+                    merged,
                     response_payload = %out.payload,
                     "received ILK_REGISTER response from identity"
                 );
                 Ok(json!({
                     "status": "ok",
                     "registered": true,
+                    "merged": merged,
+                    "ilk_id": ilk_id,
+                    "tenant_id": tenant_id,
                     "effective_target": out.effective_target,
                     "trace_id": out.trace_id,
                     "identity_payload": out.payload
@@ -2590,6 +2594,7 @@ async fn run_unconfigured_bootstrap(
         immediate_memory_store,
         gov_identity,
         gov_identity_bridge,
+        ilk_tenant: identity_shm_ilk_tenant(&node_name),
         vault,
         control_plane: Arc::new(RwLock::new(state)),
     };
@@ -3122,7 +3127,7 @@ fn build_frontdesk_result_reply(
     let value = if let Some(contract) = extract_response_envelope(&msg.meta)? {
         validate_frontdesk_response_envelope(&contract)?;
         build_text_response(serde_json::to_string(
-            &frontdesk_structured_response_payload(&payload),
+            &frontdesk_structured_response_payload(&payload, &contract),
         )?)?
     } else {
         build_text_response(payload.human_message.clone())?
@@ -3204,6 +3209,8 @@ fn validate_frontdesk_response_envelope(contract: &Value) -> fluxbee_ai_sdk::Res
             "success" => field_type == "boolean",
             "human_message" => field_type == "string",
             "error_code" => field_type == "string",
+            "ilk_id" => field_type == "string",
+            "merged" => field_type == "boolean",
             _ => false,
         };
         if !supported {
@@ -3218,7 +3225,16 @@ fn validate_frontdesk_response_envelope(contract: &Value) -> fluxbee_ai_sdk::Res
     Ok(())
 }
 
-fn frontdesk_structured_response_payload(payload: &FrontdeskResultPayload) -> Value {
+/// The structured verdict, with the optional fields the caller's contract asks for: `ilk_id` is the
+/// ILK the person ended up on (after a merge, the one that already had the email, not the
+/// temporary), and `merged` says that happened.
+fn frontdesk_structured_response_payload(payload: &FrontdeskResultPayload, contract: &Value) -> Value {
+    let requested = |field: &str| {
+        contract
+            .get("properties")
+            .and_then(Value::as_object)
+            .is_some_and(|properties| properties.contains_key(field))
+    };
     let success = payload.status == "ok";
     let error_code = if success {
         None
@@ -3228,6 +3244,7 @@ fn frontdesk_structured_response_payload(payload: &FrontdeskResultPayload) -> Va
             "IN_CONVERSATION" => "in_conversation",
             "INVALID_REQUEST" => "invalid_request",
             "IDENTITY_UNAVAILABLE" => "identity_unavailable",
+            "TENANT_UNRESOLVED" => "tenant_unresolved",
             "REGISTER_FAILED" => "register_failed",
             _ => "unknown",
         })
@@ -3242,6 +3259,17 @@ fn frontdesk_structured_response_payload(payload: &FrontdeskResultPayload) -> Va
         obj.insert(
             "error_code".to_string(),
             Value::String(error_code.to_string()),
+        );
+    }
+    if requested("ilk_id") {
+        if let Some(ilk_id) = payload.ilk_id.as_deref().filter(|id| !id.is_empty()) {
+            obj.insert("ilk_id".to_string(), Value::String(ilk_id.to_string()));
+        }
+    }
+    if requested("merged") {
+        obj.insert(
+            "merged".to_string(),
+            Value::Bool(payload.result_code == "MERGED"),
         );
     }
     Value::Object(obj)
@@ -3279,17 +3307,27 @@ fn build_frontdesk_result_from_register_response(
         .and_then(Value::as_str)
         .unwrap_or("error");
     if status.eq_ignore_ascii_case("ok") {
-        let mut payload =
-            frontdesk_result_payload("ok", "REGISTERED", "Registro completado correctamente.");
-        payload.ilk_id = src_ilk.or_else(|| {
-            register_payload
-                .get("identity_payload")
-                .and_then(|value| value.get("ilk_id"))
-                .and_then(Value::as_str)
-                .map(ToString::to_string)
-        });
-        payload.tenant_id = register_payload
-            .get("identity_payload")
+        let identity = register_payload.get("identity_payload");
+        let merged = identity
+            .and_then(|value| value.get("merged"))
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let mut payload = if merged {
+            frontdesk_result_payload(
+                "ok",
+                "MERGED",
+                "Ya estabas registrado con ese email: este canal quedó asociado a tu registro.",
+            )
+        } else {
+            frontdesk_result_payload("ok", "REGISTERED", "Registro completado correctamente.")
+        };
+        // The ilk the person ended on, as SY.identity answered: after a merge it is not src_ilk.
+        payload.ilk_id = identity
+            .and_then(|value| value.get("ilk_id"))
+            .and_then(Value::as_str)
+            .map(ToString::to_string)
+            .or(src_ilk);
+        payload.tenant_id = identity
             .and_then(|value| value.get("tenant_id"))
             .and_then(Value::as_str)
             .map(ToString::to_string);
@@ -3309,8 +3347,17 @@ fn build_frontdesk_result_from_register_response(
             "IDENTITY_UNAVAILABLE",
             "No pude completar el registro en este momento.",
         )
+    } else if error_code == CASE_TENANT_MISSING {
+        // No tenant for the case: nothing to register into, and the frontdesk creates none.
+        (
+            "TENANT_UNRESOLVED",
+            "No pude completar el registro: este contacto no tiene una organización asignada.",
+        )
     } else if error_code.starts_with("INVALID_")
-        || matches!(error_code, "missing_src_ilk" | "invalid_identity_candidate")
+        || matches!(
+            error_code,
+            "missing_src_ilk" | "invalid_identity_candidate" | CASE_TENANT_MISMATCH
+        )
     {
         ("INVALID_REQUEST", "No pude completar el registro.")
     } else {
@@ -3591,6 +3638,21 @@ fn require_src_ilk(ctx: &BehaviorContext) -> fluxbee_ai_sdk::Result<&str> {
 
 #[cfg(test)]
 mod tests {
+    /// The contract the IO producers send (io_common::frontdesk_gate::frontdesk_response_contract).
+    fn producer_contract() -> Value {
+        json!({
+            "kind": "json_object_v1",
+            "required": ["success", "human_message"],
+            "properties": {
+                "success": {"type": "boolean"},
+                "human_message": {"type": "string"},
+                "error_code": {"type": "string"},
+                "ilk_id": {"type": "string"},
+                "merged": {"type": "boolean"}
+            }
+        })
+    }
+
     use super::*;
     use fluxbee_ai_sdk::{Destination, Meta, Routing};
     use gov_common::frontdesk_contract::FRONTDESK_RESULT_PAYLOAD_TYPE;
@@ -3665,6 +3727,7 @@ mod tests {
             immediate_memory_store: None,
             gov_identity,
             gov_identity_bridge: None,
+            ilk_tenant: test_ilk_tenant(),
             vault: None,
             control_plane: Arc::new(RwLock::new(ControlPlaneState {
                 current_state: NodeLifecycleState::Unconfigured,
@@ -4210,21 +4273,6 @@ mod tests {
     }
 
     #[test]
-    fn resolve_tenant_id_prefers_explicit_over_hint() {
-        let explicit = "tnt:11111111-1111-4111-8111-111111111111";
-        let hint = "tnt:22222222-2222-4222-8222-222222222222";
-        let out = resolve_tenant_id_for_register(Some(explicit), Some(hint), None);
-        assert_eq!(out.as_deref(), Some(explicit));
-    }
-
-    #[test]
-    fn resolve_tenant_id_uses_hint_when_explicit_missing() {
-        let hint = "tnt:22222222-2222-4222-8222-222222222222";
-        let out = resolve_tenant_id_for_register(None, Some(hint), None);
-        assert_eq!(out.as_deref(), Some(hint));
-    }
-
-    #[test]
     fn materialize_effective_config_defaults_injects_frontdesk_prompt_when_missing() {
         let config = materialize_effective_defaults(
             "SY.frontdesk.gov@motherbee",
@@ -4312,7 +4360,7 @@ mod tests {
             registration_status: Some("complete".to_string()),
         };
 
-        let structured = frontdesk_structured_response_payload(&payload);
+        let structured = frontdesk_structured_response_payload(&payload, &producer_contract());
         assert_eq!(
             structured.get("success").and_then(Value::as_bool),
             Some(true)
@@ -4340,7 +4388,7 @@ mod tests {
             registration_status: Some("temporary".to_string()),
         };
 
-        let structured = frontdesk_structured_response_payload(&payload);
+        let structured = frontdesk_structured_response_payload(&payload, &producer_contract());
         assert_eq!(
             structured.get("success").and_then(Value::as_bool),
             Some(false)
@@ -4353,6 +4401,14 @@ mod tests {
 
     const TEST_ILK: &str = "ilk:11111111-1111-4111-8111-111111111111";
     const TEST_TENANT: &str = "tnt:22222222-2222-4222-8222-222222222222";
+    const OTHER_TENANT: &str = "tnt:33333333-3333-4333-8333-333333333333";
+    const UNKNOWN_ILK: &str = "ilk:44444444-4444-4444-8444-444444444444";
+    const REGISTERED_ILK: &str = "ilk:55555555-5555-4555-8555-555555555555";
+
+    /// The identity SHM of the tests: TEST_ILK is a temporary ILK of TEST_TENANT.
+    fn test_ilk_tenant() -> IlkTenantLookup {
+        Arc::new(|ilk_id: &str| (ilk_id == TEST_ILK).then(|| TEST_TENANT.to_string()))
+    }
 
     fn register_failure(error_code: &str) -> FrontdeskResultPayload {
         let reply = fluxbee_sdk::IdentitySystemResult {
@@ -4376,6 +4432,7 @@ mod tests {
     fn final_identity_rejections_are_register_failed_not_identity_unavailable() {
         for code in [
             "TENANT_PENDING",
+            "TENANT_SUSPENDED",
             "TENANT_DELETED",
             "ILK_DELETED",
             "ILK_NOT_FOUND",
@@ -4389,7 +4446,7 @@ mod tests {
             assert_eq!(result.error_code.as_deref(), Some(code));
             assert_eq!(result.registration_status.as_deref(), Some("temporary"));
             assert_eq!(
-                frontdesk_structured_response_payload(&result)["error_code"],
+                frontdesk_structured_response_payload(&result, &producer_contract())["error_code"],
                 "register_failed"
             );
         }
@@ -4412,7 +4469,7 @@ mod tests {
         let result = build_frontdesk_result_from_register_response(&unreachable, None);
         assert_eq!(result.result_code, "IDENTITY_UNAVAILABLE");
         assert_eq!(
-            frontdesk_structured_response_payload(&result)["error_code"],
+            frontdesk_structured_response_payload(&result, &producer_contract())["error_code"],
             "identity_unavailable"
         );
     }
@@ -4429,34 +4486,68 @@ mod tests {
             reply(json!({"status": "ok", "ilk_id": TEST_ILK}))
         )
         .is_ok());
-        let err = identity_reply_outcome(MSG_TNT_CREATE, reply(json!({"status": "error"})))
+        let err = identity_reply_outcome(MSG_ILK_REGISTER, reply(json!({"status": "error"})))
             .expect_err("status error is a rejection");
         assert!(matches!(
             err,
             IdentityError::SystemRejected { ref action, ref error_code, .. }
-                if action == MSG_TNT_CREATE && error_code == "UNKNOWN"
+                if action == MSG_ILK_REGISTER && error_code == "UNKNOWN"
         ));
+    }
+
+    fn test_tool(
+        scoped_src_ilk: Option<&str>,
+        informed_tenant_id: Option<&str>,
+    ) -> IlkRegisterTool {
+        IlkRegisterTool {
+            scoped_src_ilk: scoped_src_ilk.map(ToString::to_string),
+            informed_tenant_id: informed_tenant_id.map(ToString::to_string),
+            ilk_tenant: test_ilk_tenant(),
+            identity: GovIdentityConfig::default(),
+            bridge: None,
+        }
     }
 
     #[test]
     fn ilk_register_schema_has_no_thread_id() {
-        let tool = IlkRegisterTool {
-            scoped_src_ilk: None,
-            default_tenant_id: None,
-            identity: GovIdentityConfig::default(),
-            bridge: None,
-        };
-        let schema = tool.definition().parameters_json_schema;
+        let schema = test_tool(None, None).definition().parameters_json_schema;
         assert!(schema["properties"].get("thread_id").is_none());
+    }
+
+    #[test]
+    fn ilk_register_schema_takes_no_tenant() {
+        let schema = test_tool(None, None).definition().parameters_json_schema;
+        assert!(schema["properties"].get("tenant_id").is_none());
+        let candidate = &schema["properties"]["identity_candidate"];
+        assert!(candidate["properties"].get("tenant_hint").is_none());
+        assert_eq!(candidate["additionalProperties"], false);
     }
 
     /// Collects what the fmt layer writes on this thread while its guard lives.
     #[derive(Clone, Default)]
     struct LogCapture(Arc<Mutex<Vec<u8>>>);
 
-    impl std::io::Write for LogCapture {
+    thread_local! {
+        static THREAD_CAPTURE: std::cell::RefCell<Option<LogCapture>> =
+            const { std::cell::RefCell::new(None) };
+    }
+
+    /// The writer of the one global test subscriber: this thread's capture, if any. A global
+    /// subscriber that takes every level keeps tracing's per-callsite interest cache from
+    /// silencing a capture when parallel tests hit the same callsites (as `set_default` did).
+    struct ThreadCaptureWriter;
+
+    impl std::io::Write for ThreadCaptureWriter {
         fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-            self.0.lock().expect("log capture").extend_from_slice(buf);
+            THREAD_CAPTURE.with(|capture| {
+                if let Some(capture) = capture.borrow().as_ref() {
+                    capture
+                        .0
+                        .lock()
+                        .expect("log capture")
+                        .extend_from_slice(buf);
+                }
+            });
             Ok(buf.len())
         }
 
@@ -4465,16 +4556,33 @@ mod tests {
         }
     }
 
+    /// Ends this thread's capture.
+    struct LogCaptureGuard;
+
+    impl Drop for LogCaptureGuard {
+        fn drop(&mut self) {
+            THREAD_CAPTURE.with(|capture| *capture.borrow_mut() = None);
+        }
+    }
+
     impl LogCapture {
-        fn start() -> (Self, tracing::subscriber::DefaultGuard) {
+        fn start() -> (Self, LogCaptureGuard) {
+            static GLOBAL_SUBSCRIBER: OnceLock<()> = OnceLock::new();
+            GLOBAL_SUBSCRIBER.get_or_init(|| {
+                let subscriber = tracing_subscriber::fmt()
+                    .with_writer(|| ThreadCaptureWriter)
+                    .with_ansi(false)
+                    .with_max_level(tracing::Level::TRACE)
+                    .finish();
+                tracing::subscriber::set_global_default(subscriber)
+                    .expect("the test log subscriber is the only global one");
+            });
+            // A callsite registered while the subscriber was being installed keeps no stale
+            // "never" interest.
+            tracing::callsite::rebuild_interest_cache();
             let capture = Self::default();
-            let writer = capture.clone();
-            let subscriber = tracing_subscriber::fmt()
-                .with_writer(move || writer.clone())
-                .with_ansi(false)
-                .with_max_level(tracing::Level::TRACE)
-                .finish();
-            (capture, tracing::subscriber::set_default(subscriber))
+            THREAD_CAPTURE.with(|slot| *slot.borrow_mut() = Some(capture.clone()));
+            (capture, LogCaptureGuard)
         }
 
         fn text(&self) -> String {
@@ -4503,12 +4611,7 @@ mod tests {
 
     #[tokio::test]
     async fn ilk_register_tool_logs_carry_no_personal_data() {
-        let tool = IlkRegisterTool {
-            scoped_src_ilk: Some(TEST_ILK.to_string()),
-            default_tenant_id: None,
-            identity: GovIdentityConfig::default(),
-            bridge: None,
-        };
+        let tool = test_tool(Some(TEST_ILK), None);
         let candidate = json!({
             "name": "Juana Secreta",
             "email": "juana.secreta@example.com",
@@ -4517,39 +4620,280 @@ mod tests {
             "attributes": { "crm_customer_id": "crm-secret-42" },
             "tenant_hint": "Hint Secreto SRL"
         });
-        {
-            // No env tenant, so the tenant-less call below goes through TNT_CREATE.
-            let _env = env_lock().lock().expect("env lock");
-            std::env::remove_var(GOV_IDENTITY_TENANT_ID_ENV);
-        }
         let (logs, _guard) = LogCapture::start();
-        // With a tenant: straight to ILK_REGISTER (it then fails: no identity bridge here).
+        // Straight to ILK_REGISTER with the case's tenant (it then fails: no identity bridge).
         let registered = tool
-            .call(json!({
-                "src_ilk": TEST_ILK,
-                "identity_candidate": candidate.clone(),
-                "tenant_id": TEST_TENANT
-            }))
-            .await
-            .expect("tool call");
-        assert_eq!(registered["status"], "error");
-        // Without one: TNT_CREATE from the hint first.
-        let created = tool
             .call(json!({ "src_ilk": TEST_ILK, "identity_candidate": candidate }))
             .await
             .expect("tool call");
-        assert_eq!(created["status"], "error");
+        assert_eq!(registered["status"], "error");
 
         let text = logs.text();
         assert_no_personal_data(&text);
         assert!(text.contains("sending ILK_REGISTER to identity"));
-        assert!(text.contains("sending TNT_CREATE to identity"));
         assert!(text.contains(TEST_ILK));
         assert!(text.contains(TEST_TENANT));
         assert!(
             text.contains("\"email\""),
             "field names are logged:\n{text}"
         );
+    }
+
+    #[tokio::test]
+    async fn ilk_register_takes_the_tenant_of_the_case_never_the_llms() {
+        // The LLM (or the person through it) names a tenant: it is not a parameter, and it is not
+        // followed. The registration goes to the tenant of the case's ILK.
+        let tool = test_tool(Some(TEST_ILK), None);
+        let (logs, _guard) = LogCapture::start();
+        let out = tool
+            .call(json!({
+                "src_ilk": TEST_ILK,
+                "tenant_id": OTHER_TENANT,
+                "identity_candidate": {
+                    "name": "Ana", "email": "ana@example.com", "tenant_hint": OTHER_TENANT
+                }
+            }))
+            .await
+            .expect("tool call");
+        assert_eq!(
+            out["error_code"], "IDENTITY_ERROR",
+            "it reached ILK_REGISTER"
+        );
+
+        let text = logs.text();
+        assert!(text.contains("sending ILK_REGISTER to identity"));
+        assert!(text.contains(TEST_TENANT));
+        assert!(!text.contains(OTHER_TENANT), "{text}");
+        assert!(!text.contains("TNT_CREATE"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn ilk_register_without_the_case_tenant_sends_nothing_and_creates_no_tenant() {
+        // An ILK whose tenant cannot be read: whatever the LLM says, nothing goes to identity.
+        let tool = test_tool(Some(UNKNOWN_ILK), None);
+        let (logs, _guard) = LogCapture::start();
+        let out = tool
+            .call(json!({
+                "src_ilk": UNKNOWN_ILK,
+                "tenant_id": TEST_TENANT,
+                "identity_candidate": {
+                    "name": "Ana", "email": "ana@example.com", "company_name": "Acme SA"
+                }
+            }))
+            .await
+            .expect("tool call");
+        assert_eq!(out["status"], "error");
+        assert_eq!(out["error_code"], CASE_TENANT_MISSING);
+        let text = logs.text();
+        assert!(!text.contains("sending ILK_REGISTER"), "{text}");
+        assert!(!text.contains("TNT_CREATE"), "{text}");
+    }
+
+    #[test]
+    fn tenant_errors_are_explicit_results() {
+        let missing = build_frontdesk_result_from_register_response(
+            &case_tenant_error_payload(CASE_TENANT_MISSING),
+            Some(UNKNOWN_ILK.to_string()),
+        );
+        assert_eq!(missing.status, "error");
+        assert_eq!(missing.result_code, "TENANT_UNRESOLVED");
+        assert_eq!(missing.error_code.as_deref(), Some(CASE_TENANT_MISSING));
+        assert_eq!(
+            frontdesk_structured_response_payload(&missing, &producer_contract())["error_code"],
+            "tenant_unresolved"
+        );
+        let mismatch = build_frontdesk_result_from_register_response(
+            &case_tenant_error_payload(CASE_TENANT_MISMATCH),
+            Some(TEST_ILK.to_string()),
+        );
+        assert_eq!(mismatch.result_code, "INVALID_REQUEST");
+        assert_eq!(mismatch.error_code.as_deref(), Some(CASE_TENANT_MISMATCH));
+    }
+
+    #[test]
+    fn a_merge_is_reported_with_the_ilk_the_person_ended_on() {
+        let tool_output = |identity_payload: Value| {
+            json!({
+                "status": "ok",
+                "registered": true,
+                "identity_payload": identity_payload
+            })
+        };
+        let merged = build_frontdesk_result_from_register_response(
+            &tool_output(json!({
+                "status": "ok", "ilk_id": REGISTERED_ILK, "tenant_id": TEST_TENANT,
+                "registration_status": "complete", "merged": true, "merged_from_ilk_id": TEST_ILK
+            })),
+            Some(TEST_ILK.to_string()),
+        );
+        assert_eq!(merged.status, "ok");
+        assert_eq!(merged.result_code, "MERGED");
+        assert_eq!(merged.ilk_id.as_deref(), Some(REGISTERED_ILK));
+        assert_eq!(merged.tenant_id.as_deref(), Some(TEST_TENANT));
+        assert_eq!(merged.registration_status.as_deref(), Some("complete"));
+        let structured = frontdesk_structured_response_payload(&merged, &producer_contract());
+        assert_eq!(structured["success"], true);
+        assert!(structured.get("error_code").is_none());
+        // The caller learns where the person ended up, not the temporary it provisioned.
+        assert_eq!(structured["ilk_id"], REGISTERED_ILK);
+        assert_eq!(structured["merged"], true);
+        // A caller that did not ask for them does not get them.
+        let minimal = json!({
+            "kind": "json_object_v1",
+            "required": ["success", "human_message"],
+            "properties": {"success": {"type": "boolean"}, "human_message": {"type": "string"}}
+        });
+        let structured_minimal = frontdesk_structured_response_payload(&merged, &minimal);
+        assert!(structured_minimal.get("ilk_id").is_none());
+        assert!(structured_minimal.get("merged").is_none());
+        assert!(structured["human_message"]
+            .as_str()
+            .is_some_and(|text| text.contains("Ya estabas registrado")));
+
+        let registered = build_frontdesk_result_from_register_response(
+            &tool_output(json!({
+                "status": "ok", "ilk_id": TEST_ILK, "tenant_id": TEST_TENANT,
+                "registration_status": "complete", "merged": false
+            })),
+            Some(TEST_ILK.to_string()),
+        );
+        assert_eq!(registered.result_code, "REGISTERED");
+        assert_eq!(registered.ilk_id.as_deref(), Some(TEST_ILK));
+        assert_eq!(registered.tenant_id.as_deref(), Some(TEST_TENANT));
+    }
+
+    /// Thread state in memory, so a test can see what a handoff left for the case.
+    #[derive(Default)]
+    struct MemoryThreadState(Mutex<HashMap<String, Value>>);
+
+    #[async_trait]
+    impl ThreadStateStore for MemoryThreadState {
+        async fn get(
+            &self,
+            key: &str,
+        ) -> fluxbee_ai_sdk::Result<Option<fluxbee_ai_sdk::ThreadStateRecord>> {
+            let state = self.0.lock().expect("thread state");
+            Ok(state
+                .get(key)
+                .map(|data| fluxbee_ai_sdk::ThreadStateRecord {
+                    thread_id: key.to_string(),
+                    data: data.clone(),
+                    updated_at: String::new(),
+                    ttl_seconds: None,
+                }))
+        }
+
+        async fn put(
+            &self,
+            key: &str,
+            data: Value,
+            _ttl_seconds: Option<u64>,
+        ) -> fluxbee_ai_sdk::Result<()> {
+            self.0
+                .lock()
+                .expect("thread state")
+                .insert(key.to_string(), data);
+            Ok(())
+        }
+
+        async fn delete(&self, key: &str) -> fluxbee_ai_sdk::Result<()> {
+            self.0.lock().expect("thread state").remove(key);
+            Ok(())
+        }
+    }
+
+    fn test_node_with_state() -> (GenericAiNode, Arc<MemoryThreadState>) {
+        let state = Arc::new(MemoryThreadState::default());
+        let mut node = test_node();
+        node.thread_state_store = Some(state.clone() as Arc<dyn ThreadStateStore>);
+        (node, state)
+    }
+
+    fn structured_handoff(src_ilk: &str, tenant_id: Option<&str>) -> Message {
+        let mut msg = sample_user_request_with_context(
+            json!({
+                "thread_id": "frontdesk-thread-tenant",
+                "response_envelope": {
+                    "kind": "json_object_v1",
+                    "required": ["success", "human_message"],
+                    "properties": {
+                        "success": { "type": "boolean" },
+                        "human_message": { "type": "string" },
+                        "error_code": { "type": "string" }
+                    }
+                }
+            }),
+            Some(src_ilk),
+        );
+        msg.payload = json!({
+            "type": "frontdesk_handoff",
+            "schema_version": 1,
+            "operation": "complete_registration",
+            "subject": { "display_name": "Ana", "email": "ana@example.com" },
+            "tenant_id": tenant_id
+        });
+        msg
+    }
+
+    async fn structured_reply(node: &GenericAiNode, msg: Message) -> Value {
+        let response = node
+            .on_message(msg)
+            .await
+            .expect("handoff should not fail")
+            .expect("response should exist");
+        let content = extract_text(&response.payload).expect("structured text");
+        serde_json::from_str(&content).expect("valid structured json")
+    }
+
+    #[tokio::test]
+    async fn handoff_with_a_tenant_that_contradicts_the_ilk_registers_nothing() {
+        let (node, state) = test_node_with_state();
+        let reply = structured_reply(&node, structured_handoff(TEST_ILK, Some(OTHER_TENANT))).await;
+        assert_eq!(reply["success"], false);
+        assert_eq!(reply["error_code"], "invalid_request");
+        assert!(state.0.lock().expect("thread state").is_empty());
+    }
+
+    #[tokio::test]
+    async fn handoff_without_a_case_tenant_answers_tenant_unresolved() {
+        // A handoff tenant alone does not make one: the ILK's tenant cannot be read.
+        let (node, state) = test_node_with_state();
+        let reply =
+            structured_reply(&node, structured_handoff(UNKNOWN_ILK, Some(TEST_TENANT))).await;
+        assert_eq!(reply["success"], false);
+        assert_eq!(reply["error_code"], "tenant_unresolved");
+        assert!(state.0.lock().expect("thread state").is_empty());
+    }
+
+    #[tokio::test]
+    async fn handoff_without_src_ilk_is_an_invalid_request() {
+        let (node, state) = test_node_with_state();
+        let mut msg = structured_handoff(TEST_ILK, Some(TEST_TENANT));
+        msg.meta.src_ilk = None;
+        let reply = structured_reply(&node, msg).await;
+        assert_eq!(reply["success"], false);
+        assert_eq!(reply["error_code"], "invalid_request");
+        assert!(state.0.lock().expect("thread state").is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_failed_handoff_keeps_the_tenant_of_its_case() {
+        // No tenant_id in the handoff: the case's comes from its ILK. The registration fails (no
+        // identity bridge here) and the case keeps its tenant for the retry.
+        let (node, state) = test_node_with_state();
+        let reply = structured_reply(&node, structured_handoff(TEST_ILK, None)).await;
+        assert_eq!(reply["success"], false);
+        assert_eq!(reply["error_code"], "identity_unavailable");
+        let kept = state.0.lock().expect("thread state").get(TEST_ILK).cloned();
+        let kept = kept.expect("the failed case keeps its state");
+        assert_eq!(kept["status"], "completed_error");
+        assert_eq!(kept["tenant_id"], TEST_TENANT);
+
+        // The retry, again without tenant_id, still knows its tenant.
+        let retry = structured_reply(&node, structured_handoff(TEST_ILK, None)).await;
+        assert_eq!(retry["error_code"], "identity_unavailable");
+        let kept = state.0.lock().expect("thread state").get(TEST_ILK).cloned();
+        assert_eq!(kept.expect("state")["tenant_id"], TEST_TENANT);
     }
 
     #[tokio::test]

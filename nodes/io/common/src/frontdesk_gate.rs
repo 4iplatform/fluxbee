@@ -64,7 +64,9 @@ pub fn frontdesk_response_contract() -> serde_json::Value {
         "properties": {
             "success": {"type": "boolean"},
             "human_message": {"type": "string"},
-            "error_code": {"type": "string"}
+            "error_code": {"type": "string"},
+            "ilk_id": {"type": "string"},
+            "merged": {"type": "boolean"}
         }
     })
 }

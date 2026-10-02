@@ -1,6 +1,6 @@
 # SY.frontdesk.gov - Especificacion tecnica (v2)
 
-Estado: vigente
+Estado: vigente (actualizada 2026-10-02: tenant del caso, sin creacion de tenants, merge por email)
 
 > Nota de deprecacion:
 > `frontdesk_result` queda deprecado como contrato de salida de `SY.frontdesk.gov`.
@@ -43,15 +43,19 @@ Regla operativa:
   - `payload.type = "frontdesk_handoff"`
 - reutiliza estado por `src_ilk`;
 - completa o corrige los datos minimos del humano;
-- llama a `ilk_register` cuando el caso ya esta listo;
+- llama a `ilk_register` cuando el caso ya esta listo, en el tenant del caso (seccion 4.3);
 - responde por defecto con `payload.type = "text"`;
 - cuando recibe `meta.context.response_envelope`, puede responder con `payload.type = "text"` estructurado compatible con ese envelope.
 
 No debe:
 
 - escribir directo en la identity DB;
-- inventar tenants o ILKs;
-- volver a inferir tenancy desde hints textuales cuando el handoff ya trae `tenant_id`;
+- crear tenants. No manda `TNT_CREATE`, y `SY.identity` tampoco se lo permite: `TNT_CREATE`,
+  `TNT_UPDATE` y `TNT_SET_SPONSOR` no estan en su allowlist. Un tenant lo crea el operador por
+  `SY.admin`, o Fluxbee Cloud con su propio proceso (`create_tenant` de io.cloud, que pasa por
+  `SY.admin`);
+- tomar el tenant de la persona, del LLM, de su config o de su entorno (seccion 4.3);
+- inventar ILKs;
 - asumir que todos los consumidores requieren el mismo contrato de salida.
 
 ## 4. Inputs oficiales
@@ -105,9 +109,36 @@ Reglas:
 
 - `operation = "complete_registration"` es la unica operacion cerrada en esta version;
 - `subject.display_name` y `subject.email` son requeridos para esa operacion;
-- `tenant_id` es opcional;
-- si falta `tenant_id`, frontdesk conserva el tenant ya asociado al caso/ILK;
-- frontdesk no toma tenancy desde `tenant_hint` ni desde metadata blanda.
+- `subject.company_name` es un dato de la persona: nunca elige ni crea un tenant;
+- `tenant_id` es opcional. Si viene, tiene que ser el tenant del caso (seccion 4.3); si no lo es,
+  no se registra nada (`INVALID_REQUEST`, `error_code = tenant_mismatch`).
+
+### 4.3 Tenant del caso
+
+El tenant de un registro es el que `SY.identity` tiene para el ILK temporal del caso
+(`meta.src_ilk`). Lo fijo el nodo IO que creo ese ILK con `ILK_PROVISION`:
+
+- un nodo IO provisiona con su propio tenant (`FLUXBEE_NODE_TENANT_ID`, el que le dio el
+  orchestrator);
+- io.api e io.cloud provisionan con el tenant para el que los llamaron: io.api, el de su
+  integracion; io.cloud, el `tenant_id` del sobre de Cloud, el tenant que creo Cloud;
+- un nodo IO sin tenant provisiona en el tenant por defecto (`fluxbee`), y el registro queda ahi.
+
+Reglas:
+
+- el frontdesk lee ese tenant del SHM de identity de su hive (`jsr-identity-<hive>`), que
+  `SY.identity` escribe antes de responder el `ILK_PROVISION`;
+- `frontdesk_handoff.tenant_id`, si viene, solo se compara con ese tenant;
+- en el camino conversacional la unica fuente es el tenant del ILK: el estado del hilo lo escribe
+  el LLM, asi que no es fuente de tenant;
+- si el tenant del ILK no se puede leer (el ILK no esta en el SHM, o el SHM no se lee), no se manda
+  `ILK_REGISTER` y no se crea nada. La respuesta es explicita: `status = "error"`,
+  `result_code = TENANT_UNRESOLVED`, `error_code = missing_tenant_id`;
+- no hay otras fuentes: la tool no tiene `tenant_id` ni `identity_candidate.tenant_hint`, y no
+  existen `effective_config.tenant_id` ni `GOV_IDENTITY_TENANT_ID`;
+- un tenant `pending`, `suspended` o borrado no recibe registros: `SY.identity` responde
+  `TENANT_PENDING`, `TENANT_SUSPENDED` o `TENANT_DELETED`, que son resultados finales
+  (`REGISTER_FAILED`, no reintentables).
 
 ## 5. Estado por hilo
 
@@ -139,6 +170,10 @@ Estado minimo actual:
 }
 ```
 
+`tenant_id` es el tenant del caso. El handoff lo guarda tambien cuando el registro falla
+(`completed_error`), asi un reintento sigue informandolo. Es informativo: el tenant de cada intento
+se vuelve a leer del ILK (seccion 4.3).
+
 ## 6. Modos internos de trabajo
 
 ### 6.1 `register_automatic`
@@ -148,6 +183,8 @@ Se activa cuando entra `frontdesk_handoff`.
 Regla:
 
 - no abre conversacion innecesaria;
+- resuelve primero el tenant del caso (seccion 4.3); sin tenant, o con uno que no coincide, responde
+  el error y no guarda nada;
 - mergea con estado previo si corresponde;
 - si ya tiene el minimo completo, intenta registrar;
 - si sigue incompleto, responde `text` con el mensaje humano correspondiente.
@@ -176,14 +213,47 @@ Payload minimo:
 Opcionales:
 
 - `identity_candidate.phone`
-- `tenant_id`
+- `identity_candidate.company_name`
+- `identity_candidate.attributes` (datos libres; van tal cual a `identification.attributes`)
 
-El estado del caso se indexa por `src_ilk` (seccion 5); la tool no recibe `thread_id`.
+No hay mas campos: el tenant no es un parametro (seccion 4.3). El estado del caso se indexa por
+`src_ilk` (seccion 5); la tool no recibe `thread_id`.
 
-Regla:
+Respuesta exitosa:
 
-- en handoff estructurado, si `tenant_id` viene, se usa ese tenant para `ILK_REGISTER`;
-- en conversacional, la resolucion de tenant sigue la logica vigente del nodo.
+```json
+{
+  "status": "ok",
+  "registered": true,
+  "merged": false,
+  "ilk_id": "ilk:...",
+  "tenant_id": "tnt:...",
+  "identity_payload": { "status": "ok", "ilk_id": "ilk:...", "merged": false }
+}
+```
+
+### 7.1 Email ya registrado: merge
+
+El email identifica a la persona dentro de su tenant. Si el registro trae un email que ya tiene otro
+ILK humano del mismo tenant, la persona ya esta registrada y el registro no falla: `SY.identity` hace
+el merge dentro del mismo `ILK_REGISTER` (detalle en `10-identity-v2.md` 6.5):
+
+- el ILK existente conserva su id, su tenant y su estado `complete`;
+- los canales del ILK temporal pasan a ese ILK, y el temporal queda como alias suyo hasta que vence
+  `merge_alias_ttl_secs` (despues lo marca borrado el GC de alias);
+- los campos de `identification` que el ILK existente tiene vacios se completan con los del
+  registro; los que ya tienen valor no se tocan;
+- `SY.identity` responde `merged: true`, `ilk_id` del ILK existente y `merged_from_ilk_id` del
+  temporal; frontdesk responde `MERGED` (seccion 9) y le dice a la persona que ya estaba registrada y
+  que este canal quedo asociado a su registro.
+
+Una actualizacion explicita si pisa: un `ILK_REGISTER` del propio ILK ya registrado (por ejemplo un
+`register_human` repetido de Cloud para el mismo email) reemplaza su `identification` entera; gana el
+ultimo.
+
+Sin prueba de que la persona es duena del email, quien escriba el email de otro hace que su canal
+quede asociado al ILK de esa persona. La verificacion (por ejemplo un codigo de un solo uso) esta
+pendiente (seccion 13).
 
 ## 8. Output por defecto
 
@@ -237,7 +307,8 @@ Reglas:
 
 - el envelope es opt-in y hop-by-hop;
 - si no existe envelope, frontdesk responde `text` normal;
-- `error_code` es opcional por ausencia;
+- `success` es `true` solo con `status = "ok"` (`REGISTERED`, `MERGED`, `ALREADY_COMPLETE`);
+- `error_code` es el `result_code` en minusculas (seccion 9) y solo va cuando `success = false`;
 - `error_code` no debe emitirse como `null` en v1;
 - en este corte, frontdesk solo declara soporte explícito para:
   - `success:boolean`
@@ -253,22 +324,30 @@ Estados cerrados:
 - `needs_input`
 - `error`
 
-`result_code` cerrados iniciales:
+`result_code` cerrados:
 
-- `REGISTERED`
-- `ALREADY_COMPLETE`
-- `MISSING_REQUIRED_FIELDS`
-- `INVALID_REQUEST`
-- `REGISTER_FAILED`
-- `IDENTITY_UNAVAILABLE`
+| `result_code` | estado | cuando |
+| --- | --- | --- |
+| `REGISTERED` | `ok` | el ILK temporal quedo `complete` |
+| `MERGED` | `ok` | el email ya era de otro ILK del tenant: este canal paso a ese ILK (seccion 7.1); `ilk_id` es ese ILK |
+| `ALREADY_COMPLETE` | `ok` | conversacional: el estado del hilo ya dice `completed` |
+| `MISSING_REQUIRED_FIELDS` | `needs_input` | faltan `display_name` y/o `email` |
+| `IN_CONVERSATION` | `needs_input` | turno conversacional en el que no hubo registro (saludo, pedido de un dato) |
+| `INVALID_REQUEST` | `error` | pedido invalido: operacion no soportada, datos invalidos, `tenant_mismatch`, `INVALID_*` de `SY.identity` |
+| `TENANT_UNRESOLVED` | `error` | no hay tenant para el caso (`missing_tenant_id`, seccion 4.3); no se registro ni se creo nada |
+| `REGISTER_FAILED` | `error` | `SY.identity` rechazo el registro con un veredicto final |
+| `IDENTITY_UNAVAILABLE` | `error` | falla transitoria, la unica reintentable |
 
 `human_message` es obligatorio siempre.
 
-Fallas de registro (`ILK_REGISTER` / `TNT_CREATE`):
+Fallas de registro (`ILK_REGISTER`):
 
 - `IDENTITY_UNAVAILABLE` solo para fallas transitorias, las unicas reintentables: `SY.identity` no respondio (`UNREACHABLE`, `TTL_EXCEEDED`, `TIMEOUT`, `IDENTITY_ERROR`) o respondio `NOT_PRIMARY`, `DB_NOT_READY` o `DB_WRITE_FAILED`;
-- cualquier otro codigo con el que `SY.identity` responde es un veredicto final, no reintentable: `INVALID_*` -> `INVALID_REQUEST`; el resto (`TENANT_PENDING`, `TENANT_DELETED`, `ILK_DELETED`, `ILK_NOT_FOUND`, `SYSTEM_ILK_PROTECTED`, `DUPLICATE_*`, `UNAUTHORIZED_REGISTRAR`, ...) -> `REGISTER_FAILED`;
-- `error_code` conserva el codigo de `SY.identity` tal cual.
+- cualquier otro codigo con el que `SY.identity` responde es un veredicto final, no reintentable: `INVALID_*` -> `INVALID_REQUEST`; el resto (`TENANT_PENDING`, `TENANT_SUSPENDED`, `TENANT_DELETED`, `ILK_DELETED`, `ILK_NOT_FOUND`, `SYSTEM_ILK_PROTECTED`, `DUPLICATE_*`, `UNAUTHORIZED_REGISTRAR`, ...) -> `REGISTER_FAILED`;
+- `error_code` conserva el codigo de `SY.identity` tal cual (o el de la tool: `missing_src_ilk`, `invalid_identity_candidate`, `missing_tenant_id`, `tenant_mismatch`).
+
+`DUPLICATE_EMAIL` queda solo para un email que no se puede mergear: el ILK del registro no es un
+temporal humano del mismo tenant (por ejemplo un ILK ya `complete` que quiere el email de otro).
 
 `missing_fields`:
 
@@ -291,61 +370,68 @@ Deben:
 - si no usan envelope, consumir texto normal;
 - si usan envelope, consumir la respuesta estructurada definida por ese hop.
 
-## 11. Lifecycle operativo actual
-
-En el estado actual del repo, `SY.frontdesk.gov` debe operarse como singleton canonico por hive.
-
-Implicancias practicas:
-
-- en updates rutinarios no conviene borrar el nodo;
-- en updates rutinarios no conviene respawnearlo como si fuera un `IO.*` comun;
-- en updates rutinarios no conviene pisar su config operativa si el objetivo es solo cambiar runtime;
-- el camino conservador actual es:
-  - publicar runtime
-  - ejecutar `SYSTEM_UPDATE` targeted para `SY.frontdesk.gov`
-  - reiniciar el servicio singleton existente, normalmente `sy-frontdesk-gov.service`
-
-Delete + spawn limpio quedan reservados para:
-
-- reinstalacion deliberada;
-- validacion de bootstrap;
-- recuperacion de estado roto;
-- pruebas controladas donde sea explicito que se acepta perder config local o secrets temporales.
-
 ### 10.3 `IO.api`
 
 `IO.api` debe:
 
-- construir `frontdesk_handoff`;
+- construir `frontdesk_handoff`, con el `tenant_id` de su integracion (el mismo con el que provisiono el ILK);
 - usar `SY.frontdesk.gov` como paso intermedio cuando el sujeto no esta registrado completamente;
 - agregar `meta.context.response_envelope` para el hop síncrono de regularización;
 - consumir la respuesta estructurada resultante y:
-- si `success = true`, permitir que el mensaje original continue al `dst_final`;
-- si `success = false`, mapearla a la respuesta HTTP de `IO.api`.
+  - si `success = true`, permitir que el mensaje original continue al `dst_final`;
+  - si `success = false`, mapearla a la respuesta HTTP de `IO.api`.
+
+### 10.4 io.cloud `register_human`
+
+io.cloud provisiona el ILK temporal en el tenant del sobre de Cloud (canal `cloud`, direccion = el
+email) y le manda al frontdesk el `frontdesk_handoff` con ese mismo `tenant_id`. Su respuesta a Cloud
+lleva el `ilk_id` que provisiono: despues de un `MERGED` ese ILK es un alias y la persona quedo en
+otro, que hoy io.cloud no reporta (seccion 13).
 
 ## 11. Configuracion y operacion
 
-Estado vigente:
+`SY.frontdesk.gov` es un nodo de sistema autonomo:
 
-- usa el runner compartido con `CONFIG_GET` / `CONFIG_SET`;
-- si `behavior.instructions` falta, usa prompt base embebido;
-- corre como servicio del sistema sin argumentos ni YAML de nodo; bootstrappea `node_name` desde `hive.yaml` como `SY.frontdesk.gov@<hive_id>`;
-- la key del provider se resuelve exclusivamente desde `SY.vault` con `resource_type=openai`;
-- `CONFIG_SET` rechaza campos de secreto; la carga de credenciales se hace por el canal de vault.
+- corre como servicio del sistema (`sy-frontdesk-gov.service`) sin argumentos ni YAML de nodo;
+  toma `node_name` de `hive.yaml` como `SY.frontdesk.gov@<hive_id>`;
+- el prompt va embebido en el binario; no se configura;
+- el proveedor y el modelo de IA son los del hive: seccion `ai` de `hive.yaml` (con un fallback
+  horneado si falta);
+- la clave del proveedor se lee de `SY.vault` por `resource_type` del proveedor (`openai` o
+  `anthropic`), en el tenant raiz, al arrancar y en cada `VAULT_SECRET_CHANGED`. Sin clave el nodo
+  queda `UNCONFIGURED`: el camino estructurado sigue andando y el conversacional responde
+  `node_not_configured`;
+- `CONFIG_SET` no acepta configuracion: rechaza `ai`, `ai_providers`, `behavior`, `api_key` y
+  `api_key_ref` con `config_not_accepted`, ignora cualquier otro campo, vuelve a leer la clave del
+  vault y no persiste nada;
+- `CONFIG_GET` informa el estado, el proveedor y el modelo, y si la clave se resolvio.
+
+Lifecycle: es singleton por hive y se actualiza con el `.deb`, como el resto de los `SY.*`; no se
+borra ni se respawnea como un `IO.*`. No guarda config local: su unico estado es el de los hilos
+(seccion 5).
 
 ## 12. Observabilidad minima
 
 Debe exponer:
 
 - `state`: `UNCONFIGURED|CONFIGURED|FAILED_CONFIG`
-- contadores sugeridos:
+- contadores sugeridos (pendientes, seccion 13):
   - `threads_active`
   - `identity_upgrades_ok`
   - `identity_upgrades_error`
   - `frontdesk_handoff_ok`
   - `frontdesk_handoff_needs_input`
 
-## 13. Dependencias abiertas de core
+Los logs no llevan datos personales: del registro se loguean `ilk_id`, `tenant_id`, los codigos y
+que campos vinieron, nunca sus valores.
 
-- `ILK_PROVISION` ya acepta `tenant_id` explicito y los ICH provisorios son tenant-scoped;
-- `IO.api` debe seguir enviando `tenant_id` validado desde su integracion para preservar aislamiento multitenant.
+## 13. Pendientes
+
+- Prueba de que la persona es duena del email (por ejemplo un codigo de un solo uso) antes del merge
+  de la seccion 7.1. Hasta entonces, quien conoce el email de otro asocia su canal al ILK de esa
+  persona.
+- io.cloud `register_human` reporta el ILK que provisiono, no el ILK en el que quedo la persona
+  despues de un `MERGED` (seccion 10.4); el envelope estructurado no lleva `ilk_id`.
+- Los contadores de la seccion 12 (G6).
+- Los reintentos conversacionales: la regla "no loop" del prompt vuelve terminal un error
+  transitorio (G8).

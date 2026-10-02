@@ -1606,6 +1606,13 @@ async fn handle_register_human(sender: &NodeSender, state: &Arc<RuntimeState>, m
                 )
             }
         };
+    register_human_reply(&temp_ilk, &structured)
+}
+
+/// Cloud's answer from the frontdesk's structured verdict. `ilk_id` is where the person ended up:
+/// after a merge by email, the ILK that already had the email (the temporary io.cloud provisioned
+/// is then only an alias of it), reported with `merged` and `merged_from_ilk_id`.
+fn register_human_reply(temp_ilk: &str, structured: &serde_json::Map<String, Value>) -> Value {
     let success = structured
         .get("success")
         .and_then(Value::as_bool)
@@ -1619,15 +1626,31 @@ async fn handle_register_human(sender: &NodeSender, state: &Arc<RuntimeState>, m
         .get("error_code")
         .and_then(Value::as_str)
         .map(ToString::to_string);
-    json!({
+    let merged = success
+        && structured
+            .get("merged")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+    let ilk_id = structured
+        .get("ilk_id")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|id| success && !id.is_empty())
+        .unwrap_or(temp_ilk);
+    let mut reply = json!({
         "status": if success { "ok" } else { "error" },
         "op": "register_human",
-        "ilk_id": temp_ilk,
+        "ilk_id": ilk_id,
         "registration_status": if success { "complete" } else { "temporary" },
         "success": success,
+        "merged": merged,
         "human_message": human_message,
         "error_code": error_code,
-    })
+    });
+    if merged {
+        reply["merged_from_ilk_id"] = json!(temp_ilk);
+    }
+    reply
 }
 
 impl Config {
@@ -1773,6 +1796,38 @@ mod tests {
         assert_eq!(action, "delete_tenant");
         assert_eq!(payload, json!({"tenant_id": tenant}));
         assert!(translate_cloud_op("delete_tenant", None, &params).is_err());
+    }
+
+    #[test]
+    fn register_human_reports_the_ilk_the_person_ended_up_on() {
+        let verdict = |v: Value| v.as_object().cloned().expect("object");
+        let temp = "ilk:11111111-1111-4111-8111-111111111111";
+        let existing = "ilk:22222222-2222-4222-8222-222222222222";
+
+        let merged = register_human_reply(
+            temp,
+            &verdict(json!({"success": true, "human_message": "ok", "ilk_id": existing, "merged": true})),
+        );
+        assert_eq!(merged["ilk_id"], existing);
+        assert_eq!(merged["merged"], true);
+        assert_eq!(merged["merged_from_ilk_id"], temp);
+
+        let registered = register_human_reply(
+            temp,
+            &verdict(json!({"success": true, "human_message": "ok", "ilk_id": temp, "merged": false})),
+        );
+        assert_eq!(registered["ilk_id"], temp);
+        assert_eq!(registered["merged"], false);
+        assert!(registered.get("merged_from_ilk_id").is_none());
+
+        // A failure keeps the temporary: it is still the person's ILK.
+        let failed = register_human_reply(
+            temp,
+            &verdict(json!({"success": false, "human_message": "no", "error_code": "register_failed"})),
+        );
+        assert_eq!(failed["ilk_id"], temp);
+        assert_eq!(failed["registration_status"], "temporary");
+        assert_eq!(failed["merged"], false);
     }
 
     #[test]
