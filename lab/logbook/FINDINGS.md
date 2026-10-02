@@ -339,6 +339,17 @@
 - **Arreglo:** claves y valores de la query se decodifican; `+` queda literal (aquí son más comunes
   los `+` crudos, como `Etc/GMT+3`) y un `%` suelto se conserva.
 
+### A-31 🟡 Los servicios escriben códigos de color ANSI en el journal
+
+- **Qué pasa:** los niveles salen como `\x1b[33m WARN\x1b[0m` en `journalctl`. Un `grep ' WARN '`
+  no encuentra nada, y al validar 0.1.52 un conteo de errores dio 0 en falso hasta limpiar los
+  códigos con `sed 's/\x1b\[[0-9;]*m//g'`.
+- **Por qué:** cada binario arma su `tracing_subscriber` por su cuenta (36 archivos) y ninguno
+  apaga el color cuando la salida no es una terminal.
+- **Arreglo propuesto:** un init de tracing en el SDK con `with_ansi` solo si la salida es una
+  terminal, usado por todos los binarios. Es un cambio mecánico en 36 archivos: va con la pasada
+  de formato masivo (ítem 8 del lote), a decisión del operador.
+
 ### A-19 ✅ RESUELTO (0.1.43) — La policy publicada esperaba hasta 60 s al watcher de Syncthing
 
 - **Qué pasaba:** con 0.1.41 el apply llegaba a los 4 hives en 16 s, pero el clear tardó 63 s y el

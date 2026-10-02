@@ -21,6 +21,7 @@
 
 | Versión | Fecha (ART) | Commit | Alcance | Estado | Rollback |
 |---|---|---|---|---|---|
+| **0.1.52** | 2026-10-02 | `0670184` | motherbee + spokes (core) | ✅ live | snap `pre-cleanup-0-1-52` (las 4 VMs) · `apt install fluxbee=0.1.51` |
 | **0.1.51** | 2026-10-01 | `f7c2520` | motherbee + spokes (core) | ✅ live | snap `pre-query-decode-0-1-51` (las 4 VMs) · `apt install fluxbee=0.1.50` |
 | **0.1.50** | 2026-10-01 | `aa206ac` | motherbee + spokes (core) | ✅ live | snap `pre-config-routes-0-1-50` (las 4 VMs) · `apt install fluxbee=0.1.49` |
 | **0.1.49** | 2026-10-01 | `c921d1a` | motherbee + spokes (core) | ✅ live | snap `pre-architect-fixes-0-1-49` (las 4 VMs) · `apt install fluxbee=0.1.48` |
@@ -60,6 +61,38 @@
 > (`dpkg-scanpackages -m`) para rollback, pero su detalle vive en la bitácora, no acá.
 
 ---
+
+## 0.1.52 — limpieza de warnings sin cambio de comportamiento; primer deploy con `lab/ops.py`
+
+- **Fecha:** 2026-10-02 (ART) · **Versión anterior:** 0.1.51 · **Commit:** `0670184` (el código
+  es `e1f0323`; el resto son herramientas y documentos del lote de temas chicos, bitácora
+  `2026-10-02`).
+- **Alcance:** motherbee + los tres spokes (core-update).
+- **Qué cambió:**
+  - Nada de comportamiento: fuera campos que nadie leía, accesores de SHM sin uso e imports; tres
+    costuras de test pasan a `cfg(test)`. Warnings del workspace raíz: 64 → 31 (lo que queda es
+    código muerto que espera la aprobación del operador). El layout de la región de identity da el
+    mismo `total_len` en el SDK y en el router.
+  - Fuera del `.deb`: `lab/ops.py` (build, publish, deploy) y el publish incremental (`fcb5af6`).
+- **Build:** 21 min con `ops build 0.1.52 --wait`. **Publish:** 9 s, 52 paquetes.
+- **Deploy:** `ops deploy 0.1.52 --snapshot pre-cleanup-0-1-52 --drop pre-architect-fixes-0-1-49`,
+  226 s de punta a punta: snapshots en las 4 VMs, install en motherbee a las 10:24 UTC, spokes en
+  paralelo, health.
+- **Verificación en vivo:**
+  - Los 4 hives en 0.1.52 con el mismo manifest (`250e0aca…`). Ninguna unit corre un binario
+    `(deleted)` y todas reiniciaron después del install, salvo `fluxbee-syncthing` (el core-update
+    no la toca).
+  - 0 líneas ERROR en los journals de las 4 VMs desde el install. Los WARN son de los reinicios
+    (RPC y WAN que reconectan) y los ya conocidos (io_slack sin credenciales,
+    `EGRESS_MOTHERBEE_BYPASS`).
+  - Identity: la réplica de worker1 reintentó mientras el identity de motherbee reiniciaba
+    (10:25:21–10:27:03 UTC). Después aplicó el full sync, se suscribió al delta stream y resolvió
+    su ILK.
+  - OPA: los 4 hives `in_sync` y los routers `ok` (sin policy de usuario cargada). La policy de
+    sistema autorizó los core-updates.
+  - 0 rechazos del gate y 0 descartes por `routing.src`.
+  - CI: `rust-tests`, `admin-catalog-guard` y `router-dispatcher-guards` en verde en `0670184`.
+- **Rollback:** snapshot `pre-cleanup-0-1-52` o `apt install fluxbee=0.1.51`.
 
 ## 0.1.51 — el admin decodifica la query; SQLite espera el lock en todas las conexiones
 
