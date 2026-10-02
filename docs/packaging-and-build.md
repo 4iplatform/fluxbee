@@ -53,7 +53,7 @@ Definido en `packaging/base-nodes.json`:
 | IO.cloud | runtime (boot=true, role: motherbee) | corriendo (degradado si no hay Fluxbee Cloud — la Cloud es otro repo) |
 | io.api | runtime | instancia default `IO.api@motherbee` corriendo + spawnable |
 | io.slack | runtime | instancia default `IO.slack.default@motherbee` corriendo + spawnable |
-| ai.generic | runtime | instancia default `AI.chat@motherbee` corriendo + spawnable |
+| ai.generic | runtime | horneado, NO al boot: las instancias `AI.*` se crean con `run_node` cuando hacen falta |
 | wf.engine | runtime | horneado, NO al boot — los nodos WF.* se spawnean desde un **workflow package** que corre sobre este runtime, no por `run_node` sobre el runtime pelado (da `WF_RUNTIME_PACKAGE_REQUIRED`) |
 | io.linkedhelper | runtime | horneado, NO al boot (spawnable a demanda) |
 
@@ -195,20 +195,20 @@ sudo fluxbee-firstboot
 `fluxbee-firstboot` (idempotente): bootea PostgreSQL + crea rol/DBs, arranca el orchestrator,
 hace el `vault_put` del secreto de postgres (la **conexión a la DB queda resuelta sola en el
 vault**), reconecta los consumidores, auto-spawnea los runtimes managed de boot (IO.blob/IO.cloud), y **auto-spawnea
-las instancias default de los boot-runtimes** (io.api/io.slack/ai.generic). Al terminar
+las instancias default de los boot-runtimes** (io.api/io.slack/io.wapp). Al terminar
 imprime los **próximos pasos**.
 
 Después del firstboot quedan **corriendo**: el core `SY.*` + IO.blob + IO.cloud +
-`AI.chat@motherbee` + `IO.api@motherbee` + `IO.slack.default@motherbee` — varios
-**degradados** hasta cargar sus secretos. (`wf.engine` queda **horneado pero NO al boot** —
-`boot:false` en `base-nodes.json`; se spawnea a demanda desde un workflow package.)
+`IO.api@motherbee` + `IO.slack.default@motherbee` + `IO.wapp.default@motherbee` — varios
+**degradados** hasta cargar sus secretos. (`ai.generic` y `wf.engine` quedan **horneados pero NO
+al boot** — `boot:false` en `base-nodes.json`; sus instancias se crean a demanda.)
 
 ### 5.1 Lo que pone el usuario (secretos en el vault)
 
 Postgres ya está resuelto por el firstboot. Lo demás es del operador:
 
 ```bash
-# Key de proveedor AI (para que AI.chat / architect / admin / cognition funcionen):
+# Key de proveedor AI (la usan architect, admin, cognition, frontdesk y todo nodo AI.*):
 curl -sS -X POST http://127.0.0.1:8080/hives/motherbee/vault/secrets \
   -H 'content-type: application/json' \
   -d '{"key":"openai_root_pool","value":{"api_key":"sk-..."},"metadata":{"tenant_id":"tnt:00000000-0000-0000-0000-000000000001","resource_type":"openai"}}'

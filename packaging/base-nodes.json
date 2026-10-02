@@ -69,12 +69,12 @@
       "instance": "IO.wapp.default@motherbee"
     },
     {
+      "_note": "ai.generic is THE generic AI runtime: baked and spawnable, but no instance boots with the base install. AI nodes (AI.<name>@<hive>) are created for a purpose with run_node; their behavior comes by CONFIG_SET and their key is the hive AI provider's key in SY.vault (resource_type openai|anthropic).",
       "runtime": "ai.generic",
       "crate": "ai-generic",
       "bin": "ai_node_runner",
       "workspace": "nodes/ai",
-      "boot": true,
-      "instance": "AI.chat@motherbee"
+      "boot": false
     },
     {
       "_note": "wf.engine (wf-generic) is the WF engine runtime; WF.* nodes are spawned from a WORKFLOW PACKAGE that runs on it, not by run_node on the bare runtime (run_node returns WF_RUNTIME_PACKAGE_REQUIRED). So it ships baked+available but boot=false — publish a workflow package and spawn the WF node when needed.",

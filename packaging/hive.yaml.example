@@ -83,7 +83,7 @@ dist:
 # Declarative packaged platform topology per hive role. `nodes` is the start order;
 # `wait_for` is the subset the orchestrator blocks on before continuing
 # bootstrap. Only SY.* system authorities are listed here; the managed IO/AI
-# runtimes (io.api, io.blob, io.cloud, io.slack, ai.chat, ...) are NOT lifecycle
+# runtimes (io.api, io.blob, io.cloud, io.slack, ai.generic, ...) are NOT lifecycle
 # nodes — the orchestrator spawns them via run_node (fluxbee-firstboot boot_runtimes)
 # after the hive is ready. Identity seeds deterministic ILKs only for the SY.* entries.
 # Workers do not run SY.vault.

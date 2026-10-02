@@ -68,7 +68,7 @@
           {
             "node_name": "AI.specialist@worker-220",
             "hive": "worker-220",
-            "runtime": "AI.common",
+            "runtime": "ai.generic",
             "config": {},
             "ownership": "solution"
           }

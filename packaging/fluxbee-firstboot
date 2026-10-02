@@ -111,7 +111,7 @@ if [ "$HIVE_READY" != "1" ]; then
   exit 1
 fi
 # IO.blob and IO.cloud are no longer systemd singletons: they are boot=true managed runtimes,
-# spawned below by the same boot_runtimes loop as io.api/io.slack/ai.chat (they come up degraded
+# spawned below by the same boot_runtimes loop as io.api/io.slack/io.wapp (they come up degraded
 # until configured via CONFIG_SET). Nothing to start here anymore.
 
 echo "== [6/6] spawn base node instances (running, degraded until configured) =="

@@ -1642,7 +1642,7 @@ impl MyNode {
 | Handshake HELLO/ANNOUNCE | Librería |
 | Reconexión automática con backoff | Librería |
 | Envío de WITHDRAW en close() | Librería |
-| Resolver UUID L1 (persistente o efÃ­mero) | Librería |
+| Resolver UUID L1 (persistente o efímero) | Librería |
 | Agregar @isla al nombre | Librería |
 | Request/response (correlación) | **Nodo** |
 | Qué hacer post-reconexión | **Nodo** |

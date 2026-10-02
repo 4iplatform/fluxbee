@@ -88,7 +88,7 @@ Rules:
 Pattern: `TYPE.name@hive`
 
 Examples:
-- `AI.chat@motherbee`
+- `AI.sales@motherbee`
 - `WF.invoice@motherbee`
 - `IO.api.support@motherbee`
 - `SY.admin@motherbee`
@@ -102,13 +102,14 @@ Examples:
 - `wf.engine`
 - `io.api`
 - `io.slack`
-- `sy.frontdesk.gov`
+- `io.wapp`
 
 Rules:
 - Do not create new mixed-case runtime names.
 - Node identity and runtime key are different concepts.
-- `AI.chat@motherbee` is a node.
+- `AI.sales@motherbee` is a node (an instance of `ai.generic`).
 - `ai.generic` is a runtime.
+- `SY.*` nodes are core services, not runtimes: never `run_node` them.
 
 ### 2.3 Creating an Internet-facing `IO.api`
 
@@ -163,9 +164,14 @@ If a worker hive does not exist yet, include topology/VPN creation in desired st
 
 Use when the work is conversational, interpretive, or agentic.
 
-Common runtime bases:
-- `ai.generic` for generic new AI nodes
-- `ai.chat` is an existing chat runtime, not the default base for cloning new AI behavior
+Every AI node is an instance of the `ai.generic` runtime; there is no other AI runtime, and no AI
+node boots with the base install. To make one:
+- `run_node` with `runtime: ai.generic` and the node's tenant;
+- `CONFIG_SET` its behavior: `behavior.kind: ai_chat`, `model`, and instructions;
+- give it a role, skills and handbook with `set_ilk_definition` on its ILK.
+
+The node does not name a Vault key: it uses the hive's AI provider key in SY.vault (resource_type
+`openai` or `anthropic`), for its tenant first and then the root tenant.
 
 ### 4.2 WF nodes and workflows
 
@@ -289,7 +295,7 @@ Examples:
 - the operator is describing a business flow, not just a network path
 
 Examples:
-- inbound from `IO.api.support@motherbee` goes to `AI.chat@motherbee`
+- inbound from `IO.api.support@motherbee` goes to `AI.support@motherbee`
 - the same interaction is mirrored to `IO.slack.support@motherbee`
 - AI response should also be echoed to Slack
 
@@ -493,7 +499,7 @@ Notes:
 ### 8.1.1 Tenant discovery before first spawn
 
 When the operator says things like:
-- "use the same tenant as `AI.chat@motherbee`"
+- "use the same tenant as `AI.sales@motherbee`"
 - "associate this tenant to that sponsor"
 - "create the client under the same sponsor as another tenant"
 

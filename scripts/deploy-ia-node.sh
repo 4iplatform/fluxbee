@@ -12,14 +12,10 @@ Usage:
 Required:
   --base <url>                 Admin API base URL (example: http://127.0.0.1:8080)
   --hive-id <id>               Target hive ID (example: motherbee)
-  --runtime <ai.runtime>       Runtime key (example: ai.common)
+  --runtime <ai.runtime>       Runtime key (example: ai.generic)
   --version <ver>              Runtime version to publish (example: 0.1.0)
 
 Options:
-  --mode <default|gov>         Deprecated compatibility flag (ignored)
-  --forced-node-name <name>    Pass-through to publish-ia-runtime.sh (deprecated emergency override)
-  --forced-dynamic-config-dir <path>
-                               Pass-through to publish-ia-runtime.sh (deprecated emergency override)
   --node-name <name@hive>      If provided, script also spawns/restarts node
   --tenant-id <tnt:...>        Tenant ID for identity registration (payload + config fallback)
   --runtime-version <ver>      Runtime version for spawn payload (default: current)
@@ -55,7 +51,7 @@ Options:
 
 Notes:
   - Runtime and node_name are different concepts. Example:
-    runtime=ai.common with node_name=AI.chat@motherbee.
+    runtime=ai.generic with node_name=AI.sales@motherbee.
   - Script parses manifest_version/manifest_hash from publish output.
   - On update status=sync_pending, it retries according to --update-retries.
   - AI runner source home in repo: nodes/ai/ai-generic
@@ -73,10 +69,6 @@ BASE=""
 HIVE_ID=""
 RUNTIME=""
 VERSION=""
-MODE="default"
-MODE_SET=0
-FORCED_NODE_NAME=""
-FORCED_DYNAMIC_CONFIG_DIR=""
 RUNTIME_VERSION="current"
 UPDATE_SCOPE="targeted"
 NODE_NAME=""
@@ -108,9 +100,6 @@ while [[ $# -gt 0 ]]; do
     --hive-id) HIVE_ID="${2:-}"; shift 2 ;;
     --runtime) RUNTIME="${2:-}"; shift 2 ;;
     --version) VERSION="${2:-}"; shift 2 ;;
-    --mode) MODE="${2:-}"; MODE_SET=1; shift 2 ;;
-    --forced-node-name) FORCED_NODE_NAME="${2:-}"; shift 2 ;;
-    --forced-dynamic-config-dir) FORCED_DYNAMIC_CONFIG_DIR="${2:-}"; shift 2 ;;
     --runtime-version) RUNTIME_VERSION="${2:-}"; shift 2 ;;
     --update-scope) UPDATE_SCOPE="${2:-}"; shift 2 ;;
     --node-name) NODE_NAME="${2:-}"; shift 2 ;;
@@ -154,10 +143,6 @@ case "$UPDATE_SCOPE" in
     exit 1
     ;;
 esac
-
-if [[ "$MODE_SET" == "1" ]]; then
-  echo "Warning: --mode is deprecated and ignored; runtime behavior is selected by --runtime" >&2
-fi
 
 if [[ "$FORCE_SKIP_SPAWN" == "1" ]]; then
   DO_SPAWN=0
@@ -377,12 +362,6 @@ log "starting deploy; log_file=$LOG_FILE"
 log "step=publish runtime=$RUNTIME version=$VERSION"
 
 publish_cmd=(bash "$PUBLISH_SCRIPT" --runtime "$RUNTIME" --version "$VERSION" --set-current)
-if [[ -n "$FORCED_NODE_NAME" ]]; then
-  publish_cmd+=(--forced-node-name "$FORCED_NODE_NAME")
-fi
-if [[ -n "$FORCED_DYNAMIC_CONFIG_DIR" ]]; then
-  publish_cmd+=(--forced-dynamic-config-dir "$FORCED_DYNAMIC_CONFIG_DIR")
-fi
 if [[ "$USE_SUDO" == "1" ]]; then
   publish_cmd+=(--sudo)
 fi

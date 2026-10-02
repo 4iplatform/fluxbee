@@ -9645,11 +9645,11 @@ fn admin_action_path_params(action: &str) -> Vec<serde_json::Value> {
         ],
         "get_runtime" => vec![
             admin_action_path_param("hive", "string", "Target hive id in the URL path."),
-            admin_action_path_param("runtime", "string", "Runtime name, for example ai.chat."),
+            admin_action_path_param("runtime", "string", "Runtime name, for example ai.generic."),
         ],
         "remove_runtime_version" => vec![
             admin_action_path_param("hive", "string", "Target hive id in the URL path."),
-            admin_action_path_param("runtime", "string", "Runtime name, for example ai.chat."),
+            admin_action_path_param("runtime", "string", "Runtime name, for example ai.generic."),
             admin_action_path_param("version", "string", "Runtime version to delete."),
         ],
         "get_ilk" | "set_ilk_definition" | "delete_ilk" | "restore_ilk" | "purge_ilk" => vec![
@@ -9827,7 +9827,7 @@ fn admin_action_body_required_fields(action: &str) -> Vec<serde_json::Value> {
             "Fully-qualified node name to start.",
         )],
         "add_route" => vec![
-            admin_action_body_field("prefix", "string", "Route prefix matched against message destinations, for example AI.chat or tenant.acme."),
+            admin_action_body_field("prefix", "string", "Route prefix matched against message destinations, for example AI.sales or tenant.acme."),
             admin_action_body_field(
                 "action",
                 "string",
@@ -10457,28 +10457,28 @@ fn admin_action_example_payload(action: &str) -> serde_json::Value {
             "ssh_password": "<bootstrap-password-or-omit-if-key-seeded>"
         }),
         "run_node" => serde_json::json!({
-            "node_name": "AI.chat@motherbee",
+            "node_name": "AI.sales@motherbee",
             "runtime": "ai.generic",
             "runtime_version": "current",
             "tenant_id": "tnt:43d576a3-d712-4d91-9245-5d5463dd693e"
         }),
         "start_node" => serde_json::json!({
-            "node_name": "AI.chat@motherbee"
+            "node_name": "AI.sales@motherbee"
         }),
         "restart_node" => serde_json::json!({
-            "node_name": "AI.chat@motherbee"
+            "node_name": "AI.sales@motherbee"
         }),
         "kill_node" => serde_json::json!({
             "force": false,
             "purge_instance": true
         }),
         "add_route" => serde_json::json!({
-            "prefix": "AI.chat.",
+            "prefix": "AI.sales.",
             "action": "FORWARD",
             "next_hop_hive": "worker-220"
         }),
         "delete_route" => serde_json::json!({
-            "prefix": "AI.chat."
+            "prefix": "AI.sales."
         }),
         "add_vpn" => serde_json::json!({
             "pattern": "worker-*",
@@ -10503,7 +10503,6 @@ fn admin_action_example_payload(action: &str) -> serde_json::Value {
             "config": {
                 "behavior": {
                     "kind": "ai_chat",
-                    "vault_key": "ai/sales",
                     "model": "gpt-5.5"
                 }
             },
@@ -10555,7 +10554,7 @@ fn admin_action_example_payload(action: &str) -> serde_json::Value {
             "manifest_hash": "sha256:deadbeef",
             "category": "runtime",
             "manifest_version": 42,
-            "runtime": "ai.common",
+            "runtime": "ai.generic",
             "runtime_version": "0.1.2"
         }),
         "sync_hint" => serde_json::json!({
@@ -10736,21 +10735,21 @@ fn admin_action_example_scmd(action: &str) -> Option<String> {
         "list_nodes" => "curl -X GET /hives/motherbee/nodes",
         "get_node_status" => "curl -X GET /hives/motherbee/nodes/SY.admin@motherbee/status",
         "get_node_state" => "curl -X GET /hives/motherbee/nodes/SY.admin@motherbee/state",
-        "get_node_config" => "curl -X GET /hives/motherbee/nodes/AI.chat@motherbee/config",
+        "get_node_config" => "curl -X GET /hives/motherbee/nodes/AI.sales@motherbee/config",
         "run_node" => {
-            r#"curl -X POST /hives/motherbee/nodes -d '{"node_name":"AI.chat@motherbee","runtime":"ai.generic","runtime_version":"current","tenant_id":"tnt:43d576a3-d712-4d91-9245-5d5463dd693e"}'"#
+            r#"curl -X POST /hives/motherbee/nodes -d '{"node_name":"AI.sales@motherbee","runtime":"ai.generic","runtime_version":"current","tenant_id":"tnt:43d576a3-d712-4d91-9245-5d5463dd693e"}'"#
         }
         "start_node" => {
-            r#"curl -X POST /hives/motherbee/nodes/AI.chat@motherbee/start -d '{"node_name":"AI.chat@motherbee"}'"#
+            r#"curl -X POST /hives/motherbee/nodes/AI.sales@motherbee/start -d '{"node_name":"AI.sales@motherbee"}'"#
         }
         "restart_node" => {
-            r#"curl -X POST /hives/motherbee/nodes/AI.chat@motherbee/restart -d '{"node_name":"AI.chat@motherbee"}'"#
+            r#"curl -X POST /hives/motherbee/nodes/AI.sales@motherbee/restart -d '{"node_name":"AI.sales@motherbee"}'"#
         }
         "kill_node" => {
-            r#"curl -X DELETE /hives/motherbee/nodes/AI.chat@motherbee -d '{"force":false,"purge_instance":true}'"#
+            r#"curl -X DELETE /hives/motherbee/nodes/AI.sales@motherbee -d '{"force":false,"purge_instance":true}'"#
         }
         "remove_node_instance" => {
-            "curl -X DELETE /hives/motherbee/nodes/AI.chat@motherbee/instance"
+            "curl -X DELETE /hives/motherbee/nodes/AI.sales@motherbee/instance"
         }
         "list_recent_commands" => {
             "curl -X GET '/hives/motherbee/commands?limit=20&status=error'"
@@ -10821,15 +10820,15 @@ fn admin_action_example_scmd(action: &str) -> Option<String> {
         "list_versions" => "curl -X GET /versions",
         "get_versions" => "curl -X GET /hives/motherbee/versions",
         "list_runtimes" => "curl -X GET /hives/motherbee/runtimes",
-        "get_runtime" => "curl -X GET /hives/motherbee/runtimes/ai.chat",
+        "get_runtime" => "curl -X GET /hives/motherbee/runtimes/ai.generic",
         "remove_runtime_version" => {
-            "curl -X DELETE /hives/motherbee/runtimes/ai.chat/versions/1.2.3"
+            "curl -X DELETE /hives/motherbee/runtimes/ai.generic/versions/1.2.3"
         }
         "list_routes" => "curl -X GET /hives/motherbee/routes",
         "add_route" => {
-            r#"curl -X POST /hives/motherbee/routes -d '{"prefix":"AI.chat.","action":"FORWARD","next_hop_hive":"worker-220"}'"#
+            r#"curl -X POST /hives/motherbee/routes -d '{"prefix":"AI.sales.","action":"FORWARD","next_hop_hive":"worker-220"}'"#
         }
-        "delete_route" => "curl -X DELETE /hives/motherbee/routes/AI.chat.",
+        "delete_route" => "curl -X DELETE /hives/motherbee/routes/AI.sales.",
         "list_vpns" => "curl -X GET /hives/motherbee/vpns",
         "add_vpn" => {
             r#"curl -X POST /hives/motherbee/vpns -d '{"pattern":"worker-*","vpn_id":220}'"#
@@ -10849,7 +10848,7 @@ fn admin_action_example_scmd(action: &str) -> Option<String> {
         "list_drift_alerts" => "curl -X GET /drift-alerts",
         "get_drift_alerts" => "curl -X GET /hives/motherbee/drift-alerts",
         "update" => {
-            r#"curl -X POST /hives/motherbee/update -d '{"manifest_hash":"sha256:deadbeef","category":"runtime","manifest_version":42,"runtime":"ai.common","runtime_version":"0.1.2"}'"#
+            r#"curl -X POST /hives/motherbee/update -d '{"manifest_hash":"sha256:deadbeef","category":"runtime","manifest_version":42,"runtime":"ai.generic","runtime_version":"0.1.2"}'"#
         }
         "sync_hint" => {
             r#"curl -X POST /hives/motherbee/sync-hint -d '{"channel":"blob","wait_for_idle":true,"timeout_ms":30000}'"#
@@ -11004,7 +11003,7 @@ fn admin_action_request_notes(action: &str) -> Vec<&'static str> {
             "The payload.config object is node-defined and is not interpreted by SY.admin.",
             "Before mutating AI.* or IO.*, call node_control_config_get and set config_version to response.config_version + 1. A smaller value is stale; an equal value is idempotent and will not apply a change.",
             "Do not use config_version from get_node_config/_system as a substitute unless it exactly matches the live CONFIG_GET response; the canonical source is node_control_config_get.",
-            "For ai.generic chat, use config.behavior.kind=ai_chat with both vault_key and model. Vault metadata selects the provider; the key never selects the model.",
+            "For ai.generic chat, use config.behavior.kind=ai_chat with a model. The key is not config: the node reads the hive AI provider's key from SY.vault (resource_type openai|anthropic), for its tenant and then the root tenant.",
             "Do not put cognitive assets under CONFIG_SET config.assets. Apply role_hash, skill_hashes, handbook_hashes, and personality_hash with set_ilk_definition against the agent ILK.",
             "For WF.* v1, CONFIG_SET is persist-only and returns restart_required; it does not hot-apply CONFIG_CHANGED.",
             "For WF.* v1, do not mutate _system through CONFIG_SET. Managed package/runtime metadata remains owned by orchestrator.",
@@ -11152,7 +11151,7 @@ fn admin_action_request_notes(action: &str) -> Vec<&'static str> {
             "These endpoints report core component versions and runtime availability/current selections.",
             "They describe versions available to a hive, not the state of one node instance.",
             "For SY nodes, map node names to core components: for example SY.identity@motherbee -> core.components['sy-identity'].version.",
-            "For runtime-backed nodes, map the node runtime family to runtimes.runtimes[<runtime>].current: for example AI.chat@motherbee -> runtimes.runtimes['ai.chat'].current.",
+            "For runtime-backed nodes, use the runtime the node was spawned from (get_node_config -> config._system.runtime): every AI.* node runs ai.generic, so AI.sales@motherbee -> runtimes.runtimes['ai.generic'].current.",
             "For IO or WF nodes with instance suffixes, use the runtime family/prefix, for example IO.slack.T123@motherbee -> io.slack and WF.blob.consume.diag.x@y -> wf.blob.consume.diag when present.",
             "Use GET /versions for cross-hive comparisons and GET /hives/{hive}/versions for one hive.",
         ],

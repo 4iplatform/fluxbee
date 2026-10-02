@@ -11270,8 +11270,8 @@ fn handle_meta_scmd(raw: &str) -> Option<Value> {
             "syntax": "SCMD: curl -X METHOD /relative/path [-d '{...}']",
             "notes": [
                 "Usa siempre paths relativos a SY.admin, por ejemplo /hives/motherbee/nodes.",
-                "Para descubrir el catÃ¡logo dinÃ¡mico completo, usÃ¡ GET /admin/actions.",
-                "Para ayuda detallada de una acciÃ³n, usÃ¡ GET /admin/actions/{action}."
+                "Para descubrir el catálogo dinámico completo, usá GET /admin/actions.",
+                "Para ayuda detallada de una acción, usá GET /admin/actions/{action}."
             ],
             "examples": [
                 "SCMD: curl -X GET /admin/actions",
@@ -11279,11 +11279,11 @@ fn handle_meta_scmd(raw: &str) -> Option<Value> {
                 "SCMD: curl -X GET /hives",
                 "SCMD: curl -X GET /inventory/summary",
                 "SCMD: curl -X GET /hives/motherbee/versions",
-                "SCMD: curl -X GET /hives/motherbee/runtimes/ai.chat",
+                "SCMD: curl -X GET /hives/motherbee/runtimes/ai.generic",
                 "SCMD: curl -X GET /hives/motherbee/nodes",
-                "SCMD: curl -X GET /hives/motherbee/nodes/AI.chat@motherbee/status",
+                "SCMD: curl -X GET /hives/motherbee/nodes/AI.sales@motherbee/status",
                 "SCMD: curl -X GET /hives/motherbee/nodes/SY.frontdesk.gov@motherbee/config",
-                "SCMD: curl -X POST /hives/motherbee/nodes/AI.chat@motherbee/control/config-get -d '{\"requested_by\":\"archi\"}'",
+                "SCMD: curl -X POST /hives/motherbee/nodes/AI.sales@motherbee/control/config-get -d '{\"requested_by\":\"archi\"}'",
                 "SCMD: curl -X GET /hives/motherbee/identity/ilks",
                 "SCMD: curl -X GET /hives/motherbee/identity/ilks/ilk:550e8400-e29b-41d4-a716-446655440000",
                 "SCMD: curl -X GET /hives/motherbee/deployments",
@@ -11297,7 +11297,7 @@ fn handle_meta_scmd(raw: &str) -> Option<Value> {
             "mutation_examples": [
                 "SCMD: curl -X POST /hives -d '{\"hive_id\":\"worker-220\",\"address\":\"192.168.8.220\"}'",
                 "SCMD: curl -X POST /hives/motherbee/sync-hint -d '{\"channel\":\"blob\",\"wait_for_idle\":true,\"timeout_ms\":30000}'",
-                "SCMD: curl -X POST /hives/motherbee/nodes -d '{\"node_name\":\"AI.chat@motherbee\",\"runtime_version\":\"current\"}'",
+                "SCMD: curl -X POST /hives/motherbee/nodes -d '{\"node_name\":\"AI.sales@motherbee\",\"runtime\":\"ai.generic\",\"runtime_version\":\"current\"}'",
                 "SCMD: curl -X POST /hives/motherbee/identity/ilks/ilk:550e8400-e29b-41d4-a716-446655440000/definition -d '{\"definition\":{\"role_hash\":\"1111111111111111111111111111111111111111111111111111111111111111\",\"skill_hashes\":[],\"handbook_hashes\":[],\"personality_hash\":\"4444444444444444444444444444444444444444444444444444444444444444\"}}'",
                 "Configure the hive-wide ai.default_provider and ai.providers.<provider>.model in hive.yaml."
             ]

@@ -59,10 +59,10 @@ Rules:
 - Use the available read-only system tool when you need live Fluxbee state instead of guessing.
 - For all nodes across the whole system or across multiple hives, use `/inventory` or `/inventory/summary` first instead of guessing hive names or looping over stale hives from conversation memory.
 - Use `/hives/{hive}/nodes` only for one explicit hive.
-- Distinguish runtime names from node instance names: `ai.chat` is a runtime/package; `AI.chat@motherbee` is a node instance.
+- Distinguish runtime names from node instance names: `ai.generic` is a runtime/package; `AI.sales@motherbee` is a node instance of it.
 - For software/core/runtime versions, use `/versions` or `/hives/{hive}/versions`. Do not infer versions from `/hives/{hive}/nodes`.
-- When the operator asks for runtime/package info such as `ai.chat`, use `/hives/{hive}/runtimes/{runtime}` or `/hives/{hive}/runtimes`, not `/hives/{hive}/nodes`.
-- When the operator asks for a node software version, map the node to the versions payload explicitly: SY.identity@hive -> core.components['sy-identity'].version; AI.chat@hive -> runtimes.runtimes['ai.chat'].current; IO.slack.T123@hive -> runtimes.runtimes['io.slack'].current.
+- When the operator asks for runtime/package info such as `ai.generic`, use `/hives/{hive}/runtimes/{runtime}` or `/hives/{hive}/runtimes`, not `/hives/{hive}/nodes`.
+- When the operator asks for a node software version, map the node to the versions payload explicitly: SY.identity@hive -> core.components['sy-identity'].version; AI.sales@hive -> its _system.runtime (ai.generic) -> runtimes.runtimes['ai.generic'].current; IO.slack.T123@hive -> runtimes.runtimes['io.slack'].current.
 - For hive-scoped deployments or drift alerts, use `/hives/{hive}/deployments` or `/hives/{hive}/drift-alerts`. Do not synthesize or locally filter a hive-specific answer from `/deployments` or `/drift-alerts` when the hive endpoint exists.
 - If a hive-specific endpoint returns an empty list, report exactly that it returned no recorded entries for that hive. Do not invent filtered rows from broader results.
 - For drift alerts specifically, if `/hives/{hive}/drift-alerts` returns `entries: []`, answer that there are no recorded drift alerts for that hive. Do not infer drift from `/deployments`, `/versions`, `/nodes`, or from the global `/drift-alerts` list.
@@ -403,7 +403,7 @@ read-only SY.timer operations. Use /admin/actions or /admin/actions/{action} whe
 dynamic help; those responses include standardized request_contract metadata, body fields,
 notes, and example_scmd values. Treat path_patterns as templates only. Prefer example_scmd
 for real execution shape, and never execute placeholder paths like /hives/{hive}/... literally.
-Distinguish runtime names from node instances: `ai.chat` is a runtime, while `AI.chat@{hive}`
+Distinguish runtime names from node instances: `ai.generic` is a runtime, while `AI.sales@{hive}`
 is a node instance. Distinguish stored node config from live node control-plane config:
 GET /hives/{hive}/nodes/{node_name}/config reads persisted effective config.json, while
 POST /hives/{hive}/nodes/{node_name}/control/config-get asks the node for live CONFIG_GET.
@@ -661,7 +661,7 @@ Always do a CONFIG_GET first to read the current config_version before calling t
 
 ```json
 {
-  "node_name": "string (required) — e.g. AI.chat@motherbee",
+  "node_name": "string (required) — e.g. AI.sales@motherbee",
   "config": "object (optional) — config payload del nodo",
   "config_json": "string (optional) — alternativa serializada",
   "hive": "string (optional)",

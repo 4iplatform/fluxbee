@@ -11,7 +11,7 @@
     "successful_shape": {
       "artifact": {
         "files": {
-          "package.json": "{\"name\":\"ai.example\",\"version\":\"0.1.0\",\"type\":\"config_only\",\"runtime_base\":\"AI.common\"}",
+          "package.json": "{\"name\":\"ai.example\",\"version\":\"0.1.0\",\"type\":\"config_only\",\"runtime_base\":\"ai.generic\"}",
           "config/default-config.json": "{}"
         }
       }
@@ -42,7 +42,7 @@
     "successful_shape": {
       "artifact": {
         "files": {
-          "package.json": "{\"name\":\"ai.example\",\"version\":\"0.1.0\",\"type\":\"config_only\",\"runtime_base\":\"AI.common\"}"
+          "package.json": "{\"name\":\"ai.example\",\"version\":\"0.1.0\",\"type\":\"config_only\",\"runtime_base\":\"ai.generic\"}"
         }
       }
     },
@@ -53,7 +53,7 @@
     "do_not_repeat": [
       "do not keep the invalid runtime_base from the previous attempt",
       "do not use a runtime_base with an @hive suffix — just the plain runtime name",
-      "do not use 'AI.chat' as a base for new config_only packages — use 'AI.common'"
+      "do not use a node name such as 'AI.sales' as a base — AI config_only packages build on the runtime 'ai.generic'"
     ],
     "failure_class": "ARTIFACT_CONTRACT_INVALID",
     "recorded_from_run": null,
