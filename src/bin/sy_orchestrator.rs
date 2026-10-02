@@ -40,8 +40,7 @@ use fluxbee_sdk::{
 };
 use json_router::{
     runtime_manifest::{
-        load_runtime_manifest_from_paths as load_runtime_manifest_paths_shared,
-        parse_runtime_manifest_file as parse_runtime_manifest_file_shared, RuntimeManifest,
+        load_runtime_manifest_from_paths as load_runtime_manifest_paths_shared, RuntimeManifest,
         RuntimeManifestEntry,
     },
     shm::{
@@ -3677,7 +3676,7 @@ fn prune_core_backup_generations_in(root: &Path, keep: usize) {
     let Ok(entries) = fs::read_dir(root) else {
         return;
     };
-    let mut generations: Vec<PathBuf> = entries
+    let generations: Vec<PathBuf> = entries
         .flatten()
         .map(|entry| entry.path())
         .filter(|path| {
@@ -5536,6 +5535,7 @@ struct EgressVerification {
 /// First usable host of a CIDR: `(network & mask) + 1`. Uses std bit-math; no
 /// CIDR crate needed (spec Open Question #2). `/31` and `/32` have no derived
 /// gateway address and require an explicit `edge_ip`.
+#[cfg(test)]
 fn first_usable_ipv4(cidr: &str) -> Result<std::net::Ipv4Addr, OrchestratorError> {
     let (network, _, prefix) = parse_ipv4_cidr_network(cidr)?;
     first_usable_ipv4_from_network(cidr, network, prefix)
@@ -10987,6 +10987,7 @@ fn verify_runtime_artifacts_for_scope(
     Ok(errors)
 }
 
+#[cfg(test)]
 fn verify_runtime_current_artifacts_with_root(
     manifest: &RuntimeManifest,
     runtimes_root: &Path,
@@ -11134,11 +11135,12 @@ fn orchestrator_runtime_dir() -> PathBuf {
     json_router::paths::storage_root_dir().join("orchestrator")
 }
 
+#[cfg(test)]
 fn parse_runtime_manifest_file(
     path: &Path,
     data: &str,
 ) -> Result<RuntimeManifest, OrchestratorError> {
-    parse_runtime_manifest_file_shared(path, data).map_err(Into::into)
+    json_router::runtime_manifest::parse_runtime_manifest_file(path, data).map_err(Into::into)
 }
 
 fn load_runtime_manifest_result() -> Result<Option<RuntimeManifest>, OrchestratorError> {

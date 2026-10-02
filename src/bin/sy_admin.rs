@@ -285,7 +285,6 @@ struct AdminExecutorFailure {
 struct AdminContext {
     config_dir: PathBuf,
     state_dir: PathBuf,
-    socket_dir: PathBuf,
     blob_root: PathBuf,
     node_name: String,
     hive_id: String,
@@ -620,7 +619,6 @@ async fn main() -> Result<(), AdminError> {
     let http_ctx = AdminContext {
         config_dir: config_dir.clone(),
         state_dir: state_dir.clone(),
-        socket_dir: socket_dir.clone(),
         blob_root,
         node_name,
         hive_id,
@@ -692,8 +690,6 @@ struct OpaRequest {
     entrypoint: Option<String>,
     #[serde(default)]
     version: Option<u64>,
-    #[serde(default)]
-    action: Option<String>,
     #[serde(default, alias = "target")]
     hive: Option<String>,
 }
@@ -5510,7 +5506,6 @@ fn parse_internal_opa_request(
             rego: None,
             entrypoint: None,
             version: None,
-            action: None,
             hive: None,
         }
     } else {
@@ -15493,7 +15488,6 @@ mod tests {
         let ctx = AdminContext {
             config_dir: root.join("config"),
             state_dir: state_dir.clone(),
-            socket_dir: root.join("run"),
             blob_root: root.join("blob"),
             node_name: format!("SY.admin@{PRIMARY_HIVE_ID}"),
             hive_id: PRIMARY_HIVE_ID.to_string(),
@@ -15552,7 +15546,6 @@ mod tests {
             rego: None,
             entrypoint: None,
             version: None,
-            action: None,
             hive: None,
         }
     }

@@ -631,7 +631,6 @@ struct IdentityRegionLayout {
     ich_mapping_offset: usize,
     ilk_alias_offset: usize,
     vocabulary_offset: usize,
-    variable_offset: usize,
     total_len: usize,
     limits: IdentityRegionLimits,
 }
@@ -753,73 +752,61 @@ pub struct MemoryHeaderSnapshot {
 }
 
 pub struct RouterRegionWriter {
-    name: String,
     mmap: MmapMut,
     layout: RegionLayout,
 }
 
 pub struct RouterRegionReader {
-    name: String,
     mmap: Mmap,
     layout: RegionLayout,
 }
 
 pub struct ConfigRegionWriter {
-    name: String,
     mmap: MmapMut,
     layout: RegionLayout,
 }
 
 pub struct ConfigRegionReader {
-    name: String,
     mmap: Mmap,
     layout: RegionLayout,
 }
 
 pub struct LsaRegionWriter {
-    name: String,
     mmap: MmapMut,
     layout: RegionLayout,
 }
 
 pub struct LsaRegionReader {
-    name: String,
     mmap: Mmap,
     layout: RegionLayout,
 }
 
 pub struct OpaRegionReader {
-    name: String,
     mmap: Mmap,
 }
 
 pub struct OpaRegionWriter {
-    name: String,
     mmap: MmapMut,
 }
 
 pub struct IdentityRegionWriter {
-    name: String,
     mmap: MmapMut,
     layout: IdentityRegionLayout,
 }
 
 pub struct IdentityRegionReader {
-    name: String,
     mmap: Mmap,
     layout: IdentityRegionLayout,
 }
 
 #[derive(Debug)]
 pub struct MemoryRegionWriter {
-    name: String,
     mmap: MmapMut,
     layout: RegionLayout,
 }
 
 #[derive(Debug)]
 pub struct MemoryRegionReader {
-    name: String,
     mmap: Mmap,
     layout: RegionLayout,
 }
@@ -890,11 +877,7 @@ impl RouterRegionWriter {
             initialize_router_header(mmap, router_uuid, hive_id, router_name, is_gateway);
         })?;
         normalize_seq_header::<ShmHeader>(&mut mmap, layout.header_offset, "router shm")?;
-        Ok(Self {
-            name: name.to_string(),
-            mmap,
-            layout,
-        })
+        Ok(Self { mmap, layout })
     }
 
     pub fn read_snapshot(&self) -> Option<ShmSnapshot> {
@@ -1022,11 +1005,6 @@ impl RouterRegionWriter {
     fn header_mut(&mut self) -> Option<&mut ShmHeader> {
         header_mut::<ShmHeader>(&mut self.mmap, self.layout.header_offset)
     }
-
-    fn nodes_mut(&mut self) -> Option<&mut [NodeEntry]> {
-        let offset = self.layout.node_offset;
-        slice_mut::<NodeEntry>(&mut self.mmap, offset, MAX_NODES as usize)
-    }
 }
 
 impl RouterRegionReader {
@@ -1034,11 +1012,7 @@ impl RouterRegionReader {
         validate_name(name)?;
         let layout = layout_router();
         let mmap = open_read_only_region(name, layout.total_len)?;
-        Ok(Self {
-            name: name.to_string(),
-            mmap,
-            layout,
-        })
+        Ok(Self { mmap, layout })
     }
 
     pub fn read_snapshot(&self) -> Option<ShmSnapshot> {
@@ -1059,11 +1033,7 @@ impl ConfigRegionWriter {
             initialize_config_header(mmap, owner_uuid, hive_id);
         })?;
         normalize_seq_header::<ConfigHeader>(&mut mmap, layout.header_offset, "config shm")?;
-        Ok(Self {
-            name: name.to_string(),
-            mmap,
-            layout,
-        })
+        Ok(Self { mmap, layout })
     }
 
     pub fn read_snapshot(&self) -> Option<ConfigSnapshot> {
@@ -1174,16 +1144,6 @@ impl ConfigRegionWriter {
     fn header_mut(&mut self) -> Option<&mut ConfigHeader> {
         header_mut::<ConfigHeader>(&mut self.mmap, self.layout.header_offset)
     }
-
-    fn routes_mut(&mut self) -> Option<&mut [StaticRouteEntry]> {
-        let offset = self.layout.static_offset;
-        slice_mut::<StaticRouteEntry>(&mut self.mmap, offset, MAX_STATIC_ROUTES as usize)
-    }
-
-    fn vpns_mut(&mut self) -> Option<&mut [VpnAssignment]> {
-        let offset = self.layout.vpn_offset;
-        slice_mut::<VpnAssignment>(&mut self.mmap, offset, MAX_VPN_ASSIGNMENTS as usize)
-    }
 }
 
 impl ConfigRegionReader {
@@ -1191,11 +1151,7 @@ impl ConfigRegionReader {
         validate_name(name)?;
         let layout = layout_config();
         let mmap = open_read_only_region(name, layout.total_len)?;
-        Ok(Self {
-            name: name.to_string(),
-            mmap,
-            layout,
-        })
+        Ok(Self { mmap, layout })
     }
 
     pub fn read_snapshot(&self) -> Option<ConfigSnapshot> {
@@ -1227,11 +1183,7 @@ impl LsaRegionWriter {
             initialize_lsa_header(mmap, gateway_uuid, hive_id);
         })?;
         normalize_seq_header::<LsaHeader>(&mut mmap, layout.header_offset, "lsa shm")?;
-        Ok(Self {
-            name: name.to_string(),
-            mmap,
-            layout,
-        })
+        Ok(Self { mmap, layout })
     }
 
     pub fn read_snapshot(&self) -> Option<LsaSnapshot> {
@@ -1344,26 +1296,6 @@ impl LsaRegionWriter {
     fn header_mut(&mut self) -> Option<&mut LsaHeader> {
         header_mut::<LsaHeader>(&mut self.mmap, self.layout.header_offset)
     }
-
-    fn hives_mut(&mut self) -> Option<&mut [RemoteHiveEntry]> {
-        let offset = self.layout.hive_offset;
-        slice_mut::<RemoteHiveEntry>(&mut self.mmap, offset, MAX_REMOTE_HIVES as usize)
-    }
-
-    fn remote_nodes_mut(&mut self) -> Option<&mut [RemoteNodeEntry]> {
-        let offset = self.layout.remote_node_offset;
-        slice_mut::<RemoteNodeEntry>(&mut self.mmap, offset, MAX_REMOTE_NODES as usize)
-    }
-
-    fn remote_routes_mut(&mut self) -> Option<&mut [RemoteRouteEntry]> {
-        let offset = self.layout.remote_route_offset;
-        slice_mut::<RemoteRouteEntry>(&mut self.mmap, offset, MAX_REMOTE_ROUTES as usize)
-    }
-
-    fn remote_vpns_mut(&mut self) -> Option<&mut [RemoteVpnEntry]> {
-        let offset = self.layout.remote_vpn_offset;
-        slice_mut::<RemoteVpnEntry>(&mut self.mmap, offset, MAX_REMOTE_VPNS as usize)
-    }
 }
 
 impl LsaRegionReader {
@@ -1371,11 +1303,7 @@ impl LsaRegionReader {
         validate_name(name)?;
         let layout = layout_lsa();
         let mmap = open_read_only_region(name, layout.total_len)?;
-        Ok(Self {
-            name: name.to_string(),
-            mmap,
-            layout,
-        })
+        Ok(Self { mmap, layout })
     }
 
     pub fn read_snapshot(&self) -> Option<LsaSnapshot> {
@@ -1400,10 +1328,7 @@ impl OpaRegionWriter {
             initialize_opa_header(mmap, owner_uuid);
         })?;
         normalize_seq_header::<OpaHeader>(&mut mmap, 0, "opa shm")?;
-        Ok(Self {
-            name: name.to_string(),
-            mmap,
-        })
+        Ok(Self { mmap })
     }
 
     pub fn read_snapshot(&self) -> Option<OpaSnapshot> {
@@ -1469,10 +1394,7 @@ impl OpaRegionReader {
     pub fn open_read_only(name: &str) -> Result<Self, ShmError> {
         validate_name(name)?;
         let mmap = open_read_only_opa_region(name)?;
-        Ok(Self {
-            name: name.to_string(),
-            mmap,
-        })
+        Ok(Self { mmap })
     }
 
     pub fn read_snapshot(&self) -> Option<OpaSnapshot> {
@@ -1504,11 +1426,7 @@ impl IdentityRegionWriter {
             initialize_identity_header(mmap, owner_uuid, hive_id, is_primary, limits);
         })?;
         normalize_seq_header::<IdentityHeader>(&mut mmap, layout.header_offset, "identity shm")?;
-        Ok(Self {
-            name: name.to_string(),
-            mmap,
-            layout,
-        })
+        Ok(Self { mmap, layout })
     }
 
     pub fn read_snapshot(&self) -> Option<IdentitySnapshot> {
@@ -2040,11 +1958,7 @@ impl IdentityRegionReader {
         validate_name(name)?;
         let layout = layout_identity(limits);
         let mmap = open_read_only_region(name, layout.total_len)?;
-        Ok(Self {
-            name: name.to_string(),
-            mmap,
-            layout,
-        })
+        Ok(Self { mmap, layout })
     }
 
     /// Opens the identity region by discovering limits from the SHM header.
@@ -2084,11 +1998,7 @@ impl IdentityRegionReader {
         if layout.total_len > stat.st_size as usize {
             return Err(ShmError::InvalidHeader);
         }
-        Ok(Self {
-            name: name.to_string(),
-            mmap,
-            layout,
-        })
+        Ok(Self { mmap, layout })
     }
 
     pub fn read_snapshot(&self) -> Option<IdentitySnapshot> {
@@ -2135,11 +2045,7 @@ impl MemoryRegionWriter {
             initialize_memory_header(mmap, owner_uuid, hive_id);
         })?;
         normalize_seq_header::<MemoryHeader>(&mut mmap, layout.header_offset, "memory shm")?;
-        Ok(Self {
-            name: name.to_string(),
-            mmap,
-            layout,
-        })
+        Ok(Self { mmap, layout })
     }
 
     pub fn read_snapshot(&self) -> Result<MemoryShmSnapshot, ShmError> {
@@ -2190,11 +2096,7 @@ impl MemoryRegionReader {
         validate_name(name)?;
         let layout = layout_memory();
         let mmap = open_read_only_region(name, layout.total_len)?;
-        Ok(Self {
-            name: name.to_string(),
-            mmap,
-            layout,
-        })
+        Ok(Self { mmap, layout })
     }
 
     pub fn read_snapshot(&self) -> Result<MemoryShmSnapshot, ShmError> {
@@ -2466,8 +2368,7 @@ fn layout_identity(limits: IdentityRegionLimits) -> IdentityRegionLayout {
     let ich_mapping_offset = align_up(ich_offset + ich_size, REGION_ALIGNMENT);
     let ilk_alias_offset = align_up(ich_mapping_offset + mapping_size, REGION_ALIGNMENT);
     let vocabulary_offset = align_up(ilk_alias_offset + alias_size, REGION_ALIGNMENT);
-    let variable_offset = align_up(vocabulary_offset + vocabulary_size, REGION_ALIGNMENT);
-    let total_len = variable_offset;
+    let total_len = align_up(vocabulary_offset + vocabulary_size, REGION_ALIGNMENT);
 
     IdentityRegionLayout {
         header_offset,
@@ -2477,7 +2378,6 @@ fn layout_identity(limits: IdentityRegionLimits) -> IdentityRegionLayout {
         ich_mapping_offset,
         ilk_alias_offset,
         vocabulary_offset,
-        variable_offset,
         total_len,
         limits,
     }
@@ -3275,15 +3175,6 @@ fn read_slice<T: Copy>(mmap: &[u8], offset: usize, len: usize) -> Option<&[T]> {
         return None;
     }
     Some(unsafe { std::slice::from_raw_parts(ptr, len) })
-}
-
-fn slice_mut<T: Copy>(mmap: &mut MmapMut, offset: usize, len: usize) -> Option<&mut [T]> {
-    let bytes = len.checked_mul(size_of::<T>())?;
-    if offset + bytes > mmap.len() {
-        return None;
-    }
-    let ptr = mmap.as_mut_ptr().wrapping_add(offset) as *mut T;
-    Some(unsafe { std::slice::from_raw_parts_mut(ptr, len) })
 }
 
 fn header_ref<T>(mmap: &[u8], offset: usize) -> Option<&T> {

@@ -243,8 +243,6 @@ struct CognitionRuntimeState {
 #[derive(Debug)]
 struct CognitionAppState {
     config_dir: PathBuf,
-    state_dir: PathBuf,
-    socket_dir: PathBuf,
     hive_id: String,
     node_name: String,
     self_ilk_id: String,
@@ -433,8 +431,6 @@ struct ScopeInstancePayload {
     #[serde(default)]
     start_thread_seq: Option<u64>,
     #[serde(default)]
-    end_thread_seq: Option<u64>,
-    #[serde(default)]
     opened_at: Option<String>,
     #[serde(default)]
     closed_at: Option<String>,
@@ -495,8 +491,6 @@ async fn main() -> Result<(), CognitionError> {
     let self_ilk_id =
         fluxbee_sdk::deterministic_system_ilk_id(&format!("SY.cognition@{}", hive.hive_id));
     tracing::info!(self_ilk_id = %self_ilk_id, "self system ILK computed deterministically");
-    let state_dir = json_router::paths::state_dir();
-    let socket_dir = json_router::paths::router_socket_dir();
     let endpoint = resolve_local_nats_endpoint(&config_dir)?;
     let use_durable_consumer = hive
         .nats
@@ -543,8 +537,6 @@ async fn main() -> Result<(), CognitionError> {
 
     let app_state = Arc::new(CognitionAppState {
         config_dir: config_dir.clone(),
-        state_dir: state_dir.clone(),
-        socket_dir: socket_dir.clone(),
         hive_id: hive.hive_id.clone(),
         node_name: node_name.clone(),
         self_ilk_id: self_ilk_id.clone(),

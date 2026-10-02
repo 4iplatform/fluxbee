@@ -197,13 +197,9 @@ struct HiveFile {
     #[serde(default)]
     role: Option<String>,
     #[serde(default)]
-    wan: Option<WanSection>,
-    #[serde(default)]
     government: Option<GovernmentSection>,
     #[serde(default)]
     identity: Option<IdentitySection>,
-    #[serde(default)]
-    database: Option<DatabaseSection>,
     #[serde(default)]
     system_nodes: Option<SystemNodesSection>,
 }
@@ -229,12 +225,6 @@ struct RoleSystemNodes {
 struct GovernmentSection {
     #[serde(default)]
     identity_frontdesk: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-struct WanSection {
-    #[serde(default)]
-    gateway_name: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -264,12 +254,6 @@ struct IdentitySyncSection {
     /// without the hive's key).
     #[serde(default)]
     auth: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-struct DatabaseSection {
-    #[serde(default)]
-    url: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -7628,12 +7612,10 @@ mod tests {
         HiveFile {
             hive_id: "motherbee".to_string(),
             role: Some("motherbee".to_string()),
-            wan: None,
             government: Some(GovernmentSection {
                 identity_frontdesk: identity_frontdesk.map(str::to_string),
             }),
             identity: None,
-            database: None,
             system_nodes: Some(SystemNodesSection {
                 motherbee: Some(RoleSystemNodes {
                     nodes: vec!["SY.identity".to_string(), "SY.architect".to_string()],

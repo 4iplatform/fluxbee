@@ -82,7 +82,6 @@ use uuid::Uuid;
 type ArchitectError = Box<dyn std::error::Error + Send + Sync>;
 
 const DEFAULT_ARCHITECT_LISTEN: &str = "127.0.0.1:3000";
-const ROUTER_RECONNECT_DELAY_SECS: u64 = 2;
 const CHAT_SESSIONS_TABLE: &str = "sessions";
 const CHAT_MESSAGES_TABLE: &str = "messages";
 const CHAT_OPERATIONS_TABLE: &str = "operations";
@@ -232,7 +231,6 @@ struct ArchitectAdminToolContext {
     hive_id: String,
     config_dir: PathBuf,
     state_dir: PathBuf,
-    socket_dir: PathBuf,
     /// Canonical architect dispatcher — used by
     /// `execute_admin_action_with_context` and `fetch_inventory_status_data`
     /// for every outbound admin RPC. No per-call ephemeral `NodeConfig`.
@@ -322,7 +320,6 @@ struct ArchitectState {
     listen: String,
     config_dir: PathBuf,
     state_dir: PathBuf,
-    socket_dir: PathBuf,
     /// Canonical dispatcher for all router traffic — admin RPC, system
     /// channel, incoming impersonation messages, and Vault lookups.
     /// Replaces the bespoke `router_connect_loop` + `router_recv_loop` +
@@ -6019,7 +6016,6 @@ async fn main() -> Result<(), ArchitectError> {
         listen: listen.clone(),
         config_dir,
         state_dir,
-        socket_dir,
         rpc: Arc::clone(&rpc),
         ai_configured: AtomicBool::new(ai_runtime.is_some()),
         ai_runtime: Arc::new(Mutex::new(ai_runtime)),
@@ -6354,7 +6350,6 @@ fn admin_tool_context(
         hive_id: state.hive_id.clone(),
         config_dir: state.config_dir.clone(),
         state_dir: state.state_dir.clone(),
-        socket_dir: state.socket_dir.clone(),
         rpc: Arc::clone(&state.rpc),
         ai_runtime: Arc::clone(&state.ai_runtime),
         session_id: session_id.map(str::to_string),

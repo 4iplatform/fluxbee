@@ -134,19 +134,12 @@ struct BlobSyncSection {
 #[derive(Debug, Deserialize)]
 struct IdentityFile {
     layer1: IdentityLayer1,
-    layer2: IdentityLayer2,
     shm: IdentityShm,
-    created_at: String,
 }
 
 #[derive(Debug, Deserialize)]
 struct IdentityLayer1 {
     uuid: String,
-}
-
-#[derive(Debug, Deserialize)]
-struct IdentityLayer2 {
-    name: String,
 }
 
 #[derive(Debug, Deserialize)]

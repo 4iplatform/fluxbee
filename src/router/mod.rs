@@ -2120,7 +2120,6 @@ async fn apply_wan_reachability(ctx: &WanContext, peer_hive: &str, msg: &Message
                     origin_hive: entry.hive_id,
                     next_hop_hive: peer_hive.to_string(),
                     vpn_id: entry.vpn_id,
-                    last_seq: payload.seq,
                     last_updated: now,
                 },
             );
@@ -3381,7 +3380,6 @@ async fn peer_discovery_loop(
                 region.router_uuid,
                 PeerRouter {
                     uuid: region.router_uuid,
-                    name: region.router_name.clone(),
                     is_gateway: region.is_gateway,
                 },
             );
@@ -3528,7 +3526,6 @@ fn discover_peer_regions(self_uuid: Uuid, self_shm_name: &str, hive_id: &str) ->
         }
         regions.push(PeerRegion {
             router_uuid: snapshot.header.router_uuid,
-            router_name: snapshot.header.router_name.clone(),
             is_gateway: snapshot.header.is_gateway,
             nodes: peer_nodes,
         });
@@ -4142,8 +4139,6 @@ struct ReachabilityEntry {
     /// The vouching hub to forward toward (a direct WAN peer of this router).
     next_hop_hive: String,
     vpn_id: u32,
-    /// Advertisement sequence from the vouching hub, for out-of-order / staleness dedup.
-    last_seq: u64,
     /// Local receive time (ms); entries expire when no advertisement refreshes them.
     last_updated: u64,
 }
@@ -4248,7 +4243,6 @@ struct PeerNode {
 #[derive(Clone, Debug)]
 struct PeerRouter {
     uuid: Uuid,
-    name: String,
     is_gateway: bool,
 }
 
@@ -4378,7 +4372,6 @@ enum ResolvedRoute {
 
 struct PeerRegion {
     router_uuid: Uuid,
-    router_name: String,
     is_gateway: bool,
     nodes: Vec<PeerNode>,
 }
@@ -6691,7 +6684,6 @@ mod tests {
                 origin_hive: "worker1".to_string(),
                 next_hop_hive: "motherbee".to_string(),
                 vpn_id: 0,
-                last_seq: 1,
                 last_updated: 0,
             },
         );

@@ -265,9 +265,6 @@ struct IdentityRegionLayout {
     ilk_offset: usize,
     ich_offset: usize,
     ich_mapping_offset: usize,
-    ilk_alias_offset: usize,
-    vocabulary_offset: usize,
-    variable_offset: usize,
     total_len: usize,
     limits: IdentityRegionLimits,
 }
@@ -1577,8 +1574,7 @@ fn layout_identity(limits: IdentityRegionLimits) -> IdentityRegionLayout {
     let ich_mapping_offset = align_up(ich_offset + ich_size, REGION_ALIGNMENT);
     let ilk_alias_offset = align_up(ich_mapping_offset + mapping_size, REGION_ALIGNMENT);
     let vocabulary_offset = align_up(ilk_alias_offset + alias_size, REGION_ALIGNMENT);
-    let variable_offset = align_up(vocabulary_offset + vocabulary_size, REGION_ALIGNMENT);
-    let total_len = variable_offset;
+    let total_len = align_up(vocabulary_offset + vocabulary_size, REGION_ALIGNMENT);
 
     IdentityRegionLayout {
         header_offset,
@@ -1586,9 +1582,6 @@ fn layout_identity(limits: IdentityRegionLimits) -> IdentityRegionLayout {
         ilk_offset,
         ich_offset,
         ich_mapping_offset,
-        ilk_alias_offset,
-        vocabulary_offset,
-        variable_offset,
         total_len,
         limits,
     }

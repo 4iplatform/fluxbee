@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 
 use serde_json::Value;
-use wasmtime::{Caller, Engine, Instance, Linker, Memory, Module, Store, TypedFunc};
+use wasmtime::{Caller, Engine, Linker, Memory, Module, Store, TypedFunc};
 
 use fluxbee_sdk::protocol::Message;
 
@@ -48,7 +48,6 @@ struct OpaRuntimeState {
 
 struct OpaWasm {
     store: Store<OpaRuntimeState>,
-    instance: Instance,
     memory: Memory,
     entrypoints: HashMap<String, i32>,
     opa_malloc: TypedFunc<i32, i32>,
@@ -553,7 +552,6 @@ impl OpaWasm {
 
         let mut out = Self {
             store,
-            instance,
             memory,
             entrypoints,
             opa_malloc,

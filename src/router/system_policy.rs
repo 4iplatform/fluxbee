@@ -77,17 +77,6 @@ pub const PRIMARY_HIVE_ID: &str = fluxbee_sdk::protocol::PRIMARY_HIVE_ID;
 /// composes the same decision from role + PRIMARY_HIVE_ID.)
 pub const EDGE_CONTROL_AUTHORITY: &str = "SY.admin@motherbee";
 
-fn is_edge_service_action(action: &str) -> bool {
-    matches!(
-        action,
-        "EDGE_OPEN_URL"
-            | "EDGE_CLOSE_URL"
-            | "EDGE_LIST_URLS"
-            | "EDGE_PUBLISH_BLOB"
-            | "EDGE_UNPUBLISH_BLOB"
-    )
-}
-
 /// Whether `action` is a protected SYSTEM action subject to the system authority
 /// gate.
 pub fn is_protected_system_action(action: &str) -> bool {
