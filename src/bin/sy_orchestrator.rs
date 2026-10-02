@@ -1635,7 +1635,9 @@ async fn bootstrap_local(
         )
         .await?;
     }
-    if let Err(err) = reconcile_persisted_custom_nodes(state).await {
+    // Boot runs after every package upgrade and core update: it also moves running nodes that
+    // follow `current` onto the version the pointer now names (FINDINGS A-39).
+    if let Err(err) = reconcile_persisted_custom_nodes(state, ReconcileRunning::Rebind).await {
         tracing::warn!(
             error = %err,
             "persisted custom node reconcile failed during bootstrap"
@@ -1743,14 +1745,42 @@ async fn run_managed_runtime_reconcile_loop(state: Arc<OrchestratorState>) {
     ticker.tick().await;
     loop {
         ticker.tick().await;
-        if let Err(err) = reconcile_persisted_custom_nodes(&state).await {
+        if let Err(err) = reconcile_persisted_custom_nodes(&state, ReconcileRunning::Leave).await {
             tracing::warn!(error = %err, "managed-runtime liveness reconcile failed");
         }
     }
 }
 
+/// What the reconcile does with a node that is already running.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReconcileRunning {
+    /// Liveness only (the periodic loop): a running node is left alone.
+    Leave,
+    /// Boot, i.e. after a package upgrade or a core update: a running node that follows
+    /// `current` and whose pointer moved is relaunched on the new version with one restart.
+    /// Left running, it would keep executing a runtime directory dpkg has already removed, and
+    /// any restart of its unit (needrestart, a crash) would fail with 203/EXEC (FINDINGS A-39).
+    Rebind,
+}
+
+/// The version a node that follows `current` should move to, when the manifest pointer moved
+/// under it. `None` when it is pinned, up to date, or its runtime cannot be resolved: a running
+/// node is never torn down because the manifest does not name a version for it.
+fn moved_current_version(
+    manifest: &RuntimeManifest,
+    node: &PersistedManagedNode,
+) -> Option<String> {
+    if !node.follows_current() {
+        return None;
+    }
+    let runtime_key = resolve_runtime_key(manifest, &node.runtime).ok()?;
+    let version = resolve_runtime_version(manifest, &runtime_key, "current").ok()?;
+    (version != node.runtime_version).then_some(version)
+}
+
 async fn reconcile_persisted_custom_nodes(
     state: &OrchestratorState,
+    running: ReconcileRunning,
 ) -> Result<(), OrchestratorError> {
     let manifest = match load_runtime_manifest_result()? {
         Some(manifest) => manifest,
@@ -1783,7 +1813,21 @@ async fn reconcile_persisted_custom_nodes(
         };
         let unit_active = systemd_unit_is_active(&unit).unwrap_or(false);
         let visible_in_router = local_inventory_has_node(state, &node.node_name);
-        if unit_active || visible_in_router {
+        // Only a node whose unit we own is rebound; one visible without an active unit is left.
+        let rebind_to = match running {
+            ReconcileRunning::Rebind if unit_active => moved_current_version(&manifest, &node),
+            _ => None,
+        };
+        if let Some(to) = rebind_to.as_deref() {
+            tracing::info!(
+                node_name = node.node_name,
+                runtime = node.runtime,
+                from = node.runtime_version,
+                to = to,
+                unit = unit,
+                "running node follows 'current' and the pointer moved; relaunching it on the new version"
+            );
+        } else if unit_active || visible_in_router {
             skipped = skipped.saturating_add(1);
             tracing::info!(
                 node_name = node.node_name,
@@ -25738,6 +25782,47 @@ blob:
             !body.contains("dist_sync_folders_for_role("),
             "dist_sync_folders_for_role da fluxbee-dist-core-motherbee en motherbee: 404, y el \
              primer no-ok hace fallar el hint entero"
+        );
+    }
+
+    /// A-39: after an upgrade, a running node that follows `current` moves to the version the
+    /// pointer names; a pinned or up-to-date node stays, and so does one whose runtime the
+    /// manifest cannot resolve (a running node is never torn down for that).
+    #[test]
+    fn only_a_node_following_a_moved_current_is_rebound() {
+        let manifest = RuntimeManifest {
+            schema_version: 1,
+            version: 1790000000000,
+            updated_at: None,
+            runtimes: serde_json::json!({
+                "io.api": {"available": ["0.1.52", "0.1.53"], "current": "0.1.53", "type": "full_runtime"}
+            }),
+            hash: None,
+        };
+        let node = |requested: &str, bound: &str, runtime: &str| PersistedManagedNode {
+            requested_runtime_version: requested.to_string(),
+            node_name: "IO.api@motherbee".to_string(),
+            kind: "IO".to_string(),
+            runtime: runtime.to_string(),
+            runtime_version: bound.to_string(),
+            config_path: PathBuf::from("/tmp/config.json"),
+            relaunch_on_boot: true,
+        };
+        assert_eq!(
+            moved_current_version(&manifest, &node("current", "0.1.52", "io.api")).as_deref(),
+            Some("0.1.53")
+        );
+        assert_eq!(
+            moved_current_version(&manifest, &node("current", "0.1.53", "io.api")),
+            None
+        );
+        assert_eq!(
+            moved_current_version(&manifest, &node("0.1.52", "0.1.52", "io.api")),
+            None
+        );
+        assert_eq!(
+            moved_current_version(&manifest, &node("current", "0.1.52", "io.gone")),
+            None
         );
     }
 

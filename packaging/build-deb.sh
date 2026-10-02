@@ -230,6 +230,10 @@ install -m0644 packaging/hive.yaml.example "$DEST/etc/fluxbee/hive.yaml.example"
 # SY.architect adds this handbook to its prompts, from where install.sh puts it. A static doc,
 # not config: replaced on every upgrade, so it is not a conffile.
 install -m0644 "docs/onworking COA/archi/handbook_fluxbee.md" "$DEST/etc/fluxbee/handbook_fluxbee.md"
+# needrestart (Ubuntu) must not restart managed node units after an apt upgrade: the old runtime
+# directory is gone by then, and the orchestrator rebinds them itself (FINDINGS A-39).
+install -d "$DEST/etc/needrestart/conf.d"
+install -m0644 packaging/needrestart-fluxbee.conf "$DEST/etc/needrestart/conf.d/fluxbee.conf"
 install -m0755 packaging/fluxbee-firstboot "$DEST/usr/share/fluxbee/fluxbee-firstboot"
 ln -sf ../share/fluxbee/fluxbee-firstboot "$DEST/usr/bin/fluxbee-firstboot"
 # The base-node manifest travels to the target too: fluxbee-firstboot reads it to know which
