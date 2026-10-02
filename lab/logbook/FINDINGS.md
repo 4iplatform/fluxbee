@@ -298,15 +298,18 @@
   vault conteste (`resolve_resource_awaiting_vault`, hasta `VAULT_BOOT_WAIT`, las dos a la vez).
   Las relecturas por aviso o por `CONFIG_SET` siguen siendo de una vez.
 
-### A-27 🔴 El guardián de paridad del catálogo del admin (CI) está en rojo desde antes
+### A-27 ✅ RESUELTO (`802faf5`) — El guardián de paridad del catálogo del admin (CI) estaba en rojo desde antes
 
 - **Qué pasa (2026-10-01):** `scripts/admin_action_catalog_parity_check.sh` corre en GitHub Actions
   en cada push que toca `sy_admin.rs` y falla: sus expresiones no reconocen cómo se despachan
   hoy 20 acciones que sí tienen ruta HTTP o son solo internas: `get_runtime`,
   `list_cloud_actions`, `publish_artifact`, `publish_cloud_endpoint`, `unpublish_artifact`, los 8
   `timer_*` y los 8 `wf_rules_*`. Cada push del tramo OPA que tocó el admin lo disparó en rojo.
-- **Hecho:** se agregó `opa_clear` (panel DTAP, T-12). El resto queda para arreglar el script
-  (mapear esos despachos y declarar las acciones solo internas).
+- **Arreglo:** el script sigue también `handle_admin_query_with_payload`, las RPC de timer, el
+  despacho interno genérico, los handlers de wf-rules y el de cloud endpoint, y declara las
+  excepciones a propósito: acciones que solo llegan por la malla (`publish_artifact`,
+  `list_cloud_actions`) y acciones con brazo dedicado (`externalize`, `unexternalize`,
+  `list_externalized`); las dos listas fallan si quedan viejas. En CI pasa desde `802faf5`.
 
 ### A-28 🟡 Tres binarios compilados de Go están versionados en git
 
@@ -353,13 +356,14 @@
 - **Arreglo:** SY.opa.rules toma CONFIG_CHANGED solo de `SY.admin@motherbee`, igual que su camino de
   comandos y que el protocolo; SY.config.routes ya no aplica listas que lleguen por CONFIG_CHANGED.
 
-### A-21 🟡 Estado del router sin policy de usuario: `error` al arrancar, `ok` después de un clear
+### A-21 ✅ RESUELTO (0.1.50) — Estado del router sin policy de usuario: `error` al arrancar, `ok` después de un clear
 
 - **Qué se ve:** en `/hives/{h}/opa/status`, un router que arrancó sin policy reporta
   `load_status=1, error`; después de un clear, `load_status=0, ok`. En los dos casos no hay policy
   y el ruteo es el mismo (un mensaje sin destino que no va al frontdesk sale `OPA_ERROR`).
 - **Causa:** el resolver nace en `OPA_STATUS_ERROR` y `unload()` lo deja en `OPA_STATUS_OK`. Es solo
-  informativo; no se tocó.
+  informativo.
+- **Arreglo (0.1.50):** el resolver nace en el mismo estado que deja un clear (`ok`, sin policy).
 
 ### A-17 ✅ RESUELTO (0.1.39) — Una réplica de identity que arranca sin primario borra los ILK de su hive
 
@@ -374,7 +378,7 @@
 - **Validado:** mismo arranque degradado → la réplica loguea `holding its self-owned snapshot`; el
   primario sigue en 25 ILKs, con el del probe.
 
-### A-18 🔴 BACKLOG (estacionado 2026-10-01) — config-routes: rutas estáticas, VPN y taps
+### A-18 ✅ CERRADO (0.1.50) — config-routes: rutas estáticas, VPN y taps
 
 - **La necesidad (operador, 2026-09-30):** las rutas estáticas se usan poco y pueden quedar
   locales. La VPN va a usarse de forma global (separar tenants, seguridad: un nodo de worker1
@@ -388,24 +392,21 @@
   | Taps | en un hive | LSA; el router de origen aplica los locales y los de LSA, una sola vez | sí |
   | VPN | en un hive | LSA las transporta, pero `assign_vpn` usa solo la config local | **no** |
 
-- **Abierto:**
-  1. **VPN no es global.** Decisión: vía LSA (asignar con las reglas locales y las de LSA, como
-     los taps). Al construirlo: conservar las últimas reglas conocidas, porque si caducan las de
-     un hive aislado los nodos vuelven a VPN 0 y el aislamiento falla abierto; orden
-     determinístico si dos hives definen lo mismo; reasignar cuando cambia el LSA
-     (`reassign_vpns` hoy solo reacciona a cambios locales).
-  2. **Lo cargado en un hive desaparece del resto si ese hive queda aislado** y su LSA caduca:
-     los taps dejan de copiar durante el corte, y una ruta que apunta a otro hive vivo se pierde.
-  3. **Endpoints duplicados:** `/routes`, `/vpns` y `/taps` con `?hive=`, y además
-     `/hives/{h}/routes|vpns|taps`. Dejar una sola superficie.
-  4. **Regla 5 de `system.rego`** nombra `SY.config-routes`; el nodo es `SY.config.routes`.
-     Habilita un chequeo de salud (`NODE_STATUS_GET`) que config.routes nunca manda: está muerta
-     y no bloquea nada. Borrar esa entrada (o corregir el nombre) con el próximo cambio de rego.
-  5. **Hives con varios routers** (panel DTAP D-12): un router sin nodos locales no relee la
-     config, porque solo la relee con frames de sus nodos. No afecta a las instalaciones de hoy
-     (un router por hive). Arreglo chico: releerla, con control de versión, en el tick de LSA.
-  6. **Taps:** el match es exacto por nombre L2, sin patrones (v1). En un host con varios routers,
-     el router par no hace el fanout (bajo, mismo caso que el punto 5).
+- **Decisión del operador (2026-10-01): la VPN queda por hive.** Cada router la asigna con las
+  reglas de su hive; para una VPN entre hives se carga la misma regla en cada uno (documentado en
+  `06-regiones.md` §5.1). Con eso no queda nada abierto; *"resolvé los detalles por
+  costo/beneficio... prefiero empezar lo próximo con estos temas cerrados"*.
+- **Cerrado en 0.1.50 (`aa206ac`):**
+  - Una sola superficie: `/hives/{h}/routes|vpns|taps`. Se borraron `/routes`, `/vpns` y `/taps`
+    con `?hive=` (nadie los usaba).
+  - La regla 5 de `system.rego` ya no nombra `SY.config-routes`.
+  - El router relee la config de ruteo en cada latido, con control de versión (panel D-12): un
+    router sin nodos locales ya no queda con config vieja. Hoy no aplicaba (un router por hive).
+- **Aceptado:**
+  - Si el hive donde se cargó una ruta o un tap queda cortado, deja de aplicarse en los demás
+    durante el corte.
+  - Los taps matchean por nombre exacto (v1).
+  - En un host con varios routers, el router par no hace el fanout de taps (mismo caso que D-12).
 - **Ya resuelto:**
   - `PUT /config/*`: 0.1.40–0.1.41.
   - Broadcast posterior a cada alta y trato especial del router a CONFIG_CHANGED: 0.1.44.
@@ -414,7 +415,6 @@
   - Taps cross-hive con destino por UUID: julio (`18c4dd8`).
 - **Aceptado:** si se borra o se reconstruye un hive, se pierden sus rutas, taps y VPN (nadie
   guarda copia).
-- **Estado:** estacionado por el operador (2026-10-01): *"hay otras cosas importantes"*.
 
 ### A-16 🔴 Los espejos receive-only acumulan cambios locales en silencio
 

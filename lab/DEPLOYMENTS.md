@@ -21,6 +21,7 @@
 
 | Versión | Fecha (ART) | Commit | Alcance | Estado | Rollback |
 |---|---|---|---|---|---|
+| **0.1.50** | 2026-10-01 | `aa206ac` | motherbee + spokes (core) | ✅ live | snap `pre-config-routes-0-1-50` (las 4 VMs) · `apt install fluxbee=0.1.49` |
 | **0.1.49** | 2026-10-01 | `c921d1a` | motherbee + spokes (core) | ✅ live | snap `pre-architect-fixes-0-1-49` (las 4 VMs) · `apt install fluxbee=0.1.48` |
 | **0.1.48** | 2026-10-01 | `1486807` | motherbee + spokes (core) | ✅ live | snap `pre-architect-opa-0-1-48` (las 4 VMs) · `apt install fluxbee=0.1.47` |
 | **0.1.47** | 2026-10-01 | `652a9c9` | motherbee + spokes (core) | ✅ live | snap `pre-opa-blockB-0-1-47` (las 4 VMs) · `apt install fluxbee=0.1.46` |
@@ -58,6 +59,36 @@
 > (`dpkg-scanpackages -m`) para rollback, pero su detalle vive en la bitácora, no acá.
 
 ---
+
+## 0.1.50 — config-routes cerrado (VPN por hive) y lo que quedaba de OPA
+
+- **Fecha:** 2026-10-01 (ART) · **Versión anterior:** 0.1.49 · **Commit:** `aa206ac` (FINDINGS
+  A-18, A-21; panel DTAP D-12). Cambian el router (`rt-gateway`), el admin y la policy de sistema.
+- **Alcance:** motherbee + los tres spokes (core-update).
+- **Qué cambió:**
+  - Una sola superficie para rutas, VPN y taps: `/hives/{h}/routes|vpns|taps`. Se borraron
+    `/routes`, `/vpns` y `/taps` con `?hive=`.
+  - La regla 5 de `system.rego` ya no nombra `SY.config-routes`; `system.wasm` y
+    `system_route.wasm` recompiladas.
+  - El router relee la config de ruteo en cada latido, con control de versión (D-12).
+  - Un router sin policy de usuario reporta `ok`, como después de un clear (A-21).
+  - `OPA_RELOAD` ya no se reenvía a todos los nodos locales: solo lo usan los routers.
+- **Build:** 23 min (cambió la librería del router: se recompila todo). **Publish:** 50 paquetes.
+  Snapshots `pre-config-routes-0-1-50` en las 4 VMs (se borró antes `pre-opa-blockB-0-1-47`).
+- **Install:** motherbee 00:04 UTC del 02/10; spokes 00:05–00:07.
+- **Verificación en vivo:**
+  - Los 4 hives con los mismos binarios; 0 `failed`.
+  - Recién arrancados y sin policy, los 4 routers reportan `load=0 ok` (antes `load=1 error`).
+  - `/routes`, `/vpns` y `/taps` → `UNKNOWN_ROUTE`; `/hives/{h}/...` responde.
+  - Ruta de prueba en worker1 y tap de prueba en el motherbee por las rutas por hive: se listan, y
+    cada una aparece en el LSA del otro hive. Borradas al terminar.
+  - Apply y clear globales: 4,9 s y 5,0 s, los 4 hives. `OPA_RELOAD` aplicado en cada router y
+    ningún "forwarded to local nodes". El refresco en el latido solo registra cuando la config
+    cambia (motherbee: 4 actualizaciones en la ventana; logs a ritmo normal).
+  - 0 rechazos del gate y 0 descartes por `routing.src`.
+  - Visto de paso: un DELETE de tap con `@` codificado como `%40` no encontraba el tap (el admin no
+    decodificaba la query). Arreglado en 0.1.51.
+- **Rollback:** snapshot `pre-config-routes-0-1-50` o `apt install fluxbee=0.1.49`.
 
 ## 0.1.49 — arquitecto: un solo admin, el handbook en el `.deb`, el vault esperado al arrancar
 

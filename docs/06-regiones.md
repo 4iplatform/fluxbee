@@ -447,6 +447,13 @@ impl Router {
 
 La tabla VPN define a qué zona pertenece cada nodo basado en pattern matching de su nombre L2.
 
+> **La VPN es por hive (decisión del operador, 2026-10-01).** Cada router asigna la VPN de sus
+> nodos solo con las reglas de **su propio hive**; las reglas de otros hives viajan por LSA pero no
+> se usan para asignar. La entrega exige la misma VPN en origen y destino, y el `vpn_id` de un nodo
+> remoto llega por LSA. Para que nodos de hives distintos compartan una VPN, hay que cargar la misma
+> regla en cada hive y mantenerlas iguales. No falla abierto: si un hive se corta, sus nodos salen
+> del LSA. (Las rutas estáticas y los taps sí se aplican en todos los hives vía LSA.)
+
 ### 5.2 Evaluación
 
 ```rust
