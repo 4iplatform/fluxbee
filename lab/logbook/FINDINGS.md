@@ -311,11 +311,13 @@
   `list_cloud_actions`) y acciones con brazo dedicado (`externalize`, `unexternalize`,
   `list_externalized`); las dos listas fallan si quedan viejas. En CI pasa desde `802faf5`.
 
-### A-28 🟡 Tres binarios compilados de Go están versionados en git
+### A-28 ✅ RESUELTO (`3eeadf2`) — Tres binarios compilados de Go estaban versionados en git
 
 - `go/sy-opa-rules/sy-opa-rules`, `go/sy-timer/sy-timer` y `go/nodes/wf/wf-generic/wf-generic`.
-  Ensucian cada `git status` después de un build local. Va a la pasada de limpieza (catálogo y
-  aprobación antes de borrar).
+  Ensuciaban cada `git status` después de un build local y quedaban a un `git add -A` de un commit.
+- **Fix:** salen del índice (los archivos quedan en disco) y `.gitignore` ignora los cuatro que
+  escribe el build (también `sy-wf-rules`). Aprobado por el operador en el lote de temas chicos
+  (2026-10-02).
 
 ### A-29 ✅ RESUELTO (0.1.51) — sy-timer y wf-generic: SQLite esperaba el lock en una sola conexión
 

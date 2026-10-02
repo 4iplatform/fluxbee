@@ -116,7 +116,7 @@ The operator went through the findings by cost and benefit (2026-10-01):
 - **A-25:** the `.deb` did not ship the architect handbook. Fixed in 0.1.49.
 - **A-26:** the architect read its vault secrets once at boot. Fixed in 0.1.49.
 - **A-27:** the admin catalog guard in CI had been red. Fixed in `802faf5`.
-- **A-28:** three Go binaries are tracked in git. Pending the cleanup pass.
+- **A-28:** three Go binaries were tracked in git. Untracked and ignored in `3eeadf2`.
 - **A-18:** config-routes closed in 0.1.50 with VPN per hive by decision: one route/VPN/tap API
   surface, system rule 5 cleaned, config refresh on the heartbeat. Accepted: a cut-off hive's routes
   and taps stop applying elsewhere during the cut; taps match exact names; deleting a hive loses its
