@@ -1,11 +1,10 @@
 use std::collections::{HashMap, HashSet};
 use std::fs;
-use std::fs::OpenOptions;
 use std::hash::{Hash, Hasher};
 use std::io::{Cursor, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 use async_trait::async_trait;
 use base64::Engine;
@@ -16,40 +15,34 @@ use fluxbee_ai_sdk::{
     resolve_model_input_from_payload_with_options, resolve_response_envelope_output_schema,
     AiBehaviorOutput, AiFinalOutput, AiNode, AiProvider, AiUserArtifact, FunctionCallingConfig,
     FunctionCallingRunner, FunctionLoopItem, FunctionLoopRunResult, FunctionRunInput, FunctionTool,
-    FunctionToolDefinition, FunctionToolProvider, FunctionToolRegistry,
+    FunctionToolDefinition, FunctionToolProvider, FunctionToolRegistry, HiveAiConfig,
     ImmediateConversationMemory, LanceDbThreadStateStore, Message, ModelInputOptions,
     ModelSettings, NodeRuntime, ResolvedModelInput, RetryPolicy, RuntimeConfig, ThreadStateStore,
     ThreadStateToolsProvider,
 };
 use fluxbee_sdk::identity::{find_ilk_by_handler_node_from_hive_config, IdentityIlkOption};
-use fluxbee_sdk::protocol::{
-    Destination, MemoryPackage, Meta, Routing, MSG_TTL_EXCEEDED, MSG_UNREACHABLE, SYSTEM_KIND,
-};
 use fluxbee_sdk::managed_control_plane::{
     bootstrap_managed_control_plane, persist_effective_config_with_root, ContractError,
     ManagedControlPlaneState, ManagedNodeConfigContract, ManagedNodeLifecycleState,
     DEFAULT_MANAGED_NODES_ROOT,
 };
+use fluxbee_sdk::protocol::{MemoryPackage, Meta};
 use fluxbee_sdk::{
     managed_node_instance_dir, managed_node_name, AdminCommandRequest, NodeConfig, NodeUuidMode,
-    OperationalRouteProfile, RouteMatch, RouteTarget, RouterDispatcher, VaultCallerOwned, VaultClient,
+    OperationalRouteProfile, RouteMatch, RouteTarget, RouterDispatcher, VaultCallerOwned,
+    VaultClient,
 };
-use fluxbee_sdk::{MSG_ILK_REGISTER, MSG_TNT_CREATE};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tokio::fs as tokio_fs;
 use tokio::sync::{Mutex, OwnedMutexGuard, RwLock};
 use tokio::task::JoinSet;
 use tracing_subscriber::EnvFilter;
-use uuid::Uuid;
 
 const MSG_NODE_STATUS_GET: &str = "NODE_STATUS_GET";
 const MSG_NODE_STATUS_GET_RESPONSE: &str = "NODE_STATUS_GET_RESPONSE";
 const NODE_STATUS_DEFAULT_HANDLER_ENABLED: &str = "NODE_STATUS_DEFAULT_HANDLER_ENABLED";
 const NODE_STATUS_DEFAULT_HEALTH_STATE: &str = "NODE_STATUS_DEFAULT_HEALTH_STATE";
-const GOV_IDENTITY_TARGET_ENV: &str = "GOV_IDENTITY_TARGET";
-const GOV_IDENTITY_TIMEOUT_MS_ENV: &str = "GOV_IDENTITY_TIMEOUT_MS";
-const GOV_IDENTITY_TENANT_ID_ENV: &str = "GOV_IDENTITY_TENANT_ID";
 const IMMEDIATE_INTERACTION_MAX_CHARS: usize = 1_200;
 const AI_RUNTIME_KIND: &str = "ai.generic";
 const DEFAULT_AGENT_ASSET_BLOB_ROOT: &str = "/var/lib/fluxbee/blob";
@@ -154,7 +147,6 @@ enum BehaviorSection {
 #[serde(deny_unknown_fields)]
 struct AiChatSection {
     model: String,
-    vault_key: String,
     #[serde(default)]
     instructions: Option<InstructionsSourceConfig>,
     #[serde(default)]
@@ -249,8 +241,6 @@ struct EffectiveBehaviorSection {
     kind: String,
     #[serde(default)]
     model: Option<String>,
-    #[serde(default)]
-    vault_key: Option<String>,
     #[serde(default)]
     params: Option<EffectiveBehaviorParams>,
     #[serde(default)]
@@ -379,7 +369,6 @@ enum NodeBehavior {
 #[derive(Debug, Clone)]
 struct AiChatRuntime {
     model: String,
-    vault_key: String,
     instructions: Option<String>,
     model_settings: ModelSettings,
     base_url: Option<String>,
@@ -391,8 +380,6 @@ struct AiChatRuntime {
 struct ResolvedAiCredential {
     provider: AiProvider,
     api_key: String,
-    vault_key: String,
-    version: Option<i64>,
 }
 
 // Manual Debug so a future `{:?}` on this struct can never leak the live provider api_key
@@ -402,245 +389,30 @@ impl std::fmt::Debug for ResolvedAiCredential {
         f.debug_struct("ResolvedAiCredential")
             .field("provider", &self.provider)
             .field("api_key", &"<redacted>")
-            .field("vault_key", &self.vault_key)
-            .field("version", &self.version)
             .finish()
     }
 }
 
 struct GenericAiNode {
-    mode: RunnerMode,
     node_name: String,
     /// Self ILK, read from `FLUXBEE_NODE_ILK_ID` env injected by orchestrator
     /// at spawn (after `ILK_REGISTER` to SY.identity). `None` only when the
     /// node was started manually outside the orchestrator pipeline; in that
     /// case vault and any identity-bearing call will be rejected by auth.
     self_ilk_id: Option<String>,
-    /// Self tenant, read from `FLUXBEE_NODE_TENANT_ID` env injected by
-    /// orchestrator at spawn. Same lifecycle as `self_ilk_id`.
+    /// Self tenant, read from `FLUXBEE_NODE_TENANT_ID` env injected by the orchestrator at
+    /// spawn. The AI key is looked up in SY.vault for this tenant first, then for the root tenant.
     self_tenant_id: Option<String>,
     behavior: Arc<RwLock<Option<NodeBehavior>>>,
     config_dir: PathBuf,
-    /// Router socket directory — kept for tracing/debug purposes only.
-    router_socket: PathBuf,
-    /// UUID persistence root — kept for tracing/debug purposes only.
-    state_dir: PathBuf,
     thread_state_store: Option<Arc<dyn ThreadStateStore>>,
     immediate_memory_store: Option<Arc<ImmediateMemoryStore>>,
-    gov_identity: GovIdentityConfig,
     /// Vault accessor over the canonical `Arc<RouterDispatcher>`. `None` when
     /// `self_ilk_id` / hive suffix is missing — the node still boots in a
     /// degraded state.
     vault: Option<VaultClient>,
     control_plane: Arc<RwLock<ControlPlaneState>>,
     cognitive_definition: Arc<RwLock<CognitiveDefinitionRuntimeState>>,
-    cognitive_definition_config: CognitiveDefinitionRuntimeConfig,
-}
-
-#[derive(Debug, Clone)]
-struct GovIdentityConfig {
-    target: String,
-    fallback_target: Option<String>,
-    timeout: Duration,
-}
-
-impl Default for GovIdentityConfig {
-    fn default() -> Self {
-        Self {
-            target: "SY.identity@motherbee".to_string(),
-            fallback_target: None,
-            timeout: Duration::from_secs(10),
-        }
-    }
-}
-
-// `SharedRouterConnection` and `GovIdentityBridge` were home-grown
-// trace_id multiplexers built on top of `RouterClient` from
-// `fluxbee_ai_sdk`. Both are eliminated by the global `RouterDispatcher`
-// unification: the dispatcher carries the canonical pending-matcher table,
-// and identity calls go through `send_with_matcher`. The ai-generic node
-// never actually wired a `gov_identity_bridge: Some(...)` in practice
-// (always `None`) — the gov-mode path lived on `ai-frontdesk-gov`. The
-// associated dead code is removed.
-struct GovIdentityBridge {
-    dispatcher: Arc<RouterDispatcher>,
-}
-
-impl GovIdentityBridge {
-    #[allow(dead_code)]
-    fn new(dispatcher: Arc<RouterDispatcher>) -> Self {
-        Self { dispatcher }
-    }
-
-    async fn call_ok(
-        &self,
-        identity: &GovIdentityConfig,
-        action: &str,
-        payload: Value,
-    ) -> std::result::Result<fluxbee_sdk::IdentitySystemResult, String> {
-        let first = self
-            .send_action_once(&identity.target, action, payload.clone(), identity.timeout)
-            .await;
-
-        match first {
-            Ok(out) => {
-                let status = out.payload.get("status").and_then(Value::as_str);
-                let error_code = out.payload.get("error_code").and_then(Value::as_str);
-                if status == Some("error") && error_code == Some("NOT_PRIMARY") {
-                    if let Some(fallback) = identity.fallback_target.as_deref() {
-                        if !fallback.trim().is_empty() && fallback != identity.target {
-                            return self
-                                .send_action_once(fallback, action, payload, identity.timeout)
-                                .await;
-                        }
-                    }
-                }
-                if status == Some("ok") {
-                    Ok(out)
-                } else {
-                    Err(format!(
-                        "identity action rejected: action={action}, error_code={}, message={}",
-                        error_code.unwrap_or("UNKNOWN"),
-                        out.payload
-                            .get("message")
-                            .and_then(Value::as_str)
-                            .unwrap_or("identity returned non-ok status")
-                    ))
-                }
-            }
-            Err(err) => {
-                let use_fallback = err.contains("original_dst=") && err.contains("NODE_NOT_FOUND");
-                if use_fallback {
-                    if let Some(fallback) = identity.fallback_target.as_deref() {
-                        if !fallback.trim().is_empty() && fallback != identity.target {
-                            return self
-                                .send_action_once(fallback, action, payload, identity.timeout)
-                                .await;
-                        }
-                    }
-                }
-                Err(err)
-            }
-        }
-    }
-
-    async fn send_action_once(
-        &self,
-        target: &str,
-        action: &str,
-        payload: Value,
-        timeout: Duration,
-    ) -> std::result::Result<fluxbee_sdk::IdentitySystemResult, String> {
-        let trace_id = Uuid::new_v4().to_string();
-        let req = Message {
-            routing: Routing {
-                src: String::new(),
-                src_l2_name: None,
-                dst: Destination::Unicast(target.to_string()),
-                ttl: 16,
-                trace_id: trace_id.clone(),
-            },
-            meta: Meta {
-                msg_type: SYSTEM_KIND.to_string(),
-                msg: Some(action.to_string()),
-                ..Meta::default()
-            },
-            payload,
-        };
-        let expected_msg = format!("{action}_RESPONSE");
-        let matcher = fluxbee_sdk::PendingMatcher::new(
-            vec![fluxbee_sdk::RouteMatch::exact(SYSTEM_KIND, &expected_msg)],
-            vec![
-                fluxbee_sdk::RouteMatch::exact(SYSTEM_KIND, MSG_UNREACHABLE),
-                fluxbee_sdk::RouteMatch::exact(SYSTEM_KIND, MSG_TTL_EXCEEDED),
-            ],
-            vec![fluxbee_sdk::RouteMatch::any_msg_type(SYSTEM_KIND)],
-        );
-        let labels = fluxbee_sdk::RpcRequestLabels::new(target, action, expected_msg.clone());
-        let msg = self
-            .dispatcher
-            .send_with_matcher(req, matcher, labels, timeout)
-            .await
-            .map_err(|err| format!("identity send failed: {err}"))?;
-        Self::parse_identity_reply(msg, &expected_msg, target, trace_id)
-    }
-
-    fn parse_identity_reply(
-        msg: Message,
-        expected_msg: &str,
-        target: &str,
-        trace_id: String,
-    ) -> std::result::Result<fluxbee_sdk::IdentitySystemResult, String> {
-        if msg.meta.msg.as_deref() == Some(expected_msg) {
-            return Ok(fluxbee_sdk::IdentitySystemResult {
-                payload: msg.payload,
-                effective_target: target.to_string(),
-                trace_id,
-            });
-        }
-        if msg.meta.msg.as_deref() == Some(MSG_UNREACHABLE) {
-            let original_dst = msg
-                .payload
-                .get("original_dst")
-                .and_then(Value::as_str)
-                .unwrap_or_default();
-            let reason = msg
-                .payload
-                .get("reason")
-                .and_then(Value::as_str)
-                .unwrap_or("unknown");
-            return Err(format!(
-                "identity transport unreachable: reason={reason}, original_dst={original_dst}"
-            ));
-        }
-        if msg.meta.msg.as_deref() == Some(MSG_TTL_EXCEEDED) {
-            let original_dst = msg
-                .payload
-                .get("original_dst")
-                .and_then(Value::as_str)
-                .unwrap_or_default();
-            let last_hop = msg
-                .payload
-                .get("last_hop")
-                .and_then(Value::as_str)
-                .unwrap_or_default();
-            return Err(format!(
-                "identity transport ttl exceeded: original_dst={original_dst}, last_hop={last_hop}"
-            ));
-        }
-        Err(format!(
-            "invalid identity response: expected {expected_msg} trace_id={trace_id}, got msg={:?}",
-            msg.meta.msg
-        ))
-    }
-}
-
-#[derive(Debug, Clone, Deserialize)]
-struct IlkRegisterIdentityCandidate {
-    name: String,
-    email: String,
-    #[serde(default)]
-    phone: Option<String>,
-    #[serde(default)]
-    tenant_hint: Option<String>,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-struct IlkRegisterArgs {
-    src_ilk: String,
-    identity_candidate: IlkRegisterIdentityCandidate,
-    #[serde(default)]
-    tenant_id: Option<String>,
-    #[serde(default)]
-    thread_id: Option<String>,
-}
-
-#[derive(Clone)]
-struct IlkRegisterTool {
-    scoped_src_ilk: Option<String>,
-    default_tenant_id: Option<String>,
-    identity: GovIdentityConfig,
-    bridge: Option<Arc<GovIdentityBridge>>,
 }
 
 #[derive(Clone)]
@@ -1173,7 +945,7 @@ impl AiNode for GenericAiNode {
                             error = %err,
                             "AI runtime missing api key; replying with runtime-not-ready payload"
                         );
-                        let payload = missing_ai_api_key_payload(&ai.vault_key);
+                        let payload = missing_ai_api_key_payload(&err.to_string());
                         return Ok(Some(build_reply_message_runtime_src(&msg, payload)));
                     }
                     Err(err) => {
@@ -1250,12 +1022,10 @@ impl GenericAiNode {
         ctx: &BehaviorContext,
         meta: &Meta,
     ) -> fluxbee_ai_sdk::Result<AiBehaviorOutput> {
-        let credential = self.resolve_ai_credential(ai).await.ok_or_else(|| {
-            fluxbee_ai_sdk::errors::AiSdkError::Protocol(format!(
-                "missing AI api key in SY.vault key={}",
-                ai.vault_key
-            ))
-        })?;
+        let credential = self
+            .resolve_ai_credential()
+            .await
+            .map_err(fluxbee_ai_sdk::errors::AiSdkError::Protocol)?;
         let client = create_llm_client(
             credential.provider,
             credential.api_key.clone(),
@@ -1277,8 +1047,6 @@ impl GenericAiNode {
             output_contract_mode,
             output_schema_name = ?output_schema.as_ref().map(|schema| schema.name()),
             provider = %credential.provider,
-            vault_key = %credential.vault_key,
-            vault_version = ?credential.version,
             "AI chat request prepared"
         );
         if !tool_registry.definitions().is_empty() {
@@ -1576,81 +1344,35 @@ impl GenericAiNode {
         Ok(())
     }
 
-    fn register_gov_tools(
-        &self,
-        registry: &mut FunctionToolRegistry,
-        ctx: &BehaviorContext,
-    ) -> fluxbee_ai_sdk::Result<()> {
-        // ai-generic never wires a gov identity bridge — that lives in
-        // ai-frontdesk-gov. The tool registers in disabled mode here.
-        let tool = IlkRegisterTool {
-            scoped_src_ilk: ctx.src_ilk.clone(),
-            default_tenant_id: self.resolve_effective_tenant_id(),
-            identity: self.gov_identity.clone(),
-            bridge: None,
-        };
-        registry.register(Arc::new(tool))?;
-        Ok(())
-    }
-
-    /// Resolves exactly the configured Vault key. Its `resource_type`
-    /// metadata selects the provider; the secret never selects the model.
-    async fn resolve_ai_credential(&self, ai: &AiChatRuntime) -> Option<ResolvedAiCredential> {
+    /// The AI key comes from SY.vault by resource type, like every other AI consumer: the
+    /// provider is the hive's (hive.yaml `ai`, OpenAI when absent) and the key is the one stored
+    /// for this node's tenant, or else the root tenant's. Nodes do not name a Vault key.
+    async fn resolve_ai_credential(&self) -> std::result::Result<ResolvedAiCredential, String> {
         let Some(vault) = self.vault.as_ref() else {
-            tracing::warn!(
-                node_name = %self.node_name,
-                "vault client unavailable (missing self_ilk_id / hive suffix); lookup skipped"
+            return Err(
+                "missing AI api key: no vault client (the node has no self ILK)".to_string(),
             );
-            return None;
         };
-        match vault.get(&ai.vault_key, Duration::from_secs(5)).await {
-            Ok(response) => {
-                let resource_type = response
-                    .metadata
-                    .as_ref()
-                    .and_then(|metadata| metadata.resource_type.as_deref());
-                let provider = resource_type.and_then(|value| value.parse::<AiProvider>().ok());
-                let api_key = response
-                    .value
-                    .as_ref()
-                    .and_then(extract_ai_api_key_from_value);
-                match (provider, api_key) {
-                    (Some(provider), Some(api_key)) => Some(ResolvedAiCredential {
-                        provider,
-                        api_key,
-                        vault_key: response.key,
-                        version: response.version,
-                    }),
-                    _ => {
-                        tracing::warn!(
-                            node_name = %self.node_name,
-                            vault_key = %ai.vault_key,
-                            resource_type = ?resource_type,
-                            "vault key must contain api_key and resource_type openai|anthropic"
-                        );
-                        None
-                    }
-                }
-            }
-            Err(err) => {
-                tracing::warn!(error = %err, vault_key = %ai.vault_key, "AI vault key lookup failed");
-                None
-            }
+        let provider = hive_ai_provider(&self.config_dir)?;
+        let tenant = self
+            .self_tenant_id
+            .as_deref()
+            .unwrap_or(fluxbee_sdk::DEFAULT_ROOT_TENANT_ID);
+        match vault
+            .resolve_resource(provider.resource_type(), tenant, Duration::from_secs(5))
+            .await
+        {
+            Ok(Some(value)) => match extract_ai_api_key_from_value(&value) {
+                Some(api_key) => Ok(ResolvedAiCredential { provider, api_key }),
+                None => Err(format!(
+                    "missing AI api key: the {provider} secret in SY.vault has no api_key"
+                )),
+            },
+            Ok(None) => Err(format!(
+                "missing AI api key: no {provider} secret in SY.vault for tenant {tenant} or the root tenant"
+            )),
+            Err(err) => Err(format!("missing AI api key: SY.vault lookup failed: {err}")),
         }
-    }
-
-    fn resolve_effective_tenant_id(&self) -> Option<String> {
-        let Ok(state) = self.control_plane.try_read() else {
-            return None;
-        };
-        state
-            .effective_config
-            .as_ref()
-            .and_then(|v| v.get("tenant_id"))
-            .and_then(Value::as_str)
-            .map(str::trim)
-            .filter(|v| looks_like_tenant_id(v))
-            .map(ToString::to_string)
     }
 
     async fn handle_control_plane(&self, msg: Message) -> fluxbee_ai_sdk::Result<Option<Message>> {
@@ -2029,8 +1751,7 @@ impl GenericAiNode {
                 "supports": ["CONFIG_GET", "CONFIG_SET"],
                 "required_fields": [
                     "config.behavior.kind",
-                    "config.behavior.model",
-                    "config.behavior.vault_key"
+                    "config.behavior.model"
                 ],
                 "field_values": {
                     "config.behavior.kind": {
@@ -2038,9 +1759,6 @@ impl GenericAiNode {
                     },
                     "config.behavior.model": {
                         "examples": ["gpt-5.5", "claude-sonnet-4-5"]
-                    },
-                    "config.behavior.vault_key": {
-                        "notes": ["The key metadata resource_type selects openai or anthropic; the key never selects the model."]
                     }
                 },
                 "optional_fields": [
@@ -2060,8 +1778,8 @@ impl GenericAiNode {
                 ],
                 "notes": [
                     "Cognitive assets are not part of CONFIG_SET. Apply role_hash, skill_hashes, handbook_hashes, and personality_hash with set_ilk_definition against the agent ILK.",
-                    "AI credentials are read from the exact config.behavior.vault_key on each request.",
-                    "Vault metadata resource_type selects openai or anthropic.",
+                    "AI credentials are not config: the provider is the hive's (hive.yaml ai, OpenAI by default) and its key is read from SY.vault by resource_type openai|anthropic on each request, for this node's tenant first and then the root tenant.",
+                    "config.behavior.vault_key is not accepted: nodes do not name a Vault key.",
                     "CONFIG_SET rejects secret-bearing fields such as config.secrets.openai.api_key, config.behavior.openai.api_key, config.behavior.api_key, and config.behavior.api_key_env.",
                     "ai.generic defaults behavior.capabilities.multimodal=true unless explicitly overridden.",
                     "Cognitive role/skill/handbook prompt definition is loaded from identity SHM and blob://agent-assets/<hash>.json."
@@ -3597,32 +3315,6 @@ fn env_bool(key: &str, default: bool) -> bool {
         .unwrap_or(default)
 }
 
-fn env_u64(key: &str, default: u64) -> u64 {
-    std::env::var(key)
-        .ok()
-        .and_then(|raw| raw.trim().parse::<u64>().ok())
-        .unwrap_or(default)
-}
-
-fn env_nonempty(key: &str) -> Option<String> {
-    std::env::var(key)
-        .ok()
-        .map(|v| v.trim().to_string())
-        .filter(|v| !v.is_empty())
-}
-
-fn gov_identity_config_from_env() -> GovIdentityConfig {
-    let mut cfg = GovIdentityConfig::default();
-    if let Some(target) = env_nonempty(GOV_IDENTITY_TARGET_ENV) {
-        cfg.target = target;
-    }
-    cfg.timeout = Duration::from_millis(env_u64(
-        GOV_IDENTITY_TIMEOUT_MS_ENV,
-        cfg.timeout.as_millis() as u64,
-    ));
-    cfg
-}
-
 #[async_trait]
 impl FunctionTool for GenerateCsvArtifactTool {
     fn definition(&self) -> FunctionToolDefinition {
@@ -4244,263 +3936,6 @@ impl FunctionTool for GenerateJpegArtifactTool {
     }
 }
 
-#[async_trait]
-impl FunctionTool for IlkRegisterTool {
-    fn definition(&self) -> FunctionToolDefinition {
-        FunctionToolDefinition {
-            name: "ilk_register".to_string(),
-            description: "Register identity completion for a temporary ILK (gov mode only)."
-                .to_string(),
-            parameters_json_schema: json!({
-                "type": "object",
-                "properties": {
-                    "src_ilk": { "type": "string", "minLength": 1 },
-                    "identity_candidate": {
-                        "type": "object",
-                        "properties": {
-                            "name": { "type": "string", "minLength": 1 },
-                            "email": { "type": "string", "minLength": 3 },
-                            "phone": { "type": "string" },
-                            "tenant_hint": { "type": "string" }
-                        },
-                        "required": ["name", "email"],
-                        "additionalProperties": true
-                    },
-                    "tenant_id": { "type": "string" },
-                    "thread_id": { "type": "string" }
-                },
-                "required": ["src_ilk", "identity_candidate"],
-                "additionalProperties": false
-            }),
-        }
-    }
-
-    async fn call(&self, arguments: Value) -> fluxbee_ai_sdk::Result<Value> {
-        let args: IlkRegisterArgs = serde_json::from_value(arguments).map_err(|err| {
-            fluxbee_ai_sdk::errors::AiSdkError::Protocol(format!(
-                "ilk_register: invalid arguments: {err}"
-            ))
-        })?;
-
-        let src_ilk_owned = self.scoped_src_ilk.clone().unwrap_or(args.src_ilk);
-        let src_ilk = src_ilk_owned.trim();
-        if src_ilk.is_empty() {
-            return Ok(json!({
-                "status": "error",
-                "error_code": "missing_src_ilk",
-                "message": "src_ilk is required",
-                "retryable": false
-            }));
-        }
-
-        if args.identity_candidate.name.trim().is_empty()
-            || args.identity_candidate.email.trim().is_empty()
-        {
-            return Ok(json!({
-                "status": "error",
-                "error_code": "invalid_identity_candidate",
-                "message": "identity_candidate.name and identity_candidate.email are required",
-                "retryable": false
-            }));
-        }
-
-        let explicit_tenant = args.tenant_id.as_deref().map(str::trim);
-        let tenant_hint = args
-            .identity_candidate
-            .tenant_hint
-            .as_deref()
-            .map(str::trim);
-        let cfg_tenant = self.default_tenant_id.as_deref().map(str::trim);
-        let env_tenant = env_nonempty(GOV_IDENTITY_TENANT_ID_ENV);
-        let mut tenant_source = tenant_resolution_source(explicit_tenant, tenant_hint, cfg_tenant);
-        let mut resolved_tenant_id =
-            resolve_tenant_id_for_register(explicit_tenant, tenant_hint, cfg_tenant);
-
-        if resolved_tenant_id.is_none() {
-            if let Some(tenant_name) = tenant_hint.filter(|value| !value.is_empty()) {
-                tracing::info!(
-                    op = "tenant_resolve",
-                    src_ilk = %src_ilk,
-                    target = %self.identity.target,
-                    tenant_hint = %tenant_name,
-                    "tenant_id missing; attempting TNT_CREATE from tenant_hint"
-                );
-                let create_payload = json!({
-                    "name": tenant_name,
-                    "status": "active"
-                });
-                tracing::info!(
-                    op = "tenant_resolve",
-                    target = %self.identity.target,
-                    msg = %MSG_TNT_CREATE,
-                    payload = %create_payload,
-                    "sending TNT_CREATE to identity"
-                );
-                let create_result = if let Some(bridge) = &self.bridge {
-                    bridge
-                        .call_ok(&self.identity, MSG_TNT_CREATE, create_payload)
-                        .await
-                } else {
-                    Err("identity bridge not initialized".to_string())
-                };
-
-                match create_result {
-                    Ok(out) => {
-                        let created_tenant_id = out
-                            .payload
-                            .get("tenant_id")
-                            .and_then(Value::as_str)
-                            .map(str::trim)
-                            .filter(|value| looks_like_tenant_id(value))
-                            .map(ToString::to_string);
-                        tracing::info!(
-                            op = "tenant_resolve",
-                            trace_id = %out.trace_id,
-                            effective_target = %out.effective_target,
-                            response_payload = %out.payload,
-                            "received TNT_CREATE response from identity"
-                        );
-                        if created_tenant_id.is_none() {
-                            tracing::warn!(
-                                op = "tenant_resolve",
-                                target = %self.identity.target,
-                                response_payload = %out.payload,
-                                "TNT_CREATE response missing valid tenant_id"
-                            );
-                            return Ok(json!({
-                                "status": "error",
-                                "error_code": "invalid_tnt_create_response",
-                                "message": "TNT_CREATE response did not include a valid tenant_id",
-                                "retryable": false
-                            }));
-                        }
-                        resolved_tenant_id = created_tenant_id;
-                        tenant_source = "tnt_create";
-                    }
-                    Err(err) => {
-                        tracing::warn!(
-                            op = "tenant_resolve",
-                            target = %self.identity.target,
-                            error = %err,
-                            "TNT_CREATE failed"
-                        );
-                        return Ok(identity_error_to_tool_payload(err));
-                    }
-                }
-            }
-        }
-
-        let Some(tenant_id) = resolved_tenant_id else {
-            tracing::warn!(
-                op = "ilk_register",
-                src_ilk = %src_ilk,
-                target = %self.identity.target,
-                explicit_tenant_id = ?explicit_tenant,
-                tenant_hint = ?tenant_hint,
-                effective_config_tenant_id = ?cfg_tenant,
-                env_tenant_id = ?env_tenant,
-                "missing tenant_id for ILK_REGISTER"
-            );
-            return Ok(json!({
-                "status": "error",
-                "error_code": "missing_tenant_id",
-                "message": "tenant_id is required for ILK_REGISTER (set tenant_id as tnt:<uuid>, use identity_candidate.tenant_hint=tnt:<uuid>, or set GOV_IDENTITY_TENANT_ID)",
-                "retryable": false
-            }));
-        };
-
-        tracing::info!(
-            op = "ilk_register",
-            src_ilk = %src_ilk,
-            tenant_id = %tenant_id,
-            tenant_source = %tenant_source,
-            target = %self.identity.target,
-            has_fallback = self.identity.fallback_target.is_some(),
-            "dispatching identity registration request"
-        );
-
-        let payload = json!({
-            "ilk_id": src_ilk,
-            "ilk_type": "human",
-            "tenant_id": tenant_id,
-            "identification": {
-                "display_name": args.identity_candidate.name,
-                "email": args.identity_candidate.email,
-                "phone": args.identity_candidate.phone,
-                "tenant_hint": args.identity_candidate.tenant_hint,
-            }
-        });
-        tracing::info!(
-            op = "ilk_register",
-            target = %self.identity.target,
-            msg = %MSG_ILK_REGISTER,
-            payload = %payload,
-            "sending ILK_REGISTER to identity"
-        );
-        let result = if let Some(bridge) = &self.bridge {
-            bridge
-                .call_ok(&self.identity, MSG_ILK_REGISTER, payload)
-                .await
-        } else {
-            Err("identity bridge not initialized".to_string())
-        };
-
-        match result {
-            Ok(out) => {
-                tracing::info!(
-                    op = "ilk_register",
-                    trace_id = %out.trace_id,
-                    effective_target = %out.effective_target,
-                    response_payload = %out.payload,
-                    "received ILK_REGISTER response from identity"
-                );
-                Ok(json!({
-                    "status": "ok",
-                    "registered": true,
-                    "effective_target": out.effective_target,
-                    "trace_id": out.trace_id,
-                    "identity_payload": out.payload
-                }))
-            }
-            Err(err) => {
-                tracing::warn!(
-                    op = "ilk_register",
-                    target = %self.identity.target,
-                    error = %err,
-                    "ILK_REGISTER failed"
-                );
-                Ok(identity_error_to_tool_payload(err))
-            }
-        }
-    }
-}
-
-fn identity_error_to_tool_payload(msg: String) -> Value {
-    let upper = msg.to_ascii_uppercase();
-    let (error_code, retryable) = if upper.contains("NOT_PRIMARY") {
-        ("NOT_PRIMARY", true)
-    } else if upper.contains("UNREACHABLE") || upper.contains("NODE_NOT_FOUND") {
-        ("UNAVAILABLE", true)
-    } else if upper.contains("TTL EXCEEDED") || upper.contains("TTL_EXCEEDED") {
-        ("TTL_EXCEEDED", true)
-    } else if upper.contains("TIMEOUT") {
-        ("TIMEOUT", true)
-    } else if upper.contains("INVALID_") {
-        ("INVALID_REQUEST", false)
-    } else if upper.contains("UNAUTHORIZED_REGISTRAR") {
-        ("UNAUTHORIZED_REGISTRAR", false)
-    } else {
-        ("IDENTITY_ERROR", true)
-    };
-
-    json!({
-        "status": "error",
-        "error_code": error_code,
-        "message": msg,
-        "retryable": retryable
-    })
-}
-
 impl NodeBehavior {
     fn kind(&self) -> &'static str {
         match self {
@@ -4559,20 +3994,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     Ok(())
 }
 
-fn with_jitter(base: Duration) -> Duration {
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|value| value.subsec_nanos() as u64)
-        .unwrap_or(0);
-    let jitter_factor_percent = nanos % 25;
-    let jitter = base
-        .as_millis()
-        .saturating_mul(jitter_factor_percent as u128)
-        / 100;
-    let total = base.as_millis().saturating_add(jitter);
-    Duration::from_millis(total as u64)
-}
-
 async fn run_one_config(
     config_path: PathBuf,
     cfg: RunnerConfig,
@@ -4617,7 +4038,6 @@ async fn run_one_config(
     );
 
     let node_name = runner_node_name.clone();
-    let gov_identity = gov_identity_config_from_env();
     // Static/dev path: keep the per-node store layout under the YAML-configured dynamic dir.
     let static_state_dir =
         infer_state_dir_from_dynamic(&PathBuf::from(&cfg.node.dynamic_config_dir));
@@ -4665,17 +4085,13 @@ async fn run_one_config(
             .await?;
     let vault = vault_client_for(dispatcher.clone(), &node_name, self_ilk_id.as_deref());
     let node = GenericAiNode {
-        mode: RunnerMode::Default,
         node_name,
         self_ilk_id,
         self_tenant_id,
         behavior: Arc::new(RwLock::new(Some(behavior))),
         config_dir: PathBuf::from(node_config_dir),
-        router_socket: runner_router_socket,
-        state_dir: runner_uuid_persistence_dir,
         thread_state_store,
         immediate_memory_store,
-        gov_identity,
         vault,
         control_plane: Arc::new(RwLock::new(ControlPlaneState {
             current_state: NodeLifecycleState::Configured,
@@ -4686,7 +4102,6 @@ async fn run_one_config(
             ..ControlPlaneState::default()
         })),
         cognitive_definition: cognitive_definition.clone(),
-        cognitive_definition_config: cognitive_definition_config.clone(),
     };
     spawn_cognitive_definition_poll_if_enabled(
         node.node_name.clone(),
@@ -4739,7 +4154,7 @@ impl ManagedNodeConfigContract for AiGenericContract {
         "AI.generic"
     }
     fn required_fields(&self) -> &'static [&'static str] {
-        &["behavior.kind", "behavior.model", "behavior.vault_key"]
+        &["behavior.kind", "behavior.model"]
     }
     fn optional_fields(&self) -> &'static [&'static str] {
         &[
@@ -4752,8 +4167,8 @@ impl ManagedNodeConfigContract for AiGenericContract {
     }
     fn notes(&self) -> &'static [&'static str] {
         &[
-            "The OpenAI/Anthropic credential is NOT config: reference it by behavior.vault_key (a \
-             Vault key with metadata.resource_type=openai|anthropic).",
+            "The OpenAI/Anthropic credential is NOT config: the node reads the hive AI provider's \
+             key from SY.vault by resource_type openai|anthropic (its tenant, then the root tenant).",
             "Cognitive assets (role/skill/handbook/personality) are applied to the agent ILK with \
              set_ilk_definition, not through CONFIG_SET.",
         ]
@@ -4872,7 +4287,6 @@ async fn run_unconfigured_bootstrap(
         node_name = %node_name,
         "starting ai_node_runner bootstrap instance"
     );
-    let gov_identity = gov_identity_config_from_env();
     let self_ilk_id = fluxbee_sdk::read_self_ilk_from_env();
     let self_tenant_id = fluxbee_sdk::read_self_tenant_from_env();
     let profile = build_ai_generic_rpc_profile()
@@ -4882,21 +4296,16 @@ async fn run_unconfigured_bootstrap(
             .await?;
     let vault = vault_client_for(dispatcher.clone(), &node_name, self_ilk_id.as_deref());
     let ai_node = GenericAiNode {
-        mode: RunnerMode::Default,
         node_name,
         self_ilk_id,
         self_tenant_id,
         behavior: Arc::new(RwLock::new(behavior)),
         config_dir: PathBuf::from(node_config_dir),
-        router_socket: runner_router_socket,
-        state_dir: runner_uuid_persistence_dir,
         thread_state_store,
         immediate_memory_store,
-        gov_identity,
         vault,
         control_plane: Arc::new(RwLock::new(state)),
         cognitive_definition: cognitive_definition.clone(),
-        cognitive_definition_config: cognitive_definition_config.clone(),
     };
     spawn_cognitive_definition_poll_if_enabled(
         ai_node.node_name.clone(),
@@ -4923,30 +4332,6 @@ struct BootstrapArgs {
 struct RunnerArgs {
     config_paths: Vec<PathBuf>,
     bootstrap: BootstrapArgs,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-enum RunnerMode {
-    #[default]
-    Default,
-    Gov,
-}
-
-impl RunnerMode {
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::Default => "default",
-            Self::Gov => "gov",
-        }
-    }
-
-    fn parse(raw: &str) -> Option<Self> {
-        match raw.trim().to_ascii_lowercase().as_str() {
-            "default" => Some(Self::Default),
-            "gov" => Some(Self::Gov),
-            _ => None,
-        }
-    }
 }
 
 fn parse_runner_args() -> Result<RunnerArgs, Box<dyn std::error::Error + Send + Sync>> {
@@ -5006,19 +4391,6 @@ fn parse_runner_args() -> Result<RunnerArgs, Box<dyn std::error::Error + Send + 
                         .into());
                 };
                 parsed.bootstrap.dynamic_config_dir = Some(value.clone());
-                i += 2;
-            }
-            "--mode" => {
-                let Some(value) = args.get(i + 1) else {
-                    return Err("missing value after --mode".to_string().into());
-                };
-                let normalized = value.trim().to_ascii_lowercase();
-                if normalized != "default" {
-                    return Err(format!(
-                        "--mode={value} is not supported in ai.common runtime (only default)"
-                    )
-                    .into());
-                }
                 i += 2;
             }
             other => {
@@ -5097,7 +4469,6 @@ fn build_behavior(
         BehaviorSection::Echo => NodeBehavior::Echo,
         BehaviorSection::AiChat(ai) => {
             require_nonempty("behavior.model", &ai.model)?;
-            require_nonempty("behavior.vault_key", &ai.vault_key)?;
             validate_managed_base_url(&ai.base_url)?;
             let instructions = resolve_instructions(&ai.instructions)?;
             let model_settings = ai
@@ -5116,7 +4487,6 @@ fn build_behavior(
                 .unwrap_or_else(default_multimodal_for_runtime);
             NodeBehavior::AiChat(AiChatRuntime {
                 model: ai.model.clone(),
-                vault_key: ai.vault_key.clone(),
                 instructions,
                 model_settings,
                 base_url: ai.base_url.clone(),
@@ -5206,11 +4576,6 @@ fn build_behavior_from_effective_config(
                 .clone()
                 .ok_or_else(|| "missing behavior.model for ai_chat".to_string())?;
             require_nonempty("behavior.model", &model)?;
-            let vault_key = behavior
-                .vault_key
-                .clone()
-                .ok_or_else(|| "missing behavior.vault_key for ai_chat".to_string())?;
-            require_nonempty("behavior.vault_key", &vault_key)?;
 
             let instructions = extract_instructions_from_effective_config(behavior);
             let model_settings = extract_model_settings_from_effective_config(behavior);
@@ -5229,7 +4594,6 @@ fn build_behavior_from_effective_config(
 
             Ok(NodeBehavior::AiChat(AiChatRuntime {
                 model,
-                vault_key,
                 instructions,
                 model_settings,
                 base_url,
@@ -5299,7 +4663,6 @@ fn build_startup_effective_config_doc(cfg: &RunnerConfig) -> EffectiveConfigDocu
         BehaviorSection::AiChat(ai) => EffectiveBehaviorSection {
             kind: "ai_chat".to_string(),
             model: Some(ai.model.clone()),
-            vault_key: Some(ai.vault_key.clone()),
             instructions: Some(format_instructions_snapshot(&ai.instructions)),
             model_settings: ai.model_settings.clone(),
             base_url: ai.base_url.clone(),
@@ -5340,48 +4703,6 @@ fn build_startup_effective_config_doc(cfg: &RunnerConfig) -> EffectiveConfigDocu
             cognitive_definition: Some(cfg.runtime.cognitive_definition.clone()),
         }),
     }
-}
-
-
-
-
-
-fn write_json_atomic(
-    path: &std::path::Path,
-    content: &str,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let parent = path
-        .parent()
-        .ok_or_else(|| "target path has no parent directory".to_string())?;
-    fs::create_dir_all(parent)?;
-
-    let tmp_name = format!(
-        ".{}.tmp.{}.{}",
-        path.file_name().and_then(|s| s.to_str()).unwrap_or("state"),
-        std::process::id(),
-        chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
-    );
-    let tmp_path = parent.join(tmp_name);
-
-    let mut file = OpenOptions::new()
-        .create_new(true)
-        .write(true)
-        .open(&tmp_path)?;
-    file.write_all(content.as_bytes())?;
-    file.flush()?;
-    file.sync_all()?;
-    drop(file);
-
-    if path.exists() {
-        fs::remove_file(path)?;
-    }
-    fs::rename(&tmp_path, path)?;
-
-    if let Ok(dir_file) = OpenOptions::new().read(true).open(parent) {
-        let _ = dir_file.sync_all();
-    }
-
-    Ok(())
 }
 
 fn format_instructions_snapshot(cfg: &Option<InstructionsSourceConfig>) -> Value {
@@ -5457,92 +4778,20 @@ fn parse_effective_config_doc(
         )
         .into());
     }
+    if config
+        .get("behavior")
+        .and_then(|behavior| behavior.get("vault_key"))
+        .is_some()
+    {
+        return Err(
+            "behavior.vault_key is not accepted: ai.generic reads the hive AI provider's \
+             key from SY.vault by resource_type (this node's tenant, then the root tenant)"
+                .into(),
+        );
+    }
     Ok(serde_json::from_value::<EffectiveConfigDocument>(
         config.clone(),
     )?)
-}
-
-
-
-fn looks_like_tenant_id(raw: &str) -> bool {
-    let Some(rest) = raw.strip_prefix("tnt:") else {
-        return false;
-    };
-    Uuid::parse_str(rest.trim()).is_ok()
-}
-
-fn resolve_tenant_id_for_register(
-    explicit_tenant_id: Option<&str>,
-    tenant_hint: Option<&str>,
-    default_tenant_id: Option<&str>,
-) -> Option<String> {
-    let explicit = explicit_tenant_id
-        .map(str::trim)
-        .filter(|v| !v.is_empty())
-        .filter(|v| looks_like_tenant_id(v))
-        .map(ToString::to_string);
-    if explicit.is_some() {
-        return explicit;
-    }
-
-    let hint = tenant_hint
-        .map(str::trim)
-        .filter(|v| !v.is_empty())
-        .filter(|v| looks_like_tenant_id(v))
-        .map(ToString::to_string);
-    if hint.is_some() {
-        return hint;
-    }
-
-    let cfg_default = default_tenant_id
-        .map(str::trim)
-        .filter(|v| !v.is_empty())
-        .filter(|v| looks_like_tenant_id(v))
-        .map(ToString::to_string);
-    if cfg_default.is_some() {
-        return cfg_default;
-    }
-
-    env_nonempty(GOV_IDENTITY_TENANT_ID_ENV).filter(|v| looks_like_tenant_id(v))
-}
-
-fn tenant_resolution_source(
-    explicit_tenant_id: Option<&str>,
-    tenant_hint: Option<&str>,
-    default_tenant_id: Option<&str>,
-) -> &'static str {
-    let explicit_ok = explicit_tenant_id
-        .map(str::trim)
-        .filter(|v| !v.is_empty())
-        .is_some_and(looks_like_tenant_id);
-    if explicit_ok {
-        return "args.tenant_id";
-    }
-
-    let hint_ok = tenant_hint
-        .map(str::trim)
-        .filter(|v| !v.is_empty())
-        .is_some_and(looks_like_tenant_id);
-    if hint_ok {
-        return "identity_candidate.tenant_hint";
-    }
-
-    let cfg_ok = default_tenant_id
-        .map(str::trim)
-        .filter(|v| !v.is_empty())
-        .is_some_and(looks_like_tenant_id);
-    if cfg_ok {
-        return "effective_config.tenant_id";
-    }
-
-    let env_ok = env_nonempty(GOV_IDENTITY_TENANT_ID_ENV)
-        .as_deref()
-        .is_some_and(looks_like_tenant_id);
-    if env_ok {
-        return GOV_IDENTITY_TENANT_ID_ENV;
-    }
-
-    "missing"
 }
 
 fn materialize_effective_defaults(
@@ -5704,14 +4953,38 @@ fn node_runtime_not_ready_payload() -> Value {
     })
 }
 
-fn missing_ai_api_key_payload(vault_key: &str) -> Value {
+fn missing_ai_api_key_payload(reason: &str) -> Value {
     json!({
         "type": "error",
         "code": "missing_ai_api_key",
-        "message": "The configured Vault key is missing, inaccessible, or is not an OpenAI/Anthropic credential.",
+        "message": "SY.vault has no usable key for the hive's AI provider (resource_type openai|anthropic, this node's tenant or the root tenant).",
         "retryable": true,
-        "details": { "vault_key": vault_key }
+        "details": { "reason": reason }
     })
+}
+
+#[derive(Debug, Deserialize)]
+struct HiveAiFile {
+    #[serde(default)]
+    ai: Option<HiveAiConfig>,
+}
+
+/// The hive's AI provider: hive.yaml `ai`, the section every SY.* AI consumer reads, or OpenAI
+/// when it is absent. It decides which Vault resource type holds the key.
+fn hive_ai_provider(config_dir: &Path) -> std::result::Result<AiProvider, String> {
+    let path = config_dir.join("hive.yaml");
+    let raw = fs::read_to_string(&path)
+        .map_err(|err| format!("cannot read {}: {err}", path.display()))?;
+    let hive: HiveAiFile =
+        serde_yaml::from_str(&raw).map_err(|err| format!("invalid {}: {err}", path.display()))?;
+    let engine = hive
+        .ai
+        .as_ref()
+        .map(HiveAiConfig::effective)
+        .transpose()
+        .map_err(|err| format!("invalid ai section in {}: {err}", path.display()))?
+        .unwrap_or_else(HiveAiConfig::fallback);
+    Ok(engine.provider)
 }
 
 fn ai_runtime_error_payload(err: &fluxbee_ai_sdk::errors::AiSdkError) -> Value {
@@ -6212,6 +5485,7 @@ mod tests {
     use std::fs;
     use std::sync::Arc;
     use std::sync::{Mutex, OnceLock};
+    use uuid::Uuid;
 
     #[test]
     fn validate_managed_base_url_allows_provider_hosts_rejects_arbitrary() {
@@ -6270,7 +5544,7 @@ mod tests {
             routing: Routing {
                 src: "SY.orchestrator@motherbee".to_string(),
                 src_l2_name: None,
-                dst: Destination::Unicast("SY.frontdesk.gov@motherbee".to_string()),
+                dst: Destination::Unicast("AI.generic@motherbee".to_string()),
                 ttl: 16,
                 trace_id: "trace-123".to_string(),
             },
@@ -6317,19 +5591,14 @@ mod tests {
     }
 
     fn test_node() -> GenericAiNode {
-        let gov_identity = GovIdentityConfig::default();
         GenericAiNode {
-            mode: RunnerMode::Default,
-            node_name: "SY.frontdesk.gov".to_string(),
+            node_name: "AI.generic@motherbee".to_string(),
             self_ilk_id: None,
             self_tenant_id: None,
             behavior: Arc::new(RwLock::new(None)),
             config_dir: PathBuf::from("/tmp"),
-            router_socket: PathBuf::from("/tmp"),
-            state_dir: PathBuf::from("/tmp"),
             thread_state_store: None,
             immediate_memory_store: None,
-            gov_identity,
             vault: None,
             control_plane: Arc::new(RwLock::new(ControlPlaneState {
                 current_state: NodeLifecycleState::Unconfigured,
@@ -6341,11 +5610,6 @@ mod tests {
             cognitive_definition: Arc::new(
                 RwLock::new(CognitiveDefinitionRuntimeState::disabled()),
             ),
-            cognitive_definition_config: CognitiveDefinitionRuntimeConfig {
-                enabled: false,
-                poll_interval: Duration::from_secs(DEFAULT_COGNITIVE_POLL_INTERVAL_SECS),
-                blob_root: PathBuf::from(DEFAULT_AGENT_ASSET_BLOB_ROOT),
-            },
         }
     }
 
@@ -6873,7 +6137,6 @@ mod tests {
             let mut behavior = node.behavior.write().await;
             *behavior = Some(NodeBehavior::AiChat(AiChatRuntime {
                 model: "gpt-5.5".to_string(),
-                vault_key: "ai/test".to_string(),
                 instructions: Some("Test instructions".to_string()),
                 model_settings: ModelSettings::default(),
                 base_url: None,
@@ -6912,7 +6175,7 @@ mod tests {
             routing: Routing {
                 src: "IO.sim.local@motherbee".to_string(),
                 src_l2_name: None,
-                dst: Destination::Unicast("SY.frontdesk.gov@motherbee".to_string()),
+                dst: Destination::Unicast("AI.generic@motherbee".to_string()),
                 ttl: 16,
                 trace_id: "trace-user-123".to_string(),
             },
@@ -7385,7 +6648,7 @@ mod tests {
         let cases = [
             (
                 json!({
-                    "behavior": {"kind": "ai_chat", "model": "gpt-5.5", "vault_key": "ai/test"},
+                    "behavior": {"kind": "ai_chat", "model": "gpt-5.5"},
                     "secrets": {"openai": {"api_key": "sk-test"}}
                 }),
                 "config.secrets",
@@ -7395,7 +6658,6 @@ mod tests {
                     "behavior": {
                         "kind": "ai_chat",
                         "model": "gpt-5.5",
-                        "vault_key": "ai/test",
                         "api_key": "sk-test"
                     }
                 }),
@@ -7406,7 +6668,6 @@ mod tests {
                     "behavior": {
                         "kind": "ai_chat",
                         "model": "gpt-5.5",
-                        "vault_key": "ai/test",
                         "api_key_env": "OPENAI_API_KEY"
                     }
                 }),
@@ -7417,7 +6678,6 @@ mod tests {
                     "behavior": {
                         "kind": "ai_chat",
                         "model": "gpt-5.5",
-                        "vault_key": "ai/test",
                         "openai": {"api_key": "sk-test"}
                     }
                 }),
@@ -7425,7 +6685,7 @@ mod tests {
             ),
             (
                 json!({
-                    "behavior": {"kind": "ai_chat", "model": "gpt-5.5", "vault_key": "ai/test"},
+                    "behavior": {"kind": "ai_chat", "model": "gpt-5.5"},
                     "assets": {"role_hash": "abc"}
                 }),
                 "config.assets",
@@ -7443,22 +6703,32 @@ mod tests {
     }
 
     #[test]
-    fn ai_chat_contract_requires_key_and_rejects_provider_selector() {
+    fn ai_chat_contract_needs_a_model_and_names_no_key_or_provider() {
+        let minimal = parse_effective_config_doc(&json!({
+            "behavior": {"kind": "ai_chat", "model": "gpt-5.5"}
+        }))
+        .expect("kind + model is a complete ai_chat config");
+        assert!(build_behavior_from_effective_config(&minimal).is_ok());
+
+        let with_key_name = json!({
+            "behavior": {"kind": "ai_chat", "model": "gpt-5.5", "vault_key": "ai/test"}
+        });
+        let err =
+            parse_effective_config_doc(&with_key_name).expect_err("a Vault key name is not config");
+        assert!(err
+            .to_string()
+            .contains("behavior.vault_key is not accepted"));
+
         let with_provider = json!({
-            "behavior": {
-                "kind": "ai_chat",
-                "vault_key": "ai/test",
-                "model": "gpt-5.5",
-                "provider": "openai"
-            }
+            "behavior": {"kind": "ai_chat", "model": "gpt-5.5", "provider": "openai"}
         });
         assert!(parse_effective_config_doc(&with_provider).is_err());
 
-        let missing_key = parse_effective_config_doc(&json!({
-            "behavior": {"kind": "ai_chat", "model": "gpt-5.5"}
+        let missing_model = parse_effective_config_doc(&json!({
+            "behavior": {"kind": "ai_chat"}
         }))
         .expect("document shape parses");
-        assert!(build_behavior_from_effective_config(&missing_key).is_err());
+        assert!(build_behavior_from_effective_config(&missing_model).is_err());
 
         let legacy = parse_effective_config_doc(&json!({
             "behavior": {"kind": "openai_chat", "model": "gpt-4.1-mini"}
@@ -7468,17 +6738,28 @@ mod tests {
     }
 
     #[test]
-    fn resolve_tenant_id_prefers_explicit_over_hint() {
-        let explicit = "tnt:11111111-1111-4111-8111-111111111111";
-        let hint = "tnt:22222222-2222-4222-8222-222222222222";
-        let out = resolve_tenant_id_for_register(Some(explicit), Some(hint), None);
-        assert_eq!(out.as_deref(), Some(explicit));
-    }
+    fn the_ai_provider_is_the_hives_and_openai_without_an_ai_section() {
+        let dir = std::env::temp_dir().join(format!("ai-generic-hive-ai-{}", Uuid::new_v4()));
+        fs::create_dir_all(&dir).expect("temp dir");
 
-    #[test]
-    fn resolve_tenant_id_uses_hint_when_explicit_missing() {
-        let hint = "tnt:22222222-2222-4222-8222-222222222222";
-        let out = resolve_tenant_id_for_register(None, Some(hint), None);
-        assert_eq!(out.as_deref(), Some(hint));
+        fs::write(dir.join("hive.yaml"), "hive_id: motherbee\n").expect("write hive.yaml");
+        assert_eq!(hive_ai_provider(&dir), Ok(AiProvider::OpenAi));
+
+        fs::write(
+            dir.join("hive.yaml"),
+            "hive_id: motherbee\nai:\n  default_provider: anthropic\n  providers:\n    anthropic:\n      model: claude-sonnet-4-5\n",
+        )
+        .expect("write hive.yaml");
+        assert_eq!(hive_ai_provider(&dir), Ok(AiProvider::Anthropic));
+
+        // The selected provider must be configured: a broken ai section is an error, not OpenAI.
+        fs::write(
+            dir.join("hive.yaml"),
+            "hive_id: motherbee\nai:\n  default_provider: anthropic\n",
+        )
+        .expect("write hive.yaml");
+        assert!(hive_ai_provider(&dir).is_err());
+
+        let _ = fs::remove_dir_all(&dir);
     }
 }

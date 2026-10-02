@@ -1,5 +1,15 @@
 # AI Nodes Specification — Consolidated Draft Replacement (v1)
 
+> **Histórico (marzo 2026). Lo vigente está en [`ai-nodes-deploy-runbook.md`](ai-nodes-deploy-runbook.md)
+> y en el contrato que devuelve `CONFIG_GET` del nodo.** Desde entonces cambiaron:
+> - el runtime es `ai.generic` (no `AI.common`), y sus nodos son instancias que crea el orchestrator con
+>   `run_node`. No hay unit systemd por nodo ni `ai-nodectl`: el modelo de template se borró el
+>   2026-10-02;
+> - el comportamiento es `ai_chat` (no `openai_chat`), configurado por `CONFIG_SET` en un único
+>   `config.json` del nodo;
+> - la clave es la del proveedor del hive en SY.vault, por `resource_type`. El nodo no nombra clave;
+> - `SY.frontdesk.gov` es un nodo de sistema aparte, no un perfil de este runtime.
+
 > ✅ Este documento consolida las Partes 1–5 en una única especificación “reemplazo” para **AI Nodes** en Fluxbee.  
 > Alcance: **AI Nodes** (Control Plane + Data Plane + Behaviors/Providers + Schema/Validation + Operación).  
 > Fuera de alcance: *cognitive* (se menciona solo como “a especificar”).
@@ -1575,34 +1585,9 @@ Phase E:
 
 ## Apéndice E: Instalación y gestión de instancias (no normativo)
 
-### 7.4 Install and manage AI node instances
-
-Installation script (does not modify core `install.sh`):
-
-```bash
-bash scripts/install-ia.sh
-```
-
-Installs:
-- `/usr/bin/ai-node-runner`
-- `/usr/bin/ai-nodectl`
-- systemd template unit `/etc/systemd/system/fluxbee-ai-node@.service`
-
-Per-instance runtime profile:
-- `AI.common`: tools/behavior de AI común (sin identidad gov).
-- `SY.frontdesk.gov`: tools/behavior de frontdesk gov (incluye identidad, por ejemplo `ilk_register`).
-- no se usa `AI_NODE_MODE` para seleccionar capacidades del runtime.
-
-Manage instances with `ai-nodectl`:
-
-```bash
-ai-nodectl list
-ai-nodectl add ai-chat /tmp/ai_chat.yaml
-sudo systemctl enable --now fluxbee-ai-node@ai-chat
-ai-nodectl status ai-chat
-ai-nodectl logs ai-chat --follow
-```
-
+Reemplazado. `ai.generic` viene en el `.deb` y sus instancias se crean con `run_node`; ver
+[`ai-nodes-deploy-runbook.md`](ai-nodes-deploy-runbook.md). `scripts/install-ia.sh`, `ai-nodectl` y el
+template `fluxbee-ai-node@.service` se borraron el 2026-10-02.
 
 ---
 

@@ -53,7 +53,8 @@ pero los wire formats de OpenAI todavía atraviesan el SDK y los consumidores.
 - Anthropic implementa texto, JSON schema, imágenes/documentos, tools multi-turn,
   errores con request id y retries acotados para transporte/408/409/429/5xx.
 - `AI.*` acepta solamente `behavior.kind=ai_chat` con `vault_key` y `model`; lee la
-  key exacta y deriva el provider de `metadata.resource_type`.
+  key exacta y deriva el provider de `metadata.resource_type`. **Reemplazado el
+  2026-10-02 (D4):** `AI.*` usa el provider del hive y su key general de Vault.
 - `SY.admin`, `SY.architect`, `SY.cognition` y `SY.frontdesk.gov` usan el provider y
   model del hive. Sin sección `ai`, el efectivo es OpenAI + `gpt-5.5`.
 - Los overrides provider/model por `CONFIG_SET` en consumidores SY se rechazan.
@@ -302,8 +303,9 @@ historia neutral suficiente para Anthropic.
 
 - `SY.*`: `hive.ai.default_provider` -> provider config/model -> `ResourceType` ->
   `resolve_resource`.
-- `AI.*`: `behavior.vault_key` -> `get(key)` -> metadata `resource_type` -> provider;
-  `behavior.model` permanece independiente de la key.
+- `AI.*` (desde 2026-10-02, D4): igual que `SY.*` para la key — provider del hive ->
+  `ResourceType` -> `resolve_resource` (tenant del nodo, después el raíz);
+  `behavior.model` sigue en el nodo.
 - Ambos extraen `api_key` según el contrato vigente de valores AI en Vault (object o
   bare string); esto no habilita compatibilidad de configuración de nodos.
 - Status y broadcast usan el provider efectivo.
@@ -410,23 +412,36 @@ Anthropic se declara explícitamente en `hive.yaml` cuando ese provider se selec
 - Si la sección `ai` no existe, el fallback cerrado es provider `openai` y model
   `gpt-5.5`.
 
-### D2. Selección de key en `AI.*`
+### D2. Selección de key en `AI.*` — reemplazada por D4
 
-Se reutiliza `CONFIG_SET` con `config.behavior.vault_key`. No se agrega un verbo de
-control nuevo. Otro `CONFIG_SET` con versión mayor cambia key y/o model.
+~~Se reutiliza `CONFIG_SET` con `config.behavior.vault_key`. No se agrega un verbo de
+control nuevo. Otro `CONFIG_SET` con versión mayor cambia key y/o model.~~
 
 ### D3. Sin backward compatibility
 
 Fluxbee está en alpha. Se reemplazan los contratos y se elimina el código anterior:
 
 - no alias de `openai_chat`;
-- no discovery implícito por `resource_type` para `AI.*` sin `vault_key`;
+- ~~no discovery implícito por `resource_type` para `AI.*` sin `vault_key`~~ (revertido por D4);
 - no `behavior.provider`;
 - no overrides provider/model por nodo `SY.*`;
 - no migración silenciosa de config persistida vieja.
 
 El sistema debe quedar en un solo estado coherente, sin tareas de deprecación ni ramas
 muertas pendientes.
+
+### D4. `AI.*` usa la key general del hive (operador, 2026-10-02)
+
+*"La clave de IA la debería tomar del vault con la clave general (sin asignación de nombre)."*
+
+- El provider de un `AI.*` es el del hive (`hive.yaml` `ai`, OpenAI si no está), como en `SY.*`
+  y en `SY.frontdesk.gov`.
+- La key se resuelve con `resolve_resource(provider.resource_type(), tenant del nodo)`: la del
+  tenant del nodo y, si no hay, la del tenant raíz.
+- `behavior.vault_key` sale del contrato. Un config que lo trae se rechaza con un mensaje que lo
+  nombra; las configs persistidas con él quedan en `FAILED_CONFIG` hasta un `CONFIG_SET` nuevo.
+- `behavior.model` sigue siendo del nodo; tiene que ser un modelo del provider del hive.
+- Para que un tenant use su propia key, se carga en Vault con su `tenant_id`.
 
 ## 7. Criterio de terminado
 

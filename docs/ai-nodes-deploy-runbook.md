@@ -1,60 +1,19 @@
-# AI Nodes Deploy Runbook (publish/update/spawn)
+# AI Nodes Runbook (`ai.generic`)
 
-## 1) Objetivo
+## 1) Modelo
 
-Desplegar y actualizar nodos IA por el camino canónico de Fluxbee:
+- `ai.generic` es el **único runtime AI**. Viene horneado en el `.deb`
+  (`/var/lib/fluxbee/dist/runtimes/ai.generic/<versión>`) y cada instalación lo deja como `current`.
+- Un nodo AI (`AI.<nombre>@<hive>`) es una **instancia** de `ai.generic`:
+  - se crea con `run_node`;
+  - su comportamiento entra por `CONFIG_SET`;
+  - su rol, skills y handbook entran por `set_ilk_definition` sobre su ILK.
+- **Ninguna instancia arranca con la instalación base.** Las instancias se crean para algo concreto;
+  las de prueba son efímeras y no quedan en la base.
+- `SY.frontdesk.gov` **no** es un runtime ni se despliega con este runbook. Es un nodo de sistema del
+  core (`sy-frontdesk-gov.service`) y se actualiza con el `.deb`.
 
-1. publish runtime en `dist/`
-2. `SYSTEM_UPDATE` en hive destino
-3. `SPAWN_NODE` o restart controlado, segun el tipo de nodo
-
-Incluye dos perfiles:
-- nodo IA común (`ai.common`)
-- frontdesk gov (`sy.frontdesk.gov`)
-
-Importante:
-- la separación de comportamiento es por runtime (`ai.common` vs `sy.frontdesk.gov`), no por flags de modo.
-
----
-
-## 2) Scripts disponibles
-
-- `scripts/publish-ia-runtime.sh`
-- `scripts/deploy-ia-node.sh`
-
-`publish-ia-runtime.sh`:
-- selecciona el perfil de runtime por `--runtime`.
-
-`deploy-ia-node.sh` ahora soporta:
-- `--update-scope <targeted|global>` (default: `targeted`).
-- En `targeted`, `SYSTEM_UPDATE category=runtime` se envía con `runtime + runtime_version` para no bloquear deploy puntual por drift global de runtimes ajenos.
-- Spawn sin `--config-json` (genera config base `{}` y usa `tenant_id` como fallback si se pasa por flag).
-
-Decisión de ownership:
-- El prompt/flujo de `sy.frontdesk.gov` pertenece al runtime frontdesk.
-- `ai.common` no debe transportar lógica específica gov/frontdesk.
-- El data-plane `text/v1` (incluyendo resolución de `content_ref`/`attachments` y offload de respuesta a `content_ref` por tamaño) pertenece al SDK AI compartido.
-
-Nota operativa vigente para frontdesk:
-- `sy.frontdesk.gov` sigue usando hoy el camino general de deploy de runtimes AI, pero debe leerse como runtime singleton `system-default` por hive.
-- para updates rutinarios, el proceso real esperado es el servicio singleton `sy-frontdesk-gov.service`.
-- en updates rutinarios, el camino correcto conceptual es `publish runtime + SYSTEM_UPDATE targeted + refresh del binario real del singleton + restart del servicio singleton`.
-- `spawn/delete/recreate` de `SY.frontdesk.gov` deben leerse como caminos excepcionales de bootstrap, reinstall o recuperación, no como el flujo normal de update.
-- el prompt funcional base del runtime no debería depender de que el operador lo cargue por `CONFIG_SET`.
-- la key de provider no entra por `CONFIG_SET`; debe cargarse en `SY.vault` con `resource_type=openai`.
-- si el servicio observado usa `ExecStart=/usr/bin/sy-frontdesk-gov`, `publish + SYSTEM_UPDATE + restart` no alcanza por sí solo para cambiar el binario efectivo; primero hay que instalar el binario actualizado en `/usr/bin/sy-frontdesk-gov` o ejecutar el camino equivalente de `scripts/install.sh`.
-- el host debe restaurar `sy-frontdesk-gov` solo despues de que `rt-gateway` y `SY.identity@<hive>` esten realmente listos; unidad activa no alcanza como señal de readiness.
-- incluso con ese orden operativo corregido, sigue pendiente endurecer `SY.frontdesk.gov` internamente con retry corto/backoff frente a errores transitorios de identity (`UNREACHABLE`, `TIMEOUT`, `NOT_PRIMARY`, etc.).
-
----
-
-## 3) Prerrequisitos
-
-- `sy-orchestrator`, `sy-admin`, `rt-gateway` activos.
-- API admin accesible (ejemplo: `BASE=http://127.0.0.1:8080`).
-- Permisos para escribir en `/var/lib/fluxbee/dist` si publicás local.
-
-Variables sugeridas:
+Variables de los ejemplos:
 
 ```bash
 BASE="http://127.0.0.1:8080"
@@ -63,175 +22,50 @@ HIVE_ID="motherbee"
 
 ---
 
-## 4) Deploy inicial de runtime IA
+## 2) Prerrequisito: la clave del proveedor
 
-### 4.1 Nodo IA común
-
-```bash
-bash scripts/deploy-ia-node.sh \
-  --base "$BASE" \
-  --hive-id "$HIVE_ID" \
-  --runtime "ai.common" \
-  --version "0.1.0" \
-  --sync-hint \
-  --sudo
-```
-
-### 4.2 Frontdesk gov
-
-Para update rutinario de frontdesk, publicar runtime y luego alinear el binario que usa el servicio singleton:
+El proveedor es del hive: `ai.default_provider` en `/etc/fluxbee/hive.yaml` (`openai` si no hay
+sección `ai`). La clave se carga una vez en `SY.vault` con el `resource_type` del proveedor, sin nombre
+fijo:
 
 ```bash
-bash scripts/deploy-ia-node.sh \
-  --base "$BASE" \
-  --hive-id "$HIVE_ID" \
-  --runtime "sy.frontdesk.gov" \
-  --version "0.1.0" \
-  --sync-hint \
-  --sudo
-
-cargo build --release -p sy-frontdesk-gov --bin sy-frontdesk-gov
-sudo install -m 0755 target/release/sy-frontdesk-gov /usr/bin/sy-frontdesk-gov
-sudo systemctl restart sy-frontdesk-gov.service
-sudo systemctl status sy-frontdesk-gov.service --no-pager -l
-sha256sum /usr/bin/sy-frontdesk-gov
-sha256sum /var/lib/fluxbee/dist/runtimes/sy.frontdesk.gov/0.1.0/bin/sy-frontdesk-gov
+curl -sS -X POST "$BASE/hives/$HIVE_ID/vault/secrets" -H 'content-type: application/json' \
+  -d '{"key":"openai_root_pool","value":{"api_key":"sk-..."},"metadata":{"tenant_id":"tnt:00000000-0000-0000-0000-000000000001","resource_type":"openai"}}'
 ```
 
-Si los hashes no coinciden, el servicio singleton sigue corriendo un binario distinto al runtime publicado.
-
-Si queres usar el camino de instalacion completo del host en vez del update puntual del binario:
-
-```bash
-bash scripts/install.sh
-```
-
-Ese camino tambien actualiza `dist/core/bin` y puede reiniciar otros servicios del core, por lo que debe tratarse como una operacion mas amplia que el update puntual de frontdesk.
-Ademas, para frontdesk el install debe entenderse como restore ordenado de dependencias: `rt-gateway` -> `sy-identity` -> `sy-frontdesk-gov`, con espera de readiness real de identity antes de restaurar frontdesk.
+- Un nodo AI busca la clave de **su tenant** y, si no hay, la del **tenant raíz**. Para que un tenant use
+  su propia clave, cargala con su `tenant_id`.
+- El nodo no nombra ninguna clave: un config con `behavior.vault_key` se rechaza.
+- Es la misma clave que usan architect, admin, cognition y frontdesk.
 
 ---
 
-## 5) Spawn de nodo (config opcional)
-
-Importante:
-
-- esta sección aplica al lifecycle managed/transient de nodos AI comunes;
-- en `SY.frontdesk.gov`, `spawn` no debe considerarse el camino rutinario de update;
-- usarlo solo para bootstrap explícito, reinstall o recuperación de estado roto.
-
-Ejemplo frontdesk solo para bootstrap controlado:
+## 3) Crear un nodo
 
 ```bash
-bash scripts/deploy-ia-node.sh \
-  --base "$BASE" \
-  --hive-id "$HIVE_ID" \
-  --runtime "sy.frontdesk.gov" \
-  --version "0.1.0" \
-  --node-name "SY.frontdesk.gov@$HIVE_ID" \
-  --spawn \
-  --sync-hint \
-  --sudo
+curl -sS -X POST "$BASE/hives/$HIVE_ID/nodes" -H 'content-type: application/json' \
+  -d '{"node_name":"AI.sales@motherbee","runtime":"ai.generic","runtime_version":"current","tenant_id":"tnt:..."}'
 ```
 
-Si no envías `--config-json`, el script hace spawn con `config={}` (más `tenant_id` si fue enviado).
-El detalle funcional (prompt/key/model/etc.) se recomienda cargarlo por `POST .../control/config-set`.
-
-### 5.1 Bootstrap canónico por FLUXBEE_NODE_NAME (dos nodos)
-
-Con el contrato actual de core, `spawn` inyecta `FLUXBEE_NODE_NAME=<node@hive>` y el runtime deriva su `config.json` canónico. No hace falta path fijo.
-
-```bash
-# GOV
-bash scripts/deploy-ia-node.sh \
-  --base "$BASE" \
-  --hive-id "$HIVE_ID" \
-  --runtime "sy.frontdesk.gov" \
-  --version "0.1.0" \
-  --sync-hint \
-  --sudo
-
-# COMUN
-bash scripts/deploy-ia-node.sh \
-  --base "$BASE" \
-  --hive-id "$HIVE_ID" \
-  --runtime "ai.common" \
-  --version "0.1.0" \
-  --sync-hint \
-  --sudo
-```
-
-Los flags `--forced-node-name` y `--forced-dynamic-config-dir` quedan solo para compatibilidad de emergencia.
+El nodo arranca **UNCONFIGURED** hasta recibir su `CONFIG_SET`.
 
 ---
 
-## 6) Update de código de nodo existente
+## 4) Configurarlo (`CONFIG_SET`)
 
-Para `ai.common` y nodos managed similares, `--update-existing` sigue siendo el camino operativo esperado.
+1. `POST .../nodes/<node>/control/config-get` → tomar `config_version`.
+2. `POST .../nodes/<node>/control/config-set` con `config_version + 1`.
 
-Para `SY.frontdesk.gov`, no tomar esta sección como camino rutinario por defecto.
-La dirección vigente para frontdesk es singleton por hive, con restart del servicio local.
-
-```bash
-bash scripts/deploy-ia-node.sh \
-  --base "$BASE" \
-  --hive-id "$HIVE_ID" \
-  --runtime "sy.frontdesk.gov" \
-  --version "0.1.1" \
-  --node-name "SY.frontdesk.gov@$HIVE_ID" \
-  --update-existing \
-  --sync-hint \
-  --sudo
-```
-
-`--update-existing` hace:
-- publish runtime nuevo
-- update con retries (`targeted` por defecto)
-- `GET config` del nodo actual
-- `DELETE` + `POST` reutilizando esa config
-
-Para frontdesk, usar este camino solo cuando sea explícito que se quiere tratarlo como reinstall/rebootstrap controlado y no como update conservador del singleton operativo.
-
-### 6.1 Scope recomendado de update
-
-- Recomendado (default): `--update-scope targeted`
-- Solo para diagnóstico de salud general: `--update-scope global`
-
-Ejemplo forzando modo global:
-
-```bash
-bash scripts/deploy-ia-node.sh \
-  --base "$BASE" \
-  --hive-id "$HIVE_ID" \
-  --runtime "ai.common" \
-  --version "0.1.2" \
-  --update-scope global \
-  --sync-hint \
-  --sudo
-```
-
----
-
-## 7) Prompts/config obligatorias
-
-Para `ai.common`, los prompts/config obligatorias pueden versionarse en el `config` del nodo.
-
-Para `sy.frontdesk.gov`, la dirección vigente es distinta:
-- el prompt funcional base pertenece al runtime frontdesk,
-- provider y modelo pertenecen al `ai` hive-wide de `hive.yaml`,
-- `CONFIG_SET` queda para timeouts y flags operativos no secretos,
-- no para transportar obligatoriamente todo el prompt funcional del nodo.
-
-Ejemplo base para un nodo dinámico `ai_chat`:
+Config mínima de un `ai_chat`: `behavior.kind` y `behavior.model`. Ejemplo completo:
 
 ```json
 {
   "behavior": {
     "kind": "ai_chat",
-    "vault_key": "ai/common",
     "model": "gpt-5.5",
     "instructions": {
       "source": "inline",
-      "value": "Prompt obligatorio del nodo...",
+      "value": "Prompt del nodo...",
       "trim": true
     },
     "model_settings": {
@@ -248,54 +82,52 @@ Ejemplo base para un nodo dinámico `ai_chat`:
 }
 ```
 
-Variables recomendadas para frontdesk gov:
-- `OPENAI_API_KEY`
-- `GOV_IDENTITY_TARGET`
-- `GOV_IDENTITY_TIMEOUT_MS`
+- El modelo tiene que ser del proveedor del hive.
+- Hay **una sola** config: el `config.json` del directorio del nodo
+  (`/var/lib/fluxbee/nodes/AI/<node@hive>/config.json`).
+  - `CONFIG_SET` la valida, la aplica en caliente y la persiste.
+  - `PUT .../config` solo la escribe; el nodo la toma en el próximo arranque.
+- `CONFIG_SET` rechaza secretos (`api_key`, `api_key_env`, `secrets.*`) y los assets cognitivos
+  (van por `set_ilk_definition`).
 
 ---
 
-## 8) Importante: estado actual del runner IA
+## 5) Actualizar `ai.generic` sin un `.deb` nuevo (desarrollo)
 
-Hoy hay dos persistencias distintas por capa:
-- `config.json` de orchestrator en `/var/lib/fluxbee/nodes/<TYPE>/<node@hive>/config.json` (infra/bootstrap).
-- estado dinámico del nodo en `/var/lib/fluxbee/state/ai-nodes/<node>.json` (runtime/business, vía `CONFIG_SET`).
+`scripts/deploy-ia-node.sh` publica una build del runner, manda el `SYSTEM_UPDATE` y hace spawn o
+recreación. Usa `scripts/publish-ia-runtime.sh`, que compila `ai_node_runner` y lo publica con
+`scripts/publish-runtime.sh`.
 
-Precedencia efectiva actual del runner AI (flujo managed-node):
-1. estado dinámico persistido por `CONFIG_SET`
-2. fallback a `config.json` de orchestrator
-3. `UNCONFIGURED`
+```bash
+bash scripts/deploy-ia-node.sh \
+  --base "$BASE" \
+  --hive-id "$HIVE_ID" \
+  --runtime "ai.generic" \
+  --version "0.1.99" \
+  --node-name "AI.sales@motherbee" \
+  --update-existing \
+  --sync-hint \
+  --sudo
+```
 
-Hot reload actual:
-- confiable/canónico: `POST .../control/config-set` (`CONFIG_SET`).
-- `PUT .../config` ya no manda `CONFIG_CHANGED` (borrado en 0.1.45): el `config.json` del orchestrator se toma en el próximo arranque.
+`--update-existing` hace:
 
-Conclusión operativa:
-- para código: `publish -> update -> spawn` (canónico) ya sirve.
-- para prompt/key/behavior en runtime: usar `CONFIG_SET` (control plane del nodo).
-- para update de runtime puntual, mantener `deploy-ia-node.sh` en scope `targeted` (default).
+- publicar el runtime nuevo;
+- el update con reintentos (`targeted` por defecto);
+- leer la config actual del nodo;
+- `DELETE` + `POST` reusando esa config.
 
-Nota sobre attachments AI (estado 2026-04-06):
-- `AI.*` ya consume `attachments[]`/`content_ref` vía SDK AI compartido.
-- imágenes soportadas (`png`/`jpeg`/`webp`) viajan como `input_image.image_url`.
-- archivos no imagen, cuando `multimodal=true`, viajan como `input_file.file_data` con formato `data:<mime>;base64,...` y `filename`.
-- `file_id` / `file_url` siguen diferidos hasta que Fluxbee/Core defina metadata suficiente para soportarlos de forma canónica.
-- esto no debe leerse como "cualquier tipo de archivo ya quedó validado end-to-end":
-  - evidencia E2E asentada hoy: imagen, PDF y `xlsx`
-  - siguen faltando pruebas por familias de tipos adicionales (`docx`, audio, otros binarios y mezcla de adjuntos)
-- esto tampoco debe leerse como "AI ya devuelve archivos al usuario final":
-  - el contrato de salida soporta `attachments[]`
-  - `IO.slack` sabe publicar adjuntos salientes si existen
-  - pero los runners `AI.*` actuales responden texto y offload de texto largo a `content_ref`
-  - la generación de PDF/XLSX/imagen saliente como adjunto no está cerrada hoy como flujo general
+Para un nodo nuevo, `--spawn` con `--config-json` (y `--tenant-id`). Sin `--config-json`, el spawn usa
+`config={}` y el nodo queda UNCONFIGURED.
 
----
+**Scope del update:**
 
-## 9) Immediate memory options for spawn/deploy
+- `--update-scope targeted` (default): el `SYSTEM_UPDATE category=runtime` lleva `runtime` y
+  `runtime_version`, así el drift de otros runtimes no bloquea el deploy.
+- `--update-scope global`: solo para diagnosticar la salud general.
 
-`deploy-ia-node.sh` now supports optional flags to inject `runtime.immediate_memory` into spawn config.
+**Memoria inmediata (opcional):** estos flags inyectan `runtime.immediate_memory` en la config del spawn:
 
-Optional flags:
 - `--immediate-memory-enabled <true|false>`
 - `--immediate-memory-recent-max <n>`
 - `--immediate-memory-active-max <n>`
@@ -303,52 +135,17 @@ Optional flags:
 - `--immediate-memory-refresh-every-turns <n>`
 - `--immediate-memory-trim-noise <true|false>`
 
-Notes:
-- These flags are opt-in. Existing commands keep working unchanged.
-- If you do not pass these flags, config remains exactly as provided by `--config-json`.
+Sin estos flags, la config queda exactamente como viene en `--config-json`.
 
-Example (`AI.chat@motherbee`):
+---
 
-```bash
-bash scripts/deploy-ia-node.sh \
-  --base "http://127.0.0.1:8080" \
-  --hive-id "motherbee" \
-  --runtime "ai.chat" \
-  --version "0.1.1" \
-  --node-name "AI.chat@motherbee" \
-  --tenant-id "tnt:43d576a3-d712-4d91-9245-5d5463dd693e" \
-  --config-json /tmp/ai_common_chat.config.json \
-  --immediate-memory-enabled true \
-  --immediate-memory-recent-max 10 \
-  --immediate-memory-active-max 8 \
-  --immediate-memory-summary-max-chars 1600 \
-  --immediate-memory-refresh-every-turns 3 \
-  --immediate-memory-trim-noise true \
-  --spawn \
-  --sync-hint \
-  --allow-sync-pending \
-  --sudo
-```
+## 6) Adjuntos (estado 2026-04-06)
 
-Example (`SY.frontdesk.gov@motherbee`):
-
-```bash
-bash scripts/deploy-ia-node.sh \
-  --base "http://127.0.0.1:8080" \
-  --hive-id "motherbee" \
-  --runtime "sy.frontdesk.gov" \
-  --version "0.1.0" \
-  --node-name "SY.frontdesk.gov@motherbee" \
-  --tenant-id "tnt:43d576a3-d712-4d91-9245-5d5463dd693e" \
-  --config-json /tmp/ai_frontdesk_gov.spawn.json \
-  --immediate-memory-enabled true \
-  --immediate-memory-recent-max 10 \
-  --immediate-memory-active-max 8 \
-  --immediate-memory-summary-max-chars 1600 \
-  --immediate-memory-refresh-every-turns 3 \
-  --immediate-memory-trim-noise true \
-  --spawn \
-  --sync-hint \
-  --allow-sync-pending \
-  --sudo
-```
+- `AI.*` consume `attachments[]`/`content_ref` vía el SDK AI compartido.
+- Imágenes (`png`/`jpeg`/`webp`) viajan como `input_image.image_url`. Otros archivos, con
+  `multimodal=true`, como `input_file.file_data` (`data:<mime>;base64,...` + `filename`).
+- `file_id` / `file_url` siguen diferidos.
+- **Evidencia E2E:** imagen, PDF y `xlsx`. Faltan `docx`, audio, otros binarios y mezclas.
+- **Salida:** el contrato soporta `attachments[]` e `IO.slack` publica adjuntos salientes. El runner
+  tiene tools que generan artefactos (csv, texto, json, markdown, html, docx, png, jpeg) y una que
+  publica una página HTML con URL pública (`publish_html_page`, solo si el nodo tiene identidad).
