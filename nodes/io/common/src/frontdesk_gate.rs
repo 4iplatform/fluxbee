@@ -197,7 +197,9 @@ pub fn build_handoff_message(
             trace_id: trace_id.to_string(),
         },
         meta: Meta {
-            msg_type: "data".to_string(),
+            // A USER message, like io.cloud's handoff: the frontdesk only takes a handoff from
+            // `user` messages, so a `data` one never reached its deterministic path.
+            msg_type: "user".to_string(),
             msg: Some(FRONTDESK_HANDOFF_TYPE.to_string()),
             src_ilk: Some(src_ilk.to_string()),
             ..Meta::default()
@@ -342,6 +344,8 @@ mod tests {
         }
         assert_eq!(msg.meta.src_ilk.as_deref(), Some("ilk:abc"));
         assert_eq!(msg.meta.msg.as_deref(), Some(FRONTDESK_HANDOFF_TYPE));
+        // El frontdesk solo toma handoffs de mensajes `user` (como el de io.cloud).
+        assert_eq!(msg.meta.msg_type, "user");
 
         // Es el camino ESTRUCTURADO, no el conversacional: tiene que parsear como handoff.
         let parsed = crate::frontdesk_contract::parse_frontdesk_handoff_payload(&msg.payload)
