@@ -36,10 +36,10 @@ jobs:
         working-directory: go/${{ matrix.module }}
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: Set up Go
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@v6
         with:
           go-version-file: go/${{ matrix.module }}/go.mod
           cache-dependency-path: go/${{ matrix.module }}/go.sum

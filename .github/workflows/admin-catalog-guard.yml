@@ -18,7 +18,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: Verify admin HTTP/socket action catalog parity
         run: bash scripts/admin_action_catalog_parity_check.sh
