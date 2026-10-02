@@ -15855,6 +15855,7 @@ async fn kill_node_flow(
                             response["removed_path"] =
                                 serde_json::json!(removed_path.display().to_string());
                             response["removed_kind_dir"] = serde_json::json!(removed_kind_dir);
+                            response["uuid_file_removed"] = purge_node_uuid_file(node_name);
                             match remove_node_ilk_mapping(state, node_name) {
                                 Ok(removed) => {
                                     response["ilk_mapping_removed"] = serde_json::json!(removed);
@@ -15986,6 +15987,43 @@ fn remove_node_instance_dir_with_root(
         removed_kind_dir = true;
     }
     Ok((node_dir, removed_kind_dir))
+}
+
+/// The node's persisted L1 UUID (`<state>/nodes/<name without @hive>.uuid`, written by the SDK
+/// on the node's first start). A purged node takes it along, so a node created later under the
+/// same name gets a fresh one. Returns whether a file was removed.
+fn remove_node_uuid_file_with_root(
+    node_name: &str,
+    uuid_root: &Path,
+) -> Result<bool, OrchestratorError> {
+    let base = node_name
+        .split_once('@')
+        .map(|(base, _)| base)
+        .unwrap_or(node_name)
+        .trim();
+    if base.is_empty() || base.contains('/') || base.contains("..") {
+        return Err(format!("invalid node_name '{node_name}'").into());
+    }
+    match fs::remove_file(uuid_root.join(format!("{base}.uuid"))) {
+        Ok(()) => Ok(true),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(err) => Err(err.into()),
+    }
+}
+
+fn node_uuid_root() -> PathBuf {
+    json_router::paths::state_dir().join("nodes")
+}
+
+/// Purge step for the UUID file: reported, never fatal (the instance and the ILK are already gone).
+fn purge_node_uuid_file(node_name: &str) -> serde_json::Value {
+    match remove_node_uuid_file_with_root(node_name, &node_uuid_root()) {
+        Ok(removed) => serde_json::json!(removed),
+        Err(err) => {
+            tracing::warn!(node_name = %node_name, error = %err, "purge: could not remove the node UUID file");
+            serde_json::json!(false)
+        }
+    }
 }
 
 async fn remove_node_instance_flow(
@@ -16151,6 +16189,7 @@ async fn remove_node_instance_flow(
                 "removed_kind_dir": removed_kind_dir,
                 "timer_purge": timer_purge,
                 "ilk_mapping_removed": ilk_mapping_removed,
+                "uuid_file_removed": purge_node_uuid_file(&node_name),
             });
             append_optional_teardown_cleanup(
                 state,
@@ -26998,6 +27037,26 @@ blob:
         assert!(removed_kind_dir);
         assert!(!removed_path.exists());
         assert!(!root.join("AI").exists());
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_purged_node_takes_its_uuid_file_and_only_its_own() {
+        let root = std::env::temp_dir().join(format!(
+            "fluxbee-remove-node-uuid-{}",
+            Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&root).expect("create uuid root");
+        std::fs::write(root.join("AI.sales.uuid"), Uuid::new_v4().to_string()).expect("uuid 1");
+        std::fs::write(root.join("AI.support.uuid"), Uuid::new_v4().to_string()).expect("uuid 2");
+
+        assert!(remove_node_uuid_file_with_root("AI.sales@motherbee", &root).expect("remove"));
+        assert!(!root.join("AI.sales.uuid").exists());
+        assert!(root.join("AI.support.uuid").exists());
+        // Already gone: not an error.
+        assert!(!remove_node_uuid_file_with_root("AI.sales@motherbee", &root).expect("again"));
+        assert!(remove_node_uuid_file_with_root("../etc@motherbee", &root).is_err());
 
         let _ = std::fs::remove_dir_all(&root);
     }
