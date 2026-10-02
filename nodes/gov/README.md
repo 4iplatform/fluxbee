@@ -12,25 +12,25 @@ Objetivo:
 ```text
 nodes/gov/
 ├── common/                  # utilidades compartidas para código gov
-└── ai-frontdesk-gov/        # runtime actual que implementa sy.frontdesk.gov
+└── ai-frontdesk-gov/        # SY.frontdesk.gov, nodo de sistema del core
 ```
 
 Alcance de esta fase:
 - el foco actual está en `ai-frontdesk-gov`;
-- no agregar otros componentes `.gov` hasta cerrar integración y E2E de frontdesk;
-- `ai-frontdesk-gov` sigue temporalmente cercano al runner de `nodes/ai/ai-generic`.
+- no agregar otros componentes `.gov` hasta cerrar integración y E2E de frontdesk.
 
 ## Convenciones
 
-- Nodo canónico actual: `SY.frontdesk.gov@<hive>`
-- Runtime canónico actual: `sy.frontdesk.gov`
+- Nodo canónico actual: `SY.frontdesk.gov@<hive>`, un servicio del core (`sy-frontdesk-gov.service`),
+  no un runtime.
 - Configuración de ruteo de temporales:
   - `government.identity_frontdesk: "SY.frontdesk.gov@motherbee"`
 
 Control plane y secrets:
-- frontdesk mantiene hoy el mismo contrato `CONFIG_GET` / `CONFIG_SET` del runner AI;
-- la key de OpenAI se persiste localmente en `secrets.json`;
-- el campo canónico actual es `config.secrets.openai.api_key`.
+- frontdesk no toma config por `CONFIG_SET`: su prompt va embebido y el proveedor/modelo salen de
+  `hive.yaml` (`ai`);
+- la key del proveedor se lee de `SY.vault` por `resource_type` (tenant raíz); `CONFIG_SET` solo
+  fuerza a releerla.
 
 ## Build
 
@@ -38,7 +38,7 @@ Desde raíz del repo:
 
 ```bash
 cargo check -p gov-common
-cargo check -p sy-frontdesk-gov --bin ai_node_runner
+cargo check -p sy-frontdesk-gov --bin sy-frontdesk-gov
 ```
 
 ## Integración Identity (frontdesk)

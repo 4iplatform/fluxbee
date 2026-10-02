@@ -3,7 +3,7 @@ pub mod frontdesk_contract;
 use std::path::PathBuf;
 use std::time::Duration;
 
-use fluxbee_sdk::{managed_node_name, NodeConfig, NodeUuidMode};
+use fluxbee_sdk::{managed_node_name, IdentityError, NodeConfig, NodeUuidMode};
 use serde_json::{json, Value};
 
 pub fn env_or(key: &str, default: &str) -> String {
@@ -77,30 +77,65 @@ pub fn gov_identity_config_from_env() -> GovIdentityConfig {
     cfg
 }
 
-pub fn identity_error_to_tool_payload(msg: String) -> Value {
-    let upper = msg.to_ascii_uppercase();
-    let (error_code, retryable) = if upper.contains("NOT_PRIMARY") {
-        ("NOT_PRIMARY", true)
-    } else if upper.contains("UNREACHABLE") {
-        ("UNREACHABLE", true)
-    } else if upper.contains("TTL EXCEEDED") || upper.contains("TTL_EXCEEDED") {
-        ("TTL_EXCEEDED", true)
-    } else if upper.contains("TIMEOUT") {
-        ("TIMEOUT", true)
-    } else if upper.contains("INVALID_") {
-        ("INVALID_REQUEST", false)
-    } else if upper.contains("UNAUTHORIZED_REGISTRAR") {
-        ("UNAUTHORIZED_REGISTRAR", false)
-    } else {
-        ("IDENTITY_ERROR", true)
-    };
+/// The code a failed identity call is reported under: SY.identity's OWN `error_code`, verbatim,
+/// when it answered (TENANT_PENDING, ILK_DELETED, DUPLICATE_EMAIL, ...); a transport code when it
+/// did not answer.
+pub fn identity_error_code(err: &IdentityError) -> String {
+    match err {
+        IdentityError::SystemRejected { error_code, .. }
+        | IdentityError::ProvisionRejected { error_code, .. } => error_code.clone(),
+        IdentityError::Unreachable { .. } => "UNREACHABLE".to_string(),
+        IdentityError::TtlExceeded { .. } => "TTL_EXCEEDED".to_string(),
+        IdentityError::Timeout { .. } | IdentityError::ActionTimeout { .. } => {
+            "TIMEOUT".to_string()
+        }
+        IdentityError::InvalidRequest(_)
+        | IdentityError::InvalidResponse(_)
+        | IdentityError::Node(_)
+        | IdentityError::Json(_) => "IDENTITY_ERROR".to_string(),
+    }
+}
 
+/// Whether retrying the same identity request may succeed: SY.identity did not answer, or answered
+/// with a transient condition (not the primary, DB not ready, DB write failed). Every other code it
+/// answers with — TENANT_PENDING, TENANT_DELETED, ILK_DELETED, ILK_NOT_FOUND, SYSTEM_ILK_PROTECTED,
+/// DUPLICATE_*, INVALID_*, UNAUTHORIZED_REGISTRAR, ... — is a final verdict on the request.
+pub fn identity_error_is_transient(error_code: &str) -> bool {
+    matches!(
+        error_code,
+        "UNREACHABLE"
+            | "TTL_EXCEEDED"
+            | "TIMEOUT"
+            | "IDENTITY_ERROR"
+            | "NOT_PRIMARY"
+            | "DB_NOT_READY"
+            | "DB_WRITE_FAILED"
+    )
+}
+
+pub fn identity_error_to_tool_payload(err: &IdentityError) -> Value {
+    let error_code = identity_error_code(err);
     json!({
         "status": "error",
+        "retryable": identity_error_is_transient(&error_code),
         "error_code": error_code,
-        "message": msg,
-        "retryable": retryable
+        "message": err.to_string()
     })
+}
+
+/// Log-safe rendering of a failed identity call. The free-text `message` SY.identity answers with
+/// is never rendered: it can echo the submitted identification (a unique-violation DETAIL carries
+/// the email). Transport errors carry only routing data and are rendered whole.
+pub fn identity_error_log_summary(err: &IdentityError) -> String {
+    match err {
+        IdentityError::SystemRejected {
+            action, error_code, ..
+        } => format!("identity rejected {action}: error_code={error_code}"),
+        IdentityError::ProvisionRejected { error_code, .. } => {
+            format!("identity rejected ILK_PROVISION: error_code={error_code}")
+        }
+        other => other.to_string(),
+    }
 }
 
 pub const GOV_IDENTITY_TENANT_ID_ENV: &str = "GOV_IDENTITY_TENANT_ID";
@@ -184,4 +219,95 @@ pub fn tenant_resolution_source(
     }
 
     "missing"
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn rejected(error_code: &str, message: &str) -> IdentityError {
+        IdentityError::SystemRejected {
+            action: "ILK_REGISTER".to_string(),
+            error_code: error_code.to_string(),
+            message: message.to_string(),
+        }
+    }
+
+    #[test]
+    fn final_identity_rejections_keep_their_code_and_are_not_retryable() {
+        for code in [
+            "TENANT_PENDING",
+            "TENANT_DELETED",
+            "ILK_DELETED",
+            "ILK_NOT_FOUND",
+            "SYSTEM_ILK_PROTECTED",
+            "DUPLICATE_EMAIL",
+            "INVALID_TENANT",
+            "INVALID_TENANT_TRANSITION",
+            "UNAUTHORIZED_REGISTRAR",
+            "UNKNOWN",
+        ] {
+            let payload = identity_error_to_tool_payload(&rejected(code, "failed to register ilk"));
+            assert_eq!(payload["status"], "error");
+            assert_eq!(payload["error_code"], code);
+            assert_eq!(payload["retryable"], false, "{code} must be final");
+        }
+    }
+
+    #[test]
+    fn transient_identity_failures_are_retryable() {
+        for code in ["NOT_PRIMARY", "DB_NOT_READY", "DB_WRITE_FAILED"] {
+            let payload = identity_error_to_tool_payload(&rejected(code, "try again"));
+            assert_eq!(payload["error_code"], code);
+            assert_eq!(payload["retryable"], true, "{code} is transient");
+        }
+        let transport = [
+            (
+                IdentityError::Unreachable {
+                    reason: "NODE_NOT_FOUND".to_string(),
+                    original_dst: "SY.identity@motherbee".to_string(),
+                },
+                "UNREACHABLE",
+            ),
+            (
+                IdentityError::TtlExceeded {
+                    original_dst: "SY.identity@motherbee".to_string(),
+                    last_hop: "RT.gateway@motherbee".to_string(),
+                },
+                "TTL_EXCEEDED",
+            ),
+            (
+                IdentityError::ActionTimeout {
+                    action: "ILK_REGISTER".to_string(),
+                    trace_id: "trace-1".to_string(),
+                    target: "SY.identity@motherbee".to_string(),
+                    timeout_ms: 10_000,
+                },
+                "TIMEOUT",
+            ),
+            (
+                IdentityError::InvalidResponse("unexpected response shape".to_string()),
+                "IDENTITY_ERROR",
+            ),
+        ];
+        for (err, code) in transport {
+            let payload = identity_error_to_tool_payload(&err);
+            assert_eq!(payload["error_code"], code);
+            assert_eq!(payload["retryable"], true, "{code} is transient");
+        }
+    }
+
+    #[test]
+    fn identity_error_log_summary_omits_the_identity_message() {
+        let err = rejected(
+            "DUPLICATE_EMAIL",
+            "failed to persist registered ilk: DETAIL: Key (email, tenant_id)=(juana@example.com, tnt:x)",
+        );
+        let summary = identity_error_log_summary(&err);
+        assert_eq!(
+            summary,
+            "identity rejected ILK_REGISTER: error_code=DUPLICATE_EMAIL"
+        );
+        assert!(!summary.contains("juana@example.com"));
+    }
 }

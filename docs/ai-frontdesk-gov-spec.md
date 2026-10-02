@@ -177,7 +177,8 @@ Opcionales:
 
 - `identity_candidate.phone`
 - `tenant_id`
-- `thread_id`
+
+El estado del caso se indexa por `src_ilk` (seccion 5); la tool no recibe `thread_id`.
 
 Regla:
 
@@ -263,6 +264,12 @@ Estados cerrados:
 
 `human_message` es obligatorio siempre.
 
+Fallas de registro (`ILK_REGISTER` / `TNT_CREATE`):
+
+- `IDENTITY_UNAVAILABLE` solo para fallas transitorias, las unicas reintentables: `SY.identity` no respondio (`UNREACHABLE`, `TTL_EXCEEDED`, `TIMEOUT`, `IDENTITY_ERROR`) o respondio `NOT_PRIMARY`, `DB_NOT_READY` o `DB_WRITE_FAILED`;
+- cualquier otro codigo con el que `SY.identity` responde es un veredicto final, no reintentable: `INVALID_*` -> `INVALID_REQUEST`; el resto (`TENANT_PENDING`, `TENANT_DELETED`, `ILK_DELETED`, `ILK_NOT_FOUND`, `SYSTEM_ILK_PROTECTED`, `DUPLICATE_*`, `UNAUTHORIZED_REGISTRAR`, ...) -> `REGISTER_FAILED`;
+- `error_code` conserva el codigo de `SY.identity` tal cual.
+
 `missing_fields`:
 
 - si `status = "needs_input"`, contiene la lista exacta de faltantes;
@@ -322,7 +329,7 @@ Estado vigente:
 
 - usa el runner compartido con `CONFIG_GET` / `CONFIG_SET`;
 - si `behavior.instructions` falta, usa prompt base embebido;
-- si corre como servicio del sistema sin YAML de nodo, bootstrappea `node_name` desde `hive.yaml` como `SY.frontdesk.gov@<hive_id>`;
+- corre como servicio del sistema sin argumentos ni YAML de nodo; bootstrappea `node_name` desde `hive.yaml` como `SY.frontdesk.gov@<hive_id>`;
 - la key del provider se resuelve exclusivamente desde `SY.vault` con `resource_type=openai`;
 - `CONFIG_SET` rechaza campos de secreto; la carga de credenciales se hace por el canal de vault.
 

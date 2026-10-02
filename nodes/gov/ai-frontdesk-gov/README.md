@@ -1,48 +1,39 @@
-# sy.frontdesk.gov
+# SY.frontdesk.gov
 
-Este directorio quedó temporalmente alineado con el runner AI genérico.
+El frontdesk de identidad: completa el registro de una persona que llegó con un ILK temporal y la
+registra en SY.identity (`ILK_REGISTER`).
 
-Estado actual:
-- contiene una copia del código fuente de `nodes/ai/ai-generic`,
-- se mantiene separado por orden de repo y ownership,
-- el equipo de dev deberá volver a especializarlo para el caso `gov`.
+## Qué es
 
-Frontera de dependencias deseada:
-- `sy.frontdesk.gov` no debe depender de `nodes/ai/common`,
-- la capa compartida de gov debe vivir en `nodes/gov/common` + SDKs (`fluxbee_sdk`, `fluxbee_ai_sdk`),
-- `ai.common` y `sy.frontdesk.gov` no deben importarse entre sí.
+- Un **nodo de sistema** del core, en motherbee: `sy-frontdesk-gov.service`, binario
+  `/usr/bin/sy-frontdesk-gov`, arrancado sin argumentos. **No** es un runtime ni una instancia de
+  `ai.generic`, y se actualiza con el `.deb`.
+- **Autónomo:**
+  - trae su prompt embebido;
+  - el proveedor y el modelo salen de la sección `ai` de `hive.yaml`;
+  - la clave sale de SY.vault por `resource_type` (tenant raíz).
+  - `CONFIG_SET` no acepta campos de config: solo vuelve a leer la clave del vault.
+- **Dos entradas:**
+  - `frontdesk_handoff`: datos ya estructurados, por ejemplo `register_human` de io.cloud. Funciona
+    sin LLM, aunque falte la clave.
+  - conversacional: el LLM junta los datos y llama a la tool `ilk_register`.
+- Lo compartido con otros componentes `.gov` vive en `nodes/gov/common` (`gov-common`).
+- Los logs no llevan datos personales: del registro se loguea `ilk_id`, `tenant_id` y qué campos
+  vinieron, nunca sus valores.
 
-Importante:
-- esta duplicación es deliberada y transitoria,
-- no expresa todavía una frontera de arquitectura limpia,
-- sirve para sacar el runner del área genérica y ubicar los fuentes bajo `nodes/`.
+## Compilar y probar
 
-Contrato operativo actual:
-- mantiene el mismo `CONFIG_GET` / `CONFIG_SET` que `nodes/ai/ai-generic`,
-- resuelve la OpenAI key exclusivamente desde `SY.vault` con `resource_type=openai`,
-- rechaza secretos OpenAI en `CONFIG_SET`; se cargan con `vault_put`,
-- si `behavior.instructions` se omite, el runtime usa un prompt base propio de frontdesk embebido en el runner,
-- `behavior.instructions` debe leerse ahora como override opcional, no como requisito para que el nodo tenga identidad funcional.
-
-## Ejecutar local
-
-Desde raíz del repo:
+Desde la raíz del repo:
 
 ```bash
-cargo run -p sy-frontdesk-gov --bin ai_node_runner
+cargo test -p sy-frontdesk-gov -p gov-common
+cargo build --release -p sy-frontdesk-gov --bin sy-frontdesk-gov
 ```
 
-## Nota para dev
+Para correrlo hace falta un router y un `hive.yaml` (de ahí toma su nombre,
+`SY.frontdesk.gov@<hive>`).
 
-Pendiente posterior a esta reorganización:
-- reintroducir comportamiento específico `gov`,
-- decidir qué parte vuelve a `nodes/gov/common`,
-- eliminar la duplicación con `nodes/ai/ai-generic`.
+## Pendiente
 
-Prompt/behavior de frontdesk:
-- el prompt funcional de frontdesk debe viajar con el runtime `sy.frontdesk.gov` (artefacto/versionado propio),
-- no debe depender de mutaciones ad-hoc en runtime común.
-- implementación actual:
-  - existe un prompt base runtime-owned en el runner de `sy.frontdesk.gov`
-  - la key de provider se resuelve desde `SY.vault`
-  - `CONFIG_SET` solo acepta configuración no secreta
+El camino de tenants todavía no cierra con lo que dicen los documentos: el tenant del caso, los
+tenants nuevos `pending` y el merge por email. El detalle está en `lab/logbook/FINDINGS.md`.

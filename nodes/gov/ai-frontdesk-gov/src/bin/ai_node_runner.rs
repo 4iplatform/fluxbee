@@ -1,8 +1,8 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 use async_trait::async_trait;
 use fluxbee_ai_sdk::{
@@ -12,15 +12,15 @@ use fluxbee_ai_sdk::{
     FunctionCallingRunner, FunctionRunInput, FunctionTool, FunctionToolDefinition,
     FunctionToolProvider, FunctionToolRegistry, HiveAiConfig, ImmediateConversationMemory,
     LanceDbThreadStateStore, Message, ModelInputOptions, ModelSettings, NodeRuntime,
-    ResolvedModelInput, RetryPolicy, RuntimeConfig, ThreadStateStore, ThreadStateToolsProvider,
+    ResolvedModelInput, RuntimeConfig, ThreadStateStore, ThreadStateToolsProvider,
 };
 use fluxbee_sdk::protocol::{
     Destination, Meta, Routing, VaultSecretChangedPayload, VaultSecretInterest, MSG_TTL_EXCEEDED,
     MSG_UNREACHABLE, MSG_VAULT_SECRET_CHANGED, SYSTEM_KIND,
 };
 use fluxbee_sdk::{
-    managed_node_name, NodeConfig, NodeUuidMode, OperationalRouteProfile, RouteMatch, RouteTarget,
-    RouterDispatcher, VaultCallerOwned, VaultClient,
+    managed_node_name, IdentityError, NodeConfig, NodeUuidMode, OperationalRouteProfile,
+    RouteMatch, RouteTarget, RouterDispatcher, RpcError, VaultCallerOwned, VaultClient,
 };
 use fluxbee_sdk::{MSG_ILK_REGISTER, MSG_TNT_CREATE};
 use gov_common::{
@@ -28,15 +28,14 @@ use gov_common::{
         frontdesk_result_payload, parse_frontdesk_handoff_payload, FrontdeskHandoffPayload,
         FrontdeskResultPayload,
     },
-    gov_identity_config_from_env, identity_error_to_tool_payload, looks_like_tenant_id,
-    resolve_tenant_id_for_register, tenant_resolution_source, GovIdentityConfig,
-    GOV_IDENTITY_TENANT_ID_ENV,
+    gov_identity_config_from_env, identity_error_is_transient, identity_error_log_summary,
+    identity_error_to_tool_payload, looks_like_tenant_id, resolve_tenant_id_for_register,
+    tenant_resolution_source, GovIdentityConfig, GOV_IDENTITY_TENANT_ID_ENV,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tokio::fs as tokio_fs;
 use tokio::sync::{Mutex, OwnedMutexGuard, RwLock};
-use tokio::task::JoinSet;
 use tracing_subscriber::EnvFilter;
 use uuid::Uuid;
 
@@ -122,7 +121,7 @@ ANTI-RECONFIRM RULE:
 - If status==awaiting_confirmation and the user reply is positive, do not restate the collected data and do not ask for confirmation again; call ilk_register immediately.
 - If registration already succeeded or failed terminally in the current turn, stop after the final message.
 
-Do not invent src_ilk or thread_id.
+Do not invent src_ilk.
 Keep replies short in Spanish.
 "#;
 
@@ -156,37 +155,24 @@ fn frontdesk_default_instructions_snapshot() -> Value {
 }
 
 #[derive(Debug, Deserialize)]
-struct RunnerConfig {
-    node: NodeSection,
-    #[serde(default)]
-    runtime: RuntimeSection,
-    behavior: BehaviorSection,
-}
-
-#[derive(Debug, Deserialize)]
 struct FrontdeskBootstrapHiveFile {
     hive_id: String,
     #[serde(default)]
     ai: Option<HiveAiConfig>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug)]
 struct NodeSection {
     name: String,
-    #[serde(default = "default_version")]
     version: String,
-    #[serde(default = "default_router_socket")]
     router_socket: String,
-    #[serde(default = "default_state_dir")]
     uuid_persistence_dir: String,
-    #[serde(default = "default_config_dir")]
     config_dir: String,
-    #[serde(default = "default_dynamic_config_dir")]
     dynamic_config_dir: String,
 }
 
-#[derive(Debug, Deserialize)]
-#[serde(default)]
+/// Runtime defaults materialized into the effective config (`materialize_runtime_defaults`).
+#[derive(Debug)]
 struct RuntimeSection {
     read_timeout_ms: u64,
     handler_timeout_ms: u64,
@@ -197,7 +183,6 @@ struct RuntimeSection {
     retry_initial_backoff_ms: u64,
     retry_max_backoff_ms: u64,
     metrics_log_interval_ms: u64,
-    #[serde(default)]
     immediate_memory: ImmediateMemorySection,
 }
 
@@ -210,26 +195,6 @@ struct ImmediateMemorySection {
     summary_max_chars: usize,
     summary_refresh_every_turns: usize,
     trim_noise_enabled: bool,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
-enum BehaviorSection {
-    Echo,
-    AiChat(OpenAiChatSection),
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct OpenAiChatSection {
-    #[serde(default)]
-    instructions: Option<InstructionsSourceConfig>,
-    #[serde(default)]
-    model_settings: Option<RunnerModelSettings>,
-    #[serde(default)]
-    base_url: Option<String>,
-    #[serde(default)]
-    capabilities: Option<BehaviorCapabilities>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -246,47 +211,6 @@ struct RunnerModelSettings {
     top_p: Option<f32>,
     #[serde(default)]
     max_output_tokens: Option<u32>,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(untagged)]
-enum InstructionsSourceConfig {
-    // Backward-compatible short form:
-    // instructions: "You are concise"
-    Inline(String),
-    // Structured strategy:
-    // instructions:
-    //   source: file|env|inline|none
-    //   value: /path/file.txt | ENV_VAR | inline text
-    //   trim: true|false (default true)
-    Strategy(InstructionsStrategy),
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct InstructionsStrategy {
-    source: InstructionsSourceKind,
-    #[serde(default)]
-    value: Option<String>,
-    #[serde(default = "default_trim_true")]
-    trim: bool,
-}
-
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-enum InstructionsSourceKind {
-    Inline,
-    File,
-    Env,
-    None,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct EffectiveStateFile {
-    schema_version: u32,
-    config_version: u64,
-    node_name: String,
-    config: EffectiveConfigDocument,
-    updated_at: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -424,10 +348,6 @@ fn default_multimodal_for_runtime() -> bool {
     false
 }
 
-fn default_trim_true() -> bool {
-    true
-}
-
 #[derive(Debug, Clone)]
 enum NodeBehavior {
     Echo,
@@ -446,7 +366,6 @@ struct OpenAiChatRuntime {
 }
 
 struct GenericAiNode {
-    mode: RunnerMode,
     node_name: String,
     /// Deterministic self ILK resolved at boot via
     /// `fluxbee_sdk::identity::wait_for_self_system_ilk_id` from identity
@@ -456,12 +375,6 @@ struct GenericAiNode {
     /// `None` if SHM lookup failed at boot (degraded).
     self_ilk_id: Option<String>,
     behavior: Arc<RwLock<Option<NodeBehavior>>>,
-    config_dir: PathBuf,
-    dynamic_config_dir: PathBuf,
-    /// Router socket directory — kept for tracing/debug purposes only.
-    router_socket: PathBuf,
-    /// UUID persistence root — kept for tracing/debug purposes only.
-    state_dir: PathBuf,
     thread_state_store: Option<Arc<dyn ThreadStateStore>>,
     immediate_memory_store: Option<Arc<ImmediateMemoryStore>>,
     gov_identity: GovIdentityConfig,
@@ -486,51 +399,30 @@ impl GovIdentityBridge {
         identity: &GovIdentityConfig,
         action: &str,
         payload: Value,
-    ) -> std::result::Result<fluxbee_sdk::IdentitySystemResult, String> {
+    ) -> std::result::Result<fluxbee_sdk::IdentitySystemResult, IdentityError> {
         let first = self
             .send_action_once(&identity.target, action, payload.clone(), identity.timeout)
             .await;
-
-        match first {
+        // One retry on the fallback target when the target is not the identity primary or is not
+        // on the router. The fallback's reply goes through the same status check as the first one.
+        let use_fallback = match &first {
             Ok(out) => {
-                let status = out.payload.get("status").and_then(Value::as_str);
-                let error_code = out.payload.get("error_code").and_then(Value::as_str);
-                if status == Some("error") && error_code == Some("NOT_PRIMARY") {
-                    if let Some(fallback) = identity.fallback_target.as_deref() {
-                        if !fallback.trim().is_empty() && fallback != identity.target {
-                            return self
-                                .send_action_once(fallback, action, payload, identity.timeout)
-                                .await;
-                        }
-                    }
-                }
-                if status == Some("ok") {
-                    Ok(out)
-                } else {
-                    Err(format!(
-                        "identity action rejected: action={action}, error_code={}, message={}",
-                        error_code.unwrap_or("UNKNOWN"),
-                        out.payload
-                            .get("message")
-                            .and_then(Value::as_str)
-                            .unwrap_or("identity returned non-ok status")
-                    ))
-                }
+                out.payload.get("status").and_then(Value::as_str) == Some("error")
+                    && out.payload.get("error_code").and_then(Value::as_str) == Some("NOT_PRIMARY")
             }
-            Err(err) => {
-                let use_fallback = err.contains("original_dst=") && err.contains("NODE_NOT_FOUND");
-                if use_fallback {
-                    if let Some(fallback) = identity.fallback_target.as_deref() {
-                        if !fallback.trim().is_empty() && fallback != identity.target {
-                            return self
-                                .send_action_once(fallback, action, payload, identity.timeout)
-                                .await;
-                        }
-                    }
-                }
-                Err(err)
+            Err(IdentityError::Unreachable { reason, .. }) => reason == "NODE_NOT_FOUND",
+            Err(_) => false,
+        };
+        let reply = match identity.fallback_target.as_deref() {
+            Some(fallback)
+                if use_fallback && !fallback.trim().is_empty() && fallback != identity.target =>
+            {
+                self.send_action_once(fallback, action, payload, identity.timeout)
+                    .await
             }
-        }
+            _ => first,
+        };
+        identity_reply_outcome(action, reply?)
     }
 
     async fn send_action_once(
@@ -539,7 +431,7 @@ impl GovIdentityBridge {
         action: &str,
         payload: Value,
         timeout: Duration,
-    ) -> std::result::Result<fluxbee_sdk::IdentitySystemResult, String> {
+    ) -> std::result::Result<fluxbee_sdk::IdentitySystemResult, IdentityError> {
         let trace_id = Uuid::new_v4().to_string();
         let req = Message {
             routing: Routing {
@@ -570,7 +462,7 @@ impl GovIdentityBridge {
             .dispatcher
             .send_with_matcher(req, matcher, labels, timeout)
             .await
-            .map_err(|err| format!("identity send failed: {err}"))?;
+            .map_err(map_rpc_error_to_identity)?;
         Self::parse_identity_reply(msg, &expected_msg, target, trace_id)
     }
 
@@ -579,7 +471,7 @@ impl GovIdentityBridge {
         expected_msg: &str,
         target: &str,
         trace_id: String,
-    ) -> std::result::Result<fluxbee_sdk::IdentitySystemResult, String> {
+    ) -> std::result::Result<fluxbee_sdk::IdentitySystemResult, IdentityError> {
         if msg.meta.msg.as_deref() == Some(expected_msg) {
             return Ok(fluxbee_sdk::IdentitySystemResult {
                 payload: msg.payload,
@@ -598,9 +490,10 @@ impl GovIdentityBridge {
                 .get("reason")
                 .and_then(Value::as_str)
                 .unwrap_or("unknown");
-            return Err(format!(
-                "identity transport unreachable: reason={reason}, original_dst={original_dst}"
-            ));
+            return Err(IdentityError::Unreachable {
+                reason: reason.to_string(),
+                original_dst: original_dst.to_string(),
+            });
         }
         if msg.meta.msg.as_deref() == Some(MSG_TTL_EXCEEDED) {
             let original_dst = msg
@@ -613,15 +506,82 @@ impl GovIdentityBridge {
                 .get("last_hop")
                 .and_then(Value::as_str)
                 .unwrap_or_default();
-            return Err(format!(
-                "identity transport ttl exceeded: original_dst={original_dst}, last_hop={last_hop}"
-            ));
+            return Err(IdentityError::TtlExceeded {
+                original_dst: original_dst.to_string(),
+                last_hop: last_hop.to_string(),
+            });
         }
-        Err(format!(
+        Err(IdentityError::InvalidResponse(format!(
             "invalid identity response: expected {expected_msg} trace_id={trace_id}, got msg={:?}",
             msg.meta.msg
-        ))
+        )))
     }
+}
+
+/// SY.identity answered: `status:"ok"` is the success; any other status is a rejection carrying
+/// SY.identity's own `error_code` verbatim, so the caller classifies the code instead of guessing
+/// it from text.
+fn identity_reply_outcome(
+    action: &str,
+    out: fluxbee_sdk::IdentitySystemResult,
+) -> std::result::Result<fluxbee_sdk::IdentitySystemResult, IdentityError> {
+    if out.payload.get("status").and_then(Value::as_str) == Some("ok") {
+        return Ok(out);
+    }
+    Err(IdentityError::SystemRejected {
+        action: action.to_string(),
+        error_code: out
+            .payload
+            .get("error_code")
+            .and_then(Value::as_str)
+            .unwrap_or("UNKNOWN")
+            .to_string(),
+        message: out
+            .payload
+            .get("message")
+            .and_then(Value::as_str)
+            .unwrap_or("identity returned non-ok status")
+            .to_string(),
+    })
+}
+
+/// Same mapping as SY.orchestrator's identity calls.
+fn map_rpc_error_to_identity(err: RpcError) -> IdentityError {
+    match err {
+        RpcError::Node(err) => IdentityError::Node(err),
+        RpcError::Unreachable {
+            reason,
+            original_dst,
+        } => IdentityError::Unreachable {
+            reason,
+            original_dst,
+        },
+        RpcError::TtlExceeded {
+            original_dst,
+            last_hop,
+        } => IdentityError::TtlExceeded {
+            original_dst,
+            last_hop,
+        },
+        RpcError::Timeout {
+            trace_id,
+            target,
+            request_msg,
+            timeout_ms,
+            ..
+        } => IdentityError::ActionTimeout {
+            action: request_msg,
+            trace_id,
+            target,
+            timeout_ms,
+        },
+        RpcError::InvalidRequest(message) => IdentityError::InvalidRequest(message),
+        other => IdentityError::InvalidResponse(other.to_string()),
+    }
+}
+
+fn identity_bridge_missing() -> IdentityError {
+    IdentityError::InvalidRequest("identity bridge not initialized".to_string())
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -646,8 +606,6 @@ struct IlkRegisterArgs {
     identity_candidate: IlkRegisterIdentityCandidate,
     #[serde(default)]
     tenant_id: Option<String>,
-    #[serde(default)]
-    thread_id: Option<String>,
 }
 
 #[derive(Clone)]
@@ -869,7 +827,7 @@ impl AiNode for GenericAiNode {
         // the frontdesk's LLM collects the data. The deterministic method must run even when the node
         // has no behavior configured — a Cloud register_human cannot depend on an LLM being set up —
         // so it is handled HERE, BEFORE the Configured/behavior gate that guards the LLM path.
-        if msg.meta.msg_type.eq_ignore_ascii_case("user") && self.mode == RunnerMode::Gov {
+        if msg.meta.msg_type.eq_ignore_ascii_case("user") {
             if let Some(handoff) = parse_frontdesk_handoff_payload(&msg.payload) {
                 tracing::info!(
                     node_name = %self.node_name,
@@ -895,30 +853,28 @@ impl AiNode for GenericAiNode {
                 let payload = invalid_payload_missing_thread_id();
                 return Ok(Some(build_reply_message_runtime_src(&msg, payload)));
             }
-            // A Gov user message that LOOKS like a handoff (type/subject/operation) but did NOT parse
+            // A user message that LOOKS like a handoff (type/subject/operation) but did NOT parse
             // fell through to the conversational path — surface it loudly, else a Cloud register_human
             // whose shape is off would be silently chatted at by the LLM instead of registered.
-            if self.mode == RunnerMode::Gov {
-                let looks_like_handoff = msg
-                    .payload
-                    .as_object()
-                    .map(|o| {
-                        o.contains_key("type")
-                            || o.contains_key("subject")
-                            || o.contains_key("operation")
-                    })
-                    .unwrap_or(false);
-                if looks_like_handoff {
-                    tracing::warn!(
-                        node_name = %self.node_name,
-                        trace_id = %msg.routing.trace_id,
-                        payload_keys = ?msg
-                            .payload
-                            .as_object()
-                            .map(|o| o.keys().cloned().collect::<Vec<_>>()),
-                        "frontdesk: payload looks like a handoff but did NOT parse → conversational path (check the handoff shape)"
-                    );
-                }
+            let looks_like_handoff = msg
+                .payload
+                .as_object()
+                .map(|o| {
+                    o.contains_key("type")
+                        || o.contains_key("subject")
+                        || o.contains_key("operation")
+                })
+                .unwrap_or(false);
+            if looks_like_handoff {
+                tracing::warn!(
+                    node_name = %self.node_name,
+                    trace_id = %msg.routing.trace_id,
+                    payload_keys = ?msg
+                        .payload
+                        .as_object()
+                        .map(|o| o.keys().cloned().collect::<Vec<_>>()),
+                    "frontdesk: payload looks like a handoff but did NOT parse → conversational path (check the handoff shape)"
+                );
             }
             let src_ilk_source = src_ilk_source(&msg);
             if behavior_ctx.src_ilk.is_none() {
@@ -966,23 +922,23 @@ impl AiNode for GenericAiNode {
             (extract_text(&msg.payload).unwrap_or_default(), None)
         };
         if msg.meta.msg_type.eq_ignore_ascii_case("user") {
+            // No text preview and no sender id: the messages a frontdesk receives are the person's
+            // own identity data (name, email, phone).
             tracing::info!(
                 node_name = %self.node_name,
                 trace_id = %msg.routing.trace_id,
                 src_ilk = ?behavior_ctx.src_ilk,
-                sender = ?incoming_sender_hint(&msg),
+                sender_kind = ?incoming_sender_kind(&msg),
                 thread_id = ?behavior_ctx.thread_id,
                 input_len = input.len(),
-                input_preview = %text_preview(&input, 240),
                 "incoming user message"
             );
         }
-        let prior_frontdesk_state =
-            if self.mode == RunnerMode::Gov && msg.meta.msg_type.eq_ignore_ascii_case("user") {
-                Some(self.load_frontdesk_thread_state(&behavior_ctx).await?)
-            } else {
-                None
-            };
+        let prior_frontdesk_state = if msg.meta.msg_type.eq_ignore_ascii_case("user") {
+            Some(self.load_frontdesk_thread_state(&behavior_ctx).await?)
+        } else {
+            None
+        };
         let output = match &behavior {
             NodeBehavior::Echo => format!("Echo: {input}"),
             NodeBehavior::OpenAiChat(openai) => {
@@ -1073,7 +1029,7 @@ impl AiNode for GenericAiNode {
             }
         };
 
-        if self.mode == RunnerMode::Gov && msg.meta.msg_type.eq_ignore_ascii_case("user") {
+        if msg.meta.msg_type.eq_ignore_ascii_case("user") {
             let payload = self
                 .build_frontdesk_result_for_conversation(
                     &behavior_ctx,
@@ -1332,9 +1288,7 @@ impl GenericAiNode {
     ) -> fluxbee_ai_sdk::Result<FunctionToolRegistry> {
         let mut registry = FunctionToolRegistry::new();
         self.register_common_tools(&mut registry, ctx)?;
-        if self.mode == RunnerMode::Gov {
-            self.register_gov_tools(&mut registry, ctx)?;
-        }
+        self.register_gov_tools(&mut registry, ctx)?;
         Ok(registry)
     }
 
@@ -1582,8 +1536,7 @@ impl GenericAiNode {
                 "attributes": attributes,
                 "tenant_hint": Value::Null
             },
-            "tenant_id": tenant_id,
-            "thread_id": ctx.thread_id.clone()
+            "tenant_id": tenant_id
         });
         let register_payload = tool.call(register_arguments).await?;
         let result =
@@ -1599,11 +1552,13 @@ impl GenericAiNode {
             );
             self.delete_frontdesk_thread_state(ctx).await?;
         } else {
+            // error_detail is not logged: it carries SY.identity's message, which can echo the
+            // submitted identification.
             tracing::warn!(
                 node_name = %self.node_name,
                 trace_id = %msg.routing.trace_id,
+                result_code = %result.result_code,
                 error_code = ?result.error_code,
-                error_detail = ?result.error_detail,
                 tenant_id = ?result.tenant_id,
                 "frontdesk handoff register FAILED (ilk stays temporary)"
             );
@@ -2237,8 +2192,7 @@ impl FunctionTool for IlkRegisterTool {
     fn definition(&self) -> FunctionToolDefinition {
         FunctionToolDefinition {
             name: "ilk_register".to_string(),
-            description: "Register identity completion for a temporary ILK (gov mode only)."
-                .to_string(),
+            description: "Register identity completion for a temporary ILK.".to_string(),
             parameters_json_schema: json!({
                 "type": "object",
                 "properties": {
@@ -2256,8 +2210,7 @@ impl FunctionTool for IlkRegisterTool {
                         "required": ["name", "email"],
                         "additionalProperties": true
                     },
-                    "tenant_id": { "type": "string" },
-                    "thread_id": { "type": "string" }
+                    "tenant_id": { "type": "string" }
                 },
                 "required": ["src_ilk", "identity_candidate"],
                 "additionalProperties": false
@@ -2308,11 +2261,11 @@ impl FunctionTool for IlkRegisterTool {
 
         if resolved_tenant_id.is_none() {
             if let Some(tenant_name) = tenant_hint.filter(|value| !value.is_empty()) {
+                // The hint is what the person typed as their company: not logged.
                 tracing::info!(
                     op = "tenant_resolve",
                     src_ilk = %src_ilk,
                     target = %self.identity.target,
-                    tenant_hint = %tenant_name,
                     "tenant_id missing; attempting TNT_CREATE from tenant_hint"
                 );
                 let create_payload = json!({
@@ -2323,7 +2276,6 @@ impl FunctionTool for IlkRegisterTool {
                     op = "tenant_resolve",
                     target = %self.identity.target,
                     msg = %MSG_TNT_CREATE,
-                    payload = %create_payload,
                     "sending TNT_CREATE to identity"
                 );
                 let create_result = if let Some(bridge) = &self.bridge {
@@ -2331,7 +2283,7 @@ impl FunctionTool for IlkRegisterTool {
                         .call_ok(&self.identity, MSG_TNT_CREATE, create_payload)
                         .await
                 } else {
-                    Err("identity bridge not initialized".to_string())
+                    Err(identity_bridge_missing())
                 };
 
                 match create_result {
@@ -2371,10 +2323,10 @@ impl FunctionTool for IlkRegisterTool {
                         tracing::warn!(
                             op = "tenant_resolve",
                             target = %self.identity.target,
-                            error = %err,
+                            error = %identity_error_log_summary(&err),
                             "TNT_CREATE failed"
                         );
-                        return Ok(identity_error_to_tool_payload(err));
+                        return Ok(identity_error_to_tool_payload(&err));
                     }
                 }
             }
@@ -2386,7 +2338,7 @@ impl FunctionTool for IlkRegisterTool {
                 src_ilk = %src_ilk,
                 target = %self.identity.target,
                 explicit_tenant_id = ?explicit_tenant,
-                tenant_hint = ?tenant_hint,
+                has_tenant_hint = tenant_hint.is_some_and(|value| !value.is_empty()),
                 effective_config_tenant_id = ?cfg_tenant,
                 env_tenant_id = ?env_tenant,
                 "missing tenant_id for ILK_REGISTER"
@@ -2422,11 +2374,15 @@ impl FunctionTool for IlkRegisterTool {
                 "tenant_hint": args.identity_candidate.tenant_hint,
             }
         });
+        // Only non-personal fields: the identification VALUES (name, email, phone, company,
+        // attributes) never reach the logs, only which fields are present.
         tracing::info!(
             op = "ilk_register",
             target = %self.identity.target,
             msg = %MSG_ILK_REGISTER,
-            payload = %payload,
+            ilk_id = %src_ilk,
+            tenant_id = %tenant_id,
+            identification_fields = ?present_identification_fields(&payload["identification"]),
             "sending ILK_REGISTER to identity"
         );
         let result = if let Some(bridge) = &self.bridge {
@@ -2434,7 +2390,7 @@ impl FunctionTool for IlkRegisterTool {
                 .call_ok(&self.identity, MSG_ILK_REGISTER, payload)
                 .await
         } else {
-            Err("identity bridge not initialized".to_string())
+            Err(identity_bridge_missing())
         };
 
         match result {
@@ -2458,13 +2414,32 @@ impl FunctionTool for IlkRegisterTool {
                 tracing::warn!(
                     op = "ilk_register",
                     target = %self.identity.target,
-                    error = %err,
+                    error = %identity_error_log_summary(&err),
                     "ILK_REGISTER failed"
                 );
-                Ok(identity_error_to_tool_payload(err))
+                Ok(identity_error_to_tool_payload(&err))
             }
         }
     }
+}
+
+/// Names of the identification fields that carry a value — what a log may say about the person.
+fn present_identification_fields(identification: &Value) -> Vec<String> {
+    identification
+        .as_object()
+        .map(|fields| {
+            fields
+                .iter()
+                .filter(|(_, value)| match value {
+                    Value::Null => false,
+                    Value::String(text) => !text.trim().is_empty(),
+                    Value::Object(map) => !map.is_empty(),
+                    _ => true,
+                })
+                .map(|(name, _)| name.clone())
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 impl NodeBehavior {
@@ -2502,154 +2477,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     };
 
     let args = parse_runner_args()?;
-    let config_paths = args.config_paths;
-    let mut loaded = Vec::with_capacity(config_paths.len());
-    for path in &config_paths {
-        let raw = fs::read_to_string(path)?;
-        let cfg: RunnerConfig = serde_yaml::from_str(&raw)?;
-        loaded.push((path.clone(), cfg));
-    }
-
-    ensure_unique_node_names(&loaded)?;
-
-    if loaded.is_empty() {
-        let bootstrap_node = bootstrap_node_from_args(&args.bootstrap)?;
-        tracing::info!(
-            node_name = %bootstrap_node.name,
-            mode = %args.mode.as_str(),
-            "starting ai_node_runner without YAML config (UNCONFIGURED mode)"
-        );
-        run_unconfigured_bootstrap(bootstrap_node, args.mode, frontdesk_self_ilk_id).await?;
-        return Ok(());
-    }
-
-    let mut runners = JoinSet::new();
-    let mode = args.mode;
-    for (config_path, cfg) in loaded {
-        let self_ilk_id = frontdesk_self_ilk_id.clone();
-        runners.spawn(async move { run_one_config(config_path, cfg, mode, self_ilk_id).await });
-    }
-
-    while let Some(result) = runners.join_next().await {
-        match result {
-            Ok(Ok(())) => {}
-            Ok(Err(err)) => return Err(err),
-            Err(err) => return Err(format!("runner task join error: {err}").into()),
-        }
-    }
-    Ok(())
-}
-
-fn with_jitter(base: Duration) -> Duration {
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|value| value.subsec_nanos() as u64)
-        .unwrap_or(0);
-    let jitter_factor_percent = nanos % 25;
-    let jitter = base
-        .as_millis()
-        .saturating_mul(jitter_factor_percent as u128)
-        / 100;
-    let total = base.as_millis().saturating_add(jitter);
-    Duration::from_millis(total as u64)
-}
-
-async fn run_one_config(
-    config_path: PathBuf,
-    cfg: RunnerConfig,
-    mode: RunnerMode,
-    self_ilk_id: Option<String>,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let startup_effective_doc = build_startup_effective_config_doc(&cfg);
-    let startup_effective_doc =
-        materialize_effective_defaults(&cfg.node.name, startup_effective_doc);
-    let startup_effective_config = serde_json::to_value(&startup_effective_doc)?;
-    let persisted_dynamic =
-        load_persisted_dynamic_config(&PathBuf::from(&cfg.node.dynamic_config_dir), &cfg.node.name);
-    let behavior = build_behavior(&cfg)?;
-    let runner_node_name = cfg.node.name.clone();
-    let runner_router_socket = PathBuf::from(cfg.node.router_socket);
-    let runner_uuid_persistence_dir = PathBuf::from(cfg.node.uuid_persistence_dir);
-    let runner_config_dir = PathBuf::from(cfg.node.config_dir);
-    let runner_node_config = NodeConfig {
-        name: runner_node_name.clone(),
-        router_socket: runner_router_socket.clone(),
-        uuid_persistence_dir: runner_uuid_persistence_dir.clone(),
-        uuid_mode: NodeUuidMode::Persistent,
-        config_dir: runner_config_dir.clone(),
-        version: cfg.node.version.clone(),
-    };
-
-    let runtime_config = RuntimeConfig {
-        read_timeout: Duration::from_millis(cfg.runtime.read_timeout_ms),
-        handler_timeout: Duration::from_millis(cfg.runtime.handler_timeout_ms),
-        write_timeout: Duration::from_millis(cfg.runtime.write_timeout_ms),
-        queue_capacity: cfg.runtime.queue_capacity,
-        worker_pool_size: cfg.runtime.worker_pool_size,
-        retry_policy: RetryPolicy {
-            max_attempts: cfg.runtime.retry_max_attempts,
-            initial_backoff: Duration::from_millis(cfg.runtime.retry_initial_backoff_ms),
-            max_backoff: Duration::from_millis(cfg.runtime.retry_max_backoff_ms),
-        },
-        metrics_log_interval: Duration::from_millis(cfg.runtime.metrics_log_interval_ms),
-    };
-
-    tracing::info!(
-        config = %config_path.display(),
-        node_name = %runner_node_name,
-        mode = %mode.as_str(),
-        "starting ai_node_runner node instance"
-    );
-
-    let node_name = runner_node_name.clone();
-    let gov_identity = gov_identity_config_from_env();
-    let thread_state_store =
-        init_thread_state_store(&node_name, &PathBuf::from(&cfg.node.dynamic_config_dir)).await;
-    let immediate_memory_store =
-        init_immediate_memory_store(&node_name, &PathBuf::from(&cfg.node.dynamic_config_dir)).await;
-
-    let profile = build_frontdesk_gov_rpc_profile()
-        .map_err(|err| format!("frontdesk-gov rpc profile invalid: {err}"))?;
-    let dispatcher =
-        RouterDispatcher::connect_with_retry(runner_node_config, Duration::from_secs(1), profile)
-            .await?;
-    let vault = vault_client_for(dispatcher.clone(), &node_name, self_ilk_id.as_deref());
-    let gov_identity_bridge = if mode == RunnerMode::Gov {
-        Some(Arc::new(GovIdentityBridge::new(dispatcher.clone())))
-    } else {
-        None
-    };
-    let node = GenericAiNode {
-        mode,
-        node_name,
-        self_ilk_id,
-        behavior: Arc::new(RwLock::new(Some(behavior))),
-        config_dir: runner_config_dir,
-        dynamic_config_dir: PathBuf::from(&cfg.node.dynamic_config_dir),
-        router_socket: runner_router_socket,
-        state_dir: runner_uuid_persistence_dir,
-        thread_state_store,
-        immediate_memory_store,
-        gov_identity,
-        gov_identity_bridge,
-        vault,
-        control_plane: Arc::new(RwLock::new(ControlPlaneState {
-            current_state: NodeLifecycleState::Configured,
-            config_source: "yaml",
-            effective_config: Some(startup_effective_config),
-            schema_version: persisted_dynamic
-                .as_ref()
-                .map(|v| v.schema_version)
-                .unwrap_or(1),
-            config_version: persisted_dynamic
-                .as_ref()
-                .map(|v| v.config_version)
-                .unwrap_or(1),
-            ..ControlPlaneState::default()
-        })),
-    };
-    let runtime = NodeRuntime::new(dispatcher, node);
-    runtime.run_with_config(runtime_config).await?;
+    let bootstrap_node = bootstrap_node_from_args(&args)?;
+    run_unconfigured_bootstrap(bootstrap_node, frontdesk_self_ilk_id).await?;
     Ok(())
 }
 
@@ -2680,7 +2509,6 @@ fn vault_client_for(
 
 async fn run_unconfigured_bootstrap(
     node: NodeSection,
-    mode: RunnerMode,
     self_ilk_id: Option<String>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let node_name = node.name.clone();
@@ -2733,21 +2561,16 @@ async fn run_unconfigured_bootstrap(
         config_version: 0,
     };
 
-    let runner_node_name = node.name.clone();
-    let runner_router_socket = PathBuf::from(node.router_socket);
-    let runner_uuid_persistence_dir = PathBuf::from(node.uuid_persistence_dir);
-    let runner_config_dir = PathBuf::from(node.config_dir);
     let runner_node_config = NodeConfig {
-        name: runner_node_name.clone(),
-        router_socket: runner_router_socket.clone(),
-        uuid_persistence_dir: runner_uuid_persistence_dir.clone(),
+        name: node.name,
+        router_socket: PathBuf::from(node.router_socket),
+        uuid_persistence_dir: PathBuf::from(node.uuid_persistence_dir),
         uuid_mode: NodeUuidMode::Persistent,
-        config_dir: runner_config_dir.clone(),
-        version: node.version.clone(),
+        config_dir: PathBuf::from(node.config_dir),
+        version: node.version,
     };
     tracing::info!(
         node_name = %node_name,
-        mode = %mode.as_str(),
         "starting ai_node_runner bootstrap instance"
     );
     let gov_identity = gov_identity_config_from_env();
@@ -2756,26 +2579,13 @@ async fn run_unconfigured_bootstrap(
     let dispatcher =
         RouterDispatcher::connect_with_retry(runner_node_config, Duration::from_secs(1), profile)
             .await?;
-    tracing::info!(
-        node_name = %node_name,
-        mode = %mode.as_str(),
-        "frontdesk-gov connected to router"
-    );
+    tracing::info!(node_name = %node_name, "frontdesk-gov connected to router");
     let vault = vault_client_for(dispatcher.clone(), &node_name, self_ilk_id.as_deref());
-    let gov_identity_bridge = if mode == RunnerMode::Gov {
-        Some(Arc::new(GovIdentityBridge::new(dispatcher.clone())))
-    } else {
-        None
-    };
+    let gov_identity_bridge = Some(Arc::new(GovIdentityBridge::new(dispatcher.clone())));
     let ai_node = GenericAiNode {
-        mode,
         node_name: node_name.clone(),
         self_ilk_id,
         behavior: Arc::new(RwLock::new(behavior)),
-        config_dir: runner_config_dir,
-        dynamic_config_dir: dynamic_dir,
-        router_socket: runner_router_socket,
-        state_dir: runner_uuid_persistence_dir,
         thread_state_store,
         immediate_memory_store,
         gov_identity,
@@ -2802,72 +2612,31 @@ struct BootstrapArgs {
     dynamic_config_dir: Option<String>,
 }
 
-#[derive(Debug, Default)]
-struct RunnerArgs {
-    config_paths: Vec<PathBuf>,
-    bootstrap: BootstrapArgs,
-    mode: RunnerMode,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-enum RunnerMode {
-    #[default]
-    Default,
-    Gov,
-}
-
-impl RunnerMode {
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::Default => "default",
-            Self::Gov => "gov",
-        }
-    }
-
-    fn parse(raw: &str) -> Option<Self> {
-        match raw.trim().to_ascii_lowercase().as_str() {
-            "default" => Some(Self::Default),
-            "gov" => Some(Self::Gov),
-            _ => None,
-        }
-    }
-}
-
-fn parse_runner_args() -> Result<RunnerArgs, Box<dyn std::error::Error + Send + Sync>> {
+fn parse_runner_args() -> Result<BootstrapArgs, Box<dyn std::error::Error + Send + Sync>> {
     let args = std::env::args().skip(1).collect::<Vec<_>>();
-    let mut parsed = RunnerArgs {
-        mode: RunnerMode::Gov,
-        ..RunnerArgs::default()
-    };
+    let mut parsed = BootstrapArgs::default();
     let mut i = 0usize;
     while i < args.len() {
         match args[i].as_str() {
-            "--config" => {
-                let Some(path) = args.get(i + 1) else {
-                    return Err("missing path after --config".to_string().into());
-                };
-                parsed.config_paths.push(PathBuf::from(path));
-                i += 2;
-            }
             "--node-name" => {
                 let Some(value) = args.get(i + 1) else {
                     return Err("missing value after --node-name".to_string().into());
                 };
-                parsed.bootstrap.node_name = Some(value.clone());
+                parsed.node_name = Some(value.clone());
                 i += 2;
             }
             "--version" => {
                 let Some(value) = args.get(i + 1) else {
                     return Err("missing value after --version".to_string().into());
                 };
-                parsed.bootstrap.version = Some(value.clone());
+                parsed.version = Some(value.clone());
                 i += 2;
             }
             "--router-socket" => {
                 let Some(value) = args.get(i + 1) else {
                     return Err("missing value after --router-socket".to_string().into());
                 };
-                parsed.bootstrap.router_socket = Some(value.clone());
+                parsed.router_socket = Some(value.clone());
                 i += 2;
             }
             "--uuid-persistence-dir" => {
@@ -2876,14 +2645,14 @@ fn parse_runner_args() -> Result<RunnerArgs, Box<dyn std::error::Error + Send + 
                         .to_string()
                         .into());
                 };
-                parsed.bootstrap.uuid_persistence_dir = Some(value.clone());
+                parsed.uuid_persistence_dir = Some(value.clone());
                 i += 2;
             }
             "--config-dir" => {
                 let Some(value) = args.get(i + 1) else {
                     return Err("missing value after --config-dir".to_string().into());
                 };
-                parsed.bootstrap.config_dir = Some(value.clone());
+                parsed.config_dir = Some(value.clone());
                 i += 2;
             }
             "--dynamic-config-dir" => {
@@ -2892,21 +2661,7 @@ fn parse_runner_args() -> Result<RunnerArgs, Box<dyn std::error::Error + Send + 
                         .to_string()
                         .into());
                 };
-                parsed.bootstrap.dynamic_config_dir = Some(value.clone());
-                i += 2;
-            }
-            "--mode" => {
-                let Some(value) = args.get(i + 1) else {
-                    return Err("missing value after --mode".to_string().into());
-                };
-                let normalized = value.trim().to_ascii_lowercase();
-                if normalized != "gov" {
-                    return Err(format!(
-                        "--mode={value} is not supported in SY.frontdesk.gov runtime (only gov)"
-                    )
-                    .into());
-                }
-                parsed.mode = RunnerMode::Gov;
+                parsed.dynamic_config_dir = Some(value.clone());
                 i += 2;
             }
             other => {
@@ -2951,7 +2706,7 @@ fn bootstrap_node_from_args(
             inferred
         })
         .ok_or_else(|| {
-            "when no --config is provided, pass --node-name (or FLUXBEE_NODE_NAME/AI_NODE_NAME env var), or provide hive.yaml with hive_id for SY.frontdesk.gov bootstrap".to_string()
+            "pass --node-name (or FLUXBEE_NODE_NAME/AI_NODE_NAME env var), or provide hive.yaml with hive_id for SY.frontdesk.gov bootstrap".to_string()
         })?;
     tracing::info!(
         node_name = %name,
@@ -2998,60 +2753,6 @@ fn infer_frontdesk_node_name_from_hive(config_dir: &std::path::Path) -> Option<S
         "bootstrapping SY.frontdesk.gov node_name from hive.yaml"
     );
     Some(format!("SY.frontdesk.gov@{hive_id}"))
-}
-
-fn ensure_unique_node_names(
-    configs: &[(PathBuf, RunnerConfig)],
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let mut names = HashSet::new();
-    for (path, cfg) in configs {
-        if !names.insert(cfg.node.name.clone()) {
-            return Err(format!(
-                "duplicate node name '{}' found in config {}",
-                cfg.node.name,
-                path.display()
-            )
-            .into());
-        }
-    }
-    Ok(())
-}
-
-fn build_behavior(
-    cfg: &RunnerConfig,
-) -> Result<NodeBehavior, Box<dyn std::error::Error + Send + Sync>> {
-    let engine = load_hive_ai_engine(&cfg.node.config_dir)?;
-    let behavior = match &cfg.behavior {
-        BehaviorSection::Echo => NodeBehavior::Echo,
-        BehaviorSection::AiChat(openai) => {
-            let instructions = resolve_instructions(&openai.instructions)?
-                .or_else(|| Some(frontdesk_default_instructions()));
-            let model_settings = openai
-                .model_settings
-                .as_ref()
-                .map(|v| ModelSettings {
-                    temperature: v.temperature,
-                    top_p: v.top_p,
-                    max_output_tokens: v.max_output_tokens,
-                })
-                .unwrap_or_default();
-            let multimodal = openai
-                .capabilities
-                .as_ref()
-                .and_then(|caps| caps.multimodal)
-                .unwrap_or_else(default_multimodal_for_runtime);
-            NodeBehavior::OpenAiChat(OpenAiChatRuntime {
-                provider: engine.provider,
-                model: engine.model,
-                instructions,
-                model_settings,
-                base_url: openai.base_url.clone(),
-                immediate_memory: cfg.runtime.immediate_memory.clone(),
-                multimodal,
-            })
-        }
-    };
-    Ok(behavior)
 }
 
 fn build_behavior_from_effective_config(
@@ -3114,142 +2815,6 @@ fn load_hive_ai_engine(
         .transpose()
         .map_err(Into::into)
         .map(|engine| engine.unwrap_or_else(HiveAiConfig::fallback))
-}
-
-fn resolve_instructions(
-    cfg: &Option<InstructionsSourceConfig>,
-) -> Result<Option<String>, Box<dyn std::error::Error + Send + Sync>> {
-    let Some(cfg) = cfg else {
-        return Ok(None);
-    };
-
-    match cfg {
-        InstructionsSourceConfig::Inline(value) => Ok(Some(value.clone())),
-        InstructionsSourceConfig::Strategy(strategy) => match strategy.source {
-            InstructionsSourceKind::Inline => {
-                let Some(value) = strategy.value.clone() else {
-                    return Err("instructions.source=inline requires instructions.value".into());
-                };
-                Ok(Some(maybe_trim(value, strategy.trim)))
-            }
-            InstructionsSourceKind::File => {
-                let Some(path) = strategy.value.clone() else {
-                    return Err(
-                        "instructions.source=file requires instructions.value (path)".into(),
-                    );
-                };
-                let content = fs::read_to_string(path)?;
-                Ok(Some(maybe_trim(content, strategy.trim)))
-            }
-            InstructionsSourceKind::Env => {
-                let Some(env_name) = strategy.value.clone() else {
-                    return Err(
-                        "instructions.source=env requires instructions.value (env var)".into(),
-                    );
-                };
-                let value = std::env::var(&env_name).map_err(|_| {
-                    format!("missing env var for instructions source env: {}", env_name)
-                })?;
-                Ok(Some(maybe_trim(value, strategy.trim)))
-            }
-            InstructionsSourceKind::None => Ok(None),
-        },
-    }
-}
-
-fn maybe_trim(value: String, trim: bool) -> String {
-    if trim {
-        value.trim().to_string()
-    } else {
-        value
-    }
-}
-
-fn build_startup_effective_config_doc(cfg: &RunnerConfig) -> EffectiveConfigDocument {
-    let behavior = match &cfg.behavior {
-        BehaviorSection::Echo => EffectiveBehaviorSection {
-            kind: "echo".to_string(),
-            ..EffectiveBehaviorSection::default()
-        },
-        BehaviorSection::AiChat(openai) => EffectiveBehaviorSection {
-            kind: "ai_chat".to_string(),
-            instructions: Some(if openai.instructions.is_some() {
-                format_instructions_snapshot(&openai.instructions)
-            } else {
-                frontdesk_default_instructions_snapshot()
-            }),
-            model_settings: openai.model_settings.clone(),
-            base_url: openai.base_url.clone(),
-            capabilities: Some(BehaviorCapabilities {
-                multimodal: Some(
-                    openai
-                        .capabilities
-                        .as_ref()
-                        .and_then(|caps| caps.multimodal)
-                        .unwrap_or_else(default_multimodal_for_runtime),
-                ),
-            }),
-            ..EffectiveBehaviorSection::default()
-        },
-    };
-
-    EffectiveConfigDocument {
-        tenant_id: None,
-        node: Some(EffectiveNodeSection {
-            name: Some(cfg.node.name.clone()),
-            version: Some(cfg.node.version.clone()),
-            router_socket: Some(cfg.node.router_socket.clone()),
-            uuid_persistence_dir: Some(cfg.node.uuid_persistence_dir.clone()),
-            config_dir: Some(cfg.node.config_dir.clone()),
-            dynamic_config_dir: Some(cfg.node.dynamic_config_dir.clone()),
-        }),
-        behavior,
-        runtime: Some(EffectiveRuntimeSection {
-            read_timeout_ms: Some(cfg.runtime.read_timeout_ms),
-            handler_timeout_ms: Some(cfg.runtime.handler_timeout_ms),
-            write_timeout_ms: Some(cfg.runtime.write_timeout_ms),
-            queue_capacity: Some(cfg.runtime.queue_capacity),
-            worker_pool_size: Some(cfg.runtime.worker_pool_size),
-            retry_max_attempts: Some(cfg.runtime.retry_max_attempts),
-            retry_initial_backoff_ms: Some(cfg.runtime.retry_initial_backoff_ms),
-            retry_max_backoff_ms: Some(cfg.runtime.retry_max_backoff_ms),
-            metrics_log_interval_ms: Some(cfg.runtime.metrics_log_interval_ms),
-            immediate_memory: Some(cfg.runtime.immediate_memory.clone()),
-        }),
-    }
-}
-
-fn dynamic_config_path(base_dir: &std::path::Path, node_name: &str) -> PathBuf {
-    let safe_name = node_name.replace(['/', '\\'], "_");
-    base_dir.join(format!("{safe_name}.json"))
-}
-
-fn load_persisted_dynamic_config(
-    base_dir: &std::path::Path,
-    node_name: &str,
-) -> Option<EffectiveStateFile> {
-    let path = dynamic_config_path(base_dir, node_name);
-    let raw = fs::read_to_string(path).ok()?;
-    serde_json::from_str::<EffectiveStateFile>(&raw).ok()
-}
-
-fn format_instructions_snapshot(cfg: &Option<InstructionsSourceConfig>) -> Value {
-    match cfg {
-        None => Value::Null,
-        Some(InstructionsSourceConfig::Inline(value)) => {
-            json!({ "source": "inline", "value": value, "trim": true })
-        }
-        Some(InstructionsSourceConfig::Strategy(strategy)) => json!({
-            "source": match strategy.source {
-                InstructionsSourceKind::Inline => "inline",
-                InstructionsSourceKind::File => "file",
-                InstructionsSourceKind::Env => "env",
-                InstructionsSourceKind::None => "none"
-            },
-            "value": strategy.value,
-            "trim": strategy.trim
-        }),
-    }
 }
 
 /// Model D' — extract the openai api_key from a vault `value`. Vault may
@@ -3736,18 +3301,22 @@ fn build_frontdesk_result_from_register_response(
         .get("error_code")
         .and_then(Value::as_str)
         .unwrap_or("IDENTITY_ERROR");
-    let result_code = match error_code {
-        "UNREACHABLE" | "TIMEOUT" | "TTL_EXCEEDED" | "NOT_PRIMARY" | "IDENTITY_ERROR" => {
-            "IDENTITY_UNAVAILABLE"
-        }
-        "INVALID_REQUEST" | "missing_src_ilk" | "invalid_identity_candidate" => "INVALID_REQUEST",
-        _ => "REGISTER_FAILED",
+    // Only a transient failure is IDENTITY_UNAVAILABLE. A code SY.identity answered with is a final
+    // verdict (TENANT_PENDING, ILK_DELETED, SYSTEM_ILK_PROTECTED, DUPLICATE_EMAIL, ...) and keeps
+    // its own error_code.
+    let (result_code, human_message) = if identity_error_is_transient(error_code) {
+        (
+            "IDENTITY_UNAVAILABLE",
+            "No pude completar el registro en este momento.",
+        )
+    } else if error_code.starts_with("INVALID_")
+        || matches!(error_code, "missing_src_ilk" | "invalid_identity_candidate")
+    {
+        ("INVALID_REQUEST", "No pude completar el registro.")
+    } else {
+        ("REGISTER_FAILED", "No pude completar el registro.")
     };
-    let mut payload = frontdesk_result_payload(
-        "error",
-        result_code,
-        "No pude completar el registro en este momento.",
-    );
+    let mut payload = frontdesk_result_payload("error", result_code, human_message);
     payload.error_code = Some(error_code.to_string());
     payload.error_detail = register_payload
         .get("message")
@@ -3999,30 +3568,18 @@ fn src_ilk_source(msg: &Message) -> &'static str {
     "missing"
 }
 
-fn incoming_sender_hint(msg: &Message) -> Option<String> {
-    let ctx = msg.meta.context.as_ref()?;
-    let io = ctx.get("io")?;
-    let sender = io.get("sender")?;
-    let kind = sender.get("kind").and_then(Value::as_str).map(str::trim);
-    let id = sender.get("id").and_then(Value::as_str).map(str::trim);
-    match (kind, id) {
-        (Some(k), Some(i)) if !k.is_empty() && !i.is_empty() => Some(format!("{k}:{i}")),
-        (_, Some(i)) if !i.is_empty() => Some(i.to_string()),
-        _ => None,
-    }
-}
-
-fn text_preview(text: &str, max_chars: usize) -> String {
-    let compact = text.split_whitespace().collect::<Vec<_>>().join(" ");
-    if compact.chars().count() <= max_chars {
-        return compact;
-    }
-    let mut out = String::new();
-    for ch in compact.chars().take(max_chars) {
-        out.push(ch);
-    }
-    out.push_str("...");
-    out
+/// The IO sender's kind only: its id is the person's handle (a phone number, a user id).
+fn incoming_sender_kind(msg: &Message) -> Option<String> {
+    msg.meta
+        .context
+        .as_ref()?
+        .get("io")?
+        .get("sender")?
+        .get("kind")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|kind| !kind.is_empty())
+        .map(ToString::to_string)
 }
 
 #[allow(dead_code)]
@@ -4101,14 +3658,9 @@ mod tests {
     fn test_node() -> GenericAiNode {
         let gov_identity = GovIdentityConfig::default();
         GenericAiNode {
-            mode: RunnerMode::Gov,
             node_name: "SY.frontdesk.gov".to_string(),
             self_ilk_id: None,
             behavior: Arc::new(RwLock::new(None)),
-            config_dir: PathBuf::from("/tmp"),
-            dynamic_config_dir: PathBuf::from("/tmp"),
-            router_socket: PathBuf::from("/tmp"),
-            state_dir: PathBuf::from("/tmp"),
             thread_state_store: None,
             immediate_memory_store: None,
             gov_identity,
@@ -4797,5 +4349,265 @@ mod tests {
             structured.get("error_code").and_then(Value::as_str),
             Some("register_failed")
         );
+    }
+
+    const TEST_ILK: &str = "ilk:11111111-1111-4111-8111-111111111111";
+    const TEST_TENANT: &str = "tnt:22222222-2222-4222-8222-222222222222";
+
+    fn register_failure(error_code: &str) -> FrontdeskResultPayload {
+        let reply = fluxbee_sdk::IdentitySystemResult {
+            payload: json!({
+                "status": "error",
+                "error_code": error_code,
+                "message": "failed to register ilk"
+            }),
+            effective_target: "SY.identity@motherbee".to_string(),
+            trace_id: "trace-identity-1".to_string(),
+        };
+        let err = identity_reply_outcome(MSG_ILK_REGISTER, reply)
+            .expect_err("a non-ok identity reply is a rejection");
+        build_frontdesk_result_from_register_response(
+            &identity_error_to_tool_payload(&err),
+            Some(TEST_ILK.to_string()),
+        )
+    }
+
+    #[test]
+    fn final_identity_rejections_are_register_failed_not_identity_unavailable() {
+        for code in [
+            "TENANT_PENDING",
+            "TENANT_DELETED",
+            "ILK_DELETED",
+            "ILK_NOT_FOUND",
+            "SYSTEM_ILK_PROTECTED",
+            "DUPLICATE_EMAIL",
+            "UNAUTHORIZED_REGISTRAR",
+        ] {
+            let result = register_failure(code);
+            assert_eq!(result.status, "error");
+            assert_eq!(result.result_code, "REGISTER_FAILED", "{code}");
+            assert_eq!(result.error_code.as_deref(), Some(code));
+            assert_eq!(result.registration_status.as_deref(), Some("temporary"));
+            assert_eq!(
+                frontdesk_structured_response_payload(&result)["error_code"],
+                "register_failed"
+            );
+        }
+        let invalid = register_failure("INVALID_TENANT");
+        assert_eq!(invalid.result_code, "INVALID_REQUEST");
+        assert_eq!(invalid.error_code.as_deref(), Some("INVALID_TENANT"));
+    }
+
+    #[test]
+    fn transient_identity_failures_stay_identity_unavailable() {
+        for code in ["NOT_PRIMARY", "DB_NOT_READY", "DB_WRITE_FAILED"] {
+            let result = register_failure(code);
+            assert_eq!(result.result_code, "IDENTITY_UNAVAILABLE", "{code}");
+            assert_eq!(result.error_code.as_deref(), Some(code));
+        }
+        let unreachable = identity_error_to_tool_payload(&IdentityError::Unreachable {
+            reason: "NODE_NOT_FOUND".to_string(),
+            original_dst: "SY.identity@motherbee".to_string(),
+        });
+        let result = build_frontdesk_result_from_register_response(&unreachable, None);
+        assert_eq!(result.result_code, "IDENTITY_UNAVAILABLE");
+        assert_eq!(
+            frontdesk_structured_response_payload(&result)["error_code"],
+            "identity_unavailable"
+        );
+    }
+
+    #[test]
+    fn identity_reply_outcome_accepts_only_status_ok() {
+        let reply = |payload: Value| fluxbee_sdk::IdentitySystemResult {
+            payload,
+            effective_target: "SY.identity@motherbee".to_string(),
+            trace_id: "trace-identity-2".to_string(),
+        };
+        assert!(identity_reply_outcome(
+            MSG_ILK_REGISTER,
+            reply(json!({"status": "ok", "ilk_id": TEST_ILK}))
+        )
+        .is_ok());
+        let err = identity_reply_outcome(MSG_TNT_CREATE, reply(json!({"status": "error"})))
+            .expect_err("status error is a rejection");
+        assert!(matches!(
+            err,
+            IdentityError::SystemRejected { ref action, ref error_code, .. }
+                if action == MSG_TNT_CREATE && error_code == "UNKNOWN"
+        ));
+    }
+
+    #[test]
+    fn ilk_register_schema_has_no_thread_id() {
+        let tool = IlkRegisterTool {
+            scoped_src_ilk: None,
+            default_tenant_id: None,
+            identity: GovIdentityConfig::default(),
+            bridge: None,
+        };
+        let schema = tool.definition().parameters_json_schema;
+        assert!(schema["properties"].get("thread_id").is_none());
+    }
+
+    /// Collects what the fmt layer writes on this thread while its guard lives.
+    #[derive(Clone, Default)]
+    struct LogCapture(Arc<Mutex<Vec<u8>>>);
+
+    impl std::io::Write for LogCapture {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().expect("log capture").extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl LogCapture {
+        fn start() -> (Self, tracing::subscriber::DefaultGuard) {
+            let capture = Self::default();
+            let writer = capture.clone();
+            let subscriber = tracing_subscriber::fmt()
+                .with_writer(move || writer.clone())
+                .with_ansi(false)
+                .with_max_level(tracing::Level::TRACE)
+                .finish();
+            (capture, tracing::subscriber::set_default(subscriber))
+        }
+
+        fn text(&self) -> String {
+            String::from_utf8_lossy(&self.0.lock().expect("log capture")).into_owned()
+        }
+    }
+
+    const PERSONAL_VALUES: [&str; 6] = [
+        "Juana Secreta",
+        "juana.secreta@example.com",
+        "+5491100009999",
+        "Empresa Secreta SA",
+        "crm-secret-42",
+        "Hint Secreto SRL",
+    ];
+
+    fn assert_no_personal_data(logs: &str) {
+        assert!(!logs.is_empty(), "expected captured logs");
+        for value in PERSONAL_VALUES {
+            assert!(
+                !logs.contains(value),
+                "personal data {value:?} leaked into the logs:\n{logs}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn ilk_register_tool_logs_carry_no_personal_data() {
+        let tool = IlkRegisterTool {
+            scoped_src_ilk: Some(TEST_ILK.to_string()),
+            default_tenant_id: None,
+            identity: GovIdentityConfig::default(),
+            bridge: None,
+        };
+        let candidate = json!({
+            "name": "Juana Secreta",
+            "email": "juana.secreta@example.com",
+            "phone": "+5491100009999",
+            "company_name": "Empresa Secreta SA",
+            "attributes": { "crm_customer_id": "crm-secret-42" },
+            "tenant_hint": "Hint Secreto SRL"
+        });
+        {
+            // No env tenant, so the tenant-less call below goes through TNT_CREATE.
+            let _env = env_lock().lock().expect("env lock");
+            std::env::remove_var(GOV_IDENTITY_TENANT_ID_ENV);
+        }
+        let (logs, _guard) = LogCapture::start();
+        // With a tenant: straight to ILK_REGISTER (it then fails: no identity bridge here).
+        let registered = tool
+            .call(json!({
+                "src_ilk": TEST_ILK,
+                "identity_candidate": candidate.clone(),
+                "tenant_id": TEST_TENANT
+            }))
+            .await
+            .expect("tool call");
+        assert_eq!(registered["status"], "error");
+        // Without one: TNT_CREATE from the hint first.
+        let created = tool
+            .call(json!({ "src_ilk": TEST_ILK, "identity_candidate": candidate }))
+            .await
+            .expect("tool call");
+        assert_eq!(created["status"], "error");
+
+        let text = logs.text();
+        assert_no_personal_data(&text);
+        assert!(text.contains("sending ILK_REGISTER to identity"));
+        assert!(text.contains("sending TNT_CREATE to identity"));
+        assert!(text.contains(TEST_ILK));
+        assert!(text.contains(TEST_TENANT));
+        assert!(
+            text.contains("\"email\""),
+            "field names are logged:\n{text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn frontdesk_handoff_logs_carry_no_personal_data() {
+        let node = test_node();
+        let mut msg = sample_user_request_with_context(
+            json!({ "thread_id": "frontdesk-thread-privacy-1" }),
+            Some(TEST_ILK),
+        );
+        msg.payload = json!({
+            "type": "frontdesk_handoff",
+            "schema_version": 1,
+            "operation": "complete_registration",
+            "subject": {
+                "display_name": "Juana Secreta",
+                "email": "juana.secreta@example.com",
+                "phone": "+5491100009999",
+                "company_name": "Empresa Secreta SA",
+                "attributes": { "crm_customer_id": "crm-secret-42" }
+            },
+            "tenant_id": TEST_TENANT
+        });
+        let (logs, _guard) = LogCapture::start();
+        node.on_message(msg)
+            .await
+            .expect("handoff should not fail")
+            .expect("response should exist");
+
+        let text = logs.text();
+        assert_no_personal_data(&text);
+        assert!(text.contains("frontdesk handoff register FAILED"));
+    }
+
+    #[tokio::test]
+    async fn incoming_user_message_log_has_no_text_or_sender_id() {
+        let node = test_node();
+        node.control_plane.write().await.current_state = NodeLifecycleState::Configured;
+        *node.behavior.write().await = Some(NodeBehavior::Echo);
+        let mut msg = sample_user_request_with_context(
+            json!({
+                "thread_id": "frontdesk-thread-privacy-2",
+                "io": { "sender": { "kind": "whatsapp", "id": "+5491100009999" } }
+            }),
+            Some(TEST_ILK),
+        );
+        msg.payload = json!({
+            "type": "text",
+            "content": "soy Juana Secreta, juana.secreta@example.com"
+        });
+        let (logs, _guard) = LogCapture::start();
+        node.on_message(msg)
+            .await
+            .expect("on_message should not fail")
+            .expect("response should exist");
+
+        let text = logs.text();
+        assert_no_personal_data(&text);
+        assert!(text.contains("incoming user message"));
+        assert!(text.contains("whatsapp"));
     }
 }
