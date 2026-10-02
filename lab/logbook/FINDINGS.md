@@ -438,7 +438,7 @@
 - **PROD:** la instancia `AI.chat@motherbee` que ya existe queda en FAILED_CONFIG, porque su config
   tiene `vault_key`. Se borra o se reconfigura a pedido del operador.
 
-### A-37 ✅ RESUELTO (0.1.54) — SY.frontdesk.gov: el camino de tenants y el merge por email
+### A-37 ✅ RESUELTO (0.1.54 + 0.1.55) — SY.frontdesk.gov: el camino de tenants y el merge por email
 
 **Decisiones del operador (2026-10-02):**
 
@@ -477,16 +477,36 @@ igual que en uno pendiente.
 - Un handoff fallido conserva el tenant del caso (G7).
 - Los tests de logs sin datos personales eran inestables; quedaron estables.
 
+**Cerrado en 0.1.55:**
+
+- **Tenant raíz:** nadie se registra ahí. Decisión del operador (2026-10-02): *"nadie se puede
+  registrar en tenant raíz"*.
+  - SY.identity rechaza el `ILK_REGISTER` de una persona en el tenant raíz con
+    `TENANT_ROOT_NOT_REGISTRABLE`, venga de quien venga. Los ILKs de nodos (`agent`) se siguen
+    registrando ahí.
+  - El frontdesk corta antes, sin LLM ni SY.identity, y responde `TENANT_NOT_REGISTRABLE`. La
+    persona queda temporal.
+  - Los nodos IO lanzados desde el tenant raíz quedan como A-43.
+- **El gate de frontdesk de io.slack e io.wapp** (`io-common`) armaba el handoff como mensaje
+  `data`, pero el frontdesk solo toma handoffs de mensajes `user`. El handoff nunca llegaba a su
+  camino determinístico. Ahora va como `user`, igual que el de io.cloud.
+- **Los e2e de laboratorio de identity:** cuatro diags creaban sus tenants con el nombre del
+  frontdesk y recibían `UNAUTHORIZED_REGISTRAR`. Eran `identity_merge`, `identity_negative`,
+  `identity_provision_complete` e `identity_replica_sync`.
+  - Ahora el script crea los tenants por SY.admin, se los pasa al diag y los purga al final. Lo común
+    quedó en `scripts/lib/identity_e2e.sh`.
+  - El de réplica además comprueba por SY.admin que el tenant y el ILK llegan a la réplica.
+  - El wrapper `gov_frontdesk_identity_e2e.sh` ya no trae hives viejos (`sandbox`, `worker-220`).
+- **Los diags se hacen pasar por el frontdesk:** se conectan con su nombre y con el UUID que el
+  frontdesk persistió.
+  - Mientras corren, el router les entrega el tráfico del frontdesk.
+  - Cuando se van, el frontdesk real queda conectado pero sin ruta hasta que reconecta (A-44).
+  - Los scripts ahora paran `sy-frontdesk-gov` mientras corre el diag y lo vuelven a arrancar.
+
 **Quedan abiertos:**
 
-- 🔴 **Seguridad:** no hay prueba de que el email sea de quien lo escribe. Quien escribe el email de
-  otro asocia su canal al ILK de esa persona. Ya está escrito en los dos documentos.
-- **Decisión:** los temporales de nodos IO del tenant raíz se registran en ese tenant. Se puede
-  bloquear con una línea.
+- 🔴 **Seguridad:** no hay prueba de que el email sea de quien lo escribe (A-42, postergado).
 - **G6 y G8:** los contadores de §12 y los reintentos conversacionales.
-- **Dos e2e de laboratorio:** `identity_merge_alias_e2e.sh` e `identity_negative_e2e.sh` crean
-  tenants con el nombre del frontdesk y ahora reciben `UNAUTHORIZED_REGISTRAR`. Van a la pasada de
-  limpieza de scripts.
 
 ### A-38 ✅ RESUELTO (0.1.54) — Cognition: preguntas de diseño
 
@@ -570,8 +590,34 @@ Respuesta del operador (2026-10-02): *"sí a todo"*.
   llegue por uno de ellos queda temporal: desde 0.1.55 nadie se registra en el tenant raíz.
 - **Operador (2026-10-02):** *"este tema del IO lanzado por tenant raíz es algo que no está del
   todo bien. Para verlo."*
+- **Efecto concreto desde 0.1.55:** `IO.api@motherbee` está en el tenant raíz, así que un sujeto
+  `by_data` que llega por ahí termina en `tenant_not_registrable` y queda temporal. Para registrar
+  personas por IO.api, a ese IO.api lo tiene que lanzar un tenant.
 - **Ya resuelto:** `io.slack` ya no tiene instancia de base (A-40).
 - **Falta decidir:** cuáles de los otros quedan como base y cuáles pasan a lanzarse por tenant.
+
+### A-44 🟡 PARCIAL (0.1.55) — Dos conexiones con un mismo UUID: la segunda se queda con la ruta
+
+Visto al arreglar los e2e de A-37, leyendo `src/router/mod.rs` y `src/shm/mod.rs`.
+
+- **Abierto, pide decisión — el router:**
+  - Un HELLO con un UUID que ya tiene una conexión viva reemplaza su entrada en la tabla de nodos.
+    La conexión vieja sigue abierta.
+  - Cuando la nueva se cierra, el router borra la entrada del UUID, porque es la suya. La vieja
+    queda conectada pero sin ruta, y no tiene cómo enterarse.
+  - **Cuándo pasa:** un proceso que se conecta con el UUID persistido de otro que sigue vivo, como
+    los diags de identity con el frontdesk; o una reconexión antes de que el router limpie la
+    conexión vieja.
+  - **Opciones:** que el router cierre la conexión vieja cuando un HELLO nuevo toma su UUID, para
+    que ese nodo reconecte; o que rechace el HELLO nuevo mientras la vieja siga viva.
+- **Cerrado en 0.1.55 — la SHM del router:**
+  - **`register_node`:** tomaba el primer slot libre aunque el UUID ya tuviera uno más adelante,
+    así que un nodo que se registraba de nuevo quedaba dos veces. Ahora conserva su slot.
+  - **El lector:** leía los primeros `node_count` slots, pero dar de baja un nodo deja un hueco.
+    Con un hueco, el snapshot traía la entrada borrada y perdía el último nodo. Lo leen el
+    orchestrator (aviso `node disconnected`, espera de los nodos del sistema al arrancar) y los
+    routers vecinos del mismo hive. Ahora lee los nodos activos, estén donde estén.
+  - Los dos casos tienen test, y los dos fallan con el código anterior.
 
 ### A-19 ✅ RESUELTO (0.1.43) — La policy publicada esperaba hasta 60 s al watcher de Syncthing
 
