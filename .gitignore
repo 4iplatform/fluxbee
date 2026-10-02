@@ -25,3 +25,9 @@ __pycache__/
 
 # Scratchpad de sesión (throwaway: dumps, patches, borradores) — nunca va al repo
 scratchpad/
+
+# Go binaries that packaging/build-deb.sh builds in place (FINDINGS A-28)
+/go/sy-opa-rules/sy-opa-rules
+/go/sy-timer/sy-timer
+/go/sy-wf-rules/sy-wf-rules
+/go/nodes/wf/wf-generic/wf-generic
