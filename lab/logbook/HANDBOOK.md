@@ -741,8 +741,41 @@ POST /hives/{spoke}/update  {"category":"core","manifest_version":0,"manifest_ha
 #    el hash sale de: GET /hives/motherbee/versions  ->  payload.hive.core.manifest_hash
 ```
 
-**Tiempo real:** ~6 min de build con la caché tibia, ~1 min el `apt install`, y el sistema se
-acomoda solo en ~25 s.
+**Tiempo real:** de 6 a 23 min de build según la caché, ~9 s el publish (desde 0.1.51 el índice
+hashea solo el `.deb` nuevo; antes eran 8,6 min), ~1 min el `apt install`, y el sistema se acomoda
+solo en ~25 s.
+
+### El mismo ciclo en un comando: `lab/ops.py` (desde 2026-10-02)
+
+`lab/ops.py` hace el ciclo de arriba por guest-agent, sobre `lab/pve.py`, con el inventario de PROD
+(motherbee=100, worker1=101, ingress1=102, egress1=103, build 110; se cambia con `FLUXBEE_HIVES` y
+`FLUXBEE_BUILD_VM`):
+
+```bash
+ops() { python3 lab/ops.py --env scratchpad/pve.env --pve-host 192.168.8.207 "$@"; }
+ops build 0.1.N --wait          # git pull + build-deb.sh en la build box (log /root/build-0.1.N.log)
+ops publish 0.1.N               # apt-repo-publish.sh (log /root/publish-0.1.N.log)
+ops deploy 0.1.N --snapshot pre-<algo>-0-1-N --drop <el-más-viejo>
+ops versions                    # versión y manifest_hash del core por hive
+ops opa-status                  # política OPA de usuario por hive
+ops health [--since HH:MM]      # por VM: units caídas, denegaciones del gate, drops de routing.src (UTC)
+ops admin GET '/hives/motherbee/routes?x=1&y=2'   # sin shell: el & y el JSON pasan intactos
+ops run 100 script.sh [args]    # un script local (bash o .py) en una VM
+```
+
+`deploy` hace, en orden:
+
+1. Snapshot de todas las VMs.
+2. `apt install` en motherbee.
+3. Espera a que el admin reporte la versión nueva.
+4. core-update de los spokes en paralelo.
+5. Espera a que cada spoke reporte la versión y el hash de motherbee: el TIMEOUT de la respuesta
+   no se mira (U-8b).
+6. `health` desde el arranque del deploy.
+
+La regla de los 3 snapshots se respeta así: si una VM ya tiene 3, `deploy` no arranca hasta que
+nombres el más viejo con `--drop`, y borra ese y ningún otro. El registro en el ledger sigue siendo
+a mano.
 
 ### Registrá el deploy — SIEMPRE (auditoría) · regla del operador (2026-08-20)
 
