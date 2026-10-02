@@ -21,6 +21,7 @@
 
 | Versión | Fecha (ART) | Commit | Alcance | Estado | Rollback |
 |---|---|---|---|---|---|
+| **0.1.55** | 2026-10-02 | `975fd34` | motherbee + spokes (core) | ✅ live | snap `pre-root-tenant-0-1-55` (las 4 VMs) · `apt install fluxbee=0.1.54` |
 | **0.1.54** | 2026-10-02 | `6aa4ee4` | motherbee + spokes (core) | ✅ live | snap `pre-gov-0-1-54` (las 4 VMs) · `apt install fluxbee=0.1.53` |
 | **0.1.53** | 2026-10-02 | `26edcd5` | motherbee + spokes (core) | ✅ live | snap `pre-ai-generic-0-1-53` (las 4 VMs) · `apt install fluxbee=0.1.52` |
 | **0.1.52** | 2026-10-02 | `0670184` | motherbee + spokes (core) | ✅ live | snap `pre-cleanup-0-1-52` (las 4 VMs) · `apt install fluxbee=0.1.51` |
@@ -63,6 +64,47 @@
 > (`dpkg-scanpackages -m`) para rollback, pero su detalle vive en la bitácora, no acá.
 
 ---
+
+## 0.1.55 — nadie se registra en el tenant raíz, U-8b, io.slack sin instancia de base
+
+- **Fecha:** 2026-10-02 (ART) · **Versión anterior:** 0.1.54 · **Commits:** `a8c6349`..`975fd34`
+  (FINDINGS A-37, A-40, A-43, A-44, A-45; PENDING-BUGS U-8b; bitácora `2026-10-02`).
+- **Alcance:** motherbee + los tres spokes (core-update).
+- **Antes del deploy, a mano en PROD (pedido del operador):** se borró `IO.slack.default@motherbee`
+  con purga; corría en el tenant raíz y no tenía su ILK (A-40). Su config quedó guardada fuera del
+  repo.
+- **Qué cambió:**
+  - **Tenant raíz:** nadie se registra ahí. SY.identity lo rechaza para cualquier llamador
+    (`TENANT_ROOT_NOT_REGISTRABLE`), el frontdesk responde `TENANT_NOT_REGISTRABLE` sin LLM y
+    `register_human` lo rechaza antes de provisionar.
+  - **U-8b:** el core update de un spoke contesta `phase: restarting` antes de reiniciar, y deja el
+    resultado en `/versions` como `core.last_update`.
+  - **io.slack:** sin instancia de arranque; cada binding lo lanza su tenant.
+  - **Gate de frontdesk de io.slack/io.wapp:** el handoff va como mensaje `user`; como `data`, el
+    frontdesk lo ignoraba.
+  - **SHM del router (A-44):** un nodo que se registra de nuevo conserva su slot, y el lector ya no
+    pierde el último nodo cuando hay un hueco.
+  - **Lab:** los e2e de identity crean sus tenants por SY.admin.
+- **Build:** 17,5 min. **Publish:** 10 s, 55 paquetes. **Deploy:** 233 s con `ops deploy`;
+  snapshots `pre-root-tenant-0-1-55` en las 4 VMs (se borró antes `pre-cleanup-0-1-52`).
+- **Verificación en vivo:**
+  - Los 4 hives en 0.1.55 con el mismo manifest (`852a21cd…`). Ningún binario `(deleted)` y 0
+    líneas ERROR desde el install, en los 4.
+  - **A-39 sigue bien:** IO.api, IO.blob, IO.cloud e IO.wapp.default arrancaron una sola vez, en
+    0.1.55, con cero `203/EXEC`; el orchestrator los reapuntó.
+  - **Identity y frontdesk:** 0 errores. La réplica de worker1 hizo el full sync y se suscribió a
+    los deltas.
+  - **U-8b, todavía no:** los spokes recibieron el update con el orchestrator 0.1.54, así que
+    ingress1 y egress1 dieron `TIMEOUT` como antes (worker1 contestó a tiempo).
+    `core.last_update` está en `/versions`, en `null`. La respuesta antes del reinicio se ve en el
+    próximo release.
+  - **No probado en vivo:** el bloqueo del tenant raíz, que necesitaría registrar a alguien en PROD.
+    Lo cubren los tests y el e2e `identity_negative`.
+  - **Visto al verificar (A-45, preexistente):** el upgrade del motherbee deja todo el core caído
+    70–86 s, porque el `prerm` para los servicios antes de desempaquetar. Las réplicas lo muestran
+    como ~2 avisos de reconexión por segundo.
+  - **CI:** `rust-tests` y `router-dispatcher-guards` en verde en `975fd34`.
+- **Rollback:** snapshot `pre-root-tenant-0-1-55` o `apt install fluxbee=0.1.54`.
 
 ## 0.1.54 — upgrades sin caída de los nodos administrados, el camino .gov cerrado, cognition A-38
 

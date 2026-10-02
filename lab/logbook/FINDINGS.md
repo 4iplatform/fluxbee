@@ -619,6 +619,25 @@ Visto al arreglar los e2e de A-37, leyendo `src/router/mod.rs` y `src/shm/mod.rs
     routers vecinos del mismo hive. Ahora lee los nodos activos, estén donde estén.
   - Los dos casos tienen test, y los dos fallan con el código anterior.
 
+### A-45 🟡 PROPUESTA — Cada upgrade del motherbee apaga todo el core antes de desempaquetar
+
+- **Qué pasa (medido en el deploy de 0.1.55):**
+  - El `prerm` del paquete (`packaging/deb-prerm`) para todos los servicios del core antes de
+    desempaquetar, también en un upgrade.
+  - El `postinst` arranca solo el orchestrator, que después levanta el resto.
+- **Caída medida:** rt-gateway 70 s, sy-admin 76 s, sy-vault 78 s, sy-storage 84 s, sy-identity
+  86 s.
+- **Impacto:** mientras tanto el motherbee no tiene router, identity ni admin.
+  - IO.api e IO.cloud no atienden: el público ve 502.
+  - Las réplicas de identity reintentan cada segundo (~2 avisos por segundo).
+  - No se puede provisionar a nadie.
+- **Por qué está así:** el `prerm` dice "stop + disable services before removal", pero corre igual
+  en un upgrade.
+- **Propuesta:** que el `prerm` pare los servicios solo al desinstalar, y que en un upgrade el
+  `postinst` los reinicie después de desempaquetar. Linux mantiene corriendo el binario viejo
+  hasta el reinicio, así que la caída quedaría en lo que tarda cada reinicio.
+- **A decidir:** el orden de los reinicios, y si los hace el `postinst` o el orchestrator.
+
 ### A-19 ✅ RESUELTO (0.1.43) — La policy publicada esperaba hasta 60 s al watcher de Syncthing
 
 - **Qué pasaba:** con 0.1.41 el apply llegaba a los 4 hives en 16 s, pero el clear tardó 63 s y el
