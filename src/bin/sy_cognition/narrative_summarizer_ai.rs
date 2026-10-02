@@ -37,8 +37,15 @@ struct RawNarrativeSummaries {
 #[derive(Debug, Clone)]
 pub(super) struct NarrativeSummaries {
     pub(super) memory_summary: String,
-    pub(super) episode_summary: Option<String>,
-    pub(super) episode_reason: Option<String>,
+    /// Present exactly when the input carried an episode candidate: the parser rejects an
+    /// answer that leaves it out, and drops one the input did not ask for.
+    pub(super) episode: Option<EpisodeNarrative>,
+}
+
+#[derive(Debug, Clone)]
+pub(super) struct EpisodeNarrative {
+    pub(super) summary: String,
+    pub(super) reason: String,
 }
 
 pub(super) async fn run_narrative_summarizer_ai(
@@ -141,12 +148,15 @@ fn parse_narrative_summaries(
         ));
     }
 
-    let episode_summary = parsed.episode_summary.map(|v| normalize_sentence(&v));
-    let episode_reason = parsed.episode_reason.map(|v| normalize_sentence(&v));
-    if expect_episode
-        && (episode_summary.as_deref().unwrap_or_default().is_empty()
-            || episode_reason.as_deref().unwrap_or_default().is_empty())
-    {
+    if !expect_episode {
+        return Ok(NarrativeSummaries {
+            memory_summary,
+            episode: None,
+        });
+    }
+    let summary = normalize_sentence(parsed.episode_summary.as_deref().unwrap_or_default());
+    let reason = normalize_sentence(parsed.episode_reason.as_deref().unwrap_or_default());
+    if summary.is_empty() || reason.is_empty() {
         return Err(AiSdkError::Protocol(
             "narrative summarizer returned incomplete episode narrative".into(),
         ));
@@ -154,8 +164,7 @@ fn parse_narrative_summaries(
 
     Ok(NarrativeSummaries {
         memory_summary,
-        episode_summary: episode_summary.filter(|value| !value.is_empty()),
-        episode_reason: episode_reason.filter(|value| !value.is_empty()),
+        episode: Some(EpisodeNarrative { summary, reason }),
     })
 }
 
@@ -211,7 +220,7 @@ mod tests {
             parsed.memory_summary,
             "Recurring billing friction with pressure for resolution."
         );
-        assert_eq!(parsed.episode_summary, None);
+        assert!(parsed.episode.is_none());
     }
 
     #[test]
@@ -238,10 +247,9 @@ mod tests {
             for expected in case.episode_summary_contains {
                 assert!(
                     parsed
-                        .episode_summary
-                        .as_deref()
-                        .unwrap_or_default()
-                        .contains(&expected),
+                        .episode
+                        .as_ref()
+                        .is_some_and(|episode| episode.summary.contains(&expected)),
                     "narrative case {} missing episode summary fragment {}",
                     case.name,
                     expected
@@ -250,10 +258,9 @@ mod tests {
             for expected in case.episode_reason_contains {
                 assert!(
                     parsed
-                        .episode_reason
-                        .as_deref()
-                        .unwrap_or_default()
-                        .contains(&expected),
+                        .episode
+                        .as_ref()
+                        .is_some_and(|episode| episode.reason.contains(&expected)),
                     "narrative case {} missing episode reason fragment {}",
                     case.name,
                     expected

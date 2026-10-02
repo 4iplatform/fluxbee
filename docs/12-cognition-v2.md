@@ -685,6 +685,13 @@ Context update and reason update run concurrently on the same message but do not
 
 Extended with reason similarity as described in section 7.
 
+Current implementation (anchor-based, per thread):
+
+- The active scope is anchored to its dominant context and dominant reason. Each turn compares the thread's current dominant pair with that anchor: `binding = S_ctx × S_rsn × S_ilk`, smoothed with `SCOPE_ENERGY_ALPHA`. The binding is a similarity in [0, 1], so the unbind threshold is 0.35, not the energy-scale −0.05 of §9.4.
+- A shift is a different dominant pair. The unbind streak grows while a shift persists with the EMA under the threshold. The scope instance cuts when the streak reaches `SCOPE_ENERGY_SUSTAIN_COUNT`.
+- While a shift whose binding is under the threshold is pending, the scope keeps its anchor, so the following turns keep measuring the divergence until the cut. A candidate that still binds (at or over the threshold) is drift inside the scope and becomes the new anchor. Before 2026-10-02 the anchor was always replaced at once, which reset the streak: a lasting topic change renamed the scope and never cut it.
+- On a weight tie the anchor stays dominant (otherwise the smaller label wins), so tags reinforced together never count as a shift.
+
 ### 8.4 Period Detection
 
 Now builds snapshots with main context AND dominant reason. Periods cut when either context or reason switches significantly.
@@ -1199,7 +1206,11 @@ Validation note:
 - The canonical E2E for cognition v2 must enter through the router path with real/disposable nodes.
 - The old direct publish-to-`storage.turns` smoke was removed from the repo to avoid confusing it with the normative path.
 - PostgreSQL is not the primary oracle for the cognition E2E. The primary oracle is delivery to the destination node plus `jsr-memory` and `SY.cognition` runtime counters.
-- Cold start rebuild is startup-only and fail-open: rebuild is attempted only when local cognition state is empty, and missing/unreachable durable storage does not block live processing.
+- Cold start rebuild is fail-open and only fills an empty local cognition state:
+  - it runs at startup, before the turn loop. Its postgres lookup waits for SY.vault up to `VAULT_BOOT_WAIT`, because on an upgrade the whole hive restarts at once and the vault may not answer yet (same pattern as SY.storage, SY.identity and SY.architect)
+  - if it still cannot load (no postgres secret yet, vault later than the budget, Postgres down), the first turn that would build state retries it once, in the turn task. A `VAULT_SECRET_CHANGED` for postgres only refreshes what `CONFIG_GET` reports: a rebuild started from there would race the turn loop
+  - missing/unreachable durable storage never blocks live processing
+  - rebuilt state is keyed exactly like the live path (contexts and reasons by label, co-occurrences by context|reason label, memories by scope, episodes by scope instance|affect), so the next live turn continues the rebuilt entities instead of re-creating them
 - Current bounded hot-set note:
   - `jsr-memory` is now emitted as a bounded hot set sized to `MEMORY_MAX_DATA_SIZE`
   - selection priority is:
@@ -1209,6 +1220,7 @@ Validation note:
     - `latest_thread_seq`
   - `turn_count`
   - startup rebuild from durable now rehydrates only that selected hot set into local cognition memory before resuming live processing
+  - live processing applies the same rule after every turn: a thread that leaves the hot set leaves local memory too, and starts over if it comes back
   - if the snapshot exceeds SHM capacity, lower-priority threads are pruned before the write
   - deferred optimization: the durable read path is still hive-scoped and applies the hot-set filter in runtime; there is no SQL-side / query-side filter yet
   - future backlog item:

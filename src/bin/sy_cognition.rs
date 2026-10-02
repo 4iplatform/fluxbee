@@ -1,7 +1,8 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::{self, OpenOptions};
+use std::future::Future;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -49,7 +50,9 @@ mod narrative_summarizer_ai;
 #[path = "sy_cognition/semantic_tagger_ai.rs"]
 mod semantic_tagger_ai;
 
-use narrative_summarizer_ai::run_narrative_summarizer_ai;
+use narrative_summarizer_ai::{
+    run_narrative_summarizer_ai, EpisodeNarrative, NarrativeSummaries, NarrativeSummarizerAiInput,
+};
 use semantic_tagger_ai::run_semantic_tagger_ai;
 
 type CognitionError = Box<dyn std::error::Error + Send + Sync>;
@@ -107,6 +110,27 @@ struct NarrativeOutcome {
 struct ThreadUpdateResult {
     envelopes: Vec<(&'static str, Vec<u8>)>,
     narrative: NarrativeOutcome,
+}
+
+/// The narrative step of a turn (memory and episode text). Production asks the AI; tests
+/// answer from the input, so the whole turn path runs without a network.
+trait NarrativeSummarizer {
+    fn summarize<'a>(
+        &'a self,
+        input: NarrativeSummarizerAiInput<'a>,
+    ) -> impl Future<Output = Result<NarrativeSummaries, fluxbee_ai_sdk::AiSdkError>> + Send + 'a;
+}
+
+struct AiNarrativeSummarizer;
+
+impl NarrativeSummarizer for AiNarrativeSummarizer {
+    fn summarize<'a>(
+        &'a self,
+        input: NarrativeSummarizerAiInput<'a>,
+    ) -> impl Future<Output = Result<NarrativeSummaries, fluxbee_ai_sdk::AiSdkError>> + Send + 'a
+    {
+        run_narrative_summarizer_ai(input)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -224,6 +248,9 @@ struct CognitionRuntimeState {
     last_rebuild_status: Option<String>,
     last_rebuild_source: Option<String>,
     last_rebuild_at: Option<String>,
+    /// Whether storage's Postgres resolved from the vault at the last lookup (`None`: not
+    /// looked up yet). It is what the cold-start rebuild reads from.
+    storage_db_configured: Option<bool>,
     shm_hot_threads_total: u64,
     shm_pruned_threads_total: u64,
     shm_payload_bytes: u64,
@@ -252,6 +279,9 @@ struct CognitionAppState {
     runtime_state: Arc<Mutex<CognitionRuntimeState>>,
     nats_subscribe_errors: Arc<AtomicU64>,
     thread_states: Arc<Mutex<HashMap<String, ThreadCognitionState>>>,
+    /// Set when the startup rebuild could not load durable state (no storage DB yet, or the
+    /// load failed); the first turn retries it once before it builds any state.
+    rebuild_owed: AtomicBool,
     memory_region: Arc<Mutex<Option<MemoryRegionWriter>>>,
     vault: VaultClient,
 }
@@ -374,15 +404,15 @@ struct EpisodeState {
     created_at: String,
 }
 
+/// The deterministic half of an episode. Its summary and reason come from the narrative
+/// summarizer, which must return both whenever a candidate exists.
 #[derive(Debug, Clone)]
 struct EpisodeCandidate {
     affect_id: String,
     title: String,
-    summary: String,
     base_intensity: f64,
     evidence_strength: f64,
     evidence_signals: Vec<String>,
-    reason: String,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -546,6 +576,7 @@ async fn main() -> Result<(), CognitionError> {
         runtime_state: Arc::clone(&runtime_state),
         nats_subscribe_errors: Arc::clone(&nats_subscribe_errors),
         thread_states: Arc::new(Mutex::new(HashMap::new())),
+        rebuild_owed: AtomicBool::new(false),
         memory_region: Arc::new(Mutex::new(None)),
         vault: vault_client,
     });
@@ -562,7 +593,12 @@ async fn main() -> Result<(), CognitionError> {
         }
     }
 
-    rebuild_from_durable_on_startup(Arc::clone(&app_state)).await;
+    // The rebuild only applies to an empty state, so it lands before the turn loop starts. On
+    // an upgrade the whole hive restarts at once: its postgres lookup waits for the vault
+    // (FINDINGS A-26). If it still cannot load, the first turn retries it once.
+    if !rebuild_from_durable(&app_state, "startup", VaultWait::UntilReachable).await {
+        app_state.rebuild_owed.store(true, Ordering::SeqCst);
+    }
 
     std::mem::drop(tokio::spawn(run_turns_loop(
         endpoint.clone(),
@@ -778,6 +814,13 @@ async fn handle_turn_payload(
         }
     };
 
+    // This turn is about to build state, after which a cold-start rebuild no longer applies.
+    // If the startup one could not load (storage's postgres arrived after the boot wait),
+    // retry it once now. It runs in the turn task, so no other turn can land in between.
+    if app_state.rebuild_owed.swap(false, Ordering::SeqCst) {
+        rebuild_from_durable(&app_state, "first_turn", VaultWait::Once).await;
+    }
+
     let update_result = {
         let mut threads = app_state.thread_states.lock().await;
         let thread_state = threads
@@ -797,6 +840,7 @@ async fn handle_turn_payload(
             &semantic_tagger_config,
             &ts,
             thread_state,
+            &AiNarrativeSummarizer,
         )
         .await
     };
@@ -930,8 +974,8 @@ async fn handle_turn_payload(
 
 async fn sync_memory_shm(app_state: &CognitionAppState) -> Result<(), json_router::shm::ShmError> {
     let hot_set = {
-        let threads = app_state.thread_states.lock().await;
-        build_memory_hot_set_snapshot(&threads)?
+        let mut threads = app_state.thread_states.lock().await;
+        retain_memory_hot_set(&mut threads)?
     };
 
     let sync_status = if hot_set.stats.pruned_threads_total > 0 {
@@ -1027,13 +1071,22 @@ fn build_memory_hot_set_snapshot(
     })
 }
 
+/// The one retention rule for local cognition state: build the jsr-memory hot set and drop
+/// every thread that did not make it. Applied after every live turn (`sync_memory_shm`) and
+/// to the cold-start snapshot, so memory stays bounded by the SHM capacity. A dropped thread
+/// starts over if it comes back, as it would after a restart.
+fn retain_memory_hot_set(
+    threads: &mut HashMap<String, ThreadCognitionState>,
+) -> Result<MemoryHotSetBuild, json_router::shm::ShmError> {
+    let hot_set = build_memory_hot_set_snapshot(threads)?;
+    threads.retain(|thread_id, _| hot_set.selected_thread_ids.contains(thread_id));
+    Ok(hot_set)
+}
+
 fn apply_memory_hot_set_to_rebuild_snapshot(
     snapshot: &mut RebuildSnapshot,
 ) -> Result<MemoryHotSetStats, json_router::shm::ShmError> {
-    let hot_set = build_memory_hot_set_snapshot(&snapshot.threads)?;
-    snapshot
-        .threads
-        .retain(|thread_id, _| hot_set.selected_thread_ids.contains(thread_id));
+    let hot_set = retain_memory_hot_set(&mut snapshot.threads)?;
     recount_rebuild_snapshot_totals(snapshot);
     Ok(hot_set.stats)
 }
@@ -1115,7 +1168,14 @@ fn parse_rfc3339_epoch_ms(value: &str) -> Option<i64> {
         .map(|dt| dt.timestamp_millis())
 }
 
-async fn rebuild_from_durable_on_startup(app_state: Arc<CognitionAppState>) {
+/// Cold-start rebuild of local cognition state from storage's durable `cognition_*` tables.
+/// It only ever installs into an EMPTY local state. Returns whether durable state was
+/// installed; the caller decides whether an attempt that could not load stays owed.
+async fn rebuild_from_durable(
+    app_state: &CognitionAppState,
+    trigger: &'static str,
+    wait: VaultWait,
+) -> bool {
     let started_at = chrono::Utc::now().to_rfc3339();
     {
         let mut state = app_state.runtime_state.lock().await;
@@ -1127,19 +1187,22 @@ async fn rebuild_from_durable_on_startup(app_state: Arc<CognitionAppState>) {
     if !should_rebuild {
         let mut state = app_state.runtime_state.lock().await;
         state.last_rebuild_status = Some("skipped_nonempty_local_state".to_string());
-        state.last_rebuild_source = Some("startup".to_string());
-        return;
+        state.last_rebuild_source = Some(trigger.to_string());
+        return false;
     }
 
-    let Some(base_database_url) = resolve_storage_database_url(&app_state).await else {
+    let base_database_url = resolve_storage_database_url(app_state, wait).await;
+    app_state.runtime_state.lock().await.storage_db_configured = Some(base_database_url.is_some());
+    let Some(base_database_url) = base_database_url else {
         let mut state = app_state.runtime_state.lock().await;
         state.last_rebuild_status = Some("skipped_missing_storage_db".to_string());
-        state.last_rebuild_source = Some("startup".to_string());
+        state.last_rebuild_source = Some(trigger.to_string());
         tracing::info!(
             node_name = %app_state.node_name,
-            "sy.cognition startup rebuild skipped; no durable storage DB configured"
+            trigger,
+            "sy.cognition rebuild skipped; storage postgres is not resolvable from the vault"
         );
-        return;
+        return false;
     };
 
     let mut snapshot = match load_rebuild_snapshot_from_storage(&base_database_url).await {
@@ -1151,10 +1214,11 @@ async fn rebuild_from_durable_on_startup(app_state: Arc<CognitionAppState>) {
             state.last_rebuild_source = Some("storage_durable".to_string());
             tracing::warn!(
                 node_name = %app_state.node_name,
+                trigger,
                 error = %err,
-                "sy.cognition startup rebuild from durable failed; continuing live"
+                "sy.cognition rebuild from durable failed; continuing live"
             );
-            return;
+            return false;
         }
     };
 
@@ -1167,27 +1231,34 @@ async fn rebuild_from_durable_on_startup(app_state: Arc<CognitionAppState>) {
             state.last_rebuild_source = Some("storage_durable".to_string());
             tracing::warn!(
                 node_name = %app_state.node_name,
+                trigger,
                 error = %err,
-                "sy.cognition startup rebuild failed while bounding jsr-memory hot set; continuing live"
+                "sy.cognition rebuild failed while bounding jsr-memory hot set; continuing live"
             );
-            return;
+            return false;
         }
     };
 
     let rebuilt_threads_total = snapshot.threads.len() as u64;
-    {
+    let installed = {
         let mut threads = app_state.thread_states.lock().await;
-        *threads = snapshot.threads;
+        install_rebuild_snapshot(&mut threads, snapshot.threads)
+    };
+    if !installed {
+        let mut state = app_state.runtime_state.lock().await;
+        state.last_rebuild_status = Some("skipped_nonempty_local_state".to_string());
+        state.last_rebuild_source = Some(trigger.to_string());
+        return false;
     }
-    if let Err(err) = sync_memory_shm(&app_state).await {
+    if let Err(err) = sync_memory_shm(app_state).await {
         tracing::warn!(
             node_name = %app_state.node_name,
             error = %err,
-            "sy.cognition startup rebuild loaded durable state but failed to sync jsr-memory"
+            "sy.cognition rebuild loaded durable state but failed to sync jsr-memory"
         );
     }
     refresh_runtime_totals(
-        &app_state,
+        app_state,
         RuntimeRefreshDelta {
             rebuilt_threads_total,
             rebuild_source: Some("storage_durable".to_string()),
@@ -1203,6 +1274,7 @@ async fn rebuild_from_durable_on_startup(app_state: Arc<CognitionAppState>) {
     .await;
     tracing::info!(
         node_name = %app_state.node_name,
+        trigger,
         rebuilt_threads_total,
         contexts = snapshot.total_contexts,
         reasons = snapshot.total_reasons,
@@ -1213,8 +1285,23 @@ async fn rebuild_from_durable_on_startup(app_state: Arc<CognitionAppState>) {
         shm_hot_threads_total = hot_set_stats.selected_threads_total,
         shm_pruned_threads_total = hot_set_stats.pruned_threads_total,
         shm_payload_bytes = hot_set_stats.payload_bytes,
-        "sy.cognition startup rebuild from durable completed"
+        "sy.cognition rebuild from durable completed"
     );
+    true
+}
+
+/// Installs a durable snapshot, but only into an EMPTY local state: the rebuild is a
+/// cold-start mechanism, and a snapshot written over live state would erase the turns that
+/// built it.
+fn install_rebuild_snapshot(
+    threads: &mut HashMap<String, ThreadCognitionState>,
+    snapshot_threads: HashMap<String, ThreadCognitionState>,
+) -> bool {
+    if !threads.is_empty() {
+        return false;
+    }
+    *threads = snapshot_threads;
+    true
 }
 
 async fn load_rebuild_snapshot_from_storage(
@@ -1240,16 +1327,144 @@ async fn load_rebuild_snapshot_from_storage(
         }
     });
 
-    let thread_rows = client
+    let rows = fetch_rebuild_rows(&client).await?;
+    Ok(build_rebuild_snapshot(rows))
+}
+
+/// The durable rows the rebuild reads, each table in `updated_at` order. Thread-scoped rows
+/// are `(entity_id, thread_id, payload)`; a payload is the envelope `data` SY.storage stored.
+#[derive(Debug, Default)]
+struct RebuildRows {
+    threads: Vec<(String, CognitionThreadData)>,
+    contexts: Vec<(String, String, CognitionContextData)>,
+    reasons: Vec<(String, String, CognitionReasonData)>,
+    cooccurrences: Vec<(String, String, CognitionCooccurrenceData)>,
+    scopes: Vec<(String, CognitionScopeData)>,
+    scope_instances: Vec<(String, String, ScopeInstancePayload)>,
+    memories: Vec<(String, String, CognitionMemoryData)>,
+    episodes: Vec<(String, String, CognitionEpisodeData)>,
+}
+
+async fn fetch_rebuild_rows(
+    client: &tokio_postgres::Client,
+) -> Result<RebuildRows, CognitionError> {
+    let mut rows = RebuildRows::default();
+    for row in client
         .query(
             "SELECT thread_id, payload FROM cognition_threads ORDER BY updated_at ASC",
             &[],
         )
-        .await?;
+        .await?
+    {
+        rows.threads
+            .push((row.get("thread_id"), row_payload(&row)?));
+    }
+
+    for row in client
+        .query(
+            "SELECT context_id, thread_id, payload FROM cognition_contexts ORDER BY updated_at ASC",
+            &[],
+        )
+        .await?
+    {
+        rows.contexts.push((
+            row.get("context_id"),
+            row.get("thread_id"),
+            row_payload(&row)?,
+        ));
+    }
+
+    for row in client
+        .query(
+            "SELECT reason_id, thread_id, payload FROM cognition_reasons ORDER BY updated_at ASC",
+            &[],
+        )
+        .await?
+    {
+        rows.reasons.push((
+            row.get("reason_id"),
+            row.get("thread_id"),
+            row_payload(&row)?,
+        ));
+    }
+
+    for row in client
+        .query(
+            "SELECT cooccurrence_id, thread_id, payload FROM cognition_cooccurrences ORDER BY updated_at ASC",
+            &[],
+        )
+        .await?
+    {
+        rows.cooccurrences.push((
+            row.get("cooccurrence_id"),
+            row.get("thread_id"),
+            row_payload(&row)?,
+        ));
+    }
+
+    for row in client
+        .query(
+            "SELECT scope_id, payload FROM cognition_scopes ORDER BY updated_at ASC",
+            &[],
+        )
+        .await?
+    {
+        rows.scopes.push((row.get("scope_id"), row_payload(&row)?));
+    }
+
+    for row in client
+        .query(
+            "SELECT scope_instance_id, thread_id, payload FROM cognition_scope_instances ORDER BY updated_at ASC",
+            &[],
+        )
+        .await?
+    {
+        rows.scope_instances.push((
+            row.get("scope_instance_id"),
+            row.get("thread_id"),
+            row_payload(&row)?,
+        ));
+    }
+
+    for row in client
+        .query(
+            "SELECT memory_id, thread_id, payload FROM cognition_memories ORDER BY updated_at ASC",
+            &[],
+        )
+        .await?
+    {
+        rows.memories.push((
+            row.get("memory_id"),
+            row.get("thread_id"),
+            row_payload(&row)?,
+        ));
+    }
+
+    for row in client
+        .query(
+            "SELECT episode_id, thread_id, payload FROM cognition_episodes ORDER BY updated_at ASC",
+            &[],
+        )
+        .await?
+    {
+        rows.episodes.push((
+            row.get("episode_id"),
+            row.get("thread_id"),
+            row_payload(&row)?,
+        ));
+    }
+
+    Ok(rows)
+}
+
+/// Assembles local cognition state from durable rows, keyed exactly like the live path:
+/// contexts and reasons by label, co-occurrences by `"<context label>|<reason label>"`,
+/// memories by scope id, episodes by `"<scope instance id>|<affect id>"`. Keyed by entity id
+/// instead, every lookup of the next live turn missed and it re-created each entity, under
+/// the same id, next to the rebuilt one.
+fn build_rebuild_snapshot(rows: RebuildRows) -> RebuildSnapshot {
     let mut snapshot = RebuildSnapshot::default();
-    for row in thread_rows {
-        let thread_id: String = row.get("thread_id");
-        let payload: CognitionThreadData = row_payload(&row)?;
+    for (thread_id, payload) in rows.threads {
         let entry = snapshot
             .threads
             .entry(thread_id)
@@ -1260,94 +1475,53 @@ async fn load_rebuild_snapshot_from_storage(
         entry.turn_count = payload.turn_count.unwrap_or(0);
     }
 
-    for row in client
-        .query(
-            "SELECT context_id, thread_id, payload FROM cognition_contexts ORDER BY updated_at ASC",
-            &[],
-        )
-        .await?
-    {
-        let context_id: String = row.get("context_id");
-        let thread_id: String = row.get("thread_id");
-        let payload: CognitionContextData = row_payload(&row)?;
-        let thread = snapshot
+    for (context_id, thread_id, payload) in rows.contexts {
+        let context = context_state_from_payload(context_id, payload);
+        snapshot
             .threads
             .entry(thread_id)
-            .or_insert_with(ThreadCognitionState::default);
-        thread.contexts.insert(
-            context_id.clone(),
-            context_state_from_payload(context_id, payload),
-        );
+            .or_insert_with(ThreadCognitionState::default)
+            .contexts
+            .insert(context.label.clone(), context);
         snapshot.total_contexts = snapshot.total_contexts.saturating_add(1);
     }
 
-    for row in client
-        .query(
-            "SELECT reason_id, thread_id, payload FROM cognition_reasons ORDER BY updated_at ASC",
-            &[],
-        )
-        .await?
-    {
-        let reason_id: String = row.get("reason_id");
-        let thread_id: String = row.get("thread_id");
-        let payload: CognitionReasonData = row_payload(&row)?;
-        let thread = snapshot
+    for (reason_id, thread_id, payload) in rows.reasons {
+        let reason = reason_state_from_payload(reason_id, payload);
+        snapshot
             .threads
             .entry(thread_id)
-            .or_insert_with(ThreadCognitionState::default);
-        thread.reasons.insert(
-            reason_id.clone(),
-            reason_state_from_payload(reason_id, payload),
-        );
+            .or_insert_with(ThreadCognitionState::default)
+            .reasons
+            .insert(reason.label.clone(), reason);
         snapshot.total_reasons = snapshot.total_reasons.saturating_add(1);
     }
 
-    for row in client
-        .query(
-            "SELECT cooccurrence_id, thread_id, payload FROM cognition_cooccurrences ORDER BY updated_at ASC",
-            &[],
-        )
-        .await?
-    {
-        let cooccurrence_id: String = row.get("cooccurrence_id");
-        let thread_id: String = row.get("thread_id");
-        let payload: CognitionCooccurrenceData = row_payload(&row)?;
-        let thread = snapshot
+    for (cooccurrence_id, thread_id, payload) in rows.cooccurrences {
+        let cooccurrence = cooccurrence_state_from_payload(cooccurrence_id, payload);
+        let pair_key = format!(
+            "{}|{}",
+            cooccurrence.context_label, cooccurrence.reason_label
+        );
+        snapshot
             .threads
             .entry(thread_id)
-            .or_insert_with(ThreadCognitionState::default);
-        thread.cooccurrences.insert(
-            cooccurrence_id.clone(),
-            cooccurrence_state_from_payload(cooccurrence_id, payload),
-        );
+            .or_insert_with(ThreadCognitionState::default)
+            .cooccurrences
+            .insert(pair_key, cooccurrence);
         snapshot.total_cooccurrences = snapshot.total_cooccurrences.saturating_add(1);
     }
 
-    let mut scope_payloads = HashMap::new();
-    for row in client
-        .query(
-            "SELECT scope_id, payload FROM cognition_scopes ORDER BY updated_at ASC",
-            &[],
-        )
-        .await?
-    {
-        let scope_id: String = row.get("scope_id");
-        let payload: CognitionScopeData = row_payload(&row)?;
-        scope_payloads.insert(scope_id, payload);
-    }
+    let scope_payloads: HashMap<String, CognitionScopeData> = rows.scopes.into_iter().collect();
 
     let mut open_scope_instances: HashMap<String, (String, ScopeInstancePayload)> = HashMap::new();
-    for row in client
-        .query(
-            "SELECT scope_instance_id, thread_id, payload FROM cognition_scope_instances ORDER BY updated_at ASC",
-            &[],
-        )
-        .await?
-    {
-        let scope_instance_id: String = row.get("scope_instance_id");
-        let thread_id: String = row.get("thread_id");
-        let payload: ScopeInstancePayload = row_payload(&row)?;
+    let mut thread_scope_instance_ids: HashMap<String, Vec<String>> = HashMap::new();
+    for (scope_instance_id, thread_id, payload) in rows.scope_instances {
         snapshot.total_scopes = snapshot.total_scopes.saturating_add(1);
+        thread_scope_instance_ids
+            .entry(thread_id.clone())
+            .or_default()
+            .push(scope_instance_id.clone());
         if payload.closed_at.is_some() {
             continue;
         }
@@ -1360,50 +1534,45 @@ async fn load_rebuild_snapshot_from_storage(
         }
     }
 
-    for row in client
-        .query(
-            "SELECT memory_id, thread_id, payload FROM cognition_memories ORDER BY updated_at ASC",
-            &[],
-        )
-        .await?
-    {
-        let memory_id: String = row.get("memory_id");
-        let thread_id: String = row.get("thread_id");
-        let payload: CognitionMemoryData = row_payload(&row)?;
-        let thread = snapshot
+    for (memory_id, thread_id, payload) in rows.memories {
+        let memory = memory_state_from_payload(memory_id, payload);
+        snapshot
             .threads
             .entry(thread_id)
-            .or_insert_with(ThreadCognitionState::default);
-        thread.memories.insert(
-            memory_id.clone(),
-            memory_state_from_payload(memory_id, payload),
-        );
+            .or_insert_with(ThreadCognitionState::default)
+            .memories
+            .insert(memory.scope_id.clone(), memory);
         snapshot.total_memories = snapshot.total_memories.saturating_add(1);
     }
 
-    for row in client
-        .query(
-            "SELECT episode_id, thread_id, payload FROM cognition_episodes ORDER BY updated_at ASC",
-            &[],
-        )
-        .await?
-    {
-        let episode_id: String = row.get("episode_id");
-        let thread_id: String = row.get("thread_id");
-        let payload: CognitionEpisodeData = row_payload(&row)?;
-        let thread = snapshot
-            .threads
-            .entry(thread_id.clone())
-            .or_insert_with(ThreadCognitionState::default);
-        let scope_instance_id = open_scope_instances
+    for (episode_id, thread_id, payload) in rows.episodes {
+        // The live path derives an episode id from (thread, scope instance, affect), so the
+        // instance an episode belongs to is the one that reproduces its id.
+        let scope_instance_id = thread_scope_instance_ids
             .get(&thread_id)
-            .map(|(id, _)| id.clone())
-            .unwrap_or_else(|| payload.scope_id.clone().unwrap_or_default());
-        let episode_key = format!("{}|{}", scope_instance_id, payload.affect_id);
-        thread.episodes.insert(
-            episode_key,
-            episode_state_from_payload(episode_id, scope_instance_id, payload),
-        );
+            .and_then(|ids| {
+                ids.iter().find(|id| {
+                    stable_entity_id(
+                        "episode",
+                        &[thread_id.as_str(), id.as_str(), payload.affect_id.as_str()],
+                    ) == episode_id
+                })
+            })
+            .cloned();
+        // Without its instance row the episode keeps its own id as key, which no live turn
+        // produces: it stays visible but is never mistaken for the open instance's episode.
+        let episode_key = match &scope_instance_id {
+            Some(instance_id) => format!("{}|{}", instance_id, payload.affect_id),
+            None => episode_id.clone(),
+        };
+        let episode =
+            episode_state_from_payload(episode_id, scope_instance_id.unwrap_or_default(), payload);
+        snapshot
+            .threads
+            .entry(thread_id)
+            .or_insert_with(ThreadCognitionState::default)
+            .episodes
+            .insert(episode_key, episode);
         snapshot.total_episodes = snapshot.total_episodes.saturating_add(1);
     }
 
@@ -1421,7 +1590,7 @@ async fn load_rebuild_snapshot_from_storage(
         }
     }
 
-    Ok(snapshot)
+    snapshot
 }
 
 fn context_state_from_payload(context_id: String, data: CognitionContextData) -> ContextState {
@@ -1538,8 +1707,13 @@ fn scope_binding_state_from_payload(
         .clone()
         .or_else(|| scope.and_then(|value| value.dominant_reason_id.clone()))
         .unwrap_or_default();
-    let dominant_context = contexts.get(&dominant_context_id)?;
-    let dominant_reason = reasons.get(&dominant_reason_id)?;
+    // The maps are keyed by label (as live); the scope names its dominants by id.
+    let dominant_context = contexts
+        .values()
+        .find(|context| context.context_id == dominant_context_id)?;
+    let dominant_reason = reasons
+        .values()
+        .find(|reason| reason.reason_id == dominant_reason_id)?;
     Some(ScopeBindingState {
         scope_id: instance.scope_id.clone(),
         scope_instance_id: scope_instance_id.to_string(),
@@ -1587,11 +1761,15 @@ fn row_payload<T: for<'de> Deserialize<'de>>(row: &Row) -> Result<T, CognitionEr
 /// `resolve_resource(Postgres)`. Returns `Some(url)` when the postgres
 /// resource is reachable from cognition's (ilk, tenant) pool match.
 /// Credentials + host only; each consumer adds the dbname.
-async fn resolve_storage_database_url(app_state: &CognitionAppState) -> Option<String> {
+async fn resolve_storage_database_url(
+    app_state: &CognitionAppState,
+    wait: VaultWait,
+) -> Option<String> {
     resolve_cognition_resource(
         app_state,
         fluxbee_sdk::ResourceType::Postgres,
         "postgres_url",
+        wait,
     )
     .await
 }
@@ -1603,7 +1781,23 @@ async fn resolve_cognition_ai_api_key(app_state: &CognitionAppState) -> Option<S
         .await
         .semantic_tagger
         .provider;
-    resolve_cognition_resource(app_state, provider.resource_type(), "api_key").await
+    resolve_cognition_resource(
+        app_state,
+        provider.resource_type(),
+        "api_key",
+        VaultWait::Once,
+    )
+    .await
+}
+
+/// Whether a vault lookup waits out a vault that is not reachable yet (as SY.architect,
+/// SY.storage and SY.identity do; FINDINGS A-26).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum VaultWait {
+    /// At boot: retry transport failures for up to `VAULT_BOOT_WAIT`.
+    UntilReachable,
+    /// After boot (a turn, a VAULT_SECRET_CHANGED): the vault is up, ask once.
+    Once,
 }
 
 /// Discover the named resource via the shared `VaultClient` (Model D' pool
@@ -1613,16 +1807,31 @@ async fn resolve_cognition_resource(
     app_state: &CognitionAppState,
     resource: fluxbee_sdk::ResourceType,
     nested_field: &str,
+    wait: VaultWait,
 ) -> Option<String> {
     let resource_label = resource.as_str().to_string();
-    let result = app_state
-        .vault
-        .resolve_resource(
-            resource,
-            fluxbee_sdk::DEFAULT_ROOT_TENANT_ID,
-            Duration::from_secs(5),
-        )
-        .await;
+    let tenant = fluxbee_sdk::DEFAULT_ROOT_TENANT_ID;
+    let timeout = Duration::from_secs(5);
+    let result = match wait {
+        VaultWait::UntilReachable => {
+            app_state
+                .vault
+                .resolve_resource_awaiting_vault(
+                    resource,
+                    tenant,
+                    timeout,
+                    fluxbee_sdk::VAULT_BOOT_WAIT,
+                    &app_state.node_name,
+                )
+                .await
+        }
+        VaultWait::Once => {
+            app_state
+                .vault
+                .resolve_resource(resource, tenant, timeout)
+                .await
+        }
+    };
     match result {
         Ok(Some(value)) => {
             if let Some(s) = value.as_str().map(str::trim).filter(|v| !v.is_empty()) {
@@ -1905,8 +2114,9 @@ fn build_memory_package_for_thread(
 /// Handle `VAULT_SECRET_CHANGED` for cognition. Both cognition resources
 /// (openai for semantic tagger, postgres for rebuild) are resolved lazily
 /// per-call, so the reaction is simply to probe the new value and update
-/// the in-memory `ai_secret_source` flag for openai. Postgres is consulted
-/// fresh on the next rebuild attempt — no state to update here.
+/// the in-memory flags (`ai_secret_source`, `storage_db_configured`). The rebuild
+/// itself is not run from here: it would race the turn loop, so a rebuild the
+/// startup could not load is retried by the first turn instead.
 async fn handle_vault_secret_changed_cognition(msg: &Message, app_state: &CognitionAppState) {
     tracing::info!(
         node_name = %app_state.node_name,
@@ -1977,13 +2187,17 @@ async fn handle_vault_secret_changed_cognition(msg: &Message, app_state: &Cognit
         }
     }
     if matched_postgres {
-        // Postgres for cognition is consulted lazily during rebuild; nothing
-        // to update in-memory. Log the event so operators can correlate.
+        let configured = resolve_storage_database_url(app_state, VaultWait::Once)
+            .await
+            .is_some();
+        app_state.runtime_state.lock().await.storage_db_configured = Some(configured);
         tracing::info!(
             node_name = %app_state.node_name,
             op = %payload.op.as_str(),
             version = payload.version,
-            "VAULT_SECRET_CHANGED (postgres) matches; next rebuild will use fresh value"
+            configured,
+            rebuild_owed = app_state.rebuild_owed.load(Ordering::SeqCst),
+            "VAULT_SECRET_CHANGED (postgres) matches; an owed cold-start rebuild runs before the next turn"
         );
     }
 }
@@ -2252,10 +2466,10 @@ fn build_cognition_config_get_payload(
         {
             "resource_type": "postgres",
             "required": false,
-            "configured": null,
+            "configured": runtime_state.storage_db_configured,
             "scope": "pool (tenant or root)",
-            "consumer_dbname": "fluxbee_storage",
-            "purpose": "cognition rebuild snapshot from storage durable tables (probed on demand)"
+            "consumer_dbname": STORAGE_DB_NAME,
+            "purpose": "cognition cold-start rebuild from storage durable tables"
         }
     ]);
 
@@ -2277,7 +2491,11 @@ fn build_cognition_config_get_payload(
                 .to_string(),
         ),
         Value::String(
-            "Cold start rebuild from durable storage is attempted only when local cognition state is empty; when storage durable is unavailable the node stays fail-open and continues live."
+            "Cold start rebuild from durable storage only fills an empty local state. At startup its postgres lookup waits for the vault; if it still cannot load, the first turn retries it once, then the node stays fail-open and continues live."
+                .to_string(),
+        ),
+        Value::String(
+            "config.storage.db_configured reports whether storage's postgres resolved from the vault at the last lookup (null: not looked up yet); derived entities are published to storage.cognition.* either way."
                 .to_string(),
         ),
     ];
@@ -2296,7 +2514,7 @@ fn build_cognition_config_get_payload(
         },
         "storage": {
             "write_subject_prefix": "storage.cognition",
-            "enabled": true,
+            "db_configured": runtime_state.storage_db_configured,
             "resolved_from": "vault://resource_type=postgres"
         },
         "ai": {
@@ -2780,7 +2998,7 @@ fn extract_turn_text(payload: &Value) -> Option<String> {
         .filter(|value| !value.is_empty())
 }
 
-async fn update_thread_state_and_build_envelopes(
+async fn update_thread_state_and_build_envelopes<S: NarrativeSummarizer>(
     hive_id: &str,
     writer: &str,
     thread_id: &str,
@@ -2794,6 +3012,7 @@ async fn update_thread_state_and_build_envelopes(
     semantic_tagger_config: &CognitionSemanticTaggerConfig,
     ts: &str,
     thread_state: &mut ThreadCognitionState,
+    narrative: &S,
 ) -> ThreadUpdateResult {
     if thread_state.first_seen_at.is_none() {
         thread_state.first_seen_at = Some(ts.to_string());
@@ -2882,6 +3101,7 @@ async fn update_thread_state_and_build_envelopes(
         &thread_state.active_scope,
         &mut thread_state.memories,
         &mut thread_state.episodes,
+        narrative,
     )
     .await;
     out.extend(memory_episode_result.envelopes);
@@ -3424,10 +3644,19 @@ fn update_scope_binding_for_thread(
     active_scope: &mut Option<ScopeBindingState>,
 ) -> Vec<(&'static str, Vec<u8>)> {
     let mut out = Vec::new();
-    let Some(context) = select_dominant_context(contexts) else {
+    // On a weight tie the scope's own context/reason stays dominant. HashMap order used to
+    // pick one, so a tag reinforced together with the incumbent could pose as a topic change.
+    let incumbent = active_scope.as_ref();
+    let Some(context) = select_dominant_context(
+        contexts,
+        incumbent.map(|scope| scope.dominant_context_id.as_str()),
+    ) else {
         return out;
     };
-    let Some(reason) = select_dominant_reason(reasons) else {
+    let Some(reason) = select_dominant_reason(
+        reasons,
+        incumbent.map(|scope| scope.dominant_reason_id.as_str()),
+    ) else {
         return out;
     };
 
@@ -3506,6 +3735,15 @@ fn update_scope_binding_for_thread(
                     hive_id, writer, thread_id, ts, thread_seq, &opened,
                 ));
                 *scope = opened;
+            } else if candidate_shift && binding < COGNITION_SCOPE_UNBIND_THRESHOLD {
+                // The candidate does not bind to this scope: the shift is pending. The scope
+                // keeps its own context/reason so the next turns keep measuring the divergence
+                // until the sustain count cuts it (§3.2, §7.2). Relabeling here reset the
+                // streak, so a lasting topic change renamed the scope instead of cutting it.
+                scope.last_seen_at = ts.to_string();
+                out.extend(build_scope_upsert_events(
+                    hive_id, writer, thread_id, ts, thread_seq, scope,
+                ));
             } else {
                 scope.label = current_label;
                 scope.dominant_context_id = context.context_id.clone();
@@ -3526,7 +3764,7 @@ fn update_scope_binding_for_thread(
     out
 }
 
-async fn update_memories_and_episodes_for_thread(
+async fn update_memories_and_episodes_for_thread<S: NarrativeSummarizer>(
     hive_id: &str,
     writer: &str,
     thread_id: &str,
@@ -3541,6 +3779,7 @@ async fn update_memories_and_episodes_for_thread(
     active_scope: &Option<ScopeBindingState>,
     memories: &mut HashMap<String, MemoryState>,
     episodes: &mut HashMap<String, EpisodeState>,
+    narrative: &S,
 ) -> ThreadUpdateResult {
     let mut out = Vec::new();
     let Some(scope) = active_scope.as_ref() else {
@@ -3553,14 +3792,14 @@ async fn update_memories_and_episodes_for_thread(
         return ThreadUpdateResult::default();
     };
 
-    let episode_candidate = build_episode_candidate(tagger, context, reason);
+    let episode_candidate = build_episode_candidate(tagger, context);
     let episode_existing = episode_candidate.as_ref().and_then(|candidate| {
         let episode_key = format!("{}|{}", scope.scope_instance_id, candidate.affect_id);
         episodes.get(&episode_key)
     });
 
-    let narrative_result = match run_narrative_summarizer_ai(
-        narrative_summarizer_ai::NarrativeSummarizerAiInput {
+    let narrative_result = match narrative
+        .summarize(NarrativeSummarizerAiInput {
             api_key,
             config: semantic_tagger_config,
             thread_id,
@@ -3574,9 +3813,8 @@ async fn update_memories_and_episodes_for_thread(
             episode_title: episode_candidate.as_ref().map(|c| c.title.as_str()),
             previous_episode_summary: episode_existing.map(|episode| episode.summary.as_str()),
             previous_episode_reason: episode_existing.map(|episode| episode.reason.as_str()),
-        },
-    )
-    .await
+        })
+        .await
     {
         Ok(value) => value,
         Err(err) => {
@@ -3619,18 +3857,24 @@ async fn update_memories_and_episodes_for_thread(
         &current_ilk_weights,
         memories,
     ));
-    out.extend(update_episodes_for_thread(
-        hive_id,
-        writer,
-        thread_id,
-        ts,
-        episode_candidate,
-        &narrative_result,
-        scope,
-        context,
-        reason,
-        episodes,
-    ));
+    // The summarizer must return the episode text whenever a candidate was sent (else the
+    // call fails above), so an episode is the candidate's gate fields plus the AI's text.
+    if let Some((candidate, episode_narrative)) =
+        episode_candidate.zip(narrative_result.episode.as_ref())
+    {
+        out.extend(update_episodes_for_thread(
+            hive_id,
+            writer,
+            thread_id,
+            ts,
+            candidate,
+            episode_narrative,
+            scope,
+            context,
+            reason,
+            episodes,
+        ));
+    }
     ThreadUpdateResult {
         envelopes: out,
         narrative: NarrativeOutcome {
@@ -3743,26 +3987,14 @@ fn update_episodes_for_thread(
     writer: &str,
     thread_id: &str,
     ts: &str,
-    episode_candidate: Option<EpisodeCandidate>,
-    narrative_result: &narrative_summarizer_ai::NarrativeSummaries,
+    candidate: EpisodeCandidate,
+    episode_narrative: &EpisodeNarrative,
     scope: &ScopeBindingState,
     context: &ContextState,
     reason: &ReasonState,
     episodes: &mut HashMap<String, EpisodeState>,
 ) -> Vec<(&'static str, Vec<u8>)> {
     let mut out = Vec::new();
-    let Some(mut candidate) = episode_candidate else {
-        return out;
-    };
-    candidate.summary = narrative_result
-        .episode_summary
-        .clone()
-        .unwrap_or(candidate.summary);
-    candidate.reason = narrative_result
-        .episode_reason
-        .clone()
-        .unwrap_or(candidate.reason);
-
     let episode_key = format!("{}|{}", scope.scope_instance_id, candidate.affect_id);
     let episode = episodes.entry(episode_key).or_insert_with(|| EpisodeState {
         episode_id: stable_entity_id(
@@ -3773,25 +4005,25 @@ fn update_episodes_for_thread(
         scope_instance_id: scope.scope_instance_id.clone(),
         affect_id: candidate.affect_id.clone(),
         title: candidate.title.clone(),
-        summary: candidate.summary.clone(),
+        summary: episode_narrative.summary.clone(),
         base_intensity: candidate.base_intensity,
         evidence_strength: candidate.evidence_strength,
         evidence_context_ids: vec![context.context_id.clone()],
         evidence_reason_ids: vec![reason.reason_id.clone()],
         evidence_signals: candidate.evidence_signals.clone(),
         intensity: candidate.base_intensity,
-        reason: candidate.reason.clone(),
+        reason: episode_narrative.reason.clone(),
         created_at: ts.to_string(),
     });
 
     episode.scope_id = scope.scope_id.clone();
     episode.scope_instance_id = scope.scope_instance_id.clone();
     episode.title = candidate.title.clone();
-    episode.summary = candidate.summary.clone();
+    episode.summary = episode_narrative.summary.clone();
     episode.base_intensity = episode.base_intensity.max(candidate.base_intensity);
     episode.evidence_strength = episode.evidence_strength.max(candidate.evidence_strength);
     episode.intensity = episode.intensity.max(candidate.base_intensity);
-    episode.reason = candidate.reason.clone();
+    episode.reason = episode_narrative.reason.clone();
     for context_id in [context.context_id.clone()] {
         if !episode.evidence_context_ids.contains(&context_id) {
             episode.evidence_context_ids.push(context_id);
@@ -3838,26 +4070,11 @@ fn update_episodes_for_thread(
     out
 }
 
-fn summarize_scope_memory(
-    context: &ContextState,
-    reason: &ReasonState,
-    reason_signals_extra: &[String],
-) -> String {
-    let mut summary = format!(
-        "The thread recurrently centers on {} with a dominant drive of {}.",
-        context.label, reason.label
-    );
-    if let Some(evidence_clause) = build_reason_signals_extra_clause(reason_signals_extra) {
-        summary.push(' ');
-        summary.push_str(&evidence_clause);
-    }
-    summary
-}
-
+/// The deterministic episode gate: an affect fires only on these canonical + extra signal
+/// combinations. The summary and reason are the narrative summarizer's.
 fn build_episode_candidate(
     tagger: &SemanticTaggerOutput,
     context: &ContextState,
-    reason: &ReasonState,
 ) -> Option<EpisodeCandidate> {
     let extra_signals: HashSet<&str> = tagger
         .reason_signals_extra
@@ -3872,24 +4089,15 @@ fn build_episode_candidate(
 
     let mut affect_id = None;
     let mut title = String::new();
-    let mut summary = String::new();
-    let mut reason_text = String::new();
     let mut evidence_signals = Vec::new();
     let mut base_intensity = 0.0;
     let mut evidence_strength = 0.0;
-    let narrative_clause = build_reason_signals_extra_clause(&tagger.reason_signals_extra);
 
     if extra_signals.contains("frustration")
         && (canonical_signals.contains("challenge") || canonical_signals.contains("resolve"))
     {
         affect_id = Some("anger".to_string());
         title = format!("Friction around {}", context.label);
-        summary = format!(
-            "Strong friction emerged around {} with the drive of {}.",
-            context.label, reason.label
-        );
-        reason_text =
-            "Frustration aligned with a confrontational or urgent resolution drive".to_string();
         evidence_signals.extend(["frustration".to_string(), "challenge".to_string()]);
         base_intensity = 8.0;
         evidence_strength = 9.0;
@@ -3898,11 +4106,6 @@ fn build_episode_candidate(
     {
         affect_id = Some("escalation".to_string());
         title = format!("Escalation around {}", context.label);
-        summary = format!(
-            "Escalation pressure appeared around {} with the drive of {}.",
-            context.label, reason.label
-        );
-        reason_text = "Escalation signal with protective or confrontational framing".to_string();
         evidence_signals.extend(["escalation".to_string(), "protect".to_string()]);
         base_intensity = 8.0;
         evidence_strength = 9.0;
@@ -3912,12 +4115,6 @@ fn build_episode_candidate(
     {
         affect_id = Some("urgency".to_string());
         title = format!("Urgent push on {}", context.label);
-        summary = format!(
-            "Urgent pressure formed around {} while seeking {}.",
-            context.label, reason.label
-        );
-        reason_text =
-            "Urgency combined with explicit assistance and resolution seeking".to_string();
         evidence_signals.extend([
             "urgency".to_string(),
             "request".to_string(),
@@ -3933,76 +4130,13 @@ fn build_episode_candidate(
         return None;
     }
 
-    if let Some(clause) = narrative_clause {
-        summary.push(' ');
-        summary.push_str(&clause);
-        reason_text.push_str(". ");
-        reason_text.push_str(&clause);
-    }
-
     Some(EpisodeCandidate {
         affect_id: affect_id?,
         title,
-        summary,
         base_intensity,
         evidence_strength,
         evidence_signals,
-        reason: reason_text,
     })
-}
-
-fn build_reason_signals_extra_clause(reason_signals_extra: &[String]) -> Option<String> {
-    let normalized = dedup_reason_signal_extras(reason_signals_extra);
-    if normalized.is_empty() {
-        return None;
-    }
-    let descriptors = normalized
-        .iter()
-        .filter_map(|signal| match signal.as_str() {
-            "urgency" => Some("clear urgency"),
-            "frustration" => Some("visible frustration"),
-            "gratitude" => Some("moments of gratitude"),
-            "confusion" => Some("signs of confusion"),
-            "escalation" => Some("escalation pressure"),
-            _ => None,
-        })
-        .collect::<Vec<_>>();
-    if descriptors.is_empty() {
-        return None;
-    }
-    Some(format!(
-        "Narrative evidence includes {}.",
-        join_human_list(&descriptors)
-    ))
-}
-
-fn dedup_reason_signal_extras(reason_signals_extra: &[String]) -> Vec<String> {
-    let mut seen = HashSet::new();
-    let mut out = Vec::new();
-    for signal in reason_signals_extra {
-        let normalized = signal.trim().to_lowercase();
-        if normalized.is_empty() {
-            continue;
-        }
-        if seen.insert(normalized.clone()) {
-            out.push(normalized);
-        }
-    }
-    out
-}
-
-fn join_human_list(values: &[&str]) -> String {
-    match values.len() {
-        0 => String::new(),
-        1 => values[0].to_string(),
-        2 => format!("{} and {}", values[0], values[1]),
-        _ => {
-            let mut out = values[..values.len() - 1].join(", ");
-            out.push_str(", and ");
-            out.push_str(values[values.len() - 1]);
-            out
-        }
-    }
 }
 
 fn build_scope_upsert_events(
@@ -4119,20 +4253,47 @@ fn build_scope_close_events(
 
 fn select_dominant_context<'a>(
     contexts: &'a HashMap<String, ContextState>,
+    incumbent_id: Option<&str>,
 ) -> Option<&'a ContextState> {
     contexts
         .values()
         .filter(|context| context.status == "open")
-        .max_by(|left, right| left.weight.total_cmp(&right.weight))
+        .max_by(|left, right| {
+            dominance_order(
+                (left.weight, &left.context_id, &left.label),
+                (right.weight, &right.context_id, &right.label),
+                incumbent_id,
+            )
+        })
 }
 
 fn select_dominant_reason<'a>(
     reasons: &'a HashMap<String, ReasonState>,
+    incumbent_id: Option<&str>,
 ) -> Option<&'a ReasonState> {
     reasons
         .values()
         .filter(|reason| reason.status == "open")
-        .max_by(|left, right| left.weight.total_cmp(&right.weight))
+        .max_by(|left, right| {
+            dominance_order(
+                (left.weight, &left.reason_id, &left.label),
+                (right.weight, &right.reason_id, &right.label),
+                incumbent_id,
+            )
+        })
+}
+
+/// Higher weight dominates. On a tie the incumbent (the active scope's own entity) keeps it,
+/// then the smaller label: deterministic, where HashMap order used to decide.
+fn dominance_order(
+    (left_weight, left_id, left_label): (f64, &str, &str),
+    (right_weight, right_id, right_label): (f64, &str, &str),
+    incumbent_id: Option<&str>,
+) -> std::cmp::Ordering {
+    left_weight
+        .total_cmp(&right_weight)
+        .then_with(|| (Some(left_id) == incumbent_id).cmp(&(Some(right_id) == incumbent_id)))
+        .then_with(|| right_label.cmp(left_label))
 }
 
 fn current_turn_ilk_weights(src_ilk: Option<&str>, dst_ilk: Option<&str>) -> BTreeMap<String, f64> {
@@ -4303,94 +4464,469 @@ fn write_json_atomic(path: &Path, body: &str) -> Result<(), CognitionError> {
 mod tests {
     use super::*;
 
-    #[test]
-    fn summarize_scope_memory_includes_reason_signal_evidence_clause() {
-        let context = ContextState {
-            context_id: "context:1".to_string(),
-            label: "billing".to_string(),
-            tags: vec!["billing".to_string()],
-            weight: 1.0,
-            weight_avg_cumulative: 1.0,
-            weight_avg_ema: 1.0,
-            weight_samples: 1,
-            ilk_weights: BTreeMap::new(),
-            ilk_profile: BTreeMap::new(),
-            opened_at: "2026-01-01T00:00:00Z".to_string(),
-            last_seen_at: "2026-01-01T00:00:00Z".to_string(),
-            closed_at: None,
-            status: "open".to_string(),
-        };
-        let reason = ReasonState {
-            reason_id: "reason:1".to_string(),
-            label: "seeking urgent resolution".to_string(),
-            signals_canonical: vec!["resolve".to_string(), "challenge".to_string()],
-            signals_extra: vec!["urgency".to_string(), "frustration".to_string()],
-            weight: 1.0,
-            weight_avg_cumulative: 1.0,
-            weight_avg_ema: 1.0,
-            weight_samples: 1,
-            ilk_weights: BTreeMap::new(),
-            ilk_profile: BTreeMap::new(),
-            opened_at: "2026-01-01T00:00:00Z".to_string(),
-            last_seen_at: "2026-01-01T00:00:00Z".to_string(),
-            closed_at: None,
-            status: "open".to_string(),
-        };
+    const TEST_THREAD: &str = "thread:sha256:test";
 
-        let summary = summarize_scope_memory(
-            &context,
-            &reason,
-            &["urgency".to_string(), "frustration".to_string()],
+    /// Answers like the AI does, from the input: memory text always, episode text exactly when
+    /// the turn carries an episode candidate (the contract `parse_narrative_summaries` enforces).
+    struct CannedNarrative;
+
+    impl NarrativeSummarizer for CannedNarrative {
+        fn summarize<'a>(
+            &'a self,
+            input: NarrativeSummarizerAiInput<'a>,
+        ) -> impl Future<Output = Result<NarrativeSummaries, fluxbee_ai_sdk::AiSdkError>> + Send + 'a
+        {
+            let memory_summary = format!(
+                "Memory of {} driven by {}.",
+                input.context_label, input.reason_label
+            );
+            let episode = input.episode_affect_id.map(|affect| EpisodeNarrative {
+                summary: format!("AI episode summary ({affect})."),
+                reason: format!("AI episode reason ({affect})."),
+            });
+            async move {
+                Ok(NarrativeSummaries {
+                    memory_summary,
+                    episode,
+                })
+            }
+        }
+    }
+
+    fn strings(values: &[&str]) -> Vec<String> {
+        values.iter().map(|value| value.to_string()).collect()
+    }
+
+    /// One turn through the live path, with a canned narrative instead of the AI.
+    async fn live_turn(
+        thread: &mut ThreadCognitionState,
+        seq: u64,
+        tags: &[&str],
+        canonical: &[&str],
+        extra: &[&str],
+    ) -> Vec<(&'static str, Vec<u8>)> {
+        let tagger = SemanticTaggerOutput {
+            tags: strings(tags),
+            reason_signals_canonical: strings(canonical),
+            reason_signals_extra: strings(extra),
+        };
+        let ts = format!("2026-01-01T{:02}:{:02}:00Z", seq / 60, seq % 60);
+        update_thread_state_and_build_envelopes(
+            "motherbee",
+            "SY.cognition@motherbee",
+            TEST_THREAD,
+            Some(seq),
+            Some("ilk:juan"),
+            Some("ilk:agent"),
+            Some("ich:test"),
+            &tagger,
+            &CognitionThresholds::default(),
+            "test-key",
+            &CognitionSemanticTaggerConfig::default(),
+            &ts,
+            thread,
+            &CannedNarrative,
+        )
+        .await
+        .envelopes
+    }
+
+    fn envelopes_of(
+        out: &[(&'static str, Vec<u8>)],
+        subject: &str,
+    ) -> Vec<CognitionDurableEnvelope<Value>> {
+        out.iter()
+            .filter(|(published_to, _)| *published_to == subject)
+            .map(|(_, body)| serde_json::from_slice(body).expect("envelope"))
+            .collect()
+    }
+
+    fn closed_scope_ids(out: &[(&'static str, Vec<u8>)]) -> Vec<String> {
+        envelopes_of(out, SUBJECT_STORAGE_COGNITION_SCOPES)
+            .into_iter()
+            .filter(|envelope| envelope.op == CognitionDurableOp::Close)
+            .map(|envelope| envelope.entity_id)
+            .collect()
+    }
+
+    fn sorted_keys<V>(map: &HashMap<String, V>) -> Vec<String> {
+        let mut keys: Vec<String> = map.keys().cloned().collect();
+        keys.sort();
+        keys
+    }
+
+    /// What SY.storage keeps of the published envelopes: one row per entity id, last write
+    /// wins, in `updated_at` order (`persist_cognition_*`).
+    fn durable_rows(published: &[(&'static str, Vec<u8>)]) -> RebuildRows {
+        let mut tables: HashMap<&str, Vec<(String, String, Value)>> = HashMap::new();
+        for (subject, body) in published {
+            let envelope: CognitionDurableEnvelope<Value> =
+                serde_json::from_slice(body).expect("envelope");
+            let table = tables.entry(*subject).or_default();
+            table.retain(|(entity_id, _, _)| *entity_id != envelope.entity_id);
+            table.push((
+                envelope.entity_id,
+                envelope.thread_id.unwrap_or_default(),
+                envelope.data,
+            ));
+        }
+        fn rows<T: serde::de::DeserializeOwned>(
+            tables: &HashMap<&str, Vec<(String, String, Value)>>,
+            subject: &str,
+        ) -> Vec<(String, String, T)> {
+            tables
+                .get(subject)
+                .into_iter()
+                .flatten()
+                .map(|(entity_id, thread_id, data)| {
+                    let payload = serde_json::from_value(data.clone()).expect("payload");
+                    (entity_id.clone(), thread_id.clone(), payload)
+                })
+                .collect()
+        }
+        RebuildRows {
+            threads: rows(&tables, SUBJECT_STORAGE_COGNITION_THREADS)
+                .into_iter()
+                .map(|(thread_id, _, payload)| (thread_id, payload))
+                .collect(),
+            contexts: rows(&tables, SUBJECT_STORAGE_COGNITION_CONTEXTS),
+            reasons: rows(&tables, SUBJECT_STORAGE_COGNITION_REASONS),
+            cooccurrences: rows(&tables, SUBJECT_STORAGE_COGNITION_COOCCURRENCES),
+            scopes: rows(&tables, SUBJECT_STORAGE_COGNITION_SCOPES)
+                .into_iter()
+                .map(|(scope_id, _, payload)| (scope_id, payload))
+                .collect(),
+            scope_instances: rows(&tables, SUBJECT_STORAGE_COGNITION_SCOPE_INSTANCES),
+            memories: rows(&tables, SUBJECT_STORAGE_COGNITION_MEMORIES),
+            episodes: rows(&tables, SUBJECT_STORAGE_COGNITION_EPISODES),
+        }
+    }
+
+    fn context_state(label: &str) -> ContextState {
+        ContextState {
+            context_id: format!("context:{label}"),
+            label: label.to_string(),
+            weight: 1.0,
+            weight_avg_cumulative: 1.0,
+            weight_avg_ema: 1.0,
+            weight_samples: 1,
+            tags: vec![label.to_string()],
+            ilk_weights: BTreeMap::new(),
+            ilk_profile: BTreeMap::new(),
+            opened_at: "2026-01-01T00:00:00Z".to_string(),
+            last_seen_at: "2026-01-01T00:00:00Z".to_string(),
+            closed_at: None,
+            status: "open".to_string(),
+        }
+    }
+
+    /// A restart (durable rows, then rebuild) must leave state the next live turn continues.
+    /// Keyed by entity id, the rebuild made every lookup of that turn miss: it re-created
+    /// each context, reason, co-occurrence, memory and episode from zero, under the same id,
+    /// next to the rebuilt one.
+    #[tokio::test]
+    async fn rebuild_keys_state_like_the_live_path() {
+        let turn = (
+            &["billing"][..],
+            &["resolve", "challenge"][..],
+            &["frustration"][..],
         );
-        assert!(summary.contains("Narrative evidence includes"));
-        assert!(summary.contains("clear urgency"));
-        assert!(summary.contains("visible frustration"));
+        let mut reference = ThreadCognitionState::default();
+        let mut published = Vec::new();
+        for seq in 1..=3 {
+            published.extend(live_turn(&mut reference, seq, turn.0, turn.1, turn.2).await);
+        }
+
+        let snapshot = build_rebuild_snapshot(durable_rows(&published));
+        let mut rebuilt = snapshot
+            .threads
+            .get(TEST_THREAD)
+            .cloned()
+            .expect("thread rebuilt");
+        let scope = rebuilt.active_scope.clone().expect("open scope rebuilt");
+        assert_eq!(
+            Some(&scope.scope_id),
+            reference.active_scope.as_ref().map(|open| &open.scope_id)
+        );
+        assert!(rebuilt.contexts.contains_key(&scope.dominant_context_label));
+        assert!(rebuilt.reasons.contains_key(&scope.dominant_reason_label));
+        assert!(rebuilt.memories.contains_key(&scope.scope_id));
+        assert!(!rebuilt.episodes.is_empty());
+
+        live_turn(&mut reference, 4, turn.0, turn.1, turn.2).await;
+        live_turn(&mut rebuilt, 4, turn.0, turn.1, turn.2).await;
+
+        assert_eq!(
+            sorted_keys(&rebuilt.contexts),
+            sorted_keys(&reference.contexts)
+        );
+        assert_eq!(
+            sorted_keys(&rebuilt.reasons),
+            sorted_keys(&reference.reasons)
+        );
+        assert_eq!(
+            sorted_keys(&rebuilt.cooccurrences),
+            sorted_keys(&reference.cooccurrences)
+        );
+        assert_eq!(
+            sorted_keys(&rebuilt.memories),
+            sorted_keys(&reference.memories)
+        );
+        assert_eq!(
+            sorted_keys(&rebuilt.episodes),
+            sorted_keys(&reference.episodes)
+        );
+        // Continued, not re-created: four samples and the same accumulated weight.
+        let billing = &rebuilt.contexts["billing"];
+        assert_eq!(billing.weight_samples, 4);
+        assert!((billing.weight - reference.contexts["billing"].weight).abs() < 1e-9);
+        assert_eq!(rebuilt.memories[&scope.scope_id].occurrences, 4);
+        assert_eq!(
+            rebuilt.active_scope.as_ref().map(|open| &open.scope_id),
+            Some(&scope.scope_id)
+        );
+        // No entity lives twice in a map.
+        let unique = |ids: Vec<&String>| ids.iter().collect::<HashSet<_>>().len() == ids.len();
+        assert!(unique(
+            rebuilt.contexts.values().map(|c| &c.context_id).collect()
+        ));
+        assert!(unique(
+            rebuilt.reasons.values().map(|r| &r.reason_id).collect()
+        ));
+        assert!(unique(
+            rebuilt
+                .cooccurrences
+                .values()
+                .map(|c| &c.cooccurrence_id)
+                .collect()
+        ));
+        assert!(unique(
+            rebuilt.memories.values().map(|m| &m.memory_id).collect()
+        ));
+        assert!(unique(
+            rebuilt.episodes.values().map(|e| &e.episode_id).collect()
+        ));
+    }
+
+    /// A snapshot only fills an empty state; one that finished loading after a turn built
+    /// state must not overwrite it.
+    #[test]
+    fn rebuild_installs_only_into_an_empty_state() {
+        let mut snapshot_threads = HashMap::new();
+        snapshot_threads.insert(
+            "thread:durable".to_string(),
+            ThreadCognitionState::default(),
+        );
+
+        let mut live = HashMap::new();
+        live.insert("thread:live".to_string(), ThreadCognitionState::default());
+        assert!(!install_rebuild_snapshot(
+            &mut live,
+            snapshot_threads.clone()
+        ));
+        assert_eq!(sorted_keys(&live), vec!["thread:live".to_string()]);
+
+        let mut empty = HashMap::new();
+        assert!(install_rebuild_snapshot(&mut empty, snapshot_threads));
+        assert_eq!(sorted_keys(&empty), vec!["thread:durable".to_string()]);
+    }
+
+    /// Live state follows the rebuild's retention rule: a thread outside the jsr-memory hot
+    /// set leaves local state too, so memory stays bounded by the SHM capacity.
+    #[test]
+    fn live_state_keeps_only_the_jsr_memory_hot_set() {
+        // Five threads of a fifth of the region each cannot all fit with the JSON framing.
+        let mut threads = HashMap::new();
+        for index in 0..5u8 {
+            let scope_id = format!("scope:{index}");
+            let mut thread = ThreadCognitionState {
+                last_seen_at: Some(format!("2026-01-01T00:00:0{index}Z")),
+                turn_count: 1,
+                ..ThreadCognitionState::default()
+            };
+            thread.memories.insert(
+                scope_id.clone(),
+                MemoryState {
+                    memory_id: format!("memory:{index}"),
+                    scope_id,
+                    summary: "x".repeat(MEMORY_MAX_DATA_SIZE / 5),
+                    weight: 1.0,
+                    occurrences: 1,
+                    dominant_context_id: String::new(),
+                    dominant_reason_id: String::new(),
+                    ilk_weights: BTreeMap::new(),
+                    created_at: String::new(),
+                    last_seen_at: String::new(),
+                },
+            );
+            threads.insert(format!("thread:{index}"), thread);
+        }
+
+        let hot_set = retain_memory_hot_set(&mut threads).expect("hot set");
+        assert_eq!(hot_set.stats.pruned_threads_total, 1);
+        assert_eq!(threads.len() as u64, hot_set.stats.selected_threads_total);
+        // Same live entities everywhere, so recency decides: the oldest thread goes.
+        assert!(!threads.contains_key("thread:0"));
+        assert!(threads
+            .keys()
+            .all(|thread_id| hot_set.selected_thread_ids.contains(thread_id)));
+    }
+
+    /// §3.2/§7.2: a lasting change of topic and drive cuts the scope once the shift is
+    /// sustained. The scope used to adopt the new topic on the first divergent turn, which
+    /// reset the unbind streak, so it was renamed instead of cut.
+    #[tokio::test]
+    async fn a_sustained_topic_change_cuts_the_scope() {
+        let mut thread = ThreadCognitionState::default();
+        for seq in 1..=3 {
+            live_turn(&mut thread, seq, &["billing"], &["inform"], &[]).await;
+        }
+        let first = thread.active_scope.clone().expect("scope opened");
+        assert_eq!(first.dominant_context_label, "billing");
+
+        let mut cut_at = None;
+        for seq in 4..=20 {
+            let out = live_turn(&mut thread, seq, &["shipping"], &["protect"], &[]).await;
+            let scope = thread.active_scope.as_ref().expect("scope");
+            if closed_scope_ids(&out).contains(&first.scope_id) {
+                assert_ne!(scope.scope_id, first.scope_id);
+                assert_eq!(scope.dominant_context_label, "shipping");
+                assert_eq!(scope.dominant_reason_label, "risk containment");
+                cut_at = Some(seq);
+                break;
+            }
+            // Until the cut the scope keeps its identity and its anchor.
+            assert_eq!(scope.scope_id, first.scope_id);
+            assert_eq!(scope.dominant_context_label, "billing");
+            assert_eq!(scope.dominant_reason_label, "information exchange");
+        }
+        let cut_at = cut_at.expect("a sustained topic change must cut the scope");
+        // Not on the first divergent turns: the shift has to be sustained.
+        assert!(cut_at > 4 + u64::from(COGNITION_SCOPE_SUSTAIN_COUNT));
+    }
+
+    /// Tags told together tie on weight. The scope's own context keeps a tie, so a tag
+    /// reinforced with it never poses as a topic change, however the map is laid out.
+    #[tokio::test]
+    async fn co_reinforced_tags_keep_the_scope() {
+        let tags = [
+            "billing",
+            "refund",
+            "invoice",
+            "charge",
+            "card",
+            "bank",
+            "statement",
+            "fee",
+            "receipt",
+            "account",
+        ];
+        let mut thread = ThreadCognitionState::default();
+        live_turn(&mut thread, 1, &tags[..2], &["inform"], &[]).await;
+        let first = thread.active_scope.clone().expect("scope opened");
+        for seq in 2..=12u64 {
+            // The same two tags every turn, plus new ones that keep growing the map.
+            let told = &tags[..(seq as usize).min(tags.len())];
+            let out = live_turn(&mut thread, seq, told, &["inform"], &[]).await;
+            assert!(closed_scope_ids(&out).is_empty());
+            let scope = thread.active_scope.as_ref().expect("scope");
+            assert_eq!(scope.scope_id, first.scope_id);
+            assert_eq!(scope.dominant_context_label, first.dominant_context_label);
+        }
+    }
+
+    /// What ships for an episode: the gate's affect, title, intensity and evidence, and the
+    /// summarizer's summary and reason. The summarizer must return both whenever there is a
+    /// candidate, so there is no deterministic text behind them.
+    #[tokio::test]
+    async fn an_episode_ships_the_gate_fields_and_the_narrative_text() {
+        let mut thread = ThreadCognitionState::default();
+        let out = live_turn(
+            &mut thread,
+            1,
+            &["billing"],
+            &["resolve", "challenge"],
+            &["frustration"],
+        )
+        .await;
+        let episodes = envelopes_of(&out, SUBJECT_STORAGE_COGNITION_EPISODES);
+        assert_eq!(episodes.len(), 1);
+        let episode: CognitionEpisodeData =
+            serde_json::from_value(episodes[0].data.clone()).expect("episode data");
+        assert_eq!(episode.affect_id, "anger");
+        assert_eq!(episode.title, "Friction around billing");
+        assert_eq!(episode.summary, "AI episode summary (anger).");
+        assert_eq!(
+            episode.reason.as_deref(),
+            Some("AI episode reason (anger).")
+        );
+        assert_eq!(episode.base_intensity, Some(8.0));
+        assert_eq!(episode.evidence_strength, Some(9.0));
+        assert!(episode
+            .evidence_signals
+            .contains(&"frustration".to_string()));
     }
 
     #[test]
-    fn build_episode_candidate_uses_reason_signal_extras_as_narrative_evidence() {
-        let tagger = SemanticTaggerOutput {
-            tags: vec!["billing".to_string()],
-            reason_signals_canonical: vec!["resolve".to_string(), "challenge".to_string()],
-            reason_signals_extra: vec!["frustration".to_string(), "escalation".to_string()],
+    fn the_episode_gate_needs_its_signal_combination() {
+        let context = context_state("billing");
+        let tagger = |canonical: &[&str], extra: &[&str]| SemanticTaggerOutput {
+            tags: strings(&["billing"]),
+            reason_signals_canonical: strings(canonical),
+            reason_signals_extra: strings(extra),
         };
-        let context = ContextState {
-            context_id: "context:1".to_string(),
-            label: "billing".to_string(),
-            tags: vec!["billing".to_string()],
-            weight: 1.0,
-            weight_avg_cumulative: 1.0,
-            weight_avg_ema: 1.0,
-            weight_samples: 1,
-            ilk_weights: BTreeMap::new(),
-            ilk_profile: BTreeMap::new(),
-            opened_at: "2026-01-01T00:00:00Z".to_string(),
-            last_seen_at: "2026-01-01T00:00:00Z".to_string(),
-            closed_at: None,
-            status: "open".to_string(),
-        };
-        let reason = ReasonState {
-            reason_id: "reason:1".to_string(),
-            label: "confrontational pushback".to_string(),
-            signals_canonical: vec!["challenge".to_string()],
-            signals_extra: vec!["frustration".to_string(), "escalation".to_string()],
-            weight: 1.0,
-            weight_avg_cumulative: 1.0,
-            weight_avg_ema: 1.0,
-            weight_samples: 1,
-            ilk_weights: BTreeMap::new(),
-            ilk_profile: BTreeMap::new(),
-            opened_at: "2026-01-01T00:00:00Z".to_string(),
-            last_seen_at: "2026-01-01T00:00:00Z".to_string(),
-            closed_at: None,
-            status: "open".to_string(),
-        };
+        assert!(
+            build_episode_candidate(&tagger(&["inform"], &["frustration"]), &context).is_none()
+        );
+        assert!(
+            build_episode_candidate(&tagger(&["resolve", "challenge"], &[]), &context).is_none()
+        );
+        let candidate =
+            build_episode_candidate(&tagger(&["resolve", "request"], &["urgency"]), &context)
+                .expect("urgency candidate");
+        assert_eq!(candidate.affect_id, "urgency");
+        assert_eq!(candidate.title, "Urgent push on billing");
+        assert_eq!(candidate.base_intensity, 7.0);
+        assert_eq!(candidate.evidence_strength, 8.0);
+    }
 
-        let candidate = build_episode_candidate(&tagger, &context, &reason).expect("candidate");
-        assert!(candidate.summary.contains("Narrative evidence includes"));
-        assert!(candidate.reason.contains("Narrative evidence includes"));
-        assert!(candidate
-            .evidence_signals
-            .contains(&"frustration".to_string()));
+    /// CONFIG_GET reports whether storage's postgres resolved, not a fixed `enabled: true`.
+    #[test]
+    fn config_get_reports_the_storage_db_state() {
+        let control = CognitionControlState {
+            schema_version: COGNITION_CONFIG_SCHEMA_VERSION,
+            config_version: 1,
+            ai_secret_source: CognitionAiSecretSource::Missing,
+            thresholds: CognitionThresholds::default(),
+            semantic_tagger: CognitionSemanticTaggerConfig::default(),
+        };
+        let paths = RuntimePaths {
+            state_dir: PathBuf::from("/var/lib/fluxbee/test"),
+            shm_dir: PathBuf::from("/var/lib/fluxbee/test/shm"),
+            cache_dir: PathBuf::from("/var/lib/fluxbee/test/cache"),
+            memory_lance_path: PathBuf::from("/var/lib/fluxbee/test/memory.lance"),
+        };
+        for (looked_up, expected) in [
+            (None, Value::Null),
+            (Some(false), json!(false)),
+            (Some(true), json!(true)),
+        ] {
+            let runtime = CognitionRuntimeState {
+                storage_db_configured: looked_up,
+                ..CognitionRuntimeState::default()
+            };
+            let payload = build_cognition_config_get_payload(
+                "SY.cognition@motherbee",
+                &control,
+                &runtime,
+                &paths,
+                true,
+                0,
+                None,
+            );
+            assert_eq!(payload["config"]["storage"]["db_configured"], expected);
+            assert_eq!(payload["contract"]["resources"][1]["configured"], expected);
+            assert!(payload["config"]["storage"].get("enabled").is_none());
+        }
     }
 }
