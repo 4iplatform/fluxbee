@@ -7525,6 +7525,9 @@ fn split_path_query(path: &str) -> (&str, HashMap<String, String>) {
     }
 }
 
+/// Query parameters, percent-decoded: a client that encodes `@` as `%40` (Python's urlencode does)
+/// must match the same tap or route as one that sends it raw. `+` stays literal: raw `+` values
+/// (an offset, a GMT+3 zone) are commoner here than form-encoded spaces.
 fn parse_query(query: &str) -> HashMap<String, String> {
     let mut params = HashMap::new();
     for pair in query.split('&') {
@@ -7535,9 +7538,30 @@ fn parse_query(query: &str) -> HashMap<String, String> {
             Some(parts) => parts,
             None => (pair, ""),
         };
-        params.insert(key.to_string(), value.to_string());
+        params.insert(decode_query_component(key), decode_query_component(value));
     }
     params
+}
+
+fn decode_query_component(input: &str) -> String {
+    if !input.contains('%') {
+        return input.to_string();
+    }
+    let bytes = input.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            if let (Some(h), Some(l)) = (from_hex(bytes[i + 1]), from_hex(bytes[i + 2])) {
+                out.push(h << 4 | l);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
 }
 
 fn deployments_payload_from_query(query: &HashMap<String, String>) -> serde_json::Value {
@@ -14874,6 +14898,20 @@ fn build_opa_query_response(
 mod tests {
     use super::*;
     use serde_json::{json, Value};
+
+    /// A tap deleted with `@` sent as `%40` (as Python's urlencode sends it) matches the same tap;
+    /// `+` and a stray `%` stay as they are.
+    #[test]
+    fn query_parameters_are_percent_decoded() {
+        let params = parse_query(
+            "match_src=IO.a%40motherbee&target=IO.c@motherbee&tz=Etc/GMT+3&odd=50%&k%65y=v",
+        );
+        assert_eq!(params["match_src"], "IO.a@motherbee");
+        assert_eq!(params["target"], "IO.c@motherbee");
+        assert_eq!(params["tz"], "Etc/GMT+3");
+        assert_eq!(params["odd"], "50%");
+        assert_eq!(params["key"], "v");
+    }
 
     #[test]
     fn unknown_route_uses_the_family_envelope() {
