@@ -2433,12 +2433,24 @@ impl IdentityRuntime {
         let src_l2_name = msg.routing.src_l2_name.as_deref();
 
         if action == MSG_ILK_PROVISION {
+            // Not the payload: its `address` is the person's own handle (phone, email, user id).
+            let ich_id = msg
+                .payload
+                .get("ich_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let channel_type = msg
+                .payload
+                .get("channel_type")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
             tracing::info!(
                 action,
                 trace_id = %trace_id,
                 src_uuid = %msg.routing.src,
                 src_l2_name = src_l2_name.unwrap_or("<unknown>"),
-                payload = %msg.payload,
+                ich_id,
+                channel_type,
                 "identity received ILK_PROVISION request"
             );
         }
@@ -5962,7 +5974,19 @@ fn error_payload(error_code: &str, message: &str) -> Value {
 
 fn db_write_error_payload(context: &str, err: &(dyn std::error::Error + 'static)) -> Value {
     let code = map_db_write_error_code(err);
-    error_payload(code, &format!("{}: {}", context, err))
+    error_payload(code, &format!("{}: {}", context, db_error_summary(err)))
+}
+
+/// A DB error as a caller may see it: Postgres' own message, without its DETAIL, which echoes the
+/// row's values (a unique violation's DETAIL carries the email of the person being registered).
+fn db_error_summary(err: &(dyn std::error::Error + 'static)) -> String {
+    match err
+        .downcast_ref::<tokio_postgres::Error>()
+        .and_then(tokio_postgres::Error::as_db_error)
+    {
+        Some(db_err) => format!("{}: {}", db_err.severity(), db_err.message()),
+        None => err.to_string(),
+    }
 }
 
 fn map_db_write_error_code(err: &(dyn std::error::Error + 'static)) -> &'static str {
