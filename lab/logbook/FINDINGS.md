@@ -350,6 +350,121 @@
   terminal, usado por todos los binarios. Es un cambio mecánico en 36 archivos: va con la pasada
   de formato masivo (ítem 8 del lote), a decisión del operador.
 
+
+### A-32 ✅ RESUELTO (0.1.53) — Datos personales en logs y respuestas (frontdesk e identity)
+
+- **Qué pasaba:**
+  - SY.frontdesk.gov escribía en el log, a nivel INFO, el payload de `ILK_REGISTER` (nombre, email,
+    teléfono, empresa), el nombre de empresa que tipeó la persona (`TNT_CREATE`), los primeros 240
+    caracteres de cada mensaje y el id del remitente (en WhatsApp, su teléfono).
+  - Los errores de SY.identity viajaban con su texto libre. Para un email duplicado ese texto trae el
+    DETAIL de Postgres con el email.
+  - SY.identity logueaba el payload de `ILK_PROVISION` (la dirección de la persona) y devolvía el
+    DETAIL de Postgres a quien llamaba.
+- **Arreglo:**
+  - De un registro se loguea `ilk_id`, `tenant_id` y qué campos vinieron, nunca sus valores.
+  - De un error de identity, solo su código.
+  - SY.identity loguea `ich_id` y `channel_type`, y responde el mensaje de Postgres sin el DETAIL.
+  - Tres tests capturan los logs de las tres entradas del frontdesk; con los campos viejos fallan.
+
+### A-33 ✅ RESUELTO (0.1.53) — SY.frontdesk.gov: rechazos definitivos de identity reportados como reintentables
+
+- **Qué pasaba:** los errores se clasificaban buscando texto. TENANT_PENDING, ILK_DELETED,
+  SYSTEM_ILK_PROTECTED, DUPLICATE_* y otros terminaban como `IDENTITY_UNAVAILABLE` con
+  `retryable: true`.
+  - **Además:** la respuesta del target de fallback no se revisaba. Un `status:"error"` salía como
+    `registered: true`, un REGISTERED falso. Solo podía pasar con `GOV_IDENTITY_FALLBACK_TARGET`
+    configurado.
+- **Arreglo:**
+  - El bridge devuelve el `IdentityError` del SDK, igual que el orchestrator, y el código de
+    SY.identity se conserva tal cual.
+  - Solo es reintentable lo transitorio: sin respuesta, NOT_PRIMARY, DB_NOT_READY y DB_WRITE_FAILED.
+  - Las dos respuestas pasan por el mismo chequeo de estado.
+
+### A-34 ✅ RESUELTO (0.1.53) — Cognition: el arranque en frío nunca corría y reconstruía mal
+
+- **Qué pasaba (visto en PROD y en una revisión del código):**
+  - **El rebuild nunca corría.** La credencial de Postgres llega del vault después del arranque y el
+    rebuild solo se intentaba al iniciar.
+  - **Reconstruía con otras claves.** Indexaba por id de entidad mientras el camino en vivo indexa
+    por etiqueta. Después de un reinicio, el siguiente turno duplicaba contextos, razones y memorias
+    con el mismo id.
+  - **El estado en vivo no se podaba nunca.**
+  - **Un scope no se cortaba jamás:** un cambio de tema sostenido lo renombraba en vez de cortarlo.
+  - **`storage.enabled: true` estaba fijo** en CONFIG_GET.
+  - **El texto determinístico de los episodios nunca se enviaba.**
+- **Arreglo:**
+  - **Rebuild:**
+    - Espera al vault al arrancar (el patrón de A-26, hasta 60 s).
+    - Si igual no carga, lo reintenta el primer turno, una sola vez y dentro de la tarea de turnos.
+    - Arma el estado con las mismas claves que el camino en vivo y solo se instala sobre un estado
+      vacío.
+    - Los episodios recuperan su instancia real.
+  - **Poda:** el estado en vivo se recorta al mismo conjunto que entra en la SHM `jsr-memory`.
+  - **Scopes:** un cambio de tema sostenido corta el scope; uno que todavía liga es deriva y lo
+    reetiqueta. El dominante se elige de forma determinística.
+  - **CONFIG_GET:** informa `storage.db_configured` real.
+  - **Episodios:** su texto es el del resumidor de IA.
+  - Tests nuevos para cada caso; cada uno se verificó fallando sin su arreglo.
+
+### A-35 ✅ RESUELTO (0.1.53) — ai.generic pedía la clave de IA por nombre
+
+- **Qué pasaba:** desde julio (`ai-engine-selection.md` D2/D3), un nodo `AI.*` tenía que nombrar su
+  clave (`behavior.vault_key`). Sin esa clave, su config se rechazaba.
+- **Decisión del operador (2026-10-02, D4):** *"La clave de IA la debería tomar del vault con la
+  clave general (sin asignación de nombre)."*
+- **Arreglo:**
+  - El proveedor es el del hive (`hive.yaml` `ai`) y la clave es la general de ese proveedor en
+    SY.vault: la del tenant del nodo y, si no hay, la del raíz. Es lo mismo que hacen los SY.* y el
+    frontdesk.
+  - `behavior.vault_key` se rechaza con un mensaje que lo nombra.
+
+### A-36 ✅ RESUELTO (0.1.53) — La instalación base levantaba una instancia de prueba y Archi conocía runtimes inexistentes
+
+- **Qué pasaba:**
+  - `AI.chat@motherbee`, el nodo de ejemplo de marzo, arrancaba con cada instalación como si fuera
+    base.
+  - Las semillas del cookbook le decían a Archi que los paquetes `config_only` usaran
+    `runtime_base: "AI.common"`, que no existe.
+  - El handbook que carga Archi decía que `ai.chat` es un runtime.
+  - Un ejemplo del architect lanzaba un nodo sin runtime, que se habría derivado a `ai.chat`.
+  - Una ayuda del architect tenía UTF-8 codificado dos veces ("catÃ¡logo").
+- **Arreglo:**
+  - `ai.generic` queda horneado y sin instancia de arranque. Las instancias se crean para algo
+    concreto; las de prueba son efímeras (operador, 2026-10-02).
+  - Todo apunta a `ai.generic`: admin, architect, handbook, semillas, docs y scripts.
+  - Se borraron `install-ia.sh` y `ai-nodectl.sh` (el modelo de unit systemd por nodo de marzo) y
+    los flags deprecados de los scripts de publicación.
+- **PROD:** la instancia `AI.chat@motherbee` que ya existe queda en FAILED_CONFIG, porque su config
+  tiene `vault_key`. Se borra o se reconfigura a pedido del operador.
+
+### A-37 🟡 SY.frontdesk.gov: el camino de tenants no cierra con lo que dicen los documentos
+
+- **G1:** el registro conversacional no puede terminar bien. El tenant no sale de ningún lado y
+  termina en `missing_tenant_id`.
+  - Propuesta: lo decide el runner, no el LLM, a partir del tenant del ILK temporal.
+- **G2:** crear un tenant hoy lo deja `active` y puede unirse a uno existente por nombre.
+  - Los documentos dicen que nace `pending` y que lo aprueba SY.admin.
+- **G3:** el merge por email (`ILK_ADD_CHANNEL` con `merge_from_ilk_id`) no está implementado.
+  - Antes hace falta probar que la persona es dueña del email; si no, cualquiera toma la identidad
+    de otro.
+- **G4–G8:** vocabulario superado (solo docs), la §11 de la spec vieja, faltan contadores, el
+  handoff fallido pierde su tenant, y los reintentos conversacionales.
+- **Además, los dos documentos se contradicen:** la spec dice "no inventa tenants"; identity v2
+  dice que crea tenants `pending`.
+- **Estado:** esperando decisiones del operador. El detalle (G1–G8, con archivos y líneas) está en la
+  bitácora 2026-10-02.
+
+### A-38 🟡 Cognition: preguntas de diseño abiertas
+
+- `thresholds.context_open` / `reason_open` solo ajustan el cierre: abrir siempre abre, porque todo
+  candidato vale 1.0. ¿Se renombran o se esperan al evaluador de contextos con IA?
+- Con la región de 4 MB llena, un hilo nuevo puede quedar afuera justo después de su turno.
+  ¿Prioridad a lo reciente?
+- Un cambio de tema sostenido corta el scope a los 6 mensajes. ¿Se ajustan las constantes?
+- Lo no ensamblado: memoria entre hilos, LanceDB, lo de los workers al motherbee, y lectores de las
+  tablas.
+
 ### A-19 ✅ RESUELTO (0.1.43) — La policy publicada esperaba hasta 60 s al watcher de Syncthing
 
 - **Qué pasaba:** con 0.1.41 el apply llegaba a los 4 hives en 16 s, pero el clear tardó 63 s y el
@@ -613,7 +728,7 @@
   - Quedó validada en PROD la carga al boot del NAT del egress (F17): el ruleset volvió idéntico.
   - Detalle en la bitácora 2026-09-25.
 
-### B-13 🟡 Las VMs de PROD no arrancan solas después de un reboot del host (`onboot` sin definir)
+### B-13 ✅ RESUELTO (2026-10-02) — Las VMs de PROD no arrancaban solas después de un reboot del host (`onboot` sin definir)
 
 - **Qué pasa:** `onboot` no está definido en fb-mb, fb-worker1, fb-ingress, fb-egress ni fb-build.
   Si el host reinicia (corte de luz, actualización), **PROD queda apagado** hasta que alguien
@@ -625,8 +740,8 @@
   dejarla siempre encendida). Sin orden de arranque, porque el arranque simultáneo de las 4 es lo
   que se validó el 30/07. `PUT /nodes/pve/qemu/<id>/config onboot=1`, o en la GUI: VM → Options →
   *Start at boot*.
-- **Estado:** pendiente. **Lo aplica el operador**: el cambio de config del host no pasó el control
-  de permisos del agente.
+- **Estado:** resuelto. El operador puso `onboot=1` en 100, 101, 102, 103 y 110; verificado por la
+  API el 2026-10-02. Queda por ver en vivo con el próximo reinicio del host.
 
 ### B-14 🟡 Arranque lento de las VMs de PROD (userspace de 53 s a 1 min 48 s)
 
@@ -645,7 +760,7 @@
   `vga=serial0`).
 - **Pendiente:** diagnóstico (`systemd-analyze plot`, qué retiene esos jobs) antes de tocar nada.
 
-### B-15 🟡 Margen de memoria del host de PROD con fb-build siempre encendida
+### B-15 ✅ RESUELTO (2026-10-02) — Margen de memoria del host de PROD con fb-build siempre encendida
 
 - **Qué se observó:** 26,0 G configurados en las VMs encendidas sobre 27,4 G físicos, sin
   ballooning. Uso real estable en ~22 G (pico de 81 % en la semana, 0 swap). mb llega a 5,8 G de
@@ -656,6 +771,9 @@
   - Ballooning con mínimo en fb-build (p. ej. `balloon=2048`): Proxmox le recupera memoria cuando
     el host pasa del 80 %.
   - Bajarle la RAM fuera de los builds.
+- **Estado:** resuelto. El operador activó ballooning en fb-build con mínimo 2 GiB (`balloon=2048`);
+  verificado por la API el 2026-10-02. Para darle más RAM al host hay que apagarlo, porque es una VM
+  de VMware.
 
 ---
 
