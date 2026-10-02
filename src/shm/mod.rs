@@ -922,18 +922,17 @@ impl RouterRegionWriter {
         let (header, nodes): (&mut ShmHeader, &mut [NodeEntry]) =
             router_header_and_nodes_mut(&mut self.mmap, &self.layout)
                 .ok_or(ShmError::InvalidHeader)?;
-        let mut slot = None;
-        for entry in nodes.iter_mut() {
-            if entry.flags & FLAG_ACTIVE == 0 {
-                slot = Some(entry);
-                break;
-            }
-            if entry.uuid == *node_uuid.as_bytes() {
-                slot = Some(entry);
-                break;
-            }
-        }
-        let Some(entry) = slot else {
+        // A node registered again keeps its own slot; only a new one takes the first free slot.
+        // Unregistering leaves holes, so a free slot can come before the node's own.
+        let own_slot = nodes.iter().position(|entry| {
+            entry.flags & FLAG_ACTIVE != 0 && entry.uuid == *node_uuid.as_bytes()
+        });
+        let slot = own_slot.or_else(|| {
+            nodes
+                .iter()
+                .position(|entry| entry.flags & FLAG_ACTIVE == 0)
+        });
+        let Some(entry) = slot.map(|index| &mut nodes[index]) else {
             return Err(ShmError::SlotFull);
         };
 
@@ -2728,9 +2727,16 @@ fn read_router_snapshot(
         atomic::fence(Ordering::Acquire);
         let node_count = header.node_count as usize;
         let nodes = read_slice::<NodeEntry>(mmap, layout.node_offset, MAX_NODES as usize)?;
-        let mut snapshot = Vec::new();
-        for node in nodes.iter().take(node_count) {
-            snapshot.push(*node);
+        // The active nodes, wherever their slots are: unregistering leaves holes, so the first
+        // `node_count` slots can hold deleted entries and miss the last nodes.
+        let mut snapshot = Vec::with_capacity(node_count);
+        for node in nodes.iter() {
+            if snapshot.len() >= node_count {
+                break;
+            }
+            if node.flags & FLAG_ACTIVE != 0 {
+                snapshot.push(*node);
+            }
         }
         atomic::fence(Ordering::Acquire);
         let s2 = header.seq.load(Ordering::Acquire);
@@ -4389,6 +4395,75 @@ mod tests {
             writer.resolve_ich_mapping("whatsapp", "+549111111", [0u8; 16]),
             None
         );
+
+        cleanup_shm(&name);
+    }
+
+    fn router_region_for_test(prefix: &str) -> (String, RouterRegionWriter) {
+        let name = format!("/{prefix}-{}", &Uuid::new_v4().simple().to_string()[..8]);
+        cleanup_shm(&name);
+        let writer = RouterRegionWriter::open_or_create(
+            &name,
+            Uuid::new_v4(),
+            "sandbox",
+            "RT.test@sandbox",
+            true,
+        )
+        .expect("open router region");
+        (name, writer)
+    }
+
+    fn router_node_names(writer: &RouterRegionWriter) -> Vec<String> {
+        let snapshot = writer.read_snapshot().expect("router snapshot");
+        assert_eq!(snapshot.header.node_count as usize, snapshot.nodes.len());
+        snapshot
+            .nodes
+            .iter()
+            .map(|node| read_string(&node.name, node.name_len as usize))
+            .collect()
+    }
+
+    #[test]
+    fn router_snapshot_lists_the_nodes_past_a_hole() {
+        let (name, mut writer) = router_region_for_test("jsr-hole");
+        let (a, b, c) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+        writer
+            .register_node(a, "IO.a@sandbox", 0, 1)
+            .expect("register a");
+        writer
+            .register_node(b, "IO.b@sandbox", 0, 2)
+            .expect("register b");
+        writer
+            .register_node(c, "IO.c@sandbox", 0, 3)
+            .expect("register c");
+        // a's slot, the first one, is now a hole before b and c.
+        writer.unregister_node(a).expect("unregister a");
+
+        assert_eq!(router_node_names(&writer), ["IO.b@sandbox", "IO.c@sandbox"]);
+
+        cleanup_shm(&name);
+    }
+
+    #[test]
+    fn a_node_registered_again_keeps_its_one_slot() {
+        let (name, mut writer) = router_region_for_test("jsr-again");
+        let (a, b) = (Uuid::new_v4(), Uuid::new_v4());
+        writer
+            .register_node(a, "IO.a@sandbox", 0, 1)
+            .expect("register a");
+        writer
+            .register_node(b, "IO.b@sandbox", 0, 2)
+            .expect("register b");
+        writer.unregister_node(a).expect("unregister a");
+        // b reconnects: the free slot a left comes before b's own.
+        writer
+            .register_node(b, "IO.b@sandbox", 0, 3)
+            .expect("register b again");
+
+        assert_eq!(router_node_names(&writer), ["IO.b@sandbox"]);
+        // When b leaves, no copy of it stays behind.
+        writer.unregister_node(b).expect("unregister b");
+        assert!(router_node_names(&writer).is_empty());
 
         cleanup_shm(&name);
     }
