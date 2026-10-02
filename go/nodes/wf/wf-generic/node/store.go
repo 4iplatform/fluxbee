@@ -80,21 +80,14 @@ func OpenStore(path string) (*Store, error) {
 			return nil, fmt.Errorf("create wf db dir for %q: %w", path, err)
 		}
 	}
-	db, err := sql.Open("sqlite", path)
+	// A pragma belongs to one connection and database/sql opens several: in the DSN,
+	// modernc.org/sqlite applies them to each connection it opens. Set once with db.Exec they
+	// reached one connection only, and the others failed at once with SQLITE_BUSY instead of
+	// waiting (as in sy-timer).
+	dsn := path + "?_pragma=busy_timeout(5000)&_pragma=journal_mode(WAL)&_pragma=synchronous(NORMAL)"
+	db, err := sql.Open("sqlite", dsn)
 	if err != nil {
 		return nil, fmt.Errorf("open wf db %q: %w", path, err)
-	}
-	if _, err := db.Exec(`PRAGMA journal_mode=WAL;`); err != nil {
-		_ = db.Close()
-		return nil, fmt.Errorf("set WAL mode: %w", err)
-	}
-	if _, err := db.Exec(`PRAGMA synchronous=NORMAL;`); err != nil {
-		_ = db.Close()
-		return nil, fmt.Errorf("set synchronous: %w", err)
-	}
-	if _, err := db.Exec(`PRAGMA busy_timeout=5000;`); err != nil {
-		_ = db.Close()
-		return nil, fmt.Errorf("set busy_timeout: %w", err)
 	}
 	if err := ensureWFSchema(db); err != nil {
 		_ = db.Close()

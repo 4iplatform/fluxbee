@@ -40,16 +40,8 @@ type timerRow struct {
 }
 
 func openTimerDB(path string) (*sql.DB, error) {
-	db, err := sql.Open("sqlite", path)
+	db, err := sql.Open("sqlite", timerDSN(path))
 	if err != nil {
-		return nil, err
-	}
-	if _, err := db.Exec("PRAGMA journal_mode=WAL;"); err != nil {
-		_ = db.Close()
-		return nil, err
-	}
-	if _, err := db.Exec("PRAGMA busy_timeout=5000;"); err != nil {
-		_ = db.Close()
 		return nil, err
 	}
 	if err := ensureTimerSchema(db); err != nil {
@@ -57,6 +49,14 @@ func openTimerDB(path string) (*sql.DB, error) {
 		return nil, err
 	}
 	return db, nil
+}
+
+// timerDSN is path plus the pragmas every connection needs. A pragma belongs to one connection and
+// database/sql opens several (the scheduler writes while requests are served): in the DSN,
+// modernc.org/sqlite applies them to each connection it opens. Set once with db.Exec they reached
+// one connection only, and the others failed at once with SQLITE_BUSY instead of waiting.
+func timerDSN(path string) string {
+	return path + "?_pragma=busy_timeout(5000)&_pragma=journal_mode(WAL)"
 }
 
 func ensureTimerSchema(db *sql.DB) error {
