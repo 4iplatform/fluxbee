@@ -572,7 +572,7 @@ acción **local**: IO.cloud la resuelve él mismo (no relaya a `SY.admin`). Prov
 
 | campo | obligatorio | notas |
 |---|---|---|
-| `tenant_id` (raíz) | ✅ **sí**, canónico `tnt:<uuid>` **existente y no-pending** | |
+| `tenant_id` (raíz) | ✅ **sí**, canónico `tnt:<uuid>` **existente, no-pending y que no sea el tenant raíz** | en el tenant raíz no se registra a nadie |
 | `params.type` | ✅ `"frontdesk_handoff"` | fijo |
 | `params.schema_version` | ✅ `1` (número) | fijo |
 | `params.operation` | ✅ `"complete_registration"` | fijo |
@@ -611,6 +611,7 @@ post '{"op":"register_human","tenant_id":"tnt:94cd37b8-…",
 | condición | respuesta |
 |---|---|
 | falta `tenant_id` en la raíz / no canónico | `"register_human requires tenant_id"` / `"…canonical tenant_id tnt:<uuid>"` |
+| `tenant_id` es el tenant raíz (`tnt:00000000-0000-0000-0000-000000000001`) | `error_code:"TENANT_ROOT_NOT_REGISTRABLE"`; no se provisiona nada |
 | `params` no es objeto | `"register_human requires an object 'params' (the frontdesk_handoff payload)"` |
 | `params.type` ≠ `frontdesk_handoff` | `"params.type must be \"frontdesk_handoff\""` |
 | `params.schema_version` ≠ 1 | `"params.schema_version must be 1"` |

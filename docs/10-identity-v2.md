@@ -75,6 +75,7 @@ A tenant is an organization, company, or account. It is the top-level partition 
 
 - `status`: `pending | active | suspended`. Only an `active` tenant takes registrations (`ILK_REGISTER` answers `TENANT_PENDING` / `TENANT_SUSPENDED`, and `TENANT_DELETED` for a marked one).
 - A default tenant (`fluxbee`) is created automatically during motherbee bootstrap. All system nodes (SY.*, RT.*) are registered under this tenant.
+- That default tenant is the root tenant (`tnt:00000000-0000-0000-0000-000000000001`, fixed by code). It holds the system, never a person: nobody registers into it (operator decision 2026-10-02). An `ILK_REGISTER` of a person into it answers `TENANT_ROOT_NOT_REGISTRABLE`; node ILKs (`agent`) still register there, and IO nodes running in it still provision temporary ILKs, which stay temporary (§6.2).
 - Subsequent tenants are created by the operator through SY.admin, by Fluxbee Cloud with its own process (io.cloud `create_tenant`, relayed by SY.admin), or by SY.architect. The frontdesk never creates one (§6.4).
 - Without at least one active tenant, no ILK can be registered and no node can be spawned.
 
@@ -99,7 +100,7 @@ An ILK is the unique identity of any entity that participates in messaging: huma
 - ILK persists across node restarts — same node_name = same ILK.
 - ILKs can be created through two actions:
   - `ILK_PROVISION` (IO nodes only): creates temporary ILKs for unknown channels.
-  - `ILK_REGISTER` (SY.orchestrator and SY.frontdesk.gov only): creates node ILKs or upgrades temporary human ILKs.
+  - `ILK_REGISTER` (SY.orchestrator and SY.frontdesk.gov only): creates node ILKs or upgrades temporary human ILKs (never into the root tenant, §3.1).
 - Temporary ILKs (registration_status=temporary) are real ILKs with valid UUIDs, not pseudo-identifiers.
 
 ### 3.3 ICH (Interlocutor Channel)
@@ -367,7 +368,8 @@ When an ILK or TNT is created, updated, or deleted, motherbee SY.identity propag
 3. SY.orchestrator registers ILKs for system nodes (SY.*, RT.*) under "fluxbee" tenant.
 4. System nodes start with identity.
 5. SY.frontdesk.gov starts (a system node of the motherbee).
-6. Humans can now register via frontdesk.
+6. Humans can now register via frontdesk, into the tenants created afterwards (§6.4), never
+   into "fluxbee" (§3.1).
 ```
 
 ### 6.2 Human Registration (via SY.frontdesk.gov)
@@ -380,8 +382,8 @@ When an ILK or TNT is created, updated, or deleted, motherbee SY.identity propag
    - sends ILK_PROVISION with ich_id + channel_type + address + tenant_id: its own tenant
      (io.api / io.cloud: the tenant they were called for).
    - SY.identity creates a real ILK (UUID v4, registration_status=temporary) in that tenant
-     (the default tenant `fluxbee` when the IO node sends none), associates the ICH,
-     persists in DB, propagates to SHM, then answers.
+     (the default tenant `fluxbee` when the IO node sends none: a person there cannot be
+     registered, see below), associates the ICH, persists in DB, propagates to SHM, then answers.
    - IO.whatsapp receives the ILK UUID back.
 5. IO.whatsapp sends message with the real (temporary) ILK as meta.src_ilk.
 6. The router sees registration_status=temporary → routes to SY.frontdesk.gov
@@ -395,9 +397,12 @@ When an ILK or TNT is created, updated, or deleted, motherbee SY.identity propag
    - identification data
    - tenant_id: the tenant of the case, the one SY.identity holds for the temporary ILK
      (read from SHM). A `frontdesk_handoff.tenant_id` must be that same tenant. When it cannot
-     be read, nothing is registered (`TENANT_UNRESOLVED`) and no tenant is created.
+     be read, nothing is registered (`TENANT_UNRESOLVED`) and no tenant is created. When it is
+     the root tenant, nothing is registered either: the frontdesk answers
+     `TENANT_NOT_REGISTRABLE` without calling SY.identity.
 9. SY.identity validates and upgrades the ILK:
-   - the tenant must be active (TENANT_PENDING / TENANT_SUSPENDED / TENANT_DELETED otherwise);
+   - the tenant must be active (TENANT_PENDING / TENANT_SUSPENDED / TENANT_DELETED otherwise)
+     and not the root tenant (TENANT_ROOT_NOT_REGISTRABLE);
    - if the email already belongs to another human ILK of the tenant, the person is already
      registered: merge into that ILK (§6.5);
    - otherwise status `temporary` → `complete`; persists and propagates.
@@ -409,6 +414,8 @@ When an ILK or TNT is created, updated, or deleted, motherbee SY.identity propag
 **Key design decision:** The temporary ILK is a real `ilk:<uuid-v4>` from the start. There are no pseudo-identifiers, no special format, no format inconsistencies. The only difference is `registration_status=temporary` which OPA uses to route to frontdesk.
 
 **Tenant of a registration:** the frontdesk takes it from the case, never from the person, the LLM, its own config or its environment, and never creates one (§6.4). SY.identity itself still accepts an `ILK_REGISTER` that moves a *temporary* ILK to another active tenant (a complete one answers `INVALID_TENANT_TRANSITION`); the frontdesk never asks for that.
+
+**Nobody registers into the root tenant** (operator decision 2026-10-02). SY.identity refuses, with `TENANT_ROOT_NOT_REGISTRABLE` and before any merge by email, every `ILK_REGISTER` that would put a person in the root tenant: one with `ilk_type: human`, or one of an ILK that is a human one (such as a temporary, whatever `ilk_type` it asks for). Every caller gets it; the frontdesk answers it by itself (`TENANT_NOT_REGISTRABLE`), and io.cloud `register_human` refuses the root tenant before provisioning anything. Node ILKs (`agent`) still register there. `ILK_PROVISION` is not restricted: an IO node running in the root tenant, or one that sends no tenant, still provisions the people who write in, and they stay `temporary`. Their messages keep reaching the frontdesk wherever the router force-routes temporaries to it (§14), and it answers that it cannot register them. The base IO instances `fluxbee-firstboot` spawns (`IO.api@motherbee`, `IO.wapp.default`, ...) run in the root tenant, so the people who reach the hive through them are in that situation; what IO nodes do in the root tenant is pending an operator decision.
 
 **Authorized registrars:** SY.identity validates source authorization at two levels:
 
@@ -487,6 +494,7 @@ Rules:
 - Only a temporary ILK of the same tenant, registered as `human`, merges, and only into a human ILK. When the email belongs to another ILK and the registration cannot merge (the registering ILK is already complete, belongs to another tenant or does not exist, or the registration or the email's holder is not human), the answer is `DUPLICATE_EMAIL` and nothing changes.
 - Fill-only is the merge's rule. An explicit update overwrites: an `ILK_REGISTER` of the registered ILK itself (for example a repeated Cloud `register_human` for the same email) replaces its identification whole — last write wins. `ILK_UPDATE` does not touch identification (§12.4).
 - Node ILKs (SY.orchestrator) carry `node_name`, not email, and never merge: the same `node_name` keeps resolving to the same ILK.
+- Nothing merges into the root tenant: a person's registration there is refused before the email is looked at (`TENANT_ROOT_NOT_REGISTRABLE`, §6.2).
 - There is no proof of email ownership yet: whoever types another person's email gets their channel attached to that person's ILK. Verification (for example a one-time code) is a later item.
 - `ILK_ADD_CHANNEL` with `merge_from_ilk_id` (§12.3) is the same merge, addressed explicitly.
 
@@ -917,6 +925,8 @@ Creates a temporary ILK for an unknown ICH. Sent by IO nodes when they encounter
 
 The IO node can now use this real ILK UUID for `meta.src_ilk`.
 
+Provisioning in the root tenant (an IO node running in it, or a request without `tenant_id`) works, but the person it creates cannot be registered and stays `temporary` (§6.2).
+
 ### 12.2 ILK_REGISTER (unicast to SY.identity@motherbee)
 
 Upgrades a temporary ILK to complete, or creates a new ILK for a node. Sent by SY.frontdesk.gov (for humans) or SY.orchestrator (for nodes).
@@ -988,6 +998,7 @@ For node spawn flows (`SY.orchestrator -> ILK_REGISTER`), this response is a har
 | `INVALID_TENANT` | the tenant does not exist |
 | `TENANT_PENDING`, `TENANT_SUSPENDED` | the tenant is not active |
 | `TENANT_DELETED` | the tenant is marked deleted |
+| `TENANT_ROOT_NOT_REGISTRABLE` | a person into the root tenant: `ilk_type` `human`, or the ILK being registered is a human one (§6.2); node ILKs (`agent`) still register there |
 | `ILK_DELETED` | a marked ILK keeps that `node_name` (across the mesh) or email (in the tenant) reserved |
 | `ILK_NOT_FOUND` | the ILK being registered is marked deleted |
 | `SYSTEM_ILK_PROTECTED` | the ILK being registered is a system ILK |

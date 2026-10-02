@@ -21,6 +21,9 @@ registra en SY.identity (`ILK_REGISTER`).
   frontdesk lo lee del SHM de identity). El `tenant_id` de un handoff solo tiene que coincidir. El
   frontdesk nunca crea tenants, ni toma uno de la persona o del LLM; sin tenant responde
   `TENANT_UNRESOLVED` y no registra nada.
+- **Tenant raíz:** nadie se registra ahí. Si el caso es del tenant raíz, responde
+  `TENANT_NOT_REGISTRABLE` (`error_code` `TENANT_ROOT_NOT_REGISTRABLE`) sin llamar a SY.identity
+  ni al LLM, y la persona sigue temporal. SY.identity rechaza lo mismo para cualquier llamador.
 - **Email ya registrado:** si el email ya es de otra persona del tenant, SY.identity hace el merge
   (el canal pasa a ese ILK y se completan solo los datos que le faltaban) y el frontdesk responde
   `MERGED`.
@@ -44,8 +47,8 @@ Para correrlo hace falta un router y un `hive.yaml` (de ahí toma su nombre,
 
 - Probar que la persona es dueña del email (por ejemplo un código de un solo uso) antes del merge:
   hoy quien escribe el email de otro asocia su canal al ILK de esa persona.
-- io.cloud `register_human` reporta el ILK que provisionó, no el ILK en el que quedó la persona
-  después de un merge.
+- Las personas que llegan por nodos IO del tenant raíz (las instancias base de
+  `fluxbee-firstboot`) quedan temporales: decisión del operador pendiente.
 - Los contadores de la spec (§12) y los reintentos conversacionales.
 
 El contrato completo está en `docs/ai-frontdesk-gov-spec.md`.

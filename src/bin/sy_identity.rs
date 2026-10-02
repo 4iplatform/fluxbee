@@ -991,6 +991,20 @@ impl IdentityStore {
         }))
     }
 
+    /// Nobody registers into the root tenant (operator decision 2026-10-02): it holds the system
+    /// and its nodes, never a person. A registration is a person's when it says `human` or when
+    /// the ilk it registers is a human one, such as the temporary a root-tenant IO node
+    /// provisioned for someone who wrote in: provisioning there still works, and that person
+    /// stays temporary. Node ilks (`agent`) still register in the root tenant.
+    fn registers_a_person_into_the_root_tenant(&self, req: &IlkRegisterRequest) -> bool {
+        req.tenant_id == DEFAULT_ROOT_TENANT_ID
+            && (req.ilk_type.trim() == "human"
+                || self
+                    .ilks
+                    .get(&req.ilk_id)
+                    .is_some_and(|ilk| ilk.ilk_type.trim() == "human"))
+    }
+
     fn register_ilk(
         &mut self,
         req: IlkRegisterRequest,
@@ -1011,6 +1025,9 @@ impl IdentityStore {
         }
         if target_tenant.status.eq_ignore_ascii_case("suspended") {
             return Err("TENANT_SUSPENDED".to_string());
+        }
+        if self.registers_a_person_into_the_root_tenant(&req) {
+            return Err("TENANT_ROOT_NOT_REGISTRABLE".to_string());
         }
         // Keys of a marked ilk stay reserved until purge, in the scope of their unique index:
         // node_name across the mesh, email within its tenant.
@@ -9723,6 +9740,124 @@ mod tests {
         let err = rg_register(&mut store, &temp, LC_TENANT, json!({"email": "a@acme.com"}))
             .expect_err("deleted");
         assert_eq!(err, "TENANT_DELETED");
+    }
+
+    #[test]
+    fn nobody_registers_a_person_into_the_root_tenant() {
+        let mut store = rg_store();
+        // A root-tenant IO node still provisions whoever writes in: a temporary of the root
+        // tenant, which is also where a provision without a tenant lands.
+        let temp = rg_provision(&mut store, DEFAULT_ROOT_TENANT_ID, "slack", "UROOT");
+        let defaulted = store
+            .provision_temporary_ilk(IlkProvisionRequest {
+                ich_id: format!("ich:{}", Uuid::new_v4()),
+                channel_type: "whatsapp".to_string(),
+                address: "+5491100000009".to_string(),
+                tenant_id: None,
+                ilk_type: None,
+            })
+            .expect("provision without a tenant");
+        let defaulted = defaulted["ilk_id"].as_str().expect("ilk_id").to_string();
+        assert_eq!(store.ilks[&defaulted].tenant_id, DEFAULT_ROOT_TENANT_ID);
+        // A person registered in the root tenant before the rule.
+        let legacy = "ilk:66666666-6666-4666-8666-666666666666";
+        store.ilks.insert(
+            legacy.to_string(),
+            IlkRecord {
+                ilk_id: legacy.to_string(),
+                ilk_type: "human".to_string(),
+                registration_status: "complete".to_string(),
+                tenant_id: DEFAULT_ROOT_TENANT_ID.to_string(),
+                identification: json!({"display_name": "Legacy", "email": "legacy@acme.com"}),
+                definition: json!({}),
+                channels: Vec::new(),
+                deleted_at_ms: None,
+                deleted_reason: None,
+            },
+        );
+        let new_ilk = "ilk:77777777-7777-4777-8777-777777777777";
+        let ilks = store.ilks.clone();
+        let lookup = store.ich_lookup.clone();
+
+        for (ilk_id, ilk_type, email) in [
+            // The temporary of a root-tenant IO node, and one provisioned without a tenant.
+            (temp.as_str(), "human", "uroot@acme.com"),
+            (defaulted.as_str(), "human", "wa@acme.com"),
+            // A person's temporary registered as an agent is still a person.
+            (temp.as_str(), "agent", "uroot@acme.com"),
+            (new_ilk, "human", "new@acme.com"),
+            // A merge into the person already there, and an update of that person.
+            (temp.as_str(), "human", "legacy@acme.com"),
+            (legacy, "human", "legacy@acme.com"),
+        ] {
+            let err = store
+                .register_ilk(
+                    IlkRegisterRequest {
+                        ilk_id: ilk_id.to_string(),
+                        ilk_type: ilk_type.to_string(),
+                        tenant_id: DEFAULT_ROOT_TENANT_ID.to_string(),
+                        identification: json!({"display_name": "Root", "email": email}),
+                    },
+                    MERGE_TTL_SECS,
+                )
+                .expect_err("refused");
+            assert_eq!(err, "TENANT_ROOT_NOT_REGISTRABLE", "{ilk_id} as {ilk_type}");
+        }
+        // Nothing changed: the temporaries stay temporary, and nothing merged.
+        assert_eq!(store.ilks, ilks);
+        assert_eq!(store.ich_lookup, lookup);
+        assert!(store.aliases.is_empty());
+        assert_eq!(store.ilks[&temp].registration_status, "temporary");
+    }
+
+    #[test]
+    fn nodes_still_register_into_the_root_tenant() {
+        let mut store = rg_store();
+        let node = "ilk:88888888-8888-4888-8888-888888888888";
+        let request = |ilk_id: &str| IlkRegisterRequest {
+            ilk_id: ilk_id.to_string(),
+            ilk_type: "agent".to_string(),
+            tenant_id: DEFAULT_ROOT_TENANT_ID.to_string(),
+            identification: json!({"display_name": "IO.api@motherbee", "node_name": "IO.api@motherbee"}),
+        };
+        let first = store
+            .register_ilk(request(node), MERGE_TTL_SECS)
+            .expect("base node");
+        assert_eq!(first["ilk_id"], node);
+        assert_eq!(first["tenant_id"], DEFAULT_ROOT_TENANT_ID);
+        assert_eq!(first["registration_status"], "complete");
+        // Its respawn keeps the node's ilk.
+        let again = store
+            .register_ilk(
+                request("ilk:99999999-9999-4999-8999-999999999990"),
+                MERGE_TTL_SECS,
+            )
+            .expect("respawn");
+        assert_eq!(again["ilk_id"], node);
+        // An agent a root-tenant IO node provisioned registers there too.
+        let bot = store
+            .provision_temporary_ilk(IlkProvisionRequest {
+                ich_id: format!("ich:{}", Uuid::new_v4()),
+                channel_type: "slack".to_string(),
+                address: "UBOT".to_string(),
+                tenant_id: None,
+                ilk_type: Some("agent".to_string()),
+            })
+            .expect("provision an agent");
+        let bot = bot["ilk_id"].as_str().expect("ilk_id").to_string();
+        let registered = store
+            .register_ilk(
+                IlkRegisterRequest {
+                    ilk_id: bot.clone(),
+                    ilk_type: "agent".to_string(),
+                    tenant_id: DEFAULT_ROOT_TENANT_ID.to_string(),
+                    identification: json!({"display_name": "Bot"}),
+                },
+                MERGE_TTL_SECS,
+            )
+            .expect("agent");
+        assert_eq!(registered["ilk_id"], bot.as_str());
+        assert_eq!(store.ilks[&bot].registration_status, "complete");
     }
 
     #[test]

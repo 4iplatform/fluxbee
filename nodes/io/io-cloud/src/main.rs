@@ -1434,6 +1434,15 @@ fn parse_register_human_request(payload: &Value) -> Result<RegisterHumanRequest,
         payload.get("tenant_id").and_then(Value::as_str),
         "register_human",
     )?;
+    // Nobody registers into the root tenant (operator decision 2026-10-02; SY.identity and the
+    // frontdesk refuse it too). Refused here, before provisioning, so it never leaves a person's
+    // temporary ilk, keyed by their email, in the root tenant.
+    if tenant_id == fluxbee_sdk::DEFAULT_ROOT_TENANT_ID {
+        return Err(cloud_error_code(
+            "TENANT_ROOT_NOT_REGISTRABLE",
+            "register_human cannot register a person into the root tenant",
+        ));
+    }
     // Email is the human's stable unique key; identity owns idempotency on (cloud, email, tenant).
     // Require a real address so a bare token can never collide with io.cloud's own channel keys.
     let Some(email) = handoff
@@ -1831,7 +1840,21 @@ mod tests {
     }
 
     #[test]
-    fn register_human_gate_uses_root_tenant_and_injects_it() {
+    fn register_human_refuses_the_root_tenant_before_provisioning() {
+        let err = parse_register_human_request(&json!({
+            "op": "register_human", "tenant_id": fluxbee_sdk::DEFAULT_ROOT_TENANT_ID,
+            "params": {
+                "type": "frontdesk_handoff", "schema_version": 1, "operation": "complete_registration",
+                "subject": {"display_name": "Juan Perez", "email": "juan@acme.com"}
+            }
+        }))
+        .expect_err("the root tenant takes no people");
+        assert_eq!(err["status"], "error");
+        assert_eq!(err["error_code"], "TENANT_ROOT_NOT_REGISTRABLE");
+    }
+
+    #[test]
+    fn register_human_gate_takes_the_tenant_from_the_envelope_root_and_injects_it() {
         let tnt = "tnt:11111111-1111-4111-8111-111111111111";
         // The frontdesk_handoff params (tenant_id is NOT here — it lives at the envelope ROOT).
         let params = |over: Value| {

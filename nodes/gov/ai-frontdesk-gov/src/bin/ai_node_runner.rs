@@ -30,7 +30,7 @@ use gov_common::{
     },
     gov_identity_config_from_env, identity_error_is_transient, identity_error_log_summary,
     identity_error_to_tool_payload, resolve_case_tenant, GovIdentityConfig, CASE_TENANT_MISMATCH,
-    CASE_TENANT_MISSING,
+    CASE_TENANT_MISSING, TENANT_ROOT_NOT_REGISTRABLE,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -432,11 +432,13 @@ fn case_tenant_of(
     resolve_case_tenant(tenant.as_deref(), informed_tenant)
 }
 
-/// The tool's answer when the tenant of the case is unknown or contradicted: no ILK_REGISTER is
-/// sent and no tenant is created.
+/// The tool's answer when the case has no tenant to register into (unknown, contradicted, or the
+/// root tenant): no ILK_REGISTER is sent and no tenant is created.
 fn case_tenant_error_payload(error_code: &str) -> Value {
     let message = if error_code == CASE_TENANT_MISMATCH {
         "the tenant informed with the case is not the tenant of its ILK; nothing was registered"
+    } else if error_code == TENANT_ROOT_NOT_REGISTRABLE {
+        "the case belongs to the root tenant, where nobody registers; nothing was registered and the ILK stays temporary"
     } else {
         "the tenant of the case is unknown (its ILK's tenant could not be read); nothing was registered and no tenant was created"
     };
@@ -911,6 +913,19 @@ impl AiNode for GenericAiNode {
                     self.handle_frontdesk_handoff(&msg, &behavior_ctx, handoff)
                         .await?,
                 ));
+            }
+            // A case of the root tenant can never be registered (nobody registers there), so the
+            // conversation does not start: the answer is final and needs neither the LLM nor
+            // SY.identity.
+            if let Some(result) = self.root_tenant_case_result(&behavior_ctx) {
+                tracing::warn!(
+                    node_name = %self.node_name,
+                    trace_id = %msg.routing.trace_id,
+                    src_ilk = ?behavior_ctx.src_ilk,
+                    error_code = TENANT_ROOT_NOT_REGISTRABLE,
+                    "frontdesk: a case of the root tenant (ilk NOT registered, stays temporary)"
+                );
+                return Ok(Some(build_frontdesk_result_reply(&msg, result)?));
             }
         }
         // Everything past here is the conversational/LLM method, which DOES require the node
@@ -1448,6 +1463,20 @@ impl GenericAiNode {
         store.delete(src_ilk).await
     }
 
+    /// The final answer to a case of the root tenant, where nobody registers. `None` for any other
+    /// case, including one whose tenant cannot be read (its registration answers that).
+    fn root_tenant_case_result(&self, ctx: &BehaviorContext) -> Option<FrontdeskResultPayload> {
+        match case_tenant_of(&self.ilk_tenant, ctx.src_ilk.as_deref(), None) {
+            Err(TENANT_ROOT_NOT_REGISTRABLE) => {
+                Some(build_frontdesk_result_from_register_response(
+                    &case_tenant_error_payload(TENANT_ROOT_NOT_REGISTRABLE),
+                    ctx.src_ilk.clone(),
+                ))
+            }
+            _ => None,
+        }
+    }
+
     async fn handle_frontdesk_handoff(
         &self,
         msg: &Message,
@@ -1528,7 +1557,8 @@ impl GenericAiNode {
                     .and_then(|state| state.collected.company_name.clone())
             });
         // The tenant of the case is the one SY.identity holds for its ILK; the handoff's tenant_id
-        // only has to agree with it. Without one, nothing is registered and no tenant is created.
+        // only has to agree with it. Without one, or when it is the root tenant (where nobody
+        // registers), nothing is registered and no tenant is created.
         let informed_tenant_id = handoff
             .tenant_id
             .as_deref()
@@ -1554,7 +1584,7 @@ impl GenericAiNode {
                     src_ilk = ?ctx.src_ilk,
                     informed_tenant_id = ?informed_tenant_id,
                     error_code = error["error_code"].as_str().unwrap_or_default(),
-                    "frontdesk handoff: no tenant for the case (ilk NOT registered, no tenant created)"
+                    "frontdesk handoff: no tenant to register the case into (ilk NOT registered, no tenant created)"
                 );
                 let result =
                     build_frontdesk_result_from_register_response(&error, ctx.src_ilk.clone());
@@ -2320,7 +2350,8 @@ impl FunctionTool for IlkRegisterTool {
             }));
         }
 
-        // The tenant of the case, never one the person or the LLM gives, and never a new one.
+        // The tenant of the case, never one the person or the LLM gives, never a new one, and
+        // never the root tenant.
         let tenant_id = match case_tenant_of(
             &self.ilk_tenant,
             Some(src_ilk),
@@ -2333,7 +2364,7 @@ impl FunctionTool for IlkRegisterTool {
                     src_ilk = %src_ilk,
                     informed_tenant_id = ?self.informed_tenant_id,
                     error_code,
-                    "the tenant of the case is not known: ILK_REGISTER not sent, no tenant created"
+                    "no tenant to register the case into: ILK_REGISTER not sent, no tenant created"
                 );
                 return Ok(case_tenant_error_payload(error_code));
             }
@@ -3245,6 +3276,7 @@ fn frontdesk_structured_response_payload(payload: &FrontdeskResultPayload, contr
             "INVALID_REQUEST" => "invalid_request",
             "IDENTITY_UNAVAILABLE" => "identity_unavailable",
             "TENANT_UNRESOLVED" => "tenant_unresolved",
+            "TENANT_NOT_REGISTRABLE" => "tenant_not_registrable",
             "REGISTER_FAILED" => "register_failed",
             _ => "unknown",
         })
@@ -3352,6 +3384,13 @@ fn build_frontdesk_result_from_register_response(
         (
             "TENANT_UNRESOLVED",
             "No pude completar el registro: este contacto no tiene una organización asignada.",
+        )
+    } else if error_code == TENANT_ROOT_NOT_REGISTRABLE {
+        // The case is of the root tenant, where nobody registers: the same final answer whether
+        // the frontdesk saw it or SY.identity did.
+        (
+            "TENANT_NOT_REGISTRABLE",
+            "No puedo completar el registro por este canal: no pertenece a ninguna organización.",
         )
     } else if error_code.starts_with("INVALID_")
         || matches!(
@@ -4404,10 +4443,16 @@ mod tests {
     const OTHER_TENANT: &str = "tnt:33333333-3333-4333-8333-333333333333";
     const UNKNOWN_ILK: &str = "ilk:44444444-4444-4444-8444-444444444444";
     const REGISTERED_ILK: &str = "ilk:55555555-5555-4555-8555-555555555555";
+    const ROOT_ILK: &str = "ilk:66666666-6666-4666-8666-666666666666";
 
-    /// The identity SHM of the tests: TEST_ILK is a temporary ILK of TEST_TENANT.
+    /// The identity SHM of the tests: TEST_ILK is a temporary ILK of TEST_TENANT, and ROOT_ILK one
+    /// a root-tenant IO node provisioned.
     fn test_ilk_tenant() -> IlkTenantLookup {
-        Arc::new(|ilk_id: &str| (ilk_id == TEST_ILK).then(|| TEST_TENANT.to_string()))
+        Arc::new(|ilk_id: &str| match ilk_id {
+            TEST_ILK => Some(TEST_TENANT.to_string()),
+            ROOT_ILK => Some(fluxbee_sdk::DEFAULT_ROOT_TENANT_ID.to_string()),
+            _ => None,
+        })
     }
 
     fn register_failure(error_code: &str) -> FrontdeskResultPayload {
@@ -4708,6 +4753,110 @@ mod tests {
         );
         assert_eq!(mismatch.result_code, "INVALID_REQUEST");
         assert_eq!(mismatch.error_code.as_deref(), Some(CASE_TENANT_MISMATCH));
+    }
+
+    #[test]
+    fn a_root_tenant_case_is_a_final_tenant_not_registrable() {
+        // The same answer whether the frontdesk sees the root tenant or SY.identity answers it.
+        for result in [
+            build_frontdesk_result_from_register_response(
+                &case_tenant_error_payload(TENANT_ROOT_NOT_REGISTRABLE),
+                Some(ROOT_ILK.to_string()),
+            ),
+            register_failure(TENANT_ROOT_NOT_REGISTRABLE),
+        ] {
+            assert_eq!(result.status, "error");
+            assert_eq!(result.result_code, "TENANT_NOT_REGISTRABLE");
+            assert_eq!(
+                result.error_code.as_deref(),
+                Some(TENANT_ROOT_NOT_REGISTRABLE)
+            );
+            assert_eq!(result.registration_status.as_deref(), Some("temporary"));
+            assert!(result.human_message.contains("ninguna organización"));
+            let structured = frontdesk_structured_response_payload(&result, &producer_contract());
+            assert_eq!(structured["success"], false);
+            assert_eq!(structured["error_code"], "tenant_not_registrable");
+        }
+    }
+
+    #[tokio::test]
+    async fn ilk_register_never_registers_into_the_root_tenant() {
+        let tool = test_tool(Some(ROOT_ILK), None);
+        let (logs, _guard) = LogCapture::start();
+        let out = tool
+            .call(json!({
+                "src_ilk": ROOT_ILK,
+                "identity_candidate": { "name": "Ana", "email": "ana@example.com" }
+            }))
+            .await
+            .expect("tool call");
+        assert_eq!(out["status"], "error");
+        assert_eq!(out["error_code"], TENANT_ROOT_NOT_REGISTRABLE);
+        assert_eq!(out["retryable"], false);
+        let text = logs.text();
+        assert!(!text.contains("sending ILK_REGISTER"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn a_handoff_of_a_root_tenant_case_registers_nothing() {
+        let (node, state) = test_node_with_state();
+        for informed in [None, Some(fluxbee_sdk::DEFAULT_ROOT_TENANT_ID)] {
+            let reply = structured_reply(&node, structured_handoff(ROOT_ILK, informed)).await;
+            assert_eq!(reply["success"], false);
+            assert_eq!(reply["error_code"], "tenant_not_registrable");
+        }
+        // Not even asked for missing data (the IO first-contact gate sends none).
+        let mut first_contact = structured_handoff(ROOT_ILK, None);
+        first_contact.payload["subject"] = json!({ "attributes": { "channel_type": "slack" } });
+        let reply = structured_reply(&node, first_contact).await;
+        assert_eq!(reply["error_code"], "tenant_not_registrable");
+        assert!(state.0.lock().expect("thread state").is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_conversation_of_a_root_tenant_case_ends_before_the_llm() {
+        // No LLM configured: a case of the root tenant still gets its final answer.
+        let (node, state) = test_node_with_state();
+        let mut msg = sample_user_request_with_context(
+            json!({
+                "thread_id": "frontdesk-thread-root",
+                "response_envelope": producer_contract()
+            }),
+            Some(ROOT_ILK),
+        );
+        msg.payload = json!({ "type": "text", "content": "hola, quiero registrarme" });
+        let reply = structured_reply(&node, msg).await;
+        assert_eq!(reply["success"], false);
+        assert_eq!(reply["error_code"], "tenant_not_registrable");
+        assert!(state.0.lock().expect("thread state").is_empty());
+
+        // Without an envelope the person reads the human message.
+        let plain = sample_user_request_with_context(
+            json!({ "thread_id": "frontdesk-thread-root" }),
+            Some(ROOT_ILK),
+        );
+        let response = node
+            .on_message(plain)
+            .await
+            .expect("on_message")
+            .expect("response");
+        let text = extract_text(&response.payload).expect("text");
+        assert!(
+            text.contains("no pertenece a ninguna organización"),
+            "{text}"
+        );
+
+        // Any other case goes on to the conversation, which here needs the LLM.
+        let other = sample_user_request_with_context(
+            json!({ "thread_id": "frontdesk-thread-other" }),
+            Some(TEST_ILK),
+        );
+        let response = node
+            .on_message(other)
+            .await
+            .expect("on_message")
+            .expect("response");
+        assert_eq!(response.payload["code"], "node_not_configured");
     }
 
     #[test]

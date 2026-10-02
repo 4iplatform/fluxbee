@@ -1,6 +1,7 @@
 # SY.frontdesk.gov - Especificacion tecnica (v2)
 
-Estado: vigente (actualizada 2026-10-02: tenant del caso, sin creacion de tenants, merge por email)
+Estado: vigente (actualizada 2026-10-02: tenant del caso, sin creacion de tenants, merge por email,
+nadie se registra en el tenant raiz)
 
 > Nota de deprecacion:
 > `frontdesk_result` queda deprecado como contrato de salida de `SY.frontdesk.gov`.
@@ -55,6 +56,7 @@ No debe:
   `SY.admin`, o Fluxbee Cloud con su propio proceso (`create_tenant` de io.cloud, que pasa por
   `SY.admin`);
 - tomar el tenant de la persona, del LLM, de su config o de su entorno (seccion 4.3);
+- registrar a nadie en el tenant raiz (seccion 4.4);
 - inventar ILKs;
 - asumir que todos los consumidores requieren el mismo contrato de salida.
 
@@ -122,7 +124,8 @@ El tenant de un registro es el que `SY.identity` tiene para el ILK temporal del 
   orchestrator);
 - io.api e io.cloud provisionan con el tenant para el que los llamaron: io.api, el de su
   integracion; io.cloud, el `tenant_id` del sobre de Cloud, el tenant que creo Cloud;
-- un nodo IO sin tenant provisiona en el tenant por defecto (`fluxbee`), y el registro queda ahi.
+- un nodo IO sin tenant provisiona en el tenant por defecto (`fluxbee`), que es el tenant raiz:
+  esa persona no se puede registrar (seccion 4.4).
 
 Reglas:
 
@@ -139,6 +142,27 @@ Reglas:
 - un tenant `pending`, `suspended` o borrado no recibe registros: `SY.identity` responde
   `TENANT_PENDING`, `TENANT_SUSPENDED` o `TENANT_DELETED`, que son resultados finales
   (`REGISTER_FAILED`, no reintentables).
+
+### 4.4 Tenant raiz
+
+Nadie se registra en el tenant raiz (`tnt:00000000-0000-0000-0000-000000000001`, el `fluxbee`
+del sistema y sus nodos; decision del operador 2026-10-02). Si el tenant del caso es el raiz:
+
+- el frontdesk no llama a `SY.identity` ni guarda estado, y responde un resultado final, no
+  reintentable: `status = "error"`, `result_code = TENANT_NOT_REGISTRABLE`,
+  `error_code = TENANT_ROOT_NOT_REGISTRABLE`, `registration_status = "temporary"` y el mensaje
+  "No puedo completar el registro por este canal: no pertenece a ninguna organización.";
+- en el handoff, antes de pedir datos que falten; en el conversacional, antes de abrir la
+  conversacion (no hace falta el LLM: responde igual aunque el nodo este `UNCONFIGURED`); la tool
+  `ilk_register` tambien lo rechaza;
+- `SY.identity` aplica la misma regla para cualquier llamador (`TENANT_ROOT_NOT_REGISTRABLE`), y
+  el frontdesk la traduce al mismo resultado.
+
+La persona queda `temporary`: el `ILK_PROVISION` en el tenant raiz sigue funcionando. Es el caso
+de quien escribe por un nodo IO que corre en el tenant raiz, como las instancias base que levanta
+`fluxbee-firstboot` (`IO.api@motherbee`, `IO.wapp.default`): si su nodo IO enruta por `Resolve`,
+cada mensaje suyo vuelve al frontdesk y recibe la misma respuesta. Que hacen los nodos IO en el
+tenant raiz esta pendiente (seccion 13).
 
 ## 5. Estado por hilo
 
@@ -183,8 +207,8 @@ Se activa cuando entra `frontdesk_handoff`.
 Regla:
 
 - no abre conversacion innecesaria;
-- resuelve primero el tenant del caso (seccion 4.3); sin tenant, o con uno que no coincide, responde
-  el error y no guarda nada;
+- resuelve primero el tenant del caso (seccion 4.3); sin tenant, con uno que no coincide o con el
+  tenant raiz (seccion 4.4), responde el error y no guarda nada;
 - mergea con estado previo si corresponde;
 - si ya tiene el minimo completo, intenta registrar;
 - si sigue incompleto, responde `text` con el mensaje humano correspondiente.
@@ -195,6 +219,8 @@ Se activa con `payload.type = "text"`.
 
 Regla:
 
+- un caso del tenant raiz no abre conversacion: recibe el resultado final de la seccion 4.4, sin
+  LLM;
 - puede recolectar datos faltantes;
 - puede pedir confirmacion;
 - ante confirmacion positiva llama `ilk_register`;
@@ -335,6 +361,7 @@ Estados cerrados:
 | `IN_CONVERSATION` | `needs_input` | turno conversacional en el que no hubo registro (saludo, pedido de un dato) |
 | `INVALID_REQUEST` | `error` | pedido invalido: operacion no soportada, datos invalidos, `tenant_mismatch`, `INVALID_*` de `SY.identity` |
 | `TENANT_UNRESOLVED` | `error` | no hay tenant para el caso (`missing_tenant_id`, seccion 4.3); no se registro ni se creo nada |
+| `TENANT_NOT_REGISTRABLE` | `error` | el tenant del caso es el tenant raiz (`TENANT_ROOT_NOT_REGISTRABLE`, seccion 4.4); no se registro nada y la persona sigue `temporary` |
 | `REGISTER_FAILED` | `error` | `SY.identity` rechazo el registro con un veredicto final |
 | `IDENTITY_UNAVAILABLE` | `error` | falla transitoria, la unica reintentable |
 
@@ -343,8 +370,8 @@ Estados cerrados:
 Fallas de registro (`ILK_REGISTER`):
 
 - `IDENTITY_UNAVAILABLE` solo para fallas transitorias, las unicas reintentables: `SY.identity` no respondio (`UNREACHABLE`, `TTL_EXCEEDED`, `TIMEOUT`, `IDENTITY_ERROR`) o respondio `NOT_PRIMARY`, `DB_NOT_READY` o `DB_WRITE_FAILED`;
-- cualquier otro codigo con el que `SY.identity` responde es un veredicto final, no reintentable: `INVALID_*` -> `INVALID_REQUEST`; el resto (`TENANT_PENDING`, `TENANT_SUSPENDED`, `TENANT_DELETED`, `ILK_DELETED`, `ILK_NOT_FOUND`, `SYSTEM_ILK_PROTECTED`, `DUPLICATE_*`, `UNAUTHORIZED_REGISTRAR`, ...) -> `REGISTER_FAILED`;
-- `error_code` conserva el codigo de `SY.identity` tal cual (o el de la tool: `missing_src_ilk`, `invalid_identity_candidate`, `missing_tenant_id`, `tenant_mismatch`).
+- cualquier otro codigo con el que `SY.identity` responde es un veredicto final, no reintentable: `INVALID_*` -> `INVALID_REQUEST`; `TENANT_ROOT_NOT_REGISTRABLE` -> `TENANT_NOT_REGISTRABLE` (el mismo resultado que si lo ve el frontdesk); el resto (`TENANT_PENDING`, `TENANT_SUSPENDED`, `TENANT_DELETED`, `ILK_DELETED`, `ILK_NOT_FOUND`, `SYSTEM_ILK_PROTECTED`, `DUPLICATE_*`, `UNAUTHORIZED_REGISTRAR`, ...) -> `REGISTER_FAILED`;
+- `error_code` conserva el codigo de `SY.identity` tal cual (o el de la tool: `missing_src_ilk`, `invalid_identity_candidate`, `missing_tenant_id`, `tenant_mismatch`, y `TENANT_ROOT_NOT_REGISTRABLE`, el mismo codigo que usa `SY.identity`).
 
 `DUPLICATE_EMAIL` queda solo para un email que no se puede mergear: el ILK del registro no es un
 temporal humano del mismo tenant (por ejemplo un ILK ya `complete` que quiere el email de otro).
@@ -381,12 +408,19 @@ Deben:
   - si `success = true`, permitir que el mensaje original continue al `dst_final`;
   - si `success = false`, mapearla a la respuesta HTTP de `IO.api`.
 
+Una instancia de `IO.api` que corre en el tenant raiz (la `IO.api@motherbee` que levanta
+`fluxbee-firstboot`) provisiona a sus sujetos `by_data` en el tenant raiz: el frontdesk responde
+`success = false`, `error_code = tenant_not_registrable` (seccion 4.4), y el mensaje no sigue.
+
 ### 10.4 io.cloud `register_human`
 
 io.cloud provisiona el ILK temporal en el tenant del sobre de Cloud (canal `cloud`, direccion = el
-email) y le manda al frontdesk el `frontdesk_handoff` con ese mismo `tenant_id`. Su respuesta a Cloud
-lleva el `ilk_id` que provisiono: despues de un `MERGED` ese ILK es un alias y la persona quedo en
-otro, que hoy io.cloud no reporta (seccion 13).
+email) y le manda al frontdesk el `frontdesk_handoff` con ese mismo `tenant_id`. Pide `ilk_id` y
+`merged` en el envelope, asi su respuesta a Cloud lleva el ILK en el que quedo la persona: despues
+de un `MERGED`, el que ya tenia el email (con `merged_from_ilk_id`, el temporal que provisiono).
+
+Un sobre con el tenant raiz se rechaza antes de provisionar nada (`TENANT_ROOT_NOT_REGISTRABLE`),
+asi no queda en el tenant raiz un temporal con el email de la persona.
 
 ## 11. Configuracion y operacion
 
@@ -430,8 +464,8 @@ que campos vinieron, nunca sus valores.
 - Prueba de que la persona es duena del email (por ejemplo un codigo de un solo uso) antes del merge
   de la seccion 7.1. Hasta entonces, quien conoce el email de otro asocia su canal al ILK de esa
   persona.
-- io.cloud `register_human` reporta el ILK que provisiono, no el ILK en el que quedo la persona
-  despues de un `MERGED` (seccion 10.4); el envelope estructurado no lleva `ilk_id`.
+- Los nodos IO que corren en el tenant raiz (las instancias base de `fluxbee-firstboot`): las
+  personas que llegan por ellos quedan `temporary` (seccion 4.4). Decision del operador pendiente.
 - Los contadores de la seccion 12 (G6).
 - Los reintentos conversacionales: la regla "no loop" del prompt vuelve terminal un error
   transitorio (G8).

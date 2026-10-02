@@ -98,8 +98,9 @@ pub fn identity_error_code(err: &IdentityError) -> String {
 
 /// Whether retrying the same identity request may succeed: SY.identity did not answer, or answered
 /// with a transient condition (not the primary, DB not ready, DB write failed). Every other code it
-/// answers with — TENANT_PENDING, TENANT_SUSPENDED, TENANT_DELETED, ILK_DELETED, ILK_NOT_FOUND,
-/// SYSTEM_ILK_PROTECTED, DUPLICATE_*, INVALID_*, UNAUTHORIZED_REGISTRAR, ... — is a final verdict.
+/// answers with — TENANT_PENDING, TENANT_SUSPENDED, TENANT_DELETED, TENANT_ROOT_NOT_REGISTRABLE,
+/// ILK_DELETED, ILK_NOT_FOUND, SYSTEM_ILK_PROTECTED, DUPLICATE_*, INVALID_*,
+/// UNAUTHORIZED_REGISTRAR, ... — is a final verdict.
 pub fn identity_error_is_transient(error_code: &str) -> bool {
     matches!(
         error_code,
@@ -149,12 +150,17 @@ pub fn looks_like_tenant_id(raw: &str) -> bool {
 pub const CASE_TENANT_MISSING: &str = "missing_tenant_id";
 /// The tenant the producer informed is not the tenant of the case's ILK: nothing is registered.
 pub const CASE_TENANT_MISMATCH: &str = "tenant_mismatch";
+/// The case belongs to the root tenant, where nobody registers (operator decision 2026-10-02):
+/// SY.identity's own code, which the frontdesk also answers by itself, without calling it.
+pub const TENANT_ROOT_NOT_REGISTRABLE: &str = "TENANT_ROOT_NOT_REGISTRABLE";
 
 /// The tenant a registration goes into: the one SY.identity holds for the case's temporary ILK.
 /// The IO node that provisioned it gave it its own tenant (io.api and io.cloud, the tenant they
 /// were called for). A tenant the producer informed (`frontdesk_handoff.tenant_id`) must be that
 /// same one. There is no other source: the frontdesk takes no tenant from the person, the LLM,
-/// its config or its environment, and never creates one. The error is the tool error code.
+/// its config or its environment, and never creates one. The root tenant is never one: a person
+/// provisioned there (by a root-tenant IO node) cannot be registered and stays temporary. The
+/// error is the tool error code.
 pub fn resolve_case_tenant(
     ilk_tenant: Option<&str>,
     informed_tenant: Option<&str>,
@@ -170,6 +176,9 @@ pub fn resolve_case_tenant(
         .filter(|tenant| !tenant.is_empty());
     if informed.is_some_and(|informed| informed != ilk_tenant) {
         return Err(CASE_TENANT_MISMATCH);
+    }
+    if ilk_tenant == fluxbee_sdk::DEFAULT_ROOT_TENANT_ID {
+        return Err(TENANT_ROOT_NOT_REGISTRABLE);
     }
     Ok(ilk_tenant.to_string())
 }
@@ -192,6 +201,7 @@ mod tests {
             "TENANT_PENDING",
             "TENANT_SUSPENDED",
             "TENANT_DELETED",
+            TENANT_ROOT_NOT_REGISTRABLE,
             "ILK_DELETED",
             "ILK_NOT_FOUND",
             "SYSTEM_ILK_PROTECTED",
@@ -287,6 +297,30 @@ mod tests {
         assert_eq!(
             resolve_case_tenant(Some("acme"), None),
             Err(CASE_TENANT_MISSING)
+        );
+    }
+
+    #[test]
+    fn a_case_of_the_root_tenant_has_no_tenant_to_register_into() {
+        let root = fluxbee_sdk::DEFAULT_ROOT_TENANT_ID;
+        assert_eq!(
+            resolve_case_tenant(Some(root), None),
+            Err(TENANT_ROOT_NOT_REGISTRABLE)
+        );
+        // The producer informing it changes nothing.
+        assert_eq!(
+            resolve_case_tenant(Some(root), Some(root)),
+            Err(TENANT_ROOT_NOT_REGISTRABLE)
+        );
+        // Neither does one that names another tenant: that is a contradiction first.
+        assert_eq!(
+            resolve_case_tenant(Some(root), Some(CASE_TENANT)),
+            Err(CASE_TENANT_MISMATCH)
+        );
+        // And the root tenant informed for a case of another is no way into it.
+        assert_eq!(
+            resolve_case_tenant(Some(CASE_TENANT), Some(root)),
+            Err(CASE_TENANT_MISMATCH)
         );
     }
 
