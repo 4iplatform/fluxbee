@@ -2658,7 +2658,7 @@ async fn handle_admin(
 async fn handle_system_message(
     sender: &NodeSender,
     msg: &Message,
-    state: &OrchestratorState,
+    state: &Arc<OrchestratorState>,
 ) -> Result<(), OrchestratorError> {
     // SYSTEM origin-authority is enforced centrally by the router at delivery time
     // (system_policy::authorize_system); an unauthorized protected SYSTEM action should
@@ -4052,6 +4052,291 @@ async fn core_rollback_local(
     })
 }
 
+/// A core update with its new binaries and units in place, waiting for its restarts.
+struct PreparedCoreUpdate {
+    updated: Vec<String>,
+    unchanged: Vec<String>,
+    backup_dir: PathBuf,
+    created_without_backup: HashSet<String>,
+}
+
+enum CorePrepareOutcome {
+    /// Binaries and units are in place; the services still run the old ones.
+    Ready(PreparedCoreUpdate),
+    /// Nothing to restart: the preparation already ended (and rolled back).
+    Done(SystemUpdateApplyResult),
+}
+
+/// Phases A-C of a core update plus the unit regeneration: back up and stamp what is replaced,
+/// swap the binaries in, re-render this role's units. Restarting is `restart_core_after_update`.
+fn prepare_core_update(state: &OrchestratorState) -> Result<CorePrepareOutcome, OrchestratorError> {
+    let manifest = load_core_manifest()?;
+    let (updated, unchanged) = compute_local_core_update_sets(&manifest, state.role)?;
+    let backup_dir = core_backup_root_dir().join(format!("update-{}", now_epoch_ms()));
+    // Created LAZILY, on the first binary we actually back up. It used to be created
+    // unconditionally, which left an empty `update-<ms>/` behind on every no-op update —
+    // so "restore the most recent backup" would have restored nothing.
+    let mut backup_dir_created = false;
+    let mut created_without_backup = HashSet::new();
+    let mut installed = Vec::new();
+    let mut backup_components: Vec<CoreBackupComponent> = Vec::new();
+
+    // PHASE A — back up every component we are about to replace, and STAMP it. The
+    // stamp is written before the first swap so a crash mid-update still leaves a
+    // rollback target that describes itself.
+    for name in &updated {
+        let target_path = Path::new("/usr/bin").join(name);
+        if target_path.exists() {
+            if !backup_dir_created {
+                fs::create_dir_all(&backup_dir)?;
+                backup_dir_created = true;
+            }
+            let backup_path = backup_dir.join(name);
+            fs::copy(&target_path, &backup_path)?;
+            // Hash the COPY, not the source: a short write is caught here, while there
+            // is still a good binary in /usr/bin to keep.
+            backup_components.push(CoreBackupComponent {
+                name: name.clone(),
+                sha256: sha256_file(&backup_path)?,
+                size: fs::metadata(&backup_path)?.len(),
+            });
+        } else {
+            created_without_backup.insert(name.clone());
+        }
+    }
+
+    // PHASE B — the stamp.
+    if backup_dir_created {
+        let generation = CoreBackupGeneration {
+            schema_version: 1,
+            generation: backup_dir
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or_default()
+                .to_string(),
+            created_at_ms: now_epoch_ms() as u64,
+            hive_id: state.hive_id.clone(),
+            role: format!("{:?}", state.role).to_lowercase(),
+            replaced_manifest_hash: read_core_installed_record().and_then(|r| {
+                r.get("manifest_hash")
+                    .and_then(|v| v.as_str().map(String::from))
+            }),
+            applied_manifest_hash: local_core_manifest_hash().ok().flatten(),
+            components: backup_components,
+            created_without_backup: created_without_backup.iter().cloned().collect(),
+        };
+        let stamp = serde_json::to_vec_pretty(&generation)?;
+        write_file_atomic(&backup_dir.join(CORE_GENERATION_MANIFEST_NAME), &stamp)?;
+    }
+
+    // PHASE C — the swap.
+    for name in &updated {
+        let source_path = local_core_bin_source_path(name);
+        let target_path = Path::new("/usr/bin").join(name);
+        let stage_path = Path::new("/usr/bin").join(format!(".{name}.fluxbee.tmp"));
+        if let Err(err) = (|| -> Result<(), OrchestratorError> {
+            fs::copy(&source_path, &stage_path)?;
+            set_exec_0755(&stage_path)?;
+            fs::rename(&stage_path, &target_path)?;
+            Ok(())
+        })() {
+            let rollback_note = match rollback_local_core_binaries(
+                &installed,
+                &backup_dir,
+                &created_without_backup,
+            ) {
+                Ok(()) => "rollback applied".to_string(),
+                Err(rb_err) => format!("rollback failed: {rb_err}"),
+            };
+            return Err(format!(
+                "core local install failed for component '{}': {}; {}",
+                name, err, rollback_note
+            )
+            .into());
+        }
+        installed.push(name.clone());
+    }
+
+    // Unit-file changes (TimeoutStopSec, dependency edits) ride a category=core update:
+    // after swapping binaries, re-render this role's units and daemon-reload BEFORE the
+    // restart, so the new binaries start under the new units. A regen failure is treated
+    // like a health-gate failure — roll the binaries back so binaries+units stay
+    // consistent (regenerated unit files are benign to leave in place: a unit adding
+    // TimeoutStopSec still runs the rolled-back binary fine).
+    if let Err(err) = regen_local_core_units(&manifest, state.role) {
+        let rollback_note =
+            match rollback_local_core_binaries(&updated, &backup_dir, &created_without_backup) {
+                Ok(()) => "rollback applied".to_string(),
+                Err(rb_err) => format!("rollback failed: {rb_err}"),
+            };
+        return Ok(CorePrepareOutcome::Done(SystemUpdateApplyResult {
+            status: "rollback".to_string(),
+            updated: Vec::new(),
+            unchanged,
+            restarted: Vec::new(),
+            errors: vec![format!("core unit regen failed: {err}; {rollback_note}")],
+        }));
+    }
+
+    Ok(CorePrepareOutcome::Ready(PreparedCoreUpdate {
+        updated,
+        unchanged,
+        backup_dir,
+        created_without_backup,
+    }))
+}
+
+/// Restart the core services onto the prepared update (health-gated, rt-gateway first), roll
+/// the binaries back if the gate fails, and record the outcome in `core-update-last.json`.
+async fn restart_core_after_update(prepared: PreparedCoreUpdate) -> SystemUpdateApplyResult {
+    let PreparedCoreUpdate {
+        updated,
+        unchanged,
+        backup_dir,
+        created_without_backup,
+    } = prepared;
+    let started_at_ms = now_epoch_ms().to_string();
+    write_core_update_last_record(&serde_json::json!({
+        "phase": "restarting",
+        "started_at_ms": started_at_ms,
+        "updated": updated,
+        "unchanged": unchanged,
+    }));
+    let attempted = updated.clone();
+    let result = match restart_local_core_services_with_health_gate().await {
+        Ok(restarted) => {
+            // sy-orchestrator excludes itself from the in-process restart above, so if
+            // its own binary was swapped, schedule a detached self-restart to pick it up
+            // (and its regenerated unit) hands-off.
+            if updated.iter().any(|n| n == "sy-orchestrator") {
+                schedule_orchestrator_self_restart();
+            }
+            // Only on the success path: a rollback still needs its generation on disk.
+            prune_core_backup_generations(CORE_BACKUP_GENERATIONS_KEPT);
+            write_core_installed_record(
+                local_core_manifest_hash().ok().flatten(),
+                "update",
+                serde_json::json!({ "components": updated }),
+            );
+            SystemUpdateApplyResult {
+                status: "ok".to_string(),
+                updated,
+                unchanged,
+                restarted,
+                errors: Vec::new(),
+            }
+        }
+        Err(err) => {
+            let rollback_note = match rollback_local_core_binaries(
+                &updated,
+                &backup_dir,
+                &created_without_backup,
+            ) {
+                Ok(()) => match restart_local_core_services_with_health_gate().await {
+                    Ok(_) => "rollback applied and services recovered".to_string(),
+                    Err(rb_restart_err) => {
+                        format!("rollback applied but service recovery failed: {rb_restart_err}")
+                    }
+                },
+                Err(rb_err) => format!("rollback failed: {rb_err}"),
+            };
+            SystemUpdateApplyResult {
+                status: "rollback".to_string(),
+                updated: Vec::new(),
+                unchanged,
+                restarted: Vec::new(),
+                errors: vec![format!("core health gate failed: {err}; {rollback_note}")],
+            }
+        }
+    };
+    write_core_update_last_record(&serde_json::json!({
+        "phase": "done",
+        "status": result.status,
+        "started_at_ms": started_at_ms,
+        "finished_at_ms": now_epoch_ms().to_string(),
+        "updated": attempted,
+        "restarted": result.restarted,
+        "errors": result.errors,
+    }));
+    result
+}
+
+fn core_update_last_record_path() -> PathBuf {
+    orchestrator_runtime_dir().join("core-update-last.json")
+}
+
+/// The last core update's progress and outcome: `phase` restarting|done, `status` ok|rollback.
+fn read_core_update_last_record() -> Option<serde_json::Value> {
+    let raw = fs::read_to_string(core_update_last_record_path()).ok()?;
+    serde_json::from_str(&raw).ok()
+}
+
+fn write_core_update_last_record(record: &serde_json::Value) {
+    match serde_json::to_vec_pretty(record) {
+        Ok(bytes) => {
+            if let Err(err) = write_file_atomic(&core_update_last_record_path(), &bytes) {
+                tracing::warn!(error = %err, "could not record the core update outcome");
+            }
+        }
+        Err(err) => tracing::warn!(error = %err, "could not serialize the core update outcome"),
+    }
+}
+
+/// How long the background restart waits before stopping rt-gateway, so the SYSTEM_UPDATE reply
+/// leaves on the bus it is about to restart.
+const CORE_RESTART_GRACE: Duration = Duration::from_secs(2);
+
+/// SYSTEM_UPDATE category=core answers once the new binaries and units are in place, and restarts
+/// in the background (U-8b). The restart begins with rt-gateway, the bus the reply travels on, so
+/// a reply sent after the restarts went out on a dead connection and was lost: by protocol the
+/// SDK drops unsent frames on reconnect and resending is the node's job (02-protocolo §10.6).
+/// The background task holds the lifecycle lock from preparation to the end of the restarts, so
+/// no other update interleaves; the outcome is in `core-update-last.json` (`/versions`:
+/// `core.last_update`).
+async fn apply_core_update_replying_first(
+    state: &Arc<OrchestratorState>,
+) -> Result<(SystemUpdateApplyResult, &'static str), OrchestratorError> {
+    let (prepared_tx, prepared_rx) =
+        tokio::sync::oneshot::channel::<Result<(SystemUpdateApplyResult, &'static str), String>>();
+    let state = Arc::clone(state);
+    tokio::spawn(async move {
+        let _lifecycle_guard = state.runtime_lifecycle_lock.lock().await;
+        let prepared = match prepare_core_update(&state) {
+            Err(err) => {
+                let _ = prepared_tx.send(Err(err.to_string()));
+                return;
+            }
+            Ok(CorePrepareOutcome::Done(result)) => {
+                let _ = prepared_tx.send(Ok((result, "done")));
+                return;
+            }
+            Ok(CorePrepareOutcome::Ready(prepared)) => prepared,
+        };
+        let ack = SystemUpdateApplyResult {
+            status: "ok".to_string(),
+            updated: prepared.updated.clone(),
+            unchanged: prepared.unchanged.clone(),
+            restarted: Vec::new(),
+            errors: Vec::new(),
+        };
+        // The restarts go ahead even if nobody waits for the answer any more.
+        let _ = prepared_tx.send(Ok((ack, "restarting")));
+        time::sleep(CORE_RESTART_GRACE).await;
+        let result = restart_core_after_update(prepared).await;
+        tracing::info!(
+            status = %result.status,
+            restarted = ?result.restarted,
+            errors = ?result.errors,
+            "core update: background restarts finished"
+        );
+    });
+    match prepared_rx.await {
+        Ok(Ok(outcome)) => Ok(outcome),
+        Ok(Err(message)) => Err(message.into()),
+        Err(_) => Err("core update task ended before it prepared the update".into()),
+    }
+}
+
 async fn apply_system_update_local(
     state: &OrchestratorState,
     request: &SystemUpdateRequest,
@@ -4118,163 +4403,10 @@ async fn apply_system_update_local(
                 errors: Vec::new(),
             })
         }
-        "core" => {
-            let manifest = load_core_manifest()?;
-            let (updated, unchanged) = compute_local_core_update_sets(&manifest, state.role)?;
-            let backup_dir = core_backup_root_dir().join(format!("update-{}", now_epoch_ms()));
-            // Created LAZILY, on the first binary we actually back up. It used to be created
-            // unconditionally, which left an empty `update-<ms>/` behind on every no-op update —
-            // so "restore the most recent backup" would have restored nothing.
-            let mut backup_dir_created = false;
-            let mut created_without_backup = HashSet::new();
-            let mut installed = Vec::new();
-            let mut backup_components: Vec<CoreBackupComponent> = Vec::new();
-
-            // PHASE A — back up every component we are about to replace, and STAMP it. The
-            // stamp is written before the first swap so a crash mid-update still leaves a
-            // rollback target that describes itself.
-            for name in &updated {
-                let target_path = Path::new("/usr/bin").join(name);
-                if target_path.exists() {
-                    if !backup_dir_created {
-                        fs::create_dir_all(&backup_dir)?;
-                        backup_dir_created = true;
-                    }
-                    let backup_path = backup_dir.join(name);
-                    fs::copy(&target_path, &backup_path)?;
-                    // Hash the COPY, not the source: a short write is caught here, while there
-                    // is still a good binary in /usr/bin to keep.
-                    backup_components.push(CoreBackupComponent {
-                        name: name.clone(),
-                        sha256: sha256_file(&backup_path)?,
-                        size: fs::metadata(&backup_path)?.len(),
-                    });
-                } else {
-                    created_without_backup.insert(name.clone());
-                }
-            }
-
-            // PHASE B — the stamp.
-            if backup_dir_created {
-                let generation = CoreBackupGeneration {
-                    schema_version: 1,
-                    generation: backup_dir
-                        .file_name()
-                        .and_then(|n| n.to_str())
-                        .unwrap_or_default()
-                        .to_string(),
-                    created_at_ms: now_epoch_ms() as u64,
-                    hive_id: state.hive_id.clone(),
-                    role: format!("{:?}", state.role).to_lowercase(),
-                    replaced_manifest_hash: read_core_installed_record()
-                        .and_then(|r| r.get("manifest_hash").and_then(|v| v.as_str().map(String::from))),
-                    applied_manifest_hash: local_core_manifest_hash().ok().flatten(),
-                    components: backup_components,
-                    created_without_backup: created_without_backup.iter().cloned().collect(),
-                };
-                let stamp = serde_json::to_vec_pretty(&generation)?;
-                write_file_atomic(&backup_dir.join(CORE_GENERATION_MANIFEST_NAME), &stamp)?;
-            }
-
-            // PHASE C — the swap.
-            for name in &updated {
-                let source_path = local_core_bin_source_path(name);
-                let target_path = Path::new("/usr/bin").join(name);
-                let stage_path = Path::new("/usr/bin").join(format!(".{name}.fluxbee.tmp"));
-                if let Err(err) = (|| -> Result<(), OrchestratorError> {
-                    fs::copy(&source_path, &stage_path)?;
-                    set_exec_0755(&stage_path)?;
-                    fs::rename(&stage_path, &target_path)?;
-                    Ok(())
-                })() {
-                    let rollback_note = match rollback_local_core_binaries(
-                        &installed,
-                        &backup_dir,
-                        &created_without_backup,
-                    ) {
-                        Ok(()) => "rollback applied".to_string(),
-                        Err(rb_err) => format!("rollback failed: {rb_err}"),
-                    };
-                    return Err(format!(
-                        "core local install failed for component '{}': {}; {}",
-                        name, err, rollback_note
-                    )
-                    .into());
-                }
-                installed.push(name.clone());
-            }
-
-            // Unit-file changes (TimeoutStopSec, dependency edits) ride a category=core update:
-            // after swapping binaries, re-render this role's units and daemon-reload BEFORE the
-            // restart, so the new binaries start under the new units. A regen failure is treated
-            // like a health-gate failure — roll the binaries back so binaries+units stay
-            // consistent (regenerated unit files are benign to leave in place: a unit adding
-            // TimeoutStopSec still runs the rolled-back binary fine).
-            if let Err(err) = regen_local_core_units(&manifest, state.role) {
-                let rollback_note = match rollback_local_core_binaries(
-                    &updated,
-                    &backup_dir,
-                    &created_without_backup,
-                ) {
-                    Ok(()) => "rollback applied".to_string(),
-                    Err(rb_err) => format!("rollback failed: {rb_err}"),
-                };
-                return Ok(SystemUpdateApplyResult {
-                    status: "rollback".to_string(),
-                    updated: Vec::new(),
-                    unchanged,
-                    restarted: Vec::new(),
-                    errors: vec![format!("core unit regen failed: {err}; {rollback_note}")],
-                });
-            }
-
-            match restart_local_core_services_with_health_gate().await {
-                Ok(restarted) => {
-                    // sy-orchestrator excludes itself from the in-process restart above, so if
-                    // its own binary was swapped, schedule a detached self-restart to pick it up
-                    // (and its regenerated unit) hands-off.
-                    if updated.iter().any(|n| n == "sy-orchestrator") {
-                        schedule_orchestrator_self_restart();
-                    }
-                    // Only on the success path: a rollback still needs its generation on disk.
-                    prune_core_backup_generations(CORE_BACKUP_GENERATIONS_KEPT);
-                    write_core_installed_record(
-                        local_core_manifest_hash().ok().flatten(),
-                        "update",
-                        serde_json::json!({ "components": updated }),
-                    );
-                    Ok(SystemUpdateApplyResult {
-                        status: "ok".to_string(),
-                        updated,
-                        unchanged,
-                        restarted,
-                        errors: Vec::new(),
-                    })
-                }
-                Err(err) => {
-                    let rollback_note = match rollback_local_core_binaries(
-                        &updated,
-                        &backup_dir,
-                        &created_without_backup,
-                    ) {
-                        Ok(()) => match restart_local_core_services_with_health_gate().await {
-                            Ok(_) => "rollback applied and services recovered".to_string(),
-                            Err(rb_restart_err) => {
-                                format!("rollback applied but service recovery failed: {rb_restart_err}")
-                            }
-                        },
-                        Err(rb_err) => format!("rollback failed: {rb_err}"),
-                    };
-                    Ok(SystemUpdateApplyResult {
-                        status: "rollback".to_string(),
-                        updated: Vec::new(),
-                        unchanged,
-                        restarted: Vec::new(),
-                        errors: vec![format!("core health gate failed: {err}; {rollback_note}")],
-                    })
-                }
-            }
-        }
+        "core" => match prepare_core_update(state)? {
+            CorePrepareOutcome::Done(result) => Ok(result),
+            CorePrepareOutcome::Ready(prepared) => Ok(restart_core_after_update(prepared).await),
+        },
         "vendor" => {
             let desired_blob = current_blob_runtime_config(state);
             let desired_dist = current_dist_runtime_config(state);
@@ -4307,7 +4439,7 @@ async fn apply_system_update_local(
 }
 
 async fn handle_system_update_message(
-    state: &OrchestratorState,
+    state: &Arc<OrchestratorState>,
     msg: &Message,
 ) -> serde_json::Value {
     let request = match parse_system_update_payload(&msg.payload) {
@@ -4436,9 +4568,19 @@ async fn handle_system_update_message(
         None
     };
 
-    match apply_system_update_local(state, &request).await {
-        Ok(result) => serde_json::json!({
+    let applied = if category == "core" {
+        apply_core_update_replying_first(state).await
+    } else {
+        apply_system_update_local(state, &request)
+            .await
+            .map(|result| (result, "done"))
+    };
+    match applied {
+        Ok((result, phase)) => serde_json::json!({
             "status": result.status,
+            // `restarting`: a core update whose new binaries are in place and whose services are
+            // restarting in the background; its outcome is `/versions` -> core.last_update.
+            "phase": phase,
             "category": category,
             "hive": state.hive_id.as_str(),
             "manifest_version": expected_version,
@@ -8634,6 +8776,8 @@ fn local_versions_snapshot(state: &OrchestratorState) -> serde_json::Value {
                 // What is actually in /usr/bin, and how it got there. `null` on a hive that has
                 // never been updated by this build.
                 "installed": read_core_installed_record(),
+                // The last core update: `phase` restarting|done, `status` ok|rollback, errors.
+                "last_update": read_core_update_last_record(),
                 "rollback_generations": rollback_generations,
             })
         }

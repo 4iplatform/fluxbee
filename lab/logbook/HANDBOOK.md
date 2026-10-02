@@ -937,11 +937,17 @@ GET /versions                  ->  payload.comparison.verdict   y   payload.comp
 > girado 600 s sobre un join **exitoso**. Si estás por escribir un `while` sobre una respuesta de
 > esta API, chequeá primero en qué campo estás mirando.
 
-### ⚠️ `update category=core` devuelve TIMEOUT aunque funcione
+### `update category=core` responde antes de reiniciar (desde 0.1.55)
 
-La llamada corta a los 60 s con `error_code: TIMEOUT` **incluso cuando el update se completó**: el
-update reinicia al propio `sy-orchestrator` del destino, que es justamente quien debía responder.
-**No lo reintentes ciegamente** — verificá con el chequeo de arriba antes de concluir nada.
+**La respuesta llega cuando el destino ya tiene los binarios y las units nuevos**, con
+`phase: "restarting"`. Los reinicios corren después, en segundo plano: el health gate, y el rollback
+si el gate falla.
+
+- **Cómo se sabe cómo terminó:** en `GET /hives/{hive}/versions`, `core.last_update` (`phase`
+  `restarting|done`, `status` `ok|rollback`, `errors`).
+- **Antes de 0.1.55** respondía TIMEOUT aunque funcionara (U-8b). La respuesta salía por el router
+  que el propio update acababa de reiniciar y se perdía.
+- **No reintentes ciegamente:** verificá con el chequeo de arriba, o con `core.last_update`.
 
 ### ⚠️ Los nodos runtime y el orden de recuperación
 

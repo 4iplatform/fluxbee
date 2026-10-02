@@ -292,15 +292,27 @@ def cmd_deploy(a):
 
     spokes = [h for h in hives() if h != PRIMARY]
     print("== core update: %s" % ", ".join(spokes))
-    # The call answers TIMEOUT even when the update works (PENDING-BUGS U-8b): fire them all at
-    # once and judge by what each spoke reports, not by the answer.
-    threads = [threading.Thread(target=admin, args=(
-        "POST", "/hives/%s/update" % h, {"category": "core", "manifest_version": 0, "manifest_hash": digest}))
-        for h in spokes]
+    # Since U-8b the call answers once the spoke has the new binaries in place (phase
+    # `restarting`); the restarts run after it. Fire them all at once, print each answer, and
+    # still judge each spoke by what it reports once it is back.
+    replies = {}
+
+    def update(h):
+        replies[h] = admin("POST", "/hives/%s/update" % h,
+                           {"category": "core", "manifest_version": 0, "manifest_hash": digest})
+
+    threads = [threading.Thread(target=update, args=(h,)) for h in spokes]
     for t in threads:
         t.start()
     for t in threads:
         t.join()
+    for h in spokes:
+        r = replies.get(h) or {}
+        p = r.get("payload") or {}
+        print("  %s answered: status=%s%s%s" % (
+            h, r.get("status") or p.get("status") or r.get("raw", "")[:60],
+            " error_code=%s" % (r.get("error_code") or p.get("error_code")) if (r.get("error_code") or p.get("error_code")) else "",
+            " phase=%s" % p.get("phase") if p.get("phase") else ""))
     for h in spokes:
         def spoke_ready(h=h):
             status, versions, got = core_of(h)

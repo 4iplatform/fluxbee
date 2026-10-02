@@ -47,7 +47,7 @@ infraestructura (serie `B-*` de FINDINGS) no entran salvo que impliquen un cambi
 | [U-6](#u-6) | 🟡 mitigado | La carrera era **el orquestador contra sí mismo**: escritura no atómica de 35 MB | — |
 | [U-7](#u-7) | ✅ **cerrado** | El watchdog reiniciaba syncthing cada ~7 s por una carpeta inexistente | — |
 | [U-8a](#u-8a) | 🟡 abierto | La API de admin no tiene contrato para operaciones largas · se cierra con [PB-7](#pb-7) | no |
-| [U-8b](#u-8b) | 🟡 reescrito | `update category=core` da TIMEOUT a los 60 s · **la causa que estaba escrita era falsa** | no |
+| [U-8b](#u-8b) | ✅ **cerrado** (0.1.55) | `update category=core` daba TIMEOUT: ahora responde antes de reiniciar | — |
 | [U-8c](#u-8c) | ✅ **CERRADO** | El `timeout_unknown` del architect estaba **muerto** por un substring imposible | — |
 | [U-9](#u-9) | ✅ **CERRADO** | El catch-all rompía el envelope **y daba 404 donde correspondía 405** | — |
 | [U-10](#u-10) | ✅ **cerrado y VALIDADO en vivo** | Un upgrade del `.deb` dejaba huérfano a todo nodo runtime | — |
@@ -942,7 +942,15 @@ seteadas en `packaging/`**; (ii) el hive queda `pending` y reintentar `add_hive`
 Se cierra junto con [PB-7](#pb-7) opción 2 — son el mismo hueco visto por dos puntas.
 
 <a id="u-8b"></a>
-### U-8b 🟡 — `update category=core` da TIMEOUT a los 60 s sobre una operación exitosa
+### U-8b ✅ CERRADO (0.1.55) — `update category=core` daba TIMEOUT a los 60 s sobre una operación exitosa
+
+> **Decisión del operador (2026-10-02): camino 1.** Con `SYSTEM_UPDATE category=core`, el destino
+> responde cuando los binarios y las units nuevos están en su lugar (`phase: "restarting"`). Los
+> reinicios, con el health gate, el rollback y el auto-reinicio del orchestrator, corren después en
+> una tarea que retiene el lock de ciclo de vida desde la preparación, así que ningún otro update se
+> intercala. Arrancan 2 s después, para que la respuesta salga antes de que se caiga el router. El
+> resultado queda en `core-update-last.json` y `/versions` lo muestra en `core.last_update`. El
+> finalize de `add_hive` sigue sincrónico (`prepare_core_update` + `restart_core_after_update`).
 
 **La causa que estaba escrita es falsa.** *No* es que el orquestador del destino se reinicie a sí
 mismo: el código **lo evita explícitamente** — se auto-excluye y **difiere su restart a un timer de
