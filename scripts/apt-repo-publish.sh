@@ -19,6 +19,8 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
 DEB="${DEB:-}"
 REPO="${REPO:-/var/lib/fluxbee-apt}"
+# Checksum cache for the index, outside the served directory: only new or changed .debs are hashed.
+CACHE="${CACHE:-${REPO%/}-cache/packages.db}"
 PORT="${PORT:-8900}"
 SERVE=0
 USE_SUDO=0
@@ -37,12 +39,10 @@ done
 
 SUDO=""; [[ "$USE_SUDO" == "1" ]] && SUDO="sudo"
 
-for t in dpkg-scanpackages apt-ftparchive; do
-  command -v "$t" >/dev/null 2>&1 || {
-    echo "Error: missing '$t' — install with: apt-get install -y dpkg-dev apt-utils" >&2
-    exit 1
-  }
-done
+command -v apt-ftparchive >/dev/null 2>&1 || {
+  echo "Error: missing 'apt-ftparchive' — install with: apt-get install -y apt-utils" >&2
+  exit 1
+}
 
 if [[ -z "$DEB" ]]; then
   DEB="$(ls -t "$ROOT_DIR"/dist/fluxbee_*_amd64.deb 2>/dev/null | head -1 || true)"
@@ -53,16 +53,19 @@ echo "== publish $(basename "$DEB") -> $REPO =="
 $SUDO mkdir -p "$REPO"
 # Copy under a hidden temp name, then rename: a client downloading the same version (re-publish)
 # never reads a half-written .deb (rename is atomic; an in-flight download keeps the old inode).
-# The temp name ends in .partial, so dpkg-scanpackages never indexes it.
+# The temp name is hidden and ends in .partial, so the index never lists it.
 TMP_DEB="$REPO/.$(basename "$DEB").partial"
 $SUDO cp -f "$DEB" "$TMP_DEB"
 $SUDO mv -f "$TMP_DEB" "$REPO/$(basename "$DEB")"
 # Flat repo: rebuild the index into temp files, then swap them in with atomic renames. Writing
-# `> Packages` in place truncated the LIVE index for the whole scan (~5 min with dozens of
-# ~240 MB .debs, all re-hashed), so a client running `apt-get update` meanwhile saw an EMPTY
-# repo. Release goes last, so it always describes the Packages already in place.
-( cd "$REPO" && $SUDO sh -c '
-    dpkg-scanpackages -m . > Packages.new &&
+# `> Packages` in place truncated the LIVE index for the whole scan, so a client running
+# `apt-get update` meanwhile saw an EMPTY repo. Release goes last, so it always describes the
+# Packages already in place. Every version stays listed (rollback is `apt install fluxbee=<v>`).
+# The checksums come from the cache: dpkg-scanpackages re-hashed every .deb on each publish
+# (8.6 min with 51 of them, ~245 MB each); with the cache only the new one is hashed.
+$SUDO mkdir -p "$(dirname "$CACHE")"
+( cd "$REPO" && $SUDO env CACHE="$CACHE" sh -c '
+    apt-ftparchive --db "$CACHE" packages . > Packages.new &&
     gzip -c Packages.new > Packages.gz.new &&
     mv -f Packages.new Packages &&
     mv -f Packages.gz.new Packages.gz &&
