@@ -1,8 +1,17 @@
+//! Lab tool (not CI): the codes SY.identity refuses identity writes with, live. Run it through
+//! `scripts/identity_negative_e2e.sh`, which creates the test tenant through SY.admin (the
+//! frontdesk no longer creates tenants) and passes it in `IDENTITY_NEGATIVE_TENANT_ID`.
+//!
+//! It connects under the names SY.identity authorizes (or not) for each message: an unknown WF
+//! node, the frontdesk (`ILK_REGISTER`, `ILK_ADD_CHANNEL`) and an IO node (`ILK_PROVISION`). The
+//! values it registers are synthetic and derived from the test id.
+
 use std::error::Error;
 use std::path::PathBuf;
 
 use fluxbee_sdk::identity::{
-    load_hive_id, MSG_ILK_ADD_CHANNEL, MSG_ILK_PROVISION, MSG_ILK_REGISTER, MSG_TNT_CREATE,
+    load_hive_id, DEFAULT_ROOT_TENANT_ID, MSG_ILK_ADD_CHANNEL, MSG_ILK_PROVISION, MSG_ILK_REGISTER,
+    MSG_TNT_CREATE,
 };
 use fluxbee_sdk::rpc::{OperationalRouteProfile, RouterDispatcher, RpcError, SystemRpcRequest};
 use fluxbee_sdk::NodeConfig;
@@ -33,6 +42,18 @@ async fn main() -> Result<(), DynError> {
         &format!("SY.identity@{}", hive_id),
     );
     let fallback_target = env_opt("IDENTITY_NEGATIVE_FALLBACK_TARGET");
+    // The frontdesk cannot create tenants (only SY.admin and SY.architect can): the test tenant
+    // comes from SY.admin, through the script.
+    let tenant_id = env_opt("IDENTITY_NEGATIVE_TENANT_ID").ok_or(
+        "IDENTITY_NEGATIVE_TENANT_ID is required: an active tenant created through SY.admin \
+         (scripts/identity_negative_e2e.sh creates one)",
+    )?;
+    if !tenant_id
+        .strip_prefix("tnt:")
+        .is_some_and(|raw| Uuid::parse_str(raw).is_ok())
+    {
+        return Err(format!("IDENTITY_NEGATIVE_TENANT_ID '{tenant_id}' is not tnt:<uuid>").into());
+    }
 
     // Case 1: unauthorized registrar for ILK_REGISTER.
     let unauthorized_name = env_or(
@@ -107,26 +128,23 @@ async fn main() -> Result<(), DynError> {
     )
     .await?;
 
-    // Case 4: duplicate email inside same tenant => DUPLICATE_EMAIL.
-    let tnt_create_payload = json!({
-        "name": format!("identity-negative-{}", test_id),
-        "status": "active",
-    });
-    let tnt_create = run_case_expect_ok(
+    // Case 4: the frontdesk creates no tenants => UNAUTHORIZED_REGISTRAR.
+    let frontdesk_tnt_create_code = run_case_expect_error(
         &frontdesk_name,
         &target,
         fallback_target.as_deref(),
         MSG_TNT_CREATE,
-        tnt_create_payload,
+        json!({
+            "name": format!("identity-negative-frontdesk-{}", test_id),
+            "status": "active",
+        }),
         timeout,
+        "UNAUTHORIZED_REGISTRAR",
     )
     .await?;
-    let tenant_id = tnt_create
-        .get("tenant_id")
-        .and_then(Value::as_str)
-        .ok_or("missing tenant_id in TNT_CREATE response")?
-        .to_string();
 
+    // Case 5: a new ilk with an email another ilk of the tenant has => DUPLICATE_EMAIL (only a
+    // temporary of the tenant merges into its holder).
     let duplicate_email = format!("duplicate-email-{}@diag.local", test_id);
     let first_human_register = json!({
         "ilk_id": format!("ilk:{}", Uuid::new_v4()),
@@ -172,7 +190,7 @@ async fn main() -> Result<(), DynError> {
     )
     .await?;
 
-    // Case 5: duplicate ICH (channel_type + address + tenant_id) => DUPLICATE_ICH.
+    // Case 6: duplicate ICH (channel_type + address + tenant_id) => DUPLICATE_ICH.
     let second_unique_human_register = json!({
         "ilk_id": format!("ilk:{}", Uuid::new_v4()),
         "ilk_type": "human",
@@ -238,13 +256,103 @@ async fn main() -> Result<(), DynError> {
     )
     .await?;
 
-    // Case 6 (optional): explicit NOT_PRIMARY against replica target.
+    // Case 7: a complete ilk that registers the email of another => DUPLICATE_EMAIL, too: a
+    // complete ilk does not merge (it keeps its channels).
+    let complete_duplicate_email_code = run_case_expect_error(
+        &frontdesk_name,
+        &target,
+        fallback_target.as_deref(),
+        MSG_ILK_REGISTER,
+        json!({
+            "ilk_id": second_human_ilk,
+            "ilk_type": "human",
+            "tenant_id": tenant_id.clone(),
+            "identification": {
+                "display_name": "dup-email-complete",
+                "email": duplicate_email,
+            },
+        }),
+        timeout,
+        "DUPLICATE_EMAIL",
+    )
+    .await?;
+
+    // Case 8: nobody registers a person into the root tenant => TENANT_ROOT_NOT_REGISTRABLE. A
+    // root-tenant IO node still provisions the person (a provision without a tenant lands in the
+    // root tenant), and the person stays temporary.
+    let io_name = env_or(
+        "IDENTITY_NEGATIVE_IO_NODE_NAME",
+        &format!("IO.identity.negative.{}@{}", test_id, hive_id),
+    );
+    let root_channel_type = "io.identity.negative.root";
+    let root_address = format!("io.identity.negative.root.{}", test_id);
+    let root_provision = || {
+        json!({
+            "ich_id": format!("ich:{}", Uuid::new_v4()),
+            "channel_type": root_channel_type,
+            "address": root_address,
+        })
+    };
+    let root_temp = run_case_expect_ok(
+        &io_name,
+        &target,
+        fallback_target.as_deref(),
+        MSG_ILK_PROVISION,
+        root_provision(),
+        timeout,
+    )
+    .await?;
+    let root_temp_ilk = root_temp
+        .get("ilk_id")
+        .and_then(Value::as_str)
+        .ok_or("missing ilk_id in the root-tenant ILK_PROVISION response")?
+        .to_string();
+    // Printed now, so the script can clean it up even if a later case fails.
+    println!("ROOT_TEMP_ILK_ID={}", root_temp_ilk);
+    let root_tenant_code = run_case_expect_error(
+        &frontdesk_name,
+        &target,
+        fallback_target.as_deref(),
+        MSG_ILK_REGISTER,
+        json!({
+            "ilk_id": root_temp_ilk,
+            "ilk_type": "human",
+            "tenant_id": DEFAULT_ROOT_TENANT_ID,
+            "identification": {
+                "display_name": "root-tenant-person",
+                "email": format!("root-tenant-{}@diag.local", test_id),
+            },
+        }),
+        timeout,
+        "TENANT_ROOT_NOT_REGISTRABLE",
+    )
+    .await?;
+    let root_again = run_case_expect_ok(
+        &io_name,
+        &target,
+        fallback_target.as_deref(),
+        MSG_ILK_PROVISION,
+        root_provision(),
+        timeout,
+    )
+    .await?;
+    let root_temp_status = root_again
+        .get("registration_status")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    if root_again.get("ilk_id").and_then(Value::as_str) != Some(root_temp_ilk.as_str())
+        || root_temp_status != "temporary"
+    {
+        return Err(format!(
+            "the root-tenant person must stay the same temporary ilk {root_temp_ilk}, got {root_again}"
+        )
+        .into());
+    }
+
+    // Case 9 (optional): explicit NOT_PRIMARY against replica target.
     let not_primary_code = if let Some(replica_target) = env_opt("IDENTITY_NEGATIVE_REPLICA_TARGET")
     {
-        let io_name = env_or(
-            "IDENTITY_NEGATIVE_IO_NODE_NAME",
-            &format!("IO.identity.negative.{}@{}", test_id, hive_id),
-        );
         let payload = json!({
             "ich_id": format!("ich:{}", Uuid::new_v4()),
             "channel_type": "io.identity.negative",
@@ -271,11 +379,19 @@ async fn main() -> Result<(), DynError> {
         "FALLBACK_TARGET={}",
         fallback_target.as_deref().unwrap_or("")
     );
+    println!("TENANT_ID={}", tenant_id);
     println!("UNAUTHORIZED_CODE={}", unauthorized_code);
     println!("INVALID_REQUEST_CODE={}", invalid_request_code);
     println!("INVALID_TENANT_CODE={}", invalid_tenant_code);
+    println!("FRONTDESK_TNT_CREATE_CODE={}", frontdesk_tnt_create_code);
     println!("DUPLICATE_EMAIL_CODE={}", duplicate_email_code);
     println!("DUPLICATE_ICH_CODE={}", duplicate_ich_code);
+    println!(
+        "COMPLETE_DUPLICATE_EMAIL_CODE={}",
+        complete_duplicate_email_code
+    );
+    println!("ROOT_TENANT_CODE={}", root_tenant_code);
+    println!("ROOT_TEMP_STATUS={}", root_temp_status);
     println!("NOT_PRIMARY_CODE={}", not_primary_code);
     Ok(())
 }

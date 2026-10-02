@@ -1,9 +1,16 @@
+//! Lab tool (not CI): an identity write on the primary reaches a replica, live. Run it through
+//! `scripts/identity_replica_sync_e2e.sh`, which creates the test tenant through SY.admin (the
+//! frontdesk no longer creates tenants), waits until the replica has it, and passes it in
+//! `IDENTITY_REPLICA_TENANT_ID`.
+//!
+//! It waits until the replica's counts reach the primary's (the baseline), then an IO node
+//! provisions an ILK in the test tenant on the primary, and it waits until the replica's counts
+//! reach the primary's again (the delta).
+
 use std::error::Error;
 use std::path::PathBuf;
 
-use fluxbee_sdk::identity::{
-    load_hive_id, MSG_IDENTITY_METRICS, MSG_ILK_PROVISION, MSG_TNT_CREATE,
-};
+use fluxbee_sdk::identity::{load_hive_id, MSG_IDENTITY_METRICS, MSG_ILK_PROVISION};
 use fluxbee_sdk::rpc::{OperationalRouteProfile, RouterDispatcher, RpcError, SystemRpcRequest};
 use fluxbee_sdk::NodeConfig;
 use serde_json::{json, Value};
@@ -38,19 +45,29 @@ async fn main() -> Result<(), DynError> {
     let poll_ms = env_u64("IDENTITY_REPLICA_POLL_MS", 250).max(50);
     let require_baseline_sync = env_bool("IDENTITY_REPLICA_REQUIRE_BASELINE_SYNC", true);
 
-    let primary_target = env_or("IDENTITY_REPLICA_PRIMARY_TARGET", "SY.identity@sandbox");
-    let replica_target = env_or("IDENTITY_REPLICA_TARGET", "SY.identity@worker-220");
+    let primary_target = env_or(
+        "IDENTITY_REPLICA_PRIMARY_TARGET",
+        &format!("SY.identity@{}", local_hive_id),
+    );
+    let replica_target = env_opt("IDENTITY_REPLICA_TARGET")
+        .ok_or("IDENTITY_REPLICA_TARGET is required: the replica's SY.identity@<hive>")?;
     let primary_fallback = env_opt("IDENTITY_REPLICA_PRIMARY_FALLBACK_TARGET");
+    // The frontdesk cannot create tenants (only SY.admin and SY.architect can): the test tenant
+    // comes from SY.admin, through the script.
+    let tenant_id = env_opt("IDENTITY_REPLICA_TENANT_ID").ok_or(
+        "IDENTITY_REPLICA_TENANT_ID is required: an active tenant created through SY.admin \
+         (scripts/identity_replica_sync_e2e.sh creates it)",
+    )?;
+    if !tenant_id
+        .strip_prefix("tnt:")
+        .is_some_and(|raw| Uuid::parse_str(raw).is_ok())
+    {
+        return Err(format!("IDENTITY_REPLICA_TENANT_ID '{tenant_id}' is not tnt:<uuid>").into());
+    }
 
     let diag_node_name = env_or(
         "IDENTITY_REPLICA_DIAG_NODE_NAME",
         &format!("WF.identity.replica.{}@{}", test_id, local_hive_id),
-    );
-    // Canonical name: SY.identity only authorizes the configured frontdesk
-    // node name (no suffixes after @hive — those malform the hive segment).
-    let frontdesk_node_name = env_or(
-        "IDENTITY_REPLICA_FRONTDESK_NODE_NAME",
-        &format!("SY.frontdesk.gov@{}", local_hive_id),
     );
     let io_node_name = env_or(
         "IDENTITY_REPLICA_IO_NODE_NAME",
@@ -58,7 +75,6 @@ async fn main() -> Result<(), DynError> {
     );
 
     let mut diag_session = connect_node(&diag_node_name).await?;
-    let mut frontdesk_session = connect_node(&frontdesk_node_name).await?;
     let mut io_session = connect_node(&io_node_name).await?;
 
     let baseline_primary = fetch_metrics(
@@ -85,54 +101,6 @@ async fn main() -> Result<(), DynError> {
         baseline_replica
     };
 
-    let tenant_create = identity_call(
-        &mut frontdesk_session,
-        &primary_target,
-        primary_fallback.as_deref(),
-        MSG_TNT_CREATE,
-        json!({
-            "name": format!("identity-replica-sync-{}", test_id),
-            "status": "active",
-        }),
-        timeout_ms,
-    )
-    .await?;
-    ensure_payload_ok(MSG_TNT_CREATE, &tenant_create.payload)?;
-    let tenant_id = tenant_create
-        .payload
-        .get("tenant_id")
-        .and_then(Value::as_str)
-        .ok_or("TNT_CREATE missing tenant_id")?
-        .to_string();
-
-    let after_tenant_primary = fetch_metrics(
-        &mut diag_session,
-        &primary_target,
-        primary_fallback.as_deref(),
-        timeout_ms,
-    )
-    .await?;
-    if after_tenant_primary.tenant_count <= baseline_primary.tenant_count {
-        return Err(format!(
-            "tenant_count did not increase in primary (before={} after={})",
-            baseline_primary.tenant_count, after_tenant_primary.tenant_count
-        )
-        .into());
-    }
-    let after_tenant_replica = wait_for_replica_min_counts(
-        &mut diag_session,
-        &replica_target,
-        IdentityMetrics {
-            tenant_count: after_tenant_primary.tenant_count,
-            ilk_count: baseline_sync_ok.ilk_count,
-            ich_count: baseline_sync_ok.ich_count,
-        },
-        timeout_ms,
-        convergence_timeout_ms,
-        poll_ms,
-    )
-    .await?;
-
     let provision = identity_call(
         &mut io_session,
         &primary_target,
@@ -142,6 +110,7 @@ async fn main() -> Result<(), DynError> {
             "ich_id": format!("ich:{}", Uuid::new_v4()),
             "channel_type": env_or("IDENTITY_REPLICA_CHANNEL_TYPE", "io.identity.replica"),
             "address": format!("io.identity.replica.{}", test_id),
+            "tenant_id": tenant_id,
         }),
         timeout_ms,
     )
@@ -161,17 +130,17 @@ async fn main() -> Result<(), DynError> {
         timeout_ms,
     )
     .await?;
-    if after_delta_primary.ilk_count <= after_tenant_primary.ilk_count {
+    if after_delta_primary.ilk_count <= baseline_primary.ilk_count {
         return Err(format!(
             "ilk_count did not increase in primary (before={} after={})",
-            after_tenant_primary.ilk_count, after_delta_primary.ilk_count
+            baseline_primary.ilk_count, after_delta_primary.ilk_count
         )
         .into());
     }
-    if after_delta_primary.ich_count <= after_tenant_primary.ich_count {
+    if after_delta_primary.ich_count <= baseline_primary.ich_count {
         return Err(format!(
             "ich_count did not increase in primary (before={} after={})",
-            after_tenant_primary.ich_count, after_delta_primary.ich_count
+            baseline_primary.ich_count, after_delta_primary.ich_count
         )
         .into());
     }
@@ -204,18 +173,6 @@ async fn main() -> Result<(), DynError> {
     println!(
         "AFTER_BASELINE_REPLICA=tenant:{} ilk:{} ich:{}",
         baseline_sync_ok.tenant_count, baseline_sync_ok.ilk_count, baseline_sync_ok.ich_count
-    );
-    println!(
-        "AFTER_TENANT_PRIMARY=tenant:{} ilk:{} ich:{}",
-        after_tenant_primary.tenant_count,
-        after_tenant_primary.ilk_count,
-        after_tenant_primary.ich_count
-    );
-    println!(
-        "AFTER_TENANT_REPLICA=tenant:{} ilk:{} ich:{}",
-        after_tenant_replica.tenant_count,
-        after_tenant_replica.ilk_count,
-        after_tenant_replica.ich_count
     );
     println!(
         "AFTER_DELTA_PRIMARY=tenant:{} ilk:{} ich:{}",

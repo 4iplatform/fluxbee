@@ -1,3 +1,17 @@
+//! Lab tool (not CI): merging a temporary ILK into a registered person, live against SY.identity.
+//! Run it through `scripts/identity_merge_alias_e2e.sh`, which creates the test tenant through
+//! SY.admin (the frontdesk no longer creates tenants) and passes it in `IDENTITY_MERGE_TENANT_ID`.
+//!
+//! In the test tenant it registers a person and merges two temporaries into them:
+//!   A. `ILK_ADD_CHANNEL` with `merge_from_ilk_id` (the merge addressed explicitly);
+//!   B. `ILK_REGISTER` of a temporary with the person's email (the merge by email): the reply
+//!      says `merged` and `merged_from_ilk_id`, and it only fills the fields the person lacked.
+//! After each merge the temporary's channel resolves to the person.
+//!
+//! It connects as an IO node (`ILK_PROVISION`) and under the frontdesk's name (`ILK_REGISTER`,
+//! `ILK_ADD_CHANNEL`): the callers SY.identity authorizes for those messages. The values it
+//! registers are synthetic and derived from the test id.
+
 use std::error::Error;
 use std::path::PathBuf;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -62,25 +76,6 @@ fn load_hive_id(config_dir: &PathBuf) -> Result<String, DiagError> {
     let data = std::fs::read_to_string(config_dir.join("hive.yaml"))?;
     let hive: HiveFile = serde_yaml::from_str(&data)?;
     Ok(hive.hive_id)
-}
-
-async fn system_call_with_fallback(
-    client: &RouterDispatcher,
-    target: &str,
-    fallback_target: Option<&str>,
-    action: &str,
-    payload: Value,
-    timeout_ms: u64,
-) -> Result<(Value, String), DiagError> {
-    identity_call_with_fallback(
-        client,
-        target,
-        fallback_target,
-        action,
-        payload,
-        Duration::from_millis(timeout_ms),
-    )
-    .await
 }
 
 /// Replicates the SDK `identity_system_call` fallback semantics over the new
@@ -158,6 +153,63 @@ async fn identity_call_with_fallback(
     }
 }
 
+/// SY.identity as the diag reaches it: later calls go to the target that answered the last one.
+struct Identity {
+    effective_target: String,
+    fallback_target: Option<String>,
+    timeout: Duration,
+}
+
+impl Identity {
+    /// `action`'s reply, which must be `status: ok`.
+    async fn call_ok(
+        &mut self,
+        client: &RouterDispatcher,
+        action: &str,
+        payload: Value,
+    ) -> Result<Value, DiagError> {
+        let (reply, used_target) = identity_call_with_fallback(
+            client,
+            &self.effective_target,
+            self.fallback_target.as_deref(),
+            action,
+            payload,
+            self.timeout,
+        )
+        .await?;
+        self.effective_target = used_target;
+        payload_status_ok(&reply).map_err(|err| format!("{action}: {err}"))?;
+        Ok(reply)
+    }
+
+    /// The ilk an IO node gets for `channel_type`/`address` in `tenant_id`, with its
+    /// registration_status: a new temporary the first time, then whoever holds the channel.
+    async fn provision(
+        &mut self,
+        io_client: &RouterDispatcher,
+        tenant_id: &str,
+        channel_type: &str,
+        address: &str,
+    ) -> Result<(String, String), DiagError> {
+        let reply = self
+            .call_ok(
+                io_client,
+                "ILK_PROVISION",
+                json!({
+                    "ich_id": format!("ich:{}", Uuid::new_v4()),
+                    "channel_type": channel_type,
+                    "address": address,
+                    "tenant_id": tenant_id,
+                }),
+            )
+            .await?;
+        Ok((
+            reply_str(&reply, "ilk_id", "ILK_PROVISION")?,
+            reply_str(&reply, "registration_status", "ILK_PROVISION")?,
+        ))
+    }
+}
+
 fn payload_status_ok(payload: &Value) -> Result<(), DiagError> {
     let status = payload
         .get("status")
@@ -181,11 +233,37 @@ fn payload_status_ok(payload: &Value) -> Result<(), DiagError> {
     .into())
 }
 
+fn reply_str(reply: &Value, field: &str, action: &str) -> Result<String, DiagError> {
+    reply
+        .get(field)
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .ok_or_else(|| format!("{action} reply has no {field}: {reply}").into())
+}
+
+fn expect_eq(what: &str, got: &str, expected: &str) -> Result<(), DiagError> {
+    if got == expected {
+        return Ok(());
+    }
+    Err(format!("{what}: expected {expected}, got {got}").into())
+}
+
 fn metric_alias_count(payload: &Value) -> Option<u64> {
     payload
         .get("metrics")
         .and_then(|v| v.get("alias_count"))
         .and_then(|v| v.as_u64())
+}
+
+fn connect_config(name: String) -> NodeConfig {
+    NodeConfig {
+        name,
+        router_socket: json_router::paths::router_socket_dir(),
+        uuid_persistence_dir: json_router::paths::state_dir().join("nodes"),
+        uuid_mode: fluxbee_sdk::NodeUuidMode::Persistent,
+        config_dir: json_router::paths::config_dir(),
+        version: "0.0.1".to_string(),
+    }
 }
 
 #[tokio::main]
@@ -201,6 +279,18 @@ async fn main() -> Result<(), DiagError> {
         "IDENTITY_MERGE_TEST_ID",
         &format!("idmerge-{}", now_epoch_ms()),
     );
+    // The frontdesk cannot create tenants (only SY.admin and SY.architect can): the test tenant
+    // comes from SY.admin, through the script.
+    let tenant_id = env_opt("IDENTITY_MERGE_TENANT_ID").ok_or(
+        "IDENTITY_MERGE_TENANT_ID is required: an active tenant created through SY.admin \
+         (scripts/identity_merge_alias_e2e.sh creates one)",
+    )?;
+    if !tenant_id
+        .strip_prefix("tnt:")
+        .is_some_and(|raw| Uuid::parse_str(raw).is_ok())
+    {
+        return Err(format!("IDENTITY_MERGE_TENANT_ID '{tenant_id}' is not tnt:<uuid>").into());
+    }
     let target = env_or("IDENTITY_MERGE_TARGET", &format!("SY.identity@{}", hive_id));
     let fallback_target = env_opt("IDENTITY_MERGE_FALLBACK_TARGET");
     let timeout_ms = env_u64("IDENTITY_MERGE_TIMEOUT_MS", 10_000);
@@ -217,6 +307,11 @@ async fn main() -> Result<(), DiagError> {
         "IDENTITY_MERGE_NEW_ADDRESS",
         &format!("merge-new-{}", test_id),
     );
+    let channel_type_email = env_or("IDENTITY_MERGE_EMAIL_CHANNEL_TYPE", "io.test.merge.email");
+    let address_email = env_or(
+        "IDENTITY_MERGE_EMAIL_ADDRESS",
+        &format!("merge-email-{}", test_id),
+    );
 
     let io_node_name = env_or(
         "IDENTITY_MERGE_IO_NODE_NAME",
@@ -227,195 +322,155 @@ async fn main() -> Result<(), DiagError> {
         &format!("SY.frontdesk.gov@{}", hive_id),
     );
 
-    let io_node_config = NodeConfig {
-        name: io_node_name,
-        router_socket: json_router::paths::router_socket_dir(),
-        uuid_persistence_dir: json_router::paths::state_dir().join("nodes"),
-        uuid_mode: fluxbee_sdk::NodeUuidMode::Persistent,
-        config_dir: json_router::paths::config_dir(),
-        version: "0.0.1".to_string(),
-    };
-    let io_profile = OperationalRouteProfile::builder().build()?;
     let io_client = RouterDispatcher::connect_with_retry(
-        io_node_config,
+        connect_config(io_node_name),
         Duration::from_millis(100),
-        io_profile,
+        OperationalRouteProfile::builder().build()?,
     )
     .await?;
+    let frontdesk_client = RouterDispatcher::connect_with_retry(
+        connect_config(frontdesk_node_name),
+        Duration::from_millis(100),
+        OperationalRouteProfile::builder().build()?,
+    )
+    .await?;
+    let mut identity = Identity {
+        effective_target: target.clone(),
+        fallback_target,
+        timeout: Duration::from_millis(timeout_ms),
+    };
 
-    let (metrics_before, mut effective_target) = system_call_with_fallback(
-        &io_client,
-        &target,
-        fallback_target.as_deref(),
-        "IDENTITY_METRICS",
-        json!({}),
-        timeout_ms,
-    )
-    .await?;
-    payload_status_ok(&metrics_before)?;
+    let metrics_before = identity
+        .call_ok(&io_client, "IDENTITY_METRICS", json!({}))
+        .await?;
     let alias_before = metric_alias_count(&metrics_before).unwrap_or(0);
 
-    let old_ich_id = format!("ich:{}", Uuid::new_v4());
-    let (provision_old, used_target) = system_call_with_fallback(
-        &io_client,
-        &effective_target,
-        fallback_target.as_deref(),
-        "ILK_PROVISION",
-        json!({
-            "ich_id": old_ich_id,
-            "channel_type": channel_type_old,
-            "address": address_old,
-        }),
-        timeout_ms,
-    )
-    .await?;
-    effective_target = used_target;
-    payload_status_ok(&provision_old)?;
-    let old_ilk_id = provision_old
-        .get("ilk_id")
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| "ILK_PROVISION missing ilk_id".to_string())?
-        .to_string();
-
-    let frontdesk_config = NodeConfig {
-        name: frontdesk_node_name,
-        router_socket: json_router::paths::router_socket_dir(),
-        uuid_persistence_dir: json_router::paths::state_dir().join("nodes"),
-        uuid_mode: fluxbee_sdk::NodeUuidMode::Persistent,
-        config_dir: json_router::paths::config_dir(),
-        version: "0.0.1".to_string(),
-    };
-    let frontdesk_profile = OperationalRouteProfile::builder().build()?;
-    let frontdesk_client = RouterDispatcher::connect_with_retry(
-        frontdesk_config,
-        Duration::from_millis(100),
-        frontdesk_profile,
-    )
-    .await?;
-
-    let (tenant_create, used_target) = system_call_with_fallback(
-        &frontdesk_client,
-        &effective_target,
-        fallback_target.as_deref(),
-        "TNT_CREATE",
-        json!({
-            "name": format!("merge-diag-{}", test_id),
-            "status": "active",
-            "settings": {},
-        }),
-        timeout_ms,
-    )
-    .await?;
-    effective_target = used_target;
-    payload_status_ok(&tenant_create)?;
-    let tenant_id = tenant_create
-        .get("tenant_id")
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| "TNT_CREATE missing tenant_id".to_string())?
-        .to_string();
-
+    // The registered person.
     let canonical_ilk_id = env_or(
         "IDENTITY_MERGE_CANONICAL_ILK_ID",
         &format!("ilk:{}", Uuid::new_v4()),
     );
-    let (register, used_target) = system_call_with_fallback(
-        &frontdesk_client,
-        &effective_target,
-        fallback_target.as_deref(),
-        "ILK_REGISTER",
-        json!({
-            "ilk_id": canonical_ilk_id,
-            "ilk_type": "human",
-            "tenant_id": tenant_id,
-            "identification": {
-                "display_name": format!("Merge {}", test_id),
-                "email": format!("merge-{}@diag.local", test_id),
-            },
-        }),
-        timeout_ms,
-    )
-    .await?;
-    effective_target = used_target;
-    payload_status_ok(&register)?;
-
-    let (add_channel, used_target) = system_call_with_fallback(
-        &frontdesk_client,
-        &effective_target,
-        fallback_target.as_deref(),
-        "ILK_ADD_CHANNEL",
-        json!({
-            "ilk_id": canonical_ilk_id,
-            "channel": {
-                "ich_id": format!("ich:{}", Uuid::new_v4()),
-                "type": channel_type_new,
-                "address": address_new,
-            },
-            "merge_from_ilk_id": old_ilk_id,
-            "change_reason": "identity merge diag",
-        }),
-        timeout_ms,
-    )
-    .await?;
-    effective_target = used_target;
-    payload_status_ok(&add_channel)?;
-
-    let (metrics_after_merge, used_target) = system_call_with_fallback(
-        &io_client,
-        &effective_target,
-        fallback_target.as_deref(),
-        "IDENTITY_METRICS",
-        json!({}),
-        timeout_ms,
-    )
-    .await?;
-    effective_target = used_target;
-    payload_status_ok(&metrics_after_merge)?;
-    let alias_after_merge = metric_alias_count(&metrics_after_merge).unwrap_or(0);
-
-    let old_ich_id_second = format!("ich:{}", Uuid::new_v4());
-    let (provision_old_again, used_target) = system_call_with_fallback(
-        &io_client,
-        &effective_target,
-        fallback_target.as_deref(),
-        "ILK_PROVISION",
-        json!({
-            "ich_id": old_ich_id_second,
-            "channel_type": channel_type_old,
-            "address": address_old,
-        }),
-        timeout_ms,
-    )
-    .await?;
-    effective_target = used_target;
-    payload_status_ok(&provision_old_again)?;
-    let resolved_old_channel_ilk = provision_old_again
-        .get("ilk_id")
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| "second ILK_PROVISION missing ilk_id".to_string())?
-        .to_string();
-
-    if resolved_old_channel_ilk != canonical_ilk_id {
-        return Err(format!(
-            "merge not converged: old channel resolved to {} (expected {})",
-            resolved_old_channel_ilk, canonical_ilk_id
+    let email = format!("merge-{}@diag.local", test_id);
+    let kept_display_name = format!("Merge {}", test_id);
+    let register = identity
+        .call_ok(
+            &frontdesk_client,
+            "ILK_REGISTER",
+            json!({
+                "ilk_id": canonical_ilk_id,
+                "ilk_type": "human",
+                "tenant_id": tenant_id,
+                "identification": {
+                    "display_name": kept_display_name,
+                    "email": email,
+                },
+            }),
         )
-        .into());
+        .await?;
+    expect_eq(
+        "ILK_REGISTER of the person: ilk_id",
+        &reply_str(&register, "ilk_id", "ILK_REGISTER")?,
+        &canonical_ilk_id,
+    )?;
+    if register.get("merged").and_then(Value::as_bool) != Some(false) {
+        return Err(
+            format!("ILK_REGISTER of the person: expected merged=false: {register}").into(),
+        );
     }
+
+    // A. ILK_ADD_CHANNEL with merge_from_ilk_id.
+    let (old_ilk_id, old_status) = identity
+        .provision(&io_client, &tenant_id, &channel_type_old, &address_old)
+        .await?;
+    expect_eq("ILK_PROVISION (A)", &old_status, "temporary")?;
+    identity
+        .call_ok(
+            &frontdesk_client,
+            "ILK_ADD_CHANNEL",
+            json!({
+                "ilk_id": canonical_ilk_id,
+                "channel": {
+                    "ich_id": format!("ich:{}", Uuid::new_v4()),
+                    "type": channel_type_new,
+                    "address": address_new,
+                },
+                "merge_from_ilk_id": old_ilk_id,
+                "change_reason": "identity merge diag",
+            }),
+        )
+        .await?;
+    let (resolved_old_channel_ilk, _) = identity
+        .provision(&io_client, &tenant_id, &channel_type_old, &address_old)
+        .await?;
+    expect_eq(
+        "the merged channel (A) resolves to the person",
+        &resolved_old_channel_ilk,
+        &canonical_ilk_id,
+    )?;
+
+    // B. ILK_REGISTER of a temporary with the person's email: the merge by email. It must keep
+    // the person's display_name and fill the phone the person lacked.
+    let (email_temp_ilk_id, email_temp_status) = identity
+        .provision(&io_client, &tenant_id, &channel_type_email, &address_email)
+        .await?;
+    expect_eq("ILK_PROVISION (B)", &email_temp_status, "temporary")?;
+    let filled_phone = format!("diag-phone-{}", test_id);
+    let merge = identity
+        .call_ok(
+            &frontdesk_client,
+            "ILK_REGISTER",
+            json!({
+                "ilk_id": email_temp_ilk_id,
+                "ilk_type": "human",
+                "tenant_id": tenant_id,
+                "identification": {
+                    "display_name": format!("Merge again {}", test_id),
+                    "email": email,
+                    "phone": filled_phone,
+                },
+            }),
+        )
+        .await?;
+    if merge.get("merged").and_then(Value::as_bool) != Some(true) {
+        return Err(format!("ILK_REGISTER by email: expected merged=true: {merge}").into());
+    }
+    let email_merge_ilk_id = reply_str(&merge, "ilk_id", "ILK_REGISTER")?;
+    let email_merged_from = reply_str(&merge, "merged_from_ilk_id", "ILK_REGISTER")?;
+    expect_eq(
+        "ILK_REGISTER by email: ilk_id",
+        &email_merge_ilk_id,
+        &canonical_ilk_id,
+    )?;
+    expect_eq(
+        "ILK_REGISTER by email: merged_from_ilk_id",
+        &email_merged_from,
+        &email_temp_ilk_id,
+    )?;
+    expect_eq(
+        "ILK_REGISTER by email: registration_status",
+        &reply_str(&merge, "registration_status", "ILK_REGISTER")?,
+        "complete",
+    )?;
+    let (resolved_email_channel_ilk, _) = identity
+        .provision(&io_client, &tenant_id, &channel_type_email, &address_email)
+        .await?;
+    expect_eq(
+        "the merged channel (B) resolves to the person",
+        &resolved_email_channel_ilk,
+        &canonical_ilk_id,
+    )?;
+
+    let metrics_after_merge = identity
+        .call_ok(&io_client, "IDENTITY_METRICS", json!({}))
+        .await?;
+    let alias_after_merge = metric_alias_count(&metrics_after_merge).unwrap_or(0);
 
     let mut alias_after_wait = alias_after_merge;
     if wait_gc_secs > 0 {
         sleep(Duration::from_secs(wait_gc_secs)).await;
-        let (metrics_after_wait, used_target) = system_call_with_fallback(
-            &io_client,
-            &effective_target,
-            fallback_target.as_deref(),
-            "IDENTITY_METRICS",
-            json!({}),
-            timeout_ms,
-        )
-        .await?;
-        effective_target = used_target;
-        payload_status_ok(&metrics_after_wait)?;
+        let metrics_after_wait = identity
+            .call_ok(&io_client, "IDENTITY_METRICS", json!({}))
+            .await?;
         alias_after_wait = metric_alias_count(&metrics_after_wait).unwrap_or(alias_after_merge);
     }
 
@@ -430,11 +485,21 @@ async fn main() -> Result<(), DiagError> {
     println!("STATUS=ok");
     println!("TEST_ID={}", test_id);
     println!("TARGET={}", target);
-    println!("EFFECTIVE_TARGET={}", effective_target);
-    println!("OLD_ILK_ID={}", old_ilk_id);
-    println!("CANONICAL_ILK_ID={}", canonical_ilk_id);
-    println!("RESOLVED_OLD_CHANNEL_ILK_ID={}", resolved_old_channel_ilk);
+    println!("EFFECTIVE_TARGET={}", identity.effective_target);
     println!("TENANT_ID={}", tenant_id);
+    println!("CANONICAL_ILK_ID={}", canonical_ilk_id);
+    println!("OLD_ILK_ID={}", old_ilk_id);
+    println!("RESOLVED_OLD_CHANNEL_ILK_ID={}", resolved_old_channel_ilk);
+    println!("EMAIL_TEMP_ILK_ID={}", email_temp_ilk_id);
+    println!("EMAIL_MERGE_ILK_ID={}", email_merge_ilk_id);
+    println!("EMAIL_MERGED_FROM_ILK_ID={}", email_merged_from);
+    println!(
+        "RESOLVED_EMAIL_CHANNEL_ILK_ID={}",
+        resolved_email_channel_ilk
+    );
+    // What the script checks through SY.admin (synthetic values derived from the test id).
+    println!("KEPT_DISPLAY_NAME={}", kept_display_name);
+    println!("FILLED_PHONE={}", filled_phone);
     println!("ALIAS_COUNT_BEFORE={}", alias_before);
     println!("ALIAS_COUNT_AFTER_MERGE={}", alias_after_merge);
     println!("ALIAS_COUNT_AFTER_WAIT={}", alias_after_wait);

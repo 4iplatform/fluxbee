@@ -1,3 +1,17 @@
+//! Lab tool (not CI): a person's identity from first contact to registered, live against
+//! SY.identity. Run it through `scripts/identity_provision_complete_e2e.sh`, which creates the two
+//! test tenants through SY.admin (the frontdesk no longer creates tenants) and passes them in
+//! `IDENTITY_PROVISION_COMPLETE_TENANT_ID` and `IDENTITY_PROVISION_COMPLETE_OTHER_TENANT_ID`.
+//!
+//! In the test tenant an IO node provisions a temporary ILK, a message from it is routed to the
+//! frontdesk, the frontdesk registers it, and provisioning the same channel again returns the same
+//! ILK as `complete`. Registering it into the other tenant then fails with
+//! `INVALID_TENANT_TRANSITION`: only a temporary changes tenant.
+//!
+//! It connects as an IO node (`ILK_PROVISION`) and under the frontdesk's name (`ILK_REGISTER`,
+//! and the routed message): the callers SY.identity and the router expect for those. The values
+//! it registers are synthetic and derived from the test id.
+
 use std::error::Error;
 use std::path::PathBuf;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -60,6 +74,18 @@ fn env_bool(key: &str, default: bool) -> bool {
             _ => None,
         })
         .unwrap_or(default)
+}
+
+/// A `tnt:<uuid>` the script passes in `key`.
+fn required_tenant_env(key: &str) -> Result<String, DiagError> {
+    let tenant_id = env_opt(key).ok_or_else(|| {
+        format!(
+            "{key} is required: an active tenant created through SY.admin \
+             (scripts/identity_provision_complete_e2e.sh creates it)"
+        )
+    })?;
+    parse_prefixed_uuid_bytes(&tenant_id, "tnt")?;
+    Ok(tenant_id)
 }
 
 fn hive_from_node_name(name: &str) -> Option<&str> {
@@ -335,6 +361,17 @@ async fn main() -> Result<(), DiagError> {
         "IDENTITY_PROVISION_COMPLETE_TEST_ID",
         &format!("idprov-{}", now_epoch_ms()),
     );
+    // The frontdesk cannot create tenants (only SY.admin and SY.architect can): the test tenants
+    // come from SY.admin, through the script.
+    let tenant_id = required_tenant_env("IDENTITY_PROVISION_COMPLETE_TENANT_ID")?;
+    let other_tenant_id = required_tenant_env("IDENTITY_PROVISION_COMPLETE_OTHER_TENANT_ID")?;
+    if other_tenant_id == tenant_id {
+        return Err(
+            "IDENTITY_PROVISION_COMPLETE_OTHER_TENANT_ID must differ from \
+             IDENTITY_PROVISION_COMPLETE_TENANT_ID"
+                .into(),
+        );
+    }
     let timeout_ms = env_u64("IDENTITY_PROVISION_COMPLETE_TIMEOUT_MS", 12_000);
     let target = env_or(
         "IDENTITY_PROVISION_COMPLETE_TARGET",
@@ -413,26 +450,7 @@ async fn main() -> Result<(), DiagError> {
     .await?;
     let mut frontdesk_receiver = frontdesk_client.take_command_receiver("user_probe").await?;
 
-    let (tenant_create, mut effective_target) = system_call_with_fallback(
-        &frontdesk_client,
-        &target,
-        fallback_target.as_deref(),
-        "TNT_CREATE",
-        json!({
-            "name": format!("idprov-tenant-{}", test_id),
-            "status": "active",
-            "settings": {},
-        }),
-        timeout_ms,
-    )
-    .await?;
-    require_payload_ok(&tenant_create, "TNT_CREATE")?;
-    let tenant_id = tenant_create
-        .get("tenant_id")
-        .and_then(Value::as_str)
-        .ok_or_else(|| "TNT_CREATE missing tenant_id".to_string())?
-        .to_string();
-
+    let mut effective_target = target.clone();
     let (provision, used_target) = system_call_with_fallback(
         &io_client,
         &effective_target,
@@ -442,6 +460,7 @@ async fn main() -> Result<(), DiagError> {
             "ich_id": format!("ich:{}", Uuid::new_v4()),
             "channel_type": channel_type,
             "address": address,
+            "tenant_id": tenant_id,
         }),
         timeout_ms,
     )
@@ -512,6 +531,7 @@ async fn main() -> Result<(), DiagError> {
             "ich_id": format!("ich:{}", Uuid::new_v4()),
             "channel_type": channel_type,
             "address": address,
+            "tenant_id": tenant_id,
         }),
         timeout_ms,
     )
@@ -541,27 +561,6 @@ async fn main() -> Result<(), DiagError> {
         .into());
     }
 
-    let (tenant_create_2, used_target) = system_call_with_fallback(
-        &frontdesk_client,
-        &effective_target,
-        fallback_target.as_deref(),
-        "TNT_CREATE",
-        json!({
-            "name": format!("idprov-tenant2-{}", test_id),
-            "status": "active",
-            "settings": {},
-        }),
-        timeout_ms,
-    )
-    .await?;
-    effective_target = used_target;
-    require_payload_ok(&tenant_create_2, "TNT_CREATE(second)")?;
-    let tenant_id_2 = tenant_create_2
-        .get("tenant_id")
-        .and_then(Value::as_str)
-        .ok_or_else(|| "TNT_CREATE(second) missing tenant_id".to_string())?
-        .to_string();
-
     let (register_second, _) = system_call_with_fallback(
         &frontdesk_client,
         &effective_target,
@@ -570,7 +569,7 @@ async fn main() -> Result<(), DiagError> {
         json!({
             "ilk_id": ilk_id,
             "ilk_type": "human",
-            "tenant_id": tenant_id_2,
+            "tenant_id": other_tenant_id,
             "identification": {
                 "display_name": format!("Identity Provision {}", test_id),
                 "email": format!("idprov-{}@diag.local", test_id),
@@ -596,6 +595,7 @@ async fn main() -> Result<(), DiagError> {
     println!("HIVE_ID={}", hive_id);
     println!("ILK_ID={}", ilk_id);
     println!("TENANT_ID={}", tenant_id);
+    println!("OTHER_TENANT_ID={}", other_tenant_id);
     println!("TENANT_REASSIGN_BLOCK_CODE=INVALID_TENANT_TRANSITION");
     println!("FRONTDESK_NODE={}", frontdesk_node_name);
     println!("FLOW=provision_route_complete");
