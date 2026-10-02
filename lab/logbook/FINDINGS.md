@@ -465,6 +465,26 @@
 - Lo no ensamblado: memoria entre hilos, LanceDB, lo de los workers al motherbee, y lectores de las
   tablas.
 
+
+### A-39 🔴 En cada release, los nodos administrados de motherbee caen entre 20 y 80 s (`203/EXEC`)
+
+- **Qué pasa (visto al validar 0.1.53, y preexistente: AI.chat sumó 104 fallas en 30 días):**
+  1. Al desempaquetar la versión nueva, dpkg borra los archivos del paquete viejo, y los directorios
+     `dist/runtimes/<rt>/<versión vieja>` venían en ese paquete.
+  2. Durante el update las units de los nodos administrados se reinician con el `ExecStart` viejo,
+     que apunta a un directorio que ya no existe: loop de `status=203/EXEC`.
+  3. Recién cuando arranca el orchestrator nuevo, ve que `current` se movió y las reapunta.
+- **Evidencia 0.1.53:**
+  - AI.chat, IO.api, IO.blob, IO.cloud e IO.slack.default: 5 fallas entre 20:32:10 y 20:32:31.
+    Reapuntadas a las 20:32:34 ("runtime 'current' pointer moved; rebinding node").
+  - IO.wapp.default: 17 fallas, hasta las 20:33:33; el reconcile la había salteado como "visible".
+- **Impacto:** IO.api e IO.cloud, lo que da la cara al público, quedan sin servicio en cada upgrade.
+- **Arreglo posible (a decidir):**
+  - que los directorios de runtime no sean archivos del paquete: se siembran en el postinst y la
+    retención borra los viejos;
+  - o que las units apunten a una ruta estable (`current`).
+  - Va con U-8b (la familia del flujo de update).
+
 ### A-19 ✅ RESUELTO (0.1.43) — La policy publicada esperaba hasta 60 s al watcher de Syncthing
 
 - **Qué pasaba:** con 0.1.41 el apply llegaba a los 4 hives en 16 s, pero el clear tardó 63 s y el

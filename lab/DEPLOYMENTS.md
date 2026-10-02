@@ -21,6 +21,7 @@
 
 | Versión | Fecha (ART) | Commit | Alcance | Estado | Rollback |
 |---|---|---|---|---|---|
+| **0.1.53** | 2026-10-02 | `26edcd5` | motherbee + spokes (core) | ✅ live | snap `pre-ai-generic-0-1-53` (las 4 VMs) · `apt install fluxbee=0.1.52` |
 | **0.1.52** | 2026-10-02 | `0670184` | motherbee + spokes (core) | ✅ live | snap `pre-cleanup-0-1-52` (las 4 VMs) · `apt install fluxbee=0.1.51` |
 | **0.1.51** | 2026-10-01 | `f7c2520` | motherbee + spokes (core) | ✅ live | snap `pre-query-decode-0-1-51` (las 4 VMs) · `apt install fluxbee=0.1.50` |
 | **0.1.50** | 2026-10-01 | `aa206ac` | motherbee + spokes (core) | ✅ live | snap `pre-config-routes-0-1-50` (las 4 VMs) · `apt install fluxbee=0.1.49` |
@@ -61,6 +62,41 @@
 > (`dpkg-scanpackages -m`) para rollback, pero su detalle vive en la bitácora, no acá.
 
 ---
+
+## 0.1.53 — limpieza de código muerto: la clave general de IA, sin instancia AI de base, privacidad y cognition
+
+- **Fecha:** 2026-10-02 (ART) · **Versión anterior:** 0.1.52 · **Commits:** `8c8c0fa`..`26edcd5` (ocho,
+  uno por tema; bitácora `2026-10-02`, FINDINGS A-32 a A-38).
+- **Alcance:** motherbee + los tres spokes (core-update).
+- **Qué cambió:**
+  - **ai.generic** toma la clave general del proveedor del hive en SY.vault (decisión D4 del
+    operador). `behavior.vault_key` se rechaza (A-35). Sale el modo gov que quedó del split de
+    frontdesk.
+  - **La instalación base** ya no levanta `AI.chat@motherbee`. Todo apunta a `ai.generic`: admin,
+    Archi, semillas del cookbook y docs (A-36).
+  - **SY.frontdesk.gov** sin datos personales en los logs (A-32). Los rechazos de identity conservan
+    su código y solo lo transitorio es reintentable (A-33).
+  - **SY.identity:** no loguea la dirección en `ILK_PROVISION` ni devuelve el DETAIL de Postgres (A-32).
+  - **SY.cognition:** el arranque en frío corre después de esperar al vault y reconstruye con las
+    claves del camino en vivo; el estado queda acotado y los scopes se cortan (A-34).
+  - **Orchestrator:** 9 funciones muertas menos. Warnings del workspace: 0.
+  - **CI:** las actions sobre Node 24.
+- **Build:** 14 min. **Publish:** 10 s, 53 paquetes. **Deploy:** 223 s con `ops deploy`; snapshots
+  `pre-ai-generic-0-1-53` en las 4 VMs (se borró antes `pre-config-routes-0-1-50`).
+- **Verificación en vivo:**
+  - Los 4 hives en 0.1.53 con el mismo manifest (`dc605aa6…`). Ningún binario `(deleted)`, 0 líneas
+    ERROR desde el install y 0 rechazos del gate y descartes por `routing.src`.
+  - **Cognition:** el rebuild de arranque corrió por primera vez (`trigger="startup"`, después de
+    esperar al vault; 0 hilos, PROD no tiene datos). CONFIG_GET informa `storage.db_configured: true`.
+  - **AI.chat:** arranca en FAILED_CONFIG con *"config.json rejected… send a valid CONFIG_SET"*,
+    porque su config tiene `vault_key`. Es lo esperado (A-36).
+  - **SY.frontdesk.gov:** arranca y queda degradado (Unconfigured): el vault de PROD no tiene clave
+    de IA. El handoff estructurado funciona sin ella.
+  - **CI:** `rust-tests`, `go-tests` y los dos guardianes en verde en `26edcd5`.
+- **Visto al validar (A-39, preexistente):** los seis nodos administrados de motherbee quedaron
+  entre 20 y 80 s en loop `203/EXEC` durante el update, porque el directorio de su versión vieja se
+  borró antes de que la unit apuntara a la nueva.
+- **Rollback:** snapshot `pre-ai-generic-0-1-53` o `apt install fluxbee=0.1.52`.
 
 ## 0.1.52 — limpieza de warnings sin cambio de comportamiento; primer deploy con `lab/ops.py`
 
