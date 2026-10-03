@@ -118,16 +118,24 @@ def cmd_run(a):
 # ---------------- versions / opa / health ----------------
 
 def core_of(hive):
+    """(status, versions, hash, source) of a hive's core. The hash is what the hive INSTALLED when
+    it says so, else what dist delivered: the rule of /versions' own comparison (X1). On a spoke
+    `core.manifest_hash` and the component versions follow dist, which Syncthing updates before
+    any core update runs, so judging by them reported spokes as updated that were not (0.1.56).
+    An install it cannot name reads as "" (unknown), never as the dist hash."""
     reply = admin("GET", "/hives/%s/versions" % hive)
     core = ((reply.get("payload") or {}).get("hive") or {}).get("core") or {}
     versions = sorted({(c or {}).get("version") for c in (core.get("components") or {}).values()}, key=str)
-    return core.get("status"), versions, core.get("manifest_hash") or ""
+    installed = core.get("installed")
+    if installed:
+        return core.get("status"), versions, installed.get("manifest_hash") or "", "installed"
+    return core.get("status"), versions, core.get("manifest_hash") or "", "dist"
 
 
 def cmd_versions(_a):
     for hive in hives():
-        status, versions, digest = core_of(hive)
-        print("%-10s core=%s versions=%s hash=%s" % (hive, status, versions, digest[:16]))
+        status, versions, digest, source = core_of(hive)
+        print("%-10s core=%s versions=%s hash=%s (%s)" % (hive, status, versions, digest[:16], source))
 
 
 def cmd_opa_status(a):
@@ -284,22 +292,32 @@ def cmd_deploy(a):
     print("== waiting for the motherbee admin on %s" % v)
 
     def primary_ready():
-        status, versions, digest = core_of(PRIMARY)
+        status, versions, digest, _ = core_of(PRIMARY)
         return digest if versions == [v] else None
 
     digest = wait_for("the motherbee core on %s" % v, primary_ready, 300)
     print("  manifest %s" % digest[:16])
 
     spokes = [h for h in hives() if h != PRIMARY]
+    # The motherbee's admin answers before its router has the spokes back: an update sent then
+    # fails with TRANSPORT_ERROR (0.1.56). Wait until each spoke's orchestrator answers.
+    for h in spokes:
+        wait_for("%s answering" % h, lambda h=h: core_of(h)[0] == "ok" or None, 300)
     print("== core update: %s" % ", ".join(spokes))
     # Since U-8b the call answers once the spoke has the new binaries in place (phase
-    # `restarting`); the restarts run after it. Fire them all at once, print each answer, and
-    # still judge each spoke by what it reports once it is back.
+    # `restarting`); the restarts run after it. Fire them all at once, retry one that did not
+    # get through, print each answer, and still judge each spoke by what it installed.
     replies = {}
 
     def update(h):
-        replies[h] = admin("POST", "/hives/%s/update" % h,
-                           {"category": "core", "manifest_version": 0, "manifest_hash": digest})
+        for attempt in range(3):
+            if attempt:
+                time.sleep(10)
+            replies[h] = admin("POST", "/hives/%s/update" % h,
+                               {"category": "core", "manifest_version": 0, "manifest_hash": digest})
+            r = replies[h]
+            if (r.get("status") or (r.get("payload") or {}).get("status")) == "ok":
+                return
 
     threads = [threading.Thread(target=update, args=(h,)) for h in spokes]
     for t in threads:
@@ -315,7 +333,7 @@ def cmd_deploy(a):
             " phase=%s" % p.get("phase") if p.get("phase") else ""))
     for h in spokes:
         def spoke_ready(h=h):
-            status, versions, got = core_of(h)
+            status, versions, got, _ = core_of(h)
             return got if versions == [v] and got == digest else None
         wait_for("%s on %s" % (h, v), spoke_ready, 600)
         print("  %s on %s" % (h, v))
