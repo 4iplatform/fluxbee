@@ -354,7 +354,7 @@
 - **Arreglo:** claves y valores de la query se decodifican; `+` queda literal (aquí son más comunes
   los `+` crudos, como `Etc/GMT+3`) y un `%` suelto se conserva.
 
-### A-31 🟡 Los servicios escriben códigos de color ANSI en el journal
+### A-31 ✅ RESUELTO (0.1.57) — Los servicios escriben códigos de color ANSI en el journal
 
 - **Qué pasa:** los niveles salen como `\x1b[33m WARN\x1b[0m` en `journalctl`. Un `grep ' WARN '`
   no encuentra nada, y al validar 0.1.52 un conteo de errores dio 0 en falso hasta limpiar los
@@ -364,6 +364,13 @@
 - **Arreglo propuesto:** un init de tracing en el SDK con `with_ansi` solo si la salida es una
   terminal, usado por todos los binarios. Es un cambio mecánico en 36 archivos: va con la pasada
   de formato masivo (ítem 8 del lote), a decisión del operador.
+- **Arreglo:**
+  - `fluxbee_sdk::logging::fmt()` y `ansi()` solo ponen color cuando stdout es una terminal.
+  - Los 36 arranques de tracing pasan por ahí: los binarios del core, los nodos IO/AI/gov/test, los
+    diags y la capa de SY.edge.
+  - El formateo masivo queda aparte; es decisión del operador.
+- **Verificado:** un diag con la salida a un pipe pasó de 48 secuencias ESC a 0, y sus niveles salen
+  como ` WARN `.
 
 
 ### A-32 ✅ RESUELTO (0.1.53) — Datos personales en logs y respuestas (frontdesk e identity)

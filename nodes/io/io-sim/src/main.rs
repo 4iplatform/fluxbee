@@ -27,7 +27,9 @@ async fn main() -> Result<()> {
     let env_filter = tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
         tracing_subscriber::EnvFilter::new("info,io_sim=debug,fluxbee_sdk=info")
     });
-    tracing_subscriber::fmt().with_env_filter(env_filter).init();
+    fluxbee_sdk::logging::fmt()
+        .with_env_filter(env_filter)
+        .init();
 
     tracing::info!(
         node_name = %config.node_name,

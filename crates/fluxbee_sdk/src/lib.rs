@@ -4,6 +4,7 @@ pub mod cloud;
 pub mod cognition;
 pub mod comm;
 pub mod identity;
+pub mod logging;
 pub mod managed_node;
 pub mod managed_control_plane;
 pub mod nats;

@@ -415,9 +415,12 @@ fn vault_change_is_wapp(payload: &Value) -> bool {
 #[tokio::main]
 async fn main() -> Result<()> {
     let config = Config::from_env();
-    let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info,io_wapp=info,fluxbee_sdk=info"));
-    tracing_subscriber::fmt().with_env_filter(env_filter).init();
+    let env_filter = tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+        tracing_subscriber::EnvFilter::new("info,io_wapp=info,fluxbee_sdk=info")
+    });
+    fluxbee_sdk::logging::fmt()
+        .with_env_filter(env_filter)
+        .init();
 
     let self_ilk_id = fluxbee_sdk::read_self_ilk_from_env();
     let self_tenant_id = fluxbee_sdk::read_self_tenant_from_env();

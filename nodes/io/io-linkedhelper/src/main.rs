@@ -473,9 +473,12 @@ impl ResponseItem {
 #[tokio::main]
 async fn main() -> Result<()> {
     let mut config = Config::from_env();
-    let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info,io_linkedhelper=info,fluxbee_sdk=info"));
-    tracing_subscriber::fmt().with_env_filter(env_filter).init();
+    let env_filter = tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+        tracing_subscriber::EnvFilter::new("info,io_linkedhelper=info,fluxbee_sdk=info")
+    });
+    fluxbee_sdk::logging::fmt()
+        .with_env_filter(env_filter)
+        .init();
 
     // Phase J'-0a: self ILK + tenant from orchestrator-injected env vars.
     let self_ilk_id = fluxbee_sdk::read_self_ilk_from_env();

@@ -138,7 +138,7 @@ struct RuntimeState {
 #[tokio::main]
 async fn main() -> Result<(), DynError> {
     let config = Config::from_env()?;
-    tracing_subscriber::fmt()
+    fluxbee_sdk::logging::fmt()
         .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| {
             EnvFilter::new("info,io_cloud=debug,io_common=info,fluxbee_sdk=info")
         }))

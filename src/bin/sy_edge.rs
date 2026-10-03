@@ -166,7 +166,7 @@ async fn main() -> Result<(), SyEdgeError> {
     let (filter_layer, reload_handle) = tracing_subscriber::reload::Layer::new(env_filter);
     tracing_subscriber::registry()
         .with(filter_layer)
-        .with(tracing_subscriber::fmt::layer())
+        .with(tracing_subscriber::fmt::layer().with_ansi(fluxbee_sdk::logging::ansi()))
         .init();
     // Current level string (EnvFilter can't be read back) + a boxed reloader for node_config.
     let current_log = Arc::new(std::sync::Mutex::new(initial_log));

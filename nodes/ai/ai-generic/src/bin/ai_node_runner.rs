@@ -3952,7 +3952,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // ai.generic was silent in journald (no config-rejection reason, no completions, no errors),
     // which turned every misconfiguration into a blind debug. Default to INFO like the sibling nodes
     // (io-api / sy-admin / sy-orchestrator); RUST_LOG still overrides when set.
-    tracing_subscriber::fmt()
+    fluxbee_sdk::logging::fmt()
         .with_env_filter(
             EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
         )

@@ -68,7 +68,9 @@ async fn main() -> Result<()> {
         }
     });
 
-    tracing_subscriber::fmt().with_env_filter(env_filter).init();
+    fluxbee_sdk::logging::fmt()
+        .with_env_filter(env_filter)
+        .init();
 
     // Phase J'-0a: read self ILK + tenant injected by orchestrator via
     // FLUXBEE_NODE_ILK_ID / FLUXBEE_NODE_TENANT_ID at spawn time. IO nodes

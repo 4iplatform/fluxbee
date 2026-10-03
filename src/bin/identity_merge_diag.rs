@@ -269,7 +269,7 @@ fn connect_config(name: String) -> NodeConfig {
 #[tokio::main]
 async fn main() -> Result<(), DiagError> {
     let log_level = env_or("JSR_LOG_LEVEL", "info");
-    tracing_subscriber::fmt()
+    fluxbee_sdk::logging::fmt()
         .with_env_filter(EnvFilter::new(log_level))
         .init();
 

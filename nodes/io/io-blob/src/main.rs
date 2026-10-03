@@ -248,7 +248,7 @@ impl Drop for FdGuard {
 
 #[tokio::main]
 async fn main() -> Result<(), DynError> {
-    tracing_subscriber::fmt()
+    fluxbee_sdk::logging::fmt()
         .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| {
             EnvFilter::new("info,io_blob=debug,io_common=info,fluxbee_sdk=info")
         }))

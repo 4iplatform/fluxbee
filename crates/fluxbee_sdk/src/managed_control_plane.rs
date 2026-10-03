@@ -425,7 +425,7 @@ pub fn managed_health_state(state: &ManagedControlPlaneState) -> &'static str {
 /// unset `RUST_LOG` emits NOTHING — which turned every misconfiguration into a blind debug. Default to
 /// INFO; `RUST_LOG` still overrides when set. Idempotent-safe to call once at startup.
 pub fn init_managed_node_logging(default_directives: &str) {
-    let _ = tracing_subscriber::fmt()
+    let _ = crate::logging::fmt()
         .with_env_filter(
             EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| EnvFilter::new(default_directives)),

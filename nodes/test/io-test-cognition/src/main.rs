@@ -28,7 +28,7 @@ struct CarrierValidation {
 
 #[tokio::main]
 async fn main() -> Result<(), DynError> {
-    tracing_subscriber::fmt()
+    fluxbee_sdk::logging::fmt()
         .with_env_filter(EnvFilter::new(env_or("JSR_LOG_LEVEL", "info")))
         .init();
 
