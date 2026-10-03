@@ -118,7 +118,9 @@ instance owns one ICH and publishes `/e/<ich>` through the configured `SY.edge`.
 
 Required sequence:
 
-1. Choose a tenant, unique node name, `api_channel_id`, fixed `dst_node` and Edge node.
+1. Choose the tenant the API serves (never the hive's root tenant
+   `tnt:00000000-0000-0000-0000-000000000001`, see §8.2), a unique node name, `api_channel_id`,
+   fixed `dst_node` and Edge node.
 2. Spawn `runtime=io.api` through `run_node`; Orchestrator injects the instance ILK/tenant.
 3. Apply the Edge-native config without credentials. IO.api self-externalizes and `SY.admin` mints
    and stores the Edge bearer through the canonical ingress flow.
@@ -494,6 +496,7 @@ Notes:
 - `node_name` uses type prefix + `@hive`
 - `runtime` is lowercase and has no `@hive`
 - `tenant_id` is root-level and required for `AI.*` / `IO.*` first spawn; do not bury it inside `config`
+- an `IO.*` node other than `IO.cloud` / `IO.blob` never runs in the hive's root tenant `tnt:00000000-0000-0000-0000-000000000001`: `run_node` with that tenant fails with `TENANT_ROOT_NOT_ALLOWED` (§8.2)
 - For `WF.*`, do not use `runtime: "wf.engine"` in `run_node`; first publish/apply the workflow through `wf_rules_compile_apply` and spawn the resulting concrete runtime (`wf.<workflow_name>`).
 
 ### 8.1.1 Tenant discovery before first spawn
@@ -526,7 +529,8 @@ Rules:
 - never use non-executable placeholders like `<tenant_id_from_s1>`
 - in tenant reads, treat `is_root=true` as a root/default tenant candidate and `is_sponsor=true` as a tenant that currently sponsors child tenants
 - if the task says "same tenant as an existing node", prefer reading the node config/live config to find the exact `tenant_id`, then validate that tenant with `get_tenant`
-- run client-facing `AI.*` / `IO.*` nodes with the client `tenant_id`, not the sponsor/admin tenant, unless the operator explicitly asks for an internal admin node
+- run client-facing `AI.*` / `IO.*` nodes with the client `tenant_id`, not the sponsor/admin tenant, unless the operator explicitly asks for an internal admin node, which runs in the admin/company tenant
+- run an `IO.*` node in the tenant the operator names, or in the one you read from an existing node (as above); if there is none, block with `missing_fields:["tenant_id"]`. Never pick the hive's root tenant `tnt:00000000-0000-0000-0000-000000000001` for it, even when it is the only `is_root=true` tenant: only `IO.cloud` and `IO.blob` run there
 - if no reliable tenant can be found, block and ask for exactly one missing tenant clarification
 
 ### 8.1.2 Agent cognitive definition
@@ -558,10 +562,15 @@ Rules:
 
 ### 8.2 IO tenant naming
 
-An IO channel node is launched by the tenant that needs it and runs with that tenant. There is no
-default Slack node in the base install: every Slack binding is its own instance of `io.slack`.
+An IO channel node (`io.api`, `io.slack`, `io.wapp`, `io.linkedhelper`, ...) is launched by the
+tenant that needs it, or by an operator for that tenant, and runs with that tenant. None runs in the
+hive's root tenant `tnt:00000000-0000-0000-0000-000000000001`: only `IO.cloud` and `IO.blob` run
+there, and they are the only IO nodes the base install starts (operator decision 2026-10-02). The
+orchestrator refuses any other IO node in the root tenant with `TENANT_ROOT_NOT_ALLOWED`. Every
+binding is its own instance of its runtime:
 
-- `IO.slack.T126@motherbee` — one binding, named after its tenant or workspace token
+- `IO.slack.T126@motherbee` — one Slack binding, named after its tenant or workspace token
+- `IO.wapp.acme@motherbee` — one WhatsApp number of the tenant `acme`
 
 Use the same short tenant token consistently across related nodes.
 

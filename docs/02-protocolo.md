@@ -1267,6 +1267,13 @@ Nodo                                    Router
   │         (operación normal)             │
 ```
 
+**Una conexión viva por UUID** (desde 0.1.56, A-44). Si el UUID del HELLO ya tiene una conexión
+viva, el router espera hasta 1 s a que esa conexión se cierre: un reinicio, una reconexión o el
+segundo HELLO que todo nodo Go manda al arrancar pueden llegar antes de que el router procese el
+cierre de la anterior. Si la anterior sigue viva, el router rechaza el HELLO: cierra la conexión
+nueva sin mandar ANNOUNCE y loguea el WARN `HELLO rejected: this node UUID already has a live
+connection`. La conexión anterior conserva su registro y su ruta.
+
 ### 8.2 Mensaje HELLO
 
 ```json
@@ -1521,7 +1528,7 @@ pub enum NodeError {
 
 > **Un nodo = Un UUID = Una conexión**
 
-El router asocia cada UUID a exactamente una conexión. Si un proceso abre dos conexiones con el mismo UUID, el router desconecta la anterior.
+El router asocia cada UUID a exactamente una conexión. Si llega un HELLO con un UUID que ya tiene una conexión viva, el router espera hasta 1 s a que esa conexión se cierre y, si sigue viva, rechaza la nueva sin ANNOUNCE (§8.1). La conexión que ya estaba no se toca (antes de 0.1.56 la nueva se quedaba con la ruta y la anterior seguía conectada, sin ruta).
 
 ### 10.6 Reconexión Automática
 
@@ -1533,6 +1540,7 @@ La librería maneja la reconexión de forma transparente:
 | Intento fallido | Backoff exponencial (100ms → 200ms → 400ms → ... → 30s max) |
 | Conexión OK | Enviar HELLO, esperar ANNOUNCE |
 | ANNOUNCE recibido | Estado = Connected |
+| HELLO rechazado (otra conexión viva tiene el UUID, §8.1) | Primera conexión: `connect()` devuelve el error. Reconexión: WARN `router handshake failed; retrying` y sigue el backoff |
 
 **Importante:** Al reconectar se vacía la cola TX. Los mensajes pendientes se pierden. Es responsabilidad del nodo re-enviar si es necesario (el nodo puede detectar desconexión via `is_connected()`).
 
@@ -1589,6 +1597,8 @@ Cuando el nodo llama `close()`, la librería envía WITHDRAW antes de cerrar:
 El router al recibir WITHDRAW remueve el nodo de su tabla inmediatamente.
 
 **Nota:** Si el nodo hace `drop()` sin llamar `close()`, no se envía WITHDRAW. El router detectará la desconexión por el socket cerrado.
+
+Todo fin de la conexión (WITHDRAW, EOF o error de lectura) desregistra el nodo y cierra su socket del lado del router. Un mensaje que el router no puede procesar se loguea y se descarta: no corta la conexión (A-44).
 
 ### 10.8 Patrón Request/Response (responsabilidad del nodo)
 

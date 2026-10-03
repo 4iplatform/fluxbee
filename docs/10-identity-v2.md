@@ -75,7 +75,7 @@ A tenant is an organization, company, or account. It is the top-level partition 
 
 - `status`: `pending | active | suspended`. Only an `active` tenant takes registrations (`ILK_REGISTER` answers `TENANT_PENDING` / `TENANT_SUSPENDED`, and `TENANT_DELETED` for a marked one).
 - A default tenant (`fluxbee`) is created automatically during motherbee bootstrap. All system nodes (SY.*, RT.*) are registered under this tenant.
-- That default tenant is the root tenant (`tnt:00000000-0000-0000-0000-000000000001`, fixed by code). It holds the system, never a person: nobody registers into it (operator decision 2026-10-02). An `ILK_REGISTER` of a person into it answers `TENANT_ROOT_NOT_REGISTRABLE`; node ILKs (`agent`) still register there, and IO nodes running in it still provision temporary ILKs, which stay temporary (§6.2).
+- That default tenant is the root tenant (`tnt:00000000-0000-0000-0000-000000000001`, fixed by code). It holds the system, never a person (operator decisions 2026-10-02): nobody registers into it, and only io.cloud and io.blob run in it. An `ILK_REGISTER` of a person into it answers `TENANT_ROOT_NOT_REGISTRABLE`; node ILKs (`agent`) still register there. The orchestrator refuses any other IO node there (`TENANT_ROOT_NOT_ALLOWED`). An `ILK_PROVISION` without a tenant still creates a temporary ILK in it, which stays temporary (§6.2).
 - Subsequent tenants are created by the operator through SY.admin, by Fluxbee Cloud with its own process (io.cloud `create_tenant`, relayed by SY.admin), or by SY.architect. The frontdesk never creates one (§6.4).
 - Without at least one active tenant, no ILK can be registered and no node can be spawned.
 
@@ -415,7 +415,7 @@ When an ILK or TNT is created, updated, or deleted, motherbee SY.identity propag
 
 **Tenant of a registration:** the frontdesk takes it from the case, never from the person, the LLM, its own config or its environment, and never creates one (§6.4). SY.identity itself still accepts an `ILK_REGISTER` that moves a *temporary* ILK to another active tenant (a complete one answers `INVALID_TENANT_TRANSITION`); the frontdesk never asks for that.
 
-**Nobody registers into the root tenant** (operator decision 2026-10-02). SY.identity refuses, with `TENANT_ROOT_NOT_REGISTRABLE` and before any merge by email, every `ILK_REGISTER` that would put a person in the root tenant: one with `ilk_type: human`, or one of an ILK that is a human one (such as a temporary, whatever `ilk_type` it asks for). Every caller gets it; the frontdesk answers it by itself (`TENANT_NOT_REGISTRABLE`), and io.cloud `register_human` refuses the root tenant before provisioning anything. Node ILKs (`agent`) still register there. `ILK_PROVISION` is not restricted: an IO node running in the root tenant, or one that sends no tenant, still provisions the people who write in, and they stay `temporary`. Their messages keep reaching the frontdesk wherever the router force-routes temporaries to it (§14), and it answers that it cannot register them. The base IO instances `fluxbee-firstboot` spawns (`IO.api@motherbee`, `IO.wapp.default`, ...) run in the root tenant, so the people who reach the hive through them are in that situation; what IO nodes do in the root tenant is pending an operator decision.
+**Nobody registers into the root tenant** (operator decision 2026-10-02). SY.identity refuses, with `TENANT_ROOT_NOT_REGISTRABLE` and before any merge by email, every `ILK_REGISTER` that would put a person in the root tenant: one with `ilk_type: human`, or one of an ILK that is a human one (such as a temporary, whatever `ilk_type` it asks for). Every caller gets it; the frontdesk answers it by itself (`TENANT_NOT_REGISTRABLE`), and io.cloud `register_human` refuses the root tenant before provisioning anything. Node ILKs (`agent`) still register there. `ILK_PROVISION` is not restricted: an IO node that sends no tenant still provisions the people who write in into the root tenant, and they stay `temporary`. Their messages keep reaching the frontdesk wherever the router force-routes temporaries to it (§14), and it answers that it cannot register them. Only io.cloud and io.blob run in the root tenant, and neither provisions people there; the orchestrator refuses any other IO node in it with `TENANT_ROOT_NOT_ALLOWED` (operator decision 2026-10-02). The frontdesk's answer stays as defense in depth.
 
 **Authorized registrars:** SY.identity validates source authorization at two levels:
 
@@ -925,7 +925,7 @@ Creates a temporary ILK for an unknown ICH. Sent by IO nodes when they encounter
 
 The IO node can now use this real ILK UUID for `meta.src_ilk`.
 
-Provisioning in the root tenant (an IO node running in it, or a request without `tenant_id`) works, but the person it creates cannot be registered and stays `temporary` (§6.2).
+Provisioning in the root tenant (a request that names it, or one without `tenant_id`) works, but a person created there cannot be registered and stays `temporary` (§6.2). Only io.cloud and io.blob run in the root tenant, and neither provisions people there (§3.1).
 
 ### 12.2 ILK_REGISTER (unicast to SY.identity@motherbee)
 

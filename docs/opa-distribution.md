@@ -115,7 +115,8 @@ owner is the solution whose saved manifest most recently declared that exact reg
 - **Integrity:** a hive installs only a wasm whose sha256 matches the manifest. That guards
   against a partial transfer, not against a writer: whoever can write the synced copy can write a
   matching pair. On a spoke the folder is receive-only, so a local change there affects that hive
-  only and is never sent back. On the motherbee the folder is send-only and **its copy is the
+  only and is never sent back; the orchestrator's watchdog also reverts it to the motherbee's copy
+  (`lab/logbook/FINDINGS.md` A-16). On the motherbee the folder is send-only and **its copy is the
   publication**: whoever can write it (root or the Syncthing service user) publishes to every
   hive, while the motherbee's own status keeps showing the policy it applied. Signing the
   manifest is postponed with the security package (`lab/logbook/FINDINGS.md` A-22).

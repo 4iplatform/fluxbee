@@ -30,10 +30,13 @@ multipart uploads and outbound webhooks.
 - Runtime key: `io.api`.
 - Node shape: managed and instanced, like `ai.generic` nodes.
 - Example names: `IO.api.orders@worker-1`, `IO.api.partner-a@motherbee`.
-- One instance belongs to one Orchestrator-injected tenant.
+- One instance belongs to one Orchestrator-injected tenant. A tenant launches it (or an operator,
+  for that tenant), never in the root tenant `tnt:00000000-0000-0000-0000-000000000001`: the
+  Orchestrator refuses that with `TENANT_ROOT_NOT_ALLOWED` (operator decision 2026-10-02, A-43).
 - One instance owns one stable `api_channel_id` and therefore one ICH/public URL.
 - Multiple APIs are multiple managed instances. They may target the same or different Edge nodes.
-- The runtime is seeded under `dist/runtimes/io.api/<version>` by install/package flows.
+- The runtime is seeded under `dist/runtimes/io.api/<version>` by install/package flows; no
+  instance boots with the base install.
 - There is no `io-api.service` singleton and no `/usr/bin/io-api` service lifecycle.
 
 Orchestrator must inject:

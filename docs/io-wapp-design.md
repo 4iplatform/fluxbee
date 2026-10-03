@@ -188,7 +188,7 @@ Mirror io.slack: inbound → fetch media via Graph media URL (bearer) → `BlobT
 - **DECISION D3 — boot=true vs false**: user leaned **`boot=true` degraded** (io.slack scheme:
   firstboot auto-spawns `IO.wapp@motherbee`, degraded until creds+config load). io.linkedhelper
   precedent is `boot=false` (spawn-on-demand per tenant). Recommend **boot=true degraded** per the
-  user's steer; per-tenant instances still spawnable via run_node.
+  user's steer; per-tenant instances still spawnable via run_node. **Changed 2026-10-02: see §10 D3.**
 - Publish via `scripts/publish-io-runtime.sh` (+ a `wapp)` case) or the generic `publish-runtime.sh`.
 
 ## 10. DECISIONS (locked 2026-07-24)
@@ -199,7 +199,10 @@ Mirror io.slack: inbound → fetch media via Graph media URL (bearer) → `BlobT
   needs to return a node-supplied HTTP body for events.
 - **D2**: Edge forwards the **raw body** + `X-Hub-Signature-256` header on the fanned-out message; each
   node verifies the HMAC with its own `app_secret` (the edge does NOT verify signatures).
-- **D3**: `boot=true` degraded (io.slack scheme).
+- **D3**: `boot=true` degraded (io.slack scheme). **Changed by the operator on 2026-10-02 (A-43):**
+  `boot=false`, no base instance. Each number's `IO.wapp.<label>` node is launched by its tenant with
+  `run_node`, never in the root tenant (only io.cloud and io.blob run there; the orchestrator refuses
+  any other IO node with `TENANT_ROOT_NOT_ALLOWED`).
 - **D4**: Vault secret `resource_type` = `"whatsapp"` (new canonical) vs reuse `"bearer_token"`
   (io-cloud test uses `wapp_token`/`bearer_token`). Recommend a dedicated `"whatsapp"` type.
 - **D5**: Default inbound target `io.dst_node` = `AI.generic@motherbee` (matches the io.slack decision).
@@ -274,6 +277,9 @@ Mirror io.slack: inbound → fetch media via Graph media URL (bearer) → `BlobT
    the operator externalizes the fanout webhook. Additional numbers = more `IO.wapp.<label>` nodes via
    `run_node` (no new .deb). build-deb picks up the crate automatically (`workspace: nodes/io`); firstboot
    post-boot hint documents the `whatsapp` secret + externalize-as-fanout step.
+   **Changed 2026-10-02 (operator decision, A-43):** io.wapp is `boot: false` with no instance, and
+   firstboot no longer spawns `IO.wapp.default@motherbee`. Every number, the first one included, is an
+   `IO.wapp.<label>` node its tenant launches with `run_node`.
 6. **Live validation** — deploy to the dev hive; boots UNCONFIGURED; then a real webhook round-trip
    once a WABA + token are available. ✅ **Degraded-boot half DONE (2026-07-25, hive 240):** rolled out
    via the canonical runtime channel (docs/14-runtime-rollout-motherbee.md: build on fb-build →

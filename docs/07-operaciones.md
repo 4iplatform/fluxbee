@@ -80,7 +80,8 @@ El control del `.deb` declara `Depends: adduser, openssl, libc6 (>= 2.39), postg
 es ahora un `Depends` duro**, así que `apt-get install` lo trae automáticamente. El `postinst`:
 - crea el usuario de sistema `fluxbee` y los directorios de estado;
 - copia `hive.yaml.example` → `hive.yaml` si no existe (el operador lo edita antes de firstboot);
-- `daemon-reload` + `enable` de `sy-orchestrator`, `io-cloud`, `io-blob`;
+- `daemon-reload` + `enable` de `sy-orchestrator` (IO.cloud e IO.blob no tienen unit en el paquete:
+  son runtimes managed);
 - en una **instalación fresca NO arranca servicios** (arranca solo en upgrade, cuando dpkg pasa el
   argumento de versión previa). El transition a "encendido" lo hace `fluxbee-firstboot`.
 
@@ -209,7 +210,7 @@ El orden de `system_nodes.motherbee` es cargado por `sy_orchestrator`:
 
 | Rol | Cómo se crea | PostgreSQL | Nodos de sistema (start order) |
 |-----|--------------|:----------:|--------------------------------|
-| **motherbee** | `.deb` + `fluxbee-firstboot` | ✓ (Depends) | config.routes, identity, opa.rules, admin, IO.blob, architect, storage, cognition, policy, timer, wf-rules, frontdesk.gov, vault |
+| **motherbee** | `.deb` + `fluxbee-firstboot` | ✓ (Depends) | config.routes, identity, opa.rules, admin, architect, storage, cognition, policy, timer, wf-rules, frontdesk.gov, vault |
 | **worker** | `add_hive role=worker` | ✗ | config.routes, identity(réplica SHM), opa.rules, cognition, policy, timer, wf-rules |
 | **egress** | `add_hive role=egress` + `egress{}` | ✗ | config.routes (+ NAT saliente por nft) |
 | **ingress** | `add_hive role=ingress` + `ingress{}` | ✗ | config.routes, SY.edge (:443 público, fail-closed) |
@@ -314,9 +315,21 @@ para que el retry siga siendo key-first en vez de dejar el spoke a medio-hacer.
 sudo apt-get install ./fluxbee_<nueva-version>_amd64.deb
 ```
 
-- `prerm` para y deshabilita el orchestrator + todos los `sy-*` en orden inverso.
+- `prerm` para solo a los que escriben el manifest de runtimes de dist: `sy-orchestrator`,
+  `sy-admin` y `sy-wf-rules`. Router, identity, vault y el resto siguen sirviendo con los binarios
+  viejos mientras dpkg desempaqueta (A-45; antes paraba todo el core y la motherbee quedaba
+  70–86 s sin router, identity ni admin). En una desinstalación para todo y deshabilita lo que el
+  paquete habilitó.
 - `postinst` instala binarios + units nuevos y, **como es upgrade** (dpkg pasa la versión previa),
-  arranca de nuevo `sy-orchestrator`, `io-cloud`, `io-blob`.
+  arranca `sy-orchestrator`. Su boot reinicia cada servicio del core que corre un binario
+  reemplazado (`/proc/<pid>/exe` termina en `(deleted)`), en el orden de arranque Model D'
+  (`rt-gateway` primero, `SY.vault` último), y después los componentes del core que el `hive.yaml`
+  no lista en `system_nodes`. El resultado queda registrado como un core update: `/versions` →
+  `core.last_update`, `via: "package"`.
+- needrestart deja `rt-gateway` y `sy-*` al orchestrator (además de los `fluxbee-node-*`, A-39).
+  Costo: un update de una librería fuera de fluxbee les llega en el próximo upgrade o reboot.
+- dpkg corre el `prerm` del paquete **viejo**: el upgrade que instala 0.1.56 todavía para todo el
+  core; el reinicio corto se ve desde el upgrade siguiente.
 - Los units tienen `TimeoutStopSec=15`, así que un stop/restart/upgrade no cuelga 90 s hasta el
   SIGKILL del default de systemd. Los binarios salen rápido con SIGTERM y **`sy-orchestrator` ya
   no tira el hive abajo al salir** — el resto de la malla sigue arriba durante el upgrade.
@@ -328,6 +341,10 @@ Un spoke no se re-instala; recibe binarios nuevos por dist-sync:
 1. La motherbee publica el core nuevo en `/var/lib/fluxbee/dist/core/bin` + `manifest.json`
    (hashes reales).
 2. Syncthing replica `dist/` a los spokes (`sendonly` en motherbee, `receiveonly` en spokes).
+   Una carpeta `receiveonly` no manda ni deshace cambios locales: si el watchdog del orchestrator
+   ve alguno (`receiveOnlyTotalItems` > 0, en un espejo de `dist/` o en el `public/` de blob del
+   ingress), loguea un WARN y llama a `/rest/db/revert`, y la carpeta vuelve a la copia de la
+   motherbee (A-16).
 3. `POST /hives/{id}/update {category:"core", manifest_version, manifest_hash}` envía
    `SYSTEM_UPDATE` al `SY.orchestrator@{hive}`.
 4. El orchestrator del spoke valida el manifiesto local, **swap-ea los binarios, re-renderiza los

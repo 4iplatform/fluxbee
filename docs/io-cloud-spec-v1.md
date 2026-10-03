@@ -134,7 +134,7 @@ El subconjunto acotado que `IO.cloud` expone (NO "todo admin"). Cada acción, su
 |---|---|---|---|
 | `create_tenant` | Command | `SY.identity` (`TNT_CREATE`) | tenant_id = `tnt:<uuid>` |
 | `put_token` → `vault_put` | Command | `SY.vault` | pool del tenant u owner `IO.*` ya registrado; descarta `ilk`/ownership crudo (ver §4) |
-| `provision_node` → `run_node` | Command | `SY.orchestrator` | spawn de un nodo `IO.*`; **requiere tenant** |
+| `provision_node` → `run_node` | Command | `SY.orchestrator` | spawn de un nodo `IO.*`; **requiere tenant**, que no puede ser el raíz (`TENANT_ROOT_NOT_ALLOWED`, ver §6) |
 
 `externalize` se usa internamente durante el bootstrap de `IO.cloud`, pero no forma parte del API
 público de Cloud. `set_ilk_definition`, `start_node`, lecturas de vault y el resto de admin tampoco se
@@ -271,7 +271,9 @@ que `IO.cloud` orquesta:
 - **Spawn:** `run_node` (admin) → `SY.orchestrator :: run_node_flow` → `SPAWN_NODE`. Runtime = primeros
   2 segmentos del nombre (`IO.wapp.<x>` → `io.wapp`). **Requiere `tenant_id`** para `IO.`/`AI.`
   (`run_node_args_require_tenant`). Inyecta `FLUXBEE_NODE_ILK_ID`/`FLUXBEE_NODE_TENANT_ID` al unit y
-  registra workloads managed (`AI`/`IO`/`WF`/`RT`) como principals `agent`.
+  registra workloads managed (`AI`/`IO`/`WF`/`RT`) como principals `agent`. En el tenant raíz solo
+  corren `io.cloud` e `io.blob`: `run_node_flow` rechaza cualquier otro nodo `IO.*` ahí con
+  `TENANT_ROOT_NOT_ALLOWED`, antes de crear nada (decisión del operador 2026-10-02).
 - **Namespacing:** `ilk_id` es `ilk:<uuid>` (random para IO/AI); el `node@hive` va en
   `identification.node_name`/`ChannelRecord.owner_l2_name`. Solo los SY.* tienen ilk determinista
   (SHA256 del nombre).

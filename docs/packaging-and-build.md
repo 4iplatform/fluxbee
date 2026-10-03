@@ -39,7 +39,7 @@ Cada entrada de `base-nodes.json` declara su clase:
 | Clase | Qué es | Cómo arranca |
 |-------|--------|--------------|
 | **singleton** | (clase vacia hoy) nodo de infra motherbee-only con unit systemd horneada — IO.blob/IO.cloud pasaron a runtime managed | — |
-| **runtime** | nodo instanciado, spawneable por-tenant vía `run_node` desde `dist/runtimes/<runtime>/<ver>` | si `boot: true`, `fluxbee-firstboot` auto-spawnea una instancia default al boot; si `false`, queda horneado y spawneable a demanda |
+| **runtime** | nodo instanciado, spawneable por-tenant vía `run_node` desde `dist/runtimes/<runtime>/<ver>` | si `boot: true`, `fluxbee-firstboot` auto-spawnea una instancia default en el tenant raíz (solo io.cloud e io.blob, ver §2); si `false`, queda horneado y spawneable a demanda |
 
 ---
 
@@ -51,15 +51,18 @@ Definido en `packaging/base-nodes.json`:
 |------|-------|---------|
 | IO.blob | runtime (boot=true) | corriendo |
 | IO.cloud | runtime (boot=true, role: motherbee) | corriendo (degradado si no hay Fluxbee Cloud — la Cloud es otro repo) |
-| io.api | runtime | instancia default `IO.api@motherbee` corriendo + spawnable |
+| io.api | runtime | horneado, NO al boot: cada API (`IO.api.<label>`) la lanza el tenant que la necesita, con su tenant |
 | io.slack | runtime | horneado, NO al boot: cada binding de Slack lo lanza el tenant que lo necesita, con su tenant |
+| io.wapp | runtime | horneado, NO al boot: cada número de WhatsApp (`IO.wapp.<label>`) lo lanza su tenant |
 | ai.generic | runtime | horneado, NO al boot: las instancias `AI.*` se crean con `run_node` cuando hacen falta |
 | wf.engine | runtime | horneado, NO al boot — los nodos WF.* se spawnean desde un **workflow package** que corre sobre este runtime, no por `run_node` sobre el runtime pelado (da `WF_RUNTIME_PACKAGE_REQUIRED`) |
-| io.linkedhelper | runtime | horneado, NO al boot (spawnable a demanda) |
+| io.linkedhelper | runtime | horneado, NO al boot (lo lanza un tenant a demanda) |
 
-Los nodos base arrancan **corriendo pero degradados** hasta que el operador cargue su
-secreto/config en `SY.vault` — es deliberado: un backend recién instalado tiene los nodos
-básicos vivos "out of the box".
+Solo IO.cloud e IO.blob arrancan con la instalación, y son los únicos nodos IO que corren en el
+tenant raíz `tnt:00000000-0000-0000-0000-000000000001` (decisión del operador 2026-10-02, A-43).
+Arrancan **corriendo pero degradados** hasta que el operador los configure. Los demás runtimes IO
+quedan horneados y spawneables: los lanza un tenant (o un operador, para ese tenant) con `run_node`.
+El orchestrator rechaza cualquier otro nodo IO en el tenant raíz con `TENANT_ROOT_NOT_ALLOWED`.
 
 ---
 
@@ -68,19 +71,21 @@ básicos vivos "out of the box".
 **Es una edición de una línea** en `packaging/base-nodes.json`:
 
 ```json
-{ "runtime": "io.foo", "crate": "io-foo", "bin": "io-foo", "workspace": "nodes/io", "boot": true, "instance": "IO.foo@motherbee" }
+{ "runtime": "io.foo", "crate": "io-foo", "bin": "io-foo", "workspace": "nodes/io", "boot": false }
 ```
 
 Requisitos:
 1. El crate existe (ej. `nodes/io/io-foo`, miembro del workspace `nodes/io`).
-2. Agregar la entrada al manifest (arriba). `boot: true` = arranca una instancia default al
-   boot; `false` = solo horneado/spawnable.
+2. Agregar la entrada al manifest (arriba). `boot: false` = horneado y spawneable: lo lanza un
+   tenant con `run_node`. `boot: true` (con `instance`) hace que `fluxbee-firstboot` arranque una
+   instancia default en el tenant raíz; solo lo usan io.cloud e io.blob, porque el orchestrator
+   rechaza cualquier otro nodo IO en el tenant raíz (`TENANT_ROOT_NOT_ALLOWED`, A-43).
 3. Para un **singleton** nuevo (raro; solo infra 1-por-hive): agregarlo a `singletons`, crear su
-   unit systemd, y sumarlo al allowlist `MOTHERBEE_PACKAGED_NON_SYSTEM_NODES` en
-   `src/bin/sy_orchestrator.rs` + a `system_nodes` de `packaging/hive.yaml.example`.
+   unit systemd, y sumarlo al allowlist `HIVE_YAML_NON_SY_LIFECYCLE_NODES` (vacío hoy) en
+   `crates/fluxbee_sdk/src/managed_node.rs` + a `system_nodes` de `packaging/hive.yaml.example`.
 
-`build-deb.sh` compila el crate y lo hornea/publica según su clase; `fluxbee-firstboot` lo
-arranca/spawnea. **No hay que tocar el script de build.**
+`build-deb.sh` compila el crate y lo hornea/publica según su clase; `fluxbee-firstboot` spawnea los
+que tienen `boot: true`. **No hay que tocar el script de build.**
 
 > **Invariante (U-3): `dist/runtimes/manifest.json` es ESTADO DEL OPERADOR, nunca payload del
 > paquete.** El `.deb` envía solo el árbol de artefactos (`dist/runtimes/<runtime>/<versión>/`) y
@@ -194,14 +199,19 @@ sudo fluxbee-firstboot
 
 `fluxbee-firstboot` (idempotente): bootea PostgreSQL + crea rol/DBs, arranca el orchestrator,
 hace el `vault_put` del secreto de postgres (la **conexión a la DB queda resuelta sola en el
-vault**), reconecta los consumidores, auto-spawnea los runtimes managed de boot (IO.blob/IO.cloud), y **auto-spawnea
-las instancias default de los boot-runtimes** (io.api/io.wapp). Al terminar
-imprime los **próximos pasos**.
+vault**), reconecta los consumidores y auto-spawnea en el tenant raíz los runtimes managed de boot
+(IO.blob/IO.cloud). Al terminar imprime los **próximos pasos**.
 
-Después del firstboot quedan **corriendo**: el core `SY.*` + IO.blob + IO.cloud +
-`IO.api@motherbee` + `IO.wapp.default@motherbee` — varios
-**degradados** hasta cargar sus secretos. (`ai.generic` y `wf.engine` quedan **horneados pero NO
-al boot** — `boot:false` en `base-nodes.json`; sus instancias se crean a demanda.)
+Después del firstboot quedan **corriendo**: el core `SY.*` + IO.blob + IO.cloud, **degradados**
+hasta configurarlos. (io.api, io.wapp, io.slack, io.linkedhelper, `ai.generic` y `wf.engine` quedan
+**horneados pero NO al boot** — `boot:false` en `base-nodes.json`; sus instancias se crean a
+demanda, y las IO desde su tenant.)
+
+Un hive instalado antes de 0.1.56 puede tener `IO.api@motherbee` e `IO.wapp.default@motherbee` en
+el tenant raíz. El orchestrator ya no los arranca, reinicia ni relanza al boot
+(`TENANT_ROOT_NOT_ALLOWED`); si siguen corriendo, no los mata. Borralos
+(`DELETE /hives/motherbee/nodes/<nodo>` con `{"purge_instance":true}`) y lanzá cada nodo desde su
+tenant.
 
 ### 5.1 Lo que pone el usuario (secretos en el vault)
 
@@ -235,6 +245,10 @@ problema de quien conecte una Cloud, no del backend.
   base en el manifest **vivo** en tiempo de instalación (merge, no reemplazo). También es la
   superficie de reparación del operador: `sudo fluxbee-seed-runtimes`.
 - [`packaging/deb-preinst`](../packaging/deb-preinst) — copia el manifest vivo antes del unpack.
+- [`packaging/deb-prerm`](../packaging/deb-prerm) / [`packaging/deb-postinst`](../packaging/deb-postinst)
+  — en un upgrade el `prerm` para solo `sy-orchestrator`, `sy-admin` y `sy-wf-rules`; el resto del
+  core sigue sirviendo con los binarios viejos hasta que el boot del orchestrator nuevo lo reinicia
+  en orden (A-45). Detalle en [07-operaciones.md](07-operaciones.md) §6.1.
 - [`scripts/make-deb.sh`](../scripts/make-deb.sh) — entrypoint de build para devs.
 - [07-operaciones.md](07-operaciones.md) — deploy y ciclo de vida (add_hive, update, roles).
 - [14-runtime-rollout-motherbee.md](14-runtime-rollout-motherbee.md) — canal de update de runtimes.

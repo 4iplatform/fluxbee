@@ -281,7 +281,9 @@ stream. HTML recibe la CSP fija de la seccion 6; ningun header viene del produce
 
 - Folder id nuevo: `fluxbee-blob-public`.
 - Source: motherbee `<blob.path>/public`, `sendonly`.
-- Destination: ingress `edge.blob_public_root`, `receiveonly`.
+- Destination: ingress `edge.blob_public_root`, `receiveonly`. Si la replica tiene cambios locales,
+  el watchdog del orchestrator del ingress los loguea y los revierte (`/rest/db/revert`): la carpeta
+  vuelve a la copia de la motherbee (A-16).
 - Peer point-to-point; no discovery/relay/NAT traversal automatico.
 - Nunca agregar ingress como device del folder `fluxbee-blob` (`active/`).
 - Un publish no termina hasta que edge puede abrir/verificar el archivo.

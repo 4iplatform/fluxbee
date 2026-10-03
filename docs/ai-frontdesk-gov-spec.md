@@ -158,11 +158,12 @@ del sistema y sus nodos; decision del operador 2026-10-02). Si el tenant del cas
 - `SY.identity` aplica la misma regla para cualquier llamador (`TENANT_ROOT_NOT_REGISTRABLE`), y
   el frontdesk la traduce al mismo resultado.
 
-La persona queda `temporary`: el `ILK_PROVISION` en el tenant raiz sigue funcionando. Es el caso
-de quien escribe por un nodo IO que corre en el tenant raiz, como las instancias base que levanta
-`fluxbee-firstboot` (`IO.api@motherbee`, `IO.wapp.default`): si su nodo IO enruta por `Resolve`,
-cada mensaje suyo vuelve al frontdesk y recibe la misma respuesta. Que hacen los nodos IO en el
-tenant raiz esta pendiente (seccion 13).
+La persona queda `temporary`: el `ILK_PROVISION` en el tenant raiz sigue funcionando. En el tenant
+raiz solo corren io.cloud e io.blob, y ninguno provisiona personas ahi: el orchestrator rechaza
+cualquier otro nodo IO con `TENANT_ROOT_NOT_ALLOWED` (decision del operador 2026-10-02, A-43). Queda
+el caso de un nodo IO que provisiona sin tenant (seccion 4.3): si enruta por `Resolve`, cada mensaje
+de esa persona vuelve al frontdesk y recibe la misma respuesta. Esta regla del frontdesk queda como
+defensa en profundidad.
 
 ## 5. Estado por hilo
 
@@ -408,9 +409,10 @@ Deben:
   - si `success = true`, permitir que el mensaje original continue al `dst_final`;
   - si `success = false`, mapearla a la respuesta HTTP de `IO.api`.
 
-Una instancia de `IO.api` que corre en el tenant raiz (la `IO.api@motherbee` que levanta
-`fluxbee-firstboot`) provisiona a sus sujetos `by_data` en el tenant raiz: el frontdesk responde
-`success = false`, `error_code = tenant_not_registrable` (seccion 4.4), y el mensaje no sigue.
+Ninguna instancia de `IO.api` corre en el tenant raiz: la lanza su tenant, y el orchestrator la
+rechaza en el raiz (`TENANT_ROOT_NOT_ALLOWED`; decision del operador 2026-10-02, A-43). Si igual
+llega un sujeto `by_data` con un ILK del tenant raiz, el frontdesk responde `success = false`,
+`error_code = tenant_not_registrable` (seccion 4.4), y el mensaje no sigue.
 
 ### 10.4 io.cloud `register_human`
 
@@ -464,8 +466,6 @@ que campos vinieron, nunca sus valores.
 - Prueba de que la persona es duena del email (por ejemplo un codigo de un solo uso) antes del merge
   de la seccion 7.1. Hasta entonces, quien conoce el email de otro asocia su canal al ILK de esa
   persona.
-- Los nodos IO que corren en el tenant raiz (las instancias base de `fluxbee-firstboot`): las
-  personas que llegan por ellos quedan `temporary` (seccion 4.4). Decision del operador pendiente.
 - Los contadores de la seccion 12 (G6).
 - Los reintentos conversacionales: la regla "no loop" del prompt vuelve terminal un error
   transitorio (G8).

@@ -465,7 +465,7 @@ systemctl --failed                                        # vacio
 curl -s http://127.0.0.1:8080/hives/motherbee/commands   # el audit log ya registra
 ```
 
-Los nodos base (`IO.api`, `IO.slack`, `IO.wapp.default`, `AI.chat`) arrancan en `UNCONFIGURED`.
+Los nodos base (`IO.cloud`, `IO.blob`) arrancan en `UNCONFIGURED`.
 **Eso es correcto**, no es una falla: el arranque degradado es de diseño.
 
 > **`wan.authorized_hives` vacío = permite todo.** No está en el `hive.yaml` que genera el postinst y
@@ -960,9 +960,11 @@ tiene un **orden obligatorio**:
 # UNA sola llamada: baja el nodo Y borra su directorio persistido.
 DELETE /hives/{h}/nodes/{n}@{h}   -d '{"purge_instance":true}'
 
-POST   /hives/{h}/nodes                 # run_node — tenant_id es OBLIGATORIO
-  {"node_name":"IO.api","runtime":"io.api","runtime_version":"current",
-   "tenant_id":"tnt:00000000-0000-0000-0000-000000000001"}
+POST   /hives/{h}/nodes                 # run_node — tenant_id es OBLIGATORIO: el que tenía el nodo
+  {"node_name":"IO.api.acme","runtime":"io.api","runtime_version":"current",
+   "tenant_id":"tnt:<tenant del nodo>"}
+# El tenant raíz (tnt:00000000-0000-0000-0000-000000000001) solo vale para IO.cloud e IO.blob:
+# cualquier otro nodo IO ahí da TENANT_ROOT_NOT_ALLOWED (A-43).
 ```
 
 ⚠️ **Usá `purge_instance`, no dos llamadas.** Encadenar `kill_node` y después

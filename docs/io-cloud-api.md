@@ -466,7 +466,7 @@ Y un `owner_node` que no empiece con `IO.` es **error duro**, no un descarte sil
 
 | campo | obligatorio | notas |
 |---|---|---|
-| `tenant_id` (raíz) | ✅ **sí**, canónico | |
+| `tenant_id` (raíz) | ✅ **sí**, canónico | el tenant del cliente; nunca el tenant raíz `tnt:00000000-0000-0000-0000-000000000001` (`TENANT_ROOT_NOT_ALLOWED`) |
 | `params.node_name` | ✅ **sí** | **debe empezar con `IO.`**; el sufijo `@hive` elige servidor |
 | `params.runtime` | opcional (ver abajo) | qué implementación levantar |
 | `params.runtime_version` | opcional | default `"current"` |
@@ -548,6 +548,7 @@ Si falta alguno: `"invalid add_channels entry: …"`.
 | `error_code` | qué pasó |
 |---|---|
 | `NODE_ALREADY_EXISTS` | ya existe un nodo con ese nombre |
+| `TENANT_ROOT_NOT_ALLOWED` | el `tenant_id` es el tenant raíz: ahí solo corren `IO.cloud` e `IO.blob` (decisión del operador 2026-10-02). No se crea nada; manden el tenant del cliente |
 | `RUNTIME_NOT_AVAILABLE` | el runtime o la versión pedidos no se pueden resolver |
 | `RUNTIME_MANIFEST_MISSING` / `MANIFEST_INVALID` | el catálogo de runtimes del hive está roto |
 | `INVALID_REQUEST` | `node_name` inválido, runtime no derivable, `runtime_version` inválido |
@@ -780,7 +781,7 @@ en ese tenant: `{"status":"error","error_code":"ILK_NOT_FOUND",…}` sin tocar a
 | `IO.cloud may relay only ["create_tenant","vault_put","run_node"] …` | pidieron algo fuera de la lista blanca. **Es el control de seguridad del hive funcionando**, no un bug |
 
 `error_code` cuando viene: `UNAUTHORIZED`, `INVALID_REQUEST`, `INVALID_VALUE`,
-`INVALID_SPONSOR_TENANT`, `NODE_ALREADY_EXISTS`, `RUNTIME_NOT_AVAILABLE`,
+`INVALID_SPONSOR_TENANT`, `NODE_ALREADY_EXISTS`, `TENANT_ROOT_NOT_ALLOWED`, `RUNTIME_NOT_AVAILABLE`,
 `RUNTIME_MANIFEST_MISSING`, `MANIFEST_INVALID`, `IDENTITY_REGISTER_FAILED`,
 `IDENTITY_UPDATE_FAILED`, `CONFIG_WRITE_FAILED`, `SERVICE_FAILED`, `SPAWN_FAILED`,
 `STORAGE_ERROR`, `ENCRYPTION_ERROR`, `MASTER_KEY_NOT_AVAILABLE`, `KEY_NOT_FOUND`,
