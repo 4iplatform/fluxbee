@@ -622,9 +622,12 @@ Respuesta del operador (2026-10-02): *"sí a todo"*.
   sus configs quedaron guardadas fuera del repo.
 - **Validado en vivo (0.1.56):** un `run_node` de io.api en el tenant raíz da
   `TENANT_ROOT_NOT_ALLOWED` y no deja nada creado.
-- **Queda para el operador:**
-  - El runbook de LinkedHelper de Noelia (`docs/onworking NOE/...`) lanza el nodo en el tenant raíz.
-  - `docs/io-web-spec-beta-v1.md` diseña `IO.web@motherbee` con `boot=true` en el tenant raíz.
+- **io.web (operador, 2026-10-03):** *"io.web también va en el core, la idea es que los IO que se
+  requieren como recursos compartidos y no porque una solución lo requiera, corren en el core"*.
+  - Quedó en `ROOT_TENANT_IO_RUNTIMES`, aunque todavía no existe: hay solo una spec.
+  - Su spec lo declara en `system_nodes`; cuando se construya, va como IO.blob e IO.cloud (runtime
+    managed `boot=true`).
+- **El runbook de LinkedHelper de Noelia** lanza el nodo en el tenant raíz. Lo ve el operador.
 
 ### A-44 ✅ RESUELTO (0.1.55 + 0.1.56) — Dos conexiones con un mismo UUID: la segunda se queda con la ruta
 
@@ -806,6 +809,10 @@ Visto al arreglar los e2e de A-37, leyendo `src/router/mod.rs` y `src/shm/mod.rs
   - Si una carpeta receive-only tiene cambios locales, deja un WARN y la revierte.
   - Cubre los espejos de `dist/` de los spokes y el `public/` de blob del ingress.
   - El 2026-10-02 las 12 carpetas receive-only de PROD estaban en 0.
+- **Validado en vivo (0.1.56, 2026-10-03, con el OK del operador):**
+  - Un archivo de prueba en `dist/vendor` de worker1 subió `receiveOnlyTotalItems` a 1 a los 11 s.
+  - El watchdog dejó el WARN y revirtió la carpeta.
+  - A los 16 s el archivo ya no estaba y el contador volvió a 0.
 
 ---
 

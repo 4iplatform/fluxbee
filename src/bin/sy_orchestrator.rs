@@ -2145,7 +2145,7 @@ async fn reconcile_persisted_custom_nodes(
                 node_name = node.node_name,
                 runtime = runtime_key,
                 payload = %refusal,
-                "persisted custom node not relaunched: only io.cloud and io.blob run in the root tenant"
+                "persisted custom node not relaunched: only the core IO runtimes run in the root tenant"
             );
             continue;
         }
@@ -10432,8 +10432,8 @@ fn node_kind_from_name(name: &str) -> String {
     }
 }
 
-/// Only io.cloud and io.blob run in the root tenant; a tenant launches every other IO node
-/// (operator decision 2026-10-02, FINDINGS A-43). Some(error reply) when `tenant_id` is the root
+/// Only the core IO runtimes (fluxbee_sdk::ROOT_TENANT_IO_RUNTIMES) run in the root tenant; a
+/// tenant launches every other IO node (operator decisions 2026-10-02/03, FINDINGS A-43). Some(error reply) when `tenant_id` is the root
 /// tenant and the node is another IO node. Checked wherever a node is launched: run_node, start
 /// and restart, and the boot relaunch.
 fn root_tenant_io_refusal(
@@ -10449,8 +10449,8 @@ fn root_tenant_io_refusal(
         "status": "error",
         "error_code": "TENANT_ROOT_NOT_ALLOWED",
         "message": format!(
-            "IO node '{node_name}' (runtime '{runtime}') cannot run in the root tenant: only {} run there; launch it from a tenant",
-            fluxbee_sdk::ROOT_TENANT_IO_RUNTIMES.join(" and ")
+            "IO node '{node_name}' (runtime '{runtime}') cannot run in the root tenant: only the core IO runtimes ({}) run there; launch it from a tenant",
+            fluxbee_sdk::ROOT_TENANT_IO_RUNTIMES.join(", ")
         ),
         "node_name": node_name,
         "runtime": runtime,

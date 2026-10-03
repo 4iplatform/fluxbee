@@ -62,10 +62,12 @@ fn node_matches(node_name: &str, known: &[&str]) -> bool {
     known.iter().any(|k| k.eq_ignore_ascii_case(local))
 }
 
-/// The IO runtimes that run in the root tenant: io.cloud and io.blob, which the core itself runs
-/// (operator decision 2026-10-02, FINDINGS A-43). Every other IO runtime stays installed and
-/// spawnable, but a tenant launches it: never in the root tenant, never by default.
-pub const ROOT_TENANT_IO_RUNTIMES: &[&str] = &["io.cloud", "io.blob"];
+/// The IO runtimes the core itself runs, in the root tenant: the ones the platform needs as shared
+/// resources, not because a solution asks for them (operator decisions 2026-10-02 and 2026-10-03,
+/// FINDINGS A-43). io.web is designed (docs/io-web-spec-beta-v1.md) but not built yet. Every other
+/// IO runtime stays installed and spawnable, but a tenant launches it: never in the root tenant,
+/// never by default.
+pub const ROOT_TENANT_IO_RUNTIMES: &[&str] = &["io.cloud", "io.blob", "io.web"];
 
 /// True when the root tenant refuses this node: an IO node (an `IO.*` name or an `io.*` runtime)
 /// whose runtime is not one of [`ROOT_TENANT_IO_RUNTIMES`], with `tenant_id` the root tenant.
@@ -133,10 +135,10 @@ mod tests {
         unsafe { std::env::remove_var("GOV_NODE_NAME") };
     }
 
-    /// A-43: only io.cloud and io.blob run in the root tenant; any other IO node is launched by
-    /// a tenant. Other kinds, and other tenants, are not restricted.
+    /// A-43: only the core IO runtimes (io.cloud, io.blob, io.web) run in the root tenant; any
+    /// other IO node is launched by a tenant. Other kinds, and other tenants, are not restricted.
     #[test]
-    fn the_root_tenant_takes_only_io_cloud_and_io_blob() {
+    fn the_root_tenant_takes_only_the_core_io_runtimes() {
         let root = crate::identity::DEFAULT_ROOT_TENANT_ID;
         let root_without_hyphens = "tnt:00000000000000000000000000000001";
         let tenant = "tnt:8a0c3f8e-2f1b-4d3a-9c55-0f6e2b7d9a11";
@@ -148,6 +150,11 @@ mod tests {
         assert!(!root_tenant_refuses_io_node(
             "IO.blob@motherbee",
             "io.blob",
+            root
+        ));
+        assert!(!root_tenant_refuses_io_node(
+            "IO.web@motherbee",
+            "io.web",
             root
         ));
         for (name, runtime) in [

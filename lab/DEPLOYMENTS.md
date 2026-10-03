@@ -112,8 +112,8 @@
     - este upgrade todavía paró todo el core, entre 06:33:26 y 06:34:58, porque corre el `prerm`
       de 0.1.55;
     - se mide en el próximo upgrade.
-  - **A-16:** no se probó en vivo. Hacerlo implica escribir en un espejo de un spoke, y queda a
-    decisión del operador.
+  - **A-16, validado después del deploy con el OK del operador:** un archivo de prueba en
+    `dist/vendor` de worker1 se revirtió en 16 s, con su WARN.
   - **Identity y frontdesk:** 0 errores. La réplica de worker1 hizo el full sync después de su
     reinicio.
   - **CI:** `rust-tests`, `admin-catalog-guard` y `router-dispatcher-guards` en verde en `715143a`.
