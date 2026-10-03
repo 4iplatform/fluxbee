@@ -1,14 +1,32 @@
 #!/bin/sh
-# fluxbee .deb prerm: stop + disable services before removal.
+# fluxbee .deb prerm.
+#
+# Upgrade (FINDINGS A-45): stop only the writers of the dist runtimes manifest, which the
+# postinst's seed rewrites: sy-orchestrator, sy-admin and sy-wf-rules. Router, identity, vault and
+# the other services keep serving on the old binaries while dpkg unpacks; when the postinst starts
+# the new orchestrator, its boot restarts each service that runs a replaced binary, in its start
+# order. Stopping the whole core here left the motherbee 70-86 s without router, identity or admin
+# on every upgrade.
+#
+# Removal: stop every service and disable the ones the package enabled.
 set -e
 if [ -d /run/systemd/system ]; then
-    for s in sy-orchestrator io-cloud io-blob sy-edge sy-frontdesk-gov sy-wf-rules sy-timer sy-policy \
-             sy-cognition sy-identity sy-storage sy-vault sy-architect sy-admin \
-             sy-opa-rules sy-config-routes rt-gateway; do
-        systemctl stop "$s.service" >/dev/null 2>&1 || true
-    done
-    systemctl disable sy-orchestrator.service >/dev/null 2>&1 || true
-    systemctl disable io-cloud.service >/dev/null 2>&1 || true
-    systemctl disable io-blob.service >/dev/null 2>&1 || true
+    case "$1" in
+        upgrade|failed-upgrade)
+            for s in sy-orchestrator sy-admin sy-wf-rules; do
+                systemctl stop "$s.service" >/dev/null 2>&1 || true
+            done
+            ;;
+        *)
+            for s in sy-orchestrator io-cloud io-blob sy-edge sy-frontdesk-gov sy-wf-rules sy-timer sy-policy \
+                     sy-cognition sy-identity sy-storage sy-vault sy-architect sy-admin \
+                     sy-opa-rules sy-config-routes rt-gateway; do
+                systemctl stop "$s.service" >/dev/null 2>&1 || true
+            done
+            systemctl disable sy-orchestrator.service >/dev/null 2>&1 || true
+            systemctl disable io-cloud.service >/dev/null 2>&1 || true
+            systemctl disable io-blob.service >/dev/null 2>&1 || true
+            ;;
+    esac
 fi
 exit 0

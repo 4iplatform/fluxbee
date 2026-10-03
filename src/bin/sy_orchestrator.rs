@@ -1537,9 +1537,8 @@ async fn bootstrap_local(
         ensure_motherbee_ssh_key();
         ensure_motherbee_mesh_tls(&state.hive_id);
         // Refresh the per-role core subtrees the spokes sync from. Boot is the right trigger:
-        // a `.deb` upgrade stops every core unit in `prerm` and `postinst` starts the
-        // orchestrator again, so this runs exactly once per new package, before any spoke can
-        // ask for an update. Non-fatal — motherbee itself runs from `dist/core`, so a
+        // a `.deb` upgrade stops the orchestrator in `prerm` and `postinst` starts it again, so
+        // this runs exactly once per new package, before any spoke can ask for an update. Non-fatal — motherbee itself runs from `dist/core`, so a
         // materialization failure must not take the whole hive down; it makes spoke updates
         // stale, which the loud log plus the update path's own hash gate will surface.
         match materialize_role_core_trees(&core_manifest) {
@@ -1555,8 +1554,29 @@ async fn bootstrap_local(
         sweep_interrupted_joins();
     }
 
+    // A package upgrade swaps the core binaries while they run and stops only the orchestrator and
+    // the dist manifest's other writers (FINDINGS A-45): the rest keep serving on the old binaries
+    // until this boot restarts them, in the start order below. Reported as the last core update.
+    let mut core_services = vec!["rt-gateway".to_string()];
+    core_services.extend(
+        state
+            .system_nodes
+            .nodes
+            .iter()
+            .map(|name| name_to_service(name)),
+    );
+    // Core components a hive.yaml leaves out of system_nodes get their new binary too; they are
+    // restarted after the listed ones, and only if they run a replaced binary.
+    let unlisted_core: Vec<String> = core_component_names_for_role(&core_manifest, state.role)?
+        .into_iter()
+        .filter(|name| name != "sy-orchestrator" && !core_services.contains(name))
+        .collect();
+    core_services.extend(unlisted_core.iter().cloned());
+    let replaced = services_running_replaced_binary(&core_services);
+    let mut upgrade_restart = BootUpgradeRestart::begin(&core_services, &replaced);
+
     tracing::info!("starting rt-gateway");
-    systemd_start("rt-gateway")?;
+    start_core_service("rt-gateway", &replaced, &mut upgrade_restart)?;
     wait_for_router_ready(state, socket_dir, Duration::from_secs(30)).await?;
     wait_for_nats_ready(
         &state.nats_endpoint,
@@ -1607,8 +1627,16 @@ async fn bootstrap_local(
             node = node_name.as_str(),
             "starting configured lifecycle node"
         );
-        if let Err(err) = systemd_start(&service) {
+        if let Err(err) = start_core_service(&service, &replaced, &mut upgrade_restart) {
             tracing::warn!(service = service.as_str(), error = %err, "failed to start service");
+        }
+    }
+    for service in unlisted_core
+        .iter()
+        .filter(|service| replaced.contains(*service))
+    {
+        if let Err(err) = start_core_service(service, &replaced, &mut upgrade_restart) {
+            tracing::warn!(service = service.as_str(), error = %err, "failed to restart service");
         }
     }
 
@@ -1623,6 +1651,7 @@ async fn bootstrap_local(
             "lifecycle nodes did not fully bootstrap before timeout; continuing and relying on watchdog restarts"
         );
     }
+    upgrade_restart.finish();
     if state.is_motherbee {
         wait_for_service_active(
             "sy-storage",
@@ -1644,6 +1673,127 @@ async fn bootstrap_local(
         );
     }
     Ok(())
+}
+
+/// Of `services`, the ones running a binary that was replaced on disk since they started.
+fn services_running_replaced_binary(services: &[String]) -> HashSet<String> {
+    services
+        .iter()
+        .filter(|service| service_runs_replaced_binary(service))
+        .cloned()
+        .collect()
+}
+
+fn service_runs_replaced_binary(service: &str) -> bool {
+    let props = systemd_unit_show(service, &["MainPID"]);
+    let Some(pid) = parse_systemd_u64(props.get("MainPID")).filter(|pid| *pid > 0) else {
+        return false;
+    };
+    fs::read_link(format!("/proc/{pid}/exe"))
+        .map(|exe| exe_link_is_replaced(&exe))
+        .unwrap_or(false)
+}
+
+/// `/proc/<pid>/exe` of a process whose binary was unlinked, as dpkg does when it installs a new
+/// one: the kernel appends ` (deleted)` to the old path.
+fn exe_link_is_replaced(exe: &Path) -> bool {
+    exe.to_string_lossy().ends_with(" (deleted)")
+}
+
+/// `systemctl start`, or `restart` for a service in `replaced`: `start` leaves a running service
+/// on its old binary.
+fn start_core_service(
+    service: &str,
+    replaced: &HashSet<String>,
+    upgrade_restart: &mut BootUpgradeRestart,
+) -> Result<(), OrchestratorError> {
+    if !replaced.contains(service) {
+        return systemd_start(service);
+    }
+    tracing::info!(
+        service,
+        "restarting onto the binary the package upgrade installed"
+    );
+    let result = systemd_restart(service);
+    upgrade_restart.record(service, &result);
+    result
+}
+
+/// The restarts a boot does after a package upgrade, recorded like a core update (`/versions`:
+/// `core.last_update`, `via: package`).
+struct BootUpgradeRestart {
+    started_at_ms: Option<String>,
+    attempted: Vec<String>,
+    restarted: Vec<String>,
+    errors: Vec<String>,
+}
+
+impl BootUpgradeRestart {
+    fn begin(order: &[String], replaced: &HashSet<String>) -> Self {
+        let attempted = upgrade_restart_order(order, replaced);
+        let started_at_ms = (!attempted.is_empty()).then(|| now_epoch_ms().to_string());
+        if let Some(started_at_ms) = &started_at_ms {
+            tracing::info!(services = ?attempted, "core services run replaced binaries; restarting them in start order");
+            write_core_update_last_record(&serde_json::json!({
+                "phase": "restarting",
+                "via": "package",
+                "started_at_ms": started_at_ms,
+                "updated": attempted,
+            }));
+        }
+        Self {
+            started_at_ms,
+            attempted,
+            restarted: Vec::new(),
+            errors: Vec::new(),
+        }
+    }
+
+    fn record(&mut self, service: &str, result: &Result<(), OrchestratorError>) {
+        match result {
+            Ok(()) => self.restarted.push(service.to_string()),
+            Err(err) => self.errors.push(format!("{service}: {err}")),
+        }
+    }
+
+    fn finish(&self) {
+        let Some(started_at_ms) = &self.started_at_ms else {
+            return;
+        };
+        write_core_update_last_record(&boot_upgrade_restart_record(
+            started_at_ms,
+            &self.attempted,
+            &self.restarted,
+            &self.errors,
+        ));
+    }
+}
+
+/// The services of `replaced`, in the boot's start order (`order`).
+fn upgrade_restart_order(order: &[String], replaced: &HashSet<String>) -> Vec<String> {
+    order
+        .iter()
+        .filter(|service| replaced.contains(*service))
+        .cloned()
+        .collect()
+}
+
+fn boot_upgrade_restart_record(
+    started_at_ms: &str,
+    attempted: &[String],
+    restarted: &[String],
+    errors: &[String],
+) -> serde_json::Value {
+    serde_json::json!({
+        "phase": "done",
+        "via": "package",
+        "status": if errors.is_empty() && restarted.len() == attempted.len() { "ok" } else { "error" },
+        "started_at_ms": started_at_ms,
+        "finished_at_ms": now_epoch_ms().to_string(),
+        "updated": attempted,
+        "restarted": restarted,
+        "errors": errors,
+    })
 }
 
 async fn wait_for_storage_db_ready(
@@ -22079,12 +22229,6 @@ fn systemd_start(service: &str) -> Result<(), OrchestratorError> {
     run_cmd(cmd, "systemctl start")
 }
 
-/// `systemctl restart` — the only way to make an already-running service pick up a
-/// swapped binary. `systemd_start` is a NO-OP on a live unit (systemd reports success
-/// and the process keeps executing the old, now-unlinked inode), so a `category=core`
-/// update that used it reported `status: ok` with a full `restarted` list while nothing
-/// had actually changed. The remote/SSH core-sync path always used `systemctl restart`;
-/// the local path was the divergent one. See U-1 in lab/logbook/PENDING-BUGS.md.
 /// Unload a transient unit so its name can be reused by a fresh `systemd-run`.
 ///
 /// Best-effort by design: every failure here is expected in the normal case (the unit may not
@@ -22112,6 +22256,12 @@ fn clear_stale_transient_unit(unit: &str) {
     tracing::info!(unit = %unit, "freed stale transient unit name before relaunch");
 }
 
+/// `systemctl restart` — the only way to make an already-running service pick up a
+/// swapped binary. `systemd_start` is a NO-OP on a live unit (systemd reports success
+/// and the process keeps executing the old, now-unlinked inode), so a `category=core`
+/// update that used it reported `status: ok` with a full `restarted` list while nothing
+/// had actually changed. The remote/SSH core-sync path always used `systemctl restart`;
+/// the local path was the divergent one. See U-1 in lab/logbook/PENDING-BUGS.md.
 fn systemd_restart(service: &str) -> Result<(), OrchestratorError> {
     let mut cmd = Command::new("systemctl");
     cmd.arg("restart").arg(service);
@@ -25992,6 +26142,58 @@ blob:
             "needTotalItems": 0
         }));
         assert_eq!(send_receive.receive_only_total_items, 0);
+    }
+
+    /// A-45: a service still running the binary dpkg replaced shows it in `/proc/<pid>/exe`.
+    #[test]
+    fn a_binary_replaced_on_disk_shows_as_deleted() {
+        assert!(exe_link_is_replaced(Path::new(
+            "/usr/bin/sy-identity (deleted)"
+        )));
+        assert!(!exe_link_is_replaced(Path::new("/usr/bin/sy-identity")));
+        assert!(!exe_link_is_replaced(Path::new("/usr/bin/sy-deleted")));
+    }
+
+    /// A-45: after a package upgrade the boot restarts the services on replaced binaries in its
+    /// own start order (rt-gateway first, SY.vault last), not in the order it found them.
+    #[test]
+    fn the_boot_restarts_replaced_services_in_start_order() {
+        let order: Vec<String> = [
+            "rt-gateway",
+            "sy-config-routes",
+            "sy-identity",
+            "sy-admin",
+            "sy-vault",
+        ]
+        .map(str::to_string)
+        .to_vec();
+        let replaced: HashSet<String> = ["sy-vault", "sy-identity", "rt-gateway"]
+            .map(str::to_string)
+            .into_iter()
+            .collect();
+        assert_eq!(
+            upgrade_restart_order(&order, &replaced),
+            ["rt-gateway", "sy-identity", "sy-vault"]
+        );
+        assert!(upgrade_restart_order(&order, &HashSet::new()).is_empty());
+    }
+
+    /// A-45: the outcome is `ok` only when every service it set out to restart restarted.
+    #[test]
+    fn a_boot_upgrade_restart_is_ok_only_when_every_service_restarted() {
+        let attempted = ["rt-gateway".to_string(), "sy-identity".to_string()];
+        let ok = boot_upgrade_restart_record("1", &attempted, &attempted, &[]);
+        assert_eq!(ok["status"], "ok");
+        assert_eq!(ok["phase"], "done");
+        assert_eq!(ok["via"], "package");
+        let failed = boot_upgrade_restart_record(
+            "1",
+            &attempted,
+            &attempted[..1],
+            &["sy-identity: systemctl restart failed".to_string()],
+        );
+        assert_eq!(failed["status"], "error");
+        assert_eq!(failed["restarted"], serde_json::json!(["rt-gateway"]));
     }
 
     /// A-39: after an upgrade, a running node that follows `current` moves to the version the
