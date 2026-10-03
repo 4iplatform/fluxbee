@@ -21,6 +21,7 @@
 
 | Versión | Fecha (ART) | Commit | Alcance | Estado | Rollback |
 |---|---|---|---|---|---|
+| **0.1.56** | 2026-10-03 | `715143a` | motherbee + spokes (core) | ✅ live | snap `pre-root-io-0-1-56` (las 4 VMs) · `apt install fluxbee=0.1.55` |
 | **0.1.55** | 2026-10-02 | `975fd34` | motherbee + spokes (core) | ✅ live | snap `pre-root-tenant-0-1-55` (las 4 VMs) · `apt install fluxbee=0.1.54` |
 | **0.1.54** | 2026-10-02 | `6aa4ee4` | motherbee + spokes (core) | ✅ live | snap `pre-gov-0-1-54` (las 4 VMs) · `apt install fluxbee=0.1.53` |
 | **0.1.53** | 2026-10-02 | `26edcd5` | motherbee + spokes (core) | ✅ live | snap `pre-ai-generic-0-1-53` (las 4 VMs) · `apt install fluxbee=0.1.52` |
@@ -64,6 +65,66 @@
 > (`dpkg-scanpackages -m`) para rollback, pero su detalle vive en la bitácora, no acá.
 
 ---
+
+## 0.1.56 — una conexión por UUID, upgrades sin apagar el core, solo io.cloud e io.blob en el tenant raíz
+
+- **Fecha:** 2026-10-03 (ART) · **Versión anterior:** 0.1.55 · **Commits:** `068014d`..`715143a`
+  (FINDINGS A-16, A-43, A-44, A-45, B-16; bitácora `2026-10-03`).
+- **Alcance:** motherbee + los tres spokes (core-update).
+- **Antes del deploy, a mano en PROD (el operador, porque el clasificador de permisos se lo
+  bloqueó a la sesión):** se purgaron `IO.api@motherbee` e `IO.wapp.default@motherbee`, con sus
+  ILKs y sus archivos UUID. Sus configs quedaron guardadas fuera del repo; solo tenían `_system` y
+  `tenant_id`.
+- **Qué cambió:**
+  - **A-44:**
+    - el router acepta una sola conexión viva por UUID, con 1 s de espera para los duplicados
+      pasajeros;
+    - toda conexión que termina se limpia, incluso por error (antes quedaba registrada y sin
+      lectura).
+  - **A-45:** un upgrade solo para a los que escriben el manifest de runtimes. El orchestrator
+    nuevo reinicia en orden lo que corre binarios reemplazados, y needrestart deja el core al
+    orchestrator.
+  - **A-43:** solo io.cloud e io.blob corren en el tenant raíz y arrancan por defecto
+    (`TENANT_ROOT_NOT_ALLOWED`).
+  - **A-16:** el watchdog revierte los cambios locales de las carpetas receive-only.
+- **Build:** 20,5 min. **Publish:** 11 s, 56 paquetes. **Deploy:** 214 s con `ops deploy`;
+  snapshots `pre-root-io-0-1-56` en las 4 VMs (se borró antes `pre-ai-generic-0-1-53`).
+- **Incidente del deploy (B-16):**
+  - Los core updates salieron antes de que el router del motherbee tuviera de vuelta a los spokes.
+    Los tres dieron `TRANSPORT_ERROR` y no llegaron.
+  - Igual `ops.py` los dio por actualizados: juzgaba por el hash de dist, no por el instalado.
+  - El chequeo de binarios lo mostró. El update se volvió a mandar a mano a las 06:39:52 UTC y
+    `ops.py` quedó corregido.
+- **Verificación en vivo:**
+  - **U-8b validado:** los tres spokes contestaron `status=ok phase=restarting` (9, 5 y 4
+    componentes) y terminaron en `core.last_update` `done ok`. worker1 reinició los servicios en
+    orden y después se reinició a sí mismo.
+  - Los 4 hives en 0.1.56: el motherbee por dist y los spokes por hash instalado (`3260c886…`).
+    Ningún binario `(deleted)` y 0 líneas ERROR, en los 4.
+  - **A-39 sigue bien:** IO.blob e IO.cloud arrancaron una sola vez, en 0.1.56, con cero
+    `203/EXEC`. Son los únicos nodos administrados que quedan en el motherbee.
+  - **A-44:** 0 HELLO rechazados, 0 conexiones terminadas por error y 0 handshakes fallidos en el
+    tráfico normal de los 4 hives. Los nodos Go arrancaron bien con su doble HELLO.
+  - **A-43:** un `run_node` de `IO.api.a43probe@motherbee` en el tenant raíz dio
+    `TENANT_ROOT_NOT_ALLOWED`, sin dejar nada creado (ni ILK, ni archivo UUID, ni unit).
+  - **A-45:**
+    - el `prerm` nuevo y la conf de needrestart quedaron instalados;
+    - este upgrade todavía paró todo el core, entre 06:33:26 y 06:34:58, porque corre el `prerm`
+      de 0.1.55;
+    - se mide en el próximo upgrade.
+  - **A-16:** no se probó en vivo. Hacerlo implica escribir en un espejo de un spoke, y queda a
+    decisión del operador.
+  - **Identity y frontdesk:** 0 errores. La réplica de worker1 hizo el full sync después de su
+    reinicio.
+  - **CI:** `rust-tests`, `admin-catalog-guard` y `router-dispatcher-guards` en verde en `715143a`.
+- **Error propio, sin consecuencias:**
+  - Para leer la versión corrí `/usr/bin/sy-orchestrator --version` en worker1. El binario no
+    tiene ese flag y arrancó como orchestrator.
+  - Murió antes de conectarse al router: no hubo registro nuevo en el router de worker1 y el
+    orchestrator real siguió accesible.
+  - No hay que correr binarios del core para consultar versiones; se usa `/versions`.
+- **Rollback:** snapshot `pre-root-io-0-1-56` o `apt install fluxbee=0.1.55` (los spokes, por core
+  update o `core_rollback`).
 
 ## 0.1.55 — nadie se registra en el tenant raíz, U-8b, io.slack sin instancia de base
 

@@ -956,10 +956,9 @@ Se cierra junto con [PB-7](#pb-7) opción 2 — son el mismo hueco visto por dos
 > resultado queda en `core-update-last.json` y `/versions` lo muestra en `core.last_update`. El
 > finalize de `add_hive` sigue sincrónico (`prepare_core_update` + `restart_core_after_update`).
 >
-> **Validación en vivo: en el próximo release.** El deploy de 0.1.55 lo recibieron spokes con el
-> orchestrator 0.1.54, así que ingress1 y egress1 todavía dieron `TIMEOUT`. `core.last_update` ya
-> está en `/versions`, en `null`. Con 0.1.56, `ops deploy` tiene que mostrar a cada spoke contestando
-> `status=ok phase=restarting`, y después `core.last_update` en `phase: done`.
+> **Validado en vivo con 0.1.56 (2026-10-03):** los tres spokes contestaron `status=ok
+> phase=restarting` y terminaron con `core.last_update` en `done ok`. El primer envío del deploy no
+> había llegado (`TRANSPORT_ERROR`, B-16) y se repitió a mano.
 
 **La causa que estaba escrita es falsa.** *No* es que el orquestador del destino se reinicie a sí
 mismo: el código **lo evita explícitamente** — se auto-excluye y **difiere su restart a un timer de

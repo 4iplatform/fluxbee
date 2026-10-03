@@ -756,7 +756,7 @@ ops() { python3 lab/ops.py --env scratchpad/pve.env --pve-host 192.168.8.207 "$@
 ops build 0.1.N --wait          # git pull + build-deb.sh en la build box (log /root/build-0.1.N.log)
 ops publish 0.1.N               # apt-repo-publish.sh (log /root/publish-0.1.N.log)
 ops deploy 0.1.N --snapshot pre-<algo>-0-1-N --drop <el-más-viejo>
-ops versions                    # versión y manifest_hash del core por hive
+ops versions                    # versión y hash del core por hive: el instalado si lo hay, si no el de dist
 ops opa-status                  # política OPA de usuario por hive
 ops health [--since HH:MM]      # por VM: units caídas, denegaciones del gate, drops de routing.src (UTC)
 ops admin GET '/hives/motherbee/routes?x=1&y=2'   # sin shell: el & y el JSON pasan intactos
@@ -768,10 +768,16 @@ ops run 100 script.sh [args]    # un script local (bash o .py) en una VM
 1. Snapshot de todas las VMs.
 2. `apt install` en motherbee.
 3. Espera a que el admin reporte la versión nueva.
-4. core-update de los spokes en paralelo.
-5. Espera a que cada spoke reporte la versión y el hash de motherbee: el TIMEOUT de la respuesta
-   no se mira (U-8b).
-6. `health` desde el arranque del deploy.
+4. Espera a que el orchestrator de cada spoke conteste: el admin del motherbee responde antes de que
+   su router tenga de vuelta a los spokes, y un update mandado en ese momento falla con
+   `TRANSPORT_ERROR` (0.1.56).
+5. core-update de los spokes en paralelo; reintenta, hasta 3 veces, uno que no llegó. Desde 0.1.55
+   cada spoke contesta `status=ok phase=restarting`.
+6. Espera a que cada spoke tenga **instalado** el hash del motherbee (`core.installed`). En un spoke
+   `core.manifest_hash` y las versiones de los componentes son lo que trajo dist, que Syncthing
+   actualiza antes de cualquier update: en 0.1.56 dieron por actualizados a spokes que seguían en la
+   versión anterior.
+7. `health` desde el arranque del deploy.
 
 La regla de los 3 snapshots se respeta así: si una VM ya tiene 3, `deploy` no arranca hasta que
 nombres el más viejo con `--drop`, y borra ese y ningún otro. El registro en el ledger sigue siendo
@@ -946,7 +952,8 @@ si el gate falla.
 - **Cómo se sabe cómo terminó:** en `GET /hives/{hive}/versions`, `core.last_update` (`phase`
   `restarting|done`, `status` `ok|rollback`, `errors`).
 - **Antes de 0.1.55** respondía TIMEOUT aunque funcionara (U-8b). La respuesta salía por el router
-  que el propio update acababa de reiniciar y se perdía.
+  que el propio update acababa de reiniciar y se perdía. Validado en vivo con 0.1.56: los tres
+  spokes contestaron `phase=restarting` y terminaron en `done ok`.
 - **No reintentes ciegamente:** verificá con el chequeo de arriba, o con `core.last_update`.
 
 ### ⚠️ Los nodos runtime y el orden de recuperación

@@ -617,9 +617,11 @@ Respuesta del operador (2026-10-02): *"sí a todo"*.
     IO.blob.
   - Archi nunca elige el tenant raíz para un nodo IO.
   - Docs: `715143a`.
-- **PROD:** hay que purgar `IO.api@motherbee` e `IO.wapp.default@motherbee` antes del deploy de 0.1.56.
-  En 30 días no tuvieron uso y sus configs quedaron guardadas fuera del repo. La purga desde la
-  sesión la bloqueó el clasificador de permisos, así que queda para el operador.
+- **PROD:** el operador purgó `IO.api@motherbee` e `IO.wapp.default@motherbee` antes del deploy de
+  0.1.56; desde la sesión lo bloqueaba el clasificador de permisos. En 30 días no habían tenido uso y
+  sus configs quedaron guardadas fuera del repo.
+- **Validado en vivo (0.1.56):** un `run_node` de io.api en el tenant raíz da
+  `TENANT_ROOT_NOT_ALLOWED` y no deja nada creado.
 - **Queda para el operador:**
   - El runbook de LinkedHelper de Noelia (`docs/onworking NOE/...`) lanza el nodo en el tenant raíz.
   - `docs/io-web-spec-beta-v1.md` diseña `IO.web@motherbee` con `boot=true` en el tenant raíz.
@@ -1007,6 +1009,28 @@ Visto al arreglar los e2e de A-37, leyendo `src/router/mod.rs` y `src/shm/mod.rs
 - **Estado:** resuelto. El operador activó ballooning en fb-build con mínimo 2 GiB (`balloon=2048`);
   verificado por la API el 2026-10-02. Para darle más RAM al host hay que apagarlo, porque es una VM
   de VMware.
+
+### B-16 ✅ RESUELTO (2026-10-03) — `ops.py deploy` dio por actualizados a spokes que no lo estaban
+
+- **Qué pasó (deploy de 0.1.56):**
+  - El core update se disparó unos segundos después de que el admin del motherbee volvió, antes de
+    que su router tuviera de vuelta a los spokes. Los tres pedidos fallaron con `TRANSPORT_ERROR` y
+    ninguno llegó: ningún servicio de los spokes se reinició.
+  - Igual el deploy dijo "worker1 on 0.1.56". `ops.py` juzgaba por `core.manifest_hash` y las
+    versiones de los componentes de `/versions`, que en un spoke son lo que trajo dist. Syncthing
+    los actualiza antes de cualquier update. Lo instalado está en `core.installed`, y seguía en el
+    hash de 0.1.55.
+- **Cómo se vio:** el chequeo de binarios después del deploy mostró `not_restarted` en todas las
+  units de los spokes.
+- **Arreglo (`lab/ops.py`):**
+  - `core_of` usa el hash instalado cuando el hive lo reporta, igual que la comparación de
+    `/versions` (X1). `ops versions` dice de dónde sale cada hash.
+  - `deploy` espera a que el orchestrator de cada spoke conteste antes del update, y reintenta hasta
+    3 veces un pedido que no llegó.
+  - El update se volvió a mandar a mano y los tres spokes terminaron bien (U-8b validado).
+- **Para considerar:** en `/versions` de un spoke, `core.manifest_hash` y las versiones de los
+  componentes describen lo que está disponible, no lo que corre. La comparación de la flota ya lo
+  resuelve, pero leído suelto confunde.
 
 ---
 
