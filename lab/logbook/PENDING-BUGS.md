@@ -46,7 +46,7 @@ infraestructura (serie `B-*` de FINDINGS) no entran salvo que impliquen un cambi
 | [U-5b](#u-5b) | ✅ **CERRADO** | Los backups de core se acumulaban sin GC **y se creaban vacíos en cada no-op** | — |
 | [U-6](#u-6) | 🟡 mitigado | La carrera era **el orquestador contra sí mismo**: escritura no atómica de 35 MB | — |
 | [U-7](#u-7) | ✅ **cerrado** | El watchdog reiniciaba syncthing cada ~7 s por una carpeta inexistente | — |
-| [U-8a](#u-8a) | 🟡 abierto | La API de admin no tiene contrato para operaciones largas · se cierra con [PB-7](#pb-7) | no |
+| [U-8a](#u-8a) | ✅ **cerrado y VALIDADO en vivo** (`9f86c12`, con PB-7) | La API de admin no tenía contrato para operaciones largas | — |
 | [U-8b](#u-8b) | ✅ **cerrado** (0.1.55) | `update category=core` daba TIMEOUT: ahora responde antes de reiniciar | — |
 | [U-8c](#u-8c) | ✅ **CERRADO** | El `timeout_unknown` del architect estaba **muerto** por un substring imposible | — |
 | [U-9](#u-9) | ✅ **CERRADO** | El catch-all rompía el envelope **y daba 404 donde correspondía 405** | — |
@@ -127,7 +127,7 @@ casa no bloquea. La rotación del cert es anual (Sectigo), así que el reinicio 
 ---
 
 <a id="pb-2"></a>
-## PB-2 🟡 — Nadie verifica la **completitud** de la cadena TLS: una cadena truncada entra al vault y el edge la sirve sin quejarse
+## PB-2 ✅ CERRADO y VALIDADO en vivo — Nadie verifica la **completitud** de la cadena TLS: una cadena truncada entra al vault y el edge la sirve sin quejarse
 
 > **Reescrito el 2026-08-03 tras auditoría adversarial.** El hallazgo original (*"`vault_put` acepta
 > material TLS sin validarlo"*) proponía un validador que **no habría atajado el archivo roto del
@@ -200,7 +200,7 @@ falta la fila `{cert, key}`).
 ---
 
 <a id="pb-4"></a>
-## PB-4 🟡 — El arranque en frío del ingress **se ve** como una falla: el edge dice "arreglá el vault" cuando no hay nada que arreglar
+## PB-4 ✅ CERRADO — El arranque en frío del ingress **se ve** como una falla: el edge dice "arreglá el vault" cuando no hay nada que arreglar
 
 > **Reescrito el 2026-08-03.** Se le sacó el título causal: lo que el hallazgo pedía revisar **ya
 > existe y es deliberado**.
@@ -372,7 +372,7 @@ vencen a los 30 s del lado del cliente, y **después se ejecutan tarde**.
 ---
 
 <a id="pb-8"></a>
-## PB-8 🟡 — El modelo de egress **no tiene historia para motherbee** — y motherbee es donde corren los nodos que llaman a internet
+## PB-8 ✅ CERRADO y VALIDADO en vivo (solo reporta) — El modelo de egress **no tiene historia para motherbee** — y motherbee es donde corren los nodos que llaman a internet
 
 > **Reescrito el 2026-08-03.** El arreglo que sugería el título anterior (*"propagar `gateway_ip` a
 > MB"*) **es un lockout del plano de control**.
@@ -761,7 +761,7 @@ versión es telemetría**. Se ve igual en el reload de OPA: versión distinta �
 rechazo.
 
 <a id="u-4a"></a>
-### U-4a 🟢 — El HELLO lleva versión de protocolo y nadie la mira
+### U-4a ✅ CERRADO y VALIDADO en vivo — El HELLO lleva versión de protocolo y nadie la mira
 
 `WanHelloPayload` transporta `protocol: "fluxbee/1.16"` y existe `WanRejectPayload` (se usa para
 `HIVE_NOT_AUTHORIZED`), pero **`peer_hello.protocol` no se compara nunca**, y el
@@ -774,7 +774,7 @@ el único canal capaz de arreglarlo**. Corresponde (a) usar el campo solo para *
 (b) **borrarlo del contrato** para que no simule una garantía que no da. **Decisión de diseño → hablarlo.**
 
 <a id="u-4b"></a>
-### U-4b 🔴 — Las drift-alerts **no se escriben nunca**
+### U-4b ✅ CERRADO y VALIDADO en vivo — Las drift-alerts **no se escriben nunca**
 
 No son "informativas": `drift_alerts_path()` (→ `orchestrator/drift-alerts.jsonl`) **solo aparece en
 la ruta de lectura**. No hay un solo escritor en todo el repo — lo verifiqué por nombre de función y
@@ -807,7 +807,7 @@ es un snapshot, o deja de sintetizar.
 ---
 
 <a id="u-5"></a>
-## U-5 🟡 — No hay rollback de core como comando · **gap, no bug**
+## U-5 ✅ CERRADO y VALIDADO en vivo — No hay rollback de core como comando · **gap, no bug**
 
 > Bajado de 🔴 el 2026-08-03: **"automático-solo" es el contrato de la familia** — vendor tampoco
 > tiene comando, y runtime no lo necesita porque está versionado.
@@ -862,7 +862,7 @@ el state dir real. Dos tests: que conserva las más nuevas y respeta lo que no e
 ---
 
 <a id="u-6"></a>
-## U-6 🔴 — `add_hive` corre una carrera entre el push de vendor por SSH y la carpeta de syncthing
+## U-6 🟡 MITIGADO — `add_hive` corre una carrera entre el push de vendor por SSH y la carpeta de syncthing
 
 **Encontrado en vivo** al reconstruir prod (2026-07-30), en el primer `add_hive role=ingress`:
 
@@ -927,7 +927,11 @@ reinicia ante un cambio real de config, así que es un warn ruidoso, no un loop 
 > está muerta por un bug de una línea.**
 
 <a id="u-8a"></a>
-### U-8a 🟡 — La API de admin no tiene contrato para operaciones largas
+### U-8a ✅ CERRADO (`9f86c12`, con PB-7) — La API de admin no tiene contrato para operaciones largas
+
+> **Cerrado junto con [PB-7](#pb-7):** `add_hive` responde `202`, el join corre en segundo plano y
+> su fase queda en `info.yaml` (`GET /hives` la muestra). Validado en vivo el 2026-08-05: el plano
+> de control contestó en ~100 ms durante un join.
 
 Un `add_hive` tarda **más de 6 minutos** y no hay manera de preguntarle en qué paso está: el audit log
 se escribe **al terminar**, no hay acción de estado-de-operación en el registro, y el `info.yaml` del
@@ -1186,7 +1190,7 @@ mensaje sería otro.
 ---
 
 <a id="u-11"></a>
-## U-11 🔴 — `IO.cloud` no puede auto-publicar su propio canal
+## U-11 ✅ CERRADO y VALIDADO en vivo — `IO.cloud` no puede auto-publicar su propio canal
 
 **Encontrado el 2026-07-30** al configurar IO.cloud en producción para conectar Fluxbee Cloud.
 

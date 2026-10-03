@@ -14,7 +14,11 @@
 
 ## A. Producto fluxbee — candidatos a cambio de código
 
-### A-1 🔴 El orchestrator no configura placas de red secundarias
+### A-1 🟡 REENCUADRADO (→ PB-5) — El orchestrator no configura placas de red secundarias
+
+> **Reencuadrado en la auditoría del 2026-08-03 ([PB-5](PENDING-BUGS.md#pb-5)):** direccionar las
+> placas es del operador por contrato, en todos los roles. Queda abierto que el egress reporta
+> `nat_applied: true` sin verificar su pata LAN.
 
 - **Qué pasa:** `add_hive role=ingress|egress` **exige** los nombres de interfaz (`wan_iface`,
   `lan_iface`) y asume que **ya existen y están direccionadas**. No hay una sola línea en el
@@ -29,7 +33,11 @@
 - **Estado:** hueco real del producto. **A discutir:** ¿el orchestrator debería aceptar la
   configuración de las patas secundarias en el payload de `add_hive` y aplicarla?
 
-### A-2 🔴 `harden_ssh` viene en `false` por defecto
+### A-2 🟡 ABIERTO (→ PB-6) — `harden_ssh` viene en `false` por defecto
+
+> **Reescrito en la auditoría del 2026-08-03 ([PB-6](PENDING-BUGS.md#pb-6)):** invertir el default
+> dejaría cajas sin ninguna vía de acceso. Lo abierto es que el canal `ssh_password` no se cierra
+> solo.
 
 - **Qué pasa:** con bootstrap por `ssh_password`, si no se pasa `harden_ssh:true` explícitamente,
   al terminar el join `add_hive` **saca su clave y su sudoers pero deja `PasswordAuthentication yes`**.
@@ -41,7 +49,10 @@
 - **Estado:** **a discutir.** Opciones: invertir el default, o hacerlo ruidoso (advertir en la
   respuesta cuando se bootstrapeó con password y no se endureció).
 
-### A-3 🔴 El timeout del admin (180 s) puede quedar corto para `add_hive`
+### A-3 ✅ CERRADO (→ PB-7, `9f86c12`) — El timeout del admin (180 s) puede quedar corto para `add_hive`
+
+> **Cerrado con [PB-7](PENDING-BUGS.md#pb-7):** `add_hive` responde `202` enseguida y el join corre en
+> segundo plano, con su fase en `info.yaml`. Validado en vivo el 2026-08-05.
 
 - **Qué pasa:** `JSR_ADMIN_ADD_HIVE_TIMEOUT_SECS` default **180 s**, pero las esperas internas del
   flujo pueden sumar más (30 s salud + 60 s WAN + 60 s LSA + finalize).
@@ -53,7 +64,11 @@
 - **Estado:** **a discutir.** ¿Subir el default, o que la respuesta indique explícitamente
   "en progreso, reintentá para ver el estado"?
 
-### A-4 🟡 `egress.gateway_ip` se propaga a los workers, pero **no a motherbee**
+### A-4 ✅ CERRADO (→ PB-8) — `egress.gateway_ip` se propaga a los workers, pero **no a motherbee**
+
+> **Cerrado con [PB-8](PENDING-BUGS.md#pb-8):** no era un olvido. `egress.gateway_ip` es, por
+> contrato, la salida de los workers, y propagarlo al motherbee lo dejaría sin plano de control. El
+> motherbee lo reporta con `EGRESS_MOTHERBEE_BYPASS` y no toca su ruta. Validado en vivo.
 
 - **Qué pasa:** cuando MB declara `egress.gateway_ip`, **cada worker** rutea su default por el egress
   (`reconcile_worker_egress` → `ip route replace default via <gw>`). **MB no está en esa lista.**
