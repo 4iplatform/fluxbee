@@ -6726,6 +6726,8 @@ struct SyncthingFolderStatus {
     need_total_items: u64,
     error: String,
     invalid: String,
+    /// Local changes in a receive-only folder, which Syncthing neither sends nor undoes.
+    receive_only_total_items: u64,
 }
 
 impl SyncthingFolderStatus {
@@ -6764,13 +6766,17 @@ fn syncthing_folder_status(
     let payload: serde_json::Value = serde_json::from_str(&out).map_err(|err| {
         format!("invalid syncthing db/status payload for folder '{folder_id}': {err}")
     })?;
+    Ok(syncthing_folder_status_from_payload(&payload))
+}
+
+fn syncthing_folder_status_from_payload(payload: &serde_json::Value) -> SyncthingFolderStatus {
     let state = payload
         .get("state")
         .and_then(|v| v.as_str())
         .unwrap_or("unknown")
         .trim()
         .to_string();
-    let need_total_items = json_u64(&payload, "needTotalItems", "need_total_items");
+    let need_total_items = json_u64(payload, "needTotalItems", "need_total_items");
     let error = payload
         .get("error")
         .and_then(|v| v.as_str())
@@ -6783,20 +6789,59 @@ fn syncthing_folder_status(
         .unwrap_or("")
         .trim()
         .to_string();
-    Ok(SyncthingFolderStatus {
+    SyncthingFolderStatus {
         state,
         need_total_items,
         error,
         invalid,
-    })
+        receive_only_total_items: json_u64(
+            payload,
+            "receiveOnlyTotalItems",
+            "receive_only_total_items",
+        ),
+    }
 }
 
-fn syncthing_folder_healthy(
+/// The watchdog's check of one folder: whether it is healthy. A receive-only folder with local
+/// changes gets them reverted first (FINDINGS A-16): Syncthing neither sends nor undoes them, so a
+/// spoke's mirror that something touched would stay diverged from its source, in silence.
+fn check_syncthing_folder(
     sync: &BlobRuntimeConfig,
     folder_id: &str,
 ) -> Result<bool, OrchestratorError> {
     let status = syncthing_folder_status(sync, folder_id)?;
+    if status.receive_only_total_items > 0 {
+        tracing::warn!(
+            folder = folder_id,
+            local_items = status.receive_only_total_items,
+            "receive-only folder has local changes; reverting it to its source"
+        );
+        if let Err(err) = syncthing_revert_folder(sync, folder_id) {
+            tracing::warn!(folder = folder_id, error = %err, "could not revert the local changes");
+        }
+    }
     Ok(status.is_healthy())
+}
+
+/// `POST /rest/db/revert`: a receive-only folder drops its local changes and takes the source's.
+fn syncthing_revert_folder(
+    sync: &BlobRuntimeConfig,
+    folder_id: &str,
+) -> Result<(), OrchestratorError> {
+    let api_key = syncthing_api_key(sync)?;
+    let endpoint = format!(
+        "http://127.0.0.1:{}/rest/db/revert?folder={}",
+        sync.sync_api_port, folder_id
+    );
+    let mut cmd = Command::new("curl");
+    cmd.arg("-fsS")
+        .arg("-X")
+        .arg("POST")
+        .arg("-H")
+        .arg(format!("X-API-Key: {}", api_key))
+        .arg(&endpoint);
+    let _ = run_cmd_output(cmd, &format!("syncthing revert folder={folder_id}"))?;
+    Ok(())
 }
 
 fn syncthing_trigger_folder_scan(
@@ -8067,7 +8112,7 @@ async fn watchdog_blob_sync(state: &OrchestratorState) -> Result<(), Orchestrato
             && desired_blob.sync_enabled
             && blob_sync_tool_is_syncthing(&desired_blob)
         {
-            match syncthing_folder_healthy(&desired_sync, SYNCTHING_FOLDER_BLOB_ID) {
+            match check_syncthing_folder(&desired_sync, SYNCTHING_FOLDER_BLOB_ID) {
                 Ok(true) => {}
                 Ok(false) => {
                     folders_healthy = false;
@@ -8087,7 +8132,7 @@ async fn watchdog_blob_sync(state: &OrchestratorState) -> Result<(), Orchestrato
             }
         }
         if desired_blob.public_sync_enabled && blob_sync_tool_is_syncthing(&desired_blob) {
-            match syncthing_folder_healthy(&desired_sync, SYNCTHING_FOLDER_BLOB_PUBLIC_ID) {
+            match check_syncthing_folder(&desired_sync, SYNCTHING_FOLDER_BLOB_PUBLIC_ID) {
                 Ok(true) => {}
                 Ok(false) => {
                     folders_healthy = false;
@@ -8107,10 +8152,9 @@ async fn watchdog_blob_sync(state: &OrchestratorState) -> Result<(), Orchestrato
             }
         }
         if desired_dist.sync_enabled && dist_sync_tool_is_syncthing(&desired_dist) {
-            for folder in
-                dist_sync_folders_for_hive(&desired_dist, state.role, state.is_motherbee)
+            for folder in dist_sync_folders_for_hive(&desired_dist, state.role, state.is_motherbee)
             {
-                match syncthing_folder_healthy(&desired_sync, &folder.id) {
+                match check_syncthing_folder(&desired_sync, &folder.id) {
                     Ok(true) => {}
                     Ok(false) => {
                         folders_healthy = false;
@@ -25927,6 +25971,27 @@ blob:
             "dist_sync_folders_for_role da fluxbee-dist-core-motherbee en motherbee: 404, y el \
              primer no-ok hace fallar el hint entero"
         );
+    }
+
+    /// A-16: the watchdog reads a receive-only folder's local changes from its status, which
+    /// is what triggers the revert; a folder of another type reports none.
+    #[test]
+    fn a_receive_only_folders_local_changes_are_read_from_its_status() {
+        let touched = syncthing_folder_status_from_payload(&serde_json::json!({
+            "state": "idle",
+            "needTotalItems": 0,
+            "receiveOnlyTotalItems": 3,
+            "receiveOnlyChangedFiles": 2,
+            "error": "",
+            "invalid": ""
+        }));
+        assert_eq!(touched.receive_only_total_items, 3);
+        assert!(touched.is_healthy(), "local changes are not a sync error");
+        let send_receive = syncthing_folder_status_from_payload(&serde_json::json!({
+            "state": "idle",
+            "needTotalItems": 0
+        }));
+        assert_eq!(send_receive.receive_only_total_items, 0);
     }
 
     /// A-39: after an upgrade, a running node that follows `current` moves to the version the
