@@ -704,6 +704,26 @@ Visto al arreglar los e2e de A-37, leyendo `src/router/mod.rs` y `src/shm/mod.rs
   - dpkg corre el `prerm` del paquete viejo: el upgrade a 0.1.56 todavía para todo, y la mejora se
     ve desde 0.1.57.
 
+### A-46 🔴 PARA DECIDIR — La API HTTP de Archi no tiene autenticación y se alcanza desde el ingress
+
+- **Qué pasa (verificado el 2026-10-03, en el relevamiento de nodos):**
+  - El router axum de SY.architect (`sy_architect.rs`, `Router::new()`) no tiene ninguna capa de
+    autenticación. Abiertas: `/api/chat`, `/api/executor/plan`, `/api/package/publish`,
+    `/api/software/upload|publish`, `/api/agent-assets`, `/api/messages`, `/api/sessions`.
+  - En PROD escucha en `0.0.0.0:3000`. El default del código es `127.0.0.1:3000`, pero el
+    `hive.yaml.example` empaquetado usa `0.0.0.0`.
+  - El firewall del motherbee está inactivo (`ufw status`: inactive).
+  - Desde `fb-ingress`, que tiene interfaz pública (`eth1`), el puerto `10.10.10.10:3000` está
+    abierto. El 8080 del admin no.
+- **Impacto:** quien comprometa el ingress puede pedirle planes al executor de Archi y publicar
+  paquetes o software. La identidad de Archi puede además escribir en el vault. Es un camino desde
+  la DMZ al plano de control.
+- **Opciones:**
+  - Inmediata: que Archi escuche en `127.0.0.1` (y se use por túnel), o un firewall que deje pasar
+    el 3000 solo desde la red del operador.
+  - De fondo: autenticación en la API, con el paquete de seguridad (A-22).
+- **Estado:** se informó al operador. No se tocó PROD.
+
 ### A-19 ✅ RESUELTO (0.1.43) — La policy publicada esperaba hasta 60 s al watcher de Syncthing
 
 - **Qué pasaba:** con 0.1.41 el apply llegaba a los 4 hives en 16 s, pero el clear tardó 63 s y el
