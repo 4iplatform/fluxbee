@@ -3,8 +3,7 @@
   "_doc": [
     "Declarative base-node set baked into the from-scratch Fluxbee install.",
     "Single source of truth read by BOTH packaging/build-deb.sh and scripts/install.sh",
-    "(they must not diverge), and cross-checked against the sy_orchestrator",
-    "non-SY system_node allowlist + packaging/hive.yaml.example system_nodes.",
+    "(they must not diverge).",
     "",
     "TO ADD A NODE TO THE INSTALL: add one entry below (and make sure its crate builds).",
     "",
@@ -16,7 +15,10 @@
     "  per-tenant on demand via run_node. When 'boot': true, fluxbee-firstboot auto-spawns",
     "  one default instance ('instance') at the root tenant so it is RUNNING at boot",
     "  (degraded/unconfigured until the operator loads its secret/config into SY.vault).",
-    "  When 'boot': false the runtime is only baked+spawnable, not started.",
+    "  Only the system IO nodes boot (io.cloud, io.blob), and only they run in the root tenant",
+    "  (operator, 2026-10-02; FINDINGS A-43): every other runtime is 'boot': false, baked and",
+    "  spawnable, launched by a tenant (the orchestrator refuses any other IO node in the root",
+    "  tenant: TENANT_ROOT_NOT_ALLOWED).",
     "workspace: cargo manifest dir for the crate; 'go' means a Go binary (see go/).",
     "",
     "Growth BEYOND this base set does NOT need a new .deb: publish the runtime and push a",
@@ -25,12 +27,12 @@
   "singletons": [],
   "runtimes": [
     {
+      "_note": "io.api is instanced: an IO.api node is launched by a tenant, or by an operator or a system programmer for one (run_node with that tenant), never in the root tenant. It is baked and spawnable, but no instance boots with the base install (operator, 2026-10-02). Each instance externalizes itself through SY.edge with its own bearer.",
       "runtime": "io.api",
       "crate": "io-api",
       "bin": "io-api",
       "workspace": "nodes/io",
-      "boot": true,
-      "instance": "IO.api@motherbee"
+      "boot": false
     },
     {
       "_note": "io.blob is the motherbee-local public-artifact curator. Promoted from a systemd singleton to a first-class MANAGED runtime: it boots DEGRADED (a curator with default paths + default max_bytes is a valid unconfigured node) and takes config (io.max_bytes / io.admin_hive) via CONFIG_SET/GET, NO env. Motherbee-only is enforced by a fail-closed self-check in the binary. Bare instance name (not .default) because it is a true singleton, not a fanout family.",
@@ -59,13 +61,12 @@
       "boot": false
     },
     {
-      "_note": "io.wapp is fanout (one node per WhatsApp number; all share ONE Meta webhook). The boot instance uses the DOTTED name IO.wapp.default so it matches the externalize-as-fanout family glob 'IO.wapp.*@<hive>' (the bare 'IO.wapp' would NOT match that glob). Additional per-number nodes are spawned as IO.wapp.<label>@<hive> via run_node. Degraded until BOTH its vault secret (resource_type 'whatsapp') is loaded AND the operator externalizes the fanout webhook.",
+      "_note": "io.wapp is fanout (one node per WhatsApp number; all share ONE Meta webhook). Each number's node is launched by its tenant as IO.wapp.<label>@<hive> via run_node: the DOTTED name matches the externalize-as-fanout family glob 'IO.wapp.*@<hive>' (a bare 'IO.wapp' would NOT). Baked and spawnable, but no instance boots with the base install (operator, 2026-10-02). A node is degraded until BOTH its vault secret (resource_type 'whatsapp') is loaded AND the operator externalizes the fanout webhook.",
       "runtime": "io.wapp",
       "crate": "io-wapp",
       "bin": "io-wapp",
       "workspace": "nodes/io",
-      "boot": true,
-      "instance": "IO.wapp.default@motherbee"
+      "boot": false
     },
     {
       "_note": "ai.generic is THE generic AI runtime: baked and spawnable, but no instance boots with the base install. AI nodes (AI.<name>@<hive>) are created for a purpose with run_node; their behavior comes by CONFIG_SET and their key is the hive AI provider's key in SY.vault (resource_type openai|anthropic).",

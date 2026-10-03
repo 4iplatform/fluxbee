@@ -49,9 +49,11 @@ pub use identity::{
     MSG_ILK_UPDATE, MSG_TNT_APPROVE, MSG_TNT_CREATE, MSG_TNT_SET_SPONSOR, MSG_TNT_UPDATE,
 };
 pub use managed_node::{
-    is_allowed_non_sy_lifecycle_node, managed_node_config_path, managed_node_config_path_with_root,
-    managed_node_instance_dir, managed_node_instance_dir_with_root, managed_node_name,
-    ManagedNodeError, DEFAULT_MANAGED_NODE_ROOT, FLUXBEE_NODE_NAME_ENV, HIVE_YAML_NON_SY_LIFECYCLE_NODES,
+    is_allowed_non_sy_lifecycle_node, is_root_tenant, managed_node_config_path,
+    managed_node_config_path_with_root, managed_node_instance_dir,
+    managed_node_instance_dir_with_root, managed_node_name, root_tenant_refuses_io_node,
+    ManagedNodeError, DEFAULT_MANAGED_NODE_ROOT, FLUXBEE_NODE_NAME_ENV,
+    HIVE_YAML_NON_SY_LIFECYCLE_NODES, ROOT_TENANT_IO_RUNTIMES,
 };
 pub use node_client::{NodeConfig, NodeError, NodeUuidMode};
 pub use node_config::{

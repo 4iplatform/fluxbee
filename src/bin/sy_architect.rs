@@ -2307,7 +2307,9 @@ Use these facts only to select and validate planning intent. Do not treat them a
 - First-spawn `run_node` for `AI.*` and `IO.*` managed nodes requires root-level `tenant_id`.
 - Do not invent `tenant_id`.
 - Discover tenant candidates through identity reads first: `list_tenants` for discovery and `get_tenant` for exact sponsor/default detail.
-- In legacy direct-task mode, if the operator asks to create an `AI.*` or `IO.*` node and does not provide a tenant, query `list_tenants`; if exactly one active root/default tenant exists, use that `tenant_id`, otherwise block with `missing_fields:["tenant_id"]`.
+- Only `IO.cloud` and `IO.blob` (runtimes `io.cloud`, `io.blob`) run in the root tenant `tnt:00000000-0000-0000-0000-000000000001`. Every other `IO.*` node runs in a tenant other than the root one; the orchestrator refuses it in the root tenant with `TENANT_ROOT_NOT_ALLOWED`.
+- In legacy direct-task mode, if the operator asks to create an `IO.*` node and does not name its tenant, block with `missing_fields:["tenant_id"]`; never pick the root tenant for it.
+- In legacy direct-task mode, if the operator asks to create an `AI.*` node and does not provide a tenant, query `list_tenants`; if exactly one active root/default tenant exists, use that `tenant_id`, otherwise block with `missing_fields:["tenant_id"]`.
 - If the operator says "same tenant as node X", read node config/live config to recover the exact `tenant_id`, then validate it with `get_tenant`.
 - If a required `tenant_id` is missing and cannot be read from reliable context, block with a clear missing-field reason.
 - If a later step needs a value produced by an earlier step, use a formal executor output reference: `$steps.<step_id>.payload.<field>`.

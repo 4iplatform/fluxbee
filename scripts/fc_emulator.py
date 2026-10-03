@@ -29,9 +29,11 @@ Usage:
   fc_emulator.py --edge https://192.168.4.41:8443 --ich ich:<uuid> --token <tok> --insecure \
       put-token --key wapp_token:acme --value-token sk-live-xyz --resource-type bearer_token
 
-  # launch a node (the "lanzar nodos" path; needs a published io.wapp runtime)
+  # launch a node (the "lanzar nodos" path; needs a published io.wapp runtime). It runs in the
+  # customer's tenant: the root tenant (the default --tenant) only takes io.cloud and io.blob,
+  # and the orchestrator refuses any other IO node there with TENANT_ROOT_NOT_ALLOWED.
   fc_emulator.py --edge https://... --ich ich:<uuid> --token <tok> --cafile edge-ca.pem \
-      provision-node --node-name IO.acme --runtime io.wapp
+      --tenant tnt:<customer-uuid> provision-node --node-name IO.wapp.acme --runtime io.wapp
 
   # full security probe — proves the lock, not just the path:
   #   no token -> 401, wrong token -> 401, correct token -> 200 (put_token stored)

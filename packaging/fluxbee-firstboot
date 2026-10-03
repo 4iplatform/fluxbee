@@ -111,13 +111,14 @@ if [ "$HIVE_READY" != "1" ]; then
   exit 1
 fi
 # IO.blob and IO.cloud are no longer systemd singletons: they are boot=true managed runtimes,
-# spawned below by the same boot_runtimes loop as io.api/io.wapp (they come up degraded
-# until configured via CONFIG_SET). Nothing to start here anymore.
+# spawned below by the boot_runtimes loop (they come up degraded until configured via
+# CONFIG_SET). Nothing to start here anymore.
 
 echo "== [6/6] spawn base node instances (running, degraded until configured) =="
-# Auto-spawn one default instance of each boot=true runtime at the root tenant. They come up
-# RUNNING but degraded/unconfigured (no secret/config yet) — deliberate, so a fresh backend has
-# basic nodes alive out of the box; the operator loads secrets into SY.vault to make them work.
+# Auto-spawn one default instance of each boot=true runtime at the root tenant: the system IO
+# nodes (IO.cloud, IO.blob), the only IO nodes that run there (FINDINGS A-43). They come up
+# RUNNING but degraded/unconfigured until the operator configures them. Every other runtime
+# (io.api, io.wapp, io.slack, ai.generic, ...) is baked but not started: a tenant launches it.
 while IFS=$'\t' read -r rt inst; do
   [ -n "$rt" ] && [ -n "$inst" ] || continue
   body="{\"node_name\":\"$inst\",\"runtime\":\"$rt\",\"runtime_version\":\"current\",\"tenant_id\":\"$ROOT_TENANT\"}"
@@ -142,14 +143,13 @@ cat <<EOF
     also set 'ai.default_provider: anthropic' in /etc/fluxbee/hive.yaml and restart the AI nodes,
     or the AI nodes keep resolving the openai pool and stay degraded.
 
-  - Slack is not started here: each Slack binding (IO.slack.<label>) is launched by the tenant
-    that needs it, and its tokens go to SY.vault (resource_type "slack", {app_token, bot_token}).
-
-  - IO.wapp (WhatsApp Cloud API) needs its secret (resource_type "whatsapp",
-    value {access_token, app_secret, verify_token}) AND the public webhook wired
-    as a fanout: externalize ONE edge endpoint for the Meta app with the family
-    glob "IO.wapp.*@$HIVE_ID" and the app-level verify_token, then set each node's
-    io.phone_number_id via CONFIG_SET. One IO.wapp.<label> node per number.
+  - IO channel nodes are not started here, and none runs in the root tenant: each one
+    (IO.api.<label>, IO.slack.<label>, IO.wapp.<label>, ...) is launched with run_node by the
+    tenant that needs it, and its secret goes to SY.vault for that tenant.
+    Slack: resource_type "slack", {app_token, bot_token}.
+    WhatsApp: resource_type "whatsapp", {access_token, app_secret, verify_token}, plus ONE
+    edge endpoint for the Meta app with the family glob "IO.wapp.*@$HIVE_ID" and each node's
+    io.phone_number_id set via CONFIG_SET (one IO.wapp.<label> node per number).
 
   Any other node secret is loaded into SY.vault the same way (POST .../vault/secrets).
 

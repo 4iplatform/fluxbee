@@ -2136,6 +2136,19 @@ async fn reconcile_persisted_custom_nodes(
             } else {
                 (persisted_ilk, persisted_tenant)
             };
+        // Checked before anything is stopped: a node that still runs is left running, not killed.
+        if let Some(refusal) =
+            root_tenant_io_refusal(&node.node_name, &runtime_key, persisted_tenant.as_deref())
+        {
+            failed = failed.saturating_add(1);
+            tracing::warn!(
+                node_name = node.node_name,
+                runtime = runtime_key,
+                payload = %refusal,
+                "persisted custom node not relaunched: only io.cloud and io.blob run in the root tenant"
+            );
+            continue;
+        }
         // Free the unit name before relaunching.
         //
         // Managed nodes run as TRANSIENT units (`systemd-run`), and systemd refuses to create a
@@ -2254,8 +2267,8 @@ async fn wait_for_lifecycle_nodes(
     timeout: Duration,
 ) -> Result<(), OrchestratorError> {
     // Only router-connected nodes are visible in router SHM. The declarative
-    // lifecycle includes SY authorities plus explicitly allowlisted packaged
-    // workers such as the motherbee IO.blob managed runtime.
+    // lifecycle lists SY authorities only: the managed runtimes (IO.blob, IO.cloud, ...) are
+    // spawned with run_node and are not waited for here.
     let required: Vec<String> = state
         .system_nodes
         .wait_for
@@ -10419,6 +10432,32 @@ fn node_kind_from_name(name: &str) -> String {
     }
 }
 
+/// Only io.cloud and io.blob run in the root tenant; a tenant launches every other IO node
+/// (operator decision 2026-10-02, FINDINGS A-43). Some(error reply) when `tenant_id` is the root
+/// tenant and the node is another IO node. Checked wherever a node is launched: run_node, start
+/// and restart, and the boot relaunch.
+fn root_tenant_io_refusal(
+    node_name: &str,
+    runtime: &str,
+    tenant_id: Option<&str>,
+) -> Option<serde_json::Value> {
+    let tenant_id = tenant_id?;
+    if !fluxbee_sdk::root_tenant_refuses_io_node(node_name, runtime, tenant_id) {
+        return None;
+    }
+    Some(serde_json::json!({
+        "status": "error",
+        "error_code": "TENANT_ROOT_NOT_ALLOWED",
+        "message": format!(
+            "IO node '{node_name}' (runtime '{runtime}') cannot run in the root tenant: only {} run there; launch it from a tenant",
+            fluxbee_sdk::ROOT_TENANT_IO_RUNTIMES.join(" and ")
+        ),
+        "node_name": node_name,
+        "runtime": runtime,
+        "tenant_id": tenant_id,
+    }))
+}
+
 fn managed_spawn_disallowed_reason(node_name: &str) -> Option<&'static str> {
     let local = node_name.split('@').next().unwrap_or(node_name).trim();
     let kind = node_kind_from_name(node_name);
@@ -13463,6 +13502,22 @@ fn derive_ilk_type_for_node(_node_name: &str) -> &'static str {
     "agent"
 }
 
+/// The tenant a node's effective config records: `_system.tenant_id`, else top-level `tenant_id`.
+fn config_tenant_id(config: &serde_json::Value) -> Option<String> {
+    [
+        config
+            .get("_system")
+            .and_then(|system| system.get("tenant_id")),
+        config.get("tenant_id"),
+    ]
+    .into_iter()
+    .flatten()
+    .filter_map(serde_json::Value::as_str)
+    .map(str::trim)
+    .find(|tenant| !tenant.is_empty())
+    .map(str::to_string)
+}
+
 fn resolve_tenant_id_for_node(payload: &serde_json::Value) -> Option<String> {
     let from_payload = payload
         .get("tenant_id")
@@ -15300,6 +15355,15 @@ async fn run_node_flow(
         });
     }
 
+    // The tenant this spawn would register and inject: the one the rule is about.
+    if let Some(refusal) = root_tenant_io_refusal(
+        &node_name,
+        &runtime,
+        resolve_tenant_id_for_node(payload).as_deref(),
+    ) {
+        return refusal;
+    }
+
     // SO-01: the systemd unit is ALWAYS derived from the validated, managed
     // node_name (`unit_from_node_name` prefixes `fluxbee-node-`), never taken
     // from the caller — so a lifecycle-authorized caller cannot spawn/register
@@ -15786,6 +15850,11 @@ fn managed_node_launch_plan(
                 }));
             }
         };
+    let (_, persisted_tenant) = load_persisted_node_identity(state, node_name);
+    let tenant = persisted_tenant.or_else(|| config_tenant_id(&config));
+    if let Some(refusal) = root_tenant_io_refusal(node_name, &runtime_key, tenant.as_deref()) {
+        return Err(refusal);
+    }
     validate_wf_runtime_spawn_contract(
         &manifest,
         &runtime_key,
@@ -26120,6 +26189,45 @@ blob:
             !body.contains("dist_sync_folders_for_role("),
             "dist_sync_folders_for_role da fluxbee-dist-core-motherbee en motherbee: 404, y el \
              primer no-ok hace fallar el hint entero"
+        );
+    }
+
+    /// A-43: launching an IO node other than io.cloud or io.blob in the root tenant is refused
+    /// with TENANT_ROOT_NOT_ALLOWED; in a tenant, or with no tenant known, it is not.
+    #[test]
+    fn only_io_cloud_and_io_blob_launch_in_the_root_tenant() {
+        let root = fluxbee_sdk::DEFAULT_ROOT_TENANT_ID;
+        let refusal = root_tenant_io_refusal("IO.api@motherbee", "io.api", Some(root))
+            .expect("io.api in the root tenant");
+        assert_eq!(refusal["status"], "error");
+        assert_eq!(refusal["error_code"], "TENANT_ROOT_NOT_ALLOWED");
+        assert_eq!(refusal["runtime"], "io.api");
+        assert!(root_tenant_io_refusal("IO.cloud@motherbee", "io.cloud", Some(root)).is_none());
+        assert!(root_tenant_io_refusal("IO.blob@motherbee", "io.blob", Some(root)).is_none());
+        assert!(root_tenant_io_refusal(
+            "IO.api.acme@motherbee",
+            "io.api",
+            Some("tnt:8a0c3f8e-2f1b-4d3a-9c55-0f6e2b7d9a11")
+        )
+        .is_none());
+        assert!(root_tenant_io_refusal("IO.api@motherbee", "io.api", None).is_none());
+    }
+
+    /// A start or restart reads the node's tenant from the identity map, else from its config.
+    #[test]
+    fn a_nodes_config_names_its_tenant_in_system_or_at_the_top() {
+        let root = fluxbee_sdk::DEFAULT_ROOT_TENANT_ID;
+        assert_eq!(
+            config_tenant_id(&serde_json::json!({ "_system": { "tenant_id": root } })).as_deref(),
+            Some(root)
+        );
+        assert_eq!(
+            config_tenant_id(&serde_json::json!({ "_system": {}, "tenant_id": root })).as_deref(),
+            Some(root)
+        );
+        assert_eq!(
+            config_tenant_id(&serde_json::json!({ "_system": { "tenant_id": " " } })),
+            None
         );
     }
 
