@@ -12,7 +12,7 @@
 #   1. build or reuse target/release/identity_negative_diag;
 #   2. create an active test tenant through SY.admin (POST $BASE/hives/$HIVE_ID/identity/tenants):
 #      the frontdesk no longer creates tenants, so the diag cannot either;
-#   3. run the diag (retried while the control plane comes up) under the frontdesk's name, with
+#   3. run the diag under the frontdesk's name (DIAG_TIMEOUT_SECS, default 180), with
 #      sy-frontdesk-gov stopped meanwhile (see scripts/lib/identity_e2e.sh), and check each code:
 #        UNAUTHORIZED_REGISTRAR       ILK_REGISTER from a node that is not a registrar
 #        INVALID_REQUEST              ILK_REGISTER with a malformed ilk_id
@@ -30,7 +30,8 @@
 # Environment: BASE (SY.admin HTTP, default http://127.0.0.1:8080), HIVE_ID (default motherbee),
 # IDENTITY_NEGATIVE_TENANT_ID (use this active tenant instead of creating one; it is never
 # deleted), IDENTITY_NEGATIVE_TEST_ID, IDENTITY_NEGATIVE_TIMEOUT_MS,
-# IDENTITY_NEGATIVE_STARTUP_WAIT_SECS, IDENTITY_NEGATIVE_RETRY_SLEEP_SECS, IDENTITY_NEGATIVE_TARGET,
+# IDENTITY_NEGATIVE_STARTUP_WAIT_SECS and IDENTITY_NEGATIVE_RETRY_SLEEP_SECS (waiting for SY.admin),
+# DIAG_TIMEOUT_SECS, IDENTITY_NEGATIVE_TARGET,
 # IDENTITY_NEGATIVE_FALLBACK_TARGET, IDENTITY_NEGATIVE_REPLICA_TARGET, CLEANUP (default 1).
 set -euo pipefail
 
@@ -75,6 +76,7 @@ trap cleanup EXIT
 
 command -v curl >/dev/null 2>&1 || fail "missing required command 'curl'"
 command -v python3 >/dev/null 2>&1 || fail "missing required command 'python3'"
+command -v timeout >/dev/null 2>&1 || fail "missing required command 'timeout'"
 
 if [[ "${BUILD_BIN}" == "1" ]]; then
   echo "Step 1/4: build identity_negative_diag"
@@ -86,7 +88,6 @@ if [[ ! -x "$ROOT_DIR/target/release/identity_negative_diag" ]]; then
   fail "missing $ROOT_DIR/target/release/identity_negative_diag (set BUILD_BIN=1)"
 fi
 
-deadline=$((SECONDS + STARTUP_WAIT_SECS))
 if [[ -n "$TENANT_ID" ]]; then
   echo "Step 2/4: using the given tenant $TENANT_ID (not deleted afterwards)"
 else
@@ -96,43 +97,20 @@ fi
 
 echo "Step 3/4: run identity negative diag (test id $TEST_ID)"
 stop_frontdesk
-attempt=0
-while :; do
-  attempt=$((attempt + 1))
-  tmp_run="$WORK_DIR/attempt.out"
-  set +e
-  JSR_LOG_LEVEL="${JSR_LOG_LEVEL:-info}" \
-  IDENTITY_NEGATIVE_TEST_ID="$TEST_ID" \
-  IDENTITY_NEGATIVE_TENANT_ID="$TENANT_ID" \
-  IDENTITY_NEGATIVE_TIMEOUT_MS="$TIMEOUT_MS" \
-  IDENTITY_NEGATIVE_TARGET="${IDENTITY_NEGATIVE_TARGET:-}" \
-  IDENTITY_NEGATIVE_FALLBACK_TARGET="${IDENTITY_NEGATIVE_FALLBACK_TARGET:-}" \
-  IDENTITY_NEGATIVE_REPLICA_TARGET="${IDENTITY_NEGATIVE_REPLICA_TARGET:-}" \
-  ./target/release/identity_negative_diag >"$tmp_run" 2>&1
-  rc=$?
-  set -e
-  # Every attempt's output is kept, so the cleanup finds what any of them provisioned.
-  cat "$tmp_run" >>"$TMP_OUT"
-
-  if [[ $rc -eq 0 ]]; then
-    cat "$tmp_run"
-    break
-  fi
-
-  if grep -Eq "Connection refused|No such file or directory|timed out waiting ANNOUNCE" "$tmp_run"; then
-    if (( SECONDS >= deadline )); then
-      cat "$tmp_run"
-      fail "identity_negative_diag did not become ready within ${STARTUP_WAIT_SECS}s"
-    fi
-    echo "WARN: control plane not ready yet (attempt=$attempt rc=$rc), retrying in ${RETRY_SLEEP_SECS}s..."
-    sleep "$RETRY_SLEEP_SECS"
-    continue
-  fi
-
-  cat "$tmp_run"
-  exit $rc
-done
+set +e
+JSR_LOG_LEVEL="${JSR_LOG_LEVEL:-info}" \
+IDENTITY_NEGATIVE_TEST_ID="$TEST_ID" \
+IDENTITY_NEGATIVE_TENANT_ID="$TENANT_ID" \
+IDENTITY_NEGATIVE_TIMEOUT_MS="$TIMEOUT_MS" \
+IDENTITY_NEGATIVE_TARGET="${IDENTITY_NEGATIVE_TARGET:-}" \
+IDENTITY_NEGATIVE_FALLBACK_TARGET="${IDENTITY_NEGATIVE_FALLBACK_TARGET:-}" \
+IDENTITY_NEGATIVE_REPLICA_TARGET="${IDENTITY_NEGATIVE_REPLICA_TARGET:-}" \
+timeout "$DIAG_TIMEOUT_SECS" ./target/release/identity_negative_diag >"$TMP_OUT" 2>&1
+rc=$?
+set -e
+cat "$TMP_OUT"
 start_frontdesk
+check_diag_rc identity_negative_diag "$rc"
 
 expect_code() {
   local key="$1" expected="$2" got

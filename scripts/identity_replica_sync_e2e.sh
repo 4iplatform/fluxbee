@@ -14,16 +14,17 @@
 #   2. create an active test tenant through SY.admin on the primary (the frontdesk no longer
 #      creates tenants, so the diag cannot either) and wait until the replica has it
 #      (GET $BASE/hives/$REPLICA_HIVE/identity/tenants/<id>);
-#   3. run the diag (retried while the control plane comes up): the replica's counts reach the
-#      primary's, an IO node provisions an ILK in the tenant on the primary, and the replica's
-#      counts reach the primary's again;
+#   3. run the diag (DIAG_TIMEOUT_SECS, default 180): the replica's counts reach the primary's, an
+#      IO node provisions an ILK in the tenant on the primary, and the replica's counts reach the
+#      primary's again;
 #   4. check through SY.admin that the replica has that ILK, in the test tenant;
 #   5. delete and purge the test tenant, with its ILK, through SY.admin (CLEANUP=0 keeps it).
 #
 # Environment: REPLICA_HIVE (required), BASE (SY.admin HTTP, default http://127.0.0.1:8080),
 # HIVE_ID (the primary, default motherbee), IDENTITY_REPLICA_TEST_ID, IDENTITY_REPLICA_TIMEOUT_MS,
 # IDENTITY_REPLICA_CONVERGENCE_TIMEOUT_MS, IDENTITY_REPLICA_POLL_MS,
-# IDENTITY_REPLICA_STARTUP_WAIT_SECS, IDENTITY_REPLICA_RETRY_SLEEP_SECS,
+# IDENTITY_REPLICA_STARTUP_WAIT_SECS and IDENTITY_REPLICA_RETRY_SLEEP_SECS (waiting for SY.admin),
+# DIAG_TIMEOUT_SECS,
 # IDENTITY_REPLICA_PRIMARY_TARGET, IDENTITY_REPLICA_TARGET (default SY.identity@$REPLICA_HIVE),
 # IDENTITY_REPLICA_PRIMARY_FALLBACK_TARGET, IDENTITY_REPLICA_REQUIRE_BASELINE_SYNC, CLEANUP
 # (default 1).
@@ -68,6 +69,7 @@ trap cleanup EXIT
 [[ "$REPLICA_HIVE" != "$HIVE_ID" ]] || fail "REPLICA_HIVE must differ from the primary $HIVE_ID"
 command -v curl >/dev/null 2>&1 || fail "missing required command 'curl'"
 command -v python3 >/dev/null 2>&1 || fail "missing required command 'python3'"
+command -v timeout >/dev/null 2>&1 || fail "missing required command 'timeout'"
 
 if [[ "${BUILD_BIN}" == "1" ]]; then
   echo "Step 1/5: build identity_replica_sync_diag"
@@ -95,44 +97,22 @@ while :; do
 done
 
 echo "Step 3/5: run identity replica sync diag (test id $TEST_ID)"
-deadline=$((SECONDS + STARTUP_WAIT_SECS))
-attempt=0
-while :; do
-  attempt=$((attempt + 1))
-  tmp_run="$WORK_DIR/attempt.out"
-  set +e
-  JSR_LOG_LEVEL="${JSR_LOG_LEVEL:-info}" \
-  IDENTITY_REPLICA_TEST_ID="$TEST_ID" \
-  IDENTITY_REPLICA_TENANT_ID="$TENANT_ID" \
-  IDENTITY_REPLICA_PRIMARY_TARGET="${IDENTITY_REPLICA_PRIMARY_TARGET:-SY.identity@$HIVE_ID}" \
-  IDENTITY_REPLICA_TARGET="${IDENTITY_REPLICA_TARGET:-SY.identity@$REPLICA_HIVE}" \
-  IDENTITY_REPLICA_PRIMARY_FALLBACK_TARGET="${IDENTITY_REPLICA_PRIMARY_FALLBACK_TARGET:-}" \
-  IDENTITY_REPLICA_TIMEOUT_MS="$IDENTITY_REPLICA_TIMEOUT_MS" \
-  IDENTITY_REPLICA_CONVERGENCE_TIMEOUT_MS="$IDENTITY_REPLICA_CONVERGENCE_TIMEOUT_MS" \
-  IDENTITY_REPLICA_POLL_MS="$IDENTITY_REPLICA_POLL_MS" \
-  IDENTITY_REPLICA_REQUIRE_BASELINE_SYNC="${IDENTITY_REPLICA_REQUIRE_BASELINE_SYNC:-1}" \
-  ./target/release/identity_replica_sync_diag >"$tmp_run" 2>&1
-  rc=$?
-  set -e
-
-  if [[ $rc -eq 0 ]]; then
-    tee "$TMP_OUT" <"$tmp_run"
-    break
-  fi
-
-  if grep -Eq "Connection refused|No such file or directory|timed out waiting ANNOUNCE" "$tmp_run"; then
-    if ((SECONDS >= deadline)); then
-      cat "$tmp_run"
-      fail "identity_replica_sync_diag did not become ready within ${STARTUP_WAIT_SECS}s"
-    fi
-    echo "WARN: control plane not ready yet (attempt=$attempt rc=$rc), retrying in ${RETRY_SLEEP_SECS}s..."
-    sleep "$RETRY_SLEEP_SECS"
-    continue
-  fi
-
-  cat "$tmp_run"
-  exit $rc
-done
+set +e
+JSR_LOG_LEVEL="${JSR_LOG_LEVEL:-info}" \
+IDENTITY_REPLICA_TEST_ID="$TEST_ID" \
+IDENTITY_REPLICA_TENANT_ID="$TENANT_ID" \
+IDENTITY_REPLICA_PRIMARY_TARGET="${IDENTITY_REPLICA_PRIMARY_TARGET:-SY.identity@$HIVE_ID}" \
+IDENTITY_REPLICA_TARGET="${IDENTITY_REPLICA_TARGET:-SY.identity@$REPLICA_HIVE}" \
+IDENTITY_REPLICA_PRIMARY_FALLBACK_TARGET="${IDENTITY_REPLICA_PRIMARY_FALLBACK_TARGET:-}" \
+IDENTITY_REPLICA_TIMEOUT_MS="$IDENTITY_REPLICA_TIMEOUT_MS" \
+IDENTITY_REPLICA_CONVERGENCE_TIMEOUT_MS="$IDENTITY_REPLICA_CONVERGENCE_TIMEOUT_MS" \
+IDENTITY_REPLICA_POLL_MS="$IDENTITY_REPLICA_POLL_MS" \
+IDENTITY_REPLICA_REQUIRE_BASELINE_SYNC="${IDENTITY_REPLICA_REQUIRE_BASELINE_SYNC:-1}" \
+timeout "$DIAG_TIMEOUT_SECS" ./target/release/identity_replica_sync_diag >"$TMP_OUT" 2>&1
+rc=$?
+set -e
+cat "$TMP_OUT"
+check_diag_rc identity_replica_sync_diag "$rc"
 
 [[ "$(out_value STATUS)" == "ok" ]] || fail "identity replica sync diag did not return STATUS=ok"
 [[ "$(out_value BASELINE_SYNC_OK)" == "1" ]] || fail "baseline sync check did not pass"

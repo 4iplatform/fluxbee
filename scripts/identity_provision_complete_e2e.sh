@@ -60,6 +60,7 @@ trap cleanup EXIT
 
 command -v curl >/dev/null 2>&1 || fail "missing required command 'curl'"
 command -v python3 >/dev/null 2>&1 || fail "missing required command 'python3'"
+command -v timeout >/dev/null 2>&1 || fail "missing required command 'timeout'"
 
 if [[ "${BUILD_BIN}" == "1" ]]; then
   echo "Step 1/4: build identity_provision_complete_diag"
@@ -77,14 +78,18 @@ create_test_tenant "idprov-other-$TEST_ID" OTHER_TENANT_ID
 
 echo "Step 3/4: run identity provision+complete diag (test id $TEST_ID)"
 stop_frontdesk
+set +e
 JSR_LOG_LEVEL="${JSR_LOG_LEVEL:-info}" \
 IDENTITY_PROVISION_COMPLETE_TEST_ID="$TEST_ID" \
 IDENTITY_PROVISION_COMPLETE_TENANT_ID="$TENANT_ID" \
 IDENTITY_PROVISION_COMPLETE_OTHER_TENANT_ID="$OTHER_TENANT_ID" \
 IDENTITY_PROVISION_COMPLETE_TIMEOUT_MS="$TIMEOUT_MS" \
 IDENTITY_PROVISION_COMPLETE_FALLBACK_TARGET="$FALLBACK_TARGET" \
-./target/release/identity_provision_complete_diag | tee "$TMP_OUT"
+timeout "$DIAG_TIMEOUT_SECS" ./target/release/identity_provision_complete_diag 2>&1 | tee "$TMP_OUT"
+rc=${PIPESTATUS[0]}
+set -e
 start_frontdesk
+check_diag_rc identity_provision_complete_diag "$rc"
 
 [[ "$(out_value STATUS)" == "ok" ]] || fail "identity provision+complete diag did not return STATUS=ok"
 

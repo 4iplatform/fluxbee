@@ -41,6 +41,21 @@ elif cur is not None:
 PY
 }
 
+# The diags retry their router connection forever, so they run under `timeout`.
+DIAG_TIMEOUT_SECS="${DIAG_TIMEOUT_SECS:-180}"
+
+# check_diag_rc <name> <rc>: fails with the reason when a diag did not succeed. 124 is the timeout:
+# the router was unreachable, or it refused the diag's HELLO because another live connection holds
+# that node name's UUID (A-44), such as a sy-frontdesk-gov that is still running.
+check_diag_rc() {
+  local name="$1" rc="$2"
+  [[ "$rc" -eq 0 ]] && return 0
+  if [[ "$rc" -eq 124 ]]; then
+    fail "$name timed out after ${DIAG_TIMEOUT_SECS}s: the router is unreachable, or it refused a HELLO because another connection holds that node's UUID"
+  fi
+  fail "$name failed (rc=$rc)"
+}
+
 # The tenants this run created: the cleanup purges these and no others.
 CREATED_TENANTS=()
 

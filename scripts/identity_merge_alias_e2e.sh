@@ -81,6 +81,7 @@ trap cleanup EXIT
 
 command -v curl >/dev/null 2>&1 || fail "missing required command 'curl'"
 command -v python3 >/dev/null 2>&1 || fail "missing required command 'python3'"
+command -v timeout >/dev/null 2>&1 || fail "missing required command 'timeout'"
 
 if [[ "${BUILD_BIN}" == "1" ]]; then
   echo "Step 1/5: build identity_merge_diag"
@@ -101,6 +102,7 @@ fi
 
 echo "Step 3/5: run identity merge diag (test id $TEST_ID)"
 stop_frontdesk
+set +e
 JSR_LOG_LEVEL="${JSR_LOG_LEVEL:-info}" \
 IDENTITY_MERGE_TEST_ID="$TEST_ID" \
 IDENTITY_MERGE_TENANT_ID="$TENANT_ID" \
@@ -108,8 +110,11 @@ IDENTITY_MERGE_TIMEOUT_MS="$IDENTITY_MERGE_TIMEOUT_MS" \
 IDENTITY_MERGE_WAIT_GC_SECS="$IDENTITY_MERGE_WAIT_GC_SECS" \
 IDENTITY_MERGE_REQUIRE_ALIAS_CLEANUP="$IDENTITY_MERGE_REQUIRE_ALIAS_CLEANUP" \
 IDENTITY_MERGE_FALLBACK_TARGET="$IDENTITY_MERGE_FALLBACK_TARGET" \
-./target/release/identity_merge_diag | tee "$TMP_OUT"
+timeout "$DIAG_TIMEOUT_SECS" ./target/release/identity_merge_diag 2>&1 | tee "$TMP_OUT"
+rc=${PIPESTATUS[0]}
+set -e
 start_frontdesk
+check_diag_rc identity_merge_diag "$rc"
 
 [[ "$(out_value STATUS)" == "ok" ]] || fail "identity merge diag did not return STATUS=ok"
 canonical="$(out_value CANONICAL_ILK_ID)"

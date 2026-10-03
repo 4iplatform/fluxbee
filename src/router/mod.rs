@@ -695,24 +695,41 @@ async fn handle_node(
     let vpn_id = assign_vpn(&node_name, snapshot.as_ref());
     tracing::info!(node = %node_name, vpn_id = vpn_id, "vpn assigned");
     let connected_at = now_epoch_ms();
+    let handle = NodeHandle {
+        name: node_name.clone(),
+        vpn_id,
+        sender: tx.clone(),
+        connected_at,
+    };
+    if let Err(holder) = claim_node_uuid(&nodes, node_uuid, handle, DUPLICATE_HELLO_GRACE).await {
+        tracing::warn!(
+            node = %node_name,
+            uuid = %node_uuid,
+            connected_as = %holder,
+            "HELLO rejected: this node UUID already has a live connection"
+        );
+        writer_task.abort();
+        return Err(RouterError::Io(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            format!("node uuid {node_uuid} already connected as {holder}"),
+        )));
+    }
     {
         let mut shm = shm.lock().await;
-        shm.register_node(node_uuid, &node_name, vpn_id, connected_at)
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+        if let Err(err) = shm.register_node(node_uuid, &node_name, vpn_id, connected_at) {
+            drop(shm);
+            let mut nodes = nodes.lock().await;
+            if nodes
+                .get(&node_uuid)
+                .is_some_and(|handle| handle.connected_at == connected_at)
+            {
+                nodes.remove(&node_uuid);
+            }
+            writer_task.abort();
+            return Err(io::Error::new(io::ErrorKind::Other, err).into());
+        }
     }
     tracing::info!(node = %node_uuid, "node registered in shm");
-    {
-        let mut nodes = nodes.lock().await;
-        nodes.insert(
-            node_uuid,
-            NodeHandle {
-                name: node_name.clone(),
-                vpn_id,
-                sender: tx.clone(),
-                connected_at,
-            },
-        );
-    }
     rebuild_fib(
         &fib,
         &nodes,
@@ -760,18 +777,22 @@ async fn handle_node(
         tracing::info!("announce queued");
     }
 
-    loop {
+    // The connection ends only on EOF, WITHDRAW or a read error, and every end runs the cleanup
+    // below (A-44): an end that skipped it left the node registered with its writer alive, so a
+    // node that was still running stayed connected while nobody read its frames, and its next
+    // HELLO found the UUID taken. A message that cannot be handled is logged and skipped.
+    let exit: Result<(), RouterError> = loop {
         let frame = match read_frame(&mut reader).await {
             Ok(Some(f)) => f,
             Ok(None) => {
                 tracing::info!(node = %node_uuid, "router: node closed connection (EOF)");
-                break;
+                break Ok(());
             }
             Err(err) => {
                 if err.kind() == std::io::ErrorKind::InvalidData {
                     tracing::error!(node = %node_uuid, error = %err, "FRAME_TOO_LARGE — node sent oversized frame; disconnecting");
                 }
-                return Err(err.into());
+                break Err(err.into());
             }
         };
         {
@@ -796,17 +817,29 @@ async fn handle_node(
                 maybe_publish_turn(&nats_publisher, &nats_publish_errors, &msg);
                 if is_system_kind(&msg.meta.msg_type) {
                     if msg.meta.msg.as_deref() == Some(MSG_WITHDRAW) {
-                        break;
+                        break Ok(());
                     }
                     if msg.meta.msg.as_deref() == Some(MSG_OPA_RELOAD) {
                         // SY.opa.rules installed a policy: load it now, and tell the other routers
                         // of this hive. No node consumes OPA_RELOAD, so it goes to none of them.
-                        let payload: OpaReloadPayload =
-                            serde_json::from_value(msg.payload.clone())?;
-                        apply_opa_reload(&opa, &opa_reader, &shm, hive_id, &payload).await;
-                        if msg.routing.ttl >= 2 {
-                            broadcast_to_peers(&peers, &msg).await?;
-                            tracing::info!("opa reload forwarded to peers");
+                        match serde_json::from_value::<OpaReloadPayload>(msg.payload.clone()) {
+                            Ok(payload) => {
+                                apply_opa_reload(&opa, &opa_reader, &shm, hive_id, &payload).await;
+                                if msg.routing.ttl >= 2 {
+                                    match broadcast_to_peers(&peers, &msg).await {
+                                        Ok(()) => tracing::info!("opa reload forwarded to peers"),
+                                        Err(err) => tracing::warn!(
+                                            error = %err,
+                                            "opa reload could not be forwarded to peers"
+                                        ),
+                                    }
+                                }
+                            }
+                            Err(err) => tracing::warn!(
+                                node = %conn_node_name,
+                                error = %err,
+                                "router ignored an OPA_RELOAD with an invalid payload"
+                            ),
                         }
                         continue;
                     }
@@ -838,7 +871,7 @@ async fn handle_node(
                     &reachability,
                 )
                 .await;
-                handle_message(
+                if let Err(err) = handle_message(
                     &msg,
                     &nodes,
                     &fib,
@@ -858,12 +891,20 @@ async fn handle_node(
                     &reachability,
                     snapshot.as_ref(),
                 )
-                .await?;
+                .await
+                {
+                    tracing::warn!(
+                        node = %conn_node_name,
+                        trace_id = %msg.routing.trace_id,
+                        error = %err,
+                        "router could not handle a message from this node"
+                    );
+                }
             } else {
                 tracing::warn!("received invalid message frame");
             }
         }
-    }
+    };
 
     {
         let mut nodes = nodes.lock().await;
@@ -903,7 +944,42 @@ async fn handle_node(
     }
     writer_task.abort();
     tracing::info!(node = %node_uuid, "node disconnected");
-    Ok(())
+    exit
+}
+
+/// How long a HELLO waits for an earlier connection with its UUID to go before it is refused
+/// (A-44). A node that restarts or reconnects, and every Go node's second HELLO at startup, can
+/// arrive before the router has processed the close of the connection it replaces.
+const DUPLICATE_HELLO_GRACE: Duration = Duration::from_secs(1);
+const DUPLICATE_HELLO_POLL: Duration = Duration::from_millis(50);
+
+/// Registers `handle` as the connection of `uuid`, one live connection per node UUID. While
+/// another connection holds the UUID it waits up to `grace` for it to go; Err carries the name
+/// that connection registered with. A second live process with a node's UUID is refused instead
+/// of taking its route.
+async fn claim_node_uuid(
+    nodes: &Mutex<std::collections::HashMap<Uuid, NodeHandle>>,
+    uuid: Uuid,
+    handle: NodeHandle,
+    grace: Duration,
+) -> Result<(), String> {
+    let deadline = time::Instant::now() + grace;
+    loop {
+        let mut guard = nodes.lock().await;
+        match guard.get(&uuid).map(|holder| holder.name.clone()) {
+            None => {
+                guard.insert(uuid, handle);
+                return Ok(());
+            }
+            Some(holder) => {
+                drop(guard);
+                if time::Instant::now() >= deadline {
+                    return Err(holder);
+                }
+                time::sleep(DUPLICATE_HELLO_POLL).await;
+            }
+        }
+    }
 }
 
 /// A node speaks only as itself. `handle_message` takes the sender's authoritative L2 name from
@@ -7586,6 +7662,289 @@ mod tests {
         drop(client);
         let _ = time::timeout(Duration::from_secs(5), router).await;
         cleanup(&shm_name);
+    }
+
+    /// A router SHM for one test, removed when dropped.
+    struct TestShm {
+        name: String,
+        writer: Arc<Mutex<RouterRegionWriter>>,
+    }
+
+    impl TestShm {
+        fn new(prefix: &str) -> Self {
+            let name = format!("/{prefix}-{}", &Uuid::new_v4().simple().to_string()[..8]);
+            unlink_test_shm(&name);
+            let writer = RouterRegionWriter::open_or_create(
+                &name,
+                Uuid::new_v4(),
+                "motherbee",
+                "RT.gateway@motherbee",
+                false,
+            )
+            .expect("create test shm");
+            Self {
+                name,
+                writer: Arc::new(Mutex::new(writer)),
+            }
+        }
+    }
+
+    impl Drop for TestShm {
+        fn drop(&mut self) {
+            unlink_test_shm(&self.name);
+        }
+    }
+
+    fn unlink_test_shm(name: &str) {
+        if let Ok(cstr) = std::ffi::CString::new(name) {
+            let _ = nix::sys::mman::shm_unlink(cstr.as_c_str());
+        }
+    }
+
+    /// `handle_node` on `server` for a motherbee router with no peers, config or policy.
+    fn spawn_node_connection(
+        server: UnixStream,
+        shm: &TestShm,
+        nodes: &Arc<Mutex<HashMap<Uuid, NodeHandle>>>,
+    ) -> tokio::task::JoinHandle<Result<(), RouterError>> {
+        tokio::spawn(handle_node(
+            server,
+            Arc::clone(&shm.writer),
+            Arc::clone(nodes),
+            Arc::new(Mutex::new(HashMap::new())),
+            Arc::new(Mutex::new(HashMap::new())),
+            Arc::new(Mutex::new(HashMap::new())),
+            Arc::new(Mutex::new(HashMap::new())),
+            Arc::new(Mutex::new(None)),
+            Arc::new(Mutex::new(None)),
+            Arc::new(Mutex::new(None)),
+            Arc::new(Mutex::new(HashMap::new())),
+            Arc::new(Mutex::new(Vec::new())),
+            Arc::new(Mutex::new(Vec::new())),
+            Arc::new(Mutex::new(Vec::new())),
+            Arc::new(Mutex::new(Vec::new())),
+            Arc::new(Mutex::new(0)),
+            Arc::new(Mutex::new(OpaResolver::new())),
+            Arc::new(Mutex::new(None)),
+            Arc::new(Mutex::new(BroadcastCache::new())),
+            Arc::new(Mutex::new(0)),
+            Arc::new(Mutex::new(None)),
+            Arc::new(Mutex::new(HashMap::new())),
+            None,
+            Arc::new(AtomicU64::new(0)),
+            Uuid::new_v4(),
+            "RT.gateway@motherbee",
+            "motherbee",
+            "SY.frontdesk.gov@motherbee",
+            false,
+        ))
+    }
+
+    fn test_frame(
+        src: Uuid,
+        msg_type: &str,
+        msg: Option<&str>,
+        dst: Destination,
+        payload: serde_json::Value,
+    ) -> Vec<u8> {
+        serde_json::to_vec(&Message {
+            routing: Routing {
+                src: src.to_string(),
+                src_l2_name: None,
+                dst,
+                ttl: 16,
+                trace_id: Uuid::new_v4().to_string(),
+            },
+            meta: Meta {
+                msg_type: msg_type.to_string(),
+                msg: msg.map(str::to_string),
+                ..Meta::default()
+            },
+            payload,
+        })
+        .expect("frame")
+    }
+
+    /// Connects a node as `name` with `uuid`: Some(stream) once the router announced it, None if
+    /// the router closed the connection instead.
+    async fn hello(
+        shm: &TestShm,
+        nodes: &Arc<Mutex<HashMap<Uuid, NodeHandle>>>,
+        uuid: Uuid,
+        name: &str,
+    ) -> (
+        Option<UnixStream>,
+        tokio::task::JoinHandle<Result<(), RouterError>>,
+    ) {
+        let (mut client, server) = UnixStream::pair().expect("socket pair");
+        let connection = spawn_node_connection(server, shm, nodes);
+        let frame = test_frame(
+            uuid,
+            SYSTEM_KIND,
+            Some(MSG_HELLO),
+            Destination::Broadcast,
+            serde_json::json!({ "uuid": uuid.to_string(), "name": name, "version": "1" }),
+        );
+        write_frame(&mut client, &frame).await.expect("hello");
+        let answer = time::timeout(Duration::from_secs(5), read_frame(&mut client))
+            .await
+            .expect("an answer in time");
+        match answer {
+            Ok(Some(_announce)) => (Some(client), connection),
+            _ => (None, connection),
+        }
+    }
+
+    async fn holder_name(
+        nodes: &Arc<Mutex<HashMap<Uuid, NodeHandle>>>,
+        uuid: Uuid,
+    ) -> Option<String> {
+        nodes
+            .lock()
+            .await
+            .get(&uuid)
+            .map(|handle| handle.name.clone())
+    }
+
+    /// A-44: a second live process with a node's UUID does not take its route. Its HELLO waits
+    /// the grace for the first connection to go, and is refused while it stays.
+    #[tokio::test]
+    async fn a_hello_with_a_uuid_that_is_still_connected_is_refused() {
+        let shm = TestShm::new("rt-dup");
+        let nodes: Arc<Mutex<HashMap<Uuid, NodeHandle>>> = Arc::new(Mutex::new(HashMap::new()));
+        let uuid = Uuid::new_v4();
+        let (first, _first_conn) = hello(&shm, &nodes, uuid, "AI.first").await;
+        assert!(first.is_some(), "the first connection is announced");
+
+        let started = time::Instant::now();
+        let (second, second_conn) = hello(&shm, &nodes, uuid, "AI.second").await;
+        assert!(second.is_none(), "the second connection gets no ANNOUNCE");
+        assert!(
+            started.elapsed() >= DUPLICATE_HELLO_GRACE,
+            "it waited the grace first"
+        );
+        let refused = time::timeout(Duration::from_secs(5), second_conn)
+            .await
+            .expect("the refused connection ends")
+            .expect("join");
+        assert!(refused.is_err());
+        assert_eq!(
+            holder_name(&nodes, uuid).await.as_deref(),
+            Some("AI.first@motherbee"),
+            "the first connection keeps the route"
+        );
+        drop(first);
+    }
+
+    /// A node that reconnects right after its connection closed (a restart, the Go SDK's second
+    /// HELLO) is accepted: its HELLO waits until the router cleaned up the old connection.
+    #[tokio::test]
+    async fn a_node_reconnecting_right_after_closing_is_accepted() {
+        let shm = TestShm::new("rt-recon");
+        let nodes: Arc<Mutex<HashMap<Uuid, NodeHandle>>> = Arc::new(Mutex::new(HashMap::new()));
+        let uuid = Uuid::new_v4();
+        let (first, first_conn) = hello(&shm, &nodes, uuid, "AI.node").await;
+        drop(first.expect("announced"));
+        let (second, _second_conn) = hello(&shm, &nodes, uuid, "AI.node").await;
+        assert!(second.is_some(), "the reconnect is announced");
+        assert!(time::timeout(Duration::from_secs(5), first_conn)
+            .await
+            .expect("the first connection ended")
+            .expect("join")
+            .is_ok());
+        assert_eq!(
+            holder_name(&nodes, uuid).await.as_deref(),
+            Some("AI.node@motherbee")
+        );
+    }
+
+    /// A-44: a connection that ends in a read error is cleaned up like one that ends in EOF.
+    /// Before, the node stayed registered with its writer alive.
+    #[tokio::test]
+    async fn a_connection_that_ends_in_a_read_error_is_cleaned_up() {
+        use tokio::io::AsyncWriteExt;
+
+        let shm = TestShm::new("rt-rderr");
+        let nodes: Arc<Mutex<HashMap<Uuid, NodeHandle>>> = Arc::new(Mutex::new(HashMap::new()));
+        let uuid = Uuid::new_v4();
+        let (client, connection) = hello(&shm, &nodes, uuid, "AI.node").await;
+        let mut client = client.expect("announced");
+        // A frame header for 100 bytes, then 10 bytes and the close: a partial frame.
+        client
+            .write_all(&100u32.to_be_bytes())
+            .await
+            .expect("header");
+        client
+            .write_all(&[0u8; 10])
+            .await
+            .expect("part of the body");
+        drop(client);
+
+        let ended = time::timeout(Duration::from_secs(5), connection)
+            .await
+            .expect("the connection ends")
+            .expect("join");
+        assert!(ended.is_err(), "a partial frame is a read error");
+        assert_eq!(
+            holder_name(&nodes, uuid).await,
+            None,
+            "the node is unregistered"
+        );
+        let snapshot = shm.writer.lock().await.read_snapshot().expect("snapshot");
+        assert!(
+            snapshot
+                .nodes
+                .iter()
+                .all(|node| node.uuid != *uuid.as_bytes()),
+            "and its SHM slot is freed"
+        );
+    }
+
+    /// A message the router cannot handle is skipped; the connection stays up.
+    #[tokio::test]
+    async fn a_message_the_router_cannot_handle_does_not_end_the_connection() {
+        let shm = TestShm::new("rt-badmsg");
+        let receiver_uuid = Uuid::new_v4();
+        let (receiver_tx, mut receiver_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+        let nodes: Arc<Mutex<HashMap<Uuid, NodeHandle>>> = Arc::new(Mutex::new(HashMap::new()));
+        nodes.lock().await.insert(
+            receiver_uuid,
+            NodeHandle {
+                name: "SY.timer@motherbee".to_string(),
+                vpn_id: 0,
+                sender: receiver_tx,
+                connected_at: 0,
+            },
+        );
+        let uuid = Uuid::new_v4();
+        let (client, connection) = hello(&shm, &nodes, uuid, "AI.node").await;
+        let mut client = client.expect("announced");
+        // An OPA_RELOAD whose payload is not one ended the connection before.
+        let bad = test_frame(
+            uuid,
+            SYSTEM_KIND,
+            Some(MSG_OPA_RELOAD),
+            Destination::Broadcast,
+            serde_json::json!({ "not": "an opa reload" }),
+        );
+        write_frame(&mut client, &bad).await.expect("bad frame");
+        let good = test_frame(
+            uuid,
+            "user",
+            None,
+            Destination::Unicast(receiver_uuid.to_string()),
+            serde_json::json!({ "n": "after" }),
+        );
+        write_frame(&mut client, &good).await.expect("good frame");
+
+        let delivered = time::timeout(Duration::from_secs(5), receiver_rx.recv())
+            .await
+            .expect("delivery in time")
+            .expect("delivered");
+        let delivered: Message = serde_json::from_slice(&delivered).expect("message");
+        assert_eq!(delivered.payload["n"], "after");
+        assert!(!connection.is_finished(), "the connection is still up");
+        drop(client);
     }
 
     /// The admin's OPA sync notice (panel DTAP T-8): a broadcast with meta.target

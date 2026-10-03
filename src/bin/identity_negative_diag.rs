@@ -6,8 +6,10 @@
 //! node, the frontdesk (`ILK_REGISTER`, `ILK_ADD_CHANNEL`) and an IO node (`ILK_PROVISION`). The
 //! values it registers are synthetic and derived from the test id.
 
+use std::collections::HashMap;
 use std::error::Error;
 use std::path::PathBuf;
+use std::sync::{Arc, OnceLock};
 
 use fluxbee_sdk::identity::{
     load_hive_id, DEFAULT_ROOT_TENANT_ID, MSG_ILK_ADD_CHANNEL, MSG_ILK_PROVISION, MSG_ILK_REGISTER,
@@ -16,6 +18,7 @@ use fluxbee_sdk::identity::{
 use fluxbee_sdk::rpc::{OperationalRouteProfile, RouterDispatcher, RpcError, SystemRpcRequest};
 use fluxbee_sdk::NodeConfig;
 use serde_json::{json, Value};
+use tokio::sync::Mutex;
 use tokio::time::Duration;
 use tracing_subscriber::EnvFilter;
 use uuid::Uuid;
@@ -396,14 +399,14 @@ async fn main() -> Result<(), DynError> {
     Ok(())
 }
 
-async fn run_case_expect_ok(
-    node_name: &str,
-    target: &str,
-    fallback_target: Option<&str>,
-    action: &str,
-    payload: Value,
-    timeout: Duration,
-) -> Result<Value, DynError> {
+/// The connection under `node_name`, one per name for the whole run. The UUID is persisted per
+/// name, and the router refuses a second connection with a UUID that is still connected (A-44).
+async fn connection(node_name: &str) -> Result<Arc<RouterDispatcher>, DynError> {
+    static CONNECTIONS: OnceLock<Mutex<HashMap<String, Arc<RouterDispatcher>>>> = OnceLock::new();
+    let mut connections = CONNECTIONS.get_or_init(Default::default).lock().await;
+    if let Some(client) = connections.get(node_name) {
+        return Ok(Arc::clone(client));
+    }
     let cfg = NodeConfig {
         name: node_name.to_string(),
         router_socket: json_router::paths::router_socket_dir(),
@@ -415,6 +418,19 @@ async fn run_case_expect_ok(
     let profile = OperationalRouteProfile::builder().build()?;
     let client =
         RouterDispatcher::connect_with_retry(cfg, Duration::from_millis(100), profile).await?;
+    connections.insert(node_name.to_string(), Arc::clone(&client));
+    Ok(client)
+}
+
+async fn run_case_expect_ok(
+    node_name: &str,
+    target: &str,
+    fallback_target: Option<&str>,
+    action: &str,
+    payload: Value,
+    timeout: Duration,
+) -> Result<Value, DynError> {
+    let client = connection(node_name).await?;
     let (payload, effective_target) =
         identity_call_with_fallback(&client, target, fallback_target, action, payload, timeout)
             .await?;
@@ -441,17 +457,7 @@ async fn run_case_expect_error(
     timeout: Duration,
     expected_code: &str,
 ) -> Result<String, DynError> {
-    let cfg = NodeConfig {
-        name: node_name.to_string(),
-        router_socket: json_router::paths::router_socket_dir(),
-        uuid_persistence_dir: json_router::paths::state_dir().join("nodes"),
-        uuid_mode: fluxbee_sdk::NodeUuidMode::Persistent,
-        config_dir: json_router::paths::config_dir(),
-        version: "0.0.1".to_string(),
-    };
-    let profile = OperationalRouteProfile::builder().build()?;
-    let client =
-        RouterDispatcher::connect_with_retry(cfg, Duration::from_millis(100), profile).await?;
+    let client = connection(node_name).await?;
     let (payload, effective_target) =
         identity_call_with_fallback(&client, target, fallback_target, action, payload, timeout)
             .await?;
