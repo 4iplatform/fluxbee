@@ -598,43 +598,70 @@ Respuesta del operador (2026-10-02): *"sí a todo"*.
 - **Arreglo previsto:** una prueba de pertenencia antes del merge, por ejemplo un código de un solo
   uso al email.
 
-### A-43 🟡 PARA VER — Nodos IO lanzados desde el tenant raíz
+### A-43 ✅ RESUELTO (0.1.56) — Nodos IO lanzados desde el tenant raíz
 
-- **Qué pasa:** la instalación base levanta nodos IO en el tenant raíz: `IO.api@motherbee`,
-  `IO.wapp.default@motherbee`, y además `IO.blob` e `IO.cloud`, que son de sistema. Una persona que
-  llegue por uno de ellos queda temporal: desde 0.1.55 nadie se registra en el tenant raíz.
-- **Operador (2026-10-02):** *"este tema del IO lanzado por tenant raíz es algo que no está del
-  todo bien. Para verlo."*
-- **Efecto concreto desde 0.1.55:** `IO.api@motherbee` está en el tenant raíz, así que un sujeto
-  `by_data` que llega por ahí termina en `tenant_not_registrable` y queda temporal. Para registrar
-  personas por IO.api, a ese IO.api lo tiene que lanzar un tenant.
-- **Ya resuelto:** `io.slack` ya no tiene instancia de base (A-40).
-- **Falta decidir:** cuáles de los otros quedan como base y cuáles pasan a lanzarse por tenant.
+- **Qué pasaba:** la instalación base levantaba nodos IO de canal en el tenant raíz
+  (`IO.api@motherbee`, `IO.wapp.default@motherbee`). Una persona que llegaba por uno de ellos quedaba
+  temporal, porque desde 0.1.55 nadie se registra en el tenant raíz.
+- **Decisión del operador (2026-10-02):** *"algunos nodos IO tienen que correr con el tenant raíz,
+  ej io.cloud io.blob los demás no"*; *"todos quedan para poder usarlos pero no corriendo default.
+  Solo io.cloud y io.blob por ahora"*.
+- **Arreglo (`4a9249f`):**
+  - El SDK define `ROOT_TENANT_IO_RUNTIMES` (io.cloud, io.blob).
+  - El orchestrator rechaza cualquier otro nodo IO en el tenant raíz con `TENANT_ROOT_NOT_ALLOWED`
+    en los tres lugares donde lanza un nodo:
+    - `run_node`, que cubre admin, Cloud, Archi, firstboot y los reenvíos;
+    - start/restart;
+    - el relanzamiento al arrancar. Si un nodo ya corre, lo deja corriendo.
+  - io.api e io.wapp quedan horneados y sin instancia de base; firstboot solo levanta IO.cloud e
+    IO.blob.
+  - Archi nunca elige el tenant raíz para un nodo IO.
+  - Docs: `715143a`.
+- **PROD:** hay que purgar `IO.api@motherbee` e `IO.wapp.default@motherbee` antes del deploy de 0.1.56.
+  En 30 días no tuvieron uso y sus configs quedaron guardadas fuera del repo. La purga desde la
+  sesión la bloqueó el clasificador de permisos, así que queda para el operador.
+- **Queda para el operador:**
+  - El runbook de LinkedHelper de Noelia (`docs/onworking NOE/...`) lanza el nodo en el tenant raíz.
+  - `docs/io-web-spec-beta-v1.md` diseña `IO.web@motherbee` con `boot=true` en el tenant raíz.
 
-### A-44 🟡 PARCIAL (0.1.55) — Dos conexiones con un mismo UUID: la segunda se queda con la ruta
+### A-44 ✅ RESUELTO (0.1.55 + 0.1.56) — Dos conexiones con un mismo UUID: la segunda se queda con la ruta
 
 Visto al arreglar los e2e de A-37, leyendo `src/router/mod.rs` y `src/shm/mod.rs`.
 
-- **Abierto, pide decisión — el router:**
-  - Un HELLO con un UUID que ya tiene una conexión viva reemplaza su entrada en la tabla de nodos.
-    La conexión vieja sigue abierta.
-  - Cuando la nueva se cierra, el router borra la entrada del UUID, porque es la suya. La vieja
-    queda conectada pero sin ruta, y no tiene cómo enterarse.
-  - **Cuándo pasa:** un proceso que se conecta con el UUID persistido de otro que sigue vivo, como
-    los diags de identity con el frontdesk; o una reconexión antes de que el router limpie la
-    conexión vieja.
-  - **Opciones:** que el router cierre la conexión vieja cuando un HELLO nuevo toma su UUID, para
-    que ese nodo reconecte; o que rechace el HELLO nuevo mientras la vieja siga viva.
-- **Cerrado en 0.1.55 — la SHM del router:**
-  - **`register_node`:** tomaba el primer slot libre aunque el UUID ya tuviera uno más adelante,
-    así que un nodo que se registraba de nuevo quedaba dos veces. Ahora conserva su slot.
-  - **El lector:** leía los primeros `node_count` slots, pero dar de baja un nodo deja un hueco.
-    Con un hueco, el snapshot traía la entrada borrada y perdía el último nodo. Lo leen el
-    orchestrator (aviso `node disconnected`, espera de los nodos del sistema al arrancar) y los
-    routers vecinos del mismo hive. Ahora lee los nodos activos, estén donde estén.
-  - Los dos casos tienen test, y los dos fallan con el código anterior.
+- **Qué pasaba en el router:**
+  - Un HELLO con un UUID que ya tenía una conexión viva reemplazaba su entrada en la tabla de
+    nodos.
+  - Cuando la nueva se cerraba, la vieja quedaba conectada pero sin ruta.
+- **Decisión del operador (2026-10-02):** *"rechazar la nueva, no veo porque deba aparecer una en el
+  esquema normal"*.
+- **Lo que mostró verificarlo antes:**
+  - **Bug preexistente:** si una conexión terminaba por error (de lectura, un OPA_RELOAD
+    inválido, un reenvío a pares, `handle_message`), el router no la limpiaba. La entrada quedaba en
+    la tabla y el socket abierto: un nodo vivo seguía conectado sin que nadie leyera sus mensajes.
+    Con "rechazar la nueva" eso se volvía un bloqueo permanente.
+  - **Duplicados pasajeros en el esquema normal:**
+    - todo nodo Go manda dos HELLO al arrancar;
+    - un nodo puede reconectar antes de que el router procese el cierre de la conexión anterior.
+- **Arreglo (`068014d`, 0.1.56):**
+  - Toda conexión termina limpiando su entrada; un mensaje que no se puede procesar se loguea y se
+    saltea.
+  - Un HELLO con un UUID ocupado espera hasta 1 s a que la conexión anterior se vaya; si sigue viva,
+    se rechaza sin ANNOUNCE y con WARN. El chequeo y la inserción van bajo un mismo lock.
+  - El SDK loguea el handshake rechazado.
+  - El diag negativo de identity usa una conexión por nombre.
+  - Los e2e de identity corren con `timeout`: sus reintentos esperaban un error que ningún binario
+    imprime.
+  - Tres de los cuatro tests nuevos fallan con el código anterior.
+- **SHM del router (0.1.55):**
+  - `register_node` duplicaba a un nodo que se registraba de nuevo.
+  - El lector perdía el último nodo cuando había un hueco.
+- **Quedan anotados:**
+  - el doble HELLO del SDK de Go: lo absorbe la espera, pero el SDK podría reusar la primera
+    conexión;
+  - el SDK de Rust no tiene timeout de handshake: un router que acepta y no contesta lo deja
+    colgado.
 
-### A-45 🟡 PROPUESTA — Cada upgrade del motherbee apaga todo el core antes de desempaquetar
+### A-45 ✅ RESUELTO (0.1.56; se ve desde 0.1.57) — Cada upgrade del motherbee apaga todo el core antes de desempaquetar
 
 - **Qué pasa (medido en el deploy de 0.1.55):**
   - El `prerm` del paquete (`packaging/deb-prerm`) para todos los servicios del core antes de
@@ -652,6 +679,18 @@ Visto al arreglar los e2e de A-37, leyendo `src/router/mod.rs` y `src/shm/mod.rs
   `postinst` los reinicie después de desempaquetar. Linux mantiene corriendo el binario viejo
   hasta el reinicio, así que la caída quedaría en lo que tarda cada reinicio.
 - **A decidir:** el orden de los reinicios, y si los hace el `postinst` o el orchestrator.
+- **Operador (2026-10-02):** *"no me parece mal"*.
+- **Arreglo (`1a10cab`):**
+  - En un upgrade el `prerm` para solo a los que escriben el manifest de runtimes:
+    sy-orchestrator, sy-admin y sy-wf-rules. El `postinst` cuenta con eso al registrar los runtimes.
+  - El resto sigue sirviendo con los binarios viejos.
+  - El boot del orchestrator nuevo reinicia cada servicio que corre un binario reemplazado, en su
+    orden de arranque: rt-gateway primero y SY.vault último. Así ordenar los reinicios lo resuelve el
+    orchestrator, no un script.
+  - El resultado queda en `/versions` como `core.last_update`, con `via: package`.
+  - needrestart deja también rt-gateway y sy-* al orchestrator.
+  - dpkg corre el `prerm` del paquete viejo: el upgrade a 0.1.56 todavía para todo, y la mejora se
+    ve desde 0.1.57.
 
 ### A-19 ✅ RESUELTO (0.1.43) — La policy publicada esperaba hasta 60 s al watcher de Syncthing
 
@@ -752,13 +791,19 @@ Visto al arreglar los e2e de A-37, leyendo `src/router/mod.rs` y `src/shm/mod.rs
 - **Aceptado:** si se borra o se reconstruye un hive, se pierden sus rutas, taps y VPN (nadie
   guarda copia).
 
-### A-16 🔴 Los espejos receive-only acumulan cambios locales en silencio
+### A-16 ✅ RESUELTO (0.1.56) — Los espejos receive-only acumulan cambios locales en silencio
 
 - **Qué pasa:** en una carpeta receive-only, Syncthing no propaga ni revierte los cambios locales.
   Si algo toca el espejo en un spoke, diverge del motherbee para siempre y nadie se entera. El
   orquestador administra Syncthing pero no mira ni revierte estos cambios.
 - **A discutir:** que el orquestador revierta (`/rest/db/revert`) los cambios locales de las
   carpetas receive-only y lo loguee, para que el espejo converja solo al origen.
+- **Arreglo (`10c97b1`):**
+  - El watchdog, que ya leía el estado de cada carpeta en cada vuelta, lee también
+    `receiveOnlyTotalItems`.
+  - Si una carpeta receive-only tiene cambios locales, deja un WARN y la revierte.
+  - Cubre los espejos de `dist/` de los spokes y el `public/` de blob del ingress.
+  - El 2026-10-02 las 12 carpetas receive-only de PROD estaban en 0.
 
 ---
 
