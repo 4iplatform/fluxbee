@@ -704,7 +704,7 @@ Visto al arreglar los e2e de A-37, leyendo `src/router/mod.rs` y `src/shm/mod.rs
   - dpkg corre el `prerm` del paquete viejo: el upgrade a 0.1.56 todavía para todo, y la mejora se
     ve desde 0.1.57.
 
-### A-46 🔴 PARA DECIDIR — La API HTTP de Archi no tiene autenticación y se alcanza desde el ingress
+### A-46 🟡 DISEÑO ACORDADO (2026-10-05), panel DTAP pendiente — La API HTTP de Archi no tiene autenticación y se alcanza desde el ingress
 
 - **Qué pasa (verificado el 2026-10-03, en el relevamiento de nodos):**
   - El router axum de SY.architect (`sy_architect.rs`, `Router::new()`) no tiene ninguna capa de
@@ -722,7 +722,105 @@ Visto al arreglar los e2e de A-37, leyendo `src/router/mod.rs` y `src/shm/mod.rs
   - Inmediata: que Archi escuche en `127.0.0.1` (y se use por túnel), o un firewall que deje pasar
     el 3000 solo desde la red del operador.
   - De fondo: autenticación en la API, con el paquete de seguridad (A-22).
-- **Estado:** se informó al operador. No se tocó PROD.
+- **Ampliación (2026-10-05): por qué el 3000 se alcanzaba.** No es solo Archi:
+  - **Ningún hive filtra tráfico entrante.** `ufw` está inactivo en los 4. El input de la tabla
+    nft del egress está en `policy accept` ("hardening futuro").
+  - **Las reglas del orquestador son inertes.** `ensure_core_firewall_local` y la de Syncthing
+    hacen `ufw allow` (9000, 9100, 22000, 21027, desde cualquier origen) sobre un ufw apagado:
+    quedan guardadas sin efecto.
+    - Es una trampa: si alguien prende ufw, quedan bloqueados el SSH de todos los hosts y el 443
+      del ingress.
+    - Las reglas de core nunca se cierran.
+  - **Escuchan en interfaces externas:** el SSH y el Syncthing del ingress, también por `eth1`
+    (pública), y los del egress por la red de la oficina.
+  - **El admin también acepta cualquier dirección** (`admin.listen` / `JSR_ADMIN_LISTEN`) y
+    tampoco tiene auth HTTP.
+  - **Corregir el example no alcanza.** El postinst solo lo copia si `hive.yaml` no existe, así
+    que no arregla PROD ni DEV.
+- **Decidido con el operador (2026-10-05):**
+  - la postura del host (firewall nft por rol, binds, Syncthing) la declara, aplica y verifica el
+    orquestador;
+  - Archi y el admin, solo en loopback;
+  - lo único público es el 443 del ingress;
+  - desde afuera, Archi se usa vía Cloud → IO.cloud → IO.web, con una URL que entrega Cloud.
+- **Diseño y plan por etapas:** `docs/host-posture-and-exposure-spec-v1.md`. Etapa 1 = binds.
+- **Panel DTAP (2026-10-05):**
+  - Reprobó la revisión 1 en las 4 lentes: 75 findings, ninguno refutado (registro en
+    `docs/audits/2026-10-05-host-posture-dtap-panel.md`).
+  - La revisión 2 suma todo lo técnico.
+  - Quedan decisiones del operador: O1–O4 antes de las etapas 1–5, O5–O8 antes de la 6–7.
+- **Lo que queda abierto aunque se cierren las etapas 1–5:**
+  - la malla de control: cualquier orquestador, el ingress incluido, puede mandar SPAWN, KILL,
+    etc. (A-20, A-22);
+  - la etapa 7 reabre un camino a Archi con sesión: un ingress comprometido puede emitir y usar la
+    sesión (O5).
+- **Estado:** diseño acordado, revisión 2 escrita. No se tocó PROD.
+
+### A-47 🟡 DISEÑO ACORDADO (2026-10-05) — Syncthing usa la infraestructura pública y worker1 depende del discovery
+
+- **Qué pasa (verificado el 2026-10-05 en los 4 hosts de PROD):**
+  - Están prendidos `globalAnnounce`, `localAnnounce`, `relays`, `nat` y `crashReporting`, y el
+    orquestador nunca los configura.
+  - Cada hive anuncia su device ID y sus IPs a los servidores públicos de discovery, puede pasar
+    por relays públicos, intenta UPnP/NAT-PMP y manda crash reports.
+  - El discovery local sale por todas las interfaces: en el ingress por la pública, en el egress
+    por la red de la oficina.
+  - Escucha en todas las interfaces.
+- **La trampa:** motherbee ↔ worker1 están como `dynamic` de los dos lados, así que hoy
+  sincronizan solo porque el discovery los encuentra. Ingress y egress tienen fija la dirección
+  del motherbee.
+  - Causa: `add_hive` toma `syncthing_peer_address` como opcional, y sin dirección se escribe
+    `dynamic` (`sy_orchestrator.rs:7340`).
+  - Apagar el discovery sin arreglar esto corta dist, blob y policy a worker1.
+- **Decidido:**
+  - nada de infraestructura pública;
+  - escucha solo en la IP interna;
+  - el lado que disca siempre con dirección fija (los spokes discan al motherbee, como WAN e
+    identity);
+  - `add_hive` no crea peers sin dirección;
+  - el cambio va en dos pasos: primero las direcciones, verificando conexiones, y recién después
+    apagar el discovery.
+- **Diseño:** `docs/host-posture-and-exposure-spec-v1.md` §1.4 y §3.5 (etapas 2 y 3).
+  - El orden se hace cumplir en el código, así que saltear versiones no corta a nadie (panel T-1).
+  - Las direcciones se reconcilian en cada arranque, no solo en el join.
+  - El orquestador es el único dueño de las opciones.
+- **También encontrado:** `vendor/syncthing/config.xml` ya trae lo público apagado, pero solo lo
+  usa el camino de instalación dev. El `.deb` y los spokes corren los defaults de Syncthing.
+- **Estado:** diseño acordado. No se tocó PROD.
+
+### A-48 🟡 PARA ARREGLAR — `remove_hive` no revoca nada: el hive sacado sigue siendo un par válido
+
+- **Qué pasa (panel DTAP 2026-10-05, D-1, verificado):**
+  - `remove_hive_flow` (`sy_orchestrator.rs:10635`) borra `hives/<id>`.
+  - Desvincula el device de Syncthing solo si `info.yaml` tiene `syncthing_device_id`, y el del
+    egress nunca lo tiene (`:20989-20996`).
+  - No borra la clave HMAC de identity, que queda en `/var/lib/fluxbee/identity/keys`
+    (`src/mesh_hmac.rs:33`).
+  - No revoca el certificado de la malla: no hay CRL, y con `wan.authorized_hives` vacío el router
+    acepta a cualquier hive con certificado válido de la CA (`src/router/mod.rs:2853`).
+- **Impacto:** un hive sacado (o su disco) puede volver a conectarse a la malla y a identity. Hoy
+  el único freno sería el firewall, que no existe.
+- **Arreglo propuesto:** que `remove_hive`:
+  - revoque (o mantenga `authorized_hives` con los hives vivos);
+  - borre la clave HMAC;
+  - desvincule Syncthing en todos los roles.
+
+  Va como pista aparte del diseño de postura (§6 del doc).
+- **Estado:** registrado. No se tocó nada.
+
+### A-49 🟡 PARA ARREGLAR — El repo apt no está firmado (`[trusted=yes]`): quien se haga pasar por él es root en el motherbee
+
+- **Qué pasa (panel DTAP 2026-10-05, P-14, verificado):**
+  - El motherbee instala de `http://10.10.10.50:8900` con `[trusted=yes]`, porque el repo no está
+    firmado (HANDBOOK:419, :434; `docs/packaging-and-build.md:157`).
+  - La red 10.10.10.0/24 es plana: el ingress (DMZ) comparte segmento con el motherbee y con
+    fb-build.
+- **Impacto:** un ingress comprometido que se haga pasar por 10.10.10.50 sirve un `.deb` propio, y
+  el siguiente upgrade lo instala como root en el motherbee.
+- **Arreglo propuesto:**
+  - firmar el `Release` (`InRelease`) y sacar `[trusted=yes]` (el `.deb` no cambia);
+  - aparte, aislar el ingress (O4 del doc).
+- **Estado:** registrado. No se tocó nada.
 
 ### A-19 ✅ RESUELTO (0.1.43) — La policy publicada esperaba hasta 60 s al watcher de Syncthing
 
