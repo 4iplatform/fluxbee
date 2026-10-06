@@ -321,8 +321,9 @@ no remote commands.
 accounting report-only) changes what the approved D21 and D22 meant, so it must be marked proposed
 and approved explicitly. D25 and D27 are still open.
 
-**Disposition:** A5-1, P5-1 and T5-1 are in revision 8 (spec §8, "Round 5"). Every other finding goes
-into revision 9 before stage 4, followed by round 6.
+**Disposition:** A5-1, P5-1 and T5-1 are in revision 8. Every other finding is in revision 9 (spec §8,
+"Round 5", maps each one), with the operator's D25–D28 of 2026-10-06; A5-3 became D29, proposed.
+**Next:** round 6 on revision 9, before stage 4.
 
 | Finding | Severity | Verifier | Claim | Disposition |
 |---|---|---|---|---|
