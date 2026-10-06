@@ -21,6 +21,7 @@
 
 | Versión | Fecha (ART) | Commit | Alcance | Estado | Rollback |
 |---|---|---|---|---|---|
+| **0.1.57** | 2026-10-06 | `a703b89` | motherbee + spokes (core) | ✅ live | snap `pre-posture-0-1-57` (las 4 VMs) · `apt install fluxbee=0.1.56` |
 | **0.1.56** | 2026-10-03 | `715143a` | motherbee + spokes (core) | ✅ live | snap `pre-root-io-0-1-56` (las 4 VMs) · `apt install fluxbee=0.1.55` |
 | **0.1.55** | 2026-10-02 | `975fd34` | motherbee + spokes (core) | ✅ live | snap `pre-root-tenant-0-1-55` (las 4 VMs) · `apt install fluxbee=0.1.54` |
 | **0.1.54** | 2026-10-02 | `6aa4ee4` | motherbee + spokes (core) | ✅ live | snap `pre-gov-0-1-54` (las 4 VMs) · `apt install fluxbee=0.1.53` |
@@ -65,6 +66,64 @@
 > (`dpkg-scanpackages -m`) para rollback, pero su detalle vive en la bitácora, no acá.
 
 ---
+
+## 0.1.57 — Archi y el admin solo en loopback (etapa 1 de la postura), sin botón de apagado en el motherbee, logs sin colores
+
+- **Fecha:** 2026-10-06 (ART) · **Versión anterior:** 0.1.56 · **Commits:** `d0c957d`..`a703b89`
+  (FINDINGS A-31, A-45, A-46, A-48; bitácora `2026-10-06`; diseño
+  `docs/host-posture-and-exposure-spec-v1.md`, revisión 5).
+- **Alcance:** motherbee + los tres spokes (core-update).
+- **Qué cambió:**
+  - **Etapa 1 de la postura (A-46):**
+    - `architect.listen` pasa a `127.0.0.1:3000` en el example y en el config de dev;
+    - el postinst corre `fluxbee-migrate-config`, que mueve a loopback el `0.0.0.0:3000` que
+      traían los `hive.yaml` instalados;
+    - el orchestrator chequea cada ~60 s si Archi o el admin escuchan fuera de loopback, y deja
+      una alerta de drift `posture` por proceso;
+    - docs y firstboot apuntan a loopback más túnel SSH;
+    - guard de CI en cada push.
+  - **El motherbee rechaza `ADD_HIVE_FINALIZE` y `REMOVE_HIVE_CLEANUP`** (`FORBIDDEN`): eran un
+    botón de apagado que cualquier orquestador, incluido el del ingress, podía apretar (A-48,
+    adelantado; DTAP ronda 3).
+  - **A-31:** colores ANSI en los logs solo con terminal.
+  - **io.web en la lista de IO del core** (tenant raíz).
+  - **Se borró el laboratorio Docker** (no se usaba) y su quickstart del sitio. El sitio cambia
+    recién con el merge a `main`.
+- **Build:** 20 min (commit `a703b89`). **Publish:** 10 s, 57 paquetes. **Deploy:** 218 s con
+  `ops deploy`; snapshots `pre-posture-0-1-57` en las 4 VMs (se borró antes `pre-gov-0-1-54`).
+- **Verificación en vivo (validación de la etapa 1):**
+  - **Migración:** el `hive.yaml` del motherbee quedó en `listen: "127.0.0.1:3000"`, y el postinst
+    dejó su línea en el log de apt.
+  - **Listeners:** `ss` en el motherbee muestra 3000 (sy-architect) y 8080 (sy-admin) solo en
+    `127.0.0.1`.
+  - **Puertos:** `lab/posture-probe.sh 10.10.10.10 3000 8080 9000` desde worker1, ingress,
+    egress y fb-build dio `refused`, `refused`, `open` en los 4. En 0.1.56 era `open`, `refused`,
+    `open`: **el ingress ya no llega a Archi**.
+  - **Local:** en el motherbee, `curl 127.0.0.1:3000/` y `curl 127.0.0.1:8080/hives` dan 200.
+  - **Control positivo:** un listener falso llamado `sy-admin` en `10.10.10.10:39555` levantó la
+    alerta `loopback_service_exposed_sy-admin` a los 33 s. Es la única alerta `posture`: Archi
+    no dio ninguna después del deploy.
+  - **A-45 medido por primera vez.** Caída de cada servicio del motherbee en el upgrade:
+
+    | Servicio | 0.1.55 | 0.1.57 |
+    |---|---|---|
+    | rt-gateway | 70 s | 0 s |
+    | sy-vault | 78 s | 1 s |
+    | sy-storage | 84 s | 5 s |
+    | sy-identity | 86 s | 5 s |
+    | resto | — | 0 s |
+
+    Solo paran los que escriben el manifest: el orchestrator estuvo 44 s caído, y el admin hasta
+    el reinicio ordenado.
+  - **A-31:** cero códigos ANSI en los procesos nuevos de los 4 hosts. Antes del upgrade había
+    cientos por servicio en el motherbee. Las únicas líneas con color son los "SIGTERM received"
+    de los procesos viejos.
+  - **Los 4 hives en 0.1.57** (hash `9e13e6bf…`): el motherbee por dist, los spokes por hash
+    instalado. Health con 0 fallas, 0 denials y 0 srcdrops.
+  - **CI:** `rust-tests`, `posture-guards` (primera corrida) y `router-dispatcher-guards` en verde
+    en `a703b89`.
+- **Sin probar en vivo:** el rechazo de las acciones solo-spoke en el motherbee. Lo cubre su test
+  unitario: no hay forma limpia de mandarlas como si fuera el orquestador del ingress.
 
 ## 0.1.56 — una conexión por UUID, upgrades sin apagar el core, solo io.cloud e io.blob en el tenant raíz
 

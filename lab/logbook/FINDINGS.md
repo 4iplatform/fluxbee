@@ -371,6 +371,8 @@
   - El formateo masivo queda aparte; es decisión del operador.
 - **Verificado:** un diag con la salida a un pipe pasó de 48 secuencias ESC a 0, y sus niveles salen
   como ` WARN `.
+- **Validado en vivo (0.1.57, 2026-10-06):** cero códigos ANSI en los procesos nuevos de los 4
+  hosts. Antes del upgrade había cientos por servicio en el motherbee (rt-gateway: 564).
 
 
 ### A-32 ✅ RESUELTO (0.1.53) — Datos personales en logs y respuestas (frontdesk e identity)
@@ -673,7 +675,7 @@ Visto al arreglar los e2e de A-37, leyendo `src/router/mod.rs` y `src/shm/mod.rs
   - el SDK de Rust no tiene timeout de handshake: un router que acepta y no contesta lo deja
     colgado.
 
-### A-45 ✅ RESUELTO (0.1.56; se ve desde 0.1.57) — Cada upgrade del motherbee apaga todo el core antes de desempaquetar
+### A-45 ✅ RESUELTO Y MEDIDO (0.1.57) — Cada upgrade del motherbee apaga todo el core antes de desempaquetar
 
 - **Qué pasa (medido en el deploy de 0.1.55):**
   - El `prerm` del paquete (`packaging/deb-prerm`) para todos los servicios del core antes de
@@ -703,8 +705,19 @@ Visto al arreglar los e2e de A-37, leyendo `src/router/mod.rs` y `src/shm/mod.rs
   - needrestart deja también rt-gateway y sy-* al orchestrator.
   - dpkg corre el `prerm` del paquete viejo: el upgrade a 0.1.56 todavía para todo, y la mejora se
     ve desde 0.1.57.
+- **Medido en el upgrade a 0.1.57 (2026-10-06):**
 
-### A-46 🟡 DISEÑO ACORDADO (2026-10-05), panel DTAP pendiente — La API HTTP de Archi no tiene autenticación y se alcanza desde el ingress
+  | Servicio | 0.1.55 | 0.1.57 |
+  |---|---|---|
+  | rt-gateway | 70 s | 0 s (reinicio) |
+  | sy-vault | 78 s | 1 s |
+  | sy-storage | 84 s | 5 s |
+  | sy-identity | 86 s | 5 s |
+  | resto | — | 0 s |
+
+  Solo paran los que escriben el manifest: el orchestrator estuvo 44 s caído.
+
+### A-46 🟡 ETAPA 1 HECHA (0.1.57): el ingress ya no llega a Archi; el resto de la postura, en diseño — La API HTTP de Archi no tiene autenticación y se alcanza desde el ingress
 
 - **Qué pasa (verificado el 2026-10-03, en el relevamiento de nodos):**
   - El router axum de SY.architect (`sy_architect.rs`, `Router::new()`) no tiene ninguna capa de
@@ -764,7 +777,17 @@ Visto al arreglar los e2e de A-37, leyendo `src/router/mod.rs` y `src/shm/mod.rs
     etc. (A-20, A-22);
   - la etapa 7 reabre un camino a Archi con sesión: un ingress comprometido puede emitir y usar la
     sesión (O5).
-- **Estado:** diseño acordado, revisión 2 escrita. No se tocó PROD.
+- **Etapa 1 (0.1.57, 2026-10-06), validada en PROD:**
+  - Archi y el admin escuchan solo en `127.0.0.1`. El `hive.yaml` del motherbee se migró solo en
+    el upgrade (`fluxbee-migrate-config`).
+  - Desde worker1, ingress, egress y fb-build, el 3000 del motherbee pasó de `open` a `refused`.
+  - El orchestrator avisa si alguno vuelve a escuchar afuera. Lo probó un control positivo:
+    alerta a los 33 s.
+- **Estado:**
+  - Ronda 3 del panel hecha.
+  - El firewall (etapas 4–5) y Syncthing (etapas 2–3) siguen en diseño: revisión 6 y ronda 4
+    antes de construirlos (§8 del doc).
+  - El acceso desde Cloud (etapa 7) es de la fase Cloud.
 
 ### A-47 🟡 DISEÑO ACORDADO (2026-10-05) — Syncthing usa la infraestructura pública y worker1 depende del discovery
 
@@ -816,7 +839,17 @@ Visto al arreglar los e2e de A-37, leyendo `src/router/mod.rs` y `src/shm/mod.rs
   - desvincule Syncthing en todos los roles.
 
   Va como pista aparte del diseño de postura (§6 del doc).
-- **Estado:** registrado. No se tocó nada.
+- **Lo mismo, del lado del motherbee (DTAP ronda 3, D3-3/P3-3):**
+  - `REMOVE_HIVE_CLEANUP` y `ADD_HIVE_FINALIZE` mandados al motherbee eran un botón de apagado.
+  - La policy deja a cualquier orquestador mandarlos, incluido el del ingress.
+  - El primero para y deshabilita todo el core; el segundo reinicia el core y vincula a Syncthing
+    un dispositivo que elige quien lo manda.
+- **Estado:**
+  - **0.1.57: el motherbee rechaza las dos acciones** (`FORBIDDEN`, con el origen en el log;
+    cubierto por test unitario).
+  - El resto de A-48 (pin del certificado, vista del router, claves HMAC, host keys SSH) sigue en
+    diseño: la ronda 3 encontró que, tal como estaba escrito, cortaba a todos los hives
+    existentes (§8 del doc).
 
 ### A-49 🟡 PARA ARREGLAR — El repo apt no está firmado (`[trusted=yes]`): quien se haga pasar por él es root en el motherbee
 
