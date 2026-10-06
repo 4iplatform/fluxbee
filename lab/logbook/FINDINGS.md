@@ -911,7 +911,7 @@ Visto al arreglar los e2e de A-37, leyendo `src/router/mod.rs` y `src/shm/mod.rs
 - **Estado:** validado en 0.1.58 (2026-10-06): el primer round sacó a egress1 de `fluxbee-blob`, y
   la oferta pendiente desapareció del egress.
 
-### A-51 🟡 PARA ARREGLAR (paso propio después de la etapa 2) — root escribe en directorios del usuario `fluxbee` siguiendo nombres que ese usuario controla
+### A-51 🟡 ARREGLADO EN 0.1.60 EN EL MOTHERBEE (en los spokes, abierto hasta un manifiesto firmado) — root escribía en directorios del usuario `fluxbee` siguiendo nombres que ese usuario controla
 
 - **Qué pasa (revisión adversarial de la etapa 2, 2026-10-06):**
   - `ensure_owned_tree` deja todo `/var/lib/fluxbee/dist` del usuario de Syncthing (`fluxbee`), y
@@ -929,9 +929,31 @@ Visto al arreglar los e2e de A-37, leyendo `src/router/mod.rs` y `src/shm/mod.rs
   `O_EXCL` con nombre aleatorio, dueño y modo por descriptor, rename, fsync del directorio) para
   `write_file_atomic`, `copy_exec_file` y `ensure_owned_file`. Se hace en un paso propio, con su
   revisión, porque toca el camino de la actualización del core.
-- **Estado:** para arreglar después de validar la etapa 2.
+- **Arreglo (0.1.60, cuatro revisiones adversariales):**
+  - **Escritura:** temporal `O_EXCL` con un token por ejecución y prefijo `.syncthing.` (Syncthing
+    nunca lo envía), modo puesto sobre el descriptor, fsync del directorio con `O_NOFOLLOW`. Los
+    temporales de otra ejecución se barren al toque; los de esta, nunca.
+  - **Directorios administrados:** se abren `O_DIRECTORY|O_NOFOLLOW` y se les hace chmod/chown sobre
+    el descriptor. Lo que no es un directorio (un symlink o un archivo plantado) se deja como está y
+    se reporta como alerta de postura, sin tumbar el arranque.
+  - **`.stfolder`:** se crea exclusivo; un symlink en su lugar se reemplaza; una carpeta que es un
+    symlink no recibe marcador. El join del ingress ya no hace chmod de los directorios de blob.
+  - **Se borró** la copia (muerta) del Syncthing instalado hacia `dist/vendor`.
+  - **El `dist/` del motherbee es de root** (`root:<grupo de Syncthing>`, 0750, `g+rX,go-w`). Los
+    links adentro se borran sin seguirlos, en el preinst y en cada arranque; Syncthing solo lo lee
+    (en el motherbee es de solo envío). El operador: *"Si root PERO!!! cuidado que hay muchas
+    carpetas de syncthing, no todas pueden ser root"*: solo `dist/`; `blob/active` (envío y
+    recepción), `blob/public`, el home de Syncthing y el `dist/` de los spokes siguen de `fluxbee`.
+- **Lo que queda abierto:**
+  - **Los spokes instalan y corren lo que les entrega Syncthing** (core, vendor, runtimes). Quien
+    tenga el usuario de Syncthing del motherbee (su `key.pem`) llega a root en todos los spokes. El
+    arreglo es un manifiesto firmado con una llave de root que verifica el root de cada spoke.
+  - **Root escribe por ruta en el `blob/` del usuario de Syncthing** del motherbee: A-56.
+  - **Un re-join** instala con `install -m` dentro del `dist/` del spoke por nombre (una carrera en
+    una caja usada); misma clase que el primer punto.
+- **Estado:** en 0.1.60.
 
-### A-52 🟡 PARA ARREGLAR — `add_hive` sobre un clon recién creado choca con el `dist-upgrade` de cloud-init
+### A-52 🟡 ARREGLADO EN 0.1.60 (lo valida el próximo join) — `add_hive` sobre un clon recién creado choca con el `dist-upgrade` de cloud-init
 
 - **Qué pasó (2026-10-06, join de `worker2` en 8.x):** el primer join falló con `CONFIG_FAILED`
   ("identity HMAC key distribution failed … port 22: Connection refused").
@@ -947,7 +969,15 @@ Visto al arreglar los e2e de A-37, leyendo `src/router/mod.rs` y `src/shm/mod.rs
 - **Arreglo propuesto:** que el bootstrap del join se proteja solo y espere a cloud-init
   (`cloud-init status --wait`, acotado) y al lock de dpkg antes de empezar: el orquestador es el
   dueño del entorno del host. Mientras tanto vale la receta del HANDBOOK §3.4.
-- **Estado:** para arreglar; el gate de la etapa 2 ya asienta la VM antes de unirla.
+- **Arreglo (0.1.60):** apenas verifica la llave sembrada, y antes de instalar el sudoers, el join
+  espera mientras systemd no terminó de arrancar (`is-system-running` en `starting`,
+  `initializing` o `stopping`; cubre el hueco entre dos etapas de cloud-init) o mientras una etapa
+  de cloud-init o un job diario de apt (unattended-upgrades) está `activating`. No usa
+  `cloud-init status`, que dice "error" mientras siguen etapas y "not started" para siempre si
+  cloud-init no corre. Hasta 15 min en total, reintentando si la caja se reinicia; el join muestra
+  la fase `waiting_for_host`. Si sigue ocupada: `HOST_NOT_SETTLED` (reintentable, la llave queda,
+  503); si el chequeo mismo falla: `HOST_SETTLE_CHECK_FAILED` (502).
+- **Estado:** en 0.1.60; lo valida el próximo join en la VM 104.
 
 ### A-53 🟡 ARREGLADO EN 0.1.58 (lo ejercita el próximo join) — `local_syncthing_device_id` siempre fallaba con Syncthing v2 y caía al primer device de `config.xml`
 
@@ -963,6 +993,31 @@ Visto al arreglar los e2e de A-37, leyendo `src/router/mod.rs` y `src/shm/mod.rs
 - **Arreglo (etapa 2):** el subcomando `device-id`, solo si existe `cert.pem` (sin certificado el
   binario generaría uno como root); si no, el `myID` del Syncthing en marcha. Nunca `config.xml`.
 - **Estado:** construido; lo ejercita el próximo join (el de A-48).
+
+### A-56 🟡 PARA ARREGLAR — Root escribe por ruta en el `blob/` del usuario de Syncthing
+
+- **Qué pasa (tercera revisión adversarial de A-51, 2026-10-06; verificado paso a paso en el código,
+  no ejecutado de punta a punta):** en el motherbee, `blob/` y `blob/staging` son del usuario de
+  Syncthing, y procesos root escriben ahí por ruta: el SDK de blobs (`fs::write`, chmod por ruta,
+  `ensure_dir_mode_0750`) desde io.blob, los nodos IO y AI y sy_architect.
+  - El nombre en staging es predecible (`staging/<hash16[..2]>/<nombre>_<hash16>.<ext>`). Ese usuario
+    puede plantar un symlink ahí y root escribe bytes de un tercero (por ejemplo, un adjunto
+    entrante) donde apunte.
+  - io.blob hace chmod 0750 de un `blob/public` plantado en cada arranque.
+- **Arreglo propuesto:** `blob/` y `blob/staging` de root (staging no es carpeta de Syncthing y
+  `blob/` solo necesita ser atravesable), y la misma primitiva de A-51 en el SDK y en io.blob.
+- **Estado:** para arreglar en un paso propio (toca el SDK y el workspace de IO).
+
+### A-57 🟡 PARA ARREGLAR — `update category=vendor` instala el Syncthing nuevo pero no lo reinicia, y responde que sí
+
+- **Qué pasa (verificado en el código el 2026-10-06):** el update de vendor llama a
+  `ensure_blob_sync_runtime`, que reinstala el binario si cambió el hash y después hace
+  `systemctl start`, que no hace nada si el servicio ya corre. El Syncthing en marcha sigue con el
+  binario viejo hasta el próximo reinicio, y la respuesta dice
+  `restarted: [fluxbee-syncthing]` igual.
+- **Arreglo propuesto:** si se instaló un binario nuevo, reiniciar el servicio y reportar lo que
+  pasó de verdad (`updated`, `restarted`).
+- **Estado:** para arreglar; existía antes de la postura.
 
 ### A-54 🟡 PARA ARREGLAR (0.1.61) — El motherbee usaba SSH fuera de `add_hive`
 
