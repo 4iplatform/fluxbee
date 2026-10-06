@@ -23,8 +23,9 @@ if [ "$(grep -c . <<<"$calls")" -ne 1 ]; then
   fail=1
 fi
 
-# No other write of config.xml, whatever the call or the variable.
-hits=$(grep -nE '(fs::write|File::create|write_file_atomic|fs::copy|OpenOptions)' <<<"$prod" \
+# No other write of config.xml on a line that names it. A grep cannot see a write through another
+# variable name or a multi-line builder chain; review covers those.
+hits=$(grep -nE '(fs::write|fs::rename|File::create|write_file_atomic|fs::copy|OpenOptions)' <<<"$prod" \
   | grep -E 'config_path|config\.xml' || true)
 if [ -n "$hits" ]; then
   echo "syncthing single-writer guard: config.xml written outside update_syncthing_config:"
