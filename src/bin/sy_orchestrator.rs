@@ -2433,16 +2433,7 @@ async fn watchdog_tick(state: &OrchestratorState) {
                     )]);
                 }
             }
-            Err(err) => {
-                tracing::debug!(error = %err, "syncthing peer reconcile failed");
-                // Digits masked: a timeout's milliseconds must not make the same failure new.
-                let text: String = err
-                    .to_string()
-                    .chars()
-                    .map(|c| if c.is_ascii_digit() { '#' } else { c })
-                    .collect();
-                report_syncthing_reconcile(&[format!("failed, retrying next round: {text}")]);
-            }
+            Err(err) => report_syncthing_reconcile_failure(&err.to_string()),
         }
     }
 
@@ -7361,18 +7352,24 @@ fn syncthing_tcp_address_for_host(host: &str) -> Result<String, OrchestratorErro
     ))
 }
 
-/// This hive's Syncthing device id. From the binary when the certificate is there (Syncthing v2
-/// has a `device-id` subcommand; v1's `--device-id` flag is gone, so that call always failed),
+/// This hive's Syncthing device id. From the binary when its key pair is there (Syncthing v2 has a
+/// `device-id` subcommand; v1's `--device-id` flag is gone, so that call always failed),
 /// otherwise from the running Syncthing. Never from config.xml's first device: Syncthing sorts
 /// folder members by id, so that can be a peer, and a join would then hand a spoke the wrong
 /// "motherbee".
 fn local_syncthing_device_id(sync: &BlobRuntimeConfig) -> Result<String, OrchestratorError> {
-    // Without a certificate the binary would generate one, as root, in the Syncthing user's
-    // directory.
-    if sync.sync_data_dir.join("cert.pem").is_file() {
+    // The binary reads cert.pem and key.pem as root from the Syncthing user's directory: both
+    // must be regular files, not symlinks, and the call is bounded, since a FIFO planted there
+    // would block it.
+    let regular = |name: &str| {
+        fs::symlink_metadata(sync.sync_data_dir.join(name)).is_ok_and(|m| m.file_type().is_file())
+    };
+    if regular("cert.pem") && regular("key.pem") {
         let home = sync.sync_data_dir.display().to_string();
-        let mut cmd = Command::new(SYNCTHING_INSTALL_PATH);
-        cmd.arg("--home")
+        let mut cmd = Command::new("timeout");
+        cmd.arg("5")
+            .arg(SYNCTHING_INSTALL_PATH)
+            .arg("--home")
             .arg(&sync.sync_data_dir)
             .arg("device-id")
             .env("HOME", &home)
@@ -7544,8 +7541,8 @@ fn ensure_isolated_syncthing_folder_in_config_xml(
         );
     }
 
-    // A public folder must start with only this device. Cloning active/dist as a
-    // template would inherit their peers and accidentally share public bytes.
+    // A new folder starts with no member: cloning active/dist as a template would inherit
+    // their peers and share their bytes.
     let new_block =
         minimal_syncthing_folder_block(folder_id, folder_path, folder_label, folder_type);
     let insert_at = config_xml
@@ -8385,10 +8382,11 @@ struct RegistrySnapshot {
 }
 
 /// A registry entry at rest: `status: connected`, and its join record, when there is one, says
-/// `done`. The flows rewrite the entry without that record while they hold the topology lock, and
-/// the tail records the result under the same lock. Between the two a failing join can read as
-/// `connected`; the reconcile then treats it as a connected hive, and the backfill cannot overwrite
-/// the result the tail writes. A record left at another phase keeps the hive out.
+/// `done`. A record left at another phase keeps the hive out. The flows rewrite the entry without
+/// that record while they run, so a failing join can read as `connected` until its tail records
+/// the result; the reconcile then only does what it does for a connected hive, and the device-id
+/// backfill, the one write that could race the tail, waits for an explicit `done`
+/// (`record_syncthing_device_id`).
 fn hive_entry_at_rest(info: &serde_json::Value) -> bool {
     let connected = info.get("status").and_then(|v| v.as_str()) == Some("connected");
     let phase = info.get("join").and_then(|join| join.get("phase"));
@@ -8656,7 +8654,9 @@ fn apply_motherbee_peer_plan_xml(
 }
 
 /// Records the Syncthing device id in a connected registry entry that records none. Skipped
-/// while a join or a removal holds that hive; the next round retries.
+/// while a join or a removal holds that hive, and until the entry's join record says `done`: a
+/// join's tail writes its result without the topology lock, and this read-modify-write must not
+/// interleave with it. The next round retries.
 fn record_syncthing_device_id(
     state: &OrchestratorState,
     root: &Path,
@@ -8673,7 +8673,12 @@ fn record_syncthing_device_id(
         return;
     };
     // An invalid recorded value counts as none, as it does in the snapshot.
-    if !hive_entry_at_rest(&info) || recorded_syncthing_device_id(&info).is_some() {
+    let join_done = info
+        .get("join")
+        .and_then(|join| join.get("phase"))
+        .and_then(|v| v.as_str())
+        == Some("done");
+    if !hive_entry_at_rest(&info) || !join_done || recorded_syncthing_device_id(&info).is_some() {
         return;
     }
     let Some(obj) = info.as_object_mut() else {
@@ -8743,10 +8748,25 @@ fn report_syncthing_reconcile(notes: &[String]) {
     notes.sort();
     notes.dedup();
     let report = notes.join("; ");
+    log_syncthing_reconcile_report(&report, &report);
+}
+
+fn report_syncthing_reconcile_failure(error: &str) {
+    let report = format!("failed, retrying next round: {error}");
+    // Compared without digits: a timeout's milliseconds must not make the same failure new.
+    let key: String = report
+        .chars()
+        .map(|c| if c.is_ascii_digit() { '#' } else { c })
+        .collect();
+    log_syncthing_reconcile_report(&report, &key);
+}
+
+/// Logs `report` unless the last one had the same `key`.
+fn log_syncthing_reconcile_report(report: &str, key: &str) {
     let mut last = SYNCTHING_RECONCILE_REPORT
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    if *last == report {
+    if *last == key {
         return;
     }
     if report.is_empty() {
@@ -8754,7 +8774,7 @@ fn report_syncthing_reconcile(notes: &[String]) {
     } else {
         tracing::warn!(report = %report, "syncthing peer reconcile");
     }
-    *last = report;
+    *last = key.to_string();
 }
 
 /// A topology operation longer than this is reported: a hung join would otherwise keep the
@@ -8818,6 +8838,10 @@ async fn reconcile_syncthing_peer_addresses(
     let config_path = sync.sync_data_dir.join("config.xml");
     if !config_path.exists() {
         return Ok(Some(Vec::new()));
+    }
+    // A join restarts Syncthing itself; asking it for its id then would only report a failure.
+    if state.is_motherbee && state.any_hive_topology_busy() {
+        return Ok(None);
     }
     let marker = syncthing_restart_pending_marker();
     // Blocking work (one REST call, the registry, the config write), off the async workers. The
@@ -9212,7 +9236,8 @@ fn reconcile_syncthing_folders_xml(
     Ok((updated, changed_folders))
 }
 
-/// The devices a folder is shared with (this device included), in document order.
+/// The devices a folder lists, in document order (the local device too, when config.xml lists it:
+/// a folder created by Fluxbee starts with no member).
 fn syncthing_folder_device_ids(
     config_xml: &str,
     folder_id: &str,
@@ -20349,23 +20374,18 @@ async fn run_background_join(state: &Arc<OrchestratorState>, params: JoinParams)
         local_core_manifest_hash().ok().flatten(),
     );
 
-    // The flow itself sets `connected` on success; only stamp the terminal join record. Under the
-    // hive's topology lock: the Syncthing reconcile's device-id backfill rewrites this entry under
-    // the same lock, and interleaved with this write it could put `connected` back over `failed`.
-    {
-        let _topology_guard = state.lock_hive_topology(&hive_id).await;
-        let status = if ok {
-            hive_status(&hives_root(), &hive_id).unwrap_or_else(|| "connected".to_string())
-        } else {
-            "failed".to_string()
-        };
-        update_join_state(&hive_id, &status, "done", |info| {
-            info["join"]["finished_at_ms"] = serde_json::json!(now_epoch_ms().to_string());
-            info["join"]["error_code"] = serde_json::json!(error_code);
-            info["join"]["error_detail"] = serde_json::json!(error_detail);
-            info["join"]["result"] = result.clone();
-        });
-    }
+    // The flow itself sets `connected` on success; only stamp the terminal join record.
+    let status = if ok {
+        hive_status(&hives_root(), &hive_id).unwrap_or_else(|| "connected".to_string())
+    } else {
+        "failed".to_string()
+    };
+    update_join_state(&hive_id, &status, "done", |info| {
+        info["join"]["finished_at_ms"] = serde_json::json!(now_epoch_ms().to_string());
+        info["join"]["error_code"] = serde_json::json!(error_code);
+        info["join"]["error_detail"] = serde_json::json!(error_detail);
+        info["join"]["result"] = result.clone();
+    });
 
     if ok {
         tracing::info!(hive_id = %hive_id, "background join finished OK");
@@ -27401,13 +27421,21 @@ mod tests {
     /// One hand-edited id must not stop the round: it is reported, and the rest is reconciled.
     #[test]
     fn a_device_with_an_invalid_id_is_left_alone() {
-        let config = stage2_motherbee_config().replace(
-            "    <gui enabled",
-            &format!(
-                "{}    <gui enabled",
-                stage2_device("not-a-valid-id", "stray", "dynamic")
-            ),
-        );
+        let config = stage2_motherbee_config()
+            .replace(
+                "    <gui enabled",
+                &format!(
+                    "{}    <gui enabled",
+                    stage2_device("not-a-valid-id", "stray", "dynamic")
+                ),
+            )
+            .replace(
+                &stage2_member(ST_OLDHIVE),
+                &format!(
+                    "{}        <device id=\"not-a-valid-id\" introducedBy=\"\"/>\n",
+                    stage2_member(ST_OLDHIVE)
+                ),
+            );
         let plan = stage2_plan(&config, &stage2_recorded_registry(), false);
         assert!(plan
             .notes
@@ -27736,6 +27764,23 @@ mod tests {
             fs::symlink_metadata(&planted).is_err(),
             "the planted temp was swept"
         );
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Hard-link backups must not break Syncthing management: only the writer refuses a
+    /// hard-linked config.xml.
+    #[test]
+    fn only_the_writer_refuses_a_hard_linked_config() {
+        let dir = stage2_writer_dir("hardlink");
+        let path = dir.join("config.xml");
+        fs::write(
+            &path,
+            "<configuration><gui><apikey>k</apikey></gui></configuration>\n",
+        )
+        .unwrap();
+        fs::hard_link(&path, dir.join("backup.xml")).unwrap();
+        assert!(read_syncthing_config(&path, false).is_ok());
+        assert!(read_syncthing_config(&path, true).is_err());
         fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -28251,10 +28296,13 @@ blob:
             if is_motherbee {
                 // Created with no member (Syncthing adds the local device itself); the peer that
                 // never had runtimes does not get it.
+                assert!(updated.contains(&format!(
+                    "<folder id=\"{SYNCTHING_FOLDER_DIST_RUNTIMES_ID}\""
+                )));
                 assert!(
-                    !syncthing_folder_device_ids(&updated, SYNCTHING_FOLDER_DIST_RUNTIMES_ID)
+                    syncthing_folder_device_ids(&updated, SYNCTHING_FOLDER_DIST_RUNTIMES_ID)
                         .unwrap()
-                        .contains(&PEER_DEVICE_ID.to_string())
+                        .is_empty()
                 );
             }
             let (again, changed_again) =
