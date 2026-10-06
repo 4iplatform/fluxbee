@@ -7629,6 +7629,9 @@ fn error_code_to_http_status(error_code: &str) -> u16 {
         // Worker orchestrator is online but a socket op failed transiently
         // (add_hive did not fall back to SSH); the client should retry.
         "WORKER_SOCKET_UNREACHABLE" => 503,
+        // A join found the box still settling (cloud-init or apt's daily jobs still running after
+        // the wait): retry once it has (A-52).
+        "HOST_NOT_SETTLED" => 503,
         "INVALID_REQUEST" | "INVALID_ADDRESS" | "INVALID_ARCHIVE" | "INVALID_HIVE_ID"
         | "INVALID_ZIP" | "INVALID_KEY_FORMAT" | "INVALID_VALUE" => 400,
         "UNAUTHORIZED" | "SYSTEM_ILK_PROTECTED" => 403,
@@ -7687,7 +7690,9 @@ fn error_code_to_http_status(error_code: &str) -> u16 {
         | "RESTART_FAILED"
         | "STORAGE_ERROR"
         | "ENCRYPTION_ERROR"
-        | "TRANSPORT_ERROR" => 502,
+        | "TRANSPORT_ERROR"
+        // add_hive could not check whether the box had settled (A-52); not about settling.
+        | "HOST_SETTLE_CHECK_FAILED" => 502,
         "SHM_NOT_FOUND"
         | "RUNTIME_MANIFEST_MISSING"
         | "MISSING_WAN_LISTEN"
