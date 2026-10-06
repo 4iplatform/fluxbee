@@ -1,8 +1,8 @@
-# Host posture and exposure — design v1 (revision 6)
+# Host posture and exposure — design v1 (revision 7)
 
 **Status:** design agreed with the operator on 2026-10-05. Stage 1 is live (0.1.57, validated on 8.x).
-Revision 6 folds round 3 into stages 2–5, A-48 and A-49. They go through DTAP round 4 before any
-of them is built.
+Revision 7 folds DTAP round 4 in. Stage 2 can be built. Stages 4–5, A-48 and A-49 go through
+round 5 first.
 
 **History:**
 
@@ -14,6 +14,7 @@ of them is built.
 | 4 | Part A of revision 3 failed a second panel (84 findings). Most came from per-hive IP filtering and from the machinery added to steer spokes. Revision 4 **simplifies Part A**: rules by port and interface per role, an automatic mode, no configuration. |
 | 5 | A third panel on Part A of revision 4 found 64 issues. Its 6 blockers are all in stages 4–5 and A-48; stage 1 needed only details. Stage 1 is built (§3.4 as built), with the A-48 guard against the spoke-only actions moved into it. The Docker lab is removed (D23). §8 lists what round 3 requires before stages 2–5, A-48 and A-49. |
 | 6 | Round 3's findings folded into stages 2–5, A-48 and A-49 (see §8). The main changes: evidence counts only what a drop would break, i.e. packets to a port that has a listener, plus SSH logins through non-internal interfaces; the mode is a persisted pure function; ICMP errors come before conntrack (PMTU); A-48 admits unpinned pre-existing hives; each host installs its own nftables; `remove_hive` and downgrades keep the last ruleset. |
+| 7 | Round 4 (68 findings; Acceptance passed) folded in (§8). The main changes: the switch is gated only by SSH logins through non-internal interfaces plus preconditions, with packet accounting report-only (D28); the render hash is mode-independent; sshd ports come from socket activation too; DHCP and ICMPv6 RA/MLD are allowed; the egress input chain is dropped from the render, never deleted; the remove cleanup runs outside the orchestrator; A-48 pins new joins before they dial, admits only legacy hives unpinned, and spokes check that their uplink is the motherbee; A-49 never replaces a key. |
 
 Every finding and where it went: `docs/audits/2026-10-05-host-posture-dtap-panel.md`.
 
@@ -70,7 +71,8 @@ or later from Fluxbee Cloud through IO.web (Part B).
 **What this does not fix (stated so nobody assumes it does):**
 
 - **Mesh control plane.** Any orchestrator, the DMZ ingress included, can still send SPAWN, KILL,
-  NODE_CONFIG_SET and SYSTEM_CORE_ROLLBACK to any hive (A-20, A-22).
+  NODE_CONFIG_SET and SYSTEM_CORE_ROLLBACK to the motherbee; spoke-to-spoke SYSTEM is denied
+  (A-20, A-22).
 - **Flat internal network.** The ingress, the motherbee, the workers, fb-build and the hypervisor
   gateway (10.10.10.1) share one L2.
   - Any host on it can reach the motherbee's mesh ports and SSH.
@@ -94,6 +96,17 @@ or later from Fluxbee Cloud through IO.web (Part B).
   A-49 stops impersonation of the repo, not a compromise of fb-build.
 - **The PROD motherbee accepts password SSH** for `fluxops` (cloud-init's `50-` file wins over
   `60-`). The posture reports it; the fix is A-2.
+- **Every release that changes the render** puts every host back into observe for at least 24 h at
+  once. In that window the ingress' public SSH and the egress' office SSH are open again.
+- **Hives joined before A-48** stay unpinned and admit any CA-valid leaf of their `hive_id` until
+  they are re-added once.
+- **A downgrade below A-48** brings back a router that ignores the view: every removed hive whose
+  leaf is still CA-valid is admitted again.
+- **D26's frozen ruleset** is harmless only while ports and interface names stay the same. A
+  renamed NIC on a downgraded host loses SSH on its internal interface.
+- **D27** keeps SSH closed only on a host that was enforcing when it was removed.
+- **After A-49,** the first install trusts the key on first use, and `InRelease` has no
+  `Valid-Until`, so a freeze attack goes unnoticed.
 - **Stage 7.** It adds a session-gated path to Archi through the edge. How much a compromised
   ingress can do with it is decision O5.
 
@@ -344,6 +357,7 @@ configured address (schema example `0.0.0.0:19091`), and Cloud and its adapter r
 | D25 *(rev 6, proposed)* | The ufw/firewalld writes into an inactive firewall are removed (the inert code of the approved stage 4). Where ufw is active or firewalld is running, the orchestrator still opens the role's declared ports there, so a customer host with its own firewall keeps working with no configuration. |
 | D26 *(rev 6, proposed)* | No automatic teardown on downgrade or rollback: the host keeps its last ruleset, which is harmless without per-hive sets, and break-glass is the escape. Only package remove/purge tears down. |
 | D27 *(rev 6, proposed)* | `remove_hive` does not tear the posture down, so a removed ingress or egress does not reopen SSH on its external interface. Repurposing a box is one documented command. |
+| D28 *(rev 7)* | Under D3 enforce can only cut three things: SSH through non-internal interfaces, undeclared listeners (cut on purpose, and reported) and special UDP/ICMP (allowed explicitly). So the automatic switch is gated by SSH logins through non-internal interfaces plus preconditions, and packet accounting is report-only. Nothing an attacker or a scanner sends can hold a host in observe. |
 
 ### 2.2 Open — the operator decides
 
@@ -365,8 +379,8 @@ Before stages 6–7 (the Cloud phase):
 
 ### 3.1 One declaration per role
 
-One pure function computes the posture from the host's own role, configuration, interfaces and
-listeners. No registry entry and no other hive is an input. From it the orchestrator renders:
+One pure function computes the posture from the host's own role, configuration and interfaces. No
+registry entry and no other hive is an input. From it the orchestrator renders:
 
 - the nftables ruleset;
 - the expected TCP listeners;
@@ -379,19 +393,37 @@ Unit tests pin that every allow has a listener and every listener has an allow.
 - **The role.**
 - **The motherbee's ports from config:** the `wan.listen` port and `identity.sync.port`.
 - **On the ingress:** the edge port from `edge.listen`. A non-443 or plaintext edge is reported.
-- **sshd ports:** those `sshd -T` reports, plus any port held by sshd or `ssh.socket` (seen with
-  `ss`). The fallback is 22, and the list is never empty. On the PROD motherbee `sshd -T` fails,
-  because `/run/sshd` exists only once a connection arrives; the `ss` source covers that case.
+- **sshd ports**, from all of these:
+  - `sshd -T`, run after `install -d -m0755 /run/sshd` (what `ssh.service`'s RuntimeDirectory
+    does). On a socket-activated host with no connection since boot, `sshd -T` otherwise fails;
+    it does on the PROD motherbee today.
+  - `systemctl show -p Listen --value ssh.socket`, when `ssh.socket` is active;
+  - sshd-owned lines in `ss`.
+
+  A `systemd`-owned listener on one of those ports is sshd (socket activation). If no source
+  answers, that is a derivation failure: the host does not switch to enforce. It never assumes 22.
 - **The internal interface:**
   - **motherbee:** every interface (deployment model). A public address on it is reported as a
     warning.
-  - **every spoke** (worker, ingress, egress): the interface of the route to the motherbee's
-    uplink IP. It is derived once the uplink is connected, from the WAN session's local address.
-    On the egress, a result that differs from `lan_iface` is reported.
-  - **if the derivation fails,** the applied ruleset and mode stay as they are and the failure is
-    reported. A failure never reopens a host.
-- **Closed lists in code:** the core IO listeners (none in the core phase; IO.web joins at stage
-  7) and the node listeners (none; io.linkedhelper stays out, D18).
+  - **every spoke** (worker, ingress, egress): the interface that carries the established WAN
+    session to the motherbee. It is read from the session's local address
+    (`ss -Htn state established '( dport = :<wan port> )'` mapped with `ip -o addr`). On the
+    egress, a result that differs from `lan_iface` is reported.
+  - **If the derivation fails** (no uplink session yet, an unknown address), the applied ruleset
+    and mode stay as they are and the failure is reported. A failure never reopens a host.
+- **Closed lists in code:** the core IO listeners (none in the core phase; IO.web joins at stage 7)
+  and the node listeners (none; io.linkedhelper stays out, D18).
+
+**The render hash** covers a canonical, mode-independent declaration:
+
+- the role;
+- the internal interface name (spokes);
+- the sshd ports;
+- the wan, identity and edge ports;
+- a rules-template version constant.
+
+It never covers the policy, the INVALID verdict, set elements, live listeners, the interface list
+or build strings. Switching observe → enforce therefore never changes the hash.
 
 ### 3.2 Inbound rules
 
@@ -400,13 +432,16 @@ The order of the render matters:
 1. `iif lo` accept.
 2. ICMP and ICMPv6 errors by type, whatever the conntrack state: destination-unreachable
    (including frag-needed), packet-too-big, time-exceeded, parameter-problem. The edge port is
-   untracked, so the Path MTU errors about its connections are INVALID to conntrack, and dropping
-   them would break PMTU discovery on the public port.
-3. ICMPv6 neighbor discovery; ICMP and ICMPv6 echo, rate-limited.
-4. `ct state established,related` accept.
-5. `ct state invalid`: counted; dropped in enforce, nothing more in observe.
-6. The role's allows (table below).
-7. The accounting rule (§3.3), then the chain policy: `drop` in enforce, `accept` in observe.
+   untracked, so the Path MTU errors about its connections are INVALID to conntrack.
+3. ICMPv6 neighbor discovery, router advertisements and multicast listener queries; ICMP and ICMPv6
+   echo, rate-limited.
+4. DHCP client replies: udp 67 → 68, and udp 547 → 546 from `fe80::/10`. DHCPv4 OFFER/ACK arrive
+   on packet sockets anyway, but renewals and DHCPv6 replies do not.
+5. `ct state established,related` accept.
+6. `ct state invalid`: one counter; dropped in enforce, nothing more in observe.
+7. The role's allows (table below).
+8. A report-only counter and rate-limited `log` (prefix `fluxbee-posture: `), then the chain
+   policy: `drop` in enforce, `accept` in observe.
 
 | Role | Accepted | On |
 |---|---|---|
@@ -419,15 +454,20 @@ The order of the render matters:
 listens on loopback (§3.5).
 
 **The edge port runs untracked.** Raw `notrack` on prerouting for packets to the edge port, and on
-output for packets from it. The ingress' own dials use ephemeral ports and stay tracked. A
-connection flood on the public port cannot fill conntrack.
+output for packets from it. The ingress' own dials use ephemeral ports and stay tracked.
 
 **Outbound is not filtered** (D19).
 
-**Why there are no per-hive sources (D3).** The mesh ports are authenticated, and the DMZ ingress
-must reach them anyway. Removed hives are kept out by A-48, at the protocol layer.
+**What enforce can break, and how each is covered.** Under D3, internal interfaces have no source
+restrictions, so every declared listener is accepted there. Enforce can only cut:
 
-**SSH (D16).** Accepted only on internal interfaces, with no configuration.
+1. **SSH through a non-internal interface** (D16). Covered by the SSH-login evidence (§3.3), which
+   holds the host in observe while that path is used.
+2. **Undeclared listeners.** They are closed on purpose ("lo demás tiene que estar cerrado", D18).
+   The listener check reports them before and after.
+3. **Special UDP and ICMP.** Covered by the explicit allows above.
+
+So no packet accounting gates the switch. The counter and log in step 8 are for the report only.
 
 **Evidence from PROD.** In the journal since August:
 
@@ -435,65 +475,72 @@ must reach them anyway. Removed hives are kept out by A-48, at the protocol laye
 - the only SSH logins on the spokes came from the motherbee (10.10.10.10), over eth0;
 - none came in through the egress' office address or the ingress' public one.
 
-So D16 cuts nothing in use. The PROD path for an Archi tunnel is a jump through a host on the
-internal LAN that the posture does not filter (fb-build or the Proxmox host).
+The PROD path for an Archi tunnel is a jump through a host on the internal LAN that the posture
+does not filter (fb-build or the Proxmox host).
 
 ### 3.3 Modes, evidence, apply
 
-**The mode is a pure function, unit-tested with an injected clock.** Its inputs:
+**The mode is a pure function, unit-tested table by table with an injected clock.** Its inputs:
 
-- the persisted state: mode, render hash, observed time, last reset and its reason;
+- the persisted state: mode, render hash, observed time, `render_changed_at`, last reset and its
+  reason;
 - the current render hash;
-- relevant would-drops since the last tick;
-- SSH logins through a non-internal interface since the last tick;
+- SSH logins through a non-internal interface since the last check. Optional: unread means
+  unknown;
 - whether `nft` is present;
 - third-party firewall, hold and break-glass;
 - whether the derivation succeeded;
 - whether the expected listeners are up;
-- on spokes, the two Syncthing facts (§3.5);
-- the tick's monotonic delta.
+- on spokes, the two persisted Syncthing facts (§3.5);
+- whether the release enables the switch (from stage 5);
+- the check's monotonic delta.
 
 **Its rules:**
 
-- **Break-glass** (`/etc/fluxbee/posture.disabled`) present → `off`.
-  - There is no table, and the boot unit does not load one.
-  - The orchestrator removes the table and never re-applies it while the file exists.
-  - Removing the file starts observe with a fresh window.
-- **A render change** (new hash) → observe, with the window reset.
-- **In observe, observed time accumulates.** It is the sum of tick deltas while the orchestrator
-  runs, persisted with the render hash, so restarts and reboots keep it.
-- **A reset.** A relevant would-drop, or an SSH login through a non-internal interface, resets the
-  window and is reported with its tuple.
+- **Break-glass** (`/etc/fluxbee/posture.disabled`) present → `off`. There is no table, the boot
+  unit does not load one, and the orchestrator removes it and never re-applies it while the file
+  exists. Removing the file starts observe with a fresh window.
+- **A render change** (new hash) → observe, with the window reset and `render_changed_at` set.
+- **Observed time grows** only on a check where:
+  - the table is applied in observe;
+  - every evidence read succeeded;
+  - `nft` is present.
+
+  The first check after a process start adds 0. Observed time is persisted with the render hash,
+  so restarts and reboots keep it.
+- **An unread evidence input** pauses the clock and is reported. It never counts as clean.
+- **An SSH login through a non-internal interface** resets the window and is reported with its
+  source.
 - **observe → enforce** once observed time reaches 24 hours and all of these hold:
+  - the release enables the switch;
   - `nft` is present;
   - there is no third-party firewall;
   - the derivation succeeded;
   - the expected listeners are up;
   - there is no hold;
-  - on spokes, both Syncthing facts are true;
-  - the release enables the switch (from stage 5).
+  - on spokes, both Syncthing facts are true.
+
+  Observed time starts at 0 with the stage-5 release: time observed under stage 4 does not count.
 - **enforce → observe** only on a render change, a hold file or a third-party firewall that
-  appears. A would-drop in enforce is the firewall doing its job: it is reported, and the mode does
+  appears. Drops in enforce are the firewall doing its job: they are reported, and the mode does
   not change.
 - **A derivation failure** keeps the applied ruleset and mode, and is reported.
+- **Missing state** starts a fresh observe. **Unreadable state** starts a fresh observe and is
+  reported; it never leads to enforce.
 - **Hold** (`/etc/fluxbee/posture.hold`): never switch to enforce, and go back to observe if
   enforcing. Ours, for the rollout order.
 - **Console escape.** `touch /etc/fluxbee/posture.disabled; nft delete table inet fluxbee_host`
   works without the orchestrator.
 
-**Evidence: only what a drop would actually break.** A SYN to a port with no listener is refused
-today, so enforcing changes nothing for it. So:
+**SSH-login evidence.**
 
-- **`@listening`.** The orchestrator keeps a small named set with the ports that have a
-  non-loopback listener, from the listener check. Updating its elements is data, not a re-render.
-- **The accounting rule.** Before the policy, on internal interfaces, packets whose destination
-  port is in `@listening` hit a counter and a rate-limited `log` (prefix `fluxbee-posture: `).
-  - The counter's delta is the relevant would-drop count; the log gives the tuples for the report.
-  - There is no per-tuple dynamic set an attacker could fill, and scans of closed ports do not
-    count.
-- **Non-internal interfaces** admit only the edge port. SSH there is judged by successful logins
-  in the sshd journal, whose source routes through a non-internal interface, not by packets. That
-  way internet scanners cannot hold the ingress or the egress in observe.
+- The source is the sshd journal (identifiers `sshd` and `sshd-session`): successful logins
+  (`Accepted … from <ip>`) whose source routes through a non-internal interface (`ip route get`),
+  IPv4 or IPv6.
+- Read from a cursor persisted in the state, so nothing is missed across restarts.
+- A journal read error is an unread input.
+- Failed logins and bare packets never count, so internet scanners cannot hold the ingress or the
+  egress in observe.
 
 **Apply.** In one `nft -f`:
 
@@ -503,13 +550,11 @@ delete table inet fluxbee_host
 <full definition>
 ```
 
-Then the elements of `@listening` are set.
-
 **Persist.**
 
 - `/etc/fluxbee/posture.nft`: the last applied ruleset.
-- `/var/lib/fluxbee/state/posture.json`: mode, render hash, observed time, last reset and its
-  reason, and the drift baseline.
+- `/var/lib/fluxbee/state/posture.json`: mode, render hash, observed time, `render_changed_at`,
+  last reset and its reason, the journal cursor, and the drift baseline.
 
 Neither lives under `/etc/nftables.d`.
 
@@ -527,7 +572,7 @@ Rules use `iifname` / `oifname` only. A failed load is reported.
 **Drift.**
 
 - **The baseline** is nft's own listing, normalized (no handles, counters or set elements), taken
-  right after the apply and stored in `posture.json`. Later listings are compared with it.
+  right after the apply and stored in the state. Later listings are compared with it.
 - **Re-apply only on drift**, and honour break-glass.
 - **`nftables.service`:** an enabled one that runs `flush ruleset` is reported as a conflict; its
   effect is repaired as drift.
@@ -574,24 +619,36 @@ not changed.
 
 ### 3.5 Syncthing (stages 2 and 3)
 
-**Addresses (stage 2)** are reconciled at every boot and watchdog run, not only at join:
+**Addresses (stage 2)** are reconciled at every boot and watchdog run, not only at join.
 
-- **Spoke side.** The spoke has exactly one remote device, named after the motherbee's `hive_id`.
-  It gets `Static(<motherbee uplink IP>:22000)`.
-- **Motherbee side.**
-  - Every device named after a registered hive gets `AcceptOnly`: address `dynamic`, so the
-    motherbee never dials once discovery is off.
-  - A device whose name has no registry entry is reported as an orphan. A-48's `remove_hive`
-    removes such devices by name.
-- **The address type** becomes `AcceptOnly | Static(SocketAddr)`, IP literals only.
-  - A finalize without a derivable address is refused, never written as `dynamic`.
-  - The worker join derives the motherbee address the way ingress and egress do.
-- **One serialized writer** for `config.xml` (a mutex plus atomic writes), kept that way by a CI
-  grep guard. Syncthing restarts only when something changed.
-- **Listen addresses do not change in stage 2.**
+**Spoke side.** The spoke has exactly one remote device, named after the motherbee's `hive_id`. It
+gets `Static(<motherbee uplink IP>:22000)`.
 
-**Options (stage 3).** The orchestrator owns them, and they are aligned with
-`vendor/syncthing/config.xml`:
+**Motherbee side.**
+
+- **Which device is a hive's.** The device id recorded in that hive's registry entry. The existing
+  egress entry has none; it is backfilled from the motherbee's `config.xml` when exactly one
+  device there carries that hive's name, and otherwise reported.
+- **Registered devices** get `AcceptOnly`: address `dynamic`, so the motherbee never dials once
+  discovery is off.
+- **Orphans are removed.** A device with no registry entry, or a second device under a registered
+  name, is removed from the config and reported, so it stops being authorized.
+
+**The address type** becomes `AcceptOnly | Static(SocketAddr)`, IP literals only.
+
+- A finalize without a derivable address is refused, never written as `dynamic`.
+- The worker join derives the motherbee address the way ingress and egress do.
+
+**One serialized writer** for `config.xml`:
+
+- a mutex plus an atomic rename;
+- the temp file is created with the original's owner (fluxbee) and mode;
+- a CI grep guard keeps every write in it;
+- Syncthing restarts only when something changed.
+
+**Listen addresses do not change in stage 2.**
+
+**Options (stage 3).** The orchestrator owns them, aligned with `vendor/syncthing/config.xml`:
 
 - global and local announce, relays, NAT and crash reporting off;
 - `urAccepted=-1`, `autoUpgradeIntervalH=0`, STUN off;
@@ -604,122 +661,167 @@ The whole set switches together.
 **The order is enforced in code, and each switch happens once:**
 
 1. **A spoke switches** when its motherbee device is `Static` and a plain TCP connect to
-   `<motherbee>:22000` succeeds. It reports both facts in its `/versions` snapshot.
+   `<motherbee>:22000` succeeds. Both facts are persisted the first time they are true and are
+   reported in its `/versions` snapshot. Later outages do not undo them, so they are not live
+   remote data for the posture (D22).
 2. **The motherbee polls**, while it has not switched yet. A background task, not the
    single-flight watchdog tick, reads the snapshots of the spokes that are registered devices
    through the existing GET_VERSIONS, about every 60 s.
 3. **The motherbee switches** when every one of them reports both facts. An offline spoke that
    never reported keeps it waiting, and the report names it.
-4. **Both switches are one-way.** Once off, the public set stays off: a later outage does not turn
-   discovery back on.
+4. **Both switches are one-way.**
 
 **Unit tests** cover both predicates on fixtures captured read-only from the four PROD hosts
 (worker1 `dynamic`↔`dynamic`, ingress static, egress without a device id), plus synthetic reports:
-fields absent (an old spoke), static false, connect false, both true. The captures drop the `<gui>`
-block, whose API key cannot go into the public repo.
+fields absent, static false, connect false, both true. The captures drop the `<gui>` block.
 
 ### 3.6 Reports and checks (report-only)
 
 | Check | What it reports |
 |---|---|
-| Listener | From stage 1, on every role: `sy-architect` or `sy-admin` off loopback. From stage 4: every non-loopback TCP listener not in the declaration, by process name; this list also feeds `@listening`. |
+| Listener | From stage 1, on every role: `sy-architect` or `sy-admin` off loopback. From stage 4: every non-loopback TCP listener not in the declaration, by process name. A `systemd`-owned listener on an sshd port is sshd. |
 | sshd | `PasswordAuthentication yes` and `PermitRootLogin yes`, as warnings. The fix is A-2; the PROD motherbee has password login on. |
 | Mesh auth | `wan.mtls` other than `required` (motherbee) and `identity.sync.auth: disabled`, as warnings. D3 rests on them. |
 | Third-party firewall | ufw active, firewalld running, or any non-Fluxbee base chain on the input hook with a non-accept policy or rules. The host stays in observe, and the report names the ports to open there. |
-| Recorder | INVALID counts per interface, the relevant would-drop count, and the size of `@listening`. |
+| Packets | The report-only drop counter and the INVALID counter, with top tuples from the log. |
+| Conntrack | Fill level. Loading `fluxbee_host` enables conntrack on hosts that did not track before. |
+| apt source | Whether the Fluxbee source is `signed-by` or still `[trusted=yes]` (A-49). |
 | Motherbee | A public address, as a warning. |
 
 **Where it shows.**
 
 - `watchdog_tick` computes the posture and caches it; `local_versions_snapshot` returns the cached
   value, and `/versions` fans it out.
-- `ops.py health` fails on drift, `unavailable`, a third-party firewall, a derivation failure, or
-  break-glass or hold present.
-- From the stage-5 release it also fails when a host is not in enforce 48 hours after its last
-  render change. Before that, an open window is not a failure.
+- **`ops.py health` fails on:** break-glass, drift, `unavailable`, a third-party firewall, or a
+  derivation failure.
+- **It warns** on hold: the line prints "held" on every run, so a forgotten hold stays visible.
+- **From the stage-5 release** it also fails when a host that is not held is not in enforce 48 hours
+  after its last render change.
 
 ### 3.7 Lifecycle
 
-- **nftables.**
-  - Each host's orchestrator ensures it once per boot, non-fatal:
-    `command -v nft || (apt-get update && apt-get install -y nftables)`, with a dpkg lock timeout.
-    The result goes into the report.
-  - The motherbee's `.deb` depends on nftables. The 4 PROD hosts already have it.
-  - Without `nft` the host is `unavailable`, which means unfiltered. Health names it, with the
-    command to run.
-  - The egress keeps failing loud without `nft`, because its NAT needs it.
-- **ufw / firewalld.**
-  - The writes into an inactive ufw are removed.
-  - Where ufw is active or firewalld is running, the orchestrator still opens the role's declared
-    ports there (motherbee: 9000, 9100, 22000; spokes: none). A customer host with its own firewall
-    keeps working with no configuration, stays in observe, and the report says so.
-- **`add_hive`.** Nothing to admit on the motherbee. The spoke starts in observe.
-- **`remove_hive`.** The posture is **not** torn down: the removed host keeps SSH on its internal
-  interface only, so a removed ingress does not reopen SSH on its public interface.
-  - For an ingress, REMOVE_HIVE_CLEANUP also stops and disables sy-edge, and deletes its
-    publications and its mesh TLS directory.
-  - To repurpose a box: `touch /etc/fluxbee/posture.disabled; nft delete table inet fluxbee_host`.
-- **Upgrade.** If the render changes, the host goes back to observe for a new window.
-- **Downgrade or rollback to a build without the posture.** The host keeps its last ruleset, which
-  the boot unit keeps loading. That is harmless: it admits SSH on the internal interface, the
-  motherbee's mesh ports and the edge port. Break-glass is the escape. There are no version
-  comparisons.
-- **Package remove / purge.** The prerm tears down the table, the file, the state and the unit.
-- **Egress.** `fluxbee_egress` loses its input chain, with an explicit `delete chain` in the same
-  transaction. This supersedes edge-egress-nat-spec §3.3 and §8.5; a dated note there says so.
+**nftables.**
+
+- The orchestrator ensures it once per boot, in a background task that never blocks bootstrap:
+  `command -v nft || (apt-get update && apt-get -o DPkg::Lock::Timeout=300 install -y nftables)`,
+  with a bounded time. The result goes into the report.
+- The motherbee's `.deb` depends on nftables. The 4 PROD hosts already have it.
+- Without `nft` the host is `unavailable` (unfiltered), and health names it with the command to
+  run.
+- The egress keeps failing loud without `nft`, because its NAT needs it.
+
+**ufw / firewalld** (D25, proposed).
+
+- The writes into an inactive ufw are removed.
+- Where ufw is active or firewalld is running, the orchestrator opens the role's declared accepts
+  there: motherbee 9000, 9100, 22000; ingress its edge port. SSH is left to the customer's own
+  rules. The host stays in observe, and the report says so.
+
+**`add_hive`.**
+
+- It refuses `hive_id` `motherbee` before issuing any leaf.
+- Nothing is admitted on the motherbee beyond the A-48 pin.
+- The spoke starts in observe.
+
+**`remove_hive`** (D27, proposed).
+
+- The cleanup script runs in a transient unit outside sy-orchestrator's cgroup
+  (`systemd-run --unit=fluxbee-remove-cleanup --collect`), as the self-restart already does.
+  Today the script dies when it stops sy-orchestrator, so nothing after it in the loop ever ran:
+  fluxbee-syncthing stayed up and enabled on removed spokes.
+- The script stops and disables the core services and fluxbee-syncthing, and deletes node state
+  and the mesh TLS directory, on every role.
+- On an ingress it also stops and disables sy-edge and deletes its publications.
+- The posture is **not** torn down: the removed host keeps SSH on its internal interface only.
+- **To repurpose a box:**
+  `touch /etc/fluxbee/posture.disabled; nft delete table inet fluxbee_host; systemctl disable fluxbee-host-nft.service; rm /etc/fluxbee/posture.nft`.
+
+**Upgrade.** If the render changes, the host goes back to observe for a new window.
+
+**Downgrade or rollback to a build without the posture** (D26). The host keeps its last ruleset,
+which the boot unit keeps loading. That is harmless: SSH on the internal interface, the motherbee's
+mesh ports and the edge port are admitted. Break-glass is the escape. There are no version
+comparisons.
+
+**Package remove / purge.** The prerm tears down the table, the file, the state and the unit.
+
+**Egress.** `fluxbee_egress` stops rendering its input chain. No `delete chain` statement: the file
+is re-applied every minute and loaded at every boot, and a delete would fail on the second apply.
+The leftover chain is empty with `policy accept`, which cannot override fluxbee_host's drop, and it
+is gone at the next boot. This supersedes edge-egress-nat-spec §3.3 and §8.5; a dated note there
+says so.
 
 ### 3.8 A-48 — `remove_hive` revokes the hive
 
-**The router's view.** The motherbee orchestrator writes `/var/lib/fluxbee/state/router-hives.json`.
-It lists every registered hive, whatever its status, with its leaf pin when known.
+**The router's view.** The motherbee orchestrator rebuilds `/var/lib/fluxbee/state/router-hives.json`
+from the whole registry, under one global lock, and writes it atomically.
 
-- It is written at every boot, before rt-gateway starts, and on `add_hive` / `remove_hive`.
-- The router reloads it. On a read error it keeps the last good view.
+- **Contents:** every registered hive with its leaf pin, plus a `legacy_unpinned` flag for the
+  entries that existed when A-48 first booted.
+- **When:** at every boot before rt-gateway starts, and on `add_hive` / `remove_hive`.
+- **If the write fails, `remove_hive` fails.**
+- **The router reloads the view when it changes.**
+  - No readable view at startup → today's admission (any CA-valid peer), plus a loud report and a
+    health failure.
+  - A read error after a good load → keep the last good view.
 
-**Admission, on the motherbee's accept path only.**
+**Admission, on the motherbee's accept path:**
 
-- A WAN peer is admitted if its `hive_id` is in the view.
-- If the view has a pin for it, the presented leaf must match.
-- A registered hive without a pin (one joined before A-48) is admitted and listed as unpinned.
-- A pin is written whenever the motherbee issues a leaf (`add_hive`, TLS reconcile).
-- Spokes' dials to the motherbee are not checked against a view.
+- A WAN peer is admitted only if its `hive_id` is in the view and its presented leaf matches the
+  pin.
+- The only exception is an entry marked `legacy_unpinned`, admitted without a pin and listed.
+- A new or re-added hive has no such mark. Its pin is written right after the motherbee issues and
+  pushes its leaf, before the spoke's router starts. The pin is written only after the push
+  succeeded.
+- A hive that has a pin and whose certificate goes missing is reported, never silently re-issued.
+- Each WAN session keeps the leaf pin it was admitted with. When the view drops a hive, or its pin
+  changes, the router closes the sessions that no longer match.
+- A `wan_peers` entry is removed only by the session that owns it.
+
+**The other side.** A spoke accepts a WAN uplink only if the server's leaf carries `hive_id`
+`motherbee`. A removed box or a compromised hive that takes the motherbee's address cannot become
+a spoke's peer.
 
 **`remove_hive`, in this order:**
 
 1. REMOVE_HIVE_CLEANUP (§3.7).
-2. Delete the registry entry. The view drops the hive and the router closes its sessions.
-3. Delete its HMAC key and restart sy-identity on the motherbee; the replicas reconnect, as after
-   any deploy.
-4. Unlink its Syncthing device by name, on every role.
+2. Delete the registry entry and rewrite the view. The router closes the hive's sessions.
+3. Delete its HMAC key and restart sy-identity on the motherbee; the replicas reconnect.
+4. Unlink its Syncthing device on every role.
 5. Delete its `known_hosts`.
 
 **SSH host keys.** `StrictHostKeyChecking=accept-new`, with one `known_hosts` per hive
-(`UserKnownHostsFile=<hives>/<id>/known_hosts`, `HostKeyAlias=<hive_id>`). The first connection
-records the key, existing spokes included, and checking is strict afterwards.
+(`UserKnownHostsFile=<hives>/<id>/known_hosts`, `HostKeyAlias=<hive_id>`), at every SSH call site.
+The first connection records the key, existing spokes included; checking is strict afterwards.
 
 **Registry writes** become read-modify-write merges under the per-hive lock, so a join keeps keys
-it does not own (the pin, the device id).
+it does not own (the pin, the device id, the legacy mark).
 
 **Already in 0.1.57:** the motherbee refuses `REMOVE_HIVE_CLEANUP` and `ADD_HIVE_FINALIZE` (D24).
 
-**Residual:** the old box of a hive re-added before A-48, when it had no pin, stays admissible until
-that hive is re-added again.
+**Residual:** a `legacy_unpinned` hive's old box stays admissible until that hive is re-added once.
 
 ### 3.9 A-49 — signed apt repo
 
-- **Signing.** `scripts/apt-repo-publish.sh` signs `InRelease` with a key that has no passphrase
-  and no expiry. The key lives on fb-build and is backed up off fb-build. The public key file is
-  published next to the repo, and its fingerprint goes into the install docs.
+- **The key.** The public key is a file committed to the repo, also published next to the apt repo
+  with its fingerprint in the install docs. The private key has no passphrase and no expiry; it
+  lives on fb-build and is backed up off fb-build.
+- **Publishing.** `scripts/apt-repo-publish.sh` builds `InRelease` from `Release.new` and swaps it
+  after `Packages`, so a client updating mid-publish never sees a mismatched pair.
 - **First install.** It keeps `[trusted=yes]` once, or downloads the key from the repo (trust on
   first use).
-- **The postinst:**
-  - copies the key to `/etc/apt/keyrings/fluxbee.gpg`, which no package owns, so a downgrade
-    keeps it;
-  - switches an existing Fluxbee source to `[signed-by=/etc/apt/keyrings/fluxbee.gpg]`, but only
-    if apt's cached `InRelease` for that source verifies with `gpgv`. There is no network I/O
-    inside dpkg. Otherwise it leaves the source alone and says so.
-- **Residual:** fb-build holds the signing key on the flat L2. A-49 stops impersonation of the
-  repo, not a compromise of fb-build.
+- **The postinst** touches the keyring only together with a verified switch:
+  - if apt's cached `InRelease` for the Fluxbee source verifies with `gpgv` against the shipped key,
+    it adds the key to `/etc/apt/keyrings/fluxbee.gpg` (owned by no package, so a downgrade keeps
+    it) and switches the source to `[signed-by=…]`;
+  - it never replaces a key that is already there;
+  - there is no network I/O inside dpkg.
+- **Key rotation.** Sign `InRelease` with the old and the new key, ship a package that adds the new
+  one, then drop the old.
+- **`ops.py deploy`** prints the `W:` and `E:` lines of `apt-get update`, so a signature failure is
+  visible.
+- **Residual:** fb-build holds the signing key on the flat L2. A-49 stops impersonation of the repo,
+  not a compromise of fb-build.
 
 ---
 
@@ -851,17 +953,17 @@ The next stage starts only when the previous one is validated.
 |---|---|---|
 | 0 | Revisions 4–6 and DTAP rounds 1–3; the operator approved D3 and D16. Round 4 on revision 6 is next. | Round 4 before stage 2. |
 | 1 | Binds, the listener check and the spoke-only guards (§3.4), released as 0.1.57. | **Done: validated on 8.x on 2026-10-06 (see the ledger).** Unit: listener fixtures (the PROD capture flags only sy-architect 0.0.0.0:3000; `*`, `[::]`, scope before and after the brackets; several owners or none); the spoke-only guard; 19 migration checks; the CI guard. Infra, after `ops.py deploy`: (1) `ss` on the motherbee shows 3000 and 8080 only on 127.0.0.1; (2) `lab/posture-probe.sh 10.10.10.10 3000 8080 9000` from VMs 101, 102, 103 and 110 gives refused, refused, open (baseline on 0.1.56: open, refused, open); (3) on the motherbee, `curl 127.0.0.1:3000/` returns the UI and `curl 127.0.0.1:8080/hives` answers; (4) positive control: a dummy listener whose process is named `sy-admin`, on a spare port of 10.10.10.10 for about 20 s, produces `loopback_service_exposed_sy-admin` within two minutes (`GET /hives/motherbee/drift-alerts?category=posture`), and sy-architect raises no alert after the deploy; (5) the postinst printed its migration line. The operator checks the tunnel once, outside the gate. |
-| 2 | Syncthing addresses (§3.5). | **Unit:** the address type; IP literals only; v6 formatting; a finalize without an address refused; PROD fixtures reconcile to the target; a second pass is a no-op; orphan devices reported. **CI:** a grep guard keeps `config.xml` writes in the single writer. **Infra:** `/rest/config/devices` on the 4 hives matches the target; `/rest/db/completion` is 100% for every folder and device on the motherbee; `ops.py opa-status` in_sync 4/4; listen addresses unchanged. |
-| 3 | Syncthing options and the ordering predicates (§3.5). | **The first deploy of stage 3 is the skip-upgrade test.** With the operator's OK at that time, roll the 4 VMs back to the pre-stage-2 snapshot, then deploy stage 3 directly. **Then:** `/rest/config/options` exact on the 4 hives; `/rest/system/status` shows discovery off; no relay or QUIC connections; `ss` shows no non-loopback UDP for Syncthing; the motherbee listens on `tcp://:22000`; after a motherbee Syncthing restart every spoke reconnects within 30 s (measured on the motherbee's `/rest/system/connections`); a dist publish reaches 4/4. **Unit:** both predicates on PROD fixtures and on synthetic reports. |
-| 4 | Firewall in observe only (§3.1–§3.3, §3.6, §3.7). | **Unit:** role × mode render invariants: observe and enforce differ only in the policy and the INVALID verdict; the only accept of new connections without a source restriction is the ingress edge port; no role accepts 3000, 8080, 5432, 4222 or 8384; ICMP errors come before established; the `delete table` render is deterministic. The mode function, with an injected clock, through every transition: restart, reboot, break-glass removal, hold, render change, derivation failure. **CI:** a network-namespace job in its own workflow with sudo applies every role, checks connect/timeout over veth, and accepts a frag-needed for an untracked edge flow in enforce. **Infra:** the posture in `/versions` for 4/4. A canary on every hive: a short-lived listener on an unlisted port of the internal address, connected from another VM, succeeds and appears as a relevant would-drop within two ticks. Injections on worker1, each under a minute: flush the input chain (drift reported and repaired); add a foreign input base chain (third-party firewall reported, health fails); break-glass (the table goes and does not come back; health shows it). The table is there after a spoke reboot with sy-orchestrator disabled. Measure how long spokes take to rejoin after a motherbee reboot; that is the stage-5 baseline. |
-| 5 | Automatic enforce. | Put `posture.hold` on every host before the deploy. Release worker1, then the other spokes, then the motherbee last, a day apart. The canary now times out with no RST from other VMs and still connects from loopback. SSH to 192.168.8.240 from fb-build is refused. On the ingress' public address, from the operator's workstation, only the edge port answers (a manual step). After a motherbee reboot, spokes rejoin within the stage-4 baseline. An enforcing ingress reboots and stays in enforce. An upgrade with an unchanged render stays in enforce; a changed one goes back to observe. Break-glass from the console works without the orchestrator. |
+| 2 | Syncthing addresses (§3.5). | **Unit:** the address type; IP literals only; v6 formatting; a finalize without an address refused; PROD fixtures reconcile to the target; a second pass is a no-op; orphans removed; the egress device id backfilled by name; the temp file keeps owner and mode. **CI:** a grep guard keeps `config.xml` writes in the single writer. **Infra** (`lab/posture-check.sh` through `ops.py run`): `/rest/config/devices` on the 4 hives matches the target; `/rest/db/completion` is 100% for every folder and device on the motherbee; `ops.py opa-status` in_sync 4/4; listen addresses unchanged; Syncthing uptime keeps growing across three checks (no restart loop). Join the throwaway VM as a worker on this release: its motherbee device is `Static(10.10.10.10:22000)` and completion reaches 100%. Remove it before stage 3. |
+| 3 | Syncthing options and the ordering predicates (§3.5). | **Skip-upgrade, with no PROD rollback:** before the stage-3 deploy, join the throwaway VM as a worker on the stage-1 release (0.1.57), which gives `dynamic`↔`dynamic` like worker1, and keep it stopped. After the deploy, the motherbee keeps discovery on and names the throwaway as the spoke it waits for. Boot the throwaway and update it directly from 0.1.57: it gets a static address and switches, then the motherbee switches. **Then, on the 4 hives:** `/rest/config/options` exact; `/rest/system/status` shows discovery off; no relay or QUIC connections; no non-loopback UDP for Syncthing in `ss`; the motherbee listens on `tcp://:22000`; after a motherbee Syncthing restart every spoke reconnects within 30 s (motherbee `/rest/system/connections`); a dist publish reaches 4/4. **Unit:** both predicates on PROD fixtures and synthetic reports. Remove the throwaway afterwards. |
+| 4 | Firewall in observe only (§3.1–§3.3, §3.6, §3.7). | **Unit:** role × mode render invariants: observe and enforce differ only in the policy and the INVALID verdict; on a non-internal interface the only accept of new connections is the ingress edge port; no role accepts 3000, 8080, 5432, 4222 or 8384; ICMP errors and DHCP replies come before established. The render hash does not change between observe and enforce. The `delete table` render is deterministic, and the egress render has no input chain and survives a double apply. The mode function, table-driven with an injected clock: every transition, including restart, reboot, unread evidence, missing or unreadable state, hold, break-glass, render change and derivation failure; and observe → enforce → the next check stays in enforce. The sshd-port derivation on fixtures: the PROD socket-activated capture gives {22}; a socket on a non-22 port with `sshd -T` failing; sshd running; no source at all gives a derivation failure. The SSH-login evidence on journal fixtures (`sshd` and `sshd-session`, internal and external sources, IPv6). **CI:** a network-namespace job in its own workflow with sudo applies every role, checks connect/timeout over veth, and accepts a frag-needed for an untracked edge flow in enforce. **Infra:** the posture in `/versions` for 4/4, every host in observe, reasons named. SSH-login evidence: authorize a throwaway key on the egress (`ops.py run 103`), log in from fb-build to 192.168.8.240 (`ops.py run 110`), and expect a window reset naming 192.168.8.180 within two checks; then remove the key. Injections on worker1, each kept until detected (at most two checks) and then undone: flush the input chain (drift reported and repaired); a foreign chain `hook input priority 10; policy accept; tcp dport 9 drop` (third-party firewall reported, health fails); break-glass (the table goes and does not come back; reboot with sy-orchestrator disabled: still no table; remove the file and re-enable: back in observe with a fresh window). The table is there after a spoke reboot with sy-orchestrator disabled. The egress reboots and its NAT and table come back. Rejoin baseline: from the motherbee's boot (`uptime -s`) until `ops.py versions` answers for every spoke and the motherbee's Syncthing shows the 3 spokes connected, sampled twice. Stage 4 closes with every host ready to enforce except for the release switch. |
+| 5 | Automatic enforce. | Put `posture.hold` on every host before the deploy; health shows them as held (a warning). Release worker1, then the other spokes, then the motherbee last, a day apart. After each host enters enforce, run `lab/posture-probe.sh` from fb-build (`ops.py run 110`): 10.10.10.10 gives 22, 9000, 9100 and 22000 open, and a canary listener on an unlisted port times out; 10.10.10.20, .30 and .40 give 22 open; 192.168.8.240 gives 22 timeout. From the operator's workstation, on the ingress' public address, 443 answers and everything else times out (a manual step). After a motherbee reboot, spokes rejoin within the slower stage-4 sample + 30 s. An enforcing ingress reboots and stays in enforce. Break-glass from the console works without the orchestrator. Render changes are covered by the unit tests, not by a special release. |
 
 **After stage 5:**
 
 | Item | Gate |
 |---|---|
-| A-48 (its spoke-only guard shipped with stage 1, D24) | Join a throwaway VM as a worker and snapshot it. Remove it, re-add the same `hive_id` (new leaf and pin), roll the VM back to the snapshot and boot it: its WAN dial and its 9100 attempts are refused (router reject counter and log). Within 10 s of `remove_hive`, `ss` on the motherbee shows no established 9000/9100 from its address. Re-join it as an ingress and remove it: sy-edge is inactive and disabled, and its posture is still there. Regenerate its SSH host keys: the motherbee's next SSH is refused. The registry keeps foreign keys across a join. |
-| A-49 | `ops.py publish` signs without a terminal. The motherbee's `apt-get update` verifies the signature (output read, not through deploy). A copy of the repo with one byte of `Release` changed, used as a temporary source, fails with a signature error; the live repo is never touched. Postinst fixtures: a valid cached `InRelease` switches the source; a missing or bad one keeps `[trusted=yes]`. A downgrade below A-49 still verifies, and the re-upgrade works. |
+| A-48 (its spoke-only guard shipped with stage 1, D24) | **Host keys:** join the throwaway VM as a worker with `ssh_access=key_only_persist`, snapshot it, regenerate its host keys and restart sy-orchestrator on the motherbee: a host-key failure appears in its log. **Sessions:** stop sy-orchestrator on the throwaway, then remove the hive. The cleanup times out, and within 10 s `ss` on the motherbee shows no established 9000 or 9100 from its address. **Refusal:** roll the throwaway back to the snapshot and boot it; it is refused (WAN in the router log, 9100 in the sy-identity log). **Re-add:** re-add the hive while the rolled-back box keeps dialing. The old box is never admitted, the socket-first fast path is not taken, and the new box is admitted by its pin. **Ingress branch:** re-join it as an ingress (after confirming `admin.public_edge_node`) and remove it. sy-edge and fluxbee-syncthing are inactive and disabled, and its posture is still there. **Legacy hives:** `router-hives.json` lists the 3 PROD spokes as `legacy_unpinned`, and they stay connected after the deploy and after a motherbee reboot. **No view:** delete the view and restart rt-gateway; the spokes stay connected and the report fires. **Registry:** a join keeps foreign keys. |
+| A-49 | `ops.py publish` signs without a terminal. On the motherbee, `apt-get update` verifies the signature, and deploy prints its `W:`/`E:` lines. A copy of the repo with one byte of `InRelease` changed, used as a temporary source, fails with a signature error; the live repo is never touched. Postinst fixtures: a valid cached `InRelease` adds the key and switches the source; a missing or bad one keeps `[trusted=yes]`; an existing key is never replaced. `/versions` shows the source mode. |
 
 The throwaway hive is a 2 GB clone of template 9000, kept stopped between uses.
 
@@ -900,7 +1002,12 @@ io.linkedhelper through the edge (D18), then the rest.
   - An adversarial review of the stage 1 diff found no blocker or major.
 - **2026-10-06, stage 1 live:** 0.1.57 deployed and validated on 8.x. See lab/DEPLOYMENTS.md.
 - **2026-10-06, revision 6:** round 3 folded into stages 2–5, A-48 and A-49.
-- **Next:** DTAP round 4 on revision 6 (stages 2–5, A-48, A-49), then stage 2.
+- **2026-10-06, DTAP round 4 on revision 6:** 68 findings, 2 blockers (the egress `delete chain`;
+  A-48 admitting the old box during a re-join). Acceptance passed with observations for the first
+  time.
+- **2026-10-06, revision 7:** round 4 folded in (§8).
+- **Next:** stage 2 (its design is settled); DTAP round 5 on stages 4–5, A-48 and A-49 before
+  they are built.
 
 ## 8. Round 3 → revision 6
 
@@ -922,3 +1029,33 @@ io.linkedhelper through the edge (D18), then the rest.
 | P3-14 | §0 residuals. |
 | D3-1, T3-16, A3-1, P3-2, D3-16, T3-17, P3-12 | §3.8: unpinned pre-existing hives admitted; view at boot; sessions closed by reload and restart; `accept-new` host keys; the A-48 gate. |
 | D3-17, A3-12, P3-11, T3-18 | §3.9: first install, gpgv on the cached `InRelease`, a keyring that no package owns, tampering only on a copy. |
+
+### Round 4 → revision 7
+
+| Round-4 findings | Where they went |
+|---|---|
+| D4-1, A4-4, P4-4, T4-5 (blocker) | §3.7: the egress input chain is dropped from the render, never deleted; double apply in CI; egress reboot in the stage-4 gate. |
+| D4-3, P4-1 (blocker), P4-3, A4-5, D4-6 | §3.8: `legacy_unpinned` only for entries that existed at A-48's first boot; new joins pinned before they dial; pin written only after a successful push; sessions closed on a view or pin change; `wan_peers` removed by the owning session; global lock and atomic write; `remove_hive` fails if the view write fails; no view at startup admits as today, with a report. |
+| P4-2 | §3.8: spokes accept only a motherbee leaf as uplink; `add_hive` refuses `hive_id` `motherbee`. |
+| D4-2 | §3.7: the remove cleanup runs in a transient unit outside the orchestrator's cgroup. It also fixes today's cleanup, which died at sy-orchestrator. |
+| D4-4, T4-2, A4-9 | §3.1 and §3.3: a mode-independent render hash; unread evidence pauses the clock; the first check adds 0; missing or unreadable state; `render_changed_at`. |
+| D4-5, T4-1, P4-5 | §3.1: `/run/sshd` created before `sshd -T`; `ssh.socket` Listen; `systemd`-owned listener means sshd; no source is a derivation failure. |
+| P4-6, P4-7, P4-8, A4-6, A4-7, T4-4, T4-16, D4-11, P4-12 | §3.2 and D28: no packet gating; DHCP and ICMPv6 RA/MLD allowed; io.linkedhelper is cut on purpose. |
+| D4-10, T4-3 | §3.3: journal identifiers, IPv6, persisted cursor; a live SSH-login injection in the stage-4 gate. |
+| D4-7 | §3.1: the interface from the WAN session's local address. |
+| D4-8 | §3.7: nftables installed in a background task, with a lock timeout. |
+| D4-9, T4-17, P4-10 | §3.7 (D25): the ingress edge port is included. D25 itself awaits the operator. |
+| D4-12 | §3.5: the temp file keeps owner and mode. |
+| D4-13 | §3.8: `accept-new` at every SSH call site. |
+| D4-14, A4-8, P4-15 | §3.5: orphans removed; the egress device id backfilled by name. |
+| D4-15, T4-10, A4-10 | §6: the invariant reworded for non-internal interfaces. |
+| D4-16, P4-14, T4-9, T4-17 | §6 A-48 gate rewritten. |
+| D4-17, T4-15, P4-9 | §3.9 and the A-49 gate: tamper a copy of `InRelease`; the key is never replaced; rotation; `InRelease` swapped after `Packages`; deploy prints apt warnings. |
+| D4-18, A4-14, P4-17 | §0 residuals. |
+| D4-19 | §3.2: ICMPv6 RA and MLD. |
+| T4-6, T4-7, T4-8, A4-12, T4-11, T4-12, T4-13, T4-14, T4-18, P4-11 | §6 gates: positives in stage 5; hold is a warning; the skip-upgrade test on the throwaway worker with no PROD rollback; precise injections; a defined rejoin baseline; render changes in unit tests; `lab/posture-check.sh`; observed time starts at 0 with the stage-5 release. |
+| P4-13 | §3.6: conntrack fill reported. |
+| P4-16 | §3.7: the full repurpose command. |
+| A4-1, A4-3 | D25 and D27 await the operator. A4-2 found D26 consistent. |
+| A4-11 | §3.5: the Syncthing facts are persisted once true. |
+| A4-13 | Header and status. |

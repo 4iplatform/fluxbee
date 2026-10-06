@@ -248,3 +248,42 @@ is left: the listener check would report it.
 
 **Everything else** (stages 2–5, A-48, A-49) is listed in spec §8. It becomes revision 6, with a
 DTAP round 4, before any of those stages is built.
+
+---
+
+# Round 4 — revision 6: core stages 2–5, A-48, A-49 (2026-10-06)
+
+**Verdict:**
+
+| Lens | Verdict | Findings | Blockers |
+|---|---|---|---|
+| Development | fail | 19 | 1 |
+| Test | fail | 18 | 0 |
+| Acceptance | **pass with observations** (first time) | 14 | 0 |
+| Production | fail | 17 | 1 |
+
+Verifiers: 52 confirmed, 16 partial, 0 refuted.
+
+**About the Test reviewer:** the safety classifier timed out while reviewing its run. Its transcript
+was checked afterwards: 58 calls, all read-only (`grep`, `wc`, `Read`), no writes and no remote
+commands.
+
+**Blockers:**
+
+- **D4-1:** revision 6's "explicit `delete chain`" for `fluxbee_egress` fails on the second apply.
+  It would leave the egress without NAT at its next boot, and crash-loop its orchestrator.
+- **P4-1:** A-48 admitted unpinned entries whatever their status. A removed box could come back in
+  while its `hive_id` was re-added, and stay.
+
+**The idea that simplified the most:** under D3 enforce can only cut three things. Those are SSH
+through non-internal interfaces, undeclared listeners (cut on purpose) and special UDP/ICMP. So the
+switch is gated by SSH logins plus preconditions, and packet accounting is report-only (D28). That
+dissolves P4-6, P4-7, P4-8, A4-6, A4-7, T4-4, T4-16, D4-11 and P4-12.
+
+**Also found, in today's code:** the remove cleanup script dies when it stops sy-orchestrator
+(D4-2). Everything after it in the loop never runs, so removed spokes keep fluxbee-syncthing up and
+enabled. Revision 7 fixes it under A-48.
+
+**Disposition:** everything is in revision 7; spec §8, "Round 4 → revision 7", maps each finding.
+D25 and D27 still await the operator; Acceptance found D26 consistent with what he approved.
+**Next:** stage 2, then round 5 on stages 4–5, A-48 and A-49.
