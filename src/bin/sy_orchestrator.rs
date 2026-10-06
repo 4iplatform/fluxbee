@@ -1222,18 +1222,48 @@ fn ensure_motherbee_ssh_key() {
     }
 }
 
-/// add_hive: issue a leaf for `hive_id` and push the mesh TLS material to the remote node's
-/// `/var/lib/fluxbee/tls/<hive_id>/` over the join's SSH channel. Fatal: every spoke template
-/// requires mTLS, so a spoke without its leaf never reaches the mesh, and the join is the only
-/// place a leaf is issued (D32). A push lost to an SSH blip is retryable, so the key stays and the
+/// A spoke's mesh TLS material: the CA certificate and the spoke's leaf.
+struct HiveTlsMaterial {
+    ca_cert_pem: String,
+    leaf: json_router::mesh_tls::LeafBundle,
+}
+
+/// add_hive: issue the leaf for `hive_id`. Every flow calls it before the join's first SSH
+/// session, so a CA that cannot issue fails the join before it installs anything on the box (the
+/// failure path's best-effort revoke still runs). The join is the only place a leaf is issued
+/// (D32).
+fn issue_hive_tls(hive_id: &str) -> Result<HiveTlsMaterial, serde_json::Value> {
+    let issued = ensure_mesh_ca().and_then(|ca| {
+        let leaf = ca
+            .issue_leaf(hive_id)
+            .map_err(|e| -> OrchestratorError { format!("issue leaf: {e}").into() })?;
+        Ok(HiveTlsMaterial {
+            ca_cert_pem: ca.ca_cert_pem().to_string(),
+            leaf,
+        })
+    });
+    issued.map_err(|err| {
+        serde_json::json!({
+            "status": "error",
+            "error_code": "TLS_ISSUE_FAILED",
+            "retryable": false,
+            "message": format!("the mesh CA could not issue this hive's leaf: {err}"),
+        })
+    })
+}
+
+/// add_hive: push the mesh TLS material to the remote node's `/var/lib/fluxbee/tls/<hive_id>/`
+/// over the join's SSH channel. Fatal: every spoke template requires mTLS, so a spoke without its
+/// leaf never reaches the mesh. A push lost to an SSH blip is retryable, so the key stays and the
 /// retry is key-first.
-fn distribute_hive_tls(
+fn push_hive_tls(
     address: &str,
     key_path: &Path,
     user: &str,
     hive_id: &str,
+    tls: &HiveTlsMaterial,
 ) -> Result<(), serde_json::Value> {
-    distribute_hive_tls_inner(address, key_path, user, hive_id).map_err(|err| {
+    push_hive_tls_inner(address, key_path, user, hive_id, tls).map_err(|err| {
         let message = format!("mesh TLS material distribution failed: {err}");
         serde_json::json!({
             "status": "error",
@@ -1244,16 +1274,13 @@ fn distribute_hive_tls(
     })
 }
 
-fn distribute_hive_tls_inner(
+fn push_hive_tls_inner(
     address: &str,
     key_path: &Path,
     user: &str,
     hive_id: &str,
+    tls: &HiveTlsMaterial,
 ) -> Result<(), OrchestratorError> {
-    let ca = ensure_mesh_ca()?;
-    let leaf = ca
-        .issue_leaf(hive_id)
-        .map_err(|e| format!("issue leaf: {e}"))?;
     let dir = format!("/var/lib/fluxbee/tls/{hive_id}");
     // Create the dir 0700 BEFORE writing: write_remote_file streams via `tee`,
     // which leaves the new file at the umask default (often world-readable) until
@@ -1273,21 +1300,21 @@ fn distribute_hive_tls_inner(
         key_path,
         user,
         &format!("{dir}/ca.crt"),
-        ca.ca_cert_pem(),
+        &tls.ca_cert_pem,
     )?;
     write_remote_file(
         address,
         key_path,
         user,
         &format!("{dir}/cert.crt"),
-        &leaf.cert_pem,
+        &tls.leaf.cert_pem,
     )?;
     write_remote_file(
         address,
         key_path,
         user,
         &format!("{dir}/cert.key"),
-        &leaf.key_pem,
+        &tls.leaf.key_pem,
     )?;
     ssh_with_key(
         address,
@@ -1392,7 +1419,8 @@ async fn bootstrap_local(
         ensure_motherbee_mesh_tls(&state.hive_id);
         // Refresh the per-role core subtrees the spokes sync from. Boot is the right trigger:
         // a `.deb` upgrade stops the orchestrator in `prerm` and `postinst` starts it again, so
-        // this runs exactly once per new package, before any spoke can ask for an update. Non-fatal — motherbee itself runs from `dist/core`, so a
+        // this runs exactly once per new package, before any spoke can ask for an update.
+        // Non-fatal: the motherbee's own units run the installed `/usr/bin` binaries, so a
         // materialization failure must not take the whole hive down; it makes spoke updates
         // stale, which the loud log plus the update path's own hash gate will surface.
         match materialize_role_core_trees(&core_manifest) {
@@ -3542,6 +3570,29 @@ struct SystemUpdateApplyResult {
     errors: Vec<String>,
 }
 
+/// `update category=vendor` says what it did: `updated` when a new Syncthing binary was
+/// installed, `restarted` only when the service was restarted (A-57). A new binary with no
+/// restart means the service was not running and started on the new one.
+fn vendor_update_result(outcome: SyncthingRuntimeOutcome) -> SystemUpdateApplyResult {
+    let syncthing = vec!["syncthing".to_string()];
+    let (updated, unchanged) = if outcome.binary_updated {
+        (syncthing, Vec::new())
+    } else {
+        (Vec::new(), syncthing)
+    };
+    SystemUpdateApplyResult {
+        status: "ok".to_string(),
+        updated,
+        unchanged,
+        restarted: if outcome.restarted {
+            vec![SYNCTHING_SERVICE_NAME.to_string()]
+        } else {
+            Vec::new()
+        },
+        errors: Vec::new(),
+    }
+}
+
 fn set_exec_0755(path: &Path) -> Result<(), OrchestratorError> {
     let mut perms = fs::metadata(path)?.permissions();
     perms.set_mode(0o755);
@@ -4532,15 +4583,14 @@ async fn apply_system_update_local(
                 && (blob_sync_tool_is_syncthing(&desired_sync)
                     || dist_sync_tool_is_syncthing(&desired_dist))
             {
-                ensure_blob_sync_runtime(&desired_blob, &desired_dist, state.is_motherbee, state.role)
-            .await?;
-                Ok(SystemUpdateApplyResult {
-                    status: "ok".to_string(),
-                    updated: Vec::new(),
-                    unchanged: vec!["syncthing".to_string()],
-                    restarted: vec![SYNCTHING_SERVICE_NAME.to_string()],
-                    errors: Vec::new(),
-                })
+                let outcome = ensure_blob_sync_runtime(
+                    &desired_blob,
+                    &desired_dist,
+                    state.is_motherbee,
+                    state.role,
+                )
+                .await?;
+                Ok(vendor_update_result(outcome))
             } else {
                 Ok(SystemUpdateApplyResult {
                     status: "ok".to_string(),
@@ -7133,7 +7183,9 @@ fn reconcile_egress(state: &OrchestratorState) -> Result<(), OrchestratorError> 
     Ok(())
 }
 
-fn ensure_syncthing_installed() -> Result<(), OrchestratorError> {
+/// Installs the vendored Syncthing when the installed binary is missing or differs from it.
+/// Returns whether it installed one: a running Syncthing keeps the old binary until it restarts.
+fn ensure_syncthing_installed() -> Result<bool, OrchestratorError> {
     let source = resolve_syncthing_vendor_source_path()?;
     let source_hash = local_syncthing_vendor_hash()?.unwrap_or_default();
     if let Some(parent) = Path::new(SYNCTHING_INSTALL_PATH).parent() {
@@ -7169,7 +7221,7 @@ fn ensure_syncthing_installed() -> Result<(), OrchestratorError> {
         }
     }
     if !install_required {
-        return Ok(());
+        return Ok(false);
     }
     tracing::info!(
         source = %source.display(),
@@ -7186,7 +7238,7 @@ fn ensure_syncthing_installed() -> Result<(), OrchestratorError> {
     if !syncthing_binary_available() {
         return Err("syncthing install finished but installed binary is still missing".into());
     }
-    Ok(())
+    Ok(true)
 }
 
 fn syncthing_unit_contents(blob: &BlobRuntimeConfig, service_user: &str) -> String {
@@ -7273,7 +7325,9 @@ fn validate_unit_path_field(path: &Path, label: &str) -> Result<(), Orchestrator
     Ok(())
 }
 
-fn ensure_syncthing_unit(blob: &BlobRuntimeConfig) -> Result<(), OrchestratorError> {
+/// Writes the Syncthing unit when it differs. Returns whether it did: a running service keeps
+/// the unit it started with until it restarts.
+fn ensure_syncthing_unit(blob: &BlobRuntimeConfig) -> Result<bool, OrchestratorError> {
     let service_user = resolve_syncthing_service_user(blob)?;
     // SO-06: service_user and sync_data_dir are interpolated verbatim into a
     // root-written systemd unit file; reject control chars / non-absolute paths
@@ -7287,13 +7341,13 @@ fn ensure_syncthing_unit(blob: &BlobRuntimeConfig) -> Result<(), OrchestratorErr
         Path::new("/etc/systemd/system").join(format!("{SYNCTHING_SERVICE_NAME}.service"));
     let current = fs::read_to_string(&unit_path).unwrap_or_default();
     if current == unit_contents {
-        return Ok(());
+        return Ok(false);
     }
     fs::write(&unit_path, unit_contents)?;
     let mut daemon_reload = Command::new("systemctl");
     daemon_reload.arg("daemon-reload");
     run_cmd(daemon_reload, "systemctl daemon-reload")?;
-    Ok(())
+    Ok(true)
 }
 
 async fn syncthing_api_healthy(api_port: u16) -> bool {
@@ -10176,15 +10230,36 @@ fn ensure_syncthing_folder_markers(
     Ok(repaired)
 }
 
+/// What `ensure_blob_sync_runtime` did to the Syncthing service.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct SyncthingRuntimeOutcome {
+    /// The vendored binary differed from the installed one and was installed.
+    binary_updated: bool,
+    /// The service was restarted.
+    restarted: bool,
+}
+
+/// A running Syncthing keeps the binary and the unit it started with (A-57): it is stale when
+/// either changed under it. A replaced binary also shows on the process itself, so a restart a
+/// failed call never reached is caught by the next one.
+fn syncthing_runs_stale(
+    active: bool,
+    binary_updated: bool,
+    unit_changed: bool,
+    runs_replaced_binary: bool,
+) -> bool {
+    active && (binary_updated || unit_changed || runs_replaced_binary)
+}
+
 async fn ensure_blob_sync_runtime(
     blob: &BlobRuntimeConfig,
     dist: &DistRuntimeConfig,
     is_motherbee: bool,
     role: HiveRole,
-) -> Result<(), OrchestratorError> {
+) -> Result<SyncthingRuntimeOutcome, OrchestratorError> {
     let sync = effective_syncthing_runtime_config(blob, dist);
     if !sync.sync_enabled {
-        return Ok(());
+        return Ok(SyncthingRuntimeOutcome::default());
     }
     if !(blob_sync_tool_is_syncthing(&sync) || dist_sync_tool_is_syncthing(dist)) {
         return Err(format!(
@@ -10196,23 +10271,41 @@ async fn ensure_blob_sync_runtime(
 
     let repaired_markers = ensure_syncthing_folder_markers(blob, dist, is_motherbee, role)?;
 
-    ensure_syncthing_installed()?;
-    ensure_syncthing_unit(&sync)?;
+    let binary_updated = ensure_syncthing_installed()?;
+    let unit_changed = ensure_syncthing_unit(&sync)?;
     ensure_syncthing_firewall_local();
-    tracing::info!(
-        service = SYNCTHING_SERVICE_NAME,
-        "starting blob sync service"
+    // Restart a stale Syncthing now, before the checks below: they already use the new unit's
+    // port and home.
+    let stale = syncthing_runs_stale(
+        systemd_is_active(SYNCTHING_SERVICE_NAME),
+        binary_updated,
+        unit_changed,
+        service_runs_replaced_binary(SYNCTHING_SERVICE_NAME),
     );
-    systemd_start(SYNCTHING_SERVICE_NAME)?;
+    if stale {
+        tracing::info!(
+            service = SYNCTHING_SERVICE_NAME,
+            binary_updated,
+            unit_changed,
+            "restarting syncthing onto its installed binary and unit (A-57)"
+        );
+        systemd_restart(SYNCTHING_SERVICE_NAME)?;
+    } else {
+        tracing::info!(
+            service = SYNCTHING_SERVICE_NAME,
+            "starting blob sync service"
+        );
+        systemd_start(SYNCTHING_SERVICE_NAME)?;
+    }
     wait_for_service_active(
         SYNCTHING_SERVICE_NAME,
         Duration::from_secs(SYNCTHING_BOOTSTRAP_TIMEOUT_SECS),
     )
     .await?;
     wait_for_syncthing_health(&sync).await?;
-    let changed_folders =
-        reconcile_local_syncthing_folders(&sync, blob, dist, is_motherbee, role)?;
-    if !changed_folders.is_empty() || !repaired_markers.is_empty() {
+    let changed_folders = reconcile_local_syncthing_folders(&sync, blob, dist, is_motherbee, role)?;
+    let folders_repaired = !changed_folders.is_empty() || !repaired_markers.is_empty();
+    if folders_repaired {
         tracing::info!(
             service = SYNCTHING_SERVICE_NAME,
             folders = ?changed_folders,
@@ -10234,7 +10327,10 @@ async fn ensure_blob_sync_runtime(
         api_port = sync.sync_api_port,
         "blob sync service healthy"
     );
-    Ok(())
+    Ok(SyncthingRuntimeOutcome {
+        binary_updated,
+        restarted: stale || folders_repaired,
+    })
 }
 
 fn disable_blob_sync_runtime_local() -> Result<(), OrchestratorError> {
@@ -19447,7 +19543,8 @@ fn scope_core_manifest_to_components(
 /// failure but an orchestrator crash-loop with no channel left to repair it. Both sides derive
 /// the role's set from the same `system_nodes.<role>` — motherbee's template, which it wrote
 /// into the spoke's hive.yaml at add_hive — so they agree unless that template is edited after
-/// the join. That residual is tracked with U-6 (hive.yaml is never re-emitted to spokes).
+/// the join: a spoke's hive.yaml is written once, at the join, and never re-emitted (the HANDBOOK
+/// recipe for a new system node in a role covers that order).
 ///
 /// Copies, never hardlinks: `build-deb.sh` and `install.sh` write with `install -m0755`,
 /// which unlinks and recreates, so a hardlink would silently keep pointing at the previous
@@ -19655,8 +19752,8 @@ fn write_new_file_atomic(path: &Path, bytes: &[u8], mode: u32) -> Result<(), Orc
 /// add_hive: push the motherbee's vendor runtime (syncthing binary + manifest +
 /// optional config template) to the worker, so the worker's blob/dist-sync setup
 /// finds the vendored syncthing during finalize. Mirrors `sync_core_to_worker`.
-/// Best-effort by contract of its caller: if the motherbee has no vendor manifest
-/// there is nothing to push, so this returns Ok and the join proceeds.
+/// If the motherbee has no vendor manifest there is nothing to push, so this returns Ok and the
+/// join proceeds; any other failure fails the join in all three flows (VENDOR_SYNC_FAILED).
 fn sync_vendor_to_worker(
     hive_id: &str,
     address: &str,
@@ -21693,6 +21790,11 @@ async fn add_hive_flow(
         }
     }
 
+    // The leaf first: a CA that cannot issue fails the join before it installs anything.
+    let tls = match issue_hive_tls(hive_id) {
+        Ok(tls) => tls,
+        Err(payload) => return payload,
+    };
     let key_path = PathBuf::from(MOTHERBEE_SSH_KEY_PATH);
     if !key_path.exists() {
         return serde_json::json!({
@@ -21930,11 +22032,25 @@ async fn add_hive_flow(
         });
     }
 
-    // Push the vendor runtime (syncthing) so the worker's finalize can set up
-    // blob/dist sync; best-effort — a hiccup must not fail the join (the mTLS
-    // link is already up by now), it just leaves sync unavailable until repaired.
+    // Push the vendor runtime (syncthing) so the worker's finalize can set up blob/dist sync.
+    // Fatal, as in the egress and ingress flows: the vendor arrives THROUGH syncthing, so a worker
+    // joined without it never gets syncthing and nothing can repair it. An SSH blip here is
+    // retryable (the message carries it), so the key stays for the retry.
     if let Err(err) = sync_vendor_to_worker(hive_id, address, &key_path, creds.user.as_str()) {
-        tracing::warn!(hive_id = hive_id, error = %err, "vendor sync to worker failed; blob/dist sync may be unavailable");
+        append_single_deployment_history(
+            state,
+            "vendor",
+            "add_hive",
+            hive_id,
+            "error",
+            Some("VENDOR_SYNC_FAILED".to_string()),
+            local_syncthing_vendor_hash().ok().flatten(),
+        );
+        return serde_json::json!({
+            "status": "error",
+            "error_code": "VENDOR_SYNC_FAILED",
+            "message": err.to_string(),
+        });
     }
 
     let wan_listen = state.wan_listen.clone().unwrap_or_default();
@@ -22053,7 +22169,7 @@ async fn add_hive_flow(
     }
 
     // The mesh TLS material: the worker's router requires it (fatal, D32).
-    if let Err(payload) = distribute_hive_tls(address, &key_path, creds.user.as_str(), hive_id) {
+    if let Err(payload) = push_hive_tls(address, &key_path, creds.user.as_str(), hive_id, &tls) {
         return payload;
     }
     // Distribute the per-hive identity HMAC key so this worker's sy-identity can
@@ -22578,6 +22694,11 @@ async fn add_egress_hive_flow(
         return err_payload("IO_ERROR", err.to_string());
     }
 
+    // The leaf first: a CA that cannot issue fails the join before it installs anything.
+    let tls = match issue_hive_tls(hive_id) {
+        Ok(tls) => tls,
+        Err(payload) => return payload,
+    };
     // SSH bootstrap: seed the motherbee key, then operate over the key channel.
     let key_path = PathBuf::from(MOTHERBEE_SSH_KEY_PATH);
     if !key_path.exists() {
@@ -22802,7 +22923,7 @@ async fn add_egress_hive_flow(
         return err_payload("CONFIG_FAILED", err.to_string());
     }
     // The mesh TLS material: the egress' router requires it (fatal, D32).
-    if let Err(payload) = distribute_hive_tls(address, &key_path, creds.user.as_str(), hive_id) {
+    if let Err(payload) = push_hive_tls(address, &key_path, creds.user.as_str(), hive_id, &tls) {
         return payload;
     }
     let config_routes_yaml = format!(
@@ -23257,6 +23378,11 @@ async fn add_ingress_hive_flow(
         return err_payload("IO_ERROR", err.to_string());
     }
 
+    // The leaf first: a CA that cannot issue fails the join before it installs anything.
+    let tls = match issue_hive_tls(hive_id) {
+        Ok(tls) => tls,
+        Err(payload) => return payload,
+    };
     // SSH bootstrap (key-first probe, password fallback) — identical to egress.
     let key_path = PathBuf::from(MOTHERBEE_SSH_KEY_PATH);
     if !key_path.exists() {
@@ -23501,7 +23627,7 @@ async fn add_ingress_hive_flow(
         return err_payload("CONFIG_FAILED", err.to_string());
     }
     // The mesh TLS material: the ingress' router requires it (fatal, D32).
-    if let Err(payload) = distribute_hive_tls(address, &key_path, creds.user.as_str(), hive_id) {
+    if let Err(payload) = push_hive_tls(address, &key_path, creds.user.as_str(), hive_id, &tls) {
         return payload;
     }
     let config_routes_yaml = format!(
@@ -24752,6 +24878,24 @@ fn seed_motherbee_key_over_operator_key(
     result
 }
 
+/// The comment of a per-spoke recovery key the removed `ssh_access=key_only_persist` mode left in
+/// `authorized_keys` (D32). Every join's revoke strips it, so a box joined in that mode loses its
+/// standing SSH door at its next join.
+const RETIRED_SPOKE_RECOVERY_KEY_MARKER: &str = "fluxbee-spoke-recovery";
+
+/// The `authorized_keys` filter both revoke scripts run on `$auth_keys`: it drops the gate line,
+/// the motherbee's bootstrap key and a retired recovery key. The recovery key is matched on its
+/// comment field only (the line's last field), so an operator key that merely mentions the name
+/// stays.
+fn bootstrap_authorized_keys_filter(gate_path: &str, key_material: &str) -> String {
+    format!(
+        "grep -Fv '{gate_path}' \"$auth_keys\" | grep -Fv '{key_material}' | grep -Ev '[[:space:]]{retired}[[:space:]]*$'",
+        gate_path = shell_single_quote(gate_path),
+        key_material = shell_single_quote(key_material),
+        retired = shell_single_quote(RETIRED_SPOKE_RECOVERY_KEY_MARKER),
+    )
+}
+
 /// SO-02: revoke the bootstrap SSH access at the end of a successful add_hive.
 /// The deploy model is SSH-is-bootstrap-only (post-bootstrap is router socket +
 /// syncthing dist-sync; verified: no post-bootstrap path SSHes to a worker), so
@@ -24762,22 +24906,27 @@ fn seed_motherbee_key_over_operator_key(
 /// authorized_keys edit that follows still runs. Best-effort by contract of its
 /// caller (a failure to revoke must not fail an otherwise-successful join, but is
 /// surfaced as `ssh_bootstrap_revoked=false`).
-/// The comment of a per-spoke recovery key the removed `ssh_access=key_only_persist` mode left in
-/// `authorized_keys` (D32). Every join's revoke strips it, so a box joined in that mode loses its
-/// standing SSH door at its next join.
-const RETIRED_SPOKE_RECOVERY_KEY_MARKER: &str = "fluxbee-spoke-recovery";
-
 fn revoke_bootstrap_ssh_access(
     address: &str,
     key_path: &Path,
     user: &str,
     pub_key: &str,
 ) -> Result<(), OrchestratorError> {
+    let script = revoke_bootstrap_ssh_access_script(user, pub_key)?;
+    let cmd = sudo_wrap(&format!("bash -lc '{}'", shell_single_quote(&script)));
+    ssh_with_key(address, key_path, &cmd, user)?;
+    Ok(())
+}
+
+fn revoke_bootstrap_ssh_access_script(
+    user: &str,
+    pub_key: &str,
+) -> Result<String, OrchestratorError> {
     let key_material = pub_key
         .split_whitespace()
         .nth(1)
         .ok_or_else(|| "invalid public key format: missing key material".to_string())?;
-    let script = format!(
+    Ok(format!(
         "set -uo pipefail\n\
 user='{user}'\n\
 rm -f {sudoers} || true\n\
@@ -24785,20 +24934,15 @@ home_dir=\"$(getent passwd \"$user\" | cut -d: -f6)\"\n\
 if [[ -z \"$home_dir\" ]]; then home_dir=\"/home/$user\"; fi\n\
 auth_keys=\"$home_dir/.ssh/authorized_keys\"\n\
 if [[ -f \"$auth_keys\" ]]; then \
-{{ grep -Fv '{gate_path}' \"$auth_keys\" | grep -Fv '{key_material}' | grep -Fv '{retired}' > \"$auth_keys.tmp\"; }} || true; \
+{{ {filter} > \"$auth_keys.tmp\"; }} || true; \
 mv \"$auth_keys.tmp\" \"$auth_keys\" 2>/dev/null || true; \
 chown \"$user:$user\" \"$auth_keys\" 2>/dev/null || true; \
 chmod 600 \"$auth_keys\" 2>/dev/null || true; \
 fi\n",
         user = user,
         sudoers = shell_single_quote(ORCH_SUDOERS_PATH),
-        gate_path = shell_single_quote(ORCH_SSH_GATE_PATH),
-        key_material = shell_single_quote(key_material),
-        retired = RETIRED_SPOKE_RECOVERY_KEY_MARKER,
-    );
-    let cmd = sudo_wrap(&format!("bash -lc '{}'", shell_single_quote(&script)));
-    ssh_with_key(address, key_path, &cmd, user)?;
-    Ok(())
+        filter = bootstrap_authorized_keys_filter(ORCH_SSH_GATE_PATH, key_material),
+    ))
 }
 
 fn bootstrap_authorized_key_cleanup_script(pub_key: &str) -> Result<String, OrchestratorError> {
@@ -24810,13 +24954,11 @@ fn bootstrap_authorized_key_cleanup_script(pub_key: &str) -> Result<String, Orch
         "set -uo pipefail\n\
 auth_keys=\"$HOME/.ssh/authorized_keys\"\n\
 if [[ -f \"$auth_keys\" ]]; then \
-{{ grep -Fv '{gate_path}' \"$auth_keys\" | grep -Fv '{key_material}' | grep -Fv '{retired}' > \"$auth_keys.tmp\"; }} || true; \
+{{ {filter} > \"$auth_keys.tmp\"; }} || true; \
 mv \"$auth_keys.tmp\" \"$auth_keys\" 2>/dev/null || true; \
 chmod 600 \"$auth_keys\" 2>/dev/null || true; \
 fi\n",
-        gate_path = shell_single_quote(ORCH_SSH_GATE_PATH),
-        key_material = shell_single_quote(key_material),
-        retired = RETIRED_SPOKE_RECOVERY_KEY_MARKER,
+        filter = bootstrap_authorized_keys_filter(ORCH_SSH_GATE_PATH, key_material),
     ))
 }
 
@@ -25992,6 +26134,21 @@ mod tests {
                 body.contains("sync_vendor_to_worker("),
                 "{flow} must push vendor — without it the hive never gets syncthing, and the \
                  vendor arrives THROUGH syncthing, so it can never self-repair"
+            );
+            assert!(
+                body.contains("\"VENDOR_SYNC_FAILED\""),
+                "{flow} must fail the join when the vendor push fails, for the same reason"
+            );
+            let issue_at = body
+                .find("issue_hive_tls(")
+                .unwrap_or_else(|| panic!("{flow} must issue the hive's leaf"));
+            let first_ssh = body
+                .find("ssh_with_key(")
+                .expect("each flow probes its key");
+            assert!(
+                issue_at < first_ssh,
+                "{flow} must issue the leaf before its first SSH session, so a CA that cannot \
+                 issue fails the join with nothing done on the box"
             );
             let wait_at = body
                 .find("wait_for_host_to_settle(")
@@ -27175,13 +27332,24 @@ mod tests {
                 literals.push((i + 1, src[i + 1..end].to_string()));
                 blank(&mut out, i + 1, end);
                 i = end + 1;
-            } else if b[i] == b'\'' && i + 2 < b.len() && b[i + 2] == b'\'' {
-                blank(&mut out, i + 1, i + 2);
-                i += 3;
             } else if b[i] == b'\'' && i + 1 < b.len() && b[i + 1] == b'\\' {
-                let end = src[i + 2..].find('\'').map_or(b.len(), |n| i + 2 + n);
+                // An escaped char literal ('\n', '\'', '\u{e9}'): the escaped character is at
+                // i + 2, so the closing quote is looked for after it.
+                let end = src
+                    .get(i + 3..)
+                    .and_then(|rest| rest.find('\''))
+                    .map_or(b.len(), |n| i + 3 + n);
                 blank(&mut out, i + 1, end);
                 i = end + 1;
+            } else if let Some(width) = (b[i] == b'\'')
+                .then(|| src[i + 1..].chars().next())
+                .flatten()
+                .map(char::len_utf8)
+                .filter(|width| src[i + 1 + width..].starts_with('\''))
+            {
+                // A plain char literal, sized by its UTF-8 length ('é' is two bytes).
+                blank(&mut out, i + 1, i + 1 + width);
+                i += 2 + width;
             } else {
                 i += 1;
             }
@@ -27193,17 +27361,37 @@ mod tests {
     }
 
     /// D32: SSH exists only inside `add_hive`. Every place that can start ssh is found: a
-    /// `Command::new` (whose argument must be a literal), or any string literal that names ssh,
-    /// scp, sftp, rsync, sshpass or ssh-keyscan as a program, alone or at the head of a command
-    /// line. From each, every use of the enclosing function is followed upwards (calls, function
-    /// pointers, turbofish) until `accept_add_hive`, the only entry. A use outside any function, or
-    /// a function nothing uses that is not `accept_add_hive`, fails with the chain that reaches it.
-    /// The boot-time TLS reconcile was such a chain (`main`).
+    /// `Command::new` (whose argument must be a literal, and `Command` is never renamed), or any
+    /// string literal that names ssh, scp, sftp, rsync, sshpass, ssh-keyscan, ssh-copy-id or
+    /// autossh in command position (see `names_a_program`). From each, every use of the enclosing
+    /// function is followed upwards (calls, function pointers, turbofish) until `accept_add_hive`,
+    /// the only entry, which `handle_admin` alone calls. A use outside any function, or a function
+    /// nothing uses that is not `accept_add_hive`, fails with the chain that reaches it. The
+    /// boot-time TLS reconcile was such a chain (`main`).
+    ///
+    /// What a source walk cannot see: a closure stored in a static or a struct field and called
+    /// from elsewhere, a thread the join spawns that outlives it, a program name built at runtime.
+    /// Review covers those.
     #[test]
     fn ssh_happens_only_inside_add_hive() {
         let full = include_str!("sy_orchestrator.rs");
-        let src = &full[..full.find("\nmod tests {").expect("tests module")];
+        let tests_at = full.find("\nmod tests {").expect("tests module");
+        let src = &full[..tests_at];
+        // Everything after `mod tests {` must be inside it, or it would escape the walk: a line
+        // of code at column 0 there can only be the module's closing brace (a multi-line
+        // literal's closing quote can sit there too).
+        let (all_code, _) = rust_code_and_literals(full);
+        let after_tests: Vec<&str> = all_code[tests_at + 1..]
+            .lines()
+            .skip(1)
+            .filter(|line| !line.is_empty() && !line.starts_with([' ', '\t', '"']))
+            .collect();
+        assert_eq!(after_tests, vec!["}"], "code after the tests module");
         let (code, literals) = rust_code_and_literals(src);
+        assert!(
+            !Regex::new(r"\bCommand\s+as\b").unwrap().is_match(&code),
+            "`Command` renamed: the walk looks for `Command::new`"
+        );
         let fn_re = Regex::new(
             r#"(?m)^[ \t]*(?:pub(?:\([^)]*\))?\s+)?(?:(?:async|unsafe|const|extern(?:\s+"[^"]*")?)\s+)*fn\s+([A-Za-z_][A-Za-z_0-9]*)"#,
         )
@@ -27227,12 +27415,78 @@ mod tests {
         };
         let mut problems: Vec<String> = Vec::new();
         let mut frontier: Vec<(String, String)> = Vec::new();
-        let programs = ["ssh", "scp", "sftp", "rsync", "sshpass", "ssh-keyscan"];
+        let programs = [
+            "ssh",
+            "scp",
+            "sftp",
+            "rsync",
+            "sshpass",
+            "ssh-keyscan",
+            "ssh-copy-id",
+            "autossh",
+        ];
+        // Words that run a later word as a program.
+        let wrappers = [
+            "sudo",
+            "timeout",
+            "env",
+            "exec",
+            "nohup",
+            "setsid",
+            "command",
+            "nice",
+            "ionice",
+            "stdbuf",
+            "xargs",
+            "sh",
+            "bash",
+            "su",
+            "runuser",
+            "systemd-run",
+            "time",
+            "if",
+            "while",
+            "until",
+            "then",
+            "do",
+            "else",
+            "{",
+            "!",
+        ];
+        // A program in command position: the head of a shell segment (the literal, or a part of
+        // it after `;`, `|`, `&`, `(`, a backtick or a line break, real or escaped), past
+        // wrappers, flags, a flag's value, assignments and numbers (`sudo -n -u x ssh`,
+        // `timeout 5 ssh`, `env A=b ssh`, `bash -lc 'ssh`, `su -c \"ssh`, `if ssh`). A plain
+        // word that follows none of those ends the head: `systemctl restart ssh` names no
+        // program.
         let names_a_program = |text: &str| {
-            text.split_whitespace()
-                .next()
-                .and_then(|word| word.rsplit('/').next())
-                .is_some_and(|program| programs.contains(&program))
+            text.replace("\\n", "\n")
+                .replace("\\\"", "\"")
+                .replace("\\'", "'")
+                .split(|c: char| ";|&(`\n".contains(c))
+                .any(|segment| {
+                    let mut after_flag = false;
+                    for word in segment.split_whitespace() {
+                        let word = word.trim_matches(|c| c == '\'' || c == '"');
+                        let word = word.rsplit('/').next().unwrap_or(word);
+                        if programs.contains(&word) {
+                            return true;
+                        }
+                        let is_flag = word.starts_with('-');
+                        if !(is_flag
+                            || after_flag
+                            || wrappers.contains(&word)
+                            || word.contains('=')
+                            || word
+                                .chars()
+                                .all(|c| c.is_ascii_digit() || ".sm".contains(c)))
+                        {
+                            return false;
+                        }
+                        after_flag = is_flag;
+                    }
+                    false
+                })
         };
         for (at, text) in &literals {
             if names_a_program(text) {
@@ -27295,6 +27549,97 @@ mod tests {
         ] {
             assert!(seen.contains(flow), "the walk never reached {flow}");
         }
+        // The walk stops at `accept_add_hive`, so it must be the admin action's alone.
+        let entry_uses: Vec<Option<String>> = Regex::new(r"\baccept_add_hive\b")
+            .unwrap()
+            .find_iter(&code)
+            .filter(|m| !code[..m.start()].trim_end().ends_with("fn"))
+            .map(|m| owner(m.start()))
+            .collect();
+        assert_eq!(
+            entry_uses,
+            vec![Some("handle_admin".to_string())],
+            "accept_add_hive must have one caller, the admin action"
+        );
+    }
+
+    /// D32: the revoke filter drops the gate line, the bootstrap key and a retired recovery key,
+    /// and keeps every other key, including one whose comment only mentions the recovery name.
+    /// Both revoke scripts run this filter.
+    #[test]
+    fn bootstrap_revoke_filter_keeps_operator_keys() {
+        let home = std::env::temp_dir().join(format!("fluxbee-revoke-filter-{}", Uuid::new_v4()));
+        fs::create_dir_all(home.join(".ssh")).unwrap();
+        let auth_keys = home.join(".ssh/authorized_keys");
+        let keep = [
+            "ssh-ed25519 AAAAoperator ops@laptop",
+            "ssh-ed25519 AAAAnotes notes-on-fluxbee-spoke-recovery",
+            "ssh-ed25519 AAAAmention fluxbee-spoke-recovery is retired",
+        ];
+        let drop = [
+            format!("command=\"{ORCH_SSH_GATE_PATH}\" ssh-ed25519 AAAAgate gate"),
+            "ssh-ed25519 AAAAbootstrap root@motherbee".to_string(),
+            "ssh-ed25519 AAAArecovery fluxbee-spoke-recovery".to_string(),
+            "restrict ssh-ed25519 AAAArecovery2 fluxbee-spoke-recovery  ".to_string(),
+        ];
+        let mut lines: Vec<String> = keep.iter().map(|l| l.to_string()).collect();
+        lines.extend(drop.iter().cloned());
+        fs::write(&auth_keys, lines.join("\n") + "\n").unwrap();
+        let script =
+            bootstrap_authorized_key_cleanup_script("ssh-ed25519 AAAAbootstrap root@motherbee")
+                .unwrap();
+        let status = Command::new("bash")
+            .arg("-c")
+            .arg(&script)
+            .env("HOME", &home)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let left = fs::read_to_string(&auth_keys).unwrap();
+        assert_eq!(left.lines().collect::<Vec<_>>(), keep.to_vec());
+        let revoke =
+            revoke_bootstrap_ssh_access_script("admin", "ssh-ed25519 AAAAbootstrap x").unwrap();
+        assert!(revoke.contains(&bootstrap_authorized_keys_filter(
+            ORCH_SSH_GATE_PATH,
+            "AAAAbootstrap"
+        )));
+        let _ = fs::remove_dir_all(&home);
+    }
+
+    /// The guard's tokenizer: char literals with an escaped quote or a multi-byte character do
+    /// not swallow the code after them.
+    #[test]
+    fn guard_tokenizer_keeps_code_after_tricky_char_literals() {
+        let snippet =
+            "let q = ['\\'', '\"', 'é', '\\u{e9}']; Command::new(\"ssh\"); let p = \"\\\"\";";
+        let (code, literals) = rust_code_and_literals(snippet);
+        assert!(code.contains("Command::new("), "{code}");
+        assert!(
+            literals.iter().any(|(_, text)| text == "ssh"),
+            "{literals:?}"
+        );
+        assert_eq!(code.len(), snippet.len());
+    }
+
+    /// D32: the admin action itself refuses the removed field, with nothing started.
+    #[tokio::test]
+    async fn accept_add_hive_answers_ssh_access_with_invalid_request() {
+        let state = Arc::new(sample_orchestrator_state_for_tests());
+        let reply = accept_add_hive(
+            &state,
+            &serde_json::json!({
+                "hive_id": "worker9",
+                "address": "10.0.0.9",
+                "ssh_access": "key_only_persist",
+            }),
+        )
+        .await;
+        assert_eq!(reply["error_code"], "INVALID_REQUEST", "{reply}");
+        assert!(
+            reply["message"].as_str().is_some_and(|m| m.contains("D32")),
+            "{reply}"
+        );
+        assert!(!state.any_hive_topology_busy());
     }
 
     /// D32: a request with the removed field is refused before anything starts.
@@ -33585,5 +33930,36 @@ blob:
         ));
         assert!(!should_purge_inactive_kill_target(true, None));
         assert!(!should_purge_inactive_kill_target(true, Some("   ")));
+    }
+
+    #[test]
+    fn syncthing_restarts_only_a_running_service_left_on_an_old_binary_or_unit() {
+        // active, binary_updated, unit_changed, runs_replaced_binary
+        assert!(syncthing_runs_stale(true, true, false, false));
+        assert!(syncthing_runs_stale(true, false, true, false));
+        // A restart an earlier call lost: nothing changed now, but the process runs a deleted file.
+        assert!(syncthing_runs_stale(true, false, false, true));
+        assert!(!syncthing_runs_stale(true, false, false, false));
+        // A stopped service starts on what is on disk: nothing to restart.
+        assert!(!syncthing_runs_stale(false, true, true, true));
+    }
+
+    #[test]
+    fn vendor_update_reports_what_it_did() {
+        let installed_and_restarted = vendor_update_result(SyncthingRuntimeOutcome {
+            binary_updated: true,
+            restarted: true,
+        });
+        assert_eq!(installed_and_restarted.updated, vec!["syncthing"]);
+        assert!(installed_and_restarted.unchanged.is_empty());
+        assert_eq!(
+            installed_and_restarted.restarted,
+            vec![SYNCTHING_SERVICE_NAME]
+        );
+
+        let nothing_new = vendor_update_result(SyncthingRuntimeOutcome::default());
+        assert!(nothing_new.updated.is_empty());
+        assert_eq!(nothing_new.unchanged, vec!["syncthing"]);
+        assert!(nothing_new.restarted.is_empty());
     }
 }

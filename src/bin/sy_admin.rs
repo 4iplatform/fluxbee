@@ -5780,8 +5780,9 @@ fn enforce_cloud_relay_content(
             // translate reads owner_node from params OR metadata — check the top-level too.
             owner_node_ok(params.get("owner_node"))?;
             // Reserved infra namespaces: the Cloud relay stores PROVIDER tokens, never the keys that
-            // protect the mesh itself (endpoint bearers `edge_channel_secret:*`, `edge_tls`, spoke
-            // recovery keys `ssh:*`). Reject so a semi-trusted/compromised relay cannot overwrite an
+            // protect the mesh itself (endpoint bearers `edge_channel_secret:*`, `edge_tls`, and
+            // `ssh:*`, kept reserved since D32 retired the spoke recovery keys stored there).
+            // Reject so a semi-trusted/compromised relay cannot overwrite an
             // externalized endpoint's OWN bearer (DoS/takeover) or another infra secret. Single
             // source: fluxbee_sdk::vault (io.cloud mirrors it for a clean early error).
             let key = params.get("key").and_then(|v| v.as_str()).unwrap_or_default();
