@@ -21,6 +21,7 @@
 
 | Versión | Fecha (ART) | Commit | Alcance | Estado | Rollback |
 |---|---|---|---|---|---|
+| **0.1.60** | 2026-10-06 | `0af5469` | motherbee + spokes (core) | ✅ live | snap `pre-hardening-0-1-60` (las 4 VMs) · `apt install fluxbee=0.1.59` |
 | **0.1.59** | 2026-10-06 | `f60eb92` | motherbee + spokes (core) | ✅ live | snap `pre-stage3-0-1-59` (las 4 VMs) · `apt install fluxbee=0.1.58` |
 | **0.1.58** | 2026-10-06 | `9d9391b` | motherbee + spokes (core) | ✅ live | snap `pre-stage2-0-1-58` (las 4 VMs) · `apt install fluxbee=0.1.57` |
 | **0.1.57** | 2026-10-06 | `a703b89` | motherbee + spokes (core) | ✅ live | snap `pre-posture-0-1-57` (las 4 VMs) · `apt install fluxbee=0.1.56` |
@@ -68,6 +69,41 @@
 > (`dpkg-scanpackages -m`) para rollback, pero su detalle vive en la bitácora, no acá.
 
 ---
+
+## 0.1.60 — Escrituras de root en árboles de `fluxbee`; el join espera a que la caja se asiente (A-51, A-52)
+
+- **Fecha:** 2026-10-06 (ART) · **Versión anterior:** 0.1.59 · **Commits:** `d3710c4`..`05ac354`,
+  merge `0af5469` (FINDINGS A-51, A-52; tres revisiones adversariales).
+- **Alcance:** motherbee + los tres spokes (core-update).
+- **Qué cambió:**
+  - **El `dist/` del motherbee es de root** y Syncthing solo lo lee (`root:fluxbee`, 0750,
+    `g+rX,go-w`); los links adentro se borran. Lo hacen el preinst (antes del unpack) y el orquestador
+    en cada arranque. `blob/`, el home de Syncthing y el `dist/` de los spokes no cambian.
+  - Escrituras de root: temporal `O_EXCL` con token por ejecución y prefijo `.syncthing.`, modo sobre
+    el descriptor; directorios administrados abiertos `O_NOFOLLOW` (lo que no es un directorio se deja
+    y se reporta, sin tumbar el arranque); el marcador `.stfolder` nunca sigue un symlink.
+  - Los joins esperan, antes del sudoers, a que systemd termine de arrancar y a que no corra una etapa
+    de cloud-init ni un job diario de apt (hasta 15 min; fase `waiting_for_host`; `HOST_NOT_SETTLED`).
+- **Deploy:** build 8 min (`0af5469`), publish 12 s, deploy 192 s; snapshots `pre-hardening-0-1-60`
+  en las 4 VMs (se borró `pre-posture-0-1-57`). Los spokes recibieron el core por Syncthing desde el
+  `dist/` ya de root: la distribución funciona.
+- **Gate:**
+  - Motherbee: `dist/` `root:fluxbee 750`, las 107 entradas `root:fluxbee`, 0 links, 0 temporales;
+    `blob/*` y `syncthing/` de `fluxbee`; sin errores de Syncthing ni del orquestador.
+  - Spokes sin cambios de dueño; `posture-check --stage 3` ok en los 4; OPA in_sync 4/4; versiones
+    0.1.60 en los 4; health `failed=0`.
+  - A-52 lo valida el próximo join (VM 104, clon recién creado).
+- **Incidente durante la verificación (mío, resuelto):** un script de verificación corrió
+  `sy-orchestrator --version` y `rt-gateway --version` en el motherbee; esos binarios no tienen
+  `--version` y arrancaron como segundas instancias.
+  - El orquestador de más (~11 min) fue rechazado por el router (UUID ya conectado) y pisó el PID.
+  - El router de más (~84 s) recreó los archivos de socket; al matarlo, los paths quedaron muertos
+    (los nodos conectados siguieron; uno que se reiniciara no habría podido volver).
+  - Arreglo: matar solo esos procesos y reiniciar `rt-gateway` y `sy-orchestrator`. Después: sockets
+    ok, PID ok, health `failed=0` en los 4, 15 nodos activos, OPA 4/4, `--stage 3` ok.
+  - Regla: una verificación nunca ejecuta binarios del producto; las versiones salen de `/versions` o
+    `dpkg-query`.
+- **Visto:** en worker1 y egress1 no existe el usuario `fluxbee`: Syncthing corre como root (A-58).
 
 ## 0.1.59 — Syncthing sin infraestructura pública (etapa 3 de la postura)
 

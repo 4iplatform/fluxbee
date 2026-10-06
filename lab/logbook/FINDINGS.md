@@ -994,6 +994,19 @@ Visto al arreglar los e2e de A-37, leyendo `src/router/mod.rs` y `src/shm/mod.rs
   binario generaría uno como root); si no, el `myID` del Syncthing en marcha. Nunca `config.xml`.
 - **Estado:** construido; lo ejercita el próximo join (el de A-48).
 
+### A-58 🟡 PARA ARREGLAR — En los workers y el egress Syncthing corre como root
+
+- **Qué pasa (visto el 2026-10-06 en PROD, solo lectura):** worker1 y egress1 no tienen el usuario
+  `fluxbee`, así que `resolve_syncthing_service_user` cae al respaldo root: Syncthing y todo su
+  `dist/` son de root. El bootstrap del ingress crea el usuario (`useradd`), el de worker y egress no
+  (`worker_remote_base_dirs_command`).
+- **Impacto:** un Syncthing comprometido en esos hosts ya es root. Desde la etapa 3 escucha solo en
+  loopback y su único par es el motherbee, así que hace falta comprometer antes al motherbee.
+- **Arreglo propuesto:** que los bootstraps de worker y egress creen el usuario como el del ingress, y
+  que un spoke existente pase su Syncthing a ese usuario en su próximo arranque (unit `User=`, dueño de
+  `dist/` y del home). Va en un paso propio con validación: cambia el usuario de un servicio vivo.
+- **Estado:** para arreglar.
+
 ### A-56 🟡 PARA ARREGLAR — Root escribe por ruta en el `blob/` del usuario de Syncthing
 
 - **Qué pasa (tercera revisión adversarial de A-51, 2026-10-06; verificado paso a paso en el código,
