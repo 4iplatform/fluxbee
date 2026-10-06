@@ -358,15 +358,16 @@ configured address (schema example `0.0.0.0:19091`), and Cloud and its adapter r
 | D22 *(rev 4)* | No verify probes, commit-confirm timers or quarantines. A ruleset is enforced only after it ran clean in observe. It filters only inbound, keeps established connections, and depends on no remote data. |
 | D23 *(2026-10-06)* | The Docker lab is removed: it was old and unused. Every stage is validated on the 8.x Proxmox testbed. The Docker quickstart leaves the open-source site. The rest of `lab/` (Proxmox, ops, logbooks) stays. |
 | D24 *(rev 5)* | The A-48 guard ships with stage 1: the motherbee refuses `ADD_HIVE_FINALIZE` and `REMOVE_HIVE_CLEANUP`. On the motherbee they are a kill switch any orchestrator can pull, and they depend on nothing in the posture work. |
-| D25 *(rev 6, proposed)* | The ufw/firewalld writes into an inactive firewall are removed (the inert code of the approved stage 4). Where ufw is active or firewalld is running, the orchestrator still opens the role's declared ports there, so a customer host with its own firewall keeps working with no configuration. |
-| D26 *(rev 6, proposed)* | No automatic teardown on downgrade or rollback: the host keeps its last ruleset, which is harmless without per-hive sets, and break-glass is the escape. Only package remove/purge tears down. |
-| D27 *(rev 6, proposed)* | `remove_hive` does not tear the posture down, so a removed ingress or egress does not reopen SSH on its external interface. Repurposing a box is one documented command. |
-| D28 *(rev 7)* | Under D3 enforce can only cut three things: SSH through non-internal interfaces, undeclared listeners (cut on purpose, and reported) and special UDP/ICMP (allowed explicitly). So the automatic switch is gated by SSH logins through non-internal interfaces plus preconditions, and packet accounting is report-only. Nothing an attacker or a scanner sends can hold a host in observe. |
+| D25 *(operator, 2026-10-06)* | Fluxbee is installed only on clean Linux boxes created for it, so there is no existing firewall to coexist with. The orchestrator's ufw/firewalld writes are removed (they are inert on such boxes). An active ufw or firewalld found on a host is reported as a third-party firewall (health fails) and the host stays in observe; nothing is written into it. |
+| D26 *(operator, 2026-10-06)* | No automatic teardown on downgrade or rollback: the host keeps its last ruleset, which is harmless without per-hive sets, and break-glass is the escape. Only package remove/purge tears down. |
+| D27 *(operator, 2026-10-06)* | `remove_hive` does not tear the posture down, so a removed ingress or egress does not reopen SSH on its external interface. Repurposing a box is one documented command. |
+| D28 *(operator, 2026-10-06; refines what D21's clean window and D22's "ran clean" mean, A5-2)* | Under D3 enforce can only cut three things: SSH through non-internal interfaces, undeclared listeners (cut on purpose, and reported) and special UDP/ICMP (allowed explicitly). So the automatic switch is gated by SSH logins through non-internal interfaces plus preconditions, and packet accounting is report-only. Nothing an attacker or a scanner sends can hold a host in observe. |
 
 ### 2.2 Open — the operator decides
 
-The core questions are answered: the operator approved D3 and D16 (2026-10-05). §8 lists what the
-design itself still has to fix before stages 2–5.
+The core questions are answered: the operator approved D3 and D16 (2026-10-05), and D25–D28
+(2026-10-06; D25 resolved by the deployment model: Fluxbee runs only on clean boxes created for
+it). §8 lists what the design itself still has to fix before stages 4–5.
 
 Before stages 6–7 (the Cloud phase):
 
@@ -778,12 +779,12 @@ wait set from the registry and the folders, and the motherbee's combined write.
   run.
 - The egress keeps failing loud without `nft`, because its NAT needs it.
 
-**ufw / firewalld** (D25, proposed).
+**ufw / firewalld** (D25, operator 2026-10-06).
 
-- The writes into an inactive ufw are removed.
-- Where ufw is active or firewalld is running, the orchestrator opens the role's declared accepts
-  there: motherbee 9000, 9100, 22000; ingress its edge port. SSH is left to the customer's own
-  rules. The host stays in observe, and the report says so.
+- Fluxbee runs only on clean Linux boxes created for it, so the orchestrator's ufw/firewalld
+  writes are removed.
+- An active ufw or firewalld found on a host is a third-party firewall (§3.6): reported, health
+  fails, the host stays in observe. Nothing is written into it.
 
 **`add_hive`.**
 
@@ -791,7 +792,7 @@ wait set from the registry and the folders, and the motherbee's combined write.
 - Nothing is admitted on the motherbee beyond the A-48 pin.
 - The spoke starts in observe.
 
-**`remove_hive`** (D27, proposed).
+**`remove_hive`** (D27, operator 2026-10-06).
 
 - The cleanup script runs in a transient unit outside sy-orchestrator's cgroup
   (`systemd-run --unit=fluxbee-remove-cleanup --collect`), as the self-restart already does.
