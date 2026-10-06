@@ -797,6 +797,7 @@ struct SystemUpdateRequest {
 
 #[tokio::main]
 async fn main() -> Result<(), OrchestratorError> {
+    let _ = PROCESS_STARTED.set(std::time::SystemTime::now());
     if cfg!(not(target_os = "linux")) {
         eprintln!("sy_orchestrator supports only Linux targets.");
         std::process::exit(1);
@@ -5582,6 +5583,119 @@ fn current_dist_runtime_config(state: &OrchestratorState) -> DistRuntimeConfig {
     }
 }
 
+/// The numeric uid and gid of a local user (`id -u`, `id -g`).
+fn linux_user_ids(user: &str) -> Result<(u32, u32), OrchestratorError> {
+    let id = |flag: &str| -> Result<u32, OrchestratorError> {
+        let mut cmd = Command::new("id");
+        cmd.arg(flag).arg(user);
+        let out = run_cmd_output(cmd, "id")?;
+        out.trim()
+            .parse::<u32>()
+            .map_err(|err| format!("id {flag} {user}: {err}").into())
+    };
+    Ok((id("-u")?, id("-g")?))
+}
+
+/// How long a join waits, in all, for a fresh box to settle (FINDINGS A-52).
+const FIRST_BOOT_WAIT_SECS: u64 = 900;
+
+/// The remote script that waits, at most `secs` seconds, while something that restarts sshd or
+/// reboots the box is still running there (FINDINGS A-52): cloud-init (on a fresh clone it runs a
+/// dist-upgrade at first boot, which restarts sshd, and reboots when the upgrade asks for it) and
+/// apt's daily jobs (unattended-upgrades, which a box that missed its schedule runs right after
+/// it boots). A join running alongside either loses its SSH channel half-way. It waits only while
+/// one of them RUNS: a box whose cloud-init will not run this boot (disabled, masked) says "not
+/// started" for ever, and `cloud-init status --wait` would wait on that. A oneshot unit is
+/// "activating" while it runs, so any state but inactive/failed counts. Exit 124 says what is
+/// still running.
+fn first_boot_wait_script(secs: u64) -> String {
+    format!(
+        "end=$(( $(date +%s) + {secs} )); \
+         while :; do \
+         busy=; \
+         if command -v cloud-init >/dev/null 2>&1; then \
+         case \"$(timeout 30 cloud-init status 2>/dev/null)\" in *running*) busy=cloud-init ;; esac; \
+         fi; \
+         if [ -z \"$busy\" ] && systemctl is-active apt-daily.service apt-daily-upgrade.service 2>/dev/null | grep -qvx -e inactive -e failed -e unknown; then busy=apt-daily; fi; \
+         if [ -z \"$busy\" ]; then exit 0; fi; \
+         if [ \"$(date +%s)\" -ge \"$end\" ]; then echo \"still running: $busy\"; exit 124; fi; \
+         sleep 5; \
+         done"
+    )
+}
+
+fn first_boot_wait_command(secs: u64) -> String {
+    format!("sudo -n /bin/bash -lc '{}'", first_boot_wait_script(secs))
+}
+
+/// Waits, before a join changes the box, until it has settled (FINDINGS A-52), at most
+/// `FIRST_BOOT_WAIT_SECS` in all. cloud-init may reboot the box while it settles, so a dropped or
+/// refused connection is tried again until that deadline, never past it. The session sends
+/// keepalives: it is silent while it waits, and a path that died silently would otherwise hold the
+/// join (and its topology lock) until the kernel gives up on the connection, two hours later.
+fn wait_remote_first_boot(
+    address: &str,
+    key_path: &Path,
+    user: &str,
+) -> Result<(), OrchestratorError> {
+    let deadline = Instant::now() + Duration::from_secs(FIRST_BOOT_WAIT_SECS);
+    tracing::info!(
+        target = address,
+        "waiting for the box to settle (cloud-init, apt daily jobs)"
+    );
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now()).as_secs();
+        let mut cmd = Command::new("ssh");
+        cmd.arg("-i")
+            .arg(key_path)
+            .arg("-o")
+            .arg("IdentitiesOnly=yes")
+            .arg("-o")
+            .arg("BatchMode=yes")
+            .arg("-o")
+            .arg("PreferredAuthentications=publickey")
+            .arg("-o")
+            .arg("PasswordAuthentication=no")
+            .arg("-o")
+            .arg("LogLevel=ERROR")
+            .arg("-o")
+            .arg("StrictHostKeyChecking=no")
+            .arg("-o")
+            .arg("UserKnownHostsFile=/dev/null")
+            .arg("-o")
+            .arg("ConnectTimeout=10")
+            .arg("-o")
+            .arg("ServerAliveInterval=15")
+            .arg("-o")
+            .arg("ServerAliveCountMax=4")
+            .arg(format!("{user}@{address}"))
+            .arg(first_boot_wait_command(remaining));
+        let output = cmd.output()?;
+        if output.status.success() {
+            return Ok(());
+        }
+        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        if output.status.code() == Some(124) {
+            return Err(format!(
+                "the box is still settling after {FIRST_BOOT_WAIT_SECS} s ({stdout}); retry once it settles (HANDBOOK §3.4)"
+            )
+            .into());
+        }
+        if remaining > 0 && is_transient_ssh_error(&stderr) {
+            tracing::warn!(
+                target = address,
+                error = %stderr,
+                "lost the box while it settles (it may be rebooting); trying again"
+            );
+            std::thread::sleep(Duration::from_secs(5));
+            continue;
+        }
+        let detail = if stderr.is_empty() { stdout } else { stderr };
+        return Err(format!("could not check whether the box has settled: {detail}").into());
+    }
+}
+
 fn linux_user_exists(user: &str) -> bool {
     Command::new("id")
         .arg("-u")
@@ -5630,20 +5744,37 @@ fn resolve_syncthing_service_user(blob: &BlobRuntimeConfig) -> Result<String, Or
     .into())
 }
 
-fn ensure_dir_permissions_0750(path: &Path) -> Result<(), OrchestratorError> {
+/// Creates `path` when missing and opens it as the directory it must be, never through a symlink
+/// (FINDINGS A-51). Some of these sit inside a directory the Syncthing user owns (`blob/active`,
+/// `blob/staging`, `blob/public`), so that user can put a symlink where one should be; root
+/// following it would chmod or chown whatever it points at.
+fn open_managed_dir(path: &Path) -> Result<fs::File, OrchestratorError> {
     fs::create_dir_all(path)?;
-    let mut perms = fs::metadata(path)?.permissions();
-    perms.set_mode(0o750);
-    fs::set_permissions(path, perms)?;
+    fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(nix::libc::O_DIRECTORY | nix::libc::O_NOFOLLOW)
+        .open(path)
+        .map_err(|err| {
+            format!(
+                "'{}' must be a plain directory, a symlink there is refused: {err}",
+                path.display()
+            )
+            .into()
+        })
+}
+
+fn ensure_dir_permissions_0750(path: &Path) -> Result<(), OrchestratorError> {
+    let dir = open_managed_dir(path)?;
+    dir.set_permissions(fs::Permissions::from_mode(0o750))?;
     Ok(())
 }
 
 fn ensure_owned_dir(path: &Path, user: &str) -> Result<(), OrchestratorError> {
-    ensure_dir_permissions_0750(path)?;
-    let group = linux_user_primary_group(user).unwrap_or_else(|| user.to_string());
-    let mut chown = Command::new("chown");
-    chown.arg(format!("{user}:{group}")).arg(path);
-    run_cmd(chown, "chown syncthing dir ownership")
+    let dir = open_managed_dir(path)?;
+    dir.set_permissions(fs::Permissions::from_mode(0o750))?;
+    let (uid, gid) = linux_user_ids(user)?;
+    std::os::unix::fs::fchown(&dir, Some(uid), Some(gid))?;
+    Ok(())
 }
 
 fn ensure_owned_tree(path: &Path, user: &str) -> Result<(), OrchestratorError> {
@@ -5652,20 +5783,6 @@ fn ensure_owned_tree(path: &Path, user: &str) -> Result<(), OrchestratorError> {
     let mut chown = Command::new("chown");
     chown.arg("-R").arg(format!("{user}:{group}")).arg(path);
     run_cmd(chown, "chown syncthing tree ownership")
-}
-
-fn ensure_owned_file(path: &Path, user: &str) -> Result<(), OrchestratorError> {
-    if !path.is_file() {
-        return Err(format!(
-            "syncthing ownership target is not a file: {}",
-            path.display()
-        )
-        .into());
-    }
-    let group = linux_user_primary_group(user).unwrap_or_else(|| user.to_string());
-    let mut chown = Command::new("chown");
-    chown.arg(format!("{user}:{group}")).arg(path);
-    run_cmd(chown, "chown syncthing file ownership")
 }
 
 fn syncthing_binary_available() -> bool {
@@ -6949,50 +7066,6 @@ fn ensure_syncthing_installed() -> Result<(), OrchestratorError> {
     if !syncthing_binary_available() {
         return Err("syncthing install finished but installed binary is still missing".into());
     }
-    Ok(())
-}
-
-fn ensure_local_syncthing_vendor_layout(service_user: &str) -> Result<(), OrchestratorError> {
-    if !Path::new(SYNCTHING_INSTALL_PATH).exists() {
-        return Err("syncthing installed binary missing while ensuring vendor layout".into());
-    }
-    let target_path = Path::new(DIST_SYNCTHING_VENDOR_SOURCE_PATH);
-    if let Some(parent) = target_path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-
-    // Skip when the target already matches. This used to rewrite ~35 MB unconditionally on
-    // EVERY call, and `ensure_blob_sync_runtime` is called from the health watchdog — so any
-    // condition that keeps `folders_healthy=false` turns this into a 35 MB rewrite every five
-    // seconds. Comparing first makes the steady state a no-op.
-    let source_meta = fs::metadata(SYNCTHING_INSTALL_PATH)?;
-    let already_current = match fs::metadata(target_path) {
-        Ok(target_meta) => {
-            target_meta.len() == source_meta.len()
-                && sha256_file(Path::new(SYNCTHING_INSTALL_PATH))
-                    .ok()
-                    .zip(sha256_file(target_path).ok())
-                    .is_some_and(|(a, b)| a.eq_ignore_ascii_case(&b))
-        }
-        Err(_) => false,
-    };
-    if already_current {
-        return Ok(());
-    }
-
-    // Atomic: temp sibling + rename, never `install` in place.
-    //
-    // `install` unlinks and recreates, so a concurrent reader sees a partially written file.
-    // That is not hypothetical: on 2026-07-30 an `add_hive role=ingress` failed with
-    // "vendor manifest size mismatch: expected=35806960 actual=22364160" — 62 %, an exact
-    // multiple of the filesystem block size, i.e. a copy caught in flight. The tell was that
-    // the HASH check (which runs first, on a `sha256sum` that had already pinned the old
-    // complete inode) passed while the SIZE check, re-resolving the PATH, landed on the new
-    // half-written one. `ensure_blob_sync_runtime` contains both the reader
-    // (`ensure_syncthing_installed`) and this writer, and nothing serialises it against the
-    // watchdog running concurrently.
-    copy_exec_file(Path::new(SYNCTHING_INSTALL_PATH), target_path)?;
-    ensure_owned_file(target_path, service_user)?;
     Ok(())
 }
 
@@ -9913,14 +9986,24 @@ fn reconcile_local_syncthing_folders(
     Ok(changed_folders)
 }
 
+/// Creates the folder's `.stfolder` marker when it has none. Created exclusively: the folder may
+/// belong to the Syncthing user, and `fs::write` through a dangling `.stfolder` symlink would have
+/// root create the file it points at (FINDINGS A-51). Anything already there counts as present.
 fn ensure_syncthing_folder_marker(path: &Path) -> Result<bool, OrchestratorError> {
     fs::create_dir_all(path)?;
-    let marker = path.join(".stfolder");
-    if marker.exists() {
-        return Ok(false);
+    match fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .custom_flags(nix::libc::O_NOFOLLOW)
+        .open(path.join(".stfolder"))
+    {
+        Ok(mut marker) => {
+            marker.write_all(b"fluxbee syncthing marker\n")?;
+            Ok(true)
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => Ok(false),
+        Err(err) => Err(err.into()),
     }
-    fs::write(&marker, b"fluxbee syncthing marker\n")?;
-    Ok(true)
 }
 
 fn ensure_syncthing_folder_markers(
@@ -9979,8 +10062,6 @@ async fn ensure_blob_sync_runtime(
     let repaired_markers = ensure_syncthing_folder_markers(blob, dist, is_motherbee, role)?;
 
     ensure_syncthing_installed()?;
-    let service_user = resolve_syncthing_service_user(&sync)?;
-    ensure_local_syncthing_vendor_layout(&service_user)?;
     ensure_syncthing_unit(&sync)?;
     ensure_syncthing_firewall_local();
     tracing::info!(
@@ -19337,29 +19418,115 @@ fn materialize_role_core_trees(
     Ok(changed_roles)
 }
 
-/// Copy an executable, preserving 0755, via a temp file + rename so a reader (syncthing, or a
-/// spoke mid-scan) never sees a partial binary.
+/// Copy an executable as 0755, via a temp file + rename so a reader (syncthing, or a spoke
+/// mid-scan) never sees a partial binary.
 fn copy_exec_file(src: &Path, dst: &Path) -> Result<(), OrchestratorError> {
     let bytes = fs::read(src)?;
-    write_file_atomic(dst, &bytes)?;
-    set_exec_0755(dst)?;
-    Ok(())
+    write_new_file_atomic(dst, &bytes, 0o755, Some(0o755))
 }
 
-/// Write `bytes` to `path` atomically (temp sibling + rename).
+/// Write `bytes` to `path` atomically (temp sibling + rename), with the mode `fs::write` gives.
 fn write_file_atomic(path: &Path, bytes: &[u8]) -> Result<(), OrchestratorError> {
+    write_new_file_atomic(path, bytes, 0o666, None)
+}
+
+/// How old a temp of ours must be before a later write sweeps it: a write in flight is never
+/// that old, so a concurrent writer of the same path keeps its temp.
+const STALE_WRITE_TEMP_SECS: u64 = 10 * 60;
+
+/// When this run of the orchestrator started (set first thing in `main`). A temp of ours from
+/// before it was left by an earlier run that died mid-write, and the next write sweeps it at once.
+static PROCESS_STARTED: OnceLock<std::time::SystemTime> = OnceLock::new();
+
+/// Writes `bytes` to a new temp sibling of `path` and renames it over `path` (FINDINGS A-51).
+///
+/// Parts of the dist tree belong to the Syncthing user while the orchestrator is root, so the
+/// last component is not trusted to be what its name says: the temp is created exclusively
+/// (`O_EXCL`, never through a planted entry) under an unpredictable name, and its mode is set on
+/// the open file before the rename, never on a path. It used to be a fixed `.name.tmp` written
+/// with `fs::write`, which follows a symlink, and a mode set afterwards with `chmod` on the path.
+/// A directory ABOVE the file that the Syncthing user can replace is still followed: that part of
+/// A-51 is open.
+///
+/// The temp is `.syncthing.<name>.fluxbee-<random>.tmp`: Syncthing skips that prefix in a shared
+/// folder (its own temps use it) and drops such a file after a day, so a temp is never sent to a
+/// peer, not even one a crash left behind. `create_mode` is the mode the temp is created with (the
+/// umask applies, as with `fs::write`); `exact_mode`, when given, is set on the descriptor.
+fn write_new_file_atomic(
+    path: &Path,
+    bytes: &[u8],
+    create_mode: u32,
+    exact_mode: Option<u32>,
+) -> Result<(), OrchestratorError> {
     let parent = path
         .parent()
         .ok_or_else(|| format!("path '{}' has no parent directory", path.display()))?;
     fs::create_dir_all(parent)?;
-    let tmp = parent.join(format!(
-        ".{}.tmp",
-        path.file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("fluxbee-write")
-    ));
-    fs::write(&tmp, bytes)?;
-    fs::rename(&tmp, path)?;
+    let name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("fluxbee-write");
+    let prefix = format!(".syncthing.{name}.fluxbee-");
+    let legacy_tmp = format!(".{name}.tmp");
+    // A second of slack: the kernel stamps files from a coarser clock than `SystemTime::now`.
+    let started = PROCESS_STARTED
+        .get()
+        .and_then(|started| started.checked_sub(Duration::from_secs(1)));
+    if let Ok(entries) = fs::read_dir(parent) {
+        for entry in entries.flatten() {
+            let ours = entry.file_name().to_str().is_some_and(|n| {
+                (n.starts_with(&prefix) && n.ends_with(".tmp")) || n == legacy_tmp
+            });
+            if !ours {
+                continue;
+            }
+            let Ok(modified) = entry.metadata().and_then(|m| m.modified()) else {
+                continue;
+            };
+            let stale = started.is_some_and(|started| modified < started)
+                || modified
+                    .elapsed()
+                    .is_ok_and(|age| age.as_secs() >= STALE_WRITE_TEMP_SECS);
+            if stale {
+                let _ = fs::remove_file(entry.path());
+            }
+        }
+    }
+    let mut created = None;
+    for _ in 0..8 {
+        let tmp = parent.join(format!("{prefix}{:016x}.tmp", rand::random::<u64>()));
+        match fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(create_mode)
+            .open(&tmp)
+        {
+            Ok(file) => {
+                created = Some((file, tmp));
+                break;
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(err) => return Err(err.into()),
+        }
+    }
+    let (mut file, tmp) = created
+        .ok_or_else(|| format!("could not create a temp file next to '{}'", path.display()))?;
+    let result = (|| -> Result<(), OrchestratorError> {
+        file.write_all(bytes)?;
+        if let Some(mode) = exact_mode {
+            file.set_permissions(fs::Permissions::from_mode(mode))?;
+        }
+        file.sync_all()?;
+        fs::rename(&tmp, path)?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&tmp);
+        return result;
+    }
+    if let Err(err) = fs::File::open(parent).and_then(|dir| dir.sync_all()) {
+        tracing::warn!(path = %path.display(), error = %err, "could not fsync the directory after a write");
+    }
     Ok(())
 }
 
@@ -21521,6 +21688,14 @@ async fn add_hive_flow(
             "message": format!("key access verification failed after bootstrap seed: {err}"),
         });
     }
+    if let Err(err) = wait_remote_first_boot(address, &key_path, creds.user.as_str()) {
+        return serde_json::json!({
+            "status": "error",
+            "error_code": "HOST_NOT_SETTLED",
+            "retryable": true,
+            "message": err.to_string(),
+        });
+    }
 
     let core_manifest = match load_core_manifest() {
         Ok(manifest) => manifest,
@@ -22406,6 +22581,15 @@ async fn add_egress_hive_flow(
             format!("key access verification failed: {err}"),
         );
     }
+    if let Err(err) = wait_remote_first_boot(address, &key_path, creds.user.as_str()) {
+        // Retryable: the bootstrap key stays, so the retry is key-first.
+        return serde_json::json!({
+            "status": "error",
+            "error_code": "HOST_NOT_SETTLED",
+            "retryable": true,
+            "message": err.to_string(),
+        });
+    }
 
     // Resolve the egress profile template from motherbee's own hive.yaml
     // (system_nodes.egress), symmetric with the worker template.
@@ -23101,6 +23285,15 @@ async fn add_ingress_hive_flow(
             "SSH_KEY_FAILED",
             format!("key access verification failed: {err}"),
         );
+    }
+    if let Err(err) = wait_remote_first_boot(address, &key_path, creds.user.as_str()) {
+        // Retryable: the bootstrap key stays, so the retry is key-first.
+        return serde_json::json!({
+            "status": "error",
+            "error_code": "HOST_NOT_SETTLED",
+            "retryable": true,
+            "message": err.to_string(),
+        });
     }
 
     // Resolve the ingress profile template from motherbee's own hive.yaml.
@@ -26050,6 +26243,14 @@ mod tests {
                 "{flow} must push vendor — without it the hive never gets syncthing, and the \
                  vendor arrives THROUGH syncthing, so it can never self-repair"
             );
+            let wait_at = body
+                .find("wait_remote_first_boot(")
+                .unwrap_or_else(|| panic!("{flow} must wait for the box to settle (A-52)"));
+            let push_at = body.find("sync_core_to_worker(").expect("checked above");
+            assert!(
+                wait_at < push_at,
+                "{flow} must wait for the box to settle before it installs anything there (A-52)"
+            );
             assert!(
                 body.contains("ensure_syncthing_peer_link_runtime("),
                 "{flow} must link the spoke's Syncthing device — without it motherbee's \
@@ -28800,6 +29001,289 @@ mod tests {
             full
         );
         assert!(serde_json::from_str::<SyncthingPostureState>("not json").is_err());
+    }
+
+    fn a51_dir(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("fluxbee-a51-{tag}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// A-51: a write never goes through what the Syncthing user can plant next to the file: not a
+    /// symlink at the old fixed temp name (the old writer wrote through it, chmodded what it
+    /// pointed at and renamed the link into place) nor one at the destination. The result is a
+    /// plain file with exactly the mode `fs::write` gives, or exactly 0755 for an executable.
+    #[test]
+    fn a51_writes_never_follow_a_planted_entry() {
+        use std::os::unix::fs::MetadataExt;
+        let dir = a51_dir("write");
+        let victim = dir.join("victim");
+        fs::write(&victim, "root-owned\n").unwrap();
+        fs::set_permissions(&victim, fs::Permissions::from_mode(0o600)).unwrap();
+        let untouched = |victim: &Path| {
+            assert_eq!(fs::read_to_string(victim).unwrap(), "root-owned\n");
+            assert_eq!(fs::metadata(victim).unwrap().mode() & 0o7777, 0o600);
+        };
+        let reference = dir.join("reference");
+        fs::write(&reference, b"x").unwrap();
+
+        let path = dir.join("manifest.json");
+        std::os::unix::fs::symlink(&victim, dir.join(".manifest.json.tmp")).unwrap();
+        std::os::unix::fs::symlink(&victim, &path).unwrap();
+        write_file_atomic(&path, b"{}\n").unwrap();
+        untouched(&victim);
+        assert!(fs::symlink_metadata(&path).unwrap().file_type().is_file());
+        assert_eq!(fs::read_to_string(&path).unwrap(), "{}\n");
+        assert_eq!(
+            fs::metadata(&path).unwrap().mode() & 0o7777,
+            fs::metadata(&reference).unwrap().mode() & 0o7777,
+            "the mode fs::write gives"
+        );
+
+        let src = dir.join("binary-src");
+        fs::write(&src, b"\x7fELF").unwrap();
+        let exe = dir.join("rt-gateway");
+        std::os::unix::fs::symlink(&victim, dir.join(".rt-gateway.tmp")).unwrap();
+        copy_exec_file(&src, &exe).unwrap();
+        untouched(&victim);
+        assert!(fs::symlink_metadata(&exe).unwrap().file_type().is_file());
+        assert_eq!(fs::read(&exe).unwrap(), b"\x7fELF");
+        assert_eq!(fs::metadata(&exe).unwrap().mode() & 0o7777, 0o755);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A-51: a directory the orchestrator chmods or chowns is opened as the directory it must be.
+    /// A symlink the Syncthing user put in its place is refused, and what it points at keeps its
+    /// mode; the refusal comes before any owner is looked up.
+    #[test]
+    fn a51_managed_dirs_refuse_a_symlink() {
+        use std::os::unix::fs::MetadataExt;
+        let dir = a51_dir("dirs");
+        let victim = dir.join("victim-dir");
+        fs::create_dir(&victim).unwrap();
+        fs::set_permissions(&victim, fs::Permissions::from_mode(0o755)).unwrap();
+        let active = dir.join("active");
+        std::os::unix::fs::symlink(&victim, &active).unwrap();
+        let err = ensure_dir_permissions_0750(&active)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("symlink there is refused"), "{err}");
+        let err = ensure_owned_dir(&active, "no-such-user-a51")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("symlink there is refused"), "{err}");
+        assert_eq!(fs::metadata(&victim).unwrap().mode() & 0o7777, 0o755);
+        let staging = dir.join("staging");
+        ensure_dir_permissions_0750(&staging).unwrap();
+        assert!(fs::symlink_metadata(&staging).unwrap().file_type().is_dir());
+        assert_eq!(fs::metadata(&staging).unwrap().mode() & 0o7777, 0o750);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A-51: the `.stfolder` marker is created where it is missing and never through a symlink:
+    /// a dangling one counts as present, and nothing is created where it points.
+    #[test]
+    fn a51_folder_marker_never_follows_a_symlink() {
+        let dir = a51_dir("marker");
+        let folder = dir.join("folder");
+        fs::create_dir_all(&folder).unwrap();
+        let victim = dir.join("nologin");
+        std::os::unix::fs::symlink(&victim, folder.join(".stfolder")).unwrap();
+        assert!(!ensure_syncthing_folder_marker(&folder).unwrap());
+        assert!(fs::symlink_metadata(&victim).is_err(), "nothing created");
+        let fresh = dir.join("fresh");
+        assert!(ensure_syncthing_folder_marker(&fresh).unwrap());
+        assert!(fs::symlink_metadata(fresh.join(".stfolder"))
+            .unwrap()
+            .file_type()
+            .is_file());
+        assert!(!ensure_syncthing_folder_marker(&fresh).unwrap());
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A-51: temps are named so Syncthing never sends them. A crash's leftover is swept by the
+    /// next write once it is old, or at once when it predates this process (the fixed `.name.tmp`
+    /// of older releases too); a fresh one, which a concurrent write may still own, and
+    /// Syncthing's own temp are left alone.
+    #[test]
+    fn a51_only_stale_temps_of_ours_are_swept() {
+        let dir = a51_dir("sweep");
+        let path = dir.join("drift-alerts.jsonl");
+        let now = std::time::SystemTime::now();
+        let started = *PROCESS_STARTED.get_or_init(|| now);
+        let old = now - Duration::from_secs(STALE_WRITE_TEMP_SECS + 60);
+        let before_start = started - Duration::from_secs(5);
+        let leftover = dir.join(".syncthing.drift-alerts.jsonl.fluxbee-leftover.tmp");
+        let crashed = dir.join(".syncthing.drift-alerts.jsonl.fluxbee-crashed.tmp");
+        let legacy = dir.join(".drift-alerts.jsonl.tmp");
+        let fresh = dir.join(".syncthing.drift-alerts.jsonl.fluxbee-inflight.tmp");
+        let syncthing_own = dir.join(".syncthing.drift-alerts.jsonl.tmp");
+        for (tmp, modified) in [
+            (&leftover, old),
+            (&crashed, before_start),
+            (&legacy, old),
+            (&fresh, now),
+            (&syncthing_own, old),
+        ] {
+            fs::File::create(tmp)
+                .unwrap()
+                .set_modified(modified)
+                .unwrap();
+        }
+        write_file_atomic(&path, b"line\n").unwrap();
+        assert!(!leftover.exists() && !crashed.exists() && !legacy.exists());
+        assert!(
+            fresh.exists(),
+            "an in-flight temp of a concurrent write stays"
+        );
+        assert!(syncthing_own.exists(), "Syncthing's own temp is not ours");
+        assert_eq!(fs::read_to_string(&path).unwrap(), "line\n");
+        let mut names: Vec<String> = fs::read_dir(&dir)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        assert_eq!(
+            names,
+            [
+                ".syncthing.drift-alerts.jsonl.fluxbee-inflight.tmp",
+                ".syncthing.drift-alerts.jsonl.tmp",
+                "drift-alerts.jsonl"
+            ],
+            "the write left no temp of its own"
+        );
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A-52: the wait is one single-quoted script under sudo.
+    #[test]
+    fn a52_the_wait_is_one_quoted_script_under_sudo() {
+        let cmd = first_boot_wait_command(FIRST_BOOT_WAIT_SECS);
+        assert!(cmd.starts_with("sudo -n /bin/bash -lc '") && cmd.ends_with('\''));
+        assert_eq!(
+            cmd.matches('\'').count(),
+            2,
+            "no quote inside the script: {cmd}"
+        );
+    }
+
+    /// A-52: runs the wait script under bash with stand-ins for `cloud-init`, `systemctl`,
+    /// `timeout` and `sleep`. Each stand-in answers the next entry of its list on every call (the
+    /// last one for ever; a space separates the lines of one answer). Returns the exit code,
+    /// stdout and how many times cloud-init was asked.
+    fn a52_run_wait(
+        tag: &str,
+        secs: u64,
+        cloud_init: Option<&[&str]>,
+        apt: &[&str],
+    ) -> (i32, String, usize) {
+        let dir = a51_dir(&format!("a52-{tag}"));
+        let bin = dir.join("bin");
+        fs::create_dir_all(&bin).unwrap();
+        let stand_in = |name: &str, body: String| {
+            let path = bin.join(name);
+            fs::write(&path, body).unwrap();
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+        };
+        let replay = |name: &str, entries: &[&str]| {
+            let list = dir.join(format!("{name}.list"));
+            fs::write(&list, entries.join("\n") + "\n").unwrap();
+            let count = dir.join(format!("{name}.count"));
+            format!(
+                "#!/bin/sh\nn=$(cat '{c}' 2>/dev/null || echo 0); n=$((n+1)); echo $n > '{c}'\n\
+                 l=$(wc -l < '{l}'); [ $n -gt $l ] && n=$l\nsed -n \"${{n}}p\" '{l}' | tr ' ' '\\n'\n",
+                c = count.display(),
+                l = list.display()
+            )
+        };
+        if let Some(entries) = cloud_init {
+            stand_in("cloud-init", replay("cloud-init", entries));
+        }
+        stand_in("systemctl", replay("systemctl", apt));
+        stand_in("timeout", "#!/bin/sh\nshift\nexec \"$@\"\n".to_string());
+        stand_in("sleep", "#!/bin/sh\nexit 0\n".to_string());
+        let output = Command::new("/bin/bash")
+            .arg("-c")
+            .arg(first_boot_wait_script(secs))
+            .env("PATH", format!("{}:/usr/bin:/bin", bin.display()))
+            .output()
+            .unwrap();
+        let asked = fs::read_to_string(dir.join("cloud-init.count"))
+            .ok()
+            .and_then(|n| n.trim().parse().ok())
+            .unwrap_or(0);
+        fs::remove_dir_all(&dir).unwrap();
+        (
+            output.status.code().unwrap_or(-1),
+            String::from_utf8_lossy(&output.stdout).trim().to_string(),
+            asked,
+        )
+    }
+
+    /// A-52: the join waits only while cloud-init or an apt daily job RUNS, and gives up at the
+    /// deadline naming what still runs. A cloud-init that will never run this boot ("not
+    /// started", "disabled") is not waited on.
+    #[test]
+    fn a52_waits_only_while_something_runs() {
+        let idle = ["inactive inactive"];
+        for status in [
+            "status: not started",
+            "status: disabled",
+            "status: done",
+            "status: error",
+        ] {
+            assert_eq!(
+                a52_run_wait("settled", 0, Some(&[status]), &idle),
+                (0, String::new(), 1),
+                "{status}"
+            );
+        }
+        assert_eq!(
+            a52_run_wait(
+                "running",
+                FIRST_BOOT_WAIT_SECS,
+                Some(&["status: running", "status: running", "status: done"]),
+                &idle
+            ),
+            (0, String::new(), 3)
+        );
+        assert_eq!(
+            a52_run_wait("stuck", 0, Some(&["status: running"]), &idle),
+            (124, "still running: cloud-init".to_string(), 1)
+        );
+        assert_eq!(
+            a52_run_wait(
+                "apt",
+                FIRST_BOOT_WAIT_SECS,
+                Some(&["status: done"]),
+                &[
+                    "activating inactive",
+                    "inactive activating",
+                    "inactive inactive"
+                ]
+            ),
+            (0, String::new(), 3)
+        );
+        assert_eq!(
+            a52_run_wait(
+                "apt-stuck",
+                0,
+                Some(&["status: done"]),
+                &["inactive active"]
+            ),
+            (124, "still running: apt-daily".to_string(), 1)
+        );
+        assert_eq!(
+            a52_run_wait(
+                "old-systemd",
+                0,
+                Some(&["status: done"]),
+                &["unknown failed"]
+            ),
+            (0, String::new(), 1)
+        );
     }
 
     // `ss -H -tlnp` captured read-only on the PROD motherbee on 2026-10-05 (0.1.56): Archi on
