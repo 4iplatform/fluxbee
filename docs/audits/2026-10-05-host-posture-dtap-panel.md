@@ -29,6 +29,8 @@ document.
   or a separate finding (A-48, A-49).
 - The raw panel output (claims, evidence with file:line, recommendations, verifier notes) stayed in
   the session scratchpad. This file is the durable record.
+- Revision 3 (same day): the operator answered O1–O4, recorded in the spec as D16–D19, and set
+  the order of work, D20: core, then the Cloud connection, then the implementation nodes.
 
 ---
 

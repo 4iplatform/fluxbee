@@ -749,6 +749,12 @@ Visto al arreglar los e2e de A-37, leyendo `src/router/mod.rs` y `src/shm/mod.rs
     `docs/audits/2026-10-05-host-posture-dtap-panel.md`).
   - La revisión 2 suma todo lo técnico.
   - Quedan decisiones del operador: O1–O4 antes de las etapas 1–5, O5–O8 antes de la 6–7.
+  - O1–O4 respondidas el mismo día (D16–D19 de la revisión 3):
+    - SSH sin configurar nada: abierto a todos menos a los hives;
+    - Archi a loopback solo por config;
+    - io.linkedhelper por el edge, al final;
+    - del ingress, solo lo que resuelven `add_hive` y el orquestador.
+  - Orden de trabajo (D20): core → conexión con Cloud → nodos de implementación.
 - **Lo que queda abierto aunque se cierren las etapas 1–5:**
   - la malla de control: cualquier orquestador, el ingress incluido, puede mandar SPAWN, KILL,
     etc. (A-20, A-22);
@@ -819,7 +825,7 @@ Visto al arreglar los e2e de A-37, leyendo `src/router/mod.rs` y `src/shm/mod.rs
   el siguiente upgrade lo instala como root en el motherbee.
 - **Arreglo propuesto:**
   - firmar el `Release` (`InRelease`) y sacar `[trusted=yes]` (el `.deb` no cambia);
-  - aparte, aislar el ingress (O4 del doc).
+  - aislar el ingress a nivel de red queda para después del core: necesita config de infra (D19).
 - **Estado:** registrado. No se tocó nada.
 
 ### A-19 ✅ RESUELTO (0.1.43) — La policy publicada esperaba hasta 60 s al watcher de Syncthing

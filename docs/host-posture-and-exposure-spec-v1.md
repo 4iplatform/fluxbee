@@ -1,13 +1,13 @@
-# Host posture and exposure — design v1 (revision 2)
+# Host posture and exposure — design v1 (revision 3)
 
 **Status:** design. Agreed in principle with the operator on 2026-10-05.
 
 - Revision 1 failed the DTAP panel on all four lenses: 75 findings, none refuted. The full list
   and where each one landed: `docs/audits/2026-10-05-host-posture-dtap-panel.md`.
-- Revision 2 folds in every technical fix and lists the decisions that are still the operator's
-  (§2.2).
-- Nothing is implemented. Stages 1–5 need a second DTAP round on this revision and the operator's
-  answers to O1–O4.
+- Revision 2 folded in every technical fix.
+- Revision 3 records the operator's answers to O1–O4 (D16–D19) and the order of work (D20): the
+  core first, then the connection with Fluxbee Cloud, then the implementation nodes.
+- Nothing is implemented. Part A, the core, goes through a second DTAP round before stage 1.
 
 **Scope:** what each hive exposes on the network, who sets and verifies it, and how operators and
 the public reach an installation from outside:
@@ -58,7 +58,8 @@ verificaría eso"*.
 - **Mesh control plane.** Any orchestrator, the DMZ ingress included, can still send SPAWN, KILL,
   NODE_CONFIG_SET and SYSTEM_CORE_ROLLBACK to any hive (A-20, A-22, postponed).
 - **Shared L2.** Source allowlists are not authentication. A compromised ingress can spoof LAN
-  addresses (O4 asks about isolating it).
+  addresses. Isolating it at the network level needs infrastructure configuration, so it is not
+  done now (D19).
 - **Unsigned apt repo.** A LAN attacker who impersonates the repo gets root on the motherbee at the
   next upgrade (A-49).
 - **`remove_hive`.** A removed hive keeps a valid mesh certificate and its identity HMAC key
@@ -313,7 +314,7 @@ and the adapter's `/v1/poll` reach it directly, outside the edge.
 | D1 | The orchestrator owns the host posture of its role. It declares it, applies it whole and atomically, verifies it at bootstrap and in the watchdog, corrects drift and reports it. |
 | D2 | One Fluxbee firewall owner per host: the nftables table `inet fluxbee_host` on every role. `fluxbee_egress` keeps only forward and NAT. The ufw/firewalld code paths go away. Third-party firewalls are reported and never changed. |
 | D3 | Allowed sources come from the hive registry, as IP literals per hive (§3.2). They are not a CIDR. Multi-site needs routed private connectivity without NAT between hives (v1 scope). |
-| D4 | Archi and the admin HTTP API listen on loopback only. Operators reach them on the motherbee or through an SSH tunnel (`ssh -L 3000:127.0.0.1:3000 ...`). DEV switches to the tunnel. How Archi gets there is O2. |
+| D4 | Archi and the admin HTTP API listen on loopback only. Operators reach them on the motherbee or through an SSH tunnel (`ssh -L 3000:127.0.0.1:3000 ...`). DEV switches to the tunnel. How they get there: D17. |
 | D5 | Syncthing never uses public infrastructure. Spokes dial the motherbee at its static address; the motherbee only accepts. The address is derived at `add_hive`, and the hive is refused only when it cannot be derived. |
 | D6 | The only public port of an installation is the edge port of its ingress hive. |
 | D7 | IO.web is the URL plane: Archi, artifacts, documents, web traffic between Fluxbee and Cloud. IO.cloud stays the command plane. IO.web v2 is session-gated Archi plus artifacts, and nothing more unless the operator re-approves it: *"no quiero complicarla"*. |
@@ -325,19 +326,17 @@ and the adapter's `/v1/poll` reach it directly, outside the edge.
 | D13 | No second registrable domain for now. Tenant content is a directory of the installation host, and Archi never shares a host with it. This holds only under these conditions: Cloud and the brand site set host-only cookies (never `Domain=fluxbee.ai`); CSRF protection relies on Origin checks, not SameSite; no installation holds a certificate that covers Cloud's host. |
 | D14 | IO.web will handle artifacts (security, maybe sharing). Kept in mind, not designed here. |
 | D15 | Process: document, then DTAP panel, then staged implementation. Each stage is validated in infra before the next. Never one pass. The 8.x installation is the authorized testbed (2026-09-28). |
+| D16 | Operator SSH sources are optional and nobody has to configure them. Without them, SSH stays open to anyone except the registered hives, so no hive (the DMZ ingress included) can SSH into the motherbee or between spokes. On the ingress it is open only on the internal interface. Declaring `posture.operator_sources` narrows it further. Enforce does not depend on it. |
+| D17 | Archi and the admin get to loopback through configuration only. Archi's code is not changed. |
+| D18 | io.linkedhelper will take the same path through the edge as every other IO, in the last phase (implementation nodes). Until then it is outside the core posture: if someone instantiates it, its direct port is closed under enforce and its listener is reported. |
+| D19 | Ingress hardening is only what `add_hive` with the ingress role and the orchestrator do by themselves: its posture (the public port, SSH on the internal interface, nothing else). Nothing that needs infrastructure configuration from the user (VLANs, hypervisor anti-spoofing), and nothing odd, is done now; those stay as stated residuals. *"el usuario no puede hacer config complicado desde infra, si queda algo raro no lo hagamos ahora"*. |
+| D20 | Order of work: the core first (Part A stages 1–5, A-48, A-49), then the connection with Fluxbee Cloud (Parts B and C, stages 6–7), then the implementation nodes (io.linkedhelper and the rest). *"quiero cerrar el core primero, luego conexión con fluxbee cloud y luego los nodos de implementación"*. |
 
 ### 2.2 Open — the operator decides
 
-Needed before stages 1–5:
+O1–O4 were answered on 2026-10-05: O1 → D16, O2 → D17, O3 → D18, O4 → D19.
 
-| ID | Question | Options and recommendation |
-|---|---|---|
-| O1 | Where operator SSH comes from, per installation (PROD, DEV). | Data from the operator: explicit CIDRs, e.g. the VPN range for DEV. The rules are fixed in §3.3. Until sources are declared, the host never enforces. |
-| O2 | How Archi gets to loopback. | **(a) Recommended: config only, no Archi code change.** Ship loopback; the postinst rewrites the exact `0.0.0.0:3000` default it shipped; the orchestrator reports any non-loopback listen config; the listener audit and the firewall back it up. (b) Make the host non-configurable in Archi's code. The admin follows the same path. |
-| O3 | io.linkedhelper's direct listener. | **(a) Recommended: close it.** It goes behind the edge (`/e/<ich>`, its documented final design) before it is ever enforced, and its owners are told. (b) A declared, reported exception, which contradicts D6. |
-| O4 | Isolating the DMZ ingress. | **(a) Recommended:** give the ingress its own segment, with anti-spoofing at the hypervisor (Proxmox IP filter / VLAN), and filter its outbound traffic in v1: motherbee 9000/22000 (and 8443 later), DNS, NTP, apt; everything else dropped and counted. (b) Leave it, and state the residual risk. |
-
-Needed before stages 6–7:
+Needed before stages 6–7 (the Cloud phase):
 
 | ID | Question | Options and recommendation |
 |---|---|---|
@@ -421,19 +420,19 @@ The motherbee recomputes and applies its sets in the join-accept path, before
 
 DHCPv4 is not affected: clients receive OFFER/ACK on packet sockets, and renewals match conntrack.
 
-Outbound is not filtered in v1, except on the ingress if O4 says so. Syncthing's public traffic is
-removed by configuration (§3.5), not by the firewall.
+Outbound is not filtered in v1 (D19). Syncthing's public traffic is removed by configuration
+(§3.5), not by the firewall.
 
 | Role | Port | From |
 |---|---|---|
-| motherbee | 22/tcp (the ports `sshd -T` reports) | operator sources, minus every registry hive address |
+| motherbee | 22/tcp (the ports `sshd -T` reports) | operator sources if declared, otherwise anyone; never a registered hive |
 | motherbee | 9000/tcp | every registered hive |
 | motherbee | 9100/tcp | registered hives that run SY.identity (workers) |
 | motherbee | 22000/tcp | every registered hive (TCP only, no QUIC) |
 | motherbee | IO.web listener | ingress hives (when IO.web runs) |
-| worker, egress | 22/tcp | the motherbee + operator sources (minus other hives) |
+| worker, egress | 22/tcp | the motherbee, plus operator sources if declared, otherwise anyone; never another hive |
 | ingress | edge port | anywhere, untracked (below) |
-| ingress | 22/tcp | the motherbee + operator sources (minus other hives), internal interface only |
+| ingress | 22/tcp | as for worker, and only on the internal interface |
 | any | `extra_inbound` entries | as declared, reported |
 
 **Spokes expose no Syncthing port.** They dial out, and their Syncthing listens on loopback.
@@ -442,17 +441,24 @@ removed by configuration (§3.5), not by the firewall.
 connection flood cannot fill conntrack and cut the ingress' own dials to the motherbee. Conntrack
 fill is reported.
 
-**Rules for operator sources (O1):**
+**SSH and operator sources (D16):**
 
-- Only explicit CIDRs. Nothing is inferred from a shared subnet; the motherbee's own /24 in PROD
-  contains the DMZ ingress.
-- Registry hive addresses are always subtracted, so no hive gets SSH to the motherbee or between
-  spokes.
-- With no declared sources, 22 stays open and is reported, and the host never moves to `enforce`.
+- **Optional.** With no declared sources, SSH is open to anyone except the registered hives, and
+  the report says so. Nobody has to configure anything.
+- **When declared:** only explicit CIDRs. Nothing is inferred from a shared subnet; the
+  motherbee's own /24 in PROD contains the DMZ ingress.
+- **Hive addresses are always excluded.** No hive gets SSH to the motherbee or between spokes. The
+  motherbee keeps SSH to every spoke (`add_hive`, `reconcile_hive_tls_material`).
+- **The ingress' internal interface is derived** by the orchestrator from the route to the
+  motherbee (`ip route get`). Nobody configures it.
+
+Rule order on 22/tcp: drop on the ingress' non-internal interfaces; accept the motherbee on spokes;
+drop registered hives; accept the declared sources, or anyone when none are declared.
 
 ### 3.4 Binds (stage 1)
 
-The target is that Archi and the admin listen only on `127.0.0.1`. With O2(a):
+The target is that Archi and the admin listen only on `127.0.0.1`, through configuration only
+(D17):
 
 - `architect.listen` leaves the example and `config/hive.yaml`; the code default is already
   loopback.
@@ -592,11 +598,11 @@ reported.
 says why:
 
 - `nft` is present;
-- operator sources are declared;
-- observe has seen SSH from a declared source;
 - zero would-drops from known sources over the observation window;
 - no source-address mismatch;
-- no active third-party firewall.
+- no active third-party firewall;
+- if operator sources are declared, observe has seen SSH from one of them, so a mistyped CIDR
+  cannot lock operators out.
 
 Errors never abort bootstrap.
 
@@ -798,7 +804,7 @@ The next stage starts only when the previous one is validated.
 
 | Stage | Content | Gate |
 |---|---|---|
-| 0 | This revision; a second DTAP round on Part A; the operator's answers to O1–O4. | Operator approval. |
+| 0 | Revision 3; a second DTAP round on Part A. | Operator approval. |
 | 1 | Binds (§3.4). | On PROD, without touching its `hive.yaml` by hand: `ss -ltn` shows 3000 and 8080 only on 127.0.0.1. Connections from worker, ingress, egress and fb-build are refused. The tunnel works, SSE included. The drift alert appears for a non-loopback value. The Docker lab procedure is rewritten and re-run. The CI guard is on. |
 | 2 | Syncthing addresses (§3.5). | Unit tests: derivation for v4, v6 and a rejected name; finalize without an address refused; today's PROD shapes reconcile; a second pass is a no-op. `/rest/config/devices` on every hive shows spoke → motherbee static and motherbee → spoke accept-only. A fresh `add_hive` of a throwaway hive writes the same. |
 | 3 | Syncthing options (§3.5). | `/rest/config/options` is exact. `/rest/system/status` shows discovery off. No relay or QUIC connections. The motherbee sees `tcp-server` from every spoke. Sampled `ss` shows only registry peers and no non-loopback UDP. Reconnection after a motherbee Syncthing restart and after a motherbee reboot is no slower than today. A skip-upgrade from 0.1.56 straight to this build converges. CI: two Syncthing instances; `dynamic`↔`dynamic` without discovery does not connect, static → accept-only does. |
@@ -809,13 +815,20 @@ The next stage starts only when the previous one is validated.
 
 Stages 1–5 close the inbound and HTTP side of A-46, and A-47. They need nothing from Cloud.
 
-**Separate tracks:**
+**Order of work (D20):**
 
-- A-48: `remove_hive` revokes the mesh certificate (or sets `authorized_hives`), deletes the HMAC
-  key and unlinks Syncthing.
-- A-49: sign the apt repo and drop `[trusted=yes]`.
-- O3: io.linkedhelper behind the edge.
-- O4: isolate the ingress.
+1. **Core.** Stages 1–5, then:
+   - A-48: `remove_hive` revokes the hive. The router admits only registered hives, the HMAC key is
+     deleted, and Syncthing is unlinked on every role.
+   - A-49: sign the apt repo and drop `[trusted=yes]`.
+2. **Connection with Fluxbee Cloud.** Stages 6–7 (O5–O8).
+3. **Implementation nodes.** io.linkedhelper through the edge (D18), then the rest.
+
+**Not now (D19), stated residuals revisited after the core:**
+
+- network-level isolation of the ingress (VLAN, hypervisor anti-spoofing);
+- outbound filtering on the ingress (pointless while SY.edge runs as root);
+- an unprivileged, sandboxed SY.edge.
 
 ---
 
