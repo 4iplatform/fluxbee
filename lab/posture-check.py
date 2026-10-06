@@ -13,6 +13,10 @@ Stage 2 target
   spoke      exactly one remote device, the motherbee, at tcp://<wan uplink host>:22000; no
              folder offered by the motherbee left pending
 
+A hive that is stopped on purpose (the throwaway worker kept on an old release for the stage-3
+skip-upgrade test) is named with --offline HIVE: its addresses and folders are still judged, its
+completion is printed but not required.
+
 It never prints the Syncthing API key. Device ids are shortened to their first block.
 """
 import glob
@@ -94,7 +98,16 @@ def registry():
     return out
 
 
+def offline_hives(argv):
+    out = set()
+    for i, arg in enumerate(argv):
+        if arg == "--offline" and i + 1 < len(argv):
+            out.add(argv[i + 1])
+    return out
+
+
 def main():
+    offline = offline_hives(sys.argv[1:])
     hive = read(HIVE_YAML) or ""
     role = yaml_scalar(hive, "role") or "?"
     hive_id = yaml_scalar(hive, "hive_id") or "?"
@@ -191,7 +204,7 @@ def main():
                     continue
                 print("completion folder=%-28s device=%-10s %s%% need_items=%s" % (
                     folder.get("id"), names.get(peer, short(peer)), done.get("completion"), done.get("needItems")))
-                if done.get("completion") != 100:
+                if done.get("completion") != 100 and names.get(peer) not in offline:
                     problems.append("folder %s on %s at %s%%" % (folder.get("id"), names.get(peer, short(peer)), done.get("completion")))
     else:
         host = first_uplink_host(hive)

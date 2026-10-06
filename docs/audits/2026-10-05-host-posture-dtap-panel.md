@@ -287,3 +287,112 @@ enabled. Revision 7 fixes it under A-48.
 **Disposition:** everything is in revision 7; spec §8, "Round 4 → revision 7", maps each finding.
 D25 and D27 still await the operator; Acceptance found D26 consistent with what he approved.
 **Next:** stage 2, then round 5 on stages 4–5, A-48 and A-49.
+
+---
+
+# Round 5 — revision 7: core stages 4–5, A-48, A-49 (2026-10-06)
+
+**Verdict:**
+
+| Lens | Verdict | Findings | Blockers |
+|---|---|---|---|
+| Development | pass with observations | 16 | 0 |
+| Test | fail | 20 | 1 |
+| Acceptance | fail | 15 | 1 |
+| Production | fail | 14 | 1 |
+
+Verifiers: 48 confirmed, 17 partial, 0 refuted.
+
+**About the Test reviewer:** the safety classifier timed out while reviewing its run. Its transcript
+was checked afterwards: 81 calls, all read-only (`grep`, `wc`, `ls`, `sed -n`, `Read`), no writes and
+no remote commands.
+
+**Blockers:**
+
+- **A5-1, P5-1:** read literally, §3.5's orphan rule removes the motherbee's own Syncthing device. The
+  stage-2 code never touched it (the local id is excluded); the wording now says "remote devices
+  only", and a fixture holds the local device.
+- **T5-1:** the stage-3 skip-upgrade test needs a 0.1.57 `dynamic`↔`dynamic` worker, which can only be
+  built before stage 2 is deployed. Done on 2026-10-06: VM 104 joined as `worker2` on 0.1.57 and was
+  stopped. Its first join failed because cloud-init's first-boot dist-upgrade restarted sshd mid-join
+  (A-52); it was retried after cloud-init finished and a reboot.
+
+**For the operator, before revision 9:** A5-2 finds that D28 (gate only on SSH logins; packet
+accounting report-only) changes what the approved D21 and D22 meant, so it must be marked proposed
+and approved explicitly. D25 and D27 are still open.
+
+**Disposition:** A5-1, P5-1 and T5-1 are in revision 8 (spec §8, "Round 5"). Every other finding goes
+into revision 9 before stage 4, followed by round 6.
+
+| Finding | Severity | Verifier | Claim | Disposition |
+|---|---|---|---|---|
+| D5-1 | major | confirmed | On an egress without nft, the background install cannot finish and can leave dpkg interrupted. The egress bootstrap aborts when nft is missing, the orchestrator exits … | rev 9 |
+| D5-2 | major | confirmed | 'Closes the sessions that no longer match' cannot be built on today's wan_peers. It keeps one entry per hive_id. A second session for the same hive_id overwrites the … | rev 9 |
+| D5-3 | minor | confirmed | The ss filter `dport = :<wan port>` matches any established connection to that remote port, not only the uplink. On a multi-NIC host, a node talking to some service on … | rev 9 |
+| D5-4 | minor | confirmed | The hash depends on a template version constant bumped by hand. Re-apply happens only on drift, so a template change shipped without the bump is never applied: the hash … | rev 9 |
+| D5-5 | minor | confirmed | Two legitimate setups would keep a host in observe and failing health forever. A host without sshd (no binary, no ssh.service or ssh.socket) is a permanent derivation … | rev 9 |
+| D5-6 | minor | confirmed | Three gaps. (a) Nothing says the cursor advances only after every entry in the batch was classified, so a login read while the internal interface or `ip route get` was … | rev 9 |
+| D5-7 | minor | confirmed | The firewall writes run only at bootstrap and on a Syncthing config change. Today they also land in an inactive ufw, which pre-stages the mesh ports for a customer who … | rev 9 |
+| D5-8 | minor | confirmed | The transient-unit command as written starts the script at once. Today's cleanup starts with `sleep 1` so the REMOVE_HIVE_CLEANUP reply leaves before rt-gateway stops. … | rev 9 |
+| D5-9 | minor | confirmed | The dated note in the egress spec still says the input chain 'is deleted'. That is revision 6's design, which round 4 found to be a blocker (D4-1). §3.7 claims that note … | fixed now: the dated note in edge-egress-nat-spec |
+| D5-10 | minor | confirmed | Three gaps. (a) 'Existed when A-48 first booted' needs a durable one-shot marker. If 'no view file' serves as that marker, deleting the view (as the A-48 gate does) and … | rev 9 |
+| D5-11 | minor | confirmed | The TLS push is best-effort in all three join flows, on the stated grounds that the WAN degrades to plaintext. That no longer holds: spokes are rendered with `mtls … | rev 9 |
+| D5-12 | minor | confirmed | Step 2 deletes the registry entry and then rewrites the view. If that write fails, remove_hive fails, but a retry answers NOT_FOUND, and the router keeps admitting the … | rev 9 |
+| D5-13 | minor | partial | Not every registry write is under the per-hive lock. The join's first and last update_join_state calls run outside it, and write_file_atomic creates the directory. A … | rev 9 |
+| D5-14 | minor | confirmed | A host-key mismatch is treated as an auth failure, because any ssh exit 255 counts as one. For hives joined in the default revoke mode (all of PROD's spokes), the … | rev 9 |
+| D5-15 | minor | confirmed | Swapping InRelease after Packages cannot guarantee that no client sees a mismatched pair. A client that fetches the old InRelease before the swap and Packages after it … | rev 9 |
+| D5-16 | minor | confirmed | Rotation contradicts the postinst rules. After the first switch there is nothing left to switch, so 'touches the keyring only together with a verified switch' forbids … | rev 9 |
+| T5-1 | blocker | confirmed | The stage-3 skip-upgrade precondition cannot be produced once stage 2 is on 8.x. The gate says: 'before the stage-3 deploy, join the throwaway VM as a worker on the … | rev 8, §6 (done before the stage-2 deploy) |
+| T5-2 | major | partial | The pure mode function is not specified completely enough for a table-driven test: 1. No outputs. The new state, the action (apply observe, apply enforce, remove the … | rev 9 |
+| T5-3 | major | confirmed | The render hash covers the declaration plus a rules-template version constant bumped by hand, not the rendered rules. Suppose a template change is merged without a bump … | rev 9 |
+| T5-4 | major | partial | The stage-4 unit list has fixtures for the sshd ports and the SSH logins, but none for the derivations and classifiers whose errors 8.x cannot show: - (a) … | rev 9 |
+| T5-5 | major | confirmed | The prerm teardown has no test. dpkg runs the old package's prerm at the next upgrade, so a teardown placed where `upgrade` reaches it cannot be fixed by the next … | rev 9 |
+| T5-6 | major | confirmed | Under D28, the only protection for DHCP, DHCPv6, ICMPv6 ND/RA and echo in enforce is that their explicit allows are correct, and the gate checks only their order. 8.x is … | rev 9 |
+| T5-7 | major | confirmed | The stage-5 probes cannot tell enforce from observe on worker1, the first host released, or on the ingress' internal side. '22 open' is true in both modes, and the … | rev 9 |
+| T5-8 | major | confirmed | The A-48 gate has only infra steps. Most of the new logic has no unit or CI coverage, and one VM cannot reach it: - the admission predicate: not in view; in view without … | rev 9 |
+| T5-9 | major | confirmed | The No-view step leaves the 8.x motherbee (PROD) admitting any CA-valid peer, and nothing restores the view: - The view is rebuilt only at orchestrator boot or on … | rev 9 |
+| T5-10 | minor | confirmed | The re-add has no working credentials as written: - `key_only_persist` turns password login off in every case and removes the motherbee's key; - `add_hive` never reads … | rev 9 |
+| T5-11 | minor | confirmed | With one VM, 'the old box is never admitted ... the new box is admitted by its pin' cannot be checked: - the old and new box share the VM, the address and the `hive_id` … | rev 9 |
+| T5-12 | minor | partial | A-48 is feasible with one VM and at most 3 snapshots, but two things are wrong. - (a) Base state undefined. The throwaway's state before each join is not defined, and … | rev 9 |
+| T5-13 | minor | confirmed | 'Within 10 s `ss` shows no established 9000 or 9100' is a single sample with no defined start. The box keeps redialing: the router every 5 s after each successful TCP … | rev 9 |
+| T5-14 | minor | confirmed | - (a) 'After confirming `admin.public_edge_node`' names no check and no fallback. If neither the setting nor the env override is set, a second connected ingress makes … | rev 9 |
+| T5-15 | minor | partial | The expected result is only a log line, and the step proves detection only for `key_only_persist`. In the default `revoke` mode, `ssh_error_is_auth_failure` matches any … | rev 9 |
+| T5-16 | minor | partial | Starting the clock at `uptime -s` includes the motherbee's userspace boot. FINDINGS B-14 measured it at 108 s, with no known cause and a 53–108 s spread across hosts. … | rev 9 |
+| T5-17 | minor | confirmed | Health is to fail on a derivation failure, yet the spec expects one after every uplink drop: a motherbee upgrade or reboot, or a spoke restart. The router redials with a … | rev 9 |
+| T5-18 | minor | confirmed | Several stage-4 infra items have no defined result or lack a cheap control: - they do not say where drift and third-party detections are read; - the new … | rev 9 |
+| T5-19 | minor | confirmed | - (a) The public check from the operator's Mac cannot reuse `posture-probe.sh`: macOS has no `timeout`, so every port prints `error:`. 'Everything else' also names no … | rev 9 |
+| T5-20 | minor | confirmed | - (a) The first verified `apt-get update` is the one after the postinst switch. The deploy's own update still runs under `[trusted=yes]`, and the gate does not say so. - … | rev 9 |
+| A5-1 | blocker | confirmed | As worded, the orphan rule deletes the motherbee's own Syncthing device. A hive's device is defined by its registry entry, and 'a device with no registry entry' is … | rev 8, §3.5 |
+| A5-2 | major | confirmed | D28 sits in the table of decisions agreed with the operator and is not marked proposed. But it changes what approved D21 ('clean window') and D22 ('ran clean in … | rev 9 |
+| A5-3 | major | partial | Under D28, going back to observe on every render change protects nothing, and it periodically undoes D6 and D16. The window can only detect SSH logins through … | rev 9 |
+| A5-4 | major | confirmed | The evidence classifies a login by the route back to its source (`ip route get`). Enforce filters by the interface the packet arrived on (`iifname`). So the claim that … | rev 9 |
+| A5-5 | major | confirmed | The dated note in the egress spec, which revision 7 points to as recording the supersession, still says the egress input chain 'is deleted'. That is the instruction … | fixed now: the dated note in edge-egress-nat-spec |
+| A5-6 | major | confirmed | The spec never says how 'entries that existed when A-48 first booted' is determined. If it is inferred from a missing view file or from an entry without a pin, the P4-1 … | rev 9 |
+| A5-7 | minor | confirmed | D28 says undeclared listeners are 'cut on purpose, and reported', but the listener check reports TCP only. Undeclared UDP listeners are cut and show up only in the … | rev 9 |
+| A5-8 | minor | confirmed | D25 writes into an active ufw or firewalld, which contradicts approved D2 ('Fluxbee stops writing ufw/firewalld rules ... Third-party firewalls are reported, never … | rev 9 |
+| A5-9 | minor | partial | Any foreign input base chain with rules counts as a third-party firewall. Tools that only ban addresses, such as fail2ban's standard actions, would hold a host in … | rev 9 |
+| A5-10 | minor | confirmed | The documented repurpose command leaves /etc/fluxbee/posture.disabled in place. If the box is later joined again, its posture starts off instead of in observe, which … | rev 9 |
+| A5-11 | minor | partial | 'Observed time starts at 0 with the stage-5 release' has no mechanism. Observed time grows regardless of the release switch, and the hash changes only if the template … | rev 9 |
+| A5-12 | minor | partial | Under D28 packet accounting gates nothing, yet the report still parses the kernel log into top tuples. That is a log parser and an aggregation that no gate uses. | rev 9 |
+| A5-13 | minor | confirmed | The rotation path cannot work under the postinst rules. The postinst touches the keyring only together with a verified switch and never replaces a key. After the first … | rev 9 |
+| A5-14 | minor | confirmed | A motherbee with a second network, office or public, accepts SSH and the mesh ports there, so D6/D16 do not hold on it. Only a public address gets a warning, and §0 does … | rev 9 |
+| A5-15 | minor | confirmed | Some status lines contradict revision 7. | rev 9 |
+| P5-1 | blocker | partial | Read literally, the orphan rule removes the motherbee's own Syncthing device. Every config.xml lists its local device, and the motherbee has no registry entry, so its … | rev 8, §3.5 |
+| P5-2 | major | confirmed | The SSH-login evidence can be forged, so an attacker can hold a host in observe. (a) Remotely, without credentials: sshd logs the username verbatim on failed attempts … | rev 9 |
+| P5-3 | major | confirmed | Enforce cuts UDP listeners and other IP protocols, and no check reports them beforehand. D28 says undeclared listeners are 'cut on purpose, and reported', and §3.2 says … | rev 9 |
+| P5-4 | major | partial | The one-time, stored legacy mark cuts legitimate hives, and the spec never says whether the pin or the mark wins. (1) Downgrade, then upgrade again: a pre-A-48 build … | rev 9 |
+| P5-5 | major | confirmed | remove_hive is a one-shot sequence, so a failure or crash after step 2 leaves the hive's identity key behind, and nothing finishes the job. Once the entry is gone, a … | rev 9 |
+| P5-6 | major | confirmed | A-49 can break deploys in four ways the spec does not exclude. (1) Failure handling: the postinst runs under set -e, so a failing switch step aborts it before `systemctl … | rev 9 |
+| P5-7 | minor | partial | Observe turns conntrack into a resource the internet can fill on the ingress. The edge port is untracked for exactly this reason, but in observe every other connection … | rev 9 |
+| P5-8 | minor | confirmed | The evidence has silent blind spots, and in each one enforce cuts an SSH path that was never reported. (1) With sshd LogLevel QUIET, FATAL or ERROR, or journald storing … | rev 9 |
+| P5-9 | minor | confirmed | The derivation takes any established TCP connection whose destination port is the WAN port, from any process to any address, and its result decides which interface keeps … | rev 9 |
+| P5-10 | minor | confirmed | Three edges of the view admit more than intended. (1) The view is written only at boot and on add_hive/remove_hive. If the file is lost, the router fails open at its … | rev 9 |
+| P5-11 | minor | partial | Today a host-key failure looks like an auth failure. Reconcile treats an ssh exit 255 on a revoke-mode hive as 'no SSH channel' and logs it at debug. So on the 3 PROD … | rev 9 |
+| P5-12 | minor | partial | The 3 PROD spokes will stay unpinned indefinitely, because the only way out, a re-add, needs console work. They were joined with harden_ssh:true: password login off, the … | rev 9 |
+| P5-13 | minor | partial | The third-party rule ('any non-Fluxbee base chain on the input hook with … rules') also catches tools that only add drops or accepts: fail2ban, Tailscale, LXD/Incus … | rev 9 |
+| P5-14 | minor | partial | Section 0 should still name eight residuals. (a) SSH host keys are trust on first use, not closed. The first contact with every new spoke, and with each existing spoke … | rev 9 |
+
+**Also found while building stage 2** (code reviews, not the panel): the `config.xml` writer
+followed symlinks planted in the Syncthing user's directory; the folder rule followed hive.yaml's
+enable flags; and on PROD the motherbee shared `blob/active` with the egress (A-50). All fixed in
+stage 2.

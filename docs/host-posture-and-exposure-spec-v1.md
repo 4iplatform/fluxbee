@@ -1,8 +1,10 @@
-# Host posture and exposure — design v1 (revision 7)
+# Host posture and exposure — design v1 (revision 8)
 
 **Status:** design agreed with the operator on 2026-10-05. Stage 1 is live (0.1.57, validated on 8.x).
-Revision 7 folds DTAP round 4 in. Stage 2 can be built. Stages 4–5, A-48 and A-49 go through
-round 5 first.
+Stage 2 is built for 0.1.58 after four adversarial code reviews (§3.5 as built), with A-50 found on
+PROD and fixed in it. DTAP round 5 (on revision 7) is recorded: its stage 2–3 findings are folded
+here; its stage 4–5, A-48 and A-49 findings, and the decisions they need from the operator, go into
+revision 9 before stage 4.
 
 **History:**
 
@@ -14,6 +16,7 @@ round 5 first.
 | 4 | Part A of revision 3 failed a second panel (84 findings). Most came from per-hive IP filtering and from the machinery added to steer spokes. Revision 4 **simplifies Part A**: rules by port and interface per role, an automatic mode, no configuration. |
 | 5 | A third panel on Part A of revision 4 found 64 issues. Its 6 blockers are all in stages 4–5 and A-48; stage 1 needed only details. Stage 1 is built (§3.4 as built), with the A-48 guard against the spoke-only actions moved into it. The Docker lab is removed (D23). §8 lists what round 3 requires before stages 2–5, A-48 and A-49. |
 | 6 | Round 3's findings folded into stages 2–5, A-48 and A-49 (see §8). The main changes: evidence counts only what a drop would break, i.e. packets to a port that has a listener, plus SSH logins through non-internal interfaces; the mode is a persisted pure function; ICMP errors come before conntrack (PMTU); A-48 admits unpinned pre-existing hives; each host installs its own nftables; `remove_hive` and downgrades keep the last ruleset. |
+| 8 | Stage 2 as built (§3.5): ownership by recorded device id, the role-only folder rule for A-50, a writer hardened against the Syncthing user's directory. Round 5's stage 2–3 findings folded in: only remote devices are touched (A5-1, P5-1); the throwaway worker joined on 0.1.57 before stage 2 (T5-1). |
 | 7 | Round 4 (68 findings; Acceptance passed) folded in (§8). The main changes: the switch is gated only by SSH logins through non-internal interfaces plus preconditions, with packet accounting report-only (D28); the render hash is mode-independent; sshd ports come from socket activation too; DHCP and ICMPv6 RA/MLD are allowed; the egress input chain is dropped from the render, never deleted; the remove cleanup runs outside the orchestrator; A-48 pins new joins before they dial, admits only legacy hives unpinned, and spokes check that their uplink is the motherbee; A-49 never replaces a key. |
 
 Every finding and where it went: `docs/audits/2026-10-05-host-posture-dtap-panel.md`.
@@ -619,32 +622,76 @@ not changed.
 
 ### 3.5 Syncthing (stages 2 and 3)
 
-**Addresses (stage 2)** are reconciled at every boot and watchdog run, not only at join.
+**Addresses and folders (stage 2) — as built (0.1.58).** Reconciled by the watchdog about once a
+minute, not only at join. Only **remote** devices are touched: never the local device (its id comes
+from the running Syncthing, `/rest/system/status`), nor the `<defaults>` templates, nor folder
+members. Top-level devices are found by structure (`<device>` outside `<folder>` and `<defaults>`),
+so a device without a name is seen too.
 
-**Spoke side.** The spoke has exactly one remote device, named after the motherbee's `hive_id`. It
-gets `Static(<motherbee uplink IP>:22000)`.
+**Spoke side.** The spoke's device named after the motherbee's `hive_id` gets
+`Static(<first wan.uplinks IP>:22000)`. No uplink, or a host that is not an IP literal, is reported
+and nothing changes.
 
 **Motherbee side.**
 
-- **Which device is a hive's.** The device id recorded in that hive's registry entry. The existing
-  egress entry has none; it is backfilled from the motherbee's `config.xml` when exactly one
-  device there carries that hive's name, and otherwise reported.
-- **Registered devices** get `AcceptOnly`: address `dynamic`, so the motherbee never dials once
-  discovery is off.
-- **Orphans are removed.** A device with no registry entry, or a second device under a registered
-  name, is removed from the config and reported, so it stops being authorized.
+- **Which device is a hive's.** The device id its registry entry records, whatever the device's
+  name. Every join records it (the egress joins did not; now they do). An entry that records none
+  takes the one remote device named after it, and its id is backfilled; two such devices are
+  reported and kept.
+- **Hives' devices** get `AcceptOnly`: address `dynamic`, so the motherbee never dials once
+  discovery is off. A device left with several addresses ends up with exactly one.
+- **Folders (A-50).** A spoke is taken out of every Fluxbee folder its role must never have:
+  `blob/active` and `runtimes` outside workers, `blob/public` outside the ingress, another role's
+  core folder. The rule is the role alone, never hive.yaml's enable flags, so turning a sync off
+  for a while strips nobody. Only the joins add a spoke to a folder, and they never add one of
+  these; a test pins that under every flag combination. A new folder starts with no member
+  (Syncthing adds the local device when it loads its config): it is never cloned from another
+  folder with its members, nor seeded with `config.xml`'s first device, which can be a peer.
+  **Known limit:** a folder created after spokes joined (blob or public sync turned on later)
+  stays empty until `add_hive` is run again for them; a backfill by role, like policy's from
+  vendor, is the planned fix.
+- **Orphans are removed** from every Fluxbee folder and from the declarations, connected or not, so
+  they stop being authorized: a device no hive claims, or a second device under a hive's name.
+- **When it acts.** Nothing while any `add_hive` or `remove_hive` holds or is taking a topology
+  lock. Only hives at rest are touched: `status: connected` and their join `done`. Orphans are
+  removed only when the registry was read completely, is not empty, and every hive in it is at rest
+  and records its device. The registry is read under the config lock: a join creates its entry
+  before it links, and links under the same lock.
 
-**The address type** becomes `AcceptOnly | Static(SocketAddr)`, IP literals only.
+**The address type** is `AcceptOnly | Static(SocketAddr)`, IP literals only.
 
-- A finalize without a derivable address is refused, never written as `dynamic`.
-- The worker join derives the motherbee address the way ingress and egress do.
+- A finalize that links a peer without a static address, or with one that is not a
+  `tcp://<ip>:<port>` literal, is refused, never written as `dynamic`.
+- The worker join derives the motherbee address from the uplink, as ingress and egress do.
+- The local device id comes from `syncthing --home <dir> device-id`, bounded to 5 s, when
+  `cert.pem` and `key.pem` are regular files (Syncthing v2 dropped the `--device-id` flag, so that
+  call always failed: A-53), otherwise from the running Syncthing; never from `config.xml`'s first
+  device, which can be a peer.
 
-**One serialized writer** for `config.xml`:
+**One serialized writer** for `config.xml`. The directory belongs to the Syncthing user and the
+orchestrator is root, so no name in it is trusted:
 
-- a mutex plus an atomic rename;
-- the temp file is created with the original's owner (fluxbee) and mode;
-- a CI grep guard keeps every write in it;
-- Syncthing restarts only when something changed.
+- one lock; the update never calls Syncthing (the REST read happens before the lock, bounded);
+- the file is read with `O_NOFOLLOW|O_NONBLOCK` and refused unless it is a single-link regular file
+  of at most 16 MiB;
+- the temp is created with `O_EXCL` under a random name, gets the owner and permission bits of the
+  file that was read (special bits dropped) through its descriptor, and is renamed over the file;
+  the directory is then fsynced, and temps left by a crash are swept under the lock;
+- the API key is read without following a symlink or blocking on a FIFO (hard links allowed, so
+  hard-link backups do not break Syncthing management);
+- a CI guard keeps the atomic replace to one caller and no other write on a line naming the file.
+
+**Restarts.** Syncthing restarts only when the reconcile wrote something. The pending restart is a
+marker file, so it survives an orchestrator restart, and it waits while a topology operation runs
+(a join waiting for its spoke to connect must not see every link drop).
+
+**Reports.** A condition that lasts (an ambiguous name, a kept orphan, a hive not at rest, an
+invalid id, an unknown role, a missing uplink) is logged once, when it appears. Nothing is reported
+while a topology operation runs; one that lasts more than 15 minutes is. The device-id backfill
+waits for an entry's join record to say `done`, so it never races a join's tail.
+
+**An ingress join waits 90 s** for the spoke to connect: the motherbee only accepts now, so the
+spoke dials, and Syncthing's default reconnection interval is 60 s until stage 3.
 
 **Listen addresses do not change in stage 2.**
 
@@ -953,8 +1000,8 @@ The next stage starts only when the previous one is validated.
 |---|---|---|
 | 0 | Revisions 4–6 and DTAP rounds 1–3; the operator approved D3 and D16. Round 4 on revision 6 is next. | Round 4 before stage 2. |
 | 1 | Binds, the listener check and the spoke-only guards (§3.4), released as 0.1.57. | **Done: validated on 8.x on 2026-10-06 (see the ledger).** Unit: listener fixtures (the PROD capture flags only sy-architect 0.0.0.0:3000; `*`, `[::]`, scope before and after the brackets; several owners or none); the spoke-only guard; 19 migration checks; the CI guard. Infra, after `ops.py deploy`: (1) `ss` on the motherbee shows 3000 and 8080 only on 127.0.0.1; (2) `lab/posture-probe.sh 10.10.10.10 3000 8080 9000` from VMs 101, 102, 103 and 110 gives refused, refused, open (baseline on 0.1.56: open, refused, open); (3) on the motherbee, `curl 127.0.0.1:3000/` returns the UI and `curl 127.0.0.1:8080/hives` answers; (4) positive control: a dummy listener whose process is named `sy-admin`, on a spare port of 10.10.10.10 for about 20 s, produces `loopback_service_exposed_sy-admin` within two minutes (`GET /hives/motherbee/drift-alerts?category=posture`), and sy-architect raises no alert after the deploy; (5) the postinst printed its migration line. The operator checks the tunnel once, outside the gate. |
-| 2 | Syncthing addresses (§3.5). | **Unit:** the address type; IP literals only; v6 formatting; a finalize without an address refused; PROD fixtures reconcile to the target; a second pass is a no-op; orphans removed; the egress device id backfilled by name; the temp file keeps owner and mode. **CI:** a grep guard keeps `config.xml` writes in the single writer. **Infra** (`lab/posture-check.sh` through `ops.py run`): `/rest/config/devices` on the 4 hives matches the target; `/rest/db/completion` is 100% for every folder and device on the motherbee; `ops.py opa-status` in_sync 4/4; listen addresses unchanged; Syncthing uptime keeps growing across three checks (no restart loop). Join the throwaway VM as a worker on this release: its motherbee device is `Static(10.10.10.10:22000)` and completion reaches 100%. Remove it before stage 3. |
-| 3 | Syncthing options and the ordering predicates (§3.5). | **Skip-upgrade, with no PROD rollback:** before the stage-3 deploy, join the throwaway VM as a worker on the stage-1 release (0.1.57), which gives `dynamic`↔`dynamic` like worker1, and keep it stopped. After the deploy, the motherbee keeps discovery on and names the throwaway as the spoke it waits for. Boot the throwaway and update it directly from 0.1.57: it gets a static address and switches, then the motherbee switches. **Then, on the 4 hives:** `/rest/config/options` exact; `/rest/system/status` shows discovery off; no relay or QUIC connections; no non-loopback UDP for Syncthing in `ss`; the motherbee listens on `tcp://:22000`; after a motherbee Syncthing restart every spoke reconnects within 30 s (motherbee `/rest/system/connections`); a dist publish reaches 4/4. **Unit:** both predicates on PROD fixtures and synthetic reports. Remove the throwaway afterwards. |
+| 2 | Syncthing addresses and folders (§3.5). Built for 0.1.58. | **Unit:** the address type; IP literals only; v6 formatting; the finalize rule; the spoke's uplink address; PROD-shaped fixtures (both member forms) reach the target in two rounds and then change nothing; the egress leaves `blob/active`; the role rule under every enable-flag combination; ownership by recorded id; ambiguous names, missing recorded devices and nameless devices; nothing while busy, nothing on a hive not at rest, no removal on an unreadable, empty or unrecorded registry; the writer refuses symlinks, FIFOs and hard links, never opens a planted temp, keeps the mode and drops special bits. **CI:** the single-writer guard. **Before the deploy (T5-1, done 2026-10-06):** the throwaway VM 104 joined as `worker2` on 0.1.57 (`dynamic` on both sides) and was stopped; it stays registered and stopped until stage 3. **Infra** (`lab/posture-check.py -- --offline worker2` through `ops.py run`, on the 4 hives): the target on each; completion 100% on the motherbee for the 3 PROD spokes; the egress' pending `blob/active` offer gone; egress1's device id in its registry entry; `ops.py opa-status` in_sync 4/4; listen addresses unchanged; Syncthing uptime growing across three checks (no restart loop). The "a join on this release gives `Static`" check moves to the A-48 join. |
+| 3 | Syncthing options and the ordering predicates (§3.5). | **Skip-upgrade, with no PROD rollback:** `worker2`, joined on 0.1.57 before the stage-2 deploy and kept stopped (T5-1), is the `dynamic`↔`dynamic` case, like worker1 was. After the deploy, the motherbee keeps discovery on and names `worker2` as the spoke it waits for. Boot it and update it directly from 0.1.57: it gets a static address and switches, then the motherbee switches. **Then, on the 4 hives:** `/rest/config/options` exact; `/rest/system/status` shows discovery off; no relay or QUIC connections; no non-loopback UDP for Syncthing in `ss`; the motherbee listens on `tcp://:22000`; after a motherbee Syncthing restart every spoke reconnects within 30 s (motherbee `/rest/system/connections`); a dist publish reaches 4/4. **Unit:** both predicates on PROD fixtures and synthetic reports. Remove the throwaway afterwards. |
 | 4 | Firewall in observe only (§3.1–§3.3, §3.6, §3.7). | **Unit:** role × mode render invariants: observe and enforce differ only in the policy and the INVALID verdict; on a non-internal interface the only accept of new connections is the ingress edge port; no role accepts 3000, 8080, 5432, 4222 or 8384; ICMP errors and DHCP replies come before established. The render hash does not change between observe and enforce. The `delete table` render is deterministic, and the egress render has no input chain and survives a double apply. The mode function, table-driven with an injected clock: every transition, including restart, reboot, unread evidence, missing or unreadable state, hold, break-glass, render change and derivation failure; and observe → enforce → the next check stays in enforce. The sshd-port derivation on fixtures: the PROD socket-activated capture gives {22}; a socket on a non-22 port with `sshd -T` failing; sshd running; no source at all gives a derivation failure. The SSH-login evidence on journal fixtures (`sshd` and `sshd-session`, internal and external sources, IPv6). **CI:** a network-namespace job in its own workflow with sudo applies every role, checks connect/timeout over veth, and accepts a frag-needed for an untracked edge flow in enforce. **Infra:** the posture in `/versions` for 4/4, every host in observe, reasons named. SSH-login evidence: authorize a throwaway key on the egress (`ops.py run 103`), log in from fb-build to 192.168.8.240 (`ops.py run 110`), and expect a window reset naming 192.168.8.180 within two checks; then remove the key. Injections on worker1, each kept until detected (at most two checks) and then undone: flush the input chain (drift reported and repaired); a foreign chain `hook input priority 10; policy accept; tcp dport 9 drop` (third-party firewall reported, health fails); break-glass (the table goes and does not come back; reboot with sy-orchestrator disabled: still no table; remove the file and re-enable: back in observe with a fresh window). The table is there after a spoke reboot with sy-orchestrator disabled. The egress reboots and its NAT and table come back. Rejoin baseline: from the motherbee's boot (`uptime -s`) until `ops.py versions` answers for every spoke and the motherbee's Syncthing shows the 3 spokes connected, sampled twice. Stage 4 closes with every host ready to enforce except for the release switch. |
 | 5 | Automatic enforce. | Put `posture.hold` on every host before the deploy; health shows them as held (a warning). Release worker1, then the other spokes, then the motherbee last, a day apart. After each host enters enforce, run `lab/posture-probe.sh` from fb-build (`ops.py run 110`): 10.10.10.10 gives 22, 9000, 9100 and 22000 open, and a canary listener on an unlisted port times out; 10.10.10.20, .30 and .40 give 22 open; 192.168.8.240 gives 22 timeout. From the operator's workstation, on the ingress' public address, 443 answers and everything else times out (a manual step). After a motherbee reboot, spokes rejoin within the slower stage-4 sample + 30 s. An enforcing ingress reboots and stays in enforce. Break-glass from the console works without the orchestrator. Render changes are covered by the unit tests, not by a special release. |
 
@@ -965,7 +1012,7 @@ The next stage starts only when the previous one is validated.
 | A-48 (its spoke-only guard shipped with stage 1, D24) | **Host keys:** join the throwaway VM as a worker with `ssh_access=key_only_persist`, snapshot it, regenerate its host keys and restart sy-orchestrator on the motherbee: a host-key failure appears in its log. **Sessions:** stop sy-orchestrator on the throwaway, then remove the hive. The cleanup times out, and within 10 s `ss` on the motherbee shows no established 9000 or 9100 from its address. **Refusal:** roll the throwaway back to the snapshot and boot it; it is refused (WAN in the router log, 9100 in the sy-identity log). **Re-add:** re-add the hive while the rolled-back box keeps dialing. The old box is never admitted, the socket-first fast path is not taken, and the new box is admitted by its pin. **Ingress branch:** re-join it as an ingress (after confirming `admin.public_edge_node`) and remove it. sy-edge and fluxbee-syncthing are inactive and disabled, and its posture is still there. **Legacy hives:** `router-hives.json` lists the 3 PROD spokes as `legacy_unpinned`, and they stay connected after the deploy and after a motherbee reboot. **No view:** delete the view and restart rt-gateway; the spokes stay connected and the report fires. **Registry:** a join keeps foreign keys. |
 | A-49 | `ops.py publish` signs without a terminal. On the motherbee, `apt-get update` verifies the signature, and deploy prints its `W:`/`E:` lines. A copy of the repo with one byte of `InRelease` changed, used as a temporary source, fails with a signature error; the live repo is never touched. Postinst fixtures: a valid cached `InRelease` adds the key and switches the source; a missing or bad one keeps `[trusted=yes]`; an existing key is never replaced. `/versions` shows the source mode. |
 
-The throwaway hive is a 2 GB clone of template 9000, kept stopped between uses.
+The throwaway hive is VM 104 (`fb-worker2`, 10.10.10.60), a 2 GB clone of template 9000, kept stopped between uses. A fresh clone is settled before any join (HANDBOOK §3.4): cloud-init's first boot runs a dist-upgrade that restarts sshd (A-52), so wait for it and reboot if one is required.
 
 ### Cloud phase
 
@@ -1006,8 +1053,17 @@ io.linkedhelper through the edge (D18), then the rest.
   A-48 admitting the old box during a re-join). Acceptance passed with observations for the first
   time.
 - **2026-10-06, revision 7:** round 4 folded in (§8).
-- **Next:** stage 2 (its design is settled); DTAP round 5 on stages 4–5, A-48 and A-49 before
-  they are built.
+- **2026-10-06, stage 2 built:** four adversarial code reviews. The first found the writer
+  following symlinks planted in the Syncthing user's directory (major); the second found the folder
+  rule driven by hive.yaml's enable flags, which would have stripped every spoke for good (major).
+  The third and fourth found minors only: new folders cloned or seeded with peers, Syncthing v2's
+  missing `--device-id` (A-53), races with a join's tail. All fixed; see §3.5.
+- **2026-10-06, A-50:** found on PROD with `lab/posture-check.py`: the motherbee shared
+  `blob/active` with the egress. Fixed in stage 2.
+- **2026-10-06, DTAP round 5 on revision 7:** 65 findings, 3 blockers. A5-1 and P5-1 (the orphan
+  rule, read literally, removes the motherbee's own device) and T5-1 (the skip-upgrade precondition
+  had to be built before stage 2) are folded into revision 8. The rest is for revision 9.
+- **Next:** deploy and validate stage 2 (0.1.58); stage 3; revision 9 and round 6 before stage 4.
 
 ## 8. Round 3 → revision 6
 
@@ -1029,6 +1085,15 @@ io.linkedhelper through the edge (D18), then the rest.
 | P3-14 | §0 residuals. |
 | D3-1, T3-16, A3-1, P3-2, D3-16, T3-17, P3-12 | §3.8: unpinned pre-existing hives admitted; view at boot; sessions closed by reload and restart; `accept-new` host keys; the A-48 gate. |
 | D3-17, A3-12, P3-11, T3-18 | §3.9: first install, gpgv on the cached `InRelease`, a keyring that no package owns, tampering only on a copy. |
+
+### Round 5 → revision 8 (stages 2–3) and revision 9 (the rest)
+
+| Round-5 findings | Where they went |
+|---|---|
+| A5-1, P5-1 (blockers) | §3.5: only remote devices are touched, never the local one (its id from the running Syncthing), the `<defaults>` templates or folder members; a fixture holds the motherbee's own device. |
+| T5-1 (blocker) | §6: `worker2` joined on 0.1.57 before the stage-2 deploy and stopped; the stage-2 completion check excludes it; the "join gives `Static`" check moves to the A-48 join. |
+| D5's stage-2 note | §3.5: no orphan is removed while any registered hive records no device. |
+| Every other round-5 finding | Recorded in `docs/audits/2026-10-05-host-posture-dtap-panel.md`; folded into revision 9 before stage 4. |
 
 ### Round 4 → revision 7
 

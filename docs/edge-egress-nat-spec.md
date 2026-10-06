@@ -16,7 +16,9 @@
 >   egress gets no WAN listener, and accepts SSH from any host on its internal interface.
 > - §8.5, that motherbee and worker hosts keep the ufw/firewalld inbound path. Every role gets the
 >   Fluxbee-owned `table inet fluxbee_host`, and `fluxbee_egress` keeps only forward and NAT: its
->   input chain is deleted.
+>   input chain is no longer rendered. It is never deleted explicitly (the file is re-applied every
+>   minute, and a delete fails on the second apply); the leftover chain is empty with `policy
+>   accept`, which cannot override `fluxbee_host`'s drop, and is gone at the next boot.
 >
 > The egress still fails loud without `nft`, because its NAT needs it.
 **Audience:** `SY.orchestrator` developer, deployment tooling, Ops/SRE

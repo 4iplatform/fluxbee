@@ -789,7 +789,7 @@ Visto al arreglar los e2e de A-37, leyendo `src/router/mod.rs` y `src/shm/mod.rs
     antes de construirlos (§8 del doc).
   - El acceso desde Cloud (etapa 7) es de la fase Cloud.
 
-### A-47 🟡 DISEÑO ACORDADO (2026-10-05) — Syncthing usa la infraestructura pública y worker1 depende del discovery
+### A-47 🟡 ETAPA 2 CONSTRUIDA (0.1.58, por validar) — Syncthing usa la infraestructura pública y worker1 depende del discovery
 
 - **Qué pasa (verificado el 2026-10-05 en los 4 hosts de PROD):**
   - Están prendidos `globalAnnounce`, `localAnnounce`, `relays`, `nat` y `crashReporting`, y el
@@ -819,7 +819,15 @@ Visto al arreglar los e2e de A-37, leyendo `src/router/mod.rs` y `src/shm/mod.rs
   - El orquestador es el único dueño de las opciones.
 - **También encontrado:** `vendor/syncthing/config.xml` ya trae lo público apagado, pero solo lo
   usa el camino de instalación dev. El `.deb` y los spokes corren los defaults de Syncthing.
-- **Estado:** diseño acordado. No se tocó PROD.
+- **Estado:**
+  - **Etapa 2 (direcciones y carpetas) construida para 0.1.58**, después de tres revisiones
+    adversariales del código (`docs/host-posture-and-exposure-spec-v1.md` §3.5, "as built"). Los
+    spokes quedan con el motherbee en dirección fija y el motherbee solo acepta; además saca a cada
+    spoke de las carpetas que su rol no debe tener (A-50) y borra los devices que ningún hive
+    reclama.
+  - Antes del deploy se unió `worker2` (VM 104) con 0.1.57 y quedó apagada, para la prueba de
+    salteo de versiones de la etapa 3 (T5-1).
+  - Etapa 3 (opciones de Syncthing: sin discovery, relays ni infraestructura pública) pendiente.
 
 ### A-48 🟡 PARA ARREGLAR — `remove_hive` no revoca nada: el hive sacado sigue siendo un par válido
 
@@ -864,6 +872,94 @@ Visto al arreglar los e2e de A-37, leyendo `src/router/mod.rs` y `src/shm/mod.rs
   - firmar el `Release` (`InRelease`) y sacar `[trusted=yes]` (el `.deb` no cambia);
   - aislar el ingress a nivel de red queda para después del core: necesita config de infra (D19).
 - **Estado:** registrado. No se tocó nada.
+
+### A-50 🔴 ARREGLADO EN LA ETAPA 2 (0.1.58, por validar) — El motherbee le compartía `blob/active` al egress
+
+- **Qué pasa (verificado el 2026-10-06 en PROD, solo lectura, con `lab/posture-check.py`):**
+  - En el motherbee, la carpeta `fluxbee-blob` (`/var/lib/fluxbee/blob/active`, sendreceive: los
+    blobs vivos de todos los tenants) está compartida con worker1 **y con egress1**.
+  - El egress nunca la aceptó: su `hive.yaml` dice `blob: enabled: false` y la tiene como carpeta
+    pendiente ofrecida por el motherbee. No viajó ningún dato.
+  - Pero la autorización existe del lado del motherbee: quien tenga root en el egress (un host con
+    dirección en la red de la oficina) puede aceptar la carpeta por la API de su Syncthing y recibir
+    todos los blobs activos.
+  - Efecto lateral: el motherbee ve `fluxbee-blob` al 0% para egress1 para siempre.
+- **Causa:** `d73687f` (2026-07-30, U-2) metió al egress en la malla de Syncthing para que reciba el
+  core, y el gate de blob quedó en `public_only = spoke_role == HiveRole::Ingress`. Desde ahí el
+  motherbee comparte `blob/active` con todo spoke que no sea ingress, y el egress no corre nodos (no
+  recibe `runtimes`) ni declara blob.
+- **Arreglo (etapa 2):**
+  - El join comparte `blob/active` solo con workers.
+  - La reconciliación del motherbee saca a cada spoke de toda carpeta que su rol nunca debe tener
+    (`blob/active` y `runtimes` fuera de los workers, `blob/public` fuera del ingress, el core de
+    otro rol). La regla es el rol solo, nunca los flags de `hive.yaml`: la segunda revisión
+    adversarial encontró que derivarla de los flags dejaba a todos los spokes sin carpetas para
+    siempre si alguien apagaba un sync un rato.
+  - Un test fija que el join nunca agrega una de esas carpetas, con cualquier combinación de flags.
+- **Segunda vía, encontrada en la tercera revisión:** crear una carpeta que falta clonaba otra con
+  sus miembros (crear `blob/active` después de que los spokes se unieron la compartía con todos los
+  peers de la primera carpeta), y la carpeta "aislada" se sembraba con el primer `<device id=>` de
+  `config.xml`, que puede ser un peer. Ahora toda carpeta nueva nace sin miembros (Syncthing agrega
+  el device local al cargar la config).
+- **Límite conocido:** una carpeta creada después de que los spokes se unieron (prender el sync de
+  blob o el público más tarde) queda vacía hasta volver a correr `add_hive` para ellos. El arreglo
+  propuesto es un backfill por rol, como el de policy desde vendor. Hoy no aplica en PROD: blob está
+  prendido desde la instalación.
+- **Estado:** construido; se valida con el deploy de 0.1.58 (el egress sale de `fluxbee-blob` y su
+  oferta pendiente desaparece).
+
+### A-51 🟡 PARA ARREGLAR (paso propio después de la etapa 2) — root escribe en directorios del usuario `fluxbee` siguiendo nombres que ese usuario controla
+
+- **Qué pasa (revisión adversarial de la etapa 2, 2026-10-06):**
+  - `ensure_owned_tree` deja todo `/var/lib/fluxbee/dist` del usuario de Syncthing (`fluxbee`), y
+    `sync_data_dir` también.
+  - `write_file_atomic` escribe ahí (el core materializado por rol, el manifest, el binario de
+    Syncthing en vendor) con un temporal de nombre fijo (`.<nombre>.tmp`) y `fs::write`, que sigue
+    symlinks.
+  - `copy_exec_file` hace `chmod` por ruta después del rename, y `ensure_owned_file` hace
+    `chown fluxbee:…` por ruta, que también sigue symlinks.
+- **Impacto:** quien tenga el usuario `fluxbee` (Syncthing escucha en la red) puede plantar un
+  symlink y hacer que root escriba en un archivo de root, o cambiar de dueño uno (`chown` de
+  `/etc/sudoers` o similar → root). Requiere comprometer antes al usuario `fluxbee`; es defensa en
+  profundidad. Existe desde antes de la postura.
+- **Arreglo propuesto:** la misma primitiva que ya usa el escritor de `config.xml` (temporal
+  `O_EXCL` con nombre aleatorio, dueño y modo por descriptor, rename, fsync del directorio) para
+  `write_file_atomic`, `copy_exec_file` y `ensure_owned_file`. Se hace en un paso propio, con su
+  revisión, porque toca el camino de la actualización del core.
+- **Estado:** para arreglar después de validar la etapa 2.
+
+### A-52 🟡 PARA ARREGLAR — `add_hive` sobre un clon recién creado choca con el `dist-upgrade` de cloud-init
+
+- **Qué pasó (2026-10-06, join de `worker2` en 8.x):** el primer join falló con `CONFIG_FAILED`
+  ("identity HMAC key distribution failed … port 22: Connection refused").
+  - cloud-init, en el primer arranque del clon, corre un `apt-get dist-upgrade`. Al actualizar
+    `openssh-server` detiene `ssh.service` y cierra `ssh.socket`, en pleno join.
+  - Después de que cloud-init terminó y la VM se reinició (kernel nuevo), el join reanudado salió
+    bien.
+  - El HANDBOOK §3.4 ya lo documenta ("Un clon recién booteado NO está listo": esperar el ciclo y
+    reiniciar antes de unirlo). Esta vez no se siguió; el error fue de operación, no del HANDBOOK.
+- **También visto:** la VM descartable (10.10.10.60) tiene salida a internet (bajó paquetes de
+  `archive.ubuntu.com`). La bitácora del 2026-07-29 dice que las máquinas de 8.x no deberían tenerla;
+  es configuración de red del operador.
+- **Arreglo propuesto:** que el bootstrap del join se proteja solo y espere a cloud-init
+  (`cloud-init status --wait`, acotado) y al lock de dpkg antes de empezar: el orquestador es el
+  dueño del entorno del host. Mientras tanto vale la receta del HANDBOOK §3.4.
+- **Estado:** para arreglar; el gate de la etapa 2 ya asienta la VM antes de unirla.
+
+### A-53 🟡 ARREGLADO EN LA ETAPA 2 (0.1.58, por validar) — `local_syncthing_device_id` siempre fallaba con Syncthing v2 y caía al primer device de `config.xml`
+
+- **Qué pasa (verificado el 2026-10-06 en el motherbee de PROD, solo lectura):**
+  - El orquestador pedía el ID con `syncthing --home … --device-id`; el binario v2.0.14 responde
+    `unknown flag --device-id` (en v2 es el subcomando `device-id`).
+  - Entonces caía siempre a "el primer `<device id=>` de `config.xml`". El journal desde septiembre
+    muestra el fallback 2 veces.
+  - Ese primer device puede ser un peer: Syncthing ordena los miembros de las carpetas por ID. Un
+    join le habría pasado a un spoke el ID equivocado como "motherbee".
+- **En PROD no hubo daño:** el ID del motherbee (`BBJBKBB…`) es el menor, así que el fallback dio
+  justo el local; los 4 spokes tienen bien el device del motherbee.
+- **Arreglo (etapa 2):** el subcomando `device-id`, solo si existe `cert.pem` (sin certificado el
+  binario generaría uno como root); si no, el `myID` del Syncthing en marcha. Nunca `config.xml`.
+- **Estado:** construido; lo ejercita el próximo join (el de A-48).
 
 ### A-19 ✅ RESUELTO (0.1.43) — La policy publicada esperaba hasta 60 s al watcher de Syncthing
 
