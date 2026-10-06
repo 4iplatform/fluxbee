@@ -986,6 +986,13 @@ async fn main() -> Result<(), OrchestratorError> {
         let state = Arc::clone(&state);
         tokio::spawn(run_managed_runtime_reconcile_loop(state));
     }
+    if state.is_motherbee {
+        // Host posture stage 3: switch Syncthing off public infrastructure once every spoke
+        // reported a static, reachable motherbee. Its own task: GET_VERSIONS to an offline spoke
+        // waits for a timeout, which must not hold the watchdog.
+        let state = Arc::clone(&state);
+        tokio::spawn(run_syncthing_options_switch_loop(state));
+    }
 
     let mut sigterm = signal(SignalKind::terminate())?;
     let mut sigint = signal(SignalKind::interrupt())?;
@@ -8892,6 +8899,16 @@ fn reconcile_motherbee_peers(
 ) -> Result<(bool, Option<Vec<String>>), OrchestratorError> {
     let root = hives_root();
     let mut plan = MotherbeePeerPlan::default();
+    // Stage 3: once the motherbee has switched, it keeps the owned options. An unreadable state
+    // is reported and enforces nothing; it never stops the peer reconcile.
+    let (switched, posture_note) = match read_syncthing_posture_state() {
+        Ok(posture) => (posture.switched_at_ms.is_some(), None),
+        Err(err) => (
+            false,
+            Some(format!("Syncthing options not reconciled: {err}")),
+        ),
+    };
+    let listen = syncthing_owned_listen_address(true);
     let changed = update_syncthing_config(config_path, |current| {
         // Read under the lock. A join creates its registry entry before it links its device,
         // and links under this lock, so every device seen here has its entry visible.
@@ -8900,7 +8917,16 @@ fn reconcile_motherbee_peers(
         let devices = syncthing_declared_devices(current)?;
         let memberships = fluxbee_folder_memberships(current)?;
         plan = motherbee_peer_plan(&devices, &memberships, local_device_id, &registry, busy);
-        let (updated, changed) = apply_motherbee_peer_plan_xml(current, &plan, &memberships)?;
+        let (mut updated, mut changed) =
+            apply_motherbee_peer_plan_xml(current, &plan, &memberships)?;
+        if switched && !plan.busy {
+            let (next, options_changed) = apply_syncthing_owned_options_xml(&updated, &listen)?;
+            if options_changed {
+                tracing::info!("syncthing: owned options restored");
+            }
+            updated = next;
+            changed |= options_changed;
+        }
         if changed && updated != current {
             mark_syncthing_restart_pending();
         }
@@ -8920,7 +8946,9 @@ fn reconcile_motherbee_peers(
     for (hive_id, device_id) in &plan.backfill {
         record_syncthing_device_id(state, &root, hive_id, device_id);
     }
-    Ok((changed, (!plan.busy).then_some(plan.notes)))
+    let mut notes = plan.notes;
+    notes.extend(posture_note);
+    Ok((changed, (!plan.busy).then_some(notes)))
 }
 
 fn reconcile_spoke_motherbee_address(
@@ -8962,14 +8990,371 @@ fn reconcile_spoke_motherbee_address(
             tracing::info!(device = %id, address = %address.config_value(), "syncthing: the motherbee set to its static address");
         }
     }
-    let notes = if found {
+    let mut notes = if found {
         Vec::new()
     } else {
         vec![format!(
             "no device named {PRIMARY_HIVE_ID}; the motherbee's address was not set"
         )]
     };
-    Ok((changed, Some(notes)))
+    // Stage 3, once the address is in place. Its failure never stops the address reconcile, nor
+    // the restart that applies it.
+    let options_changed =
+        match reconcile_spoke_syncthing_options(config_path, local_device_id, address) {
+            Ok((options_changed, options_notes)) => {
+                notes.extend(options_notes);
+                options_changed
+            }
+            Err(err) => {
+                notes.push(format!("Syncthing options not reconciled: {err}"));
+                false
+            }
+        };
+    Ok((changed || options_changed, Some(notes)))
+}
+
+// ===========================================================================
+// Host posture, stage 3: Syncthing options (FINDINGS A-47,
+// docs/host-posture-and-exposure-spec-v1.md §3.5). The orchestrator owns Syncthing's options: no
+// public discovery, relays, NAT, usage or crash reports, self-upgrades or STUN, and a listener
+// only where one is needed (every interface on the motherbee; loopback on spokes, which dial).
+// The switch is one-way and ordered so that no link depends on discovery when it goes off: a spoke
+// switches once its motherbee device is static and the motherbee answers on its Syncthing port;
+// the motherbee switches once every spoke with a registered device has reported both.
+// ===========================================================================
+
+/// The options the orchestrator owns once a hive has switched, as (element, value).
+const SYNCTHING_OWNED_OPTIONS: [(&str, &str); 9] = [
+    ("globalAnnounceEnabled", "false"),
+    ("localAnnounceEnabled", "false"),
+    ("relaysEnabled", "false"),
+    ("natEnabled", "false"),
+    ("crashReportingEnabled", "false"),
+    ("urAccepted", "-1"),
+    ("autoUpgradeIntervalH", "0"),
+    ("stunKeepaliveStartS", "0"),
+    ("reconnectionIntervalS", "10"),
+];
+
+/// The one listen address of a switched hive: the motherbee accepts on every interface (dual
+/// stack); a spoke only dials, so it listens on loopback.
+fn syncthing_owned_listen_address(is_motherbee: bool) -> String {
+    if is_motherbee {
+        format!("tcp://:{SYNCTHING_SYNC_PORT_TCP}")
+    } else {
+        format!("tcp://127.0.0.1:{SYNCTHING_SYNC_PORT_TCP}")
+    }
+}
+
+/// Sets the owned options inside `<options>`: each owned element to its value (added when
+/// missing) and exactly one `<listenAddress>`. Every other option is left as it is.
+fn apply_syncthing_owned_options_xml(
+    config_xml: &str,
+    listen_address: &str,
+) -> Result<(String, bool), OrchestratorError> {
+    let block_re = Regex::new(r#"(?s)<options>(.*?)</options>"#)?;
+    let body = block_re
+        .captures(config_xml)
+        .and_then(|caps| caps.get(1))
+        .ok_or("syncthing config.xml has no <options> block")?;
+    let indent = Regex::new(r#"\n([ \t]*)<"#)?
+        .captures(body.as_str())
+        .map(|caps| caps[1].to_string())
+        .unwrap_or_else(|| "        ".to_string());
+    let mut updated = body.as_str().to_string();
+    let insert = |text: &mut String, element: &str| {
+        // Before the newline that precedes `</options>`, so the closing tag keeps its line.
+        let at = text.rfind('\n').unwrap_or(text.len());
+        text.insert_str(at, &format!("\n{indent}{element}"));
+    };
+    for (name, value) in SYNCTHING_OWNED_OPTIONS {
+        let wanted = format!("<{name}>{value}</{name}>");
+        let element_re = Regex::new(&format!(r#"<{name}>[^<]*</{name}>"#))?;
+        if element_re.is_match(&updated) {
+            updated = element_re
+                .replace_all(&updated, wanted.as_str())
+                .into_owned();
+        } else {
+            insert(&mut updated, &wanted);
+        }
+    }
+    let listen_re = Regex::new(r#"<listenAddress>([^<]*)</listenAddress>"#)?;
+    let current: Vec<String> = listen_re
+        .captures_iter(&updated)
+        .map(|caps| caps[1].trim().to_string())
+        .collect();
+    if current != [listen_address] {
+        updated = Regex::new(r#"\n?[ \t]*<listenAddress>[^<]*</listenAddress>"#)?
+            .replace_all(&updated, "")
+            .into_owned();
+        let element = format!(
+            "<listenAddress>{}</listenAddress>",
+            xml_escape_attr(listen_address)
+        );
+        // First in the block, where Syncthing writes it.
+        updated.insert_str(0, &format!("\n{indent}{element}"));
+    }
+    if updated == body.as_str() {
+        return Ok((config_xml.to_string(), false));
+    }
+    let mut out = config_xml.to_string();
+    out.replace_range(body.start()..body.end(), &updated);
+    Ok((out, true))
+}
+
+/// This hive's stage-3 facts, persisted the first time they are true and never undone (D22): a
+/// later outage does not take a hive back to discovery.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+struct SyncthingPostureState {
+    /// Spoke: when its motherbee device was first seen with its static address (epoch ms).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    motherbee_static_at_ms: Option<u64>,
+    /// Spoke: when a plain TCP connect to the motherbee's Syncthing port first succeeded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    motherbee_reachable_at_ms: Option<u64>,
+    /// When this hive switched to the owned options.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    switched_at_ms: Option<u64>,
+}
+
+fn syncthing_posture_state_path() -> PathBuf {
+    orchestrator_runtime_dir().join("syncthing-posture.json")
+}
+
+/// The persisted facts. Missing means none yet; unreadable is an error, so nothing switches on a
+/// state that could not be read.
+fn read_syncthing_posture_state() -> Result<SyncthingPostureState, OrchestratorError> {
+    let path = syncthing_posture_state_path();
+    match fs::read_to_string(&path) {
+        Ok(text) => serde_json::from_str(&text)
+            .map_err(|err| format!("unreadable '{}': {err}", path.display()).into()),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            Ok(SyncthingPostureState::default())
+        }
+        Err(err) => Err(err.into()),
+    }
+}
+
+fn write_syncthing_posture_state(posture: &SyncthingPostureState) -> Result<(), OrchestratorError> {
+    let bytes = serde_json::to_vec_pretty(posture)?;
+    write_file_atomic(&syncthing_posture_state_path(), &bytes)
+}
+
+/// The `/versions` section other hives read: the persisted facts, never live checks.
+fn syncthing_posture_snapshot() -> serde_json::Value {
+    match read_syncthing_posture_state() {
+        Ok(posture) => serde_json::json!({
+            "motherbee_static": posture.motherbee_static_at_ms.is_some(),
+            "motherbee_reachable": posture.motherbee_reachable_at_ms.is_some(),
+            "switched": posture.switched_at_ms.is_some(),
+        }),
+        Err(err) => serde_json::json!({ "error": err.to_string() }),
+    }
+}
+
+/// A spoke's facts as its `/versions` snapshot reports them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SpokePostureFacts {
+    motherbee_static: bool,
+    motherbee_reachable: bool,
+}
+
+/// The facts in a GET_VERSIONS reply. `None` when the spoke did not answer, or answered without
+/// the section (a release before stage 3): both keep the motherbee waiting.
+fn spoke_posture_facts(reply: &serde_json::Value) -> Option<SpokePostureFacts> {
+    if reply.get("status").and_then(|v| v.as_str()) != Some("ok") {
+        return None;
+    }
+    let section = reply.get("hive")?.get("syncthing_posture")?;
+    let fact = |name: &str| section.get(name).and_then(|v| v.as_bool());
+    Some(SpokePostureFacts {
+        motherbee_static: fact("motherbee_static")?,
+        motherbee_reachable: fact("motherbee_reachable")?,
+    })
+}
+
+/// The spokes the motherbee still waits for, named with the reason; empty means it can switch.
+fn motherbee_switch_waiting_for(
+    reports: &BTreeMap<String, Option<SpokePostureFacts>>,
+) -> Vec<String> {
+    reports
+        .iter()
+        .filter_map(|(hive_id, facts)| match facts {
+            None => Some(format!("{hive_id} (no report)")),
+            Some(f) if !f.motherbee_static => {
+                Some(format!("{hive_id} (motherbee address not static)"))
+            }
+            Some(f) if !f.motherbee_reachable => {
+                Some(format!("{hive_id} (motherbee Syncthing port not reached)"))
+            }
+            Some(_) => None,
+        })
+        .collect()
+}
+
+/// The spoke's next facts from what it sees now. Facts only ever go from unset to set.
+fn spoke_posture_step(
+    mut posture: SyncthingPostureState,
+    motherbee_static_now: bool,
+    motherbee_reachable_now: bool,
+    now_ms: u64,
+) -> SyncthingPostureState {
+    if motherbee_static_now && posture.motherbee_static_at_ms.is_none() {
+        posture.motherbee_static_at_ms = Some(now_ms);
+    }
+    if motherbee_reachable_now && posture.motherbee_reachable_at_ms.is_none() {
+        posture.motherbee_reachable_at_ms = Some(now_ms);
+    }
+    posture
+}
+
+/// A spoke switches once both facts are recorded.
+fn spoke_may_switch(posture: &SyncthingPostureState) -> bool {
+    posture.motherbee_static_at_ms.is_some() && posture.motherbee_reachable_at_ms.is_some()
+}
+
+/// Spoke side of stage 3, after the address reconcile: record the facts, switch once both hold,
+/// and keep the owned options from then on. Returns whether config.xml changed and what to report.
+fn reconcile_spoke_syncthing_options(
+    config_path: &Path,
+    local_device_id: &str,
+    address: SyncthingPeerAddress,
+) -> Result<(bool, Vec<String>), OrchestratorError> {
+    let before = read_syncthing_posture_state()?;
+    let mut posture = before.clone();
+    if !spoke_may_switch(&posture) {
+        let (current, _) = read_syncthing_config(config_path, false)?;
+        let static_now = syncthing_declared_devices(&current)?.iter().any(|d| {
+            d.id != local_device_id
+                && d.name == PRIMARY_HIVE_ID
+                && d.address == address.config_value()
+        });
+        let reachable_now = match address {
+            SyncthingPeerAddress::Static(socket) => {
+                std::net::TcpStream::connect_timeout(&socket, Duration::from_secs(3)).is_ok()
+            }
+            SyncthingPeerAddress::AcceptOnly => false,
+        };
+        posture = spoke_posture_step(posture, static_now, reachable_now, now_epoch_ms());
+    }
+    let mut notes = Vec::new();
+    let mut changed = false;
+    if spoke_may_switch(&posture) {
+        let listen = syncthing_owned_listen_address(false);
+        changed = update_syncthing_config(config_path, |current| {
+            let (updated, changed) = apply_syncthing_owned_options_xml(current, &listen)?;
+            if changed && updated != current {
+                mark_syncthing_restart_pending();
+            }
+            Ok((updated, changed))
+        })?;
+        if posture.switched_at_ms.is_none() {
+            posture.switched_at_ms = Some(now_epoch_ms());
+            tracing::info!(
+                "syncthing: switched off public discovery, relays and NAT; listening on loopback"
+            );
+        } else if changed {
+            tracing::info!("syncthing: owned options restored");
+        }
+    } else if posture.motherbee_static_at_ms.is_none() {
+        notes.push(
+            "Syncthing keeps discovery on: the motherbee device has no static address yet"
+                .to_string(),
+        );
+    } else {
+        notes.push(format!(
+            "Syncthing keeps discovery on: {} does not answer yet",
+            address.config_value()
+        ));
+    }
+    if posture != before {
+        write_syncthing_posture_state(&posture)?;
+    }
+    Ok((changed, notes))
+}
+
+/// The motherbee side of stage 3, in its own task: until it has switched, about once a minute it
+/// reads the facts of every spoke whose device the registry records, through GET_VERSIONS, and
+/// switches once all of them report both. An offline spoke keeps it waiting, and is named. The
+/// restart follows on the watchdog's next reconcile, through the pending marker.
+async fn run_syncthing_options_switch_loop(state: Arc<OrchestratorState>) {
+    let mut ticker = time::interval(Duration::from_secs(60));
+    ticker.set_missed_tick_behavior(time::MissedTickBehavior::Delay);
+    let mut last_report = String::new();
+    loop {
+        ticker.tick().await;
+        let report = match motherbee_options_switch_round(&state).await {
+            Ok(None) => return,
+            Ok(Some(report)) => report,
+            Err(err) => format!("Syncthing options switch failed, retrying: {err}"),
+        };
+        if report != last_report {
+            if report.is_empty() {
+                tracing::info!("syncthing options switch: nothing to report");
+            } else {
+                tracing::warn!(report = %report, "syncthing options switch");
+            }
+            last_report = report;
+        }
+    }
+}
+
+/// One round: `Ok(None)` once switched (the loop ends), otherwise what to report.
+async fn motherbee_options_switch_round(
+    state: &OrchestratorState,
+) -> Result<Option<String>, OrchestratorError> {
+    let mut posture = read_syncthing_posture_state()?;
+    if posture.switched_at_ms.is_some() {
+        return Ok(None);
+    }
+    let blob = current_blob_runtime_config(state);
+    let dist = current_dist_runtime_config(state);
+    let sync = effective_syncthing_runtime_config(&blob, &dist);
+    let config_path = sync.sync_data_dir.join("config.xml");
+    if !sync.sync_enabled || !config_path.exists() {
+        return Ok(Some(String::new()));
+    }
+    if state.any_hive_topology_busy() {
+        return Ok(Some(String::new()));
+    }
+    let registry = read_registry_snapshot(&hives_root());
+    if !registry.complete {
+        return Ok(Some(
+            "Syncthing keeps discovery on: the hive registry could not be read".to_string(),
+        ));
+    }
+    let mut reports = BTreeMap::new();
+    for (hive_id, hive) in &registry.hives {
+        if hive.device_id.is_none() {
+            continue;
+        }
+        let reply = get_versions_flow(state, &serde_json::json!({ "target": hive_id })).await;
+        reports.insert(hive_id.clone(), spoke_posture_facts(&reply));
+    }
+    let waiting = motherbee_switch_waiting_for(&reports);
+    if !waiting.is_empty() {
+        return Ok(Some(format!(
+            "Syncthing keeps discovery on, waiting for: {}",
+            waiting.join(", ")
+        )));
+    }
+    let listen = syncthing_owned_listen_address(true);
+    tokio::task::block_in_place(|| {
+        update_syncthing_config(&config_path, |current| {
+            let (updated, changed) = apply_syncthing_owned_options_xml(current, &listen)?;
+            if changed && updated != current {
+                mark_syncthing_restart_pending();
+            }
+            Ok((updated, changed))
+        })
+    })?;
+    posture.switched_at_ms = Some(now_epoch_ms());
+    write_syncthing_posture_state(&posture)?;
+    tracing::info!(
+        spokes = reports.len(),
+        "syncthing: every spoke reported a static, reachable motherbee; switched off public discovery, relays and NAT"
+    );
+    Ok(None)
 }
 
 fn remove_syncthing_folder_device(
@@ -10266,6 +10651,8 @@ fn local_versions_snapshot(state: &OrchestratorState) -> serde_json::Value {
         "core": core,
         "runtimes": runtimes,
         "vendor": vendor,
+        // Host posture stage 3: the persisted Syncthing facts the motherbee waits on.
+        "syncthing_posture": syncthing_posture_snapshot(),
     })
 }
 
@@ -27802,6 +28189,200 @@ mod tests {
         assert_eq!(fs::read_to_string(&victim).unwrap(), "keep\n");
         assert!(fs::symlink_metadata(dir.join("nowhere")).is_err());
         fs::remove_dir_all(&dir).unwrap();
+    }
+
+    // Host posture stage 3 fixture: the motherbee's `<options>` as captured read-only on PROD on
+    // 2026-10-06 (0.1.58): every public-infrastructure option still on.
+    const ST3_PROD_OPTIONS: &str = "<configuration version=\"51\">\n    <options>\n        <listenAddress>default</listenAddress>\n        <globalAnnounceServer>default</globalAnnounceServer>\n        <globalAnnounceEnabled>true</globalAnnounceEnabled>\n        <localAnnounceEnabled>true</localAnnounceEnabled>\n        <localAnnouncePort>21027</localAnnouncePort>\n        <localAnnounceMCAddr>[ff12::8384]:21027</localAnnounceMCAddr>\n        <reconnectionIntervalS>60</reconnectionIntervalS>\n        <relaysEnabled>true</relaysEnabled>\n        <natEnabled>true</natEnabled>\n        <natLeaseMinutes>60</natLeaseMinutes>\n        <urAccepted>0</urAccepted>\n        <autoUpgradeIntervalH>12</autoUpgradeIntervalH>\n        <crashReportingURL>https://crash.syncthing.net/newcrash</crashReportingURL>\n        <crashReportingEnabled>true</crashReportingEnabled>\n        <stunKeepaliveStartS>180</stunKeepaliveStartS>\n        <stunKeepaliveMinS>20</stunKeepaliveMinS>\n        <stunServer>default</stunServer>\n    </options>\n    <gui enabled=\"true\" tls=\"false\">\n        <address>127.0.0.1:8384</address>\n    </gui>\n</configuration>\n";
+
+    fn st3_option(config: &str, name: &str) -> Vec<String> {
+        let block = Regex::new(r#"(?s)<options>(.*?)</options>"#)
+            .unwrap()
+            .captures(config)
+            .unwrap()[1]
+            .to_string();
+        Regex::new(&format!(r#"<{name}>([^<]*)</{name}>"#))
+            .unwrap()
+            .captures_iter(&block)
+            .map(|caps| caps[1].to_string())
+            .collect()
+    }
+
+    #[test]
+    fn stage3_owned_options_on_the_prod_motherbee() {
+        let listen = syncthing_owned_listen_address(true);
+        assert_eq!(listen, "tcp://:22000");
+        let (updated, changed) =
+            apply_syncthing_owned_options_xml(ST3_PROD_OPTIONS, &listen).unwrap();
+        assert!(changed);
+        for (name, value) in SYNCTHING_OWNED_OPTIONS {
+            assert_eq!(st3_option(&updated, name), [value], "{name}");
+        }
+        assert_eq!(st3_option(&updated, "listenAddress"), ["tcp://:22000"]);
+        // Everything else is left as it is.
+        for (name, value) in [
+            ("globalAnnounceServer", "default"),
+            ("localAnnouncePort", "21027"),
+            ("natLeaseMinutes", "60"),
+            ("stunKeepaliveMinS", "20"),
+            ("stunServer", "default"),
+            ("crashReportingURL", "https://crash.syncthing.net/newcrash"),
+        ] {
+            assert_eq!(st3_option(&updated, name), [value], "{name}");
+        }
+        assert!(updated.contains("<address>127.0.0.1:8384</address>"));
+        assert!(updated.ends_with("    </options>\n    <gui enabled=\"true\" tls=\"false\">\n        <address>127.0.0.1:8384</address>\n    </gui>\n</configuration>\n"));
+        let (again, changed_again) = apply_syncthing_owned_options_xml(&updated, &listen).unwrap();
+        assert!(!changed_again);
+        assert_eq!(again, updated);
+    }
+
+    #[test]
+    fn stage3_owned_options_add_what_is_missing_and_keep_one_listener() {
+        let config = "<configuration>\n    <options>\n        <listenAddress>tcp://0.0.0.0:22000</listenAddress>\n        <listenAddress>quic://0.0.0.0:22000</listenAddress>\n        <listenAddress>dynamic+https://relays.syncthing.net/endpoint</listenAddress>\n        <maxSendKbps>0</maxSendKbps>\n    </options>\n</configuration>\n";
+        let listen = syncthing_owned_listen_address(false);
+        assert_eq!(listen, "tcp://127.0.0.1:22000");
+        let (updated, changed) = apply_syncthing_owned_options_xml(config, &listen).unwrap();
+        assert!(changed);
+        assert_eq!(
+            st3_option(&updated, "listenAddress"),
+            ["tcp://127.0.0.1:22000"]
+        );
+        for (name, value) in SYNCTHING_OWNED_OPTIONS {
+            assert_eq!(st3_option(&updated, name), [value], "{name}");
+        }
+        assert_eq!(st3_option(&updated, "maxSendKbps"), ["0"]);
+        assert!(updated.contains("\n    </options>\n</configuration>\n"));
+        assert!(
+            !apply_syncthing_owned_options_xml(&updated, &listen)
+                .unwrap()
+                .1
+        );
+        assert!(apply_syncthing_owned_options_xml("<configuration/>", &listen).is_err());
+    }
+
+    fn st3_versions_reply(section: Option<serde_json::Value>) -> serde_json::Value {
+        let mut hive = serde_json::json!({ "hive_id": "worker1", "role": "worker" });
+        if let Some(section) = section {
+            hive["syncthing_posture"] = section;
+        }
+        serde_json::json!({ "status": "ok", "hive": hive })
+    }
+
+    #[test]
+    fn stage3_spoke_facts_come_from_the_versions_reply() {
+        let both = serde_json::json!({"motherbee_static": true, "motherbee_reachable": true, "switched": true});
+        assert_eq!(
+            spoke_posture_facts(&st3_versions_reply(Some(both))),
+            Some(SpokePostureFacts {
+                motherbee_static: true,
+                motherbee_reachable: true
+            })
+        );
+        // A release before stage 3 has no section; a partial or failed section, or no answer,
+        // counts as no report.
+        assert_eq!(spoke_posture_facts(&st3_versions_reply(None)), None);
+        assert_eq!(
+            spoke_posture_facts(&st3_versions_reply(Some(
+                serde_json::json!({"motherbee_static": true})
+            ))),
+            None
+        );
+        assert_eq!(
+            spoke_posture_facts(&st3_versions_reply(Some(
+                serde_json::json!({"error": "unreadable"})
+            ))),
+            None
+        );
+        assert_eq!(
+            spoke_posture_facts(
+                &serde_json::json!({"status": "error", "error_code": "VERSIONS_FAILED"})
+            ),
+            None
+        );
+    }
+
+    /// PROD at the stage-3 deploy: the three spokes on the new release report both facts, and
+    /// worker2 is stopped on 0.1.57. The motherbee waits for it, by name.
+    #[test]
+    fn stage3_the_motherbee_waits_for_every_spoke() {
+        let both = Some(SpokePostureFacts {
+            motherbee_static: true,
+            motherbee_reachable: true,
+        });
+        let mut reports = BTreeMap::from([
+            ("egress1".to_string(), both),
+            ("ingress1".to_string(), both),
+            ("worker1".to_string(), both),
+            ("worker2".to_string(), None),
+        ]);
+        assert_eq!(
+            motherbee_switch_waiting_for(&reports),
+            ["worker2 (no report)"]
+        );
+        reports.insert(
+            "worker2".to_string(),
+            Some(SpokePostureFacts {
+                motherbee_static: false,
+                motherbee_reachable: true,
+            }),
+        );
+        assert_eq!(
+            motherbee_switch_waiting_for(&reports),
+            ["worker2 (motherbee address not static)"]
+        );
+        reports.insert(
+            "worker2".to_string(),
+            Some(SpokePostureFacts {
+                motherbee_static: true,
+                motherbee_reachable: false,
+            }),
+        );
+        assert_eq!(
+            motherbee_switch_waiting_for(&reports),
+            ["worker2 (motherbee Syncthing port not reached)"]
+        );
+        reports.insert("worker2".to_string(), both);
+        assert!(motherbee_switch_waiting_for(&reports).is_empty());
+        assert!(motherbee_switch_waiting_for(&BTreeMap::new()).is_empty());
+    }
+
+    /// The facts are recorded the first time they hold and never undone; the spoke switches only
+    /// with both.
+    #[test]
+    fn stage3_spoke_facts_are_one_way() {
+        let none = SyncthingPostureState::default();
+        assert!(!spoke_may_switch(&none));
+        let only_static = spoke_posture_step(none.clone(), true, false, 10);
+        assert_eq!(only_static.motherbee_static_at_ms, Some(10));
+        assert!(!spoke_may_switch(&only_static));
+        let both = spoke_posture_step(only_static, false, true, 20);
+        assert_eq!(
+            both.motherbee_static_at_ms,
+            Some(10),
+            "a later outage undoes nothing"
+        );
+        assert_eq!(both.motherbee_reachable_at_ms, Some(20));
+        assert!(spoke_may_switch(&both));
+        assert_eq!(spoke_posture_step(both.clone(), false, false, 30), both);
+    }
+
+    #[test]
+    fn stage3_state_file_roundtrip() {
+        let empty: SyncthingPostureState = serde_json::from_str("{}").unwrap();
+        assert_eq!(empty, SyncthingPostureState::default());
+        assert_eq!(serde_json::to_string(&empty).unwrap(), "{}");
+        let full = SyncthingPostureState {
+            motherbee_static_at_ms: Some(1),
+            motherbee_reachable_at_ms: Some(2),
+            switched_at_ms: Some(3),
+        };
+        let text = serde_json::to_string(&full).unwrap();
+        assert_eq!(
+            serde_json::from_str::<SyncthingPostureState>(&text).unwrap(),
+            full
+        );
+        assert!(serde_json::from_str::<SyncthingPostureState>("not json").is_err());
     }
 
     // `ss -H -tlnp` captured read-only on the PROD motherbee on 2026-10-05 (0.1.56): Archi on

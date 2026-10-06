@@ -13,6 +13,12 @@ Stage 2 target
   spoke      exactly one remote device, the motherbee, at tcp://<wan uplink host>:22000; no
              folder offered by the motherbee left pending
 
+Stage 3 target (--stage 3, on top of stage 2)
+  every hive  the owned options exact (no announce, relays, NAT, crash or usage reports, upgrades
+              or STUN; reconnection every 10 s), discovery off, no relay or QUIC connection, no
+              Syncthing UDP socket off loopback, and the persisted facts switched
+  listen      the motherbee tcp://:22000, a spoke tcp://127.0.0.1:22000
+
 A hive that is stopped on purpose (the throwaway worker kept on an old release for the stage-3
 skip-upgrade test) is named with --offline HIVE: its addresses and folders are still judged, its
 completion is printed but not required.
@@ -29,6 +35,13 @@ import sys
 import urllib.request
 
 SYNC_DIR = "/var/lib/fluxbee/syncthing"
+POSTURE_STATE = "/var/lib/fluxbee/orchestrator/syncthing-posture.json"
+# The options the orchestrator owns from stage 3 on (REST names), as the oracle for the gate.
+OWNED_OPTIONS = {
+    "globalAnnounceEnabled": False, "localAnnounceEnabled": False, "relaysEnabled": False,
+    "natEnabled": False, "crashReportingEnabled": False, "urAccepted": -1,
+    "autoUpgradeIntervalH": 0, "stunKeepaliveStartS": 0, "reconnectionIntervalS": 10,
+}
 HIVE_YAML = "/etc/fluxbee/hive.yaml"
 HIVES_ROOT = "/var/lib/fluxbee/hives"
 PRIMARY = "motherbee"
@@ -106,8 +119,47 @@ def offline_hives(argv):
     return out
 
 
+def stage(argv):
+    for i, arg in enumerate(argv):
+        if arg == "--stage" and i + 1 < len(argv):
+            return int(argv[i + 1])
+    return 2
+
+
+def check_stage3(st, role, options, status, connections, listeners):
+    """The stage-3 target on this host; appends to problems."""
+    for name, value in OWNED_OPTIONS.items():
+        if options.get(name) != value:
+            problems.append("option %s is %r, expected %r" % (name, options.get(name), value))
+    expected = ["tcp://:22000"] if role == PRIMARY else ["tcp://127.0.0.1:22000"]
+    if (options.get("listenAddresses") or []) != expected:
+        problems.append("listen %s, expected %s" % (options.get("listenAddresses"), expected))
+    if status.get("discoveryEnabled"):
+        problems.append("discovery is enabled")
+    for device_id, conn in connections.items():
+        kind = (conn.get("type") or "").lower()
+        if conn.get("connected") and ("relay" in kind or "quic" in kind):
+            problems.append("connection %s is %s" % (short(device_id), kind))
+    for line in listeners.splitlines():
+        fields = line.split()
+        if '"syncthing"' in line and fields and fields[0] == "udp":
+            local = fields[4]
+            if not (local.startswith("127.") or local.startswith("[::1]")):
+                problems.append("syncthing UDP socket on %s" % local)
+    posture = read(POSTURE_STATE)
+    try:
+        facts = json.loads(posture) if posture else {}
+    except ValueError:
+        facts = {}
+        problems.append("posture state unreadable")
+    print("posture facts %s" % json.dumps(facts, sort_keys=True))
+    if not facts.get("switched_at_ms"):
+        problems.append("the persisted facts do not say switched")
+
+
 def main():
     offline = offline_hives(sys.argv[1:])
+    target = stage(sys.argv[1:])
     hive = read(HIVE_YAML) or ""
     role = yaml_scalar(hive, "role") or "?"
     hive_id = yaml_scalar(hive, "hive_id") or "?"
@@ -222,12 +274,15 @@ def main():
         if '"syncthing"' in line:
             fields = line.split()
             print("socket %s %s" % (fields[0], fields[4]))
+    if target >= 3:
+        print("discovery enabled=%s" % status.get("discoveryEnabled"))
+        check_stage3(st, role, options, status, connections, listeners)
 
     if problems:
         for problem in problems:
             print("FAIL %s" % problem)
         return 1
-    print("verdict ok (stage 2 target)")
+    print("verdict ok (stage %d target)" % target)
     return 0
 
 
