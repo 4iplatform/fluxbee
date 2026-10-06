@@ -137,3 +137,65 @@ document.
 | P-14 | Source allowlists are not authentication on a shared L2; the apt repo is unsigned; outbound is open. | §0 residuals; O4 (ingress segment, anti-spoofing, outbound filter); A-49 (sign the repo). |
 | A-21 | "Stages 1–5 close A-46" overstated. | §6: they close the inbound and HTTP side; §0 lists what stays open. |
 | D-18 | §1 imprecisions: only the motherbee gets core ufw rules; the egress re-applies every ~60 s; no 501 stub; Archi's catch-all route. | Corrected in §1.2, §1.3, §1.5. |
+
+---
+
+# Round 2 — Part A of revision 3 (2026-10-05)
+
+**Scope:** sections 0–3 and stages 0–5 of the spec, plus A-48 and A-49. Same four lenses, each with
+an adversarial verifier.
+
+**Verdict:** all four lenses failed again.
+
+| Lens | Findings | Blockers |
+|---|---|---|
+| Development | 23 | 2 |
+| Test | 22 | 0 |
+| Acceptance | 16 | 1 |
+| Production | 23 | 1 |
+
+Verifiers: 47 confirmed, 37 partial, 0 refuted.
+
+**The common cause.** Most findings come from mechanisms revision 2 added to filter the mesh ports
+per hive IP and to steer spokes from the motherbee:
+
+- `source_ips`, their backfill, and the comparison of session addresses;
+- the settings push;
+- verify probes, commit-confirm, quarantine and hold-down;
+- `operator_sources` and `extra_inbound`.
+
+Each brought its own failure modes:
+
+- admitting a joining hive was circular (D2-2, A2-2);
+- a re-addressed hive was cut off for good (A2-1, P2-11);
+- spokes never get the registry (A2-3, P2-13);
+- the push could be sent by any orchestrator (D2-1, P2-15);
+- verify could pass with zero probes after an upgrade (P2-4);
+- a widening change could stall `add_hive` (P2-5).
+
+The Acceptance lens found that safety needs none of these (A2-1, A2-7, A2-8), which is also the
+operator's "no la compliques".
+
+**Disposition: revision 4 simplifies Part A** instead of patching each mechanism.
+
+| Change | Findings resolved |
+|---|---|
+| Ports and interfaces per role, with no per-hive IPs, no registry input to the ruleset and no settings from other hives. Mesh ports are already authenticated. Removed hives are kept out at the protocol layer (A-48). | D2-1, D2-2, D2-3, D2-4, D2-23 (partly), A2-1, A2-2, A2-3, A2-7, P2-6, P2-11, P2-13, P2-15, T2-6, T2-7 |
+| Automatic mode with no configuration: observe until a clean window fixed in code, then enforce; a changed ruleset goes back to observe. Two local files for us: break-glass, which the orchestrator also honours, and hold. | D2-5, D2-10, A2-6, P2-2, P2-8, T2-9, T2-10 |
+| No probes, commit-confirm or quarantine: a ruleset is enforced only after it ran clean in observe. | D2-9, A2-8, P2-4, P2-5, T2-12 |
+| Would-drop accounting never carries the verdict (chain policy), records only unicast to the host on internal interfaces, and keeps INVALID separate. | P2-1 (blocker), A2-9, T2-5 |
+| SSH only on internal interfaces, on every role, with no configuration. Report-only sshd warnings. `operator_sources` and `extra_inbound` dropped from v1. | A2-4, P2-12, P2-14, P2-21, P2-22, T2-4 |
+| Report-only TCP listener check from stage 1 (the live bind, not the config); a scoped CI guard. | T2-1, T2-16, D2-13, A2-11 |
+| Syncthing: the motherbee on `0.0.0.0`, spokes on loopback, IP literals only, reconnection interval owned; ordering predicates taken from spoke reports over the existing GET_VERSIONS, over linked devices only; the whole public set gated together. | D2-6, D2-17, D2-18, T2-2, T2-3, P2-19, P2-20, A2-16 |
+| nftables: `.deb` Depends on the motherbee; `add_hive` installs it on spokes; a failure means `unavailable`, never a refused join. | D2-12, A2-5 |
+| Third-party firewalls: a generic check, and Fluxbee stops writing ufw/firewalld rules without touching existing ones. | A2-10, T2-17 |
+| Lifecycle: the outgoing code tears the posture down on a downgrade or rollback; REMOVE_HIVE_CLEANUP runs before the registry entry goes and stops sy-edge on an ingress. | D2-8, P2-7, P2-10, P2-17, T2-14, T2-20, T2-22 |
+| A-48 detailed: leaf pinned, a router registry view, sessions closed, REMOVE_HIVE_CLEANUP refused on the motherbee, SSH host keys recorded. | D2-11, A2-12, A2-13, P2-16 |
+| A-49 detailed: non-interactive signing, the key shipped in the `.deb`, the postinst switches the source. | D2-22, A2-14, P2-18, T2-15 |
+| §1 facts and residuals corrected. | D2-14, D2-21, A2-15, P2-23, T2-11, T2-13, T2-18, T2-19, T2-21 |
+
+**Operator decisions.** Two simplifications narrow decisions the operator already took, so they
+need his OK: D3 (filtering by interface instead of per-hive IP) and D16 (SSH only on internal
+interfaces).
+
+**Next.** A third round on revision 4, before stage 1.

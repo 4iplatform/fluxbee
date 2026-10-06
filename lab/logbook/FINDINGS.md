@@ -755,6 +755,10 @@ Visto al arreglar los e2e de A-37, leyendo `src/router/mod.rs` y `src/shm/mod.rs
     - io.linkedhelper por el edge, al final;
     - del ingress, solo lo que resuelven `add_hive` y el orquestador.
   - Orden de trabajo (D20): core → conexión con Cloud → nodos de implementación.
+  - Ronda 2 del panel (sobre la Parte A, revisión 3): reprobó otra vez, 84 findings. La causa
+    fue el filtrado por IP de cada hive y todo lo que lo rodeaba.
+  - La revisión 4 simplifica: reglas por puerto e interfaz según el rol, modo automático (observa
+    24 h y después bloquea), sin configuración y sin probes.
 - **Lo que queda abierto aunque se cierren las etapas 1–5:**
   - la malla de control: cualquier orquestador, el ingress incluido, puede mandar SPAWN, KILL,
     etc. (A-20, A-22);
