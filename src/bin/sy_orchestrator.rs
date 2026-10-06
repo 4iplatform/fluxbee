@@ -2520,6 +2520,28 @@ fn watchdog_egress_reconcile(state: &OrchestratorState) {
     }
 }
 
+/// SYSTEM actions that only a spoke runs. The motherbee sends them to the hive it is adding or
+/// removing, never to itself (remove_hive refuses the local hive). On the motherbee they would be
+/// a kill switch that any orchestrator, the DMZ ingress included, could pull: ADD_HIVE_FINALIZE
+/// restarts the whole core and links a Syncthing device the sender chooses, and
+/// REMOVE_HIVE_CLEANUP stops and disables every core service. So the motherbee refuses them
+/// (FINDINGS A-48; DTAP round 3, D3-3 and P3-3).
+const SPOKE_ONLY_SYSTEM_ACTIONS: &[&str] = &["ADD_HIVE_FINALIZE", "REMOVE_HIVE_CLEANUP"];
+
+/// The refusal payload when `action` is spoke-only and this hive is the motherbee.
+fn spoke_only_action_refusal(action: &str, is_motherbee: bool) -> Option<serde_json::Value> {
+    if !is_motherbee || !SPOKE_ONLY_SYSTEM_ACTIONS.contains(&action) {
+        return None;
+    }
+    Some(serde_json::json!({
+        "status": "error",
+        "error_code": "FORBIDDEN",
+        "message": format!(
+            "{action} runs only on the hive being added or removed, never on the motherbee"
+        ),
+    }))
+}
+
 async fn send_admin_forbidden(
     sender: &NodeSender,
     msg: &Message,
@@ -2966,7 +2988,16 @@ async fn handle_system_message(
             let _ = send_system_action_response(sender, msg, "INVENTORY_RESPONSE", result).await;
         }
         Some("ADD_HIVE_FINALIZE") => {
-            let result = add_hive_finalize_local_flow(state, &msg.payload).await;
+            let result = match spoke_only_action_refusal("ADD_HIVE_FINALIZE", state.is_motherbee) {
+                Some(refusal) => {
+                    tracing::warn!(
+                        src_l2_name = ?msg.routing.src_l2_name,
+                        "ADD_HIVE_FINALIZE refused: it never runs on the motherbee"
+                    );
+                    refusal
+                }
+                None => add_hive_finalize_local_flow(state, &msg.payload).await,
+            };
             tracing::info!(result = %result, "ADD_HIVE_FINALIZE processed");
             let _ = send_system_action_response(sender, msg, "ADD_HIVE_FINALIZE_RESPONSE", result)
                 .await;
@@ -2979,7 +3010,17 @@ async fn handle_system_message(
                 .get("egress_teardown")
                 .and_then(|value| value.as_bool())
                 .unwrap_or(false);
-            let result = remove_hive_cleanup_local_flow(egress_teardown);
+            let result = match spoke_only_action_refusal("REMOVE_HIVE_CLEANUP", state.is_motherbee)
+            {
+                Some(refusal) => {
+                    tracing::warn!(
+                        src_l2_name = ?msg.routing.src_l2_name,
+                        "REMOVE_HIVE_CLEANUP refused: it never runs on the motherbee"
+                    );
+                    refusal
+                }
+                None => remove_hive_cleanup_local_flow(egress_teardown),
+            };
             tracing::info!(result = %result, "REMOVE_HIVE_CLEANUP processed");
             let _ =
                 send_system_action_response(sender, msg, "REMOVE_HIVE_CLEANUP_RESPONSE", result)
@@ -5956,7 +5997,9 @@ fn watchdog_listener_check(state: &OrchestratorState) {
     };
     let listeners = parse_ss_tcp_listeners(&output);
     if listeners.is_empty() && !output.trim().is_empty() {
-        tracing::warn!("listener check: could not parse any line of `ss -H -tlnp`; the check is blind");
+        tracing::warn!(
+            "listener check: could not parse any line of `ss -H -tlnp`; the check is blind"
+        );
         return;
     }
     for (process, host, port) in loopback_only_exposures(&listeners) {
@@ -25880,6 +25923,26 @@ LISTEN 0      4096               *:22000       *:* users:(("syncthing",pid=20134
     }
 
     #[test]
+    fn the_motherbee_refuses_the_spoke_only_actions() {
+        for action in ["ADD_HIVE_FINALIZE", "REMOVE_HIVE_CLEANUP"] {
+            let refusal =
+                spoke_only_action_refusal(action, true).expect("refused on the motherbee");
+            assert_eq!(refusal["status"], "error");
+            assert_eq!(refusal["error_code"], "FORBIDDEN");
+            assert!(
+                spoke_only_action_refusal(action, false).is_none(),
+                "{action} runs on a spoke"
+            );
+        }
+        for action in ["SPAWN_NODE", "KILL_NODE", "GET_VERSIONS", "SYSTEM_UPDATE"] {
+            assert!(
+                spoke_only_action_refusal(action, true).is_none(),
+                "{action} is not spoke-only"
+            );
+        }
+    }
+
+    #[test]
     fn listener_check_drops_the_scope_before_the_brackets() {
         let output = r#"LISTEN 0 4096 [::1]%lo:3000 [::]:* users:(("sy-architect",pid=1,fd=1))
 LISTEN 0 4096 [fe80::1]%eth0:8080 [::]:* users:(("sy-admin",pid=2,fd=2))
@@ -25897,10 +25960,24 @@ LISTEN 0 4096 [fe80::1]%eth0:8080 [::]:* users:(("sy-admin",pid=2,fd=2))
 
     #[test]
     fn listener_check_loopback_rule() {
-        for host in ["127.0.0.1", "127.0.0.2", "127.0.0.53", "::1", "::ffff:127.0.0.1"] {
+        for host in [
+            "127.0.0.1",
+            "127.0.0.2",
+            "127.0.0.53",
+            "::1",
+            "::ffff:127.0.0.1",
+        ] {
             assert!(listen_host_is_loopback(host), "{host} is loopback");
         }
-        for host in ["0.0.0.0", "::", "*", "10.10.10.10", "fe80::1", "", "localhost"] {
+        for host in [
+            "0.0.0.0",
+            "::",
+            "*",
+            "10.10.10.10",
+            "fe80::1",
+            "",
+            "localhost",
+        ] {
             assert!(!listen_host_is_loopback(host), "{host} is not loopback");
         }
     }
