@@ -789,7 +789,7 @@ Visto al arreglar los e2e de A-37, leyendo `src/router/mod.rs` y `src/shm/mod.rs
     antes de construirlos (§8 del doc).
   - El acceso desde Cloud (etapa 7) es de la fase Cloud.
 
-### A-47 🟡 ETAPA 2 CONSTRUIDA (0.1.58, por validar) — Syncthing usa la infraestructura pública y worker1 depende del discovery
+### A-47 🟡 ETAPA 2 VALIDADA (0.1.58) — Syncthing usa la infraestructura pública y worker1 depende del discovery
 
 - **Qué pasa (verificado el 2026-10-05 en los 4 hosts de PROD):**
   - Están prendidos `globalAnnounce`, `localAnnounce`, `relays`, `nat` y `crashReporting`, y el
@@ -820,8 +820,8 @@ Visto al arreglar los e2e de A-37, leyendo `src/router/mod.rs` y `src/shm/mod.rs
 - **También encontrado:** `vendor/syncthing/config.xml` ya trae lo público apagado, pero solo lo
   usa el camino de instalación dev. El `.deb` y los spokes corren los defaults de Syncthing.
 - **Estado:**
-  - **Etapa 2 (direcciones y carpetas) construida para 0.1.58**, después de tres revisiones
-    adversariales del código (`docs/host-posture-and-exposure-spec-v1.md` §3.5, "as built"). Los
+  - **Etapa 2 (direcciones y carpetas) validada en 0.1.58** (2026-10-06), después de cuatro
+    revisiones adversariales del código (`docs/host-posture-and-exposure-spec-v1.md` §3.5, "as built"). Los
     spokes quedan con el motherbee en dirección fija y el motherbee solo acepta; además saca a cada
     spoke de las carpetas que su rol no debe tener (A-50) y borra los devices que ningún hive
     reclama.
@@ -873,7 +873,7 @@ Visto al arreglar los e2e de A-37, leyendo `src/router/mod.rs` y `src/shm/mod.rs
   - aislar el ingress a nivel de red queda para después del core: necesita config de infra (D19).
 - **Estado:** registrado. No se tocó nada.
 
-### A-50 🔴 ARREGLADO EN LA ETAPA 2 (0.1.58, por validar) — El motherbee le compartía `blob/active` al egress
+### A-50 ✅ RESUELTO (0.1.58, validado en 8.x) — El motherbee le compartía `blob/active` al egress
 
 - **Qué pasa (verificado el 2026-10-06 en PROD, solo lectura, con `lab/posture-check.py`):**
   - En el motherbee, la carpeta `fluxbee-blob` (`/var/lib/fluxbee/blob/active`, sendreceive: los
@@ -905,8 +905,8 @@ Visto al arreglar los e2e de A-37, leyendo `src/router/mod.rs` y `src/shm/mod.rs
   blob o el público más tarde) queda vacía hasta volver a correr `add_hive` para ellos. El arreglo
   propuesto es un backfill por rol, como el de policy desde vendor. Hoy no aplica en PROD: blob está
   prendido desde la instalación.
-- **Estado:** construido; se valida con el deploy de 0.1.58 (el egress sale de `fluxbee-blob` y su
-  oferta pendiente desaparece).
+- **Estado:** validado en 0.1.58 (2026-10-06): el primer round sacó a egress1 de `fluxbee-blob`, y
+  la oferta pendiente desapareció del egress.
 
 ### A-51 🟡 PARA ARREGLAR (paso propio después de la etapa 2) — root escribe en directorios del usuario `fluxbee` siguiendo nombres que ese usuario controla
 
@@ -946,7 +946,7 @@ Visto al arreglar los e2e de A-37, leyendo `src/router/mod.rs` y `src/shm/mod.rs
   dueño del entorno del host. Mientras tanto vale la receta del HANDBOOK §3.4.
 - **Estado:** para arreglar; el gate de la etapa 2 ya asienta la VM antes de unirla.
 
-### A-53 🟡 ARREGLADO EN LA ETAPA 2 (0.1.58, por validar) — `local_syncthing_device_id` siempre fallaba con Syncthing v2 y caía al primer device de `config.xml`
+### A-53 🟡 ARREGLADO EN 0.1.58 (lo ejercita el próximo join) — `local_syncthing_device_id` siempre fallaba con Syncthing v2 y caía al primer device de `config.xml`
 
 - **Qué pasa (verificado el 2026-10-06 en el motherbee de PROD, solo lectura):**
   - El orquestador pedía el ID con `syncthing --home … --device-id`; el binario v2.0.14 responde

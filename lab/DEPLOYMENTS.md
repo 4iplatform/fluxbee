@@ -21,6 +21,7 @@
 
 | Versión | Fecha (ART) | Commit | Alcance | Estado | Rollback |
 |---|---|---|---|---|---|
+| **0.1.58** | 2026-10-06 | `9d9391b` | motherbee + spokes (core) | ✅ live | snap `pre-stage2-0-1-58` (las 4 VMs) · `apt install fluxbee=0.1.57` |
 | **0.1.57** | 2026-10-06 | `a703b89` | motherbee + spokes (core) | ✅ live | snap `pre-posture-0-1-57` (las 4 VMs) · `apt install fluxbee=0.1.56` |
 | **0.1.56** | 2026-10-03 | `715143a` | motherbee + spokes (core) | ✅ live | snap `pre-root-io-0-1-56` (las 4 VMs) · `apt install fluxbee=0.1.55` |
 | **0.1.55** | 2026-10-02 | `975fd34` | motherbee + spokes (core) | ✅ live | snap `pre-root-tenant-0-1-55` (las 4 VMs) · `apt install fluxbee=0.1.54` |
@@ -66,6 +67,49 @@
 > (`dpkg-scanpackages -m`) para rollback, pero su detalle vive en la bitácora, no acá.
 
 ---
+
+## 0.1.58 — Syncthing: los spokes discan al motherbee y el motherbee solo acepta (etapa 2 de la postura); `blob/active` solo para workers
+
+- **Fecha:** 2026-10-06 (ART) · **Versión anterior:** 0.1.57 · **Commits:** `0a35329`..`9d9391b`
+  (FINDINGS A-47, A-50, A-51, A-52, A-53; bitácora `2026-10-06`; diseño
+  `docs/host-posture-and-exposure-spec-v1.md`, revisión 8, §3.5 "as built").
+- **Alcance:** motherbee + los tres spokes (core-update). `worker2` (VM 104), unida hoy en 0.1.57
+  para la prueba de salteo de versiones de la etapa 3, quedó **apagada y afuera del deploy** a
+  propósito.
+- **Qué cambió:**
+  - **Direcciones (A-47, etapa 2):** el watchdog reconcilia cada ~60 s. En cada spoke, el device
+    del motherbee pasa a `tcp://<IP del uplink>:22000`. En el motherbee, los devices de los hives
+    quedan `dynamic` (solo acepta), y su device se identifica por el ID que registra cada entrada.
+    El ID del egress, que nunca se había registrado, se completa por nombre.
+  - **A-50:** el motherbee le compartía `blob/active` al egress. El join solo lo comparte con
+    workers, y la reconciliación saca a cada spoke de las carpetas que su rol no debe tener (regla
+    por rol, nunca por flags). Las carpetas nuevas nacen sin miembros.
+  - **Escritor único de `config.xml`**, endurecido contra el directorio del usuario de Syncthing
+    (sin seguir symlinks, temporal `O_EXCL`, dueño y modo por descriptor). Guard de CI.
+  - **A-53:** el ID local sale de `syncthing device-id` (v2 no tiene `--device-id`).
+  - Huérfanos: se borran solo con el registro completo y todos los hives en reposo y registrados.
+  - Un join de ingress espera 90 s a que el spoke disque.
+  - Cuatro revisiones adversariales del código antes del release.
+- **Build:** 7 min (commit `9d9391b`). **CI:** `rust-tests`, `posture-guards` y
+  `router-dispatcher-guards` en verde. **Publish:** 10 s, 58 paquetes. **Deploy:** 202 s con
+  `ops deploy`; snapshots `pre-stage2-0-1-58` en las 4 VMs (se borró antes `pre-root-tenant-0-1-55`).
+- **Verificación en vivo (gate de la etapa 2):**
+  - **Primer round, como se predijo:** en el motherbee (08:51:10 UTC) ingress1 pasó a `dynamic`,
+    egress1 salió de `fluxbee-blob`, su device ID quedó registrado y Syncthing se reinició **una**
+    vez; en worker1 (08:51:47) el motherbee pasó a `tcp://10.10.10.10:22000`, con un reinicio.
+    ingress1 y egress1 no cambiaron (Syncthing con 461 k segundos arriba).
+  - **`lab/posture-check.py -- --offline worker2`:** `verdict ok` en los 4. Completion 100% en el
+    motherbee para los tres spokes de PROD; la oferta pendiente de `blob/active` desapareció del
+    egress; las 4 entradas del registro tienen device ID.
+  - **Listen:** `default` en los 4, sin cambios. **OPA:** `in_sync` 4/4. **Avisos:** cero líneas
+    WARN de Syncthing en los 4 orquestadores desde el deploy.
+  - **Sin loop de reinicios:** el uptime de Syncthing crece en tres muestras cada ~130 s
+    (motherbee 99 → 228 → 359 s; worker1 64 → 194 → 326 s; ingress1 y egress1 sin reiniciarse).
+  - **Health** desde las 08:48 UTC: 0 unidades caídas, 0 denegaciones, 0 descartes de origen en
+    los 4. `ops versions`: los 4 en 0.1.58, manifest `043d3d6ac6f51896`.
+- **Rollback:** `apt install fluxbee=0.1.57` en el motherbee + core-update de los spokes, o el
+  snapshot `pre-stage2-0-1-58`. Los cambios en `config.xml` (direcciones, membresía del egress) no
+  rompen 0.1.57: no los revierte nadie y siguen siendo correctos.
 
 ## 0.1.57 — Archi y el admin solo en loopback (etapa 1 de la postura), sin botón de apagado en el motherbee, logs sin colores
 
