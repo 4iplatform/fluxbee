@@ -42,9 +42,7 @@ fi
 install -d /run/fluxbee/routers
 # Not dist: the motherbee's dist is root's and Syncthing only reads it, which the orchestrator
 # sets at every start (FINDINGS A-51).
-chown -R fluxbee:fluxbee \
-    /var/lib/fluxbee/syncthing \
-    /var/lib/fluxbee/blob 2>/dev/null || true
+chown -R fluxbee:fluxbee /var/lib/fluxbee/syncthing /var/lib/fluxbee/blob 2>/dev/null || true
 
 # Seed a config if none exists yet (the operator edits this before first-boot).
 if [ ! -f /etc/fluxbee/hive.yaml ] && [ -f /etc/fluxbee/hive.yaml.example ]; then

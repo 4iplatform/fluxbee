@@ -355,7 +355,7 @@ func (s *Service) answerPendingSyncs() {
 	s.pendingSyncs = kept
 }
 
-// writeSyncedFile writes atomically (temp + rename) and hands the file to Syncthing's user.
+// writeSyncedFile writes atomically (temp + rename) and gives the file the synced tree's owner.
 func writeSyncedFile(path string, data []byte) error {
 	tmp := path + ".tmp"
 	if err := os.WriteFile(tmp, data, 0o640); err != nil {
@@ -365,8 +365,9 @@ func writeSyncedFile(path string, data []byte) error {
 	return os.Rename(tmp, path)
 }
 
-// chownForSync hands a published file to whoever owns the synced folder (dist/policy): the
-// orchestrator gives it to the Syncthing service user configured in hive.yaml.
+// chownForSync gives a published file the owner of the dist tree. On the motherbee that is root,
+// with the Syncthing user's group, which only reads it (A-51); the file's 0640 lets that group
+// read it.
 func chownForSync(path string) {
 	info, err := os.Stat(filepath.Dir(policyDistDir))
 	if err != nil {

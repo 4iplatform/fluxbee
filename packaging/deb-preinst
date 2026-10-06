@@ -29,4 +29,16 @@ if [ "$1" = "upgrade" ] && [ -f "$MANIFEST" ]; then
     echo "fluxbee: snapshotted runtimes manifest -> $SNAPSHOT"
 fi
 
+# A-51: the motherbee's dist is root's and the Syncthing user only reads it (the orchestrator sets
+# that at every start). Switch an older install over BEFORE this package unpacks, so dpkg and the
+# postinst never consume files that user could still rewrite. A link there is never legitimate and
+# is removed, never followed. Best effort: the orchestrator does it again at its start.
+DIST=/var/lib/fluxbee/dist
+if [ -d "$DIST" ] && [ ! -L "$DIST" ]; then
+    find "$DIST" -mindepth 1 -type l -delete 2>/dev/null || true
+    chown -R root:fluxbee "$DIST" 2>/dev/null || chown -R root:root "$DIST" 2>/dev/null || true
+    chmod -R g+rX,go-w "$DIST" 2>/dev/null || true
+    chmod 0750 "$DIST" 2>/dev/null || true
+fi
+
 exit 0

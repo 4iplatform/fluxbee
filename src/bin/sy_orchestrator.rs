@@ -5515,13 +5515,30 @@ fn ensure_dirs(
     fs::create_dir_all(dist.path.join("vendor"))?;
     // Before the ownership pass: on a spoke it is a receive-only folder syncthing must write.
     fs::create_dir_all(dist.path.join("policy"))?;
-    if dist.sync_enabled && dist_sync_tool_is_syncthing(dist) {
+    // The motherbee's dist is root's whatever syncs it (A-51); a spoke's is the Syncthing user's,
+    // who writes what it receives there. A failed pass (chown -R exits 1 when a file vanishes
+    // mid-walk) is reported and runs again at the next start: never a reason not to start.
+    let owned = if is_motherbee {
+        let reader = resolve_syncthing_service_user(blob).unwrap_or_else(|_| "root".to_string());
+        Some(ensure_root_owned_tree(&dist.path, &reader))
+    } else if dist.sync_enabled && dist_sync_tool_is_syncthing(dist) {
         let service_user = resolve_syncthing_service_user(blob)?;
-        if is_motherbee {
-            ensure_root_owned_tree(&dist.path, &service_user)?;
-        } else {
-            ensure_owned_tree(&dist.path, &service_user)?;
-        }
+        Some(ensure_owned_tree(&dist.path, &service_user))
+    } else {
+        None
+    };
+    if let Some(Err(err)) = owned {
+        tracing::error!(error = %err, "could not set the dist tree's owner");
+        append_drift_alert(
+            "posture",
+            "dist_owner_not_set",
+            "warning",
+            hive_id,
+            format!("the dist tree's owner was not set at this start: {err}"),
+            None,
+            None,
+            None,
+        );
     }
     report_unusable_managed_dirs(
         hive_id,
@@ -5652,7 +5669,8 @@ const FIRST_BOOT_UNITS: &[&str] = &[
 ///   (an older systemd's answer for a missing unit) are settled.
 /// - Any other answer, an empty one included, counts as busy.
 ///
-/// No sudo: systemctl answers any user. Exit 124 names what still runs.
+/// No sudo: systemctl answers any user. Exit 124 names what still runs, with the first queued boot
+/// jobs when the boot never finished.
 fn first_boot_wait_script(secs: u64) -> String {
     let units = FIRST_BOOT_UNITS.join(" ");
     format!(
@@ -5670,7 +5688,13 @@ fn first_boot_wait_script(secs: u64) -> String {
          esac; \
          done; fi; \
          if [ -z \"$busy\" ]; then exit 0; fi; \
-         if [ \"$(date +%s)\" -ge \"$end\" ]; then echo \"still running: $busy\"; exit 124; fi; \
+         if [ \"$(date +%s)\" -ge \"$end\" ]; then \
+         if [ \"$busy\" = boot ]; then \
+         jobs=$(timeout 10 systemctl list-jobs --no-legend --no-pager 2>/dev/null | head -3 | tr -s \" \\n\" \" \" | sed \"s/ *\\$//\"); \
+         busy=\"boot${{jobs:+ ($jobs)}}\"; \
+         fi; \
+         echo \"still running: $busy\"; exit 124; \
+         fi; \
          sleep 5; \
          done"
     )
@@ -5779,26 +5803,41 @@ fn run_first_boot_check(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()?;
+    // Drained while it runs, so a chatty box never blocks ssh on a full pipe.
+    let drain = |pipe: Option<Box<dyn Read + Send>>| {
+        std::thread::spawn(move || {
+            let mut text = String::new();
+            if let Some(mut pipe) = pipe {
+                let _ = pipe.read_to_string(&mut text);
+            }
+            text
+        })
+    };
+    let stdout = drain(
+        child
+            .stdout
+            .take()
+            .map(|p| Box::new(p) as Box<dyn Read + Send>),
+    );
+    let stderr = drain(
+        child
+            .stderr
+            .take()
+            .map(|p| Box::new(p) as Box<dyn Read + Send>),
+    );
     let limit = Instant::now() + Duration::from_secs(secs + FIRST_BOOT_RUN_GRACE_SECS);
     loop {
         if let Some(status) = child.try_wait()? {
-            let mut stdout = String::new();
-            let mut stderr = String::new();
-            if let Some(mut out) = child.stdout.take() {
-                let _ = out.read_to_string(&mut stdout);
-            }
-            if let Some(mut err) = child.stderr.take() {
-                let _ = err.read_to_string(&mut stderr);
-            }
             return Ok(FirstBootRun {
                 code: status.code(),
-                stdout,
-                stderr,
+                stdout: stdout.join().unwrap_or_default(),
+                stderr: stderr.join().unwrap_or_default(),
             });
         }
         if Instant::now() >= limit {
             let _ = child.kill();
             let _ = child.wait();
+            let _ = (stdout.join(), stderr.join());
             return Ok(FirstBootRun {
                 code: Some(124),
                 stdout: "the run outlived its deadline on this side".to_string(),
@@ -5922,7 +5961,16 @@ fn open_managed_dir(path: &Path) -> Result<Option<fs::File>, OrchestratorError> 
             return Ok(None);
         }
         Ok(_) => {}
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => fs::create_dir_all(path)?,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            if let Err(err) = fs::create_dir_all(path) {
+                // Something else took the name between the check and the create.
+                if fs::symlink_metadata(path).is_ok_and(|meta| !meta.is_dir()) {
+                    tracing::error!(path = %path.display(), "a managed directory became something else; left alone");
+                    return Ok(None);
+                }
+                return Err(err.into());
+            }
+        }
         Err(err) => return Err(err.into()),
     }
     match fs::OpenOptions::new()
@@ -5931,9 +5979,12 @@ fn open_managed_dir(path: &Path) -> Result<Option<fs::File>, OrchestratorError> 
         .open(path)
     {
         Ok(dir) => Ok(Some(dir)),
-        // It became a symlink after the check above.
-        Err(err) if err.raw_os_error() == Some(nix::libc::ELOOP) => {
-            tracing::error!(path = %path.display(), "a managed directory became a symlink; left alone");
+        // It became a symlink, or a file, after the check above.
+        Err(err)
+            if err.raw_os_error() == Some(nix::libc::ELOOP)
+                || err.raw_os_error() == Some(nix::libc::ENOTDIR) =>
+        {
+            tracing::error!(path = %path.display(), "a managed directory became something else; left alone");
             Ok(None)
         }
         Err(err) => {
@@ -6004,16 +6055,36 @@ fn ensure_owned_tree(path: &Path, user: &str) -> Result<(), OrchestratorError> {
 /// send-receive and Syncthing's home is its own, so they stay the Syncthing user's, and so does a
 /// spoke's dist, where Syncthing writes what it receives.
 fn ensure_root_owned_tree(path: &Path, reader: &str) -> Result<(), OrchestratorError> {
+    let (_, gid) = linux_user_ids(reader)?;
+    own_tree_for_reading(path, 0, gid)
+}
+
+/// `uid` owns the tree and `gid` may only read it: links inside are removed (never followed; the
+/// motherbee's dist has no legitimate one, and one planted while the Syncthing user owned the tree
+/// would keep root reading bytes that user can still write), then `chown -R` and
+/// `chmod -R g+rX,go-w`, and the top directory 0750.
+fn own_tree_for_reading(path: &Path, uid: u32, gid: u32) -> Result<(), OrchestratorError> {
     let Some(dir) = open_managed_dir(path)? else {
         return Ok(());
     };
-    let (_, gid) = linux_user_ids(reader)?;
+    let mut find = Command::new("find");
+    find.arg(path)
+        .arg("-mindepth")
+        .arg("1")
+        .arg("-type")
+        .arg("l")
+        .arg("-print")
+        .arg("-delete");
+    let removed = run_cmd_output(find, "remove links under the dist tree")?;
+    if !removed.trim().is_empty() {
+        tracing::warn!(links = %removed.trim(), "removed links under the dist tree (A-51)");
+    }
     let mut chown = Command::new("chown");
-    chown.arg("-R").arg(format!("0:{gid}")).arg(path);
-    run_cmd(chown, "chown dist tree to root")?;
+    chown.arg("-R").arg(format!("{uid}:{gid}")).arg(path);
+    run_cmd(chown, "chown the dist tree")?;
     let mut chmod = Command::new("chmod");
     chmod.arg("-R").arg("g+rX,go-w").arg(path);
-    run_cmd(chmod, "make the dist tree readable to syncthing")?;
+    run_cmd(chmod, "make the dist tree readable to its group")?;
     dir.set_permissions(fs::Permissions::from_mode(0o750))?;
     Ok(())
 }
@@ -29371,34 +29442,55 @@ mod tests {
         fs::remove_dir_all(&dir).unwrap();
     }
 
-    /// A-51: on the motherbee dist is root's and Syncthing only reads it; a spoke's stays the
-    /// Syncthing user's, because Syncthing writes what it receives there. The package must not
-    /// hand the motherbee's dist back to the Syncthing user at every upgrade.
+    /// A-51: the motherbee's dist tree is root's and its group only reads it. The pass removes
+    /// every link inside (never following one), takes write away from group and other, gives the
+    /// group read (and search on directories), and closes the top directory to others. Run here
+    /// with this user's ids, since a test cannot chown to root.
     #[test]
-    fn a51_the_motherbee_keeps_dist_and_a_spoke_hands_it_to_syncthing() {
-        let src = include_str!("sy_orchestrator.rs");
-        let start = src.find("fn ensure_dirs(").expect("ensure_dirs");
-        let end = src[start..]
-            .find("\nfn blob_sync_folder_path")
-            .map(|o| start + o)
-            .unwrap_or(src.len());
-        let body = &src[start..end];
-        let mb = body
-            .find("if is_motherbee {\n            ensure_root_owned_tree(&dist.path")
-            .expect("the motherbee keeps dist");
-        let spoke = body
-            .find("ensure_owned_tree(&dist.path")
-            .expect("a spoke hands dist to syncthing");
-        assert!(mb < spoke && body[mb..spoke].contains("} else {"));
+    fn a51_the_motherbee_dist_is_root_s_and_its_group_only_reads_it() {
+        use std::os::unix::fs::MetadataExt;
+        let dir = a51_dir("tree");
+        let tree = dir.join("dist");
+        let elsewhere = dir.join("elsewhere");
+        fs::create_dir_all(tree.join("runtimes/x/current")).unwrap();
+        fs::create_dir_all(&elsewhere).unwrap();
+        let mode = |path: &Path| fs::symlink_metadata(path).unwrap().mode() & 0o7777;
+        let set = |path: &Path, mode: u32| {
+            fs::set_permissions(path, fs::Permissions::from_mode(mode)).unwrap()
+        };
+        let writable = tree.join("runtimes/x/current/config.json");
+        fs::write(&writable, b"{}").unwrap();
+        set(&writable, 0o666);
+        let private = tree.join("runtimes/manifest.json");
+        fs::write(&private, b"{}").unwrap();
+        set(&private, 0o600);
+        set(&tree.join("runtimes/x"), 0o700);
+        std::os::unix::fs::symlink(&elsewhere, tree.join("runtimes/x/current/escape")).unwrap();
+        let me = fs::metadata(&dir).unwrap();
+        own_tree_for_reading(&tree, me.uid(), me.gid()).unwrap();
+        assert!(fs::symlink_metadata(tree.join("runtimes/x/current/escape")).is_err());
+        assert!(elsewhere.is_dir(), "a link is removed, never followed");
+        assert_eq!(mode(&writable), 0o644);
+        assert_eq!(mode(&private), 0o640);
+        assert_eq!(mode(&tree.join("runtimes/x")), 0o750);
+        assert_eq!(mode(&tree), 0o750);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A-51: the package never hands the motherbee's dist back to the Syncthing user, and its
+    /// preinst switches an older install over before anything is unpacked.
+    #[test]
+    fn a51_the_package_keeps_the_motherbee_dist_root_s() {
         let postinst = include_str!("../../packaging/deb-postinst");
-        let chown = postinst
-            .find("chown -R fluxbee:fluxbee")
-            .expect("the postinst chown");
-        let chown_end = postinst[chown..].find("|| true").expect("its end") + chown;
-        assert!(
-            !postinst[chown..chown_end].contains("/var/lib/fluxbee/dist"),
-            "the postinst hands dist to the Syncthing user again"
-        );
+        for line in postinst.lines().filter(|line| line.contains("chown")) {
+            assert!(
+                !line.contains("/var/lib/fluxbee/dist") && !line.trim_end().ends_with('\\'),
+                "the postinst hands dist to someone: {line}"
+            );
+        }
+        let preinst = include_str!("../../packaging/deb-preinst");
+        assert!(preinst.contains("find \"$DIST\" -mindepth 1 -type l -delete"));
+        assert!(preinst.contains("chown -R root:"));
     }
 
     /// A-52: the wait is one single-quoted script, with no sudo (systemctl answers any user).
@@ -29424,11 +29516,12 @@ mod tests {
         let bin = dir.join("bin");
         fs::create_dir_all(&bin).unwrap();
         for (unit, answers) in states {
-            fs::write(
-                dir.join(format!("{unit}.states")),
-                answers.join("\n") + "\n",
-            )
-            .unwrap();
+            let file = if *unit == "jobs" {
+                "jobs".to_string()
+            } else {
+                format!("{unit}.states")
+            };
+            fs::write(dir.join(file), answers.join("\n") + "\n").unwrap();
         }
         let stand_in = |name: &str, body: String| {
             let path = bin.join(name);
@@ -29438,7 +29531,8 @@ mod tests {
         stand_in(
             "systemctl",
             format!(
-                "#!/bin/sh\nif [ \"$1\" = is-system-running ]; then u=system; none=running; \
+                "#!/bin/sh\nif [ \"$1\" = list-jobs ]; then cat '{d}'/jobs 2>/dev/null; exit 0; fi\n\
+                 if [ \"$1\" = is-system-running ]; then u=system; none=running; \
                  else u=${{2%.service}}; none=inactive; fi\n\
                  f='{d}'/$u.states; c='{d}'/$u.count\n\
                  n=$(cat \"$c\" 2>/dev/null || echo 0); n=$((n+1)); echo $n > \"$c\"\n\
@@ -29525,6 +29619,22 @@ mod tests {
                 "{busy:?}"
             );
         }
+        // A boot that never finishes names its first queued jobs.
+        assert_eq!(
+            a52_run_wait(
+                "stuck-boot",
+                0,
+                &[
+                    ("system", &["starting"]),
+                    ("jobs", &["7 mnt-data.mount start running"])
+                ]
+            ),
+            (
+                124,
+                "still running: boot (7 mnt-data.mount start running)".to_string(),
+                0
+            )
+        );
     }
 
     fn a52_run(code: Option<i32>, stderr: &str) -> std::io::Result<FirstBootRun> {
