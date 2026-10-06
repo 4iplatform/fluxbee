@@ -995,7 +995,7 @@ Visto al arreglar los e2e de A-37, leyendo `src/router/mod.rs` y `src/shm/mod.rs
   binario generaría uno como root); si no, el `myID` del Syncthing en marcha. Nunca `config.xml`.
 - **Estado:** construido; lo ejercita el próximo join (el de A-48).
 
-### A-59 🟡 ARREGLADO EN CÓDIGO (para 0.1.62, falta validar en 8.x) — La réplica de identity esperaba para siempre en una suscripción cortada sin FIN
+### A-59 ✅ RESUELTO (0.1.62, validado en 8.x) — La réplica de identity esperaba para siempre en una suscripción cortada sin FIN
 
 - **Qué pasaba (panel DTAP ronda 7, P7-1, confirmado en el código):** la suscripción de deltas de
   una réplica es un long-poll. La réplica solo escribe para confirmar un delta, leía sin timeout y el
@@ -1024,9 +1024,11 @@ Visto al arreglar los e2e de A-37, leyendo `src/router/mod.rs` y `src/shm/mod.rs
     60 s: el HANDBOOK ("El rollback") pide bajar primero los spokes.
 - **Visto en PROD antes del arreglo (0.1.61):** la suscripción de worker1 llevaba 15.929 s sin un
   paquete en ninguna dirección; el canal de publicación, cada 30 s.
-- **Validar en 8.x:** worker1 tiene dos conexiones a 10.10.10.10:9100. En la de la suscripción (la que
-  casi no envía) `lastrcv` no pasa de ~20 s; la de publicación llega a ~30 s, el ciclo de su snapshot.
-  Y una prueba concreta: cortar 100 s lo que llega de :9100 y ver que la réplica lo dice y se reconecta.
+- **Validado (2026-10-06, ledger 0.1.62):**
+  - En worker1, la suscripción pasó de 15.929 s sin un paquete a `lastrcv` de 8, 3 y 18,5 s.
+  - Un corte de 100 s de lo que llega de :9100: la réplica lo dijo a los 60 s del último latido, y se
+    re-suscribió 5 s después de levantarlo.
+  - Un worker unido de cero (worker2) también recibe latidos.
 
 ### A-58 🟡 PARA ARREGLAR — En los workers y el egress Syncthing corre como root
 
@@ -1055,7 +1057,7 @@ Visto al arreglar los e2e de A-37, leyendo `src/router/mod.rs` y `src/shm/mod.rs
   `blob/` solo necesita ser atravesable), y la misma primitiva de A-51 en el SDK y en io.blob.
 - **Estado:** para arreglar en un paso propio (toca el SDK y el workspace de IO).
 
-### A-57 🟡 ARREGLADO EN CÓDIGO (para 0.1.62, falta validar en 8.x) — `update category=vendor` instalaba el Syncthing nuevo pero no lo reiniciaba, y respondía que sí
+### A-57 ✅ RESUELTO (0.1.62, validado en 8.x) — `update category=vendor` instalaba el Syncthing nuevo pero no lo reiniciaba, y respondía que sí
 
 - **Qué pasaba (verificado en el código el 2026-10-06):** el update de vendor llamaba a
   `ensure_blob_sync_runtime`, que reinstalaba el binario si cambió el hash y después hacía
@@ -1070,9 +1072,13 @@ Visto al arreglar los e2e de A-37, leyendo `src/router/mod.rs` y `src/shm/mod.rs
   por un error en el medio ocurra en la llamada siguiente (revisión adversarial, F1). La respuesta
   dice lo que pasó: `updated: [syncthing]` solo con un binario nuevo, `restarted` solo si hubo
   reinicio. Tests de la regla y de la respuesta.
-- **Validar en 8.x:** un `update category=vendor` sin binario nuevo responde `unchanged` y sin
-  reinicio. El camino con binario nuevo lo ejercita el próximo vendor que cambie.
-- **Estado:** arreglado en código; existía antes de la postura.
+- **Validado (2026-10-06, ledger 0.1.62):**
+  - Sin binario nuevo, el update responde `unchanged` y sin reinicio, y ningún host reinició
+    Syncthing al arrancar el orquestador nuevo.
+  - Con el binario reemplazado bajo el proceso en marcha (una copia idéntica con otro inode), el
+    update reinició Syncthing y lo dijo (`restarted: [fluxbee-syncthing]`). El siguiente no
+    reinició.
+  - Falta solo el caso de un vendor con bytes nuevos, que sigue el mismo camino.
 
 ### A-54 ✅ RESUELTO (0.1.61, validado en 8.x) — El motherbee usaba SSH fuera de `add_hive`
 

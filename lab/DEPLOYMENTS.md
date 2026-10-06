@@ -21,6 +21,7 @@
 
 | Versión | Fecha (ART) | Commit | Alcance | Estado | Rollback |
 |---|---|---|---|---|---|
+| **0.1.62** | 2026-10-06 | `b4868e8` | motherbee + spokes (core) | ✅ live | snap `pre-identity-0-1-62` (las 4 VMs) · `apt install fluxbee=0.1.61` (spokes primero) |
 | **0.1.61** | 2026-10-06 | `e0f2d04` | motherbee + spokes (core) | ✅ live | snap `pre-ssh-0-1-61` (las 4 VMs) · `apt install fluxbee=0.1.60` |
 | **0.1.60** | 2026-10-06 | `0af5469` | motherbee + spokes (core) | ✅ live | snap `pre-hardening-0-1-60` (las 4 VMs) · `apt install fluxbee=0.1.59` |
 | **0.1.59** | 2026-10-06 | `f60eb92` | motherbee + spokes (core) | ✅ live | snap `pre-stage3-0-1-59` (las 4 VMs) · `apt install fluxbee=0.1.58` |
@@ -70,6 +71,78 @@
 > (`dpkg-scanpackages -m`) para rollback, pero su detalle vive en la bitácora, no acá.
 
 ---
+
+## 0.1.62 — La réplica de identity ya no cuelga detrás de un firewall (P7-1, A-59); Syncthing vuelve a su binario nuevo (A-57); seguimiento de D32
+
+- **Fecha:** 2026-10-06 (ART) · **Versión anterior:** 0.1.61 · **Commits:** `b6435cf`, `c7c7d6d`,
+  `b4868e8` (FINDINGS A-59, A-57, A-54). Tres revisiones adversariales (identity, orquestador, docs),
+  más una segunda sobre el arreglo de la carrera de identity.
+- **Alcance:** motherbee + los tres spokes (core-update).
+- **Qué cambió:**
+  - **sy-identity:**
+    - el primario manda un latido en la suscripción cada 20 s sin tráfico;
+    - la réplica corta y se vuelve a suscribir tras 60 s sin oír nada;
+    - el suscriptor se registra antes de contestar y antes de cada snapshot, así un delta ya no se
+      pierde entre el snapshot y el stream;
+    - las suscripciones muertas se limpian al registrar una nueva.
+  - **Orquestador:**
+    - Syncthing se reinicia si cambió su binario o su unit, o si su proceso corre un binario borrado;
+    - el update de vendor responde lo que hizo de verdad;
+    - el join emite el leaf antes del primer SSH;
+    - el revoke borra la llave vieja de recuperación solo por su comentario;
+    - el test de guardia de SSH es más estricto;
+    - un worker sin vendor falla el join, como ya pasaba en egress e ingress.
+  - **Docs:** deriva corregida.
+- **Deploy:** build `b4868e8` en 8 min, publish 9 s, deploy 201 s. Snapshots `pre-identity-0-1-62` en
+  las 4 VMs (se borró `pre-stage3-0-1-59`). Versiones 0.1.62 en los 4, health `failed=0`.
+- **Gate A-59 (P7-1):**
+  - Antes (0.1.61), en worker1: la suscripción llevaba 15.929 s sin un paquete en ninguna dirección.
+  - Después: tres muestras de `lastrcv` en la suscripción dieron 8 s, 3 s y 18,5 s, con `lastsnd`
+    creciendo porque no envía. El canal de publicación sigue su ciclo de 30 s.
+  - Corte de 100 s en worker1, con una tabla nft de prueba que descarta lo que llega de
+    10.10.10.10:9100 y un temporizador que la borra igual:
+    - 60 s después del último latido, la réplica dijo "no frame from the primary for 60s
+      (heartbeats stopped); resubscribing";
+    - 5 s después de levantar el corte, "identity full sync applied (delta stream subscribed)";
+    - la tabla quedó borrada.
+- **Gate A-57:**
+  - Ningún host corría un Syncthing con el binario borrado, y ninguno lo reinició al arrancar el
+    orquestador nuevo.
+  - `update category=vendor` a worker1, con el mismo binario 2.0.14, respondió `unchanged: [syncthing]`
+    y `restarted: []`. Antes decía `restarted` sin haber reiniciado.
+  - El camino con binario nuevo lo ejercita el próximo vendor que cambie.
+  - **El reinicio, con una prueba concreta en worker1:**
+    - Se instaló una copia idéntica del binario con otro inode. El Syncthing en marcha (pid 2507959,
+      arriba desde las 10:21) pasó a correr un archivo `(deleted)` con los mismos bytes: es el caso
+      del reinicio perdido de la revisión.
+    - El primer `update category=vendor` respondió `unchanged: [syncthing]` y
+      `restarted: [fluxbee-syncthing]`. El log dice "restarting syncthing onto its installed binary
+      and unit (A-57)": pid nuevo y sano 4 s después.
+    - El segundo respondió `restarted: []`, sin bucle.
+- **Gate del join (la VM 104 re-clonada):**
+  - Se borró y se clonó del template. `add_hive worker2` se lanzó a las 22:50:38, con la caja todavía
+    en `starting`.
+  - El join esperó en `waiting_for_host` de 22:51:09 a 22:59:35 (cloud-final) y terminó
+    `connected` a las 23:01:39.
+  - Resultado: `harden_ssh_applied`, `restrict_ssh` `from_only`, `ssh_bootstrap_revoked`, WAN,
+    orquestador y dist listos, y el peer de Syncthing enlazado. Ese join ejercitó el leaf emitido
+    antes del primer SSH y el envío de vendor que ahora es fatal.
+  - En la caja:
+    - password apagado;
+    - en `authorized_keys` solo quedó la llave descartable del operador;
+    - el sudoers del orquestador se borró;
+    - estaba el material TLS;
+    - en el journal de sshd, las sesiones desde 10.10.10.10 caen solo dentro del join (22:50:44 a
+      23:01:27);
+    - la suscripción de identity recibía latidos (`lastrcv` 14,8 s);
+    - todos los componentes en 0.1.62.
+  - Limpieza: llave descartable borrada, `DELETE /hives/worker2` ok por socket, VM 104 apagada.
+  - Visto de paso: Syncthing corre como root también en este worker nuevo (A-58, va en 0.1.63).
+- **Cierre:** `ops.py health` en `failed=0` desde el deploy, y OPA `in_sync` 4/4.
+- **Rollback:**
+  - Snapshot `pre-identity-0-1-62`, o `apt install fluxbee=0.1.61`.
+  - **Primero los spokes** (`core_rollback` o update al core viejo), después el motherbee: un worker
+    de 0.1.62 frente a un motherbee viejo se re-suscribe cada 60 s (HANDBOOK, "El rollback").
 
 ## 0.1.61 — SSH solo dentro de `add_hive` (D32, A-54)
 
