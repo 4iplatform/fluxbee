@@ -2396,6 +2396,9 @@ async fn watchdog_tick(state: &OrchestratorState) {
     // worker thread while it blocks, so the periodic egress work never starves
     // the admin/system message handlers (#[tokio::main] defaults to multi_thread).
     tokio::task::block_in_place(|| watchdog_egress_reconcile(state));
+
+    // A-46: report Archi or the admin bound off loopback, whatever bound them there.
+    tokio::task::block_in_place(|| watchdog_listener_check(state));
 }
 
 /// Watchdog tick counter for egress drift correction (F6). Every
@@ -5832,6 +5835,163 @@ fn ensure_core_firewall_local(state: &OrchestratorState) {
     rules.sort();
     rules.dedup();
     open_firewall_rules_local(&rules, "core");
+}
+
+// ===========================================================================
+// Host posture, stage 1: loopback-only services (FINDINGS A-46,
+// docs/host-posture-and-exposure-spec-v1.md §3.4). Archi and the admin HTTP API have no
+// authentication, so they must listen on loopback only. This reads what is actually bound
+// (`ss`), whatever bound it there (hive.yaml, a JSR_*_LISTEN override, the code default), and
+// reports a service bound off loopback. Report-only: it never changes a bind.
+// ===========================================================================
+
+/// Processes that must listen on loopback only, as `ss -p` names them.
+const LOOPBACK_ONLY_PROCESSES: &[&str] = &["sy-architect", "sy-admin"];
+
+/// Watchdog tick counter for the listener check. At the 5s cadence, 12 ticks ≈ 60s between
+/// checks; `tick % N == 0` fires on the first tick, right after bootstrap.
+static LISTENER_CHECK_TICKS: AtomicU64 = AtomicU64::new(0);
+const LISTENER_CHECK_EVERY_TICKS: u64 = 12;
+
+/// One TCP listener as `ss -H -tlnp` reports it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TcpListenerEntry {
+    host: String,
+    port: u16,
+    processes: Vec<String>,
+}
+
+/// Parses `ss -H -tlnp` output: `State Recv-Q Send-Q Local:Port Peer:Port [users:((...))]`.
+/// Lines that do not parse are skipped: this feeds a report, and a format surprise must not
+/// become a false alarm.
+fn parse_ss_tcp_listeners(output: &str) -> Vec<TcpListenerEntry> {
+    let mut listeners = Vec::new();
+    for line in output.lines() {
+        let fields: Vec<&str> = line.split_whitespace().collect();
+        if fields.len() < 5 {
+            continue;
+        }
+        let Some((host, port)) = fields[3].rsplit_once(':') else {
+            continue;
+        };
+        let Ok(port) = port.parse::<u16>() else {
+            continue;
+        };
+        // Drop the scope first (`127.0.0.53%lo`, `[::1]%lo`), then the brackets (`[::1]` → `::1`).
+        let host = host.split('%').next().unwrap_or(host);
+        let host = host.trim_start_matches('[').trim_end_matches(']');
+        let processes = fields
+            .get(5..)
+            .map(|rest| parse_ss_process_names(&rest.join(" ")))
+            .unwrap_or_default();
+        listeners.push(TcpListenerEntry {
+            host: host.to_string(),
+            port,
+            processes,
+        });
+    }
+    listeners
+}
+
+/// Process names from an `ss -p` users field: `users:(("sshd",pid=1,fd=3),("systemd",...))`.
+fn parse_ss_process_names(users: &str) -> Vec<String> {
+    let mut names = Vec::new();
+    let mut rest = users;
+    while let Some(start) = rest.find("(\"") {
+        rest = &rest[start + 2..];
+        let Some(end) = rest.find('"') else {
+            break;
+        };
+        names.push(rest[..end].to_string());
+        rest = &rest[end + 1..];
+    }
+    names
+}
+
+/// Whether a listen host is loopback. Wildcards (`*`, `0.0.0.0`, `::`) and anything that is not
+/// an IP address count as exposed.
+fn listen_host_is_loopback(host: &str) -> bool {
+    match host.parse::<std::net::IpAddr>() {
+        Ok(std::net::IpAddr::V4(v4)) => v4.is_loopback(),
+        Ok(std::net::IpAddr::V6(v6)) => {
+            v6.is_loopback() || v6.to_ipv4_mapped().is_some_and(|v4| v4.is_loopback())
+        }
+        Err(_) => false,
+    }
+}
+
+/// Loopback-only services found listening off loopback, as `(process, host, port)`.
+fn loopback_only_exposures(listeners: &[TcpListenerEntry]) -> Vec<(String, String, u16)> {
+    let mut exposures = Vec::new();
+    for listener in listeners {
+        if listen_host_is_loopback(&listener.host) {
+            continue;
+        }
+        for process in &listener.processes {
+            if LOOPBACK_ONLY_PROCESSES.contains(&process.as_str()) {
+                exposures.push((process.clone(), listener.host.clone(), listener.port));
+            }
+        }
+    }
+    exposures.sort();
+    exposures.dedup();
+    exposures
+}
+
+/// Every `LISTENER_CHECK_EVERY_TICKS`, reports a loopback-only service bound off loopback, in
+/// the log and in the drift store (deduplicated there for an hour).
+fn watchdog_listener_check(state: &OrchestratorState) {
+    let tick = LISTENER_CHECK_TICKS.fetch_add(1, Ordering::Relaxed);
+    if tick % LISTENER_CHECK_EVERY_TICKS != 0 {
+        return;
+    }
+    let mut cmd = Command::new("ss");
+    cmd.args(["-H", "-tlnp"]);
+    let output = match run_cmd_output(cmd, "ss -H -tlnp") {
+        Ok(output) => output,
+        Err(err) => {
+            tracing::warn!(error = %err, "listener check: ss failed; skipping");
+            return;
+        }
+    };
+    let listeners = parse_ss_tcp_listeners(&output);
+    if listeners.is_empty() && !output.trim().is_empty() {
+        tracing::warn!("listener check: could not parse any line of `ss -H -tlnp`; the check is blind");
+        return;
+    }
+    for (process, host, port) in loopback_only_exposures(&listeners) {
+        let endpoint = listen_endpoint(&host, port);
+        tracing::warn!(
+            process = process.as_str(),
+            endpoint = endpoint.as_str(),
+            "service without authentication listens off loopback (A-46)"
+        );
+        // The drift store keeps one alert per kind and hour, so each process gets its own kind:
+        // with both exposed, one must not hide the other.
+        append_drift_alert(
+            "posture",
+            &format!("loopback_service_exposed_{process}"),
+            "error",
+            &state.hive_id,
+            format!(
+                "{process} listens on {endpoint}. It has no authentication and must listen on \
+                 127.0.0.1 only (FINDINGS A-46). Check architect.listen / admin.listen in \
+                 /etc/fluxbee/hive.yaml and any JSR_ARCHITECT_LISTEN / JSR_ADMIN_LISTEN override."
+            ),
+            None,
+            None,
+            None,
+        );
+    }
+}
+
+/// `host:port` for messages, with an IPv6 host in brackets (`[::]:3000`).
+fn listen_endpoint(host: &str, port: u16) -> String {
+    if host.contains(':') {
+        format!("[{host}]:{port}")
+    } else {
+        format!("{host}:{port}")
+    }
 }
 
 // ===========================================================================
@@ -25676,6 +25836,95 @@ mod tests {
         .unwrap();
         assert!(!changed_again);
         assert_eq!(idempotent, updated);
+    }
+
+    // `ss -H -tlnp` captured read-only on the PROD motherbee on 2026-10-05 (0.1.56): Archi on
+    // 0.0.0.0:3000 is the A-46 exposure; everything else there is expected.
+    const SS_TLNP_PROD_MOTHERBEE_0_1_56: &str = r#"LISTEN 0      4096         0.0.0.0:3000  0.0.0.0:* users:(("sy-architect",pid=2936175,fd=11))
+LISTEN 0      4096   127.0.0.53%lo:53    0.0.0.0:* users:(("systemd-resolve",pid=1722615,fd=15))
+LISTEN 0      4096       127.0.0.1:8384  0.0.0.0:* users:(("syncthing",pid=2013481,fd=44))
+LISTEN 0      4096         0.0.0.0:9100  0.0.0.0:* users:(("sy-identity",pid=2936268,fd=11))
+LISTEN 0      4096         0.0.0.0:9000  0.0.0.0:* users:(("rt-gateway",pid=2936036,fd=12))
+LISTEN 0      4096         0.0.0.0:22    0.0.0.0:* users:(("systemd",pid=1,fd=228))
+LISTEN 0      4096       127.0.0.1:8080  0.0.0.0:* users:(("sy-admin",pid=2936173,fd=10))
+LISTEN 0      4096      127.0.0.54:53    0.0.0.0:* users:(("systemd-resolve",pid=1722615,fd=17))
+LISTEN 0      4096       127.0.0.1:4222  0.0.0.0:* users:(("rt-gateway",pid=2936036,fd=9))
+LISTEN 0      200        127.0.0.1:5432  0.0.0.0:* users:(("postgres",pid=1722647,fd=7))
+LISTEN 0      200            [::1]:5432     [::]:* users:(("postgres",pid=1722647,fd=6))
+LISTEN 0      4096            [::]:22       [::]:* users:(("systemd",pid=1,fd=229))
+LISTEN 0      4096               *:22000       *:* users:(("syncthing",pid=2013481,fd=34))
+"#;
+
+    #[test]
+    fn listener_check_flags_archi_on_the_prod_motherbee() {
+        let listeners = parse_ss_tcp_listeners(SS_TLNP_PROD_MOTHERBEE_0_1_56);
+        assert_eq!(listeners.len(), 13);
+        assert_eq!(
+            loopback_only_exposures(&listeners),
+            vec![("sy-architect".to_string(), "0.0.0.0".to_string(), 3000)]
+        );
+    }
+
+    #[test]
+    fn listener_check_parses_scopes_brackets_and_users() {
+        let listeners = parse_ss_tcp_listeners(SS_TLNP_PROD_MOTHERBEE_0_1_56);
+        let resolver = &listeners[1];
+        assert_eq!((resolver.host.as_str(), resolver.port), ("127.0.0.53", 53));
+        let pg_v6 = &listeners[10];
+        assert_eq!((pg_v6.host.as_str(), pg_v6.port), ("::1", 5432));
+        assert_eq!(listeners[12].host, "*");
+        assert_eq!(
+            parse_ss_process_names(r#"users:(("sshd",pid=1,fd=3),("systemd",pid=1,fd=50))"#),
+            vec!["sshd".to_string(), "systemd".to_string()]
+        );
+    }
+
+    #[test]
+    fn listener_check_drops_the_scope_before_the_brackets() {
+        let output = r#"LISTEN 0 4096 [::1]%lo:3000 [::]:* users:(("sy-architect",pid=1,fd=1))
+LISTEN 0 4096 [fe80::1]%eth0:8080 [::]:* users:(("sy-admin",pid=2,fd=2))
+"#;
+        let listeners = parse_ss_tcp_listeners(output);
+        assert_eq!(listeners[0].host, "::1");
+        assert_eq!(listeners[1].host, "fe80::1");
+        assert_eq!(
+            loopback_only_exposures(&listeners),
+            vec![("sy-admin".to_string(), "fe80::1".to_string(), 8080)]
+        );
+        assert_eq!(listen_endpoint("::", 3000), "[::]:3000");
+        assert_eq!(listen_endpoint("0.0.0.0", 3000), "0.0.0.0:3000");
+    }
+
+    #[test]
+    fn listener_check_loopback_rule() {
+        for host in ["127.0.0.1", "127.0.0.2", "127.0.0.53", "::1", "::ffff:127.0.0.1"] {
+            assert!(listen_host_is_loopback(host), "{host} is loopback");
+        }
+        for host in ["0.0.0.0", "::", "*", "10.10.10.10", "fe80::1", "", "localhost"] {
+            assert!(!listen_host_is_loopback(host), "{host} is not loopback");
+        }
+    }
+
+    #[test]
+    fn listener_check_flags_every_exposed_shape_and_nothing_else() {
+        let output = r#"LISTEN 0 4096 [::]:3000 [::]:* users:(("sy-architect",pid=1,fd=1))
+LISTEN 0 4096 10.10.10.10:8080 0.0.0.0:* users:(("sy-admin",pid=2,fd=2))
+LISTEN 0 4096 *:3000 *:* users:(("sy-architect",pid=1,fd=3))
+LISTEN 0 4096 [::1]:3000 [::]:* users:(("sy-architect",pid=1,fd=4))
+LISTEN 0 4096 127.0.0.2:8080 0.0.0.0:* users:(("sy-admin",pid=2,fd=5))
+LISTEN 0 4096 0.0.0.0:9000 0.0.0.0:* users:(("rt-gateway",pid=3,fd=6))
+LISTEN 0 4096 0.0.0.0:3000 0.0.0.0:*
+not an ss line
+LISTEN 0 4096 0.0.0.0:notaport 0.0.0.0:* users:(("sy-architect",pid=1,fd=7))
+"#;
+        assert_eq!(
+            loopback_only_exposures(&parse_ss_tcp_listeners(output)),
+            vec![
+                ("sy-admin".to_string(), "10.10.10.10".to_string(), 8080),
+                ("sy-architect".to_string(), "*".to_string(), 3000),
+                ("sy-architect".to_string(), "::".to_string(), 3000),
+            ]
+        );
     }
 
     #[test]

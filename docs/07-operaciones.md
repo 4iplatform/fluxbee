@@ -147,7 +147,7 @@ admin:
   listen: "127.0.0.1:8080"
 
 architect:
-  listen: "0.0.0.0:3000"
+  listen: "127.0.0.1:3000"   # solo loopback: Archi no tiene autenticación (A-46); desde otra máquina, túnel SSH
 
 storage:
   path: "/var/lib/fluxbee"

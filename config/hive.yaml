@@ -29,9 +29,11 @@ admin:
   # Optional absolute content origin returned alongside /public/<key>.
   # public_base_url: "https://content.example.com"
 
-# Local architect HTTP UI/API (typically exposed through reverse proxy).
+# Archi's HTTP UI/API. Loopback only: it has no authentication (FINDINGS A-46). Use it on the
+# motherbee itself, or from another machine through an SSH tunnel:
+#   ssh -L 3000:127.0.0.1:3000 <user>@<motherbee>
 architect:
-  listen: "0.0.0.0:3000"
+  listen: "127.0.0.1:3000"
 
 # Shared filesystem root used by admin/orchestrator.
 storage:

@@ -249,6 +249,8 @@ ln -sf ../share/fluxbee/fluxbee-factory-reset "$DEST/usr/bin/fluxbee-factory-res
 install -m0755 scripts/publish-runtime.sh "$DEST/usr/share/fluxbee/publish-runtime.sh"
 install -m0755 packaging/fluxbee-seed-runtimes "$DEST/usr/share/fluxbee/fluxbee-seed-runtimes"
 ln -sf ../share/fluxbee/fluxbee-seed-runtimes "$DEST/usr/bin/fluxbee-seed-runtimes"
+# The postinst runs it on every install to fix values older packages shipped wrong (A-46).
+install -m0755 packaging/fluxbee-migrate-config "$DEST/usr/share/fluxbee/fluxbee-migrate-config"
 printf '%s\n' "$VERSION" > "$DEST/usr/share/fluxbee/base-runtime-version"
 chmod 0644 "$DEST/usr/share/fluxbee/base-runtime-version"
 

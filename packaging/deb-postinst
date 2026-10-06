@@ -51,6 +51,13 @@ if [ ! -f /etc/fluxbee/hive.yaml ] && [ -f /etc/fluxbee/hive.yaml.example ]; the
     cp /etc/fluxbee/hive.yaml.example /etc/fluxbee/hive.yaml
 fi
 
+# An existing hive.yaml keeps whatever an older package seeded into it. Fix the values those
+# packages shipped wrong (A-46: Archi on 0.0.0.0) BEFORE the orchestrator starts: its boot
+# restarts sy-architect, which still runs the old binary, and it must come back on loopback.
+if [ -x /usr/share/fluxbee/fluxbee-migrate-config ]; then
+    /usr/share/fluxbee/fluxbee-migrate-config /etc/fluxbee/hive.yaml || true
+fi
+
 if [ -d /run/systemd/system ]; then
     systemctl daemon-reload || true
     systemctl enable sy-orchestrator.service >/dev/null 2>&1 || true

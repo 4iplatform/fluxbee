@@ -442,7 +442,8 @@ sudo apt-get update && sudo apt-get install -y fluxbee    # o fluxbee=<versión>
   - `apt install` 0.1.33: el `.deb` de 245 MB tarda ~3 min por el enlace 4.x ↔ 8.x.
   - `fluxbee-firstboot`: rc=0 en 28 s, sin editar el `hive.yaml`.
   - Resultado: `motherbee alive`, 21 units, 0 failed, y los nodos base en `UNCONFIGURED`.
-  - Archi, `http://<ip>:3000`, responde desde la VPN.
+  - Archi, `http://<ip>:3000`, respondía desde la VPN. **Desde 0.1.57 escucha solo en loopback**
+    (A-46): se usa en el motherbee o con un túnel SSH (`ssh -L 3000:127.0.0.1:3000 ...`).
 
 `fluxbee-firstboot` es **idempotente-ish pero irreversible en la práctica**: bootstrapea el hive.
 Su log cuenta exactamente qué hace:

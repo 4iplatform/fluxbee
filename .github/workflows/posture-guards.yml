@@ -1,0 +1,25 @@
+name: posture-guards
+
+# Host posture guards (docs/host-posture-and-exposure-spec-v1.md). Runs on every push because the
+# files they check (shipped config, packaging, lab, install docs) are outside the Rust paths that
+# trigger rust-tests.yml.
+on:
+  pull_request:
+  push:
+    branches: ["**"]
+
+permissions:
+  contents: read
+
+jobs:
+  guards:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Archi and admin stay on loopback (FINDINGS A-46)
+        run: bash scripts/check_loopback_binds.sh
+
+      - name: hive.yaml migration (packaging/fluxbee-migrate-config)
+        run: bash scripts/packaging_tests/migrate_config_test.sh

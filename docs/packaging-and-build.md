@@ -229,7 +229,10 @@ curl -sS -X POST http://127.0.0.1:8080/hives/motherbee/vault/secrets \
 # Tokens de Slack para un binding IO.slack (lo lanza su tenant): resource_type "slack", value {app_token, bot_token}.
 ```
 
-**Architect (Archi):** `http://<motherbee>:3000` · **Admin API:** `http://127.0.0.1:8080`.
+**Architect (Archi):** `http://127.0.0.1:3000` en el motherbee · **Admin API:** `http://127.0.0.1:8080`.
+Los dos escuchan solo en loopback (no tienen autenticación, FINDINGS A-46). Desde otra máquina,
+con un túnel SSH que lleve los dos puertos (la UI de Archi indica llamar al admin en el 8080):
+`ssh -L 3000:127.0.0.1:3000 -L 8080:127.0.0.1:8080 <usuario>@<motherbee>` y abrir `http://127.0.0.1:3000`.
 
 `IO.cloud` corre aunque no haya Fluxbee Cloud configurada (la Cloud vive en otro repo); es
 problema de quien conecte una Cloud, no del backend.
