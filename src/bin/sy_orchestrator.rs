@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
@@ -79,6 +79,10 @@ const LIFECYCLE_NODES_BOOTSTRAP_TIMEOUT_SECS: u64 = 60;
 const ADD_HIVE_SOCKET_READY_PROBE_TIMEOUT_SECS: u64 = 10;
 const SYNCTHING_SERVICE_NAME: &str = "fluxbee-syncthing";
 const SYNCTHING_BOOTSTRAP_TIMEOUT_SECS: u64 = 30;
+/// How long a join waits for a new spoke's Syncthing to connect. The motherbee only accepts
+/// (host posture stage 2), so the spoke dials: after a motherbee restart that is its next
+/// reconnection attempt, up to `reconnectionIntervalS` later (60 s by Syncthing's default).
+const SYNCTHING_PEER_CONNECT_TIMEOUT_SECS: u64 = 90;
 const SYNCTHING_HEALTH_TIMEOUT_SECS: u64 = 2;
 const SYNCTHING_INSTALL_USER: &str = "fluxbee";
 const SYNCTHING_SYNC_PORT_TCP: u16 = 22000;
@@ -682,6 +686,18 @@ impl OrchestratorState {
                 .clone()
         };
         lock.try_lock_owned().ok()
+    }
+
+    /// Whether any add_hive or remove_hive holds its hive's topology lock right now.
+    fn any_hive_topology_busy(&self) -> bool {
+        let locks: Vec<Arc<Mutex<()>>> = self
+            .hive_topology_locks
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .values()
+            .cloned()
+            .collect();
+        locks.iter().any(|lock| lock.try_lock().is_err())
     }
 
     /// SO-04: acquire the per-node lifecycle lock, held for the whole
@@ -2398,11 +2414,15 @@ async fn watchdog_tick(state: &OrchestratorState) {
         tracing::warn!(error = %err, "blob sync watchdog failed");
     }
 
-    // Host posture stage 2: Syncthing peer addresses (A-47), about once a minute.
+    // Host posture stage 2: Syncthing peers (A-47, A-50), about once a minute. A condition that
+    // lasts is logged once.
     if SYNCTHING_ADDRESS_TICKS.fetch_add(1, Ordering::Relaxed) % SYNCTHING_ADDRESS_EVERY_TICKS == 0
     {
-        if let Err(err) = reconcile_syncthing_peer_addresses(state).await {
-            tracing::warn!(error = %err, "syncthing peer address reconcile failed; retrying next round");
+        match reconcile_syncthing_peer_addresses(state).await {
+            Ok(notes) => report_syncthing_reconcile(&notes),
+            Err(err) => {
+                report_syncthing_reconcile(&[format!("failed, retrying next round: {err}")])
+            }
         }
     }
 
@@ -7071,6 +7091,8 @@ fn syncthing_device_connected(
     );
     let mut cmd = Command::new("curl");
     cmd.arg("-fsS")
+        .arg("--max-time")
+        .arg("5")
         .arg("-H")
         .arg(format!("X-API-Key: {api_key}"))
         .arg(&endpoint);
@@ -7658,14 +7680,21 @@ static SYNCTHING_CONFIG_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 /// `update` and, when something changed, replaces the file with an atomic rename that keeps its
 /// owner and mode (Syncthing runs as fluxbee; the orchestrator as root).
 /// `scripts/check_syncthing_single_writer.sh` keeps every write going through here.
+///
+/// `update` runs under the lock, so it must not call Syncthing or anything else that can stall:
+/// every writer (joins, `remove_hive`, the watchdog) waits on it.
 fn update_syncthing_config<F>(config_path: &Path, update: F) -> Result<bool, OrchestratorError>
 where
     F: FnOnce(&str) -> Result<(String, bool), OrchestratorError>,
 {
+    // A panic in another writer leaves nothing half-done on disk (the rename is atomic), so a
+    // poisoned lock is safe to take over.
     let _guard = SYNCTHING_CONFIG_LOCK
         .lock()
-        .map_err(|_| "syncthing config lock poisoned")?;
-    let current = fs::read_to_string(config_path)?;
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    // No writer is in flight while the lock is held, so any temp of ours is a crash leftover.
+    remove_stale_replace_temps(config_path);
+    let current = read_regular_file_nofollow(config_path)?;
     let (updated, changed) = update(&current)?;
     if !changed || updated == current {
         return Ok(false);
@@ -7674,33 +7703,101 @@ where
     Ok(true)
 }
 
-/// Writes `contents` to a sibling temp file with `path`'s owner and mode, then renames it over
-/// `path`: a reader never sees a half-written file, and the owner never changes.
-fn replace_file_keeping_owner(path: &Path, contents: &[u8]) -> Result<(), OrchestratorError> {
-    use std::os::unix::fs::MetadataExt;
-    let meta = fs::metadata(path)?;
-    let mode = meta.mode() & 0o7777;
-    let dir = path
-        .parent()
-        .ok_or_else(|| format!("path '{}' has no parent directory", path.display()))?;
+/// Reads a file that must be a regular file, without following a symlink in its place: the
+/// orchestrator is root and the directory belongs to a less trusted user.
+fn read_regular_file_nofollow(path: &Path) -> Result<String, OrchestratorError> {
+    use std::io::Read;
+    use std::os::unix::fs::OpenOptionsExt;
+    let mut file = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(nix::libc::O_NOFOLLOW)
+        .open(path)
+        .map_err(|err| format!("cannot open '{}' as a regular file: {err}", path.display()))?;
+    if !file.metadata()?.file_type().is_file() {
+        return Err(format!("'{}' is not a regular file", path.display()).into());
+    }
+    let mut out = String::new();
+    file.read_to_string(&mut out)?;
+    Ok(out)
+}
+
+/// The temp prefix `replace_file_keeping_owner` uses next to `path`.
+fn replace_temp_prefix(path: &Path) -> String {
     let name = path
         .file_name()
         .and_then(|n| n.to_str())
         .unwrap_or("fluxbee-write");
-    let tmp = dir.join(format!(".{name}.fluxbee-tmp-{}", std::process::id()));
-    let result = (|| -> Result<(), OrchestratorError> {
-        let mut file = fs::OpenOptions::new()
+    format!(".{name}.fluxbee-tmp-")
+}
+
+/// Removes the temps a crashed write left next to `path`. Unlinking never follows a symlink.
+fn remove_stale_replace_temps(path: &Path) {
+    let (Some(dir), prefix) = (path.parent(), replace_temp_prefix(path)) else {
+        return;
+    };
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        if entry
+            .file_name()
+            .to_str()
+            .is_some_and(|name| name.starts_with(&prefix))
+        {
+            let _ = fs::remove_file(entry.path());
+        }
+    }
+}
+
+/// Writes `contents` to a new sibling temp file and renames it over `path`, keeping `path`'s
+/// owner and mode: a reader never sees a half-written file, and the owner never changes.
+///
+/// The directory belongs to the Syncthing user and the orchestrator is root, so nothing in it is
+/// trusted to be what its name says. `path` must be a regular file and is replaced, never
+/// followed. The temp is created exclusively (`O_EXCL`, which also refuses a planted symlink)
+/// under an unpredictable name, and its owner and mode are set on the open file, not on a path.
+fn replace_file_keeping_owner(path: &Path, contents: &[u8]) -> Result<(), OrchestratorError> {
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+    let meta = fs::symlink_metadata(path)?;
+    if !meta.file_type().is_file() {
+        return Err(format!(
+            "refusing to replace '{}': not a regular file",
+            path.display()
+        )
+        .into());
+    }
+    let mode = meta.mode() & 0o7777;
+    let dir = path
+        .parent()
+        .ok_or_else(|| format!("path '{}' has no parent directory", path.display()))?;
+    let prefix = replace_temp_prefix(path);
+    let mut created = None;
+    for _ in 0..8 {
+        let tmp = dir.join(format!("{prefix}{:016x}", rand::random::<u64>()));
+        match fs::OpenOptions::new()
             .write(true)
-            .create(true)
-            .truncate(true)
-            .mode(mode)
-            .open(&tmp)?;
+            .create_new(true)
+            .mode(0o600)
+            .open(&tmp)
+        {
+            Ok(file) => {
+                created = Some((file, tmp));
+                break;
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(err) => return Err(err.into()),
+        }
+    }
+    let (mut file, tmp) = created
+        .ok_or_else(|| format!("could not create a temp file next to '{}'", path.display()))?;
+    let result = (|| -> Result<(), OrchestratorError> {
         file.write_all(contents)?;
+        std::os::unix::fs::fchown(&file, Some(meta.uid()), Some(meta.gid()))?;
+        file.set_permissions(fs::Permissions::from_mode(mode))?;
         file.sync_all()?;
-        drop(file);
-        std::os::unix::fs::chown(&tmp, Some(meta.uid()), Some(meta.gid()))?;
-        fs::set_permissions(&tmp, fs::Permissions::from_mode(mode))?;
         fs::rename(&tmp, path)?;
+        // The rename is durable only once the directory is.
+        fs::File::open(dir)?.sync_all()?;
         Ok(())
     })();
     if result.is_err() {
@@ -7871,6 +7968,46 @@ fn dist_sync_folders_for_hive(
     out
 }
 
+/// `blob/active` holds every tenant's live blobs, so it goes to workers only: they run the nodes
+/// that use it. The ingress gets `blob/public` instead (io-blob-spec-v1 P5), and the egress gets
+/// neither: it runs no node and declares `blob.enabled: false`. Sharing it with every non-ingress
+/// role authorized the egress for all of it (A-50).
+fn peer_shares_active_blob(blob: &BlobRuntimeConfig, spoke_role: HiveRole) -> bool {
+    spoke_role == HiveRole::Worker
+        && blob.enabled
+        && blob.sync_enabled
+        && blob_sync_tool_is_syncthing(blob)
+}
+
+fn peer_shares_public_blob(blob: &BlobRuntimeConfig, spoke_role: HiveRole) -> bool {
+    spoke_role == HiveRole::Ingress && blob.public_sync_enabled && blob_sync_tool_is_syncthing(blob)
+}
+
+/// Every Fluxbee folder the motherbee shares with a spoke of this role. The link below adds the
+/// spoke to exactly these, and the motherbee's reconcile takes it out of any other Fluxbee
+/// folder, so the two can never disagree.
+fn peer_folder_ids(
+    blob: &BlobRuntimeConfig,
+    dist: &DistRuntimeConfig,
+    spoke_role: HiveRole,
+) -> BTreeSet<String> {
+    let mut ids = BTreeSet::new();
+    if peer_shares_active_blob(blob, spoke_role) {
+        ids.insert(SYNCTHING_FOLDER_BLOB_ID.to_string());
+    }
+    if peer_shares_public_blob(blob, spoke_role) {
+        ids.insert(SYNCTHING_FOLDER_BLOB_PUBLIC_ID.to_string());
+    }
+    if dist.sync_enabled && dist_sync_tool_is_syncthing(dist) {
+        ids.extend(
+            dist_sync_folders_for_role(dist, spoke_role, true)
+                .into_iter()
+                .map(|folder| folder.id),
+        );
+    }
+    ids
+}
+
 fn reconcile_syncthing_peer_xml(
     config_xml: &str,
     blob: &BlobRuntimeConfig,
@@ -7881,11 +8018,8 @@ fn reconcile_syncthing_peer_xml(
     is_motherbee: bool,
     spoke_role: HiveRole,
 ) -> Result<(String, bool), OrchestratorError> {
-    // The non-motherbee end of the link. On motherbee this is the peer's role; on a spoke it is
-    // the spoke's own. Previously a `public_only: bool`, which conflated "this is an ingress"
-    // with "share no dist at all" — that conflation is what left ingress and egress with no
-    // core channel while only the blob invariant actually required it.
-    let public_only = spoke_role == HiveRole::Ingress;
+    // `spoke_role` is the non-motherbee end of the link: on motherbee the peer's role, on a
+    // spoke its own.
     let mut updated = config_xml.to_string();
     let mut changed = false;
 
@@ -7898,7 +8032,7 @@ fn reconcile_syncthing_peer_xml(
     updated = next;
     changed |= top_changed;
 
-    if !public_only && blob.enabled && blob.sync_enabled && blob_sync_tool_is_syncthing(blob) {
+    if peer_shares_active_blob(blob, spoke_role) {
         let blob_sync_path = blob_sync_folder_path(blob);
         let (next, folder_changed) = ensure_syncthing_folder_in_config_xml(
             &updated,
@@ -7915,7 +8049,7 @@ fn reconcile_syncthing_peer_xml(
         changed |= device_changed;
     }
 
-    if public_only && blob.public_sync_enabled && blob_sync_tool_is_syncthing(blob) {
+    if peer_shares_public_blob(blob, spoke_role) {
         let public_path = blob_public_sync_folder_path(blob);
         let (next, folder_changed) = ensure_isolated_syncthing_folder_in_config_xml(
             &updated,
@@ -7935,9 +8069,8 @@ fn reconcile_syncthing_peer_xml(
         changed |= device_changed;
     }
 
-    // dist: no longer gated on `public_only`. The DMZ invariant (io-blob-spec-v1 P5) is about
-    // `blob/active`, handled above; software distribution is a separate concern and is scoped
-    // by content instead — see `dist_sync_folders_for_role`.
+    // dist is scoped by content per role (`dist_sync_folders_for_role`), apart from the blob
+    // folders above.
     if dist.sync_enabled && dist_sync_tool_is_syncthing(dist) {
         for folder in dist_sync_folders_for_role(dist, spoke_role, is_motherbee) {
             // Isolated: each dist folder owns a disjoint subtree (core/, vendor/, runtimes/ are
@@ -8080,11 +8213,13 @@ async fn ensure_syncthing_peer_link_runtime(
 }
 
 // ===========================================================================
-// Host posture, stage 2: Syncthing peer addresses (FINDINGS A-47,
+// Host posture, stage 2: Syncthing peers (FINDINGS A-47, A-50,
 // docs/host-posture-and-exposure-spec-v1.md §3.5). A spoke reaches the motherbee at a static
-// address and the motherbee only accepts, so no link depends on discovery. This reconciles the
-// joined hives too, not only new joins; on PROD worker1 and the motherbee had `dynamic` on both
-// sides. Syncthing restarts only when the config changed.
+// address and the motherbee only accepts, so no link depends on discovery. The motherbee keeps
+// each spoke in exactly its role's folders and removes devices no hive claims. This reconciles
+// the joined hives too, not only new joins; on PROD worker1 and the motherbee had `dynamic` on
+// both sides, and the egress was in `blob/active`. Syncthing restarts only when the config
+// changed.
 // ===========================================================================
 
 /// Watchdog tick counter for the address reconcile. At the 5s cadence, 12 ticks ≈ 60s; the first
@@ -8151,63 +8286,224 @@ fn spoke_motherbee_device_updates(
         .collect()
 }
 
+/// One hive of the motherbee's registry, as the reconcile reads it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RegisteredHive {
+    /// The recorded Syncthing device id; `None` when absent or not a valid id.
+    device_id: Option<String>,
+    /// A spoke role; `None` when absent or not a spoke's.
+    role: Option<HiveRole>,
+    /// `status: connected`. A hive joining, pending or failed is left alone.
+    connected: bool,
+}
+
+/// The hive registry as the reconcile sees it. `complete` is false when the registry or one of
+/// its entries could not be read; then no device is removed.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct RegistrySnapshot {
+    hives: BTreeMap<String, RegisteredHive>,
+    complete: bool,
+}
+
+fn read_registry_snapshot(root: &Path) -> RegistrySnapshot {
+    let mut snapshot = RegistrySnapshot {
+        hives: BTreeMap::new(),
+        complete: true,
+    };
+    let Ok(entries) = fs::read_dir(root) else {
+        snapshot.complete = false;
+        return snapshot;
+    };
+    for entry in entries {
+        let Ok(entry) = entry else {
+            snapshot.complete = false;
+            continue;
+        };
+        let Ok(hive_id) = entry.file_name().into_string() else {
+            snapshot.complete = false;
+            continue;
+        };
+        // A directory without info.yaml is a join being accepted, which holds that hive's
+        // topology lock: the busy check covers it.
+        if !entry.path().join("info.yaml").exists() {
+            continue;
+        }
+        let Ok(info) = read_hive_info(root, &hive_id) else {
+            snapshot.complete = false;
+            continue;
+        };
+        let device_id = info
+            .get("syncthing_device_id")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|id| valid_syncthing_device_id(id))
+            .map(str::to_string);
+        let role = HiveRole::from_role(info.get("role").and_then(|v| v.as_str()))
+            .filter(|role| *role != HiveRole::Motherbee);
+        let connected = info.get("status").and_then(|v| v.as_str()) == Some("connected");
+        snapshot.hives.insert(
+            hive_id,
+            RegisteredHive {
+                device_id,
+                role,
+                connected,
+            },
+        );
+    }
+    snapshot
+}
+
+/// The members of every Fluxbee folder in config.xml, as folder id → device ids.
+fn fluxbee_folder_memberships(
+    config_xml: &str,
+) -> Result<BTreeMap<String, Vec<String>>, OrchestratorError> {
+    let folder_re = Regex::new(r#"<folder\b[^>]*\bid="(fluxbee-[^"]*)""#)?;
+    let mut out = BTreeMap::new();
+    for caps in folder_re.captures_iter(config_xml) {
+        let id = caps[1].to_string();
+        if !out.contains_key(&id) {
+            let members = syncthing_folder_device_ids(config_xml, &id)?;
+            out.insert(id, members);
+        }
+    }
+    Ok(out)
+}
+
 /// What the motherbee changes in its Syncthing peers.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 struct MotherbeePeerPlan {
-    /// Registered devices still declared with a fixed address, as (id, name).
+    /// Hives' devices still declared with a fixed address, as (id, name).
     accept_only: Vec<(String, String)>,
-    /// Devices no registry entry claims, or a second device under a registered name.
-    orphans: Vec<(String, String)>,
-    /// (hive_id, device id) to record in a registry entry that has none (the existing egress).
+    /// (hive_id, device id) to record in a connected entry that records none.
     backfill: Vec<(String, String)>,
+    /// (folder id, device id): a hive's device in a Fluxbee folder its role does not get (A-50).
+    drop_memberships: Vec<(String, String)>,
+    /// Devices no hive claims, as (id, name). Removed, so they stop being authorized.
+    orphans: Vec<(String, String)>,
+    /// What is left as it is and needs an operator.
+    notes: Vec<String>,
 }
 
-/// The motherbee's plan for its declared devices against the hive registry (hive_id → recorded
-/// device id). A device is a hive's when its name is that hive_id, as the joins name them; when
-/// the entry records a device id, only that device is.
+/// The motherbee's plan for its declared devices against the hive registry.
+///
+/// A device is a hive's when that hive's entry records its id. A device whose id no entry
+/// records is the hive's it is named after only while that entry records none and no other
+/// unrecorded device has the name (the egress joins never recorded theirs); its id is then
+/// backfilled. Any other device is an orphan: a leftover of a removed hive, or a second device
+/// under a hive's name.
+///
+/// Nothing is planned while a topology operation runs, and only `connected` hives are
+/// reconciled. Orphans are removed only when the registry was read completely, is not empty and
+/// every hive in it is connected and records its device: a join that stopped half-way keeps its
+/// device, and so does a hive's device that is named differently before its id is recorded.
 fn motherbee_peer_plan(
     devices: &[SyncthingDeclaredDevice],
+    memberships: &BTreeMap<String, Vec<String>>,
     local_device_id: &str,
-    registry: &BTreeMap<String, Option<String>>,
+    registry: &RegistrySnapshot,
+    busy: bool,
+    folders_for_role: &dyn Fn(HiveRole) -> BTreeSet<String>,
 ) -> MotherbeePeerPlan {
     let mut plan = MotherbeePeerPlan::default();
-    for device in devices {
-        if device.id == local_device_id {
+    if busy {
+        plan.notes
+            .push("a hive topology operation is running; nothing reconciled".to_string());
+        return plan;
+    }
+    let recorded: BTreeMap<&str, &str> = registry
+        .hives
+        .iter()
+        .filter_map(|(hive_id, hive)| hive.device_id.as_deref().map(|id| (id, hive_id.as_str())))
+        .collect();
+    let remote: Vec<&SyncthingDeclaredDevice> =
+        devices.iter().filter(|d| d.id != local_device_id).collect();
+    let may_remove = registry.complete
+        && !registry.hives.is_empty()
+        && registry
+            .hives
+            .values()
+            .all(|hive| hive.connected && hive.device_id.is_some());
+    for device in &remote {
+        let owner = match recorded.get(device.id.as_str()) {
+            Some(hive_id) => Some((*hive_id, false)),
+            None => match registry.hives.get(&device.name) {
+                None => None,
+                Some(hive) => match hive.device_id.as_deref() {
+                    None => {
+                        let unrecorded = remote
+                            .iter()
+                            .filter(|d| {
+                                d.name == device.name && !recorded.contains_key(d.id.as_str())
+                            })
+                            .count();
+                        if unrecorded != 1 {
+                            plan.notes.push(format!(
+                                "{unrecorded} devices are named {} and its entry records none; kept",
+                                device.name
+                            ));
+                            continue;
+                        }
+                        Some((device.name.as_str(), true))
+                    }
+                    Some(recorded_id) if !remote.iter().any(|d| d.id == recorded_id) => {
+                        plan.notes.push(format!(
+                            "{} records device {recorded_id}, which is not declared; device {} kept",
+                            device.name, device.id
+                        ));
+                        continue;
+                    }
+                    // A second device under the name of a hive that records another.
+                    Some(_) => None,
+                },
+            },
+        };
+        let Some((hive_id, backfill)) = owner else {
+            if may_remove {
+                plan.orphans.push((device.id.clone(), device.name.clone()));
+            } else {
+                plan.notes.push(format!(
+                    "device {} ({}) is claimed by no hive; kept while the registry is unreadable or empty, or has a hive not connected or without a recorded device",
+                    device.name, device.id
+                ));
+            }
+            continue;
+        };
+        let Some(hive) = registry.hives.get(hive_id) else {
+            continue;
+        };
+        if !hive.connected {
             continue;
         }
-        match registry.get(&device.name) {
-            None => plan.orphans.push((device.id.clone(), device.name.clone())),
-            Some(Some(recorded)) if recorded != &device.id => {
-                plan.orphans.push((device.id.clone(), device.name.clone()))
-            }
-            Some(recorded) => {
-                if recorded.is_none() {
-                    let same_name = devices
-                        .iter()
-                        .filter(|d| d.id != local_device_id && d.name == device.name)
-                        .count();
-                    if same_name == 1 {
-                        plan.backfill.push((device.name.clone(), device.id.clone()));
-                    }
-                }
-                if device.address != SyncthingPeerAddress::AcceptOnly.config_value() {
-                    plan.accept_only
-                        .push((device.id.clone(), device.name.clone()));
-                }
+        if backfill {
+            plan.backfill.push((hive_id.to_string(), device.id.clone()));
+        }
+        if device.address != SyncthingPeerAddress::AcceptOnly.config_value() {
+            plan.accept_only
+                .push((device.id.clone(), device.name.clone()));
+        }
+        let Some(role) = hive.role else {
+            plan.notes.push(format!(
+                "hive {hive_id} has no spoke role in its entry; its folders are left as they are"
+            ));
+            continue;
+        };
+        let wanted = folders_for_role(role);
+        for (folder_id, members) in memberships {
+            if members.iter().any(|m| *m == device.id) && !wanted.contains(folder_id) {
+                plan.drop_memberships
+                    .push((folder_id.clone(), device.id.clone()));
             }
         }
     }
     plan
 }
 
-/// Applies the accept-only part of a plan and removes the given orphans (their folder memberships
-/// and their declaration).
+/// Applies a plan: accept-only addresses, the folder memberships to drop, and the orphans
+/// (out of every Fluxbee folder, then their declaration).
 fn apply_motherbee_peer_plan_xml(
     config_xml: &str,
     plan: &MotherbeePeerPlan,
-    removable_orphans: &[String],
-    blob: &BlobRuntimeConfig,
-    dist: &DistRuntimeConfig,
+    memberships: &BTreeMap<String, Vec<String>>,
 ) -> Result<(String, bool), OrchestratorError> {
     let mut updated = config_xml.to_string();
     let mut changed = false;
@@ -8221,60 +8517,49 @@ fn apply_motherbee_peer_plan_xml(
         updated = next;
         changed |= c;
     }
-    for id in removable_orphans {
-        let (next, c) = reconcile_syncthing_peer_removal_xml(&updated, blob, dist, id)?;
+    for (folder_id, id) in &plan.drop_memberships {
+        let (next, c) = remove_syncthing_folder_device(&updated, folder_id, id)?;
+        updated = next;
+        changed |= c;
+    }
+    for (id, _) in &plan.orphans {
+        for (folder_id, members) in memberships {
+            if members.iter().any(|m| m == id) {
+                let (next, c) = remove_syncthing_folder_device(&updated, folder_id, id)?;
+                updated = next;
+                changed |= c;
+            }
+        }
+        let (next, c) = remove_syncthing_top_level_device_from_config_xml(&updated, id)?;
         updated = next;
         changed |= c;
     }
     Ok((updated, changed))
 }
 
-/// The hive registry as hive_id → recorded Syncthing device id. An unreadable registry is an
-/// error, so the caller removes no orphan on a registry it could not read.
-fn registered_syncthing_devices(
-    root: &Path,
-) -> Result<BTreeMap<String, Option<String>>, OrchestratorError> {
-    let mut out = BTreeMap::new();
-    for entry in fs::read_dir(root)?.flatten() {
-        let Ok(hive_id) = entry.file_name().into_string() else {
-            continue;
-        };
-        if !entry.path().join("info.yaml").exists() {
-            continue;
-        }
-        let device = read_hive_info(root, &hive_id).ok().and_then(|info| {
-            info.get("syncthing_device_id")
-                .and_then(|v| v.as_str())
-                .map(str::to_string)
-        });
-        out.insert(hive_id, device);
-    }
-    Ok(out)
-}
-
-/// Records the Syncthing device id in a registry entry that has none. Skipped while a join or a
-/// removal holds that hive; the next round retries.
+/// Records the Syncthing device id in a connected registry entry that records none. Skipped
+/// while a join or a removal holds that hive; the next round retries.
 fn record_syncthing_device_id(
     state: &OrchestratorState,
     root: &Path,
     hive_id: &str,
     device_id: &str,
 ) {
+    if !valid_syncthing_device_id(device_id) {
+        return;
+    }
     let Some(_guard) = state.try_lock_hive_topology(hive_id) else {
         return;
     };
-    let mut info = match read_hive_info(root, hive_id) {
-        Ok(info) => info,
-        Err(err) => {
-            tracing::warn!(hive_id = hive_id, error = %err, "syncthing: cannot read registry entry for backfill");
-            return;
-        }
+    let Ok(mut info) = read_hive_info(root, hive_id) else {
+        return;
     };
-    if info
+    let connected = info.get("status").and_then(|v| v.as_str()) == Some("connected");
+    let recorded = info
         .get("syncthing_device_id")
         .and_then(|v| v.as_str())
-        .is_some()
-    {
+        .is_some_and(|id| !id.trim().is_empty());
+    if !connected || recorded {
         return;
     }
     let Some(obj) = info.as_object_mut() else {
@@ -8296,107 +8581,105 @@ fn record_syncthing_device_id(
     }
 }
 
-/// On a spoke: the motherbee's static Syncthing address, the host of its WAN uplink at port 22000.
-/// `None` when the hive has no uplink (the motherbee itself, or a hive not joined yet).
-fn spoke_motherbee_syncthing_address(
-    state: &OrchestratorState,
-) -> Result<Option<SyncthingPeerAddress>, OrchestratorError> {
-    let hive = load_hive(&state.config_dir)?;
-    let Some(uplink) = hive
-        .wan
-        .as_ref()
-        .and_then(|wan| wan.uplinks.as_ref())
-        .and_then(|uplinks| uplinks.first())
-    else {
-        return Ok(None);
-    };
-    let (host, _) = parse_host_port(uplink.address.trim())?;
-    let address = syncthing_tcp_address_for_host(&host)?;
-    Ok(SyncthingPeerAddress::parse_static(&address))
+/// On a spoke: the motherbee's static Syncthing address, the host of the first WAN uplink at
+/// port 22000. The error says why there is none.
+fn spoke_motherbee_static_address(uplinks: &[WanUplink]) -> Result<SyncthingPeerAddress, String> {
+    let uplink = uplinks
+        .first()
+        .ok_or("hive.yaml has no wan.uplinks, so the motherbee's address is unknown")?;
+    let (host, _) = parse_host_port(uplink.address.trim()).map_err(|err| err.to_string())?;
+    syncthing_tcp_address_for_host(&host)
+        .ok()
+        .and_then(|address| SyncthingPeerAddress::parse_static(&address))
+        .ok_or_else(|| {
+            format!("wan uplink host '{host}' is not an IP literal; the motherbee device keeps its address")
+        })
 }
 
-/// Stage 2 reconcile, from the watchdog. On a spoke the motherbee device gets its static address;
-/// on the motherbee every registered spoke is accept-only, the existing egress gets its device id
-/// recorded, and devices no registry entry claims are removed when they are not connected.
+/// The local device id from the running Syncthing (`/rest/system/status`), bounded in time.
+/// Never guessed from config.xml: its first device can be a peer.
+fn syncthing_rest_my_id(sync: &BlobRuntimeConfig) -> Result<String, OrchestratorError> {
+    let api_key = syncthing_api_key(sync)?;
+    let endpoint = format!("http://127.0.0.1:{}/rest/system/status", sync.sync_api_port);
+    let mut cmd = Command::new("curl");
+    cmd.arg("-fsS")
+        .arg("--max-time")
+        .arg("5")
+        .arg("-H")
+        .arg(format!("X-API-Key: {api_key}"))
+        .arg(&endpoint);
+    let out = run_cmd_output(cmd, "syncthing system status")?;
+    let payload: serde_json::Value = serde_json::from_str(&out)
+        .map_err(|err| format!("invalid syncthing status payload: {err}"))?;
+    payload
+        .get("myID")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|id| valid_syncthing_device_id(id))
+        .map(str::to_string)
+        .ok_or_else(|| "syncthing status has no valid myID".into())
+}
+
+/// The last condition the reconcile reported: a state that lasts is logged once, not every
+/// minute.
+static SYNCTHING_RECONCILE_REPORT: std::sync::Mutex<String> = std::sync::Mutex::new(String::new());
+
+fn report_syncthing_reconcile(notes: &[String]) {
+    let report = notes.join("; ");
+    let mut last = SYNCTHING_RECONCILE_REPORT
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if *last == report {
+        return;
+    }
+    if report.is_empty() {
+        tracing::info!("syncthing peer reconcile: nothing to report");
+    } else {
+        tracing::warn!(report = %report, "syncthing peer reconcile");
+    }
+    *last = report;
+}
+
+/// Set while config.xml holds a reconcile change that Syncthing has not been restarted with:
+/// the next round restarts even though it finds nothing to change.
+static SYNCTHING_RESTART_PENDING: AtomicBool = AtomicBool::new(false);
+
+/// Stage 2 reconcile, from the watchdog. On a spoke the motherbee device gets its static
+/// address. On the motherbee every registered spoke is accept-only, the existing egress gets its
+/// device id recorded, each spoke shares exactly its role's folders (A-50), and devices no hive
+/// claims are removed. Returns the conditions to report; Syncthing restarts only on a change.
 async fn reconcile_syncthing_peer_addresses(
     state: &OrchestratorState,
-) -> Result<(), OrchestratorError> {
+) -> Result<Vec<String>, OrchestratorError> {
     let blob = current_blob_runtime_config(state);
     let dist = current_dist_runtime_config(state);
     let sync = effective_syncthing_runtime_config(&blob, &dist);
     if !sync.sync_enabled
         || !(blob_sync_tool_is_syncthing(&sync) || dist_sync_tool_is_syncthing(&dist))
     {
-        return Ok(());
+        return Ok(Vec::new());
     }
     let config_path = sync.sync_data_dir.join("config.xml");
     if !config_path.exists() {
-        return Ok(());
+        return Ok(Vec::new());
     }
-    let local_device_id = local_syncthing_device_id(&sync)?;
-
-    let changed = if state.is_motherbee {
-        let root = hives_root();
-        let registry = match registered_syncthing_devices(&root) {
-            Ok(registry) => Some(registry),
-            Err(err) => {
-                tracing::warn!(error = %err, "syncthing: hive registry unreadable; no orphan is removed this round");
-                None
+    // Blocking work (one REST call, the registry, the config write), off the async workers. The
+    // REST call happens before the config lock: nothing that can stall runs under it.
+    let (changed, notes) =
+        tokio::task::block_in_place(|| -> Result<(bool, Vec<String>), OrchestratorError> {
+            let local_device_id = syncthing_rest_my_id(&sync)?;
+            if state.is_motherbee {
+                reconcile_motherbee_peers(state, &config_path, &local_device_id, &blob, &dist)
+            } else {
+                reconcile_spoke_motherbee_address(state, &config_path, &local_device_id)
             }
-        };
-        let registry_for_plan = registry.clone().unwrap_or_default();
-        let registry_usable = registry.as_ref().is_some_and(|r| !r.is_empty());
-        let mut backfill = Vec::new();
-        let changed = update_syncthing_config(&config_path, |current| {
-            let devices = syncthing_declared_devices(current)?;
-            let plan = motherbee_peer_plan(&devices, &local_device_id, &registry_for_plan);
-            let mut removable = Vec::new();
-            for (id, name) in &plan.orphans {
-                // Never remove on an unusable registry or a live connection: a device whose entry
-                // could not be read, or that is in use, is reported and kept.
-                let connected = syncthing_device_connected(&sync, id).unwrap_or(true);
-                if registry_usable && !connected {
-                    tracing::info!(device = %id, name = %name, "syncthing: removing a device no registered hive claims");
-                    removable.push(id.clone());
-                } else {
-                    tracing::warn!(device = %id, name = %name, connected = connected, registry_usable = registry_usable, "syncthing: device no registered hive claims, kept");
-                }
-            }
-            if !plan.accept_only.is_empty() {
-                tracing::info!(devices = ?plan.accept_only, "syncthing: spokes set to accept-only (the motherbee no longer dials them)");
-            }
-            backfill = plan.backfill.clone();
-            apply_motherbee_peer_plan_xml(current, &plan, &removable, &blob, &dist)
         })?;
-        for (hive_id, device_id) in backfill {
-            record_syncthing_device_id(state, &root, &hive_id, &device_id);
-        }
-        changed
-    } else {
-        let Some(address) = spoke_motherbee_syncthing_address(state)? else {
-            return Ok(());
-        };
-        update_syncthing_config(&config_path, |current| {
-            let devices = syncthing_declared_devices(current)?;
-            let mut updated = current.to_string();
-            let mut changed = false;
-            for (id, name) in
-                spoke_motherbee_device_updates(&devices, &local_device_id, PRIMARY_HIVE_ID, address)
-            {
-                tracing::info!(device = %id, address = %address.config_value(), "syncthing: the motherbee set to its static address");
-                let (next, c) =
-                    ensure_syncthing_top_level_device_in_config_xml(&updated, &id, &name, address)?;
-                updated = next;
-                changed |= c;
-            }
-            Ok((updated, changed))
-        })?
-    };
 
-    if changed {
+    if changed || SYNCTHING_RESTART_PENDING.load(Ordering::Relaxed) {
+        SYNCTHING_RESTART_PENDING.store(true, Ordering::Relaxed);
         tracing::info!(
             service = SYNCTHING_SERVICE_NAME,
-            "syncthing peer addresses reconciled; restarting service"
+            "syncthing peer config reconciled; restarting service"
         );
         let mut restart = Command::new("systemctl");
         restart.arg("restart").arg(SYNCTHING_SERVICE_NAME);
@@ -8407,8 +8690,99 @@ async fn reconcile_syncthing_peer_addresses(
         )
         .await?;
         wait_for_syncthing_health(&sync).await?;
+        SYNCTHING_RESTART_PENDING.store(false, Ordering::Relaxed);
     }
-    Ok(())
+    Ok(notes)
+}
+
+fn reconcile_motherbee_peers(
+    state: &OrchestratorState,
+    config_path: &Path,
+    local_device_id: &str,
+    blob: &BlobRuntimeConfig,
+    dist: &DistRuntimeConfig,
+) -> Result<(bool, Vec<String>), OrchestratorError> {
+    let root = hives_root();
+    let mut plan = MotherbeePeerPlan::default();
+    let changed = update_syncthing_config(config_path, |current| {
+        // Read under the lock. A join creates its registry entry before it links its device,
+        // and links under this lock, so every device seen here has its entry visible.
+        let registry = read_registry_snapshot(&root);
+        let busy = state.any_hive_topology_busy();
+        let devices = syncthing_declared_devices(current)?;
+        let memberships = fluxbee_folder_memberships(current)?;
+        plan = motherbee_peer_plan(
+            &devices,
+            &memberships,
+            local_device_id,
+            &registry,
+            busy,
+            &|role| peer_folder_ids(blob, dist, role),
+        );
+        apply_motherbee_peer_plan_xml(current, &plan, &memberships)
+    })?;
+    if changed {
+        for (id, name) in &plan.accept_only {
+            tracing::info!(device = %id, name = %name, "syncthing: spoke set to accept-only (the motherbee no longer dials it)");
+        }
+        for (folder, id) in &plan.drop_memberships {
+            tracing::info!(device = %id, folder = %folder, "syncthing: spoke taken out of a folder its role does not get");
+        }
+        for (id, name) in &plan.orphans {
+            tracing::info!(device = %id, name = %name, "syncthing: removed a device no registered hive claims");
+        }
+    }
+    for (hive_id, device_id) in &plan.backfill {
+        record_syncthing_device_id(state, &root, hive_id, device_id);
+    }
+    Ok((changed, plan.notes))
+}
+
+fn reconcile_spoke_motherbee_address(
+    state: &OrchestratorState,
+    config_path: &Path,
+    local_device_id: &str,
+) -> Result<(bool, Vec<String>), OrchestratorError> {
+    let uplinks = load_hive(&state.config_dir)?
+        .wan
+        .and_then(|wan| wan.uplinks)
+        .unwrap_or_default();
+    let address = match spoke_motherbee_static_address(&uplinks) {
+        Ok(address) => address,
+        Err(reason) => return Ok((false, vec![reason])),
+    };
+    let mut updates = Vec::new();
+    let mut found = false;
+    let changed = update_syncthing_config(config_path, |current| {
+        let devices = syncthing_declared_devices(current)?;
+        found = devices
+            .iter()
+            .any(|d| d.id != local_device_id && d.name == PRIMARY_HIVE_ID);
+        updates =
+            spoke_motherbee_device_updates(&devices, local_device_id, PRIMARY_HIVE_ID, address);
+        let mut updated = current.to_string();
+        let mut changed = false;
+        for (id, name) in &updates {
+            let (next, c) =
+                ensure_syncthing_top_level_device_in_config_xml(&updated, id, name, address)?;
+            updated = next;
+            changed |= c;
+        }
+        Ok((updated, changed))
+    })?;
+    if changed {
+        for (id, _) in &updates {
+            tracing::info!(device = %id, address = %address.config_value(), "syncthing: the motherbee set to its static address");
+        }
+    }
+    let notes = if found {
+        Vec::new()
+    } else {
+        vec![format!(
+            "no device named {PRIMARY_HIVE_ID}; the motherbee's address was not set"
+        )]
+    };
+    Ok((changed, notes))
 }
 
 fn remove_syncthing_folder_device(
@@ -18876,34 +19250,19 @@ async fn add_hive_finalize_local_flow(
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(str::to_string);
-    // Host posture stage 2: a spoke always reaches the motherbee at a static address, so the
-    // link never depends on discovery (A-47). A finalize that links a peer without one is
-    // refused instead of being written as `dynamic`.
-    let syncthing_peer_static = match (
+    let syncthing_peer_static = match finalize_peer_static_address(
         syncthing_peer_device_id.as_deref(),
         syncthing_peer_address.as_deref(),
     ) {
-        (_, Some(address)) => match SyncthingPeerAddress::parse_static(address) {
-            Some(parsed) => Some(parsed),
-            None => {
-                return serde_json::json!({
-                    "status": "error",
-                    "error_code": "INVALID_REQUEST",
-                    "message": format!("invalid syncthing_peer_address '{address}'"),
-                    "hive_id": state.hive_id,
-                });
-            }
-        },
-        (Some(_), None) => {
+        Ok(address) => address,
+        Err(message) => {
             return serde_json::json!({
                 "status": "error",
                 "error_code": "INVALID_REQUEST",
-                "message": "syncthing_peer_address is required with syncthing_peer_device_id: \
-                            the spoke reaches the motherbee at a static address",
+                "message": message,
                 "hive_id": state.hive_id,
             });
         }
-        (None, None) => None,
     };
     let mut updated: Vec<String> = Vec::new();
     let mut unchanged: Vec<String> = Vec::new();
@@ -19331,6 +19690,27 @@ fn dist_sync_ready_from_finalize_payload(
                 .and_then(|value| value.as_bool())
         })
         .unwrap_or(false)
+}
+
+/// The static address a spoke's finalize links the motherbee at (host posture stage 2, A-47): a
+/// spoke always reaches the motherbee at one, so the link never depends on discovery. `Ok(None)`
+/// when the finalize links no peer. A peer without an address, or with one that is not a
+/// `tcp://<ip>:<port>` literal, is refused instead of being written as `dynamic`.
+fn finalize_peer_static_address(
+    peer_device_id: Option<&str>,
+    peer_address: Option<&str>,
+) -> Result<Option<SyncthingPeerAddress>, String> {
+    match (peer_device_id, peer_address) {
+        (_, Some(address)) => SyncthingPeerAddress::parse_static(address)
+            .map(Some)
+            .ok_or_else(|| format!("invalid syncthing_peer_address '{address}'")),
+        (Some(_), None) => Err(
+            "syncthing_peer_address is required with syncthing_peer_device_id: \
+                                the spoke reaches the motherbee at a static address"
+                .to_string(),
+        ),
+        (None, None) => Ok(None),
+    }
 }
 
 fn syncthing_device_id_from_finalize_payload(finalize: &serde_json::Value) -> Option<String> {
@@ -21445,10 +21825,13 @@ async fn add_egress_hive_flow(
     let desired_blob = current_blob_runtime_config(state);
     let desired_dist = current_dist_runtime_config(state);
     let desired_sync = effective_syncthing_runtime_config(&desired_blob, &desired_dist);
-    let mut syncthing_peer_linked = false;
+    // The linked device is recorded in the registry like the worker's and the ingress's: the
+    // motherbee's reconcile identifies a hive's device by it (host posture stage 2).
+    let mut egress_syncthing_device_id: Option<String> = None;
     if desired_dist.sync_enabled && dist_sync_tool_is_syncthing(&desired_dist) {
         match (
-            parse_host_port(&worker_uplink).and_then(|(host, _)| syncthing_tcp_address_for_host(&host)),
+            parse_host_port(&worker_uplink)
+                .and_then(|(host, _)| syncthing_tcp_address_for_host(&host)),
             local_syncthing_device_id(&desired_sync),
         ) {
             (Ok(mother_syncthing_address), Ok(mother_device_id)) => {
@@ -21488,7 +21871,7 @@ async fn add_egress_hive_flow(
                                         "egress joined but its Syncthing peer link FAILED — it will not receive core or vendor updates"
                                     );
                                 } else {
-                                    syncthing_peer_linked = true;
+                                    egress_syncthing_device_id = Some(device_id);
                                 }
                             }
                             None => tracing::error!(
@@ -21512,7 +21895,6 @@ async fn add_egress_hive_flow(
             ),
         }
     }
-    let _ = syncthing_peer_linked;
 
     // Connectivity gates: WAN to motherbee + orchestrator visible in LSA.
     let mut wan_connected = true;
@@ -21533,7 +21915,7 @@ async fn add_egress_hive_flow(
     // the F9 resume guard would then refuse to re-run it. Leaving `pending` lets
     // a retry resume via the idempotent egress bootstrap. The success path below
     // promotes it to `connected` (D3).
-    let info_payload = serde_json::json!({
+    let mut info_payload = serde_json::json!({
         "hive_id": hive_id,
         "address": address,
         "role": "egress",
@@ -21541,6 +21923,9 @@ async fn add_egress_hive_flow(
         "status": "pending",
         "ssh_user": creds.user,
     });
+    if let Some(device_id) = &egress_syncthing_device_id {
+        info_payload["syncthing_device_id"] = serde_json::json!(device_id);
+    }
     if let Err(err) = write_hive_info(&root, hive_id, &info_payload) {
         return err_payload("IO_ERROR", err.to_string());
     }
@@ -21654,7 +22039,7 @@ async fn add_egress_hive_flow(
     // Hardening succeeded — the node is closed. Promote the hive to `connected`
     // (D3), mirroring the worker's post-hardening write. Preserve `role: egress`
     // so list_hives / the F9 resume guard keep the role.
-    let connected_info = serde_json::json!({
+    let mut connected_info = serde_json::json!({
         "hive_id": hive_id,
         "address": address,
         "role": "egress",
@@ -21662,6 +22047,9 @@ async fn add_egress_hive_flow(
         "status": "connected",
         "ssh_user": creds.user,
     });
+    if let Some(device_id) = &egress_syncthing_device_id {
+        connected_info["syncthing_device_id"] = serde_json::json!(device_id);
+    }
     if let Err(err) = write_hive_info(&root, hive_id, &connected_info) {
         return err_payload("IO_ERROR", err.to_string());
     }
@@ -22313,7 +22701,7 @@ async fn add_ingress_hive_flow(
     if let Err(err) = wait_for_syncthing_device_connected(
         &desired_sync,
         &ingress_syncthing_device_id,
-        Duration::from_secs(SYNCTHING_BOOTSTRAP_TIMEOUT_SECS),
+        Duration::from_secs(SYNCTHING_PEER_CONNECT_TIMEOUT_SECS),
     )
     .await
     {
@@ -26339,9 +26727,10 @@ mod tests {
         assert_eq!(idempotent, updated);
     }
 
-    // Host posture stage 2 fixtures: the PROD shapes of 2026-10-06 with made-up device ids (the
-    // repo is public). On the motherbee: worker1 and egress1 `dynamic`, ingress1 static, plus a
-    // device left by an old removal and a stale second device under "worker1".
+    // Host posture stage 2 fixtures: the motherbee's config.xml as captured read-only on PROD on
+    // 2026-10-06 (0.1.57), with made-up device ids (the repo is public): worker1 and egress1
+    // `dynamic`, ingress1 static, and egress1 in `fluxbee-blob` (A-50). Added: a device left by an
+    // old removal and a stale second device under "worker1".
     const ST_MB_LOCAL: &str = "MBLOCAL-AAAAAAA-BBBBBBB";
     const ST_WORKER1: &str = "WORKER1-AAAAAAA-BBBBBBB";
     const ST_WORKER1_STALE: &str = "WORKER1-STALEXX-BBBBBBB";
@@ -26349,26 +26738,146 @@ mod tests {
     const ST_EGRESS1: &str = "EGRESS1-AAAAAAA-BBBBBBB";
     const ST_OLDHIVE: &str = "OLDHIVE-AAAAAAA-BBBBBBB";
 
+    fn stage2_folder(id: &str, path: &str, kind: &str, members: &[&str]) -> String {
+        let mut out =
+            format!("    <folder id=\"{id}\" label=\"{id}\" path=\"{path}\" type=\"{kind}\">\n");
+        for member in members {
+            out.push_str(&format!(
+                "        <device id=\"{member}\" introducedBy=\"\"></device>\n"
+            ));
+        }
+        out.push_str("    </folder>\n");
+        out
+    }
+
+    fn stage2_device(id: &str, name: &str, address: &str) -> String {
+        format!("    <device id=\"{id}\" name=\"{name}\" compression=\"metadata\" introducer=\"false\">\n        <address>{address}</address>\n    </device>\n")
+    }
+
     fn stage2_motherbee_config() -> String {
-        format!(
-            "<configuration version=\"51\">\n    <folder id=\"{vendor}\" label=\"Vendor\" path=\"/var/lib/fluxbee/dist/vendor\" type=\"sendonly\">\n        <device id=\"{mb}\" introducedBy=\"\"></device>\n        <device id=\"{w}\" introducedBy=\"\"></device>\n        <device id=\"{ws}\" introducedBy=\"\"></device>\n        <device id=\"{i}\" introducedBy=\"\"></device>\n        <device id=\"{e}\" introducedBy=\"\"></device>\n        <device id=\"{o}\" introducedBy=\"\"></device>\n    </folder>\n    <device id=\"{mb}\" name=\"fb-mb\" compression=\"metadata\" introducer=\"false\">\n        <address>dynamic</address>\n    </device>\n    <device id=\"{w}\" name=\"worker1\" compression=\"metadata\" introducer=\"false\">\n        <address>dynamic</address>\n    </device>\n    <device id=\"{ws}\" name=\"worker1\" compression=\"metadata\" introducer=\"false\">\n        <address>dynamic</address>\n    </device>\n    <device id=\"{i}\" name=\"ingress1\" compression=\"metadata\" introducer=\"false\">\n        <address>tcp://10.10.10.30:22000</address>\n    </device>\n    <device id=\"{e}\" name=\"egress1\" compression=\"metadata\" introducer=\"false\">\n        <address>dynamic</address>\n    </device>\n    <device id=\"{o}\" name=\"old-worker\" compression=\"metadata\" introducer=\"false\">\n        <address>dynamic</address>\n    </device>\n    <defaults>\n        <device id=\"\" compression=\"metadata\"><address>dynamic</address></device>\n        <folder id=\"\" path=\"\"><device id=\"{mb}\"/></folder>\n    </defaults>\n</configuration>\n",
-            vendor = SYNCTHING_FOLDER_DIST_VENDOR_ID,
-            mb = ST_MB_LOCAL,
-            w = ST_WORKER1,
-            ws = ST_WORKER1_STALE,
-            i = ST_INGRESS1,
-            e = ST_EGRESS1,
-            o = ST_OLDHIVE,
+        let (mb, w, ws, i, e, o) = (
+            ST_MB_LOCAL,
+            ST_WORKER1,
+            ST_WORKER1_STALE,
+            ST_INGRESS1,
+            ST_EGRESS1,
+            ST_OLDHIVE,
+        );
+        let mut out = String::from("<configuration version=\"51\">\n");
+        let root = "/var/lib/fluxbee";
+        out.push_str(&stage2_folder(
+            "fluxbee-blob",
+            &format!("{root}/blob/active"),
+            "sendreceive",
+            &[mb, e, w, ws, o],
+        ));
+        out.push_str(&stage2_folder(
+            "fluxbee-blob-public",
+            &format!("{root}/blob/public"),
+            "sendonly",
+            &[mb, i],
+        ));
+        out.push_str(&stage2_folder(
+            "fluxbee-dist-core-egress",
+            &format!("{root}/dist/core/egress"),
+            "sendonly",
+            &[mb, e],
+        ));
+        out.push_str(&stage2_folder(
+            "fluxbee-dist-core-ingress",
+            &format!("{root}/dist/core/ingress"),
+            "sendonly",
+            &[mb, i],
+        ));
+        out.push_str(&stage2_folder(
+            "fluxbee-dist-core-worker",
+            &format!("{root}/dist/core/worker"),
+            "sendonly",
+            &[mb, w],
+        ));
+        out.push_str(&stage2_folder(
+            "fluxbee-dist-policy",
+            &format!("{root}/dist/policy"),
+            "sendonly",
+            &[mb, i, e, w],
+        ));
+        out.push_str(&stage2_folder(
+            "fluxbee-dist-runtimes",
+            &format!("{root}/dist/runtimes"),
+            "sendonly",
+            &[mb, w],
+        ));
+        out.push_str(&stage2_folder(
+            "fluxbee-dist-vendor",
+            &format!("{root}/dist/vendor"),
+            "sendonly",
+            &[mb, i, e, w, ws, o],
+        ));
+        out.push_str(&stage2_device(mb, "fb-mb", "dynamic"));
+        out.push_str(&stage2_device(i, "ingress1", "tcp://10.10.10.30:22000"));
+        out.push_str(&stage2_device(e, "egress1", "dynamic"));
+        out.push_str(&stage2_device(w, "worker1", "dynamic"));
+        out.push_str(&stage2_device(ws, "worker1", "dynamic"));
+        out.push_str(&stage2_device(o, "old-worker", "dynamic"));
+        out.push_str("    <defaults>\n        <device id=\"\" compression=\"metadata\"><address>dynamic</address></device>\n");
+        out.push_str(&format!("        <folder id=\"\" path=\"\"><device id=\"{mb}\"/></folder>\n    </defaults>\n</configuration>\n"));
+        out
+    }
+
+    fn stage2_hive(device_id: Option<&str>, role: HiveRole, connected: bool) -> RegisteredHive {
+        RegisteredHive {
+            device_id: device_id.map(str::to_string),
+            role: Some(role),
+            connected,
+        }
+    }
+
+    /// The PROD registry: the egress entry records no device id.
+    fn stage2_registry() -> RegistrySnapshot {
+        RegistrySnapshot {
+            hives: BTreeMap::from([
+                (
+                    "worker1".to_string(),
+                    stage2_hive(Some(ST_WORKER1), HiveRole::Worker, true),
+                ),
+                (
+                    "ingress1".to_string(),
+                    stage2_hive(Some(ST_INGRESS1), HiveRole::Ingress, true),
+                ),
+                (
+                    "egress1".to_string(),
+                    stage2_hive(None, HiveRole::Egress, true),
+                ),
+            ]),
+            complete: true,
+        }
+    }
+
+    fn stage2_plan(config: &str, registry: &RegistrySnapshot, busy: bool) -> MotherbeePeerPlan {
+        let blob = sample_blob_config();
+        let dist = sample_dist_config();
+        motherbee_peer_plan(
+            &syncthing_declared_devices(config).unwrap(),
+            &fluxbee_folder_memberships(config).unwrap(),
+            ST_MB_LOCAL,
+            registry,
+            busy,
+            &|role| peer_folder_ids(&blob, &dist, role),
         )
     }
 
-    fn stage2_registry() -> BTreeMap<String, Option<String>> {
-        BTreeMap::from([
-            ("worker1".to_string(), Some(ST_WORKER1.to_string())),
-            ("ingress1".to_string(), Some(ST_INGRESS1.to_string())),
-            // The PROD egress entry records no device id.
-            ("egress1".to_string(), None),
-        ])
+    fn stage2_apply(config: &str, plan: &MotherbeePeerPlan) -> (String, bool) {
+        apply_motherbee_peer_plan_xml(config, plan, &fluxbee_folder_memberships(config).unwrap())
+            .unwrap()
+    }
+
+    fn folders_with(config: &str, device_id: &str) -> Vec<String> {
+        fluxbee_folder_memberships(config)
+            .unwrap()
+            .into_iter()
+            .filter(|(_, members)| members.iter().any(|m| m == device_id))
+            .map(|(folder, _)| folder)
+            .collect()
     }
 
     #[test]
@@ -26379,10 +26888,10 @@ mod tests {
             names,
             [
                 "fb-mb",
-                "worker1",
-                "worker1",
                 "ingress1",
                 "egress1",
+                "worker1",
+                "worker1",
                 "old-worker"
             ]
         );
@@ -26391,53 +26900,268 @@ mod tests {
     }
 
     #[test]
+    fn fluxbee_folder_memberships_skip_the_defaults_template() {
+        let memberships = fluxbee_folder_memberships(&stage2_motherbee_config()).unwrap();
+        assert_eq!(memberships.len(), 8);
+        assert_eq!(
+            memberships["fluxbee-dist-core-egress"],
+            vec![ST_MB_LOCAL.to_string(), ST_EGRESS1.to_string()]
+        );
+    }
+
+    /// A-50: the egress never gets `blob/active`; each role gets exactly its folders.
+    #[test]
+    fn peer_folders_per_role() {
+        let blob = sample_blob_config();
+        let dist = sample_dist_config();
+        let ids =
+            |role| -> Vec<String> { peer_folder_ids(&blob, &dist, role).into_iter().collect() };
+        assert_eq!(
+            ids(HiveRole::Worker),
+            [
+                "fluxbee-blob",
+                "fluxbee-dist-core-worker",
+                "fluxbee-dist-policy",
+                "fluxbee-dist-runtimes",
+                "fluxbee-dist-vendor"
+            ]
+        );
+        assert_eq!(
+            ids(HiveRole::Ingress),
+            [
+                "fluxbee-blob-public",
+                "fluxbee-dist-core-ingress",
+                "fluxbee-dist-policy",
+                "fluxbee-dist-vendor"
+            ]
+        );
+        assert_eq!(
+            ids(HiveRole::Egress),
+            [
+                "fluxbee-dist-core-egress",
+                "fluxbee-dist-policy",
+                "fluxbee-dist-vendor"
+            ]
+        );
+    }
+
+    /// The link and the reconcile agree by construction: linking a spoke on the motherbee puts it
+    /// in exactly `peer_folder_ids` of its role (plus policy, which the folder reconcile adds to
+    /// vendor's peers), so the reconcile never takes back what a join gives.
+    #[test]
+    fn the_motherbee_link_adds_exactly_the_role_folders() {
+        const PEER: &str = "PEERDEV-AAAAAAA-BBBBBBB";
+        let blob = sample_blob_config();
+        let dist = sample_dist_config();
+        for role in [HiveRole::Worker, HiveRole::Ingress, HiveRole::Egress] {
+            let (linked, _) = reconcile_syncthing_peer_xml(
+                &sample_syncthing_config_with_peer(),
+                &blob,
+                &dist,
+                PEER,
+                "spoke",
+                SyncthingPeerAddress::AcceptOnly,
+                true,
+                role,
+            )
+            .unwrap();
+            let (linked, _) =
+                reconcile_syncthing_folders_xml(&linked, &blob, &dist, true, HiveRole::Motherbee)
+                    .unwrap();
+            let got: BTreeSet<String> = folders_with(&linked, PEER).into_iter().collect();
+            assert_eq!(
+                got,
+                peer_folder_ids(&blob, &dist, role),
+                "{}",
+                role.as_str()
+            );
+        }
+    }
+
+    /// First round on PROD: ingress1 becomes accept-only, egress1's id is backfilled and it leaves
+    /// `fluxbee-blob`. Nothing is removed yet, since the egress entry records no device.
+    #[test]
     fn motherbee_plan_on_the_prod_shapes() {
-        let devices = syncthing_declared_devices(&stage2_motherbee_config()).unwrap();
-        let plan = motherbee_peer_plan(&devices, ST_MB_LOCAL, &stage2_registry());
+        let plan = stage2_plan(&stage2_motherbee_config(), &stage2_registry(), false);
         assert_eq!(
             plan.accept_only,
             vec![(ST_INGRESS1.to_string(), "ingress1".to_string())]
         );
         assert_eq!(
-            plan.orphans,
+            plan.backfill,
+            vec![("egress1".to_string(), ST_EGRESS1.to_string())]
+        );
+        assert_eq!(
+            plan.drop_memberships,
+            vec![("fluxbee-blob".to_string(), ST_EGRESS1.to_string())]
+        );
+        assert!(plan.orphans.is_empty(), "{:?}", plan.orphans);
+        assert_eq!(plan.notes.len(), 2, "{:?}", plan.notes);
+        assert!(plan.notes.iter().any(|n| n.contains(ST_WORKER1_STALE)));
+        assert!(plan.notes.iter().any(|n| n.contains(ST_OLDHIVE)));
+    }
+
+    /// Round two, once the backfill recorded the egress: the stale device and the old hive's are
+    /// removed from every folder and from the declarations. Round three changes nothing.
+    #[test]
+    fn motherbee_plan_converges_in_two_rounds() {
+        let first = stage2_plan(&stage2_motherbee_config(), &stage2_registry(), false);
+        let (config, changed) = stage2_apply(&stage2_motherbee_config(), &first);
+        assert!(changed);
+        assert!(!config.contains("tcp://10.10.10.30:22000"));
+        assert!(!folders_with(&config, ST_EGRESS1).contains(&"fluxbee-blob".to_string()));
+        assert_eq!(folders_with(&config, ST_WORKER1).len(), 5);
+
+        let mut registry = stage2_registry();
+        registry.hives.get_mut("egress1").unwrap().device_id = Some(ST_EGRESS1.to_string());
+        let second = stage2_plan(&config, &registry, false);
+        assert!(second.accept_only.is_empty() && second.backfill.is_empty());
+        assert!(second.drop_memberships.is_empty());
+        assert_eq!(
+            second.orphans,
             vec![
                 (ST_WORKER1_STALE.to_string(), "worker1".to_string()),
                 (ST_OLDHIVE.to_string(), "old-worker".to_string()),
             ]
         );
+        let (config, changed) = stage2_apply(&config, &second);
+        assert!(changed);
+        assert!(!config.contains(ST_WORKER1_STALE) && !config.contains(ST_OLDHIVE));
+        assert!(config.contains(ST_WORKER1) && config.contains(ST_EGRESS1));
+
+        let third = stage2_plan(&config, &registry, false);
+        assert_eq!(third, MotherbeePeerPlan::default());
+        let (unchanged, changed) = stage2_apply(&config, &third);
+        assert!(!changed);
+        assert_eq!(unchanged, config);
+    }
+
+    #[test]
+    fn motherbee_plan_does_nothing_while_a_topology_operation_runs() {
+        let plan = stage2_plan(&stage2_motherbee_config(), &stage2_registry(), true);
+        assert!(plan.accept_only.is_empty() && plan.backfill.is_empty());
+        assert!(plan.drop_memberships.is_empty() && plan.orphans.is_empty());
+        assert_eq!(plan.notes.len(), 1);
+    }
+
+    /// A hive that is joining (or stopped half-way) is left alone, and with it in the registry
+    /// nothing is removed.
+    #[test]
+    fn motherbee_plan_leaves_a_hive_that_is_not_connected() {
+        let mut registry = stage2_registry();
+        registry.hives.get_mut("egress1").unwrap().device_id = Some(ST_EGRESS1.to_string());
+        registry.hives.get_mut("ingress1").unwrap().connected = false;
+        let plan = stage2_plan(&stage2_motherbee_config(), &registry, false);
+        assert!(plan.accept_only.is_empty(), "ingress1 is not touched");
+        assert!(plan.orphans.is_empty());
         assert_eq!(
-            plan.backfill,
-            vec![("egress1".to_string(), ST_EGRESS1.to_string())]
+            plan.drop_memberships,
+            vec![("fluxbee-blob".to_string(), ST_EGRESS1.to_string())]
         );
     }
 
     #[test]
-    fn motherbee_plan_applied_once_then_nothing_left() {
-        let blob = sample_blob_config();
-        let dist = sample_dist_config();
-        let config = stage2_motherbee_config();
-        let registry = stage2_registry();
-        let devices = syncthing_declared_devices(&config).unwrap();
-        let plan = motherbee_peer_plan(&devices, ST_MB_LOCAL, &registry);
-        let removable: Vec<String> = plan.orphans.iter().map(|(id, _)| id.clone()).collect();
-        let (updated, changed) =
-            apply_motherbee_peer_plan_xml(&config, &plan, &removable, &blob, &dist).unwrap();
-        assert!(changed);
-        assert!(!updated.contains("tcp://10.10.10.30:22000"));
-        assert!(!updated.contains(ST_OLDHIVE));
-        assert!(!updated.contains(ST_WORKER1_STALE));
-        assert!(updated.contains(ST_WORKER1));
-        let again = motherbee_peer_plan(
-            &syncthing_declared_devices(&updated).unwrap(),
-            ST_MB_LOCAL,
-            &registry,
+    fn motherbee_plan_removes_nothing_on_an_unreadable_or_empty_registry() {
+        let mut registry = stage2_registry();
+        registry.hives.get_mut("egress1").unwrap().device_id = Some(ST_EGRESS1.to_string());
+        registry.complete = false;
+        assert!(stage2_plan(&stage2_motherbee_config(), &registry, false)
+            .orphans
+            .is_empty());
+        let empty = RegistrySnapshot {
+            hives: BTreeMap::new(),
+            complete: true,
+        };
+        let plan = stage2_plan(&stage2_motherbee_config(), &empty, false);
+        assert!(plan.orphans.is_empty() && plan.accept_only.is_empty());
+    }
+
+    /// A hive's device is found by its recorded id, whatever its name (renamed in the GUI, or
+    /// re-added under another hive_id): it is never taken for an orphan.
+    #[test]
+    fn a_hive_device_is_found_by_its_recorded_id() {
+        let config = stage2_motherbee_config().replace(
+            &format!("id=\"{ST_INGRESS1}\" name=\"ingress1\""),
+            &format!("id=\"{ST_INGRESS1}\" name=\"renamed\""),
         );
-        assert!(again.accept_only.is_empty());
-        assert!(again.orphans.is_empty());
-        let (unchanged, changed_again) =
-            apply_motherbee_peer_plan_xml(&updated, &again, &[], &blob, &dist).unwrap();
-        assert!(!changed_again);
-        assert_eq!(unchanged, updated);
+        let mut registry = stage2_registry();
+        registry.hives.get_mut("egress1").unwrap().device_id = Some(ST_EGRESS1.to_string());
+        let plan = stage2_plan(&config, &registry, false);
+        assert!(!plan.orphans.iter().any(|(id, _)| id == ST_INGRESS1));
+        assert_eq!(
+            plan.accept_only,
+            vec![(ST_INGRESS1.to_string(), "renamed".to_string())]
+        );
+    }
+
+    #[test]
+    fn two_unrecorded_devices_under_one_name_are_kept_and_reported() {
+        const SECOND: &str = "EGRESS2-AAAAAAA-BBBBBBB";
+        let config = stage2_motherbee_config().replace(
+            "    <defaults>",
+            &format!(
+                "{}    <defaults>",
+                stage2_device(SECOND, "egress1", "dynamic")
+            ),
+        );
+        let plan = stage2_plan(&config, &stage2_registry(), false);
+        assert!(plan.backfill.is_empty());
+        assert!(!plan
+            .orphans
+            .iter()
+            .any(|(id, _)| id == SECOND || id == ST_EGRESS1));
+        assert!(plan
+            .notes
+            .iter()
+            .any(|n| n.contains("2 devices are named egress1")));
+    }
+
+    #[test]
+    fn a_recorded_device_missing_from_the_config_keeps_the_named_one() {
+        let mut registry = stage2_registry();
+        registry.hives.get_mut("egress1").unwrap().device_id =
+            Some("GONEDEV-AAAAAAA-BBBBBBB".to_string());
+        let plan = stage2_plan(&stage2_motherbee_config(), &registry, false);
+        assert!(!plan.orphans.iter().any(|(id, _)| id == ST_EGRESS1));
+        assert!(plan.notes.iter().any(|n| n.contains("GONEDEV")));
+    }
+
+    #[test]
+    fn registry_snapshot_reads_entries_and_flags_unreadable_ones() {
+        let root = std::env::temp_dir().join(format!("fluxbee-st-registry-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let entry = |hive: &str, body: &str| {
+            fs::create_dir_all(root.join(hive)).unwrap();
+            fs::write(root.join(hive).join("info.yaml"), body).unwrap();
+        };
+        entry(
+            "worker1",
+            &format!("hive_id: worker1\nrole: worker\nstatus: connected\nsyncthing_device_id: \" {ST_WORKER1} \"\n"),
+        );
+        entry(
+            "egress1",
+            "hive_id: egress1\nrole: egress\nstatus: pending\nsyncthing_device_id: not-an-id\n",
+        );
+        entry("odd", "hive_id: odd\nrole: motherbee\nstatus: connected\n");
+        fs::create_dir_all(root.join("accepting")).unwrap();
+
+        let snapshot = read_registry_snapshot(&root);
+        assert!(snapshot.complete);
+        assert_eq!(
+            snapshot.hives["worker1"],
+            stage2_hive(Some(ST_WORKER1), HiveRole::Worker, true)
+        );
+        assert_eq!(
+            snapshot.hives["egress1"],
+            stage2_hive(None, HiveRole::Egress, false)
+        );
+        assert_eq!(snapshot.hives["odd"].role, None);
+        assert!(!snapshot.hives.contains_key("accepting"));
+
+        entry("broken", "status: [connected\n");
+        assert!(!read_registry_snapshot(&root).complete);
+        fs::remove_dir_all(&root).unwrap();
+        assert!(!read_registry_snapshot(&root).complete);
     }
 
     #[test]
@@ -26471,9 +27195,51 @@ mod tests {
     }
 
     #[test]
-    fn syncthing_config_writer_writes_only_on_change_and_keeps_the_mode() {
-        let dir = std::env::temp_dir().join(format!("fluxbee-st-writer-{}", std::process::id()));
+    fn the_spoke_derives_the_motherbee_address_from_its_uplink() {
+        let uplink = |address: &str| {
+            vec![WanUplink {
+                address: address.to_string(),
+            }]
+        };
+        let value = |address: &str| {
+            spoke_motherbee_static_address(&uplink(address)).map(SyncthingPeerAddress::config_value)
+        };
+        assert_eq!(
+            value("10.10.10.10:9000").unwrap(),
+            "tcp://10.10.10.10:22000"
+        );
+        assert_eq!(value("[fd00::10]:9000").unwrap(), "tcp://[fd00::10]:22000");
+        // What `resolve_worker_uplink_address` writes for a bare IPv6 wan.listen.
+        assert_eq!(value("fd00::10:9000").unwrap(), "tcp://[fd00::10]:22000");
+        assert!(value("motherbee.lan:9000").is_err());
+        assert!(spoke_motherbee_static_address(&[]).is_err());
+    }
+
+    #[test]
+    fn finalize_needs_a_static_motherbee_address() {
+        let device = Some(ST_MB_LOCAL);
+        assert_eq!(finalize_peer_static_address(None, None), Ok(None));
+        assert!(finalize_peer_static_address(device, None).is_err());
+        assert!(finalize_peer_static_address(device, Some("dynamic")).is_err());
+        assert!(finalize_peer_static_address(device, Some("tcp://motherbee:22000")).is_err());
+        assert_eq!(
+            finalize_peer_static_address(device, Some("tcp://10.10.10.10:22000")),
+            Ok(Some(SyncthingPeerAddress::Static(
+                "10.10.10.10:22000".parse().unwrap()
+            )))
+        );
+    }
+
+    fn stage2_writer_dir(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("fluxbee-st-{tag}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn syncthing_config_writer_writes_only_on_change_and_keeps_the_mode() {
+        let dir = stage2_writer_dir("writer");
         let path = dir.join("config.xml");
         fs::write(&path, "<configuration/>\n").unwrap();
         fs::set_permissions(&path, fs::Permissions::from_mode(0o640)).unwrap();
@@ -26494,6 +27260,39 @@ mod tests {
         assert!(
             fs::read_dir(&dir).unwrap().count() == 1,
             "no temp file is left behind"
+        );
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// The directory belongs to the Syncthing user. A config.xml swapped for a symlink is neither
+    /// read nor written through, and a planted temp name never redirects the write.
+    #[test]
+    fn syncthing_config_writer_never_follows_a_planted_symlink() {
+        let dir = stage2_writer_dir("symlink");
+        let victim = dir.join("victim");
+        fs::write(&victim, "root-owned contents\n").unwrap();
+        let path = dir.join("config.xml");
+        std::os::unix::fs::symlink(&victim, &path).unwrap();
+        assert!(update_syncthing_config(&path, |_| Ok(("x".to_string(), true))).is_err());
+        assert!(replace_file_keeping_owner(&path, b"x").is_err());
+        assert_eq!(
+            fs::read_to_string(&victim).unwrap(),
+            "root-owned contents\n"
+        );
+
+        fs::remove_file(&path).unwrap();
+        fs::write(&path, "<configuration/>\n").unwrap();
+        let planted = dir.join(format!("{}planted", replace_temp_prefix(&path)));
+        std::os::unix::fs::symlink(&victim, &planted).unwrap();
+        assert!(update_syncthing_config(&path, |_| Ok(("<new/>\n".to_string(), true))).unwrap());
+        assert_eq!(fs::read_to_string(&path).unwrap(), "<new/>\n");
+        assert_eq!(
+            fs::read_to_string(&victim).unwrap(),
+            "root-owned contents\n"
+        );
+        assert!(
+            fs::symlink_metadata(&planted).is_err(),
+            "the planted temp was swept"
         );
         fs::remove_dir_all(&dir).unwrap();
     }
