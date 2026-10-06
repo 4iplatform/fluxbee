@@ -924,14 +924,6 @@ async fn main() -> Result<(), OrchestratorError> {
 
     bootstrap_local(&state, &socket_dir).await?;
 
-    // Off the boot path: catch up mesh TLS material on existing hives (legacy pre-mTLS, or a
-    // partial add_hive). key_only_persist hives are reached via their per-spoke recovery key in
-    // the vault; this needs the Arc<State>, so it is spawned here rather than inside bootstrap_local.
-    if state.is_motherbee {
-        let reconcile_state = Arc::clone(&state);
-        tokio::spawn(async move { reconcile_hive_tls_material(reconcile_state).await });
-    }
-
     let node_config = NodeConfig {
         name: "SY.orchestrator".to_string(),
         router_socket: socket_dir.clone(),
@@ -1234,19 +1226,6 @@ fn ensure_motherbee_ssh_key() {
 /// the remote node's `/var/lib/fluxbee/tls/<hive_id>/` over the authenticated SSH
 /// channel. Best-effort (logged): the WAN degrades to plaintext without certs, so
 /// a distribution hiccup must not fail the whole add_hive.
-/// True when an SSH failure is authentication/transport, not a remote command that ran and
-/// returned non-zero.
-///
-/// `ssh` exits 255 for its own failures (auth, connect, host key); anything else is the remote
-/// command's own exit code. Used to tell "this hive deliberately has no SSH channel" apart from
-/// "the command failed", so hardened spokes stop being reported as errors.
-fn ssh_error_is_auth_failure(err: &OrchestratorError) -> bool {
-    let text = err.to_string();
-    text.contains("exit=255")
-        || text.contains("Permission denied")
-        || text.contains("Too many authentication failures")
-}
-
 fn distribute_hive_tls(address: &str, key_path: &Path, user: &str, hive_id: &str) {
     if let Err(err) = distribute_hive_tls_inner(address, key_path, user, hive_id) {
         tracing::warn!(hive_id = hive_id, error = %err, "failed to distribute mesh TLS material");
@@ -1368,180 +1347,6 @@ fn distribute_hive_identity_key_inner(
     Ok(())
 }
 
-/// Motherbee: (re)distribute mesh TLS material to all already-provisioned hives
-/// that don't have it yet. New hives get certs at `add_hive`; this catches up the
-/// hives created BEFORE mTLS existed (so the operator can flip `wan.mtls` without
-/// a manual cert step). Idempotent (skips hives that already hold a cert; a CA
-/// rotation is a separate forced op) and best-effort (logged). Runs blocking, so
-/// the caller should spawn it off the boot path.
-/// A per-spoke recovery private key materialized to a 0600 scratch file for the duration of a
-/// reconcile probe. The scratch dir is removed on drop.
-struct SpokeRecoveryKey {
-    dir: PathBuf,
-    path: PathBuf,
-}
-
-impl Drop for SpokeRecoveryKey {
-    fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.dir);
-    }
-}
-
-/// Read a hive's per-spoke recovery SSH private key (`ssh:<hive_id>`, a root-tenant POOL secret
-/// written by `add_hive ssh_access=key_only_persist`) from SY.vault and materialize it to a
-/// 0600 scratch file. Returns None when the hive has no such key (revoke-mode / legacy hive) or
-/// the vault read fails — the caller then falls back to the motherbee bootstrap key.
-#[cfg(not(test))]
-async fn read_spoke_recovery_key_to_temp(
-    state: &OrchestratorState,
-    hive_id: &str,
-) -> Option<SpokeRecoveryKey> {
-    let admin_target = teardown_admin_target();
-    let resp = orchestrator_admin_command(
-        state,
-        AdminCommandRequest {
-            admin_target: &admin_target,
-            action: "vault_get",
-            target: Some(PRIMARY_HIVE_ID),
-            params: serde_json::json!({ "key": format!("ssh:{hive_id}") }),
-            request_id: None,
-            timeout: Duration::from_secs(15),
-        },
-    )
-    .await
-    .ok()?;
-    if resp.status != "ok" {
-        return None;
-    }
-    let priv_pem = resp
-        .payload
-        .get("value")
-        .and_then(|v| v.get("private_key"))
-        .and_then(|v| v.as_str())
-        .filter(|s| !s.is_empty())?
-        .to_string();
-    let dir = spoke_key_scratch_dir("recover");
-    fs::create_dir_all(&dir).ok()?;
-    let _ = fs::set_permissions(&dir, fs::Permissions::from_mode(0o700));
-    let path = dir.join("id");
-    fs::write(&path, &priv_pem).ok()?;
-    let _ = fs::set_permissions(&path, fs::Permissions::from_mode(0o600));
-    Some(SpokeRecoveryKey { dir, path })
-}
-
-#[cfg(test)]
-async fn read_spoke_recovery_key_to_temp(
-    _state: &OrchestratorState,
-    _hive_id: &str,
-) -> Option<SpokeRecoveryKey> {
-    None
-}
-
-/// Off-boot-path catch-up of mesh TLS material on existing hives (legacy pre-mTLS, or a hive
-/// whose add_hive TLS push was partial). The motherbee bootstrap key is revoked on every joined
-/// hive, so for a `key_only_persist` hive this reads that hive's per-spoke recovery key from the
-/// vault to reach it (closing the reconcile↔revoke contradiction); revoke-mode / legacy hives
-/// fall back to the motherbee key (which only still works for a pre-revoke/legacy hive). A hive
-/// we cannot reach is left alone, and only an actual successful distribution is counted.
-async fn reconcile_hive_tls_material(state: Arc<OrchestratorState>) {
-    let root = hives_root();
-    let Ok(entries) = fs::read_dir(&root) else {
-        return;
-    };
-    let mut filled = 0u32;
-    for entry in entries.flatten() {
-        let hive_id = entry.file_name().to_string_lossy().to_string();
-        if hive_id == PRIMARY_HIVE_ID || !valid_hive_id(&hive_id) {
-            continue;
-        }
-        let Ok(info) = read_hive_info(&root, &hive_id) else {
-            continue;
-        };
-        if info.get("status").and_then(|v| v.as_str()) != Some("connected") {
-            continue;
-        }
-        let address = info
-            .get("address")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string();
-        let user = info
-            .get("ssh_user")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string();
-        if address.is_empty() || user.is_empty() {
-            continue;
-        }
-        let recovery = read_spoke_recovery_key_to_temp(&state, &hive_id).await;
-        if recovery.is_some() {
-            tracing::info!(
-                hive_id = %hive_id,
-                "reconcile: reaching key_only_persist hive via its per-spoke recovery key from the vault"
-            );
-        }
-        let key_path = recovery
-            .as_ref()
-            .map(|r| r.path.clone())
-            .unwrap_or_else(|| PathBuf::from(MOTHERBEE_SSH_KEY_PATH));
-        let hive_c = hive_id.clone();
-        // A hive joined with the default `ssh_access=revoke` has no recovery key in the vault and
-        // motherbee's own key was removed from it by `harden_ssh` — on purpose. Every SSH attempt
-        // against it will fail authentication, forever. That is the hardening working, not a
-        // fault, so it must not be reported as one: this loop was emitting
-        // "failed to distribute mesh TLS material ... Permission denied (publickey)" for every
-        // hardened spoke on every pass, which is noise that trains an operator to ignore the log.
-        let ssh_intentionally_closed = recovery.is_none();
-        // The SSH calls are blocking; run them off the async worker.
-        let distributed = tokio::task::spawn_blocking(move || {
-            // Idempotent + reachability probe: a hive that already holds a cert (or that we
-            // cannot ssh into at all) is left alone rather than pushed blindly.
-            match ssh_with_key(
-                &address,
-                &key_path,
-                &sudo_wrap(&format!("test -f '/var/lib/fluxbee/tls/{hive_c}/cert.crt'")),
-                &user,
-            ) {
-                Ok(_) => return false,
-                Err(err) if ssh_intentionally_closed && ssh_error_is_auth_failure(&err) => {
-                    tracing::debug!(
-                        hive_id = %hive_c,
-                        "reconcile: hive has no SSH channel (ssh_access=revoke); skipping TLS catch-up"
-                    );
-                    return false;
-                }
-                Err(_) => {}
-            }
-            match distribute_hive_tls_inner(&address, &key_path, &user, &hive_c) {
-                Ok(()) => true,
-                Err(err) => {
-                    if ssh_intentionally_closed && ssh_error_is_auth_failure(&err) {
-                        tracing::debug!(
-                            hive_id = %hive_c,
-                            "reconcile: hive has no SSH channel (ssh_access=revoke); skipping TLS catch-up"
-                        );
-                    } else {
-                        tracing::warn!(hive_id = %hive_c, error = %err, "reconcile: failed to distribute mesh TLS material");
-                    }
-                    false
-                }
-            }
-        })
-        .await
-        .unwrap_or(false);
-        drop(recovery); // remove the scratch private key
-        if distributed {
-            filled += 1;
-        }
-    }
-    if filled > 0 {
-        tracing::info!(
-            count = filled,
-            "distributed mesh TLS material to existing hives"
-        );
-    }
-}
-
 async fn bootstrap_local(
     state: &OrchestratorState,
     socket_dir: &Path,
@@ -1568,9 +1373,8 @@ async fn bootstrap_local(
     }
 
     // Motherbee is the mesh CA: ensure the CA + its own WAN-mTLS material exist before
-    // rt-gateway starts (the router loads certs at startup). The off-boot-path TLS catch-up for
-    // existing hives is spawned by the caller — it needs the Arc<State> to read per-spoke
-    // recovery keys from the vault.
+    // rt-gateway starts (the router loads certs at startup). A hive's leaf is issued only by its
+    // join: one that lost it is joined again (D32).
     if state.is_motherbee {
         ensure_motherbee_ssh_key();
         ensure_motherbee_mesh_tls(&state.hive_id);
@@ -11716,8 +11520,8 @@ async fn list_versions_flow(state: &OrchestratorState) -> serde_json::Value {
         // Only hives that actually joined. `list_managed_hive_ids` filters on `is_dir` alone, so
         // a hive whose join failed leaves a directory behind forever — and fanning out to it
         // yields `unknown`, which pins the FLEET verdict at `unknown` permanently and makes
-        // /versions useless as an instrument. Same `status == "connected"` gate that
-        // `reconcile_hive_tls_material` and the public-edge selection already apply.
+        // /versions useless as an instrument. Same `status == "connected"` gate that the
+        // public-edge selection applies.
         if hive_status(&root, &hive_id).as_deref() != Some("connected") {
             continue;
         }
@@ -21059,7 +20863,6 @@ struct JoinParams {
     address: String,
     harden_ssh: bool,
     restrict_ssh: bool,
-    ssh_access: SshAccess,
     require_dist_sync: bool,
     dist_sync_probe_timeout_secs: u64,
     /// Held in memory for the life of the join and never written anywhere: the contract is
@@ -21170,7 +20973,9 @@ async fn accept_add_hive(
     // malformed payload is still an immediate, actionable error rather than a background failure.
     let harden_ssh = resolve_add_hive_harden_ssh(payload);
     let restrict_ssh = resolve_add_hive_restrict_ssh(payload, harden_ssh);
-    let ssh_access = resolve_add_hive_ssh_access(payload);
+    if let Err(message) = reject_removed_add_hive_fields(payload) {
+        return invalid(message);
+    }
     let require_dist_sync = resolve_add_hive_require_dist_sync(payload);
     let dist_sync_probe_timeout_secs = resolve_add_hive_dist_sync_probe_timeout_secs(payload);
     let creds = match resolve_add_hive_ssh_creds(payload) {
@@ -21308,7 +21113,6 @@ async fn accept_add_hive(
         address: address.clone(),
         harden_ssh,
         restrict_ssh,
-        ssh_access,
         require_dist_sync,
         dist_sync_probe_timeout_secs,
         creds,
@@ -21359,7 +21163,6 @@ async fn run_background_join(state: &Arc<OrchestratorState>, params: JoinParams)
         address,
         harden_ssh,
         restrict_ssh,
-        ssh_access,
         require_dist_sync,
         dist_sync_probe_timeout_secs,
         creds,
@@ -21376,7 +21179,6 @@ async fn run_background_join(state: &Arc<OrchestratorState>, params: JoinParams)
                 &address,
                 harden_ssh,
                 restrict_ssh,
-                ssh_access,
                 section.clone(),
                 &creds,
             )
@@ -21389,7 +21191,6 @@ async fn run_background_join(state: &Arc<OrchestratorState>, params: JoinParams)
                 &address,
                 harden_ssh,
                 restrict_ssh,
-                ssh_access,
                 section.clone(),
                 &creds,
             )
@@ -21402,7 +21203,6 @@ async fn run_background_join(state: &Arc<OrchestratorState>, params: JoinParams)
                 &address,
                 harden_ssh,
                 restrict_ssh,
-                ssh_access,
                 require_dist_sync,
                 dist_sync_probe_timeout_secs,
                 &creds,
@@ -21415,11 +21215,9 @@ async fn run_background_join(state: &Arc<OrchestratorState>, params: JoinParams)
     // separated from the flow again, a failed background join silently leaves the motherbee
     // key and the NOPASSWD sudoers on the box forever.
     //
-    // Skipped for key_only_persist (its error paths deliberately KEEP the motherbee key as the
-    // recovery channel, so a failed join never strands the spoke) and on a transient failure
-    // (so the retry stays key-first).
+    // Skipped on a transient failure, so the retry stays key-first.
     let ok = result.get("status").and_then(|v| v.as_str()) == Some("ok");
-    if !ok && ssh_access != SshAccess::KeyOnlyPersist && !add_hive_result_is_transient(&result) {
+    if !ok && !add_hive_result_is_transient(&result) {
         let revoke =
             best_effort_revoke_bootstrap(&address, creds.user.as_str(), creds.password.as_deref());
         let ssh_key_removed = revoke.ssh_key_removed;
@@ -21445,13 +21243,7 @@ async fn run_background_join(state: &Arc<OrchestratorState>, params: JoinParams)
                 serde_json::json!(sudoers_removed),
             );
         }
-    // The `ssh_access != KeyOnlyPersist` guard belongs here too: that path keeps the motherbee
-    // key deliberately, as the recovery channel, so labelling it `ssh_bootstrap_open` /
-    // `revoke_skipped_transient` would misreport WHY the key is still on the box.
-    } else if !ok
-        && ssh_access != SshAccess::KeyOnlyPersist
-        && add_hive_result_is_transient(&result)
-    {
+    } else if !ok && add_hive_result_is_transient(&result) {
         if let Some(obj) = result.as_object_mut() {
             obj.insert("ssh_bootstrap_open".to_string(), serde_json::json!(true));
             obj.insert(
@@ -21508,7 +21300,6 @@ async fn add_hive_flow(
     address: &str,
     harden_ssh: bool,
     restrict_ssh: bool,
-    ssh_access: SshAccess,
     require_dist_sync: bool,
     dist_sync_probe_timeout_secs: u64,
     creds: &BootstrapCreds,
@@ -22585,70 +22376,40 @@ async fn add_hive_flow(
         });
     }
 
-    // key_only_persist replaces the controls+revoke pair with the per-spoke persist finalize
-    // (seed a per-spoke key, harden, verify-before-revoke, vault_put, remove only the MB key);
-    // default `revoke` keeps today's controls + full bootstrap revoke below.
-    let controls_result = if ssh_access == SshAccess::KeyOnlyPersist {
-        finalize_spoke_key_persist(
-            state,
-            address,
-            &key_path,
-            creds.user.as_str(),
-            &pub_key,
-            hive_id,
-        )
-        .await
-        .map(|r| {
-            (
-                AddHiveSshControlsResult {
-                    restrict_ssh_applied: r.restrict_ssh_applied,
-                    restrict_ssh_mode: r.restrict_ssh_mode,
-                    harden_ssh_applied: r.harden_ssh_applied,
-                },
-                r.ssh_access,
-                r.spoke_key_vault_ref,
-                Some(r.ssh_bootstrap_revoked),
-            )
-        })
-    } else {
-        apply_add_hive_ssh_controls_after_finalize(
-            address,
-            &key_path,
-            creds.user.as_str(),
-            &pub_key,
-            restrict_ssh,
-            harden_ssh,
-        )
-        .map(|result| (result, "revoke".to_string(), None::<String>, None::<bool>))
+    let ssh_controls = match apply_add_hive_ssh_controls_after_finalize(
+        address,
+        &key_path,
+        creds.user.as_str(),
+        &pub_key,
+        restrict_ssh,
+        harden_ssh,
+    ) {
+        Ok(controls) => controls,
+        Err(err) => {
+            let err_text = err.to_string();
+            let error_code = if err_text.to_ascii_lowercase().contains("harden") {
+                "SSH_HARDEN_FAILED"
+            } else {
+                "SSH_KEY_FAILED"
+            };
+            return serde_json::json!({
+                "status": "error",
+                "error_code": error_code,
+                "message": err_text,
+                "hive_id": hive_id,
+                "address": address,
+                "harden_ssh": harden_ssh,
+                "restrict_ssh": false,
+                "restrict_ssh_requested": restrict_ssh,
+                "require_dist_sync": require_dist_sync,
+                "dist_sync_probe_timeout_secs": dist_sync_probe_timeout_secs,
+                "wan_connected": true,
+                "orchestrator_connected": true,
+                "dist_sync_ready": dist_sync_ready,
+                "finalize": finalize,
+            });
+        }
     };
-    let (ssh_controls, ssh_access_mode, spoke_key_vault_ref, persist_revoked) =
-        match controls_result {
-            Ok(tuple) => tuple,
-            Err(err) => {
-                let err_text = err.to_string();
-                let error_code = if err_text.to_ascii_lowercase().contains("harden") {
-                    "SSH_HARDEN_FAILED"
-                } else {
-                    "SSH_KEY_FAILED"
-                };
-                return serde_json::json!({
-                    "status": "error",
-                    "error_code": error_code,
-                    "message": err_text,
-                    "hive_id": hive_id,
-                    "address": address,
-                    "harden_ssh": harden_ssh,
-                    "restrict_ssh": false,
-                    "restrict_ssh_requested": restrict_ssh,
-                    "require_dist_sync": require_dist_sync,
-                    "dist_sync_probe_timeout_secs": dist_sync_probe_timeout_secs,
-                    "wan_connected": true,
-                    "orchestrator_connected": true,
-                    "dist_sync_ready": dist_sync_ready,
-                    "finalize": finalize,
-                });
-            }
-        };
     restrict_ssh_applied = ssh_controls.restrict_ssh_applied;
     let restrict_ssh_mode = ssh_controls.restrict_ssh_mode;
     let harden_ssh_applied = ssh_controls.harden_ssh_applied;
@@ -22677,18 +22438,16 @@ async fn add_hive_flow(
     // dist-sync, so revoke the bootstrap SSH access (strip the motherbee key from
     // authorized_keys + drop the sudoers NOPASSWD grant). This is the last SSH op.
     // Best-effort: a revoke failure must not fail an otherwise-successful join.
-    // key_only_persist already removed only the MB key (persist_revoked=Some); otherwise do the
-    // full SO-02 bootstrap revoke (MB key + sudoers).
-    let ssh_bootstrap_revoked = match persist_revoked {
-        Some(revoked) => revoked,
-        None => {
-            match revoke_bootstrap_ssh_access(address, &key_path, creds.user.as_str(), &pub_key) {
-                Ok(()) => true,
-                Err(err) => {
-                    tracing::warn!(hive_id = hive_id, error = %err, "SO-02: failed to revoke bootstrap SSH access; key/sudoers may remain on the worker");
-                    false
-                }
-            }
+    let ssh_bootstrap_revoked = match revoke_bootstrap_ssh_access(
+        address,
+        &key_path,
+        creds.user.as_str(),
+        &pub_key,
+    ) {
+        Ok(()) => true,
+        Err(err) => {
+            tracing::warn!(hive_id = hive_id, error = %err, "SO-02: failed to revoke bootstrap SSH access; key/sudoers may remain on the worker");
+            false
         }
     };
 
@@ -22702,8 +22461,6 @@ async fn add_hive_flow(
         "restrict_ssh_mode": restrict_ssh_mode,
         "restrict_ssh_requested": restrict_ssh,
         "ssh_bootstrap_revoked": ssh_bootstrap_revoked,
-        "ssh_access": ssh_access_mode,
-        "spoke_key_vault_ref": spoke_key_vault_ref,
         "require_dist_sync": require_dist_sync,
         "dist_sync_probe_timeout_secs": dist_sync_probe_timeout_secs,
         "wan_connected": true,
@@ -22726,7 +22483,6 @@ async fn add_egress_hive_flow(
     address: &str,
     harden_ssh: bool,
     restrict_ssh: bool,
-    ssh_access: SshAccess,
     egress: EgressSection,
     creds: &BootstrapCreds,
 ) -> serde_json::Value {
@@ -23276,66 +23032,39 @@ async fn add_egress_hive_flow(
     // boundary exposed to the internet, so a failure to disable password auth or
     // restrict the bootstrap key must NOT be reported as success. info.yaml stays
     // `pending` (written above), so a retry resumes via the F9 egress guard.
-    let controls_result = if ssh_access == SshAccess::KeyOnlyPersist {
-        finalize_spoke_key_persist(
-            state,
-            address,
-            &key_path,
-            creds.user.as_str(),
-            &pub_key,
-            hive_id,
-        )
-        .await
-        .map(|r| {
-            (
-                AddHiveSshControlsResult {
-                    restrict_ssh_applied: r.restrict_ssh_applied,
-                    restrict_ssh_mode: r.restrict_ssh_mode,
-                    harden_ssh_applied: r.harden_ssh_applied,
-                },
-                r.ssh_access,
-                r.spoke_key_vault_ref,
-                Some(r.ssh_bootstrap_revoked),
-            )
-        })
-    } else {
-        apply_add_hive_ssh_controls_after_finalize(
-            address,
-            &key_path,
-            creds.user.as_str(),
-            &pub_key,
-            restrict_ssh,
-            harden_ssh,
-        )
-        .map(|c| (c, "revoke".to_string(), None::<String>, None::<bool>))
+    let ssh_controls = match apply_add_hive_ssh_controls_after_finalize(
+        address,
+        &key_path,
+        creds.user.as_str(),
+        &pub_key,
+        restrict_ssh,
+        harden_ssh,
+    ) {
+        Ok(controls) => controls,
+        Err(err) => {
+            let err_text = err.to_string();
+            let error_code = if err_text.to_ascii_lowercase().contains("harden") {
+                "SSH_HARDEN_FAILED"
+            } else {
+                "SSH_KEY_FAILED"
+            };
+            tracing::warn!(hive_id = hive_id, error = %err_text, "egress ssh hardening failed");
+            return serde_json::json!({
+                "status": "error",
+                "error_code": error_code,
+                "message": err_text,
+                "hive_id": hive_id,
+                "address": address,
+                "egress_role": "egress",
+                "harden_ssh": harden_ssh,
+                "harden_ssh_applied": false,
+                "restrict_ssh": false,
+                "restrict_ssh_requested": restrict_ssh,
+                "wan_connected": true,
+                "orchestrator_connected": true,
+            });
+        }
     };
-    let (ssh_controls, ssh_access_mode, spoke_key_vault_ref, persist_revoked) =
-        match controls_result {
-            Ok(tuple) => tuple,
-            Err(err) => {
-                let err_text = err.to_string();
-                let error_code = if err_text.to_ascii_lowercase().contains("harden") {
-                    "SSH_HARDEN_FAILED"
-                } else {
-                    "SSH_KEY_FAILED"
-                };
-                tracing::warn!(hive_id = hive_id, error = %err_text, "egress ssh hardening failed");
-                return serde_json::json!({
-                    "status": "error",
-                    "error_code": error_code,
-                    "message": err_text,
-                    "hive_id": hive_id,
-                    "address": address,
-                    "egress_role": "egress",
-                    "harden_ssh": harden_ssh,
-                    "harden_ssh_applied": false,
-                    "restrict_ssh": false,
-                    "restrict_ssh_requested": restrict_ssh,
-                    "wan_connected": true,
-                    "orchestrator_connected": true,
-                });
-            }
-        };
     let restrict_ssh_applied = ssh_controls.restrict_ssh_applied;
     let restrict_ssh_mode = ssh_controls.restrict_ssh_mode;
     let harden_ssh_applied = ssh_controls.harden_ssh_applied;
@@ -23381,16 +23110,16 @@ async fn add_egress_hive_flow(
     // the real value back here is the T-VER-1 follow-up.
     // SO-02: revoke bootstrap SSH access (key + sudoers) — especially important on
     // an egress boundary host. Best-effort. Post-bootstrap is socket + dist-sync.
-    let ssh_bootstrap_revoked = match persist_revoked {
-        Some(revoked) => revoked,
-        None => {
-            match revoke_bootstrap_ssh_access(address, &key_path, creds.user.as_str(), &pub_key) {
-                Ok(()) => true,
-                Err(err) => {
-                    tracing::warn!(hive_id = hive_id, error = %err, "SO-02: failed to revoke bootstrap SSH access on egress; key/sudoers may remain");
-                    false
-                }
-            }
+    let ssh_bootstrap_revoked = match revoke_bootstrap_ssh_access(
+        address,
+        &key_path,
+        creds.user.as_str(),
+        &pub_key,
+    ) {
+        Ok(()) => true,
+        Err(err) => {
+            tracing::warn!(hive_id = hive_id, error = %err, "SO-02: failed to revoke bootstrap SSH access on egress; key/sudoers may remain");
+            false
         }
     };
 
@@ -23411,8 +23140,6 @@ async fn add_egress_hive_flow(
         "restrict_ssh_mode": restrict_ssh_mode,
         "restrict_ssh_requested": restrict_ssh,
         "ssh_bootstrap_revoked": ssh_bootstrap_revoked,
-        "ssh_access": ssh_access_mode,
-        "spoke_key_vault_ref": spoke_key_vault_ref,
         "wan_connected": wan_connected,
         "orchestrator_connected": orchestrator_connected,
         "note": "egress orchestrator active implies NAT applied + ipv4_forwarding + ipv6_blocked (reconcile is fatal at its boot). internet_reachable is verified ONLY on the egress host (degrades to WARN in its journal + re-checked every drift tick); not transmitted to motherbee in v1 (T-VER-1). See the egress journal for live detail.",
@@ -23434,7 +23161,6 @@ async fn add_ingress_hive_flow(
     address: &str,
     harden_ssh: bool,
     restrict_ssh: bool,
-    ssh_access: SshAccess,
     ingress: IngressSection,
     creds: &BootstrapCreds,
 ) -> serde_json::Value {
@@ -24050,67 +23776,40 @@ async fn add_ingress_hive_flow(
     }
 
     // SSH hardening (ingress is an internet-facing boundary; fatal, like egress).
-    let controls_result = if ssh_access == SshAccess::KeyOnlyPersist {
-        finalize_spoke_key_persist(
-            state,
-            address,
-            &key_path,
-            creds.user.as_str(),
-            &pub_key,
-            hive_id,
-        )
-        .await
-        .map(|r| {
-            (
-                AddHiveSshControlsResult {
-                    restrict_ssh_applied: r.restrict_ssh_applied,
-                    restrict_ssh_mode: r.restrict_ssh_mode,
-                    harden_ssh_applied: r.harden_ssh_applied,
-                },
-                r.ssh_access,
-                r.spoke_key_vault_ref,
-                Some(r.ssh_bootstrap_revoked),
-            )
-        })
-    } else {
-        apply_add_hive_ssh_controls_after_finalize(
-            address,
-            &key_path,
-            creds.user.as_str(),
-            &pub_key,
-            restrict_ssh,
-            harden_ssh,
-        )
-        .map(|c| (c, "revoke".to_string(), None::<String>, None::<bool>))
+    let ssh_controls = match apply_add_hive_ssh_controls_after_finalize(
+        address,
+        &key_path,
+        creds.user.as_str(),
+        &pub_key,
+        restrict_ssh,
+        harden_ssh,
+    ) {
+        Ok(controls) => controls,
+        Err(err) => {
+            let err_text = err.to_string();
+            let error_code = if err_text.to_ascii_lowercase().contains("harden") {
+                "SSH_HARDEN_FAILED"
+            } else {
+                "SSH_KEY_FAILED"
+            };
+            tracing::warn!(hive_id = hive_id, error = %err_text, "ingress ssh hardening failed");
+            return serde_json::json!({
+                "status": "error",
+                "error_code": error_code,
+                "message": err_text,
+                "hive_id": hive_id,
+                "address": address,
+                "ingress_role": "ingress",
+                "harden_ssh": harden_ssh,
+                "harden_ssh_applied": false,
+                "restrict_ssh": false,
+                "restrict_ssh_requested": restrict_ssh,
+                "wan_connected": true,
+                "orchestrator_connected": true,
+                "edge_service_active": edge_service_active,
+            });
+        }
     };
-    let (ssh_controls, ssh_access_mode, spoke_key_vault_ref, persist_revoked) =
-        match controls_result {
-            Ok(tuple) => tuple,
-            Err(err) => {
-                let err_text = err.to_string();
-                let error_code = if err_text.to_ascii_lowercase().contains("harden") {
-                    "SSH_HARDEN_FAILED"
-                } else {
-                    "SSH_KEY_FAILED"
-                };
-                tracing::warn!(hive_id = hive_id, error = %err_text, "ingress ssh hardening failed");
-                return serde_json::json!({
-                    "status": "error",
-                    "error_code": error_code,
-                    "message": err_text,
-                    "hive_id": hive_id,
-                    "address": address,
-                    "ingress_role": "ingress",
-                    "harden_ssh": harden_ssh,
-                    "harden_ssh_applied": false,
-                    "restrict_ssh": false,
-                    "restrict_ssh_requested": restrict_ssh,
-                    "wan_connected": true,
-                    "orchestrator_connected": true,
-                    "edge_service_active": edge_service_active,
-                });
-            }
-        };
     let restrict_ssh_applied = ssh_controls.restrict_ssh_applied;
     let restrict_ssh_mode = ssh_controls.restrict_ssh_mode;
     let harden_ssh_applied = ssh_controls.harden_ssh_applied;
@@ -24139,16 +23838,16 @@ async fn add_ingress_hive_flow(
         local_core_manifest_hash().ok().flatten(),
     );
 
-    let ssh_bootstrap_revoked = match persist_revoked {
-        Some(revoked) => revoked,
-        None => {
-            match revoke_bootstrap_ssh_access(address, &key_path, creds.user.as_str(), &pub_key) {
-                Ok(()) => true,
-                Err(err) => {
-                    tracing::warn!(hive_id = hive_id, error = %err, "SO-02: failed to revoke bootstrap SSH access on ingress; key/sudoers may remain");
-                    false
-                }
-            }
+    let ssh_bootstrap_revoked = match revoke_bootstrap_ssh_access(
+        address,
+        &key_path,
+        creds.user.as_str(),
+        &pub_key,
+    ) {
+        Ok(()) => true,
+        Err(err) => {
+            tracing::warn!(hive_id = hive_id, error = %err, "SO-02: failed to revoke bootstrap SSH access on ingress; key/sudoers may remain");
+            false
         }
     };
 
@@ -24164,8 +23863,6 @@ async fn add_ingress_hive_flow(
         "restrict_ssh_mode": restrict_ssh_mode,
         "restrict_ssh_requested": restrict_ssh,
         "ssh_bootstrap_revoked": ssh_bootstrap_revoked,
-        "ssh_access": ssh_access_mode,
-        "spoke_key_vault_ref": spoke_key_vault_ref,
         "wan_connected": wan_connected,
         "orchestrator_connected": orchestrator_connected,
         "edge_service_active": edge_service_active,
@@ -24307,30 +24004,17 @@ fn resolve_add_hive_harden_ssh(payload: &serde_json::Value) -> bool {
     false
 }
 
-/// Post-join SSH posture requested by `add_hive`.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum SshAccess {
-    /// SO-02 default: after a successful join, strip the motherbee bootstrap key AND the
-    /// sudoers grant — the spoke has no standing SSH access (management is router-socket +
-    /// dist-sync). This is the historical, unchanged behavior.
-    Revoke,
-    /// Opt-in (`ssh_access:"key_only_persist"`): leave SSH open KEY-ONLY (password auth off)
-    /// via a freshly generated PER-SPOKE key whose private half is stored in SY.vault under
-    /// `ssh/<hive_id>` for recovery. Only the motherbee bootstrap key is removed; the sudoers
-    /// grant and the per-spoke key are kept. Reverses the SO-02 revoke-everything invariant,
-    /// so it is off by default and gated by a verify-before-revoke that never strands a spoke.
-    KeyOnlyPersist,
-}
-
-/// `add_hive.ssh_access` — default `revoke` (unchanged). Only the exact string
-/// `"key_only_persist"` (case-insensitive) opts into the persistent per-spoke recovery key.
-fn resolve_add_hive_ssh_access(payload: &serde_json::Value) -> SshAccess {
-    match payload.get("ssh_access").and_then(|v| v.as_str()) {
-        Some(raw) if raw.trim().eq_ignore_ascii_case("key_only_persist") => {
-            SshAccess::KeyOnlyPersist
-        }
-        _ => SshAccess::Revoke,
+/// D32: SSH exists only inside `add_hive`, and the join revokes its access at the end; the
+/// persistent per-spoke key mode is gone (FINDINGS A-54). A request that still asks for a
+/// post-join SSH posture is refused, never silently ignored.
+fn reject_removed_add_hive_fields(payload: &serde_json::Value) -> Result<(), String> {
+    if payload.get("ssh_access").is_some() {
+        return Err(
+            "ssh_access was removed: SSH exists only inside add_hive and is always revoked at its end (D32)"
+                .to_string(),
+        );
     }
+    Ok(())
 }
 
 /// Role requested by `add_hive` (default worker). Egress provisioning takes a
@@ -24707,22 +24391,16 @@ fn systemd_disable(service: &str) -> Result<(), OrchestratorError> {
 struct AddHiveSshControlsResult {
     restrict_ssh_applied: bool,
     restrict_ssh_mode: String,
-    /// Measured, not requested. `add_hive` used to report `"harden_ssh_applied": harden_ssh`
-    /// — a literal echo of the flag — which was wrong in BOTH directions once
-    /// `ssh_access=key_only_persist` landed: that path hardens unconditionally, so a join
-    /// with `harden_ssh:false` left the box with password auth OFF while telling the
-    /// operator it was still on.
+    /// Measured, not requested: `add_hive` used to report `"harden_ssh_applied": harden_ssh`, a
+    /// literal echo of the flag.
     harden_ssh_applied: bool,
 }
 
-/// Comment stamped on every per-spoke recovery key. Doubles as the authorized_keys dedup
-/// marker so a retried/failed persist never accumulates orphaned recovery entries.
-const SPOKE_RECOVERY_KEY_COMMENT: &str = "fluxbee-spoke-recovery";
-
-/// Monotonic suffix for per-spoke key scratch dirs, so two concurrent add_hive calls that land
-/// in the same millisecond can never clobber each other's private-key file.
+/// Monotonic suffix for a join's key scratch dirs, so two concurrent add_hive calls that land in
+/// the same millisecond can never clobber each other's private-key file.
 static SPOKE_KEY_SCRATCH_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+/// A scratch dir under the orchestrator runtime dir for key material a join holds briefly.
 fn spoke_key_scratch_dir(kind: &str) -> PathBuf {
     let seq = SPOKE_KEY_SCRATCH_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     orchestrator_runtime_dir().join(format!(
@@ -24730,250 +24408,6 @@ fn spoke_key_scratch_dir(kind: &str) -> PathBuf {
         std::process::id(),
         now_epoch_ms()
     ))
-}
-
-/// Generate an ephemeral per-spoke ed25519 keypair in a 0700 scratch dir under the
-/// orchestrator runtime dir and return (private_pem, public_openssh). The scratch dir is
-/// removed before returning — the caller holds the material in memory (and writes the private
-/// half to a 0600 temp only for the verify-before-revoke probe). Mirrors ensure_motherbee_ssh_key.
-fn generate_spoke_ssh_keypair() -> Result<(String, String), OrchestratorError> {
-    let dir = spoke_key_scratch_dir("keygen");
-    fs::create_dir_all(&dir)?;
-    let _ = fs::set_permissions(&dir, fs::Permissions::from_mode(0o700));
-    let key_path = dir.join("spoke.key");
-    let out = Command::new("ssh-keygen")
-        .args([
-            "-t",
-            "ed25519",
-            "-N",
-            "",
-            "-q",
-            "-C",
-            SPOKE_RECOVERY_KEY_COMMENT,
-            "-f",
-        ])
-        .arg(&key_path)
-        .output();
-    let result = (|| -> Result<(String, String), OrchestratorError> {
-        match out {
-            Ok(o) if o.status.success() => {
-                let priv_pem = fs::read_to_string(&key_path)?;
-                let pub_openssh = fs::read_to_string(dir.join("spoke.key.pub"))?
-                    .trim()
-                    .to_string();
-                if pub_openssh.split_whitespace().nth(1).is_none() {
-                    return Err("generated spoke public key has unexpected format".into());
-                }
-                Ok((priv_pem, pub_openssh))
-            }
-            Ok(o) => Err(format!(
-                "ssh-keygen failed for per-spoke key: {}",
-                String::from_utf8_lossy(&o.stderr)
-            )
-            .into()),
-            Err(err) => Err(format!("ssh-keygen unavailable: {err}").into()),
-        }
-    })();
-    let _ = fs::remove_dir_all(&dir);
-    result
-}
-
-/// Append the per-spoke public key to the target user's authorized_keys over motherbee's key
-/// access, WITHOUT disturbing the motherbee bootstrap key (dedups only the per-spoke material
-/// for idempotency). Unrestricted (no `from=`) — recovery access is by possession of the key.
-fn append_spoke_authorized_key_with_key(
-    address: &str,
-    key_path: &Path,
-    user: &str,
-    spoke_pub: &str,
-) -> Result<(), OrchestratorError> {
-    // Validate the key format up front (a malformed key would silently no-op the sshd match).
-    spoke_pub
-        .split_whitespace()
-        .nth(1)
-        .ok_or_else(|| "invalid spoke public key format: missing key material".to_string())?;
-    let entry =
-        format!("no-port-forwarding,no-X11-forwarding,no-agent-forwarding,no-pty {spoke_pub}");
-    // Dedup by the recovery-key marker (never the MB key's comment) so a retried or
-    // previously-failed persist never accumulates orphaned recovery keys, and the MB bootstrap
-    // key — the live channel here — is always preserved.
-    let script = format!(
-        "set -euo pipefail\n\
-user='{user}'\n\
-home_dir=\"$(getent passwd \"$user\" | cut -d: -f6)\"\n\
-if [[ -z \"$home_dir\" ]]; then home_dir=\"/home/$user\"; fi\n\
-ssh_dir=\"$home_dir/.ssh\"\n\
-auth_keys=\"$ssh_dir/authorized_keys\"\n\
-mkdir -p \"$ssh_dir\"\n\
-chown \"$user:$user\" \"$ssh_dir\"\n\
-chmod 700 \"$ssh_dir\"\n\
-touch \"$auth_keys\"\n\
-grep -Fv '{marker}' \"$auth_keys\" > \"$auth_keys.tmp\" || true\n\
-mv \"$auth_keys.tmp\" \"$auth_keys\"\n\
-printf '%s\\n' '{entry}' >> \"$auth_keys\"\n\
-chown \"$user:$user\" \"$auth_keys\"\n\
-chmod 600 \"$auth_keys\"\n",
-        user = user,
-        marker = SPOKE_RECOVERY_KEY_COMMENT,
-        entry = shell_single_quote(&entry),
-    );
-    let cmd = sudo_wrap(&format!("bash -lc '{}'", shell_single_quote(&script)));
-    ssh_with_key(address, key_path, &cmd, user)?;
-    Ok(())
-}
-
-/// Store a per-spoke SSH private key in SY.vault under `ssh/<hive_id>` via the SY.admin
-/// `vault_put` action over the mesh (the orchestrator has no in-process VaultClient; it reaches
-/// the vault exactly as purge_vault_secrets_for_ilk does). NEVER log the params — they carry
-/// the private key. resource_type "ssh" is an accepted Custom type (nothing auto-consumes it).
-#[cfg(not(test))]
-async fn vault_put_spoke_ssh_key(
-    state: &OrchestratorState,
-    hive_id: &str,
-    priv_pem: &str,
-) -> Result<String, OrchestratorError> {
-    let admin_target = teardown_admin_target();
-    let key = format!("ssh:{hive_id}");
-    // Pool secret (NO owner_node): the root-tenant pool is readable by SY system callers and by
-    // the admin, so an operator can retrieve the recovery key via the admin API during a
-    // break-glass. Scoping it to owner_node=SY.orchestrator makes it orchestrator-ILK-only —
-    // even the admin/operator gets UNAUTHORIZED — which defeats the whole recovery purpose.
-    let params = serde_json::json!({
-        "key": key,
-        "value": { "private_key": priv_pem, "format": "openssh" },
-        "metadata": {
-            "resource_type": "ssh",
-            "tenant_id": fluxbee_sdk::DEFAULT_ROOT_TENANT_ID,
-            "description": format!("per-spoke recovery ssh key for {hive_id}"),
-        }
-    });
-    let resp = orchestrator_admin_command(
-        state,
-        AdminCommandRequest {
-            admin_target: &admin_target,
-            action: "vault_put",
-            target: Some(PRIMARY_HIVE_ID),
-            params,
-            request_id: None,
-            timeout: Duration::from_secs(15),
-        },
-    )
-    .await?;
-    if resp.status != "ok" {
-        return Err(format!(
-            "vault_put {key} failed: {}",
-            resp.error_code.unwrap_or_else(|| "UNKNOWN".to_string())
-        )
-        .into());
-    }
-    Ok(key)
-}
-
-#[cfg(test)]
-async fn vault_put_spoke_ssh_key(
-    _state: &OrchestratorState,
-    hive_id: &str,
-    _priv_pem: &str,
-) -> Result<String, OrchestratorError> {
-    Ok(format!("ssh:{hive_id}"))
-}
-
-struct SpokeKeyPersistResult {
-    restrict_ssh_applied: bool,
-    restrict_ssh_mode: String,
-    /// Whether password auth was actually turned off AND verified — a measured fact,
-    /// not an echo of the request. This path hardens unconditionally, so it reports
-    /// `true` even when the caller never passed `harden_ssh`.
-    harden_ssh_applied: bool,
-    ssh_bootstrap_revoked: bool,
-    ssh_access: String,
-    spoke_key_vault_ref: Option<String>,
-}
-
-/// `ssh_access=key_only_persist` finalize (replaces the controls + revoke pair for the three
-/// add_*_hive flows when opted in). Ordering IS the safety: seed a per-spoke key, disable
-/// password auth, then VERIFY the per-spoke key logs in and can `sudo -n` BEFORE removing
-/// motherbee's key. If the verify fails, motherbee's key is KEPT (no revoke) so the spoke is
-/// never stranded. On success the private half is stored in the vault (fail-soft) and only the
-/// motherbee bootstrap key is removed (sudoers + the per-spoke key are kept for recovery).
-async fn finalize_spoke_key_persist(
-    state: &OrchestratorState,
-    address: &str,
-    mb_key_path: &Path,
-    user: &str,
-    mb_pub_key: &str,
-    hive_id: &str,
-) -> Result<SpokeKeyPersistResult, OrchestratorError> {
-    let (priv_pem, spoke_pub) = generate_spoke_ssh_keypair()?;
-
-    append_spoke_authorized_key_with_key(address, mb_key_path, user, &spoke_pub)?;
-
-    disable_remote_password_auth_with_access(address, mb_key_path, user)
-        .map_err(|err| format!("ssh hardening failed: {err}"))?;
-    verify_remote_ssh_hardening_with_access(address, mb_key_path, user)
-        .map_err(|err| format!("ssh hardening verification failed: {err}"))?;
-
-    // VERIFY-BEFORE-REVOKE via the PER-SPOKE key: write the private half to a 0600 scratch,
-    // probe `sudo -n`, then ALWAYS remove the scratch — even if the write itself fails (so the
-    // private key never lingers on disk on an error path).
-    let verify_dir = spoke_key_scratch_dir("verify");
-    fs::create_dir_all(&verify_dir)?;
-    let _ = fs::set_permissions(&verify_dir, fs::Permissions::from_mode(0o700));
-    let verify_key = verify_dir.join("id");
-    let per_spoke_probe = (|| -> Result<bool, OrchestratorError> {
-        fs::write(&verify_key, &priv_pem)?;
-        let _ = fs::set_permissions(&verify_key, fs::Permissions::from_mode(0o600));
-        Ok(verify_remote_key_access_after_hardening(address, &verify_key, user).is_ok())
-    })();
-    let _ = fs::remove_dir_all(&verify_dir);
-    let per_spoke_ok = per_spoke_probe?;
-
-    if !per_spoke_ok {
-        tracing::warn!(
-            hive_id = hive_id,
-            "key_only_persist: per-spoke key did not verify; KEEPING the motherbee bootstrap key (no lock-out)"
-        );
-        return Ok(SpokeKeyPersistResult {
-            restrict_ssh_applied: false,
-            restrict_ssh_mode: "key_only_persist".to_string(),
-            // The harden above already succeeded and verified before we got here:
-            // this degraded path is about the per-spoke key, not about password auth.
-            harden_ssh_applied: true,
-            ssh_bootstrap_revoked: false,
-            ssh_access: "degraded_kept_bootstrap".to_string(),
-            spoke_key_vault_ref: None,
-        });
-    }
-
-    let spoke_key_vault_ref = match vault_put_spoke_ssh_key(state, hive_id, &priv_pem).await {
-        Ok(reference) => Some(reference),
-        Err(err) => {
-            tracing::warn!(hive_id = hive_id, error = %err, "key_only_persist: vault_put of the per-spoke key failed; the key is live on the spoke but not backed up in the vault");
-            None
-        }
-    };
-
-    let ssh_bootstrap_revoked = match revoke_bootstrap_authorized_key_with_key(
-        address,
-        mb_key_path,
-        user,
-        mb_pub_key,
-    ) {
-        Ok(()) => true,
-        Err(err) => {
-            tracing::warn!(hive_id = hive_id, error = %err, "key_only_persist: failed to remove the motherbee bootstrap key; it may remain in authorized_keys");
-            false
-        }
-    };
-
-    Ok(SpokeKeyPersistResult {
-        restrict_ssh_applied: false,
-        restrict_ssh_mode: "key_only_persist".to_string(),
-        harden_ssh_applied: true,
-        ssh_bootstrap_revoked,
-        ssh_access: "key_only".to_string(),
-        spoke_key_vault_ref,
-    })
 }
 
 fn apply_add_hive_ssh_controls_after_finalize(
@@ -27642,34 +27076,93 @@ mod tests {
         );
     }
 
+    /// D32: a request that still asks for a post-join SSH posture is refused, whatever it asks.
     #[test]
-    fn resolve_add_hive_ssh_access_defaults_to_revoke_and_opts_in() {
-        // Absent / unknown / explicit "revoke" all keep today's SO-02 revoke-everything.
-        assert_eq!(
-            resolve_add_hive_ssh_access(&serde_json::json!({})),
-            SshAccess::Revoke
+    fn add_hive_refuses_the_removed_ssh_access() {
+        assert!(reject_removed_add_hive_fields(&serde_json::json!({})).is_ok());
+        for value in [
+            serde_json::json!("revoke"),
+            serde_json::json!("key_only_persist"),
+            serde_json::json!(1),
+        ] {
+            let err = reject_removed_add_hive_fields(&serde_json::json!({ "ssh_access": value }))
+                .unwrap_err();
+            assert!(err.contains("D32"), "{err}");
+        }
+    }
+
+    /// D32: SSH exists only inside `add_hive`. Walking the callers of every function that spawns
+    /// ssh or scp must end in the join (the three flows and the background runner that wraps
+    /// them, which revokes after a failed join). Any other root (the boot, the watchdog, a
+    /// reconcile loop) fails here; the boot-time TLS reconcile was one.
+    #[test]
+    fn ssh_happens_only_inside_add_hive() {
+        let src = include_str!("sy_orchestrator.rs");
+        let code: String = src[..src.find("\nmod tests {").expect("tests module")]
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let fn_re =
+            Regex::new(r"(?m)^\s*(?:pub(?:\([^)]*\))? )?(?:async )?fn ([a-z_0-9]+)").unwrap();
+        let fns: Vec<(usize, String)> = fn_re
+            .captures_iter(&code)
+            .map(|c| (c.get(0).unwrap().start(), c[1].to_string()))
+            .collect();
+        let enclosing = |pos: usize| -> Option<String> {
+            fns.iter()
+                .rev()
+                .find(|(start, _)| *start <= pos)
+                .map(|(_, name)| name.clone())
+        };
+        let callers_of = |name: &str| -> BTreeSet<String> {
+            let call = Regex::new(&format!(r"\b{}\s*\(", regex::escape(name))).unwrap();
+            call.find_iter(&code)
+                .filter_map(|m| enclosing(m.start()))
+                .filter(|caller| caller != name)
+                .collect()
+        };
+        let mut frontier: Vec<String> = [
+            "Command::new(\"ssh\")",
+            "Command::new(\"scp\")",
+            ".arg(\"ssh\")",
+        ]
+        .iter()
+        .flat_map(|spawn| {
+            code.match_indices(spawn)
+                .filter_map(|(at, _)| enclosing(at))
+                .collect::<Vec<_>>()
+        })
+        .collect();
+        assert!(
+            !frontier.is_empty(),
+            "no ssh spawn found: the walk would prove nothing"
         );
-        assert_eq!(
-            resolve_add_hive_ssh_access(&serde_json::json!({"ssh_access": "revoke"})),
-            SshAccess::Revoke
+        let join = [
+            "add_hive_flow",
+            "add_egress_hive_flow",
+            "add_ingress_hive_flow",
+            "run_background_join",
+        ];
+        let mut seen = BTreeSet::new();
+        let mut outside_the_join = BTreeSet::new();
+        while let Some(function) = frontier.pop() {
+            if !seen.insert(function.clone()) || join.contains(&function.as_str()) {
+                continue;
+            }
+            let callers = callers_of(&function);
+            if callers.is_empty() {
+                outside_the_join.insert(function);
+            }
+            frontier.extend(callers);
+        }
+        assert!(
+            outside_the_join.is_empty(),
+            "SSH is reachable from outside add_hive through: {outside_the_join:?}"
         );
-        assert_eq!(
-            resolve_add_hive_ssh_access(&serde_json::json!({"ssh_access": "bogus"})),
-            SshAccess::Revoke
-        );
-        assert_eq!(
-            resolve_add_hive_ssh_access(&serde_json::json!({"ssh_access": 1})),
-            SshAccess::Revoke
-        );
-        // Only the exact string (case-insensitive, trimmed) opts into persistence.
-        assert_eq!(
-            resolve_add_hive_ssh_access(&serde_json::json!({"ssh_access": "key_only_persist"})),
-            SshAccess::KeyOnlyPersist
-        );
-        assert_eq!(
-            resolve_add_hive_ssh_access(&serde_json::json!({"ssh_access": " KEY_ONLY_PERSIST "})),
-            SshAccess::KeyOnlyPersist
-        );
+        for flow in join {
+            assert!(seen.contains(flow), "the walk never reached {flow}");
+        }
     }
 
     #[test]

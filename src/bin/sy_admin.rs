@@ -5692,20 +5692,13 @@ fn authorize_cloud_relay(
     }
     // All OTHER callers: a non-exposed action is not this gate's concern (other per-action gates /
     // trusted internal paths apply). The exposed provisioning actions may originate over the mesh
-    // ONLY from IO.cloud (handled above) or, for vault_put, the co-resident primary orchestrator.
+    // ONLY from IO.cloud (handled above), apart from an orchestrator's node teardown (below).
     if !IO_CLOUD_EXPOSED_ACTIONS.contains(&action) {
         return Ok(());
     }
     let Some(caller) = caller_l2_name else {
         return Ok(());
     };
-    // The primary orchestrator persists per-spoke recovery SSH keys during add_hive
-    // (ssh_access=key_only_persist) via vault_put. It is a trusted system node on the
-    // primary hive, co-resident with admin — allow it, but ONLY for vault_put (never the other
-    // Fluxbee Cloud provisioning relay actions create_tenant / run_node).
-    if action == "vault_put" && caller == format!("SY.orchestrator@{admin_hive}") {
-        return Ok(());
-    }
     // Node teardown (kill_node / remove_node_instance with purge_instance) marks the node's ILK
     // through delete_ilk and then purges it. delete_ilk joined the Cloud surface on 2026-09-28 (mark
     // only), and without this exemption the gate silently refused the orchestrators' teardown,
@@ -10031,11 +10024,6 @@ fn admin_action_body_optional_fields(action: &str) -> Vec<serde_json::Value> {
                 "ssh_key",
                 "string",
                 "Optional bootstrap SSH PRIVATE key (PEM). Key-first channel for a fresh box: on a stock cloud image (authorized key injected by cloud-init, server PasswordAuthentication OFF) this seeds the mesh bootstrap key without needing server-side password auth. Assumes ssh_user has passwordless sudo (cloud-init default) or that ssh_password is also supplied for sudo escalation. Never logged, never stored.",
-            ),
-            admin_action_body_field(
-                "ssh_access",
-                "string",
-                "Post-join SSH posture. Default \"revoke\" (SSH is bootstrap-only: the motherbee key + sudoers grant are stripped after join). \"key_only_persist\" instead leaves SSH open key-only (password off) via a per-spoke recovery key stored in SY.vault under ssh:<hive_id>.",
             ),
             admin_action_body_field(
                 "role",
@@ -15091,9 +15079,9 @@ mod tests {
             assert!(
                 authorize_cloud_relay(Some("AI.worker@motherbee"), action, "motherbee").is_err()
             );
-            // The primary orchestrator may relay ONLY vault_put (per-spoke recovery key during
-            // add_hive); it is denied the other exposed actions (create_tenant / run_node).
-            if *action == "vault_put" || *action == "delete_ilk" {
+            // An orchestrator only for its node teardown (delete_ilk). Never vault_put: the
+            // per-spoke SSH recovery key it stored is gone with key_only_persist (D32).
+            if *action == "delete_ilk" {
                 assert!(authorize_cloud_relay(
                     Some("SY.orchestrator@motherbee"),
                     action,

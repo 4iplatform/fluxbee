@@ -45,9 +45,10 @@ Puntos clave (todos verificados contra el código):
 - **DB centralizada en la motherbee.** Los spokes NO tienen PostgreSQL. `SY.storage` y
   `SY.vault` corren solo en motherbee; `SY.identity` corre en motherbee (primary, escribe DB) y
   en worker (réplica en SHM, sin DB).
-- **SSH es solo bootstrap.** Tras un join exitoso el default (`ssh_access:"revoke"`) borra la
-  llave de bootstrap de la motherbee y el grant de sudoers del spoke. La gestión diaria es por
-  socket del router + dist-sync, no por SSH.
+- **SSH es solo bootstrap (D32).** Fluxbee usa SSH solo dentro de `add_hive`: al terminar el join
+  borra la llave de bootstrap de la motherbee y el grant de sudoers del spoke, siempre. La gestión
+  diaria es por socket del router + dist-sync, nunca por SSH. Un spoke que pierde su certificado
+  de malla se vuelve a unir (`DELETE /hives/{id}` + `POST /hives`).
 - **WAN mTLS requerido por default** (`wan.mtls: required` en el template de motherbee).
 
 ---
@@ -252,7 +253,6 @@ Ruteo interno: `SY.admin` → `SY.orchestrator@motherbee` (action `add_hive`).
 |-------|------|-------------|
 | `ssh_password` | string | Password admin para el bootstrap de una caja vacía. Solo se consulta si la llave de bootstrap aún no está sembrada y no se pasó `ssh_key`. Nunca se loguea ni se persiste. |
 | `ssh_key` | string | Llave privada SSH de bootstrap (PEM, **sin cifrar**). Canal key-first para una imagen cloud (authorized key inyectada por cloud-init, `PasswordAuthentication` OFF en el server): siembra la llave de la malla sin password del server. Rechaza llaves con passphrase (`ENCRYPTED`). Nunca se loguea ni se persiste. |
-| `ssh_access` | string | Postura SSH post-join. `revoke` (default) = SSH es solo-bootstrap: se borra la llave de la motherbee + el grant de sudoers. `key_only_persist` = deja SSH abierto solo-por-llave (password off) vía una **llave per-spoke de recuperación** guardada en `SY.vault` bajo `ssh:<hive_id>`. |
 | `role` | string | `worker` (default), `egress`, `ingress`. |
 | `egress` | object | Requerido si `role=egress`: `lan_cidr` (req), `wan_iface` (req), `lan_iface` (req), `edge_ip` (opt, default = primera IP usable de `lan_cidr`), `ipv6` (opt, solo `"blocked"`). |
 | `ingress` | object | Requerido si `role=ingress`: `listen` (req, `host:port`), `tls_vault_key` + `vault_hive` para HTTPS, o `allow_plaintext=true` solo para un listener de desarrollo explícito fuera de :443. |
@@ -272,8 +272,12 @@ El orchestrator siempre intenta **primero la llave** (`/var/lib/fluxbee/ssh/moth
      `PasswordAuthentication=no`), o
    - `ssh_password` (canal password), o
    - si no hay ninguno → error `SSH_KEY_FAILED` (nunca hay fallback hardcodeado).
-3. Asegura el sudoers del orchestrator remoto, verifica `sudo -n`, y ya opera todo por la llave.
-4. Empuja los binarios del core (desde `dist/core/bin` + manifiesto), escribe `hive.yaml` del
+3. Verifica que la llave abre la caja y **espera a que la caja se asiente** (A-52): mientras
+   systemd no terminó de arrancar, o corre una etapa de cloud-init o un job diario de apt
+   (unattended-upgrades), hasta 15 min en total; el join muestra la fase `waiting_for_host`. Si
+   sigue ocupada al final responde `HOST_NOT_SETTLED` (reintentable, la llave queda).
+4. Asegura el sudoers del orchestrator remoto, verifica `sudo -n`, y ya opera todo por la llave.
+5. Empuja los binarios del core (desde `dist/core/bin` + manifiesto), escribe `hive.yaml` del
    spoke (uplink a la motherbee, sin `wan.listen`, sin `sy-admin`), instala units y arranca
    `sy-orchestrator` remoto, que conecta por WAN.
 
@@ -283,16 +287,10 @@ para que el retry siga siendo key-first en vez de dejar el spoke a medio-hacer.
 
 ### 5.4 Postura post-join
 
-- **`revoke` (default):** tras join exitoso, `best_effort_revoke_bootstrap` borra la llave de la
-  motherbee de `authorized_keys` del spoke y remueve el grant de sudoers. El spoke queda sin
-  acceso SSH permanente. La reconciliación posterior llega por socket del router.
-- **`key_only_persist`:** `finalize_spoke_key_persist` genera una llave **per-spoke** nueva,
-  la agrega a `authorized_keys`, apaga password auth, y hace un **verify-before-revoke**: escribe
-  la privada a un scratch 0600, prueba `sudo -n` con ella, y solo entonces persiste la privada en
-  `SY.vault` bajo `ssh:<hive_id>` y borra la llave de la motherbee. Si el verify falla, **mantiene
-  la llave de la motherbee** (nunca deja al spoke sin acceso) y responde en modo
-  `degraded_kept_bootstrap`. La reconciliación de un hive `key_only_persist` lee esa llave
-  per-spoke del vault (cierra la contradicción reconcile↔revoke).
+Tras el join, la motherbee borra su llave de `authorized_keys` del spoke y remueve el grant de
+sudoers. El spoke queda sin acceso SSH de Fluxbee; todo lo posterior llega por socket del router y
+dist-sync (D32). El modo `ssh_access=key_only_persist` (llave per-spoke de recuperación en el
+vault) se eliminó: un pedido con `ssh_access` se rechaza con `INVALID_REQUEST`.
 
 ### 5.5 Egress e ingress (particularidades)
 
@@ -393,10 +391,8 @@ curl -sS -X POST "$BASE/hives" -H 'content-type: application/json' -d "{
   \"address\": \"10.0.0.30\",
   \"ssh_user\": \"ubuntu\",
   \"ssh_key\": \"$(sed ':a;N;$!ba;s/\n/\\n/g' ~/.ssh/cloud_image_key)\",
-  \"role\": \"worker\",
-  \"ssh_access\": \"key_only_persist\"
+  \"role\": \"worker\"
 }" | jq .
-# key_only_persist → llave per-spoke de recuperación queda en SY.vault bajo ssh:worker-2
 
 # --- 3. Egress (NAT saliente) ---
 curl -sS -X POST "$BASE/hives" -H 'content-type: application/json' -d '{
@@ -463,23 +459,17 @@ Un spoke es una **caja Linux limpia con SOLO SSH**, bootstrapeada por la motherb
   inyectada). Una imagen/plantilla propia debe habilitar sshd + crear el usuario (ver
   `lab/template-prep.sh` para el patrón del lab).
 
-### 8.2 Recuperar un spoke `key_only_persist`
-La llave per-spoke de recuperación está en `SY.vault` bajo `ssh:<hive_id>`. La reconciliación del
-orchestrator la usa automáticamente para alcanzar el spoke (el bootstrap de la motherbee ya fue
-revocado). Para acceso manual, materializarla desde el vault a un scratch 0600 y
-`ssh -i <scratch> <ssh_user>@<address>`.
+### 8.2 Recuperar un spoke (SSH cerrado)
+No hay llave permanente (D32). Recuperar por consola out-of-band (hipervisor): dar de nuevo acceso
+de bootstrap al `ssh_user` (su llave o password) y volver a unirlo por API, como una máquina nueva
+(`DELETE /hives/{id}` seguido de `POST /hives`).
 
-### 8.3 Recuperar un spoke `revoke` (SSH cerrado)
-No hay llave permanente. Recuperar por consola out-of-band (hipervisor), reinstalar la pública de
-la motherbee en `authorized_keys` del `ssh_user`, y re-reconciliar por API
-(`DELETE /hives/{id}` seguido de `POST /hives` con las mismas credenciales).
-
-### 8.4 El hive no queda ready tras firstboot
+### 8.3 El hive no queda ready tras firstboot
 `fluxbee-firstboot` es idempotente: re-correrlo. Revisar postgres (`systemctl status postgresql`),
 que el secreto esté en el vault (`GET /hives/<hive>/vault/secrets`), y los logs
 (`journalctl -u sy-orchestrator -f`, `-u sy-vault`, `-u sy-storage`).
 
-### 8.5 Comandos de diagnóstico
+### 8.4 Comandos de diagnóstico
 ```bash
 journalctl -u sy-orchestrator -f
 systemctl is-active rt-gateway sy-orchestrator sy-identity sy-admin sy-vault sy-storage
