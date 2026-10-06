@@ -7690,7 +7690,9 @@ fn error_code_to_http_status(error_code: &str) -> u16 {
         | "RESTART_FAILED"
         | "STORAGE_ERROR"
         | "ENCRYPTION_ERROR"
-        | "TRANSPORT_ERROR" => 502,
+        | "TRANSPORT_ERROR"
+        // add_hive could not check whether the box had settled (A-52); not about settling.
+        | "HOST_SETTLE_CHECK_FAILED" => 502,
         "SHM_NOT_FOUND"
         | "RUNTIME_MANIFEST_MISSING"
         | "MISSING_WAN_LISTEN"

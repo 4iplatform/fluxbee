@@ -797,7 +797,6 @@ struct SystemUpdateRequest {
 
 #[tokio::main]
 async fn main() -> Result<(), OrchestratorError> {
-    let _ = PROCESS_STARTED.set(std::time::SystemTime::now());
     if cfg!(not(target_os = "linux")) {
         eprintln!("sy_orchestrator supports only Linux targets.");
         std::process::exit(1);
@@ -919,6 +918,7 @@ async fn main() -> Result<(), OrchestratorError> {
         &state.blob,
         &state.dist,
         state.is_motherbee,
+        &state.hive_id,
     )?;
     write_pid(&run_dir)?;
 
@@ -5454,6 +5454,7 @@ fn ensure_dirs(
     blob: &BlobRuntimeConfig,
     dist: &DistRuntimeConfig,
     is_motherbee: bool,
+    hive_id: &str,
 ) -> Result<(), OrchestratorError> {
     let storage_root = json_router::paths::storage_root_dir();
     let opa_root = storage_root.join("opa");
@@ -5522,6 +5523,17 @@ fn ensure_dirs(
             ensure_owned_tree(&dist.path, &service_user)?;
         }
     }
+    report_unusable_managed_dirs(
+        hive_id,
+        &[
+            blob.path.clone(),
+            blob.path.join("active"),
+            blob.path.join("staging"),
+            blob.path.join("public"),
+            blob.sync_data_dir.clone(),
+            dist.path.clone(),
+        ],
+    );
     fs::create_dir_all(runtimes_root())?;
     fs::create_dir_all(Path::new(DIST_CORE_BIN_SOURCE_DIR))?;
     fs::create_dir_all(Path::new(DIST_VENDOR_ROOT_DIR))?;
@@ -5611,24 +5623,52 @@ fn linux_user_ids(user: &str) -> Result<(u32, u32), OrchestratorError> {
 /// How long a join waits, in all, for a fresh box to settle (FINDINGS A-52).
 const FIRST_BOOT_WAIT_SECS: u64 = 900;
 
-/// The remote script that waits, at most `secs` seconds, while something that restarts sshd or
-/// reboots the box is still running there (FINDINGS A-52): cloud-init (on a fresh clone it runs a
-/// dist-upgrade at first boot, which restarts sshd, and reboots when the upgrade asks for it) and
-/// apt's daily jobs (unattended-upgrades, which a box that missed its schedule runs right after
-/// it boots). A join running alongside either loses its SSH channel half-way. It waits only while
-/// one of them RUNS: a box whose cloud-init will not run this boot (disabled, masked) says "not
-/// started" for ever, and `cloud-init status --wait` would wait on that. A oneshot unit is
-/// "activating" while it runs, so any state but inactive/failed counts. Exit 124 says what is
-/// still running.
+/// How long past its deadline this side waits for one run before it kills it: the script's
+/// deadline is the box's clock, which can step.
+const FIRST_BOOT_RUN_GRACE_SECS: u64 = 60;
+
+/// The units that can restart sshd or reboot the box while they run: cloud-init's stages (on a
+/// fresh clone the first boot runs a dist-upgrade, which restarts sshd, and reboots when the
+/// upgrade asks for it; `cloud-init-network` is `cloud-init`'s name from 24.3) and apt's daily
+/// jobs (unattended-upgrades, which a box that missed its schedule runs right after it boots).
+const FIRST_BOOT_UNITS: &[&str] = &[
+    "cloud-init-local",
+    "cloud-init",
+    "cloud-init-network",
+    "cloud-config",
+    "cloud-final",
+    "apt-daily",
+    "apt-daily-upgrade",
+];
+
+/// The remote script that waits, at most `secs` seconds, while the box is still booting or one of
+/// `FIRST_BOOT_UNITS` runs (FINDINGS A-52). It asks systemd, not `cloud-init status`, which says
+/// "not started" for ever on a box whose cloud-init will not run this boot, and "error" while
+/// later stages still run once an earlier one recorded an error.
+/// - `is-system-running` says `starting` until the boot transaction is done, which covers the gap
+///   between two cloud-init stages, when the next one is queued and not yet running; `stopping`
+///   means a reboot is under way.
+/// - A oneshot unit is `activating` while it runs; `active`, `inactive`, `failed` and `unknown`
+///   (an older systemd's answer for a missing unit) are settled.
+/// - Any other answer, an empty one included, counts as busy.
+///
+/// No sudo: systemctl answers any user. Exit 124 names what still runs.
 fn first_boot_wait_script(secs: u64) -> String {
+    let units = FIRST_BOOT_UNITS.join(" ");
     format!(
         "end=$(( $(date +%s) + {secs} )); \
          while :; do \
          busy=; \
-         if command -v cloud-init >/dev/null 2>&1; then \
-         case \"$(timeout 30 cloud-init status 2>/dev/null)\" in *running*) busy=cloud-init ;; esac; \
-         fi; \
-         if [ -z \"$busy\" ] && systemctl is-active apt-daily.service apt-daily-upgrade.service 2>/dev/null | grep -qvx -e inactive -e failed -e unknown; then busy=apt-daily; fi; \
+         case \"$(timeout 30 systemctl is-system-running 2>/dev/null)\" in \
+         running|degraded|maintenance|offline) ;; \
+         *) busy=boot ;; \
+         esac; \
+         if [ -z \"$busy\" ]; then for u in {units}; do \
+         case \"$(timeout 30 systemctl is-active \"$u.service\" 2>/dev/null)\" in \
+         active|inactive|failed|unknown) ;; \
+         *) busy=$u; break ;; \
+         esac; \
+         done; fi; \
          if [ -z \"$busy\" ]; then exit 0; fi; \
          if [ \"$(date +%s)\" -ge \"$end\" ]; then echo \"still running: $busy\"; exit 124; fi; \
          sleep 5; \
@@ -5637,74 +5677,187 @@ fn first_boot_wait_script(secs: u64) -> String {
 }
 
 fn first_boot_wait_command(secs: u64) -> String {
-    format!("sudo -n /bin/bash -lc '{}'", first_boot_wait_script(secs))
+    format!("/bin/bash -c '{}'", first_boot_wait_script(secs))
+}
+
+/// How one run of the wait script over SSH ended.
+struct FirstBootRun {
+    code: Option<i32>,
+    stdout: String,
+    stderr: String,
+}
+
+/// Why a join's wait for the box failed.
+#[derive(Debug, PartialEq)]
+enum FirstBootWaitError {
+    /// Something still runs at the deadline, or the box could not be reached again before it.
+    NotSettled(String),
+    /// The check itself failed, which says nothing about the box settling.
+    CheckFailed(String),
+}
+
+/// The wait loop, apart from SSH so it can be tested: `run` runs the script for at most the given
+/// seconds. ssh exits 255 for every way it loses the box: a refused connection, a reboot under
+/// the session ("closed by remote host"), a silent path cut by the keepalive (nothing on stderr at
+/// `LogLevel=ERROR`), early boot's nologin ("Permission denied"). The key opened the box moments
+/// earlier, so each of those is tried again until the deadline, never past it. The script's own
+/// exit codes are final.
+fn wait_first_boot_with(
+    total_secs: u64,
+    retry_delay: Duration,
+    mut run: impl FnMut(u64) -> std::io::Result<FirstBootRun>,
+) -> Result<(), FirstBootWaitError> {
+    let deadline = Instant::now() + Duration::from_secs(total_secs);
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now()).as_secs();
+        let outcome = run(remaining)
+            .map_err(|err| FirstBootWaitError::CheckFailed(format!("could not run ssh: {err}")))?;
+        let detail = if outcome.stderr.trim().is_empty() {
+            outcome.stdout.trim().to_string()
+        } else {
+            outcome.stderr.trim().to_string()
+        };
+        match outcome.code {
+            Some(0) => return Ok(()),
+            Some(124) => {
+                return Err(FirstBootWaitError::NotSettled(format!(
+                    "the box is still settling after {total_secs} s ({}); retry once it settles",
+                    outcome.stdout.trim()
+                )))
+            }
+            Some(255) | None => {
+                if Instant::now() >= deadline {
+                    return Err(FirstBootWaitError::NotSettled(format!(
+                        "the box could not be reached again within {total_secs} s ({detail}); retry once it is up"
+                    )));
+                }
+                tracing::warn!(detail = %detail, "lost the box while it settles (it may be rebooting); trying again");
+                std::thread::sleep(retry_delay);
+            }
+            Some(code) => {
+                return Err(FirstBootWaitError::CheckFailed(format!(
+                    "the settle check exited {code}: {detail}"
+                )))
+            }
+        }
+    }
+}
+
+/// One run of the wait script over SSH, with keepalives, and bounded on this side too.
+fn run_first_boot_check(
+    address: &str,
+    key_path: &Path,
+    user: &str,
+    secs: u64,
+) -> std::io::Result<FirstBootRun> {
+    let mut child = Command::new("ssh")
+        .arg("-i")
+        .arg(key_path)
+        .arg("-o")
+        .arg("IdentitiesOnly=yes")
+        .arg("-o")
+        .arg("BatchMode=yes")
+        .arg("-o")
+        .arg("PreferredAuthentications=publickey")
+        .arg("-o")
+        .arg("PasswordAuthentication=no")
+        .arg("-o")
+        .arg("LogLevel=ERROR")
+        .arg("-o")
+        .arg("StrictHostKeyChecking=no")
+        .arg("-o")
+        .arg("UserKnownHostsFile=/dev/null")
+        .arg("-o")
+        .arg("ConnectTimeout=10")
+        .arg("-o")
+        .arg("ServerAliveInterval=15")
+        .arg("-o")
+        .arg("ServerAliveCountMax=4")
+        .arg(format!("{user}@{address}"))
+        .arg(first_boot_wait_command(secs))
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    let limit = Instant::now() + Duration::from_secs(secs + FIRST_BOOT_RUN_GRACE_SECS);
+    loop {
+        if let Some(status) = child.try_wait()? {
+            let mut stdout = String::new();
+            let mut stderr = String::new();
+            if let Some(mut out) = child.stdout.take() {
+                let _ = out.read_to_string(&mut stdout);
+            }
+            if let Some(mut err) = child.stderr.take() {
+                let _ = err.read_to_string(&mut stderr);
+            }
+            return Ok(FirstBootRun {
+                code: status.code(),
+                stdout,
+                stderr,
+            });
+        }
+        if Instant::now() >= limit {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Ok(FirstBootRun {
+                code: Some(124),
+                stdout: "the run outlived its deadline on this side".to_string(),
+                stderr: String::new(),
+            });
+        }
+        std::thread::sleep(Duration::from_millis(500));
+    }
 }
 
 /// Waits, before a join changes the box, until it has settled (FINDINGS A-52), at most
-/// `FIRST_BOOT_WAIT_SECS` in all. cloud-init may reboot the box while it settles, so a dropped or
-/// refused connection is tried again until that deadline, never past it. The session sends
-/// keepalives: it is silent while it waits, and a path that died silently would otherwise hold the
-/// join (and its topology lock) until the kernel gives up on the connection, two hours later.
+/// `FIRST_BOOT_WAIT_SECS` in all.
 fn wait_remote_first_boot(
     address: &str,
     key_path: &Path,
     user: &str,
-) -> Result<(), OrchestratorError> {
-    let deadline = Instant::now() + Duration::from_secs(FIRST_BOOT_WAIT_SECS);
+) -> Result<(), FirstBootWaitError> {
     tracing::info!(
         target = address,
         "waiting for the box to settle (cloud-init, apt daily jobs)"
     );
-    loop {
-        let remaining = deadline.saturating_duration_since(Instant::now()).as_secs();
-        let mut cmd = Command::new("ssh");
-        cmd.arg("-i")
-            .arg(key_path)
-            .arg("-o")
-            .arg("IdentitiesOnly=yes")
-            .arg("-o")
-            .arg("BatchMode=yes")
-            .arg("-o")
-            .arg("PreferredAuthentications=publickey")
-            .arg("-o")
-            .arg("PasswordAuthentication=no")
-            .arg("-o")
-            .arg("LogLevel=ERROR")
-            .arg("-o")
-            .arg("StrictHostKeyChecking=no")
-            .arg("-o")
-            .arg("UserKnownHostsFile=/dev/null")
-            .arg("-o")
-            .arg("ConnectTimeout=10")
-            .arg("-o")
-            .arg("ServerAliveInterval=15")
-            .arg("-o")
-            .arg("ServerAliveCountMax=4")
-            .arg(format!("{user}@{address}"))
-            .arg(first_boot_wait_command(remaining));
-        let output = cmd.output()?;
-        if output.status.success() {
-            return Ok(());
-        }
-        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
-        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-        if output.status.code() == Some(124) {
-            return Err(format!(
-                "the box is still settling after {FIRST_BOOT_WAIT_SECS} s ({stdout}); retry once it settles (HANDBOOK §3.4)"
-            )
-            .into());
-        }
-        if remaining > 0 && is_transient_ssh_error(&stderr) {
-            tracing::warn!(
-                target = address,
-                error = %stderr,
-                "lost the box while it settles (it may be rebooting); trying again"
-            );
-            std::thread::sleep(Duration::from_secs(5));
-            continue;
-        }
-        let detail = if stderr.is_empty() { stdout } else { stderr };
-        return Err(format!("could not check whether the box has settled: {detail}").into());
+    wait_first_boot_with(FIRST_BOOT_WAIT_SECS, Duration::from_secs(5), |secs| {
+        run_first_boot_check(address, key_path, user, secs)
+    })
+}
+
+/// Before a join changes anything on the box beyond the motherbee key it just seeded: check that
+/// the key opens it, then wait for the box to settle (FINDINGS A-52). The join shows the phase
+/// `waiting_for_host` meanwhile. Not settled is retryable (the key stays, so the retry is
+/// key-first); a failed check is not.
+fn wait_for_host_to_settle(
+    hive_id: &str,
+    address: &str,
+    key_path: &Path,
+    user: &str,
+) -> Result<(), serde_json::Value> {
+    if let Err(err) = ssh_with_key(address, key_path, "true", user) {
+        return Err(serde_json::json!({
+            "status": "error",
+            "error_code": "SSH_KEY_FAILED",
+            "message": format!("the motherbee key does not open the box after the seed: {err}"),
+        }));
+    }
+    update_join_state(hive_id, "joining", "waiting_for_host", |_| {});
+    let result = wait_remote_first_boot(address, key_path, user);
+    update_join_state(hive_id, "joining", "running", |_| {});
+    match result {
+        Ok(()) => Ok(()),
+        Err(FirstBootWaitError::NotSettled(message)) => Err(serde_json::json!({
+            "status": "error",
+            "error_code": "HOST_NOT_SETTLED",
+            "retryable": true,
+            "message": message,
+        })),
+        Err(FirstBootWaitError::CheckFailed(message)) => Err(serde_json::json!({
+            "status": "error",
+            "error_code": "HOST_SETTLE_CHECK_FAILED",
+            "message": message,
+        })),
     }
 }
 
@@ -5758,31 +5911,74 @@ fn resolve_syncthing_service_user(blob: &BlobRuntimeConfig) -> Result<String, Or
 
 /// Creates `path` when missing and opens it as the directory it must be, never through a symlink
 /// (FINDINGS A-51). Some of these sit inside a directory the Syncthing user owns (`blob/active`,
-/// `blob/staging`, `blob/public`), so that user can put a symlink where one should be; root
-/// following it would chmod or chown whatever it points at.
-fn open_managed_dir(path: &Path) -> Result<fs::File, OrchestratorError> {
-    fs::create_dir_all(path)?;
-    fs::OpenOptions::new()
+/// `blob/staging`, `blob/public`), so that user can put a symlink, or a file, where one should
+/// be; root following a symlink would chmod or chown whatever it points at. Anything but a
+/// directory is left alone (`None`) and `ensure_dirs` reports it: it is never followed, and never
+/// a reason for the orchestrator not to start, or that user could crash-loop it by planting one.
+fn open_managed_dir(path: &Path) -> Result<Option<fs::File>, OrchestratorError> {
+    match fs::symlink_metadata(path) {
+        Ok(meta) if !meta.is_dir() => {
+            tracing::error!(path = %path.display(), "a managed directory is not a directory (a symlink?); left alone");
+            return Ok(None);
+        }
+        Ok(_) => {}
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => fs::create_dir_all(path)?,
+        Err(err) => return Err(err.into()),
+    }
+    match fs::OpenOptions::new()
         .read(true)
         .custom_flags(nix::libc::O_DIRECTORY | nix::libc::O_NOFOLLOW)
         .open(path)
-        .map_err(|err| {
-            format!(
-                "'{}' must be a plain directory, a symlink there is refused: {err}",
-                path.display()
-            )
-            .into()
-        })
+    {
+        Ok(dir) => Ok(Some(dir)),
+        // It became a symlink after the check above.
+        Err(err) if err.raw_os_error() == Some(nix::libc::ELOOP) => {
+            tracing::error!(path = %path.display(), "a managed directory became a symlink; left alone");
+            Ok(None)
+        }
+        Err(err) => {
+            Err(format!("cannot open managed directory '{}': {err}", path.display()).into())
+        }
+    }
+}
+
+/// Reports, as one posture alert, every managed directory that `open_managed_dir` left alone.
+fn report_unusable_managed_dirs(hive_id: &str, paths: &[PathBuf]) {
+    let unusable: Vec<String> = paths
+        .iter()
+        .filter(|path| fs::symlink_metadata(path).is_ok_and(|meta| !meta.is_dir()))
+        .map(|path| path.display().to_string())
+        .collect();
+    if unusable.is_empty() {
+        return;
+    }
+    append_drift_alert(
+        "posture",
+        "managed_dir_not_a_directory",
+        "critical",
+        hive_id,
+        format!(
+            "left alone, not followed (A-51): {}. A tree is moved with a bind mount, never a symlink.",
+            unusable.join(", ")
+        ),
+        None,
+        None,
+        None,
+    );
 }
 
 fn ensure_dir_permissions_0750(path: &Path) -> Result<(), OrchestratorError> {
-    let dir = open_managed_dir(path)?;
+    let Some(dir) = open_managed_dir(path)? else {
+        return Ok(());
+    };
     dir.set_permissions(fs::Permissions::from_mode(0o750))?;
     Ok(())
 }
 
 fn ensure_owned_dir(path: &Path, user: &str) -> Result<(), OrchestratorError> {
-    let dir = open_managed_dir(path)?;
+    let Some(dir) = open_managed_dir(path)? else {
+        return Ok(());
+    };
     dir.set_permissions(fs::Permissions::from_mode(0o750))?;
     let (uid, gid) = linux_user_ids(user)?;
     std::os::unix::fs::fchown(&dir, Some(uid), Some(gid))?;
@@ -5790,7 +5986,10 @@ fn ensure_owned_dir(path: &Path, user: &str) -> Result<(), OrchestratorError> {
 }
 
 fn ensure_owned_tree(path: &Path, user: &str) -> Result<(), OrchestratorError> {
-    ensure_dir_permissions_0750(path)?;
+    let Some(dir) = open_managed_dir(path)? else {
+        return Ok(());
+    };
+    dir.set_permissions(fs::Permissions::from_mode(0o750))?;
     let group = linux_user_primary_group(user).unwrap_or_else(|| user.to_string());
     let mut chown = Command::new("chown");
     chown.arg("-R").arg(format!("{user}:{group}")).arg(path);
@@ -5805,7 +6004,9 @@ fn ensure_owned_tree(path: &Path, user: &str) -> Result<(), OrchestratorError> {
 /// send-receive and Syncthing's home is its own, so they stay the Syncthing user's, and so does a
 /// spoke's dist, where Syncthing writes what it receives.
 fn ensure_root_owned_tree(path: &Path, reader: &str) -> Result<(), OrchestratorError> {
-    let dir = open_managed_dir(path)?;
+    let Some(dir) = open_managed_dir(path)? else {
+        return Ok(());
+    };
     let (_, gid) = linux_user_ids(reader)?;
     let mut chown = Command::new("chown");
     chown.arg("-R").arg(format!("0:{gid}")).arg(path);
@@ -10018,19 +10219,34 @@ fn reconcile_local_syncthing_folders(
     Ok(changed_folders)
 }
 
-/// Creates the folder's `.stfolder` marker when it has none. Created exclusively: the folder may
-/// belong to the Syncthing user, and `fs::write` through a dangling `.stfolder` symlink would have
-/// root create the file it points at (FINDINGS A-51). Anything already there counts as present.
+/// Creates the folder's `.stfolder` marker when it has none (FINDINGS A-51). The folder may belong
+/// to the Syncthing user: a folder that is not a directory is left alone (`ensure_dirs` reports
+/// it), so root never creates the marker where a symlink points; a symlink in the marker's place,
+/// dangling or not, is replaced, because Syncthing follows it and a dangling one stops the folder
+/// for good; the marker is created exclusively.
 fn ensure_syncthing_folder_marker(path: &Path) -> Result<bool, OrchestratorError> {
-    fs::create_dir_all(path)?;
+    match fs::symlink_metadata(path) {
+        Ok(meta) if !meta.is_dir() => {
+            tracing::error!(folder = %path.display(), "a Syncthing folder is not a directory (a symlink?); no marker written");
+            return Ok(false);
+        }
+        Ok(_) => {}
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => fs::create_dir_all(path)?,
+        Err(err) => return Err(err.into()),
+    }
+    let marker = path.join(".stfolder");
+    if fs::symlink_metadata(&marker).is_ok_and(|meta| meta.file_type().is_symlink()) {
+        fs::remove_file(&marker)?;
+        tracing::warn!(marker = %marker.display(), "replaced a symlink at a Syncthing folder marker");
+    }
     match fs::OpenOptions::new()
         .write(true)
         .create_new(true)
         .custom_flags(nix::libc::O_NOFOLLOW)
-        .open(path.join(".stfolder"))
+        .open(&marker)
     {
-        Ok(mut marker) => {
-            marker.write_all(b"fluxbee syncthing marker\n")?;
+        Ok(mut file) => {
+            file.write_all(b"fluxbee syncthing marker\n")?;
             Ok(true)
         }
         Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => Ok(false),
@@ -19122,17 +19338,18 @@ fn worker_remote_base_dirs_command(blob: &BlobRuntimeConfig) -> String {
     ))
 }
 
+/// No `chmod` on the blob directories: on a re-join they may be the Syncthing user's names, and
+/// chmod follows a symlink. The spoke's orchestrator sets their modes on the descriptor at start
+/// (FINDINGS A-51); `chown -R` acts on a symlink itself.
 fn ingress_remote_base_dirs_command(blob: &BlobRuntimeConfig) -> String {
     let public_dir = blob_public_sync_folder_path(blob);
     sudo_bash_wrap(&format!(
-        "getent passwd fluxbee >/dev/null 2>&1 || useradd --system --user-group --home-dir /var/lib/fluxbee --no-create-home --shell /usr/sbin/nologin fluxbee; mkdir -p /etc/fluxbee /var/lib/fluxbee/state/nodes /var/lib/fluxbee/state/sy-edge /var/lib/fluxbee/opa/current /var/lib/fluxbee/opa/staged /var/lib/fluxbee/opa/backup /var/lib/fluxbee/nats /var/lib/fluxbee/dist /var/lib/fluxbee/dist/runtimes /var/lib/fluxbee/dist/core/bin /var/lib/fluxbee/dist/vendor /var/run/fluxbee/routers '{}' '{}' '{}' && chown -R fluxbee:fluxbee '{}' '{}' && chmod 0750 '{}' '{}' /var/lib/fluxbee/state/sy-edge",
+        "getent passwd fluxbee >/dev/null 2>&1 || useradd --system --user-group --home-dir /var/lib/fluxbee --no-create-home --shell /usr/sbin/nologin fluxbee; mkdir -p /etc/fluxbee /var/lib/fluxbee/state/nodes /var/lib/fluxbee/state/sy-edge /var/lib/fluxbee/opa/current /var/lib/fluxbee/opa/staged /var/lib/fluxbee/opa/backup /var/lib/fluxbee/nats /var/lib/fluxbee/dist /var/lib/fluxbee/dist/runtimes /var/lib/fluxbee/dist/core/bin /var/lib/fluxbee/dist/vendor /var/run/fluxbee/routers '{}' '{}' '{}' && chown -R fluxbee:fluxbee '{}' '{}' && chmod 0750 /var/lib/fluxbee/state/sy-edge",
         shell_single_quote_path(&blob.path),
         shell_single_quote_path(&public_dir),
         shell_single_quote_path(&blob.sync_data_dir),
         shell_single_quote_path(&public_dir),
         shell_single_quote_path(&blob.sync_data_dir),
-        shell_single_quote_path(&blob.path),
-        shell_single_quote_path(&public_dir),
     ))
 }
 
@@ -19454,42 +19671,37 @@ fn materialize_role_core_trees(
 /// mid-scan) never sees a partial binary.
 fn copy_exec_file(src: &Path, dst: &Path) -> Result<(), OrchestratorError> {
     let bytes = fs::read(src)?;
-    write_new_file_atomic(dst, &bytes, 0o755, Some(0o755))
+    write_new_file_atomic(dst, &bytes, 0o755)
 }
 
-/// Write `bytes` to `path` atomically (temp sibling + rename), with the mode `fs::write` gives.
+/// Write `bytes` to `path` atomically (temp sibling + rename), mode 0644.
 fn write_file_atomic(path: &Path, bytes: &[u8]) -> Result<(), OrchestratorError> {
-    write_new_file_atomic(path, bytes, 0o666, None)
+    write_new_file_atomic(path, bytes, 0o644)
 }
 
-/// How old a temp of ours must be before a later write sweeps it: a write in flight is never
-/// that old, so a concurrent writer of the same path keeps its temp.
-const STALE_WRITE_TEMP_SECS: u64 = 10 * 60;
-
-/// When this run of the orchestrator started (set first thing in `main`). A temp of ours from
-/// before it was left by an earlier run that died mid-write, and the next write sweeps it at once.
-static PROCESS_STARTED: OnceLock<std::time::SystemTime> = OnceLock::new();
+/// This run's token, in the name of every temp it writes. Only one orchestrator runs at a time,
+/// so a temp of ours with another run's token was left by a run that died mid-write, and the next
+/// write of that path sweeps it at once; this run's own temps are never swept. No clock decides.
+fn write_run_token() -> &'static str {
+    static TOKEN: OnceLock<String> = OnceLock::new();
+    TOKEN.get_or_init(|| format!("{:08x}", rand::random::<u32>()))
+}
 
 /// Writes `bytes` to a new temp sibling of `path` and renames it over `path` (FINDINGS A-51).
 ///
-/// Parts of the dist tree belong to the Syncthing user while the orchestrator is root, so the
-/// last component is not trusted to be what its name says: the temp is created exclusively
-/// (`O_EXCL`, never through a planted entry) under an unpredictable name, and its mode is set on
-/// the open file before the rename, never on a path. It used to be a fixed `.name.tmp` written
-/// with `fs::write`, which follows a symlink, and a mode set afterwards with `chmod` on the path.
-/// A directory ABOVE the file that the Syncthing user can replace is still followed: that part of
-/// A-51 is open.
+/// Parts of the dist tree belong to the Syncthing user on a spoke while the orchestrator is root,
+/// so the last component is not trusted to be what its name says: the temp is created exclusively
+/// (`O_EXCL`, never through a planted entry), mode 0600, under an unpredictable name, and gets
+/// `mode` on the open file before the rename, never on a path. It used to be a fixed `.name.tmp`
+/// written with `fs::write`, which follows a symlink, and a mode set afterwards with `chmod` on the
+/// path. A directory ABOVE the file that the Syncthing user can replace is still followed; on the
+/// motherbee that user owns none (it only reads dist), on a spoke root installs what Syncthing
+/// delivers anyway (A-51).
 ///
-/// The temp is `.syncthing.<name>.fluxbee-<random>.tmp`: Syncthing skips that prefix in a shared
-/// folder (its own temps use it) and drops such a file after a day, so a temp is never sent to a
-/// peer, not even one a crash left behind. `create_mode` is the mode the temp is created with (the
-/// umask applies, as with `fs::write`); `exact_mode`, when given, is set on the descriptor.
-fn write_new_file_atomic(
-    path: &Path,
-    bytes: &[u8],
-    create_mode: u32,
-    exact_mode: Option<u32>,
-) -> Result<(), OrchestratorError> {
+/// The temp is `.syncthing.<name>.fluxbee-<run>-<random>.tmp`: Syncthing skips that prefix in a
+/// shared folder (its own temps use it) and drops such a file after a day, so a temp is never sent
+/// to a peer, not even one a crash left behind.
+fn write_new_file_atomic(path: &Path, bytes: &[u8], mode: u32) -> Result<(), OrchestratorError> {
     let parent = path
         .parent()
         .ok_or_else(|| format!("path '{}' has no parent directory", path.display()))?;
@@ -19499,38 +19711,26 @@ fn write_new_file_atomic(
         .and_then(|n| n.to_str())
         .unwrap_or("fluxbee-write");
     let prefix = format!(".syncthing.{name}.fluxbee-");
+    let own = format!("{prefix}{}-", write_run_token());
     let legacy_tmp = format!(".{name}.tmp");
-    // A second of slack: the kernel stamps files from a coarser clock than `SystemTime::now`.
-    let started = PROCESS_STARTED
-        .get()
-        .and_then(|started| started.checked_sub(Duration::from_secs(1)));
     if let Ok(entries) = fs::read_dir(parent) {
         for entry in entries.flatten() {
-            let ours = entry.file_name().to_str().is_some_and(|n| {
-                (n.starts_with(&prefix) && n.ends_with(".tmp")) || n == legacy_tmp
+            let leftover = entry.file_name().to_str().is_some_and(|n| {
+                (n.starts_with(&prefix) && n.ends_with(".tmp") && !n.starts_with(&own))
+                    || n == legacy_tmp
             });
-            if !ours {
-                continue;
-            }
-            let Ok(modified) = entry.metadata().and_then(|m| m.modified()) else {
-                continue;
-            };
-            let stale = started.is_some_and(|started| modified < started)
-                || modified
-                    .elapsed()
-                    .is_ok_and(|age| age.as_secs() >= STALE_WRITE_TEMP_SECS);
-            if stale {
+            if leftover {
                 let _ = fs::remove_file(entry.path());
             }
         }
     }
     let mut created = None;
     for _ in 0..8 {
-        let tmp = parent.join(format!("{prefix}{:016x}.tmp", rand::random::<u64>()));
+        let tmp = parent.join(format!("{own}{:016x}.tmp", rand::random::<u64>()));
         match fs::OpenOptions::new()
             .write(true)
             .create_new(true)
-            .mode(create_mode)
+            .mode(0o600)
             .open(&tmp)
         {
             Ok(file) => {
@@ -19545,9 +19745,7 @@ fn write_new_file_atomic(
         .ok_or_else(|| format!("could not create a temp file next to '{}'", path.display()))?;
     let result = (|| -> Result<(), OrchestratorError> {
         file.write_all(bytes)?;
-        if let Some(mode) = exact_mode {
-            file.set_permissions(fs::Permissions::from_mode(mode))?;
-        }
+        file.set_permissions(fs::Permissions::from_mode(mode))?;
         file.sync_all()?;
         fs::rename(&tmp, path)?;
         Ok(())
@@ -19556,7 +19754,12 @@ fn write_new_file_atomic(
         let _ = fs::remove_file(&tmp);
         return result;
     }
-    if let Err(err) = fs::File::open(parent).and_then(|dir| dir.sync_all()) {
+    let synced = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(nix::libc::O_DIRECTORY | nix::libc::O_NOFOLLOW)
+        .open(parent)
+        .and_then(|dir| dir.sync_all());
+    if let Err(err) = synced {
         tracing::warn!(path = %path.display(), error = %err, "could not fsync the directory after a write");
     }
     Ok(())
@@ -21694,6 +21897,10 @@ async fn add_hive_flow(
         }
     }
 
+    if let Err(payload) = wait_for_host_to_settle(hive_id, address, &key_path, creds.user.as_str())
+    {
+        return payload;
+    }
     if let Err(err) = ensure_remote_orchestrator_sudoers_with_access(
         address,
         &key_path,
@@ -21718,14 +21925,6 @@ async fn add_hive_flow(
             "status": "error",
             "error_code": "SSH_KEY_FAILED",
             "message": format!("key access verification failed after bootstrap seed: {err}"),
-        });
-    }
-    if let Err(err) = wait_remote_first_boot(address, &key_path, creds.user.as_str()) {
-        return serde_json::json!({
-            "status": "error",
-            "error_code": "HOST_NOT_SETTLED",
-            "retryable": true,
-            "message": err.to_string(),
         });
     }
 
@@ -22594,6 +22793,10 @@ async fn add_egress_hive_flow(
             }
         }
     }
+    if let Err(payload) = wait_for_host_to_settle(hive_id, address, &key_path, creds.user.as_str())
+    {
+        return payload;
+    }
     if let Err(err) = ensure_remote_orchestrator_sudoers_with_access(
         address,
         &key_path,
@@ -22612,15 +22815,6 @@ async fn add_egress_hive_flow(
             "SSH_KEY_FAILED",
             format!("key access verification failed: {err}"),
         );
-    }
-    if let Err(err) = wait_remote_first_boot(address, &key_path, creds.user.as_str()) {
-        // Retryable: the bootstrap key stays, so the retry is key-first.
-        return serde_json::json!({
-            "status": "error",
-            "error_code": "HOST_NOT_SETTLED",
-            "retryable": true,
-            "message": err.to_string(),
-        });
     }
 
     // Resolve the egress profile template from motherbee's own hive.yaml
@@ -23299,6 +23493,10 @@ async fn add_ingress_hive_flow(
             }
         }
     }
+    if let Err(payload) = wait_for_host_to_settle(hive_id, address, &key_path, creds.user.as_str())
+    {
+        return payload;
+    }
     if let Err(err) = ensure_remote_orchestrator_sudoers_with_access(
         address,
         &key_path,
@@ -23317,15 +23515,6 @@ async fn add_ingress_hive_flow(
             "SSH_KEY_FAILED",
             format!("key access verification failed: {err}"),
         );
-    }
-    if let Err(err) = wait_remote_first_boot(address, &key_path, creds.user.as_str()) {
-        // Retryable: the bootstrap key stays, so the retry is key-first.
-        return serde_json::json!({
-            "status": "error",
-            "error_code": "HOST_NOT_SETTLED",
-            "retryable": true,
-            "message": err.to_string(),
-        });
     }
 
     // Resolve the ingress profile template from motherbee's own hive.yaml.
@@ -26276,13 +26465,18 @@ mod tests {
                  vendor arrives THROUGH syncthing, so it can never self-repair"
             );
             let wait_at = body
-                .find("wait_remote_first_boot(")
+                .find("wait_for_host_to_settle(")
                 .unwrap_or_else(|| panic!("{flow} must wait for the box to settle (A-52)"));
-            let push_at = body.find("sync_core_to_worker(").expect("checked above");
-            assert!(
-                wait_at < push_at,
-                "{flow} must wait for the box to settle before it installs anything there (A-52)"
-            );
+            for later in [
+                "ensure_remote_orchestrator_sudoers_with_access(",
+                "sync_core_to_worker(",
+            ] {
+                let at = body.find(later).expect("each flow has it");
+                assert!(
+                    wait_at < at,
+                    "{flow} must wait for the box to settle before {later} (A-52)"
+                );
+            }
             assert!(
                 body.contains("ensure_syncthing_peer_link_runtime("),
                 "{flow} must link the spoke's Syncthing device — without it motherbee's \
@@ -27119,7 +27313,10 @@ mod tests {
         assert!(cmd.starts_with("sudo -n bash -lc '"));
         assert!(cmd.contains("; mkdir -p /etc/fluxbee"));
         assert!(cmd.contains("&& chown -R fluxbee:fluxbee"));
-        assert!(cmd.contains("&& chmod 0750"));
+        // Only the edge's own state dir: never a blob dir, which may be the Syncthing user's name
+        // on a re-join and chmod follows a symlink (A-51).
+        assert!(cmd.contains("&& chmod 0750 /var/lib/fluxbee/state/sy-edge"));
+        assert_eq!(cmd.matches("chmod").count(), 1);
     }
 
     #[test]
@@ -29044,8 +29241,8 @@ mod tests {
 
     /// A-51: a write never goes through what the Syncthing user can plant next to the file: not a
     /// symlink at the old fixed temp name (the old writer wrote through it, chmodded what it
-    /// pointed at and renamed the link into place) nor one at the destination. The result is a
-    /// plain file with exactly the mode `fs::write` gives, or exactly 0755 for an executable.
+    /// pointed at and renamed the link into place), nor one at the destination (replaced, as
+    /// before). The result is a plain file of exactly 0644, or 0755 for an executable.
     #[test]
     fn a51_writes_never_follow_a_planted_entry() {
         use std::os::unix::fs::MetadataExt;
@@ -29057,8 +29254,6 @@ mod tests {
             assert_eq!(fs::read_to_string(victim).unwrap(), "root-owned\n");
             assert_eq!(fs::metadata(victim).unwrap().mode() & 0o7777, 0o600);
         };
-        let reference = dir.join("reference");
-        fs::write(&reference, b"x").unwrap();
 
         let path = dir.join("manifest.json");
         std::os::unix::fs::symlink(&victim, dir.join(".manifest.json.tmp")).unwrap();
@@ -29067,11 +29262,7 @@ mod tests {
         untouched(&victim);
         assert!(fs::symlink_metadata(&path).unwrap().file_type().is_file());
         assert_eq!(fs::read_to_string(&path).unwrap(), "{}\n");
-        assert_eq!(
-            fs::metadata(&path).unwrap().mode() & 0o7777,
-            fs::metadata(&reference).unwrap().mode() & 0o7777,
-            "the mode fs::write gives"
-        );
+        assert_eq!(fs::metadata(&path).unwrap().mode() & 0o7777, 0o644);
 
         let src = dir.join("binary-src");
         fs::write(&src, b"\x7fELF").unwrap();
@@ -29085,11 +29276,12 @@ mod tests {
         fs::remove_dir_all(&dir).unwrap();
     }
 
-    /// A-51: a directory the orchestrator chmods or chowns is opened as the directory it must be.
-    /// A symlink the Syncthing user put in its place is refused, and what it points at keeps its
-    /// mode; the refusal comes before any owner is looked up.
+    /// A-51: a managed directory is opened as the directory it must be. A symlink or a file the
+    /// Syncthing user put in its place is left alone: never followed (what a symlink points at
+    /// keeps its mode), and never an error that would keep the orchestrator from starting. The
+    /// owner is looked up only for a real directory.
     #[test]
-    fn a51_managed_dirs_refuse_a_symlink() {
+    fn a51_managed_dirs_leave_what_is_not_a_directory_alone() {
         use std::os::unix::fs::MetadataExt;
         let dir = a51_dir("dirs");
         let victim = dir.join("victim-dir");
@@ -29097,15 +29289,18 @@ mod tests {
         fs::set_permissions(&victim, fs::Permissions::from_mode(0o755)).unwrap();
         let active = dir.join("active");
         std::os::unix::fs::symlink(&victim, &active).unwrap();
-        let err = ensure_dir_permissions_0750(&active)
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("symlink there is refused"), "{err}");
-        let err = ensure_owned_dir(&active, "no-such-user-a51")
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("symlink there is refused"), "{err}");
+        ensure_dir_permissions_0750(&active).unwrap();
+        ensure_owned_dir(&active, "no-such-user-a51").unwrap();
+        ensure_owned_tree(&active, "no-such-user-a51").unwrap();
         assert_eq!(fs::metadata(&victim).unwrap().mode() & 0o7777, 0o755);
+        assert!(fs::symlink_metadata(&active)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        let public = dir.join("public");
+        fs::write(&public, b"planted").unwrap();
+        ensure_dir_permissions_0750(&public).unwrap();
+        assert_eq!(fs::read(&public).unwrap(), b"planted");
         let staging = dir.join("staging");
         ensure_dir_permissions_0750(&staging).unwrap();
         assert!(fs::symlink_metadata(&staging).unwrap().file_type().is_dir());
@@ -29113,8 +29308,9 @@ mod tests {
         fs::remove_dir_all(&dir).unwrap();
     }
 
-    /// A-51: the `.stfolder` marker is created where it is missing and never through a symlink:
-    /// a dangling one counts as present, and nothing is created where it points.
+    /// A-51: the `.stfolder` marker is created where it is missing, never through a symlink. A
+    /// symlink in its place, dangling or not, is replaced by a real marker (Syncthing follows it);
+    /// a folder that is itself a symlink gets no marker, so nothing is created where it points.
     #[test]
     fn a51_folder_marker_never_follows_a_symlink() {
         let dir = a51_dir("marker");
@@ -29122,54 +29318,42 @@ mod tests {
         fs::create_dir_all(&folder).unwrap();
         let victim = dir.join("nologin");
         std::os::unix::fs::symlink(&victim, folder.join(".stfolder")).unwrap();
-        assert!(!ensure_syncthing_folder_marker(&folder).unwrap());
+        assert!(ensure_syncthing_folder_marker(&folder).unwrap());
         assert!(fs::symlink_metadata(&victim).is_err(), "nothing created");
-        let fresh = dir.join("fresh");
-        assert!(ensure_syncthing_folder_marker(&fresh).unwrap());
-        assert!(fs::symlink_metadata(fresh.join(".stfolder"))
+        assert!(fs::symlink_metadata(folder.join(".stfolder"))
             .unwrap()
             .file_type()
             .is_file());
-        assert!(!ensure_syncthing_folder_marker(&fresh).unwrap());
+        assert!(!ensure_syncthing_folder_marker(&folder).unwrap());
+        let target = dir.join("elsewhere");
+        fs::create_dir_all(&target).unwrap();
+        let linked = dir.join("linked");
+        std::os::unix::fs::symlink(&target, &linked).unwrap();
+        assert!(!ensure_syncthing_folder_marker(&linked).unwrap());
+        assert!(fs::symlink_metadata(target.join(".stfolder")).is_err());
         fs::remove_dir_all(&dir).unwrap();
     }
 
-    /// A-51: temps are named so Syncthing never sends them. A crash's leftover is swept by the
-    /// next write once it is old, or at once when it predates this process (the fixed `.name.tmp`
-    /// of older releases too); a fresh one, which a concurrent write may still own, and
-    /// Syncthing's own temp are left alone.
+    /// A-51: temps are named so Syncthing never sends them. A temp of ours from another run (one
+    /// that died mid-write) and the fixed `.name.tmp` of older releases are swept by the next write
+    /// of that path at once; this run's own temps and Syncthing's own are left alone. No clock
+    /// is involved.
     #[test]
-    fn a51_only_stale_temps_of_ours_are_swept() {
+    fn a51_temps_of_other_runs_are_swept_at_once() {
         let dir = a51_dir("sweep");
         let path = dir.join("drift-alerts.jsonl");
-        let now = std::time::SystemTime::now();
-        let started = *PROCESS_STARTED.get_or_init(|| now);
-        let old = now - Duration::from_secs(STALE_WRITE_TEMP_SECS + 60);
-        let before_start = started - Duration::from_secs(5);
-        let leftover = dir.join(".syncthing.drift-alerts.jsonl.fluxbee-leftover.tmp");
-        let crashed = dir.join(".syncthing.drift-alerts.jsonl.fluxbee-crashed.tmp");
+        let own = format!(
+            ".syncthing.drift-alerts.jsonl.fluxbee-{}-inflight.tmp",
+            write_run_token()
+        );
+        let other_run = dir.join(".syncthing.drift-alerts.jsonl.fluxbee-otherrun-0001.tmp");
         let legacy = dir.join(".drift-alerts.jsonl.tmp");
-        let fresh = dir.join(".syncthing.drift-alerts.jsonl.fluxbee-inflight.tmp");
         let syncthing_own = dir.join(".syncthing.drift-alerts.jsonl.tmp");
-        for (tmp, modified) in [
-            (&leftover, old),
-            (&crashed, before_start),
-            (&legacy, old),
-            (&fresh, now),
-            (&syncthing_own, old),
-        ] {
-            fs::File::create(tmp)
-                .unwrap()
-                .set_modified(modified)
-                .unwrap();
+        for tmp in [&other_run, &legacy, &dir.join(&own), &syncthing_own] {
+            fs::write(tmp, b"x").unwrap();
         }
         write_file_atomic(&path, b"line\n").unwrap();
-        assert!(!leftover.exists() && !crashed.exists() && !legacy.exists());
-        assert!(
-            fresh.exists(),
-            "an in-flight temp of a concurrent write stays"
-        );
-        assert!(syncthing_own.exists(), "Syncthing's own temp is not ours");
+        assert!(!other_run.exists() && !legacy.exists());
         assert_eq!(fs::read_to_string(&path).unwrap(), "line\n");
         let mut names: Vec<String> = fs::read_dir(&dir)
             .unwrap()
@@ -29177,15 +29361,13 @@ mod tests {
             .map(|e| e.file_name().to_string_lossy().into_owned())
             .collect();
         names.sort();
-        assert_eq!(
-            names,
-            [
-                ".syncthing.drift-alerts.jsonl.fluxbee-inflight.tmp",
-                ".syncthing.drift-alerts.jsonl.tmp",
-                "drift-alerts.jsonl"
-            ],
-            "the write left no temp of its own"
-        );
+        let mut expected = vec![
+            own,
+            ".syncthing.drift-alerts.jsonl.tmp".to_string(),
+            "drift-alerts.jsonl".to_string(),
+        ];
+        expected.sort();
+        assert_eq!(names, expected, "the write left no temp of its own");
         fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -29219,51 +29401,52 @@ mod tests {
         );
     }
 
-    /// A-52: the wait is one single-quoted script under sudo.
+    /// A-52: the wait is one single-quoted script, with no sudo (systemctl answers any user).
     #[test]
-    fn a52_the_wait_is_one_quoted_script_under_sudo() {
+    fn a52_the_wait_is_one_quoted_script() {
         let cmd = first_boot_wait_command(FIRST_BOOT_WAIT_SECS);
-        assert!(cmd.starts_with("sudo -n /bin/bash -lc '") && cmd.ends_with('\''));
+        assert!(cmd.starts_with("/bin/bash -c '") && cmd.ends_with('\''));
         assert_eq!(
             cmd.matches('\'').count(),
             2,
             "no quote inside the script: {cmd}"
         );
+        assert!(!cmd.contains("sudo"));
     }
 
-    /// A-52: runs the wait script under bash with stand-ins for `cloud-init`, `systemctl`,
-    /// `timeout` and `sleep`. Each stand-in answers the next entry of its list on every call (the
-    /// last one for ever; a space separates the lines of one answer). Returns the exit code,
-    /// stdout and how many times cloud-init was asked.
-    fn a52_run_wait(
-        tag: &str,
-        secs: u64,
-        cloud_init: Option<&[&str]>,
-        apt: &[&str],
-    ) -> (i32, String, usize) {
+    /// A-52: runs the wait script under bash with stand-ins for `systemctl`, `timeout` and
+    /// `sleep`. `states` gives, per unit, its answer to each successive `systemctl is-active`
+    /// (the last one for ever), and under `system` the answers to `is-system-running`; a unit not
+    /// listed answers "inactive", the system "running". Returns the exit code, stdout and how many
+    /// times cloud-final was asked.
+    fn a52_run_wait(tag: &str, secs: u64, states: &[(&str, &[&str])]) -> (i32, String, usize) {
         let dir = a51_dir(&format!("a52-{tag}"));
         let bin = dir.join("bin");
         fs::create_dir_all(&bin).unwrap();
+        for (unit, answers) in states {
+            fs::write(
+                dir.join(format!("{unit}.states")),
+                answers.join("\n") + "\n",
+            )
+            .unwrap();
+        }
         let stand_in = |name: &str, body: String| {
             let path = bin.join(name);
             fs::write(&path, body).unwrap();
             fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
         };
-        let replay = |name: &str, entries: &[&str]| {
-            let list = dir.join(format!("{name}.list"));
-            fs::write(&list, entries.join("\n") + "\n").unwrap();
-            let count = dir.join(format!("{name}.count"));
+        stand_in(
+            "systemctl",
             format!(
-                "#!/bin/sh\nn=$(cat '{c}' 2>/dev/null || echo 0); n=$((n+1)); echo $n > '{c}'\n\
-                 l=$(wc -l < '{l}'); [ $n -gt $l ] && n=$l\nsed -n \"${{n}}p\" '{l}' | tr ' ' '\\n'\n",
-                c = count.display(),
-                l = list.display()
-            )
-        };
-        if let Some(entries) = cloud_init {
-            stand_in("cloud-init", replay("cloud-init", entries));
-        }
-        stand_in("systemctl", replay("systemctl", apt));
+                "#!/bin/sh\nif [ \"$1\" = is-system-running ]; then u=system; none=running; \
+                 else u=${{2%.service}}; none=inactive; fi\n\
+                 f='{d}'/$u.states; c='{d}'/$u.count\n\
+                 n=$(cat \"$c\" 2>/dev/null || echo 0); n=$((n+1)); echo $n > \"$c\"\n\
+                 if [ ! -f \"$f\" ]; then echo $none; exit 3; fi\n\
+                 l=$(wc -l < \"$f\"); [ $n -gt $l ] && n=$l\nsed -n \"${{n}}p\" \"$f\"\n",
+                d = dir.display()
+            ),
+        );
         stand_in("timeout", "#!/bin/sh\nshift\nexec \"$@\"\n".to_string());
         stand_in("sleep", "#!/bin/sh\nexit 0\n".to_string());
         let output = Command::new("/bin/bash")
@@ -29272,7 +29455,7 @@ mod tests {
             .env("PATH", format!("{}:/usr/bin:/bin", bin.display()))
             .output()
             .unwrap();
-        let asked = fs::read_to_string(dir.join("cloud-init.count"))
+        let asked = fs::read_to_string(dir.join("cloud-final.count"))
             .ok()
             .and_then(|n| n.trim().parse().ok())
             .unwrap_or(0);
@@ -29284,68 +29467,137 @@ mod tests {
         )
     }
 
-    /// A-52: the join waits only while cloud-init or an apt daily job RUNS, and gives up at the
-    /// deadline naming what still runs. A cloud-init that will never run this boot ("not
-    /// started", "disabled") is not waited on.
+    /// A-52: the join waits while the box still boots or a cloud-init stage or an apt daily job
+    /// RUNS (systemd says `activating`), never on a cloud-init that will not run this boot or that
+    /// recorded an error, and gives up at the deadline naming what still runs. An empty answer
+    /// counts as busy.
     #[test]
-    fn a52_waits_only_while_something_runs() {
-        let idle = ["inactive inactive"];
-        for status in [
-            "status: not started",
-            "status: disabled",
-            "status: done",
-            "status: error",
-        ] {
+    fn a52_waits_only_while_a_unit_runs() {
+        assert_eq!(a52_run_wait("idle", 0, &[]), (0, String::new(), 1));
+        for settled in ["active", "inactive", "failed", "unknown"] {
             assert_eq!(
-                a52_run_wait("settled", 0, Some(&[status]), &idle),
+                a52_run_wait("settled", 0, &[("cloud-final", &[settled])]),
                 (0, String::new(), 1),
-                "{status}"
+                "{settled}"
             );
         }
         assert_eq!(
             a52_run_wait(
                 "running",
                 FIRST_BOOT_WAIT_SECS,
-                Some(&["status: running", "status: running", "status: done"]),
-                &idle
+                &[("cloud-final", &["activating", "activating", "active"])]
             ),
             (0, String::new(), 3)
         );
         assert_eq!(
-            a52_run_wait("stuck", 0, Some(&["status: running"]), &idle),
-            (124, "still running: cloud-init".to_string(), 1)
+            a52_run_wait("stuck", 0, &[("cloud-config", &["activating"])]),
+            (124, "still running: cloud-config".to_string(), 0)
         );
         assert_eq!(
             a52_run_wait(
                 "apt",
                 FIRST_BOOT_WAIT_SECS,
-                Some(&["status: done"]),
-                &[
-                    "activating inactive",
-                    "inactive activating",
-                    "inactive inactive"
-                ]
+                &[("apt-daily-upgrade", &["activating", "inactive"])]
             ),
-            (0, String::new(), 3)
+            (0, String::new(), 2)
         );
         assert_eq!(
-            a52_run_wait(
-                "apt-stuck",
-                0,
-                Some(&["status: done"]),
-                &["inactive active"]
-            ),
+            a52_run_wait("apt-stuck", 0, &[("apt-daily", &["activating"])]),
             (124, "still running: apt-daily".to_string(), 1)
         );
         assert_eq!(
+            a52_run_wait("silent", 0, &[("cloud-init-local", &[""])]),
+            (124, "still running: cloud-init-local".to_string(), 0)
+        );
+        // Between two stages the next one is only queued: the boot is not done.
+        assert_eq!(
             a52_run_wait(
-                "old-systemd",
-                0,
-                Some(&["status: done"]),
-                &["unknown failed"]
+                "queued",
+                FIRST_BOOT_WAIT_SECS,
+                &[("system", &["starting", "starting", "degraded"])]
             ),
             (0, String::new(), 1)
         );
+        for busy in ["starting", "stopping", "initializing", ""] {
+            assert_eq!(
+                a52_run_wait("booting", 0, &[("system", &[busy])]),
+                (124, "still running: boot".to_string(), 0),
+                "{busy:?}"
+            );
+        }
+    }
+
+    fn a52_run(code: Option<i32>, stderr: &str) -> std::io::Result<FirstBootRun> {
+        Ok(FirstBootRun {
+            code,
+            stdout: if code == Some(124) {
+                "still running: cloud-final".to_string()
+            } else {
+                String::new()
+            },
+            stderr: stderr.to_string(),
+        })
+    }
+
+    /// A-52: every way ssh loses the box (exit 255: refused, closed by a reboot, a silent path cut
+    /// by the keepalive, nologin's "Permission denied"; or a signal) is tried again until the
+    /// deadline; the script's own codes are final, and anything else is a failed check.
+    #[test]
+    fn a52_the_loop_retries_a_lost_box_until_the_deadline() {
+        let mut lost = vec![
+            a52_run(
+                Some(255),
+                "Connection to 10.10.10.60 closed by remote host.",
+            ),
+            a52_run(Some(255), ""),
+            a52_run(None, ""),
+            a52_run(
+                Some(255),
+                "fluxops@10.10.10.60: Permission denied (publickey).",
+            ),
+            a52_run(Some(0), ""),
+        ]
+        .into_iter();
+        let mut calls = 0;
+        assert_eq!(
+            wait_first_boot_with(FIRST_BOOT_WAIT_SECS, Duration::ZERO, |_| {
+                calls += 1;
+                lost.next().unwrap()
+            }),
+            Ok(())
+        );
+        assert_eq!(calls, 5);
+
+        let mut calls = 0;
+        let gone = wait_first_boot_with(0, Duration::ZERO, |secs| {
+            calls += 1;
+            assert_eq!(secs, 0);
+            a52_run(
+                Some(255),
+                "ssh: connect to host 10.10.10.60 port 22: Connection refused",
+            )
+        });
+        assert!(
+            matches!(gone, Err(FirstBootWaitError::NotSettled(ref m)) if m.contains("Connection refused"))
+        );
+        assert_eq!(calls, 1, "never past the deadline");
+
+        let busy = wait_first_boot_with(FIRST_BOOT_WAIT_SECS, Duration::ZERO, |_| {
+            a52_run(Some(124), "")
+        });
+        assert!(
+            matches!(busy, Err(FirstBootWaitError::NotSettled(ref m)) if m.contains("cloud-final"))
+        );
+
+        let odd = wait_first_boot_with(FIRST_BOOT_WAIT_SECS, Duration::ZERO, |_| {
+            a52_run(Some(127), "/bin/bash: no such file")
+        });
+        assert!(matches!(odd, Err(FirstBootWaitError::CheckFailed(ref m)) if m.contains("127")));
+
+        let no_ssh = wait_first_boot_with(FIRST_BOOT_WAIT_SECS, Duration::ZERO, |_| {
+            Err(std::io::Error::from(std::io::ErrorKind::NotFound))
+        });
+        assert!(matches!(no_ssh, Err(FirstBootWaitError::CheckFailed(_))));
     }
 
     // `ss -H -tlnp` captured read-only on the PROD motherbee on 2026-10-05 (0.1.56): Archi on
