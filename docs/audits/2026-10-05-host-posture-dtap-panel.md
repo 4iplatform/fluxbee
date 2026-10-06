@@ -199,3 +199,52 @@ need his OK: D3 (filtering by interface instead of per-hive IP) and D16 (SSH onl
 interfaces).
 
 **Next.** A third round on revision 4, before stage 1.
+
+---
+
+# Round 3 — Part A of revision 4 (2026-10-05/06)
+
+**Scope:** sections 0–3, core stages 0–5, A-48 and A-49. The prompts told the lenses that the
+round-2 machinery had been removed on purpose. Same four lenses, each with an adversarial verifier.
+
+**Verdict:** all four lenses failed.
+
+| Lens | Findings | Blockers |
+|---|---|---|
+| Development | 17 | 1 |
+| Test | 18 | 1 |
+| Acceptance | 13 | 1 |
+| Production | 16 | 3 |
+
+Verifiers: 39 confirmed, 25 partial, 0 refuted.
+
+**Blockers — none in stage 1:**
+
+- **A-48 cuts every pre-existing hive** (D3-1, T3-16, A3-1, P3-2): they have no pin, and the
+  motherbee cannot compute one.
+- **The observe window is blind on non-internal interfaces** (P3-1), so the automatic switch would
+  close SSH there with no evidence.
+- **`ADD_HIVE_FINALIZE` on the motherbee is a kill switch** (P3-3), the twin of the
+  `REMOVE_HIVE_CLEANUP` guard that A-48 already planned.
+
+**Stage 1 findings:**
+
+| Findings | Where they went |
+|---|---|
+| D3-2, T3-5, A3-10, P3-15 | Moot: the Docker lab was removed (D23). |
+| D3-8, T3-1 | Fixtures for `*`, `[::]`, the scope before and after the brackets, several owners or none, mapped loopback; one alert kind per process. |
+| D3-9, T3-3 | The migration is a separate, non-fatal script that runs before the orchestrator starts, with 19 checks in CI. |
+| D3-10, T3-4 | The guard checks each URL on its own, runs on every push, fails on a missing input, and keeps history out of scope. |
+| T3-2 | A positive control in the gate: a dummy `sy-admin` listener must produce the alert. |
+| T3-6 | The SSE item is dropped, and `lab/posture-probe.sh` is versioned. |
+| D3-3, P3-3 | The spoke-only guards ship with stage 1 (D24). |
+| A3-13 | D3 and D16 are marked approved. |
+
+**An adversarial review of the stage 1 diff** found no blocker or major. Its minors are fixed (one
+alert per process, guard hardening, the scope parse order, a warning when `ss` stops parsing, the
+migration on symlinks and CRLF, a tunnel carrying 8080) or became moot with the Docker lab's
+removal. The theoretical upgrade race, where Archi restarts on its own between unpack and postinst,
+is left: the listener check would report it.
+
+**Everything else** (stages 2–5, A-48, A-49) is listed in spec §8. It becomes revision 6, with a
+DTAP round 4, before any of those stages is built.
