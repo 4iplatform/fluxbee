@@ -360,6 +360,14 @@ struct WanSection {
     gateway_name: Option<String>,
     listen: Option<String>,
     authorized_hives: Option<Vec<String>>,
+    /// On a spoke, the motherbee it dials (`add_hive` writes one). The router reads it for the
+    /// WAN; the orchestrator reads it for the motherbee's static Syncthing address (stage 2).
+    uplinks: Option<Vec<WanUplink>>,
+}
+
+#[derive(Debug, Deserialize)]
+struct WanUplink {
+    address: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -2388,6 +2396,14 @@ async fn watchdog_tick(state: &OrchestratorState) {
 
     if let Err(err) = watchdog_blob_sync(state).await {
         tracing::warn!(error = %err, "blob sync watchdog failed");
+    }
+
+    // Host posture stage 2: Syncthing peer addresses (A-47), about once a minute.
+    if SYNCTHING_ADDRESS_TICKS.fetch_add(1, Ordering::Relaxed) % SYNCTHING_ADDRESS_EVERY_TICKS == 0
+    {
+        if let Err(err) = reconcile_syncthing_peer_addresses(state).await {
+            tracing::warn!(error = %err, "syncthing peer address reconcile failed; retrying next round");
+        }
     }
 
     // watchdog_egress_reconcile runs blocking subprocess I/O (nft/sysctl, and on
@@ -7255,11 +7271,35 @@ fn valid_syncthing_device_id(device_id: &str) -> bool {
         .all(|ch| ch.is_ascii_uppercase() || ch.is_ascii_digit() || ch == '-')
 }
 
-fn valid_syncthing_peer_address(address: &str) -> bool {
-    address
-        .trim()
-        .strip_prefix("tcp://")
-        .is_some_and(|socket| socket.parse::<std::net::SocketAddr>().is_ok())
+/// Where a Syncthing peer is reached (host posture stage 2, docs/host-posture-and-exposure-spec-v1.md
+/// §3.5). `AcceptOnly` is Syncthing's `dynamic`: this side never dials once discovery is off, and
+/// the peer dials in. Spokes reach the motherbee at its `Static` address; the motherbee accepts.
+/// There is no implicit default on purpose: an `Option` that fell back to `dynamic` is what left
+/// worker1 and the motherbee depending on public discovery to find each other (FINDINGS A-47).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SyncthingPeerAddress {
+    AcceptOnly,
+    Static(std::net::SocketAddr),
+}
+
+impl SyncthingPeerAddress {
+    /// The `<address>` value written into config.xml.
+    fn config_value(self) -> String {
+        match self {
+            Self::AcceptOnly => "dynamic".to_string(),
+            Self::Static(addr) => format!("tcp://{addr}"),
+        }
+    }
+
+    /// A `tcp://<ip>:<port>` literal. Names and `dynamic` are refused.
+    fn parse_static(value: &str) -> Option<Self> {
+        value
+            .trim()
+            .strip_prefix("tcp://")?
+            .parse::<std::net::SocketAddr>()
+            .ok()
+            .map(Self::Static)
+    }
 }
 
 fn syncthing_tcp_address_for_host(host: &str) -> Result<String, OrchestratorError> {
@@ -7534,16 +7574,14 @@ fn ensure_syncthing_top_level_device_in_config_xml(
     config_xml: &str,
     device_id: &str,
     device_name: &str,
-    peer_address: Option<&str>,
+    peer_address: SyncthingPeerAddress,
 ) -> Result<(String, bool), OrchestratorError> {
     let normalized_id = device_id.trim();
     if !valid_syncthing_device_id(normalized_id) {
         return Err(format!("invalid syncthing device id '{}'", device_id).into());
     }
-    let desired_address = peer_address.unwrap_or("dynamic").trim();
-    if desired_address.is_empty() {
-        return Err("syncthing peer address cannot be empty".into());
-    }
+    let desired_address = peer_address.config_value();
+    let desired_address = desired_address.as_str();
 
     let (self_closing_device_re, device_re) = syncthing_named_device_regexes(normalized_id)?;
     let defaults_re = Regex::new(r#"(?s)<defaults>.*?</defaults>"#)?;
@@ -7610,6 +7648,65 @@ fn ensure_syncthing_top_level_device_in_config_xml(
     out.push_str(&new_device);
     out.push_str(&updated[insert_at..]);
     Ok((out, true))
+}
+
+/// Serializes every read-modify-write of Syncthing's config.xml (host posture stage 2). Three
+/// unlocked writers used to race each other.
+static SYNCTHING_CONFIG_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// The single writer of Syncthing's config.xml. Under one lock it reads the file, applies
+/// `update` and, when something changed, replaces the file with an atomic rename that keeps its
+/// owner and mode (Syncthing runs as fluxbee; the orchestrator as root).
+/// `scripts/check_syncthing_single_writer.sh` keeps every write going through here.
+fn update_syncthing_config<F>(config_path: &Path, update: F) -> Result<bool, OrchestratorError>
+where
+    F: FnOnce(&str) -> Result<(String, bool), OrchestratorError>,
+{
+    let _guard = SYNCTHING_CONFIG_LOCK
+        .lock()
+        .map_err(|_| "syncthing config lock poisoned")?;
+    let current = fs::read_to_string(config_path)?;
+    let (updated, changed) = update(&current)?;
+    if !changed || updated == current {
+        return Ok(false);
+    }
+    replace_file_keeping_owner(config_path, updated.as_bytes())?;
+    Ok(true)
+}
+
+/// Writes `contents` to a sibling temp file with `path`'s owner and mode, then renames it over
+/// `path`: a reader never sees a half-written file, and the owner never changes.
+fn replace_file_keeping_owner(path: &Path, contents: &[u8]) -> Result<(), OrchestratorError> {
+    use std::os::unix::fs::MetadataExt;
+    let meta = fs::metadata(path)?;
+    let mode = meta.mode() & 0o7777;
+    let dir = path
+        .parent()
+        .ok_or_else(|| format!("path '{}' has no parent directory", path.display()))?;
+    let name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("fluxbee-write");
+    let tmp = dir.join(format!(".{name}.fluxbee-tmp-{}", std::process::id()));
+    let result = (|| -> Result<(), OrchestratorError> {
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(mode)
+            .open(&tmp)?;
+        file.write_all(contents)?;
+        file.sync_all()?;
+        drop(file);
+        std::os::unix::fs::chown(&tmp, Some(meta.uid()), Some(meta.gid()))?;
+        fs::set_permissions(&tmp, fs::Permissions::from_mode(mode))?;
+        fs::rename(&tmp, path)?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&tmp);
+    }
+    result
 }
 
 fn syncthing_named_device_regexes(device_id: &str) -> Result<(Regex, Regex), OrchestratorError> {
@@ -7780,7 +7877,7 @@ fn reconcile_syncthing_peer_xml(
     dist: &DistRuntimeConfig,
     peer_device_id: &str,
     peer_name: &str,
-    peer_address: Option<&str>,
+    peer_address: SyncthingPeerAddress,
     is_motherbee: bool,
     spoke_role: HiveRole,
 ) -> Result<(String, bool), OrchestratorError> {
@@ -7917,26 +8014,23 @@ fn ensure_local_syncthing_peer_link(
     dist: &DistRuntimeConfig,
     peer_device_id: &str,
     peer_name: &str,
-    peer_address: Option<&str>,
+    peer_address: SyncthingPeerAddress,
     is_motherbee: bool,
     spoke_role: HiveRole,
 ) -> Result<bool, OrchestratorError> {
     let config_path = sync.sync_data_dir.join("config.xml");
-    let current = fs::read_to_string(&config_path)?;
-    let (updated, changed) = reconcile_syncthing_peer_xml(
-        &current,
-        blob,
-        dist,
-        peer_device_id,
-        peer_name,
-        peer_address,
-        is_motherbee,
-        spoke_role,
-    )?;
-    if changed {
-        fs::write(&config_path, updated)?;
-    }
-    Ok(changed)
+    update_syncthing_config(&config_path, |current| {
+        reconcile_syncthing_peer_xml(
+            current,
+            blob,
+            dist,
+            peer_device_id,
+            peer_name,
+            peer_address,
+            is_motherbee,
+            spoke_role,
+        )
+    })
 }
 
 async fn ensure_syncthing_peer_link_runtime(
@@ -7945,7 +8039,7 @@ async fn ensure_syncthing_peer_link_runtime(
     dist: &DistRuntimeConfig,
     peer_device_id: &str,
     peer_name: &str,
-    peer_address: Option<&str>,
+    peer_address: SyncthingPeerAddress,
     is_motherbee: bool,
     spoke_role: HiveRole,
 ) -> Result<(), OrchestratorError> {
@@ -7982,6 +8076,338 @@ async fn ensure_syncthing_peer_link_runtime(
     )
     .await?;
     wait_for_syncthing_health(sync).await?;
+    Ok(())
+}
+
+// ===========================================================================
+// Host posture, stage 2: Syncthing peer addresses (FINDINGS A-47,
+// docs/host-posture-and-exposure-spec-v1.md §3.5). A spoke reaches the motherbee at a static
+// address and the motherbee only accepts, so no link depends on discovery. This reconciles the
+// joined hives too, not only new joins; on PROD worker1 and the motherbee had `dynamic` on both
+// sides. Syncthing restarts only when the config changed.
+// ===========================================================================
+
+/// Watchdog tick counter for the address reconcile. At the 5s cadence, 12 ticks ≈ 60s; the first
+/// tick runs right after bootstrap.
+static SYNCTHING_ADDRESS_TICKS: AtomicU64 = AtomicU64::new(0);
+const SYNCTHING_ADDRESS_EVERY_TICKS: u64 = 12;
+
+/// One named, top-level `<device>` of config.xml: a peer declaration (or the local device).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SyncthingDeclaredDevice {
+    id: String,
+    name: String,
+    address: String,
+}
+
+/// The named, top-level `<device>` blocks of config.xml. Folder membership entries carry no name,
+/// and the devices inside `<defaults>` are templates; both are skipped.
+fn syncthing_declared_devices(
+    config_xml: &str,
+) -> Result<Vec<SyncthingDeclaredDevice>, OrchestratorError> {
+    let defaults_re = Regex::new(r#"(?s)<defaults>.*?</defaults>"#)?;
+    let without_defaults = defaults_re.replace_all(config_xml, "");
+    let block_re = Regex::new(r#"(?s)<device\b([^>/]*)>(.*?)</device>|<device\b([^>/]*)/>"#)?;
+    let id_re = Regex::new(r#"\bid="([^"]+)""#)?;
+    let name_re = Regex::new(r#"\bname="([^"]*)""#)?;
+    let address_re = Regex::new(r#"<address>([^<]*)</address>"#)?;
+    let mut out = Vec::new();
+    for caps in block_re.captures_iter(&without_defaults) {
+        let (attrs, body) = match (caps.get(1), caps.get(3)) {
+            (Some(attrs), _) => (
+                attrs.as_str(),
+                caps.get(2).map(|m| m.as_str()).unwrap_or(""),
+            ),
+            (None, Some(attrs)) => (attrs.as_str(), ""),
+            _ => continue,
+        };
+        let Some(name) = name_re.captures(attrs).map(|c| c[1].to_string()) else {
+            continue;
+        };
+        let Some(id) = id_re.captures(attrs).map(|c| c[1].to_string()) else {
+            continue;
+        };
+        let address = address_re
+            .captures(body)
+            .map(|c| c[1].trim().to_string())
+            .unwrap_or_default();
+        out.push(SyncthingDeclaredDevice { id, name, address });
+    }
+    Ok(out)
+}
+
+/// On a spoke: the motherbee device(s) whose address is not the static one, as (id, name).
+fn spoke_motherbee_device_updates(
+    devices: &[SyncthingDeclaredDevice],
+    local_device_id: &str,
+    motherbee_name: &str,
+    address: SyncthingPeerAddress,
+) -> Vec<(String, String)> {
+    let desired = address.config_value();
+    devices
+        .iter()
+        .filter(|d| d.id != local_device_id && d.name == motherbee_name && d.address != desired)
+        .map(|d| (d.id.clone(), d.name.clone()))
+        .collect()
+}
+
+/// What the motherbee changes in its Syncthing peers.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+struct MotherbeePeerPlan {
+    /// Registered devices still declared with a fixed address, as (id, name).
+    accept_only: Vec<(String, String)>,
+    /// Devices no registry entry claims, or a second device under a registered name.
+    orphans: Vec<(String, String)>,
+    /// (hive_id, device id) to record in a registry entry that has none (the existing egress).
+    backfill: Vec<(String, String)>,
+}
+
+/// The motherbee's plan for its declared devices against the hive registry (hive_id → recorded
+/// device id). A device is a hive's when its name is that hive_id, as the joins name them; when
+/// the entry records a device id, only that device is.
+fn motherbee_peer_plan(
+    devices: &[SyncthingDeclaredDevice],
+    local_device_id: &str,
+    registry: &BTreeMap<String, Option<String>>,
+) -> MotherbeePeerPlan {
+    let mut plan = MotherbeePeerPlan::default();
+    for device in devices {
+        if device.id == local_device_id {
+            continue;
+        }
+        match registry.get(&device.name) {
+            None => plan.orphans.push((device.id.clone(), device.name.clone())),
+            Some(Some(recorded)) if recorded != &device.id => {
+                plan.orphans.push((device.id.clone(), device.name.clone()))
+            }
+            Some(recorded) => {
+                if recorded.is_none() {
+                    let same_name = devices
+                        .iter()
+                        .filter(|d| d.id != local_device_id && d.name == device.name)
+                        .count();
+                    if same_name == 1 {
+                        plan.backfill.push((device.name.clone(), device.id.clone()));
+                    }
+                }
+                if device.address != SyncthingPeerAddress::AcceptOnly.config_value() {
+                    plan.accept_only
+                        .push((device.id.clone(), device.name.clone()));
+                }
+            }
+        }
+    }
+    plan
+}
+
+/// Applies the accept-only part of a plan and removes the given orphans (their folder memberships
+/// and their declaration).
+fn apply_motherbee_peer_plan_xml(
+    config_xml: &str,
+    plan: &MotherbeePeerPlan,
+    removable_orphans: &[String],
+    blob: &BlobRuntimeConfig,
+    dist: &DistRuntimeConfig,
+) -> Result<(String, bool), OrchestratorError> {
+    let mut updated = config_xml.to_string();
+    let mut changed = false;
+    for (id, name) in &plan.accept_only {
+        let (next, c) = ensure_syncthing_top_level_device_in_config_xml(
+            &updated,
+            id,
+            name,
+            SyncthingPeerAddress::AcceptOnly,
+        )?;
+        updated = next;
+        changed |= c;
+    }
+    for id in removable_orphans {
+        let (next, c) = reconcile_syncthing_peer_removal_xml(&updated, blob, dist, id)?;
+        updated = next;
+        changed |= c;
+    }
+    Ok((updated, changed))
+}
+
+/// The hive registry as hive_id → recorded Syncthing device id. An unreadable registry is an
+/// error, so the caller removes no orphan on a registry it could not read.
+fn registered_syncthing_devices(
+    root: &Path,
+) -> Result<BTreeMap<String, Option<String>>, OrchestratorError> {
+    let mut out = BTreeMap::new();
+    for entry in fs::read_dir(root)?.flatten() {
+        let Ok(hive_id) = entry.file_name().into_string() else {
+            continue;
+        };
+        if !entry.path().join("info.yaml").exists() {
+            continue;
+        }
+        let device = read_hive_info(root, &hive_id).ok().and_then(|info| {
+            info.get("syncthing_device_id")
+                .and_then(|v| v.as_str())
+                .map(str::to_string)
+        });
+        out.insert(hive_id, device);
+    }
+    Ok(out)
+}
+
+/// Records the Syncthing device id in a registry entry that has none. Skipped while a join or a
+/// removal holds that hive; the next round retries.
+fn record_syncthing_device_id(
+    state: &OrchestratorState,
+    root: &Path,
+    hive_id: &str,
+    device_id: &str,
+) {
+    let Some(_guard) = state.try_lock_hive_topology(hive_id) else {
+        return;
+    };
+    let mut info = match read_hive_info(root, hive_id) {
+        Ok(info) => info,
+        Err(err) => {
+            tracing::warn!(hive_id = hive_id, error = %err, "syncthing: cannot read registry entry for backfill");
+            return;
+        }
+    };
+    if info
+        .get("syncthing_device_id")
+        .and_then(|v| v.as_str())
+        .is_some()
+    {
+        return;
+    }
+    let Some(obj) = info.as_object_mut() else {
+        return;
+    };
+    obj.insert(
+        "syncthing_device_id".to_string(),
+        serde_json::Value::String(device_id.to_string()),
+    );
+    match write_hive_info(root, hive_id, &info) {
+        Ok(()) => tracing::info!(
+            hive_id = hive_id,
+            device_id = device_id,
+            "syncthing: device id recorded in the registry"
+        ),
+        Err(err) => {
+            tracing::warn!(hive_id = hive_id, error = %err, "syncthing: device id backfill failed")
+        }
+    }
+}
+
+/// On a spoke: the motherbee's static Syncthing address, the host of its WAN uplink at port 22000.
+/// `None` when the hive has no uplink (the motherbee itself, or a hive not joined yet).
+fn spoke_motherbee_syncthing_address(
+    state: &OrchestratorState,
+) -> Result<Option<SyncthingPeerAddress>, OrchestratorError> {
+    let hive = load_hive(&state.config_dir)?;
+    let Some(uplink) = hive
+        .wan
+        .as_ref()
+        .and_then(|wan| wan.uplinks.as_ref())
+        .and_then(|uplinks| uplinks.first())
+    else {
+        return Ok(None);
+    };
+    let (host, _) = parse_host_port(uplink.address.trim())?;
+    let address = syncthing_tcp_address_for_host(&host)?;
+    Ok(SyncthingPeerAddress::parse_static(&address))
+}
+
+/// Stage 2 reconcile, from the watchdog. On a spoke the motherbee device gets its static address;
+/// on the motherbee every registered spoke is accept-only, the existing egress gets its device id
+/// recorded, and devices no registry entry claims are removed when they are not connected.
+async fn reconcile_syncthing_peer_addresses(
+    state: &OrchestratorState,
+) -> Result<(), OrchestratorError> {
+    let blob = current_blob_runtime_config(state);
+    let dist = current_dist_runtime_config(state);
+    let sync = effective_syncthing_runtime_config(&blob, &dist);
+    if !sync.sync_enabled
+        || !(blob_sync_tool_is_syncthing(&sync) || dist_sync_tool_is_syncthing(&dist))
+    {
+        return Ok(());
+    }
+    let config_path = sync.sync_data_dir.join("config.xml");
+    if !config_path.exists() {
+        return Ok(());
+    }
+    let local_device_id = local_syncthing_device_id(&sync)?;
+
+    let changed = if state.is_motherbee {
+        let root = hives_root();
+        let registry = match registered_syncthing_devices(&root) {
+            Ok(registry) => Some(registry),
+            Err(err) => {
+                tracing::warn!(error = %err, "syncthing: hive registry unreadable; no orphan is removed this round");
+                None
+            }
+        };
+        let registry_for_plan = registry.clone().unwrap_or_default();
+        let registry_usable = registry.as_ref().is_some_and(|r| !r.is_empty());
+        let mut backfill = Vec::new();
+        let changed = update_syncthing_config(&config_path, |current| {
+            let devices = syncthing_declared_devices(current)?;
+            let plan = motherbee_peer_plan(&devices, &local_device_id, &registry_for_plan);
+            let mut removable = Vec::new();
+            for (id, name) in &plan.orphans {
+                // Never remove on an unusable registry or a live connection: a device whose entry
+                // could not be read, or that is in use, is reported and kept.
+                let connected = syncthing_device_connected(&sync, id).unwrap_or(true);
+                if registry_usable && !connected {
+                    tracing::info!(device = %id, name = %name, "syncthing: removing a device no registered hive claims");
+                    removable.push(id.clone());
+                } else {
+                    tracing::warn!(device = %id, name = %name, connected = connected, registry_usable = registry_usable, "syncthing: device no registered hive claims, kept");
+                }
+            }
+            if !plan.accept_only.is_empty() {
+                tracing::info!(devices = ?plan.accept_only, "syncthing: spokes set to accept-only (the motherbee no longer dials them)");
+            }
+            backfill = plan.backfill.clone();
+            apply_motherbee_peer_plan_xml(current, &plan, &removable, &blob, &dist)
+        })?;
+        for (hive_id, device_id) in backfill {
+            record_syncthing_device_id(state, &root, &hive_id, &device_id);
+        }
+        changed
+    } else {
+        let Some(address) = spoke_motherbee_syncthing_address(state)? else {
+            return Ok(());
+        };
+        update_syncthing_config(&config_path, |current| {
+            let devices = syncthing_declared_devices(current)?;
+            let mut updated = current.to_string();
+            let mut changed = false;
+            for (id, name) in
+                spoke_motherbee_device_updates(&devices, &local_device_id, PRIMARY_HIVE_ID, address)
+            {
+                tracing::info!(device = %id, address = %address.config_value(), "syncthing: the motherbee set to its static address");
+                let (next, c) =
+                    ensure_syncthing_top_level_device_in_config_xml(&updated, &id, &name, address)?;
+                updated = next;
+                changed |= c;
+            }
+            Ok((updated, changed))
+        })?
+    };
+
+    if changed {
+        tracing::info!(
+            service = SYNCTHING_SERVICE_NAME,
+            "syncthing peer addresses reconciled; restarting service"
+        );
+        let mut restart = Command::new("systemctl");
+        restart.arg("restart").arg(SYNCTHING_SERVICE_NAME);
+        run_cmd(restart, "systemctl restart")?;
+        wait_for_service_active(
+            SYNCTHING_SERVICE_NAME,
+            Duration::from_secs(SYNCTHING_BOOTSTRAP_TIMEOUT_SECS),
+        )
+        .await?;
+        wait_for_syncthing_health(&sync).await?;
+    }
     Ok(())
 }
 
@@ -8100,13 +8526,9 @@ fn ensure_local_syncthing_peer_unlink(
     peer_device_id: &str,
 ) -> Result<bool, OrchestratorError> {
     let config_path = sync.sync_data_dir.join("config.xml");
-    let current = fs::read_to_string(&config_path)?;
-    let (updated, changed) =
-        reconcile_syncthing_peer_removal_xml(&current, blob, dist, peer_device_id)?;
-    if changed {
-        fs::write(&config_path, updated)?;
-    }
-    Ok(changed)
+    update_syncthing_config(&config_path, |current| {
+        reconcile_syncthing_peer_removal_xml(current, blob, dist, peer_device_id)
+    })
 }
 
 async fn ensure_syncthing_peer_unlink_runtime(
@@ -8287,12 +8709,14 @@ fn reconcile_local_syncthing_folders(
     role: HiveRole,
 ) -> Result<Vec<String>, OrchestratorError> {
     let config_path = sync.sync_data_dir.join("config.xml");
-    let current = fs::read_to_string(&config_path)?;
-    let (updated, changed_folders) =
-        reconcile_syncthing_folders_xml(&current, blob, dist, is_motherbee, role)?;
-    if !changed_folders.is_empty() {
-        fs::write(&config_path, updated)?;
-    }
+    let mut changed_folders = Vec::new();
+    update_syncthing_config(&config_path, |current| {
+        let (updated, changed) =
+            reconcile_syncthing_folders_xml(current, blob, dist, is_motherbee, role)?;
+        let any = !changed.is_empty();
+        changed_folders = changed;
+        Ok((updated, any))
+    })?;
     Ok(changed_folders)
 }
 
@@ -18452,16 +18876,35 @@ async fn add_hive_finalize_local_flow(
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(str::to_string);
-    if let Some(address) = syncthing_peer_address.as_deref() {
-        if !valid_syncthing_peer_address(address) {
+    // Host posture stage 2: a spoke always reaches the motherbee at a static address, so the
+    // link never depends on discovery (A-47). A finalize that links a peer without one is
+    // refused instead of being written as `dynamic`.
+    let syncthing_peer_static = match (
+        syncthing_peer_device_id.as_deref(),
+        syncthing_peer_address.as_deref(),
+    ) {
+        (_, Some(address)) => match SyncthingPeerAddress::parse_static(address) {
+            Some(parsed) => Some(parsed),
+            None => {
+                return serde_json::json!({
+                    "status": "error",
+                    "error_code": "INVALID_REQUEST",
+                    "message": format!("invalid syncthing_peer_address '{address}'"),
+                    "hive_id": state.hive_id,
+                });
+            }
+        },
+        (Some(_), None) => {
             return serde_json::json!({
                 "status": "error",
                 "error_code": "INVALID_REQUEST",
-                "message": format!("invalid syncthing_peer_address '{address}'"),
+                "message": "syncthing_peer_address is required with syncthing_peer_device_id: \
+                            the spoke reaches the motherbee at a static address",
                 "hive_id": state.hive_id,
             });
         }
-    }
+        (None, None) => None,
+    };
     let mut updated: Vec<String> = Vec::new();
     let mut unchanged: Vec<String> = Vec::new();
     let mut restarted: Vec<String> = Vec::new();
@@ -18587,14 +19030,16 @@ async fn add_hive_finalize_local_flow(
     restarted.extend(vendor_result.restarted);
 
     let mut syncthing_peer_linked = false;
-    if let Some(peer_device_id) = syncthing_peer_device_id.as_deref() {
+    if let (Some(peer_device_id), Some(peer_address)) =
+        (syncthing_peer_device_id.as_deref(), syncthing_peer_static)
+    {
         if let Err(err) = ensure_syncthing_peer_link_runtime(
             &desired_sync,
             &desired_blob,
             &desired_dist,
             peer_device_id,
             &syncthing_peer_name,
-            syncthing_peer_address.as_deref(),
+            peer_address,
             state.is_motherbee,
             // This link is the local hive's own; on a spoke that is its own role.
             state.role,
@@ -19440,6 +19885,26 @@ async fn add_hive_flow(
     } else {
         None
     };
+    // Host posture stage 2: the worker reaches the motherbee's Syncthing at the same address it
+    // dials for the WAN uplink, as egress and ingress joins already do (A-47).
+    let mother_syncthing_address = if syncthing_expected {
+        let wan_listen = state.wan_listen.clone().unwrap_or_default();
+        match resolve_worker_uplink_address(&wan_listen, address)
+            .and_then(|uplink| parse_host_port(&uplink))
+            .and_then(|(host, _)| syncthing_tcp_address_for_host(&host))
+        {
+            Ok(value) => Some(value),
+            Err(err) => {
+                return serde_json::json!({
+                    "status": "error",
+                    "error_code": "SYNC_SETUP_FAILED",
+                    "message": format!("motherbee Syncthing address unavailable: {err}"),
+                });
+            }
+        }
+    } else {
+        None
+    };
     let mut dist_sync_ready =
         !desired_dist.sync_enabled || !dist_sync_tool_is_syncthing(&desired_dist);
     let root = hives_root();
@@ -19564,7 +20029,7 @@ async fn add_hive_flow(
                 dist_sync_probe_timeout_secs,
                 mother_syncthing_device_id.as_deref(),
                 Some(&state.hive_id),
-                None,
+                mother_syncthing_address.as_deref(),
             )
             .await
             {
@@ -19642,7 +20107,7 @@ async fn add_hive_flow(
                         &desired_dist,
                         &peer_device_id,
                         hive_id,
-                        None,
+                        SyncthingPeerAddress::AcceptOnly,
                         state.is_motherbee,
                         HiveRole::Worker,
                     )
@@ -20340,7 +20805,7 @@ async fn add_hive_flow(
         dist_sync_probe_timeout_secs,
         mother_syncthing_device_id.as_deref(),
         Some(&state.hive_id),
-        None,
+        mother_syncthing_address.as_deref(),
     )
     .await
     {
@@ -20394,7 +20859,7 @@ async fn add_hive_flow(
             &desired_dist,
             &peer_device_id,
             hive_id,
-            None,
+            SyncthingPeerAddress::AcceptOnly,
             state.is_motherbee,
             HiveRole::Worker,
         )
@@ -21008,7 +21473,7 @@ async fn add_egress_hive_flow(
                                     &desired_dist,
                                     &device_id,
                                     hive_id,
-                                    None,
+                                    SyncthingPeerAddress::AcceptOnly,
                                     state.is_motherbee,
                                     HiveRole::Egress,
                                 )
@@ -21524,15 +21989,6 @@ async fn add_ingress_hive_flow(
             )
         }
     };
-    let ingress_syncthing_address = match syncthing_tcp_address_for_host(address) {
-        Ok(value) => value,
-        Err(err) => {
-            return err_payload(
-                "CONFIG_FAILED",
-                format!("resolve ingress Syncthing address failed: {err}"),
-            )
-        }
-    };
     let storage_path = state
         .storage_path
         .try_lock()
@@ -21843,7 +22299,7 @@ async fn add_ingress_hive_flow(
         &desired_dist,
         &ingress_syncthing_device_id,
         hive_id,
-        Some(&ingress_syncthing_address),
+        SyncthingPeerAddress::AcceptOnly,
         state.is_motherbee,
         HiveRole::Ingress,
     )
@@ -25765,13 +26221,15 @@ mod tests {
             &dist,
             INGRESS_DEVICE_ID,
             "ingress-1",
-            Some("tcp://192.0.2.10:22000"),
+            SyncthingPeerAddress::AcceptOnly,
             true,
             HiveRole::Ingress,
         )
         .unwrap();
         assert!(changed);
-        assert!(mother.contains("<address>tcp://192.0.2.10:22000</address>"));
+        // Stage 2: the motherbee never dials a spoke; the ingress dials it.
+        assert!(mother.contains("<address>dynamic</address>"));
+        assert!(!mother.contains("tcp://192.0.2.10:22000"));
         assert!(mother.contains(&format!("id=\"{}\"", SYNCTHING_FOLDER_BLOB_PUBLIC_ID)));
 
         let folder_block = |xml: &str, id: &str| -> Option<String> {
@@ -25830,7 +26288,7 @@ mod tests {
             &dist,
             INGRESS_DEVICE_ID,
             "motherbee",
-            Some("tcp://192.0.2.1:22000"),
+            SyncthingPeerAddress::Static("192.0.2.1:22000".parse().unwrap()),
             false,
             HiveRole::Ingress,
         )
@@ -25856,7 +26314,7 @@ mod tests {
             &config,
             REMOTE_DEVICE_ID,
             "ingress-public-test",
-            Some("tcp://192.0.2.44:22000"),
+            SyncthingPeerAddress::Static("192.0.2.44:22000".parse().unwrap()),
         )
         .unwrap();
 
@@ -25874,11 +26332,170 @@ mod tests {
             &updated,
             REMOTE_DEVICE_ID,
             "ingress-public-test",
-            Some("tcp://192.0.2.44:22000"),
+            SyncthingPeerAddress::Static("192.0.2.44:22000".parse().unwrap()),
         )
         .unwrap();
         assert!(!changed_again);
         assert_eq!(idempotent, updated);
+    }
+
+    // Host posture stage 2 fixtures: the PROD shapes of 2026-10-06 with made-up device ids (the
+    // repo is public). On the motherbee: worker1 and egress1 `dynamic`, ingress1 static, plus a
+    // device left by an old removal and a stale second device under "worker1".
+    const ST_MB_LOCAL: &str = "MBLOCAL-AAAAAAA-BBBBBBB";
+    const ST_WORKER1: &str = "WORKER1-AAAAAAA-BBBBBBB";
+    const ST_WORKER1_STALE: &str = "WORKER1-STALEXX-BBBBBBB";
+    const ST_INGRESS1: &str = "INGRESS-AAAAAAA-BBBBBBB";
+    const ST_EGRESS1: &str = "EGRESS1-AAAAAAA-BBBBBBB";
+    const ST_OLDHIVE: &str = "OLDHIVE-AAAAAAA-BBBBBBB";
+
+    fn stage2_motherbee_config() -> String {
+        format!(
+            "<configuration version=\"51\">\n    <folder id=\"{vendor}\" label=\"Vendor\" path=\"/var/lib/fluxbee/dist/vendor\" type=\"sendonly\">\n        <device id=\"{mb}\" introducedBy=\"\"></device>\n        <device id=\"{w}\" introducedBy=\"\"></device>\n        <device id=\"{ws}\" introducedBy=\"\"></device>\n        <device id=\"{i}\" introducedBy=\"\"></device>\n        <device id=\"{e}\" introducedBy=\"\"></device>\n        <device id=\"{o}\" introducedBy=\"\"></device>\n    </folder>\n    <device id=\"{mb}\" name=\"fb-mb\" compression=\"metadata\" introducer=\"false\">\n        <address>dynamic</address>\n    </device>\n    <device id=\"{w}\" name=\"worker1\" compression=\"metadata\" introducer=\"false\">\n        <address>dynamic</address>\n    </device>\n    <device id=\"{ws}\" name=\"worker1\" compression=\"metadata\" introducer=\"false\">\n        <address>dynamic</address>\n    </device>\n    <device id=\"{i}\" name=\"ingress1\" compression=\"metadata\" introducer=\"false\">\n        <address>tcp://10.10.10.30:22000</address>\n    </device>\n    <device id=\"{e}\" name=\"egress1\" compression=\"metadata\" introducer=\"false\">\n        <address>dynamic</address>\n    </device>\n    <device id=\"{o}\" name=\"old-worker\" compression=\"metadata\" introducer=\"false\">\n        <address>dynamic</address>\n    </device>\n    <defaults>\n        <device id=\"\" compression=\"metadata\"><address>dynamic</address></device>\n        <folder id=\"\" path=\"\"><device id=\"{mb}\"/></folder>\n    </defaults>\n</configuration>\n",
+            vendor = SYNCTHING_FOLDER_DIST_VENDOR_ID,
+            mb = ST_MB_LOCAL,
+            w = ST_WORKER1,
+            ws = ST_WORKER1_STALE,
+            i = ST_INGRESS1,
+            e = ST_EGRESS1,
+            o = ST_OLDHIVE,
+        )
+    }
+
+    fn stage2_registry() -> BTreeMap<String, Option<String>> {
+        BTreeMap::from([
+            ("worker1".to_string(), Some(ST_WORKER1.to_string())),
+            ("ingress1".to_string(), Some(ST_INGRESS1.to_string())),
+            // The PROD egress entry records no device id.
+            ("egress1".to_string(), None),
+        ])
+    }
+
+    #[test]
+    fn syncthing_declared_devices_reads_only_peer_declarations() {
+        let devices = syncthing_declared_devices(&stage2_motherbee_config()).unwrap();
+        let names: Vec<&str> = devices.iter().map(|d| d.name.as_str()).collect();
+        assert_eq!(
+            names,
+            [
+                "fb-mb",
+                "worker1",
+                "worker1",
+                "ingress1",
+                "egress1",
+                "old-worker"
+            ]
+        );
+        let ingress = devices.iter().find(|d| d.id == ST_INGRESS1).unwrap();
+        assert_eq!(ingress.address, "tcp://10.10.10.30:22000");
+    }
+
+    #[test]
+    fn motherbee_plan_on_the_prod_shapes() {
+        let devices = syncthing_declared_devices(&stage2_motherbee_config()).unwrap();
+        let plan = motherbee_peer_plan(&devices, ST_MB_LOCAL, &stage2_registry());
+        assert_eq!(
+            plan.accept_only,
+            vec![(ST_INGRESS1.to_string(), "ingress1".to_string())]
+        );
+        assert_eq!(
+            plan.orphans,
+            vec![
+                (ST_WORKER1_STALE.to_string(), "worker1".to_string()),
+                (ST_OLDHIVE.to_string(), "old-worker".to_string()),
+            ]
+        );
+        assert_eq!(
+            plan.backfill,
+            vec![("egress1".to_string(), ST_EGRESS1.to_string())]
+        );
+    }
+
+    #[test]
+    fn motherbee_plan_applied_once_then_nothing_left() {
+        let blob = sample_blob_config();
+        let dist = sample_dist_config();
+        let config = stage2_motherbee_config();
+        let registry = stage2_registry();
+        let devices = syncthing_declared_devices(&config).unwrap();
+        let plan = motherbee_peer_plan(&devices, ST_MB_LOCAL, &registry);
+        let removable: Vec<String> = plan.orphans.iter().map(|(id, _)| id.clone()).collect();
+        let (updated, changed) =
+            apply_motherbee_peer_plan_xml(&config, &plan, &removable, &blob, &dist).unwrap();
+        assert!(changed);
+        assert!(!updated.contains("tcp://10.10.10.30:22000"));
+        assert!(!updated.contains(ST_OLDHIVE));
+        assert!(!updated.contains(ST_WORKER1_STALE));
+        assert!(updated.contains(ST_WORKER1));
+        let again = motherbee_peer_plan(
+            &syncthing_declared_devices(&updated).unwrap(),
+            ST_MB_LOCAL,
+            &registry,
+        );
+        assert!(again.accept_only.is_empty());
+        assert!(again.orphans.is_empty());
+        let (unchanged, changed_again) =
+            apply_motherbee_peer_plan_xml(&updated, &again, &[], &blob, &dist).unwrap();
+        assert!(!changed_again);
+        assert_eq!(unchanged, updated);
+    }
+
+    #[test]
+    fn spoke_gets_the_motherbee_static_once() {
+        let worker1 = format!(
+            "<configuration version=\"51\">\n    <device id=\"{w}\" name=\"fb-worker1\"><address>dynamic</address></device>\n    <device id=\"{mb}\" name=\"motherbee\"><address>dynamic</address></device>\n</configuration>\n",
+            w = ST_WORKER1,
+            mb = ST_MB_LOCAL,
+        );
+        let address = SyncthingPeerAddress::Static("10.10.10.10:22000".parse().unwrap());
+        let devices = syncthing_declared_devices(&worker1).unwrap();
+        let updates =
+            spoke_motherbee_device_updates(&devices, ST_WORKER1, PRIMARY_HIVE_ID, address);
+        assert_eq!(
+            updates,
+            vec![(ST_MB_LOCAL.to_string(), "motherbee".to_string())]
+        );
+        let (updated, changed) = ensure_syncthing_top_level_device_in_config_xml(
+            &worker1,
+            ST_MB_LOCAL,
+            "motherbee",
+            address,
+        )
+        .unwrap();
+        assert!(changed);
+        assert!(updated.contains("<address>tcp://10.10.10.10:22000</address>"));
+        let again = syncthing_declared_devices(&updated).unwrap();
+        assert!(
+            spoke_motherbee_device_updates(&again, ST_WORKER1, PRIMARY_HIVE_ID, address).is_empty()
+        );
+    }
+
+    #[test]
+    fn syncthing_config_writer_writes_only_on_change_and_keeps_the_mode() {
+        let dir = std::env::temp_dir().join(format!("fluxbee-st-writer-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.xml");
+        fs::write(&path, "<configuration/>\n").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o640)).unwrap();
+        let unchanged =
+            update_syncthing_config(&path, |current| Ok((current.to_string(), false))).unwrap();
+        assert!(!unchanged);
+        let changed = update_syncthing_config(&path, |_| {
+            Ok(("<configuration>new</configuration>\n".to_string(), true))
+        })
+        .unwrap();
+        assert!(changed);
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            "<configuration>new</configuration>\n"
+        );
+        use std::os::unix::fs::MetadataExt;
+        assert_eq!(fs::metadata(&path).unwrap().mode() & 0o7777, 0o640);
+        assert!(
+            fs::read_dir(&dir).unwrap().count() == 1,
+            "no temp file is left behind"
+        );
+        fs::remove_dir_all(&dir).unwrap();
     }
 
     // `ss -H -tlnp` captured read-only on the PROD motherbee on 2026-10-05 (0.1.56): Archi on
@@ -26015,8 +26632,18 @@ LISTEN 0 4096 0.0.0.0:notaport 0.0.0.0:* users:(("sy-architect",pid=1,fd=7))
             "tcp://[2001:db8::7]:22000"
         );
         assert!(syncthing_tcp_address_for_host("peer.example").is_err());
-        assert!(valid_syncthing_peer_address("tcp://192.0.2.7:22000"));
-        assert!(!valid_syncthing_peer_address("dynamic"));
+        assert_eq!(
+            SyncthingPeerAddress::parse_static("tcp://192.0.2.7:22000"),
+            Some(SyncthingPeerAddress::Static(
+                "192.0.2.7:22000".parse().unwrap()
+            ))
+        );
+        assert!(SyncthingPeerAddress::parse_static("tcp://[2001:db8::7]:22000").is_some());
+        assert_eq!(SyncthingPeerAddress::parse_static("dynamic"), None);
+        assert_eq!(
+            SyncthingPeerAddress::parse_static("tcp://peer.example:22000"),
+            None
+        );
     }
 
     fn sample_dist_config() -> DistRuntimeConfig {

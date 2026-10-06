@@ -23,3 +23,6 @@ jobs:
 
       - name: hive.yaml migration (packaging/fluxbee-migrate-config)
         run: bash scripts/packaging_tests/migrate_config_test.sh
+
+      - name: Syncthing config.xml has a single writer (stage 2)
+        run: bash scripts/check_syncthing_single_writer.sh
