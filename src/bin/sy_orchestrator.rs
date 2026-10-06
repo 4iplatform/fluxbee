@@ -912,7 +912,14 @@ async fn main() -> Result<(), OrchestratorError> {
         identity_sync_port = state.identity_sync_port,
         "blob/dist runtime config loaded"
     );
-    ensure_dirs(&config_dir, &state_dir, &run_dir, &state.blob, &state.dist)?;
+    ensure_dirs(
+        &config_dir,
+        &state_dir,
+        &run_dir,
+        &state.blob,
+        &state.dist,
+        state.is_motherbee,
+    )?;
     write_pid(&run_dir)?;
 
     bootstrap_local(&state, &socket_dir).await?;
@@ -5446,6 +5453,7 @@ fn ensure_dirs(
     run_dir: &Path,
     blob: &BlobRuntimeConfig,
     dist: &DistRuntimeConfig,
+    is_motherbee: bool,
 ) -> Result<(), OrchestratorError> {
     let storage_root = json_router::paths::storage_root_dir();
     let opa_root = storage_root.join("opa");
@@ -5508,7 +5516,11 @@ fn ensure_dirs(
     fs::create_dir_all(dist.path.join("policy"))?;
     if dist.sync_enabled && dist_sync_tool_is_syncthing(dist) {
         let service_user = resolve_syncthing_service_user(blob)?;
-        ensure_owned_tree(&dist.path, &service_user)?;
+        if is_motherbee {
+            ensure_root_owned_tree(&dist.path, &service_user)?;
+        } else {
+            ensure_owned_tree(&dist.path, &service_user)?;
+        }
     }
     fs::create_dir_all(runtimes_root())?;
     fs::create_dir_all(Path::new(DIST_CORE_BIN_SOURCE_DIR))?;
@@ -5783,6 +5795,26 @@ fn ensure_owned_tree(path: &Path, user: &str) -> Result<(), OrchestratorError> {
     let mut chown = Command::new("chown");
     chown.arg("-R").arg(format!("{user}:{group}")).arg(path);
     run_cmd(chown, "chown syncthing tree ownership")
+}
+
+/// The motherbee's dist tree is root's, and the Syncthing user only reads it (FINDINGS A-51). The
+/// motherbee only SENDS dist (every dist folder is send-only there), so Syncthing never writes in
+/// it, and everything else that writes it (the package, the orchestrator, SY.admin's publish) runs
+/// as root. Were it the Syncthing user's, that user could replace the core and vendor binaries the
+/// motherbee installs, and hands every spoke to install, as root. Only dist: blob/active is
+/// send-receive and Syncthing's home is its own, so they stay the Syncthing user's, and so does a
+/// spoke's dist, where Syncthing writes what it receives.
+fn ensure_root_owned_tree(path: &Path, reader: &str) -> Result<(), OrchestratorError> {
+    let dir = open_managed_dir(path)?;
+    let (_, gid) = linux_user_ids(reader)?;
+    let mut chown = Command::new("chown");
+    chown.arg("-R").arg(format!("0:{gid}")).arg(path);
+    run_cmd(chown, "chown dist tree to root")?;
+    let mut chmod = Command::new("chmod");
+    chmod.arg("-R").arg("g+rX,go-w").arg(path);
+    run_cmd(chmod, "make the dist tree readable to syncthing")?;
+    dir.set_permissions(fs::Permissions::from_mode(0o750))?;
+    Ok(())
 }
 
 fn syncthing_binary_available() -> bool {
@@ -29155,6 +29187,36 @@ mod tests {
             "the write left no temp of its own"
         );
         fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A-51: on the motherbee dist is root's and Syncthing only reads it; a spoke's stays the
+    /// Syncthing user's, because Syncthing writes what it receives there. The package must not
+    /// hand the motherbee's dist back to the Syncthing user at every upgrade.
+    #[test]
+    fn a51_the_motherbee_keeps_dist_and_a_spoke_hands_it_to_syncthing() {
+        let src = include_str!("sy_orchestrator.rs");
+        let start = src.find("fn ensure_dirs(").expect("ensure_dirs");
+        let end = src[start..]
+            .find("\nfn blob_sync_folder_path")
+            .map(|o| start + o)
+            .unwrap_or(src.len());
+        let body = &src[start..end];
+        let mb = body
+            .find("if is_motherbee {\n            ensure_root_owned_tree(&dist.path")
+            .expect("the motherbee keeps dist");
+        let spoke = body
+            .find("ensure_owned_tree(&dist.path")
+            .expect("a spoke hands dist to syncthing");
+        assert!(mb < spoke && body[mb..spoke].contains("} else {"));
+        let postinst = include_str!("../../packaging/deb-postinst");
+        let chown = postinst
+            .find("chown -R fluxbee:fluxbee")
+            .expect("the postinst chown");
+        let chown_end = postinst[chown..].find("|| true").expect("its end") + chown;
+        assert!(
+            !postinst[chown..chown_end].contains("/var/lib/fluxbee/dist"),
+            "the postinst hands dist to the Syncthing user again"
+        );
     }
 
     /// A-52: the wait is one single-quoted script under sudo.

@@ -21,8 +21,7 @@ for d in state/nodes state/cookbook state/sy-admin state/sy-edge hives opa/curre
 done
 
 # U-3: register this package's base runtimes into the LIVE dist manifest (merge, never replace).
-# Runs BEFORE the chown below so ownership covers what it writes, and BEFORE the orchestrator
-# starts so it never observes a manifest without its base runtimes. There is no race: the prerm
+# Runs BEFORE the orchestrator starts so it never observes a manifest without its base runtimes. There is no race: the prerm
 # stopped the manifest's writers (sy-orchestrator, sy-admin, sy-wf-rules), so nothing writes it
 # right now.
 # dpkg just replaced the core binaries in /usr/bin, so any core-installed.json left over from a
@@ -41,10 +40,11 @@ else
 fi
 
 install -d /run/fluxbee/routers
+# Not dist: the motherbee's dist is root's and Syncthing only reads it, which the orchestrator
+# sets at every start (FINDINGS A-51).
 chown -R fluxbee:fluxbee \
     /var/lib/fluxbee/syncthing \
-    /var/lib/fluxbee/blob \
-    /var/lib/fluxbee/dist 2>/dev/null || true
+    /var/lib/fluxbee/blob 2>/dev/null || true
 
 # Seed a config if none exists yet (the operator edits this before first-boot).
 if [ ! -f /etc/fluxbee/hive.yaml ] && [ -f /etc/fluxbee/hive.yaml.example ]; then
