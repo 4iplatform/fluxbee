@@ -2435,7 +2435,7 @@ async fn watchdog_tick(state: &OrchestratorState) {
                     > Duration::from_secs(SYNCTHING_RECONCILE_BUSY_REPORT_SECS)
                 {
                     report_syncthing_reconcile(&[format!(
-                        "a hive topology operation has run for more than {} minutes; the Syncthing reconcile waits for it",
+                        "a topology operation (a join or a removal; on a spoke, a finalize) has run for more than {} minutes; the Syncthing reconcile waits for it",
                         SYNCTHING_RECONCILE_BUSY_REPORT_SECS / 60
                     )]);
                 }
@@ -3395,17 +3395,10 @@ async fn wait_for_syncthing_folder_convergence(
     }
 
     let deadline = Instant::now() + Duration::from_millis(timeout_ms);
-    // A Syncthing restart (a reconcile on this hive) refuses the API for a few seconds: that is
-    // asked again until the deadline, never taken as the folder's answer.
-    let mut folder_status = loop {
-        match syncthing_folder_status(&desired_sync, folder_id) {
-            Ok(status) => break status,
-            Err(err) if wait_for_idle && Instant::now() < deadline => {
-                tracing::debug!(folder = %folder_id, error = %err, "syncthing folder status unavailable; retrying");
-                time::sleep(Duration::from_millis(SYSTEM_SYNC_HINT_POLL_INTERVAL_MS)).await;
-            }
-            Err(err) => return Err(err),
-        }
+    let mut folder_status = if wait_for_idle {
+        syncthing_folder_status_across_restart(&desired_sync, folder_id, deadline).await?
+    } else {
+        syncthing_folder_status(&desired_sync, folder_id)?
     };
     loop {
         if !folder_status.is_healthy() {
@@ -3439,13 +3432,34 @@ async fn wait_for_syncthing_folder_convergence(
         }
 
         time::sleep(Duration::from_millis(SYSTEM_SYNC_HINT_POLL_INTERVAL_MS)).await;
-        match syncthing_folder_status(&desired_sync, folder_id) {
-            Ok(status) => folder_status = status,
-            // The last answer stands while the API is briefly away; the deadline still holds.
-            Err(err) if Instant::now() < deadline => {
-                tracing::debug!(folder = %folder_id, error = %err, "syncthing folder status unavailable; retrying");
+        folder_status =
+            syncthing_folder_status_across_restart(&desired_sync, folder_id, deadline).await?;
+    }
+}
+
+/// A folder's status, asked again while Syncthing is restarting (its API port refuses
+/// connections), for at most the restart window and never past `deadline`. An API that answers
+/// with an error (a folder it does not have, a bad payload) is the real answer, at once.
+async fn syncthing_folder_status_across_restart(
+    sync: &BlobRuntimeConfig,
+    folder_id: &str,
+    deadline: Instant,
+) -> Result<SyncthingFolderStatus, OrchestratorError> {
+    let restart_window = Instant::now() + Duration::from_secs(SYNCTHING_BOOTSTRAP_TIMEOUT_SECS);
+    loop {
+        match syncthing_folder_status(sync, folder_id) {
+            Ok(status) => return Ok(status),
+            Err(err) => {
+                let now = Instant::now();
+                if now >= deadline
+                    || now >= restart_window
+                    || syncthing_api_healthy(sync.sync_api_port).await
+                {
+                    return Err(err);
+                }
+                tracing::debug!(folder = %folder_id, error = %err, "syncthing API restarting; asking again");
+                time::sleep(Duration::from_millis(SYSTEM_SYNC_HINT_POLL_INTERVAL_MS)).await;
             }
-            Err(err) => return Err(err),
         }
     }
 }
@@ -8910,8 +8924,10 @@ async fn reconcile_syncthing_peer_addresses(
     if !changed && !marker.exists() {
         return Ok(notes);
     }
-    // A join waiting for its spoke to connect must not see the motherbee drop every link.
-    if state.any_hive_topology_busy() {
+    // A join waiting for its spoke to connect must not see the motherbee drop every link, and a
+    // finalize that started on this spoke since the check above must not see its Syncthing
+    // restart under its probe: the restart waits, the marker stays.
+    if state.any_hive_topology_busy() || SYNCTHING_FINALIZES_IN_FLIGHT.load(Ordering::SeqCst) > 0 {
         return Ok(notes);
     }
     tracing::info!(
@@ -9160,45 +9176,85 @@ fn syncthing_posture_state_path() -> PathBuf {
     orchestrator_runtime_dir().join("syncthing-posture.json")
 }
 
-/// The persisted facts. Missing means none yet. A file that does not parse (an empty one after a
-/// power loss) is moved aside and counts as none: the facts are derived again, which only ever
-/// leads to the same switch. Any other read error is an error, and nothing switches on it.
-fn read_syncthing_posture_state() -> Result<SyncthingPostureState, OrchestratorError> {
-    let path = syncthing_posture_state_path();
-    let text = match fs::read_to_string(&path) {
-        Ok(text) => text,
+/// The persisted facts at `path`. Missing means none yet; a file that does not decode (empty after
+/// a power loss, not UTF-8, not JSON) is an error here, for readers. Its writer moves it aside
+/// (`read_syncthing_posture_state_to_write`).
+fn read_syncthing_posture_state_at(
+    path: &Path,
+) -> Result<SyncthingPostureState, OrchestratorError> {
+    match fs::read(path) {
+        Ok(bytes) => serde_json::from_slice(&bytes)
+            .map_err(|err| format!("unreadable '{}': {err}", path.display()).into()),
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-            return Ok(SyncthingPostureState::default())
-        }
-        Err(err) => return Err(err.into()),
-    };
-    match serde_json::from_str(&text) {
-        Ok(posture) => Ok(posture),
-        Err(err) => {
-            let aside = path.with_extension("json.corrupt");
-            tracing::warn!(path = %path.display(), error = %err, "syncthing posture state unreadable; moved aside, facts derived again");
-            let _ = fs::rename(&path, &aside);
             Ok(SyncthingPostureState::default())
         }
+        Err(err) => Err(err.into()),
     }
 }
 
+fn read_syncthing_posture_state() -> Result<SyncthingPostureState, OrchestratorError> {
+    read_syncthing_posture_state_at(&syncthing_posture_state_path())
+}
+
+/// For the one writer of the facts on this hive: a file that does not decode is moved aside and
+/// counts as none, so the facts are derived again (which only ever leads to the same switch). Any
+/// other read error stays an error, and nothing switches on it.
+fn read_syncthing_posture_state_to_write_at(
+    path: &Path,
+) -> Result<SyncthingPostureState, OrchestratorError> {
+    match fs::read(path) {
+        Ok(bytes) => match serde_json::from_slice(&bytes) {
+            Ok(posture) => Ok(posture),
+            Err(err) => {
+                tracing::warn!(path = %path.display(), error = %err, "syncthing posture state unreadable; moved aside, facts derived again");
+                fs::rename(path, path.with_extension("json.corrupt"))?;
+                Ok(SyncthingPostureState::default())
+            }
+        },
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            Ok(SyncthingPostureState::default())
+        }
+        Err(err) => Err(err.into()),
+    }
+}
+
+fn read_syncthing_posture_state_to_write() -> Result<SyncthingPostureState, OrchestratorError> {
+    read_syncthing_posture_state_to_write_at(&syncthing_posture_state_path())
+}
+
 /// Written durably (fsync of the file and of its directory): the facts gate a one-way switch.
-fn write_syncthing_posture_state(posture: &SyncthingPostureState) -> Result<(), OrchestratorError> {
-    let path = syncthing_posture_state_path();
+/// Temps a crash left behind are swept first; this is the only writer.
+fn write_syncthing_posture_state_at(
+    path: &Path,
+    posture: &SyncthingPostureState,
+) -> Result<(), OrchestratorError> {
     let dir = path
         .parent()
         .ok_or("syncthing posture state path has no parent")?;
     fs::create_dir_all(dir)?;
-    let tmp = dir.join(format!(
-        ".syncthing-posture.json.tmp-{:016x}",
-        rand::random::<u64>()
-    ));
+    let prefix = format!(
+        ".{}.tmp-",
+        path.file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("posture")
+    );
+    if let Ok(entries) = fs::read_dir(dir) {
+        for entry in entries.flatten() {
+            if entry
+                .file_name()
+                .to_str()
+                .is_some_and(|n| n.starts_with(&prefix))
+            {
+                let _ = fs::remove_file(entry.path());
+            }
+        }
+    }
+    let tmp = dir.join(format!("{prefix}{:016x}", rand::random::<u64>()));
     let written = (|| -> Result<(), OrchestratorError> {
         let mut file = create_exclusive(&tmp)?;
         file.write_all(&serde_json::to_vec_pretty(posture)?)?;
         file.sync_all()?;
-        fs::rename(&tmp, &path)?;
+        fs::rename(&tmp, path)?;
         Ok(())
     })();
     if written.is_err() {
@@ -9209,6 +9265,10 @@ fn write_syncthing_posture_state(posture: &SyncthingPostureState) -> Result<(), 
         tracing::warn!(error = %err, "could not fsync the orchestrator directory");
     }
     Ok(())
+}
+
+fn write_syncthing_posture_state(posture: &SyncthingPostureState) -> Result<(), OrchestratorError> {
+    write_syncthing_posture_state_at(&syncthing_posture_state_path(), posture)
 }
 
 /// The `/versions` section: whether this hive runs Syncthing, and its persisted facts (never live
@@ -9252,14 +9312,12 @@ struct SpokePostureFacts {
 /// The facts in a GET_VERSIONS reply, or why there are none (each keeps the motherbee waiting).
 fn spoke_posture_facts(reply: &serde_json::Value) -> Result<SpokePostureFacts, String> {
     if reply.get("status").and_then(|v| v.as_str()) != Some("ok") {
-        return Err(format!(
-            "no answer: {}",
-            reply
-                .get("error_code")
-                .and_then(|v| v.as_str())
-                .or_else(|| reply.get("message").and_then(|v| v.as_str()))
-                .unwrap_or("unknown error")
-        ));
+        let field = |name: &str| reply.get(name).and_then(|v| v.as_str());
+        return Err(match (field("error_code"), field("message")) {
+            (Some(code), Some(message)) => format!("no answer: {code}: {message}"),
+            (Some(text), None) | (None, Some(text)) => format!("no answer: {text}"),
+            (None, None) => "no answer".to_string(),
+        });
     }
     let Some(section) = reply
         .get("hive")
@@ -9385,7 +9443,7 @@ fn reconcile_spoke_syncthing_options(
     local_device_id: &str,
     address: SyncthingPeerAddress,
 ) -> Result<(bool, Vec<String>), OrchestratorError> {
-    let before = read_syncthing_posture_state()?;
+    let before = read_syncthing_posture_state_to_write()?;
     let mut posture = before.clone();
     if !spoke_may_switch(&posture) {
         let (current, _) = read_syncthing_config(config_path, false)?;
@@ -9479,7 +9537,7 @@ async fn run_syncthing_options_switch_loop(state: Arc<OrchestratorState>) {
 async fn motherbee_options_switch_round(
     state: &OrchestratorState,
 ) -> Result<SwitchRound, OrchestratorError> {
-    let mut posture = read_syncthing_posture_state()?;
+    let mut posture = read_syncthing_posture_state_to_write()?;
     if posture.switched_at_ms.is_some() {
         return Ok(SwitchRound::Switched);
     }
@@ -9496,8 +9554,16 @@ async fn motherbee_options_switch_round(
             "Syncthing keeps discovery on: the hive registry could not be read".to_string(),
         ));
     }
-    let local_device_id = tokio::task::block_in_place(|| syncthing_rest_my_id(&sync))?;
     let (current, _) = read_syncthing_config(&config_path, false)?;
+    // The switch is one-way: a lost record with the owned options already in place is recorded
+    // again, without waiting on every spoke to answer.
+    if !apply_syncthing_owned_options_xml(&current, &syncthing_owned_listen_address(true))?.1 {
+        posture.switched_at_ms = Some(now_epoch_ms());
+        write_syncthing_posture_state(&posture)?;
+        tracing::info!("syncthing: the owned options are in place; switch recorded again");
+        return Ok(SwitchRound::Switched);
+    }
+    let local_device_id = tokio::task::block_in_place(|| syncthing_rest_my_id(&sync))?;
     let (hives, unclaimed) = motherbee_switch_wait_set(&registry, &current, &local_device_id)?;
     let mut reports = BTreeMap::new();
     for hive_id in hives {
@@ -28658,6 +28724,64 @@ mod tests {
         assert_eq!(both.motherbee_reachable_at_ms, Some(20));
         assert!(spoke_may_switch(&both));
         assert_eq!(spoke_posture_step(both.clone(), false, false, 30), both);
+    }
+
+    /// The finalize counter goes back down on an early return and on a panic, so a spoke never
+    /// stays out of its reconcile for good.
+    #[test]
+    fn stage3_the_finalize_counter_always_goes_back_down() {
+        let before = SYNCTHING_FINALIZES_IN_FLIGHT.load(Ordering::SeqCst);
+        let early = || -> Result<(), ()> {
+            let _in_flight = SyncthingFinalizeInFlight::start();
+            assert!(SYNCTHING_FINALIZES_IN_FLIGHT.load(Ordering::SeqCst) > before);
+            Err(())
+        };
+        assert!(early().is_err());
+        assert_eq!(SYNCTHING_FINALIZES_IN_FLIGHT.load(Ordering::SeqCst), before);
+        let panicked = std::panic::catch_unwind(|| {
+            let _in_flight = SyncthingFinalizeInFlight::start();
+            panic!("finalize panicked");
+        });
+        assert!(panicked.is_err());
+        assert_eq!(SYNCTHING_FINALIZES_IN_FLIGHT.load(Ordering::SeqCst), before);
+    }
+
+    /// Readers report a state that does not decode; its writer moves it aside and derives the
+    /// facts again. The durable write sweeps the temps a crash left.
+    #[test]
+    fn stage3_the_state_file_on_disk() {
+        let dir = stage2_writer_dir("posture");
+        let path = dir.join("syncthing-posture.json");
+        assert_eq!(
+            read_syncthing_posture_state_at(&path).unwrap(),
+            SyncthingPostureState::default(),
+            "missing means none yet"
+        );
+        for broken in [&b""[..], &[0u8; 64][..], &[0xff, 0xfe, 0x00, 0x7b][..]] {
+            fs::write(&path, broken).unwrap();
+            assert!(read_syncthing_posture_state_at(&path).is_err());
+            assert!(path.exists(), "a reader never moves the file");
+            assert_eq!(
+                read_syncthing_posture_state_to_write_at(&path).unwrap(),
+                SyncthingPostureState::default()
+            );
+            assert!(!path.exists());
+            assert_eq!(
+                fs::read(path.with_extension("json.corrupt")).unwrap(),
+                broken
+            );
+        }
+        let leftover = dir.join(".syncthing-posture.json.tmp-leftover");
+        fs::write(&leftover, "partial").unwrap();
+        let posture = SyncthingPostureState {
+            motherbee_static_at_ms: Some(1),
+            motherbee_reachable_at_ms: Some(2),
+            switched_at_ms: None,
+        };
+        write_syncthing_posture_state_at(&path, &posture).unwrap();
+        assert!(!leftover.exists(), "the crash leftover was swept");
+        assert_eq!(read_syncthing_posture_state_at(&path).unwrap(), posture);
+        fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
