@@ -397,3 +397,107 @@ and approved explicitly. D25 and D27 are still open.
 followed symlinks planted in the Syncthing user's directory; the folder rule followed hive.yaml's
 enable flags; and on PROD the motherbee shared `blob/active` with the egress (A-50). All fixed in
 stage 2.
+
+# Round 6 — revision 9: core stages 4–5, A-48, A-49 (2026-10-06)
+
+**Verdict:**
+
+| Lens | Verdict | Findings | Blockers |
+|---|---|---|---|
+| Development | pass with observations | 18 | 0 |
+| Test | fail | 18 | 0 |
+| Acceptance | pass with observations | 13 | 0 |
+| Production | pass with observations | 21 | 0 |
+
+Verifiers: 61 confirmed, 8 partial, 1 refuted.
+
+**No blocker.** All four lenses found that revision 9 had pasted its stage-4 and stage-5 gates into
+the History table, so §6 still carried revision 7's gates. Most majors were about the mode decision
+list (missing and unreachable rows, logins lost under "first match wins"), the SSH-login evidence
+(a journald suppression could hold a host in observe), D29 (no guard for a host already enforcing),
+A-48's pins and revocation, and A-49's publish order.
+
+**The operator, after round 6 (2026-10-06):**
+
+- D30: no observe phase (*"eso de esperar 24hrs es un total parche que no sirve"*) and no check on
+  the host before applying (*"demasiado frágil"*); CI proves the rules.
+- D31: one SSH door on the egress, for now.
+- D32: SSH only inside `add_hive`; the boot-time TLS reconcile and `key_only_persist` go (A-54).
+- O9 opened: how software enters an installation, keeping apt.
+
+**Disposition:** revision 10 (spec §8, "Round 6", maps each finding). The findings that were only
+about the mode machinery or SSH outside `add_hive` are withdrawn with it. **Next:** a focused
+re-check of revision 10 (§3.1–§3.3, §3.6–§3.9, §6), then stage 4.
+
+| Finding | Severity | Verifier | Claim | Disposition |
+|---|---|---|---|---|
+| D6-1 | major | confirmed | Revision 9's stage-4 and stage-5 gates were written into the History table instead of §6. §6 still carries the revision-7/8 gates, which contradict §3, and the History … | rev 10 |
+| D6-2 | major | confirmed | Read as 'first match wins', the list has transitions with no row and rows that can never be reached, so it cannot become the one-row-per-rule table the gate asks for. | withdrawn with the mode machinery (D30) |
+| D6-3 | major | confirmed | A login read in a check where an earlier row matches is used up without resetting the window. A host can then enforce after an SSH login through a non-internal interfa … | withdrawn with the mode machinery (D30) |
+| D6-4 | major | confirmed | Rewriting the view while the registry entry still exists works against the watchdog's restore and the boot rebuild. A crash or failure between the two steps admits the … | rev 10 |
+| D6-5 | major | confirmed | The pin lifecycle has three holes: first-use pins have no trigger; a failed pin write silently turns an A-48 join into a legacy entry; and a box holding an older leaf … | rev 10 |
+| D6-6 | minor | partial | D29 cannot be decided from the persisted state, its test misses SSH changes that come from the template, and its rationale relies on a precondition that is not checked … | withdrawn with the mode machinery (D30) |
+| D6-7 | minor | confirmed | Switching the live stage-1 check to `ss -H -tulnp` blinds it. One alert kind for undeclared listeners hides all but the first for an hour. | rev 10 |
+| D6-8 | minor | confirmed | Four details of the evidence rules would lose real logins or hold hosts in observe for nothing. | withdrawn with the mode machinery (D30) |
+| D6-9 | minor | refuted | Untracking the sshd ports does not stop the internet from filling conntrack while a host observes. In observe the policy accepts every packet to any closed port on a n … | refuted by its verifier; no change |
+| D6-10 | minor | confirmed | The posture check is put in watchdog_tick, the single-flight self-heal tick, with subprocesses that have no time bound. One hung command would stop rt-gateway restarts … | rev 10 |
+| D6-11 | minor | confirmed | Three details decide whether pinned admission and view reloads work as described. | rev 10 |
+| D6-12 | minor | confirmed | `<hives>/known_hosts.d/` puts a directory that is not a hive in the registry root. It would show up as a phantom hive. | rev 10 |
+| D6-13 | minor | confirmed | 'A hive that has a pin and whose certificate goes missing is reported' can work only where the motherbee has SSH. Two gate expectations cannot be met as written. | withdrawn with SSH outside add_hive (D32) |
+| D6-14 | minor | confirmed | The refusal needs no sender check, because nothing legitimate ever sends SYSTEM_CORE_ROLLBACK to the motherbee. | rev 10 |
+| D6-15 | minor | confirmed | Once the cleanup runs outside sy-orchestrator's cgroup, the orchestrator stays alive until the loop reaches it. Meanwhile it undoes the loop: its 5 s watchdog restarts … | rev 10 |
+| D6-16 | minor | confirmed | 'Publish without the key fails and leaves the previous InRelease in place' leaves the repo broken, because by then Packages has already been swapped. | rev 10 |
+| D6-17 | minor | confirmed | The helper's way of finding the Fluxbee source, and what it does when a new key is added, are undefined. | rev 10 |
+| D6-18 | minor | confirmed | For a third-party firewall, §3.6's health verdict contradicts the operator's D25, and the classifier rule names a chain policy nftables does not have. | rev 10 |
+| T6-1 | major | confirmed | Revision 9's stage-4 and stage-5 gates went into the History table instead of §6. The rows for revisions 4 and 5 now hold the gates: three cells in a two-column table, … | rev 10 |
+| T6-2 | major | confirmed | The decision list is still not complete enough for a table-driven test: (a) No rule takes a host out of `off` once the break-glass file is removed, or out of `unavaila … | withdrawn with the mode machinery (D30) |
+| T6-3 | major | confirmed | Posture alerts from spokes cannot be read where the spec and the gate read them. The motherbee's own orchestrator serves `GET /hives/<h>/drift-alerts`, reading its loc … | rev 10 |
+| T6-4 | major | partial | From stage 5, health fails a host that is not held and not in enforce 48 hours after the later of its last render change and switch_enabled_since. The stage-5 gate hol … | withdrawn with the mode machinery (D30) |
+| T6-5 | major | confirmed | Since D28, the netns job is the only check of what the render does on a real kernel (§3.2:500-502). Revision 9 does not say what it checks per role and per interface. … | rev 10 |
+| T6-6 | major | confirmed | The stage-4 infra checks only what the orchestrator reports about itself: the posture in /versions, the mode and the reasons. It never checks, on each real host, the i … | rev 10 |
+| T6-7 | major | confirmed | The A-48 steps do not say which join (hive_id, ssh_access mode) each runs on, or where the 'clean' rollbacks fall. As written, several steps cannot work or cannot fail … | rev 10 |
+| T6-8 | major | confirmed | The A-48 unit list misses the new logic most likely to regress, and the infra steps cannot reach most of it: (a) The per-hive session map: admitting B closes A; A exit … | rev 10 |
+| T6-9 | major | confirmed | The publish-without-key test checks the wrong property and runs where it can break the repo. Today the publish renames Packages and Packages.gz before Release. If sign … | rev 10 |
+| T6-10 | minor | confirmed | The SSH-login test cannot run in the order written, and it lacks the attacker-side control: (a) The negative control (a login through 10.10.10.40) comes before the key … | withdrawn with the mode machinery (D30) |
+| T6-11 | minor | confirmed | The rejoin times cannot be measured live as written. After a motherbee reboot, the guest agent comes back after about 2.5 minutes. That is around when the spokes, whic … | rev 10 |
+| T6-12 | minor | confirmed | §0 says enforce keeps established connections, including an SSH session opened through a path it now closes. Revision 9 untracks the sshd ports on non-internal interfa … | rev 10 |
+| T6-13 | minor | confirmed | Two decisions disagree with the tests: - D25 says a third-party firewall makes health fail; §3.6 and the stage-4 injection say health only warns. - D29 is only propose … | rev 10 (D25 kept as decided; D29 withdrawn by D30) |
+| T6-14 | minor | confirmed | One stage-4 check cannot fail because of the posture, and one has no defined check: - In observe the policy is accept, so `curl -sk https://10.10.10.30/` succeeds what … | rev 10 |
+| T6-15 | minor | confirmed | The prerm test is not specified well enough to test what it claims: - No postrm exists, and build-deb.sh installs only preinst, postinst and prerm, so a script-level t … | rev 10 |
+| T6-16 | minor | confirmed | The guard bans two literal strings but does not prove what §3.8 requires: accept-new and a per-address known_hosts file at every call site. All of these pass it: - `-o … | rev 10 |
+| T6-17 | minor | confirmed | The tamper test has no positive control and one wrong expectation, and nothing tests the first install or rotation: (a) The gate never shows that the untouched copy up … | rev 10 |
+| T6-18 | minor | confirmed | Rolling VM 104 back to 'clean' and joining right away can repeat A-52. The apt timers in the snapshot are persistent and fire after boot, and unattended-upgrades resta … | rev 10 |
+| A6-1 | major | confirmed | Revision 9's stage-4 and stage-5 gates were written into the History table instead of §6: - They sit as a third cell of rows 4 and 5 of a two-column table, overwriting … | rev 10 |
+| A6-2 | major | confirmed | D29 is consistent with D28. Observe can only produce SSH-login evidence, so a change that does not move SSH gains nothing from a new window. But as written D29 has thr … | withdrawn with the mode machinery (D30) |
+| A6-3 | major | confirmed | "First match wins" stops the evaluation at rules that should not stop it, so the stage-4 table test would encode wrong behaviour: - D29's in-place branch skips the hol … | withdrawn with the mode machinery (D30) |
+| A6-4 | major | confirmed | A journald suppression of ssh.service counts as unread evidence. That lets anyone who can open TCP connections to sshd hold a host in observe indefinitely, which break … | withdrawn with the mode machinery (D30) |
+| A6-5 | minor | confirmed | D25, recorded as the operator's decision, says that an active ufw or firewalld makes health fail. §3.6 makes a third-party firewall only a warning. | rev 10 |
+| A6-6 | minor | confirmed | Over-engineered under D25. Besides ufw and firewalld, §3.6 classifies foreign nft base chains by their policy, with its own fixtures and a worker1 injection: - drop or … | rev 10 |
+| A6-7 | minor | confirmed | The stage-5 health rule fails hosts that the planned staggered release has just freed: - The 48 hours run from switch_enabled_since. - But a hold resets the window on … | withdrawn with the mode machinery (D30) |
+| A6-8 | minor | partial | Two A-48 statements have no trigger behind them: - Legacy hives are said to be pinned by their first session after A-48, but nothing rebuilds the view when the router … | rev 10 |
+| A6-9 | minor | confirmed | The A-48 gate joins the throwaway in the default revoke mode, then runs two steps that need key_only_persist: - the missing-certificate report needs an SSH channel to … | withdrawn with SSH outside add_hive (D32) |
+| A6-10 | minor | confirmed | A-49's helper keeps three parts that are unneeded or undefined: - The first install has two paths, and one of them is a step for the user. - "The Fluxbee URI" is undef … | rev 10 |
+| A6-11 | minor | partial | §0 contradicts itself on SYSTEM_CORE_ROLLBACK. It also omits a residual that stage 4 creates: while the ingress observes, the internet can fill its conntrack table. | rev 10 (§0); its conntrack part refuted |
+| A6-12 | minor | confirmed | §3.7's "the orchestrator installs nothing" rests on a fresh template clone having nft. Nothing in the repo records that check, and the HANDBOOK still tells operators t … | rev 10 |
+| A6-13 | minor | confirmed | "Set elements" is left over from the removed dynamic sets. Revision 9 renders no named set. A normalizer that strips set elements would also strip the anonymous sets i … | rev 10 |
+| P6-1 | major | confirmed | Revision 9's stage-4 and stage-5 gates landed in the History table and overwrote the history rows for revisions 4 and 5. §6 still carries revision 7's gates, so the ga … | rev 10 |
+| P6-2 | major | confirmed | 'When the TLS reconcile re-issues a leaf for an unpinned hive, it writes the pin too' turns the named first-contact residual into a takeover, and it can also cut a leg … | rev 10 |
+| P6-3 | major | partial | A-48 cuts a live pre-A-48 hive whose registry entry says `failed` or `interrupted`. After the upgrade it can be recovered only over SSH, which means console work for r … | rev 10 |
+| P6-4 | major | partial | A registry read error becomes a revocation. Read literally, a failed listing of the hives directory at boot yields an empty view, so every spoke is refused as not_in_v … | rev 10 |
+| P6-5 | major | confirmed | An internet scanner can hold the ingress in observe. The same works for an office host against the egress, and for any flat-L2 host against the motherbee. The attacker … | withdrawn with the mode machinery (D30) |
+| P6-6 | major | confirmed | No check stops enforce from cutting a core port when the declaration is wrong. The expected listeners come from the same pure function as the render. A port missing fr … | withdrawn with the mode machinery (D30) |
+| P6-7 | minor | confirmed | Four gaps in pinning legacy hives on first use. (a) Two different CA-valid leaves of the same legacy hive_id can connect before the pin is written, for example a box r … | rev 10 |
+| P6-8 | minor | confirmed | 'Rewrite the view, only then delete the entry' is redundant and opens a window. Revision 9 also made revocation a reconcile, and a remove on a missing entry runs it, w … | rev 10 |
+| P6-9 | minor | confirmed | `<hives>/known_hosts.d/<address>` puts a non-hive directory in the registry root. `list_hives` returns every directory there, so GET /hives gains a hive named `known_h … | rev 10 |
+| P6-10 | minor | confirmed | Any successful `ip route get <uplink>` answer is adopted and persisted. On the ingress and the egress, the default route goes through the external NIC. When the intern … | rev 10 |
+| P6-11 | minor | confirmed | Three gaps, for the table-driven test and for safety across transitions. (a) The 5 → 4 rollback rule sits outside the numbered list. Its place relative to rule 4 (a de … | withdrawn with the mode machinery (D30) |
+| P6-12 | minor | confirmed | (a) 'The source comes from its fixed tail, `from <ip> port <n> ssh2`' fails on publickey and certificate logins, which continue after 'ssh2:' with the key type and fin … | withdrawn with the mode machinery (D30) |
+| P6-13 | minor | confirmed | 'sshd-owned lines in ss' also match per-session listeners. Ubuntu's sshd_config enables X11 forwarding by default, and the session's sshd then owns a listener on 127.0 … | rev 10 (SSH fixed at tcp 22) |
+| P6-14 | minor | confirmed | §0 says enforce keeps established connections, 'including an SSH session opened through a path it now closes'. But SSH on non-internal interfaces is untracked in both … | rev 10 |
+| P6-15 | minor | partial | 'Admitting a session for a hive closes the previous one' makes a spoke with two wan.uplinks entries flap. The router dials every uplink, and after A-48 both can reach … | rev 10 |
+| P6-16 | minor | confirmed | Loading fluxbee_host turns conntrack on for the motherbee, which then tracks its mesh ports and SSH on every interface, in both modes. §0 says only that 'a host on the … | rev 10 |
+| P6-17 | minor | confirmed | 'Publish without the key fails and leaves the previous InRelease in place' can break every deploy. The publish swaps Packages first and Release last. If signing fails … | rev 10 |
+| P6-18 | minor | confirmed | (a) The append-only rule undoes key removal. 'Every run adds a shipped key that is missing', and the rotation steps never say to stop shipping the old key before the r … | rev 10 |
+| P6-19 | minor | confirmed | D25 says a third-party firewall makes health fail. §3.6 and the revision-9 gate say it only warns. The stale §6 gate says it fails. | rev 10 |
+| P6-20 | minor | confirmed | The 'set elements' exclusions are left over from the removed dynamic sets, and they are now harmful. An implementation may well put the sshd or edge ports in a named s … | rev 10 |
+| P6-21 | minor | partial | Section 0 must still name or correct the following. (1) The sshd-flood suppression (P6-5), either as a hold or as a missed login, whichever rule is kept. (2) SSH sessi … | rev 10 |

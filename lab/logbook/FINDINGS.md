@@ -964,6 +964,34 @@ Visto al arreglar los e2e de A-37, leyendo `src/router/mod.rs` y `src/shm/mod.rs
   binario generaría uno como root); si no, el `myID` del Syncthing en marcha. Nunca `config.xml`.
 - **Estado:** construido; lo ejercita el próximo join (el de A-48).
 
+### A-54 🟡 PARA ARREGLAR (0.1.61) — El motherbee usaba SSH fuera de `add_hive`
+
+- **Qué pasa (verificado en el código el 2026-10-06):** todo el SSH vive dentro de los tres flujos
+  de `add_hive`, con una excepción. En cada arranque del motherbee, `reconcile_hive_tls_material`
+  entra por SSH a cada spoke `connected` para ver si tiene su certificado de malla y, si falta, lo
+  reemite.
+  - En PROD los cuatro spokes se unieron en modo `revoke`: esos intentos fallan la autenticación y
+    se descartan a nivel debug. Es ruido en cada arranque.
+  - Con el modo opcional `ssh_access=key_only_persist` (deja una llave SSH por spoke en el vault
+    después del join) sí entra. P6-2 de la ronda 6 mostró el riesgo: solo un fallo de autenticación
+    corta el intento, así que una máquina que tome la IP del spoke y acepte cualquier llave recibe
+    un leaf y su clave privada nuevos.
+- **Decisión del operador (D32, 2026-10-06):** *"no deberíamos tener comunicaciones NUNCA por ssh a
+  no ser cuando se hace un add_hive y es totalmente temporal"*. Se borran la reconciliación al
+  arrancar y el modo `key_only_persist` (ningún spoke de PROD lo usa). Un spoke que pierde su
+  certificado se vuelve a unir (`remove_hive` + `add_hive`), como una máquina nueva.
+- **Estado:** aprobado; va en 0.1.61, con su revisión y un join de prueba en la VM 104.
+
+### A-55 🟡 ABIERTO POR DECISIÓN (D31) — La puerta SSH del egress
+
+- **Qué es:** el operador mantiene SSH (tcp 22) abierto en `egress.wan_iface` para operación y
+  mantenimiento durante este desarrollo. En PROD es 192.168.8.240, una red interna detrás de un
+  firewall (*"no es la NSA pero es red segura"*). Nada más entra por ahí.
+- **Riesgo:** el código no puede distinguir una red de oficina segura de internet. Si un cliente
+  conecta la WAN del egress directo a internet, esa puerta queda abierta a internet.
+- **Estado:** cerrarla antes de la primera instalación de un cliente (un cambio de código en un
+  release; el diseño la tiene en la declaración del rol egress, §3.2).
+
 ### A-19 ✅ RESUELTO (0.1.43) — La policy publicada esperaba hasta 60 s al watcher de Syncthing
 
 - **Qué pasaba:** con 0.1.41 el apply llegaba a los 4 hives en 16 s, pero el clear tardó 63 s y el
