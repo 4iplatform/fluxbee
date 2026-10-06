@@ -21,6 +21,7 @@
 
 | Versión | Fecha (ART) | Commit | Alcance | Estado | Rollback |
 |---|---|---|---|---|---|
+| **0.1.61** | 2026-10-06 | `e0f2d04` | motherbee + spokes (core) | ✅ live | snap `pre-ssh-0-1-61` (las 4 VMs) · `apt install fluxbee=0.1.60` |
 | **0.1.60** | 2026-10-06 | `0af5469` | motherbee + spokes (core) | ✅ live | snap `pre-hardening-0-1-60` (las 4 VMs) · `apt install fluxbee=0.1.59` |
 | **0.1.59** | 2026-10-06 | `f60eb92` | motherbee + spokes (core) | ✅ live | snap `pre-stage3-0-1-59` (las 4 VMs) · `apt install fluxbee=0.1.58` |
 | **0.1.58** | 2026-10-06 | `9d9391b` | motherbee + spokes (core) | ✅ live | snap `pre-stage2-0-1-58` (las 4 VMs) · `apt install fluxbee=0.1.57` |
@@ -70,6 +71,33 @@
 
 ---
 
+## 0.1.61 — SSH solo dentro de `add_hive` (D32, A-54)
+
+- **Fecha:** 2026-10-06 (ART) · **Versión anterior:** 0.1.60 · **Commits:** `31dd105`, `3ae2929`
+  (FINDINGS A-54; dos revisiones adversariales).
+- **Alcance:** motherbee + los tres spokes (core-update).
+- **Qué cambió:** se borraron la reconciliación de TLS por SSH al arrancar y el modo
+  `key_only_persist`; un pedido con `ssh_access` se rechaza; el envío del leaf es fatal para el join
+  (`TLS_PUSH_FAILED`); el revoke borra una llave de recuperación vieja; un test de guardia recorre el
+  código desde cada uso de SSH hasta `accept_add_hive`.
+- **Deploy:** build `e0f2d04`, publish 9 s, deploy 198 s; snapshots `pre-ssh-0-1-61` en las 4 VMs
+  (se borró `pre-stage2-0-1-58`). Versiones 0.1.61 en los 4, health `failed=0`.
+- **Gate D32:** en el journal de sshd de los tres spokes, desde el deploy de 0.1.60 hasta el de 0.1.61,
+  3 intentos de SSH desde 10.10.10.10 por spoke (uno por arranque del orquestador del motherbee, todos
+  fallidos en la autenticación); desde el deploy de 0.1.61, **cero**.
+- **Gate A-52 + D32 con un clon nuevo:** la VM 104 se borró y se clonó otra vez del template;
+  `add_hive worker2` se lanzó apenas respondió el guest agent (17:28:37, systemd `starting`).
+  - El join entró en `waiting_for_host` a las 17:29:43 con cloud-final `activating` (el dist-upgrade
+    del primer arranque) y esperó 8 min; a las 17:37:38 la caja quedó `running` y el join siguió.
+  - Terminó `connected` a las 17:39:42: `harden_ssh_applied`, `restrict_ssh`,
+    `ssh_bootstrap_revoked`, WAN, orquestador y dist listos; sin `ssh_access` ni
+    `spoke_key_vault_ref` en el resultado.
+  - Syncthing: dirección estática del motherbee a los 70 s (17:40:38) y opciones de la etapa 3; el
+    `posture-check --stage 3` de worker2 da ok (el chequeo "un join da `Static`", movido desde la
+    etapa 2, queda hecho).
+  - Limpieza: llave descartable borrada (password auth `no`), `DELETE /hives/worker2` ok por socket,
+    VM 104 apagada.
+
 ## 0.1.60 — Escrituras de root en árboles de `fluxbee`; el join espera a que la caja se asiente (A-51, A-52)
 
 - **Fecha:** 2026-10-06 (ART) · **Versión anterior:** 0.1.59 · **Commits:** `d3710c4`..`05ac354`,
@@ -92,7 +120,7 @@
     `blob/*` y `syncthing/` de `fluxbee`; sin errores de Syncthing ni del orquestador.
   - Spokes sin cambios de dueño; `posture-check --stage 3` ok en los 4; OPA in_sync 4/4; versiones
     0.1.60 en los 4; health `failed=0`.
-  - A-52 lo valida el próximo join (VM 104, clon recién creado).
+  - A-52 validado con el join de 0.1.61 (clon nuevo, ver arriba).
 - **Incidente durante la verificación (mío, resuelto):** un script de verificación corrió
   `sy-orchestrator --version` y `rt-gateway --version` en el motherbee; esos binarios no tienen
   `--version` y arrancaron como segundas instancias.

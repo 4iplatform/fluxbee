@@ -501,3 +501,93 @@ re-check of revision 10 (§3.1–§3.3, §3.6–§3.9, §6), then stage 4.
 | P6-19 | minor | confirmed | D25 says a third-party firewall makes health fail. §3.6 and the revision-9 gate say it only warns. The stale §6 gate says it fails. | rev 10 |
 | P6-20 | minor | confirmed | The 'set elements' exclusions are left over from the removed dynamic sets, and they are now harmful. An implementation may well put the sshd or edge ports in a named s … | rev 10 |
 | P6-21 | minor | partial | Section 0 must still name or correct the following. (1) The sshd-flood suppression (P6-5), either as a hold or as a missed login, whichever rule is kept. (2) SSH sessi … | rev 10 |
+
+# Round 7 — revision 10 (focused): §0, D30–D32, §3.1–§3.3, §3.6–§3.8, stage-4 and A-48 gates (2026-10-06)
+
+**Verdict:**
+
+| Lens | Verdict | Findings | Blockers |
+|---|---|---|---|
+| Development | pass with observations | 15 | 0 |
+| Test | fail | 14 | 0 |
+| Acceptance | pass with observations | 16 | 0 |
+| Production | fail | 11 | 1 |
+
+Verifiers: 43 confirmed, 13 partial, 0 refuted. Nothing argues against D30–D32.
+
+**Blocker (P7-1):** a worker's identity replica reads its delta subscription with no idle timeout
+and no keepalive. Under a stateful firewall a packet conntrack does not know is dropped: a
+subscription opened before the first apply, one opened before the posture's first check on a fresh
+join, or one idle for 5 days (conntrack's established timeout) hangs for good, and revocations stop
+reaching the worker. Fix at the source before stage 4: a heartbeat from the primary and a read-idle
+timeout on the replica, like the WAN and io.slack links; the posture's first check runs before the
+core services start.
+
+**Main majors:** the stage-4 and A-48 gate orders cannot run as written (the motherbee is necessarily
+the first host under new rules); a join must run over the spoke's internal interface or stage 4 cuts
+its last SSH steps and leaves the bootstrap key behind; the internal interface must be on-link (the
+egress uses `lan_iface`); CI cannot see a listener a release adds (a bind-site guard); "keeps
+established connections" is false on hosts that start tracking at the first apply; `pin: pending` at
+accept cuts a resumed running hive; the egress door with a default join keeps the template's
+password; health cannot see the posture; the status list is not closed.
+
+**Disposition:** revision 11.
+
+| Finding | Severity | Verifier | Claim | Disposition |
+|---|---|---|---|---|
+| D7-1 | major | confirmed | The derivation adopts whatever `ip route get <uplink>` answers, including a route through a gateway. On the ingress and the egress the default route leaves through the … | rev 11 |
+| D7-2 | minor | confirmed | No status covers a failed apply. - §3.3 names off, unavailable, not_derived, applied and derivation_failed, and says a failed `nft -f` is only 'reported'. - Health fai … | rev 11 |
+| D7-3 | minor | confirmed | The router's view is not scoped, and its state cannot be read. (a) Scope. The 'no readable view at startup → loud report and health failure' rule is not limited to the … | rev 11 |
+| D7-4 | minor | confirmed | The lock order is not defined, and the literal reading deadlocks. The only per-hive lock in the code is the topology lock, a tokio mutex held for a whole join and by r … | rev 11 |
+| D7-5 | minor | confirmed | 'Legacy is a missing pin' fails open. Any registry write that drops the `pin` key silently turns a pinned hive into a legacy one. A legacy hive admits any CA-valid lea … | rev 11 |
+| D7-6 | minor | confirmed | 'A crash at any step therefore heals at the next boot' does not hold for the Syncthing device. Once the entry is deleted, the boot reconcile no longer knows the remove … | rev 11 |
+| D7-7 | minor | confirmed | The per-join known_hosts file has no name or lifecycle the code can carry. - The SSH wrappers take (address, key, user) and are called about 80 times (ssh_with_key 50, … | rev 11 |
+| D7-8 | minor | confirmed | The new CI guard duplicates the 0.1.61 test and is weaker. ssh_happens_only_inside_add_hive already: - finds every string literal that names ssh, scp, sftp, rsync, ssh … | rev 11 |
+| D7-9 | minor | confirmed | Answering ok to a remove_hive on a missing entry hides a typo. Removing 'wroker1' reports success while worker1 stays admitted. Today this case answers NOT_FOUND. | rev 11 |
+| D7-10 | minor | confirmed | wan.authorized_hives is not addressed. The router still refuses hives missing from it, and add_hive checks it twice. After A-48 there are two allowlists, one of them u … | rev 11 |
+| D7-11 | minor | confirmed | The stage-1 listener check still runs inside watchdog_tick with an unbounded `ss`. That is the risk D6-10 moved the posture out of the watchdog for. §3.6 says the post … | rev 11 |
+| D7-12 | minor | confirmed | The test runs the prerm and postrm 'under a temporary root', but the teardown uses absolute paths: /etc/fluxbee/posture.nft, /var/lib/fluxbee/state/posture.json and th … | rev 11 |
+| D7-13 | minor | confirmed | Two classifiers remain that D25 makes unnecessary: - The nftables.service 'conflict' report. It requires reading the unit and parsing nftables.conf, and its effect is … | rev 11 |
+| D7-14 | minor | confirmed | A spoke applies its posture in the middle of its own join. The join starts sy-orchestrator on the box and only later runs its last SSH steps: the SSH controls, the rev … | rev 11 |
+| D7-15 | minor | confirmed | The sshd report needs sshd's effective settings, which come from `sshd -T`. Round 4 fixed the precondition with '/run/sshd created before sshd -T'. Revision 10 dropped … | rev 11 |
+| T7-1 | major | confirmed | The stage-4 gate's order cannot run as written. (a) 'On the throwaway first (VM 104 at clean, joined as a worker on this release)' sits between 'Baseline, before the d … | rev 11 |
+| T7-2 | major | partial | The status order still cannot become a table test without guessing outputs. (1) A failed `nft -f` has no status name, though §6 lists it as a row and §3.6 fails health … | rev 11 |
+| T7-3 | major | confirmed | `ops.py health` cannot see the posture or the router view, so every health step in the two gates passes or fails for unrelated reasons. It runs a per-VM script that co … | rev 11 |
+| T7-4 | major | confirmed | The A-48 steps cannot run in the order given. (a) Step (5) rolls VM 104 back to `clean` and joins it as an ingress, all on 'one hive_id'. After step (4) that entry is … | rev 11 |
+| T7-5 | major | confirmed | As specified, CI does not prove the ruleset that ships, and D30 makes CI the only gate. rust-tests runs only on changes under src/, crates/, nodes/, policy/ and the Ca … | rev 11 |
+| T7-6 | major | confirmed | The PROD capture check cannot be computed as written, and it does not show what stage 4 will cut. The declaration depends on config and on the derived interface: `wan. … | rev 11 |
+| T7-7 | minor | confirmed | The planned guard is weaker than the test already at HEAD. Matching `Command::new("ssh")`, `Command::new("scp")` and `.arg("ssh")` misses `.args(["ssh", …])`, a shell … | rev 11 |
+| T7-8 | minor | confirmed | The packaging test cannot run as specified. (a) 'Under a temporary root' needs a teardown that takes its root as an input. Today's maintainer scripts use absolute path … | rev 11 |
+| T7-9 | minor | partial | The PROD infra checks can pass vacuously. posture-check.py accepts any `--stage` value and only adds checks at `>= 3`, so today `--stage 4` prints 'verdict ok (stage 4 … | rev 11 |
+| T7-10 | minor | partial | The rejoin time cannot be computed as written, so 'within the baseline + 60 s' cannot be judged. 'Each spoke's first answer to /versions' is not recorded anywhere. It … | rev 11 |
+| T7-11 | minor | partial | One check is impossible as written under D32: A-48 step (1)'s 'the box's sshd journal has no line naming 10.10.10.10' always fails, because the join's own SSH sessions … | rev 11 |
+| T7-12 | minor | confirmed | The worker1 injections cost more than the risk they test, on a PROD spoke. Flushing the input chain removes `iif lo accept` and the established rule but keeps policy d … | rev 11 |
+| T7-13 | minor | confirmed | Several A-48 steps lack a concrete input or can flake. (a) Step (4)'s 'bootstrap access again from the console' depends on step (1)'s payload, which the gate does not … | rev 11 |
+| T7-14 | minor | confirmed | Some CI items name no mechanism, or test less than they claim: - (a) 'Accepts a frag-needed and a packet-too-big for an untracked edge flow' and 'accepts an RA' name n … | rev 11 |
+| A7-1 | major | confirmed | The gate's order cannot be run as written. - It puts "On the throwaway first (VM 104 at clean, joined as a worker on this release)" before "Infra, after the deploy (sn … | rev 11 |
+| A7-2 | major | confirmed | Nothing makes a join run over the spoke's internal network, and stage 4 breaks a join that does not. - After the spoke's orchestrator is up (its posture applies at its … | rev 11 |
+| A7-3 | major | partial | D32 says "the join revokes its access at the end", and §3.7 repeats it, but the code at HEAD does not guarantee it and nothing shows the failure afterwards. - On succe … | rev 11 |
+| A7-4 | major | confirmed | D30 rests on "CI proves the rules", but the three CI checks cannot see a listener that a release adds. - Golden renders and the netns job test the declaration against … | rev 11 |
+| A7-5 | major | confirmed | §3.8 says an A-48 join writes `pin: pending` on its accept path, and also that the worker socket-only path keeps an existing pin. Both cannot hold: if accept always wr … | rev 11 |
+| A7-6 | minor | confirmed | Several automatic state changes the design adds are only logged, or not reported at all, which is what the operator asked to avoid: - (a) A derivation answer that diff … | rev 11 |
+| A7-7 | minor | partial | D31 defines the door's port and interface, but not who can log in through it, so its use and its safety depend on per-join choices the operator must remember. - A hard … | rev 11 |
+| A7-8 | minor | partial | The status set is not one list. - §3.3 names off, unavailable, not_derived, applied and derivation_failed across four numbered facts. derivation_failed sits inside fac … | rev 11 |
+| A7-9 | minor | partial | D30 says a ruleset that cannot be applied leaves the last one loaded. §3.3 does not say that posture.nft is replaced only after a successful apply, and it points at th … | rev 11 |
+| A7-10 | minor | confirmed | The claim holds only where conntrack already runs, which is the egress (for its NAT). §3.6 itself says that loading fluxbee_host starts conntrack on the other hosts. C … | rev 11 |
+| A7-11 | minor | confirmed | The stage-4 gate cites "§3.1–§3.3, §3.6, §3.7", but the scope is unclear: - §3.7 mixes stage-4 items with A-48 items ("Nothing is admitted on the motherbee beyond the … | rev 11 |
+| A7-12 | minor | confirmed | On the egress the derivation is redundant, which is over-engineering. - egress.lan_iface is required, validated and distinct from wan_iface, and it is already the NAT' … | rev 11 |
+| A7-13 | minor | confirmed | Two reports decide nothing, which is over-engineering: - (a) Beyond D25's ufw and firewalld checks, §3.6 classifies foreign nft base chains on the input hook as inform … | rev 11 |
+| A7-14 | minor | partial | First-use pinning is a cross-process protocol for a one-time migration, and it stays in the code for good: - rt-gateway writes router-legacy-leaves.json; - the watchdo … | rev 11 |
+| A7-15 | minor | partial | §3.8 adds a CI guard that Command::new("ssh"), Command::new("scp") and .arg("ssh") appear only in the SSH helper. But 0.1.61 already ships the test ssh_happens_only_in … | rev 11 |
+| A7-16 | minor | partial | Two amended rows contradict themselves: - D16 still says "the egress' office/WAN interface lose SSH" and then "D31: the egress keeps SSH", so the row asserts both. - D … | rev 11 |
+| P7-1 | blocker | confirmed | Once fluxbee_host is loaded, a worker's identity replica stops receiving deltas from the motherbee, silently and permanently. Why: - The replica's delta subscription i … | rev 11 |
+| P7-2 | major | confirmed | §0 and D22 say the first apply keeps established connections, including an SSH session through a path the rules now close. That is true only on the egress, whose NAT a … | rev 11 |
+| P7-3 | major | partial | The derivation can fix SSH on the external NIC for good. - `ip route get <uplink>` is a local lookup. It answers whenever a default route exists. - The ingress' and th … | rev 11 |
+| P7-4 | major | confirmed | §3.8 says an A-48 join writes `pin: pending` on its accept path, and that the worker join's socket-only path keeps an existing pin. The two contradict each other. - Th … | rev 11 |
+| P7-5 | major | confirmed | CI cannot see a listener that a release adds, which is the most likely way a later release cuts a flow. - The golden renders and the netns job are generated from the d … | rev 11 |
+| P7-6 | major | partial | The egress door is bounded at the network layer as stated: tcp 22 on one interface, whose name is validated (no wildcard, no metacharacters) and must differ from lan_i … | rev 11 |
+| P7-7 | minor | confirmed | Two gaps in first-use pinning. (a) `legacy_conflict` leaves both leaves admitted for good: - the entry has no pin, so both leaves match "legacy"; - with one session pe … | rev 11 |
+| P7-8 | minor | partial | "Legacy is a missing pin" can also be reached by A-48 code, not only by builds before A-48: - (a) list_hives turns a directory without info.yaml into `{hive_id}` with … | rev 11 |
+| P7-9 | minor | confirmed | "A crash at any step therefore heals at the next boot" depends, for the Syncthing link, on §3.5's orphan rule as built. That rule removes orphans only when the registr … | rev 11 |
+| P7-10 | minor | confirmed | `not_derived` says "nothing is applied yet", but the join's bootstrap deletes only posture.disabled and the posture state. - The table loaded in the box's earlier life … | rev 11 |
+| P7-11 | minor | confirmed | A-48 adds a second admission list next to `wan.authorized_hives`, which the router and four join paths still check. Two lists that must agree are a trap: a hive in the … | rev 11 |

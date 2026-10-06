@@ -953,7 +953,7 @@ Visto al arreglar los e2e de A-37, leyendo `src/router/mod.rs` y `src/shm/mod.rs
     una caja usada); misma clase que el primer punto.
 - **Estado:** en 0.1.60.
 
-### A-52 🟡 ARREGLADO EN 0.1.60 (lo valida el próximo join) — `add_hive` sobre un clon recién creado choca con el `dist-upgrade` de cloud-init
+### A-52 ✅ RESUELTO (0.1.60, validado en 8.x) — `add_hive` sobre un clon recién creado choca con el `dist-upgrade` de cloud-init
 
 - **Qué pasó (2026-10-06, join de `worker2` en 8.x):** el primer join falló con `CONFIG_FAILED`
   ("identity HMAC key distribution failed … port 22: Connection refused").
@@ -977,7 +977,8 @@ Visto al arreglar los e2e de A-37, leyendo `src/router/mod.rs` y `src/shm/mod.rs
   cloud-init no corre. Hasta 15 min en total, reintentando si la caja se reinicia; el join muestra
   la fase `waiting_for_host`. Si sigue ocupada: `HOST_NOT_SETTLED` (reintentable, la llave queda,
   503); si el chequeo mismo falla: `HOST_SETTLE_CHECK_FAILED` (502).
-- **Estado:** en 0.1.60; lo valida el próximo join en la VM 104.
+- **Validado (2026-10-06):** un clon nuevo de la VM 104 unido apenas arrancó esperó 8 min en
+  `waiting_for_host` mientras corría cloud-final y después completó el join (ledger 0.1.61).
 
 ### A-53 🟡 ARREGLADO EN 0.1.58 (lo ejercita el próximo join) — `local_syncthing_device_id` siempre fallaba con Syncthing v2 y caía al primer device de `config.xml`
 
@@ -1032,7 +1033,7 @@ Visto al arreglar los e2e de A-37, leyendo `src/router/mod.rs` y `src/shm/mod.rs
   pasó de verdad (`updated`, `restarted`).
 - **Estado:** para arreglar; existía antes de la postura.
 
-### A-54 🟡 ARREGLADO EN 0.1.61 — El motherbee usaba SSH fuera de `add_hive`
+### A-54 ✅ RESUELTO (0.1.61, validado en 8.x) — El motherbee usaba SSH fuera de `add_hive`
 
 - **Qué pasa (verificado en el código el 2026-10-06):** todo el SSH vive dentro de los tres flujos
   de `add_hive`, con una excepción. En cada arranque del motherbee, `reconcile_hive_tls_material`
@@ -1061,7 +1062,8 @@ Visto al arreglar los e2e de A-37, leyendo `src/router/mod.rs` y `src/shm/mod.rs
   la caja hasta que lo complete o los saque por consola. Una caja unida alguna vez con
   `key_only_persist` (solo DEV, julio) pierde su llave de recuperación en su próximo join; el secreto
   `ssh:<hive>` del vault se borra con `vault_delete` o con un factory reset.
-- **Estado:** en 0.1.61; lo valida el próximo join en la VM 104.
+- **Validado (2026-10-06):** cero intentos de SSH del motherbee a los spokes desde el deploy (antes,
+  uno por arranque); un join nuevo completó con el envío del leaf fatal y el revoke (ledger 0.1.61).
 
 ### A-55 🟡 ABIERTO POR DECISIÓN (D31) — La puerta SSH del egress
 
