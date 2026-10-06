@@ -21,6 +21,7 @@
 
 | Versión | Fecha (ART) | Commit | Alcance | Estado | Rollback |
 |---|---|---|---|---|---|
+| **0.1.59** | 2026-10-06 | `f60eb92` | motherbee + spokes (core) | ✅ live | snap `pre-stage3-0-1-59` (las 4 VMs) · `apt install fluxbee=0.1.58` |
 | **0.1.58** | 2026-10-06 | `9d9391b` | motherbee + spokes (core) | ✅ live | snap `pre-stage2-0-1-58` (las 4 VMs) · `apt install fluxbee=0.1.57` |
 | **0.1.57** | 2026-10-06 | `a703b89` | motherbee + spokes (core) | ✅ live | snap `pre-posture-0-1-57` (las 4 VMs) · `apt install fluxbee=0.1.56` |
 | **0.1.56** | 2026-10-03 | `715143a` | motherbee + spokes (core) | ✅ live | snap `pre-root-io-0-1-56` (las 4 VMs) · `apt install fluxbee=0.1.55` |
@@ -67,6 +68,54 @@
 > (`dpkg-scanpackages -m`) para rollback, pero su detalle vive en la bitácora, no acá.
 
 ---
+
+## 0.1.59 — Syncthing sin infraestructura pública (etapa 3 de la postura)
+
+- **Fecha:** 2026-10-06 (ART) · **Versión anterior:** 0.1.58 · **Commits:** `d55ab73`..`f60eb92`
+  (FINDINGS A-47; bitácora `2026-10-06`; diseño `docs/host-posture-and-exposure-spec-v1.md` §3.5,
+  "Options (stage 3) — as built").
+- **Alcance:** motherbee + los tres spokes (core-update); `worker2` (VM 104) saltó de 0.1.57 a
+  0.1.59 en la prueba del gate.
+- **Qué cambió:**
+  - **El orquestador es dueño de las opciones de Syncthing:** sin announce global ni local, sin
+    relays, NAT, STUN, reportes de uso ni de crashes, sin auto-upgrade; reconexión cada 10 s; un
+    solo listen (el motherbee `tcp://:22000`, los spokes `tcp://127.0.0.1:22000`). Con eso
+    Syncthing no abre ningún socket UDP.
+  - **El cambio es de una sola vía y ordenado en el código:** cada spoke cambia cuando tiene al
+    motherbee en dirección fija y alcanzable (hechos persistidos en
+    `/var/lib/fluxbee/orchestrator/syncthing-posture.json` y publicados en `/versions`); el
+    motherbee, cuando todos los spokes registrados lo reportan, y mientras tanto nombra a quién
+    espera.
+  - **Joins protegidos:** mientras corre un `ADD_HIVE_FINALIZE`, el spoke no reinicia Syncthing, y
+    el sondeo de convergencia aguanta un reinicio.
+  - Dos revisiones adversariales del código antes del release.
+- **Build:** 6,5 min (commit `f60eb92`). **CI:** `rust-tests`, `posture-guards` y
+  `router-dispatcher-guards` en verde. **Publish:** 9 s, 59 paquetes. **Deploy:** 198 s con
+  `ops deploy`; snapshots `pre-stage3-0-1-59` en las 4 VMs (se borró antes `pre-root-io-0-1-56`).
+- **Verificación en vivo (gate de la etapa 3):**
+  - **Spokes de PROD:** cambiaron solos a los ~3 min del deploy (ingress1 10:21:19, egress1
+    10:21:26, worker1 10:21:30 UTC), con un reinicio de Syncthing cada uno.
+  - **El motherbee esperó a `worker2`**, nombrándolo en su journal ("no answer: … not reachable
+    in LSA"), con discovery prendido.
+  - **Salteo de versiones:** `worker2`, apagada desde 0.1.57 con `dynamic` de los dos lados,
+    arrancó, se conectó por discovery, recibió el core nuevo y se actualizó de 0.1.57 a 0.1.59 de
+    una (10:24:40). Su primer round puso al motherbee en dirección fija y cambió las opciones. El
+    motherbee registró el cambio en su siguiente sondeo (10:24:54) y el watchdog escribió sus
+    opciones y reinició Syncthing una vez (10:25:52).
+  - **`lab/posture-check.py -- --stage 3`:** `verdict ok` en los 5 hives: opciones exactas,
+    discovery apagado, ningún socket UDP de Syncthing, el motherbee escuchando en `*:22000`, los
+    spokes en `127.0.0.1:22000`, todos conectados al motherbee por `tcp://10.10.10.10:22000`,
+    completion 100%.
+  - **Reconexión:** tras reiniciar el Syncthing del motherbee, los 4 spokes volvieron en 10,5 s.
+  - **Publicación de dist:** un archivo de prueba en `dist/vendor` llegó a los 4 spokes en ~1 s
+    después del scan, y su borrado en ~3 s.
+  - **OPA** `in_sync` 4/4; **health** desde las 10:18 UTC: 0 unidades caídas, 0 denegaciones, 0
+    descartes de origen; `ops versions`: los 5 en 0.1.59, manifest `d0803b54ab5caf58`.
+  - **Sin loop de reinicios:** el uptime de Syncthing crece en tres muestras cada ~130 s en los 5
+    (motherbee 69 → 203 → 331 s; worker2 218 → 348 → 480 s; el resto igual).
+- **Rollback:** `apt install fluxbee=0.1.58` en el motherbee + core-update de los spokes, o el
+  snapshot `pre-stage3-0-1-59`. Volver a 0.1.58 no revierte las opciones (nadie las toca) y los
+  links siguen funcionando: los spokes discan fijo.
 
 ## 0.1.58 — Syncthing: los spokes discan al motherbee y el motherbee solo acepta (etapa 2 de la postura); `blob/active` solo para workers
 
