@@ -563,11 +563,12 @@ pub fn vault_key_is_valid(key: &str) -> bool {
 ///   INCLUDING io.cloud's own Cloud endpoint; overwriting it breaks/hijacks the very door the
 ///   request came through.
 /// - `edge_tls` — the edge's TLS material.
-/// - `ssh:<hive_id>` — the per-spoke recovery SSH private key stored during add_hive.
+/// - `ssh:<hive_id>` — held per-spoke SSH recovery keys until D32 removed that mode; nothing
+///   writes it now, and it stays reserved so no Cloud caller takes the name.
 ///
 /// This is NOT a general vault ACL: only the Cloud-relay origin is bound (enforced SERVER-SIDE in
 /// SY.admin's `enforce_cloud_relay_content`, mirrored in io.cloud for a clean early error). SY.*
-/// internals still write these keys normally. Lives here because both sides ship in different cargo
+/// internals still write the first two normally. Lives here because both sides ship in different cargo
 /// workspaces and must agree — same reason as [`vault_key_is_valid`].
 pub const CLOUD_RESERVED_VAULT_KEY_PREFIXES: &[&str] =
     &["edge_channel_secret:", "edge_tls", "ssh:"];

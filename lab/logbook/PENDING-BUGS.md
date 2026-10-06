@@ -1174,7 +1174,8 @@ mensaje sería otro.
   **Y además valida**: probándolo en vivo aceptó `9.9.9`, una versión inexistente, con `ok` — el
   mismo pecado con otra cara. Ahora un rebind a una versión no instalada devuelve
   `RUNTIME_NOT_AVAILABLE` en el momento del pedido, no en el próximo restart.
-- ✅ **El ruido de SSH se calló.** El reconcile de TLS emitía
+- ✅ **El ruido de SSH se calló** *(2026-10-06: obsoleto, la reconciliación de TLS por SSH se
+  borró con D32)*. El reconcile de TLS emitía
   *"failed to distribute mesh TLS material … Permission denied (publickey)"* para cada spoke
   endurecido, en cada pasada. Un hive unido con `ssh_access=revoke` **no tiene** canal SSH a
   propósito: eso es el endurecimiento funcionando, y reportarlo como warn entrena a ignorar el log.

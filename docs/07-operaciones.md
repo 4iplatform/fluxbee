@@ -292,6 +292,10 @@ sudoers. El spoke queda sin acceso SSH de Fluxbee; todo lo posterior llega por s
 dist-sync (D32). El modo `ssh_access=key_only_persist` (llave per-spoke de recuperación en el
 vault) se eliminó: un pedido con `ssh_access` se rechaza con `INVALID_REQUEST`.
 
+Una excepción a propósito: si el join falla de forma reintentable (`HOST_NOT_SETTLED`,
+`TLS_PUSH_FAILED` por un corte de SSH, un corte de transporte), la llave de la motherbee queda para
+que el reintento entre por llave. Si se abandona el join, hay que completarlo o sacarla por consola.
+
 ### 5.5 Egress e ingress (particularidades)
 
 - **Egress** (`add_egress_hive_flow`): valida `egress{}` eagerly (resuelve la config de NAT en

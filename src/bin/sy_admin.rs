@@ -7685,7 +7685,9 @@ fn error_code_to_http_status(error_code: &str) -> u16 {
         | "ENCRYPTION_ERROR"
         | "TRANSPORT_ERROR"
         // add_hive could not check whether the box had settled (A-52); not about settling.
-        | "HOST_SETTLE_CHECK_FAILED" => 502,
+        | "HOST_SETTLE_CHECK_FAILED"
+        // add_hive could not push the spoke's mesh TLS material (D32); fatal for the join.
+        | "TLS_PUSH_FAILED" => 502,
         "SHM_NOT_FOUND"
         | "RUNTIME_MANIFEST_MISSING"
         | "MISSING_WAN_LISTEN"
@@ -15124,7 +15126,7 @@ mod tests {
             &serde_json::json!({"key":"k","metadata":{"owner_node":"SY.identity@motherbee"}})).is_err());
         assert!(enforce_cloud_relay_content(io, "vault_put", "motherbee",
             &serde_json::json!({"key":"k","owner_node":"AI.x@motherbee"})).is_err());
-        // vault_put: reserved INFRA key namespaces (endpoint bearers, edge TLS, spoke recovery keys)
+        // vault_put: reserved INFRA key namespaces (endpoint bearers, edge TLS, the retired spoke keys)
         // must be rejected — a Cloud relay stores provider tokens, never the keys that guard the mesh.
         for reserved in [
             "edge_channel_secret:ich:14b66389-d425-531c-a140-a591d25e8f39",

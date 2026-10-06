@@ -53,10 +53,12 @@ MANIFEST = os.environ.get("FLUXBEE_BASE_NODES", "/usr/share/fluxbee/base-nodes.j
 STORAGE_DB = "fluxbee_storage"
 LOG_PATH = os.path.join(STATE_DIR, "state", "factory-reset.log")
 
-# Vault infrastructure that survives. The prefixes are fluxbee_sdk's
-# CLOUD_RESERVED_VAULT_KEY_PREFIXES (edge bearers, edge TLS, spoke SSH recovery keys); the key is
-# the postgres secret fluxbee-firstboot writes. Anything else -- AI keys included -- is user data.
-INFRA_PREFIXES = ("edge_channel_secret:", "edge_tls", "ssh:")
+# Vault infrastructure that survives: edge bearers and edge TLS (two of fluxbee_sdk's
+# CLOUD_RESERVED_VAULT_KEY_PREFIXES), and the postgres secret fluxbee-firstboot writes. The third
+# reserved prefix, `ssh:`, held per-spoke SSH recovery keys until D32 removed that mode: nothing
+# writes it now, so a leftover is removed like user data. Anything else -- AI keys included -- is
+# user data.
+INFRA_PREFIXES = ("edge_channel_secret:", "edge_tls")
 INFRA_KEYS = ("storage_postgres_url",)
 SYSTEM_NODE_PREFIXES = ("SY.", "RT.")
 WF_NODE_PREFIX = "WF."

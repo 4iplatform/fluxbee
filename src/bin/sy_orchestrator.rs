@@ -1222,14 +1222,26 @@ fn ensure_motherbee_ssh_key() {
     }
 }
 
-/// add_hive: issue a leaf for `hive_id` and distribute the mesh TLS material to
-/// the remote node's `/var/lib/fluxbee/tls/<hive_id>/` over the authenticated SSH
-/// channel. Best-effort (logged): the WAN degrades to plaintext without certs, so
-/// a distribution hiccup must not fail the whole add_hive.
-fn distribute_hive_tls(address: &str, key_path: &Path, user: &str, hive_id: &str) {
-    if let Err(err) = distribute_hive_tls_inner(address, key_path, user, hive_id) {
-        tracing::warn!(hive_id = hive_id, error = %err, "failed to distribute mesh TLS material");
-    }
+/// add_hive: issue a leaf for `hive_id` and push the mesh TLS material to the remote node's
+/// `/var/lib/fluxbee/tls/<hive_id>/` over the join's SSH channel. Fatal: every spoke template
+/// requires mTLS, so a spoke without its leaf never reaches the mesh, and the join is the only
+/// place a leaf is issued (D32). A push lost to an SSH blip is retryable, so the key stays and the
+/// retry is key-first.
+fn distribute_hive_tls(
+    address: &str,
+    key_path: &Path,
+    user: &str,
+    hive_id: &str,
+) -> Result<(), serde_json::Value> {
+    distribute_hive_tls_inner(address, key_path, user, hive_id).map_err(|err| {
+        let message = format!("mesh TLS material distribution failed: {err}");
+        serde_json::json!({
+            "status": "error",
+            "error_code": "TLS_PUSH_FAILED",
+            "retryable": is_transient_ssh_error(&message),
+            "message": message,
+        })
+    })
 }
 
 fn distribute_hive_tls_inner(
@@ -22040,9 +22052,10 @@ async fn add_hive_flow(
         });
     }
 
-    // Distribute the mesh TLS material so this worker's router can present a cert
-    // when wan.mtls is enabled (best-effort; WAN degrades to plaintext without it).
-    distribute_hive_tls(address, &key_path, creds.user.as_str(), hive_id);
+    // The mesh TLS material: the worker's router requires it (fatal, D32).
+    if let Err(payload) = distribute_hive_tls(address, &key_path, creds.user.as_str(), hive_id) {
+        return payload;
+    }
     // Distribute the per-hive identity HMAC key so this worker's sy-identity can
     // authenticate to the motherbee's :9100. Fatal: the worker template ships
     // identity.sync.auth=required, so without the key its sy-identity fails
@@ -22788,9 +22801,10 @@ async fn add_egress_hive_flow(
     ) {
         return err_payload("CONFIG_FAILED", err.to_string());
     }
-    // Distribute the mesh TLS material so the egress hive's router can present a
-    // cert when wan.mtls is enabled (best-effort; WAN degrades to plaintext).
-    distribute_hive_tls(address, &key_path, creds.user.as_str(), hive_id);
+    // The mesh TLS material: the egress' router requires it (fatal, D32).
+    if let Err(payload) = distribute_hive_tls(address, &key_path, creds.user.as_str(), hive_id) {
+        return payload;
+    }
     let config_routes_yaml = format!(
         "version: 1\nupdated_at: \"{}\"\nroutes: []\nvpns: []\ntaps: []\n",
         now_epoch_ms()
@@ -23486,7 +23500,10 @@ async fn add_ingress_hive_flow(
     ) {
         return err_payload("CONFIG_FAILED", err.to_string());
     }
-    distribute_hive_tls(address, &key_path, creds.user.as_str(), hive_id);
+    // The mesh TLS material: the ingress' router requires it (fatal, D32).
+    if let Err(payload) = distribute_hive_tls(address, &key_path, creds.user.as_str(), hive_id) {
+        return payload;
+    }
     let config_routes_yaml = format!(
         "version: 1\nupdated_at: \"{}\"\nroutes: []\nvpns: []\ntaps: []\n",
         now_epoch_ms()
@@ -24745,6 +24762,11 @@ fn seed_motherbee_key_over_operator_key(
 /// authorized_keys edit that follows still runs. Best-effort by contract of its
 /// caller (a failure to revoke must not fail an otherwise-successful join, but is
 /// surfaced as `ssh_bootstrap_revoked=false`).
+/// The comment of a per-spoke recovery key the removed `ssh_access=key_only_persist` mode left in
+/// `authorized_keys` (D32). Every join's revoke strips it, so a box joined in that mode loses its
+/// standing SSH door at its next join.
+const RETIRED_SPOKE_RECOVERY_KEY_MARKER: &str = "fluxbee-spoke-recovery";
+
 fn revoke_bootstrap_ssh_access(
     address: &str,
     key_path: &Path,
@@ -24763,7 +24785,7 @@ home_dir=\"$(getent passwd \"$user\" | cut -d: -f6)\"\n\
 if [[ -z \"$home_dir\" ]]; then home_dir=\"/home/$user\"; fi\n\
 auth_keys=\"$home_dir/.ssh/authorized_keys\"\n\
 if [[ -f \"$auth_keys\" ]]; then \
-{{ grep -Fv '{gate_path}' \"$auth_keys\" | grep -Fv '{key_material}' > \"$auth_keys.tmp\"; }} || true; \
+{{ grep -Fv '{gate_path}' \"$auth_keys\" | grep -Fv '{key_material}' | grep -Fv '{retired}' > \"$auth_keys.tmp\"; }} || true; \
 mv \"$auth_keys.tmp\" \"$auth_keys\" 2>/dev/null || true; \
 chown \"$user:$user\" \"$auth_keys\" 2>/dev/null || true; \
 chmod 600 \"$auth_keys\" 2>/dev/null || true; \
@@ -24772,6 +24794,7 @@ fi\n",
         sudoers = shell_single_quote(ORCH_SUDOERS_PATH),
         gate_path = shell_single_quote(ORCH_SSH_GATE_PATH),
         key_material = shell_single_quote(key_material),
+        retired = RETIRED_SPOKE_RECOVERY_KEY_MARKER,
     );
     let cmd = sudo_wrap(&format!("bash -lc '{}'", shell_single_quote(&script)));
     ssh_with_key(address, key_path, &cmd, user)?;
@@ -24787,12 +24810,13 @@ fn bootstrap_authorized_key_cleanup_script(pub_key: &str) -> Result<String, Orch
         "set -uo pipefail\n\
 auth_keys=\"$HOME/.ssh/authorized_keys\"\n\
 if [[ -f \"$auth_keys\" ]]; then \
-{{ grep -Fv '{gate_path}' \"$auth_keys\" | grep -Fv '{key_material}' > \"$auth_keys.tmp\"; }} || true; \
+{{ grep -Fv '{gate_path}' \"$auth_keys\" | grep -Fv '{key_material}' | grep -Fv '{retired}' > \"$auth_keys.tmp\"; }} || true; \
 mv \"$auth_keys.tmp\" \"$auth_keys\" 2>/dev/null || true; \
 chmod 600 \"$auth_keys\" 2>/dev/null || true; \
 fi\n",
         gate_path = shell_single_quote(ORCH_SSH_GATE_PATH),
         key_material = shell_single_quote(key_material),
+        retired = RETIRED_SPOKE_RECOVERY_KEY_MARKER,
     ))
 }
 
@@ -27091,78 +27115,201 @@ mod tests {
         }
     }
 
-    /// D32: SSH exists only inside `add_hive`. Walking the callers of every function that spawns
-    /// ssh or scp must end in the join (the three flows and the background runner that wraps
-    /// them, which revokes after a failed join). Any other root (the boot, the watchdog, a
-    /// reconcile loop) fails here; the boot-time TLS reconcile was one.
+    /// The source with every comment and string content blanked (same length, so offsets hold),
+    /// and the string literals found, with the offset of their first character.
+    fn rust_code_and_literals(src: &str) -> (String, Vec<(usize, String)>) {
+        let b = src.as_bytes();
+        let mut out = b.to_vec();
+        let mut literals = Vec::new();
+        let blank = |out: &mut Vec<u8>, from: usize, to: usize| {
+            for byte in &mut out[from..to] {
+                if *byte != b'\n' {
+                    *byte = b' ';
+                }
+            }
+        };
+        let mut i = 0;
+        while i < b.len() {
+            let ident_before = i > 0 && (b[i - 1].is_ascii_alphanumeric() || b[i - 1] == b'_');
+            if b[i..].starts_with(b"//") {
+                let end = src[i..].find('\n').map_or(b.len(), |n| i + n);
+                blank(&mut out, i, end);
+                i = end;
+            } else if b[i..].starts_with(b"/*") {
+                let (mut depth, mut j) = (0usize, i);
+                while j < b.len() {
+                    if b[j..].starts_with(b"/*") {
+                        depth += 1;
+                        j += 2;
+                    } else if b[j..].starts_with(b"*/") {
+                        depth -= 1;
+                        j += 2;
+                        if depth == 0 {
+                            break;
+                        }
+                    } else {
+                        j += 1;
+                    }
+                }
+                blank(&mut out, i, j);
+                i = j;
+            } else if !ident_before && (b[i] == b'r' || b[i..].starts_with(b"br")) {
+                let mut j = i + if b[i] == b'b' { 2 } else { 1 };
+                let hashes = b[j..].iter().take_while(|c| **c == b'#').count();
+                j += hashes;
+                if j < b.len() && b[j] == b'"' {
+                    let close = format!("\"{}", "#".repeat(hashes));
+                    let end = src[j + 1..].find(&close).map_or(b.len(), |n| j + 1 + n);
+                    literals.push((j + 1, src[j + 1..end].to_string()));
+                    blank(&mut out, j + 1, end);
+                    i = end + close.len();
+                } else {
+                    i += 1;
+                }
+            } else if b[i] == b'"' {
+                let mut j = i + 1;
+                while j < b.len() && b[j] != b'"' {
+                    j += if b[j] == b'\\' { 2 } else { 1 };
+                }
+                let end = j.min(b.len());
+                literals.push((i + 1, src[i + 1..end].to_string()));
+                blank(&mut out, i + 1, end);
+                i = end + 1;
+            } else if b[i] == b'\'' && i + 2 < b.len() && b[i + 2] == b'\'' {
+                blank(&mut out, i + 1, i + 2);
+                i += 3;
+            } else if b[i] == b'\'' && i + 1 < b.len() && b[i + 1] == b'\\' {
+                let end = src[i + 2..].find('\'').map_or(b.len(), |n| i + 2 + n);
+                blank(&mut out, i + 1, end);
+                i = end + 1;
+            } else {
+                i += 1;
+            }
+        }
+        (
+            String::from_utf8(out).expect("ascii blanks keep it utf-8"),
+            literals,
+        )
+    }
+
+    /// D32: SSH exists only inside `add_hive`. Every place that can start ssh is found: a
+    /// `Command::new` (whose argument must be a literal), or any string literal that names ssh,
+    /// scp, sftp, rsync, sshpass or ssh-keyscan as a program, alone or at the head of a command
+    /// line. From each, every use of the enclosing function is followed upwards (calls, function
+    /// pointers, turbofish) until `accept_add_hive`, the only entry. A use outside any function, or
+    /// a function nothing uses that is not `accept_add_hive`, fails with the chain that reaches it.
+    /// The boot-time TLS reconcile was such a chain (`main`).
     #[test]
     fn ssh_happens_only_inside_add_hive() {
-        let src = include_str!("sy_orchestrator.rs");
-        let code: String = src[..src.find("\nmod tests {").expect("tests module")]
-            .lines()
-            .filter(|line| !line.trim_start().starts_with("//"))
-            .collect::<Vec<_>>()
-            .join("\n");
-        let fn_re =
-            Regex::new(r"(?m)^\s*(?:pub(?:\([^)]*\))? )?(?:async )?fn ([a-z_0-9]+)").unwrap();
-        let fns: Vec<(usize, String)> = fn_re
+        let full = include_str!("sy_orchestrator.rs");
+        let src = &full[..full.find("\nmod tests {").expect("tests module")];
+        let (code, literals) = rust_code_and_literals(src);
+        let fn_re = Regex::new(
+            r#"(?m)^[ \t]*(?:pub(?:\([^)]*\))?\s+)?(?:(?:async|unsafe|const|extern(?:\s+"[^"]*")?)\s+)*fn\s+([A-Za-z_][A-Za-z_0-9]*)"#,
+        )
+        .unwrap();
+        let item_re = Regex::new(
+            r"(?m)^(?:pub(?:\([^)]*\))?\s+)?(?:static\s|const\s+[A-Z_]|struct\s|enum\s|impl\b|trait\s|type\s|mod\s|union\s|macro_rules!|use\s)",
+        )
+        .unwrap();
+        let mut bounds: Vec<(usize, Option<String>)> = fn_re
             .captures_iter(&code)
-            .map(|c| (c.get(0).unwrap().start(), c[1].to_string()))
+            .map(|c| (c.get(0).unwrap().start(), Some(c[1].to_string())))
+            .chain(item_re.find_iter(&code).map(|m| (m.start(), None)))
             .collect();
-        let enclosing = |pos: usize| -> Option<String> {
-            fns.iter()
+        bounds.sort_by_key(|(at, name)| (*at, name.is_some()));
+        let owner = |at: usize| -> Option<String> {
+            bounds
+                .iter()
                 .rev()
-                .find(|(start, _)| *start <= pos)
-                .map(|(_, name)| name.clone())
+                .find(|(start, _)| *start <= at)
+                .and_then(|(_, name)| name.clone())
         };
-        let callers_of = |name: &str| -> BTreeSet<String> {
-            let call = Regex::new(&format!(r"\b{}\s*\(", regex::escape(name))).unwrap();
-            call.find_iter(&code)
-                .filter_map(|m| enclosing(m.start()))
-                .filter(|caller| caller != name)
-                .collect()
+        let mut problems: Vec<String> = Vec::new();
+        let mut frontier: Vec<(String, String)> = Vec::new();
+        let programs = ["ssh", "scp", "sftp", "rsync", "sshpass", "ssh-keyscan"];
+        let names_a_program = |text: &str| {
+            text.split_whitespace()
+                .next()
+                .and_then(|word| word.rsplit('/').next())
+                .is_some_and(|program| programs.contains(&program))
         };
-        let mut frontier: Vec<String> = [
-            "Command::new(\"ssh\")",
-            "Command::new(\"scp\")",
-            ".arg(\"ssh\")",
-        ]
-        .iter()
-        .flat_map(|spawn| {
-            code.match_indices(spawn)
-                .filter_map(|(at, _)| enclosing(at))
-                .collect::<Vec<_>>()
-        })
-        .collect();
+        for (at, text) in &literals {
+            if names_a_program(text) {
+                match owner(*at) {
+                    Some(f) => frontier.push((f.clone(), format!("{f} (\"{text}\")"))),
+                    None => problems.push(format!("\"{text}\" outside any function")),
+                }
+            }
+        }
+        for m in code.match_indices("Command::new(") {
+            let arg = src[m.0 + "Command::new(".len()..].trim_start();
+            if !arg.starts_with('"') {
+                problems.push(format!(
+                    "Command::new with a non-literal program in {:?}",
+                    owner(m.0)
+                ));
+            }
+        }
         assert!(
             !frontier.is_empty(),
-            "no ssh spawn found: the walk would prove nothing"
+            "no ssh found: the walk would prove nothing"
         );
-        let join = [
+        let mut seen = BTreeSet::new();
+        while let Some((function, chain)) = frontier.pop() {
+            if !seen.insert(function.clone()) || function == "accept_add_hive" {
+                continue;
+            }
+            let uses = Regex::new(&format!(r"\b{}\b", regex::escape(&function))).unwrap();
+            let mut used = false;
+            for m in uses.find_iter(&code) {
+                if code[..m.start()].trim_end().ends_with("fn") {
+                    continue;
+                }
+                match owner(m.start()) {
+                    Some(user) if user == function => {}
+                    Some(user) => {
+                        used = true;
+                        frontier.push((user.clone(), format!("{user} <- {chain}")));
+                    }
+                    None => {
+                        used = true;
+                        problems.push(format!("used outside any function: {chain}"));
+                    }
+                }
+            }
+            if !used {
+                problems.push(format!("reached from outside add_hive: {chain}"));
+            }
+        }
+        assert!(
+            problems.is_empty(),
+            "SSH outside add_hive (D32):\n{}",
+            problems.join("\n")
+        );
+        for flow in [
             "add_hive_flow",
             "add_egress_hive_flow",
             "add_ingress_hive_flow",
-            "run_background_join",
-        ];
-        let mut seen = BTreeSet::new();
-        let mut outside_the_join = BTreeSet::new();
-        while let Some(function) = frontier.pop() {
-            if !seen.insert(function.clone()) || join.contains(&function.as_str()) {
-                continue;
-            }
-            let callers = callers_of(&function);
-            if callers.is_empty() {
-                outside_the_join.insert(function);
-            }
-            frontier.extend(callers);
-        }
-        assert!(
-            outside_the_join.is_empty(),
-            "SSH is reachable from outside add_hive through: {outside_the_join:?}"
-        );
-        for flow in join {
+            "accept_add_hive",
+        ] {
             assert!(seen.contains(flow), "the walk never reached {flow}");
         }
+    }
+
+    /// D32: a request with the removed field is refused before anything starts.
+    #[test]
+    fn add_hive_refuses_ssh_access_before_the_join_starts() {
+        let src = include_str!("sy_orchestrator.rs");
+        let start = src
+            .find("async fn accept_add_hive(")
+            .expect("accept_add_hive");
+        let body = &src[start..];
+        let refuse = body
+            .find("reject_removed_add_hive_fields(payload)")
+            .expect("refusal");
+        let spawn = body.find("spawn_background_join(").expect("spawn");
+        assert!(refuse < spawn);
     }
 
     #[test]

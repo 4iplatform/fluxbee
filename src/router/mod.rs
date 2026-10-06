@@ -436,7 +436,7 @@ impl Router {
                             tracing::error!(
                                 error = %err,
                                 dir = %self.cfg.tls_dir.display(),
-                                "wan.mtls=required but no TLS material on disk; WAN FAIL-CLOSED (all peers rejected). Provision certs (add_hive / cert reconcile)."
+                                "wan.mtls=required but no TLS material on disk; WAN FAIL-CLOSED (all peers rejected). A hive without its leaf is joined again (add_hive)."
                             );
                         } else {
                             tracing::warn!(

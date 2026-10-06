@@ -170,8 +170,9 @@ Al final del día: un bloque **Estado al cierre** (qué quedó vivo) y **Pendien
   *nombre* de la key. Los archivos temporales con credenciales se borran (local y remoto) apenas se usan.
 - ⚠️ **`lab/template-prep.sh` hornea el usuario `administrator` con password `magicAI`** (default de
   los scripts de `add_hive`). **Está bien para el lab; en prod hay que cambiarlo.** El propio script lo
-  advierte. → Para prod: variante con credencial propia y, mejor aún, `ssh_access=key_only_persist`
-  (la clave del spoke se revoca tras el join; ver memoria de install-UX).
+  advierte. → Para prod: variante con credencial propia y `harden_ssh: true`; la recuperación es por
+  consola y un join nuevo (D32: Fluxbee usa SSH solo dentro de `add_hive`; `key_only_persist` se
+  eliminó en 0.1.61).
 - **Tokens de Proxmox**: no se pegan en comandos que queden en logs; van por variable de entorno.
 
 ---

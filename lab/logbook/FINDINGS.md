@@ -1019,7 +1019,7 @@ Visto al arreglar los e2e de A-37, leyendo `src/router/mod.rs` y `src/shm/mod.rs
   pasó de verdad (`updated`, `restarted`).
 - **Estado:** para arreglar; existía antes de la postura.
 
-### A-54 🟡 PARA ARREGLAR (0.1.61) — El motherbee usaba SSH fuera de `add_hive`
+### A-54 🟡 ARREGLADO EN 0.1.61 — El motherbee usaba SSH fuera de `add_hive`
 
 - **Qué pasa (verificado en el código el 2026-10-06):** todo el SSH vive dentro de los tres flujos
   de `add_hive`, con una excepción. En cada arranque del motherbee, `reconcile_hive_tls_material`
@@ -1035,7 +1035,20 @@ Visto al arreglar los e2e de A-37, leyendo `src/router/mod.rs` y `src/shm/mod.rs
   no ser cuando se hace un add_hive y es totalmente temporal"*. Se borran la reconciliación al
   arrancar y el modo `key_only_persist` (ningún spoke de PROD lo usa). Un spoke que pierde su
   certificado se vuelve a unir (`remove_hive` + `add_hive`), como una máquina nueva.
-- **Estado:** aprobado; va en 0.1.61, con su revisión y un join de prueba en la VM 104.
+- **Arreglo (0.1.61, una revisión adversarial):** se borraron la reconciliación y el modo; un pedido
+  con `ssh_access` se rechaza (`INVALID_REQUEST`). El envío del leaf pasó a ser fatal para el join
+  (`TLS_PUSH_FAILED`, reintentable si fue un corte de SSH): ahora el join es el único que lo emite. El
+  revoke de cada join borra también una llave `fluxbee-spoke-recovery` que haya dejado el modo viejo,
+  y el factory reset ya no preserva secretos `ssh:*`. Un test de guardia recorre el código desde cada
+  uso de ssh/scp/sftp/rsync/sshpass/ssh-keyscan hasta `accept_add_hive` y falla con la cadena si
+  algo más llega (probado con sondas: desde el arranque, `sh -c "ssh …"`, `Command::new` sin
+  literal, relanzar el join desde `main`).
+- **Queda dicho:** un join que falla de forma reintentable deja la llave de bootstrap a propósito
+  (para que el reintento entre por llave); si el operador lo abandona, la llave y el sudoers quedan en
+  la caja hasta que lo complete o los saque por consola. Una caja unida alguna vez con
+  `key_only_persist` (solo DEV, julio) pierde su llave de recuperación en su próximo join; el secreto
+  `ssh:<hive>` del vault se borra con `vault_delete` o con un factory reset.
+- **Estado:** en 0.1.61; lo valida el próximo join en la VM 104.
 
 ### A-55 🟡 ABIERTO POR DECISIÓN (D31) — La puerta SSH del egress
 
