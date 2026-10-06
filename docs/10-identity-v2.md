@@ -348,13 +348,17 @@ Identity synchronization uses direct socket connections between SY.identity inst
 
 Identity is NOT a CONFIG_CHANGED subsystem. It does not participate in the CONFIG_CHANGED/CONFIG_RESPONSE pattern used by routes, vpns, opa, and storage.
 
-**Full sync (cold start / worker boot):**
+**Full sync (worker boot, and the start of every delta subscription):**
 
-Worker SY.identity connects to motherbee SY.identity via socket, requests full dataset, receives it in chunks, and writes to local SHM. This may take seconds for large datasets — acceptable at boot time only.
+Worker SY.identity connects to motherbee SY.identity via socket, requests full dataset, receives it in chunks, and writes to local SHM. This may take seconds for large datasets. A worker takes one at boot and one more each time it (re)subscribes to deltas: after a sequence gap, a closed stream, or 60 s without hearing motherbee.
 
 **Delta sync (runtime):**
 
-When an ILK or TNT is created, updated, or deleted, motherbee SY.identity propagates the individual change via socket to all connected worker SY.identity instances. Workers apply the delta to their local SHM. Latency: sub-millisecond for the SHM write once the delta arrives.
+When a tenant, an ILK or an alias changes, motherbee SY.identity sends the change to every worker SY.identity subscribed to its deltas (`IDENTITY_DELTA_SUBSCRIBE` on :9100, after the HMAC handshake unless `identity.sync.auth` is disabled). Workers apply each delta to their local SHM. Latency: sub-millisecond for the SHM write once the delta arrives.
+
+- Each delta carries a sequence number, and the worker acks it. A gap makes the worker resubscribe.
+- Every subscription starts with a full snapshot, so whatever changed while it was down is recovered. Motherbee registers the subscription before it answers, and registers every waiting subscription before it builds a snapshot, so no delta falls between the snapshot and the stream.
+- When nothing has gone out on a subscription for 20 s, motherbee writes a heartbeat. A worker that hears nothing for 60 s drops the subscription and resubscribes. That catches a link cut without a FIN, by a dead peer or by a firewall that stopped tracking it (DTAP P7-1, FINDINGS A-59).
 
 ---
 
@@ -1104,27 +1108,31 @@ Propagated from motherbee to workers via direct socket (not via router messages)
 
 ```json
 {
-  "version": 42,
-  "operation": "ilk_created",
-  "ilk": { ... full ILK document ... }
+  "version": 1,
+  "operation": "IDENTITY_DELTA",
+  "seq": 17,
+  "delta": { "type": "ilk_upsert", "ilk": { ... full ILK record ... } }
 }
 ```
 
-Operations: `ilk_created`, `ilk_updated`, `ilk_deleted`, `tenant_created`, `tenant_updated`, `vocabulary_added`, `vocabulary_deprecated`.
+Delta types: `tenant_upsert`, `tenant_delete`, `ilk_upsert`, `ilk_delete`, `alias_upsert`, `alias_delete`.
+
+- The worker acks each delta with `{"operation": "IDENTITY_DELTA_ACK", "seq": 17}`.
+- On a quiet subscription motherbee writes `{"operation": "IDENTITY_SYNC_HEARTBEAT"}` after 20 s without a frame. It has no seq and gets no ack.
 
 ### 12.8 IDENTITY_FULL_SYNC (socket, not router)
 
-Sent from motherbee to a worker during cold start. Streamed in chunks.
+Streamed by motherbee in chunks when a worker asks for it (`IDENTITY_FULL_SYNC_REQUEST`, on its own connection): at boot, and again at the start of every delta subscription.
 
 ```json
 {
-  "version": 42,
+  "version": 1,
   "operation": "full_sync",
   "chunk": 1,
   "total_chunks": 15,
   "tenants": [ ... ],
   "ilks": [ ... ],
-  "vocabulary": [ ... ]
+  "aliases": [ ... ]
 }
 ```
 
@@ -1455,9 +1463,10 @@ pub const TNT_STATUS_SUSPENDED: u8 = 2;
 pub const FLAG_ACTIVE: u16 = 0x0001;
 pub const FLAG_DELETED: u16 = 0x0002;
 
-// Timers
-pub const IDENTITY_HEARTBEAT_INTERVAL_MS: u64 = 5_000;
-pub const IDENTITY_SYNC_TIMEOUT_MS: u64 = 30_000;
+// Timers (src/bin/sy_identity.rs)
+const IDENTITY_SYNC_HEARTBEAT_SECS: u64 = 20; // motherbee writes a heartbeat on a quiet subscription
+const IDENTITY_SYNC_READ_IDLE_SECS: u64 = 60; // a worker drops a subscription it hears nothing on
+// The SHM heartbeat is a separate 5 s timer in the main loop.
 ```
 
 ---

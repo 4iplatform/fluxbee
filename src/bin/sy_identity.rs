@@ -53,6 +53,7 @@ const SYNC_OP_DELTA_SUBSCRIBE: &str = "IDENTITY_DELTA_SUBSCRIBE";
 const SYNC_OP_DELTA_SUBSCRIBED: &str = "IDENTITY_DELTA_SUBSCRIBED";
 const SYNC_OP_DELTA: &str = "IDENTITY_DELTA";
 const SYNC_OP_DELTA_ACK: &str = "IDENTITY_DELTA_ACK";
+const SYNC_OP_HEARTBEAT: &str = "IDENTITY_SYNC_HEARTBEAT";
 // Upstream push (replica → primary): a replica publishes its own `@hive` ilks so
 // motherbee converges to the additive union of the whole mesh ("who exists").
 const SYNC_OP_DELTA_PUBLISH: &str = "IDENTITY_DELTA_PUBLISH";
@@ -74,7 +75,16 @@ const MAX_SYNC_LINE_BYTES: usize = 16 * 1024 * 1024;
 // Idle read timeout for post-handshake sync frames: a peer that stops sending
 // mid-stream is dropped rather than pinning a reader task forever (G-4). Sized
 // generously for large full-syncs over a slow WAN link (per-frame, not total).
+// A replica reads its delta subscription with it too (P7-1).
 const IDENTITY_SYNC_READ_IDLE_SECS: u64 = 60;
+// The primary writes a heartbeat on a delta subscription after this long without
+// a frame, so a quiet mesh still sends on it. A replica that hears nothing for
+// IDENTITY_SYNC_READ_IDLE_SECS (three heartbeats) resubscribes from a full
+// snapshot. Before this, a subscription that a stateful firewall stopped tracking
+// (a table loaded after it opened, or 5 quiet days) lost every later delta and
+// the FIN, and the replica waited on it forever (P7-1).
+const IDENTITY_SYNC_HEARTBEAT_SECS: u64 = 20;
+const _: () = assert!(IDENTITY_SYNC_HEARTBEAT_SECS * 3 <= IDENTITY_SYNC_READ_IDLE_SECS);
 // Upper bound on the advertised full-sync chunk count, checked before allocating
 // the reassembly buffer, so a crafted/corrupted total_chunks (u32, up to ~4.3e9)
 // cannot drive a multi-hundred-GB allocation that aborts a booting replica
@@ -3879,9 +3889,9 @@ async fn main() -> Result<(), IdentityError> {
     let mut next_delta_seq: u64 = 1;
     // F-02: each accepted :9100 connection is handled in its own task so a slow
     // reader cannot pin the event loop. The semaphore caps concurrent handlers;
-    // handlers return a registered subscriber over `new_sub_rx` and request an
-    // on-demand full-sync snapshot over `chunks_req_rx` (built here, on the loop,
-    // only for authenticated FULL_SYNC requests — G-9).
+    // handlers queue a new subscriber over `new_sub_rx` before answering it, and
+    // request an on-demand full-sync snapshot over `chunks_req_rx` (built here, on
+    // the loop, only for authenticated FULL_SYNC requests — G-9).
     let sync_conn_sem = Arc::new(Semaphore::new(MAX_CONCURRENT_SYNC_CONNS));
     let (new_sub_tx, mut new_sub_rx) =
         mpsc::unbounded_channel::<mpsc::Sender<IdentityDeltaEnvelope>>();
@@ -4062,24 +4072,16 @@ async fn main() -> Result<(), IdentityError> {
                             let new_sub_tx2 = new_sub_tx.clone();
                             tokio::spawn(async move {
                                 let _permit = permit;
-                                match handle_sync_connection(
+                                if let Err(err) = handle_sync_connection(
                                     stream,
                                     chunks_req_tx2,
+                                    new_sub_tx2,
                                     ingest_tx2,
                                     auth_required,
                                 )
                                 .await
                                 {
-                                    Ok(Some(subscriber)) => {
-                                        // Registration happens on the main loop
-                                        // (new_sub branch) so delta_subscribers is
-                                        // only ever touched there.
-                                        let _ = new_sub_tx2.send(subscriber);
-                                    }
-                                    Ok(None) => {}
-                                    Err(err) => {
-                                        tracing::warn!(remote = %remote_addr, error = %err, "identity sync request failed");
-                                    }
+                                    tracing::warn!(remote = %remote_addr, error = %err, "identity sync request failed");
                                 }
                             });
                         }
@@ -4095,21 +4097,18 @@ async fn main() -> Result<(), IdentityError> {
             }
             maybe_new_sub = new_sub_rx.recv() => {
                 if let Some(subscriber) = maybe_new_sub {
-                    if delta_subscribers.len() >= MAX_DELTA_SUBSCRIBERS {
-                        // Cap fan-out (G-5): drop the sender (its task exits when
-                        // the channel closes). The peer retries later.
-                        tracing::warn!(
-                            cap = MAX_DELTA_SUBSCRIBERS,
-                            "identity delta subscriber cap reached; rejecting new subscriber"
-                        );
-                    } else {
-                        tracing::info!("identity delta subscriber connected");
-                        delta_subscribers.push(subscriber);
-                    }
+                    register_delta_subscriber(&mut delta_subscribers, subscriber);
                 }
             }
             maybe_chunks_req = chunks_req_rx.recv() => {
                 if let Some(reply) = maybe_chunks_req {
+                    // A replica asks for its snapshot only after its subscription answered, and
+                    // that subscriber was queued before the answer. Register every queued one
+                    // first: a delta broadcast between this snapshot and a later registration
+                    // would be in neither, and the replica would never know.
+                    while let Ok(subscriber) = new_sub_rx.try_recv() {
+                        register_delta_subscriber(&mut delta_subscribers, subscriber);
+                    }
                     // On-demand full-sync snapshot for an authenticated FULL_SYNC
                     // request (G-9): bounded CPU (clone+sort), no I/O — the
                     // streaming to the peer happens in the spawned handler task.
@@ -5168,9 +5167,10 @@ async fn connect_and_auth(
 async fn handle_sync_connection(
     stream: TcpStream,
     chunks_req_tx: mpsc::UnboundedSender<oneshot::Sender<Arc<Vec<IdentityFullSyncChunk>>>>,
+    new_sub_tx: mpsc::UnboundedSender<mpsc::Sender<IdentityDeltaEnvelope>>,
     ingest_tx: mpsc::Sender<IngestFrame>,
     auth_required: bool,
-) -> Result<Option<mpsc::Sender<IdentityDeltaEnvelope>>, IdentityError> {
+) -> Result<(), IdentityError> {
     let (read_half, mut write_half) = stream.into_split();
     let mut reader = BufReader::new(read_half);
     // Per-hive HMAC handshake before any protocol message (when required).
@@ -5202,14 +5202,21 @@ async fn handle_sync_connection(
                 write_timed(&mut write_half, b"\n").await?;
             }
             flush_timed(&mut write_half).await?;
-            Ok(None)
+            Ok(())
         }
         SYNC_OP_DELTA_SUBSCRIBE => {
             // Bounded (G-5): a slow subscriber whose queue fills is dropped by
             // broadcast_deltas (it recovers via full-sync on reconnect) instead
             // of buffering deltas without bound and exhausting primary memory.
-            let (tx, mut rx) =
-                mpsc::channel::<IdentityDeltaEnvelope>(IDENTITY_SUBSCRIBER_CHANNEL_CAP);
+            let (tx, rx) = mpsc::channel::<IdentityDeltaEnvelope>(IDENTITY_SUBSCRIBER_CHANNEL_CAP);
+            // Queue the registration (on the main loop, the only place that touches the
+            // subscriber list) BEFORE answering: the replica asks for its snapshot only after the
+            // answer, and the main loop registers queued subscribers before it builds a snapshot,
+            // so no delta falls between the two. Deltas queued before the task below starts wait
+            // in the channel and go out after the answer.
+            new_sub_tx.send(tx).map_err(|_| -> IdentityError {
+                "identity main loop unavailable for delta subscribe".into()
+            })?;
             let ack = json!({
                 "status": "ok",
                 "operation": SYNC_OP_DELTA_SUBSCRIBED
@@ -5217,56 +5224,13 @@ async fn handle_sync_connection(
             write_timed(&mut write_half, serde_json::to_string(&ack)?.as_bytes()).await?;
             write_timed(&mut write_half, b"\n").await?;
             flush_timed(&mut write_half).await?;
-            tokio::spawn(async move {
-                while let Some(envelope) = rx.recv().await {
-                    let encoded = match serde_json::to_string(&envelope) {
-                        Ok(encoded) => encoded,
-                        Err(err) => {
-                            tracing::warn!(error = %err, seq = envelope.seq, "failed to encode identity delta frame");
-                            continue;
-                        }
-                    };
-                    let mut acked = false;
-                    for attempt in 1..=IDENTITY_DELTA_MAX_RETRIES {
-                        if write_timed(&mut write_half, encoded.as_bytes())
-                            .await
-                            .is_err()
-                        {
-                            return;
-                        }
-                        if write_timed(&mut write_half, b"\n").await.is_err() {
-                            return;
-                        }
-                        if flush_timed(&mut write_half).await.is_err() {
-                            return;
-                        }
-                        match wait_for_delta_ack(&mut reader, envelope.seq).await {
-                            Ok(()) => {
-                                acked = true;
-                                break;
-                            }
-                            Err(err) => {
-                                tracing::warn!(
-                                    seq = envelope.seq,
-                                    attempt,
-                                    max_retries = IDENTITY_DELTA_MAX_RETRIES,
-                                    error = %err,
-                                    "identity delta ack not received; retrying"
-                                );
-                            }
-                        }
-                    }
-                    if !acked {
-                        tracing::warn!(
-                            seq = envelope.seq,
-                            max_retries = IDENTITY_DELTA_MAX_RETRIES,
-                            "identity delta ack retries exhausted; closing subscriber stream"
-                        );
-                        return;
-                    }
-                }
-            });
-            Ok(Some(tx))
+            tokio::spawn(serve_delta_subscriber(
+                reader,
+                write_half,
+                rx,
+                Duration::from_secs(IDENTITY_SYNC_HEARTBEAT_SECS),
+            ));
+            Ok(())
         }
         SYNC_OP_DELTA_PUBLISH => {
             // A replica publishes its own `@hive` ilks upstream. Require the
@@ -5288,7 +5252,7 @@ async fn handle_sync_connection(
                     .await?;
                 write_half.write_all(b"\n").await?;
                 write_half.flush().await?;
-                return Ok(None);
+                return Ok(());
             };
             // Bind the HMAC-authenticated identity to the published-as hive_id:
             // a peer must not authenticate as one hive and push another's ilks.
@@ -5306,7 +5270,7 @@ async fn handle_sync_connection(
                         .await?;
                     write_half.write_all(b"\n").await?;
                     write_half.flush().await?;
-                    return Ok(None);
+                    return Ok(());
                 }
             }
             let ack = json!({ "status": "ok", "operation": SYNC_OP_PUBLISH_OK });
@@ -5329,7 +5293,7 @@ async fn handle_sync_connection(
                     tracing::warn!(hive = %publisher_hive, error = %err, "identity publish reader ended");
                 }
             });
-            Ok(None)
+            Ok(())
         }
         _ => {
             let payload = IdentitySyncError {
@@ -5341,7 +5305,85 @@ async fn handle_sync_connection(
             write_half.write_all(encoded.as_bytes()).await?;
             write_half.write_all(b"\n").await?;
             write_half.flush().await?;
-            Ok(None)
+            Ok(())
+        }
+    }
+}
+
+/// Primary side of one delta subscription: write each delta and wait for the
+/// replica's ack (retried), and write a heartbeat whenever no frame went out for
+/// `heartbeat_every`. Returns, closing the stream, on a write error, when the acks
+/// run out, or when the main loop drops the subscriber; the replica then
+/// resubscribes from a full snapshot.
+async fn serve_delta_subscriber(
+    mut reader: BufReader<tokio::net::tcp::OwnedReadHalf>,
+    mut write_half: tokio::net::tcp::OwnedWriteHalf,
+    mut rx: mpsc::Receiver<IdentityDeltaEnvelope>,
+    heartbeat_every: Duration,
+) {
+    let heartbeat = json!({ "operation": SYNC_OP_HEARTBEAT }).to_string();
+    loop {
+        let envelope = match time::timeout(heartbeat_every, rx.recv()).await {
+            Ok(Some(envelope)) => envelope,
+            Ok(None) => return,
+            Err(_) => {
+                // A quiet stream: the replica only needs to hear the primary
+                // (P7-1). Heartbeats carry no seq and get no ack.
+                if write_timed(&mut write_half, heartbeat.as_bytes())
+                    .await
+                    .is_err()
+                    || write_timed(&mut write_half, b"\n").await.is_err()
+                    || flush_timed(&mut write_half).await.is_err()
+                {
+                    return;
+                }
+                continue;
+            }
+        };
+        let encoded = match serde_json::to_string(&envelope) {
+            Ok(encoded) => encoded,
+            Err(err) => {
+                tracing::warn!(error = %err, seq = envelope.seq, "failed to encode identity delta frame");
+                continue;
+            }
+        };
+        let mut acked = false;
+        for attempt in 1..=IDENTITY_DELTA_MAX_RETRIES {
+            if write_timed(&mut write_half, encoded.as_bytes())
+                .await
+                .is_err()
+            {
+                return;
+            }
+            if write_timed(&mut write_half, b"\n").await.is_err() {
+                return;
+            }
+            if flush_timed(&mut write_half).await.is_err() {
+                return;
+            }
+            match wait_for_delta_ack(&mut reader, envelope.seq).await {
+                Ok(()) => {
+                    acked = true;
+                    break;
+                }
+                Err(err) => {
+                    tracing::warn!(
+                        seq = envelope.seq,
+                        attempt,
+                        max_retries = IDENTITY_DELTA_MAX_RETRIES,
+                        error = %err,
+                        "identity delta ack not received; retrying"
+                    );
+                }
+            }
+        }
+        if !acked {
+            tracing::warn!(
+                seq = envelope.seq,
+                max_retries = IDENTITY_DELTA_MAX_RETRIES,
+                "identity delta ack retries exhausted; closing subscriber stream"
+            );
+            return;
         }
     }
 }
@@ -5483,6 +5525,30 @@ fn push_local_deltas_upstream(
     }
 }
 
+/// Registers a delta subscriber, first dropping those whose stream ended (their task exits on a
+/// write error or a closed channel), so the cap counts live subscribers only.
+fn register_delta_subscriber(
+    subscribers: &mut Vec<mpsc::Sender<IdentityDeltaEnvelope>>,
+    subscriber: mpsc::Sender<IdentityDeltaEnvelope>,
+) {
+    subscribers.retain(|tx| !tx.is_closed());
+    if subscriber.is_closed() {
+        // Its handler failed after queueing it (the answer never went out).
+        return;
+    }
+    if subscribers.len() >= MAX_DELTA_SUBSCRIBERS {
+        // Cap fan-out (G-5): drop the sender (its task exits when the channel closes). The peer
+        // retries later.
+        tracing::warn!(
+            cap = MAX_DELTA_SUBSCRIBERS,
+            "identity delta subscriber cap reached; rejecting new subscriber"
+        );
+    } else {
+        tracing::info!("identity delta subscriber registered");
+        subscribers.push(subscriber);
+    }
+}
+
 fn broadcast_deltas(
     subscribers: &mut Vec<mpsc::Sender<IdentityDeltaEnvelope>>,
     deltas: &[IdentityDeltaEnvelope],
@@ -5572,12 +5638,48 @@ async fn stream_deltas_from_primary(
         return Err("delta sink dropped".into());
     }
 
+    read_delta_stream(
+        &mut reader,
+        &mut write_half,
+        sink,
+        Duration::from_secs(IDENTITY_SYNC_READ_IDLE_SECS),
+    )
+    .await
+}
+
+/// Replica side of a delta subscription, after its snapshot: hand each delta to
+/// the main loop in order and ack it. Returns Ok when the primary closes the
+/// stream, and Err on a rejection, a sequence gap, or `idle` without any frame;
+/// either way the caller resubscribes from a full snapshot.
+async fn read_delta_stream(
+    reader: &mut BufReader<tokio::net::tcp::OwnedReadHalf>,
+    write_half: &mut tokio::net::tcp::OwnedWriteHalf,
+    sink: &mpsc::UnboundedSender<ReplicaSyncEvent>,
+    idle: Duration,
+) -> Result<(), IdentityError> {
+    let mut line = String::new();
     let mut last_seq: Option<u64> = None;
     loop {
         line.clear();
-        // Size-capped (G-4) but NO idle timeout: this is a long-poll for deltas
-        // that may be sparse on a quiet mesh; a timeout would churn reconnects.
-        let n = read_sync_line(&mut reader, &mut line, MAX_SYNC_LINE_BYTES, None).await?;
+        // Size-capped (G-4), with an idle deadline: the primary writes at least
+        // a heartbeat every IDENTITY_SYNC_HEARTBEAT_SECS, so silence means the
+        // link is gone even when no FIN or RST ever arrives (P7-1). A heartbeat
+        // matches neither frame below; reading it only renews the deadline.
+        let n = match time::timeout(
+            idle,
+            read_capped_line(reader, &mut line, MAX_SYNC_LINE_BYTES),
+        )
+        .await
+        {
+            Ok(read) => read?,
+            Err(_) => {
+                return Err(format!(
+                    "no frame from the primary for {idle:?} (heartbeats stopped); \
+                     resubscribing from a full snapshot"
+                )
+                .into())
+            }
+        };
         if n == 0 {
             return Ok(());
         }
@@ -5603,7 +5705,7 @@ async fn stream_deltas_from_primary(
                 }
                 if let Some(last) = last_seq {
                     if envelope.seq == last {
-                        send_delta_ack(&mut write_half, envelope.seq).await?;
+                        send_delta_ack(write_half, envelope.seq).await?;
                         continue;
                     }
                     if envelope.seq != last.saturating_add(1) {
@@ -5624,7 +5726,7 @@ async fn stream_deltas_from_primary(
                     return Err("delta sink dropped".into());
                 }
                 last_seq = Some(envelope.seq);
-                send_delta_ack(&mut write_half, envelope.seq).await?;
+                send_delta_ack(write_half, envelope.seq).await?;
             }
         }
     }
@@ -10141,5 +10243,179 @@ mod tests {
         let mut empty = Value::Null;
         fill_missing_identification(&mut empty, &json!({"email": "ana@acme.com"}));
         assert_eq!(empty, json!({"email": "ana@acme.com"}));
+    }
+
+    type SyncHalves = (
+        BufReader<tokio::net::tcp::OwnedReadHalf>,
+        tokio::net::tcp::OwnedWriteHalf,
+    );
+
+    /// A connected loopback pair: (the primary's end, the replica's end).
+    async fn sync_link() -> (SyncHalves, SyncHalves) {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind loopback");
+        let addr = listener.local_addr().expect("local addr");
+        let (replica, primary) = tokio::join!(TcpStream::connect(addr), listener.accept());
+        let (p_read, p_write) = primary.expect("accept").0.into_split();
+        let (r_read, r_write) = replica.expect("connect").into_split();
+        (
+            (BufReader::new(p_read), p_write),
+            (BufReader::new(r_read), r_write),
+        )
+    }
+
+    fn ilk_delete_envelope(seq: u64) -> IdentityDeltaEnvelope {
+        IdentityDeltaEnvelope {
+            version: IDENTITY_SYNC_VERSION,
+            operation: SYNC_OP_DELTA.to_string(),
+            seq,
+            delta: IdentityDelta::IlkDelete {
+                ilk_id: "ilk:00000000-0000-0000-0000-0000000000aa".to_string(),
+            },
+        }
+    }
+
+    async fn next_frame(reader: &mut BufReader<tokio::net::tcp::OwnedReadHalf>) -> Value {
+        let mut line = String::new();
+        let n = time::timeout(
+            Duration::from_secs(5),
+            read_capped_line(reader, &mut line, MAX_SYNC_LINE_BYTES),
+        )
+        .await
+        .expect("a frame within 5 s")
+        .expect("read a frame");
+        assert!(n > 0, "the stream closed");
+        serde_json::from_str(line.trim()).expect("a JSON frame")
+    }
+
+    #[test]
+    fn registering_a_subscriber_drops_the_ones_whose_stream_ended() {
+        let mut subscribers = Vec::new();
+        let (live, _live_rx) = mpsc::channel(1);
+        let (dead, dead_rx) = mpsc::channel(1);
+        subscribers.push(live);
+        subscribers.push(dead);
+        drop(dead_rx);
+        let (new, _new_rx) = mpsc::channel(1);
+        register_delta_subscriber(&mut subscribers, new);
+        assert_eq!(subscribers.len(), 2);
+        assert!(subscribers.iter().all(|tx| !tx.is_closed()));
+    }
+
+    #[tokio::test]
+    async fn primary_heartbeats_a_quiet_subscription_and_still_delivers_deltas() {
+        let ((p_reader, p_writer), (mut r_reader, mut r_writer)) = sync_link().await;
+        let (tx, rx) = mpsc::channel(4);
+        let primary = tokio::spawn(serve_delta_subscriber(
+            p_reader,
+            p_writer,
+            rx,
+            Duration::from_millis(50),
+        ));
+
+        assert_eq!(
+            next_frame(&mut r_reader).await,
+            json!({ "operation": SYNC_OP_HEARTBEAT })
+        );
+
+        tx.send(ilk_delete_envelope(1))
+            .await
+            .expect("queue a delta");
+        let delta = loop {
+            let frame = next_frame(&mut r_reader).await;
+            if frame["operation"] != SYNC_OP_HEARTBEAT {
+                break frame;
+            }
+        };
+        assert_eq!(delta["operation"], SYNC_OP_DELTA);
+        assert_eq!(delta["seq"], 1);
+        send_delta_ack(&mut r_writer, 1).await.expect("ack");
+
+        // Acked: the stream stays up and keeps beating.
+        assert_eq!(
+            next_frame(&mut r_reader).await["operation"],
+            SYNC_OP_HEARTBEAT
+        );
+        assert!(!primary.is_finished());
+        drop(tx);
+        time::timeout(Duration::from_secs(5), primary)
+            .await
+            .expect("the subscriber ends with its channel")
+            .expect("no panic");
+    }
+
+    #[tokio::test]
+    async fn replica_drops_a_subscription_that_goes_silent() {
+        // The primary's end stays open and writes nothing: what a replica sees
+        // when a firewall drops the stream's packets and its FIN (P7-1).
+        let ((_p_reader, _p_writer), (mut r_reader, mut r_writer)) = sync_link().await;
+        let (sink, _events) = mpsc::unbounded_channel();
+        let started = Instant::now();
+        let err = time::timeout(
+            Duration::from_secs(5),
+            read_delta_stream(
+                &mut r_reader,
+                &mut r_writer,
+                &sink,
+                Duration::from_millis(200),
+            ),
+        )
+        .await
+        .expect("returns on its own idle deadline")
+        .expect_err("silence is an error, so the caller resubscribes");
+        assert!(
+            err.to_string().contains("no frame from the primary"),
+            "{err}"
+        );
+        assert!(started.elapsed() >= Duration::from_millis(200));
+    }
+
+    #[tokio::test]
+    async fn heartbeats_keep_a_quiet_replica_subscribed() {
+        let ((p_reader, p_writer), (mut r_reader, mut r_writer)) = sync_link().await;
+        let (tx, rx) = mpsc::channel(4);
+        tokio::spawn(serve_delta_subscriber(
+            p_reader,
+            p_writer,
+            rx,
+            Duration::from_millis(50),
+        ));
+        let (sink, mut events) = mpsc::unbounded_channel();
+        let replica = tokio::spawn(async move {
+            read_delta_stream(
+                &mut r_reader,
+                &mut r_writer,
+                &sink,
+                Duration::from_millis(500),
+            )
+            .await
+        });
+
+        // Quiet for three idle deadlines: only the heartbeats keep it subscribed.
+        time::sleep(Duration::from_millis(1_500)).await;
+        assert!(
+            !replica.is_finished(),
+            "a quiet but live stream must stay subscribed"
+        );
+
+        tx.send(ilk_delete_envelope(1))
+            .await
+            .expect("queue a delta");
+        match time::timeout(Duration::from_secs(5), events.recv())
+            .await
+            .expect("a delta within 5 s")
+        {
+            Some(ReplicaSyncEvent::Delta(envelope)) => assert_eq!(envelope.seq, 1),
+            _ => panic!("expected the delta"),
+        }
+
+        // The primary dropping the subscriber closes the stream cleanly.
+        drop(tx);
+        let ended = time::timeout(Duration::from_secs(5), replica)
+            .await
+            .expect("ends after the close")
+            .expect("no panic");
+        assert!(ended.is_ok(), "a closed stream is not an error: {ended:?}");
     }
 }
