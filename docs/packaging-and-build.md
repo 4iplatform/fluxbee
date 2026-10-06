@@ -122,7 +122,7 @@ Ubuntu 24.04 con:
 
 ```bash
 sudo apt-get update
-sudo apt-get install -y git build-essential protobuf-compiler golang python3 dpkg-dev
+sudo apt-get install -y git build-essential protobuf-compiler golang python3 apt-utils
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
 . "$HOME/.cargo/env"
 ```
@@ -138,7 +138,8 @@ git clone git@github.com:4iplatform/fluxbee.git ~/fluxbee   # (o https)
 `packaging/build-deb.sh`, y deja el paquete en `dist/fluxbee_<ver>_amd64.deb`. Un dev nuevo solo
 necesita acceso a GitHub y el toolchain — nada más.
 
-> Caja de referencia en el lab: la VM **fb-build** (Proxmox `PC-004-165`, VM 210) ya tiene el
+> Caja de referencia: la VM **fb-build** (VM 110 en el Proxmox de PROD; el cluster de dev tiene
+> otra, la VM 210 en `PC-004-165`, §4.4) ya tiene el
 > toolchain y `/opt/fluxbee`. `scripts/make-deb.sh` reproduce ese setup en cualquier máquina.
 
 ### 4.3 Repo apt interno (instalar por red, sin copiar el `.deb`) — recomendado
@@ -153,7 +154,7 @@ En el build+repo box (tras `make-deb.sh`):
 scripts/apt-repo-publish.sh --serve          # publica el .deb en un repo flat + lo sirve en :8900
 ```
 
-`apt-repo-publish.sh` arma un repo flat (`dpkg-scanpackages` + `apt-ftparchive release`) y lo sirve.
+`apt-repo-publish.sh` arma un repo flat (`apt-ftparchive packages` + `apt-ftparchive release`) y lo sirve.
 Es **sin firmar** + `[trusted=yes]` (uso interno). Para un repo **público/internet**, firmá el
 `Release` con GPG (`InRelease`) y sacá `[trusted=yes]` — el `.deb` en sí no cambia. Volvé a correr
 el script tras cada build nuevo para regenerar el índice.
@@ -173,7 +174,7 @@ sudo apt-get update && sudo apt-get install -y fluxbee
 sudo nano /etc/fluxbee/hive.yaml && sudo fluxbee-firstboot
 ```
 
-### 4.4 Layout de 3 servers (lab Proxmox `PC-004-165/157/156`)
+### 4.4 Layout del cluster de dev (lab Proxmox `PC-004-165/157/156`)
 
 | Server | Rol | Qué corre |
 |--------|-----|-----------|

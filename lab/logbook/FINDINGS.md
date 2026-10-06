@@ -995,6 +995,39 @@ Visto al arreglar los e2e de A-37, leyendo `src/router/mod.rs` y `src/shm/mod.rs
   binario generaría uno como root); si no, el `myID` del Syncthing en marcha. Nunca `config.xml`.
 - **Estado:** construido; lo ejercita el próximo join (el de A-48).
 
+### A-59 🟡 ARREGLADO EN CÓDIGO (para 0.1.62, falta validar en 8.x) — La réplica de identity esperaba para siempre en una suscripción cortada sin FIN
+
+- **Qué pasaba (panel DTAP ronda 7, P7-1, confirmado en el código):** la suscripción de deltas de
+  una réplica es un long-poll. La réplica solo escribe para confirmar un delta, leía sin timeout y el
+  socket no tiene keepalive. Si un firewall con estado deja de seguir la conexión, descarta los
+  deltas siguientes y también el FIN, y la réplica no se entera nunca. Pasa con una tabla cargada
+  después de abrir la conexión (el primer apply de la etapa 4, o un join donde sy-identity arranca
+  antes que la postura) o tras 5 días sin tráfico (el timeout de conntrack). Altas, bajas y
+  revocaciones dejan de llegar a ese hive hasta que se reinicie su sy-identity.
+- **Arreglo:** el primario escribe un latido (`IDENTITY_SYNC_HEARTBEAT`, sin seq ni ack) cuando
+  pasan 20 s sin enviar nada. La réplica corta la suscripción tras 60 s sin oír nada, lo dice en el
+  log ("no frame from the primary for 60s (heartbeats stopped)") y se vuelve a suscribir desde un
+  snapshot completo. Es el mismo patrón de los pares: el WAN manda un LSA cada 10 s y la publicación
+  de identity reconcilia cada 30 s.
+- **Pruebas:** tres tests con sockets reales: el primario late y sigue entregando deltas; la réplica
+  corta un stream mudo; y los dos juntos se mantienen suscritos. Sin el latido fallan dos, y sin el
+  timeout falla uno.
+- **De la revisión adversarial (dos arreglos más, existían antes):**
+  - un delta podía perderse en silencio al abrir una suscripción: el primario podía armar el
+    snapshot antes de registrar al suscriptor, y un delta difundido en el medio no estaba en
+    ninguno de los dos. Ahora el handler encola la registración antes de responder y el lazo
+    principal registra lo encolado antes de armar cada snapshot. Con P7-1 las re-suscripciones son
+    más frecuentes, por eso importa;
+  - las suscripciones muertas se limpiaban solo al difundir un cambio; ahora también al registrar
+    una nueva, así el tope de 256 cuenta solo las vivas.
+  - Bajar el motherbee de 0.1.62 dejando los spokes arriba hace que el worker se re-suscriba cada
+    60 s: el HANDBOOK ("El rollback") pide bajar primero los spokes.
+- **Visto en PROD antes del arreglo (0.1.61):** la suscripción de worker1 llevaba 15.929 s sin un
+  paquete en ninguna dirección; el canal de publicación, cada 30 s.
+- **Validar en 8.x:** worker1 tiene dos conexiones a 10.10.10.10:9100. En la de la suscripción (la que
+  casi no envía) `lastrcv` no pasa de ~20 s; la de publicación llega a ~30 s, el ciclo de su snapshot.
+  Y una prueba concreta: cortar 100 s lo que llega de :9100 y ver que la réplica lo dice y se reconecta.
+
 ### A-58 🟡 PARA ARREGLAR — En los workers y el egress Syncthing corre como root
 
 - **Qué pasa (visto el 2026-10-06 en PROD, solo lectura):** worker1 y egress1 no tienen el usuario
@@ -1022,16 +1055,24 @@ Visto al arreglar los e2e de A-37, leyendo `src/router/mod.rs` y `src/shm/mod.rs
   `blob/` solo necesita ser atravesable), y la misma primitiva de A-51 en el SDK y en io.blob.
 - **Estado:** para arreglar en un paso propio (toca el SDK y el workspace de IO).
 
-### A-57 🟡 PARA ARREGLAR — `update category=vendor` instala el Syncthing nuevo pero no lo reinicia, y responde que sí
+### A-57 🟡 ARREGLADO EN CÓDIGO (para 0.1.62, falta validar en 8.x) — `update category=vendor` instalaba el Syncthing nuevo pero no lo reiniciaba, y respondía que sí
 
-- **Qué pasa (verificado en el código el 2026-10-06):** el update de vendor llama a
-  `ensure_blob_sync_runtime`, que reinstala el binario si cambió el hash y después hace
-  `systemctl start`, que no hace nada si el servicio ya corre. El Syncthing en marcha sigue con el
-  binario viejo hasta el próximo reinicio, y la respuesta dice
+- **Qué pasaba (verificado en el código el 2026-10-06):** el update de vendor llamaba a
+  `ensure_blob_sync_runtime`, que reinstalaba el binario si cambió el hash y después hacía
+  `systemctl start`, que no hace nada si el servicio ya corre. El Syncthing en marcha seguía con el
+  binario viejo hasta el próximo reinicio, y la respuesta decía
   `restarted: [fluxbee-syncthing]` igual.
-- **Arreglo propuesto:** si se instaló un binario nuevo, reiniciar el servicio y reportar lo que
-  pasó de verdad (`updated`, `restarted`).
-- **Estado:** para arreglar; existía antes de la postura.
+- **Arreglo:** instalar el binario y escribir la unit ahora dicen si cambiaron algo (la unit tenía
+  el mismo problema: `daemon-reload` sin reinicio). Si el servicio corre y cambió cualquiera de los
+  dos, o si su proceso corre un binario borrado (`/proc/<pid>/exe` termina en `(deleted)`, el mismo
+  chequeo que usa el core), se reinicia en ese momento, antes de los chequeos de salud, que ya
+  usan el puerto y el home de la unit nueva. Leerlo del proceso hace que un reinicio que se perdió
+  por un error en el medio ocurra en la llamada siguiente (revisión adversarial, F1). La respuesta
+  dice lo que pasó: `updated: [syncthing]` solo con un binario nuevo, `restarted` solo si hubo
+  reinicio. Tests de la regla y de la respuesta.
+- **Validar en 8.x:** un `update category=vendor` sin binario nuevo responde `unchanged` y sin
+  reinicio. El camino con binario nuevo lo ejercita el próximo vendor que cambie.
+- **Estado:** arreglado en código; existía antes de la postura.
 
 ### A-54 ✅ RESUELTO (0.1.61, validado en 8.x) — El motherbee usaba SSH fuera de `add_hive`
 
@@ -1064,6 +1105,19 @@ Visto al arreglar los e2e de A-37, leyendo `src/router/mod.rs` y `src/shm/mod.rs
   `ssh:<hive>` del vault se borra con `vault_delete` o con un factory reset.
 - **Validado (2026-10-06):** cero intentos de SSH del motherbee a los spokes desde el deploy (antes,
   uno por arranque); un join nuevo completó con el envío del leaf fatal y el revoke (ledger 0.1.61).
+- **Seguimiento (0.1.62, de la revisión de D32):**
+  - cada flujo emite el leaf antes de su primera sesión SSH: si la CA no puede, el join falla con
+    `TLS_ISSUE_FAILED` antes de instalar nada en la caja (el revoke del camino de falla igual
+    intenta entrar, como en cualquier falla no reintentable);
+  - el revoke borra la llave `fluxbee-spoke-recovery` solo si ese nombre es el comentario de la
+    línea (antes, cualquier línea que lo mencionara), con un test que corre el filtro con bash;
+  - el test de guardia también cubre ssh-copy-id y autossh, busca el programa en posición de comando
+    dentro de un shell (después de `sudo -n -u x`, `timeout 5`, `env A=b`, `bash -lc`, `su -c`,
+    `runuser`, `systemd-run`, `if`, `{`, con las comillas escapadas del fuente), rechaza
+    renombrar `Command` y código después de `mod tests`, y exige que `accept_add_hive` tenga un solo
+    llamador, `handle_admin`. Probado con siete sondas que lo hacen fallar y un control que no;
+  - de paso, el join de un worker falla con `VENDOR_SYNC_FAILED` si no le llega el vendor, como ya
+    hacían egress e ingress: sin vendor nunca recibe Syncthing y nada lo repara.
 
 ### A-55 🟡 ABIERTO POR DECISIÓN (D31) — La puerta SSH del egress
 

@@ -376,10 +376,11 @@ camino documentado que resuelve dependencias.
 
 #### ⚠️ Usá el script. No rehagas el índice a mano.
 
-El script hace **tres** cosas en una línea, y las tres importan:
+El script rehace los tres archivos del índice, y los tres importan (en archivos temporales que
+después renombra, así un `apt-get update` en curso nunca ve un índice a medias):
 
 ```bash
-dpkg-scanpackages -m . > Packages  &&  gzip -kf Packages  &&  apt-ftparchive release . > Release
+apt-ftparchive --db "$CACHE" packages . > Packages  &&  gzip -c Packages > Packages.gz  &&  apt-ftparchive release . > Release
 ```
 
 Copiar un `.deb` nuevo a la carpeta **no alcanza**. Si lo hacés a mano, hay dos maneras de que
@@ -388,7 +389,7 @@ salga mal y ninguna avisa:
 | omisión | síntoma | por qué engaña |
 |---|---|---|
 | no regenerar `Release` | `apt` dice **`fluxbee is already the newest version`** con el paquete nuevo ahí | `apt` ve `Hit:` en `Release` y ni mira `Packages` |
-| `dpkg-scanpackages` **sin `-m`** | el índice queda con **una sola** versión | sin `-m` publica sólo la más nueva por paquete, y te quedás **sin rollback por apt** |
+| un índice con **una sola** versión (por ejemplo `dpkg-scanpackages` sin `-m`) | `apt` ofrece solo la más nueva | te quedás **sin rollback por apt**; `apt-ftparchive packages` lista todas |
 
 La segunda es la peligrosa: no rompe nada hoy, te saca el camino de vuelta. Se nota comparando el
 tamaño de `Packages` — 13 versiones son ~13 KB, una sola son ~1 KB.
@@ -694,7 +695,7 @@ vez, **se rearmó solo**, sin intervención. Pero las VMs **no arrancan solas** 
 | 14 | Cert rotado en el vault | El edge sigue sirviendo el viejo | Reiniciar `sy-edge` (ver PB-1) |
 | 15 | Placas secundarias | `add_hive` no las configura | Dejarlas listas antes del join |
 | 16 | Repo apt hecho a mano | `apt` dice *already the newest version* con el `.deb` nuevo ahí | Usar `scripts/apt-repo-publish.sh`: regenera **`Release`**, no sólo `Packages` |
-| 17 | `dpkg-scanpackages` sin `-m` | El índice queda con una sola versión · **te quedás sin rollback** | El script ya trae `-m`. No lo rehagas a mano |
+| 17 | Índice rehecho a mano con `dpkg-scanpackages` sin `-m` | Queda con una sola versión · **te quedás sin rollback** | Usar el script (`apt-ftparchive packages` lista todas). No lo rehagas a mano |
 | 18 | `dpkg-deb` "colgado" | El `.deb` sigue en 3 KB y `dpkg-deb -c` dice *unexpected end of file* | Está comprimiendo con `xz`. Esperá el `BUILD END`; termina en ~240 MB |
 | 19 | Toolchain y `$HOME` | `rustup` dice *no installed toolchains* con la toolchain ahí | `rustup` lee `$HOME/.rustup`: en `fb-build` compilá con `HOME=/root` |
 | 20 | Carácter > U+00FF en un `exec` (`—` `→` `✓`) | `QEMU guest agent is not running` con la VM viva — **no es la carga** (B-11) | `lab/pve.py` (codifica el argv); si ya pasó: reboot y si no, `reset` |
@@ -986,12 +987,13 @@ con tokens cargados es una pérdida real.
 
 ### Un nodo de sistema nuevo en un rol, con hives ya unidos (0.1.41: SY.opa.rules en ingress/egress)
 
-El `hive.yaml` de un spoke se escribe una sola vez, en el join, y no se re-emite
-([U-6](PENDING-BUGS.md#u-6)). El spoke arranca los nodos de **su** `system_nodes.<rol>` y los valida
+El `hive.yaml` de un spoke se escribe una sola vez, en el join, y no se re-emite. El spoke arranca los nodos de **su** `system_nodes.<rol>` y los valida
 contra el manifest core que le manda el motherbee. Por eso el orden importa:
 
 1. **Motherbee, antes del `apt install`:** agregar el nodo a `system_nodes.<rol>.nodes` de
-   `/etc/fluxbee/hive.yaml` (conffile: el `.deb` no lo toca). Al reiniciar, el orquestador arma
+   `/etc/fluxbee/hive.yaml` (el `.deb` no pisa tus cambios: su payload trae solo `hive.yaml.example`;
+   el postinst crea `hive.yaml` solo si falta y solo corrige `architect.listen` en `0.0.0.0`, A-46).
+   Al reiniciar, el orquestador arma
    `dist/core/<rol>` con el binario nuevo y Syncthing lo lleva al spoke.
 2. **Esperar que el binario llegue al spoke:** `dist/core/bin/<binario>` presente y con el sha256
    que dice `dist/core/manifest.json`. Si el `hive.yaml` del spoke lo nombra antes, el orquestador
@@ -1007,12 +1009,24 @@ nombre fijo; una carpeta nueva de todos los roles necesita el mismo código (o g
 
 ### El rollback
 
-No existe rollback de core como comando ([U-5](PENDING-BUGS.md#u-5)). Los dos caminos reales:
+Tres caminos:
 
-1. **Snapshot en frío de las VMs** — ver §1 sobre por qué en frío. Con el máximo de 3 por VM
+1. **`core_rollback`** ([U-5](PENDING-BUGS.md#u-5)): `POST /hives/{hive}/core/rollback` devuelve
+   un **spoke** a la generación que reemplazó su último `update category=core` (cada binario sellado
+   con su sha256), con gate de salud (la unit activa). Necesita un update previo que haya cambiado
+   binarios. El motherbee no tiene generaciones (su core lo instala dpkg): para él, igual que para un
+   hive cuyo orquestador es lo que está roto, los dos siguientes. Si restaura `sy-orchestrator`, la
+   respuesta puede ser `FORWARD_UNKNOWN`: verificá `core.installed.source = core_rollback` en
+   `/versions`.
+2. **Snapshot en frío de las VMs** — ver §1 sobre por qué en frío. Con el máximo de 3 por VM
    (§12), cubre solo lo reciente.
-2. **Conservar el `.deb` anterior publicado** en el repo apt y bajar de versión con `apt`. Es el
+3. **Conservar el `.deb` anterior publicado** en el repo apt y bajar de versión con `apt`. Es el
    camino para cualquier versión vieja.
+
+**Bajar de 0.1.62 o más a una anterior:** primero los spokes (`core_rollback` o `update` al core
+viejo), después el motherbee. Un worker de 0.1.62 frente a un motherbee viejo no recibe latidos en su
+suscripción de identity: la corta cada 60 s y pide un snapshot completo, y el motherbee viejo solo
+limpia esas suscripciones muertas cuando difunde un cambio.
 
 **Bajar de 0.1.41 o más a una anterior** (antes de la policy OPA global): primero
 `POST /opa/policy/clear` y esperar `converged: true`. Si no, los workers siguen aplicando la última
@@ -1069,7 +1083,7 @@ sudo fluxbee-factory-reset --yes --confirm-hive motherbee   # ejecuta sin pregun
 | Nodos lanzados por usuarios, en todos los hives (kill + purge: se van con su ILK, sus secretos y sus timers) | La instalación: paquete, `/etc/fluxbee`, master key del vault, TLS, mesh y spokes |
 | ILKs de usuario (humanos, agentes y temporales creados por mensajes o por Cloud), **purgados**, incluidos los que un borrado previo solo marcó, y **todos los tenants salvo el raíz** | Lo que arranca como sistema: nodos `SY.*` y sus ILKs, y los nodos base de `base-nodes.json` con su ILK, ICH y config (la puerta de Cloud sigue publicada) |
 | El log de mensajes: todas las tablas de `fluxbee_storage`, la caché de SY.cognition, el estado de conversación (`thread-state/`, `immediate-memory/`) y las sesiones de Archi | Rutas, VPNs y taps |
-| Todos los secretos del vault salvo los de infraestructura (`storage_postgres_url`, `ssh:*`, `edge_tls*`, `edge_channel_secret:*`). **Incluye las claves de IA**: el AI queda degradado hasta recargarlas | El historial operativo: audit log de admin, historial de deploys y audit del vault |
+| Todos los secretos del vault salvo los de infraestructura (`storage_postgres_url`, `edge_tls*`, `edge_channel_secret:*`). Desde D32 se borran también las viejas claves de recuperación `ssh:*`. **Incluye las claves de IA**: el AI queda degradado hasta recargarlas | El historial operativo: audit log de admin, historial de deploys y audit del vault |
 
 - **Workflows:** se borran por su propio camino. En cada hive con SY.wf-rules (motherbee y
   workers) se llama a `wf_rules_delete` con `force`, que borra la regla, el nodo `WF.*`, su estado

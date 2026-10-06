@@ -77,7 +77,7 @@ mismatch" que causaba una copia manual de binarios).
 sudo apt-get install ./fluxbee_0.1.0_amd64.deb
 ```
 
-El control del `.deb` declara `Depends: adduser, openssl, libc6 (>= 2.39), postgresql` — **PostgreSQL
+El control del `.deb` declara `Depends: adduser, openssl, libc6 (>= 2.39), postgresql, curl, python3` — **PostgreSQL
 es ahora un `Depends` duro**, así que `apt-get install` lo trae automáticamente. El `postinst`:
 - crea el usuario de sistema `fluxbee` y los directorios de estado;
 - copia `hive.yaml.example` → `hive.yaml` si no existe (el operador lo edita antes de firstboot);
@@ -342,7 +342,10 @@ sudo apt-get install ./fluxbee_<nueva-version>_amd64.deb
 Un spoke no se re-instala; recibe binarios nuevos por dist-sync:
 1. La motherbee publica el core nuevo en `/var/lib/fluxbee/dist/core/bin` + `manifest.json`
    (hashes reales).
-2. Syncthing replica `dist/` a los spokes (`sendonly` en motherbee, `receiveonly` en spokes).
+2. Syncthing replica `dist/` a los spokes en carpetas por contenido, `sendonly` en motherbee y
+   `receiveonly` en spokes: `fluxbee-dist-core-<rol>` (el `dist/core/<rol>` que la motherbee arma
+   para cada rol), `fluxbee-dist-vendor` y `fluxbee-dist-policy` (todos), y `fluxbee-dist-runtimes`
+   (solo workers).
    Una carpeta `receiveonly` no manda ni deshace cambios locales: si el watchdog del orchestrator
    ve alguno (`receiveOnlyTotalItems` > 0, en un espejo de `dist/` o en el `public/` de blob del
    ingress), loguea un WARN y llama a `/rest/db/revert`, y la carpeta vuelve a la copia de la
@@ -522,7 +525,8 @@ Runbook de status por nodo (campos de `payload.node_status`):
 /etc/fluxbee/
 ├── hive.yaml                 # ÚNICO archivo que edita el operador
 ├── hive.yaml.example         # template (conffile del .deb)
-├── io-cloud.env / io-blob.env(.example)
+├── handbook_fluxbee.md       # handbook de SY.architect (se reemplaza en cada upgrade)
+├── vault.master.key          # solo motherbee: la clave maestra de SY.vault
 
 /var/lib/fluxbee/
 ├── ssh/motherbee.key(.pub)   # 0700 dir; llave de bootstrap ed25519
@@ -533,9 +537,12 @@ Runbook de status por nodo (campos de `payload.node_status`):
 ├── wf-rules/  modules/  nats/
 ├── blob/{,public}            # public = canal one-way a ingress
 ├── syncthing/                # home gestionado del syncthing (user fluxbee)
-└── dist/
-    ├── core/{bin,manifest.json}    # binarios del core + hashes (sendonly→spokes)
-    ├── runtimes/                   # io.api, ai.generic, wf.engine, io.slack, io.linkedhelper
+└── dist/                     # motherbee: de root, el usuario fluxbee solo lee (A-51)
+    ├── core/{bin,manifest.json}    # binarios del core + hashes
+    ├── core/<rol>/                 # árbol por rol que la motherbee arma (sendonly→spokes)
+    ├── policy/opa/                 # policy OPA global compilada (todos los hives)
+    ├── runtimes/                   # los de base-nodes.json: io.api, io.blob, io.cloud, io.slack,
+    │                               # io.wapp, ai.generic, wf.engine, io.linkedhelper
     └── vendor/syncthing/           # binario + manifest del syncthing vendorizado
 
 /run/fluxbee/routers/          # sockets del router (volátil)

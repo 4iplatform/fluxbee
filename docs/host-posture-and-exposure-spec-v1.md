@@ -178,7 +178,7 @@ Loopback only, correct today: 4222 embedded NATS, 5432 postgres (motherbee), 808
 |---|---|---|---|
 | Router WAN | spoke → motherbee | 9000/tcp | Spokes get `wan.uplinks` and no `wan.listen`. |
 | Identity sync | worker → motherbee | 9100/tcp | Ingress and egress run no SY.identity. |
-| SSH | motherbee → spoke | 22/tcp | At `add_hive`, and attempted at every motherbee orchestrator start (`reconcile_hive_tls_material`). The motherbee keeps a key only with `ssh_access=key_only_persist`; default joins revoke it. No hive SSHes into the motherbee. |
+| SSH | motherbee → spoke | 22/tcp | Only inside `add_hive`, which revokes its access at the end (D32, 0.1.61). No hive SSHes into the motherbee. Before 0.1.61 the motherbee also tried it at every orchestrator start (`reconcile_hive_tls_material`), and `ssh_access=key_only_persist` left a key behind. |
 | Syncthing | both directions today | 22000/tcp, QUIC on 22000/udp, 21027/udp | |
 | Edge | internet → ingress | edge port | |
 | Egress NAT | worker → egress → internet | — | Forward/NAT. |

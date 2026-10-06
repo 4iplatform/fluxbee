@@ -812,6 +812,11 @@ es un snapshot, o deja de sintetizar.
 > Bajado de 🔴 el 2026-08-03: **"automático-solo" es el contrato de la familia** — vendor tampoco
 > tiene comando, y runtime no lo necesita porque está versionado.
 
+> **Cómo quedó:** existe `core_rollback` (`POST /hives/{hive}/core/rollback`): devuelve un spoke a la
+> generación sellada que reemplazó su último `update category=core`, con gate de salud y forward por
+> la malla; el motherbee no tiene generaciones (su core lo instala dpkg). Receta en el HANDBOOK,
+> "El rollback". Lo que sigue es el problema original.
+
 Existe rollback **automático** (local, ante fallo detectado) y hay backup de los binarios previos en
 `/var/lib/fluxbee/orchestrator/core-bin.prev.local/update-<ms>/` *(ruta corregida)*. No hay acción de
 rollback de core: las únicas `*_rollback` son de vault, opa y wf_rules.
