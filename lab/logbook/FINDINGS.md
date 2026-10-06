@@ -827,7 +827,10 @@ Visto al arreglar los e2e de A-37, leyendo `src/router/mod.rs` y `src/shm/mod.rs
     reclama.
   - Antes del deploy se unió `worker2` (VM 104) con 0.1.57 y quedó apagada, para la prueba de
     salteo de versiones de la etapa 3 (T5-1).
-  - Etapa 3 (opciones de Syncthing: sin discovery, relays ni infraestructura pública) pendiente.
+  - **Etapa 3 (opciones de Syncthing: sin discovery, relays, NAT, STUN ni reportes; listen solo
+    donde hace falta) construida para 0.1.59**, después de dos revisiones adversariales. Cada spoke
+    cambia cuando tiene al motherbee en dirección fija y alcanzable; el motherbee, cuando todos lo
+    reportan. Se valida con `worker2` saltando de 0.1.57 a 0.1.59.
 
 ### A-48 🟡 PARA ARREGLAR — `remove_hive` no revoca nada: el hive sacado sigue siendo un par válido
 

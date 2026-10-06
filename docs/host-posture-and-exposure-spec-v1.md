@@ -2,7 +2,8 @@
 
 **Status:** design agreed with the operator on 2026-10-05. Stage 1 is live (0.1.57, validated on 8.x).
 Stage 2 is live (0.1.58, validated on 8.x) after four adversarial code reviews (§3.5 as built),
-with A-50 found on PROD and fixed in it. DTAP round 5 (on revision 7) is recorded: its stage 2–3 findings are folded
+with A-50 found on PROD and fixed in it. Stage 3 is built for 0.1.59 after two reviews (§3.5 as
+built). DTAP round 5 (on revision 7) is recorded: its stage 2–3 findings are folded
 here; its stage 4–5, A-48 and A-49 findings, and the decisions they need from the operator, go into
 revision 9 before stage 4.
 
@@ -695,32 +696,52 @@ spoke dials, and Syncthing's default reconnection interval is 60 s until stage 3
 
 **Listen addresses do not change in stage 2.**
 
-**Options (stage 3).** The orchestrator owns them, aligned with `vendor/syncthing/config.xml`:
+**Options (stage 3) — as built (0.1.59).** The orchestrator owns them, and leaves every other
+option as it is:
 
 - global and local announce, relays, NAT and crash reporting off;
-- `urAccepted=-1`, `autoUpgradeIntervalH=0`, STUN off;
+- `urAccepted=-1` (no usage reports), `autoUpgradeIntervalH=0`, `stunKeepaliveStartS=0` (STUN off);
 - `reconnectionIntervalS=10`;
-- `listenAddresses`: on the motherbee `tcp://:22000` (dual-stack), on spokes
-  `tcp://127.0.0.1:22000`.
+- exactly one `listenAddress`: on the motherbee `tcp://:22000` (dual-stack), on spokes
+  `tcp://127.0.0.1:22000` (they only dial).
 
-The whole set switches together.
+With these, Syncthing v2.0.14 opens no UDP socket (no local discovery, QUIC, UPnP or STUN) and
+reports `discoveryEnabled: false`. The whole set switches together, in one write.
 
 **The order is enforced in code, and each switch happens once:**
 
-1. **A spoke switches** when its motherbee device is `Static` and a plain TCP connect to
-   `<motherbee>:22000` succeeds. Both facts are persisted the first time they are true and are
-   reported in its `/versions` snapshot. Later outages do not undo them, so they are not live
-   remote data for the posture (D22).
-2. **The motherbee polls**, while it has not switched yet. A background task, not the
-   single-flight watchdog tick, reads the snapshots of the spokes that are registered devices
-   through the existing GET_VERSIONS, about every 60 s.
-3. **The motherbee switches** when every one of them reports both facts. An offline spoke that
-   never reported keeps it waiting, and the report names it.
-4. **Both switches are one-way.**
+1. **A spoke switches** when its motherbee device has the static address in config.xml and a
+   plain TCP connect to it succeeds. Both facts are recorded the first time they hold, in
+   `/var/lib/fluxbee/orchestrator/syncthing-posture.json` (written durably; a file that does not
+   decode is moved aside by its writer and the facts are derived again), and never undone (D22).
+   From the switch on, the spoke keeps the owned options. While the spoke runs an
+   `ADD_HIVE_FINALIZE`, its reconcile neither writes config.xml nor restarts Syncthing, and the
+   finalize's convergence probe asks again while the API port refuses connections (a restart),
+   for at most 30 s.
+2. **Every hive reports its facts** in its `/versions` snapshot (`syncthing_posture`: whether it
+   runs Syncthing, the two facts, switched).
+3. **The motherbee polls**, about every 60 s, in its own task (not the single-flight watchdog
+   tick). It waits for every registered spoke, and for any device still linked in a Fluxbee
+   folder that no registry entry records. A spoke that runs no Syncthing is not waited for. An
+   offline spoke, or one on a release before stage 3, keeps it waiting, and the report names it
+   with the reason.
+4. **The motherbee switches** once all of them report both facts. The task records the switch;
+   the watchdog's peer reconcile then writes the owned options in the same write as the peer plan
+   and restarts Syncthing once. A lost record with the owned options already in place is recorded
+   again without asking the spokes.
+5. **Both switches are one-way.**
 
-**Unit tests** cover both predicates on fixtures captured read-only from the four PROD hosts
-(worker1 `dynamic`↔`dynamic`, ingress static, egress without a device id), plus synthetic reports:
-fields absent, static false, connect false, both true. The captures drop the `<gui>` block.
+**Unit tests** cover the options edit on the PROD motherbee's block, both predicates, the
+snapshot-to-facts contract, the spoke's static fact on PROD shapes (IPv6, the local device), the
+wait set from the registry and the folders, and the motherbee's combined write.
+
+**Residuals.**
+
+- "Reachable" is a TCP connect to the first WAN uplink at the Syncthing port. In Fluxbee's
+  topology that uplink is the motherbee; a NAT or a balancer in between is not supported.
+- After the motherbee switches, a spoke restored to a state before stage 2 (an old snapshot or
+  release, with the motherbee `dynamic`) cannot sync, so it cannot get a core update through dist.
+  It is recovered by re-joining it over SSH.
 
 ### 3.6 Reports and checks (report-only)
 
@@ -1001,7 +1022,7 @@ The next stage starts only when the previous one is validated.
 | 0 | Revisions 4–6 and DTAP rounds 1–3; the operator approved D3 and D16. Round 4 on revision 6 is next. | Round 4 before stage 2. |
 | 1 | Binds, the listener check and the spoke-only guards (§3.4), released as 0.1.57. | **Done: validated on 8.x on 2026-10-06 (see the ledger).** Unit: listener fixtures (the PROD capture flags only sy-architect 0.0.0.0:3000; `*`, `[::]`, scope before and after the brackets; several owners or none); the spoke-only guard; 19 migration checks; the CI guard. Infra, after `ops.py deploy`: (1) `ss` on the motherbee shows 3000 and 8080 only on 127.0.0.1; (2) `lab/posture-probe.sh 10.10.10.10 3000 8080 9000` from VMs 101, 102, 103 and 110 gives refused, refused, open (baseline on 0.1.56: open, refused, open); (3) on the motherbee, `curl 127.0.0.1:3000/` returns the UI and `curl 127.0.0.1:8080/hives` answers; (4) positive control: a dummy listener whose process is named `sy-admin`, on a spare port of 10.10.10.10 for about 20 s, produces `loopback_service_exposed_sy-admin` within two minutes (`GET /hives/motherbee/drift-alerts?category=posture`), and sy-architect raises no alert after the deploy; (5) the postinst printed its migration line. The operator checks the tunnel once, outside the gate. |
 | 2 | Syncthing addresses and folders (§3.5). **Live in 0.1.58, gate passed on 2026-10-06.** | **Unit:** the address type; IP literals only; v6 formatting; the finalize rule; the spoke's uplink address; PROD-shaped fixtures (both member forms) reach the target in two rounds and then change nothing; the egress leaves `blob/active`; the role rule under every enable-flag combination; ownership by recorded id; ambiguous names, missing recorded devices and nameless devices; nothing while busy, nothing on a hive not at rest, no removal on an unreadable, empty or unrecorded registry; the writer refuses symlinks, FIFOs and hard links, never opens a planted temp, keeps the mode and drops special bits. **CI:** the single-writer guard. **Before the deploy (T5-1, done 2026-10-06):** the throwaway VM 104 joined as `worker2` on 0.1.57 (`dynamic` on both sides) and was stopped; it stays registered and stopped until stage 3. **Infra** (`lab/posture-check.py -- --offline worker2` through `ops.py run`, on the 4 hives): the target on each; completion 100% on the motherbee for the 3 PROD spokes; the egress' pending `blob/active` offer gone; egress1's device id in its registry entry; `ops.py opa-status` in_sync 4/4; listen addresses unchanged; Syncthing uptime growing across three checks (no restart loop). The "a join on this release gives `Static`" check moves to the A-48 join. |
-| 3 | Syncthing options and the ordering predicates (§3.5). | **Skip-upgrade, with no PROD rollback:** `worker2`, joined on 0.1.57 before the stage-2 deploy and kept stopped (T5-1), is the `dynamic`↔`dynamic` case, like worker1 was. After the deploy, the motherbee keeps discovery on and names `worker2` as the spoke it waits for. Boot it and update it directly from 0.1.57: it gets a static address and switches, then the motherbee switches. **Then, on the 4 hives:** `/rest/config/options` exact; `/rest/system/status` shows discovery off; no relay or QUIC connections; no non-loopback UDP for Syncthing in `ss`; the motherbee listens on `tcp://:22000`; after a motherbee Syncthing restart every spoke reconnects within 30 s (motherbee `/rest/system/connections`); a dist publish reaches 4/4. **Unit:** both predicates on PROD fixtures and synthetic reports. Remove the throwaway afterwards. |
+| 3 | Syncthing options and the ordering predicates (§3.5). Built for 0.1.59. | **Skip-upgrade, with no PROD rollback:** `worker2`, joined on 0.1.57 before the stage-2 deploy and kept stopped (T5-1), is the `dynamic`↔`dynamic` case, like worker1 was. After the deploy, the motherbee keeps discovery on and names `worker2` in its journal as the spoke it waits for, while the three PROD spokes switch (`lab/posture-check.py -- --offline worker2 --stage 2` still passes on the motherbee; `--stage 3` passes on the spokes). Boot it and update it directly from 0.1.57: it gets a static address and switches, then the motherbee switches. **Then, on the 4 hives and worker2** (`--stage 3`), with Syncthing uptime growing across three checks: `/rest/config/options` exact; `/rest/system/status` shows discovery off; no relay or QUIC connections; no non-loopback UDP for Syncthing in `ss`; the motherbee listens on `tcp://:22000`; after a motherbee Syncthing restart every spoke reconnects within 30 s (motherbee `/rest/system/connections`); a dist publish reaches 4/4. **Unit:** both predicates on PROD fixtures and synthetic reports. Remove the throwaway afterwards. |
 | 4 | Firewall in observe only (§3.1–§3.3, §3.6, §3.7). | **Unit:** role × mode render invariants: observe and enforce differ only in the policy and the INVALID verdict; on a non-internal interface the only accept of new connections is the ingress edge port; no role accepts 3000, 8080, 5432, 4222 or 8384; ICMP errors and DHCP replies come before established. The render hash does not change between observe and enforce. The `delete table` render is deterministic, and the egress render has no input chain and survives a double apply. The mode function, table-driven with an injected clock: every transition, including restart, reboot, unread evidence, missing or unreadable state, hold, break-glass, render change and derivation failure; and observe → enforce → the next check stays in enforce. The sshd-port derivation on fixtures: the PROD socket-activated capture gives {22}; a socket on a non-22 port with `sshd -T` failing; sshd running; no source at all gives a derivation failure. The SSH-login evidence on journal fixtures (`sshd` and `sshd-session`, internal and external sources, IPv6). **CI:** a network-namespace job in its own workflow with sudo applies every role, checks connect/timeout over veth, and accepts a frag-needed for an untracked edge flow in enforce. **Infra:** the posture in `/versions` for 4/4, every host in observe, reasons named. SSH-login evidence: authorize a throwaway key on the egress (`ops.py run 103`), log in from fb-build to 192.168.8.240 (`ops.py run 110`), and expect a window reset naming 192.168.8.180 within two checks; then remove the key. Injections on worker1, each kept until detected (at most two checks) and then undone: flush the input chain (drift reported and repaired); a foreign chain `hook input priority 10; policy accept; tcp dport 9 drop` (third-party firewall reported, health fails); break-glass (the table goes and does not come back; reboot with sy-orchestrator disabled: still no table; remove the file and re-enable: back in observe with a fresh window). The table is there after a spoke reboot with sy-orchestrator disabled. The egress reboots and its NAT and table come back. Rejoin baseline: from the motherbee's boot (`uptime -s`) until `ops.py versions` answers for every spoke and the motherbee's Syncthing shows the 3 spokes connected, sampled twice. Stage 4 closes with every host ready to enforce except for the release switch. |
 | 5 | Automatic enforce. | Put `posture.hold` on every host before the deploy; health shows them as held (a warning). Release worker1, then the other spokes, then the motherbee last, a day apart. After each host enters enforce, run `lab/posture-probe.sh` from fb-build (`ops.py run 110`): 10.10.10.10 gives 22, 9000, 9100 and 22000 open, and a canary listener on an unlisted port times out; 10.10.10.20, .30 and .40 give 22 open; 192.168.8.240 gives 22 timeout. From the operator's workstation, on the ingress' public address, 443 answers and everything else times out (a manual step). After a motherbee reboot, spokes rejoin within the slower stage-4 sample + 30 s. An enforcing ingress reboots and stays in enforce. Break-glass from the console works without the orchestrator. Render changes are covered by the unit tests, not by a special release. |
 
@@ -1066,7 +1087,12 @@ io.linkedhelper through the edge (D18), then the rest.
 - **2026-10-06, stage 2 live:** 0.1.58 deployed and validated on 8.x: the first round did exactly
   what the plan predicted (one Syncthing restart on the motherbee and one on worker1), every gate
   item passed. See lab/DEPLOYMENTS.md.
-- **Next:** stage 3; revision 9 and round 6 before stage 4.
+- **2026-10-06, stage 3 built:** two adversarial code reviews. The first found that a spoke's
+  first switch could restart Syncthing under a join's finalize probe (major); fixed with a
+  finalize guard and a probe that rides out a restart. The rest were minors: one writer of the
+  motherbee's options, the wait set from the registry and the folders, a durable facts file.
+- **Next:** deploy and validate stage 3 (0.1.59) with `worker2`; revision 9 and round 6 before
+  stage 4.
 
 ## 8. Round 3 → revision 6
 
