@@ -21,6 +21,7 @@
 
 | Versión | Fecha (ART) | Commit | Alcance | Estado | Rollback |
 |---|---|---|---|---|---|
+| **0.1.63** | 2026-10-06 | `aab0e3e` | motherbee + spokes (core) | ✅ live | snap `pre-a58-0-1-63` (las 4 VMs) · `apt install fluxbee=0.1.62` (HANDBOOK, rollback bajo 0.1.63) |
 | **0.1.62** | 2026-10-06 | `b4868e8` | motherbee + spokes (core) | ✅ live | snap `pre-identity-0-1-62` (las 4 VMs) · `apt install fluxbee=0.1.61` (spokes primero) |
 | **0.1.61** | 2026-10-06 | `e0f2d04` | motherbee + spokes (core) | ✅ live | snap `pre-ssh-0-1-61` (las 4 VMs) · `apt install fluxbee=0.1.60` |
 | **0.1.60** | 2026-10-06 | `0af5469` | motherbee + spokes (core) | ✅ live | snap `pre-hardening-0-1-60` (las 4 VMs) · `apt install fluxbee=0.1.59` |
@@ -71,6 +72,55 @@
 > (`dpkg-scanpackages -m`) para rollback, pero su detalle vive en la bitácora, no acá.
 
 ---
+
+## 0.1.63 — Syncthing corre como `fluxbee` en todos los hosts (A-58); los blobs se escriben y se leen por descriptor y toman el dueño de su carpeta (A-56)
+
+- **Fecha:** 2026-10-06 (ART) · **Versión anterior:** 0.1.62 · **Commits:** `02f7fdb`, `506151c`,
+  `aab0e3e` (FINDINGS A-56, A-58, A-60).
+- **Revisión:** dos revisiones adversariales (SDK/io.blob y orquestador), dos rondas cada una. Los
+  números de los arneses están en A-56.
+- **Alcance:** motherbee + los tres spokes (core-update).
+- **Qué cambió:**
+  - **Syncthing como `fluxbee`:**
+    - el orquestador crea el usuario `fluxbee` en cada host, y Syncthing corre siempre con él;
+    - en worker1 y egress1 el cambio es un paso único y visible: para, traspasa sus árboles y
+      arranca.
+  - **Dueños de `blob/`:**
+    - `blob/` es root:fluxbee;
+    - staging y `agent-assets` son de root;
+    - `active/` y `public/` son de `fluxbee`.
+  - **SDK e io.blob:** escriben por descriptor y le entregan cada blob al dueño de su carpeta. Los
+    lectores usan `read_blob`, que verifica tamaño y hash. ai.generic verifica el hash de cada asset.
+  - **Postinst:** se fue el `chown -R`, que tapaba el problema.
+- **Deploy:**
+  - build `aab0e3e` en 21 min, publish 10 s, deploy 193 s;
+  - snapshots `pre-a58-0-1-63` en las 4 VMs (se borró `pre-hardening-0-1-60`);
+  - versiones 0.1.63 en los 4, health `failed=0`, OPA `in_sync` 4/4.
+- **Gate A-58:**
+  - worker1 y egress1 crearon el usuario `fluxbee`;
+  - su Syncthing quedó con unit y proceso `fluxbee` desde las 01:29:27 y 01:29:22, y la alerta
+    `syncthing_user_switched` salió recién con el servicio sano;
+  - home, `active/` (worker1) y dist pasaron a `fluxbee`;
+  - el motherbee y el ingress no se reiniciaron (Syncthing arriba desde antes del deploy);
+  - todas las carpetas de los 4 hosts quedaron `idle` y sin errores.
+- **Gate A-56:**
+  - Motherbee:
+    - `blob/` pasó a root:fluxbee 0750;
+    - staging (10 entradas) y `agent-assets` (5) pasaron a root;
+    - `active/` y `public/` sin entradas ajenas.
+  - Ingress: el traspaso del arranque pasó el `.stfolder` de root, con la alerta
+    `blob_entries_handed_over:public` (1 entrada).
+  - Prueba concreta con `blob_sync_diag` compilado del mismo commit:
+    - un blob escrito como root con el SDK nuevo quedó `fluxbee:fluxbee 0640` (prefijo 0750),
+      tanto en worker1 como en el motherbee;
+    - llegó al otro lado en ~12 s y ~10 s, con el mismo hash;
+    - con 0.1.62, el del motherbee habría quedado ilegible para su Syncthing hasta la próxima
+      instalación;
+    - después se borraron los dos blobs (el borrado llegó a worker1 en ~12 s) y el binario.
+- **Rollback:**
+  - snapshot `pre-a58-0-1-63`, o `apt install fluxbee=0.1.62`;
+  - en un worker que produzca blobs, volver Syncthing a root como dice el HANDBOOK ("El
+    rollback").
 
 ## 0.1.62 — La réplica de identity ya no cuelga detrás de un firewall (P7-1, A-59); Syncthing vuelve a su binario nuevo (A-57); seguimiento de D32
 

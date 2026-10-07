@@ -1050,7 +1050,7 @@ Visto al arreglar los e2e de A-37, leyendo `src/router/mod.rs` y `src/shm/mod.rs
     re-suscribió 5 s después de levantarlo.
   - Un worker unido de cero (worker2) también recibe latidos.
 
-### A-58 🟡 ARREGLADO EN CÓDIGO (para 0.1.63, falta validar en 8.x) — En los workers y el egress Syncthing corría como root
+### A-58 ✅ RESUELTO (0.1.63, validado en 8.x) — En los workers y el egress Syncthing corría como root
 
 - **Qué pasa (visto el 2026-10-06 en PROD, solo lectura):** worker1 y egress1 no tienen el usuario
   `fluxbee`, así que `resolve_syncthing_service_user` cae al respaldo root: Syncthing y todo su
@@ -1084,12 +1084,15 @@ Visto al arreglar los e2e de A-37, leyendo `src/router/mod.rs` y `src/shm/mod.rs
     `fluxbee-syncthing`, `userdel fluxbee` y reiniciar `sy-orchestrator` (HANDBOOK, "El rollback").
 - **Queda:** el bootstrap del ingress todavía crea el usuario y hace su `chown`. Sobra, pero no se
   toca hasta validar un join de ingress (la rama de ingreso del gate de A-48).
-- **Validar en 8.x:**
-  - worker1 y egress1 cambian una vez y Syncthing queda sano;
-  - un core update sigue llegando a los dos;
-  - un blob escrito en worker1 llega al motherbee.
+- **Validado (2026-10-06, ledger 0.1.63):**
+  - worker1 y egress1 crearon `fluxbee` y cambiaron una vez (alerta `syncthing_user_switched` con el
+    servicio sano);
+  - sus carpetas quedaron `idle` sin errores;
+  - un blob escrito en worker1 llegó al motherbee en ~12 s, y uno del motherbee llegó a worker1 en
+    ~10 s;
+  - el motherbee y el ingress no se tocaron.
 
-### A-56 🟡 ARREGLADO EN CÓDIGO (para 0.1.63, falta validar en 8.x) — Root escribía por ruta en el `blob/` del usuario de Syncthing
+### A-56 ✅ RESUELTO (0.1.63, validado en 8.x) — Root escribía por ruta en el `blob/` del usuario de Syncthing
 
 - **Qué pasa (tercera revisión adversarial de A-51, 2026-10-06; verificado paso a paso en el código,
   no ejecutado de punta a punta):** en el motherbee, `blob/` y `blob/staging` son del usuario de
@@ -1167,6 +1170,11 @@ Visto al arreglar los e2e de A-37, leyendo `src/router/mod.rs` y `src/shm/mod.rs
 - **Contra el código anterior:** según la revisión, fallaban los tests de link en staging y en el
   prefijo de `active/`, y el del grupo. El de `public/` también fallaba, pero solo por el temporal
   que dejaba.
+- **Validado (2026-10-06, ledger 0.1.63):**
+  - los dueños nuevos están en los 4 hosts, con 0 entradas ajenas;
+  - el ingress traspasó su `.stfolder`;
+  - un blob escrito como root con el SDK nuevo quedó `fluxbee:fluxbee 0640` y cruzó entre worker1 y
+    el motherbee en los dos sentidos.
 - **Residuo:** el GC de `active/` todavía lista, mide y borra por ruta. Si alguien cambia una carpeta
   de prefijo por un link entre el listado y el borrado, root podría borrar afuera nombres con forma
   de blob. Viene apagado por defecto (`gc.enabled` y `gc.apply` en `false`); se pasa a descriptores
