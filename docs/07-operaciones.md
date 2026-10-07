@@ -535,7 +535,10 @@ Runbook de status por nodo (campos de `payload.node_status`):
 ├── hives/                    # repo de spokes (info por hive)
 ├── opa/{current,staged,backup}
 ├── wf-rules/  modules/  nats/
-├── blob/{,public}            # public = canal one-way a ingress
+├── blob/                     # root:fluxbee 0750 (A-56)
+│   ├── staging/              # solo root: los nodos dejan ahí los blobs antes de promoverlos
+│   ├── active/               # del usuario fluxbee (Syncthing la sirve); cada blob toma ese dueño
+│   └── public/               # del usuario fluxbee; canal one-way a ingress
 ├── syncthing/                # home gestionado del syncthing (user fluxbee)
 └── dist/                     # motherbee: de root, el usuario fluxbee solo lee (A-51)
     ├── core/{bin,manifest.json}    # binarios del core + hashes

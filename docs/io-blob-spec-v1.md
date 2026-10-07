@@ -245,7 +245,8 @@ Responsabilidades:
 - resolver solo mediante `BlobToolkit`, nunca aceptar paths;
 - rechazar symlink/no-regular y size mismatch;
 - SHA-256 completo calculado por streaming;
-- escritura atomica y permisos `0640`;
+- escritura atómica por descriptor dentro de `blob/public` (temporal exclusivo y `linkat`), con el
+  dueño de esa carpeta y permisos `0640` (FINDINGS A-56);
 - ledger atomico, idempotencia y refcount;
 - release seguro y status operacional;
 - no Identity SHM, no tenant decision, no edge call, no public HTTP.

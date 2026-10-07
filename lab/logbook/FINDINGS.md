@@ -995,6 +995,26 @@ Visto al arreglar los e2e de A-37, leyendo `src/router/mod.rs` y `src/shm/mod.rs
   binario generaría uno como root); si no, el `myID` del Syncthing en marcha. Nunca `config.xml`.
 - **Estado:** construido; lo ejercita el próximo join (el de A-48).
 
+### A-60 🔵 PARA EVALUAR (pedido del operador, 2026-10-06) — Los nodos administrados corren como root
+
+- **Qué pasa:** el orquestador lanza los nodos (IO, AI, WF) con `systemd-run` sin `User=`, así que
+  corren como root en todos los hosts. Visto en PROD el 2026-10-06 (solo lectura): `io-blob`,
+  `io-cloud` y `sy-wf-rules` corren como root. Un nodo comprometido es root en su host, y todo lo
+  que escribe queda de root (por eso A-56).
+- **Lo que 0.1.63 hace (el paso mínimo, aprobado):** los nodos siguen como root, pero el SDK le
+  entrega cada blob al dueño de la carpeta donde lo deja, y se va el `chown -R` del postinst.
+- **Lo que hay que evaluar (operador: *"deja documentado el tema de evaluar correr los nodos como
+  fluxbee de usuario"*):** correrlos como `fluxbee`, o con un usuario por nodo. Antes hay que ver qué
+  usan hoy que solo root alcanza. En el motherbee, el 2026-10-06:
+  - las regiones SHM (`/dev/shm/jsr-*`: router, config, identity, lsa, memory, opa) son
+    `root:root 0600`, y el SDK las lee para las búsquedas de ILK, la config y la policy;
+  - el socket del router es `0666`, pero el `irp-*.sock` es `root:root 0600`;
+  - `state/nodes/` es `root:root 0755`, con los `.uuid` de cada nodo de root;
+  - `dist/runtimes` es `root:fluxbee 0755` (legible).
+  Hay que medir también qué hace cada nodo base (io.api, io.blob, io.cloud, io.slack, io.wapp,
+  ai.generic, wf.engine, io.linkedhelper) con el filesystem y la red.
+- **Estado:** para evaluar después de 0.1.63; no tiene diseño todavía.
+
 ### A-59 ✅ RESUELTO (0.1.62, validado en 8.x) — La réplica de identity esperaba para siempre en una suscripción cortada sin FIN
 
 - **Qué pasaba (panel DTAP ronda 7, P7-1, confirmado en el código):** la suscripción de deltas de
@@ -1030,7 +1050,7 @@ Visto al arreglar los e2e de A-37, leyendo `src/router/mod.rs` y `src/shm/mod.rs
     re-suscribió 5 s después de levantarlo.
   - Un worker unido de cero (worker2) también recibe latidos.
 
-### A-58 🟡 PARA ARREGLAR — En los workers y el egress Syncthing corre como root
+### A-58 🟡 ARREGLADO EN CÓDIGO (para 0.1.63, falta validar en 8.x) — En los workers y el egress Syncthing corría como root
 
 - **Qué pasa (visto el 2026-10-06 en PROD, solo lectura):** worker1 y egress1 no tienen el usuario
   `fluxbee`, así que `resolve_syncthing_service_user` cae al respaldo root: Syncthing y todo su
@@ -1038,12 +1058,38 @@ Visto al arreglar los e2e de A-37, leyendo `src/router/mod.rs` y `src/shm/mod.rs
   (`worker_remote_base_dirs_command`).
 - **Impacto:** un Syncthing comprometido en esos hosts ya es root. Desde la etapa 3 escucha solo en
   loopback y su único par es el motherbee, así que hace falta comprometer antes al motherbee.
-- **Arreglo propuesto:** que los bootstraps de worker y egress creen el usuario como el del ingress, y
-  que un spoke existente pase su Syncthing a ese usuario en su próximo arranque (unit `User=`, dueño de
-  `dist/` y del home). Va en un paso propio con validación: cambia el usuario de un servicio vivo.
-- **Estado:** para arreglar.
+- **Arreglo (aprobado por el operador, 0.1.63):**
+  - El orquestador crea el usuario `fluxbee` al arrancar, en cualquier rol. Syncthing corre siempre
+    como `fluxbee`: se fueron el respaldo a root y las opciones `blob.sync.service_user` y
+    `blob.sync.allow_root_fallback`.
+  - En un spoke que hoy lo corre como root, el cambio es un paso visible, una sola vez: el log dice
+    "Syncthing moves to its own user (A-58)", Syncthing se para, su home, sus carpetas de blob y el
+    `dist/` del spoke pasan a `fluxbee` (`chown -R` con el servicio parado, para que no siga creando
+    archivos de root), se escribe la unit nueva y arranca.
+  - El home pasa a ser de `fluxbee` siempre que Syncthing corre; antes el egress (que solo sincroniza
+    dist) nunca lo tenía.
+  - Lo que agregó la revisión adversarial:
+    - el binario se instala antes de parar nada: un vendor que no se puede instalar deja corriendo al
+      Syncthing que lo trae;
+    - el cambio se decide por la unit, por los archivos del home y por el usuario del proceso, así
+      que un cambio que quedó a medias corre de nuevo;
+    - deja una alerta `syncthing_user_switched`, recién cuando Syncthing quedó sano como `fluxbee`;
+    - `useradd` usa un grupo `fluxbee` que ya exista;
+    - segunda ronda:
+      - el uid del proceso cuenta solo cuando `/proc/<pid>/comm` es `syncthing`, porque mientras
+        systemd lo arranca el proceso todavía corre como root;
+      - `daemon-reload` en el cambio, para que no levante la definición vieja de la unit.
+  - Volver una caja a 0.1.62 deja Syncthing como `fluxbee`, porque el usuario ya existe. Pero los
+    nodos de 0.1.62 escriben blobs de root que ese Syncthing no lee. Para devolverlo a root: parar
+    `fluxbee-syncthing`, `userdel fluxbee` y reiniciar `sy-orchestrator` (HANDBOOK, "El rollback").
+- **Queda:** el bootstrap del ingress todavía crea el usuario y hace su `chown`. Sobra, pero no se
+  toca hasta validar un join de ingress (la rama de ingreso del gate de A-48).
+- **Validar en 8.x:**
+  - worker1 y egress1 cambian una vez y Syncthing queda sano;
+  - un core update sigue llegando a los dos;
+  - un blob escrito en worker1 llega al motherbee.
 
-### A-56 🟡 PARA ARREGLAR — Root escribe por ruta en el `blob/` del usuario de Syncthing
+### A-56 🟡 ARREGLADO EN CÓDIGO (para 0.1.63, falta validar en 8.x) — Root escribía por ruta en el `blob/` del usuario de Syncthing
 
 - **Qué pasa (tercera revisión adversarial de A-51, 2026-10-06; verificado paso a paso en el código,
   no ejecutado de punta a punta):** en el motherbee, `blob/` y `blob/staging` son del usuario de
@@ -1053,9 +1099,78 @@ Visto al arreglar los e2e de A-37, leyendo `src/router/mod.rs` y `src/shm/mod.rs
     puede plantar un symlink ahí y root escribe bytes de un tercero (por ejemplo, un adjunto
     entrante) donde apunte.
   - io.blob hace chmod 0750 de un `blob/public` plantado en cada arranque.
-- **Arreglo propuesto:** `blob/` y `blob/staging` de root (staging no es carpeta de Syncthing y
-  `blob/` solo necesita ser atravesable), y la misma primitiva de A-51 en el SDK y en io.blob.
-- **Estado:** para arreglar en un paso propio (toca el SDK y el workspace de IO).
+- **Lo que además tapaba (visto el 2026-10-06):** los nodos corren como root (A-60) y el SDK dejaba
+  cada blob `root:root 0640`. En el motherbee Syncthing corre como `fluxbee`, así que un blob nuevo
+  no podía leerse ni sincronizarse. Nadie se enteraba porque el postinst hacía
+  `chown -R fluxbee blob/` en cada instalación.
+- **Arreglo (aprobado por el operador, 0.1.63):**
+  - Dueños: `blob/` es `root:fluxbee 0750`; `staging/` es solo de root, todo el árbol, sin links
+    adentro; `active/` y `public/` son de `fluxbee`. El orquestador lo deja así en cada arranque.
+  - SDK (`blob::safe_fs`): staging se escribe con un temporal exclusivo y un rename por descriptor.
+    `promote` abre `active/<prefijo>` sin seguir links, le entrega el blob al dueño de `active/` con
+    `fchown` sobre el descriptor y hace `renameat`.
+  - io.blob: la copia pública se escribe igual dentro de `blob/public`, con el dueño de la carpeta,
+    temporal exclusivo y `linkat`. Ya no hace chmod por ruta, ni le cambia el modo a la carpeta al
+    arrancar.
+  - Se borró el `chown -R` del postinst y los de `blob` en `install.sh`.
+- **Lo que agregaron las dos revisiones adversariales (mismo paso):**
+  - **Lectura, venía de antes:** `resolve` entregaba una ruta que io.slack, el SDK de AI, el
+    arquitecto e `io_common` leían con `fs::read`. Syncthing replica symlinks, así que un worker
+    comprometido podía hacer que el motherbee leyera un archivo de root y lo mandara a Slack o a un
+    LLM. Ahora:
+    - `open_blob` abre toda la cadena sin seguir links y solo acepta un archivo regular del tamaño
+      del `BlobRef`;
+    - `read_blob` además verifica que el SHA-256 empiece con el hash del nombre;
+    - los cuatro lectores y el curador de io.blob usan esto;
+    - `resolve` queda solo para saber dónde vive el blob.
+  - **`promote`:**
+    - solo da por promovido un archivo regular; un link plantado con el nombre se reemplaza, nunca
+      se sigue;
+    - el blob en staging tiene que ser un archivo regular con un solo link, de este proceso;
+    - abrir no se bloquea ante un FIFO;
+    - después de mover se verifica el inodo que llegó: un `put` concurrente podía cambiar el
+      archivo entre el traspaso y el `renameat`, y se dejaba un blob de root.
+  - **Temporales:**
+    - el GC de staging borra los que dejó un crash;
+    - io.blob borra al arrancar los `.curate-*` que quedaron en `public/`.
+  - **`blob/agent-assets`:** pasa a ser solo de root. Quedó del usuario de Syncthing por el viejo
+    `chown -R`, y el arquitecto y ai.generic escriben y leen ahí por ruta: ese usuario podía cambiar
+    el prompt de sistema de un agente.
+  - **Lo que root ya dejó en `active/` y `public/`:**
+    - cada arranque, después del rebind, se pasa al usuario de Syncthing (`chown -R`, que recorre por
+      descriptor) y una alerta dice cuántas entradas eran. Solo corre con
+      `fs.protected_hardlinks=1`;
+    - además, el watchdog alerta cuando Syncthing reporta errores por archivo en las carpetas de
+      blobs. Un archivo que no puede leer nunca vuelve "no sana" a la carpeta.
+  - **Marcadores:** los `.stfolder` toman el dueño de su carpeta.
+- **Segunda ronda de las revisiones (mismo paso):**
+  - **Concurrencia del mismo blob:** un `put` + `promote` concurrentes del mismo blob ya no dan un
+    falso error de integridad. Se acepta un archivo de staging que otro `put` reemplazó (sin links)
+    o que otro `promote` ya entregó, y si otro `promote` ya lo movió, es Ok. Hay un test con 4 hilos.
+  - **Lectura acotada:** `read_blob` lee como máximo el tamaño del `BlobRef` más un byte, aunque el
+    archivo crezca mientras se lee.
+  - **Async:** las lecturas corren en el pool de bloqueo (`read_blob_async`) para los que llaman
+    desde código async.
+  - **ai.generic:** verifica que cada asset de `agent-assets` tenga el SHA-256 de su nombre. Si
+    alguien lo editó antes del primer arranque de 0.1.63, no se carga.
+  - **El traspaso del arranque:** tolera carreras (`-ignore_readdir_race`, `-execdir chown -h`). Lo
+    juzga un recuento, y alerta por carpeta con lo que quedó.
+  - **`protected_hardlinks`:** el pase que devuelve staging y `agent-assets` a root también exige
+    `fs.protected_hardlinks=1`.
+- **Tests:**
+  - ningún link plantado se sigue, ni en staging, ni en `active/<prefijo>`, ni en `public/`;
+  - `read_blob` rechaza un link, otro tamaño, otros bytes y un FIFO, sin colgarse;
+  - el blob toma el grupo de `active/` (un grupo secundario del usuario de test, así se ve sin
+    root);
+  - el GC borra temporales;
+  - io.blob limpia `.curate-*`.
+- **Contra el código anterior:** según la revisión, fallaban los tests de link en staging y en el
+  prefijo de `active/`, y el del grupo. El de `public/` también fallaba, pero solo por el temporal
+  que dejaba.
+- **Residuo:** el GC de `active/` todavía lista, mide y borra por ruta. Si alguien cambia una carpeta
+  de prefijo por un link entre el listado y el borrado, root podría borrar afuera nombres con forma
+  de blob. Viene apagado por defecto (`gc.enabled` y `gc.apply` en `false`); se pasa a descriptores
+  antes de prenderlo.
 
 ### A-57 ✅ RESUELTO (0.1.62, validado en 8.x) — `update category=vendor` instalaba el Syncthing nuevo pero no lo reiniciaba, y respondía que sí
 

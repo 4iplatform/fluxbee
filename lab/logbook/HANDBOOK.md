@@ -1023,6 +1023,12 @@ Tres caminos:
 3. **Conservar el `.deb` anterior publicado** en el repo apt y bajar de versión con `apt`. Es el
    camino para cualquier versión vieja.
 
+**Bajar de 0.1.63 o más a una anterior:** Syncthing queda corriendo como `fluxbee` (0.1.62 usa el
+usuario si existe), pero los nodos de 0.1.62 escriben blobs de root que no puede leer. Si un worker
+produce blobs, volverlo a root: `systemctl stop fluxbee-syncthing`, `userdel fluxbee` y
+`systemctl restart sy-orchestrator`. En el motherbee no hace falta, porque el postinst de 0.1.62
+vuelve a hacer `chown -R`.
+
 **Bajar de 0.1.62 o más a una anterior:** primero los spokes (`core_rollback` o `update` al core
 viejo), después el motherbee. Un worker de 0.1.62 frente a un motherbee viejo no recibe latidos en su
 suscripción de identity: la corta cada 60 s y pide un snapshot completo, y el motherbee viejo solo

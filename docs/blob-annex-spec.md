@@ -362,11 +362,11 @@ put(source_path="/tmp/upload/Factura Marzo 2026.png", original_filename="Factura
   ├─ 3. Construir blob_name
   │     "Factura_Marzo_2026_a1b2c3d4e5f6a7b8.png"
   │
-  ├─ 4. Crear subdirectorio staging/<prefix>/
-  │     mkdir -p /var/lib/fluxbee/blob/staging/a1/
+  ├─ 4. Abrir staging/<prefix>/ sin seguir links (se crea 0750 si falta)
+  │     /var/lib/fluxbee/blob/staging/a1/
   │
-  ├─ 5. Copiar archivo
-  │     cp source → /var/lib/fluxbee/blob/staging/a1/Factura_Marzo_2026_a1b2c3d4e5f6a7b8.png
+  ├─ 5. Escribir un temporal exclusivo (0640) y renombrarlo sobre el nombre, por descriptor
+  │     → /var/lib/fluxbee/blob/staging/a1/Factura_Marzo_2026_a1b2c3d4e5f6a7b8.png
   │
   └─ 6. Retornar BlobRef {
            type: "blob_ref",
@@ -390,12 +390,28 @@ promote(blob_ref)
   │     from = /var/lib/fluxbee/blob/staging/a1/Factura_Marzo_2026_a1b2c3d4e5f6a7b8.png
   │     to   = /var/lib/fluxbee/blob/active/a1/Factura_Marzo_2026_a1b2c3d4e5f6a7b8.png
   │
-  ├─ 3. Crear subdirectorio active/<prefix>/ si no existe
-  │     mkdir -p /var/lib/fluxbee/blob/active/a1/
+  ├─ 3. Abrir active/<prefix>/ sin seguir links (se crea 0750, con el dueño de active/)
+  │     /var/lib/fluxbee/blob/active/a1/
   │
-  └─ 4. Rename atómico (mismo filesystem)
-        rename(from, to)
+  ├─ 4. Darle el blob al dueño de active/ (fchown sobre el descriptor), 0640
+  │
+  ├─ 5. Rename atómico entre los descriptores de las dos carpetas (mismo filesystem)
+  │     renameat(staging/a1, nombre, active/a1, nombre)
+  │
+  └─ 6. Verificar que el inodo que llegó es el que se entregó (un put concurrente puede cambiar el
+        archivo de staging entre el paso 4 y el 5); si no, entregar también el que llegó
 ```
+
+> **Lectura.** Un blob se lee con `read_blob` (o `open_blob` para leerlo en streaming), nunca por la
+> ruta de `resolve`: abre toda la cadena sin seguir links, exige un archivo regular del tamaño del
+> `BlobRef` y, en `read_blob`, que el SHA-256 empiece con el hash del nombre (FINDINGS A-56).
+
+> **Dueños (FINDINGS A-56).** `blob/` es de root y el usuario de Syncthing solo lo atraviesa;
+> `staging/` es solo de root; `active/` y `public/` son del usuario de Syncthing, que los sirve. Los
+> nodos corren como root (A-60) y nunca actúan sobre un nombre de esas carpetas que otro pudo
+> plantar: abren todo por descriptor y le entregan cada blob al dueño de la carpeta donde queda, así
+> Syncthing lo puede leer. Antes de 0.1.63 los blobs quedaban de root y un `chown -R` en cada
+> instalación lo tapaba.
 
 > **Nota:** `staging/` y `active/` están en el mismo filesystem (`/var/lib/fluxbee/blob/`), por lo que `rename()` es atómico y O(1). No hay copia de datos.
 
