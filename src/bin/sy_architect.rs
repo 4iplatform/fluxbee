@@ -10713,8 +10713,8 @@ async fn enrich_interaction_with_blob_content(
         parts.push(base_content.to_string());
     }
     for attachment in attachments {
-        let path = toolkit.resolve(&attachment.blob_ref);
-        let bytes = match tokio::fs::read(&path).await {
+        // Read checked against the BlobRef, never through a path under active/ (FINDINGS A-56).
+        let bytes = match toolkit.read_blob_async(&attachment.blob_ref).await {
             Ok(b) => b,
             Err(_) => {
                 parts.push(format!(

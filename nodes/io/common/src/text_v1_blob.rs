@@ -133,10 +133,11 @@ pub struct TextV1NormalizationDecision {
     pub has_attachments: bool,
 }
 
+/// An attachment whose blob is present. Read its bytes with `BlobToolkit::read_blob`, never
+/// through a path under `active/` (FINDINGS A-56).
 #[derive(Debug, Clone)]
 pub struct ResolvedAttachment {
     pub blob_ref: BlobRef,
-    pub path: PathBuf,
 }
 
 #[derive(Debug, Clone)]
@@ -173,6 +174,7 @@ impl IoBlobContractError {
                 BlobError::Io(_) => "BLOB_IO_ERROR",
                 BlobError::InvalidName(_) => "BLOB_INVALID_NAME",
                 BlobError::TooLarge { .. } => "BLOB_TOO_LARGE",
+                BlobError::Integrity(_) => "BLOB_INTEGRITY",
                 BlobError::InvalidRef(_) => "BLOB_INVALID_REF",
                 BlobError::SyncHintTimeout { .. } => "BLOB_SYNC_HINT_TIMEOUT",
                 BlobError::SyncHintFailed { .. } => "BLOB_SYNC_HINT_FAILED",
@@ -332,7 +334,7 @@ pub async fn resolve_text_v1_for_outbound(
                 blob_ref.blob_name.clone(),
             )));
         }
-        attachments.push(ResolvedAttachment { blob_ref, path });
+        attachments.push(ResolvedAttachment { blob_ref });
     }
 
     Ok(ResolvedTextV1Payload { text, attachments })
@@ -345,14 +347,12 @@ async fn resolve_content_ref_text(
     use_retry: bool,
 ) -> Result<String, IoBlobContractError> {
     content_ref.validate()?;
-    let path = if use_retry {
-        blob.resolve_with_retry(content_ref, ResolveRetryConfig::default())
+    let bytes = if use_retry {
+        blob.read_blob_with_retry(content_ref, ResolveRetryConfig::default())
             .await?
     } else {
-        blob.resolve(content_ref)
+        blob.read_blob_async(content_ref).await?
     };
-    let bytes = std::fs::read(&path)
-        .map_err(|err| BlobError::Io(format!("read content_ref file: {err}")))?;
     String::from_utf8(bytes).map_err(|_| {
         IoBlobContractError::InvalidTextPayload("content_ref is not valid UTF-8 text".to_string())
     })
@@ -699,7 +699,7 @@ mod tests {
         assert_eq!(resolved.text, "hola");
         assert_eq!(resolved.attachments.len(), 1);
         assert_eq!(resolved.attachments[0].blob_ref, attachment);
-        assert!(resolved.attachments[0].path.exists());
+        assert!(toolkit.read_blob(&resolved.attachments[0].blob_ref).is_ok());
     }
 
     #[tokio::test]

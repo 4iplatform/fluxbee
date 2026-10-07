@@ -164,9 +164,10 @@ async fn run_consume() -> Result<(), DynError> {
 
     let blob_ref: BlobRef = serde_json::from_str(&blob_ref_json)?;
     let started = Instant::now();
-    let resolved = toolkit.resolve_with_retry(&blob_ref, retry_cfg).await?;
+    // Read checked against the BlobRef, never through a path under active/ (FINDINGS A-56).
+    let bytes = toolkit.read_blob_with_retry(&blob_ref, retry_cfg).await?;
     let elapsed_ms = started.elapsed().as_millis() as u64;
-    let bytes = std::fs::read(&resolved)?;
+    let resolved = toolkit.resolve(&blob_ref);
 
     if let Some(expected) = expected_content.as_ref() {
         if bytes != expected.as_bytes() {

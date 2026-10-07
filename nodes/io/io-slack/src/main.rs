@@ -2869,7 +2869,7 @@ async fn run_outbound_loop(
                     } else {
                         attachment.blob_ref.filename_original.as_str()
                     };
-                    match std::fs::read(&attachment.path) {
+                    match blob_toolkit.read_blob_async(&attachment.blob_ref).await {
                         Ok(bytes) => {
                             if let Err(error) = slack
                                 .upload_file(
@@ -2899,7 +2899,7 @@ async fn run_outbound_loop(
                             tracing::warn!(
                                 error = %error,
                                 blob_name = %attachment.blob_ref.blob_name,
-                                "failed to read resolved attachment path"
+                                "failed to read the attachment blob"
                             );
                         }
                     }

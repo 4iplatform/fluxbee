@@ -2352,10 +2352,17 @@ fn load_cognitive_asset(
             AGENT_ASSET_MAX_BYTES
         ));
     }
-    let raw = fs::read_to_string(&path)
-        .map_err(|err| format!("asset read failed '{}': {err}", path.display()))?;
+    let raw =
+        fs::read(&path).map_err(|err| format!("asset read failed '{}': {err}", path.display()))?;
+    // The name is the SHA-256 of the bytes SY.architect wrote: anything else is not that asset.
+    if fluxbee_sdk::blob::sha256_hex(&raw) != hash.trim().to_ascii_lowercase() {
+        return Err(format!(
+            "asset content does not match its hash '{}'",
+            path.display()
+        ));
+    }
     let doc: CognitiveAssetDocument =
-        serde_json::from_str(&raw).map_err(|err| format!("asset JSON invalid: {err}"))?;
+        serde_json::from_slice(&raw).map_err(|err| format!("asset JSON invalid: {err}"))?;
     if doc.asset_type != expected_type {
         return Err(format!(
             "asset_type mismatch: expected '{expected_type}', got '{}'",
@@ -5624,13 +5631,41 @@ mod tests {
         path
     }
 
-    fn write_cognitive_asset(root: &std::path::Path, hash: &str, value: Value) {
-        let path = root.join("agent-assets").join(format!("{hash}.json"));
+    /// Writes an asset the way SY.architect does, named by the SHA-256 of its bytes, and returns
+    /// that hash.
+    fn write_cognitive_asset(root: &std::path::Path, value: Value) -> String {
+        let bytes = serde_json::to_vec_pretty(&value).expect("serialize asset");
+        let hash = fluxbee_sdk::blob::sha256_hex(&bytes);
         fs::write(
-            path,
-            serde_json::to_string_pretty(&value).expect("serialize asset"),
+            root.join("agent-assets").join(format!("{hash}.json")),
+            bytes,
         )
         .expect("write cognitive asset");
+        hash
+    }
+
+    /// An agent asset is the bytes its name hashes: one whose content changed under the same name
+    /// (an edit by whoever could write agent-assets) is refused, never loaded as the agent's role.
+    #[test]
+    fn an_agent_asset_must_hash_to_its_name() {
+        let root = cognitive_temp_root("asset-hash");
+        let hash = write_cognitive_asset(
+            &root,
+            json!({"asset_type": "role", "name": "Support role", "description": "Help."}),
+        );
+        assert!(load_cognitive_asset(&root, &hash, "role").is_ok());
+        let path = root.join("agent-assets").join(format!("{hash}.json"));
+        fs::write(
+            &path,
+            serde_json::to_vec(
+                &json!({"asset_type": "role", "name": "Evil", "description": "Lie."}),
+            )
+            .expect("json"),
+        )
+        .expect("swap the asset");
+        let err = load_cognitive_asset(&root, &hash, "role").expect_err("a changed asset");
+        assert!(err.contains("does not match its hash"), "{err}");
+        let _ = fs::remove_dir_all(&root);
     }
 
     fn sample_agent_ilk() -> IdentityIlkOption {
@@ -5699,10 +5734,8 @@ mod tests {
     #[test]
     fn cognitive_definition_reuses_state_when_hashes_are_unchanged() {
         let root = cognitive_temp_root("reuse-unchanged-hashes");
-        let role_hash = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
-        write_cognitive_asset(
+        let role_hash = write_cognitive_asset(
             &root,
-            role_hash,
             json!({
                 "asset_type": "role",
                 "name": "Support role",
@@ -5744,12 +5777,8 @@ mod tests {
     #[test]
     fn cognitive_definition_composes_role_skill_and_handbook_assets() {
         let root = cognitive_temp_root("compose-assets");
-        let role_hash = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
-        let skill_hash = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
-        let handbook_hash = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
-        write_cognitive_asset(
+        let role_hash = write_cognitive_asset(
             &root,
-            role_hash,
             json!({
                 "asset_type": "role",
                 "name": "Support role",
@@ -5758,9 +5787,8 @@ mod tests {
                 "limits": ["Do not invent platform capabilities."]
             }),
         );
-        write_cognitive_asset(
+        let skill_hash = write_cognitive_asset(
             &root,
-            skill_hash,
             json!({
                 "asset_type": "skill",
                 "name": "triage",
@@ -5770,9 +5798,8 @@ mod tests {
                 "examples": [{"input": "list nodes", "output": "read-only inventory"}]
             }),
         );
-        write_cognitive_asset(
+        let handbook_hash = write_cognitive_asset(
             &root,
-            handbook_hash,
             json!({
                 "asset_type": "handbook",
                 "name": "Fluxbee basics",
@@ -5792,7 +5819,7 @@ mod tests {
         let prompt = state.active_prompt.as_deref().expect("active prompt");
 
         assert_eq!(state.definition_state, "composed");
-        assert_eq!(state.role_hash_loaded.as_deref(), Some(role_hash));
+        assert_eq!(state.role_hash_loaded.as_deref(), Some(role_hash.as_str()));
         assert_eq!(state.skill_hashes_loaded, vec![skill_hash.to_string()]);
         assert_eq!(
             state.handbook_hashes_loaded,
@@ -5808,20 +5835,16 @@ mod tests {
     #[test]
     fn cognitive_definition_composes_personality_before_role() {
         let root = cognitive_temp_root("compose-personality");
-        let role_hash = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
-        let personality_hash = "9999999999999999999999999999999999999999999999999999999999999999";
-        write_cognitive_asset(
+        let role_hash = write_cognitive_asset(
             &root,
-            role_hash,
             json!({
                 "asset_type": "role",
                 "name": "Support role",
                 "description": "Receive and triage support tickets.",
             }),
         );
-        write_cognitive_asset(
+        let personality_hash = write_cognitive_asset(
             &root,
-            personality_hash,
             json!({
                 "asset_type": "personality",
                 "name": "Argentine engineer",
@@ -5852,7 +5875,7 @@ mod tests {
         assert_eq!(state.definition_state, "composed");
         assert_eq!(
             state.personality_hash_loaded.as_deref(),
-            Some(personality_hash)
+            Some(personality_hash.as_str())
         );
         let prompt = state.active_prompt.as_deref().expect("prompt");
         let personality_idx = prompt
@@ -5874,12 +5897,10 @@ mod tests {
     #[test]
     fn cognitive_definition_personality_failure_yields_partial() {
         let root = cognitive_temp_root("personality-partial");
-        let role_hash = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
         let missing_personality =
             "5555555555555555555555555555555555555555555555555555555555555555";
-        write_cognitive_asset(
+        let role_hash = write_cognitive_asset(
             &root,
-            role_hash,
             json!({
                 "asset_type": "role",
                 "name": "R",
@@ -5894,7 +5915,7 @@ mod tests {
         let state = compose_cognitive_state(&root, 22, &ilk, hashes).expect("compose state");
 
         assert_eq!(state.definition_state, "partial");
-        assert_eq!(state.role_hash_loaded.as_deref(), Some(role_hash));
+        assert_eq!(state.role_hash_loaded.as_deref(), Some(role_hash.as_str()));
         assert!(state.personality_hash_loaded.is_none());
         let failure = state
             .failed_hashes
@@ -5908,10 +5929,8 @@ mod tests {
     #[test]
     fn cognitive_definition_personality_rejects_missing_required_system_fields() {
         let root = cognitive_temp_root("personality-bad");
-        let personality_hash = "7777777777777777777777777777777777777777777777777777777777777777";
-        write_cognitive_asset(
+        let personality_hash = write_cognitive_asset(
             &root,
-            personality_hash,
             json!({
                 "asset_type": "personality",
                 "name": "Broken",
@@ -5943,11 +5962,9 @@ mod tests {
     #[test]
     fn cognitive_definition_reports_partial_when_some_assets_fail() {
         let root = cognitive_temp_root("partial-assets");
-        let role_hash = "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd";
         let missing_skill_hash = "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee";
-        write_cognitive_asset(
+        let role_hash = write_cognitive_asset(
             &root,
-            role_hash,
             json!({
                 "asset_type": "role",
                 "name": "Support role",
@@ -5962,7 +5979,7 @@ mod tests {
         let state = compose_cognitive_state(&root, 9, &ilk, hashes).expect("compose state");
 
         assert_eq!(state.definition_state, "partial");
-        assert_eq!(state.role_hash_loaded.as_deref(), Some(role_hash));
+        assert_eq!(state.role_hash_loaded.as_deref(), Some(role_hash.as_str()));
         assert_eq!(state.failed_hashes.len(), 1);
         assert_eq!(state.failed_hashes[0].asset_type, "skill");
         assert_eq!(state.failed_hashes[0].hash, missing_skill_hash);
@@ -5976,10 +5993,8 @@ mod tests {
     #[test]
     fn cognitive_definition_reports_error_for_malformed_asset_schema() {
         let root = cognitive_temp_root("malformed-asset");
-        let role_hash = "abababababababababababababababababababababababababababababababab";
-        write_cognitive_asset(
+        let role_hash = write_cognitive_asset(
             &root,
-            role_hash,
             json!({
                 "asset_type": "role",
                 "name": "Broken role"
@@ -6019,11 +6034,9 @@ mod tests {
     #[test]
     fn cognitive_definition_truncates_large_composed_prompt() {
         let root = cognitive_temp_root("truncate-prompt");
-        let handbook_hash = "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff";
         let large_content = "x".repeat(COMPOSED_PROMPT_MAX_BYTES * 2);
-        write_cognitive_asset(
+        let handbook_hash = write_cognitive_asset(
             &root,
-            handbook_hash,
             json!({
                 "asset_type": "handbook",
                 "name": "Large handbook",

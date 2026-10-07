@@ -15,13 +15,14 @@
 use std::collections::{BTreeMap, HashSet};
 use std::fs::{self, OpenOptions};
 use std::io::Write;
-use std::os::fd::RawFd;
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use fluxbee_sdk::blob::{BlobConfig, BlobError, BlobRef, BlobToolkit, BLOB_DEFAULT_MAX_BYTES};
+use fluxbee_sdk::blob::{
+    safe_fs, BlobConfig, BlobError, BlobRef, BlobToolkit, BLOB_DEFAULT_MAX_BYTES,
+};
 use fluxbee_sdk::protocol::{
     Destination, Message, Meta, Routing, MSG_BLOB_CURATE, MSG_BLOB_CURATE_RESPONSE,
     MSG_BLOB_RELEASE, MSG_BLOB_RELEASE_RESPONSE, MSG_BLOB_STATUS_GET, MSG_BLOB_STATUS_GET_RESPONSE,
@@ -50,12 +51,14 @@ use io_common::io_control_plane_logging::{
 };
 use io_common::io_control_plane_metrics::IoControlPlaneMetrics;
 use io_common::io_control_plane_store::persist_io_control_plane_state;
-use nix::fcntl::{open, OFlag};
-use nix::sys::stat::{fstat, Mode, SFlag};
-use nix::unistd::{close, read};
+use nix::errno::Errno;
+use nix::fcntl::AtFlags;
+use nix::sys::stat::{fstat, SFlag};
+use nix::unistd::{linkat, unlinkat, UnlinkatFlags};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
+use std::os::fd::AsRawFd;
 use tokio::sync::{Mutex, RwLock};
 use tracing_subscriber::EnvFilter;
 use uuid::Uuid;
@@ -132,7 +135,6 @@ impl Config {
 #[derive(Debug, Clone)]
 struct BlobCurator {
     toolkit: BlobToolkit,
-    blob_root: PathBuf,
     public_root: PathBuf,
     ledger_path: PathBuf,
     max_bytes: u64,
@@ -235,14 +237,6 @@ impl CuratorError {
             Self::Blob(BlobError::TooLarge { .. }) => "BLOB_TOO_LARGE",
             Self::Io(_) | Self::Json(_) | Self::Blob(_) | Self::System(_) => "SERVICE_FAILED",
         }
-    }
-}
-
-struct FdGuard(RawFd);
-
-impl Drop for FdGuard {
-    fn drop(&mut self) {
-        let _ = close(self.0);
     }
 }
 
@@ -687,18 +681,18 @@ impl BlobCurator {
         ledger_path: PathBuf,
         max_bytes: u64,
     ) -> Result<Self, CuratorError> {
-        ensure_dir(&public_root, 0o750)?;
+        ensure_public_dir(&public_root)?;
+        remove_stale_curate_temps(&public_root)?;
         if let Some(parent) = ledger_path.parent() {
             ensure_dir(parent, 0o750)?;
         }
         let toolkit = BlobToolkit::new(BlobConfig {
-            blob_root: blob_root.clone(),
+            blob_root,
             max_blob_bytes: Some(max_bytes),
             ..BlobConfig::default()
         })?;
         let curator = Self {
             toolkit,
-            blob_root,
             public_root,
             ledger_path,
             max_bytes,
@@ -841,28 +835,14 @@ impl BlobCurator {
         &self,
         blob_ref: &BlobRef,
     ) -> Result<(String, u64, bool), CuratorError> {
-        let source = self.toolkit.resolve(blob_ref);
-        let active_root = self.blob_root.join("active");
-        ensure_source_under_root(&source, &active_root)?;
-        let meta = fs::symlink_metadata(&source).map_err(|err| {
-            if err.kind() == std::io::ErrorKind::NotFound {
-                CuratorError::NotFound(blob_ref.blob_name.clone())
-            } else {
-                CuratorError::Io(err)
-            }
+        // Opened by descriptor without following a link anywhere under blob/ (FINDINGS A-56): a
+        // regular file of the BlobRef's size. Its bytes are checked below, against the full hash.
+        let source = self.toolkit.open_blob(blob_ref).map_err(|err| match err {
+            BlobError::NotFound(_) => CuratorError::NotFound(blob_ref.blob_name.clone()),
+            BlobError::Integrity(detail) => CuratorError::Integrity(detail),
+            other => CuratorError::Blob(other),
         })?;
-        if meta.file_type().is_symlink() || !meta.is_file() {
-            return Err(CuratorError::Integrity(
-                "source blob must be a regular non-symlink file".to_string(),
-            ));
-        }
-        if meta.len() != blob_ref.size {
-            return Err(CuratorError::Integrity(format!(
-                "source size {} does not match BlobRef size {}",
-                meta.len(),
-                blob_ref.size
-            )));
-        }
+        let meta = source.metadata()?;
         if meta.len() > self.max_bytes {
             return Err(CuratorError::TooLarge {
                 size: meta.len(),
@@ -870,19 +850,39 @@ impl BlobCurator {
             });
         }
 
-        let temp_path =
-            self.public_root
-                .join(format!(".curate-{}-{}", std::process::id(), Uuid::new_v4()));
-        let copied = copy_hash_no_follow(&source, &temp_path, self.max_bytes);
+        // The public folder is the Syncthing user's (FINDINGS A-56): the copy is created
+        // exclusively inside it by descriptor, takes the folder's owner so that Syncthing can read
+        // it, and is linked to its final name by descriptor. Nothing here acts through a name that
+        // user could plant.
+        let public = safe_fs::open_dir_no_follow(None, &self.public_root)?;
+        let owner = safe_fs::owner_of(&public)?;
+        let temp_name = format!(".curate-{}-{}", std::process::id(), Uuid::new_v4());
+        let unlink_temp = || {
+            let _ = unlinkat(
+                Some(public.as_raw_fd()),
+                temp_name.as_str(),
+                UnlinkatFlags::NoRemoveDir,
+            );
+        };
+        let mut temp = safe_fs::create_file_exclusive(&public, &temp_name)?;
+        let copied = hash_file(source, self.max_bytes, |chunk| {
+            temp.write_all(chunk)?;
+            Ok(())
+        })
+        .and_then(|result| {
+            temp.flush()?;
+            temp.sync_all()?;
+            Ok(result)
+        });
         let (sha256, size) = match copied {
             Ok(result) => result,
             Err(err) => {
-                let _ = fs::remove_file(&temp_path);
+                unlink_temp();
                 return Err(err);
             }
         };
         if size != blob_ref.size {
-            let _ = fs::remove_file(&temp_path);
+            unlink_temp();
             return Err(CuratorError::Integrity(format!(
                 "copied size {size} does not match BlobRef size {}",
                 blob_ref.size
@@ -892,27 +892,39 @@ impl BlobCurator {
             CuratorError::Integrity("BlobRef name has no embedded hash16".to_string())
         })?;
         if !sha256[..16].eq_ignore_ascii_case(expected_hash16) {
-            let _ = fs::remove_file(&temp_path);
+            unlink_temp();
             return Err(CuratorError::Integrity(format!(
                 "BlobRef hash16 '{}' does not match content SHA-256",
                 expected_hash16
             )));
         }
+        if let Err(err) = safe_fs::give_to(&temp, owner)
+            .and_then(|()| temp.set_permissions(fs::Permissions::from_mode(0o640)))
+        {
+            unlink_temp();
+            return Err(err.into());
+        }
 
         let final_path = self.public_path(&sha256)?;
-        let file_created = match fs::hard_link(&temp_path, &final_path) {
+        let file_created = match linkat(
+            Some(public.as_raw_fd()),
+            temp_name.as_str(),
+            Some(public.as_raw_fd()),
+            sha256.as_str(),
+            AtFlags::empty(),
+        ) {
             Ok(()) => true,
-            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
+            Err(Errno::EEXIST) => {
+                unlink_temp();
                 verify_file_hash(&final_path, &sha256, size, self.max_bytes)?;
                 false
             }
             Err(err) => {
-                let _ = fs::remove_file(&temp_path);
-                return Err(err.into());
+                unlink_temp();
+                return Err(std::io::Error::from(err).into());
             }
         };
-        fs::remove_file(&temp_path)?;
-        fs::set_permissions(&final_path, fs::Permissions::from_mode(0o640))?;
+        unlink_temp();
         Ok((sha256, size, file_created))
     }
 
@@ -1000,39 +1012,36 @@ impl BlobCurator {
     }
 }
 
-fn copy_hash_no_follow(
-    source: &Path,
-    destination: &Path,
-    max_bytes: u64,
-) -> Result<(String, u64), CuratorError> {
-    let mut output = OpenOptions::new()
-        .create_new(true)
-        .write(true)
-        .mode(0o640)
-        .open(destination)?;
-    let result = hash_no_follow(source, max_bytes, |chunk| {
-        output.write_all(chunk)?;
-        Ok(())
-    })?;
-    output.flush()?;
-    output.sync_all()?;
-    Ok(result)
-}
-
+/// Hashes the file at `path` without following a link at its last component and without blocking
+/// on a FIFO planted there. Used for the public copies: `public/` sits under the root-owned `blob/`,
+/// so only the last component is the Syncthing user's.
 fn hash_no_follow<F>(
     source: &Path,
+    max_bytes: u64,
+    consume: F,
+) -> Result<(String, u64), CuratorError>
+where
+    F: FnMut(&[u8]) -> Result<(), CuratorError>,
+{
+    let file = OpenOptions::new()
+        .read(true)
+        .custom_flags(nix::libc::O_NOFOLLOW | nix::libc::O_NONBLOCK)
+        .open(source)?;
+    hash_file(file, max_bytes, consume)
+}
+
+/// Streams an open file through SHA-256, refusing anything but a regular file within `max_bytes`.
+fn hash_file<F>(
+    mut file: fs::File,
     max_bytes: u64,
     mut consume: F,
 ) -> Result<(String, u64), CuratorError>
 where
     F: FnMut(&[u8]) -> Result<(), CuratorError>,
 {
-    let fd = open(source, OFlag::O_RDONLY | OFlag::O_NOFOLLOW, Mode::empty())
-        .map_err(|err| CuratorError::System(format!("open source: {err}")))?;
-    let fd = FdGuard(fd);
-    let stat = fstat(fd.0).map_err(|err| CuratorError::System(format!("fstat source: {err}")))?;
-    let kind = SFlag::from_bits_truncate(stat.st_mode);
-    if !kind.contains(SFlag::S_IFREG) {
+    let stat = fstat(file.as_raw_fd())
+        .map_err(|err| CuratorError::System(format!("fstat source: {err}")))?;
+    if SFlag::from_bits_truncate(stat.st_mode) & SFlag::S_IFMT != SFlag::S_IFREG {
         return Err(CuratorError::Integrity(
             "source blob is not a regular file".to_string(),
         ));
@@ -1048,8 +1057,7 @@ where
     let mut total = 0_u64;
     let mut buffer = [0_u8; 64 * 1024];
     loop {
-        let count = read(fd.0, &mut buffer)
-            .map_err(|err| CuratorError::System(format!("read source: {err}")))?;
+        let count = std::io::Read::read(&mut file, &mut buffer)?;
         if count == 0 {
             break;
         }
@@ -1091,29 +1099,6 @@ fn verify_file_hash(
             "public file verification failed for '{}'",
             path.display()
         )));
-    }
-    Ok(())
-}
-
-fn ensure_source_under_root(source: &Path, active_root: &Path) -> Result<(), CuratorError> {
-    let canonical_root = active_root.canonicalize().map_err(|err| {
-        if err.kind() == std::io::ErrorKind::NotFound {
-            CuratorError::NotFound(active_root.display().to_string())
-        } else {
-            CuratorError::Io(err)
-        }
-    })?;
-    let canonical_source = source.canonicalize().map_err(|err| {
-        if err.kind() == std::io::ErrorKind::NotFound {
-            CuratorError::NotFound(source.display().to_string())
-        } else {
-            CuratorError::Io(err)
-        }
-    })?;
-    if !canonical_source.starts_with(canonical_root) {
-        return Err(CuratorError::Integrity(
-            "source blob resolves outside active root".to_string(),
-        ));
     }
     Ok(())
 }
@@ -1225,6 +1210,33 @@ fn is_full_sha256(value: &str) -> bool {
         && value
             .chars()
             .all(|ch| ch.is_ascii_hexdigit() && !ch.is_ascii_uppercase())
+}
+
+/// The public folder belongs to the Syncthing user, and the orchestrator sets its owner and mode
+/// (FINDINGS A-56): io.blob only makes sure it exists and is a directory, never through a link.
+fn ensure_public_dir(path: &Path) -> Result<(), std::io::Error> {
+    fs::create_dir_all(path)?;
+    safe_fs::open_dir_no_follow(None, path).map(drop)
+}
+
+/// A curate that crashed leaves its `.curate-*` temporary in the public folder, root's, so the
+/// Syncthing serving the folder can never read it. They go at start, before any curate runs, each
+/// removed by name relative to the folder: unlinkat removes the name, never what a link points at.
+fn remove_stale_curate_temps(public_root: &Path) -> Result<(), std::io::Error> {
+    let public = safe_fs::open_dir_no_follow(None, public_root)?;
+    for entry in fs::read_dir(public_root)? {
+        let name = entry?.file_name();
+        let Some(name) = name.to_str().filter(|name| name.starts_with(".curate-")) else {
+            continue;
+        };
+        match unlinkat(Some(public.as_raw_fd()), name, UnlinkatFlags::NoRemoveDir) {
+            Ok(()) => tracing::warn!(name, "removed a stale curate temporary"),
+            Err(err) => {
+                tracing::warn!(name, error = %err, "could not remove a stale curate temporary")
+            }
+        }
+    }
+    Ok(())
 }
 
 fn ensure_dir(path: &Path, mode: u32) -> Result<(), std::io::Error> {
@@ -1351,6 +1363,57 @@ mod tests {
         assert_eq!(second["ref_count"], 1);
         let ledger = curator.load_ledger().expect("ledger");
         assert_eq!(ledger.publications.len(), 1);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    /// A-56: a link planted in the public folder under the final name is refused, never written
+    /// through; a curated copy has the public folder's owner and mode 0640, and no temporary is
+    /// left behind.
+    #[test]
+    fn curate_never_writes_through_a_planted_public_link() {
+        use std::os::unix::fs::MetadataExt;
+        let root = temp_root("planted");
+        let curator = test_curator(&root);
+        let blob_ref = create_blob(&curator, b"public bytes", "doc.pdf", "application/pdf");
+        let sha = format!("{:x}", Sha256::digest(b"public bytes"));
+        let victim = root.join("victim");
+        fs::write(&victim, b"untouched").expect("victim");
+        std::os::unix::fs::symlink(&victim, curator.public_root.join(&sha)).expect("plant link");
+        let req = request("pub:55555555-5555-4555-8555-555555555555", blob_ref.clone());
+        assert!(
+            curator.curate(req).is_err(),
+            "a planted link must be refused"
+        );
+        assert_eq!(fs::read(&victim).unwrap(), b"untouched");
+
+        fs::remove_file(curator.public_root.join(&sha)).expect("remove link");
+        let req = request("pub:66666666-6666-4666-8666-666666666666", blob_ref);
+        let done = curator.curate(req).expect("curate");
+        assert_eq!(done["sha256"], sha);
+        let public = fs::metadata(&curator.public_root).expect("public");
+        let file = fs::symlink_metadata(curator.public_root.join(&sha)).expect("public file");
+        assert!(file.file_type().is_file());
+        assert_eq!((file.uid(), file.gid()), (public.uid(), public.gid()));
+        assert_eq!(file.mode() & 0o777, 0o640);
+        let leftovers: Vec<_> = fs::read_dir(&curator.public_root)
+            .expect("list public")
+            .filter_map(Result::ok)
+            .filter(|entry| entry.file_name().to_string_lossy().starts_with(".curate-"))
+            .collect();
+        assert!(leftovers.is_empty(), "temporaries left: {leftovers:?}");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn a_stale_curate_temporary_is_removed_at_start() {
+        let root = temp_root("stale-temp");
+        let public = root.join("blob/public");
+        fs::create_dir_all(&public).expect("public");
+        fs::write(public.join(".curate-1-left-by-a-crash"), b"partial").expect("temp");
+        fs::write(public.join("keep-me"), b"public copy").expect("other entry");
+        let _curator = test_curator(&root);
+        assert!(!public.join(".curate-1-left-by-a-crash").exists());
+        assert!(public.join("keep-me").exists());
         let _ = fs::remove_dir_all(root);
     }
 

@@ -1,9 +1,15 @@
 use std::collections::HashSet;
+use std::io::{Read, Write};
+use std::os::fd::{AsRawFd, OwnedFd};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
-#[cfg(unix)]
 use std::{fs::Permissions, os::unix::fs::PermissionsExt};
+
+use nix::errno::Errno;
+use nix::fcntl::{renameat, AtFlags};
+use nix::sys::stat::{fchmod, fstatat, Mode, SFlag};
+use nix::unistd::{unlinkat, UnlinkatFlags};
 
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
@@ -14,6 +20,8 @@ use crate::payload::{PayloadError, TextV1Payload, TEXT_V1_DEFAULT_MESSAGE_MAX_BY
 use crate::protocol::{
     Destination, Message, Meta, Routing, MSG_TTL_EXCEEDED, MSG_UNREACHABLE, SYSTEM_KIND,
 };
+
+pub mod safe_fs;
 
 pub mod constants {
     pub const BLOB_NAME_MAX_CHARS: usize = 128;
@@ -229,6 +237,9 @@ pub enum BlobError {
     InvalidRef(String),
     #[error("BLOB_TOO_LARGE: size={size} max={max}")]
     TooLarge { size: u64, max: u64 },
+    /// What is stored under a blob's name is not the blob its BlobRef describes (FINDINGS A-56).
+    #[error("BLOB_INTEGRITY: {0}")]
+    Integrity(String),
     #[error("BLOB_SYNC_HINT_TIMEOUT: target={target} timeout_ms={timeout_ms}")]
     SyncHintTimeout { target: String, timeout_ms: u64 },
     #[error("BLOB_SYNC_HINT_FAILED: target={target} detail={detail}")]
@@ -303,11 +314,8 @@ impl BlobToolkit {
             } else {
                 original_filename
             };
-            let (blob_ref, staging_path) =
-                self.build_blob_ref_and_staging_path(&data, requested_name, None)?;
-            std::fs::write(&staging_path, data)
-                .map_err(|err| map_io_error(err, "write staging file"))?;
-            set_file_mode_0640(&staging_path)?;
+            let blob_ref = self.build_blob_ref(&data, requested_name, None)?;
+            self.write_staging(&blob_ref, &data)?;
             Ok(blob_ref)
         })();
         match result {
@@ -340,11 +348,8 @@ impl BlobToolkit {
             } else {
                 Some(mime)
             };
-            let (blob_ref, staging_path) =
-                self.build_blob_ref_and_staging_path(data, fallback_name, mime_override)?;
-            std::fs::write(&staging_path, data)
-                .map_err(|err| map_io_error(err, "write staging file"))?;
-            set_file_mode_0640(&staging_path)?;
+            let blob_ref = self.build_blob_ref(data, fallback_name, mime_override)?;
+            self.write_staging(&blob_ref, data)?;
             Ok(blob_ref)
         })();
         match result {
@@ -533,25 +538,7 @@ impl BlobToolkit {
     pub fn promote(&self, blob_ref: &BlobRef) -> Result<(), BlobError> {
         let result = (|| -> Result<(), BlobError> {
             Self::validate_blob_ref(blob_ref)?;
-            let from = self.staging_path(blob_ref);
-            let to = self.resolve_path(blob_ref);
-            if to.exists() {
-                return Ok(());
-            }
-
-            if let Some(parent) = to.parent() {
-                ensure_dir_mode_0750(parent)?;
-            }
-
-            std::fs::rename(&from, &to).map_err(|err| {
-                if err.kind() == std::io::ErrorKind::NotFound {
-                    BlobError::NotFound(blob_ref.blob_name.clone())
-                } else {
-                    map_io_error(err, "promote staging->active")
-                }
-            })?;
-            set_file_mode_0640(&to)?;
-            Ok(())
+            self.move_staged_to_active(blob_ref)
         })();
         if let Err(err) = result {
             metrics_record_error();
@@ -597,6 +584,8 @@ impl BlobToolkit {
         Ok(payload)
     }
 
+    /// Where a blob lives. Never read it through this path: `active/` is the Syncthing user's,
+    /// and a name there can be a link (FINDINGS A-56). Read blobs with `read_blob`.
     pub fn resolve(&self, blob_ref: &BlobRef) -> PathBuf {
         metrics_record_resolve();
         self.resolve_path(blob_ref)
@@ -787,7 +776,9 @@ impl BlobToolkit {
                         continue;
                     }
                 };
-                if validate_blob_name(filename).is_err() {
+                // A temporary of a put that never finished (`.<name>.<uuid>.tmp`) ages out too.
+                let staging_temp = filename.starts_with('.') && filename.ends_with(".tmp");
+                if !staging_temp && validate_blob_name(filename).is_err() {
                     report.skipped_non_blob_files = report.skipped_non_blob_files.saturating_add(1);
                     continue;
                 }
@@ -957,15 +948,6 @@ impl BlobToolkit {
             .unwrap_or("00")
     }
 
-    fn staging_path(&self, blob_ref: &BlobRef) -> PathBuf {
-        let prefix = Self::prefix(&blob_ref.blob_name);
-        self.cfg
-            .blob_root
-            .join("staging")
-            .join(prefix)
-            .join(&blob_ref.blob_name)
-    }
-
     fn resolve_path(&self, blob_ref: &BlobRef) -> PathBuf {
         let prefix = Self::prefix(&blob_ref.blob_name);
         self.cfg
@@ -975,12 +957,12 @@ impl BlobToolkit {
             .join(&blob_ref.blob_name)
     }
 
-    fn build_blob_ref_and_staging_path(
+    fn build_blob_ref(
         &self,
         data: &[u8],
         original_filename: &str,
         mime_override: Option<&str>,
-    ) -> Result<(BlobRef, PathBuf), BlobError> {
+    ) -> Result<BlobRef, BlobError> {
         let hash_hex = sha256_hex(data);
         let hash16 = &hash_hex[..BLOB_HASH_LEN];
 
@@ -988,11 +970,6 @@ impl BlobToolkit {
             sanitize_filename(original_filename, self.cfg.name_max_chars);
         let blob_name = format!("{name}_{hash16}.{ext}");
         Self::validate_blob_name(&blob_name)?;
-
-        let prefix = &hash16[..BLOB_PREFIX_LEN];
-        let staging_dir = self.cfg.blob_root.join("staging").join(prefix);
-        ensure_dir_mode_0750(&staging_dir)?;
-        let staging_path = staging_dir.join(&blob_name);
 
         // FIX-8: io.blob is the integrity authority, so it must not blindly trust the producer's
         // declared type for the case that actually matters when a blob is served to the public web —
@@ -1024,7 +1001,258 @@ impl BlobToolkit {
             filename_original,
             spool_day,
         };
-        Ok((blob_ref, staging_path))
+        Ok(blob_ref)
+    }
+
+    /// Writes `data` as `staging/<prefix>/<name>` (FINDINGS A-56): each directory opened without
+    /// following a link, the bytes written to an exclusive temporary file, then renamed over the
+    /// name. `staging/` is root's; nothing here acts through a name another user could plant.
+    fn write_staging(&self, blob_ref: &BlobRef, data: &[u8]) -> Result<(), BlobError> {
+        let name = blob_ref.blob_name.as_str();
+        let write = || -> std::io::Result<()> {
+            std::fs::create_dir_all(&self.cfg.blob_root)?;
+            let root = safe_fs::open_dir_no_follow(None, &self.cfg.blob_root)?;
+            let staging = safe_fs::ensure_child_dir(&root, "staging", None)?;
+            let dir = safe_fs::ensure_child_dir(&staging, Self::prefix(name), None)?;
+            let temp = format!(".{name}.{}.tmp", uuid::Uuid::new_v4().simple());
+            let mut file = safe_fs::create_file_exclusive(&dir, &temp)?;
+            let written = file
+                .write_all(data)
+                .and_then(|()| file.set_permissions(Permissions::from_mode(0o640)))
+                .and_then(|()| {
+                    renameat(
+                        Some(dir.as_raw_fd()),
+                        temp.as_str(),
+                        Some(dir.as_raw_fd()),
+                        name,
+                    )
+                    .map_err(std::io::Error::from)
+                });
+            if written.is_err() {
+                let _ = unlinkat(
+                    Some(dir.as_raw_fd()),
+                    temp.as_str(),
+                    UnlinkatFlags::NoRemoveDir,
+                );
+            }
+            written
+        };
+        write().map_err(|err| map_io_error(err, "write staging file"))
+    }
+
+    /// Moves `staging/<prefix>/<name>` to `active/<prefix>/<name>` (FINDINGS A-56). `active/` is
+    /// the Syncthing user's: the blob, and a prefix directory made here, take its owner before
+    /// they appear there, so the Syncthing that serves the folder can read them.
+    fn move_staged_to_active(&self, blob_ref: &BlobRef) -> Result<(), BlobError> {
+        let name = blob_ref.blob_name.as_str();
+        let prefix = Self::prefix(name);
+        let not_found_or = |ctx: &'static str| {
+            move |err: std::io::Error| {
+                if err.kind() == std::io::ErrorKind::NotFound {
+                    BlobError::NotFound(name.to_string())
+                } else {
+                    map_io_error(err, ctx)
+                }
+            }
+        };
+        let io = |ctx: &'static str| move |err: std::io::Error| map_io_error(err, ctx);
+        std::fs::create_dir_all(&self.cfg.blob_root).map_err(io("create blob root"))?;
+        let root =
+            safe_fs::open_dir_no_follow(None, &self.cfg.blob_root).map_err(io("open blob root"))?;
+        let active = safe_fs::ensure_child_dir(&root, "active", None)
+            .map_err(io("open active directory"))?;
+        let owner = safe_fs::owner_of(&active).map_err(io("read active directory owner"))?;
+        let dir = safe_fs::ensure_child_dir(&active, prefix, Some(owner))
+            .map_err(io("open active prefix directory"))?;
+        // Content-addressed: the same name is the same bytes. Only a regular file counts; anything
+        // else planted under the name is refused, never taken for the blob.
+        if regular_file_at(&dir, name).map_err(io("read the active entry"))? {
+            return Ok(());
+        }
+        // Nothing staged any more is fine when a promote of the same blob already moved it.
+        let promoted_already = |err: std::io::Error, ctx: &'static str| {
+            if err.kind() == std::io::ErrorKind::NotFound
+                && regular_file_at(&dir, name).unwrap_or(false)
+            {
+                Ok(())
+            } else {
+                Err(not_found_or(ctx)(err))
+            }
+        };
+        let staging = match safe_fs::open_dir_no_follow(Some(&root), Path::new("staging")) {
+            Ok(staging) => staging,
+            Err(err) => return promoted_already(err, "open staging directory"),
+        };
+        let staged_dir = match safe_fs::open_dir_no_follow(Some(&staging), Path::new(prefix)) {
+            Ok(staged_dir) => staged_dir,
+            Err(err) => return promoted_already(err, "open staging prefix directory"),
+        };
+        let staged = match safe_fs::open_file_no_follow(&staged_dir, name) {
+            Ok(staged) => staged,
+            Err(err) => return promoted_already(err, "open staged blob"),
+        };
+        hand_over_staged_blob(&staged, owner)?;
+        let held = safe_fs::identity_of(&staged).map_err(io("read the staged blob"))?;
+        match renameat(
+            Some(staged_dir.as_raw_fd()),
+            name,
+            Some(dir.as_raw_fd()),
+            name,
+        ) {
+            Ok(()) => {}
+            // A promote of the same blob moved it first.
+            Err(Errno::ENOENT) if regular_file_at(&dir, name).unwrap_or(false) => return Ok(()),
+            Err(err) => return Err(not_found_or("promote staging->active")(err.into())),
+        }
+        // renameat moves a name: a put of the same blob can replace the staged file between the
+        // open above and the move, so the inode that landed may not be the one handed over.
+        let landed =
+            safe_fs::open_file_no_follow(&dir, name).map_err(io("open the promoted blob"))?;
+        if safe_fs::identity_of(&landed).map_err(io("read the promoted blob"))? != held {
+            tracing::warn!(
+                blob = name,
+                "a newer copy of the staged blob moved instead of the one handed over; handing it over"
+            );
+            hand_over_staged_blob(&landed, owner)?;
+        }
+        Ok(())
+    }
+
+    /// Reads a blob and checks it is the one its BlobRef names (FINDINGS A-56). Every directory
+    /// under blob/ and the file are opened without following a link; the file must be a regular
+    /// file of the BlobRef's size whose SHA-256 starts with the hash in its name. `active/` belongs
+    /// to the Syncthing user and receives entries from other hives: a reader that followed a name
+    /// there could be handed any file root can read. Read blobs with this, never through `resolve`.
+    pub fn read_blob(&self, blob_ref: &BlobRef) -> Result<Vec<u8>, BlobError> {
+        let result = Self::validate_blob_ref(blob_ref).and_then(|()| {
+            metrics_record_resolve();
+            self.read_blob_checked(blob_ref)
+        });
+        if result.is_err() {
+            metrics_record_error();
+        }
+        result
+    }
+
+    /// `read_blob` for async callers: the read and the hash run on the blocking pool.
+    pub async fn read_blob_async(&self, blob_ref: &BlobRef) -> Result<Vec<u8>, BlobError> {
+        let toolkit = self.clone();
+        let blob_ref = blob_ref.clone();
+        tokio::task::spawn_blocking(move || toolkit.read_blob(&blob_ref))
+            .await
+            .map_err(|err| BlobError::Io(format!("blob read task failed: {err}")))?
+    }
+
+    /// `read_blob`, waiting with backoff for a blob that has not arrived yet, as
+    /// `resolve_with_retry` does. Only a missing blob is retried. Each attempt runs on the blocking
+    /// pool.
+    pub async fn read_blob_with_retry(
+        &self,
+        blob_ref: &BlobRef,
+        cfg: ResolveRetryConfig,
+    ) -> Result<Vec<u8>, BlobError> {
+        if let Err(err) = Self::validate_blob_ref(blob_ref) {
+            metrics_record_error();
+            return Err(err);
+        }
+        metrics_record_resolve();
+        let started = Instant::now();
+        let max_wait = Duration::from_millis(cfg.max_wait_ms);
+        let mut delay_ms = cfg.initial_delay_ms.max(1);
+        let backoff = cfg.backoff_factor.max(1.0);
+        let mut retry_attempts: u64 = 0;
+        loop {
+            let toolkit = self.clone();
+            let attempt_ref = blob_ref.clone();
+            let attempt =
+                tokio::task::spawn_blocking(move || toolkit.read_blob_checked(&attempt_ref))
+                    .await
+                    .map_err(|err| BlobError::Io(format!("blob read task failed: {err}")))
+                    .and_then(|result| result);
+            match attempt {
+                Err(BlobError::NotFound(_)) if started.elapsed() < max_wait => {}
+                result => {
+                    if retry_attempts > 0 {
+                        BLOB_RESOLVE_RETRY_TOTAL.fetch_add(retry_attempts, Ordering::Relaxed);
+                    }
+                    if result.is_err() {
+                        metrics_record_error();
+                    }
+                    return result;
+                }
+            }
+            let remaining = max_wait.saturating_sub(started.elapsed());
+            tokio::time::sleep(Duration::from_millis(delay_ms).min(remaining)).await;
+            retry_attempts = retry_attempts.saturating_add(1);
+            delay_ms = (((delay_ms as f64) * backoff).ceil() as u64).max(1);
+        }
+    }
+
+    /// Opens a blob without following a link anywhere under blob/ (FINDINGS A-56): a regular file
+    /// of the BlobRef's size. Its bytes are not checked here; `read_blob` checks them, and a caller
+    /// that streams the file checks them itself.
+    pub fn open_blob(&self, blob_ref: &BlobRef) -> Result<std::fs::File, BlobError> {
+        Self::validate_blob_ref(blob_ref)?;
+        let name = blob_ref.blob_name.as_str();
+        let not_found_or = |ctx: &'static str| {
+            move |err: std::io::Error| {
+                if err.kind() == std::io::ErrorKind::NotFound {
+                    BlobError::NotFound(name.to_string())
+                } else {
+                    map_io_error(err, ctx)
+                }
+            }
+        };
+        let root = safe_fs::open_dir_no_follow(None, &self.cfg.blob_root)
+            .map_err(not_found_or("open blob root"))?;
+        let active = safe_fs::open_dir_no_follow(Some(&root), Path::new("active"))
+            .map_err(not_found_or("open active directory"))?;
+        let dir = safe_fs::open_dir_no_follow(Some(&active), Path::new(Self::prefix(name)))
+            .map_err(not_found_or("open active prefix directory"))?;
+        let fd = safe_fs::open_file_no_follow(&dir, name).map_err(not_found_or("open blob"))?;
+        if !safe_fs::is_regular_file(&fd).map_err(|err| map_io_error(err, "read blob type"))? {
+            return Err(BlobError::Integrity(format!(
+                "'{name}' is not a regular file"
+            )));
+        }
+        let file = std::fs::File::from(fd);
+        let size = file
+            .metadata()
+            .map_err(|err| map_io_error(err, "read blob size"))?
+            .len();
+        if size != blob_ref.size {
+            return Err(BlobError::Integrity(format!(
+                "'{name}' has {size} bytes, its BlobRef says {}",
+                blob_ref.size
+            )));
+        }
+        if let Some(max) = self.cfg.max_blob_bytes {
+            if size > max {
+                return Err(BlobError::TooLarge { size, max });
+            }
+        }
+        Ok(file)
+    }
+
+    fn read_blob_checked(&self, blob_ref: &BlobRef) -> Result<Vec<u8>, BlobError> {
+        let name = blob_ref.blob_name.as_str();
+        let file = self.open_blob(blob_ref)?;
+        let mut data = Vec::with_capacity(blob_ref.size as usize);
+        // Never more than the BlobRef's size plus one byte, whatever the file grows to meanwhile.
+        file.take(blob_ref.size.saturating_add(1))
+            .read_to_end(&mut data)
+            .map_err(|err| map_io_error(err, "read blob"))?;
+        let expected = parse_blob_name(name)
+            .map(|parts| parts.hash)
+            .ok_or_else(|| BlobError::InvalidName(name.to_string()))?;
+        if data.len() as u64 != blob_ref.size
+            || !sha256_hex(&data)[..BLOB_HASH_LEN].eq_ignore_ascii_case(expected)
+        {
+            return Err(BlobError::Integrity(format!(
+                "the bytes of '{name}' do not match the hash in its name"
+            )));
+        }
+        Ok(data)
     }
 
     fn enforce_size_limit(&self, size: u64) -> Result<(), BlobError> {
@@ -1124,6 +1352,31 @@ fn is_iso_day(value: &str) -> bool {
         && bytes[8..10].iter().all(|b| b.is_ascii_digit())
 }
 
+/// Whether `name` under `dir` is a regular file, without following a link.
+fn regular_file_at(dir: &OwnedFd, name: &str) -> std::io::Result<bool> {
+    match fstatat(Some(dir.as_raw_fd()), name, AtFlags::AT_SYMLINK_NOFOLLOW) {
+        Ok(stat) => Ok(SFlag::from_bits_truncate(stat.st_mode) & SFlag::S_IFMT == SFlag::S_IFREG),
+        Err(Errno::ENOENT) => Ok(false),
+        Err(err) => Err(err.into()),
+    }
+}
+
+/// Gives a staged blob to the owner of `active/`, 0640, after checking root may
+/// (`safe_fs::is_handable_staged_file`). Root never gives away anything else.
+fn hand_over_staged_blob(fd: &OwnedFd, owner: (u32, u32)) -> Result<(), BlobError> {
+    if !safe_fs::is_handable_staged_file(fd, owner)
+        .map_err(|err| map_io_error(err, "read the staged blob"))?
+    {
+        return Err(BlobError::Integrity(
+            "the staged blob is not a regular file this process staged".to_string(),
+        ));
+    }
+    safe_fs::give_to(fd, owner)
+        .map_err(|err| map_io_error(err, "give the blob to the active owner"))?;
+    fchmod(fd.as_raw_fd(), Mode::from_bits_truncate(0o640))
+        .map_err(|err| map_io_error(err.into(), "set the blob mode"))
+}
+
 fn map_io_error(err: std::io::Error, ctx: &str) -> BlobError {
     BlobError::Io(format!("{ctx}: {err}"))
 }
@@ -1139,27 +1392,6 @@ fn metrics_record_resolve() {
 
 fn metrics_record_error() {
     BLOB_ERRORS_TOTAL.fetch_add(1, Ordering::Relaxed);
-}
-
-fn ensure_dir_mode_0750(path: &Path) -> Result<(), BlobError> {
-    std::fs::create_dir_all(path).map_err(|err| map_io_error(err, "create directory"))?;
-    #[cfg(unix)]
-    {
-        let perms = Permissions::from_mode(0o750);
-        std::fs::set_permissions(path, perms)
-            .map_err(|err| map_io_error(err, "set directory permissions"))?;
-    }
-    Ok(())
-}
-
-fn set_file_mode_0640(path: &Path) -> Result<(), BlobError> {
-    #[cfg(unix)]
-    {
-        let perms = Permissions::from_mode(0o640);
-        std::fs::set_permissions(path, perms)
-            .map_err(|err| map_io_error(err, "set file permissions"))?;
-    }
-    Ok(())
 }
 
 fn list_prefix_dirs(root: &Path) -> Result<Vec<PathBuf>, BlobError> {
@@ -1258,7 +1490,8 @@ fn parse_sync_hint_response_payload(
     })
 }
 
-fn sha256_hex(data: &[u8]) -> String {
+/// The lowercase hex SHA-256 of `data`.
+pub fn sha256_hex(data: &[u8]) -> String {
     let hash = Sha256::digest(data);
     let mut out = String::with_capacity(64);
     for byte in hash {
@@ -1421,8 +1654,14 @@ mod tests {
 
     #[test]
     fn sniff_detects_active_content_and_ignores_inert_binaries() {
-        assert_eq!(sniff_active_content(b"<!DOCTYPE html><html>"), Some("text/html"));
-        assert_eq!(sniff_active_content(b"   \n<html><body>hi"), Some("text/html"));
+        assert_eq!(
+            sniff_active_content(b"<!DOCTYPE html><html>"),
+            Some("text/html")
+        );
+        assert_eq!(
+            sniff_active_content(b"   \n<html><body>hi"),
+            Some("text/html")
+        );
         assert_eq!(
             sniff_active_content(b"<script>alert(1)</script>"),
             Some("text/html")
@@ -1843,6 +2082,227 @@ mod tests {
             & 0o777;
         assert_eq!(active_dir_mode, 0o750);
         assert_eq!(active_file_mode, 0o640);
+    }
+
+    /// A-56: a prefix directory under `active/` that the Syncthing user replaced with a link is
+    /// refused, never followed: nothing lands where the link points.
+    #[cfg(unix)]
+    #[test]
+    fn promote_never_follows_a_planted_active_prefix_link() {
+        let (toolkit, root) = test_toolkit();
+        let blob_ref = toolkit
+            .put_bytes(b"payload", "planted.txt", "text/plain")
+            .expect("put_bytes");
+        let outside = root.path.join("outside");
+        std::fs::create_dir_all(&outside).expect("outside dir");
+        let active = root.path.join("active");
+        std::fs::create_dir_all(&active).expect("active dir");
+        std::os::unix::fs::symlink(
+            &outside,
+            active.join(BlobToolkit::prefix(&blob_ref.blob_name)),
+        )
+        .expect("plant link");
+        let err = toolkit
+            .promote(&blob_ref)
+            .expect_err("a planted link is refused");
+        assert!(matches!(err, BlobError::Io(_)), "{err}");
+        assert!(std::fs::read_dir(&outside)
+            .expect("outside")
+            .next()
+            .is_none());
+    }
+
+    /// A-56: a link planted at a blob's staging name is replaced, never written through.
+    #[cfg(unix)]
+    #[test]
+    fn put_never_writes_through_a_planted_staging_link() {
+        let (toolkit, root) = test_toolkit();
+        let data = b"staged-bytes";
+        let probe = toolkit
+            .put_bytes(data, "victim.txt", "text/plain")
+            .expect("first put");
+        let prefix_dir = root
+            .path
+            .join("staging")
+            .join(BlobToolkit::prefix(&probe.blob_name));
+        let staged = prefix_dir.join(&probe.blob_name);
+        std::fs::remove_file(&staged).expect("clear the staged blob");
+        let target = root.path.join("target.txt");
+        std::fs::write(&target, b"untouched").expect("target");
+        std::os::unix::fs::symlink(&target, &staged).expect("plant link");
+        toolkit
+            .put_bytes(data, "victim.txt", "text/plain")
+            .expect("second put");
+        assert_eq!(std::fs::read(&target).expect("target"), b"untouched");
+        let meta = std::fs::symlink_metadata(&staged).expect("staged");
+        assert!(meta.file_type().is_file());
+        assert_eq!(std::fs::read(&staged).expect("staged bytes"), data);
+    }
+
+    /// A gid the test user belongs to besides its effective one, if any.
+    #[cfg(unix)]
+    fn a_secondary_group() -> Option<u32> {
+        // SAFETY: plain libc queries into a buffer of the size they report.
+        let egid = unsafe { nix::libc::getegid() };
+        let count = unsafe { nix::libc::getgroups(0, std::ptr::null_mut()) };
+        if count <= 0 {
+            return None;
+        }
+        let mut groups = vec![0 as nix::libc::gid_t; count as usize];
+        let count = unsafe { nix::libc::getgroups(count, groups.as_mut_ptr()) };
+        groups.truncate(count.max(0) as usize);
+        groups.into_iter().find(|gid| *gid != egid)
+    }
+
+    /// A-56: the blob, and the prefix directory made for it, take the owner of `active/`. Without
+    /// root only the group can change, to one the test user belongs to: `active/` gets such a
+    /// group and the promoted blob must follow it (the old promote kept the staged file's group).
+    #[cfg(unix)]
+    #[test]
+    fn a_promoted_blob_takes_the_owner_of_active() {
+        use std::os::unix::fs::MetadataExt;
+        let Some(gid) = a_secondary_group() else {
+            eprintln!("no secondary group for the test user; skipped");
+            return;
+        };
+        let (toolkit, root) = test_toolkit();
+        let blob_ref = toolkit
+            .put_bytes(b"grouped", "grouped.txt", "text/plain")
+            .expect("put_bytes");
+        let active = root.path.join("active");
+        std::fs::create_dir_all(&active).expect("active dir");
+        std::os::unix::fs::chown(&active, None, Some(gid)).expect("chgrp active");
+        toolkit.promote(&blob_ref).expect("promote");
+        let path = toolkit.resolve(&blob_ref);
+        let file = std::fs::metadata(&path).expect("blob");
+        let prefix = std::fs::metadata(path.parent().expect("prefix")).expect("prefix dir");
+        assert_eq!(file.gid(), gid);
+        assert_eq!(prefix.gid(), gid);
+        assert_eq!(file.mode() & 0o777, 0o640);
+        // Promoting again is a no-op: the name is already there.
+        toolkit.promote(&blob_ref).expect("second promote");
+    }
+
+    /// A-56: a link planted under a blob's name in `active/` is never taken for the blob: read_blob
+    /// refuses it, and promote replaces the link itself with the real blob, never writing through
+    /// it.
+    #[cfg(unix)]
+    #[test]
+    fn a_planted_link_at_a_blob_name_is_never_taken_for_the_blob() {
+        let (toolkit, root) = test_toolkit();
+        let blob_ref = toolkit
+            .put_bytes(b"real bytes", "real.txt", "text/plain")
+            .expect("put_bytes");
+        let secret = root.path.join("secret");
+        std::fs::write(&secret, b"root only!").expect("secret");
+        let path = toolkit.resolve(&blob_ref);
+        std::fs::create_dir_all(path.parent().expect("prefix")).expect("prefix dir");
+        std::os::unix::fs::symlink(&secret, &path).expect("plant link");
+        assert!(
+            toolkit.read_blob(&blob_ref).is_err(),
+            "a link is never read"
+        );
+        toolkit
+            .promote(&blob_ref)
+            .expect("promote replaces the link");
+        assert!(std::fs::symlink_metadata(&path)
+            .expect("entry")
+            .file_type()
+            .is_file());
+        assert_eq!(toolkit.read_blob(&blob_ref).expect("read"), b"real bytes");
+        assert_eq!(std::fs::read(&secret).expect("secret"), b"root only!");
+    }
+
+    /// A-56: read_blob returns only the bytes the BlobRef names.
+    #[cfg(unix)]
+    #[test]
+    fn read_blob_checks_type_size_and_hash() {
+        let (toolkit, _root) = test_toolkit();
+        let blob_ref = toolkit
+            .put_bytes(b"exact bytes", "exact.txt", "text/plain")
+            .expect("put_bytes");
+        toolkit.promote(&blob_ref).expect("promote");
+        assert_eq!(toolkit.read_blob(&blob_ref).expect("read"), b"exact bytes");
+        let path = toolkit.resolve(&blob_ref);
+        // Same size, other bytes.
+        std::fs::remove_file(&path).expect("remove");
+        std::fs::write(&path, b"other bytes").expect("swap");
+        assert!(matches!(
+            toolkit.read_blob(&blob_ref),
+            Err(BlobError::Integrity(_))
+        ));
+        // Another size.
+        std::fs::write(&path, b"short").expect("swap");
+        assert!(matches!(
+            toolkit.read_blob(&blob_ref),
+            Err(BlobError::Integrity(_))
+        ));
+        // A FIFO is refused without blocking.
+        std::fs::remove_file(&path).expect("remove");
+        nix::unistd::mkfifo(&path, nix::sys::stat::Mode::from_bits_truncate(0o600))
+            .expect("mkfifo");
+        assert!(matches!(
+            toolkit.read_blob(&blob_ref),
+            Err(BlobError::Integrity(_))
+        ));
+    }
+
+    /// Puts and promotes of the same blob racing each other (fan-out sends, retried events) all
+    /// succeed: a staged file a concurrent put replaced, or a concurrent promote already moved or
+    /// handed over, is not an integrity failure (A-56 review).
+    #[cfg(unix)]
+    #[test]
+    fn concurrent_puts_and_promotes_of_the_same_blob_all_succeed() {
+        let (toolkit, root) = test_toolkit();
+        let failures = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let workers: Vec<_> = (0..4)
+            .map(|_| {
+                let toolkit = toolkit.clone();
+                let failures = failures.clone();
+                std::thread::spawn(move || {
+                    for _ in 0..150 {
+                        let result = toolkit
+                            .put_bytes(b"the same bytes", "same.txt", "text/plain")
+                            .and_then(|blob_ref| toolkit.promote(&blob_ref));
+                        if let Err(err) = result {
+                            failures.lock().unwrap().push(err.to_string());
+                        }
+                    }
+                })
+            })
+            .collect();
+        for worker in workers {
+            worker.join().expect("worker");
+        }
+        let failures = failures.lock().unwrap();
+        assert!(
+            failures.is_empty(),
+            "{} failures, e.g. {:?}",
+            failures.len(),
+            failures.first()
+        );
+        drop(root);
+    }
+
+    /// A temporary that a crashed put left in staging ages out with the staging GC.
+    #[test]
+    fn staging_gc_removes_temporaries_left_by_a_crash() {
+        let (toolkit, root) = test_toolkit();
+        let blob_ref = toolkit
+            .put_bytes(b"staged", "staged.txt", "text/plain")
+            .expect("put_bytes");
+        let dir = root
+            .path
+            .join("staging")
+            .join(BlobToolkit::prefix(&blob_ref.blob_name));
+        let temp = dir.join(format!(".{}.deadbeef.tmp", blob_ref.blob_name));
+        std::fs::write(&temp, b"partial").expect("temp");
+        let later = std::time::SystemTime::now() + Duration::from_secs(48 * 3600);
+        let report = toolkit
+            .cleanup_staging_orphans_with_now(24, true, later)
+            .expect("gc");
+        assert!(report.errors.is_empty(), "{:?}", report.errors);
+        assert!(!temp.exists());
     }
 
     #[test]
