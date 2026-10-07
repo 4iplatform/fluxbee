@@ -4,8 +4,26 @@
 (0.1.57 binds; 0.1.58 Syncthing addresses and folders, with A-50; 0.1.59 Syncthing off public
 infrastructure; A-47 closed). Revision 10 applies the operator's D30–D32 (2026-10-06): no observe
 phase and no runtime check, one SSH door on the egress, SSH only inside `add_hive`. It folds in what
-DTAP round 6 found in revision 9 and still applies (§8). A focused re-check of §3.1–§3.3, §3.6–§3.9
-and §6 comes before stage 4.
+DTAP round 6 found in revision 9 and still applies (§8). Also live since: 0.1.60 (A-51, A-52), 0.1.61
+(D32/A-54), 0.1.62 (A-59, A-57), 0.1.63 (A-58, A-56).
+
+**PARKED (operator, 2026-10-07).** *"Cerrá temas importantes y documentá los menores, costo/beneficio
+… problemas en la red local interna… es importante pero puede esperar si no anda lo operativo."* The
+reachable holes are closed. From outside, the ingress answers only the edge port and SSH by key
+(password and keyboard-interactive off, checked on PROD 2026-10-07). Archi, the admin and Syncthing
+are off public infrastructure (stages 1–3). The egress door is key-only too. What remains below is
+internal-network or defense-in-depth work, parked until the operational track (Fluxbee Cloud
+connection, then implementation nodes) needs it, and **required before the first customer
+installation** where marked.
+
+| Item | What it protects against | Exposure today | Cost | Before a customer? |
+|---|---|---|---|---|
+| Stage 4: host firewall (§3.1–§3.7) and revision 11 with DTAP round 7's 56 findings (docs/audits/2026-10-05-host-posture-dtap-panel.md) | A LAN peer reaching internal ports; SSH on non-internal interfaces | Internal network only; the internal ports are authenticated (mTLS, HMAC) | High: a revision, a panel round, implementation, a gate | Yes |
+| A-55: the egress SSH door; D33 (its key in the vault, egress only) | Access to the box that NATs the internal network | The office network (192.168.8.0/24), key only | Low | Yes (close the door) |
+| A-48: `remove_hive` revokes nothing | A removed box still on the LAN rejoining with its old leaf and key | Internal | Medium: the A-48 design in §3.8 | Yes |
+| A-49: unsigned apt repo (waits for O9) | Whoever answers for the repo address installs root software on the motherbee | Internal network | Medium, after O9 | Yes |
+| A-60: managed nodes run as root | A compromised node is root on its host | Local | Medium; to be evaluated | No |
+| The `active/` blob GC walks by path (A-56 residual) | Root deleting outside the tree if a prefix dir is swapped | None while `gc.apply` is off (the default) | Low | Only if the GC is turned on |
 
 **History:**
 
