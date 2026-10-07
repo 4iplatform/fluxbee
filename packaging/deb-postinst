@@ -40,9 +40,10 @@ else
 fi
 
 install -d /run/fluxbee/routers
-# Not dist: the motherbee's dist is root's and Syncthing only reads it, which the orchestrator
-# sets at every start (FINDINGS A-51).
-chown -R fluxbee:fluxbee /var/lib/fluxbee/syncthing /var/lib/fluxbee/blob 2>/dev/null || true
+# No recursive chown here. The orchestrator sets the owners at every start: dist (A-51), blob/ and
+# its folders (A-56), the Syncthing home (A-58). The nodes give each blob the owner of the folder
+# it lands in. A chown -R at each install used to hide blobs that root wrote and Syncthing could
+# not read.
 
 # Seed a config if none exists yet (the operator edits this before first-boot).
 if [ ! -f /etc/fluxbee/hive.yaml ] && [ -f /etc/fluxbee/hive.yaml.example ]; then

@@ -346,9 +346,8 @@ sudo install -d "$RUN_DIR/routers"
 sudo install -d "$STATE_ROOT_DIR"
 ensure_fluxbee_system_user
 sudo chown -R fluxbee:fluxbee "$STATE_DIR/syncthing"
-sudo chown -R fluxbee:fluxbee "$STATE_DIR/blob"
-# Not dist: the orchestrator sets its owner by role at every start (root on the motherbee, the
-# Syncthing user on a spoke; FINDINGS A-51).
+# Not dist or blob: the orchestrator sets their owners at every start (dist by role, A-51; blob/
+# and its folders, A-56), and the nodes give each blob the owner of the folder it lands in.
 
 if [[ "$CLEAN_RUNTIME_VOLATILE_ON_INSTALL" == "1" ]]; then
   stop_install_service "sy-orchestrator"
@@ -1280,7 +1279,13 @@ if [[ "$APPLY_DEV_OWNERSHIP" == "1" ]]; then
   echo "Applying ownership for test/dev user: $INSTALL_OWNER"
   sudo chown -R "$INSTALL_OWNER":"$INSTALL_OWNER" "$CONFIG_DIR" "$STATE_DIR" "$RUN_DIR"
   sudo chown "$INSTALL_OWNER":"$INSTALL_OWNER" "$CONFIG_DIR/sy-config-routes.yaml" "$CONFIG_DIR/hive.yaml" 2>/dev/null || true
-  sudo chown -R fluxbee:fluxbee "$STATE_DIR/syncthing" "$STATE_DIR/blob"
+  # The dev chown above gave everything to the dev user. The folders Syncthing serves go back to
+  # fluxbee; blob/, staging/ and agent-assets/ are root's, which the orchestrator sets at its
+  # next start (A-56).
+  sudo chown -R fluxbee:fluxbee "$STATE_DIR/syncthing"
+  for served in "$STATE_DIR/blob/active" "$STATE_DIR/blob/public"; do
+    if [[ -d "$served" ]]; then sudo chown -R fluxbee:fluxbee "$served"; fi
+  done
 fi
 
 echo "Installed config to $CONFIG_DIR, binaries to /usr/bin, core source repo to $STATE_DIR/dist/core/bin, systemd units, and runtime directories."

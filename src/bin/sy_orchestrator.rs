@@ -84,7 +84,8 @@ const SYNCTHING_BOOTSTRAP_TIMEOUT_SECS: u64 = 30;
 /// reconnection attempt, up to `reconnectionIntervalS` later (60 s by Syncthing's default).
 const SYNCTHING_PEER_CONNECT_TIMEOUT_SECS: u64 = 90;
 const SYNCTHING_HEALTH_TIMEOUT_SECS: u64 = 2;
-const SYNCTHING_INSTALL_USER: &str = "fluxbee";
+/// Syncthing runs as this user on every host (FINDINGS A-58); the orchestrator creates it.
+const SYNCTHING_SERVICE_USER: &str = "fluxbee";
 const SYNCTHING_SYNC_PORT_TCP: u16 = 22000;
 const SYNCTHING_SYNC_PORT_UDP: u16 = 22000;
 const SYNCTHING_DISCOVERY_PORT_UDP: u16 = 21027;
@@ -147,8 +148,6 @@ const DEFAULT_BLOB_SYNC_ENABLED: bool = false;
 const DEFAULT_BLOB_SYNC_TOOL: &str = "syncthing";
 const DEFAULT_BLOB_SYNC_API_PORT: u16 = 8384;
 const DEFAULT_BLOB_SYNC_DATA_DIR: &str = "/var/lib/fluxbee/syncthing";
-const DEFAULT_BLOB_SYNC_SERVICE_USER: &str = SYNCTHING_INSTALL_USER;
-const DEFAULT_BLOB_SYNC_ALLOW_ROOT_FALLBACK: bool = true;
 const DEFAULT_BLOB_GC_ENABLED: bool = false;
 const DEFAULT_BLOB_GC_INTERVAL_SECS: u64 = 3600;
 const DEFAULT_BLOB_GC_APPLY: bool = false;
@@ -401,8 +400,6 @@ struct BlobSyncSection {
     tool: Option<String>,
     api_port: Option<u16>,
     data_dir: Option<String>,
-    service_user: Option<String>,
-    allow_root_fallback: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -435,8 +432,6 @@ struct BlobRuntimeConfig {
     sync_tool: String,
     sync_api_port: u16,
     sync_data_dir: PathBuf,
-    sync_service_user: String,
-    sync_allow_root_fallback: bool,
     gc_enabled: bool,
     gc_interval_secs: u64,
     gc_apply: bool,
@@ -1490,8 +1485,14 @@ async fn bootstrap_local(
     if !startup_sync.sync_enabled {
         disable_blob_sync_runtime_local()?;
     } else if startup_sync.sync_enabled {
-        if let Err(err) =
-            ensure_blob_sync_runtime(&state.blob, &state.dist, state.is_motherbee, state.role).await
+        if let Err(err) = ensure_blob_sync_runtime(
+            &state.blob,
+            &state.dist,
+            state.is_motherbee,
+            state.role,
+            &state.hive_id,
+        )
+        .await
         {
             tracing::warn!(
                 error = %err,
@@ -1554,6 +1555,7 @@ async fn bootstrap_local(
             "persisted custom node reconcile failed during bootstrap"
         );
     }
+    hand_over_blob_folder_entries(&state.hive_id, &state.blob, &state.dist);
     Ok(())
 }
 
@@ -3217,7 +3219,14 @@ async fn wait_for_syncthing_folder_convergence(
     };
 
     if !service_active || !api_healthy {
-        ensure_blob_sync_runtime(desired_blob, desired_dist, state.is_motherbee, state.role).await?;
+        ensure_blob_sync_runtime(
+            desired_blob,
+            desired_dist,
+            state.is_motherbee,
+            state.role,
+            &state.hive_id,
+        )
+        .await?;
         service_active = systemd_is_active(SYNCTHING_SERVICE_NAME);
         api_healthy = if service_active {
             syncthing_api_healthy(desired_sync.sync_api_port).await
@@ -4588,6 +4597,7 @@ async fn apply_system_update_local(
                     &desired_dist,
                     state.is_motherbee,
                     state.role,
+                    &state.hive_id,
                 )
                 .await?;
                 Ok(vendor_update_result(outcome))
@@ -4915,8 +4925,6 @@ fn blob_runtime_from_hive(hive: &HiveFile) -> BlobRuntimeConfig {
     let mut sync_tool = DEFAULT_BLOB_SYNC_TOOL.to_string();
     let mut sync_api_port = DEFAULT_BLOB_SYNC_API_PORT;
     let mut sync_data_dir = PathBuf::from(DEFAULT_BLOB_SYNC_DATA_DIR);
-    let mut sync_service_user = DEFAULT_BLOB_SYNC_SERVICE_USER.to_string();
-    let mut sync_allow_root_fallback = DEFAULT_BLOB_SYNC_ALLOW_ROOT_FALLBACK;
     let mut gc_enabled = DEFAULT_BLOB_GC_ENABLED;
     let mut gc_interval_secs = DEFAULT_BLOB_GC_INTERVAL_SECS;
     let mut gc_apply = DEFAULT_BLOB_GC_APPLY;
@@ -4955,15 +4963,6 @@ fn blob_runtime_from_hive(hive: &HiveFile) -> BlobRuntimeConfig {
                     sync_data_dir = PathBuf::from(value);
                 }
             }
-            if let Some(value) = sync.service_user.as_ref() {
-                let value = value.trim();
-                if !value.is_empty() {
-                    sync_service_user = value.to_string();
-                }
-            }
-            if let Some(value) = sync.allow_root_fallback {
-                sync_allow_root_fallback = value;
-            }
         }
         if let Some(gc) = blob.gc.as_ref() {
             if let Some(value) = gc.enabled {
@@ -4992,8 +4991,6 @@ fn blob_runtime_from_hive(hive: &HiveFile) -> BlobRuntimeConfig {
         sync_tool,
         sync_api_port,
         sync_data_dir,
-        sync_service_user,
-        sync_allow_root_fallback,
         gc_enabled,
         gc_interval_secs,
         gc_apply,
@@ -5332,13 +5329,39 @@ fn ensure_dirs(
     fs::create_dir_all(opa_root.join("staged"))?;
     fs::create_dir_all(opa_root.join("backup"))?;
     fs::create_dir_all(storage_root.join("nats"))?;
+    ensure_syncthing_user()?;
+    // blob/ is root's and the Syncthing user only traverses it to its folders; staging/ is root's
+    // alone, links inside removed: nodes stage blobs there before they hand them to the folder
+    // Syncthing serves, and nobody else may touch those bytes (FINDINGS A-56). A failed pass is
+    // reported and runs again at the next start.
+    let mut root_trees_owned = Vec::new();
+    if blob.enabled || blob.public_sync_enabled {
+        ensure_blob_root_dir(&blob.path)?;
+    }
+    // Taking these trees back from the Syncthing user walks entries it could have planted: only
+    // where hard links to another user's files are protected, or a planted link to a root file
+    // would be re-owned too.
+    let can_take_back = hard_links_protected();
     if blob.enabled {
-        ensure_dir_permissions_0750(&blob.path)?;
         ensure_dir_permissions_0750(&blob.path.join("active"))?;
-        ensure_dir_permissions_0750(&blob.path.join("staging"))?;
+        if can_take_back {
+            root_trees_owned.push(own_tree_for_reading(&blob.path.join("staging"), 0, 0));
+        }
+    }
+    // agent-assets (SY.architect writes, ai.generic reads, both as root) is root's alone too: an
+    // upgraded hive got it from the old postinst's chown -R, and root acts there by path.
+    let agent_assets = blob.path.join("agent-assets");
+    if can_take_back && fs::symlink_metadata(&agent_assets).is_ok() {
+        root_trees_owned.push(own_tree_for_reading(&agent_assets, 0, 0));
+    }
+    if !can_take_back && (blob.enabled || blob.public_sync_enabled) {
+        root_trees_owned.push(Err(
+            "fs.protected_hardlinks is not 1: blob/staging and blob/agent-assets were not \
+             taken back"
+                .into(),
+        ));
     }
     if blob.public_sync_enabled {
-        ensure_dir_permissions_0750(&blob.path)?;
         ensure_dir_permissions_0750(&blob.path.join("public"))?;
     }
     // The syncthing HOME must exist whenever syncthing will RUN — and it runs for BLOB sync or
@@ -5348,32 +5371,28 @@ fn ensure_dirs(
     // `WorkingDirectory=/var/lib/fluxbee/syncthing`, systemd could not chdir there, and the
     // service failed 200/CHDIR in a restart loop forever — so the egress could never receive
     // core or vendor at all.
-    if blob.sync_enabled || (dist.sync_enabled && dist_sync_tool_is_syncthing(dist)) {
+    let syncthing_runs =
+        blob.sync_enabled || (dist.sync_enabled && dist_sync_tool_is_syncthing(dist));
+    if syncthing_runs {
         ensure_dir_permissions_0750(&blob.sync_data_dir)?;
+        // Its home is the Syncthing user's whenever it runs, the egress (dist sync only) included.
+        ensure_owned_dir(&blob.sync_data_dir, SYNCTHING_SERVICE_USER)?;
     }
-    if blob.sync_enabled && blob_sync_tool_is_syncthing(blob) {
-        let service_user = resolve_syncthing_service_user(blob)?;
-        if service_user == "root" {
-            ensure_owned_dir(&blob.path, "root")?;
-            if blob.enabled {
-                ensure_owned_dir(&blob.path.join("active"), "root")?;
-                ensure_owned_dir(&blob.path.join("staging"), "root")?;
-            }
-            if blob.public_sync_enabled {
-                ensure_owned_dir(&blob.path.join("public"), "root")?;
-            }
-            ensure_owned_dir(&blob.sync_data_dir, "root")?;
-        } else {
-            ensure_owned_dir(&blob.path, &service_user)?;
-            if blob.enabled {
-                ensure_owned_dir(&blob.path.join("active"), &service_user)?;
-                ensure_owned_dir(&blob.path.join("staging"), &service_user)?;
-            }
-            if blob.public_sync_enabled {
-                ensure_owned_dir(&blob.path.join("public"), &service_user)?;
-            }
-            ensure_owned_dir(&blob.sync_data_dir, &service_user)?;
-        }
+    for folder in served_blob_folders(blob, syncthing_runs) {
+        ensure_owned_dir(&folder, SYNCTHING_SERVICE_USER)?;
+    }
+    for err in root_trees_owned.into_iter().filter_map(Result::err) {
+        tracing::error!(error = %err, "could not make a blob tree root's");
+        append_drift_alert(
+            "posture",
+            "blob_root_tree_not_set",
+            "warning",
+            hive_id,
+            format!("blob/staging or blob/agent-assets was not made root's at this start: {err}"),
+            None,
+            None,
+            None,
+        );
     }
     fs::create_dir_all(&dist.path)?;
     fs::create_dir_all(dist.path.join("runtimes"))?;
@@ -5385,11 +5404,9 @@ fn ensure_dirs(
     // who writes what it receives there. A failed pass (chown -R exits 1 when a file vanishes
     // mid-walk) is reported and runs again at the next start: never a reason not to start.
     let owned = if is_motherbee {
-        let reader = resolve_syncthing_service_user(blob).unwrap_or_else(|_| "root".to_string());
-        Some(ensure_root_owned_tree(&dist.path, &reader))
+        Some(ensure_root_owned_tree(&dist.path, SYNCTHING_SERVICE_USER))
     } else if dist.sync_enabled && dist_sync_tool_is_syncthing(dist) {
-        let service_user = resolve_syncthing_service_user(blob)?;
-        Some(ensure_owned_tree(&dist.path, &service_user))
+        Some(ensure_owned_tree(&dist.path, SYNCTHING_SERVICE_USER))
     } else {
         None
     };
@@ -5412,6 +5429,7 @@ fn ensure_dirs(
             blob.path.clone(),
             blob.path.join("active"),
             blob.path.join("staging"),
+            blob.path.join("agent-assets"),
             blob.path.join("public"),
             blob.sync_data_dir.clone(),
             dist.path.clone(),
@@ -5789,35 +5807,62 @@ fn linux_user_primary_group(user: &str) -> Option<String> {
     }
 }
 
-fn resolve_syncthing_service_user(blob: &BlobRuntimeConfig) -> Result<String, OrchestratorError> {
-    let requested = blob.sync_service_user.trim();
-    let requested = if requested.is_empty() {
-        DEFAULT_BLOB_SYNC_SERVICE_USER
+/// Syncthing runs as its own user on every host (FINDINGS A-58). The motherbee's package and the
+/// ingress join create it; until 0.1.63 workers and the egress did not, and ran Syncthing as root.
+fn ensure_syncthing_user() -> Result<(), OrchestratorError> {
+    if linux_user_exists(SYNCTHING_SERVICE_USER) {
+        return Ok(());
+    }
+    tracing::warn!(
+        user = SYNCTHING_SERVICE_USER,
+        "creating the Syncthing user (A-58)"
+    );
+    let mut useradd = Command::new("useradd");
+    useradd.arg("--system");
+    // useradd --user-group refuses a group of the same name that already exists.
+    if linux_group_exists(SYNCTHING_SERVICE_USER) {
+        useradd.arg("-g").arg(SYNCTHING_SERVICE_USER);
     } else {
-        requested
+        useradd.arg("--user-group");
+    }
+    useradd.args([
+        "--home-dir",
+        "/var/lib/fluxbee",
+        "--no-create-home",
+        "--shell",
+        "/usr/sbin/nologin",
+        SYNCTHING_SERVICE_USER,
+    ]);
+    run_cmd(useradd, "create the Syncthing user")
+}
+
+fn linux_group_exists(group: &str) -> bool {
+    Command::new("getent")
+        .arg("group")
+        .arg(group)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success())
+}
+
+/// `blob/` is root's, and the Syncthing user only traverses it to the folders it serves (FINDINGS
+/// A-56): were it that user's, they could replace `staging/` or `public/` with a link.
+fn ensure_blob_root_dir(path: &Path) -> Result<(), OrchestratorError> {
+    let Some(dir) = open_managed_dir(path)? else {
+        return Ok(());
     };
-    if linux_user_exists(requested) {
-        return Ok(requested.to_string());
-    }
-    if blob.sync_allow_root_fallback {
-        tracing::warn!(
-            user = requested,
-            allow_root_fallback = blob.sync_allow_root_fallback,
-            "syncthing service user missing; using explicit root fallback"
-        );
-        return Ok("root".to_string());
-    }
-    Err(format!(
-        "linux user '{}' not found and blob.sync.allow_root_fallback=false",
-        requested
-    )
-    .into())
+    let (_, gid) = linux_user_ids(SYNCTHING_SERVICE_USER)?;
+    std::os::unix::fs::fchown(&dir, Some(0), Some(gid))?;
+    dir.set_permissions(fs::Permissions::from_mode(0o750))?;
+    Ok(())
 }
 
 /// Creates `path` when missing and opens it as the directory it must be, never through a symlink
-/// (FINDINGS A-51). Some of these sit inside a directory the Syncthing user owns (`blob/active`,
-/// `blob/staging`, `blob/public`), so that user can put a symlink, or a file, where one should
-/// be; root following a symlink would chmod or chown whatever it points at. Anything but a
+/// (FINDINGS A-51). Some of these are, or sit inside, a directory the Syncthing user owns
+/// (`blob/active`, `blob/public`, the Syncthing home, a spoke's dist; `blob/` itself until its first
+/// 0.1.63 start), so that user can put a symlink, or a file, where one should be; root following a
+/// symlink would chmod or chown whatever it points at. Anything but a
 /// directory is left alone (`None`) and `ensure_dirs` reports it: it is never followed, and never
 /// a reason for the orchestrator not to start, or that user could crash-loop it by planting one.
 fn open_managed_dir(path: &Path) -> Result<Option<fs::File>, OrchestratorError> {
@@ -5941,16 +5986,17 @@ fn own_tree_for_reading(path: &Path, uid: u32, gid: u32) -> Result<(), Orchestra
         .arg("l")
         .arg("-print")
         .arg("-delete");
-    let removed = run_cmd_output(find, "remove links under the dist tree")?;
+    let tree = path.display();
+    let removed = run_cmd_output(find, &format!("remove links under {tree}"))?;
     if !removed.trim().is_empty() {
-        tracing::warn!(links = %removed.trim(), "removed links under the dist tree (A-51)");
+        tracing::warn!(links = %removed.trim(), %tree, "removed links under a root-owned tree (A-51)");
     }
     let mut chown = Command::new("chown");
     chown.arg("-R").arg(format!("{uid}:{gid}")).arg(path);
-    run_cmd(chown, "chown the dist tree")?;
+    run_cmd(chown, &format!("chown {tree}"))?;
     let mut chmod = Command::new("chmod");
     chmod.arg("-R").arg("g+rX,go-w").arg(path);
-    run_cmd(chmod, "make the dist tree readable to its group")?;
+    run_cmd(chmod, &format!("make {tree} readable to its group"))?;
     dir.set_permissions(fs::Permissions::from_mode(0o750))?;
     Ok(())
 }
@@ -7241,7 +7287,8 @@ fn ensure_syncthing_installed() -> Result<bool, OrchestratorError> {
     Ok(true)
 }
 
-fn syncthing_unit_contents(blob: &BlobRuntimeConfig, service_user: &str) -> String {
+fn syncthing_unit_contents(blob: &BlobRuntimeConfig) -> String {
+    let service_user = SYNCTHING_SERVICE_USER;
     let service_group =
         linux_user_primary_group(service_user).unwrap_or_else(|| service_user.to_string());
     format!(
@@ -7328,15 +7375,10 @@ fn validate_unit_path_field(path: &Path, label: &str) -> Result<(), Orchestrator
 /// Writes the Syncthing unit when it differs. Returns whether it did: a running service keeps
 /// the unit it started with until it restarts.
 fn ensure_syncthing_unit(blob: &BlobRuntimeConfig) -> Result<bool, OrchestratorError> {
-    let service_user = resolve_syncthing_service_user(blob)?;
-    // SO-06: service_user and sync_data_dir are interpolated verbatim into a
-    // root-written systemd unit file; reject control chars / non-absolute paths
-    // that could break the unit or inject directives before writing it.
-    if service_user.chars().any(char::is_control) {
-        return Err("syncthing: service user contains control characters".into());
-    }
+    // SO-06: sync_data_dir is interpolated verbatim into a root-written systemd unit file; reject
+    // control chars / non-absolute paths that could break the unit or inject directives.
     validate_unit_path_field(&blob.sync_data_dir, "blob.sync.data_dir")?;
-    let unit_contents = syncthing_unit_contents(blob, &service_user);
+    let unit_contents = syncthing_unit_contents(blob);
     let unit_path =
         Path::new("/etc/systemd/system").join(format!("{SYNCTHING_SERVICE_NAME}.service"));
     let current = fs::read_to_string(&unit_path).unwrap_or_default();
@@ -10188,6 +10230,13 @@ fn ensure_syncthing_folder_marker(path: &Path) -> Result<bool, OrchestratorError
     {
         Ok(mut file) => {
             file.write_all(b"fluxbee syncthing marker\n")?;
+            // The marker belongs to whoever owns its folder, like everything Syncthing serves.
+            let folder = fs::symlink_metadata(path)?;
+            std::os::unix::fs::fchown(
+                &file,
+                Some(std::os::unix::fs::MetadataExt::uid(&folder)),
+                Some(std::os::unix::fs::MetadataExt::gid(&folder)),
+            )?;
             Ok(true)
         }
         Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => Ok(false),
@@ -10256,6 +10305,7 @@ async fn ensure_blob_sync_runtime(
     dist: &DistRuntimeConfig,
     is_motherbee: bool,
     role: HiveRole,
+    hive_id: &str,
 ) -> Result<SyncthingRuntimeOutcome, OrchestratorError> {
     let sync = effective_syncthing_runtime_config(blob, dist);
     if !sync.sync_enabled {
@@ -10271,8 +10321,38 @@ async fn ensure_blob_sync_runtime(
 
     let repaired_markers = ensure_syncthing_folder_markers(blob, dist, is_motherbee, role)?;
 
+    // Installed before anything is stopped: a vendor that cannot be installed now leaves the
+    // running Syncthing alone, and it is the one that brings the vendor (review F4).
     let binary_updated = ensure_syncthing_installed()?;
+    // A-58: until 0.1.63 workers and the egress ran Syncthing as root. Moving it to its own user is
+    // one visible step: stop it, hand over the trees it wrote, and start it under the new unit
+    // below. Never while it runs, or it would keep writing root's files (its index, for one). It
+    // is decided from the unit, the home's own files and the running process, so a switch that
+    // stopped halfway runs again.
+    let (uid, _) = linux_user_ids(SYNCTHING_SERVICE_USER)?;
+    let switched_user = syncthing_needs_handover(
+        installed_syncthing_unit_user().as_deref(),
+        &syncthing_home_owners(&sync.sync_data_dir),
+        syncthing_process_uid(),
+        uid,
+    );
+    if switched_user {
+        tracing::warn!(
+            to = SYNCTHING_SERVICE_USER,
+            "Syncthing moves to its own user (A-58): stopping it and handing its trees over"
+        );
+        if systemd_is_active(SYNCTHING_SERVICE_NAME) {
+            systemd_stop(SYNCTHING_SERVICE_NAME)?;
+        }
+        hand_over_syncthing_trees(blob, dist, is_motherbee)?;
+    }
     let unit_changed = ensure_syncthing_unit(&sync)?;
+    if switched_user && !unit_changed {
+        // The unit file already named the user but systemd may still hold the old definition.
+        let mut daemon_reload = Command::new("systemctl");
+        daemon_reload.arg("daemon-reload");
+        run_cmd(daemon_reload, "systemctl daemon-reload")?;
+    }
     ensure_syncthing_firewall_local();
     // Restart a stale Syncthing now, before the checks below: they already use the new unit's
     // port and home.
@@ -10327,10 +10407,328 @@ async fn ensure_blob_sync_runtime(
         api_port = sync.sync_api_port,
         "blob sync service healthy"
     );
+    if switched_user {
+        append_drift_alert(
+            "posture",
+            "syncthing_user_switched",
+            "info",
+            hive_id,
+            format!(
+                "Syncthing was not running as {SYNCTHING_SERVICE_USER}: it was stopped, its home, \
+                 blob folders and dist were handed over, and it now runs healthy as \
+                 {SYNCTHING_SERVICE_USER} (A-58)"
+            ),
+            None,
+            None,
+            None,
+        );
+    }
     Ok(SyncthingRuntimeOutcome {
         binary_updated,
-        restarted: stale || folders_repaired,
+        restarted: stale || folders_repaired || switched_user,
     })
+}
+
+/// The blob folders Syncthing serves on this hive: `active/` with blob sync, `public/` with the
+/// public channel. Both belong to the Syncthing user (FINDINGS A-56).
+fn served_blob_folders(blob: &BlobRuntimeConfig, syncthing_runs: bool) -> Vec<PathBuf> {
+    let mut folders = Vec::new();
+    if !syncthing_runs || !blob_sync_tool_is_syncthing(blob) {
+        return folders;
+    }
+    if blob.enabled && blob.sync_enabled {
+        folders.push(blob_sync_folder_path(blob));
+    }
+    if blob.public_sync_enabled {
+        folders.push(blob_public_sync_folder_path(blob));
+    }
+    folders
+}
+
+/// What root left in the blob folders Syncthing serves, Syncthing can never read: blobs written
+/// before 0.1.63, or by a node still on an older SDK (FINDINGS A-56). At every boot, after the
+/// rebind (no old writer is left then), they go to the Syncthing user, and an alert says how many:
+/// the old postinst's chown -R did the same in silence. `chown -R` walks by descriptor and never
+/// follows a link; it runs only where hard links to another user's files are protected.
+fn hand_over_blob_folder_entries(
+    hive_id: &str,
+    blob: &BlobRuntimeConfig,
+    dist: &DistRuntimeConfig,
+) {
+    let syncthing_runs =
+        blob.sync_enabled || (dist.sync_enabled && dist_sync_tool_is_syncthing(dist));
+    let folders: Vec<PathBuf> = served_blob_folders(blob, syncthing_runs)
+        .into_iter()
+        .filter(|folder| fs::symlink_metadata(folder).is_ok_and(|meta| meta.is_dir()))
+        .collect();
+    if folders.is_empty() {
+        return;
+    }
+    if !hard_links_protected() {
+        append_drift_alert(
+            "posture",
+            "blob_handover_skipped",
+            "warning",
+            hive_id,
+            "fs.protected_hardlinks is not 1: the blob folders were not handed to the Syncthing user"
+                .to_string(),
+            None,
+            None,
+            None,
+        );
+        return;
+    }
+    for folder in folders {
+        let label = folder
+            .file_name()
+            .map(|name| name.to_string_lossy().to_string())
+            .unwrap_or_default();
+        let foreign = match count_entries_not_the_syncthing_users(&folder) {
+            Ok(count) => count,
+            Err(err) => {
+                tracing::warn!(folder = %folder.display(), error = %err, "could not count blob entries; retried at the next start");
+                continue;
+            }
+        };
+        if foreign == 0 {
+            continue;
+        }
+        // Each entry is changed from its own directory (`-execdir`, `chown -h`), never through a
+        // path a link could redirect. Entries that vanish mid-walk are fine; the recount judges.
+        let mut chown = Command::new("find");
+        chown
+            .arg("-P")
+            .arg(&folder)
+            .arg("-ignore_readdir_race")
+            .args(not_the_syncthing_users_predicate())
+            .arg("-execdir")
+            .arg("chown")
+            .arg("-h")
+            .arg(format!("{SYNCTHING_SERVICE_USER}:{SYNCTHING_SERVICE_USER}"))
+            .arg("{}")
+            .arg("+");
+        let _ = chown.status();
+        let left = count_entries_not_the_syncthing_users(&folder).unwrap_or(foreign);
+        let (kind, severity, message) = if left == 0 {
+            (
+                format!("blob_entries_handed_over:{label}"),
+                "warning",
+                format!(
+                    "{foreign} entries under {} were not the Syncthing user's (written by root \
+                     before 0.1.63, or by a node on an older SDK) and Syncthing could not read \
+                     them; handed over",
+                    folder.display()
+                ),
+            )
+        } else {
+            (
+                format!("blob_entries_not_handed_over:{label}"),
+                "critical",
+                format!(
+                    "{left} of {foreign} entries under {} are still not the Syncthing user's \
+                     after the hand-over",
+                    folder.display()
+                ),
+            )
+        };
+        tracing::warn!(folder = %folder.display(), entries = foreign, left, %kind, "blob folder entries were not the Syncthing user's");
+        append_drift_alert(
+            "posture", &kind, severity, hive_id, message, None, None, None,
+        );
+    }
+}
+
+/// Whether the kernel stops a user from hard-linking another user's files
+/// (`fs.protected_hardlinks`): a tree that user wrote can then be re-owned without reaching outside.
+fn hard_links_protected() -> bool {
+    fs::read_to_string("/proc/sys/fs/protected_hardlinks").is_ok_and(|v| v.trim() == "1")
+}
+
+/// `find` tests for an entry another user or group owns.
+fn not_the_syncthing_users_predicate() -> [&'static str; 9] {
+    [
+        "(",
+        "!",
+        "-user",
+        SYNCTHING_SERVICE_USER,
+        "-o",
+        "!",
+        "-group",
+        SYNCTHING_SERVICE_USER,
+        ")",
+    ]
+}
+
+/// The entries under `folder` that are not the Syncthing user's and group's. A walk that meets a
+/// vanished entry does not fail (`-ignore_readdir_race`).
+fn count_entries_not_the_syncthing_users(folder: &Path) -> Result<usize, OrchestratorError> {
+    let mut find = Command::new("find");
+    find.arg("-P")
+        .arg(folder)
+        .arg("-ignore_readdir_race")
+        .args(not_the_syncthing_users_predicate())
+        .args(["-printf", "."]);
+    Ok(
+        run_cmd_output(find, "count blob entries not the Syncthing user's")?
+            .trim()
+            .len(),
+    )
+}
+
+/// Syncthing's own per-file errors in the blob folders, reported once when they appear or their
+/// count changes (FINDINGS A-56): a file it cannot read never makes the folder unhealthy, so the
+/// folder health alone would never show it.
+fn report_blob_folder_errors(hive_id: &str, sync: &BlobRuntimeConfig, blob: &BlobRuntimeConfig) {
+    static REPORTED: OnceLock<std::sync::Mutex<HashMap<String, usize>>> = OnceLock::new();
+    let mut folders = Vec::new();
+    if blob.enabled && blob.sync_enabled && blob_sync_tool_is_syncthing(blob) {
+        folders.push(SYNCTHING_FOLDER_BLOB_ID);
+    }
+    if blob.public_sync_enabled && blob_sync_tool_is_syncthing(blob) {
+        folders.push(SYNCTHING_FOLDER_BLOB_PUBLIC_ID);
+    }
+    for folder in folders {
+        let (count, first) = match syncthing_folder_errors(sync, folder) {
+            Ok(errors) => errors,
+            Err(err) => {
+                tracing::debug!(folder, error = %err, "could not read Syncthing folder errors");
+                continue;
+            }
+        };
+        let before = REPORTED
+            .get_or_init(Default::default)
+            .lock()
+            .map(|mut reported| reported.insert(folder.to_string(), count))
+            .ok()
+            .flatten()
+            .unwrap_or(0);
+        if count > 0 && count != before {
+            tracing::warn!(folder, errors = count, first = ?first, "Syncthing reports file errors");
+            append_drift_alert(
+                "syncthing",
+                &format!("folder_errors:{folder}"),
+                "warning",
+                hive_id,
+                format!(
+                    "Syncthing reports {count} file errors in {folder}{}",
+                    first.map(|f| format!(", e.g. {f}")).unwrap_or_default()
+                ),
+                None,
+                None,
+                None,
+            );
+        } else if count == 0 && before > 0 {
+            tracing::info!(folder, "Syncthing folder errors cleared");
+        }
+    }
+}
+
+/// The number of per-file errors Syncthing reports for a folder (at most 100) and the first one.
+fn syncthing_folder_errors(
+    sync: &BlobRuntimeConfig,
+    folder_id: &str,
+) -> Result<(usize, Option<String>), OrchestratorError> {
+    let api_key = syncthing_api_key(sync)?;
+    let endpoint = format!(
+        "http://127.0.0.1:{}/rest/folder/errors?folder={}&perpage=100",
+        sync.sync_api_port, folder_id
+    );
+    let mut cmd = Command::new("curl");
+    cmd.arg("-fsS")
+        .arg("--max-time")
+        .arg("10")
+        .arg("-H")
+        .arg(format!("X-API-Key: {}", api_key))
+        .arg(&endpoint);
+    let out = run_cmd_output(cmd, &format!("syncthing folder errors folder={folder_id}"))?;
+    let payload: serde_json::Value = serde_json::from_str(&out).map_err(|err| {
+        format!("invalid syncthing folder/errors payload for folder '{folder_id}': {err}")
+    })?;
+    let errors = payload
+        .get("errors")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
+    let first = errors.first().map(|error| {
+        format!(
+            "{}: {}",
+            error.get("path").and_then(|v| v.as_str()).unwrap_or("?"),
+            error.get("error").and_then(|v| v.as_str()).unwrap_or("?")
+        )
+    });
+    Ok((errors.len(), first))
+}
+
+/// The `User=` of the installed Syncthing unit, when there is one.
+fn installed_syncthing_unit_user() -> Option<String> {
+    let unit_path =
+        Path::new("/etc/systemd/system").join(format!("{SYNCTHING_SERVICE_NAME}.service"));
+    syncthing_unit_user(&fs::read_to_string(unit_path).ok()?)
+}
+
+/// Whether Syncthing must move to its own user: the unit names another one, a file of its home
+/// belongs to someone else, or the running process is another user's (A-58).
+fn syncthing_needs_handover(
+    unit_user: Option<&str>,
+    home_owners: &[u32],
+    process_uid: Option<u32>,
+    syncthing_uid: u32,
+) -> bool {
+    unit_user.is_some_and(|user| user != SYNCTHING_SERVICE_USER)
+        || home_owners.iter().any(|owner| *owner != syncthing_uid)
+        || process_uid.is_some_and(|uid| uid != syncthing_uid)
+}
+
+/// The owners of the files Syncthing keeps in its home: its config and its identity.
+fn syncthing_home_owners(home: &Path) -> Vec<u32> {
+    ["config.xml", "cert.pem", "key.pem"]
+        .iter()
+        .filter_map(|name| fs::symlink_metadata(home.join(name)).ok())
+        .map(|meta| std::os::unix::fs::MetadataExt::uid(&meta))
+        .collect()
+}
+
+/// The real uid of the running Syncthing, when it runs. Only once the process is Syncthing itself:
+/// systemd sets MainPID at the fork, and its executor runs as root until it drops to the unit's
+/// user, which is not a Syncthing running as root.
+fn syncthing_process_uid() -> Option<u32> {
+    let props = systemd_unit_show(SYNCTHING_SERVICE_NAME, &["MainPID"]);
+    let pid = parse_systemd_u64(props.get("MainPID")).filter(|pid| *pid > 0)?;
+    if fs::read_to_string(format!("/proc/{pid}/comm")).ok()?.trim() != "syncthing" {
+        return None;
+    }
+    let status = fs::read_to_string(format!("/proc/{pid}/status")).ok()?;
+    status
+        .lines()
+        .find_map(|line| line.strip_prefix("Uid:"))?
+        .split_whitespace()
+        .next()?
+        .parse()
+        .ok()
+}
+
+fn syncthing_unit_user(unit: &str) -> Option<String> {
+    unit.lines()
+        .find_map(|line| line.trim().strip_prefix("User="))
+        .map(|user| user.trim().to_string())
+        .filter(|user| !user.is_empty())
+}
+
+/// The trees a root Syncthing wrote, handed to the Syncthing user before it runs as that user
+/// (A-58): its home, the blob folders it serves, and a spoke's dist.
+fn hand_over_syncthing_trees(
+    blob: &BlobRuntimeConfig,
+    dist: &DistRuntimeConfig,
+    is_motherbee: bool,
+) -> Result<(), OrchestratorError> {
+    ensure_owned_tree(&blob.sync_data_dir, SYNCTHING_SERVICE_USER)?;
+    for folder in served_blob_folders(blob, true) {
+        ensure_owned_tree(&folder, SYNCTHING_SERVICE_USER)?;
+    }
+    if !is_motherbee && dist.sync_enabled && dist_sync_tool_is_syncthing(dist) {
+        ensure_owned_tree(&dist.path, SYNCTHING_SERVICE_USER)?;
+    }
+    Ok(())
 }
 
 fn disable_blob_sync_runtime_local() -> Result<(), OrchestratorError> {
@@ -10394,8 +10792,14 @@ async fn watchdog_blob_sync(state: &OrchestratorState) -> Result<(), Orchestrato
 
     if changed {
         tracing::info!("blob/dist sync config changed in hive.yaml; reconciling syncthing runtime");
-        ensure_blob_sync_runtime(&desired_blob, &desired_dist, state.is_motherbee, state.role)
-            .await?;
+        ensure_blob_sync_runtime(
+            &desired_blob,
+            &desired_dist,
+            state.is_motherbee,
+            state.role,
+            &state.hive_id,
+        )
+        .await?;
         return Ok(());
     }
 
@@ -10470,6 +10874,9 @@ async fn watchdog_blob_sync(state: &OrchestratorState) -> Result<(), Orchestrato
             }
         }
     }
+    if service_active && api_healthy {
+        report_blob_folder_errors(&state.hive_id, &desired_sync, &desired_blob);
+    }
     if service_active && api_healthy && folders_healthy {
         return Ok(());
     }
@@ -10481,8 +10888,14 @@ async fn watchdog_blob_sync(state: &OrchestratorState) -> Result<(), Orchestrato
         folders_healthy = folders_healthy,
         "syncthing unhealthy; restarting"
     );
-    ensure_blob_sync_runtime(&desired_blob, &desired_dist, state.is_motherbee, state.role)
-            .await?;
+    ensure_blob_sync_runtime(
+        &desired_blob,
+        &desired_dist,
+        state.is_motherbee,
+        state.role,
+        &state.hive_id,
+    )
+    .await?;
     Ok(())
 }
 
@@ -23812,8 +24225,14 @@ async fn add_ingress_hive_flow(
     let desired_blob = current_blob_runtime_config(state);
     let desired_dist = current_dist_runtime_config(state);
     let desired_sync = effective_syncthing_runtime_config(&desired_blob, &desired_dist);
-    if let Err(err) =
-        ensure_blob_sync_runtime(&desired_blob, &desired_dist, state.is_motherbee, state.role).await
+    if let Err(err) = ensure_blob_sync_runtime(
+        &desired_blob,
+        &desired_dist,
+        state.is_motherbee,
+        state.role,
+        &state.hive_id,
+    )
+    .await
     {
         return err_payload(
             "SYNC_SETUP_FAILED",
@@ -26093,9 +26512,17 @@ mod tests {
         let gate = body
             .find("ensure_dir_permissions_0750(&blob.sync_data_dir)")
             .expect("la creacion del home de syncthing");
-        // Walk back to the `if` that guards it and assert dist is part of the condition.
+        // Walk back to the `if` that guards it and assert dist is part of the condition, following
+        // a named condition to its definition.
         let guard_start = body[..gate].rfind("if ").expect("su guard");
-        let guard = &body[guard_start..gate];
+        let mut guard = &body[guard_start..gate];
+        if guard.contains("if syncthing_runs") {
+            let def = body
+                .find("let syncthing_runs =")
+                .expect("syncthing_runs definition");
+            let def_end = def + body[def..].find(';').expect("end of the definition");
+            guard = &body[def..def_end];
+        }
         assert!(
             guard.contains("dist.sync_enabled"),
             "el home de syncthing debe crearse tambien cuando lo unico que lo necesita es el \
@@ -27888,8 +28315,6 @@ mod tests {
             sync_tool: "syncthing".to_string(),
             sync_api_port: 8384,
             sync_data_dir: PathBuf::from("/var/lib/fluxbee/syncthing"),
-            sync_service_user: DEFAULT_BLOB_SYNC_SERVICE_USER.to_string(),
-            sync_allow_root_fallback: DEFAULT_BLOB_SYNC_ALLOW_ROOT_FALLBACK,
             gc_enabled: DEFAULT_BLOB_GC_ENABLED,
             gc_interval_secs: DEFAULT_BLOB_GC_INTERVAL_SECS,
             gc_apply: DEFAULT_BLOB_GC_APPLY,
@@ -29909,22 +30334,55 @@ LISTEN 0 4096 0.0.0.0:notaport 0.0.0.0:* users:(("sy-architect",pid=1,fd=7))
         );
     }
 
+    /// A-58: Syncthing moves to its own user when the unit, a home file or the process is another
+    /// user's; never when all three are already the Syncthing user's (and nothing is installed).
     #[test]
-    fn resolve_syncthing_service_user_accepts_existing_user() {
-        let mut blob = sample_blob_config();
-        blob.sync_service_user = "root".to_string();
-        blob.sync_allow_root_fallback = false;
-        let effective = resolve_syncthing_service_user(&blob).expect("resolve user");
-        assert_eq!(effective, "root");
+    fn syncthing_moves_to_its_own_user_only_when_something_is_someone_elses() {
+        let uid = 110;
+        assert!(!syncthing_needs_handover(None, &[], None, uid));
+        assert!(!syncthing_needs_handover(
+            Some(SYNCTHING_SERVICE_USER),
+            &[uid, uid, uid],
+            Some(uid),
+            uid
+        ));
+        // A worker before 0.1.63: the unit says root.
+        assert!(syncthing_needs_handover(
+            Some("root"),
+            &[0, 0],
+            Some(0),
+            uid
+        ));
+        // A switch that stopped halfway: the unit was rewritten, a home file is still root's.
+        assert!(syncthing_needs_handover(
+            Some(SYNCTHING_SERVICE_USER),
+            &[uid, 0],
+            None,
+            uid
+        ));
+        // The unit was rewritten but systemd still runs the old one as root.
+        assert!(syncthing_needs_handover(
+            Some(SYNCTHING_SERVICE_USER),
+            &[uid],
+            Some(0),
+            uid
+        ));
     }
 
+    /// A-58: the switch reads the user of the installed unit; the unit always names `fluxbee`.
     #[test]
-    fn resolve_syncthing_service_user_rejects_missing_without_fallback() {
-        let mut blob = sample_blob_config();
-        blob.sync_service_user = format!("missing-{}", Uuid::new_v4());
-        blob.sync_allow_root_fallback = false;
-        let err = resolve_syncthing_service_user(&blob).expect_err("must fail");
-        assert!(err.to_string().contains("allow_root_fallback=false"));
+    fn the_syncthing_unit_names_its_own_user() {
+        let blob = sample_blob_config();
+        let unit = syncthing_unit_contents(&blob);
+        assert_eq!(
+            syncthing_unit_user(&unit).as_deref(),
+            Some(SYNCTHING_SERVICE_USER)
+        );
+        assert_eq!(
+            syncthing_unit_user("[Service]\nType=simple\nUser=root\nGroup=root\n").as_deref(),
+            Some("root")
+        );
+        assert_eq!(syncthing_unit_user("[Service]\nType=simple\n"), None);
     }
 
     #[test]
