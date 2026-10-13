@@ -25,19 +25,22 @@ Usage:
   fc_emulator.py --edge https://192.168.4.41:8443 --ich ich:<uuid> --token <tok> --insecure \
       create-tenant --name Acme --domain acme.example
 
+  # Every op but create-tenant acts on the customer's tenant (--tenant), never the root tenant:
+  # IO.cloud answers TENANT_ROOT_PROTECTED (docs/io-cloud-api.md §3).
+
   # store a provider token (the "guardar tokens" path)
   fc_emulator.py --edge https://192.168.4.41:8443 --ich ich:<uuid> --token <tok> --insecure \
-      put-token --key wapp_token:acme --value-token sk-live-xyz --resource-type bearer_token
+      --tenant tnt:<customer-uuid> put-token --key wapp_token:acme --value-token sk-live-xyz \
+      --resource-type bearer_token
 
-  # launch a node (the "lanzar nodos" path; needs a published io.wapp runtime). It runs in the
-  # customer's tenant: the root tenant (the default --tenant) only takes io.cloud and io.blob,
-  # and the orchestrator refuses any other IO node there with TENANT_ROOT_NOT_ALLOWED.
+  # launch a node (the "lanzar nodos" path; needs a published io.wapp runtime)
   fc_emulator.py --edge https://... --ich ich:<uuid> --token <tok> --cafile edge-ca.pem \
       --tenant tnt:<customer-uuid> provision-node --node-name IO.wapp.acme --runtime io.wapp
 
   # full security probe — proves the lock, not just the path:
-  #   no token -> 401, wrong token -> 401, correct token -> 200 (put_token stored)
-  fc_emulator.py --edge https://192.168.4.41:8443 --ich ich:<uuid> --token <tok> --insecure probe
+  #   no token -> 401, wrong token -> 401, correct token -> 200 (put_token stored, then deleted)
+  fc_emulator.py --edge https://192.168.4.41:8443 --ich ich:<uuid> --token <tok> --insecure \
+      --tenant tnt:<customer-uuid> probe
 
 TLS:
   --cafile <pem>   trust this CA/cert (real *.fluxbee.ai or a lab self-signed CA)
@@ -54,13 +57,12 @@ import urllib.error
 import urllib.request
 import uuid
 
-DEFAULT_TENANT = "tnt:00000000-0000-0000-0000-000000000001"
 
 
 class FluxbeeCloudClient:
     """A minimal, faithful external client for one externalized edge channel."""
 
-    def __init__(self, edge_base, ich, token=None, tenant=DEFAULT_TENANT,
+    def __init__(self, edge_base, ich, token=None, tenant=None,
                  cafile=None, insecure=False, timeout=15):
         self.url = "%s/e/%s" % (edge_base.rstrip("/"), ich)
         self.ich = ich
@@ -186,7 +188,13 @@ def cmd_probe(c, a):
         if not ok:
             failures.append(label)
 
-    probe_params = {"key": "wapp_token:probe", "value": {"token": "probe-secret"},
+    if not c.tenant:
+        print("probe needs --tenant (a customer tenant; never the root tenant)")
+        return 2
+    # A key of the probe's own tenant (keys share one namespace for the whole hive), deleted at
+    # the end so the probe leaves nothing behind.
+    probe_key = "probe:%s" % c.tenant
+    probe_params = {"key": probe_key, "value": {"token": "probe-secret"},
                     "resource_type": "bearer_token"}
 
     print("Probing %s" % c.url)
@@ -197,6 +205,9 @@ def cmd_probe(c, a):
     s, b = c.call("put_token", probe_params, token="__default__")
     check("correct-token accepted + stored", 200, s, extra_ok=_ok(b) and isinstance(b, dict)
           and isinstance(b.get("result"), dict) and b["result"].get("status") == "ok")
+    s, b = c.call("delete_token", {"key": probe_key})
+    check("probe key deleted", 200, s, extra_ok=_ok(b) and isinstance(b, dict)
+          and isinstance(b.get("result"), dict) and b["result"].get("deleted") is True)
 
     if failures:
         print("PROBE FAILED: %s" % ", ".join(failures))
@@ -210,7 +221,9 @@ def main():
     p.add_argument("--edge", required=True, help="edge public base URL, e.g. https://192.168.4.41:8443")
     p.add_argument("--ich", required=True, help="the externalized channel ICH (ich:<uuid>)")
     p.add_argument("--token", default=None, help="entry bearer token (from externalize; §8)")
-    p.add_argument("--tenant", default=DEFAULT_TENANT, help="tenant_id the Cloud asserts (§1.2)")
+    p.add_argument("--tenant", default=None,
+                   help="tenant_id the Cloud asserts: required by every op but create-tenant, "
+                        "never the root tenant (docs/io-cloud-api.md §3)")
     p.add_argument("--cafile", default=None, help="CA/cert PEM to trust for HTTPS")
     p.add_argument("--insecure", action="store_true", help="skip TLS verification (LAB ONLY)")
     p.add_argument("--timeout", type=int, default=15)

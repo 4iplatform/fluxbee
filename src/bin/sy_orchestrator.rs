@@ -19329,6 +19329,27 @@ fn take_test_ilk_delete_result() -> Option<serde_json::Value> {
         .take()
 }
 
+/// Each secret of a vault listing with the tenant it belongs to: a delete names that tenant, and
+/// SY.vault refuses one in another.
+fn vault_keys_with_tenant(listing: &serde_json::Value) -> Vec<(String, String)> {
+    listing
+        .get("secrets")
+        .and_then(|secrets| secrets.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|entry| {
+                    let key = entry.get("key").and_then(|key| key.as_str())?;
+                    let tenant_id = entry
+                        .get("metadata")
+                        .and_then(|metadata| metadata.get("tenant_id"))
+                        .and_then(|tenant| tenant.as_str())?;
+                    Some((key.to_string(), tenant_id.to_string()))
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 /// Routes vault list+delete through the primary Admin to purge every
 /// secret whose metadata is dedicated to `ilk_id`. List is open in vault, but
 /// delete requires admin-class privileges (the doomed ILK no longer exists at
@@ -19393,30 +19414,21 @@ async fn purge_vault_secrets_for_ilk(
         });
     }
 
-    let keys: Vec<String> = list_resp
-        .payload
-        .get("secrets")
-        .and_then(|secrets| secrets.as_array())
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|entry| entry.get("key").and_then(|key| key.as_str()))
-                .map(str::to_string)
-                .collect()
-        })
-        .unwrap_or_default();
+    let keys = vault_keys_with_tenant(&list_resp.payload);
 
     let scanned = keys.len();
     let mut deleted = 0usize;
     let mut errors: Vec<serde_json::Value> = Vec::new();
 
-    for key in keys {
+    for (key, tenant_id) in keys {
         let delete_resp = orchestrator_admin_command(
             state,
             AdminCommandRequest {
                 admin_target: &admin_target,
                 action: "vault_delete",
                 target: Some(PRIMARY_HIVE_ID),
-                params: serde_json::json!({ "key": key }),
+                // SY.vault deletes a key only in the tenant it belongs to.
+                params: serde_json::json!({ "key": key, "tenant_id": tenant_id }),
                 request_id: None,
                 timeout: Duration::from_secs(10),
             },
@@ -26281,6 +26293,34 @@ fn is_ingress_role(role: Option<&str>) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn teardown_deletes_each_secret_in_its_own_tenant() {
+        let listing = serde_json::json!({
+            "status": "ok",
+            "count": 2,
+            "secrets": [
+                {"key": "slack:acme:bot", "version": 1, "access_count": 0,
+                 "metadata": {"tenant_id": "tnt:11111111-1111-4111-8111-111111111111", "ilk": "ilk:x"}},
+                {"key": "openai:node", "version": 3, "access_count": 2,
+                 "metadata": {"tenant_id": "tnt:00000000-0000-0000-0000-000000000001", "ilk": "ilk:x"}},
+            ]
+        });
+        assert_eq!(
+            vault_keys_with_tenant(&listing),
+            vec![
+                (
+                    "slack:acme:bot".to_string(),
+                    "tnt:11111111-1111-4111-8111-111111111111".to_string()
+                ),
+                (
+                    "openai:node".to_string(),
+                    "tnt:00000000-0000-0000-0000-000000000001".to_string()
+                ),
+            ]
+        );
+        assert!(vault_keys_with_tenant(&serde_json::json!({})).is_empty());
+    }
 
     fn stamp_generation(
         root: &Path,

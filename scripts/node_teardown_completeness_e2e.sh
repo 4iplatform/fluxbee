@@ -39,7 +39,7 @@ map_body="$tmpdir/node_ilk_map.json"
 cleanup() {
   local _ec=$?
   http_call "DELETE" "$BASE/hives/$HIVE_ID/nodes/$NODE_NAME" "$kill_body" '{"force":true,"purge_instance":true}' >/dev/null 2>&1 || true
-  http_call "DELETE" "$BASE/hives/$HIVE_ID/vault/secrets/$(url_encode "$SECRET_KEY")" "$vault_body" >/dev/null 2>&1 || true
+  http_call "DELETE" "$BASE/hives/$HIVE_ID/vault/secrets/$(url_encode "$SECRET_KEY")?tenant_id=$(url_encode "$TENANT_ID")" "$vault_body" >/dev/null 2>&1 || true
   rm -rf "$tmpdir"
   return "$_ec"
 }
@@ -264,7 +264,7 @@ fi
 
 echo "Step 2/10: cleanup baseline node and secret"
 http_call "DELETE" "$BASE/hives/$HIVE_ID/nodes/$NODE_NAME" "$kill_body" '{"force":true,"purge_instance":true}' >/dev/null 2>&1 || true
-http_call "DELETE" "$BASE/hives/$HIVE_ID/vault/secrets/$(url_encode "$SECRET_KEY")" "$vault_body" >/dev/null 2>&1 || true
+http_call "DELETE" "$BASE/hives/$HIVE_ID/vault/secrets/$(url_encode "$SECRET_KEY")?tenant_id=$(url_encode "$TENANT_ID")" "$vault_body" >/dev/null 2>&1 || true
 
 echo "Step 3/10: spawn node"
 spawn1_http="$(spawn_node "$spawn1_body")"

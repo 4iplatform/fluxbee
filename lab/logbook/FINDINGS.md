@@ -995,6 +995,69 @@ Visto al arreglar los e2e de A-37, leyendo `src/router/mod.rs` y `src/shm/mod.rs
   binario generaría uno como root); si no, el `myID` del Syncthing en marcha. Nunca `config.xml`.
 - **Estado:** construido; lo ejercita el próximo join (el de A-48).
 
+### A-62 🟡 ESTACIONADO (costo/beneficio, 2026-10-13) — Cualquier nodo de la malla puede pedirle cualquier acción al admin
+
+- **Qué pasa (visto en el código el 2026-10-07):** el gateway interno del admin (`ADMIN_COMMAND`)
+  no mira quién llama, salvo para unas pocas acciones con compuerta propia: el relay de Cloud
+  (`authorize_cloud_relay`), `externalize` y `publish_artifact`. El resto (`add_hive`, `vault_get`,
+  `kill_node`, `opa_*`, `publish_cloud_endpoint`, que emite un bearer de Cloud nuevo y lo devuelve)
+  lo ejecuta para cualquier nodo conectado al router. Es así por diseño desde el gateway interno
+  (`docs/02-protocolo.md` §7.10: llamadores AI/WF/IO).
+- **Por qué no es urgente:** la lógica de los tenants no llega. Un WF no puede apuntar a `SY.*`
+  (`go/nodes/wf/wf-generic/node/actions.go`), y ai.generic solo manda `publish_artifact`, con la
+  acción fija. Hace falta un proceso de nodo comprometido, y los nodos ya corren como root (A-60):
+  quien lo compromete ya es root en el host.
+- **Cuándo mirarlo:** junto con A-60 (nodos sin root). Ahí sí pasa a importar quién puede pedir qué.
+  Forma probable: una lista por prefijo de rol, con lo de sistema solo para `SY.*`.
+
+### A-61 ✅ RESUELTO EN CÓDIGO (0.1.64) — Cloud podía pisar claves de otro tenant y leer identidades de cualquier tenant
+
+- **Qué pasaba (revisión de las fichas del equipo de Cloud, 2026-10-07):**
+  - `put_token` pisaba una clave existente de **cualquier** tenant, también de infraestructura (la
+    clave del proveedor de AI): SY.vault no miraba el tenant al escribir. Con el tenant raíz hasta
+    era "la suya".
+  - `get_ilk_details` por id leía el ILK de cualquier tenant, y las lecturas rápidas tomaban el
+    tenant de `params`.
+  - `edge_fanout_verify:<ich>` no estaba entre las claves reservadas.
+- **Arreglo (aprobado por el operador, 2026-10-13: *"primero io.cloud"*):**
+  - **SY.vault, para todos los llamadores:** un put de una clave de otro tenant es `KEY_TAKEN`
+    (aunque el valor sea el mismo) y nunca la mueve. Borrar, rotar y volver atrás llevan
+    `tenant_id` obligatorio, y una clave de otro tenant contesta `KEY_NOT_FOUND`. El admin pone el
+    raíz si no viene, igual que en el put; el orquestador pasa el tenant de cada clave al limpiar los
+    secretos de un nodo; los planes de Archi tienen el campo.
+  - **SY.identity:** ILK_GET acepta `tenant_id` y contesta `NOT_FOUND` para un ILK de otro tenant.
+    `update_tenant` rechaza el raíz (`TENANT_ROOT_PROTECTED`, se reescribe en cada arranque) y un
+    nombre o dominio de otro tenant (`TENANT_NAME_TAKEN` / `TENANT_DOMAIN_TAKEN`), y valida todo
+    antes de cambiar nada (antes un `status` malo dejaba el nombre nuevo puesto).
+  - **IO.cloud (regla 3):** el tenant va solo en la raíz del sobre (uno en `params` se rechaza),
+    nunca es el raíz, y todo lo que la op toca es de ese tenant. Operaciones nuevas `list_tokens`,
+    `delete_token` y `update_tenant`. Todo error lleva `error_code`.
+  - **SY.admin:** vuelve a exigir todo eso del lado del servidor para `IO.cloud`
+    (`enforce_cloud_relay_content`).
+- **Lo que casi se rompe:** agregar acciones a la superficie de Cloud hace que, por la malla, solo
+  io.cloud pueda pedirlas (ya pasó con `delete_ilk` el 2026-09-28). Se dejaron puntualmente
+  `delete_ilk`, `vault_list` y `vault_delete` al orquestador (limpieza de un nodo) y toda la
+  superficie a `SY.architect@motherbee`. A Archi ya le rechazaban por la malla `run_node`, `get_ilk`
+  y `delete_ilk` de sus comandos.
+- **Revisión adversarial (una ronda, 2026-10-13):** un MAJOR: el factory reset del .deb borraba
+  los secretos sin nombrar el tenant, así que con la regla nueva dejaba los de los tenants y después
+  no podía purgarlos (TENANT_HAS_SECRETS). Ahora borra cada clave en su tenant. Seis menores
+  arreglados:
+  - una clave de otro tenant se lee igual que una inexistente (mismo código y mismo texto; solo la
+    auditoría dice "denied");
+  - el tenant de Cloud se acepta solo en su forma canónica (las otras grafías del UUID del raíz
+    pasaban el chequeo exacto);
+  - el emulador de Cloud ya no usa el raíz por defecto y su prueba borra su clave;
+  - `KEY_TAKEN` y los `*_TAKEN` de tenant contestan 409, `TENANT_ROOT_PROTECTED` 403;
+  - dos bloques de doc corridos de lugar;
+  - una frase de la doc.
+- **Fuera de esto (decisión del operador):** una persona en varias empresas y los tenants
+  padre/hijo van a la charla de identity. Restringir `delete_ilk`/`restore_ilk` de Cloud a ILKs
+  humanos quedó en pregunta: el operador dudó, porque los tokens se asignan al ILK del nodo. Eso
+  último no cambia el ILK, solo la metadata del secreto.
+- **Contrato:** `docs/io-cloud-api.md`, reescrito al estado real (estaba en 3 operaciones y
+  configuración por `.env`).
+
 ### A-60 🔵 PARA EVALUAR (pedido del operador, 2026-10-06) — Los nodos administrados corren como root
 
 - **Qué pasa:** el orquestador lanza los nodos (IO, AI, WF) con `systemd-run` sin `User=`, así que

@@ -31,6 +31,11 @@ pub const CLOUD_OP_ACTIONS: &[(&str, &str)] = &[
     ("restore_ilk", "restore_ilk"),
     ("delete_tenant", "delete_tenant"),
     ("restore_tenant", "restore_tenant"),
+    // The tenant's credentials (2026-10-13): list them (metadata only, never the value), delete
+    // one, and edit the tenant's own name and domain. Always the tenant Cloud claims.
+    ("list_tokens", "vault_list"),
+    ("delete_token", "vault_delete"),
+    ("update_tenant", "update_tenant"),
 ];
 
 /// The admin actions IO.cloud may relay over the mesh — the security allowlist SY.admin enforces in
@@ -46,6 +51,9 @@ pub const CLOUD_EXPOSED_ACTIONS: &[&str] = &[
     "restore_ilk",
     "delete_tenant",
     "restore_tenant",
+    "vault_list",
+    "vault_delete",
+    "update_tenant",
 ];
 
 /// The [`CLOUD_EXPOSED_ACTIONS`] set computed from [`CLOUD_OP_ACTIONS`] (deduped, first-seen order).
@@ -96,31 +104,37 @@ pub fn is_cloud_local_op(op: &str) -> bool {
 pub fn cloud_action_catalog() -> Value {
     json!([
         { "op": "create_tenant", "category": "relay",
-          "summary": "Create (or find — idempotent by domain/name) a tenant. tenant_id ignored; params.name required, params.domain recommended as the dedup key." },
+          "summary": "Create (or find: idempotent by domain, then by name) a tenant. No envelope tenant_id: the tenant does not exist yet. params.name required, params.domain recommended (the dedup key)." },
+        { "op": "update_tenant", "category": "relay",
+          "summary": "Edit YOUR tenant (the envelope tenant_id): params.name and/or params.domain (\"\" or null clears the domain). A name or domain another tenant holds answers TENANT_NAME_TAKEN / TENANT_DOMAIN_TAKEN. Returns {status, tenant_id, sponsor_tenant_id}; read the tenant again to see it." },
         { "op": "put_token", "category": "relay",
-          "summary": "Store a provider credential in the hive vault. Needs tenant_id (root) + params.key ([a-z0-9:_-], GLOBAL namespace) + params.value + params.resource_type; optional owner_node (an existing IO.* node) scopes it." },
+          "summary": "Store a provider credential for YOUR tenant: its pool, or one IO.* node of it (params.owner_node). Needs the envelope tenant_id + params.key ([a-z0-9:_-], one namespace for the whole hive: a key another tenant holds answers KEY_TAKEN) + params.value + params.resource_type. Infrastructure keys are refused." },
+        { "op": "list_tokens", "category": "relay",
+          "summary": "List YOUR tenant's credentials: key, metadata, version, access_count and last_accessed_at, never the value. Needs the envelope tenant_id; optional params.resource_type, params.prefix, params.limit (default 200, max 1000)." },
+        { "op": "delete_token", "category": "relay",
+          "summary": "Delete one credential of YOUR tenant. Needs the envelope tenant_id + params.key. A key that does not exist or belongs to another tenant answers KEY_NOT_FOUND; infrastructure keys are refused." },
         { "op": "provision_node", "category": "relay",
-          "summary": "Spawn an IO.* node. Needs tenant_id (root) + params.node_name (IO.*) + params.runtime. NOT idempotent." },
+          "summary": "Spawn an IO.* node in YOUR tenant. Needs the envelope tenant_id + params.node_name (IO.*) + params.runtime. NOT idempotent." },
         { "op": "register_human", "category": "local",
-          "summary": "Register a human's identity (mint the human ilk). Needs tenant_id (root) + params = a frontdesk_handoff {type:'frontdesk_handoff', schema_version:1, operation:'complete_registration', subject:{display_name,email,phone?,company_name?,attributes?}}. IO.cloud provisions the temporary human ilk and hands it to SY.frontdesk.gov; returns the frontdesk verdict + ilk_id." },
+          "summary": "Register a human's identity (mint the human ilk) in YOUR tenant. Needs the envelope tenant_id + params = a frontdesk_handoff {type:'frontdesk_handoff', schema_version:1, operation:'complete_registration', subject:{display_name,email,phone?,company_name?,attributes?}}. IO.cloud provisions the temporary human ilk and hands it to SY.frontdesk.gov; returns the frontdesk verdict + ilk_id." },
         { "op": "list_cloud_actions", "category": "local",
           "summary": "Return this catalog (the actions IO.cloud offers: relay + local) so Cloud can discover its surface." },
         { "op": "get_ilk", "category": "local",
-          "summary": "FAST existence+subset read from the identity SHM (no round-trip). Selector: params.ilk_id (ilk:<uuid>) OR params.email (matches the ilk's cloud channel, ASCII case-insensitive). With params.tenant_id (tnt:<uuid>): O(1) tenant-scoped probe -> {exists, ilk?}. WITHOUT tenant_id (first-login flow: the email is all you have): cross-tenant search -> {exists, ilk?: set only when exactly one match, matches:[subset...] — every tenant's ilk for that email; each subset carries its tenant_id}. Subset = {ilk_id, ilk_type, registration_status, tenant_id, display_name}. For full identification + channels use get_ilk_details." },
+          "summary": "FAST existence+subset read from the identity SHM (no round-trip). Selector: params.ilk_id (ilk:<uuid>) OR params.email (matches the ilk's cloud channel, ASCII case-insensitive). With the envelope tenant_id: scoped to YOUR tenant -> {exists, ilk?}; an ilk of another tenant answers exists:false. WITHOUT it, by email only (first login: the email is all you have): cross-tenant search -> {exists, ilk?: set only when exactly one match, matches:[subset...], one per tenant, each with its tenant_id}. Subset = {ilk_id, ilk_type, registration_status, tenant_id, display_name}. For full identification + channels use get_ilk_details." },
         { "op": "get_tenant", "category": "local",
-          "summary": "FAST existence read of one tenant from the identity SHM. Needs params.tenant_id (tnt:<uuid>). Returns {exists, tenant_id, ilk_count}." },
+          "summary": "FAST existence read of YOUR tenant (the envelope tenant_id) from the identity SHM. Returns {exists, tenant_id, ilk_count}." },
         { "op": "list_ilks", "category": "local",
-          "summary": "List the ilks of ONE tenant from the identity SHM (subset each). Needs params.tenant_id (tnt:<uuid>). Returns {tenant_id, count, ilks:[{ilk_id, ilk_type, registration_status, display_name}]}." },
-        { "op": "delete_ilk", "category": "relay",
-          "summary": "Mark one ilk of YOUR tenant deleted (reversible: hidden, its email/channels stay reserved until the operator purges it). Needs tenant_id + params.ilk_id. Idempotent." },
-        { "op": "restore_ilk", "category": "relay",
-          "summary": "Undo delete_ilk for one ilk of YOUR tenant. Needs tenant_id + params.ilk_id. Refused while the tenant itself is deleted (restore the tenant)." },
-        { "op": "delete_tenant", "category": "relay",
-          "summary": "Mark YOUR tenant (the tenant_id you claim) deleted and, in cascade, its ilks (reversible; name/domain stay reserved). Refused while node identities live in it or it sponsors tenants." },
-        { "op": "restore_tenant", "category": "relay",
-          "summary": "Undo delete_tenant for YOUR tenant: it and the ilks its cascade marked come back." },
+          "summary": "List the ilks of YOUR tenant (the envelope tenant_id) from the identity SHM (subset each). Returns {tenant_id, count, ilks:[{ilk_id, ilk_type, registration_status, display_name}]}." },
         { "op": "get_ilk_details", "category": "relay",
-          "summary": "FULL identity read (all identification PII + channels + tenant) — relayed to SY.admin. Selector: params.ilk_id (ilk:<uuid>) OR params.email + params.tenant_id (pre-resolved locally to the canonical ilk_id, then relayed). Slower than get_ilk (a DB read); use it when you need everything." }
+          "summary": "FULL identity read (all identification PII + channels + tenant) of one ilk of YOUR tenant — relayed to SY.admin. Needs the envelope tenant_id + params.ilk_id (ilk:<uuid>) OR params.email. One that does not exist or belongs to another tenant answers NOT_FOUND. Slower than get_ilk (a DB read); use it when you need everything." },
+        { "op": "delete_ilk", "category": "relay",
+          "summary": "Mark one ilk of YOUR tenant deleted (reversible: hidden, its email/channels stay reserved until the operator purges it). Needs the envelope tenant_id + params.ilk_id. Idempotent." },
+        { "op": "restore_ilk", "category": "relay",
+          "summary": "Undo delete_ilk for one ilk of YOUR tenant. Needs the envelope tenant_id + params.ilk_id. Refused while the tenant itself is deleted (restore the tenant)." },
+        { "op": "delete_tenant", "category": "relay",
+          "summary": "Mark YOUR tenant (the envelope tenant_id) deleted and, in cascade, its ilks (reversible; name/domain stay reserved). Refused while node identities live in it or it sponsors tenants." },
+        { "op": "restore_tenant", "category": "relay",
+          "summary": "Undo delete_tenant for YOUR tenant: it and the ilks its cascade marked come back." }
     ])
 }
 
@@ -141,7 +155,10 @@ mod tests {
                 "delete_ilk",
                 "restore_ilk",
                 "delete_tenant",
-                "restore_tenant"
+                "restore_tenant",
+                "vault_list",
+                "vault_delete",
+                "update_tenant"
             ]
         );
     }
@@ -158,6 +175,15 @@ mod tests {
         assert_eq!(admin_action_for_cloud_op("create_tenant"), Some("create_tenant"));
         assert_eq!(admin_action_for_cloud_op("put_token"), Some("vault_put"));
         assert_eq!(admin_action_for_cloud_op("provision_node"), Some("run_node"));
+        assert_eq!(admin_action_for_cloud_op("list_tokens"), Some("vault_list"));
+        assert_eq!(
+            admin_action_for_cloud_op("delete_token"),
+            Some("vault_delete")
+        );
+        assert_eq!(
+            admin_action_for_cloud_op("update_tenant"),
+            Some("update_tenant")
+        );
         assert_eq!(admin_action_for_cloud_op("kill_node"), None);
     }
 

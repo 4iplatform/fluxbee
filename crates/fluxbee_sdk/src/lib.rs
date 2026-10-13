@@ -111,7 +111,7 @@ pub use timer::{
 pub use vault::{
     normalize_resource_type, vault_failure_is_transport, vault_key_is_valid, ResourceType, VaultCaller, VaultCallerOwned, VaultClient,
     VaultDeleteResponse, VaultError, VaultFilter, VaultGetMetadataRequest,
-    VaultGetMetadataResponse, VaultGetRequest, VaultGetResponse, VaultKeyRequest, VaultListRequest,
+    VaultGetMetadataResponse, VaultGetRequest, VaultGetResponse, VaultKeyRequest, VaultListRequest, VaultScopedKeyRequest,
     VaultListResponse, VaultMetadata, VaultPutRequest, VaultPutResponse, VaultRetryPolicy,
     VaultRollbackResponse, VaultRotateRequest, VaultRotateResponse, VaultSecretSummary,
     VaultValueResponse, VAULT_BOOT_RETRY_INTERVAL, VAULT_BOOT_WAIT, MSG_VAULT_DELETE, MSG_VAULT_DELETE_RESPONSE, MSG_VAULT_GET,

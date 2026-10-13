@@ -76,7 +76,7 @@ pub use crate::timer::{
 pub use crate::vault::{
     normalize_resource_type, ResourceType, VaultCaller, VaultCallerOwned, VaultClient,
     VaultDeleteResponse, VaultError, VaultFilter, VaultGetMetadataRequest,
-    VaultGetMetadataResponse, VaultGetRequest, VaultGetResponse, VaultKeyRequest, VaultListRequest,
+    VaultGetMetadataResponse, VaultGetRequest, VaultGetResponse, VaultKeyRequest, VaultListRequest, VaultScopedKeyRequest,
     VaultListResponse, VaultMetadata, VaultPutRequest, VaultPutResponse, VaultRetryPolicy,
     VaultRollbackResponse, VaultRotateRequest, VaultRotateResponse, VaultSecretSummary,
     VaultValueResponse, MSG_VAULT_DELETE, MSG_VAULT_DELETE_RESPONSE, MSG_VAULT_GET,

@@ -286,6 +286,11 @@ struct IlkProvisionRequest {
 #[serde(deny_unknown_fields)]
 struct IlkGetRequest {
     ilk_id: String,
+    /// Optional scope: when present the ilk must belong to this tenant, and one of another tenant
+    /// answers NOT_FOUND, exactly like a missing one. SY.admin always sends it for Fluxbee Cloud, so
+    /// Cloud reads only its own identities and learns nothing about the others.
+    #[serde(default)]
+    tenant_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -629,7 +634,11 @@ impl IdentityStore {
         None
     }
 
-    fn get_ilk_payload(&self, requested_ilk_id: &str) -> Result<Value, String> {
+    fn get_ilk_payload(
+        &self,
+        requested_ilk_id: &str,
+        tenant_scope: Option<&str>,
+    ) -> Result<Value, String> {
         let requested_ilk_id = requested_ilk_id.trim();
         if requested_ilk_id.is_empty() {
             return Err("INVALID_REQUEST".to_string());
@@ -645,6 +654,11 @@ impl IdentityStore {
         let Some(ilk) = self.ilks.get(&canonical_ilk_id).cloned() else {
             return Err("NOT_FOUND".to_string());
         };
+        if let Some(scope) = tenant_scope.map(str::trim).filter(|v| !v.is_empty()) {
+            if ilk.tenant_id != scope {
+                return Err("NOT_FOUND".to_string());
+            }
+        }
 
         let tenant = self.tenants.get(&ilk.tenant_id).cloned();
         let merged_aliases: Vec<Value> = self
@@ -1946,6 +1960,12 @@ impl IdentityStore {
     fn update_tenant(&mut self, req: TntUpdateRequest) -> Result<Value, String> {
         let tenant_id = req.tenant_id.trim().to_string();
         let _ = parse_prefixed_uuid(&tenant_id, "tnt")?;
+        // The root tenant is the system's own: SY.identity rewrites it at every boot and resync
+        // (`ensure_default_root_tenant`), so an edit would be undone later without a word. Refused
+        // up front, like delete, restore and purge.
+        if tenant_id == DEFAULT_ROOT_TENANT_ID {
+            return Err("TENANT_ROOT_PROTECTED".to_string());
+        }
         let sponsor_update =
             self.parse_optional_sponsor_update(&tenant_id, req.sponsor_tenant_id)?;
         if let Some(Some(sponsor)) = sponsor_update.as_ref() {
@@ -1954,26 +1974,72 @@ impl IdentityStore {
             }
         }
 
+        let current = self
+            .tenants
+            .get(&tenant_id)
+            .ok_or_else(|| "TENANT_NOT_FOUND".to_string())?;
+        if current.deleted_at_ms.is_some() {
+            return Err("TENANT_DELETED".to_string());
+        }
+
+        // Every field is checked before any changes, so a refused update leaves the tenant as it
+        // was.
+        let name = match req.name {
+            Some(name) => {
+                validate_non_empty("name", &name)?;
+                Some(name.trim().to_string())
+            }
+            None => None,
+        };
+        // `Some(None)` clears the domain (an empty string).
+        let domain = req
+            .domain
+            .map(|domain| normalize_tenant_domain(Some(&domain)));
+        let status = match req.status {
+            Some(status) => {
+                let status = status.trim().to_ascii_lowercase();
+                if !matches!(status.as_str(), "pending" | "active" | "suspended") {
+                    return Err("INVALID_REQUEST".to_string());
+                }
+                Some(status)
+            }
+            None => None,
+        };
+        // create_tenant finds a tenant by its domain, then by its name, so two tenants must never
+        // share either. Another tenant holding it, marked deleted or not (a deleted tenant keeps
+        // its name and domain reserved), refuses the change; keeping the current value is no change.
+        if let Some(name) = name.as_deref() {
+            if normalize_tenant_name(name) != normalize_tenant_name(&current.name)
+                && self.another_tenant_holds(&tenant_id, |other| {
+                    normalize_tenant_name(&other.name) == normalize_tenant_name(name)
+                })
+            {
+                return Err("TENANT_NAME_TAKEN".to_string());
+            }
+        }
+        if let Some(Some(domain)) = domain.as_ref() {
+            if normalize_tenant_domain(current.domain.as_deref()).as_deref()
+                != Some(domain.as_str())
+                && self.another_tenant_holds(&tenant_id, |other| {
+                    normalize_tenant_domain(other.domain.as_deref()).as_deref()
+                        == Some(domain.as_str())
+                })
+            {
+                return Err("TENANT_DOMAIN_TAKEN".to_string());
+            }
+        }
+
         let tenant = self
             .tenants
             .get_mut(&tenant_id)
             .ok_or_else(|| "TENANT_NOT_FOUND".to_string())?;
-        if tenant.deleted_at_ms.is_some() {
-            return Err("TENANT_DELETED".to_string());
+        if let Some(name) = name {
+            tenant.name = name;
         }
-
-        if let Some(name) = req.name {
-            validate_non_empty("name", &name)?;
-            tenant.name = name.trim().to_string();
+        if let Some(domain) = domain {
+            tenant.domain = domain;
         }
-        if let Some(domain) = req.domain {
-            tenant.domain = normalize_tenant_domain(Some(&domain));
-        }
-        if let Some(status) = req.status {
-            let status = status.trim().to_ascii_lowercase();
-            if !matches!(status.as_str(), "pending" | "active" | "suspended") {
-                return Err("INVALID_REQUEST".to_string());
-            }
+        if let Some(status) = status {
             tenant.status = status;
         }
         if let Some(settings) = req.settings {
@@ -1988,6 +2054,13 @@ impl IdentityStore {
             "tenant_id": tenant_id,
             "sponsor_tenant_id": tenant.sponsor_tenant_id,
         }))
+    }
+
+    /// Whether a tenant other than `tenant_id` matches `holds`.
+    fn another_tenant_holds(&self, tenant_id: &str, holds: impl Fn(&TenantRecord) -> bool) -> bool {
+        self.tenants
+            .values()
+            .any(|other| other.tenant_id != tenant_id && holds(other))
     }
 
     fn set_tenant_sponsor(&mut self, req: TntSetSponsorRequest) -> Result<Value, String> {
@@ -2737,7 +2810,10 @@ impl IdentityRuntime {
         let payload = match action {
             MSG_ILK_LIST => self.store.list_ilks_payload(payload_include_deleted(&msg.payload)),
             MSG_ILK_GET => match serde_json::from_value::<IlkGetRequest>(msg.payload.clone()) {
-                Ok(req) => match self.store.get_ilk_payload(&req.ilk_id) {
+                Ok(req) => match self
+                    .store
+                    .get_ilk_payload(&req.ilk_id, req.tenant_id.as_deref())
+                {
                     Ok(ok) => ok,
                     Err(code) => error_payload(&code, "failed to get ilk"),
                 },
@@ -8035,7 +8111,7 @@ mod tests {
         );
 
         let payload = store
-            .get_ilk_payload("ilk:44444444-4444-4444-4444-444444444444")
+            .get_ilk_payload("ilk:44444444-4444-4444-4444-444444444444", None)
             .expect("payload");
 
         assert_eq!(
@@ -8052,6 +8128,160 @@ mod tests {
                 .and_then(|value| value.get("tenant_id"))
                 .and_then(Value::as_str),
             Some("tnt:11111111-1111-1111-1111-111111111111")
+        );
+
+        // Scoped to its own tenant (through the alias too): the same payload.
+        assert!(store
+            .get_ilk_payload(
+                "ilk:44444444-4444-4444-4444-444444444444",
+                Some("tnt:11111111-1111-1111-1111-111111111111"),
+            )
+            .is_ok());
+        // Scoped to another tenant: NOT_FOUND, exactly like an ilk that does not exist.
+        for requested in [
+            "ilk:22222222-2222-2222-2222-222222222222",
+            "ilk:44444444-4444-4444-4444-444444444444",
+        ] {
+            assert_eq!(
+                store.get_ilk_payload(requested, Some("tnt:99999999-9999-4999-8999-999999999999")),
+                Err("NOT_FOUND".to_string())
+            );
+        }
+        assert_eq!(
+            store.get_ilk_payload(
+                "ilk:55555555-5555-4555-8555-555555555555",
+                Some("tnt:99999999-9999-4999-8999-999999999999"),
+            ),
+            Err("NOT_FOUND".to_string())
+        );
+    }
+
+    fn update_fixture() -> IdentityStore {
+        let mut store = IdentityStore::with_default_tenant();
+        for (tenant_id, name, domain, deleted) in [
+            (
+                "tnt:aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+                "Acme",
+                Some("acme.com"),
+                None,
+            ),
+            (
+                "tnt:bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+                "Globex",
+                Some("globex.com"),
+                None,
+            ),
+            (
+                "tnt:cccccccc-cccc-4ccc-8ccc-cccccccccccc",
+                "Initech",
+                Some("initech.com"),
+                Some(1),
+            ),
+        ] {
+            store.tenants.insert(
+                tenant_id.to_string(),
+                TenantRecord {
+                    tenant_id: tenant_id.to_string(),
+                    name: name.to_string(),
+                    domain: domain.map(str::to_string),
+                    status: "active".to_string(),
+                    settings: json!({}),
+                    sponsor_tenant_id: None,
+                    deleted_at_ms: deleted,
+                },
+            );
+        }
+        store
+    }
+
+    fn tenant_update(
+        tenant_id: &str,
+        name: Option<&str>,
+        domain: Option<&str>,
+    ) -> TntUpdateRequest {
+        TntUpdateRequest {
+            tenant_id: tenant_id.to_string(),
+            name: name.map(str::to_string),
+            domain: domain.map(str::to_string),
+            status: None,
+            settings: None,
+            sponsor_tenant_id: None,
+        }
+    }
+
+    #[test]
+    fn update_tenant_never_takes_another_tenants_name_or_domain() {
+        let acme = "tnt:aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+        let mut store = update_fixture();
+        let refused = [
+            // Another active tenant's name or domain, whatever the case and spaces.
+            (
+                tenant_update(acme, Some("  globex "), None),
+                "TENANT_NAME_TAKEN",
+            ),
+            (
+                tenant_update(acme, None, Some("GLOBEX.com")),
+                "TENANT_DOMAIN_TAKEN",
+            ),
+            // A tenant marked deleted keeps its name and domain reserved.
+            (
+                tenant_update(acme, Some("Initech"), None),
+                "TENANT_NAME_TAKEN",
+            ),
+            (
+                tenant_update(acme, None, Some("initech.com")),
+                "TENANT_DOMAIN_TAKEN",
+            ),
+            // The root tenant's name too.
+            (
+                tenant_update(acme, Some(DEFAULT_DEFAULT_TENANT_NAME), None),
+                "TENANT_NAME_TAKEN",
+            ),
+        ];
+        for (req, code) in refused {
+            assert_eq!(store.update_tenant(req), Err(code.to_string()));
+        }
+        let tenant = store.tenants.get(acme).unwrap();
+        assert_eq!(
+            (tenant.name.as_str(), tenant.domain.as_deref()),
+            ("Acme", Some("acme.com"))
+        );
+
+        // Its own current values (another spelling of them) and new free ones are fine.
+        store
+            .update_tenant(tenant_update(acme, Some("ACME"), Some("Acme.com")))
+            .unwrap();
+        store
+            .update_tenant(tenant_update(acme, Some("Acme S.A."), Some("acme.example")))
+            .unwrap();
+        let tenant = store.tenants.get(acme).unwrap();
+        assert_eq!(
+            (tenant.name.as_str(), tenant.domain.as_deref()),
+            ("Acme S.A.", Some("acme.example"))
+        );
+        // An empty domain clears it.
+        store
+            .update_tenant(tenant_update(acme, None, Some("")))
+            .unwrap();
+        assert_eq!(store.tenants.get(acme).unwrap().domain, None);
+    }
+
+    #[test]
+    fn update_tenant_refuses_the_root_and_changes_nothing_when_refused() {
+        let acme = "tnt:aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+        let mut store = update_fixture();
+        assert_eq!(
+            store.update_tenant(tenant_update(DEFAULT_ROOT_TENANT_ID, Some("Other"), None)),
+            Err("TENANT_ROOT_PROTECTED".to_string())
+        );
+        // A bad status after a good name: nothing changes (it used to keep the new name).
+        let mut req = tenant_update(acme, Some("Renamed"), Some("renamed.com"));
+        req.status = Some("bogus".to_string());
+        assert_eq!(store.update_tenant(req), Err("INVALID_REQUEST".to_string()));
+        let tenant = store.tenants.get(acme).unwrap();
+        assert_eq!(
+            (tenant.name.as_str(), tenant.domain.as_deref()),
+            ("Acme", Some("acme.com"))
         );
     }
 

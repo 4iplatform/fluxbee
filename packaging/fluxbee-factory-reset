@@ -492,9 +492,12 @@ def main():
         lambda i: i["ilk_id"])
 
     print("== [3/7] delete user vault secrets")
+    # Each key is deleted in the tenant it belongs to: SY.vault answers KEY_NOT_FOUND for a key
+    # named in another tenant, and admin fills in the root tenant when none is named.
     vault_fail = delete_until_empty(
         "secrets", lambda: user_secrets(hive_id),
-        lambda s: api("DELETE", "/hives/%s/vault/secrets/%s" % (q(hive_id), q(s["key"]))),
+        lambda s: api("DELETE", "/hives/%s/vault/secrets/%s?tenant_id=%s" % (
+            q(hive_id), q(s["key"]), q((s.get("metadata") or {}).get("tenant_id", "")))),
         lambda s: s["key"])
 
     print("== [4/7] delete tenants (all but the root)")

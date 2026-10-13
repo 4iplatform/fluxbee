@@ -16,8 +16,8 @@ use fluxbee_sdk::protocol::{
 };
 use fluxbee_sdk::{
     try_handle_default_node_status, NodeConfig, NodeSender, NodeUuidMode, OperationalRouteProfile,
-    RouteMatch, RouteTarget, RouterDispatcher, VaultFilter, VaultKeyRequest, VaultListRequest,
-    VaultMetadata, VaultRotateRequest, VaultSecretSummary, MSG_VAULT_DELETE,
+    RouteMatch, RouteTarget, RouterDispatcher, VaultFilter, VaultListRequest, VaultMetadata,
+    VaultRotateRequest, VaultScopedKeyRequest, VaultSecretSummary, MSG_VAULT_DELETE,
     MSG_VAULT_DELETE_RESPONSE, MSG_VAULT_GET, MSG_VAULT_GET_METADATA,
     MSG_VAULT_GET_METADATA_RESPONSE, MSG_VAULT_GET_RESPONSE, MSG_VAULT_LIST,
     MSG_VAULT_LIST_RESPONSE, MSG_VAULT_PUT, MSG_VAULT_PUT_RESPONSE, MSG_VAULT_ROLLBACK,
@@ -70,6 +70,15 @@ enum VaultError {
     Unauthorized,
     #[error("key not found")]
     KeyNotFound,
+    /// The key exists, but in another tenant than the request names: answered exactly like a key
+    /// that does not exist (same code, same text), so naming another tenant's key reveals nothing.
+    /// Only the audit row tells them apart ("denied").
+    #[error("key not found")]
+    KeyNotFoundInTenant,
+    /// A put names a key that already belongs to another tenant. The namespace is global, so the
+    /// name is taken; the put never takes it over.
+    #[error("key is taken by another tenant")]
+    KeyTaken,
     #[error("no previous version available")]
     NoPreviousVersion,
     #[error("storage error: {0}")]
@@ -84,7 +93,8 @@ impl VaultError {
             VaultError::InvalidMasterKey(_) => "MASTER_KEY_NOT_AVAILABLE",
             VaultError::InvalidRequest(_) => "INVALID_REQUEST",
             VaultError::Unauthorized => "UNAUTHORIZED",
-            VaultError::KeyNotFound => "KEY_NOT_FOUND",
+            VaultError::KeyNotFound | VaultError::KeyNotFoundInTenant => "KEY_NOT_FOUND",
+            VaultError::KeyTaken => "KEY_TAKEN",
             VaultError::NoPreviousVersion => "NO_PREVIOUS_VERSION",
             VaultError::Sqlite(_) | VaultError::Storage(_) => "STORAGE_ERROR",
             VaultError::Encryption => "ENCRYPTION_ERROR",
@@ -632,11 +642,13 @@ fn handle_delete(
     well_known: &HashSet<String>,
     hive_id: &str,
 ) -> VaultResult<HandlerOutcome> {
-    let request: VaultKeyRequest = serde_json::from_value(msg.payload.clone())?;
+    let request: VaultScopedKeyRequest = serde_json::from_value(msg.payload.clone())?;
     validate_key(&request.key)?;
+    let tenant = validate_request_tenant(&request.tenant_id)?;
+    let pre_metadata = store.get_record(&request.key)?.map(|r| r.metadata);
+    ensure_in_tenant(pre_metadata.as_ref(), tenant)?;
     // Auth: admin/architect can delete anything; non-admin can only delete
     // secrets dedicated to their own ILK.
-    let pre_metadata = store.get_record(&request.key)?.map(|r| r.metadata);
     if !caller.is_well_known_admin(well_known) {
         let Some(existing_metadata) = pre_metadata.as_ref() else {
             return Err(VaultError::Unauthorized);
@@ -677,7 +689,9 @@ fn handle_rotate(
 ) -> VaultResult<HandlerOutcome> {
     let request: VaultRotateRequest = serde_json::from_value(msg.payload.clone())?;
     validate_key(&request.key)?;
+    let tenant = validate_request_tenant(&request.tenant_id)?;
     let pre_metadata = store.get_record(&request.key)?.map(|r| r.metadata);
+    ensure_in_tenant(pre_metadata.as_ref(), tenant)?;
     if !caller.is_well_known_admin(well_known) {
         let Some(existing_metadata) = pre_metadata.as_ref() else {
             return Err(VaultError::Unauthorized);
@@ -723,9 +737,11 @@ fn handle_rollback(
     well_known: &HashSet<String>,
     hive_id: &str,
 ) -> VaultResult<HandlerOutcome> {
-    let request: VaultKeyRequest = serde_json::from_value(msg.payload.clone())?;
+    let request: VaultScopedKeyRequest = serde_json::from_value(msg.payload.clone())?;
     validate_key(&request.key)?;
+    let tenant = validate_request_tenant(&request.tenant_id)?;
     let pre_metadata = store.get_record(&request.key)?.map(|r| r.metadata);
+    ensure_in_tenant(pre_metadata.as_ref(), tenant)?;
     if !caller.is_well_known_admin(well_known) {
         let Some(existing_metadata) = pre_metadata.as_ref() else {
             return Err(VaultError::Unauthorized);
@@ -974,6 +990,11 @@ impl VaultStore {
 
         let existing = self.get_record(key)?;
         if let Some(existing) = existing {
+            // Checked before the no-op shortcut: a put of the same value under another tenant
+            // must not answer ok as if the caller held the key.
+            if existing.metadata.tenant_id.trim() != metadata.tenant_id.trim() {
+                return Err(VaultError::KeyTaken);
+            }
             let current_value =
                 self.decrypt_value(&existing.current_nonce, &existing.current_ciphertext)?;
             if current_value == value {
@@ -1456,7 +1477,10 @@ fn authorize_read(
 
 fn audit_result_for_error(err: &VaultError) -> &'static str {
     match err {
-        VaultError::Unauthorized => "denied",
+        // Reaching for another tenant's key is a refusal, even when the caller is told "not found".
+        VaultError::Unauthorized | VaultError::KeyNotFoundInTenant | VaultError::KeyTaken => {
+            "denied"
+        }
         _ => "error",
     }
 }
@@ -1522,6 +1546,29 @@ fn validate_metadata(metadata: &VaultMetadata) -> VaultResult<()> {
         ));
     }
     Ok(())
+}
+
+/// The tenant a delete, rotate or rollback acts for. Every write names one (a put through
+/// `metadata.tenant_id`); infrastructure keys live in the root tenant.
+fn validate_request_tenant(tenant_id: &str) -> VaultResult<&str> {
+    let tenant = tenant_id.trim();
+    if !tenant.starts_with("tnt:") {
+        return Err(VaultError::InvalidRequest(
+            "tenant_id must be tnt:<uuid> (the tenant the key belongs to; the hive's root tenant for infrastructure keys)".to_string(),
+        ));
+    }
+    Ok(tenant)
+}
+
+/// A key of another tenant is answered like a missing one. A missing key passes: each operation
+/// reports it as before.
+fn ensure_in_tenant(metadata: Option<&VaultMetadata>, tenant: &str) -> VaultResult<()> {
+    match metadata {
+        Some(metadata) if metadata.tenant_id.trim() != tenant => {
+            Err(VaultError::KeyNotFoundInTenant)
+        }
+        _ => Ok(()),
+    }
 }
 
 fn request_key(payload: &Value) -> Option<String> {
@@ -1955,6 +2002,74 @@ mod tests {
             "rollback restores the previous value"
         );
         cleanup(dir);
+    }
+
+    #[test]
+    fn a_put_never_takes_over_another_tenants_key() {
+        let (mut store, dir) = open_test_store([11u8; 32]);
+        let c = admin_caller();
+        let tenant_a = "tnt:11111111-1111-4111-8111-111111111111";
+        let tenant_b = "tnt:22222222-2222-4222-8222-222222222222";
+        store
+            .put(
+                "google:acme:sales",
+                json!({"t":"a"}),
+                metadata(tenant_a, None),
+                &c,
+            )
+            .expect("first put");
+        // Another tenant: refused, with a new value and with the very same one (no ok no-op).
+        for value in [json!({"t":"b"}), json!({"t":"a"})] {
+            let err = store
+                .put("google:acme:sales", value, metadata(tenant_b, None), &c)
+                .expect_err("another tenant's key is taken");
+            assert!(matches!(err, VaultError::KeyTaken));
+            assert_eq!(err.code(), "KEY_TAKEN");
+        }
+        let rec = store.get_record("google:acme:sales").unwrap().unwrap();
+        assert_eq!(rec.metadata.tenant_id, tenant_a);
+        assert_eq!(rec.version, 1);
+        // Its own tenant still writes it.
+        let (version, changed) = store
+            .put(
+                "google:acme:sales",
+                json!({"t":"a2"}),
+                metadata(tenant_a, None),
+                &c,
+            )
+            .expect("own tenant rewrites");
+        assert_eq!((version, changed), (2, true));
+        cleanup(dir);
+    }
+
+    #[test]
+    fn another_tenants_key_is_answered_as_missing() {
+        let tenant_a = "tnt:11111111-1111-4111-8111-111111111111";
+        let tenant_b = "tnt:22222222-2222-4222-8222-222222222222";
+        let md = metadata(tenant_a, None);
+        assert!(ensure_in_tenant(Some(&md), tenant_a).is_ok());
+        // A missing key passes: delete/rotate/rollback then report it as before.
+        assert!(ensure_in_tenant(None, tenant_b).is_ok());
+        let err = ensure_in_tenant(Some(&md), tenant_b).expect_err("another tenant");
+        // Indistinguishable from a missing key on the wire: same code, same text.
+        assert_eq!(err.code(), VaultError::KeyNotFound.code());
+        assert_eq!(err.to_string(), VaultError::KeyNotFound.to_string());
+        // Only the audit row says it was a refusal.
+        assert_eq!(audit_result_for_error(&err), "denied");
+        assert_eq!(audit_result_for_error(&VaultError::KeyNotFound), "error");
+    }
+
+    #[test]
+    fn every_scoped_request_names_a_canonical_tenant() {
+        assert!(validate_request_tenant(" tnt:11111111-1111-4111-8111-111111111111 ").is_ok());
+        for bad in ["", "  ", "sys", "11111111-1111-4111-8111-111111111111"] {
+            assert!(validate_request_tenant(bad).is_err(), "{bad:?}");
+        }
+        // The wire refuses a delete, rotate or rollback without a tenant.
+        assert!(serde_json::from_value::<VaultScopedKeyRequest>(json!({"key":"k"})).is_err());
+        assert!(
+            serde_json::from_value::<VaultRotateRequest>(json!({"key":"k","value":1})).is_err()
+        );
     }
 
     #[test]

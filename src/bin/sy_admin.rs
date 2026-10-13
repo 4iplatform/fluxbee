@@ -5641,6 +5641,10 @@ fn authorize_channel_command(
     Ok(())
 }
 
+/// What an orchestrator's node teardown calls from the Cloud surface: the node's ILK and the
+/// secrets it owns.
+const ORCHESTRATOR_TEARDOWN_ACTIONS: &[&str] = &["delete_ilk", "vault_list", "vault_delete"];
+
 /// Relay gate for the Fluxbee Cloud provisioning actions (`IO_CLOUD_EXPOSED_ACTIONS`). These are
 /// reachable from the internet (Cloud -> edge -> IO.cloud -> here), so over the MESH they may ONLY
 /// originate from IO.cloud in this admin's hive — the internal relay. `caller==None`
@@ -5699,12 +5703,21 @@ fn authorize_cloud_relay(
     let Some(caller) = caller_l2_name else {
         return Ok(());
     };
+    // The system nodes that call some of these actions themselves. Adding an action to the Cloud
+    // surface must not take it away from them (it did twice: delete_ilk on 2026-09-28, which left
+    // orphan node identities behind, and the vault and tenant actions on 2026-10-13). Router-stamped
+    // names, never params.
+    //
     // Node teardown (kill_node / remove_node_instance with purge_instance) marks the node's ILK
-    // through delete_ilk and then purges it. delete_ilk joined the Cloud surface on 2026-09-28 (mark
-    // only), and without this exemption the gate silently refused the orchestrators' teardown,
-    // leaving orphan node identities behind. ANY hive's orchestrator: a spoke tears down its own
-    // nodes. Router-stamped name, never params; ONLY delete_ilk (purge_ilk is not a relay action).
-    if action == "delete_ilk" && caller.starts_with("SY.orchestrator@") {
+    // through delete_ilk and deletes the secrets that ILK owns (vault_list + vault_delete). ANY
+    // hive's orchestrator: a spoke tears down its own nodes. Never vault_put: the per-spoke SSH
+    // recovery key it stored is gone with key_only_persist (D32).
+    if ORCHESTRATOR_TEARDOWN_ACTIONS.contains(&action) && caller.starts_with("SY.orchestrator@") {
+        return Ok(());
+    }
+    // Archi is the operator's own agent, next to admin; its commands reach these actions over the
+    // mesh like every other admin action it runs.
+    if caller == format!("SY.architect@{admin_hive}") {
         return Ok(());
     }
     Err(format!(
@@ -5713,11 +5726,15 @@ fn authorize_cloud_relay(
 }
 
 /// FIX-2: re-enforce io.cloud's `translate_cloud_op` content restrictions SERVER-SIDE. Those checks
-/// (run_node → IO.* only; vault_put → no caller-set ownership-authority fields, owner_node IO.*)
-/// today live ONLY inside io.cloud, which a compromised relay bypasses. Admin must not trust the
-/// relay to have sanitized its own payload. Applies ONLY to the IO.cloud@hive mesh origin — operator
+/// live first inside io.cloud, which a compromised relay bypasses; admin must not trust the relay
+/// to have sanitized its own payload. Applies ONLY to the IO.cloud@hive mesh origin — operator
 /// (caller=None) and every other caller are unaffected. Runs right after `authorize_cloud_relay`
-/// (so it only ever sees the exposed 3 actions from this origin).
+/// (so it only ever sees the exposed actions from this origin).
+///
+/// Rule 3 of the Cloud contract, held here: every action on a tenant names the tenant Cloud
+/// claims (canonical, never the root tenant, which holds the system), and the stores refuse
+/// anything of another tenant (SY.vault: KEY_TAKEN / KEY_NOT_FOUND; SY.identity: NOT_FOUND /
+/// ILK_TENANT_MISMATCH).
 fn enforce_cloud_relay_content(
     caller_l2_name: Option<&str>,
     action: &str,
@@ -5735,28 +5752,51 @@ fn enforce_cloud_relay_content(
         }
         Ok(())
     };
-    match action {
-        // Lifecycle over the Cloud relay (mark / restore only; purge is not in the allowlist):
-        // the request MUST carry the claimed tenant. For ilks, SY.identity refuses an ilk of
-        // another tenant (ILK_TENANT_MISMATCH); without this check a compromised relay could drop
-        // the tenant and mark ANY ilk.
-        "delete_ilk" | "restore_ilk" | "delete_tenant" | "restore_tenant" => {
-            let tenant_id = params
-                .get("tenant_id")
-                .and_then(|v| v.as_str())
-                .map(str::trim)
-                .unwrap_or("");
-            let valid = tenant_id
-                .strip_prefix("tnt:")
-                .and_then(|raw| uuid::Uuid::parse_str(raw).ok())
-                .is_some();
-            if !valid {
+    // Reserved infra namespaces (endpoint bearers `edge_channel_secret:*`, `edge_tls`, `ssh:*`,
+    // fanout verify tokens): the Cloud relay stores and deletes PROVIDER tokens, never the keys
+    // that protect the mesh itself. Single source: fluxbee_sdk::vault (io.cloud mirrors it for a
+    // clean early error).
+    let not_reserved = |key: &str| -> Result<(), String> {
+        if fluxbee_sdk::vault::is_cloud_reserved_vault_key(key) {
+            return Err(format!(
+                "IO.cloud {action} may not touch the reserved infrastructure key '{key}'"
+            ));
+        }
+        Ok(())
+    };
+    let only_fields =
+        |object: Option<&serde_json::Value>, allowed: &[&str]| -> Result<(), String> {
+            let Some(object) = object.and_then(|value| value.as_object()) else {
+                return Ok(());
+            };
+            if let Some(extra) = object.keys().find(|key| !allowed.contains(&key.as_str())) {
                 return Err(format!(
-                    "IO.cloud {action} must be scoped to the claimed tenant (tenant_id tnt:<uuid>)"
+                    "IO.cloud {action} may carry only {allowed:?}, not '{extra}'"
                 ));
             }
+            Ok(())
+        };
+    match action {
+        // create_tenant has no tenant yet: the one tenant-free write.
+        "create_tenant" => {}
+        // Lifecycle over the Cloud relay (mark / restore only; purge is not in the allowlist): the
+        // request MUST carry the claimed tenant. For ilks, SY.identity refuses an ilk of another
+        // tenant (ILK_TENANT_MISMATCH); without this check a compromised relay could drop the
+        // tenant and mark ANY ilk.
+        "delete_ilk" | "restore_ilk" | "delete_tenant" | "restore_tenant" => {
+            cloud_claimed_tenant(params.get("tenant_id"), action)?;
+        }
+        "get_ilk" => {
+            // SY.identity answers NOT_FOUND for an ilk of another tenant.
+            cloud_claimed_tenant(params.get("tenant_id"), action)?;
+        }
+        "update_tenant" => {
+            cloud_claimed_tenant(params.get("tenant_id"), action)?;
+            // Name and domain only: status, settings and the sponsor are the operator's.
+            only_fields(Some(params), &["tenant_id", "name", "domain"])?;
         }
         "run_node" => {
+            cloud_claimed_tenant(params.get("tenant_id"), action)?;
             let node_name = params.get("node_name").and_then(|v| v.as_str()).unwrap_or("");
             if !node_name.starts_with("IO.") {
                 return Err(format!(
@@ -5765,6 +5805,11 @@ fn enforce_cloud_relay_content(
             }
         }
         "vault_put" => {
+            // The key's tenant. SY.vault refuses a key another tenant holds (KEY_TAKEN).
+            cloud_claimed_tenant(
+                params.get("metadata").and_then(|md| md.get("tenant_id")),
+                action,
+            )?;
             // Ownership-authority fields io.cloud must NEVER set (translate strips them); reject so a
             // compromised relay cannot plant a secret under a victim's ilk/owner.
             if let Some(md) = params.get("metadata").and_then(|v| v.as_object()) {
@@ -5779,20 +5824,55 @@ fn enforce_cloud_relay_content(
             }
             // translate reads owner_node from params OR metadata — check the top-level too.
             owner_node_ok(params.get("owner_node"))?;
-            // Reserved infra namespaces: the Cloud relay stores PROVIDER tokens, never the keys that
-            // protect the mesh itself (endpoint bearers `edge_channel_secret:*`, `edge_tls`, and
-            // `ssh:*`, kept reserved since D32 retired the spoke recovery keys stored there).
-            // Reject so a semi-trusted/compromised relay cannot overwrite an
-            // externalized endpoint's OWN bearer (DoS/takeover) or another infra secret. Single
-            // source: fluxbee_sdk::vault (io.cloud mirrors it for a clean early error).
-            let key = params.get("key").and_then(|v| v.as_str()).unwrap_or_default();
-            if fluxbee_sdk::vault::is_cloud_reserved_vault_key(key) {
-                return Err(format!(
-                    "IO.cloud vault_put may not write the reserved infrastructure key '{key}'"
-                ));
-            }
+            not_reserved(
+                params
+                    .get("key")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default(),
+            )?;
+        }
+        "vault_list" => {
+            // Never an unfiltered listing: always the claimed tenant, and no owner or tag filter.
+            let filter = params.get("filter");
+            cloud_claimed_tenant(filter.and_then(|f| f.get("tenant_id")), action)?;
+            only_fields(filter, &["tenant_id", "resource_type", "prefix", "limit"])?;
+            only_fields(Some(params), &["filter"])?;
+        }
+        "vault_delete" => {
+            // SY.vault answers KEY_NOT_FOUND for a key of another tenant.
+            cloud_claimed_tenant(params.get("tenant_id"), action)?;
+            not_reserved(
+                params
+                    .get("key")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default(),
+            )?;
+            only_fields(Some(params), &["key", "tenant_id"])?;
         }
         _ => {}
+    }
+    Ok(())
+}
+
+/// The tenant a Cloud action claims: canonical `tnt:<uuid>` (hyphenated and lowercase, the one
+/// spelling the stores compare), and never the root tenant, which holds the system and its nodes.
+fn cloud_claimed_tenant(value: Option<&serde_json::Value>, action: &str) -> Result<(), String> {
+    let tenant_id = value.and_then(|v| v.as_str()).unwrap_or("");
+    let canonical = tenant_id
+        .strip_prefix("tnt:")
+        .and_then(|raw| {
+            uuid::Uuid::parse_str(raw)
+                .ok()
+                .filter(|uuid| uuid.to_string() == raw)
+        })
+        .is_some();
+    if !canonical {
+        return Err(format!(
+            "IO.cloud {action} must be scoped to the claimed tenant (tenant_id tnt:<uuid>)"
+        ));
+    }
+    if tenant_id == fluxbee_sdk::DEFAULT_ROOT_TENANT_ID {
+        return Err(format!("IO.cloud {action} may not act on the root tenant"));
     }
     Ok(())
 }
@@ -6991,9 +7071,12 @@ async fn handle_hive_paths(
             Ok(Some((status, resp)))
         }
         ("DELETE", ["vault", "secrets", key]) => {
-            let payload = serde_json::json!({
+            let mut payload = serde_json::json!({
                 "key": decode_percent(key),
             });
+            if let Some(tenant_id) = query.get("tenant_id") {
+                payload["tenant_id"] = serde_json::Value::String(tenant_id.to_string());
+            }
             let (status, resp) =
                 handle_admin_command(ctx, client, "vault_delete", payload, Some(hive)).await?;
             Ok(Some((status, resp)))
@@ -7018,14 +7101,20 @@ async fn handle_hive_paths(
                 )));
             }
             payload["key"] = serde_json::Value::String(decode_percent(key));
+            if let Some(tenant_id) = query.get("tenant_id") {
+                payload["tenant_id"] = serde_json::Value::String(tenant_id.to_string());
+            }
             let (status, resp) =
                 handle_admin_command(ctx, client, "vault_rotate", payload, Some(hive)).await?;
             Ok(Some((status, resp)))
         }
         ("POST", ["vault", "secrets", key, "rollback"]) => {
-            let payload = serde_json::json!({
+            let mut payload = serde_json::json!({
                 "key": decode_percent(key),
             });
+            if let Some(tenant_id) = query.get("tenant_id") {
+                payload["tenant_id"] = serde_json::Value::String(tenant_id.to_string());
+            }
             let (status, resp) =
                 handle_admin_command(ctx, client, "vault_rollback", payload, Some(hive)).await?;
             Ok(Some((status, resp)))
@@ -7628,7 +7717,7 @@ fn error_code_to_http_status(error_code: &str) -> u16 {
         "HOST_NOT_SETTLED" => 503,
         "INVALID_REQUEST" | "INVALID_ADDRESS" | "INVALID_ARCHIVE" | "INVALID_HIVE_ID"
         | "INVALID_ZIP" | "INVALID_KEY_FORMAT" | "INVALID_VALUE" => 400,
-        "UNAUTHORIZED" | "SYSTEM_ILK_PROTECTED" => 403,
+        "UNAUTHORIZED" | "SYSTEM_ILK_PROTECTED" | "TENANT_ROOT_PROTECTED" => 403,
         "NOT_FOUND"
         | "ILK_NOT_FOUND"
         | "NODE_NOT_FOUND"
@@ -7659,6 +7748,11 @@ fn error_code_to_http_status(error_code: &str) -> u16 {
         | "RUNTIME_IN_USE"
         | "RUNTIME_HAS_DEPENDENTS"
         | "RUNTIME_CURRENT_CONFLICT"
+        // A name another tenant holds: a vault key (one namespace for the hive), a tenant name or
+        // domain.
+        | "KEY_TAKEN"
+        | "TENANT_NAME_TAKEN"
+        | "TENANT_DOMAIN_TAKEN"
         | "BUSY" => 409,
         "COMPILE_ERROR"
         | "INVALID_CONFIG"
@@ -9988,6 +10082,11 @@ fn admin_action_body_required_fields(action: &str) -> Vec<serde_json::Value> {
 
 fn admin_action_body_optional_fields(action: &str) -> Vec<serde_json::Value> {
     match action {
+        "vault_delete" | "vault_rotate" | "vault_rollback" => vec![admin_action_body_field(
+                "tenant_id",
+                "string",
+                "Tenant the key belongs to, canonical tnt:<uuid> (metadata.tenant_id in vault_list). Defaults to the hive's root tenant (infrastructure keys). A key of another tenant answers KEY_NOT_FOUND.",
+            )],
         "publish_artifact" => vec![
             admin_action_body_field(
                 "presentation",
@@ -11116,6 +11215,7 @@ fn admin_action_request_notes(action: &str) -> Vec<&'static str> {
             "Writes plaintext to SY.vault over L2; SY.vault encrypts at rest and writes local audit.",
             "value is secret-sensitive and must be redacted in previews/history.",
             "Model D' metadata contract: metadata.resource_type is REQUIRED (canonical lowercase snake_case). metadata.tenant_id is optional (defaults to the hive's root tenant — infrastructure-wide secret; values must be in canonical tnt:<uuid> form). metadata.owner_node is optional (friendly L2 name like 'SY.architect' — admin resolves the ILK); omit owner_node entirely for a pool secret. metadata.owner_ilk is REJECTED — never include it.",
+            "Keys share one namespace for the whole hive: a put of a key another tenant holds answers KEY_TAKEN, and never moves the key to the new tenant.",
             "Same-value PUT is idempotent: the vault returns changed=false and does not increment version.",
         ],
         "vault_get_metadata" => vec![
@@ -11130,14 +11230,17 @@ fn admin_action_request_notes(action: &str) -> Vec<&'static str> {
         "vault_delete" => vec![
             "Deletes one secret. Admin/Architect only.",
             "Use metadata/list first when you need to inspect before delete.",
+            "Pass tenant_id = the key's metadata.tenant_id; omitted means the root tenant, and a key of another tenant answers KEY_NOT_FOUND.",
         ],
         "vault_rotate" => vec![
             "Rotates one secret value and preserves the immediately previous version for rollback.",
             "value is secret-sensitive and must be redacted in previews/history.",
+            "Pass tenant_id = the key's metadata.tenant_id; omitted means the root tenant, and a key of another tenant answers KEY_NOT_FOUND.",
         ],
         "vault_rollback" => vec![
             "Rolls one secret back to the immediately previous version.",
             "Fails with NO_PREVIOUS_VERSION when no previous encrypted value is available.",
+            "Pass tenant_id = the key's metadata.tenant_id; omitted means the root tenant, and a key of another tenant answers KEY_NOT_FOUND.",
         ],
         "inventory" => vec![
             "Use GET /inventory for the full global inventory view.",
@@ -13433,6 +13536,8 @@ async fn handle_vault_command(
                 ));
             }
         }
+    } else if matches!(action, "vault_delete" | "vault_rotate" | "vault_rollback") {
+        default_vault_request_tenant(payload)
     } else {
         payload
     };
@@ -13458,6 +13563,27 @@ async fn handle_vault_command(
     )
     .await;
     Ok(build_admin_http_response(action, response))
+}
+
+/// Every delete, rotate and rollback names the tenant its key belongs to, and SY.vault refuses a
+/// key of another tenant as if it did not exist. When the caller names none it is the hive's root
+/// tenant, where infrastructure keys live: the same default `vault_put` applies to
+/// `metadata.tenant_id`.
+fn default_vault_request_tenant(mut payload: serde_json::Value) -> serde_json::Value {
+    if let Some(object) = payload.as_object_mut() {
+        let named = object
+            .get("tenant_id")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .is_some_and(|v| !v.is_empty());
+        if !named {
+            object.insert(
+                "tenant_id".to_string(),
+                serde_json::Value::String(fluxbee_sdk::DEFAULT_ROOT_TENANT_ID.to_string()),
+            );
+        }
+    }
+    payload
 }
 
 /// Normalize a vault_put HTTP payload to the Model D' contract before
@@ -14989,12 +15115,50 @@ mod tests {
     #[test]
     fn cloud_relay_gate_lets_every_orchestrator_mark_node_ilks_for_teardown() {
         for caller in ["SY.orchestrator@motherbee", "SY.orchestrator@worker1"] {
-            assert!(authorize_cloud_relay(Some(caller), "delete_ilk", "motherbee").is_ok(), "{caller}");
+            // The node's ILK and the secrets it owns (purge_vault_secrets_for_ilk).
+            for teardown in ["delete_ilk", "vault_list", "vault_delete"] {
+                assert!(
+                    authorize_cloud_relay(Some(caller), teardown, "motherbee").is_ok(),
+                    "{caller} {teardown}"
+                );
+            }
             // ...but nothing else from the Cloud surface
-            assert!(authorize_cloud_relay(Some(caller), "delete_tenant", "motherbee").is_err());
-            assert!(authorize_cloud_relay(Some(caller), "create_tenant", "motherbee").is_err());
+            for other in [
+                "delete_tenant",
+                "create_tenant",
+                "vault_put",
+                "update_tenant",
+                "run_node",
+            ] {
+                assert!(
+                    authorize_cloud_relay(Some(caller), other, "motherbee").is_err(),
+                    "{caller} {other}"
+                );
+            }
         }
-        assert!(authorize_cloud_relay(Some("AI.chat@motherbee"), "delete_ilk", "motherbee").is_err());
+        assert!(
+            authorize_cloud_relay(Some("AI.chat@motherbee"), "delete_ilk", "motherbee").is_err()
+        );
+        assert!(
+            authorize_cloud_relay(Some("AI.chat@motherbee"), "vault_delete", "motherbee").is_err()
+        );
+    }
+
+    #[test]
+    fn cloud_relay_gate_keeps_archi_actions_on_the_cloud_surface() {
+        // Archi's commands reach admin over the mesh: putting an action on the Cloud surface must
+        // not take it from Archi (vault_list and update_tenant were Archi's before 2026-10-13).
+        for action in IO_CLOUD_EXPOSED_ACTIONS {
+            assert!(
+                authorize_cloud_relay(Some("SY.architect@motherbee"), action, "motherbee").is_ok(),
+                "{action}"
+            );
+            // Only the admin hive's Archi.
+            assert!(
+                authorize_cloud_relay(Some("SY.architect@worker1"), action, "motherbee").is_err(),
+                "{action}"
+            );
+        }
     }
 
     #[test]
@@ -15027,7 +15191,9 @@ mod tests {
         // 2026-09-28: it now only MARKS and is tenant-scoped; the physical purges stay denied.)
         for evil in [
             "vault_get",
-            "vault_list",
+            "vault_get_metadata",
+            "vault_rotate",
+            "vault_rollback",
             "purge_ilk",
             "purge_tenant",
             "add_route",
@@ -15082,70 +15248,229 @@ mod tests {
             assert!(
                 authorize_cloud_relay(Some("AI.worker@motherbee"), action, "motherbee").is_err()
             );
-            // An orchestrator only for its node teardown (delete_ilk). Never vault_put: the
-            // per-spoke SSH recovery key it stored is gone with key_only_persist (D32).
-            if *action == "delete_ilk" {
-                assert!(authorize_cloud_relay(
-                    Some("SY.orchestrator@motherbee"),
-                    action,
-                    "motherbee"
-                )
-                .is_ok());
-            } else {
-                assert!(authorize_cloud_relay(
-                    Some("SY.orchestrator@motherbee"),
-                    action,
-                    "motherbee"
-                )
-                .is_err());
+            // An orchestrator only for its node teardown. Never vault_put: the per-spoke SSH
+            // recovery key it stored is gone with key_only_persist (D32).
+            for orchestrator in ["SY.orchestrator@motherbee", "SY.orchestrator@worker1"] {
+                assert_eq!(
+                    authorize_cloud_relay(Some(orchestrator), action, "motherbee").is_ok(),
+                    ORCHESTRATOR_TEARDOWN_ACTIONS.contains(action),
+                    "{orchestrator} on '{action}'"
+                );
             }
-            // A spoke orchestrator only for its node teardown (delete_ilk); never vault_put.
-            assert_eq!(
-                authorize_cloud_relay(Some("SY.orchestrator@worker1"), action, "motherbee").is_ok(),
-                *action == "delete_ilk",
-                "spoke orchestrator on '{action}'"
-            );
         }
     }
 
     #[test]
     fn cloud_relay_content_reenforced_server_side() {
         let io = Some("IO.cloud@motherbee");
-        // run_node: IO.* only.
-        assert!(enforce_cloud_relay_content(io, "run_node", "motherbee",
-            &serde_json::json!({"node_name":"IO.api.x@motherbee"})).is_ok());
-        assert!(enforce_cloud_relay_content(io, "run_node", "motherbee",
-            &serde_json::json!({"node_name":"AI.worker@motherbee"})).is_err());
+        let t = "tnt:11111111-1111-4111-8111-111111111111";
+        let check = |action: &str, params: serde_json::Value| {
+            enforce_cloud_relay_content(io, action, "motherbee", &params)
+        };
+        // run_node: IO.* only, in the claimed tenant.
+        assert!(check(
+            "run_node",
+            serde_json::json!({"node_name":"IO.api.x@motherbee","tenant_id":t})
+        )
+        .is_ok());
+        assert!(check(
+            "run_node",
+            serde_json::json!({"node_name":"AI.worker@motherbee","tenant_id":t})
+        )
+        .is_err());
+        assert!(check(
+            "run_node",
+            serde_json::json!({"node_name":"IO.api.x@motherbee"})
+        )
+        .is_err());
         // vault_put: no caller-set ownership-authority fields.
         for bad in ["ilk", "owner_ilk", "owner_l2"] {
-            assert!(enforce_cloud_relay_content(io, "vault_put", "motherbee",
-                &serde_json::json!({"key":"k","metadata":{bad:"x"}})).is_err(),
-                "vault_put must reject metadata.{bad} from io.cloud");
+            assert!(
+                check(
+                    "vault_put",
+                    serde_json::json!({"key":"k","metadata":{"tenant_id":t,bad:"x"}})
+                )
+                .is_err(),
+                "vault_put must reject metadata.{bad} from io.cloud"
+            );
         }
         // owner_node must be IO.* (top-level or in metadata).
-        assert!(enforce_cloud_relay_content(io, "vault_put", "motherbee",
-            &serde_json::json!({"key":"k","metadata":{"owner_node":"SY.identity@motherbee"}})).is_err());
-        assert!(enforce_cloud_relay_content(io, "vault_put", "motherbee",
-            &serde_json::json!({"key":"k","owner_node":"AI.x@motherbee"})).is_err());
-        // vault_put: reserved INFRA key namespaces (endpoint bearers, edge TLS, the retired spoke keys)
-        // must be rejected — a Cloud relay stores provider tokens, never the keys that guard the mesh.
+        assert!(check("vault_put", serde_json::json!({"key":"k","metadata":{"tenant_id":t,"owner_node":"SY.identity@motherbee"}})).is_err());
+        assert!(check(
+            "vault_put",
+            serde_json::json!({"key":"k","owner_node":"AI.x@motherbee","metadata":{"tenant_id":t}})
+        )
+        .is_err());
+        // Reserved INFRA key namespaces (endpoint bearers, edge TLS, the retired spoke keys, fanout
+        // verify tokens): a Cloud relay stores and deletes provider tokens, never the keys that
+        // guard the mesh.
         for reserved in [
             "edge_channel_secret:ich:14b66389-d425-531c-a140-a591d25e8f39",
             "edge_tls",
+            "edge_tls_fluxbee_ai",
             "ssh:motherbee",
+            "edge_fanout_verify:ich:14b66389-d425-531c-a140-a591d25e8f39",
         ] {
-            assert!(enforce_cloud_relay_content(io, "vault_put", "motherbee",
-                &serde_json::json!({"key":reserved,"metadata":{"resource_type":"bearer_token"}})).is_err(),
+            assert!(check("vault_put", serde_json::json!({"key":reserved,"metadata":{"tenant_id":t,"resource_type":"bearer_token"}})).is_err(),
                 "vault_put must reject reserved infra key {reserved} from io.cloud");
+            assert!(
+                check(
+                    "vault_delete",
+                    serde_json::json!({"key":reserved,"tenant_id":t})
+                )
+                .is_err(),
+                "vault_delete must reject reserved infra key {reserved} from io.cloud"
+            );
         }
-        // Legit: clean metadata + IO.* owner_node + tenant_id (translate sets tenant_id) is fine.
-        assert!(enforce_cloud_relay_content(io, "vault_put", "motherbee",
-            &serde_json::json!({"key":"slack:auth:bot","metadata":{"resource_type":"openai","tenant_id":"tnt:x","owner_node":"IO.api.x@motherbee"}})).is_ok());
+        // Legit: clean metadata + IO.* owner_node + the claimed tenant is fine.
+        assert!(check("vault_put", serde_json::json!({"key":"slack:auth:bot","metadata":{"resource_type":"openai","tenant_id":t,"owner_node":"IO.api.x@motherbee"}})).is_ok());
         // Not enforced for the operator path or other callers.
         assert!(enforce_cloud_relay_content(None, "run_node", "motherbee",
             &serde_json::json!({"node_name":"AI.worker@motherbee"})).is_ok());
         assert!(enforce_cloud_relay_content(Some("SY.orchestrator@motherbee"), "vault_put", "motherbee",
             &serde_json::json!({"metadata":{"ilk":"x"}})).is_ok());
+    }
+
+    #[test]
+    fn cloud_relay_every_tenant_action_names_the_claimed_tenant_never_the_root() {
+        let io = Some("IO.cloud@motherbee");
+        let t = "tnt:11111111-1111-4111-8111-111111111111";
+        let root = fluxbee_sdk::DEFAULT_ROOT_TENANT_ID;
+        // (action, params with the tenant set to TENANT)
+        type Shape = fn(&str) -> serde_json::Value;
+        let shapes: Vec<(&str, Shape)> = vec![
+            (
+                "delete_ilk",
+                |tn| serde_json::json!({"ilk_id":"ilk:22222222-2222-4222-8222-222222222222","tenant_id":tn}),
+            ),
+            ("delete_tenant", |tn| serde_json::json!({"tenant_id":tn})),
+            (
+                "get_ilk",
+                |tn| serde_json::json!({"ilk_id":"ilk:22222222-2222-4222-8222-222222222222","tenant_id":tn}),
+            ),
+            (
+                "update_tenant",
+                |tn| serde_json::json!({"tenant_id":tn,"name":"Acme"}),
+            ),
+            (
+                "run_node",
+                |tn| serde_json::json!({"node_name":"IO.api.x@motherbee","tenant_id":tn}),
+            ),
+            (
+                "vault_put",
+                |tn| serde_json::json!({"key":"google:a:b","metadata":{"tenant_id":tn,"resource_type":"gmail"}}),
+            ),
+            (
+                "vault_list",
+                |tn| serde_json::json!({"filter":{"tenant_id":tn}}),
+            ),
+            (
+                "vault_delete",
+                |tn| serde_json::json!({"key":"google:a:b","tenant_id":tn}),
+            ),
+        ];
+        for (action, params) in shapes {
+            let check = |tenant: &str| {
+                enforce_cloud_relay_content(io, action, "motherbee", &params(tenant))
+            };
+            assert!(check(t).is_ok(), "{action} with the claimed tenant");
+            assert!(check(root).is_err(), "{action} on the root tenant");
+            assert!(
+                check("tnt:acme").is_err(),
+                "{action} with a non-canonical tenant"
+            );
+            assert!(check("").is_err(), "{action} without a tenant");
+            // Other spellings of a UUID, the root's included, are not canonical.
+            for spelling in [
+                "tnt:00000000000000000000000000000001",
+                "tnt:{00000000-0000-0000-0000-000000000001}",
+                "tnt:11111111-1111-4111-8111-11111111111A",
+                " tnt:11111111-1111-4111-8111-111111111111",
+            ] {
+                assert!(check(spelling).is_err(), "{action} with {spelling:?}");
+            }
+        }
+        // create_tenant: no tenant yet, nothing to scope.
+        assert!(enforce_cloud_relay_content(
+            io,
+            "create_tenant",
+            "motherbee",
+            &serde_json::json!({"name":"Acme"})
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn cloud_relay_reads_and_edits_stay_narrow() {
+        let io = Some("IO.cloud@motherbee");
+        let t = "tnt:11111111-1111-4111-8111-111111111111";
+        let check = |action: &str, params: serde_json::Value| {
+            enforce_cloud_relay_content(io, action, "motherbee", &params)
+        };
+        // vault_list: the tenant, a resource type, a prefix and a limit; never an owner or tags.
+        assert!(check("vault_list", serde_json::json!({"filter":{"tenant_id":t,"resource_type":"gmail","prefix":"google:","limit":50}})).is_ok());
+        for extra in ["ilk", "tags"] {
+            assert!(
+                check(
+                    "vault_list",
+                    serde_json::json!({"filter":{"tenant_id":t, extra:"x"}})
+                )
+                .is_err(),
+                "{extra}"
+            );
+        }
+        assert!(
+            check("vault_list", serde_json::json!({})).is_err(),
+            "never unfiltered"
+        );
+        // vault_delete: the key and the tenant only.
+        assert!(check(
+            "vault_delete",
+            serde_json::json!({"key":"google:a:b","tenant_id":t,"force":true})
+        )
+        .is_err());
+        // update_tenant: name and domain only; status, settings and the sponsor are the operator's.
+        assert!(check(
+            "update_tenant",
+            serde_json::json!({"tenant_id":t,"name":"Acme","domain":""})
+        )
+        .is_ok());
+        for field in ["status", "settings", "sponsor_tenant_id"] {
+            assert!(
+                check(
+                    "update_tenant",
+                    serde_json::json!({"tenant_id":t, field:"x"})
+                )
+                .is_err(),
+                "{field}"
+            );
+        }
+    }
+
+    #[test]
+    fn names_held_by_another_tenant_are_conflicts_and_the_root_is_protected() {
+        for code in ["KEY_TAKEN", "TENANT_NAME_TAKEN", "TENANT_DOMAIN_TAKEN"] {
+            assert_eq!(error_code_to_http_status(code), 409, "{code}");
+        }
+        assert_eq!(error_code_to_http_status("TENANT_ROOT_PROTECTED"), 403);
+    }
+
+    #[test]
+    fn every_vault_delete_rotate_and_rollback_names_a_tenant() {
+        let root = fluxbee_sdk::DEFAULT_ROOT_TENANT_ID;
+        let t = "tnt:11111111-1111-4111-8111-111111111111";
+        // Unnamed or blank: the root tenant, where infrastructure keys live (vault_put's default).
+        for payload in [
+            serde_json::json!({"key":"k"}),
+            serde_json::json!({"key":"k","tenant_id":"  "}),
+        ] {
+            assert_eq!(default_vault_request_tenant(payload)["tenant_id"], root);
+        }
+        // Named: kept as given.
+        assert_eq!(
+            default_vault_request_tenant(serde_json::json!({"key":"k","tenant_id":t}))["tenant_id"],
+            t
+        );
     }
 
     #[test]
@@ -15160,19 +15485,21 @@ mod tests {
 
     #[test]
     fn cloud_actions_catalog_is_the_exposed_registry_subset() {
-        let expected_surface: std::collections::HashSet<&str> =
-            [
-                "create_tenant",
-                "vault_put",
-                "run_node",
-                "get_ilk",
-                "delete_ilk",
-                "restore_ilk",
-                "delete_tenant",
-                "restore_tenant",
-            ]
-            .into_iter()
-            .collect();
+        let expected_surface: std::collections::HashSet<&str> = [
+            "create_tenant",
+            "vault_put",
+            "run_node",
+            "get_ilk",
+            "delete_ilk",
+            "restore_ilk",
+            "delete_tenant",
+            "restore_tenant",
+            "vault_list",
+            "vault_delete",
+            "update_tenant",
+        ]
+        .into_iter()
+        .collect();
         let configured_surface: std::collections::HashSet<&str> =
             IO_CLOUD_EXPOSED_ACTIONS.iter().copied().collect();
         assert_eq!(configured_surface, expected_surface);

@@ -422,9 +422,21 @@ pub struct VaultKeyRequest {
     pub key: String,
 }
 
+/// VAULT_DELETE and VAULT_ROLLBACK: the key and the tenant the caller acts for. Every write names
+/// its tenant (a put through `metadata.tenant_id`): SY.vault refuses to touch a key that belongs to
+/// another tenant and answers as if it did not exist, so one tenant can never delete, roll back or
+/// rotate another's credential by naming it. Infrastructure keys live in the root tenant.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VaultScopedKeyRequest {
+    pub key: String,
+    pub tenant_id: String,
+}
+
+/// VAULT_ROTATE: like [`VaultScopedKeyRequest`], with the new value.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VaultRotateRequest {
     pub key: String,
+    pub tenant_id: String,
     pub value: Value,
 }
 
@@ -565,13 +577,19 @@ pub fn vault_key_is_valid(key: &str) -> bool {
 /// - `edge_tls` — the edge's TLS material.
 /// - `ssh:<hive_id>` — held per-spoke SSH recovery keys until D32 removed that mode; nothing
 ///   writes it now, and it stays reserved so no Cloud caller takes the name.
+/// - `edge_fanout_verify:<ich>` — the token the edge answers a fanout endpoint's verification
+///   challenge with (Meta's `hub.challenge`); overwriting it breaks or re-points that webhook.
 ///
-/// This is NOT a general vault ACL: only the Cloud-relay origin is bound (enforced SERVER-SIDE in
-/// SY.admin's `enforce_cloud_relay_content`, mirrored in io.cloud for a clean early error). SY.*
-/// internals still write the first two normally. Lives here because both sides ship in different cargo
+/// This is NOT a general vault ACL: only the Cloud-relay origin is bound, for writes and deletes
+/// alike (enforced SERVER-SIDE in SY.admin's `enforce_cloud_relay_content`, mirrored in io.cloud
+/// for a clean early error). SY.* internals still write the edge keys normally. Lives here because both sides ship in different cargo
 /// workspaces and must agree — same reason as [`vault_key_is_valid`].
-pub const CLOUD_RESERVED_VAULT_KEY_PREFIXES: &[&str] =
-    &["edge_channel_secret:", "edge_tls", "ssh:"];
+pub const CLOUD_RESERVED_VAULT_KEY_PREFIXES: &[&str] = &[
+    "edge_channel_secret:",
+    "edge_tls",
+    "ssh:",
+    "edge_fanout_verify:",
+];
 
 /// True when `key` falls in a hive-infrastructure namespace the Cloud relay may never write
 /// ([`CLOUD_RESERVED_VAULT_KEY_PREFIXES`]). Prefix match (so `edge_tls` also covers `edge_tls:*`),
@@ -1020,6 +1038,7 @@ mod tests {
             "edge_tls",
             "edge_tls:motherbee",
             "ssh:motherbee",
+            "edge_fanout_verify:ich:14b66389-d425-531c-a140-a591d25e8f39",
             "  EDGE_CHANNEL_SECRET:ich:abc  ", // stray case/whitespace must not slip past
         ] {
             assert!(

@@ -11,8 +11,10 @@
 //!   admin-driven `publish_cloud_endpoint` can resolve and externalize it on `SY.edge`);
 //! - it accepts Cloud operations only when the router-stamped source is the CURRENTLY
 //!   configured `SY.edge` (`config.io.edge_node`) and the request targets that exact ICH;
-//! - it relays the bounded provisioning set (`create_tenant`, `put_token`,
-//!   `provision_node`) to `SY.admin`.
+//! - it relays the bounded Cloud set (`fluxbee_sdk::cloud::CLOUD_OP_ACTIONS`) to `SY.admin` and
+//!   answers the identity reads in `CLOUD_LOCAL_OPS` itself;
+//! - every op on a tenant acts on the tenant at the envelope root, never the root tenant
+//!   (`claimed_tenant`), and SY.admin re-checks that server-side.
 //!
 //! # Configuration: managed CONFIG plane, NOT env
 //!
@@ -371,6 +373,12 @@ async fn run_loop(
         );
 
         let mut response = match authorize_cloud_message(&msg, &state.own_ich, cloud_edge_node) {
+            // Rule 3: the tenant travels only at the envelope root. A tenant_id inside params is
+            // refused rather than ignored: in get_ilk its presence picks the mode, and a client
+            // still sending it there must find out at once.
+            Ok(()) if tenant_in_params(&msg.payload) => {
+                cloud_error("tenant_id goes at the envelope root, next to op, never inside params")
+            }
             // io.cloud-LOCAL ops (CLOUD_LOCAL_OPS: register_human, list_cloud_actions) are handled
             // here — io.cloud does the work itself and NEVER touches SY.admin. The local-vs-relay
             // decision comes from the declared SDK set, not a magic string. Everything else is the
@@ -413,6 +421,9 @@ async fn run_loop(
             }
             obj.insert("handled_by".to_string(), json!(full_name));
             obj.insert("ich".to_string(), json!(ich));
+            if !obj.contains_key("op") && !op.is_empty() {
+                obj.insert("op".to_string(), json!(op));
+            }
         }
 
         // Egress/outcome line — the half the ingress log was missing. Every Cloud op now logs its
@@ -797,9 +808,10 @@ fn message_from_configured_edge(msg: &Message, cloud_edge_node: Option<&str>) ->
     msg.routing.src_l2_name.as_deref().map(str::trim) == Some(trusted_edge)
 }
 
-/// Error response payload for a rejected/malformed Cloud request.
+/// Error response payload for a rejected/malformed Cloud request. Every error carries an
+/// `error_code`, so Cloud maps codes and never parses details.
 fn cloud_error(detail: &str) -> serde_json::Value {
-    json!({ "status": "error", "error_detail": detail })
+    cloud_error_code("INVALID_REQUEST", detail)
 }
 
 fn cloud_error_code(code: &str, detail: &str) -> serde_json::Value {
@@ -826,6 +838,9 @@ fn optional_trimmed(params: &serde_json::Value, field: &str) -> Option<String> {
         .map(str::to_string)
 }
 
+/// The envelope's `tenant_id`, canonical `tnt:<uuid>`: the UUID hyphenated and lowercase, the one
+/// spelling the stores compare (a braced, simple or uppercase UUID parses too, but names a tenant
+/// that does not exist, and slips past an exact root-tenant check).
 fn require_tenant_id(tenant_id: Option<&str>, op: &str) -> Result<String, serde_json::Value> {
     let tenant_id = tenant_id
         .map(str::trim)
@@ -833,7 +848,11 @@ fn require_tenant_id(tenant_id: Option<&str>, op: &str) -> Result<String, serde_
         .ok_or_else(|| cloud_error(&format!("{op} requires tenant_id")))?;
     let valid = tenant_id
         .strip_prefix("tnt:")
-        .and_then(|raw| Uuid::parse_str(raw).ok())
+        .and_then(|raw| {
+            Uuid::parse_str(raw)
+                .ok()
+                .filter(|uuid| uuid.to_string() == raw)
+        })
         .is_some();
     if !valid {
         return Err(cloud_error(&format!(
@@ -841,6 +860,29 @@ fn require_tenant_id(tenant_id: Option<&str>, op: &str) -> Result<String, serde_
         )));
     }
     Ok(tenant_id.to_string())
+}
+
+/// Rule 3 of the Cloud contract: the tenant an op acts on is the one at the envelope root, and it
+/// is never the root tenant, which holds the system and its nodes. Everything the op reads or
+/// writes must belong to it; the stores answer anything of another tenant as missing (SY.admin
+/// re-checks all of this server-side).
+fn claimed_tenant(tenant_id: Option<&str>, op: &str) -> Result<String, serde_json::Value> {
+    let tenant_id = require_tenant_id(tenant_id, op)?;
+    if tenant_id == fluxbee_sdk::DEFAULT_ROOT_TENANT_ID {
+        return Err(cloud_error_code(
+            "TENANT_ROOT_PROTECTED",
+            &format!("{op} cannot act on the root tenant"),
+        ));
+    }
+    Ok(tenant_id)
+}
+
+/// Whether a request carries `tenant_id` inside `params` (it belongs at the envelope root).
+fn tenant_in_params(request: &Value) -> bool {
+    request
+        .get("params")
+        .and_then(|params| params.get("tenant_id"))
+        .is_some()
 }
 
 fn copy_optional_field(
@@ -883,14 +925,14 @@ fn translate_cloud_op(
             Ok(("create_tenant", serde_json::Value::Object(tenant)))
         }
         "put_token" => {
-            let tenant_id = require_tenant_id(tenant_id, "put_token")?;
+            let tenant_id = claimed_tenant(tenant_id, "put_token")?;
             let key = required_string(params, "key")?;
             // put_token stores PROVIDER tokens; the keys that protect the mesh itself (endpoint
             // bearers, edge TLS, spoke recovery keys) are reserved for SY.* internals. Reject early
             // with a clear error — SY.admin re-enforces this server-side (single source in the SDK).
             if is_cloud_reserved_vault_key(&key) {
                 return Err(cloud_error(
-                    "put_token may not write a reserved infrastructure key (edge_channel_secret:*, edge_tls, ssh:*)",
+                    "put_token may not write a reserved infrastructure key (edge_channel_secret:*, edge_tls*, ssh:*, edge_fanout_verify:*)",
                 ));
             }
             let value = params
@@ -945,7 +987,7 @@ fn translate_cloud_op(
             ))
         }
         "provision_node" => {
-            let tenant_id = require_tenant_id(tenant_id, "provision_node")?;
+            let tenant_id = claimed_tenant(tenant_id, "provision_node")?;
             let node_name = required_string(params, "node_name")?;
             if !node_name.starts_with("IO.") {
                 return Err(cloud_error("provision_node may launch only IO.* nodes"));
@@ -977,12 +1019,14 @@ fn translate_cloud_op(
             // `get_ilk` (SHM); this is the "give me everything" path. An email selector is
             // accepted too: `dispatch_cloud_op` pre-resolves email -> ilk_id from the SHM BEFORE
             // this translation runs, so by the time we get here a valid request always carries
-            // ilk_id (translation stays pure; admin/identity need no email selector).
+            // ilk_id (translation stays pure; admin/identity need no email selector). Scoped to the
+            // claimed tenant: SY.identity answers NOT_FOUND for an ilk of another one.
+            let tenant_id = claimed_tenant(tenant_id, op)?;
             let ilk_id = match required_string(params, "ilk_id") {
                 Ok(v) => v,
                 Err(_) => {
                     return Err(cloud_error(
-                        "get_ilk_details requires params.ilk_id (ilk:<uuid>) or params.email + params.tenant_id",
+                        "get_ilk_details requires params.ilk_id (ilk:<uuid>) or params.email",
                     ))
                 }
             };
@@ -991,13 +1035,16 @@ fn translate_cloud_op(
                     "get_ilk_details requires params.ilk_id as a canonical ilk:<uuid>",
                 ));
             }
-            Ok(("get_ilk", json!({ "ilk_id": ilk_id })))
+            Ok((
+                "get_ilk",
+                json!({ "ilk_id": ilk_id, "tenant_id": tenant_id }),
+            ))
         }
         // Lifecycle: mark / restore only (purge is operator-only). ALWAYS scoped to the tenant
         // Cloud claims: identity refuses an ilk of another tenant (ILK_TENANT_MISMATCH), and a
         // tenant op can only name the claimed tenant itself.
         "delete_ilk" | "restore_ilk" => {
-            let tenant_id = require_tenant_id(tenant_id, op)?;
+            let tenant_id = claimed_tenant(tenant_id, op)?;
             let ilk_id = required_string(params, "ilk_id")?;
             if !ilk_id.starts_with("ilk:") {
                 return Err(cloud_error(&format!(
@@ -1008,9 +1055,90 @@ fn translate_cloud_op(
             Ok((action, json!({ "ilk_id": ilk_id, "tenant_id": tenant_id })))
         }
         "delete_tenant" | "restore_tenant" => {
-            let tenant_id = require_tenant_id(tenant_id, op)?;
+            let tenant_id = claimed_tenant(tenant_id, op)?;
             let action = if op == "delete_tenant" { "delete_tenant" } else { "restore_tenant" };
             Ok((action, json!({ "tenant_id": tenant_id })))
+        }
+        // The tenant's credentials: metadata, version and use, never the value. Always filtered by
+        // the claimed tenant, so the listing holds that tenant's keys and nothing else.
+        "list_tokens" => {
+            let tenant_id = claimed_tenant(tenant_id, op)?;
+            let mut filter = serde_json::Map::new();
+            filter.insert("tenant_id".to_string(), json!(tenant_id));
+            for field in ["resource_type", "prefix"] {
+                if let Some(value) = params.get(field).filter(|value| !value.is_null()) {
+                    let text = value
+                        .as_str()
+                        .ok_or_else(|| cloud_error(&format!("params.{field} must be a string")))?;
+                    filter.insert(field.to_string(), json!(text));
+                }
+            }
+            if let Some(limit) = params.get("limit").filter(|value| !value.is_null()) {
+                let limit = limit
+                    .as_u64()
+                    .filter(|limit| (1..=1000).contains(limit))
+                    .ok_or_else(|| cloud_error("params.limit must be an integer from 1 to 1000"))?;
+                filter.insert("limit".to_string(), json!(limit));
+            }
+            Ok(("vault_list", json!({ "filter": filter })))
+        }
+        // One credential of the claimed tenant. SY.vault answers KEY_NOT_FOUND for a key of
+        // another tenant, exactly like a missing one.
+        "delete_token" => {
+            let tenant_id = claimed_tenant(tenant_id, op)?;
+            let key = required_string(params, "key")?;
+            if is_cloud_reserved_vault_key(&key) {
+                return Err(cloud_error(
+                    "delete_token may not delete a reserved infrastructure key (edge_channel_secret:*, edge_tls*, ssh:*, edge_fanout_verify:*)",
+                ));
+            }
+            Ok((
+                "vault_delete",
+                json!({ "key": key, "tenant_id": tenant_id }),
+            ))
+        }
+        // The claimed tenant's name and domain. Status, settings and the sponsor are the
+        // operator's: asking for them is refused, never dropped in silence.
+        "update_tenant" => {
+            let tenant_id = claimed_tenant(tenant_id, op)?;
+            let Some(fields) = params.as_object() else {
+                return Err(cloud_error(
+                    "update_tenant requires params.name and/or params.domain",
+                ));
+            };
+            if let Some(other) = fields
+                .keys()
+                .find(|key| !matches!(key.as_str(), "name" | "domain"))
+            {
+                return Err(cloud_error(&format!(
+                    "update_tenant edits only params.name and params.domain, not params.{other}"
+                )));
+            }
+            let mut update = serde_json::Map::new();
+            update.insert("tenant_id".to_string(), json!(tenant_id));
+            if let Some(name) = fields.get("name") {
+                let name = name
+                    .as_str()
+                    .map(str::trim)
+                    .filter(|name| !name.is_empty())
+                    .ok_or_else(|| cloud_error("params.name must be a non-empty string"))?;
+                update.insert("name".to_string(), json!(name));
+            }
+            if let Some(domain) = fields.get("domain") {
+                // null or "" clears the domain (SY.identity clears it on an empty string).
+                let domain = match domain {
+                    Value::Null => "",
+                    Value::String(domain) => domain.trim(),
+                    _ => return Err(cloud_error("params.domain must be a string or null")),
+                };
+                update.insert("domain".to_string(), json!(domain));
+            }
+            if update.len() == 1 {
+                return Err(cloud_error(
+                    "update_tenant requires params.name and/or params.domain",
+                ));
+            }
+            Ok(("update_tenant", Value::Object(update)))
         }
         "" => Err(cloud_error("missing 'op'")),
         other => Err(cloud_error(&format!("unknown op '{other}'"))),
@@ -1021,10 +1149,8 @@ fn translate_cloud_op(
 /// return the response payload. IO.cloud is the internal Fluxbee Cloud relay (spec §3): it injects
 /// the (trusted for the MVP — §1.2) tenant claim into each admin call and relays over the same
 /// `send_admin_rpc` seam it already uses. The op→action pairs come from the shared
-/// `fluxbee_sdk::cloud::CLOUD_OP_ACTIONS` (SY.admin's relay allowlist derives from the same table):
-///   create_tenant   -> create_tenant (Cloud-created tenants default to active)
-///   put_token       -> vault_put     (store a provider token in the tenant pool or for one IO node)
-///   provision_node  -> run_node      (spawn IO.<provider>@<tenant>; requires tenant_id)
+/// `fluxbee_sdk::cloud::CLOUD_OP_ACTIONS` (SY.admin's relay allowlist derives from the same table);
+/// `translate_cloud_op` rebuilds each admin payload from the fields that op takes.
 /// For an owner-scoped token the caller must provision_node BEFORE put_token (Caveat B: the
 /// `owner_node -> ilk` resolution needs the target node registered in identity SHM first). Tokens
 /// needed during first boot must be stored in the tenant pool by omitting owner_node.
@@ -1047,16 +1173,13 @@ async fn dispatch_cloud_op(
         // (a stale ilk_id next to a fresh email would silently win) — fail loud instead.
         if optional_trimmed(&params, "ilk_id").is_some() && optional_trimmed(&params, "email").is_some() {
             return cloud_error(
-                "get_ilk_details requires exactly one of params.ilk_id (ilk:<uuid>) or params.email (+ params.tenant_id)",
+                "get_ilk_details requires exactly one of params.ilk_id (ilk:<uuid>) or params.email",
             );
         }
         if let Some(email) = optional_trimmed(&params, "email") {
-            // Canonical-format check (see the local get_ilk email arm): fail loud on a
-            // malformed tenant instead of a silent hash-miss.
-            let tenant = match require_tenant_id(
-                optional_trimmed(&params, "tenant_id").as_deref(),
-                "get_ilk_details by email",
-            ) {
+            // The claimed tenant (canonical, never the root): a malformed one fails loud instead
+            // of a silent hash-miss.
+            let tenant = match claimed_tenant(tenant_id, "get_ilk_details") {
                 Ok(v) => v,
                 Err(e) => return e,
             };
@@ -1072,12 +1195,14 @@ async fn dispatch_cloud_op(
                 Ok(Some(resolved)) => {
                     params["ilk_id"] = json!(resolved.ilk.ilk_id);
                 }
+                // The same answer SY.identity gives by ilk_id, for a missing ilk and for one of
+                // another tenant alike.
                 Ok(None) => {
                     return json!({
                         "status": "error",
                         "op": op,
-                        "error_code": "ILK_NOT_FOUND",
-                        "error_detail": "no ilk with a cloud channel for that email in that tenant",
+                        "error_code": "NOT_FOUND",
+                        "error_detail": "no ilk with a cloud channel for that email in your tenant",
                     })
                 }
                 Err(err) => {
@@ -1128,7 +1253,7 @@ async fn dispatch_cloud_op(
             "error_code": res.error_code,
             "error_detail": res.error_detail.unwrap_or(res.payload),
         }),
-        Err(e) => cloud_error(&format!("admin call failed: {e}")),
+        Err(e) => cloud_error_code("ADMIN_UNAVAILABLE", &format!("admin call failed: {e}")),
     }
 }
 
@@ -1175,6 +1300,11 @@ fn ilk_shm_subset(i: &fluxbee_sdk::identity::IdentityIlkOption) -> Value {
 fn handle_shm_read(state: &Arc<RuntimeState>, msg: &Message, op: &str) -> Value {
     use fluxbee_sdk::identity::{list_ilks_from_hive_id, tenant_exists_in_hive_id};
     let params = msg.payload.get("params").cloned().unwrap_or_else(|| json!({}));
+    // The envelope's tenant (rule 3); `tenant_in_params` already refused one inside params.
+    let envelope_tenant = msg
+        .payload
+        .get("tenant_id")
+        .filter(|value| !value.is_null());
     let hive = state.config.hive_id.as_str();
     match op {
         "get_ilk" => {
@@ -1189,16 +1319,26 @@ fn handle_shm_read(state: &Arc<RuntimeState>, msg: &Message, op: &str) -> Value 
             let ilk_id = optional_trimmed(&params, "ilk_id");
             let email = optional_trimmed(&params, "email");
             match (ilk_id, email) {
-                (Some(ilk_id), None) => match list_ilks_from_hive_id(hive) {
-                    Ok(snap) => {
-                        let found = snap.ilks.iter().find(|i| i.ilk_id == ilk_id);
+                // By id: always within the claimed tenant; an ilk of another one is not there.
+                (Some(ilk_id), None) => match claimed_tenant(
+                    envelope_tenant.and_then(Value::as_str),
+                    "get_ilk by ilk_id",
+                )
+                .map(|tenant| (tenant, list_ilks_from_hive_id(hive)))
+                {
+                    Err(e) => e,
+                    Ok((tenant_id, Ok(snap))) => {
+                        let found = snap
+                            .ilks
+                            .iter()
+                            .find(|i| i.ilk_id == ilk_id && i.tenant_id == tenant_id);
                         json!({
                             "status": "ok",
                             "op": "get_ilk",
                             "result": { "exists": found.is_some(), "ilk": found.map(ilk_shm_subset) },
                         })
                     }
-                    Err(err) => cloud_error_code(
+                    Ok((_, Err(err))) => cloud_error_code(
                         "IDENTITY_SHM_UNAVAILABLE",
                         &format!("identity SHM read failed: {err}"),
                     ),
@@ -1212,16 +1352,14 @@ fn handle_shm_read(state: &Arc<RuntimeState>, msg: &Message, op: &str) -> Value 
                     // require_tenant_id — never silently widen a tenant-scoped probe into the
                     // hive-wide scan (the caller meant to scope it). Only a truly absent (or
                     // null) tenant_id selects the cross-tenant mode.
-                    let tenant_key_present = params
-                        .get("tenant_id")
-                        .is_some_and(|value| !value.is_null());
+                    let tenant_key_present = envelope_tenant.is_some();
                     match tenant_key_present {
                         // TENANT-SCOPED (0.1.32): O(1) probe of the (cloud, email, tenant) SHM
                         // index. Canonical-format check first — a typo'd tenant would silently
                         // hash-miss and report exists:false; fail loud instead.
                         true => {
-                            let tenant_id = match require_tenant_id(
-                                optional_trimmed(&params, "tenant_id").as_deref(),
+                            let tenant_id = match claimed_tenant(
+                                envelope_tenant.and_then(Value::as_str),
                                 "get_ilk by email",
                             ) {
                                 Ok(v) => v,
@@ -1334,12 +1472,12 @@ fn handle_shm_read(state: &Arc<RuntimeState>, msg: &Message, op: &str) -> Value 
                     }
                 }
                 _ => cloud_error(
-                    "get_ilk requires exactly one of params.ilk_id (ilk:<uuid>) or params.email (params.tenant_id optional: omit it to search across tenants)",
+                    "get_ilk requires exactly one of params.ilk_id (ilk:<uuid>) or params.email (by email the envelope tenant_id is optional: omit it to search across tenants)",
                 ),
             }
         }
         "get_tenant" => {
-            let tenant_id = match required_string(&params, "tenant_id") {
+            let tenant_id = match claimed_tenant(envelope_tenant.and_then(Value::as_str), op) {
                 Ok(v) => v,
                 Err(e) => return e,
             };
@@ -1354,7 +1492,7 @@ fn handle_shm_read(state: &Arc<RuntimeState>, msg: &Message, op: &str) -> Value 
             })
         }
         "list_ilks" => {
-            let tenant_id = match required_string(&params, "tenant_id") {
+            let tenant_id = match claimed_tenant(envelope_tenant.and_then(Value::as_str), op) {
                 Ok(v) => v,
                 Err(e) => return e,
             };
@@ -1771,7 +1909,8 @@ mod tests {
             admin_action_for_cloud_op, cloud_exposed_actions, CLOUD_OP_ACTIONS,
         };
         let tenant = "tnt:11111111-1111-4111-8111-111111111111";
-        // Superset of every exposed op's required params, so one loop body drives all three.
+        // Superset of every exposed op's required params, so one loop body drives them all
+        // (update_tenant takes name and domain only).
         let params = json!({
             "name": "acme",
             "key": "k", "value": {"t": "1"}, "resource_type": "bearer_token",
@@ -1779,7 +1918,12 @@ mod tests {
             "ilk_id": "ilk:22222222-2222-4222-8222-222222222222",
         });
         for (op, expected_action) in CLOUD_OP_ACTIONS {
-            let (action, _) = translate_cloud_op(op, Some(tenant), &params)
+            let op_params = if *op == "update_tenant" {
+                json!({"name": "acme"})
+            } else {
+                params.clone()
+            };
+            let (action, _) = translate_cloud_op(op, Some(tenant), &op_params)
                 .unwrap_or_else(|e| panic!("op {op} should translate: {e:?}"));
             assert_eq!(&action, expected_action, "op {op} action drift");
             assert_eq!(admin_action_for_cloud_op(op), Some(action));
@@ -1979,17 +2123,166 @@ mod tests {
 
     #[test]
     fn translate_get_ilk_details_relays_to_admin_get_ilk() {
-        let (action, p) = translate_cloud_op(
-            "get_ilk_details",
-            None,
-            &json!({"ilk_id": "ilk:22222222-2222-4222-8222-222222222222"}),
-        )
-        .unwrap();
+        let tenant = "tnt:11111111-1111-4111-8111-111111111111";
+        let ilk = json!({"ilk_id": "ilk:22222222-2222-4222-8222-222222222222"});
+        let (action, p) = translate_cloud_op("get_ilk_details", Some(tenant), &ilk).unwrap();
         assert_eq!(action, "get_ilk");
         assert_eq!(p["ilk_id"], "ilk:22222222-2222-4222-8222-222222222222");
-        // Needs a canonical ilk:<uuid>.
-        assert!(translate_cloud_op("get_ilk_details", None, &json!({"ilk_id": "nope"})).is_err());
-        assert!(translate_cloud_op("get_ilk_details", None, &json!({})).is_err());
+        // Scoped to the claimed tenant: SY.identity answers NOT_FOUND for another tenant's ilk.
+        assert_eq!(p["tenant_id"], tenant);
+        // Needs the claimed tenant (never the root) and a canonical ilk:<uuid>.
+        assert!(translate_cloud_op("get_ilk_details", None, &ilk).is_err());
+        let root = translate_cloud_op(
+            "get_ilk_details",
+            Some(fluxbee_sdk::DEFAULT_ROOT_TENANT_ID),
+            &ilk,
+        )
+        .unwrap_err();
+        assert_eq!(root["error_code"], "TENANT_ROOT_PROTECTED");
+        assert!(
+            translate_cloud_op("get_ilk_details", Some(tenant), &json!({"ilk_id": "nope"}))
+                .is_err()
+        );
+        assert!(translate_cloud_op("get_ilk_details", Some(tenant), &json!({})).is_err());
+    }
+
+    #[test]
+    fn every_tenant_op_takes_the_claimed_tenant_and_never_the_root() {
+        let root = fluxbee_sdk::DEFAULT_ROOT_TENANT_ID;
+        let params = json!({
+            "key": "google:acme:sales", "value": {"t": "1"}, "resource_type": "gmail",
+            "node_name": "IO.wapp@motherbee", "ilk_id": "ilk:22222222-2222-4222-8222-222222222222",
+        });
+        for op in [
+            "put_token",
+            "provision_node",
+            "get_ilk_details",
+            "delete_ilk",
+            "restore_ilk",
+            "delete_tenant",
+            "restore_tenant",
+            "list_tokens",
+            "delete_token",
+            "update_tenant",
+        ] {
+            let op_params = if op == "update_tenant" {
+                json!({"name": "Acme"})
+            } else {
+                params.clone()
+            };
+            let err = translate_cloud_op(op, Some(root), &op_params).unwrap_err();
+            assert_eq!(err["error_code"], "TENANT_ROOT_PROTECTED", "{op}");
+            let err = translate_cloud_op(op, None, &op_params).unwrap_err();
+            assert_eq!(err["error_code"], "INVALID_REQUEST", "{op}");
+        }
+        // Only the canonical spelling: other spellings of a UUID (the root's included) name no
+        // tenant the stores know.
+        for spelling in [
+            "tnt:00000000000000000000000000000001",
+            "tnt:{00000000-0000-0000-0000-000000000001}",
+            "tnt:AAAAAAAA-AAAA-4AAA-8AAA-AAAAAAAAAAAA",
+        ] {
+            let err = translate_cloud_op("delete_tenant", Some(spelling), &json!({})).unwrap_err();
+            assert_eq!(err["error_code"], "INVALID_REQUEST", "{spelling}");
+        }
+        // create_tenant has no tenant yet.
+        assert!(translate_cloud_op("create_tenant", None, &json!({"name": "Acme"})).is_ok());
+        // A tenant inside params is spotted (run_loop refuses it before any op runs).
+        assert!(tenant_in_params(
+            &json!({"op": "get_ilk", "params": {"tenant_id": "tnt:x"}})
+        ));
+        assert!(!tenant_in_params(
+            &json!({"op": "get_ilk", "tenant_id": "tnt:x", "params": {}})
+        ));
+        // Every error io.cloud writes has a code.
+        assert_eq!(cloud_error("x")["error_code"], "INVALID_REQUEST");
+    }
+
+    #[test]
+    fn translate_list_and_delete_tokens_stay_in_the_claimed_tenant() {
+        let tenant = "tnt:11111111-1111-4111-8111-111111111111";
+        let (action, p) = translate_cloud_op(
+            "list_tokens",
+            Some(tenant),
+            &json!({"resource_type": "gmail", "prefix": "google:", "limit": 50, "ilk": "ilk:x", "tags": ["a"]}),
+        )
+        .unwrap();
+        assert_eq!(action, "vault_list");
+        // Only the tenant, resource type, prefix and limit reach the filter.
+        assert_eq!(
+            p,
+            json!({"filter": {"tenant_id": tenant, "resource_type": "gmail", "prefix": "google:", "limit": 50}})
+        );
+        let (_, p) = translate_cloud_op("list_tokens", Some(tenant), &json!({})).unwrap();
+        assert_eq!(p, json!({"filter": {"tenant_id": tenant}}));
+        for bad in [
+            json!({"limit": 0}),
+            json!({"limit": 1001}),
+            json!({"limit": "10"}),
+            json!({"prefix": 3}),
+        ] {
+            assert!(
+                translate_cloud_op("list_tokens", Some(tenant), &bad).is_err(),
+                "{bad}"
+            );
+        }
+
+        let (action, p) = translate_cloud_op(
+            "delete_token",
+            Some(tenant),
+            &json!({"key": "google:acme:sales"}),
+        )
+        .unwrap();
+        assert_eq!(action, "vault_delete");
+        assert_eq!(p, json!({"key": "google:acme:sales", "tenant_id": tenant}));
+        assert!(translate_cloud_op("delete_token", Some(tenant), &json!({})).is_err());
+        for reserved in [
+            "edge_tls_fluxbee_ai",
+            "edge_channel_secret:ich:x",
+            "ssh:motherbee",
+            "edge_fanout_verify:ich:x",
+        ] {
+            assert!(
+                translate_cloud_op("delete_token", Some(tenant), &json!({"key": reserved}))
+                    .is_err(),
+                "{reserved}"
+            );
+        }
+    }
+
+    #[test]
+    fn translate_update_tenant_edits_only_name_and_domain() {
+        let tenant = "tnt:11111111-1111-4111-8111-111111111111";
+        let (action, p) = translate_cloud_op(
+            "update_tenant",
+            Some(tenant),
+            &json!({"name": "  Acme S.A. ", "domain": "Acme.com"}),
+        )
+        .unwrap();
+        assert_eq!(action, "update_tenant");
+        assert_eq!(
+            p,
+            json!({"tenant_id": tenant, "name": "Acme S.A.", "domain": "Acme.com"})
+        );
+        // null clears the domain (an empty string for SY.identity).
+        let (_, p) =
+            translate_cloud_op("update_tenant", Some(tenant), &json!({"domain": null})).unwrap();
+        assert_eq!(p, json!({"tenant_id": tenant, "domain": ""}));
+        // Nothing to change, an empty name, or an operator field: refused, never dropped in silence.
+        for bad in [
+            json!({}),
+            json!({"name": "  "}),
+            json!({"name": 3}),
+            json!({"domain": 3}),
+            json!({"name": "Acme", "status": "suspended"}),
+            json!({"settings": {}}),
+            json!({"sponsor_tenant_id": null}),
+        ] {
+            assert!(
+                translate_cloud_op("update_tenant", Some(tenant), &bad).is_err(),
+                "{bad}"
+            );
+        }
     }
 
     #[test]
@@ -1998,11 +2291,13 @@ mod tests {
         for reserved in [
             "edge_channel_secret:ich:14b66389-d425-531c-a140-a591d25e8f39",
             "edge_tls",
+            "edge_tls_fluxbee_ai",
             "ssh:motherbee",
+            "edge_fanout_verify:ich:14b66389-d425-531c-a140-a591d25e8f39",
         ] {
             let err = translate_cloud_op(
                 "put_token",
-                Some("tnt:00000000-0000-0000-0000-000000000001"),
+                Some("tnt:11111111-1111-4111-8111-111111111111"),
                 &json!({"key": reserved, "value": {"secret": "x"}, "resource_type": "bearer_token"}),
             )
             .unwrap_err();
@@ -2017,7 +2312,7 @@ mod tests {
         // A normal provider token still translates fine.
         let (action, _p) = translate_cloud_op(
             "put_token",
-            Some("tnt:00000000-0000-0000-0000-000000000001"),
+            Some("tnt:11111111-1111-4111-8111-111111111111"),
             &json!({"key": "slack:auth:bot", "value": {"token": "xoxb"}, "resource_type": "slack"}),
         )
         .unwrap();
