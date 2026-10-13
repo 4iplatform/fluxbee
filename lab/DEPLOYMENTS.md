@@ -21,6 +21,7 @@
 
 | Versión | Fecha (ART) | Commit | Alcance | Estado | Rollback |
 |---|---|---|---|---|---|
+| **0.1.64** | 2026-10-13 | `f8c73c5` | motherbee + spokes (core) | ✅ live | snap `pre-cloud-0-1-64` (las 4 VMs) · `apt install fluxbee=0.1.63` |
 | **0.1.63** | 2026-10-06 | `aab0e3e` | motherbee + spokes (core) | ✅ live | snap `pre-a58-0-1-63` (las 4 VMs) · `apt install fluxbee=0.1.62` (HANDBOOK, rollback bajo 0.1.63) |
 | **0.1.62** | 2026-10-06 | `b4868e8` | motherbee + spokes (core) | ✅ live | snap `pre-identity-0-1-62` (las 4 VMs) · `apt install fluxbee=0.1.61` (spokes primero) |
 | **0.1.61** | 2026-10-06 | `e0f2d04` | motherbee + spokes (core) | ✅ live | snap `pre-ssh-0-1-61` (las 4 VMs) · `apt install fluxbee=0.1.60` |
@@ -72,6 +73,72 @@
 > (`dpkg-scanpackages -m`) para rollback, pero su detalle vive en la bitácora, no acá.
 
 ---
+
+## 0.1.64 — Cloud gestiona las credenciales y el nombre de su empresa; toda escritura al vault nombra su tenant (A-61)
+
+- **Fecha:** 2026-10-13 (ART) · **Versión anterior:** 0.1.63 · **Commit:** `f8c73c5` (FINDINGS
+  A-61, A-62). Una sola revisión adversarial: un MAJOR (el factory reset) y seis menores, todos
+  arreglados antes del build.
+- **Alcance:** motherbee + los tres spokes (core-update).
+- **Qué cambió:**
+  - **SY.vault, para todos los llamadores:**
+    - un put de una clave de otro tenant es `KEY_TAKEN` y nunca la mueve;
+    - borrar, rotar y volver atrás llevan `tenant_id`, y una clave de otro tenant contesta
+      `KEY_NOT_FOUND`, con el mismo texto que una inexistente;
+    - el admin pone el raíz si no viene, acepta `?tenant_id=` por HTTP y tiene el campo en los planes
+      de Archi;
+    - el orquestador y el factory reset borran cada clave en su tenant.
+  - **SY.identity:**
+    - ILK_GET con tenant;
+    - `update_tenant` rechaza el raíz y un nombre o dominio de otro tenant, y valida todo antes de
+      cambiar nada.
+  - **IO.cloud:**
+    - la regla 3: el tenant va solo en la raíz del sobre, nunca es el raíz, y todo es de ese tenant;
+    - `list_tokens`, `delete_token` y `update_tenant`;
+    - todo error con `error_code`.
+
+    SY.admin lo vuelve a exigir del lado del servidor. Archi y la limpieza de un nodo conservan sus
+    acciones por la malla.
+  - **Contrato:** `docs/io-cloud-api.md` reescrito.
+- **Deploy:**
+  - build `f8c73c5` en 28,5 min (tocó el SDK);
+  - publish en 12 s;
+  - deploy en 233 s;
+  - snapshots `pre-cloud-0-1-64` en las 4 VMs (se borró `pre-ssh-0-1-61`);
+  - versiones 0.1.64 con el mismo manifest en los 4, health `failed=0`, OPA `in_sync` 4/4.
+- **Antes del deploy:** en 30 días PROD no tuvo tráfico real de Cloud, solo los e2e del 2026-09-28
+  y sondas. El cambio de contrato (el tenant de las lecturas pasa a la raíz del sobre) no rompió a
+  nadie en PROD. El hive de DEV del equipo de Cloud tiene que coordinarse antes de pasar a 0.1.64.
+- **Gate:**
+  - **Por la puerta pública real, desde afuera, con el bearer de Cloud:** 53 controles, todos PASS.
+    - El catálogo ofrece 16 operaciones.
+    - Regla 3: el tenant en `params`, el raíz y una grafía en mayúsculas son rechazados; sin tenant
+      hay error con código.
+    - Credenciales: put de A; la misma clave desde B es `KEY_TAKEN`, también con el mismo valor.
+    - Claves reservadas: rechazadas al escribir y al borrar.
+    - `list_tokens`: A ve su clave con la metadata y sin el valor, y B no ve nada.
+    - Borrar desde B la clave de A da `KEY_NOT_FOUND`, con el mismo texto que una inexistente; el
+      borrado propio funciona.
+    - `update_tenant`: el renombre funciona; el nombre y el dominio de B están tomados; el status es
+      del operador; vaciar el dominio funciona; el raíz está protegido.
+    - Una persona en A: B no la ve ni por id ni por email; el primer login por email la encuentra en
+      A.
+    - `delete_ilk` desde B da `ILK_TENANT_MISMATCH`.
+    - Nodos: `provision_node` en el raíz está protegido; un nodo en A con un token propio funciona.
+  - **Del lado del operador:**
+    - matar el nodo con purga borró su secreto del tenant A;
+    - `DELETE` por HTTP sin tenant da 404 para una clave de A, y con `?tenant_id=` la borra;
+    - la misma clave del raíz desde A da 409 `KEY_TAKEN`;
+    - Archi corrió por la malla `vault_list` y `get_ilk`. Antes de esta versión, `get_ilk` le
+      quedaba rechazado.
+- **Limpieza:** los dos tenants marcados por Cloud y purgados por el operador (con la persona), el
+  nodo purgado, las dos sesiones de Archi borradas. El vault quedó en sus 4 claves de
+  infraestructura.
+- **Visto de paso (menor, sin arreglar):** `GET` de un tenant purgado contesta 500
+  `TENANT_NOT_FOUND`; el código no está en el mapa de 404 del admin HTTP.
+- **Rollback:**
+  - snapshot `pre-cloud-0-1-64`, o `apt install fluxbee=0.1.63`;
+  - no hay migración de datos: los registros del vault no cambiaron de forma.
 
 ## 0.1.63 — Syncthing corre como `fluxbee` en todos los hosts (A-58); los blobs se escriben y se leen por descriptor y toman el dueño de su carpeta (A-56)
 

@@ -554,4 +554,20 @@ post '{"op":"list_cloud_actions"}'
 
 ## 10. Checked live
 
-Re-checked on PROD for 0.1.64 (see `lab/DEPLOYMENTS.md`): to be filled by the release validation.
+On PROD, 2026-10-13, through the public door from outside, with Cloud's token: 53 checks of
+§3–§5, all passing (`lab/DEPLOYMENTS.md`, 0.1.64):
+
+- the catalog lists 16 ops;
+- rule 3: the envelope tenant only, never the root, the canonical spelling only;
+- credentials:
+  - `KEY_TAKEN` across companies, even with the same value;
+  - the listing shows metadata and never the value;
+  - another company's key reads exactly like a missing one;
+  - reserved keys are refused;
+- `update_tenant` with its `*_TAKEN` codes;
+- a person invisible to the other company, by id and by email, and found by the first-login search;
+- `ILK_TENANT_MISMATCH`;
+- a node in the company with its own credential, which the node's teardown deleted.
+
+The status and error codes, and the fields those checks read, matched §5. The rest of each example
+body comes from the code.

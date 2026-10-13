@@ -427,10 +427,19 @@ Before A-49:
 |---|---|---|
 | O9 | How software enters an installation. The operator wants to keep apt, the natural Linux path (*"no quiero perder el APT natural de linux"*); a build node inside the infrastructure that propagates the software to the motherbee with apt is acceptable; publishing through IO.web with a token was raised. | To be discussed with details after revision 10. A-49 (§3.9) waits for it. |
 
-Before stages 6–7 (the Cloud phase):
+Before stages 6–7 (the Cloud phase). **Decided by the operator on 2026-10-13**, with the order of
+the Cloud track: IO.cloud's functions first (0.1.64, FINDINGS A-61), then the identity talk (a person
+in several companies, parent/child tenants), then the certificate, then IO.web, Archi and the blob
+docs, together. One track at a time.
 
-| ID | Question | Options and recommendation |
+| ID | Question | Decision (2026-10-13) |
 |---|---|---|
+| O5 | The trust anchor for Archi through Cloud. Today a compromised ingress can mint and use an Archi session by itself, and it is already the trust anchor of every IO.cloud action (it checks Cloud's bearer and sees the traffic in clear). | **(a), and the same security for IO.cloud and IO.web** (*"la seguridad igual en los dos"*): if IO.cloud has no hole, IO.web must not open one. Proposal to settle in the io.web v2 spec: each gets its own host (`cloud.<id>`, `archi.<id>`), the edge passes it through by SNI without opening it, each node terminates its own TLS, and Cloud authenticates to IO.cloud with a client certificate (mTLS). Signing each command instead would leave the edge seeing everything in clear. |
+| O6 | Certificate source with manual DNS. | **Let's Encrypt, TLS-ALPN-01 on the :443 already open** (no port 80, no DNS credentials anywhere, no wildcard), each holder its own certificate (the edge for `<id>`, IO.web for `archi.<id>` through the passthrough); expiry and the last renewal in the report, alert at 21 days. The 1-year option is gone: CA/B Forum SC-081 caps public certificates at 200 days since 2026-03-15 and 100 from 2027-03-15. Nothing to do today: the brand wildcard covers `<id>` until 2027-02-12, but never `archi.<id>` (one label only). It goes with Archi through Cloud. |
+| O7 | More than one ingress per installation. | **No:** one ingress, one egress and one edge per installation, each installation under its own public name so many can live on the internet. Manual failover (the A record). |
+| O8 | Tenant label in tenant paths, and per-tenant hosts. | **Neither.** Public URLs already follow one pattern: opaque ids (`/e/<ich>`, `/public/<key>`), the tenant inside the request or the record, never in the URL. IO.web's artifacts follow it; `/t/<label>/` (§4.4) is withdrawn. Archi is one per installation, not per tenant. |
+
+---|---|---|
 | O5 | The trust anchor for Archi through Cloud. Today a compromised ingress can mint and use an Archi session by itself. | **(a) Recommended: end to end.** Cloud signs the mint with a key pinned on the motherbee; the code goes back encrypted to Cloud; the edge passes `archi.<id>` through by SNI to IO.web, which holds the only certificate for it. (b) Accept the risk in A-46. |
 | O6 | Certificate source with manual DNS. | **(a) Recommended for now:** a 1-year per-installation certificate. (b) ACME with `_acme-challenge.<id>` delegated by CNAME. Under O5(a), the edge certificate does not cover `archi.<id>`. |
 | O7 | More than one ingress per installation. | Publication is single-edge today, so DNS points at one ingress. *"Edge replicado"* / *"cloud replica"* reads as Cloud mirroring Archi. To confirm. |
@@ -1037,9 +1046,10 @@ and `nosniff`.
 **Superseded.** Edge v6 I2 gets one named exception: operator-session access to Archi. io-cloud spec
 §3.2/§8.4/§10 are updated in the same change.
 
-### 4.4 Tenant content as a directory (D13)
+### 4.4 Tenant content on the installation host (D13)
 
-- **Where:** under `https://<id>.fluxbee.ai/t/<label>/…` (O8), next to `/e/` and `/public/`.
+- **Where:** on `https://<id>.fluxbee.ai`, under opaque ids like `/e/` and `/public/` (O8,
+  2026-10-13: no tenant label in a path, no `/t/<label>/`).
 - **Why it is safe:** that host carries no cookies, and active content is sandboxed.
 - **Edge invariants:**
   - never pass `Set-Cookie`;
@@ -1050,7 +1060,7 @@ and `nosniff`.
 
   | Host | Serves |
   |---|---|
-  | `<id>` | `/e/`, `/public/`, `/t/` |
+  | `<id>` | `/e/`, `/public/` |
   | `archi.<id>` | only the IO.web system route |
   | anything else | 404 |
 
@@ -1076,7 +1086,7 @@ PROD: `hive-k3m9x7q2`.
 
 | Host | Serves |
 |---|---|
-| `<id>.fluxbee.ai` | `/e/<ich>`, `/public/<key>`, tenant directories |
+| `<id>.fluxbee.ai` | `/e/<ich>`, `/public/<key>` (and IO.web artifacts under opaque ids, O8) |
 | `archi.<id>.fluxbee.ai` | Archi, operators only |
 
 ### 5.3 DNS and certificate (manual now)

@@ -1010,7 +1010,7 @@ Visto al arreglar los e2e de A-37, leyendo `src/router/mod.rs` y `src/shm/mod.rs
 - **Cuándo mirarlo:** junto con A-60 (nodos sin root). Ahí sí pasa a importar quién puede pedir qué.
   Forma probable: una lista por prefijo de rol, con lo de sistema solo para `SY.*`.
 
-### A-61 ✅ RESUELTO EN CÓDIGO (0.1.64) — Cloud podía pisar claves de otro tenant y leer identidades de cualquier tenant
+### A-61 ✅ RESUELTO (0.1.64, validado en 8.x) — Cloud podía pisar claves de otro tenant y leer identidades de cualquier tenant
 
 - **Qué pasaba (revisión de las fichas del equipo de Cloud, 2026-10-07):**
   - `put_token` pisaba una clave existente de **cualquier** tenant, también de infraestructura (la
@@ -1057,6 +1057,10 @@ Visto al arreglar los e2e de A-37, leyendo `src/router/mod.rs` y `src/shm/mod.rs
   último no cambia el ILK, solo la metadata del secreto.
 - **Contrato:** `docs/io-cloud-api.md`, reescrito al estado real (estaba en 3 operaciones y
   configuración por `.env`).
+- **Validado en 8.x (0.1.64, 2026-10-13):** 53 controles por la puerta pública real con el bearer
+  de Cloud y los del lado del operador (la purga del nodo borró su secreto en su tenant, el `DELETE`
+  HTTP con y sin tenant, Archi por la malla), todos PASS (ledger 0.1.64). Pendiente menor: el admin
+  HTTP mapea `TENANT_NOT_FOUND` a 500.
 
 ### A-60 🔵 PARA EVALUAR (pedido del operador, 2026-10-06) — Los nodos administrados corren como root
 
