@@ -55,7 +55,10 @@ companies, members, billing and the law.
 - **Tenant lifecycle:**
   - deleting a tenant marks every person charged to it (the 2026-09-28 cascade);
   - node identities block the delete.
-- **Tenant status is not enforced anywhere:** the SHM writes every tenant as active.
+- **Tenant status is not enforced anywhere:** each tenant's real status (pending, active, suspended)
+  reaches the identity SHM, and a deleted tenant is left out of it, but nothing reads it to refuse.
+  (This line said "the SHM writes every tenant as active" until 2026-10-14: wrong, the operator
+  caught it.)
 - **No metering.** The AI SDK reads the tokens of each model call and discards them.
 - **Sponsors** (one per tenant, no cycles) are stored and shown, and grant nothing.
 - **Not tenant-based already:** SYSTEM authority (OPA, by node role and hive) and the unpublishing of
@@ -165,6 +168,11 @@ and a purge would remove it. This is the first piece of D8.
   everyone until a purge. It stays pending; the relay's next signup of that email takes it over;
   purging the tenant removes it if it is still charged there. The answer counts them
   (`pending_signups`).
+- **A pending signup is readable as such** (D11, *"que se puedan leer las pendientes"*):
+  - `pending_signup` in every ILK the operator, Archi and Cloud read;
+  - the operator's list filters `?pending_signup=true`, wherever they are charged, deleted
+    tenants included;
+  - the boot report names the ones left charged to a deleted tenant.
 - Other humans charged to it (channel identities, temporaries without an account) still cascade as
   decided on 2026-09-28.
 
@@ -196,27 +204,70 @@ this, the channel rows' foreign key to the tenant made the purge fail.
     comes back in the installation-wide scope, as the migration would have moved it;
   - otherwise it comes back where it was.
 
-### 2.2 Permissions on resources (stage 2: SY.vault)
+### 2.2 Secrets (stage 2: SY.vault)
 
-**Today:** a secret dedicated to an ILK; the root pool for system callers; a tenant's pool by tenant
-equality. **The third one goes.**
+Decided with the operator on 2026-10-14, after stage 1 went live: *"tenant no es identidad ni
+seguridad ... el secret se guarda con el tenant para filtrar el uso del que paga"*.
 
-**Target:**
-- explicit grants `ILK → secret → {use, administer}`, plus access groups for sharing among nodes. A
-  group stands for access only, never for billing or a company;
-- a secret's `tenant_id` becomes metadata: the cost center it is administered under, which Cloud's
-  listings use.
+**What a secret carries:**
+- **its tenant:** who pays for its use. It filters Cloud's listings and administration, and the
+  vault checks it in one way only (below);
+- **optionally an owner:** a node or a person (an ILK);
+- **optionally the nodes it is assigned to:** one or several.
 
-**What has to change:**
-- the SDK's resolution: dedicated, then granted;
-- the change notifications and the credential caches: revoking a grant must stop later use;
-- `vault_list`: discovery limited by grant.
+**Who reads it:**
+- its owner, when the owner is a node;
+- a node it is assigned to;
+- for a **general** secret (no owner, no assigned node): every node charged to its tenant. Cloud
+  decides it by saving the secret that way (*"es un recurso fácil de usar"*: a company's AI key for
+  tests or a small system, a database for its new nodes). A node looks for its own secret first
+  (owned or assigned), then its tenant's general one;
+- the genesis tenant's general secrets are the system's keys (the database, the hive's AI keys):
+  the core reads them as any tenant's nodes read theirs, and at boot even before the identity SHM
+  exists (the well-known system ILK path, as today).
 
-**Migration:** every pool secret becomes explicit grants to the ILKs that can read it today. They are
-recorded and reported before the tenant rule is removed.
+**The tenant check:** the vault hands out a secret only while its tenant exists and is active. It
+reads that from the identity SHM, which already carries the real status and leaves deleted tenants
+out. The genesis tenant always counts as active.
 
-**To decide at stage 2:** the shape of groups, and Cloud's credential operations (whom a token is
-for).
+**What keeps this sound:**
+- **A node is born and dies in its tenant:** it is never reassigned; identity and the orchestrator
+  refuse it. "Every node of the tenant" is therefore a stable set.
+- **People are reassigned, and a person can own secrets:** for example, their access to an ERP or
+  another system outside Fluxbee. Which node uses a person's secret is assigned explicitly when the
+  case comes; for the vault, the person being an ILK is enough. Changing the person's tenant
+  changes nothing about who reads it.
+- **Only the core is born in the genesis tenant:** SY.\*, RT.\* and the core IO runtimes (io.cloud,
+  io.blob, io.web). The orchestrator defines the core, since it is who gives out the genesis tenant,
+  and refuses every other node there. Today it refuses other IO nodes only, and an AI or WF node can
+  still be launched there, a leftover of the tests. Cloud never acts on the genesis tenant (rule
+  3).
+- **No access groups and no installation-wide key.**
+
+**What changes:**
+- **SY.vault:** the assigned nodes on the secret, the tenant check, and a person as owner. The read
+  rules for owned and general secrets stay as they are.
+- **Change notifications:** an assigned node is notified, and so is a node removed from the list,
+  so it drops its cached value.
+- **The SDK's resolution:** owned or assigned to me, then my tenant's general secret. The third
+  step goes: the root tenant's secret for any node. It never worked for a company's node, because
+  the vault refuses it, so A-35's fallback was dead; the docs that promise it change.
+- **Identity and the orchestrator:** a node's tenant is fixed, and only the core is born in the
+  genesis tenant.
+- **Cloud (IO.cloud and SY.admin):**
+  - `put_token` with an owner (a node or a person), with nodes, or general;
+  - assigning and unassigning nodes without rewriting the value;
+  - `list_tokens` showing the owner, the nodes or "general".
+
+  The assigned nodes must be charged to the secret's tenant: Cloud reads the nodes from Fluxbee's
+  inventory and stores nothing of its own (*"cloud no guarda nada, tiene que leer todo y
+  gestionar"*).
+- **Later, not in stage 2:** the inventory reads for Cloud (which nodes use which token), and an
+  email and password login. The vault would hold the credential, and an IO.login node would serve
+  it.
+
+**Migration:** none. Every secret keeps its meaning: a dedicated one stays dedicated, and an
+owner-less one is its tenant's general secret, as today.
 
 ### 2.3 The tenant as a cost center (stage 3)
 
@@ -224,7 +275,7 @@ for).
 settings, sponsor. The sponsor is stored flat and grants nothing.
 
 **The status gate: a suspended tenant cannot use the infrastructure.**
-- The SHM carries the real tenant status.
+- The SHM already carries the real tenant status; the vault starts using it in stage 2.
 - The orchestrator refuses to start a node charged to a suspended tenant.
 - The router refuses traffic from and to ILKs charged to one.
 - AI nodes do not spend for one.
@@ -283,7 +334,7 @@ Every stage goes through:
 | Stage | Content | Gate (beyond unit tests) |
 |---|---|---|
 | 1 | ILK structure (§2.1) and its IO.cloud part. | On PROD, through Cloud's public door: <br>• the same email registered from two tenants gives one ILK; <br>• `set_ilk_tenant` moves the person, and the person's `cloud` and IO channels still resolve; <br>• the person keeps their channels after an identity restart (DB reload); <br>• worker1's identity replica shows the new tenant; <br>• a read by id across tenants works, and Cloud is refused a node's ILK on delete; <br>• a tenant with an account charged is refused (`TENANT_HAS_ACCOUNTS`), and purging the tenant a person left drops their keys there; <br>• the migration on data made with 0.1.64: a unique email moves, an email in two tenants is reported and refused (`ACCOUNT_AMBIGUOUS`). |
-| 2 | Vault grants (§2.2). | The pool migration report, and a node's credentials unchanged after it. The two invariants: sharing a tenant grants nothing, and a different tenant blocks nothing that was granted. |
+| 2 | Secrets (§2.2). | On PROD: <br>• a company's token assigned to two of its nodes reaches both and not a third; unassigned, one stops at once; <br>• a general token reaches every node of its company and none of another; <br>• a suspended or deleted tenant's secrets are not handed out, and come back when it is reactivated; <br>• a person's secret assigned to a node reaches it, and the person's reassignment changes nothing; <br>• the genesis tenant refuses an AI node, and the core still reads its keys after a restart; <br>• a node's tenant cannot change; <br>• Cloud stores, assigns and lists through the public door. |
 | 3 | Tenant firm (§2.3). | Suspend a test tenant: its node does not start, its traffic is refused, it spends nothing. Reactivate: everything works again. A tenant delete with ILKs charged is refused. |
 | 4 | Cloud (§2.4), whatever did not ship with 1–3. | The contract doc checked live. |
 | 5 | Tokens (§2.5). | Designed first. |
@@ -299,10 +350,12 @@ Every stage goes through:
 | D3 | A suspended tenant cannot use the infrastructure. | Decided 2026-10-14 |
 | D4 | Cloud deletes and restores human ILKs only. | Decided 2026-10-14 |
 | D5 | Order: ILK structure, tenant, Cloud, tokens. | Decided 2026-10-14 |
-| D6 | Stage 1 reassigns human ILKs only; nodes with stage 2. | Proposed |
-| D7 | One Cloud account per email (installation-wide scope); no automatic merge of existing duplicates. | Proposed |
-| D8 | Deleting a tenant is refused while ILKs are charged to it (replaces the cascade of people). | Stage 1 takes the account part (§2.1); the rest is proposed for stage 3 |
-| D9 | The vault grant model's shape. | Stage 2 |
+| D6 | People are reassigned (stage 1). A node is born and dies in its tenant and is never reassigned. | Decided 2026-10-14 |
+| D7 | One Cloud account per email (installation-wide scope); no automatic merge of existing duplicates. | Live in 0.1.65 |
+| D8 | Deleting a tenant is refused while ILKs are charged to it (replaces the cascade of people). | The account part decided 2026-10-14 and live in 0.1.65 (§2.1); the rest proposed for stage 3 |
+| D9 | Secrets (§2.2): the tenant is who pays, and the vault checks only that it exists and is active. An owner (node or person), assigned nodes, or general (every node of its tenant). No groups, no installation-wide key. | Decided 2026-10-14 |
+| D10 | Only the core (SY.\*, RT.\*, the core IO runtimes) is born in the genesis tenant; the orchestrator defines the core. | Decided 2026-10-14 |
+| D11 | A pending signup is readable as such (`pending_signup`), wherever it is charged. | Decided 2026-10-14 |
 
 ## 5. Related
 
