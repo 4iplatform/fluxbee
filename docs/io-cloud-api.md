@@ -630,8 +630,23 @@ post '{"op":"list_cloud_actions"}'
 
 ## 10. Checked live
 
-On PROD, 2026-10-13, through the public door from outside, with Cloud's token: 53 checks of
-§3–§5, all passing (`lab/DEPLOYMENTS.md`, 0.1.64):
+**0.1.65:** on PROD, 2026-10-14, through the public door from outside, with Cloud's token: 30 checks,
+all passing (`lab/DEPLOYMENTS.md`, 0.1.65). The data was made with 0.1.64 first: the same email from
+two companies, a unique email, a deleted person.
+
+- the email held twice answers `ACCOUNT_AMBIGUOUS`;
+- the unique email, asked from another company, answers its account (`existing: true`, still
+  charged where it was);
+- a new account asked from two companies is one identity;
+- `set_ilk_tenant` moves it (`changed: false` the second time), never to the root tenant;
+- a person deleted before 0.1.65, once restored, is where `register_human` finds her;
+- reads by id across companies work;
+- `delete_ilk` of a node answers `ILK_TYPE_MISMATCH`;
+- `delete_tenant` with an account charged answers `TENANT_HAS_ACCOUNTS`;
+- once the operator purged the extra identity and the hive restarted, the email that had been held
+  twice answered its one account.
+
+**0.1.64:** on PROD, 2026-10-13, same door and token: 53 checks of §3–§5, all passing.
 
 - the catalog lists 16 ops;
 - rule 3: the envelope tenant only, never the root, the canonical spelling only;
@@ -641,9 +656,11 @@ On PROD, 2026-10-13, through the public door from outside, with Cloud's token: 5
   - another company's key reads exactly like a missing one;
   - reserved keys are refused;
 - `update_tenant` with its `*_TAKEN` codes;
-- a person invisible to the other company, by id and by email, and found by the first-login search;
-- `ILK_TENANT_MISMATCH`;
 - a node in the company with its own credential, which the node's teardown deleted.
+
+Two of its checks no longer hold since 0.1.65: a person read by id from another company (now
+visible, since a tenant is a cost center), and `delete_ilk` from another company
+(`ILK_TENANT_MISMATCH`; now `delete_ilk` takes no tenant and acts on people only).
 
 The status and error codes, and the fields those checks read, matched §5. The rest of each example
 body comes from the code.

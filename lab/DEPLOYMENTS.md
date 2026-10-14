@@ -21,6 +21,7 @@
 
 | Versión | Fecha (ART) | Commit | Alcance | Estado | Rollback |
 |---|---|---|---|---|---|
+| **0.1.65** | 2026-10-14 | `8b3e951` | motherbee + spokes (core) | ✅ live | snap `pre-scope-0-1-65` (las 4 VMs) · `apt install fluxbee=0.1.64` (la migración v3 no se deshace; ver la entrada) |
 | **0.1.64** | 2026-10-13 | `f8c73c5` | motherbee + spokes (core) | ✅ live | snap `pre-cloud-0-1-64` (las 4 VMs) · `apt install fluxbee=0.1.63` |
 | **0.1.63** | 2026-10-06 | `aab0e3e` | motherbee + spokes (core) | ✅ live | snap `pre-a58-0-1-63` (las 4 VMs) · `apt install fluxbee=0.1.62` (HANDBOOK, rollback bajo 0.1.63) |
 | **0.1.62** | 2026-10-06 | `b4868e8` | motherbee + spokes (core) | ✅ live | snap `pre-identity-0-1-62` (las 4 VMs) · `apt install fluxbee=0.1.61` (spokes primero) |
@@ -73,6 +74,80 @@
 > (`dpkg-scanpackages -m`) para rollback, pero su detalle vive en la bitácora, no acá.
 
 ---
+
+## 0.1.65 — Un ILK por actor: el ámbito de cada canal, una cuenta de Cloud por email y `set_ilk_tenant` (A-63, etapa 1)
+
+- **Fecha:** 2026-10-14 (ART) · **Versión anterior:** 0.1.64 · **Commit:** `8b3e951` (FINDINGS A-63;
+  diseño en `docs/ilk-tenant-model-v1.md`, etapa 1). Una revisión del diseño (7 mayores, 5 menores)
+  y una del código (1 mayor, 8 menores), todo arreglado antes del build.
+- **Alcance:** motherbee + los tres spokes (core-update).
+- **Qué cambió:**
+  - **SY.identity:**
+    - cada canal guarda su ámbito (`scope`) y toda clave sale de él: memoria, base, SHM y el camino
+      rápido. Reasignar un ILK no mueve ninguna clave;
+    - una cuenta de Cloud por email, en el ámbito de la instalación, que solo escribe IO.cloud (por
+      provision, add, update, fusión y push de réplica);
+    - `ILK_SET_TENANT`, con historial en la misma transacción (`identity_ilk_tenant_history`);
+    - el registro ya no cambia el tenant de una persona, y las fusiones quedan dentro de un tenant;
+    - borrar un tenant con cuentas cargadas da `TENANT_HAS_ACCOUNTS`, y un alta sin terminar ni
+      traba ni se marca (`pending_signups`);
+    - purgar un tenant se lleva los canales que otros ILKs tenían en su ámbito
+      (`dropped_channels`);
+    - la migración v3 corre en cada arranque del primario, antes de cargar la memoria: mueve las
+      cuentas no ambiguas y reporta el resto por log.
+  - **SY.admin:** `set_ilk_tenant` (HTTP `PUT .../identity/ilks/{ilk}/tenant` y relay de Cloud),
+    con el "para quién" sellado por el admin; Cloud borra y restaura solo personas.
+  - **IO.cloud:** `register_human` devuelve la cuenta existente (`existing: true`); `set_ilk_tenant`;
+    `get_ilk`, `get_ilk_details`, `delete_ilk` y `restore_ilk` sin tenant.
+  - **Contrato:** `docs/io-cloud-api.md` (§9, 0.1.65).
+- **Deploy:**
+  - build `8b3e951` en 23 min;
+  - publish en 15 s;
+  - deploy en 230 s;
+  - snapshots `pre-scope-0-1-65` en las 4 VMs (se borró `pre-identity-0-1-62`);
+  - versiones 0.1.65 con el mismo manifest (`7515c798`) en los 4, health `failed=0`, OPA `in_sync`
+    4/4.
+- **Antes del deploy, datos viejos a propósito (en 0.1.64, por la puerta de Cloud):**
+  - el mismo email registrado desde dos tenants (dos personas);
+  - un email único;
+  - una persona borrada.
+- **Gate:**
+  - **La migración, en el arranque:**
+    - v3 registrada;
+    - el email único pasó al ámbito de la instalación;
+    - el email duplicado quedó donde estaba, reportado por log (`ambiguous_emails=1` con los dos
+      ILKs);
+    - la persona borrada no se tocó.
+  - **Por la puerta pública, con el bearer de Cloud: 30 controles, todos PASS.**
+    - El email duplicado da `ACCOUNT_AMBIGUOUS`.
+    - El único, pedido desde otro tenant, devuelve su cuenta (`existing: true`, sigue en su tenant).
+    - Una cuenta nueva desde dos tenants es un solo ILK.
+    - `set_ilk_tenant` la mueve (y la segunda vez `changed: false`); el raíz está protegido.
+    - El restore de la persona borrada antes del upgrade la deja en el ámbito de la instalación,
+      donde `register_human` la encuentra.
+    - Lectura por id entre tenants; `delete_ilk` de un nodo da `ILK_TYPE_MISMATCH`; borrar un
+      tenant con una cuenta cargada da `TENANT_HAS_ACCOUNTS`.
+  - **Del lado del operador:**
+    - la fila de historial dice `SY.admin@motherbee for IO.cloud@motherbee`;
+    - la SHM de la réplica en worker1 muestra el tenant nuevo y el canal en el ámbito de la
+      instalación;
+    - purgar el tenant del que se fue una persona funcionó (`dropped_channels=1`; era el MAJOR de
+      la revisión del código);
+    - reiniciar sy-identity: las claves sobrevivieron la recarga de la base, el reporte quedó
+      limpio y el email que había quedado único pasó al ámbito de la instalación;
+    - health `failed=0` en los 4 después del reinicio.
+- **Limpieza:** las cinco personas borradas por Cloud, los tres tenants purgados por el operador,
+  el nodo de prueba purgado. Identity quedó como antes (solo el tenant raíz, sin personas, sin
+  historial) y el vault en sus claves de infraestructura más `anthropic_root_pool`.
+- **Arreglado después, sale con el próximo release:**
+  - el admin HTTP mapeaba `TENANT_NOT_FOUND` a 500: ahora 404, y los rechazos del ciclo de vida de
+    identity (`TENANT_HAS_NODES`, `TENANT_NOT_DELETED`, `ILK_KEY_CONFLICT`, …) dan 409;
+  - el log del esquema decía "baseline v1" con la v3 aplicada.
+- **Rollback:**
+  - snapshot `pre-scope-0-1-65`;
+  - o `apt install fluxbee=0.1.64`. La migración v3 no se deshace, pero 0.1.64 vuelve a calcular
+    las claves desde el tenant del ILK y reescribe el ámbito de cada canal en su próxima escritura.
+    La tabla de historial queda, sin uso.
 
 ## 0.1.64 — Cloud gestiona las credenciales y el nombre de su empresa; toda escritura al vault nombra su tenant (A-61)
 

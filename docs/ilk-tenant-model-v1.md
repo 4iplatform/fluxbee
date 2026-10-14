@@ -1,6 +1,7 @@
 # ILK and tenant — the identity and cost-center model (v1)
 
-**Status:** contract and order of work decided by the operator on 2026-10-14. Stage 1 built for 0.1.65.
+**Status:** contract and order of work decided by the operator on 2026-10-14. Stage 1 is live in
+0.1.65, validated on the 8.x testbed on 2026-10-14 (`lab/DEPLOYMENTS.md`).
 This document is the single source for the change; FINDINGS and the ledger point here.
 
 **How it was reached.** It came out of a conversation, not out of the code: the operator, Claude

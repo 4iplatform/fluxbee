@@ -995,7 +995,7 @@ Visto al arreglar los e2e de A-37, leyendo `src/router/mod.rs` y `src/shm/mod.rs
   binario generaría uno como root); si no, el `myID` del Syncthing en marcha. Nunca `config.xml`.
 - **Estado:** construido; lo ejercita el próximo join (el de A-48).
 
-### A-63 ✅ RESUELTO EN CÓDIGO (0.1.65) — La identidad dependía del tenant: personas duplicadas, claves que se corrían y fusiones entre tenants
+### A-63 ✅ VALIDADO EN 8.x (0.1.65, 2026-10-14) — La identidad dependía del tenant: personas duplicadas, claves que se corrían y fusiones entre tenants
 
 - **El marco:** `docs/ilk-tenant-model-v1.md`. Lo decidieron el operador, Claude y Astra el
   2026-10-14: el ILK es el actor y nunca se duplica, el tenant es un centro de costo y los permisos
@@ -1052,6 +1052,15 @@ Visto al arreglar los e2e de A-37, leyendo `src/router/mod.rs` y `src/shm/mod.rs
     upgrade. Un core viejo rechaza `scope`, y un admin nuevo rechaza un `delete_ilk` viejo sin
     `ilk_type`. Son los segundos del rebind de A-39. El SQL de v3 se valida en 8.x con datos hechos
     en 0.1.64.
+- **Validado en 8.x (0.1.65):** datos viejos hechos con 0.1.64 por la puerta de Cloud. La migración
+  movió lo único y reportó lo ambiguo. Por la puerta pública pasaron 30 controles. Del lado del
+  operador:
+  - el historial;
+  - la SHM de worker1;
+  - la purga del tenant que dejó una persona (`dropped_channels=1`);
+  - un reinicio de sy-identity, que resolvió en vivo el email ambiguo.
+
+  Detalle en `lab/DEPLOYMENTS.md`.
 - **Pendiente para las etapas siguientes:** reasignar nodos (con los permisos del vault, etapa 2),
   y el estado del tenant como compuerta y el resto de D8 (etapa 3).
 
