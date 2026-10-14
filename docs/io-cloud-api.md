@@ -349,8 +349,10 @@ case-insensitive). No tenant needed.
 | `ilk_id` | `{"exists":true,"ilk":{…summary…}}`, whatever tenant it is charged to |
 | `email` | the account: `{"exists":true,"ilk":{…},"matches":[{…}]}`; nobody: `exists:false` |
 
-The summary is `{ilk_id, ilk_type, registration_status, tenant_id, display_name}`; `tenant_id` is
-what the person is charged to.
+The summary is `{ilk_id, ilk_type, registration_status, tenant_id, display_name, pending_signup}`;
+`tenant_id` is what the person is charged to, and `pending_signup` is `true` for a signup nobody
+finished: a temporary person holding an account's email. The next `register_human` of that email
+takes it over.
 
 `matches` holds more than one entry only for an email several people still hold from before
 0.1.65 (the operator resolves those); then `ilk` is `null`:
@@ -364,7 +366,7 @@ what the person is charged to.
 #### `list_ilks` (local, fast)
 
 `tenant_id` at the root: the identities charged to it.
-`result: {"tenant_id":…,"count":2,"ilks":[{ilk_id, ilk_type, registration_status, display_name}]}`.
+`result: {"tenant_id":…,"count":2,"ilks":[{ilk_id, ilk_type, registration_status, tenant_id, display_name, pending_signup}]}`.
 
 #### `get_ilk_details` (relay)
 
@@ -593,6 +595,11 @@ post '{"op":"list_cloud_actions"}'
 ---
 
 ## 9. What changed for Cloud
+
+### 0.1.66 (next release)
+
+- **`pending_signup`** in every summary `get_ilk` and `list_ilks` answer: `true` for a signup nobody
+  finished.
 
 ### 0.1.65
 

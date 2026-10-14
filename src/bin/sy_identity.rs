@@ -738,12 +738,16 @@ impl IdentityStore {
                 "expires_at_ms": entry.expires_at_ms,
             })),
             "merged_aliases": merged_aliases,
+            "pending_signup": ilk.deleted_at_ms.is_none() && is_pending_signup(&ilk),
             "ilk": ilk,
             "tenant": tenant,
         }))
     }
 
-    fn list_ilks_payload(&self, include_deleted: bool) -> Value {
+    /// Every ILK, or only the pending signups (`pending_only`): a temporary person holding a Fluxbee
+    /// Cloud account's key, wherever it is charged, deleted tenants included (docs/ilk-tenant-model-v1.md
+    /// D11).
+    fn list_ilks_payload(&self, include_deleted: bool, pending_only: bool) -> Value {
         let mut ilk_ids: Vec<&String> = self.ilks.keys().collect();
         ilk_ids.sort_unstable();
 
@@ -752,6 +756,10 @@ impl IdentityStore {
             .filter_map(|ilk_id| {
                 let ilk = self.ilks.get(ilk_id)?;
                 if ilk.deleted_at_ms.is_some() && !include_deleted {
+                    return None;
+                }
+                let pending_signup = ilk.deleted_at_ms.is_none() && is_pending_signup(ilk);
+                if pending_only && !pending_signup {
                     return None;
                 }
                 let tenant = self.tenants.get(&ilk.tenant_id);
@@ -768,11 +776,13 @@ impl IdentityStore {
                     "display_name": display_name,
                     "node_name": node_name,
                     "definition_present": agent_definition_present(&ilk.definition),
+                    "pending_signup": pending_signup,
                     "channel_count": ilk.channels.len(),
                     "channels": ilk.channels.iter().map(|channel| json!({
                         "ich_id": channel.ich_id,
                         "channel_type": channel.channel_type,
                         "address": channel.address,
+                        "scope": channel_scope(channel, &ilk.tenant_id),
                         "owner_l2_name": channel.owner_l2_name,
                         "enabled": channel.enabled,
                     })).collect::<Vec<_>>(),
@@ -3288,7 +3298,10 @@ impl IdentityRuntime {
 
         let mut deltas: Vec<IdentityDeltaEnvelope> = Vec::new();
         let payload = match action {
-            MSG_ILK_LIST => self.store.list_ilks_payload(payload_include_deleted(&msg.payload)),
+            MSG_ILK_LIST => self.store.list_ilks_payload(
+                payload_include_deleted(&msg.payload),
+                msg.payload.get("pending_signup").and_then(Value::as_bool) == Some(true),
+            ),
             MSG_ILK_GET => match serde_json::from_value::<IlkGetRequest>(msg.payload.clone()) {
                 Ok(req) => match self
                     .store
@@ -6887,7 +6900,9 @@ fn map_unique_constraint_code(constraint: &str) -> &'static str {
 /// as a `cloud` channel, or when one does outside the installation-wide scope while another ILK
 /// (a temporary, a node, a marked one) holds it there. People still charged to the root tenant
 /// with an account are listed too: IO.cloud answers ACCOUNT_IN_ROOT_TENANT for them until the
-/// operator reassigns or purges them. The report names ILK ids, never the emails.
+/// operator reassigns or purges them. So are the pending signups left charged to a deleted tenant:
+/// the next signup of their email takes them over, or purging the tenant removes them. The report
+/// names ILK ids, never the emails.
 fn report_account_scopes(store: &mut IdentityStore) {
     let mut holders: HashMap<String, HashSet<String>> = HashMap::new();
     let mut root_charged: Vec<String> = Vec::new();
@@ -6943,9 +6958,27 @@ fn report_account_scopes(store: &mut IdentityStore) {
         .collect();
     ambiguous_ilks.sort_unstable();
     root_charged.sort_unstable();
-    if store.ambiguous_account_emails.is_empty() && root_charged.is_empty() {
+    let mut stranded_signups: Vec<String> = store
+        .ilks
+        .values()
+        .filter(|ilk| {
+            ilk.deleted_at_ms.is_none()
+                && is_pending_signup(ilk)
+                && store
+                    .tenants
+                    .get(&ilk.tenant_id)
+                    .is_none_or(|tenant| tenant.deleted_at_ms.is_some())
+        })
+        .map(|ilk| ilk.ilk_id.clone())
+        .collect();
+    stranded_signups.sort_unstable();
+    if store.ambiguous_account_emails.is_empty()
+        && root_charged.is_empty()
+        && stranded_signups.is_empty()
+    {
         tracing::info!(
-            "cloud account scopes: no ambiguous email, no account charged to the root tenant"
+            "cloud account scopes: no ambiguous email, no account charged to the root tenant, \
+             no pending signup charged to a deleted tenant"
         );
         return;
     }
@@ -6953,8 +6986,11 @@ fn report_account_scopes(store: &mut IdentityStore) {
         ambiguous_emails = store.ambiguous_account_emails.len(),
         ambiguous_ilks = ?ambiguous_ilks,
         root_charged_accounts = ?root_charged,
+        pending_signups_in_deleted_tenants = ?stranded_signups,
         "cloud account scopes need the operator: delete and purge the extra ILKs of each ambiguous \
-         email (the next boot moves it), and reassign or purge the accounts charged to the root tenant"
+         email (the next boot moves it), and reassign or purge the accounts charged to the root tenant. \
+         A pending signup in a deleted tenant waits: the next signup of its email takes it over, or \
+         purging the tenant removes it"
     );
 }
 
@@ -10111,7 +10147,7 @@ mod tests {
             },
         );
 
-        let payload = store.list_ilks_payload(false);
+        let payload = store.list_ilks_payload(false, false);
         assert_eq!(payload.get("count").and_then(Value::as_u64), Some(1));
         let rows = payload
             .get("ilks")
@@ -10606,9 +10642,12 @@ mod tests {
         store.delete_ilk(lc_ilk(&ilk), 5).expect("mark");
 
         // hidden: not listed by default, listed with include_deleted
-        let listed = store.list_ilks_payload(false);
+        let listed = store.list_ilks_payload(false, false);
         assert!(!listed.to_string().contains(&ilk));
-        assert!(store.list_ilks_payload(true).to_string().contains(&ilk));
+        assert!(store
+            .list_ilks_payload(true, false)
+            .to_string()
+            .contains(&ilk));
 
         // reserved: the same channel does not mint a new identity
         let err = store
@@ -12448,5 +12487,48 @@ mod tests {
         assert_eq!(ok["purged_ilks"], 1);
         assert!(!store.ilks.contains_key(&jon));
         assert!(store.ilks.contains_key(&ivy));
+    }
+
+    #[test]
+    fn pending_signups_are_readable_wherever_they_are_charged() {
+        let mut store = sc_store();
+        let (ok, _) = sc_account_provision(&mut store, LC_TENANT, "kim@acme.com").expect("signup");
+        let kim = ok["ilk_id"].as_str().unwrap().to_string();
+        let lee = sc_account(&mut store, SC_OTHER, "lee@acme.com");
+        let slack = rg_provision(&mut store, LC_TENANT, "slack", "U20");
+        let listed = |store: &IdentityStore| -> Vec<(String, bool)> {
+            store.list_ilks_payload(false, false)["ilks"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|row| {
+                    (
+                        row["ilk_id"].as_str().unwrap().to_string(),
+                        row["pending_signup"].as_bool().unwrap(),
+                    )
+                })
+                .collect()
+        };
+        let rows = listed(&store);
+        for (ilk, pending) in [(&kim, true), (&lee, false), (&slack, false)] {
+            assert!(rows.contains(&(ilk.clone(), pending)), "{ilk} {pending}");
+        }
+        // The filter keeps only the pending ones; the channel shows where its address lives.
+        let only = store.list_ilks_payload(false, true);
+        assert_eq!(only["count"], 1);
+        assert_eq!(only["ilks"][0]["ilk_id"], kim.as_str());
+        assert_eq!(only["ilks"][0]["channels"][0]["scope"], INSTALLATION_SCOPE);
+        assert_eq!(
+            store.get_ilk_payload(&kim, None).unwrap()["pending_signup"],
+            true
+        );
+        // Its tenant deleted, it stays pending and listed.
+        store
+            .delete_tenant(lc_tenant(LC_TENANT), 1)
+            .expect("delete the tenant");
+        assert_eq!(store.list_ilks_payload(false, true)["count"], 1);
+        // Marked, it is no longer pending.
+        store.delete_ilk(lc_ilk(&kim), 2).expect("mark the signup");
+        assert_eq!(store.list_ilks_payload(true, true)["count"], 0);
     }
 }

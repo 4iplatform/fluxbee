@@ -6832,12 +6832,20 @@ async fn handle_hive_paths(
             Ok(Some((status, resp)))
         }
         ("GET", ["identity", "ilks"]) => {
-            if query_flag(query, "include_deleted") {
+            // ?include_deleted=true adds the marked ILKs; ?pending_signup=true keeps only the
+            // signups nobody finished, wherever they are charged.
+            let mut filter = serde_json::Map::new();
+            for flag in ["include_deleted", "pending_signup"] {
+                if query_flag(query, flag) {
+                    filter.insert(flag.to_string(), serde_json::Value::Bool(true));
+                }
+            }
+            if !filter.is_empty() {
                 let (status, resp) = handle_identity_query(
                     ctx,
                     client,
                     "list_ilks",
-                    serde_json::json!({"include_deleted": true}),
+                    serde_json::Value::Object(filter),
                     Some(hive),
                 )
                 .await?;
@@ -8742,6 +8750,11 @@ async fn handle_admin_query_with_payload(
     if action == "list_cloud_actions" {
         return Ok(build_cloud_actions_catalog_response());
     }
+    // The identity listings take their filters (include_deleted, pending_signup) straight to
+    // SY.identity, as the HTTP route does.
+    if matches!(action, "list_ilks" | "list_tenants") {
+        return handle_identity_query(ctx, client, action, payload, hive).await;
+    }
     let payload = normalize_admin_payload(action, payload, hive.as_deref());
     let request = build_admin_request(ctx, action, payload, hive);
     let response = send_admin_request(
@@ -9361,7 +9374,7 @@ fn admin_action_summary(action: &str) -> &'static str {
         "node_control_config_set" => {
             "Send CONFIG_SET to a node that participates in live control-plane config and return its CONFIG_RESPONSE."
         }
-        "list_ilks" => "List identity ilks in a hive.",
+        "list_ilks" => "List identity ilks in a hive. ?include_deleted=true adds the marked ones; ?pending_signup=true lists only the Fluxbee Cloud signups nobody finished (pending_signup), wherever they are charged.",
         "get_ilk" => "Read one identity ilk.",
         "set_ilk_definition" => {
             "Set the cognitive definition hashes for one identity agent ILK."
@@ -15685,6 +15698,7 @@ mod tests {
             ich_id: ich_id.to_string(),
             channel_type: "http".to_string(),
             address: "addr".to_string(),
+            scope: "tnt:00000000-0000-0000-0000-000000000001".to_string(),
             is_primary: false,
             owner_l2_name: owner_l2_name.map(ToString::to_string),
             enabled,

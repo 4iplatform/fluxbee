@@ -1326,14 +1326,37 @@ async fn handle_local_cloud_op(
 
 /// The SHM subset of one ilk returned by the fast reads (get_ilk / list_ilks). The full
 /// `identification` PII + channels live behind the `get_ilk_details` relay, not in this SHM view.
-fn ilk_shm_subset(i: &fluxbee_sdk::identity::IdentityIlkOption) -> Value {
+/// `pending` holds the pending signups (see `pending_signups`).
+fn ilk_shm_subset(
+    i: &fluxbee_sdk::identity::IdentityIlkOption,
+    pending: &std::collections::HashSet<String>,
+) -> Value {
     json!({
         "ilk_id": i.ilk_id,
         "ilk_type": i.ilk_type,
         "registration_status": i.registration_status,
         "tenant_id": i.tenant_id,
         "display_name": i.display_name,
+        "pending_signup": pending.contains(&i.ilk_id),
     })
+}
+
+/// The pending signups, as SY.identity defines them: a temporary person holding a Fluxbee Cloud
+/// account's key, the `cloud` channel in the installation-wide scope (the root tenant's). Nobody
+/// finished registering them; the next `register_human` of that email takes one over
+/// (docs/ilk-tenant-model-v1.md D11).
+fn pending_signups(
+    options: &[fluxbee_sdk::identity::IdentityIchOption],
+) -> std::collections::HashSet<String> {
+    options
+        .iter()
+        .filter(|option| {
+            option.channel_type == CLOUD_CHANNEL_TYPE && fluxbee_sdk::is_root_tenant(&option.scope)
+        })
+        .flat_map(|option| option.ilks.iter())
+        .filter(|ilk| ilk.ilk_type == "human" && ilk.registration_status == "temporary")
+        .map(|ilk| ilk.ilk_id.clone())
+        .collect()
 }
 
 /// FAST io.cloud-LOCAL identity reads served straight from the local identity SHM (io.cloud
@@ -1349,6 +1372,20 @@ fn handle_shm_read(state: &Arc<RuntimeState>, msg: &Message, op: &str) -> Value 
         .get("tenant_id")
         .filter(|value| !value.is_null());
     let hive = state.config.hive_id.as_str();
+    // Which people are pending signups, for the summaries the reads below answer.
+    let pending = if matches!(op, "get_ilk" | "list_ilks") {
+        match fluxbee_sdk::identity::list_ich_options_from_hive_id(hive) {
+            Ok(options) => pending_signups(&options),
+            Err(err) => {
+                return cloud_error_code(
+                    "IDENTITY_SHM_UNAVAILABLE",
+                    &format!("identity SHM read failed: {err}"),
+                )
+            }
+        }
+    } else {
+        std::collections::HashSet::new()
+    };
     match op {
         "get_ilk" => {
             // Two selectors, exactly one: params.ilk_id (canonical id), or params.email. The
@@ -1370,7 +1407,10 @@ fn handle_shm_read(state: &Arc<RuntimeState>, msg: &Message, op: &str) -> Value 
                         json!({
                             "status": "ok",
                             "op": "get_ilk",
-                            "result": { "exists": found.is_some(), "ilk": found.map(ilk_shm_subset) },
+                            "result": {
+                                "exists": found.is_some(),
+                                "ilk": found.map(|ilk| ilk_shm_subset(ilk, &pending)),
+                            },
                         })
                     }
                     Err(err) => cloud_error_code(
@@ -1409,7 +1449,7 @@ fn handle_shm_read(state: &Arc<RuntimeState>, msg: &Message, op: &str) -> Value 
                                     "op": "get_ilk",
                                     "result": {
                                         "exists": resolved.is_some(),
-                                        "ilk": resolved.map(|r| ilk_shm_subset(&r.ilk)),
+                                        "ilk": resolved.map(|r| ilk_shm_subset(&r.ilk, &pending)),
                                     },
                                 }),
                                 Err(err) => cloud_error_code(
@@ -1431,7 +1471,7 @@ fn handle_shm_read(state: &Arc<RuntimeState>, msg: &Message, op: &str) -> Value 
                         // ambiguous (docs/ilk-tenant-model-v1.md §2.1).
                         false => match account_by_email(hive, &email, None) {
                             Ok(Some(account)) => {
-                                let ilk = ilk_shm_subset(&account.ilk);
+                                let ilk = ilk_shm_subset(&account.ilk, &pending);
                                 json!({
                                     "status": "ok",
                                     "op": "get_ilk",
@@ -1479,7 +1519,7 @@ fn handle_shm_read(state: &Arc<RuntimeState>, msg: &Message, op: &str) -> Value 
                                         .count()
                                         > 1;
                                     if !dup {
-                                        matches.push(ilk_shm_subset(cand));
+                                        matches.push(ilk_shm_subset(cand, &pending));
                                         continue;
                                     }
                                     match fluxbee_sdk::identity::resolve_identity_option_from_hive_id_strict(
@@ -1488,10 +1528,10 @@ fn handle_shm_read(state: &Arc<RuntimeState>, msg: &Message, op: &str) -> Value 
                                         &email,
                                         &cand.tenant_id,
                                     ) {
-                                        Ok(Some(winner)) => matches.push(ilk_shm_subset(&winner.ilk)),
+                                        Ok(Some(winner)) => matches.push(ilk_shm_subset(&winner.ilk, &pending)),
                                         // Mapping probe missed mid-transition: fall back to the
                                         // first scanned candidate rather than dropping the tenant.
-                                        Ok(None) => matches.push(ilk_shm_subset(cand)),
+                                        Ok(None) => matches.push(ilk_shm_subset(cand, &pending)),
                                         Err(err) => {
                                             return cloud_error_code(
                                                 "IDENTITY_SHM_UNAVAILABLE",
@@ -1550,7 +1590,7 @@ fn handle_shm_read(state: &Arc<RuntimeState>, msg: &Message, op: &str) -> Value 
                         .ilks
                         .iter()
                         .filter(|i| i.tenant_id == tenant_id)
-                        .map(ilk_shm_subset)
+                        .map(|ilk| ilk_shm_subset(ilk, &pending))
                         .collect();
                     json!({
                         "status": "ok",
@@ -2535,6 +2575,52 @@ mod tests {
         assert_eq!(
             provision_error_reply(&IdentityError::Timeout)["error_code"],
             "IDENTITY_UNAVAILABLE"
+        );
+    }
+
+    #[test]
+    fn a_pending_signup_is_a_temporary_person_holding_an_account_key() {
+        use fluxbee_sdk::identity::{IdentityIchOption, IdentityIlkOption};
+        let person = |ilk_id: &str, status: &str| IdentityIlkOption {
+            ilk_id: ilk_id.to_string(),
+            tenant_id: "tnt:11111111-1111-4111-8111-111111111111".to_string(),
+            display_name: None,
+            handler_node: None,
+            registration_status: status.to_string(),
+            ilk_type: "human".to_string(),
+            role_hash: None,
+            skill_hashes: Vec::new(),
+            handbook_hashes: Vec::new(),
+            personality_hash: None,
+        };
+        let channel = |channel_type: &str, scope: &str, ilk: IdentityIlkOption| IdentityIchOption {
+            ich_id: format!("ich:{}", uuid::Uuid::new_v4()),
+            channel_type: channel_type.to_string(),
+            address: "someone@acme.com".to_string(),
+            scope: scope.to_string(),
+            is_primary: false,
+            owner_l2_name: None,
+            enabled: false,
+            ilks: vec![ilk],
+        };
+        let root = fluxbee_sdk::DEFAULT_ROOT_TENANT_ID;
+        let tenant = "tnt:11111111-1111-4111-8111-111111111111";
+        let options = vec![
+            channel("cloud", root, person("ilk:pending", "temporary")),
+            channel("cloud", root, person("ilk:account", "complete")),
+            channel("cloud", tenant, person("ilk:old-scope", "temporary")),
+            channel("slack", tenant, person("ilk:wrote-in", "temporary")),
+        ];
+        let pending = pending_signups(&options);
+        assert_eq!(
+            pending,
+            std::collections::HashSet::from(["ilk:pending".to_string()])
+        );
+        let summary = ilk_shm_subset(&person("ilk:pending", "temporary"), &pending);
+        assert_eq!(summary["pending_signup"], true);
+        assert_eq!(
+            ilk_shm_subset(&person("ilk:account", "complete"), &pending)["pending_signup"],
+            false
         );
     }
 }

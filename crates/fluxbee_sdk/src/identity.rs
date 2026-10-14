@@ -136,6 +136,10 @@ pub struct IdentityIchOption {
     pub ich_id: String,
     pub channel_type: String,
     pub address: String,
+    /// The namespace the address lives in (`tnt:<uuid>`): the tenant whose IO nodes look it up, or
+    /// the root tenant's for a Fluxbee Cloud account (docs/ilk-tenant-model-v1.md §2.1).
+    #[serde(default)]
+    pub scope: String,
     pub is_primary: bool,
     pub owner_l2_name: Option<String>,
     pub enabled: bool,
@@ -1444,6 +1448,7 @@ fn build_ich_options(ilks: &[IlkEntry], ichs: &[IchEntry]) -> Vec<IdentityIchOpt
                 ich_id: ich_id.clone(),
                 channel_type: channel_type.clone(),
                 address: address.clone(),
+                scope: prefixed_uuid_from_bytes("tnt", ich.tenant_id),
                 is_primary: ich.is_primary != 0,
                 owner_l2_name: {
                     let value = fixed_str_to_string(&ich.owner_l2_name);
