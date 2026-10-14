@@ -36,6 +36,9 @@ pub const CLOUD_OP_ACTIONS: &[(&str, &str)] = &[
     ("list_tokens", "vault_list"),
     ("delete_token", "vault_delete"),
     ("update_tenant", "update_tenant"),
+    // A tenant is a cost center (docs/ilk-tenant-model-v1.md): Cloud charges a person to another
+    // one. Stage 1: complete people only.
+    ("set_ilk_tenant", "set_ilk_tenant"),
 ];
 
 /// The admin actions IO.cloud may relay over the mesh — the security allowlist SY.admin enforces in
@@ -54,6 +57,7 @@ pub const CLOUD_EXPOSED_ACTIONS: &[&str] = &[
     "vault_list",
     "vault_delete",
     "update_tenant",
+    "set_ilk_tenant",
 ];
 
 /// The [`CLOUD_EXPOSED_ACTIONS`] set computed from [`CLOUD_OP_ACTIONS`] (deduped, first-seen order).
@@ -116,23 +120,25 @@ pub fn cloud_action_catalog() -> Value {
         { "op": "provision_node", "category": "relay",
           "summary": "Spawn an IO.* node in YOUR tenant. Needs the envelope tenant_id + params.node_name (IO.*) + params.runtime. NOT idempotent." },
         { "op": "register_human", "category": "local",
-          "summary": "Register a human's identity (mint the human ilk) in YOUR tenant. Needs the envelope tenant_id + params = a frontdesk_handoff {type:'frontdesk_handoff', schema_version:1, operation:'complete_registration', subject:{display_name,email,phone?,company_name?,attributes?}}. IO.cloud provisions the temporary human ilk and hands it to SY.frontdesk.gov; returns the frontdesk verdict + ilk_id." },
+          "summary": "Register a person's Fluxbee Cloud account, charged to YOUR tenant (the envelope tenant_id). params = a frontdesk_handoff {type:'frontdesk_handoff', schema_version:1, operation:'complete_registration', subject:{display_name,email,phone?,company_name?,attributes?}}. One email is one account: an email that already has one answers existing:true with its ilk_id and tenant, and nothing is created (charging it elsewhere is set_ilk_tenant). Otherwise IO.cloud provisions the person and hands it to SY.frontdesk.gov; returns the frontdesk verdict + ilk_id." },
+        { "op": "set_ilk_tenant", "category": "relay",
+          "summary": "Charge a person (params.ilk_id, a complete account) to YOUR tenant (the envelope tenant_id): a tenant is a cost center, so this grants and revokes nothing. The target must be active, never the root tenant; DUPLICATE_EMAIL when another person there holds the same email. Each change is recorded." },
         { "op": "list_cloud_actions", "category": "local",
           "summary": "Return this catalog (the actions IO.cloud offers: relay + local) so Cloud can discover its surface." },
         { "op": "get_ilk", "category": "local",
-          "summary": "FAST existence+subset read from the identity SHM (no round-trip). Selector: params.ilk_id (ilk:<uuid>) OR params.email (matches the ilk's cloud channel, ASCII case-insensitive). With the envelope tenant_id: scoped to YOUR tenant -> {exists, ilk?}; an ilk of another tenant answers exists:false. WITHOUT it, by email only (first login: the email is all you have): cross-tenant search -> {exists, ilk?: set only when exactly one match, matches:[subset...], one per tenant, each with its tenant_id}. Subset = {ilk_id, ilk_type, registration_status, tenant_id, display_name}. For full identification + channels use get_ilk_details." },
+          "summary": "FAST existence+subset read from the identity SHM (no round-trip). Selector: params.ilk_id (ilk:<uuid>) OR params.email (the account's email, ASCII case-insensitive). By id: any ilk, whatever tenant it is charged to. By email: the one account -> {exists, ilk?, matches:[...]}; matches holds more than one entry only for an email several people still hold (ACCOUNT_AMBIGUOUS until the operator resolves it). Subset = {ilk_id, ilk_type, registration_status, tenant_id (the tenant it is charged to), display_name}. For full identification + channels use get_ilk_details." },
         { "op": "get_tenant", "category": "local",
           "summary": "FAST existence read of YOUR tenant (the envelope tenant_id) from the identity SHM. Returns {exists, tenant_id, ilk_count}." },
         { "op": "list_ilks", "category": "local",
-          "summary": "List the ilks of YOUR tenant (the envelope tenant_id) from the identity SHM (subset each). Returns {tenant_id, count, ilks:[{ilk_id, ilk_type, registration_status, display_name}]}." },
+          "summary": "List the ilks charged to YOUR tenant (the envelope tenant_id) from the identity SHM (subset each). Returns {tenant_id, count, ilks:[{ilk_id, ilk_type, registration_status, display_name}]}." },
         { "op": "get_ilk_details", "category": "relay",
-          "summary": "FULL identity read (all identification PII + channels + tenant) of one ilk of YOUR tenant — relayed to SY.admin. Needs the envelope tenant_id + params.ilk_id (ilk:<uuid>) OR params.email. One that does not exist or belongs to another tenant answers NOT_FOUND. Slower than get_ilk (a DB read); use it when you need everything." },
+          "summary": "FULL identity read (all identification PII + channels + the tenant it is charged to) of one ilk — relayed to SY.admin. params.ilk_id (ilk:<uuid>) OR params.email (the account). Not tenant-filtered. One that does not exist answers NOT_FOUND. Slower than get_ilk (a DB read); use it when you need everything." },
         { "op": "delete_ilk", "category": "relay",
-          "summary": "Mark one ilk of YOUR tenant deleted (reversible: hidden, its email/channels stay reserved until the operator purges it). Needs the envelope tenant_id + params.ilk_id. Idempotent." },
+          "summary": "Mark one person's account deleted (reversible: hidden, its email/channels stay reserved until the operator purges it). params.ilk_id. People only: another type answers ILK_TYPE_MISMATCH (node identities are the orchestrator's). Not tenant-scoped. Idempotent." },
         { "op": "restore_ilk", "category": "relay",
-          "summary": "Undo delete_ilk for one ilk of YOUR tenant. Needs the envelope tenant_id + params.ilk_id. Refused while the tenant itself is deleted (restore the tenant)." },
+          "summary": "Undo delete_ilk for one person. params.ilk_id. People only. Refused while the tenant it is charged to is deleted (restore the tenant)." },
         { "op": "delete_tenant", "category": "relay",
-          "summary": "Mark YOUR tenant (the envelope tenant_id) deleted and, in cascade, its ilks (reversible; name/domain stay reserved). Refused while node identities live in it or it sponsors tenants." },
+          "summary": "Mark YOUR tenant (the envelope tenant_id) deleted and, in cascade, the people known only through its channels (reversible; name/domain stay reserved). Refused while accounts are charged to it (TENANT_HAS_ACCOUNTS: reassign or delete them first), while node identities live in it or while it sponsors tenants." },
         { "op": "restore_tenant", "category": "relay",
           "summary": "Undo delete_tenant for YOUR tenant: it and the ilks its cascade marked come back." }
     ])
@@ -158,7 +164,8 @@ mod tests {
                 "restore_tenant",
                 "vault_list",
                 "vault_delete",
-                "update_tenant"
+                "update_tenant",
+                "set_ilk_tenant"
             ]
         );
     }
@@ -183,6 +190,10 @@ mod tests {
         assert_eq!(
             admin_action_for_cloud_op("update_tenant"),
             Some("update_tenant")
+        );
+        assert_eq!(
+            admin_action_for_cloud_op("set_ilk_tenant"),
+            Some("set_ilk_tenant")
         );
         assert_eq!(admin_action_for_cloud_op("kill_node"), None);
     }

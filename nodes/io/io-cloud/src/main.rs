@@ -71,7 +71,10 @@ use io_common::io_control_plane_logging::{
 };
 use io_common::io_control_plane_metrics::IoControlPlaneMetrics;
 use io_common::io_control_plane_store::persist_io_control_plane_state;
-use io_common::provision::{ensure_own_ich, strict_provision_ilk, IdentityProvisionConfig};
+use io_common::provision::{
+    ensure_own_ich, provision_ilk_in_scope, strict_provision_ilk, IdentityProvisionConfig,
+    ProvisionOutcome,
+};
 use serde_json::{json, Value};
 use tokio::sync::RwLock;
 use tokio::time::timeout;
@@ -895,6 +898,39 @@ fn copy_optional_field(
     }
 }
 
+/// The account an email belongs to (docs/ilk-tenant-model-v1.md §2.1): first the installation-wide
+/// scope, where a Fluxbee Cloud account lives; then, when the request names a tenant, that tenant's
+/// own scope, where an email the scope migration left ambiguous (or a core older than this node)
+/// still is.
+fn account_by_email(
+    hive: &str,
+    email: &str,
+    tenant: Option<&str>,
+) -> Result<
+    Option<fluxbee_sdk::identity::ResolvedIdentityOption>,
+    fluxbee_sdk::identity::IdentityShmError,
+> {
+    if let Some(found) = fluxbee_sdk::identity::resolve_identity_option_from_hive_id_strict(
+        hive,
+        CLOUD_CHANNEL_TYPE,
+        email,
+        fluxbee_sdk::DEFAULT_ROOT_TENANT_ID,
+    )? {
+        return Ok(Some(found));
+    }
+    match tenant {
+        Some(tenant) if tenant != fluxbee_sdk::DEFAULT_ROOT_TENANT_ID => {
+            fluxbee_sdk::identity::resolve_identity_option_from_hive_id_strict(
+                hive,
+                CLOUD_CHANNEL_TYPE,
+                email,
+                tenant,
+            )
+        }
+        _ => Ok(None),
+    }
+}
+
 /// Pure translation of a Cloud op into the admin `(action, params)`, injecting the tenant claim.
 /// Returns `Err(error_payload)` for a missing/unknown op or a missing tenant. Kept pure (no admin
 /// call) so it is unit-testable; the op→action pairs are pinned to the shared source
@@ -1019,9 +1055,9 @@ fn translate_cloud_op(
             // `get_ilk` (SHM); this is the "give me everything" path. An email selector is
             // accepted too: `dispatch_cloud_op` pre-resolves email -> ilk_id from the SHM BEFORE
             // this translation runs, so by the time we get here a valid request always carries
-            // ilk_id (translation stays pure; admin/identity need no email selector). Scoped to the
-            // claimed tenant: SY.identity answers NOT_FOUND for an ilk of another one.
-            let tenant_id = claimed_tenant(tenant_id, op)?;
+            // ilk_id (translation stays pure; admin/identity need no email selector). Not
+            // tenant-filtered: a tenant is a cost center, not a boundary
+            // (docs/ilk-tenant-model-v1.md).
             let ilk_id = match required_string(params, "ilk_id") {
                 Ok(v) => v,
                 Err(_) => {
@@ -1035,16 +1071,12 @@ fn translate_cloud_op(
                     "get_ilk_details requires params.ilk_id as a canonical ilk:<uuid>",
                 ));
             }
-            Ok((
-                "get_ilk",
-                json!({ "ilk_id": ilk_id, "tenant_id": tenant_id }),
-            ))
+            Ok(("get_ilk", json!({ "ilk_id": ilk_id })))
         }
-        // Lifecycle: mark / restore only (purge is operator-only). ALWAYS scoped to the tenant
-        // Cloud claims: identity refuses an ilk of another tenant (ILK_TENANT_MISMATCH), and a
-        // tenant op can only name the claimed tenant itself.
+        // Lifecycle: mark / restore only (purge is operator-only). Deleting an account is not
+        // tenant-scoped; Cloud deletes and restores people only (operator decision 2026-10-14):
+        // SY.identity answers ILK_TYPE_MISMATCH for a node's identity.
         "delete_ilk" | "restore_ilk" => {
-            let tenant_id = claimed_tenant(tenant_id, op)?;
             let ilk_id = required_string(params, "ilk_id")?;
             if !ilk_id.starts_with("ilk:") {
                 return Err(cloud_error(&format!(
@@ -1052,7 +1084,22 @@ fn translate_cloud_op(
                 )));
             }
             let action = if op == "delete_ilk" { "delete_ilk" } else { "restore_ilk" };
-            Ok((action, json!({ "ilk_id": ilk_id, "tenant_id": tenant_id })))
+            Ok((action, json!({ "ilk_id": ilk_id, "ilk_type": "human" })))
+        }
+        // Charge a person to the claimed tenant, their cost center. It grants and revokes
+        // nothing; SY.identity checks the rest (a complete person, an active target, the email).
+        "set_ilk_tenant" => {
+            let tenant_id = claimed_tenant(tenant_id, op)?;
+            let ilk_id = required_string(params, "ilk_id")?;
+            if !ilk_id.starts_with("ilk:") {
+                return Err(cloud_error(
+                    "set_ilk_tenant requires params.ilk_id as a canonical ilk:<uuid>",
+                ));
+            }
+            Ok((
+                "set_ilk_tenant",
+                json!({ "ilk_id": ilk_id, "tenant_id": tenant_id }),
+            ))
         }
         "delete_tenant" | "restore_tenant" => {
             let tenant_id = claimed_tenant(tenant_id, op)?;
@@ -1177,32 +1224,28 @@ async fn dispatch_cloud_op(
             );
         }
         if let Some(email) = optional_trimmed(&params, "email") {
-            // The claimed tenant (canonical, never the root): a malformed one fails loud instead
-            // of a silent hash-miss.
-            let tenant = match claimed_tenant(tenant_id, "get_ilk_details") {
-                Ok(v) => v,
-                Err(e) => return e,
+            // A tenant is optional here; when named it must be canonical and not the root one.
+            let tenant = match tenant_id {
+                Some(raw) => match claimed_tenant(Some(raw), "get_ilk_details") {
+                    Ok(v) => Some(v),
+                    Err(e) => return e,
+                },
+                None => None,
             };
             if !email.contains('@') || email.len() < 3 {
                 return cloud_error("params.email must be a valid email address");
             }
-            match fluxbee_sdk::identity::resolve_identity_option_from_hive_id_strict(
-                hive_id,
-                CLOUD_CHANNEL_TYPE,
-                &email,
-                &tenant,
-            ) {
+            match account_by_email(hive_id, &email, tenant.as_deref()) {
                 Ok(Some(resolved)) => {
                     params["ilk_id"] = json!(resolved.ilk.ilk_id);
                 }
-                // The same answer SY.identity gives by ilk_id, for a missing ilk and for one of
-                // another tenant alike.
+                // The same answer SY.identity gives by ilk_id.
                 Ok(None) => {
                     return json!({
                         "status": "error",
                         "op": op,
                         "error_code": "NOT_FOUND",
-                        "error_detail": "no ilk with a cloud channel for that email in your tenant",
+                        "error_detail": "no account with that email",
                     })
                 }
                 Err(err) => {
@@ -1319,26 +1362,18 @@ fn handle_shm_read(state: &Arc<RuntimeState>, msg: &Message, op: &str) -> Value 
             let ilk_id = optional_trimmed(&params, "ilk_id");
             let email = optional_trimmed(&params, "email");
             match (ilk_id, email) {
-                // By id: always within the claimed tenant; an ilk of another one is not there.
-                (Some(ilk_id), None) => match claimed_tenant(
-                    envelope_tenant.and_then(Value::as_str),
-                    "get_ilk by ilk_id",
-                )
-                .map(|tenant| (tenant, list_ilks_from_hive_id(hive)))
-                {
-                    Err(e) => e,
-                    Ok((tenant_id, Ok(snap))) => {
-                        let found = snap
-                            .ilks
-                            .iter()
-                            .find(|i| i.ilk_id == ilk_id && i.tenant_id == tenant_id);
+                // By id: any ilk, whatever tenant it is charged to. A tenant is a cost center,
+                // not a boundary (docs/ilk-tenant-model-v1.md); the subset says which one.
+                (Some(ilk_id), None) => match list_ilks_from_hive_id(hive) {
+                    Ok(snap) => {
+                        let found = snap.ilks.iter().find(|i| i.ilk_id == ilk_id);
                         json!({
                             "status": "ok",
                             "op": "get_ilk",
                             "result": { "exists": found.is_some(), "ilk": found.map(ilk_shm_subset) },
                         })
                     }
-                    Ok((_, Err(err))) => cloud_error_code(
+                    Err(err) => cloud_error_code(
                         "IDENTITY_SHM_UNAVAILABLE",
                         &format!("identity SHM read failed: {err}"),
                     ),
@@ -1365,14 +1400,10 @@ fn handle_shm_read(state: &Arc<RuntimeState>, msg: &Message, op: &str) -> Value 
                                 Ok(v) => v,
                                 Err(e) => return e,
                             };
-                            // The resolver trims + lowercases internally — same normalization
-                            // the provision path applied when the channel was written.
-                            match fluxbee_sdk::identity::resolve_identity_option_from_hive_id_strict(
-                                hive,
-                                CLOUD_CHANNEL_TYPE,
-                                &email,
-                                &tenant_id,
-                            ) {
+                            // The account in the installation-wide scope, else what the email
+                            // still is in this tenant's own scope. The resolver trims and
+                            // lowercases, as the provision did.
+                            match account_by_email(hive, &email, Some(&tenant_id)) {
                                 Ok(resolved) => json!({
                                     "status": "ok",
                                     "op": "get_ilk",
@@ -1395,7 +1426,23 @@ fn handle_shm_read(state: &Arc<RuntimeState>, msg: &Message, op: &str) -> Value 
                         // only when the match is unambiguous (exactly one), the common case.
                         // list_ich_options propagates SHM errors (no EACCES laundering) —
                         // fail-loud like the rest of this authoritative read API.
-                        false => match fluxbee_sdk::identity::list_ich_options_from_hive_id(hive) {
+                        // The account first: one email is one account, in the installation-wide
+                        // scope. The scan below remains for an email the scope migration left
+                        // ambiguous (docs/ilk-tenant-model-v1.md §2.1).
+                        false => match account_by_email(hive, &email, None) {
+                            Ok(Some(account)) => {
+                                let ilk = ilk_shm_subset(&account.ilk);
+                                json!({
+                                    "status": "ok",
+                                    "op": "get_ilk",
+                                    "result": { "exists": true, "ilk": ilk.clone(), "matches": [ilk] },
+                                })
+                            }
+                            Err(err) => cloud_error_code(
+                                "IDENTITY_SHM_UNAVAILABLE",
+                                &format!("identity SHM read failed: {err}"),
+                            ),
+                            Ok(None) => match fluxbee_sdk::identity::list_ich_options_from_hive_id(hive) {
                             Ok(options) => {
                                 let needle = email.to_ascii_lowercase();
                                 let mut candidates: Vec<fluxbee_sdk::identity::IdentityIlkOption> =
@@ -1468,11 +1515,12 @@ fn handle_shm_read(state: &Arc<RuntimeState>, msg: &Message, op: &str) -> Value 
                                 "IDENTITY_SHM_UNAVAILABLE",
                                 &format!("identity SHM read failed: {err}"),
                             ),
+                            },
                         },
                     }
                 }
                 _ => cloud_error(
-                    "get_ilk requires exactly one of params.ilk_id (ilk:<uuid>) or params.email (by email the envelope tenant_id is optional: omit it to search across tenants)",
+                    "get_ilk requires exactly one of params.ilk_id (ilk:<uuid>) or params.email (by email the envelope tenant_id is optional)",
                 ),
             }
         }
@@ -1518,6 +1566,62 @@ fn handle_shm_read(state: &Arc<RuntimeState>, msg: &Message, op: &str) -> Value 
         }
         other => cloud_error_code("INVALID_REQUEST", &format!("no SHM handler for '{other}'")),
     }
+}
+
+/// An account that already exists answers here, with no frontdesk handoff and nothing created: a
+/// complete person holds the email (charging them to another tenant is `set_ilk_tenant`), or a
+/// person registered into the root tenant before 0.1.54 does, whom the operator must reassign or
+/// purge first. A temporary goes on to the frontdesk: SY.identity has already charged it to the
+/// requesting tenant.
+fn existing_account_reply(outcome: &ProvisionOutcome) -> Option<Value> {
+    if outcome.created || outcome.registration_status != "complete" {
+        return None;
+    }
+    if outcome.tenant_id.as_deref() == Some(fluxbee_sdk::DEFAULT_ROOT_TENANT_ID) {
+        return Some(json!({
+            "status": "error",
+            "op": "register_human",
+            "ilk_id": outcome.ilk_id,
+            "error_code": "ACCOUNT_IN_ROOT_TENANT",
+            "error_detail": "this email's account is charged to the root tenant; the operator must reassign or purge it",
+        }));
+    }
+    Some(json!({
+        "status": "ok",
+        "op": "register_human",
+        "ilk_id": outcome.ilk_id,
+        "registration_status": "complete",
+        "tenant_id": outcome.tenant_id,
+        "existing": true,
+        "success": true,
+        "merged": false,
+    }))
+}
+
+/// A provision SY.identity refused keeps its code (an ambiguous email, a reserved channel, a
+/// deleted person); anything else is the identity service being unreachable.
+fn provision_error_reply(err: &io_common::identity::IdentityError) -> Value {
+    const PASSED_THROUGH: &[&str] = &[
+        "ACCOUNT_AMBIGUOUS",
+        "ILK_DELETED",
+        "TENANT_DELETED",
+        "CLOUD_CHANNEL_RESERVED",
+        "INVALID_SCOPE",
+    ];
+    let refused = match err {
+        io_common::identity::IdentityError::Other(message) => message
+            .strip_prefix("provision rejected: ")
+            .map(str::trim)
+            .filter(|code| PASSED_THROUGH.contains(code)),
+        _ => None,
+    };
+    if let Some(code) = refused {
+        return cloud_error_code(code, &format!("SY.identity refused the account: {code}"));
+    }
+    cloud_error_code(
+        "IDENTITY_UNAVAILABLE",
+        &format!("could not provision the human ilk: {err}"),
+    )
 }
 
 /// The two fields io.cloud must read off the Cloud request to relay a human registration: the
@@ -1657,7 +1761,9 @@ async fn handle_register_human(sender: &NodeSender, state: &Arc<RuntimeState>, m
         Err(error) => return error,
     };
 
-    // (1) Provision a temporary HUMAN ilk — the same primitive every IO node uses for first contact.
+    // (1) Provision the person's account: the `cloud` channel (the email) in the installation-wide
+    // scope, so one email is one account, and the person charged to the requesting tenant
+    // (docs/ilk-tenant-model-v1.md §2.1). The same primitive every IO node uses for first contact.
     let cfg = IdentityProvisionConfig {
         target: state.config.identity_target.clone(),
         timeout: Duration::from_secs(10),
@@ -1671,18 +1777,22 @@ async fn handle_register_human(sender: &NodeSender, state: &Arc<RuntimeState>, m
         attributes: json!({ "source": "io.cloud", "role": "human" }),
         ilk_type: Some("human".to_string()),
     };
-    let temp_ilk =
-        match strict_provision_ilk(&state.dispatcher, &cfg, &state.config.identity_target, &input)
-            .await
-        {
-            Ok(ilk) => ilk,
-            Err(err) => {
-                return cloud_error_code(
-                    "IDENTITY_UNAVAILABLE",
-                    &format!("could not provision the human ilk: {err}"),
-                )
-            }
-        };
+    let outcome = match provision_ilk_in_scope(
+        &state.dispatcher,
+        &cfg,
+        &state.config.identity_target,
+        &input,
+        Some(fluxbee_sdk::DEFAULT_ROOT_TENANT_ID),
+    )
+    .await
+    {
+        Ok(outcome) => outcome,
+        Err(err) => return provision_error_reply(&err),
+    };
+    if let Some(reply) = existing_account_reply(&outcome) {
+        return reply;
+    }
+    let temp_ilk = outcome.ilk_id;
 
     // (2) Unicast the handoff to the configured frontdesk, asking for its structured verdict.
     let thread_id = format!(
@@ -1941,10 +2051,15 @@ mod tests {
         let tenant = "tnt:11111111-1111-4111-8111-111111111111";
         let params = json!({"ilk_id": "ilk:22222222-2222-4222-8222-222222222222",
                             "tenant_id": "tnt:99999999-9999-4999-8999-999999999999"});
-        let (action, payload) = translate_cloud_op("delete_ilk", Some(tenant), &params).unwrap();
-        assert_eq!(action, "delete_ilk");
-        // the claim wins over any tenant in params
-        assert_eq!(payload["tenant_id"], json!(tenant));
+        // Deleting an account is not tenant-scoped, and Cloud deletes people only.
+        for op in ["delete_ilk", "restore_ilk"] {
+            let (action, payload) = translate_cloud_op(op, None, &params).unwrap();
+            assert_eq!(action, op);
+            assert_eq!(
+                payload,
+                json!({"ilk_id": "ilk:22222222-2222-4222-8222-222222222222", "ilk_type": "human"})
+            );
+        }
         let (action, payload) = translate_cloud_op("delete_tenant", Some(tenant), &params).unwrap();
         assert_eq!(action, "delete_tenant");
         assert_eq!(payload, json!({"tenant_id": tenant}));
@@ -2125,20 +2240,15 @@ mod tests {
     fn translate_get_ilk_details_relays_to_admin_get_ilk() {
         let tenant = "tnt:11111111-1111-4111-8111-111111111111";
         let ilk = json!({"ilk_id": "ilk:22222222-2222-4222-8222-222222222222"});
-        let (action, p) = translate_cloud_op("get_ilk_details", Some(tenant), &ilk).unwrap();
-        assert_eq!(action, "get_ilk");
-        assert_eq!(p["ilk_id"], "ilk:22222222-2222-4222-8222-222222222222");
-        // Scoped to the claimed tenant: SY.identity answers NOT_FOUND for another tenant's ilk.
-        assert_eq!(p["tenant_id"], tenant);
-        // Needs the claimed tenant (never the root) and a canonical ilk:<uuid>.
-        assert!(translate_cloud_op("get_ilk_details", None, &ilk).is_err());
-        let root = translate_cloud_op(
-            "get_ilk_details",
-            Some(fluxbee_sdk::DEFAULT_ROOT_TENANT_ID),
-            &ilk,
-        )
-        .unwrap_err();
-        assert_eq!(root["error_code"], "TENANT_ROOT_PROTECTED");
+        // Not tenant-filtered: the same read with or without a tenant.
+        for claimed in [Some(tenant), None] {
+            let (action, p) = translate_cloud_op("get_ilk_details", claimed, &ilk).unwrap();
+            assert_eq!(action, "get_ilk");
+            assert_eq!(
+                p,
+                json!({"ilk_id": "ilk:22222222-2222-4222-8222-222222222222"})
+            );
+        }
         assert!(
             translate_cloud_op("get_ilk_details", Some(tenant), &json!({"ilk_id": "nope"}))
                 .is_err()
@@ -2156,14 +2266,12 @@ mod tests {
         for op in [
             "put_token",
             "provision_node",
-            "get_ilk_details",
-            "delete_ilk",
-            "restore_ilk",
             "delete_tenant",
             "restore_tenant",
             "list_tokens",
             "delete_token",
             "update_tenant",
+            "set_ilk_tenant",
         ] {
             let op_params = if op == "update_tenant" {
                 json!({"name": "Acme"})
@@ -2365,5 +2473,68 @@ mod tests {
         assert!(translate_cloud_op("", None, &json!({})).is_err());
         let err = translate_cloud_op("frobnicate", None, &json!({})).unwrap_err();
         assert_eq!(err["status"], "error");
+    }
+
+    #[test]
+    fn translate_set_ilk_tenant_names_the_target_tenant() {
+        let tenant = "tnt:11111111-1111-4111-8111-111111111111";
+        let (action, p) = translate_cloud_op(
+            "set_ilk_tenant",
+            Some(tenant),
+            &json!({"ilk_id": "ilk:22222222-2222-4222-8222-222222222222"}),
+        )
+        .unwrap();
+        assert_eq!(action, "set_ilk_tenant");
+        assert_eq!(
+            p,
+            json!({"ilk_id": "ilk:22222222-2222-4222-8222-222222222222", "tenant_id": tenant})
+        );
+        assert!(
+            translate_cloud_op("set_ilk_tenant", Some(tenant), &json!({"ilk_id": "nope"})).is_err()
+        );
+    }
+
+    #[test]
+    fn an_existing_account_answers_without_a_handoff() {
+        let tenant = "tnt:11111111-1111-4111-8111-111111111111";
+        let outcome = |created: bool, status: &str, charged: &str| ProvisionOutcome {
+            ilk_id: "ilk:22222222-2222-4222-8222-222222222222".to_string(),
+            created,
+            registration_status: status.to_string(),
+            tenant_id: Some(charged.to_string()),
+        };
+        // A complete account: existing, charged where it is, nothing created.
+        let reply = existing_account_reply(&outcome(false, "complete", tenant)).expect("existing");
+        assert_eq!(reply["existing"], true);
+        assert_eq!(reply["tenant_id"], tenant);
+        assert_eq!(reply["registration_status"], "complete");
+        // Charged to the root tenant (registered before 0.1.54): the operator first.
+        let reply = existing_account_reply(&outcome(
+            false,
+            "complete",
+            fluxbee_sdk::DEFAULT_ROOT_TENANT_ID,
+        ))
+        .expect("refused");
+        assert_eq!(reply["error_code"], "ACCOUNT_IN_ROOT_TENANT");
+        // New, or a temporary: on to the frontdesk.
+        assert!(existing_account_reply(&outcome(true, "temporary", tenant)).is_none());
+        assert!(existing_account_reply(&outcome(false, "temporary", tenant)).is_none());
+    }
+
+    #[test]
+    fn a_refused_account_keeps_its_code() {
+        use io_common::identity::IdentityError;
+        let reply = provision_error_reply(&IdentityError::Other(
+            "provision rejected: ACCOUNT_AMBIGUOUS".to_string(),
+        ));
+        assert_eq!(reply["error_code"], "ACCOUNT_AMBIGUOUS");
+        let reply = provision_error_reply(&IdentityError::Other(
+            "provision rejected: SOMETHING_ELSE".to_string(),
+        ));
+        assert_eq!(reply["error_code"], "IDENTITY_UNAVAILABLE");
+        assert_eq!(
+            provision_error_reply(&IdentityError::Timeout)["error_code"],
+            "IDENTITY_UNAVAILABLE"
+        );
     }
 }

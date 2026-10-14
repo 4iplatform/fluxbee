@@ -100,6 +100,7 @@ const ADMIN_EXECUTOR_PILOT_ACTIONS: &[&str] = &[
     "set_ilk_definition",
     "delete_ilk",
     "restore_ilk",
+    "set_ilk_tenant",
     "delete_tenant",
     "restore_tenant",
     "publish_runtime_package",
@@ -3400,6 +3401,12 @@ const INTERNAL_ACTION_REGISTRY: &[InternalActionSpec] = &[
         allow_legacy_hive_id: false,
     },
     InternalActionSpec {
+        action: "set_ilk_tenant",
+        route: InternalActionRoute::Command("set_ilk_tenant"),
+        requires_target: true,
+        allow_legacy_hive_id: false,
+    },
+    InternalActionSpec {
         action: "purge_ilk",
         route: InternalActionRoute::Command("purge_ilk"),
         requires_target: true,
@@ -5167,6 +5174,7 @@ async fn dispatch_internal_admin_command(
     if let Err(detail) = enforce_cloud_relay_content(caller_l2_name, action, &ctx.hive_id, &params) {
         return Ok(internal_unauthorized(action, &detail));
     }
+    let params = stamp_on_behalf_of(action, params, caller_l2_name);
     match action {
         "publish_artifact" => {
             if target.is_some() {
@@ -5725,6 +5733,24 @@ fn authorize_cloud_relay(
     ))
 }
 
+/// Who a tenant change is for goes into its history row: the router-stamped caller (Fluxbee
+/// Cloud's relay, Archi), or the executor for an internal plan. Never what the params say.
+fn stamp_on_behalf_of(
+    action: &str,
+    mut params: serde_json::Value,
+    caller_l2_name: Option<&str>,
+) -> serde_json::Value {
+    if action == "set_ilk_tenant" {
+        if let Some(object) = params.as_object_mut() {
+            object.insert(
+                "on_behalf_of".to_string(),
+                serde_json::Value::String(caller_l2_name.unwrap_or("executor").to_string()),
+            );
+        }
+    }
+    params
+}
+
 /// FIX-2: re-enforce io.cloud's `translate_cloud_op` content restrictions SERVER-SIDE. Those checks
 /// live first inside io.cloud, which a compromised relay bypasses; admin must not trust the relay
 /// to have sanitized its own payload. Applies ONLY to the IO.cloud@hive mesh origin — operator
@@ -5779,16 +5805,29 @@ fn enforce_cloud_relay_content(
     match action {
         // create_tenant has no tenant yet: the one tenant-free write.
         "create_tenant" => {}
-        // Lifecycle over the Cloud relay (mark / restore only; purge is not in the allowlist): the
-        // request MUST carry the claimed tenant. For ilks, SY.identity refuses an ilk of another
-        // tenant (ILK_TENANT_MISMATCH); without this check a compromised relay could drop the
-        // tenant and mark ANY ilk.
-        "delete_ilk" | "restore_ilk" | "delete_tenant" | "restore_tenant" => {
+        // A tenant's own lifecycle (mark / restore; purge is not in the allowlist): the claimed
+        // tenant.
+        "delete_tenant" | "restore_tenant" => {
             cloud_claimed_tenant(params.get("tenant_id"), action)?;
         }
-        "get_ilk" => {
-            // SY.identity answers NOT_FOUND for an ilk of another tenant.
+        // Deleting an account is not tenant-scoped (a tenant is a cost center, not a boundary,
+        // docs/ilk-tenant-model-v1.md), but Cloud deletes and restores people only (operator
+        // decision 2026-10-14, D4): SY.identity refuses another type with ILK_TYPE_MISMATCH.
+        "delete_ilk" | "restore_ilk" => {
+            if params.get("ilk_type").and_then(|v| v.as_str()) != Some("human") {
+                return Err(format!(
+                    "IO.cloud {action} must carry ilk_type \"human\": Cloud deletes and restores people only"
+                ));
+            }
+            only_fields(Some(params), &["ilk_id", "ilk_type", "tenant_id"])?;
+        }
+        // Reads by id are not tenant-filtered (§2.1).
+        "get_ilk" => {}
+        // Charging a person to another tenant: the target is the claimed tenant, never the root
+        // one. Who it is for is stamped by admin (dispatch), not taken from the relay.
+        "set_ilk_tenant" => {
             cloud_claimed_tenant(params.get("tenant_id"), action)?;
+            only_fields(Some(params), &["ilk_id", "tenant_id", "on_behalf_of"])?;
         }
         "update_tenant" => {
             cloud_claimed_tenant(params.get("tenant_id"), action)?;
@@ -6852,6 +6891,22 @@ async fn handle_hive_paths(
             let payload = serde_json::json!({ "ilk_id": decode_percent(ilk_id) });
             let (status, resp) =
                 handle_admin_command(ctx, client, "restore_ilk", payload, Some(hive)).await?;
+            Ok(Some((status, resp)))
+        }
+        ("PUT", ["identity", "ilks", ilk_id, "tenant"]) => {
+            let body: serde_json::Value = if body.is_empty() {
+                serde_json::json!({})
+            } else {
+                serde_json::from_slice(body)?
+            };
+            // The operator's own request: who it is for is stamped here, never taken from the body.
+            let payload = serde_json::json!({
+                "ilk_id": decode_percent(ilk_id),
+                "tenant_id": body.get("tenant_id").cloned().unwrap_or(serde_json::Value::Null),
+                "on_behalf_of": "operator",
+            });
+            let (status, resp) =
+                handle_admin_command(ctx, client, "set_ilk_tenant", payload, Some(hive)).await?;
             Ok(Some((status, resp)))
         }
         ("POST", ["identity", "ilks", ilk_id, "purge"]) => {
@@ -9240,6 +9295,7 @@ fn admin_action_requires_confirmation(action: &str) -> bool {
             | "set_ilk_definition"
             | "delete_ilk"
             | "restore_ilk"
+            | "set_ilk_tenant"
             | "purge_ilk"
             | "delete_tenant"
             | "restore_tenant"
@@ -9305,6 +9361,7 @@ fn admin_action_summary(action: &str) -> &'static str {
             "Mark one identity ILK deleted (reversible: hidden, its keys stay reserved until purge). Refuses well-known SY system ILKs (SYSTEM_ILK_PROTECTED)."
         }
         "restore_ilk" => "Undo the deleted mark of one identity ILK (refused while its tenant is marked).",
+        "set_ilk_tenant" => "Charge one person (a complete human ILK) to another tenant, its cost center; channels keep their scope.",
         "purge_ilk" => {
             "Physically and finally remove one identity ILK that is ALREADY marked deleted (ILK_NOT_DELETED otherwise)."
         }
@@ -9531,6 +9588,7 @@ fn admin_action_path_patterns(action: &str) -> Vec<&'static str> {
         }
         "delete_ilk" => vec!["DELETE /hives/{hive}/identity/ilks/{ilk_id}"],
         "restore_ilk" => vec!["POST /hives/{hive}/identity/ilks/{ilk_id}/restore"],
+        "set_ilk_tenant" => vec!["PUT /hives/{hive}/identity/ilks/{ilk_id}/tenant"],
         "purge_ilk" => vec!["POST /hives/{hive}/identity/ilks/{ilk_id}/purge"],
         "delete_tenant" => vec!["DELETE /hives/{hive}/identity/tenants/{tenant_id}"],
         "restore_tenant" => vec!["POST /hives/{hive}/identity/tenants/{tenant_id}/restore"],
@@ -9747,7 +9805,8 @@ fn admin_action_path_params(action: &str) -> Vec<serde_json::Value> {
             admin_action_path_param("runtime", "string", "Runtime name, for example ai.generic."),
             admin_action_path_param("version", "string", "Runtime version to delete."),
         ],
-        "get_ilk" | "set_ilk_definition" | "delete_ilk" | "restore_ilk" | "purge_ilk" => vec![
+        "get_ilk" | "set_ilk_definition" | "delete_ilk" | "restore_ilk" | "set_ilk_tenant"
+        | "purge_ilk" => vec![
             admin_action_path_param("hive", "string", "Target hive id in the URL path."),
             admin_action_path_param(
                 "ilk_id",
@@ -10071,6 +10130,11 @@ fn admin_action_body_required_fields(action: &str) -> Vec<serde_json::Value> {
                 "New secret JSON value. This field is secret-sensitive and redacted in previews/logs. Same shape rules as vault_put for the chosen resource_type (openai → api_key; postgres → postgres_url credentials+host only, no dbname; slack → app_token+bot_token).",
             ),
         ],
+        "set_ilk_tenant" => vec![admin_action_body_field(
+            "tenant_id",
+            "string",
+            "The tenant to charge the person to: an active tenant, never the root one, canonical tnt:<uuid>.",
+        )],
         "set_ilk_definition" => vec![admin_action_body_field(
             "definition",
             "object",
@@ -10871,6 +10935,9 @@ fn admin_action_example_scmd(action: &str) -> Option<String> {
         "restore_ilk" => {
             "curl -X POST /hives/motherbee/identity/ilks/ilk:550e8400-e29b-41d4-a716-446655440000/restore"
         }
+        "set_ilk_tenant" => {
+            r#"curl -X PUT /hives/motherbee/identity/ilks/ilk:550e8400-e29b-41d4-a716-446655440000/tenant -d '{"tenant_id":"tnt:550e8400-e29b-41d4-a716-446655440001"}'"#
+        }
         "purge_ilk" => {
             "curl -X POST /hives/motherbee/identity/ilks/ilk:550e8400-e29b-41d4-a716-446655440000/purge"
         }
@@ -11156,6 +11223,11 @@ fn admin_action_request_notes(action: &str) -> Vec<&'static str> {
             "Its keys (channels, node_name, email) stay RESERVED until purge: provisioning/registering them answers ILK_DELETED.",
             "Idempotent (already_deleted:true). Refuses a well-known SY system ILK with SYSTEM_ILK_PROTECTED.",
             "Physical removal is purge_ilk, which requires this mark first (the orchestrator's purge teardown does both).",
+        ],
+        "set_ilk_tenant" => vec![
+            "A tenant is a cost center: changing it grants and revokes nothing (docs/ilk-tenant-model-v1.md).",
+            "Complete human ILKs only (stage 1); the target must be active and never the root tenant.",
+            "Refused with DUPLICATE_EMAIL when another person in the target holds the same email. Channels keep their scope, so every lookup still resolves; each change writes a history row.",
         ],
         "restore_ilk" => vec![
             "Undoes delete_ilk: the ILK resolves again with the same keys.",
@@ -12998,6 +13070,7 @@ async fn handle_admin_command_inner(
             | "set_ilk_definition"
             | "delete_ilk"
             | "restore_ilk"
+            | "set_ilk_tenant"
             | "purge_ilk"
             | "get_tenant"
             | "create_tenant"
@@ -13478,6 +13551,7 @@ async fn handle_identity_command(
         "set_ilk_definition" => ("ILK_SET_DEFINITION", "ILK_SET_DEFINITION_RESPONSE"),
         "delete_ilk" => ("ILK_DELETE", "ILK_DELETE_RESPONSE"),
         "restore_ilk" => ("ILK_RESTORE", "ILK_RESTORE_RESPONSE"),
+        "set_ilk_tenant" => ("ILK_SET_TENANT", "ILK_SET_TENANT_RESPONSE"),
         "purge_ilk" => ("ILK_PURGE", "ILK_PURGE_RESPONSE"),
         "delete_tenant" => ("TNT_DELETE", "TNT_DELETE_RESPONSE"),
         "restore_tenant" => ("TNT_RESTORE", "TNT_RESTORE_RESPONSE"),
@@ -15165,19 +15239,71 @@ mod tests {
     fn cloud_relay_lifecycle_requires_the_claimed_tenant_server_side() {
         let relay = Some("IO.cloud@motherbee");
         let ilk = serde_json::json!({"ilk_id": "ilk:22222222-2222-4222-8222-222222222222"});
-        for action in ["delete_ilk", "restore_ilk", "delete_tenant", "restore_tenant"] {
+        // A tenant's own lifecycle names the claimed tenant.
+        for action in ["delete_tenant", "restore_tenant"] {
             assert!(
                 enforce_cloud_relay_content(relay, action, "motherbee", &ilk).is_err(),
                 "{action} without tenant_id must be refused for IO.cloud"
             );
         }
-        let scoped = serde_json::json!({
-            "ilk_id": "ilk:22222222-2222-4222-8222-222222222222",
-            "tenant_id": "tnt:11111111-1111-4111-8111-111111111111",
-        });
-        assert!(enforce_cloud_relay_content(relay, "delete_ilk", "motherbee", &scoped).is_ok());
+        // An account is not tenant-scoped, but Cloud deletes and restores people only.
+        for action in ["delete_ilk", "restore_ilk"] {
+            assert!(
+                enforce_cloud_relay_content(relay, action, "motherbee", &ilk).is_err(),
+                "{action}"
+            );
+            let people = serde_json::json!({
+                "ilk_id": "ilk:22222222-2222-4222-8222-222222222222",
+                "ilk_type": "human",
+            });
+            assert!(
+                enforce_cloud_relay_content(relay, action, "motherbee", &people).is_ok(),
+                "{action}"
+            );
+            let agent = serde_json::json!({
+                "ilk_id": "ilk:22222222-2222-4222-8222-222222222222",
+                "ilk_type": "agent",
+            });
+            assert!(
+                enforce_cloud_relay_content(relay, action, "motherbee", &agent).is_err(),
+                "{action}"
+            );
+        }
+        // Reads by id are not tenant-filtered.
+        assert!(enforce_cloud_relay_content(relay, "get_ilk", "motherbee", &ilk).is_ok());
         // the operator (caller None) is not scoped
         assert!(enforce_cloud_relay_content(None, "delete_ilk", "motherbee", &ilk).is_ok());
+    }
+
+    #[test]
+    fn cloud_relay_set_ilk_tenant_names_the_target_and_admin_stamps_who_for() {
+        let relay = Some("IO.cloud@motherbee");
+        let t = "tnt:11111111-1111-4111-8111-111111111111";
+        let set = |tenant: &str| serde_json::json!({"ilk_id":"ilk:22222222-2222-4222-8222-222222222222","tenant_id":tenant});
+        assert!(enforce_cloud_relay_content(relay, "set_ilk_tenant", "motherbee", &set(t)).is_ok());
+        assert!(enforce_cloud_relay_content(
+            relay,
+            "set_ilk_tenant",
+            "motherbee",
+            &set(fluxbee_sdk::DEFAULT_ROOT_TENANT_ID)
+        )
+        .is_err());
+        let mut extra = set(t);
+        extra["status"] = serde_json::json!("x");
+        assert!(enforce_cloud_relay_content(relay, "set_ilk_tenant", "motherbee", &extra).is_err());
+        // Who it is for is the router-stamped caller, whatever the params claim; the executor for
+        // an internal plan. Other actions are left alone.
+        let mut forged = set(t);
+        forged["on_behalf_of"] = serde_json::json!("operator");
+        assert_eq!(
+            stamp_on_behalf_of("set_ilk_tenant", forged.clone(), relay)["on_behalf_of"],
+            "IO.cloud@motherbee"
+        );
+        assert_eq!(
+            stamp_on_behalf_of("set_ilk_tenant", set(t), None)["on_behalf_of"],
+            "executor"
+        );
+        assert_eq!(stamp_on_behalf_of("get_ilk", forged.clone(), relay), forged);
     }
 
     #[test]
@@ -15339,13 +15465,9 @@ mod tests {
         // (action, params with the tenant set to TENANT)
         type Shape = fn(&str) -> serde_json::Value;
         let shapes: Vec<(&str, Shape)> = vec![
-            (
-                "delete_ilk",
-                |tn| serde_json::json!({"ilk_id":"ilk:22222222-2222-4222-8222-222222222222","tenant_id":tn}),
-            ),
             ("delete_tenant", |tn| serde_json::json!({"tenant_id":tn})),
             (
-                "get_ilk",
+                "set_ilk_tenant",
                 |tn| serde_json::json!({"ilk_id":"ilk:22222222-2222-4222-8222-222222222222","tenant_id":tn}),
             ),
             (
@@ -15497,6 +15619,7 @@ mod tests {
             "vault_list",
             "vault_delete",
             "update_tenant",
+            "set_ilk_tenant",
         ]
         .into_iter()
         .collect();

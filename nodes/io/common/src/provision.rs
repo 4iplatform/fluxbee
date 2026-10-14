@@ -58,12 +58,38 @@ pub async fn strict_provision_ilk(
     target: &str,
     input: &ResolveOrCreateInput,
 ) -> Result<String, IdentityError> {
+    provision_ilk_in_scope(dispatcher, config, target, input, None)
+        .await
+        .map(|outcome| outcome.ilk_id)
+}
+
+/// What ILK_PROVISION answered: the ILK, whether it was created now, its registration status and
+/// the tenant it is charged to (docs/ilk-tenant-model-v1.md §2.1).
+#[derive(Debug, Clone, PartialEq)]
+pub struct ProvisionOutcome {
+    pub ilk_id: String,
+    pub created: bool,
+    pub registration_status: String,
+    pub tenant_id: Option<String>,
+}
+
+/// ILK_PROVISION with an explicit channel `scope`: the namespace the address lives in, and the
+/// seed of its ICH id. `None` is the input's tenant, which is what every IO node uses; only
+/// IO.cloud names another one, the installation-wide scope of a Fluxbee Cloud account's email.
+pub async fn provision_ilk_in_scope(
+    dispatcher: &Arc<RouterDispatcher>,
+    config: &IdentityProvisionConfig,
+    target: &str,
+    input: &ResolveOrCreateInput,
+    scope: Option<&str>,
+) -> Result<ProvisionOutcome, IdentityError> {
     let normalized_channel = normalize_identity_field(&input.channel, true);
     let normalized_address = normalize_identity_field(&input.external_id, true);
+    let scope = scope.map(str::trim).filter(|value| !value.is_empty());
     let ich_id = stable_ich_id(
         &normalized_channel,
         &normalized_address,
-        input.tenant_id.as_deref().unwrap_or(""),
+        scope.unwrap_or_else(|| input.tenant_id.as_deref().unwrap_or("")),
     )
     .map_err(|err| IdentityError::Other(format!("invalid provision ICH seed: {err}")))?;
     let mut payload = serde_json::json!({
@@ -71,6 +97,9 @@ pub async fn strict_provision_ilk(
         "channel_type": normalized_channel,
         "address": normalized_address,
     });
+    if let Some(scope) = scope {
+        payload["scope"] = serde_json::json!(scope);
+    }
     if let Some(tenant_id) = input
         .tenant_id
         .as_deref()
@@ -358,7 +387,7 @@ fn map_rpc_err(err: RpcError) -> IdentityError {
     }
 }
 
-fn parse_provision_response(msg: WireMessage) -> Result<String, IdentityError> {
+fn parse_provision_response(msg: WireMessage) -> Result<ProvisionOutcome, IdentityError> {
     if msg.meta.msg.as_deref() == Some(MSG_ILK_PROVISION_RESPONSE) {
         let status = msg
             .payload
@@ -368,7 +397,24 @@ fn parse_provision_response(msg: WireMessage) -> Result<String, IdentityError> {
         if status.eq_ignore_ascii_case("ok") {
             if let Some(ilk_id) = msg.payload.get("ilk_id").and_then(|v| v.as_str()) {
                 if !ilk_id.trim().is_empty() {
-                    return Ok(ilk_id.to_string());
+                    let text = |field: &str| {
+                        msg.payload
+                            .get(field)
+                            .and_then(|v| v.as_str())
+                            .map(str::to_string)
+                    };
+                    return Ok(ProvisionOutcome {
+                        ilk_id: ilk_id.to_string(),
+                        // An older SY.identity says nothing: treat it as created, today's reading.
+                        created: msg
+                            .payload
+                            .get("created")
+                            .and_then(|v| v.as_bool())
+                            .unwrap_or(true),
+                        registration_status: text("registration_status")
+                            .unwrap_or_else(|| "temporary".to_string()),
+                        tenant_id: text("tenant_id"),
+                    });
                 }
             }
             return Err(IdentityError::Other(

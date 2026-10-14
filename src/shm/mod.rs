@@ -1798,14 +1798,16 @@ impl IdentityRegionWriter {
                     if channel_type.is_empty() || address.is_empty() {
                         continue;
                     }
+                    // Keyed by the channel's scope, which the channel entry carries; the ILK
+                    // entry carries the tenant it is charged to (docs/ilk-tenant-model-v1.md).
                     let inserted = upsert_ich_mapping_entry(
                         mappings,
-                        compute_ich_hash(&channel_type, &address, ilk.tenant_id),
+                        compute_ich_hash(&channel_type, &address, entry.tenant_id),
                         &channel_type,
                         &address,
                         entry.ich_id,
                         entry.ilk_id,
-                        ilk.tenant_id,
+                        entry.tenant_id,
                     )?;
                     if inserted {
                         header.ich_mapping_count = header.ich_mapping_count.saturating_add(1);

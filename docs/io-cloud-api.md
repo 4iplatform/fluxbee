@@ -2,8 +2,10 @@
 
 > **For the Fluxbee Cloud developers.** You do not need to know fluxbee's internals.
 >
-> Contract as of **fluxbee 0.1.64** (2026-10-13). Read from the code, operation by operation; §10
-> lists what was also checked live on the PROD hive. §9 lists what changed for Cloud in 0.1.64.
+> Contract as of **fluxbee 0.1.65** (2026-10-14). Read from the code, operation by operation; §10
+> lists what was also checked live on the PROD hive. §9 lists what changed for Cloud in each
+> release. The model behind it: `docs/ilk-tenant-model-v1.md` (an identity is the actor and is
+> never duplicated; a tenant is a cost center; companies, members and billing are Cloud's).
 
 ---
 
@@ -88,20 +90,24 @@ fields. Other fields are ignored, except where an op refuses them (it says so).
 **Rule 2 — `result` is the hive service's reply, untouched.** IO.cloud does not rewrite results.
 An error of the service comes back as `status:"error"` with the service's `error_code`.
 
-**Rule 3 — the tenant is at the envelope root, and the op acts on that tenant only.**
+**Rule 3 — the tenant is at the envelope root.**
 
 - `tenant_id` goes **at the root, next to `op`**. A `tenant_id` inside `params` is **refused**
   (`INVALID_REQUEST`), not ignored.
 - It must be canonical (`tnt:` + a hyphenated, lowercase UUID) and it is **never the root tenant**
   (`tnt:00000000-0000-0000-0000-000000000001`, which holds the system and its nodes): that answers
   `TENANT_ROOT_PROTECTED` (`register_human`: `TENANT_ROOT_NOT_REGISTRABLE`).
-- Everything the op reads, writes or deletes must belong to that tenant. **Something of another
-  tenant is answered exactly like something that does not exist**: `exists:false`, `NOT_FOUND`,
-  `KEY_NOT_FOUND`. Two exceptions say so: a credential key another tenant holds answers `KEY_TAKEN`
-  on `put_token` (keys share one namespace), and `delete_ilk`/`restore_ilk` answer
-  `ILK_TENANT_MISMATCH`.
-- Ops with **no tenant**: `create_tenant` (the tenant does not exist yet), `list_cloud_actions`,
-  and `get_ilk` **by email** when you do not know the tenant yet (first login, §5.2).
+- **A tenant is a cost center: what a person or a node is charged to.** It is not a permission and
+  not a boundary.
+- **Ops that act on a tenant act on that one:** its credentials, its name, the people and nodes
+  charged to it, its own lifecycle. Something of another tenant answers exactly like something
+  that does not exist (`exists:false`, `KEY_NOT_FOUND`). A credential key another tenant holds
+  answers `KEY_TAKEN` on `put_token`, because keys share one namespace.
+- **A person is not owned by a tenant, only charged to one.** Reading a person by id, reading their
+  details, and deleting or restoring their account take no tenant. `set_ilk_tenant` charges them to
+  another tenant.
+- **Ops with no tenant:** `create_tenant` (the tenant does not exist yet), `list_cloud_actions`,
+  `get_ilk` and `get_ilk_details`, and `delete_ilk` and `restore_ilk`.
 
 The hive's admin checks rule 3 again on its side for every relayed op, and the vault and the
 identity registry refuse anything of another tenant themselves.
@@ -166,13 +172,14 @@ The service codes of each op are in §5.
 |---|---|---|---|
 | `create_tenant` | relay | none | create (or find) a company |
 | `update_tenant` | relay | yes | rename your company or change its domain |
-| `get_tenant` | local | yes | does your company exist, and how many identities it has |
+| `get_tenant` | local | yes | does your company exist, and how many identities are charged to it |
 | `delete_tenant` / `restore_tenant` | relay | yes | mark your company deleted / undo it |
-| `register_human` | local | yes | register a person in your company |
-| `get_ilk` | local | yes, or none by email | fast existence + summary of an identity |
-| `list_ilks` | local | yes | the identities of your company |
-| `get_ilk_details` | relay | yes | everything about one identity |
-| `delete_ilk` / `restore_ilk` | relay | yes | mark one identity deleted / undo it |
+| `register_human` | local | yes | a person's account, charged to your company |
+| `set_ilk_tenant` | relay | yes | charge a person to your company |
+| `get_ilk` | local | none | fast existence + summary of an identity |
+| `list_ilks` | local | yes | the identities charged to your company |
+| `get_ilk_details` | relay | none | everything about one identity |
+| `delete_ilk` / `restore_ilk` | relay | none | delete a person's account / undo it |
 | `put_token` | relay | yes | store a credential |
 | `list_tokens` | relay | yes | your credentials: metadata and use, never the value |
 | `delete_token` | relay | yes | delete one credential |
@@ -247,14 +254,23 @@ A refused update changes nothing. Keeping the company's current name or domain i
 
 #### `delete_tenant` / `restore_tenant`
 
-`tenant_id` at the root, no params. Delete **marks** the company and, in cascade, its identities:
-reversible, hidden, its name and domain stay reserved. Only the operator purges.
+`tenant_id` at the root, no params. Delete **marks** the company and, in cascade, the people known
+only through its channels (a Slack user, a phone that wrote in): reversible, hidden, its name and
+domain stay reserved. Only the operator purges.
 
-- delete: `{"status":"ok","tenant_id":…,"state":"deleted","already_deleted":false,"cascaded_ilks":3}`;
-  idempotent.
+A signup charged to it that was never completed is not marked: it stays pending, so its email is not
+locked out, and the next `register_human` of that email (from any company) picks it up.
+`pending_signups` counts them.
+
+- delete: `{"status":"ok","tenant_id":…,"state":"deleted","already_deleted":false,"cascaded_ilks":3,"pending_signups":0}`;
+  idempotent (`already_deleted:true` carries no `pending_signups`).
 - restore: `{"status":"ok","tenant_id":…,"state":"active","restored_ilks":3}`.
-- Errors: `TENANT_HAS_NODES` (node identities live in it), `TENANT_HAS_CHILDREN` (it sponsors other
-  companies), `TENANT_NOT_DELETED` (restore), `TENANT_NOT_FOUND`.
+- Errors:
+  - `TENANT_HAS_ACCOUNTS`: Cloud accounts are charged to it. Reassign them (`set_ilk_tenant`) or
+    delete them first: an account's email is reserved in every tenant, so a cascade must not take it.
+  - `TENANT_HAS_NODES`: node identities live in it.
+  - `TENANT_HAS_CHILDREN`: it sponsors other companies.
+  - `TENANT_NOT_DELETED` (restore), `TENANT_NOT_FOUND`.
 
 ### 5.2 People (identities, "ilk")
 
@@ -271,51 +287,88 @@ reversible, hidden, its name and domain stay reserved. Only the operator purges.
 | `params.subject.email` | required | a real address; the person's key in the company |
 | `params.subject.phone`, `.company_name`, `.attributes` | optional | stored on the identity |
 
-IO.cloud creates a temporary identity, hands it to the hive's frontdesk, and answers **flat** (no
-`result`):
+**One email is one account, in the whole hive.** The person is charged to the tenant at the root;
+their email (the account's `cloud` channel) belongs to no tenant.
+
+- **A new email:** IO.cloud creates the person, hands them to the hive's frontdesk, and answers
+  **flat** (no `result`):
+
+  ```json
+  {"status":"ok","op":"register_human","ilk_id":"ilk:…","registration_status":"complete",
+   "success":true,"merged":false,"human_message":"…"}
+  ```
+
+- **An email that already has an account:** nothing is created and nothing is handed to the
+  frontdesk. The answer names the account and the tenant it is charged to:
+
+  ```json
+  {"status":"ok","op":"register_human","ilk_id":"ilk:…","registration_status":"complete",
+   "tenant_id":"tnt:…","existing":true,"success":true,"merged":false}
+  ```
+
+  To charge it to your company, call `set_ilk_tenant`.
+- **A signup that was never completed** (from any company) is picked up by the next
+  `register_human` of that email, charged to the new company.
+- Errors:
+  - `ACCOUNT_AMBIGUOUS`: that email is held twice from before 0.1.65 (by several people, or by a
+    person and another identity); the operator resolves it.
+  - `CLOUD_CHANNEL_RESERVED`: the email is the address of a node's own channel, not a person's.
+  - `ACCOUNT_IN_ROOT_TENANT`: the account is charged to the root tenant (registered before 0.1.54);
+    the operator reassigns it.
+  - `TENANT_ROOT_NOT_REGISTRABLE`, `INVALID_REQUEST` (the handoff shape), `ILK_DELETED` (that
+    account is marked deleted: restore it), `IDENTITY_UNAVAILABLE`, `FRONTDESK_UNAVAILABLE`.
+  - On a frontdesk refusal, `success:false` with its code, and the identity stays temporary.
+
+#### `set_ilk_tenant`
+
+`tenant_id` at the root (the company to charge the person to) + `params.ilk_id`. A tenant is a cost
+center, so this grants and revokes nothing; the person keeps every channel and lookup.
 
 ```json
-{"status":"ok","op":"register_human","ilk_id":"ilk:…","registration_status":"complete",
- "success":true,"merged":false,"human_message":"…"}
+{"status":"ok","op":"set_ilk_tenant","result":{"status":"ok","ilk_id":"ilk:…","tenant_id":"tnt:…",
+ "previous_tenant_id":"tnt:…","changed":true}}
 ```
 
-- `ilk_id` is where the person ended up. If the email already belonged to a person of the same
-  company, the hive merges: `merged:true` and `merged_from_ilk_id` names the temporary one.
-- Repeating it is safe: it does not duplicate the person; the newest data wins.
-- Errors: `TENANT_ROOT_NOT_REGISTRABLE`, `INVALID_REQUEST` (the handoff shape), `IDENTITY_UNAVAILABLE`,
-  `FRONTDESK_UNAVAILABLE`; on a frontdesk refusal, `success:false` with its code, and the identity
-  stays temporary.
+- Already charged there: `changed:false`.
+- Only a complete person's account; every change is recorded in the hive.
+- Errors:
+  - `DUPLICATE_EMAIL`: another person charged to that company has the same email in their
+    identification.
+  - `TENANT_NOT_ACTIVE` (pending or suspended), `TENANT_DELETED`, `TENANT_NOT_FOUND`,
+    `TENANT_ROOT_PROTECTED`.
+  - `INVALID_TENANT_TRANSITION` (not a complete account), `ILK_TYPE_MISMATCH` (not a person),
+    `ILK_NOT_FOUND`.
 
 #### `get_ilk` (local, fast)
 
-Exactly one selector: `params.ilk_id` (`ilk:<uuid>`) or `params.email` (the address of the identity's
-`cloud` channel; ASCII case-insensitive).
+Exactly one selector: `params.ilk_id` (`ilk:<uuid>`) or `params.email` (the account's email; ASCII
+case-insensitive). No tenant needed.
 
 | request | answer |
 |---|---|
-| `ilk_id` + `tenant_id` at the root | `{"exists":true,"ilk":{…summary…}}`; an identity of another company is `exists:false` |
-| `email` + `tenant_id` at the root | the same, an O(1) lookup |
-| `email` **without** `tenant_id` | **first login**: a search across companies, `{"exists":…,"ilk":…,"matches":[…]}` |
+| `ilk_id` | `{"exists":true,"ilk":{…summary…}}`, whatever tenant it is charged to |
+| `email` | the account: `{"exists":true,"ilk":{…},"matches":[{…}]}`; nobody: `exists:false` |
 
-The summary is `{ilk_id, ilk_type, registration_status, tenant_id, display_name}`. Without a tenant,
-`matches` holds one entry per company where that email exists, each with its `tenant_id`, and `ilk`
-is set only when there is exactly one:
+The summary is `{ilk_id, ilk_type, registration_status, tenant_id, display_name}`; `tenant_id` is
+what the person is charged to.
+
+`matches` holds more than one entry only for an email several people still hold from before
+0.1.65 (the operator resolves those); then `ilk` is `null`:
 
 ```json
-{"result":{"exists":true,"ilk":{…},"matches":[{…}]}}          // one company (the usual case)
-{"result":{"exists":true,"ilk":null,"matches":[{…},{…}]}}     // the same person in two companies
-{"result":{"exists":false,"ilk":null,"matches":[]}}           // first time: create_tenant + register_human
+{"result":{"exists":true,"ilk":{…},"matches":[{…}]}}          // the account (the usual case)
+{"result":{"exists":true,"ilk":null,"matches":[{…},{…}]}}     // several people, before 0.1.65
+{"result":{"exists":false,"ilk":null,"matches":[]}}           // first time: register_human
 ```
-
-By `ilk_id`, the tenant is required.
 
 #### `list_ilks` (local, fast)
 
-`tenant_id` at the root. `result: {"tenant_id":…,"count":2,"ilks":[{ilk_id, ilk_type, registration_status, display_name}]}`.
+`tenant_id` at the root: the identities charged to it.
+`result: {"tenant_id":…,"count":2,"ilks":[{ilk_id, ilk_type, registration_status, display_name}]}`.
 
 #### `get_ilk_details` (relay)
 
-`tenant_id` at the root, plus `params.ilk_id` **or** `params.email`. The full record from the
+`params.ilk_id` **or** `params.email` (the account). No tenant needed. The full record from the
 registry's database:
 
 ```jsonc
@@ -330,17 +383,22 @@ registry's database:
 - The name field is **`identification.display_name`**.
 - `channels[].enabled` says whether that channel is **published on the edge**. A person's `cloud`
   channel is an address, not a published endpoint, so `false` is normal and changes nothing.
-- An identity that does not exist, or of another company, answers `NOT_FOUND` (by email too).
+- `ilk.tenant_id` and the `tenant` block are what the person is charged to.
+- An identity that does not exist answers `NOT_FOUND` (by email too).
 
 #### `delete_ilk` / `restore_ilk`
 
-`tenant_id` at the root + `params.ilk_id`. Delete **marks** (reversible; its email and channels stay
-reserved until the operator purges). Idempotent.
+`params.ilk_id`. No tenant needed. **People only**: node identities belong to the hive's orchestrator.
+Delete **marks** a person's account (reversible; its email and channels stay reserved until the
+operator purges). Idempotent.
 
 - delete: `{"status":"ok","ilk_id":…,"state":"deleted","already_deleted":false}`;
   restore: `{"status":"ok","ilk_id":…,"state":"active"}`.
-- Errors: `ILK_NOT_FOUND`, `ILK_TENANT_MISMATCH` (another company's), `SYSTEM_ILK_PROTECTED`,
-  `ILK_NOT_DELETED` (restore), `TENANT_DELETED` (restore the company first).
+- Errors: `ILK_NOT_FOUND`, `ILK_TYPE_MISMATCH` (not a person), `ILK_NOT_DELETED` (restore),
+  `TENANT_DELETED` (restore the company it is charged to first), `ILK_KEY_CONFLICT` (restoring it would
+  bring back a second account for its email).
+- A person deleted before 0.1.65 comes back with their account where `register_human` finds it,
+  unless another identity holds that email.
 
 ### 5.3 Credentials (the hive's vault)
 
@@ -528,12 +586,30 @@ post '{"op":"list_cloud_actions"}'
 6. **No idempotency key** (§6).
 7. **The credential's value shape is not validated** (§5.3), and the vault has no "last error" or
    health per credential.
-8. **A person is one identity per company.** The same email in two companies is two identities
-   (`get_ilk` by email shows both). A person spanning companies is under discussion.
+8. **Companies and members are Cloud's.** Fluxbee knows each person once and the tenant they are
+   charged to now; which companies a person belongs to, and which one they act for, is Cloud's
+   (`docs/ilk-tenant-model-v1.md`). Token spending per tenant is not recorded yet (stage 5 there).
 
 ---
 
-## 9. What changed for Cloud in 0.1.64
+## 9. What changed for Cloud
+
+### 0.1.65
+
+- **One email is one account, in the whole hive.** `register_human` for an email that already has
+  one answers `existing: true` with that account and its tenant, and creates nothing.
+  `ACCOUNT_AMBIGUOUS` and `ACCOUNT_IN_ROOT_TENANT` mark data from before.
+- **New op `set_ilk_tenant`:** charge a person to your company.
+- **People are not tenant-scoped:**
+  - `get_ilk`, `get_ilk_details`, `delete_ilk` and `restore_ilk` take no tenant;
+  - `get_ilk` by email answers the account;
+  - `delete_ilk` and `restore_ilk` act on people only (`ILK_TYPE_MISMATCH` for anything else).
+- **`delete_tenant` is refused while accounts are charged to it** (`TENANT_HAS_ACCOUNTS`). A signup
+  never completed does not block it and is not marked (`pending_signups` counts them).
+- The existing data moves when the hive upgrades: an email held by one person becomes their
+  account; one held twice waits for the operator.
+
+### 0.1.64
 
 - **New ops:** `list_tokens`, `delete_token`, `update_tenant`.
 - **`tenant_id` moved to the envelope root for the reads:** `get_ilk`, `get_tenant`, `list_ilks` and

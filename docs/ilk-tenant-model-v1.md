@@ -1,6 +1,6 @@
 # ILK and tenant — the identity and cost-center model (v1)
 
-**Status:** contract and order of work decided by the operator on 2026-10-14. Stage 1 in progress.
+**Status:** contract and order of work decided by the operator on 2026-10-14. Stage 1 built for 0.1.65.
 This document is the single source for the change; FINDINGS and the ledger point here.
 
 **How it was reached.** It came out of a conversation, not out of the code: the operator, Claude
@@ -66,56 +66,134 @@ companies, members, billing and the law.
 
 ### 2.1 ILK structure (stage 1)
 
+Revised after one adversarial review of this section against the code (2026-10-14: 7 major and 5
+minor findings, all folded in below). PROD had nothing to migrate that day: no person, one tenant.
+
 **Channel scope.**
-- Each channel records the namespace its address lives in: `scope`, fixed when the channel is
-  added.
-  - IO channels: the tenant of the node that saw the address. That is today's behaviour, now frozen
-    on the channel.
-  - A Cloud account's email: the installation-wide namespace, which is the root tenant's.
-- Keys always use the channel's scope, never the ILK's current tenant:
-  - the in-memory lookup;
-  - the SHM channel entries and their hash, which already have their own tenant field: no layout
-    change;
-  - `identity_ichs.tenant_id`, which is read back on load.
-- The SHM `IlkEntry.tenant_id` carries the ILK's current tenant: its cost center.
-- A channel without a recorded scope (in flight during an upgrade) takes its ILK's tenant, which is
-  today's value.
+- Each channel records `scope`, the namespace its address lives in, fixed when the channel is
+  created:
+  - `ILK_PROVISION`: the request's `scope` if it names one, else the request's tenant (today's
+    value).
+  - `ILK_ADD_CHANNEL`: the channel's `scope` if it names one, else the target ILK's current tenant
+    (today's value).
+  - The installation-wide scope (the root tenant's) is IO.cloud@motherbee's, for channel type
+    `cloud` only. A `cloud` channel from any other caller is refused (`CLOUD_CHANNEL_RESERVED`), so
+    no IO node can squat an account's email. The same holds on every other path: `ILK_UPDATE` (the
+    orchestrator adding a node's own channels) takes no `cloud` channel, and a tenant's IO node
+    cannot merge a temporary that holds one (the relay and a frontdesk can).
+  - A new channel's ICH id must be nobody else's (`ICH_ID_CONFLICT`): the DB keys channels by it,
+    and a second channel with the same id would quietly move the first one's row. A channel the
+    migration moved keeps the id seeded from its old scope.
+- **One helper computes every channel key from the channel's scope.** That covers:
+  - provision, add and update, merge;
+  - the "deleted ILK holds this channel" check, the restore check, unmark;
+  - the replica's full-sync rebuild and its deltas;
+  - the DB load;
+  - the SHM full sync, the SHM deltas, and the SHM provision fast path in `src/shm`.
+
+  Tenant checks (`TENANT_DELETED`, pending, suspended) stay on the ILK's tenant.
+- **Persistence:**
+  - `identity_ichs.tenant_id` stores the scope and is read back on load. Today the load ignores it
+    and the upsert writes the ILK's tenant: both change.
+  - A channel record without a scope (from an older peer during an upgrade) takes its ILK's tenant
+    once, when it is deserialized, never on a DB load. Otherwise a reassigned person's keys would
+    follow the new tenant after a restart.
+- **Replica pushes:** a replica pushes its node ILKs, so a channel it adds must live in the node's
+  own tenant, and never be a `cloud` channel or in the installation-wide scope. A channel the
+  primary already holds passes as it is (the replica echoes what it was told). Both the snapshot and
+  the delta path check this. A refused push leaves the primary's record as it is: it is never taken
+  for a removal. That invariant holds until stage 2.
+- **No SHM layout change:** the channel entries already carry their own tenant field. No reader
+  joins a channel entry to its ILK entry by tenant.
 
 **One Cloud account per email.**
-- The `cloud` channel lives in the installation-wide scope.
-- `register_human` for an email that already has an account answers that ILK (`existing:true`) and
-  creates nothing. Charging it to another tenant is a separate, explicit reassignment.
-- An email is evidence here because Cloud authenticated that login. Other channels (Slack, a
-  phone) are never joined to a person automatically; linking them needs its own explicit step,
-  later.
+- IO.cloud provisions the `cloud` channel in the installation-wide scope, with the ICH id seeded
+  from that scope. The new ILK is charged to the request's tenant: only the channel is
+  installation-wide, so the rule that no person registers into the root tenant is untouched.
+- `ILK_PROVISION` answers `{created, registration_status, tenant_id}`.
+- `register_human` then works as follows:
+  - **A complete account already holds the email:** it answers `existing: true`, the `ilk_id`, its
+    tenant and `registration_status: complete`. There is no frontdesk handoff and nothing is
+    created. Charging it to another tenant is the separate reassignment.
+  - **A temporary from an abandoned signup in another tenant holds it:** SY.identity re-charges it
+    to the requesting tenant, with a history row, and the registration continues. An abandoned
+    signup never locks an email out. Only the relay's provisioning in the installation-wide scope
+    re-charges: no other scope is shared across tenants.
+  - **A node's own `cloud` channel holds it** (IO.cloud's own, `demo`): a person's signup answers
+    `CLOUD_CHANNEL_RESERVED`.
+  - **A person charged to the root tenant holds it** (registered before 0.1.54): it answers
+    `ACCOUNT_IN_ROOT_TENANT` until the operator reassigns or purges that person.
+  - **An email the migration left ambiguous:** it answers `ACCOUNT_AMBIGUOUS`, whoever holds the
+    key.
+- IO.cloud's email reads (`get_ilk` and `get_ilk_details` by email) look in the installation-wide
+  scope first, then in the claimed tenant's. That covers leftovers and the version skew between the
+  core and the managed IO.cloud runtime.
+- An email is evidence because Cloud authenticated that login. Other channels (Slack, a phone) are
+  never joined to a person automatically; linking them needs an explicit step, later.
 
 **Reassignment: `ILK_SET_TENANT`.**
-- Callers: SY.admin and SY.architect. Cloud reaches it through IO.cloud.
-- Stage 1 covers **human ILKs only**: a node's tenant still feeds its vault pool until stage 2.
-- The target must exist, must not be deleted, and must not be the root tenant. People are never
-  charged to the root tenant.
-- Channels keep their scope. Each reassignment writes a history row (ILK, from, to, when, by whom).
-- Replicas receive the new tenant like any ILK update.
+- It runs on the primary. Callers: SY.admin and SY.architect; Cloud reaches it through IO.cloud.
+- It takes only an active, complete human ILK.
+- **The target** must exist, be active (not pending or suspended), not be deleted, and not be the
+  root tenant.
+- **Refused if another ILK in the target already holds the person's email** (`DUPLICATE_EMAIL`).
+  Email is still unique per tenant in memory and in the DB, so this is checked before anything
+  changes.
+- **Channels keep their scope.** A history row (ILK, from, to, when, by whom: the operator or
+  IO.cloud, as SY.admin relays it) is written in the same transaction.
+- `ILK_REGISTER` no longer changes a human's tenant: that was a second, unrecorded reassignment
+  path. Node ILKs keep today's behaviour.
 
-**Merges.**
-- `merge_from_ilk_id` (ILK_ADD_CHANNEL) gets the check `merge_registration` already has: source and
-  target charged to the same tenant.
-- Moved channels keep their scope everywhere: memory, DB, SHM.
-- Cross-tenant linking waits for the explicit step above.
+**Merges.** `check_merge_source`, which runs before anything changes, requires the source and the
+target to be charged to the same tenant (what `merge_registration` already checks). Moved channels
+keep their scope everywhere.
 
 **Cloud's view of ILKs.**
-- **Reads by id are not tenant-filtered:** the tenant is not a boundary, and Cloud has to see a
-  person to reassign them.
-- **Lists by tenant stay:** they mean "what is charged to T".
-- **Cloud deletes and restores human ILKs only** (operator, 2026-10-14). Node identities are the
-  orchestrator's. This is an account action, not tenant-scoped.
+- **Reads by id are not tenant-filtered:** the tenant is not a boundary.
+- **`delete_ilk` and `restore_ilk` from Cloud** carry a human-only guard (`ilk_type: human`;
+  another type answers `ILK_TYPE_MISMATCH`), and they are not tenant-scoped: deleting an account is
+  an account action. Operator decision D4. Node identities are the orchestrator's.
+- **Lists by tenant stay:** "what is charged to T".
+- These ship with stage 1, because the migration changes the keys Cloud's email reads use.
 
-**One-time migration, explicit and reported.**
-- At the first start on the new release, the existing `cloud` channels move to the
-  installation-wide scope.
-- When one email has accounts in several tenants, none of them moves. The report lists them for the
-  operator: nothing is merged automatically.
-- The report goes to the identity log and to a drift alert.
+**Deleting a tenant that has accounts charged to it** is refused (`TENANT_HAS_ACCOUNTS`) until they
+are reassigned or deleted. A cascade would mark an account whose email is reserved in every tenant,
+and a purge would remove it. This is the first piece of D8.
+- **A pending signup** (a temporary person holding an account's key) is nobody's account yet: it
+  does not block the delete and it is not marked, because a mark would lock the email out for
+  everyone until a purge. It stays pending; the relay's next signup of that email takes it over;
+  purging the tenant removes it if it is still charged there. The answer counts them
+  (`pending_signups`).
+- Other humans charged to it (channel identities, temporaries without an account) still cascade as
+  decided on 2026-09-28.
+
+**Purging a tenant** also drops the channels other ILKs still hold in its scope: a person reassigned
+out keeps the keys of the tenant they left, and those keys go with the tenant. No node of that tenant
+is left to look them up (`TENANT_HAS_NODES`). The answer counts them (`dropped_channels`). Without
+this, the channel rows' foreign key to the tenant made the purge fail.
+
+**The migration.**
+- **When:** an SQL step (v3) in `ensure_identity_schema`, inside its transaction and advisory lock.
+  It runs at every primary boot, before the store loads, so memory loads the migrated scopes. It is
+  idempotent. Replicas take the result through their next full sync.
+- **What moves:** the `cloud` channels of active, complete human ILKs move to the
+  installation-wide scope. Addresses are compared trimmed and lowercased.
+- **An email is ambiguous, and stays where it is,** when:
+  - more than one active, complete human holds it;
+  - or another ILK, marked or not, already holds it in the installation-wide scope (the DB's
+    uniqueness counts marked rows).
+- **After loading,** SY.identity rebuilds the set of ambiguous emails (provisioning one answers
+  `ACCOUNT_AMBIGUOUS`) with the same two rules, and the list of root-charged people. It reports
+  both in its log at every boot, by ILK id and never by email.
+- **Resolving one:** the operator deletes and purges the extra ILKs, then restarts SY.identity: the
+  next boot moves the email. Nothing moves on its own in between.
+- **Restoring** a marked person whose `cloud` channel stayed in its old scope (marked before the
+  migration):
+  - another active ILK holds the installation-wide key: the restore is refused
+    (`ILK_KEY_CONFLICT`), so it never brings back a second account;
+  - the key is free (nobody holds it, marked or not, and the email is not ambiguous): the channel
+    comes back in the installation-wide scope, as the migration would have moved it;
+  - otherwise it comes back where it was.
 
 ### 2.2 Permissions on resources (stage 2: SY.vault)
 
@@ -203,7 +281,7 @@ Every stage goes through:
 
 | Stage | Content | Gate (beyond unit tests) |
 |---|---|---|
-| 1 | ILK structure (§2.1) and its IO.cloud part. | On PROD, through Cloud's public door: <br>• the same email registered from two tenants gives one ILK; <br>• `set_ilk_tenant` moves the person, and the person's `cloud` and IO channels still resolve; <br>• the person keeps their channels after an identity restart (DB reload); <br>• worker1's identity replica shows the new tenant; <br>• a read by id across tenants works, and Cloud is refused a node's ILK on delete; <br>• the migration report. |
+| 1 | ILK structure (§2.1) and its IO.cloud part. | On PROD, through Cloud's public door: <br>• the same email registered from two tenants gives one ILK; <br>• `set_ilk_tenant` moves the person, and the person's `cloud` and IO channels still resolve; <br>• the person keeps their channels after an identity restart (DB reload); <br>• worker1's identity replica shows the new tenant; <br>• a read by id across tenants works, and Cloud is refused a node's ILK on delete; <br>• a tenant with an account charged is refused (`TENANT_HAS_ACCOUNTS`), and purging the tenant a person left drops their keys there; <br>• the migration on data made with 0.1.64: a unique email moves, an email in two tenants is reported and refused (`ACCOUNT_AMBIGUOUS`). |
 | 2 | Vault grants (§2.2). | The pool migration report, and a node's credentials unchanged after it. The two invariants: sharing a tenant grants nothing, and a different tenant blocks nothing that was granted. |
 | 3 | Tenant firm (§2.3). | Suspend a test tenant: its node does not start, its traffic is refused, it spends nothing. Reactivate: everything works again. A tenant delete with ILKs charged is refused. |
 | 4 | Cloud (§2.4), whatever did not ship with 1–3. | The contract doc checked live. |
@@ -222,7 +300,7 @@ Every stage goes through:
 | D5 | Order: ILK structure, tenant, Cloud, tokens. | Decided 2026-10-14 |
 | D6 | Stage 1 reassigns human ILKs only; nodes with stage 2. | Proposed |
 | D7 | One Cloud account per email (installation-wide scope); no automatic merge of existing duplicates. | Proposed |
-| D8 | Deleting a tenant is refused while ILKs are charged to it (replaces the cascade of people). | Proposed, stage 3 |
+| D8 | Deleting a tenant is refused while ILKs are charged to it (replaces the cascade of people). | Stage 1 takes the account part (§2.1); the rest is proposed for stage 3 |
 | D9 | The vault grant model's shape. | Stage 2 |
 
 ## 5. Related

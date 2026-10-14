@@ -995,6 +995,66 @@ Visto al arreglar los e2e de A-37, leyendo `src/router/mod.rs` y `src/shm/mod.rs
   binario generaría uno como root); si no, el `myID` del Syncthing en marcha. Nunca `config.xml`.
 - **Estado:** construido; lo ejercita el próximo join (el de A-48).
 
+### A-63 ✅ RESUELTO EN CÓDIGO (0.1.65) — La identidad dependía del tenant: personas duplicadas, claves que se corrían y fusiones entre tenants
+
+- **El marco:** `docs/ilk-tenant-model-v1.md`. Lo decidieron el operador, Claude y Astra el
+  2026-10-14: el ILK es el actor y nunca se duplica, el tenant es un centro de costo y los permisos
+  son explícitos.
+- **Qué pasaba:**
+  - La clave de un canal era `(canal, dirección, tenant del ILK)`, recalculada siempre desde el
+    tenant actual del ILK. Así:
+    - la misma persona en dos empresas eran dos ILKs;
+    - re-registrar un temporal en otro tenant dejaba la búsqueda del primario desactualizada hasta
+      reiniciar;
+    - una fusión guardaba los canales movidos con un tenant en memoria y otro en la base.
+  - `merge_from_ilk_id` no chequeaba tenant.
+  - `delete_ilk` de Cloud podía marcar ILKs de nodos.
+  - Borrar un tenant marcaba a toda persona cargada a él.
+- **Arreglo (etapa 1):**
+  - **El ámbito del canal:**
+    - cada canal guarda su `scope`, fijo al crearlo;
+    - todas las claves lo usan: memoria, base, SHM y el camino rápido;
+    - el `IlkEntry` de la SHM lleva el centro de costo;
+    - no hay cambio de layout.
+  - **Una cuenta de Cloud por email:**
+    - el canal `cloud` vive en el ámbito de la instalación, y solo IO.cloud lo escribe;
+    - `register_human` devuelve la cuenta existente (`existing: true`);
+    - un temporal abandonado se recarga al tenant que pide, con historial;
+    - `ACCOUNT_AMBIGUOUS` y `ACCOUNT_IN_ROOT_TENANT` cubren los datos viejos.
+  - **`ILK_SET_TENANT`:**
+    - solo personas completas, con historial en la misma transacción;
+    - el admin estampa para quién es el cambio;
+    - el registro ya no cambia el tenant de una persona.
+  - **Fusiones** dentro de un mismo tenant.
+  - **Cloud** borra y restaura solo personas, y lee por id sin filtro de tenant.
+  - **Borrar un tenant** con cuentas cargadas da `TENANT_HAS_ACCOUNTS`; el resto sigue en cascada.
+  - **Migración v3 en el esquema:** antes de cargar la memoria, mueve las cuentas no ambiguas y
+    reporta el resto por log.
+- **Revisión del diseño (una ronda):** 7 hallazgos mayores y 5 menores, todos incorporados al diseño
+  antes de escribir el código.
+- **Revisión del código (una ronda):** 1 mayor y 8 menores.
+  - **El mayor:** purgar un tenant del que se había ido una persona fallaba siempre. La FK de sus
+    canales al tenant seguía viva. Ahora la purga se lleva los canales que quedan en ese ámbito
+    (`dropped_channels`).
+  - **Arreglados:**
+    - **Push de una réplica rechazado:** ya no se toma como una baja.
+    - **El canal `cloud` y el ámbito de la instalación**, cerrados también por la réplica (snapshot
+      y delta), por `ILK_UPDATE` y por la fusión desde un nodo IO del tenant.
+    - **La recarga de un temporal:** solo con IO.cloud y en el ámbito compartido.
+    - **El canal propio de un nodo** no responde un alta de persona.
+    - **Un `ich_id` ajeno se rechaza** (`ICH_ID_CONFLICT`).
+    - **Un email ambiguo:** también lo es si otro ILK lo tiene en el ámbito de la instalación.
+      Se chequea antes de buscar.
+    - **El restore de una cuenta vieja** vuelve al ámbito de la instalación si la clave está libre.
+    - **Un alta sin terminar no traba ni se marca** al borrar su tenant (`pending_signups`).
+    - **Tests:** el sello de `on_behalf_of` del admin, más 9 en identity.
+  - **Queda documentado, sin código:** el desfase de versiones entre el core e io.cloud durante el
+    upgrade. Un core viejo rechaza `scope`, y un admin nuevo rechaza un `delete_ilk` viejo sin
+    `ilk_type`. Son los segundos del rebind de A-39. El SQL de v3 se valida en 8.x con datos hechos
+    en 0.1.64.
+- **Pendiente para las etapas siguientes:** reasignar nodos (con los permisos del vault, etapa 2),
+  y el estado del tenant como compuerta y el resto de D8 (etapa 3).
+
 ### A-62 🟡 ESTACIONADO (costo/beneficio, 2026-10-13) — Cualquier nodo de la malla puede pedirle cualquier acción al admin
 
 - **Qué pasa (visto en el código el 2026-10-07):** el gateway interno del admin (`ADMIN_COMMAND`)
