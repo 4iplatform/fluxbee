@@ -28,6 +28,10 @@ pub const MSG_VAULT_ROTATE: &str = "VAULT_ROTATE";
 pub const MSG_VAULT_ROTATE_RESPONSE: &str = "VAULT_ROTATE_RESPONSE";
 pub const MSG_VAULT_ROLLBACK: &str = "VAULT_ROLLBACK";
 pub const MSG_VAULT_ROLLBACK_RESPONSE: &str = "VAULT_ROLLBACK_RESPONSE";
+/// Replace the nodes a secret is assigned to, without touching its value (docs/ilk-tenant-model-v1.md
+/// §2.2). Administrative: SY.admin (which relays Fluxbee Cloud) and SY.architect.
+pub const MSG_VAULT_ASSIGN: &str = "VAULT_ASSIGN";
+pub const MSG_VAULT_ASSIGN_RESPONSE: &str = "VAULT_ASSIGN_RESPONSE";
 
 /// Canonical resource types vault knows about. Drives the consumer-side
 /// match in Model D' (`resolve_resource(ResourceType::Openai, ...)` → vault
@@ -303,10 +307,15 @@ pub struct VaultMetadata {
     /// Model D' write paths; `None` only for legacy reads of older secrets.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resource_type: Option<String>,
-    /// Owner ILK in Model D'. `None` means the secret lives in the tenant's
-    /// pool and any caller of the same tenant can read it.
+    /// Owner ILK in Model D': a node, which reads it, or a person, whose secret it is (read by
+    /// the nodes it is assigned to). With no owner and no assigned node the secret is its tenant's
+    /// general secret: any node charged to the tenant reads it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ilk: Option<String>,
+    /// The nodes (ILKs) the secret is assigned to, besides its owner (docs/ilk-tenant-model-v1.md
+    /// §2.2). Each is charged to the secret's tenant.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub assigned_ilks: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -317,6 +326,17 @@ pub struct VaultMetadata {
     pub updated_at: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tags: Vec<String>,
+}
+
+/// `VAULT_ASSIGN`: replace the nodes a secret is assigned to (empty: none), in the tenant the
+/// request names; the value and the owner stay.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct VaultAssignRequest {
+    pub key: String,
+    pub tenant_id: String,
+    #[serde(default)]
+    pub assigned_ilks: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -379,10 +399,13 @@ pub struct VaultFilter {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resource_type: Option<String>,
     /// Filter by owner ILK. Pass `Some("ilk:<uuid>")` to match secrets
-    /// dedicated to that ILK; pass `Some("")` to match pool secrets
-    /// explicitly. `None` means "don't filter by owner".
+    /// dedicated to that ILK; pass `Some("")` to match general secrets (no owner and no assigned
+    /// node). `None` means "don't filter by owner".
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ilk: Option<String>,
+    /// Keep only the secrets assigned to this ILK.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub assigned_ilk: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tags: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -917,6 +940,9 @@ impl VaultClient {
         }
     }
 
+    /// The secret of `resource` this node uses (docs/ilk-tenant-model-v1.md §2.2): one it owns, else
+    /// one assigned to it, else its tenant's general secret. Never another tenant's: the genesis
+    /// tenant's general secrets are the core's, read by the core with the genesis tenant as theirs.
     pub async fn resolve_resource(
         &self,
         resource: ResourceType,
@@ -926,41 +952,19 @@ impl VaultClient {
         let resource_str = resource.as_str().to_string();
 
         if !self.caller.src_ilk.is_empty() {
-            if let Some(value) = self
-                .list_then_get_first(
-                    &resource_str,
-                    my_tenant,
-                    Some(self.caller.src_ilk.clone()),
-                    timeout,
-                )
-                .await?
-            {
-                return Ok(Some(value));
+            let me = self.caller.src_ilk.clone();
+            for (owner, assigned) in [(Some(me.clone()), None), (None, Some(me))] {
+                if let Some(value) = self
+                    .list_then_get_first(&resource_str, my_tenant, owner, assigned, timeout)
+                    .await?
+                {
+                    return Ok(Some(value));
+                }
             }
         }
 
-        if let Some(value) = self
-            .list_then_get_first(&resource_str, my_tenant, Some(String::new()), timeout)
-            .await?
-        {
-            return Ok(Some(value));
-        }
-
-        if my_tenant != crate::identity::DEFAULT_ROOT_TENANT_ID {
-            if let Some(value) = self
-                .list_then_get_first(
-                    &resource_str,
-                    crate::identity::DEFAULT_ROOT_TENANT_ID,
-                    Some(String::new()),
-                    timeout,
-                )
-                .await?
-            {
-                return Ok(Some(value));
-            }
-        }
-
-        Ok(None)
+        self.list_then_get_first(&resource_str, my_tenant, Some(String::new()), None, timeout)
+            .await
     }
 
     async fn list_then_get_first(
@@ -968,6 +972,7 @@ impl VaultClient {
         resource_type: &str,
         tenant_id: &str,
         ilk_filter: Option<String>,
+        assigned_filter: Option<String>,
         timeout: Duration,
     ) -> Result<Option<Value>, VaultError> {
         let filter = VaultFilter {
@@ -975,6 +980,7 @@ impl VaultClient {
             tenant_id: Some(tenant_id.to_string()),
             resource_type: Some(resource_type.to_string()),
             ilk: ilk_filter,
+            assigned_ilk: assigned_filter,
             tags: Vec::new(),
             limit: Some(1),
         };

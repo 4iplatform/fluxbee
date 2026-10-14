@@ -62,31 +62,6 @@ fn node_matches(node_name: &str, known: &[&str]) -> bool {
     known.iter().any(|k| k.eq_ignore_ascii_case(local))
 }
 
-/// The IO runtimes the core itself runs, in the root tenant: the ones the platform needs as shared
-/// resources, not because a solution asks for them (operator decisions 2026-10-02 and 2026-10-03,
-/// FINDINGS A-43). io.web is designed (docs/io-web-spec-beta-v1.md) but not built yet. Every other
-/// IO runtime stays installed and spawnable, but a tenant launches it: never in the root tenant,
-/// never by default.
-pub const ROOT_TENANT_IO_RUNTIMES: &[&str] = &["io.cloud", "io.blob", "io.web"];
-
-/// True when the root tenant refuses this node: an IO node (an `IO.*` name or an `io.*` runtime)
-/// whose runtime is not one of [`ROOT_TENANT_IO_RUNTIMES`], with `tenant_id` the root tenant.
-/// Other kinds of node are not restricted here.
-pub fn root_tenant_refuses_io_node(node_name: &str, runtime: &str, tenant_id: &str) -> bool {
-    let local = node_name
-        .split_once('@')
-        .map(|(local, _)| local)
-        .unwrap_or(node_name)
-        .trim();
-    let runtime = runtime.trim();
-    let is_io = local.starts_with("IO.") || runtime.to_ascii_lowercase().starts_with("io.");
-    is_io
-        && is_root_tenant(tenant_id)
-        && !ROOT_TENANT_IO_RUNTIMES
-            .iter()
-            .any(|allowed| allowed.eq_ignore_ascii_case(runtime))
-}
-
 /// The root tenant, in any spelling of `tnt:<uuid>` that parses to it (with or without hyphens).
 pub fn is_root_tenant(tenant_id: &str) -> bool {
     let uuid_of = |raw: &str| {
@@ -135,60 +110,11 @@ mod tests {
         unsafe { std::env::remove_var("GOV_NODE_NAME") };
     }
 
-    /// A-43: only the core IO runtimes (io.cloud, io.blob, io.web) run in the root tenant; any
-    /// other IO node is launched by a tenant. Other kinds, and other tenants, are not restricted.
     #[test]
-    fn the_root_tenant_takes_only_the_core_io_runtimes() {
-        let root = crate::identity::DEFAULT_ROOT_TENANT_ID;
-        let root_without_hyphens = "tnt:00000000000000000000000000000001";
-        let tenant = "tnt:8a0c3f8e-2f1b-4d3a-9c55-0f6e2b7d9a11";
-        assert!(!root_tenant_refuses_io_node(
-            "IO.cloud@motherbee",
-            "io.cloud",
-            root
-        ));
-        assert!(!root_tenant_refuses_io_node(
-            "IO.blob@motherbee",
-            "io.blob",
-            root
-        ));
-        assert!(!root_tenant_refuses_io_node(
-            "IO.web@motherbee",
-            "io.web",
-            root
-        ));
-        for (name, runtime) in [
-            ("IO.api@motherbee", "io.api"),
-            ("IO.wapp.default@motherbee", "io.wapp"),
-            ("IO.slack.acme@motherbee", "io.slack"),
-            ("IO.cloud2@motherbee", "io.api"),
-            ("IO.anything@motherbee", ""),
-            ("WF.oddly.named@motherbee", "io.api"),
-        ] {
-            assert!(
-                root_tenant_refuses_io_node(name, runtime, root),
-                "{name} ({runtime})"
-            );
-            assert!(root_tenant_refuses_io_node(
-                name,
-                runtime,
-                root_without_hyphens
-            ));
-            assert!(
-                !root_tenant_refuses_io_node(name, runtime, tenant),
-                "{name} in a tenant"
-            );
-        }
-        assert!(!root_tenant_refuses_io_node(
-            "AI.sales@motherbee",
-            "ai.generic",
-            root
-        ));
-        assert!(!root_tenant_refuses_io_node(
-            "WF.flow@motherbee",
-            "wf.generic",
-            root
-        ));
+    fn the_root_tenant_reads_in_any_spelling_of_its_uuid() {
+        assert!(is_root_tenant(crate::identity::DEFAULT_ROOT_TENANT_ID));
+        assert!(is_root_tenant("tnt:00000000000000000000000000000001"));
+        assert!(!is_root_tenant("tnt:8a0c3f8e-2f1b-4d3a-9c55-0f6e2b7d9a11"));
         assert!(!is_root_tenant("tnt:not-a-uuid"));
         assert!(!is_root_tenant(""));
     }

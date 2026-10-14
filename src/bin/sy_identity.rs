@@ -1235,12 +1235,9 @@ impl IdentityStore {
                 if existing.ilk_type.trim() == "system" {
                     return Err("SYSTEM_ILK_PROTECTED".to_string());
                 }
-                let tenant_change = existing.tenant_id != req.tenant_id;
-                // A person's tenant changes only through ILK_SET_TENANT, which records it; a node's
-                // temporary may still take its tenant here.
-                let is_person =
-                    existing.ilk_type.trim() == "human" || req.ilk_type.trim() == "human";
-                if tenant_change && (!existing.registration_status.eq("temporary") || is_person) {
+                // An ILK's tenant changes only through ILK_SET_TENANT, which records it and takes
+                // people only: a node is born and dies in its tenant (D6), its temporary included.
+                if existing.tenant_id != req.tenant_id {
                     return Err("INVALID_TENANT_TRANSITION".to_string());
                 }
                 // Its channels keep the scope they were created with.
@@ -2789,12 +2786,12 @@ impl IdentityStore {
                 ilk
             })
             .filter(|ilk| {
-                let acceptable = replica_channels_acceptable(ilk, self.ilks.get(&ilk.ilk_id));
+                let acceptable = replica_push_acceptable(ilk, self.ilks.get(&ilk.ilk_id));
                 if !acceptable {
                     tracing::warn!(
                         ilk_id = %ilk.ilk_id,
                         hive_id = %hive_id,
-                        "replica push ignored: a node channel names another scope or a Fluxbee Cloud account"
+                        "replica push ignored: it changes the ILK's tenant, or a node channel names another scope or a Fluxbee Cloud account"
                     );
                 }
                 acceptable
@@ -2913,7 +2910,7 @@ fn delta_authorized_for_hive(
             if !ingest_ilk_type_authorized(ilk, publisher_hive) {
                 return false;
             }
-            if !replica_channels_acceptable(ilk, store.ilks.get(&ilk.ilk_id)) {
+            if !replica_push_acceptable(ilk, store.ilks.get(&ilk.ilk_id)) {
                 return false;
             }
             match store.ilks.get(&ilk.ilk_id) {
@@ -7069,6 +7066,14 @@ fn is_pending_signup(ilk: &IlkRecord) -> bool {
     ilk.ilk_type.trim() == "human"
         && ilk.registration_status == "temporary"
         && holds_installation_account(ilk)
+}
+
+/// What a replica may push for one of its ILKs: never another tenant for an ILK the primary holds
+/// (a node is born and dies in its tenant, D6), and only channels it may hold (see
+/// `replica_channels_acceptable`).
+fn replica_push_acceptable(incoming: &IlkRecord, existing: Option<&IlkRecord>) -> bool {
+    existing.is_none_or(|existing| existing.tenant_id == incoming.tenant_id)
+        && replica_channels_acceptable(incoming, existing)
 }
 
 /// A replica's ILKs are its nodes': their channels live in their own tenant, and neither the
@@ -12530,5 +12535,64 @@ mod tests {
         // Marked, it is no longer pending.
         store.delete_ilk(lc_ilk(&kim), 2).expect("mark the signup");
         assert_eq!(store.list_ilks_payload(true, true)["count"], 0);
+    }
+
+    #[test]
+    fn a_node_is_born_and_dies_in_its_tenant() {
+        let mut store = sc_store();
+        // A node's temporary is registered into its own tenant, never another.
+        let temp = store
+            .provision_temporary_ilk(
+                IlkProvisionRequest {
+                    ich_id: format!("ich:{}", Uuid::new_v4()),
+                    channel_type: "api".to_string(),
+                    address: "bot-1".to_string(),
+                    tenant_id: Some(LC_TENANT.to_string()),
+                    ilk_type: Some("agent".to_string()),
+                    scope: None,
+                },
+                Some("IO.api@motherbee"),
+                TEST_CLOUD_RELAY,
+            )
+            .map(|(ok, _)| ok["ilk_id"].as_str().unwrap().to_string())
+            .expect("provision an agent");
+        let register = |store: &mut IdentityStore, tenant_id: &str| {
+            store.register_ilk(
+                IlkRegisterRequest {
+                    ilk_id: temp.clone(),
+                    ilk_type: "agent".to_string(),
+                    tenant_id: tenant_id.to_string(),
+                    identification: json!({"node_name": "IO.api.bot@motherbee"}),
+                },
+                MERGE_TTL_SECS,
+            )
+        };
+        assert_eq!(
+            register(&mut store, SC_OTHER).unwrap_err(),
+            "INVALID_TENANT_TRANSITION"
+        );
+        assert_eq!(store.ilks[&temp].tenant_id, LC_TENANT);
+        register(&mut store, LC_TENANT).expect("its own tenant");
+        // A replica cannot move one either.
+        let mut node = ilk_for(
+            "IO.slack@worker1",
+            "ilk:abababab-abab-4bab-8bab-abababababab",
+        );
+        node.tenant_id = LC_TENANT.to_string();
+        assert_eq!(
+            store
+                .reconcile_hive_ilks("worker1", vec![node.clone()])
+                .len(),
+            1
+        );
+        let mut moved = node.clone();
+        moved.tenant_id = SC_OTHER.to_string();
+        assert!(!delta_authorized_for_hive(
+            &IdentityDelta::IlkUpsert { ilk: moved.clone() },
+            "worker1",
+            &store
+        ));
+        assert!(store.reconcile_hive_ilks("worker1", vec![moved]).is_empty());
+        assert_eq!(store.ilks[&node.ilk_id].tenant_id, LC_TENANT);
     }
 }

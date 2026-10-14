@@ -622,6 +622,37 @@ pub fn tenant_exists_in_hive_config(
     tenant_exists_in_hive_id(&hive_id, tenant_id)
 }
 
+/// A tenant's status in the identity SHM (`pending`, `active`, `suspended`), or `None` when it is
+/// not there: it does not exist, or it is marked deleted (the SHM leaves those out).
+pub fn tenant_status_in_shm_name(
+    identity_shm_name: &str,
+    tenant_id: &str,
+) -> Result<Option<String>, IdentityShmError> {
+    let tenant_uuid = parse_prefixed_uuid(tenant_id, "tnt")?;
+    let reader = open_identity_shm_reader(identity_shm_name)?;
+    Ok(reader
+        .tenant_status(tenant_uuid.into_bytes())?
+        .map(tenant_status_from_shm))
+}
+
+/// A tenant's status for one hive (see `tenant_status_in_shm_name`).
+pub fn tenant_status_in_hive_id(
+    hive_id: &str,
+    tenant_id: &str,
+) -> Result<Option<String>, IdentityShmError> {
+    let shm_name = identity_shm_name_for_hive(hive_id)?;
+    tenant_status_in_shm_name(&shm_name, tenant_id)
+}
+
+/// A tenant's status using `hive.yaml` from config dir (see `tenant_status_in_shm_name`).
+pub fn tenant_status_in_hive_config(
+    config_dir: &Path,
+    tenant_id: &str,
+) -> Result<Option<String>, IdentityShmError> {
+    let hive_id = load_hive_id(config_dir)?;
+    tenant_status_in_hive_id(&hive_id, tenant_id)
+}
+
 /// Check whether an ILK exists in identity SHM by canonical ilk id (`ilk:<uuid>`).
 pub fn ilk_exists_in_shm_name(
     identity_shm_name: &str,
@@ -928,9 +959,13 @@ impl IdentityShmReader {
     }
 
     fn tenant_exists(&self, tenant_id: [u8; 16]) -> Result<bool, IdentityShmError> {
+        Ok(self.tenant_status(tenant_id)?.is_some())
+    }
+
+    fn tenant_status(&self, tenant_id: [u8; 16]) -> Result<Option<u8>, IdentityShmError> {
         let header = header_ref::<IdentityHeader>(self.mmap.as_ref(), self.layout.header_offset)
             .ok_or(IdentityShmError::InvalidShmHeader)?;
-        read_tenant_exists_from_region(header, self.mmap.as_ref(), &self.layout, tenant_id)
+        read_tenant_status_from_region(header, self.mmap.as_ref(), &self.layout, tenant_id)
     }
 
     fn ilk_exists(&self, ilk_id: [u8; 16]) -> Result<bool, IdentityShmError> {
@@ -1189,12 +1224,13 @@ fn read_resolved_identity_option_from_region(
     }
 }
 
-fn read_tenant_exists_from_region(
+/// The status byte of the tenant's live entry, or `None` when it has none.
+fn read_tenant_status_from_region(
     header: &IdentityHeader,
     mmap: &[u8],
     layout: &IdentityRegionLayout,
     tenant_id: [u8; 16],
-) -> Result<bool, IdentityShmError> {
+) -> Result<Option<u8>, IdentityShmError> {
     let start = StdInstant::now();
     loop {
         if start.elapsed() > StdDuration::from_millis(SEQLOCK_READ_TIMEOUT_MS) {
@@ -1217,14 +1253,15 @@ fn read_tenant_exists_from_region(
             layout.limits.max_tenants as usize,
         )
         .ok_or(IdentityShmError::InvalidShmHeader)?;
-        let exists = tenants[..max_tenants]
+        let status = tenants[..max_tenants]
             .iter()
-            .any(|entry| entry.flags & FLAG_ACTIVE != 0 && entry.tenant_id == tenant_id);
+            .find(|entry| entry.flags & FLAG_ACTIVE != 0 && entry.tenant_id == tenant_id)
+            .map(|entry| entry.status);
 
         atomic::fence(Ordering::Acquire);
         let s2 = header.seq.load(Ordering::Acquire);
         if s1 == s2 {
-            return Ok(exists);
+            return Ok(status);
         }
     }
 }
@@ -1404,6 +1441,17 @@ fn ilk_type_from_shm(value: u8) -> String {
         SHM_ILK_TYPE_HUMAN => "human",
         SHM_ILK_TYPE_AGENT => "agent",
         SHM_ILK_TYPE_SYSTEM => "system",
+        _ => "unknown",
+    }
+    .to_string()
+}
+
+/// The tenant status codes SY.identity writes (0 pending, 1 active, 2 suspended).
+fn tenant_status_from_shm(value: u8) -> String {
+    match value {
+        0 => "pending",
+        1 => "active",
+        2 => "suspended",
         _ => "unknown",
     }
     .to_string()
@@ -1886,9 +1934,16 @@ mod tests {
         write_struct(&mut mmap, layout.header_offset, &header);
         write_struct(&mut mmap, layout.tenant_offset, &tenant);
 
-        let exists =
-            read_tenant_exists_from_region(&header, &mmap, &layout, tenant.tenant_id).unwrap();
-        assert!(exists);
+        let status =
+            read_tenant_status_from_region(&header, &mmap, &layout, tenant.tenant_id).unwrap();
+        assert_eq!(
+            status.map(tenant_status_from_shm),
+            Some(tenant_status_from_shm(tenant.status))
+        );
+        assert_eq!(
+            read_tenant_status_from_region(&header, &mmap, &layout, [9u8; 16]).unwrap(),
+            None
+        );
     }
 
     #[test]

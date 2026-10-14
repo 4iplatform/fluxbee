@@ -1,7 +1,8 @@
 # ILK and tenant — the identity and cost-center model (v1)
 
 **Status:** contract and order of work decided by the operator on 2026-10-14. Stage 1 is live in
-0.1.65, validated on the 8.x testbed on 2026-10-14 (`lab/DEPLOYMENTS.md`).
+0.1.65, validated on the 8.x testbed on 2026-10-14 (`lab/DEPLOYMENTS.md`). Stage 2 built for 0.1.66
+(FINDINGS A-64).
 This document is the single source for the change; FINDINGS and the ledger point here.
 
 **How it was reached.** It came out of a conversation, not out of the code: the operator, Claude
@@ -229,6 +230,11 @@ seguridad ... el secret se guarda con el tenant para filtrar el uso del que paga
 **The tenant check:** the vault hands out a secret only while its tenant exists and is active. It
 reads that from the identity SHM, which already carries the real status and leaves deleted tenants
 out. The genesis tenant always counts as active.
+- A suspended or pending tenant is refused (UNAUTHORIZED), and the consumers drop the value.
+- A tenant the SHM does not hold is not handed out either, but answered as retryable
+  (IDENTITY_UNAVAILABLE). A degraded identity start writes only the genesis tenant, and the nodes
+  must not drop their credentials during an identity outage; a deleted tenant has no node left to
+  ask anyway.
 
 **What keeps this sound:**
 - **A node is born and dies in its tenant:** it is never reassigned; identity and the orchestrator
@@ -255,8 +261,11 @@ out. The genesis tenant always counts as active.
 - **Identity and the orchestrator:** a node's tenant is fixed, and only the core is born in the
   genesis tenant.
 - **Cloud (IO.cloud and SY.admin):**
-  - `put_token` with an owner (a node or a person), with nodes, or general;
-  - assigning and unassigning nodes without rewriting the value;
+  - `put_token` with an owner node, with nodes, or general. A person as owner goes through the
+    operator for now; Cloud's surface for it comes with the case;
+  - a new value keeps who uses the secret unless the put names it, so a refresh never turns a
+    restricted secret general;
+  - assigning and unassigning nodes without rewriting the value (`assign_token`);
   - `list_tokens` showing the owner, the nodes or "general".
 
   The assigned nodes must be charged to the secret's tenant: Cloud reads the nodes from Fluxbee's
@@ -268,6 +277,17 @@ out. The genesis tenant always counts as active.
 
 **Migration:** none. Every secret keeps its meaning: a dedicated one stays dedicated, and an
 owner-less one is its tenant's general secret, as today.
+
+**Known limits (documented, not built):**
+- A deleted node stays in the assigned lists. It reads nothing, and removing it could turn a
+  secret general on its own (no owner, no node left), which is worse. Cloud cleans the list with
+  the live nodes.
+- io.linkedhelper reads its credential only at start and on CONFIG_SET: an unassignment or a
+  suspension reaches it at its next restart. Its peers (io.slack, io.wapp) re-read on every change;
+  align it when it is next touched.
+- The vault trusts the caller's `src_ilk`, which the node itself declares. Binding it to the
+  router-stamped name is the io.web phase-0 task (`docs/io-web-spec-beta-v1.md` §21), and it applies
+  equally to owned and assigned secrets.
 
 ### 2.3 The tenant as a cost center (stage 3)
 

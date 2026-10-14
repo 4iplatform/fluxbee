@@ -27741,6 +27741,8 @@ mod tests {
             resource_type: "openai".to_string(),
             tenant_id: fluxbee_sdk::DEFAULT_ROOT_TENANT_ID.to_string(),
             ilk: None,
+            assigned_ilks: Vec::new(),
+            general: true,
             version: 1,
             key: "secret/openai".to_string(),
             hive_id: "motherbee".to_string(),

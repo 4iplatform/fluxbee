@@ -52,9 +52,9 @@ pub use identity::{
 pub use managed_node::{
     is_allowed_non_sy_lifecycle_node, is_root_tenant, managed_node_config_path,
     managed_node_config_path_with_root, managed_node_instance_dir,
-    managed_node_instance_dir_with_root, managed_node_name, root_tenant_refuses_io_node,
+    managed_node_instance_dir_with_root, managed_node_name,
     ManagedNodeError, DEFAULT_MANAGED_NODE_ROOT, FLUXBEE_NODE_NAME_ENV,
-    HIVE_YAML_NON_SY_LIFECYCLE_NODES, ROOT_TENANT_IO_RUNTIMES,
+    HIVE_YAML_NON_SY_LIFECYCLE_NODES,
 };
 pub use node_client::{NodeConfig, NodeError, NodeUuidMode};
 pub use node_config::{
@@ -113,9 +113,10 @@ pub use vault::{
     VaultDeleteResponse, VaultError, VaultFilter, VaultGetMetadataRequest,
     VaultGetMetadataResponse, VaultGetRequest, VaultGetResponse, VaultKeyRequest, VaultListRequest, VaultScopedKeyRequest,
     VaultListResponse, VaultMetadata, VaultPutRequest, VaultPutResponse, VaultRetryPolicy,
-    VaultRollbackResponse, VaultRotateRequest, VaultRotateResponse, VaultSecretSummary,
+    VaultAssignRequest, VaultRollbackResponse, VaultRotateRequest, VaultRotateResponse, VaultSecretSummary,
     VaultValueResponse, VAULT_BOOT_RETRY_INTERVAL, VAULT_BOOT_WAIT, MSG_VAULT_DELETE, MSG_VAULT_DELETE_RESPONSE, MSG_VAULT_GET,
     MSG_VAULT_GET_METADATA, MSG_VAULT_GET_METADATA_RESPONSE, MSG_VAULT_GET_RESPONSE,
     MSG_VAULT_LIST, MSG_VAULT_LIST_RESPONSE, MSG_VAULT_PUT, MSG_VAULT_PUT_RESPONSE,
-    MSG_VAULT_ROLLBACK, MSG_VAULT_ROLLBACK_RESPONSE, MSG_VAULT_ROTATE, MSG_VAULT_ROTATE_RESPONSE,
+    MSG_VAULT_ASSIGN, MSG_VAULT_ASSIGN_RESPONSE, MSG_VAULT_ROLLBACK, MSG_VAULT_ROLLBACK_RESPONSE,
+    MSG_VAULT_ROTATE, MSG_VAULT_ROTATE_RESPONSE,
 };

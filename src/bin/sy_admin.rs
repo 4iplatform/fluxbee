@@ -42,10 +42,11 @@ use fluxbee_sdk::{
     build_node_config_response_message, classify_admin_action, classify_system_message,
     derive_action_outcome, try_handle_default_node_status, ClientConfig, NodeConfig,
     OperationalRouteProfile, PendingMatcher, RouteMatch, RouteTarget, RouterDispatcher,
-    RpcCommandReceiver, RpcRequestLabels, MSG_VAULT_DELETE, MSG_VAULT_DELETE_RESPONSE,
-    MSG_VAULT_GET, MSG_VAULT_GET_METADATA, MSG_VAULT_GET_METADATA_RESPONSE, MSG_VAULT_GET_RESPONSE,
-    MSG_VAULT_LIST, MSG_VAULT_LIST_RESPONSE, MSG_VAULT_PUT, MSG_VAULT_PUT_RESPONSE,
-    MSG_VAULT_ROLLBACK, MSG_VAULT_ROLLBACK_RESPONSE, MSG_VAULT_ROTATE, MSG_VAULT_ROTATE_RESPONSE,
+    RpcCommandReceiver, RpcRequestLabels, MSG_VAULT_ASSIGN, MSG_VAULT_ASSIGN_RESPONSE,
+    MSG_VAULT_DELETE, MSG_VAULT_DELETE_RESPONSE, MSG_VAULT_GET, MSG_VAULT_GET_METADATA,
+    MSG_VAULT_GET_METADATA_RESPONSE, MSG_VAULT_GET_RESPONSE, MSG_VAULT_LIST,
+    MSG_VAULT_LIST_RESPONSE, MSG_VAULT_PUT, MSG_VAULT_PUT_RESPONSE, MSG_VAULT_ROLLBACK,
+    MSG_VAULT_ROLLBACK_RESPONSE, MSG_VAULT_ROTATE, MSG_VAULT_ROTATE_RESPONSE,
     NODE_SECRET_REDACTION_TOKEN,
 };
 use json_router::runtime_manifest::{
@@ -97,6 +98,7 @@ const ADMIN_EXECUTOR_PILOT_ACTIONS: &[&str] = &[
     "vault_delete",
     "vault_rotate",
     "vault_rollback",
+    "vault_assign",
     "set_ilk_definition",
     "delete_ilk",
     "restore_ilk",
@@ -1013,7 +1015,7 @@ fn save_admin_executor_node_config(
 }
 
 /// Build the admin executor AI runtime by discovering the `openai` resource
-/// in SY.vault (Model D' pool match: dedicated → tenant pool → root-tenant pool).
+/// in SY.vault (owned → assigned → its tenant's general secret; admin's tenant is the root one).
 /// Returns `Ok(None)` (degraded) on any of:
 /// - vault has no openai secret reachable from our (ilk, tenant) match;
 /// - vault unreachable or denies access;
@@ -3497,6 +3499,12 @@ const INTERNAL_ACTION_REGISTRY: &[InternalActionSpec] = &[
         allow_legacy_hive_id: false,
     },
     InternalActionSpec {
+        action: "vault_assign",
+        route: InternalActionRoute::Command("vault_assign"),
+        requires_target: true,
+        allow_legacy_hive_id: false,
+    },
+    InternalActionSpec {
         action: "vault_rollback",
         route: InternalActionRoute::Command("vault_rollback"),
         requires_target: true,
@@ -5877,6 +5885,20 @@ fn enforce_cloud_relay_content(
             only_fields(filter, &["tenant_id", "resource_type", "prefix", "limit"])?;
             only_fields(Some(params), &["filter"])?;
         }
+        "vault_assign" => {
+            // The key's tenant; the nodes are checked against it (resolve_assigned_ilks).
+            cloud_claimed_tenant(params.get("tenant_id"), action)?;
+            not_reserved(
+                params
+                    .get("key")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default(),
+            )?;
+            only_fields(
+                Some(params),
+                &["key", "tenant_id", "assigned_nodes", "assigned_ilks"],
+            )?;
+        }
         "vault_delete" => {
             // SY.vault answers KEY_NOT_FOUND for a key of another tenant.
             cloud_claimed_tenant(params.get("tenant_id"), action)?;
@@ -7142,6 +7164,33 @@ async fn handle_hive_paths(
             }
             let (status, resp) =
                 handle_admin_command(ctx, client, "vault_delete", payload, Some(hive)).await?;
+            Ok(Some((status, resp)))
+        }
+        ("PUT", ["vault", "secrets", key, "assigned"]) => {
+            let mut payload = if body.is_empty() {
+                serde_json::json!({})
+            } else {
+                serde_json::from_slice(body)?
+            };
+            let Some(object) = payload.as_object_mut() else {
+                return Ok(Some((
+                    400,
+                    serde_json::json!({
+                        "status": "error",
+                        "action": "vault_assign",
+                        "payload": serde_json::Value::Null,
+                        "error_code": "INVALID_REQUEST",
+                        "error_detail": "the body must be a JSON object",
+                    })
+                    .to_string(),
+                )));
+            };
+            object.insert(
+                "key".to_string(),
+                serde_json::Value::String(decode_percent(key)),
+            );
+            let (status, resp) =
+                handle_admin_command(ctx, client, "vault_assign", payload, Some(hive)).await?;
             Ok(Some((status, resp)))
         }
         ("POST", ["vault", "secrets", key, "rotate"]) => {
@@ -9207,6 +9256,7 @@ fn admin_action_executor_contract(spec: &InternalActionSpec) -> serde_json::Valu
             | "vault_delete"
             | "vault_rotate"
             | "vault_rollback"
+            | "vault_assign"
             | "core_rollback"
     ) {
         vec![
@@ -9287,6 +9337,7 @@ fn admin_action_is_read_only(action: &str) -> bool {
             | "vault_delete"
             | "vault_rotate"
             | "vault_rollback"
+            | "vault_assign"
             | "core_rollback"
             | "update"
             | "sync_hint"
@@ -9333,6 +9384,7 @@ fn admin_action_requires_confirmation(action: &str) -> bool {
             | "vault_delete"
             | "vault_rotate"
             | "vault_rollback"
+            | "vault_assign"
             | "core_rollback"
             | "update"
             | "sync_hint"
@@ -9406,6 +9458,7 @@ fn admin_action_summary(action: &str) -> &'static str {
         "vault_get_metadata" => "Read one SY.vault secret metadata record without returning the secret value.",
         "vault_get" => "Read one SY.vault secret value. Secret-sensitive; prefer metadata inspection when possible.",
         "vault_delete" => "Delete one encrypted secret from SY.vault.",
+        "vault_assign" => "Replace the nodes one secret is assigned to (who uses it besides its owner), without touching its value.",
         "vault_rotate" => "Rotate one encrypted secret value while keeping the previous version for rollback.",
         "vault_rollback" => "Rollback one encrypted secret to its previous version.",
         "core_rollback" => {
@@ -9627,6 +9680,7 @@ fn admin_action_path_patterns(action: &str) -> Vec<&'static str> {
         "vault_get_metadata" => vec!["GET /hives/{hive}/vault/secrets/{key}/metadata"],
         "vault_get" => vec!["GET /hives/{hive}/vault/secrets/{key}"],
         "vault_delete" => vec!["DELETE /hives/{hive}/vault/secrets/{key}"],
+        "vault_assign" => vec!["PUT /hives/{hive}/vault/secrets/{key}/assigned"],
         "vault_rotate" => vec!["POST /hives/{hive}/vault/secrets/{key}/rotate"],
         "vault_rollback" => vec!["POST /hives/{hive}/vault/secrets/{key}/rollback"],
         "core_rollback" => vec!["POST /hives/{hive}/core/rollback"],
@@ -9845,7 +9899,8 @@ fn admin_action_path_params(action: &str) -> Vec<serde_json::Value> {
         | "vault_get_metadata"
         | "vault_delete"
         | "vault_rotate"
-        | "vault_rollback" => vec![
+        | "vault_rollback"
+        | "vault_assign" => vec![
             admin_action_path_param("hive", "string", "Target hive id in the URL path."),
             admin_action_path_param(
                 "key",
@@ -10173,6 +10228,23 @@ fn admin_action_body_optional_fields(action: &str) -> Vec<serde_json::Value> {
                 "string",
                 "Tenant the key belongs to, canonical tnt:<uuid> (metadata.tenant_id in vault_list). Defaults to the hive's root tenant (infrastructure keys). A key of another tenant answers KEY_NOT_FOUND.",
             )],
+        "vault_assign" => vec![
+            admin_action_body_field(
+                "tenant_id",
+                "string",
+                "Tenant the key belongs to, canonical tnt:<uuid>. Defaults to the hive's root tenant. A key of another tenant answers KEY_NOT_FOUND.",
+            ),
+            admin_action_body_field(
+                "assigned_nodes",
+                "array<string>",
+                "Node names (IO.slack.sales@motherbee) the secret is assigned to; each must be charged to the key's tenant.",
+            ),
+            admin_action_body_field(
+                "assigned_ilks",
+                "array<string>",
+                "ILK ids of nodes the secret is assigned to; each must be charged to the key's tenant. Both lists together replace the assignment; none leaves the secret unassigned (its tenant's general secret if it has no owner).",
+            ),
+        ],
         "publish_artifact" => vec![
             admin_action_body_field(
                 "presentation",
@@ -10878,6 +10950,11 @@ fn admin_action_example_payload(action: &str) -> serde_json::Value {
                 "key": "infra:openai-api-key"
             })
         }
+        "vault_assign" => serde_json::json!({
+            "key": "slack:acme:bot",
+            "tenant_id": "tnt:11111111-1111-4111-8111-111111111111",
+            "assigned_nodes": ["IO.slack.sales@motherbee", "IO.slack.support@motherbee"]
+        }),
         "vault_rotate" => serde_json::json!({
             "key": "infra:openai-api-key",
             "value": {
@@ -10994,6 +11071,7 @@ fn admin_action_example_scmd(action: &str) -> Option<String> {
         }
         "vault_get" => "curl -X GET /hives/motherbee/vault/secrets/infra:openai-api-key",
         "vault_delete" => "curl -X DELETE /hives/motherbee/vault/secrets/infra:openai-api-key",
+        "vault_assign" => r#"curl -X PUT /hives/motherbee/vault/secrets/slack:acme:bot/assigned -d '{"tenant_id":"tnt:...","assigned_nodes":["IO.slack.sales@motherbee"]}'"#,
         "vault_rotate" => {
             r#"curl -X POST /hives/motherbee/vault/secrets/infra:openai-api-key/rotate -d '{"value":{"api_key":"sk-rotated-..."}}'"#
         }
@@ -11188,7 +11266,7 @@ fn admin_action_request_notes(action: &str) -> Vec<&'static str> {
             "The payload.config object is node-defined and is not interpreted by SY.admin.",
             "Before mutating AI.* or IO.*, call node_control_config_get and set config_version to response.config_version + 1. A smaller value is stale; an equal value is idempotent and will not apply a change.",
             "Do not use config_version from get_node_config/_system as a substitute unless it exactly matches the live CONFIG_GET response; the canonical source is node_control_config_get.",
-            "For ai.generic chat, use config.behavior.kind=ai_chat with a model. The key is not config: the node reads the hive AI provider's key from SY.vault (resource_type openai|anthropic), for its tenant and then the root tenant.",
+            "For ai.generic chat, use config.behavior.kind=ai_chat with a model. The key is not config: the node reads the hive AI provider's key from SY.vault (resource_type openai|anthropic): one it owns, one assigned to it, or its tenant's general one. A tenant's node never falls back to the root tenant's key (that one is the core's).",
             "Do not put cognitive assets under CONFIG_SET config.assets. Apply role_hash, skill_hashes, handbook_hashes, and personality_hash with set_ilk_definition against the agent ILK.",
             "For WF.* v1, CONFIG_SET is persist-only and returns restart_required; it does not hot-apply CONFIG_CHANGED.",
             "For WF.* v1, do not mutate _system through CONFIG_SET. Managed package/runtime metadata remains owned by orchestrator.",
@@ -11320,6 +11398,12 @@ fn admin_action_request_notes(action: &str) -> Vec<&'static str> {
             "Reads the secret value and is secret-sensitive.",
             "Use only when the operator explicitly needs the plaintext value; prefer vault_get_metadata for inspection.",
             "Executor previews/history must redact the returned value.",
+        ],
+        "vault_assign" => vec![
+            "Replaces the nodes the secret is assigned to; the value, its version and its owner stay.",
+            "Each node must be charged to the key's tenant; a person is never assigned (a person owns secrets, nodes use them).",
+            "A secret with no owner and no assigned node is its tenant's general secret: every node of the tenant uses it.",
+            "Every node that had it or has it now is told (VAULT_SECRET_CHANGED, op assign).",
         ],
         "vault_delete" => vec![
             "Deletes one secret. Admin/Architect only.",
@@ -13113,6 +13197,7 @@ async fn handle_admin_command_inner(
             | "vault_delete"
             | "vault_rotate"
             | "vault_rollback"
+            | "vault_assign"
     ) {
         return handle_vault_command(ctx, client, action, payload, hive).await;
     }
@@ -13613,10 +13698,24 @@ async fn handle_vault_command(
         "vault_delete" => (MSG_VAULT_DELETE, MSG_VAULT_DELETE_RESPONSE),
         "vault_rotate" => (MSG_VAULT_ROTATE, MSG_VAULT_ROTATE_RESPONSE),
         "vault_rollback" => (MSG_VAULT_ROLLBACK, MSG_VAULT_ROLLBACK_RESPONSE),
+        "vault_assign" => (MSG_VAULT_ASSIGN, MSG_VAULT_ASSIGN_RESPONSE),
         _ => return Err(format!("unsupported vault admin action: {action}").into()),
     };
-    let normalized_payload = if action == "vault_put" {
-        match normalize_vault_put_payload(ctx, &target_hive, payload) {
+    let normalized = match action {
+        "vault_put" => Some(normalize_vault_put_payload(
+            ctx,
+            &target_hive,
+            payload.clone(),
+        )),
+        "vault_assign" => Some(normalize_vault_assign_payload(
+            ctx,
+            &target_hive,
+            payload.clone(),
+        )),
+        _ => None,
+    };
+    let normalized_payload = if let Some(normalized) = normalized {
+        match normalized {
             Ok(value) => value,
             Err(detail) => {
                 return Ok((
@@ -13797,7 +13896,146 @@ fn normalize_vault_put_payload(
         metadata.remove("ilk");
     }
 
+    // The nodes it is assigned to (docs/ilk-tenant-model-v1.md §2.2): names and ILK ids, resolved
+    // and checked against its tenant.
+    let tenant_id = metadata
+        .get("tenant_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default()
+        .to_string();
+    let nodes = string_list(metadata.remove("assigned_nodes"), "metadata.assigned_nodes")?;
+    let ilks = string_list(metadata.remove("assigned_ilks"), "metadata.assigned_ilks")?;
+    let assigned = resolve_assigned_ilks(ctx, target_hive, &tenant_id, &nodes, &ilks)?;
+    if !assigned.is_empty() {
+        metadata.insert("assigned_ilks".to_string(), serde_json::json!(assigned));
+    }
+
     Ok(payload)
+}
+
+/// `vault_assign`: `{key, tenant_id?, assigned_nodes?, assigned_ilks?}` to the VAULT_ASSIGN request
+/// `{key, tenant_id, assigned_ilks}`. The tenant defaults to the root one, as for a delete; an empty
+/// list leaves the secret with no assigned node.
+fn normalize_vault_assign_payload(
+    ctx: &AdminContext,
+    target_hive: &str,
+    payload: serde_json::Value,
+) -> Result<serde_json::Value, String> {
+    let mut payload = default_vault_request_tenant(payload);
+    let Some(object) = payload.as_object_mut() else {
+        return Err("vault_assign requires a JSON object".to_string());
+    };
+    let key = object
+        .get("key")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .ok_or_else(|| "vault_assign requires key".to_string())?
+        .to_string();
+    let tenant_id = object
+        .get("tenant_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default()
+        .to_string();
+    let nodes = string_list(object.remove("assigned_nodes"), "assigned_nodes")?;
+    let ilks = string_list(object.remove("assigned_ilks"), "assigned_ilks")?;
+    if let Some(extra) = object
+        .keys()
+        .find(|field| !["key", "tenant_id"].contains(&field.as_str()))
+    {
+        return Err(format!("vault_assign does not take '{extra}'"));
+    }
+    let assigned = resolve_assigned_ilks(ctx, target_hive, &tenant_id, &nodes, &ilks)?;
+    Ok(serde_json::json!({"key": key, "tenant_id": tenant_id, "assigned_ilks": assigned}))
+}
+
+/// A list of strings from an optional JSON value: absent or null is empty.
+fn string_list(value: Option<serde_json::Value>, field: &str) -> Result<Vec<String>, String> {
+    match value {
+        None | Some(serde_json::Value::Null) => Ok(Vec::new()),
+        Some(serde_json::Value::Array(items)) => items
+            .into_iter()
+            .map(|item| {
+                item.as_str()
+                    .map(str::trim)
+                    .filter(|v| !v.is_empty())
+                    .map(str::to_string)
+                    .ok_or_else(|| format!("{field} must hold non-empty strings"))
+            })
+            .collect(),
+        Some(_) => Err(format!("{field} must be a list")),
+    }
+}
+
+/// The ILKs a secret is assigned to (docs/ilk-tenant-model-v1.md §2.2), from node names (resolved
+/// against the identity SHM, like `owner_node`) and ILK ids. Each is a node charged to the secret's
+/// tenant: no secret is assigned across tenants, and a person is never assigned (a person owns
+/// secrets; nodes use them).
+fn resolve_assigned_ilks(
+    ctx: &AdminContext,
+    target_hive: &str,
+    tenant_id: &str,
+    nodes: &[String],
+    ilks: &[String],
+) -> Result<Vec<String>, String> {
+    if nodes.is_empty() && ilks.is_empty() {
+        return Ok(Vec::new());
+    }
+    let snapshot = fluxbee_sdk::identity::list_ilks_from_hive_config(&ctx.config_dir)
+        .map_err(|err| format!("identity SHM read failed: {err}"))?;
+    check_assigned_ilks(&snapshot.ilks, target_hive, tenant_id, nodes, ilks)
+}
+
+/// The decision of `resolve_assigned_ilks`, over the identity's ILK list.
+fn check_assigned_ilks(
+    known: &[fluxbee_sdk::identity::IdentityIlkOption],
+    target_hive: &str,
+    tenant_id: &str,
+    nodes: &[String],
+    ilks: &[String],
+) -> Result<Vec<String>, String> {
+    let tenant = tenant_id.trim().to_ascii_lowercase();
+    let mut found: Vec<&fluxbee_sdk::identity::IdentityIlkOption> = Vec::new();
+    for node in nodes {
+        let handler_node = if node.contains('@') {
+            node.clone()
+        } else {
+            format!("{node}@{target_hive}")
+        };
+        let ilk = known
+            .iter()
+            .find(|ilk| ilk.handler_node.as_deref() == Some(handler_node.as_str()))
+            .ok_or_else(|| {
+                format!("assigned node '{handler_node}' is not registered in identity")
+            })?;
+        found.push(ilk);
+    }
+    for ilk_id in ilks {
+        let ilk = known
+            .iter()
+            .find(|ilk| ilk.ilk_id == ilk_id.trim())
+            .ok_or_else(|| format!("assigned ILK '{ilk_id}' is not in identity"))?;
+        found.push(ilk);
+    }
+    let mut assigned = Vec::new();
+    for ilk in found {
+        if ilk.tenant_id.trim().to_ascii_lowercase() != tenant {
+            return Err(format!(
+                "{} is charged to another tenant than the secret's ({tenant_id})",
+                ilk.ilk_id
+            ));
+        }
+        if ilk.ilk_type == "human" {
+            return Err(format!(
+                "{} is a person: a secret is assigned to nodes (a person owns secrets)",
+                ilk.ilk_id
+            ));
+        }
+        assigned.push(ilk.ilk_id.clone());
+    }
+    assigned.sort_unstable();
+    assigned.dedup();
+    Ok(assigned)
 }
 
 fn owner_node_has_deterministic_ilk(handler_node: &str) -> bool {
@@ -15298,6 +15536,115 @@ mod tests {
     }
 
     #[test]
+    fn cloud_relay_assigns_a_credential_of_its_own_tenant_only() {
+        let relay = Some("IO.cloud@motherbee");
+        let t = "tnt:11111111-1111-4111-8111-111111111111";
+        let assign = |tenant: &str, key: &str| serde_json::json!({"key": key, "tenant_id": tenant, "assigned_nodes": ["IO.slack.s@motherbee"]});
+        assert!(enforce_cloud_relay_content(
+            relay,
+            "vault_assign",
+            "motherbee",
+            &assign(t, "slack:t:bot")
+        )
+        .is_ok());
+        // Never the root tenant, never an infrastructure key, nothing else in the request.
+        assert!(enforce_cloud_relay_content(
+            relay,
+            "vault_assign",
+            "motherbee",
+            &assign(fluxbee_sdk::DEFAULT_ROOT_TENANT_ID, "slack:t:bot")
+        )
+        .is_err());
+        assert!(enforce_cloud_relay_content(
+            relay,
+            "vault_assign",
+            "motherbee",
+            &assign(
+                t,
+                "edge_channel_secret:ich:00000000-0000-0000-0000-000000000000"
+            )
+        )
+        .is_err());
+        let mut extra = assign(t, "slack:t:bot");
+        extra["metadata"] = serde_json::json!({"ilk": "ilk:victim"});
+        assert!(enforce_cloud_relay_content(relay, "vault_assign", "motherbee", &extra).is_err());
+    }
+
+    #[test]
+    fn assigned_nodes_are_nodes_of_the_secrets_tenant() {
+        let t = "tnt:11111111-1111-4111-8111-111111111111";
+        let other = "tnt:22222222-2222-4222-8222-222222222222";
+        let ilk = |id: &str, kind: &str, tenant: &str, node: Option<&str>| {
+            fluxbee_sdk::identity::IdentityIlkOption {
+                ilk_id: id.to_string(),
+                tenant_id: tenant.to_string(),
+                display_name: None,
+                handler_node: node.map(str::to_string),
+                registration_status: "complete".to_string(),
+                ilk_type: kind.to_string(),
+                role_hash: None,
+                skill_hashes: Vec::new(),
+                handbook_hashes: Vec::new(),
+                personality_hash: None,
+            }
+        };
+        let known = vec![
+            ilk("ilk:sales", "agent", t, Some("IO.slack.sales@motherbee")),
+            ilk(
+                "ilk:support",
+                "agent",
+                t,
+                Some("IO.slack.support@motherbee"),
+            ),
+            ilk(
+                "ilk:theirs",
+                "agent",
+                other,
+                Some("IO.slack.theirs@motherbee"),
+            ),
+            ilk("ilk:person", "human", t, None),
+        ];
+        let strings = |items: &[&str]| items.iter().map(|v| v.to_string()).collect::<Vec<_>>();
+        // Names (with or without the hive) and ids, sorted and deduplicated.
+        assert_eq!(
+            check_assigned_ilks(
+                &known,
+                "motherbee",
+                &t.to_ascii_uppercase().replace("TNT:", "tnt:"),
+                &strings(&["IO.slack.support", "IO.slack.sales@motherbee"]),
+                &strings(&["ilk:sales"]),
+            )
+            .unwrap(),
+            vec!["ilk:sales", "ilk:support"]
+        );
+        // Another tenant's node, a person, an unknown name or id: refused.
+        for (nodes, ilks) in [
+            (strings(&["IO.slack.theirs@motherbee"]), Vec::new()),
+            (Vec::new(), strings(&["ilk:theirs"])),
+            (Vec::new(), strings(&["ilk:person"])),
+            (strings(&["IO.slack.nobody@motherbee"]), Vec::new()),
+            (Vec::new(), strings(&["ilk:nobody"])),
+        ] {
+            assert!(
+                check_assigned_ilks(&known, "motherbee", t, &nodes, &ilks).is_err(),
+                "{nodes:?} {ilks:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn assigned_lists_take_strings_only() {
+        assert_eq!(string_list(None, "x").unwrap(), Vec::<String>::new());
+        assert_eq!(
+            string_list(Some(serde_json::json!([" a ", "b"])), "x").unwrap(),
+            vec!["a".to_string(), "b".to_string()]
+        );
+        assert!(string_list(Some(serde_json::json!("a")), "x").is_err());
+        assert!(string_list(Some(serde_json::json!(["a", 3])), "x").is_err());
+        assert!(string_list(Some(serde_json::json!([""])), "x").is_err());
+    }
+
+    #[test]
     fn cloud_relay_set_ilk_tenant_names_the_target_and_admin_stamps_who_for() {
         let relay = Some("IO.cloud@motherbee");
         let t = "tnt:11111111-1111-4111-8111-111111111111";
@@ -15642,6 +15989,7 @@ mod tests {
             "vault_delete",
             "update_tenant",
             "set_ilk_tenant",
+            "vault_assign",
         ]
         .into_iter()
         .collect();
@@ -18364,6 +18712,8 @@ mod tests {
             resource_type: "openai".to_string(),
             tenant_id: fluxbee_sdk::DEFAULT_ROOT_TENANT_ID.to_string(),
             ilk: None,
+            assigned_ilks: Vec::new(),
+            general: true,
             version: 1,
             key: "secret/openai".to_string(),
             hive_id: "motherbee".to_string(),

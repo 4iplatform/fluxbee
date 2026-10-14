@@ -2001,6 +2001,10 @@ fn tls_secret_change_action(
     if matches!(parsed.op, VaultSecretOp::Delete) {
         return TlsSecretChange::DeletedKeepServing { key: parsed.key };
     }
+    // Who may use the key changed, never its value: nothing to reload.
+    if matches!(parsed.op, VaultSecretOp::Assign) {
+        return TlsSecretChange::Unrelated;
+    }
     if matches!(live, LiveTlsMaterial::NotFromVault) {
         // We hold nothing from the vault to invalidate. This also closes a second latent bounce:
         // a non-ingress edge has no `http_listen`, so it never fetches TLS at all, yet it can
@@ -3043,6 +3047,23 @@ mod tests {
                 TlsSecretChange::ReloadRequired { .. }
             ));
         }
+    }
+
+    /// An assignment changes who may use the key, never its value: the edge keeps serving.
+    #[test]
+    fn tls_key_assignment_never_restarts_the_public_door() {
+        assert_eq!(
+            tls_secret_change_action(
+                &vault_changed("edge_tls", "assign", 1),
+                Some("edge_tls"),
+                LiveTlsMaterial::FromVault {
+                    version: Some(1),
+                    fingerprint: Some("fp1".into())
+                },
+                false,
+            ),
+            TlsSecretChange::Unrelated
+        );
     }
 
     /// A delete must NOT restart the edge: it would fail closed with no cert and

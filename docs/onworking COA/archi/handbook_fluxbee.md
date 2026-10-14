@@ -172,8 +172,9 @@ node boots with the base install. To make one:
 - `CONFIG_SET` its behavior: `behavior.kind: ai_chat`, `model`, and instructions;
 - give it a role, skills and handbook with `set_ilk_definition` on its ILK.
 
-The node does not name a Vault key: it uses the hive's AI provider key in SY.vault (resource_type
-`openai` or `anthropic`), for its tenant first and then the root tenant.
+The node does not name a Vault key: it uses the AI provider key SY.vault gives it (resource_type
+`openai` or `anthropic`): one it owns, one assigned to it, or its tenant's general one (no owner, no
+assigned node). The root tenant's keys are the core's; a tenant's node never falls back to them.
 
 ### 4.2 WF nodes and workflows
 

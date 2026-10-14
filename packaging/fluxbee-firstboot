@@ -135,8 +135,9 @@ cat <<EOF
  Fluxbee backend is UP. Core (SY.*) + base nodes are RUNNING.
  Some nodes are DEGRADED until you load their secret into SY.vault:
 
-  - AI (ai.generic / architect / admin / cognition) needs a provider key.
-    Load an OpenAI (or "anthropic") key:
+  - The core's AI (architect / admin / cognition / frontdesk) needs a provider key.
+    Load an OpenAI (or "anthropic") key in the root tenant (a tenant's ai.generic nodes use
+    their own tenant's key, never this one):
       curl -sS -X POST $ADMIN/hives/$HIVE_ID/vault/secrets -H 'content-type: application/json' \\
         -d '{"key":"openai_root_pool","value":{"api_key":"sk-..."},"metadata":{"tenant_id":"$ROOT_TENANT","resource_type":"openai"}}'
     NOTE: the default provider is 'openai'. For an Anthropic key (resource_type "anthropic"),

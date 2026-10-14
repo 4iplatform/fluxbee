@@ -401,7 +401,8 @@ struct GenericAiNode {
     /// case vault and any identity-bearing call will be rejected by auth.
     self_ilk_id: Option<String>,
     /// Self tenant, read from `FLUXBEE_NODE_TENANT_ID` env injected by the orchestrator at
-    /// spawn. The AI key is looked up in SY.vault for this tenant first, then for the root tenant.
+    /// spawn. The AI key is the one SY.vault gives this node: owned by it, assigned to it, or its
+    /// tenant's general one (docs/ilk-tenant-model-v1.md §2.2).
     self_tenant_id: Option<String>,
     behavior: Arc<RwLock<Option<NodeBehavior>>>,
     config_dir: PathBuf,
@@ -1345,8 +1346,9 @@ impl GenericAiNode {
     }
 
     /// The AI key comes from SY.vault by resource type, like every other AI consumer: the
-    /// provider is the hive's (hive.yaml `ai`, OpenAI when absent) and the key is the one stored
-    /// for this node's tenant, or else the root tenant's. Nodes do not name a Vault key.
+    /// provider is the hive's (hive.yaml `ai`, OpenAI when absent) and the key is one this node
+    /// owns, one assigned to it, or its tenant's general one (docs/ilk-tenant-model-v1.md §2.2).
+    /// The root tenant's keys are the core's. Nodes do not name a Vault key.
     async fn resolve_ai_credential(&self) -> std::result::Result<ResolvedAiCredential, String> {
         let Some(vault) = self.vault.as_ref() else {
             return Err(
@@ -1369,7 +1371,7 @@ impl GenericAiNode {
                 )),
             },
             Ok(None) => Err(format!(
-                "missing AI api key: no {provider} secret in SY.vault for tenant {tenant} or the root tenant"
+                "missing AI api key: SY.vault has no {provider} secret for this node (owned, assigned, or tenant {tenant}'s general one)"
             )),
             Err(err) => Err(format!("missing AI api key: SY.vault lookup failed: {err}")),
         }
@@ -1778,7 +1780,7 @@ impl GenericAiNode {
                 ],
                 "notes": [
                     "Cognitive assets are not part of CONFIG_SET. Apply role_hash, skill_hashes, handbook_hashes, and personality_hash with set_ilk_definition against the agent ILK.",
-                    "AI credentials are not config: the provider is the hive's (hive.yaml ai, OpenAI by default) and its key is read from SY.vault by resource_type openai|anthropic on each request, for this node's tenant first and then the root tenant.",
+                    "AI credentials are not config: the provider is the hive's (hive.yaml ai, OpenAI by default) and its key is read from SY.vault by resource_type openai|anthropic on each request: one this node owns, one assigned to it, or its tenant's general one.",
                     "config.behavior.vault_key is not accepted: nodes do not name a Vault key.",
                     "CONFIG_SET rejects secret-bearing fields such as config.secrets.openai.api_key, config.behavior.openai.api_key, config.behavior.api_key, and config.behavior.api_key_env.",
                     "ai.generic defaults behavior.capabilities.multimodal=true unless explicitly overridden.",
@@ -4175,7 +4177,8 @@ impl ManagedNodeConfigContract for AiGenericContract {
     fn notes(&self) -> &'static [&'static str] {
         &[
             "The OpenAI/Anthropic credential is NOT config: the node reads the hive AI provider's \
-             key from SY.vault by resource_type openai|anthropic (its tenant, then the root tenant).",
+             key from SY.vault by resource_type openai|anthropic (owned by it, assigned to it, or its \
+             tenant's general one).",
             "Cognitive assets (role/skill/handbook/personality) are applied to the agent ILK with \
              set_ilk_definition, not through CONFIG_SET.",
         ]
@@ -4792,7 +4795,7 @@ fn parse_effective_config_doc(
     {
         return Err(
             "behavior.vault_key is not accepted: ai.generic reads the hive AI provider's \
-             key from SY.vault by resource_type (this node's tenant, then the root tenant)"
+             key from SY.vault by resource_type (owned by it, assigned to it, or its tenant's general one)"
                 .into(),
         );
     }
@@ -4964,7 +4967,7 @@ fn missing_ai_api_key_payload(reason: &str) -> Value {
     json!({
         "type": "error",
         "code": "missing_ai_api_key",
-        "message": "SY.vault has no usable key for the hive's AI provider (resource_type openai|anthropic, this node's tenant or the root tenant).",
+        "message": "SY.vault has no usable key for the hive's AI provider (resource_type openai|anthropic): none owned by or assigned to this node, and no general one in its tenant.",
         "retryable": true,
         "details": { "reason": reason }
     })

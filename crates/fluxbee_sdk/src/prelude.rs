@@ -74,14 +74,14 @@ pub use crate::timer::{
     TIMER_LIST_MAX_LIMIT, TIMER_MIN_DURATION_MS, TIMER_NODE_FAMILY, TIMER_NODE_KIND,
 };
 pub use crate::vault::{
-    normalize_resource_type, ResourceType, VaultCaller, VaultCallerOwned, VaultClient,
-    VaultDeleteResponse, VaultError, VaultFilter, VaultGetMetadataRequest,
-    VaultGetMetadataResponse, VaultGetRequest, VaultGetResponse, VaultKeyRequest, VaultListRequest, VaultScopedKeyRequest,
+    normalize_resource_type, ResourceType, VaultAssignRequest, VaultCaller, VaultCallerOwned,
+    VaultClient, VaultDeleteResponse, VaultError, VaultFilter, VaultGetMetadataRequest,
+    VaultGetMetadataResponse, VaultGetRequest, VaultGetResponse, VaultKeyRequest, VaultListRequest,
     VaultListResponse, VaultMetadata, VaultPutRequest, VaultPutResponse, VaultRetryPolicy,
-    VaultRollbackResponse, VaultRotateRequest, VaultRotateResponse, VaultSecretSummary,
-    VaultValueResponse, MSG_VAULT_DELETE, MSG_VAULT_DELETE_RESPONSE, MSG_VAULT_GET,
-    MSG_VAULT_GET_METADATA, MSG_VAULT_GET_METADATA_RESPONSE, MSG_VAULT_GET_RESPONSE,
-    MSG_VAULT_LIST, MSG_VAULT_LIST_RESPONSE, MSG_VAULT_PUT, MSG_VAULT_PUT_RESPONSE,
-    MSG_VAULT_ROLLBACK, MSG_VAULT_ROLLBACK_RESPONSE, MSG_VAULT_ROTATE, MSG_VAULT_ROTATE_RESPONSE,
-    VAULT_REF_PREFIX,
+    VaultRollbackResponse, VaultRotateRequest, VaultRotateResponse, VaultScopedKeyRequest,
+    VaultSecretSummary, VaultValueResponse, MSG_VAULT_ASSIGN, MSG_VAULT_ASSIGN_RESPONSE,
+    MSG_VAULT_DELETE, MSG_VAULT_DELETE_RESPONSE, MSG_VAULT_GET, MSG_VAULT_GET_METADATA,
+    MSG_VAULT_GET_METADATA_RESPONSE, MSG_VAULT_GET_RESPONSE, MSG_VAULT_LIST,
+    MSG_VAULT_LIST_RESPONSE, MSG_VAULT_PUT, MSG_VAULT_PUT_RESPONSE, MSG_VAULT_ROLLBACK,
+    MSG_VAULT_ROLLBACK_RESPONSE, MSG_VAULT_ROTATE, MSG_VAULT_ROTATE_RESPONSE, VAULT_REF_PREFIX,
 };

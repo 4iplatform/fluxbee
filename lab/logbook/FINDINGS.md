@@ -995,6 +995,71 @@ Visto al arreglar los e2e de A-37, leyendo `src/router/mod.rs` y `src/shm/mod.rs
   binario generaría uno como root); si no, el `myID` del Syncthing en marcha. Nunca `config.xml`.
 - **Estado:** construido; lo ejercita el próximo join (el de A-48).
 
+### A-64 ✅ RESUELTO EN CÓDIGO (0.1.66) — Los secretos se compartían solo por tenant, un tenant suspendido seguía entregándolos y en el génesis podía nacer cualquier nodo
+
+- **El marco:** `docs/ilk-tenant-model-v1.md` §2.2, la etapa 2. La decidió el operador el 2026-10-14:
+  *"tenant no es identidad ni seguridad ... el secret se guarda con el tenant para filtrar el uso del
+  que paga"*.
+  - El tenant de un secreto es quién paga, y lo único que el vault chequea es que esté activo.
+  - Quién lo usa:
+    - su dueño (un nodo, o una persona);
+    - los nodos asignados;
+    - o, si no tiene ni uno ni otros, todos los nodos de su tenant: el secreto general.
+  - Un nodo nace y muere en su tenant.
+  - En el génesis nace solo el core.
+- **Qué pasaba:**
+  - **Compartir:** un secreto era de un nodo o de todo el tenant; compartirlo entre algunos no se
+    podía.
+  - **Estado del tenant:** no se miraba. Un tenant suspendido o borrado seguía entregando sus
+    secretos.
+  - **El raíz como respaldo:** A-35 prometía que un nodo de IA de una empresa caía en la clave del
+    raíz. El vault nunca lo dejó (solo los SY la leen). La promesa vivía en el SDK, en ai.generic, en
+    el handbook de Archi, en una nota del admin y en el banner de firstboot.
+  - **El génesis:** el orquestador rechazaba ahí solo nodos IO. Un AI, un WF o un `RT.*` con
+    cualquier runtime se podía lanzar en el génesis, y desde ahí leer la URL de Postgres.
+  - **El tenant de un nodo:** un temporal todavía podía tomar otro tenant al registrarse, y una
+    réplica podía empujar el cambio.
+  - **Altas sin terminar:** una de Cloud no se distinguía de alguien que escribió por un canal
+    (D11, ya resuelto en `80b479c`).
+- **Arreglo:**
+  - **SY.vault:**
+    - lista de nodos asignados en el secreto (`assigned_ilks`);
+    - `VAULT_ASSIGN`, que cambia esa lista sin tocar el valor;
+    - el chequeo del tenant activo;
+    - el aviso de cambio llega a quien tenía el secreto y a quien lo tiene ahora (también al dueño
+      anterior), y a todo el tenant si es o era general.
+  - **SDK:** la resolución busca primero uno propio, después uno asignado, después el general del
+    tenant; nunca el del raíz.
+  - **SY.admin:**
+    - `vault_assign` (por HTTP y por la malla);
+    - los nodos de `vault_put` y `vault_assign`, que tienen que estar cargados al tenant del secreto
+      y nunca ser una persona.
+  - **IO.cloud:** `nodes` en `put_token` y `assign_token`.
+  - **Orquestador:** la definición del core (SY.\*, RT.\* con runtime `rt.*`, IO del core), con la que
+    rechaza todo lo demás en el génesis.
+  - **SY.identity:** el tenant de un nodo no cambia, ni por registro ni por réplica.
+- **Revisión (una ronda):** 1 mayor y 9 menores.
+  - **El mayor:** refrescar el valor de un secreto sin nombrar nodos lo volvía general y se lo daba a
+    todo el tenant. Pasaba con cada refresco de token desde Cloud. Ahora un valor nuevo conserva quién
+    lo usa.
+  - **Arreglados:**
+    - un tenant que la SHM no tiene se contesta con un error que se reintenta, así una caída de
+      identity no deja a los nodos sin credenciales;
+    - un id de tenant inválido se rechaza;
+    - el dueño anterior recibe el aviso;
+    - `RT.*` solo pasa en el génesis con runtime `rt.*`;
+    - el edge ya no reinicia su puerta pública por un `assign` de su clave TLS;
+    - `nodes: null` ya no desasigna todo;
+    - los textos que prometían el raíz;
+    - tests de la validación de nodos asignados y de la decisión sobre el tenant.
+  - **Documentados, sin código:**
+    - un nodo borrado queda en las listas, porque sacarlo podría volver general un secreto por sí
+      solo;
+    - io.linkedhelper relee su credencial solo al arrancar y en CONFIG_SET;
+    - el vault confía en el `src_ilk` que declara el propio nodo. Atarlo al nombre que estampa el
+      router es la fase 0 de io.web, y aplica igual a secretos con dueño y asignados.
+- **Pendiente:** validar en 8.x (0.1.66).
+
 ### A-63 ✅ VALIDADO EN 8.x (0.1.65, 2026-10-14) — La identidad dependía del tenant: personas duplicadas, claves que se corrían y fusiones entre tenants
 
 - **El marco:** `docs/ilk-tenant-model-v1.md`. Lo decidieron el operador, Claude y Astra el

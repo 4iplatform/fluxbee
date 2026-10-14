@@ -39,6 +39,8 @@ pub const CLOUD_OP_ACTIONS: &[(&str, &str)] = &[
     // A tenant is a cost center (docs/ilk-tenant-model-v1.md): Cloud charges a person to another
     // one. Stage 1: complete people only.
     ("set_ilk_tenant", "set_ilk_tenant"),
+    // Which of the tenant's nodes use a credential (stage 2, §2.2), without rewriting its value.
+    ("assign_token", "vault_assign"),
 ];
 
 /// The admin actions IO.cloud may relay over the mesh — the security allowlist SY.admin enforces in
@@ -58,6 +60,7 @@ pub const CLOUD_EXPOSED_ACTIONS: &[&str] = &[
     "vault_delete",
     "update_tenant",
     "set_ilk_tenant",
+    "vault_assign",
 ];
 
 /// The [`CLOUD_EXPOSED_ACTIONS`] set computed from [`CLOUD_OP_ACTIONS`] (deduped, first-seen order).
@@ -112,9 +115,11 @@ pub fn cloud_action_catalog() -> Value {
         { "op": "update_tenant", "category": "relay",
           "summary": "Edit YOUR tenant (the envelope tenant_id): params.name and/or params.domain (\"\" or null clears the domain). A name or domain another tenant holds answers TENANT_NAME_TAKEN / TENANT_DOMAIN_TAKEN. Returns {status, tenant_id, sponsor_tenant_id}; read the tenant again to see it." },
         { "op": "put_token", "category": "relay",
-          "summary": "Store a provider credential for YOUR tenant: its pool, or one IO.* node of it (params.owner_node). Needs the envelope tenant_id + params.key ([a-z0-9:_-], one namespace for the whole hive: a key another tenant holds answers KEY_TAKEN) + params.value + params.resource_type. Infrastructure keys are refused." },
+          "summary": "Store a credential for YOUR tenant (the envelope tenant_id, who pays for its use) + params.key ([a-z0-9:_-], one namespace for the whole hive: a key another tenant holds answers KEY_TAKEN) + params.value + params.resource_type. Who uses it: one IO.* node that owns it (params.owner_node), the nodes it is assigned to (params.nodes: node names or ILK ids, each charged to your tenant), or, with neither, every node of your tenant (a general credential). Storing the same value again changes nothing: change the nodes with assign_token. Infrastructure keys are refused." },
+        { "op": "assign_token", "category": "relay",
+          "summary": "Replace the nodes one credential of YOUR tenant is assigned to, without touching its value: the envelope tenant_id + params.key + params.nodes (node names or ILK ids, each charged to your tenant; [] leaves it unassigned, so with no owner it is general again). Every node that had it or has it now reloads it. A key that does not exist or belongs to another tenant answers KEY_NOT_FOUND." },
         { "op": "list_tokens", "category": "relay",
-          "summary": "List YOUR tenant's credentials: key, metadata, version, access_count and last_accessed_at, never the value. Needs the envelope tenant_id; optional params.resource_type, params.prefix, params.limit (default 200, max 1000)." },
+          "summary": "List YOUR tenant's credentials: key, metadata (with its owner ilk and assigned_ilks, the nodes that use it; neither = general), version, access_count and last_accessed_at, never the value. Needs the envelope tenant_id; optional params.resource_type, params.prefix, params.limit (default 200, max 1000)." },
         { "op": "delete_token", "category": "relay",
           "summary": "Delete one credential of YOUR tenant. Needs the envelope tenant_id + params.key. A key that does not exist or belongs to another tenant answers KEY_NOT_FOUND; infrastructure keys are refused." },
         { "op": "provision_node", "category": "relay",
@@ -165,7 +170,8 @@ mod tests {
                 "vault_list",
                 "vault_delete",
                 "update_tenant",
-                "set_ilk_tenant"
+                "set_ilk_tenant",
+                "vault_assign"
             ]
         );
     }
@@ -194,6 +200,10 @@ mod tests {
         assert_eq!(
             admin_action_for_cloud_op("set_ilk_tenant"),
             Some("set_ilk_tenant")
+        );
+        assert_eq!(
+            admin_action_for_cloud_op("assign_token"),
+            Some("vault_assign")
         );
         assert_eq!(admin_action_for_cloud_op("kill_node"), None);
     }

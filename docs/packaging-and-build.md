@@ -62,7 +62,9 @@ Solo IO.cloud e IO.blob arrancan con la instalación, y son los únicos nodos IO
 tenant raíz `tnt:00000000-0000-0000-0000-000000000001` (decisión del operador 2026-10-02, A-43).
 Arrancan **corriendo pero degradados** hasta que el operador los configure. Los demás runtimes IO
 quedan horneados y spawneables: los lanza un tenant (o un operador, para ese tenant) con `run_node`.
-El orchestrator rechaza cualquier otro nodo IO en el tenant raíz con `TENANT_ROOT_NOT_ALLOWED`.
+En el tenant raíz (el génesis) nace solo el core: los SY.\*, los RT.\* y los IO del core (io.cloud,
+io.blob, io.web). El orchestrator lo define y rechaza cualquier otro nodo ahí (IO, AI o WF) con
+`TENANT_ROOT_NOT_ALLOWED` (decisión del operador 2026-10-14, `docs/ilk-tenant-model-v1.md` D10).
 
 ---
 
@@ -79,7 +81,7 @@ Requisitos:
 2. Agregar la entrada al manifest (arriba). `boot: false` = horneado y spawneable: lo lanza un
    tenant con `run_node`. `boot: true` (con `instance`) hace que `fluxbee-firstboot` arranque una
    instancia default en el tenant raíz; solo lo usan io.cloud e io.blob, porque el orchestrator
-   rechaza cualquier otro nodo IO en el tenant raíz (`TENANT_ROOT_NOT_ALLOWED`, A-43).
+   rechaza en el tenant raíz todo lo que no es core (`TENANT_ROOT_NOT_ALLOWED`, A-43 y D10).
 3. Para un **singleton** nuevo (raro; solo infra 1-por-hive): agregarlo a `singletons`, crear su
    unit systemd, y sumarlo al allowlist `HIVE_YAML_NON_SY_LIFECYCLE_NODES` (vacío hoy) en
    `crates/fluxbee_sdk/src/managed_node.rs` + a `system_nodes` de `packaging/hive.yaml.example`.

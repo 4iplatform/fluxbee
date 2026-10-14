@@ -17,11 +17,11 @@ use fluxbee_sdk::protocol::{
 use fluxbee_sdk::{
     try_handle_default_node_status, NodeConfig, NodeSender, NodeUuidMode, OperationalRouteProfile,
     RouteMatch, RouteTarget, RouterDispatcher, VaultFilter, VaultListRequest, VaultMetadata,
-    VaultRotateRequest, VaultScopedKeyRequest, VaultSecretSummary, MSG_VAULT_DELETE,
-    MSG_VAULT_DELETE_RESPONSE, MSG_VAULT_GET, MSG_VAULT_GET_METADATA,
-    MSG_VAULT_GET_METADATA_RESPONSE, MSG_VAULT_GET_RESPONSE, MSG_VAULT_LIST,
-    MSG_VAULT_LIST_RESPONSE, MSG_VAULT_PUT, MSG_VAULT_PUT_RESPONSE, MSG_VAULT_ROLLBACK,
-    MSG_VAULT_ROLLBACK_RESPONSE, MSG_VAULT_ROTATE, MSG_VAULT_ROTATE_RESPONSE,
+    VaultRotateRequest, VaultScopedKeyRequest, VaultSecretSummary, MSG_VAULT_ASSIGN,
+    MSG_VAULT_ASSIGN_RESPONSE, MSG_VAULT_DELETE, MSG_VAULT_DELETE_RESPONSE, MSG_VAULT_GET,
+    MSG_VAULT_GET_METADATA, MSG_VAULT_GET_METADATA_RESPONSE, MSG_VAULT_GET_RESPONSE,
+    MSG_VAULT_LIST, MSG_VAULT_LIST_RESPONSE, MSG_VAULT_PUT, MSG_VAULT_PUT_RESPONSE,
+    MSG_VAULT_ROLLBACK, MSG_VAULT_ROLLBACK_RESPONSE, MSG_VAULT_ROTATE, MSG_VAULT_ROTATE_RESPONSE,
 };
 use nix::libc::{flock, LOCK_EX, LOCK_NB};
 use rand::RngCore;
@@ -79,6 +79,17 @@ enum VaultError {
     /// name is taken; the put never takes it over.
     #[error("key is taken by another tenant")]
     KeyTaken,
+    /// The secret's tenant is not active (docs/ilk-tenant-model-v1.md §2.2): the one thing the vault
+    /// checks about a tenant. Answered as UNAUTHORIZED, with the reason, so every consumer stops
+    /// using the secret as it does for a refusal.
+    #[error("the secret's tenant {0}")]
+    TenantNotActive(String),
+    /// The secret's tenant is not in the identity SHM: deleted, or identity has not loaded its data
+    /// yet (a degraded start writes only the root tenant). The value is not handed out, but the
+    /// answer is retryable (IDENTITY_UNAVAILABLE), so a consumer keeps what it holds instead of
+    /// dropping it during an identity outage. A deleted tenant has no node left to ask.
+    #[error("the secret's tenant {0}")]
+    TenantUnknown(String),
     #[error("no previous version available")]
     NoPreviousVersion,
     #[error("storage error: {0}")]
@@ -92,13 +103,13 @@ impl VaultError {
         match self {
             VaultError::InvalidMasterKey(_) => "MASTER_KEY_NOT_AVAILABLE",
             VaultError::InvalidRequest(_) => "INVALID_REQUEST",
-            VaultError::Unauthorized => "UNAUTHORIZED",
+            VaultError::Unauthorized | VaultError::TenantNotActive(_) => "UNAUTHORIZED",
             VaultError::KeyNotFound | VaultError::KeyNotFoundInTenant => "KEY_NOT_FOUND",
             VaultError::KeyTaken => "KEY_TAKEN",
             VaultError::NoPreviousVersion => "NO_PREVIOUS_VERSION",
             VaultError::Sqlite(_) | VaultError::Storage(_) => "STORAGE_ERROR",
             VaultError::Encryption => "ENCRYPTION_ERROR",
-            VaultError::Identity(_) => "IDENTITY_UNAVAILABLE",
+            VaultError::Identity(_) | VaultError::TenantUnknown(_) => "IDENTITY_UNAVAILABLE",
             VaultError::Io(_) => "IO_ERROR",
             VaultError::Json(_) => "INVALID_VALUE",
             VaultError::Node(_) => "NODE_ERROR",
@@ -300,6 +311,7 @@ async fn main() -> Result<(), VaultError> {
                 | MSG_VAULT_DELETE
                 | MSG_VAULT_ROTATE
                 | MSG_VAULT_ROLLBACK
+                | MSG_VAULT_ASSIGN
         ) {
             continue;
         }
@@ -424,24 +436,25 @@ async fn handle_vault_message(
             store,
             msg,
             &caller,
-            well_known_admin_ilks,
             well_known_system_ilks,
             true,
+            &|tenant: &str| ensure_tenant_active(config_dir, tenant),
         )
         .map(HandlerOutcome::response_only),
         MSG_VAULT_GET_METADATA => handle_get(
             store,
             msg,
             &caller,
-            well_known_admin_ilks,
             well_known_system_ilks,
             false,
+            &|tenant: &str| ensure_tenant_active(config_dir, tenant),
         )
         .map(HandlerOutcome::response_only),
         MSG_VAULT_LIST => handle_list(store, msg, &caller).map(HandlerOutcome::response_only),
         MSG_VAULT_DELETE => handle_delete(store, msg, &caller, well_known_admin_ilks, hive_id),
         MSG_VAULT_ROTATE => handle_rotate(store, msg, &caller, well_known_admin_ilks, hive_id),
         MSG_VAULT_ROLLBACK => handle_rollback(store, msg, &caller, well_known_admin_ilks, hive_id),
+        MSG_VAULT_ASSIGN => handle_assign(store, msg, &caller, well_known_admin_ilks, hive_id),
         _ => Err(VaultError::InvalidRequest(
             "unsupported vault action".to_string(),
         )),
@@ -560,6 +573,7 @@ async fn emit_bootstrap_secret_broadcasts(
             VaultSecretOp::Put,
             &summary.key,
             &summary.metadata,
+            None,
             summary.version,
             hive_id,
         ) else {
@@ -665,6 +679,7 @@ fn handle_delete(
             VaultSecretOp::Delete,
             &request.key,
             metadata,
+            None,
             // After delete the version is gone; report 0 to signal absence.
             0,
             hive_id,
@@ -714,6 +729,7 @@ fn handle_rotate(
             VaultSecretOp::Rotate,
             &request.key,
             metadata,
+            None,
             result.current_version,
             hive_id,
         )
@@ -758,6 +774,7 @@ fn handle_rollback(
             VaultSecretOp::Rollback,
             &request.key,
             metadata,
+            None,
             result.current_version,
             hive_id,
         )
@@ -794,8 +811,24 @@ fn handle_put(
             "secret value exceeds 1 MiB".to_string(),
         ));
     }
-    let metadata_for_broadcast = request.metadata.clone();
-    let (version, changed) = store.put(&request.key, request.value, request.metadata, caller)?;
+    let previous = store
+        .get_record(&request.key)?
+        .map(|record| record.metadata);
+    let mut metadata = request.metadata;
+    // An update keeps who uses the secret unless the put names it (docs/ilk-tenant-model-v1.md
+    // §2.2): a new value never turns a restricted secret into a general one. Otherwise only
+    // VAULT_ASSIGN changes the nodes.
+    if let Some(previous) = previous.as_ref() {
+        let names_users =
+            secret_owner_ilk(&metadata).is_some() || !metadata.assigned_ilks.is_empty();
+        if !names_users && previous.tenant_id.trim() == metadata.tenant_id.trim() {
+            metadata.ilk = previous.ilk.clone();
+            metadata.owner_ilk = previous.owner_ilk.clone();
+            metadata.assigned_ilks = previous.assigned_ilks.clone();
+        }
+    }
+    let metadata_for_broadcast = metadata.clone();
+    let (version, changed) = store.put(&request.key, request.value, metadata, caller)?;
     // Only emit a broadcast when something actually changed. Idempotent
     // re-puts (same value) return changed=false and version unchanged —
     // emitting an event for those would spam consumers with no-ops.
@@ -804,6 +837,7 @@ fn handle_put(
             VaultSecretOp::Put,
             &request.key,
             &metadata_for_broadcast,
+            previous.as_ref(),
             version,
             hive_id,
         )
@@ -821,22 +855,105 @@ fn handle_put(
     })
 }
 
+/// VAULT_ASSIGN: replace the nodes a secret is assigned to, in the tenant the request names; the
+/// value, its version and the owner stay. Administrative, like a put. Everyone who had it or has
+/// it now is told (docs/ilk-tenant-model-v1.md §2.2).
+fn handle_assign(
+    store: &mut VaultStore,
+    msg: &Message,
+    caller: &Caller,
+    well_known: &HashSet<String>,
+    hive_id: &str,
+) -> VaultResult<HandlerOutcome> {
+    if !caller.is_well_known_admin(well_known) {
+        return Err(VaultError::Unauthorized);
+    }
+    let request: fluxbee_sdk::VaultAssignRequest = serde_json::from_value(msg.payload.clone())?;
+    validate_key(&request.key)?;
+    let tenant = validate_request_tenant(&request.tenant_id)?;
+    let previous = store
+        .get_record(&request.key)?
+        .map(|record| record.metadata);
+    ensure_in_tenant(previous.as_ref(), tenant)?;
+    let Some(previous) = previous else {
+        return Err(VaultError::KeyNotFound);
+    };
+    let mut assigned: Vec<String> = request
+        .assigned_ilks
+        .iter()
+        .map(|ilk| ilk.trim().to_string())
+        .filter(|ilk| !ilk.is_empty())
+        .collect();
+    assigned.sort_unstable();
+    assigned.dedup();
+    let mut metadata = previous.clone();
+    metadata.assigned_ilks = assigned;
+    validate_metadata(&metadata)?;
+    let (version, changed) = store.set_assigned(&request.key, metadata.clone(), caller)?;
+    let broadcast = if changed {
+        build_secret_changed_payload(
+            VaultSecretOp::Assign,
+            &request.key,
+            &metadata,
+            Some(&previous),
+            version,
+            hive_id,
+        )
+    } else {
+        None
+    };
+    Ok(HandlerOutcome {
+        response: json!({
+            "status": "ok",
+            "key": request.key,
+            "assigned_ilks": metadata.assigned_ilks,
+            "general": is_general_secret(&metadata),
+            "changed": changed,
+        }),
+        broadcast,
+    })
+}
+
 /// Build the broadcast payload from the secret's metadata. Returns `None`
 /// when metadata is missing `resource_type` (legacy/incomplete records),
-/// since downstream consumers filter by `resource_type`.
+/// since downstream consumers filter by `resource_type`. `previous` is the metadata before this
+/// change, when it changed who reads the secret: the nodes it had and the ones it has now are all
+/// told, and so is every node of the tenant when it was or is general.
 fn build_secret_changed_payload(
     op: VaultSecretOp,
     key: &str,
     metadata: &VaultMetadata,
+    previous: Option<&VaultMetadata>,
     version: i64,
     hive_id: &str,
 ) -> Option<VaultSecretChangedPayload> {
     let resource_type = metadata.resource_type.clone()?;
+    // The previous owner, when the change took it away, is told like a node that lost it.
+    let previous_owner = previous
+        .and_then(secret_owner_ilk)
+        .filter(|owner| Some(*owner) != secret_owner_ilk(metadata));
+    let mut assigned_ilks: Vec<String> = metadata
+        .assigned_ilks
+        .iter()
+        .chain(
+            previous
+                .into_iter()
+                .flat_map(|previous| previous.assigned_ilks.iter()),
+        )
+        .map(String::as_str)
+        .chain(previous_owner)
+        .map(|ilk| ilk.trim().to_string())
+        .filter(|ilk| !ilk.is_empty())
+        .collect();
+    assigned_ilks.sort_unstable();
+    assigned_ilks.dedup();
     Some(VaultSecretChangedPayload {
         op,
         resource_type,
         tenant_id: metadata.tenant_id.clone(),
         ilk: metadata.ilk.clone().filter(|v| !v.is_empty()),
+        assigned_ilks,
+        general: is_general_secret(metadata) || previous.is_some_and(is_general_secret),
         version,
         key: key.to_string(),
         hive_id: hive_id.to_string(),
@@ -864,18 +981,24 @@ fn secret_owner_ilk(metadata: &VaultMetadata) -> Option<&str> {
     }
 }
 
+/// `tenant_active` is the tenant check (`ensure_tenant_active`), passed in so the handler stays
+/// testable without an identity SHM.
 fn handle_get(
     store: &mut VaultStore,
     msg: &Message,
     caller: &Caller,
-    _well_known_admin: &HashSet<String>,
     well_known_system: &HashSet<String>,
     include_value: bool,
+    tenant_active: &dyn Fn(&str) -> VaultResult<()>,
 ) -> VaultResult<Value> {
     let key = request_key_required(&msg.payload)?;
     validate_key(&key)?;
     let record = store.get_record(&key)?.ok_or(VaultError::KeyNotFound)?;
     authorize_read(caller, &record.metadata, well_known_system, include_value)?;
+    // Who reads it is settled; the value goes out only while its tenant is active.
+    if include_value {
+        tenant_active(&record.metadata.tenant_id)?;
+    }
     let mut payload = json!({
         "status": "ok",
         "key": record.key,
@@ -1139,12 +1262,23 @@ impl VaultStore {
                     continue;
                 }
             }
-            // Model D' filter: ilk — `Some("")` means "pool only" (no owner),
-            // `Some("ilk:...")` means "dedicated to that ILK", `None` means
-            // "don't filter".
+            // Model D' filter: ilk — `Some("")` means "general only" (no owner and no assigned
+            // node), `Some("ilk:...")` means "dedicated to that ILK", `None` means "don't filter".
             if let Some(ilk_filter) = filter.ilk.as_deref() {
-                let secret_ilk = secret_owner_ilk(&metadata).unwrap_or("");
-                if ilk_filter != secret_ilk {
+                if ilk_filter.is_empty() {
+                    if !is_general_secret(&metadata) {
+                        continue;
+                    }
+                } else if secret_owner_ilk(&metadata) != Some(ilk_filter) {
+                    continue;
+                }
+            }
+            if let Some(assigned) = filter.assigned_ilk.as_deref() {
+                if !metadata
+                    .assigned_ilks
+                    .iter()
+                    .any(|ilk| ilk.trim() == assigned.trim())
+                {
                     continue;
                 }
             }
@@ -1171,6 +1305,32 @@ impl VaultStore {
             }
         }
         Ok(summaries)
+    }
+
+    /// Rewrite a secret's metadata for VAULT_ASSIGN: the value and its version stay. Answers the
+    /// version and whether the assignment changed.
+    fn set_assigned(
+        &mut self,
+        key: &str,
+        mut metadata: VaultMetadata,
+        caller: &Caller,
+    ) -> VaultResult<(i64, bool)> {
+        let existing = self.get_record(key)?.ok_or(VaultError::KeyNotFound)?;
+        if existing.metadata.assigned_ilks == metadata.assigned_ilks {
+            self.audit(MSG_VAULT_ASSIGN, Some(key), caller, "noop", None)?;
+            return Ok((existing.version, false));
+        }
+        let now = Utc::now().to_rfc3339();
+        metadata.updated_at = Some(now.clone());
+        let metadata_json = serde_json::to_string(&metadata)?;
+        let tx = self.conn.transaction()?;
+        tx.execute(
+            "UPDATE secrets SET metadata_json = ?2, updated_at = ?3 WHERE key = ?1",
+            params![key, metadata_json, now],
+        )?;
+        audit_with_tx(&tx, MSG_VAULT_ASSIGN, Some(key), caller, "success", None)?;
+        tx.commit()?;
+        Ok((existing.version, true))
     }
 
     fn delete(&mut self, key: &str, caller: &Caller) -> VaultResult<()> {
@@ -1443,8 +1603,18 @@ fn authorize_read(
             return Ok(());
         }
     }
-    // (2) Pool match.
-    if secret_owner.is_none() {
+    // (1b) Assigned to the caller (works without SHM resolution).
+    if let Some(self_ilk) = caller_ilk {
+        if metadata
+            .assigned_ilks
+            .iter()
+            .any(|ilk| ilk.trim() == self_ilk)
+        {
+            return Ok(());
+        }
+    }
+    // (2) General: no owner and no assigned node.
+    if is_general_secret(metadata) {
         // (2a) Root-tenant pool universal for SY system callers (no SHM
         // needed). This is the path that closes the boot chicken/egg:
         // any node whose ILK matches a deterministic SY system ILK from
@@ -1463,9 +1633,9 @@ fn authorize_read(
                 return Ok(());
             }
         }
-        // (2b) Exact tenant pool: caller and secret in same tenant
-        // (requires SHM-populated tenant for the caller). Used for
-        // tenant-scoped secrets (e.g. a client tenant's own API key).
+        // (2b) The caller's tenant's general secret: every node charged to the tenant reads it
+        // (requires the caller's tenant from the SHM). Cloud makes a secret general by saving it
+        // with no owner and no node.
         if let Some(tenant) = caller.tenant_id.as_deref() {
             if tenant == metadata.tenant_id {
                 return Ok(());
@@ -1475,12 +1645,64 @@ fn authorize_read(
     Err(VaultError::Unauthorized)
 }
 
+/// A general secret: no owner and no assigned node. Every node of its tenant reads it
+/// (docs/ilk-tenant-model-v1.md §2.2).
+fn is_general_secret(metadata: &VaultMetadata) -> bool {
+    secret_owner_ilk(metadata).is_none()
+        && metadata
+            .assigned_ilks
+            .iter()
+            .all(|ilk| ilk.trim().is_empty())
+}
+
+/// The one thing the vault checks about a tenant (docs/ilk-tenant-model-v1.md §2.2): a secret is
+/// handed out only while its tenant exists and is active, read from the identity SHM (which leaves
+/// deleted tenants out). The genesis tenant always counts as active: the core reads its keys at
+/// boot, before identity has written the SHM.
+fn ensure_tenant_active(config_dir: &Path, tenant_id: &str) -> VaultResult<()> {
+    if fluxbee_sdk::is_root_tenant(tenant_id) {
+        return Ok(());
+    }
+    tenant_check(tenant_id, || {
+        fluxbee_sdk::identity::tenant_status_in_hive_config(config_dir, tenant_id)
+    })
+}
+
+/// The tenant decision, apart from the SHM read: a malformed tenant id and a tenant that is not
+/// active are refused (UNAUTHORIZED); one the SHM does not hold, or an unreadable SHM, is
+/// retryable (IDENTITY_UNAVAILABLE).
+fn tenant_check(
+    tenant_id: &str,
+    status: impl FnOnce() -> Result<Option<String>, fluxbee_sdk::IdentityShmError>,
+) -> VaultResult<()> {
+    let valid = tenant_id
+        .trim()
+        .strip_prefix("tnt:")
+        .is_some_and(|raw| Uuid::parse_str(raw).is_ok());
+    if !valid {
+        return Err(VaultError::TenantNotActive(format!(
+            "{tenant_id} is not a valid tenant id"
+        )));
+    }
+    match status()? {
+        Some(status) if status == "active" => Ok(()),
+        Some(status) => Err(VaultError::TenantNotActive(format!(
+            "{tenant_id} is not active ({status})"
+        ))),
+        None => Err(VaultError::TenantUnknown(format!(
+            "{tenant_id} is not in the identity SHM (deleted, or identity has not loaded yet)"
+        ))),
+    }
+}
+
 fn audit_result_for_error(err: &VaultError) -> &'static str {
     match err {
         // Reaching for another tenant's key is a refusal, even when the caller is told "not found".
-        VaultError::Unauthorized | VaultError::KeyNotFoundInTenant | VaultError::KeyTaken => {
-            "denied"
-        }
+        VaultError::Unauthorized
+        | VaultError::TenantNotActive(_)
+        | VaultError::TenantUnknown(_)
+        | VaultError::KeyNotFoundInTenant
+        | VaultError::KeyTaken => "denied",
         _ => "error",
     }
 }
@@ -1536,6 +1758,17 @@ fn validate_metadata(metadata: &VaultMetadata) -> VaultResult<()> {
                 "metadata.ilk must be ilk:<uuid> (or omit for pool)".to_string(),
             ));
         }
+    }
+    // The assigned nodes are ILKs.
+    if metadata
+        .assigned_ilks
+        .iter()
+        .map(|ilk| ilk.trim())
+        .any(|ilk| !ilk.starts_with("ilk:"))
+    {
+        return Err(VaultError::InvalidRequest(
+            "metadata.assigned_ilks must hold ilk:<uuid> values".to_string(),
+        ));
     }
     // owner_ilk (legacy field) is no longer required. If present, validate;
     // if empty, fine — Model D' uses metadata.ilk instead.
@@ -1635,6 +1868,7 @@ fn response_action_for(action: &str) -> &'static str {
         MSG_VAULT_DELETE => MSG_VAULT_DELETE_RESPONSE,
         MSG_VAULT_ROTATE => MSG_VAULT_ROTATE_RESPONSE,
         MSG_VAULT_ROLLBACK => MSG_VAULT_ROLLBACK_RESPONSE,
+        MSG_VAULT_ASSIGN => MSG_VAULT_ASSIGN_RESPONSE,
         _ => MSG_VAULT_GET_RESPONSE,
     }
 }
@@ -1714,11 +1948,30 @@ mod tests {
             owner_ilk: String::new(),
             resource_type: Some("postgres".to_string()),
             ilk: ilk.map(str::to_string),
+            assigned_ilks: Vec::new(),
             description: None,
             created_by: None,
             created_at: None,
             updated_at: None,
             tags: Vec::new(),
+        }
+    }
+
+    fn vault_request(action: &str, payload: Value) -> Message {
+        Message {
+            routing: Routing {
+                src: String::new(),
+                src_l2_name: None,
+                dst: Destination::Unicast("SY.vault@motherbee".to_string()),
+                ttl: 16,
+                trace_id: String::new(),
+            },
+            meta: Meta {
+                msg_type: SYSTEM_KIND.to_string(),
+                msg: Some(action.to_string()),
+                ..Meta::default()
+            },
+            payload,
         }
     }
 
@@ -1854,6 +2107,327 @@ mod tests {
 
     fn cleanup(dir: PathBuf) {
         let _ = fs::remove_dir_all(dir);
+    }
+
+    // ---- Secrets, stage 2 (docs/ilk-tenant-model-v1.md §2.2) ----
+
+    #[test]
+    fn assigned_nodes_read_a_secret_and_other_nodes_of_its_tenant_do_not() {
+        let none = HashSet::new();
+        let node = |ilk: &str| caller(Some(ilk), Some("tnt:client-a"), Some("agent"));
+        let mut slack = metadata("tnt:client-a", None);
+        slack.assigned_ilks = vec!["ilk:sales".to_string(), "ilk:support".to_string()];
+        authorize_read(&node("ilk:sales"), &slack, &none, true).expect("assigned");
+        assert_unauthorized(authorize_read(&node("ilk:billing"), &slack, &none, true));
+        // General (no owner, no assigned node): every node of its tenant, nobody else.
+        slack.assigned_ilks.clear();
+        authorize_read(&node("ilk:billing"), &slack, &none, true).expect("general");
+        assert_unauthorized(authorize_read(
+            &caller(Some("ilk:x"), Some("tnt:client-b"), Some("agent")),
+            &slack,
+            &none,
+            true,
+        ));
+        // A person's secret: its assigned node reads it, the rest of the tenant does not.
+        let mut erp = metadata("tnt:client-a", Some("ilk:person"));
+        erp.assigned_ilks = vec!["ilk:agent".to_string()];
+        authorize_read(&node("ilk:agent"), &erp, &none, true)
+            .expect("assigned to a person's secret");
+        assert_unauthorized(authorize_read(&node("ilk:billing"), &erp, &none, true));
+    }
+
+    #[test]
+    fn the_value_goes_out_only_while_its_tenant_is_active() {
+        let (mut store, dir) = open_test_store([3u8; 32]);
+        store
+            .put(
+                "pg:client-a:pool",
+                json!({"url": "x"}),
+                metadata("tnt:client-a", None),
+                &admin_caller(),
+            )
+            .expect("put");
+        let reader = caller(Some("ilk:node"), Some("tnt:client-a"), Some("agent"));
+        let request = vault_request(MSG_VAULT_GET, json!({"key": "pg:client-a:pool"}));
+        let suspended = |tenant: &str| -> VaultResult<()> {
+            Err(VaultError::TenantNotActive(format!(
+                "{tenant} is not active (suspended)"
+            )))
+        };
+        let err = handle_get(
+            &mut store,
+            &request,
+            &reader,
+            &HashSet::new(),
+            true,
+            &suspended,
+        )
+        .expect_err("suspended");
+        assert_eq!(err.code(), "UNAUTHORIZED");
+        assert_eq!(audit_result_for_error(&err), "denied");
+        // Its metadata still reads; the value goes out once the tenant is active.
+        handle_get(
+            &mut store,
+            &request,
+            &reader,
+            &HashSet::new(),
+            false,
+            &suspended,
+        )
+        .expect("metadata");
+        let active = |_: &str| -> VaultResult<()> { Ok(()) };
+        let got = handle_get(
+            &mut store,
+            &request,
+            &reader,
+            &HashSet::new(),
+            true,
+            &active,
+        )
+        .expect("value");
+        assert_eq!(got["value"]["url"], "x");
+        // The genesis tenant needs no SHM; another one does, and an unreadable one is retried.
+        let nowhere = Path::new("/nonexistent/fluxbee");
+        ensure_tenant_active(nowhere, fluxbee_sdk::DEFAULT_ROOT_TENANT_ID).expect("genesis");
+        let err = ensure_tenant_active(nowhere, "tnt:11111111-1111-4111-8111-111111111111")
+            .expect_err("no SHM");
+        assert_eq!(err.code(), "IDENTITY_UNAVAILABLE");
+        cleanup(dir);
+    }
+
+    #[test]
+    fn assign_replaces_the_nodes_and_tells_who_had_it() {
+        let (mut store, dir) = open_test_store([4u8; 32]);
+        let admin = admin_caller();
+        let admins: HashSet<String> = HashSet::from(["ilk:admin".to_string()]);
+        store
+            .put(
+                "slack:client-a:bot",
+                json!({"t": 1}),
+                metadata("tnt:client-a", None),
+                &admin,
+            )
+            .expect("put a general secret");
+        let assign = |tenant: &str, nodes: &[&str]| {
+            vault_request(
+                MSG_VAULT_ASSIGN,
+                json!({"key": "slack:client-a:bot", "tenant_id": tenant, "assigned_ilks": nodes}),
+            )
+        };
+        let a = "tnt:client-a";
+        // Administrative, like a put.
+        let node = caller(Some("ilk:sales"), Some(a), Some("agent"));
+        let refused = handle_assign(
+            &mut store,
+            &assign(a, &["ilk:sales"]),
+            &node,
+            &admins,
+            "motherbee",
+        )
+        .map(|_| ())
+        .expect_err("not an admin");
+        assert_eq!(refused.code(), "UNAUTHORIZED");
+        // General -> two nodes: every node of the tenant is told, since it was general.
+        let out = handle_assign(
+            &mut store,
+            &assign(a, &["ilk:support", "ilk:sales", "ilk:sales"]),
+            &admin,
+            &admins,
+            "motherbee",
+        )
+        .expect("assign");
+        assert_eq!(
+            out.response["assigned_ilks"],
+            json!(["ilk:sales", "ilk:support"])
+        );
+        assert_eq!(out.response["general"], false);
+        let event = out.broadcast.expect("an event");
+        assert_eq!(event.op, VaultSecretOp::Assign);
+        assert!(event.general);
+        assert_eq!(event.assigned_ilks, vec!["ilk:sales", "ilk:support"]);
+        // The same list again changes nothing and tells nobody.
+        let again = handle_assign(
+            &mut store,
+            &assign(a, &["ilk:sales", "ilk:support"]),
+            &admin,
+            &admins,
+            "motherbee",
+        )
+        .expect("again");
+        assert_eq!(again.response["changed"], false);
+        assert!(again.broadcast.is_none());
+        // Down to one: the node removed is told too; the value and its version stay.
+        let out = handle_assign(
+            &mut store,
+            &assign(a, &["ilk:sales"]),
+            &admin,
+            &admins,
+            "motherbee",
+        )
+        .expect("unassign one");
+        let event = out.broadcast.expect("an event");
+        assert!(!event.general);
+        assert_eq!(event.assigned_ilks, vec!["ilk:sales", "ilk:support"]);
+        let record = store.get_record("slack:client-a:bot").unwrap().unwrap();
+        assert_eq!(record.version, 1);
+        assert_eq!(record.metadata.assigned_ilks, vec!["ilk:sales"]);
+        // Another tenant's key reads like a missing one; a node id must be an ILK.
+        let err = handle_assign(
+            &mut store,
+            &assign("tnt:client-b", &[]),
+            &admin,
+            &admins,
+            "motherbee",
+        )
+        .map(|_| ())
+        .expect_err("another tenant");
+        assert_eq!(err.code(), "KEY_NOT_FOUND");
+        let err = handle_assign(
+            &mut store,
+            &assign(a, &["IO.slack@motherbee"]),
+            &admin,
+            &admins,
+            "motherbee",
+        )
+        .map(|_| ())
+        .expect_err("not an ILK");
+        assert_eq!(err.code(), "INVALID_REQUEST");
+        cleanup(dir);
+    }
+
+    #[test]
+    fn a_new_value_keeps_who_uses_the_secret() {
+        let (mut store, dir) = open_test_store([6u8; 32]);
+        let admin = admin_caller();
+        let admins: HashSet<String> = HashSet::from(["ilk:admin".to_string()]);
+        let put = |value: Value, metadata: Value| {
+            vault_request(
+                MSG_VAULT_PUT,
+                json!({"key": "openai:a:vip", "value": value, "metadata": metadata}),
+            )
+        };
+        let base = json!({"tenant_id": "tnt:client-a", "resource_type": "openai"});
+        let mut assigned = base.clone();
+        assigned["assigned_ilks"] = json!(["ilk:vip"]);
+        handle_put(
+            &mut store,
+            &put(json!({"k": 1}), assigned),
+            &admin,
+            &admins,
+            "motherbee",
+        )
+        .expect("put assigned");
+        // Refreshing the value without naming who uses it keeps the assignment: it does not
+        // become the tenant's general secret, and the event says so.
+        let out = handle_put(
+            &mut store,
+            &put(json!({"k": 2}), base.clone()),
+            &admin,
+            &admins,
+            "motherbee",
+        )
+        .expect("refresh the value");
+        let event = out.broadcast.expect("an event");
+        assert!(!event.general);
+        assert_eq!(event.assigned_ilks, vec!["ilk:vip"]);
+        let record = store.get_record("openai:a:vip").unwrap().unwrap();
+        assert_eq!(record.metadata.assigned_ilks, vec!["ilk:vip"]);
+        assert_eq!(record.version, 2);
+        // A put that names an owner replaces who uses it; the nodes that lost it are told.
+        let mut owned = base.clone();
+        owned["ilk"] = json!("ilk:owner");
+        let out = handle_put(
+            &mut store,
+            &put(json!({"k": 3}), owned),
+            &admin,
+            &admins,
+            "motherbee",
+        )
+        .expect("put owned");
+        let event = out.broadcast.expect("an event");
+        assert_eq!(event.ilk.as_deref(), Some("ilk:owner"));
+        assert_eq!(event.assigned_ilks, vec!["ilk:vip"]);
+        // A new owner: the previous one is told too.
+        let mut other = base;
+        other["ilk"] = json!("ilk:other");
+        let out = handle_put(
+            &mut store,
+            &put(json!({"k": 4}), other),
+            &admin,
+            &admins,
+            "motherbee",
+        )
+        .expect("another owner");
+        assert_eq!(
+            out.broadcast.expect("an event").assigned_ilks,
+            vec!["ilk:owner"]
+        );
+        cleanup(dir);
+    }
+
+    #[test]
+    fn the_tenant_decision_refuses_inactive_and_retries_unknown() {
+        let tenant = "tnt:11111111-1111-4111-8111-111111111111";
+        let with = |status: Option<&str>| {
+            let status = status.map(str::to_string);
+            tenant_check(tenant, move || Ok(status))
+        };
+        with(Some("active")).expect("active");
+        for status in ["suspended", "pending"] {
+            let err = with(Some(status)).expect_err(status);
+            assert_eq!(err.code(), "UNAUTHORIZED", "{status}");
+            assert!(err.to_string().contains(status));
+        }
+        // Not in the SHM: deleted, or identity not loaded yet; retryable, still not handed out.
+        let err = with(None).expect_err("unknown");
+        assert_eq!(err.code(), "IDENTITY_UNAVAILABLE");
+        assert_eq!(audit_result_for_error(&err), "denied");
+        // A malformed tenant id is refused, never retried forever.
+        let err = tenant_check("tnt:client-a", || Ok(Some("active".to_string())))
+            .expect_err("not a uuid");
+        assert_eq!(err.code(), "UNAUTHORIZED");
+    }
+
+    #[test]
+    fn the_general_filter_leaves_out_assigned_secrets() {
+        let (mut store, dir) = open_test_store([5u8; 32]);
+        let admin = admin_caller();
+        let mut assigned = metadata("tnt:client-a", None);
+        assigned.assigned_ilks = vec!["ilk:sales".to_string()];
+        store
+            .put("pg:a:assigned", json!({"u": 1}), assigned, &admin)
+            .expect("put assigned");
+        store
+            .put(
+                "pg:a:general",
+                json!({"u": 2}),
+                metadata("tnt:client-a", None),
+                &admin,
+            )
+            .expect("put general");
+        let keys = |filter: VaultFilter| -> Vec<String> {
+            let mut keys: Vec<String> = store
+                .list(filter, &admin)
+                .expect("list")
+                .into_iter()
+                .map(|summary| summary.key)
+                .collect();
+            keys.sort();
+            keys
+        };
+        let general = VaultFilter {
+            tenant_id: Some("tnt:client-a".to_string()),
+            ilk: Some(String::new()),
+            ..Default::default()
+        };
+        assert_eq!(keys(general), vec!["pg:a:general"]);
+        let mine = VaultFilter {
+            tenant_id: Some("tnt:client-a".to_string()),
+            assigned_ilk: Some("ilk:sales".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(keys(mine), vec!["pg:a:assigned"]);
+        cleanup(dir);
     }
 
     fn admin_caller() -> Caller {

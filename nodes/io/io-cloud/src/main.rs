@@ -931,6 +931,35 @@ fn account_by_email(
     }
 }
 
+/// `params.nodes`: the nodes a credential is assigned to, each a node name (`IO.slack.sales@motherbee`)
+/// or an ILK id (`ilk:<uuid>`, as `list_ilks` shows them). Split for SY.admin, which resolves the
+/// names and checks every node against the tenant.
+fn split_nodes(
+    params: &serde_json::Value,
+) -> Result<(Vec<String>, Vec<String>), serde_json::Value> {
+    let Some(nodes) = params.get("nodes").filter(|value| !value.is_null()) else {
+        return Ok((Vec::new(), Vec::new()));
+    };
+    let nodes = nodes
+        .as_array()
+        .ok_or_else(|| cloud_error("params.nodes must be a list of node names or ilk ids"))?;
+    let mut names = Vec::new();
+    let mut ilks = Vec::new();
+    for node in nodes {
+        let node = node
+            .as_str()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| cloud_error("params.nodes must hold non-empty strings"))?;
+        if node.starts_with("ilk:") {
+            ilks.push(node.to_string());
+        } else {
+            names.push(node.to_string());
+        }
+    }
+    Ok((names, ilks))
+}
+
 /// Pure translation of a Cloud op into the admin `(action, params)`, injecting the tenant claim.
 /// Returns `Err(error_payload)` for a missing/unknown op or a missing tenant. Kept pure (no admin
 /// call) so it is unit-testable; the op→action pairs are pinned to the shared source
@@ -988,10 +1017,27 @@ fn translate_cloud_op(
                 .map(str::trim)
                 .filter(|value| !value.is_empty())
                 .map(str::to_string);
-            // Cloud may add descriptive metadata, but tenant and ownership are authority fields.
-            // In particular, accepting metadata.ilk would bypass admin's owner_node resolution.
-            for authority_field in ["tenant_id", "ilk", "owner_ilk", "owner_l2", "owner_node"] {
+            // Cloud may add descriptive metadata, but tenant, ownership and assignment are authority
+            // fields. In particular, accepting metadata.ilk would bypass admin's owner_node
+            // resolution; the nodes come only from params.nodes, which admin checks against the
+            // tenant.
+            for authority_field in [
+                "tenant_id",
+                "ilk",
+                "owner_ilk",
+                "owner_l2",
+                "owner_node",
+                "assigned_nodes",
+                "assigned_ilks",
+            ] {
                 metadata.remove(authority_field);
+            }
+            let (assigned_nodes, assigned_ilks) = split_nodes(params)?;
+            if !assigned_nodes.is_empty() {
+                metadata.insert("assigned_nodes".to_string(), json!(assigned_nodes));
+            }
+            if !assigned_ilks.is_empty() {
+                metadata.insert("assigned_ilks".to_string(), json!(assigned_ilks));
             }
             if let Some(resource_type) = params.get("resource_type") {
                 metadata.insert("resource_type".to_string(), resource_type.clone());
@@ -1020,6 +1066,31 @@ fn translate_cloud_op(
             Ok((
                 "vault_put",
                 json!({ "key": key, "value": value, "metadata": metadata }),
+            ))
+        }
+        "assign_token" => {
+            let tenant_id = claimed_tenant(tenant_id, "assign_token")?;
+            let key = required_string(params, "key")?;
+            if is_cloud_reserved_vault_key(&key) {
+                return Err(cloud_error(
+                    "assign_token may not touch a reserved infrastructure key (edge_channel_secret:*, edge_tls*, ssh:*, edge_fanout_verify:*)",
+                ));
+            }
+            // A list, always: a missing or null one must never unassign everything by accident.
+            if !params.get("nodes").is_some_and(Value::is_array) {
+                return Err(cloud_error(
+                    "assign_token requires params.nodes (a list; [] leaves the credential unassigned)",
+                ));
+            }
+            let (assigned_nodes, assigned_ilks) = split_nodes(params)?;
+            Ok((
+                "vault_assign",
+                json!({
+                    "key": key,
+                    "tenant_id": tenant_id,
+                    "assigned_nodes": assigned_nodes,
+                    "assigned_ilks": assigned_ilks,
+                }),
             ))
         }
         "provision_node" => {
@@ -2066,6 +2137,7 @@ mod tests {
             "key": "k", "value": {"t": "1"}, "resource_type": "bearer_token",
             "node_name": "IO.wapp@motherbee",
             "ilk_id": "ilk:22222222-2222-4222-8222-222222222222",
+            "nodes": [],
         });
         for (op, expected_action) in CLOUD_OP_ACTIONS {
             let op_params = if *op == "update_tenant" {
@@ -2241,6 +2313,74 @@ mod tests {
         assert_eq!(p["metadata"]["description"], "WhatsApp token");
         assert!(p["metadata"].get("ilk").is_none());
         assert!(p["metadata"].get("owner_ilk").is_none());
+    }
+
+    #[test]
+    fn translate_assigns_a_credential_to_the_nodes_cloud_names() {
+        let tenant = "tnt:11111111-1111-4111-8111-111111111111";
+        // put_token with nodes: names and ilk ids, split for admin; metadata cannot plant them.
+        let params = json!({
+            "key": "slack:acme:bot",
+            "value": {"bot_token": "x"},
+            "resource_type": "slack",
+            "nodes": ["IO.slack.sales@motherbee", "ilk:44444444-4444-4444-8444-444444444444"],
+            "metadata": {"assigned_ilks": ["ilk:55555555-5555-4555-8555-555555555555"]}
+        });
+        let (action, p) = translate_cloud_op("put_token", Some(tenant), &params).unwrap();
+        assert_eq!(action, "vault_put");
+        assert_eq!(
+            p["metadata"]["assigned_nodes"],
+            json!(["IO.slack.sales@motherbee"])
+        );
+        assert_eq!(
+            p["metadata"]["assigned_ilks"],
+            json!(["ilk:44444444-4444-4444-8444-444444444444"])
+        );
+        // assign_token replaces the list; [] unassigns; the list is required.
+        let (action, p) = translate_cloud_op(
+            "assign_token",
+            Some(tenant),
+            &json!({"key": "slack:acme:bot", "nodes": ["IO.slack.support@motherbee"]}),
+        )
+        .unwrap();
+        assert_eq!(action, "vault_assign");
+        assert_eq!(p["tenant_id"], tenant);
+        assert_eq!(p["assigned_nodes"], json!(["IO.slack.support@motherbee"]));
+        assert_eq!(p["assigned_ilks"], json!([]));
+        let (_, p) = translate_cloud_op(
+            "assign_token",
+            Some(tenant),
+            &json!({"key": "slack:acme:bot", "nodes": []}),
+        )
+        .unwrap();
+        assert_eq!(p["assigned_nodes"], json!([]));
+        assert!(translate_cloud_op(
+            "assign_token",
+            Some(tenant),
+            &json!({"key": "slack:acme:bot"})
+        )
+        .is_err());
+        assert!(translate_cloud_op(
+            "assign_token",
+            Some(tenant),
+            &json!({"key": "k", "nodes": "x"})
+        )
+        .is_err());
+        assert!(translate_cloud_op(
+            "assign_token",
+            Some(tenant),
+            &json!({"key": "k", "nodes": null})
+        )
+        .is_err());
+        assert!(translate_cloud_op(
+            "assign_token",
+            Some(tenant),
+            &json!({"key": "edge_channel_secret:ich:x", "nodes": []})
+        )
+        .is_err());
+        assert!(
+            translate_cloud_op("assign_token", None, &json!({"key": "k", "nodes": []})).is_err()
+        );
     }
 
     #[test]

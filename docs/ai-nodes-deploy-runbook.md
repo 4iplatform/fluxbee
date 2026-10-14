@@ -33,10 +33,11 @@ curl -sS -X POST "$BASE/hives/$HIVE_ID/vault/secrets" -H 'content-type: applicat
   -d '{"key":"openai_root_pool","value":{"api_key":"sk-..."},"metadata":{"tenant_id":"tnt:00000000-0000-0000-0000-000000000001","resource_type":"openai"}}'
 ```
 
-- Un nodo AI busca la clave de **su tenant** y, si no hay, la del **tenant raíz**. Para que un tenant use
-  su propia clave, cargala con su `tenant_id`.
+- Esa clave, en el tenant raíz, es la del core: la usan los SY (architect, admin, cognition, frontdesk).
+- Un nodo AI de una empresa usa la clave que el vault le da: una suya, una asignada a él, o la general
+  de su tenant (sin dueño y sin nodos asignados). Nunca la del tenant raíz
+  (`docs/ilk-tenant-model-v1.md` §2.2). Para que un tenant use una clave, cargala con su `tenant_id`.
 - El nodo no nombra ninguna clave: un config con `behavior.vault_key` se rechaza.
-- Es la misma clave que usan architect, admin, cognition y frontdesk.
 
 ---
 

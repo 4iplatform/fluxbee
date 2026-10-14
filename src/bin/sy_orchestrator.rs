@@ -2022,14 +2022,14 @@ async fn reconcile_persisted_custom_nodes(
             };
         // Checked before anything is stopped: a node that still runs is left running, not killed.
         if let Some(refusal) =
-            root_tenant_io_refusal(&node.node_name, &runtime_key, persisted_tenant.as_deref())
+            genesis_refusal(&node.node_name, &runtime_key, persisted_tenant.as_deref())
         {
             failed = failed.saturating_add(1);
             tracing::warn!(
                 node_name = node.node_name,
                 runtime = runtime_key,
                 payload = %refusal,
-                "persisted custom node not relaunched: only the core IO runtimes run in the root tenant"
+                "persisted custom node not relaunched: only the core is born in the genesis tenant"
             );
             continue;
         }
@@ -12979,25 +12979,49 @@ fn node_kind_from_name(name: &str) -> String {
     }
 }
 
-/// Only the core IO runtimes (fluxbee_sdk::ROOT_TENANT_IO_RUNTIMES) run in the root tenant; a
-/// tenant launches every other IO node (operator decisions 2026-10-02/03, FINDINGS A-43). Some(error reply) when `tenant_id` is the root
-/// tenant and the node is another IO node. Checked wherever a node is launched: run_node, start
-/// and restart, and the boot relaunch.
-fn root_tenant_io_refusal(
+/// The IO runtimes the core itself runs: shared platform resources, not something a solution asks
+/// for (operator decisions 2026-10-02/03, FINDINGS A-43). io.web is designed but not built yet.
+const CORE_IO_RUNTIMES: &[&str] = &["io.cloud", "io.blob", "io.web"];
+
+/// Whether a node is part of the core, the only thing born in the genesis (root) tenant. The
+/// orchestrator defines it, being who gives out the genesis tenant (operator, 2026-10-14;
+/// docs/ilk-tenant-model-v1.md D10): the SY.* nodes (never spawned by run_node), the RT.* nodes on
+/// an `rt.*` runtime (or none), and the core IO runtimes. Everything else (AI, WF, any other IO
+/// node, or a core name on another runtime) is launched by a tenant.
+fn is_core_node(node_name: &str, runtime: &str) -> bool {
+    let local = node_name
+        .split_once('@')
+        .map(|(local, _)| local)
+        .unwrap_or(node_name)
+        .trim();
+    let runtime = runtime.trim().to_ascii_lowercase();
+    if local.starts_with("SY.") {
+        return true;
+    }
+    if local.starts_with("RT.") {
+        return runtime.is_empty() || runtime.starts_with("rt.");
+    }
+    local.starts_with("IO.") && CORE_IO_RUNTIMES.iter().any(|core| *core == runtime)
+}
+
+/// Some(error reply) when `tenant_id` is the genesis (root) tenant and the node is not core (see
+/// `is_core_node`). Checked wherever a node is launched: run_node, start and restart, and the boot
+/// relaunch.
+fn genesis_refusal(
     node_name: &str,
     runtime: &str,
     tenant_id: Option<&str>,
 ) -> Option<serde_json::Value> {
     let tenant_id = tenant_id?;
-    if !fluxbee_sdk::root_tenant_refuses_io_node(node_name, runtime, tenant_id) {
+    if !fluxbee_sdk::is_root_tenant(tenant_id) || is_core_node(node_name, runtime) {
         return None;
     }
     Some(serde_json::json!({
         "status": "error",
         "error_code": "TENANT_ROOT_NOT_ALLOWED",
         "message": format!(
-            "IO node '{node_name}' (runtime '{runtime}') cannot run in the root tenant: only the core IO runtimes ({}) run there; launch it from a tenant",
-            fluxbee_sdk::ROOT_TENANT_IO_RUNTIMES.join(", ")
+            "'{node_name}' (runtime '{runtime}') cannot run in the genesis (root) tenant: only the core is born there (SY.*, RT.* and the core IO runtimes {}); launch it from a tenant",
+            CORE_IO_RUNTIMES.join(", ")
         ),
         "node_name": node_name,
         "runtime": runtime,
@@ -17903,7 +17927,7 @@ async fn run_node_flow(
     }
 
     // The tenant this spawn would register and inject: the one the rule is about.
-    if let Some(refusal) = root_tenant_io_refusal(
+    if let Some(refusal) = genesis_refusal(
         &node_name,
         &runtime,
         resolve_tenant_id_for_node(payload).as_deref(),
@@ -18399,7 +18423,7 @@ fn managed_node_launch_plan(
         };
     let (_, persisted_tenant) = load_persisted_node_identity(state, node_name);
     let tenant = persisted_tenant.or_else(|| config_tenant_id(&config));
-    if let Some(refusal) = root_tenant_io_refusal(node_name, &runtime_key, tenant.as_deref()) {
+    if let Some(refusal) = genesis_refusal(node_name, &runtime_key, tenant.as_deref()) {
         return Err(refusal);
     }
     validate_wf_runtime_spawn_contract(
@@ -30845,25 +30869,45 @@ blob:
         );
     }
 
-    /// A-43: launching an IO node other than io.cloud or io.blob in the root tenant is refused
-    /// with TENANT_ROOT_NOT_ALLOWED; in a tenant, or with no tenant known, it is not.
+    /// D10: only the core is born in the genesis (root) tenant: SY.*, RT.* and the core IO
+    /// runtimes. Any other node (AI, WF, another IO) is refused there with TENANT_ROOT_NOT_ALLOWED;
+    /// in a tenant, or with no tenant known, it is not.
     #[test]
-    fn only_io_cloud_and_io_blob_launch_in_the_root_tenant() {
+    fn only_the_core_is_born_in_the_genesis_tenant() {
         let root = fluxbee_sdk::DEFAULT_ROOT_TENANT_ID;
-        let refusal = root_tenant_io_refusal("IO.api@motherbee", "io.api", Some(root))
-            .expect("io.api in the root tenant");
-        assert_eq!(refusal["status"], "error");
-        assert_eq!(refusal["error_code"], "TENANT_ROOT_NOT_ALLOWED");
-        assert_eq!(refusal["runtime"], "io.api");
-        assert!(root_tenant_io_refusal("IO.cloud@motherbee", "io.cloud", Some(root)).is_none());
-        assert!(root_tenant_io_refusal("IO.blob@motherbee", "io.blob", Some(root)).is_none());
-        assert!(root_tenant_io_refusal(
-            "IO.api.acme@motherbee",
-            "io.api",
-            Some("tnt:8a0c3f8e-2f1b-4d3a-9c55-0f6e2b7d9a11")
-        )
-        .is_none());
-        assert!(root_tenant_io_refusal("IO.api@motherbee", "io.api", None).is_none());
+        let root_without_hyphens = "tnt:00000000000000000000000000000001";
+        let tenant = "tnt:8a0c3f8e-2f1b-4d3a-9c55-0f6e2b7d9a11";
+        for (name, runtime) in [
+            ("IO.cloud@motherbee", "io.cloud"),
+            ("IO.blob@motherbee", "io.blob"),
+            ("IO.web@motherbee", "io.web"),
+            ("SY.frontdesk.gov@motherbee", ""),
+            ("SY.architect@motherbee", "sy.architect"),
+            ("RT.gateway@motherbee", ""),
+        ] {
+            assert!(
+                genesis_refusal(name, runtime, Some(root)).is_none(),
+                "{name}"
+            );
+        }
+        for (name, runtime) in [
+            ("IO.api@motherbee", "io.api"),
+            ("IO.slack.acme@motherbee", "io.slack"),
+            ("IO.anything@motherbee", ""),
+            ("AI.sales@motherbee", "ai.generic"),
+            ("WF.flow@motherbee", "wf.engine"),
+            ("WF.oddly.named@motherbee", "io.cloud"),
+            ("RT.disguised@motherbee", "ai.generic"),
+        ] {
+            let refusal = genesis_refusal(name, runtime, Some(root)).expect(name);
+            assert_eq!(refusal["error_code"], "TENANT_ROOT_NOT_ALLOWED");
+            assert!(genesis_refusal(name, runtime, Some(root_without_hyphens)).is_some());
+            assert!(
+                genesis_refusal(name, runtime, Some(tenant)).is_none(),
+                "{name} in a tenant"
+            );
+            assert!(genesis_refusal(name, runtime, None).is_none());
+        }
     }
 
     /// A start or restart reads the node's tenant from the identity map, else from its config.

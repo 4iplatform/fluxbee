@@ -180,8 +180,9 @@ The service codes of each op are in §5.
 | `list_ilks` | local | yes | the identities charged to your company |
 | `get_ilk_details` | relay | none | everything about one identity |
 | `delete_ilk` / `restore_ilk` | relay | none | delete a person's account / undo it |
-| `put_token` | relay | yes | store a credential |
-| `list_tokens` | relay | yes | your credentials: metadata and use, never the value |
+| `put_token` | relay | yes | store a credential, and say which nodes use it |
+| `assign_token` | relay | yes | change which nodes use a credential |
+| `list_tokens` | relay | yes | your credentials: metadata, who uses them and use, never the value |
 | `delete_token` | relay | yes | delete one credential |
 | `provision_node` | relay | yes | launch an `IO.*` node |
 | `list_cloud_actions` | local | none | this list, from the hive itself |
@@ -407,6 +408,18 @@ operator purges). Idempotent.
 **Keys share one namespace for the whole hive.** A key belongs to the company that wrote it. Name
 yours `<provider>:<tenant_id>:<identifier>`, which also makes them easy to filter.
 
+**Who uses a credential** (`docs/ilk-tenant-model-v1.md` §2.2). The company is who pays for its use;
+it is not a permission. A credential is used by:
+- **one node that owns it** (`owner_node`);
+- **the nodes it is assigned to** (`nodes` in `put_token`, then `assign_token`): one or several, each
+  charged to your company. Read them from `list_ilks` (the non-`human` identities);
+- **every node of your company**, when it has neither: a *general* credential, the simple choice for
+  a company's AI key in tests or a small setup.
+
+A node uses one it owns, else one assigned to it, else its company's general one. The hive hands the
+value out only while the company is active: a suspended company's nodes are refused it (and drop it);
+while the hive cannot tell (its identity registry still loading), they keep what they have and retry.
+
 #### `put_token`
 
 | field | | |
@@ -415,7 +428,9 @@ yours `<provider>:<tenant_id>:<identifier>`, which also makes them easy to filte
 | `params.key` | required | 1–256 bytes of `[a-z0-9:_-]`, starting with `[a-z0-9]` |
 | `params.value` | required | any JSON but `null`, ≤ 1 MiB serialized |
 | `params.resource_type` | required (or in `params.metadata`) | normalized: lowercase, anything else → `_` (`"Google Calendar"` → `google_calendar`) |
-| `params.owner_node` | optional | an `IO.*` node **that already exists**: only that node reads it. Omitted: the company's pool, any node of the company reads it |
+| `params.owner_node` | optional | an `IO.*` node **that already exists**: it owns the credential and uses it |
+| `params.nodes` | optional | the nodes it is assigned to: node names (`IO.slack.sales@motherbee`) or identity ids (`ilk:…`), each **existing and charged to your company**, never a person |
+| (neither) | | a general credential: every node of your company uses it |
 | `params.metadata` | optional | `description` (string) and `tags` (string array) |
 
 ```json
@@ -423,13 +438,18 @@ yours `<provider>:<tenant_id>:<identifier>`, which also makes them easy to filte
 ```
 
 - **The same value again does nothing**: `changed:false`, the version stays, **and the metadata is
-  not updated either**. To change `description` or `tags`, change the value.
+  not updated either**. To change `description` or `tags`, change the value; to change who uses it,
+  `assign_token`.
+- **A new value keeps who uses it**: refreshing an existing credential without `owner_node` or
+  `nodes` leaves its owner and nodes as they are (it never becomes general by accident). Naming
+  either replaces both.
 - **Metadata is a fixed schema.** Only `description` and `tags` are yours; the vault sets
   `tenant_id`, `resource_type`, `created_by` (the hive-side writer, never your user), `created_at`
   and `updated_at`. Other fields are dropped; a wrong type fails the write with `INVALID_VALUE`. Your
   provenance (who connected it, which account) goes in `tags`, e.g. `source:cloud`, `by:<ilk>`.
-- **Order:** `provision_node` **before** a `put_token` with `owner_node` (the node must exist to own
-  it). A credential the node needs at its first start goes in the pool.
+- **Order:** `provision_node` **before** a `put_token` with `owner_node` or `nodes` (a node must
+  exist to own or use it). A credential the node needs at its first start is general, or assigned
+  right after the node exists.
 - The value's shape is not checked anywhere: a wrong shape fails when the node uses it. Shapes the
   hive's nodes expect today: `openai`/`anthropic` → `{"api_key":…}`; `slack` →
   `{"app_token":…,"bot_token":…}`; `postgres` → `{"postgres_url":"postgresql://user:pass@host:5432"}`
@@ -439,7 +459,7 @@ yours `<provider>:<tenant_id>:<identifier>`, which also makes them easy to filte
 | `error_code` | when |
 |---|---|
 | `KEY_TAKEN` | the key belongs to another company. It never moves |
-| `INVALID_REQUEST` | key charset/length, value over 1 MiB, missing field, `owner_node` not `IO.*` or not registered, a reserved infrastructure key (`edge_channel_secret:*`, `edge_tls*`, `ssh:*`, `edge_fanout_verify:*`) |
+| `INVALID_REQUEST` | key charset/length, value over 1 MiB, missing field, `owner_node` not `IO.*` or not registered, a node in `nodes` that does not exist, is charged to another company or is a person, a reserved infrastructure key (`edge_channel_secret:*`, `edge_tls*`, `ssh:*`, `edge_fanout_verify:*`) |
 | `INVALID_VALUE` | metadata of the wrong type |
 | `STORAGE_ERROR`, `ENCRYPTION_ERROR`, `MASTER_KEY_NOT_AVAILABLE` | the vault |
 
@@ -465,8 +485,36 @@ yours `<provider>:<tenant_id>:<identifier>`, which also makes them easy to filte
 - `access_count` / `last_accessed_at` move when a node reads the **value**, which nodes do when they
   load, not on every use: "a node took it", not "it was used". The vault does not know whether a
   credential works.
-- `metadata.ilk` appears only for a credential owned by a node (`owner_node`): that node's identity.
+- `metadata.ilk` appears only for a credential with an owner (`owner_node`): its identity.
+- `metadata.assigned_ilks` lists the identities of the nodes it is assigned to. A credential with
+  neither `ilk` nor `assigned_ilks` is general.
 - A company with no credentials, or one that does not exist: `count:0`.
+
+#### `assign_token`
+
+`tenant_id` at the root + `params.key` + `params.nodes`: the nodes the credential is assigned to from
+now on (names or `ilk:` ids, each existing and charged to your company, never a person). It replaces
+the list; `[]` leaves it with none, so a credential with no owner becomes general again. The value
+does not change.
+
+```json
+{"status":"ok","op":"assign_token","result":{"status":"ok","key":"slack:tnt:94cd37b8-…:bot",
+ "assigned_ilks":["ilk:…","ilk:…"],"general":false,"changed":true}}
+```
+
+- `params.nodes` must be a list; `[]` is the explicit "no node".
+- Every node that had it or has it now is told and reloads it; a node it was taken from stops using
+  it. A node that loads its credential only when it starts (today `io.linkedhelper`) stops at its next
+  restart or configuration.
+- The same list again: `changed:false`, nobody is told.
+- A node that is deleted stays listed in `assigned_ilks` (it reads nothing, and the credential does
+  not become general because of it). To clean it, send `assign_token` with the nodes that exist, as
+  `list_ilks` shows them: an id that no longer exists answers `INVALID_REQUEST`.
+
+| `error_code` | when |
+|---|---|
+| `KEY_NOT_FOUND` | the key does not exist or belongs to another company |
+| `INVALID_REQUEST` | `params.nodes` missing or not a list; a node that does not exist, is charged to another company or is a person; a reserved infrastructure key |
 
 #### `delete_token`
 
@@ -600,6 +648,10 @@ post '{"op":"list_cloud_actions"}'
 
 - **`pending_signup`** in every summary `get_ilk` and `list_ilks` answer: `true` for a signup nobody
   finished.
+- **Who uses a credential** (§5.3): `put_token` takes `params.nodes`, and the new `assign_token`
+  changes them without touching the value; `list_tokens` shows `metadata.assigned_ilks`. A
+  credential with no owner and no node is general, as the pool was.
+- **A suspended or deleted company's credentials are not handed out** to its nodes.
 
 ### 0.1.65
 
