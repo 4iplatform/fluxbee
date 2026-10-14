@@ -7775,6 +7775,7 @@ fn error_code_to_http_status(error_code: &str) -> u16 {
         "UNAUTHORIZED" | "SYSTEM_ILK_PROTECTED" | "TENANT_ROOT_PROTECTED" => 403,
         "NOT_FOUND"
         | "ILK_NOT_FOUND"
+        | "TENANT_NOT_FOUND"
         | "NODE_NOT_FOUND"
         | "BLOB_NOT_FOUND"
         | "KEY_NOT_FOUND"
@@ -7808,6 +7809,14 @@ fn error_code_to_http_status(error_code: &str) -> u16 {
         | "KEY_TAKEN"
         | "TENANT_NAME_TAKEN"
         | "TENANT_DOMAIN_TAKEN"
+        // An identity lifecycle step the current state refuses: what blocks it is in the detail.
+        | "TENANT_HAS_NODES"
+        | "TENANT_HAS_CHILDREN"
+        | "TENANT_HAS_ACCOUNTS"
+        | "TENANT_NOT_DELETED"
+        | "TENANT_DELETED"
+        | "ILK_NOT_DELETED"
+        | "ILK_KEY_CONFLICT"
         | "BUSY" => 409,
         "COMPILE_ERROR"
         | "INVALID_CONFIG"
@@ -16532,7 +16541,11 @@ mod tests {
     #[test]
     fn identity_delete_errors_map_to_operator_http_statuses() {
         assert_eq!(error_code_to_http_status("ILK_NOT_FOUND"), 404);
+        assert_eq!(error_code_to_http_status("TENANT_NOT_FOUND"), 404);
         assert_eq!(error_code_to_http_status("SYSTEM_ILK_PROTECTED"), 403);
+        for refused in ["TENANT_HAS_NODES", "TENANT_NOT_DELETED", "ILK_KEY_CONFLICT"] {
+            assert_eq!(error_code_to_http_status(refused), 409, "{refused}");
+        }
     }
 
     #[test]

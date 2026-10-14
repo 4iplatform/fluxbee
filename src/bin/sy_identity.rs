@@ -7585,7 +7585,7 @@ ON CONFLICT (version) DO NOTHING;
         )
         .await;
 
-    tracing::info!("identity primary schema ensured (baseline v1)");
+    tracing::info!("identity primary schema ensured (migrations through v3, channel_scope)");
     Ok(())
 }
 
