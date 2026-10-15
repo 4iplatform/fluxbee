@@ -995,7 +995,7 @@ Visto al arreglar los e2e de A-37, leyendo `src/router/mod.rs` y `src/shm/mod.rs
   binario generaría uno como root); si no, el `myID` del Syncthing en marcha. Nunca `config.xml`.
 - **Estado:** construido; lo ejercita el próximo join (el de A-48).
 
-### A-65 ✅ RESUELTO EN CÓDIGO (0.1.67) — El vault creía el ILK que el propio nodo declaraba
+### A-65 🟡 PARCIAL, EN CÓDIGO (0.1.67) · el resto es P-1, postergado — El vault creía el ILK que el propio nodo declaraba
 
 - **Qué pasaba:** SY.vault autorizaba por `meta.src_ilk`, que pone el propio nodo. El router no lo
   ataba a quien mandaba. Un nodo comprometido podía:
@@ -1004,8 +1004,8 @@ Visto al arreglar los e2e de A-37, leyendo `src/router/mod.rs` y `src/shm/mod.rs
 
   Estaba anotado como fase 0 de io.web (`docs/io-web-spec-beta-v1.md` §21).
 - **Decisión del operador (2026-10-14):** arreglarlo ya.
-- **Arreglo:** el vault ata el ILK al nombre que estampa el router (`routing.src_l2_name`, que el
-  nodo no elige).
+- **Arreglo:** el vault ata el ILK al nombre del emisor que estampa el router
+  (`routing.src_l2_name`). Lo compara exacto: sin pasar a minúsculas ni recortar espacios.
   - **Un nodo de sistema** prueba el ILK derivado de su nombre, sin la SHM, así el core lee sus
     claves al arrancar.
   - **Cualquier otro nodo:** tiene que ser el ILK que identity registró para su nombre.
@@ -1014,6 +1014,20 @@ Visto al arreglar los e2e de A-37, leyendo `src/router/mod.rs` y `src/shm/mod.rs
     arranque degradado de identity escribe solo los del sistema.
 
   La refusal se contesta y se audita, nunca se descarta.
+- **Qué cierra:**
+  - poner otro ILK en `meta.src_ilk` ya no alcanza, y un subject que io.api reenvía no lee
+    secretos;
+  - entre hives, el nombre está atado al certificado del hive (EDGE-01): un nodo de otro hive no
+    puede ser `SY.admin@motherbee`.
+- **Qué no cierra:** en el mismo hive, el nombre lo declara el proceso en su HELLO y el router lo
+  acepta (P-1, ver A-22). Un proceso local puede abrir su propia conexión con el nombre de otro nodo
+  de ese hive y usar su ILK; en el motherbee, el de SY.admin. Es el agujero que P-1 ya deja para
+  todo lo demás, no uno nuevo, y los nodos corren como root (A-60).
+- **Revisado y no construido:** dos chequeos baratos en el router, que quedan para P-1:
+  - rechazar un HELLO local con un `@hive` ajeno: suma poco mientras se pueda elegir cualquier
+    nombre del propio hive;
+  - rechazar un nombre que ya tiene una conexión viva: puede trabar el reinicio de un nodo cuyo
+    socket viejo todavía no cerró.
 - **El router no lo necesita:** en un mensaje de usuario `src_ilk` es la persona, no el nodo.
 - **Antes del cambio:** se revisaron en PROD todos los pares (nodo, ILK) que la auditoría del vault
   vio alguna vez. Todos los SY pasan con su ILK derivado; los IO/AI que aparecen eran nodos de
@@ -1080,7 +1094,8 @@ Visto al arreglar los e2e de A-37, leyendo `src/router/mod.rs` y `src/shm/mod.rs
     - un nodo borrado queda en las listas, porque sacarlo podría volver general un secreto por sí
       solo;
     - io.linkedhelper relee su credencial solo al arrancar y en CONFIG_SET;
-    - el vault confiaba en el `src_ilk` que declaraba el propio nodo: cerrado en A-65 (0.1.67).
+    - el vault confiaba en el `src_ilk` que declaraba el propio nodo: A-65 (0.1.67) lo cierra
+      entre hives y para el header; en el mismo hive queda P-1.
 - **Validado en 8.x (0.1.66):** la auditoría del vault muestra qué lee cada nodo. Con cuatro nodos
   IO.slack de dos empresas:
   - con la clave asignada a dos nodos, la leen solo esos dos;

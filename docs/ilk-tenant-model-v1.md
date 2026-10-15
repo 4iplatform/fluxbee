@@ -285,9 +285,11 @@ owner-less one is its tenant's general secret, as today.
 - io.linkedhelper reads its credential only at start and on CONFIG_SET: an unassignment or a
   suspension reaches it at its next restart. Its peers (io.slack, io.wapp) re-read on every change;
   align it when it is next touched.
-- (Closed in 0.1.67, FINDINGS A-65: the vault no longer trusts the caller's `src_ilk` as declared.
-  It must be the ILK of the node the router says sent the request: derived from its name for a
-  system node, registered for its name for any other.)
+- The vault no longer trusts the caller's `src_ilk` as declared (0.1.67, FINDINGS A-65). It must be
+  the ILK of the node the router says sent the request: derived from its name for a system node,
+  registered for its name for any other. Across hives that name is bound to the hive's certificate
+  (EDGE-01). On the same hive it is the name the process declared in its HELLO, so a local process
+  can still claim another local node's name, and its ILK, until P-1 (FINDINGS A-22, postponed).
 
 ### 2.3 The tenant as a cost center (stage 3)
 

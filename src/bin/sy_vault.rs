@@ -1582,22 +1582,14 @@ fn audit_with_tx(
     Ok(())
 }
 
-/// Resolve the caller's identity from the incoming message.
-///
-/// In Model D' vault never trusts `routing.src_l2_name` for authorization
-/// — it's kept here only for audit logging. The real key is `meta.src_ilk`,
-/// which the caller pre-computed (deterministic for SY, from env var for
-/// dynamic AI/IO/WF) and which vault may also enrich with `tenant_id` /
-/// `ilk_type` by reading identity SHM. If the caller's ILK is not yet in
-/// SHM (identity at boot, fresh node), tenant/ilk_type stay `None` and
-/// downstream auth falls back to direct ILK-equality match.
-/// Who is asking: the router-stamped node name and the ILK the request claims, which must be the
-/// one registered for that node (`check_caller_binding`), enriched with its tenant and type from the
-/// identity SHM. A request with no ILK goes on unresolved: it reads nothing but what is open.
+/// Who is asking: the router-stamped node name and the ILK the request claims (`meta.src_ilk`,
+/// which the caller computes: deterministic for SY, from its env for AI/IO/WF), which must be the
+/// one registered for that node (`check_caller_binding`), enriched with its tenant and type from
+/// the identity SHM. A request with no ILK goes on unresolved: it reads nothing but what is open.
 fn resolve_caller(config_dir: &Path, msg: &Message) -> VaultResult<Caller> {
+    // Exactly as stamped: node names are exact strings everywhere (router, identity, orchestrator).
     let l2_name = msg
         .source_l2_name()
-        .map(str::trim)
         .filter(|v| !v.is_empty())
         .map(ToString::to_string);
     let ilk_id = msg
@@ -1631,7 +1623,12 @@ fn resolve_caller(config_dir: &Path, msg: &Message) -> VaultResult<Caller> {
 /// The claimed ILK must be the sending node's (io.web spec §21, phase 0): a system node's is derived
 /// from its name, so it proves itself without the SHM (the core reads its keys at boot); any other
 /// node's is the one identity registered for its name. `registered` is the SHM's entry for the
-/// claimed ILK, if any.
+/// claimed ILK, if any. Names compare exactly: two names that differ only in case are two nodes.
+///
+/// How far this reaches (FINDINGS A-65): across hives the stamped name is authenticated (the WAN
+/// router canonicalizes it to `role@<cert-bound hive>`, EDGE-01), so a compromised spoke can no longer
+/// act as SY.admin or as another hive's node. On one host the name is still the one the process
+/// declared in its HELLO (binding it to the process is P-1), and managed nodes run as root (A-60).
 fn check_caller_binding(
     l2_name: Option<&str>,
     ilk_id: &str,
@@ -1646,14 +1643,7 @@ fn check_caller_binding(
         return Ok(());
     }
     match registered {
-        Some(ilk)
-            if ilk
-                .handler_node
-                .as_deref()
-                .is_some_and(|node| node.trim().eq_ignore_ascii_case(l2_name)) =>
-        {
-            Ok(())
-        }
+        Some(ilk) if ilk.handler_node.as_deref() == Some(l2_name) => Ok(()),
         Some(_) => Err(VaultError::CallerMismatch(format!(
             "{l2_name} claims {ilk_id}, which identity registered for another node"
         ))),
@@ -2501,8 +2491,10 @@ mod tests {
         let slack = registered("ilk:slack", "IO.slack.sales@motherbee");
         check_caller_binding(Some("IO.slack.sales@motherbee"), "ilk:slack", Some(&slack))
             .expect("its own");
-        check_caller_binding(Some("io.SLACK.sales@motherbee"), "ilk:slack", Some(&slack))
-            .expect("case");
+        // A name that differs only in case is another node.
+        let err = check_caller_binding(Some("io.SLACK.sales@motherbee"), "ilk:slack", Some(&slack))
+            .expect_err("case");
+        assert_eq!(err.code(), "UNAUTHORIZED");
         // Claiming another node's ILK, SY.admin's included, is refused.
         let err = check_caller_binding(Some("IO.slack.evil@motherbee"), "ilk:slack", Some(&slack))
             .expect_err("another node's");
@@ -2515,6 +2507,15 @@ mod tests {
         let err = check_caller_binding(Some("SY.cognition@motherbee"), &admin, Some(&admin_entry))
             .expect_err("another system node's");
         assert_eq!(err.code(), "UNAUTHORIZED");
+        for lookalike in [
+            "sy.admin@motherbee",
+            "SY.admin@Motherbee",
+            " SY.admin@motherbee",
+        ] {
+            let err = check_caller_binding(Some(lookalike), &admin, Some(&admin_entry))
+                .expect_err(lookalike);
+            assert_eq!(err.code(), "UNAUTHORIZED", "{lookalike}");
+        }
         // An ILK the SHM does not hold: retryable, still nothing read.
         let err = check_caller_binding(Some("IO.slack.new@motherbee"), "ilk:unknown", None)
             .expect_err("unknown");

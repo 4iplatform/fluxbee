@@ -1432,7 +1432,8 @@ Audit registra actor router-stamped/Admin/Cloud authority y trace/request IDs.
 - definir binding catalog inicial;
 - definir row/messages/actions y authority gates;
 - cerrar el binding autoritativo `src_l2_name -> src_ilk` de Router/Vault y probar impersonation deny
-  (Vault: hecho en 0.1.67, FINDINGS A-65; el router no lo necesita, porque en un mensaje de usuario
+  (Vault: hecho en 0.1.67, FINDINGS A-65; en el mismo hive el nombre sigue siendo el que el proceso
+  declara en su HELLO hasta P-1, ver A-22; el router no lo necesita, porque en un mensaje de usuario
   `src_ilk` es la persona y no el nodo);
 - threat review del proxy y DB connector.
 
