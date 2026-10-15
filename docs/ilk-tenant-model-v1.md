@@ -278,8 +278,9 @@ owner-less one is its tenant's general secret, as today.
   secret general on its own (no owner, no node left), which is worse. Cloud cleans the list with
   the live nodes.
 - io.linkedhelper reads its credential only at start and on CONFIG_SET: an unassignment or a
-  suspension reaches it at its next restart. Its peers (io.slack, io.wapp) re-read on every change;
-  align it when it is next touched.
+  suspension reaches it at its next restart. io.slack re-reads on every change. io.linkedhelper and
+  io.wapp are still test-grade; the IO nodes are to be normalized as a track of their own
+  (operator, 2026-10-15), not as a side change.
 - The vault no longer trusts the caller's `src_ilk` as declared (0.1.67, FINDINGS A-65). It must be
   the ILK of the node the router says sent the request: derived from its name for a system node,
   registered for its name for any other. Across hives that name is bound to the hive's certificate
