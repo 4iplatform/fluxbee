@@ -21,6 +21,7 @@
 
 | Versión | Fecha (ART) | Commit | Alcance | Estado | Rollback |
 |---|---|---|---|---|---|
+| **0.1.67** | 2026-10-15 | `e85041d` | motherbee + spokes (core) | ✅ live | snap `pre-tenant-0-1-67` (las 4 VMs) · `apt install fluxbee=0.1.66` (la migración v4 no se deshace; ver la entrada) |
 | **0.1.66** | 2026-10-14 | `96c8d77` | motherbee + spokes (core) | ✅ live | snap `pre-secrets-0-1-66` (las 4 VMs) · `apt install fluxbee=0.1.65` |
 | **0.1.65** | 2026-10-14 | `8b3e951` | motherbee + spokes (core) | ✅ live | snap `pre-scope-0-1-65` (las 4 VMs) · `apt install fluxbee=0.1.64` (la migración v3 no se deshace; ver la entrada) |
 | **0.1.64** | 2026-10-13 | `f8c73c5` | motherbee + spokes (core) | ✅ live | snap `pre-cloud-0-1-64` (las 4 VMs) · `apt install fluxbee=0.1.63` |
@@ -75,6 +76,77 @@
 > (`dpkg-scanpackages -m`) para rollback, pero su detalle vive en la bitácora, no acá.
 
 ---
+
+## 0.1.67 — Un tenant que no está activo no arranca nodos y borrarlo no marca a nadie (A-66, etapa 3); el vault ata el ILK al nodo que manda (A-65)
+
+- **Fecha:** 2026-10-15 (ART) · **Versión anterior:** 0.1.66 · **Commits:** `fbca8e7` y `81d2fab`
+  (A-65), `11aead9` (etapa 3) y `e85041d` (la revisión). Diseño en `docs/ilk-tenant-model-v1.md`
+  §2.3, decidido con el operador. Una revisión de A-65 (alcance parcial, comparación exacta) y una
+  de la etapa 3 (2 mayores, 2 menores, 4 detalles), arregladas antes del build.
+- **Alcance:** motherbee + los tres spokes (core-update).
+- **Qué cambió:**
+  - **SY.vault (A-65):** el ILK de quien pide tiene que ser el del nodo que el router dice que
+    mandó: derivado del nombre para un SY, el registrado para su nombre para cualquier otro. Entre
+    hives está cerrado; en el mismo hive el nombre sigue siendo el del HELLO (P-1).
+  - **Orquestador:** `run_node`, start y restart contestan `TENANT_NOT_ACTIVE` para un tenant
+    pendiente o suspendido, y los relanzamientos lo saltean. Un nodo que ya corre no se mata.
+  - **SY.identity:**
+    - borrar un tenant marca solo al tenant;
+    - purgarlo se rechaza con personas cargadas (`TENANT_HAS_PEOPLE`);
+    - `set_ilk_tenant` mueve temporales desde un tenant borrado;
+    - `restore_ilk` devuelve a una persona con su tenant borrado;
+    - la migración v4 desmarca a quien marcó una cascada vieja.
+  - **io.api `by_ilk`:** personas cargadas al tenant o con un canal en su espacio (D12).
+  - **Admin y Cloud:** los códigos nuevos son 409; textos y catálogo.
+- **Deploy:**
+  - **Build:** `e85041d` en 20,5 min. Antes se lanzaron por error dos builds del mismo commit a la
+    vez (`11aead9`); se pararon a los segundos y quedó uno solo.
+  - **Publish y deploy:** publish en 19 s, deploy en 293 s.
+  - **Snapshots:** `pre-tenant-0-1-67` en las 4 VMs (se borró `pre-cloud-0-1-64`).
+  - **Estado:** 0.1.67 con el mismo manifest (`637ed35d`) en los 4, health `failed=0`, OPA `in_sync`
+    4/4. Identity: *"migrations through v4"*, sin nada que desmarcar (PROD no tenía marcas de
+    cascada).
+  - **Antes del deploy:** el SQL de la v4 se probó sobre el esquema de PROD dentro de una
+    transacción que se deshizo: desmarcó al libre y a uno de dos con el mismo email; dejó marcados al
+    del email tomado, al otro y a un nodo; no tocó una marca directa.
+- **Gate:**
+  - **A-65:**
+    - después del reinicio, todos los SY leyeron sus claves sin un rechazo, también los de otros
+      hives (`SY.cognition@worker1`, `SY.edge@ingress1`);
+    - `send_node_message` del admin al vault con el ILK de IO.cloud: `UNAUTHORIZED`, auditado; con
+      el suyo: pasa;
+    - el nodo IO.slack del gate lee su clave con su propio ILK.
+  - **Etapa 3, por la puerta pública con el bearer de Cloud y del lado del operador:**
+    - **Armado:** tenants T y U; un nodo IO.slack s1 en T con la clave de T general; Ana y Bob
+      (cuentas) y un alta sin nombre, que queda pendiente (un temporal); Bob borrado.
+    - **T suspendida:**
+      - el restart de s1 da `409 TENANT_NOT_ACTIVE` y s1 sigue corriendo;
+      - un nodo nuevo en T da `TENANT_NOT_ACTIVE`;
+      - el vault le niega la clave a s1 (7 `UNAUTHORIZED`);
+      - con la unidad de s1 parada, dos pasadas seguidas lo saltean (*"not relaunched: its tenant
+        is not active"*);
+      - mover el temporal fuera de T, que no está borrada, se rechaza.
+    - **T reactivada:** la pasada siguiente (52 s después) relanzó s1, que volvió a leer.
+    - **Borrar:**
+      - con s1 vivo, `TENANT_HAS_NODES`;
+      - con s1 purgado, ok y `people_charged: 2`;
+      - Ana y el temporal no se marcan y siguen cargados a T, y la cuenta de Ana contesta por email;
+      - Bob vuelve con T borrada;
+      - restaurar T da `people_charged: 3`.
+    - **Purgar:** `TENANT_HAS_SECRETS`; sin la clave, `TENANT_HAS_PEOPLE` con los tres; los tres a U
+      (el temporal desde T borrada); purga ok sin llevarse a nadie; los tres siguen en U y el
+      temporal sigue pendiente.
+    - **Limpieza:** las tres personas borradas por Cloud, U borrada y purgada (se fueron las tres
+      marcadas). PROD quedó como antes: solo el tenant raíz y los 28 ILK del core.
+  - **Encontrado en el gate:** el rechazo de mover un temporal contestaba
+    `INVALID_TENANT_TRANSITION|<detalle>` como `error_code`. Arreglado en `a5f1b2a`; sale con el
+    próximo release.
+  - **Lo que no se probó en vivo:** io.api `by_ilk` (D12), cubierto por tests; la v4 sobre datos
+    reales, porque PROD no tenía (cubierta por la prueba en transacción).
+- **Rollback:**
+  - snapshot `pre-tenant-0-1-67`;
+  - o `apt install fluxbee=0.1.66`. La v4 no se deshace: a quien desmarcó, 0.1.66 lo ve activo, y
+    un tenant borrado sin cascada queda con su gente activa (0.1.66 no la marca de vuelta).
 
 ## 0.1.66 — Un secreto lo usa su dueño, sus nodos asignados o, si es general, los nodos de su tenant; en el génesis nace solo el core (A-64, etapa 2)
 

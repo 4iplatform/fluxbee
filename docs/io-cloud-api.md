@@ -707,6 +707,20 @@ post '{"op":"list_cloud_actions"}'
 
 ## 10. Checked live
 
+**0.1.67:** on PROD, 2026-10-15, through the public door with Cloud's token, with the operator
+suspending, reactivating and purging (`lab/DEPLOYMENTS.md`, 0.1.67):
+
+- a suspended company's node is refused a restart (`TENANT_NOT_ACTIVE`) and keeps running without its
+  credential; a new node is refused; stopped, it is not relaunched; reactivated, it comes back
+  within a minute;
+- `delete_tenant` with people charged marks nobody: `people_charged` counts them, they still answer
+  (by id and by email), a deleted person comes back with `restore_ilk`, and `restore_tenant`
+  brings the company back as it was;
+- `delete_tenant` with a node answers `TENANT_HAS_NODES`;
+- `set_ilk_tenant` moves an account and a contact out of the deleted company; a contact of a company
+  that is not deleted is refused. **In 0.1.67 that refusal arrives with its detail after a `|` in
+  `error_code` (`INVALID_TENANT_TRANSITION|…`); fixed for the next release.**
+
 **0.1.66:** on PROD, 2026-10-14, through the public door with Cloud's token: 22 checks, all passing
 (`lab/DEPLOYMENTS.md`, 0.1.66). What each node read was taken from the hive's vault audit, with four
 IO.slack nodes of two companies:

@@ -995,7 +995,7 @@ Visto al arreglar los e2e de A-37, leyendo `src/router/mod.rs` y `src/shm/mod.rs
   binario generaría uno como root); si no, el `myID` del Syncthing en marcha. Nunca `config.xml`.
 - **Estado:** construido; lo ejercita el próximo join (el de A-48).
 
-### A-66 🟡 EN CÓDIGO (0.1.67) — Un tenant suspendido seguía arrancando nodos, y borrar un tenant marcaba a su gente
+### A-66 ✅ VALIDADO EN 8.x (0.1.67, 2026-10-15) — Un tenant suspendido seguía arrancando nodos, y borrar un tenant marcaba a su gente
 
 - **El marco:** `docs/ilk-tenant-model-v1.md` §2.3, la etapa 3. Decisiones del operador del
   2026-10-14: *"no quiero borrar ni desaparecer ilk de humanos"*; *"sobre nodos y recursos sí vale la
@@ -1059,9 +1059,19 @@ Visto al arreglar los e2e de A-37, leyendo `src/router/mod.rs` y `src/shm/mod.rs
 - **Abierto (D13):** unir un contacto a una cuenta, por ejemplo un cliente de A que pasa a ser
   dueño de B, necesita un paso explícito (la persona prueba el canal desde su cuenta). No está
   diseñado.
-- **Validación en 8.x:** pendiente, con 0.1.67.
+- **Validado en 8.x (0.1.67):**
+  - **suspendido:** el restart de su nodo da `TENANT_NOT_ACTIVE` y el nodo sigue corriendo sin
+    secretos; parado, dos pasadas no lo relanzan; reactivado, la pasada siguiente lo relanza;
+  - **borrado:** nadie se marca, la gente sigue resolviendo, una persona borrada vuelve con el tenant
+    borrado, y restaurarlo lo deja como estaba;
+  - **purga:** se rechaza con la clave y después con las personas, y pasa cuando se las mueve (un
+    temporal incluido, desde el tenant borrado);
+  - **encontrado:** el rechazo de mover un temporal llegaba como `CODE|detalle` en `error_code`;
+    arreglado en `a5f1b2a`, sale con el próximo release.
 
-### A-65 🟡 PARCIAL, EN CÓDIGO (0.1.67) · el resto es P-1, postergado — El vault creía el ILK que el propio nodo declaraba
+  Detalle en `lab/DEPLOYMENTS.md`.
+
+### A-65 🟡 PARCIAL, VALIDADO EN 8.x (0.1.67, 2026-10-15) · el resto es P-1, postergado — El vault creía el ILK que el propio nodo declaraba
 
 - **Qué pasaba:** SY.vault autorizaba por `meta.src_ilk`, que pone el propio nodo. El router no lo
   ataba a quien mandaba. Un nodo comprometido podía:
@@ -1098,6 +1108,9 @@ Visto al arreglar los e2e de A-37, leyendo `src/router/mod.rs` y `src/shm/mod.rs
 - **Antes del cambio:** se revisaron en PROD todos los pares (nodo, ILK) que la auditoría del vault
   vio alguna vez. Todos los SY pasan con su ILK derivado; los IO/AI que aparecen eran nodos de
   prueba ya purgados.
+- **Validado en 8.x (0.1.67):** después del deploy todos los SY leyeron sus claves sin un rechazo,
+  también los de otros hives; el admin pidiendo con el ILK de IO.cloud recibió `UNAUTHORIZED`
+  (auditado) y con el suyo pasó; un nodo IO.slack leyó con su propio ILK.
 
 ### A-64 ✅ VALIDADO EN 8.x (0.1.66, 2026-10-14) — Los secretos se compartían solo por tenant, un tenant suspendido seguía entregándolos y en el génesis podía nacer cualquier nodo
 
