@@ -21,6 +21,7 @@
 
 | Versión | Fecha (ART) | Commit | Alcance | Estado | Rollback |
 |---|---|---|---|---|---|
+| **0.1.66** | 2026-10-14 | `96c8d77` | motherbee + spokes (core) | ✅ live | snap `pre-secrets-0-1-66` (las 4 VMs) · `apt install fluxbee=0.1.65` |
 | **0.1.65** | 2026-10-14 | `8b3e951` | motherbee + spokes (core) | ✅ live | snap `pre-scope-0-1-65` (las 4 VMs) · `apt install fluxbee=0.1.64` (la migración v3 no se deshace; ver la entrada) |
 | **0.1.64** | 2026-10-13 | `f8c73c5` | motherbee + spokes (core) | ✅ live | snap `pre-cloud-0-1-64` (las 4 VMs) · `apt install fluxbee=0.1.63` |
 | **0.1.63** | 2026-10-06 | `aab0e3e` | motherbee + spokes (core) | ✅ live | snap `pre-a58-0-1-63` (las 4 VMs) · `apt install fluxbee=0.1.62` (HANDBOOK, rollback bajo 0.1.63) |
@@ -74,6 +75,70 @@
 > (`dpkg-scanpackages -m`) para rollback, pero su detalle vive en la bitácora, no acá.
 
 ---
+
+## 0.1.66 — Un secreto lo usa su dueño, sus nodos asignados o, si es general, los nodos de su tenant; en el génesis nace solo el core (A-64, etapa 2)
+
+- **Fecha:** 2026-10-14 (ART) · **Versión anterior:** 0.1.65 · **Commits:** `80b479c` (altas
+  pendientes, D11) y `96c8d77` (etapa 2). Diseño en `docs/ilk-tenant-model-v1.md` §2.2, decidido con
+  el operador. Una revisión del código (1 mayor, 9 menores), arreglada antes del build.
+- **Alcance:** motherbee + los tres spokes (core-update).
+- **Qué cambió:**
+  - **SY.vault:**
+    - nodos asignados en el secreto y `VAULT_ASSIGN`, que los cambia sin tocar el valor;
+    - el valor sale solo con el tenant del secreto activo;
+    - un valor nuevo conserva quién lo usa;
+    - el aviso de cambio llega a quien lo tenía y a quien lo tiene.
+  - **SDK:** la resolución busca primero uno propio, después uno asignado, después el general del
+    tenant; nunca el del raíz.
+  - **SY.admin:** `vault_assign` y nodos asignados en `vault_put`, siempre del tenant del secreto y
+    nunca personas.
+  - **IO.cloud:** `nodes` en `put_token`, la operación `assign_token` y `pending_signup` en las
+    lecturas.
+  - **Orquestador:** en el génesis nace solo el core.
+  - **SY.identity:** el tenant de un nodo no cambia, y las altas pendientes se leen como tales.
+- **Deploy:**
+  - **Primer build:** murió por memoria. La VM de build (4 CPU, 8 GB, sin swap) mató un `rustc`;
+    0.1.64 y 0.1.65 habían pasado justo. Se le sumó un swapfile de 8 GB (persistente).
+  - **Segundo build:** `96c8d77` en 18 min.
+  - **Publish y deploy:** publish en 13 s, deploy en 216 s.
+  - **Snapshots:** `pre-secrets-0-1-66` en las 4 VMs (se borró `pre-a58-0-1-63`).
+  - **Estado:** 0.1.66 con el mismo manifest (`648d8493`) en los 4, health `failed=0`, OPA `in_sync`
+    4/4.
+  - **Antes del deploy:** se verificó que en el génesis de PROD corre solo el core, así que la regla
+    nueva no dejaba nada afuera.
+- **Gate (medido con la auditoría del vault, que registra cada lectura de cada nodo):**
+  - **Después del reinicio:** el core leyó todas sus claves (SY.\* las del génesis, SY.edge las
+    suyas), sin un rechazo.
+  - **Por la puerta pública, con el bearer de Cloud: 22 controles, todos PASS.**
+    - Dos empresas A y B. Cuatro nodos IO.slack: tres en A y uno en B, todos configurados con la
+      clave de A, con tokens falsos.
+    - Una persona en A.
+    - `put_token` asignado a dos nodos; `list_tokens` los muestra.
+    - Asignar un nodo de B, o una persona, da `INVALID_REQUEST`; asignar desde B la clave de A da
+      `KEY_NOT_FOUND`.
+    - Las lecturas de identidades traen `pending_signup`.
+  - **Lo que leyó cada nodo:**
+    - **Asignada a g1 y g2:** leen g1 y g2; g3 (de A, no asignado) y b1 (de B) reciben
+      `UNAUTHORIZED`.
+    - **Asignada solo a g1:** g2 quedó afuera apenas llegó el aviso y soltó la credencial.
+    - **General para A:** leen g1, g2 y g3; b1 no.
+    - **A suspendida:** los tres de A, rechazados con *"the secret's tenant … is not active
+      (suspended)"*. **Reactivada:** vuelven a leer.
+    - **El secreto de una persona** (dueña Juan, asignado a g4): g4 lo lee, y lo sigue leyendo
+      después de cambiar a Juan a la empresa B.
+  - **Del lado del operador:** un nodo AI en el génesis da `TENANT_ROOT_NOT_ALLOWED`, y
+    `?pending_signup=true` contesta (0 pendientes).
+  - **Lo que no se probó en vivo:** el cambio de tenant de un nodo, que no tiene camino de API para
+    intentarlo. Está cubierto por tests.
+- **Limpieza:** los cinco nodos purgados (al purgarlos no se borró ningún secreto, porque no eran
+  dueños de ninguno), las claves y la persona borradas por Cloud, los dos tenants purgados. Identity
+  y el vault quedaron como antes.
+- **Arreglado después, sale con el próximo release:** el admin HTTP devolvía 500 para
+  `TENANT_ROOT_NOT_ALLOWED`; ahora 403.
+- **Rollback:**
+  - snapshot `pre-secrets-0-1-66`;
+  - o `apt install fluxbee=0.1.65`. No hay migración: los secretos que 0.1.66 escribe con nodos
+    asignados, 0.1.65 los ve generales.
 
 ## 0.1.65 — Un ILK por actor: el ámbito de cada canal, una cuenta de Cloud por email y `set_ilk_tenant` (A-63, etapa 1)
 

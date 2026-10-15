@@ -644,7 +644,7 @@ post '{"op":"list_cloud_actions"}'
 
 ## 9. What changed for Cloud
 
-### 0.1.66 (next release)
+### 0.1.66
 
 - **`pending_signup`** in every summary `get_ilk` and `list_ilks` answer: `true` for a signup nobody
   finished.
@@ -688,6 +688,17 @@ post '{"op":"list_cloud_actions"}'
 ---
 
 ## 10. Checked live
+
+**0.1.66:** on PROD, 2026-10-14, through the public door with Cloud's token: 22 checks, all passing
+(`lab/DEPLOYMENTS.md`, 0.1.66). What each node read was taken from the hive's vault audit, with four
+IO.slack nodes of two companies:
+
+- a credential assigned to two nodes reaches those two only; taken from one, that one stops at once;
+- general, it reaches every node of its company and none of another;
+- assigning a node of another company, or a person, answers `INVALID_REQUEST`; another company
+  assigning your key answers `KEY_NOT_FOUND`;
+- a suspended company's nodes are refused it, and get it back when the company is reactivated;
+- `get_ilk` and `list_ilks` summaries carry `pending_signup`.
 
 **0.1.65:** on PROD, 2026-10-14, through the public door from outside, with Cloud's token: 30 checks,
 all passing (`lab/DEPLOYMENTS.md`, 0.1.65). The data was made with 0.1.64 first: the same email from

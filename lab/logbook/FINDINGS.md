@@ -995,7 +995,7 @@ Visto al arreglar los e2e de A-37, leyendo `src/router/mod.rs` y `src/shm/mod.rs
   binario generaría uno como root); si no, el `myID` del Syncthing en marcha. Nunca `config.xml`.
 - **Estado:** construido; lo ejercita el próximo join (el de A-48).
 
-### A-64 ✅ RESUELTO EN CÓDIGO (0.1.66) — Los secretos se compartían solo por tenant, un tenant suspendido seguía entregándolos y en el génesis podía nacer cualquier nodo
+### A-64 ✅ VALIDADO EN 8.x (0.1.66, 2026-10-14) — Los secretos se compartían solo por tenant, un tenant suspendido seguía entregándolos y en el génesis podía nacer cualquier nodo
 
 - **El marco:** `docs/ilk-tenant-model-v1.md` §2.2, la etapa 2. La decidió el operador el 2026-10-14:
   *"tenant no es identidad ni seguridad ... el secret se guarda con el tenant para filtrar el uso del
@@ -1058,7 +1058,18 @@ Visto al arreglar los e2e de A-37, leyendo `src/router/mod.rs` y `src/shm/mod.rs
     - io.linkedhelper relee su credencial solo al arrancar y en CONFIG_SET;
     - el vault confía en el `src_ilk` que declara el propio nodo. Atarlo al nombre que estampa el
       router es la fase 0 de io.web, y aplica igual a secretos con dueño y asignados.
-- **Pendiente:** validar en 8.x (0.1.66).
+- **Validado en 8.x (0.1.66):** la auditoría del vault muestra qué lee cada nodo. Con cuatro nodos
+  IO.slack de dos empresas:
+  - con la clave asignada a dos nodos, la leen solo esos dos;
+  - al quitarle un nodo, ese queda afuera en el momento;
+  - como general, la leen todos los de la empresa y ninguno de la otra;
+  - con la empresa suspendida, nadie; reactivada, vuelven;
+  - el secreto de una persona lo lee su nodo asignado aun después de cambiar a la persona de
+    empresa;
+  - el génesis rechaza un nodo AI;
+  - el core leyó sus claves después del reinicio.
+
+  Detalle en `lab/DEPLOYMENTS.md`.
 
 ### A-63 ✅ VALIDADO EN 8.x (0.1.65, 2026-10-14) — La identidad dependía del tenant: personas duplicadas, claves que se corrían y fusiones entre tenants
 
