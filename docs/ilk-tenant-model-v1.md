@@ -307,8 +307,13 @@ settings, sponsor. The sponsor is stored flat and grants nothing.
     (`TENANT_DELETED`). Nodes cannot outlive their tenant: deleting it waits for them.
   - A node that already runs is never stopped for it. Stopping and relaunching would be more
     machinery and less reversible, and without its secrets it spends nothing.
-- **Not built, documented:** the router does not refuse the traffic of a suspended tenant's ILKs.
-  It would be a lookup on every message, on the busiest path, and it adds little to the above.
+- `start_node` on a node that already runs answers `already_running` whatever its tenant.
+- **Not built, documented:**
+  - the router does not refuse the traffic of a suspended tenant's ILKs. It would be a lookup on
+    every message, on the busiest path, and it adds little to the above;
+  - a workflow rolled out to a suspended tenant: wf-rules writes the new version into the node's
+    config, the restart is refused, and wf-rules reports `restart_failed`. Once the tenant is active
+    again nothing restarts the running node, so it keeps the old package until a restart.
 - The root tenant is never suspended.
 
 **Deleting a tenant disables it.**
@@ -324,12 +329,20 @@ settings, sponsor. The sponsor is stored flat and grants nothing.
 - A person deleted on their own comes back with `restore_ilk` even while their tenant is marked,
   still charged to it. Any other ILK waits for its tenant to be restored.
 - This replaces the cascade of 2026-09-28 and stage 1's `TENANT_HAS_ACCOUNTS`.
+- **Data from before:** until 0.1.66 a delete marked the people charged to the tenant (reason
+  `tenant`). Migration v4 un-marks them at every primary boot, before the store loads; they stay
+  charged to their tenant, and their ids are logged. One whose email an active ILK of the tenant now
+  holds stays marked, and is logged too.
 
 **Purging a tenant** (final, the operator only) is refused while people are charged to it
 (`TENANT_HAS_PEOPLE`, the first 20 listed): they are charged elsewhere first, never removed with
 it.
-- `set_ilk_tenant` takes temporaries too, so a company with a thousand WhatsApp contacts can be
-  emptied. A bulk move ("everyone from T to U") is added if it is needed.
+- `set_ilk_tenant` takes temporaries out of a deleted tenant, so a company with a thousand WhatsApp
+  contacts can be emptied. A temporary of an active tenant stays: its frontdesk registers it in that
+  tenant's case (`INVALID_TENANT_TRANSITION`). A bulk move ("everyone from T to U") is added if it is
+  needed.
+- A temporary merged into another ILK is an alias of it until the alias expires: it is not counted
+  and goes with the purge.
 - People marked on their own go with the purge.
 - It is still refused while the vault holds its secrets (`TENANT_HAS_SECRETS`), node identities
   remain or it sponsors tenants.
@@ -345,8 +358,10 @@ that is, wrote to its WhatsApp, its Slack or its API. The channel, each company'
   comunica es asociado a un evento sobre ese TNT"*.
 - The same person writing to two companies is two ILKs. A phone number or a Slack ID is not
   evidence across companies; only an email that Cloud authenticated is (§2.1).
-- Charging a person to another company is `set_ilk_tenant`. The companies that know them are the
-  scopes of their channels, which never move, so the company they leave still reaches them.
+- Charging an account to another company is `set_ilk_tenant`; a contact that has not registered
+  stays with the company it wrote to while that company is active. The companies that know a person
+  are the scopes of their channels, which never move, so the company they leave still reaches
+  them.
 - **Open (D13):** joining a contact to an account, for example a customer of A who becomes the
   owner of B. It needs an explicit step (the person proves the channel from their account), never
   a match on the number. Not designed.
@@ -399,7 +414,7 @@ Every stage goes through:
 |---|---|---|
 | 1 | ILK structure (§2.1) and its IO.cloud part. | On PROD, through Cloud's public door: <br>• the same email registered from two tenants gives one ILK; <br>• `set_ilk_tenant` moves the person, and the person's `cloud` and IO channels still resolve; <br>• the person keeps their channels after an identity restart (DB reload); <br>• worker1's identity replica shows the new tenant; <br>• a read by id across tenants works, and Cloud is refused a node's ILK on delete; <br>• a tenant with an account charged is refused (`TENANT_HAS_ACCOUNTS`), and purging the tenant a person left drops their keys there; <br>• the migration on data made with 0.1.64: a unique email moves, an email in two tenants is reported and refused (`ACCOUNT_AMBIGUOUS`). |
 | 2 | Secrets (§2.2). | On PROD: <br>• a company's token assigned to two of its nodes reaches both and not a third; unassigned, one stops at once; <br>• a general token reaches every node of its company and none of another; <br>• a suspended or deleted tenant's secrets are not handed out, and come back when it is reactivated; <br>• a person's secret assigned to a node reaches it, and the person's reassignment changes nothing; <br>• the genesis tenant refuses an AI node, and the core still reads its keys after a restart; <br>• a node's tenant cannot change; <br>• Cloud stores, assigns and lists through the public door. |
-| 3 | Tenant firm (§2.3). | On PROD: <br>• suspended, a tenant's node does not start or restart and the running one keeps running without secrets; reactivated, the node starts; <br>• deleted with people charged, nobody is marked and they still resolve; restored, it is as it was; <br>• a purge with people charged is refused, and goes once they are charged elsewhere (a temporary included). |
+| 3 | Tenant firm (§2.3). | On PROD: <br>• suspended, a tenant's node does not start or restart and the running one keeps running without secrets; one that dies is not relaunched; reactivated, it is; <br>• deleted with people charged, nobody is marked and they still resolve; a person comes back while it is deleted; restored, it is as it was; <br>• a purge with people charged is refused, and goes once they are charged elsewhere (a temporary included, out of the deleted tenant). |
 | 4 | Cloud (§2.4), whatever did not ship with 1–3. | The contract doc checked live. |
 | 5 | Tokens (§2.5). | Designed first. |
 

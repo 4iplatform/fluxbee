@@ -9442,7 +9442,7 @@ fn admin_action_summary(action: &str) -> &'static str {
             "Mark one identity ILK deleted (reversible: hidden, its keys stay reserved until purge). Refuses well-known SY system ILKs (SYSTEM_ILK_PROTECTED)."
         }
         "restore_ilk" => "Undo the deleted mark of one identity ILK (a person also while their tenant is marked; any other ILK waits for its tenant).",
-        "set_ilk_tenant" => "Charge one person (complete or temporary) to another tenant, its cost center; channels keep their scope.",
+        "set_ilk_tenant" => "Charge one person to another tenant, its cost center (a temporary only out of a deleted tenant); channels keep their scope.",
         "purge_ilk" => {
             "Physically and finally remove one identity ILK that is ALREADY marked deleted (ILK_NOT_DELETED otherwise)."
         }
@@ -11336,7 +11336,7 @@ fn admin_action_request_notes(action: &str) -> Vec<&'static str> {
         ],
         "set_ilk_tenant" => vec![
             "A tenant is a cost center: changing it grants and revokes nothing (docs/ilk-tenant-model-v1.md).",
-            "People only, complete or temporary (a node is born and dies in its tenant); the target must be active and never the root tenant. The current tenant may be deleted: that is how its people are moved out before a purge.",
+            "People only (a node is born and dies in its tenant): an account from anywhere, a temporary only out of a deleted tenant (INVALID_TENANT_TRANSITION otherwise), which is how a tenant is emptied before its purge. The target must be active and never the root tenant.",
             "Refused with DUPLICATE_EMAIL when another person in the target holds the same email. Channels keep their scope, so every lookup still resolves; each change writes a history row.",
         ],
         "restore_ilk" => vec![

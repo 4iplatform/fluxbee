@@ -1158,7 +1158,8 @@ fn translate_cloud_op(
             Ok((action, json!({ "ilk_id": ilk_id, "ilk_type": "human" })))
         }
         // Charge a person to the claimed tenant, their cost center. It grants and revokes
-        // nothing; SY.identity checks the rest (a complete person, an active target, the email).
+        // nothing; SY.identity checks the rest (a person, a temporary only out of a deleted
+        // tenant, an active target, the email).
         "set_ilk_tenant" => {
             let tenant_id = claimed_tenant(tenant_id, op)?;
             let ilk_id = required_string(params, "ilk_id")?;

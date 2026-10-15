@@ -1044,24 +1044,31 @@ bajar, sacar la carpeta `fluxbee-dist-policy` de Syncthing y restaurar el `hive.
 ### Identidades: marcar, restaurar, purgar (desde 0.1.34)
 
 Decisión del operador (2026-09-28): los ILKs y tenants son datos únicos, así que **borrar solo
-marca** y **purgar** es un paso aparte y deliberado.
+marca** y **purgar** es un paso aparte y deliberado. Desde 0.1.67 (etapa 3, `docs/ilk-tenant-model-v1.md`
+§2.3): lo que le pasa a un tenant nunca marca ni borra a una persona.
 
 ```bash
 A=127.0.0.1:8080; H=motherbee
 curl -X DELETE $A/hives/$H/identity/ilks/<ilk_id>                # marcar (reversible, idempotente)
 curl -X POST   $A/hives/$H/identity/ilks/<ilk_id>/restore        # deshacer la marca
 curl -X POST   $A/hives/$H/identity/ilks/<ilk_id>/purge          # físico: exige la marca previa
-curl -X DELETE $A/hives/$H/identity/tenants/<tenant_id>          # marca el tenant y, en cascada, sus ILKs
-curl -X POST   $A/hives/$H/identity/tenants/<tenant_id>/restore  # vuelve con lo que se llevó la cascada
-curl -X POST   $A/hives/$H/identity/tenants/<tenant_id>/purge    # físico: el tenant y todos sus ILKs
+curl -X DELETE $A/hives/$H/identity/tenants/<tenant_id>          # marca solo el tenant (lo deshabilita)
+curl -X POST   $A/hives/$H/identity/tenants/<tenant_id>/restore  # lo devuelve tal cual
+curl -X POST   $A/hives/$H/identity/tenants/<tenant_id>/purge    # físico: sin personas cargadas
+curl -X PUT    $A/hives/$H/identity/ilks/<ilk_id>/tenant -d '{"tenant_id":"tnt:…"}'  # cargar a otro tenant
 curl "$A/hives/$H/identity/ilks?include_deleted=true"            # los marcados solo aparecen así
 ```
 
 - **Marcado = oculto pero reservado.** No resuelve (ni en la SHM, ni en los routers, ni en el
   `get_ilk` de Cloud). Su email, sus canales y su `node_name`, o el nombre y dominio del tenant,
   **quedan tomados** hasta la purga: reusarlos da `ILK_DELETED` o `TENANT_DELETED`.
-- **Restaurar un tenant** trae solo los ILKs que marcó su cascada; los que se borraron sueltos
-  antes siguen borrados.
+- **Borrar un tenant no marca a nadie.** Su gente sigue usable y se carga a otro tenant con
+  `set_ilk_tenant` (un temporal, solo si su tenant está borrado). Restaurar el tenant lo devuelve
+  tal cual.
+- **Purgar un tenant** se rechaza mientras tenga personas cargadas (`TENANT_HAS_PEOPLE`): primero
+  se las carga a otro. Las que se borraron solas se van con él.
+- **Un tenant pendiente o suspendido no arranca nodos** (`TENANT_NOT_ACTIVE`); los que ya corren no
+  se matan, pero no reciben secretos.
 - **Protecciones:**
   - no se toca el tenant raíz ni los ILKs de sistema;
   - un tenant con identidades de nodo (`TENANT_HAS_NODES`) o con tenants apadrinados

@@ -331,14 +331,16 @@ center, so this grants and revokes nothing; the person keeps every channel and l
 ```
 
 - Already charged there: `changed:false`.
-- Any person: an account, or a contact known through a channel. The company they leave may be
-  deleted: this is how its people are moved out. Every change is recorded in the hive.
+- Any person: an account from anywhere; a contact that never registered (a temporary) only out of
+  a deleted company, which is how a deleted company is emptied. A contact of an active company
+  stays: that company registers it. Every change is recorded in the hive.
 - Errors:
   - `DUPLICATE_EMAIL`: another person charged to that company has the same email in their
     identification.
   - `TENANT_NOT_ACTIVE` (pending or suspended), `TENANT_DELETED`, `TENANT_NOT_FOUND`,
     `TENANT_ROOT_PROTECTED`.
-  - `ILK_TYPE_MISMATCH` (not a person), `ILK_NOT_FOUND` (or deleted).
+  - `INVALID_TENANT_TRANSITION` (a contact of a company that is not deleted),
+    `ILK_TYPE_MISMATCH` (not a person), `ILK_NOT_FOUND` (or deleted).
 
 #### `get_ilk` (local, fast)
 
@@ -651,8 +653,9 @@ post '{"op":"list_cloud_actions"}'
 - **`delete_tenant` disables the company and marks no person.** `TENANT_HAS_ACCOUNTS` is gone, and
   so are `cascaded_ilks` and `pending_signups` in its answer; it answers `people_charged`.
   `restore_tenant` answers `people_charged` instead of `restored_ilks`.
-- **`set_ilk_tenant` takes any person,** a contact known through a channel included, also out of a
-  deleted company. `INVALID_TENANT_TRANSITION` no longer comes from it.
+- **`set_ilk_tenant` moves contacts too, out of a deleted company,** to empty it before the
+  operator purges it. `INVALID_TENANT_TRANSITION` now means a contact of a company that is not
+  deleted.
 - **`restore_ilk` brings a person back while their company is deleted** (it answered
   `TENANT_DELETED`).
 - **A company that is not active starts no node:** `provision_node` answers `TENANT_NOT_ACTIVE`

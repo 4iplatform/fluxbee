@@ -1950,9 +1950,15 @@ async fn reconcile_persisted_custom_nodes(
             } else {
                 (persisted_ilk, persisted_tenant)
             };
+        // The tenant as start and restart read it: the identity map, else the node's config.
+        let node_tenant = persisted_tenant.clone().or_else(|| {
+            load_node_effective_config(&node.config_path)
+                .ok()
+                .and_then(|config| config_tenant_id(&config))
+        });
         // Checked before anything is stopped: a node that still runs is left running, not killed.
         if let Some(refusal) =
-            genesis_refusal(&node.node_name, &runtime_key, persisted_tenant.as_deref())
+            genesis_refusal(&node.node_name, &runtime_key, node_tenant.as_deref())
         {
             failed = failed.saturating_add(1);
             tracing::warn!(
@@ -1968,13 +1974,13 @@ async fn reconcile_persisted_custom_nodes(
         // The next pass after the tenant is active again relaunches it. When this hive cannot tell
         // (identity still coming up at boot), the node goes on as before, as in run, start and
         // restart (`tenant_gate_refusal`).
-        match tenant_gate(&state.hive_id, persisted_tenant.as_deref()) {
+        match tenant_gate(&state.hive_id, node_tenant.as_deref()) {
             TenantGate::Open => {}
             TenantGate::Closed(status) => {
                 skipped = skipped.saturating_add(1);
                 tracing::info!(
                     node_name = node.node_name,
-                    tenant_id = persisted_tenant.as_deref().unwrap_or_default(),
+                    tenant_id = node_tenant.as_deref().unwrap_or_default(),
                     tenant_status = status,
                     "persisted custom node not relaunched: its tenant is not active"
                 );
@@ -1983,7 +1989,7 @@ async fn reconcile_persisted_custom_nodes(
             TenantGate::Unknown(reason) => {
                 tracing::warn!(
                     node_name = node.node_name,
-                    tenant_id = persisted_tenant.as_deref().unwrap_or_default(),
+                    tenant_id = node_tenant.as_deref().unwrap_or_default(),
                     reason = reason,
                     "cannot tell whether the node's tenant is active; relaunching it as before"
                 );
@@ -18391,6 +18397,8 @@ struct ManagedNodeLaunchPlan {
     /// now X" from "you are pinned to X".
     requested_version: String,
     entrypoint: RuntimeSpawnEntrypoint,
+    /// The node's tenant: from the identity map, else from its config.
+    tenant: Option<String>,
 }
 
 fn managed_node_launch_plan(
@@ -18528,13 +18536,6 @@ fn managed_node_launch_plan(
     if let Some(refusal) = genesis_refusal(node_name, &runtime_key, tenant.as_deref()) {
         return Err(refusal);
     }
-    if let Some(refusal) = tenant_gate_refusal(
-        node_name,
-        tenant.as_deref(),
-        &tenant_gate(&state.hive_id, tenant.as_deref()),
-    ) {
-        return Err(refusal);
-    }
     validate_wf_runtime_spawn_contract(
         &manifest,
         &runtime_key,
@@ -18589,6 +18590,7 @@ fn managed_node_launch_plan(
         resolved_version,
         requested_version,
         entrypoint,
+        tenant,
     })
 }
 
@@ -18741,6 +18743,14 @@ async fn start_or_restart_node_flow(
             "unit": plan.unit,
             "visible_in_router": visible_in_router,
         });
+    }
+    // Before anything is stopped or started: a restart refused here leaves the node running.
+    if let Some(refusal) = tenant_gate_refusal(
+        &plan.node.node_name,
+        plan.tenant.as_deref(),
+        &tenant_gate(&state.hive_id, plan.tenant.as_deref()),
+    ) {
+        return refusal;
     }
 
     let cmd = if restart {
@@ -31051,28 +31061,61 @@ blob:
         assert_eq!(tenant_gate("motherbee", Some("  ")), TenantGate::Open);
     }
 
-    /// Every launch path checks the tenant gate next to the genesis rule, and the relaunch checks
-    /// both before it moves a node's version.
+    /// Every launch path checks the tenant gate before it registers, forwards, stops or starts
+    /// anything, so a refused node is never stopped (its order in the source, which is the order it
+    /// runs in).
     #[test]
-    fn every_launch_path_checks_the_tenant_gate() {
+    fn every_launch_path_checks_the_tenant_gate_before_it_acts() {
         let src = include_str!("sy_orchestrator.rs");
         let body = |name: &str| {
             let start = src.find(name).expect(name);
-            let end = src[start..].find("\n}\n").map(|o| start + o).expect("its end");
+            let end = src[start..]
+                .find("\n}\n")
+                .map(|o| start + o)
+                .expect("its end");
             &src[start..end]
         };
-        for name in ["async fn run_node_flow(", "fn managed_node_launch_plan("] {
+        let in_order = |name: &str, marks: &[&str]| {
             let body = body(name);
-            let genesis = body.find("genesis_refusal(").expect(name);
-            let gate = body.find("tenant_gate_refusal(").expect(name);
-            assert!(genesis < gate, "{name}");
-        }
-        let reconcile = body("async fn reconcile_persisted_custom_nodes(");
-        let gate = reconcile.find("match tenant_gate(").expect("reconcile gate");
-        let persist = reconcile
-            .find("persist_node_runtime_version(")
-            .expect("version persist");
-        assert!(gate < persist, "a refused node keeps its version");
+            let at: Vec<usize> = marks
+                .iter()
+                .map(|mark| body.find(mark).unwrap_or_else(|| panic!("{name}: {mark}")))
+                .collect();
+            assert!(
+                at.windows(2).all(|w| w[0] < w[1]),
+                "{name}: {marks:?} at {at:?}"
+            );
+        };
+        in_order(
+            "async fn run_node_flow(",
+            &[
+                "genesis_refusal(",
+                "tenant_gate_refusal(",
+                "forward_system_action_to_hive(",
+                "ensure_node_identity_registered(",
+                "execute_on_hive(",
+            ],
+        );
+        in_order(
+            "async fn start_or_restart_node_flow(",
+            &[
+                "managed_node_launch_plan(",
+                "\"already_running\"",
+                "tenant_gate_refusal(",
+                "managed_node_restart_command(",
+                "execute_on_hive(",
+            ],
+        );
+        in_order(
+            "async fn reconcile_persisted_custom_nodes(",
+            &[
+                "genesis_refusal(",
+                "match tenant_gate(",
+                "persist_node_runtime_version(",
+                "clear_stale_transient_unit(",
+                "execute_on_hive(",
+            ],
+        );
     }
 
     /// A start or restart reads the node's tenant from the identity map, else from its config.
@@ -31239,6 +31282,7 @@ blob:
                     .to_string(),
                 runtime_base: None,
             },
+            tenant: None,
         };
         let state = sample_orchestrator_state_for_tests();
         let cmd = managed_node_restart_command(&state, &plan, true);
@@ -31766,6 +31810,7 @@ blob:
                     .to_string(),
                 runtime_base: Some("wf.engine".to_string()),
             },
+            tenant: None,
         };
 
         let state = sample_orchestrator_state_for_tests();

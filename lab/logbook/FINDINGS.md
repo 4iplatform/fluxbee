@@ -1026,14 +1026,33 @@ Visto al arreglar los e2e de A-37, leyendo `src/router/mod.rs` y `src/shm/mod.rs
     - restaurarlo lo devuelve tal cual;
     - purgarlo se rechaza mientras tenga personas cargadas (`TENANT_HAS_PEOPLE`); las marcadas por
       su lado se van con él;
-    - `set_ilk_tenant` mueve también temporales, y desde un tenant borrado;
-    - `restore_ilk` devuelve a una persona aunque su tenant esté borrado.
+    - `set_ilk_tenant` mueve también temporales, pero solo desde un tenant borrado: el frontdesk
+      registra a un temporal en el caso del tenant al que le escribió;
+    - `restore_ilk` devuelve a una persona aunque su tenant esté borrado;
+    - la migración v4 desmarca, en cada arranque, a quien marcó una cascada vieja (su id queda en
+      el log).
   - **io.api `by_ilk` (D12):** personas cargadas al tenant o con un canal en su espacio.
   - **Admin y Cloud:** `TENANT_HAS_PEOPLE` y `TENANT_NOT_ACTIVE` son 409; los textos de las
     acciones y el catálogo de Cloud.
+- **Revisión (una ronda): 2 mayores, 2 menores, 4 detalles.**
+  - **Mayor 1:** las personas que una cascada vieja había marcado (hasta 0.1.66) se iban con la
+    purga como si se hubieran borrado solas, y restaurar su tenant ya no las traía. Arreglado con la
+    migración v4. En PROD no había ninguna.
+  - **Mayor 2:** mover un temporal de un tenant activo cortaba su registro: el frontdesk rechaza el
+    caso si el tenant de la persona no es el del IO que la atiende (`tenant_mismatch`). Ahora un
+    temporal se mueve solo desde un tenant borrado.
+  - **Arreglados también:**
+    - el relanzamiento lee el tenant de la config si falta en el mapa, como start y restart;
+    - `start_node` de un nodo que ya corre contesta `already_running`;
+    - un temporal fusionado en otro ILK no cuenta como persona del tenant;
+    - los textos del HANDBOOK y de io.cloud que describían la cascada;
+    - un test que fija el orden: el chequeo va antes de registrar, reenviar, parar o arrancar.
 - **Sin código, documentado:**
   - el router no corta el tráfico de un tenant suspendido: sería una búsqueda en cada mensaje, en
     el camino más cargado, y suma poco a lo anterior;
+  - un workflow desplegado sobre un tenant suspendido: wf-rules escribe la versión nueva en la
+    config, el reinicio se rechaza y wf-rules reporta `restart_failed`. Al reactivar nada lo
+    reinicia, así que sigue con el paquete viejo hasta un reinicio;
   - un nodo que corre en un tenant suspendido durante un upgrade sigue en la versión vieja. Si se
     cae, systemd no lo puede relanzar (su directorio ya no está), y el relanzamiento periódico lo
     levanta en la nueva cuando el tenant vuelve a estar activo.

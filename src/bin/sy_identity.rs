@@ -1672,6 +1672,8 @@ impl IdentityStore {
     /// signups alike. Nothing that happens to their tenant marks or removes them; purging it waits
     /// until they are charged elsewhere (operator, 2026-10-14: *"no quiero borrar ni desaparecer
     /// ilk de humanos"*).
+    /// A temporary merged into another ILK is not one: it is an alias of that ILK until the alias
+    /// expires, and it goes with a purge.
     fn tenant_people(&self, tenant_id: &str) -> Vec<String> {
         let mut out: Vec<String> = self
             .ilks
@@ -1680,6 +1682,7 @@ impl IdentityStore {
                 ilk.tenant_id == tenant_id
                     && ilk.deleted_at_ms.is_none()
                     && ilk.ilk_type.trim() == "human"
+                    && !self.aliases.contains_key(&ilk.ilk_id)
             })
             .map(|ilk| ilk.ilk_id.clone())
             .collect();
@@ -1688,10 +1691,12 @@ impl IdentityStore {
     }
 
     /// ILK_SET_TENANT: charge a person to another tenant, their cost center
-    /// (docs/ilk-tenant-model-v1.md §2.1). Any person who is not marked, complete or temporary
-    /// (stage 3: a tenant's contacts can be moved out before it is purged); never a node (D6). Every
-    /// check runs before anything changes; channels keep their scope, so no key moves. Answers the
-    /// change for the history table, or none when the ILK is already charged there.
+    /// (docs/ilk-tenant-model-v1.md §2.1); never a node (D6). An account moves from anywhere. A
+    /// temporary is a contact of the tenant it wrote to, whose frontdesk registers it in that
+    /// tenant's case, so it moves only out of a deleted tenant: that is how a tenant is emptied
+    /// before its purge (stage 3). Every check runs before anything changes; channels keep their
+    /// scope, so no key moves. Answers the change for the history table, or none when the ILK is
+    /// already charged there.
     fn set_ilk_tenant(
         &mut self,
         req: &IlkSetTenantRequest,
@@ -1727,6 +1732,15 @@ impl IdentityStore {
                 json!({"status": "ok", "ilk_id": req.ilk_id, "tenant_id": target,
                        "previous_tenant_id": previous, "changed": false}),
                 None,
+            ));
+        }
+        if ilk.registration_status != "complete" && !self.tenant_is_deleted(&previous) {
+            return Err(lifecycle_error(
+                "INVALID_TENANT_TRANSITION",
+                &format!(
+                    "a temporary is registered in the case of {previous}, the tenant it wrote to; \
+                     it is charged elsewhere only once that tenant is deleted"
+                ),
             ));
         }
         // Email is still unique per tenant (in memory and in the DB): another person holding it
@@ -6877,8 +6891,8 @@ fn map_unique_constraint_code(constraint: &str) -> &'static str {
 /// (a temporary, a node, a marked one) holds it there. People still charged to the root tenant
 /// with an account are listed too: IO.cloud answers ACCOUNT_IN_ROOT_TENANT for them until the
 /// operator reassigns or purges them. So are the pending signups left charged to a deleted tenant:
-/// the next signup of their email takes them over, or purging the tenant removes them. The report
-/// names ILK ids, never the emails.
+/// the next signup of their email takes them over, or they are charged elsewhere before the tenant
+/// is purged. The report names ILK ids, never the emails.
 fn report_account_scopes(store: &mut IdentityStore) {
     let mut holders: HashMap<String, HashSet<String>> = HashMap::new();
     let mut root_charged: Vec<String> = Vec::new();
@@ -7598,6 +7612,74 @@ ON CONFLICT (version) DO NOTHING;
         .await?;
         tx.commit().await?;
     }
+    // v4 -- deleting a tenant marks no ILK (docs/ilk-tenant-model-v1.md §2.3, stage 3). Until 0.1.66
+    // it marked the ILKs charged to it (reason `tenant`): they come back, still charged to their
+    // tenant, as if it had been deleted under today's rule. Every boot, before the store loads;
+    // idempotent. A channel key is unique in the DB counting marked rows, so un-marking collides
+    // with none; an email is unique among active rows only, so an ILK whose email another active
+    // ILK of its tenant now holds stays marked (one per email), and both lists are logged by id.
+    let (unmarked, left_marked) = {
+        let tx = client.transaction().await?;
+        let unmarked = tx
+            .query(
+                r#"
+WITH free AS (
+    SELECT DISTINCT ON (coalesce(i.email, i.ilk_id::text), i.tenant_id) i.ilk_id
+    FROM identity_ilks i
+    WHERE i.deleted_reason = 'tenant'
+      AND i.node_name IS NULL
+      AND NOT EXISTS (
+          SELECT 1 FROM identity_ilks o
+          WHERE o.deleted_at IS NULL
+            AND i.email IS NOT NULL
+            AND o.email = i.email
+            AND o.tenant_id = i.tenant_id)
+    ORDER BY coalesce(i.email, i.ilk_id::text), i.tenant_id, i.ilk_id
+)
+UPDATE identity_ilks
+SET deleted_at = NULL, deleted_reason = NULL
+WHERE ilk_id IN (SELECT ilk_id FROM free)
+RETURNING ilk_id::text
+"#,
+                &[],
+            )
+            .await?;
+        let left_marked = tx
+            .query(
+                "SELECT ilk_id::text FROM identity_ilks WHERE deleted_reason = 'tenant' ORDER BY 1",
+                &[],
+            )
+            .await?;
+        tx.execute(
+            "INSERT INTO identity_schema_migrations (version, name) VALUES (4, 'tenant_marks_no_ilk') \
+             ON CONFLICT (version) DO NOTHING",
+            &[],
+        )
+        .await?;
+        tx.commit().await?;
+        let ids = |rows: Vec<tokio_postgres::Row>| -> Vec<String> {
+            rows.iter()
+                .map(|row| format!("ilk:{}", row.get::<_, String>(0)))
+                .collect()
+        };
+        (ids(unmarked), ids(left_marked))
+    };
+    if !unmarked.is_empty() {
+        tracing::warn!(
+            count = unmarked.len(),
+            ilks = ?unmarked,
+            "migration v4: un-marked the ILKs an old tenant delete had marked; they stay charged \
+             to their tenant"
+        );
+    }
+    if !left_marked.is_empty() {
+        tracing::warn!(
+            count = left_marked.len(),
+            ilks = ?left_marked,
+            "migration v4: these ILKs an old tenant delete marked stay marked, because an active \
+             ILK of their tenant now holds their email; restore or purge them on purpose"
+        );
+    }
     let _ = client
         .execute(
             "SELECT pg_advisory_unlock($1)",
@@ -7605,7 +7687,7 @@ ON CONFLICT (version) DO NOTHING;
         )
         .await;
 
-    tracing::info!("identity primary schema ensured (migrations through v3, channel_scope)");
+    tracing::info!("identity primary schema ensured (migrations through v4, tenant_marks_no_ilk)");
     Ok(())
 }
 
@@ -11899,21 +11981,13 @@ mod tests {
             "DUPLICATE_EMAIL"
         );
         assert_eq!(store.ilks[&ana].tenant_id, LC_TENANT);
-        // A temporary is charged elsewhere too (stage 3), and its channel keeps its scope.
+        // A temporary of an active tenant stays: its frontdesk registers it in that tenant's case.
         let temp = rg_provision(&mut store, LC_TENANT, "slack", "U6");
-        let (ok, change) = store
+        let err = store
             .set_ilk_tenant(&sc_set_tenant(&temp, SC_OTHER), "x")
-            .expect("a temporary moves");
-        assert_eq!(
-            (ok["changed"].clone(), change.is_some()),
-            (json!(true), true)
-        );
-        assert_eq!(
-            store
-                .ich_lookup
-                .get(&canonical_ich_key("slack", "U6", LC_TENANT)),
-            Some(&temp)
-        );
+            .unwrap_err();
+        assert!(err.starts_with("INVALID_TENANT_TRANSITION|"), "{err}");
+        assert_eq!(store.ilks[&temp].tenant_id, LC_TENANT);
         // A node never is (D6).
         let mut node = ilk_for(
             "IO.slack@motherbee",
@@ -11927,6 +12001,55 @@ mod tests {
                 .unwrap_err(),
             "ILK_TYPE_MISMATCH"
         );
+    }
+
+    /// Stage 3: a temporary is charged elsewhere only out of a deleted tenant, to empty it before
+    /// its purge; its channel keeps its scope.
+    #[test]
+    fn a_temporary_moves_only_out_of_a_deleted_tenant() {
+        let mut store = sc_store();
+        let temp = rg_provision(&mut store, LC_TENANT, "slack", "U8");
+        assert!(store
+            .set_ilk_tenant(&sc_set_tenant(&temp, SC_OTHER), "x")
+            .unwrap_err()
+            .starts_with("INVALID_TENANT_TRANSITION|"));
+        store
+            .delete_tenant(lc_tenant(LC_TENANT), 1)
+            .expect("delete");
+        let (ok, change) = store
+            .set_ilk_tenant(&sc_set_tenant(&temp, SC_OTHER), "x")
+            .expect("out of a deleted tenant");
+        assert_eq!(
+            (ok["changed"].clone(), change.is_some()),
+            (json!(true), true)
+        );
+        assert_eq!(
+            store
+                .ich_lookup
+                .get(&canonical_ich_key("slack", "U8", LC_TENANT)),
+            Some(&temp)
+        );
+    }
+
+    /// A temporary merged into another ILK is an alias, not a person: it neither counts nor blocks
+    /// its tenant's purge.
+    #[test]
+    fn a_merged_temporary_is_not_one_of_the_tenants_people() {
+        let mut store = sc_store();
+        let shell = rg_provision(&mut store, LC_TENANT, "slack", "U10");
+        store.aliases.insert(
+            shell.clone(),
+            AliasRecord {
+                canonical_ilk_id: "ilk:77777777-7777-4777-8777-777777777777".to_string(),
+                expires_at_ms: u64::MAX,
+            },
+        );
+        assert!(store.tenant_people(LC_TENANT).is_empty());
+        store
+            .delete_tenant(lc_tenant(LC_TENANT), 1)
+            .expect("delete");
+        let (ok, _) = store.purge_tenant(lc_tenant(LC_TENANT)).expect("purge");
+        assert_eq!(ok["purged_ilks"], 1);
     }
 
     #[test]
