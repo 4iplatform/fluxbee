@@ -18,7 +18,9 @@ tres, sin la charla no sale nada más que código basura"*.
   installation. An ILK is never duplicated because of a tenant. Operator: *"la identidad dentro del
   sistema es prioridad a todo, no veo bien resolver esto creando miles de ilk para lo mismo"*.
 - **A tenant is a cost center: a record of spending.**
-  - It is usually a company, not always (operator, 2026-10-14).
+  - It is a deployment or workspace of the system, an internal ID, never a company. Cloud
+    associates each company with a tenant (today one to one; the future is open), and Fluxbee
+    sees only the tenant (operator, 2026-10-15).
   - Each ILK is charged to exactly one tenant at any moment, and it can be reassigned, explicitly
     and with a record.
   - Fluxbee records what is spent and under which tenant. Who pays, which company or legal entity a
@@ -381,16 +383,75 @@ that is, wrote to its WhatsApp, its Slack or its API. The channel, each company'
 - **The root tenant** is the installation's own cost center: system nodes.
 - **Docs:** "every ILK belongs to exactly one tenant" became "is charged to" (`docs/10-identity-v2.md`).
 
-### 2.4 Cloud (stage 4; parts ship with stages 1–3)
+### 2.4 Cloud (stage 4)
 
-IO.cloud applies all of the above:
-- `set_ilk_tenant`;
-- reads by id without a tenant filter;
-- `register_human` with account semantics, and `get_ilk` by email answering the one account;
-- `delete_ilk`/`restore_ilk` for people only;
-- lists per cost center;
-- credentials per stage 2;
-- the tenant status that Cloud sets (activate, suspend).
+Decided with the operator on 2026-10-15.
+
+**What Cloud is.**
+- **Its role:** the business layer. It associates companies with tenants and registered users with
+  person ILKs, and it manages credentials.
+- **Its nodes:** it launches IO nodes only so a credential has somewhere to live. Operator: *"el
+  nodo lo lanza porque sino el token no se puede cargar"*.
+- **Not Cloud's:** the infrastructure is the operator's, through Archi: solutions, configuration,
+  routing, rules, starting and stopping nodes Cloud did not launch.
+- **Every Cloud op is an admin action** that IO.cloud relays to SY.admin. Three IO exceptions
+  stay:
+  - `register_human` provisions the person's temporary and hands the case to the frontdesk, as
+    every IO node does;
+  - the fast reads of the identity SHM;
+  - a node reads its own credential from SY.vault.
+
+**Tenants: everything but the genesis tenant.**
+- **Already there:** create, update the name and domain, delete (disable) and restore.
+- **New:**
+  - `update_tenant` also takes `status` (`active` or `suspended`), `sponsor_tenant_id` and
+    `settings`. `pending` stays the operator's.
+  - `get_tenant` becomes an admin relay and answers the whole record: name, domain, status,
+    settings, sponsor, whether it is deleted, and how many people and nodes are charged to it.
+  - `list_tenants`: every tenant but the genesis tenant, deleted ones flagged, so Cloud can
+    restore them.
+- **The purge** stays the operator's: maintenance.
+
+**People: unchanged.** `register_human` (through the frontdesk), the reads, `set_ilk_tenant`,
+`delete_ilk` and `restore_ilk`. They are the interface to registered users. Operator: *"sobre los
+ilk humanos también, porque es la interfaz contra usuarios humanos registrados"*.
+
+**Credentials: unchanged.** Everything but reading a value: store (a new value is a token change for
+the same node), assign, list, delete.
+
+**Nodes: what Cloud launched.**
+- **The lifecycle:** Cloud launches IO nodes (`provision_node`). For the nodes it launched, and only
+  those, it starts, stops and deletes them. Operator: *"son nodos que crea el usuario en cloud, él
+  decide si los quiere o no"*.
+  - `start_node` and `stop_node`.
+  - `delete_node`: the kill with the full teardown the operator's purge does. Its own secrets,
+    its identity and its timers go, and the name is free again. Secrets only assigned to it stay:
+    they are the tenant's.
+- **Who launched a node is recorded:** `_system.launched_by`, which SY.admin stamps: `cloud` for
+  the IO.cloud relay. Cloud's start, stop and delete answer `NODE_NOT_FOUND` for any other node,
+  as for another tenant's key.
+- **The reads:**
+  - `list_nodes`: every node charged to its tenant on every hive, with name, hive, runtime and
+    version, lifecycle state, health, ILK and who launched it;
+  - `get_node_status`: one node.
+- **A stop lasts (a fix for everyone):** today a kill without purge stops the process, and the
+  60 s relaunch brings it back. A stop now clears `relaunch_on_boot` and a start sets it again. A
+  node that dies on its own is still relaunched.
+- **Health:** whether a node runs comes from the orchestrator, for every node. Its health is what
+  the node reports, and IO nodes from older eras may answer unknown: the IO family is still to be
+  normalized.
+
+**Cutting access, from the narrowest to the widest:**
+- unassign or delete a credential;
+- stop or delete a node Cloud launched;
+- suspend the tenant.
+
+**The words:** Fluxbee's docs say tenant, never company. `docs/io-cloud-api.md` is reworded with
+this stage.
+
+**Shipped before, in stages 1–3:** `set_ilk_tenant`; reads by id without a tenant filter;
+`register_human` with account semantics; `delete_ilk` and `restore_ilk` for people only; lists per
+cost center; credentials per stage 2.
 
 `docs/io-cloud-api.md` and the Cloud team's note follow each stage.
 
@@ -424,7 +485,7 @@ Every stage goes through:
 | 1 | ILK structure (§2.1) and its IO.cloud part. | On PROD, through Cloud's public door: <br>• the same email registered from two tenants gives one ILK; <br>• `set_ilk_tenant` moves the person, and the person's `cloud` and IO channels still resolve; <br>• the person keeps their channels after an identity restart (DB reload); <br>• worker1's identity replica shows the new tenant; <br>• a read by id across tenants works, and Cloud is refused a node's ILK on delete; <br>• a tenant with an account charged is refused (`TENANT_HAS_ACCOUNTS`), and purging the tenant a person left drops their keys there; <br>• the migration on data made with 0.1.64: a unique email moves, an email in two tenants is reported and refused (`ACCOUNT_AMBIGUOUS`). |
 | 2 | Secrets (§2.2). | On PROD: <br>• a company's token assigned to two of its nodes reaches both and not a third; unassigned, one stops at once; <br>• a general token reaches every node of its company and none of another; <br>• a suspended or deleted tenant's secrets are not handed out, and come back when it is reactivated; <br>• a person's secret assigned to a node reaches it, and the person's reassignment changes nothing; <br>• the genesis tenant refuses an AI node, and the core still reads its keys after a restart; <br>• a node's tenant cannot change; <br>• Cloud stores, assigns and lists through the public door. |
 | 3 | Tenant firm (§2.3). | On PROD: <br>• suspended, a tenant's node does not start or restart and the running one keeps running without secrets; one that dies is not relaunched; reactivated, it is; <br>• deleted with people charged, nobody is marked and they still resolve; a person comes back while it is deleted; restored, it is as it was; <br>• a purge with people charged is refused, and goes once they are charged elsewhere (a temporary included, out of the deleted tenant). |
-| 4 | Cloud (§2.4), whatever did not ship with 1–3. | The contract doc checked live. |
+| 4 | Cloud (§2.4). | On PROD, through the public door: <br>• Cloud suspends a tenant: its nodes get no secrets and a new one is refused; reactivated, they work; <br>• `get_tenant` and `list_tenants` answer the whole record; <br>• a node Cloud launched shows in `list_nodes`; stopped, it stays down past a relaunch pass; started, it runs; deleted, its own secret and its identity are gone and its name is free; <br>• a node Cloud did not launch is refused to Cloud; <br>• the contract doc checked live; <br>• `a5f1b2a`: a refused `set_ilk_tenant` answers its code alone. |
 | 5 | Tokens (§2.5). | Designed first. |
 
 ---
@@ -446,6 +507,7 @@ Every stage goes through:
 | D11 | A pending signup is readable as such (`pending_signup`), wherever it is charged. | Decided 2026-10-14 |
 | D12 | io.api `by_ilk` acts for the people the tenant knows: charged to it, or holding a channel in its scope. | Decided 2026-10-14, stage 3 (0.1.67) |
 | D13 | A contact is charged to the company it wrote to. Only an email joins two ILKs: the same email means a merge, triggered by what the person provides; until then two ILKs coexist. | Direction set 2026-10-15. Within one tenant the merge by email exists (2026-10-02); across tenants it is open, not designed |
+| D14 | Cloud is the business layer: tenants (everything but the genesis tenant), people, credentials (all but reading a value) and the IO nodes it launched (start, stop, delete). The infrastructure is the operator's, through Archi. Every Cloud op is an admin action. | Decided 2026-10-15 |
 
 ## 5. Related
 
