@@ -90,6 +90,15 @@ enum VaultError {
     /// dropping it during an identity outage. A deleted tenant has no node left to ask.
     #[error("the secret's tenant {0}")]
     TenantUnknown(String),
+    /// The caller's `meta.src_ilk` is not the ILK registered for the node the router says sent the
+    /// request (`routing.src_l2_name`, which the node cannot choose). Without this check any node
+    /// could claim another's ILK and read its secrets, or claim SY.admin's and write any.
+    #[error("caller {0}")]
+    CallerMismatch(String),
+    /// The caller's ILK is not in the identity SHM, or the SHM cannot be read: retryable, since a
+    /// degraded identity start writes only the system's ILKs.
+    #[error("caller {0}")]
+    CallerUnknown(String),
     #[error("no previous version available")]
     NoPreviousVersion,
     #[error("storage error: {0}")]
@@ -103,13 +112,17 @@ impl VaultError {
         match self {
             VaultError::InvalidMasterKey(_) => "MASTER_KEY_NOT_AVAILABLE",
             VaultError::InvalidRequest(_) => "INVALID_REQUEST",
-            VaultError::Unauthorized | VaultError::TenantNotActive(_) => "UNAUTHORIZED",
+            VaultError::Unauthorized
+            | VaultError::TenantNotActive(_)
+            | VaultError::CallerMismatch(_) => "UNAUTHORIZED",
             VaultError::KeyNotFound | VaultError::KeyNotFoundInTenant => "KEY_NOT_FOUND",
             VaultError::KeyTaken => "KEY_TAKEN",
             VaultError::NoPreviousVersion => "NO_PREVIOUS_VERSION",
             VaultError::Sqlite(_) | VaultError::Storage(_) => "STORAGE_ERROR",
             VaultError::Encryption => "ENCRYPTION_ERROR",
-            VaultError::Identity(_) | VaultError::TenantUnknown(_) => "IDENTITY_UNAVAILABLE",
+            VaultError::Identity(_)
+            | VaultError::TenantUnknown(_)
+            | VaultError::CallerUnknown(_) => "IDENTITY_UNAVAILABLE",
             VaultError::Io(_) => "IO_ERROR",
             VaultError::Json(_) => "INVALID_VALUE",
             VaultError::Node(_) => "NODE_ERROR",
@@ -428,8 +441,35 @@ async fn handle_vault_message(
     msg: &Message,
 ) -> VaultResult<()> {
     let action = msg.meta.msg.as_deref().unwrap_or_default();
-    let caller = resolve_caller(config_dir, msg)?;
     let response_action = response_action_for(action);
+    let caller = match resolve_caller(config_dir, msg) {
+        Ok(caller) => caller,
+        Err(err) => {
+            // Answered and audited like any refusal, never dropped: the caller must not wait.
+            let claimed = Caller {
+                l2_name: msg.source_l2_name().map(ToString::to_string),
+                ilk_id: msg.meta.src_ilk.clone(),
+                ..Caller::default()
+            };
+            tracing::warn!(
+                action,
+                caller_l2_name = ?claimed.l2_name,
+                caller_ilk = ?claimed.ilk_id,
+                error = %err,
+                "vault request refused: the caller's ILK is not bound to the sending node"
+            );
+            let key = request_key(&msg.payload);
+            let _ = store.audit(
+                action,
+                key.as_deref(),
+                &claimed,
+                audit_result_for_error(&err),
+                Some(err.code()),
+            );
+            send_system_response(sender, msg, response_action, error_payload(&err)).await?;
+            return Ok(());
+        }
+    };
     let result = match action {
         MSG_VAULT_PUT => handle_put(store, msg, &caller, well_known_admin_ilks, hive_id),
         MSG_VAULT_GET => handle_get(
@@ -1551,26 +1591,76 @@ fn audit_with_tx(
 /// `ilk_type` by reading identity SHM. If the caller's ILK is not yet in
 /// SHM (identity at boot, fresh node), tenant/ilk_type stay `None` and
 /// downstream auth falls back to direct ILK-equality match.
+/// Who is asking: the router-stamped node name and the ILK the request claims, which must be the
+/// one registered for that node (`check_caller_binding`), enriched with its tenant and type from the
+/// identity SHM. A request with no ILK goes on unresolved: it reads nothing but what is open.
 fn resolve_caller(config_dir: &Path, msg: &Message) -> VaultResult<Caller> {
-    let l2_name = msg.source_l2_name().map(ToString::to_string);
-    let ilk_id = msg.meta.src_ilk.clone();
+    let l2_name = msg
+        .source_l2_name()
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .map(ToString::to_string);
+    let ilk_id = msg
+        .meta
+        .src_ilk
+        .as_deref()
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .map(ToString::to_string);
     let mut caller = Caller {
-        l2_name,
+        l2_name: l2_name.clone(),
         ilk_id: ilk_id.clone(),
         tenant_id: None,
         ilk_type: None,
     };
-    if let Some(ilk_id) = ilk_id {
-        // Best-effort enrichment from SHM; missing is fine, downstream auth
-        // handles unresolved callers.
-        if let Ok(snapshot) = list_ilks_from_hive_config(config_dir) {
-            if let Some(ilk) = snapshot.ilks.into_iter().find(|ilk| ilk.ilk_id == ilk_id) {
-                caller.tenant_id = Some(ilk.tenant_id);
-                caller.ilk_type = Some(ilk.ilk_type);
-            }
-        }
+    let Some(ilk_id) = ilk_id else {
+        return Ok(caller);
+    };
+    let snapshot = list_ilks_from_hive_config(config_dir).ok();
+    let registered = snapshot
+        .as_ref()
+        .and_then(|snapshot| snapshot.ilks.iter().find(|ilk| ilk.ilk_id == ilk_id));
+    check_caller_binding(l2_name.as_deref(), &ilk_id, registered)?;
+    if let Some(ilk) = registered {
+        caller.tenant_id = Some(ilk.tenant_id.clone());
+        caller.ilk_type = Some(ilk.ilk_type.clone());
     }
     Ok(caller)
+}
+
+/// The claimed ILK must be the sending node's (io.web spec §21, phase 0): a system node's is derived
+/// from its name, so it proves itself without the SHM (the core reads its keys at boot); any other
+/// node's is the one identity registered for its name. `registered` is the SHM's entry for the
+/// claimed ILK, if any.
+fn check_caller_binding(
+    l2_name: Option<&str>,
+    ilk_id: &str,
+    registered: Option<&fluxbee_sdk::identity::IdentityIlkOption>,
+) -> VaultResult<()> {
+    let Some(l2_name) = l2_name else {
+        return Err(VaultError::CallerMismatch(format!(
+            "claims {ilk_id} without a router-stamped node name"
+        )));
+    };
+    if l2_name.starts_with("SY.") && fluxbee_sdk::deterministic_system_ilk_id(l2_name) == ilk_id {
+        return Ok(());
+    }
+    match registered {
+        Some(ilk)
+            if ilk
+                .handler_node
+                .as_deref()
+                .is_some_and(|node| node.trim().eq_ignore_ascii_case(l2_name)) =>
+        {
+            Ok(())
+        }
+        Some(_) => Err(VaultError::CallerMismatch(format!(
+            "{l2_name} claims {ilk_id}, which identity registered for another node"
+        ))),
+        None => Err(VaultError::CallerUnknown(format!(
+            "{l2_name} claims {ilk_id}, which the identity SHM does not hold (yet)"
+        ))),
+    }
 }
 
 /// Model D' read authorization (vault_get plaintext + vault_get_metadata
@@ -1701,6 +1791,8 @@ fn audit_result_for_error(err: &VaultError) -> &'static str {
         VaultError::Unauthorized
         | VaultError::TenantNotActive(_)
         | VaultError::TenantUnknown(_)
+        | VaultError::CallerMismatch(_)
+        | VaultError::CallerUnknown(_)
         | VaultError::KeyNotFoundInTenant
         | VaultError::KeyTaken => "denied",
         _ => "error",
@@ -2385,6 +2477,50 @@ mod tests {
         // A malformed tenant id is refused, never retried forever.
         let err = tenant_check("tnt:client-a", || Ok(Some("active".to_string())))
             .expect_err("not a uuid");
+        assert_eq!(err.code(), "UNAUTHORIZED");
+    }
+
+    #[test]
+    fn a_caller_proves_its_ilk_belongs_to_the_node_that_sent_the_request() {
+        let registered = |ilk: &str, node: &str| fluxbee_sdk::identity::IdentityIlkOption {
+            ilk_id: ilk.to_string(),
+            tenant_id: "tnt:11111111-1111-4111-8111-111111111111".to_string(),
+            display_name: None,
+            handler_node: Some(node.to_string()),
+            registration_status: "complete".to_string(),
+            ilk_type: "agent".to_string(),
+            role_hash: None,
+            skill_hashes: Vec::new(),
+            handbook_hashes: Vec::new(),
+            personality_hash: None,
+        };
+        let admin = fluxbee_sdk::deterministic_system_ilk_id("SY.admin@motherbee");
+        // A system node proves its derived ILK by its name alone: no SHM at boot.
+        check_caller_binding(Some("SY.admin@motherbee"), &admin, None).expect("SY.admin at boot");
+        // A node's ILK is the one identity registered for its name (any case of the name).
+        let slack = registered("ilk:slack", "IO.slack.sales@motherbee");
+        check_caller_binding(Some("IO.slack.sales@motherbee"), "ilk:slack", Some(&slack))
+            .expect("its own");
+        check_caller_binding(Some("io.SLACK.sales@motherbee"), "ilk:slack", Some(&slack))
+            .expect("case");
+        // Claiming another node's ILK, SY.admin's included, is refused.
+        let err = check_caller_binding(Some("IO.slack.evil@motherbee"), "ilk:slack", Some(&slack))
+            .expect_err("another node's");
+        assert_eq!(err.code(), "UNAUTHORIZED");
+        assert_eq!(audit_result_for_error(&err), "denied");
+        let admin_entry = registered(&admin, "SY.admin@motherbee");
+        let err = check_caller_binding(Some("IO.slack.evil@motherbee"), &admin, Some(&admin_entry))
+            .expect_err("SY.admin's");
+        assert_eq!(err.code(), "UNAUTHORIZED");
+        let err = check_caller_binding(Some("SY.cognition@motherbee"), &admin, Some(&admin_entry))
+            .expect_err("another system node's");
+        assert_eq!(err.code(), "UNAUTHORIZED");
+        // An ILK the SHM does not hold: retryable, still nothing read.
+        let err = check_caller_binding(Some("IO.slack.new@motherbee"), "ilk:unknown", None)
+            .expect_err("unknown");
+        assert_eq!(err.code(), "IDENTITY_UNAVAILABLE");
+        // No router-stamped name: refused.
+        let err = check_caller_binding(None, "ilk:slack", Some(&slack)).expect_err("no name");
         assert_eq!(err.code(), "UNAUTHORIZED");
     }
 

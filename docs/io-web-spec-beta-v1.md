@@ -1431,7 +1431,9 @@ Audit registra actor router-stamped/Admin/Cloud authority y trace/request IDs.
 - congelar access token encoding/signing rotation;
 - definir binding catalog inicial;
 - definir row/messages/actions y authority gates;
-- cerrar el binding autoritativo `src_l2_name -> src_ilk` de Router/Vault y probar impersonation deny;
+- cerrar el binding autoritativo `src_l2_name -> src_ilk` de Router/Vault y probar impersonation deny
+  (Vault: hecho en 0.1.67, FINDINGS A-65; el router no lo necesita, porque en un mensaje de usuario
+  `src_ilk` es la persona y no el nodo);
 - threat review del proxy y DB connector.
 
 ### Fase 1 - IO.web static + proxy fijo

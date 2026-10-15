@@ -285,9 +285,9 @@ owner-less one is its tenant's general secret, as today.
 - io.linkedhelper reads its credential only at start and on CONFIG_SET: an unassignment or a
   suspension reaches it at its next restart. Its peers (io.slack, io.wapp) re-read on every change;
   align it when it is next touched.
-- The vault trusts the caller's `src_ilk`, which the node itself declares. Binding it to the
-  router-stamped name is the io.web phase-0 task (`docs/io-web-spec-beta-v1.md` §21), and it applies
-  equally to owned and assigned secrets.
+- (Closed in 0.1.67, FINDINGS A-65: the vault no longer trusts the caller's `src_ilk` as declared.
+  It must be the ILK of the node the router says sent the request: derived from its name for a
+  system node, registered for its name for any other.)
 
 ### 2.3 The tenant as a cost center (stage 3)
 

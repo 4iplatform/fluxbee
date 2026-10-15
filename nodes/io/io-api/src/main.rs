@@ -1381,10 +1381,11 @@ fn api_error(code: &str, detail: impl Into<String>) -> Value {
 /// `ilk_type` gate — a bearer holder may present ANY same-tenant ILK as the subject,
 /// including an agent/system ILK (the by_data path forces ilk_type=human, by_ilk does not).
 /// This is safe ONLY under the standing constraint that NO downstream consumer treats the
-/// forwarded `src_ilk` as an authenticated principal (it is a routing/attribution hint, and
-/// is inert as an authority today). If a downstream node ever begins trusting `src_ilk` as a
-/// principal (e.g. for vault/memory authorization), this gate MUST be revisited (add an
-/// ilk_type allowlist) BEFORE that lands. Tenant isolation is the load-bearing boundary here.
+/// forwarded `src_ilk` as an authenticated principal (it is a routing/attribution hint). SY.vault
+/// does read `src_ilk`, but only bound to the node the router says sent the request (0.1.67,
+/// FINDINGS A-65), so a subject forwarded from here never reads a secret as that ILK. If another
+/// node ever trusts `src_ilk` as a principal, this gate MUST be revisited (add an ilk_type
+/// allowlist) BEFORE that lands. Tenant isolation is the load-bearing boundary here.
 fn validate_explicit_subject_ilk(
     hive_id: &str,
     tenant_id: &str,
