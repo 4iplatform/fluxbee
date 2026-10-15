@@ -54,7 +54,7 @@ All entity identifiers follow a single convention across the entire system:
 
 ### 3.1 TNT (Tenant)
 
-A tenant is an organization, company, or account. It is the top-level partition of the system. Every ILK belongs to exactly one tenant.
+A tenant is a cost center: who pays for what is spent. It is usually a company, not always. Every ILK is charged to exactly one tenant at a time, and a person can be charged to another one (`ILK_SET_TENANT`). The tenant is not a permission (docs/ilk-tenant-model-v1.md).
 
 ```json
 {
@@ -96,7 +96,7 @@ An ILK is the unique identity of any entity that participates in messaging: huma
 **Rules:**
 
 - ILK is immutable once created (the UUID never changes).
-- Every ILK belongs to exactly one tenant.
+- Every ILK is charged to exactly one tenant at a time (its cost center); a node never changes tenant.
 - ILK persists across node restarts — same node_name = same ILK.
 - ILKs can be created through two actions:
   - `ILK_PROVISION` (IO nodes only): creates temporary ILKs for unknown channels.
@@ -417,7 +417,7 @@ When a tenant, an ILK or an alias changes, motherbee SY.identity sends the chang
 
 **Key design decision:** The temporary ILK is a real `ilk:<uuid-v4>` from the start. There are no pseudo-identifiers, no special format, no format inconsistencies. The only difference is `registration_status=temporary` which OPA uses to route to frontdesk.
 
-**Tenant of a registration:** the frontdesk takes it from the case, never from the person, the LLM, its own config or its environment, and never creates one (§6.4). SY.identity itself still accepts an `ILK_REGISTER` that moves a *temporary* ILK to another active tenant (a complete one answers `INVALID_TENANT_TRANSITION`); the frontdesk never asks for that.
+**Tenant of a registration:** the frontdesk takes it from the case, never from the person, the LLM, its own config or its environment, and never creates one (§6.4). A registration never changes an ILK's tenant (`INVALID_TENANT_TRANSITION`): a person is charged elsewhere only with `ILK_SET_TENANT`, which records it (docs/ilk-tenant-model-v1.md §2.1).
 
 **Nobody registers into the root tenant** (operator decision 2026-10-02). SY.identity refuses, with `TENANT_ROOT_NOT_REGISTRABLE` and before any merge by email, every `ILK_REGISTER` that would put a person in the root tenant: one with `ilk_type: human`, or one of an ILK that is a human one (such as a temporary, whatever `ilk_type` it asks for). Every caller gets it; the frontdesk answers it by itself (`TENANT_NOT_REGISTRABLE`), and io.cloud `register_human` refuses the root tenant before provisioning anything. Node ILKs (`agent`) still register there. `ILK_PROVISION` is not restricted: an IO node that sends no tenant still provisions the people who write in into the root tenant, and they stay `temporary`. Their messages keep reaching the frontdesk wherever the router force-routes temporaries to it (§14), and it answers that it cannot register them. Only io.cloud and io.blob run in the root tenant, and neither provisions people there; the orchestrator refuses any other IO node in it with `TENANT_ROOT_NOT_ALLOWED` (operator decision 2026-10-02). The frontdesk's answer stays as defense in depth.
 
@@ -1006,7 +1006,7 @@ For node spawn flows (`SY.orchestrator -> ILK_REGISTER`), this response is a har
 | `ILK_DELETED` | a marked ILK keeps that `node_name` (across the mesh) or email (in the tenant) reserved |
 | `ILK_NOT_FOUND` | the ILK being registered is marked deleted |
 | `SYSTEM_ILK_PROTECTED` | the ILK being registered is a system ILK |
-| `INVALID_TENANT_TRANSITION` | a complete ILK cannot change tenant |
+| `INVALID_TENANT_TRANSITION` | a registration never changes an ILK's tenant (`ILK_SET_TENANT` does, for people) |
 | `DUPLICATE_EMAIL` | the email belongs to another ILK of the tenant and the registration cannot merge (§6.5); also the DB unique index |
 | `DUPLICATE_NODE_NAME`, `DUPLICATE_ICH`, `DUPLICATE_CONSTRAINT` | a DB unique index |
 | `UNAUTHORIZED_REGISTRAR` | the sender is not allowed (§6.2) |

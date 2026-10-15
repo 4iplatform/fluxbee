@@ -1920,6 +1920,75 @@ async fn reconcile_persisted_custom_nodes(
                 continue;
             }
         };
+        let (persisted_ilk, persisted_tenant) =
+            load_persisted_node_identity(state, &node.node_name);
+        // FIX-5: if the on-disk node->ilk map is empty (a persist failed at spawn), do NOT relaunch
+        // blind — recover the identity from SY.identity's SHM by handler node and re-persist, so
+        // io.api comes up WITH its tenant/ilk instead of node_not_configured on every request.
+        let (persisted_ilk, persisted_tenant) =
+            if persisted_ilk.is_none() && persisted_tenant.is_none() {
+                match fluxbee_sdk::identity::find_ilk_by_handler_node_from_hive_id(
+                    &state.hive_id,
+                    &node.node_name,
+                ) {
+                    Ok(Some((_, ilk))) => {
+                        tracing::warn!(
+                            node_name = %node.node_name,
+                            ilk_id = %ilk.ilk_id,
+                            "reconcile: node->ilk map missing; recovered identity from SY.identity SHM and re-persisting"
+                        );
+                        let _ = persist_node_ilk_mapping(
+                            state,
+                            &node.node_name,
+                            &ilk.ilk_id,
+                            &ilk.tenant_id,
+                        );
+                        (Some(ilk.ilk_id), Some(ilk.tenant_id))
+                    }
+                    _ => (persisted_ilk, persisted_tenant),
+                }
+            } else {
+                (persisted_ilk, persisted_tenant)
+            };
+        // Checked before anything is stopped: a node that still runs is left running, not killed.
+        if let Some(refusal) =
+            genesis_refusal(&node.node_name, &runtime_key, persisted_tenant.as_deref())
+        {
+            failed = failed.saturating_add(1);
+            tracing::warn!(
+                node_name = node.node_name,
+                runtime = runtime_key,
+                payload = %refusal,
+                "persisted custom node not relaunched: only the core is born in the genesis tenant"
+            );
+            continue;
+        }
+        // A tenant that is not active cannot use the infrastructure (docs/ilk-tenant-model-v1.md
+        // §2.3): its node is neither relaunched nor rebound, and one that still runs keeps running.
+        // The next pass after the tenant is active again relaunches it. When this hive cannot tell
+        // (identity still coming up at boot), the node goes on as before, as in run, start and
+        // restart (`tenant_gate_refusal`).
+        match tenant_gate(&state.hive_id, persisted_tenant.as_deref()) {
+            TenantGate::Open => {}
+            TenantGate::Closed(status) => {
+                skipped = skipped.saturating_add(1);
+                tracing::info!(
+                    node_name = node.node_name,
+                    tenant_id = persisted_tenant.as_deref().unwrap_or_default(),
+                    tenant_status = status,
+                    "persisted custom node not relaunched: its tenant is not active"
+                );
+                continue;
+            }
+            TenantGate::Unknown(reason) => {
+                tracing::warn!(
+                    node_name = node.node_name,
+                    tenant_id = persisted_tenant.as_deref().unwrap_or_default(),
+                    reason = reason,
+                    "cannot tell whether the node's tenant is active; relaunching it as before"
+                );
+            }
+        }
         if version != node.runtime_version {
             // The pointer moved under a `current` node — say so plainly. This is the visible
             // sign that an upgrade propagated, and it is the line an operator should find when
@@ -1990,49 +2059,6 @@ async fn reconcile_persisted_custom_nodes(
             continue;
         }
 
-        let (persisted_ilk, persisted_tenant) =
-            load_persisted_node_identity(state, &node.node_name);
-        // FIX-5: if the on-disk node->ilk map is empty (a persist failed at spawn), do NOT relaunch
-        // blind — recover the identity from SY.identity's SHM by handler node and re-persist, so
-        // io.api comes up WITH its tenant/ilk instead of node_not_configured on every request.
-        let (persisted_ilk, persisted_tenant) =
-            if persisted_ilk.is_none() && persisted_tenant.is_none() {
-                match fluxbee_sdk::identity::find_ilk_by_handler_node_from_hive_id(
-                    &state.hive_id,
-                    &node.node_name,
-                ) {
-                    Ok(Some((_, ilk))) => {
-                        tracing::warn!(
-                            node_name = %node.node_name,
-                            ilk_id = %ilk.ilk_id,
-                            "reconcile: node->ilk map missing; recovered identity from SY.identity SHM and re-persisting"
-                        );
-                        let _ = persist_node_ilk_mapping(
-                            state,
-                            &node.node_name,
-                            &ilk.ilk_id,
-                            &ilk.tenant_id,
-                        );
-                        (Some(ilk.ilk_id), Some(ilk.tenant_id))
-                    }
-                    _ => (persisted_ilk, persisted_tenant),
-                }
-            } else {
-                (persisted_ilk, persisted_tenant)
-            };
-        // Checked before anything is stopped: a node that still runs is left running, not killed.
-        if let Some(refusal) =
-            genesis_refusal(&node.node_name, &runtime_key, persisted_tenant.as_deref())
-        {
-            failed = failed.saturating_add(1);
-            tracing::warn!(
-                node_name = node.node_name,
-                runtime = runtime_key,
-                payload = %refusal,
-                "persisted custom node not relaunched: only the core is born in the genesis tenant"
-            );
-            continue;
-        }
         // Free the unit name before relaunching.
         //
         // Managed nodes run as TRANSIENT units (`systemd-run`), and systemd refuses to create a
@@ -13029,6 +13055,78 @@ fn genesis_refusal(
     }))
 }
 
+/// What this hive's identity view says about a node's tenant, for the launch gate: a tenant that
+/// is not active cannot use the infrastructure (docs/ilk-tenant-model-v1.md §2.3).
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum TenantGate {
+    /// Active, the genesis tenant (always active), or no tenant to check.
+    Open,
+    /// Pending or suspended.
+    Closed(String),
+    /// Not in this hive's identity SHM (deleted, or not synced yet), or the SHM cannot be read.
+    Unknown(String),
+}
+
+fn tenant_gate(hive_id: &str, tenant_id: Option<&str>) -> TenantGate {
+    let Some(tenant_id) = tenant_id.map(str::trim).filter(|value| !value.is_empty()) else {
+        return TenantGate::Open;
+    };
+    if fluxbee_sdk::is_root_tenant(tenant_id) {
+        return TenantGate::Open;
+    }
+    tenant_gate_from_status(
+        fluxbee_sdk::identity::tenant_status_in_hive_id(hive_id, tenant_id)
+            .map_err(|err| err.to_string()),
+    )
+}
+
+fn tenant_gate_from_status(status: Result<Option<String>, String>) -> TenantGate {
+    match status {
+        Ok(Some(status)) if status == "active" => TenantGate::Open,
+        Ok(Some(status)) => TenantGate::Closed(status),
+        Ok(None) => TenantGate::Unknown(
+            "it is not in this hive's identity view: deleted, or not synced yet".to_string(),
+        ),
+        Err(err) => TenantGate::Unknown(format!("the identity SHM cannot be read: {err}")),
+    }
+}
+
+/// Some(error reply) when a node's tenant is known not to be active: run_node, start and restart
+/// refuse it (TENANT_NOT_ACTIVE). When this hive cannot tell, the launch goes on as before, said in
+/// the log: a deleted tenant is refused by SY.identity when the node registers (TENANT_DELETED),
+/// and SY.vault hands nothing to a tenant it does not know to be active. A node that already runs
+/// is never stopped for it: it gets no secrets while its tenant is not active, and the boot and
+/// periodic relaunches skip it until it is.
+fn tenant_gate_refusal(
+    node_name: &str,
+    tenant_id: Option<&str>,
+    gate: &TenantGate,
+) -> Option<serde_json::Value> {
+    let tenant = tenant_id.unwrap_or_default();
+    match gate {
+        TenantGate::Open => None,
+        TenantGate::Closed(status) => Some(serde_json::json!({
+            "status": "error",
+            "error_code": "TENANT_NOT_ACTIVE",
+            "message": format!(
+                "'{node_name}' is not started: its tenant {tenant} is {status}, and a tenant that is not active cannot use the infrastructure"
+            ),
+            "node_name": node_name,
+            "tenant_id": tenant,
+            "tenant_status": status,
+        })),
+        TenantGate::Unknown(reason) => {
+            tracing::warn!(
+                node_name = node_name,
+                tenant_id = tenant,
+                reason = reason.as_str(),
+                "cannot tell whether the node's tenant is active; launching it as before"
+            );
+            None
+        }
+    }
+}
+
 fn managed_spawn_disallowed_reason(node_name: &str) -> Option<&'static str> {
     let local = node_name.split('@').next().unwrap_or(node_name).trim();
     let kind = node_kind_from_name(node_name);
@@ -17926,11 +18024,15 @@ async fn run_node_flow(
         });
     }
 
-    // The tenant this spawn would register and inject: the one the rule is about.
-    if let Some(refusal) = genesis_refusal(
+    // The tenant this spawn would register and inject: the one both rules are about.
+    let spawn_tenant = resolve_tenant_id_for_node(payload);
+    if let Some(refusal) = genesis_refusal(&node_name, &runtime, spawn_tenant.as_deref()) {
+        return refusal;
+    }
+    if let Some(refusal) = tenant_gate_refusal(
         &node_name,
-        &runtime,
-        resolve_tenant_id_for_node(payload).as_deref(),
+        spawn_tenant.as_deref(),
+        &tenant_gate(&state.hive_id, spawn_tenant.as_deref()),
     ) {
         return refusal;
     }
@@ -18424,6 +18526,13 @@ fn managed_node_launch_plan(
     let (_, persisted_tenant) = load_persisted_node_identity(state, node_name);
     let tenant = persisted_tenant.or_else(|| config_tenant_id(&config));
     if let Some(refusal) = genesis_refusal(node_name, &runtime_key, tenant.as_deref()) {
+        return Err(refusal);
+    }
+    if let Some(refusal) = tenant_gate_refusal(
+        node_name,
+        tenant.as_deref(),
+        &tenant_gate(&state.hive_id, tenant.as_deref()),
+    ) {
         return Err(refusal);
     }
     validate_wf_runtime_spawn_contract(
@@ -30908,6 +31017,62 @@ blob:
             );
             assert!(genesis_refusal(name, runtime, None).is_none());
         }
+    }
+
+    /// Stage 3 (docs/ilk-tenant-model-v1.md §2.3): a node of a tenant known not to be active is not
+    /// started; when the hive cannot tell, the launch goes on as before.
+    #[test]
+    fn a_tenant_that_is_not_active_starts_no_node() {
+        let tenant = "tnt:8a0c3f8e-2f1b-4d3a-9c55-0f6e2b7d9a11";
+        assert_eq!(
+            tenant_gate_from_status(Ok(Some("active".to_string()))),
+            TenantGate::Open
+        );
+        for status in ["suspended", "pending"] {
+            let gate = tenant_gate_from_status(Ok(Some(status.to_string())));
+            assert_eq!(gate, TenantGate::Closed(status.to_string()));
+            let refusal =
+                tenant_gate_refusal("IO.slack.acme@motherbee", Some(tenant), &gate).expect(status);
+            assert_eq!(refusal["error_code"], "TENANT_NOT_ACTIVE");
+            assert_eq!(refusal["tenant_status"], status);
+        }
+        for unknown in [Ok(None), Err("no shm".to_string())] {
+            let gate = tenant_gate_from_status(unknown);
+            assert!(matches!(gate, TenantGate::Unknown(_)), "{gate:?}");
+            assert!(tenant_gate_refusal("IO.slack.acme@motherbee", Some(tenant), &gate).is_none());
+        }
+        // The genesis tenant is always active, and no tenant means nothing to check: neither
+        // reads the identity SHM.
+        assert_eq!(
+            tenant_gate("motherbee", Some(fluxbee_sdk::DEFAULT_ROOT_TENANT_ID)),
+            TenantGate::Open
+        );
+        assert_eq!(tenant_gate("motherbee", None), TenantGate::Open);
+        assert_eq!(tenant_gate("motherbee", Some("  ")), TenantGate::Open);
+    }
+
+    /// Every launch path checks the tenant gate next to the genesis rule, and the relaunch checks
+    /// both before it moves a node's version.
+    #[test]
+    fn every_launch_path_checks_the_tenant_gate() {
+        let src = include_str!("sy_orchestrator.rs");
+        let body = |name: &str| {
+            let start = src.find(name).expect(name);
+            let end = src[start..].find("\n}\n").map(|o| start + o).expect("its end");
+            &src[start..end]
+        };
+        for name in ["async fn run_node_flow(", "fn managed_node_launch_plan("] {
+            let body = body(name);
+            let genesis = body.find("genesis_refusal(").expect(name);
+            let gate = body.find("tenant_gate_refusal(").expect(name);
+            assert!(genesis < gate, "{name}");
+        }
+        let reconcile = body("async fn reconcile_persisted_custom_nodes(");
+        let gate = reconcile.find("match tenant_gate(").expect("reconcile gate");
+        let persist = reconcile
+            .find("persist_node_runtime_version(")
+            .expect("version persist");
+        assert!(gate < persist, "a refused node keeps its version");
     }
 
     /// A start or restart reads the node's tenant from the identity map, else from its config.

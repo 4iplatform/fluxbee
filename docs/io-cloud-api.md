@@ -255,21 +255,21 @@ A refused update changes nothing. Keeping the company's current name or domain i
 
 #### `delete_tenant` / `restore_tenant`
 
-`tenant_id` at the root, no params. Delete **marks** the company and, in cascade, the people known
-only through its channels (a Slack user, a phone that wrote in): reversible, hidden, its name and
-domain stay reserved. Only the operator purges.
+`tenant_id` at the root, no params. Delete **disables** the company: it is marked deleted,
+reversibly, and its name and domain stay reserved. **No person is marked**, whatever they are: an
+account, a contact known through a channel (a Slack user, a phone that wrote in), a signup never
+completed. They keep their identity and channels, and `set_ilk_tenant` charges them to another
+company. Restore brings the company back as it was. Only the operator purges, and only once nobody
+is charged to it.
 
-A signup charged to it that was never completed is not marked: it stays pending, so its email is not
-locked out, and the next `register_human` of that email (from any company) picks it up.
-`pending_signups` counts them.
+While it is deleted, like while it is suspended, its nodes do not start and its credentials are not
+handed out (§5.3, §5.4).
 
-- delete: `{"status":"ok","tenant_id":…,"state":"deleted","already_deleted":false,"cascaded_ilks":3,"pending_signups":0}`;
-  idempotent (`already_deleted:true` carries no `pending_signups`).
-- restore: `{"status":"ok","tenant_id":…,"state":"active","restored_ilks":3}`.
+- delete: `{"status":"ok","tenant_id":…,"state":"deleted","already_deleted":false,"people_charged":3}`;
+  idempotent (`already_deleted:true`). `people_charged` counts the people still charged to it.
+- restore: `{"status":"ok","tenant_id":…,"state":"active","people_charged":3}`.
 - Errors:
-  - `TENANT_HAS_ACCOUNTS`: Cloud accounts are charged to it. Reassign them (`set_ilk_tenant`) or
-    delete them first: an account's email is reserved in every tenant, so a cascade must not take it.
-  - `TENANT_HAS_NODES`: node identities live in it.
+  - `TENANT_HAS_NODES`: node identities live in it (kill its nodes first).
   - `TENANT_HAS_CHILDREN`: it sponsors other companies.
   - `TENANT_NOT_DELETED` (restore), `TENANT_NOT_FOUND`.
 
@@ -331,14 +331,14 @@ center, so this grants and revokes nothing; the person keeps every channel and l
 ```
 
 - Already charged there: `changed:false`.
-- Only a complete person's account; every change is recorded in the hive.
+- Any person: an account, or a contact known through a channel. The company they leave may be
+  deleted: this is how its people are moved out. Every change is recorded in the hive.
 - Errors:
   - `DUPLICATE_EMAIL`: another person charged to that company has the same email in their
     identification.
   - `TENANT_NOT_ACTIVE` (pending or suspended), `TENANT_DELETED`, `TENANT_NOT_FOUND`,
     `TENANT_ROOT_PROTECTED`.
-  - `INVALID_TENANT_TRANSITION` (not a complete account), `ILK_TYPE_MISMATCH` (not a person),
-    `ILK_NOT_FOUND`.
+  - `ILK_TYPE_MISMATCH` (not a person), `ILK_NOT_FOUND` (or deleted).
 
 #### `get_ilk` (local, fast)
 
@@ -397,9 +397,10 @@ operator purges). Idempotent.
 
 - delete: `{"status":"ok","ilk_id":…,"state":"deleted","already_deleted":false}`;
   restore: `{"status":"ok","ilk_id":…,"state":"active"}`.
+- A person also comes back while the company they are charged to is deleted, still charged to it;
+  `set_ilk_tenant` then moves them.
 - Errors: `ILK_NOT_FOUND`, `ILK_TYPE_MISMATCH` (not a person), `ILK_NOT_DELETED` (restore),
-  `TENANT_DELETED` (restore the company it is charged to first), `ILK_KEY_CONFLICT` (restoring it would
-  bring back a second account for its email).
+  `ILK_KEY_CONFLICT` (restoring it would bring back a second account for its email).
 - A person deleted before 0.1.65 comes back with their account where `register_human` finds it,
   unless another identity holds that email.
 
@@ -557,9 +558,10 @@ until it reloads; revoking the credential at the provider is what makes it usele
 | `error_code` | when |
 |---|---|
 | `NODE_ALREADY_EXISTS` | a node with that name exists |
+| `TENANT_NOT_ACTIVE` | the company is pending or suspended: it starts no node |
 | `RUNTIME_NOT_AVAILABLE` | the runtime or version cannot be resolved |
 | `INVALID_REQUEST` | not `IO.*`, runtime not derivable, bad version |
-| `IDENTITY_REGISTER_FAILED`, `CONFIG_WRITE_FAILED`, `SERVICE_FAILED`, `SPAWN_FAILED` | the hive could not launch it |
+| `IDENTITY_REGISTER_FAILED`, `CONFIG_WRITE_FAILED`, `SERVICE_FAILED`, `SPAWN_FAILED` | the hive could not launch it; for a deleted company, `IDENTITY_REGISTER_FAILED` with `TENANT_DELETED` in the detail |
 
 ### 5.5 `list_cloud_actions` (local)
 
@@ -644,6 +646,19 @@ post '{"op":"list_cloud_actions"}'
 
 ## 9. What changed for Cloud
 
+### 0.1.67
+
+- **`delete_tenant` disables the company and marks no person.** `TENANT_HAS_ACCOUNTS` is gone, and
+  so are `cascaded_ilks` and `pending_signups` in its answer; it answers `people_charged`.
+  `restore_tenant` answers `people_charged` instead of `restored_ilks`.
+- **`set_ilk_tenant` takes any person,** a contact known through a channel included, also out of a
+  deleted company. `INVALID_TENANT_TRANSITION` no longer comes from it.
+- **`restore_ilk` brings a person back while their company is deleted** (it answered
+  `TENANT_DELETED`).
+- **A company that is not active starts no node:** `provision_node` answers `TENANT_NOT_ACTIVE`
+  while it is pending or suspended (a deleted one already failed to register the node). Its running
+  nodes keep running without credentials.
+
 ### 0.1.66
 
 - **`pending_signup`** in every summary `get_ilk` and `list_ilks` answer: `true` for a signup nobody
@@ -712,7 +727,8 @@ two companies, a unique email, a deleted person.
 - a person deleted before 0.1.65, once restored, is where `register_human` finds her;
 - reads by id across companies work;
 - `delete_ilk` of a node answers `ILK_TYPE_MISMATCH`;
-- `delete_tenant` with an account charged answers `TENANT_HAS_ACCOUNTS`;
+- `delete_tenant` with an account charged answers `TENANT_HAS_ACCOUNTS` (no longer since 0.1.67:
+  deleting a company marks no one);
 - once the operator purged the extra identity and the hive restarted, the email that had been held
   twice answered its one account.
 

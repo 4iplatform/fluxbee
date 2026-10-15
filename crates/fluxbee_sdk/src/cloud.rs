@@ -123,11 +123,11 @@ pub fn cloud_action_catalog() -> Value {
         { "op": "delete_token", "category": "relay",
           "summary": "Delete one credential of YOUR tenant. Needs the envelope tenant_id + params.key. A key that does not exist or belongs to another tenant answers KEY_NOT_FOUND; infrastructure keys are refused." },
         { "op": "provision_node", "category": "relay",
-          "summary": "Spawn an IO.* node in YOUR tenant. Needs the envelope tenant_id + params.node_name (IO.*) + params.runtime. NOT idempotent." },
+          "summary": "Spawn an IO.* node in YOUR tenant. Needs the envelope tenant_id + params.node_name (IO.*) + params.runtime. A tenant that is not active (pending, suspended) starts no node: TENANT_NOT_ACTIVE. NOT idempotent." },
         { "op": "register_human", "category": "local",
           "summary": "Register a person's Fluxbee Cloud account, charged to YOUR tenant (the envelope tenant_id). params = a frontdesk_handoff {type:'frontdesk_handoff', schema_version:1, operation:'complete_registration', subject:{display_name,email,phone?,company_name?,attributes?}}. One email is one account: an email that already has one answers existing:true with its ilk_id and tenant, and nothing is created (charging it elsewhere is set_ilk_tenant). Otherwise IO.cloud provisions the person and hands it to SY.frontdesk.gov; returns the frontdesk verdict + ilk_id." },
         { "op": "set_ilk_tenant", "category": "relay",
-          "summary": "Charge a person (params.ilk_id, a complete account) to YOUR tenant (the envelope tenant_id): a tenant is a cost center, so this grants and revokes nothing. The target must be active, never the root tenant; DUPLICATE_EMAIL when another person there holds the same email. Each change is recorded." },
+          "summary": "Charge a person (params.ilk_id: an account, or a contact known through a channel) to YOUR tenant (the envelope tenant_id): a tenant is a cost center, so this grants and revokes nothing, and the person's channels stay where they are. The target must be active, never the root tenant; the tenant they leave may be deleted. DUPLICATE_EMAIL when another person there holds the same email. Each change is recorded." },
         { "op": "list_cloud_actions", "category": "local",
           "summary": "Return this catalog (the actions IO.cloud offers: relay + local) so Cloud can discover its surface." },
         { "op": "get_ilk", "category": "local",
@@ -141,11 +141,11 @@ pub fn cloud_action_catalog() -> Value {
         { "op": "delete_ilk", "category": "relay",
           "summary": "Mark one person's account deleted (reversible: hidden, its email/channels stay reserved until the operator purges it). params.ilk_id. People only: another type answers ILK_TYPE_MISMATCH (node identities are the orchestrator's). Not tenant-scoped. Idempotent." },
         { "op": "restore_ilk", "category": "relay",
-          "summary": "Undo delete_ilk for one person. params.ilk_id. People only. Refused while the tenant it is charged to is deleted (restore the tenant)." },
+          "summary": "Undo delete_ilk for one person. params.ilk_id. People only. Also while the tenant they are charged to is deleted: they come back charged to it, and set_ilk_tenant moves them." },
         { "op": "delete_tenant", "category": "relay",
-          "summary": "Mark YOUR tenant (the envelope tenant_id) deleted and, in cascade, the people known only through its channels (reversible; name/domain stay reserved). Refused while accounts are charged to it (TENANT_HAS_ACCOUNTS: reassign or delete them first), while node identities live in it or while it sponsors tenants." },
+          "summary": "Disable YOUR tenant (the envelope tenant_id): it is marked deleted, reversibly, and its name/domain stay reserved. No person is marked: the people charged to it stay usable and set_ilk_tenant charges them elsewhere. Answers people_charged. Refused while node identities live in it (kill them first) or while it sponsors tenants." },
         { "op": "restore_tenant", "category": "relay",
-          "summary": "Undo delete_tenant for YOUR tenant: it and the ilks its cascade marked come back." }
+          "summary": "Undo delete_tenant for YOUR tenant: it comes back as it was." }
     ])
 }
 

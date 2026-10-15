@@ -7874,8 +7874,10 @@ fn error_code_to_http_status(error_code: &str) -> u16 {
         // An identity lifecycle step the current state refuses: what blocks it is in the detail.
         | "TENANT_HAS_NODES"
         | "TENANT_HAS_CHILDREN"
-        | "TENANT_HAS_ACCOUNTS"
+        | "TENANT_HAS_PEOPLE"
         | "TENANT_NOT_DELETED"
+        // A node of a tenant that is not active is not started (docs/ilk-tenant-model-v1.md §2.3).
+        | "TENANT_NOT_ACTIVE"
         | "TENANT_DELETED"
         | "ILK_NOT_DELETED"
         | "ILK_KEY_CONFLICT"
@@ -9439,17 +9441,17 @@ fn admin_action_summary(action: &str) -> &'static str {
         "delete_ilk" => {
             "Mark one identity ILK deleted (reversible: hidden, its keys stay reserved until purge). Refuses well-known SY system ILKs (SYSTEM_ILK_PROTECTED)."
         }
-        "restore_ilk" => "Undo the deleted mark of one identity ILK (refused while its tenant is marked).",
-        "set_ilk_tenant" => "Charge one person (a complete human ILK) to another tenant, its cost center; channels keep their scope.",
+        "restore_ilk" => "Undo the deleted mark of one identity ILK (a person also while their tenant is marked; any other ILK waits for its tenant).",
+        "set_ilk_tenant" => "Charge one person (complete or temporary) to another tenant, its cost center; channels keep their scope.",
         "purge_ilk" => {
             "Physically and finally remove one identity ILK that is ALREADY marked deleted (ILK_NOT_DELETED otherwise)."
         }
         "delete_tenant" => {
-            "Mark one identity tenant deleted and, in cascade, its active ILKs (reversible; name/domain stay reserved)."
+            "Mark one identity tenant deleted, i.e. disable it (reversible; name/domain stay reserved). No ILK is marked: its people stay usable."
         }
-        "restore_tenant" => "Undo the deleted mark of one tenant and of the ILKs its cascade marked.",
+        "restore_tenant" => "Undo the deleted mark of one tenant: it comes back as it was.",
         "purge_tenant" => {
-            "Physically and finally remove one tenant ALREADY marked deleted and every ILK in it. Refused while it has vault secrets, node identities or sponsored tenants."
+            "Physically and finally remove one tenant ALREADY marked deleted and the ILKs marked in it. Refused while people are charged to it, or it has vault secrets, node identities or sponsored tenants."
         }
         "list_tenants" => "List identity tenants in a hive.",
         "get_tenant" => "Read one identity tenant in a hive.",
@@ -11226,17 +11228,20 @@ fn admin_action_request_notes(action: &str) -> Vec<&'static str> {
             "runtime can be omitted when it is derivable from node_name.",
             "AI.* and IO.* managed nodes require root-level tenant_id on first spawn. Discover it with list_tenants/get_tenant or from an existing node config; do not place it only under config.",
             "Only IO.cloud and IO.blob (runtimes io.cloud, io.blob) run in the root tenant. Launch any other IO.* node with the tenant it serves; in the root tenant it is refused with TENANT_ROOT_NOT_ALLOWED.",
+            "A tenant that is not active (pending or suspended) starts no node: TENANT_NOT_ACTIVE.",
             "WF.* managed nodes must use an already published workflow package runtime, for example wf.invoice. Do not spawn WF.* directly with the base runtime wf.engine; use wf_rules_compile_apply with auto_spawn=true to publish and deploy workflows.",
             "For internal ADMIN_COMMAND dispatch, the hive target is encoded via payload.target; in HTTP it comes from /hives/{hive}.",
         ],
         "start_node" => vec![
             "Use this when the persisted managed node instance already exists and needs to be started again.",
             "This reuses the stored config.json and runtime metadata instead of creating a new instance.",
+            "Refused with TENANT_NOT_ACTIVE while the node's tenant is pending or suspended.",
             "The hive target comes from the /hives/{hive} path in HTTP.",
         ],
         "restart_node" => vec![
             "Use this when the managed node instance already exists and should be restarted.",
             "If the transient systemd unit is missing or inactive, orchestrator can fall back to the start path for the persisted instance.",
+            "Refused with TENANT_NOT_ACTIVE while the node's tenant is pending or suspended; a node that already runs is never stopped for it.",
             "The hive target comes from the /hives/{hive} path in HTTP.",
         ],
         "kill_node" | "remove_node_instance" | "set_node_config" | "send_node_message" => vec![
@@ -11331,27 +11336,27 @@ fn admin_action_request_notes(action: &str) -> Vec<&'static str> {
         ],
         "set_ilk_tenant" => vec![
             "A tenant is a cost center: changing it grants and revokes nothing (docs/ilk-tenant-model-v1.md).",
-            "Complete human ILKs only (stage 1); the target must be active and never the root tenant.",
+            "People only, complete or temporary (a node is born and dies in its tenant); the target must be active and never the root tenant. The current tenant may be deleted: that is how its people are moved out before a purge.",
             "Refused with DUPLICATE_EMAIL when another person in the target holds the same email. Channels keep their scope, so every lookup still resolves; each change writes a history row.",
         ],
         "restore_ilk" => vec![
             "Undoes delete_ilk: the ILK resolves again with the same keys.",
-            "Refused with TENANT_DELETED while its tenant is marked (restore the tenant instead), ILK_NOT_DELETED if it is not marked.",
+            "A person comes back even while their tenant is marked, still charged to it; any other ILK answers TENANT_DELETED until its tenant is restored. ILK_NOT_DELETED if it is not marked.",
         ],
         "purge_ilk" => vec![
             "Final: removes the ILK row, its ICHs and aliases; replicas get IlkDelete deltas.",
             "Requires the ILK to be marked first (ILK_NOT_DELETED otherwise). Operator-only: not offered to Archi's executor nor to Fluxbee Cloud.",
         ],
         "delete_tenant" => vec![
-            "MARKS the tenant deleted and, in cascade, its active ILKs (reason tenant). Its name/domain stay reserved: create_tenant answers TENANT_DELETED.",
-            "Refused for the root tenant (TENANT_ROOT_PROTECTED), while node identities live in it (TENANT_HAS_NODES) or while it sponsors active tenants (TENANT_HAS_CHILDREN).",
+            "MARKS the tenant deleted, i.e. disables it: no ILK is marked, its people stay usable and can be charged elsewhere (set_ilk_tenant). Its name/domain stay reserved: create_tenant answers TENANT_DELETED.",
+            "Answers people_charged, the people still charged to it. Refused for the root tenant (TENANT_ROOT_PROTECTED), while node identities live in it (TENANT_HAS_NODES) or while it sponsors active tenants (TENANT_HAS_CHILDREN).",
         ],
         "restore_tenant" => vec![
-            "Undoes delete_tenant: the tenant and ONLY the ILKs its cascade marked come back; ILKs deleted on their own stay deleted.",
+            "Undoes delete_tenant: the tenant comes back as it was, since nobody in it was marked.",
         ],
         "purge_tenant" => vec![
-            "Final: removes the tenant and every ILK in it. Requires the tenant to be marked first (TENANT_NOT_DELETED otherwise).",
-            "Refused while SY.vault still holds secrets of the tenant (TENANT_HAS_SECRETS, keys listed), node identities remain or it sponsors tenants. Operator-only.",
+            "Final: removes the tenant, the ILKs marked in it and the channels other ILKs hold in its scope. Requires the tenant to be marked first (TENANT_NOT_DELETED otherwise).",
+            "Refused while people are charged to it (TENANT_HAS_PEOPLE: charge them elsewhere first), while SY.vault still holds secrets of the tenant (TENANT_HAS_SECRETS, keys listed), node identities remain or it sponsors tenants. Operator-only.",
         ],
         "list_tenants" => vec![
             "Lists the identity tenants currently known by SY.identity for one hive.",
@@ -16911,7 +16916,13 @@ mod tests {
         assert_eq!(error_code_to_http_status("TENANT_NOT_FOUND"), 404);
         assert_eq!(error_code_to_http_status("SYSTEM_ILK_PROTECTED"), 403);
         assert_eq!(error_code_to_http_status("TENANT_ROOT_NOT_ALLOWED"), 403);
-        for refused in ["TENANT_HAS_NODES", "TENANT_NOT_DELETED", "ILK_KEY_CONFLICT"] {
+        for refused in [
+            "TENANT_HAS_NODES",
+            "TENANT_HAS_PEOPLE",
+            "TENANT_NOT_DELETED",
+            "TENANT_NOT_ACTIVE",
+            "ILK_KEY_CONFLICT",
+        ] {
             assert_eq!(error_code_to_http_status(refused), 409, "{refused}");
         }
     }

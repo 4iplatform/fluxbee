@@ -995,6 +995,53 @@ Visto al arreglar los e2e de A-37, leyendo `src/router/mod.rs` y `src/shm/mod.rs
   binario generaría uno como root); si no, el `myID` del Syncthing en marcha. Nunca `config.xml`.
 - **Estado:** construido; lo ejercita el próximo join (el de A-48).
 
+### A-66 🟡 EN CÓDIGO (0.1.67) — Un tenant suspendido seguía arrancando nodos, y borrar un tenant marcaba a su gente
+
+- **El marco:** `docs/ilk-tenant-model-v1.md` §2.3, la etapa 3. Decisiones del operador del
+  2026-10-14: *"no quiero borrar ni desaparecer ilk de humanos"*; *"sobre nodos y recursos sí vale la
+  pena actuar"*; restituir es reactivar el tenant.
+- **Qué pasaba:**
+  - **Nodos:** el orquestador arrancaba y relanzaba nodos de un tenant suspendido o pendiente.
+    Desde la etapa 2 no recibían secretos, pero corrían.
+  - **Borrar un tenant** marcaba en cascada a la gente que le escribió por un canal (2026-09-28), y
+    se rechazaba si tenía cuentas de Cloud (`TENANT_HAS_ACCOUNTS`, etapa 1). Una persona borrada por
+    su lado no volvía mientras su tenant estuviera borrado.
+  - **Purgar un tenant** borraba a todas las personas cargadas a él.
+  - **`set_ilk_tenant`** movía solo cuentas completas: los contactos de una empresa no se podían
+    sacar de ahí.
+  - **io.api `by_ilk`:** la API de una empresa actuaba solo por personas cargadas a esa empresa. Una
+    persona que le escribió pero estaba cargada a otra no se podía usar.
+- **Arreglo:**
+  - **Orquestador:**
+    - `run_node`, start y restart contestan `TENANT_NOT_ACTIVE` si el tenant del nodo está
+      pendiente o suspendido;
+    - el relanzamiento al arrancar y el periódico lo saltean, sin relanzarlo ni pasarlo a otra
+      versión, hasta que el tenant vuelva a estar activo;
+    - un nodo que ya corre no se mata;
+    - si el hive no sabe el estado (identity todavía arrancando), sigue como antes y lo dice en el
+      log.
+  - **SY.identity:**
+    - borrar un tenant lo marca solo a él, sin cascada, y contesta `people_charged`; se rechaza si
+      tiene nodos o patrocina tenants;
+    - restaurarlo lo devuelve tal cual;
+    - purgarlo se rechaza mientras tenga personas cargadas (`TENANT_HAS_PEOPLE`); las marcadas por
+      su lado se van con él;
+    - `set_ilk_tenant` mueve también temporales, y desde un tenant borrado;
+    - `restore_ilk` devuelve a una persona aunque su tenant esté borrado.
+  - **io.api `by_ilk` (D12):** personas cargadas al tenant o con un canal en su espacio.
+  - **Admin y Cloud:** `TENANT_HAS_PEOPLE` y `TENANT_NOT_ACTIVE` son 409; los textos de las
+    acciones y el catálogo de Cloud.
+- **Sin código, documentado:**
+  - el router no corta el tráfico de un tenant suspendido: sería una búsqueda en cada mensaje, en
+    el camino más cargado, y suma poco a lo anterior;
+  - un nodo que corre en un tenant suspendido durante un upgrade sigue en la versión vieja. Si se
+    cae, systemd no lo puede relanzar (su directorio ya no está), y el relanzamiento periódico lo
+    levanta en la nueva cuando el tenant vuelve a estar activo.
+- **Abierto (D13):** unir un contacto a una cuenta, por ejemplo un cliente de A que pasa a ser
+  dueño de B, necesita un paso explícito (la persona prueba el canal desde su cuenta). No está
+  diseñado.
+- **Validación en 8.x:** pendiente, con 0.1.67.
+
 ### A-65 🟡 PARCIAL, EN CÓDIGO (0.1.67) · el resto es P-1, postergado — El vault creía el ILK que el propio nodo declaraba
 
 - **Qué pasaba:** SY.vault autorizaba por `meta.src_ilk`, que pone el propio nodo. El router no lo

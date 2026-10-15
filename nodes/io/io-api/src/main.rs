@@ -12,7 +12,8 @@ mod subject;
 
 use anyhow::Result;
 use fluxbee_sdk::identity::{
-    list_ilks_from_hive_id, resolve_identity_option_from_hive_id, IdentityIlkOption,
+    list_ich_options_from_hive_id, list_ilks_from_hive_id, resolve_identity_option_from_hive_id,
+    IdentityIchOption, IdentityIlkOption,
 };
 use fluxbee_sdk::protocol::{
     Destination, Message, Meta, Routing, MSG_TTL_EXCEEDED, MSG_UNREACHABLE, SYSTEM_KIND,
@@ -1374,35 +1375,44 @@ fn api_error(code: &str, detail: impl Into<String>) -> Value {
     })
 }
 
-/// Validate a by_ilk explicit subject: the supplied ILK must exist and belong to THIS
-/// IO.api instance's tenant. Cross-tenant subjects are rejected here.
+/// Validate a by_ilk explicit subject: the supplied ILK must be one THIS IO.api instance's tenant
+/// knows (docs/ilk-tenant-model-v1.md §2.3, D12): charged to it, or holding a channel in its scope,
+/// i.e. someone who wrote to one of its IO nodes. Anyone else is rejected here.
+///
+/// The tenant is who pays, not a permission: a person charged to another tenant, or to one that
+/// was deleted, stays reachable by every company they wrote to, and nobody has to be moved for it.
 ///
 /// DESIGN DECISION (audit residual #2, ratified 2026-07-21): there is intentionally NO
-/// `ilk_type` gate — a bearer holder may present ANY same-tenant ILK as the subject,
+/// `ilk_type` gate — a bearer holder may present ANY ILK its tenant knows as the subject,
 /// including an agent/system ILK (the by_data path forces ilk_type=human, by_ilk does not).
 /// This is safe ONLY under the standing constraint that NO downstream consumer treats the
 /// forwarded `src_ilk` as an authenticated principal (it is a routing/attribution hint). SY.vault
 /// does read `src_ilk`, but only bound to the node the router says sent the request (0.1.67,
 /// FINDINGS A-65), so a subject forwarded from here never reads a secret as that ILK. If another
 /// node ever trusts `src_ilk` as a principal, this gate MUST be revisited (add an ilk_type
-/// allowlist) BEFORE that lands. Tenant isolation is the load-bearing boundary here.
+/// allowlist) BEFORE that lands. What the tenant knows is the load-bearing boundary here.
 fn validate_explicit_subject_ilk(
     hive_id: &str,
     tenant_id: &str,
     ilk_id: &str,
 ) -> Result<(), ApiIngressError> {
-    let snapshot = list_ilks_from_hive_id(hive_id).map_err(|err| {
+    let unavailable = |err: fluxbee_sdk::identity::IdentityShmError| {
         ApiIngressError::new(
             "identity_unavailable",
             format!("unable to validate subject identity: {err}"),
         )
-    })?;
+    };
+    let snapshot = list_ilks_from_hive_id(hive_id).map_err(unavailable)?;
     if ilk_belongs_to_tenant(&snapshot.ilks, ilk_id, tenant_id) {
+        return Ok(());
+    }
+    let channels = list_ich_options_from_hive_id(hive_id).map_err(unavailable)?;
+    if ilk_has_channel_in_scope(&channels, ilk_id, tenant_id) {
         Ok(())
     } else {
         Err(ApiIngressError::new(
             "subject_not_found",
-            "requested subject does not exist in this IO.api tenant",
+            "requested subject is not known to this IO.api tenant",
         ))
     }
 }
@@ -1410,6 +1420,13 @@ fn validate_explicit_subject_ilk(
 fn ilk_belongs_to_tenant(ilks: &[IdentityIlkOption], ilk_id: &str, tenant_id: &str) -> bool {
     ilks.iter()
         .any(|ilk| ilk.ilk_id == ilk_id && ilk.tenant_id == tenant_id)
+}
+
+/// Does the ILK hold a channel whose address lives in `scope` (a tenant's namespace)?
+fn ilk_has_channel_in_scope(channels: &[IdentityIchOption], ilk_id: &str, scope: &str) -> bool {
+    channels.iter().any(|channel| {
+        channel.scope == scope && channel.ilks.iter().any(|ilk| ilk.ilk_id == ilk_id)
+    })
 }
 
 async fn resolve_explicit_subject(
@@ -1928,6 +1945,49 @@ mod tests {
             &ilks,
             "ilk:11111111-1111-4111-8111-111111111111",
             "tnt:22222222-2222-4222-8222-222222222222"
+        ));
+    }
+
+    /// D12: a company knows a person charged elsewhere once they wrote to it (a channel in its
+    /// scope); a channel in another company's scope does not count.
+    #[test]
+    fn a_subject_with_a_channel_in_the_tenants_scope_is_known() {
+        let acme = "tnt:11111111-1111-4111-8111-111111111111";
+        let globex = "tnt:22222222-2222-4222-8222-222222222222";
+        let ana = "ilk:33333333-3333-4333-8333-333333333333";
+        let person = IdentityIlkOption {
+            ilk_id: ana.to_string(),
+            tenant_id: globex.to_string(),
+            display_name: None,
+            handler_node: None,
+            registration_status: "temporary".to_string(),
+            ilk_type: "human".to_string(),
+            role_hash: None,
+            skill_hashes: Vec::new(),
+            handbook_hashes: Vec::new(),
+            personality_hash: None,
+        };
+        let channel = |scope: &str| IdentityIchOption {
+            ich_id: "ich:44444444-4444-4444-8444-444444444444".to_string(),
+            channel_type: "whatsapp".to_string(),
+            address: "5491100000000".to_string(),
+            scope: scope.to_string(),
+            is_primary: true,
+            owner_l2_name: None,
+            enabled: true,
+            ilks: vec![person.clone()],
+        };
+        assert!(!ilk_belongs_to_tenant(
+            std::slice::from_ref(&person),
+            ana,
+            acme
+        ));
+        assert!(ilk_has_channel_in_scope(&[channel(acme)], ana, acme));
+        assert!(!ilk_has_channel_in_scope(&[channel(globex)], ana, acme));
+        assert!(!ilk_has_channel_in_scope(
+            &[channel(acme)],
+            "ilk:55555555-5555-4555-8555-555555555555",
+            acme
         ));
     }
 

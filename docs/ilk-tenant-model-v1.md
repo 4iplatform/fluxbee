@@ -2,7 +2,7 @@
 
 **Status:** contract and order of work decided by the operator on 2026-10-14. Stage 1 is live in
 0.1.65, validated on the 8.x testbed on 2026-10-14 (`lab/DEPLOYMENTS.md`). Stage 2 is live in 0.1.66,
-validated on 8.x the same day (FINDINGS A-64).
+validated on 8.x the same day (FINDINGS A-64). Stage 3 is built for 0.1.67 (FINDINGS A-66).
 This document is the single source for the change; FINDINGS and the ledger point here.
 
 **How it was reached.** It came out of a conversation, not out of the code: the operator, Claude
@@ -17,6 +17,7 @@ tres, sin la charla no sale nada más que código basura"*.
   installation. An ILK is never duplicated because of a tenant. Operator: *"la identidad dentro del
   sistema es prioridad a todo, no veo bien resolver esto creando miles de ilk para lo mismo"*.
 - **A tenant is a cost center: a record of spending.**
+  - It is usually a company, not always (operator, 2026-10-14).
   - Each ILK is charged to exactly one tenant at any moment, and it can be reassigned, explicitly
     and with a record.
   - Fluxbee records what is spent and under which tenant. Who pays, which company or legal entity a
@@ -161,21 +162,14 @@ keep their scope everywhere.
 - **Lists by tenant stay:** "what is charged to T".
 - These ship with stage 1, because the migration changes the keys Cloud's email reads use.
 
-**Deleting a tenant that has accounts charged to it** is refused (`TENANT_HAS_ACCOUNTS`) until they
-are reassigned or deleted. A cascade would mark an account whose email is reserved in every tenant,
-and a purge would remove it. This is the first piece of D8.
-- **A pending signup** (a temporary person holding an account's key) is nobody's account yet: it
-  does not block the delete and it is not marked, because a mark would lock the email out for
-  everyone until a purge. It stays pending; the relay's next signup of that email takes it over;
-  purging the tenant removes it if it is still charged there. The answer counts them
-  (`pending_signups`).
+**Deleting a tenant** with accounts charged to it was refused in stage 1 (`TENANT_HAS_ACCOUNTS`),
+and the other people charged to it were marked with it. Stage 3 replaced both: deleting a tenant
+marks no one (§2.3).
 - **A pending signup is readable as such** (D11, *"que se puedan leer las pendientes"*):
   - `pending_signup` in every ILK the operator, Archi and Cloud read;
   - the operator's list filters `?pending_signup=true`, wherever they are charged, deleted
     tenants included;
   - the boot report names the ones left charged to a deleted tenant.
-- Other humans charged to it (channel identities, temporaries without an account) still cascade as
-  decided on 2026-09-28.
 
 **Purging a tenant** also drops the channels other ILKs still hold in its scope: a person reassigned
 out keeps the keys of the tenant they left, and those keys go with the tenant. No node of that tenant
@@ -293,27 +287,75 @@ owner-less one is its tenant's general secret, as today.
 
 ### 2.3 The tenant as a cost center (stage 3)
 
+Decided with the operator on 2026-10-14, after stage 2: *"no quiero borrar ni desaparecer ilk de
+humanos"*; *"sobre nodos y recursos sí vale la pena actuar"*.
+
 **The record.** `TenantRecord` holds labels and a state Cloud sets: name, domain, status,
 settings, sponsor. The sponsor is stored flat and grants nothing.
 
-**The status gate: a suspended tenant cannot use the infrastructure.**
-- The SHM already carries the real tenant status; the vault starts using it in stage 2.
-- The orchestrator refuses to start a node charged to a suspended tenant.
-- The router refuses traffic from and to ILKs charged to one.
-- AI nodes do not spend for one.
+**A tenant that is not active (pending, suspended or deleted) cannot use the infrastructure.**
+- **Secrets:** SY.vault hands it none (stage 2). Its running nodes lose their credentials at once
+  and get them back when it is active again. An AI node reads its key on every call, so it spends
+  nothing.
+- **Nodes:** the orchestrator starts none of its nodes.
+  - `run_node`, start and restart answer `TENANT_NOT_ACTIVE`.
+  - The boot and periodic relaunches skip its nodes: no relaunch, no move to a new version. Once
+    it is active again, the next pass (within 60 s) relaunches the ones that died.
+  - When the hive cannot tell (identity not up, or the tenant not synced yet), the launch goes on as
+    before, said in the log. The vault hands the node nothing until its tenant is known to be
+    active, and a deleted tenant is refused by identity when a new node registers
+    (`TENANT_DELETED`). Nodes cannot outlive their tenant: deleting it waits for them.
+  - A node that already runs is never stopped for it. Stopping and relaunching would be more
+    machinery and less reversible, and without its secrets it spends nothing.
+- **Not built, documented:** the router does not refuse the traffic of a suspended tenant's ILKs.
+  It would be a lookup on every message, on the busiest path, and it adds little to the above.
 - The root tenant is never suspended.
 
-**Deleting a tenant.**
-- Refused while ILKs are charged to it: reassign or delete them first.
-- This replaces the cascade that marked people (2026-09-28). Node identities already blocked it.
+**Deleting a tenant disables it.**
+- **Only the tenant is marked.** No person charged to it is marked, whatever they are: an account,
+  a contact known through a channel, a pending signup. They keep their identity and their
+  channels, they can write to any company, and Cloud charges them elsewhere with `set_ilk_tenant`.
+  What they spend with another company's nodes is that company's, because the node is the one
+  that spends.
+- **Refused** while it still runs nodes (`TENANT_HAS_NODES`: kill them first) or sponsors active
+  tenants.
+- **Restoring it is reactivating it:** it comes back as it was, because nobody in it was touched.
+- The answer counts the people still charged to it (`people_charged`).
+- A person deleted on their own comes back with `restore_ilk` even while their tenant is marked,
+  still charged to it. Any other ILK waits for its tenant to be restored.
+- This replaces the cascade of 2026-09-28 and stage 1's `TENANT_HAS_ACCOUNTS`.
+
+**Purging a tenant** (final, the operator only) is refused while people are charged to it
+(`TENANT_HAS_PEOPLE`, the first 20 listed): they are charged elsewhere first, never removed with
+it.
+- `set_ilk_tenant` takes temporaries too, so a company with a thousand WhatsApp contacts can be
+  emptied. A bulk move ("everyone from T to U") is added if it is needed.
+- People marked on their own go with the purge.
+- It is still refused while the vault holds its secrets (`TENANT_HAS_SECRETS`), node identities
+  remain or it sponsors tenants.
+
+**io.api `by_ilk`: people the tenant knows (D12).** A company's API can act for a person (the
+request names their ILK) when the person is charged to the company or holds a channel in its scope,
+that is, wrote to its WhatsApp, its Slack or its API. The channel, each company's space since stage
+1, replaces the tenant as the permission, and nobody has to be moved for it.
+
+**Contacts: the people who write to a company.**
+- A person who writes to a company's channel is created charged to that company, and the channel
+  lives in its scope: the IO node provisions with its own tenant. Operator: *"si hay alguien que se
+  comunica es asociado a un evento sobre ese TNT"*.
+- The same person writing to two companies is two ILKs. A phone number or a Slack ID is not
+  evidence across companies; only an email that Cloud authenticated is (§2.1).
+- Charging a person to another company is `set_ilk_tenant`. The companies that know them are the
+  scopes of their channels, which never move, so the company they leave still reaches them.
+- **Open (D13):** joining a contact to an account, for example a customer of A who becomes the
+  owner of B. It needs an explicit step (the person proves the channel from their account), never
+  a match on the number. Not designed.
 
 **Other tenant uses.**
-- **io.api's `by_ilk` check:** it rests on the tenant, so it moves to a real rule. The candidate is
-  the instance's own channels.
 - **OPA:** `data.identity[ilk].tenant_id` stays, documented as the cost center. Installed user
   policies must not use it as a permission (PROD has no user policy).
 - **The root tenant** is the installation's own cost center: system nodes.
-- **Docs:** "every ILK belongs to exactly one tenant" becomes "is charged to".
+- **Docs:** "every ILK belongs to exactly one tenant" became "is charged to" (`docs/10-identity-v2.md`).
 
 ### 2.4 Cloud (stage 4; parts ship with stages 1–3)
 
@@ -357,7 +399,7 @@ Every stage goes through:
 |---|---|---|
 | 1 | ILK structure (§2.1) and its IO.cloud part. | On PROD, through Cloud's public door: <br>• the same email registered from two tenants gives one ILK; <br>• `set_ilk_tenant` moves the person, and the person's `cloud` and IO channels still resolve; <br>• the person keeps their channels after an identity restart (DB reload); <br>• worker1's identity replica shows the new tenant; <br>• a read by id across tenants works, and Cloud is refused a node's ILK on delete; <br>• a tenant with an account charged is refused (`TENANT_HAS_ACCOUNTS`), and purging the tenant a person left drops their keys there; <br>• the migration on data made with 0.1.64: a unique email moves, an email in two tenants is reported and refused (`ACCOUNT_AMBIGUOUS`). |
 | 2 | Secrets (§2.2). | On PROD: <br>• a company's token assigned to two of its nodes reaches both and not a third; unassigned, one stops at once; <br>• a general token reaches every node of its company and none of another; <br>• a suspended or deleted tenant's secrets are not handed out, and come back when it is reactivated; <br>• a person's secret assigned to a node reaches it, and the person's reassignment changes nothing; <br>• the genesis tenant refuses an AI node, and the core still reads its keys after a restart; <br>• a node's tenant cannot change; <br>• Cloud stores, assigns and lists through the public door. |
-| 3 | Tenant firm (§2.3). | Suspend a test tenant: its node does not start, its traffic is refused, it spends nothing. Reactivate: everything works again. A tenant delete with ILKs charged is refused. |
+| 3 | Tenant firm (§2.3). | On PROD: <br>• suspended, a tenant's node does not start or restart and the running one keeps running without secrets; reactivated, the node starts; <br>• deleted with people charged, nobody is marked and they still resolve; restored, it is as it was; <br>• a purge with people charged is refused, and goes once they are charged elsewhere (a temporary included). |
 | 4 | Cloud (§2.4), whatever did not ship with 1–3. | The contract doc checked live. |
 | 5 | Tokens (§2.5). | Designed first. |
 
@@ -369,15 +411,17 @@ Every stage goes through:
 |---|---|---|
 | D1 | The contract of §0. | Decided 2026-10-14 |
 | D2 | A tenant is a spending record; who pays is Cloud's. | Decided 2026-10-14 |
-| D3 | A suspended tenant cannot use the infrastructure. | Decided 2026-10-14 |
+| D3 | A suspended tenant cannot use the infrastructure. | Decided 2026-10-14. Built: the vault (0.1.66) and the orchestrator (0.1.67); the router gate is not built (§2.3) |
 | D4 | Cloud deletes and restores human ILKs only. | Decided 2026-10-14 |
 | D5 | Order: ILK structure, tenant, Cloud, tokens. | Decided 2026-10-14 |
 | D6 | People are reassigned (stage 1). A node is born and dies in its tenant and is never reassigned. | Decided 2026-10-14 |
 | D7 | One Cloud account per email (installation-wide scope); no automatic merge of existing duplicates. | Live in 0.1.65 |
-| D8 | Deleting a tenant is refused while ILKs are charged to it (replaces the cascade of people). | The account part decided 2026-10-14 and live in 0.1.65 (§2.1); the rest proposed for stage 3 |
+| D8 | Deleting a tenant disables it: only the tenant is marked, never a person; restoring it is reactivating it; the purge is refused while people are charged to it. Replaces the 2026-09-28 cascade and stage 1's `TENANT_HAS_ACCOUNTS`. | Decided 2026-10-14, stage 3 (0.1.67) |
 | D9 | Secrets (§2.2): the tenant is who pays, and the vault checks only that it exists and is active. An owner (node or person), assigned nodes, or general (every node of its tenant). No groups, no installation-wide key. | Decided 2026-10-14 |
 | D10 | Only the core (SY.\*, RT.\*, the core IO runtimes) is born in the genesis tenant; the orchestrator defines the core. | Decided 2026-10-14 |
 | D11 | A pending signup is readable as such (`pending_signup`), wherever it is charged. | Decided 2026-10-14 |
+| D12 | io.api `by_ilk` acts for the people the tenant knows: charged to it, or holding a channel in its scope. | Decided 2026-10-14, stage 3 (0.1.67) |
+| D13 | A contact is charged to the company it wrote to. Joining a contact to an account is an explicit step, never a match on the number. | The first part is how it works; the joining is open, not designed |
 
 ## 5. Related
 

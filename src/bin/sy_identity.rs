@@ -390,9 +390,9 @@ struct TntLifecycleRequest {
     tenant_id: String,
 }
 
-/// Why an ilk is marked deleted (persisted in identity_ilks.deleted_reason).
+/// Why an ilk is marked deleted (persisted in identity_ilks.deleted_reason). Its own delete is the
+/// only reason: deleting a tenant marks no ILK (docs/ilk-tenant-model-v1.md §2.3).
 const DELETED_REASON_DIRECT: &str = "direct";
-const DELETED_REASON_TENANT: &str = "tenant";
 
 /// Everything a lifecycle op (mark / restore / purge, ilk or tenant) changed, so the handler
 /// persists it in ONE transaction and emits the matching deltas.
@@ -516,8 +516,7 @@ struct IlkRecord {
     definition: Value,
     channels: Vec<ChannelRecord>,
     deleted_at_ms: Option<u64>,
-    /// Why it is marked: `direct` (its own delete) or `tenant` (its tenant's cascade) -- a
-    /// tenant restore only brings back what the cascade took.
+    /// Why it is marked: `direct`, its own delete.
     #[serde(default)]
     deleted_reason: Option<String>,
 }
@@ -1576,8 +1575,9 @@ impl IdentityStore {
 
     // ---- lifecycle: active -> deleted (marked: reversible, hidden, keys RESERVED) -> purged ----
     // Operator decision (2026-09-28): a normal delete only MARKS; purge is a separate,
-    // deliberate step that requires the mark first; a tenant mark cascades to its ilks. Every
-    // op VALIDATES before it mutates, and the handler restores a snapshot on any error.
+    // deliberate step that requires the mark first. A tenant mark disables the tenant and marks no
+    // ILK (2026-10-14, docs/ilk-tenant-model-v1.md §2.3). Every op VALIDATES before it mutates,
+    // and the handler restores a snapshot on any error.
 
     fn tenant_is_deleted(&self, tenant_id: &str) -> bool {
         self.tenants
@@ -1668,11 +1668,11 @@ impl IdentityStore {
         Ok(())
     }
 
-    /// The people whose Fluxbee Cloud account (a `cloud` channel in the installation-wide scope)
-    /// is charged to `tenant_id`. Their email is reserved in every tenant, so a cascade must not
-    /// mark them: deleting their tenant waits until they are reassigned or deleted. A pending
-    /// signup is nobody's account yet (see `is_pending_signup`).
-    fn tenant_account_ilks(&self, tenant_id: &str) -> Vec<String> {
+    /// The people charged to `tenant_id` and not marked: accounts, temporaries and pending
+    /// signups alike. Nothing that happens to their tenant marks or removes them; purging it waits
+    /// until they are charged elsewhere (operator, 2026-10-14: *"no quiero borrar ni desaparecer
+    /// ilk de humanos"*).
+    fn tenant_people(&self, tenant_id: &str) -> Vec<String> {
         let mut out: Vec<String> = self
             .ilks
             .values()
@@ -1680,8 +1680,6 @@ impl IdentityStore {
                 ilk.tenant_id == tenant_id
                     && ilk.deleted_at_ms.is_none()
                     && ilk.ilk_type.trim() == "human"
-                    && ilk.registration_status == "complete"
-                    && holds_installation_account(ilk)
             })
             .map(|ilk| ilk.ilk_id.clone())
             .collect();
@@ -1690,7 +1688,8 @@ impl IdentityStore {
     }
 
     /// ILK_SET_TENANT: charge a person to another tenant, their cost center
-    /// (docs/ilk-tenant-model-v1.md §2.1). Stage 1 takes complete, active human ILKs only. Every
+    /// (docs/ilk-tenant-model-v1.md §2.1). Any person who is not marked, complete or temporary
+    /// (stage 3: a tenant's contacts can be moved out before it is purged); never a node (D6). Every
     /// check runs before anything changes; channels keep their scope, so no key moves. Answers the
     /// change for the history table, or none when the ILK is already charged there.
     fn set_ilk_tenant(
@@ -1721,9 +1720,6 @@ impl IdentityStore {
             .ok_or_else(|| "ILK_NOT_FOUND".to_string())?;
         if ilk.ilk_type.trim() != "human" {
             return Err("ILK_TYPE_MISMATCH".to_string());
-        }
-        if ilk.registration_status != "complete" {
-            return Err("INVALID_TENANT_TRANSITION".to_string());
         }
         let previous = ilk.tenant_id.clone();
         if previous == target {
@@ -1967,7 +1963,10 @@ impl IdentityStore {
         ))
     }
 
-    /// ILK_RESTORE: un-mark. Refused while its tenant is marked (restore the tenant instead).
+    /// ILK_RESTORE: un-mark. A person also comes back while their tenant is marked, still charged
+    /// to it, and can then be charged elsewhere (`set_ilk_tenant`): what happens to a tenant never
+    /// strands a person. Any other ILK waits for its tenant to be restored (a node is born and dies
+    /// in its tenant, D6).
     fn restore_ilk(&mut self, req: IlkDeleteRequest) -> Result<(Value, LifecycleChanges), String> {
         let _ = parse_prefixed_uuid(&req.ilk_id, "ilk")?;
         self.check_ilk_tenant_scope(&req)?;
@@ -1978,7 +1977,7 @@ impl IdentityStore {
         if entry.deleted_at_ms.is_none() {
             return Err("ILK_NOT_DELETED".to_string());
         }
-        if self.tenant_is_deleted(&entry.tenant_id) {
+        if entry.ilk_type.trim() != "human" && self.tenant_is_deleted(&entry.tenant_id) {
             return Err(lifecycle_error(
                 "TENANT_DELETED",
                 &format!("tenant {} is marked deleted; restore the tenant", entry.tenant_id),
@@ -2065,17 +2064,21 @@ impl IdentityStore {
         out
     }
 
-    /// TNT_DELETE: mark the tenant and, in cascade, its active ilks (reason `tenant`).
+    /// TNT_DELETE: mark the tenant, i.e. disable it (docs/ilk-tenant-model-v1.md §2.3). No ILK is
+    /// marked: its people stay usable and can be charged elsewhere, and restoring the tenant brings
+    /// it back as it was. Refused while it still runs nodes or sponsors active tenants. Answers how
+    /// many people are still charged to it (they block its purge).
     fn delete_tenant(
         &mut self,
         req: TntLifecycleRequest,
         now_ms: u64,
     ) -> Result<(Value, LifecycleChanges), String> {
         let tenant = self.tenant_record_for_lifecycle(&req.tenant_id)?;
+        let people_charged = self.tenant_people(&req.tenant_id).len();
         if tenant.deleted_at_ms.is_some() {
             return Ok((
                 json!({"status": "ok", "tenant_id": req.tenant_id, "state": "deleted",
-                       "already_deleted": true, "cascaded_ilks": 0}),
+                       "already_deleted": true, "people_charged": people_charged}),
                 LifecycleChanges::default(),
             ));
         }
@@ -2096,47 +2099,19 @@ impl IdentityStore {
                 ),
             ));
         }
-        let accounts = self.tenant_account_ilks(&req.tenant_id);
-        if !accounts.is_empty() {
-            return Err(lifecycle_error(
-                "TENANT_HAS_ACCOUNTS",
-                &format!(
-                    "Fluxbee Cloud accounts are charged to the tenant (reassign or delete them first): {}",
-                    accounts.join(", ")
-                ),
-            ));
-        }
         let mut changes = LifecycleChanges::default();
-        let charged: Vec<&IlkRecord> = self
-            .ilks
-            .values()
-            .filter(|ilk| ilk.tenant_id == req.tenant_id && ilk.deleted_at_ms.is_none())
-            .collect();
-        let pending_signups = charged.iter().filter(|ilk| is_pending_signup(ilk)).count();
-        let mut ilk_ids: Vec<String> = charged
-            .into_iter()
-            .filter(|ilk| !is_pending_signup(ilk))
-            .map(|ilk| ilk.ilk_id.clone())
-            .collect();
-        ilk_ids.sort_unstable();
-        for ilk_id in &ilk_ids {
-            changes
-                .ilks
-                .extend(self.mark_ilk_unchecked(ilk_id, DELETED_REASON_TENANT, now_ms));
-        }
         if let Some(tenant) = self.tenants.get_mut(&req.tenant_id) {
             tenant.deleted_at_ms = Some(now_ms);
             changes.tenants.push(tenant.clone());
         }
         Ok((
             json!({"status": "ok", "tenant_id": req.tenant_id, "state": "deleted",
-                   "already_deleted": false, "cascaded_ilks": changes.ilks.len(),
-                   "pending_signups": pending_signups}),
+                   "already_deleted": false, "people_charged": people_charged}),
             changes,
         ))
     }
 
-    /// TNT_RESTORE: un-mark the tenant and ONLY the ilks its cascade marked.
+    /// TNT_RESTORE: un-mark the tenant. Its people were never marked, so it comes back as it was.
     fn restore_tenant(
         &mut self,
         req: TntLifecycleRequest,
@@ -2153,38 +2128,23 @@ impl IdentityStore {
                 ));
             }
         }
-        let mut ilk_ids: Vec<String> = self
-            .ilks
-            .values()
-            .filter(|ilk| {
-                ilk.tenant_id == req.tenant_id
-                    && ilk.deleted_at_ms.is_some()
-                    && ilk.deleted_reason.as_deref() == Some(DELETED_REASON_TENANT)
-            })
-            .map(|ilk| ilk.ilk_id.clone())
-            .collect();
-        ilk_ids.sort_unstable();
-        for ilk_id in &ilk_ids {
-            self.check_ilk_restorable(ilk_id)?;
-        }
         let mut changes = LifecycleChanges::default();
-        for ilk_id in &ilk_ids {
-            self.unmark_ilk_unchecked(ilk_id, &mut changes);
-        }
         if let Some(tenant) = self.tenants.get_mut(&req.tenant_id) {
             tenant.deleted_at_ms = None;
             changes.tenants.push(tenant.clone());
         }
         Ok((
             json!({"status": "ok", "tenant_id": req.tenant_id, "state": "active",
-                   "restored_ilks": changes.ilks.len()}),
+                   "people_charged": self.tenant_people(&req.tenant_id).len()}),
             changes,
         ))
     }
 
     /// TNT_PURGE: physical and final -- the tenant and every ilk in it. Only a MARKED tenant;
-    /// never one that still sponsors tenants (deleted or not). Node/vault references are
-    /// checked by SY.admin before it calls this (identity cannot see the vault).
+    /// never one that still sponsors tenants (deleted or not), runs nodes or has people charged to
+    /// it: a person is moved out first (`set_ilk_tenant`), never removed with the tenant. A person
+    /// already marked on their own goes with it. Vault references are checked by SY.admin before it
+    /// calls this (identity cannot see the vault).
     fn purge_tenant(
         &mut self,
         req: TntLifecycleRequest,
@@ -2208,6 +2168,25 @@ impl IdentityStore {
             return Err(lifecycle_error(
                 "TENANT_HAS_NODES",
                 &format!("node identities still in the tenant: {}", nodes.join(", ")),
+            ));
+        }
+        let people = self.tenant_people(&req.tenant_id);
+        if !people.is_empty() {
+            const SHOWN: usize = 20;
+            let more = people.len().saturating_sub(SHOWN);
+            return Err(lifecycle_error(
+                "TENANT_HAS_PEOPLE",
+                &format!(
+                    "{} people are still charged to the tenant; charge them elsewhere first \
+                     (set_ilk_tenant): {}{}",
+                    people.len(),
+                    people[..people.len().min(SHOWN)].join(", "),
+                    if more > 0 {
+                        format!(" and {more} more")
+                    } else {
+                        String::new()
+                    }
+                ),
             ));
         }
         let mut ilk_ids: Vec<String> = self
@@ -6987,7 +6966,7 @@ fn report_account_scopes(store: &mut IdentityStore) {
         "cloud account scopes need the operator: delete and purge the extra ILKs of each ambiguous \
          email (the next boot moves it), and reassign or purge the accounts charged to the root tenant. \
          A pending signup in a deleted tenant waits: the next signup of its email takes it over, or \
-         purging the tenant removes it"
+         it is charged elsewhere before the tenant is purged"
     );
 }
 
@@ -7059,9 +7038,9 @@ fn holds_installation_account(ilk: &IlkRecord) -> bool {
 }
 
 /// A pending Fluxbee Cloud signup: a temporary person holding an account's key. It is nobody's
-/// account yet, so deleting the tenant it is charged to leaves it pending (marking it would lock
-/// the email out for everyone): the relay's next signup of that email takes it over, and purging
-/// the tenant removes it if it is still charged there.
+/// account yet: the relay's next signup of that email takes it over, wherever it is charged. Like
+/// any person, it is never marked by its tenant's delete and it blocks the tenant's purge until it
+/// is charged elsewhere.
 fn is_pending_signup(ilk: &IlkRecord) -> bool {
     ilk.ilk_type.trim() == "human"
         && ilk.registration_status == "temporary"
@@ -10731,23 +10710,24 @@ mod tests {
     }
 
     #[test]
-    fn lifecycle_tenant_cascade_and_restore_only_brings_back_the_cascade() {
+    fn deleting_a_tenant_marks_no_one_and_restoring_brings_it_back() {
         let mut store = lc_store_with_tenant();
-        let direct = lc_provision(&mut store, "gone@acme.com");
-        let cascaded = lc_provision(&mut store, "kept@acme.com");
-        store.delete_ilk(lc_ilk(&direct), 3).expect("direct mark");
+        let gone = lc_provision(&mut store, "gone@acme.com");
+        let kept = lc_provision(&mut store, "kept@acme.com");
+        store.delete_ilk(lc_ilk(&gone), 3).expect("direct mark");
 
         let (out, changes) = store.delete_tenant(lc_tenant(LC_TENANT), 10).expect("tenant mark");
-        assert_eq!(out.get("cascaded_ilks").and_then(Value::as_u64), Some(1));
+        assert_eq!(out["people_charged"], 1);
+        assert!(changes.ilks.is_empty(), "no ILK is marked");
         assert_eq!(changes.tenants.len(), 1);
-        assert_eq!(store.ilks[&cascaded].deleted_reason.as_deref(), Some(DELETED_REASON_TENANT));
-        assert_eq!(store.ilks[&direct].deleted_reason.as_deref(), Some(DELETED_REASON_DIRECT));
-        // ilks of a marked tenant cannot be restored on their own
-        assert_eq!(
-            lc_code(store.restore_ilk(lc_ilk(&cascaded)).expect_err("tenant marked")),
-            "TENANT_DELETED"
-        );
-        // its name stays reserved
+        assert_eq!(store.ilks[&kept].deleted_at_ms, None);
+        assert!(store.ich_lookup.values().any(|mapped| mapped == &kept));
+        // A person deleted on their own comes back while the tenant is marked, still charged to it.
+        store
+            .restore_ilk(lc_ilk(&gone))
+            .expect("a person is never stranded");
+        assert_eq!(store.ilks[&gone].tenant_id, LC_TENANT);
+        // Its name stays reserved.
         let err = store
             .create_tenant(TntCreateRequest {
                 name: "Acme".to_string(),
@@ -10759,10 +10739,9 @@ mod tests {
             .expect_err("name reserved");
         assert_eq!(err, "TENANT_DELETED");
 
-        let (restored, _) = store.restore_tenant(lc_tenant(LC_TENANT)).expect("restore");
-        assert_eq!(restored.get("restored_ilks").and_then(Value::as_u64), Some(1));
-        assert_eq!(store.ilks[&cascaded].deleted_at_ms, None);
-        assert!(store.ilks[&direct].deleted_at_ms.is_some(), "a direct delete stays deleted");
+        let (restored, changes) = store.restore_tenant(lc_tenant(LC_TENANT)).expect("restore");
+        assert_eq!(restored["people_charged"], 2);
+        assert!(changes.ilks.is_empty());
         assert_eq!(store.tenants[LC_TENANT].deleted_at_ms, None);
     }
 
@@ -10813,20 +10792,42 @@ mod tests {
     }
 
     #[test]
-    fn lifecycle_tenant_purge_requires_the_mark_and_removes_everything() {
-        let mut store = lc_store_with_tenant();
-        let ilk = lc_provision(&mut store, "zoe@acme.com");
+    fn purging_a_tenant_waits_for_its_people_and_takes_the_marked_ones() {
+        let mut store = sc_store();
+        let zoe = lc_provision(&mut store, "zoe@acme.com");
+        let gone = lc_provision(&mut store, "gone@acme.com");
+        store.delete_ilk(lc_ilk(&gone), 3).expect("direct mark");
         assert_eq!(
             lc_code(store.purge_tenant(lc_tenant(LC_TENANT)).expect_err("not marked")),
             "TENANT_NOT_DELETED"
         );
         store.delete_tenant(lc_tenant(LC_TENANT), 10).expect("mark");
+        let err = store
+            .purge_tenant(lc_tenant(LC_TENANT))
+            .expect_err("zoe is charged");
+        assert!(
+            err.starts_with("TENANT_HAS_PEOPLE|") && err.contains(&zoe),
+            "{err}"
+        );
+        assert!(
+            !err.contains(&gone),
+            "a marked person does not block: {err}"
+        );
+        assert!(store.tenants.contains_key(LC_TENANT));
+
+        store
+            .set_ilk_tenant(&sc_set_tenant(&zoe, SC_OTHER), "x")
+            .expect("charged elsewhere");
         let (out, changes) = store.purge_tenant(lc_tenant(LC_TENANT)).expect("purge");
-        assert_eq!(out.get("purged_ilks").and_then(Value::as_u64), Some(1));
+        assert_eq!(out["purged_ilks"], 1);
         assert_eq!(changes.purged_tenants, vec![LC_TENANT.to_string()]);
-        assert!(!store.ilks.contains_key(&ilk));
+        assert!(
+            !store.ilks.contains_key(&gone),
+            "the marked person goes with the tenant"
+        );
+        assert_eq!(store.ilks[&zoe].tenant_id, SC_OTHER);
         assert!(!store.tenants.contains_key(LC_TENANT));
-        // after the purge the name is free again
+        // After the purge the name is free again.
         let created = store
             .create_tenant(TntCreateRequest {
                 name: "Acme".to_string(),
@@ -11898,14 +11899,22 @@ mod tests {
             "DUPLICATE_EMAIL"
         );
         assert_eq!(store.ilks[&ana].tenant_id, LC_TENANT);
-        // A temporary and a node are not reassigned in stage 1.
+        // A temporary is charged elsewhere too (stage 3), and its channel keeps its scope.
         let temp = rg_provision(&mut store, LC_TENANT, "slack", "U6");
+        let (ok, change) = store
+            .set_ilk_tenant(&sc_set_tenant(&temp, SC_OTHER), "x")
+            .expect("a temporary moves");
+        assert_eq!(
+            (ok["changed"].clone(), change.is_some()),
+            (json!(true), true)
+        );
         assert_eq!(
             store
-                .set_ilk_tenant(&sc_set_tenant(&temp, SC_OTHER), "x")
-                .unwrap_err(),
-            "INVALID_TENANT_TRANSITION"
+                .ich_lookup
+                .get(&canonical_ich_key("slack", "U6", LC_TENANT)),
+            Some(&temp)
         );
+        // A node never is (D6).
         let mut node = ilk_for(
             "IO.slack@motherbee",
             "ilk:55555555-5555-4555-8555-555555555555",
@@ -11990,23 +11999,52 @@ mod tests {
     }
 
     #[test]
-    fn a_tenant_with_accounts_charged_to_it_is_not_deleted() {
+    fn deleting_a_tenant_leaves_its_people_usable() {
         let mut store = sc_store();
         let ana = sc_account(&mut store, LC_TENANT, "ana@acme.com");
-        let err = store
+        let contact = rg_provision(&mut store, LC_TENANT, "slack", "U9");
+        let (ok, changes) = store
             .delete_tenant(lc_tenant(LC_TENANT), 1)
-            .expect_err("an account is charged");
-        assert_eq!(lc_code(err), "TENANT_HAS_ACCOUNTS");
-        // Reassigned, the tenant goes; a person known only through a channel still cascades.
-        store
-            .set_ilk_tenant(&sc_set_tenant(&ana, SC_OTHER), "x")
-            .expect("reassign");
-        let slack_person = rg_provision(&mut store, LC_TENANT, "slack", "U9");
-        store
-            .delete_tenant(lc_tenant(LC_TENANT), 1)
-            .expect("delete");
-        assert!(store.ilks[&slack_person].deleted_at_ms.is_some());
-        assert!(store.ilks[&ana].deleted_at_ms.is_none());
+            .expect("people do not block a delete");
+        assert_eq!(ok["people_charged"], 2);
+        assert!(changes.ilks.is_empty());
+        for person in [&ana, &contact] {
+            assert!(store.ilks[person].deleted_at_ms.is_none());
+        }
+        // Both still resolve: the account by its installation-wide key, the contact in the scope.
+        assert_eq!(
+            store.ich_lookup.get(&canonical_ich_key(
+                "cloud",
+                "ana@acme.com",
+                INSTALLATION_SCOPE
+            )),
+            Some(&ana)
+        );
+        assert_eq!(
+            store
+                .ich_lookup
+                .get(&canonical_ich_key("slack", "U9", LC_TENANT)),
+            Some(&contact)
+        );
+        // Charged elsewhere out of the deleted tenant, the purge goes and takes the scope's keys.
+        for person in [&ana, &contact] {
+            store
+                .set_ilk_tenant(&sc_set_tenant(person, SC_OTHER), "x")
+                .expect("move out");
+        }
+        let (ok, _) = store.purge_tenant(lc_tenant(LC_TENANT)).expect("purge");
+        assert_eq!(
+            (ok["purged_ilks"].clone(), ok["dropped_channels"].clone()),
+            (json!(0), json!(1))
+        );
+        assert_eq!(
+            store.ich_lookup.get(&canonical_ich_key(
+                "cloud",
+                "ana@acme.com",
+                INSTALLATION_SCOPE
+            )),
+            Some(&ana)
+        );
     }
 
     #[test]
@@ -12474,11 +12512,8 @@ mod tests {
         let jon = signup(&mut store, "jon@acme.com");
         let (ok, changes) = store
             .delete_tenant(lc_tenant(LC_TENANT), 1)
-            .expect("no account yet");
-        assert_eq!(
-            (ok["cascaded_ilks"].clone(), ok["pending_signups"].clone()),
-            (json!(0), json!(2))
-        );
+            .expect("delete");
+        assert_eq!(ok["people_charged"], 2);
         assert!(changes.ilks.is_empty());
         assert!(store.ilks[&ivy].deleted_at_ms.is_none());
         // Another tenant signs Ivy up: she is charged there now.
@@ -12487,11 +12522,18 @@ mod tests {
         assert_eq!(ok["ilk_id"], ivy.as_str());
         assert_eq!(ok["tenant_id"], SC_OTHER);
         assert!(change.is_some());
-        // Purging the tenant removes the signup still charged there, and only it.
+        // Jon is still charged there: the purge waits for him like for anyone.
+        let err = store.purge_tenant(lc_tenant(LC_TENANT)).expect_err("jon");
+        assert!(
+            err.starts_with("TENANT_HAS_PEOPLE|") && err.contains(&jon),
+            "{err}"
+        );
+        store
+            .set_ilk_tenant(&sc_set_tenant(&jon, SC_OTHER), "x")
+            .expect("a pending signup moves");
         let (ok, _) = store.purge_tenant(lc_tenant(LC_TENANT)).expect("purge");
-        assert_eq!(ok["purged_ilks"], 1);
-        assert!(!store.ilks.contains_key(&jon));
-        assert!(store.ilks.contains_key(&ivy));
+        assert_eq!(ok["purged_ilks"], 0);
+        assert!(store.ilks.contains_key(&jon) && store.ilks.contains_key(&ivy));
     }
 
     #[test]
