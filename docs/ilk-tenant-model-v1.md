@@ -364,9 +364,16 @@ that is, wrote to its WhatsApp, its Slack or its API. The channel, each company'
   stays with the company it wrote to while that company is active. The companies that know a person
   are the scopes of their channels, which never move, so the company they leave still reaches
   them.
-- **Open (D13):** joining a contact to an account, for example a customer of A who becomes the
-  owner of B. It needs an explicit step (the person proves the channel from their account), never
-  a match on the number. Not designed.
+- **Joining two ILKs of one person (D13).** Operator, 2026-10-15: only an email joins. The same
+  email means one person and a merge; anything else (a phone, a Slack ID) leaves two people.
+  *"Dependiendo de la info que tenemos se disparan triggers para mergear, mientras se convive con dos
+  ilks distintos."*
+  - **Today, within one tenant:** an `ILK_REGISTER` whose email a person of that tenant already
+    holds merges the temporary into that person, who keeps an alias of it (2026-10-02).
+  - **Today, across tenants:** nothing joins them. A customer of A who gives A's frontdesk the email
+    of their Cloud account (charged to B) stays a second ILK in A, with the same email.
+  - **Open, not to build now:** the cross-tenant merge on an email, and what triggers it. Until then
+    the two ILKs coexist, and each company's spending stays right.
 
 **Other tenant uses.**
 - **OPA:** `data.identity[ilk].tenant_id` stays, documented as the cost center. Installed user
@@ -438,7 +445,7 @@ Every stage goes through:
 | D10 | Only the core (SY.\*, RT.\*, the core IO runtimes) is born in the genesis tenant; the orchestrator defines the core. | Decided 2026-10-14 |
 | D11 | A pending signup is readable as such (`pending_signup`), wherever it is charged. | Decided 2026-10-14 |
 | D12 | io.api `by_ilk` acts for the people the tenant knows: charged to it, or holding a channel in its scope. | Decided 2026-10-14, stage 3 (0.1.67) |
-| D13 | A contact is charged to the company it wrote to. Joining a contact to an account is an explicit step, never a match on the number. | The first part is how it works; the joining is open, not designed |
+| D13 | A contact is charged to the company it wrote to. Only an email joins two ILKs: the same email means a merge, triggered by what the person provides; until then two ILKs coexist. | Direction set 2026-10-15. Within one tenant the merge by email exists (2026-10-02); across tenants it is open, not designed |
 
 ## 5. Related
 
