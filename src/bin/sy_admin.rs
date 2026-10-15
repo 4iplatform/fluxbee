@@ -7829,7 +7829,12 @@ fn error_code_to_http_status(error_code: &str) -> u16 {
         "HOST_NOT_SETTLED" => 503,
         "INVALID_REQUEST" | "INVALID_ADDRESS" | "INVALID_ARCHIVE" | "INVALID_HIVE_ID"
         | "INVALID_ZIP" | "INVALID_KEY_FORMAT" | "INVALID_VALUE" => 400,
-        "UNAUTHORIZED" | "SYSTEM_ILK_PROTECTED" | "TENANT_ROOT_PROTECTED" => 403,
+        "UNAUTHORIZED"
+        | "SYSTEM_ILK_PROTECTED"
+        | "TENANT_ROOT_PROTECTED"
+        // Only the core is born in the genesis tenant, and nobody registers there (D10).
+        | "TENANT_ROOT_NOT_ALLOWED"
+        | "TENANT_ROOT_NOT_REGISTRABLE" => 403,
         "NOT_FOUND"
         | "ILK_NOT_FOUND"
         | "TENANT_NOT_FOUND"
@@ -16905,6 +16910,7 @@ mod tests {
         assert_eq!(error_code_to_http_status("ILK_NOT_FOUND"), 404);
         assert_eq!(error_code_to_http_status("TENANT_NOT_FOUND"), 404);
         assert_eq!(error_code_to_http_status("SYSTEM_ILK_PROTECTED"), 403);
+        assert_eq!(error_code_to_http_status("TENANT_ROOT_NOT_ALLOWED"), 403);
         for refused in ["TENANT_HAS_NODES", "TENANT_NOT_DELETED", "ILK_KEY_CONFLICT"] {
             assert_eq!(error_code_to_http_status(refused), 409, "{refused}");
         }
