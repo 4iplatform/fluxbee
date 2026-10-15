@@ -3062,8 +3062,7 @@ impl IdentityRuntime {
             Ok(done) => done,
             Err(code) => {
                 self.store = snapshot;
-                let (code, detail) = code.split_once('|').unwrap_or((code.as_str(), context));
-                return error_payload(code, detail);
+                return op_error_payload(&code, context);
             }
         };
         if self.is_primary {
@@ -3402,7 +3401,9 @@ impl IdentityRuntime {
                                 )
                                 .await
                             }
-                            Err(code) => error_payload(&code, "failed to change the ilk's tenant"),
+                            Err(code) => {
+                                op_error_payload(&code, "failed to change the ilk's tenant")
+                            }
                         }
                     }
                     Err(err) => error_payload("INVALID_REQUEST", &err.to_string()),
@@ -6819,6 +6820,13 @@ fn error_payload(error_code: &str, message: &str) -> Value {
         "error_code": error_code,
         "message": message,
     })
+}
+
+/// The reply for an op's error: a `CODE|detail` (`lifecycle_error`) is split so the caller sees the
+/// code alone in `error_code`; a plain code keeps `fallback` as its message.
+fn op_error_payload(error: &str, fallback: &str) -> Value {
+    let (code, detail) = error.split_once('|').unwrap_or((error, fallback));
+    error_payload(code, detail)
 }
 
 fn db_write_error_payload(context: &str, err: &(dyn std::error::Error + 'static)) -> Value {
@@ -12001,6 +12009,18 @@ mod tests {
                 .unwrap_err(),
             "ILK_TYPE_MISMATCH"
         );
+    }
+
+    /// An op's `CODE|detail` reaches the caller as the code alone, with the detail as its message
+    /// (live on 0.1.67: set_ilk_tenant answered `INVALID_TENANT_TRANSITION|…` as the code).
+    #[test]
+    fn an_op_error_answers_its_code_alone() {
+        let split = op_error_payload("INVALID_TENANT_TRANSITION|why it is refused", "fallback");
+        assert_eq!(split["error_code"], "INVALID_TENANT_TRANSITION");
+        assert_eq!(split["message"], "why it is refused");
+        let plain = op_error_payload("TENANT_NOT_ACTIVE", "failed to change the ilk's tenant");
+        assert_eq!(plain["error_code"], "TENANT_NOT_ACTIVE");
+        assert_eq!(plain["message"], "failed to change the ilk's tenant");
     }
 
     /// Stage 3: a temporary is charged elsewhere only out of a deleted tenant, to empty it before
