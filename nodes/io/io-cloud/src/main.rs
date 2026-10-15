@@ -1216,21 +1216,24 @@ fn translate_cloud_op(
                 json!({ "key": key, "tenant_id": tenant_id }),
             ))
         }
-        // The claimed tenant's name and domain. Status, settings and the sponsor are the
-        // operator's: asking for them is refused, never dropped in silence.
+        // Everything about the claimed tenant (docs/ilk-tenant-model-v1.md §2.4): name, domain,
+        // status (active or suspended; pending stays the operator's), settings and sponsor.
+        // Anything else is refused, never dropped in silence.
         "update_tenant" => {
             let tenant_id = claimed_tenant(tenant_id, op)?;
+            const FIELDS: &str =
+                "params.name, params.domain, params.status, params.settings and/or params.sponsor_tenant_id";
             let Some(fields) = params.as_object() else {
-                return Err(cloud_error(
-                    "update_tenant requires params.name and/or params.domain",
-                ));
+                return Err(cloud_error(&format!("update_tenant requires {FIELDS}")));
             };
-            if let Some(other) = fields
-                .keys()
-                .find(|key| !matches!(key.as_str(), "name" | "domain"))
-            {
+            if let Some(other) = fields.keys().find(|key| {
+                !matches!(
+                    key.as_str(),
+                    "name" | "domain" | "status" | "settings" | "sponsor_tenant_id"
+                )
+            }) {
                 return Err(cloud_error(&format!(
-                    "update_tenant edits only params.name and params.domain, not params.{other}"
+                    "update_tenant edits only {FIELDS}, not params.{other}"
                 )));
             }
             let mut update = serde_json::Map::new();
@@ -1252,12 +1255,77 @@ fn translate_cloud_op(
                 };
                 update.insert("domain".to_string(), json!(domain));
             }
+            if let Some(status) = fields.get("status") {
+                let status = status
+                    .as_str()
+                    .map(|status| status.trim().to_ascii_lowercase())
+                    .filter(|status| matches!(status.as_str(), "active" | "suspended"))
+                    .ok_or_else(|| {
+                        cloud_error("params.status must be \"active\" or \"suspended\"")
+                    })?;
+                update.insert("status".to_string(), json!(status));
+            }
+            if let Some(settings) = fields.get("settings") {
+                if !settings.is_object() {
+                    return Err(cloud_error("params.settings must be an object"));
+                }
+                update.insert("settings".to_string(), settings.clone());
+            }
+            if let Some(sponsor) = fields.get("sponsor_tenant_id") {
+                let sponsor = match sponsor {
+                    Value::Null => Value::Null,
+                    Value::String(raw) => {
+                        json!(claimed_tenant(Some(raw), "update_tenant sponsor")?)
+                    }
+                    _ => {
+                        return Err(cloud_error(
+                            "params.sponsor_tenant_id must be a tenant id or null",
+                        ))
+                    }
+                };
+                update.insert("sponsor_tenant_id".to_string(), sponsor);
+            }
             if update.len() == 1 {
-                return Err(cloud_error(
-                    "update_tenant requires params.name and/or params.domain",
-                ));
+                return Err(cloud_error(&format!("update_tenant requires {FIELDS}")));
             }
             Ok(("update_tenant", Value::Object(update)))
+        }
+        // The whole record of the claimed tenant, and every tenant but the genesis one (SY.admin
+        // leaves it out and shows the deleted ones).
+        "get_tenant" => {
+            let tenant_id = claimed_tenant(tenant_id, op)?;
+            Ok(("get_tenant", json!({ "tenant_id": tenant_id })))
+        }
+        "list_tenants" => Ok(("list_tenants", json!({}))),
+        // The claimed tenant's nodes on every hive.
+        "list_nodes" => {
+            let tenant_id = claimed_tenant(tenant_id, op)?;
+            Ok(("list_tenant_nodes", json!({ "tenant_id": tenant_id })))
+        }
+        // One IO node of the claimed tenant; start, stop and delete only the nodes Cloud launched
+        // (SY.admin stamps that requirement, the hive that holds the node checks it).
+        "get_node_status" | "start_node" | "stop_node" | "delete_node" => {
+            let tenant_id = claimed_tenant(tenant_id, op)?;
+            let node_name = required_string(params, "node_name")?;
+            if !node_name.starts_with("IO.") {
+                return Err(cloud_error(&format!("{op} acts only on IO.* nodes")));
+            }
+            let mut request = json!({ "node_name": node_name, "tenant_id": tenant_id });
+            let action = match op {
+                "get_node_status" => "get_node_status",
+                "start_node" => "start_node",
+                // A stop lasts: the node stays down, with its config and identity, until started.
+                "stop_node" => {
+                    request["purge_instance"] = json!(false);
+                    "kill_node"
+                }
+                // The teardown: its timers, the credentials it owns and its identity go.
+                _ => {
+                    request["purge_instance"] = json!(true);
+                    "kill_node"
+                }
+            };
+            Ok((action, request))
         }
         "" => Err(cloud_error("missing 'op'")),
         other => Err(cloud_error(&format!("unknown op '{other}'"))),
@@ -1358,7 +1426,7 @@ async fn dispatch_cloud_op(
                 "status": "ok",
                 "op": op,
                 "request_id": res.request_id,
-                "result": res.payload,
+                "result": cloud_view(op, res.payload),
             })
         }
         Ok(res) => json!({
@@ -1369,6 +1437,63 @@ async fn dispatch_cloud_op(
             "error_detail": res.error_detail.unwrap_or(res.payload),
         }),
         Err(e) => cloud_error_code("ADMIN_UNAVAILABLE", &format!("admin call failed: {e}")),
+    }
+}
+
+/// What Fluxbee Cloud sees of a node: its state, not how the hive runs it (operator, 2026-10-15:
+/// inventory and state, nothing operational). The hive's answer carries more (the process, the
+/// host paths); `list_nodes` and `get_node_status` give Cloud this view. Every other op answers as
+/// the hive does.
+fn cloud_view(op: &str, payload: Value) -> Value {
+    fn node_view(node: &Value) -> Value {
+        let field = |key: &str| node.get(key).cloned().unwrap_or(Value::Null);
+        let mut view = json!({
+            "node_name": field("node_name"),
+            "hive": node.get("hive").or_else(|| node.get("hive_id")).cloned().unwrap_or(Value::Null),
+            "kind": field("kind"),
+            "lifecycle_state": field("lifecycle_state"),
+            "health_state": field("health_state"),
+            "runtime": {
+                "name": node.pointer("/runtime/name").cloned().unwrap_or(Value::Null),
+                "version": node
+                    .pointer("/runtime/version")
+                    .or_else(|| node.pointer("/runtime/resolved_version"))
+                    .cloned()
+                    .unwrap_or(Value::Null),
+            },
+            "identity": field("identity"),
+            "config_version": node.pointer("/config/config_version").cloned().unwrap_or(Value::Null),
+        });
+        for optional in ["launched_by", "relaunch_on_boot", "observed_at", "health_source", "last_error"] {
+            if let Some(value) = node.get(optional) {
+                view[optional] = value.clone();
+            }
+        }
+        view
+    }
+    match op {
+        "list_nodes" => {
+            let nodes: Vec<Value> = payload
+                .get("nodes")
+                .and_then(Value::as_array)
+                .map(|nodes| nodes.iter().map(node_view).collect())
+                .unwrap_or_default();
+            json!({
+                "status": payload.get("status").cloned().unwrap_or_else(|| json!("ok")),
+                "tenant_id": payload.get("tenant_id").cloned().unwrap_or(Value::Null),
+                "count": nodes.len(),
+                "nodes": nodes,
+                "unreachable_hives": payload.get("unreachable_hives").cloned().unwrap_or_else(|| json!([])),
+            })
+        }
+        "get_node_status" => match payload.get("node_status") {
+            Some(status) => json!({
+                "status": payload.get("status").cloned().unwrap_or_else(|| json!("ok")),
+                "node_status": node_view(status),
+            }),
+            None => payload,
+        },
+        _ => payload,
     }
 }
 
@@ -1436,7 +1561,7 @@ fn pending_signups(
 /// return the SHM subset (identity + tenant + status + name); the full `identification` PII lives
 /// behind the `get_ilk_details` relay.
 fn handle_shm_read(state: &Arc<RuntimeState>, msg: &Message, op: &str) -> Value {
-    use fluxbee_sdk::identity::{list_ilks_from_hive_id, tenant_exists_in_hive_id};
+    use fluxbee_sdk::identity::list_ilks_from_hive_id;
     let params = msg.payload.get("params").cloned().unwrap_or_else(|| json!({}));
     // The envelope's tenant (rule 3); `tenant_in_params` already refused one inside params.
     let envelope_tenant = msg
@@ -1635,21 +1760,6 @@ fn handle_shm_read(state: &Arc<RuntimeState>, msg: &Message, op: &str) -> Value 
                     "get_ilk requires exactly one of params.ilk_id (ilk:<uuid>) or params.email (by email the envelope tenant_id is optional)",
                 ),
             }
-        }
-        "get_tenant" => {
-            let tenant_id = match claimed_tenant(envelope_tenant.and_then(Value::as_str), op) {
-                Ok(v) => v,
-                Err(e) => return e,
-            };
-            let exists = tenant_exists_in_hive_id(hive, &tenant_id).unwrap_or(false);
-            let ilk_count = list_ilks_from_hive_id(hive)
-                .map(|snap| snap.ilks.iter().filter(|i| i.tenant_id == tenant_id).count())
-                .unwrap_or(0);
-            json!({
-                "status": "ok",
-                "op": "get_tenant",
-                "result": { "exists": exists, "tenant_id": tenant_id, "ilk_count": ilk_count },
-            })
         }
         "list_ilks" => {
             let tenant_id = match claimed_tenant(envelope_tenant.and_then(Value::as_str), op) {
@@ -2540,8 +2650,9 @@ mod tests {
     }
 
     #[test]
-    fn translate_update_tenant_edits_only_name_and_domain() {
+    fn translate_update_tenant_edits_the_whole_tenant_but_pending() {
         let tenant = "tnt:11111111-1111-4111-8111-111111111111";
+        let sponsor = "tnt:22222222-2222-4222-8222-222222222222";
         let (action, p) = translate_cloud_op(
             "update_tenant",
             Some(tenant),
@@ -2557,21 +2668,143 @@ mod tests {
         let (_, p) =
             translate_cloud_op("update_tenant", Some(tenant), &json!({"domain": null})).unwrap();
         assert_eq!(p, json!({"tenant_id": tenant, "domain": ""}));
-        // Nothing to change, an empty name, or an operator field: refused, never dropped in silence.
+        // Stage 4: the status (active or suspended), the settings and the sponsor too.
+        let (_, p) = translate_cloud_op(
+            "update_tenant",
+            Some(tenant),
+            &json!({"status": "Suspended", "settings": {"plan": "pro"}, "sponsor_tenant_id": sponsor}),
+        )
+        .unwrap();
+        assert_eq!(
+            p,
+            json!({"tenant_id": tenant, "status": "suspended", "settings": {"plan": "pro"},
+                   "sponsor_tenant_id": sponsor})
+        );
+        let (_, p) = translate_cloud_op(
+            "update_tenant",
+            Some(tenant),
+            &json!({"sponsor_tenant_id": null}),
+        )
+        .unwrap();
+        assert_eq!(p, json!({"tenant_id": tenant, "sponsor_tenant_id": null}));
+        // Nothing to change, a bad value, pending (the operator's), the root tenant as sponsor or
+        // an unknown field: refused, never dropped in silence.
         for bad in [
             json!({}),
             json!({"name": "  "}),
             json!({"name": 3}),
             json!({"domain": 3}),
-            json!({"name": "Acme", "status": "suspended"}),
-            json!({"settings": {}}),
-            json!({"sponsor_tenant_id": null}),
+            json!({"status": "pending"}),
+            json!({"status": 1}),
+            json!({"settings": "x"}),
+            json!({"sponsor_tenant_id": fluxbee_sdk::DEFAULT_ROOT_TENANT_ID}),
+            json!({"sponsor_tenant_id": "tnt:NOT-CANONICAL"}),
+            json!({"name": "Acme", "approved_by": "x"}),
         ] {
             assert!(
                 translate_cloud_op("update_tenant", Some(tenant), &bad).is_err(),
                 "{bad}"
             );
         }
+    }
+
+    /// What Cloud sees of a node is its state: the process and the host paths stay in the hive.
+    #[test]
+    fn cloud_sees_the_state_of_its_nodes_not_how_they_run() {
+        let node = json!({
+            "node_name": "IO.slack.a@motherbee", "hive": "motherbee", "kind": "IO",
+            "lifecycle_state": "RUNNING", "health_state": "HEALTHY",
+            "runtime": {"name": "io.slack", "version": "0.1.68"},
+            "config": {"path": "/var/lib/fluxbee/nodes/IO/x/config.json", "config_version": 3},
+            "state": {"path": "/var/lib/fluxbee/nodes/IO/x/state.json"},
+            "identity": {"ilk_id": "ilk:a", "tenant_id": "tnt:a"},
+            "launched_by": "cloud", "relaunch_on_boot": true, "managed": true
+        });
+        let listed = cloud_view(
+            "list_nodes",
+            json!({"status": "ok", "tenant_id": "tnt:a", "nodes": [node], "unreachable_hives": []}),
+        );
+        let seen = &listed["nodes"][0];
+        assert_eq!(seen["config_version"], 3);
+        assert_eq!(seen["launched_by"], "cloud");
+        assert_eq!(seen["runtime"]["version"], "0.1.68");
+        assert!(seen.get("config").is_none() && seen.get("state").is_none());
+        let status = cloud_view(
+            "get_node_status",
+            json!({"status": "ok", "node_status": {
+                "node_name": "IO.slack.a@motherbee", "hive_id": "motherbee",
+                "lifecycle_state": "STOPPED", "health_state": "UNKNOWN",
+                "runtime": {"name": "io.slack", "resolved_version": "0.1.68"},
+                "process": {"pid": 42, "unit": "fluxbee-node-x"},
+                "config": {"path": "/x", "config_version": 3},
+                "identity": {"ilk_id": "ilk:a", "tenant_id": "tnt:a"}
+            }}),
+        );
+        assert_eq!(status["node_status"]["hive"], "motherbee");
+        assert_eq!(status["node_status"]["runtime"]["version"], "0.1.68");
+        assert!(status["node_status"].get("process").is_none());
+        // Any other op answers as the hive does.
+        assert_eq!(cloud_view("list_tokens", json!({"x": 1})), json!({"x": 1}));
+    }
+
+    /// Stage 4: the tenant reads and the node lifecycle go to the admin, scoped to the claimed
+    /// tenant; stop and delete are kills, a stop that lasts and the teardown.
+    #[test]
+    fn translate_stage_four_ops() {
+        let tenant = "tnt:11111111-1111-4111-8111-111111111111";
+        assert_eq!(
+            translate_cloud_op("get_tenant", Some(tenant), &json!({})).unwrap(),
+            ("get_tenant", json!({"tenant_id": tenant}))
+        );
+        assert_eq!(
+            translate_cloud_op("list_tenants", None, &json!({})).unwrap(),
+            ("list_tenants", json!({}))
+        );
+        assert_eq!(
+            translate_cloud_op("list_nodes", Some(tenant), &json!({})).unwrap(),
+            ("list_tenant_nodes", json!({"tenant_id": tenant}))
+        );
+        let node = json!({"node_name": "IO.slack.acme@motherbee"});
+        assert_eq!(
+            translate_cloud_op("get_node_status", Some(tenant), &node).unwrap(),
+            (
+                "get_node_status",
+                json!({"node_name": "IO.slack.acme@motherbee", "tenant_id": tenant})
+            )
+        );
+        assert_eq!(
+            translate_cloud_op("start_node", Some(tenant), &node)
+                .unwrap()
+                .0,
+            "start_node"
+        );
+        let (action, p) = translate_cloud_op("stop_node", Some(tenant), &node).unwrap();
+        assert_eq!(
+            (action, p["purge_instance"].clone()),
+            ("kill_node", json!(false))
+        );
+        let (action, p) = translate_cloud_op("delete_node", Some(tenant), &node).unwrap();
+        assert_eq!(
+            (action, p["purge_instance"].clone()),
+            ("kill_node", json!(true))
+        );
+        // Never a node that is not IO.*, never without the claimed tenant, never the genesis.
+        for op in ["get_node_status", "start_node", "stop_node", "delete_node"] {
+            assert!(
+                translate_cloud_op(op, Some(tenant), &json!({"node_name": "AI.x@motherbee"}))
+                    .is_err()
+            );
+            assert!(translate_cloud_op(op, None, &node).is_err());
+            assert!(
+                translate_cloud_op(op, Some(fluxbee_sdk::DEFAULT_ROOT_TENANT_ID), &node).is_err()
+            );
+        }
+        assert!(translate_cloud_op(
+            "get_tenant",
+            Some(fluxbee_sdk::DEFAULT_ROOT_TENANT_ID),
+            &json!({})
+        )
+        .is_err());
     }
 
     #[test]

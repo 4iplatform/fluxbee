@@ -82,6 +82,7 @@ pub fn classify_admin_action(action: &str) -> Option<ActionClass> {
         "list_hives"
         | "get_hive"
         | "list_nodes"
+        | "list_tenant_nodes"
         | "get_node_status"
         | "get_node_config"
         | "get_node_state"

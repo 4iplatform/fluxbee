@@ -2,10 +2,13 @@
 
 > **For the Fluxbee Cloud developers.** You do not need to know fluxbee's internals.
 >
-> Contract as of **fluxbee 0.1.65** (2026-10-14). Read from the code, operation by operation; §10
+> Contract as of **fluxbee 0.1.68** (2026-10-15). Read from the code, operation by operation; §10
 > lists what was also checked live on the PROD hive. §9 lists what changed for Cloud in each
 > release. The model behind it: `docs/ilk-tenant-model-v1.md` (an identity is the actor and is
-> never duplicated; a tenant is a cost center; companies, members and billing are Cloud's).
+> never duplicated; a tenant is a cost center, a workspace of the system, never a company).
+>
+> **Tenant, not company.** Fluxbee sees tenants only. Cloud associates each of its companies with
+> a tenant (today one to one); companies, members and billing are Cloud's.
 
 ---
 
@@ -13,7 +16,7 @@
 
 A fluxbee **hive** is a private installation. Its services (the vault, the identity registry, the
 node launcher) talk over an internal network with no HTTP door. Fluxbee Cloud still has to manage
-its customers inside a hive: create a company, store its credentials, list them, launch a node.
+its customers inside a hive: create a tenant, store its credentials, list them, launch a node.
 
 **IO.cloud is the one door for that, and it is narrow on purpose.** It runs inside the hive,
 publishes **one HTTPS endpoint**, and knows a fixed list of operations (§5). It is not a general API
@@ -75,7 +78,7 @@ Every request is one JSON object:
 ```jsonc
 {
   "op":         "list_tokens",       // required, exact and case-sensitive (no trim)
-  "tenant_id":  "tnt:<uuid>",        // the company the op acts on; see rule 3
+  "tenant_id":  "tnt:<uuid>",        // the tenant the op acts on; see rule 3
   "params":     { },                 // per op (§5); absent = {}
   "request_id": "<your uuid>"        // optional, strongly recommended: it is the trace key
 }
@@ -170,14 +173,15 @@ The service codes of each op are in §5.
 
 | op | kind | tenant | what |
 |---|---|---|---|
-| `create_tenant` | relay | none | create (or find) a company |
-| `update_tenant` | relay | yes | rename your company or change its domain |
-| `get_tenant` | local | yes | does your company exist, and how many identities are charged to it |
-| `delete_tenant` / `restore_tenant` | relay | yes | mark your company deleted / undo it |
-| `register_human` | local | yes | a person's account, charged to your company |
-| `set_ilk_tenant` | relay | yes | charge a person to your company |
+| `create_tenant` | relay | none | create (or find) a tenant |
+| `update_tenant` | relay | yes | edit your tenant: name, domain, status (suspend, reactivate), settings, sponsor |
+| `get_tenant` | relay | yes | your tenant's whole record, and how many people and nodes are charged to it |
+| `list_tenants` | relay | none | every tenant but the genesis one, deleted ones included |
+| `delete_tenant` / `restore_tenant` | relay | yes | mark your tenant deleted / undo it |
+| `register_human` | local | yes | a person's account, charged to your tenant |
+| `set_ilk_tenant` | relay | yes | charge a person to your tenant |
 | `get_ilk` | local | none | fast existence + summary of an identity |
-| `list_ilks` | local | yes | the identities charged to your company |
+| `list_ilks` | local | yes | the identities charged to your tenant |
 | `get_ilk_details` | relay | none | everything about one identity |
 | `delete_ilk` / `restore_ilk` | relay | none | delete a person's account / undo it |
 | `put_token` | relay | yes | store a credential, and say which nodes use it |
@@ -185,6 +189,9 @@ The service codes of each op are in §5.
 | `list_tokens` | relay | yes | your credentials: metadata, who uses them and use, never the value |
 | `delete_token` | relay | yes | delete one credential |
 | `provision_node` | relay | yes | launch an `IO.*` node |
+| `list_nodes` | relay | yes | your tenant's nodes on every hive, with their state |
+| `get_node_status` | relay | yes | one node's status |
+| `start_node` / `stop_node` / `delete_node` | relay | yes | start, stop (it stays stopped) or delete a node you launched |
 | `list_cloud_actions` | local | none | this list, from the hive itself |
 
 *relay* = IO.cloud turns it into a hive admin action; *local* = IO.cloud answers it itself, the fast
@@ -197,7 +204,7 @@ post() { curl -sS -m 35 -X POST "$URL" -H "Authorization: Bearer $TOK" \
               -H 'Content-Type: application/json' -d "$1"; echo; }
 ```
 
-### 5.1 Companies (tenants)
+### 5.1 Tenants
 
 #### `create_tenant`
 
@@ -227,39 +234,67 @@ Errors: `INVALID_REQUEST` (bad `status`, a non-string field), `INVALID_SPONSOR_T
 
 | field | | |
 |---|---|---|
-| `tenant_id` (root) | required | the company you edit |
+| `tenant_id` (root) | required | the tenant you edit |
 | `params.name` | optional | non-empty |
 | `params.domain` | optional | lowercased; `""` or `null` clears it |
+| `params.status` | optional | `active` or `suspended` |
+| `params.settings` | optional | a JSON object; replaces the settings |
+| `params.sponsor_tenant_id` | optional | another tenant (`tnt:<uuid>`, never the genesis one), or `null` to clear it |
 
-At least one of the two. **Any other field is refused** (`status`, `settings` and the sponsor are the
-operator's).
+At least one. **Any other field is refused**, and so is `pending`, which stays the operator's.
+
+- **Suspending a tenant:** its nodes get no credentials (they drop the ones they hold) and no node of
+  it starts (`TENANT_NOT_ACTIVE`). The nodes that run keep running. **Reactivating it:** they get
+  their credentials back, and the ones that died are relaunched within a minute.
+- The genesis tenant is never edited (`TENANT_ROOT_PROTECTED`).
 
 ```json
 {"status":"ok","op":"update_tenant","result":{"status":"ok","tenant_id":"tnt:94cd37b8-…","sponsor_tenant_id":null}}
 ```
 
-It does not return the tenant: read it again (`get_ilk_details` carries the `tenant` block).
+It does not return the tenant: read it again with `get_tenant`.
 
 | `error_code` | when |
 |---|---|
-| `TENANT_NAME_TAKEN` | another company has that name (case and spaces ignored), including one marked deleted |
+| `TENANT_NAME_TAKEN` | another tenant has that name (case and spaces ignored), including one marked deleted |
 | `TENANT_DOMAIN_TAKEN` | the same for the domain |
 | `TENANT_NOT_FOUND` / `TENANT_DELETED` | |
-| `INVALID_REQUEST` | nothing to change, an empty name, another field |
+| `INVALID_SPONSOR_TENANT` / `INVALID_SPONSOR_RELATION` | the sponsor does not exist / it is the tenant itself or makes a cycle |
+| `INVALID_REQUEST` | nothing to change, an empty name, `pending`, a bad value, another field |
 
-A refused update changes nothing. Keeping the company's current name or domain is not a conflict.
+A refused update changes nothing. Keeping the tenant's current name or domain is not a conflict.
 
-#### `get_tenant` (local)
+#### `get_tenant`
 
-`tenant_id` at the root. `result: {"exists": true, "tenant_id": "tnt:…", "ilk_count": 2}`.
+`tenant_id` at the root. The whole record, from the hive's identity store:
+
+```json
+{"status":"ok","op":"get_tenant","result":{"status":"ok","tenant_id":"tnt:…",
+ "tenant":{"tenant_id":"tnt:…","name":"Acme","domain":"acme.com","status":"active","settings":{},
+           "sponsor_tenant_id":null,"deleted_at_ms":null},
+ "sponsor":null,"children":[],"child_count":0,"ilk_count":4,"people_count":2,"node_count":2,
+ "is_root":true,"is_sponsor":false}}
+```
+
+- `people_count`: the people charged to it (accounts, contacts, pending signups; not the deleted
+  ones). `node_count`: the node identities charged to it. `ilk_count`: every identity.
+- A deleted tenant answers with `deleted_at_ms` set.
+- `is_root` means it has no sponsor; the genesis tenant itself is refused (`TENANT_ROOT_PROTECTED`).
+
+#### `list_tenants`
+
+No tenant, no params. Every tenant but the genesis one, deleted ones included (with
+`deleted_at_ms`, so you can restore them): `result: {"status":"ok","count":2,"tenants":[{tenant_id,
+name, domain, status, settings, sponsor_tenant_id, child_count, ilk_count, people_count, node_count,
+is_root, is_sponsor, deleted_at_ms}, …]}`.
 
 #### `delete_tenant` / `restore_tenant`
 
-`tenant_id` at the root, no params. Delete **disables** the company: it is marked deleted,
+`tenant_id` at the root, no params. Delete **disables** the tenant: it is marked deleted,
 reversibly, and its name and domain stay reserved. **No person is marked**, whatever they are: an
 account, a contact known through a channel (a Slack user, a phone that wrote in), a signup never
 completed. They keep their identity and channels, and `set_ilk_tenant` charges them to another
-company. Restore brings the company back as it was. Only the operator purges, and only once nobody
+tenant. Restore brings the tenant back as it was. Only the operator purges, and only once nobody
 is charged to it.
 
 While it is deleted, like while it is suspended, its nodes do not start and its credentials are not
@@ -270,7 +305,7 @@ handed out (§5.3, §5.4).
 - restore: `{"status":"ok","tenant_id":…,"state":"active","people_charged":3}`.
 - Errors:
   - `TENANT_HAS_NODES`: node identities live in it (kill its nodes first).
-  - `TENANT_HAS_CHILDREN`: it sponsors other companies.
+  - `TENANT_HAS_CHILDREN`: it sponsors other tenants.
   - `TENANT_NOT_DELETED` (restore), `TENANT_NOT_FOUND`.
 
 ### 5.2 People (identities, "ilk")
@@ -285,7 +320,7 @@ handed out (§5.3, §5.4).
 | `params.schema_version` | required | `1` (a number) |
 | `params.operation` | required | `"complete_registration"` |
 | `params.subject.display_name` | required | |
-| `params.subject.email` | required | a real address; the person's key in the company |
+| `params.subject.email` | required | a real address; the person's key in the tenant |
 | `params.subject.phone`, `.company_name`, `.attributes` | optional | stored on the identity |
 
 **One email is one account, in the whole hive.** The person is charged to the tenant at the root;
@@ -307,9 +342,9 @@ their email (the account's `cloud` channel) belongs to no tenant.
    "tenant_id":"tnt:…","existing":true,"success":true,"merged":false}
   ```
 
-  To charge it to your company, call `set_ilk_tenant`.
-- **A signup that was never completed** (from any company) is picked up by the next
-  `register_human` of that email, charged to the new company.
+  To charge it to your tenant, call `set_ilk_tenant`.
+- **A signup that was never completed** (from any tenant) is picked up by the next
+  `register_human` of that email, charged to the new tenant.
 - Errors:
   - `ACCOUNT_AMBIGUOUS`: that email is held twice from before 0.1.65 (by several people, or by a
     person and another identity); the operator resolves it.
@@ -322,7 +357,7 @@ their email (the account's `cloud` channel) belongs to no tenant.
 
 #### `set_ilk_tenant`
 
-`tenant_id` at the root (the company to charge the person to) + `params.ilk_id`. A tenant is a cost
+`tenant_id` at the root (the tenant to charge the person to) + `params.ilk_id`. A tenant is a cost
 center, so this grants and revokes nothing; the person keeps every channel and lookup.
 
 ```json
@@ -332,14 +367,14 @@ center, so this grants and revokes nothing; the person keeps every channel and l
 
 - Already charged there: `changed:false`.
 - Any person: an account from anywhere; a contact that never registered (a temporary) only out of
-  a deleted company, which is how a deleted company is emptied. A contact of an active company
-  stays: that company registers it. Every change is recorded in the hive.
+  a deleted tenant, which is how a deleted tenant is emptied. A contact of an active tenant
+  stays: that tenant registers it. Every change is recorded in the hive.
 - Errors:
-  - `DUPLICATE_EMAIL`: another person charged to that company has the same email in their
+  - `DUPLICATE_EMAIL`: another person charged to that tenant has the same email in their
     identification.
   - `TENANT_NOT_ACTIVE` (pending or suspended), `TENANT_DELETED`, `TENANT_NOT_FOUND`,
     `TENANT_ROOT_PROTECTED`.
-  - `INVALID_TENANT_TRANSITION` (a contact of a company that is not deleted),
+  - `INVALID_TENANT_TRANSITION` (a contact of a tenant that is not deleted),
     `ILK_TYPE_MISMATCH` (not a person), `ILK_NOT_FOUND` (or deleted).
 
 #### `get_ilk` (local, fast)
@@ -399,7 +434,7 @@ operator purges). Idempotent.
 
 - delete: `{"status":"ok","ilk_id":…,"state":"deleted","already_deleted":false}`;
   restore: `{"status":"ok","ilk_id":…,"state":"active"}`.
-- A person also comes back while the company they are charged to is deleted, still charged to it;
+- A person also comes back while the tenant they are charged to is deleted, still charged to it;
   `set_ilk_tenant` then moves them.
 - Errors: `ILK_NOT_FOUND`, `ILK_TYPE_MISMATCH` (not a person), `ILK_NOT_DELETED` (restore),
   `ILK_KEY_CONFLICT` (restoring it would bring back a second account for its email).
@@ -408,32 +443,32 @@ operator purges). Idempotent.
 
 ### 5.3 Credentials (the hive's vault)
 
-**Keys share one namespace for the whole hive.** A key belongs to the company that wrote it. Name
+**Keys share one namespace for the whole hive.** A key belongs to the tenant that wrote it. Name
 yours `<provider>:<tenant_id>:<identifier>`, which also makes them easy to filter.
 
-**Who uses a credential** (`docs/ilk-tenant-model-v1.md` §2.2). The company is who pays for its use;
+**Who uses a credential** (`docs/ilk-tenant-model-v1.md` §2.2). The tenant is who pays for its use;
 it is not a permission. A credential is used by:
 - **one node that owns it** (`owner_node`);
 - **the nodes it is assigned to** (`nodes` in `put_token`, then `assign_token`): one or several, each
-  charged to your company. Read them from `list_ilks` (the non-`human` identities);
-- **every node of your company**, when it has neither: a *general* credential, the simple choice for
-  a company's AI key in tests or a small setup.
+  charged to your tenant. Read them from `list_ilks` (the non-`human` identities);
+- **every node of your tenant**, when it has neither: a *general* credential, the simple choice for
+  a tenant's AI key in tests or a small setup.
 
-A node uses one it owns, else one assigned to it, else its company's general one. The hive hands the
-value out only while the company is active: a suspended company's nodes are refused it (and drop it);
+A node uses one it owns, else one assigned to it, else its tenant's general one. The hive hands the
+value out only while the tenant is active: a suspended tenant's nodes are refused it (and drop it);
 while the hive cannot tell (its identity registry still loading), they keep what they have and retry.
 
 #### `put_token`
 
 | field | | |
 |---|---|---|
-| `tenant_id` (root) | required | the credential's company |
+| `tenant_id` (root) | required | the credential's tenant |
 | `params.key` | required | 1–256 bytes of `[a-z0-9:_-]`, starting with `[a-z0-9]` |
 | `params.value` | required | any JSON but `null`, ≤ 1 MiB serialized |
 | `params.resource_type` | required (or in `params.metadata`) | normalized: lowercase, anything else → `_` (`"Google Calendar"` → `google_calendar`) |
 | `params.owner_node` | optional | an `IO.*` node **that already exists**: it owns the credential and uses it |
-| `params.nodes` | optional | the nodes it is assigned to: node names (`IO.slack.sales@motherbee`) or identity ids (`ilk:…`), each **existing and charged to your company**, never a person |
-| (neither) | | a general credential: every node of your company uses it |
+| `params.nodes` | optional | the nodes it is assigned to: node names (`IO.slack.sales@motherbee`) or identity ids (`ilk:…`), each **existing and charged to your tenant**, never a person |
+| (neither) | | a general credential: every node of your tenant uses it |
 | `params.metadata` | optional | `description` (string) and `tags` (string array) |
 
 ```json
@@ -457,12 +492,12 @@ while the hive cannot tell (its identity registry still loading), they keep what
   hive's nodes expect today: `openai`/`anthropic` → `{"api_key":…}`; `slack` →
   `{"app_token":…,"bot_token":…}`; `postgres` → `{"postgres_url":"postgresql://user:pass@host:5432"}`
   (no database name).
-- It does not check that the company exists.
+- It does not check that the tenant exists.
 
 | `error_code` | when |
 |---|---|
-| `KEY_TAKEN` | the key belongs to another company. It never moves |
-| `INVALID_REQUEST` | key charset/length, value over 1 MiB, missing field, `owner_node` not `IO.*` or not registered, a node in `nodes` that does not exist, is charged to another company or is a person, a reserved infrastructure key (`edge_channel_secret:*`, `edge_tls*`, `ssh:*`, `edge_fanout_verify:*`) |
+| `KEY_TAKEN` | the key belongs to another tenant. It never moves |
+| `INVALID_REQUEST` | key charset/length, value over 1 MiB, missing field, `owner_node` not `IO.*` or not registered, a node in `nodes` that does not exist, is charged to another tenant or is a person, a reserved infrastructure key (`edge_channel_secret:*`, `edge_tls*`, `ssh:*`, `edge_fanout_verify:*`) |
 | `INVALID_VALUE` | metadata of the wrong type |
 | `STORAGE_ERROR`, `ENCRYPTION_ERROR`, `MASTER_KEY_NOT_AVAILABLE` | the vault |
 
@@ -470,7 +505,7 @@ while the hive cannot tell (its identity registry still loading), they keep what
 
 | field | | |
 |---|---|---|
-| `tenant_id` (root) | required | lists **only** that company's credentials |
+| `tenant_id` (root) | required | lists **only** that tenant's credentials |
 | `params.resource_type` | optional | exact, in its normalized form |
 | `params.prefix` | optional | key prefix |
 | `params.limit` | optional | 1–1000; the vault's default is 200 |
@@ -491,12 +526,12 @@ while the hive cannot tell (its identity registry still loading), they keep what
 - `metadata.ilk` appears only for a credential with an owner (`owner_node`): its identity.
 - `metadata.assigned_ilks` lists the identities of the nodes it is assigned to. A credential with
   neither `ilk` nor `assigned_ilks` is general.
-- A company with no credentials, or one that does not exist: `count:0`.
+- A tenant with no credentials, or one that does not exist: `count:0`.
 
 #### `assign_token`
 
 `tenant_id` at the root + `params.key` + `params.nodes`: the nodes the credential is assigned to from
-now on (names or `ilk:` ids, each existing and charged to your company, never a person). It replaces
+now on (names or `ilk:` ids, each existing and charged to your tenant, never a person). It replaces
 the list; `[]` leaves it with none, so a credential with no owner becomes general again. The value
 does not change.
 
@@ -516,8 +551,8 @@ does not change.
 
 | `error_code` | when |
 |---|---|
-| `KEY_NOT_FOUND` | the key does not exist or belongs to another company |
-| `INVALID_REQUEST` | `params.nodes` missing or not a list; a node that does not exist, is charged to another company or is a person; a reserved infrastructure key |
+| `KEY_NOT_FOUND` | the key does not exist or belongs to another tenant |
+| `INVALID_REQUEST` | `params.nodes` missing or not a list; a node that does not exist, is charged to another tenant or is a person; a reserved infrastructure key |
 
 #### `delete_token`
 
@@ -529,7 +564,7 @@ does not change.
 
 | `error_code` | when |
 |---|---|
-| `KEY_NOT_FOUND` | the key does not exist **or belongs to another company**: same code and same text, on purpose |
+| `KEY_NOT_FOUND` | the key does not exist **or belongs to another tenant**: same code and same text, on purpose |
 | `INVALID_REQUEST` | missing key, a reserved infrastructure key |
 
 The hive announces the deletion to its nodes. A node that already loaded the value may keep using it
@@ -541,7 +576,7 @@ until it reloads; revoking the credential at the provider is what makes it usele
 
 | field | | |
 |---|---|---|
-| `tenant_id` (root) | required | the node's company |
+| `tenant_id` (root) | required | the node's tenant |
 | `params.node_name` | required | **must start with `IO.`**; a `@hive` suffix picks the server (omit it if unsure) |
 | `params.runtime` | send it | what to run (e.g. `io.api`). Omitted, it is derived from the name's first two segments, which rarely exists |
 | `params.runtime_version` | optional | default `"current"` |
@@ -560,10 +595,77 @@ until it reloads; revoking the credential at the provider is what makes it usele
 | `error_code` | when |
 |---|---|
 | `NODE_ALREADY_EXISTS` | a node with that name exists |
-| `TENANT_NOT_ACTIVE` | the company is pending or suspended: it starts no node |
+| `TENANT_NOT_ACTIVE` | the tenant is pending or suspended: it starts no node |
 | `RUNTIME_NOT_AVAILABLE` | the runtime or version cannot be resolved |
 | `INVALID_REQUEST` | not `IO.*`, runtime not derivable, bad version |
-| `IDENTITY_REGISTER_FAILED`, `CONFIG_WRITE_FAILED`, `SERVICE_FAILED`, `SPAWN_FAILED` | the hive could not launch it; for a deleted company, `IDENTITY_REGISTER_FAILED` with `TENANT_DELETED` in the detail |
+| `IDENTITY_REGISTER_FAILED`, `CONFIG_WRITE_FAILED`, `SERVICE_FAILED`, `SPAWN_FAILED` | the hive could not launch it; for a deleted tenant, `IDENTITY_REGISTER_FAILED` with `TENANT_DELETED` in the detail |
+
+The hive records that you launched it (`launched_by: "cloud"`): only those nodes can you start, stop
+or delete. Configuring a node after it is launched, routing it or wiring it into a solution is the
+operator's work, through Archi.
+
+#### `list_nodes`
+
+`tenant_id` at the root, no params. Every node charged to your tenant, on every hive: the ones you
+launched and the ones the operator launched.
+
+```json
+{"status":"ok","op":"list_nodes","result":{"status":"ok","tenant_id":"tnt:…","count":1,
+ "nodes":[{"node_name":"IO.slack.acme@motherbee","hive":"motherbee","kind":"IO",
+           "runtime":{"name":"io.slack","version":"0.1.68"},
+           "lifecycle_state":"RUNNING","health_state":"HEALTHY",
+           "identity":{"ilk_id":"ilk:…","tenant_id":"tnt:…"},"config_version":1,
+           "launched_by":"cloud","relaunch_on_boot":true}],
+ "unreachable_hives":[]}}
+```
+
+You see a node's state, not how the hive runs it: no process, unit or host paths.
+
+- `lifecycle_state`: `RUNNING`, `STARTING`, `STOPPED` or `FAILED`, from the hive itself, for every
+  node.
+- `health_state`: what the node reports about itself. IO nodes are not all at the same stage, and
+  an older one may answer `UNKNOWN`.
+- `identity.ilk_id` is what `list_tokens` shows in `assigned_ilks`.
+- `relaunch_on_boot: false` means it was stopped and stays stopped until `start_node`.
+- A hive that did not answer in time is listed in `unreachable_hives`; its nodes are missing from
+  `nodes`, never left out in silence.
+- A node appears once it really exists, so after `provision_node` read it here, not from your own
+  records.
+
+#### `get_node_status`
+
+`tenant_id` at the root + `params.node_name` (`IO.…@hive`). The same view as `list_nodes`, for one
+node, plus when the hive looked (`observed_at`), where the health came from (`health_source`) and
+the node's last error when it reported one:
+
+```json
+{"status":"ok","op":"get_node_status","result":{"status":"ok","node_status":{
+ "node_name":"IO.slack.acme@motherbee","hive":"motherbee","lifecycle_state":"RUNNING",
+ "health_state":"HEALTHY","health_source":"NODE_REPORTED","observed_at":"…",
+ "runtime":{"name":"io.slack","version":"0.1.68"},"identity":{"ilk_id":"ilk:…","tenant_id":"tnt:…"},
+ "config_version":1, …}}}
+```
+
+A node of another tenant, or one that does not exist, answers `NODE_NOT_FOUND`.
+
+#### `start_node` / `stop_node` / `delete_node`
+
+`tenant_id` at the root + `params.node_name`. **Only the IO nodes you launched in your tenant**: any
+other node answers `NODE_NOT_FOUND`, exactly as one that does not exist.
+
+| op | what it does |
+|---|---|
+| `start_node` | starts it; `state: "started"`, or `"already_running"`. Refused with `TENANT_NOT_ACTIVE` while the tenant is pending or suspended |
+| `stop_node` | stops it, and it **stays stopped**: the hive does not bring it back, not even after a reboot, until `start_node`. Its config, identity and credentials stay. A node that dies on its own is relaunched; one you stopped is not |
+| `delete_node` | stops it and removes it: its timers, the credentials it **owns** and its identity go, and its name is free again. Credentials only **assigned** to it stay (they are the tenant's). Final |
+
+```json
+{"status":"ok","op":"stop_node","result":{"status":"ok","state":"stopped",
+ "node_name":"IO.slack.acme@motherbee","unit_was_active":true,"relaunch_on_boot":false, …}}
+```
+
+To cut a node's access without stopping it, take its credential away (`assign_token`) or delete
+the credential (`delete_token`); to cut a whole tenant, suspend it (`update_tenant`).
 
 ### 5.5 `list_cloud_actions` (local)
 
@@ -629,8 +731,8 @@ post '{"op":"list_cloud_actions"}'
 
 ## 8. Limits and what is not there
 
-1. **One platform token; the tenant is trusted as sent.** No per-company credentials and no
-   end-user identity: whoever holds the token acts on any company. Guard it as a platform secret.
+1. **One platform token; the tenant is trusted as sent.** No per-tenant credentials and no
+   end-user identity: whoever holds the token acts on any tenant. Guard it as a platform secret.
 2. **`create_tenant` is not scoped:** it can set `status`, `settings` and a sponsor.
 3. **The edge host is the trust anchor:** it checks the token and sees the traffic in clear. Moving
    Cloud's channel end to end is planned (host-posture spec, O5).
@@ -648,17 +750,33 @@ post '{"op":"list_cloud_actions"}'
 
 ## 9. What changed for Cloud
 
+### 0.1.68
+
+- **"Tenant", never "company", in this contract.** Fluxbee sees tenants; which company a tenant
+  stands for is yours.
+- **`update_tenant` edits the whole tenant:** also `status` (`active` or `suspended`), `settings`
+  and `sponsor_tenant_id`. Suspending a tenant cuts its credentials and stops it starting nodes;
+  reactivating it brings everything back.
+- **`get_tenant` answers the whole record** through the hive's admin (it was a fast local read of
+  `exists` and `ilk_count`): name, domain, status, settings, sponsor, `deleted_at_ms`,
+  `people_count` and `node_count`.
+- **New `list_tenants`:** every tenant but the genesis one, deleted ones included.
+- **Your nodes:** new `list_nodes` and `get_node_status` (state, not process), and `start_node`,
+  `stop_node` (it stays stopped) and `delete_node` for the IO nodes you launched.
+- **`set_ilk_tenant`'s refusal of a contact** of a tenant that is not deleted answers
+  `INVALID_TENANT_TRANSITION` alone (in 0.1.67 the detail came after a `|`).
+
 ### 0.1.67
 
-- **`delete_tenant` disables the company and marks no person.** `TENANT_HAS_ACCOUNTS` is gone, and
+- **`delete_tenant` disables the tenant and marks no person.** `TENANT_HAS_ACCOUNTS` is gone, and
   so are `cascaded_ilks` and `pending_signups` in its answer; it answers `people_charged`.
   `restore_tenant` answers `people_charged` instead of `restored_ilks`.
-- **`set_ilk_tenant` moves contacts too, out of a deleted company,** to empty it before the
-  operator purges it. `INVALID_TENANT_TRANSITION` now means a contact of a company that is not
+- **`set_ilk_tenant` moves contacts too, out of a deleted tenant,** to empty it before the
+  operator purges it. `INVALID_TENANT_TRANSITION` now means a contact of a tenant that is not
   deleted.
-- **`restore_ilk` brings a person back while their company is deleted** (it answered
+- **`restore_ilk` brings a person back while their tenant is deleted** (it answered
   `TENANT_DELETED`).
-- **A company that is not active starts no node:** `provision_node` answers `TENANT_NOT_ACTIVE`
+- **A tenant that is not active starts no node:** `provision_node` answers `TENANT_NOT_ACTIVE`
   while it is pending or suspended (a deleted one already failed to register the node). Its running
   nodes keep running without credentials.
 
@@ -669,14 +787,14 @@ post '{"op":"list_cloud_actions"}'
 - **Who uses a credential** (§5.3): `put_token` takes `params.nodes`, and the new `assign_token`
   changes them without touching the value; `list_tokens` shows `metadata.assigned_ilks`. A
   credential with no owner and no node is general, as the pool was.
-- **A suspended or deleted company's credentials are not handed out** to its nodes.
+- **A suspended or deleted tenant's credentials are not handed out** to its nodes.
 
 ### 0.1.65
 
 - **One email is one account, in the whole hive.** `register_human` for an email that already has
   one answers `existing: true` with that account and its tenant, and creates nothing.
   `ACCOUNT_AMBIGUOUS` and `ACCOUNT_IN_ROOT_TENANT` mark data from before.
-- **New op `set_ilk_tenant`:** charge a person to your company.
+- **New op `set_ilk_tenant`:** charge a person to your tenant.
 - **People are not tenant-scoped:**
   - `get_ilk`, `get_ilk_details`, `delete_ilk` and `restore_ilk` take no tenant;
   - `get_ilk` by email answers the account;
@@ -696,7 +814,7 @@ post '{"op":"list_cloud_actions"}'
 - **`get_ilk_details` by email answers `NOT_FOUND`** (was `ILK_NOT_FOUND`), like by id.
 - **No op acts on the root tenant** (`TENANT_ROOT_PROTECTED`; `provision_node` used to answer
   `TENANT_ROOT_NOT_ALLOWED` from the hive).
-- **`put_token` can no longer overwrite another company's key** (`KEY_TAKEN`), and
+- **`put_token` can no longer overwrite another tenant's key** (`KEY_TAKEN`), and
   `edge_fanout_verify:*` joined the reserved keys.
 - **Every error carries `error_code`** and every reply carries `op`. IO.cloud's own validation
   errors are `INVALID_REQUEST`; a hive that does not answer in time is `ADMIN_UNAVAILABLE`.
@@ -710,42 +828,42 @@ post '{"op":"list_cloud_actions"}'
 **0.1.67:** on PROD, 2026-10-15, through the public door with Cloud's token, with the operator
 suspending, reactivating and purging (`lab/DEPLOYMENTS.md`, 0.1.67):
 
-- a suspended company's node is refused a restart (`TENANT_NOT_ACTIVE`) and keeps running without its
+- a suspended tenant's node is refused a restart (`TENANT_NOT_ACTIVE`) and keeps running without its
   credential; a new node is refused; stopped, it is not relaunched; reactivated, it comes back
   within a minute;
 - `delete_tenant` with people charged marks nobody: `people_charged` counts them, they still answer
   (by id and by email), a deleted person comes back with `restore_ilk`, and `restore_tenant`
-  brings the company back as it was;
+  brings the tenant back as it was;
 - `delete_tenant` with a node answers `TENANT_HAS_NODES`;
-- `set_ilk_tenant` moves an account and a contact out of the deleted company; a contact of a company
+- `set_ilk_tenant` moves an account and a contact out of the deleted tenant; a contact of a tenant
   that is not deleted is refused. **In 0.1.67 that refusal arrives with its detail after a `|` in
   `error_code` (`INVALID_TENANT_TRANSITION|…`); fixed for the next release.**
 
 **0.1.66:** on PROD, 2026-10-14, through the public door with Cloud's token: 22 checks, all passing
 (`lab/DEPLOYMENTS.md`, 0.1.66). What each node read was taken from the hive's vault audit, with four
-IO.slack nodes of two companies:
+IO.slack nodes of two tenants:
 
 - a credential assigned to two nodes reaches those two only; taken from one, that one stops at once;
-- general, it reaches every node of its company and none of another;
-- assigning a node of another company, or a person, answers `INVALID_REQUEST`; another company
+- general, it reaches every node of its tenant and none of another;
+- assigning a node of another tenant, or a person, answers `INVALID_REQUEST`; another tenant
   assigning your key answers `KEY_NOT_FOUND`;
-- a suspended company's nodes are refused it, and get it back when the company is reactivated;
+- a suspended tenant's nodes are refused it, and get it back when the tenant is reactivated;
 - `get_ilk` and `list_ilks` summaries carry `pending_signup`.
 
 **0.1.65:** on PROD, 2026-10-14, through the public door from outside, with Cloud's token: 30 checks,
 all passing (`lab/DEPLOYMENTS.md`, 0.1.65). The data was made with 0.1.64 first: the same email from
-two companies, a unique email, a deleted person.
+two tenants, a unique email, a deleted person.
 
 - the email held twice answers `ACCOUNT_AMBIGUOUS`;
-- the unique email, asked from another company, answers its account (`existing: true`, still
+- the unique email, asked from another tenant, answers its account (`existing: true`, still
   charged where it was);
-- a new account asked from two companies is one identity;
+- a new account asked from two tenants is one identity;
 - `set_ilk_tenant` moves it (`changed: false` the second time), never to the root tenant;
 - a person deleted before 0.1.65, once restored, is where `register_human` finds her;
-- reads by id across companies work;
+- reads by id across tenants work;
 - `delete_ilk` of a node answers `ILK_TYPE_MISMATCH`;
 - `delete_tenant` with an account charged answers `TENANT_HAS_ACCOUNTS` (no longer since 0.1.67:
-  deleting a company marks no one);
+  deleting a tenant marks no one);
 - once the operator purged the extra identity and the hive restarted, the email that had been held
   twice answered its one account.
 
@@ -754,15 +872,15 @@ two companies, a unique email, a deleted person.
 - the catalog lists 16 ops;
 - rule 3: the envelope tenant only, never the root, the canonical spelling only;
 - credentials:
-  - `KEY_TAKEN` across companies, even with the same value;
+  - `KEY_TAKEN` across tenants, even with the same value;
   - the listing shows metadata and never the value;
-  - another company's key reads exactly like a missing one;
+  - another tenant's key reads exactly like a missing one;
   - reserved keys are refused;
 - `update_tenant` with its `*_TAKEN` codes;
-- a node in the company with its own credential, which the node's teardown deleted.
+- a node in the tenant with its own credential, which the node's teardown deleted.
 
-Two of its checks no longer hold since 0.1.65: a person read by id from another company (now
-visible, since a tenant is a cost center), and `delete_ilk` from another company
+Two of its checks no longer hold since 0.1.65: a person read by id from another tenant (now
+visible, since a tenant is a cost center), and `delete_ilk` from another tenant
 (`ILK_TENANT_MISMATCH`; now `delete_ilk` takes no tenant and acts on people only).
 
 The status and error codes, and the fields those checks read, matched §5. The rest of each example

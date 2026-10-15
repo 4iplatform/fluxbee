@@ -631,6 +631,10 @@ impl IdentityStore {
     fn tenant_summary_value(&self, tenant: &TenantRecord) -> Value {
         let child_count = self.tenant_child_count(&tenant.tenant_id);
         let ilk_count = self.tenant_ilk_count(&tenant.tenant_id);
+        // What is charged to it: people (not marked) and node identities (docs/ilk-tenant-model-v1.md
+        // §2.4, what Fluxbee Cloud reads).
+        let people_count = self.tenant_people(&tenant.tenant_id).len();
+        let node_count = self.tenant_node_ilks(&tenant.tenant_id).len();
         let is_root = tenant.sponsor_tenant_id.is_none();
         let is_sponsor = child_count > 0;
         json!({
@@ -642,6 +646,8 @@ impl IdentityStore {
             "sponsor_tenant_id": tenant.sponsor_tenant_id,
             "child_count": child_count,
             "ilk_count": ilk_count,
+            "people_count": people_count,
+            "node_count": node_count,
             "is_root": is_root,
             "is_sponsor": is_sponsor,
             "deleted_at_ms": tenant.deleted_at_ms,
@@ -814,6 +820,8 @@ impl IdentityStore {
             .and_then(|sponsor_id| self.tenants.get(sponsor_id).cloned());
         let child_count = self.tenant_child_count(tenant_id);
         let ilk_count = self.tenant_ilk_count(tenant_id);
+        let people_count = self.tenant_people(tenant_id).len();
+        let node_count = self.tenant_node_ilks(tenant_id).len();
         let is_root = tenant.sponsor_tenant_id.is_none();
         let is_sponsor = child_count > 0;
         let mut child_tenants: Vec<TenantRecord> = self
@@ -835,13 +843,17 @@ impl IdentityStore {
             "sponsor": sponsor,
             "child_count": child_count,
             "ilk_count": ilk_count,
+            "people_count": people_count,
+            "node_count": node_count,
             "is_root": is_root,
             "is_sponsor": is_sponsor,
             "children": children,
         }))
     }
 
-    fn list_tenants_payload(&self, include_deleted: bool) -> Value {
+    /// `exclude_root` leaves the genesis tenant out: Fluxbee Cloud manages every tenant but that one
+    /// (docs/ilk-tenant-model-v1.md §2.4).
+    fn list_tenants_payload(&self, include_deleted: bool, exclude_root: bool) -> Value {
         let mut tenant_ids: Vec<&String> = self.tenants.keys().collect();
         tenant_ids.sort_unstable();
 
@@ -850,6 +862,9 @@ impl IdentityStore {
             .filter_map(|tenant_id| {
                 let tenant = self.tenants.get(tenant_id)?;
                 if tenant.deleted_at_ms.is_some() && !include_deleted {
+                    return None;
+                }
+                if exclude_root && tenant.tenant_id == DEFAULT_ROOT_TENANT_ID {
                     return None;
                 }
                 Some(self.tenant_summary_value(tenant))
@@ -3301,7 +3316,10 @@ impl IdentityRuntime {
                 },
                 Err(err) => error_payload("INVALID_REQUEST", &err.to_string()),
             },
-            MSG_TNT_LIST => self.store.list_tenants_payload(payload_include_deleted(&msg.payload)),
+            MSG_TNT_LIST => self.store.list_tenants_payload(
+                payload_include_deleted(&msg.payload),
+                msg.payload.get("exclude_root").and_then(Value::as_bool) == Some(true),
+            ),
             MSG_TNT_GET => match serde_json::from_value::<TntGetRequest>(msg.payload.clone()) {
                 Ok(req) => match self.store.get_tenant_payload(&req.tenant_id) {
                     Ok(ok) => ok,
@@ -9312,7 +9330,7 @@ mod tests {
             },
         );
 
-        let payload = store.list_tenants_payload(false);
+        let payload = store.list_tenants_payload(false, false);
         let tenants = payload
             .get("tenants")
             .and_then(Value::as_array)
@@ -12009,6 +12027,50 @@ mod tests {
                 .unwrap_err(),
             "ILK_TYPE_MISMATCH"
         );
+    }
+
+    /// Stage 4 (§2.4): what Fluxbee Cloud reads of a tenant: how many people and node identities
+    /// are charged to it, and every tenant but the genesis one.
+    #[test]
+    fn a_tenant_read_counts_its_people_and_nodes() {
+        let mut store = sc_store();
+        let ana = sc_account(&mut store, LC_TENANT, "ana@acme.com");
+        rg_provision(&mut store, LC_TENANT, "slack", "U11");
+        let mut node = ilk_for(
+            "IO.slack.acme@motherbee",
+            "ilk:88888888-8888-4888-8888-888888888888",
+        );
+        node.tenant_id = LC_TENANT.to_string();
+        store.ilks.insert(node.ilk_id.clone(), node);
+        store
+            .delete_ilk(lc_ilk(&ana), 1)
+            .expect("a deleted person is not counted");
+        let summary = store.tenant_summary_value(&store.tenants[LC_TENANT].clone());
+        assert_eq!(
+            (
+                summary["people_count"].clone(),
+                summary["node_count"].clone()
+            ),
+            (json!(1), json!(1))
+        );
+        let got = store.get_tenant_payload(LC_TENANT).expect("get");
+        assert_eq!(
+            (got["people_count"].clone(), got["node_count"].clone()),
+            (json!(1), json!(1))
+        );
+        let ids = |payload: Value| -> Vec<String> {
+            payload["tenants"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|tenant| tenant["tenant_id"].as_str().unwrap().to_string())
+                .collect()
+        };
+        assert!(ids(store.list_tenants_payload(false, false))
+            .contains(&DEFAULT_ROOT_TENANT_ID.to_string()));
+        let without_root = ids(store.list_tenants_payload(false, true));
+        assert!(!without_root.contains(&DEFAULT_ROOT_TENANT_ID.to_string()));
+        assert!(without_root.contains(&LC_TENANT.to_string()));
     }
 
     /// An op's `CODE|detail` reaches the caller as the code alone, with the detail as its message

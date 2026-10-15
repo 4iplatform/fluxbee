@@ -2608,6 +2608,7 @@ async fn handle_admin(
             payload
         }
         "list_nodes" => list_nodes_flow(state, &msg.payload).await,
+        "list_tenant_nodes" => list_tenant_nodes_flow(state, &msg.payload).await,
         "list_versions" => list_versions_flow(state).await,
         "get_versions" => get_versions_flow(state, &msg.payload).await,
         "list_runtimes" => list_runtimes_flow(state, &msg.payload).await,
@@ -11007,12 +11008,19 @@ fn managed_node_inventory_with_root(
             let mut runtime_version: Option<String> = None;
             let mut identity_ilk_id: Option<String> = None;
             let mut identity_tenant_id: Option<String> = None;
+            let mut launched_by: Option<String> = None;
+            let mut relaunch_on_boot: Option<bool> = None;
             if config_exists {
                 if let Ok(config_payload) = load_node_effective_config(&config_path) {
                     config_valid = true;
                     config_version = Some(config_version_from_value(&config_payload));
                     if let Some(system) = config_payload.get("_system").and_then(|v| v.as_object())
                     {
+                        launched_by = system
+                            .get("launched_by")
+                            .and_then(|v| v.as_str())
+                            .map(str::to_string);
+                        relaunch_on_boot = system.get("relaunch_on_boot").and_then(|v| v.as_bool());
                         runtime_name = system
                             .get("runtime")
                             .and_then(|v| v.as_str())
@@ -11090,7 +11098,9 @@ fn managed_node_inventory_with_root(
                 "identity": {
                     "ilk_id": identity_ilk_id,
                     "tenant_id": identity_tenant_id,
-                }
+                },
+                "launched_by": launched_by,
+                "relaunch_on_boot": relaunch_on_boot,
             }));
         }
     }
@@ -11227,11 +11237,57 @@ fn persisted_managed_node_from_config_value(
     }))
 }
 
+/// The managed instances of this hive, those of one tenant only when `tenant_id` is given.
+fn managed_nodes_of_tenant(
+    state: &OrchestratorState,
+    tenant_id: Option<&str>,
+) -> Result<Vec<serde_json::Value>, OrchestratorError> {
+    let nodes = managed_node_inventory(state)?;
+    Ok(match tenant_id {
+        Some(tenant_id) => nodes
+            .into_iter()
+            .filter(|node| {
+                node.get("identity")
+                    .and_then(|identity| identity.get("tenant_id"))
+                    .and_then(|value| value.as_str())
+                    == Some(tenant_id)
+            })
+            .collect(),
+        None => nodes,
+    })
+}
+
 async fn list_nodes_flow(
     state: &OrchestratorState,
     payload: &serde_json::Value,
 ) -> serde_json::Value {
     let target_hive = target_hive_from_payload(payload, &state.hive_id);
+    // `managed`: the managed instances (what was launched here, running or not, with their
+    // runtime, identity and who launched them), of one tenant when `tenant_id` is given
+    // (`list_tenant_nodes`), instead of the nodes the router sees.
+    let managed = payload.get("managed").and_then(|value| value.as_bool()) == Some(true);
+    if target_hive == state.hive_id && managed {
+        let tenant_id = payload
+            .get("tenant_id")
+            .and_then(|value| value.as_str())
+            .map(str::trim)
+            .filter(|value| !value.is_empty());
+        return match managed_nodes_of_tenant(state, tenant_id) {
+            Ok(nodes) => serde_json::json!({
+                "status": "ok",
+                "target": state.hive_id,
+                "hive": state.hive_id,
+                "inventory_source": "managed_instances",
+                "node_count": nodes.len(),
+                "nodes": nodes,
+            }),
+            Err(err) => serde_json::json!({
+                "status": "error",
+                "error_code": "NODE_INVENTORY_READ_FAILED",
+                "message": err.to_string(),
+            }),
+        };
+    }
     if target_hive == state.hive_id {
         let inventory_payload = serde_json::json!({
             "scope": "hive",
@@ -11265,14 +11321,19 @@ async fn list_nodes_flow(
         };
     }
 
+    let mut forwarded_payload = serde_json::json!({ "target": target_hive });
+    if managed {
+        forwarded_payload["managed"] = serde_json::json!(true);
+        if let Some(tenant_id) = payload.get("tenant_id") {
+            forwarded_payload["tenant_id"] = tenant_id.clone();
+        }
+    }
     match forward_system_action_to_hive(
         state,
         &target_hive,
         "LIST_NODES",
         "LIST_NODES_RESPONSE",
-        serde_json::json!({
-            "target": target_hive,
-        }),
+        forwarded_payload,
     )
     .await
     {
@@ -11284,6 +11345,91 @@ async fn list_nodes_flow(
             "target": target_hive,
         }),
     }
+}
+
+/// The nodes charged to one tenant on every hive (Fluxbee Cloud's `list_nodes`, docs/ilk-tenant-
+/// model-v1.md §2.4): this hive's managed instances plus each connected hive's, asked with
+/// LIST_NODES. A hive that does not answer is listed in `unreachable_hives`, never left out
+/// silently.
+async fn list_tenant_nodes_flow(
+    state: &OrchestratorState,
+    payload: &serde_json::Value,
+) -> serde_json::Value {
+    let Some(tenant_id) = payload
+        .get("tenant_id")
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .filter(|value| value.starts_with("tnt:"))
+    else {
+        return serde_json::json!({
+            "status": "error",
+            "error_code": "INVALID_REQUEST",
+            "message": "list_tenant_nodes requires tenant_id (tnt:<uuid>)",
+        });
+    };
+    let mut nodes = match managed_nodes_of_tenant(state, Some(tenant_id)) {
+        Ok(nodes) => nodes,
+        Err(err) => {
+            return serde_json::json!({
+                "status": "error",
+                "error_code": "NODE_INVENTORY_READ_FAILED",
+                "message": err.to_string(),
+            });
+        }
+    };
+    // Every connected hive at once, each bounded: Fluxbee Cloud waits 20 s for the whole answer.
+    const PER_HIVE: Duration = Duration::from_secs(10);
+    let root = hives_root();
+    let hives: Vec<String> = list_managed_hive_ids()
+        .into_iter()
+        .filter(|hive_id| {
+            *hive_id != state.hive_id && hive_status(&root, hive_id).as_deref() == Some("connected")
+        })
+        .collect();
+    let answers = futures::future::join_all(hives.iter().map(|hive_id| {
+        forward_system_action_to_hive_with_timeout(
+            state,
+            hive_id,
+            "LIST_NODES",
+            "LIST_NODES_RESPONSE",
+            serde_json::json!({ "target": hive_id, "managed": true, "tenant_id": tenant_id }),
+            PER_HIVE,
+        )
+    }))
+    .await;
+    let mut unreachable = Vec::new();
+    for (hive_id, answer) in hives.iter().zip(answers) {
+        let response = answer.unwrap_or_else(|err| {
+            serde_json::json!({
+                "status": "error",
+                "error_code": "NODE_LIST_FAILED",
+                "message": err.to_string(),
+            })
+        });
+        let remote_nodes = (response.get("status").and_then(|value| value.as_str()) == Some("ok"))
+            .then(|| {
+                response
+                    .get("nodes")
+                    .and_then(|value| value.as_array())
+                    .cloned()
+            })
+            .flatten();
+        match remote_nodes {
+            Some(remote_nodes) => nodes.extend(remote_nodes),
+            None => unreachable.push(serde_json::json!({
+                "hive_id": hive_id,
+                "error_code": response.get("error_code").cloned().unwrap_or(serde_json::Value::Null),
+                "message": response.get("message").cloned().unwrap_or(serde_json::Value::Null),
+            })),
+        }
+    }
+    serde_json::json!({
+        "status": "ok",
+        "tenant_id": tenant_id,
+        "count": nodes.len(),
+        "nodes": nodes,
+        "unreachable_hives": unreachable,
+    })
 }
 
 fn remote_router_name(entry: &RemoteHiveEntry) -> String {
@@ -13133,6 +13279,86 @@ fn tenant_gate_refusal(
     }
 }
 
+/// Who launched a node, as SY.admin stamps it on run_node (`cloud` for the Fluxbee Cloud relay,
+/// `archi`, `operator`); `system` when a system node asked the orchestrator itself (docs/ilk-tenant-
+/// model-v1.md §2.4). Kept in the node's `_system.launched_by`.
+fn launched_by_from_payload(payload: &serde_json::Value) -> String {
+    payload
+        .get("launched_by")
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .filter(|value| {
+            !value.is_empty()
+                && value.len() <= 128
+                && value
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-' | '@'))
+        })
+        .unwrap_or("system")
+        .to_string()
+}
+
+/// Whether a node meets what its caller requires of it: being charged to a tenant, and having been
+/// launched by someone. `None` requires nothing.
+fn node_requirements_met(
+    required_tenant: Option<&str>,
+    required_launcher: Option<&str>,
+    tenant: Option<&str>,
+    launched_by: Option<&str>,
+) -> bool {
+    required_tenant.is_none_or(|required| tenant == Some(required))
+        && required_launcher.is_none_or(|required| launched_by == Some(required))
+}
+
+/// SY.admin stamps `require_tenant_id` and `require_launched_by` on the node actions it relays for
+/// Fluxbee Cloud, which acts only on the nodes it launched in its tenant (docs/ilk-tenant-model-v1.md
+/// §2.4). Checked on the hive that holds the node, before anything else: a node that does not meet
+/// them is answered as missing, as another tenant's key is.
+fn node_requirements_refusal(
+    state: &OrchestratorState,
+    node_name: &str,
+    payload: &serde_json::Value,
+) -> Option<serde_json::Value> {
+    let required = |key: &str| {
+        payload
+            .get(key)
+            .and_then(|value| value.as_str())
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+    };
+    let required_tenant = required("require_tenant_id");
+    let required_launcher = required("require_launched_by");
+    if required_tenant.is_none() && required_launcher.is_none() {
+        return None;
+    }
+    let config = node_effective_config_path(state, node_name)
+        .ok()
+        .filter(|path| path.is_file())
+        .and_then(|path| load_node_effective_config(&path).ok());
+    let (_, persisted_tenant) = load_persisted_node_identity(state, node_name);
+    let tenant = persisted_tenant.or_else(|| config.as_ref().and_then(config_tenant_id));
+    let launched_by = config
+        .as_ref()
+        .and_then(|config| config.get("_system"))
+        .and_then(|system| system.get("launched_by"))
+        .and_then(|value| value.as_str())
+        .map(str::to_string);
+    if node_requirements_met(
+        required_tenant,
+        required_launcher,
+        tenant.as_deref(),
+        launched_by.as_deref(),
+    ) {
+        return None;
+    }
+    Some(serde_json::json!({
+        "status": "error",
+        "error_code": "NODE_NOT_FOUND",
+        "message": format!("node '{node_name}' not found"),
+        "node_name": node_name,
+    }))
+}
+
 fn managed_spawn_disallowed_reason(node_name: &str) -> Option<&'static str> {
     let local = node_name.split('@').next().unwrap_or(node_name).trim();
     let kind = node_kind_from_name(node_name);
@@ -14721,6 +14947,63 @@ fn persist_node_runtime_version(
     Ok(())
 }
 
+/// Whether the boot and periodic relaunches bring a node back (`_system.relaunch_on_boot`). A stop
+/// clears it, so a stopped node stays stopped; a start or a restart sets it again. A node that dies
+/// on its own keeps it, and is relaunched (docs/ilk-tenant-model-v1.md §2.4).
+fn persist_node_relaunch_on_boot(
+    config_path: &Path,
+    relaunch: bool,
+) -> Result<(), OrchestratorError> {
+    let raw = fs::read_to_string(config_path)?;
+    let mut config: serde_json::Value = serde_json::from_str(&raw)?;
+    let Some(system) = config
+        .get_mut("_system")
+        .and_then(|value| value.as_object_mut())
+    else {
+        return Err(format!(
+            "node config '{}' has no _system block",
+            config_path.display()
+        )
+        .into());
+    };
+    if system
+        .get("relaunch_on_boot")
+        .and_then(|value| value.as_bool())
+        == Some(relaunch)
+    {
+        return Ok(());
+    }
+    system.insert(
+        "relaunch_on_boot".to_string(),
+        serde_json::Value::Bool(relaunch),
+    );
+    system.insert(
+        "updated_at_ms".to_string(),
+        serde_json::Value::from(now_epoch_ms()),
+    );
+    write_json_atomic(config_path, &config)?;
+    Ok(())
+}
+
+/// `persist_node_relaunch_on_boot` for a node of this hive, by name. Logged, never fatal: the stop
+/// or start already happened.
+fn set_node_relaunch_on_boot(state: &OrchestratorState, node_name: &str, relaunch: bool) -> bool {
+    let result = node_effective_config_path(state, node_name)
+        .and_then(|path| persist_node_relaunch_on_boot(&path, relaunch));
+    match result {
+        Ok(()) => true,
+        Err(err) => {
+            tracing::warn!(
+                node_name = node_name,
+                relaunch_on_boot = relaunch,
+                error = %err,
+                "could not record whether the relaunches bring this node back"
+            );
+            false
+        }
+    }
+}
+
 fn build_node_system_block(
     node_name: &str,
     hive_id: &str,
@@ -14836,6 +15119,8 @@ fn ensure_node_effective_config_on_spawn_with_roots(
         config.get("tenant_id").and_then(|v| v.as_str()),
         1,
     );
+    let mut system_block = system_block;
+    system_block["launched_by"] = serde_json::Value::String(launched_by_from_payload(payload));
     config.insert("_system".to_string(), system_block);
     write_json_atomic(&path, &serde_json::Value::Object(config))?;
 
@@ -17299,6 +17584,9 @@ async fn get_node_status_flow(
         };
     }
 
+    if let Some(refusal) = node_requirements_refusal(state, &node_name, payload) {
+        return refusal;
+    }
     let config_path = match node_effective_config_path(state, &node_name) {
         Ok(path) => path,
         Err(err) => {
@@ -18723,6 +19011,9 @@ async fn start_or_restart_node_flow(
         };
     }
 
+    if let Some(refusal) = node_requirements_refusal(state, &node_name, payload) {
+        return refusal;
+    }
     let plan = match managed_node_launch_plan(state, &node_name) {
         Ok(value) => value,
         Err(payload) => return payload,
@@ -18731,6 +19022,8 @@ async fn start_or_restart_node_flow(
     let visible_in_router = local_inventory_has_node(state, &plan.node.node_name);
 
     if !restart && (unit_active || visible_in_router) {
+        // Asked to run: the relaunches keep it running from now on.
+        set_node_relaunch_on_boot(state, &plan.node.node_name, true);
         return serde_json::json!({
             "status": "ok",
             "state": "already_running",
@@ -18766,6 +19059,7 @@ async fn start_or_restart_node_flow(
     match execute_on_hive(state, &target_hive, &cmd, label) {
         Ok(()) => serde_json::json!({
             "status": "ok",
+            "relaunch_on_boot": set_node_relaunch_on_boot(state, &plan.node.node_name, true),
             "state": if restart { "restarted" } else { "started" },
             "target": target_hive,
             "hive": target_hive,
@@ -18924,8 +19218,28 @@ async fn kill_node_flow(
         };
     }
 
+    if let Some(refusal) = node_requirements_refusal(state, node_name_ref, payload) {
+        return refusal;
+    }
     let unit_was_active = match systemd_unit_is_active(&unit) {
         Ok(false) => {
+            // A stop of a node that is down right now (between relaunches) still lasts.
+            if !purge_instance
+                && node_effective_config_path(state, node_name_ref).is_ok_and(|path| path.is_file())
+            {
+                let recorded = set_node_relaunch_on_boot(state, node_name_ref, false);
+                return serde_json::json!({
+                    "status": "ok",
+                    "state": "stopped",
+                    "hive": target_hive,
+                    "target": target_hive,
+                    "node_name": validated_node_name,
+                    "unit": unit,
+                    "purge_instance": purge_instance,
+                    "unit_was_active": false,
+                    "relaunch_on_boot": !recorded,
+                });
+            }
             if !should_purge_inactive_kill_target(purge_instance, validated_node_name.as_deref()) {
                 return serde_json::json!({
                     "status": "not_found",
@@ -18969,6 +19283,12 @@ async fn kill_node_flow(
                 "unit_was_active": unit_was_active,
                 "pre_stop_state": if unit_was_active { "active" } else { "inactive_or_not_found" },
             });
+            if !purge_instance {
+                // A stop lasts: the relaunches leave the node down until it is started again.
+                let recorded = set_node_relaunch_on_boot(state, node_name_ref, false);
+                response["state"] = serde_json::json!("stopped");
+                response["relaunch_on_boot"] = serde_json::json!(!recorded);
+            }
             if purge_instance {
                 if let Some(node_name) = validated_node_name.as_ref() {
                     let (persisted_ilk_id, _persisted_tenant_id) =
@@ -31099,11 +31419,32 @@ blob:
         in_order(
             "async fn start_or_restart_node_flow(",
             &[
+                "node_requirements_refusal(",
                 "managed_node_launch_plan(",
                 "\"already_running\"",
                 "tenant_gate_refusal(",
                 "managed_node_restart_command(",
                 "execute_on_hive(",
+            ],
+        );
+        in_order(
+            "async fn kill_node_flow(",
+            &[
+                "node_requirements_refusal(",
+                "systemd_unit_is_active(",
+                "execute_on_hive(",
+            ],
+        );
+        // A stop lasts on both ways out: the node already down, and the stop itself.
+        let kill = body("async fn kill_node_flow(");
+        let stopped = kill.find("execute_on_hive(").expect("the stop");
+        assert!(kill[..stopped].contains("set_node_relaunch_on_boot(state, node_name_ref, false)"));
+        assert!(kill[stopped..].contains("set_node_relaunch_on_boot(state, node_name_ref, false)"));
+        in_order(
+            "async fn get_node_status_flow(",
+            &[
+                "forward_system_action_to_hive(",
+                "node_requirements_refusal(",
             ],
         );
         in_order(
@@ -32512,7 +32853,9 @@ blob:
                 "_system": {
                     "runtime": "ai.persisted.test",
                     "runtime_version": "1.0.0-diag",
-                    "tenant_id": "tnt:test"
+                    "tenant_id": "tnt:test",
+                    "launched_by": "cloud",
+                    "relaunch_on_boot": false
                 }
             })
             .to_string(),
@@ -32527,7 +32870,76 @@ blob:
         assert_eq!(inventory[0]["lifecycle_state"], "STOPPED");
         assert_eq!(inventory[0]["runtime"]["name"], "ai.persisted.test");
         assert_eq!(inventory[0]["runtime"]["version"], "1.0.0-diag");
+        assert_eq!(inventory[0]["identity"]["tenant_id"], "tnt:test");
+        assert_eq!(inventory[0]["launched_by"], "cloud");
+        assert_eq!(inventory[0]["relaunch_on_boot"], false);
 
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Stage 4 (docs/ilk-tenant-model-v1.md §2.4): who launched a node comes from SY.admin's stamp;
+    /// a requirement is met only by a node that matches it; a stop lasts.
+    #[test]
+    fn who_launched_a_node_and_what_its_caller_requires() {
+        let launched = |payload: serde_json::Value| launched_by_from_payload(&payload);
+        assert_eq!(
+            launched(serde_json::json!({"launched_by": "cloud"})),
+            "cloud"
+        );
+        assert_eq!(launched(serde_json::json!({})), "system");
+        assert_eq!(launched(serde_json::json!({"launched_by": "  "})), "system");
+        assert_eq!(
+            launched(serde_json::json!({"launched_by": "x y;rm"})),
+            "system"
+        );
+        let t = Some("tnt:a");
+        assert!(node_requirements_met(None, None, None, None));
+        assert!(node_requirements_met(t, Some("cloud"), t, Some("cloud")));
+        assert!(!node_requirements_met(t, Some("cloud"), t, Some("archi")));
+        assert!(!node_requirements_met(
+            t,
+            Some("cloud"),
+            Some("tnt:b"),
+            Some("cloud")
+        ));
+        assert!(
+            !node_requirements_met(t, None, None, None),
+            "a missing node meets nothing"
+        );
+        assert!(!node_requirements_met(None, Some("cloud"), t, None));
+    }
+
+    #[test]
+    fn a_stop_clears_the_relaunch_and_a_start_sets_it() {
+        let root =
+            std::env::temp_dir().join(format!("fluxbee-relaunch-{}", Uuid::new_v4().simple()));
+        std::fs::create_dir_all(&root).expect("dir");
+        let path = root.join("config.json");
+        std::fs::write(
+            &path,
+            serde_json::json!({"a": 1, "_system": {"relaunch_on_boot": true}}).to_string(),
+        )
+        .expect("write");
+        let read = || -> serde_json::Value {
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap()
+        };
+        persist_node_relaunch_on_boot(&path, false).expect("stop");
+        assert_eq!(read()["_system"]["relaunch_on_boot"], false);
+        assert_eq!(read()["a"], 1);
+        // The relaunches only take nodes that keep the flag.
+        assert!(persisted_managed_node_from_config_value(
+            "IO.x@motherbee",
+            "IO",
+            path.clone(),
+            &serde_json::json!({"_system": {"runtime": "io.x", "runtime_version": "1", "relaunch_on_boot": false}}),
+            true,
+        )
+        .expect("parse")
+        .is_none());
+        persist_node_relaunch_on_boot(&path, true).expect("start");
+        assert_eq!(read()["_system"]["relaunch_on_boot"], true);
+        std::fs::write(&path, "{}").expect("no system block");
+        assert!(persist_node_relaunch_on_boot(&path, false).is_err());
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -34000,6 +34412,7 @@ blob:
             &state,
             &serde_json::json!({
                 "tenant_id": "tnt:request",
+                "launched_by": "cloud",
                 "config": {
                     "temperature": 0.9,
                     "model": "gpt-5"
@@ -34043,6 +34456,12 @@ blob:
         assert_eq!(
             config["_system"]["package_path"],
             serde_json::json!(package_path)
+        );
+        // Who launched it, as SY.admin stamped it (stage 4, docs/ilk-tenant-model-v1.md §2.4).
+        assert_eq!(config["_system"]["launched_by"], serde_json::json!("cloud"));
+        assert_eq!(
+            config["_system"]["relaunch_on_boot"],
+            serde_json::json!(true)
         );
 
         let _ = fs::remove_dir_all(root);

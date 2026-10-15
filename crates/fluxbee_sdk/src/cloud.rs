@@ -37,10 +37,22 @@ pub const CLOUD_OP_ACTIONS: &[(&str, &str)] = &[
     ("delete_token", "vault_delete"),
     ("update_tenant", "update_tenant"),
     // A tenant is a cost center (docs/ilk-tenant-model-v1.md): Cloud charges a person to another
-    // one. Stage 1: complete people only.
+    // one (an account from anywhere, a temporary only out of a deleted tenant).
     ("set_ilk_tenant", "set_ilk_tenant"),
     // Which of the tenant's nodes use a credential (stage 2, §2.2), without rewriting its value.
     ("assign_token", "vault_assign"),
+    // Stage 4 (§2.4): the whole tenant record and every tenant but the genesis one, through the
+    // admin (identity's store holds what the SHM does not: settings, sponsor, the deleted mark).
+    ("get_tenant", "get_tenant"),
+    ("list_tenants", "list_tenants"),
+    // The tenant's nodes on every hive, and one node's status.
+    ("list_nodes", "list_tenant_nodes"),
+    ("get_node_status", "get_node_status"),
+    // The lifecycle of the IO nodes Cloud launched, and only those (SY.admin stamps the
+    // requirement; the hive that holds the node checks it): a stop lasts, a delete is the teardown.
+    ("start_node", "start_node"),
+    ("stop_node", "kill_node"),
+    ("delete_node", "kill_node"),
 ];
 
 /// The admin actions IO.cloud may relay over the mesh — the security allowlist SY.admin enforces in
@@ -61,6 +73,12 @@ pub const CLOUD_EXPOSED_ACTIONS: &[&str] = &[
     "update_tenant",
     "set_ilk_tenant",
     "vault_assign",
+    "get_tenant",
+    "list_tenants",
+    "list_tenant_nodes",
+    "get_node_status",
+    "start_node",
+    "kill_node",
 ];
 
 /// The [`CLOUD_EXPOSED_ACTIONS`] set computed from [`CLOUD_OP_ACTIONS`] (deduped, first-seen order).
@@ -94,9 +112,8 @@ pub const CLOUD_LOCAL_OPS: &[&str] = &[
     // FAST identity reads served straight from the local identity SHM (io.cloud co-resides with
     // SY.identity on motherbee) — NO mesh round-trip, the io.api read pattern. They return the SHM
     // subset (identity + tenant + status + name); the full `identification` PII lives behind the
-    // `get_ilk_details` relay.
+    // `get_ilk_details` relay. (`get_tenant` moved to the admin in stage 4: the whole record.)
     "get_ilk",
-    "get_tenant",
     "list_ilks",
 ];
 
@@ -113,7 +130,21 @@ pub fn cloud_action_catalog() -> Value {
         { "op": "create_tenant", "category": "relay",
           "summary": "Create (or find: idempotent by domain, then by name) a tenant. No envelope tenant_id: the tenant does not exist yet. params.name required, params.domain recommended (the dedup key)." },
         { "op": "update_tenant", "category": "relay",
-          "summary": "Edit YOUR tenant (the envelope tenant_id): params.name and/or params.domain (\"\" or null clears the domain). A name or domain another tenant holds answers TENANT_NAME_TAKEN / TENANT_DOMAIN_TAKEN. Returns {status, tenant_id, sponsor_tenant_id}; read the tenant again to see it." },
+          "summary": "Edit YOUR tenant (the envelope tenant_id), any of: params.name, params.domain (\"\" or null clears it), params.status (active or suspended: a suspended tenant gets no credentials and starts no node; active again, everything resumes), params.settings (an object), params.sponsor_tenant_id (another tenant, or null). A name or domain another tenant holds answers TENANT_NAME_TAKEN / TENANT_DOMAIN_TAKEN. Never the genesis tenant. Returns {status, tenant_id, sponsor_tenant_id}; get_tenant reads it again." },
+        { "op": "get_tenant", "category": "relay",
+          "summary": "The whole record of YOUR tenant (the envelope tenant_id): tenant {name, domain, status, settings, sponsor_tenant_id, deleted_at_ms}, its sponsor, children, ilk_count, people_count (people charged to it) and node_count (node identities charged to it)." },
+        { "op": "list_tenants", "category": "relay",
+          "summary": "Every tenant but the genesis one, deleted ones included (deleted_at_ms set, so you can restore them): tenant_id, name, domain, status, settings, sponsor_tenant_id, ilk_count, people_count, node_count. No envelope tenant_id." },
+        { "op": "list_nodes", "category": "relay",
+          "summary": "The nodes charged to YOUR tenant (the envelope tenant_id) on every hive: node_name, hive, runtime {name, version}, lifecycle_state (RUNNING, STARTING, STOPPED, FAILED), health_state, identity {ilk_id, tenant_id} (the ilk_id is what list_tokens shows in assigned_ilks), launched_by (cloud for yours) and relaunch_on_boot (false once stopped). A hive that does not answer is listed in unreachable_hives. Health is what each node reports: an older IO node may answer UNKNOWN." },
+        { "op": "get_node_status", "category": "relay",
+          "summary": "The status of one node of YOUR tenant: the envelope tenant_id + params.node_name (IO.*@hive). A node of another tenant answers NODE_NOT_FOUND." },
+        { "op": "start_node", "category": "relay",
+          "summary": "Start one IO node YOU launched (provision_node) in YOUR tenant: the envelope tenant_id + params.node_name. Any other node answers NODE_NOT_FOUND. Refused with TENANT_NOT_ACTIVE while the tenant is pending or suspended. Already running answers state already_running." },
+        { "op": "stop_node", "category": "relay",
+          "summary": "Stop one IO node YOU launched in YOUR tenant: the envelope tenant_id + params.node_name. It stays stopped, kept with its config and identity, until start_node. Any other node answers NODE_NOT_FOUND." },
+        { "op": "delete_node", "category": "relay",
+          "summary": "Delete one IO node YOU launched in YOUR tenant: the envelope tenant_id + params.node_name. It stops, and its timers, the credentials it owns and its identity go; credentials only assigned to it stay (they are the tenant's), and the name is free again. Final. Any other node answers NODE_NOT_FOUND." },
         { "op": "put_token", "category": "relay",
           "summary": "Store a credential for YOUR tenant (the envelope tenant_id, who pays for its use) + params.key ([a-z0-9:_-], one namespace for the whole hive: a key another tenant holds answers KEY_TAKEN) + params.value + params.resource_type. Who uses it: one IO.* node that owns it (params.owner_node), the nodes it is assigned to (params.nodes: node names or ILK ids, each charged to your tenant), or, with neither, every node of your tenant (a general credential). Storing the same value again changes nothing: change the nodes with assign_token. Infrastructure keys are refused." },
         { "op": "assign_token", "category": "relay",
@@ -132,8 +163,6 @@ pub fn cloud_action_catalog() -> Value {
           "summary": "Return this catalog (the actions IO.cloud offers: relay + local) so Cloud can discover its surface." },
         { "op": "get_ilk", "category": "local",
           "summary": "FAST existence+subset read from the identity SHM (no round-trip). Selector: params.ilk_id (ilk:<uuid>) OR params.email (the account's email, ASCII case-insensitive). By id: any ilk, whatever tenant it is charged to. By email: the one account -> {exists, ilk?, matches:[...]}; matches holds more than one entry only for an email several people still hold (ACCOUNT_AMBIGUOUS until the operator resolves it). Subset = {ilk_id, ilk_type, registration_status, tenant_id (the tenant it is charged to), display_name, pending_signup (true for a signup nobody finished; the next register_human of that email takes it over)}. For full identification + channels use get_ilk_details." },
-        { "op": "get_tenant", "category": "local",
-          "summary": "FAST existence read of YOUR tenant (the envelope tenant_id) from the identity SHM. Returns {exists, tenant_id, ilk_count}." },
         { "op": "list_ilks", "category": "local",
           "summary": "List the ilks charged to YOUR tenant (the envelope tenant_id) from the identity SHM (subset each). Returns {tenant_id, count, ilks:[{ilk_id, ilk_type, registration_status, tenant_id, display_name, pending_signup}]}." },
         { "op": "get_ilk_details", "category": "relay",
@@ -171,7 +200,13 @@ mod tests {
                 "vault_delete",
                 "update_tenant",
                 "set_ilk_tenant",
-                "vault_assign"
+                "vault_assign",
+                "get_tenant",
+                "list_tenants",
+                "list_tenant_nodes",
+                "get_node_status",
+                "start_node",
+                "kill_node"
             ]
         );
     }
@@ -205,7 +240,12 @@ mod tests {
             admin_action_for_cloud_op("assign_token"),
             Some("vault_assign")
         );
+        assert_eq!(admin_action_for_cloud_op("list_nodes"), Some("list_tenant_nodes"));
+        assert_eq!(admin_action_for_cloud_op("stop_node"), Some("kill_node"));
+        assert_eq!(admin_action_for_cloud_op("delete_node"), Some("kill_node"));
+        // Cloud names its node ops; the admin action names are not Cloud ops.
         assert_eq!(admin_action_for_cloud_op("kill_node"), None);
+        assert_eq!(admin_action_for_cloud_op("list_tenant_nodes"), None);
     }
 
     #[test]

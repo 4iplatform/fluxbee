@@ -995,6 +995,42 @@ Visto al arreglar los e2e de A-37, leyendo `src/router/mod.rs` y `src/shm/mod.rs
   binario generaría uno como root); si no, el `myID` del Syncthing en marcha. Nunca `config.xml`.
 - **Estado:** construido; lo ejercita el próximo join (el de A-48).
 
+### A-67 🟡 EN CÓDIGO (0.1.68) — Cloud no podía ver ni manejar sus nodos, ni suspender un tenant, y un nodo parado volvía solo
+
+- **El marco:** `docs/ilk-tenant-model-v1.md` §2.4 y D14, la etapa 4, decidida con el operador el
+  2026-10-15.
+  - Cloud es la capa de negocio: asocia empresas con tenants y usuarios con ILK de personas, y
+    maneja credenciales.
+  - Los nodos IO los lanza solo para tener dónde cargar el token: *"el nodo lo lanza porque sino el
+    token no se puede cargar"*.
+  - La infraestructura es del operador, por Archi.
+  - Todo pasa por el admin.
+- **Qué pasaba:**
+  - **Nodos:** Cloud creaba nodos y no los podía ver, parar ni borrar. El runbook de linkedhelper
+    consultaba el estado por el admin directo, que Cloud ya no tiene.
+  - **Tenants:** Cloud no podía suspender ni reactivar un tenant, ni editar su sponsor o sus
+    settings. `get_tenant` solo decía si existía.
+  - **Parar no duraba:** un kill sin purga paraba el proceso y el relanzamiento de cada 60 s lo
+    volvía a levantar. Le pasaba también al operador.
+  - **Quién lanzó un nodo** no quedaba registrado.
+- **Arreglo:**
+  - **Tenants:**
+    - `update_tenant` acepta `status` (`active` o `suspended`), `settings` y `sponsor_tenant_id`;
+    - `get_tenant` lee el registro completo por el admin, con `people_count` y `node_count`;
+    - `list_tenants` trae todos menos el génesis, con los borrados marcados.
+  - **Nodos:**
+    - el admin anota quién lanzó cada nodo (`_system.launched_by`: `cloud`, `archi`, `operator`);
+    - Cloud arranca, para y borra solo los nodos IO que lanzó en su tenant. El admin le pone esa
+      condición al pedido y el hive del nodo la chequea; cualquier otro contesta `NODE_NOT_FOUND`;
+    - `list_nodes` junta los nodos del tenant de todos los hives en paralelo, y `get_node_status`
+      da el de uno;
+    - Cloud ve el estado, no cómo corre el nodo: sin proceso, unidad ni rutas.
+  - **Parar dura, para todos:** parar saca la marca de relanzar y arrancar la vuelve a poner. Un
+    nodo que se cae solo se sigue relanzando.
+  - **La palabra:** el contrato de Cloud dice tenant, nunca empresa (85 lugares).
+  - **`a5f1b2a`** sale en este release: el rechazo de `set_ilk_tenant` contesta el código solo.
+- **Validación en 8.x:** pendiente, con 0.1.68.
+
 ### A-66 ✅ VALIDADO EN 8.x (0.1.67, 2026-10-15) — Un tenant suspendido seguía arrancando nodos, y borrar un tenant marcaba a su gente
 
 - **El marco:** `docs/ilk-tenant-model-v1.md` §2.3, la etapa 3. Decisiones del operador del

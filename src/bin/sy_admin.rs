@@ -3348,6 +3348,12 @@ const INTERNAL_ACTION_REGISTRY: &[InternalActionSpec] = &[
         allow_legacy_hive_id: false,
     },
     InternalActionSpec {
+        action: "list_tenant_nodes",
+        route: InternalActionRoute::Query("list_tenant_nodes"),
+        requires_target: true,
+        allow_legacy_hive_id: false,
+    },
+    InternalActionSpec {
         action: "send_node_message",
         route: InternalActionRoute::Command("send_node_message"),
         requires_target: true,
@@ -5182,7 +5188,7 @@ async fn dispatch_internal_admin_command(
     if let Err(detail) = enforce_cloud_relay_content(caller_l2_name, action, &ctx.hive_id, &params) {
         return Ok(internal_unauthorized(action, &detail));
     }
-    let params = stamp_on_behalf_of(action, params, caller_l2_name);
+    let params = stamp_relay_facts(action, params, caller_l2_name, &ctx.hive_id);
     match action {
         "publish_artifact" => {
             if target.is_some() {
@@ -5741,20 +5747,65 @@ fn authorize_cloud_relay(
     ))
 }
 
-/// Who a tenant change is for goes into its history row: the router-stamped caller (Fluxbee
-/// Cloud's relay, Archi), or the executor for an internal plan. Never what the params say.
-fn stamp_on_behalf_of(
+/// What admin stamps on a command from the router-stamped caller, never from what the params say:
+/// - `set_ilk_tenant`: who the tenant change is for, for its history row (the caller, or the
+///   executor for an internal plan);
+/// - `run_node`: who launched the node, kept in its `_system.launched_by` (`cloud` for the Fluxbee
+///   Cloud relay, `archi`, `operator` for the operator and the executor, else the caller);
+/// - for the Cloud relay, which acts only on the nodes it launched in the tenant it claims
+///   (docs/ilk-tenant-model-v1.md §2.4): `start_node` and `kill_node` require such a node,
+///   `get_node_status` a node of that tenant, and the hive that holds the node answers
+///   NODE_NOT_FOUND otherwise; `list_tenants` leaves the genesis tenant out and shows the deleted
+///   ones, so Cloud can restore them.
+fn stamp_relay_facts(
     action: &str,
     mut params: serde_json::Value,
     caller_l2_name: Option<&str>,
+    admin_hive: &str,
 ) -> serde_json::Value {
-    if action == "set_ilk_tenant" {
-        if let Some(object) = params.as_object_mut() {
+    let cloud_relay = caller_l2_name == Some(format!("IO.cloud@{admin_hive}").as_str());
+    let Some(object) = params.as_object_mut() else {
+        return params;
+    };
+    match action {
+        "set_ilk_tenant" => {
             object.insert(
                 "on_behalf_of".to_string(),
                 serde_json::Value::String(caller_l2_name.unwrap_or("executor").to_string()),
             );
         }
+        "run_node" => {
+            let launched_by = match caller_l2_name {
+                _ if cloud_relay => "cloud".to_string(),
+                Some(caller) if caller == format!("SY.architect@{admin_hive}") => {
+                    "archi".to_string()
+                }
+                Some(caller) => caller.to_string(),
+                None => "operator".to_string(),
+            };
+            object.insert(
+                "launched_by".to_string(),
+                serde_json::Value::String(launched_by),
+            );
+        }
+        "start_node" | "kill_node" | "get_node_status" if cloud_relay => {
+            // The claimed tenant (checked by enforce_cloud_relay_content) becomes a requirement on
+            // the node; the node actions themselves take no tenant.
+            if let Some(tenant_id) = object.remove("tenant_id") {
+                object.insert("require_tenant_id".to_string(), tenant_id);
+            }
+            if action != "get_node_status" {
+                object.insert(
+                    "require_launched_by".to_string(),
+                    serde_json::Value::String("cloud".to_string()),
+                );
+            }
+        }
+        "list_tenants" if cloud_relay => {
+            object.insert("include_deleted".to_string(), serde_json::Value::Bool(true));
+            object.insert("exclude_root".to_string(), serde_json::Value::Bool(true));
+        }
+        _ => {}
     }
     params
 }
@@ -5839,8 +5890,63 @@ fn enforce_cloud_relay_content(
         }
         "update_tenant" => {
             cloud_claimed_tenant(params.get("tenant_id"), action)?;
-            // Name and domain only: status, settings and the sponsor are the operator's.
-            only_fields(Some(params), &["tenant_id", "name", "domain"])?;
+            // Everything about the tenant (operator, 2026-10-15) but `pending`, which stays the
+            // operator's; a sponsor is another canonical tenant, never the root one.
+            only_fields(
+                Some(params),
+                &[
+                    "tenant_id",
+                    "name",
+                    "domain",
+                    "status",
+                    "settings",
+                    "sponsor_tenant_id",
+                ],
+            )?;
+            if let Some(status) = params.get("status") {
+                if !matches!(status.as_str(), Some("active") | Some("suspended")) {
+                    return Err(format!(
+                        "IO.cloud {action} may set status to active or suspended only, not {status}"
+                    ));
+                }
+            }
+            if let Some(sponsor) = params.get("sponsor_tenant_id").filter(|v| !v.is_null()) {
+                cloud_claimed_tenant(Some(sponsor), action)?;
+            }
+            if params
+                .get("settings")
+                .is_some_and(|settings| !settings.is_object())
+            {
+                return Err(format!("IO.cloud {action} settings must be an object"));
+            }
+        }
+        // Reads of a tenant: the claimed one; the list is stamped (stamp_relay_facts).
+        "get_tenant" | "list_tenant_nodes" => {
+            cloud_claimed_tenant(params.get("tenant_id"), action)?;
+            only_fields(Some(params), &["tenant_id"])?;
+        }
+        "list_tenants" => {
+            only_fields(Some(params), &[])?;
+        }
+        // An IO node of the claimed tenant; start and kill also need one Cloud launched, which
+        // the hive that holds it checks (stamp_relay_facts).
+        "get_node_status" | "start_node" | "kill_node" => {
+            cloud_claimed_tenant(params.get("tenant_id"), action)?;
+            let node_name = params
+                .get("node_name")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            if !node_name.starts_with("IO.") {
+                return Err(format!(
+                    "IO.cloud {action} acts only on IO.* nodes, not '{node_name}'"
+                ));
+            }
+            let allowed: &[&str] = if action == "kill_node" {
+                &["tenant_id", "node_name", "purge_instance", "force"]
+            } else {
+                &["tenant_id", "node_name"]
+            };
+            only_fields(Some(params), allowed)?;
         }
         "run_node" => {
             cloud_claimed_tenant(params.get("tenant_id"), action)?;
@@ -6638,11 +6744,18 @@ async fn handle_hive_paths(
             Ok(Some((status, resp)))
         }
         ("POST", ["nodes"]) => {
-            let payload = if body.is_empty() {
+            let mut payload = if body.is_empty() {
                 serde_json::json!({})
             } else {
                 serde_json::from_slice(body)?
             };
+            // Who launched it: the operator (stamp_relay_facts does it for the mesh).
+            if let Some(object) = payload.as_object_mut() {
+                object.insert(
+                    "launched_by".to_string(),
+                    serde_json::Value::String("operator".to_string()),
+                );
+            }
             let (status, resp) =
                 handle_admin_command(ctx, client, "run_node", payload, Some(hive)).await?;
             Ok(Some((status, resp)))
@@ -7000,6 +7113,18 @@ async fn handle_hive_paths(
             }
             let (status, resp) =
                 handle_admin_command(ctx, client, "create_tenant", payload, Some(hive)).await?;
+            Ok(Some((status, resp)))
+        }
+        ("GET", ["identity", "tenants", tenant_id, "nodes"]) => {
+            let payload = serde_json::json!({ "tenant_id": decode_percent(tenant_id) });
+            let (status, resp) = handle_admin_query_with_payload(
+                ctx,
+                client,
+                "list_tenant_nodes",
+                payload,
+                Some(hive),
+            )
+            .await?;
             Ok(Some((status, resp)))
         }
         ("GET", ["identity", "tenants", tenant_id]) => {
@@ -9424,6 +9549,9 @@ fn admin_action_summary(action: &str) -> &'static str {
         "list_nodes" => {
             "List nodes for one hive only. Use inventory for system-wide node visibility."
         }
+        "list_tenant_nodes" => {
+            "List the managed nodes charged to one tenant on every hive, with their runtime, state and who launched them."
+        }
         "get_node_status" => "Read the effective runtime status of one node.",
         "get_node_state" => "Read the persisted state payload of one node.",
         "get_node_config" => "Read the stored effective config.json payload for a managed node.",
@@ -9654,6 +9782,7 @@ fn admin_action_path_patterns(action: &str) -> Vec<&'static str> {
         "list_hives" => vec!["GET /hives"],
         "get_hive" => vec!["GET /hives/{hive}"],
         "list_nodes" => vec!["GET /hives/{hive}/nodes"],
+        "list_tenant_nodes" => vec!["GET /hives/{hive}/identity/tenants/{tenant_id}/nodes"],
         "get_node_status" => vec!["GET /hives/{hive}/nodes/{node_name}/status"],
         "get_node_state" => vec!["GET /hives/{hive}/nodes/{node_name}/state"],
         "get_node_config" => vec!["GET /hives/{hive}/nodes/{node_name}/config"],
@@ -10998,6 +11127,7 @@ fn admin_action_example_scmd(action: &str) -> Option<String> {
         }
         "remove_hive" => "curl -X DELETE /hives/worker-220",
         "list_nodes" => "curl -X GET /hives/motherbee/nodes",
+        "list_tenant_nodes" => "curl -X GET /hives/motherbee/identity/tenants/tnt:.../nodes",
         "get_node_status" => "curl -X GET /hives/motherbee/nodes/SY.admin@motherbee/status",
         "get_node_state" => "curl -X GET /hives/motherbee/nodes/SY.admin@motherbee/state",
         "get_node_config" => "curl -X GET /hives/motherbee/nodes/AI.sales@motherbee/config",
@@ -11218,6 +11348,10 @@ fn admin_action_request_notes(action: &str) -> Vec<&'static str> {
             "Motherbee-only operation.",
             "For HTTP usage the hive id is in the body for add_hive and in the path for remove_hive.",
         ],
+        "list_tenant_nodes" => vec![
+            "Every managed node charged to the tenant, on every connected hive: node_name, hive, runtime, lifecycle_state, health_state, identity (ilk_id, tenant_id), launched_by (cloud, archi, operator, system) and relaunch_on_boot (false once stopped).",
+            "A hive that does not answer is listed in unreachable_hives. Fluxbee Cloud reads its tenant's nodes this way (list_nodes).",
+        ],
         "list_nodes" => vec![
             "This endpoint is hive-scoped only.",
             "For all nodes across the system, use GET /inventory or GET /inventory/summary instead.",
@@ -11236,6 +11370,7 @@ fn admin_action_request_notes(action: &str) -> Vec<&'static str> {
             "Use this when the persisted managed node instance already exists and needs to be started again.",
             "This reuses the stored config.json and runtime metadata instead of creating a new instance.",
             "Refused with TENANT_NOT_ACTIVE while the node's tenant is pending or suspended.",
+            "It also sets relaunch_on_boot again, which a stop (kill_node without purge_instance) clears.",
             "The hive target comes from the /hives/{hive} path in HTTP.",
         ],
         "restart_node" => vec![
@@ -11244,7 +11379,13 @@ fn admin_action_request_notes(action: &str) -> Vec<&'static str> {
             "Refused with TENANT_NOT_ACTIVE while the node's tenant is pending or suspended; a node that already runs is never stopped for it.",
             "The hive target comes from the /hives/{hive} path in HTTP.",
         ],
-        "kill_node" | "remove_node_instance" | "set_node_config" | "send_node_message" => vec![
+        "kill_node" => vec![
+            "The hive target comes from the /hives/{hive} path in HTTP.",
+            "The node_name path segment should be a fully-qualified Fluxbee node name.",
+            "Without purge_instance it is a stop that lasts: the boot and periodic relaunches leave the node down (relaunch_on_boot false) until start_node or restart_node. A node that dies on its own is still relaunched.",
+            "With purge_instance it is the full teardown: its timers, the secrets it owns and its identity go, and the name is free again.",
+        ],
+        "remove_node_instance" | "set_node_config" | "send_node_message" => vec![
             "The hive target comes from the /hives/{hive} path in HTTP.",
             "The node_name path segment should be a fully-qualified Fluxbee node name.",
         ],
@@ -14415,6 +14556,7 @@ fn build_admin_request(
         | "set_node_config"
         | "get_node_state"
         | "get_node_status"
+        | "list_tenant_nodes"
         | "remove_hive"
         | "core_rollback"
         | "add_hive" => "SY.orchestrator",
@@ -14727,6 +14869,7 @@ fn action_routes_via_local_orchestrator(action: &str) -> bool {
     matches!(
         action,
         "list_nodes"
+            | "list_tenant_nodes"
             | "run_node"
             | "start_node"
             | "restart_node"
@@ -15675,14 +15818,115 @@ mod tests {
         let mut forged = set(t);
         forged["on_behalf_of"] = serde_json::json!("operator");
         assert_eq!(
-            stamp_on_behalf_of("set_ilk_tenant", forged.clone(), relay)["on_behalf_of"],
+            stamp_relay_facts("set_ilk_tenant", forged.clone(), relay, "motherbee")["on_behalf_of"],
             "IO.cloud@motherbee"
         );
         assert_eq!(
-            stamp_on_behalf_of("set_ilk_tenant", set(t), None)["on_behalf_of"],
+            stamp_relay_facts("set_ilk_tenant", set(t), None, "motherbee")["on_behalf_of"],
             "executor"
         );
-        assert_eq!(stamp_on_behalf_of("get_ilk", forged.clone(), relay), forged);
+        assert_eq!(
+            stamp_relay_facts("get_ilk", forged.clone(), relay, "motherbee"),
+            forged
+        );
+    }
+
+    /// Stage 4 (docs/ilk-tenant-model-v1.md §2.4): who launched a node is stamped from the
+    /// router-stamped caller, never the params; the Cloud relay's node actions carry the
+    /// requirement that the hive holding the node checks.
+    #[test]
+    fn the_relay_facts_come_from_the_caller() {
+        let relay = Some("IO.cloud@motherbee");
+        let t = "tnt:11111111-1111-4111-8111-111111111111";
+        let forged =
+            serde_json::json!({"node_name": "IO.slack.a@motherbee", "launched_by": "archi"});
+        for (caller, expected) in [
+            (relay, "cloud"),
+            (Some("SY.architect@motherbee"), "archi"),
+            (None, "operator"),
+            (Some("SY.wf-rules@motherbee"), "SY.wf-rules@motherbee"),
+        ] {
+            assert_eq!(
+                stamp_relay_facts("run_node", forged.clone(), caller, "motherbee")["launched_by"],
+                expected
+            );
+        }
+        let node = serde_json::json!({"node_name": "IO.slack.a@motherbee", "tenant_id": t});
+        for action in ["start_node", "kill_node"] {
+            let stamped = stamp_relay_facts(action, node.clone(), relay, "motherbee");
+            assert_eq!(stamped["require_tenant_id"], t);
+            assert_eq!(stamped["require_launched_by"], "cloud");
+            assert!(stamped.get("tenant_id").is_none());
+            // Anyone else's node actions are left as they come.
+            assert_eq!(
+                stamp_relay_facts(
+                    action,
+                    node.clone(),
+                    Some("SY.architect@motherbee"),
+                    "motherbee"
+                ),
+                node
+            );
+        }
+        let status = stamp_relay_facts("get_node_status", node.clone(), relay, "motherbee");
+        assert_eq!(status["require_tenant_id"], t);
+        assert!(status.get("require_launched_by").is_none());
+        let tenants = stamp_relay_facts("list_tenants", serde_json::json!({}), relay, "motherbee");
+        assert_eq!(
+            tenants,
+            serde_json::json!({"include_deleted": true, "exclude_root": true})
+        );
+    }
+
+    #[test]
+    fn cloud_relay_content_for_the_stage_four_actions() {
+        let relay = Some("IO.cloud@motherbee");
+        let t = "tnt:11111111-1111-4111-8111-111111111111";
+        let root = fluxbee_sdk::DEFAULT_ROOT_TENANT_ID;
+        let check = |action: &str, params: serde_json::Value| {
+            enforce_cloud_relay_content(relay, action, "motherbee", &params)
+        };
+        // The whole tenant but pending, a root sponsor or an unknown field.
+        assert!(check(
+            "update_tenant",
+            serde_json::json!({"tenant_id": t, "status": "suspended", "settings": {}, "sponsor_tenant_id": null})
+        )
+        .is_ok());
+        for bad in [
+            serde_json::json!({"tenant_id": t, "status": "pending"}),
+            serde_json::json!({"tenant_id": t, "sponsor_tenant_id": root}),
+            serde_json::json!({"tenant_id": t, "settings": "x"}),
+            serde_json::json!({"tenant_id": t, "approved_by": "x"}),
+            serde_json::json!({"tenant_id": root, "name": "x"}),
+        ] {
+            assert!(check("update_tenant", bad.clone()).is_err(), "{bad}");
+        }
+        assert!(check("get_tenant", serde_json::json!({"tenant_id": t})).is_ok());
+        assert!(check("get_tenant", serde_json::json!({"tenant_id": root})).is_err());
+        assert!(check("list_tenant_nodes", serde_json::json!({"tenant_id": t})).is_ok());
+        assert!(check("list_tenants", serde_json::json!({})).is_ok());
+        assert!(check("list_tenants", serde_json::json!({"exclude_root": false})).is_err());
+        // Node actions: an IO.* node of the claimed tenant; a kill may purge.
+        let node = |name: &str| serde_json::json!({"tenant_id": t, "node_name": name});
+        for action in ["get_node_status", "start_node", "kill_node"] {
+            assert!(
+                check(action, node("IO.slack.a@motherbee")).is_ok(),
+                "{action}"
+            );
+            assert!(check(action, node("AI.x@motherbee")).is_err(), "{action}");
+            assert!(check(
+                action,
+                serde_json::json!({"node_name": "IO.slack.a@motherbee"})
+            )
+            .is_err());
+        }
+        let mut purge = node("IO.slack.a@motherbee");
+        purge["purge_instance"] = serde_json::json!(true);
+        assert!(check("kill_node", purge.clone()).is_ok());
+        assert!(check("start_node", purge).is_err());
+        let mut planted = node("IO.slack.a@motherbee");
+        planted["require_launched_by"] = serde_json::json!("archi");
+        assert!(check("kill_node", planted).is_err());
     }
 
     #[test]
@@ -15693,7 +15937,9 @@ mod tests {
         );
         // FIX-1 (HIGH): IO.cloud is DEFAULT-DENY beyond the exposed set — a compromised relay
         // cannot be a confused deputy for these privileged actions. (delete_ilk left this list on
-        // 2026-09-28: it now only MARKS and is tenant-scoped; the physical purges stay denied.)
+        // 2026-09-28: it now only MARKS and is tenant-scoped; the physical purges stay denied.
+        // kill_node left it on 2026-10-15, D14: only for the IO nodes Cloud launched in its
+        // tenant, which stamp_relay_facts requires and the hive holding the node checks.)
         for evil in [
             "vault_get",
             "vault_get_metadata",
@@ -15703,7 +15949,8 @@ mod tests {
             "purge_tenant",
             "add_route",
             "add_vpn",
-            "kill_node",
+            "restart_node",
+            "remove_node_instance",
             "add_hive",
             "set_node_config",
             "list_nodes",
@@ -16000,6 +16247,12 @@ mod tests {
             "update_tenant",
             "set_ilk_tenant",
             "vault_assign",
+            "get_tenant",
+            "list_tenants",
+            "list_tenant_nodes",
+            "get_node_status",
+            "start_node",
+            "kill_node",
         ]
         .into_iter()
         .collect();
