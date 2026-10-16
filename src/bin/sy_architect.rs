@@ -2268,7 +2268,7 @@ Use these facts only to select and validate planning intent. Do not treat them a
 ### Naming
 
 - A full L2 node identity is composed as `<node_name>@<hive>`.
-- `node_name` must include a functional prefix such as `AI.*`, `IO.*`, `WF.*`, `SY.*`, or supported `RT.*`.
+- `node_name` must include a functional prefix such as `AI.*`, `IO.*` or `WF.*`. `SY.*` names are the system's and `RT.*` names are the router's own (its streams included): never use them for a node you create.
 - The hive in the node identity suffix must match the target hive argument when creating or operating that node.
 - Runtime names do not include `@hive`. Node instances do.
 - Example: `AI.support@motherbee` is a node instance. `ai.generic` is a runtime/package name.

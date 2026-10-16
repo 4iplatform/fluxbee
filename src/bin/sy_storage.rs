@@ -48,6 +48,44 @@ const NATS_ERROR_LOG_EVERY: u64 = 20;
 const INBOX_REPLAY_BATCH_SIZE: i64 = 200;
 const INBOX_REPLAY_MAX_ROUNDS: u32 = 20;
 const INBOX_ERROR_MAX_LEN: usize = 1024;
+/// How often SY.storage retries the inbox rows that failed. Until 0.1.74 they were retried only at
+/// startup (A-70). Processed rows are kept: Archi's Messages page reads `storage_inbox` as the
+/// message log, and the AI replies `turns` dropped before 0.1.75 exist only there.
+const INBOX_MAINTENANCE_INTERVAL_SECS: u64 = 60;
+/// A failed row is retried until it has this many attempts; then it stays, with its last error,
+/// visible in the inbox metrics.
+const INBOX_MAX_ATTEMPTS: i32 = 10;
+/// A row younger than this is left to its live handler, so a retry never races it.
+const INBOX_RETRY_MIN_AGE_SECS: i32 = 60;
+
+/// `turns` is keyed by the record's inbox key (A-70). It was keyed by `(ctx, seq)`, which come from
+/// the `trace_id` when the message has no `meta.ctx`; a reply reuses its request's `trace_id`, so
+/// `ON CONFLICT DO NOTHING` threw the reply away. Rows written before take `legacy:<ctx>:<seq>`.
+/// Runs at every start: the column check keeps it from rescanning the table once migrated.
+const TURNS_KEY_MIGRATION_SQL: &str = r#"
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM information_schema.columns
+        WHERE table_schema = current_schema() AND table_name = 'turns'
+          AND column_name = 'dedupe_key' AND is_nullable = 'NO'
+    ) THEN
+        ALTER TABLE turns ADD COLUMN IF NOT EXISTS dedupe_key TEXT;
+        UPDATE turns SET dedupe_key = 'legacy:' || ctx || ':' || seq WHERE dedupe_key IS NULL;
+        ALTER TABLE turns ALTER COLUMN dedupe_key SET NOT NULL;
+    END IF;
+    IF EXISTS (
+        SELECT 1 FROM pg_constraint c JOIN pg_class t ON t.oid = c.conrelid
+        WHERE t.relname = 'turns' AND t.relnamespace = current_schema()::regnamespace
+          AND c.conname = 'turns_pkey' AND c.contype = 'p'
+    ) THEN
+        ALTER TABLE turns DROP CONSTRAINT turns_pkey;
+    END IF;
+END $$;
+CREATE UNIQUE INDEX IF NOT EXISTS idx_turns_dedupe_key ON turns (dedupe_key);
+CREATE INDEX IF NOT EXISTS idx_turns_ctx_seq ON turns (ctx, seq);
+DROP INDEX IF EXISTS idx_turns_ctx;
+"#;
 const STORAGE_METRICS_LOG_INTERVAL_SECS: u64 = 30;
 const STORAGE_METRICS_WARN_PENDING: i64 = 100;
 const STORAGE_METRICS_WARN_AGE_SECS: i64 = 120;
@@ -276,7 +314,7 @@ async fn main() -> Result<(), StorageError> {
     let storage = initialize_storage_backend(database_url.as_deref(), &node_name).await;
     if let Some(storage) = storage.as_ref() {
         let replayed = storage
-            .replay_pending_messages(INBOX_REPLAY_BATCH_SIZE, INBOX_REPLAY_MAX_ROUNDS)
+            .replay_pending_messages(INBOX_REPLAY_BATCH_SIZE, INBOX_REPLAY_MAX_ROUNDS, 0)
             .await?;
         if replayed > 0 {
             tracing::info!(count = replayed, "replayed pending storage inbox messages");
@@ -391,6 +429,9 @@ async fn main() -> Result<(), StorageError> {
             Arc::clone(&nats_subscribe_errors),
             Arc::clone(&storage_handler_errors),
         )));
+        std::mem::drop(tokio::spawn(run_inbox_maintenance_loop(Arc::clone(
+            storage,
+        ))));
     }
     std::mem::drop(tokio::spawn(run_storage_metrics_query_loop(
         config_dir.clone(),
@@ -441,9 +482,19 @@ impl Storage {
     async fn connect(database_config: &PgConfig) -> Result<Self, StorageError> {
         let (client, connection) = database_config.connect(NoTls).await?;
         tokio::spawn(async move {
-            if let Err(err) = connection.await {
-                tracing::error!(error = %err, "postgres connection closed");
+            // The client does not reconnect: once its connection is gone every write fails, and
+            // until 0.1.74 SY.storage only logged it and kept running without a database. It exits
+            // instead, and systemd starts it again (Restart=always) with a new connection (A-70).
+            match connection.await {
+                Ok(()) => tracing::error!(
+                    "postgres connection closed; exiting so that systemd restarts sy-storage"
+                ),
+                Err(err) => tracing::error!(
+                    error = %err,
+                    "postgres connection closed; exiting so that systemd restarts sy-storage"
+                ),
             }
+            std::process::exit(1);
         });
         Ok(Self { client })
     }
@@ -453,6 +504,7 @@ impl Storage {
             .batch_execute(
                 r#"
 CREATE TABLE IF NOT EXISTS turns (
+    dedupe_key  TEXT NOT NULL,
     ctx         TEXT NOT NULL,
     seq         BIGINT NOT NULL,
     ts          TIMESTAMPTZ NOT NULL DEFAULT now(),
@@ -461,8 +513,7 @@ CREATE TABLE IF NOT EXISTS turns (
     ich         TEXT NOT NULL,
     msg_type    TEXT NOT NULL,
     content     JSONB NOT NULL,
-    tags        TEXT[],
-    PRIMARY KEY (ctx, seq)
+    tags        TEXT[]
 );
 
 CREATE TABLE IF NOT EXISTS events (
@@ -512,7 +563,6 @@ CREATE TABLE IF NOT EXISTS storage_reactivation_applied (
     PRIMARY KEY (dedupe_key, event_id)
 );
 
-CREATE INDEX IF NOT EXISTS idx_turns_ctx ON turns (ctx);
 CREATE INDEX IF NOT EXISTS idx_events_cues ON events USING GIN(cues_agg);
 CREATE INDEX IF NOT EXISTS idx_events_activation ON events(activation_strength DESC);
 CREATE INDEX IF NOT EXISTS idx_events_natural_key ON events(ctx, start_seq, end_seq, boundary_reason);
@@ -700,27 +750,46 @@ CREATE INDEX IF NOT EXISTS idx_cognition_episodes_scope ON cognition_episodes(sc
 	"#,
             )
             .await?;
+        self.client.batch_execute(TURNS_KEY_MIGRATION_SQL).await?;
         Ok(())
     }
 
+    /// Retries the inbox rows not processed yet, oldest first: at startup, and every
+    /// `INBOX_MAINTENANCE_INTERVAL_SECS`. A row with `INBOX_MAX_ATTEMPTS` stays as it is, and one
+    /// younger than `min_age_secs` is left to its live handler.
     async fn replay_pending_messages(
         &self,
         batch_size: i64,
         max_rounds: u32,
+        min_age_secs: i32,
     ) -> Result<u64, StorageError> {
         let mut replayed = 0u64;
+        // One pass walks the pending rows in (received_at, dedupe_key) order, so the rows that
+        // fail again do not hold back the ones after them.
+        let mut after: Option<(std::time::SystemTime, String)> = None;
         for _ in 0..max_rounds {
+            let after_ts = after.as_ref().map(|(ts, _)| *ts);
+            let after_key = after.as_ref().map(|(_, key)| key.clone());
             let rows = self
                 .client
                 .query(
                     r#"
-SELECT dedupe_key, subject, payload
+SELECT dedupe_key, subject, payload, received_at
 FROM storage_inbox
 WHERE processed_at IS NULL
-ORDER BY received_at ASC
+  AND attempts < $2
+  AND received_at < now() - make_interval(secs => $3)
+  AND ($4::timestamptz IS NULL OR (received_at, dedupe_key) > ($4::timestamptz, $5::text))
+ORDER BY received_at ASC, dedupe_key ASC
 LIMIT $1
 "#,
-                    &[&batch_size],
+                    &[
+                        &batch_size,
+                        &INBOX_MAX_ATTEMPTS,
+                        &f64::from(min_age_secs),
+                        &after_ts,
+                        &after_key,
+                    ],
                 )
                 .await?;
             if rows.is_empty() {
@@ -731,6 +800,7 @@ LIMIT $1
                 let dedupe_key: String = row.get(0);
                 let subject: String = row.get(1);
                 let payload: Vec<u8> = row.get(2);
+                after = Some((row.get(3), dedupe_key.clone()));
                 let Some(kind) = handler_kind_for_subject(&subject) else {
                     let err_msg = format!("unsupported subject in inbox replay: {subject}");
                     self.client
@@ -750,6 +820,14 @@ WHERE dedupe_key = $1
                     .process_inbox_message(&dedupe_key, &subject, kind, &payload)
                     .await
                 {
+                    // A retry counts as an attempt, so a row that keeps failing stops at
+                    // INBOX_MAX_ATTEMPTS instead of being retried forever.
+                    self.client
+                        .execute(
+                            "UPDATE storage_inbox SET attempts = attempts + 1 WHERE dedupe_key = $1",
+                            &[&dedupe_key],
+                        )
+                        .await?;
                     tracing::warn!(
                         subject = %subject,
                         dedupe_key = %dedupe_key,
@@ -911,7 +989,7 @@ WHERE dedupe_key = $1
             HandlerKind::Turns => {
                 let value: Value = serde_json::from_slice(payload)?;
                 let turn = parse_turn(value)?;
-                self.persist_turn(&self.client, &turn).await
+                self.persist_turn(&self.client, dedupe_key, &turn).await
             }
             HandlerKind::Events => {
                 let value: Value = serde_json::from_slice(payload)?;
@@ -976,17 +1054,25 @@ WHERE dedupe_key = $1
         }
     }
 
-    async fn persist_turn<C>(&self, db: &C, turn: &TurnRecord) -> Result<(), StorageError>
+    /// One row per turn, keyed by its inbox key: a redelivered turn is the same payload and lands
+    /// on the same key, while a reply, which shares its request's `trace_id`, is a row of its own.
+    async fn persist_turn<C>(
+        &self,
+        db: &C,
+        dedupe_key: &str,
+        turn: &TurnRecord,
+    ) -> Result<(), StorageError>
     where
         C: GenericClient + Sync,
     {
         db.execute(
             r#"
-INSERT INTO turns (ctx, seq, ts, from_ilk, to_ilk, ich, msg_type, content, tags)
-VALUES ($1, $2, now(), $3, $4, $5, $6, $7, $8)
-ON CONFLICT (ctx, seq) DO NOTHING
+INSERT INTO turns (dedupe_key, ctx, seq, ts, from_ilk, to_ilk, ich, msg_type, content, tags)
+VALUES ($1, $2, $3, now(), $4, $5, $6, $7, $8, $9)
+ON CONFLICT (dedupe_key) DO NOTHING
 "#,
             &[
+                &dedupe_key,
                 &turn.ctx,
                 &turn.seq,
                 &turn.from_ilk,
@@ -2009,6 +2095,29 @@ fn message_dedupe_key(subject: &str, payload: &[u8]) -> String {
     format!("{subject}:{hash:016x}:{}", payload.len())
 }
 
+/// Every `INBOX_MAINTENANCE_INTERVAL_SECS`, retries the rows that failed (A-70). The startup
+/// replay already ran, so the first round waits one interval.
+async fn run_inbox_maintenance_loop(storage: Arc<Storage>) {
+    let mut ticker = time::interval(Duration::from_secs(INBOX_MAINTENANCE_INTERVAL_SECS));
+    ticker.set_missed_tick_behavior(time::MissedTickBehavior::Delay);
+    ticker.tick().await;
+    loop {
+        ticker.tick().await;
+        match storage
+            .replay_pending_messages(
+                INBOX_REPLAY_BATCH_SIZE,
+                INBOX_REPLAY_MAX_ROUNDS,
+                INBOX_RETRY_MIN_AGE_SECS,
+            )
+            .await
+        {
+            Ok(0) => {}
+            Ok(count) => tracing::info!(count, "retried failed storage inbox messages"),
+            Err(err) => tracing::warn!(error = %err, "storage inbox retry failed"),
+        }
+    }
+}
+
 fn truncate_error(input: &str, max_len: usize) -> String {
     if input.len() <= max_len {
         return input.to_string();
@@ -2497,34 +2606,29 @@ async fn initialize_storage_backend(
         }
     };
     if let Err(err) = ensure_database_exists(&base_database_config, STORAGE_DB_NAME).await {
-        tracing::warn!(
-            node_name = %node_name,
-            error = %err,
-            "failed to ensure storage database exists; starting without DB backend"
-        );
-        return None;
+        exit_without_database(node_name, "ensure the storage database exists", &err);
     }
     let storage_database_config = with_dbname(&base_database_config, STORAGE_DB_NAME);
     let storage = match Storage::connect(&storage_database_config).await {
         Ok(storage) => Arc::new(storage),
-        Err(err) => {
-            tracing::warn!(
-                node_name = %node_name,
-                error = %err,
-                "failed to connect SY.storage DB backend; starting without DB backend"
-            );
-            return None;
-        }
+        Err(err) => exit_without_database(node_name, "connect to the storage database", &err),
     };
     if let Err(err) = storage.ensure_schema().await {
-        tracing::warn!(
-            node_name = %node_name,
-            error = %err,
-            "failed to ensure SY.storage schema; starting without DB backend"
-        );
-        return None;
+        exit_without_database(node_name, "ensure the storage schema", &err);
     }
     Some(storage)
+}
+
+/// A database is configured but cannot be used. SY.storage exits, and systemd starts it again
+/// (Restart=always) until postgres answers. Running on without a database, as it did until 0.1.74,
+/// left it with no ingestion and no retry until someone restarted it (A-70).
+fn exit_without_database(node_name: &str, what: &str, err: &StorageError) -> ! {
+    tracing::error!(
+        node_name = %node_name,
+        error = %err,
+        "SY.storage could not {what}; exiting so that systemd retries"
+    );
+    std::process::exit(1);
 }
 
 fn with_dbname(base: &PgConfig, dbname: &str) -> PgConfig {
@@ -3388,4 +3492,51 @@ fn write_json_atomic(path: &Path, content: &str) -> Result<(), StorageError> {
         let _ = dir_file.sync_all();
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn message(trace_id: &str, src: &str, text: &str) -> Value {
+        serde_json::json!({
+            "routing": {"src": src, "dst": "x", "ttl": 8, "trace_id": trace_id},
+            "meta": {"type": "user", "src_ilk": src},
+            "payload": {"type": "text", "content": text}
+        })
+    }
+
+    #[test]
+    fn a_reply_lands_on_a_key_of_its_own() {
+        // The request and its reply share the trace_id, so the old (ctx, seq) key was the same and
+        // the reply was dropped (A-70). The inbox key is not.
+        let request = message("trace-1", "ilk:person", "hola");
+        let reply = message("trace-1", "ilk:ai", "hola, en qué te ayudo");
+        let request_turn = parse_turn(request.clone()).expect("request parses");
+        let reply_turn = parse_turn(reply.clone()).expect("reply parses");
+        assert_eq!(
+            (request_turn.ctx.as_str(), request_turn.seq),
+            (reply_turn.ctx.as_str(), reply_turn.seq)
+        );
+        let key = |value: &Value| {
+            message_dedupe_key(SUBJECT_STORAGE_TURNS, &serde_json::to_vec(value).unwrap())
+        };
+        assert_ne!(key(&request), key(&reply));
+        assert_eq!(
+            key(&request),
+            key(&request),
+            "a redelivered turn keeps its key"
+        );
+    }
+
+    #[test]
+    fn turns_are_keyed_by_the_inbox_key() {
+        assert!(TURNS_KEY_MIGRATION_SQL.contains(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_turns_dedupe_key ON turns (dedupe_key)"
+        ));
+        // The primary key goes only where it still exists, so a start never locks `turns` again.
+        assert!(TURNS_KEY_MIGRATION_SQL.contains("c.conname = 'turns_pkey' AND c.contype = 'p'"));
+        assert!(TURNS_KEY_MIGRATION_SQL.contains("ALTER TABLE turns DROP CONSTRAINT turns_pkey;"));
+        assert!(TURNS_KEY_MIGRATION_SQL.contains("'legacy:' || ctx || ':' || seq"));
+    }
 }

@@ -4,6 +4,12 @@
 **Fecha:** 2026-02-06  
 **Audiencia:** Desarrolladores de router core, infraestructura
 
+> **Desactualizado en el transporte (2026-10-16, A-70).** Lo que este doc dice de NATS (reenvío
+> entre hives, buffers de días) nunca existió así: el broker es propio, local a cada hive, y solo
+> el tráfico del motherbee llega a la base. NATS muere: lo reemplaza el stream de cada router,
+> `docs/router-stream-v1.md`. La clave de `turns` ya está al día (§7.3); el resto se reescribe
+> cuando NATS se borre (etapa 2).
+
 ---
 
 ## 1. Resumen
@@ -29,7 +35,7 @@ La capa de persistencia desacopla los procesos de la base de datos mediante un b
 | WAN cae | NATS local bufferea hasta reconexión |
 | PostgreSQL lento/caído | NATS bufferea, SY.storage retryea |
 | Duplicados por retry | DB: `ON CONFLICT DO NOTHING` |
-| Orden de llegada | No importa, (ctx, seq) es la clave |
+| Orden de llegada | No importa: cada turno tiene su clave, el hash de su tema y su contenido |
 
 ---
 
@@ -426,9 +432,9 @@ impl Storage {
         // Idempotente: ON CONFLICT DO NOTHING
         let result = sqlx::query!(
             r#"
-            INSERT INTO turns (ctx, seq, ts, from_ilk, to_ilk, ich, msg_type, content, tags)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
-            ON CONFLICT (ctx, seq) DO NOTHING
+            INSERT INTO turns (dedupe_key, ctx, seq, ts, from_ilk, to_ilk, ich, msg_type, content, tags)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+            ON CONFLICT (dedupe_key) DO NOTHING
             "#,
             turn.ctx,
             turn.seq,
@@ -691,8 +697,10 @@ impl Cognition {
 ### 7.3 Idempotencia
 
 ```sql
--- Turns: (ctx, seq) es unique
-INSERT INTO turns ... ON CONFLICT (ctx, seq) DO NOTHING;
+-- Turns: la clave es dedupe_key, la misma de storage_inbox (hash del tema y el contenido).
+-- (ctx, seq) era la clave hasta 0.1.74: sale del trace_id, y una respuesta reusa el de su
+-- pedido, así que la respuesta se descartaba (A-70). Hoy es solo un índice.
+INSERT INTO turns ... ON CONFLICT (dedupe_key) DO NOTHING;
 
 -- Events: event_id es serial, pero content es determinístico
 INSERT INTO events ... ON CONFLICT DO UPDATE SET ...;
@@ -725,11 +733,11 @@ Cada uno:
   - Bufferea localmente
   - Forward por WAN
   - Madre recibe de todos
-  - PostgreSQL deduplica por (ctx, seq)
+  - PostgreSQL deduplica por dedupe_key
 ```
 
 **No hay conflicto porque:**
-- Cada turn tiene (ctx, seq) único
+- Cada turn tiene su dedupe_key, que no se repite
 - `ON CONFLICT DO NOTHING` es idempotente
 - El orden de llegada no importa
 

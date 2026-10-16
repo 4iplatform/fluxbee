@@ -72,10 +72,14 @@ fixes the bugs the review found in today's router, SY.storage and SY.cognition (
   - **SY.cognition processes a turn several times.** It acks only after processing, and the broker
     re-sends an unacked message every 2 s. A turn whose tagging takes more than 2 s is processed
     again. On 2026-10-16 one probe turn cost 3 or 4 tagger calls and as many summarizer calls.
-  - **An oversize frame kills a link for good,** in the router's node, WAN and IRP writers.
+  - **An oversize frame breaks a link.** The router's writers stop at a frame over 128 KB. A node
+    or a sibling router then sees its link close and reconnects, losing the frames in between. The
+    WAN link stays dead in one direction for good.
   - **A message from another hive to a node on a non-gateway router is dropped.**
-  - **SY.storage never reconnects to postgres:** a closed connection is only logged.
-  - **`storage_inbox` is never purged,** and its retry of failed rows runs only at startup.
+  - **SY.storage never reconnects to postgres:** a closed connection is only logged, and a
+    database it cannot use at start leaves it running without one until someone restarts it.
+  - **`storage_inbox` retries failed rows only at startup.** It is also the message log: Archi's
+    Messages page reads it, and the AI replies `turns` dropped exist only there (Q7).
 
 What the stream reuses:
 - **Router-internal messages:** the router already consumes OPA_RELOAD itself and routes it to no
@@ -349,20 +353,26 @@ others like switches, joined by IRP. Each node picks a router by a hash of its n
 
 The stream depends on these, so they come first.
 
-- **An oversize frame kills a link for good (D11).**
-  - When a frame to a node is over 128 KB, the node's writer task stops, but the node stays
-    registered and its reader keeps running: every later delivery to it is silently lost.
-  - The WAN writer and both IRP writers behave the same, leaving a link dead in one direction
-    that never reconnects.
-  - If that node were SY.storage@motherbee, it would stop receiving from every hive.
-  - **Fix:** the four writers skip a frame that `write_frame` refuses as too large (it refuses
-    before writing a byte), count it, log it at most once per interval, and keep the link.
+- **An oversize frame breaks a link (D11).**
+  - When a frame is over 128 KB, the router's writer for that link stops.
+  - A node or a sibling router sees its link close and reconnects, losing the frames in between.
+    The WAN writer leaves its link dead in one direction for good.
+  - A node cannot send one: the SDK refuses it before sending. A frame grows past the limit only
+    when the router enlarges it on the way (`src_l2_name`, `action_class`, the memory package).
+  - **Fix:** one writer for the four links. It skips a frame over the limit (`write_frame` would
+    refuse it before writing a byte), counts it, logs at most once per interval with the total,
+    and keeps the link.
 - **A message from another hive to a node on a non-gateway router is dropped.**
   - The gateway hands it over IRP, and the receiving router's `handle_peer_message` drops any frame
     whose sender is not one of its sibling routers' nodes.
-  - **Fix:** when the sender is not a sibling's node, resolve it as a remote node (LSA,
-    reachability) and keep the gateway's canonical `src_l2_name`. IRP is a 0600 socket only
-    routers open. With a test.
+  - **Fix:** when the sender is not a sibling's node and the frame comes from the gateway, the
+    sender must be a node of another hive in this router's LSA.
+    - Its name is derived here, canonical to its hive as the gateway's WAN ingress does
+      (EDGE-01), not taken from the frame.
+    - A miss refreshes the LSA once before dropping, and a drop is logged.
+    - With tests on an LSA snapshot.
+  - **Known limit:** a node the gateway knows only through the hub's reachability plane (spoke to
+    hub to spoke) still cannot reach a non-gateway router: that plane lives only on the gateway.
 - **`RT.` names are not reserved:** the HELLO check and the orchestrator guard of §2.1.
 
 ### 2.13 Storage and cognition bugs fixed on the way
@@ -373,11 +383,21 @@ The stream depends on these, so they come first.
 - **Cognition processes a turn several times.** In stage 1, still on NATS, its consumer acks on
   receipt and processes from its own bounded queue, as §2.7 says. It stops paying 2 to 4 LLM calls
   per turn now, before the stream reaches it.
-- **SY.storage's database connection:** it exits when the connection closes (§2.7).
-- **`storage_inbox`:**
-  - processed rows older than `STORAGE_INBOX_RETENTION_HOURS` (24, a constant) are purged
-    periodically. They only need to cover the window and a restart;
-  - the retry of failed rows becomes periodic, in insert order, with a cap on attempts.
+- **Cognition's worker:** if it ever stops, cognition exits instead of acking and dropping every
+  turn.
+- **SY.storage and its database:** with a database configured, SY.storage exits when it cannot
+  create, connect or set up its schema at start, and when its connection closes. systemd starts
+  it again until postgres answers. Without a database URL it still starts degraded.
+- **`storage_inbox`'s retry** becomes periodic, every 60 s, for rows over a minute old:
+  - in insert order, with a cursor, so failing rows do not hold back the rest;
+  - each failed retry counts as an attempt, up to 10.
+
+  Processed rows are not purged (Q7).
+- **The `turns` migration** runs once and does not touch the table again. Rolling back to 0.1.74
+  or earlier needs the VM snapshot: the old code inserts with `ON CONFLICT (ctx, seq)`, which no
+  longer has a unique index.
+- **`ts` from the record:** comes with the stream (1b); on NATS a turn arrives within
+  milliseconds.
 
 ### 2.14 Stage 3: LLM usage records
 
@@ -445,7 +465,7 @@ The stream depends on these, so they come first.
 
 | Stage | What | Gate on 8.x |
 |---|---|---|
-| 1a | The live bugs (§2.12, §2.13), on today's NATS: frames, IRP, `RT.` reserved, the `turns` key, cognition's duplicates, SY.storage's connection, the inbox | an AI reply and its request both land in `turns`; one turn costs one tagger call; a 130 KB message to a node is skipped and the next one arrives; SY.storage restarts when postgres restarts; health clean |
+| 1a | The live bugs (§2.12, §2.13), on today's NATS: frames, IRP, `RT.` reserved, the `turns` key, cognition's duplicates, SY.storage's database, the inbox retry | a request and its reply (one trace_id) both land in `turns`; one turn costs one tagger call; SY.storage restarts when its database connection is cut; a process that is not the router cannot HELLO as `RT.*`; health clean. The oversize skip and the IRP hand-over are unit tests: PROD cannot produce them (one router per hive, the SDK refuses oversize sends) |
 | 1b | The stream in every router; SY.storage as the sink of `storage.turns`; `STREAM_STATUS`, the admin endpoint and the health count. On the motherbee, SY.storage drops only its NATS turns loop; the router removes `durable.sy-storage.turns` once at start; ingress and egress stop copying turns to NATS | worker1's and the ingress's turns reach the database; SY.storage stopped 60 s under traffic: backlog visible, then all delivered, nothing twice; stopped 3 min: expired counted, the alarm logged, routing unaffected; a router restarted with a backlog resumes; a motherbee deploy loses nothing inside the window; health clean |
 | 2 | Cognition and policy as sinks; cognition's outputs by `STREAM_APPEND`; `STORAGE_METRICS_GET` over the mesh; NATS removed everywhere (§2.11) | cognition on the motherbee and worker1 tags turns; worker1's cognition outputs reach the database; nothing listens on 4222; a new worker join renders a `hive.yaml` without `nats`; health clean |
 | 3 | The AI function and the usage records (§2.14). The SDK part may be built during stages 1 and 2. | one call from each kind of consumer leaves a record with the right tenant, node, model and tokens; a forged record is refused; the admin answers by tenant and period; Cloud reads it through io.cloud |
@@ -463,6 +483,9 @@ the ledger and the logbook.
 - **A local process can still HELLO with any other node's name** (P-1, postponed with A-22). The
   streams are out of it: an `RT.*` name needs the router's own process (§2.1).
 - **An Anthropic retry after a transport error can be billed twice:** one record, two charges.
+- **Cognition loses its queue on a restart:** up to 256 turns acked but not processed yet, and,
+  with a backlog, the newest past the queue. Best effort (D4).
+- **Hub-vouched senders and non-gateway routers** (§2.12).
 
 ## 5. Open questions (for the operator)
 
@@ -492,3 +515,11 @@ the ledger and the logbook.
   Does io.cloud show the root tenant's spending (Archi, SY.admin)?
 - **Q6 (stage 3): `ai_local_probe`.** It builds an OpenAI client directly and has no router. Delete
   it (repo cleanup)?
+- **Q7 (after stage 1): where the message log lives.**
+  - Archi's Messages page reads `storage_inbox` as the system-wide message log, so the inbox
+    cannot be purged.
+  - The AI replies `turns` dropped before 0.1.75 exist only there.
+  - Options:
+    - Archi reads `turns`, complete from 0.1.75 on, plus a one-time backfill of the old replies
+      from the inbox; then the inbox keeps only what dedupe and retries need;
+    - or the inbox stays the log, with no purge.

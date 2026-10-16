@@ -1054,6 +1054,19 @@ Visto al arreglar los e2e de A-37, leyendo `src/router/mod.rs` y `src/shm/mod.rs
     - un ack al recibir para cognition y policy, sin reprocesar lo repetido;
     - una conexión propia de SY.storage para lo que llega en lotes.
   - **Para el operador:** seis preguntas (Q1 a Q6 del doc). Ninguna frena la etapa 1.
+- **Etapa 1a, el código (2026-10-16):** los bugs vivos arreglados sobre el NATS de hoy. Una
+  revisión del código (dos miradas) encontró, y se arregló antes del build:
+  - **La purga de `storage_inbox` habría borrado historia:** la página de mensajes de Archi lee la
+    inbox como el log de mensajes, y las respuestas que `turns` descartaba existen solo ahí. Sin
+    purga; dónde vive el log lo decide el operador (Q7 del doc);
+  - **el reintento de la inbox no contaba intentos** y reintentaba siempre las mismas filas: ahora
+    suma un intento por falla y avanza con un cursor;
+  - **SY.storage seguía sin base si postgres no estaba al arrancar:** ahora sale y systemd
+    reintenta;
+  - **el origen remoto del router** sale solo del LSA, con el nombre canónico (EDGE-01), y no del
+    frame. El respaldo por la tabla de alcance era código muerto fuera del gateway;
+  - **el daño del frame grande era menor que lo escrito:** nodo e IRP se reconectaban perdiendo lo
+    del medio; solo el enlace WAN quedaba muerto en un sentido.
 - **Etapas:**
   1. **1a:** los bugs vivos;
   2. **1b:** el stream con SY.storage;

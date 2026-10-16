@@ -13207,9 +13207,9 @@ const CORE_IO_RUNTIMES: &[&str] = &["io.cloud", "io.blob", "io.web"];
 
 /// Whether a node is part of the core, the only thing born in the genesis (root) tenant. The
 /// orchestrator defines it, being who gives out the genesis tenant (operator, 2026-10-14;
-/// docs/ilk-tenant-model-v1.md D10): the SY.* nodes (never spawned by run_node), the RT.* nodes on
-/// an `rt.*` runtime (or none), and the core IO runtimes. Everything else (AI, WF, any other IO
-/// node, or a core name on another runtime) is launched by a tenant.
+/// docs/ilk-tenant-model-v1.md D10): the SY.* nodes and the RT.* names, which belong to the router
+/// (neither is ever spawned by run_node), and the core IO runtimes. Everything else (AI, WF, any
+/// other IO node, or a core IO name on another runtime) is launched by a tenant.
 fn is_core_node(node_name: &str, runtime: &str) -> bool {
     let local = node_name
         .split_once('@')
@@ -13221,7 +13221,7 @@ fn is_core_node(node_name: &str, runtime: &str) -> bool {
         return true;
     }
     if local.starts_with("RT.") {
-        return runtime.is_empty() || runtime.starts_with("rt.");
+        return true;
     }
     local.starts_with("IO.") && CORE_IO_RUNTIMES.iter().any(|core| *core == runtime)
 }
@@ -13454,13 +13454,15 @@ fn node_requirements_refusal(
     Some(node_not_found(node_name))
 }
 
+/// `RT.` is the router's own (operator, 2026-10-16, D12 of docs/router-stream-v1.md): the router
+/// itself and its streams (`RT.<router>.stream@<hive>`). No managed node takes such a name; the
+/// router also refuses a HELLO with one from any other process.
 fn managed_spawn_disallowed_reason(node_name: &str) -> Option<&'static str> {
-    let local = node_name.split('@').next().unwrap_or(node_name).trim();
     let kind = node_kind_from_name(node_name);
     match kind.as_str() {
         "SY" => Some("managed spawn does not support SY.* nodes"),
-        "RT" if local.eq_ignore_ascii_case("RT.gateway") => {
-            Some("managed spawn does not support RT.gateway; it is core hive infrastructure")
+        "RT" => {
+            Some("managed spawn does not support RT.* nodes; the RT. prefix is the router's own")
         }
         _ => None,
     }
@@ -31532,7 +31534,6 @@ blob:
             ("AI.sales@motherbee", "ai.generic"),
             ("WF.flow@motherbee", "wf.engine"),
             ("WF.oddly.named@motherbee", "io.cloud"),
-            ("RT.disguised@motherbee", "ai.generic"),
         ] {
             let refusal = genesis_refusal(name, runtime, Some(root)).expect(name);
             assert_eq!(refusal["error_code"], "TENANT_ROOT_NOT_ALLOWED");
@@ -33361,31 +33362,38 @@ blob:
         .expect("write broken config");
 
         let nodes = persisted_custom_nodes_with_root(&root).expect("load persisted nodes");
-        assert_eq!(nodes.len(), 2);
+        // RT.* names are the router's own (D12): neither RT.gateway nor RT.edge.buffer relaunch.
+        assert_eq!(nodes.len(), 1);
         assert_eq!(nodes[0].node_name, "AI.keep.test@motherbee");
         assert_eq!(nodes[0].runtime, "ai.keep.test");
         assert_eq!(nodes[0].runtime_version, "1.0.0-diag");
-        assert_eq!(nodes[1].node_name, "RT.edge.buffer@motherbee");
-        assert_eq!(nodes[1].runtime, "rt.edge.buffer");
-        assert_eq!(nodes[1].runtime_version, "1.2.3");
 
         let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
-    fn managed_spawn_disallowed_reason_blocks_sy_and_rt_gateway_only() {
+    fn managed_spawn_disallowed_reason_blocks_sy_and_rt() {
         assert_eq!(
             managed_spawn_disallowed_reason("SY.admin@motherbee"),
             Some("managed spawn does not support SY.* nodes")
         );
-        assert_eq!(
-            managed_spawn_disallowed_reason("RT.gateway@motherbee"),
-            Some("managed spawn does not support RT.gateway; it is core hive infrastructure")
-        );
-        assert_eq!(
-            managed_spawn_disallowed_reason("RT.edge.buffer@motherbee"),
-            None
-        );
+        // The RT. prefix is the router's own (D12): a tenant's ai.generic node cannot pose as a
+        // router's stream, nor take its name first.
+        for name in [
+            "RT.gateway@motherbee",
+            "RT.edge.buffer@motherbee",
+            "RT.gateway.stream@worker1",
+            "RT.disguised@motherbee",
+        ] {
+            assert_eq!(
+                managed_spawn_disallowed_reason(name),
+                Some(
+                    "managed spawn does not support RT.* nodes; the RT. prefix is the router's own"
+                ),
+                "{name}"
+            );
+        }
+        assert_eq!(managed_spawn_disallowed_reason("AI.sales@worker1"), None);
         assert_eq!(
             managed_spawn_disallowed_reason("SY.frontdesk.gov@motherbee"),
             Some("managed spawn does not support SY.* nodes")

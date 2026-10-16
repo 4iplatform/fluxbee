@@ -9,7 +9,7 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
-use tokio::sync::Mutex;
+use tokio::sync::{mpsc, Mutex};
 use tokio::time;
 use tokio_postgres::{Config as PgConfig, NoTls, Row};
 use tracing_subscriber::EnvFilter;
@@ -229,6 +229,8 @@ struct RuntimePaths {
 struct CognitionRuntimeState {
     processed_turns_total: u64,
     invalid_turns_total: u64,
+    /// Turns dropped because the queue between their delivery and their processing was full.
+    dropped_turns_queue_full_total: u64,
     published_entities_total: u64,
     publish_errors_total: u64,
     last_trace_id: Option<String>,
@@ -675,7 +677,23 @@ async fn main() -> Result<(), CognitionError> {
     }
 }
 
+/// How many delivered turns may wait for their processing. Past it, a turn is dropped and counted.
+const COGNITION_TURN_QUEUE: usize = 256;
+
+/// Cognition takes a turn off the broker as soon as it is queued, and processes the queue in order
+/// on a task of its own: it works best effort. It used to ack only after processing, and the broker
+/// re-sends what is unacked every 2 s, so a turn whose tagging took longer was processed again,
+/// one LLM call each time: a probe turn cost 3 or 4 (A-70).
 async fn run_turns_loop(endpoint: String, app_state: Arc<CognitionAppState>) {
+    let (turn_tx, mut turn_rx) = mpsc::channel::<Vec<u8>>(COGNITION_TURN_QUEUE);
+    let worker_state = Arc::clone(&app_state);
+    std::mem::drop(tokio::spawn(async move {
+        while let Some(payload) = turn_rx.recv().await {
+            if let Err(err) = handle_turn_payload(payload, Arc::clone(&worker_state)).await {
+                tracing::warn!(error = %err, "sy.cognition failed to process a turn");
+            }
+        }
+    }));
     loop {
         let subscriber = if app_state.use_durable_consumer {
             RouterNatsSubscriber::new(
@@ -692,10 +710,36 @@ async fn run_turns_loop(endpoint: String, app_state: Arc<CognitionAppState>) {
             )
         };
         let run_app_state = Arc::clone(&app_state);
+        let run_turn_tx = turn_tx.clone();
         let run_result = subscriber
             .run(move |payload| {
                 let app_state = Arc::clone(&run_app_state);
-                async move { handle_turn_payload(payload, app_state).await }
+                let turn_tx = run_turn_tx.clone();
+                async move {
+                    if let Err(err) = turn_tx.try_send(payload) {
+                        if matches!(err, mpsc::error::TrySendError::Closed(_)) {
+                            // The worker is gone: acking would drop every turn without a trace.
+                            tracing::error!(
+                                "sy.cognition turn worker stopped; exiting so that systemd restarts it"
+                            );
+                            std::process::exit(1);
+                        }
+                        let dropped = {
+                            let mut state = app_state.runtime_state.lock().await;
+                            state.dropped_turns_queue_full_total =
+                                state.dropped_turns_queue_full_total.saturating_add(1);
+                            state.dropped_turns_queue_full_total
+                        };
+                        if dropped == 1 || dropped % NATS_ERROR_LOG_EVERY == 0 {
+                            tracing::warn!(
+                                dropped,
+                                queue = COGNITION_TURN_QUEUE,
+                                "sy.cognition turn queue full; turn dropped"
+                            );
+                        }
+                    }
+                    Ok(())
+                }
             })
             .await;
         if let Err(err) = run_result {
@@ -2409,6 +2453,7 @@ fn build_status_payload(
         },
         "processed_turns_total": runtime_state.processed_turns_total,
         "invalid_turns_total": runtime_state.invalid_turns_total,
+        "dropped_turns_queue_full_total": runtime_state.dropped_turns_queue_full_total,
         "subscribe_failures": nats_subscribe_errors,
         "published_entities_total": runtime_state.published_entities_total,
         "publish_errors_total": runtime_state.publish_errors_total,
@@ -2590,6 +2635,7 @@ fn build_cognition_config_get_payload(
     let runtime = json!({
         "processed_turns_total": runtime_state.processed_turns_total,
         "invalid_turns_total": runtime_state.invalid_turns_total,
+        "dropped_turns_queue_full_total": runtime_state.dropped_turns_queue_full_total,
         "published_entities_total": runtime_state.published_entities_total,
         "publish_errors_total": runtime_state.publish_errors_total,
         "subscribe_failures": nats_subscribe_errors,

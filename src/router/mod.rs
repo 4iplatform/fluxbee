@@ -41,7 +41,7 @@ use fluxbee_sdk::protocol::{
     MSG_EDGE_UNPUBLISH_BLOB_RESPONSE, MSG_HELLO, MSG_LSA, MSG_OPA_RELOAD, MSG_TTL_EXCEEDED,
     MSG_UNREACHABLE, MSG_WAN_REACHABILITY, MSG_WITHDRAW, SCOPE_GLOBAL, SYSTEM_KIND,
 };
-use fluxbee_sdk::socket::connection::{read_frame, write_frame};
+use fluxbee_sdk::socket::connection::{read_frame, write_frame, MAX_FRAME_SIZE};
 use fluxbee_sdk::{classify_routed_message, MSG_VAULT_GET, MSG_VAULT_GET_RESPONSE};
 
 #[derive(Debug, thiserror::Error)]
@@ -609,24 +609,17 @@ async fn handle_node(
     identity_frontdesk_node_name: &str,
     is_gateway: bool,
 ) -> Result<(), RouterError> {
-    let (mut reader, mut writer) = stream.into_split();
-    let (tx, mut rx) = mpsc::unbounded_channel::<Vec<u8>>();
-    let writer_task = tokio::spawn(async move {
-        while let Some(frame) = rx.recv().await {
-            if let Err(err) = write_frame(&mut writer, &frame).await {
-                if err.kind() == std::io::ErrorKind::InvalidData {
-                    tracing::error!(
-                        frame_len = frame.len(),
-                        max = 128 * 1024,
-                        "FRAME_TOO_LARGE — router rejected oversized frame to node; disconnecting"
-                    );
-                } else {
-                    tracing::warn!(error = %err, frame_len = frame.len(), "router: node write error");
-                }
-                break;
-            }
-        }
-    });
+    // Who opened this socket, for the `RT.` names only the router's own process may take.
+    let peer_pid = stream.peer_cred().ok().and_then(|cred| cred.pid());
+    let (mut reader, writer) = stream.into_split();
+    let (tx, rx) = mpsc::unbounded_channel::<Vec<u8>>();
+    let link_peer = Arc::new(std::sync::OnceLock::<String>::new());
+    let writer_task = tokio::spawn(write_link_frames(
+        writer,
+        rx,
+        "node",
+        Arc::clone(&link_peer),
+    ));
     let frame = read_frame(&mut reader)
         .await?
         .ok_or_else(|| io::Error::new(io::ErrorKind::UnexpectedEof, "missing HELLO"))?;
@@ -652,6 +645,19 @@ async fn handle_node(
     }
 
     let node_name = normalize_name(&payload.name, hive_id);
+    if !rt_name_allowed(&node_name, peer_pid, std::process::id()) {
+        tracing::warn!(
+            node = %node_name,
+            peer_pid = ?peer_pid,
+            "HELLO rejected: RT.* names belong to the router's own process"
+        );
+        writer_task.abort();
+        return Err(RouterError::Io(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "RT.* names are reserved for the router's own process",
+        )));
+    }
+    let _ = link_peer.set(node_name.clone());
     tracing::info!(node = %node_name, "loading config snapshot");
     let snapshot = refresh_config(
         &config_reader,
@@ -2810,16 +2816,10 @@ async fn handle_wan_connection<S>(
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
-    let (mut reader, mut writer) = tokio::io::split(stream);
-    let (tx, mut rx) = mpsc::unbounded_channel::<Vec<u8>>();
-    let writer_task = tokio::spawn(async move {
-        while let Some(frame) = rx.recv().await {
-            if let Err(err) = write_frame(&mut writer, &frame).await {
-                tracing::warn!("wan write error: {err}");
-                break;
-            }
-        }
-    });
+    let (mut reader, writer) = tokio::io::split(stream);
+    let (tx, rx) = mpsc::unbounded_channel::<Vec<u8>>();
+    let link_peer = Arc::new(std::sync::OnceLock::<String>::new());
+    let writer_task = tokio::spawn(write_link_frames(writer, rx, "wan", Arc::clone(&link_peer)));
 
     let hello_payload = WanHelloPayload {
         protocol: MESH_PROTOCOL_VERSION.to_string(),
@@ -2887,6 +2887,7 @@ where
             return Ok(());
         }
     }
+    let _ = link_peer.set(peer_hello.hive_id.clone());
 
     if !initiator {
         let hello = build_wan_hello(
@@ -3636,8 +3637,8 @@ async fn connect_to_peer(
 ) -> Result<(), RouterError> {
     let socket_path = peer_socket_path(socket_dir, peer_uuid);
     let stream = UnixStream::connect(&socket_path).await?;
-    let (mut reader, mut writer) = stream.into_split();
-    let (tx, mut rx) = mpsc::unbounded_channel::<Vec<u8>>();
+    let (mut reader, writer) = stream.into_split();
+    let (tx, rx) = mpsc::unbounded_channel::<Vec<u8>>();
     {
         let mut peers_guard = peers.lock().await;
         if peers_guard.contains_key(&peer_uuid) {
@@ -3645,14 +3646,8 @@ async fn connect_to_peer(
         }
         peers_guard.insert(peer_uuid, PeerHandle { sender: tx.clone() });
     }
-    let writer_task = tokio::spawn(async move {
-        while let Some(frame) = rx.recv().await {
-            if let Err(err) = write_frame(&mut writer, &frame).await {
-                tracing::warn!("peer write error: {err}");
-                break;
-            }
-        }
-    });
+    let link_peer = Arc::new(std::sync::OnceLock::from(peer_uuid.to_string()));
+    let writer_task = tokio::spawn(write_link_frames(writer, rx, "irp", link_peer));
 
     let hello = build_router_hello(
         &self_uuid.to_string(),
@@ -3729,7 +3724,7 @@ async fn handle_peer_incoming(
     thread_sequences: Arc<Mutex<HashMap<String, u64>>>,
     is_gateway: bool,
 ) -> Result<(), RouterError> {
-    let (mut reader, mut writer) = stream.into_split();
+    let (mut reader, writer) = stream.into_split();
     let frame = read_frame(&mut reader)
         .await?
         .ok_or_else(|| io::Error::new(io::ErrorKind::UnexpectedEof, "missing HELLO"))?;
@@ -3745,19 +3740,13 @@ async fn handle_peer_incoming(
             return Ok(());
         }
     }
-    let (tx, mut rx) = mpsc::unbounded_channel::<Vec<u8>>();
+    let (tx, rx) = mpsc::unbounded_channel::<Vec<u8>>();
     {
         let mut peers_guard = peers.lock().await;
         peers_guard.insert(peer_uuid, PeerHandle { sender: tx.clone() });
     }
-    let writer_task = tokio::spawn(async move {
-        while let Some(frame) = rx.recv().await {
-            if let Err(err) = write_frame(&mut writer, &frame).await {
-                tracing::warn!("peer write error: {err}");
-                break;
-            }
-        }
-    });
+    let link_peer = Arc::new(std::sync::OnceLock::from(peer_uuid.to_string()));
+    let writer_task = tokio::spawn(write_link_frames(writer, rx, "irp", link_peer));
 
     loop {
         match read_frame(&mut reader).await? {
@@ -3800,6 +3789,124 @@ async fn handle_peer_incoming(
     Ok(())
 }
 
+/// Frames skipped for being over the socket's size limit, process-wide, across every link. Each
+/// warn line about them carries the total.
+static OVERSIZE_FRAMES_SKIPPED: AtomicU64 = AtomicU64::new(0);
+/// At most one log line per link and interval about the frames it skipped.
+const OVERSIZE_FRAME_LOG_INTERVAL: Duration = Duration::from_secs(30);
+
+/// Writes the frames queued for one link (a node, a WAN peer, a sibling router) until the link
+/// ends. A frame over the socket's 128 KB limit is skipped and counted, and the link goes on: until
+/// 0.1.74 the writer stopped while the link stayed registered, so every later frame to it was lost
+/// for good (A-70, D11 of docs/router-stream-v1.md). Any other write error ends the link.
+async fn write_link_frames<W>(
+    mut writer: W,
+    mut rx: mpsc::UnboundedReceiver<Vec<u8>>,
+    link: &'static str,
+    peer: Arc<std::sync::OnceLock<String>>,
+) where
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    let mut skipped_unlogged = 0u64;
+    let mut last_logged: Option<Instant> = None;
+    while let Some(frame) = rx.recv().await {
+        if frame.len() > MAX_FRAME_SIZE {
+            let skipped_total = OVERSIZE_FRAMES_SKIPPED.fetch_add(1, Ordering::Relaxed) + 1;
+            skipped_unlogged += 1;
+            if last_logged.is_none_or(|at| at.elapsed() >= OVERSIZE_FRAME_LOG_INTERVAL) {
+                tracing::warn!(
+                    link,
+                    peer = peer.get().map(String::as_str).unwrap_or("-"),
+                    frame_len = frame.len(),
+                    max = MAX_FRAME_SIZE,
+                    skipped = skipped_unlogged,
+                    skipped_total,
+                    "router skipped a frame over the size limit; the link goes on"
+                );
+                skipped_unlogged = 0;
+                last_logged = Some(Instant::now());
+            }
+            continue;
+        }
+        if let Err(err) = write_frame(&mut writer, &frame).await {
+            tracing::warn!(
+                link,
+                peer = peer.get().map(String::as_str).unwrap_or("-"),
+                error = %err,
+                frame_len = frame.len(),
+                "router: link write error; closing the link"
+            );
+            break;
+        }
+    }
+}
+
+/// `RT.` names are the router's own (operator, 2026-10-16, D12 of docs/router-stream-v1.md): a
+/// HELLO with one is accepted only from the router's own process. Anything else could pose as a
+/// router's stream and feed records to SY.storage, or take a stream's name first and lock it out.
+fn rt_name_allowed(node_name: &str, peer_pid: Option<i32>, own_pid: u32) -> bool {
+    let local = node_name.split('@').next().unwrap_or(node_name).trim();
+    if !local
+        .get(..3)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("RT."))
+    {
+        return true;
+    }
+    peer_pid.is_some_and(|pid| u32::try_from(pid).is_ok_and(|pid| pid == own_pid))
+}
+
+/// At most one log line per interval about frames from the gateway whose sender this router does
+/// not know.
+const UNKNOWN_REMOTE_SOURCE_LOG_INTERVAL_MS: u64 = 30_000;
+static UNKNOWN_REMOTE_SOURCE_LAST_LOG_MS: AtomicU64 = AtomicU64::new(0);
+
+/// A frame a sibling router hands over IRP comes from one of its own nodes or, when that router is
+/// the hive's gateway, from a node of another hive that the gateway took in from the WAN. Until
+/// 0.1.74 only the first was accepted, so a message from another hive to a node on a non-gateway
+/// router was dropped (A-70).
+///
+/// The sender must be in this router's LSA, a directly learned node: the gateway's reachability
+/// plane (hub-vouched nodes) lives only on the gateway, so a node relayed spoke to hub to spoke
+/// cannot reach a non-gateway router (known limit). Its name is derived here, canonical to its
+/// hive like the gateway's WAN ingress does (EDGE-01), not taken from the frame.
+async fn remote_source_from_gateway(
+    msg: &Message,
+    peer_uuid: &Uuid,
+    src_uuid: Uuid,
+    peer_routers: &Arc<Mutex<std::collections::HashMap<Uuid, PeerRouter>>>,
+    lsa_snapshot: &Arc<Mutex<Option<LsaSnapshot>>>,
+) -> Option<PeerNode> {
+    let from_gateway = peer_routers
+        .lock()
+        .await
+        .get(peer_uuid)
+        .is_some_and(|router| router.is_gateway);
+    if !from_gateway {
+        return None;
+    }
+    let remote = {
+        let snapshot = lsa_snapshot.lock().await;
+        find_remote_node(&snapshot, src_uuid)
+    }?;
+    let name = canonical_wan_src_name(&remote.name, &remote.hive_id);
+    if let Some(stamped) = msg.routing.src_l2_name.as_deref() {
+        if stamped != name {
+            tracing::warn!(
+                src = %src_uuid,
+                stamped,
+                canonical = %name,
+                "router: the gateway handed over a frame whose name differs from the LSA's; using the LSA's"
+            );
+        }
+    }
+    Some(PeerNode {
+        uuid: src_uuid,
+        name,
+        vpn_id: remote.vpn_id,
+        router_uuid: *peer_uuid,
+    })
+}
+
 async fn handle_peer_message(
     msg: &Message,
     peer_uuid: &Uuid,
@@ -3838,6 +3945,54 @@ async fn handle_peer_message(
     let src_node = {
         let peer_guard = peer_nodes.lock().await;
         peer_guard.get(&src_uuid).cloned()
+    };
+    let src_node = match src_node {
+        Some(node) => Some(node),
+        None => {
+            let mut found =
+                remote_source_from_gateway(&msg, peer_uuid, src_uuid, peer_routers, lsa_snapshot)
+                    .await;
+            let from_gateway = peer_routers
+                .lock()
+                .await
+                .get(peer_uuid)
+                .is_some_and(|router| router.is_gateway);
+            if found.is_none() && from_gateway {
+                // A node the gateway just learned may not be in this router's snapshot yet.
+                let _ = refresh_lsa(
+                    lsa_reader,
+                    lsa_snapshot,
+                    hive_id,
+                    nodes,
+                    peer_nodes,
+                    static_routes,
+                    fib,
+                    reachability,
+                )
+                .await;
+                found = remote_source_from_gateway(
+                    &msg,
+                    peer_uuid,
+                    src_uuid,
+                    peer_routers,
+                    lsa_snapshot,
+                )
+                .await;
+                if found.is_none() {
+                    let now = now_epoch_ms();
+                    let last = UNKNOWN_REMOTE_SOURCE_LAST_LOG_MS.load(Ordering::Relaxed);
+                    if now.saturating_sub(last) >= UNKNOWN_REMOTE_SOURCE_LOG_INTERVAL_MS {
+                        UNKNOWN_REMOTE_SOURCE_LAST_LOG_MS.store(now, Ordering::Relaxed);
+                        tracing::warn!(
+                            src = %src_uuid,
+                            src_l2_name = ?msg.routing.src_l2_name,
+                            "router dropped a frame from the gateway: its sender is not in this router's LSA"
+                        );
+                    }
+                }
+            }
+            found
+        }
     };
     let Some(src_node) = src_node else {
         if is_system_kind(&msg.meta.msg_type) {
@@ -8251,6 +8406,245 @@ mod tests {
             delivered_msg.routing.src_l2_name.as_deref(),
             Some("WF.external@worker-hive"),
             "delivered message must carry the L2 name from this router's peer_nodes, not whatever the remote router sent"
+        );
+    }
+
+    #[test]
+    fn rt_names_belong_to_the_routers_own_process() {
+        let own = 4242u32;
+        assert!(rt_name_allowed(
+            "RT.gateway.stream@worker1",
+            Some(4242),
+            own
+        ));
+        assert!(rt_name_allowed(
+            "rt.gateway.stream@worker1",
+            Some(4242),
+            own
+        ));
+        assert!(!rt_name_allowed(
+            "RT.gateway.stream@worker1",
+            Some(4243),
+            own
+        ));
+        assert!(!rt_name_allowed("RT.x.stream@worker1", None, own));
+        assert!(!rt_name_allowed("rt.edge.buffer@motherbee", Some(1), own));
+        // Every other name is untouched, whoever opened the socket.
+        assert!(rt_name_allowed("SY.storage@motherbee", None, own));
+        assert!(rt_name_allowed("AI.sales@worker1", Some(1), own));
+        assert!(rt_name_allowed("RTX.thing@worker1", Some(1), own));
+    }
+
+    #[tokio::test]
+    async fn an_oversize_frame_is_skipped_and_the_link_goes_on() {
+        let (writer, mut reader) = tokio::io::duplex(4 * MAX_FRAME_SIZE);
+        let (tx, rx) = mpsc::unbounded_channel::<Vec<u8>>();
+        let task = tokio::spawn(write_link_frames(
+            writer,
+            rx,
+            "node",
+            Arc::new(std::sync::OnceLock::from(
+                "SY.storage@motherbee".to_string(),
+            )),
+        ));
+        tx.send(vec![b'x'; MAX_FRAME_SIZE + 1]).unwrap();
+        tx.send(b"next".to_vec()).unwrap();
+        drop(tx);
+        task.await.unwrap();
+        let frame = read_frame(&mut reader)
+            .await
+            .unwrap()
+            .expect("a frame after the skip");
+        assert_eq!(frame, b"next".to_vec());
+        assert!(
+            read_frame(&mut reader).await.unwrap().is_none(),
+            "nothing else was written"
+        );
+    }
+
+    /// An LSA snapshot with one remote hive and one node of it.
+    fn lsa_with_remote_node(hive: &str, node_uuid: Uuid, node_name: &str) -> LsaSnapshot {
+        let mut hive_id = [0u8; 64];
+        hive_id[..hive.len()].copy_from_slice(hive.as_bytes());
+        let mut name = [0u8; 256];
+        name[..node_name.len()].copy_from_slice(node_name.as_bytes());
+        LsaSnapshot {
+            header: crate::shm::LsaHeaderSnapshot {
+                hive_count: 1,
+                total_node_count: 1,
+                total_route_count: 0,
+                total_vpn_count: 0,
+                total_tap_count: 0,
+                heartbeat: 0,
+            },
+            hives: vec![crate::shm::RemoteHiveEntry {
+                hive_id,
+                hive_id_len: hive.len() as u16,
+                router_uuid: [0u8; 16],
+                router_name: [0u8; 64],
+                router_name_len: 0,
+                last_lsa_seq: 1,
+                last_updated: 0,
+                flags: 0,
+                node_count: 1,
+                route_count: 0,
+                vpn_count: 0,
+                tap_count: 0,
+            }],
+            nodes: vec![crate::shm::RemoteNodeEntry {
+                uuid: *node_uuid.as_bytes(),
+                name,
+                name_len: node_name.len() as u16,
+                vpn_id: 0,
+                hive_index: 0,
+                flags: 0,
+                _reserved: [0u8; 6],
+            }],
+            routes: Vec::new(),
+            vpns: Vec::new(),
+            taps: Vec::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_hello_from_the_routers_own_process_may_take_an_rt_name() {
+        // The plumbing the HELLO check relies on: a socket's peer is this very process.
+        let (a, _b) = tokio::net::UnixStream::pair().unwrap();
+        let pid = a.peer_cred().unwrap().pid();
+        assert!(rt_name_allowed(
+            "RT.gateway.stream@motherbee",
+            pid,
+            std::process::id()
+        ));
+    }
+
+    async fn deliver_from_peer(peer_is_gateway: bool) -> Option<Message> {
+        use nix::sys::mman::shm_unlink;
+        use std::ffi::CString;
+
+        let id = Uuid::new_v4().simple().to_string();
+        let shm_name = format!("/rt-gw-{}", &id[..8]);
+        let cleanup = |name: &str| {
+            if let Ok(cstr) = CString::new(name) {
+                let _ = shm_unlink(cstr.as_c_str());
+            }
+        };
+        cleanup(&shm_name);
+
+        let remote_sender_uuid = Uuid::new_v4();
+        let gateway_uuid = Uuid::new_v4();
+        let local_receiver_uuid = Uuid::new_v4();
+        let (receiver_tx, mut receiver_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+        let nodes: Arc<Mutex<HashMap<Uuid, NodeHandle>>> = Arc::new(Mutex::new(HashMap::new()));
+        nodes.lock().await.insert(
+            local_receiver_uuid,
+            NodeHandle {
+                name: "RT.switch1.stream@worker1".to_string(),
+                vpn_id: 0,
+                sender: receiver_tx,
+                connected_at: 0,
+            },
+        );
+        // The sender is a node of another hive: not one of this router's siblings' nodes, but in
+        // the LSA this router reads.
+        let peer_nodes: Arc<Mutex<HashMap<Uuid, PeerNode>>> = Arc::new(Mutex::new(HashMap::new()));
+        let lsa_snapshot = Arc::new(Mutex::new(Some(lsa_with_remote_node(
+            "motherbee",
+            remote_sender_uuid,
+            "SY.storage@motherbee",
+        ))));
+        let peer_routers: Arc<Mutex<HashMap<Uuid, PeerRouter>>> =
+            Arc::new(Mutex::new(HashMap::new()));
+        peer_routers.lock().await.insert(
+            gateway_uuid,
+            PeerRouter {
+                uuid: gateway_uuid,
+                is_gateway: peer_is_gateway,
+            },
+        );
+        let reachability: Arc<Mutex<HashMap<Uuid, ReachabilityEntry>>> =
+            Arc::new(Mutex::new(HashMap::new()));
+        let (peer_tx, _peer_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+        let peers: Arc<Mutex<HashMap<Uuid, PeerHandle>>> = Arc::new(Mutex::new(HashMap::new()));
+        peers
+            .lock()
+            .await
+            .insert(gateway_uuid, PeerHandle { sender: peer_tx });
+        let msg = Message {
+            routing: Routing {
+                src: remote_sender_uuid.to_string(),
+                // Whatever the frame says, the name comes from this router's LSA.
+                src_l2_name: Some("SY.forged@motherbee".to_string()),
+                dst: Destination::Unicast(local_receiver_uuid.to_string()),
+                ttl: 16,
+                trace_id: Uuid::new_v4().to_string(),
+            },
+            meta: Meta {
+                msg_type: "system".to_string(),
+                msg: Some("STREAM_ACK".to_string()),
+                ..Meta::default()
+            },
+            payload: serde_json::json!({"up_to_seq": 7}),
+        };
+        let router_uuid = Uuid::new_v4();
+        let shm_writer = RouterRegionWriter::open_or_create(
+            &shm_name,
+            router_uuid,
+            "worker1",
+            "RT.switch1@worker1",
+            false,
+        )
+        .expect("create test shm");
+        let shm = Arc::new(Mutex::new(shm_writer));
+        handle_peer_message(
+            &msg,
+            &gateway_uuid,
+            &peers,
+            &peer_nodes,
+            &peer_routers,
+            &nodes,
+            &Arc::new(Mutex::new(HashMap::<String, WanPeer>::new())),
+            &Arc::new(Mutex::new(None::<LsaRegionReader>)),
+            &Arc::new(Mutex::new(Vec::<StaticRoute>::new())),
+            &shm,
+            &Arc::new(Mutex::new(OpaResolver::new())),
+            &Arc::new(Mutex::new(None::<OpaRegionReader>)),
+            &Arc::new(Mutex::new(None::<MemoryRegionReader>)),
+            "worker1",
+            "SY.frontdesk.gov@worker1",
+            &Arc::new(Mutex::new(Vec::<FibEntry>::new())),
+            router_uuid,
+            false,
+            &lsa_snapshot,
+            &reachability,
+            &Arc::new(Mutex::new(HashMap::<String, u64>::new())),
+        )
+        .await
+        .unwrap();
+        cleanup(&shm_name);
+        receiver_rx
+            .try_recv()
+            .ok()
+            .map(|frame| serde_json::from_slice(&frame).unwrap())
+    }
+
+    #[tokio::test]
+    async fn a_message_from_another_hive_reaches_a_node_on_a_non_gateway_router() {
+        let delivered = deliver_from_peer(true)
+            .await
+            .expect("the gateway's hand-over is delivered");
+        assert_eq!(
+            delivered.routing.src_l2_name.as_deref(),
+            Some("SY.storage@motherbee"),
+            "the name comes from this router's LSA, not from the frame"
+        );
+    }
+
+    #[tokio::test]
+    async fn only_the_gateway_hands_over_another_hives_nodes() {
+        assert!(
+            deliver_from_peer(false).await.is_none(),
+            "a sibling that is not the gateway cannot speak for another hive's node"
         );
     }
 
