@@ -106,6 +106,11 @@
   - **Archi con Claude:** sigue usando sus herramientas (6 s).
   - **Los cuatro consumidores** en Claude, con cognition listo en los dos hives; health `failed=0`.
 - **Rollback:** snapshot `pre-sdk-0-1-74`, o `apt install fluxbee=0.1.73`.
+- **Después, sobre 0.1.74 (decisión del operador, 2026-10-16):** la infra pasa a
+  `claude-sonnet-5-5` (*"vamos por Sonnet 5.5"*).
+  - Se cambió el modelo en los dos `hive.yaml` y se reiniciaron los mismos servicios.
+  - Archi usa sus herramientas en 3 s (con Opus, 4 a 6 s).
+  - Cognition: 3 de 3 etiquetados y 3 de 3 resúmenes, sin timeouts.
 
 ## 0.1.73 — La infra de IA pasa a Claude; SY.cognition deja de mandar `temperature` (A-69)
 
