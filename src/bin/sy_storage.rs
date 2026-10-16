@@ -43,20 +43,37 @@ use json_router::nats::{
 
 type StorageError = Box<dyn std::error::Error + Send + Sync>;
 use json_router::router::system_policy::PRIMARY_HIVE_ID;
+use fluxbee_sdk::stream::{
+    is_stream_node_name, stream_hive, StreamBatch, MSG_STREAM_ACK, MSG_STREAM_BATCH,
+    SUBJECT_STORAGE_COGNITION_PREFIX as STREAM_SUBJECT_COGNITION_PREFIX,
+};
 
 const NATS_ERROR_LOG_EVERY: u64 = 20;
 const INBOX_REPLAY_BATCH_SIZE: i64 = 200;
 const INBOX_REPLAY_MAX_ROUNDS: u32 = 20;
 const INBOX_ERROR_MAX_LEN: usize = 1024;
-/// How often SY.storage retries the inbox rows that failed. Until 0.1.74 they were retried only at
-/// startup (A-70). Processed rows are kept: Archi's Messages page reads `storage_inbox` as the
-/// message log, and the AI replies `turns` dropped before 0.1.75 exist only there.
+/// How often SY.storage retries the inbox rows that failed and purges the processed ones. Until
+/// 0.1.74 failed rows were retried only at startup (A-70).
 const INBOX_MAINTENANCE_INTERVAL_SECS: u64 = 60;
 /// A failed row is retried until it has this many attempts; then it stays, with its last error,
 /// visible in the inbox metrics.
 const INBOX_MAX_ATTEMPTS: i32 = 10;
 /// A row younger than this is left to its live handler, so a retry never races it.
 const INBOX_RETRY_MIN_AGE_SECS: i32 = 60;
+/// Processed rows are kept this long, then purged: once `turns` holds the whole message (the
+/// one-time backfill below), the inbox only absorbs redeliveries and restarts.
+const STORAGE_INBOX_RETENTION_HOURS: i32 = 24;
+/// The most processed rows one purge deletes, so a purge is never one huge transaction.
+const INBOX_PURGE_BATCH: i64 = 10_000;
+/// How many stream batches may wait for the ingest task. Past it a batch is not acked, and its
+/// stream sends it again (docs/router-stream-v1.md §2.7).
+const STREAM_INGEST_QUEUE: usize = 64;
+/// How many acked batches may wait for their rows to be processed, off the ack's path. Past it the
+/// rows wait in the inbox for the retry (`INBOX_RETRY_MIN_AGE_SECS`).
+const STREAM_PROCESS_QUEUE: usize = 64;
+/// The one-time copy of the old turns' whole messages from the inbox into `turns` (A-70, Q7).
+const TURNS_BACKFILL_MIGRATION: &str = "turns_backfill_from_inbox_v1";
+const TURNS_BACKFILL_PAGE: i64 = 500;
 
 /// `turns` is keyed by the record's inbox key (A-70). It was keyed by `(ctx, seq)`, which come from
 /// the `trace_id` when the message has no `meta.ctx`; a reply reuses its request's `trace_id`, so
@@ -86,10 +103,42 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_turns_dedupe_key ON turns (dedupe_key);
 CREATE INDEX IF NOT EXISTS idx_turns_ctx_seq ON turns (ctx, seq);
 DROP INDEX IF EXISTS idx_turns_ctx;
 "#;
+
+/// `turns` becomes the message log (A-70, Q7 of docs/router-stream-v1.md): each row keeps the whole
+/// message, its thread and its trace, and the time the router copied it (`ts`); `stored_at` is when
+/// SY.storage wrote it, the order a live reader follows, since a stream's batch can arrive late.
+/// The inbox keeps the router's time too. Columns are added only when missing, so a start never
+/// takes the tables' locks again.
+const MESSAGE_LOG_MIGRATION_SQL: &str = r#"
+DO $$
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema = current_schema()
+                   AND table_name = 'storage_inbox' AND column_name = 'source_ts') THEN
+        ALTER TABLE storage_inbox ADD COLUMN source_ts TIMESTAMPTZ;
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema = current_schema()
+                   AND table_name = 'turns' AND column_name = 'message') THEN
+        ALTER TABLE turns ADD COLUMN thread_id TEXT;
+        ALTER TABLE turns ADD COLUMN trace_id TEXT;
+        ALTER TABLE turns ADD COLUMN message JSONB;
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema = current_schema()
+                   AND table_name = 'turns' AND column_name = 'stored_at') THEN
+        ALTER TABLE turns ADD COLUMN stored_at TIMESTAMPTZ NOT NULL DEFAULT now();
+    END IF;
+END $$;
+CREATE INDEX IF NOT EXISTS idx_turns_ts_key ON turns (ts DESC, dedupe_key DESC);
+CREATE INDEX IF NOT EXISTS idx_turns_stored_at ON turns (stored_at, dedupe_key);
+CREATE INDEX IF NOT EXISTS idx_turns_thread ON turns (thread_id);
+CREATE TABLE IF NOT EXISTS storage_migrations (
+    name        TEXT PRIMARY KEY,
+    applied_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+    detail      TEXT
+);
+"#;
 const STORAGE_METRICS_LOG_INTERVAL_SECS: u64 = 30;
 const STORAGE_METRICS_WARN_PENDING: i64 = 100;
 const STORAGE_METRICS_WARN_AGE_SECS: i64 = 120;
-const DURABLE_QUEUE_TURNS: &str = "durable.sy-storage.turns";
 const DURABLE_QUEUE_EVENTS: &str = "durable.sy-storage.events";
 const DURABLE_QUEUE_ITEMS: &str = "durable.sy-storage.items";
 const DURABLE_QUEUE_REACTIVATION: &str = "durable.sy-storage.reactivation";
@@ -163,6 +212,9 @@ struct NatsSection {
 
 struct Storage {
     client: Client,
+    /// Its own connection for the stream's batches, one transaction each: the shared client
+    /// cannot run a transaction, and a `BEGIN` on it would take in the other loops' statements.
+    ingest: tokio::sync::Mutex<Client>,
 }
 
 #[derive(Debug)]
@@ -175,6 +227,10 @@ struct TurnRecord {
     msg_type: String,
     content: Value,
     tags: Vec<String>,
+    thread_id: Option<String>,
+    trace_id: String,
+    /// The whole message, as the router copied it: `turns` is the message log (Archi reads it).
+    message: Value,
 }
 
 #[derive(Debug)]
@@ -339,14 +395,8 @@ async fn main() -> Result<(), StorageError> {
     let nats_subscribe_errors = Arc::new(AtomicU64::new(0));
     let storage_handler_errors = Arc::new(AtomicU64::new(0));
 
+    // Turns come from the routers' streams since 0.1.76, as STREAM_BATCH (A-70): not from NATS.
     if let Some(storage) = storage.as_ref() {
-        std::mem::drop(tokio::spawn(run_turns_loop(
-            endpoint.clone(),
-            use_durable_consumer,
-            Arc::clone(storage),
-            Arc::clone(&nats_subscribe_errors),
-            Arc::clone(&storage_handler_errors),
-        )));
         std::mem::drop(tokio::spawn(run_events_loop(
             endpoint.clone(),
             use_durable_consumer,
@@ -445,6 +495,15 @@ async fn main() -> Result<(), StorageError> {
     // `handle_vault_secret_changed` in process_router_message.
 
     let mut heartbeat = time::interval(Duration::from_secs(5));
+    let ingest_tx = storage.as_ref().map(|storage| {
+        let (tx, rx) = tokio::sync::mpsc::channel(STREAM_INGEST_QUEUE);
+        std::mem::drop(tokio::spawn(run_stream_ingest(
+            Arc::clone(storage),
+            Arc::clone(&dispatcher),
+            rx,
+        )));
+        tx
+    });
     let mut system_rx = dispatcher
         .take_command_receiver(RPC_CH_SYSTEM)
         .await
@@ -464,6 +523,19 @@ async fn main() -> Result<(), StorageError> {
                     tracing::warn!("sy.storage system channel closed; exiting main loop");
                     return Ok(());
                 };
+                if msg.meta.msg.as_deref() == Some(MSG_STREAM_BATCH) {
+                    // To the ingest task. Without a database, or with its queue full, the batch is
+                    // not acked and its stream sends it again.
+                    match ingest_tx.as_ref() {
+                        Some(tx) => {
+                            if tx.try_send(msg).is_err() {
+                                tracing::warn!("sy.storage stream ingest queue full; a batch waits for its stream to resend it");
+                            }
+                        }
+                        None => tracing::debug!("sy.storage has no database; a stream batch waits"),
+                    }
+                    continue;
+                }
                 let sender = dispatcher.sender_snapshot();
                 if let Err(err) = process_router_message(
                     &sender,
@@ -478,25 +550,35 @@ async fn main() -> Result<(), StorageError> {
     }
 }
 
+/// A client whose connection, once gone, ends SY.storage. The client does not reconnect: once its
+/// connection is gone every write fails, and until 0.1.74 SY.storage only logged it and kept
+/// running without a database. It exits instead, and systemd starts it again (Restart=always) with
+/// a new connection (A-70).
+async fn connect_or_exit_on_close(database_config: &PgConfig) -> Result<Client, StorageError> {
+    let (client, connection) = database_config.connect(NoTls).await?;
+    tokio::spawn(async move {
+        match connection.await {
+            Ok(()) => tracing::error!(
+                "postgres connection closed; exiting so that systemd restarts sy-storage"
+            ),
+            Err(err) => tracing::error!(
+                error = %err,
+                "postgres connection closed; exiting so that systemd restarts sy-storage"
+            ),
+        }
+        std::process::exit(1);
+    });
+    Ok(client)
+}
+
 impl Storage {
     async fn connect(database_config: &PgConfig) -> Result<Self, StorageError> {
-        let (client, connection) = database_config.connect(NoTls).await?;
-        tokio::spawn(async move {
-            // The client does not reconnect: once its connection is gone every write fails, and
-            // until 0.1.74 SY.storage only logged it and kept running without a database. It exits
-            // instead, and systemd starts it again (Restart=always) with a new connection (A-70).
-            match connection.await {
-                Ok(()) => tracing::error!(
-                    "postgres connection closed; exiting so that systemd restarts sy-storage"
-                ),
-                Err(err) => tracing::error!(
-                    error = %err,
-                    "postgres connection closed; exiting so that systemd restarts sy-storage"
-                ),
-            }
-            std::process::exit(1);
-        });
-        Ok(Self { client })
+        let client = connect_or_exit_on_close(database_config).await?;
+        let ingest = connect_or_exit_on_close(database_config).await?;
+        Ok(Self {
+            client,
+            ingest: tokio::sync::Mutex::new(ingest),
+        })
     }
 
     async fn ensure_schema(&self) -> Result<(), StorageError> {
@@ -751,6 +833,7 @@ CREATE INDEX IF NOT EXISTS idx_cognition_episodes_scope ON cognition_episodes(sc
             )
             .await?;
         self.client.batch_execute(TURNS_KEY_MIGRATION_SQL).await?;
+        self.client.batch_execute(MESSAGE_LOG_MIGRATION_SQL).await?;
         Ok(())
     }
 
@@ -774,7 +857,7 @@ CREATE INDEX IF NOT EXISTS idx_cognition_episodes_scope ON cognition_episodes(sc
                 .client
                 .query(
                     r#"
-SELECT dedupe_key, subject, payload, received_at
+SELECT dedupe_key, subject, payload, received_at, source_ts
 FROM storage_inbox
 WHERE processed_at IS NULL
   AND attempts < $2
@@ -801,6 +884,7 @@ LIMIT $1
                 let subject: String = row.get(1);
                 let payload: Vec<u8> = row.get(2);
                 after = Some((row.get(3), dedupe_key.clone()));
+                let source_ts: Option<std::time::SystemTime> = row.get(4);
                 let Some(kind) = handler_kind_for_subject(&subject) else {
                     let err_msg = format!("unsupported subject in inbox replay: {subject}");
                     self.client
@@ -817,7 +901,7 @@ WHERE dedupe_key = $1
                 };
 
                 if let Err(err) = self
-                    .process_inbox_message(&dedupe_key, &subject, kind, &payload)
+                    .process_inbox_message(&dedupe_key, &subject, kind, &payload, source_ts)
                     .await
                 {
                     // A retry counts as an attempt, so a row that keeps failing stops at
@@ -843,6 +927,181 @@ WHERE dedupe_key = $1
             }
         }
         Ok(replayed)
+    }
+
+    /// A stream batch's records into the inbox, in one transaction on the ingest connection.
+    /// Returns, per row, whether it was processed already: a repeat of a processed row is absorbed.
+    async fn upsert_stream_rows(&self, rows: &[StreamRow]) -> Result<Vec<bool>, StorageError> {
+        let mut client = self.ingest.lock().await;
+        let tx = client.transaction().await?;
+        let stmt = tx
+            .prepare(
+                r#"
+INSERT INTO storage_inbox (dedupe_key, subject, payload, attempts, last_error, source_ts)
+VALUES ($1, $2, $3, 1, NULL, $4)
+ON CONFLICT (dedupe_key) DO UPDATE SET
+    attempts = storage_inbox.attempts + 1,
+    last_error = NULL
+RETURNING processed_at IS NOT NULL
+"#,
+            )
+            .await?;
+        let mut processed = Vec::with_capacity(rows.len());
+        for row in rows {
+            processed.push(
+                tx.query_one(
+                    &stmt,
+                    &[&row.dedupe_key, &row.subject, &row.payload, &row.source_ts],
+                )
+                .await?
+                .get::<_, bool>(0),
+            );
+        }
+        tx.commit().await?;
+        Ok(processed)
+    }
+
+    async fn migration_applied(&self, name: &str) -> Result<bool, StorageError> {
+        Ok(self
+            .client
+            .query_opt("SELECT 1 FROM storage_migrations WHERE name = $1", &[&name])
+            .await?
+            .is_some())
+    }
+
+    /// Once: `turns` gets the whole message of every turn the inbox still holds (A-70, Q7). A row
+    /// of 0.1.75 (already under its inbox key) gets the message; a row of before 0.1.75
+    /// (`legacy:<ctx>:<seq>`) is matched by (ctx, seq, from_ilk) and takes its inbox key and
+    /// message; a turn `turns` had dropped (an AI reply, same trace_id as its request) is inserted
+    /// with its arrival time. Until it ran, the inbox is not purged.
+    async fn backfill_turns_from_inbox(&self) -> Result<(), StorageError> {
+        if self.migration_applied(TURNS_BACKFILL_MIGRATION).await? {
+            return Ok(());
+        }
+        let (mut completed, mut relinked, mut inserted, mut present, mut unreadable) =
+            (0u64, 0u64, 0u64, 0u64, 0u64);
+        let mut after: Option<(std::time::SystemTime, String)> = None;
+        loop {
+            let after_ts = after.as_ref().map(|(ts, _)| *ts);
+            let after_key = after.as_ref().map(|(_, key)| key.clone());
+            let rows = self
+                .client
+                .query(
+                    r#"
+SELECT dedupe_key, payload, received_at
+FROM storage_inbox
+WHERE subject = $1 AND processed_at IS NOT NULL
+  AND ($2::timestamptz IS NULL OR (received_at, dedupe_key) > ($2::timestamptz, $3::text))
+ORDER BY received_at ASC, dedupe_key ASC
+LIMIT $4
+"#,
+                    &[
+                        &SUBJECT_STORAGE_TURNS,
+                        &after_ts,
+                        &after_key,
+                        &TURNS_BACKFILL_PAGE,
+                    ],
+                )
+                .await?;
+            if rows.is_empty() {
+                break;
+            }
+            for row in &rows {
+                let dedupe_key: String = row.get(0);
+                let payload: Vec<u8> = row.get(1);
+                let received_at: std::time::SystemTime = row.get(2);
+                after = Some((received_at, dedupe_key.clone()));
+                let Ok(turn) = serde_json::from_slice::<Value>(&payload)
+                    .map_err(StorageError::from)
+                    .and_then(parse_turn)
+                else {
+                    unreadable += 1;
+                    continue;
+                };
+                let filled = self
+                    .client
+                    .execute(
+                        r#"
+UPDATE turns SET thread_id = $2, trace_id = $3, message = $4
+WHERE dedupe_key = $1 AND message IS NULL
+"#,
+                        &[&dedupe_key, &turn.thread_id, &turn.trace_id, &turn.message],
+                    )
+                    .await?;
+                if filled > 0 {
+                    completed += 1;
+                    continue;
+                }
+                let exists = self
+                    .client
+                    .query_opt("SELECT 1 FROM turns WHERE dedupe_key = $1", &[&dedupe_key])
+                    .await?
+                    .is_some();
+                if exists {
+                    present += 1;
+                    continue;
+                }
+                let updated = self
+                    .client
+                    .execute(
+                        r#"
+UPDATE turns SET dedupe_key = $1, thread_id = $2, trace_id = $3, message = $4
+WHERE dedupe_key LIKE 'legacy:%' AND ctx = $5 AND seq = $6 AND from_ilk = $7
+"#,
+                        &[
+                            &dedupe_key,
+                            &turn.thread_id,
+                            &turn.trace_id,
+                            &turn.message,
+                            &turn.ctx,
+                            &turn.seq,
+                            &turn.from_ilk,
+                        ],
+                    )
+                    .await?;
+                if updated > 0 {
+                    relinked += 1;
+                    continue;
+                }
+                self.persist_turn(&self.client, &dedupe_key, &turn, Some(received_at))
+                    .await?;
+                inserted += 1;
+            }
+            if (rows.len() as i64) < TURNS_BACKFILL_PAGE {
+                break;
+            }
+        }
+        let detail = format!(
+            "completed {completed}, relinked {relinked}, inserted {inserted}, already present {present}, unreadable {unreadable}"
+        );
+        self.client
+            .execute(
+                "INSERT INTO storage_migrations (name, detail) VALUES ($1, $2) ON CONFLICT (name) DO NOTHING",
+                &[&TURNS_BACKFILL_MIGRATION, &detail],
+            )
+            .await?;
+        tracing::info!(%detail, "turns backfilled from the storage inbox (once)");
+        Ok(())
+    }
+
+    /// Deletes processed rows older than `retention_hours`, at most `INBOX_PURGE_BATCH` per call.
+    async fn purge_processed_inbox(&self, retention_hours: i32) -> Result<u64, StorageError> {
+        let deleted = self
+            .client
+            .execute(
+                r#"
+DELETE FROM storage_inbox
+WHERE dedupe_key IN (
+    SELECT dedupe_key FROM storage_inbox
+    WHERE processed_at IS NOT NULL
+      AND processed_at < now() - make_interval(hours => $1)
+    LIMIT $2
+)
+"#,
+                &[&retention_hours, &INBOX_PURGE_BATCH],
+            )
+            .await?;
+        Ok(deleted)
     }
 
     async fn inbox_metrics(&self) -> Result<InboxMetrics, StorageError> {
@@ -905,7 +1164,7 @@ FROM storage_inbox
         if already_processed {
             return Ok(());
         }
-        self.process_inbox_message(&dedupe_key, subject, kind, payload)
+        self.process_inbox_message(&dedupe_key, subject, kind, payload, None)
             .await
     }
 
@@ -938,9 +1197,10 @@ RETURNING processed_at IS NOT NULL
         subject: &str,
         kind: HandlerKind,
         payload: &[u8],
+        source_ts: Option<std::time::SystemTime>,
     ) -> Result<(), StorageError> {
         let result = self
-            .process_subject_payload(kind, payload, dedupe_key)
+            .process_subject_payload(kind, payload, dedupe_key, source_ts)
             .await;
         match result {
             Ok(()) => {
@@ -984,12 +1244,14 @@ WHERE dedupe_key = $1
         kind: HandlerKind,
         payload: &[u8],
         dedupe_key: &str,
+        source_ts: Option<std::time::SystemTime>,
     ) -> Result<(), StorageError> {
         match kind {
             HandlerKind::Turns => {
                 let value: Value = serde_json::from_slice(payload)?;
                 let turn = parse_turn(value)?;
-                self.persist_turn(&self.client, dedupe_key, &turn).await
+                self.persist_turn(&self.client, dedupe_key, &turn, source_ts)
+                    .await
             }
             HandlerKind::Events => {
                 let value: Value = serde_json::from_slice(payload)?;
@@ -1061,14 +1323,18 @@ WHERE dedupe_key = $1
         db: &C,
         dedupe_key: &str,
         turn: &TurnRecord,
+        source_ts: Option<std::time::SystemTime>,
     ) -> Result<(), StorageError>
     where
         C: GenericClient + Sync,
     {
+        // `ts` is when the router copied the message (the stream record's time), not when it got
+        // here: a turn that waited in a stream keeps its time.
         db.execute(
             r#"
-INSERT INTO turns (dedupe_key, ctx, seq, ts, from_ilk, to_ilk, ich, msg_type, content, tags)
-VALUES ($1, $2, $3, now(), $4, $5, $6, $7, $8, $9)
+INSERT INTO turns (dedupe_key, ctx, seq, ts, from_ilk, to_ilk, ich, msg_type, content, tags,
+                   thread_id, trace_id, message)
+VALUES ($1, $2, $3, COALESCE($10, now()), $4, $5, $6, $7, $8, $9, $11, $12, $13)
 ON CONFLICT (dedupe_key) DO NOTHING
 "#,
             &[
@@ -1081,6 +1347,10 @@ ON CONFLICT (dedupe_key) DO NOTHING
                 &turn.msg_type,
                 &turn.content,
                 &turn.tags,
+                &source_ts,
+                &turn.thread_id,
+                &turn.trace_id,
+                &turn.message,
             ],
         )
         .await?;
@@ -1806,26 +2076,6 @@ ON CONFLICT (episode_id) DO UPDATE SET
     }
 }
 
-async fn run_turns_loop(
-    endpoint: String,
-    use_durable_consumer: bool,
-    storage: Arc<Storage>,
-    nats_subscribe_errors: Arc<AtomicU64>,
-    storage_handler_errors: Arc<AtomicU64>,
-) {
-    run_subject_loop(
-        endpoint,
-        SUBJECT_STORAGE_TURNS,
-        10,
-        use_durable_consumer.then_some(DURABLE_QUEUE_TURNS),
-        storage,
-        HandlerKind::Turns,
-        nats_subscribe_errors,
-        storage_handler_errors,
-    )
-    .await;
-}
-
 async fn run_events_loop(
     endpoint: String,
     use_durable_consumer: bool,
@@ -2095,14 +2345,20 @@ fn message_dedupe_key(subject: &str, payload: &[u8]) -> String {
     format!("{subject}:{hash:016x}:{}", payload.len())
 }
 
-/// Every `INBOX_MAINTENANCE_INTERVAL_SECS`, retries the rows that failed (A-70). The startup
-/// replay already ran, so the first round waits one interval.
+/// Every `INBOX_MAINTENANCE_INTERVAL_SECS`, retries the rows that failed and purges the processed
+/// ones past `STORAGE_INBOX_RETENTION_HOURS` (A-70). The startup replay already ran, so the first
+/// round waits one interval. The one-time turns backfill runs here first, off the startup path:
+/// SY.storage takes the streams' batches meanwhile. Until it ran, the inbox is not purged.
 async fn run_inbox_maintenance_loop(storage: Arc<Storage>) {
+    let mut backfilled = backfill_turns(&storage).await;
     let mut ticker = time::interval(Duration::from_secs(INBOX_MAINTENANCE_INTERVAL_SECS));
     ticker.set_missed_tick_behavior(time::MissedTickBehavior::Delay);
     ticker.tick().await;
     loop {
         ticker.tick().await;
+        if !backfilled {
+            backfilled = backfill_turns(&storage).await;
+        }
         match storage
             .replay_pending_messages(
                 INBOX_REPLAY_BATCH_SIZE,
@@ -2115,7 +2371,168 @@ async fn run_inbox_maintenance_loop(storage: Arc<Storage>) {
             Ok(count) => tracing::info!(count, "retried failed storage inbox messages"),
             Err(err) => tracing::warn!(error = %err, "storage inbox retry failed"),
         }
+        // Until the backfill ran, the old replies exist only in the inbox: no purge before.
+        if backfilled {
+            match storage
+                .purge_processed_inbox(STORAGE_INBOX_RETENTION_HOURS)
+                .await
+            {
+                Ok(0) => {}
+                Ok(count) => tracing::info!(count, "purged processed storage inbox messages"),
+                Err(err) => tracing::warn!(error = %err, "storage inbox purge failed"),
+            }
+        }
     }
+}
+
+async fn backfill_turns(storage: &Storage) -> bool {
+    match storage.backfill_turns_from_inbox().await {
+        Ok(()) => true,
+        Err(err) => {
+            tracing::warn!(error = %err, "turns backfill from the inbox failed; it runs again next round");
+            false
+        }
+    }
+}
+
+/// One record of a stream batch, ready for the inbox.
+struct StreamRow {
+    dedupe_key: String,
+    subject: String,
+    kind: HandlerKind,
+    payload: Vec<u8>,
+    source_ts: std::time::SystemTime,
+}
+
+/// The records of a batch SY.storage takes, and how many it drops: a subject it has no handler for
+/// (usage, until stage 3); a record whose producer is not a node of the stream's hive (a router
+/// copies and takes only what its own nodes send); a cognition record not from that hive's
+/// SY.cognition; a turn whose message names another sender than its producer (Archi shows that
+/// name). A resent record lands on the same key: the same subject and payload, the same row.
+fn stream_rows(batch: &StreamBatch, from: &str) -> Result<(Vec<StreamRow>, usize), StorageError> {
+    let hive = stream_hive(from).unwrap_or_default();
+    let cognition_producer = format!("SY.cognition@{hive}");
+    let mut rows = Vec::with_capacity(batch.records.len());
+    let mut dropped = 0usize;
+    for record in &batch.records {
+        let Some(kind) = handler_kind_for_subject(&record.subject) else {
+            dropped += 1;
+            continue;
+        };
+        let producer_hive = record.producer.rsplit_once('@').map(|(_, hive)| hive);
+        if producer_hive != Some(hive) {
+            dropped += 1;
+            continue;
+        }
+        if record.subject.starts_with(STREAM_SUBJECT_COGNITION_PREFIX)
+            && !record.producer.eq_ignore_ascii_case(&cognition_producer)
+        {
+            dropped += 1;
+            continue;
+        }
+        if record.subject == SUBJECT_STORAGE_TURNS
+            && record.payload["routing"]["src_l2_name"].as_str() != Some(record.producer.as_str())
+        {
+            dropped += 1;
+            continue;
+        }
+        let payload = serde_json::to_vec(&record.payload)?;
+        rows.push(StreamRow {
+            dedupe_key: message_dedupe_key(&record.subject, &payload),
+            subject: record.subject.clone(),
+            kind,
+            payload,
+            source_ts: std::time::UNIX_EPOCH + Duration::from_millis(record.ts_ms),
+        });
+    }
+    Ok((rows, dropped))
+}
+
+/// Takes the stream batches the main loop hands over, one at a time, in arrival order, and hands
+/// their new rows to a task of their own: an ack never waits for the previous batch's processing.
+async fn run_stream_ingest(
+    storage: Arc<Storage>,
+    dispatcher: Arc<RouterDispatcher>,
+    mut rx: tokio::sync::mpsc::Receiver<Message>,
+) {
+    let (process_tx, mut process_rx) =
+        tokio::sync::mpsc::channel::<Vec<StreamRow>>(STREAM_PROCESS_QUEUE);
+    let processor = Arc::clone(&storage);
+    std::mem::drop(tokio::spawn(async move {
+        while let Some(rows) = process_rx.recv().await {
+            for row in rows {
+                // A failure is recorded on the row, which the inbox retry takes again.
+                let _ = processor
+                    .process_inbox_message(
+                        &row.dedupe_key,
+                        &row.subject,
+                        row.kind,
+                        &row.payload,
+                        Some(row.source_ts),
+                    )
+                    .await;
+            }
+        }
+    }));
+    while let Some(msg) = rx.recv().await {
+        match ingest_stream_batch(&storage, &dispatcher, &msg).await {
+            Ok(rows) if rows.is_empty() => {}
+            Ok(rows) => {
+                if process_tx.try_send(rows).is_err() {
+                    tracing::warn!("sy.storage stream processing queue full; the rows wait in the inbox for the retry");
+                }
+            }
+            Err(err) => {
+                tracing::warn!(error = %err, "sy.storage could not take a stream batch; its stream sends it again");
+            }
+        }
+    }
+}
+
+/// A batch from a router's stream (docs/router-stream-v1.md §2.7): into the inbox in one
+/// transaction, then acked. Returns the rows not processed yet, for the processing task. A record
+/// SY.storage does not take (see `stream_rows`) is acked and dropped.
+async fn ingest_stream_batch(
+    storage: &Storage,
+    dispatcher: &RouterDispatcher,
+    msg: &Message,
+) -> Result<Vec<StreamRow>, StorageError> {
+    let from = msg.routing.src_l2_name.as_deref().unwrap_or("");
+    if !is_stream_node_name(from) {
+        tracing::warn!(
+            from,
+            "sy.storage dropped a STREAM_BATCH that does not come from a router stream"
+        );
+        return Ok(Vec::new());
+    }
+    let batch: StreamBatch = serde_json::from_value(msg.payload.clone())?;
+    let Some(last_seq) = batch.records.last().map(|record| record.seq) else {
+        return Ok(Vec::new());
+    };
+    let (rows, dropped) = stream_rows(&batch, from)?;
+    let processed = storage.upsert_stream_rows(&rows).await?;
+    let sender = dispatcher.sender_snapshot();
+    let ack = build_system_reply(
+        &sender,
+        msg,
+        MSG_STREAM_ACK,
+        json!({ "up_to_seq": last_seq }),
+    );
+    sender.send(ack).await?;
+    tracing::debug!(
+        stream = from,
+        records = batch.records.len(),
+        taken = rows.len(),
+        dropped,
+        up_to_seq = last_seq,
+        "sy.storage took a stream batch"
+    );
+    Ok(rows
+        .into_iter()
+        .zip(processed)
+        .filter(|(_, processed)| !processed)
+        .map(|(row, _)| row)
+        .collect())
 }
 
 fn truncate_error(input: &str, max_len: usize) -> String {
@@ -2685,6 +3102,7 @@ fn parse_turn(value: Value) -> Result<TurnRecord, StorageError> {
         .or_else(|| get_string_vec(&value, &["meta", "tags"]))
         .unwrap_or_default();
     dedup_sort(&mut tags);
+    let thread_id = get_str(&value, &["meta", "thread_id"]);
     Ok(TurnRecord {
         ctx,
         seq,
@@ -2694,6 +3112,9 @@ fn parse_turn(value: Value) -> Result<TurnRecord, StorageError> {
         msg_type,
         content,
         tags,
+        thread_id,
+        trace_id,
+        message: value,
     })
 }
 
@@ -3497,6 +3918,7 @@ fn write_json_atomic(path: &Path, content: &str) -> Result<(), StorageError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use fluxbee_sdk::stream::StreamRecord;
 
     fn message(trace_id: &str, src: &str, text: &str) -> Value {
         serde_json::json!({
@@ -3538,5 +3960,149 @@ mod tests {
         assert!(TURNS_KEY_MIGRATION_SQL.contains("c.conname = 'turns_pkey' AND c.contype = 'p'"));
         assert!(TURNS_KEY_MIGRATION_SQL.contains("ALTER TABLE turns DROP CONSTRAINT turns_pkey;"));
         assert!(TURNS_KEY_MIGRATION_SQL.contains("'legacy:' || ctx || ':' || seq"));
+    }
+
+    fn record(seq: u64, subject: &str, producer: &str, payload: Value) -> StreamRecord {
+        StreamRecord {
+            seq,
+            ts_ms: 1_700_000_000_000 + seq,
+            subject: subject.to_string(),
+            producer: producer.to_string(),
+            payload,
+        }
+    }
+
+    /// A turn as the router copies it: the sender's name stamped on it.
+    fn copied_turn(trace_id: &str, sender: &str, text: &str) -> Value {
+        let mut turn = message(trace_id, "ilk:person", text);
+        turn["routing"]["src_l2_name"] = Value::String(sender.to_string());
+        turn
+    }
+
+    #[test]
+    fn a_batch_becomes_inbox_rows_keyed_as_before() {
+        let turn = copied_turn("trace-1", "IO.slack.T1@worker1", "hola");
+        let batch = StreamBatch {
+            stream: "RT.gateway.stream@worker1".to_string(),
+            records: vec![record(
+                7,
+                SUBJECT_STORAGE_TURNS,
+                "IO.slack.T1@worker1",
+                turn.clone(),
+            )],
+        };
+        let (rows, dropped) = stream_rows(&batch, "RT.gateway.stream@worker1").unwrap();
+        assert_eq!(dropped, 0);
+        assert_eq!(rows.len(), 1);
+        let bytes = serde_json::to_vec(&turn).unwrap();
+        assert_eq!(
+            rows[0].dedupe_key,
+            message_dedupe_key(SUBJECT_STORAGE_TURNS, &bytes)
+        );
+        assert_eq!(rows[0].payload, bytes);
+        assert!(matches!(rows[0].kind, HandlerKind::Turns));
+        // `ts` is when the router copied the turn, not when the batch got here.
+        assert_eq!(
+            rows[0].source_ts,
+            std::time::UNIX_EPOCH + Duration::from_millis(1_700_000_000_007)
+        );
+        let (again, _) = stream_rows(&batch, "RT.gateway.stream@worker1").unwrap();
+        assert_eq!(
+            again[0].dedupe_key, rows[0].dedupe_key,
+            "a resent batch lands on the same rows"
+        );
+    }
+
+    #[test]
+    fn cognition_records_come_only_from_the_streams_own_cognition() {
+        let subject = "storage.cognition.threads";
+        let batch = StreamBatch {
+            stream: "RT.gateway.stream@worker1".to_string(),
+            records: vec![
+                record(
+                    1,
+                    subject,
+                    "SY.cognition@worker1",
+                    serde_json::json!({"a": 1}),
+                ),
+                record(2, subject, "AI.sales@worker1", serde_json::json!({"a": 2})),
+                record(
+                    3,
+                    subject,
+                    "SY.cognition@motherbee",
+                    serde_json::json!({"a": 3}),
+                ),
+                record(
+                    4,
+                    "storage.usage",
+                    "AI.sales@worker1",
+                    serde_json::json!({"a": 4}),
+                ),
+                record(
+                    5,
+                    "storage.unknown",
+                    "AI.sales@worker1",
+                    serde_json::json!({"a": 5}),
+                ),
+            ],
+        };
+        let (rows, dropped) = stream_rows(&batch, "RT.gateway.stream@worker1").unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].subject, subject);
+        assert!(matches!(rows[0].kind, HandlerKind::CognitionThreads));
+        assert_eq!(dropped, 4);
+    }
+
+    #[test]
+    fn a_record_comes_from_a_node_of_the_streams_hive() {
+        let stream = "RT.gateway.stream@ingress1";
+        let batch = StreamBatch {
+            stream: stream.to_string(),
+            records: vec![
+                record(
+                    1,
+                    SUBJECT_STORAGE_TURNS,
+                    "IO.web@ingress1",
+                    copied_turn("t1", "IO.web@ingress1", "ok"),
+                ),
+                // Another hive's node, or a message naming another sender than its producer.
+                record(
+                    2,
+                    SUBJECT_STORAGE_TURNS,
+                    "SY.admin@motherbee",
+                    copied_turn("t2", "SY.admin@motherbee", "forged"),
+                ),
+                record(
+                    3,
+                    SUBJECT_STORAGE_TURNS,
+                    "IO.web@ingress1",
+                    copied_turn("t3", "SY.admin@motherbee", "forged"),
+                ),
+                record(
+                    4,
+                    SUBJECT_STORAGE_TURNS,
+                    "IO.web@ingress1",
+                    message("t4", "x", "no name"),
+                ),
+            ],
+        };
+        let (rows, dropped) = stream_rows(&batch, stream).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(dropped, 3);
+        let kept: Value = serde_json::from_slice(&rows[0].payload).unwrap();
+        assert_eq!(kept["routing"]["trace_id"], "t1");
+    }
+
+    #[test]
+    fn the_message_log_migration_runs_once() {
+        // Every column is added only when missing; the backfill and the purge depend on its
+        // marker table.
+        for column in ["'source_ts'", "'message'", "'stored_at'"] {
+            assert!(MESSAGE_LOG_MIGRATION_SQL.contains(&format!("column_name = {column}")));
+        }
+        assert!(MESSAGE_LOG_MIGRATION_SQL.contains("CREATE TABLE IF NOT EXISTS storage_migrations"));
+        assert!(MESSAGE_LOG_MIGRATION_SQL.contains(
+            "CREATE INDEX IF NOT EXISTS idx_turns_stored_at ON turns (stored_at, dedupe_key)"
+        ));
     }
 }

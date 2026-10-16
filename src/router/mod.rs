@@ -1,3 +1,4 @@
+pub mod stream;
 pub mod system_policy;
 
 use std::collections::HashMap;
@@ -87,6 +88,11 @@ pub struct Router {
     thread_sequences: Arc<Mutex<HashMap<String, u64>>>,
     nats_publisher: Option<Arc<NatsPublisher>>,
     nats_publish_errors: Arc<AtomicU64>,
+    /// This router's stream (docs/router-stream-v1.md, A-70): the turn copies and the nodes'
+    /// appends go here, for SY.storage.
+    stream: stream::StreamHandle,
+    /// The stream's node, started once the router listens.
+    stream_runtime: std::sync::Mutex<Option<stream::StreamRuntime>>,
 }
 
 const NATS_READY_TIMEOUT_SECS: u64 = 20;
@@ -132,10 +138,23 @@ impl Router {
             Ok(name) => MemoryRegionReader::open_read_only(&name).ok(),
             Err(_) => None,
         };
-        let nats_publisher = Some(Arc::new(NatsPublisher::new(
-            cfg.nats_url.clone(),
-            SUBJECT_STORAGE_TURNS.to_string(),
-        )));
+        // Turns still go to the local NATS where SY.cognition and SY.policy read them (the motherbee
+        // and the workers) until stage 2; nothing reads them on the ingress or the egress, whose
+        // brokers only piled them up (A-70). SY.storage takes them from the stream.
+        let nats_publisher = turns_go_to_nats(&cfg.hive_role).then(|| {
+            Arc::new(NatsPublisher::new(
+                cfg.nats_url.clone(),
+                SUBJECT_STORAGE_TURNS.to_string(),
+            ))
+        });
+        let (stream, stream_runtime) = stream::open(
+            &cfg.router_l2_name,
+            &cfg.hive_id,
+            &cfg.hive_role,
+            &cfg.state_dir,
+            &cfg.config_dir,
+            &cfg.node_socket_path,
+        );
         Self {
             cfg,
             shm: Arc::new(Mutex::new(shm)),
@@ -163,6 +182,8 @@ impl Router {
             thread_sequences: Arc::new(Mutex::new(HashMap::new())),
             nats_publisher,
             nats_publish_errors: Arc::new(AtomicU64::new(0)),
+            stream,
+            stream_runtime: std::sync::Mutex::new(Some(stream_runtime)),
         }
     }
 
@@ -177,11 +198,33 @@ impl Router {
         wait_for_nats_ready(&self.cfg, Duration::from_secs(NATS_READY_TIMEOUT_SECS)).await?;
         if self.cfg.nats_mode == "embedded" {
             spawn_embedded_nats_recovery_loop(&self.cfg);
+            // SY.storage takes turns from the stream since 0.1.76: its old NATS consumer would
+            // keep every turn in the broker up to the 50,000 cap (A-70). The broker refuses it
+            // from now on.
+            for (consumer, pending) in
+                crate::nats::remove_retired_durable_consumers(&self.cfg.nats_url).await
+            {
+                tracing::info!(
+                    consumer = %consumer,
+                    pending,
+                    "removed a retired durable consumer from the local broker; the stream delivers turns now"
+                );
+            }
         }
         ensure_parent_dir(&self.cfg.node_socket_path)?;
         let _ = std::fs::remove_file(&self.cfg.node_socket_path);
         let listener = UnixListener::bind(&self.cfg.node_socket_path)?;
         set_socket_mode(&self.cfg.node_socket_path, 0o666)?;
+        // The stream joins this router as a node once it listens; never awaited here, since the
+        // router accepts nodes only at the end of `run` (§2.1).
+        if let Some(runtime) = self
+            .stream_runtime
+            .lock()
+            .ok()
+            .and_then(|mut slot| slot.take())
+        {
+            std::mem::drop(tokio::spawn(stream::run_node(runtime)));
+        }
         tracing::info!(
             router = %self.cfg.router_l2_name,
             socket = %self.cfg.node_socket_path.display(),
@@ -535,6 +578,7 @@ impl Router {
             let memory_reader = Arc::clone(&self.memory_reader);
             let nats_publisher = self.nats_publisher.clone();
             let nats_publish_errors = Arc::clone(&self.nats_publish_errors);
+            let log_stream = self.stream.clone();
             let is_gateway = self.cfg.is_gateway;
             let identity_frontdesk_node_name = self.cfg.identity_frontdesk_node_name.clone();
             tokio::spawn(async move {
@@ -563,6 +607,7 @@ impl Router {
                     thread_sequences,
                     nats_publisher,
                     nats_publish_errors,
+                    log_stream,
                     router_uuid,
                     &router_name,
                     &hive_id,
@@ -603,6 +648,7 @@ async fn handle_node(
     thread_sequences: Arc<Mutex<HashMap<String, u64>>>,
     nats_publisher: Option<Arc<NatsPublisher>>,
     nats_publish_errors: Arc<AtomicU64>,
+    log_stream: stream::StreamHandle,
     router_uuid: Uuid,
     router_name: &str,
     hive_id: &str,
@@ -812,6 +858,14 @@ async fn handle_node(
                     );
                     continue;
                 }
+                // A node's append to this router's stream: the router consumes it and routes it
+                // to no node. Before the thread sequence, so it never takes a conversation's seq.
+                if is_system_kind(&msg.meta.msg_type)
+                    && msg.meta.msg.as_deref() == Some(fluxbee_sdk::stream::MSG_STREAM_APPEND)
+                {
+                    take_stream_append(&log_stream, &msg, &conn_node_name, hive_id);
+                    continue;
+                }
                 assign_thread_seq_if_missing(&mut msg, &thread_sequences).await;
                 tracing::info!(
                     src = %msg.routing.src,
@@ -821,6 +875,11 @@ async fn handle_node(
                     "message received"
                 );
                 maybe_publish_turn(&nats_publisher, &nats_publish_errors, &msg);
+                if should_publish_turn(&msg) {
+                    if let Some(copy) = turn_copy(&msg, &conn_node_name) {
+                        log_stream.append_turn(&conn_node_name, copy);
+                    }
+                }
                 if is_system_kind(&msg.meta.msg_type) {
                     if msg.meta.msg.as_deref() == Some(MSG_WITHDRAW) {
                         break Ok(());
@@ -6253,6 +6312,60 @@ fn maybe_publish_turn(
     });
 }
 
+/// Whether this hive's local NATS still gets the turn copies: where SY.cognition and SY.policy
+/// read them, until they take them from the stream (stage 2 of docs/router-stream-v1.md).
+fn turns_go_to_nats(hive_role: &str) -> bool {
+    matches!(
+        hive_role.trim().to_ascii_lowercase().as_str(),
+        "motherbee" | "worker"
+    )
+}
+
+/// The router's copy of a turn for its stream: the message as routed (thread sequence assigned),
+/// with its action class and the sender's real name. The node's own `src_l2_name` is never kept:
+/// the router stamps it only later, on delivery.
+fn turn_copy(msg: &Message, conn_node_name: &str) -> Option<Vec<u8>> {
+    let mut copy = msg.clone();
+    if copy.meta.action_class.is_none() {
+        copy.meta.action_class = classify_routed_message(&copy.meta.msg_type);
+    }
+    copy.routing.src_l2_name = Some(conn_node_name.to_string());
+    serde_json::to_vec(&copy).ok()
+}
+
+/// At most one log line per interval about the appends this router refused.
+const REFUSED_APPEND_LOG_INTERVAL_MS: u64 = 30_000;
+static REFUSED_APPEND_LAST_LOG_MS: AtomicU64 = AtomicU64::new(0);
+
+/// A node's `STREAM_APPEND`: appended under its subject when that node may append it (§2.2), the
+/// producer being the node's connection name.
+fn take_stream_append(stream: &stream::StreamHandle, msg: &Message, producer: &str, hive_id: &str) {
+    let append: Option<fluxbee_sdk::stream::StreamAppend> =
+        serde_json::from_value(msg.payload.clone()).ok();
+    let allowed = append
+        .as_ref()
+        .is_some_and(|append| stream::subject_allowed(&append.subject, producer, hive_id));
+    match (append, allowed) {
+        (Some(append), true) => match serde_json::to_vec(&append.payload) {
+            Ok(payload) => stream.append_from_node(&append.subject, producer, payload),
+            Err(_) => stream.count_refused(),
+        },
+        (append, _) => {
+            stream.count_refused();
+            let now = now_epoch_ms();
+            let last = REFUSED_APPEND_LAST_LOG_MS.load(Ordering::Relaxed);
+            if now.saturating_sub(last) >= REFUSED_APPEND_LOG_INTERVAL_MS {
+                REFUSED_APPEND_LAST_LOG_MS.store(now, Ordering::Relaxed);
+                tracing::warn!(
+                    producer,
+                    subject = ?append.map(|append| append.subject),
+                    "router refused a STREAM_APPEND: not a subject this node may append"
+                );
+            }
+        }
+    }
+}
+
 fn should_publish_turn(msg: &Message) -> bool {
     if is_system_kind(&msg.meta.msg_type) {
         return false;
@@ -7737,6 +7850,7 @@ mod tests {
             Arc::new(Mutex::new(HashMap::new())),
             None,
             Arc::new(AtomicU64::new(0)),
+            stream::StreamHandle::detached(),
             router_uuid,
             "RT.gateway@motherbee",
             "motherbee",
@@ -7862,6 +7976,15 @@ mod tests {
         shm: &TestShm,
         nodes: &Arc<Mutex<HashMap<Uuid, NodeHandle>>>,
     ) -> tokio::task::JoinHandle<Result<(), RouterError>> {
+        spawn_node_connection_with_stream(server, shm, nodes, stream::StreamHandle::detached())
+    }
+
+    fn spawn_node_connection_with_stream(
+        server: UnixStream,
+        shm: &TestShm,
+        nodes: &Arc<Mutex<HashMap<Uuid, NodeHandle>>>,
+        log_stream: stream::StreamHandle,
+    ) -> tokio::task::JoinHandle<Result<(), RouterError>> {
         tokio::spawn(handle_node(
             server,
             Arc::clone(&shm.writer),
@@ -7887,6 +8010,7 @@ mod tests {
             Arc::new(Mutex::new(HashMap::new())),
             None,
             Arc::new(AtomicU64::new(0)),
+            log_stream,
             Uuid::new_v4(),
             "RT.gateway@motherbee",
             "motherbee",
@@ -7959,6 +8083,103 @@ mod tests {
             .await
             .get(&uuid)
             .map(|handle| handle.name.clone())
+    }
+
+    /// A-70 (stage 1b): the router copies a node's message to its stream under the name it
+    /// registered, takes the node's `STREAM_APPEND` for a subject it may append, refuses the rest,
+    /// and routes neither append to any node.
+    #[tokio::test]
+    async fn the_router_copies_turns_and_takes_appends_without_routing_them() {
+        let shm = TestShm::new("rt-stream");
+        let nodes: Arc<Mutex<HashMap<Uuid, NodeHandle>>> = Arc::new(Mutex::new(HashMap::new()));
+        let receiver_uuid = Uuid::new_v4();
+        let (receiver_tx, mut receiver_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+        nodes.lock().await.insert(
+            receiver_uuid,
+            NodeHandle {
+                name: "SY.timer@motherbee".to_string(),
+                vpn_id: 0,
+                sender: receiver_tx,
+                connected_at: 0,
+            },
+        );
+        let (log_stream, observed) = stream::StreamHandle::observed();
+        let (mut client, server) = UnixStream::pair().expect("socket pair");
+        let _connection = spawn_node_connection_with_stream(server, &shm, &nodes, log_stream);
+        let uuid = Uuid::new_v4();
+        let frame = test_frame(
+            uuid,
+            SYSTEM_KIND,
+            Some(MSG_HELLO),
+            Destination::Broadcast,
+            serde_json::json!({ "uuid": uuid.to_string(), "name": "AI.sales", "version": "1" }),
+        );
+        write_frame(&mut client, &frame).await.expect("hello");
+        time::timeout(Duration::from_secs(5), read_frame(&mut client))
+            .await
+            .expect("announce in time")
+            .expect("read")
+            .expect("announce");
+
+        let to_receiver = Destination::Unicast(receiver_uuid.to_string());
+        let usage = test_frame(
+            uuid,
+            SYSTEM_KIND,
+            Some(fluxbee_sdk::stream::MSG_STREAM_APPEND),
+            to_receiver.clone(),
+            serde_json::json!({ "subject": "storage.usage", "payload": { "tokens": 12 } }),
+        );
+        let forged_turn = test_frame(
+            uuid,
+            SYSTEM_KIND,
+            Some(fluxbee_sdk::stream::MSG_STREAM_APPEND),
+            to_receiver.clone(),
+            serde_json::json!({ "subject": "storage.turns", "payload": { "fake": true } }),
+        );
+        let turn = test_frame(
+            uuid,
+            "user",
+            None,
+            to_receiver,
+            serde_json::json!({ "n": "hola" }),
+        );
+        for frame in [&usage, &forged_turn, &turn] {
+            write_frame(&mut client, frame).await.expect("frame");
+        }
+
+        let delivered = time::timeout(Duration::from_secs(5), receiver_rx.recv())
+            .await
+            .expect("delivery in time")
+            .expect("delivered");
+        let delivered: Message = serde_json::from_slice(&delivered).expect("message");
+        assert_eq!(
+            delivered.payload["n"], "hola",
+            "only the user message is routed"
+        );
+        assert!(
+            time::timeout(Duration::from_millis(200), receiver_rx.recv())
+                .await
+                .is_err(),
+            "no append reaches a node"
+        );
+
+        let appends = observed.drain();
+        assert_eq!(appends.len(), 2, "{appends:?}");
+        assert_eq!(appends[0].0, "storage.usage");
+        assert_eq!(appends[0].1, "AI.sales@motherbee");
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&appends[0].2).unwrap(),
+            serde_json::json!({ "tokens": 12 })
+        );
+        assert_eq!(appends[1].0, "storage.turns");
+        assert_eq!(appends[1].1, "AI.sales@motherbee");
+        let copy: Message = serde_json::from_slice(&appends[1].2).expect("the turn copy");
+        assert_eq!(copy.payload["n"], "hola");
+        assert_eq!(
+            copy.routing.src_l2_name.as_deref(),
+            Some("AI.sales@motherbee")
+        );
+        assert_eq!(observed.refused(), 1, "a node never appends a turn");
     }
 
     /// A-44: a second live process with a node's UUID does not take its route. Its HELLO waits

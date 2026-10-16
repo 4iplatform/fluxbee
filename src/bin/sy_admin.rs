@@ -136,6 +136,7 @@ const ADMIN_EXECUTOR_PILOT_ACTIONS: &[&str] = &[
 // cargo workspace); a test there pins it to the CLOUD_OP_ACTIONS map so the relay gate and Cloud's
 // op translation can never drift (FIX-12).
 use fluxbee_sdk::cloud::CLOUD_EXPOSED_ACTIONS as IO_CLOUD_EXPOSED_ACTIONS;
+use fluxbee_sdk::stream::{is_stream_node_name, MSG_STREAM_STATUS, MSG_STREAM_STATUS_RESPONSE};
 
 #[derive(Debug, Deserialize)]
 struct HiveFile {
@@ -3148,6 +3149,8 @@ enum InternalActionRoute {
     WfRulesHttp(WfRulesAction),
     WfRulesQuery(&'static str),
     TimerRpc(&'static str),
+    /// Admin asks every router stream of the hive itself (A-70).
+    StreamStatus,
 }
 
 #[derive(Clone, Copy)]
@@ -3158,7 +3161,7 @@ struct InternalActionSpec {
     allow_legacy_hive_id: bool,
 }
 
-const INTERNAL_ACTION_REGISTRY_VERSION: &str = "11";
+const INTERNAL_ACTION_REGISTRY_VERSION: &str = "12";
 
 const INTERNAL_ACTION_REGISTRY: &[InternalActionSpec] = &[
     InternalActionSpec {
@@ -3254,6 +3257,12 @@ const INTERNAL_ACTION_REGISTRY: &[InternalActionSpec] = &[
     InternalActionSpec {
         action: "list_nodes",
         route: InternalActionRoute::Query("list_nodes"),
+        requires_target: true,
+        allow_legacy_hive_id: false,
+    },
+    InternalActionSpec {
+        action: "list_streams",
+        route: InternalActionRoute::StreamStatus,
         requires_target: true,
         allow_legacy_hive_id: false,
     },
@@ -5475,6 +5484,16 @@ async fn dispatch_internal_admin_command(
             };
             handle_timer_rpc(ctx, client, action, timer_msg, params, hive_id).await?
         }
+        InternalActionRoute::StreamStatus => {
+            let hive = resolve_internal_action_hive(action, target, &params);
+            let Some(hive_id) = hive else {
+                return Ok(internal_invalid_request(
+                    action,
+                    "missing target (payload.target required for this action)",
+                ));
+            };
+            handle_list_streams(ctx, client, hive_id).await?
+        }
     };
 
     Ok(InternalAdminDispatchResult {
@@ -7530,6 +7549,10 @@ async fn handle_hive_paths(
                 handle_admin_query(ctx, client, "get_versions", Some(hive)).await?;
             Ok(Some((status, resp)))
         }
+        ("GET", ["streams"]) => {
+            let (status, resp) = handle_list_streams(ctx, client, hive).await?;
+            Ok(Some((status, resp)))
+        }
         ("GET", ["runtimes"]) => {
             let (status, resp) =
                 handle_admin_query(ctx, client, "list_runtimes", Some(hive)).await?;
@@ -9086,6 +9109,96 @@ async fn handle_timer_rpc(
     Ok(build_admin_http_response(action, response))
 }
 
+/// `GET /hives/{hive}/streams` (A-70, docs/router-stream-v1.md §2.10): asks every router stream of
+/// the hive, the `RT.<router>.stream@<hive>` nodes the LSA lists for it, for its status. A stream
+/// that does not answer is listed with its error.
+async fn handle_list_streams(
+    ctx: &AdminContext,
+    client: &RouterDispatcher,
+    hive_id: String,
+) -> Result<(u16, String), AdminError> {
+    let action = "list_streams";
+    let Some(streams) = stream_nodes_from_lsa(ctx, &hive_id) else {
+        return Ok((
+            404,
+            serde_json::json!({
+                "status": "error",
+                "action": action,
+                "payload": serde_json::Value::Null,
+                "error_code": "HIVE_NOT_FOUND",
+                "error_detail": format!("hive '{hive_id}' is not in this router's LSA"),
+            })
+            .to_string(),
+        ));
+    };
+    let timeout_window = admin_action_timeout(action);
+    let answers = futures::future::join_all(streams.iter().map(|node| {
+        send_system_request(
+            client,
+            node,
+            MSG_STREAM_STATUS,
+            MSG_STREAM_STATUS_RESPONSE,
+            serde_json::json!({}),
+            timeout_window,
+        )
+    }))
+    .await;
+    let items: Vec<serde_json::Value> = streams
+        .iter()
+        .zip(answers)
+        .map(|(node, answer)| match answer {
+            Ok(status) => serde_json::json!({ "node": node, "status": status }),
+            Err(err) => serde_json::json!({
+                "node": node,
+                "status": serde_json::Value::Null,
+                "error": err.to_string(),
+            }),
+        })
+        .collect();
+    Ok((
+        200,
+        serde_json::json!({
+            "status": "ok",
+            "action": action,
+            "payload": { "hive": hive_id, "streams": items },
+            "error_code": serde_json::Value::Null,
+            "error_detail": serde_json::Value::Null,
+        })
+        .to_string(),
+    ))
+}
+
+/// The router streams the LSA lists for `hive_id`, by L2 name; None when the hive is not in it.
+fn stream_nodes_from_lsa(ctx: &AdminContext, hive_id: &str) -> Option<Vec<String>> {
+    let shm_name = format!("/jsr-lsa-{}", ctx.hive_id);
+    let snapshot = LsaRegionReader::open_read_only(&shm_name)
+        .ok()?
+        .read_snapshot()?;
+    let hive_index = snapshot
+        .hives
+        .iter()
+        .position(|entry| remote_hive_name(entry).as_deref() == Some(hive_id))?;
+    let mut streams: Vec<String> = snapshot
+        .nodes
+        .iter()
+        .filter(|node| node.hive_index as usize == hive_index)
+        .filter(|node| node.name_len > 0 && node.flags & FLAG_DELETED == 0)
+        .map(|node| {
+            let len = (node.name_len as usize).min(node.name.len());
+            let name = String::from_utf8_lossy(&node.name[..len]).into_owned();
+            if name.contains('@') {
+                name
+            } else {
+                format!("{name}@{hive_id}")
+            }
+        })
+        .filter(|name| is_stream_node_name(name))
+        .collect();
+    streams.sort();
+    streams.dedup();
+    Some(streams)
+}
+
 async fn handle_admin_query(
     ctx: &AdminContext,
     client: &RouterDispatcher,
@@ -9536,6 +9649,7 @@ fn build_admin_action_doc(spec: &InternalActionSpec) -> serde_json::Value {
         InternalActionRoute::WfRulesHttp(_) => ("wf_rules_http", None),
         InternalActionRoute::WfRulesQuery(canonical) => ("wf_rules_query", Some(canonical)),
         InternalActionRoute::TimerRpc(canonical) => ("timer_rpc", Some(canonical)),
+        InternalActionRoute::StreamStatus => ("stream_status", None),
     };
     serde_json::json!({
         "name": spec.action,
@@ -9740,6 +9854,9 @@ fn admin_action_summary(action: &str) -> &'static str {
         "get_hive" => "Read one hive definition.",
         "list_nodes" => {
             "List nodes for one hive only. Use inventory for system-wide node visibility."
+        }
+        "list_streams" => {
+            "Read the status of every router stream of one hive: backlog, deliveries and drops."
         }
         "list_tenant_nodes" => {
             "List the managed nodes charged to one tenant on every hive, with their runtime, state and who launched them."
@@ -9974,6 +10091,7 @@ fn admin_action_path_patterns(action: &str) -> Vec<&'static str> {
         "list_hives" => vec!["GET /hives"],
         "get_hive" => vec!["GET /hives/{hive}"],
         "list_nodes" => vec!["GET /hives/{hive}/nodes"],
+        "list_streams" => vec!["GET /hives/{hive}/streams"],
         "list_tenant_nodes" => vec!["GET /hives/{hive}/identity/tenants/{tenant_id}/nodes"],
         "get_node_status" => vec!["GET /hives/{hive}/nodes/{node_name}/status"],
         "get_node_state" => vec!["GET /hives/{hive}/nodes/{node_name}/state"],
@@ -10156,7 +10274,7 @@ fn admin_action_path_params(action: &str) -> Vec<serde_json::Value> {
             "string",
             "Hive id, for example worker-220.",
         )],
-        "list_nodes" | "list_ilks" | "list_tenants" | "get_versions" | "list_runtimes" | "list_routes"
+        "list_nodes" | "list_streams" | "list_ilks" | "list_tenants" | "get_versions" | "list_runtimes" | "list_routes"
         | "list_vpns" | "list_taps" | "get_deployments" | "get_drift_alerts" | "opa_get_policy"
         | "opa_get_status" | "wf_rules_get_workflow" | "wf_rules_get_status"
         | "wf_rules_list_workflows" | "timer_help" | "timer_list" | "timer_now"
@@ -11319,6 +11437,7 @@ fn admin_action_example_scmd(action: &str) -> Option<String> {
         }
         "remove_hive" => "curl -X DELETE /hives/worker-220",
         "list_nodes" => "curl -X GET /hives/motherbee/nodes",
+        "list_streams" => "curl -X GET /hives/worker-220/streams",
         "list_tenant_nodes" => "curl -X GET /hives/motherbee/identity/tenants/tnt:.../nodes",
         "get_node_status" => "curl -X GET /hives/motherbee/nodes/SY.admin@motherbee/status",
         "get_node_state" => "curl -X GET /hives/motherbee/nodes/SY.admin@motherbee/state",
@@ -14988,7 +15107,8 @@ fn admin_action_timeout(action: &str) -> Duration {
         | "timer_now_in"
         | "timer_convert"
         | "timer_parse"
-        | "timer_format" => {
+        | "timer_format"
+        | "list_streams" => {
             Duration::from_secs(env_timeout_secs("JSR_ADMIN_TIMEOUT_SECS").unwrap_or(5))
         }
         _ => Duration::from_secs(env_timeout_secs("JSR_ADMIN_ORCH_TIMEOUT_SECS").unwrap_or(30)),

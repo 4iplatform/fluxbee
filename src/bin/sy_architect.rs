@@ -7788,11 +7788,11 @@ async fn handle_messages_stream(state: &ArchitectState, query: &str) -> Response
         query_param(query, "after_dk"),
     ) {
         (Some(ts), Some(dk)) => messages_db::MessagesCursor {
-            received_at_iso: ts,
+            at_iso: ts,
             dedupe_key: dk,
         },
         (None, None) => messages_db::MessagesCursor {
-            received_at_iso: current_messages_iso_timestamp(),
+            at_iso: current_messages_iso_timestamp(),
             dedupe_key: String::new(),
         },
         _ => {
@@ -7910,7 +7910,7 @@ async fn messages_stream_task(
                 }
                 if let Some(last) = items.last() {
                     cursor = messages_db::MessagesCursor {
-                        received_at_iso: last.received_at.clone(),
+                        at_iso: last.stored_at.clone(),
                         dedupe_key: last.dedupe_key.clone(),
                     };
                 }
@@ -7963,14 +7963,12 @@ async fn handle_messages_list(state: &ArchitectState, query: &str) -> Response {
         },
         None => messages_db::TimeWindow::All,
     };
-    let with_error = query_bool_param(query, "with_error");
-
     let cursor = match (
         query_param(query, "cursor_ts"),
         query_param(query, "cursor_dk"),
     ) {
         (Some(ts), Some(dk)) => Some(messages_db::MessagesCursor {
-            received_at_iso: ts,
+            at_iso: ts,
             dedupe_key: dk,
         }),
         (None, None) => None,
@@ -7998,14 +7996,15 @@ async fn handle_messages_list(state: &ArchitectState, query: &str) -> Response {
             .into_response();
     };
 
-    let filters = messages_db::MessagesFilters { since, with_error };
+    let filters = messages_db::MessagesFilters { since };
     match client
         .list_messages(cursor.as_ref(), &filters, limit)
         .await
     {
-        Ok((items, next_cursor)) => Json(json!({
+        Ok((items, next_cursor, tail_cursor)) => Json(json!({
             "items": items,
-            "next_cursor": next_cursor.map(|c| json!({ "ts": c.received_at_iso, "dk": c.dedupe_key })),
+            "next_cursor": next_cursor.map(|c| json!({ "ts": c.at_iso, "dk": c.dedupe_key })),
+            "tail_cursor": tail_cursor.map(|c| json!({ "ts": c.at_iso, "dk": c.dedupe_key })),
         }))
         .into_response(),
         Err(err) => {
@@ -15352,10 +15351,6 @@ fn architect_index_html(state: &ArchitectState) -> String {
       font-size: 0.84rem;
       color: var(--text);
     }}
-    .messages-filter-toggle {{
-      cursor: pointer;
-      user-select: none;
-    }}
     .messages-status-pill {{
       font-size: 0.7rem;
       font-weight: 700;
@@ -15433,7 +15428,7 @@ fn architect_index_html(state: &ArchitectState) -> String {
       font-size: 0.78rem;
       flex: none;
     }}
-    .messages-row-subject {{
+    .messages-row-route {{
       font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
       font-size: 0.82rem;
       color: var(--text);
@@ -15467,18 +15462,8 @@ fn architect_index_html(state: &ArchitectState) -> String {
     .messages-row-meta-size {{
       flex: none;
     }}
-    .messages-row-status {{
+    .messages-row-kind {{
       flex: none;
-      font-weight: 700;
-    }}
-    .messages-row-status.ok {{
-      color: #15803d;
-    }}
-    .messages-row-status.pending {{
-      color: var(--muted);
-    }}
-    .messages-row-status.err {{
-      color: #b91c1c;
     }}
     .messages-load-more {{
       border: none;
@@ -15552,9 +15537,6 @@ fn architect_index_html(state: &ArchitectState) -> String {
       font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
       word-break: break-all;
       color: var(--text);
-    }}
-    .messages-detail-meta-value.err {{
-      color: #b91c1c;
     }}
     .messages-detail-json-head {{
       display: flex;
@@ -17099,7 +17081,7 @@ fn architect_index_html(state: &ArchitectState) -> String {
         <div class="messages-toolbar">
           <div class="messages-toolbar-left">
             <h1 class="messages-title">Messages</h1>
-            <span class="messages-toolbar-meta">System message log &middot; storage_inbox</span>
+            <span class="messages-toolbar-meta">Message log &middot; turns</span>
           </div>
           <div class="messages-toolbar-right">
             <label class="messages-filter">
@@ -17110,10 +17092,6 @@ fn architect_index_html(state: &ArchitectState) -> String {
                 <option value="1h">1h</option>
                 <option value="15m">15m</option>
               </select>
-            </label>
-            <label class="messages-filter messages-filter-toggle">
-              <input type="checkbox" id="messages-with-error" />
-              <span>Only errors</span>
             </label>
             <span id="messages-status-pill" class="messages-status-pill" data-state="paused">paused</span>
           </div>
@@ -17134,7 +17112,7 @@ fn architect_index_html(state: &ArchitectState) -> String {
         <div id="messages-unconfigured" class="messages-unconfigured" hidden>
           <div class="messages-unconfigured-card">
             <h2>messages_db not configured</h2>
-            <p>archi needs a Postgres connection (credentials + host only — <strong>no dbname</strong>) to read storage's inbox. archi internally hardcodes the dbname (<code>fluxbee_storage</code>); the secret is the same one storage and cognition use.</p>
+            <p>archi needs a Postgres connection (credentials + host only — <strong>no dbname</strong>) to read storage's message log (<code>turns</code>). archi internally hardcodes the dbname (<code>fluxbee_storage</code>); the secret is the same one storage and cognition use.</p>
             <p class="messages-unconfigured-label">Operator flow (Phase J' — vault):</p>
             <code>curl -sS -X POST http://MOTHERBEE:8080/hives/HIVE/vault/secrets \
   -H 'Content-Type: application/json' \
@@ -19613,7 +19591,6 @@ fn architect_index_html(state: &ArchitectState) -> String {
         const loadMoreBtn = document.getElementById('messages-load-more');
         const newPillBtn = document.getElementById('messages-new-pill');
         const sinceSelect = document.getElementById('messages-since');
-        const errorToggle = document.getElementById('messages-with-error');
         const statusPill = document.getElementById('messages-status-pill');
         const unconfiguredEl = document.getElementById('messages-unconfigured');
         const bodyEl = document.querySelector('.messages-view .messages-body');
@@ -19622,6 +19599,9 @@ fn architect_index_html(state: &ArchitectState) -> String {
         let initialLoaded = false;
         let rows = [];
         let nextCursor = null;
+        // Where the live tail goes on: the last row written (the list is in message time, the tail
+        // in the order SY.storage wrote them, since a stream's batch can arrive late).
+        let tailCursor = null;
         let selectedKey = null;
         let eventSource = null;
         let pendingNew = 0;
@@ -19656,25 +19636,13 @@ fn architect_index_html(state: &ArchitectState) -> String {
         function formatTimeOnly(iso) {{
           const t = iso.indexOf('T');
           if (t < 0) return iso;
-          return iso.slice(t + 1).replace('Z', '');
+          return iso.slice(t + 1, t + 13);
         }}
 
         function formatSize(bytes) {{
           if (bytes < 1024) return bytes + ' B';
           if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(1) + ' KB';
           return (bytes / (1024 * 1024)).toFixed(2) + ' MB';
-        }}
-
-        function statusClass(item) {{
-          if (item.has_error) return 'err';
-          if (!item.processed_at) return 'pending';
-          return 'ok';
-        }}
-
-        function statusGlyph(item) {{
-          if (item.has_error) return '!';
-          if (!item.processed_at) return '…';
-          return '✓';
         }}
 
         function identifierFor(item) {{
@@ -19685,17 +19653,17 @@ fn architect_index_html(state: &ArchitectState) -> String {
 
         function rowHtml(item) {{
           const id = identifierFor(item);
-          const subject = escapeHtml(item.subject);
+          const route = escapeHtml(item.from + ' → ' + (item.to || '(resolved)'));
           const idText = escapeHtml(id.text);
           return ''
             + '<div class="messages-row-head">'
-            + '<span class="messages-row-time">' + formatTimeOnly(item.received_at) + '</span>'
-            + '<span class="messages-row-subject" title="' + subject + '">' + subject + '</span>'
+            + '<span class="messages-row-time">' + formatTimeOnly(item.ts) + '</span>'
+            + '<span class="messages-row-route" title="' + route + '">' + route + '</span>'
             + '</div>'
             + '<div class="messages-row-meta">'
             + '<span class="messages-row-meta-id ' + id.cls + '" title="' + idText + '">' + idText + '</span>'
+            + '<span class="messages-row-kind">' + escapeHtml(item.msg_type) + '</span>'
             + '<span class="messages-row-meta-size">' + formatSize(item.size_bytes) + '</span>'
-            + '<span class="messages-row-status ' + statusClass(item) + '">' + statusGlyph(item) + '</span>'
             + '</div>';
         }}
 
@@ -19721,35 +19689,32 @@ fn architect_index_html(state: &ArchitectState) -> String {
             return;
           }}
           const meta = [
-            ['Subject', detail.subject],
-            ['Received', detail.received_at],
-            ['Dedupe key', detail.dedupe_key],
+            ['Time', detail.ts],
+            ['Stored', detail.stored_at],
+            ['From', detail.from],
+            ['To', detail.to || '(resolved)'],
+            ['Kind', detail.msg_type],
             ['ICH', detail.ich || '(none)'],
             ['Thread', detail.thread_id || '(none)'],
-            ['Attempts', String(detail.attempts)],
-            ['Processed', detail.processed_at || '(pending)'],
-            ['Size', formatSize(detail.size_bytes)]
+            ['Trace', detail.trace_id || '(none)'],
+            ['From ILK', detail.from_ilk],
+            ['To ILK', detail.to_ilk || '(none)'],
+            ['Size', formatSize(detail.size_bytes)],
+            ['Key', detail.dedupe_key]
           ];
-          if (detail.last_error) meta.push(['Error', detail.last_error]);
+          if (detail.tags && detail.tags.length) meta.push(['Tags', detail.tags.join(', ')]);
           const metaHtml = meta.map(function(pair) {{
-            const k = pair[0];
-            const v = pair[1];
-            const errCls = k === 'Error' ? ' err' : '';
-            return '<div class="messages-detail-meta-key">' + escapeHtml(k) + '</div>'
-              + '<div class="messages-detail-meta-value' + errCls + '">' + escapeHtml(v) + '</div>';
+            return '<div class="messages-detail-meta-key">' + escapeHtml(pair[0]) + '</div>'
+              + '<div class="messages-detail-meta-value">' + escapeHtml(pair[1]) + '</div>';
           }}).join('');
-          let payloadDisplay;
-          if (detail.payload_json !== null && detail.payload_json !== undefined) {{
-            payloadDisplay = JSON.stringify(detail.payload_json, null, 2);
-          }} else if (detail.payload_text) {{
-            payloadDisplay = detail.payload_text;
-          }} else {{
-            payloadDisplay = '(empty)';
-          }}
+          // Rows written before 0.1.76 keep only the payload.
+          const whole = detail.message !== null && detail.message !== undefined;
+          const payloadDisplay = JSON.stringify(whole ? detail.message : detail.content, null, 2);
+          const payloadTitle = whole ? 'Message' : 'Payload (this row keeps only the payload)';
           detailEl.innerHTML = ''
             + '<div class="messages-detail-meta">' + metaHtml + '</div>'
             + '<div class="messages-detail-json-head">'
-            + '<span class="messages-detail-json-title">Payload</span>'
+            + '<span class="messages-detail-json-title">' + escapeHtml(payloadTitle) + '</span>'
             + '<button class="messages-detail-copy" id="messages-detail-copy" type="button">Copy JSON</button>'
             + '</div>'
             + '<pre class="messages-detail-json" id="messages-detail-json"></pre>';
@@ -19765,7 +19730,6 @@ fn architect_index_html(state: &ArchitectState) -> String {
           const params = new URLSearchParams();
           params.set('limit', '200');
           params.set('since', sinceSelect.value);
-          if (errorToggle.checked) params.set('with_error', 'true');
           if (extra && extra.cursor) {{
             params.set('cursor_ts', extra.cursor.ts);
             params.set('cursor_dk', extra.cursor.dk);
@@ -19789,6 +19753,7 @@ fn architect_index_html(state: &ArchitectState) -> String {
             const data = await resp.json();
             rows = data.items || [];
             nextCursor = data.next_cursor || null;
+            tailCursor = data.tail_cursor || null;
             initialLoaded = true;
             pendingNew = 0;
             newPillBtn.hidden = true;
@@ -19841,7 +19806,8 @@ fn architect_index_html(state: &ArchitectState) -> String {
         }}
 
         function handleStreamEvent(item) {{
-          if (rows.length > 0 && rows[0].dedupe_key === item.dedupe_key) return;
+          tailCursor = {{ ts: item.stored_at, dk: item.dedupe_key }};
+          if (rows.some(function(r) {{ return r.dedupe_key === item.dedupe_key; }})) return;
           if (atTop) {{
             rows.unshift(item);
             if (rows.length > 1000) rows.length = 1000;
@@ -19855,11 +19821,10 @@ fn architect_index_html(state: &ArchitectState) -> String {
 
         function startStream() {{
           if (eventSource) return;
-          const top = rows[0];
           const params = new URLSearchParams();
-          if (top) {{
-            params.set('after_ts', top.received_at);
-            params.set('after_dk', top.dedupe_key);
+          if (tailCursor) {{
+            params.set('after_ts', tailCursor.ts);
+            params.set('after_dk', tailCursor.dk);
           }}
           const url = MESSAGES_STREAM_URL + (params.toString() ? ('?' + params.toString()) : '');
           try {{
@@ -19926,13 +19891,6 @@ fn architect_index_html(state: &ArchitectState) -> String {
           flushPending();
         }});
         sinceSelect.addEventListener('change', async function() {{
-          stopStream();
-          selectedKey = null;
-          renderDetail(null);
-          const ok = await loadInitial();
-          if (ok) startStream();
-        }});
-        errorToggle.addEventListener('change', async function() {{
           stopStream();
           selectedKey = null;
           renderDetail(null);

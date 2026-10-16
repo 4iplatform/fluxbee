@@ -13,7 +13,8 @@ Commands
   run VM SCRIPT [ARGS...]          run a local bash or python (.py) script on a VM
   versions                         core version and manifest hash per hive
   opa-status [HIVE...]             user OPA policy per hive: version, in_sync, published, router
-  health [--since HH:MM]           per VM: failed units, gate denials, routing.src drops (UTC)
+  health [--since HH:MM]           per VM: failed units, gate denials, routing.src drops, records
+                                   the router stream lost (UTC)
   build VERSION [--wait]           pull and build the .deb on the build VM (log /root/build-V.log)
   publish VERSION                  publish the built .deb to the apt repo on the build VM
   deploy VERSION --snapshot NAME [--drop OLD]
@@ -157,16 +158,20 @@ def cmd_opa_status(a):
         print(line)
 
 
-# Gate denials and routing.src drops are logged by the router only: reading its unit alone also
-# keeps out the guest agent's own log of this command (which contains the patterns).
-# A journal that cannot be read is reported, never counted as zero.
+# Gate denials, routing.src drops and the stream's losses are logged by the router only: reading
+# its unit alone also keeps out the guest agent's own log of this command (which contains the
+# patterns). The stream logs at most one line per 30 s with its losses by reason ("expired: 12");
+# `streamlost` sums them. A journal that cannot be read is reported, never counted as zero.
 HEALTH_SCRIPT = r"""
 if ! log=$(journalctl -u rt-gateway --since "%s" --no-pager -o cat 2>&1); then
   echo "journal unreadable: $(printf '%%s' "$log" | head -1)"; exit 1
 fi
 echo "failed=$(systemctl --failed --no-legend --plain | wc -l)" \
      "denials=$(printf '%%s\n' "$log" | grep -c 'dropped protected SYSTEM action')" \
-     "srcdrops=$(printf '%%s\n' "$log" | grep -c 'routing.src is not the sending node')"
+     "srcdrops=$(printf '%%s\n' "$log" | grep -c 'routing.src is not the sending node')" \
+     "streamlost=$(printf '%%s\n' "$log" | grep 'router stream lost records' \
+                   | sed 's/.*router stream lost records in the last [0-9]* s//' \
+                   | grep -oE ': [0-9]+' | awk '{s+=$2} END {print s+0}')"
 """
 
 
@@ -186,7 +191,7 @@ def health(since):
     ok = True
     for hive in hives():
         print("%-10s %s" % (hive, rows.get(hive, "no answer")))
-        ok = ok and rows.get(hive, "").startswith("failed=0 denials=0 srcdrops=0")
+        ok = ok and rows.get(hive, "") == "failed=0 denials=0 srcdrops=0 streamlost=0"
     return ok
 
 

@@ -20,6 +20,7 @@ mod send_normalization;
 pub mod socket;
 pub mod split;
 pub mod status;
+pub mod stream;
 pub mod thread;
 pub mod timer;
 pub mod vault;

@@ -542,6 +542,13 @@ async fn handle_embedded_connection(
         }
         if line.starts_with("SUB ") {
             let (subject, sid, queue) = parse_sub_command(line)?;
+            if queue
+                .as_deref()
+                .is_some_and(|queue| is_retired_durable_consumer(&subject, queue))
+            {
+                let _ = tx.send(b"-ERR 'retired durable consumer'\r\n".to_vec());
+                continue;
+            }
             let durable_consumer =
                 queue.and_then(|value| parse_durable_consumer_key(&subject, &value));
             add_embedded_subscriber(
@@ -1274,6 +1281,58 @@ fn parse_sub_command(line: &str) -> Result<(String, String, Option<String>), io:
     Ok((subject.to_string(), sid.to_string(), queue))
 }
 
+/// Durable consumers no node reads any more: SY.storage takes turns from the router stream since
+/// 0.1.76 (A-70). The router drops them from its broker once at start, and the broker refuses them
+/// after, so an old binary still running during an upgrade cannot bring one back: it would pin its
+/// subject up to the 50,000 cap, and store a second copy of each turn meanwhile.
+const RETIRED_DURABLE_CONSUMERS: &[(&str, &str)] =
+    &[(SUBJECT_STORAGE_TURNS, "durable.sy-storage.turns")];
+
+fn is_retired_durable_consumer(subject: &str, queue: &str) -> bool {
+    RETIRED_DURABLE_CONSUMERS
+        .iter()
+        .any(|(retired_subject, retired_queue)| {
+            *retired_subject == subject && *retired_queue == queue.trim()
+        })
+}
+
+/// Removes the retired durable consumers the broker at `endpoint` still keeps, so their subjects
+/// can be pruned again: a subject is pruned only up to its slowest consumer. Returns each one it
+/// removed, with how many messages it still had pending.
+pub async fn remove_retired_durable_consumers(endpoint: &str) -> Vec<(String, u64)> {
+    let mut removed = Vec::new();
+    for (subject, queue) in RETIRED_DURABLE_CONSUMERS {
+        if let Some(pending) = remove_durable_consumer(endpoint, subject, queue).await {
+            removed.push((format!("{subject}|{queue}"), pending));
+        }
+    }
+    removed
+}
+
+/// Removes one durable consumer; how many messages it still had pending, or None when the broker
+/// or the consumer is not there.
+async fn remove_durable_consumer(endpoint: &str, subject: &str, queue: &str) -> Option<u64> {
+    let addr = endpoint_to_addr(endpoint).ok()?;
+    let key = parse_durable_consumer_key(subject, queue)?;
+    let state = {
+        let registry = embedded_registry().lock().await;
+        Arc::clone(&registry.get(&addr)?.state)
+    };
+    let mut state = state.lock().await;
+    let consumer = state.durable_consumers.remove(&key)?;
+    let pending = state
+        .durable_streams
+        .get(subject)
+        .map(|stream| stream.last_seq.saturating_sub(consumer.acked_seq))
+        .unwrap_or(0);
+    state
+        .pending
+        .retain(|_, delivery| delivery.durable_consumer.as_deref() != Some(key.as_str()));
+    prune_stream_for_subject(&mut state, subject);
+    state.durable_dirty = true;
+    Some(pending)
+}
+
 fn parse_durable_consumer_key(subject: &str, queue: &str) -> Option<String> {
     let trimmed = queue.trim();
     if trimmed.is_empty() || !trimmed.starts_with(DURABLE_QUEUE_PREFIX) {
@@ -1646,6 +1705,61 @@ mod tests {
             .expect("stop embedded broker");
     }
 
+    /// A-70: SY.storage's old turns consumer is retired. The router drops the one its broker kept,
+    /// and an old binary subscribing again during an upgrade is refused, so it cannot bring it back.
+    #[tokio::test]
+    async fn a_retired_durable_consumer_is_removed_and_refused() {
+        let endpoint = free_endpoint();
+        let storage_dir = temp_storage_dir("retired-consumer");
+        start_embedded_broker_with_storage(&endpoint, Some(storage_dir.as_path()))
+            .await
+            .expect("start embedded broker with durable storage");
+        let key = "storage.turns|durable.sy-storage.turns".to_string();
+        let state = {
+            let addr = endpoint_to_addr(&endpoint).expect("addr");
+            let registry = embedded_registry().lock().await;
+            Arc::clone(&registry.get(&addr).expect("broker").state)
+        };
+        // The consumer a 0.1.75 snapshot holds.
+        state.lock().await.durable_consumers.insert(
+            key.clone(),
+            DurableConsumer {
+                subject: SUBJECT_STORAGE_TURNS.to_string(),
+                durable_name: key.clone(),
+                acked_seq: 0,
+            },
+        );
+        publish(&endpoint, SUBJECT_STORAGE_TURNS, br#"{"seq":1}"#)
+            .await
+            .expect("publish");
+
+        assert_eq!(
+            remove_retired_durable_consumers(&endpoint).await,
+            vec![(key.clone(), 1)]
+        );
+        assert!(remove_retired_durable_consumers(&endpoint).await.is_empty());
+
+        let subscriber =
+            NatsSubscriber::new(endpoint.clone(), SUBJECT_STORAGE_TURNS.to_string(), 10)
+                .with_queue("durable.sy-storage.turns");
+        let result = timeout(
+            Duration::from_secs(5),
+            subscriber.run(|_payload| async { Ok(()) }),
+        )
+        .await
+        .expect("the broker answers in time");
+        let err = result.expect_err("the subscription is refused");
+        assert!(
+            err.to_string().contains("retired durable consumer"),
+            "{err}"
+        );
+        assert!(!state.lock().await.durable_consumers.contains_key(&key));
+
+        stop_embedded_broker(&endpoint)
+            .await
+            .expect("stop embedded broker");
+    }
+
     #[tokio::test]
     async fn embedded_broker_recovers_durable_stream_after_restart() {
         let endpoint = free_endpoint();
@@ -1672,7 +1786,7 @@ mod tests {
         let calls = Arc::new(AtomicU64::new(0));
         let subscriber =
             NatsSubscriber::new(endpoint.clone(), SUBJECT_STORAGE_TURNS.to_string(), 10)
-                .with_queue("durable.sy-storage.turns");
+                .with_queue("durable.sy-cognition.turns");
         let calls_for_task = Arc::clone(&calls);
         let subscriber_task = tokio::spawn(async move {
             let _ = subscriber

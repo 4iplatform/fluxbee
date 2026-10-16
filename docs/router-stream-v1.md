@@ -1,6 +1,7 @@
 # Router stream — v1
 
-Status: design, reviewed once (2026-10-16). Finding A-70 (`lab/logbook/FINDINGS.md`).
+Status: design reviewed once (2026-10-16); stage 1a validated on 8.x (0.1.75); stage 1b built for
+0.1.76. Finding A-70 (`lab/logbook/FINDINGS.md`).
 
 The router gets a small stream of its own. It replaces the embedded NATS broker, and carries three
 kinds of data to SY.storage:
@@ -79,7 +80,8 @@ fixes the bugs the review found in today's router, SY.storage and SY.cognition (
   - **SY.storage never reconnects to postgres:** a closed connection is only logged, and a
     database it cannot use at start leaves it running without one until someone restarts it.
   - **`storage_inbox` retries failed rows only at startup.** It is also the message log: Archi's
-    Messages page reads it, and the AI replies `turns` dropped exist only there (Q7).
+    Messages page reads it, and the AI replies `turns` dropped exist only there (Q7, decided in
+    1b: Archi reads `turns`).
 
 What the stream reuses:
 - **Router-internal messages:** the router already consumes OPA_RELOAD itself and routes it to no
@@ -103,8 +105,8 @@ Every router runs a stream, as a task of its own process. The stream is also a n
     land on a sibling router.
   - It is spawned after the socket is bound and never awaited inside `Router::run`, which accepts
     nodes last: waiting for its HELLO there would deadlock.
-  - Its UUID is a UUIDv5 of the router's UUID, kept under `state/<router L2 name>/`, so no node
-    file under `state/nodes` can collide with it.
+  - Its UUID is persisted under `state/<router L2 name>/` (SDK `NodeUuidMode::Persistent`), so
+    no node file under `state/nodes` can collide with it.
 - **Its name is `RT.<router>.stream@<hive>`,** derived from `router_l2_name`
   (`JSR_ROUTER_NAME` may lack the `RT.` prefix): `RT.gateway.stream@motherbee`,
   `RT.gateway.stream@worker1`, and `RT.<switch>.stream@<hive>` for another router of the hive.
@@ -177,16 +179,24 @@ constants; the router starts reading `hive_role` for it.
 Each sink has its own cursor. A slow or absent sink falls behind on its own and holds back no
 other sink.
 
+**Stage 1b:** every subject goes to `SY.storage@motherbee` only. SY.cognition and SY.policy keep
+reading turns from NATS until stage 2 makes them sinks; the router still copies turns to NATS on
+the motherbee and the workers, where they read them, and no longer on the ingress and the egress.
+
 ### 2.4 The log on disk
 
-- **Where:** `/var/lib/fluxbee/stream/<router L2 name>/`, owned by the router.
-- **The thread:** all of it runs on the stream's own OS thread (D13).
-- **Segments:** append-only files named by their first seq, up to `STREAM_SEGMENT_BYTES` each.
-- **A record:** `[u32 len][u32 crc32][u64 seq][u64 ts_ms][u16 subject_len][subject][u16
-  producer_len][producer][payload]`.
-- **`next_seq`** is persisted next to the cursors, so seqs never restart under live cursors.
-- **Cursors:** `cursors.json` (sink name → last acked seq), rewritten by temp file and rename at
-  most once a second, and only up to what has been fsynced.
+- **Where:** `<state dir>/<router L2 name>/stream/` (`/var/lib/fluxbee/state/RT.gateway@<hive>/stream/`
+  on PROD), owned by the router.
+- **The thread:** all of it runs on the stream's own OS thread (D13). It places a record in the
+  in-memory log under a lock and writes it to disk after releasing it: the senders and the status
+  take that lock on the router's runtime threads, which never wait on the disk.
+- **Segments:** append-only files named by their first seq, up to `STREAM_SEGMENT_BYTES` each. A
+  write that fails closes the segment, and the next record starts a new one.
+- **A record:** `[u32 len][u32 checksum][u64 seq][u64 ts_ms][u8 source][u16 subject_len][subject]
+  [u16 producer_len][producer][payload]`; the checksum is FNV-1a folded to 32 bits.
+- **`state.json`:** `next_seq` and the cursors (sink name → last acked seq), rewritten by temp
+  file and rename at most once a second when they changed, and only up to what has been fsynced.
+  `next_seq` keeps the seqs from restarting under live cursors.
 - **Durability:**
   - every write goes to the file at once, so a router crash loses nothing written;
   - an fsync runs every `STREAM_FSYNC_INTERVAL_MS`, so a power cut loses at most that long.
@@ -195,10 +205,13 @@ other sink.
   - each cursor is capped at the last seq on disk;
   - cursors of sinks no longer in the table are dropped.
 - **Trim:**
-  - a segment is deleted when every sink's cursor is past it, or when its newest record is older
-    than the window;
-  - the newest segment is rolled first and never deleted, so an idle router keeps its seqs;
-  - records a sink had not acked when their segment went count as expired for that sink.
+  - a record leaves the log when every sink took it, or when it is past the window and no batch
+    carrying it waits for an ack;
+  - a record that leaves before one of its sinks took it counts as expired for that sink, once;
+  - a segment is deleted when every record in it left the log; when nothing is left, the newest
+    goes too, once `state.json` is saved, so a record stays on disk only until its sinks took it
+    (§4) and the next record starts a new segment;
+  - at a restart, the records past the window leave the log at once, counted the same way.
 - **Cap:** at `STREAM_MAX_BYTES`, new records are dropped and counted (D5). Nothing old is deleted
   to make room; age trimming frees space within the window.
 
@@ -211,7 +224,9 @@ other sink.
     serialized `STREAM_BATCH`. Each router hop re-serializes a message and adds a few fields, so
     the margin under the 128 KB frame stays;
   - `STREAM_BATCH {stream, records: [{seq, ts_ms, subject, producer, payload}]}`, with every
-    payload embedded as raw JSON (`RawValue`), byte for byte.
+    payload embedded as JSON. It round-trips through `serde_json::Value`, so its bytes can change
+    (key order), but the same record always yields the same bytes: a resent record keeps its
+    inbox key.
 - **The ack:** the sink answers `STREAM_ACK {up_to_seq}` to the stream's name, and the stream
   advances that sink's cursor.
   - The stream accepts an ack only when its router-stamped sender is that sink, it moves the
@@ -225,6 +240,9 @@ other sink.
 - **Expired:** a record older than `STREAM_MAX_AGE_SECS` when its turn comes is skipped for that
   sink and counted.
 - **Oversize:** a record that alone does not fit in a frame is skipped and counted.
+- **Counted once:** a skipped record is counted when the sink's cursor passes it, which happens
+  right away ahead of a batch; one met after the first record of a batch ends that batch and is
+  passed by the next plan. A batch sent again counts nothing more.
   - Only text over 64 KB goes to blobs, so turns between about 96 and 128 KB are a new loss.
   - NATS took up to 1 MB.
 
@@ -248,13 +266,19 @@ pub const STREAM_RETRY_MAX_MS: u64 = 8_000;
 pub const STREAM_FSYNC_INTERVAL_MS: u64 = 250;
 pub const STREAM_TURN_QUEUE: usize = 4_096;
 pub const STREAM_NODE_APPEND_QUEUE: usize = 1_024;
+/// Payload bytes waiting for the disk thread, both queues together.
+pub const STREAM_QUEUE_MAX_BYTES: u64 = 16 * 1024 * 1024;
 /// At most one alarm line per interval, with the counts since the last one (D5, "log reducido").
 pub const STREAM_ALARM_INTERVAL_SECS: u64 = 30;
 ```
 
 **The alarm:** when anything is dropped (cap, full queue, expired, oversize, refused), the stream
-logs one WARN line per `STREAM_ALARM_INTERVAL_SECS` with the counts by reason and subject. The
-counters are also in its status, and `lab/ops.py health` counts them per hive.
+logs one WARN line per `STREAM_ALARM_INTERVAL_SECS` with the counts by reason. The counters are
+also in its status, and `lab/ops.py health` sums them per hive (`streamlost`).
+
+A third bound covers the queue to the disk thread: `STREAM_QUEUE_MAX_BYTES` (16 MB) of payload
+waiting, both queues together, so a stalled disk cannot grow the router's memory; past it a record
+is dropped like on a full queue.
 
 ### 2.7 The sinks
 
@@ -267,8 +291,14 @@ counters are also in its status, and `lab/ops.py health` counts them per hive.
   - **No database, no ack.** If the connection closes, SY.storage exits and systemd restarts it.
     Today it only logs, and with the stream the backlog would expire meanwhile.
   - **Ingest:** in one transaction it upserts every record into `storage_inbox`, with the same key
-    as today, then acks up to the last seq. It processes the rows after the ack.
+    as today, then acks up to the last seq. A task of its own processes the new rows after the
+    ack, so an ack never waits for the previous batch's processing; past `STREAM_PROCESS_QUEUE`
+    batches the rows wait in the inbox for its retry.
   - **Checks on the producer:**
+    - every record's producer must be a node of the stream's hive: a router copies and takes only
+      what its own nodes send;
+    - a turn's message must name its producer as sender (`routing.src_l2_name`), the name Archi
+      shows;
     - `storage.cognition.*` must come from `SY.cognition@<the stream's hive>`;
     - usage records are checked as §2.14 says.
   - **Its INFO log line per system message** drops to debug for `STREAM_BATCH`.
@@ -282,6 +312,9 @@ counters are also in its status, and `lab/ops.py health` counts them per hive.
 
 ### 2.8 The SDK
 
+- **Built in 1b:** the wire contract, `fluxbee_sdk::stream` (the message names, the subjects, the
+  batch and ack shapes, the stream node names). The helpers below come with their first users,
+  cognition in stage 2 and the AI function in stage 3.
 - **Rust:**
   - `fluxbee_sdk::stream::append(sender, subject, payload)`: a `STREAM_APPEND` to the node's own
     router, fire and forget, no reply;
@@ -308,13 +341,16 @@ others like switches, joined by IRP. Each node picks a router by a hash of its n
 ### 2.10 Status
 
 - **The stream answers `STREAM_STATUS`:**
-  - appended, by subject;
+  - appended, turns and node appends;
   - delivered and expired, by sink;
   - dropped, by reason;
   - the backlog in records and bytes, and the age of the oldest;
   - the last ack per sink.
-- **SY.admin:** `GET /hives/{hive}/streams` asks every `RT.*.stream@<hive>` of that hive.
-- **`ops.py health`:** it adds the stream drops since the given time.
+- **SY.admin:** `GET /hives/{hive}/streams` (action `list_streams`) asks every
+  `RT.*.stream@<hive>` the LSA lists for that hive. A stream that does not answer is listed with
+  its error.
+- **`ops.py health`:** `streamlost` sums the losses the stream's alarm lines report since the given
+  time.
 
 ### 2.11 What dies with NATS (stage 2)
 
@@ -392,7 +428,8 @@ The stream depends on these, so they come first.
   - in insert order, with a cursor, so failing rows do not hold back the rest;
   - each failed retry counts as an attempt, up to 10.
 
-  Processed rows are not purged (Q7).
+  Processed rows were kept until Q7 was decided; since 1b they are purged after 24 h, once the
+  one-time backfill ran (Q7).
 - **The `turns` migration** runs once and does not touch the table again. Rolling back to 0.1.74
   or earlier needs the VM snapshot: the old code inserts with `ON CONFLICT (ctx, seq)`, which no
   longer has a unique index.
@@ -518,11 +555,17 @@ the ledger and the logbook.
   Does io.cloud show the root tenant's spending (Archi, SY.admin)?
 - **Q6 (stage 3): `ai_local_probe`.** It builds an OpenAI client directly and has no router. Delete
   it (repo cleanup)?
-- **Q7 (after stage 1): where the message log lives.**
-  - Archi's Messages page reads `storage_inbox` as the system-wide message log, so the inbox
-    cannot be purged.
-  - The AI replies `turns` dropped before 0.1.75 exist only there.
-  - Options:
-    - Archi reads `turns`, complete from 0.1.75 on, plus a one-time backfill of the old replies
-      from the inbox; then the inbox keeps only what dedupe and retries need;
-    - or the inbox stays the log, with no purge.
+- **Q7 (after stage 1): where the message log lives.** *Decided (operator, 2026-10-16): Archi
+  reads `turns` — "que lea turn es integrado mas que lo otro, si es asi hacerlo". Built in 1b:*
+  - **`turns` keeps the whole message** (`message`), its `thread_id` and `trace_id`. `ts` is when
+    the router copied it; `stored_at`, when SY.storage wrote it, which is the order Archi's live
+    tail follows, since a worker's batch can arrive late.
+  - **A one-time backfill** (`turns_backfill_from_inbox_v1`, recorded in `storage_migrations`)
+    copies the messages the inbox still holds:
+    - a 0.1.75 row gets its message;
+    - a row of before 0.1.75 (`legacy:<ctx>:<seq>`) takes its inbox key and message;
+    - an AI reply `turns` had dropped is inserted with its arrival time.
+  - **Then the inbox is purged:** processed rows older than 24 h, never before the backfill ran.
+    The inbox keeps only what dedupe and retries need.
+  - Archi's Messages page shows time, from, to, kind, ICH and thread; the detail shows the whole
+    message, or the payload alone on rows older than the backfill can reach.
