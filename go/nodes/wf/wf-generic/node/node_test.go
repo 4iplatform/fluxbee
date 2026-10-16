@@ -34,6 +34,46 @@ func TestLoadConfigAcceptsManagedSystemBlock(t *testing.T) {
 	}
 }
 
+// Every key the orchestrator writes in _system (build_node_system_block, plus launched_by at
+// spawn; pinned on the Rust side by the_system_block_keys_are_the_ones_the_wf_node_decodes). The
+// decoder is strict: an unknown key would make every WF node fail to load its config.
+func TestLoadConfigAcceptsEverySystemKeyTheOrchestratorWrites(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.json")
+	data := `{
+  "workflow_definition_path": "/tmp/wf.invoice.json",
+  "db_path": "/tmp/wf.db",
+  "sy_timer_l2_name": "SY.timer@motherbee",
+  "_system": {
+    "managed_by": "SY.orchestrator",
+    "node_name": "WF.invoice@motherbee",
+    "hive_id": "motherbee",
+    "relaunch_on_boot": false,
+    "config_version": 1,
+    "created_at_ms": 1,
+    "updated_at_ms": 2,
+    "runtime": "wf.invoice",
+    "runtime_version": "4",
+    "requested_runtime_version": "current",
+    "runtime_base": "wf.engine",
+    "package_path": "/var/lib/fluxbee/dist/runtimes/wf.invoice/4",
+    "ilk_id": "ilk:11111111-1111-4111-8111-111111111111",
+    "tenant_id": "tnt:11111111-1111-4111-8111-111111111111",
+    "launched_by": "archi"
+  }
+}`
+	if err := os.WriteFile(path, []byte(data), 0o644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+	cfg, err := LoadConfig(path)
+	if err != nil {
+		t.Fatalf("LoadConfig: %v", err)
+	}
+	if cfg.System == nil || cfg.System.LaunchedBy != "archi" {
+		t.Fatalf("expected _system.launched_by to be loaded, got %+v", cfg.System)
+	}
+}
+
 func TestLoadConfigAcceptsTenantIDAndTopLevelConfigVersion(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "config.json")

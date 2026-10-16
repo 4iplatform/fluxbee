@@ -1845,6 +1845,22 @@ async fn reconcile_persisted_custom_nodes(
             skipped = skipped.saturating_add(1);
             continue;
         };
+        // The list was read before this node's lock: a stop that finished in between cleared the
+        // flag, and the node stays stopped.
+        let still_relaunched =
+            load_node_effective_config(&node.config_path)
+                .ok()
+                .and_then(|config| {
+                    config
+                        .get("_system")
+                        .and_then(|system| system.get("relaunch_on_boot"))
+                        .and_then(|value| value.as_bool())
+                })
+                == Some(true);
+        if !still_relaunched {
+            skipped = skipped.saturating_add(1);
+            continue;
+        }
         let unit_active = systemd_unit_is_active(&unit).unwrap_or(false);
         let visible_in_router = local_inventory_has_node(state, &node.node_name);
         // Only a node whose unit we own is rebound; one visible without an active unit is left.
@@ -11380,12 +11396,21 @@ async fn list_tenant_nodes_flow(
     // Every connected hive at once, each bounded: Fluxbee Cloud waits 20 s for the whole answer.
     const PER_HIVE: Duration = Duration::from_secs(10);
     let root = hives_root();
-    let hives: Vec<String> = list_managed_hive_ids()
-        .into_iter()
-        .filter(|hive_id| {
-            *hive_id != state.hive_id && hive_status(&root, hive_id).as_deref() == Some("connected")
-        })
-        .collect();
+    let mut unreachable = Vec::new();
+    let mut hives: Vec<String> = Vec::new();
+    for hive_id in list_managed_hive_ids() {
+        if hive_id == state.hive_id {
+            continue;
+        }
+        match hive_status(&root, &hive_id) {
+            Some(status) if status == "connected" => hives.push(hive_id),
+            status => unreachable.push(serde_json::json!({
+                "hive_id": hive_id,
+                "error_code": "HIVE_NOT_CONNECTED",
+                "message": format!("its join status is {}", status.as_deref().unwrap_or("unknown")),
+            })),
+        }
+    }
     let answers = futures::future::join_all(hives.iter().map(|hive_id| {
         forward_system_action_to_hive_with_timeout(
             state,
@@ -11397,7 +11422,6 @@ async fn list_tenant_nodes_flow(
         )
     }))
     .await;
-    let mut unreachable = Vec::new();
     for (hive_id, answer) in hives.iter().zip(answers) {
         let response = answer.unwrap_or_else(|err| {
             serde_json::json!({
@@ -11406,6 +11430,21 @@ async fn list_tenant_nodes_flow(
                 "message": err.to_string(),
             })
         });
+        // A hive whose core predates the managed listing answers with what its router sees,
+        // every tenant's nodes: never passed on.
+        if response.get("status").and_then(|value| value.as_str()) == Some("ok")
+            && response
+                .get("inventory_source")
+                .and_then(|value| value.as_str())
+                != Some("managed_instances")
+        {
+            unreachable.push(serde_json::json!({
+                "hive_id": hive_id,
+                "error_code": "HIVE_OUTDATED",
+                "message": "its core predates the managed node listing: update its core",
+            }));
+            continue;
+        }
         let remote_nodes = (response.get("status").and_then(|value| value.as_str()) == Some("ok"))
             .then(|| {
                 response
@@ -11415,7 +11454,12 @@ async fn list_tenant_nodes_flow(
             })
             .flatten();
         match remote_nodes {
-            Some(remote_nodes) => nodes.extend(remote_nodes),
+            Some(remote_nodes) => nodes.extend(remote_nodes.into_iter().filter(|node| {
+                node.get("identity")
+                    .and_then(|identity| identity.get("tenant_id"))
+                    .and_then(|value| value.as_str())
+                    == Some(tenant_id)
+            })),
             None => unreachable.push(serde_json::json!({
                 "hive_id": hive_id,
                 "error_code": response.get("error_code").cloned().unwrap_or(serde_json::Value::Null),
@@ -13314,11 +13358,8 @@ fn node_requirements_met(
 /// Fluxbee Cloud, which acts only on the nodes it launched in its tenant (docs/ilk-tenant-model-v1.md
 /// §2.4). Checked on the hive that holds the node, before anything else: a node that does not meet
 /// them is answered as missing, as another tenant's key is.
-fn node_requirements_refusal(
-    state: &OrchestratorState,
-    node_name: &str,
-    payload: &serde_json::Value,
-) -> Option<serde_json::Value> {
+/// `require_tenant_id` and `require_launched_by`, when the caller set them.
+fn node_requirements(payload: &serde_json::Value) -> (Option<&str>, Option<&str>) {
     let required = |key: &str| {
         payload
             .get(key)
@@ -13326,8 +13367,67 @@ fn node_requirements_refusal(
             .map(str::trim)
             .filter(|value| !value.is_empty())
     };
-    let required_tenant = required("require_tenant_id");
-    let required_launcher = required("require_launched_by");
+    (
+        required("require_tenant_id"),
+        required("require_launched_by"),
+    )
+}
+
+fn node_not_found(node_name: &str) -> serde_json::Value {
+    serde_json::json!({
+        "status": "error",
+        "error_code": "NODE_NOT_FOUND",
+        "message": format!("node '{node_name}' not found"),
+        "node_name": node_name,
+    })
+}
+
+/// `node_requirements_refusal` for a node on another hive, checked here before the request is
+/// forwarded: a hive whose core predates the check would act on the node without it. It reads the
+/// node's config from its hive (NODE_CONFIG_GET, which every core answers); a node it cannot read
+/// is answered as missing.
+async fn remote_node_requirements_refusal(
+    state: &OrchestratorState,
+    target_hive: &str,
+    node_name: &str,
+    payload: &serde_json::Value,
+) -> Option<serde_json::Value> {
+    let (required_tenant, required_launcher) = node_requirements(payload);
+    if required_tenant.is_none() && required_launcher.is_none() {
+        return None;
+    }
+    let response = get_node_config_flow(
+        state,
+        &serde_json::json!({ "target": target_hive, "node_name": node_name }),
+    )
+    .await;
+    let config = (response.get("status").and_then(|value| value.as_str()) == Some("ok"))
+        .then(|| response.get("config").cloned())
+        .flatten();
+    let tenant = config.as_ref().and_then(config_tenant_id);
+    let launched_by = config
+        .as_ref()
+        .and_then(|config| config.get("_system"))
+        .and_then(|system| system.get("launched_by"))
+        .and_then(|value| value.as_str());
+    if node_requirements_met(
+        required_tenant,
+        required_launcher,
+        tenant.as_deref(),
+        launched_by,
+    ) {
+        None
+    } else {
+        Some(node_not_found(node_name))
+    }
+}
+
+fn node_requirements_refusal(
+    state: &OrchestratorState,
+    node_name: &str,
+    payload: &serde_json::Value,
+) -> Option<serde_json::Value> {
+    let (required_tenant, required_launcher) = node_requirements(payload);
     if required_tenant.is_none() && required_launcher.is_none() {
         return None;
     }
@@ -13351,12 +13451,7 @@ fn node_requirements_refusal(
     ) {
         return None;
     }
-    Some(serde_json::json!({
-        "status": "error",
-        "error_code": "NODE_NOT_FOUND",
-        "message": format!("node '{node_name}' not found"),
-        "node_name": node_name,
-    }))
+    Some(node_not_found(node_name))
 }
 
 fn managed_spawn_disallowed_reason(node_name: &str) -> Option<&'static str> {
@@ -17559,6 +17654,11 @@ async fn get_node_status_flow(
     };
 
     if target_hive != state.hive_id {
+        if let Some(refusal) =
+            remote_node_requirements_refusal(state, &target_hive, &node_name, payload).await
+        {
+            return refusal;
+        }
         let mut forwarded_payload = payload.clone();
         if let Some(obj) = forwarded_payload.as_object_mut() {
             obj.insert("target".to_string(), serde_json::json!(target_hive));
@@ -17637,12 +17737,19 @@ async fn get_node_status_flow(
     let mut runtime_version: Option<String> = None;
     let mut identity_ilk_id: Option<String> = None;
     let mut identity_tenant_id: Option<String> = None;
+    let mut launched_by: Option<String> = None;
+    let mut relaunch_on_boot: Option<bool> = None;
     if config_exists {
         match load_node_effective_config(&config_path) {
             Ok(config_payload) => {
                 config_valid = true;
                 config_version = Some(config_version_from_value(&config_payload));
                 if let Some(system) = config_payload.get("_system").and_then(|v| v.as_object()) {
+                    launched_by = system
+                        .get("launched_by")
+                        .and_then(|v| v.as_str())
+                        .map(str::to_string);
+                    relaunch_on_boot = system.get("relaunch_on_boot").and_then(|v| v.as_bool());
                     config_updated_at_ms = system.get("updated_at_ms").and_then(|v| v.as_u64());
                     runtime_requested_version = system
                         .get("requested_runtime_version")
@@ -17877,6 +17984,8 @@ async fn get_node_status_flow(
             "ilk_id": identity_ilk_id,
             "tenant_id": identity_tenant_id,
         },
+        "launched_by": launched_by,
+        "relaunch_on_boot": relaunch_on_boot,
     });
     if let Some(value) = last_error {
         node_status["last_error"] = value;
@@ -18986,6 +19095,11 @@ async fn start_or_restart_node_flow(
     };
 
     if target_hive != state.hive_id {
+        if let Some(refusal) =
+            remote_node_requirements_refusal(state, &target_hive, &node_name, payload).await
+        {
+            return refusal;
+        }
         let mut forwarded_payload = payload.clone();
         if let Some(obj) = forwarded_payload.as_object_mut() {
             obj.insert("target".to_string(), serde_json::json!(target_hive));
@@ -19183,6 +19297,11 @@ async fn kill_node_flow(
     };
 
     if target_hive != state.hive_id {
+        if let Some(refusal) =
+            remote_node_requirements_refusal(state, &target_hive, node_name_ref, payload).await
+        {
+            return refusal;
+        }
         let mut forwarded_payload = payload.clone();
         if let Some(obj) = forwarded_payload.as_object_mut() {
             obj.insert("target".to_string(), serde_json::json!(target_hive));
@@ -19223,10 +19342,22 @@ async fn kill_node_flow(
     }
     let unit_was_active = match systemd_unit_is_active(&unit) {
         Ok(false) => {
-            // A stop of a node that is down right now (between relaunches) still lasts.
+            // A stop of a node that is down right now still lasts. "Down" includes a node waiting
+            // for systemd's next automatic restart (a crash loop): the stop cancels that too.
             if !purge_instance
                 && node_effective_config_path(state, node_name_ref).is_ok_and(|path| path.is_file())
             {
+                if let Err(err) = execute_on_hive(state, &target_hive, &cmd, "kill_node") {
+                    return serde_json::json!({
+                        "status": "error",
+                        "error_code": "KILL_FAILED",
+                        "message": err.to_string(),
+                        "target": target_hive,
+                        "node_name": validated_node_name,
+                        "unit": unit,
+                        "purge_instance": purge_instance,
+                    });
+                }
                 let recorded = set_node_relaunch_on_boot(state, node_name_ref, false);
                 return serde_json::json!({
                     "status": "ok",
@@ -31435,16 +31566,39 @@ blob:
                 "execute_on_hive(",
             ],
         );
-        // A stop lasts on both ways out: the node already down, and the stop itself.
+        // A stop lasts on both ways out, the node already down (a crash loop waiting for its next
+        // restart included) and running: each stops the unit, then clears the flag.
         let kill = body("async fn kill_node_flow(");
-        let stopped = kill.find("execute_on_hive(").expect("the stop");
-        assert!(kill[..stopped].contains("set_node_relaunch_on_boot(state, node_name_ref, false)"));
-        assert!(kill[stopped..].contains("set_node_relaunch_on_boot(state, node_name_ref, false)"));
+        let clears: Vec<&str> = kill
+            .split("set_node_relaunch_on_boot(state, node_name_ref, false)")
+            .collect();
+        assert_eq!(clears.len(), 3, "two ways a stop clears the flag");
+        for before in &clears[..2] {
+            assert!(
+                before.contains("execute_on_hive("),
+                "a stop before the flag is cleared"
+            );
+        }
+        // A node on another hive is checked here before the request goes there: a hive whose core
+        // predates the check would act without it.
+        for name in [
+            "async fn kill_node_flow(",
+            "async fn start_or_restart_node_flow(",
+            "async fn get_node_status_flow(",
+        ] {
+            in_order(
+                name,
+                &[
+                    "remote_node_requirements_refusal(",
+                    "forward_system_action_to_hive(",
+                ],
+            );
+        }
         in_order(
             "async fn get_node_status_flow(",
             &[
                 "forward_system_action_to_hive(",
-                "node_requirements_refusal(",
+                "= node_requirements_refusal(state, &node_name, payload)",
             ],
         );
         in_order(
@@ -32875,6 +33029,55 @@ blob:
         assert_eq!(inventory[0]["relaunch_on_boot"], false);
 
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// go/nodes/wf/wf-generic/node/node.go decodes the `_system` block strictly
+    /// (ManagedSystemConfig): every key written here must be there too, and in its
+    /// TestLoadConfigAcceptsEverySystemKeyTheOrchestratorWrites. A key added here alone took every
+    /// WF node down in the stage-4 review (2026-10-15).
+    #[test]
+    fn the_system_block_keys_are_the_ones_the_wf_node_decodes() {
+        let mut system = build_node_system_block(
+            "WF.x@motherbee",
+            "motherbee",
+            Some("wf.x"),
+            Some("1"),
+            Some("current"),
+            Some("wf.engine"),
+            Some("/p"),
+            Some("ilk:x"),
+            Some("tnt:x"),
+            1,
+        );
+        // As the spawn adds it.
+        system["launched_by"] = serde_json::json!("archi");
+        let mut keys: Vec<&str> = system
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            vec![
+                "config_version",
+                "created_at_ms",
+                "hive_id",
+                "ilk_id",
+                "launched_by",
+                "managed_by",
+                "node_name",
+                "package_path",
+                "relaunch_on_boot",
+                "requested_runtime_version",
+                "runtime",
+                "runtime_base",
+                "runtime_version",
+                "tenant_id",
+                "updated_at_ms",
+            ]
+        );
     }
 
     /// Stage 4 (docs/ilk-tenant-model-v1.md §2.4): who launched a node comes from SY.admin's stamp;

@@ -41,6 +41,10 @@ type ManagedSystemConfig struct {
 	PackagePath    string `json:"package_path,omitempty"`
 	IlkID          string `json:"ilk_id,omitempty"`
 	TenantID       string `json:"tenant_id,omitempty"`
+	// Who launched the node (cloud, archi, operator, system), stamped by SY.admin at spawn
+	// (docs/ilk-tenant-model-v1.md §2.4). This struct decodes the orchestrator's _system block
+	// strictly: every key the orchestrator writes must be here.
+	LaunchedBy string `json:"launched_by,omitempty"`
 }
 
 // LoadConfig reads and validates a config.json file.

@@ -5,7 +5,7 @@ set -euo pipefail
 # - builds fluxbee-publish + ai-test-gov + io-test
 # - publishes temporary full_runtime fixtures for AI.test.gov and IO.test
 # - spawns AI.test.gov as managed custom node
-# - kills the node and waits until it is no longer visible in router inventory
+# - takes the node down as a reboot does and waits until it is no longer visible in router inventory
 # - restarts sy-orchestrator to trigger bootstrap reconcile
 # - verifies AI.test.gov is relaunched from persisted config.json
 # - spawns IO.test and validates a real routed reply handled by AI.test.gov
@@ -667,8 +667,11 @@ fi
 echo "Step 6/11: wait frontdesk active before simulated reboot"
 frontdesk_lifecycle_before="$(wait_node_active "$FRONTDESK_NODE_NAME")"
 
-echo "Step 7/11: kill frontdesk and wait until STOPPED + not visible"
-kill_node "$FRONTDESK_NODE_NAME"
+echo "Step 7/11: take frontdesk down as a reboot does, and wait until STOPPED + not visible"
+# Not kill_node: since 0.1.68 that is a stop that lasts (FINDINGS A-67), which the reconcile leaves
+# down. A reboot takes the transient unit away without touching the node's relaunch flag.
+frontdesk_unit="fluxbee-node-$(printf '%s' "$FRONTDESK_NODE_NAME" | sed 's/[^A-Za-z0-9._-]/-/g')"
+as_root_local systemctl stop "$frontdesk_unit"
 wait_node_stopped_and_not_visible "$FRONTDESK_NODE_NAME"
 
 echo "Step 8/11: restart sy-orchestrator to trigger bootstrap reconcile"

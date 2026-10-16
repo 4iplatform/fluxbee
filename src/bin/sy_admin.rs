@@ -5667,6 +5667,19 @@ fn authorize_channel_command(
 /// secrets it owns.
 const ORCHESTRATOR_TEARDOWN_ACTIONS: &[&str] = &["delete_ilk", "vault_list", "vault_delete"];
 
+/// Actions Fluxbee Cloud relays since stage 4 (docs/ilk-tenant-model-v1.md §2.4) that every other
+/// mesh caller could already call, or reads like them: putting them on the Cloud surface must not
+/// take them away from anyone else (the stage-4 review found the lab's diagnostic nodes cut off).
+/// For IO.cloud they stay bounded by enforce_cloud_relay_content and stamp_relay_facts.
+const CLOUD_SHARED_ACTIONS: &[&str] = &[
+    "get_tenant",
+    "list_tenants",
+    "list_tenant_nodes",
+    "get_node_status",
+    "start_node",
+    "kill_node",
+];
+
 /// Relay gate for the Fluxbee Cloud provisioning actions (`IO_CLOUD_EXPOSED_ACTIONS`). These are
 /// reachable from the internet (Cloud -> edge -> IO.cloud -> here), so over the MESH they may ONLY
 /// originate from IO.cloud in this admin's hive — the internal relay. `caller==None`
@@ -5717,9 +5730,10 @@ fn authorize_cloud_relay(
         ));
     }
     // All OTHER callers: a non-exposed action is not this gate's concern (other per-action gates /
-    // trusted internal paths apply). The exposed provisioning actions may originate over the mesh
-    // ONLY from IO.cloud (handled above), apart from an orchestrator's node teardown (below).
-    if !IO_CLOUD_EXPOSED_ACTIONS.contains(&action) {
+    // trusted internal paths apply), and neither is one Cloud shares with everyone else. The
+    // exposed provisioning actions may originate over the mesh ONLY from IO.cloud (handled above),
+    // apart from an orchestrator's node teardown (below).
+    if !IO_CLOUD_EXPOSED_ACTIONS.contains(&action) || CLOUD_SHARED_ACTIONS.contains(&action) {
         return Ok(());
     }
     let Some(caller) = caller_l2_name else {
@@ -15640,11 +15654,14 @@ mod tests {
                 authorize_cloud_relay(Some("SY.architect@motherbee"), action, "motherbee").is_ok(),
                 "{action}"
             );
-            // Only the admin hive's Archi.
-            assert!(
-                authorize_cloud_relay(Some("SY.architect@worker1"), action, "motherbee").is_err(),
-                "{action}"
-            );
+            // Only the admin hive's Archi, but for what Cloud shares with every mesh caller.
+            if !CLOUD_SHARED_ACTIONS.contains(action) {
+                assert!(
+                    authorize_cloud_relay(Some("SY.architect@worker1"), action, "motherbee")
+                        .is_err(),
+                    "{action}"
+                );
+            }
         }
     }
 
@@ -15981,13 +15998,48 @@ mod tests {
                 "the channel exception must not open '{still_denied}'"
             );
         }
+        // The actions Cloud shares since stage 4 stay open to the other mesh callers, as before;
+        // the rest of the Cloud surface stays IO.cloud's.
+        for shared in CLOUD_SHARED_ACTIONS {
+            assert!(
+                authorize_cloud_relay(
+                    Some("WF.admin.internal.diag@motherbee"),
+                    shared,
+                    "motherbee"
+                )
+                .is_ok(),
+                "{shared} must stay open to the other mesh callers"
+            );
+            assert!(IO_CLOUD_EXPOSED_ACTIONS.contains(shared), "{shared}");
+        }
+        for cloud_only in [
+            "run_node",
+            "vault_put",
+            "create_tenant",
+            "update_tenant",
+            "delete_tenant",
+        ] {
+            assert!(
+                authorize_cloud_relay(
+                    Some("WF.admin.internal.diag@motherbee"),
+                    cloud_only,
+                    "motherbee"
+                )
+                .is_err(),
+                "{cloud_only}"
+            );
+        }
         // A channel command from a NON-IO caller is not this gate's business (it has no relay
         // privilege to contain) — `authorize_channel_command` rejects it downstream on the I1 rule.
         assert!(
             authorize_cloud_relay(Some("AI.worker@motherbee"), "externalize", "motherbee").is_ok()
         );
 
-        for action in IO_CLOUD_EXPOSED_ACTIONS {
+        // What Cloud shares with every mesh caller is checked above.
+        for action in IO_CLOUD_EXPOSED_ACTIONS
+            .iter()
+            .filter(|action| !CLOUD_SHARED_ACTIONS.contains(*action))
+        {
             // Trusted internal path (caller==None: HTTP operator / executor) — allowed.
             assert!(authorize_cloud_relay(None, action, "motherbee").is_ok());
             // Over the mesh, ONLY IO.cloud in the admin's hive may relay it.

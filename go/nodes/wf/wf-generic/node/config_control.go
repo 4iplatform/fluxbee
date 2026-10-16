@@ -80,6 +80,9 @@ func loadConfigFromPayload(payload []byte, configPath string, system *ManagedSys
 		if cfg.System.TenantID != "" {
 			merged.TenantID = cfg.System.TenantID
 		}
+		if cfg.System.LaunchedBy != "" {
+			merged.LaunchedBy = cfg.System.LaunchedBy
+		}
 		cfg.System = &merged
 	}
 	if err := finalizeConfig(&cfg, configPath); err != nil {

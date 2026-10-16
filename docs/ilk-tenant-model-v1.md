@@ -440,6 +440,18 @@ the same node), assign, list, delete.
 - **Health:** whether a node runs comes from the orchestrator, for every node. Its health is what
   the node reports, and IO nodes from older eras may answer unknown: the IO family is still to be
   normalized.
+- **Limits, documented:**
+  - nodes launched before 0.1.68 carry no `launched_by`: Cloud sees them and cannot start, stop
+    or delete them; the operator handles them;
+  - `launched_by` is SY.admin's stamp on its own path; a system node that asks the orchestrator
+    to launch directly (SY.wf-rules) is taken at its word, as every node name is on one host
+    (FINDINGS A-22, A-65);
+  - a hive whose core predates 0.1.68 does not check Cloud's requirement itself: the motherbee
+    checks it before forwarding (it reads the node's config there), and `list_nodes` lists that
+    hive as outdated instead of passing on what its router sees;
+  - the node actions Cloud relays (`get_node_status`, `start_node`, `kill_node`) and the tenant
+    reads stay open to every other mesh caller, as they were (A-62 is parked); only IO.cloud is
+    bound by Cloud's rules.
 
 **Cutting access, from the narrowest to the widest:**
 - unassign or delete a credential;

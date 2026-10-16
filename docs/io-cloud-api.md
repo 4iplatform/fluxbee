@@ -601,7 +601,9 @@ until it reloads; revoking the credential at the provider is what makes it usele
 | `IDENTITY_REGISTER_FAILED`, `CONFIG_WRITE_FAILED`, `SERVICE_FAILED`, `SPAWN_FAILED` | the hive could not launch it; for a deleted tenant, `IDENTITY_REGISTER_FAILED` with `TENANT_DELETED` in the detail |
 
 The hive records that you launched it (`launched_by: "cloud"`): only those nodes can you start, stop
-or delete. Configuring a node after it is launched, routing it or wiring it into a solution is the
+or delete. Nodes launched before 0.1.68 carry no `launched_by`: `list_nodes` shows them
+(`launched_by: null`), and start, stop and delete answer `NODE_NOT_FOUND`; the operator handles
+them. Configuring a node after it is launched, routing it or wiring it into a solution is the
 operator's work, through Archi.
 
 #### `list_nodes`
@@ -627,16 +629,17 @@ You see a node's state, not how the hive runs it: no process, unit or host paths
   an older one may answer `UNKNOWN`.
 - `identity.ilk_id` is what `list_tokens` shows in `assigned_ilks`.
 - `relaunch_on_boot: false` means it was stopped and stays stopped until `start_node`.
-- A hive that did not answer in time is listed in `unreachable_hives`; its nodes are missing from
-  `nodes`, never left out in silence.
+- A hive whose nodes are missing from `nodes` is listed in `unreachable_hives`, never left out in
+  silence: it did not answer in time, it is not connected (`HIVE_NOT_CONNECTED`), or its core
+  predates 0.1.68 (`HIVE_OUTDATED`, the operator updates it).
 - A node appears once it really exists, so after `provision_node` read it here, not from your own
   records.
 
 #### `get_node_status`
 
 `tenant_id` at the root + `params.node_name` (`IO.…@hive`). The same view as `list_nodes`, for one
-node, plus when the hive looked (`observed_at`), where the health came from (`health_source`) and
-the node's last error when it reported one:
+node (`launched_by` and `relaunch_on_boot` included), plus when the hive looked (`observed_at`),
+where the health came from (`health_source`) and the node's last error when it reported one:
 
 ```json
 {"status":"ok","op":"get_node_status","result":{"status":"ok","node_status":{
@@ -661,8 +664,11 @@ other node answers `NODE_NOT_FOUND`, exactly as one that does not exist.
 
 ```json
 {"status":"ok","op":"stop_node","result":{"status":"ok","state":"stopped",
- "node_name":"IO.slack.acme@motherbee","unit_was_active":true,"relaunch_on_boot":false, …}}
+ "node_name":"IO.slack.acme@motherbee","unit_was_active":true,"relaunch_on_boot":false}}
 ```
+
+The answer says what happened (`state`: `started`, `already_running`, `stopped`, `deleted`), never
+how: no unit, signal or host path.
 
 To cut a node's access without stopping it, take its credential away (`assign_token`) or delete
 the credential (`delete_token`); to cut a whole tenant, suspend it (`update_tenant`).

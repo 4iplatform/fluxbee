@@ -1447,10 +1447,18 @@ async fn dispatch_cloud_op(
 fn cloud_view(op: &str, payload: Value) -> Value {
     fn node_view(node: &Value) -> Value {
         let field = |key: &str| node.get(key).cloned().unwrap_or(Value::Null);
+        // IO, AI, WF...: the first segment of the name when the hive does not say.
+        let kind = node.get("kind").cloned().unwrap_or_else(|| {
+            node.get("node_name")
+                .and_then(Value::as_str)
+                .and_then(|name| name.split('.').next())
+                .map(|kind| json!(kind))
+                .unwrap_or(Value::Null)
+        });
         let mut view = json!({
             "node_name": field("node_name"),
             "hive": node.get("hive").or_else(|| node.get("hive_id")).cloned().unwrap_or(Value::Null),
-            "kind": field("kind"),
+            "kind": kind,
             "lifecycle_state": field("lifecycle_state"),
             "health_state": field("health_state"),
             "runtime": {
@@ -1493,6 +1501,27 @@ fn cloud_view(op: &str, payload: Value) -> Value {
             }),
             None => payload,
         },
+        // What happened to the node, not how: no unit, signal, host path or timer report.
+        "start_node" | "stop_node" | "delete_node" => {
+            let mut view = serde_json::Map::new();
+            for key in [
+                "status",
+                "state",
+                "node_name",
+                "hive",
+                "relaunch_on_boot",
+                "unit_was_active",
+                "instance_purged",
+            ] {
+                if let Some(value) = payload.get(key) {
+                    view.insert(key.to_string(), value.clone());
+                }
+            }
+            if op == "delete_node" && !view.contains_key("state") {
+                view.insert("state".to_string(), json!("deleted"));
+            }
+            Value::Object(view)
+        }
         _ => payload,
     }
 }
@@ -1508,7 +1537,7 @@ async fn handle_local_cloud_op(
     match op {
         "register_human" => handle_register_human(sender, state, msg).await,
         // FAST identity reads straight from the local identity SHM — NO mesh round-trip.
-        "get_ilk" | "get_tenant" | "list_ilks" => handle_shm_read(state, msg, op),
+        "get_ilk" | "list_ilks" => handle_shm_read(state, msg, op),
         // Discovery: return the shared catalog (relay + local, with help) so Cloud knows its surface.
         "list_cloud_actions" => json!({
             "status": "ok",
@@ -2743,6 +2772,27 @@ mod tests {
         assert_eq!(status["node_status"]["hive"], "motherbee");
         assert_eq!(status["node_status"]["runtime"]["version"], "0.1.68");
         assert!(status["node_status"].get("process").is_none());
+        // Starting, stopping and deleting: what happened, not the unit, signal or host paths.
+        let stopped = cloud_view(
+            "stop_node",
+            json!({"status": "ok", "state": "stopped", "node_name": "IO.slack.a@motherbee",
+                   "unit": "fluxbee-node-x", "signal": "SIGTERM", "relaunch_on_boot": false,
+                   "unit_was_active": true}),
+        );
+        assert_eq!(
+            stopped,
+            json!({"status": "ok", "state": "stopped", "node_name": "IO.slack.a@motherbee",
+                   "relaunch_on_boot": false, "unit_was_active": true})
+        );
+        let deleted = cloud_view(
+            "delete_node",
+            json!({"status": "ok", "node_name": "IO.slack.a@motherbee", "instance_purged": true,
+                   "removed_path": "/var/lib/fluxbee/nodes/IO/x", "timer_purge": {"status": "ok"}}),
+        );
+        assert_eq!(deleted["state"], "deleted");
+        assert!(deleted.get("removed_path").is_none() && deleted.get("timer_purge").is_none());
+        // The kind comes from the name when the hive does not say it.
+        assert_eq!(status["node_status"]["kind"], "IO");
         // Any other op answers as the hive does.
         assert_eq!(cloud_view("list_tokens", json!({"x": 1})), json!({"x": 1}));
     }

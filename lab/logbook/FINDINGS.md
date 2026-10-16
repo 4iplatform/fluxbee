@@ -1029,6 +1029,25 @@ Visto al arreglar los e2e de A-37, leyendo `src/router/mod.rs` y `src/shm/mod.rs
     nodo que se cae solo se sigue relanzando.
   - **La palabra:** el contrato de Cloud dice tenant, nunca empresa (85 lugares).
   - **`a5f1b2a`** sale en este release: el rechazo de `set_ilk_tenant` contesta el código solo.
+- **Revisión (una ronda): 3 mayores, 4 menores y detalles, arreglados antes del build.**
+  - **Mayor 1:** todo nodo WF lanzado con esta versión caía en bucle. El nodo WF en Go lee el
+    bloque `_system` en estricto y no conocía `launched_by`. Lo aprendió, y un test en Rust fija
+    las claves del bloque contra el de Go. El build en curso se frenó.
+  - **Mayor 2:** con un spoke de core viejo, Cloud podía parar o borrar nodos de otros, y
+    `list_nodes` le pasaba todo el inventario del router de ese spoke. Ahora el motherbee chequea
+    la condición antes de reenviar, leyendo la config del nodo allá, y `list_nodes` filtra por
+    tenant y marca el hive como desactualizado.
+  - **Mayor 3:** parar un nodo en bucle de caídas (esperando el próximo reinicio de systemd)
+    contestaba "parado" sin pararlo. Ahora ese camino también para la unidad.
+  - **Menores:**
+    - el relanzamiento vuelve a leer la marca después de tomar el lock del nodo;
+    - las respuestas de arrancar, parar y borrar ya no muestran unidad ni rutas;
+    - el estado de un nodo trae `launched_by` y `relaunch_on_boot`;
+    - las acciones que Cloud comparte siguen abiertas a los otros llamadores de la malla (los
+      nodos de diagnóstico del laboratorio se habían quedado afuera);
+    - el script de reinicio del laboratorio baja el nodo como un reinicio, no con un stop.
+  - **Documentados:** los nodos lanzados antes de 0.1.68 no los maneja Cloud; `launched_by` de un
+    pedido directo al orquestador se toma como viene (A-22).
 - **Validación en 8.x:** pendiente, con 0.1.68.
 
 ### A-66 ✅ VALIDADO EN 8.x (0.1.67, 2026-10-15) — Un tenant suspendido seguía arrancando nodos, y borrar un tenant marcaba a su gente
