@@ -8,15 +8,18 @@ import (
 )
 
 // wfRulesRequestBudget bounds one request to SY.wf-rules end to end (publish, purge, the node's
-// rebind and restart, or its launch), so it answers before SY.admin stops waiting for it (45 s),
-// and Archi waits longer still (60 s). A deploy that outlived its callers would change state after
+// rebind and restart, or its launch), so it answers before SY.admin stops waiting for it (75 s),
+// and Archi waits longer still (90 s). A deploy that outlived its callers would change state after
 // they had reported a timeout (A-68).
-const wfRulesRequestBudget = 35 * time.Second
+const wfRulesRequestBudget = 60 * time.Second
 
 // runtimeSyncBudget bounds how long a deploy waits for the package it just published to reach this
-// hive. Publishing happens on the motherbee; a worker gets the package through Syncthing (~11 s
-// measured on the 8.x hive), while on the motherbee it is there at once.
-const runtimeSyncBudget = 20 * time.Second
+// hive, whole (manifest, package.json, flow/definition.json). Publishing happens on the motherbee,
+// where it is there at once; a worker gets it through Syncthing: ~11 s usually, but more than 20 s
+// when its runtimes folder is retrying a failed pull — a workflow delete just before makes it fail
+// on the deleted directories and retry (0.1.70 gate on 8.x, A-68). The wait ends as soon as the
+// package is there.
+const runtimeSyncBudget = 45 * time.Second
 
 func newRequestContext() (context.Context, context.CancelFunc) {
 	return context.WithTimeout(context.Background(), wfRulesRequestBudget)

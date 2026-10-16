@@ -8919,10 +8919,11 @@ async fn handle_wf_rules_http(
 }
 
 /// How long the admin waits for SY.wf-rules: longer than the deadline SY.wf-rules gives a request
-/// end to end (35 s: publish, purge, the node's rebind and restart or launch), so the answer is
-/// never lost to a timeout while the deploy goes on; Archi waits longer still (60 s). A-68.
+/// end to end (60 s: publish, purge, waiting for the package to reach a worker, the node's rebind
+/// and restart or launch), so the answer is never lost to a timeout while the deploy goes on; Archi
+/// waits longer still (90 s). A-68.
 fn wf_rules_request_timeout() -> Duration {
-    Duration::from_secs(env_timeout_secs("JSR_ADMIN_WF_RULES_TIMEOUT_SECS").unwrap_or(45))
+    Duration::from_secs(env_timeout_secs("JSR_ADMIN_WF_RULES_TIMEOUT_SECS").unwrap_or(75))
 }
 
 async fn handle_wf_rules_query(

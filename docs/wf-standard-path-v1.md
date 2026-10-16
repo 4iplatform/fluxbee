@@ -113,6 +113,12 @@ deploy or delete WF nodes, which it now does under its own gate at the admin.
 admin's `remove_runtime_version` on every hive, the motherbee included. Before, on the motherbee it
 deleted them and rewrote the manifest itself, racing the admin's own writes.
 
+**The current version goes last.** The admin refuses to remove a runtime's current version while
+others remain (`RUNTIME_CURRENT_CONFLICT`). SY.wf-rules orders by its own copy of the manifest, and
+a version refused as current is tried again once the others are gone. A worker's copy can lag
+behind the motherbee's: after a rollback the 0.1.70 gate saw a delete on worker1 stop at that
+refusal and leave the packages behind.
+
 **A rebind carries only the binding.** `set_node_config` merges, so the node's operator config stays
 as it is without being copied back. Copying it carried along the keys an older WF node had written
 at the top of its file.
@@ -132,16 +138,19 @@ Known gaps:
 - another mesh caller of `wf_rules_*` is recorded as `SY.wf-rules@<hive>`.
 
 **Timeouts, nested so each caller outlasts what it waits for:**
-- **SY.wf-rules** gives each request one deadline of 35 s, shared by every call it makes: the
+- **SY.wf-rules** gives each request one deadline of 60 s, shared by every call it makes: the
   publish, the purge, then the rebind and restart, or the launch. The retries while a package
-  syncs stop at that deadline.
+  syncs to a worker (up to 45 s) stop at that deadline. The 0.1.70 gate measured more than 20 s
+  when the worker's runtimes folder was retrying a failed pull: a workflow delete just before
+  makes Syncthing fail on the deleted directories and retry. The 0.1.70 build had 35 s and 20 s,
+  and its update on worker1 timed out waiting.
 - **Per call within it:**
   - `get_node_config`, `set_node_config`, `get_node_status`: 10 s;
-  - `run_node`, `restart_node`: 15 s, inside the 20 s budget for the package to reach a worker;
+  - `run_node`, `restart_node`: 15 s, inside the 45 s budget for the package to reach a worker;
   - `kill_node` with purge: 25 s, as for IO.cloud;
   - the admin calls for publish and remove: 5 s.
-- **SY.admin** waits 45 s for SY.wf-rules (`JSR_ADMIN_WF_RULES_TIMEOUT_SECS`).
-- **Archi** waits 60 s for the admin on `wf_rules_*` (`JSR_ARCHITECT_WF_RULES_TIMEOUT_SECS`).
+- **SY.admin** waits 75 s for SY.wf-rules (`JSR_ADMIN_WF_RULES_TIMEOUT_SECS`).
+- **Archi** waits 90 s for the admin on `wf_rules_*` (`JSR_ARCHITECT_WF_RULES_TIMEOUT_SECS`).
 
 The 30 s Archi used to wait, the same as the admin's own wait, lost the answer of a deploy near the
 limit.

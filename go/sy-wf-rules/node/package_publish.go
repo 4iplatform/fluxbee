@@ -183,8 +183,10 @@ func (s *Service) purgeWorkflowPackages(ctx context.Context, workflowName string
 }
 
 // purgeOnPrimary removes versions from the motherbee's dist. The admin refuses to remove a
-// runtime's current version while other versions remain, so the current one (per this hive's copy
-// of the manifest) goes last.
+// runtime's current version while other versions remain (RUNTIME_CURRENT_CONFLICT), so the current
+// one goes last: first by this hive's copy of the manifest, and a version refused as current is
+// tried again once the others are gone, since a worker's copy can lag behind the motherbee's (a
+// rollback moves the current version back; 0.1.70 gate, A-68).
 func (s *Service) purgeOnPrimary(ctx context.Context, runtimeName string, versions []string) error {
 	current := ""
 	if manifest, err := loadRuntimeManifest(filepath.Join(s.cfg.DistRuntimeRoot, "manifest.json")); err == nil {
@@ -193,7 +195,19 @@ func (s *Service) purgeOnPrimary(ctx context.Context, runtimeName string, versio
 	sort.SliceStable(versions, func(i, j int) bool {
 		return versions[i] != current && versions[j] == current
 	})
+	var refusedAsCurrent []string
 	for _, version := range versions {
+		err := s.removeRuntimeVersionOnPrimary(ctx, runtimeName, version)
+		var actionErr *adminActionError
+		if errors.As(err, &actionErr) && actionErr.Code == "RUNTIME_CURRENT_CONFLICT" {
+			refusedAsCurrent = append(refusedAsCurrent, version)
+			continue
+		}
+		if err != nil {
+			return err
+		}
+	}
+	for _, version := range refusedAsCurrent {
 		if err := s.removeRuntimeVersionOnPrimary(ctx, runtimeName, version); err != nil {
 			return err
 		}

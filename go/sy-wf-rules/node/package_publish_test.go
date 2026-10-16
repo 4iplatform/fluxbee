@@ -216,11 +216,24 @@ type fakeAdminClient struct {
 	lastPackageFiles          map[string]string
 	removedVersions           []string
 	removeErr                 map[string]error
+	// currentOnPrimary is refused with RUNTIME_CURRENT_CONFLICT while other versions remain, as
+	// the motherbee's admin does.
+	currentOnPrimary  string
+	versionsOnPrimary int
 }
 
 func (f *fakeAdminClient) RemoveRuntimeVersion(_ context.Context, runtimeName, version string) error {
 	f.removedVersions = append(f.removedVersions, runtimeName+"@"+version)
-	return f.removeErr[version]
+	if version == f.currentOnPrimary && f.versionsOnPrimary > 1 {
+		return &adminActionError{Status: "error", Code: "RUNTIME_CURRENT_CONFLICT", Message: "cannot delete current version"}
+	}
+	if err := f.removeErr[version]; err != nil {
+		return err
+	}
+	if f.versionsOnPrimary > 0 {
+		f.versionsOnPrimary--
+	}
+	return nil
 }
 
 func (f *fakeAdminClient) PublishRuntimePackage(ctx context.Context, packageFiles map[string]string) (*PackagePublishResult, error) {
@@ -265,4 +278,34 @@ func installWorkflowPackageViaFakeAdmin(svc *Service, packageFiles map[string]st
 		Version:     packageMeta.Version,
 		PackagePath: packageDir,
 	}, nil
+}
+
+// A worker's copy of the manifest can lag behind the motherbee's: after a rollback the motherbee's
+// current version is the older one. A version the admin refuses as current is removed once the
+// others are gone (0.1.70 gate on 8.x, A-68).
+func TestPurgeRemovesTheCurrentVersionLastEvenWithALaggingManifest(t *testing.T) {
+	svc := newTestService(t)
+	definitionBytes, err := normalizeDefinitionBytes(validWorkflowDefinition())
+	if err != nil {
+		t.Fatal(err)
+	}
+	for version := uint64(1); version <= 2; version++ {
+		meta := WfRulesMetadata{Version: version, Hash: HashDefinition(definitionBytes), WorkflowName: "invoice", WorkflowType: "invoice", WFSchemaVersion: "1", CompiledAt: "2026-04-16T12:00:00Z"}
+		if _, err := svc.PublishWorkflowPackage("invoice", meta, definitionBytes); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// This hive's copy says 0.0.2 is current; on the motherbee it is 0.0.1.
+	svc.cfg.HiveID = "worker1"
+	admin := svc.admin.(*fakeAdminClient)
+	admin.currentOnPrimary = "0.0.1"
+	admin.versionsOnPrimary = 2
+
+	if err := svc.PurgeWorkflowPackages("invoice", false); err != nil {
+		t.Fatalf("PurgeWorkflowPackages: %v", err)
+	}
+	want := "wf.invoice@0.0.1,wf.invoice@0.0.2,wf.invoice@0.0.1"
+	if got := strings.Join(admin.removedVersions, ","); got != want {
+		t.Fatalf("removals = %s, want %s", got, want)
+	}
 }

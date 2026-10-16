@@ -1081,6 +1081,20 @@ Visto al arreglar los e2e de A-37, leyendo `src/router/mod.rs` y `src/shm/mod.rs
     - la respuesta del CONFIG_SET del nodo WF trae su estado real, sin cambiar hasta el reinicio,
       y `pending_restart`;
     - el SDK no escribe sobre un `config.json` que no puede leer.
+- **El gate de 0.1.70 en 8.x encontró dos cosas, arregladas para 0.1.71:**
+  - **Una actualización en worker1 no esperó lo suficiente.**
+    - El paquete nuevo llegó más de 20 s después de publicado.
+    - La causa: justo antes se había borrado otro workflow. Syncthing de worker1 falló al borrar
+      sus directorios ("not empty", padre antes que hijos), marcó la carpeta de runtimes como
+      fallida y la reintentó.
+    - Ahora SY.wf-rules espera el paquete hasta 45 s, con un plazo de 60 s por pedido; el admin
+      espera 75 s y Archi 90 s.
+  - **Un borrado en worker1 dejó sus paquetes en el motherbee.**
+    - SY.wf-rules borra la versión vigente al final según su copia del manifest, que después de
+      un rollback iba atrasada. El admin la rechazó (`RUNTIME_CURRENT_CONFLICT`) y la purga cortó
+      ahí.
+    - Ahora una versión rechazada como vigente se reintenta cuando las demás ya no están.
+    - Los paquetes huérfanos de la prueba se borraron a mano.
 - **Lo que no entra (anotado):**
   - **La superficie del admin por la malla** sigue abierta a cualquier nodo para casi todas las
     acciones: solo IO.cloud y SY.wf-rules tienen gate. Un workflow también puede mandar un
