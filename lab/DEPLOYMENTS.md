@@ -21,7 +21,8 @@
 
 | Versión | Fecha (ART) | Commit | Alcance | Estado | Rollback |
 |---|---|---|---|---|---|
-| **0.1.73** | 2026-10-16 | `822f237` | motherbee + spokes (core) + `hive.yaml` (IA: Claude) | ✅ live | snap `pre-cognition-0-1-73` (las 4 VMs) · `apt install fluxbee=0.1.72` · `hive.yaml.pre-claude-0-1-72` |
+| **0.1.74** | 2026-10-16 | `0d69329` | motherbee + spokes (core) | ✅ live | snap `pre-sdk-0-1-74` (las 4 VMs) · `apt install fluxbee=0.1.73` |
+| **0.1.73** | 2026-10-16 | `822f237` | motherbee + spokes (core) + `hive.yaml` (IA: Claude) | ✅ reemplazado por 0.1.74 | snap `pre-cognition-0-1-73` (las 4 VMs) · `apt install fluxbee=0.1.72` · `hive.yaml.pre-claude-0-1-72` |
 | **0.1.72** | 2026-10-16 | `17e1edd` | motherbee + spokes (core) | ✅ reemplazado por 0.1.73 | snap `pre-sync-0-1-72` (las 4 VMs) · `apt install fluxbee=0.1.71` |
 | **0.1.71** | 2026-10-16 | `73f7132` | motherbee + spokes (core) | ✅ reemplazado por 0.1.72 | snap `pre-gate-0-1-71` (las 4 VMs) · `apt install fluxbee=0.1.70` |
 | **0.1.70** | 2026-10-16 | `c289bb3` | motherbee + spokes (core) | ✅ reemplazado por 0.1.71 | snap `pre-wf-0-1-70` (las 4 VMs) · `apt install fluxbee=0.1.69` |
@@ -82,6 +83,29 @@
 > (`dpkg-scanpackages -m`) para rollback, pero su detalle vive en la bitácora, no acá.
 
 ---
+
+## 0.1.74 — El SDK de IA lee la respuesta de OpenAI de su ítem `message` (A-69)
+
+- **Fecha:** 2026-10-16 (ART) · **Versión anterior:** 0.1.73 · **Commit:** `0d69329`. Sale de lo
+  que encontró el gate de 0.1.73.
+- **Alcance:** motherbee + los tres spokes (core-update). Los `hive.yaml` siguen en Claude.
+- **Qué cambió:** el camino sin herramientas del SDK leía el texto de `output[0]`; con un modelo que
+  razona (gpt-5.5) ese es el ítem de razonamiento. Ahora un solo lector para los dos caminos:
+  `output_text` si viene, si no el primer ítem `message`.
+- **Deploy:** build de `0d69329` en 19 min (el SDK de IA recompila a todos sus consumidores),
+  publish en 14 s, deploy en 251 s. Snapshots `pre-sdk-0-1-74` en las 4 VMs (se borró
+  `pre-gate-0-1-71`). 0.1.74 con el mismo manifest (`b9d64985`) en los 4, health `failed=0`.
+- **Gate:**
+  - **Cognition con OpenAI** (solo el del motherbee, un rato): etiquetador y resumidor anduvieron
+    (4 y 4 llamados, sin fallas).
+  - **De vuelta en Claude:**
+    - el etiquetador anduvo;
+    - de 3 resúmenes, uno pasó el timeout de 8 s de cognition (`semantic_tagger.timeout_ms`):
+      Opus 5.5 es más lento. Ese turno se queda sin síntesis de memoria, sin más daño. Queda para
+      el operador: subir ese timeout o usar Sonnet 5.5.
+  - **Archi con Claude:** sigue usando sus herramientas (6 s).
+  - **Los cuatro consumidores** en Claude, con cognition listo en los dos hives; health `failed=0`.
+- **Rollback:** snapshot `pre-sdk-0-1-74`, o `apt install fluxbee=0.1.73`.
 
 ## 0.1.73 — La infra de IA pasa a Claude; SY.cognition deja de mandar `temperature` (A-69)
 

@@ -995,7 +995,7 @@ Visto al arreglar los e2e de A-37, leyendo `src/router/mod.rs` y `src/shm/mod.rs
   binario generaría uno como root); si no, el `myID` del Syncthing en marcha. Nunca `config.xml`.
 - **Estado:** construido; lo ejercita el próximo join (el de A-48).
 
-### A-69 🟡 CON CLAUDE VALIDADO EN 8.x (0.1.73); EL ARREGLO PARA OPENAI SALE EN 0.1.74 — SY.cognition fallaba en cada turno con los dos proveedores: mandaba `temperature`
+### A-69 ✅ VALIDADO EN 8.x (0.1.73 y 0.1.74, 2026-10-16) — SY.cognition fallaba en cada turno con los dos proveedores: mandaba `temperature`
 
 - **Cómo salió:** el operador pidió probar su key de Anthropic en toda la infra (2026-10-16).
   - Archi, el admin y el frontdesk anduvieron con Claude: Archi contesta y usa sus herramientas.
@@ -1030,11 +1030,19 @@ Visto al arreglar los e2e de A-37, leyendo `src/router/mod.rs` y `src/shm/mod.rs
   - Archi no lo veía porque su camino con herramientas recorre todos los ítems.
   - Arreglo para 0.1.74: un solo lector para los dos caminos. Toma `output_text` si el servidor lo
     manda; si no, el primer ítem `message`.
+- **El gate de 0.1.74:** cognition anduvo con OpenAI (etiquetador y resumidor) y con Claude. Con
+  Opus 5.5, uno de tres resúmenes pasó el timeout de 8 s (`semantic_tagger.timeout_ms`): ese turno
+  queda sin síntesis de memoria. Subirlo o usar Sonnet 5.5 lo decide el operador.
 - **Lo que no entra (anotado):**
   - el SDK informa un error HTTP del proveedor como error de protocolo, y eso mezcla dos contadores
     de cognition. Va con la revisión del SDK de IA;
   - `config-get` sobre SY.admin contesta su rechazo de origen (`CONFIG_GET_RESPONSE`) a una consulta
     del propio admin. Sin investigar.
+  - **SY.cognition en un worker no llega a la base:** cada hive tiene su NATS embebido y
+    SY.storage corre solo en el motherbee. Lo que publica un nodo de worker1 (sus turnos, lo que
+    escribe su cognition) se queda en el NATS de worker1, y su reconstrucción falla ("error
+    connecting to server"). Es anterior a esto; importa para la etapa 5 (dónde se registra el
+    consumo de un nodo de un worker).
 
 ### A-68 ✅ VALIDADO EN 8.x (0.1.70 a 0.1.72, 2026-10-16) — Los nodos WF quedaban fuera del estándar: SY.wf-rules los manejaba directo con el orquestador, y el nodo Go tenía su propio plano de control
 
