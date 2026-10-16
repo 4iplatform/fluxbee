@@ -995,7 +995,7 @@ Visto al arreglar los e2e de A-37, leyendo `src/router/mod.rs` y `src/shm/mod.rs
   binario generaría uno como root); si no, el `myID` del Syncthing en marcha. Nunca `config.xml`.
 - **Estado:** construido; lo ejercita el próximo join (el de A-48).
 
-### A-69 🟡 CONSTRUIDO (0.1.73), falta validar en 8.x — SY.cognition fallaba en cada turno con los dos proveedores: mandaba `temperature`
+### A-69 🟡 CON CLAUDE VALIDADO EN 8.x (0.1.73); EL ARREGLO PARA OPENAI SALE EN 0.1.74 — SY.cognition fallaba en cada turno con los dos proveedores: mandaba `temperature`
 
 - **Cómo salió:** el operador pidió probar su key de Anthropic en toda la infra (2026-10-16).
   - Archi, el admin y el frontdesk anduvieron con Claude: Archi contesta y usa sus herramientas.
@@ -1020,6 +1020,16 @@ Visto al arreglar los e2e de A-37, leyendo `src/router/mod.rs` y `src/shm/mod.rs
   - topes de 1024 tokens: el tope solo acota una respuesta desbocada, no cambia lo que se gasta;
   - la key se resuelve al arrancar, esperando al vault como la reconstrucción desde la base;
   - el log del cambio de secreto decía "openai" fijo; ahora nombra el tipo de la key.
+- **El gate de 0.1.73 (con Claude) pasó:**
+  - cognition arrancó listo en los dos hives, también en worker1 recién actualizado;
+  - un turno de prueba salió etiquetado (`billing`, `duplicate charge`, `october invoice`…) y
+    resumido.
+- **El mismo turno con OpenAI encontró un segundo bug, en el SDK:**
+  - Su camino sin herramientas leía el texto de `output[0]`. Un modelo que razona (gpt-5.5) pone
+    primero un ítem `reasoning`, y el mensaje viene después: "missing text output".
+  - Archi no lo veía porque su camino con herramientas recorre todos los ítems.
+  - Arreglo para 0.1.74: un solo lector para los dos caminos. Toma `output_text` si el servidor lo
+    manda; si no, el primer ítem `message`.
 - **Lo que no entra (anotado):**
   - el SDK informa un error HTTP del proveedor como error de protocolo, y eso mezcla dos contadores
     de cognition. Va con la revisión del SDK de IA;

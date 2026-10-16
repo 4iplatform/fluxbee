@@ -21,7 +21,8 @@
 
 | Versión | Fecha (ART) | Commit | Alcance | Estado | Rollback |
 |---|---|---|---|---|---|
-| **0.1.72** | 2026-10-16 | `17e1edd` | motherbee + spokes (core) | ✅ live | snap `pre-sync-0-1-72` (las 4 VMs) · `apt install fluxbee=0.1.71` |
+| **0.1.73** | 2026-10-16 | `822f237` | motherbee + spokes (core) + `hive.yaml` (IA: Claude) | ✅ live | snap `pre-cognition-0-1-73` (las 4 VMs) · `apt install fluxbee=0.1.72` · `hive.yaml.pre-claude-0-1-72` |
+| **0.1.72** | 2026-10-16 | `17e1edd` | motherbee + spokes (core) | ✅ reemplazado por 0.1.73 | snap `pre-sync-0-1-72` (las 4 VMs) · `apt install fluxbee=0.1.71` |
 | **0.1.71** | 2026-10-16 | `73f7132` | motherbee + spokes (core) | ✅ reemplazado por 0.1.72 | snap `pre-gate-0-1-71` (las 4 VMs) · `apt install fluxbee=0.1.70` |
 | **0.1.70** | 2026-10-16 | `c289bb3` | motherbee + spokes (core) | ✅ reemplazado por 0.1.71 | snap `pre-wf-0-1-70` (las 4 VMs) · `apt install fluxbee=0.1.69` |
 | **0.1.69** | 2026-10-15 | `6f03310` | motherbee + spokes (core) | ✅ reemplazado por 0.1.70 | snap `pre-teardown-0-1-69` (las 4 VMs) · `apt install fluxbee=0.1.68` |
@@ -81,6 +82,46 @@
 > (`dpkg-scanpackages -m`) para rollback, pero su detalle vive en la bitácora, no acá.
 
 ---
+
+## 0.1.73 — La infra de IA pasa a Claude; SY.cognition deja de mandar `temperature` (A-69)
+
+- **Fecha:** 2026-10-16 (ART) · **Versión anterior:** 0.1.72 · **Commit:** `822f237`. Pedido del
+  operador: probar su key de Anthropic en toda la infra y, si no anda, volver a OpenAI.
+- **Alcance:** motherbee + los tres spokes (core-update). Además, sobre 0.1.72 y antes del build,
+  el `hive.yaml` del motherbee y de worker1 (los únicos con sección `ai`; ingress y egress no corren
+  IA):
+  - `default_provider: anthropic`, con `claude-opus-5-5`;
+  - la entrada de OpenAI (`gpt-5.5`) sigue declarada: volver es cambiar una línea y reiniciar
+    `sy-admin`, `sy-architect`, `sy-cognition` y `sy-frontdesk-gov` (en worker1, `sy-cognition`);
+  - backup `hive.yaml.pre-claude-0-1-72` en los dos.
+- **La prueba sobre 0.1.72, consumidor por consumidor:**
+  - **Archi:** contesta con Claude (2 s) y usa sus herramientas: listó los nodos de worker1 con
+    `fluxbee_system_get` (4 s).
+  - **El admin y SY.frontdesk.gov:** resuelven la key de Anthropic (`CONFIGURED`). No mandan
+    `temperature`.
+  - **SY.cognition:** con Opus 5.5 y con Sonnet 5.5, su etiquetador falló en un turno de prueba:
+    "`temperature` is deprecated for this model". De vuelta en OpenAI falló igual ("not
+    supported"): cognition estaba roto con los dos proveedores (A-69). Se volvió a Claude, que anda
+    en todo lo que anda OpenAI, y se arregló cognition.
+- **Qué cambió (`822f237`):** cognition sin `temperature`, topes de salida de 1024 tokens, y la key
+  de IA resuelta al arrancar (antes decía `degraded_no_ai_provider` hasta su primer turno).
+- **Deploy:** build de `822f237` en 7 min, publish en 12 s, deploy en 229 s. Snapshots
+  `pre-cognition-0-1-73` en las 4 VMs (se borró `pre-wf-0-1-70`). 0.1.73 con el mismo manifest
+  (`13af35fc`) en los 4, health `failed=0`.
+- **Gate:**
+  - **Cognition en los dos hives:** `ready_semantic_ai` con Claude apenas arrancó, también en
+    worker1 recién actualizado.
+  - **Un turno de prueba en el motherbee:**
+    - el etiquetador devolvió tags reales (`billing`, `duplicate charge`, `october invoice`…);
+    - el resumidor narrativo corrió con `claude-opus-5-5`;
+    - ninguna falla.
+  - **Encontrado, arreglado para 0.1.74:** con OpenAI el etiquetador ya no falla por
+    `temperature`, pero el SDK no encuentra el texto de la respuesta ("missing text output"). Un
+    modelo que razona pone primero un ítem de razonamiento, y el SDK leía el primer ítem.
+  - **Datos de prueba:** los turnos de prueba quedaron en el log de mensajes y en la memoria de
+    cognition, con hilos `claude-probe-20261016*` y `openai-probe-20261016*`.
+- **Rollback:** snapshot `pre-cognition-0-1-73`, o `apt install fluxbee=0.1.72`. Para volver a
+  OpenAI, `default_provider: openai` en los dos `hive.yaml` y reiniciar esos servicios.
 
 ## 0.1.72 — Un deploy de WF en un worker hace que el motherbee anuncie su paquete (A-68, gate de 0.1.71)
 

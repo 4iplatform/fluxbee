@@ -428,23 +428,7 @@ impl LlmClient for OpenAiResponsesClient {
         }
         openai_check_truncation(&value)?;
 
-        // Responses API returns output_text for text generations.
-        let text = value
-            .get("output_text")
-            .and_then(|v| v.as_str())
-            .map(ToString::to_string)
-            .or_else(|| {
-                value
-                    .get("output")
-                    .and_then(|out| out.as_array())
-                    .and_then(|arr| arr.first())
-                    .and_then(|item| item.get("content"))
-                    .and_then(|content| content.as_array())
-                    .and_then(|arr| arr.first())
-                    .and_then(|item| item.get("text"))
-                    .and_then(|v| v.as_str())
-                    .map(ToString::to_string)
-            })
+        let text = openai_response_text(&value)
             .ok_or_else(|| AiSdkError::Protocol("responses payload missing text output".into()))?;
 
         let text = match &request.output_schema {
@@ -454,6 +438,26 @@ impl LlmClient for OpenAiResponsesClient {
 
         Ok(LlmResponse { content: text })
     }
+}
+
+/// The answer of a Responses payload: `output_text` when the server sends it (the official SDKs
+/// compute it client-side), else the first text of the first `message` item of `output`. A model
+/// that reasons puts a `reasoning` item first, so the first item is not the answer: reading it
+/// left SY.cognition's tagger with "missing text output" on gpt-5.5 (A-69).
+fn openai_response_text(value: &Value) -> Option<String> {
+    if let Some(text) = value.get("output_text").and_then(Value::as_str) {
+        return Some(text.to_string());
+    }
+    value
+        .get("output")
+        .and_then(Value::as_array)?
+        .iter()
+        .find(|item| item.get("type").and_then(Value::as_str) == Some("message"))?
+        .get("content")
+        .and_then(Value::as_array)?
+        .iter()
+        .find_map(|part| part.get("text").and_then(Value::as_str))
+        .map(ToString::to_string)
 }
 
 fn build_openai_input_items(request: &LlmRequest) -> Vec<Value> {
@@ -827,10 +831,7 @@ impl FunctionCallingModel for OpenAiFunctionCallingModel {
             .get("id")
             .and_then(Value::as_str)
             .map(ToString::to_string);
-        let mut assistant_text = value
-            .get("output_text")
-            .and_then(Value::as_str)
-            .map(ToString::to_string);
+        let assistant_text = openai_response_text(&value);
         let mut tool_calls = Vec::<FunctionToolCall>::new();
 
         if let Some(items) = value.get("output").and_then(Value::as_array) {
@@ -862,20 +863,6 @@ impl FunctionCallingModel for OpenAiFunctionCallingModel {
                         });
                     }
                     continue;
-                }
-
-                if assistant_text.is_none() && item_type == "message" {
-                    assistant_text =
-                        item.get("content")
-                            .and_then(Value::as_array)
-                            .and_then(|arr| {
-                                arr.iter().find_map(|content_item| {
-                                    content_item
-                                        .get("text")
-                                        .and_then(Value::as_str)
-                                        .map(ToString::to_string)
-                                })
-                            });
                 }
             }
         }
@@ -2135,6 +2122,47 @@ mod tests {
         let body = body_rx.recv().expect("captured body");
         assert!(body.get("text").is_none());
         handle.join().expect("server thread");
+    }
+
+    #[tokio::test]
+    async fn openai_responses_client_reads_the_message_after_a_reasoning_item() {
+        let (base_url, _body_rx, handle) = spawn_single_response_server(json!({
+            "status": "completed",
+            "output": [
+                {"type": "reasoning", "id": "rs_1", "summary": []},
+                {"type": "message", "id": "msg_1", "role": "assistant",
+                 "content": [{"type": "output_text", "text": "{\"tags\":[\"billing\"]}", "annotations": []}]}
+            ]
+        }));
+        let client = OpenAiResponsesClient::new("test-key").with_base_url(base_url);
+        let request = LlmRequest {
+            model: "gpt-5.5".to_string(),
+            system: Some("sys".to_string()),
+            input: "hola".to_string(),
+            input_parts: None,
+            output_schema: None,
+            max_output_tokens: Some(1024),
+            model_settings: None,
+        };
+
+        let response = client
+            .generate(request)
+            .await
+            .expect("generate should succeed");
+        assert_eq!(response.content, "{\"tags\":[\"billing\"]}");
+        handle.join().expect("server thread");
+    }
+
+    #[test]
+    fn a_responses_payload_without_a_message_has_no_text() {
+        assert_eq!(
+            openai_response_text(&json!({"output": [{"type": "reasoning", "summary": []}]})),
+            None
+        );
+        assert_eq!(
+            openai_response_text(&json!({"output_text": "plain"})).as_deref(),
+            Some("plain")
+        );
     }
 
     #[test]
