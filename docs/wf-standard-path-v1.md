@@ -155,6 +155,24 @@ Known gaps:
 The 30 s Archi used to wait, the same as the admin's own wait, lost the answer of a deploy near the
 limit.
 
+**A worker deploy brings its package to the hive first.**
+- A package published on the motherbee reaches a worker through Syncthing. Two delays are built
+  in there:
+  - the motherbee's watcher aggregates changes (10 s, up to a minute when the runtimes folder is
+    busy, as after a core update or other deploys);
+  - a worker whose folder failed a pull waits before it retries. A workflow delete makes it fail
+    once on the deleted directories: "not empty", parent before children.
+- The 0.1.71 gate measured 62 s from publish to the package's files on worker1, with the manifest
+  there after 12 s.
+- So on a worker, right after publishing, SY.wf-rules asks the admin for two `sync_hint`s on
+  `fluxbee-dist-runtimes`:
+  1. on the motherbee, which scans now and announces the package, waiting up to 5 s;
+  2. on its own hive, which scans and pulls now, waiting up to 20 s for it to settle.
+- While a node call still answers that the package is not here, it nudges its hive again before
+  each retry.
+- This is an explicit, bounded step of the deploy. If it does not settle, the retries below still
+  wait for the package, and say so when it never comes.
+
 **A workflow package is not on a hive until its definition is.**
 - Syncthing can deliver a package's manifest entry and `package.json` before `flow/definition.json`.
 - Before, the WF node crash-looped until the file came, which fixed itself; it now waits in

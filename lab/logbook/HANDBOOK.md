@@ -996,9 +996,11 @@ con tokens cargados es una pérdida real.
     Archi): `get_node_status` lo muestra.
   - Desde Archi el deploy funciona desde 0.1.70. Antes se trababa en el loop del admin y
     respondía `PACKAGE_PUBLISH_FAILED` (A-68).
-  - En un worker, el deploy espera a que el paquete llegue entero por Syncthing (hasta 45 s).
-    Suele tardar unos 11 s, pero si justo antes se borró un workflow, Syncthing del worker
-    reintenta su carpeta de runtimes y el paquete tarda más.
+  - En un worker, el deploy primero trae el paquete. Le pide al motherbee y a su hive que
+    Syncthing escanee ya (`sync_hint` sobre `fluxbee-dist-runtimes`), y espera el paquete entero
+    hasta 45 s.
+    - Sin ese empujón, el paquete llegó a tardar 62 s: el watcher del motherbee agrupa cambios, y
+      la carpeta del worker espera para reintentar después de fallar al borrar directorios.
 - **Un nodo WF con config o definición rota no se cae:**
   - queda corriendo en `FAILED_CONFIG`;
   - `get_node_status` muestra `health_state: DEGRADED` y `last_error` (`invalid_config`, o

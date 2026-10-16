@@ -492,6 +492,7 @@ When a definition is applied (compile_apply or apply operations):
 - A request runs under one 60 s deadline end to end (publish, purge, waiting up to 45 s for the package to reach a worker, rebind and restart, or launch); SY.admin waits 75 s for it, and Archi 90 s for the admin.
 - SY.wf-rules takes its operations (CONFIG_SET/GET, commands, queries) only from `SY.admin@motherbee`, by the router-stamped sender.
 - Obsolete package versions are removed through SY.admin's `remove_runtime_version` on every hive; SY.wf-rules never writes the dist tree or its manifest.
+- On a worker, right after publishing, SY.wf-rules asks SY.admin for a `sync_hint` on `fluxbee-dist-runtimes`: first on the motherbee (scan now), then on its own hive (scan and pull now, wait up to 20 s). While a node call still answers RUNTIME_NOT_PRESENT, it nudges its hive again before each retry.
 - Publication state and deployment state are intentionally different. A package may already exist in `dist` with a newer version while the WF node still runs the older `runtime_version` recorded in its managed config. The node only changes versions after the explicit rebind/restart sequence completes successfully.
 - The only environment-level tenant fallback relevant to this path is `ORCH_DEFAULT_TENANT_ID` inside `SY.orchestrator`, which remains a platform escape hatch. `SY.wf-rules` itself must not rely on a local `tenant_id` environment variable.
 

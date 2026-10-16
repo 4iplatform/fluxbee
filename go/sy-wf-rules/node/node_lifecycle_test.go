@@ -301,3 +301,36 @@ func TestAWFNodeThatCannotCountItsInstancesSaysWhy(t *testing.T) {
 		t.Fatalf("delete without force: %v", err)
 	}
 }
+
+// On a worker the package travels through Syncthing: the deploy asks the motherbee and this hive
+// to scan now before it rebinds or launches the node, and nudges this hive while the package is
+// still missing. On the motherbee the package is already local (A-68, 0.1.71 gate).
+func TestAWorkerDeploySettlesItsRuntimesFirst(t *testing.T) {
+	for _, hive := range []string{"motherbee", "worker1"} {
+		svc := newTestService(t)
+		svc.cfg.HiveID = hive
+		attempts := 0
+		svc.nodes = &fakeNodeClient{runNodeFunc: func(context.Context, string, string, string, map[string]any, string) (map[string]any, error) {
+			attempts++
+			if attempts < 2 {
+				return nil, &nodeActionError{Status: "error", Code: "RUNTIME_NOT_PRESENT"}
+			}
+			return map[string]any{"status": "ok"}, nil
+		}}
+		if _, err := svc.CompileWorkflow(CompileRequest{WorkflowName: "invoice", Definition: validWorkflowDefinition()}); err != nil {
+			t.Fatal(err)
+		}
+		result, err := svc.ApplyWorkflowAndDeploy(ApplyRequest{WorkflowName: "invoice", AutoSpawn: true, TenantID: "tnt:1"})
+		if err != nil || result.WFNode.Action != "restarted" {
+			t.Fatalf("%s: result = %#v, err = %v", hive, result, err)
+		}
+		hints := strings.Join(svc.admin.(*fakeAdminClient).syncHints, ",")
+		want := ""
+		if hive == "worker1" {
+			want = "motherbee/5000,worker1/20000,worker1/0"
+		}
+		if hints != want {
+			t.Fatalf("%s: sync hints = %q, want %q", hive, hints, want)
+		}
+	}
+}

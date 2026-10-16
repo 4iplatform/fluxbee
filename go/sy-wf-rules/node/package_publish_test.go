@@ -220,6 +220,12 @@ type fakeAdminClient struct {
 	// the motherbee's admin does.
 	currentOnPrimary  string
 	versionsOnPrimary int
+	syncHints         []string
+}
+
+func (f *fakeAdminClient) SyncRuntimes(_ context.Context, hive string, waitMs int) error {
+	f.syncHints = append(f.syncHints, fmt.Sprintf("%s/%d", hive, waitMs))
+	return nil
 }
 
 func (f *fakeAdminClient) RemoveRuntimeVersion(_ context.Context, runtimeName, version string) error {

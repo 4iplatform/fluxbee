@@ -23,6 +23,9 @@ type adminClient interface {
 	PublishRuntimePackage(ctx context.Context, packageFiles map[string]string) (*PackagePublishResult, error)
 	// RemoveRuntimeVersion deletes one published version from the motherbee's dist and manifest.
 	RemoveRuntimeVersion(ctx context.Context, runtimeName, version string) error
+	// SyncRuntimes asks a hive's Syncthing to scan its runtimes folder now (sync_hint), and
+	// waits for it to settle when waitMs > 0.
+	SyncRuntimes(ctx context.Context, hive string, waitMs int) error
 }
 
 type adminActionError struct {
@@ -116,13 +119,37 @@ func (c *l2AdminClient) RemoveRuntimeVersion(ctx context.Context, runtimeName, v
 	return err
 }
 
+// runtimesFolderID is the Syncthing folder of dist/runtimes: sendonly on the motherbee, a
+// receive-only mirror on every worker.
+const runtimesFolderID = "fluxbee-dist-runtimes"
+
+func (c *l2AdminClient) SyncRuntimes(ctx context.Context, hive string, waitMs int) error {
+	if c == nil || c.dispatcher == nil {
+		return fmt.Errorf("admin client unavailable")
+	}
+	params := map[string]any{
+		"channel":       "dist",
+		"folder_id":     runtimesFolderID,
+		"wait_for_idle": waitMs > 0,
+		"timeout_ms":    max(waitMs, 1000),
+	}
+	callCtx, cancel := context.WithTimeout(ctx, time.Duration(max(waitMs, 1000))*time.Millisecond+adminRPCTimeout)
+	defer cancel()
+	_, err := c.requestWithTimeout(callCtx, "sync_hint", hive, params, time.Duration(max(waitMs, 1000))*time.Millisecond+adminRPCTimeout)
+	return err
+}
+
 func (c *l2AdminClient) request(ctx context.Context, action, target string, params map[string]any) (map[string]any, error) {
+	return c.requestWithTimeout(ctx, action, target, params, adminRPCTimeout)
+}
+
+func (c *l2AdminClient) requestWithTimeout(ctx context.Context, action, target string, params map[string]any, timeout time.Duration) (map[string]any, error) {
 	msg, err := c.dispatcher.SendAdminRPC(ctx, fluxbeesdk.AdminRpcRequest{
 		AdminTarget: c.targetNode,
 		Action:      action,
 		Target:      target,
 		Params:      params,
-		Timeout:     adminRPCTimeout,
+		Timeout:     timeout,
 	})
 	if err != nil {
 		return nil, err

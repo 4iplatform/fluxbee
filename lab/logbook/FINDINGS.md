@@ -1095,6 +1095,20 @@ Visto al arreglar los e2e de A-37, leyendo `src/router/mod.rs` y `src/shm/mod.rs
       ahí.
     - Ahora una versión rechazada como vigente se reintenta cuando las demás ya no están.
     - Los paquetes huérfanos de la prueba se borraron a mano.
+- **El gate de 0.1.71 encontró que esperar más no alcanzaba, arreglado para 0.1.72.**
+  - **Un primer deploy en worker1 esperó 45 s y el paquete no llegó.**
+    - Del motherbee al worker: el manifest llegó a los 12 s y los archivos del paquete a los
+      62 s.
+    - El watcher del motherbee agrupa los cambios. Con la carpeta de runtimes agitada (el
+      core-update recién hecho, los borrados del E2E anterior), tarda en anunciarlos.
+    - El borrado de un workflow (y la limpieza de versiones de un core-update) hace además que la
+      carpeta del worker falle una vez ("not empty") y espere antes de reintentar.
+  - **Arreglo:** en un worker, después de publicar, SY.wf-rules pide por el admin dos
+    `sync_hint` sobre `fluxbee-dist-runtimes`.
+    - En el motherbee: escanea ya y anuncia el paquete.
+    - En su hive: escanea y trae ya, y espera a que quede quieto.
+    - Mientras el paquete no esté, empuja a su hive antes de cada reintento.
+    - Es un paso explícito y acotado del deploy.
 - **Lo que no entra (anotado):**
   - **La superficie del admin por la malla** sigue abierta a cualquier nodo para casi todas las
     acciones: solo IO.cloud y SY.wf-rules tienen gate. Un workflow también puede mandar un

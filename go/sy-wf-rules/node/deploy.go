@@ -4,7 +4,10 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log"
 	"time"
+
+	fluxbeesdk "github.com/4iplatform/json-router/fluxbee-go-sdk"
 )
 
 // wfRulesRequestBudget bounds one request to SY.wf-rules end to end (publish, purge, the node's
@@ -41,8 +44,8 @@ func runtimeNotSyncedYet(err error) bool {
 
 // untilRuntimeSynced runs call, and runs it again while the answer is that the runtime has not
 // reached this hive yet — until it succeeds, fails for another reason, the budget runs out, or the
-// request's deadline passes.
-func untilRuntimeSynced(ctx context.Context, budget time.Duration, call func() error) error {
+// request's deadline passes. Before each wait it calls nudge, when given, to hurry the sync.
+func untilRuntimeSynced(ctx context.Context, budget time.Duration, call func() error, nudge func()) error {
 	deadline := time.Now().Add(budget)
 	if requestDeadline, ok := ctx.Deadline(); ok && requestDeadline.Before(deadline) {
 		deadline = requestDeadline
@@ -52,6 +55,9 @@ func untilRuntimeSynced(ctx context.Context, budget time.Duration, call func() e
 		err := call()
 		if err == nil || !runtimeNotSyncedYet(err) || time.Now().Add(delay).After(deadline) {
 			return err
+		}
+		if nudge != nil {
+			nudge()
 		}
 		select {
 		case <-ctx.Done():
@@ -128,6 +134,8 @@ func (s *Service) deployPublishedWorkflow(ctx context.Context, workflowName stri
 		}, "Package published, but the admin client is unavailable. Deployment did not run."
 	}
 
+	s.settleRuntimesForThisHive(ctx)
+	nudge := func() { s.nudgeRuntimes(ctx) }
 	_, err := s.nodes.GetNodeConfig(ctx, nodeName)
 	if err == nil {
 		// The rebind changes only the binding: set_node_config merges the patch into the node's
@@ -138,7 +146,7 @@ func (s *Service) deployPublishedWorkflow(ctx context.Context, workflowName stri
 			_, err := s.nodes.SetNodeConfig(ctx, nodeName, map[string]any{}, &binding)
 			return err
 		}
-		if err := untilRuntimeSynced(ctx, runtimeSyncBudget, rebind); err != nil {
+		if err := untilRuntimeSynced(ctx, runtimeSyncBudget, rebind, nudge); err != nil {
 			return WFNodeActionResult{
 					NodeName: nodeName,
 					Action:   "restart_failed",
@@ -150,7 +158,7 @@ func (s *Service) deployPublishedWorkflow(ctx context.Context, workflowName stri
 			_, err := s.nodes.RestartNode(ctx, nodeName)
 			return err
 		}
-		if err := untilRuntimeSynced(ctx, runtimeSyncBudget, restart); err != nil {
+		if err := untilRuntimeSynced(ctx, runtimeSyncBudget, restart, nudge); err != nil {
 			retryErr := err
 			select {
 			case <-ctx.Done():
@@ -214,7 +222,7 @@ func (s *Service) deployPublishedWorkflow(ctx context.Context, workflowName stri
 	err = untilRuntimeSynced(ctx, runtimeSyncBudget, func() error {
 		_, err := s.nodes.RunNode(ctx, nodeName, runtimeName, pkg.Version, config, launchedBy)
 		return err
-	})
+	}, nudge)
 	if err != nil {
 		return WFNodeActionResult{
 				NodeName: nodeName,
@@ -228,4 +236,35 @@ func (s *Service) deployPublishedWorkflow(ctx context.Context, workflowName stri
 		Action:   "restarted",
 		Status:   "ok",
 	}, ""
+}
+
+// settleRuntimesForThisHive brings a package just published on the motherbee to this hive before
+// the node is rebound or launched. On a worker it travels through Syncthing, and two waits are
+// built in there: the motherbee's watcher announces a change only after 10 s, and a worker whose
+// runtimes folder failed a pull (a workflow deleted just before, whose directories it could not
+// remove in one pass) retries only after a minute. The 0.1.71 gate on 8.x saw a first deploy on
+// worker1 wait more than 45 s for that. So the deploy asks both, through the admin's sync_hint, to
+// scan now, and waits for this hive to settle. If it does not, the node calls below still wait
+// for the package, and say so when it never comes (A-68).
+func (s *Service) settleRuntimesForThisHive(ctx context.Context) {
+	if s.admin == nil || s.cfg.HiveID == fluxbeesdk.PrimaryHiveID {
+		return
+	}
+	if err := s.admin.SyncRuntimes(ctx, fluxbeesdk.PrimaryHiveID, 5000); err != nil {
+		log.Printf("sync_hint on %s: %v", fluxbeesdk.PrimaryHiveID, err)
+	}
+	if err := s.admin.SyncRuntimes(ctx, s.cfg.HiveID, 20000); err != nil {
+		log.Printf("sync_hint on %s: %v", s.cfg.HiveID, err)
+	}
+}
+
+// nudgeRuntimes asks this hive's Syncthing to scan and pull now, without waiting; called while a
+// package is still missing on a worker.
+func (s *Service) nudgeRuntimes(ctx context.Context) {
+	if s.admin == nil || s.cfg.HiveID == fluxbeesdk.PrimaryHiveID {
+		return
+	}
+	if err := s.admin.SyncRuntimes(ctx, s.cfg.HiveID, 0); err != nil {
+		log.Printf("sync_hint nudge on %s: %v", s.cfg.HiveID, err)
+	}
 }

@@ -19,7 +19,7 @@ func TestUntilRuntimeSyncedRetriesUntilThePackageArrives(t *testing.T) {
 			return notSynced()
 		}
 		return nil
-	})
+	}, nil)
 	if err != nil || calls != 3 {
 		t.Fatalf("want success on the 3rd call, got err=%v calls=%d", err, calls)
 	}
@@ -31,7 +31,7 @@ func TestUntilRuntimeSyncedDoesNotRetryOtherErrors(t *testing.T) {
 	err := untilRuntimeSynced(context.Background(), 10*time.Second, func() error {
 		calls++
 		return other
-	})
+	}, nil)
 	if !errors.Is(err, other) || calls != 1 {
 		t.Fatalf("want the first error back after 1 call, got err=%v calls=%d", err, calls)
 	}
@@ -43,7 +43,7 @@ func TestUntilRuntimeSyncedGivesUpAtTheBudget(t *testing.T) {
 	err := untilRuntimeSynced(context.Background(), 1500*time.Millisecond, func() error {
 		calls++
 		return notSynced()
-	})
+	}, nil)
 	if !runtimeNotSyncedYet(err) {
 		t.Fatalf("want the not-synced error back, got %v", err)
 	}
@@ -73,7 +73,7 @@ func TestUntilRuntimeSyncedStopsAtTheRequestDeadline(t *testing.T) {
 	err := untilRuntimeSynced(ctx, 20*time.Second, func() error {
 		calls++
 		return notSynced()
-	})
+	}, nil)
 	if !runtimeNotSyncedYet(err) {
 		t.Fatalf("want the not-synced error back, got %v", err)
 	}
