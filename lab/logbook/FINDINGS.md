@@ -995,7 +995,7 @@ Visto al arreglar los e2e de A-37, leyendo `src/router/mod.rs` y `src/shm/mod.rs
   binario generaría uno como root); si no, el `myID` del Syncthing en marcha. Nunca `config.xml`.
 - **Estado:** construido; lo ejercita el próximo join (el de A-48).
 
-### A-68 🟡 CONSTRUIDO (0.1.70), falta validar en 8.x — Los nodos WF quedaban fuera del estándar: SY.wf-rules los manejaba directo con el orquestador, y el nodo Go tenía su propio plano de control
+### A-68 ✅ VALIDADO EN 8.x (0.1.70 a 0.1.72, 2026-10-16) — Los nodos WF quedaban fuera del estándar: SY.wf-rules los manejaba directo con el orquestador, y el nodo Go tenía su propio plano de control
 
 - **Cómo salió:** el operador preguntó si el nodo WF arranca como los demás (2026-10-15). El
   orquestador lo arranca igual: `systemd-run`, `config.json` con `_system`, el reconcile de 60 s.
@@ -1113,10 +1113,18 @@ Visto al arreglar los e2e de A-37, leyendo `src/router/mod.rs` y `src/shm/mod.rs
       esperaba hasta 20 s a que la carpeta del worker quedara quieta, cosa que después de un
       borrado fallido no pasa. Se corrigió antes de publicarla.
     - Es un paso explícito y acotado del deploy.
+- **El gate de 0.1.72 pasó todo,** en el peor caso: recién hecho el core-update, y el E2E de
+  worker1 justo después del borrado del E2E del motherbee.
+  - **El motherbee y worker1:** 35/35 cada uno.
+    - En worker1 el primer deploy tardó 4 s: el paquete llegó 1 s después de publicado.
+    - La v2 llegó en 2 s, y el borrado no dejó paquetes.
+  - **Por Archi:** deploy y borrado en 1 s; `launched_by: archi`; una clave de `_system`
+    desconocida queda en el archivo y el nodo sigue `HEALTHY`.
+  - **No quedó nada de la prueba,** y el tenant de prueba se purgó.
 - **Lo que no entra (anotado):**
   - **La superficie del admin por la malla** sigue abierta a cualquier nodo para casi todas las
-    acciones: solo IO.cloud y SY.wf-rules tienen gate. Un workflow también puede mandar un
-    ADMIN_COMMAND. Va con el trabajo de seguridad postergado (A-22).
+    acciones: solo IO.cloud y SY.wf-rules tienen compuerta. Un workflow no llega: el motor rechaza
+    todo destino `SY.*` o `RT.*` al enviar. Es A-62, estacionado junto con A-60.
   - **Todas las acciones de nodos pasan por el worker serial del orquestador del motherbee.** Un
     rollback largo o un hive que no contesta demoran a las demás, también un deploy de WF.
   - **Configs de WF escritas antes de 0.1.70** con `config_version` en la raíz (un CONFIG_SET

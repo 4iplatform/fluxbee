@@ -21,7 +21,8 @@
 
 | Versión | Fecha (ART) | Commit | Alcance | Estado | Rollback |
 |---|---|---|---|---|---|
-| **0.1.71** | 2026-10-16 | `73f7132` | motherbee + spokes (core) | ✅ live | snap `pre-gate-0-1-71` (las 4 VMs) · `apt install fluxbee=0.1.70` |
+| **0.1.72** | 2026-10-16 | `17e1edd` | motherbee + spokes (core) | ✅ live | snap `pre-sync-0-1-72` (las 4 VMs) · `apt install fluxbee=0.1.71` |
+| **0.1.71** | 2026-10-16 | `73f7132` | motherbee + spokes (core) | ✅ reemplazado por 0.1.72 | snap `pre-gate-0-1-71` (las 4 VMs) · `apt install fluxbee=0.1.70` |
 | **0.1.70** | 2026-10-16 | `c289bb3` | motherbee + spokes (core) | ✅ reemplazado por 0.1.71 | snap `pre-wf-0-1-70` (las 4 VMs) · `apt install fluxbee=0.1.69` |
 | **0.1.69** | 2026-10-15 | `6f03310` | motherbee + spokes (core) | ✅ reemplazado por 0.1.70 | snap `pre-teardown-0-1-69` (las 4 VMs) · `apt install fluxbee=0.1.68` |
 | **0.1.68** | 2026-10-15 | `1b47c3e` | motherbee + spokes (core) | ✅ reemplazado por 0.1.69 | snap `pre-cloud-0-1-68` (las 4 VMs) · `apt install fluxbee=0.1.67` |
@@ -80,6 +81,41 @@
 > (`dpkg-scanpackages -m`) para rollback, pero su detalle vive en la bitácora, no acá.
 
 ---
+
+## 0.1.72 — Un deploy de WF en un worker hace que el motherbee anuncie su paquete (A-68, gate de 0.1.71)
+
+- **Fecha:** 2026-10-16 (ART) · **Versión anterior:** 0.1.71 · **Commits:** `a053102` y `17e1edd`.
+  Sale de lo que encontró el gate de 0.1.71.
+  - `a053102` pedía escanear también en el worker y esperar a que su carpeta quedara quieta.
+  - Leído contra Syncthing 2.0.14 antes de publicarlo, no servía: el worker trae apenas el
+    motherbee anuncia, y un escaneo en el worker no trae nada.
+  - Se corrigió en `17e1edd`. El paquete armado con `a053102` no se publicó.
+- **Alcance:** motherbee + los tres spokes (core-update).
+- **Qué cambió:**
+  - **En un worker, después de publicar,** SY.wf-rules le pide al admin un `sync_hint` sobre el
+    `fluxbee-dist-runtimes` del motherbee. El motherbee escanea ya y anuncia el paquete.
+  - **Mientras el paquete no esté,** pide el mismo escaneo antes de cada reintento.
+- **Deploy:** build de `17e1edd` en 6 min, publish en 9 s, deploy en 176 s. Snapshots
+  `pre-sync-0-1-72` en las 4 VMs (se borró `pre-teardown-0-1-69`). 0.1.72 con el mismo manifest
+  (`acbb2efd`) en los 4, health `failed=0`.
+- **Gate, en el peor caso:** recién hecho el core-update, y el E2E de worker1 justo después del
+  borrado del E2E del motherbee (lo que falló en 0.1.71).
+  - **El E2E del ciclo de vida en el motherbee:** 35/35.
+  - **El E2E en worker1:** 35/35.
+    - El primer deploy tardó 4 s: el paquete llegó 1 s después de publicado, en el mismo pull que
+      el borrado del workflow anterior.
+    - La v2 llegó en 2 s.
+    - El borrado después del rollback no dejó paquetes (el arreglo de 0.1.71).
+  - **Por Archi:**
+    - el deploy y el borrado tardan 1 s cada uno;
+    - el nodo arranca `HEALTHY` con `launched_by: archi`;
+    - una clave de `_system` que no conoce queda en el archivo, y sigue `HEALTHY`.
+  - **Un anuncio le gana a la espera de Syncthing:** un pull del manifest falló y Syncthing anotó
+    que reintentaba en 1 min; con el anuncio siguiente lo trajo al segundo.
+  - **Limpieza:** el tenant de prueba (`wf-gate-0170`) se borró y se purgó. PROD quedó como antes:
+    solo el tenant raíz, los 28 ILK del core, ningún nodo WF y solo `wf.engine` entre los
+    runtimes `wf.*`.
+- **Rollback:** snapshot `pre-sync-0-1-72`, o `apt install fluxbee=0.1.71`.
 
 ## 0.1.71 — Un deploy de WF en un worker espera su paquete; el borrado deja la versión vigente para el final (A-68, gate de 0.1.70)
 

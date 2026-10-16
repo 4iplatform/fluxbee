@@ -1,6 +1,6 @@
 # WF nodes on the standard path — v1
 
-Status: design, 2026-10-16. Finding A-68 (`lab/logbook/FINDINGS.md`). Target release: 0.1.70.
+Status: validated on 8.x, 2026-10-16 (0.1.70 to 0.1.72). Finding A-68 (`lab/logbook/FINDINGS.md`).
 
 A `WF.*` node is a workflow node. It works at the same level as an AI or IO node and gets nothing
 more. Two things kept it off the standard path:
@@ -278,9 +278,10 @@ survives a CONFIG_SET.
 - **The admin's mesh surface:**
   - any node may still ask the admin for most actions (`kill_node`, `restart_node`,
     `set_node_config`…), since only IO.cloud and SY.wf-rules are gated;
-  - a workflow can send such an ADMIN_COMMAND (`send_message` with `meta.type: admin`);
-  - removing rule (4)'s extra names closes the SYSTEM path, not this one. That belongs to the
-    postponed security work (A-22).
+  - a workflow cannot: the engine refuses any `SY.*` or `RT.*` target when it sends
+    (`wfcel.IsForbiddenSystemTarget`);
+  - removing rule (4)'s extra names closes the SYSTEM path, not this one. That is A-62, parked
+    with A-60 (nodes without root).
 - **Other unlocked read-modify-writes:** the OPA version counter (`next_opa_version`) has no lock
   either. It is reachable only by operator actions (the HTTP API could already race it).
 - **WF configs written before 0.1.70:** a WF node that once got a direct CONFIG_SET wrote
@@ -315,3 +316,15 @@ survives a CONFIG_SET.
   config brings it back;
 - an unknown `_system` key does not stop it;
 - the new system policy is loaded.
+
+**Result (0.1.70 to 0.1.72; detail in `lab/DEPLOYMENTS.md`):**
+- All of the above passed on the motherbee and on worker1. A deploy and a delete from Archi passed
+  too, each in about a second, with `launched_by: archi`.
+- The policy is compiled into every router. No hive logged a denial after any of the deploys or
+  gates, so nothing still uses the old path. The denials themselves are covered by the truth
+  table.
+- The gates found three things on worker1, fixed on the way:
+  - an update that did not wait for its package (0.1.71);
+  - a delete that left packages on the motherbee (0.1.71);
+  - a first deploy that waited on the motherbee's Syncthing watcher (0.1.72, §2.2).
+- In the last gate, a first deploy on worker1 right after another workflow's delete took 4 s.
