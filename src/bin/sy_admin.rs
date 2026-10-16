@@ -1909,10 +1909,35 @@ async fn run_internal_admin_loop(
     mut rx: RpcCommandReceiver,
 ) {
     while let Some(msg) = rx.recv().await {
+        // A command whose handler calls back into this loop runs in its own task: run here, the
+        // loop would wait for the orchestrator while the orchestrator waits for the loop.
+        if internal_command_calls_back(&msg) {
+            let (ctx, client) = (ctx.clone(), client.clone());
+            tokio::spawn(async move {
+                if let Err(err) = handle_internal_admin_command(&ctx, &client, &msg).await {
+                    tracing::warn!(error = %err, "internal admin command handling failed");
+                }
+            });
+            continue;
+        }
         if let Err(err) = handle_internal_admin_command(&ctx, &client, &msg).await {
             tracing::warn!(error = %err, "internal admin command handling failed");
         }
     }
+}
+
+/// A node teardown (kill_node or remove_node_instance with purge_instance) makes the orchestrator
+/// call this admin back over the mesh (delete_ilk, purge_ilk, vault_list, vault_delete). Over the
+/// mesh, as Fluxbee Cloud's delete_node arrives, the serial loop deadlocked until the timeouts:
+/// the identity marked but not purged and Cloud answered ADMIN_UNAVAILABLE (0.1.68 gate on 8.x,
+/// FINDINGS A-67). The operator's HTTP path was never affected: it runs in its own task.
+fn internal_command_calls_back(msg: &Message) -> bool {
+    msg.meta.msg.as_deref() == Some(MSG_ADMIN_COMMAND)
+        && msg
+            .payload
+            .get("action")
+            .and_then(|action| action.as_str())
+            .is_some_and(|action| matches!(action, "kill_node" | "remove_node_instance"))
 }
 
 async fn run_system_command_loop(
@@ -15944,6 +15969,36 @@ mod tests {
         let mut planted = node("IO.slack.a@motherbee");
         planted["require_launched_by"] = serde_json::json!("archi");
         assert!(check("kill_node", planted).is_err());
+    }
+
+    /// A teardown calls the admin back: the mesh loop hands it to its own task (0.1.68 gate).
+    #[test]
+    fn a_teardown_runs_off_the_mesh_loop() {
+        let command = |action: &str| {
+            let mut msg = Message {
+                routing: Routing {
+                    src: "u".to_string(),
+                    src_l2_name: None,
+                    dst: Destination::Unicast("SY.admin@motherbee".to_string()),
+                    ttl: 4,
+                    trace_id: "t".to_string(),
+                },
+                meta: Meta {
+                    msg_type: "admin".to_string(),
+                    msg: Some(MSG_ADMIN_COMMAND.to_string()),
+                    ..Meta::default()
+                },
+                payload: serde_json::json!({ "action": action, "params": {} }),
+            };
+            msg.meta.msg = Some(MSG_ADMIN_COMMAND.to_string());
+            msg
+        };
+        assert!(internal_command_calls_back(&command("kill_node")));
+        assert!(internal_command_calls_back(&command(
+            "remove_node_instance"
+        )));
+        assert!(!internal_command_calls_back(&command("delete_ilk")));
+        assert!(!internal_command_calls_back(&command("run_node")));
     }
 
     #[test]

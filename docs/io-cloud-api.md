@@ -684,7 +684,7 @@ every op of §5 with a one-line summary, from the hive itself.
 
 ```text
 you / the edge wait   30 s
-IO.cloud waits        20 s for the hive (25 s for provision_node)
+IO.cloud waits        20 s for the hive (25 s for provision_node, stop_node and delete_node)
 ```
 
 A request that takes between 20 (25) and 30 s answers `ADMIN_UNAVAILABLE` **while it may still be
@@ -694,6 +694,8 @@ completing inside**. Treat it as **unknown**, not failed:
 - `delete_token`: a retry of a delete that did complete answers `KEY_NOT_FOUND`.
 - `provision_node`: a retry answers `NODE_ALREADY_EXISTS`, which may mean the timed-out attempt
   worked. There is no idempotency key (`request_id` is for traces only); ask the operator.
+- `delete_node`: a retry answers `NODE_NOT_FOUND` once the timed-out attempt finished; read
+  `list_nodes` to know.
 
 **IO.cloud serves one request at a time.** Concurrent calls queue, and a queued one can spend the
 edge's 30 s and get a 504. Serialize your calls.

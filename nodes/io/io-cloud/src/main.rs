@@ -1417,7 +1417,11 @@ async fn dispatch_cloud_op(
             target: hive.as_deref(),
             params: admin_params,
             request_id,
-            timeout: Duration::from_secs(if action == "run_node" { 25 } else { 20 }),
+            // Launching a node and tearing one down take the longest; both stay under the edge's 30 s.
+            timeout: Duration::from_secs(match action {
+                "run_node" | "kill_node" => 25,
+                _ => 20,
+            }),
         })
         .await
     {

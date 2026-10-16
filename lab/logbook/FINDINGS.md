@@ -1048,7 +1048,20 @@ Visto al arreglar los e2e de A-37, leyendo `src/router/mod.rs` y `src/shm/mod.rs
     - el script de reinicio del laboratorio baja el nodo como un reinicio, no con un stop.
   - **Documentados:** los nodos lanzados antes de 0.1.68 no los maneja Cloud; `launched_by` de un
     pedido directo al orquestador se toma como viene (A-22).
-- **Validación en 8.x:** pendiente, con 0.1.68.
+- **Encontrado en el gate de 0.1.68 (8.x, 2026-10-16), arreglado para 0.1.69:**
+  - **`delete_node` desde Cloud se trababa.** El admin atiende de a uno los comandos que llegan
+    por la malla. El kill con purga que pide Cloud espera al orquestador, y el orquestador, para
+    limpiar, le pide al admin borrar la identidad y las claves del nodo; ese pedido queda en cola
+    detrás. Resultado: timeout para Cloud (`ADMIN_UNAVAILABLE`), la identidad marcada sin purgar
+    (el nombre reservado) y la clave propia borrada recién cuando el admin se liberó. Al operador
+    no le pasaba: lo suyo llega por HTTP, en su propia tarea. Ahora el admin corre en su propia
+    tarea los comandos que lo vuelven a llamar (kill y remove de nodos), y IO.cloud le da 25 s a
+    `delete_node`.
+  - **Un SY de otro hive leyendo una clave del génesis mientras identity se reinicia** (el deploy)
+    recibía `UNAUTHORIZED` una vez: el vault solo conoce de memoria a los SY de su hive y a los
+    otros por la SHM. Ahora contesta `IDENTITY_UNAVAILABLE`, que se reintenta, sin dar nada de más.
+    Venía de antes; en este deploy le tocó a `SY.cognition@worker1`, que leyó bien 42 s después.
+- **Validación en 8.x:** 0.1.68 en PROD; el resto del gate pasó. Falta `delete_node`, con 0.1.69.
 
 ### A-66 ✅ VALIDADO EN 8.x (0.1.67, 2026-10-15) — Un tenant suspendido seguía arrancando nodos, y borrar un tenant marcaba a su gente
 

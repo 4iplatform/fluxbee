@@ -1712,6 +1712,16 @@ fn authorize_read(
             if caller.ilk_type.as_deref() == Some("system") {
                 return Ok(());
             }
+            // A system node of another hive the identity SHM does not hold yet (identity is
+            // restarting, as in a deploy): retry, not refused. Nothing is handed out without the
+            // SHM; only the answer says to come back (0.1.68 gate on 8.x: SY.cognition@worker1
+            // was refused once while the motherbee's identity restarted).
+            if caller.ilk_type.is_none() && caller_is_a_system_node_by_name(caller) {
+                return Err(VaultError::CallerUnknown(format!(
+                    "{} is a system node the identity SHM does not hold yet; retry",
+                    caller.l2_name.as_deref().unwrap_or_default()
+                )));
+            }
         }
         // (2b) The caller's tenant's general secret: every node charged to the tenant reads it
         // (requires the caller's tenant from the SHM). Cloud makes a secret general by saving it
@@ -1723,6 +1733,17 @@ fn authorize_read(
         }
     }
     Err(VaultError::Unauthorized)
+}
+
+/// The caller proved, by the router-stamped name, that it is a system node: a `SY.*` name and the
+/// ILK derived from it (what `check_caller_binding` accepts without the SHM).
+fn caller_is_a_system_node_by_name(caller: &Caller) -> bool {
+    match (caller.l2_name.as_deref(), caller.ilk_id.as_deref()) {
+        (Some(name), Some(ilk)) => {
+            name.starts_with("SY.") && fluxbee_sdk::deterministic_system_ilk_id(name) == ilk
+        }
+        _ => false,
+    }
 }
 
 /// A general secret: no owner and no assigned node. Every node of its tenant reads it
@@ -2468,6 +2489,50 @@ mod tests {
         let err = tenant_check("tnt:client-a", || Ok(Some("active".to_string())))
             .expect_err("not a uuid");
         assert_eq!(err.code(), "UNAUTHORIZED");
+    }
+
+    /// A system node of another hive the SHM does not hold yet is told to retry, never handed a
+    /// genesis secret and never refused for good.
+    #[test]
+    fn a_remote_system_node_the_shm_does_not_hold_yet_retries() {
+        let name = "SY.cognition@worker1";
+        let remote = Caller {
+            l2_name: Some(name.to_string()),
+            ilk_id: Some(fluxbee_sdk::deterministic_system_ilk_id(name)),
+            tenant_id: None,
+            ilk_type: None,
+        };
+        let genesis_pool = metadata(fluxbee_sdk::DEFAULT_ROOT_TENANT_ID, None);
+        let local_system = HashSet::new();
+        let err = authorize_read(&remote, &genesis_pool, &local_system, true).unwrap_err();
+        assert_eq!(err.code(), "IDENTITY_UNAVAILABLE");
+        // Once the SHM holds it, it reads.
+        let known = Caller {
+            ilk_type: Some("system".to_string()),
+            ..remote.clone()
+        };
+        assert!(authorize_read(&known, &genesis_pool, &local_system, true).is_ok());
+        // A name that is not a system node's, or an ILK that is not the one derived from it: refused.
+        let impostor = Caller {
+            l2_name: Some("IO.x@worker1".to_string()),
+            ..remote.clone()
+        };
+        assert_eq!(
+            authorize_read(&impostor, &genesis_pool, &local_system, true)
+                .unwrap_err()
+                .code(),
+            "UNAUTHORIZED"
+        );
+        let wrong_ilk = Caller {
+            ilk_id: Some("ilk:11111111-1111-4111-8111-111111111111".to_string()),
+            ..remote
+        };
+        assert_eq!(
+            authorize_read(&wrong_ilk, &genesis_pool, &local_system, true)
+                .unwrap_err()
+                .code(),
+            "UNAUTHORIZED"
+        );
     }
 
     #[test]
