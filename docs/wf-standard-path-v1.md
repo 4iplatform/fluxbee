@@ -158,20 +158,22 @@ limit.
 **A worker deploy brings its package to the hive first.**
 - A package published on the motherbee reaches a worker through Syncthing. Two delays are built
   in there:
-  - the motherbee's watcher aggregates changes (10 s, up to a minute when the runtimes folder is
-    busy, as after a core update or other deploys);
+  - the motherbee's watcher aggregates changes: 10 s, and up to a minute when the change sits
+    next to deletions, as after a core update or a workflow delete;
   - a worker whose folder failed a pull waits before it retries. A workflow delete makes it fail
     once on the deleted directories: "not empty", parent before children.
 - The 0.1.71 gate measured 62 s from publish to the package's files on worker1, with the manifest
   there after 12 s.
-- So on a worker, right after publishing, SY.wf-rules asks the admin for two `sync_hint`s on
-  `fluxbee-dist-runtimes`:
-  1. on the motherbee, which scans now and announces the package, waiting up to 5 s;
-  2. on its own hive, which scans and pulls now, waiting up to 20 s for it to settle.
-- While a node call still answers that the package is not here, it nudges its hive again before
-  each retry.
-- This is an explicit, bounded step of the deploy. If it does not settle, the retries below still
-  wait for the package, and say so when it never comes.
+- A worker pulls as soon as the motherbee announces a change, even while it waits to retry a
+  failed pull. A scan on the worker would not make it pull (Syncthing 2.0 pulls after a local
+  scan only when the scan found local changes).
+- So on a worker, right after publishing, SY.wf-rules asks the admin for a `sync_hint` on the
+  motherbee's `fluxbee-dist-runtimes`: the motherbee scans now and announces the package. It
+  waits up to 5 s for the scan.
+- While a node call still answers that the package is not here, it asks for the same scan again,
+  without waiting, before each retry.
+- This is an explicit, bounded step of the deploy. If the package still does not come, the
+  retries below wait for it, and say so when it never comes.
 
 **A workflow package is not on a hive until its definition is.**
 - Syncthing can deliver a package's manifest entry and `package.json` before `flow/definition.json`.

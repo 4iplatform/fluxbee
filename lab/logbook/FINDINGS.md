@@ -1103,11 +1103,15 @@ Visto al arreglar los e2e de A-37, leyendo `src/router/mod.rs` y `src/shm/mod.rs
       core-update recién hecho, los borrados del E2E anterior), tarda en anunciarlos.
     - El borrado de un workflow (y la limpieza de versiones de un core-update) hace además que la
       carpeta del worker falle una vez ("not empty") y espere antes de reintentar.
-  - **Arreglo:** en un worker, después de publicar, SY.wf-rules pide por el admin dos
-    `sync_hint` sobre `fluxbee-dist-runtimes`.
-    - En el motherbee: escanea ya y anuncia el paquete.
-    - En su hive: escanea y trae ya, y espera a que quede quieto.
-    - Mientras el paquete no esté, empuja a su hive antes de cada reintento.
+  - **Arreglo:** en un worker, después de publicar, SY.wf-rules le pide al admin un `sync_hint`
+    sobre el `fluxbee-dist-runtimes` del motherbee.
+    - El motherbee escanea ya y anuncia el paquete. El worker lo trae apenas llega el anuncio,
+      aunque esté esperando para reintentar un pull fallido.
+    - Mientras el paquete no esté, pide el mismo escaneo antes de cada reintento.
+    - Escanear en el worker no sirve: Syncthing 2.0 hace un pull después de un escaneo solo si
+      encontró cambios locales. La primera versión del arreglo (`a053102`) hacía eso y además
+      esperaba hasta 20 s a que la carpeta del worker quedara quieta, cosa que después de un
+      borrado fallido no pasa. Se corrigió antes de publicarla.
     - Es un paso explícito y acotado del deploy.
 - **Lo que no entra (anotado):**
   - **La superficie del admin por la malla** sigue abierta a cualquier nodo para casi todas las

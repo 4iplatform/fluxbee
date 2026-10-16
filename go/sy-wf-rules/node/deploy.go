@@ -134,8 +134,8 @@ func (s *Service) deployPublishedWorkflow(ctx context.Context, workflowName stri
 		}, "Package published, but the admin client is unavailable. Deployment did not run."
 	}
 
-	s.settleRuntimesForThisHive(ctx)
-	nudge := func() { s.nudgeRuntimes(ctx) }
+	s.announceRuntimes(ctx, 5000)
+	nudge := func() { s.announceRuntimes(ctx, 0) }
 	_, err := s.nodes.GetNodeConfig(ctx, nodeName)
 	if err == nil {
 		// The rebind changes only the binding: set_node_config merges the patch into the node's
@@ -238,33 +238,20 @@ func (s *Service) deployPublishedWorkflow(ctx context.Context, workflowName stri
 	}, ""
 }
 
-// settleRuntimesForThisHive brings a package just published on the motherbee to this hive before
-// the node is rebound or launched. On a worker it travels through Syncthing, and two waits are
-// built in there: the motherbee's watcher announces a change only after 10 s, and a worker whose
-// runtimes folder failed a pull (a workflow deleted just before, whose directories it could not
-// remove in one pass) retries only after a minute. The 0.1.71 gate on 8.x saw a first deploy on
-// worker1 wait more than 45 s for that. So the deploy asks both, through the admin's sync_hint, to
-// scan now, and waits for this hive to settle. If it does not, the node calls below still wait
-// for the package, and say so when it never comes (A-68).
-func (s *Service) settleRuntimesForThisHive(ctx context.Context) {
+// announceRuntimes makes the motherbee's Syncthing announce a package it just published, so that a
+// worker pulls it now. On a worker the package travels through Syncthing, and the motherbee's
+// watcher announces a change only after its delay: 10 s, and up to a minute when the change sits
+// next to deletions. The 0.1.71 gate on 8.x saw a first deploy on worker1, right after another
+// workflow was deleted, get its package 62 s after publishing. A scan on the motherbee announces
+// it at once, and a worker pulls as soon as an announcement arrives, even while it waits to retry
+// a failed pull. A scan on the worker would not make it pull. Called with a wait (for the scan to
+// finish) before the node calls, and without one before each retry while the package is missing
+// (A-68).
+func (s *Service) announceRuntimes(ctx context.Context, waitMs int) {
 	if s.admin == nil || s.cfg.HiveID == fluxbeesdk.PrimaryHiveID {
 		return
 	}
-	if err := s.admin.SyncRuntimes(ctx, fluxbeesdk.PrimaryHiveID, 5000); err != nil {
+	if err := s.admin.SyncRuntimes(ctx, fluxbeesdk.PrimaryHiveID, waitMs); err != nil {
 		log.Printf("sync_hint on %s: %v", fluxbeesdk.PrimaryHiveID, err)
-	}
-	if err := s.admin.SyncRuntimes(ctx, s.cfg.HiveID, 20000); err != nil {
-		log.Printf("sync_hint on %s: %v", s.cfg.HiveID, err)
-	}
-}
-
-// nudgeRuntimes asks this hive's Syncthing to scan and pull now, without waiting; called while a
-// package is still missing on a worker.
-func (s *Service) nudgeRuntimes(ctx context.Context) {
-	if s.admin == nil || s.cfg.HiveID == fluxbeesdk.PrimaryHiveID {
-		return
-	}
-	if err := s.admin.SyncRuntimes(ctx, s.cfg.HiveID, 0); err != nil {
-		log.Printf("sync_hint nudge on %s: %v", s.cfg.HiveID, err)
 	}
 }

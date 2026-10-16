@@ -21,7 +21,9 @@
 
 | Versión | Fecha (ART) | Commit | Alcance | Estado | Rollback |
 |---|---|---|---|---|---|
-| **0.1.69** | 2026-10-15 | `6f03310` | motherbee + spokes (core) | ✅ live | snap `pre-teardown-0-1-69` (las 4 VMs) · `apt install fluxbee=0.1.68` |
+| **0.1.71** | 2026-10-16 | `73f7132` | motherbee + spokes (core) | ✅ live | snap `pre-gate-0-1-71` (las 4 VMs) · `apt install fluxbee=0.1.70` |
+| **0.1.70** | 2026-10-16 | `c289bb3` | motherbee + spokes (core) | ✅ reemplazado por 0.1.71 | snap `pre-wf-0-1-70` (las 4 VMs) · `apt install fluxbee=0.1.69` |
+| **0.1.69** | 2026-10-15 | `6f03310` | motherbee + spokes (core) | ✅ reemplazado por 0.1.70 | snap `pre-teardown-0-1-69` (las 4 VMs) · `apt install fluxbee=0.1.68` |
 | **0.1.68** | 2026-10-15 | `1b47c3e` | motherbee + spokes (core) | ✅ reemplazado por 0.1.69 | snap `pre-cloud-0-1-68` (las 4 VMs) · `apt install fluxbee=0.1.67` |
 | **0.1.67** | 2026-10-15 | `e85041d` | motherbee + spokes (core) | ✅ live | snap `pre-tenant-0-1-67` (las 4 VMs) · `apt install fluxbee=0.1.66` (la migración v4 no se deshace; ver la entrada) |
 | **0.1.66** | 2026-10-14 | `96c8d77` | motherbee + spokes (core) | ✅ live | snap `pre-secrets-0-1-66` (las 4 VMs) · `apt install fluxbee=0.1.65` |
@@ -78,6 +80,66 @@
 > (`dpkg-scanpackages -m`) para rollback, pero su detalle vive en la bitácora, no acá.
 
 ---
+
+## 0.1.71 — Un deploy de WF en un worker espera su paquete; el borrado deja la versión vigente para el final (A-68, gate de 0.1.70)
+
+- **Fecha:** 2026-10-16 (ART) · **Versión anterior:** 0.1.70 · **Commit:** `73f7132`. Sale de lo
+  que encontró el gate de 0.1.70.
+- **Alcance:** motherbee + los tres spokes (core-update).
+- **Qué cambió:**
+  - **SY.wf-rules** espera el paquete de un workflow hasta 45 s, con un plazo de 60 s por pedido;
+    el admin lo espera 75 s y Archi 90 s.
+  - **Al borrar un workflow,** una versión que el admin rechaza como vigente
+    (`RUNTIME_CURRENT_CONFLICT`) se reintenta cuando las demás ya no están.
+- **Deploy:** build de `73f7132` en 12 min, publish en 14 s, deploy en 186 s. Snapshots
+  `pre-gate-0-1-71` en las 4 VMs (se borró `pre-cloud-0-1-68`). 0.1.71 con el mismo manifest
+  (`94ae3776`) en los 4, health `failed=0`.
+- **Gate:**
+  - **El E2E del ciclo de vida en el motherbee:** 35/35.
+  - **Encontrado en worker1, arreglado en 0.1.72:** el primer deploy esperó 45 s y el paquete no
+    llegó (`RUNTIME_NOT_PRESENT`).
+    - El manifest llegó a los 12 s y los archivos del paquete a los 62 s.
+    - El watcher del motherbee agrupa los cambios mientras la carpeta de runtimes está agitada, y
+      la del worker espera para reintentar después de fallar al borrar directorios.
+    - La limpieza del E2E borró el workflow y no dejó paquetes.
+- **Rollback:** snapshot `pre-gate-0-1-71`, o `apt install fluxbee=0.1.70`.
+
+## 0.1.70 — Los nodos WF por el camino estándar: SY.wf-rules por el admin, el plano de control en el SDK de Go (A-68)
+
+- **Fecha:** 2026-10-16 (ART) · **Versión anterior:** 0.1.69 · **Commit:** `c289bb3`. Diseño en
+  `docs/wf-standard-path-v1.md`, aprobado por el operador el 2026-10-15. Una revisión (1
+  bloqueante, 7 a arreglar), arreglada antes del build.
+- **Alcance:** motherbee + los tres spokes (core-update).
+- **Qué cambió:**
+  - **SY.admin** atiende cada comando de la malla en su propia tarea, y un lock serializa los
+    cambios del manifest de runtimes. El deploy de un workflow desde Archi vuelve a andar.
+  - **SY.wf-rules** lanza, reinicia, configura y borra sus nodos WF por el admin, que lo deja
+    actuar solo sobre los `WF.*` de su hive. Acepta operaciones solo del admin.
+  - **`launched_by`** es quien pidió el deploy: `operator` por HTTP, `archi` desde Archi.
+  - **La política de sistema:** la regla (4) queda solo para SY.admin, sin SY.wf-rules ni
+    `WF.orch.diag`.
+  - **El SDK de Go** tiene el plano de control de los nodos administrados y el nodo WF lo usa: con
+    una config que no puede usar queda arriba, en FAILED_CONFIG y con el motivo.
+  - **El orquestador** no arranca un paquete de workflow sin su `flow/definition.json`
+    (`RUNTIME_NOT_PRESENT`).
+- **Deploy:** build de `c289bb3` en 25 min, publish en 14 s, deploy en 221 s. Snapshots
+  `pre-wf-0-1-70` en las 4 VMs (se borró `pre-tenant-0-1-67`). 0.1.70 con el mismo manifest
+  (`e3986977`) en los 4, health `failed=0`.
+- **Gate, con un tenant de prueba, por el HTTP del operador y por Archi:**
+  - **El E2E del ciclo de vida en el motherbee** (`scripts/wf_rules_lifecycle_e2e.sh`): 35/35.
+    - Compile, apply con spawn, estado, update, rollback y delete, todo por el admin.
+    - El nodo queda con `launched_by: operator`.
+    - Con un error en su config queda `RUNNING` y `DEGRADED` con `invalid_config`, sin
+      reinicios; con la config arreglada y un reinicio vuelve a `HEALTHY`.
+  - **Por Archi** (SCMD por la malla):
+    - el deploy tarda 1,3 s y el nodo arranca `HEALTHY` con `launched_by: archi`;
+    - una clave de `_system` que el nodo no conoce queda en el archivo y el nodo sigue `HEALTHY`;
+    - el borrado tarda 1,3 s y el nodo desaparece.
+  - **Encontrado en worker1, arreglado en 0.1.71:**
+    - la actualización no esperó lo suficiente al paquete nuevo (`restart_failed`);
+    - el borrado dejó los paquetes en el motherbee (`RUNTIME_CURRENT_CONFLICT`). Se borraron por
+      el admin.
+- **Rollback:** snapshot `pre-wf-0-1-70`, o `apt install fluxbee=0.1.69`. En PROD no hay nodos WF.
 
 ## 0.1.69 — Cloud borra sus nodos sin trabar al admin; un SY de otro hive reintenta mientras identity arranca (A-67)
 

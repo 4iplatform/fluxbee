@@ -305,7 +305,7 @@ func TestAWFNodeThatCannotCountItsInstancesSaysWhy(t *testing.T) {
 // On a worker the package travels through Syncthing: the deploy asks the motherbee and this hive
 // to scan now before it rebinds or launches the node, and nudges this hive while the package is
 // still missing. On the motherbee the package is already local (A-68, 0.1.71 gate).
-func TestAWorkerDeploySettlesItsRuntimesFirst(t *testing.T) {
+func TestAWorkerDeployHasTheMotherbeeAnnounceItsPackage(t *testing.T) {
 	for _, hive := range []string{"motherbee", "worker1"} {
 		svc := newTestService(t)
 		svc.cfg.HiveID = hive
@@ -327,7 +327,7 @@ func TestAWorkerDeploySettlesItsRuntimesFirst(t *testing.T) {
 		hints := strings.Join(svc.admin.(*fakeAdminClient).syncHints, ",")
 		want := ""
 		if hive == "worker1" {
-			want = "motherbee/5000,worker1/20000,worker1/0"
+			want = "motherbee/5000,motherbee/0"
 		}
 		if hints != want {
 			t.Fatalf("%s: sync hints = %q, want %q", hive, hints, want)

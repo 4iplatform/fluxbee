@@ -24,7 +24,7 @@ type adminClient interface {
 	// RemoveRuntimeVersion deletes one published version from the motherbee's dist and manifest.
 	RemoveRuntimeVersion(ctx context.Context, runtimeName, version string) error
 	// SyncRuntimes asks a hive's Syncthing to scan its runtimes folder now (sync_hint), and
-	// waits for it to settle when waitMs > 0.
+	// waits for the folder to settle when waitMs > 0.
 	SyncRuntimes(ctx context.Context, hive string, waitMs int) error
 }
 
