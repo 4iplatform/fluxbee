@@ -995,6 +995,71 @@ Visto al arreglar los e2e de A-37, leyendo `src/router/mod.rs` y `src/shm/mod.rs
   binario generaría uno como root); si no, el `myID` del Syncthing en marcha. Nunca `config.xml`.
 - **Estado:** construido; lo ejercita el próximo join (el de A-48).
 
+### A-70 🔵 DISEÑO REVISADO (2026-10-16) — El "NATS" de los registros vive dentro del router, pierde datos y solo guarda lo del motherbee
+
+- **Cómo salió:** diseñando la etapa 5 (tokens), el registro iba a viajar por NATS. El operador
+  pidió revisar NATS en general y entre hives. Diseño: `docs/router-stream-v1.md`.
+- **Qué pasa (verificado en el código de 0.1.74 y medido en PROD el 2026-10-16):**
+  - **No es NATS:** es un broker propio que habla parte del protocolo de texto de NATS y corre
+    adentro del proceso del router, uno por hive, sin enlace entre hives.
+  - **Los mensajes no viajan por ahí.** El router publica una copia de cada mensaje de usuario
+    como turno, con una conexión TCP nueva por cada publicación.
+  - **Su durabilidad es débil:**
+    - cada tema es una cola en memoria de hasta 50.000 mensajes, que pasado el tope borra los más
+      viejos aunque nadie los haya leído, en silencio;
+    - un mensaje en vuelo por consumidor;
+    - el disco es un único JSON que se reescribe entero cada 500 ms.
+  - **Solo llega a la base lo del motherbee,** porque SY.storage corre solo ahí:
+    - worker1 tenía 67 turnos que nunca se guardaron;
+    - el ingress (DMZ) guardaba en disco 597 turnos del tráfico del edge que nadie consume, e iban
+      a crecer hasta 50.000.
+
+    Es el hueco que A-38 dejó anotado ("que lo de los workers llegue al motherbee"), y abarca todos
+    los hives menos el motherbee.
+  - **Tres temas sin productor** (`storage.events`, `storage.items`, `storage.reactivation`):
+    solo los usa un script E2E.
+  - **El plano del log vive en el camino rápido del router.** El operador: *"todo lo que va a DB es
+    de log, alta cantidad de datos, tiempos largos... eso choca contra la dinámica de fluxbee
+    principalmente en los routers, que es alta velocidad"*.
+- **Decisiones del operador (2026-10-16, en el doc §0):**
+  - NATS muere (*"quedó como algo inicial viejo"*).
+  - El router gana un stream simple, uno por router, `RT.<router>.stream@<hive>`. La tubería es
+    el socket de Fluxbee.
+  - Mejor esfuerzo para todos.
+  - Ventana chica: 2 minutos y 32 MB por router, en constantes visibles. Al acumularse: alarma y
+    log reducido.
+  - El router nunca espera.
+  - Orden:
+    1. el stream con SY.storage;
+    2. cognition y policy, y NATS borrado;
+    3. los tokens.
+- **Revisión (una ronda, tres miradas: el router, el camino de los datos, los tokens):** todo
+  incorporado al doc.
+  - **Bugs vivos que encontró** (se arreglan en la etapa 1a, sobre el NATS de hoy):
+    - **las respuestas de la IA no se guardan en `turns`:** la clave `(ctx, seq)` sale del
+      `trace_id` y la respuesta reusa el del pedido, así que `ON CONFLICT DO NOTHING` la tira;
+    - **SY.cognition procesa varias veces cada turno:** confirma recién al terminar y el broker
+      reenvía cada 2 s. Un turno de prueba costó 3 o 4 llamados al modelo;
+    - **un frame de más de 128 KB mata un enlace para siempre** en los escritores de nodo, WAN e
+      IRP;
+    - **se descarta un mensaje de otro hive a un nodo de un router que no es el gateway;**
+    - **SY.storage no se reconecta a postgres;**
+    - **`storage_inbox` no se purga nunca,** y su reintento corre solo al arrancar.
+  - **Del diseño:**
+    - `RT.` reservado, con la verificación del PID del router;
+    - el disco del stream en su propio hilo;
+    - las colas separadas para turnos y para nodos;
+    - los acks autenticados;
+    - el cursor y la secuencia a prueba de recortes y reinicios;
+    - un ack al recibir para cognition y policy, sin reprocesar lo repetido;
+    - una conexión propia de SY.storage para lo que llega en lotes.
+  - **Para el operador:** seis preguntas (Q1 a Q6 del doc). Ninguna frena la etapa 1.
+- **Etapas:**
+  1. **1a:** los bugs vivos;
+  2. **1b:** el stream con SY.storage;
+  3. **2:** cognition y policy, y NATS borrado;
+  4. **3:** los tokens.
+
 ### A-69 ✅ VALIDADO EN 8.x (0.1.73 y 0.1.74, 2026-10-16) — SY.cognition fallaba en cada turno con los dos proveedores: mandaba `temperature`
 
 - **Cómo salió:** el operador pidió probar su key de Anthropic en toda la infra (2026-10-16).
