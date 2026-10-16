@@ -21,6 +21,8 @@
 
 | Versión | Fecha (ART) | Commit | Alcance | Estado | Rollback |
 |---|---|---|---|---|---|
+| **0.1.69** | 2026-10-15 | `6f03310` | motherbee + spokes (core) | ✅ live | snap `pre-teardown-0-1-69` (las 4 VMs) · `apt install fluxbee=0.1.68` |
+| **0.1.68** | 2026-10-15 | `1b47c3e` | motherbee + spokes (core) | ✅ reemplazado por 0.1.69 | snap `pre-cloud-0-1-68` (las 4 VMs) · `apt install fluxbee=0.1.67` |
 | **0.1.67** | 2026-10-15 | `e85041d` | motherbee + spokes (core) | ✅ live | snap `pre-tenant-0-1-67` (las 4 VMs) · `apt install fluxbee=0.1.66` (la migración v4 no se deshace; ver la entrada) |
 | **0.1.66** | 2026-10-14 | `96c8d77` | motherbee + spokes (core) | ✅ live | snap `pre-secrets-0-1-66` (las 4 VMs) · `apt install fluxbee=0.1.65` |
 | **0.1.65** | 2026-10-14 | `8b3e951` | motherbee + spokes (core) | ✅ live | snap `pre-scope-0-1-65` (las 4 VMs) · `apt install fluxbee=0.1.64` (la migración v3 no se deshace; ver la entrada) |
@@ -76,6 +78,77 @@
 > (`dpkg-scanpackages -m`) para rollback, pero su detalle vive en la bitácora, no acá.
 
 ---
+
+## 0.1.69 — Cloud borra sus nodos sin trabar al admin; un SY de otro hive reintenta mientras identity arranca (A-67)
+
+- **Fecha:** 2026-10-15 (ART) · **Versión anterior:** 0.1.68 · **Commit:** `6f03310`. Sale de lo
+  que encontró el gate de 0.1.68.
+- **Alcance:** motherbee + los tres spokes (core-update).
+- **Qué cambió:**
+  - **SY.admin:** los comandos que llegan por la malla y hacen que el orquestador lo vuelva a
+    llamar (kill y remove de nodos con purga) corren en su propia tarea. Antes el `delete_node` de
+    Cloud se trababa: el admin esperaba al orquestador y el orquestador al admin.
+  - **IO.cloud:** espera 25 s para `stop_node` y `delete_node`.
+  - **SY.vault:** a un SY de otro hive que la SHM todavía no tiene le contesta
+    `IDENTITY_UNAVAILABLE`, que se reintenta, en vez de `UNAUTHORIZED`. No entrega nada de más.
+- **Deploy:** build de `6f03310` en 9 min, publish en 16 s, deploy en 237 s. Snapshots
+  `pre-teardown-0-1-69` en las 4 VMs (se borró `pre-secrets-0-1-66`). 0.1.69 con el mismo manifest
+  (`baf673f4`) en los 4, health `failed=0`.
+- **Gate:**
+  - **El reinicio:** `SY.cognition@worker1` volvió a leer una clave del génesis en el hueco en que
+    identity arrancaba, y esta vez recibió `IDENTITY_UNAVAILABLE`; después leyó bien. Ningún
+    `UNAUTHORIZED` de un SY.
+  - **`delete_node` por la puerta pública:** contesta ok; la clave que el nodo tenía como propia se
+    borra y la asignada queda; el nombre queda libre (se volvió a crear y a borrar).
+  - **Limpieza:** PROD quedó como antes (solo el tenant raíz y los 28 ILK del core).
+- **Rollback:** snapshot `pre-teardown-0-1-69`, o `apt install fluxbee=0.1.68`.
+
+## 0.1.68 — Cloud maneja sus tenants y los nodos IO que lanzó; parar un nodo dura (A-67, etapa 4)
+
+- **Fecha:** 2026-10-15 (ART) · **Versión anterior:** 0.1.67 · **Commits:** `a5f1b2a` (el código del
+  rechazo de `set_ilk_tenant`), `b26de82` (etapa 4) y `1b47c3e` (la revisión). Diseño en
+  `docs/ilk-tenant-model-v1.md` §2.4 y D14, decidido con el operador el 2026-10-15. Una revisión (3
+  mayores, 4 menores), arreglada antes del build; el build que traía el primer mayor se frenó.
+- **Alcance:** motherbee + los tres spokes (core-update).
+- **Qué cambió:**
+  - **Tenants por Cloud:** `update_tenant` con estado (`active`, `suspended`), settings y sponsor;
+    `get_tenant` completo por el admin; `list_tenants` sin el génesis.
+  - **Nodos por Cloud:** `list_nodes`, `get_node_status`, y `start_node`, `stop_node` y
+    `delete_node` solo para los nodos IO que lanzó en su tenant (el admin anota quién lanzó cada
+    nodo; el hive del nodo, o el motherbee si el hive es de una versión anterior, chequea la
+    condición).
+  - **Parar dura, para todos.**
+  - **El nodo WF en Go** conoce `launched_by`.
+- **Deploy:** build de `1b47c3e` en 8 min, publish en 15 s, deploy en 216 s. Snapshots
+  `pre-cloud-0-1-68` (se borró `pre-scope-0-1-65`). 0.1.68 en los 4 (`a41a6af7`), health
+  `failed=0`, OPA `in_sync` 4/4.
+- **Gate, por la puerta pública con el bearer de Cloud y del lado del operador:**
+  - **El catálogo** lista 24 operaciones, con las 7 nuevas.
+  - **Tenants:**
+    - settings y sponsor editados y leídos de vuelta con `get_tenant`;
+    - `pending` rechazado (`INVALID_REQUEST`) y el génesis rechazado (`TENANT_ROOT_PROTECTED`);
+    - `list_tenants` sin el génesis.
+  - **Nodos:**
+    - s1, lanzado por Cloud y configurado al lanzarlo, aparece en `list_nodes` con
+      `launched_by: cloud` y solo su estado;
+    - un nodo de otro tenant da `NODE_NOT_FOUND`;
+    - o1, lanzado por el operador en el mismo tenant, le da `NODE_NOT_FOUND` a Cloud para arrancar,
+      parar y borrar;
+    - un nodo que no es IO da `INVALID_REQUEST`.
+  - **Parar dura:** Cloud paró s1 y siguió abajo más de una pasada del relanzamiento; arrancado,
+    volvió con la marca de relanzar.
+  - **Suspender por Cloud:** un nodo nuevo, `TENANT_NOT_ACTIVE`; el vault le niega la clave a s1;
+    reactivado, la vuelve a leer.
+  - **`a5f1b2a`:** mover un temporal de un tenant que no está borrado contesta
+    `INVALID_TENANT_TRANSITION` solo, con el detalle aparte.
+  - **Un workflow de prueba:** su nodo WF arrancó limpio (0 reinicios, `launched_by: system`).
+  - **Encontrado, arreglado en 0.1.69:** `delete_node` desde Cloud se trababa (timeout, la
+    identidad marcada sin purgar), y un SY de otro hive recibió un `UNAUTHORIZED` transitorio
+    mientras identity arrancaba.
+  - **Limpieza:** la identidad trabada purgada, o1 matado, personas, claves y tenants borrados por
+    Cloud y purgados. PROD quedó como antes.
+- **Rollback:** snapshot `pre-cloud-0-1-68`, o `apt install fluxbee=0.1.67`. Un nodo parado con 0.1.68
+  queda con `relaunch_on_boot: false`; con 0.1.67 tampoco se relanza solo.
 
 ## 0.1.67 — Un tenant que no está activo no arranca nodos y borrarlo no marca a nadie (A-66, etapa 3); el vault ata el ILK al nodo que manda (A-65)
 

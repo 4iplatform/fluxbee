@@ -995,7 +995,7 @@ Visto al arreglar los e2e de A-37, leyendo `src/router/mod.rs` y `src/shm/mod.rs
   binario generaría uno como root); si no, el `myID` del Syncthing en marcha. Nunca `config.xml`.
 - **Estado:** construido; lo ejercita el próximo join (el de A-48).
 
-### A-67 🟡 EN CÓDIGO (0.1.68) — Cloud no podía ver ni manejar sus nodos, ni suspender un tenant, y un nodo parado volvía solo
+### A-67 ✅ VALIDADO EN 8.x (0.1.68 y 0.1.69, 2026-10-15) — Cloud no podía ver ni manejar sus nodos, ni suspender un tenant, y un nodo parado volvía solo
 
 - **El marco:** `docs/ilk-tenant-model-v1.md` §2.4 y D14, la etapa 4, decidida con el operador el
   2026-10-15.
@@ -1061,7 +1061,17 @@ Visto al arreglar los e2e de A-37, leyendo `src/router/mod.rs` y `src/shm/mod.rs
     recibía `UNAUTHORIZED` una vez: el vault solo conoce de memoria a los SY de su hive y a los
     otros por la SHM. Ahora contesta `IDENTITY_UNAVAILABLE`, que se reintenta, sin dar nada de más.
     Venía de antes; en este deploy le tocó a `SY.cognition@worker1`, que leyó bien 42 s después.
-- **Validación en 8.x:** 0.1.68 en PROD; el resto del gate pasó. Falta `delete_node`, con 0.1.69.
+- **Validado en 8.x:**
+  - **0.1.68:** tenants por Cloud (settings, sponsor, lecturas, `pending` y génesis rechazados);
+    sus nodos (`list_nodes` con solo el estado, `NODE_NOT_FOUND` para un nodo de otro tenant y para
+    uno que lanzó el operador en el mismo tenant); parar dura más de una pasada del relanzamiento;
+    suspender por Cloud corta nodos nuevos y credenciales; `a5f1b2a` contesta el código solo; un
+    workflow de prueba arranca limpio.
+  - **0.1.69:** `delete_node` contesta ok, se va la clave propia, queda la asignada y el nombre
+    queda libre; en el reinicio, el SY de otro hive recibió `IDENTITY_UNAVAILABLE` en vez de
+    `UNAUTHORIZED`.
+
+  Detalle en `lab/DEPLOYMENTS.md`.
 
 ### A-66 ✅ VALIDADO EN 8.x (0.1.67, 2026-10-15) — Un tenant suspendido seguía arrancando nodos, y borrar un tenant marcaba a su gente
 

@@ -2,7 +2,7 @@
 
 > **For the Fluxbee Cloud developers.** You do not need to know fluxbee's internals.
 >
-> Contract as of **fluxbee 0.1.68** (2026-10-15). Read from the code, operation by operation; §10
+> Contract as of **fluxbee 0.1.69** (2026-10-15). Read from the code, operation by operation; §10
 > lists what was also checked live on the PROD hive. §9 lists what changed for Cloud in each
 > release. The model behind it: `docs/ilk-tenant-model-v1.md` (an identity is the actor and is
 > never duplicated; a tenant is a cost center, a workspace of the system, never a company).
@@ -832,6 +832,22 @@ post '{"op":"list_cloud_actions"}'
 ---
 
 ## 10. Checked live
+
+**0.1.68 and 0.1.69:** on PROD, 2026-10-15, through the public door with Cloud's token, with the
+operator launching a node of its own in the same tenant (`lab/DEPLOYMENTS.md`):
+
+- `list_cloud_actions` lists 24 ops;
+- `update_tenant` with settings and a sponsor, read back with `get_tenant`; `pending` and the
+  genesis tenant refused; `list_tenants` without the genesis tenant;
+- a node launched by Cloud shows in `list_nodes` with `launched_by: cloud` and its state only; a
+  node of another tenant answers `NODE_NOT_FOUND`, and so does the operator's node, for start, stop
+  and delete;
+- `stop_node`: the node stays down past the hive's relaunch pass; `start_node` brings it back;
+- a tenant Cloud suspended starts no node and its node is refused its credential; reactivated, the
+  node reads it again;
+- `delete_node` (0.1.69): its own credential goes, the assigned one stays, and the name is free
+  again;
+- a refused `set_ilk_tenant` of a contact answers `INVALID_TENANT_TRANSITION` alone.
 
 **0.1.67:** on PROD, 2026-10-15, through the public door with Cloud's token, with the operator
 suspending, reactivating and purging (`lab/DEPLOYMENTS.md`, 0.1.67):
