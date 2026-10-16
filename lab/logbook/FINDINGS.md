@@ -995,6 +995,110 @@ Visto al arreglar los e2e de A-37, leyendo `src/router/mod.rs` y `src/shm/mod.rs
   binario generaría uno como root); si no, el `myID` del Syncthing en marcha. Nunca `config.xml`.
 - **Estado:** construido; lo ejercita el próximo join (el de A-48).
 
+### A-68 🟡 CONSTRUIDO (0.1.70), falta validar en 8.x — Los nodos WF quedaban fuera del estándar: SY.wf-rules los manejaba directo con el orquestador, y el nodo Go tenía su propio plano de control
+
+- **Cómo salió:** el operador preguntó si el nodo WF arranca como los demás (2026-10-15). El
+  orquestador lo arranca igual: `systemd-run`, `config.json` con `_system`, el reconcile de 60 s.
+  Lo distinto estaba alrededor. Diseño: `docs/wf-standard-path-v1.md`.
+- **Qué pasaba:**
+  - **Quién lo lanza.**
+    - SY.wf-rules mandaba SPAWN, RESTART, KILL y NODE_CONFIG_GET/SET directo a
+      `SY.orchestrator@<hive>`, y NODE_STATUS_GET al nodo, con la autoridad de la regla (4) de
+      la política de sistema.
+    - Rompía "todas las acciones pasan por el admin".
+    - Todo nodo WF quedaba con `launched_by: system`.
+  - **El nodo Go.**
+    - Leía `_system` en estricto y lo reescribía desde su struct: una clave nueva del
+      orquestador lo tiraba (pasó con `launched_by` en la etapa 4).
+    - Con una config o una definición rota salía, systemd lo relanzaba cada 5 s, y el motivo
+      quedaba solo en journald.
+    - Siempre contestaba HEALTHY.
+    - Sus errores de CONFIG_SET traían `detail`, que el admin no lee.
+    - Escribía un `config_version` de más en la raíz, sin escritura atómica y con 0644.
+  - **El deploy desde Archi estaba roto.**
+    - El admin atendía de a uno los pedidos de la malla, y el `wf_rules_*` de Archi esperaba a
+      SY.wf-rules.
+    - SY.wf-rules llamaba al admin para publicar el paquete y ese pedido quedaba en cola: a los
+      5 s `PACKAGE_PUBLISH_FAILED`, con `current` ya rotado.
+    - Borrar fallaba igual, y los planes del executor también corrían en ese loop.
+    - Solo andaba el HTTP del operador, que atiende cada conexión en su propia tarea.
+  - **`WF.orch.diag`.**
+    - La regla (4) le daba autoridad casi de admin a ese nombre de las pruebas E2E.
+    - Un workflow llamado `orch.diag` se habría desplegado con ese nombre, y un workflow puede
+      mandar mensajes de sistema.
+- **Arreglo:**
+  - **El admin atiende cada comando de la malla en su propia tarea,** como el HTTP. Se va la
+    clase entera de deadlock: el de 0.1.69, el de Archi y el de los planes.
+  - **SY.wf-rules maneja sus nodos por el admin.**
+    - Usa `get_node_config`, `set_node_config`, `run_node`, `restart_node`, `kill_node` y
+      `get_node_status`.
+    - El admin lo deja actuar solo sobre los `WF.*` de su hive.
+    - Lo único que le pregunta directo al nodo son sus instancias en curso (WF_LIST_INSTANCES),
+      que es una lectura.
+  - **`launched_by`:** el admin anota quién pidió el deploy (`operator` por HTTP, `archi`) y
+    SY.wf-rules lo lleva al `run_node`.
+  - **La política:**
+    - la regla (4) queda solo para SY.admin, con los dos wasm recompilados;
+    - los marcadores de autoridad de config-routes y la tabla de `docs/04-routing.md` quedan al
+      día.
+  - **El SDK de Go tiene el plano de control de los nodos administrados,** un port del de Rust:
+    - `_system` intocable;
+    - FAILED_CONFIG con su motivo;
+    - escritura atómica que conserva el modo del archivo;
+    - salud según el estado de la config.
+  - **El nodo WF lo usa,** y valida la definición del workflow como parte de la config
+    (`invalid_definition`). Con una config que no puede usar queda arriba, contesta lo de control
+    y descarta el tráfico de workflow hasta que un reinicio aplique una config buena.
+  - **Una consulta `wf_rules_*` por la malla sin hive** contesta un error en vez de nada.
+- **Revisión (una ronda): 1 bloqueante y 7 a arreglar, todo arreglado antes del build.**
+  - **Bloqueante: un paquete de workflow a medio sincronizar.**
+    - Syncthing puede traer el manifest y el `package.json` antes que el `flow/definition.json`.
+      Antes el nodo WF caía en bucle hasta que llegaba, y se arreglaba solo; con el cambio
+      esperaba en FAILED_CONFIG y nadie lo reintentaba.
+    - Ahora el orquestador contesta `RUNTIME_NOT_PRESENT` para un paquete de workflow sin su
+      definición: en `run_node`, en cada arranque y reinicio (el reconcile incluido) y antes de que
+      `set_node_config` vincule la versión. SY.wf-rules reintenta mientras se sincroniza.
+  - **El manifest de runtimes.**
+    - Con el admin atendiendo en paralelo, publicar y borrar versiones podían pisarse; un lock los
+      serializa.
+    - SY.wf-rules ya no escribe el dist del motherbee: borra las versiones viejas por el admin en
+      todos los hives.
+  - **Los tiempos.**
+    - SY.wf-rules le da a cada pedido un plazo de 35 s; el admin lo espera 45 s y Archi 60 s.
+    - Antes Archi y el admin esperaban lo mismo, 30 s, y una respuesta cerca del límite se perdía.
+  - **Quién le pide a SY.wf-rules.**
+    - Acepta operaciones solo del admin; antes cualquier nodo podía pedirle desplegar o borrar.
+    - El admin le acepta `launched_by` solo `operator` o `archi`. Nunca `cloud`, que le daría a
+      Cloud el manejo del nodo.
+  - **El contenido:** el admin le exige el runtime `wf.<x>` del propio nodo, la base `wf.engine` y
+    un `package_path` de ese paquete.
+  - **El re-vinculado manda solo el binding** (el orquestador mezcla), en vez de copiar la config
+    del nodo, que arrastraba claves escritas por nodos viejos.
+  - **SY.wf-rules lee bien la negativa de un nodo WF** (`node_not_configured`) y deja de tomarla
+    como un timeout.
+  - **Menores:**
+    - un comando de la malla que falla antes de responder contesta `INTERNAL_ERROR`;
+    - la respuesta del CONFIG_SET del nodo WF trae su estado real, sin cambiar hasta el reinicio,
+      y `pending_restart`;
+    - el SDK no escribe sobre un `config.json` que no puede leer.
+- **Lo que no entra (anotado):**
+  - **La superficie del admin por la malla** sigue abierta a cualquier nodo para casi todas las
+    acciones: solo IO.cloud y SY.wf-rules tienen gate. Un workflow también puede mandar un
+    ADMIN_COMMAND. Va con el trabajo de seguridad postergado (A-22).
+  - **Todas las acciones de nodos pasan por el worker serial del orquestador del motherbee.** Un
+    rollback largo o un hive que no contesta demoran a las demás, también un deploy de WF.
+  - **Configs de WF escritas antes de 0.1.70** con `config_version` en la raíz (un CONFIG_SET
+    directo) quedan en FAILED_CONFIG con el motivo. Se arreglan con `set_node_config?replace=true`
+    y un reinicio. En PROD no hay nodos WF.
+  - **El contador de versiones de OPA** tampoco tiene lock. Solo lo tocan acciones del operador.
+  - **La salud de los nodos IO** ignora el estado de la config, y io.slack no contesta
+    NODE_STATUS_GET. Va a la revisión de la familia IO.
+  - **En el nodo WF** siguen siendo fatales abrir la base y la recuperación.
+  - **Las herramientas de diagnóstico que usaban la autoridad de `WF.orch.diag`** la pierden y van
+    al catálogo de limpieza:
+    - `orch_system_diag` y los `scripts/orchestrator_*_e2e.sh` que la usan;
+    - `blob_sync_diag`, cuyo SYSTEM_SYNC_HINT ya estaba negado.
+
 ### A-67 ✅ VALIDADO EN 8.x (0.1.68 y 0.1.69, 2026-10-15) — Cloud no podía ver ni manejar sus nodos, ni suspender un tenant, y un nodo parado volvía solo
 
 - **El marco:** `docs/ilk-tenant-model-v1.md` §2.4 y D14, la etapa 4, decidida con el operador el

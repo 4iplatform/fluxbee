@@ -111,8 +111,8 @@ func TestPurgeWorkflowPackagesKeepsCurrentBackupAndBoundVersion(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("WriteSlot backup: %v", err)
 	}
-	svc.orchestrator = &fakeOrchestratorClient{
-		getNodeConfigFunc: func(_ context.Context, targetNode, nodeName string) (map[string]any, error) {
+	svc.nodes = &fakeNodeClient{
+		getNodeConfigFunc: func(_ context.Context, nodeName string) (map[string]any, error) {
 			return map[string]any{
 				"status": "ok",
 				"config": map[string]any{
@@ -128,13 +128,17 @@ func TestPurgeWorkflowPackagesKeepsCurrentBackupAndBoundVersion(t *testing.T) {
 		t.Fatalf("PurgeWorkflowPackages: %v", err)
 	}
 
-	for _, version := range []string{"0.0.1", "0.0.3", "0.0.4"} {
-		if _, err := os.Stat(filepath.Join(svc.cfg.DistRuntimeRoot, "wf.invoice", version)); err != nil {
-			t.Fatalf("expected version %s kept: %v", version, err)
-		}
+	// Current (4), backup (3) and the version the node is bound to (1) stay; 2 goes, through
+	// SY.admin, which writes the motherbee's dist and manifest (A-68): wf-rules does not, even on
+	// the motherbee.
+	admin := svc.admin.(*fakeAdminClient)
+	if strings.Join(admin.removedVersions, ",") != "wf.invoice@0.0.2" {
+		t.Fatalf("want only 0.0.2 removed through the admin, got %v", admin.removedVersions)
 	}
-	if _, err := os.Stat(filepath.Join(svc.cfg.DistRuntimeRoot, "wf.invoice", "0.0.2")); !os.IsNotExist(err) {
-		t.Fatalf("expected version 2 purged, err=%v", err)
+	for _, version := range []string{"0.0.1", "0.0.2", "0.0.3", "0.0.4"} {
+		if _, err := os.Stat(filepath.Join(svc.cfg.DistRuntimeRoot, "wf.invoice", version)); err != nil {
+			t.Fatalf("wf-rules leaves the dist tree to the admin, %s gone: %v", version, err)
+		}
 	}
 }
 

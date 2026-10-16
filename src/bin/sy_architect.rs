@@ -11831,6 +11831,19 @@ fn architect_admin_action_timeout(action: &str) -> Duration {
         | "opa_check" => {
             Duration::from_secs(env_timeout_secs("JSR_ADMIN_OPA_TIMEOUT_SECS").unwrap_or(80))
         }
+        // A workflow deploy runs in SY.wf-rules under a 35 s deadline (publish, purge, the node's
+        // rebind and restart or launch) and the admin waits 45 s for it: wait longer than both,
+        // or a deploy that succeeded is reported as a timeout (A-68).
+        "wf_rules_compile_apply"
+        | "wf_rules_compile"
+        | "wf_rules_apply"
+        | "wf_rules_rollback"
+        | "wf_rules_delete"
+        | "wf_rules_get_workflow"
+        | "wf_rules_get_status"
+        | "wf_rules_list_workflows" => Duration::from_secs(
+            env_timeout_secs("JSR_ARCHITECT_WF_RULES_TIMEOUT_SECS").unwrap_or(60),
+        ),
         "list_admin_actions" | "get_admin_action_help" | "hive_status" => {
             Duration::from_secs(env_timeout_secs("JSR_ADMIN_TIMEOUT_SECS").unwrap_or(5))
         }

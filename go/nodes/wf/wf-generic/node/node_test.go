@@ -11,443 +11,431 @@ import (
 	sdk "github.com/4iplatform/json-router/fluxbee-go-sdk"
 )
 
-func TestLoadConfigAcceptsManagedSystemBlock(t *testing.T) {
-	dir := t.TempDir()
-	path := filepath.Join(dir, "config.json")
-	data := `{
-  "workflow_definition_path": "/tmp/wf.invoice.json",
-  "db_path": "/tmp/wf.db",
-  "sy_timer_l2_name": "SY.timer@motherbee",
-  "_system": {
-    "node_name": "WF.invoice@motherbee"
-  }
-}`
-	if err := os.WriteFile(path, []byte(data), 0o644); err != nil {
-		t.Fatalf("write config: %v", err)
+const testNodeName = "WF.invoice@motherbee"
+
+// writeWorkflowPackage writes a workflow package with the given definition and returns its path.
+func writeWorkflowPackage(t *testing.T, definition string) string {
+	t.Helper()
+	pkgPath := filepath.Join(t.TempDir(), "runtimes", "wf.invoice", "3")
+	if err := os.MkdirAll(filepath.Join(pkgPath, "flow"), 0o755); err != nil {
+		t.Fatal(err)
 	}
-	cfg, err := LoadConfig(path)
-	if err != nil {
-		t.Fatalf("LoadConfig: %v", err)
+	if definition != "" {
+		if err := os.WriteFile(filepath.Join(pkgPath, "flow", "definition.json"), []byte(definition), 0o644); err != nil {
+			t.Fatal(err)
+		}
 	}
-	if cfg.System == nil || cfg.System.NodeName != "WF.invoice@motherbee" {
-		t.Fatalf("expected _system.node_name to be loaded, got %+v", cfg.System)
-	}
+	return pkgPath
 }
 
-// Every key the orchestrator writes in _system (build_node_system_block, plus launched_by at
-// spawn; pinned on the Rust side by the_system_block_keys_are_the_ones_the_wf_node_decodes). The
-// decoder is strict: an unknown key would make every WF node fail to load its config.
-func TestLoadConfigAcceptsEverySystemKeyTheOrchestratorWrites(t *testing.T) {
-	dir := t.TempDir()
-	path := filepath.Join(dir, "config.json")
-	data := `{
-  "workflow_definition_path": "/tmp/wf.invoice.json",
-  "db_path": "/tmp/wf.db",
-  "sy_timer_l2_name": "SY.timer@motherbee",
-  "_system": {
-    "managed_by": "SY.orchestrator",
-    "node_name": "WF.invoice@motherbee",
-    "hive_id": "motherbee",
-    "relaunch_on_boot": false,
-    "config_version": 1,
-    "created_at_ms": 1,
-    "updated_at_ms": 2,
-    "runtime": "wf.invoice",
-    "runtime_version": "4",
-    "requested_runtime_version": "current",
-    "runtime_base": "wf.engine",
-    "package_path": "/var/lib/fluxbee/dist/runtimes/wf.invoice/4",
-    "ilk_id": "ilk:11111111-1111-4111-8111-111111111111",
-    "tenant_id": "tnt:11111111-1111-4111-8111-111111111111",
-    "launched_by": "archi"
-  }
-}`
-	if err := os.WriteFile(path, []byte(data), 0o644); err != nil {
-		t.Fatalf("write config: %v", err)
+// writeNodeConfig writes config.json in a node dir, as the orchestrator lays it out.
+func writeNodeConfig(t *testing.T, document map[string]any) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "WF", testNodeName, "config.json")
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatal(err)
 	}
-	cfg, err := LoadConfig(path)
+	raw, err := json.MarshalIndent(document, "", "  ")
 	if err != nil {
-		t.Fatalf("LoadConfig: %v", err)
+		t.Fatal(err)
 	}
-	if cfg.System == nil || cfg.System.LaunchedBy != "archi" {
-		t.Fatalf("expected _system.launched_by to be loaded, got %+v", cfg.System)
+	if err := os.WriteFile(path, raw, 0o600); err != nil {
+		t.Fatal(err)
 	}
+	return path
 }
 
-func TestLoadConfigAcceptsTenantIDAndTopLevelConfigVersion(t *testing.T) {
-	dir := t.TempDir()
-	path := filepath.Join(dir, "config.json")
-	data := `{
-  "config_version": 1,
-  "workflow_definition_path": "/tmp/wf.invoice.json",
-  "db_path": "/tmp/wf.db",
-  "tenant_id": "tnt:43d576a3-d712-4d91-9245-5d5463dd693e",
-  "sy_timer_l2_name": "SY.timer@motherbee",
-  "_system": {
-    "node_name": "WF.invoice@motherbee"
-  }
-}`
-	if err := os.WriteFile(path, []byte(data), 0o644); err != nil {
-		t.Fatalf("write config: %v", err)
-	}
-	cfg, err := LoadConfig(path)
-	if err != nil {
-		t.Fatalf("LoadConfig: %v", err)
-	}
-	if cfg.TenantID != "tnt:43d576a3-d712-4d91-9245-5d5463dd693e" {
-		t.Fatalf("expected tenant_id to be loaded, got %q", cfg.TenantID)
-	}
-}
-
-func TestLoadConfigAcceptsWrappedConfigEnvelope(t *testing.T) {
-	dir := t.TempDir()
-	path := filepath.Join(dir, "config.json")
-	data := `{
-  "config_version": 1,
-  "tenant_id": "tnt:43d576a3-d712-4d91-9245-5d5463dd693e",
-  "_system": {
-    "node_name": "WF.invoice@motherbee"
-  },
-  "config": {
-    "workflow_definition_path": "/tmp/wf.invoice.json",
-    "db_path": "/tmp/wf.db",
-    "sy_timer_l2_name": "SY.timer@motherbee"
-  }
-}`
-	if err := os.WriteFile(path, []byte(data), 0o644); err != nil {
-		t.Fatalf("write config: %v", err)
-	}
-	cfg, err := LoadConfig(path)
-	if err != nil {
-		t.Fatalf("LoadConfig: %v", err)
-	}
-	if cfg.System == nil || cfg.System.NodeName != "WF.invoice@motherbee" {
-		t.Fatalf("expected _system.node_name to be merged, got %+v", cfg.System)
-	}
-	if cfg.TenantID != "tnt:43d576a3-d712-4d91-9245-5d5463dd693e" {
-		t.Fatalf("expected tenant_id to be merged, got %q", cfg.TenantID)
-	}
-}
-
-func TestLoadConfigIgnoresOrchestratorMetadataEnvelope(t *testing.T) {
-	dir := t.TempDir()
-	path := filepath.Join(dir, "config.json")
-	data := `{
-  "config_version": 1,
-  "managed_by": "SY.orchestrator",
-  "runtime": "wf.engine",
-  "runtime_version": "0.1.0",
-  "tenant_id": "tnt:43d576a3-d712-4d91-9245-5d5463dd693e",
-  "_system": {
-    "node_name": "WF.invoice@motherbee"
-  },
-  "workflow_definition_path": "/tmp/wf.invoice.json",
-  "db_path": "/tmp/wf.db",
-  "sy_timer_l2_name": "SY.timer@motherbee"
-}`
-	if err := os.WriteFile(path, []byte(data), 0o644); err != nil {
-		t.Fatalf("write config: %v", err)
-	}
-	cfg, err := LoadConfig(path)
-	if err != nil {
-		t.Fatalf("LoadConfig: %v", err)
-	}
-	if cfg.WorkflowDefinitionPath != "/tmp/wf.invoice.json" {
-		t.Fatalf("unexpected workflow_definition_path %q", cfg.WorkflowDefinitionPath)
-	}
-	if cfg.DBPath != "/tmp/wf.db" {
-		t.Fatalf("unexpected db_path %q", cfg.DBPath)
-	}
-}
-
-func TestLoadConfigDerivesWorkflowDefinitionAndRuntimeDefaultsFromManagedPackage(t *testing.T) {
-	dir := t.TempDir()
-	path := filepath.Join(dir, "config.json")
-	data := `{
-  "config_version": 1,
-  "_system": {
-    "node_name": "WF.invoice@motherbee",
-    "package_path": "/var/lib/fluxbee/dist/runtimes/wf.invoice/0.1.0"
-  }
-}`
-	if err := os.WriteFile(path, []byte(data), 0o644); err != nil {
-		t.Fatalf("write config: %v", err)
-	}
-	cfg, err := LoadConfig(path)
-	if err != nil {
-		t.Fatalf("LoadConfig: %v", err)
-	}
-	if got := cfg.WorkflowDefinitionPath; got != "/var/lib/fluxbee/dist/runtimes/wf.invoice/0.1.0/flow/definition.json" {
-		t.Fatalf("unexpected workflow_definition_path %q", got)
-	}
-	if got := cfg.DBPath; got != filepath.Join(dir, "wf_instances.db") {
-		t.Fatalf("unexpected db_path %q", got)
-	}
-	if got := cfg.SYTimerL2Name; got != "SY.timer@motherbee" {
-		t.Fatalf("unexpected sy_timer_l2_name %q", got)
-	}
-}
-
-func TestLoadConfigUsesSystemTenantAndHiveDefaults(t *testing.T) {
-	dir := t.TempDir()
-	path := filepath.Join(dir, "config.json")
-	data := `{
-  "_system": {
-    "node_name": "WF.invoice@motherbee",
-    "hive_id": "motherbee",
-    "tenant_id": "tnt:43d576a3-d712-4d91-9245-5d5463dd693e",
-    "package_path": "/pkg/wf.invoice"
-  }
-}`
-	if err := os.WriteFile(path, []byte(data), 0o644); err != nil {
-		t.Fatalf("write config: %v", err)
-	}
-	cfg, err := LoadConfig(path)
-	if err != nil {
-		t.Fatalf("LoadConfig: %v", err)
-	}
-	if got := cfg.TenantID; got != "tnt:43d576a3-d712-4d91-9245-5d5463dd693e" {
-		t.Fatalf("unexpected tenant_id %q", got)
-	}
-	if got := cfg.SYTimerL2Name; got != "SY.timer@motherbee" {
-		t.Fatalf("unexpected sy_timer_l2_name %q", got)
-	}
-}
-
-func TestManagedConfigPathFromEnv(t *testing.T) {
-	t.Setenv("FLUXBEE_NODE_NAME", "WF.invoice@motherbee")
-	got, err := ManagedConfigPathFromEnv()
-	if err != nil {
-		t.Fatalf("ManagedConfigPathFromEnv: %v", err)
-	}
-	want := "/var/lib/fluxbee/nodes/WF/WF.invoice@motherbee/config.json"
-	if got != want {
-		t.Fatalf("expected %q, got %q", want, got)
-	}
-}
-
-func TestWFConfigGetReturnsStandardConfigResponse(t *testing.T) {
-	cfg := &Config{
-		WorkflowDefinitionPath: "/pkg/wf.invoice/flow/definition.json",
-		DBPath:                 "/var/lib/fluxbee/nodes/WF/WF.invoice@motherbee/wf_instances.db",
-		SYTimerL2Name:          "SY.timer@motherbee",
-		TenantID:               "tnt:test-1",
-		GCRetentionDays:        7,
-		GCIntervalSeconds:      3600,
-		System: &ManagedSystemConfig{
-			NodeName:      "WF.invoice@motherbee",
-			HiveID:        "motherbee",
-			ConfigVersion: 4,
-			PackagePath:   "/pkg/wf.invoice",
+// spawnConfig is config.json as the orchestrator writes it for a workflow package: the package's
+// default config, the tenant, and `_system`.
+func spawnConfig(pkgPath string) map[string]any {
+	return map[string]any{
+		"sy_timer_l2_name":    "SY.timer@motherbee",
+		"gc_retention_days":   7,
+		"gc_interval_seconds": 3600,
+		"tenant_id":           "tnt:43d576a3-d712-4d91-9245-5d5463dd693e",
+		"_system": map[string]any{
+			"managed_by":                "SY.orchestrator",
+			"node_name":                 testNodeName,
+			"hive_id":                   "motherbee",
+			"relaunch_on_boot":          true,
+			"config_version":            4,
+			"runtime":                   "wf.invoice",
+			"runtime_version":           "3",
+			"requested_runtime_version": "current",
+			"runtime_base":              "wf.engine",
+			"package_path":              pkgPath,
+			"ilk_id":                    "ilk:11111111-1111-4111-8111-111111111111",
+			"tenant_id":                 "tnt:43d576a3-d712-4d91-9245-5d5463dd693e",
+			"launched_by":               "operator",
 		},
 	}
-	disp := &mockDispatcher{l2name: "WF.invoice@motherbee", uuid: "wf-uuid-cfg-get"}
-	actx := makeActx(t, disp, &mockTimerSender{})
-	rt := &NodeRuntime{
-		Def:        mustLoadValidDefinition(t),
-		DefJSON:    validWorkflowJSON(),
-		Registry:   NewInstanceRegistry(),
-		Store:      actx.Store,
-		ActCtx:     actx,
-		NodeUUID:   "wf-uuid-cfg-get",
-		NodeName:   "WF.invoice@motherbee",
-		Config:     cloneConfig(cfg),
-		ConfigPath: filepath.Join(t.TempDir(), "config.json"),
-	}
+}
 
-	request, err := sdk.BuildNodeConfigGetMessage(
-		"caller-uuid-1",
-		"WF.invoice@motherbee",
-		sdk.NodeConfigGetPayload{NodeName: "WF.invoice@motherbee"},
-		sdk.NodeConfigEnvelopeOptions{},
-		"trace-config-get-1",
-	)
+func bootstrap(t *testing.T, configPath string) *ControlPlane {
+	t.Helper()
+	plane, err := BootstrapControlPlane(configPath, testNodeName, fixedClock)
 	if err != nil {
-		t.Fatalf("BuildNodeConfigGetMessage: %v", err)
+		t.Fatalf("BootstrapControlPlane: %v", err)
 	}
+	return plane
+}
 
-	if err := Dispatch(context.Background(), request, rt); err != nil {
-		t.Fatalf("Dispatch: %v", err)
+func TestAWorkflowPackageRunsOnWhatTheOrchestratorWrites(t *testing.T) {
+	pkgPath := writeWorkflowPackage(t, validWorkflowJSON())
+	configPath := writeNodeConfig(t, spawnConfig(pkgPath))
+	plane := bootstrap(t, configPath)
+	materialized := plane.Configured()
+	if materialized == nil {
+		t.Fatalf("expected CONFIGURED, got %+v", plane.State)
 	}
-	if len(disp.sent) != 1 {
-		t.Fatalf("expected one CONFIG_RESPONSE, got %d", len(disp.sent))
+	cfg := materialized.Config
+	if cfg.WorkflowDefinitionPath != filepath.Join(pkgPath, "flow", "definition.json") {
+		t.Fatalf("definition = %q", cfg.WorkflowDefinitionPath)
+	}
+	if cfg.DBPath != filepath.Join(filepath.Dir(configPath), "wf_instances.db") {
+		t.Fatalf("db_path = %q", cfg.DBPath)
+	}
+	if cfg.SYTimerL2Name != "SY.timer@motherbee" || cfg.TenantID != "tnt:43d576a3-d712-4d91-9245-5d5463dd693e" {
+		t.Fatalf("cfg = %+v", cfg)
+	}
+	if materialized.Definition.WorkflowType != "invoice" || plane.State.ConfigVersion != 4 {
+		t.Fatalf("materialized = %+v, state = %+v", materialized.Definition, plane.State)
+	}
+}
+
+// The orchestrator owns `_system` and adds keys over time (launched_by in stage 4 crash-looped the
+// strict decoder this node used to have): a key the node does not know never stops it.
+func TestAnUnknownSystemKeyNeverStopsTheNode(t *testing.T) {
+	document := spawnConfig(writeWorkflowPackage(t, validWorkflowJSON()))
+	document["_system"].(map[string]any)["a_key_from_a_newer_orchestrator"] = map[string]any{"nested": true}
+	plane := bootstrap(t, writeNodeConfig(t, document))
+	if plane.Configured() == nil {
+		t.Fatalf("expected CONFIGURED, got %+v", plane.State)
+	}
+}
+
+func TestTenantAndHiveComeFromSystemOrTheNodeName(t *testing.T) {
+	pkgPath := writeWorkflowPackage(t, validWorkflowJSON())
+	plane := bootstrap(t, writeNodeConfig(t, map[string]any{
+		"_system": map[string]any{"tenant_id": "tnt:from-system", "package_path": pkgPath},
+	}))
+	materialized := plane.Configured()
+	if materialized == nil {
+		t.Fatalf("expected CONFIGURED, got %+v", plane.State)
+	}
+	if materialized.Config.TenantID != "tnt:from-system" || materialized.Config.SYTimerL2Name != "SY.timer@motherbee" {
+		t.Fatalf("cfg = %+v", materialized.Config)
+	}
+	if materialized.Config.GCRetentionDays != 7 || materialized.Config.GCIntervalSeconds != 3600 {
+		t.Fatalf("GC defaults: %+v", materialized.Config)
+	}
+}
+
+func TestAConfigTheNodeCannotUseIsFailedConfigNotAnExit(t *testing.T) {
+	brokenDefinition := writeWorkflowPackage(t, `{"wf_schema_version": "1", "states": "not a list"}`)
+	missingDefinition := writeWorkflowPackage(t, "")
+	typo := spawnConfig(writeWorkflowPackage(t, validWorkflowJSON()))
+	typo["gc_retention_day"] = 3
+	cases := []struct {
+		name     string
+		document map[string]any
+		raw      string
+		code     string
+		mention  string
+	}{
+		{name: "broken definition", document: spawnConfig(brokenDefinition), code: ErrCodeInvalidDefinition},
+		{name: "missing definition", document: spawnConfig(missingDefinition), code: ErrCodeInvalidDefinition, mention: "definition.json"},
+		{name: "unknown operator key", document: typo, code: sdk.ErrCodeInvalidConfig, mention: "gc_retention_day"},
+		{name: "not JSON", raw: `{"sy_timer_l2_name":`, code: sdk.ErrCodeInvalidConfig},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			var configPath string
+			if c.raw != "" {
+				configPath = writeNodeConfig(t, map[string]any{})
+				if err := os.WriteFile(configPath, []byte(c.raw), 0o600); err != nil {
+					t.Fatal(err)
+				}
+			} else {
+				configPath = writeNodeConfig(t, c.document)
+			}
+			plane := bootstrap(t, configPath)
+			if plane.State.CurrentState != sdk.ManagedFailedConfig || plane.State.LastError == nil {
+				t.Fatalf("expected FAILED_CONFIG, got %+v", plane.State)
+			}
+			if plane.State.LastError.Code != c.code || !strings.Contains(plane.State.LastError.Message, c.mention) {
+				t.Fatalf("last_error = %+v", plane.State.LastError)
+			}
+			if err := Run(context.Background(), RunOptions{Plane: plane}); err == nil {
+				t.Fatal("a dry run reports the config it cannot use")
+			}
+		})
+	}
+}
+
+// --- control messages ---
+
+func newRuntime(t *testing.T, plane *ControlPlane, withEngine bool) (*NodeRuntime, *mockDispatcher) {
+	t.Helper()
+	disp := &mockDispatcher{l2name: testNodeName, uuid: "wf-uuid"}
+	actx := makeActx(t, disp, &mockTimerSender{})
+	rt := &NodeRuntime{ActCtx: actx, NodeUUID: "wf-uuid", NodeName: testNodeName, Plane: plane}
+	if withEngine {
+		rt.Def = mustLoadValidDefinition(t)
+		rt.DefJSON = validWorkflowJSON()
+		rt.Registry = NewInstanceRegistry()
+		rt.Store = actx.Store
+	}
+	return rt, disp
+}
+
+func configSet(t *testing.T, version uint64, config map[string]any) sdk.Message {
+	t.Helper()
+	msg, err := sdk.BuildNodeConfigSetMessage("caller-uuid", testNodeName, sdk.NodeConfigSetPayload{
+		NodeName:      testNodeName,
+		SchemaVersion: 1,
+		ConfigVersion: version,
+		ApplyMode:     sdk.NodeConfigApplyModeReplace,
+		Config:        config,
+	}, sdk.NodeConfigEnvelopeOptions{}, "trace-config-set")
+	if err != nil {
+		t.Fatal(err)
+	}
+	return msg
+}
+
+func configGet(t *testing.T) sdk.Message {
+	t.Helper()
+	msg, err := sdk.BuildNodeConfigGetMessage("caller-uuid", testNodeName, sdk.NodeConfigGetPayload{NodeName: testNodeName}, sdk.NodeConfigEnvelopeOptions{}, "trace-config-get")
+	if err != nil {
+		t.Fatal(err)
+	}
+	return msg
+}
+
+func lastReply(t *testing.T, disp *mockDispatcher) map[string]any {
+	t.Helper()
+	if len(disp.sent) == 0 {
+		t.Fatal("no reply sent")
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(disp.sent[len(disp.sent)-1].Payload, &payload); err != nil {
+		t.Fatal(err)
+	}
+	return payload
+}
+
+func TestConfigGetAnswersTheConfigState(t *testing.T) {
+	plane := bootstrap(t, writeNodeConfig(t, spawnConfig(writeWorkflowPackage(t, validWorkflowJSON()))))
+	rt, disp := newRuntime(t, plane, true)
+	if err := Dispatch(context.Background(), configGet(t), rt); err != nil {
+		t.Fatal(err)
 	}
 	if got := derefString(disp.sent[0].Meta.Msg); got != sdk.MSGConfigResponse {
-		t.Fatalf("expected %q, got %q", sdk.MSGConfigResponse, got)
+		t.Fatalf("reply msg = %q", got)
 	}
-	resp, err := sdk.ParseNodeConfigResponse(&disp.sent[0])
-	if err != nil {
-		t.Fatalf("ParseNodeConfigResponse: %v", err)
+	reply := lastReply(t, disp)
+	if reply["ok"] != true || reply["state"] != "CONFIGURED" || reply["node_name"] != testNodeName || reply["error"] != nil {
+		t.Fatalf("reply = %v", reply)
 	}
-	if !resp.OK {
-		t.Fatalf("expected ok response, got %+v", resp)
-	}
-	if resp.NodeName != "WF.invoice@motherbee" {
-		t.Fatalf("unexpected node_name %q", resp.NodeName)
+	effective := reply["effective_config"].(map[string]any)
+	if effective["workflow_definition_source"] != "managed_package" || effective["sy_timer_l2_name"] != "SY.timer@motherbee" {
+		t.Fatalf("effective_config = %v", effective)
 	}
 }
 
-func TestWFConfigSetPersistsManagedConfigAndRequiresRestart(t *testing.T) {
-	dir := t.TempDir()
-	configPath := filepath.Join(dir, "config.json")
-	initialConfig := `{
-  "config_version": 4,
-  "managed_by": "SY.orchestrator",
-  "workflow_definition_path": "/pkg/wf.invoice/flow/definition.json",
-  "db_path": "/var/lib/fluxbee/nodes/WF/WF.invoice@motherbee/wf_instances.db",
-  "sy_timer_l2_name": "SY.timer@motherbee",
-  "gc_retention_days": 7,
-  "gc_interval_seconds": 3600,
-  "_system": {
-    "node_name": "WF.invoice@motherbee",
-    "hive_id": "motherbee",
-    "package_path": "/pkg/wf.invoice",
-    "config_version": 4
-  }
-}`
-	if err := os.WriteFile(configPath, []byte(initialConfig), 0o644); err != nil {
-		t.Fatalf("write config: %v", err)
-	}
-	cfg, err := LoadConfig(configPath)
+func TestConfigSetKeepsSystemAndWaitsForARestart(t *testing.T) {
+	document := spawnConfig(writeWorkflowPackage(t, validWorkflowJSON()))
+	document["_system"].(map[string]any)["relaunch_on_boot"] = false
+	document["_system"].(map[string]any)["a_key_from_a_newer_orchestrator"] = "kept"
+	configPath := writeNodeConfig(t, document)
+	plane := bootstrap(t, configPath)
+	rt, disp := newRuntime(t, plane, true)
+
+	err := Dispatch(context.Background(), configSet(t, 5, map[string]any{
+		"sy_timer_l2_name":    "SY.timer@motherbee",
+		"gc_retention_days":   14,
+		"gc_interval_seconds": 900,
+		"tenant_id":           "tnt:43d576a3-d712-4d91-9245-5d5463dd693e",
+	}), rt)
 	if err != nil {
-		t.Fatalf("LoadConfig: %v", err)
+		t.Fatal(err)
 	}
-	disp := &mockDispatcher{l2name: "WF.invoice@motherbee", uuid: "wf-uuid-cfg-set"}
-	actx := makeActx(t, disp, &mockTimerSender{})
-	rt := &NodeRuntime{
-		Def:        mustLoadValidDefinition(t),
-		DefJSON:    validWorkflowJSON(),
-		Registry:   NewInstanceRegistry(),
-		Store:      actx.Store,
-		ActCtx:     actx,
-		NodeUUID:   "wf-uuid-cfg-set",
-		NodeName:   "WF.invoice@motherbee",
-		Config:     cfg,
-		ConfigPath: configPath,
+	reply := lastReply(t, disp)
+	if reply["ok"] != true || reply["restart_required"] != true || reply["applied"] != false || reply["config_version"] != float64(5) {
+		t.Fatalf("reply = %v", reply)
 	}
 
-	request, err := sdk.BuildNodeConfigSetMessage(
-		"caller-uuid-2",
-		"WF.invoice@motherbee",
-		sdk.NodeConfigSetPayload{
-			NodeName:      "WF.invoice@motherbee",
-			SchemaVersion: 1,
-			ConfigVersion: 5,
-			ApplyMode:     sdk.NodeConfigApplyModeReplace,
-			Config: map[string]any{
-				"workflow_definition_path": "/pkg/wf.invoice/flow/definition.json",
-				"db_path":                  "/var/lib/fluxbee/nodes/WF/WF.invoice@motherbee/new.db",
-				"sy_timer_l2_name":         "SY.timer@motherbee",
-				"gc_retention_days":        14,
-				"gc_interval_seconds":      900,
-			},
-		},
-		sdk.NodeConfigEnvelopeOptions{},
-		"trace-config-set-1",
-	)
-	if err != nil {
-		t.Fatalf("BuildNodeConfigSetMessage: %v", err)
+	persisted := readJSONFile(t, configPath)
+	system := persisted["_system"].(map[string]any)
+	if system["config_version"] != float64(5) || system["relaunch_on_boot"] != false || system["a_key_from_a_newer_orchestrator"] != "kept" || system["launched_by"] != "operator" {
+		t.Fatalf("_system after CONFIG_SET = %v", system)
+	}
+	if persisted["gc_retention_days"] != float64(14) {
+		t.Fatalf("persisted = %v", persisted)
+	}
+	for _, key := range []string{"config_version", "workflow_definition_path"} {
+		if _, present := persisted[key]; present {
+			t.Fatalf("persisted carries %s: %v", key, persisted)
+		}
 	}
 
-	if err := Dispatch(context.Background(), request, rt); err != nil {
-		t.Fatalf("Dispatch: %v", err)
+	if plane.Configured().Config.GCRetentionDays != 7 {
+		t.Fatal("the running config does not change before a restart")
 	}
-	resp, err := sdk.ParseNodeConfigResponse(&disp.sent[0])
-	if err != nil {
-		t.Fatalf("ParseNodeConfigResponse: %v", err)
+	disp.sent = nil
+	if err := Dispatch(context.Background(), configGet(t), rt); err != nil {
+		t.Fatal(err)
 	}
-	if !resp.OK {
-		t.Fatalf("expected ok CONFIG_SET response, got %+v", resp)
+	pending, _ := lastReply(t, disp)["pending_restart"].(map[string]any)
+	if pending["config_version"] != float64(5) {
+		t.Fatalf("CONFIG_GET shows the pending config: %v", lastReply(t, disp))
 	}
-	if state := derefString(resp.State); state != "restart_required" {
-		t.Fatalf("expected state restart_required, got %q", state)
-	}
-	if version := *resp.ConfigVersion; version != 5 {
-		t.Fatalf("expected config_version 5, got %d", version)
-	}
-
-	data, err := os.ReadFile(configPath)
-	if err != nil {
-		t.Fatalf("read persisted config: %v", err)
-	}
-	text := string(data)
-	if !strings.Contains(text, `"managed_by": "SY.orchestrator"`) {
-		t.Fatalf("expected top-level orchestrator metadata to be preserved, got %s", text)
-	}
-	if !strings.Contains(text, `"db_path": "/var/lib/fluxbee/nodes/WF/WF.invoice@motherbee/new.db"`) {
-		t.Fatalf("expected new db_path in persisted config, got %s", text)
-	}
-
-	var raw map[string]any
-	if err := json.Unmarshal(data, &raw); err != nil {
-		t.Fatalf("json.Unmarshal persisted config: %v", err)
-	}
-	if got := int(raw["config_version"].(float64)); got != 5 {
-		t.Fatalf("expected top-level config_version 5, got %d", got)
+	restarted := bootstrap(t, configPath)
+	if restarted.Configured() == nil || restarted.Configured().Config.GCRetentionDays != 14 || restarted.State.ConfigVersion != 5 {
+		t.Fatalf("a restart applies it: %+v", restarted.State)
 	}
 }
 
-func TestWFConfigSetRejectsSystemMutation(t *testing.T) {
-	dir := t.TempDir()
-	configPath := filepath.Join(dir, "config.json")
-	initialConfig := `{
-  "_system": {
-    "node_name": "WF.invoice@motherbee",
-    "hive_id": "motherbee",
-    "package_path": "/pkg/wf.invoice",
-    "config_version": 1
-  }
-}`
-	if err := os.WriteFile(configPath, []byte(initialConfig), 0o644); err != nil {
-		t.Fatalf("write config: %v", err)
+func TestConfigSetRefusalsSayWhyAndChangeNothing(t *testing.T) {
+	configPath := writeNodeConfig(t, spawnConfig(writeWorkflowPackage(t, validWorkflowJSON())))
+	before, _ := os.ReadFile(configPath)
+	plane := bootstrap(t, configPath)
+	cases := []struct {
+		name    string
+		version uint64
+		config  map[string]any
+		code    string
+	}{
+		{name: "_system", version: 5, config: map[string]any{"_system": map[string]any{"node_name": "WF.evil@motherbee"}}, code: sdk.ErrCodeInvalidConfig},
+		{name: "stale version", version: 4, config: map[string]any{"gc_retention_days": 3}, code: errCodeStaleConfigVersion},
+		{name: "unknown key", version: 5, config: map[string]any{"gc_retention_day": 3}, code: sdk.ErrCodeInvalidConfig},
+		{name: "empty", version: 5, config: map[string]any{}, code: sdk.ErrCodeInvalidConfig},
 	}
-	cfg, err := LoadConfig(configPath)
-	if err != nil {
-		t.Fatalf("LoadConfig: %v", err)
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			rt, disp := newRuntime(t, plane, true)
+			if err := Dispatch(context.Background(), configSet(t, c.version, c.config), rt); err != nil {
+				t.Fatal(err)
+			}
+			reply := lastReply(t, disp)
+			errObj, _ := reply["error"].(map[string]any)
+			message, _ := errObj["message"].(string)
+			if reply["ok"] != false || errObj["code"] != c.code || message == "" {
+				t.Fatalf("reply = %v", reply)
+			}
+			if reply["state"] != "CONFIGURED" || reply["config_version"] != float64(4) {
+				t.Fatalf("a refusal reports the node's own state and version: %v", reply)
+			}
+		})
 	}
-	disp := &mockDispatcher{l2name: "WF.invoice@motherbee", uuid: "wf-uuid-cfg-set-reject"}
-	actx := makeActx(t, disp, &mockTimerSender{})
-	rt := &NodeRuntime{
-		Def:        mustLoadValidDefinition(t),
-		DefJSON:    validWorkflowJSON(),
-		Registry:   NewInstanceRegistry(),
-		Store:      actx.Store,
-		ActCtx:     actx,
-		NodeUUID:   "wf-uuid-cfg-set-reject",
-		NodeName:   "WF.invoice@motherbee",
-		Config:     cfg,
-		ConfigPath: configPath,
+	after, _ := os.ReadFile(configPath)
+	if string(before) != string(after) {
+		t.Fatal("a refused CONFIG_SET changes nothing")
+	}
+}
+
+func TestANodeWithoutAConfigInUseAnswersControlAndDropsWorkflowTraffic(t *testing.T) {
+	configPath := writeNodeConfig(t, spawnConfig(writeWorkflowPackage(t, `{"states": 1}`)))
+	plane := bootstrap(t, configPath)
+	rt, disp := newRuntime(t, plane, false)
+
+	statusName := sdk.MSGNodeStatusGet
+	status := sdk.Message{Routing: sdk.Routing{Src: "orchestrator-uuid", TraceID: "t-status"}, Meta: sdk.Meta{MsgType: "SYSTEM", Msg: &statusName}}
+	if err := Dispatch(context.Background(), status, rt); err != nil {
+		t.Fatal(err)
+	}
+	reply := lastReply(t, disp)
+	lastError, _ := reply["last_error"].(map[string]any)
+	if reply["health_state"] != "DEGRADED" || lastError["code"] != ErrCodeInvalidDefinition {
+		t.Fatalf("NODE_STATUS_GET = %v", reply)
 	}
 
-	request, err := sdk.BuildNodeConfigSetMessage(
-		"caller-uuid-3",
-		"WF.invoice@motherbee",
-		sdk.NodeConfigSetPayload{
-			NodeName:      "WF.invoice@motherbee",
-			SchemaVersion: 1,
-			ConfigVersion: 2,
-			ApplyMode:     sdk.NodeConfigApplyModeReplace,
-			Config: map[string]any{
-				"_system": map[string]any{"node_name": "WF.evil@motherbee"},
-			},
-		},
-		sdk.NodeConfigEnvelopeOptions{},
-		"trace-config-set-2",
-	)
-	if err != nil {
-		t.Fatalf("BuildNodeConfigSetMessage: %v", err)
+	if err := Dispatch(context.Background(), configGet(t), rt); err != nil {
+		t.Fatal(err)
+	}
+	reply = lastReply(t, disp)
+	if reply["ok"] != false || reply["state"] != "FAILED_CONFIG" || reply["error"] == nil || reply["effective_config"] != nil {
+		t.Fatalf("CONFIG_GET = %v", reply)
 	}
 
-	if err := Dispatch(context.Background(), request, rt); err != nil {
-		t.Fatalf("Dispatch: %v", err)
+	if err := Dispatch(context.Background(), msgWithName(MsgWFListInstances), rt); err != nil {
+		t.Fatal(err)
 	}
-	resp, err := sdk.ParseNodeConfigResponse(&disp.sent[0])
+	if got := derefString(disp.sent[len(disp.sent)-1].Meta.Msg); got != MsgWFListInstancesResponse {
+		t.Fatalf("reply msg = %q", got)
+	}
+	if reply = lastReply(t, disp); reply["ok"] != false || reply["error"] != errCodeNodeNotConfigured {
+		t.Fatalf("WF_LIST_INSTANCES = %v", reply)
+	}
+
+	sent := len(disp.sent)
+	if err := Dispatch(context.Background(), msgWithName("INVOICE_REQUEST"), rt); err != nil {
+		t.Fatal(err)
+	}
+	if len(disp.sent) != sent {
+		t.Fatal("workflow traffic is dropped, not answered")
+	}
+}
+
+func TestAFailedNodeTakesACorrectedConfigAtTheNextRestart(t *testing.T) {
+	document := spawnConfig(writeWorkflowPackage(t, validWorkflowJSON()))
+	document["gc_retention_day"] = 3
+	configPath := writeNodeConfig(t, document)
+	plane := bootstrap(t, configPath)
+	if plane.State.CurrentState != sdk.ManagedFailedConfig {
+		t.Fatalf("state = %+v", plane.State)
+	}
+	rt, disp := newRuntime(t, plane, false)
+	if err := Dispatch(context.Background(), configSet(t, 0, map[string]any{"gc_retention_days": 3}), rt); err != nil {
+		t.Fatal(err)
+	}
+	if reply := lastReply(t, disp); reply["ok"] != true || reply["config_version"] != float64(5) {
+		t.Fatalf("reply = %v", reply)
+	}
+	restarted := bootstrap(t, configPath)
+	if restarted.Configured() == nil || restarted.Configured().Config.GCRetentionDays != 3 {
+		t.Fatalf("state after restart = %+v", restarted.State)
+	}
+}
+
+// The orchestrator's set_node_config bumps `_system.config_version` on disk without telling the
+// node: a CONFIG_SET still has to be newer than that.
+func TestConfigSetMustBeNewerThanWhatTheOrchestratorWrote(t *testing.T) {
+	configPath := writeNodeConfig(t, spawnConfig(writeWorkflowPackage(t, validWorkflowJSON())))
+	plane := bootstrap(t, configPath)
+	document := readJSONFile(t, configPath)
+	document["_system"].(map[string]any)["config_version"] = 9
+	raw, _ := json.Marshal(document)
+	if err := os.WriteFile(configPath, raw, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	rt, disp := newRuntime(t, plane, true)
+	if err := Dispatch(context.Background(), configSet(t, 6, map[string]any{"gc_retention_days": 3}), rt); err != nil {
+		t.Fatal(err)
+	}
+	if errObj, _ := lastReply(t, disp)["error"].(map[string]any); errObj["code"] != errCodeStaleConfigVersion {
+		t.Fatalf("reply = %v", lastReply(t, disp))
+	}
+	if err := Dispatch(context.Background(), configSet(t, 0, map[string]any{"gc_retention_days": 3}), rt); err != nil {
+		t.Fatal(err)
+	}
+	if reply := lastReply(t, disp); reply["config_version"] != float64(10) {
+		t.Fatalf("reply = %v", reply)
+	}
+}
+
+func readJSONFile(t *testing.T, path string) map[string]any {
+	t.Helper()
+	data, err := os.ReadFile(path)
 	if err != nil {
-		t.Fatalf("ParseNodeConfigResponse: %v", err)
+		t.Fatal(err)
 	}
-	if resp.OK {
-		t.Fatalf("expected CONFIG_SET rejection, got %+v", resp)
+	var document map[string]any
+	if err := json.Unmarshal(data, &document); err != nil {
+		t.Fatal(err)
 	}
+	return document
 }
 
 func mustLoadValidDefinition(t *testing.T) *WorkflowDefinition {

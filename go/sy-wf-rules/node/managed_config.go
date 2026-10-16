@@ -15,14 +15,10 @@ type managedRuntimeBinding struct {
 	PackagePath             string
 }
 
-func (s *Service) buildManagedWFConfig(existing map[string]any, tenantID string) map[string]any {
+// buildManagedWFConfig is the operator config a WF node is launched with (its first deploy); a
+// redeploy rebinds the node and leaves its config as it is.
+func (s *Service) buildManagedWFConfig(tenantID string) map[string]any {
 	cfg := map[string]any{}
-	for key, value := range existing {
-		if key == "_system" {
-			continue
-		}
-		cfg[key] = value
-	}
 	if stringValueFromMap(cfg, "sy_timer_l2_name") == "" {
 		cfg["sy_timer_l2_name"] = fmt.Sprintf("SY.timer@%s", s.cfg.HiveID)
 	}

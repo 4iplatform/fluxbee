@@ -25,11 +25,10 @@ type RuntimeConfig struct {
 }
 
 type NodeConfig struct {
-	HiveID             string
-	NodeName           string
-	OrchestratorTarget string
-	StateDir           string
-	DistRuntimeRoot    string
+	HiveID          string
+	NodeName        string
+	StateDir        string
+	DistRuntimeRoot string
 }
 
 func DefaultRuntimeConfig() RuntimeConfig {
@@ -59,10 +58,9 @@ func BuildNodeConfig(fullNodeName string, stateDir string, distRuntimeRoot strin
 		distRuntimeRoot = defaultDistRoot
 	}
 	return NodeConfig{
-		HiveID:             strings.TrimSpace(hiveID),
-		NodeName:           fullNodeName,
-		OrchestratorTarget: fmt.Sprintf("SY.orchestrator@%s", strings.TrimSpace(hiveID)),
-		StateDir:           filepath.Clean(stateDir),
-		DistRuntimeRoot:    filepath.Clean(distRuntimeRoot),
+		HiveID:          strings.TrimSpace(hiveID),
+		NodeName:        fullNodeName,
+		StateDir:        filepath.Clean(stateDir),
+		DistRuntimeRoot: filepath.Clean(distRuntimeRoot),
 	}, nil
 }

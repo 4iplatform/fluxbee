@@ -12,10 +12,23 @@ func (s *Service) handleSystemMessage(msg fluxbeesdk.Message) {
 	switch stringValue(msg.Meta.Msg) {
 	case fluxbeesdk.MSGNodeStatusGet:
 		s.handleNodeStatusGet(msg)
-	case fluxbeesdk.MSGConfigGet:
-		s.handleNodeConfigGet(msg)
-	case fluxbeesdk.MSGConfigSet:
-		s.handleNodeConfigSet(msg)
+	case fluxbeesdk.MSGConfigGet, fluxbeesdk.MSGConfigSet:
+		// The system policy already lets only the primary admin send these; checked here too.
+		if !fromAdmin(msg) {
+			detail := notFromAdmin(msg)["error_detail"]
+			s.sendNodeConfigResponse(msg, map[string]any{
+				"ok":        false,
+				"node_name": s.nodeName(),
+				"state":     "error",
+				"error":     map[string]any{"code": "UNAUTHORIZED", "message": detail},
+			})
+			return
+		}
+		if stringValue(msg.Meta.Msg) == fluxbeesdk.MSGConfigGet {
+			s.handleNodeConfigGet(msg)
+		} else {
+			s.handleNodeConfigSet(msg)
+		}
 	}
 }
 
@@ -170,6 +183,7 @@ func (s *Service) handleQuery(msg fluxbeesdk.Message) {
 				"wf_node_health_state": workflow.WFNodeHealthState,
 				"active_instances":     formatOptionalInt(workflow.ActiveInstances),
 				"wf_node_timeout":      workflow.WFNodeTimeout,
+				"instances_error":      workflow.InstancesError,
 			})
 		}
 		s.sendQueryResponse(msg, action, map[string]any{
@@ -210,6 +224,7 @@ func (s *Service) handleQuery(msg fluxbeesdk.Message) {
 				"health_state":     statusView.WFNode.HealthState,
 				"active_instances": formatOptionalInt(statusView.WFNode.ActiveInstances),
 				"wf_node_timeout":  statusView.WFNode.Timeout,
+				"instances_error":  statusView.WFNode.InstancesError,
 				"deployed_version": statusView.WFNode.RuntimeVersion,
 			},
 		}
@@ -235,9 +250,10 @@ func (s *Service) handleNodeConfigGet(msg fluxbeesdk.Message) {
 		"schema_version": 1,
 		"config_version": 0,
 		"effective_config": map[string]any{
-			"hive_id":             s.cfg.HiveID,
-			"state_dir":           s.cfg.StateDir,
-			"orchestrator_target": s.cfg.OrchestratorTarget,
+			"hive_id":   s.cfg.HiveID,
+			"state_dir": s.cfg.StateDir,
+			// WF nodes are managed through the admin, like every other launcher.
+			"node_actions_via": fluxbeesdk.PrimaryAdminNode,
 		},
 		"contract": map[string]any{
 			"supports":             []string{fluxbeesdk.MSGConfigGet, fluxbeesdk.MSGConfigSet},
@@ -405,6 +421,7 @@ func (s *Service) handleNodeConfigSet(msg fluxbeesdk.Message) {
 			Version:      meta.Version,
 			AutoSpawn:    compileReq.AutoSpawn,
 			TenantID:     compileReq.TenantID,
+			LaunchedBy:   compileReq.LaunchedBy,
 		})
 		if err != nil {
 			s.sendNodeConfigResponse(msg, configErrorPayload(s.nodeName(), req.SchemaVersion, req.ConfigVersion, err))
@@ -579,14 +596,6 @@ func intValueFromMap(values map[string]any, key string) int {
 	default:
 		return 0
 	}
-}
-
-func configMapFromNodeConfigPayload(payload map[string]any) map[string]any {
-	config, _ := payload["config"].(map[string]any)
-	if config == nil {
-		return map[string]any{}
-	}
-	return config
 }
 
 func stringValueFromMapMap(values map[string]any, outerKey, innerKey string) string {

@@ -18,6 +18,8 @@ type CompileRequest struct {
 	Version      uint64 `json:"version,omitempty"`
 	AutoSpawn    bool   `json:"auto_spawn,omitempty"`
 	TenantID     string `json:"tenant_id,omitempty"`
+	// LaunchedBy is who asked for the deploy, stamped by SY.admin (operator, archi).
+	LaunchedBy string `json:"launched_by,omitempty"`
 }
 
 type GetWorkflowRequest struct {

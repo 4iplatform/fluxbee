@@ -212,6 +212,24 @@ const (
 	ScopeGlobal              = "global"
 )
 
+// IsSystemKind reports whether a msg_type is the system kind, ignoring ASCII case, as the router
+// and the Rust SDK compare it (`is_system_kind`).
+func IsSystemKind(msgType string) bool {
+	if len(msgType) != len(SYSTEMKind) {
+		return false
+	}
+	for i := 0; i < len(msgType); i++ {
+		c := msgType[i]
+		if 'A' <= c && c <= 'Z' {
+			c += 'a' - 'A'
+		}
+		if c != SYSTEMKind[i] {
+			return false
+		}
+	}
+	return true
+}
+
 // SourceL2Name returns the canonical L2 name of the sender as stamped by the
 // router on delivery. Node code should read sender identity from here rather
 // than performing any router SHM lookup.

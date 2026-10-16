@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"path/filepath"
 	"strings"
+
+	fluxbeesdk "github.com/4iplatform/json-router/fluxbee-go-sdk"
 )
 
 type wfNodeSnapshot struct {
@@ -17,6 +19,9 @@ type wfNodeSnapshot struct {
 	HealthState     string
 	ActiveInstances *int
 	Timeout         bool
+	// InstancesError is why a WF node that answered could not count its running instances (e.g.
+	// node_not_configured while its config is not in use); a timeout is Timeout instead.
+	InstancesError string
 }
 
 type WorkflowStatusView struct {
@@ -39,6 +44,7 @@ type ListedWorkflowStatus struct {
 	WFNodeHealthState string
 	ActiveInstances   *int
 	WFNodeTimeout     bool
+	InstancesError    string
 	DeployedVersion   string
 }
 
@@ -61,9 +67,9 @@ func (s *Service) GetWorkflowStatus(req GetStatusRequest) (*WorkflowStatusView, 
 	if published := s.currentPublishedVersion(workflowName); published != "" {
 		view.PublishedVersion = stringPtr(published)
 	}
-	rpcCtx, cancel := context.WithTimeout(context.Background(), wfNodeRPCTimeout)
+	ctx, cancel := newRequestContext()
 	defer cancel()
-	snapshot, err := s.inspectWFNode(rpcCtx, workflowName, true)
+	snapshot, err := s.inspectWFNode(ctx, workflowName, true)
 	if err != nil {
 		return nil, err
 	}
@@ -76,6 +82,10 @@ func (s *Service) ListWorkflowStatuses() ([]ListedWorkflowStatus, error) {
 	if err != nil {
 		return nil, err
 	}
+	// One deadline for the whole list: a node that does not answer shows as a timeout, and the
+	// ones after it as well once the request's time is up, rather than SY.admin giving up first.
+	ctx, cancel := newRequestContext()
+	defer cancel()
 	out := make([]ListedWorkflowStatus, 0, len(workflows))
 	for _, workflowName := range workflows {
 		item := ListedWorkflowStatus{WorkflowName: workflowName}
@@ -86,9 +96,7 @@ func (s *Service) ListWorkflowStatuses() ([]ListedWorkflowStatus, error) {
 		if published := s.currentPublishedVersion(workflowName); published != "" {
 			item.PublishedVersion = stringPtr(published)
 		}
-		rpcCtx, cancel := context.WithTimeout(context.Background(), wfNodeRPCTimeout)
-		snapshot, err := s.inspectWFNode(rpcCtx, workflowName, true)
-		cancel()
+		snapshot, err := s.inspectWFNode(ctx, workflowName, true)
 		if err != nil {
 			return nil, err
 		}
@@ -97,6 +105,7 @@ func (s *Service) ListWorkflowStatuses() ([]ListedWorkflowStatus, error) {
 		item.WFNodeHealthState = snapshot.HealthState
 		item.ActiveInstances = snapshot.ActiveInstances
 		item.WFNodeTimeout = snapshot.Timeout
+		item.InstancesError = snapshot.InstancesError
 		item.DeployedVersion = snapshot.RuntimeVersion
 		out = append(out, item)
 	}
@@ -106,12 +115,12 @@ func (s *Service) ListWorkflowStatuses() ([]ListedWorkflowStatus, error) {
 func (s *Service) inspectWFNode(rpcCtx context.Context, workflowName string, queryInstances bool) (wfNodeSnapshot, error) {
 	nodeName := fmt.Sprintf("WF.%s@%s", workflowName, s.cfg.HiveID)
 	snapshot := wfNodeSnapshot{NodeName: nodeName}
-	if s.orchestrator == nil {
+	if s.nodes == nil {
 		return snapshot, nil
 	}
-	configPayload, err := s.orchestrator.GetNodeConfig(rpcCtx, s.cfg.OrchestratorTarget, nodeName)
+	configPayload, err := s.nodes.GetNodeConfig(rpcCtx, nodeName)
 	if err != nil {
-		if actionErr, ok := err.(*orchestratorActionError); ok && actionErr.Code == "NODE_CONFIG_NOT_FOUND" {
+		if actionErr, ok := err.(*nodeActionError); ok && actionErr.Code == "NODE_CONFIG_NOT_FOUND" {
 			return snapshot, nil
 		}
 		if isRPCTimeout(rpcCtx, err) {
@@ -122,24 +131,30 @@ func (s *Service) inspectWFNode(rpcCtx context.Context, workflowName string, que
 	}
 	snapshot.ConfigExists = true
 	snapshot.RuntimeVersion = runtimeVersionFromNodeConfig(configPayload)
-	if !queryInstances || s.wfNodes == nil {
+	if !queryInstances {
 		return snapshot, nil
 	}
-	statusProbe, err := s.wfNodes.GetNodeStatus(rpcCtx, nodeName)
+	nodeStatus, err := s.nodes.GetNodeStatus(rpcCtx, nodeName)
 	if err != nil {
 		if isRPCTimeout(rpcCtx, err) {
 			snapshot.Timeout = true
-			return snapshot, nil
 		}
+		return snapshot, nil
+	}
+	if !strings.EqualFold(stringValueFromMap(nodeStatus, "lifecycle_state"), "RUNNING") {
 		return snapshot, nil
 	}
 	snapshot.Running = true
 	snapshot.StatusReachable = true
-	snapshot.HealthState = statusProbe.HealthState
+	snapshot.HealthState = strings.TrimSpace(stringValueFromMap(nodeStatus, "health_state"))
+	if s.wfNodes == nil {
+		return snapshot, nil
+	}
 	count, err := s.wfNodes.CountRunningInstances(rpcCtx, nodeName)
 	if err != nil {
-		if rpcCtx.Err() != nil {
-			snapshot.Timeout = true
+		var refusal WfRulesError
+		if errors.As(err, &refusal) && !isRPCTimeout(rpcCtx, err) {
+			snapshot.InstancesError = refusal.Error()
 			return snapshot, nil
 		}
 		snapshot.Timeout = true
@@ -156,16 +171,18 @@ func isRPCTimeout(rpcCtx context.Context, err error) bool {
 	if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
 		return true
 	}
+	var rpcErr *fluxbeesdk.RpcError
+	if errors.As(err, &rpcErr) && rpcErr.Kind == fluxbeesdk.RpcErrTimeout {
+		return true
+	}
 	if rpcCtx != nil && rpcCtx.Err() != nil {
 		return true
 	}
 	return strings.Contains(strings.ToLower(err.Error()), "context deadline exceeded")
 }
 
-func (s *Service) boundRuntimeVersionForWorkflow(workflowName string) (string, error) {
-	rpcCtx, cancel := context.WithTimeout(context.Background(), orchestratorRPCTimeout)
-	defer cancel()
-	snapshot, err := s.inspectWFNode(rpcCtx, workflowName, false)
+func (s *Service) boundRuntimeVersionForWorkflow(ctx context.Context, workflowName string) (string, error) {
+	snapshot, err := s.inspectWFNode(ctx, workflowName, false)
 	if err != nil {
 		return "", err
 	}

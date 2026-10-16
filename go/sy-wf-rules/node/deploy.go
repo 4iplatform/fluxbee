@@ -7,16 +7,25 @@ import (
 	"time"
 )
 
+// wfRulesRequestBudget bounds one request to SY.wf-rules end to end (publish, purge, the node's
+// rebind and restart, or its launch), so it answers before SY.admin stops waiting for it (45 s),
+// and Archi waits longer still (60 s). A deploy that outlived its callers would change state after
+// they had reported a timeout (A-68).
+const wfRulesRequestBudget = 35 * time.Second
+
 // runtimeSyncBudget bounds how long a deploy waits for the package it just published to reach this
 // hive. Publishing happens on the motherbee; a worker gets the package through Syncthing (~11 s
-// measured on the 8.x hive), while on the motherbee it is there at once. Stays inside SY.admin's
-// 30 s request timeout.
+// measured on the 8.x hive), while on the motherbee it is there at once.
 const runtimeSyncBudget = 20 * time.Second
 
-// runtimeNotSyncedYet reports an orchestrator refusal that only means the package published on the
-// motherbee has not reached this hive's dist tree yet.
+func newRequestContext() (context.Context, context.CancelFunc) {
+	return context.WithTimeout(context.Background(), wfRulesRequestBudget)
+}
+
+// runtimeNotSyncedYet reports a refusal that only means the package published on the motherbee has
+// not reached this hive's dist tree yet.
 func runtimeNotSyncedYet(err error) bool {
-	var actionErr *orchestratorActionError
+	var actionErr *nodeActionError
 	if !errors.As(err, &actionErr) {
 		return false
 	}
@@ -27,17 +36,25 @@ func runtimeNotSyncedYet(err error) bool {
 	return false
 }
 
-// untilRuntimeSynced runs call, and runs it again while the orchestrator answers that the runtime
-// has not reached this hive yet — until it succeeds, fails for another reason, or budget runs out.
-func untilRuntimeSynced(budget time.Duration, call func() error) error {
+// untilRuntimeSynced runs call, and runs it again while the answer is that the runtime has not
+// reached this hive yet — until it succeeds, fails for another reason, the budget runs out, or the
+// request's deadline passes.
+func untilRuntimeSynced(ctx context.Context, budget time.Duration, call func() error) error {
 	deadline := time.Now().Add(budget)
+	if requestDeadline, ok := ctx.Deadline(); ok && requestDeadline.Before(deadline) {
+		deadline = requestDeadline
+	}
 	delay := time.Second
 	for {
 		err := call()
 		if err == nil || !runtimeNotSyncedYet(err) || time.Now().Add(delay).After(deadline) {
 			return err
 		}
-		time.Sleep(delay)
+		select {
+		case <-ctx.Done():
+			return err
+		case <-time.After(delay):
+		}
 		if delay < 4*time.Second {
 			delay *= 2
 		}
@@ -67,11 +84,13 @@ type RollbackExecutionResult struct {
 }
 
 func (s *Service) ApplyWorkflowAndDeploy(req ApplyRequest) (*ApplyExecutionResult, error) {
-	result, err := s.ApplyWorkflow(req)
+	ctx, cancel := newRequestContext()
+	defer cancel()
+	result, err := s.applyWorkflow(ctx, req)
 	if err != nil {
 		return nil, err
 	}
-	wfNode, warning := s.deployPublishedWorkflow(req.WorkflowName, req.AutoSpawn, req.TenantID, result.Package)
+	wfNode, warning := s.deployPublishedWorkflow(ctx, req.WorkflowName, req.AutoSpawn, req.TenantID, req.LaunchedBy, result.Package)
 	return &ApplyExecutionResult{
 		Current: result.Current,
 		Package: result.Package,
@@ -81,11 +100,13 @@ func (s *Service) ApplyWorkflowAndDeploy(req ApplyRequest) (*ApplyExecutionResul
 }
 
 func (s *Service) RollbackWorkflowAndDeploy(req RollbackRequest) (*RollbackExecutionResult, error) {
-	result, err := s.RollbackWorkflow(req)
+	ctx, cancel := newRequestContext()
+	defer cancel()
+	result, err := s.rollbackWorkflow(ctx, req)
 	if err != nil {
 		return nil, err
 	}
-	wfNode, warning := s.deployPublishedWorkflow(req.WorkflowName, req.AutoSpawn, req.TenantID, result.Package)
+	wfNode, warning := s.deployPublishedWorkflow(ctx, req.WorkflowName, req.AutoSpawn, req.TenantID, req.LaunchedBy, result.Package)
 	return &RollbackExecutionResult{
 		Current: result.Current,
 		Package: result.Package,
@@ -94,30 +115,27 @@ func (s *Service) RollbackWorkflowAndDeploy(req RollbackRequest) (*RollbackExecu
 	}, nil
 }
 
-func (s *Service) deployPublishedWorkflow(workflowName string, autoSpawn bool, tenantID string, pkg PackagePublishResult) (WFNodeActionResult, string) {
+func (s *Service) deployPublishedWorkflow(ctx context.Context, workflowName string, autoSpawn bool, tenantID, launchedBy string, pkg PackagePublishResult) (WFNodeActionResult, string) {
 	nodeName := fmt.Sprintf("WF.%s@%s", workflowName, s.cfg.HiveID)
-	if s.orchestrator == nil {
+	if s.nodes == nil {
 		return WFNodeActionResult{
 			NodeName: nodeName,
 			Action:   "none",
-			Reason:   "orchestrator client unavailable",
-		}, "Package published, but orchestrator client is unavailable. Deployment did not run."
+			Reason:   "admin client unavailable",
+		}, "Package published, but the admin client is unavailable. Deployment did not run."
 	}
 
-	rpcCtx, cancel := context.WithTimeout(context.Background(), orchestratorRPCTimeout)
-	defer cancel()
-	existingConfigPayload, err := s.orchestrator.GetNodeConfig(rpcCtx, s.cfg.OrchestratorTarget, nodeName)
+	_, err := s.nodes.GetNodeConfig(ctx, nodeName)
 	if err == nil {
-		existingConfig := configMapFromNodeConfigPayload(existingConfigPayload)
-		config := s.buildManagedWFConfig(existingConfig, tenantID)
+		// The rebind changes only the binding: set_node_config merges the patch into the node's
+		// config, so its operator config stays as it is without copying it back (copying it
+		// carried along keys an older node had written, A-68).
 		binding := buildManagedRuntimeBinding(pkg)
 		rebind := func() error {
-			rpcCtx, cancel := context.WithTimeout(context.Background(), orchestratorRPCTimeout)
-			defer cancel()
-			_, err := s.orchestrator.SetNodeConfig(rpcCtx, s.cfg.OrchestratorTarget, nodeName, config, &binding)
+			_, err := s.nodes.SetNodeConfig(ctx, nodeName, map[string]any{}, &binding)
 			return err
 		}
-		if err := untilRuntimeSynced(runtimeSyncBudget, rebind); err != nil {
+		if err := untilRuntimeSynced(ctx, runtimeSyncBudget, rebind); err != nil {
 			return WFNodeActionResult{
 					NodeName: nodeName,
 					Action:   "restart_failed",
@@ -126,14 +144,17 @@ func (s *Service) deployPublishedWorkflow(workflowName string, autoSpawn bool, t
 				"Package published, but sy.wf-rules could not rebind the existing node config."
 		}
 		restart := func() error {
-			rpcCtx, cancel := context.WithTimeout(context.Background(), orchestratorRPCTimeout)
-			defer cancel()
-			_, err := s.orchestrator.RestartNode(rpcCtx, s.cfg.OrchestratorTarget, nodeName)
+			_, err := s.nodes.RestartNode(ctx, nodeName)
 			return err
 		}
-		if err := untilRuntimeSynced(runtimeSyncBudget, restart); err != nil {
-			time.Sleep(1 * time.Second)
-			if retryErr := restart(); retryErr != nil {
+		if err := untilRuntimeSynced(ctx, runtimeSyncBudget, restart); err != nil {
+			retryErr := err
+			select {
+			case <-ctx.Done():
+			case <-time.After(time.Second):
+				retryErr = restart()
+			}
+			if retryErr != nil {
 				return WFNodeActionResult{
 						NodeName: nodeName,
 						Action:   "restart_failed",
@@ -148,24 +169,24 @@ func (s *Service) deployPublishedWorkflow(workflowName string, autoSpawn bool, t
 			Status:   "ok",
 		}, ""
 	}
-	if actionErr, ok := err.(*orchestratorActionError); ok {
+	if actionErr, ok := err.(*nodeActionError); ok {
 		if actionErr.Code != "NODE_CONFIG_NOT_FOUND" {
 			return WFNodeActionResult{
 					NodeName: nodeName,
 					Action:   "none",
-					Reason:   "orchestrator query failed",
+					Reason:   "node query failed",
 					Error:    actionErr.Error(),
 				},
-				"Package published, but sy.wf-rules could not determine current node state from orchestrator."
+				"Package published, but sy.wf-rules could not determine the node's current state."
 		}
 	} else if err != nil {
 		return WFNodeActionResult{
 				NodeName: nodeName,
 				Action:   "none",
-				Reason:   "orchestrator query failed",
+				Reason:   "node query failed",
 				Error:    err.Error(),
 			},
-			"Package published, but sy.wf-rules could not determine current node state from orchestrator."
+			"Package published, but sy.wf-rules could not determine the node's current state."
 	}
 
 	if !autoSpawn {
@@ -186,11 +207,9 @@ func (s *Service) deployPublishedWorkflow(workflowName string, autoSpawn bool, t
 	}
 
 	runtimeName := pkg.RuntimeName
-	config := s.buildManagedWFConfig(nil, tenantID)
-	err = untilRuntimeSynced(runtimeSyncBudget, func() error {
-		rpcCtx, cancel := context.WithTimeout(context.Background(), orchestratorRPCTimeout)
-		defer cancel()
-		_, err := s.orchestrator.RunNode(rpcCtx, s.cfg.OrchestratorTarget, nodeName, runtimeName, pkg.Version, config)
+	config := s.buildManagedWFConfig(tenantID)
+	err = untilRuntimeSynced(ctx, runtimeSyncBudget, func() error {
+		_, err := s.nodes.RunNode(ctx, nodeName, runtimeName, pkg.Version, config, launchedBy)
 		return err
 	})
 	if err != nil {

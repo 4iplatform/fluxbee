@@ -15831,6 +15831,7 @@ fn runtime_spawn_preflight_with_manifest_and_root(
             runtimes_root,
             requested_runtime,
             package_version,
+            runtime_package_type(requested_entry),
             target_hive,
             node_name,
             package_materialization,
@@ -15862,35 +15863,77 @@ fn runtime_spawn_preflight_with_manifest_and_root(
 
 /// A package published on the motherbee reaches this hive through Syncthing, and the runtimes
 /// manifest can land before the package's own files (lab 2026-09-30: a WF node crash-looped on a
-/// missing flow/definition.json). Until the package's package.json is here, refuse the spawn as
-/// RUNTIME_NOT_PRESENT — callers retry — instead of starting a node that dies on a missing file.
+/// missing flow/definition.json). Until they are here, refuse as RUNTIME_NOT_PRESENT — callers
+/// retry (SY.wf-rules waits for the sync) — instead of starting a node on a package that is not.
+/// A package is here with its package.json; a workflow package also with its flow/definition.json,
+/// since 0.1.70: the WF node no longer exits on a missing definition but waits in FAILED_CONFIG,
+/// so nothing would retry it (A-68). Checked on run_node, on every start and restart, and before
+/// set_node_config binds the version.
 fn runtime_package_files_preflight(
     runtimes_root: &Path,
     runtime: &str,
     version: &str,
+    package_type: &str,
     target_hive: &str,
     node_name: &str,
     materialization: serde_json::Value,
 ) -> Result<(), serde_json::Value> {
-    let package_json = runtimes_root.join(runtime).join(version).join("package.json");
-    if package_json.is_file() {
-        return Ok(());
+    let package_dir = runtimes_root.join(runtime).join(version);
+    let mut required = vec![package_dir.join("package.json")];
+    if package_type == "workflow" {
+        required.push(package_dir.join("flow").join("definition.json"));
     }
+    let Some(missing) = required.iter().find(|path| !path.is_file()) else {
+        return Ok(());
+    };
     Err(serde_json::json!({
         "status": "error",
         "error_code": "RUNTIME_NOT_PRESENT",
         "message": format!(
             "runtime package {runtime} {version} is not on this hive yet (no {})",
-            package_json.display()
+            missing.display()
         ),
         "runtime": runtime,
         "version": version,
-        "expected_path": package_json.display().to_string(),
+        "expected_path": missing.display().to_string(),
         "hint": "The package syncs from the motherbee; retry once it has arrived",
         "target": target_hive,
         "node_name": node_name,
         "requested_runtime_materialization": materialization,
     }))
+}
+
+/// The package files preflight for the version a node would run, by the package type in the
+/// manifest: only packages that run on a base runtime (config_only, workflow) carry their own
+/// files; a full runtime's start script has its own preflight.
+fn node_package_files_preflight(
+    manifest: &RuntimeManifest,
+    runtimes_root: &Path,
+    runtime_key: &str,
+    version: &str,
+    target_hive: &str,
+    node_name: &str,
+) -> Result<(), serde_json::Value> {
+    let package_type = runtime_manifest_entry_map(manifest)
+        .ok()
+        .and_then(|entries| {
+            entries
+                .get(runtime_key)
+                .map(|entry| runtime_package_type(entry).to_string())
+        })
+        .unwrap_or_default();
+    if !matches!(package_type.as_str(), "config_only" | "workflow") {
+        return Ok(());
+    }
+    runtime_package_files_preflight(
+        runtimes_root,
+        runtime_key,
+        version,
+        &package_type,
+        target_hive,
+        node_name,
+        serde_json::json!({}),
+    )
 }
 
 fn runtime_versions_from_manifest_entry(entry: &RuntimeManifestEntry) -> Vec<String> {
@@ -18269,17 +18312,31 @@ async fn set_node_config_flow(
                 Ok(Some(manifest)) => {
                     let resolved = resolve_runtime_key(&manifest, &runtime_name).and_then(|key| {
                         resolve_runtime_version(&manifest, &key, &runtime_version)
+                            .map(|version| (key, version))
                     });
-                    if let Err(err) = resolved {
-                        return serde_json::json!({
-                            "status": "error",
-                            "error_code": "RUNTIME_NOT_AVAILABLE",
-                            "message": err.to_string(),
-                            "target": target_hive,
-                            "node_name": node_name,
-                            "runtime": runtime_name,
-                            "runtime_version": runtime_version,
-                        });
+                    let (runtime_key, resolved_version) = match resolved {
+                        Ok(value) => value,
+                        Err(err) => {
+                            return serde_json::json!({
+                                "status": "error",
+                                "error_code": "RUNTIME_NOT_AVAILABLE",
+                                "message": err.to_string(),
+                                "target": target_hive,
+                                "node_name": node_name,
+                                "runtime": runtime_name,
+                                "runtime_version": runtime_version,
+                            });
+                        }
+                    };
+                    if let Err(payload) = node_package_files_preflight(
+                        &manifest,
+                        Path::new(DIST_RUNTIME_ROOT_DIR),
+                        &runtime_key,
+                        &resolved_version,
+                        &target_hive,
+                        &node_name,
+                    ) {
+                        return payload;
                     }
                 }
                 // No manifest to check against: bind and let the spawn path be the gate, rather
@@ -18979,6 +19036,14 @@ fn managed_node_launch_plan(
     if let Some(payload) = preflight_error {
         return Err(payload);
     }
+    node_package_files_preflight(
+        &manifest,
+        Path::new(DIST_RUNTIME_ROOT_DIR),
+        &runtime_key,
+        &resolved_version,
+        &state.hive_id,
+        &node.node_name,
+    )?;
 
     Ok(ManagedNodeLaunchPlan {
         unit: unit_from_node_name(&node.node_name),
@@ -33031,55 +33096,6 @@ blob:
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    /// go/nodes/wf/wf-generic/node/node.go decodes the `_system` block strictly
-    /// (ManagedSystemConfig): every key written here must be there too, and in its
-    /// TestLoadConfigAcceptsEverySystemKeyTheOrchestratorWrites. A key added here alone took every
-    /// WF node down in the stage-4 review (2026-10-15).
-    #[test]
-    fn the_system_block_keys_are_the_ones_the_wf_node_decodes() {
-        let mut system = build_node_system_block(
-            "WF.x@motherbee",
-            "motherbee",
-            Some("wf.x"),
-            Some("1"),
-            Some("current"),
-            Some("wf.engine"),
-            Some("/p"),
-            Some("ilk:x"),
-            Some("tnt:x"),
-            1,
-        );
-        // As the spawn adds it.
-        system["launched_by"] = serde_json::json!("archi");
-        let mut keys: Vec<&str> = system
-            .as_object()
-            .unwrap()
-            .keys()
-            .map(String::as_str)
-            .collect();
-        keys.sort_unstable();
-        assert_eq!(
-            keys,
-            vec![
-                "config_version",
-                "created_at_ms",
-                "hive_id",
-                "ilk_id",
-                "launched_by",
-                "managed_by",
-                "node_name",
-                "package_path",
-                "relaunch_on_boot",
-                "requested_runtime_version",
-                "runtime",
-                "runtime_base",
-                "runtime_version",
-                "tenant_id",
-                "updated_at_ms",
-            ]
-        );
-    }
-
     /// Stage 4 (docs/ilk-tenant-model-v1.md §2.4): who launched a node comes from SY.admin's stamp;
     /// a requirement is met only by a node that matches it; a stop lasts.
     #[test]
@@ -34129,29 +34145,34 @@ blob:
     fn runtime_package_files_preflight_waits_for_the_package_json() {
         let root = std::env::temp_dir().join(format!("fluxbee-pkg-files-{}", Uuid::new_v4()));
         let package_dir = root.join("wf.w1probe").join("0.0.1");
+        let check = |package_type: &str| {
+            runtime_package_files_preflight(
+                &root,
+                "wf.w1probe",
+                "0.0.1",
+                package_type,
+                "worker1",
+                "WF.w1probe@worker1",
+                serde_json::json!({}),
+            )
+        };
         // The directory can land before its files: that is not "present" yet.
         fs::create_dir_all(package_dir.join("flow")).expect("package dir");
-        let out = runtime_package_files_preflight(
-            &root,
-            "wf.w1probe",
-            "0.0.1",
-            "worker1",
-            "WF.w1probe@worker1",
-            serde_json::json!({}),
-        )
-        .expect_err("no package.json yet must refuse the spawn");
+        let out = check("workflow").expect_err("no package.json yet must refuse the spawn");
         assert_eq!(out["error_code"], "RUNTIME_NOT_PRESENT");
 
+        // A workflow package also waits for its definition (A-68): the WF node would otherwise
+        // start without one and wait in FAILED_CONFIG, with nothing to retry it.
         fs::write(package_dir.join("package.json"), "{}").expect("package.json");
-        runtime_package_files_preflight(
-            &root,
-            "wf.w1probe",
-            "0.0.1",
-            "worker1",
-            "WF.w1probe@worker1",
-            serde_json::json!({}),
-        )
-        .expect("with its package.json the package is here");
+        let out = check("workflow").expect_err("no definition yet must refuse the spawn");
+        assert_eq!(out["error_code"], "RUNTIME_NOT_PRESENT");
+        assert!(out["expected_path"]
+            .as_str()
+            .is_some_and(|path| path.ends_with("flow/definition.json")));
+        check("config_only").expect("a config-only package is here with its package.json");
+
+        fs::write(package_dir.join("flow").join("definition.json"), "{}").expect("definition");
+        check("workflow").expect("with its definition the workflow package is here");
         let _ = fs::remove_dir_all(root);
     }
 

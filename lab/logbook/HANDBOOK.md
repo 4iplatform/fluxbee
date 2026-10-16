@@ -985,6 +985,25 @@ relanza desde el config persistido. El nombre va **calificado** (`<node>@<hive>`
 ⚠️ **Esta recuperación pierde la configuración del nodo.** Con nodos `UNCONFIGURED` no cuesta nada;
 con tokens cargados es una pérdida real.
 
+### Workflows: el deploy pasa por el admin, y un nodo WF roto queda arriba (desde 0.1.70)
+
+- **Cómo se despliega:**
+  - Un workflow se despliega con `POST /hives/<hive>/wf-rules` (o `…/compile`, `…/apply`,
+    `…/rollback`, `…/delete`) o desde Archi.
+  - SY.wf-rules lanza, reinicia y borra el nodo `WF.<nombre>@<hive>` **a través de SY.admin**,
+    como cualquier otro, y solo para los `WF.*` de su hive.
+  - El nodo queda con `launched_by` = quien pidió el deploy (`operator` por HTTP, `archi` desde
+    Archi): `get_node_status` lo muestra.
+  - Desde Archi el deploy funciona desde 0.1.70. Antes se trababa en el loop del admin y
+    respondía `PACKAGE_PUBLISH_FAILED` (A-68).
+- **Un nodo WF con config o definición rota no se cae:**
+  - queda corriendo en `FAILED_CONFIG`;
+  - `get_node_status` muestra `health_state: DEGRADED` y `last_error` (`invalid_config`, o
+    `invalid_definition` si el `flow/definition.json` del paquete falta o no valida);
+  - se arregla redesplegando el workflow, o corrigiendo la config (`set_node_config`) y
+    reiniciándolo (`restart_node`).
+  - Antes se caía y systemd lo relanzaba cada 5 s, y el motivo solo quedaba en journald.
+
 ### Un nodo de sistema nuevo en un rol, con hives ya unidos (0.1.41: SY.opa.rules en ingress/egress)
 
 El `hive.yaml` de un spoke se escribe una sola vez, en el join, y no se re-emite. El spoke arranca los nodos de **su** `system_nodes.<rol>` y los valida

@@ -50,6 +50,12 @@ type runtimeManifestEntry struct {
 }
 
 func (s *Service) PublishWorkflowPackage(workflowName string, meta WfRulesMetadata, definitionBytes []byte) (*PackagePublishResult, error) {
+	ctx, cancel := newRequestContext()
+	defer cancel()
+	return s.publishWorkflowPackage(ctx, workflowName, meta, definitionBytes)
+}
+
+func (s *Service) publishWorkflowPackage(ctx context.Context, workflowName string, meta WfRulesMetadata, definitionBytes []byte) (*PackagePublishResult, error) {
 	packageFiles, err := buildWorkflowPackageFiles(s.cfg.HiveID, workflowName, meta, definitionBytes)
 	if err != nil {
 		return nil, err
@@ -57,9 +63,9 @@ func (s *Service) PublishWorkflowPackage(workflowName string, meta WfRulesMetada
 	if s.admin == nil {
 		return nil, fmt.Errorf("admin client unavailable")
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), adminRPCTimeout)
+	callCtx, cancel := context.WithTimeout(ctx, adminRPCTimeout)
 	defer cancel()
-	return s.admin.PublishRuntimePackage(ctx, packageFiles)
+	return s.admin.PublishRuntimePackage(callCtx, packageFiles)
 }
 
 func buildWorkflowPackageFiles(hiveID, workflowName string, meta WfRulesMetadata, definitionBytes []byte) (map[string]string, error) {
@@ -124,6 +130,12 @@ func (s *Service) publishWorkflowPackageLocal(workflowName string, meta WfRulesM
 }
 
 func (s *Service) PurgeWorkflowPackages(workflowName string, preserveBoundVersion bool) error {
+	ctx, cancel := newRequestContext()
+	defer cancel()
+	return s.purgeWorkflowPackages(ctx, workflowName, preserveBoundVersion)
+}
+
+func (s *Service) purgeWorkflowPackages(ctx context.Context, workflowName string, preserveBoundVersion bool) error {
 	runtimeName := workflowRuntimeName(workflowName)
 	runtimeDir := filepath.Join(s.cfg.DistRuntimeRoot, runtimeName)
 	entries, err := os.ReadDir(runtimeDir)
@@ -142,7 +154,7 @@ func (s *Service) PurgeWorkflowPackages(workflowName string, preserveBoundVersio
 		keep[workflowRuntimeVersion(meta.Version)] = struct{}{}
 	}
 	if preserveBoundVersion {
-		boundVersion, err := s.boundRuntimeVersionForWorkflow(workflowName)
+		boundVersion, err := s.boundRuntimeVersionForWorkflow(ctx, workflowName)
 		if err != nil {
 			return err
 		}
@@ -151,11 +163,11 @@ func (s *Service) PurgeWorkflowPackages(workflowName string, preserveBoundVersio
 		}
 	}
 
-	// The dist tree is the motherbee's. On any other hive it is a Syncthing receive-only mirror:
-	// a local delete is never restored (the next deploy of that version finds no files) and a
-	// manifest edit only diverges from the source. There, obsolete versions are removed through
-	// SY.admin from the motherbee's dist, and the sync carries the removal here.
-	mirror := s.cfg.HiveID != fluxbeesdk.PrimaryHiveID
+	// The dist tree and its manifest are the motherbee's, and only SY.admin writes them: obsolete
+	// versions are removed through it on every hive (A-68). On any other hive the tree is a
+	// Syncthing receive-only mirror, where a local delete is never restored and a manifest edit
+	// only diverges from the source; on the motherbee, a write of its own raced the admin's
+	// publishes now that the admin serves the mesh concurrently.
 	var obsolete []string
 	for _, entry := range entries {
 		if !entry.IsDir() {
@@ -165,32 +177,15 @@ func (s *Service) PurgeWorkflowPackages(workflowName string, preserveBoundVersio
 		if _, ok := keep[version]; ok {
 			continue
 		}
-		if mirror {
-			obsolete = append(obsolete, version)
-			continue
-		}
-		if err := os.RemoveAll(filepath.Join(runtimeDir, version)); err != nil {
-			return err
-		}
+		obsolete = append(obsolete, version)
 	}
-	if mirror {
-		return s.purgeOnPrimary(runtimeName, obsolete)
-	}
-
-	remaining, err := runtimeVersionsOnDisk(runtimeDir)
-	if err != nil {
-		return err
-	}
-	if len(remaining) == 0 {
-		_ = os.Remove(runtimeDir)
-	}
-	return s.updateRuntimeManifestAfterPurge(runtimeName, remaining, preferredCurrentVersion(keep))
+	return s.purgeOnPrimary(ctx, runtimeName, obsolete)
 }
 
 // purgeOnPrimary removes versions from the motherbee's dist. The admin refuses to remove a
 // runtime's current version while other versions remain, so the current one (per this hive's copy
 // of the manifest) goes last.
-func (s *Service) purgeOnPrimary(runtimeName string, versions []string) error {
+func (s *Service) purgeOnPrimary(ctx context.Context, runtimeName string, versions []string) error {
 	current := ""
 	if manifest, err := loadRuntimeManifest(filepath.Join(s.cfg.DistRuntimeRoot, "manifest.json")); err == nil {
 		current = manifest.Runtimes[runtimeName].Current
@@ -199,20 +194,20 @@ func (s *Service) purgeOnPrimary(runtimeName string, versions []string) error {
 		return versions[i] != current && versions[j] == current
 	})
 	for _, version := range versions {
-		if err := s.removeRuntimeVersionOnPrimary(runtimeName, version); err != nil {
+		if err := s.removeRuntimeVersionOnPrimary(ctx, runtimeName, version); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
-func (s *Service) removeRuntimeVersionOnPrimary(runtimeName, version string) error {
+func (s *Service) removeRuntimeVersionOnPrimary(ctx context.Context, runtimeName, version string) error {
 	if s.admin == nil {
 		return fmt.Errorf("admin client unavailable")
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), adminRPCTimeout)
+	callCtx, cancel := context.WithTimeout(ctx, adminRPCTimeout)
 	defer cancel()
-	if err := s.admin.RemoveRuntimeVersion(ctx, runtimeName, version); err != nil {
+	if err := s.admin.RemoveRuntimeVersion(callCtx, runtimeName, version); err != nil {
 		var actionErr *adminActionError
 		if errors.As(err, &actionErr) &&
 			(actionErr.Code == "RUNTIME_NOT_FOUND" || actionErr.Code == "RUNTIME_VERSION_NOT_FOUND") {
@@ -238,32 +233,6 @@ func (s *Service) updateRuntimeManifest(runtimeName, version string) error {
 	entry.Available = appendIfMissing(entry.Available, version)
 	sort.Strings(entry.Available)
 	manifest.Runtimes[runtimeName] = entry
-	manifest.SchemaVersion = 2
-	manifest.Version = nextManifestVersion(manifest.Version, uint64(time.Now().UTC().UnixMilli()))
-	manifest.UpdatedAt = time.Now().UTC().Format(timeRFC3339)
-	manifest.Hash = nil
-	return writeRuntimeManifest(manifestPath, manifest)
-}
-
-func (s *Service) updateRuntimeManifestAfterPurge(runtimeName string, available []string, preferredCurrent string) error {
-	manifestPath := filepath.Join(s.cfg.DistRuntimeRoot, "manifest.json")
-	manifest, err := loadRuntimeManifest(manifestPath)
-	if err != nil {
-		return err
-	}
-	entry, ok := manifest.Runtimes[runtimeName]
-	if !ok && len(available) == 0 {
-		return nil
-	}
-	if len(available) == 0 {
-		delete(manifest.Runtimes, runtimeName)
-	} else {
-		entry.Available = available
-		entry.Current = chooseManifestCurrent(available, preferredCurrent, entry.Current)
-		entry.PackageType = "workflow"
-		entry.RuntimeBase = workflowRuntimeBase
-		manifest.Runtimes[runtimeName] = entry
-	}
 	manifest.SchemaVersion = 2
 	manifest.Version = nextManifestVersion(manifest.Version, uint64(time.Now().UTC().UnixMilli()))
 	manifest.UpdatedAt = time.Now().UTC().Format(timeRFC3339)
@@ -312,37 +281,6 @@ func appendIfMissing(values []string, target string) []string {
 		}
 	}
 	return append(values, target)
-}
-
-func runtimeVersionsOnDisk(runtimeDir string) ([]string, error) {
-	entries, err := os.ReadDir(runtimeDir)
-	if err != nil {
-		if os.IsNotExist(err) {
-			return nil, nil
-		}
-		return nil, err
-	}
-	versions := make([]string, 0, len(entries))
-	for _, entry := range entries {
-		if !entry.IsDir() {
-			continue
-		}
-		versions = append(versions, entry.Name())
-	}
-	sort.Strings(versions)
-	return versions, nil
-}
-
-func preferredCurrentVersion(keep map[string]struct{}) string {
-	if len(keep) == 0 {
-		return ""
-	}
-	versions := make([]string, 0, len(keep))
-	for version := range keep {
-		versions = append(versions, version)
-	}
-	sort.Strings(versions)
-	return versions[len(versions)-1]
 }
 
 func chooseManifestCurrent(available []string, preferredCurrent string, fallbackCurrent string) string {

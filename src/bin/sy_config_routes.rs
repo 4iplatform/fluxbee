@@ -783,13 +783,11 @@ fn write_config(
 /// Enforcement is the router's `system_policy::authorize_system` gate (the single source of
 /// truth); these entries are the visible mirror of that rule set and must be kept
 /// in sync with it by hand. `SY.orchestrator@*` is any-hive (cross-hive forwards);
-/// the rest are this hive's control plane.
+/// `SY.admin@<hive>` is this hive's control plane (SY.wf-rules and WF.orch.diag left it in A-68).
 fn frozen_system_authority_routes(hive_id: &str) -> Vec<StaticRouteEntry> {
     let patterns = [
         ("SY.orchestrator@*".to_string(), MATCH_GLOB),
         (format!("SY.admin@{hive_id}"), MATCH_EXACT),
-        (format!("SY.wf-rules@{hive_id}"), MATCH_EXACT),
-        (format!("WF.orch.diag@{hive_id}"), MATCH_EXACT),
     ];
     patterns
         .into_iter()

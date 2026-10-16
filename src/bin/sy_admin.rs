@@ -310,6 +310,10 @@ struct AdminContext {
     public_base_url: Option<String>,
     publication_ledger_path: PathBuf,
     publication_lock: Arc<Mutex<()>>,
+    /// Serializes the writers of the motherbee's runtime manifest (publish_runtime_package,
+    /// remove_runtime_version), held across their awaits: each reads, decides and rewrites the
+    /// whole file, and since every mesh command runs in its own task (A-68) two can overlap.
+    runtime_manifest_lock: Arc<Mutex<()>>,
     /// Serializes rotate+append on the command audit log (see `append_admin_command_log_locked`).
     command_log_lock: Arc<std::sync::Mutex<()>>,
 }
@@ -636,6 +640,7 @@ async fn main() -> Result<(), AdminError> {
         public_base_url,
         publication_ledger_path: state_dir.join("sy-admin/publications.json"),
         publication_lock: Arc::new(Mutex::new(())),
+        runtime_manifest_lock: Arc::new(Mutex::new(())),
         command_log_lock: Arc::new(std::sync::Mutex::new(())),
     };
     let internal_ctx = http_ctx.clone();
@@ -1909,35 +1914,18 @@ async fn run_internal_admin_loop(
     mut rx: RpcCommandReceiver,
 ) {
     while let Some(msg) = rx.recv().await {
-        // A command whose handler calls back into this loop runs in its own task: run here, the
-        // loop would wait for the orchestrator while the orchestrator waits for the loop.
-        if internal_command_calls_back(&msg) {
-            let (ctx, client) = (ctx.clone(), client.clone());
-            tokio::spawn(async move {
-                if let Err(err) = handle_internal_admin_command(&ctx, &client, &msg).await {
-                    tracing::warn!(error = %err, "internal admin command handling failed");
-                }
-            });
-            continue;
-        }
-        if let Err(err) = handle_internal_admin_command(&ctx, &client, &msg).await {
-            tracing::warn!(error = %err, "internal admin command handling failed");
-        }
+        // Every command runs in its own task, as the operator's HTTP requests do (one task per
+        // connection). A handler that calls this admin back must never wait behind its own
+        // caller: a node teardown (delete_ilk, vault_delete), SY.wf-rules publishing and launching
+        // a workflow, an executor plan. Run inline, each deadlocked until a timeout: Cloud's
+        // delete_node (0.1.68 gate, A-67) and every workflow deploy from Archi (A-68).
+        let (ctx, client) = (ctx.clone(), client.clone());
+        tokio::spawn(async move {
+            if let Err(err) = handle_internal_admin_command(&ctx, &client, &msg).await {
+                tracing::warn!(error = %err, "internal admin command handling failed");
+            }
+        });
     }
-}
-
-/// A node teardown (kill_node or remove_node_instance with purge_instance) makes the orchestrator
-/// call this admin back over the mesh (delete_ilk, purge_ilk, vault_list, vault_delete). Over the
-/// mesh, as Fluxbee Cloud's delete_node arrives, the serial loop deadlocked until the timeouts:
-/// the identity marked but not purged and Cloud answered ADMIN_UNAVAILABLE (0.1.68 gate on 8.x,
-/// FINDINGS A-67). The operator's HTTP path was never affected: it runs in its own task.
-fn internal_command_calls_back(msg: &Message) -> bool {
-    msg.meta.msg.as_deref() == Some(MSG_ADMIN_COMMAND)
-        && msg
-            .payload
-            .get("action")
-            .and_then(|action| action.as_str())
-            .is_some_and(|action| matches!(action, "kill_node" | "remove_node_instance"))
 }
 
 async fn run_system_command_loop(
@@ -2992,13 +2980,11 @@ async fn handle_internal_admin_command(
         }
     };
 
-    // No global command_lock here: this loop is already a single async task
-    // serialised by `rx.recv()` in run_internal_admin_loop. Holding a shared
-    // lock across an external `.await` deadlocks when the forwarded command
-    // causes the target node (e.g. architect) to call back to admin with a
-    // nested ADMIN_COMMAND (e.g. vault_put) — the callback then blocks waiting
-    // for the lock the HTTP handler still holds.
-    let internal = dispatch_internal_admin_command(
+    // No global command_lock here: each command runs in its own task (run_internal_admin_loop),
+    // as each HTTP request does. Holding a shared lock across an external `.await` deadlocks when
+    // the forwarded command causes the target node (e.g. architect) to call back to admin with a
+    // nested ADMIN_COMMAND (e.g. vault_put) — the callback then blocks waiting for the lock.
+    let internal = match dispatch_internal_admin_command(
         ctx,
         client,
         &action,
@@ -3008,7 +2994,26 @@ async fn handle_internal_admin_command(
         // cross-hive). This is the authz origin — never the payload.
         msg.routing.src_l2_name.as_deref(),
     )
-    .await?;
+    .await
+    {
+        Ok(internal) => internal,
+        // A failure before any reply was built (a request it could not parse, a transport error)
+        // still answers: a caller over the mesh would otherwise wait for its own timeout.
+        Err(err) => {
+            let detail = serde_json::json!({ "message": err.to_string() });
+            return send_admin_command_response(
+                client,
+                msg,
+                &action,
+                "error",
+                serde_json::Value::Null,
+                Some("INTERNAL_ERROR".to_string()),
+                Some(detail),
+                parsed.request_id,
+            )
+            .await;
+        }
+    };
     let status = internal
         .envelope
         .get("status")
@@ -5205,6 +5210,9 @@ async fn dispatch_internal_admin_command(
     // EDGE-06 (scoped to the Fluxbee Cloud relay): the provisioning actions IO.cloud relays are
     // exposed behind an internet token via io.cloud, so over the MESH they may only originate from
     // IO.cloud. The operator HTTP path + the internal executor are caller==None and stay trusted.
+    if let Err(detail) = authorize_wf_rules_caller(caller_l2_name, action, target, &params) {
+        return Ok(internal_unauthorized(action, &detail));
+    }
     if let Err(detail) = authorize_cloud_relay(caller_l2_name, action, &ctx.hive_id) {
         return Ok(internal_unauthorized(action, &detail));
     }
@@ -5441,12 +5449,20 @@ async fn dispatch_internal_admin_command(
             let hive = resolve_internal_action_hive(action, target, &params);
             let req = parse_internal_wf_rules_request(params, hive)
                 .map_err(|detail| -> AdminError { detail.into() })?;
-            handle_wf_rules_http(ctx, client, req, wf_action).await?
+            let launched_by = launched_by_for_caller(caller_l2_name, &ctx.hive_id);
+            handle_wf_rules_http(ctx, client, req, wf_action, &launched_by).await?
         }
         InternalActionRoute::WfRulesQuery(query_action) => {
             let hive = resolve_internal_action_hive(action, target, &params);
             let req = parse_internal_wf_rules_request(params, hive)
                 .map_err(|detail| -> AdminError { detail.into() })?;
+            // Without a hive the query has no SY.wf-rules to ask: answer so, rather than not at all.
+            if normalize_wf_rules_target(req.hive.clone(), "").is_empty() {
+                return Ok(internal_invalid_request(
+                    action,
+                    "missing target (payload.target or params.hive)",
+                ));
+            }
             handle_wf_rules_query(ctx, client, query_action, req).await?
         }
         InternalActionRoute::TimerRpc(timer_msg) => {
@@ -5781,16 +5797,127 @@ fn authorize_cloud_relay(
     if caller == format!("SY.architect@{admin_hive}") {
         return Ok(());
     }
+    // SY.wf-rules launches the WF nodes of its own hive when a workflow is deployed;
+    // authorize_wf_rules_caller bounds it to them.
+    if action == "run_node" && caller.starts_with(WF_RULES_ROLE_PREFIX) {
+        return Ok(());
+    }
     Err(format!(
         "only {expected} may relay '{action}' over the mesh (Fluxbee Cloud provisioning gate); caller={caller}"
     ))
+}
+
+/// The node actions SY.wf-rules runs to deploy, restart and delete the WF nodes of its hive
+/// (docs/wf-standard-path-v1.md).
+const WF_RULES_NODE_ACTIONS: &[&str] = &[
+    "run_node",
+    "restart_node",
+    "kill_node",
+    "set_node_config",
+    "get_node_config",
+    "get_node_status",
+];
+
+const WF_RULES_ROLE_PREFIX: &str = "SY.wf-rules@";
+
+/// SY.wf-rules goes through the admin like every other launcher, and the admin lets it act only on
+/// the `WF.*` nodes of its own hive: the node name and, when given, the target must both name the
+/// caller's hive (the router-stamped name, never the params). Other actions and other callers are
+/// not this gate's business.
+fn authorize_wf_rules_caller(
+    caller_l2_name: Option<&str>,
+    action: &str,
+    target: Option<&str>,
+    params: &serde_json::Value,
+) -> Result<(), String> {
+    let Some(caller) = caller_l2_name else {
+        return Ok(());
+    };
+    let Some(caller_hive) = caller.strip_prefix(WF_RULES_ROLE_PREFIX) else {
+        return Ok(());
+    };
+    if !WF_RULES_NODE_ACTIONS.contains(&action) {
+        return Ok(());
+    }
+    let node_name = params
+        .get("node_name")
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .unwrap_or("");
+    let refusal = || {
+        Err(format!(
+            "{caller} may act only on the WF.* nodes of hive '{caller_hive}', not '{action}' on '{node_name}'"
+        ))
+    };
+    let Some((local, node_hive)) = node_name.rsplit_once('@') else {
+        return refusal();
+    };
+    if !local.starts_with("WF.") || local.len() <= "WF.".len() || node_hive.trim() != caller_hive {
+        return refusal();
+    }
+    let targets = [
+        normalize_internal_target_hive(target),
+        normalize_internal_target_hive(params.get("target").and_then(|value| value.as_str())),
+    ];
+    if targets.iter().flatten().any(|hive| hive != caller_hive) {
+        return refusal();
+    }
+    // What it binds or launches is the node's own workflow package, on the WF engine: never
+    // another runtime under a WF.* name.
+    let workflow_runtime = format!("wf.{}", &local["WF.".len()..]);
+    let field = |key: &str| {
+        params
+            .get(key)
+            .and_then(|value| value.as_str())
+            .map(str::trim)
+    };
+    let runtime_ok = match field("runtime") {
+        Some(runtime) => runtime == workflow_runtime,
+        None => action != "run_node",
+    };
+    let base_ok = field("runtime_base").is_none_or(|base| base == "wf.engine");
+    let package_ok = field("package_path").is_none_or(|path| {
+        let root = format!("{DIST_RUNTIME_ROOT_DIR}/{workflow_runtime}/");
+        path.starts_with(&root) && !path.contains("..")
+    });
+    if !(runtime_ok && base_ok && package_ok) {
+        return Err(format!(
+            "{caller} may bind or launch only {workflow_runtime} on wf.engine for '{node_name}'"
+        ));
+    }
+    Ok(())
+}
+
+/// Who launched a node, as the admin records it in `_system.launched_by`: `cloud` for the Fluxbee
+/// Cloud relay, `archi`, `operator` for the operator and the executor, else the caller's name.
+fn launched_by_for_caller(caller_l2_name: Option<&str>, admin_hive: &str) -> String {
+    match caller_l2_name {
+        Some(caller) if caller == format!("IO.cloud@{admin_hive}") => "cloud".to_string(),
+        Some(caller) if caller == format!("SY.architect@{admin_hive}") => "archi".to_string(),
+        Some(caller) => caller.to_string(),
+        None => "operator".to_string(),
+    }
+}
+
+/// The launcher SY.wf-rules carries for a workflow deploy: `operator` or `archi`, the two the admin
+/// stamps on the wf_rules requests that reach it (the operator's HTTP and executor plans, Archi).
+/// Anything else, `cloud` above all (it would give Fluxbee Cloud's relay start and kill rights on
+/// the node), is not carried: the admin records SY.wf-rules itself.
+fn launcher_carried_by_wf_rules(
+    params: &serde_json::Map<String, serde_json::Value>,
+) -> Option<String> {
+    match params.get("launched_by")?.as_str()?.trim() {
+        launcher @ ("operator" | "archi") => Some(launcher.to_string()),
+        _ => None,
+    }
 }
 
 /// What admin stamps on a command from the router-stamped caller, never from what the params say:
 /// - `set_ilk_tenant`: who the tenant change is for, for its history row (the caller, or the
 ///   executor for an internal plan);
 /// - `run_node`: who launched the node, kept in its `_system.launched_by` (`cloud` for the Fluxbee
-///   Cloud relay, `archi`, `operator` for the operator and the executor, else the caller);
+///   Cloud relay, `archi`, `operator` for the operator and the executor, else the caller; for
+///   SY.wf-rules, whoever asked for the workflow deploy);
 /// - for the Cloud relay, which acts only on the nodes it launched in the tenant it claims
 ///   (docs/ilk-tenant-model-v1.md §2.4): `start_node` and `kill_node` require such a node,
 ///   `get_node_status` a node of that tenant, and the hive that holds the node answers
@@ -5814,14 +5941,16 @@ fn stamp_relay_facts(
             );
         }
         "run_node" => {
-            let launched_by = match caller_l2_name {
-                _ if cloud_relay => "cloud".to_string(),
-                Some(caller) if caller == format!("SY.architect@{admin_hive}") => {
-                    "archi".to_string()
+            // SY.wf-rules launches a deployed workflow's node for whoever asked for the deploy;
+            // the admin stamped that on the wf_rules request (handle_wf_rules_http).
+            let carried = match caller_l2_name {
+                Some(caller) if caller.starts_with(WF_RULES_ROLE_PREFIX) => {
+                    launcher_carried_by_wf_rules(object)
                 }
-                Some(caller) => caller.to_string(),
-                None => "operator".to_string(),
+                _ => None,
             };
+            let launched_by =
+                carried.unwrap_or_else(|| launched_by_for_caller(caller_l2_name, admin_hive));
             object.insert(
                 "launched_by".to_string(),
                 serde_json::Value::String(launched_by),
@@ -6551,31 +6680,32 @@ async fn handle_http(
         ("POST", "/wf-rules") => {
             let req: WfRulesRequest = serde_json::from_slice(&body)?;
             let (status, resp) =
-                handle_wf_rules_http(ctx, client, req, WfRulesAction::CompileApply).await?;
+                handle_wf_rules_http(ctx, client, req, WfRulesAction::CompileApply, "operator")
+                    .await?;
             respond_json(stream, status, &resp).await?;
         }
         ("POST", "/wf-rules/compile") => {
             let req: WfRulesRequest = serde_json::from_slice(&body)?;
             let (status, resp) =
-                handle_wf_rules_http(ctx, client, req, WfRulesAction::Compile).await?;
+                handle_wf_rules_http(ctx, client, req, WfRulesAction::Compile, "operator").await?;
             respond_json(stream, status, &resp).await?;
         }
         ("POST", "/wf-rules/apply") => {
             let req: WfRulesRequest = serde_json::from_slice(&body)?;
             let (status, resp) =
-                handle_wf_rules_http(ctx, client, req, WfRulesAction::Apply).await?;
+                handle_wf_rules_http(ctx, client, req, WfRulesAction::Apply, "operator").await?;
             respond_json(stream, status, &resp).await?;
         }
         ("POST", "/wf-rules/rollback") => {
             let req: WfRulesRequest = serde_json::from_slice(&body)?;
             let (status, resp) =
-                handle_wf_rules_http(ctx, client, req, WfRulesAction::Rollback).await?;
+                handle_wf_rules_http(ctx, client, req, WfRulesAction::Rollback, "operator").await?;
             respond_json(stream, status, &resp).await?;
         }
         ("POST", "/wf-rules/delete") => {
             let req: WfRulesRequest = serde_json::from_slice(&body)?;
             let (status, resp) =
-                handle_wf_rules_http(ctx, client, req, WfRulesAction::Delete).await?;
+                handle_wf_rules_http(ctx, client, req, WfRulesAction::Delete, "operator").await?;
             respond_json(stream, status, &resp).await?;
         }
         ("GET", "/wf-rules") => {
@@ -7500,7 +7630,8 @@ async fn handle_hive_paths(
             let mut req = req;
             req.hive = Some(hive);
             let (status, resp) =
-                handle_wf_rules_http(ctx, client, req, WfRulesAction::CompileApply).await?;
+                handle_wf_rules_http(ctx, client, req, WfRulesAction::CompileApply, "operator")
+                    .await?;
             Ok(Some((status, resp)))
         }
         ("POST", ["wf-rules", "compile"]) => {
@@ -7508,7 +7639,7 @@ async fn handle_hive_paths(
             let mut req = req;
             req.hive = Some(hive);
             let (status, resp) =
-                handle_wf_rules_http(ctx, client, req, WfRulesAction::Compile).await?;
+                handle_wf_rules_http(ctx, client, req, WfRulesAction::Compile, "operator").await?;
             Ok(Some((status, resp)))
         }
         ("POST", ["wf-rules", "apply"]) => {
@@ -7516,7 +7647,7 @@ async fn handle_hive_paths(
             let mut req = req;
             req.hive = Some(hive);
             let (status, resp) =
-                handle_wf_rules_http(ctx, client, req, WfRulesAction::Apply).await?;
+                handle_wf_rules_http(ctx, client, req, WfRulesAction::Apply, "operator").await?;
             Ok(Some((status, resp)))
         }
         ("POST", ["wf-rules", "rollback"]) => {
@@ -7524,7 +7655,7 @@ async fn handle_hive_paths(
             let mut req = req;
             req.hive = Some(hive);
             let (status, resp) =
-                handle_wf_rules_http(ctx, client, req, WfRulesAction::Rollback).await?;
+                handle_wf_rules_http(ctx, client, req, WfRulesAction::Rollback, "operator").await?;
             Ok(Some((status, resp)))
         }
         ("POST", ["wf-rules", "delete"]) => {
@@ -7532,7 +7663,7 @@ async fn handle_hive_paths(
             let mut req = req;
             req.hive = Some(hive);
             let (status, resp) =
-                handle_wf_rules_http(ctx, client, req, WfRulesAction::Delete).await?;
+                handle_wf_rules_http(ctx, client, req, WfRulesAction::Delete, "operator").await?;
             Ok(Some((status, resp)))
         }
         ("GET", ["wf-rules"]) => {
@@ -8725,17 +8856,31 @@ async fn handle_opa_query(
     Ok(build_opa_query_response(ctx, action, responses, target))
 }
 
+/// The config SY.wf-rules gets for an operation: the request, the operation, and who asked for it
+/// (`launched_by`, stamped by the admin, never taken from the request), which SY.wf-rules carries
+/// into the run_node of a first deploy.
+fn wf_rules_operation_config(
+    mut payload: serde_json::Map<String, serde_json::Value>,
+    operation: &str,
+    launched_by: &str,
+) -> serde_json::Value {
+    payload.insert("operation".to_string(), serde_json::json!(operation));
+    payload.insert("launched_by".to_string(), serde_json::json!(launched_by));
+    serde_json::Value::Object(payload)
+}
+
+/// `launched_by`: who asked (`operator` on the HTTP API; launched_by_for_caller over the mesh).
 async fn handle_wf_rules_http(
     ctx: &AdminContext,
     client: &RouterDispatcher,
     req: WfRulesRequest,
     action: WfRulesAction,
+    launched_by: &str,
 ) -> Result<(u16, String), AdminError> {
     let target_hive = normalize_wf_rules_target(req.hive.clone(), &ctx.hive_id);
     let target_node = format!("SY.wf-rules@{}", target_hive);
     let response = if let Some(operation) = action.operation() {
-        let mut payload = req.payload;
-        payload.insert("operation".to_string(), serde_json::json!(operation));
+        let config = wf_rules_operation_config(req.payload, operation, launched_by);
         send_system_request_with_meta(
             client,
             &target_node,
@@ -8746,7 +8891,7 @@ async fn handle_wf_rules_http(
                 "schema_version": 1,
                 "config_version": 0,
                 "apply_mode": "replace",
-                "config": serde_json::Value::Object(payload),
+                "config": config,
             }),
             16,
             None,
@@ -8754,7 +8899,7 @@ async fn handle_wf_rules_http(
             Some(target_node.clone()),
             Some("CONFIG_SET".to_string()),
             None,
-            admin_action_timeout(action.action_name()),
+            wf_rules_request_timeout(),
         )
         .await
     } else if let Some(command) = action.command() {
@@ -8764,13 +8909,20 @@ async fn handle_wf_rules_http(
             "command",
             command,
             serde_json::Value::Object(req.payload),
-            admin_action_timeout(action.action_name()),
+            wf_rules_request_timeout(),
         )
         .await
     } else {
         Err("unsupported wf-rules action".into())
     };
     Ok(build_admin_http_response(action.action_name(), response))
+}
+
+/// How long the admin waits for SY.wf-rules: longer than the deadline SY.wf-rules gives a request
+/// end to end (35 s: publish, purge, the node's rebind and restart or launch), so the answer is
+/// never lost to a timeout while the deploy goes on; Archi waits longer still (60 s). A-68.
+fn wf_rules_request_timeout() -> Duration {
+    Duration::from_secs(env_timeout_secs("JSR_ADMIN_WF_RULES_TIMEOUT_SECS").unwrap_or(45))
 }
 
 async fn handle_wf_rules_query(
@@ -8791,7 +8943,7 @@ async fn handle_wf_rules_query(
         "query",
         action,
         serde_json::Value::Object(req.payload),
-        admin_action_timeout(action),
+        wf_rules_request_timeout(),
     )
     .await;
     Ok(build_admin_http_response(action, response))
@@ -12575,6 +12727,7 @@ async fn handle_publish_runtime_package(
         ));
     }
 
+    let _manifest_guard = ctx.runtime_manifest_lock.lock().await;
     let req: PublishRuntimePackageRequest = match serde_json::from_value(payload) {
         Ok(req) => req,
         Err(err) => {
@@ -12794,6 +12947,7 @@ async fn handle_remove_runtime_version(
         ));
     }
 
+    let _manifest_guard = ctx.runtime_manifest_lock.lock().await;
     let runtime = payload
         .get("runtime")
         .and_then(|value| value.as_str())
@@ -15886,11 +16040,32 @@ mod tests {
             (relay, "cloud"),
             (Some("SY.architect@motherbee"), "archi"),
             (None, "operator"),
-            (Some("SY.wf-rules@motherbee"), "SY.wf-rules@motherbee"),
+            (Some("AI.chat@motherbee"), "AI.chat@motherbee"),
+            // SY.wf-rules carries the launcher the admin stamped on the workflow deploy.
+            (Some("SY.wf-rules@motherbee"), "archi"),
         ] {
             assert_eq!(
                 stamp_relay_facts("run_node", forged.clone(), caller, "motherbee")["launched_by"],
                 expected
+            );
+        }
+        // …but only `operator` or `archi`, the two the admin stamps on a workflow deploy; anything
+        // else, `cloud` above all, is recorded as SY.wf-rules.
+        for carried in [
+            serde_json::json!({"launched_by": "cloud"}),
+            serde_json::json!({"launched_by": "WF.admin.internal.diag@motherbee"}),
+            serde_json::json!({"launched_by": "system"}),
+            serde_json::json!({"launched_by": ""}),
+            serde_json::json!({}),
+        ] {
+            assert_eq!(
+                stamp_relay_facts(
+                    "run_node",
+                    carried,
+                    Some("SY.wf-rules@worker1"),
+                    "motherbee"
+                )["launched_by"],
+                "SY.wf-rules@worker1"
             );
         }
         let node = serde_json::json!({"node_name": "IO.slack.a@motherbee", "tenant_id": t});
@@ -15971,34 +16146,186 @@ mod tests {
         assert!(check("kill_node", planted).is_err());
     }
 
-    /// A teardown calls the admin back: the mesh loop hands it to its own task (0.1.68 gate).
+    /// Every mesh command runs in its own task (A-68): a handler that calls this admin back — a
+    /// node teardown, SY.wf-rules publishing and launching a workflow, an executor plan — must
+    /// never wait behind its own caller (Cloud's delete_node in the 0.1.68 gate; every workflow
+    /// deploy from Archi before 0.1.70).
     #[test]
-    fn a_teardown_runs_off_the_mesh_loop() {
-        let command = |action: &str| {
-            let mut msg = Message {
-                routing: Routing {
-                    src: "u".to_string(),
-                    src_l2_name: None,
-                    dst: Destination::Unicast("SY.admin@motherbee".to_string()),
-                    ttl: 4,
-                    trace_id: "t".to_string(),
-                },
-                meta: Meta {
-                    msg_type: "admin".to_string(),
-                    msg: Some(MSG_ADMIN_COMMAND.to_string()),
-                    ..Meta::default()
-                },
-                payload: serde_json::json!({ "action": action, "params": {} }),
-            };
-            msg.meta.msg = Some(MSG_ADMIN_COMMAND.to_string());
-            msg
+    fn every_mesh_command_runs_off_the_loop() {
+        let source = include_str!("sy_admin.rs");
+        let start = source
+            .find("async fn run_internal_admin_loop(")
+            .expect("the mesh loop");
+        let body = &source[start..start + source[start..].find("\n}\n").expect("loop end")];
+        let spawn = body
+            .find("tokio::spawn")
+            .expect("the loop spawns each command");
+        assert_eq!(body.matches("handle_internal_admin_command(").count(), 1);
+        assert!(
+            body.find("handle_internal_admin_command(")
+                .expect("the handler")
+                > spawn
+        );
+    }
+
+    /// SY.wf-rules goes through the admin for its WF nodes, and only for the WF.* nodes of its own
+    /// hive (docs/wf-standard-path-v1.md).
+    #[test]
+    fn wf_rules_acts_only_on_the_wf_nodes_of_its_hive() {
+        let node = |name: &str| serde_json::json!({ "node_name": name });
+        for action in WF_RULES_NODE_ACTIONS {
+            for caller in ["SY.wf-rules@motherbee", "SY.wf-rules@worker1"] {
+                let hive = caller.trim_start_matches(WF_RULES_ROLE_PREFIX);
+                let mut own = node(&format!("WF.invoice@{hive}"));
+                if *action == "run_node" {
+                    own["runtime"] = serde_json::json!("wf.invoice");
+                }
+                assert!(
+                    authorize_wf_rules_caller(Some(caller), action, Some(hive), &own).is_ok(),
+                    "{caller} {action} on its own WF node"
+                );
+                assert!(authorize_wf_rules_caller(Some(caller), action, None, &own).is_ok());
+                for (target, params) in [
+                    (Some(hive), node(&format!("IO.slack.a@{hive}"))),
+                    (Some(hive), node(&format!("AI.chat@{hive}"))),
+                    (Some(hive), node(&format!("SY.admin@{hive}"))),
+                    (Some(hive), node(&format!("WF.@{hive}"))),
+                    (Some("elsewhere"), own.clone()),
+                    (None, node("WF.invoice@elsewhere")),
+                    (Some(hive), node("WF.invoice")),
+                    (Some(hive), serde_json::json!({})),
+                    (
+                        None,
+                        serde_json::json!({"node_name": format!("WF.invoice@{hive}"), "target": "elsewhere"}),
+                    ),
+                ] {
+                    assert!(
+                        authorize_wf_rules_caller(Some(caller), action, target, &params).is_err(),
+                        "{caller} {action} {target:?} {params}"
+                    );
+                }
+            }
+        }
+        // What it binds or launches is the node's own workflow package, on the WF engine.
+        let caller = Some("SY.wf-rules@worker1");
+        let package = format!("{DIST_RUNTIME_ROOT_DIR}/wf.invoice/3");
+        let launch = |runtime: &str| serde_json::json!({"node_name": "WF.invoice@worker1", "runtime": runtime, "runtime_version": "3"});
+        assert!(authorize_wf_rules_caller(
+            caller,
+            "run_node",
+            Some("worker1"),
+            &launch("wf.invoice")
+        )
+        .is_ok());
+        for runtime in ["io.slack", "wf.other", "ai.generic", "wf.engine"] {
+            assert!(
+                authorize_wf_rules_caller(caller, "run_node", Some("worker1"), &launch(runtime))
+                    .is_err(),
+                "{runtime}"
+            );
+        }
+        assert!(authorize_wf_rules_caller(
+            caller,
+            "run_node",
+            Some("worker1"),
+            &serde_json::json!({"node_name": "WF.invoice@worker1"})
+        )
+        .is_err());
+        let rebind = |base: &str, path: &str| {
+            serde_json::json!({
+                "node_name": "WF.invoice@worker1",
+                "config": {},
+                "runtime": "wf.invoice",
+                "runtime_version": "3",
+                "runtime_base": base,
+                "package_path": path,
+            })
         };
-        assert!(internal_command_calls_back(&command("kill_node")));
-        assert!(internal_command_calls_back(&command(
-            "remove_node_instance"
-        )));
-        assert!(!internal_command_calls_back(&command("delete_ilk")));
-        assert!(!internal_command_calls_back(&command("run_node")));
+        assert!(authorize_wf_rules_caller(
+            caller,
+            "set_node_config",
+            Some("worker1"),
+            &rebind("wf.engine", &package)
+        )
+        .is_ok());
+        for (base, path) in [
+            ("io.cloud", package.clone()),
+            ("wf.engine", format!("{DIST_RUNTIME_ROOT_DIR}/io.slack/1")),
+            (
+                "wf.engine",
+                format!("{DIST_RUNTIME_ROOT_DIR}/wf.invoice/../io.slack/1"),
+            ),
+            ("wf.engine", "/tmp/wf.invoice/3".to_string()),
+        ] {
+            assert!(
+                authorize_wf_rules_caller(
+                    caller,
+                    "set_node_config",
+                    Some("worker1"),
+                    &rebind(base, &path)
+                )
+                .is_err(),
+                "{base} {path}"
+            );
+        }
+        // Its other actions, and every other caller, are other gates' business.
+        assert!(authorize_wf_rules_caller(
+            Some("SY.wf-rules@motherbee"),
+            "publish_runtime_package",
+            None,
+            &serde_json::json!({})
+        )
+        .is_ok());
+        for caller in [
+            None,
+            Some("SY.architect@motherbee"),
+            Some("IO.cloud@motherbee"),
+        ] {
+            assert!(authorize_wf_rules_caller(
+                caller,
+                "run_node",
+                None,
+                &node("IO.slack.a@motherbee")
+            )
+            .is_ok());
+        }
+        // The Cloud relay gate lets SY.wf-rules launch (bounded above), and nothing else of the
+        // Cloud surface.
+        for caller in ["SY.wf-rules@motherbee", "SY.wf-rules@worker1"] {
+            assert!(authorize_cloud_relay(Some(caller), "run_node", "motherbee").is_ok());
+            for cloud_only in ["vault_put", "create_tenant", "delete_ilk", "set_ilk_tenant"] {
+                assert!(
+                    authorize_cloud_relay(Some(caller), cloud_only, "motherbee").is_err(),
+                    "{caller} {cloud_only}"
+                );
+            }
+        }
+    }
+
+    /// A workflow deploy launches its node for whoever asked: the admin stamps the requester on
+    /// the wf_rules request, never what the request claims, and SY.wf-rules carries it.
+    #[test]
+    fn a_workflow_node_is_launched_for_whoever_asked_for_the_deploy() {
+        for (caller, expected) in [
+            (None, "operator"),
+            (Some("SY.architect@motherbee"), "archi"),
+            (Some("IO.cloud@motherbee"), "cloud"),
+            (
+                Some("WF.admin.internal.diag@motherbee"),
+                "WF.admin.internal.diag@motherbee",
+            ),
+        ] {
+            assert_eq!(launched_by_for_caller(caller, "motherbee"), expected);
+        }
+        let forged = serde_json::json!({"workflow_name": "invoice", "launched_by": "cloud"});
+        let config = wf_rules_operation_config(
+            forged.as_object().cloned().expect("object"),
+            "compile_apply",
+            "archi",
+        );
+        assert_eq!(config["launched_by"], "archi");
+        assert_eq!(config["operation"], "compile_apply");
+        assert_eq!(config["workflow_name"], "invoice");
     }
 
     #[test]
@@ -16689,6 +17016,7 @@ mod tests {
             public_base_url: None,
             publication_ledger_path: state_dir.join("sy-admin/publications.json"),
             publication_lock: Arc::new(Mutex::new(())),
+            runtime_manifest_lock: Arc::new(Mutex::new(())),
             command_log_lock: Arc::new(std::sync::Mutex::new(())),
         };
         (ctx, harness)

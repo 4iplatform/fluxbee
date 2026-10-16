@@ -45,15 +45,7 @@ func TestGetWorkflowRequiresCurrentDefinition(t *testing.T) {
 }
 
 type fakeWFNodeClient struct {
-	getNodeStatusFunc         func(nodeName string) (wfNodeStatusProbe, error)
 	countRunningInstancesFunc func(nodeName string) (int, error)
-}
-
-func (f *fakeWFNodeClient) GetNodeStatus(_ context.Context, nodeName string) (wfNodeStatusProbe, error) {
-	if f.getNodeStatusFunc != nil {
-		return f.getNodeStatusFunc(nodeName)
-	}
-	return wfNodeStatusProbe{HealthState: "HEALTHY"}, nil
 }
 
 func (f *fakeWFNodeClient) CountRunningInstances(_ context.Context, nodeName string) (int, error) {
@@ -71,8 +63,8 @@ func TestGetWorkflowStatusReturnsNodeState(t *testing.T) {
 	if _, err := svc.ApplyWorkflow(ApplyRequest{WorkflowName: "invoice"}); err != nil {
 		t.Fatalf("ApplyWorkflow: %v", err)
 	}
-	svc.orchestrator = &fakeOrchestratorClient{
-		getNodeConfigFunc: func(_ context.Context, targetNode, nodeName string) (map[string]any, error) {
+	svc.nodes = &fakeNodeClient{
+		getNodeConfigFunc: func(_ context.Context, nodeName string) (map[string]any, error) {
 			return map[string]any{
 				"status": "ok",
 				"config": map[string]any{
@@ -85,13 +77,13 @@ func TestGetWorkflowStatusReturnsNodeState(t *testing.T) {
 			}, nil
 		},
 	}
+	svc.nodes.(*fakeNodeClient).getNodeStatusFunc = func(_ context.Context, nodeName string) (map[string]any, error) {
+		if nodeName != "WF.invoice@motherbee" {
+			t.Fatalf("unexpected node %q", nodeName)
+		}
+		return map[string]any{"lifecycle_state": "RUNNING", "health_state": "HEALTHY"}, nil
+	}
 	svc.wfNodes = &fakeWFNodeClient{
-		getNodeStatusFunc: func(nodeName string) (wfNodeStatusProbe, error) {
-			if nodeName != "WF.invoice@motherbee" {
-				t.Fatalf("unexpected node %q", nodeName)
-			}
-			return wfNodeStatusProbe{HealthState: "HEALTHY"}, nil
-		},
 		countRunningInstancesFunc: func(nodeName string) (int, error) {
 			if nodeName != "WF.invoice@motherbee" {
 				t.Fatalf("unexpected node %q", nodeName)
@@ -120,8 +112,8 @@ func TestGetWorkflowStatusTreatsInstanceQueryTimeoutAsNonFatal(t *testing.T) {
 	if _, err := svc.CompileWorkflow(CompileRequest{WorkflowName: "invoice", Definition: validWorkflowDefinition()}); err != nil {
 		t.Fatalf("CompileWorkflow: %v", err)
 	}
-	svc.orchestrator = &fakeOrchestratorClient{
-		getNodeConfigFunc: func(_ context.Context, targetNode, nodeName string) (map[string]any, error) {
+	svc.nodes = &fakeNodeClient{
+		getNodeConfigFunc: func(_ context.Context, nodeName string) (map[string]any, error) {
 			return map[string]any{
 				"status": "ok",
 				"config": map[string]any{
@@ -133,9 +125,6 @@ func TestGetWorkflowStatusTreatsInstanceQueryTimeoutAsNonFatal(t *testing.T) {
 		},
 	}
 	svc.wfNodes = &fakeWFNodeClient{
-		getNodeStatusFunc: func(nodeName string) (wfNodeStatusProbe, error) {
-			return wfNodeStatusProbe{HealthState: "HEALTHY"}, nil
-		},
 		countRunningInstancesFunc: func(nodeName string) (int, error) {
 			return 0, errors.New("timeout")
 		},
@@ -155,8 +144,8 @@ func TestGetWorkflowStatusTreatsNodeStatusTimeoutAsNonFatal(t *testing.T) {
 	if _, err := svc.CompileWorkflow(CompileRequest{WorkflowName: "invoice", Definition: validWorkflowDefinition()}); err != nil {
 		t.Fatalf("CompileWorkflow: %v", err)
 	}
-	svc.orchestrator = &fakeOrchestratorClient{
-		getNodeConfigFunc: func(_ context.Context, targetNode, nodeName string) (map[string]any, error) {
+	svc.nodes = &fakeNodeClient{
+		getNodeConfigFunc: func(_ context.Context, nodeName string) (map[string]any, error) {
 			return map[string]any{
 				"status": "ok",
 				"config": map[string]any{
@@ -167,10 +156,8 @@ func TestGetWorkflowStatusTreatsNodeStatusTimeoutAsNonFatal(t *testing.T) {
 			}, nil
 		},
 	}
-	svc.wfNodes = &fakeWFNodeClient{
-		getNodeStatusFunc: func(nodeName string) (wfNodeStatusProbe, error) {
-			return wfNodeStatusProbe{}, context.DeadlineExceeded
-		},
+	svc.nodes.(*fakeNodeClient).getNodeStatusFunc = func(_ context.Context, nodeName string) (map[string]any, error) {
+		return nil, context.DeadlineExceeded
 	}
 
 	status, err := svc.GetWorkflowStatus(GetStatusRequest{WorkflowName: "invoice"})
@@ -187,8 +174,8 @@ func TestGetWorkflowStatusUsesNodeStatusForRunningEvenWhenInstanceQueryTimesOut(
 	if _, err := svc.CompileWorkflow(CompileRequest{WorkflowName: "invoice", Definition: validWorkflowDefinition()}); err != nil {
 		t.Fatalf("CompileWorkflow: %v", err)
 	}
-	svc.orchestrator = &fakeOrchestratorClient{
-		getNodeConfigFunc: func(_ context.Context, targetNode, nodeName string) (map[string]any, error) {
+	svc.nodes = &fakeNodeClient{
+		getNodeConfigFunc: func(_ context.Context, nodeName string) (map[string]any, error) {
 			return map[string]any{
 				"status": "ok",
 				"config": map[string]any{
@@ -200,9 +187,6 @@ func TestGetWorkflowStatusUsesNodeStatusForRunningEvenWhenInstanceQueryTimesOut(
 		},
 	}
 	svc.wfNodes = &fakeWFNodeClient{
-		getNodeStatusFunc: func(nodeName string) (wfNodeStatusProbe, error) {
-			return wfNodeStatusProbe{HealthState: "HEALTHY"}, nil
-		},
 		countRunningInstancesFunc: func(nodeName string) (int, error) {
 			return 0, errors.New("timeout")
 		},
@@ -228,8 +212,8 @@ func TestGetWorkflowStatusTreatsOrchestratorTimeoutAsNonFatal(t *testing.T) {
 	if _, err := svc.ApplyWorkflow(ApplyRequest{WorkflowName: "invoice"}); err != nil {
 		t.Fatalf("ApplyWorkflow: %v", err)
 	}
-	svc.orchestrator = &fakeOrchestratorClient{
-		getNodeConfigFunc: func(_ context.Context, targetNode, nodeName string) (map[string]any, error) {
+	svc.nodes = &fakeNodeClient{
+		getNodeConfigFunc: func(_ context.Context, nodeName string) (map[string]any, error) {
 			return nil, context.DeadlineExceeded
 		},
 	}
@@ -254,8 +238,8 @@ func TestListWorkflowStatusesReturnsStructuredItems(t *testing.T) {
 	if _, err := svc.ApplyWorkflow(ApplyRequest{WorkflowName: "invoice"}); err != nil {
 		t.Fatalf("ApplyWorkflow: %v", err)
 	}
-	svc.orchestrator = &fakeOrchestratorClient{
-		getNodeConfigFunc: func(_ context.Context, targetNode, nodeName string) (map[string]any, error) {
+	svc.nodes = &fakeNodeClient{
+		getNodeConfigFunc: func(_ context.Context, nodeName string) (map[string]any, error) {
 			return map[string]any{
 				"status": "ok",
 				"config": map[string]any{
@@ -267,9 +251,6 @@ func TestListWorkflowStatusesReturnsStructuredItems(t *testing.T) {
 		},
 	}
 	svc.wfNodes = &fakeWFNodeClient{
-		getNodeStatusFunc: func(nodeName string) (wfNodeStatusProbe, error) {
-			return wfNodeStatusProbe{HealthState: "HEALTHY"}, nil
-		},
 		countRunningInstancesFunc: func(nodeName string) (int, error) {
 			return 3, nil
 		},

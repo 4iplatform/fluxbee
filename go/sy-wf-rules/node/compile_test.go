@@ -75,11 +75,10 @@ func TestCompileWorkflowRejectsInvalidDefinitionAndDoesNotWriteStaged(t *testing
 func newTestService(t *testing.T) *Service {
 	t.Helper()
 	cfg := NodeConfig{
-		HiveID:             "motherbee",
-		NodeName:           "SY.wf-rules@motherbee",
-		OrchestratorTarget: "SY.orchestrator@motherbee",
-		StateDir:           t.TempDir(),
-		DistRuntimeRoot:    filepath.Join(t.TempDir(), "dist", "runtimes"),
+		HiveID:          "motherbee",
+		NodeName:        "SY.wf-rules@motherbee",
+		StateDir:        t.TempDir(),
+		DistRuntimeRoot: filepath.Join(t.TempDir(), "dist", "runtimes"),
 	}
 	svc := NewService(cfg, nil, nil, func() time.Time {
 		return time.Date(2026, 4, 16, 12, 0, 0, 0, time.UTC)

@@ -598,24 +598,29 @@ es **autoritativo** (lo resuelve el router del UUID origen contra su registro de
 nodos en delivery local / WAN / peer, sobreescribiendo cualquier valor que haya
 puesto el emisor — ver el test de spoof), así que es una barrera real.
 
-Acciones protegidas (25): `SYSTEM_UPDATE`, `SYSTEM_SYNC_HINT`, `EDGE_OPEN_URL`,
+Acciones protegidas (27, `PROTECTED_SYSTEM_ACTIONS` en `src/router/system_policy.rs`):
+`SYSTEM_UPDATE`, `SYSTEM_CORE_ROLLBACK`, `SYSTEM_SYNC_HINT`, `EDGE_OPEN_URL`,
 `EDGE_CLOSE_URL`, `EDGE_LIST_URLS`, `EDGE_PUBLISH_BLOB`, `EDGE_UNPUBLISH_BLOB`,
 `SPAWN_NODE`, `KILL_NODE`, `START_NODE`, `RESTART_NODE`, `REMOVE_NODE_INSTANCE`,
 `NODE_CONFIG_SET`, `NODE_CONFIG_GET`, `CONFIG_SET`, `CONFIG_GET`, `NODE_STATE_GET`,
 `NODE_STATUS_GET`, `GET_VERSIONS`, `GET_RUNTIMES`, `GET_RUNTIME`, `LIST_NODES`,
-`INVENTORY_REQUEST`, `ADD_HIVE_FINALIZE`, `REMOVE_HIVE_CLEANUP`.
+`INVENTORY_REQUEST`, `ADD_HIVE_FINALIZE`, `REMOVE_HIVE_CLEANUP`, `CONFIG_CHANGED`.
 
-Allow-list `SY.` (sobre el `src_l2_name` autoritativo):
+Quién puede cada una (sobre el `src_l2_name` autoritativo; la fuente de verdad es
+`policy/system.rego`):
 
 | Origen | Hive | Alcance |
 |--------|------|---------|
-| `SY.orchestrator@*` | **cualquiera** | todas las acciones (forwards cross-hive de la malla; control plane, exento de user-deny) |
-| `SY.admin@<hive>` | same-hive | todas |
-| `SY.wf-rules@<hive>` | same-hive | todas |
-| `WF.orch.diag@<hive>` | same-hive | todas |
-| `SY.config-routes@<hive>`, `SY.vault@<hive>` | same-hive | **solo** `NODE_STATUS_GET` (probe read-only) |
-| `SY.admin@motherbee` | primary | **solo** `EDGE_*` (`EDGE_OPEN_URL`/`EDGE_CLOSE_URL`/`EDGE_LIST_URLS`/`EDGE_PUBLISH_BLOB`/`EDGE_UNPUBLISH_BLOB`) + `CONFIG_GET`/`CONFIG_SET` cross-hive |
+| `SY.orchestrator@*` | **cualquiera** | **solo** lo que reenvía entre hives (`orchestrator_actions`: ciclo de vida e inspección de nodos, versiones/runtimes, rollback de core, alta/baja de hive) |
+| `SY.admin@<hive>` | same-hive | todas, menos `EDGE_*`, `CONFIG_GET`/`CONFIG_SET`/`SYSTEM_UPDATE`/`SYSTEM_SYNC_HINT`/`CONFIG_CHANGED` y `WAN_REACHABILITY_VOUCH` |
+| `SY.admin@motherbee` | primary | `EDGE_*` y el control de nodos (`CONFIG_GET`/`CONFIG_SET`/`SYSTEM_UPDATE`/`SYSTEM_SYNC_HINT`/`CONFIG_CHANGED`) cross-hive |
+| `SY.vault@<hive>` | same-hive | **solo** `NODE_STATUS_GET` (probe read-only) |
 | `RT.gateway@motherbee` | primary | **solo** `WAN_REACHABILITY_VOUCH` (Option B: solo el hub primario puede vouchear reachability transitiva; no está en la lista de protegidas, es un gate de autoridad aparte) |
+
+Nadie más. Desde 0.1.70 (FINDINGS A-68) SY.wf-rules ya no tiene autoridad propia: lanza,
+reinicia y borra sus nodos WF a través de SY.admin, como cualquier otro. También salió
+`WF.orch.diag`, un nombre de las pruebas E2E: un workflow llamado `orch.diag` se habría
+desplegado como `WF.orch.diag@<hive>` con esa autoridad.
 
 El rol se matchea exacto (`split_once('@')`), así que un `SY.orchestrator.relay@h`
 NO pasa como `SY.orchestrator`. Cross-hive solo para `SY.orchestrator` (cierra el

@@ -1,6 +1,7 @@
 package node
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"strings"
@@ -10,6 +11,8 @@ type RollbackRequest struct {
 	WorkflowName string `json:"workflow_name"`
 	AutoSpawn    bool   `json:"auto_spawn,omitempty"`
 	TenantID     string `json:"tenant_id,omitempty"`
+	// LaunchedBy is who asked for the deploy, stamped by SY.admin (operator, archi).
+	LaunchedBy string `json:"launched_by,omitempty"`
 }
 
 type RollbackResult struct {
@@ -18,6 +21,12 @@ type RollbackResult struct {
 }
 
 func (s *Service) RollbackWorkflow(req RollbackRequest) (*RollbackResult, error) {
+	ctx, cancel := newRequestContext()
+	defer cancel()
+	return s.rollbackWorkflow(ctx, req)
+}
+
+func (s *Service) rollbackWorkflow(ctx context.Context, req RollbackRequest) (*RollbackResult, error) {
 	workflowName := strings.TrimSpace(req.WorkflowName)
 	if !workflowNamePattern.MatchString(workflowName) {
 		return nil, WfRulesError{Code: "INVALID_WORKFLOW_NAME", Detail: fmt.Sprintf("invalid workflow_name %q", workflowName)}
@@ -39,11 +48,11 @@ func (s *Service) RollbackWorkflow(req RollbackRequest) (*RollbackResult, error)
 	if err != nil {
 		return nil, err
 	}
-	publish, err := s.PublishWorkflowPackage(workflowName, *currentMeta, definitionBytes)
+	publish, err := s.publishWorkflowPackage(ctx, workflowName, *currentMeta, definitionBytes)
 	if err != nil {
 		return nil, WfRulesError{Code: "PACKAGE_PUBLISH_FAILED", Detail: err.Error()}
 	}
-	_ = s.PurgeWorkflowPackages(workflowName, true)
+	_ = s.purgeWorkflowPackages(ctx, workflowName, true)
 	return &RollbackResult{
 		Current: *currentMeta,
 		Package: *publish,

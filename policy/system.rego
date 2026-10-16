@@ -103,14 +103,16 @@ allow if {
 	parsed.hive != ""
 }
 
-# (4) Same-hive privileged control-plane roles, all protected actions.
+# (4) The Admin, same hive: every other protected action. It is the only node that acts on other
+# nodes for a user (every action goes through SY.admin). SY.wf-rules goes through it for its WF
+# nodes, and the E2E name WF.orch.diag is gone: a workflow named "orch.diag" would have been
+# WF.orch.diag@<hive>, with this authority (docs/wf-standard-path-v1.md, FINDINGS A-68).
 allow if {
 	not input.action in edge_service_actions
 	not input.action in node_control_actions
 	not input.action in reachability_actions
-	parsed.role != "SY.orchestrator"
 	parsed.hive == input.hive_id
-	parsed.role in {"SY.admin", "SY.wf-rules", "WF.orch.diag"}
+	parsed.role == "SY.admin"
 }
 
 # (5) Read-only health probe opened to the vault, same hive only (never mutations). It also named

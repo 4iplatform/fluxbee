@@ -387,10 +387,30 @@ mod tests {
             hive
         ));
         assert!(!authorize_system(act, Some("SY.orchestrator@"), hive));
-        // same-hive control plane.
-        for role in ["SY.admin", "SY.wf-rules", "WF.orch.diag"] {
-            assert!(authorize_system(act, Some(&format!("{role}@motherbee")), hive));
-            assert!(!authorize_system(act, Some(&format!("{role}@worker1")), hive));
+        // The same-hive Admin: the only node that acts on other nodes for a user.
+        assert!(authorize_system(act, Some("SY.admin@motherbee"), hive));
+        assert!(!authorize_system(act, Some("SY.admin@worker1"), hive));
+        // SY.wf-rules goes through the Admin for its WF nodes, and the E2E name WF.orch.diag is
+        // gone: a workflow named "orch.diag" would have carried it (A-68). No protected action
+        // that rule (4) grants, on any hive.
+        for role in ["SY.wf-rules", "WF.orch.diag"] {
+            for action in [
+                "SPAWN_NODE",
+                "KILL_NODE",
+                "RESTART_NODE",
+                "NODE_CONFIG_SET",
+                "NODE_CONFIG_GET",
+                "NODE_STATUS_GET",
+                "LIST_NODES",
+                "INVENTORY_REQUEST",
+            ] {
+                for name_hive in ["motherbee", "worker1"] {
+                    assert!(
+                        !authorize_system(action, Some(&format!("{role}@{name_hive}")), name_hive),
+                        "{role}@{name_hive} must not have {action}"
+                    );
+                }
+            }
         }
         // Rejected for a mutation.
         for bad in [

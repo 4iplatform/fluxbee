@@ -1,7 +1,6 @@
 package node
 
 import (
-	"context"
 	"fmt"
 	"strings"
 )
@@ -20,9 +19,9 @@ func (s *Service) DeleteWorkflow(req DeleteWorkflowRequest) (*DeleteWorkflowResu
 		return nil, WfRulesError{Code: "WORKFLOW_NOT_FOUND", Detail: fmt.Sprintf("workflow %q not found", workflowName)}
 	}
 
-	rpcCtx, cancel := context.WithTimeout(context.Background(), wfNodeRPCTimeout)
+	ctx, cancel := newRequestContext()
 	defer cancel()
-	snapshot, err := s.inspectWFNode(rpcCtx, workflowName, true)
+	snapshot, err := s.inspectWFNode(ctx, workflowName, true)
 	if err != nil {
 		return nil, err
 	}
@@ -30,6 +29,9 @@ func (s *Service) DeleteWorkflow(req DeleteWorkflowRequest) (*DeleteWorkflowResu
 	if !req.Force {
 		if snapshot.Timeout {
 			return nil, WfRulesError{Code: "INSTANCES_UNKNOWN", Detail: "cannot confirm active instances because wf node status timed out"}
+		}
+		if snapshot.InstancesError != "" {
+			return nil, WfRulesError{Code: "INSTANCES_UNKNOWN", Detail: fmt.Sprintf("cannot confirm active instances: the wf node answered %s (delete with force to remove it anyway)", snapshot.InstancesError)}
 		}
 		if snapshot.ConfigExists && snapshot.ActiveInstances != nil && *snapshot.ActiveInstances > 0 {
 			return nil, WfRulesError{Code: "INSTANCES_ACTIVE", Detail: fmt.Sprintf("wf node still has %d running instances", *snapshot.ActiveInstances)}
@@ -45,12 +47,10 @@ func (s *Service) DeleteWorkflow(req DeleteWorkflowRequest) (*DeleteWorkflowResu
 		},
 	}
 	if snapshot.ConfigExists {
-		if s.orchestrator == nil {
-			return nil, WfRulesError{Code: "ORCHESTRATOR_ERROR", Detail: "orchestrator client unavailable"}
+		if s.nodes == nil {
+			return nil, WfRulesError{Code: "ORCHESTRATOR_ERROR", Detail: "admin client unavailable"}
 		}
-		rpcCtx, cancel = context.WithTimeout(context.Background(), orchestratorRPCTimeout)
-		defer cancel()
-		if _, err := s.orchestrator.KillNode(rpcCtx, s.cfg.OrchestratorTarget, snapshot.NodeName, true, true); err != nil {
+		if _, err := s.nodes.KillNode(ctx, snapshot.NodeName, true, true); err != nil {
 			return nil, WfRulesError{Code: "ORCHESTRATOR_ERROR", Detail: err.Error()}
 		}
 		result.WFNode = WFNodeActionResult{
@@ -63,7 +63,7 @@ func (s *Service) DeleteWorkflow(req DeleteWorkflowRequest) (*DeleteWorkflowResu
 	if err := s.store.DeleteWorkflowState(workflowName); err != nil {
 		return nil, err
 	}
-	if err := s.PurgeWorkflowPackages(workflowName, false); err != nil {
+	if err := s.purgeWorkflowPackages(ctx, workflowName, false); err != nil {
 		return nil, WfRulesError{Code: "PACKAGE_PUBLISH_FAILED", Detail: err.Error()}
 	}
 	return result, nil

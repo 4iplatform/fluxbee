@@ -166,15 +166,15 @@ func (p *NodeConfigControlResponse) UnmarshalJSON(data []byte) error {
 }
 
 func IsNodeConfigGetMessage(msg *Message) bool {
-	return msg.Meta.MsgType == SYSTEMKind && stringValue(msg.Meta.Msg) == MSGConfigGet
+	return IsSystemKind(msg.Meta.MsgType) && stringValue(msg.Meta.Msg) == MSGConfigGet
 }
 
 func IsNodeConfigSetMessage(msg *Message) bool {
-	return msg.Meta.MsgType == SYSTEMKind && stringValue(msg.Meta.Msg) == MSGConfigSet
+	return IsSystemKind(msg.Meta.MsgType) && stringValue(msg.Meta.Msg) == MSGConfigSet
 }
 
 func IsNodeConfigResponseMessage(msg *Message) bool {
-	return msg.Meta.MsgType == SYSTEMKind && stringValue(msg.Meta.Msg) == MSGConfigResponse
+	return IsSystemKind(msg.Meta.MsgType) && stringValue(msg.Meta.Msg) == MSGConfigResponse
 }
 
 func ParseNodeConfigRequest(msg *Message) (*NodeConfigControlRequest, error) {

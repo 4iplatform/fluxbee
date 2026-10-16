@@ -2,8 +2,11 @@
 set -euo pipefail
 
 # E2E lifecycle test for SY.wf-rules:
-#   compile → apply (auto_spawn) → status check → update (compile_apply)
-#   → rollback → delete
+#   compile → apply (auto_spawn) → status check → the node as the admin sees it
+#   (launched_by, a config it cannot use) → update (compile_apply) → rollback → delete
+#
+# Since 0.1.70 SY.wf-rules launches, restarts and deletes the WF node through SY.admin
+# (docs/wf-standard-path-v1.md), so every step below also exercises that path.
 #
 # Usage:
 #   BASE="http://127.0.0.1:8080" HIVE_ID="motherbee" \
@@ -378,6 +381,61 @@ if [[ "$AUTO_SPAWN" == "true" ]]; then
   node_name="$(json_get "$resp" "payload.wf_node.node_name")"
   assert_eq "wf_node.running" "$running" "true"
   assert_contains "wf_node.node_name" "$node_name" "WF.$WF_NAME@"
+fi
+
+# ── STEP 4b-4c: the node as the admin sees it ───────────────────────────────
+
+node_get() {
+  curl -sS "$BASE/hives/$HIVE_ID/nodes/$1"
+}
+
+wait_for_health() {
+  local node="$1" want="$2" secs="$3" resp="" health=""
+  local deadline=$((SECONDS + secs))
+  while [[ $SECONDS -lt $deadline ]]; do
+    resp="$(node_get "$node/status")"
+    health="$(json_get "$resp" "payload.node_status.health_state")"
+    if [[ "$health" == "$want" ]]; then break; fi
+    sleep 2
+  done
+  echo "$resp"
+}
+
+if [[ "$AUTO_SPAWN" == "true" ]]; then
+  NODE="WF.$WF_NAME@$HIVE_ID"
+
+  step "4b. launched by whoever asked for the deploy"
+  resp="$(wait_for_health "$NODE" HEALTHY 20)"
+  assert_eq "node_status.launched_by" "$(json_get "$resp" "payload.node_status.launched_by")" "operator"
+  assert_eq "node_status.health_state" "$(json_get "$resp" "payload.node_status.health_state")" "HEALTHY"
+
+  step "4c. a config the node cannot use leaves it up, saying why"
+  config="$(node_get "$NODE/config")"
+  original="$(JSON_DOC="$config" python3 -c "
+import json, os
+doc = json.loads(os.environ['JSON_DOC'])
+config = dict(doc['payload']['config'])
+config.pop('_system', None)
+print(json.dumps(config))")"
+  resp="$(curl -sS -X PUT "$BASE/hives/$HIVE_ID/nodes/$NODE/config" \
+    -H "Content-Type: application/json" -d '{"gc_retention_day": 3}')"
+  assert_eq "set_node_config (typo)" "$(json_get "$resp" "status")" "ok"
+  curl -sS -X POST "$BASE/hives/$HIVE_ID/nodes/$NODE/restart" >/dev/null
+  resp="$(wait_for_health "$NODE" DEGRADED 30)"
+  assert_eq "health with a config it cannot use" "$(json_get "$resp" "payload.node_status.health_state")" "DEGRADED"
+  assert_eq "last_error.code" "$(json_get "$resp" "payload.node_status.last_error.code")" "invalid_config"
+  assert_eq "lifecycle_state" "$(json_get "$resp" "payload.node_status.lifecycle_state")" "RUNNING"
+  restarts_before="$(json_get "$resp" "payload.node_status.process.restart_count")"
+  sleep 12
+  resp="$(node_get "$NODE/status")"
+  assert_eq "no restart loop (restart_count)" "$(json_get "$resp" "payload.node_status.process.restart_count")" "$restarts_before"
+
+  resp="$(curl -sS -X PUT "$BASE/hives/$HIVE_ID/nodes/$NODE/config?replace=true" \
+    -H "Content-Type: application/json" -d "$original")"
+  assert_eq "set_node_config (fixed)" "$(json_get "$resp" "status")" "ok"
+  curl -sS -X POST "$BASE/hives/$HIVE_ID/nodes/$NODE/restart" >/dev/null
+  resp="$(wait_for_health "$NODE" HEALTHY 30)"
+  assert_eq "health after the fix" "$(json_get "$resp" "payload.node_status.health_state")" "HEALTHY"
 fi
 
 # ── STEP 5: compile_apply with v2 definition (update) ─────────────────────
