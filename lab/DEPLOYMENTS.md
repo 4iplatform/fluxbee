@@ -21,7 +21,8 @@
 
 | Versión | Fecha (ART) | Commit | Alcance | Estado | Rollback |
 |---|---|---|---|---|---|
-| **0.1.74** | 2026-10-16 | `0d69329` | motherbee + spokes (core) | ✅ live | snap `pre-sdk-0-1-74` (las 4 VMs) · `apt install fluxbee=0.1.73` |
+| **0.1.75** | 2026-10-16 | `1c00389` | motherbee + spokes (core) | ✅ live | snap `pre-stream1a-0-1-75` (las 4 VMs); `apt` solo no alcanza (ver la entrada) |
+| **0.1.74** | 2026-10-16 | `0d69329` | motherbee + spokes (core) | ✅ reemplazado por 0.1.75 | snap `pre-sdk-0-1-74` (las 4 VMs) · `apt install fluxbee=0.1.73` |
 | **0.1.73** | 2026-10-16 | `822f237` | motherbee + spokes (core) + `hive.yaml` (IA: Claude) | ✅ reemplazado por 0.1.74 | snap `pre-cognition-0-1-73` (las 4 VMs) · `apt install fluxbee=0.1.72` · `hive.yaml.pre-claude-0-1-72` |
 | **0.1.72** | 2026-10-16 | `17e1edd` | motherbee + spokes (core) | ✅ reemplazado por 0.1.73 | snap `pre-sync-0-1-72` (las 4 VMs) · `apt install fluxbee=0.1.71` |
 | **0.1.71** | 2026-10-16 | `73f7132` | motherbee + spokes (core) | ✅ reemplazado por 0.1.72 | snap `pre-gate-0-1-71` (las 4 VMs) · `apt install fluxbee=0.1.70` |
@@ -83,6 +84,48 @@
 > (`dpkg-scanpackages -m`) para rollback, pero su detalle vive en la bitácora, no acá.
 
 ---
+
+## 0.1.75 — Los bugs vivos bajo el plano del log (A-70, etapa 1a)
+
+- **Fecha:** 2026-10-16 (ART) · **Versión anterior:** 0.1.74 · **Commit:** `1c00389`.
+  - Sale de la revisión del diseño del stream del router (`docs/router-stream-v1.md`): bugs que
+    ya estaban en PROD, arreglados sobre el NATS de hoy.
+  - Una revisión del código, arreglada antes del build.
+- **Alcance:** motherbee + los tres spokes (core-update).
+- **Qué cambió:**
+  - **Router:**
+    - un frame de más de 128 KB se salta y se cuenta, y el enlace sigue;
+    - un mensaje de otro hive a un nodo de un router que no es el gateway ya no se descarta;
+    - `RT.` reservado: un HELLO con ese prefijo solo se acepta del propio proceso del router.
+  - **SY.storage:**
+    - `turns` usa la clave de la inbox, así que la respuesta de la IA ya no se pierde. La
+      migración corre una vez; las filas viejas quedan como `legacy:<ctx>:<seq>`;
+    - sale si no puede usar su base, al arrancar o después, y systemd reintenta;
+    - reintenta la inbox cada 60 s, en orden y contando intentos;
+    - la inbox no se purga (Q7 del doc).
+  - **SY.cognition:** confirma cada turno al encolarlo y lo procesa en su propia tarea; si esa
+    tarea muere, sale.
+  - **SY.orchestrator:** ningún nodo administrado usa `RT.*`, y el prompt de Archi lo dice.
+- **Deploy:**
+  - antes: ningún hive tenía nodos `RT.*` persistidos;
+  - build de `1c00389` en 17 min, publish en 16 s, deploy en 218 s;
+  - snapshots `pre-stream1a-0-1-75` en las 4 VMs (se borró `pre-sync-0-1-72`);
+  - 0.1.75 con el mismo manifest (`6a07db01`) en los 4, health `failed=0`.
+- **Gate:**
+  - **La migración de `turns`:** índice único por `dedupe_key`, sin la clave primaria vieja, 542
+    filas `legacy:`.
+  - **Un pedido y su respuesta con el mismo `trace_id`:** dos filas en `turns`. Se probó con un
+    workflow de prueba cuyo mensaje reusa el `trace_id` del evento.
+  - **Cognition:** un turno de prueba costó un llamado al etiquetador. En 0.1.74 costaba 3 o 4.
+  - **SY.storage:** con su conexión a postgres cortada, salió, y systemd lo levantó con base en 7 s.
+  - **`RT.`:** un proceso que no es el router no puede hacer HELLO con un nombre `RT.`. Se rechaza,
+    con su PID en el log.
+  - **Lo que PROD no puede producir** (un router por hive, el SDK no manda frames de más): el salto
+    de frames grandes y la entrega por IRP quedan probados por tests unitarios.
+  - **Limpieza:** el tenant de prueba se purgó; PROD quedó como antes.
+- **Rollback:** snapshot `pre-stream1a-0-1-75`. `apt install fluxbee=0.1.74` solo no alcanza: la
+  migración de `turns` no se deshace, y el código viejo inserta con `ON CONFLICT (ctx, seq)`, que
+  ya no tiene índice único, así que los turnos fallarían.
 
 ## 0.1.74 — El SDK de IA lee la respuesta de OpenAI de su ítem `message` (A-69)
 

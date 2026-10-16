@@ -496,6 +496,9 @@ the ledger and the logbook.
   - The options:
     - key the rows by writer and entity, and rebuild only one's own;
     - or give each thread a single cognition.
+  - Operator's direction (2026-10-16), to design after stage 1: *"la idea es que los mensajes y los
+    cognitions trabajen juntos, que sean un solo sistema, que el generador del mensaje, evaluador,
+    sea el dueño y no se duplique"*.
 - **Q2 (stage 3): who is charged.**
   - A message carries no tenant. Its `src_ilk` is what the sender declared, and the frontdesk
     works exactly on messages without one.

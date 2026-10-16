@@ -995,7 +995,7 @@ Visto al arreglar los e2e de A-37, leyendo `src/router/mod.rs` y `src/shm/mod.rs
   binario generaría uno como root); si no, el `myID` del Syncthing en marcha. Nunca `config.xml`.
 - **Estado:** construido; lo ejercita el próximo join (el de A-48).
 
-### A-70 🔵 DISEÑO REVISADO (2026-10-16) — El "NATS" de los registros vive dentro del router, pierde datos y solo guarda lo del motherbee
+### A-70 🟡 ETAPA 1a VALIDADA EN 8.x (0.1.75, 2026-10-16); 1b EN ADELANTE PENDIENTE — El "NATS" de los registros vive dentro del router, pierde datos y solo guarda lo del motherbee
 
 - **Cómo salió:** diseñando la etapa 5 (tokens), el registro iba a viajar por NATS. El operador
   pidió revisar NATS en general y entre hives. Diseño: `docs/router-stream-v1.md`.
@@ -1067,6 +1067,13 @@ Visto al arreglar los e2e de A-37, leyendo `src/router/mod.rs` y `src/shm/mod.rs
     frame. El respaldo por la tabla de alcance era código muerto fuera del gateway;
   - **el daño del frame grande era menor que lo escrito:** nodo e IRP se reconectaban perdiendo lo
     del medio; solo el enlace WAN quedaba muerto en un sentido.
+- **La etapa 1a, validada en 8.x (0.1.75):**
+  - un pedido y su respuesta quedan los dos en `turns`;
+  - un turno cuesta un llamado al etiquetador, contra 3 o 4 antes;
+  - SY.storage vuelve solo cuando se le corta la base;
+  - `RT.` queda reservado.
+
+  Detalle en `lab/DEPLOYMENTS.md`.
 - **Etapas:**
   1. **1a:** los bugs vivos;
   2. **1b:** el stream con SY.storage;
