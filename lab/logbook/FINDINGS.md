@@ -995,6 +995,37 @@ Visto al arreglar los e2e de A-37, leyendo `src/router/mod.rs` y `src/shm/mod.rs
   binario generaría uno como root); si no, el `myID` del Syncthing en marcha. Nunca `config.xml`.
 - **Estado:** construido; lo ejercita el próximo join (el de A-48).
 
+### A-69 🟡 CONSTRUIDO (0.1.73), falta validar en 8.x — SY.cognition fallaba en cada turno con los dos proveedores: mandaba `temperature`
+
+- **Cómo salió:** el operador pidió probar su key de Anthropic en toda la infra (2026-10-16).
+  - Archi, el admin y el frontdesk anduvieron con Claude: Archi contesta y usa sus herramientas.
+  - SY.cognition falló al etiquetar un turno de prueba, con Opus 5.5 y con Sonnet 5.5.
+  - De vuelta en OpenAI, falló igual.
+- **Qué pasaba:**
+  - **`temperature`:** el etiquetador semántico y el resumidor narrativo lo mandaban (0,1 y 0,2).
+    Los modelos actuales de los dos proveedores lo rechazan:
+    - Claude 5: "`temperature` is deprecated for this model";
+    - gpt-5.5: "Unsupported parameter: 'temperature' is not supported with this model".
+
+    Cada turno se quedaba sin derivación semántica. Solo se veía un WARN y el contador
+    `semantic_tagger_invalid_outputs_total`, porque el SDK informa el 400 del proveedor como error
+    de protocolo.
+  - **Los topes de salida** (256 y 220 tokens) quedaban justos para un modelo que razona antes de
+    contestar.
+  - **El estado mentía después de cada arranque:** decía `degraded_no_ai_provider` hasta su primer
+    turno o un cambio de la key, aunque la key estuviera. No la resolvía al arrancar, a diferencia
+    de Archi y el frontdesk. En worker1 se veía después de cada core-update.
+- **Arreglo:**
+  - sin `temperature`, como sus pares (Archi, el admin, ai.generic);
+  - topes de 1024 tokens: el tope solo acota una respuesta desbocada, no cambia lo que se gasta;
+  - la key se resuelve al arrancar, esperando al vault como la reconstrucción desde la base;
+  - el log del cambio de secreto decía "openai" fijo; ahora nombra el tipo de la key.
+- **Lo que no entra (anotado):**
+  - el SDK informa un error HTTP del proveedor como error de protocolo, y eso mezcla dos contadores
+    de cognition. Va con la revisión del SDK de IA;
+  - `config-get` sobre SY.admin contesta su rechazo de origen (`CONFIG_GET_RESPONSE`) a una consulta
+    del propio admin. Sin investigar.
+
 ### A-68 ✅ VALIDADO EN 8.x (0.1.70 a 0.1.72, 2026-10-16) — Los nodos WF quedaban fuera del estándar: SY.wf-rules los manejaba directo con el orquestador, y el nodo Go tenía su propio plano de control
 
 - **Cómo salió:** el operador preguntó si el nodo WF arranca como los demás (2026-10-15). El

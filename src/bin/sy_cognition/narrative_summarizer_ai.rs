@@ -8,6 +8,10 @@ use tokio::time;
 
 use crate::CognitionSemanticTaggerConfig;
 
+/// The summaries are two or three sentences of JSON; the cap only bounds a runaway answer. A
+/// model that reasons spends part of it before it answers (A-69).
+const NARRATIVE_SUMMARIZER_MAX_OUTPUT_TOKENS: u32 = 1024;
+
 #[derive(Debug, Clone)]
 pub(super) struct NarrativeSummarizerAiInput<'a> {
     pub(super) api_key: &'a str,
@@ -56,11 +60,12 @@ pub(super) async fn run_narrative_summarizer_ai(
         system: Some(build_system_prompt(input.episode_affect_id.is_some())),
         input: build_user_prompt(&input),
         input_parts: None,
-        max_output_tokens: Some(220),
+        max_output_tokens: Some(NARRATIVE_SUMMARIZER_MAX_OUTPUT_TOKENS),
+        // No temperature: the current models of both providers reject it (A-69).
         model_settings: Some(ModelSettings {
-            temperature: Some(0.2),
+            temperature: None,
             top_p: None,
-            max_output_tokens: Some(220),
+            max_output_tokens: Some(NARRATIVE_SUMMARIZER_MAX_OUTPUT_TOKENS),
         }),
         output_schema: None,
     };

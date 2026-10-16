@@ -606,6 +606,17 @@ async fn main() -> Result<(), CognitionError> {
         app_state.rebuild_owed.store(true, Ordering::SeqCst);
     }
 
+    // The AI key is resolved once here, as SY.architect and SY.frontdesk.gov do at startup, so the
+    // state this node reports is true from the start. It said degraded_no_ai_provider until its
+    // first turn or a change of the key, even with the key in place (A-69). Each turn still
+    // resolves it again.
+    if resolve_cognition_ai_api_key(&app_state, VaultWait::UntilReachable)
+        .await
+        .is_some()
+    {
+        control_state.lock().await.ai_secret_source = CognitionAiSecretSource::LocalFile;
+    }
+
     std::mem::drop(tokio::spawn(run_turns_loop(
         endpoint.clone(),
         Arc::clone(&app_state),
@@ -754,7 +765,7 @@ async fn handle_turn_payload(
         state.last_semantic_impl = Some(format!("{}_sdk", semantic_tagger_config.provider));
     }
 
-    let Some(api_key) = resolve_cognition_ai_api_key(&app_state).await else {
+    let Some(api_key) = resolve_cognition_ai_api_key(&app_state, VaultWait::Once).await else {
         {
             let mut control = app_state.control_state.lock().await;
             control.ai_secret_source = CognitionAiSecretSource::Missing;
@@ -1795,20 +1806,17 @@ async fn resolve_storage_database_url(
     .await
 }
 
-async fn resolve_cognition_ai_api_key(app_state: &CognitionAppState) -> Option<String> {
+async fn resolve_cognition_ai_api_key(
+    app_state: &CognitionAppState,
+    wait: VaultWait,
+) -> Option<String> {
     let provider = app_state
         .control_state
         .lock()
         .await
         .semantic_tagger
         .provider;
-    resolve_cognition_resource(
-        app_state,
-        provider.resource_type(),
-        "api_key",
-        VaultWait::Once,
-    )
-    .await
+    resolve_cognition_resource(app_state, provider.resource_type(), "api_key", wait).await
 }
 
 /// Whether a vault lookup waits out a vault that is not reachable yet (as SY.architect,
@@ -2187,11 +2195,14 @@ async fn handle_vault_secret_changed_cognition(msg: &Message, app_state: &Cognit
     if matched_ai {
         tracing::info!(
             node_name = %app_state.node_name,
+            resource_type = %ai_resource_type,
             op = %payload.op.as_str(),
             version = payload.version,
-            "VAULT_SECRET_CHANGED (openai) matches; probing fresh value"
+            "VAULT_SECRET_CHANGED for the AI provider matches; probing fresh value"
         );
-        let resolved = resolve_cognition_ai_api_key(app_state).await.is_some();
+        let resolved = resolve_cognition_ai_api_key(app_state, VaultWait::Once)
+            .await
+            .is_some();
         let next_source = if resolved {
             CognitionAiSecretSource::LocalFile
         } else {
