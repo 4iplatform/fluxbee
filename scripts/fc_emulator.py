@@ -16,7 +16,7 @@ exercised end-to-end with real security:
                                                               SY.admin / SY.vault
 
 The edge exposes one channel as `<edge>/e/<ich>`; the request body is the cloud op envelope
-`{op, tenant_id, params}` (spec docs/io-cloud-spec-v1.md §1.2 — the tenant is Cloud-asserted).
+`{op, tenant_id, params}` (docs/io-cloud-api.md §3 — the tenant is Cloud-asserted).
 The entry `token` is the `IO_CLOUD_SECRET` service bearer configured in both IO.cloud and FC; SY.admin
 stores it in vault during externalize and the edge checks `Authorization: Bearer <token>` at the door.
 
@@ -106,7 +106,7 @@ class FluxbeeCloudClient:
             sys.exit("connection error to %s: %s\n(is the ingress up + reachable? forwarder / "
                      "LAN?)" % (self.url, e.reason))
 
-    # --- cloud ops (spec io-cloud-spec-v1.md) ----------------------------------------
+    # --- cloud ops (docs/io-cloud-api.md) ----------------------------------------
     def create_tenant(self, name, domain=None, status="active"):
         params = {"name": name, "status": status}
         if domain:

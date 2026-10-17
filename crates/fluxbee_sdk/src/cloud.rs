@@ -4,7 +4,7 @@
 //! (`fluxbee_sdk`, a dependency of both) is the only place both can import. See EDGE-06:
 //! advertised == enforced.
 //!
-//! **Two categories of Cloud op** (io-cloud-spec-v1 §3.3): RELAY ops (`CLOUD_OP_ACTIONS`, relayed to
+//! **Two categories of Cloud op** (docs/io-cloud-api.md §5): RELAY ops (`CLOUD_OP_ACTIONS`, relayed to
 //! `SY.admin`) and io.cloud-LOCAL ops (`CLOUD_LOCAL_OPS`, handled by IO.cloud itself — they NEVER
 //! touch `SY.admin`, e.g. `register_human` provisions the ilk + hands off to the frontdesk).
 //! `cloud_action_catalog()` is the discoverable surface (relay + local, with help) that IO.cloud's

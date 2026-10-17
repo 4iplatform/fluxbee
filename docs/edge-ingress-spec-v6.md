@@ -260,57 +260,14 @@ changed live; `config-set listen` → `restart_required:[listen]`; `config-get` 
 
 ---
 
-## 10. `IO.cloud` — the cloud manager, in-mesh, and the bootstrap
+## 10. `IO.cloud` — the cloud manager, in-mesh
 
-- Same code species as `IO.linkedhelper` (an in-mesh IO adapter for an external system, here Fluxbee
-  Cloud) — but a **different deployment shape**: it is a **SINGLETON, one per system, on the
-  motherbee**, so it is **baked into the core `.deb`** (binary + `io-cloud.service`), NOT published as
-  a per-tenant runtime package like `io-api`/`io-slack`. The unit is enabled everywhere but an
-  `ExecCondition` gates it to `role: motherbee`, so it only ever runs on the motherbee. It comes up
-  after `rt-gateway`/`SY.identity`/`SY.admin` and retries registration until the mesh is ready.
-- **The first node to externalize.** On boot → gets its ilk (orchestrator-injected
-  `FLUXBEE_NODE_ILK_ID` if spawned, else self-provisions via `ILK_PROVISION`) → registers its channel
-  `ICH` (identity plane) → optionally sends `externalize {ich}` to `SY.admin` (command plane, opt-in
-  via `IO_CLOUD_EDGE_NODE`; opening a public URL is deliberate, not automatic). All **over the
-  internal mesh**, not through the edge — so there is **no chicken-and-egg**.
-  Its `ICH` routes only to `IO.cloud`. Then external traffic reaches the mesh **only** as ordinary
-  app traffic to `IO.cloud` (I2); `IO.cloud → SY.admin`/`archi`/`frontdesk` are internal calls.
-- **Entrada Cloud autenticada.** Si se configura `IO_CLOUD_EDGE_NODE`, el bootstrap exige
-  `IO_CLOUD_SECRET` y externaliza el ICH como `shared-secret`, solo `POST`. El edge valida el bearer y
-  no lo forwardea. `IO.cloud` además exige el origen router-stamped configurado en
-  `IO_CLOUD_EDGE_NODE` y su propio ICH.
-- **Relay de provisioning alpha.** Traduce solo `create_tenant`, `put_token` y `provision_node` a
-  `create_tenant`, `vault_put` y `run_node`. `SY.admin` vuelve a gatear esas acciones para que por mesh
-  solo puedan originarse en el singleton `IO.cloud` del mismo hive que admin. El bearer de servicio
-  de Cloud es la autoridad alpha para
-  crear tenants y asegurar el `tenant_id`.
-- **Agente acotado, no admin general.** Permanece en ilk/ICH-space y no necesita una vista SHM completa
-  de identity. Las respuestas no exponen lecturas de vault ni secretos.
-- Lives **inside the mesh, not in the DMZ hive** — must not share blast radius with the edge.
-- Deferred para producción: el end-user ilk/subject dentro del comando y una policy sobre
-  `(IO.cloud transport principal) + (user ilk subject)` (pensada para `SY.policy`, que se retiró:
-  solo contaba turns; se paró en 0.1.77 y su binario y su unit se borraron en 0.1.78).
-
-### 10.1 `IO.api` - instancias publicas sobre el mismo circuito
-
-`IO.api` adopta el circuito de esta spec sin agregar una segunda superficie HTTP:
-
-- es un runtime dinamico `io.api`, instanciado por Orchestrator como los nodos AI;
-- cada instancia recibe ILK/tenant, registra un `api_channel_id` propio y obtiene un ICH distinto;
-- pide `externalize` sin credencial para que Admin genere y persista el bearer canonico;
-- se auto-externaliza como `shared-secret`, `POST` only, familia `io.api.inbound.v1`;
-- no abre listener TCP/HTTP y recibe exclusivamente el mensaje Edge por router socket;
-- vuelve a verificar `src_l2_name == edge configurado` y `meta.ich == ICH propio`;
-- tenant y destino pertenecen a la instancia; el request no puede inyectarlos;
-- varias instancias pueden publicar varias URLs en el mismo Edge porque el registry ya esta
-  indexado por ICH y Admin verifica ownership uno-a-uno.
-
-El token nuevo se entrega una sola vez en la respuesta autorizada de `CONFIG_SET`; no forma parte
-del config ni se expone por `CONFIG_GET`. El reconcile adopta una fila Edge existente sin rotarla y
-solo vuelve a externalizar cuando falta o deriva del contrato fijo.
-
-El contrato viejo de API keys internas, multipart y webhook HTTP fue eliminado para mantener el
-envelope de 64 KiB y el Edge como unica frontera de red. Ver `docs/io/io-api-node-spec.md`.
+`IO.cloud` is Fluxbee Cloud's relay into the mesh: a managed node on the motherbee that translates
+each Cloud op into an `ADMIN_COMMAND` to SY.admin. It lives inside the mesh, never in the DMZ hive.
+The operator opens its public door through the edge with
+`POST /hives/{hive}/cloud/endpoint {"edge_node":"SY.edge@<edge hive>"}`, which mints the bearer.
+The contract Cloud uses, the door and its checks: `docs/io-cloud-api.md`. The first design of this
+section is in `docs/history/io-cloud-spec-v1.md`.
 
 ---
 

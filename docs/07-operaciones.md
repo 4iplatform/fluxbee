@@ -578,4 +578,4 @@ Runbook de status por nodo (campos de `payload.node_status`):
 | Conectividad WAN | `05-conectividad.md` |
 | Regiones SHM | `06-regiones.md` |
 | Edge/ingress v6 | `docs/edge-ingress-spec-v6.md` |
-| IO.cloud provisioning | `docs/io-cloud-spec-v1.md` |
+| IO.cloud provisioning | `docs/io-cloud-api.md` |

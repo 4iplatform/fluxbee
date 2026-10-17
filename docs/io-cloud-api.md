@@ -2,7 +2,7 @@
 
 > **For the Fluxbee Cloud developers.** You do not need to know fluxbee's internals.
 >
-> Contract as of **fluxbee 0.1.69** (2026-10-15). Read from the code, operation by operation; §10
+> Contract as of **fluxbee 0.1.79** (2026-10-17). Read from the code, operation by operation; §10
 > lists what was also checked live on the PROD hive. §9 lists what changed for Cloud in each
 > release. The model behind it: `docs/ilk-tenant-model-v1.md` (an identity is the actor and is
 > never duplicated; a tenant is a cost center, a workspace of the system, never a company).
@@ -109,8 +109,8 @@ An error of the service comes back as `status:"error"` with the service's `error
 - **A person is not owned by a tenant, only charged to one.** Reading a person by id, reading their
   details, and deleting or restoring their account take no tenant. `set_ilk_tenant` charges them to
   another tenant.
-- **Ops with no tenant:** `create_tenant` (the tenant does not exist yet), `list_cloud_actions`,
-  `get_ilk` and `get_ilk_details`, and `delete_ilk` and `restore_ilk`.
+- **Ops with no tenant:** `create_tenant` (the tenant does not exist yet), `list_tenants`,
+  `list_cloud_actions`, `get_ilk` and `get_ilk_details`, and `delete_ilk` and `restore_ilk`.
 
 The hive's admin checks rule 3 again on its side for every relayed op, and the vault and the
 identity registry refuse anything of another tenant themselves.
@@ -943,6 +943,15 @@ post '{"op":"list_cloud_actions"}'
 ---
 
 ## 10. Checked live
+
+**0.1.79:** on PROD, 2026-10-17, through the public door with Cloud's token, with a test tenant
+whose agent, memory and frontdesk made model calls (`lab/DEPLOYMENTS.md`, 0.1.79):
+
+- `list_cloud_actions` lists `get_usage`;
+- `get_usage` by day and by node answers the tenant's groups; since a cursor, its records only,
+  charged as `node`, `agent` and `case`;
+- the root tenant answers `TENANT_ROOT_PROTECTED`; no tenant, `all_tenants` or another tenant in
+  `params`, or a period over 92 days, `INVALID_REQUEST`.
 
 **0.1.68 and 0.1.69:** on PROD, 2026-10-15, through the public door with Cloud's token, with the
 operator launching a node of its own in the same tenant (`lab/DEPLOYMENTS.md`):

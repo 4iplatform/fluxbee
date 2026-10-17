@@ -6,7 +6,7 @@
 
 **Audiencia:** desarrollo de `IO.web`, `SY.edge`, `SY.admin`, Orchestrator, Fluxbee Cloud y runtime/ops.
 
-**Relacionadas:** `edge-ingress-spec-v6.md`, `io-blob-spec-v1.md`, `io-cloud-spec-v1.md`,
+**Relacionadas:** `edge-ingress-spec-v6.md`, `io-blob-spec-v1.md`, `io-cloud-api.md`,
 `blob-annex-spec.md`, `node-spawn-config-spec.md`, `runtime-lifecycle-spec.md` y
 `system-inventory-spec.md`.
 

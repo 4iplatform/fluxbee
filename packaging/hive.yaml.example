@@ -9,17 +9,17 @@ ai:
     openai:
       model: "gpt-5.5"
     # anthropic:
-    #   model: "claude-sonnet-4-5"
+    #   model: "claude-sonnet-5-5"
 
 # WAN / inter-hive gateway. A root motherbee has no uplink (workers/egress
 # connect TO it). `wan.mtls` controls inter-hive transport auth:
-#   disabled   - plaintext WAN (default)
+#   disabled   - plaintext WAN (what the code assumes when the key is absent)
 #   permissive - use mTLS when both peers present a cert, accept plaintext (WARN)
 #   required   - reject any peer without a valid mesh cert (fail-closed)
 # The installer provisions the mesh CA + this hive's cert under
 # /var/lib/fluxbee/tls/<hive_id> regardless of mode, so flipping the mode is
-# instant. NOTE: if set to "required", every joined hive must also run
-# "required" (add_hive distributes their cert) or the plaintext join is rejected.
+# instant. This file ships "required", and add_hive writes "required" for every hive it joins
+# (distributing its cert): a hive on "required" rejects any plaintext join.
 wan:
   listen: "0.0.0.0:9000"
   gateway_name: "RT.gateway"

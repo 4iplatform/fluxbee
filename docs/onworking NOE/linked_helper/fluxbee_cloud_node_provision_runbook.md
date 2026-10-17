@@ -1,3 +1,7 @@
+> **OBSOLETO (2026-10-17).** Este runbook le indicaba a Cloud llamar a la API HTTP del admin con el
+> tenant raíz. Hoy esa API escucha solo en loopback, el tenant raíz no acepta nodos IO, y Cloud
+> provisiona sus nodos por IO.cloud: ver `docs/io-cloud-api.md` §5.3 (credenciales) y §5.4 (nodos).
+
 # Runbook — Fluxbee Cloud para provisionar y levantar `IO.linkedhelper`
 
 ## 1. Objetivo

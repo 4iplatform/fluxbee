@@ -995,6 +995,42 @@ Visto al arreglar los e2e de A-37, leyendo `src/router/mod.rs` y `src/shm/mod.rs
   binario generaría uno como root); si no, el `myID` del Syncthing en marcha. Nunca `config.xml`.
 - **Estado:** construido; lo ejercita el próximo join (el de A-48).
 
+### A-72 🔴 CONFIRMADO EN CÓDIGO (2026-10-17) — El rol de un agente no llega a los workers: `blob/agent-assets` no se replica
+
+- **Qué pasa:**
+  - El rol, las skills, los handbooks y la personalidad de un agente son assets JSON en
+    `blob/agent-assets/` del motherbee; los escribe Archi. El ILK del agente guarda sus hashes.
+  - ai.generic los lee del disco local, `<blob_root>/agent-assets/<hash>.json`
+    (`load_cognitive_asset`, `nodes/ai/ai-generic/src/bin/ai_node_runner.rs`).
+  - Syncthing replica a los workers solo `blob/active`. `agent-assets` no está en ninguna carpeta
+    (`src/bin/sy_orchestrator.rs`, `peer_shares_active_blob` y los permisos de `agent-assets`).
+- **Impacto:**
+  - Un agente en un worker no encuentra sus assets: queda sin definición y contesta el JSON fijo
+    de "unconfigured".
+  - Hoy un agente con rol solo funciona en el motherbee. Sin embargo, la cognition por
+    interlocutor (A-70) quedó en los workers para que los agentes corran ahí.
+- **Cómo apareció:** en la revisión de los docs de desarrollo (2026-10-17). No se probó en vivo:
+  los agentes de los gates corrieron en el motherbee.
+- **Propuesta:** compartir `agent-assets` con los workers, solo lectura como `blob/active`, o
+  servirlos por la malla. A decidir con el operador.
+
+### A-71 🔴 CONFIRMADO EN CÓDIGO (2026-10-17) — ai.generic corta a 1.200 caracteres el mensaje del usuario junto con su memoria
+
+- **Qué pasa:**
+  - Con `capabilities.multimodal: false`, ai.generic antepone al texto del usuario el bloque de
+    memoria de la comunicación: `Conversation memory: … Current user message: …`
+    (`inject_memory_package_into_text_input`, `ai_node_runner.rs`).
+  - El runner del AI SDK recorta ese texto entero a 1.200 caracteres
+    (`DEFAULT_INTERACTION_MAX_CHARS`, `crates/fluxbee_ai_sdk/src/function_calling.rs`).
+- **Impacto:**
+  - Con una memoria de más de unos 1.100 caracteres, el modelo no ve el mensaje actual: contesta
+    sin saber qué le dijeron.
+  - Un mensaje largo, por ejemplo un mail, también llega cortado.
+  - Los gates no lo mostraron: sus conversaciones eran cortas.
+- **Cómo apareció:** en la revisión de los docs de desarrollo (2026-10-17).
+- **Propuesta:** no recortar el mensaje actual (el límite queda para la historia inmediata), o
+  acotar la memoria por su lado. A decidir con el operador.
+
 ### A-70 ✅ VALIDADO EN 8.x (0.1.75 a 0.1.79, 2026-10-16/17): NATS BORRADO Y USO DE LLM REGISTRADO — El "NATS" de los registros vivía dentro del router, perdía datos y solo guardaba lo del motherbee
 
 - **Cómo salió:** diseñando la etapa 5 (tokens), el registro iba a viajar por NATS. El operador

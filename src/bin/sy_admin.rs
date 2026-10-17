@@ -132,7 +132,7 @@ const ADMIN_EXECUTOR_PILOT_ACTIONS: &[&str] = &[
 /// SINGLE SOURCE, read by BOTH the `list_cloud_actions` capability query (so Cloud discovers its
 /// surface without a duplicated hardcoded list) AND the io.cloud relay authz gate (so "what is
 /// advertised" == "what is permitted"; they cannot drift). Tier-1 provisioning set
-/// (io-cloud-spec-v1 §3.2): create the tenant, store provider tokens in vault and spawn the IO node.
+/// (docs/history/io-cloud-spec-v1.md §3.2): create the tenant, store provider tokens in vault and spawn the IO node.
 /// A subset of ADMIN_EXECUTOR_PILOT_ACTIONS.
 // Single source of truth in fluxbee_sdk::cloud (shared with IO.cloud, which lives in a separate
 // cargo workspace); a test there pins it to the CLOUD_OP_ACTIONS map so the relay gate and Cloud's

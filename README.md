@@ -10,1325 +10,582 @@
 [![Website](https://img.shields.io/badge/website-fluxbee.ai-blue)](https://fluxbee.ai)
 [![Status](https://img.shields.io/badge/status-active%20development-orange)]()
 
-*Describe what you need. Archi designs the system, deploys the agents, and the hive runs itself — with persistent memory, self-regulation, and infrastructure that reconfigures on demand.*
+*Describe what you need to Archi. It designs the solution, asks you to confirm, and applies it.
+The hive routes every message by identity and policy, keeps the memory of each conversation,
+and records what every model call costs.*
 
 </div>
 
 ---
 
-## Table of Contents
+## Table of contents
 
 - [What is Fluxbee?](#what-is-fluxbee)
-- [Why it exists](#why-it-exists)
-- [Core Concepts](#core-concepts)
+- [Core concepts](#core-concepts)
 - [Architecture](#architecture)
-- [What you can build](#what-you-can-build)
-- [Design Principles](#design-principles)
-- [Current Status](#current-status)
-- [Getting Started](#getting-started)
-- [Creating a Node from Scratch](#creating-a-node-from-scratch)
-- [SY.admin API](#syadmin-api)
-- [Infrastructure Reference](#infrastructure-reference)
-- [SDK Development](#sdk-development)
+- [Current status](#current-status)
+- [Getting started](#getting-started)
+- [Create a node](#create-a-node)
+- [Operate](#operate)
 - [Documentation](#documentation)
-- [License & Contributing](#license--contributing)
+- [License & contributing](#license--contributing)
 
 ---
 
 ## What is Fluxbee?
 
-Fluxbee is infrastructure for building systems where AI agents, humans, and automated workflows communicate seamlessly across any channel. It's the nervous system for organizations that want to operate with AI at the center, not at the edges.
+Fluxbee is infrastructure for systems where AI agents, people and workflows work together across
+channels. Think of it as a phone system that, instead of phone numbers, connects AI agents (each
+with its own role), people (customers and operators), workflows, and channels such as Slack,
+WhatsApp or an HTTP API. Every message goes through a router that knows who sent it, where it
+should go, and which conversation it belongs to.
 
-Think of it as a phone system, but instead of connecting phone numbers, it connects:
+Most AI integrations are point to point: one bot on WhatsApp, another on Slack, each with its own
+idea of who the user is. Fluxbee puts them on one mesh, with one identity registry, one routing
+policy, a memory per conversation, and a record of what each model call costs and who pays for it.
 
-- AI agents with specialized knowledge
-- Human operators and customers
-- Workflows and integrations
-- Any communication channel (WhatsApp, Email, Slack, etc.)
-
-Every message flows through a unified routing layer that knows who's talking, who they're talking to, what they're capable of, and where to send the conversation next.
-
----
-
-## Why it exists
-
-**The problem.** Today's AI integrations are point-to-point. You connect an AI to WhatsApp. Another to your CRM. Another to email. Each one is a hive. They don't share context. They can't hand off conversations. They can't be managed as a coherent system.
-
-**The insight.** What if we treated AI agents the way organizations treat employees? Each one has a role, capabilities, and credentials. They're trained (prompted) for specific jobs. They work together, escalate to each other, and when they can't handle something, they bring in a human.
-
-**The solution.** A routing layer that understands identity (who), capability (what they can do), and conversation flow (where things go next). Built for AI-first but works just as well for humans.
+The router, the system services and the AI and IO runtimes are written in Rust. The policy
+compiler, the timers and the workflow engine are written in Go.
 
 ---
 
-## Core Concepts
-
-### Three Layers of Routing
-
-| Layer | What it routes | Example |
-|---|---|---|
-| **L1 — Connection** | Raw sockets | Which process on which machine |
-| **L2 — Node** | Named services | `AI.support.l1@production` |
-| **L3 — Interlocutor** | Identities | Customer "John" or Agent "Support-L1" |
-
-Most systems only have L1. Some have L2. Fluxbee has all three, which means you can route based on *who someone is* and *what they need*, not just where the bytes go.
+## Core concepts
 
 ### Hives
 
-A **hive** is a deployment unit — a cluster of nodes that share memory and communicate via Unix sockets. Fast, local, zero serialization overhead.
+A **hive** is one machine running Fluxbee. Every hive runs a router (`RT.gateway`) and
+`SY.orchestrator`, which starts and watches the hive's other nodes. A hive has one of four roles:
 
-Hives connect to each other over the network. A customer in São Paulo talks to an AI agent in the São Paulo hive. If that agent needs to escalate, the message routes to the Buenos Aires hive where the senior agents live. The customer doesn't know. The routing is automatic.
+| Role | Purpose | Created by |
+|---|---|---|
+| `motherbee` | The control plane: admin API, Archi, SY.vault, PostgreSQL. One per installation. | The `.deb` package and `sudo fluxbee-firstboot` |
+| `worker` | More room for agents, channels and workflows. | `add_hive` from the motherbee |
+| `ingress` | The public HTTPS door: `SY.edge` on port 443. | `add_hive` with `"role": "ingress"` |
+| `egress` | Outbound NAT: the workers' way to the internet. | `add_hive` with `"role": "egress"` |
 
-### The Identity System (ILK)
+### Nodes
 
-Every participant in the system has an **ILK** (Interlocutor Key) — a unique identifier that follows them everywhere:
+A **node** is a process attached to its hive's router through a Unix socket. Its name is
+`<PREFIX>.<name>@<hive>`, with five prefixes: `RT` (the router's own nodes, reserved), `SY`
+(system services), `AI` (agents), `IO` (channels to the outside world) and `WF` (workflows).
+Examples: `SY.identity@motherbee`, `AI.billing@motherbee`, `IO.slack.support@motherbee`,
+`WF.onboarding@worker1`.
 
+`AI`, `IO` and `WF` nodes are instances of a **runtime**, a versioned package such as
+`ai.generic`. The orchestrator launches them with `run_node`, always for a tenant.
+
+### Identity: ILK and tenant
+
+- **ILK** (`ilk:<uuid>`): the actor. Its type is `human` (a person), `agent` (any node the
+  orchestrator launches: AI, IO or WF) or `system` (the `SY.*` services). An ILK can hold several
+  channels, such as a Slack user, a WhatsApp number or an email.
+- **Tenant** (`tnt:<uuid>`): a **cost center**. It pays for what its ILKs and nodes use. Each ILK
+  is charged to exactly one tenant, and charging it to another keeps the same ILK. A tenant is not
+  a company: Fluxbee Cloud maps its companies to tenants. Changing an ILK's tenant grants or
+  revokes nothing. A tenant that is not active gets no secrets and no new nodes.
+- **Root tenant** (`tnt:00000000-0000-0000-0000-000000000001`): the installation's own. Only the
+  core runs there (`SY.*`, the router, `IO.cloud`, `IO.blob`). Every other node runs in a tenant
+  you create.
+
+A new person arrives in two steps: an IO node provisions a `temporary` ILK for a sender it does
+not know, and `SY.frontdesk.gov` completes the registration. `SY.identity` on the motherbee is the
+primary, backed by PostgreSQL; each worker keeps a replica. The full model is in
+[docs/ilk-tenant-model-v1.md](docs/ilk-tenant-model-v1.md).
+
+### Agents
+
+An agent is an `AI.*` node on `ai.generic`, the generic AI runtime. Two things define it:
+
+- **Its config:** `behavior.kind` (`ai_chat`, or `echo`, which replies with the input and calls
+  no model) and `behavior.model`, a model of its hive's AI provider. Each hive picks OpenAI or
+  Anthropic in `hive.yaml` (`ai.default_provider`). A fresh install uses OpenAI with `gpt-5.5`.
+- **Its cognitive definition, on its ILK:** `role_hash`, `skill_hashes`, `handbook_hashes` and
+  `personality_hash`. Each hash names a JSON asset in `blob://agent-assets/<hash>.json`, and the
+  runtime refuses an asset whose content does not match its hash. Archi writes the assets. The
+  admin action `set_ilk_definition` puts them on the ILK. The agent rebuilds its prompt when its
+  ILK changes, without a restart.
+
+An agent without a definition runs on a fixed prompt that makes it answer only with a
+`"status": "unconfigured"` message.
+
+An API key is never node config. An agent reads its key from `SY.vault` on every call: a key it
+owns, one assigned to it, or its tenant's general key for the hive's provider.
+
+### Memory
+
+Memory belongs to a **communication**: the thread between someone and the agent that serves them,
+keyed by `(thread_id, agent ILK)`. Two agents in one conversation are two communications, each
+with its own memory.
+
+The agent's router copies both directions of its messages to `SY.cognition` on the same hive.
+Cognition builds the memory and keeps it in the hive's shared memory, and `SY.storage` stores what
+it derives. When the router delivers the agent's next message, it attaches that memory
+(`meta.memory_package`). Only `AI.*` nodes receive it. Details: §6 of
+[docs/router-stream-v1.md](docs/router-stream-v1.md).
+
+### Routing and policy
+
+A message names its destination: a node (by name or UUID), a broadcast, or nobody (`dst: null`).
+When it names nobody, the router decides:
+
+1. A sender with no ILK, or a `temporary` one, goes to `SY.frontdesk.gov`. This rule belongs to
+   the **system policy**, compiled from `policy/system.rego` and baked into the router binary. It
+   also decides who may send protected system actions. If it fails to load, the router does not
+   start.
+2. Anyone else goes where the **user policy** says. There is one user policy for the whole
+   installation: the motherbee compiles it to WASM and every hive installs it
+   ([docs/opa-distribution.md](docs/opa-distribution.md)).
+
+A user policy is package `router` with a `target` rule:
+
+```rego
+package router
+
+import rego.v1
+
+# Send what people write to the billing agent.
+target := "AI.billing@motherbee" if {
+    data.identity[input.meta.src_ilk].ilk_type == "human"
+}
 ```
-ilk:550e8400-e29b-41d4-a716-446655440000
-```
 
-ILKs have types:
+The input carries the message's `meta`, `routing` (`src`, `src_l2_name`) and `action`.
+`data.identity` maps each ILK to `tenant_id`, `ilk_type`, `registration_status`, `handler_node`,
+`role_hash`, `skill_hashes`, `handbook_hashes` and `personality_hash`. `tenant_id` is a cost
+center: do not use it as a permission. Check a policy with `POST /opa/policy/check` and apply it
+with `POST /opa/policy` (body `{"rego": "..."}`).
 
-- **Tenant** — An organization (for billing, isolation, contracts)
-- **Agent** — An AI with a specific degree (training)
-- **Human/Internal** — An operator who can see inside the system
-- **Human/External** — A customer who interacts from outside
+`SY.config.routes` keeps each hive's routes (forward or drop by name prefix) and VPN rules (VPNs
+assigned by name pattern; outside the system nodes, only nodes in the same VPN reach each other).
 
-The routing layer uses ILKs to make decisions: this customer belongs to this tenant, should talk to agents with these capabilities, and if things go wrong, escalate to this human.
+### Logs and usage
 
-### The University Model
+- Each router runs a small stream, `RT.<router>.stream@<hive>`. The router where a message enters
+  copies it there once (system and admin messages aside), and `SY.storage` writes it to the
+  `turns` table on the motherbee: the message log. The stream is best effort, with a two-minute
+  window. It absorbs delays; it is not a store.
+- Every model call (agents, cognition, the frontdesk, Archi) leaves a usage record charged to a
+  tenant, in the `llm_usage` table. Read it with `GET /hives/motherbee/usage`, filtered by
+  `tenant_id`, `from`, `to` and `group_by`. Fluxbee Cloud reads its tenants' records through
+  `IO.cloud`.
 
-AI agents don't just exist — they **graduate**.
+### SY.admin and Archi
 
-1. **Modules** are fragments of knowledge: "You speak Spanish", "You know our product catalog", "You escalate after 3 failed attempts".
-2. **Degrees** combine modules into a complete training: `Support-L1-Spanish` = Spanish + Product Knowledge + Basic Troubleshooting + Escalation Rules.
-3. **Graduation** assigns a degree to an agent with a cryptographic seal. The agent cannot operate without a valid degree. If someone tampers with the training, the hash breaks, and the agent refuses to run.
-
-This means you can audit exactly what an agent knows, version and roll back training, and never accidentally deploy an untrained agent. The AI manages the AI — humans write modules, but compilation and verification is automatic.
+- **SY.admin** is the door for every change. Operators, Archi, Fluxbee Cloud (through `IO.cloud`)
+  and `SY.wf-rules` all act through it. Its HTTP API listens on `127.0.0.1:8080` on the motherbee.
+- **Archi** (`SY.architect`) is the operator's AI architect: a chat at `http://127.0.0.1:3000` on
+  the motherbee. It designs a solution, asks you to confirm, applies it through SY.admin, and
+  checks the result. It also publishes packages and writes agent assets.
 
 ---
 
 ## Architecture
 
-```
-┌─────────────────────────────────────────────────────────────────┐
-│                         Mother Hive                             │
-│                                                                 │
-│  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐           │
-│  │ PostgreSQL   │  │ SY.identity  │  │ SY.admin     │           │
-│  │ (source of   │  │ (graduates   │  │ (human       │           │
-│  │  truth)      │  │  agents)     │  │  interface)  │           │
-│  └──────────────┘  └──────────────┘  └──────────────┘           │
-│                                                                 │
-└──────────────────────────┬──────────────────────────────────────┘
-                           │
-                           │ WAN (broadcast replication)
-                           │
-┌──────────────────────────┼──────────────────────────────────────┐
-│                          ▼                                      │
-│                    Production Hive                              │
-│                                                                 │
-│  ┌─────────┐    ┌─────────┐    ┌─────────┐    ┌─────────┐       │
-│  │ Router  │    │ Router  │    │ Gateway │    │ SY.*    │       │
-│  │ (RT)    │    │ (RT)    │    │ (to WAN)│    │ (system)│       │
-│  └────┬────┘    └────┬────┘    └─────────┘    └─────────┘       │
-│       │              │                                          │
-│       │   Unix Sockets (fast, local)                            │
-│       │              │                                          │
-│  ┌────┴────┐    ┌────┴────┐    ┌─────────┐    ┌─────────┐       │
-│  │ AI.     │    │ AI.     │    │ IO.     │    │ WF.     │       │
-│  │ support │    │ sales   │    │ whatsapp│    │ crm     │       │
-│  │ (agent) │    │ (agent) │    │ (edge)  │    │ (flow)  │       │
-│  └─────────┘    └─────────┘    └─────────┘    └─────────┘       │
-│                                      │                          │
-└──────────────────────────────────────┼──────────────────────────┘
-                                       │
-                                       │ HTTPS (WhatsApp API)
-                                       │
-                                  ┌────┴────┐
-                                  │ Customer│
-                                  │ (phone) │
-                                  └─────────┘
-```
-
-### Node Types
-
-| Prefix | Purpose | Examples |
-|---|---|---|
-| **RT** | Router — moves messages | `RT.main@production` |
-| **SY** | System — configuration, identity, admin | `SY.identity@motherbee` |
-| **IO** | Edge — connects to external channels | `IO.whatsapp@production` |
-| **AI** | Agent — processes conversations | `AI.support.l1@production` |
-| **WF** | Workflow — orchestrates processes | `WF.onboarding@production` |
-
-### Shared Memory
-
-Within a hive, nodes communicate through shared memory regions:
-
-- **Node table** — Who's connected right now
-- **Config** — Routes and VPNs
-- **Identity** — ILKs, degrees, capabilities
-- **OPA** — Compiled routing policies
-- **Memory** — Cognitive snapshots per thread
-
-No serialization. No network calls. Just memory reads. This is why it's fast.
-
-### OPA Policies
-
-Routing decisions are made by [OPA](https://www.openpolicyagent.org/) (Open Policy Agent). You write rules like:
-
-```rego
-# Route to agent with required capability
-target = node {
-    required := input.meta.context.required_capability
-    some ilk
-    data.identity[ilk].type == "agent"
-    required in data.identity[ilk].capabilities
-    node := data.identity[ilk].handler_node
-}
-
-# Only internal humans can see system status
-allow {
-    input.meta.action == "system_status"
-    data.identity[input.meta.src_ilk].human_subtype == "internal"
-}
-```
-
-Policies are compiled to WASM and distributed to all hives. Changes propagate in seconds.
-
----
-
-## What you can build
-
-### Multi-channel Customer Support
-
-- Customer writes on WhatsApp → AI agent responds
-- Same customer emails later → Same context, same agent knowledge
-- Agent can't solve it → Escalates to senior AI → Escalates to human
-- Human resolves → AI learns for next time
-
-### AI-Native Sales Team
-
-- Lead comes in → AI qualifier assesses fit
-- Qualified → AI sales rep handles objections
-- Ready to close → Senior AI or human closer takes over
-- All in the same conversation thread, all with full context
-
-### Operations Dashboard
-
-- Internal operators (human/internal) can query system status
-- See which agents are handling what
-- Monitor escalation rates
-- Adjust routing in real-time
-
-### Multi-tenant SaaS
-
-- Each tenant gets isolated agents, routing, and data
-- Billing per tenant
-- Custom training per tenant
-- Shared infrastructure, separated concerns
-
----
-
-## Design Principles
-
-**1. AI-Native, Human-Compatible.** The system assumes AI is the primary operator. Humans are escalation points, not the main workforce. But when humans are needed, they have full visibility.
-
-**2. Identity is Everything.** Every message carries who sent it, who it's for, and what conversation it belongs to. You can't lose context. You can't have orphan messages.
-
-**3. Verified Knowledge.** Agents can't operate without valid credentials. Training is versioned, hashed, and auditable. No "oops, we deployed the wrong prompt."
-
-**4. Local Speed, Global Reach.** Within a hive: shared memory, microsecond latency. Between hives: async replication, eventual consistency. Best of both worlds.
-
-**5. Policy-Driven Routing.** Business rules live in OPA policies, not in code. Change who handles what without deploying code. Audit routing decisions after the fact.
-
-**6. The System Doesn't Self-Modify.** Configuration comes from outside (admins, APIs). The system executes but doesn't decide its own rules. This is intentional. AI managing AI is powerful, but there's always a human-controlled layer at the top.
-
----
-
-## Current Status
-
-This is a working system with ongoing spec/doc alignment. Core routing, SHM regions, node communication, and identity v2 core flows are implemented and running in multi-hive E2E.
-
-### Implemented
-
-- Core router with FIB and shared memory
-- Node library with split sender/receiver model
-- Inter-hive gateway communication
-- OPA policy compilation and distribution
-- Configuration broadcast and replication
-- `SY.identity` v2 core: primary/replica sync (full + delta), DB persistence (`identity_*` tables), SHM identity region + alias canonicalization, orchestrator node registration integration (`ILK_REGISTER` / `ILK_UPDATE`)
-
-### Still In Progress
-
-- Module/Degree/Graduation lifecycle service
-- Product runtimes outside this repo using identity helpers end-to-end:
-  - IO runtimes (channel lookup + `ILK_PROVISION`)
-  - `AI.frontdesk` runtime (complete register + merge channel flows)
-- Broader AI/workflow runtime catalog
-
----
-
-## Getting Started
-
-See the [Technical Specification](./docs/) for complete details. This README explains the system and concepts. For how to run, build, and develop locally, see [`DEVELOPMENT.md`](./DEVELOPMENT.md).
-
----
-
-## Creating a Node from Scratch
-
-This section walks through the complete lifecycle of creating a new Fluxbee node: from an empty directory to a running agent inside the hive. No prior knowledge of the internal packaging format is required.
-
-### The three node types at a glance
-
-| Type | When to use | Needs compilation? |
-|---|---|---|
-| `full_runtime` | You write a custom binary (Rust, Go, etc.) and it runs as its own process | Yes |
-| `config_only` | You only need to configure an existing runtime — change the prompt, model, thresholds | No |
-| `workflow` | You define a workflow that runs on top of an existing workflow engine | No |
-
-Start with `config_only` if you just want to create a new agent persona on top of `ai.generic`. Use `full_runtime` when you are writing a new binary from scratch.
-
----
-
-### Step 1 — Scaffold the package directory
-
-`fluxbee-scaffold` creates the correct directory structure and `package.json` for you so you don't have to remember the format.
-
-**Config-only agent** (most common for a new AI persona):
-
-```bash
-./target/release/fluxbee-scaffold \
-  --name ai.soporte.billing \
-  --type config_only \
-  --base ai.generic
-```
-
-**Full runtime** (custom binary):
-
-```bash
-./target/release/fluxbee-scaffold \
-  --name sy.frontdesk.gov \
-  --type full_runtime \
-  --version 1.0.0
-```
-
-**Workflow**:
-
-```bash
-./target/release/fluxbee-scaffold \
-  --name wf.onboarding.standard \
-  --type workflow \
-  --base wf.engine
-```
-
-The tool creates a directory named after the runtime in the current folder. Example output for `config_only`:
-
-```
-ai.soporte.billing/
-├── package.json
-├── assets/
-│   └── prompts/
-│       └── system.txt       ← your agent's system prompt
-└── config/
-    └── default-config.json  ← model settings and defaults
-```
-
-**Runtime naming rules:** lowercase letters, digits, dots, and hyphens only. Dots separate segments (e.g. `ai.soporte.billing`, `wf.onboarding.v2`).
-
----
-
-### Step 2 — Edit the files
-
-Open the scaffolded directory and customize the placeholder content.
-
-#### `package.json`
-
-Generated automatically. You normally only need to update `description` and `version`. Example for a config-only package:
-
-```json
-{
-  "name": "ai.soporte.billing",
-  "version": "1.0.0",
-  "type": "config_only",
-  "description": "Billing support agent for Acme Corp",
-  "runtime_base": "ai.generic",
-  "config_template": "config/default-config.json"
-}
-```
-
-#### `assets/prompts/system.txt` (config_only / full_runtime)
-
-Write the system prompt your agent will use. The base runtime loads it from `_system.package_path` at startup.
-
-```
-You are a billing support specialist for Acme Corp.
-You handle refunds, payment inquiries, and invoice disputes.
-Always respond in the customer's language.
-```
-
-#### `config/default-config.json`
-
-Defines default runtime settings. These are merged with any config the operator provides at spawn time (operator config takes precedence):
-
-```json
-{
-  "model": "gpt-4o",
-  "temperature": 0.3,
-  "max_tokens": 4096
-}
-```
-
-#### `bin/start.sh` (full_runtime only)
-
-The scaffold generates a placeholder. Replace it with the actual entry point to your binary:
-
-```bash
-#!/usr/bin/env bash
-set -euo pipefail
-exec "$(dirname "${BASH_SOURCE[0]}")/my-binary"
-```
-
-Then copy your compiled binary into `bin/`:
-
-```bash
-cargo build --release --bin my-binary
-cp target/release/my-binary ai.my.node/bin/my-binary
-chmod 0755 ai.my.node/bin/my-binary ai.my.node/bin/start.sh
-```
-
-#### `flow/definition.json` (workflow only)
-
-Define the steps, timeout, and escalation behavior:
-
-```json
-{
-  "steps": ["greeting", "collect_data", "verify", "confirm"],
-  "timeout_secs": 300,
-  "on_timeout": "escalate"
-}
-```
-
----
-
-### Step 3 — Zip the package
-
-Use `fluxbee-scaffold pack` to validate and zip the package in one step. It reads `name` and `version` from `package.json` and writes `<name>-<version>.zip` next to the package directory by default.
-
-**Config-only or workflow** (no binary needed):
-
-```bash
-fluxbee-scaffold pack ./ai.soporte.billing
-# → ai.soporte.billing-1.0.0.zip
-```
-
-**Full runtime** — pass the compiled binary with `--binary`. It gets copied as `bin/start.sh` before zipping:
-
-```bash
-cargo build --release --bin sy-frontdesk-gov
-fluxbee-scaffold pack ./sy.frontdesk.gov --binary ./target/release/sy-frontdesk-gov
-# → sy.frontdesk.gov-1.0.0.zip
-```
-
-Custom output path:
-
-```bash
-fluxbee-scaffold pack ./ai.soporte.billing --output ./dist/ai.soporte.billing-1.0.0.zip
-```
-
-`pack` will error if:
-
-- `full_runtime` and `bin/start.sh` is missing (you forgot `--binary`)
-- `workflow` and the `flow/` directory is absent
-- `package.json` is missing or malformed
-
-The resulting zip is the file you upload in Step 4.
-
----
-
-### Step 4 — Upload and publish via Archi
-
-Open Archi in your browser (default `http://127.0.0.1:3000`).
-
-The left rail switches between sections; pick the chat-bubble icon (default landing) to access the operator chat. The list-with-lightning icon below it opens **Messages**, a read-only viewer of the system-wide ILK message log persisted by storage in `turns`. Messages requires a one-time CONFIG SET pointing at storage's database (`fluxbee_storage`); see [docs/onworking COA/archi/handbook_fluxbee.md §6.5](docs/onworking%20COA/archi/handbook_fluxbee.md) and [admin_help_reference.md `architect_local_config_set`](docs/onworking%20COA/archi/admin_help_reference.md) for the field shape.
-
-In the left sidebar of the chat section, scroll to the **Publish Package** panel at the bottom.
-
-1. Click the drop zone (or drag the `.zip` file onto it).
-2. Select the zip you created in Step 3.
-3. Optionally configure:
-   - **Set as current** — make this version the default for new spawns (checked by default).
-   - **Sync to hive** — comma-separated hive IDs to push `dist` to after publish (e.g. `worker-220`).
-   - **Update on hive** — comma-separated hive IDs to trigger `SYSTEM_UPDATE` on after sync.
-4. Click **Publish**.
-
-Archi uploads the zip, sends it to `SY.admin`, which validates the package, installs it under `/var/lib/fluxbee/dist/runtimes/<name>/<version>/`, and updates `manifest.json`.
-
-A success response shows the installed path, manifest version, and follow-up status.
-
----
-
-### Step 5 — Verify the package is ready
-
-Check that the runtime was published and is ready on the target hive:
-
-```bash
-BASE="http://127.0.0.1:8080"
-HIVE="worker-220"
-RUNTIME="ai.soporte.billing"
-
-# list all runtimes and their readiness
-curl -sS "$BASE/hives/$HIVE/versions" | jq .
-
-# check one runtime specifically
-curl -sS "$BASE/hives/$HIVE/runtimes/$RUNTIME" | jq .
-```
-
-Expected response for a healthy `config_only` package:
-
-```json
-{
-  "runtime_present": true,
-  "start_sh_executable": true,
-  "base_runtime_ready": true
-}
-```
-
-For `full_runtime`, `base_runtime_ready` is always `true` and not meaningful.
-
-If `runtime_present` is `false`, the sync has not converged yet. Wait a few seconds and retry, or trigger a manual sync:
-
-```bash
-curl -sS -X POST "$BASE/hives/$HIVE/sync-hint" \
-  -H "Content-Type: application/json" \
-  -d '{"channel":"dist","folder_id":"fluxbee-dist","wait_for_idle":true,"timeout_ms":30000}'
-```
-
----
-
-### Step 6 — Spawn the node
-
-Once the runtime is ready, spawn an instance of the node on the target hive:
-
-```bash
-BASE="http://127.0.0.1:8080"
-HIVE="worker-220"
-
-curl -sS -X POST "$BASE/hives/$HIVE/nodes" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "node_name": "AI.soporte.billing.l1",
-    "runtime": "ai.soporte.billing",
-    "runtime_version": "current",
-    "config": {
-      "api_key": "sk-...",
-      "tenant_id": "tnt:12345678-..."
-    }
-  }'
-```
-
-The `config` block here overrides the defaults from `config/default-config.json`. The orchestrator merges them in order: template defaults → request config → forced `_system` fields.
-
----
-
-### Step 7 — Confirm it is running
-
-```bash
-NODE="AI.soporte.billing.l1"
-
-curl -sS "$BASE/hives/$HIVE/nodes/$NODE/status" | jq .payload.node_status.lifecycle_state
-# → "running"
-
-curl -sS "$BASE/hives/$HIVE/nodes/$NODE/config" | jq .payload.config._system
-# shows runtime, runtime_version, runtime_base, package_path
-```
-
-For `config_only` and `workflow` nodes, `_system.package_path` points to the installed package directory in `dist`. The running process reads its assets (prompts, flow definitions, scripts) from that path.
-
----
-
-### Quick reference
-
-| Task | Command / Where |
-|---|---|
-| Scaffold new package | `fluxbee-scaffold new --name <name> --type <type> [--base <base>]` |
-| Zip for upload (config/workflow) | `fluxbee-scaffold pack ./<name>` |
-| Zip for upload (full_runtime) | `fluxbee-scaffold pack ./<name> --binary ./target/release/<bin>` |
-| Upload & publish | Archi → Publish Package panel (left sidebar) |
-| Check readiness | `GET /hives/<hive>/runtimes/<name>` |
-| Spawn node | `POST /hives/<hive>/nodes` |
-| Node status | `GET /hives/<hive>/nodes/<node>/status` |
-| Kill node | `DELETE /hives/<hive>/nodes/<node>` |
-
-For the complete packaging contract (all three types, `inline_package` source, error codes, manifest format), see [`docs/runtime-packaging-cli-spec.md`](docs/runtime-packaging-cli-spec.md).
-
----
-
-## SY.admin API
-
-Operational control of motherbee is exposed by `SY.admin` over HTTP (default `127.0.0.1:8080`).
-
-### Base URL
-
-```bash
-BASE="http://127.0.0.1:8080"
-```
-
-### Health and local status
-
-```bash
-curl -sS "$BASE/health"
-curl -sS "$BASE/hive/status"
-curl -sS "$BASE/hives"
-```
-
-### Add and remove a worker hive
-
-```bash
-HIVE_ID="worker-220"
-HIVE_ADDR="192.168.8.220"
-
-# bootstrap worker + connect WAN
-curl -sS -X POST "$BASE/hives" \
-  -H "Content-Type: application/json" \
-  -d "{\"hive_id\":\"$HIVE_ID\",\"address\":\"$HIVE_ADDR\"}"
-
-# inspect hive metadata
-curl -sS "$BASE/hives/$HIVE_ID"
-
-# deprovision worker services + remove hive metadata
-curl -sS -X DELETE "$BASE/hives/$HIVE_ID"
-```
-
-### Publishing a custom node runtime
-
-The normal operator flow is:
-
-1. Build your node binary.
-2. Package it as a Fluxbee runtime.
-3. Publish it with `fluxbee-publish` on motherbee.
-4. Let `--deploy` propagate `dist` and trigger `SYSTEM_UPDATE` on the target hive.
-5. Spawn the node through `SY.admin`.
-
-This is the path validated by the runtime packaging E2E suite (`PUB-T22` through `PUB-T26`).
-
-#### Package types
-
-- `full_runtime` — your package ships its own `bin/start.sh` and binaries. This is the normal choice for a custom node.
-- `config_only` — your package ships config/assets and uses the `bin/start.sh` of an existing base runtime.
-- `workflow` — your package ships flow definitions/assets and uses the `bin/start.sh` of an existing workflow engine runtime.
-
-If you are publishing a brand new custom node, start with `full_runtime`.
-
-#### Minimal `full_runtime` package
-
 ```text
-my-node/
-├── package.json
-├── bin/
-│   ├── start.sh
-│   └── ai-my-node
-└── config/
-    └── default-config.json
+            ┌───────────────────────────────────────────────┐
+            │ motherbee                                     │
+            │                                               │
+            │ RT.gateway              SY.orchestrator       │
+            │ SY.admin :8080          Archi :3000           │
+            │ SY.identity (primary)   SY.vault              │
+            │ SY.storage              SY.cognition  ...     │
+            │ PostgreSQL                                    │
+            └────────┬───────────────────┬─────────────┬────┘
+                     │                   │             │
+                     │                   │             │   WAN, port 9000, mutual TLS:
+                     │                   │             │   each hive dials the motherbee
+                     │                   │             │
+      ┌──────────────┴──────────┐ ┌──────┴──────┐ ┌────┴────────┐
+      │ worker1                 │ │ ingress     │ │ egress      │
+      │                         │ │             │ │             │
+      │ RT.gateway              │ │ RT.gateway  │ │ RT.gateway  │
+      │ SY.identity (replica)   │ │ SY.edge :443│ │ outbound NAT│
+      │ SY.cognition  SY.timer  │ │ public HTTPS│ └─────────────┘
+      │ AI, IO and WF nodes     │ └─────────────┘
+      └─────────────────────────┘
 ```
 
-`package.json`:
+**System nodes** (`system_nodes` in [packaging/hive.yaml.example](packaging/hive.yaml.example);
+every hive also runs the router, `RT.gateway`):
+
+| Node | Runs on | What it does |
+|---|---|---|
+| `SY.orchestrator` | every hive | Launches and watches nodes, joins new hives, rolls out software. |
+| `SY.config.routes` | every hive | Routes and VPN rules. |
+| `SY.opa.rules` | every hive | Compiles the user policy (motherbee) and installs it (every hive). |
+| `SY.identity` | motherbee (primary), workers (replica) | ILKs, tenants and channels. |
+| `SY.cognition` | motherbee, workers | Memory per communication. |
+| `SY.timer` | motherbee, workers | Persistent timers and time services. |
+| `SY.wf-rules` | motherbee, workers | Deploys workflows through SY.admin. |
+| `SY.admin` | motherbee | The admin API. |
+| `SY.architect` | motherbee | Archi. |
+| `SY.storage` | motherbee | Writes the message log, cognition data and usage records to PostgreSQL. |
+| `SY.frontdesk.gov` | motherbee | Registers new people. |
+| `SY.vault` | motherbee | Secrets, encrypted with AES-256-GCM. |
+| `SY.edge` | ingress | The public HTTPS door. |
+
+**Inside a hive**, each node talks to its router over a Unix socket in `/var/run/fluxbee/routers`.
+The router reads shared-memory regions that the system nodes keep: its connected nodes
+(`jsr-<router uuid>`), routes and VPN rules (`jsr-config-<hive>`), the other hives' topology
+(`jsr-lsa-<hive>`), identity (`jsr-identity-<hive>`), the compiled user policy (`jsr-opa-<hive>`)
+and memory packages (`jsr-memory-<hive>`).
+
+**Base runtimes**, shipped in the `.deb` ([packaging/base-nodes.json](packaging/base-nodes.json)):
+
+| Runtime | What it is |
+|---|---|
+| `ai.generic` | The AI agent runtime. |
+| `wf.engine` | The workflow engine. WF nodes run workflow packages on it. |
+| `io.api` | An HTTP API channel for a tenant, published through SY.edge with its own bearer token. |
+| `io.slack` | Slack over Socket Mode, one node per workspace and channel binding. |
+| `io.wapp` | WhatsApp, one node per number. Test-grade. |
+| `io.linkedhelper` | LinkedHelper. Test-grade. |
+| `io.cloud` | The relay for Fluxbee Cloud. Motherbee, root tenant, started at boot. |
+| `io.blob` | Public files served through SY.edge. Motherbee, root tenant, started at boot. |
+
+Software lives in `/var/lib/fluxbee/dist/`. Only the motherbee writes it, and Syncthing carries it
+to the other hives.
+
+---
+
+## Current status
+
+Fluxbee runs end to end on a multi-hive lab (motherbee, workers, ingress, egress) and is in active
+development: APIs and docs still change. This section describes version 0.1.79.
+
+### Working today
+
+- Router: nodes on Unix sockets, shared-memory tables, WAN links between hives with mutual TLS.
+- Identity (ILKs, tenants as cost centers, channels), replicated from the motherbee to workers.
+- Agents on `ai.generic` with OpenAI or Anthropic, defined by hash-checked assets on their ILK;
+  memory per communication, built by `SY.cognition` and delivered by the router.
+- The message log and per-tenant LLM usage records, carried by each router's stream.
+- Policy: the baked system policy plus one global user policy.
+- Install (`.deb` and `fluxbee-firstboot`, then `add_hive`) and packages (scaffold, publish,
+  `run_node`).
+- Workflows on `wf.engine`, deployed by `SY.wf-rules`; persistent timers in `SY.timer`.
+- The public door (`SY.edge`), `IO.cloud` for Fluxbee Cloud, and `IO.blob` for public files.
+
+### Next
+
+- Let's Encrypt certificates for the edge. Today the operator loads the TLS certificate into
+  SY.vault.
+- Archi and `io.web` reachable through Fluxbee Cloud. `io.web` is a design today
+  ([docs/io-web-spec-beta-v1.md](docs/io-web-spec-beta-v1.md)).
+
+### Known limits
+
+- The admin API and Archi have no authentication. They listen on loopback only.
+- Fluxbee does not manage the host firewall yet: stage 4 of
+  [docs/host-posture-and-exposure-spec-v1.md](docs/host-posture-and-exposure-spec-v1.md) is parked.
+- Archi writes agent assets to the motherbee's blob store, and they are not synced to workers. An
+  agent that needs a definition runs on the motherbee.
+
+---
+
+## Getting started
+
+### 1. Build the package
+
+On an Ubuntu 24.04 build machine with git, Rust (`rustup`), Go, `protoc` and `python3`:
+
+```bash
+git clone https://github.com/4iplatform/fluxbee.git
+cd fluxbee
+packaging/build-deb.sh 0.1.0        # writes dist/fluxbee_0.1.0_amd64.deb
+```
+
+### 2. Install the motherbee
+
+On a clean Ubuntu 24.04 machine:
+
+```bash
+sudo apt-get install ./fluxbee_0.1.0_amd64.deb   # also installs PostgreSQL
+sudoedit /etc/fluxbee/hive.yaml                  # copied from hive.yaml.example: hive_id, wan, ai
+sudo fluxbee-firstboot
+```
+
+`fluxbee-firstboot` starts PostgreSQL and creates the databases, starts the orchestrator, stores
+the database URL in SY.vault, waits for the hive to be ready, and starts `IO.cloud` and `IO.blob`.
+Those two run degraded until you configure them.
+
+Then load the AI key the core uses (Archi, cognition, the frontdesk) into the root tenant:
+
+```bash
+curl -sS -X POST http://127.0.0.1:8080/hives/motherbee/vault/secrets \
+  -H 'Content-Type: application/json' \
+  -d '{"key":"openai_root_pool","value":{"api_key":"sk-..."},"metadata":{"tenant_id":"tnt:00000000-0000-0000-0000-000000000001","resource_type":"openai"}}'
+```
+
+For Anthropic, use `"resource_type": "anthropic"`, set `ai.default_provider: anthropic` in
+`/etc/fluxbee/hive.yaml`, and restart the AI nodes.
+
+### 3. Open Archi
+
+Archi and the admin API listen on loopback, so reach them through an SSH tunnel:
+
+```bash
+ssh -L 3000:127.0.0.1:3000 -L 8080:127.0.0.1:8080 <user>@<motherbee>
+```
+
+Then open `http://127.0.0.1:3000`.
+
+### 4. Add a worker
+
+A worker starts as a clean Ubuntu 24.04 box with SSH and a user with passwordless sudo. From the
+motherbee:
+
+```bash
+curl -sS -X POST http://127.0.0.1:8080/hives \
+  -H 'Content-Type: application/json' \
+  -d '{"hive_id":"worker1","address":"192.0.2.21","ssh_user":"ubuntu","ssh_password":"..."}'
+```
+
+- Pass `ssh_key` (an unencrypted PEM private key) instead of `ssh_password` when the box only
+  accepts keys. Neither is stored.
+- The join runs in the background: the call answers `accepted` (HTTP 202). Poll
+  `GET /hives/worker1` until its status is `connected`.
+- SSH is used only during the join, which removes the motherbee's key from the box at the end.
+- `"role": "ingress"` and `"role": "egress"` add the other roles.
+  `GET /admin/actions/add_hive` lists their fields.
+
+---
+
+## Create a node
+
+A package has one of three types:
+
+| Type | What you ship | What it runs on |
+|---|---|---|
+| `config_only` | Config and assets | A base runtime, such as `ai.generic` |
+| `workflow` | A flow definition (`flow/definition.json`) | `wf.engine` |
+| `full_runtime` | Your own executable, as `bin/start.sh` | Itself |
+
+This walk-through publishes an agent on `ai.generic` and runs it on the motherbee. You need a
+running motherbee, `jq`, and a checkout of this repository with a Rust toolchain. Run the API
+calls on the motherbee, or from your machine through the SSH tunnel above.
+
+```bash
+ADMIN=http://127.0.0.1:8080
+```
+
+### 1. Scaffold the package
+
+```bash
+cargo build --release --bin fluxbee-scaffold
+./target/release/fluxbee-scaffold new --name ai.billing --type config_only --base ai.generic
+```
+
+Runtime names use lowercase letters, digits, dots and hyphens. Versions are `MAJOR.MINOR.PATCH`
+(`--version`, default `0.1.0`). The scaffold writes `ai.billing/package.json` (name, version,
+type, `runtime_base: "ai.generic"`, `config_template`) and `ai.billing/config/default-config.json`:
 
 ```json
 {
-  "name": "ai.my.node",
-  "version": "1.0.0",
-  "type": "full_runtime",
-  "description": "Custom Fluxbee node",
-  "config_template": "config/default-config.json",
-  "entry_point": "bin/start.sh"
+  "behavior": {
+    "kind": "ai_chat",
+    "model": "gpt-5.5",
+    "instructions": "Replace with your agent's instructions."
+  }
 }
 ```
 
-`bin/start.sh`:
+### 2. Edit it
+
+- Fill in `description`. Raise `version` for every new publish.
+- `behavior.kind` and `behavior.model` are required. The model must belong to the hive's
+  provider (`gpt-5.5` with the default OpenAI).
+- Leave out `temperature`: the current models reject it.
+- Put no keys in the config. `ai.generic` rejects `secrets`, `behavior.api_key` and
+  `behavior.openai`.
+- `instructions` is only a fallback. Once the agent finds its ILK, its prompt comes from the ILK's
+  definition (step 6), or it is the fixed "unconfigured" one.
+
+At spawn, the orchestrator builds the node's config from this file, then the request's `config`
+(each top-level key replaces the file's), then a `_system` block it controls.
+
+### 3. Pack it
 
 ```bash
-#!/usr/bin/env bash
-set -euo pipefail
-exec "$(dirname "${BASH_SOURCE[0]}")/ai-my-node"
+./target/release/fluxbee-scaffold pack ./ai.billing    # writes ai.billing-0.1.0.zip
 ```
 
-#### End-to-end example (`full_runtime`)
+`pack` checks the layout (a `full_runtime` needs an executable `bin/start.sh`, a `workflow` needs
+`flow/`) and zips the directory next to it.
+
+### 4. Publish it
+
+- **From Archi:** in the chat sidebar, open **Publish Software**, drop the zip, tick
+  **Promote To Current**, and click **Publish**. A first version must be current, or
+  `"runtime_version": "current"` finds nothing to run.
+- **From the admin API**, straight from the files (no zip needed; `set_current` defaults to true):
 
 ```bash
-MOTHER_HIVE="motherbee"
-TARGET_HIVE="worker-220"
-RUNTIME_NAME="ai.my.node"
-RUNTIME_VERSION="1.0.0"
-PKG_DIR="$PWD/package"
-
-# prerequisite for current workspace builds: `protoc` in PATH
-# Debian/Ubuntu: sudo apt-get install -y protobuf-compiler
-
-# 1) build your node binary
-cargo build --release --bin ai-my-node
-
-# 2) assemble package
-mkdir -p "$PKG_DIR/bin" "$PKG_DIR/config"
-cp target/release/ai-my-node "$PKG_DIR/bin/ai-my-node"
-chmod 0755 "$PKG_DIR/bin/ai-my-node"
-cat >"$PKG_DIR/bin/start.sh" <<'EOF'
-#!/usr/bin/env bash
-set -euo pipefail
-exec "$(dirname "${BASH_SOURCE[0]}")/ai-my-node"
-EOF
-chmod 0755 "$PKG_DIR/bin/start.sh"
-cat >"$PKG_DIR/package.json" <<EOF
-{
-  "name": "$RUNTIME_NAME",
-  "version": "$RUNTIME_VERSION",
-  "type": "full_runtime",
-  "description": "Custom Fluxbee node",
-  "config_template": "config/default-config.json",
-  "entry_point": "bin/start.sh"
-}
-EOF
-cat >"$PKG_DIR/config/default-config.json" <<'EOF'
-{
-  "model": "gpt-5",
-  "temperature": 0.2
-}
-EOF
-
-# 3) publish on motherbee and deploy to target hive
-FLUXBEE_PUBLISH_BASE="$BASE" \
-FLUXBEE_PUBLISH_MOTHER_HIVE_ID="$MOTHER_HIVE" \
-target/release/fluxbee-publish "$PKG_DIR" \
-  --version "$RUNTIME_VERSION" \
-  --deploy "$TARGET_HIVE"
+jq -n --rawfile pkg ai.billing/package.json --rawfile cfg ai.billing/config/default-config.json \
+  '{source: {kind: "inline_package", files: {"package.json": $pkg, "config/default-config.json": $cfg}}}' |
+  curl -sS -X POST "$ADMIN/admin/runtime-packages/publish" \
+    -H 'Content-Type: application/json' -d @- | jq .
 ```
 
-`fluxbee-publish` does the following:
+The package lands in `/var/lib/fluxbee/dist/runtimes/ai.billing/0.1.0/` on the motherbee.
 
-- validates the package layout
-- installs it under `/var/lib/fluxbee/dist/runtimes/<n>/<version>`
-- updates `/var/lib/fluxbee/dist/runtimes/manifest.json`
-- when `--deploy` is present, sends `sync-hint + update` to the target hive
+### 5. Create a tenant and launch the agent
 
-Important:
-
-- `update_status=sync_pending` is not a failure by itself
-- the correct post-publish check is runtime readiness in `/hives/<hive>/versions`
-- for runtime-only validation/materialization you can scope update with `runtime` + `runtime_version`
-- targeted runtime update may return `global_runtime_health` as context, but unrelated global drift should not block the targeted deploy
-
-#### Check readiness on the target hive
+Agents cannot run in the root tenant, and only an active tenant takes new nodes. Create one, store
+its general OpenAI key (no owner and no assigned nodes, so every node of the tenant can use it),
+and launch the agent:
 
 ```bash
-curl -sS "$BASE/hives/$TARGET_HIVE/versions" | jq .
+TENANT=$(curl -sS -X POST "$ADMIN/hives/motherbee/identity/tenants" \
+  -H 'Content-Type: application/json' \
+  -d '{"name":"demo","status":"active"}' | jq -r .payload.tenant_id)
+
+curl -sS -X POST "$ADMIN/hives/motherbee/vault/secrets" -H 'Content-Type: application/json' \
+  -d '{"key":"demo-openai","value":{"api_key":"sk-..."},"metadata":{"resource_type":"openai","tenant_id":"'"$TENANT"'"}}'
+
+curl -sS -X POST "$ADMIN/hives/motherbee/nodes" -H 'Content-Type: application/json' \
+  -d '{"node_name":"AI.billing@motherbee","runtime":"ai.billing","runtime_version":"current","tenant_id":"'"$TENANT"'"}'
+
+curl -sS "$ADMIN/hives/motherbee/nodes/AI.billing@motherbee/status" \
+  | jq '.payload.node_status | {lifecycle_state, ilk: .identity.ilk_id}'
 ```
 
-For one runtime with explicit materialization details:
+`lifecycle_state` should read `RUNNING`. The orchestrator registered an agent ILK for the node,
+charged to the tenant.
+
+### 6. Give the agent a role
+
+Write a role asset through Archi's API (Archi computes its hash), then put it on the agent's ILK:
 
 ```bash
-curl -sS "$BASE/hives/$TARGET_HIVE/runtimes/$RUNTIME_NAME" | jq .
+ROLE=$(curl -sS -X POST http://127.0.0.1:3000/api/agent-assets \
+  -H 'Content-Type: application/json' \
+  -d '{"asset_type":"role","name":"Billing support","description":"Answers questions about invoices, payments and refunds."}' \
+  | jq -r .definition_fragment.role_hash)
+
+ILK=$(curl -sS "$ADMIN/hives/motherbee/nodes/AI.billing@motherbee/status" \
+  | jq -r .payload.node_status.identity.ilk_id)
+
+curl -sS -X POST "$ADMIN/hives/motherbee/identity/ilks/$ILK/definition" \
+  -H 'Content-Type: application/json' \
+  -d '{"definition":{"role_hash":"'"$ROLE"'","skill_hashes":[],"handbook_hashes":[],"personality_hash":null}}'
 ```
 
-Expected for `full_runtime`:
-
-- `runtime_present = true`
-- `start_sh_executable = true`
-
-Expected for `config_only` / `workflow`:
-
-- `runtime_present = true`
-- `start_sh_executable = true`
-- `base_runtime_ready = true`
-
-#### Spawn the node
+Within about ten seconds the agent rebuilds its prompt. Check it:
 
 ```bash
-TENANT_ID="tnt:12345678-1234-1234-1234-123456789abc"
-NODE_NAME="AI.my.node.1"
-
-curl -sS -X POST "$BASE/hives/$TARGET_HIVE/nodes" \
-  -H "Content-Type: application/json" \
-  -d "{
-    \"node_name\":\"$NODE_NAME\",
-    \"runtime\":\"$RUNTIME_NAME\",
-    \"runtime_version\":\"current\",
-    \"tenant_id\":\"$TENANT_ID\",
-    \"config\":{
-      \"model\":\"gpt-5\",
-      \"temperature\":0.7
-    }
-  }"
+curl -sS -X POST "$ADMIN/hives/motherbee/nodes/AI.billing@motherbee/control/config-get" \
+  -H 'Content-Type: application/json' -d '{}' | jq .payload.response.definition_state
+# "composed"
 ```
 
-At spawn time, the orchestrator builds the final config as:
+Skills and handbooks are assets too (`"asset_type": "skill"` or `"handbook"`), and Archi's chat
+can write all four kinds, personality included.
 
-1. package template defaults
-2. request `config` overrides
-3. forced `_system` block
+### 7. Connect a channel
 
-For `config_only` and `workflow`, `_system` also includes `runtime_base` and `package_path`. This lets the node load assets directly from the published package in `dist`.
-
-#### Verify status and effective config
+An IO node launched for the same tenant (`io.api`, `io.slack` or `io.wapp`) carries a channel's
+messages: its `io.dst_node` setting names the agent, and when it is unset the user policy picks the
+target. Each runtime lists its settings in its `CONFIG_GET` contract (`control/config-get`, as
+above). What the agent spends shows up under its tenant:
 
 ```bash
-curl -sS "$BASE/hives/$TARGET_HIVE/nodes/$NODE_NAME/status" | jq .
-curl -sS "$BASE/hives/$TARGET_HIVE/nodes/$NODE_NAME/config" | jq .
+curl -sS "$ADMIN/hives/motherbee/usage?tenant_id=$TENANT" | jq .
 ```
 
-Useful checks:
+### Workflows and custom executables
 
-- `payload.node_status.lifecycle_state`
-- `payload.node_status.runtime.name`
-- `payload.node_status.runtime.resolved_version`
-- `payload.config._system.runtime`
-- `payload.config._system.runtime_version`
-- `payload.config._system.runtime_base` for `config_only` / `workflow`
-- `payload.config._system.package_path` for `config_only` / `workflow`
+- **Workflow:** `fluxbee-scaffold new --name wf.onboarding --type workflow --base wf.engine`
+  writes the smallest definition `wf.engine` accepts (it waits for a `WF_DONE` message and
+  finishes) and `{"gc_retention_days": 7, "gc_interval_seconds": 3600}` as its config. Publish it
+  like the agent, then launch `WF.onboarding@<hive>` with runtime `wf.onboarding` and a tenant:
+  `WF.*` nodes must run a workflow package. `SY.wf-rules` can publish and launch one in a single
+  call (`POST /hives/{hive}/wf-rules`, see
+  [docs/wf-rules-quickstart.md](docs/wf-rules-quickstart.md)).
+- **Custom executable:** `fluxbee-scaffold new --name ai.custom --type full_runtime` writes a
+  placeholder `bin/start.sh` and an empty config. Build your node with an SDK (below), then run
+  `fluxbee-scaffold pack ./ai.custom --binary <your executable>`: it copies the executable over
+  `bin/start.sh` and zips the package. Publish the zip from Archi.
 
-#### When to use `config_only` or `workflow`
-
-- Use `config_only` when you already have a reusable base runtime and only want to ship config, prompts, or assets.
-- Use `workflow` when the package is a flow definition that runs on top of a workflow engine runtime.
-
-In both cases the package must declare `runtime_base` in `package.json`, and the base runtime must already be published and ready on the target hive.
-
-For the full packaging contract and examples of all three package types, see [`docs/runtime-packaging-cli-spec.md`](docs/runtime-packaging-cli-spec.md).
-
-#### Low-level fallback: manual `dist` / manifest editing
-
-Manual editing of `/var/lib/fluxbee/dist/runtimes` and `manifest.json` is still possible for debugging, but it is no longer the recommended operator path. Prefer `fluxbee-publish` unless you are diagnosing a broken rollout or reproducing a low-level runtime lifecycle issue.
-
-For a low-level operational rollout (manual `dist` + `sync-hint` + `update` + run node), see:
-
-- [`docs/14-runtime-rollout-motherbee.md`](docs/14-runtime-rollout-motherbee.md)
-- `scripts/orchestrator_system_update_api_e2e.sh`
-
-### Trigger / confirm Syncthing convergence (`SYSTEM_SYNC_HINT`)
-
-```bash
-curl -sS -X POST "$BASE/hives/$HIVE_ID/sync-hint" \
-  -H "Content-Type: application/json" \
-  -d '{"channel":"blob","folder_id":"fluxbee-blob","wait_for_idle":true,"timeout_ms":30000}'; echo
-```
-
-### Query remote worker state
-
-```bash
-curl -sS "$BASE/hives/$HIVE_ID/nodes"
-curl -sS "$BASE/hives/$HIVE_ID/versions"
-curl -sS "$BASE/hives/$HIVE_ID/deployments?limit=10"
-```
-
-### Node status / config quick checks
-
-```bash
-NODE_NAME="WF.demo.worker@$HIVE_ID"
-
-# canonical node status snapshot
-curl -sS "$BASE/hives/$HIVE_ID/nodes/$NODE_NAME/status" | jq .
-
-# effective node config
-curl -sS "$BASE/hives/$HIVE_ID/nodes/$NODE_NAME/config" | jq .
-
-# node runtime state (null if not created yet)
-curl -sS "$BASE/hives/$HIVE_ID/nodes/$NODE_NAME/state" | jq .
-```
-
-Useful status fields:
-
-- `payload.node_status.lifecycle_state`
-- `payload.node_status.health_state`
-- `payload.node_status.health_source`
-- `payload.node_status.status_version`
-
-### Common config calls
-
-```bash
-curl -sS "$BASE/config/storage"
-
-# routes, VPN rules and taps are per hive: one rule per call
-curl -sS -X POST "$BASE/hives/motherbee/vpns" \
-  -H "Content-Type: application/json" \
-  -d '{"pattern":"WF.echo","match_kind":"PREFIX","vpn_id":20}'
-```
-
-For a larger command matrix and error smoke checks, see:
-
-- `docs/onworking COA/sy-architect-admin-command-test-matrix.md`
-- `scripts/admin_add_hive_matrix.sh`
-
-### Identity inspection
-
-Useful when debugging registration and routing state from `SY.admin` without talking to `SY.identity` directly:
-
-```bash
-HIVE_ID="motherbee"
-ILK_ID="ilk:xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
-
-# compact list of current ILKs on the hive
-curl -sS "$BASE/hives/$HIVE_ID/identity/ilks" | jq .
-
-# full detail for one ILK
-curl -sS "$BASE/hives/$HIVE_ID/identity/ilks/$ILK_ID" | jq .
-
-# set cognitive definition hashes for an agent ILK
-# Body accepts role_hash, skill_hashes[], handbook_hashes[], and personality_hash (single, optional).
-# Omit personality_hash or set to null to leave personality unconfigured.
-curl -sS -X POST "$BASE/hives/$HIVE_ID/identity/ilks/$ILK_ID/definition" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "definition": {
-      "role_hash": "1111111111111111111111111111111111111111111111111111111111111111",
-      "skill_hashes": [],
-      "handbook_hashes": [],
-      "personality_hash": "9f8e7d6c5b4a3210123456789abcdef0123456789abcdef0123456789abcdef0"
-    }
-  }' | jq .
-```
-
-`GET /hives/{hive}/identity/ilks` returns a compact row per ILK with `ilk_id`, `ilk_type`, `registration_status`, `tenant_id`, `tenant_name`, `display_name`, `node_name`, `channel_count`, `channels` (`ich_id`, `channel_type`, `address`), and `deleted_at_ms`.
-`POST /hives/{hive}/identity/ilks/{ilk_id}/definition` forwards `ILK_SET_DEFINITION` to `SY.identity`; identity validates the target is an agent ILK and publishes the hash facts to identity SHM for router/OPA projection. The body accepts the agent's four cognitive asset references — `role_hash`, `skill_hashes[]`, `handbook_hashes[]`, and `personality_hash` (the last is optional and represents nationality, languages, timezone, biography). See [docs/identity-v2.1-agent-definition-addendum.md](docs/identity-v2.1-agent-definition-addendum.md) for the full schema.
-
-### Debug message to one node
-
-For ad-hoc debugging, `SY.admin` can emit a direct message to a specific node by name and return the generated `trace_id`.
-
-```bash
-HIVE_ID="motherbee"
-NODE_NAME="SY.frontdesk.gov@motherbee"
-
-curl -sS -X POST "$BASE/hives/$HIVE_ID/nodes/$NODE_NAME/messages" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "msg_type": "user",
-    "msg": "LLM",
-    "payload": {
-      "text": "hola desde admin"
-    }
-  }' | jq .
-```
-
-Optional fields: `src_ilk`, `scope`, `meta_target`, `meta_action`, `priority`, `context`, `ttl`.
-
-### Endpoint Reference
-
-Current HTTP surface exposed by `SY.admin`.
-
-**Global endpoints:**
-
-| Method | Path | Purpose |
-|---|---|---|
-| `GET` | `/health` | Liveness/health probe |
-| `GET` | `/admin/actions` | Introspect internal admin action catalog (`list_admin_actions`) |
-| `GET` | `/hive/status` | Local hive/orchestrator status |
-| `GET` | `/hives` | List managed hives |
-| `POST` | `/hives` | Add hive (`hive_id`, `address`) |
-| `GET` | `/versions` | Effective versions (local or `?hive=`) |
-| `GET` | `/deployments` | Historical deployment entries (`?hive=`, `?category=`, `?limit=`) |
-| `GET` | `/drift-alerts` | Historical drift alert entries (`?hive=`, `?category=`, `?limit=`) |
-| `GET` | `/config/storage` | Read storage config |
-| `PUT` | `/config/storage` | Update storage config |
-| `GET` | `/config/storage/metrics` | SY.storage inbox metrics (`STORAGE_METRICS_GET` over the mesh) |
-| `POST` | `/opa/policy` | Compile the user OPA policy on the motherbee and apply it on every hive |
-| `POST` | `/opa/policy/compile` | Compile the user policy (motherbee) |
-| `POST` | `/opa/policy/apply` | Apply a compiled version on every hive |
-| `POST` | `/opa/policy/rollback` | Roll the user policy back on every hive |
-| `POST` | `/opa/policy/clear` | Remove the user policy from every hive |
-| `POST` | `/opa/policy/check` | Validate a policy without applying it |
-| `GET` | `/opa/policy` | Read current policy state |
-| `GET` | `/opa/status` | OPA runtime status |
-| `GET` | `/modules` | List modules |
-| `GET` | `/modules/{name}` | List versions for module |
-| `GET` | `/modules/{name}/{version}` | Get module version payload |
-| `POST` | `/modules/{name}/{version}` | Publish/update module version |
-
-**Hive-scoped endpoints:**
-
-| Method | Path | Purpose |
-|---|---|---|
-| `GET` | `/hives/{hive}` | Get hive metadata |
-| `DELETE` | `/hives/{hive}` | Remove hive |
-| `GET` | `/hives/{hive}/routes` | List routes for hive |
-| `POST` | `/hives/{hive}/routes` | Add/update route on hive |
-| `DELETE` | `/hives/{hive}/routes/{prefix}` | Delete route by prefix |
-| `GET` | `/hives/{hive}/vpns` | List VPN rules for hive |
-| `POST` | `/hives/{hive}/vpns` | Add/update VPN rule on hive |
-| `DELETE` | `/hives/{hive}/vpns/{pattern}` | Delete VPN rule by pattern |
-| `GET` | `/hives/{hive}/taps` | List taps for hive |
-| `POST` | `/hives/{hive}/taps` | Add a tap on hive |
-| `DELETE` | `/hives/{hive}/taps` | Delete a tap (`?match_src=&match_dst=&target=`) |
-| `GET` | `/hives/{hive}/nodes` | List nodes on hive |
-| `POST` | `/hives/{hive}/nodes` | Spawn node on hive |
-| `DELETE` | `/hives/{hive}/nodes/{name}` | Kill node on hive |
-| `GET` | `/hives/{hive}/nodes/{name}/status` | Canonical node status |
-| `GET` | `/hives/{hive}/nodes/{name}/config` | Read node effective config |
-| `PUT` | `/hives/{hive}/nodes/{name}/config` | Update node effective config |
-| `GET` | `/hives/{hive}/nodes/{name}/state` | Read node runtime state payload |
-| `POST` | `/hives/{hive}/nodes/{name}/messages` | Send a direct debug message to one node |
-| `POST` | `/hives/{hive}/nodes/{name}/control/config-get` | Request node-owned control-plane contract/config (`CONFIG_GET`) |
-| `POST` | `/hives/{hive}/nodes/{name}/control/config-set` | Apply node-owned control-plane config (`CONFIG_SET`) |
-| `GET` | `/hives/{hive}/streams` | Status of the hive's router streams (`STREAM_STATUS` of each `RT.*.stream@<hive>`) |
-| `GET` | `/hives/{hive}/identity/ilks` | List ILKs on hive (compact identity view) |
-| `GET` | `/hives/{hive}/identity/ilks/{ilk_id}` | Read one ILK with resolved tenant/alias detail |
-| `POST` | `/hives/{hive}/identity/ilks/{ilk_id}/definition` | Set cognitive definition hashes for one agent ILK |
-| `GET` | `/hives/{hive}/identity/tenants` | List tenants on hive (summary view for sponsor/default discovery) |
-| `POST` | `/hives/{hive}/identity/tenants` | Create a tenant; optional `sponsor_tenant_id` creates a client tenant under an admin/company tenant |
-| `GET` | `/hives/{hive}/identity/tenants/{tenant_id}` | Read one tenant with resolved sponsor detail |
-| `PUT` | `/hives/{hive}/identity/tenants/{tenant_id}` | Update mutable tenant fields |
-| `POST` | `/hives/{hive}/identity/tenants/{tenant_id}/sponsor` | Set or clear tenant sponsor |
-| `POST` | `/hives/{hive}/update` | Send `SYSTEM_UPDATE` to hive orchestrator |
-| `POST` | `/hives/{hive}/sync-hint` | Send `SYSTEM_SYNC_HINT` (`blob`/`dist`) to hive orchestrator |
-| `GET` | `/hives/{hive}/versions` | Effective versions for hive |
-| `GET` | `/hives/{hive}/deployments` | Historical deployment entries targeting hive |
-| `GET` | `/hives/{hive}/drift-alerts` | Historical drift alert entries for hive |
-| `GET` | `/hives/{hive}/opa/policy` | User policy the hive runs: version and hash (the rego on the motherbee only) |
-| `GET` | `/hives/{hive}/opa/status` | User policy status on the hive (`in_sync`, `waiting`, …; see `docs/opa-distribution.md`) |
-
-Notes:
-
-- Router operations are managed as node lifecycle (`RT.*`) via `/hives/{hive}/nodes`.
-- `GET /deployments` and `GET /hives/{hive}/deployments` are history views, not a list of currently running deployments.
-- `GET /drift-alerts` and `GET /hives/{hive}/drift-alerts` are history views, not a live health snapshot.
-- History responses may include `target_hives_detail[*].present` and `workers[*].hive_present` so removed hives remain visible as history.
-- Drift alert history responses may include `hive_present` and `synthetic` markers when a local `motherbee` current-state snapshot is synthesized for history continuity.
-- For `motherbee`, hive-scoped deployment history may include synthesized local-current-state entries when no older history was recorded with `motherbee` as explicit deployment target.
-- For identity-aware first spawn, discover or verify `tenant_id` through `/hives/{hive}/identity/tenants` and `/hives/{hive}/identity/tenants/{tenant_id}` instead of inferring it from inventory alone.
-- Tenant reads expose role hints:
-  - `is_root=true` means root/default tenant for that hive
-  - `is_sponsor=true` means the tenant currently sponsors child tenants
-  - `child_count` and `children` help distinguish sponsor/admin tenants from ordinary client tenants
+The package contract (all three types, sources, errors) is in
+[docs/runtime-packaging-cli-spec.md](docs/runtime-packaging-cli-spec.md).
 
 ---
 
-## Infrastructure Reference
+## Operate
 
-### Network Ports (Motherbee ↔ Workers)
+### The admin API
 
-This is the effective port map for current deployments.
+SY.admin describes itself. List its actions, then ask for one:
 
-| Port | Proto | Scope | Purpose | Default owner / listener |
-|---|---|---|---|---|
-| `9000` | TCP | inter-hive | WAN gateway channel (`RT.gateway`) | `motherbee` (`wan.listen`) |
-| `9100` | TCP | inter-hive | Identity full-sync + delta stream | `SY.identity` primary (`motherbee`) |
-| `22000` | TCP | inter-hive | Syncthing data sync (`blob`/`dist`) | peer-to-peer (`motherbee` + workers) |
-| `22000` | UDP | inter-hive | Syncthing QUIC/data sync | peer-to-peer (`motherbee` + workers) |
-| `21027` | UDP | LAN discovery | Syncthing local discovery | peer-to-peer LAN |
-| `8080` | TCP | local | `SY.admin` HTTP API | local host (`127.0.0.1` by default) |
-| `8384` | TCP | local | Syncthing API/GUI | local host (`127.0.0.1` by default) |
-| `22` | TCP | ops/bootstrap | SSH bootstrap/maintenance channel | worker host SSH daemon |
-
-**Firewall behavior in `SY.orchestrator`:**
-
-- Automatic firewall management is currently implemented for Syncthing ports (`22000/tcp`, `22000/udp`, `21027/udp`) when blob/dist sync is enabled.
-- Automatic firewall management is also applied for core listener ports:
-  - WAN listener from `wan.listen` (e.g. `9000/tcp`) when configured.
-  - Identity sync listener on motherbee (`identity.sync.port`, default `9100/tcp`).
-- This runs locally on each hive where `SY.orchestrator` starts and reconciles Syncthing runtime.
-- Workers typically do not need `identity.sync.port` inbound because replicas use `identity.sync.upstream` (outbound to primary), but WAN listener firewall rules are applied if `wan.listen` is set on that worker.
-- If neither `ufw` nor `firewalld` exists on host, orchestrator logs a warning and port policy remains external.
-
-### PostgreSQL Ownership
-
-`SY.storage` and `SY.identity` use fixed database names defined in code (not in `hive.yaml`):
-
-- `SY.storage` → `fluxbee_storage`
-- `SY.identity` (primary only) → `fluxbee_identity`
-
-**Bootstrap behavior:**
-
-- `scripts/install.sh` runs `scripts/fluxbee_db_bootstrap.sh` by default when local `psql` is available.
-- The DB bootstrap is installation/package infrastructure only: it creates local PostgreSQL role/DBs but does not write Fluxbee node secrets.
-- Default managed DBs: `fluxbee`, `fluxbee_identity`, `fluxbee_storage`.
-- For clean test installs, run install with `FLUXBEE_DB_RESET=1`; this terminates active connections and recreates the managed DBs.
-- Override the DB owner with `FLUXBEE_DB_USER=<role>`; if omitted, the bootstrap uses existing `sa`, then existing `fluxbee`, else creates `fluxbee`.
-- `SY.identity` exposes `CONFIG_GET` / `CONFIG_SET` for its primary DB bootstrap. Precedence: local `secrets.json` via `CONFIG_SET` → env overrides.
-- `SY.storage` precedence: local `secrets.json` via `CONFIG_SET` → env overrides. Does **not** use `database.url` in `hive.yaml`.
-- On motherbee startup, each service ensures its own database exists (`CREATE DATABASE` if missing) and then ensures its own schema/tables.
-- Worker identity replicas remain read-only for DB writes and continue syncing from primary through identity sync.
-
----
-
-## SDK Development
-
-### Node Development Template (Rust)
-
-If you want to build a node in another repo, use `fluxbee_sdk` (`json-router/crates/fluxbee_sdk`) as the canonical base SDK.
-
-For AI-specific runtimes, `json-router/crates/fluxbee_ai_sdk` is available as a separate higher-level SDK on top of `fluxbee_sdk`. It is intended for `SY.architect` and future `AI.*` nodes, not as a replacement for the transport/protocol SDK.
-
-SDK entry points:
-
-- [AI SDK README](./crates/fluxbee_ai_sdk/README.md) — Immediate memory, function calling, summary refresh, and AI runtime guidance.
-- [AI immediate memory spec](./docs/immediate-conversation-memory-spec.md) — Contract and design scope for short-horizon conversation context.
-
-For domain nodes that live in this repo (for example `.gov`), see [`nodes/gov/README.md`](nodes/gov/README.md).
-
-**What to copy:**
-
-```
-json-router/crates/fluxbee_sdk/
+```bash
+curl -sS http://127.0.0.1:8080/admin/actions | jq -r '.payload.actions[].action'
+curl -sS http://127.0.0.1:8080/admin/actions/run_node | jq .payload.entry.request_contract
 ```
 
-**Suggested structure:**
+The second call returns the method and path, the required and optional fields, an example
+payload, and a ready `curl` line. Every response uses the same envelope: `status`, `action`,
+`payload`, `error_code`, `error_detail`. Hive-scoped actions take the hive in the path
+(`/hives/{hive}/...`). Secrets, usage records and identity changes live on the motherbee, so those
+calls use `/hives/motherbee/...`.
 
-```
-my-node/
-├── Cargo.toml
-├── src/
-│   └── main.rs
-└── fluxbee_sdk/       # copied from json-router/crates/fluxbee_sdk
-```
+### Ports
 
-**`Cargo.toml`:**
-
-```toml
-[package]
-name = "my-node"
-version = "0.1.0"
-edition = "2021"
-
-[dependencies]
-tokio = { version = "1.37", features = ["full"] }
-serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
-uuid = { version = "1.7", features = ["v4"] }
-fluxbee-sdk = { path = "./fluxbee_sdk" }
-```
-
-**Minimal node example:**
-
-```rust
-use fluxbee_sdk::{connect, NodeConfig, NodeUuidMode};
-use fluxbee_sdk::protocol::{Destination, Message, Meta, Routing};
-use uuid::Uuid;
-
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let config = NodeConfig {
-        name: "WF.test".to_string(),
-        router_socket: "/var/run/fluxbee/routers".into(),
-        uuid_persistence_dir: "/var/lib/fluxbee/state/nodes".into(),
-        uuid_mode: NodeUuidMode::Persistent,
-        config_dir: "/etc/fluxbee".into(),
-        version: "1.0".to_string(),
-    };
-
-    let (sender, mut receiver) = connect(&config).await?;
-
-    let msg = Message {
-        routing: Routing {
-            src: sender.uuid().to_string(),
-            dst: Destination::Broadcast,
-            ttl: 16,
-            trace_id: Uuid::new_v4().to_string(),
-        },
-        meta: Meta {
-            msg_type: "user".to_string(),
-            msg: Some("HELLO".to_string()),
-            scope: None,
-            target: None,
-            action: None,
-            priority: None,
-            context: None,
-        },
-        payload: serde_json::json!({"hello":"world"}),
-    };
-    sender.send(msg).await?;
-
-    loop {
-        let msg = receiver.recv().await?;
-        println!("received: {:?}", msg);
-    }
-}
-```
-
-### SDK Tools
-
-`fluxbee_sdk` is the canonical base toolset for node development. `fluxbee_ai_sdk` is a separate AI-oriented crate layered on top of it for architect/AI runtimes. Current base toolbox:
-
-| Tool | Path | Purpose |
+| Port | Where | What |
 |---|---|---|
-| Node connection | `fluxbee_sdk::{connect, NodeConfig}` | Connect node to router (split sender/receiver) |
-| Protocol types | `fluxbee_sdk::protocol` | Build/route messages (`Message`, `Routing`, `Destination`, `Meta`) |
-| Typed payloads | `fluxbee_sdk::payload::TextV1Payload` | Canonical `text/v1` payload (`content`, `content_ref`, `attachments`) |
-| Router stream | `fluxbee_sdk::stream` | `append` sends `STREAM_APPEND` to the node's own router (fire and forget; the router keeps only the subjects that producer may append), plus the `STREAM_BATCH`/`STREAM_ACK` wire contract |
-| Blob toolkit | `fluxbee_sdk::blob::BlobToolkit` | `put`, `put_bytes`, `promote`, `resolve`, `resolve_with_retry`, GC |
-| Blob confirmed publish | `fluxbee_sdk::blob::PublishBlobRequest` | `publish_blob_and_confirm` (`SYSTEM_SYNC_HINT` gate before emitting `blob_ref`) |
-| Blob metrics snapshot | `fluxbee_sdk::blob::BlobToolkit::metrics_snapshot` | Operational counters (`put/resolve/retry/errors/bytes`) |
-| Identity SHM lookup | `fluxbee_sdk::identity::{resolve_ilk_from_shm_name, resolve_ilk_from_hive_id, resolve_ilk_from_hive_config}` | Resolve `(channel_type,address) -> ilk` locally from identity SHM |
-| Identity provision | `fluxbee_sdk::identity::{IlkProvisionRequest, provision_ilk}` | Request `ILK_PROVISION` with automatic `NOT_PRIMARY` fallback target support. `IlkProvisionRequest.ilk_type` is set by the IO node at construction time — `Some("human")`, `Some("agent")`, or `None` (server defaults to `"human"`). Only the IO node knows whether its external counterpart is human or agent. `"system"` is rejected here; it is reserved for SY-internal creation paths. |
-| Identity system calls | `fluxbee_sdk::identity::{IdentitySystemRequest, identity_system_call, identity_system_call_ok}` | Generic helpers for `ILK_REGISTER`, `ILK_ADD_CHANNEL`, `ILK_UPDATE`, tenant actions |
-| Node status default handler | `fluxbee_sdk::try_handle_default_node_status` | Respond `NODE_STATUS_GET` with canonical `health_state` |
-| Admin internal gateway | `fluxbee_sdk::{admin_command, admin_command_ok, AdminCommandRequest}` | Execute `ADMIN_COMMAND` over socket/WAN against `SY.admin@<hive>` |
-| Convenience imports | `fluxbee_sdk::prelude::*` | Common SDK symbols in one import |
+| 9000/tcp | motherbee | WAN links between routers. The shipped `hive.yaml` requires mutual TLS (`wan.mtls: required`). |
+| 9100/tcp | motherbee | Identity sync to the worker replicas, with a per-hive HMAC (`identity.sync.auth: required`). |
+| 22000/tcp | motherbee | Syncthing, for software and blobs. Once a hive switches to the owned options (host posture stage 3), spokes only dial out, and discovery, relays and UDP are off. |
+| 443/tcp | ingress | `SY.edge`, the public HTTPS door. |
+| 8080/tcp | motherbee, 127.0.0.1 | SY.admin. |
+| 3000/tcp | motherbee, 127.0.0.1 | Archi. |
+| 8384/tcp | 127.0.0.1 | Syncthing's API. |
+| 22/tcp | new spokes | SSH from the motherbee, only while `add_hive` runs. |
 
-`NodeConfig` supports two UUID modes:
+### Data on the motherbee
 
-- `NodeUuidMode::Persistent` — default for normal nodes. Reuses/stores L1 UUID in `uuid_persistence_dir`.
-- `NodeUuidMode::Ephemeral` — for short-lived relays/diagnostic sessions. Generates a new L1 UUID per process without writing `*.uuid` files.
-
-Both modes still require:
-
-- L1 UUID for connection identity (`HELLO.uuid`, `routing.src`)
-- L2 node name for canonical process identity (`HELLO.name`, router registration, routing by name)
-
-Recommended for every new node/scaffold:
-
-- call `try_handle_default_node_status(&sender, &msg).await` inside the receive loop.
-- keep it enabled unless the runtime provides a custom status handler with the same contract.
-- this makes `GET /hives/{hive}/nodes/{name}/status` report `health_source=NODE_REPORTED` in normal operation.
-
-### Cognitive Data Access: Carrier vs Router Stream vs SHM
-
-Cognition is per communication, `(thread_id, agent ILK)`: the thread between an interlocutor and the agent (`AI.*` node) that serves it. Cognitive data is exposed in three different ways:
-
-**1. Message carrier**, automatic for normal nodes:
-
-- `meta.thread_id`
-- `meta.memory_package` (only on delivery to an `AI.*` node, when its router finds the memory of that communication)
-
-The message carries no sequence: the order of a communication is `SY.cognition`'s turn number.
-
-**2. The router stream** (`RT.<router>.stream@<hive>`), the log plane: fixed sinks per subject, no subscription:
-
-- `storage.turns` → `SY.storage@motherbee` (table `turns`, the message log)
-- `cognition.turns` → `SY.cognition` of the same hive
-- `storage.cognition.batch` → `SY.storage@motherbee` (the `cognition_*` tables)
-
-**3. Local SHM** (`jsr-memory-<hive>`), not a normal application-node contract:
-
-- written by `SY.cognition`
-- read by router for enrichment
-- suitable for diagnostics/admin tooling, not as the default path for AI/IO nodes
-
-**Practical rule:**
-
-- If you are writing a normal AI/IO/WF node, consume cognitive context from the delivered message (`meta.thread_id`, `meta.memory_package`).
-- Raw durable cognition entities live in `SY.storage`'s `cognition_*` tables; only `SY.cognition` reads them back (`COGNITION_STATE_GET` over the mesh).
-- Do not assume that cognition entities or SHM content are injected automatically into every node message.
-- Do not use PostgreSQL as the primary integration surface for normal nodes.
-
-The canonical cognition boundary today is:
-
-- the router where a message enters copies it to its stream as `storage.turns`
-- the router where an agent is attached copies both directions of each turn with a `thread_id` to `cognition.turns`, for its hive's `SY.cognition`
-- `SY.cognition` appends its derived entities with `STREAM_APPEND` (`storage.cognition.batch`), and at start reloads its communications from `SY.storage` over the mesh
-- `SY.storage` takes the streams' batches into `storage_inbox` and writes `turns` and the `cognition_*` tables
-- router reads `jsr-memory` and attaches the communication's `memory_package` per destination, only to `AI.*` nodes; a package the sender put in is dropped
-
-### Admin Internal Gateway from SDK (`ADMIN_COMMAND`)
-
-Use this when a node/workflow needs to call `SY.admin` without HTTP (socket/WAN path):
-
-```rust
-use std::time::Duration;
-use fluxbee_sdk::{admin_command, AdminCommandRequest};
-use serde_json::json;
-
-let out = admin_command(
-    &sender,
-    &mut receiver,
-    AdminCommandRequest {
-        admin_target: "SY.admin@motherbee",
-        action: "list_admin_actions",
-        target: None,                 // use Some("worker-220") for hive-scoped actions
-        params: json!({}),
-        request_id: None,
-        timeout: Duration::from_secs(10),
-    },
-).await?;
-
-assert_eq!(out.status, "ok");
-```
-
-Operational checks for this gateway:
-
-- `scripts/admin_internal_socket_actions_e2e.sh`
-- `scripts/admin_http_socket_parity_e2e.sh`
-- `scripts/admin_list_actions_e2e.sh`
-- `scripts/admin_all_actions_matrix_e2e.sh`
-
-### Blob: Basic Flow (`put` / `promote` → attach)
-
-```rust
-use fluxbee_sdk::blob::{BlobConfig, BlobToolkit};
-use fluxbee_sdk::payload::TextV1Payload;
-
-let blob = BlobToolkit::new(BlobConfig::default())?;
-let blob_ref = blob.put_bytes(b"hello", "note.txt", "text/plain")?;
-blob.promote(&blob_ref)?;
-
-let payload = TextV1Payload::new("Adjunto archivo", vec![blob_ref]);
-let payload_json = payload.to_value()?;
-```
-
-### Blob: Confirmed Publish Before Emit (`publish_blob_and_confirm`)
-
-```rust
-use fluxbee_sdk::blob::{BlobConfig, BlobToolkit, PublishBlobRequest};
-use fluxbee_sdk::{connect, NodeConfig, NodeUuidMode};
-
-let cfg = NodeConfig {
-    name: "WF.blob.publisher".into(),
-    router_socket: "/var/run/fluxbee/routers".into(),
-    uuid_persistence_dir: "/var/lib/fluxbee/state/nodes".into(),
-    uuid_mode: NodeUuidMode::Persistent,
-    config_dir: "/etc/fluxbee".into(),
-    version: "1.0".into(),
-};
-let (sender, mut receiver) = connect(&cfg).await?;
-
-let blob = BlobToolkit::new(BlobConfig::default())?;
-let published = blob.publish_blob_and_confirm(
-    &sender,
-    &mut receiver,
-    PublishBlobRequest {
-        data: b"payload",
-        filename_original: "payload.txt",
-        mime: "text/plain",
-        targets: vec!["worker-220".into()],
-        wait_for_idle: true,
-        timeout_ms: 30_000,
-    },
-).await?;
-
-// emit only after confirm
-let payload = fluxbee_sdk::payload::TextV1Payload::new("ready", vec![published.blob_ref]);
-let payload_json = payload.to_value()?;
-```
-
-Operational Blob references:
-
-- [`docs/blob-annex-spec.md`](docs/blob-annex-spec.md)
-- `scripts/blob_sync_e2e.sh`
-- `scripts/blob_sync_multi_hive_e2e.sh`
+- **PostgreSQL:** `fluxbee_identity` (tenants, ILKs, channels, aliases, tenant history) and
+  `fluxbee_storage` (`turns`, the `cognition_*` tables, `llm_usage`). The connection URL
+  (credentials and host, no database name) is a SY.vault secret with resource type `postgres` in
+  the root tenant. `fluxbee-firstboot` stores it as `storage_postgres_url`, and each service adds
+  its own database name.
+- **SY.vault:** `/var/lib/fluxbee/vault.db`, values encrypted under
+  `/etc/fluxbee/vault.master.key`.
+- **Blobs:** `/var/lib/fluxbee/blob/`. `active/` is synced with the workers; `agent-assets/` is
+  not.
 
 ---
 
 ## Documentation
 
-The functional specification lives in [`docs/`](./docs/). There is no cross-navigation between files yet, so here is the full index:
-
-| Doc | Description |
+| Topic | Document |
 |---|---|
-| [`01-arquitectura.md`](docs/01-arquitectura.md) | Architecture overview |
-| [`02-protocolo.md`](docs/02-protocolo.md) | Protocol and node library behavior |
-| [`03-shm.md`](docs/03-shm.md) | Shared memory regions and layout |
-| [`04-routing.md`](docs/04-routing.md) | Routing, FIB, VPNs, OPA integration |
-| [`05-conectividad.md`](docs/05-conectividad.md) | WAN connectivity and gateway behavior |
-| [`06-regiones.md`](docs/06-regiones.md) | Config/LSA regions and update flows |
-| [`07-operaciones.md`](docs/07-operaciones.md) | Ops, deployment, and admin workflows |
-| [`08-apendices.md`](docs/08-apendices.md) | Appendix and reference notes |
-| [`09-router-status.md`](docs/09-router-status.md) | Router implementation status checklist |
-| [`10-identity-v2.md`](docs/10-identity-v2.md) | Identity system and L3 routing (current spec) |
-| [`SY_nodes_spec.md`](docs/SY_nodes_spec.md) | System nodes specification |
+| Identity and tenants (cost centers) | [docs/ilk-tenant-model-v1.md](docs/ilk-tenant-model-v1.md) |
+| An agent's cognitive definition | [docs/identity-v2.1-agent-definition-addendum.md](docs/identity-v2.1-agent-definition-addendum.md) |
+| Router stream: message log, memory, usage | [docs/router-stream-v1.md](docs/router-stream-v1.md) |
+| The user policy on every hive | [docs/opa-distribution.md](docs/opa-distribution.md) |
+| IO.cloud, the API for Fluxbee Cloud | [docs/io-cloud-api.md](docs/io-cloud-api.md) |
+| SY.edge, the public door | [docs/edge-ingress-spec-v6.md](docs/edge-ingress-spec-v6.md) |
+| Host posture and exposure | [docs/host-posture-and-exposure-spec-v1.md](docs/host-posture-and-exposure-spec-v1.md) |
+| Secrets | [docs/sy-vault-spec.md](docs/sy-vault-spec.md) |
+| Package format and publishing | [docs/runtime-packaging-cli-spec.md](docs/runtime-packaging-cli-spec.md) |
+| Packaging, build and install (Spanish) | [docs/packaging-and-build.md](docs/packaging-and-build.md) |
+| Operations: hive.yaml, add_hive, upgrades (Spanish) | [docs/07-operaciones.md](docs/07-operaciones.md) |
+| Workflows with SY.wf-rules (Spanish) | [docs/wf-rules-quickstart.md](docs/wf-rules-quickstart.md) |
+| Original architecture, protocol, shared memory and routing specs (Spanish, older) | [docs/01-arquitectura.md](docs/01-arquitectura.md) to [docs/05-conectividad.md](docs/05-conectividad.md) |
+| Rust SDK | [crates/fluxbee_sdk/README.md](crates/fluxbee_sdk/README.md) |
+| AI SDK (Rust) | [crates/fluxbee_ai_sdk/README.md](crates/fluxbee_ai_sdk/README.md) |
+| Go SDK | [go/fluxbee-go-sdk/README.md](go/fluxbee-go-sdk/README.md) |
+
+When a document and the code disagree, the code is right.
 
 ---
 
-## License & Contributing
+## License & contributing
 
-Licensed under the [MIT License](LICENSE).
+Fluxbee is licensed under the [MIT License](LICENSE), Copyright (c) 2026 4i Platform Inc.
 
-Contributions welcome. Please read the technical specifications first.
+Contributions are welcome: open an issue or a pull request.
 
 ---
 

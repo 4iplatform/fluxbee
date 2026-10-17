@@ -1,118 +1,284 @@
 # fluxbee-ai-sdk
 
-SDK base para nodos `AI.*` y para `SY.architect`.
+The AI layer on top of [`fluxbee-sdk`](../fluxbee_sdk/README.md). Every model call in Fluxbee goes
+through it: `ai.generic` (every `AI.*` node), SY.frontdesk.gov, SY.architect, SY.admin's executor and
+SY.cognition.
 
-Expone cuatro bloques principales:
+It provides:
 
-- cliente/modelos LLM
-- loop de function calling con tools
-- thread state tools/store
-- memoria inmediata de conversación para continuidad entre turns
+- the only way to call a model: two factories that return an OpenAI or Anthropic client, and every
+  call they make is charged to a tenant (usage records);
+- the tool loop: `FunctionCallingRunner`, `FunctionTool`, `FunctionToolRegistry`;
+- immediate conversation memory and a helper that refreshes its summary;
+- thread-state tools and their LanceDB store;
+- the AI node runtime (`AiNode`, `NodeRuntime`), reply builders, and helpers for `text/v1` input
+  (attachments) and output (artifacts).
 
-Regla canónica actual:
+## Calling a model
 
-- `thread_id` llega al nodo AI como metadata conversacional
-- `src_ilk` sigue siendo la key canónica de state/immediate memory en runtimes AI
-- los thread-state tools quedan por compatibilidad de nombre, pero en runtimes scoped operan sobre `src_ilk`
-- `thread_id` sigue disponible como metadata conversacional
+### The provider and the key
 
-La spec de memoria inmediata vive en [docs/immediate-conversation-memory-spec.md](/Users/cagostino/Documents/GitHub/fluxbee/docs/immediate-conversation-memory-spec.md).
+- **The provider is the hive's.** It is the `ai:` section of `/etc/fluxbee/hive.yaml`, read as a
+  `HiveAiConfig`. `HiveAiConfig::effective()` returns the provider and the model configured for it.
+  Without the section, `HiveAiConfig::fallback()` applies: OpenAI with `gpt-5.5`
+  (`DEFAULT_HIVE_OPENAI_MODEL`). An `ai.generic` node takes only the provider from it; its model is
+  its own `behavior.model`.
 
-## Cognitive input boundary for AI nodes
+  ```yaml
+  ai:
+    default_provider: openai        # openai | anthropic
+    providers:
+      openai:
+        model: "gpt-5.5"
+  ```
 
-Para un nodo AI normal, cognition no entra por una única vía.
+- **The key comes from SY.vault, never from config.** Look it up with
+  `fluxbee_sdk::VaultClient::resolve_resource(provider.resource_type(), tenant, timeout)`.
+  `AiProvider::resource_type()` gives `openai` or `anthropic`. The lookup returns the key the node
+  owns, else one assigned to it, else its tenant's general key.
 
-### Lo que llega automáticamente en el mensaje
-
-El router del agente le adjunta en `meta` el paquete de memoria de su comunicación (el `thread_id`
-con el ILK del agente), cuando SY.cognition ya armó uno:
-
-- `thread_id`
-- `memory_package`
-
-Ese es el camino canónico para consumo cognitivo online en un `AI.*`. El orden de la comunicación
-lo lleva SY.cognition con el número de turno; el mensaje no trae una secuencia.
-
-### Lo que NO llega automáticamente
-
-Las entidades durables de cognition (threads, contexts, reasons, cooccurrences, scopes,
-scope_instances, memories, episodes) y el log de mensajes (`turns`) viven en SY.storage. Un nodo AI
-no las lee: hoy solo SY.cognition pide el estado de una comunicación (`COGNITION_STATE_GET`).
-
-### Qué hacer y qué no hacer
-
-- Usar `meta.memory_package` para enrichment conversacional normal.
-- Usar `meta.thread_id` como metadata conversacional.
-- Mantener state e immediate memory keyed por `src_ilk`.
-- No asumir acceso a las entidades de cognition.
-- No usar SHM (`jsr-memory`) como interfaz normal de nodo AI.
-- No usar PostgreSQL como superficie primaria para un nodo AI normal.
-
-## Function Calling
-
-El loop clásico sigue disponible:
+### The two factories
 
 ```rust
-use fluxbee_ai_sdk::{
-    FunctionCallingConfig, FunctionCallingRunner, FunctionToolRegistry,
-    OpenAiResponsesClient,
-};
+pub fn create_llm_client(
+    provider: AiProvider,
+    api_key: impl Into<String>,
+    base_url: Option<String>,
+    account: AiAccount,
+) -> Arc<dyn LlmClient>;
 
-let model = OpenAiResponsesClient::new(api_key).function_model(
-    "gpt-4.1-mini",
-    Some("You are a Fluxbee node.".to_string()),
-    Default::default(),
-);
-let tools = FunctionToolRegistry::new();
-let runner = FunctionCallingRunner::new(FunctionCallingConfig::default());
-
-let result = runner.run(&model, &tools, "hello").await?;
+pub fn create_function_calling_model(
+    provider: AiProvider,
+    api_key: impl Into<String>,
+    base_url: Option<String>,
+    model: impl Into<String>,
+    system: Option<String>,
+    model_settings: ModelSettings,
+    account: AiAccount,
+) -> Arc<dyn FunctionCallingModel>;
 ```
 
-## Immediate Memory
+- **The factories are the only way in.** Since 0.1.79 the provider clients are private to the SDK.
+- **`create_llm_client`** is the plain path: `LlmClient::generate(LlmRequest)`.
+- **`create_function_calling_model`** is the tool-loop path, run by `FunctionCallingRunner`.
+- **`account`** says who spends and who pays (see [Usage records](#usage-records-who-pays-for-each-call)).
+- **`base_url`:** pass `None` for the provider's own endpoint. When set, it is the full URL the
+  request is posted to: `https://api.openai.com/v1/responses` or `https://api.anthropic.com/v1/messages`.
+- **`ModelSettings { temperature, top_p, max_output_tokens }`:**
+  - leave `temperature` unset: current models reject it (gpt-5.5 and Claude 5, FINDINGS A-69);
+  - Anthropic needs a token limit on every request, so the SDK sends 4,096 when
+    `max_output_tokens` is unset; OpenAI uses the model's default;
+  - an answer cut at the limit is an error on the plain path of both providers and on Anthropic's
+    tool turns. An OpenAI tool turn does not check it yet; its usage record still says `truncated`.
 
-Para nodos que necesitan continuidad real entre turns, usar `run_with_input(...)` con `FunctionRunInput`.
-
-El bundle admite:
-
-- `summary`
-- `recent_interactions`
-- `active_operations`
-- `thread_id`
-- `scope_id`
-
-Semántica recomendada en v2:
-
-- `thread_id` describe continuidad conversacional/cognitiva
-- `scope_id` en runtimes AI suele mapear a `src_ilk`
-- la persistencia de memoria inmediata se resuelve por `src_ilk`, no por `thread_id`
-
-Ejemplo:
+### A tool loop
 
 ```rust
 use fluxbee_ai_sdk::{
-    ConversationSummary, FunctionCallingConfig, FunctionCallingRunner, FunctionRunInput,
-    FunctionToolRegistry, ImmediateConversationMemory, ImmediateInteraction,
-    ImmediateInteractionKind, ImmediateOperation, ImmediateRole, OpenAiResponsesClient,
+    create_function_calling_model, AiAccount, AiProvider, FunctionCallingConfig,
+    FunctionCallingRunner, FunctionToolRegistry, ModelSettings, TenantSource, UsageRecorder,
 };
 
-let model = OpenAiResponsesClient::new(api_key).function_model(
-    "gpt-4.1-mini",
+// Once per process, after the node joined its router (`dispatcher: Arc<RouterDispatcher>`).
+let usage = UsageRecorder::start(dispatcher.clone());
+
+// Per operation: this node spends and its own tenant pays.
+let account = AiAccount::charge(
+    usage.clone(),
+    "AI.sales@motherbee",
+    fluxbee_sdk::read_self_tenant_from_env(),
+    TenantSource::Node,
+)
+.with_node_ilk(fluxbee_sdk::read_self_ilk_from_env())
+.with_counterpart(msg.meta.src_ilk.clone())
+.with_trace(Some(msg.routing.trace_id.clone()))
+.with_thread(msg.meta.thread_id.clone());
+
+let model = create_function_calling_model(
+    AiProvider::OpenAi,
+    api_key, // from SY.vault
+    None,    // the provider's endpoint
+    "gpt-5.5",
     Some("You are a Fluxbee node.".to_string()),
-    Default::default(),
+    ModelSettings::default(),
+    account,
 );
 let tools = FunctionToolRegistry::new();
-let runner = FunctionCallingRunner::new(FunctionCallingConfig::default());
+let runner = FunctionCallingRunner::new(FunctionCallingConfig::default()); // max_turns: 8
+let result = runner.run(model.as_ref(), &tools, "hello").await?;
+let answer = result.final_assistant_text;
+```
+
+- A run that needs more than `max_turns` model turns ends in an error.
+- `result.tokens_used` sums what the provider reported over the run.
+- The runner cuts a text input at 1,200 characters. A longer input has to go as
+  `FunctionRunInput::current_user_parts`, which is sent as it is.
+
+### A plain call
+
+```rust
+use fluxbee_ai_sdk::{create_llm_client, AiProvider, LlmClient, LlmRequest};
+
+let llm = create_llm_client(AiProvider::OpenAi, api_key, None, account);
+let response = llm
+    .generate(LlmRequest {
+        model: "gpt-5.5".to_string(),
+        system: Some("Answer in one sentence.".to_string()),
+        input: "What is a hive?".to_string(),
+        input_parts: None,
+        output_schema: None,
+        max_output_tokens: None,
+        model_settings: None,
+    })
+    .await?;
+println!("{}", response.content);
+```
+
+`output_schema: Some(OutputSchemaSpec::new(name, schema, strict)?)` asks for structured JSON; the
+answer is checked against the schema.
+
+### Writing a tool
+
+```rust
+use std::sync::Arc;
+
+use async_trait::async_trait;
+use fluxbee_ai_sdk::{FunctionTool, FunctionToolDefinition, FunctionToolRegistry};
+use serde_json::{json, Value};
+
+struct HiveName;
+
+#[async_trait]
+impl FunctionTool for HiveName {
+    fn definition(&self) -> FunctionToolDefinition {
+        FunctionToolDefinition {
+            name: "hive_name".to_string(),
+            description: "The name of the hive this node runs on.".to_string(),
+            parameters_json_schema: json!({"type": "object", "properties": {}}),
+        }
+    }
+
+    async fn call(&self, _arguments: Value) -> fluxbee_ai_sdk::Result<Value> {
+        Ok(json!({"hive": "motherbee"}))
+    }
+}
+
+let mut tools = FunctionToolRegistry::new();
+tools.register(Arc::new(HiveName))?; // an empty or duplicate name is refused
+```
+
+- **Errors go back to the model.** A tool that returns `Err`, or a call to an unknown tool, becomes
+  a tool result with `is_error: true`, and the loop continues.
+- **Providers of several tools** implement `FunctionToolProvider`, as the thread-state tools do.
+
+### Testing without a provider
+
+- **`MockLlmClient`** implements `LlmClient` with queued responses (`with_responses`,
+  `push_response`, `take_requests`).
+- **For a tool loop**, implement `FunctionCallingModel` on a test type, as
+  `tests/immediate_memory.rs` does.
+- **An `AiAccount` on `UsageRecorder::disabled()`** records nothing.
+
+## Usage records: who pays for each call
+
+Every model call leaves a usage record charged to a tenant. The record goes to the node's router
+stream under `storage.usage`, and SY.storage keeps it in `llm_usage`
+([docs/router-stream-v1.md §7](../../docs/router-stream-v1.md)). That is why both factories require an
+`AiAccount`.
+
+- **`UsageRecorder::start(dispatcher)`:** call it once per process, inside the Tokio runtime, with the
+  node's `Arc<RouterDispatcher>`.
+  - A task appends each record with the dispatcher's current sender, so it follows reconnections.
+  - It holds up to 1,024 records (`USAGE_RECORDER_QUEUE`). Past that it drops them and counts the
+    drops (`stats()`).
+  - A failed append is logged in the node's journal. It is never returned to the caller.
+- **`UsageRecorder::disabled()`** records nothing: unit tests, and tools without a router.
+- **`AiAccount::charge(recorder, node_name, tenant, source)`:** `node_name` is the spending node's full
+  L2 name. `tenant` pays, for the reason `source` gives:
+
+  | `TenantSource` | Used by |
+  | --- | --- |
+  | `Node` | a tenant's node, paying its own tenant |
+  | `Agent` | SY.cognition, with the tenant of the communication's agent |
+  | `Case` | SY.frontdesk.gov, with the tenant of the case |
+  | `Root` | `AiAccount::root(recorder, node_name)`: SY.architect, SY.admin's executor |
+  | `FallbackRoot` | set by the SDK when `tenant` is `None` or empty: the root tenant pays |
+
+- **Builders:** `with_node_ilk`, `with_counterpart` (the ILK the call serves), `with_trace`,
+  `with_thread`, `with_work(UsageWork { .. })`. All are optional, and a blank value is left out.
+- **One account per operation:** its trace, thread and counterpart are those of the work the call
+  serves. Clone the recorder, not an old account.
+
+What is recorded:
+
+- **Every 2xx answer:** one record, queued before the answer is checked, because a truncated or
+  invalid answer still cost. Its `outcome` is `ok`, `truncated`, `refused` or `unreadable`.
+- **A call dropped while its request is outstanding** (a caller's timeout): `abandoned`, without
+  tokens.
+- **Non-2xx answers and transport errors:** no record. Of Anthropic's retries, only the attempt that
+  answered is recorded.
+- **The counts, normalized across providers:** `uncached_input`, `cache_read`, `cache_write`,
+  `output` (reasoning included), `reasoning` (OpenAI only), plus the provider's raw usage object.
+
+SY.storage checks every record. A node outside `SY.*` is charged to its own tenant as identity knows
+it, whatever the record claims; a record that claims another tenant is stored with the node's tenant
+and counted as a mismatch. For a node, the meaningful account is `TenantSource::Node` with its own
+tenant (`FLUXBEE_NODE_TENANT_ID`, read by `fluxbee_sdk::read_self_tenant_from_env()`).
+
+## Cognition: what reaches an AI node
+
+Cognition belongs to the communication: the thread between an interlocutor and the agent that serves
+it, `(thread_id, agent ILK)` ([docs/router-stream-v1.md §6](../../docs/router-stream-v1.md)).
+
+**On the message:**
+
+- **`meta.thread_id`:** the conversation's thread. ai.generic answers a `user` message without one
+  with an `invalid_payload` error.
+- **`meta.memory_package`:** set by the agent's router when it delivers a message with a `thread_id`
+  to an `AI.*` node and SY.cognition has already built the memory of that communication. The router
+  takes it from its hive's memory region, for each destination, and drops any package the sender put
+  in. ai.generic renders it as a text block in front of the user input.
+- **No sequence number:** SY.cognition keeps the order of a communication with its own turn count.
+
+**Not on the message:** the durable cognition entities (threads, contexts, reasons, cooccurrences,
+scopes, scope instances, memories, episodes) and the message log (`turns`) live in SY.storage. A node
+does not read them; only SY.cognition reads a communication's state back (`COGNITION_STATE_GET`).
+
+So, in an AI node:
+
+- use `meta.memory_package` for conversational context, and `meta.thread_id` as conversation
+  metadata;
+- keep hard state and immediate memory keyed by `src_ilk`;
+- do not read the memory region (`jsr-memory-<hive>`) or PostgreSQL.
+
+## Immediate memory
+
+For continuity between turns, call `run_with_input(...)` with a `FunctionRunInput`. Its
+`ImmediateConversationMemory` takes:
+
+- `summary` (a `ConversationSummary`);
+- `recent_interactions`;
+- `active_operations`;
+- `thread_id`, as conversation metadata;
+- `scope_id`, which in ai.generic is the sender's `src_ilk`.
+
+ai.generic stores immediate memory by `src_ilk`, not by `thread_id`, and only when
+`runtime.immediate_memory.enabled` is true in its config (off by default).
+
+```rust
+use fluxbee_ai_sdk::{
+    ConversationSummary, FunctionRunInput, ImmediateConversationMemory, ImmediateInteraction,
+    ImmediateInteractionKind, ImmediateOperation, ImmediateRole,
+};
 
 let input = FunctionRunInput {
-    current_user_message: "confirm the previous hive operation".to_string(),
     immediate_memory: Some(ImmediateConversationMemory {
-        thread_id: Some("thread:abc".to_string()),
-        scope_id: None,
+        thread_id: msg.meta.thread_id.clone(),
+        scope_id: msg.meta.src_ilk.clone(),
         summary: Some(ConversationSummary {
-            goal: Some("Provision worker-220".to_string()),
-            current_focus: Some("Review add_hive result".to_string()),
-            decisions: vec!["Mutations require explicit CONFIRM".to_string()],
+            goal: Some("Provision worker1".to_string()),
+            current_focus: Some("Review the add_hive result".to_string()),
+            decisions: vec!["Mutations require an explicit CONFIRM".to_string()],
             confirmed_facts: vec![],
             open_questions: vec!["Whether add_hive already completed".to_string()],
         }),
@@ -120,7 +286,7 @@ let input = FunctionRunInput {
             ImmediateInteraction {
                 role: ImmediateRole::User,
                 kind: ImmediateInteractionKind::Text,
-                content: "create hive worker-220".to_string(),
+                content: "create hive worker1".to_string(),
             },
             ImmediateInteraction {
                 role: ImmediateRole::Assistant,
@@ -130,80 +296,107 @@ let input = FunctionRunInput {
         ],
         active_operations: vec![ImmediateOperation {
             operation_id: "op-1".to_string(),
-            resource_scope: Some("hive:worker-220".to_string()),
-            origin_thread_id: Some("thread:abc".to_string()),
-            origin_session_id: Some("session-1".to_string()),
+            resource_scope: Some("hive:worker1".to_string()),
+            origin_thread_id: msg.meta.thread_id.clone(),
+            origin_session_id: None,
             scope_id: None,
             action: "add_hive".to_string(),
-            target: Some("worker-220".to_string()),
+            target: Some("worker1".to_string()),
             status: "timeout_unknown".to_string(),
             summary: "Inspect before retrying".to_string(),
             created_at_ms: None,
             updated_at_ms: None,
         }],
     }),
+    ..FunctionRunInput::new("confirm the previous hive operation")
 };
 
-let result = runner.run_with_input(&model, &tools, input).await?;
+let result = runner.run_with_input(model.as_ref(), &tools, input).await?;
 ```
 
-El SDK serializa esa memoria en este orden:
+The runner sends, in this order:
 
-1. system prompt
-2. conversation summary
-3. recent interactions
-4. active operations
-5. current user message
+1. the system prompt (the model's `system`);
+2. the conversation summary;
+3. the recent interactions: the last 10, each cut at 1,200 characters;
+4. the active operations: up to 8, open ones first;
+5. the current input: `current_user_parts` when set, as they are; else `current_user_message`, cut
+   at 1,200 characters like the interactions.
 
-## Summary Refresh Helper
+### Refreshing the summary
 
-El summary sigue siendo estado del caller. El SDK no lo refresca automáticamente en cada turn.
-
-Para nodos que quieran actualizarlo explícitamente, usar:
+The summary is the caller's state. The SDK does not refresh it on every turn. To refresh it
+explicitly:
 
 ```rust
-use fluxbee_ai_sdk::{
-    refresh_conversation_summary, SummaryRefreshConfig, SummaryRefreshInput,
-};
+use fluxbee_ai_sdk::{refresh_conversation_summary, SummaryRefreshConfig, SummaryRefreshInput};
 
+let llm = create_llm_client(AiProvider::OpenAi, api_key, None, account);
 let refreshed = refresh_conversation_summary(
     llm.as_ref(),
     SummaryRefreshConfig {
-        model: "gpt-4.1-mini".to_string(),
+        model: "gpt-5.5".to_string(),
         system_prompt: None,
         model_settings: None,
     },
     SummaryRefreshInput {
-        thread_id: Some("thread:abc".to_string()),
-        scope_id: None,
+        thread_id: msg.meta.thread_id.clone(),
+        scope_id: msg.meta.src_ilk.clone(),
         existing_summary: current_summary,
         recent_interactions,
         active_operations,
     },
-).await?;
+)
+.await?;
 ```
 
-Ese helper:
+The helper:
 
-- usa el LLM normal del SDK
-- pide salida JSON estricta
-- toma `existing_summary + recent_interactions + active_operations`
-- devuelve un `ConversationSummary` normalizado
+- makes one plain call, which leaves its usage record like any other;
+- asks for strict JSON;
+- reads `existing_summary`, the recent interactions (up to 12) and the active operations (up to 8);
+- returns a normalized `ConversationSummary`.
 
-## Current V1 Guidance
+It does no advanced semantic compression; that belongs to cognition.
 
-Para `AI.*` y `SY.architect`, la recomendación v1 es:
+## Thread-state tools
 
-- mandar los últimos `8-12` mensajes recientes
-- preservar errores/tool failures recientes
-- incluir operaciones activas o ambiguas
-- usar el helper de refresh solo cuando el caller decida actualizar el summary
+`ThreadStateToolsProvider` registers `thread_state_get`, `thread_state_put` and
+`thread_state_delete` over a `ThreadStateStore` (`LanceDbThreadStateStore`).
 
-Compat/migración:
+- **The key is `state_key`.** A call that passes the legacy `thread_id` argument is refused.
+- **In a scoped runtime the key is fixed.** ai.generic builds the provider with
+  `with_get_put_delete_scoped(store, src_ilk)`, so its tools always read and write the sender's
+  state, whatever key the model passes.
 
-- los replies nuevos del AI SDK ya no deben reemitir `ctx`, `ctx_seq`, `ctx_window` ni `memory_package`
-- los runtimes AI siguen leyendo `thread_id` y `src_ilk` desde `meta` top-level
-- los nodos AI del repo ya no deben depender de `meta.context.thread_id` ni `meta.context.src_ilk`
-- los thread-state tools del SDK aceptan solo `state_key`; si llega `thread_id` como alias legacy, la tool lo rechaza explícitamente
+## Writing an AI node
 
-No hace compresión semántica avanzada. Esa capa queda para sistemas cognitivos posteriores.
+- **Implement `AiNode`:** `on_message(&self, msg) -> Result<Option<Message>>`. Return the reply built
+  with `build_reply_message_runtime_src(&msg, payload)`; the runtime fills in `routing.src`.
+- **Run it:** `NodeRuntime::new(dispatcher, node).run_with_config(RuntimeConfig::default())`.
+  - The runtime drains the dispatcher's `AI_RUNTIME_CHANNEL` (`"incoming"`). Declare that channel in
+    the dispatcher's profile:
+    `.command_channel(AI_RUNTIME_CHANNEL).post_pending_rule(RouteMatch::Any, RouteTarget::Command(AI_RUNTIME_CHANNEL))`.
+  - `RuntimeConfig::default()` gives 60 s per message, 4 workers and a queue of 128.
+  - A recoverable error, a handler timeout included, runs the message again, up to 3 attempts. A
+    slow model call can therefore cost up to three runs.
+- **A reply goes from the agent to whoever spoke:**
+  - its `dst_ilk` is the incoming `src_ilk`;
+  - its `src_ilk` is the agent's own ILK (`RuntimeConfig::self_ilk_id`, read from
+    `FLUXBEE_NODE_ILK_ID` by default), never the human's;
+  - it keeps `thread_id` and drops `memory_package`.
+- **Input and output helpers:**
+  - `resolve_model_input_from_payload_with_options` reads a `text/v1` payload, its `content_ref` and
+    its attachments;
+  - `build_model_user_content_parts` turns them into text, image and document parts;
+  - `build_text_response` and `build_ai_behavior_response` build the reply payload, with artifacts.
+
+## References
+
+- [`fluxbee-sdk`](../fluxbee_sdk/README.md): connecting a node, the protocol, blobs, the admin
+  gateway.
+- [docs/router-stream-v1.md](../../docs/router-stream-v1.md): §6 cognition per communication, §7
+  usage records.
+- [docs/immediate-conversation-memory-spec.md](../../docs/immediate-conversation-memory-spec.md).
+- [docs/ai-nodes-deploy-runbook.md](../../docs/ai-nodes-deploy-runbook.md): running an `ai.generic`
+  node.

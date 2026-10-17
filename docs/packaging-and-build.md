@@ -221,7 +221,8 @@ tenant.
 Postgres ya está resuelto por el firstboot. Lo demás es del operador:
 
 ```bash
-# Key de proveedor AI (la usan architect, admin, cognition, frontdesk y todo nodo AI.*):
+# Key de proveedor AI del core (la usan architect, admin, cognition y frontdesk). Un nodo AI.* no
+# la usa: lee la key general de su propio tenant (sin caída al raíz desde 0.1.66).
 curl -sS -X POST http://127.0.0.1:8080/hives/motherbee/vault/secrets \
   -H 'content-type: application/json' \
   -d '{"key":"openai_root_pool","value":{"api_key":"sk-..."},"metadata":{"tenant_id":"tnt:00000000-0000-0000-0000-000000000001","resource_type":"openai"}}'

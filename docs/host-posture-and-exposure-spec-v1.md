@@ -63,7 +63,7 @@ the public reach an installation from outside:
 - A-55: the egress' SSH door (D31) must close before the first customer install.
 
 **Related:** `io-web-spec-beta-v1.md`, `edge-ingress-spec-v6.md`, `edge-egress-nat-spec.md`,
-`fc-edge-manager-spec.md`, `edge-control-protocol-v2.md`, `io-cloud-spec-v1.md`,
+`fc-edge-manager-spec.md`, `edge-control-protocol-v2.md`, `io-cloud-api.md`,
 `lab/logbook/HANDBOOK.md` §8.
 
 ---
@@ -369,7 +369,7 @@ in `base-nodes.json` yet; only the SDK's root-tenant allowlist names it. The bet
 - uses `<52-char key>.apps.<domain>` hosts;
 - plans a unit, a `system_nodes` entry and a `web:` block, which predate the packaging model.
 
-`io-cloud-spec-v1.md:372`'s per-tenant `IO.archi` is superseded (D10).
+`history/io-cloud-spec-v1.md`'s per-tenant `IO.archi` is superseded (D10).
 
 **io.linkedhelper.** In the base set with `boot:false`. When instantiated it serves plain HTTP on a
 configured address (schema example `0.0.0.0:19091`), and Cloud and its adapter reach it directly.

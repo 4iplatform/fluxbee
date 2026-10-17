@@ -1,3 +1,6 @@
+> **History (archived 2026-10-17).** The design of IO.cloud's first version. The live contract is
+> `docs/io-cloud-api.md`; where they differ, the API doc and the code hold.
+
 # IO.cloud — spec v1 (el representante interno de Fluxbee Cloud)
 
 > **Para el equipo de Fluxbee Cloud, la referencia operativa es

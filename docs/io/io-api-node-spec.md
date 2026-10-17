@@ -4,7 +4,7 @@
 
 **Updated:** 2026-07-19
 
-**Related:** `edge-ingress-spec-v6.md`, `io-blob-spec-v1.md`, `io-cloud-spec-v1.md`
+**Related:** `edge-ingress-spec-v6.md`, `io-blob-spec-v1.md`, `io-cloud-api.md`
 
 ## 1. Purpose
 
@@ -220,9 +220,10 @@ remain Edge 502/504.
 }
 ```
 
-`explicit_subject by_ilk` replaces subject data with an `ilk`. IO.api lists Identity ILKs and
-requires an exact `(ilk_id, instance tenant_id)` match. Unknown and cross-tenant ILKs return the
-same `subject_not_found` error.
+`explicit_subject by_ilk` replaces subject data with an `ilk`. IO.api accepts an ILK its
+instance's tenant knows: one charged to that tenant, or one holding a channel in the tenant's scope
+(someone who wrote to one of its IO nodes; `docs/ilk-tenant-model-v1.md` §2.3, D12). Any other ILK,
+unknown or not, returns the same `subject_not_found` error.
 
 Prohibited request authority fields:
 
