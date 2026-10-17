@@ -12,7 +12,7 @@
       "artifact_kind": "runtime_package",
       "artifact": {
         "files": {
-          "package.json": "{\"name\":\"ai.example\",\"version\":\"0.1.0\",\"type\":\"config_only\",\"runtime_base\":\"AI.common\"}",
+          "package.json": "{\"name\":\"ai.example\",\"version\":\"0.1.0\",\"type\":\"config_only\",\"runtime_base\":\"ai.generic\"}",
           "config/default-config.json": "{\"tenant_id\":\"tnt:example\",\"language\":\"es\"}",
           "prompts/system.txt": "You are an AI assistant specialized in..."
         }

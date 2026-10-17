@@ -2,6 +2,7 @@ package wfcel
 
 import (
 	"context"
+	"fmt"
 	"log"
 
 	"github.com/google/cel-go/cel"
@@ -31,6 +32,13 @@ func EvalGuard(program cel.Program, input, state, event map[string]any) bool {
 	}
 	ch := make(chan result, 1)
 	go func() {
+		// A panic anywhere in the (now wider — json_parse/ext.Strings) eval surface must NOT crash the
+		// node: convert it to a guard error so the guard evaluates false.
+		defer func() {
+			if p := recover(); p != nil {
+				ch <- result{nil, fmt.Errorf("guard eval panicked: %v", p)}
+			}
+		}()
 		val, _, err := program.Eval(map[string]any{
 			"input": input,
 			"state": state,

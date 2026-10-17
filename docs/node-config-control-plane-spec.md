@@ -10,9 +10,9 @@ Define one common control-plane contract for node runtime configuration without 
 This spec does **not** replace the current orchestrator-owned per-node config path:
 - `set_node_config`
 - `NODE_CONFIG_SET`
-- `CONFIG_CHANGED`
 
 That path remains unchanged and is responsible for infrastructure/bootstrap config persistence.
+(It used to end with a `CONFIG_CHANGED` to the node; removed in 0.1.45, no node acted on it.)
 
 This spec defines a second, node-facing contract for runtime/business configuration:
 - `CONFIG_GET`
@@ -51,7 +51,7 @@ Transport is always:
 
 Routing baseline:
 
-- `routing.dst`: fully-qualified node name, for example `AI.chat@motherbee`
+- `routing.dst`: fully-qualified node name, for example `AI.sales@motherbee`
 - `routing.ttl`: default `16`
 - `routing.trace_id`: caller-assigned trace id
 
@@ -86,7 +86,7 @@ Minimal request:
 ```json
 {
   "routing": {
-    "dst": "AI.chat@motherbee",
+    "dst": "AI.sales@motherbee",
     "ttl": 16,
     "trace_id": "9d8c6f4b-2f4d-4ad4-b5f4-8d8d9d9d0001"
   },
@@ -95,7 +95,7 @@ Minimal request:
     "msg": "CONFIG_GET"
   },
   "payload": {
-    "node_name": "AI.chat@motherbee"
+    "node_name": "AI.sales@motherbee"
   }
 }
 ```
@@ -107,7 +107,7 @@ Minimal request:
 ```json
 {
   "routing": {
-    "dst": "AI.chat@motherbee",
+    "dst": "AI.sales@motherbee",
     "ttl": 16,
     "trace_id": "9d8c6f4b-2f4d-4ad4-b5f4-8d8d9d9d0002"
   },
@@ -116,7 +116,7 @@ Minimal request:
     "msg": "CONFIG_SET"
   },
   "payload": {
-    "node_name": "AI.chat@motherbee",
+    "node_name": "AI.sales@motherbee",
     "config_version": 8,
     "apply_mode": "replace",
     "config": {}
@@ -200,23 +200,21 @@ Example:
 ```json
 {
   "ok": true,
-  "node_name": "AI.chat@motherbee",
+  "node_name": "AI.sales@motherbee",
   "config_version": 6,
   "state": "configured",
   "config": {
     "behavior": {
       "kind": "ai_chat",
-      "vault_key": "ai/chat",
       "model": "gpt-5.5"
     }
   },
     "contract": {
       "node_family": "AI",
-      "node_kind": "AI.common",
+      "node_kind": "AI.generic",
       "supports": ["CONFIG_GET", "CONFIG_SET"],
       "required_fields": [
         "behavior.kind",
-        "behavior.vault_key",
         "behavior.model"
       ],
       "field_values": {
@@ -242,14 +240,13 @@ Example:
         "config": {
           "behavior": {
             "kind": "ai_chat",
-            "vault_key": "ai/chat",
             "model": "gpt-5.5"
           }
         }
       }
     ],
     "notes": [
-      "The Vault key selects access/provider; behavior.model selects the model.",
+      "The provider is the hive's (hive.yaml ai); its key is read from SY.vault by resource_type. behavior.model selects the model.",
       "CONFIG_SET may override in-memory behavior depending on node implementation."
     ]
   }
@@ -283,7 +280,7 @@ Example success:
 ```json
 {
   "ok": true,
-  "node_name": "AI.chat@motherbee",
+  "node_name": "AI.sales@motherbee",
   "config_version": 7,
   "state": "configured"
 }
@@ -294,7 +291,7 @@ Example error:
 ```json
 {
   "ok": false,
-  "node_name": "AI.chat@motherbee",
+  "node_name": "AI.sales@motherbee",
   "config_version": 7,
   "state": "failed_config",
   "error": {
@@ -358,7 +355,6 @@ This contract is intentionally separate from:
 
 - `PUT /hives/{hive}/nodes/{node_name}/config`
 - orchestrator `config.json`
-- `CONFIG_CHANGED`
 
 Recommended mental model:
 

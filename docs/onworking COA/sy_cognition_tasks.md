@@ -503,11 +503,12 @@ Estado actual:
 - `SY.cognition` ya emite:
   - `storage.cognition.memories`
   - `storage.cognition.episodes`
-- la memoria v1 es narrativa determinística por `scope`
-- el gate de episodios es conservador y solo abre con combinaciones fuertes de:
+- hay una memoria por `scope`; su texto (`summary`) lo escribe el summarizer narrativo AI (`COG-M11-T6`). Desde 0.1.52 (2026-10-02) no queda texto determinístico de memories ni de episodios: si el summarizer falla, el turno no actualiza memories ni episodios
+- el gate de episodios sigue determinístico y conservador; solo abre con combinaciones fuertes de:
   - `frustration + challenge/resolve`
   - `escalation + protect/challenge`
   - `urgency + request + resolve`
+- del gate salen `affect_id`, título, intensidad y evidencia; el `summary` y el `reason` del episodio los escribe el summarizer AI, que tiene que devolverlos siempre que hay candidato (si no, la respuesta cuenta como inválida)
 
 ### Fase COG-M8 - SHM nueva + enrichment del router
 
@@ -577,11 +578,13 @@ Estado actual:
   - `SY.cognition` ya no intenta volcar todo el universo de threads a SHM
   - `jsr-memory` se construye como hot set bounded por `MEMORY_MAX_DATA_SIZE`
   - prioridad de selección actual:
+    - el thread que acaba de actualizar el turno en curso: nunca es el que se poda
+    - recencia por `last_seen_at`
     - threads con `active_scope`
     - mayor cantidad de entidades vivas (`contexts/reasons/cooccurrences` abiertos + memories/episodes)
-    - recencia por `last_seen_at`
     - `latest_thread_seq`
     - `turn_count`
+  - hasta 2026-10-02 las entidades vivas iban antes que la recencia: con la región llena, un thread nuevo se podaba justo después de su turno y arrancaba de cero, con un scope nuevo en storage, en cada turno
   - si un thread no entra por capacidad, se poda del snapshot SHM y queda fuera del hot set
   - el rebuild de startup desde durable ya no rehidrata todo el hive en memoria: primero calcula ese mismo hot set y luego solo restaura esos threads
   - el estado operativo ahora expone métricas de SHM (`hot_threads_total`, `pruned_threads_total`, `payload_bytes`, `last_sync_status`)
@@ -741,8 +744,9 @@ Definición de alcance:
     - canonicalización backend de aliases/sinónimos antes del filtro cerrado de 8 señales
 - [x] COG-M11-T5. Usar `reason_signals_extra` como evidencia narrativa real para memory fusion, no solo como bolsa de strings.
   - implementación actual:
-    - `reason_signals_extra` ya alimenta el summary de memories mediante cláusulas narrativas explícitas
-    - `reason_signals_extra` también refuerza `summary` y `reason` de episodios, no solo el trigger/gate
+    - `reason_signals_extra` entra al summarizer narrativo AI como evidencia (`reason.extra_signals`); de ahí salen el `summary` de la memoria y el `summary`/`reason` del episodio
+    - en el gate de episodios, `frustration`, `escalation` y `urgency` siguen siendo parte de las combinaciones que lo abren
+    - las cláusulas narrativas determinísticas ("Narrative evidence includes …") y `summarize_scope_memory` se borraron en 0.1.52 (2026-10-02): el texto de memories y episodios es solo el del AI
     - el esquema durable no cambia; la mejora vive en la síntesis narrativa del contenido
 - [x] COG-M11-T6. Introducir summarizer narrativo v2 para memories/episodes:
   - resumen más fiel del contenido del thread

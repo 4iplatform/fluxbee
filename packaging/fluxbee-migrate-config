@@ -1,0 +1,48 @@
+#!/bin/sh
+# fluxbee-migrate-config [hive.yaml]: fixes, in an EXISTING hive.yaml, a value this package used to
+# ship wrong. The postinst runs it on every install; it is idempotent.
+#
+# Packages up to 0.1.56 shipped `architect.listen: "0.0.0.0:3000"`, and Archi's HTTP API has no
+# authentication (FINDINGS A-46). The postinst seeds hive.yaml only when it is missing, so fixing
+# the example never reached installed hosts. Only that exact value under `architect:` is moved to
+# loopback; any other value is the operator's and is left alone (the orchestrator reports a
+# non-loopback bind as drift).
+#
+# Never fails the install: any error is reported and the file is left as it was.
+set -u
+
+f="${1:-/etc/fluxbee/hive.yaml}"
+[ -f "$f" ] || exit 0
+# A symlinked hive.yaml is fixed at its target; replacing the link itself would leave the target
+# on 0.0.0.0.
+f="$(readlink -f "$f")" || exit 0
+
+tmp="$(mktemp "${f}.migrate.XXXXXX")" || { echo "fluxbee-migrate-config: cannot create a temp file next to $f" >&2; exit 0; }
+trap 'rm -f "$tmp"' EXIT
+# The copy carries mode and owner over; awk then rewrites its content in place.
+cp -p "$f" "$tmp" 2>/dev/null || true
+
+# A top-level key (a line starting with neither a blank nor '#') opens or closes the architect
+# block; comment lines never do. `\r?` accepts a file saved with CRLF line endings.
+if ! awk '
+    /^[^ \t#]/ { in_arch = ($0 ~ /^architect:[ \t]*(#.*)?\r?$/) }
+    in_arch && /^[ \t]+listen:[ \t]*"0\.0\.0\.0:3000"[ \t]*(#.*)?\r?$/ {
+        sub(/"0\.0\.0\.0:3000"/, "\"127.0.0.1:3000\"")
+    }
+    { print }
+' "$f" > "$tmp"; then
+    echo "fluxbee-migrate-config: could not read $f; left unchanged" >&2
+    exit 0
+fi
+
+if cmp -s "$f" "$tmp"; then
+    exit 0
+fi
+
+if mv "$tmp" "$f"; then
+    trap - EXIT
+    echo "fluxbee: $f architect.listen moved from 0.0.0.0:3000 to 127.0.0.1:3000 (Archi has no authentication; FINDINGS A-46)"
+else
+    echo "fluxbee-migrate-config: could not replace $f; left unchanged" >&2
+fi
+exit 0

@@ -18,6 +18,8 @@ type CompileRequest struct {
 	Version      uint64 `json:"version,omitempty"`
 	AutoSpawn    bool   `json:"auto_spawn,omitempty"`
 	TenantID     string `json:"tenant_id,omitempty"`
+	// LaunchedBy is who asked for the deploy, stamped by SY.admin (operator, archi).
+	LaunchedBy string `json:"launched_by,omitempty"`
 }
 
 type GetWorkflowRequest struct {
@@ -44,17 +46,6 @@ type WfRulesMetadata struct {
 	StateCount      int    `json:"state_count"`
 	ActionCount     int    `json:"action_count"`
 	ErrorDetail     string `json:"error_detail"`
-}
-
-type WFConfigChangedPayload struct {
-	Subsystem    string `json:"subsystem"`
-	Action       string `json:"action"`
-	WorkflowName string `json:"workflow_name"`
-	AutoApply    *bool  `json:"auto_apply,omitempty"`
-	AutoSpawn    bool   `json:"auto_spawn,omitempty"`
-	Version      uint64 `json:"version,omitempty"`
-	TenantID     string `json:"tenant_id,omitempty"`
-	Definition   any    `json:"definition,omitempty"`
 }
 
 type WfRulesError struct {

@@ -1,8 +1,9 @@
 #!/bin/sh
 # fluxbee .deb postinst: system user, dirs, units. A fresh install does NOT start
 # services: `fluxbee-firstboot` owns that transition after provisioning secrets.
-# During an upgrade, prerm stopped the old processes, so start the orchestrator
-# and the motherbee singleton nodes again after the new binaries and units are installed.
+# During an upgrade the prerm stopped the dist manifest's writers (sy-orchestrator, sy-admin,
+# sy-wf-rules) and left the rest serving on the old binaries; starting the orchestrator brings the
+# writers back and its boot restarts every service that runs a replaced binary (FINDINGS A-45).
 set -e
 
 if ! getent passwd fluxbee >/dev/null 2>&1; then
@@ -14,35 +15,71 @@ install -d /etc/fluxbee
 install -d -m 0700 /var/lib/fluxbee/ssh
 install -d -m 0700 /var/lib/fluxbee/tls
 for d in state/nodes state/cookbook state/sy-admin state/sy-edge hives opa/current opa/staged opa/backup \
-         wf-rules modules blob blob/public state/io-blob syncthing nats \
-         dist/runtimes dist/vendor; do
+         wf-rules modules blob blob/public state/io-blob syncthing \
+         dist/runtimes dist/vendor dist/policy; do
     install -d "/var/lib/fluxbee/$d"
 done
+
+# U-3: register this package's base runtimes into the LIVE dist manifest (merge, never replace).
+# Runs BEFORE the orchestrator starts so it never observes a manifest without its base runtimes. There is no race: the prerm
+# stopped the manifest's writers (sy-orchestrator, sy-admin, sy-wf-rules), so nothing writes it
+# right now.
+# dpkg just replaced the core binaries in /usr/bin, so any core-installed.json left over from a
+# mesh `update` or a `core_rollback` now describes a build that is no longer there. Drop it:
+# absent means "whatever dist says", which is exactly true right after a package install, and a
+# stale record would make /versions report drift that does not exist (versions_comparison
+# deliberately prefers `installed` over the dist hash).
+rm -f /var/lib/fluxbee/orchestrator/core-installed.json
+
+seed_rc=0
+if [ -x /usr/share/fluxbee/fluxbee-seed-runtimes ]; then
+    /usr/share/fluxbee/fluxbee-seed-runtimes || seed_rc=$?
+else
+    echo "fluxbee: ERROR /usr/share/fluxbee/fluxbee-seed-runtimes missing; base runtimes are NOT registered" >&2
+    seed_rc=1
+fi
+
 install -d /run/fluxbee/routers
-chown -R fluxbee:fluxbee \
-    /var/lib/fluxbee/syncthing \
-    /var/lib/fluxbee/blob \
-    /var/lib/fluxbee/dist 2>/dev/null || true
+# No recursive chown here. The orchestrator sets the owners at every start: dist (A-51), blob/ and
+# its folders (A-56), the Syncthing home (A-58). The nodes give each blob the owner of the folder
+# it lands in. A chown -R at each install used to hide blobs that root wrote and Syncthing could
+# not read.
 
 # Seed a config if none exists yet (the operator edits this before first-boot).
 if [ ! -f /etc/fluxbee/hive.yaml ] && [ -f /etc/fluxbee/hive.yaml.example ]; then
     cp /etc/fluxbee/hive.yaml.example /etc/fluxbee/hive.yaml
 fi
 
+# An existing hive.yaml keeps whatever an older package seeded into it. Fix the values those
+# packages shipped wrong (A-46: Archi on 0.0.0.0) BEFORE the orchestrator starts: its boot
+# restarts sy-architect, which still runs the old binary, and it must come back on loopback.
+if [ -x /usr/share/fluxbee/fluxbee-migrate-config ]; then
+    /usr/share/fluxbee/fluxbee-migrate-config /etc/fluxbee/hive.yaml || true
+fi
+
 if [ -d /run/systemd/system ]; then
     systemctl daemon-reload || true
     systemctl enable sy-orchestrator.service >/dev/null 2>&1 || true
-    # IO.cloud singleton: enabled everywhere but self-limited to role: motherbee via the
-    # unit's ExecCondition, so it only ever runs on the motherbee. Restart=always lets it
-    # wait out the mesh coming up (rt-gateway/identity/admin) after first-boot.
-    systemctl enable io-cloud.service >/dev/null 2>&1 || true
-    systemctl enable io-blob.service >/dev/null 2>&1 || true
+    # IO.cloud and IO.blob are managed runtimes now (no systemd unit): the orchestrator spawns
+    # them from their config.json. A FRESH install spawns them via fluxbee-firstboot's
+    # boot_runtimes; an EXISTING-hive upgrade must run_node them once (they have no config.json
+    # yet, so bootstrap_local's reconcile won't relaunch them) — that one-time migration is an
+    # operator step, same as adding any new boot=true runtime to a running hive.
     if [ -n "${2:-}" ]; then
         systemctl start sy-orchestrator.service >/dev/null 2>&1 || true
-        systemctl start io-cloud.service >/dev/null 2>&1 || true
-        systemctl start io-blob.service >/dev/null 2>&1 || true
     fi
 fi
 
 echo "fluxbee installed. Edit /etc/fluxbee/hive.yaml, then run:  sudo fluxbee-firstboot"
+
+# Report the seed failure LAST. The box must still come up (never leave it half-installed and
+# stopped), so the services above were enabled and started regardless; exiting non-zero here
+# makes `dpkg --configure -a` retry the idempotent seed.
+if [ "$seed_rc" -ne 0 ]; then
+    echo "fluxbee: base runtime registration FAILED — base nodes will report RUNTIME_NOT_AVAILABLE." >&2
+    echo "  repair:  sudo fluxbee-seed-runtimes && sudo systemctl restart sy-orchestrator" >&2
+    echo "  or:      sudo dpkg --configure -a" >&2
+    exit "$seed_rc"
+fi
+
 exit 0

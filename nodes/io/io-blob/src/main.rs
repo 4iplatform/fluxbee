@@ -6,31 +6,60 @@
 //! producer, resolves publication ownership, and then sends one of the bounded worker commands
 //! handled here. The worker validates a `BlobRef`, copies its bytes to `public/<full-sha256>`, and
 //! maintains an idempotent publication/refcount ledger.
+//!
+//! Configuration model: io.blob is a FIRST-CLASS MANAGED IO NODE like io.api/io.slack. Its tunables
+//! (`max_bytes`, `admin_hive`) come from the managed CONFIG_SET/GET control plane, NOT from ENV. The
+//! blob roots and ledger path are FIXED design paths (node defaults, dirs created at install). A
+//! curator with no operator config is VALID and runs on defaults (it is not `FAILED_CONFIG`).
 
 use std::collections::{BTreeMap, HashSet};
 use std::fs::{self, OpenOptions};
 use std::io::Write;
-use std::os::fd::RawFd;
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use fluxbee_sdk::blob::{BlobConfig, BlobError, BlobRef, BlobToolkit, BLOB_DEFAULT_MAX_BYTES};
+use fluxbee_sdk::blob::{
+    safe_fs, BlobConfig, BlobError, BlobRef, BlobToolkit, BLOB_DEFAULT_MAX_BYTES,
+};
 use fluxbee_sdk::protocol::{
     Destination, Message, Meta, Routing, MSG_BLOB_CURATE, MSG_BLOB_CURATE_RESPONSE,
     MSG_BLOB_RELEASE, MSG_BLOB_RELEASE_RESPONSE, MSG_BLOB_STATUS_GET, MSG_BLOB_STATUS_GET_RESPONSE,
-    MSG_NODE_STATUS_GET, SYSTEM_KIND,
+    MSG_CONFIG_GET, MSG_CONFIG_SET, MSG_NODE_STATUS_GET, SYSTEM_KIND,
 };
 use fluxbee_sdk::{
-    managed_node_name, try_handle_default_node_status, NodeConfig, NodeSender, NodeUuidMode,
-    OperationalRouteProfile, RouteMatch, RouteTarget, RouterDispatcher,
+    managed_node_config_path, try_handle_default_node_status, NodeConfig, NodeSender, NodeUuidMode,
+    OperationalRouteProfile, RouteMatch, RouteTarget, RouterDispatcher, FLUXBEE_NODE_NAME_ENV,
 };
-use nix::fcntl::{open, OFlag};
-use nix::sys::stat::{fstat, Mode, SFlag};
-use nix::unistd::{close, read};
+use io_common::io_adapter_config::{
+    apply_adapter_config_replace, build_io_adapter_contract_payload, IoAdapterConfigContract,
+};
+use io_common::io_blob_adapter_config::{
+    configured_admin_hive, configured_max_bytes, IoBlobAdapterConfigContract,
+};
+use io_common::io_control_plane::{
+    build_io_config_get_response_payload, build_io_config_response_message,
+    build_io_config_set_error_payload, build_io_config_set_ok_payload,
+    ensure_config_version_advances, parse_and_validate_io_control_plane_request, IoConfigSource,
+    IoControlPlaneErrorInfo, IoControlPlaneRequest, IoControlPlaneState, IoNodeLifecycleState,
+};
+use io_common::io_control_plane_bootstrap::bootstrap_io_control_plane_state;
+use io_common::io_control_plane_logging::{
+    log_config_get_served, log_config_set_applied, log_config_set_persist_error,
+    log_config_set_stale_rejected, log_control_plane_request_rejected,
+};
+use io_common::io_control_plane_metrics::IoControlPlaneMetrics;
+use io_common::io_control_plane_store::persist_io_control_plane_state;
+use nix::errno::Errno;
+use nix::fcntl::AtFlags;
+use nix::sys::stat::{fstat, SFlag};
+use nix::unistd::{linkat, unlinkat, UnlinkatFlags};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
+use std::os::fd::AsRawFd;
+use tokio::sync::{Mutex, RwLock};
 use tracing_subscriber::EnvFilter;
 use uuid::Uuid;
 
@@ -38,26 +67,90 @@ type DynError = Box<dyn std::error::Error + Send + Sync>;
 
 const RPC_CH_CONTROL: &str = "control";
 const LEDGER_SCHEMA_VERSION: u32 = 1;
+// Rutas FIJAS de diseño del sistema: NO son config de operador ni ENV. Los dirs se crean al
+// instalar; el nodo solo usa estas rutas (con `ensure_dir` como red de seguridad en boot).
 const DEFAULT_BLOB_ROOT: &str = "/var/lib/fluxbee/blob";
+const DEFAULT_PUBLIC_ROOT: &str = "/var/lib/fluxbee/blob/public";
 const DEFAULT_LEDGER_PATH: &str = "/var/lib/fluxbee/state/io-blob/publications.json";
 
+/// Infra de arranque leida del managed spawn (env inyectado por el runtime / `_system` de
+/// `config.json`), NO los tunables de operador. Los tunables (`max_bytes`, `admin_hive`) viven en el
+/// plano de control (`RuntimeState.control_plane`).
 #[derive(Debug, Clone)]
-struct WorkerConfig {
-    node: NodeConfig,
-    admin_hive: Option<String>,
-    blob_root: PathBuf,
-    public_root: PathBuf,
-    ledger_path: PathBuf,
-    max_bytes: u64,
+struct Config {
+    node_name: String,
+    node_version: String,
+    router_socket: PathBuf,
+    uuid_persistence_dir: PathBuf,
+    config_dir: PathBuf,
+    orchestrator_target: String,
+}
+
+impl Config {
+    /// Carga la infra al estilo io.api: env primero, luego el `node`/`_system` del spawn `config.json`,
+    /// luego el default. A diferencia de io.api, la lectura del spawn doc es TOLERANTE: un io.blob sin
+    /// `config.json` (o con uno ilegible) es un curador valido con defaults, no un arranque abortado —
+    /// el plano de control clasifica por separado una config corrupta como FAILED_CONFIG.
+    fn load() -> Result<Self, DynError> {
+        let node_name = env(FLUXBEE_NODE_NAME_ENV).ok_or_else(|| {
+            format!("missing required env {FLUXBEE_NODE_NAME_ENV} for managed spawn")
+        })?;
+        let hive_id = node_name
+            .split_once('@')
+            .map(|(_, hive)| hive.trim().to_string())
+            .filter(|hive| !hive.is_empty())
+            .ok_or_else(|| {
+                format!("invalid {FLUXBEE_NODE_NAME_ENV}='{node_name}': expected <name>@<hive>")
+            })?;
+        let spawn_doc = load_spawn_doc(&node_name);
+        Ok(Self {
+            node_name,
+            node_version: env("NODE_VERSION")
+                .or_else(|| json_get_string(&spawn_doc, "_system.runtime_version"))
+                .unwrap_or_else(|| "0.1.0".to_string()),
+            router_socket: PathBuf::from(
+                env("ROUTER_SOCKET")
+                    .or_else(|| json_get_string(&spawn_doc, "node.router_socket"))
+                    .unwrap_or_else(|| "/var/run/fluxbee/routers".to_string()),
+            ),
+            uuid_persistence_dir: PathBuf::from(
+                env("UUID_PERSISTENCE_DIR")
+                    .or_else(|| json_get_string(&spawn_doc, "node.uuid_persistence_dir"))
+                    .unwrap_or_else(|| "/var/lib/fluxbee/state/nodes".to_string()),
+            ),
+            config_dir: PathBuf::from(
+                env("CONFIG_DIR")
+                    .or_else(|| json_get_string(&spawn_doc, "node.config_dir"))
+                    .unwrap_or_else(|| "/etc/fluxbee".to_string()),
+            ),
+            // El orchestrator es una segunda autoridad de CONFIG (ademas de SY.admin). No es un
+            // tunable de operador, asi que sale del spawn doc o del default del hive, nunca de un
+            // env IO_BLOB_*.
+            orchestrator_target: json_get_string(&spawn_doc, "node.orchestrator_target")
+                .unwrap_or_else(|| format!("SY.orchestrator@{hive_id}")),
+        })
+    }
 }
 
 #[derive(Debug, Clone)]
 struct BlobCurator {
     toolkit: BlobToolkit,
-    blob_root: PathBuf,
     public_root: PathBuf,
     ledger_path: PathBuf,
     max_bytes: u64,
+}
+
+/// Estado de runtime del nodo, al estilo `io.api::RuntimeState`. El curador vive detras de un `Mutex`
+/// porque un CONFIG_SET de `max_bytes` lo reconstruye en caliente (rutas fijas, sin reiniciar el
+/// proceso).
+struct RuntimeState {
+    config: Config,
+    local_hive: String,
+    adapter_contract: Arc<dyn IoAdapterConfigContract>,
+    dispatcher: Arc<RouterDispatcher>,
+    control_plane: RwLock<IoControlPlaneState>,
+    control_metrics: IoControlPlaneMetrics,
+    curator: Mutex<BlobCurator>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
@@ -147,24 +240,34 @@ impl CuratorError {
     }
 }
 
-struct FdGuard(RawFd);
-
-impl Drop for FdGuard {
-    fn drop(&mut self) {
-        let _ = close(self.0);
-    }
-}
-
 #[tokio::main]
 async fn main() -> Result<(), DynError> {
-    tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::new(env_or(
-            "JSR_LOG_LEVEL",
-            "info,io_blob=debug,fluxbee_sdk=info",
-        )))
+    fluxbee_sdk::logging::fmt()
+        .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+            EnvFilter::new("info,io_blob=debug,io_common=info,fluxbee_sdk=info")
+        }))
         .init();
 
-    let cfg = build_worker_config()?;
+    let config = Config::load()?;
+
+    // Plano de control: boot lee SOLO el `config.json` del dir del nodo, validado por el contrato del
+    // adapter via el SDK (single-config, sin archivo dinamico que ensombrezca un respawn — BUG-4).
+    let adapter_contract: Arc<dyn IoAdapterConfigContract> = Arc::new(IoBlobAdapterConfigContract);
+    let mut boot_state =
+        bootstrap_io_control_plane_state(&config.node_name, adapter_contract.as_ref())
+            .unwrap_or_else(|err| IoControlPlaneState {
+                current_state: IoNodeLifecycleState::FailedConfig,
+                config_source: IoConfigSource::None,
+                schema_version: 1,
+                config_version: 0,
+                effective_config: None,
+                last_error: Some(IoControlPlaneErrorInfo {
+                    code: "config_bootstrap_failed".to_string(),
+                    message: err.to_string(),
+                }),
+            });
+    validate_boot_effective_config(&mut boot_state, adapter_contract.as_ref());
+
     let profile = OperationalRouteProfile::builder()
         .command_channel(RPC_CH_CONTROL)
         .post_pending_rule(
@@ -183,40 +286,96 @@ async fn main() -> Result<(), DynError> {
             RouteMatch::exact(SYSTEM_KIND, MSG_NODE_STATUS_GET),
             RouteTarget::Command(RPC_CH_CONTROL),
         )
+        // Plano de control managed: CONFIG_GET/SET entran por el mismo canal.
+        .post_pending_rule(
+            RouteMatch::one_of(SYSTEM_KIND, [MSG_CONFIG_GET, MSG_CONFIG_SET]),
+            RouteTarget::Command(RPC_CH_CONTROL),
+        )
         .build()?;
 
+    let node_config = NodeConfig {
+        name: config.node_name.clone(),
+        router_socket: config.router_socket.clone(),
+        uuid_persistence_dir: config.uuid_persistence_dir.clone(),
+        uuid_mode: NodeUuidMode::Persistent,
+        config_dir: config.config_dir.clone(),
+        version: config.node_version.clone(),
+    };
     let dispatcher =
-        RouterDispatcher::connect_with_retry(cfg.node.clone(), Duration::from_secs(1), profile)
-            .await?;
+        RouterDispatcher::connect_with_retry(node_config, Duration::from_secs(1), profile).await?;
     let sender = dispatcher.sender_snapshot();
     let full_name = sender.full_name().to_string();
     let local_hive = full_name
         .rsplit_once('@')
         .map(|(_, hive)| hive.to_string())
         .unwrap_or_else(|| "motherbee".to_string());
-    let admin_hive = cfg.admin_hive.as_deref().unwrap_or(&local_hive);
-    let expected_admin = format!("SY.admin@{admin_hive}");
-    let curator = BlobCurator::new(&cfg)?;
-    let mut incoming = dispatcher.take_command_receiver(RPC_CH_CONTROL).await?;
+
+    // Red de seguridad fail-closed: io.blob es SOLO-motherbee. Un runtime managed ya no tiene el
+    // ExecCondition de systemd que antes vetaba spokes, asi que el chequeo se hace aca.
+    if local_hive != "motherbee" {
+        tracing::error!(
+            node = %full_name,
+            hive = %local_hive,
+            "IO.blob is motherbee-only; refusing to run on a non-motherbee hive"
+        );
+        return Err(format!("IO.blob must run on motherbee, not '{local_hive}'").into());
+    }
+
+    // El tope inicial sale del plano de control vivo (default baked si no hay config).
+    let initial_max_bytes =
+        configured_max_bytes(boot_state.effective_config.as_ref()).unwrap_or(BLOB_DEFAULT_MAX_BYTES);
+    let curator = build_curator(initial_max_bytes)?;
+
+    let control_metrics = IoControlPlaneMetrics::with_initial_state(
+        boot_state.current_state.as_str(),
+        boot_state.config_version,
+    );
 
     tracing::info!(
         node = %full_name,
-        expected_admin = %expected_admin,
-        public_root = %cfg.public_root.display(),
-        ledger_path = %cfg.ledger_path.display(),
-        "IO.blob curator ready"
+        hive = %local_hive,
+        lifecycle = %boot_state.current_state.as_str(),
+        config_version = boot_state.config_version,
+        max_bytes = initial_max_bytes,
+        public_root = %curator.public_root.display(),
+        ledger_path = %curator.ledger_path.display(),
+        orchestrator_target = %config.orchestrator_target,
+        "IO.blob curator ready (managed control plane)"
     );
+
+    let state = RuntimeState {
+        config,
+        local_hive,
+        adapter_contract,
+        dispatcher: dispatcher.clone(),
+        control_plane: RwLock::new(boot_state),
+        control_metrics,
+        curator: Mutex::new(curator),
+    };
+
+    let mut incoming = dispatcher.take_command_receiver(RPC_CH_CONTROL).await?;
 
     while let Some(message) = incoming.recv().await {
         if try_handle_default_node_status(&sender, &message).await? {
             continue;
         }
 
+        // Plano de control ANTES de la compuerta de admin del curador: CONFIG_GET/SET los autoriza el
+        // admin O el orchestrator (no la compuerta `expected_admin` del curador).
+        if is_config_command(&message) {
+            let response = handle_control_message(&state, &message).await;
+            sender.send(response).await?;
+            continue;
+        }
+
         let response_msg = response_message_for(message.meta.msg.as_deref());
+        // `expected_admin` se lee del plano de control VIVO, asi que un CONFIG_SET de `admin_hive`
+        // tiene efecto sin reiniciar.
+        let expected_admin = current_expected_admin(&state).await;
         let result = match authorize_admin_message(&message, &expected_admin) {
             Err(err) => Err(err),
             Ok(()) => {
-                let curator = curator.clone();
+                let curator = state.curator.lock().await.clone();
                 let command = message.meta.msg.clone().unwrap_or_default();
                 let payload = message.payload.clone();
                 tokio::task::spawn_blocking(move || curator.handle(&command, payload))
@@ -251,23 +410,292 @@ async fn main() -> Result<(), DynError> {
     Ok(())
 }
 
+// --- Plano de control (espejo de io.api) --------------------------------------------------------
+
+fn validate_boot_effective_config(
+    state: &mut IoControlPlaneState,
+    contract: &dyn IoAdapterConfigContract,
+) {
+    let Some(candidate) = state.effective_config.as_ref() else {
+        return;
+    };
+    match contract.validate_and_materialize(candidate) {
+        Ok(effective) => {
+            state.effective_config = Some(effective);
+            state.current_state = IoNodeLifecycleState::Configured;
+            state.last_error = None;
+        }
+        Err(err) => {
+            state.current_state = IoNodeLifecycleState::FailedConfig;
+            state.last_error = Some(IoControlPlaneErrorInfo {
+                code: err.code().to_string(),
+                message: err.to_string(),
+            });
+        }
+    }
+}
+
+fn is_config_command(message: &Message) -> bool {
+    message.meta.msg_type.eq_ignore_ascii_case(SYSTEM_KIND)
+        && matches!(
+            message.meta.msg.as_deref(),
+            Some(command)
+                if command.eq_ignore_ascii_case("CONFIG_GET")
+                    || command.eq_ignore_ascii_case("CONFIG_SET")
+        )
+}
+
+/// `SY.admin@{admin_hive}` derivado del plano de control VIVO (default = hive local). io.blob NO
+/// tiene un `admin_target` fijo como io.api: su autoridad de admin es config-driven (`admin_hive`).
+async fn current_expected_admin(state: &RuntimeState) -> String {
+    let effective = state.control_plane.read().await;
+    let hive = configured_admin_hive(effective.effective_config.as_ref())
+        .unwrap_or_else(|| state.local_hive.clone());
+    format!("SY.admin@{hive}")
+}
+
+fn control_caller_authorized(state: &RuntimeState, message: &Message, expected_admin: &str) -> bool {
+    let caller = message.routing.src_l2_name.as_deref().map(str::trim);
+    caller == Some(expected_admin) || caller == Some(state.config.orchestrator_target.as_str())
+}
+
+async fn handle_control_message(state: &RuntimeState, message: &Message) -> Message {
+    let expected_admin = current_expected_admin(state).await;
+    let payload = if !control_caller_authorized(state, message, &expected_admin) {
+        tracing::warn!(
+            trace_id = %message.routing.trace_id,
+            source = ?message.routing.src_l2_name,
+            command = ?message.meta.msg,
+            "IO.blob rejected configuration command from non-authority"
+        );
+        let snapshot = state.control_plane.read().await.clone();
+        build_io_config_set_error_payload(
+            &state.config.node_name,
+            &snapshot,
+            "unauthorized",
+            "CONFIG_GET/SET requires the configured Admin or Orchestrator origin",
+        )
+    } else {
+        match parse_and_validate_io_control_plane_request(message, &state.config.node_name) {
+            Ok(IoControlPlaneRequest::Get(_)) => build_config_get_payload(state, message).await,
+            Ok(IoControlPlaneRequest::Set(set)) => apply_config_set(state, &set).await,
+            Err(err) => {
+                log_control_plane_request_rejected(
+                    &message.routing.trace_id,
+                    &state.config.node_name,
+                    err.code(),
+                    &err.to_string(),
+                );
+                let snapshot = state.control_plane.read().await.clone();
+                build_io_config_set_error_payload(
+                    &state.config.node_name,
+                    &snapshot,
+                    err.code(),
+                    err.to_string(),
+                )
+            }
+        }
+    };
+    let mut response = build_io_config_response_message(message, payload);
+    response.routing.src = state.dispatcher.sender_snapshot().uuid().to_string();
+    response
+}
+
+async fn build_config_get_payload(state: &RuntimeState, message: &Message) -> Value {
+    let snapshot = state.control_plane.read().await.clone();
+    log_config_get_served(&message.routing.trace_id, &state.config.node_name, &snapshot);
+    let mut payload = build_io_config_get_response_payload(
+        &state.config.node_name,
+        &snapshot,
+        build_io_adapter_contract_payload(
+            state.adapter_contract.as_ref(),
+            snapshot.effective_config.as_ref(),
+        ),
+    );
+    inject_runtime_status(&mut payload, state).await;
+    payload
+}
+
+async fn apply_config_set(
+    state: &RuntimeState,
+    payload: &fluxbee_sdk::node_config::NodeConfigSetPayload,
+) -> Value {
+    let current = state.control_plane.read().await.clone();
+    if let Err(err) = ensure_config_version_advances(payload.config_version, current.config_version)
+    {
+        log_config_set_stale_rejected(
+            &state.config.node_name,
+            payload.config_version,
+            current.config_version,
+        );
+        state.control_metrics.record_config_set_error(
+            current.current_state.as_str(),
+            current.config_version,
+            err.code(),
+        );
+        return build_io_config_set_error_payload(
+            &state.config.node_name,
+            &current,
+            err.code(),
+            err.to_string(),
+        );
+    }
+    let effective =
+        match apply_adapter_config_replace(state.adapter_contract.as_ref(), &payload.config) {
+            Ok(value) => value,
+            Err(err) => {
+                state.control_metrics.record_config_set_error(
+                    current.current_state.as_str(),
+                    current.config_version,
+                    err.code(),
+                );
+                return build_io_config_set_error_payload(
+                    &state.config.node_name,
+                    &current,
+                    err.code(),
+                    err.to_string(),
+                );
+            }
+        };
+    let next = IoControlPlaneState {
+        current_state: IoNodeLifecycleState::Configured,
+        config_source: IoConfigSource::Dynamic,
+        schema_version: payload.schema_version,
+        config_version: payload.config_version,
+        effective_config: Some(effective.clone()),
+        last_error: None,
+    };
+    if let Err(err) = persist_io_control_plane_state(&state.config.node_name, &next) {
+        log_config_set_persist_error(
+            &state.config.node_name,
+            payload.schema_version,
+            payload.config_version,
+            &err.to_string(),
+        );
+        return build_io_config_set_error_payload(
+            &state.config.node_name,
+            &current,
+            "config_persist_error",
+            err.to_string(),
+        );
+    }
+
+    // Diferencias contra la config previa para decidir el hot-apply.
+    let old_max =
+        configured_max_bytes(current.effective_config.as_ref()).unwrap_or(BLOB_DEFAULT_MAX_BYTES);
+    let new_max = configured_max_bytes(Some(&effective)).unwrap_or(BLOB_DEFAULT_MAX_BYTES);
+    let admin_hive_changed = configured_admin_hive(current.effective_config.as_ref())
+        != configured_admin_hive(Some(&effective));
+
+    *state.control_plane.write().await = next.clone();
+    state
+        .control_metrics
+        .record_config_set_ok(next.current_state.as_str(), next.config_version);
+
+    let mut hot_applied = Vec::new();
+    if new_max != old_max {
+        // El curador guarda `max_bytes` por valor. Las rutas son FIJAS, asi que un cambio de tope se
+        // aplica en caliente reconstruyendo el curador en proceso (relee el ledger, barato) — nunca
+        // hace falta reiniciar el nodo.
+        match build_curator(new_max) {
+            Ok(rebuilt) => {
+                *state.curator.lock().await = rebuilt;
+                hot_applied.push("io.max_bytes".to_string());
+            }
+            Err(err) => {
+                tracing::error!(
+                    error = %err,
+                    "validated IO.blob max_bytes failed to hot-apply; keeping previous curator"
+                );
+            }
+        }
+    }
+    if admin_hive_changed {
+        // `expected_admin` se lee del plano de control vivo en cada comando, asi que ya quedo aplicado.
+        hot_applied.push("io.admin_hive".to_string());
+    }
+    log_config_set_applied(
+        &state.config.node_name,
+        payload.schema_version,
+        payload.config_version,
+        &hot_applied,
+        &[],
+        &[],
+    );
+
+    let mut response = build_io_config_set_ok_payload(&state.config.node_name, &next);
+    if let Some(object) = response.as_object_mut() {
+        object.insert(
+            "apply".to_string(),
+            json!({
+                "mode":"hot_reload",
+                "hot_applied":hot_applied,
+                "reinit_performed":[],
+                "restart_required":[],
+            }),
+        );
+    }
+    inject_runtime_status(&mut response, state).await;
+    response
+}
+
+async fn inject_runtime_status(payload: &mut Value, state: &RuntimeState) {
+    let (public_root, ledger_path, max_bytes) = {
+        let curator = state.curator.lock().await;
+        (
+            curator.public_root.display().to_string(),
+            curator.ledger_path.display().to_string(),
+            curator.max_bytes,
+        )
+    };
+    if let Some(object) = payload.as_object_mut() {
+        object.insert(
+            "runtime".to_string(),
+            json!({
+                "transport":"router_socket",
+                "role":"public-artifact-curator",
+                "public_root":public_root,
+                "ledger_path":ledger_path,
+                "max_bytes":max_bytes,
+                "control_plane_metrics":state.control_metrics.snapshot(),
+            }),
+        );
+    }
+}
+
+/// Construye un curador con las rutas FIJAS de diseño y el tope dado. Unico punto de creacion en
+/// produccion (boot + hot-apply de `max_bytes`).
+fn build_curator(max_bytes: u64) -> Result<BlobCurator, CuratorError> {
+    BlobCurator::new(
+        PathBuf::from(DEFAULT_BLOB_ROOT),
+        PathBuf::from(DEFAULT_PUBLIC_ROOT),
+        PathBuf::from(DEFAULT_LEDGER_PATH),
+        max_bytes,
+    )
+}
+
 impl BlobCurator {
-    fn new(cfg: &WorkerConfig) -> Result<Self, CuratorError> {
-        ensure_dir(&cfg.public_root, 0o750)?;
-        if let Some(parent) = cfg.ledger_path.parent() {
+    fn new(
+        blob_root: PathBuf,
+        public_root: PathBuf,
+        ledger_path: PathBuf,
+        max_bytes: u64,
+    ) -> Result<Self, CuratorError> {
+        ensure_public_dir(&public_root)?;
+        remove_stale_curate_temps(&public_root)?;
+        if let Some(parent) = ledger_path.parent() {
             ensure_dir(parent, 0o750)?;
         }
         let toolkit = BlobToolkit::new(BlobConfig {
-            blob_root: cfg.blob_root.clone(),
-            max_blob_bytes: Some(cfg.max_bytes),
+            blob_root,
+            max_blob_bytes: Some(max_bytes),
             ..BlobConfig::default()
         })?;
         let curator = Self {
             toolkit,
-            blob_root: cfg.blob_root.clone(),
-            public_root: cfg.public_root.clone(),
-            ledger_path: cfg.ledger_path.clone(),
-            max_bytes: cfg.max_bytes,
+            public_root,
+            ledger_path,
+            max_bytes,
         };
         curator.load_ledger()?;
         Ok(curator)
@@ -407,28 +835,14 @@ impl BlobCurator {
         &self,
         blob_ref: &BlobRef,
     ) -> Result<(String, u64, bool), CuratorError> {
-        let source = self.toolkit.resolve(blob_ref);
-        let active_root = self.blob_root.join("active");
-        ensure_source_under_root(&source, &active_root)?;
-        let meta = fs::symlink_metadata(&source).map_err(|err| {
-            if err.kind() == std::io::ErrorKind::NotFound {
-                CuratorError::NotFound(blob_ref.blob_name.clone())
-            } else {
-                CuratorError::Io(err)
-            }
+        // Opened by descriptor without following a link anywhere under blob/ (FINDINGS A-56): a
+        // regular file of the BlobRef's size. Its bytes are checked below, against the full hash.
+        let source = self.toolkit.open_blob(blob_ref).map_err(|err| match err {
+            BlobError::NotFound(_) => CuratorError::NotFound(blob_ref.blob_name.clone()),
+            BlobError::Integrity(detail) => CuratorError::Integrity(detail),
+            other => CuratorError::Blob(other),
         })?;
-        if meta.file_type().is_symlink() || !meta.is_file() {
-            return Err(CuratorError::Integrity(
-                "source blob must be a regular non-symlink file".to_string(),
-            ));
-        }
-        if meta.len() != blob_ref.size {
-            return Err(CuratorError::Integrity(format!(
-                "source size {} does not match BlobRef size {}",
-                meta.len(),
-                blob_ref.size
-            )));
-        }
+        let meta = source.metadata()?;
         if meta.len() > self.max_bytes {
             return Err(CuratorError::TooLarge {
                 size: meta.len(),
@@ -436,19 +850,39 @@ impl BlobCurator {
             });
         }
 
-        let temp_path =
-            self.public_root
-                .join(format!(".curate-{}-{}", std::process::id(), Uuid::new_v4()));
-        let copied = copy_hash_no_follow(&source, &temp_path, self.max_bytes);
+        // The public folder is the Syncthing user's (FINDINGS A-56): the copy is created
+        // exclusively inside it by descriptor, takes the folder's owner so that Syncthing can read
+        // it, and is linked to its final name by descriptor. Nothing here acts through a name that
+        // user could plant.
+        let public = safe_fs::open_dir_no_follow(None, &self.public_root)?;
+        let owner = safe_fs::owner_of(&public)?;
+        let temp_name = format!(".curate-{}-{}", std::process::id(), Uuid::new_v4());
+        let unlink_temp = || {
+            let _ = unlinkat(
+                Some(public.as_raw_fd()),
+                temp_name.as_str(),
+                UnlinkatFlags::NoRemoveDir,
+            );
+        };
+        let mut temp = safe_fs::create_file_exclusive(&public, &temp_name)?;
+        let copied = hash_file(source, self.max_bytes, |chunk| {
+            temp.write_all(chunk)?;
+            Ok(())
+        })
+        .and_then(|result| {
+            temp.flush()?;
+            temp.sync_all()?;
+            Ok(result)
+        });
         let (sha256, size) = match copied {
             Ok(result) => result,
             Err(err) => {
-                let _ = fs::remove_file(&temp_path);
+                unlink_temp();
                 return Err(err);
             }
         };
         if size != blob_ref.size {
-            let _ = fs::remove_file(&temp_path);
+            unlink_temp();
             return Err(CuratorError::Integrity(format!(
                 "copied size {size} does not match BlobRef size {}",
                 blob_ref.size
@@ -458,27 +892,39 @@ impl BlobCurator {
             CuratorError::Integrity("BlobRef name has no embedded hash16".to_string())
         })?;
         if !sha256[..16].eq_ignore_ascii_case(expected_hash16) {
-            let _ = fs::remove_file(&temp_path);
+            unlink_temp();
             return Err(CuratorError::Integrity(format!(
                 "BlobRef hash16 '{}' does not match content SHA-256",
                 expected_hash16
             )));
         }
+        if let Err(err) = safe_fs::give_to(&temp, owner)
+            .and_then(|()| temp.set_permissions(fs::Permissions::from_mode(0o640)))
+        {
+            unlink_temp();
+            return Err(err.into());
+        }
 
         let final_path = self.public_path(&sha256)?;
-        let file_created = match fs::hard_link(&temp_path, &final_path) {
+        let file_created = match linkat(
+            Some(public.as_raw_fd()),
+            temp_name.as_str(),
+            Some(public.as_raw_fd()),
+            sha256.as_str(),
+            AtFlags::empty(),
+        ) {
             Ok(()) => true,
-            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
+            Err(Errno::EEXIST) => {
+                unlink_temp();
                 verify_file_hash(&final_path, &sha256, size, self.max_bytes)?;
                 false
             }
             Err(err) => {
-                let _ = fs::remove_file(&temp_path);
-                return Err(err.into());
+                unlink_temp();
+                return Err(std::io::Error::from(err).into());
             }
         };
-        fs::remove_file(&temp_path)?;
-        fs::set_permissions(&final_path, fs::Permissions::from_mode(0o640))?;
+        unlink_temp();
         Ok((sha256, size, file_created))
     }
 
@@ -566,39 +1012,36 @@ impl BlobCurator {
     }
 }
 
-fn copy_hash_no_follow(
-    source: &Path,
-    destination: &Path,
-    max_bytes: u64,
-) -> Result<(String, u64), CuratorError> {
-    let mut output = OpenOptions::new()
-        .create_new(true)
-        .write(true)
-        .mode(0o640)
-        .open(destination)?;
-    let result = hash_no_follow(source, max_bytes, |chunk| {
-        output.write_all(chunk)?;
-        Ok(())
-    })?;
-    output.flush()?;
-    output.sync_all()?;
-    Ok(result)
-}
-
+/// Hashes the file at `path` without following a link at its last component and without blocking
+/// on a FIFO planted there. Used for the public copies: `public/` sits under the root-owned `blob/`,
+/// so only the last component is the Syncthing user's.
 fn hash_no_follow<F>(
     source: &Path,
+    max_bytes: u64,
+    consume: F,
+) -> Result<(String, u64), CuratorError>
+where
+    F: FnMut(&[u8]) -> Result<(), CuratorError>,
+{
+    let file = OpenOptions::new()
+        .read(true)
+        .custom_flags(nix::libc::O_NOFOLLOW | nix::libc::O_NONBLOCK)
+        .open(source)?;
+    hash_file(file, max_bytes, consume)
+}
+
+/// Streams an open file through SHA-256, refusing anything but a regular file within `max_bytes`.
+fn hash_file<F>(
+    mut file: fs::File,
     max_bytes: u64,
     mut consume: F,
 ) -> Result<(String, u64), CuratorError>
 where
     F: FnMut(&[u8]) -> Result<(), CuratorError>,
 {
-    let fd = open(source, OFlag::O_RDONLY | OFlag::O_NOFOLLOW, Mode::empty())
-        .map_err(|err| CuratorError::System(format!("open source: {err}")))?;
-    let fd = FdGuard(fd);
-    let stat = fstat(fd.0).map_err(|err| CuratorError::System(format!("fstat source: {err}")))?;
-    let kind = SFlag::from_bits_truncate(stat.st_mode);
-    if !kind.contains(SFlag::S_IFREG) {
+    let stat = fstat(file.as_raw_fd())
+        .map_err(|err| CuratorError::System(format!("fstat source: {err}")))?;
+    if SFlag::from_bits_truncate(stat.st_mode) & SFlag::S_IFMT != SFlag::S_IFREG {
         return Err(CuratorError::Integrity(
             "source blob is not a regular file".to_string(),
         ));
@@ -614,8 +1057,7 @@ where
     let mut total = 0_u64;
     let mut buffer = [0_u8; 64 * 1024];
     loop {
-        let count = read(fd.0, &mut buffer)
-            .map_err(|err| CuratorError::System(format!("read source: {err}")))?;
+        let count = std::io::Read::read(&mut file, &mut buffer)?;
         if count == 0 {
             break;
         }
@@ -657,29 +1099,6 @@ fn verify_file_hash(
             "public file verification failed for '{}'",
             path.display()
         )));
-    }
-    Ok(())
-}
-
-fn ensure_source_under_root(source: &Path, active_root: &Path) -> Result<(), CuratorError> {
-    let canonical_root = active_root.canonicalize().map_err(|err| {
-        if err.kind() == std::io::ErrorKind::NotFound {
-            CuratorError::NotFound(active_root.display().to_string())
-        } else {
-            CuratorError::Io(err)
-        }
-    })?;
-    let canonical_source = source.canonicalize().map_err(|err| {
-        if err.kind() == std::io::ErrorKind::NotFound {
-            CuratorError::NotFound(source.display().to_string())
-        } else {
-            CuratorError::Io(err)
-        }
-    })?;
-    if !canonical_source.starts_with(canonical_root) {
-        return Err(CuratorError::Integrity(
-            "source blob resolves outside active root".to_string(),
-        ));
     }
     Ok(())
 }
@@ -793,6 +1212,33 @@ fn is_full_sha256(value: &str) -> bool {
             .all(|ch| ch.is_ascii_hexdigit() && !ch.is_ascii_uppercase())
 }
 
+/// The public folder belongs to the Syncthing user, and the orchestrator sets its owner and mode
+/// (FINDINGS A-56): io.blob only makes sure it exists and is a directory, never through a link.
+fn ensure_public_dir(path: &Path) -> Result<(), std::io::Error> {
+    fs::create_dir_all(path)?;
+    safe_fs::open_dir_no_follow(None, path).map(drop)
+}
+
+/// A curate that crashed leaves its `.curate-*` temporary in the public folder, root's, so the
+/// Syncthing serving the folder can never read it. They go at start, before any curate runs, each
+/// removed by name relative to the folder: unlinkat removes the name, never what a link points at.
+fn remove_stale_curate_temps(public_root: &Path) -> Result<(), std::io::Error> {
+    let public = safe_fs::open_dir_no_follow(None, public_root)?;
+    for entry in fs::read_dir(public_root)? {
+        let name = entry?.file_name();
+        let Some(name) = name.to_str().filter(|name| name.starts_with(".curate-")) else {
+            continue;
+        };
+        match unlinkat(Some(public.as_raw_fd()), name, UnlinkatFlags::NoRemoveDir) {
+            Ok(()) => tracing::warn!(name, "removed a stale curate temporary"),
+            Err(err) => {
+                tracing::warn!(name, error = %err, "could not remove a stale curate temporary")
+            }
+        }
+    }
+    Ok(())
+}
+
 fn ensure_dir(path: &Path, mode: u32) -> Result<(), std::io::Error> {
     fs::create_dir_all(path)?;
     fs::set_permissions(path, fs::Permissions::from_mode(mode))
@@ -805,45 +1251,26 @@ fn now_epoch_ms() -> u64 {
         .unwrap_or(0)
 }
 
-fn build_worker_config() -> Result<WorkerConfig, CuratorError> {
-    let blob_root = PathBuf::from(env_or("IO_BLOB_BLOB_ROOT", DEFAULT_BLOB_ROOT));
-    let public_root = env("IO_BLOB_PUBLIC_ROOT")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| blob_root.join("public"));
-    let max_bytes = env("IO_BLOB_MAX_BYTES")
-        .map(|raw| {
-            raw.parse::<u64>().map_err(|_| {
-                CuratorError::InvalidRequest("IO_BLOB_MAX_BYTES must be an integer".to_string())
-            })
-        })
-        .transpose()?
-        .unwrap_or(BLOB_DEFAULT_MAX_BYTES);
-    if max_bytes == 0 {
-        return Err(CuratorError::InvalidRequest(
-            "IO_BLOB_MAX_BYTES must be greater than zero".to_string(),
-        ));
+/// Lee (tolerante) el spawn `config.json` del dir del nodo para la infra de arranque. Un archivo
+/// ausente o ilegible NO aborta el boot: cae a env/defaults (io.blob sin config es valido).
+fn load_spawn_doc(node_name: &str) -> Value {
+    let Ok(path) = managed_node_config_path(node_name) else {
+        return Value::Null;
+    };
+    let Ok(raw) = std::fs::read_to_string(&path) else {
+        return Value::Null;
+    };
+    match serde_json::from_str::<Value>(&raw) {
+        Ok(doc) => doc,
+        Err(err) => {
+            tracing::debug!(
+                path = %path.display(),
+                error = %err,
+                "io.blob spawn config.json is not valid JSON; using env/defaults for infra"
+            );
+            Value::Null
+        }
     }
-    Ok(WorkerConfig {
-        node: NodeConfig {
-            name: managed_node_name("IO.blob", &["IO_BLOB_NODE_NAME"]),
-            router_socket: PathBuf::from(env_or(
-                "IO_BLOB_ROUTER_SOCKET_DIR",
-                "/var/run/fluxbee/routers",
-            )),
-            uuid_persistence_dir: PathBuf::from(env_or(
-                "IO_BLOB_UUID_PERSISTENCE_DIR",
-                "/var/lib/fluxbee/state/nodes",
-            )),
-            uuid_mode: NodeUuidMode::Persistent,
-            config_dir: PathBuf::from(env_or("IO_BLOB_CONFIG_DIR", "/etc/fluxbee")),
-            version: env_or("IO_BLOB_NODE_VERSION", "0.1.0"),
-        },
-        admin_hive: env("IO_BLOB_ADMIN_HIVE"),
-        blob_root,
-        public_root,
-        ledger_path: PathBuf::from(env_or("IO_BLOB_LEDGER_PATH", DEFAULT_LEDGER_PATH)),
-        max_bytes,
-    })
 }
 
 fn env(key: &str) -> Option<String> {
@@ -853,8 +1280,20 @@ fn env(key: &str) -> Option<String> {
         .filter(|value| !value.is_empty())
 }
 
-fn env_or(key: &str, default: &str) -> String {
-    env(key).unwrap_or_else(|| default.to_string())
+fn json_get_string(root: &Value, dotted_path: &str) -> Option<String> {
+    json_get_path(root, dotted_path)
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string)
+}
+
+fn json_get_path<'a>(root: &'a Value, dotted_path: &str) -> Option<&'a Value> {
+    let mut current = root;
+    for segment in dotted_path.split('.') {
+        current = current.get(segment)?;
+    }
+    Some(current)
 }
 
 #[cfg(test)]
@@ -872,23 +1311,15 @@ mod tests {
     }
 
     fn test_curator(root: &Path) -> BlobCurator {
-        let cfg = WorkerConfig {
-            node: NodeConfig {
-                name: "IO.blob".to_string(),
-                router_socket: root.join("routers"),
-                uuid_persistence_dir: root.join("nodes"),
-                uuid_mode: NodeUuidMode::Ephemeral,
-                config_dir: root.to_path_buf(),
-                version: "test".to_string(),
-            },
-            admin_hive: Some("motherbee".to_string()),
-            blob_root: root.join("blob"),
-            public_root: root.join("blob/public"),
-            ledger_path: root.join("state/io-blob/publications.json"),
-            max_bytes: 1024 * 1024,
-        };
-        ensure_dir(&cfg.blob_root.join("active"), 0o750).expect("active root");
-        BlobCurator::new(&cfg).expect("curator")
+        let blob_root = root.join("blob");
+        ensure_dir(&blob_root.join("active"), 0o750).expect("active root");
+        BlobCurator::new(
+            blob_root.clone(),
+            root.join("blob/public"),
+            root.join("state/io-blob/publications.json"),
+            1024 * 1024,
+        )
+        .expect("curator")
     }
 
     fn create_blob(curator: &BlobCurator, data: &[u8], filename: &str, mime: &str) -> BlobRef {
@@ -932,6 +1363,57 @@ mod tests {
         assert_eq!(second["ref_count"], 1);
         let ledger = curator.load_ledger().expect("ledger");
         assert_eq!(ledger.publications.len(), 1);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    /// A-56: a link planted in the public folder under the final name is refused, never written
+    /// through; a curated copy has the public folder's owner and mode 0640, and no temporary is
+    /// left behind.
+    #[test]
+    fn curate_never_writes_through_a_planted_public_link() {
+        use std::os::unix::fs::MetadataExt;
+        let root = temp_root("planted");
+        let curator = test_curator(&root);
+        let blob_ref = create_blob(&curator, b"public bytes", "doc.pdf", "application/pdf");
+        let sha = format!("{:x}", Sha256::digest(b"public bytes"));
+        let victim = root.join("victim");
+        fs::write(&victim, b"untouched").expect("victim");
+        std::os::unix::fs::symlink(&victim, curator.public_root.join(&sha)).expect("plant link");
+        let req = request("pub:55555555-5555-4555-8555-555555555555", blob_ref.clone());
+        assert!(
+            curator.curate(req).is_err(),
+            "a planted link must be refused"
+        );
+        assert_eq!(fs::read(&victim).unwrap(), b"untouched");
+
+        fs::remove_file(curator.public_root.join(&sha)).expect("remove link");
+        let req = request("pub:66666666-6666-4666-8666-666666666666", blob_ref);
+        let done = curator.curate(req).expect("curate");
+        assert_eq!(done["sha256"], sha);
+        let public = fs::metadata(&curator.public_root).expect("public");
+        let file = fs::symlink_metadata(curator.public_root.join(&sha)).expect("public file");
+        assert!(file.file_type().is_file());
+        assert_eq!((file.uid(), file.gid()), (public.uid(), public.gid()));
+        assert_eq!(file.mode() & 0o777, 0o640);
+        let leftovers: Vec<_> = fs::read_dir(&curator.public_root)
+            .expect("list public")
+            .filter_map(Result::ok)
+            .filter(|entry| entry.file_name().to_string_lossy().starts_with(".curate-"))
+            .collect();
+        assert!(leftovers.is_empty(), "temporaries left: {leftovers:?}");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn a_stale_curate_temporary_is_removed_at_start() {
+        let root = temp_root("stale-temp");
+        let public = root.join("blob/public");
+        fs::create_dir_all(&public).expect("public");
+        fs::write(public.join(".curate-1-left-by-a-crash"), b"partial").expect("temp");
+        fs::write(public.join("keep-me"), b"public copy").expect("other entry");
+        let _curator = test_curator(&root);
+        assert!(!public.join(".curate-1-left-by-a-crash").exists());
+        assert!(public.join("keep-me").exists());
         let _ = fs::remove_dir_all(root);
     }
 

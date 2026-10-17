@@ -10,16 +10,12 @@ Usage:
   publish-ia-runtime.sh --runtime <ai.runtime> --version <version> [options]
 
 Required:
-  --runtime <ai.runtime>   Runtime key (example: ai.common)
+  --runtime <ai.runtime>   Runtime key (example: ai.generic)
   --version <version>      Runtime version (example: 0.1.0)
 
 Options:
   --binary <path>          Binary path (default: target/release/ai_node_runner)
   --dist-root <path>       Dist root (default: /var/lib/fluxbee/dist)
-  --mode <default|gov>     Deprecated compatibility flag (ignored)
-  --forced-node-name <n>   Deprecated emergency override for --node-name in start.sh
-  --forced-dynamic-config-dir <p>
-                            Deprecated emergency override for --dynamic-config-dir in start.sh
   --set-current            Set current version in manifest
   --sudo                   Use sudo for writes
   --skip-build             Skip cargo build
@@ -37,10 +33,6 @@ DIST_ROOT=""
 SET_CURRENT=0
 USE_SUDO=0
 SKIP_BUILD=0
-MODE="default"
-MODE_SET=0
-FORCED_NODE_NAME=""
-FORCED_DYNAMIC_CONFIG_DIR=""
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -58,19 +50,6 @@ while [[ $# -gt 0 ]]; do
       ;;
     --dist-root)
       DIST_ROOT="${2:-}"
-      shift 2
-      ;;
-    --mode)
-      MODE="${2:-}"
-      MODE_SET=1
-      shift 2
-      ;;
-    --forced-node-name)
-      FORCED_NODE_NAME="${2:-}"
-      shift 2
-      ;;
-    --forced-dynamic-config-dir)
-      FORCED_DYNAMIC_CONFIG_DIR="${2:-}"
       shift 2
       ;;
     --set-current)
@@ -103,21 +82,12 @@ if [[ -z "$RUNTIME" || -z "$VERSION" ]]; then
   exit 1
 fi
 
-if [[ "$MODE_SET" == "1" ]]; then
-  echo "Warning: --mode is deprecated and ignored; runtime behavior is selected by --runtime" >&2
-fi
-
 if [[ "$SKIP_BUILD" != "1" ]]; then
   if ! command -v cargo >/dev/null 2>&1; then
     echo "Error: cargo not found (use --skip-build if binary already exists)" >&2
     exit 1
   fi
-  if [[ "$RUNTIME" == "sy.frontdesk.gov" ]]; then
-    BINARY="$ROOT_DIR/target/release/sy-frontdesk-gov"
-    (cd "$ROOT_DIR" && cargo build --release -p sy-frontdesk-gov --bin sy-frontdesk-gov)
-  else
-    (cd "$ROOT_DIR" && cargo build --release -p fluxbee-ai-nodes --bin ai_node_runner)
-  fi
+  (cd "$ROOT_DIR" && cargo build --release -p fluxbee-ai-nodes --bin ai_node_runner)
 fi
 
 cmd=(bash "$PUBLISH_SCRIPT" --runtime "$RUNTIME" --version "$VERSION" --binary "$BINARY")
@@ -170,16 +140,7 @@ if [[ -z "\${RUST_LOG:-}" ]]; then
   export RUST_LOG="info,fluxbee_ai_nodes=debug,fluxbee_ai_sdk=info,fluxbee_ai_sdk::runtime=warn"
 fi
 SCRIPT_DIR="\$(cd "\$(dirname "\${BASH_SOURCE[0]}")" && pwd)"
-forced_node_name="${FORCED_NODE_NAME}"
-forced_dynamic_dir="${FORCED_DYNAMIC_CONFIG_DIR}"
-runner_args=()
-if [[ -n "\${forced_node_name}" && -z "\${AI_NODE_NAME:-}" ]]; then
-  runner_args+=(--node-name "\${forced_node_name}")
-fi
-if [[ -n "\${forced_dynamic_dir}" && -z "\${AI_DYNAMIC_CONFIG_DIR:-}" ]]; then
-  runner_args+=(--dynamic-config-dir "\${forced_dynamic_dir}")
-fi
-exec "\$SCRIPT_DIR/$BINARY_NAME" "\${runner_args[@]}" "\$@"
+exec "\$SCRIPT_DIR/$BINARY_NAME" "\$@"
 EOF
 
 if [[ "$USE_SUDO" == "1" ]]; then
@@ -190,9 +151,3 @@ fi
 rm -f "$tmp_start"
 
 echo "Configured AI start.sh runtime profile: $RUNTIME"
-if [[ -n "$FORCED_NODE_NAME" ]]; then
-  echo "Configured AI start.sh forced node name: $FORCED_NODE_NAME"
-fi
-if [[ -n "$FORCED_DYNAMIC_CONFIG_DIR" ]]; then
-  echo "Configured AI start.sh forced dynamic config dir: $FORCED_DYNAMIC_CONFIG_DIR"
-fi

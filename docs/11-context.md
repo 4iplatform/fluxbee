@@ -4,7 +4,7 @@
 **Fecha:** 2026-02-04  
 **Audiencia:** Desarrolladores de nodos IO/AI, router core, infraestructura
 
-> **Warning (2026-05-20):** este documento describe el modelo histórico `CTX/ctx_window` y no debe usarse como contrato canónico actual. Sus ejemplos de `ICH` no reflejan la semántica vigente. En el modelo actual, `ICH` representa el canal local/sistémico operado por un nodo IO y la continuidad conversacional canónica usa `thread_id/thread_seq`.
+> **Warning (2026-05-20):** este documento describe el modelo histórico `CTX/ctx_window` y no debe usarse como contrato canónico actual. Sus ejemplos de `ICH` no reflejan la semántica vigente. En el modelo actual, `ICH` representa el canal local/sistémico operado por un nodo IO y la continuidad conversacional canónica usa `thread_id` (el mensaje no lleva secuencia: el orden de una comunicación es el número de turno de SY.cognition).
 
 ---
 
@@ -869,4 +869,4 @@ Pero empezamos con PostgreSQL solo.
 | Estructura de mensaje | `02-protocolo.md` |
 | Router | `04-routing.md` |
 | Operaciones | `07-operaciones.md` |
-> Historical document from the older CTX/ctx_window model. The active conversational carrier in the repo is now based on `meta.thread_id` / `meta.thread_seq`; `ctx*` remains only as legacy protocol surface.
+> Historical document from the older CTX/ctx_window model. The active conversational carrier in the repo is now `meta.thread_id` (the message carries no sequence; the order of a communication is SY.cognition's turn number); `ctx*` remains only as legacy protocol surface.

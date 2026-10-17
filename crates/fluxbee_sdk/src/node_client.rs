@@ -180,17 +180,32 @@ async fn connection_manager_loop(
                     backoff = Duration::from_millis(100);
                     continue;
                 }
-                Err(err) => {
-                    if let Some(tx) = announce_tx.take() {
+                // After the first connection the caller is gone and only the log can tell: a
+                // router that answers a HELLO with a close has refused it (A-44: another live
+                // connection holds this node's UUID).
+                Err(err) => match announce_tx.take() {
+                    Some(tx) => {
                         let _ = tx.send(Err(err));
                     }
-                }
+                    None => tracing::warn!(
+                        node = %cfg.full_name,
+                        error = %err,
+                        retry_in_ms = backoff.as_millis() as u64,
+                        "router handshake failed; retrying"
+                    ),
+                },
             },
-            Err(err) => {
-                if let Some(tx) = announce_tx.take() {
+            Err(err) => match announce_tx.take() {
+                Some(tx) => {
                     let _ = tx.send(Err(err));
                 }
-            }
+                None => tracing::debug!(
+                    node = %cfg.full_name,
+                    error = %err,
+                    retry_in_ms = backoff.as_millis() as u64,
+                    "router socket not reachable; retrying"
+                ),
+            },
         }
         time::sleep(backoff).await;
         backoff = std::cmp::min(backoff * 2, Duration::from_secs(30));

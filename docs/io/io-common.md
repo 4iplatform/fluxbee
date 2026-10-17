@@ -26,7 +26,7 @@
 
 ## Adaptación temporal al core/SDK (campos L3 e identidad)
 
-> ✅ **Canónico (protocolo Fluxbee):** existen carriers dedicados para identidad y continuidad conversacional. En el repo actual, `src_ilk` y `thread_id/thread_seq` forman parte del camino canónico activo, mientras que `ich` debe interpretarse como **canal local/sistémico** del nodo IO.  
+> ✅ **Canónico (protocolo Fluxbee):** existen carriers dedicados para identidad y continuidad conversacional. En el repo actual, `src_ilk` y `thread_id` forman parte del camino canónico activo, mientras que `ich` debe interpretarse como **canal local/sistémico** del nodo IO.  
 > ⚠️ **Estado actual (core/SDK):** el SDK no expone todos los campos L3 dedicados, pero `src_ilk` sí se transporta canónicamente en `meta.src_ilk`. `meta.context` queda para metadata adicional.
 
 ✅ **NORMATIVO (HOY, implementación compatible):**

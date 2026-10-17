@@ -58,8 +58,6 @@ pub struct Meta {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub thread_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub thread_seq: Option<u64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     /// Legacy/historical field from the pre-thread cognition model.
     pub ctx: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -271,6 +269,22 @@ pub struct ConfigChangedPayload {
     pub version: u64,
     #[serde(default)]
     pub config: Value,
+    /// The hive this config belongs to. `None` = every hive (global config). `Some(h)` =
+    /// hive-scoped config (e.g. the route list of hive `h` after `add_route?hive=h`): a
+    /// receiver on any other hive MUST ignore it, or it would overwrite its own config
+    /// with another hive's.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hive: Option<String>,
+}
+
+impl ConfigChangedPayload {
+    /// True when this payload may be applied by a receiver on `local_hive`.
+    pub fn addressed_to(&self, local_hive: &str) -> bool {
+        match self.hive.as_deref().map(str::trim) {
+            None | Some("") => true,
+            Some(hive) => hive == local_hive,
+        }
+    }
 }
 
 /// Broadcast payload emitted by SY.vault whenever a secret changes
@@ -291,10 +305,18 @@ pub struct VaultSecretChangedPayload {
     /// Owning tenant. `DEFAULT_ROOT_TENANT_ID` for infrastructure-wide
     /// system pool secrets; `"tnt:<uuid>"` for tenant-scoped secrets.
     pub tenant_id: String,
-    /// Owner ILK when the secret is dedicated to a single caller. `None`
-    /// (or empty string) when the secret lives in the pool.
+    /// Owner ILK when the secret has one (a node or a person). `None` (or empty string) when it
+    /// has none.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ilk: Option<String>,
+    /// The nodes the secret is assigned to; on an assignment change, those it had and those it
+    /// has now, so a node that lost it reacts too (docs/ilk-tenant-model-v1.md §2.2).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub assigned_ilks: Vec<String>,
+    /// The secret is, or was before this change, its tenant's general secret (no owner, no
+    /// assigned node): every node of the tenant may have been reading it.
+    #[serde(default)]
+    pub general: bool,
     /// New version number after the operation. Increments per change.
     /// `0` for delete events (the version no longer exists).
     pub version: i64,
@@ -317,6 +339,8 @@ pub enum VaultSecretOp {
     Rotate,
     Delete,
     Rollback,
+    /// The nodes it is assigned to changed; the value did not.
+    Assign,
 }
 
 impl VaultSecretOp {
@@ -326,6 +350,7 @@ impl VaultSecretOp {
             Self::Rotate => "rotate",
             Self::Delete => "delete",
             Self::Rollback => "rollback",
+            Self::Assign => "assign",
         }
     }
 }
@@ -358,21 +383,20 @@ impl VaultSecretChangedPayload {
         }
         let secret_ilk = self.ilk.as_deref().map(str::trim).filter(|v| !v.is_empty());
         let my_ilk = interest.my_ilk.map(str::trim).filter(|v| !v.is_empty());
-        // (1) Dedicated match.
-        if let (Some(owner), Some(mine)) = (secret_ilk, my_ilk) {
-            return owner == mine;
+        // (1) Owned by me, or assigned to me (now or before this change).
+        if let Some(mine) = my_ilk {
+            if secret_ilk == Some(mine) || self.assigned_ilks.iter().any(|ilk| ilk.trim() == mine) {
+                return true;
+            }
         }
-        // Pool match — secret has no ilk.
-        if secret_ilk.is_none() {
-            // (2a) Tenant pool.
+        // (2) General — no owner and no assigned node, now or before this change.
+        if self.general {
+            // (2a) My tenant's general secret.
             if self.tenant_id == interest.my_tenant {
                 return true;
             }
-            // (2b) Root-tenant pool universal for system callers — secrets
-            // in the hive's root tenant (`DEFAULT_ROOT_TENANT_ID`, alias
-            // `fluxbee`) are infrastructure-wide; any SY system caller
-            // reads them regardless of which tenant they themselves
-            // belong to.
+            // (2b) The genesis (root) tenant's general secrets are the system's keys: any SY
+            // system caller reads them.
             if interest.system_caller && self.tenant_id == crate::identity::DEFAULT_ROOT_TENANT_ID {
                 return true;
             }
@@ -499,7 +523,30 @@ pub const MSG_WAN_REJECT: &str = "WAN_REJECT";
 pub const MSG_TIME_SYNC: &str = "TIME_SYNC";
 pub const MSG_WITHDRAW: &str = "WITHDRAW";
 pub const MSG_CONFIG_CHANGED: &str = "CONFIG_CHANGED";
+
+/// The primary hive — the single motherbee, home of the singleton SY.admin and SY.vault.
+/// Nodes on any other hive reach those services here, never at their own hive.
+pub const PRIMARY_HIVE_ID: &str = "motherbee";
+/// Protocol version advertised in the WAN `HELLO` between hives.
+///
+/// TELEMETRY, NOT A GATE. In fluxbee the HASH is the gate and the VERSION is a report — the same
+/// split the OPA reload uses (different version → warn, different hash → reject).
+///
+/// ⛔ Do NOT start rejecting peers whose version differs. That is self-fencing: the cross-hive
+/// `SYSTEM_UPDATE` travels over the mesh and needs LSA visibility of its target, so cutting off
+/// the outdated peer severs the only channel capable of updating it (U-4a).
+pub const MESH_PROTOCOL_VERSION: &str = "fluxbee/1.16";
+
 pub const MSG_VAULT_SECRET_CHANGED: &str = "VAULT_SECRET_CHANGED";
+
+/// Stamped in `Meta.action` (NOT in the payload) on the `VAULT_SECRET_CHANGED` broadcasts
+/// `SY.vault` emits for every secret it already holds during ITS OWN startup.
+///
+/// These are a re-announcement, not a change — they exist to rescue consumers that raced ahead
+/// of the vault at boot. Any consumer whose reaction is DESTRUCTIVE must check this: `SY.edge`
+/// reacts to a TLS change by exiting for a systemd restart, so before this was honoured every
+/// `sy-vault` bounce recycled a perfectly healthy public HTTPS listener (PB-9).
+pub const VAULT_BOOTSTRAP_ACTION: &str = "bootstrap";
 pub const MSG_CONFIG_GET: &str = "CONFIG_GET";
 pub const MSG_CONFIG_SET: &str = "CONFIG_SET";
 pub const MSG_CONFIG_RESPONSE: &str = "CONFIG_RESPONSE";
@@ -567,7 +614,6 @@ pub fn build_system_message(
             dst_ilk: None,
             ich: None,
             thread_id: None,
-            thread_seq: None,
             ctx: None,
             ctx_seq: None,
             ctx_window: None,
@@ -793,6 +839,28 @@ mod tests {
     use super::*;
 
     #[test]
+    fn config_changed_payload_hive_scope() {
+        let global: ConfigChangedPayload =
+            serde_json::from_value(json!({"subsystem": "routes", "version": 3})).expect("parse");
+        assert_eq!(global.hive, None);
+        assert!(global.addressed_to("motherbee"));
+        assert!(global.addressed_to("worker1"));
+        assert!(serde_json::to_value(&global).expect("encode").get("hive").is_none());
+
+        let scoped: ConfigChangedPayload = serde_json::from_value(
+            json!({"subsystem": "routes", "version": 3, "hive": "worker1"}),
+        )
+        .expect("parse");
+        assert!(scoped.addressed_to("worker1"));
+        assert!(!scoped.addressed_to("motherbee"));
+
+        let blank: ConfigChangedPayload =
+            serde_json::from_value(json!({"subsystem": "routes", "version": 3, "hive": " "}))
+                .expect("parse");
+        assert!(blank.addressed_to("motherbee"));
+    }
+
+    #[test]
     fn build_system_message_omits_src_l2_name_on_outbound_messages() {
         let msg = build_system_message(
             "src-uuid-1",
@@ -943,6 +1011,8 @@ mod tests {
             resource_type: resource_type.to_string(),
             tenant_id: tenant_id.to_string(),
             ilk: ilk.map(str::to_string),
+            assigned_ilks: Vec::new(),
+            general: ilk.is_none(),
             version: 1,
             key: "infra:test".to_string(),
             hive_id: "motherbee".to_string(),
@@ -988,6 +1058,32 @@ mod tests {
             my_ilk: Some("ilk:consumer"),
             system_caller: false,
         }));
+    }
+
+    #[test]
+    fn vault_secret_changed_reaches_assigned_nodes_and_the_tenant_only_when_general() {
+        let interest = |ilk: &'static str| VaultSecretInterest {
+            resource_type: "slack",
+            my_tenant: "tnt:client",
+            my_ilk: Some(ilk),
+            system_caller: false,
+        };
+        let mut event = vault_changed_event("slack", "tnt:client", None);
+        event.op = VaultSecretOp::Assign;
+        event.assigned_ilks = vec!["ilk:sales".to_string(), "ilk:support".to_string()];
+        event.general = false;
+        assert!(event.matches_interest(&interest("ilk:sales")));
+        assert!(event.matches_interest(&interest("ilk:support")));
+        // Another node of the tenant: the secret is not general.
+        assert!(!event.matches_interest(&interest("ilk:billing")));
+        // It was general before the assignment: every node of the tenant may have been reading it.
+        event.general = true;
+        assert!(event.matches_interest(&interest("ilk:billing")));
+        // A person-owned secret reaches its assigned node, not the person's other nodes.
+        let mut owned = vault_changed_event("slack", "tnt:client", Some("ilk:person"));
+        owned.assigned_ilks = vec!["ilk:agent".to_string()];
+        assert!(owned.matches_interest(&interest("ilk:agent")));
+        assert!(!owned.matches_interest(&interest("ilk:billing")));
     }
 
     #[test]

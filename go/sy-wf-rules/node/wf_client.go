@@ -4,20 +4,20 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"strings"
+	"time"
 
 	fluxbeesdk "github.com/4iplatform/json-router/fluxbee-go-sdk"
 )
 
-const wfNodeRPCTimeout = 2 * orchestratorRPCTimeout / 3
+// wfNodeRPCTimeout bounds a direct read of a WF node's running instances (WF_LIST_INSTANCES).
+const wfNodeRPCTimeout = 2 * time.Second
 
+// wfNodeClient reads a WF node's own data. Counting a workflow's running instances is the one
+// thing SY.wf-rules asks a WF node directly: a read of the workflow's own state, not an action on
+// the node; launching, restarting, deleting and the node's status go through SY.admin
+// (node_lifecycle.go).
 type wfNodeClient interface {
-	GetNodeStatus(ctx context.Context, nodeName string) (wfNodeStatusProbe, error)
 	CountRunningInstances(ctx context.Context, nodeName string) (int, error)
-}
-
-type wfNodeStatusProbe struct {
-	HealthState string
 }
 
 type l2WFNodeClient struct {
@@ -59,31 +59,6 @@ func (c *l2WFNodeClient) wfSystemRPC(
 	return decoded, nil
 }
 
-func (c *l2WFNodeClient) GetNodeStatus(ctx context.Context, nodeName string) (wfNodeStatusProbe, error) {
-	decoded, err := c.wfSystemRPC(
-		ctx,
-		nodeName,
-		fluxbeesdk.MSGNodeStatusGet,
-		fluxbeesdk.MSGNodeStatusGetResponse,
-		map[string]any{"node_name": nodeName},
-	)
-	if err != nil {
-		return wfNodeStatusProbe{}, err
-	}
-	status := strings.TrimSpace(stringValueFromMap(decoded, "status"))
-	if status != "" && status != "ok" {
-		code := stringValueFromMap(decoded, "error_code")
-		detail := stringValueFromMap(decoded, "error_detail")
-		if code == "" && detail == "" {
-			return wfNodeStatusProbe{}, fmt.Errorf("wf node returned unsuccessful node status response")
-		}
-		return wfNodeStatusProbe{}, WfRulesError{Code: code, Detail: detail}
-	}
-	return wfNodeStatusProbe{
-		HealthState: strings.TrimSpace(stringValueFromMap(decoded, "health_state")),
-	}, nil
-}
-
 func (c *l2WFNodeClient) CountRunningInstances(ctx context.Context, nodeName string) (int, error) {
 	decoded, err := c.wfSystemRPC(
 		ctx,
@@ -97,8 +72,7 @@ func (c *l2WFNodeClient) CountRunningInstances(ctx context.Context, nodeName str
 	}
 	ok, _ := decoded["ok"].(bool)
 	if !ok {
-		code := stringValueFromMapMap(decoded, "error", "code")
-		detail := stringValueFromMapMap(decoded, "error", "detail")
+		code, detail := wfControlError(decoded)
 		if code == "" && detail == "" {
 			return 0, fmt.Errorf("wf node returned unsuccessful response")
 		}
@@ -118,4 +92,21 @@ func (c *l2WFNodeClient) CountRunningInstances(ctx context.Context, nodeName str
 	default:
 		return 0, fmt.Errorf("wf node returned invalid count type %T", countValue)
 	}
+}
+
+// wfControlError reads a WF node's refusal of a WF_* request: `{ok:false, error:<code>,
+// detail:<text>}`, the shape the node's control verbs answer with (e.g. node_not_configured while
+// its config is not in use); an `error` object with code and message/detail is read as well.
+func wfControlError(decoded map[string]any) (string, string) {
+	switch value := decoded["error"].(type) {
+	case string:
+		return value, stringValueFromMap(decoded, "detail")
+	case map[string]any:
+		detail := stringValueFromMap(value, "message")
+		if detail == "" {
+			detail = stringValueFromMap(value, "detail")
+		}
+		return stringValueFromMap(value, "code"), detail
+	}
+	return "", stringValueFromMap(decoded, "detail")
 }

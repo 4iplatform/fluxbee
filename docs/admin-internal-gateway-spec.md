@@ -287,8 +287,8 @@ Params:
 
 ### 7.5 Explicit exclusions (v1)
 
-- `PUT /config/routes` y `PUT /config/vpns`: flujo broadcast/config local, fuera de `ADMIN_COMMAND` v1.
-- `GET /config/storage/metrics`: endpoint especializado NATS/metrics, fuera de `ADMIN_COMMAND` v1.
+- (`PUT /config/routes` y `PUT /config/vpns` ya no existen desde 0.1.40–0.1.41: rutas y VPN se cambian con las acciones admin de cada hive.)
+- `GET /config/storage/metrics`: endpoint especializado (pide a `SY.storage` sus métricas de inbox con `STORAGE_METRICS_GET` por la malla), fuera de `ADMIN_COMMAND` v1.
 - `/modules/*`: superficie de módulos queda HTTP-only en esta fase.
 
 ---

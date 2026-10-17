@@ -9,6 +9,18 @@
 > and drift-reconciled) all exist. A single-NIC guard also shipped: `resolve_egress_nat_config`
 > rejects `wan_iface == lan_iface`. The design-tense wording below (§6 "currently binary", §6.5
 > "does not exist today", the §12 unchecked checklist) predates this and no longer reflects the code.
+>
+> **Update 2026-10-06 (design, not yet built): host posture.** `docs/host-posture-and-exposure-spec-v1.md`
+> (stages 4–5) supersedes two statements here once it is built:
+> - §3.3, that the egress accepts Fluxbee WAN and control SSH from the motherbee on its LAN. The
+>   egress gets no WAN listener, and accepts SSH from any host on its internal interface.
+> - §8.5, that motherbee and worker hosts keep the ufw/firewalld inbound path. Every role gets the
+>   Fluxbee-owned `table inet fluxbee_host`, and `fluxbee_egress` keeps only forward and NAT: its
+>   input chain is no longer rendered. It is never deleted explicitly (the file is re-applied every
+>   minute, and a delete fails on the second apply); the leftover chain is empty with `policy
+>   accept`, which cannot override `fluxbee_host`'s drop, and is gone at the next boot.
+>
+> The egress still fails loud without `nft`, because its NAT needs it.
 **Audience:** `SY.orchestrator` developer, deployment tooling, Ops/SRE
 **Supersedes:** `edge-egress-nat-spec.md` v0.1 (2026-05-27)
 **Related:** `edge-control-protocol.md`, `01-arquitectura.md`, `05-conectividad.md`, `07-operaciones.md`, `sy_orchestrator.rs`
@@ -152,10 +164,6 @@ egress:
   lan_iface: "eth1"                   # interface toward the LAN
   ipv6: "blocked"                     # only "blocked" supported in v1
 
-nats:
-  mode: embedded
-  port: 4222
-
 storage:
   path: "/var/lib/fluxbee"
 
@@ -207,7 +215,6 @@ struct HiveFile {
     hive_id: String,
     role: Option<String>,
     wan: Option<WanSection>,
-    nats: Option<NatsSection>,
     storage: Option<StorageSection>,
     blob: Option<BlobSection>,
     dist: Option<DistSection>,
@@ -516,11 +523,7 @@ For a worker receiving the route:
 
 Egress NAT does not touch the `wan` section or `RT.gateway`. WAN is Fluxbee protocol connectivity between hives over sockets; egress NAT is OS-level IP forwarding to the internet. They are orthogonal layers on the same host and coexist without interaction.
 
-### 10.2 With NATS
-
-Egress to the internet does not use NATS. An AI node calling OpenAI opens HTTPS directly; the OS routes it through the egress gateway. NATS configuration is not coupled to egress.
-
-### 10.3 With `RT.edge` (ingress, future)
+### 10.2 With `RT.edge` (ingress, future)
 
 `RT.edge` is the future public ingress runtime (`edge-control-protocol.md`). It handles HTTPS termination, TLS material, JWT validation, tenant cache, and HTTP→L2 translation. It is a **separate responsibility** from egress NAT.
 

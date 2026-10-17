@@ -46,6 +46,11 @@ pub enum ActionResult {
     Blocked,
     Applied,
     Failed,
+    /// Taken, but not finished — the work runs in the background and the caller polls for the
+    /// outcome (a backgrounded `add_hive`, PB-7). Distinct from `Applied`: nothing has been
+    /// applied yet. Without this, `derive_action_outcome`'s catch-all stamped every successful
+    /// acceptance as `Failed`.
+    Accepted,
 }
 
 impl ActionResult {
@@ -54,6 +59,7 @@ impl ActionResult {
             Self::Blocked => "blocked",
             Self::Applied => "applied",
             Self::Failed => "failed",
+            Self::Accepted => "accepted",
         }
     }
 }
@@ -76,6 +82,7 @@ pub fn classify_admin_action(action: &str) -> Option<ActionClass> {
         "list_hives"
         | "get_hive"
         | "list_nodes"
+        | "list_tenant_nodes"
         | "get_node_status"
         | "get_node_config"
         | "get_node_state"
@@ -101,11 +108,15 @@ pub fn classify_admin_action(action: &str) -> Option<ActionClass> {
         | "opa_apply"
         | "opa_compile_apply"
         | "opa_rollback"
+        | "opa_clear"
         | "update_policy_matrix"
         | "clear_override"
         | "sync_hint"
         | "update"
         | "set_storage"
+        // Swaps /usr/bin binaries and restarts the core. Without this arm
+        // `admin_action_requires_origin` returns false and the F8 origin gate never runs.
+        | "core_rollback"
         | "remove_runtime_version" => Some(ActionClass::SystemConfig),
         "add_hive" | "remove_hive" => Some(ActionClass::TopologyChange),
         "run_node" | "kill_node" | "remove_node_instance" => Some(ActionClass::NodeLifecycle),
@@ -115,6 +126,11 @@ pub fn classify_admin_action(action: &str) -> Option<ActionClass> {
         | "list_ilks"
         | "get_ilk"
         | "delete_ilk"
+        | "restore_ilk"
+        | "purge_ilk"
+        | "delete_tenant"
+        | "restore_tenant"
+        | "purge_tenant"
         | "list_vocabulary"
         | "add_vocabulary"
         | "deprecate_vocabulary" => Some(ActionClass::IdentityChange),
@@ -129,7 +145,7 @@ pub fn classify_system_message(msg: &str) -> Option<ActionClass> {
         | "NODE_STATUS_GET" | "GET_VERSIONS" | "GET_RUNTIMES" | "LIST_NODES" | "GET_RUNTIME"
         | "INVENTORY_REQUEST" | "ILK_LIST" | "ILK_GET" => Some(ActionClass::Read),
         MSG_CONFIG_SET | "NODE_CONFIG_SET" => Some(ActionClass::Write),
-        "RUNTIME_UPDATE" | "SYSTEM_UPDATE" | "SYSTEM_SYNC_HINT" | "OPA_APPLY"
+        "RUNTIME_UPDATE" | "SYSTEM_UPDATE" | "SYSTEM_CORE_ROLLBACK" | "SYSTEM_SYNC_HINT" | "OPA_APPLY"
         | "OPA_COMPILE_APPLY" | "OPA_ROLLBACK" => Some(ActionClass::SystemConfig),
         "ADD_HIVE_FINALIZE" | "REMOVE_HIVE_CLEANUP" => Some(ActionClass::TopologyChange),
         "SPAWN_NODE" | "KILL_NODE" | "REMOVE_NODE_INSTANCE" => Some(ActionClass::NodeLifecycle),
@@ -153,6 +169,10 @@ pub fn derive_action_outcome(
 
     if status.is_some_and(|value| value.eq_ignore_ascii_case("ok")) {
         return (Some(ActionResult::Applied), None);
+    }
+
+    if status.is_some_and(|value| value.eq_ignore_ascii_case("accepted")) {
+        return (Some(ActionResult::Accepted), None);
     }
 
     if status.is_some_and(|value| value.eq_ignore_ascii_case("blocked"))

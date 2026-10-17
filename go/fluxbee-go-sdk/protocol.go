@@ -5,6 +5,13 @@ import (
 	"fmt"
 )
 
+// PrimaryHiveID is the single motherbee: home of the singleton SY.admin and SY.vault.
+// Mirrors Rust `system_policy::PRIMARY_HIVE_ID`.
+const PrimaryHiveID = "motherbee"
+
+// PrimaryAdminNode is the only SY.admin in the mesh.
+const PrimaryAdminNode = "SY.admin@" + PrimaryHiveID
+
 type Message struct {
 	Routing Routing         `json:"routing"`
 	Meta    Meta            `json:"meta"`
@@ -97,7 +104,6 @@ type Meta struct {
 	DstIlk           *string         `json:"dst_ilk,omitempty"`
 	Ich              *string         `json:"ich,omitempty"`
 	ThreadID         *string         `json:"thread_id,omitempty"`
-	ThreadSeq        *uint64         `json:"thread_seq,omitempty"`
 	Ctx              *string         `json:"ctx,omitempty"`
 	CtxSeq           *uint64         `json:"ctx_seq,omitempty"`
 	CtxWindow        []CtxTurn       `json:"ctx_window,omitempty"`
@@ -204,6 +210,24 @@ const (
 	ScopeVPN                 = "vpn"
 	ScopeGlobal              = "global"
 )
+
+// IsSystemKind reports whether a msg_type is the system kind, ignoring ASCII case, as the router
+// and the Rust SDK compare it (`is_system_kind`).
+func IsSystemKind(msgType string) bool {
+	if len(msgType) != len(SYSTEMKind) {
+		return false
+	}
+	for i := 0; i < len(msgType); i++ {
+		c := msgType[i]
+		if 'A' <= c && c <= 'Z' {
+			c += 'a' - 'A'
+		}
+		if c != SYSTEMKind[i] {
+			return false
+		}
+	}
+	return true
+}
 
 // SourceL2Name returns the canonical L2 name of the sender as stamped by the
 // router on delivery. Node code should read sender identity from here rather

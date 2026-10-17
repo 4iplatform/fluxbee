@@ -5,7 +5,6 @@ use fluxbee_sdk::blob::{BlobConfig, BlobRef, BlobToolkit, ResolveRetryConfig};
 use fluxbee_sdk::payload::TextV1Payload;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use tokio::fs as tokio_fs;
 
 use crate::errors::{AiSdkError, Result};
 
@@ -62,10 +61,12 @@ impl Default for TextResponseOptions {
     }
 }
 
+/// An attachment with its bytes, read and checked against its BlobRef (FINDINGS A-56). A non-text
+/// attachment that has not arrived yet has no bytes: building the model parts reports it, as before.
 #[derive(Debug, Clone)]
 pub struct ResolvedModelAttachment {
     pub blob_ref: BlobRef,
-    pub path: PathBuf,
+    pub data: Option<Vec<u8>>,
     pub text_content: Option<String>,
 }
 
@@ -142,21 +143,14 @@ pub async fn build_model_user_content_parts_with_options(
             continue;
         }
 
+        let data = attachment.data.as_ref().ok_or_else(|| {
+            ModelInputPayloadError::BlobNotFound(format!(
+                "Failed to read attachment blob '{}': not in the blob store",
+                attachment.blob_ref.blob_name
+            ))
+        })?;
         if is_supported_image_mime(&attachment.blob_ref.mime) {
-            let bytes = tokio_fs::read(&attachment.path).await.map_err(|err| {
-                if err.kind() == std::io::ErrorKind::NotFound {
-                    ModelInputPayloadError::BlobNotFound(format!(
-                        "Failed to read attachment blob '{}': {}",
-                        attachment.blob_ref.blob_name, err
-                    ))
-                } else {
-                    ModelInputPayloadError::BlobIo(format!(
-                        "Failed to read attachment blob '{}': {}",
-                        attachment.blob_ref.blob_name, err
-                    ))
-                }
-            })?;
-            let encoded = base64::engine::general_purpose::STANDARD.encode(bytes);
+            let encoded = base64::engine::general_purpose::STANDARD.encode(data);
             parts.push(ModelContentPart::Image {
                 media_type: attachment.blob_ref.mime.clone(),
                 data_base64: encoded,
@@ -165,20 +159,7 @@ pub async fn build_model_user_content_parts_with_options(
             continue;
         }
 
-        let bytes = tokio_fs::read(&attachment.path).await.map_err(|err| {
-            if err.kind() == std::io::ErrorKind::NotFound {
-                ModelInputPayloadError::BlobNotFound(format!(
-                    "Failed to read attachment blob '{}': {}",
-                    attachment.blob_ref.blob_name, err
-                ))
-            } else {
-                ModelInputPayloadError::BlobIo(format!(
-                    "Failed to read attachment blob '{}': {}",
-                    attachment.blob_ref.blob_name, err
-                ))
-            }
-        })?;
-        let encoded = base64::engine::general_purpose::STANDARD.encode(bytes);
+        let encoded = base64::engine::general_purpose::STANDARD.encode(data);
         parts.push(ModelContentPart::Document {
             media_type: attachment.blob_ref.mime.clone(),
             filename: canonical_attachment_filename(attachment),
@@ -340,16 +321,28 @@ pub async fn resolve_model_input_from_payload_with_options(
             options.multimodal,
         )?;
 
-        let path =
-            resolve_blob_path(&blob, attachment, "attachments[]", options.resolve_retry).await?;
-        let mut text_content = None;
-        if is_textual_mime(&attachment.mime) {
-            text_content =
-                Some(load_blob_text_from_path(&path, attachment, "attachments[]").await?);
-        }
+        let data = match read_blob_bytes(&blob, attachment, "attachments[]", options.resolve_retry)
+            .await
+        {
+            Ok(data) => Some(data),
+            // Only text is needed now; other bytes are needed when the parts are built.
+            Err(ModelInputPayloadError::BlobNotFound(_)) if !is_textual_mime(&attachment.mime) => {
+                None
+            }
+            Err(err) => return Err(err),
+        };
+        // Text goes into the prompt as text; only other attachments keep their bytes.
+        let (data, text_content) = if is_textual_mime(&attachment.mime) {
+            (
+                None,
+                data.map(|data| String::from_utf8_lossy(&data).to_string()),
+            )
+        } else {
+            (data, None)
+        };
         resolved_attachments.push(ResolvedModelAttachment {
             blob_ref: attachment.clone(),
-            path: path.clone(),
+            data,
             text_content,
         });
 
@@ -409,54 +402,34 @@ async fn load_blob_text(
     field: &str,
     resolve_retry: Option<ResolveRetryConfig>,
 ) -> std::result::Result<String, ModelInputPayloadError> {
-    let path = resolve_blob_path(blob, blob_ref, field, resolve_retry).await?;
-    load_blob_text_from_path(&path, blob_ref, field).await
+    let data = read_blob_bytes(blob, blob_ref, field, resolve_retry).await?;
+    Ok(String::from_utf8_lossy(&data).to_string())
 }
 
-async fn resolve_blob_path(
+/// Reads a blob checked against its BlobRef (FINDINGS A-56), waiting for it to arrive when asked.
+async fn read_blob_bytes(
     blob: &BlobToolkit,
     blob_ref: &BlobRef,
     field: &str,
     resolve_retry: Option<ResolveRetryConfig>,
-) -> std::result::Result<PathBuf, ModelInputPayloadError> {
-    if let Some(cfg) = resolve_retry {
-        blob.resolve_with_retry(blob_ref, cfg).await.map_err(|err| {
-            if matches!(err, fluxbee_sdk::blob::BlobError::NotFound(_)) {
-                ModelInputPayloadError::BlobNotFound(format!(
-                    "Failed to resolve {field} blob '{}': {}",
-                    blob_ref.blob_name, err
-                ))
-            } else {
-                ModelInputPayloadError::BlobIo(format!(
-                    "Failed to resolve {field} blob '{}': {}",
-                    blob_ref.blob_name, err
-                ))
-            }
-        })
-    } else {
-        Ok(blob.resolve(blob_ref))
-    }
-}
-
-async fn load_blob_text_from_path(
-    path: &PathBuf,
-    blob_ref: &BlobRef,
-    field: &str,
-) -> std::result::Result<String, ModelInputPayloadError> {
-    let data = tokio_fs::read(path).await.map_err(|err| {
-        if err.kind() == std::io::ErrorKind::NotFound {
+) -> std::result::Result<Vec<u8>, ModelInputPayloadError> {
+    let read = match resolve_retry {
+        Some(cfg) => blob.read_blob_with_retry(blob_ref, cfg).await,
+        None => blob.read_blob_async(blob_ref).await,
+    };
+    read.map_err(|err| {
+        if matches!(err, fluxbee_sdk::blob::BlobError::NotFound(_)) {
             ModelInputPayloadError::BlobNotFound(format!(
                 "Failed to resolve {field} blob '{}': {}",
                 blob_ref.blob_name, err
             ))
         } else {
             ModelInputPayloadError::BlobIo(format!(
-                "Failed to resolve {field} blob '{}': {}",
+                "Failed to read {field} blob '{}': {}",
                 blob_ref.blob_name, err
             ))
         }
-    })?;
-    Ok(String::from_utf8_lossy(&data).to_string())
+    })
 }
 
 fn is_textual_mime(mime: &str) -> bool {
@@ -545,6 +518,7 @@ mod tests {
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
+    use tokio::fs as tokio_fs;
     use tokio::time::{sleep, Duration};
 
     fn temp_blob_root() -> PathBuf {
@@ -692,14 +666,13 @@ mod tests {
     async fn model_input_resolves_content_ref_with_retry_when_blob_appears_late() {
         let root = temp_blob_root();
         let toolkit = blob_toolkit(Some(&root)).expect("toolkit");
-        let blob_ref = BlobRef {
-            ref_type: "blob_ref".to_string(),
-            blob_name: "late_0123456789abcdef.txt".to_string(),
-            size: 11,
-            mime: "text/plain".to_string(),
-            filename_original: "late.txt".to_string(),
-            spool_day: "2026-03-31".to_string(),
-        };
+        // The real name and size of these bytes (read_blob checks them), staged in a scratch root.
+        let scratch_root = temp_blob_root();
+        let blob_ref = blob_toolkit(Some(&scratch_root))
+            .expect("scratch toolkit")
+            .put_bytes(b"hola tardio", "late.txt", "text/plain")
+            .expect("name the late blob");
+        let _ = std::fs::remove_dir_all(&scratch_root);
         let target = toolkit.resolve(&blob_ref);
         std::fs::create_dir_all(
             target
@@ -772,22 +745,10 @@ mod tests {
     async fn resolve_model_input_builds_mixed_prompt_and_structured_attachments() {
         let root = temp_blob_root();
         let toolkit = blob_toolkit(Some(&root)).expect("toolkit");
-        let text_blob = BlobRef {
-            ref_type: "blob_ref".to_string(),
-            blob_name: "doc_0123456789abcdef.txt".to_string(),
-            size: 15,
-            mime: "text/plain".to_string(),
-            filename_original: "error.txt".to_string(),
-            spool_day: "2026-03-31".to_string(),
-        };
-        let text_path = toolkit.resolve(&text_blob);
-        std::fs::create_dir_all(
-            text_path
-                .parent()
-                .expect("text blob parent must exist for test setup"),
-        )
-        .expect("create blob parent");
-        std::fs::write(&text_path, b"linea uno\nlinea dos").expect("write text blob");
+        let text_blob = toolkit
+            .put_bytes(b"linea uno\nlinea dos", "error.txt", "text/plain")
+            .expect("put text blob");
+        toolkit.promote(&text_blob).expect("promote text blob");
 
         let image_blob = BlobRef {
             ref_type: "blob_ref".to_string(),
@@ -864,7 +825,7 @@ mod tests {
             prompt_text: "mirÃ¡".to_string(),
             attachments: vec![ResolvedModelAttachment {
                 blob_ref: image_blob,
-                path: image_path,
+                data: Some(std::fs::read(&image_path).expect("read image bytes")),
                 text_content: None,
             }],
         };
@@ -905,7 +866,7 @@ mod tests {
             prompt_text: "mira".to_string(),
             attachments: vec![ResolvedModelAttachment {
                 blob_ref: file_blob,
-                path: file_path,
+                data: Some(std::fs::read(&file_path).expect("read file bytes")),
                 text_content: None,
             }],
         };
@@ -946,7 +907,7 @@ mod tests {
             prompt_text: "mira".to_string(),
             attachments: vec![ResolvedModelAttachment {
                 blob_ref: file_blob,
-                path: file_path,
+                data: Some(std::fs::read(&file_path).expect("read file bytes")),
                 text_content: None,
             }],
         };
@@ -976,7 +937,7 @@ mod tests {
                     filename_original: "bad.bin".to_string(),
                     spool_day: "2026-03-31".to_string(),
                 },
-                path: PathBuf::from("bad.bin"),
+                data: None,
                 text_content: None,
             }],
         };
@@ -1012,7 +973,7 @@ mod tests {
             prompt_text: "mira".to_string(),
             attachments: vec![ResolvedModelAttachment {
                 blob_ref: image_blob,
-                path: image_path,
+                data: Some(std::fs::read(&image_path).expect("read image bytes")),
                 text_content: None,
             }],
         };
@@ -1056,7 +1017,7 @@ mod tests {
             prompt_text: String::new(),
             attachments: vec![ResolvedModelAttachment {
                 blob_ref: image_blob,
-                path: image_path,
+                data: Some(std::fs::read(&image_path).expect("read image bytes")),
                 text_content: None,
             }],
         };
@@ -1129,17 +1090,17 @@ mod tests {
             attachments: vec![
                 ResolvedModelAttachment {
                     blob_ref: text_blob,
-                    path: root.join("unused-notes-path.txt"),
+                    data: Some(b"linea uno".to_vec()),
                     text_content: Some("linea uno".to_string()),
                 },
                 ResolvedModelAttachment {
                     blob_ref: image_blob,
-                    path: image_path,
+                    data: Some(std::fs::read(&image_path).expect("read image bytes")),
                     text_content: None,
                 },
                 ResolvedModelAttachment {
                     blob_ref: file_blob,
-                    path: file_path,
+                    data: Some(std::fs::read(&file_path).expect("read file bytes")),
                     text_content: None,
                 },
             ],

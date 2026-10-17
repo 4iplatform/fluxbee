@@ -2,7 +2,7 @@ use std::collections::HashSet;
 use std::time::Duration;
 
 use fluxbee_ai_sdk::errors::AiSdkError;
-use fluxbee_ai_sdk::{create_llm_client, LlmClient, LlmRequest, ModelSettings};
+use fluxbee_ai_sdk::{create_llm_client, AiAccount, LlmClient, LlmRequest, ModelSettings};
 use serde::Deserialize;
 use serde_json::json;
 use tokio::time;
@@ -11,9 +11,15 @@ use crate::{
     CognitionSemanticTaggerConfig, SemanticTaggerOutput, COGNITION_REASON_CANONICAL_SIGNALS,
 };
 
+/// The tagger answers one small JSON object; the cap only bounds a runaway answer. A model that
+/// reasons spends part of it before it answers, so it is not set as tight as the answer (A-69).
+const SEMANTIC_TAGGER_MAX_OUTPUT_TOKENS: u32 = 1024;
+
 #[derive(Debug, Clone)]
 pub(super) struct SemanticTaggerAiInput<'a> {
     pub(super) api_key: &'a str,
+    /// Who pays for the call: the communication's agent's tenant (docs/router-stream-v1.md §7.3).
+    pub(super) account: &'a AiAccount,
     pub(super) text: &'a str,
     pub(super) src_ilk: Option<&'a str>,
     pub(super) dst_ilk: Option<&'a str>,
@@ -43,16 +49,24 @@ pub(super) async fn run_semantic_tagger_ai(
         system: Some(build_system_prompt(input.config)),
         input: build_user_prompt(&input),
         input_parts: None,
-        max_output_tokens: Some(256),
+        max_output_tokens: Some(SEMANTIC_TAGGER_MAX_OUTPUT_TOKENS),
+        // No temperature: the current models of both providers reject it (Claude 5 "deprecated
+        // for this model", gpt-5.5 "not supported"), and every turn failed on it (A-69). The
+        // prompt fixes the shape of the answer.
         model_settings: Some(ModelSettings {
-            temperature: Some(0.1),
+            temperature: None,
             top_p: None,
-            max_output_tokens: Some(256),
+            max_output_tokens: Some(SEMANTIC_TAGGER_MAX_OUTPUT_TOKENS),
         }),
         output_schema: None,
     };
 
-    let client = create_llm_client(input.config.provider, input.api_key, None);
+    let client = create_llm_client(
+        input.config.provider,
+        input.api_key,
+        None,
+        input.account.clone(),
+    );
     let response = time::timeout(
         Duration::from_millis(input.config.timeout_ms),
         LlmClient::generate(client.as_ref(), request),

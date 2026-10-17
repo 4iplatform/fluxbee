@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
@@ -26,11 +26,7 @@ use fluxbee_sdk::blob::{
     BLOB_NAME_MAX_CHARS, BLOB_STAGING_TTL_HOURS,
 };
 use fluxbee_sdk::identity::IdentityError;
-use fluxbee_sdk::nats::{request_local, NatsRequestEnvelope, NatsResponseEnvelope};
-use fluxbee_sdk::protocol::{
-    ConfigChangedPayload, Destination, Message, Meta, Routing, MSG_CONFIG_CHANGED, SCOPE_GLOBAL,
-    SYSTEM_KIND,
-};
+use fluxbee_sdk::protocol::{Destination, Message, Meta, Routing, SYSTEM_KIND};
 #[cfg(not(test))]
 use fluxbee_sdk::rpc::{AdminCommandRequest, AdminCommandResult};
 use fluxbee_sdk::rpc::{
@@ -39,19 +35,19 @@ use fluxbee_sdk::rpc::{
 };
 use fluxbee_sdk::{
     classify_admin_action, classify_system_message, derive_action_outcome, ActionClass, NodeConfig,
-    NodeSender, NodeUuidMode, ADMIN_KIND, MSG_ADMIN_COMMAND,
+    NodeSender, NodeUuidMode, StorageMetricsResponse, ADMIN_KIND, MSG_ADMIN_COMMAND,
+    MSG_STORAGE_METRICS_GET, MSG_STORAGE_METRICS_RESPONSE,
 };
 use json_router::{
     runtime_manifest::{
-        load_runtime_manifest_from_paths as load_runtime_manifest_paths_shared,
-        parse_runtime_manifest_file as parse_runtime_manifest_file_shared, RuntimeManifest,
+        load_runtime_manifest_from_paths as load_runtime_manifest_paths_shared, RuntimeManifest,
         RuntimeManifestEntry,
     },
     shm::{
         now_epoch_ms, ConfigRegionReader, ConfigSnapshot, LsaRegionReader, LsaSnapshot, NodeEntry,
-        RemoteHiveEntry, RemoteNodeEntry, RouterRegionReader, ShmSnapshot, StaticRouteEntry,
-        TapEntry, VpnAssignment, ACTION_DROP, ACTION_FORWARD, FLAG_ACTIVE, FLAG_DELETED,
-        FLAG_STALE, HEARTBEAT_STALE_MS, HIVE_FLAG_SELF, MATCH_EXACT, MATCH_GLOB, MATCH_PREFIX,
+        RemoteHiveEntry, RouterRegionReader, ShmSnapshot, StaticRouteEntry, TapEntry,
+        VpnAssignment, ACTION_DROP, ACTION_FORWARD, FLAG_ACTIVE, FLAG_DELETED, FLAG_STALE,
+        HEARTBEAT_STALE_MS, HIVE_FLAG_SELF, MATCH_EXACT, MATCH_GLOB, MATCH_PREFIX,
     },
 };
 
@@ -65,23 +61,29 @@ const ORCH_SUDOERS_PATH: &str = "/etc/sudoers.d/fluxbee-orchestrator";
 const ORCH_SSH_GATE_PATH: &str = "/usr/local/bin/fluxbee-ssh-gate.sh";
 const RUNTIME_VERIFY_INTERVAL_SECS: u64 = 300;
 const RUNTIME_RETENTION_PROTECTION_WINDOW_SECS: u64 = 600;
-const NATS_BOOTSTRAP_TIMEOUT_SECS: u64 = 20;
 const STORAGE_BOOTSTRAP_TIMEOUT_SECS: u64 = 30;
 const STORAGE_DB_READINESS_TIMEOUT_SECS: u64 = 30;
 const STORAGE_DB_READINESS_REQUEST_TIMEOUT_SECS: u64 = 3;
-const SUBJECT_STORAGE_METRICS_GET: &str = "storage.metrics.get";
 const RPC_CH_ADMIN: &str = "admin";
 const RPC_CH_SYSTEM: &str = "system";
 const MSG_ILK_REGISTER: &str = "ILK_REGISTER";
 const MSG_ILK_UPDATE: &str = "ILK_UPDATE";
 const MSG_ILK_DELETE: &str = "ILK_DELETE";
+/// Since 2026-09-28 ILK_DELETE only MARKS (reversible, keys reserved); tearing a node down for
+/// good needs the purge too -- otherwise its node_name stays reserved and a re-spawn under the
+/// same name would be refused with ILK_DELETED.
+const MSG_ILK_PURGE: &str = "ILK_PURGE";
 const LIFECYCLE_NODES_BOOTSTRAP_TIMEOUT_SECS: u64 = 60;
-const MOTHERBEE_PACKAGED_NON_SYSTEM_NODES: &[&str] = &["IO.blob"];
 const ADD_HIVE_SOCKET_READY_PROBE_TIMEOUT_SECS: u64 = 10;
 const SYNCTHING_SERVICE_NAME: &str = "fluxbee-syncthing";
 const SYNCTHING_BOOTSTRAP_TIMEOUT_SECS: u64 = 30;
+/// How long a join waits for a new spoke's Syncthing to connect. The motherbee only accepts
+/// (host posture stage 2), so the spoke dials: after a motherbee restart that is its next
+/// reconnection attempt, up to `reconnectionIntervalS` later (60 s by Syncthing's default).
+const SYNCTHING_PEER_CONNECT_TIMEOUT_SECS: u64 = 90;
 const SYNCTHING_HEALTH_TIMEOUT_SECS: u64 = 2;
-const SYNCTHING_INSTALL_USER: &str = "fluxbee";
+/// Syncthing runs as this user on every host (FINDINGS A-58); the orchestrator creates it.
+const SYNCTHING_SERVICE_USER: &str = "fluxbee";
 const SYNCTHING_SYNC_PORT_TCP: u16 = 22000;
 const SYNCTHING_SYNC_PORT_UDP: u16 = 22000;
 const SYNCTHING_DISCOVERY_PORT_UDP: u16 = 21027;
@@ -91,7 +93,32 @@ const SSH_HARDEN_VERIFY_RETRIES: usize = 6;
 const SSH_HARDEN_VERIFY_DELAY_MS: u64 = 1000;
 const SYNCTHING_FOLDER_BLOB_ID: &str = "fluxbee-blob";
 const SYNCTHING_FOLDER_BLOB_PUBLIC_ID: &str = "fluxbee-blob-public";
-const SYNCTHING_FOLDER_DIST_ID: &str = "fluxbee-dist";
+/// LEGACY. One folder over the whole of `dist/`, shared with workers only. Superseded by the
+/// per-content / per-role folders below, which is what lets ingress and egress receive core
+/// updates at all without also receiving `runtimes/`. Kept solely so migration can REMOVE it:
+/// never re-point it, because `ensure_syncthing_folder_in_config_xml` rewrites a matching id's
+/// path in place, and a receive-only spoke then applies remote deletes — this repo already has
+/// an incident of syncthing deleting `runtimes/ai.common/0.1.2/**` through exactly that path
+/// (`docs/onworking NOE/CORE_DIAG_runtime_deletion_by_fluxbee_syncthing.md`).
+const SYNCTHING_FOLDER_DIST_LEGACY_ID: &str = "fluxbee-dist";
+/// Per-role core binaries: `fluxbee-dist-core-<role>`. Motherbee serves
+/// `dist/core/<role>` (materialized by `materialize_role_core_trees`); the spoke receives it
+/// onto its own `dist/core`, so `dist/core/bin/<c>` and `dist/core/manifest.json` stay put.
+const SYNCTHING_FOLDER_DIST_CORE_PREFIX: &str = "fluxbee-dist-core-";
+/// The vendored syncthing binary + its manifest. Every hive that runs syncthing needs it:
+/// `update category=vendor` reads the vendor manifest and hashes the syncthing binary, and
+/// returns MANIFEST_INVALID without them — i.e. a hive with no vendor channel can never
+/// upgrade its own syncthing.
+const SYNCTHING_FOLDER_DIST_VENDOR_ID: &str = "fluxbee-dist-vendor";
+/// Published runtime packages. WORKER ONLY — this is the subtree that carries tenant workflow
+/// packages, and the reason the DMZ must not receive all of `dist/`. It is also the ONLY
+/// delivery path for them: there is no `sync_runtime_to_worker` SSH push, so a worker without
+/// this folder can never receive a published package.
+const SYNCTHING_FOLDER_DIST_RUNTIMES_ID: &str = "fluxbee-dist-runtimes";
+/// The global user OPA policy, compiled once on the motherbee (SY.opa.rules publishes the wasm and
+/// a manifest under `dist/policy/opa/`). EVERY hive: each one's SY.opa.rules installs it from its
+/// local copy, so a hive that was down or cut off catches up as soon as the folder syncs.
+const SYNCTHING_FOLDER_DIST_POLICY_ID: &str = "fluxbee-dist-policy";
 const SYNCTHING_FOLDER_TYPE_SEND_RECEIVE: &str = "sendreceive";
 const SYNCTHING_FOLDER_TYPE_SEND_ONLY: &str = "sendonly";
 const SYNCTHING_FOLDER_TYPE_RECEIVE_ONLY: &str = "receiveonly";
@@ -102,6 +129,7 @@ const SYNCTHING_INSTALL_PATH: &str = "/var/lib/fluxbee/vendor/bin/syncthing";
 const DIST_ROOT_DIR: &str = "/var/lib/fluxbee/dist";
 const DIST_RUNTIME_ROOT_DIR: &str = "/var/lib/fluxbee/dist/runtimes";
 const DIST_RUNTIME_MANIFEST_PATH: &str = "/var/lib/fluxbee/dist/runtimes/manifest.json";
+const DIST_CORE_ROOT_DIR: &str = "/var/lib/fluxbee/dist/core";
 const DIST_CORE_BIN_SOURCE_DIR: &str = "/var/lib/fluxbee/dist/core/bin";
 const DIST_CORE_MANIFEST_PATH: &str = "/var/lib/fluxbee/dist/core/manifest.json";
 const DIST_VENDOR_ROOT_DIR: &str = "/var/lib/fluxbee/dist/vendor";
@@ -118,8 +146,6 @@ const DEFAULT_BLOB_SYNC_ENABLED: bool = false;
 const DEFAULT_BLOB_SYNC_TOOL: &str = "syncthing";
 const DEFAULT_BLOB_SYNC_API_PORT: u16 = 8384;
 const DEFAULT_BLOB_SYNC_DATA_DIR: &str = "/var/lib/fluxbee/syncthing";
-const DEFAULT_BLOB_SYNC_SERVICE_USER: &str = SYNCTHING_INSTALL_USER;
-const DEFAULT_BLOB_SYNC_ALLOW_ROOT_FALLBACK: bool = true;
 const DEFAULT_BLOB_GC_ENABLED: bool = false;
 const DEFAULT_BLOB_GC_INTERVAL_SECS: u64 = 3600;
 const DEFAULT_BLOB_GC_APPLY: bool = false;
@@ -137,7 +163,6 @@ struct HiveFile {
     hive_id: String,
     role: Option<String>,
     wan: Option<WanSection>,
-    nats: Option<NatsSection>,
     storage: Option<StorageSection>,
     blob: Option<BlobSection>,
     dist: Option<DistSection>,
@@ -335,13 +360,14 @@ struct WanSection {
     gateway_name: Option<String>,
     listen: Option<String>,
     authorized_hives: Option<Vec<String>>,
+    /// On a spoke, the motherbee it dials (`add_hive` writes one). The router reads it for the
+    /// WAN; the orchestrator reads it for the motherbee's static Syncthing address (stage 2).
+    uplinks: Option<Vec<WanUplink>>,
 }
 
 #[derive(Debug, Deserialize)]
-struct NatsSection {
-    mode: Option<String>,
-    port: Option<u16>,
-    url: Option<String>,
+struct WanUplink {
+    address: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -364,8 +390,6 @@ struct BlobSyncSection {
     tool: Option<String>,
     api_port: Option<u16>,
     data_dir: Option<String>,
-    service_user: Option<String>,
-    allow_root_fallback: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -398,8 +422,6 @@ struct BlobRuntimeConfig {
     sync_tool: String,
     sync_api_port: u16,
     sync_data_dir: PathBuf,
-    sync_service_user: String,
-    sync_allow_root_fallback: bool,
     gc_enabled: bool,
     gc_interval_secs: u64,
     gc_apply: bool,
@@ -568,6 +590,9 @@ struct OrchestratorState {
     is_motherbee: bool,
     role: HiveRole,
     started_at: Instant,
+    /// Set once the boot ended (`finish_bootstrap`). Until then admin commands get
+    /// ORCHESTRATOR_BOOTING: the orchestrator is on its router before its boot ends.
+    booted: AtomicBool,
     config_dir: PathBuf,
     state_dir: PathBuf,
     gateway_name: String,
@@ -580,7 +605,6 @@ struct OrchestratorState {
     runtime_lifecycle_lock: Mutex<()>,
     last_runtime_verify: Mutex<Instant>,
     last_blob_gc: Mutex<Instant>,
-    nats_endpoint: String,
     identity_sync_port: u16,
     system_nodes: RoleSystemNodes,
     egress: Option<EgressSection>,
@@ -631,6 +655,37 @@ impl OrchestratorState {
         lock.lock_owned().await
     }
 
+    /// Non-blocking variant, for callers that run ON THE SERIAL ADMIN WORKER.
+    ///
+    /// `add_hive` now holds the per-hive lock for the whole multi-minute background join, so a
+    /// caller that `.await`s it would park the single admin channel for exactly as long as the
+    /// join takes — reintroducing the blockage PB-7 exists to remove, and making the
+    /// `JOIN_IN_PROGRESS` answer unreachable because the check would never get to run.
+    fn try_lock_hive_topology(&self, hive_id: &str) -> Option<tokio::sync::OwnedMutexGuard<()>> {
+        let lock = {
+            let mut registry = self
+                .hive_topology_locks
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            registry
+                .entry(hive_id.to_string())
+                .or_insert_with(|| Arc::new(Mutex::new(())))
+                .clone()
+        };
+        lock.try_lock_owned().ok()
+    }
+
+    /// Whether any add_hive or remove_hive holds, or is taking, its hive's topology lock. A
+    /// holder keeps a clone of the lock's `Arc` (the owned guard), so this never takes a lock
+    /// itself and cannot make a concurrent `try_lock_hive_topology` fail.
+    fn any_hive_topology_busy(&self) -> bool {
+        self.hive_topology_locks
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .values()
+            .any(|lock| Arc::strong_count(lock) > 1)
+    }
+
     /// SO-04: acquire the per-node lifecycle lock, held for the whole
     /// run/kill/start/restart/remove/config_set flow so concurrent ops on the
     /// same node don't drift identity/config/systemd. Keyed by the (validated,
@@ -647,6 +702,24 @@ impl OrchestratorState {
                 .clone()
         };
         lock.lock_owned().await
+    }
+
+    /// Non-blocking variant of `lock_node`: returns the guard if the per-node
+    /// lifecycle lock is free, or `None` if another op holds it. The periodic
+    /// managed-runtime reconcile uses this so it never blocks self-heal of other
+    /// nodes on one an admin op is already managing — it retries that node next cycle.
+    fn try_lock_node(&self, node_name: &str) -> Option<tokio::sync::OwnedMutexGuard<()>> {
+        let lock = {
+            let mut registry = self
+                .node_lifecycle_locks
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            registry
+                .entry(node_name.to_string())
+                .or_insert_with(|| Arc::new(Mutex::new(())))
+                .clone()
+        };
+        lock.try_lock_owned().ok()
     }
 }
 
@@ -677,9 +750,27 @@ struct PersistedManagedNode {
     node_name: String,
     kind: String,
     runtime: String,
+    /// The version this node is CURRENTLY bound to (a concrete version string).
     runtime_version: String,
+    /// What the caller ASKED FOR, verbatim — `"current"` when they wanted to follow the
+    /// manifest pointer, or a concrete version when they pinned deliberately.
+    ///
+    /// Keeping the intent separate from its resolution is the whole point: `run_node` used to
+    /// resolve `"current"` once and persist only the answer, so a `.deb` upgrade that replaced
+    /// the runtime directory left every node pointing at a version that no longer existed
+    /// (203/EXEC, and `restart_node` answering RUNTIME_NOT_AVAILABLE). The operator had asked
+    /// to follow the pointer and silently got a pin. See U-10.
+    requested_runtime_version: String,
     config_path: PathBuf,
     relaunch_on_boot: bool,
+}
+
+impl PersistedManagedNode {
+    /// True when this node asked to track the manifest's `current` pointer rather than pin.
+    fn follows_current(&self) -> bool {
+        let requested = self.requested_runtime_version.trim();
+        requested.is_empty() || requested.eq_ignore_ascii_case("current")
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -699,7 +790,7 @@ async fn main() -> Result<(), OrchestratorError> {
     }
 
     let log_level = std::env::var("JSR_LOG_LEVEL").unwrap_or_else(|_| "info".to_string());
-    tracing_subscriber::fmt()
+    fluxbee_sdk::logging::fmt()
         .with_env_filter(EnvFilter::new(log_level))
         .init();
 
@@ -746,11 +837,12 @@ async fn main() -> Result<(), OrchestratorError> {
         .as_ref()
         .and_then(|wan| wan.authorized_hives.clone())
         .unwrap_or_default();
-    let nats_endpoint = nats_endpoint_from_hive(&hive);
     let identity_sync_port = identity_sync_port_from_hive(&hive);
     let blob_runtime = blob_runtime_from_hive(&hive);
     let dist_runtime = dist_runtime_from_hive(&hive);
     let storage_path = storage_path_from_hive(&hive);
+    // A retired node runs nowhere, even while this hive's hive.yaml still names it.
+    retire_system_nodes(&config_dir);
     let system_nodes = system_nodes_for_role(&hive, role)?;
     let ai = hive
         .ai
@@ -765,6 +857,7 @@ async fn main() -> Result<(), OrchestratorError> {
         is_motherbee,
         role,
         started_at: Instant::now(),
+        booted: AtomicBool::new(false),
         config_dir: config_dir.clone(),
         state_dir: state_dir.clone(),
         gateway_name,
@@ -777,7 +870,6 @@ async fn main() -> Result<(), OrchestratorError> {
         runtime_lifecycle_lock: Mutex::new(()),
         last_runtime_verify: Mutex::new(Instant::now()),
         last_blob_gc: Mutex::new(Instant::now()),
-        nats_endpoint,
         identity_sync_port,
         system_nodes,
         egress: hive.egress.clone(),
@@ -807,18 +899,18 @@ async fn main() -> Result<(), OrchestratorError> {
         identity_sync_port = state.identity_sync_port,
         "blob/dist runtime config loaded"
     );
-    ensure_dirs(&config_dir, &state_dir, &run_dir, &state.blob, &state.dist)?;
+    ensure_dirs(
+        &config_dir,
+        &state_dir,
+        &run_dir,
+        &state.blob,
+        &state.dist,
+        state.is_motherbee,
+        &state.hive_id,
+    )?;
     write_pid(&run_dir)?;
 
     bootstrap_local(&state, &socket_dir).await?;
-
-    // Off the boot path: catch up mesh TLS material on existing hives (legacy pre-mTLS, or a
-    // partial add_hive). key_only_persist hives are reached via their per-spoke recovery key in
-    // the vault; this needs the Arc<State>, so it is spawned here rather than inside bootstrap_local.
-    if state.is_motherbee {
-        let reconcile_state = Arc::clone(&state);
-        tokio::spawn(async move { reconcile_hive_tls_material(reconcile_state).await });
-    }
 
     let node_config = NodeConfig {
         name: "SY.orchestrator".to_string(),
@@ -838,15 +930,6 @@ async fn main() -> Result<(), OrchestratorError> {
         return Err("orchestrator rpc client already initialized".into());
     }
     tracing::info!("connected to router");
-    tracing::info!(hive = %hive.hive_id, "hive ready");
-    tracing::info!(
-        mode = if state.is_motherbee {
-            "motherbee-control-plane"
-        } else {
-            "worker-agent"
-        },
-        "orchestrator role mode"
-    );
 
     // Long-lived workers serializing admin/system command delivery. Each one
     // owns its `RpcCommandReceiver` so we keep ordering inside a category
@@ -874,6 +957,36 @@ async fn main() -> Result<(), OrchestratorError> {
             run_system_worker(state, client, system_rx).await;
         });
     }
+    {
+        // Periodic managed-runtime liveness reconcile in its OWN task (see
+        // run_managed_runtime_reconcile_loop): respawns a dead IO./AI./WF. runtime within ~60s
+        // instead of only on the next orchestrator boot, without ever stalling the 5s watchdog.
+        // This is the fix for io.cloud being found dead in prod and never respawned.
+        let state = Arc::clone(&state);
+        tokio::spawn(run_managed_runtime_reconcile_loop(state));
+    }
+    if state.is_motherbee {
+        // Host posture stage 3: switch Syncthing off public infrastructure once every spoke
+        // reported a static, reachable motherbee. Its own task: GET_VERSIONS to an offline spoke
+        // waits for a timeout, which must not hold the watchdog.
+        let state = Arc::clone(&state);
+        tokio::spawn(run_syncthing_options_switch_loop(state));
+    }
+
+    // The boot's last steps run with the workers up: system messages are taken as they come (as
+    // the periodic reconcile already allows), and admin commands get ORCHESTRATOR_BOOTING until
+    // the boot ends, so a caller is not left waiting on a hive that is not ready.
+    finish_bootstrap(&state, &rpc_client).await?;
+    state.booted.store(true, Ordering::Release);
+    tracing::info!(hive = %hive.hive_id, "hive ready");
+    tracing::info!(
+        mode = if state.is_motherbee {
+            "motherbee-control-plane"
+        } else {
+            "worker-agent"
+        },
+        "orchestrator role mode"
+    );
 
     let mut sigterm = signal(SignalKind::terminate())?;
     let mut sigint = signal(SignalKind::interrupt())?;
@@ -928,6 +1041,21 @@ async fn run_admin_worker(
 ) {
     while let Some(msg) = rx.recv().await {
         let sender = client.sender_snapshot();
+        if !state.booted.load(Ordering::Acquire) {
+            let action = msg.meta.action.as_deref().unwrap_or("");
+            if let Err(err) = send_admin_error(
+                &sender,
+                &msg,
+                action,
+                "ORCHESTRATOR_BOOTING",
+                "the orchestrator is still booting; retry shortly",
+            )
+            .await
+            {
+                tracing::warn!("admin action error: {err}");
+            }
+            continue;
+        }
         if let Err(err) = handle_admin(&sender, &msg, &state).await {
             tracing::warn!("admin action error: {err}");
         }
@@ -1103,26 +1231,65 @@ fn ensure_motherbee_ssh_key() {
     }
 }
 
-/// add_hive: issue a leaf for `hive_id` and distribute the mesh TLS material to
-/// the remote node's `/var/lib/fluxbee/tls/<hive_id>/` over the authenticated SSH
-/// channel. Best-effort (logged): the WAN degrades to plaintext without certs, so
-/// a distribution hiccup must not fail the whole add_hive.
-fn distribute_hive_tls(address: &str, key_path: &Path, user: &str, hive_id: &str) {
-    if let Err(err) = distribute_hive_tls_inner(address, key_path, user, hive_id) {
-        tracing::warn!(hive_id = hive_id, error = %err, "failed to distribute mesh TLS material");
-    }
+/// A spoke's mesh TLS material: the CA certificate and the spoke's leaf.
+struct HiveTlsMaterial {
+    ca_cert_pem: String,
+    leaf: json_router::mesh_tls::LeafBundle,
 }
 
-fn distribute_hive_tls_inner(
+/// add_hive: issue the leaf for `hive_id`. Every flow calls it before the join's first SSH
+/// session, so a CA that cannot issue fails the join before it installs anything on the box (the
+/// failure path's best-effort revoke still runs). The join is the only place a leaf is issued
+/// (D32).
+fn issue_hive_tls(hive_id: &str) -> Result<HiveTlsMaterial, serde_json::Value> {
+    let issued = ensure_mesh_ca().and_then(|ca| {
+        let leaf = ca
+            .issue_leaf(hive_id)
+            .map_err(|e| -> OrchestratorError { format!("issue leaf: {e}").into() })?;
+        Ok(HiveTlsMaterial {
+            ca_cert_pem: ca.ca_cert_pem().to_string(),
+            leaf,
+        })
+    });
+    issued.map_err(|err| {
+        serde_json::json!({
+            "status": "error",
+            "error_code": "TLS_ISSUE_FAILED",
+            "retryable": false,
+            "message": format!("the mesh CA could not issue this hive's leaf: {err}"),
+        })
+    })
+}
+
+/// add_hive: push the mesh TLS material to the remote node's `/var/lib/fluxbee/tls/<hive_id>/`
+/// over the join's SSH channel. Fatal: every spoke template requires mTLS, so a spoke without its
+/// leaf never reaches the mesh. A push lost to an SSH blip is retryable, so the key stays and the
+/// retry is key-first.
+fn push_hive_tls(
     address: &str,
     key_path: &Path,
     user: &str,
     hive_id: &str,
+    tls: &HiveTlsMaterial,
+) -> Result<(), serde_json::Value> {
+    push_hive_tls_inner(address, key_path, user, hive_id, tls).map_err(|err| {
+        let message = format!("mesh TLS material distribution failed: {err}");
+        serde_json::json!({
+            "status": "error",
+            "error_code": "TLS_PUSH_FAILED",
+            "retryable": is_transient_ssh_error(&message),
+            "message": message,
+        })
+    })
+}
+
+fn push_hive_tls_inner(
+    address: &str,
+    key_path: &Path,
+    user: &str,
+    hive_id: &str,
+    tls: &HiveTlsMaterial,
 ) -> Result<(), OrchestratorError> {
-    let ca = ensure_mesh_ca()?;
-    let leaf = ca
-        .issue_leaf(hive_id)
-        .map_err(|e| format!("issue leaf: {e}"))?;
     let dir = format!("/var/lib/fluxbee/tls/{hive_id}");
     // Create the dir 0700 BEFORE writing: write_remote_file streams via `tee`,
     // which leaves the new file at the umask default (often world-readable) until
@@ -1142,21 +1309,21 @@ fn distribute_hive_tls_inner(
         key_path,
         user,
         &format!("{dir}/ca.crt"),
-        ca.ca_cert_pem(),
+        &tls.ca_cert_pem,
     )?;
     write_remote_file(
         address,
         key_path,
         user,
         &format!("{dir}/cert.crt"),
-        &leaf.cert_pem,
+        &tls.leaf.cert_pem,
     )?;
     write_remote_file(
         address,
         key_path,
         user,
         &format!("{dir}/cert.key"),
-        &leaf.key_pem,
+        &tls.leaf.key_pem,
     )?;
     ssh_with_key(
         address,
@@ -1228,160 +1395,6 @@ fn distribute_hive_identity_key_inner(
     Ok(())
 }
 
-/// Motherbee: (re)distribute mesh TLS material to all already-provisioned hives
-/// that don't have it yet. New hives get certs at `add_hive`; this catches up the
-/// hives created BEFORE mTLS existed (so the operator can flip `wan.mtls` without
-/// a manual cert step). Idempotent (skips hives that already hold a cert; a CA
-/// rotation is a separate forced op) and best-effort (logged). Runs blocking, so
-/// the caller should spawn it off the boot path.
-/// A per-spoke recovery private key materialized to a 0600 scratch file for the duration of a
-/// reconcile probe. The scratch dir is removed on drop.
-struct SpokeRecoveryKey {
-    dir: PathBuf,
-    path: PathBuf,
-}
-
-impl Drop for SpokeRecoveryKey {
-    fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.dir);
-    }
-}
-
-/// Read a hive's per-spoke recovery SSH private key (`ssh:<hive_id>`, a root-tenant POOL secret
-/// written by `add_hive ssh_access=key_only_persist`) from SY.vault and materialize it to a
-/// 0600 scratch file. Returns None when the hive has no such key (revoke-mode / legacy hive) or
-/// the vault read fails — the caller then falls back to the motherbee bootstrap key.
-#[cfg(not(test))]
-async fn read_spoke_recovery_key_to_temp(
-    state: &OrchestratorState,
-    hive_id: &str,
-) -> Option<SpokeRecoveryKey> {
-    let admin_target = teardown_admin_target();
-    let resp = orchestrator_admin_command(
-        state,
-        AdminCommandRequest {
-            admin_target: &admin_target,
-            action: "vault_get",
-            target: Some(PRIMARY_HIVE_ID),
-            params: serde_json::json!({ "key": format!("ssh:{hive_id}") }),
-            request_id: None,
-            timeout: Duration::from_secs(15),
-        },
-    )
-    .await
-    .ok()?;
-    if resp.status != "ok" {
-        return None;
-    }
-    let priv_pem = resp
-        .payload
-        .get("value")
-        .and_then(|v| v.get("private_key"))
-        .and_then(|v| v.as_str())
-        .filter(|s| !s.is_empty())?
-        .to_string();
-    let dir = spoke_key_scratch_dir("recover");
-    fs::create_dir_all(&dir).ok()?;
-    let _ = fs::set_permissions(&dir, fs::Permissions::from_mode(0o700));
-    let path = dir.join("id");
-    fs::write(&path, &priv_pem).ok()?;
-    let _ = fs::set_permissions(&path, fs::Permissions::from_mode(0o600));
-    Some(SpokeRecoveryKey { dir, path })
-}
-
-#[cfg(test)]
-async fn read_spoke_recovery_key_to_temp(
-    _state: &OrchestratorState,
-    _hive_id: &str,
-) -> Option<SpokeRecoveryKey> {
-    None
-}
-
-/// Off-boot-path catch-up of mesh TLS material on existing hives (legacy pre-mTLS, or a hive
-/// whose add_hive TLS push was partial). The motherbee bootstrap key is revoked on every joined
-/// hive, so for a `key_only_persist` hive this reads that hive's per-spoke recovery key from the
-/// vault to reach it (closing the reconcile↔revoke contradiction); revoke-mode / legacy hives
-/// fall back to the motherbee key (which only still works for a pre-revoke/legacy hive). A hive
-/// we cannot reach is left alone, and only an actual successful distribution is counted.
-async fn reconcile_hive_tls_material(state: Arc<OrchestratorState>) {
-    let root = hives_root();
-    let Ok(entries) = fs::read_dir(&root) else {
-        return;
-    };
-    let mut filled = 0u32;
-    for entry in entries.flatten() {
-        let hive_id = entry.file_name().to_string_lossy().to_string();
-        if hive_id == PRIMARY_HIVE_ID || !valid_hive_id(&hive_id) {
-            continue;
-        }
-        let Ok(info) = read_hive_info(&root, &hive_id) else {
-            continue;
-        };
-        if info.get("status").and_then(|v| v.as_str()) != Some("connected") {
-            continue;
-        }
-        let address = info
-            .get("address")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string();
-        let user = info
-            .get("ssh_user")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string();
-        if address.is_empty() || user.is_empty() {
-            continue;
-        }
-        let recovery = read_spoke_recovery_key_to_temp(&state, &hive_id).await;
-        if recovery.is_some() {
-            tracing::info!(
-                hive_id = %hive_id,
-                "reconcile: reaching key_only_persist hive via its per-spoke recovery key from the vault"
-            );
-        }
-        let key_path = recovery
-            .as_ref()
-            .map(|r| r.path.clone())
-            .unwrap_or_else(|| PathBuf::from(MOTHERBEE_SSH_KEY_PATH));
-        let hive_c = hive_id.clone();
-        // The SSH calls are blocking; run them off the async worker.
-        let distributed = tokio::task::spawn_blocking(move || {
-            // Idempotent + reachability probe: a hive that already holds a cert (or that we
-            // cannot ssh into at all) is left alone rather than pushed blindly.
-            if ssh_with_key(
-                &address,
-                &key_path,
-                &sudo_wrap(&format!("test -f '/var/lib/fluxbee/tls/{hive_c}/cert.crt'")),
-                &user,
-            )
-            .is_ok()
-            {
-                return false;
-            }
-            match distribute_hive_tls_inner(&address, &key_path, &user, &hive_c) {
-                Ok(()) => true,
-                Err(err) => {
-                    tracing::warn!(hive_id = %hive_c, error = %err, "reconcile: failed to distribute mesh TLS material");
-                    false
-                }
-            }
-        })
-        .await
-        .unwrap_or(false);
-        drop(recovery); // remove the scratch private key
-        if distributed {
-            filled += 1;
-        }
-    }
-    if filled > 0 {
-        tracing::info!(
-            count = filled,
-            "distributed mesh TLS material to existing hives"
-        );
-    }
-}
-
 async fn bootstrap_local(
     state: &OrchestratorState,
     socket_dir: &Path,
@@ -1408,22 +1421,56 @@ async fn bootstrap_local(
     }
 
     // Motherbee is the mesh CA: ensure the CA + its own WAN-mTLS material exist before
-    // rt-gateway starts (the router loads certs at startup). The off-boot-path TLS catch-up for
-    // existing hives is spawned by the caller — it needs the Arc<State> to read per-spoke
-    // recovery keys from the vault.
+    // rt-gateway starts (the router loads certs at startup). A hive's leaf is issued only by its
+    // join: one that lost it is joined again (D32).
     if state.is_motherbee {
         ensure_motherbee_ssh_key();
         ensure_motherbee_mesh_tls(&state.hive_id);
+        // Refresh the per-role core subtrees the spokes sync from. Boot is the right trigger:
+        // a `.deb` upgrade stops the orchestrator in `prerm` and `postinst` starts it again, so
+        // this runs exactly once per new package, before any spoke can ask for an update.
+        // Non-fatal: the motherbee's own units run the installed `/usr/bin` binaries, so a
+        // materialization failure must not take the whole hive down; it makes spoke updates
+        // stale, which the loud log plus the update path's own hash gate will surface.
+        match materialize_role_core_trees(&core_manifest) {
+            Ok(roles) if !roles.is_empty() => {
+                tracing::info!(roles = ?roles, "refreshed per-role core distribution subtrees")
+            }
+            Ok(_) => {}
+            Err(err) => tracing::error!(
+                error = %err,
+                "failed to materialize per-role core distribution subtrees; spokes will not see this build"
+            ),
+        }
+        sweep_interrupted_joins();
     }
 
+    // A package upgrade swaps the core binaries while they run and stops only the orchestrator and
+    // the dist manifest's other writers (FINDINGS A-45): the rest keep serving on the old binaries
+    // until this boot restarts them, in the start order below. Reported as the last core update.
+    let mut core_services = vec!["rt-gateway".to_string()];
+    core_services.extend(
+        state
+            .system_nodes
+            .nodes
+            .iter()
+            .map(|name| name_to_service(name)),
+    );
+    // Core components a hive.yaml leaves out of system_nodes get their new binary too; they are
+    // restarted after the listed ones, and only if they run a replaced binary.
+    let unlisted_core: Vec<String> = core_component_names_for_role(&core_manifest, state.role)?
+        .into_iter()
+        .filter(|name| name != "sy-orchestrator" && !core_services.contains(name))
+        .collect();
+    core_services.extend(unlisted_core.iter().cloned());
+    let replaced = services_running_replaced_binary(&core_services);
+    let mut upgrade_restart = BootUpgradeRestart::begin(&core_services, &replaced);
+
     tracing::info!("starting rt-gateway");
-    systemd_start("rt-gateway")?;
+    start_core_service("rt-gateway", &replaced, &mut upgrade_restart)?;
     wait_for_router_ready(state, socket_dir, Duration::from_secs(30)).await?;
-    wait_for_nats_ready(
-        &state.nats_endpoint,
-        Duration::from_secs(NATS_BOOTSTRAP_TIMEOUT_SECS),
-    )
-    .await?;
+    // Only now: an upgraded hive's old router, stopping above, flushed its broker to disk.
+    retire_nats_state(&state.config_dir);
     ensure_core_firewall_local(state);
     if let Err(err) = reconcile_egress(state) {
         if state.role == HiveRole::Egress {
@@ -1438,12 +1485,25 @@ async fn bootstrap_local(
         // usable on the LAN and the watchdog re-applies the route.
         tracing::error!(error = %err, "worker egress route reconciliation failed; continuing");
     }
+    // The egress used to have syncthing hard-disabled by role. That predates it having any
+    // core channel at all: with dist split by content it receives `core/<role>` + `vendor` and
+    // nothing else — no blob, no runtimes. Syncthing is not a plain open port either: device
+    // IDs are the hash of each peer's TLS certificate and only explicitly paired devices can
+    // connect, so this is an authenticated, encrypted, pinned channel rather than new exposed
+    // surface. Enablement now comes from config like every other role (an egress carries
+    // blob.enabled=false, so `effective_syncthing_runtime_config` turns it on off dist alone).
     let startup_sync = effective_syncthing_runtime_config(&state.blob, &state.dist);
-    if state.role == HiveRole::Egress {
+    if !startup_sync.sync_enabled {
         disable_blob_sync_runtime_local()?;
     } else if startup_sync.sync_enabled {
-        if let Err(err) =
-            ensure_blob_sync_runtime(&state.blob, &state.dist, state.is_motherbee).await
+        if let Err(err) = ensure_blob_sync_runtime(
+            &state.blob,
+            &state.dist,
+            state.is_motherbee,
+            state.role,
+            &state.hive_id,
+        )
+        .await
         {
             tracing::warn!(
                 error = %err,
@@ -1461,8 +1521,16 @@ async fn bootstrap_local(
             node = node_name.as_str(),
             "starting configured lifecycle node"
         );
-        if let Err(err) = systemd_start(&service) {
+        if let Err(err) = start_core_service(&service, &replaced, &mut upgrade_restart) {
             tracing::warn!(service = service.as_str(), error = %err, "failed to start service");
+        }
+    }
+    for service in unlisted_core
+        .iter()
+        .filter(|service| replaced.contains(*service))
+    {
+        if let Err(err) = start_core_service(service, &replaced, &mut upgrade_restart) {
+            tracing::warn!(service = service.as_str(), error = %err, "failed to restart service");
         }
     }
 
@@ -1477,6 +1545,17 @@ async fn bootstrap_local(
             "lifecycle nodes did not fully bootstrap before timeout; continuing and relying on watchdog restarts"
         );
     }
+    upgrade_restart.finish();
+    Ok(())
+}
+
+/// The boot's last steps, once this orchestrator is on its router: on the motherbee, the wait for
+/// SY.storage's database, asked over the mesh (A-70 stage 2b); then the persisted nodes'
+/// reconcile and the blob hand-over. Meanwhile admin commands get ORCHESTRATOR_BOOTING.
+async fn finish_bootstrap(
+    state: &OrchestratorState,
+    rpc: &RouterDispatcher,
+) -> Result<(), OrchestratorError> {
     if state.is_motherbee {
         wait_for_service_active(
             "sy-storage",
@@ -1484,89 +1563,193 @@ async fn bootstrap_local(
         )
         .await?;
         wait_for_storage_db_ready(
-            &state.config_dir,
+            rpc,
+            &format!("SY.storage@{}", state.hive_id),
             Duration::from_secs(STORAGE_DB_READINESS_TIMEOUT_SECS),
         )
         .await?;
     }
-    if let Err(err) = reconcile_persisted_custom_nodes(state).await {
+    // Boot runs after every package upgrade and core update: it also moves running nodes that
+    // follow `current` onto the version the pointer now names (FINDINGS A-39).
+    if let Err(err) = reconcile_persisted_custom_nodes(state, ReconcileRunning::Rebind).await {
         tracing::warn!(
             error = %err,
             "persisted custom node reconcile failed during bootstrap"
         );
     }
+    hand_over_blob_folder_entries(&state.hive_id, &state.blob, &state.dist);
     Ok(())
 }
 
+/// Of `services`, the ones running a binary that was replaced on disk since they started.
+fn services_running_replaced_binary(services: &[String]) -> HashSet<String> {
+    services
+        .iter()
+        .filter(|service| service_runs_replaced_binary(service))
+        .cloned()
+        .collect()
+}
+
+fn service_runs_replaced_binary(service: &str) -> bool {
+    let props = systemd_unit_show(service, &["MainPID"]);
+    let Some(pid) = parse_systemd_u64(props.get("MainPID")).filter(|pid| *pid > 0) else {
+        return false;
+    };
+    fs::read_link(format!("/proc/{pid}/exe"))
+        .map(|exe| exe_link_is_replaced(&exe))
+        .unwrap_or(false)
+}
+
+/// `/proc/<pid>/exe` of a process whose binary was unlinked, as dpkg does when it installs a new
+/// one: the kernel appends ` (deleted)` to the old path.
+fn exe_link_is_replaced(exe: &Path) -> bool {
+    exe.to_string_lossy().ends_with(" (deleted)")
+}
+
+/// `systemctl start`, or `restart` for a service in `replaced`: `start` leaves a running service
+/// on its old binary.
+fn start_core_service(
+    service: &str,
+    replaced: &HashSet<String>,
+    upgrade_restart: &mut BootUpgradeRestart,
+) -> Result<(), OrchestratorError> {
+    if !replaced.contains(service) {
+        return systemd_start(service);
+    }
+    tracing::info!(
+        service,
+        "restarting onto the binary the package upgrade installed"
+    );
+    let result = systemd_restart(service);
+    upgrade_restart.record(service, &result);
+    result
+}
+
+/// The restarts a boot does after a package upgrade, recorded like a core update (`/versions`:
+/// `core.last_update`, `via: package`).
+struct BootUpgradeRestart {
+    started_at_ms: Option<String>,
+    attempted: Vec<String>,
+    restarted: Vec<String>,
+    errors: Vec<String>,
+}
+
+impl BootUpgradeRestart {
+    fn begin(order: &[String], replaced: &HashSet<String>) -> Self {
+        let attempted = upgrade_restart_order(order, replaced);
+        let started_at_ms = (!attempted.is_empty()).then(|| now_epoch_ms().to_string());
+        if let Some(started_at_ms) = &started_at_ms {
+            tracing::info!(services = ?attempted, "core services run replaced binaries; restarting them in start order");
+            write_core_update_last_record(&serde_json::json!({
+                "phase": "restarting",
+                "via": "package",
+                "started_at_ms": started_at_ms,
+                "updated": attempted,
+            }));
+        }
+        Self {
+            started_at_ms,
+            attempted,
+            restarted: Vec::new(),
+            errors: Vec::new(),
+        }
+    }
+
+    fn record(&mut self, service: &str, result: &Result<(), OrchestratorError>) {
+        match result {
+            Ok(()) => self.restarted.push(service.to_string()),
+            Err(err) => self.errors.push(format!("{service}: {err}")),
+        }
+    }
+
+    fn finish(&self) {
+        let Some(started_at_ms) = &self.started_at_ms else {
+            return;
+        };
+        write_core_update_last_record(&boot_upgrade_restart_record(
+            started_at_ms,
+            &self.attempted,
+            &self.restarted,
+            &self.errors,
+        ));
+    }
+}
+
+/// The services of `replaced`, in the boot's start order (`order`).
+fn upgrade_restart_order(order: &[String], replaced: &HashSet<String>) -> Vec<String> {
+    order
+        .iter()
+        .filter(|service| replaced.contains(*service))
+        .cloned()
+        .collect()
+}
+
+fn boot_upgrade_restart_record(
+    started_at_ms: &str,
+    attempted: &[String],
+    restarted: &[String],
+    errors: &[String],
+) -> serde_json::Value {
+    serde_json::json!({
+        "phase": "done",
+        "via": "package",
+        "status": if errors.is_empty() && restarted.len() == attempted.len() { "ok" } else { "error" },
+        "started_at_ms": started_at_ms,
+        "finished_at_ms": now_epoch_ms().to_string(),
+        "updated": attempted,
+        "restarted": restarted,
+        "errors": errors,
+    })
+}
+
+/// Waits until SY.storage answers its inbox metrics, which it does once it reads its database:
+/// `STORAGE_METRICS_GET` over the mesh (A-70 stage 2b; it was `storage.metrics.get` on the embedded
+/// NATS broker).
 async fn wait_for_storage_db_ready(
-    config_dir: &Path,
+    rpc: &RouterDispatcher,
+    target: &str,
     timeout: Duration,
 ) -> Result<(), OrchestratorError> {
     let started = Instant::now();
     let mut attempts: u64 = 0;
     loop {
         attempts = attempts.saturating_add(1);
-        let trace_id = Uuid::new_v4().to_string();
-        let reply_subject = format!("storage.metrics.reply.orchestrator.{trace_id}");
-        let sid = 40_019;
-        let request = NatsRequestEnvelope::<serde_json::Value>::new(
-            SUBJECT_STORAGE_METRICS_GET,
-            trace_id.clone(),
-            reply_subject.clone(),
-            None,
-        );
-        let request_body = serde_json::to_vec(&request)?;
-
-        match request_local(
-            config_dir,
-            SUBJECT_STORAGE_METRICS_GET,
-            &request_body,
-            &reply_subject,
-            sid,
-            Duration::from_secs(STORAGE_DB_READINESS_REQUEST_TIMEOUT_SECS),
-        )
-        .await
-        {
-            Ok(body) => {
-                match serde_json::from_slice::<NatsResponseEnvelope<serde_json::Value>>(&body) {
-                    Ok(response) if response.status == "ok" => {
-                        tracing::info!(
-                            attempts = attempts,
-                            elapsed_ms = started.elapsed().as_millis() as u64,
-                            "sy-storage DB readiness confirmed via storage.metrics.get"
-                        );
-                        return Ok(());
-                    }
-                    Ok(response) => {
-                        tracing::warn!(
-                            attempts = attempts,
-                            elapsed_ms = started.elapsed().as_millis() as u64,
-                            status = %response.status,
-                            error_code = ?response.error_code,
-                            error_detail = ?response.error_detail,
-                            "sy-storage readiness probe returned non-ok status; retrying"
-                        );
-                    }
-                    Err(err) => {
-                        tracing::warn!(
-                            attempts = attempts,
-                            elapsed_ms = started.elapsed().as_millis() as u64,
-                            error = %err,
-                            "sy-storage readiness probe decode failed; retrying"
-                        );
-                    }
-                }
-            }
-            Err(err) => {
-                tracing::warn!(
-                    attempts = attempts,
+        let answer = rpc
+            .send_system_rpc(SystemRpcRequest {
+                target,
+                request_msg: MSG_STORAGE_METRICS_GET,
+                response_msg: MSG_STORAGE_METRICS_RESPONSE,
+                payload: serde_json::json!({}),
+                timeout: Duration::from_secs(STORAGE_DB_READINESS_REQUEST_TIMEOUT_SECS),
+            })
+            .await
+            .map_err(|err| err.to_string())
+            .and_then(|reply| {
+                serde_json::from_value::<StorageMetricsResponse>(reply.payload)
+                    .map_err(|err| err.to_string())
+            });
+        match answer {
+            Ok(response) if response.ok => {
+                tracing::info!(
+                    attempts,
                     elapsed_ms = started.elapsed().as_millis() as u64,
-                    error = %err,
-                    "sy-storage readiness probe failed; retrying"
+                    "sy-storage DB readiness confirmed over the mesh"
                 );
+                return Ok(());
             }
+            Ok(response) => tracing::warn!(
+                attempts,
+                elapsed_ms = started.elapsed().as_millis() as u64,
+                error = ?response.error,
+                "sy-storage has no database yet; retrying"
+            ),
+            Err(err) => tracing::warn!(
+                attempts,
+                elapsed_ms = started.elapsed().as_millis() as u64,
+                error = %err,
+                "sy-storage readiness probe failed; retrying"
+            ),
         }
-
         if started.elapsed() >= timeout {
             return Err(format!(
                 "sy-storage DB readiness timeout after {}s (attempts={})",
@@ -1579,8 +1762,60 @@ async fn wait_for_storage_db_ready(
     }
 }
 
+/// Interval between periodic managed-runtime liveness reconciles. Managed runtimes
+/// (IO./AI./WF.) run as transient `systemd-run` units with `Restart=always`, but if one
+/// exhausts systemd's start limit or its unit is otherwise collected, only this loop
+/// re-creates it: the boot-time reconcile has already run and the 5s watchdog merely LOGS
+/// managed runtimes as disconnected (it restarts SY.*/rt-gateway). io.cloud was found dead
+/// in production for exactly this reason. Runs in its OWN task — NOT the 5s watchdog critical
+/// path — so a slow systemctl on a wedged unit never stalls rt-gateway/SY.* self-heal; and
+/// reconcile uses try_lock per node so a held admin lock never blocks it.
+const MANAGED_RECONCILE_INTERVAL_SECS: u64 = 60;
+
+async fn run_managed_runtime_reconcile_loop(state: Arc<OrchestratorState>) {
+    let mut ticker = time::interval(Duration::from_secs(MANAGED_RECONCILE_INTERVAL_SECS));
+    ticker.set_missed_tick_behavior(time::MissedTickBehavior::Delay);
+    // Consume the immediate first tick: the boot-time reconcile already covered t=0, and
+    // firing again seconds later could bounce a node still exec'ing from boot.
+    ticker.tick().await;
+    loop {
+        ticker.tick().await;
+        if let Err(err) = reconcile_persisted_custom_nodes(&state, ReconcileRunning::Leave).await {
+            tracing::warn!(error = %err, "managed-runtime liveness reconcile failed");
+        }
+    }
+}
+
+/// What the reconcile does with a node that is already running.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReconcileRunning {
+    /// Liveness only (the periodic loop): a running node is left alone.
+    Leave,
+    /// Boot, i.e. after a package upgrade or a core update: a running node that follows
+    /// `current` and whose pointer moved is relaunched on the new version with one restart.
+    /// Left running, it would keep executing a runtime directory dpkg has already removed, and
+    /// any restart of its unit (needrestart, a crash) would fail with 203/EXEC (FINDINGS A-39).
+    Rebind,
+}
+
+/// The version a node that follows `current` should move to, when the manifest pointer moved
+/// under it. `None` when it is pinned, up to date, or its runtime cannot be resolved: a running
+/// node is never torn down because the manifest does not name a version for it.
+fn moved_current_version(
+    manifest: &RuntimeManifest,
+    node: &PersistedManagedNode,
+) -> Option<String> {
+    if !node.follows_current() {
+        return None;
+    }
+    let runtime_key = resolve_runtime_key(manifest, &node.runtime).ok()?;
+    let version = resolve_runtime_version(manifest, &runtime_key, "current").ok()?;
+    (version != node.runtime_version).then_some(version)
+}
+
 async fn reconcile_persisted_custom_nodes(
     state: &OrchestratorState,
+    running: ReconcileRunning,
 ) -> Result<(), OrchestratorError> {
     let manifest = match load_runtime_manifest_result()? {
         Some(manifest) => manifest,
@@ -1602,9 +1837,48 @@ async fn reconcile_persisted_custom_nodes(
 
     for node in nodes {
         let unit = unit_from_node_name(&node.node_name);
+        // SO-04: hold the per-node lifecycle lock across this node's liveness check AND its
+        // respawn — exactly like run/kill/restart/remove/config_set — so a reconcile never races
+        // a concurrent admin op on the same node (identity/config/systemd drift). try_lock, NOT
+        // block: if an admin op holds this node's lock it is already managing it, so skip and
+        // retry next cycle rather than stalling the reconcile of every OTHER node behind it.
+        let Some(_node_guard) = state.try_lock_node(&node.node_name) else {
+            skipped = skipped.saturating_add(1);
+            continue;
+        };
+        // The list was read before this node's lock: a stop that finished in between cleared the
+        // flag, and the node stays stopped.
+        let still_relaunched =
+            load_node_effective_config(&node.config_path)
+                .ok()
+                .and_then(|config| {
+                    config
+                        .get("_system")
+                        .and_then(|system| system.get("relaunch_on_boot"))
+                        .and_then(|value| value.as_bool())
+                })
+                == Some(true);
+        if !still_relaunched {
+            skipped = skipped.saturating_add(1);
+            continue;
+        }
         let unit_active = systemd_unit_is_active(&unit).unwrap_or(false);
         let visible_in_router = local_inventory_has_node(state, &node.node_name);
-        if unit_active || visible_in_router {
+        // Only a node whose unit we own is rebound; one visible without an active unit is left.
+        let rebind_to = match running {
+            ReconcileRunning::Rebind if unit_active => moved_current_version(&manifest, &node),
+            _ => None,
+        };
+        if let Some(to) = rebind_to.as_deref() {
+            tracing::info!(
+                node_name = node.node_name,
+                runtime = node.runtime,
+                from = node.runtime_version,
+                to = to,
+                unit = unit,
+                "running node follows 'current' and the pointer moved; relaunching it on the new version"
+            );
+        } else if unit_active || visible_in_router {
             skipped = skipped.saturating_add(1);
             tracing::info!(
                 node_name = node.node_name,
@@ -1632,8 +1906,23 @@ async fn reconcile_persisted_custom_nodes(
                 continue;
             }
         };
-        let version = match resolve_runtime_version(&manifest, &runtime_key, &node.runtime_version)
-        {
+        // Resolve against what the caller ASKED FOR, not against the answer they got last time.
+        //
+        // A node spawned with `runtime_version: "current"` must keep following the pointer, which
+        // is exactly what makes it survive a `.deb` upgrade: the upgrade installs the new runtime
+        // directory and removes the old one, so re-resolving the stored answer ("0.1.1") fails
+        // with `version not available` and the node is abandoned mid-crash-loop — observed in
+        // production on the 0.1.1 → 0.1.2 upgrade, on all four runtime nodes at once (U-10).
+        // Re-resolving the INTENT lands on the new version and this boot pass repairs them.
+        //
+        // A node pinned to an explicit version still resolves to that version, and still fails
+        // loudly if it is gone — which is the correct outcome for a deliberate pin.
+        let requested_version = if node.follows_current() {
+            "current"
+        } else {
+            node.runtime_version.as_str()
+        };
+        let version = match resolve_runtime_version(&manifest, &runtime_key, &requested_version) {
             Ok(value) => value,
             Err(err) => {
                 failed = failed.saturating_add(1);
@@ -1641,12 +1930,109 @@ async fn reconcile_persisted_custom_nodes(
                     node_name = node.node_name,
                     runtime = runtime_key,
                     runtime_version = node.runtime_version,
+                    requested_runtime_version = node.requested_runtime_version,
                     error = %err,
                     "unable to resolve runtime version for persisted custom node reconcile"
                 );
                 continue;
             }
         };
+        let (persisted_ilk, persisted_tenant) =
+            load_persisted_node_identity(state, &node.node_name);
+        // FIX-5: if the on-disk node->ilk map is empty (a persist failed at spawn), do NOT relaunch
+        // blind — recover the identity from SY.identity's SHM by handler node and re-persist, so
+        // io.api comes up WITH its tenant/ilk instead of node_not_configured on every request.
+        let (persisted_ilk, persisted_tenant) =
+            if persisted_ilk.is_none() && persisted_tenant.is_none() {
+                match fluxbee_sdk::identity::find_ilk_by_handler_node_from_hive_id(
+                    &state.hive_id,
+                    &node.node_name,
+                ) {
+                    Ok(Some((_, ilk))) => {
+                        tracing::warn!(
+                            node_name = %node.node_name,
+                            ilk_id = %ilk.ilk_id,
+                            "reconcile: node->ilk map missing; recovered identity from SY.identity SHM and re-persisting"
+                        );
+                        let _ = persist_node_ilk_mapping(
+                            state,
+                            &node.node_name,
+                            &ilk.ilk_id,
+                            &ilk.tenant_id,
+                        );
+                        (Some(ilk.ilk_id), Some(ilk.tenant_id))
+                    }
+                    _ => (persisted_ilk, persisted_tenant),
+                }
+            } else {
+                (persisted_ilk, persisted_tenant)
+            };
+        // The tenant as start and restart read it: the identity map, else the node's config.
+        let node_tenant = persisted_tenant.clone().or_else(|| {
+            load_node_effective_config(&node.config_path)
+                .ok()
+                .and_then(|config| config_tenant_id(&config))
+        });
+        // Checked before anything is stopped: a node that still runs is left running, not killed.
+        if let Some(refusal) =
+            genesis_refusal(&node.node_name, &runtime_key, node_tenant.as_deref())
+        {
+            failed = failed.saturating_add(1);
+            tracing::warn!(
+                node_name = node.node_name,
+                runtime = runtime_key,
+                payload = %refusal,
+                "persisted custom node not relaunched: only the core is born in the genesis tenant"
+            );
+            continue;
+        }
+        // A tenant that is not active cannot use the infrastructure (docs/ilk-tenant-model-v1.md
+        // §2.3): its node is neither relaunched nor rebound, and one that still runs keeps running.
+        // The next pass after the tenant is active again relaunches it. When this hive cannot tell
+        // (identity still coming up at boot), the node goes on as before, as in run, start and
+        // restart (`tenant_gate_refusal`).
+        match tenant_gate(&state.hive_id, node_tenant.as_deref()) {
+            TenantGate::Open => {}
+            TenantGate::Closed(status) => {
+                skipped = skipped.saturating_add(1);
+                tracing::info!(
+                    node_name = node.node_name,
+                    tenant_id = node_tenant.as_deref().unwrap_or_default(),
+                    tenant_status = status,
+                    "persisted custom node not relaunched: its tenant is not active"
+                );
+                continue;
+            }
+            TenantGate::Unknown(reason) => {
+                tracing::warn!(
+                    node_name = node.node_name,
+                    tenant_id = node_tenant.as_deref().unwrap_or_default(),
+                    reason = reason,
+                    "cannot tell whether the node's tenant is active; relaunching it as before"
+                );
+            }
+        }
+        if version != node.runtime_version {
+            // The pointer moved under a `current` node — say so plainly. This is the visible
+            // sign that an upgrade propagated, and it is the line an operator should find when
+            // they wonder why a node restarted.
+            tracing::info!(
+                node_name = node.node_name,
+                runtime = runtime_key,
+                from = node.runtime_version,
+                to = version,
+                "runtime 'current' pointer moved; rebinding node to the new version"
+            );
+            if let Err(err) =
+                persist_node_runtime_version(&node.config_path, &version)
+            {
+                tracing::warn!(
+                    node_name = node.node_name,
+                    error = %err,
+                    "failed to persist the rebound runtime version; the node still starts on the new one"
+                );
+            }
+        }
         let entrypoint = match resolve_runtime_spawn_entrypoint(&manifest, &runtime_key, &version) {
             Ok(value) => value,
             Err(err) => {
@@ -1696,8 +2082,15 @@ async fn reconcile_persisted_custom_nodes(
             continue;
         }
 
-        let (persisted_ilk, persisted_tenant) =
-            load_persisted_node_identity(state, &node.node_name);
+        // Free the unit name before relaunching.
+        //
+        // Managed nodes run as TRANSIENT units (`systemd-run`), and systemd refuses to create a
+        // transient unit whose name is still loaded — "Unit ... was already loaded or has a
+        // fragment file". A node left crash-looping by an upgrade sits in `auto-restart`, which
+        // is exactly that state: not active, but still loaded, holding its name hostage with the
+        // OLD ExecStart path. Without this the rebind above resolves correctly and then the
+        // relaunch fails on every boot, which is what happened on the 0.1.2 → 0.1.3 upgrade.
+        clear_stale_transient_unit(&unit);
         let cmd = build_managed_node_run_command(
             &unit,
             &node.node_name,
@@ -1721,7 +2114,7 @@ async fn reconcile_persisted_custom_nodes(
                     relaunch_on_boot = node.relaunch_on_boot,
                     config_path = %node.config_path.display(),
                     unit = unit,
-                    "persisted custom node relaunched during bootstrap reconcile"
+                    "persisted custom node relaunched during reconcile"
                 );
             }
             Err(err) => {
@@ -1732,7 +2125,7 @@ async fn reconcile_persisted_custom_nodes(
                     runtime_version = version,
                     unit = unit,
                     error = %err,
-                    "failed to relaunch persisted custom node during bootstrap reconcile"
+                    "failed to relaunch persisted custom node during reconcile"
                 );
             }
         }
@@ -1807,8 +2200,8 @@ async fn wait_for_lifecycle_nodes(
     timeout: Duration,
 ) -> Result<(), OrchestratorError> {
     // Only router-connected nodes are visible in router SHM. The declarative
-    // lifecycle includes SY authorities plus explicitly allowlisted packaged
-    // workers such as the motherbee IO.blob singleton.
+    // lifecycle lists SY authorities only: the managed runtimes (IO.blob, IO.cloud, ...) are
+    // spawned with run_node and are not waited for here.
     let required: Vec<String> = state
         .system_nodes
         .wait_for
@@ -1930,12 +2323,39 @@ async fn watchdog_tick(state: &OrchestratorState) {
         tracing::warn!(error = %err, "blob sync watchdog failed");
     }
 
+    // Host posture stage 2: Syncthing peers (A-47, A-50), about once a minute. A condition that
+    // lasts is logged once.
+    if SYNCTHING_ADDRESS_TICKS.fetch_add(1, Ordering::Relaxed) % SYNCTHING_ADDRESS_EVERY_TICKS == 0
+    {
+        match reconcile_syncthing_peer_addresses(state).await {
+            Ok(Some(notes)) => {
+                syncthing_reconcile_busy_for(None);
+                report_syncthing_reconcile(&notes);
+            }
+            // A topology operation is running; a long one is reported once.
+            Ok(None) => {
+                if syncthing_reconcile_busy_for(Some(Instant::now()))
+                    > Duration::from_secs(SYNCTHING_RECONCILE_BUSY_REPORT_SECS)
+                {
+                    report_syncthing_reconcile(&[format!(
+                        "a topology operation (a join or a removal; on a spoke, a finalize) has run for more than {} minutes; the Syncthing reconcile waits for it",
+                        SYNCTHING_RECONCILE_BUSY_REPORT_SECS / 60
+                    )]);
+                }
+            }
+            Err(err) => report_syncthing_reconcile_failure(&err.to_string()),
+        }
+    }
+
     // watchdog_egress_reconcile runs blocking subprocess I/O (nft/sysctl, and on
     // the periodic drift tick a full reconcile incl. ping+curl up to ~7s).
     // block_in_place lets the multi-thread runtime relocate other tasks off this
     // worker thread while it blocks, so the periodic egress work never starves
     // the admin/system message handlers (#[tokio::main] defaults to multi_thread).
     tokio::task::block_in_place(|| watchdog_egress_reconcile(state));
+
+    // A-46: report Archi or the admin bound off loopback, whatever bound them there.
+    tokio::task::block_in_place(|| watchdog_listener_check(state));
 }
 
 /// Watchdog tick counter for egress drift correction (F6). Every
@@ -2036,8 +2456,47 @@ fn watchdog_egress_reconcile(state: &OrchestratorState) {
                 }
             }
         }
-        _ => {}
+        HiveRole::Motherbee => {
+            // PB-8: re-assert the OBSERVATION on the periodic tick (no internet probe here —
+            // the watchdog runs often and the probe costs a network round-trip). Read-only.
+            if periodic {
+                if let Some(gateway_ip) = eg
+                    .gateway_ip
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|g| !g.is_empty())
+                {
+                    let _ = verify_motherbee_egress(gateway_ip, false, &state.hive_id);
+                }
+            }
+        }
+        // Explicit, not `_`: an `enabled: false` egress hive used to fall into the catch-all
+        // by accident, because the arm above is guarded.
+        HiveRole::Egress => {}
+        HiveRole::Ingress => {}
     }
+}
+
+/// SYSTEM actions that only a spoke runs. The motherbee sends them to the hive it is adding or
+/// removing, never to itself (remove_hive refuses the local hive). On the motherbee they would be
+/// a kill switch that any orchestrator, the DMZ ingress included, could pull: ADD_HIVE_FINALIZE
+/// restarts the whole core and links a Syncthing device the sender chooses, and
+/// REMOVE_HIVE_CLEANUP stops and disables every core service. So the motherbee refuses them
+/// (FINDINGS A-48; DTAP round 3, D3-3 and P3-3).
+const SPOKE_ONLY_SYSTEM_ACTIONS: &[&str] = &["ADD_HIVE_FINALIZE", "REMOVE_HIVE_CLEANUP"];
+
+/// The refusal payload when `action` is spoke-only and this hive is the motherbee.
+fn spoke_only_action_refusal(action: &str, is_motherbee: bool) -> Option<serde_json::Value> {
+    if !is_motherbee || !SPOKE_ONLY_SYSTEM_ACTIONS.contains(&action) {
+        return None;
+    }
+    Some(serde_json::json!({
+        "status": "error",
+        "error_code": "FORBIDDEN",
+        "message": format!(
+            "{action} runs only on the hive being added or removed, never on the motherbee"
+        ),
+    }))
 }
 
 async fn send_admin_forbidden(
@@ -2046,12 +2505,23 @@ async fn send_admin_forbidden(
     action: &str,
     reason: &str,
 ) -> Result<(), OrchestratorError> {
+    send_admin_error(sender, msg, action, "FORBIDDEN", reason).await
+}
+
+/// An admin command's error answer, before any flow ran.
+async fn send_admin_error(
+    sender: &NodeSender,
+    msg: &Message,
+    action: &str,
+    error_code: &str,
+    reason: &str,
+) -> Result<(), OrchestratorError> {
     let action_class = classify_admin_action(action);
     let (action_result, result_origin) =
-        derive_action_outcome(action_class, Some("error"), Some("FORBIDDEN"));
+        derive_action_outcome(action_class, Some("error"), Some(error_code));
     let payload = serde_json::json!({
         "status": "error",
-        "error_code": "FORBIDDEN",
+        "error_code": error_code,
         "message": reason,
     });
     let reply = Message {
@@ -2085,8 +2555,11 @@ async fn send_admin_forbidden(
 async fn handle_admin(
     sender: &NodeSender,
     msg: &Message,
-    state: &OrchestratorState,
+    state_arc: &Arc<OrchestratorState>,
 ) -> Result<(), OrchestratorError> {
+    // Only the add_hive arm needs the Arc (it hands a clone to a background join). Everything
+    // else in this 400-line body keeps working against the plain reference.
+    let state: &OrchestratorState = state_arc.as_ref();
     let action = msg.meta.action.as_deref().unwrap_or("");
 
     // F8: gate state-mutating admin actions on an authorized origin. The SY.admin
@@ -2160,33 +2633,10 @@ async fn handle_admin(
                     *guard = path.to_string();
                 }
             }
-            let error_code = payload
-                .get("error_code")
-                .and_then(|value| value.as_str())
-                .map(|value| value.to_string());
-            let error_detail = payload
-                .get("message")
-                .and_then(|value| value.as_str())
-                .map(|value| value.to_string());
-            let version = msg
-                .payload
-                .get("version")
-                .and_then(|value| value.as_u64())
-                .unwrap_or(0);
-            let _ = send_config_response(
-                sender,
-                msg,
-                "storage",
-                version,
-                status,
-                error_code,
-                error_detail,
-                &state.hive_id,
-            )
-            .await;
             payload
         }
         "list_nodes" => list_nodes_flow(state, &msg.payload).await,
+        "list_tenant_nodes" => list_tenant_nodes_flow(state, &msg.payload).await,
         "list_versions" => list_versions_flow(state).await,
         "get_versions" => get_versions_flow(state, &msg.payload).await,
         "list_runtimes" => list_runtimes_flow(state, &msg.payload).await,
@@ -2199,7 +2649,7 @@ async fn handle_admin(
         "get_node_config" => get_node_config_flow(state, &msg.payload).await,
         "get_node_state" => get_node_state_flow(state, &msg.payload).await,
         "get_node_status" => get_node_status_flow(state, &msg.payload).await,
-        "set_node_config" => set_node_config_flow(sender, state, &msg.payload).await,
+        "set_node_config" => set_node_config_flow(state, &msg.payload).await,
         "start_node" => start_node_flow(state, &msg.payload).await,
         "restart_node" => restart_node_flow(state, &msg.payload).await,
         "run_node" => run_node_flow(state, &msg.payload).await,
@@ -2262,6 +2712,53 @@ async fn handle_admin(
                 })
             }
         }
+        "core_rollback" => {
+            let target = target_hive_from_payload(&msg.payload, &state.hive_id);
+            if target != state.hive_id {
+                // Forwarded over the mesh, exactly like SYSTEM_UPDATE. Without this the action
+                // was unreachable in practice: motherbee owns the admin API but never has a
+                // stamped generation (dpkg manages its core, not the mesh update path), while
+                // the spokes that DO have generations expose no admin API of their own.
+                //
+                // STRUCTURAL LIMIT that this does not fix: a spoke whose ORCHESTRATOR is the
+                // broken binary cannot answer the forward at all. For that case the external
+                // path — VM snapshot, or an apt downgrade — is the correct answer.
+                match forward_system_action_to_hive_with_timeout(
+                    state,
+                    &target,
+                    "SYSTEM_CORE_ROLLBACK",
+                    "SYSTEM_CORE_ROLLBACK_RESPONSE",
+                    msg.payload.clone(),
+                    core_rollback_forward_timeout(),
+                )
+                .await
+                {
+                    Ok(payload) => payload,
+                    // A TIMEOUT here usually does NOT mean the rollback failed. When the
+                    // restored set includes `sy-orchestrator` — the common case, since a core
+                    // rollback restores the whole component set — the target restarts the very
+                    // process that owes the answer, so the reply is lost BY CONSTRUCTION. Saying
+                    // "its orchestrator is the broken binary" would send the operator hunting a
+                    // failure that did not happen. Point at the two places that hold the truth.
+                    Err(err) => serde_json::json!({
+                        "status": "error",
+                        "error_code": "FORWARD_UNKNOWN",
+                        "retryable": true,
+                        "message": format!(
+                            "core_rollback: no reply from '{target}' ({err}). This is EXPECTED \
+                             when the restore includes sy-orchestrator: the target restarts the \
+                             process that owed the answer. The rollback has very likely applied — \
+                             verify with `GET /hives/{target}/versions` (core.installed.source \
+                             should read core_rollback) before retrying. If the hive is genuinely \
+                             unreachable, its orchestrator cannot be rescued in-band at all: use \
+                             the VM snapshot or an apt downgrade."
+                        ),
+                    }),
+                }
+            } else {
+                core_rollback_local(state, &msg.payload).await
+            }
+        }
         "add_hive" => {
             if !state.is_motherbee {
                 return send_admin_forbidden(
@@ -2272,242 +2769,9 @@ async fn handle_admin(
                 )
                 .await;
             }
-            let hive_id = msg
-                .payload
-                .get("hive_id")
-                .and_then(|value| value.as_str())
-                .map(|value| value.to_string());
-            let address = msg
-                .payload
-                .get("address")
-                .and_then(|value| value.as_str())
-                .map(|value| value.to_string());
-            if let Some(hive_id) = hive_id {
-                let address = address.unwrap_or_default();
-                let harden_ssh = resolve_add_hive_harden_ssh(&msg.payload);
-                let restrict_ssh = resolve_add_hive_restrict_ssh(&msg.payload, harden_ssh);
-                let ssh_access = resolve_add_hive_ssh_access(&msg.payload);
-                let require_dist_sync = resolve_add_hive_require_dist_sync(&msg.payload);
-                let dist_sync_probe_timeout_secs =
-                    resolve_add_hive_dist_sync_probe_timeout_secs(&msg.payload);
-                // SSH bootstrap login flows from the caller-supplied payload; the
-                // password is optional (key-first probe, see add_*_hive_flow).
-                match resolve_add_hive_ssh_creds(&msg.payload) {
-                    Err(err) => serde_json::json!({
-                        "status": "error",
-                        "error_code": "INVALID_REQUEST",
-                        "message": err.to_string(),
-                    }),
-                    Ok(creds) => match resolve_add_hive_role(&msg.payload) {
-                        Ok(HiveRole::Egress) => match resolve_add_hive_egress_section(&msg.payload)
-                        {
-                            Ok(egress) => {
-                                let mut result = add_egress_hive_flow(
-                                    state,
-                                    &hive_id,
-                                    &address,
-                                    harden_ssh,
-                                    restrict_ssh,
-                                    ssh_access,
-                                    egress,
-                                    &creds,
-                                )
-                                .await;
-                                // B-2: same as the worker path — on a failed egress join,
-                                // best-effort revoke the (possibly seeded) bootstrap key. NOT for
-                                // key_only_persist: on any of its error paths we KEEP the
-                                // motherbee key as the recovery channel (the per-spoke private
-                                // key may have been discarded), so a failed join is never a strand.
-                                // Also skipped on a transient/retryable failure so the retry stays key-first.
-                                if result.get("status").and_then(|v| v.as_str()) != Some("ok")
-                                    && ssh_access != SshAccess::KeyOnlyPersist
-                                    && !add_hive_result_is_transient(&result)
-                                {
-                                    let revoke = best_effort_revoke_bootstrap(
-                                        &address,
-                                        creds.user.as_str(),
-                                        creds.password.as_deref(),
-                                    );
-                                    if let Some(obj) = result.as_object_mut() {
-                                        obj.insert(
-                                            "ssh_bootstrap_open".to_string(),
-                                            serde_json::json!(!revoke.closed()),
-                                        );
-                                        obj.insert(
-                                            "ssh_key_removed".to_string(),
-                                            serde_json::json!(revoke.ssh_key_removed),
-                                        );
-                                        obj.insert(
-                                            "sudoers_removed".to_string(),
-                                            serde_json::json!(revoke.sudoers_removed),
-                                        );
-                                    }
-                                } else if result.get("status").and_then(|v| v.as_str())
-                                    != Some("ok")
-                                    && ssh_access != SshAccess::KeyOnlyPersist
-                                {
-                                    // Transient failure: the B-2 revoke was skipped so the retry
-                                    // stays key-first — but the motherbee key + sudoers remain on
-                                    // the box. Surface it so an abandoned box is not silently open.
-                                    if let Some(obj) = result.as_object_mut() {
-                                        obj.insert(
-                                            "ssh_bootstrap_open".to_string(),
-                                            serde_json::json!(true),
-                                        );
-                                        obj.insert(
-                                            "revoke_skipped_transient".to_string(),
-                                            serde_json::json!(true),
-                                        );
-                                    }
-                                }
-                                result
-                            }
-                            Err(err) => serde_json::json!({
-                                "status": "error",
-                                "error_code": "INVALID_REQUEST",
-                                "message": err.to_string(),
-                            }),
-                        },
-                        Ok(HiveRole::Ingress) => {
-                            match resolve_add_hive_ingress_section(&msg.payload) {
-                                Ok(ingress) => {
-                                    let mut result = add_ingress_hive_flow(
-                                        state,
-                                        &hive_id,
-                                        &address,
-                                        harden_ssh,
-                                        restrict_ssh,
-                                        ssh_access,
-                                        ingress,
-                                        &creds,
-                                    )
-                                    .await;
-                                    // Same failure tail as worker/egress: on a failed
-                                    // ingress join, best-effort revoke the seeded key. Skipped for
-                                    // key_only_persist (keep the motherbee key as recovery), and on
-                                    // a transient/retryable failure so the retry stays key-first.
-                                    if result.get("status").and_then(|v| v.as_str()) != Some("ok")
-                                        && ssh_access != SshAccess::KeyOnlyPersist
-                                        && !add_hive_result_is_transient(&result)
-                                    {
-                                        let revoke = best_effort_revoke_bootstrap(
-                                            &address,
-                                            creds.user.as_str(),
-                                            creds.password.as_deref(),
-                                        );
-                                        if let Some(obj) = result.as_object_mut() {
-                                            obj.insert(
-                                                "ssh_bootstrap_open".to_string(),
-                                                serde_json::json!(!revoke.closed()),
-                                            );
-                                            obj.insert(
-                                                "ssh_key_removed".to_string(),
-                                                serde_json::json!(revoke.ssh_key_removed),
-                                            );
-                                            obj.insert(
-                                                "sudoers_removed".to_string(),
-                                                serde_json::json!(revoke.sudoers_removed),
-                                            );
-                                        }
-                                    } else if result.get("status").and_then(|v| v.as_str())
-                                        != Some("ok")
-                                        && ssh_access != SshAccess::KeyOnlyPersist
-                                    {
-                                        // Transient failure: revoke skipped so the retry stays
-                                        // key-first; motherbee key + sudoers remain on the box.
-                                        if let Some(obj) = result.as_object_mut() {
-                                            obj.insert(
-                                                "ssh_bootstrap_open".to_string(),
-                                                serde_json::json!(true),
-                                            );
-                                            obj.insert(
-                                                "revoke_skipped_transient".to_string(),
-                                                serde_json::json!(true),
-                                            );
-                                        }
-                                    }
-                                    result
-                                }
-                                Err(err) => serde_json::json!({
-                                    "status": "error",
-                                    "error_code": "INVALID_REQUEST",
-                                    "message": err.to_string(),
-                                }),
-                            }
-                        }
-                        Ok(_) => {
-                            let mut result = add_hive_flow(
-                                state,
-                                &hive_id,
-                                &address,
-                                harden_ssh,
-                                restrict_ssh,
-                                ssh_access,
-                                require_dist_sync,
-                                dist_sync_probe_timeout_secs,
-                                &creds,
-                            )
-                            .await;
-                            // B-2: on a failed join, best-effort revoke the (possibly
-                            // already-seeded) bootstrap SSH access and surface whether it
-                            // may still be open (a retry re-seeds via the password channel).
-                            // Skipped for key_only_persist (keep the motherbee key as recovery), and
-                            // on a transient/retryable failure so the retry stays key-first.
-                            if result.get("status").and_then(|v| v.as_str()) != Some("ok")
-                                && ssh_access != SshAccess::KeyOnlyPersist
-                                && !add_hive_result_is_transient(&result)
-                            {
-                                let revoke = best_effort_revoke_bootstrap(
-                                    &address,
-                                    creds.user.as_str(),
-                                    creds.password.as_deref(),
-                                );
-                                if let Some(obj) = result.as_object_mut() {
-                                    obj.insert(
-                                        "ssh_bootstrap_open".to_string(),
-                                        serde_json::json!(!revoke.closed()),
-                                    );
-                                    obj.insert(
-                                        "ssh_key_removed".to_string(),
-                                        serde_json::json!(revoke.ssh_key_removed),
-                                    );
-                                    obj.insert(
-                                        "sudoers_removed".to_string(),
-                                        serde_json::json!(revoke.sudoers_removed),
-                                    );
-                                }
-                            } else if result.get("status").and_then(|v| v.as_str()) != Some("ok")
-                                && ssh_access != SshAccess::KeyOnlyPersist
-                            {
-                                // Transient failure: revoke skipped so the retry stays key-first;
-                                // motherbee key + sudoers remain on the box. Surface it.
-                                if let Some(obj) = result.as_object_mut() {
-                                    obj.insert(
-                                        "ssh_bootstrap_open".to_string(),
-                                        serde_json::json!(true),
-                                    );
-                                    obj.insert(
-                                        "revoke_skipped_transient".to_string(),
-                                        serde_json::json!(true),
-                                    );
-                                }
-                            }
-                            result
-                        }
-                        Err(err) => serde_json::json!({
-                            "status": "error",
-                            "error_code": "INVALID_REQUEST",
-                            "message": err.to_string(),
-                        }),
-                    },
-                }
-            } else {
-                serde_json::json!({
-                    "status": "error",
-                    "error_code": "INVALID_REQUEST",
-                    "message": "missing hive_id",
-                })
-            }
+            // PB-7: accept and return; the join runs in the background so the serial admin
+            // channel stays free. The B-2 revoke tails moved INTO the background task.
+            accept_add_hive(state_arc, &msg.payload).await
         }
         _ => serde_json::json!({
             "status": "error",
@@ -2551,10 +2815,10 @@ async fn handle_admin(
 async fn handle_system_message(
     sender: &NodeSender,
     msg: &Message,
-    state: &OrchestratorState,
+    state: &Arc<OrchestratorState>,
 ) -> Result<(), OrchestratorError> {
     // SYSTEM origin-authority is enforced centrally by the router at delivery time
-    // (system_policy::authority); an unauthorized protected SYSTEM action should
+    // (system_policy::authorize_system); an unauthorized protected SYSTEM action should
     // never reach this node (F4/F15).
     //
     // SO-05 (defense in depth): re-check protected actions locally against the
@@ -2565,7 +2829,7 @@ async fn handle_system_message(
     // this is a no-op (the message already passed the identical router check).
     if let Some(action) = msg.meta.msg.as_deref() {
         if json_router::router::system_policy::is_protected_system_action(action)
-            && !json_router::router::system_policy::authority(
+            && !json_router::router::system_policy::authorize_system(
                 action,
                 msg.routing.src_l2_name.as_deref(),
                 &state.hive_id,
@@ -2606,6 +2870,16 @@ async fn handle_system_message(
             let _ =
                 send_system_action_response(sender, msg, "SYSTEM_UPDATE_RESPONSE", result).await;
         }
+        Some("SYSTEM_CORE_ROLLBACK") => {
+            let result = core_rollback_local(state, &msg.payload).await;
+            let _ = send_system_action_response(
+                sender,
+                msg,
+                "SYSTEM_CORE_ROLLBACK_RESPONSE",
+                result,
+            )
+            .await;
+        }
         Some("SYSTEM_SYNC_HINT") => {
             let result = handle_system_sync_hint_message(state, msg).await;
             let _ =
@@ -2629,7 +2903,7 @@ async fn handle_system_message(
                     .await;
         }
         Some("NODE_CONFIG_SET") => {
-            let result = set_node_config_flow(sender, state, &msg.payload).await;
+            let result = set_node_config_flow(state, &msg.payload).await;
             tracing::info!(result = %result, "NODE_CONFIG_SET processed");
             let _ =
                 send_system_action_response(sender, msg, "NODE_CONFIG_SET_RESPONSE", result).await;
@@ -2683,7 +2957,16 @@ async fn handle_system_message(
             let _ = send_system_action_response(sender, msg, "INVENTORY_RESPONSE", result).await;
         }
         Some("ADD_HIVE_FINALIZE") => {
-            let result = add_hive_finalize_local_flow(state, &msg.payload).await;
+            let result = match spoke_only_action_refusal("ADD_HIVE_FINALIZE", state.is_motherbee) {
+                Some(refusal) => {
+                    tracing::warn!(
+                        src_l2_name = ?msg.routing.src_l2_name,
+                        "ADD_HIVE_FINALIZE refused: it never runs on the motherbee"
+                    );
+                    refusal
+                }
+                None => add_hive_finalize_local_flow(state, &msg.payload).await,
+            };
             tracing::info!(result = %result, "ADD_HIVE_FINALIZE processed");
             let _ = send_system_action_response(sender, msg, "ADD_HIVE_FINALIZE_RESPONSE", result)
                 .await;
@@ -2696,7 +2979,17 @@ async fn handle_system_message(
                 .get("egress_teardown")
                 .and_then(|value| value.as_bool())
                 .unwrap_or(false);
-            let result = remove_hive_cleanup_local_flow(egress_teardown);
+            let result = match spoke_only_action_refusal("REMOVE_HIVE_CLEANUP", state.is_motherbee)
+            {
+                Some(refusal) => {
+                    tracing::warn!(
+                        src_l2_name = ?msg.routing.src_l2_name,
+                        "REMOVE_HIVE_CLEANUP refused: it never runs on the motherbee"
+                    );
+                    refusal
+                }
+                None => remove_hive_cleanup_local_flow(egress_teardown),
+            };
             tracing::info!(result = %result, "REMOVE_HIVE_CLEANUP processed");
             let _ =
                 send_system_action_response(sender, msg, "REMOVE_HIVE_CLEANUP_RESPONSE", result)
@@ -2853,10 +3146,17 @@ struct SystemSyncHintRequest {
     timeout_ms: u64,
 }
 
+/// Default folder for a channel when the caller does not name one.
+///
+/// `dist` deliberately resolves to the LEGACY id: it is no longer a single folder, and
+/// `handle_system_sync_hint_message` expands any non-existent dist folder id (this one
+/// included) into the per-content folders the hive actually has. Keeping the historical value
+/// here means every existing caller — sy_admin, fluxbee-publish, the e2e scripts — keeps
+/// working unchanged and gets the whole channel settled.
 fn default_folder_id_for_sync_channel(channel: &str) -> Option<&'static str> {
     match channel {
         "blob" => Some(SYNCTHING_FOLDER_BLOB_ID),
-        "dist" => Some(SYNCTHING_FOLDER_DIST_ID),
+        "dist" => Some(SYNCTHING_FOLDER_DIST_LEGACY_ID),
         _ => None,
     }
 }
@@ -2884,7 +3184,12 @@ fn parse_system_sync_hint_payload(
         .unwrap_or(default_folder_id.as_str())
         .to_string();
 
-    if folder_id != default_folder_id {
+    // A dist caller may name one dist folder (SY.admin scans `fluxbee-dist-policy` right after
+    // publishing a policy); `handle_system_sync_hint_message` honours it if this hive has it and
+    // settles the whole channel otherwise.
+    let folder_ok = folder_id == default_folder_id
+        || (channel == "dist" && folder_id.starts_with(SYNCTHING_FOLDER_DIST_LEGACY_ID));
+    if !folder_ok {
         return Err(format!(
             "folder_id '{}' is invalid for channel '{}'; expected '{}'",
             folder_id, channel, default_folder_id
@@ -2975,7 +3280,14 @@ async fn wait_for_syncthing_folder_convergence(
     };
 
     if !service_active || !api_healthy {
-        ensure_blob_sync_runtime(desired_blob, desired_dist, state.is_motherbee).await?;
+        ensure_blob_sync_runtime(
+            desired_blob,
+            desired_dist,
+            state.is_motherbee,
+            state.role,
+            &state.hive_id,
+        )
+        .await?;
         service_active = systemd_is_active(SYNCTHING_SERVICE_NAME);
         api_healthy = if service_active {
             syncthing_api_healthy(desired_sync.sync_api_port).await
@@ -3004,8 +3316,12 @@ async fn wait_for_syncthing_folder_convergence(
         warnings.push(format!("scan trigger failed: {err}"));
     }
 
-    let mut folder_status = syncthing_folder_status(&desired_sync, folder_id)?;
     let deadline = Instant::now() + Duration::from_millis(timeout_ms);
+    let mut folder_status = if wait_for_idle {
+        syncthing_folder_status_across_restart(&desired_sync, folder_id, deadline).await?
+    } else {
+        syncthing_folder_status(&desired_sync, folder_id)?
+    };
     loop {
         if !folder_status.is_healthy() {
             return Ok(SyncthingConvergenceProbe {
@@ -3038,8 +3354,55 @@ async fn wait_for_syncthing_folder_convergence(
         }
 
         time::sleep(Duration::from_millis(SYSTEM_SYNC_HINT_POLL_INTERVAL_MS)).await;
-        folder_status = syncthing_folder_status(&desired_sync, folder_id)?;
+        folder_status =
+            syncthing_folder_status_across_restart(&desired_sync, folder_id, deadline).await?;
     }
+}
+
+/// A folder's status, asked again while Syncthing is restarting (its API port refuses
+/// connections), for at most the restart window and never past `deadline`. An API that answers
+/// with an error (a folder it does not have, a bad payload) is the real answer, at once.
+async fn syncthing_folder_status_across_restart(
+    sync: &BlobRuntimeConfig,
+    folder_id: &str,
+    deadline: Instant,
+) -> Result<SyncthingFolderStatus, OrchestratorError> {
+    let restart_window = Instant::now() + Duration::from_secs(SYNCTHING_BOOTSTRAP_TIMEOUT_SECS);
+    loop {
+        match syncthing_folder_status(sync, folder_id) {
+            Ok(status) => return Ok(status),
+            Err(err) => {
+                let now = Instant::now();
+                if now >= deadline
+                    || now >= restart_window
+                    || syncthing_api_healthy(sync.sync_api_port).await
+                {
+                    return Err(err);
+                }
+                tracing::debug!(folder = %folder_id, error = %err, "syncthing API restarting; asking again");
+                time::sleep(Duration::from_millis(SYSTEM_SYNC_HINT_POLL_INTERVAL_MS)).await;
+            }
+        }
+    }
+}
+
+/// The `dist` syncthing folders THIS hive actually has, given its role.
+///
+/// A caller asking to settle the "dist" channel names the channel, not the layout: motherbee
+/// and the e2e scripts still send the historical `folder_id: "fluxbee-dist"`, and they should
+/// not have to know that the target now holds `fluxbee-dist-core-<role>` plus `-vendor`, plus
+/// `-runtimes` only on a worker. The hive knows its own role, so it resolves the request here.
+///
+/// Resolves through `dist_sync_folders_for_hive`, NOT `dist_sync_folders_for_role`. On motherbee
+/// the per-role variant answers `fluxbee-dist-core-motherbee` — a folder motherbee never declares,
+/// because it does not sync to itself. That is the U-7 drift, and this caller was still on the
+/// wrong side of it after the watchdog was fixed: since a `dist` hint fans out over these ids and
+/// the first non-ok wins, the undeclared folder's 404 failed the WHOLE hint on motherbee.
+fn dist_sync_hint_folder_ids(state: &OrchestratorState, dist: &DistRuntimeConfig) -> Vec<String> {
+    dist_sync_folders_for_hive(dist, state.role, state.is_motherbee)
+        .into_iter()
+        .map(|f| f.id)
+        .collect()
 }
 
 async fn handle_system_sync_hint_message(
@@ -3056,6 +3419,40 @@ async fn handle_system_sync_hint_message(
             });
         }
     };
+
+    // "dist" is a channel, not a folder. Settle every dist folder this role carries, so an
+    // `update category=core` that waits on the channel is not satisfied by, say, vendor having
+    // converged while the core binaries are still in flight. A caller naming a folder that
+    // exists here (a specific `fluxbee-dist-*`) is honoured verbatim.
+    if request.channel == "dist" {
+        let dist = current_dist_runtime_config(state);
+        let ids = dist_sync_hint_folder_ids(state, &dist);
+        if !ids.iter().any(|id| id == &request.folder_id) {
+            let mut last = serde_json::Value::Null;
+            for id in ids {
+                let scoped = SystemSyncHintRequest {
+                    channel: request.channel.clone(),
+                    folder_id: id,
+                    wait_for_idle: request.wait_for_idle,
+                    timeout_ms: request.timeout_ms,
+                };
+                let value = handle_system_sync_hint_for_folder(state, scoped).await;
+                // First non-ok wins: a partially converged dist channel is not converged.
+                if value.get("status").and_then(|v| v.as_str()) != Some("ok") {
+                    return value;
+                }
+                last = value;
+            }
+            return last;
+        }
+    }
+    handle_system_sync_hint_for_folder(state, request).await
+}
+
+async fn handle_system_sync_hint_for_folder(
+    state: &OrchestratorState,
+    request: SystemSyncHintRequest,
+) -> serde_json::Value {
 
     let desired_blob = current_blob_runtime_config(state);
     let desired_dist = current_dist_runtime_config(state);
@@ -3218,7 +3615,12 @@ async fn restart_local_core_services_with_health_gate() -> Result<Vec<String>, O
         if !systemd_unit_exists(&service) {
             continue;
         }
-        systemd_start(&service)?;
+        // MUST be restart, not start: this runs AFTER the binaries were swapped in place
+        // while the services stayed up, so `start` would be a silent no-op and the unit
+        // would keep running the old inode. The rollback path calls this same function
+        // expecting the services to come back on the restored binary — that only works
+        // with a real restart either. See U-1.
+        systemd_restart(&service)?;
         wait_for_service_active(
             &service,
             Duration::from_secs(CORE_SERVICE_HEALTH_TIMEOUT_SECS),
@@ -3236,6 +3638,29 @@ struct SystemUpdateApplyResult {
     unchanged: Vec<String>,
     restarted: Vec<String>,
     errors: Vec<String>,
+}
+
+/// `update category=vendor` says what it did: `updated` when a new Syncthing binary was
+/// installed, `restarted` only when the service was restarted (A-57). A new binary with no
+/// restart means the service was not running and started on the new one.
+fn vendor_update_result(outcome: SyncthingRuntimeOutcome) -> SystemUpdateApplyResult {
+    let syncthing = vec!["syncthing".to_string()];
+    let (updated, unchanged) = if outcome.binary_updated {
+        (syncthing, Vec::new())
+    } else {
+        (Vec::new(), syncthing)
+    };
+    SystemUpdateApplyResult {
+        status: "ok".to_string(),
+        updated,
+        unchanged,
+        restarted: if outcome.restarted {
+            vec![SYNCTHING_SERVICE_NAME.to_string()]
+        } else {
+            Vec::new()
+        },
+        errors: Vec::new(),
+    }
 }
 
 fn set_exec_0755(path: &Path) -> Result<(), OrchestratorError> {
@@ -3279,6 +3704,299 @@ fn compute_local_core_update_sets(
     Ok((updated, unchanged))
 }
 
+/// How many `update-<ms>/` generations of previous core binaries to keep.
+///
+/// Mirrors the retention already applied to runtimes. Before this, the directory grew
+/// without bound — one generation per core update, forever.
+const CORE_BACKUP_GENERATIONS_KEPT: usize = 3;
+
+fn core_backup_root_dir() -> PathBuf {
+    orchestrator_runtime_dir().join("core-bin.prev.local")
+}
+
+const CORE_GENERATION_MANIFEST_NAME: &str = "generation.json";
+
+/// What is ACTUALLY installed in `/usr/bin` right now.
+///
+/// Nothing on disk tracked this before: `local_versions_snapshot` reports the hash of the DIST
+/// manifest — what syncthing delivered — as though it were what is running. After a rollback the
+/// two deliberately disagree, so without this record a rolled-back hive would keep reporting the
+/// version it is precisely NOT running.
+fn core_installed_record_path() -> PathBuf {
+    orchestrator_runtime_dir().join("core-installed.json")
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct CoreBackupComponent {
+    name: String,
+    sha256: String,
+    size: u64,
+}
+
+/// The stamp that makes a backup generation self-describing.
+///
+/// Without it a `core_rollback` cannot be expressed at all: the directories carried no
+/// `manifest_hash` and no version, so "roll back to X" had nothing to match against and
+/// "restore the most recent" was the only option — on a store whose most recent directory was
+/// usually EMPTY (fixed in U-5b) and whose restore reported success when it found nothing.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct CoreBackupGeneration {
+    schema_version: u64,
+    /// Directory name, `update-<epoch_ms>`.
+    generation: String,
+    created_at_ms: u64,
+    hive_id: String,
+    role: String,
+    /// The manifest hash these binaries WERE running before the update replaced them — i.e. the
+    /// state a rollback returns you to.
+    replaced_manifest_hash: Option<String>,
+    /// The manifest hash the update installed over them.
+    applied_manifest_hash: Option<String>,
+    components: Vec<CoreBackupComponent>,
+    /// Components the update CREATED (no previous binary): a rollback removes these rather than
+    /// restoring them.
+    created_without_backup: Vec<String>,
+}
+
+fn read_core_installed_record() -> Option<serde_json::Value> {
+    let raw = fs::read_to_string(core_installed_record_path()).ok()?;
+    serde_json::from_str(&raw).ok()
+}
+
+/// Record what is now in `/usr/bin`, and how it got there.
+fn write_core_installed_record(
+    manifest_hash: Option<String>,
+    source: &str,
+    extra: serde_json::Value,
+) {
+    let mut record = serde_json::json!({
+        "manifest_hash": manifest_hash,
+        "source": source,
+        "installed_at_ms": now_epoch_ms().to_string(),
+    });
+    if let (Some(obj), Some(more)) = (record.as_object_mut(), extra.as_object()) {
+        for (k, v) in more {
+            obj.insert(k.clone(), v.clone());
+        }
+    }
+    match serde_json::to_vec_pretty(&record) {
+        Ok(bytes) => {
+            if let Err(err) = write_file_atomic(&core_installed_record_path(), &bytes) {
+                tracing::warn!(error = %err, "could not record what core version is installed");
+            }
+        }
+        Err(err) => tracing::warn!(error = %err, "could not serialize the core installed record"),
+    }
+}
+
+fn read_core_backup_generation(dir: &Path) -> Option<CoreBackupGeneration> {
+    let raw = fs::read_to_string(dir.join(CORE_GENERATION_MANIFEST_NAME)).ok()?;
+    serde_json::from_str(&raw).ok()
+}
+
+/// Which generation to roll back to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum CoreRollbackSelector {
+    /// Undo the most recent core update.
+    Latest,
+    /// A specific `update-<ms>` directory.
+    Generation(String),
+    /// The generation that returns this hive to a named manifest hash.
+    ToManifestHash(String),
+}
+
+fn normalize_hash(value: &str) -> String {
+    value.trim().trim_start_matches("sha256:").to_ascii_lowercase()
+}
+
+/// Pick and FULLY VERIFY a generation before anything in `/usr/bin` is touched.
+///
+/// Every failure mode is loud. In particular an empty `components` list is an error, not an
+/// empty success: hives updated before U-5b created a directory on every no-op, so "restore the
+/// latest" would otherwise cheerfully restore nothing and report `ok`.
+///
+/// Takes both roots as parameters so tests never touch the real `/usr/bin`.
+fn select_core_backup_generation(
+    root: &Path,
+    selector: &CoreRollbackSelector,
+) -> Result<(PathBuf, CoreBackupGeneration), (&'static str, String)> {
+    let mut generations: Vec<(PathBuf, CoreBackupGeneration)> = fs::read_dir(root)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|p| {
+            p.is_dir()
+                && p.file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|n| n.starts_with("update-"))
+        })
+        .filter_map(|p| read_core_backup_generation(&p).map(|g| (p, g)))
+        .collect();
+    // Fixed-width epoch suffix, so lexical order is chronological — the same assumption
+    // `prune_core_backup_generations_in` documents.
+    generations.sort_by(|a, b| a.1.generation.cmp(&b.1.generation));
+
+    if generations.is_empty() {
+        return Err((
+            "NO_BACKUP",
+            format!(
+                "no stamped core backup generation under {}. Generations created before this \
+                 build carry no generation.json and cannot be rolled back to.",
+                root.display()
+            ),
+        ));
+    }
+
+    let (dir, generation) = match selector {
+        CoreRollbackSelector::Latest => generations.pop().expect("non-empty"),
+        CoreRollbackSelector::Generation(id) => generations
+            .into_iter()
+            .find(|(_, g)| g.generation == *id)
+            .ok_or_else(|| ("NO_BACKUP", format!("no backup generation named '{id}'")))?,
+        CoreRollbackSelector::ToManifestHash(hash) => {
+            let wanted = normalize_hash(hash);
+            let matches: Vec<_> = generations
+                .into_iter()
+                .filter(|(_, g)| {
+                    g.replaced_manifest_hash
+                        .as_deref()
+                        .map(normalize_hash)
+                        .is_some_and(|h| h == wanted)
+                })
+                .collect();
+            match matches.len() {
+                1 => matches.into_iter().next().expect("len 1"),
+                0 => {
+                    return Err((
+                        "NO_BACKUP",
+                        format!("no backup generation returns this hive to manifest_hash {hash}"),
+                    ))
+                }
+                // NEVER silently pick one.
+                _ => {
+                    let names: Vec<_> =
+                        matches.iter().map(|(_, g)| g.generation.clone()).collect();
+                    return Err((
+                        "NO_BACKUP",
+                        format!(
+                            "manifest_hash {hash} matches {} generations ({}); name one with \
+                             `generation`",
+                            names.len(),
+                            names.join(", ")
+                        ),
+                    ));
+                }
+            }
+        }
+    };
+
+    if generation.components.is_empty() {
+        return Err((
+            "NO_BACKUP",
+            format!(
+                "generation '{}' restored nothing (no components recorded); rolling back to it \
+                 would be a no-op reported as success",
+                generation.generation
+            ),
+        ));
+    }
+
+    // Pre-flight the WHOLE generation before touching anything.
+    for component in &generation.components {
+        let path = dir.join(&component.name);
+        let meta = fs::metadata(&path).map_err(|err| {
+            (
+                "BACKUP_CORRUPT",
+                format!("component '{}' is missing: {err}", component.name),
+            )
+        })?;
+        if meta.len() != component.size {
+            return Err((
+                "BACKUP_CORRUPT",
+                format!(
+                    "component '{}' is {} bytes but the stamp says {}",
+                    component.name,
+                    meta.len(),
+                    component.size
+                ),
+            ));
+        }
+        let actual = sha256_file(&path).map_err(|err| {
+            (
+                "BACKUP_CORRUPT",
+                format!("component '{}' could not be hashed: {err}", component.name),
+            )
+        })?;
+        if normalize_hash(&actual) != normalize_hash(&component.sha256) {
+            return Err((
+                "BACKUP_CORRUPT",
+                format!("component '{}' failed its sha256 check", component.name),
+            ));
+        }
+    }
+
+    // Return the directory we actually hashed. Recomputing it downstream from the stamp's
+    // `generation` FIELD would let a renamed or hand-copied directory verify one tree and
+    // restore from another.
+    Ok((dir, generation))
+}
+
+fn prune_core_backup_generations(keep: usize) {
+    prune_core_backup_generations_in(&core_backup_root_dir(), keep)
+}
+
+/// Drop all but the newest `keep` backup generations under `root`.
+///
+/// Best-effort on purpose: this runs after a core update has already succeeded, and failing
+/// to tidy up must never turn a good update into a reported failure. Ordering is by
+/// directory name, which sorts chronologically because the suffix is a fixed-width epoch
+/// in milliseconds.
+///
+/// Takes the root as a parameter so it is testable without touching the real state dir.
+fn prune_core_backup_generations_in(root: &Path, keep: usize) {
+    let Ok(entries) = fs::read_dir(root) else {
+        return;
+    };
+    let generations: Vec<PathBuf> = entries
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.is_dir()
+                && path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.starts_with("update-"))
+        })
+        .collect();
+
+    // A generation with no stamp cannot be rolled back to, so it must never count against the
+    // retention budget: Phase A/B abort with `?` on a disk-full or EIO and leave the partial
+    // directory behind, and three of those in a row would otherwise evict every usable
+    // generation. Drop them eagerly, then apply `keep` to what is actually restorable.
+    let (usable, junk): (Vec<PathBuf>, Vec<PathBuf>) = generations
+        .into_iter()
+        .partition(|path| path.join(CORE_GENERATION_MANIFEST_NAME).is_file());
+    for path in junk {
+        tracing::warn!(
+            path = %path.display(),
+            "core backup retention: removing an unstamped generation (a core update failed partway)"
+        );
+        let _ = fs::remove_dir_all(&path);
+    }
+    let mut generations = usable;
+    if generations.len() <= keep {
+        return;
+    }
+    generations.sort();
+    let doomed = generations.len() - keep;
+    for path in generations.into_iter().take(doomed) {
+        if let Err(err) = fs::remove_dir_all(&path) {
+            tracing::warn!(path = %path.display(), error = %err, "core backup retention: could not remove old generation");
+        }
+    }
+}
+
 fn rollback_local_core_binaries(
     updated: &[String],
     backup_dir: &Path,
@@ -3289,34 +4007,571 @@ fn rollback_local_core_binaries(
         let target_path = Path::new("/usr/bin").join(name);
         let backup_path = backup_dir.join(name);
         if backup_path.exists() {
-            if let Err(err) = fs::copy(&backup_path, &target_path) {
+            // STAGE + RENAME, never `fs::copy` onto the target. Writing directly into a binary
+            // whose process is running fails with ETXTBSY — and this primitive's whole job is to
+            // undo an update whose services were just restarted, so the target is running by
+            // definition. A rename swaps the directory entry instead of the file, which the
+            // update path (and `core_rollback_local`) already do for exactly this reason.
+            let stage_path = Path::new("/usr/bin").join(format!(".{name}.fluxbee.rollback"));
+            if let Err(err) = (|| -> Result<(), OrchestratorError> {
+                fs::copy(&backup_path, &stage_path)?;
+                set_exec_0755(&stage_path)?;
+                fs::rename(&stage_path, &target_path)?;
+                Ok(())
+            })() {
+                let _ = fs::remove_file(&stage_path);
                 rollback_errors.push(format!("restore {} failed: {}", target_path.display(), err));
                 continue;
             }
-            if let Err(err) = set_exec_0755(&target_path) {
+            continue;
+        }
+        if created_without_backup.contains(name) {
+            if target_path.exists() && fs::remove_file(&target_path).is_err() {
                 rollback_errors.push(format!(
-                    "restore chmod {} failed: {}",
-                    target_path.display(),
-                    err
+                    "remove {} failed during rollback",
+                    target_path.display()
                 ));
             }
             continue;
         }
-        if created_without_backup.contains(name)
-            && target_path.exists()
-            && fs::remove_file(&target_path).is_err()
-        {
-            rollback_errors.push(format!(
-                "remove {} failed during rollback",
-                target_path.display()
-            ));
-        }
+        // No backup AND not recorded as newly created. Today this branch is UNREACHABLE from
+        // the three in-flight callers, which all pass `installed` — every element of which was
+        // either copied into backup_dir or inserted into created_without_backup one iteration
+        // earlier. It becomes reachable with `core_rollback`, whose component list comes from a
+        // stamp on disk. Falling through silently would return Ok() having restored NOTHING —
+        // exactly the U-1 failure mode (report success without doing the work).
+        rollback_errors.push(format!(
+            "no backup for '{}' in {} and it was not recorded as newly created; refusing to \
+             report a rollback that restored nothing",
+            name,
+            backup_dir.display()
+        ));
     }
 
     if rollback_errors.is_empty() {
         Ok(())
     } else {
         Err(format!("rollback errors: {}", rollback_errors.join("; ")).into())
+    }
+}
+
+/// Undo the last core update on THIS hive.
+///
+/// U-5. What already existed was automatic rollback inside a failed update; there was no way to
+/// back out an update that "succeeded" and then turned out to be wrong.
+///
+/// ⛔ The tempting version of this — "restore the most recent backup" — was UNSAFE against the
+/// old store and is why the prerequisites landed first: generations were created even on a no-op
+/// (so the newest was usually empty), carried no manifest hash (so "roll back to X" was not
+/// expressible), and the restore primitive returned `Ok()` when it found nothing to restore.
+/// That last one is U-1 exactly: report success, do nothing.
+///
+/// STRUCTURAL LIMIT, stated rather than papered over: this is an in-band action routed to
+/// `SY.orchestrator@<hive>`, so it can never rescue the hive whose ORCHESTRATOR is the broken
+/// binary. For that case the external path — VM snapshot, or `apt` downgrade plus a fresh
+/// `update category=core` — is the correct answer, not a missing feature.
+async fn core_rollback_local(
+    state: &OrchestratorState,
+    payload: &serde_json::Value,
+) -> serde_json::Value {
+    let err = |code: &str, message: String| {
+        serde_json::json!({ "status": "error", "error_code": code, "message": message })
+    };
+
+    let generation = payload.get("generation").and_then(|v| v.as_str());
+    let to_hash = payload.get("to_manifest_hash").and_then(|v| v.as_str());
+    let dry_run = payload
+        .get("dry_run")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let restart = payload
+        .get("restart")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(true);
+
+    let selector = match (generation, to_hash) {
+        (Some(_), Some(_)) => {
+            return err(
+                "INVALID_REQUEST",
+                "pass exactly one of 'generation' or 'to_manifest_hash'".to_string(),
+            )
+        }
+        (Some(g), None) if g.eq_ignore_ascii_case("latest") => CoreRollbackSelector::Latest,
+        (Some(g), None) => CoreRollbackSelector::Generation(g.to_string()),
+        (None, Some(h)) => CoreRollbackSelector::ToManifestHash(h.to_string()),
+        // No selector means "undo the last update", the operator's actual intent.
+        (None, None) => CoreRollbackSelector::Latest,
+    };
+
+    // Same guard the update path takes, so a rollback can never interleave with an update.
+    let _lifecycle_guard = state.runtime_lifecycle_lock.lock().await;
+
+    let root = core_backup_root_dir();
+    let (backup_dir, generation) = match select_core_backup_generation(&root, &selector) {
+        Ok(selected) => selected,
+        Err((code, message)) => return err(code, message),
+    };
+    let restored: Vec<String> = generation
+        .components
+        .iter()
+        .map(|c| c.name.clone())
+        .collect();
+
+    if dry_run {
+        return serde_json::json!({
+            "status": "ok",
+            "dry_run": true,
+            "hive": state.hive_id,
+            "generation": generation.generation,
+            "replaced_manifest_hash": generation.replaced_manifest_hash,
+            "applied_manifest_hash": generation.applied_manifest_hash,
+            "would_restore": restored,
+            "would_remove": generation.created_without_backup,
+        });
+    }
+
+    // Byte-identical staging to the update path: tmp sibling + rename, which is what makes the
+    // swap atomic against a running unit.
+    let mut errors = Vec::new();
+    // Tracked per component: a partial failure leaves /usr/bin mixed, and the operator needs to
+    // know WHICH side each binary landed on.
+    let mut restored_ok: Vec<String> = Vec::new();
+    let mut restore_failed: Vec<String> = Vec::new();
+    for component in &generation.components {
+        let target = Path::new("/usr/bin").join(&component.name);
+        let stage = Path::new("/usr/bin").join(format!(".{}.fluxbee.tmp", component.name));
+        match (|| -> Result<(), OrchestratorError> {
+            fs::copy(backup_dir.join(&component.name), &stage)?;
+            set_exec_0755(&stage)?;
+            fs::rename(&stage, &target)?;
+            Ok(())
+        })() {
+            Ok(()) => restored_ok.push(component.name.clone()),
+            Err(e) => {
+                // Leave no staging file behind to be mistaken for a binary.
+                let _ = fs::remove_file(&stage);
+                restore_failed.push(component.name.clone());
+                errors.push(format!("restore {} failed: {e}", component.name));
+            }
+        }
+    }
+    // Components the update CREATED have nothing to restore to: remove them.
+    for name in &generation.created_without_backup {
+        let target = Path::new("/usr/bin").join(name);
+        if target.exists() {
+            if let Err(e) = fs::remove_file(&target) {
+                errors.push(format!("remove {name} failed: {e}"));
+            }
+        }
+    }
+
+    if !errors.is_empty() {
+        append_single_deployment_history(
+            state,
+            "core",
+            "core_rollback",
+            &state.hive_id,
+            "error",
+            Some("ROLLBACK_FAILED".to_string()),
+            generation.replaced_manifest_hash.clone(),
+        );
+        // /usr/bin is now MIXED: some components are the old build, some are still the new one.
+        // Say so, and make the installed record say so too — leaving it claiming the new
+        // manifest would be a lie the next `versions` call would repeat, and the operator would
+        // have no way to know the box is inconsistent.
+        write_core_installed_record(
+            None,
+            "core_rollback_partial",
+            serde_json::json!({
+                "generation": generation.generation,
+                "inconsistent": true,
+                "restored": restored_ok,
+                "still_on_new_build": restore_failed,
+            }),
+        );
+        return serde_json::json!({
+            "status": "error",
+            "error_code": "ROLLBACK_FAILED",
+            "message": format!(
+                "core rollback left /usr/bin INCONSISTENT: restored {:?} but {:?} are still the \
+                 new build. Re-run the rollback, or `update category=core` to return to a \
+                 uniform build. Errors: {}",
+                restored_ok,
+                restore_failed,
+                errors.join("; ")
+            ),
+            "hive": state.hive_id,
+            "generation": generation.generation,
+            "inconsistent": true,
+            "restored": restored_ok,
+            "still_on_new_build": restore_failed,
+        });
+    }
+
+    // The hive is now DELIBERATELY off-manifest, and says so.
+    write_core_installed_record(
+        generation.replaced_manifest_hash.clone(),
+        "core_rollback",
+        serde_json::json!({
+            "generation": generation.generation,
+            "rolled_back_from": generation.applied_manifest_hash,
+            "components": restored,
+        }),
+    );
+
+    // Recorded BEFORE the restarts: restarting can kill the reply, and then the audit log is
+    // the only way the operator learns what happened.
+    append_single_deployment_history(
+        state,
+        "core",
+        "core_rollback",
+        &state.hive_id,
+        "ok",
+        None,
+        generation.replaced_manifest_hash.clone(),
+    );
+
+    let mut restarted: Vec<String> = Vec::new();
+    let mut self_restart = false;
+    if restart {
+        match restart_local_core_services_with_health_gate().await {
+            Ok(units) => restarted = units,
+            Err(e) => errors.push(format!("restart after rollback failed: {e}")),
+        }
+        if restored.iter().any(|n| n == "sy-orchestrator") {
+            schedule_orchestrator_self_restart();
+            self_restart = true;
+        }
+    }
+
+    // The health gate `?`-returns on the FIRST unit that does not come up, so a non-empty
+    // `errors` here means services are down and the operator must intervene. Reporting `ok`
+    // anyway would be U-1's shape all over again — success on work that did not complete.
+    if !errors.is_empty() {
+        append_single_deployment_history(
+            state,
+            "core",
+            "core_rollback",
+            &state.hive_id,
+            "error",
+            Some("ROLLBACK_RESTART_FAILED".to_string()),
+            generation.replaced_manifest_hash.clone(),
+        );
+        return serde_json::json!({
+            "status": "error",
+            "error_code": "ROLLBACK_RESTART_FAILED",
+            "message": format!(
+                "binaries were restored from generation '{}' but the core did not come back up: {}",
+                generation.generation,
+                errors.join("; ")
+            ),
+            "hive": state.hive_id,
+            "generation": generation.generation,
+            "restored": restored,
+            "restarted": restarted,
+            "orchestrator_self_restart_scheduled": self_restart,
+        });
+    }
+
+    serde_json::json!({
+        "status": "ok",
+        "hive": state.hive_id,
+        "generation": generation.generation,
+        "replaced_manifest_hash": generation.replaced_manifest_hash,
+        "applied_manifest_hash": generation.applied_manifest_hash,
+        "restored": restored,
+        "removed": generation.created_without_backup,
+        "restarted": restarted,
+        "orchestrator_self_restart_scheduled": self_restart,
+        // Deliberately not called "verified": the gate proves each unit reached active/running,
+        // NOT that the mesh works or that the rolled-back build is functionally correct.
+        "health_gate": "unit_active_only",
+        "errors": errors,
+    })
+}
+
+/// A core update with its new binaries and units in place, waiting for its restarts.
+struct PreparedCoreUpdate {
+    updated: Vec<String>,
+    unchanged: Vec<String>,
+    backup_dir: PathBuf,
+    created_without_backup: HashSet<String>,
+}
+
+enum CorePrepareOutcome {
+    /// Binaries and units are in place; the services still run the old ones.
+    Ready(PreparedCoreUpdate),
+    /// Nothing to restart: the preparation already ended (and rolled back).
+    Done(SystemUpdateApplyResult),
+}
+
+/// Phases A-C of a core update plus the unit regeneration: back up and stamp what is replaced,
+/// swap the binaries in, re-render this role's units. Restarting is `restart_core_after_update`.
+fn prepare_core_update(state: &OrchestratorState) -> Result<CorePrepareOutcome, OrchestratorError> {
+    let manifest = load_core_manifest()?;
+    let (updated, unchanged) = compute_local_core_update_sets(&manifest, state.role)?;
+    let backup_dir = core_backup_root_dir().join(format!("update-{}", now_epoch_ms()));
+    // Created LAZILY, on the first binary we actually back up. It used to be created
+    // unconditionally, which left an empty `update-<ms>/` behind on every no-op update —
+    // so "restore the most recent backup" would have restored nothing.
+    let mut backup_dir_created = false;
+    let mut created_without_backup = HashSet::new();
+    let mut installed = Vec::new();
+    let mut backup_components: Vec<CoreBackupComponent> = Vec::new();
+
+    // PHASE A — back up every component we are about to replace, and STAMP it. The
+    // stamp is written before the first swap so a crash mid-update still leaves a
+    // rollback target that describes itself.
+    for name in &updated {
+        let target_path = Path::new("/usr/bin").join(name);
+        if target_path.exists() {
+            if !backup_dir_created {
+                fs::create_dir_all(&backup_dir)?;
+                backup_dir_created = true;
+            }
+            let backup_path = backup_dir.join(name);
+            fs::copy(&target_path, &backup_path)?;
+            // Hash the COPY, not the source: a short write is caught here, while there
+            // is still a good binary in /usr/bin to keep.
+            backup_components.push(CoreBackupComponent {
+                name: name.clone(),
+                sha256: sha256_file(&backup_path)?,
+                size: fs::metadata(&backup_path)?.len(),
+            });
+        } else {
+            created_without_backup.insert(name.clone());
+        }
+    }
+
+    // PHASE B — the stamp.
+    if backup_dir_created {
+        let generation = CoreBackupGeneration {
+            schema_version: 1,
+            generation: backup_dir
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or_default()
+                .to_string(),
+            created_at_ms: now_epoch_ms() as u64,
+            hive_id: state.hive_id.clone(),
+            role: format!("{:?}", state.role).to_lowercase(),
+            replaced_manifest_hash: read_core_installed_record().and_then(|r| {
+                r.get("manifest_hash")
+                    .and_then(|v| v.as_str().map(String::from))
+            }),
+            applied_manifest_hash: local_core_manifest_hash().ok().flatten(),
+            components: backup_components,
+            created_without_backup: created_without_backup.iter().cloned().collect(),
+        };
+        let stamp = serde_json::to_vec_pretty(&generation)?;
+        write_file_atomic(&backup_dir.join(CORE_GENERATION_MANIFEST_NAME), &stamp)?;
+    }
+
+    // PHASE C — the swap.
+    for name in &updated {
+        let source_path = local_core_bin_source_path(name);
+        let target_path = Path::new("/usr/bin").join(name);
+        let stage_path = Path::new("/usr/bin").join(format!(".{name}.fluxbee.tmp"));
+        if let Err(err) = (|| -> Result<(), OrchestratorError> {
+            fs::copy(&source_path, &stage_path)?;
+            set_exec_0755(&stage_path)?;
+            fs::rename(&stage_path, &target_path)?;
+            Ok(())
+        })() {
+            let rollback_note = match rollback_local_core_binaries(
+                &installed,
+                &backup_dir,
+                &created_without_backup,
+            ) {
+                Ok(()) => "rollback applied".to_string(),
+                Err(rb_err) => format!("rollback failed: {rb_err}"),
+            };
+            return Err(format!(
+                "core local install failed for component '{}': {}; {}",
+                name, err, rollback_note
+            )
+            .into());
+        }
+        installed.push(name.clone());
+    }
+
+    // Unit-file changes (TimeoutStopSec, dependency edits) ride a category=core update:
+    // after swapping binaries, re-render this role's units and daemon-reload BEFORE the
+    // restart, so the new binaries start under the new units. A regen failure is treated
+    // like a health-gate failure — roll the binaries back so binaries+units stay
+    // consistent (regenerated unit files are benign to leave in place: a unit adding
+    // TimeoutStopSec still runs the rolled-back binary fine).
+    if let Err(err) = regen_local_core_units(&manifest, state.role) {
+        let rollback_note =
+            match rollback_local_core_binaries(&updated, &backup_dir, &created_without_backup) {
+                Ok(()) => "rollback applied".to_string(),
+                Err(rb_err) => format!("rollback failed: {rb_err}"),
+            };
+        return Ok(CorePrepareOutcome::Done(SystemUpdateApplyResult {
+            status: "rollback".to_string(),
+            updated: Vec::new(),
+            unchanged,
+            restarted: Vec::new(),
+            errors: vec![format!("core unit regen failed: {err}; {rollback_note}")],
+        }));
+    }
+
+    Ok(CorePrepareOutcome::Ready(PreparedCoreUpdate {
+        updated,
+        unchanged,
+        backup_dir,
+        created_without_backup,
+    }))
+}
+
+/// Restart the core services onto the prepared update (health-gated, rt-gateway first), roll
+/// the binaries back if the gate fails, and record the outcome in `core-update-last.json`.
+async fn restart_core_after_update(prepared: PreparedCoreUpdate) -> SystemUpdateApplyResult {
+    let PreparedCoreUpdate {
+        updated,
+        unchanged,
+        backup_dir,
+        created_without_backup,
+    } = prepared;
+    let started_at_ms = now_epoch_ms().to_string();
+    write_core_update_last_record(&serde_json::json!({
+        "phase": "restarting",
+        "started_at_ms": started_at_ms,
+        "updated": updated,
+        "unchanged": unchanged,
+    }));
+    let attempted = updated.clone();
+    let result = match restart_local_core_services_with_health_gate().await {
+        Ok(restarted) => {
+            // sy-orchestrator excludes itself from the in-process restart above, so if
+            // its own binary was swapped, schedule a detached self-restart to pick it up
+            // (and its regenerated unit) hands-off.
+            if updated.iter().any(|n| n == "sy-orchestrator") {
+                schedule_orchestrator_self_restart();
+            }
+            // Only on the success path: a rollback still needs its generation on disk.
+            prune_core_backup_generations(CORE_BACKUP_GENERATIONS_KEPT);
+            write_core_installed_record(
+                local_core_manifest_hash().ok().flatten(),
+                "update",
+                serde_json::json!({ "components": updated }),
+            );
+            SystemUpdateApplyResult {
+                status: "ok".to_string(),
+                updated,
+                unchanged,
+                restarted,
+                errors: Vec::new(),
+            }
+        }
+        Err(err) => {
+            let rollback_note = match rollback_local_core_binaries(
+                &updated,
+                &backup_dir,
+                &created_without_backup,
+            ) {
+                Ok(()) => match restart_local_core_services_with_health_gate().await {
+                    Ok(_) => "rollback applied and services recovered".to_string(),
+                    Err(rb_restart_err) => {
+                        format!("rollback applied but service recovery failed: {rb_restart_err}")
+                    }
+                },
+                Err(rb_err) => format!("rollback failed: {rb_err}"),
+            };
+            SystemUpdateApplyResult {
+                status: "rollback".to_string(),
+                updated: Vec::new(),
+                unchanged,
+                restarted: Vec::new(),
+                errors: vec![format!("core health gate failed: {err}; {rollback_note}")],
+            }
+        }
+    };
+    write_core_update_last_record(&serde_json::json!({
+        "phase": "done",
+        "status": result.status,
+        "started_at_ms": started_at_ms,
+        "finished_at_ms": now_epoch_ms().to_string(),
+        "updated": attempted,
+        "restarted": result.restarted,
+        "errors": result.errors,
+    }));
+    result
+}
+
+fn core_update_last_record_path() -> PathBuf {
+    orchestrator_runtime_dir().join("core-update-last.json")
+}
+
+/// The last core update's progress and outcome: `phase` restarting|done, `status` ok|rollback.
+fn read_core_update_last_record() -> Option<serde_json::Value> {
+    let raw = fs::read_to_string(core_update_last_record_path()).ok()?;
+    serde_json::from_str(&raw).ok()
+}
+
+fn write_core_update_last_record(record: &serde_json::Value) {
+    match serde_json::to_vec_pretty(record) {
+        Ok(bytes) => {
+            if let Err(err) = write_file_atomic(&core_update_last_record_path(), &bytes) {
+                tracing::warn!(error = %err, "could not record the core update outcome");
+            }
+        }
+        Err(err) => tracing::warn!(error = %err, "could not serialize the core update outcome"),
+    }
+}
+
+/// How long the background restart waits before stopping rt-gateway, so the SYSTEM_UPDATE reply
+/// leaves on the bus it is about to restart.
+const CORE_RESTART_GRACE: Duration = Duration::from_secs(2);
+
+/// SYSTEM_UPDATE category=core answers once the new binaries and units are in place, and restarts
+/// in the background (U-8b). The restart begins with rt-gateway, the bus the reply travels on, so
+/// a reply sent after the restarts went out on a dead connection and was lost: by protocol the
+/// SDK drops unsent frames on reconnect and resending is the node's job (02-protocolo §10.6).
+/// The background task holds the lifecycle lock from preparation to the end of the restarts, so
+/// no other update interleaves; the outcome is in `core-update-last.json` (`/versions`:
+/// `core.last_update`).
+async fn apply_core_update_replying_first(
+    state: &Arc<OrchestratorState>,
+) -> Result<(SystemUpdateApplyResult, &'static str), OrchestratorError> {
+    let (prepared_tx, prepared_rx) =
+        tokio::sync::oneshot::channel::<Result<(SystemUpdateApplyResult, &'static str), String>>();
+    let state = Arc::clone(state);
+    tokio::spawn(async move {
+        let _lifecycle_guard = state.runtime_lifecycle_lock.lock().await;
+        let prepared = match prepare_core_update(&state) {
+            Err(err) => {
+                let _ = prepared_tx.send(Err(err.to_string()));
+                return;
+            }
+            Ok(CorePrepareOutcome::Done(result)) => {
+                let _ = prepared_tx.send(Ok((result, "done")));
+                return;
+            }
+            Ok(CorePrepareOutcome::Ready(prepared)) => prepared,
+        };
+        let ack = SystemUpdateApplyResult {
+            status: "ok".to_string(),
+            updated: prepared.updated.clone(),
+            unchanged: prepared.unchanged.clone(),
+            restarted: Vec::new(),
+            errors: Vec::new(),
+        };
+        // The restarts go ahead even if nobody waits for the answer any more.
+        let _ = prepared_tx.send(Ok((ack, "restarting")));
+        time::sleep(CORE_RESTART_GRACE).await;
+        let result = restart_core_after_update(prepared).await;
+        tracing::info!(
+            status = %result.status,
+            restarted = ?result.restarted,
+            errors = ?result.errors,
+            "core update: background restarts finished"
+        );
+    });
+    match prepared_rx.await {
+        Ok(Ok(outcome)) => Ok(outcome),
+        Ok(Err(message)) => Err(message.into()),
+        Err(_) => Err("core update task ended before it prepared the update".into()),
     }
 }
 
@@ -3386,112 +4641,10 @@ async fn apply_system_update_local(
                 errors: Vec::new(),
             })
         }
-        "core" => {
-            let manifest = load_core_manifest()?;
-            let (updated, unchanged) = compute_local_core_update_sets(&manifest, state.role)?;
-            let backup_dir = orchestrator_runtime_dir()
-                .join("core-bin.prev.local")
-                .join(format!("update-{}", now_epoch_ms()));
-            fs::create_dir_all(&backup_dir)?;
-            let mut created_without_backup = HashSet::new();
-            let mut installed = Vec::new();
-            for name in &updated {
-                let source_path = local_core_bin_source_path(name);
-                let target_path = Path::new("/usr/bin").join(name);
-                if target_path.exists() {
-                    fs::copy(&target_path, backup_dir.join(name))?;
-                } else {
-                    created_without_backup.insert(name.clone());
-                }
-
-                let stage_path = Path::new("/usr/bin").join(format!(".{name}.fluxbee.tmp"));
-                if let Err(err) = (|| -> Result<(), OrchestratorError> {
-                    fs::copy(&source_path, &stage_path)?;
-                    set_exec_0755(&stage_path)?;
-                    fs::rename(&stage_path, &target_path)?;
-                    Ok(())
-                })() {
-                    let rollback_note = match rollback_local_core_binaries(
-                        &installed,
-                        &backup_dir,
-                        &created_without_backup,
-                    ) {
-                        Ok(()) => "rollback applied".to_string(),
-                        Err(rb_err) => format!("rollback failed: {rb_err}"),
-                    };
-                    return Err(format!(
-                        "core local install failed for component '{}': {}; {}",
-                        name, err, rollback_note
-                    )
-                    .into());
-                }
-                installed.push(name.clone());
-            }
-
-            // Unit-file changes (TimeoutStopSec, dependency edits) ride a category=core update:
-            // after swapping binaries, re-render this role's units and daemon-reload BEFORE the
-            // restart, so the new binaries start under the new units. A regen failure is treated
-            // like a health-gate failure — roll the binaries back so binaries+units stay
-            // consistent (regenerated unit files are benign to leave in place: a unit adding
-            // TimeoutStopSec still runs the rolled-back binary fine).
-            if let Err(err) = regen_local_core_units(&manifest, state.role) {
-                let rollback_note = match rollback_local_core_binaries(
-                    &updated,
-                    &backup_dir,
-                    &created_without_backup,
-                ) {
-                    Ok(()) => "rollback applied".to_string(),
-                    Err(rb_err) => format!("rollback failed: {rb_err}"),
-                };
-                return Ok(SystemUpdateApplyResult {
-                    status: "rollback".to_string(),
-                    updated: Vec::new(),
-                    unchanged,
-                    restarted: Vec::new(),
-                    errors: vec![format!("core unit regen failed: {err}; {rollback_note}")],
-                });
-            }
-
-            match restart_local_core_services_with_health_gate().await {
-                Ok(restarted) => {
-                    // sy-orchestrator excludes itself from the in-process restart above, so if
-                    // its own binary was swapped, schedule a detached self-restart to pick it up
-                    // (and its regenerated unit) hands-off.
-                    if updated.iter().any(|n| n == "sy-orchestrator") {
-                        schedule_orchestrator_self_restart();
-                    }
-                    Ok(SystemUpdateApplyResult {
-                        status: "ok".to_string(),
-                        updated,
-                        unchanged,
-                        restarted,
-                        errors: Vec::new(),
-                    })
-                }
-                Err(err) => {
-                    let rollback_note = match rollback_local_core_binaries(
-                        &updated,
-                        &backup_dir,
-                        &created_without_backup,
-                    ) {
-                        Ok(()) => match restart_local_core_services_with_health_gate().await {
-                            Ok(_) => "rollback applied and services recovered".to_string(),
-                            Err(rb_restart_err) => {
-                                format!("rollback applied but service recovery failed: {rb_restart_err}")
-                            }
-                        },
-                        Err(rb_err) => format!("rollback failed: {rb_err}"),
-                    };
-                    Ok(SystemUpdateApplyResult {
-                        status: "rollback".to_string(),
-                        updated: Vec::new(),
-                        unchanged,
-                        restarted: Vec::new(),
-                        errors: vec![format!("core health gate failed: {err}; {rollback_note}")],
-                    })
-                }
-            }
-        }
+        "core" => match prepare_core_update(state)? {
+            CorePrepareOutcome::Done(result) => Ok(result),
+            CorePrepareOutcome::Ready(prepared) => Ok(restart_core_after_update(prepared).await),
+        },
         "vendor" => {
             let desired_blob = current_blob_runtime_config(state);
             let desired_dist = current_dist_runtime_config(state);
@@ -3500,14 +4653,15 @@ async fn apply_system_update_local(
                 && (blob_sync_tool_is_syncthing(&desired_sync)
                     || dist_sync_tool_is_syncthing(&desired_dist))
             {
-                ensure_blob_sync_runtime(&desired_blob, &desired_dist, state.is_motherbee).await?;
-                Ok(SystemUpdateApplyResult {
-                    status: "ok".to_string(),
-                    updated: Vec::new(),
-                    unchanged: vec!["syncthing".to_string()],
-                    restarted: vec![SYNCTHING_SERVICE_NAME.to_string()],
-                    errors: Vec::new(),
-                })
+                let outcome = ensure_blob_sync_runtime(
+                    &desired_blob,
+                    &desired_dist,
+                    state.is_motherbee,
+                    state.role,
+                    &state.hive_id,
+                )
+                .await?;
+                Ok(vendor_update_result(outcome))
             } else {
                 Ok(SystemUpdateApplyResult {
                     status: "ok".to_string(),
@@ -3523,7 +4677,7 @@ async fn apply_system_update_local(
 }
 
 async fn handle_system_update_message(
-    state: &OrchestratorState,
+    state: &Arc<OrchestratorState>,
     msg: &Message,
 ) -> serde_json::Value {
     let request = match parse_system_update_payload(&msg.payload) {
@@ -3652,9 +4806,19 @@ async fn handle_system_update_message(
         None
     };
 
-    match apply_system_update_local(state, &request).await {
-        Ok(result) => serde_json::json!({
+    let applied = if category == "core" {
+        apply_core_update_replying_first(state).await
+    } else {
+        apply_system_update_local(state, &request)
+            .await
+            .map(|result| (result, "done"))
+    };
+    match applied {
+        Ok((result, phase)) => serde_json::json!({
             "status": result.status,
+            // `restarting`: a core update whose new binaries are in place and whose services are
+            // restarting in the background; its outcome is `/versions` -> core.last_update.
+            "phase": phase,
             "category": category,
             "hive": state.hive_id.as_str(),
             "manifest_version": expected_version,
@@ -3746,28 +4910,6 @@ async fn send_system_action_response(
     Ok(())
 }
 
-async fn wait_for_nats_ready(endpoint: &str, timeout: Duration) -> Result<(), OrchestratorError> {
-    let start = Instant::now();
-    loop {
-        match json_router::nats::check_endpoint(endpoint, Duration::from_secs(2)).await {
-            Ok(()) => {
-                tracing::info!(endpoint = %endpoint, "nats endpoint ready");
-                return Ok(());
-            }
-            Err(err) => {
-                if start.elapsed() >= timeout {
-                    return Err(format!(
-                        "nats bootstrap timeout endpoint={} error={}",
-                        endpoint, err
-                    )
-                    .into());
-                }
-            }
-        }
-        time::sleep(Duration::from_millis(250)).await;
-    }
-}
-
 async fn wait_for_service_active(
     service: &str,
     timeout: Duration,
@@ -3785,32 +4927,6 @@ async fn wait_for_service_active(
     }
 }
 
-fn nats_endpoint_from_hive(hive: &HiveFile) -> String {
-    let Some(nats) = hive.nats.as_ref() else {
-        return "nats://127.0.0.1:4222".to_string();
-    };
-
-    if let Some(url) = nats.url.as_ref() {
-        let url = url.trim();
-        if !url.is_empty() {
-            return url.to_string();
-        }
-    }
-
-    let mode = nats
-        .mode
-        .as_deref()
-        .unwrap_or("embedded")
-        .trim()
-        .to_ascii_lowercase();
-    let port = nats.port.unwrap_or(4222);
-    if mode == "embedded" || mode == "client" {
-        format!("nats://127.0.0.1:{port}")
-    } else {
-        "nats://127.0.0.1:4222".to_string()
-    }
-}
-
 fn blob_runtime_from_hive(hive: &HiveFile) -> BlobRuntimeConfig {
     let mut enabled = DEFAULT_BLOB_ENABLED;
     let mut path = PathBuf::from(DEFAULT_BLOB_PATH);
@@ -3822,8 +4938,6 @@ fn blob_runtime_from_hive(hive: &HiveFile) -> BlobRuntimeConfig {
     let mut sync_tool = DEFAULT_BLOB_SYNC_TOOL.to_string();
     let mut sync_api_port = DEFAULT_BLOB_SYNC_API_PORT;
     let mut sync_data_dir = PathBuf::from(DEFAULT_BLOB_SYNC_DATA_DIR);
-    let mut sync_service_user = DEFAULT_BLOB_SYNC_SERVICE_USER.to_string();
-    let mut sync_allow_root_fallback = DEFAULT_BLOB_SYNC_ALLOW_ROOT_FALLBACK;
     let mut gc_enabled = DEFAULT_BLOB_GC_ENABLED;
     let mut gc_interval_secs = DEFAULT_BLOB_GC_INTERVAL_SECS;
     let mut gc_apply = DEFAULT_BLOB_GC_APPLY;
@@ -3862,15 +4976,6 @@ fn blob_runtime_from_hive(hive: &HiveFile) -> BlobRuntimeConfig {
                     sync_data_dir = PathBuf::from(value);
                 }
             }
-            if let Some(value) = sync.service_user.as_ref() {
-                let value = value.trim();
-                if !value.is_empty() {
-                    sync_service_user = value.to_string();
-                }
-            }
-            if let Some(value) = sync.allow_root_fallback {
-                sync_allow_root_fallback = value;
-            }
         }
         if let Some(gc) = blob.gc.as_ref() {
             if let Some(value) = gc.enabled {
@@ -3899,8 +5004,6 @@ fn blob_runtime_from_hive(hive: &HiveFile) -> BlobRuntimeConfig {
         sync_tool,
         sync_api_port,
         sync_data_dir,
-        sync_service_user,
-        sync_allow_root_fallback,
         gc_enabled,
         gc_interval_secs,
         gc_apply,
@@ -3946,6 +5049,249 @@ fn load_hive(config_dir: &Path) -> Result<HiveFile, OrchestratorError> {
     Ok(serde_yaml::from_str(&data)?)
 }
 
+/// System nodes that no longer run, with their units (A-70 stage 2, docs/router-stream-v1.md
+/// §6.2): SY.policy only counted turns. Retired over two releases, because a hive whose
+/// orchestrator is older rejects a core manifest without a component its hive.yaml lists: 0.1.77
+/// stopped it and took it out of each hive's own section; since 0.1.78 no package ships it, and it
+/// leaves every section, the motherbee's templates for the spokes too. This list and its clean-up
+/// go once every hive booted 0.1.78.
+const RETIRED_SYSTEM_NODES: &[(&str, &str)] = &[("SY.policy", "sy-policy")];
+
+fn without_retired_nodes(mut section: RoleSystemNodes) -> RoleSystemNodes {
+    let retired = |name: &String| RETIRED_SYSTEM_NODES.iter().any(|(node, _)| node == name);
+    section.nodes.retain(|name| !retired(name));
+    section.wait_for.retain(|name| !retired(name));
+    section
+}
+
+/// At boot, before the node list is read: each retired node leaves every role section of
+/// hive.yaml (`nodes` and `wait_for`), this hive's own and, on the motherbee, its templates for the
+/// spokes; its unit is stopped and disabled; its unit file and binary go where they are left (a
+/// spoke's, a motherbee installed by scripts/install.sh; a package's are gone with the package).
+/// Once and logged. The file is edited by lines, so its comments stay. Best effort: a failure is
+/// logged and the boot goes on (`system_nodes_for_role` leaves the node out anyway).
+fn retire_system_nodes(config_dir: &Path) {
+    let path = config_dir.join("hive.yaml");
+    let retired: Vec<&str> = RETIRED_SYSTEM_NODES.iter().map(|(node, _)| *node).collect();
+    match fs::read_to_string(&path) {
+        Ok(text) => {
+            let mut edited = text;
+            let mut removed = Vec::new();
+            for section in ["motherbee", "worker", "ingress", "egress"] {
+                let (next, dropped) = drop_retired_from_role_section(&edited, section, &retired);
+                edited = next;
+                removed.extend(dropped.into_iter().map(|node| format!("{section}: {node}")));
+            }
+            if !removed.is_empty() {
+                match write_file_atomic(&path, edited.as_bytes()) {
+                    Ok(()) => tracing::info!(
+                        removed = ?removed,
+                        "retired system nodes left the node lists in hive.yaml"
+                    ),
+                    Err(err) => {
+                        tracing::warn!(error = %err, "could not rewrite hive.yaml to drop retired system nodes")
+                    }
+                }
+            }
+        }
+        Err(err) => {
+            tracing::warn!(error = %err, "could not read hive.yaml to drop retired system nodes")
+        }
+    }
+    for (node, service) in RETIRED_SYSTEM_NODES {
+        let is = |what: &str| {
+            Command::new("systemctl")
+                .args([what, "--quiet", service])
+                .status()
+                .is_ok_and(|status| status.success())
+        };
+        if is("is-active") || is("is-enabled") {
+            let _ = Command::new("systemctl")
+                .args(["disable", "--now", service])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status();
+            tracing::info!(node, service, "retired system node stopped and disabled");
+        }
+        let unit = PathBuf::from(format!("/etc/systemd/system/{service}.service"));
+        let binary = PathBuf::from(service_to_exec(service));
+        let mut gone = Vec::new();
+        for file in [&unit, &binary] {
+            if !file.exists() {
+                continue;
+            }
+            match fs::remove_file(file) {
+                Ok(()) => gone.push(file.display().to_string()),
+                Err(err) => tracing::warn!(
+                    file = %file.display(),
+                    error = %err,
+                    "could not remove a retired system node's file"
+                ),
+            }
+        }
+        if gone.is_empty() {
+            continue;
+        }
+        if gone.contains(&unit.display().to_string()) {
+            let _ = Command::new("systemctl")
+                .arg("daemon-reload")
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status();
+        }
+        tracing::info!(node, files = ?gone, "retired system node's unit and binary removed");
+    }
+}
+
+/// The embedded NATS broker is gone (A-70 stage 2b). Once at boot, and logged: what its state
+/// file still held (messages nobody reads any more; on the ingress, the edge's old turns), then
+/// its directory, and the `nats:` section of hive.yaml with the comment above it. Best effort.
+/// This clean-up goes once every hive booted 0.1.78.
+fn retire_nats_state(config_dir: &Path) {
+    let dir = json_router::paths::storage_root_dir().join("nats");
+    if dir.is_dir() {
+        for entry in fs::read_dir(&dir).into_iter().flatten().flatten() {
+            let path = entry.path();
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if !name.starts_with("embedded-js-") || !name.ends_with(".json") {
+                continue;
+            }
+            let pending = fs::read(&path)
+                .ok()
+                .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+                .map(|state| nats_pending_by_subject(&state))
+                .unwrap_or_default();
+            tracing::info!(
+                file = %path.display(),
+                pending = ?pending,
+                "the embedded NATS broker's messages go with it"
+            );
+        }
+        match fs::remove_dir_all(&dir) {
+            Ok(()) => {
+                tracing::info!(dir = %dir.display(), "removed the embedded NATS broker's directory")
+            }
+            Err(err) => tracing::warn!(
+                dir = %dir.display(),
+                error = %err,
+                "could not remove the embedded NATS broker's directory"
+            ),
+        }
+    }
+    let path = config_dir.join("hive.yaml");
+    let Ok(text) = fs::read_to_string(&path) else {
+        return;
+    };
+    if let Some(edited) = drop_top_level_section(&text, "nats") {
+        match write_file_atomic(&path, edited.as_bytes()) {
+            Ok(()) => tracing::info!("removed the nats section from hive.yaml"),
+            Err(err) => {
+                tracing::warn!(error = %err, "could not remove the nats section from hive.yaml")
+            }
+        }
+    }
+}
+
+/// Messages per subject in the broker's state file (`streams.<subject>.messages`), the empty
+/// subjects left out.
+fn nats_pending_by_subject(state: &serde_json::Value) -> BTreeMap<String, usize> {
+    let Some(streams) = state.get("streams").and_then(|streams| streams.as_object()) else {
+        return BTreeMap::new();
+    };
+    streams
+        .iter()
+        .filter_map(|(subject, stream)| {
+            let messages = stream
+                .get("messages")
+                .and_then(|messages| messages.as_array())
+                .map_or(0, Vec::len);
+            (messages > 0).then(|| (subject.clone(), messages))
+        })
+        .collect()
+}
+
+/// hive.yaml without a top-level section: its key line, the lines indented under it, and the
+/// comment lines right above it that name it; `None` when there is no such section.
+fn drop_top_level_section(text: &str, key: &str) -> Option<String> {
+    let lines: Vec<&str> = text.lines().collect();
+    let header = format!("{key}:");
+    let start = lines.iter().position(|line| {
+        line.strip_prefix(header.as_str())
+            .is_some_and(|rest| rest.is_empty() || rest.starts_with(' '))
+    })?;
+    let mut first = start;
+    while first > 0
+        && lines[first - 1].starts_with('#')
+        && lines[first - 1].to_ascii_lowercase().contains(key)
+    {
+        first -= 1;
+    }
+    let mut end = start + 1;
+    while end < lines.len() && (lines[end].starts_with(' ') || lines[end].starts_with('\t')) {
+        end += 1;
+    }
+    // One blank line is enough between the sections around it.
+    if end < lines.len()
+        && lines[end].trim().is_empty()
+        && (first == 0 || lines[first - 1].trim().is_empty())
+    {
+        end += 1;
+    }
+    let mut out = lines[..first].to_vec();
+    out.extend_from_slice(&lines[end..]);
+    let mut edited = out.join("\n");
+    if text.ends_with('\n') {
+        edited.push('\n');
+    }
+    Some(edited)
+}
+
+/// hive.yaml without the retired nodes in `system_nodes.<role>`, by lines; and what it removed.
+fn drop_retired_from_role_section(
+    text: &str,
+    role: &str,
+    retired: &[&str],
+) -> (String, Vec<String>) {
+    let role_key = format!("{role}:");
+    let mut out = Vec::new();
+    let mut removed = Vec::new();
+    let mut system_nodes_indent: Option<usize> = None;
+    let mut role_indent: Option<usize> = None;
+    for line in text.lines() {
+        let trimmed = line.trim_start();
+        let indent = line.len() - trimmed.len();
+        if !trimmed.is_empty() && !trimmed.starts_with('#') {
+            if role_indent.is_some_and(|role_indent| indent <= role_indent) {
+                role_indent = None;
+            }
+            if system_nodes_indent.is_some_and(|nodes_indent| indent <= nodes_indent) {
+                system_nodes_indent = None;
+            }
+            if trimmed.starts_with("system_nodes:") {
+                system_nodes_indent = Some(indent);
+            } else if system_nodes_indent.is_some() && role_indent.is_none() && trimmed == role_key
+            {
+                role_indent = Some(indent);
+            } else if role_indent.is_some() {
+                if let Some(item) = trimmed.strip_prefix("- ") {
+                    let item = item.trim().trim_matches(|c| c == '"' || c == '\'');
+                    if retired.contains(&item) {
+                        removed.push(item.to_string());
+                        continue;
+                    }
+                }
+            }
+        }
+        out.push(line);
+    }
+    let mut edited = out.join("\n");
+    if text.ends_with('\n') {
+        edited.push('\n');
+    }
+    (edited, removed)
+}
+
 fn system_nodes_for_role(
     hive: &HiveFile,
     role: HiveRole,
@@ -3966,8 +5312,11 @@ fn system_nodes_for_role(
             role.as_str()
         )
     })?;
-    validate_system_nodes(role_section, role)?;
-    Ok(role_section.clone())
+    // A retired node is left out for every reader: the boot, the core components a spoke
+    // installs, the templates of a join; even where the hive.yaml rewrite failed.
+    let role_section = without_retired_nodes(role_section.clone());
+    validate_system_nodes(&role_section, role)?;
+    Ok(role_section)
 }
 
 fn validate_system_nodes(
@@ -4037,7 +5386,7 @@ fn validate_system_nodes(
         let name = raw_name.trim();
         let is_sy_node = name.starts_with("SY.");
         let is_packaged_non_system_node =
-            is_motherbee && MOTHERBEE_PACKAGED_NON_SYSTEM_NODES.contains(&name);
+            is_motherbee && fluxbee_sdk::is_allowed_non_sy_lifecycle_node(name);
         if !is_sy_node && !is_packaged_non_system_node {
             return Err(format!(
                 "invalid hive.yaml: lifecycle node '{}' must use SY.* naming or be an allowlisted motherbee packaged node",
@@ -4092,12 +5441,11 @@ fn validate_system_nodes(
     Ok(())
 }
 
-/// Map an allowlisted declarative node to its packaged systemd service.
+/// Map an allowlisted declarative node to its packaged systemd service. Only SY.* system
+/// authorities reach here now — IO.blob/IO.cloud are managed runtimes (no packaged unit), not
+/// lifecycle nodes, so they never pass through validate_system_nodes -> name_to_service.
 fn name_to_service(node_name: &str) -> String {
     let trimmed = node_name.trim();
-    if trimmed == "IO.blob" {
-        return "io-blob".to_string();
-    }
     let base = trimmed.strip_prefix("SY.").unwrap_or(trimmed);
     format!("sy-{}", base.to_ascii_lowercase().replace('.', "-"))
 }
@@ -4227,6 +5575,8 @@ fn ensure_dirs(
     run_dir: &Path,
     blob: &BlobRuntimeConfig,
     dist: &DistRuntimeConfig,
+    is_motherbee: bool,
+    hive_id: &str,
 ) -> Result<(), OrchestratorError> {
     let storage_root = json_router::paths::storage_root_dir();
     let opa_root = storage_root.join("opa");
@@ -4237,51 +5587,112 @@ fn ensure_dirs(
     fs::create_dir_all(opa_root.join("current"))?;
     fs::create_dir_all(opa_root.join("staged"))?;
     fs::create_dir_all(opa_root.join("backup"))?;
-    fs::create_dir_all(storage_root.join("nats"))?;
+    ensure_syncthing_user()?;
+    // blob/ is root's and the Syncthing user only traverses it to its folders; staging/ is root's
+    // alone, links inside removed: nodes stage blobs there before they hand them to the folder
+    // Syncthing serves, and nobody else may touch those bytes (FINDINGS A-56). A failed pass is
+    // reported and runs again at the next start.
+    let mut root_trees_owned = Vec::new();
+    if blob.enabled || blob.public_sync_enabled {
+        ensure_blob_root_dir(&blob.path)?;
+    }
+    // Taking these trees back from the Syncthing user walks entries it could have planted: only
+    // where hard links to another user's files are protected, or a planted link to a root file
+    // would be re-owned too.
+    let can_take_back = hard_links_protected();
     if blob.enabled {
-        ensure_dir_permissions_0750(&blob.path)?;
         ensure_dir_permissions_0750(&blob.path.join("active"))?;
-        ensure_dir_permissions_0750(&blob.path.join("staging"))?;
+        if can_take_back {
+            root_trees_owned.push(own_tree_for_reading(&blob.path.join("staging"), 0, 0));
+        }
+    }
+    // agent-assets (SY.architect writes, ai.generic reads, both as root) is root's alone too: an
+    // upgraded hive got it from the old postinst's chown -R, and root acts there by path.
+    let agent_assets = blob.path.join("agent-assets");
+    if can_take_back && fs::symlink_metadata(&agent_assets).is_ok() {
+        root_trees_owned.push(own_tree_for_reading(&agent_assets, 0, 0));
+    }
+    if !can_take_back && (blob.enabled || blob.public_sync_enabled) {
+        root_trees_owned.push(Err(
+            "fs.protected_hardlinks is not 1: blob/staging and blob/agent-assets were not \
+             taken back"
+                .into(),
+        ));
     }
     if blob.public_sync_enabled {
-        ensure_dir_permissions_0750(&blob.path)?;
         ensure_dir_permissions_0750(&blob.path.join("public"))?;
     }
-    if blob.sync_enabled {
+    // The syncthing HOME must exist whenever syncthing will RUN — and it runs for BLOB sync or
+    // DIST sync (`ensure_blob_sync_runtime` takes both configs and starts the service if either
+    // needs it). Gating this on `blob.sync_enabled` alone broke the one role that has dist sync
+    // ON and blob sync OFF: the egress. Its unit was started with
+    // `WorkingDirectory=/var/lib/fluxbee/syncthing`, systemd could not chdir there, and the
+    // service failed 200/CHDIR in a restart loop forever — so the egress could never receive
+    // core or vendor at all.
+    let syncthing_runs =
+        blob.sync_enabled || (dist.sync_enabled && dist_sync_tool_is_syncthing(dist));
+    if syncthing_runs {
         ensure_dir_permissions_0750(&blob.sync_data_dir)?;
+        // Its home is the Syncthing user's whenever it runs, the egress (dist sync only) included.
+        ensure_owned_dir(&blob.sync_data_dir, SYNCTHING_SERVICE_USER)?;
     }
-    if blob.sync_enabled && blob_sync_tool_is_syncthing(blob) {
-        let service_user = resolve_syncthing_service_user(blob)?;
-        if service_user == "root" {
-            ensure_owned_dir(&blob.path, "root")?;
-            if blob.enabled {
-                ensure_owned_dir(&blob.path.join("active"), "root")?;
-                ensure_owned_dir(&blob.path.join("staging"), "root")?;
-            }
-            if blob.public_sync_enabled {
-                ensure_owned_dir(&blob.path.join("public"), "root")?;
-            }
-            ensure_owned_dir(&blob.sync_data_dir, "root")?;
-        } else {
-            ensure_owned_dir(&blob.path, &service_user)?;
-            if blob.enabled {
-                ensure_owned_dir(&blob.path.join("active"), &service_user)?;
-                ensure_owned_dir(&blob.path.join("staging"), &service_user)?;
-            }
-            if blob.public_sync_enabled {
-                ensure_owned_dir(&blob.path.join("public"), &service_user)?;
-            }
-            ensure_owned_dir(&blob.sync_data_dir, &service_user)?;
-        }
+    for folder in served_blob_folders(blob, syncthing_runs) {
+        ensure_owned_dir(&folder, SYNCTHING_SERVICE_USER)?;
+    }
+    for err in root_trees_owned.into_iter().filter_map(Result::err) {
+        tracing::error!(error = %err, "could not make a blob tree root's");
+        append_drift_alert(
+            "posture",
+            "blob_root_tree_not_set",
+            "warning",
+            hive_id,
+            format!("blob/staging or blob/agent-assets was not made root's at this start: {err}"),
+            None,
+            None,
+            None,
+        );
     }
     fs::create_dir_all(&dist.path)?;
     fs::create_dir_all(dist.path.join("runtimes"))?;
     fs::create_dir_all(dist.path.join("core").join("bin"))?;
     fs::create_dir_all(dist.path.join("vendor"))?;
-    if dist.sync_enabled && dist_sync_tool_is_syncthing(dist) {
-        let service_user = resolve_syncthing_service_user(blob)?;
-        ensure_owned_tree(&dist.path, &service_user)?;
+    // Before the ownership pass: on a spoke it is a receive-only folder syncthing must write.
+    fs::create_dir_all(dist.path.join("policy"))?;
+    // The motherbee's dist is root's whatever syncs it (A-51); a spoke's is the Syncthing user's,
+    // who writes what it receives there. A failed pass (chown -R exits 1 when a file vanishes
+    // mid-walk) is reported and runs again at the next start: never a reason not to start.
+    let owned = if is_motherbee {
+        Some(ensure_root_owned_tree(&dist.path, SYNCTHING_SERVICE_USER))
+    } else if dist.sync_enabled && dist_sync_tool_is_syncthing(dist) {
+        Some(ensure_owned_tree(&dist.path, SYNCTHING_SERVICE_USER))
+    } else {
+        None
+    };
+    if let Some(Err(err)) = owned {
+        tracing::error!(error = %err, "could not set the dist tree's owner");
+        append_drift_alert(
+            "posture",
+            "dist_owner_not_set",
+            "warning",
+            hive_id,
+            format!("the dist tree's owner was not set at this start: {err}"),
+            None,
+            None,
+            None,
+        );
     }
+    report_unusable_managed_dirs(
+        hive_id,
+        &[
+            blob.path.clone(),
+            blob.path.join("active"),
+            blob.path.join("staging"),
+            blob.path.join("agent-assets"),
+            blob.path.join("public"),
+            blob.sync_data_dir.clone(),
+            dist.path.clone(),
+        ],
+    );
     fs::create_dir_all(runtimes_root())?;
     fs::create_dir_all(Path::new(DIST_CORE_BIN_SOURCE_DIR))?;
     fs::create_dir_all(Path::new(DIST_VENDOR_ROOT_DIR))?;
@@ -4355,6 +5766,282 @@ fn current_dist_runtime_config(state: &OrchestratorState) -> DistRuntimeConfig {
     }
 }
 
+/// The numeric uid and gid of a local user (`id -u`, `id -g`).
+fn linux_user_ids(user: &str) -> Result<(u32, u32), OrchestratorError> {
+    let id = |flag: &str| -> Result<u32, OrchestratorError> {
+        let mut cmd = Command::new("id");
+        cmd.arg(flag).arg(user);
+        let out = run_cmd_output(cmd, "id")?;
+        out.trim()
+            .parse::<u32>()
+            .map_err(|err| format!("id {flag} {user}: {err}").into())
+    };
+    Ok((id("-u")?, id("-g")?))
+}
+
+/// How long a join waits, in all, for a fresh box to settle (FINDINGS A-52).
+const FIRST_BOOT_WAIT_SECS: u64 = 900;
+
+/// How long past its deadline this side waits for one run before it kills it: the script's
+/// deadline is the box's clock, which can step.
+const FIRST_BOOT_RUN_GRACE_SECS: u64 = 60;
+
+/// The units that can restart sshd or reboot the box while they run: cloud-init's stages (on a
+/// fresh clone the first boot runs a dist-upgrade, which restarts sshd, and reboots when the
+/// upgrade asks for it; `cloud-init-network` is `cloud-init`'s name from 24.3) and apt's daily
+/// jobs (unattended-upgrades, which a box that missed its schedule runs right after it boots).
+const FIRST_BOOT_UNITS: &[&str] = &[
+    "cloud-init-local",
+    "cloud-init",
+    "cloud-init-network",
+    "cloud-config",
+    "cloud-final",
+    "apt-daily",
+    "apt-daily-upgrade",
+];
+
+/// The remote script that waits, at most `secs` seconds, while the box is still booting or one of
+/// `FIRST_BOOT_UNITS` runs (FINDINGS A-52). It asks systemd, not `cloud-init status`, which says
+/// "not started" for ever on a box whose cloud-init will not run this boot, and "error" while
+/// later stages still run once an earlier one recorded an error.
+/// - `is-system-running` says `starting` until the boot transaction is done, which covers the gap
+///   between two cloud-init stages, when the next one is queued and not yet running; `stopping`
+///   means a reboot is under way.
+/// - A oneshot unit is `activating` while it runs; `active`, `inactive`, `failed` and `unknown`
+///   (an older systemd's answer for a missing unit) are settled.
+/// - Any other answer, an empty one included, counts as busy.
+///
+/// No sudo: systemctl answers any user. Exit 124 names what still runs, with the first queued boot
+/// jobs when the boot never finished.
+fn first_boot_wait_script(secs: u64) -> String {
+    let units = FIRST_BOOT_UNITS.join(" ");
+    format!(
+        "end=$(( $(date +%s) + {secs} )); \
+         while :; do \
+         busy=; \
+         case \"$(timeout 30 systemctl is-system-running 2>/dev/null)\" in \
+         running|degraded|maintenance|offline) ;; \
+         *) busy=boot ;; \
+         esac; \
+         if [ -z \"$busy\" ]; then for u in {units}; do \
+         case \"$(timeout 30 systemctl is-active \"$u.service\" 2>/dev/null)\" in \
+         active|inactive|failed|unknown) ;; \
+         *) busy=$u; break ;; \
+         esac; \
+         done; fi; \
+         if [ -z \"$busy\" ]; then exit 0; fi; \
+         if [ \"$(date +%s)\" -ge \"$end\" ]; then \
+         if [ \"$busy\" = boot ]; then \
+         jobs=$(timeout 10 systemctl list-jobs --no-legend --no-pager 2>/dev/null | head -3 | tr -s \" \\n\" \" \" | sed \"s/ *\\$//\"); \
+         busy=\"boot${{jobs:+ ($jobs)}}\"; \
+         fi; \
+         echo \"still running: $busy\"; exit 124; \
+         fi; \
+         sleep 5; \
+         done"
+    )
+}
+
+fn first_boot_wait_command(secs: u64) -> String {
+    format!("/bin/bash -c '{}'", first_boot_wait_script(secs))
+}
+
+/// How one run of the wait script over SSH ended.
+struct FirstBootRun {
+    code: Option<i32>,
+    stdout: String,
+    stderr: String,
+}
+
+/// Why a join's wait for the box failed.
+#[derive(Debug, PartialEq)]
+enum FirstBootWaitError {
+    /// Something still runs at the deadline, or the box could not be reached again before it.
+    NotSettled(String),
+    /// The check itself failed, which says nothing about the box settling.
+    CheckFailed(String),
+}
+
+/// The wait loop, apart from SSH so it can be tested: `run` runs the script for at most the given
+/// seconds. ssh exits 255 for every way it loses the box: a refused connection, a reboot under
+/// the session ("closed by remote host"), a silent path cut by the keepalive (nothing on stderr at
+/// `LogLevel=ERROR`), early boot's nologin ("Permission denied"). The key opened the box moments
+/// earlier, so each of those is tried again until the deadline, never past it. The script's own
+/// exit codes are final.
+fn wait_first_boot_with(
+    total_secs: u64,
+    retry_delay: Duration,
+    mut run: impl FnMut(u64) -> std::io::Result<FirstBootRun>,
+) -> Result<(), FirstBootWaitError> {
+    let deadline = Instant::now() + Duration::from_secs(total_secs);
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now()).as_secs();
+        let outcome = run(remaining)
+            .map_err(|err| FirstBootWaitError::CheckFailed(format!("could not run ssh: {err}")))?;
+        let detail = if outcome.stderr.trim().is_empty() {
+            outcome.stdout.trim().to_string()
+        } else {
+            outcome.stderr.trim().to_string()
+        };
+        match outcome.code {
+            Some(0) => return Ok(()),
+            Some(124) => {
+                return Err(FirstBootWaitError::NotSettled(format!(
+                    "the box is still settling after {total_secs} s ({}); retry once it settles",
+                    outcome.stdout.trim()
+                )))
+            }
+            Some(255) | None => {
+                if Instant::now() >= deadline {
+                    return Err(FirstBootWaitError::NotSettled(format!(
+                        "the box could not be reached again within {total_secs} s ({detail}); retry once it is up"
+                    )));
+                }
+                tracing::warn!(detail = %detail, "lost the box while it settles (it may be rebooting); trying again");
+                std::thread::sleep(retry_delay);
+            }
+            Some(code) => {
+                return Err(FirstBootWaitError::CheckFailed(format!(
+                    "the settle check exited {code}: {detail}"
+                )))
+            }
+        }
+    }
+}
+
+/// One run of the wait script over SSH, with keepalives, and bounded on this side too.
+fn run_first_boot_check(
+    address: &str,
+    key_path: &Path,
+    user: &str,
+    secs: u64,
+) -> std::io::Result<FirstBootRun> {
+    let mut child = Command::new("ssh")
+        .arg("-i")
+        .arg(key_path)
+        .arg("-o")
+        .arg("IdentitiesOnly=yes")
+        .arg("-o")
+        .arg("BatchMode=yes")
+        .arg("-o")
+        .arg("PreferredAuthentications=publickey")
+        .arg("-o")
+        .arg("PasswordAuthentication=no")
+        .arg("-o")
+        .arg("LogLevel=ERROR")
+        .arg("-o")
+        .arg("StrictHostKeyChecking=no")
+        .arg("-o")
+        .arg("UserKnownHostsFile=/dev/null")
+        .arg("-o")
+        .arg("ConnectTimeout=10")
+        .arg("-o")
+        .arg("ServerAliveInterval=15")
+        .arg("-o")
+        .arg("ServerAliveCountMax=4")
+        .arg(format!("{user}@{address}"))
+        .arg(first_boot_wait_command(secs))
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    // Drained while it runs, so a chatty box never blocks ssh on a full pipe.
+    let drain = |pipe: Option<Box<dyn Read + Send>>| {
+        std::thread::spawn(move || {
+            let mut text = String::new();
+            if let Some(mut pipe) = pipe {
+                let _ = pipe.read_to_string(&mut text);
+            }
+            text
+        })
+    };
+    let stdout = drain(
+        child
+            .stdout
+            .take()
+            .map(|p| Box::new(p) as Box<dyn Read + Send>),
+    );
+    let stderr = drain(
+        child
+            .stderr
+            .take()
+            .map(|p| Box::new(p) as Box<dyn Read + Send>),
+    );
+    let limit = Instant::now() + Duration::from_secs(secs + FIRST_BOOT_RUN_GRACE_SECS);
+    loop {
+        if let Some(status) = child.try_wait()? {
+            return Ok(FirstBootRun {
+                code: status.code(),
+                stdout: stdout.join().unwrap_or_default(),
+                stderr: stderr.join().unwrap_or_default(),
+            });
+        }
+        if Instant::now() >= limit {
+            let _ = child.kill();
+            let _ = child.wait();
+            let _ = (stdout.join(), stderr.join());
+            return Ok(FirstBootRun {
+                code: Some(124),
+                stdout: "the run outlived its deadline on this side".to_string(),
+                stderr: String::new(),
+            });
+        }
+        std::thread::sleep(Duration::from_millis(500));
+    }
+}
+
+/// Waits, before a join changes the box, until it has settled (FINDINGS A-52), at most
+/// `FIRST_BOOT_WAIT_SECS` in all.
+fn wait_remote_first_boot(
+    address: &str,
+    key_path: &Path,
+    user: &str,
+) -> Result<(), FirstBootWaitError> {
+    tracing::info!(
+        target = address,
+        "waiting for the box to settle (cloud-init, apt daily jobs)"
+    );
+    wait_first_boot_with(FIRST_BOOT_WAIT_SECS, Duration::from_secs(5), |secs| {
+        run_first_boot_check(address, key_path, user, secs)
+    })
+}
+
+/// Before a join changes anything on the box beyond the motherbee key it just seeded: check that
+/// the key opens it, then wait for the box to settle (FINDINGS A-52). The join shows the phase
+/// `waiting_for_host` meanwhile. Not settled is retryable (the key stays, so the retry is
+/// key-first); a failed check is not.
+fn wait_for_host_to_settle(
+    hive_id: &str,
+    address: &str,
+    key_path: &Path,
+    user: &str,
+) -> Result<(), serde_json::Value> {
+    if let Err(err) = ssh_with_key(address, key_path, "true", user) {
+        return Err(serde_json::json!({
+            "status": "error",
+            "error_code": "SSH_KEY_FAILED",
+            "message": format!("the motherbee key does not open the box after the seed: {err}"),
+        }));
+    }
+    update_join_state(hive_id, "joining", "waiting_for_host", |_| {});
+    let result = wait_remote_first_boot(address, key_path, user);
+    update_join_state(hive_id, "joining", "running", |_| {});
+    match result {
+        Ok(()) => Ok(()),
+        Err(FirstBootWaitError::NotSettled(message)) => Err(serde_json::json!({
+            "status": "error",
+            "error_code": "HOST_NOT_SETTLED",
+            "retryable": true,
+            "message": message,
+        })),
+        Err(FirstBootWaitError::CheckFailed(message)) => Err(serde_json::json!({
+            "status": "error",
+            "error_code": "HOST_SETTLE_CHECK_FAILED",
+            "message": message,
+        })),
+    }
+}
+
 fn linux_user_exists(user: &str) -> bool {
     Command::new("id")
         .arg("-u")
@@ -4378,67 +6065,198 @@ fn linux_user_primary_group(user: &str) -> Option<String> {
     }
 }
 
-fn resolve_syncthing_service_user(blob: &BlobRuntimeConfig) -> Result<String, OrchestratorError> {
-    let requested = blob.sync_service_user.trim();
-    let requested = if requested.is_empty() {
-        DEFAULT_BLOB_SYNC_SERVICE_USER
+/// Syncthing runs as its own user on every host (FINDINGS A-58). The motherbee's package and the
+/// ingress join create it; until 0.1.63 workers and the egress did not, and ran Syncthing as root.
+fn ensure_syncthing_user() -> Result<(), OrchestratorError> {
+    if linux_user_exists(SYNCTHING_SERVICE_USER) {
+        return Ok(());
+    }
+    tracing::warn!(
+        user = SYNCTHING_SERVICE_USER,
+        "creating the Syncthing user (A-58)"
+    );
+    let mut useradd = Command::new("useradd");
+    useradd.arg("--system");
+    // useradd --user-group refuses a group of the same name that already exists.
+    if linux_group_exists(SYNCTHING_SERVICE_USER) {
+        useradd.arg("-g").arg(SYNCTHING_SERVICE_USER);
     } else {
-        requested
+        useradd.arg("--user-group");
+    }
+    useradd.args([
+        "--home-dir",
+        "/var/lib/fluxbee",
+        "--no-create-home",
+        "--shell",
+        "/usr/sbin/nologin",
+        SYNCTHING_SERVICE_USER,
+    ]);
+    run_cmd(useradd, "create the Syncthing user")
+}
+
+fn linux_group_exists(group: &str) -> bool {
+    Command::new("getent")
+        .arg("group")
+        .arg(group)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success())
+}
+
+/// `blob/` is root's, and the Syncthing user only traverses it to the folders it serves (FINDINGS
+/// A-56): were it that user's, they could replace `staging/` or `public/` with a link.
+fn ensure_blob_root_dir(path: &Path) -> Result<(), OrchestratorError> {
+    let Some(dir) = open_managed_dir(path)? else {
+        return Ok(());
     };
-    if linux_user_exists(requested) {
-        return Ok(requested.to_string());
+    let (_, gid) = linux_user_ids(SYNCTHING_SERVICE_USER)?;
+    std::os::unix::fs::fchown(&dir, Some(0), Some(gid))?;
+    dir.set_permissions(fs::Permissions::from_mode(0o750))?;
+    Ok(())
+}
+
+/// Creates `path` when missing and opens it as the directory it must be, never through a symlink
+/// (FINDINGS A-51). Some of these are, or sit inside, a directory the Syncthing user owns
+/// (`blob/active`, `blob/public`, the Syncthing home, a spoke's dist; `blob/` itself until its first
+/// 0.1.63 start), so that user can put a symlink, or a file, where one should be; root following a
+/// symlink would chmod or chown whatever it points at. Anything but a
+/// directory is left alone (`None`) and `ensure_dirs` reports it: it is never followed, and never
+/// a reason for the orchestrator not to start, or that user could crash-loop it by planting one.
+fn open_managed_dir(path: &Path) -> Result<Option<fs::File>, OrchestratorError> {
+    match fs::symlink_metadata(path) {
+        Ok(meta) if !meta.is_dir() => {
+            tracing::error!(path = %path.display(), "a managed directory is not a directory (a symlink?); left alone");
+            return Ok(None);
+        }
+        Ok(_) => {}
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            if let Err(err) = fs::create_dir_all(path) {
+                // Something else took the name between the check and the create.
+                if fs::symlink_metadata(path).is_ok_and(|meta| !meta.is_dir()) {
+                    tracing::error!(path = %path.display(), "a managed directory became something else; left alone");
+                    return Ok(None);
+                }
+                return Err(err.into());
+            }
+        }
+        Err(err) => return Err(err.into()),
     }
-    if blob.sync_allow_root_fallback {
-        tracing::warn!(
-            user = requested,
-            allow_root_fallback = blob.sync_allow_root_fallback,
-            "syncthing service user missing; using explicit root fallback"
-        );
-        return Ok("root".to_string());
+    match fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(nix::libc::O_DIRECTORY | nix::libc::O_NOFOLLOW)
+        .open(path)
+    {
+        Ok(dir) => Ok(Some(dir)),
+        // It became a symlink, or a file, after the check above.
+        Err(err)
+            if err.raw_os_error() == Some(nix::libc::ELOOP)
+                || err.raw_os_error() == Some(nix::libc::ENOTDIR) =>
+        {
+            tracing::error!(path = %path.display(), "a managed directory became something else; left alone");
+            Ok(None)
+        }
+        Err(err) => {
+            Err(format!("cannot open managed directory '{}': {err}", path.display()).into())
+        }
     }
-    Err(format!(
-        "linux user '{}' not found and blob.sync.allow_root_fallback=false",
-        requested
-    )
-    .into())
+}
+
+/// Reports, as one posture alert, every managed directory that `open_managed_dir` left alone.
+fn report_unusable_managed_dirs(hive_id: &str, paths: &[PathBuf]) {
+    let unusable: Vec<String> = paths
+        .iter()
+        .filter(|path| fs::symlink_metadata(path).is_ok_and(|meta| !meta.is_dir()))
+        .map(|path| path.display().to_string())
+        .collect();
+    if unusable.is_empty() {
+        return;
+    }
+    append_drift_alert(
+        "posture",
+        "managed_dir_not_a_directory",
+        "critical",
+        hive_id,
+        format!(
+            "left alone, not followed (A-51): {}. A tree is moved with a bind mount, never a symlink.",
+            unusable.join(", ")
+        ),
+        None,
+        None,
+        None,
+    );
 }
 
 fn ensure_dir_permissions_0750(path: &Path) -> Result<(), OrchestratorError> {
-    fs::create_dir_all(path)?;
-    let mut perms = fs::metadata(path)?.permissions();
-    perms.set_mode(0o750);
-    fs::set_permissions(path, perms)?;
+    let Some(dir) = open_managed_dir(path)? else {
+        return Ok(());
+    };
+    dir.set_permissions(fs::Permissions::from_mode(0o750))?;
     Ok(())
 }
 
 fn ensure_owned_dir(path: &Path, user: &str) -> Result<(), OrchestratorError> {
-    ensure_dir_permissions_0750(path)?;
-    let group = linux_user_primary_group(user).unwrap_or_else(|| user.to_string());
-    let mut chown = Command::new("chown");
-    chown.arg(format!("{user}:{group}")).arg(path);
-    run_cmd(chown, "chown syncthing dir ownership")
+    let Some(dir) = open_managed_dir(path)? else {
+        return Ok(());
+    };
+    dir.set_permissions(fs::Permissions::from_mode(0o750))?;
+    let (uid, gid) = linux_user_ids(user)?;
+    std::os::unix::fs::fchown(&dir, Some(uid), Some(gid))?;
+    Ok(())
 }
 
 fn ensure_owned_tree(path: &Path, user: &str) -> Result<(), OrchestratorError> {
-    ensure_dir_permissions_0750(path)?;
+    let Some(dir) = open_managed_dir(path)? else {
+        return Ok(());
+    };
+    dir.set_permissions(fs::Permissions::from_mode(0o750))?;
     let group = linux_user_primary_group(user).unwrap_or_else(|| user.to_string());
     let mut chown = Command::new("chown");
     chown.arg("-R").arg(format!("{user}:{group}")).arg(path);
     run_cmd(chown, "chown syncthing tree ownership")
 }
 
-fn ensure_owned_file(path: &Path, user: &str) -> Result<(), OrchestratorError> {
-    if !path.is_file() {
-        return Err(format!(
-            "syncthing ownership target is not a file: {}",
-            path.display()
-        )
-        .into());
+/// The motherbee's dist tree is root's, and the Syncthing user only reads it (FINDINGS A-51). The
+/// motherbee only SENDS dist (every dist folder is send-only there), so Syncthing never writes in
+/// it, and everything else that writes it (the package, the orchestrator, SY.admin's publish) runs
+/// as root. Were it the Syncthing user's, that user could replace the core and vendor binaries the
+/// motherbee installs, and hands every spoke to install, as root. Only dist: blob/active is
+/// send-receive and Syncthing's home is its own, so they stay the Syncthing user's, and so does a
+/// spoke's dist, where Syncthing writes what it receives.
+fn ensure_root_owned_tree(path: &Path, reader: &str) -> Result<(), OrchestratorError> {
+    let (_, gid) = linux_user_ids(reader)?;
+    own_tree_for_reading(path, 0, gid)
+}
+
+/// `uid` owns the tree and `gid` may only read it: links inside are removed (never followed; the
+/// motherbee's dist has no legitimate one, and one planted while the Syncthing user owned the tree
+/// would keep root reading bytes that user can still write), then `chown -R` and
+/// `chmod -R g+rX,go-w`, and the top directory 0750.
+fn own_tree_for_reading(path: &Path, uid: u32, gid: u32) -> Result<(), OrchestratorError> {
+    let Some(dir) = open_managed_dir(path)? else {
+        return Ok(());
+    };
+    let mut find = Command::new("find");
+    find.arg(path)
+        .arg("-mindepth")
+        .arg("1")
+        .arg("-type")
+        .arg("l")
+        .arg("-print")
+        .arg("-delete");
+    let tree = path.display();
+    let removed = run_cmd_output(find, &format!("remove links under {tree}"))?;
+    if !removed.trim().is_empty() {
+        tracing::warn!(links = %removed.trim(), %tree, "removed links under a root-owned tree (A-51)");
     }
-    let group = linux_user_primary_group(user).unwrap_or_else(|| user.to_string());
     let mut chown = Command::new("chown");
-    chown.arg(format!("{user}:{group}")).arg(path);
-    run_cmd(chown, "chown syncthing file ownership")
+    chown.arg("-R").arg(format!("{uid}:{gid}")).arg(path);
+    run_cmd(chown, &format!("chown {tree}"))?;
+    let mut chmod = Command::new("chmod");
+    chmod.arg("-R").arg("g+rX,go-w").arg(path);
+    run_cmd(chmod, &format!("make {tree} readable to its group"))?;
+    dir.set_permissions(fs::Permissions::from_mode(0o750))?;
+    Ok(())
 }
 
 fn syncthing_binary_available() -> bool {
@@ -4738,6 +6556,165 @@ fn ensure_core_firewall_local(state: &OrchestratorState) {
 }
 
 // ===========================================================================
+// Host posture, stage 1: loopback-only services (FINDINGS A-46,
+// docs/host-posture-and-exposure-spec-v1.md §3.4). Archi and the admin HTTP API have no
+// authentication, so they must listen on loopback only. This reads what is actually bound
+// (`ss`), whatever bound it there (hive.yaml, a JSR_*_LISTEN override, the code default), and
+// reports a service bound off loopback. Report-only: it never changes a bind.
+// ===========================================================================
+
+/// Processes that must listen on loopback only, as `ss -p` names them.
+const LOOPBACK_ONLY_PROCESSES: &[&str] = &["sy-architect", "sy-admin"];
+
+/// Watchdog tick counter for the listener check. At the 5s cadence, 12 ticks ≈ 60s between
+/// checks; `tick % N == 0` fires on the first tick, right after bootstrap.
+static LISTENER_CHECK_TICKS: AtomicU64 = AtomicU64::new(0);
+const LISTENER_CHECK_EVERY_TICKS: u64 = 12;
+
+/// One TCP listener as `ss -H -tlnp` reports it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TcpListenerEntry {
+    host: String,
+    port: u16,
+    processes: Vec<String>,
+}
+
+/// Parses `ss -H -tlnp` output: `State Recv-Q Send-Q Local:Port Peer:Port [users:((...))]`.
+/// Lines that do not parse are skipped: this feeds a report, and a format surprise must not
+/// become a false alarm.
+fn parse_ss_tcp_listeners(output: &str) -> Vec<TcpListenerEntry> {
+    let mut listeners = Vec::new();
+    for line in output.lines() {
+        let fields: Vec<&str> = line.split_whitespace().collect();
+        if fields.len() < 5 {
+            continue;
+        }
+        let Some((host, port)) = fields[3].rsplit_once(':') else {
+            continue;
+        };
+        let Ok(port) = port.parse::<u16>() else {
+            continue;
+        };
+        // Drop the scope first (`127.0.0.53%lo`, `[::1]%lo`), then the brackets (`[::1]` → `::1`).
+        let host = host.split('%').next().unwrap_or(host);
+        let host = host.trim_start_matches('[').trim_end_matches(']');
+        let processes = fields
+            .get(5..)
+            .map(|rest| parse_ss_process_names(&rest.join(" ")))
+            .unwrap_or_default();
+        listeners.push(TcpListenerEntry {
+            host: host.to_string(),
+            port,
+            processes,
+        });
+    }
+    listeners
+}
+
+/// Process names from an `ss -p` users field: `users:(("sshd",pid=1,fd=3),("systemd",...))`.
+fn parse_ss_process_names(users: &str) -> Vec<String> {
+    let mut names = Vec::new();
+    let mut rest = users;
+    while let Some(start) = rest.find("(\"") {
+        rest = &rest[start + 2..];
+        let Some(end) = rest.find('"') else {
+            break;
+        };
+        names.push(rest[..end].to_string());
+        rest = &rest[end + 1..];
+    }
+    names
+}
+
+/// Whether a listen host is loopback. Wildcards (`*`, `0.0.0.0`, `::`) and anything that is not
+/// an IP address count as exposed.
+fn listen_host_is_loopback(host: &str) -> bool {
+    match host.parse::<std::net::IpAddr>() {
+        Ok(std::net::IpAddr::V4(v4)) => v4.is_loopback(),
+        Ok(std::net::IpAddr::V6(v6)) => {
+            v6.is_loopback() || v6.to_ipv4_mapped().is_some_and(|v4| v4.is_loopback())
+        }
+        Err(_) => false,
+    }
+}
+
+/// Loopback-only services found listening off loopback, as `(process, host, port)`.
+fn loopback_only_exposures(listeners: &[TcpListenerEntry]) -> Vec<(String, String, u16)> {
+    let mut exposures = Vec::new();
+    for listener in listeners {
+        if listen_host_is_loopback(&listener.host) {
+            continue;
+        }
+        for process in &listener.processes {
+            if LOOPBACK_ONLY_PROCESSES.contains(&process.as_str()) {
+                exposures.push((process.clone(), listener.host.clone(), listener.port));
+            }
+        }
+    }
+    exposures.sort();
+    exposures.dedup();
+    exposures
+}
+
+/// Every `LISTENER_CHECK_EVERY_TICKS`, reports a loopback-only service bound off loopback, in
+/// the log and in the drift store (deduplicated there for an hour).
+fn watchdog_listener_check(state: &OrchestratorState) {
+    let tick = LISTENER_CHECK_TICKS.fetch_add(1, Ordering::Relaxed);
+    if tick % LISTENER_CHECK_EVERY_TICKS != 0 {
+        return;
+    }
+    let mut cmd = Command::new("ss");
+    cmd.args(["-H", "-tlnp"]);
+    let output = match run_cmd_output(cmd, "ss -H -tlnp") {
+        Ok(output) => output,
+        Err(err) => {
+            tracing::warn!(error = %err, "listener check: ss failed; skipping");
+            return;
+        }
+    };
+    let listeners = parse_ss_tcp_listeners(&output);
+    if listeners.is_empty() && !output.trim().is_empty() {
+        tracing::warn!(
+            "listener check: could not parse any line of `ss -H -tlnp`; the check is blind"
+        );
+        return;
+    }
+    for (process, host, port) in loopback_only_exposures(&listeners) {
+        let endpoint = listen_endpoint(&host, port);
+        tracing::warn!(
+            process = process.as_str(),
+            endpoint = endpoint.as_str(),
+            "service without authentication listens off loopback (A-46)"
+        );
+        // The drift store keeps one alert per kind and hour, so each process gets its own kind:
+        // with both exposed, one must not hide the other.
+        append_drift_alert(
+            "posture",
+            &format!("loopback_service_exposed_{process}"),
+            "error",
+            &state.hive_id,
+            format!(
+                "{process} listens on {endpoint}. It has no authentication and must listen on \
+                 127.0.0.1 only (FINDINGS A-46). Check architect.listen / admin.listen in \
+                 /etc/fluxbee/hive.yaml and any JSR_ARCHITECT_LISTEN / JSR_ADMIN_LISTEN override."
+            ),
+            None,
+            None,
+            None,
+        );
+    }
+}
+
+/// `host:port` for messages, with an IPv6 host in brackets (`[::]:3000`).
+fn listen_endpoint(host: &str, port: u16) -> String {
+    if host.contains(':') {
+        format!("[{host}]:{port}")
+    } else {
+        format!("{host}:{port}")
+    }
+}
+
+// ===========================================================================
 // Egress NAT reconciliation — docs/edge-egress-nat-spec.md §8.
 // Runs locally on the hive's own orchestrator. On a `role: egress` hive it
 // reconciles IPv4 forwarding + nftables NAT + conntrack. On a worker that
@@ -4778,11 +6755,16 @@ struct EgressVerification {
     conntrack_tuned: bool,
     route_applied: bool,
     internet_reachable: bool,
+    /// Motherbee only (PB-8): its observed IPv4 default route equals the declared
+    /// `egress.gateway_ip`. Purely observational — on that path `route_applied` is
+    /// always `false` by contract, because Fluxbee never touches the control plane's route.
+    gateway_matches: bool,
 }
 
 /// First usable host of a CIDR: `(network & mask) + 1`. Uses std bit-math; no
 /// CIDR crate needed (spec Open Question #2). `/31` and `/32` have no derived
 /// gateway address and require an explicit `edge_ip`.
+#[cfg(test)]
 fn first_usable_ipv4(cidr: &str) -> Result<std::net::Ipv4Addr, OrchestratorError> {
     let (network, _, prefix) = parse_ipv4_cidr_network(cidr)?;
     first_usable_ipv4_from_network(cidr, network, prefix)
@@ -5191,15 +7173,125 @@ fn ensure_egress_nft_boot_unit() -> Result<(), OrchestratorError> {
 /// Whether the current IPv4 default route already points at `gateway_ip`.
 /// Used by the watchdog to skip a no-op `ip route replace`. On any error
 /// reading the route table, returns false so the caller re-applies (safe).
-fn default_route_via(gateway_ip: &str) -> bool {
+/// The gateway of the first IPv4 default route, i.e. the token after `via`.
+///
+/// Pure, so the parsing is testable without a host. Mirrors how the validating
+/// `resolve_egress_nat_config` sits under the I/O shell `reconcile_egress_nat`.
+fn parse_default_gateway(route_output: &str) -> Option<String> {
+    route_output.lines().find_map(|line| {
+        let mut tokens = line.split_whitespace();
+        if tokens.next() != Some("default") {
+            return None;
+        }
+        let mut tokens = tokens.skip_while(|tok| *tok != "via");
+        tokens.next()?; // the literal "via"
+        tokens.next().map(str::to_string)
+    })
+}
+
+fn observed_default_gateway() -> Option<String> {
     let mut cmd = Command::new("ip");
     cmd.arg("-4").arg("route").arg("show").arg("default");
-    match run_cmd_output(cmd, "ip route show default") {
-        Ok(out) => out
-            .lines()
-            .any(|line| line.split_whitespace().any(|tok| tok == gateway_ip)),
-        Err(_) => false,
+    run_cmd_output(cmd, "ip route show default")
+        .ok()
+        .and_then(|out| parse_default_gateway(&out))
+}
+
+fn default_route_via(gateway_ip: &str) -> bool {
+    observed_default_gateway().is_some_and(|observed| observed == gateway_ip)
+}
+
+/// Is motherbee's own egress path the one the operator declared?
+#[derive(Debug, PartialEq, Eq)]
+enum MotherbeeEgressVerdict {
+    Match,
+    Bypass { observed: String },
+    Unknown,
+}
+
+fn motherbee_egress_verdict(declared: &str, observed: Option<&str>) -> MotherbeeEgressVerdict {
+    match observed.map(str::trim).filter(|o| !o.is_empty()) {
+        Some(o) if o == declared.trim() => MotherbeeEgressVerdict::Match,
+        Some(o) => MotherbeeEgressVerdict::Bypass {
+            observed: o.to_string(),
+        },
+        None => MotherbeeEgressVerdict::Unknown,
     }
+}
+
+/// PB-8: check — and ONLY check — whether motherbee egresses through the declared gateway.
+///
+/// `egress.gateway_ip` means, by documented contract, "where the WORKERS egress"; motherbee was
+/// never in the model. But motherbee is where `base-nodes.json` boots the nodes that actually
+/// call the internet (`IO.slack.*`, `IO.wapp.*`, `AI.*`), so an operator reading that field can
+/// reasonably believe those calls go through the managed chokepoint. Often they do not.
+///
+/// ⛔ THE FORBIDDEN FIX, so nobody "completes" this later: do NOT add `HiveRole::Motherbee` to the
+/// Worker arm of `reconcile_egress`. That would put the CONTROL PLANE rewriting its own default
+/// route on every boot and every watchdog tick, from a yaml field, with no rollback, on the very
+/// box that provisions the egress. On a worker that failure is non-fatal by design; on motherbee
+/// it is a lockout. Fluxbee reports the mismatch and leaves the route to the operator.
+fn verify_motherbee_egress(
+    gateway_ip: &str,
+    probe_internet: bool,
+    verify_hive_id: &str,
+) -> EgressVerification {
+    // `route_applied` stays false on purpose: nothing was applied, and saying otherwise is the
+    // class of lie this whole change exists to remove.
+    let mut verification = EgressVerification::default();
+    let observed = observed_default_gateway();
+    let verdict = motherbee_egress_verdict(gateway_ip, observed.as_deref());
+    verification.gateway_matches = verdict == MotherbeeEgressVerdict::Match;
+
+    let probed = probe_internet && (command_exists("ping") || command_exists("curl"));
+    if probed {
+        verification.internet_reachable = check_internet_reachable();
+    }
+
+    match &verdict {
+        MotherbeeEgressVerdict::Match => tracing::info!(
+            declared_gateway = gateway_ip,
+            gateway_matches = true,
+            probed = probed,
+            internet_reachable = verification.internet_reachable,
+            "motherbee egress path matches the declared gateway (read-only; Fluxbee does not manage this route)"
+        ),
+        MotherbeeEgressVerdict::Bypass { observed } => {
+            // PB-8's only surface was a journal WARN nobody tails. Now it is queryable — this
+            // is the natural home the drift store never had a producer for.
+            append_drift_alert(
+                "egress",
+                "health_check_failed",
+                "warning",
+                &verify_hive_id,
+                format!(
+                    "motherbee egresses via {observed}, not the declared gateway {gateway_ip}. \
+                     The nodes that call the internet run here, so they are outside the managed \
+                     chokepoint. Fluxbee does not rewrite the control plane's route."
+                ),
+                None,
+                None,
+                None,
+            );
+            tracing::warn!(
+            declared_gateway = gateway_ip,
+            observed_gateway = %observed,
+            probed = probed,
+            internet_reachable = verification.internet_reachable,
+            "EGRESS_MOTHERBEE_BYPASS: this hive's IPv4 default route is not the declared egress gateway; \
+             the nodes that run here reach the internet through the observed gateway, outside the managed \
+             chokepoint. Fluxbee does NOT rewrite the control plane's route — put motherbee on the egress \
+             path at the host/network level, or accept the bypass"
+            )
+        }
+        MotherbeeEgressVerdict::Unknown => tracing::warn!(
+            declared_gateway = gateway_ip,
+            "EGRESS_MOTHERBEE_UNVERIFIED: no readable IPv4 default route on this hive; cannot confirm \
+             whether motherbee egresses through the declared gateway"
+        ),
+    }
+
+    verification
 }
 
 /// Smoke-test that the egress path reaches the internet. Tries ICMP first
@@ -5367,16 +7459,37 @@ fn reconcile_egress(state: &OrchestratorState) -> Result<(), OrchestratorError> 
             tracing::warn!("role=egress but egress.enabled=false; skipping NAT reconciliation");
         }
         HiveRole::Worker => {
-            if let Some(gateway_ip) = eg.gateway_ip.as_deref() {
+            if let Some(gateway_ip) = eg
+                .gateway_ip
+                .as_deref()
+                .map(str::trim)
+                .filter(|g| !g.is_empty())
+            {
                 reconcile_worker_egress(gateway_ip, &eg.ipv6)?;
             }
         }
-        HiveRole::Motherbee | HiveRole::Ingress => {}
+        HiveRole::Motherbee => {
+            // PB-8: VERIFY ONLY. `gateway_ip` is the workers' route by contract, but motherbee
+            // hosts the nodes that call the internet, so a mismatch is worth saying out loud.
+            // Fluxbee must never rewrite the control plane's own route — see
+            // `verify_motherbee_egress` for why that would be a lockout.
+            if let Some(gateway_ip) = eg
+                .gateway_ip
+                .as_deref()
+                .map(str::trim)
+                .filter(|g| !g.is_empty())
+            {
+                let _ = verify_motherbee_egress(gateway_ip, true, &state.hive_id);
+            }
+        }
+        HiveRole::Ingress => {}
     }
     Ok(())
 }
 
-fn ensure_syncthing_installed() -> Result<(), OrchestratorError> {
+/// Installs the vendored Syncthing when the installed binary is missing or differs from it.
+/// Returns whether it installed one: a running Syncthing keeps the old binary until it restarts.
+fn ensure_syncthing_installed() -> Result<bool, OrchestratorError> {
     let source = resolve_syncthing_vendor_source_path()?;
     let source_hash = local_syncthing_vendor_hash()?.unwrap_or_default();
     if let Some(parent) = Path::new(SYNCTHING_INSTALL_PATH).parent() {
@@ -5412,7 +7525,7 @@ fn ensure_syncthing_installed() -> Result<(), OrchestratorError> {
         }
     }
     if !install_required {
-        return Ok(());
+        return Ok(false);
     }
     tracing::info!(
         source = %source.display(),
@@ -5429,35 +7542,11 @@ fn ensure_syncthing_installed() -> Result<(), OrchestratorError> {
     if !syncthing_binary_available() {
         return Err("syncthing install finished but installed binary is still missing".into());
     }
-    Ok(())
+    Ok(true)
 }
 
-fn ensure_local_syncthing_vendor_layout(service_user: &str) -> Result<(), OrchestratorError> {
-    if !Path::new(SYNCTHING_INSTALL_PATH).exists() {
-        return Err("syncthing installed binary missing while ensuring vendor layout".into());
-    }
-    let target_path = Path::new(DIST_SYNCTHING_VENDOR_SOURCE_PATH);
-    if let Some(parent) = target_path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    let mut install = Command::new("install");
-    install
-        .arg("-m")
-        .arg("0755")
-        .arg(SYNCTHING_INSTALL_PATH)
-        .arg(DIST_SYNCTHING_VENDOR_SOURCE_PATH);
-    run_cmd(
-        install,
-        &format!(
-            "install local syncthing vendor source ({})",
-            DIST_SYNCTHING_VENDOR_SOURCE_PATH
-        ),
-    )?;
-    ensure_owned_file(target_path, service_user)?;
-    Ok(())
-}
-
-fn syncthing_unit_contents(blob: &BlobRuntimeConfig, service_user: &str) -> String {
+fn syncthing_unit_contents(blob: &BlobRuntimeConfig) -> String {
+    let service_user = SYNCTHING_SERVICE_USER;
     let service_group =
         linux_user_primary_group(service_user).unwrap_or_else(|| service_user.to_string());
     format!(
@@ -5541,27 +7630,24 @@ fn validate_unit_path_field(path: &Path, label: &str) -> Result<(), Orchestrator
     Ok(())
 }
 
-fn ensure_syncthing_unit(blob: &BlobRuntimeConfig) -> Result<(), OrchestratorError> {
-    let service_user = resolve_syncthing_service_user(blob)?;
-    // SO-06: service_user and sync_data_dir are interpolated verbatim into a
-    // root-written systemd unit file; reject control chars / non-absolute paths
-    // that could break the unit or inject directives before writing it.
-    if service_user.chars().any(char::is_control) {
-        return Err("syncthing: service user contains control characters".into());
-    }
+/// Writes the Syncthing unit when it differs. Returns whether it did: a running service keeps
+/// the unit it started with until it restarts.
+fn ensure_syncthing_unit(blob: &BlobRuntimeConfig) -> Result<bool, OrchestratorError> {
+    // SO-06: sync_data_dir is interpolated verbatim into a root-written systemd unit file; reject
+    // control chars / non-absolute paths that could break the unit or inject directives.
     validate_unit_path_field(&blob.sync_data_dir, "blob.sync.data_dir")?;
-    let unit_contents = syncthing_unit_contents(blob, &service_user);
+    let unit_contents = syncthing_unit_contents(blob);
     let unit_path =
         Path::new("/etc/systemd/system").join(format!("{SYNCTHING_SERVICE_NAME}.service"));
     let current = fs::read_to_string(&unit_path).unwrap_or_default();
     if current == unit_contents {
-        return Ok(());
+        return Ok(false);
     }
     fs::write(&unit_path, unit_contents)?;
     let mut daemon_reload = Command::new("systemctl");
     daemon_reload.arg("daemon-reload");
     run_cmd(daemon_reload, "systemctl daemon-reload")?;
-    Ok(())
+    Ok(true)
 }
 
 async fn syncthing_api_healthy(api_port: u16) -> bool {
@@ -5578,7 +7664,7 @@ async fn syncthing_api_healthy(api_port: u16) -> bool {
 
 fn syncthing_api_key(sync: &BlobRuntimeConfig) -> Result<String, OrchestratorError> {
     let config_path = sync.sync_data_dir.join("config.xml");
-    let data = fs::read_to_string(&config_path)?;
+    let (data, _) = read_syncthing_config(&config_path, false)?;
     let re = Regex::new(r#"(?s)<apikey>([^<]+)</apikey>"#)?;
     let api_key = re
         .captures(&data)
@@ -5602,6 +7688,8 @@ fn syncthing_device_connected(
     );
     let mut cmd = Command::new("curl");
     cmd.arg("-fsS")
+        .arg("--max-time")
+        .arg("5")
         .arg("-H")
         .arg(format!("X-API-Key: {api_key}"))
         .arg(&endpoint);
@@ -5639,6 +7727,8 @@ struct SyncthingFolderStatus {
     need_total_items: u64,
     error: String,
     invalid: String,
+    /// Local changes in a receive-only folder, which Syncthing neither sends nor undoes.
+    receive_only_total_items: u64,
 }
 
 impl SyncthingFolderStatus {
@@ -5670,6 +7760,8 @@ fn syncthing_folder_status(
     );
     let mut cmd = Command::new("curl");
     cmd.arg("-fsS")
+        .arg("--max-time")
+        .arg("10")
         .arg("-H")
         .arg(format!("X-API-Key: {}", api_key))
         .arg(&endpoint);
@@ -5677,13 +7769,17 @@ fn syncthing_folder_status(
     let payload: serde_json::Value = serde_json::from_str(&out).map_err(|err| {
         format!("invalid syncthing db/status payload for folder '{folder_id}': {err}")
     })?;
+    Ok(syncthing_folder_status_from_payload(&payload))
+}
+
+fn syncthing_folder_status_from_payload(payload: &serde_json::Value) -> SyncthingFolderStatus {
     let state = payload
         .get("state")
         .and_then(|v| v.as_str())
         .unwrap_or("unknown")
         .trim()
         .to_string();
-    let need_total_items = json_u64(&payload, "needTotalItems", "need_total_items");
+    let need_total_items = json_u64(payload, "needTotalItems", "need_total_items");
     let error = payload
         .get("error")
         .and_then(|v| v.as_str())
@@ -5696,20 +7792,61 @@ fn syncthing_folder_status(
         .unwrap_or("")
         .trim()
         .to_string();
-    Ok(SyncthingFolderStatus {
+    SyncthingFolderStatus {
         state,
         need_total_items,
         error,
         invalid,
-    })
+        receive_only_total_items: json_u64(
+            payload,
+            "receiveOnlyTotalItems",
+            "receive_only_total_items",
+        ),
+    }
 }
 
-fn syncthing_folder_healthy(
+/// The watchdog's check of one folder: whether it is healthy. A receive-only folder with local
+/// changes gets them reverted first (FINDINGS A-16): Syncthing neither sends nor undoes them, so a
+/// spoke's mirror that something touched would stay diverged from its source, in silence.
+fn check_syncthing_folder(
     sync: &BlobRuntimeConfig,
     folder_id: &str,
 ) -> Result<bool, OrchestratorError> {
     let status = syncthing_folder_status(sync, folder_id)?;
+    if status.receive_only_total_items > 0 {
+        tracing::warn!(
+            folder = folder_id,
+            local_items = status.receive_only_total_items,
+            "receive-only folder has local changes; reverting it to its source"
+        );
+        if let Err(err) = syncthing_revert_folder(sync, folder_id) {
+            tracing::warn!(folder = folder_id, error = %err, "could not revert the local changes");
+        }
+    }
     Ok(status.is_healthy())
+}
+
+/// `POST /rest/db/revert`: a receive-only folder drops its local changes and takes the source's.
+fn syncthing_revert_folder(
+    sync: &BlobRuntimeConfig,
+    folder_id: &str,
+) -> Result<(), OrchestratorError> {
+    let api_key = syncthing_api_key(sync)?;
+    let endpoint = format!(
+        "http://127.0.0.1:{}/rest/db/revert?folder={}",
+        sync.sync_api_port, folder_id
+    );
+    let mut cmd = Command::new("curl");
+    cmd.arg("-fsS")
+        .arg("--max-time")
+        .arg("120")
+        .arg("-X")
+        .arg("POST")
+        .arg("-H")
+        .arg(format!("X-API-Key: {}", api_key))
+        .arg(&endpoint);
+    let _ = run_cmd_output(cmd, &format!("syncthing revert folder={folder_id}"))?;
+    Ok(())
 }
 
 fn syncthing_trigger_folder_scan(
@@ -5723,6 +7860,8 @@ fn syncthing_trigger_folder_scan(
     );
     let mut cmd = Command::new("curl");
     cmd.arg("-fsS")
+        .arg("--max-time")
+        .arg("120")
         .arg("-X")
         .arg("POST")
         .arg("-H")
@@ -5757,11 +7896,35 @@ fn valid_syncthing_device_id(device_id: &str) -> bool {
         .all(|ch| ch.is_ascii_uppercase() || ch.is_ascii_digit() || ch == '-')
 }
 
-fn valid_syncthing_peer_address(address: &str) -> bool {
-    address
-        .trim()
-        .strip_prefix("tcp://")
-        .is_some_and(|socket| socket.parse::<std::net::SocketAddr>().is_ok())
+/// Where a Syncthing peer is reached (host posture stage 2, docs/host-posture-and-exposure-spec-v1.md
+/// §3.5). `AcceptOnly` is Syncthing's `dynamic`: this side never dials once discovery is off, and
+/// the peer dials in. Spokes reach the motherbee at its `Static` address; the motherbee accepts.
+/// There is no implicit default on purpose: an `Option` that fell back to `dynamic` is what left
+/// worker1 and the motherbee depending on public discovery to find each other (FINDINGS A-47).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SyncthingPeerAddress {
+    AcceptOnly,
+    Static(std::net::SocketAddr),
+}
+
+impl SyncthingPeerAddress {
+    /// The `<address>` value written into config.xml.
+    fn config_value(self) -> String {
+        match self {
+            Self::AcceptOnly => "dynamic".to_string(),
+            Self::Static(addr) => format!("tcp://{addr}"),
+        }
+    }
+
+    /// A `tcp://<ip>:<port>` literal. Names and `dynamic` are refused.
+    fn parse_static(value: &str) -> Option<Self> {
+        value
+            .trim()
+            .strip_prefix("tcp://")?
+            .parse::<std::net::SocketAddr>()
+            .ok()
+            .map(Self::Static)
+    }
 }
 
 fn syncthing_tcp_address_for_host(host: &str) -> Result<String, OrchestratorError> {
@@ -5775,53 +7938,41 @@ fn syncthing_tcp_address_for_host(host: &str) -> Result<String, OrchestratorErro
     ))
 }
 
-fn extract_first_syncthing_device_id(config_xml: &str) -> Option<String> {
-    let device_re = Regex::new(r#"<device\b[^>]*\bid="([^"]+)""#).ok()?;
-    for caps in device_re.captures_iter(config_xml) {
-        let candidate = caps.get(1).map(|m| m.as_str().trim()).unwrap_or("");
-        if valid_syncthing_device_id(candidate) {
-            return Some(candidate.to_string());
-        }
-    }
-    None
-}
-
+/// This hive's Syncthing device id. From the binary when its key pair is there (Syncthing v2 has a
+/// `device-id` subcommand; v1's `--device-id` flag is gone, so that call always failed),
+/// otherwise from the running Syncthing. Never from config.xml's first device: Syncthing sorts
+/// folder members by id, so that can be a peer, and a join would then hand a spoke the wrong
+/// "motherbee".
 fn local_syncthing_device_id(sync: &BlobRuntimeConfig) -> Result<String, OrchestratorError> {
-    let home = sync.sync_data_dir.display().to_string();
-    let mut cmd = Command::new(SYNCTHING_INSTALL_PATH);
-    cmd.arg("--home")
-        .arg(&sync.sync_data_dir)
-        .arg("--device-id")
-        .env("HOME", &home)
-        .env("XDG_CONFIG_HOME", &home);
-    match run_cmd_output(cmd, "syncthing --device-id") {
-        Ok(out) => {
-            let device_id = out.trim();
-            if valid_syncthing_device_id(device_id) {
-                return Ok(device_id.to_string());
-            }
-            tracing::warn!(
+    // The binary reads cert.pem and key.pem as root from the Syncthing user's directory: both
+    // must be regular files, not symlinks, and the call is bounded, since a FIFO planted there
+    // would block it.
+    let regular = |name: &str| {
+        fs::symlink_metadata(sync.sync_data_dir.join(name)).is_ok_and(|m| m.file_type().is_file())
+    };
+    if regular("cert.pem") && regular("key.pem") {
+        let home = sync.sync_data_dir.display().to_string();
+        let mut cmd = Command::new("timeout");
+        cmd.arg("5")
+            .arg(SYNCTHING_INSTALL_PATH)
+            .arg("--home")
+            .arg(&sync.sync_data_dir)
+            .arg("device-id")
+            .env("HOME", &home)
+            .env("XDG_CONFIG_HOME", &home);
+        match run_cmd_output(cmd, "syncthing device-id") {
+            Ok(out) if valid_syncthing_device_id(out.trim()) => return Ok(out.trim().to_string()),
+            Ok(out) => tracing::warn!(
                 output = %truncate_for_error(&out, 200),
-                "invalid syncthing --device-id output; falling back to config.xml parsing"
-            );
-        }
-        Err(err) => {
-            tracing::warn!(
+                "invalid syncthing device-id output; asking the running syncthing"
+            ),
+            Err(err) => tracing::warn!(
                 error = %err,
-                "failed to resolve syncthing device id from binary; falling back to config.xml parsing"
-            );
+                "syncthing device-id failed; asking the running syncthing"
+            ),
         }
     }
-
-    let config_path = sync.sync_data_dir.join("config.xml");
-    let data = fs::read_to_string(&config_path)?;
-    extract_first_syncthing_device_id(&data).ok_or_else(|| {
-        format!(
-            "failed to resolve syncthing device id from '{}'",
-            config_path.display()
-        )
-        .into()
-    })
+    syncthing_rest_my_id(sync)
 }
 
 fn xml_escape_attr(value: &str) -> String {
@@ -5879,28 +8030,23 @@ fn rewrite_syncthing_folder_block(
     Ok(format!("{updated_tag}{body}"))
 }
 
+/// A new folder block with no member. Syncthing adds the local device to every folder when it
+/// loads its config, and the joins add the peers. Seeding it with the first `<device id=` of the
+/// file, as this used to, could share the folder with a peer: the first one is often a folder
+/// member, and Syncthing sorts those by id.
 fn minimal_syncthing_folder_block(
-    config_xml: &str,
     folder_id: &str,
     folder_path: &str,
     folder_label: &str,
     folder_type: &str,
-) -> Result<String, OrchestratorError> {
-    let device_re = Regex::new(r#"<device\b[^>]*\bid="([^"]+)""#)?;
-    let Some(caps) = device_re.captures(config_xml) else {
-        return Err("syncthing config has no device id to seed folder".into());
-    };
-    let Some(device_id) = caps.get(1).map(|m| m.as_str()) else {
-        return Err("syncthing config has malformed device id".into());
-    };
-    Ok(format!(
-        "<folder id=\"{}\" label=\"{}\" path=\"{}\" type=\"{}\" rescanIntervalS=\"3600\" fsWatcherEnabled=\"true\" fsWatcherDelayS=\"10\" ignorePerms=\"false\" autoNormalize=\"true\">\n    <filesystemType>basic</filesystemType>\n    <device id=\"{}\" introducedBy=\"\"/>\n    <minDiskFree unit=\"%\">1</minDiskFree>\n  </folder>",
+) -> String {
+    format!(
+        "<folder id=\"{}\" label=\"{}\" path=\"{}\" type=\"{}\" rescanIntervalS=\"3600\" fsWatcherEnabled=\"true\" fsWatcherDelayS=\"10\" ignorePerms=\"false\" autoNormalize=\"true\">\n    <filesystemType>basic</filesystemType>\n    <minDiskFree unit=\"%\">1</minDiskFree>\n  </folder>",
         xml_escape_attr(folder_id),
         xml_escape_attr(folder_label),
         xml_escape_attr(folder_path),
         xml_escape_attr(folder_type),
-        xml_escape_attr(device_id)
-    ))
+    )
 }
 
 fn ensure_syncthing_folder_in_config_xml(
@@ -5940,37 +8086,10 @@ fn ensure_syncthing_folder_in_config_xml(
         return Ok((out, true));
     }
 
-    let mut template_block: Option<String> = None;
-    for caps in folder_re.captures_iter(config_xml) {
-        let Some(full) = caps.get(0) else {
-            continue;
-        };
-        if template_block.is_none() {
-            template_block = Some(full.as_str().to_string());
-        }
-        if caps.get(1).map(|m| m.as_str()) == Some("default") {
-            template_block = Some(full.as_str().to_string());
-            break;
-        }
-    }
-
-    let new_block = if let Some(template) = template_block {
-        rewrite_syncthing_folder_block(
-            &template,
-            folder_id,
-            folder_path,
-            folder_label,
-            folder_type,
-        )?
-    } else {
-        minimal_syncthing_folder_block(
-            config_xml,
-            folder_id,
-            folder_path,
-            folder_label,
-            folder_type,
-        )?
-    };
+    // A new folder never clones another one: that copied its members, so creating `blob/active`
+    // after spokes had joined shared it with every peer of the first folder (A-50).
+    let new_block =
+        minimal_syncthing_folder_block(folder_id, folder_path, folder_label, folder_type);
 
     let insert_at = config_xml
         .rfind("</configuration>")
@@ -6008,15 +8127,10 @@ fn ensure_isolated_syncthing_folder_in_config_xml(
         );
     }
 
-    // A public folder must start with only this device. Cloning active/dist as a
-    // template would inherit their peers and accidentally share public bytes.
-    let new_block = minimal_syncthing_folder_block(
-        config_xml,
-        folder_id,
-        folder_path,
-        folder_label,
-        folder_type,
-    )?;
+    // A new folder starts with no member: cloning active/dist as a template would inherit
+    // their peers and share their bytes.
+    let new_block =
+        minimal_syncthing_folder_block(folder_id, folder_path, folder_label, folder_type);
     let insert_at = config_xml
         .rfind("</configuration>")
         .unwrap_or(config_xml.len());
@@ -6036,16 +8150,14 @@ fn ensure_syncthing_top_level_device_in_config_xml(
     config_xml: &str,
     device_id: &str,
     device_name: &str,
-    peer_address: Option<&str>,
+    peer_address: SyncthingPeerAddress,
 ) -> Result<(String, bool), OrchestratorError> {
     let normalized_id = device_id.trim();
     if !valid_syncthing_device_id(normalized_id) {
         return Err(format!("invalid syncthing device id '{}'", device_id).into());
     }
-    let desired_address = peer_address.unwrap_or("dynamic").trim();
-    if desired_address.is_empty() {
-        return Err("syncthing peer address cannot be empty".into());
-    }
+    let desired_address = peer_address.config_value();
+    let desired_address = desired_address.as_str();
 
     let (self_closing_device_re, device_re) = syncthing_named_device_regexes(normalized_id)?;
     let defaults_re = Regex::new(r#"(?s)<defaults>.*?</defaults>"#)?;
@@ -6112,6 +8224,162 @@ fn ensure_syncthing_top_level_device_in_config_xml(
     out.push_str(&new_device);
     out.push_str(&updated[insert_at..]);
     Ok((out, true))
+}
+
+/// Serializes every read-modify-write of Syncthing's config.xml (host posture stage 2). Three
+/// unlocked writers used to race each other.
+static SYNCTHING_CONFIG_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// The single writer of Syncthing's config.xml. Under one lock it reads the file, applies
+/// `update` and, when something changed, replaces the file with an atomic rename that keeps its
+/// owner and mode (Syncthing runs as fluxbee; the orchestrator as root).
+/// `scripts/check_syncthing_single_writer.sh` keeps every write going through here.
+///
+/// `update` runs under the lock, so it must not call Syncthing or anything else that can stall:
+/// every writer (joins, `remove_hive`, the watchdog) waits on it.
+fn update_syncthing_config<F>(config_path: &Path, update: F) -> Result<bool, OrchestratorError>
+where
+    F: FnOnce(&str) -> Result<(String, bool), OrchestratorError>,
+{
+    // A panic in another writer leaves nothing half-done on disk (the rename is atomic), so a
+    // poisoned lock is safe to take over.
+    let _guard = SYNCTHING_CONFIG_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    // No writer is in flight while the lock is held, so any temp of ours is a crash leftover.
+    remove_stale_replace_temps(config_path);
+    let (current, meta) = read_syncthing_config(config_path, true)?;
+    let (updated, changed) = update(&current)?;
+    if !changed || updated == current {
+        return Ok(false);
+    }
+    replace_file_keeping_owner(config_path, updated.as_bytes(), &meta)?;
+    Ok(true)
+}
+
+/// config.xml is a few KiB; anything near this is not Syncthing's.
+const SYNCTHING_CONFIG_MAX_BYTES: u64 = 16 * 1024 * 1024;
+
+/// Reads config.xml with the metadata of the file actually read. The directory belongs to the
+/// Syncthing user and the orchestrator is root, so the name is not trusted: a symlink is not
+/// followed, a FIFO does not block the open, and anything but a regular file of a sane size is
+/// refused. `for_write` also refuses a file with other hard links, whose owner and mode the
+/// replace would otherwise copy; readers of the API key do not need that, and hard-link backups
+/// must not break them.
+fn read_syncthing_config(
+    path: &Path,
+    for_write: bool,
+) -> Result<(String, fs::Metadata), OrchestratorError> {
+    use std::io::Read;
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+    let file = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(nix::libc::O_NOFOLLOW | nix::libc::O_NONBLOCK)
+        .open(path)
+        .map_err(|err| format!("cannot open '{}': {err}", path.display()))?;
+    let meta = file.metadata()?;
+    if !meta.file_type().is_file() {
+        return Err(format!("'{}' is not a regular file", path.display()).into());
+    }
+    if for_write && meta.nlink() != 1 {
+        return Err(format!("'{}' has {} hard links", path.display(), meta.nlink()).into());
+    }
+    let mut out = String::new();
+    file.take(SYNCTHING_CONFIG_MAX_BYTES + 1)
+        .read_to_string(&mut out)?;
+    if out.len() as u64 > SYNCTHING_CONFIG_MAX_BYTES {
+        return Err(format!("'{}' is larger than expected", path.display()).into());
+    }
+    Ok((out, meta))
+}
+
+/// The temp prefix `replace_file_keeping_owner` uses next to `path`.
+fn replace_temp_prefix(path: &Path) -> String {
+    let name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("fluxbee-write");
+    format!(".{name}.fluxbee-tmp-")
+}
+
+/// Removes the temps a crashed write left next to `path`. Unlinking never follows a symlink.
+fn remove_stale_replace_temps(path: &Path) {
+    let (Some(dir), prefix) = (path.parent(), replace_temp_prefix(path)) else {
+        return;
+    };
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        if entry
+            .file_name()
+            .to_str()
+            .is_some_and(|name| name.starts_with(&prefix))
+        {
+            let _ = fs::remove_file(entry.path());
+        }
+    }
+}
+
+/// Creates `path` exclusively (`O_CREAT|O_EXCL`): an existing entry, a planted symlink included,
+/// is never opened.
+fn create_exclusive(path: &Path) -> std::io::Result<fs::File> {
+    use std::os::unix::fs::OpenOptionsExt;
+    fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(path)
+}
+
+/// Writes `contents` to a new sibling temp file and renames it over `path`, with the owner and
+/// permission bits of `original` (the metadata of the file that was read; setuid, setgid and
+/// sticky bits are dropped). A reader never sees a half-written file, and the owner never changes.
+///
+/// The temp is created exclusively under an unpredictable name, and its owner and mode are set on
+/// the open file, not on a path. The rename replaces the directory entry and never follows it.
+fn replace_file_keeping_owner(
+    path: &Path,
+    contents: &[u8],
+    original: &fs::Metadata,
+) -> Result<(), OrchestratorError> {
+    use std::os::unix::fs::MetadataExt;
+    let mode = original.mode() & 0o777;
+    let dir = path
+        .parent()
+        .ok_or_else(|| format!("path '{}' has no parent directory", path.display()))?;
+    let prefix = replace_temp_prefix(path);
+    let mut created = None;
+    for _ in 0..8 {
+        let tmp = dir.join(format!("{prefix}{:016x}", rand::random::<u64>()));
+        match create_exclusive(&tmp) {
+            Ok(file) => {
+                created = Some((file, tmp));
+                break;
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(err) => return Err(err.into()),
+        }
+    }
+    let (mut file, tmp) = created
+        .ok_or_else(|| format!("could not create a temp file next to '{}'", path.display()))?;
+    let result = (|| -> Result<(), OrchestratorError> {
+        file.write_all(contents)?;
+        std::os::unix::fs::fchown(&file, Some(original.uid()), Some(original.gid()))?;
+        file.set_permissions(fs::Permissions::from_mode(mode))?;
+        file.sync_all()?;
+        fs::rename(&tmp, path)?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&tmp);
+        return result;
+    }
+    // The new contents are in place; only their durability across a crash depends on this.
+    if let Err(err) = fs::File::open(dir).and_then(|d| d.sync_all()) {
+        tracing::warn!(path = %path.display(), error = %err, "could not fsync the directory after a replace");
+    }
+    Ok(())
 }
 
 fn syncthing_named_device_regexes(device_id: &str) -> Result<(Regex, Regex), OrchestratorError> {
@@ -6188,16 +8456,136 @@ fn ensure_syncthing_folder_has_device(
     Ok((config_xml.to_string(), false))
 }
 
+/// One syncthing folder to declare on this side of a motherbee<->spoke link.
+struct DistSyncFolder {
+    id: String,
+    path: PathBuf,
+    label: &'static str,
+}
+
+/// The `dist` folders a link with a spoke of `spoke_role` must carry, resolved for whichever
+/// side is calling (`is_motherbee`).
+///
+/// This is where "each hive gets only what it runs" is actually decided, and the split is by
+/// CONTENT, deliberately:
+///   * core    — per role. The ingress runs 4 of the 17 core binaries; shipping it all of
+///               `dist/core` would hand the DMZ box the 181 MB motherbee-only `sy_architect`
+///               for nothing.
+///   * vendor  — everyone. Without it `update category=vendor` is permanently unsatisfiable.
+///   * runtimes— worker only. Tenant workflow packages live here; this is the subtree that
+///               must never reach the DMZ.
+///
+/// Paths are asymmetric by design: motherbee serves `dist/core/<role>`, the spoke receives it
+/// as its own `dist/core`. Syncthing resolves a folder id to a local path per device, so both
+/// ends agree on the id while each keeps the layout its own code expects.
+fn dist_sync_folders_for_role(
+    dist: &DistRuntimeConfig,
+    spoke_role: HiveRole,
+    is_motherbee: bool,
+) -> Vec<DistSyncFolder> {
+    let mut out = Vec::new();
+    let core_path = if is_motherbee {
+        role_core_dist_dir(spoke_role)
+    } else {
+        dist.path.join("core")
+    };
+    out.push(DistSyncFolder {
+        id: format!("{}{}", SYNCTHING_FOLDER_DIST_CORE_PREFIX, spoke_role.as_str()),
+        path: core_path,
+        label: "Fluxbee Dist Core",
+    });
+    out.push(DistSyncFolder {
+        id: SYNCTHING_FOLDER_DIST_VENDOR_ID.to_string(),
+        path: dist.path.join("vendor"),
+        label: "Fluxbee Dist Vendor",
+    });
+    out.push(DistSyncFolder {
+        id: SYNCTHING_FOLDER_DIST_POLICY_ID.to_string(),
+        path: dist.path.join("policy"),
+        label: "Fluxbee Dist Policy",
+    });
+    if spoke_role == HiveRole::Worker {
+        out.push(DistSyncFolder {
+            id: SYNCTHING_FOLDER_DIST_RUNTIMES_ID.to_string(),
+            path: dist.path.join("runtimes"),
+            label: "Fluxbee Dist Runtimes",
+        });
+    }
+    out
+}
+
+/// Every dist folder THIS hive carries, deduplicated.
+///
+/// Motherbee serves one core folder per spoke role plus the shared vendor and runtimes folders;
+/// a spoke carries only its own. Declaration, `.stfolder` markers and health checks must all
+/// agree on this set — when they did not, the health watchdog polled
+/// `fluxbee-dist-core-motherbee`, a folder motherbee never declares (it does not sync to
+/// itself), and logged a 404 every five seconds forever. Deriving all three from one function
+/// makes that class of drift impossible rather than merely fixed once.
+fn dist_sync_folders_for_hive(
+    dist: &DistRuntimeConfig,
+    role: HiveRole,
+    is_motherbee: bool,
+) -> Vec<DistSyncFolder> {
+    let roles: &[HiveRole] = if is_motherbee {
+        &ROLE_CORE_DIST_ROLES
+    } else {
+        std::slice::from_ref(&role)
+    };
+    let mut out: Vec<DistSyncFolder> = Vec::new();
+    for r in roles {
+        for folder in dist_sync_folders_for_role(dist, *r, is_motherbee) {
+            // vendor (and runtimes) are shared across roles — declare each id once.
+            if !out.iter().any(|f| f.id == folder.id) {
+                out.push(folder);
+            }
+        }
+    }
+    out
+}
+
+/// `blob/active` holds every tenant's live blobs, so it goes to workers only: they run the nodes
+/// that use it. The ingress gets `blob/public` instead (io-blob-spec-v1 P5), and the egress gets
+/// neither: it runs no node and declares `blob.enabled: false`. Sharing it with every non-ingress
+/// role authorized the egress for all of it (A-50).
+fn peer_shares_active_blob(blob: &BlobRuntimeConfig, spoke_role: HiveRole) -> bool {
+    spoke_role == HiveRole::Worker
+        && blob.enabled
+        && blob.sync_enabled
+        && blob_sync_tool_is_syncthing(blob)
+}
+
+fn peer_shares_public_blob(blob: &BlobRuntimeConfig, spoke_role: HiveRole) -> bool {
+    spoke_role == HiveRole::Ingress && blob.public_sync_enabled && blob_sync_tool_is_syncthing(blob)
+}
+
+/// Whether a spoke of this role must never be in this Fluxbee folder, whatever hive.yaml's enable
+/// flags say: blob/active is workers' only (A-50), blob/public the ingress's, runtimes workers'
+/// only, and each core folder its own role's. The reconcile takes a spoke out of these folders and
+/// nothing else, so a flag turned off for a while never strips anyone: the joins are the only
+/// place that adds a spoke to a folder, and they never add a forbidden one.
+fn folder_forbidden_for_role(folder_id: &str, role: HiveRole) -> bool {
+    match folder_id {
+        SYNCTHING_FOLDER_BLOB_ID | SYNCTHING_FOLDER_DIST_RUNTIMES_ID => role != HiveRole::Worker,
+        SYNCTHING_FOLDER_BLOB_PUBLIC_ID => role != HiveRole::Ingress,
+        id => id
+            .strip_prefix(SYNCTHING_FOLDER_DIST_CORE_PREFIX)
+            .is_some_and(|core_role| core_role != role.as_str()),
+    }
+}
+
 fn reconcile_syncthing_peer_xml(
     config_xml: &str,
     blob: &BlobRuntimeConfig,
     dist: &DistRuntimeConfig,
     peer_device_id: &str,
     peer_name: &str,
-    peer_address: Option<&str>,
+    peer_address: SyncthingPeerAddress,
     is_motherbee: bool,
-    public_only: bool,
+    spoke_role: HiveRole,
 ) -> Result<(String, bool), OrchestratorError> {
+    // `spoke_role` is the non-motherbee end of the link: on motherbee the peer's role, on a
+    // spoke its own.
     let mut updated = config_xml.to_string();
     let mut changed = false;
 
@@ -6210,7 +8598,7 @@ fn reconcile_syncthing_peer_xml(
     updated = next;
     changed |= top_changed;
 
-    if !public_only && blob.enabled && blob.sync_enabled && blob_sync_tool_is_syncthing(blob) {
+    if peer_shares_active_blob(blob, spoke_role) {
         let blob_sync_path = blob_sync_folder_path(blob);
         let (next, folder_changed) = ensure_syncthing_folder_in_config_xml(
             &updated,
@@ -6227,7 +8615,7 @@ fn reconcile_syncthing_peer_xml(
         changed |= device_changed;
     }
 
-    if public_only && blob.public_sync_enabled && blob_sync_tool_is_syncthing(blob) {
+    if peer_shares_public_blob(blob, spoke_role) {
         let public_path = blob_public_sync_folder_path(blob);
         let (next, folder_changed) = ensure_isolated_syncthing_folder_in_config_xml(
             &updated,
@@ -6247,23 +8635,76 @@ fn reconcile_syncthing_peer_xml(
         changed |= device_changed;
     }
 
-    if !public_only && dist.sync_enabled && dist_sync_tool_is_syncthing(dist) {
-        let (next, folder_changed) = ensure_syncthing_folder_in_config_xml(
-            &updated,
-            SYNCTHING_FOLDER_DIST_ID,
-            &dist.path.display().to_string(),
-            "Fluxbee Dist",
-            dist_syncthing_folder_type(is_motherbee),
-        )?;
+    // dist is scoped by content per role (`dist_sync_folders_for_role`), apart from the blob
+    // folders above.
+    if dist.sync_enabled && dist_sync_tool_is_syncthing(dist) {
+        for folder in dist_sync_folders_for_role(dist, spoke_role, is_motherbee) {
+            // Isolated: each dist folder owns a disjoint subtree (core/, vendor/, runtimes/ are
+            // siblings under dist/), so no two of them may ever converge on one path. Overlapping
+            // syncthing folders are accepted silently by the daemon and then fight over one
+            // index — the failure mode behind the runtime-deletion incident.
+            let (next, folder_changed) = ensure_isolated_syncthing_folder_in_config_xml(
+                &updated,
+                &folder.id,
+                &folder.path.display().to_string(),
+                folder.label,
+                dist_syncthing_folder_type(is_motherbee),
+            )?;
+            updated = next;
+            changed |= folder_changed;
+            let (next, device_changed) =
+                ensure_syncthing_folder_has_device(&updated, &folder.id, peer_device_id)?;
+            updated = next;
+            changed |= device_changed;
+        }
+
+        // Retire the legacy whole-`dist/` folder. Removing it (rather than re-pointing it) is
+        // the only safe move: the id must never be reused with a different path, and leaving it
+        // in place would keep shipping `runtimes/` to every hive that already had it, silently
+        // defeating the split.
+        let (next, legacy_removed) =
+            remove_syncthing_folder_from_config_xml(&updated, SYNCTHING_FOLDER_DIST_LEGACY_ID)?;
+        if legacy_removed {
+            tracing::info!(
+                folder = SYNCTHING_FOLDER_DIST_LEGACY_ID,
+                "removed legacy whole-dist syncthing folder in favour of per-content folders"
+            );
+        }
         updated = next;
-        changed |= folder_changed;
-        let (next, device_changed) =
-            ensure_syncthing_folder_has_device(&updated, SYNCTHING_FOLDER_DIST_ID, peer_device_id)?;
-        updated = next;
-        changed |= device_changed;
+        changed |= legacy_removed;
     }
 
     Ok((updated, changed))
+}
+
+/// Remove a `<folder>` block entirely from a syncthing config.
+///
+/// Every other `reconcile_*`/`ensure_*` helper here is additive; there was no way to retire a
+/// folder at all, which is why the legacy whole-`dist/` folder could not simply be replaced.
+fn remove_syncthing_folder_from_config_xml(
+    config_xml: &str,
+    folder_id: &str,
+) -> Result<(String, bool), OrchestratorError> {
+    let pattern = format!(
+        r#"(?s)[ \t]*<folder\b[^>]*\bid="{}"[^>]*>.*?</folder>\s*\n?"#,
+        regex::escape(folder_id)
+    );
+    let re = Regex::new(&pattern)
+        .map_err(|err| format!("invalid folder-removal regex for '{folder_id}': {err}"))?;
+    if !re.is_match(config_xml) {
+        // Also handle the self-closing form some syncthing versions emit.
+        let self_closing = format!(
+            r#"(?s)[ \t]*<folder\b[^>]*\bid="{}"[^>]*/>\s*\n?"#,
+            regex::escape(folder_id)
+        );
+        let re_sc = Regex::new(&self_closing)
+            .map_err(|err| format!("invalid folder-removal regex for '{folder_id}': {err}"))?;
+        if !re_sc.is_match(config_xml) {
+            return Ok((config_xml.to_string(), false));
+        }
+        return Ok((re_sc.replace(config_xml, "").to_string(), true));
+    }
+    Ok((re.replace(config_xml, "").to_string(), true))
 }
 
 fn ensure_local_syncthing_peer_link(
@@ -6272,26 +8713,23 @@ fn ensure_local_syncthing_peer_link(
     dist: &DistRuntimeConfig,
     peer_device_id: &str,
     peer_name: &str,
-    peer_address: Option<&str>,
+    peer_address: SyncthingPeerAddress,
     is_motherbee: bool,
-    public_only: bool,
+    spoke_role: HiveRole,
 ) -> Result<bool, OrchestratorError> {
     let config_path = sync.sync_data_dir.join("config.xml");
-    let current = fs::read_to_string(&config_path)?;
-    let (updated, changed) = reconcile_syncthing_peer_xml(
-        &current,
-        blob,
-        dist,
-        peer_device_id,
-        peer_name,
-        peer_address,
-        is_motherbee,
-        public_only,
-    )?;
-    if changed {
-        fs::write(&config_path, updated)?;
-    }
-    Ok(changed)
+    update_syncthing_config(&config_path, |current| {
+        reconcile_syncthing_peer_xml(
+            current,
+            blob,
+            dist,
+            peer_device_id,
+            peer_name,
+            peer_address,
+            is_motherbee,
+            spoke_role,
+        )
+    })
 }
 
 async fn ensure_syncthing_peer_link_runtime(
@@ -6300,9 +8738,9 @@ async fn ensure_syncthing_peer_link_runtime(
     dist: &DistRuntimeConfig,
     peer_device_id: &str,
     peer_name: &str,
-    peer_address: Option<&str>,
+    peer_address: SyncthingPeerAddress,
     is_motherbee: bool,
-    public_only: bool,
+    spoke_role: HiveRole,
 ) -> Result<(), OrchestratorError> {
     if !sync.sync_enabled {
         return Ok(());
@@ -6318,7 +8756,7 @@ async fn ensure_syncthing_peer_link_runtime(
         peer_name,
         peer_address,
         is_motherbee,
-        public_only,
+        spoke_role,
     )?;
     if !changed {
         return Ok(());
@@ -6340,6 +8778,1378 @@ async fn ensure_syncthing_peer_link_runtime(
     Ok(())
 }
 
+// ===========================================================================
+// Host posture, stage 2: Syncthing peers (FINDINGS A-47, A-50,
+// docs/host-posture-and-exposure-spec-v1.md §3.5). A spoke reaches the motherbee at a static
+// address and the motherbee only accepts, so no link depends on discovery. The motherbee keeps
+// each spoke in exactly its role's folders and removes devices no hive claims. This reconciles
+// the joined hives too, not only new joins; on PROD worker1 and the motherbee had `dynamic` on
+// both sides, and the egress was in `blob/active`. Syncthing restarts only when the config
+// changed.
+// ===========================================================================
+
+/// Watchdog tick counter for the address reconcile. At the 5s cadence, 12 ticks ≈ 60s; the first
+/// tick runs right after bootstrap.
+static SYNCTHING_ADDRESS_TICKS: AtomicU64 = AtomicU64::new(0);
+const SYNCTHING_ADDRESS_EVERY_TICKS: u64 = 12;
+
+/// One top-level `<device>` of config.xml: a peer declaration, or the local device.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SyncthingDeclaredDevice {
+    id: String,
+    /// Empty when the element has no `name` (Syncthing omits an empty one).
+    name: String,
+    /// Every `<address>`, comma-joined; converged means exactly the one wanted.
+    address: String,
+}
+
+/// The spans of the top-level `<device>` elements of config.xml, as (start, end, id). A
+/// `<device>` inside a `<folder>` is a membership entry and one inside `<defaults>` a template;
+/// both are skipped by structure, so a device without a name is still seen.
+fn syncthing_top_level_device_spans(
+    config_xml: &str,
+) -> Result<Vec<(usize, usize, String)>, OrchestratorError> {
+    let nested_re = Regex::new(r#"(?s)<defaults>.*?</defaults>|<folder\b[^>]*>.*?</folder>"#)?;
+    let nested: Vec<(usize, usize)> = nested_re
+        .find_iter(config_xml)
+        .map(|m| (m.start(), m.end()))
+        .collect();
+    // `[^>/]*`: a self-closing element must not run on into the next one's body.
+    let device_re = Regex::new(r#"(?s)<device\b[^>/]*(?:/>|>.*?</device>)"#)?;
+    let id_re = Regex::new(r#"^<device\b[^>]*?\bid="([^"]+)""#)?;
+    let mut out = Vec::new();
+    for found in device_re.find_iter(config_xml) {
+        if nested
+            .iter()
+            .any(|(start, end)| found.start() >= *start && found.end() <= *end)
+        {
+            continue;
+        }
+        if let Some(caps) = id_re.captures(found.as_str()) {
+            out.push((found.start(), found.end(), caps[1].to_string()));
+        }
+    }
+    Ok(out)
+}
+
+/// The top-level `<device>` elements of config.xml (see `syncthing_top_level_device_spans`).
+fn syncthing_declared_devices(
+    config_xml: &str,
+) -> Result<Vec<SyncthingDeclaredDevice>, OrchestratorError> {
+    let open_tag_re = Regex::new(r#"^<device\b[^>]*>"#)?;
+    let name_re = Regex::new(r#"\bname="([^"]*)""#)?;
+    let address_re = Regex::new(r#"<address>([^<]*)</address>"#)?;
+    let mut out = Vec::new();
+    for (start, end, id) in syncthing_top_level_device_spans(config_xml)? {
+        let element = &config_xml[start..end];
+        let open_tag = open_tag_re
+            .find(element)
+            .map(|m| m.as_str())
+            .unwrap_or(element);
+        let name = name_re
+            .captures(open_tag)
+            .map(|c| c[1].to_string())
+            .unwrap_or_default();
+        let address = address_re
+            .captures_iter(element)
+            .map(|c| c[1].trim().to_string())
+            .collect::<Vec<_>>()
+            .join(",");
+        out.push(SyncthingDeclaredDevice { id, name, address });
+    }
+    Ok(out)
+}
+
+/// Sets a top-level device's addresses to exactly `address`. Returns unchanged when the device is
+/// not declared at top level.
+fn set_top_level_device_address(
+    config_xml: &str,
+    device_id: &str,
+    address: SyncthingPeerAddress,
+) -> Result<(String, bool), OrchestratorError> {
+    let wanted = format!(
+        "<address>{}</address>",
+        xml_escape_attr(&address.config_value())
+    );
+    let address_re = Regex::new(r#"<address>[^<]*</address>"#)?;
+    let extra_re = Regex::new(r#"\n?[ \t]*<address>[^<]*</address>"#)?;
+    let Some((start, end, _)) = syncthing_top_level_device_spans(config_xml)?
+        .into_iter()
+        .find(|(_, _, id)| id == device_id)
+    else {
+        return Ok((config_xml.to_string(), false));
+    };
+    let element = &config_xml[start..end];
+    let rewritten = if let Some(stripped) = element.strip_suffix("/>") {
+        format!("{}>\n        {wanted}\n    </device>", stripped.trim_end())
+    } else if let Some(first) = address_re.find(element) {
+        let rest = extra_re.replace_all(&element[first.end()..], "");
+        format!("{}{wanted}{rest}", &element[..first.start()])
+    } else {
+        let tag_end = element
+            .find('>')
+            .ok_or("invalid syncthing device element")?;
+        format!(
+            "{}\n        {wanted}{}",
+            &element[..=tag_end],
+            &element[tag_end + 1..]
+        )
+    };
+    if rewritten == element {
+        return Ok((config_xml.to_string(), false));
+    }
+    let mut out = config_xml.to_string();
+    out.replace_range(start..end, &rewritten);
+    Ok((out, true))
+}
+
+/// Removes a top-level device element (named or not) and the whitespace of its lines.
+fn remove_top_level_device(
+    config_xml: &str,
+    device_id: &str,
+) -> Result<(String, bool), OrchestratorError> {
+    let Some((start, end, _)) = syncthing_top_level_device_spans(config_xml)?
+        .into_iter()
+        .find(|(_, _, id)| id == device_id)
+    else {
+        return Ok((config_xml.to_string(), false));
+    };
+    let bytes = config_xml.as_bytes();
+    let mut from = start;
+    while from > 0 && matches!(bytes[from - 1], b' ' | b'\t') {
+        from -= 1;
+    }
+    let mut to = end;
+    while to < bytes.len() && matches!(bytes[to], b' ' | b'\t') {
+        to += 1;
+    }
+    if to < bytes.len() && bytes[to] == b'\n' {
+        to += 1;
+    }
+    let mut out = config_xml.to_string();
+    out.replace_range(from..to, "");
+    Ok((out, true))
+}
+
+/// On a spoke: the motherbee device(s) whose address is not the static one, as (id, name).
+fn spoke_motherbee_device_updates(
+    devices: &[SyncthingDeclaredDevice],
+    local_device_id: &str,
+    motherbee_name: &str,
+    address: SyncthingPeerAddress,
+) -> Vec<(String, String)> {
+    let desired = address.config_value();
+    devices
+        .iter()
+        .filter(|d| d.id != local_device_id && d.name == motherbee_name && d.address != desired)
+        .map(|d| (d.id.clone(), d.name.clone()))
+        .collect()
+}
+
+/// One hive of the motherbee's registry, as the reconcile reads it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RegisteredHive {
+    /// The recorded Syncthing device id; `None` when absent or not a valid id.
+    device_id: Option<String>,
+    /// A spoke role; `None` when absent or not a spoke's.
+    role: Option<HiveRole>,
+    /// At rest (`hive_entry_at_rest`). A hive joining, pending or failed is left alone.
+    connected: bool,
+    /// Its status and join phase, for the report.
+    state: String,
+}
+
+/// The hive registry as the reconcile sees it. `complete` is false when the registry or one of
+/// its entries could not be read; then no device is removed.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct RegistrySnapshot {
+    hives: BTreeMap<String, RegisteredHive>,
+    complete: bool,
+}
+
+/// A registry entry at rest: `status: connected`, and its join record, when there is one, says
+/// `done`. A record left at another phase keeps the hive out. The flows rewrite the entry without
+/// that record while they run, so a failing join can read as `connected` until its tail records
+/// the result; the reconcile then only does what it does for a connected hive, and the device-id
+/// backfill, the one write that could race the tail, waits for an explicit `done`
+/// (`record_syncthing_device_id`).
+fn hive_entry_at_rest(info: &serde_json::Value) -> bool {
+    let connected = info.get("status").and_then(|v| v.as_str()) == Some("connected");
+    let phase = info.get("join").and_then(|join| join.get("phase"));
+    connected && phase.is_none_or(|phase| phase.as_str() == Some("done"))
+}
+
+/// The valid Syncthing device id an entry records, if any.
+fn recorded_syncthing_device_id(info: &serde_json::Value) -> Option<String> {
+    info.get("syncthing_device_id")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|id| valid_syncthing_device_id(id))
+        .map(str::to_string)
+}
+
+fn read_registry_snapshot(root: &Path) -> RegistrySnapshot {
+    let mut snapshot = RegistrySnapshot {
+        hives: BTreeMap::new(),
+        complete: true,
+    };
+    let Ok(entries) = fs::read_dir(root) else {
+        snapshot.complete = false;
+        return snapshot;
+    };
+    for entry in entries {
+        let Ok(entry) = entry else {
+            snapshot.complete = false;
+            continue;
+        };
+        let Ok(hive_id) = entry.file_name().into_string() else {
+            snapshot.complete = false;
+            continue;
+        };
+        // Not a spoke's entry: the motherbee itself, or a name a join would refuse.
+        if hive_id == PRIMARY_HIVE_ID || !valid_hive_id(&hive_id) {
+            continue;
+        }
+        // A directory without info.yaml is a join being accepted, which holds that hive's
+        // topology lock: the busy check covers it.
+        if !entry.path().join("info.yaml").exists() {
+            continue;
+        }
+        let Ok(info) = read_hive_info(root, &hive_id) else {
+            snapshot.complete = false;
+            continue;
+        };
+        let device_id = recorded_syncthing_device_id(&info);
+        let role = HiveRole::from_role(info.get("role").and_then(|v| v.as_str()))
+            .filter(|role| *role != HiveRole::Motherbee);
+        let connected = hive_entry_at_rest(&info);
+        let state = format!(
+            "status {}, join {}",
+            info.get("status")
+                .and_then(|v| v.as_str())
+                .unwrap_or("none"),
+            info.get("join")
+                .and_then(|join| join.get("phase"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("none")
+        );
+        snapshot.hives.insert(
+            hive_id,
+            RegisteredHive {
+                device_id,
+                role,
+                connected,
+                state,
+            },
+        );
+    }
+    snapshot
+}
+
+/// The members of every Fluxbee folder in config.xml, as folder id → device ids.
+fn fluxbee_folder_memberships(
+    config_xml: &str,
+) -> Result<BTreeMap<String, Vec<String>>, OrchestratorError> {
+    let folder_re = Regex::new(r#"<folder\b[^>]*\bid="(fluxbee-[^"]*)""#)?;
+    let mut out = BTreeMap::new();
+    for caps in folder_re.captures_iter(config_xml) {
+        let id = caps[1].to_string();
+        if !out.contains_key(&id) {
+            let members = syncthing_folder_device_ids(config_xml, &id)?;
+            out.insert(id, members);
+        }
+    }
+    Ok(out)
+}
+
+/// What the motherbee changes in its Syncthing peers.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+struct MotherbeePeerPlan {
+    /// Hives' devices still declared with a fixed address, as (id, name).
+    accept_only: Vec<(String, String)>,
+    /// (hive_id, device id) to record in a connected entry that records none.
+    backfill: Vec<(String, String)>,
+    /// (folder id, device id): a hive's device in a Fluxbee folder its role must never be in
+    /// (A-50).
+    drop_memberships: Vec<(String, String)>,
+    /// Devices no hive claims, as (id, name). Removed, so they stop being authorized.
+    orphans: Vec<(String, String)>,
+    /// What is left as it is and needs an operator.
+    notes: Vec<String>,
+    /// A topology operation was running: nothing was planned, and nothing is to be reported.
+    busy: bool,
+}
+
+/// The motherbee's plan for its declared devices against the hive registry.
+///
+/// A device is a hive's when that hive's entry records its id. A device whose id no entry
+/// records is the hive's it is named after only while that entry records none and no other
+/// unrecorded device has the name (the egress joins never recorded theirs); its id is then
+/// backfilled. Any other device is an orphan: a leftover of a removed hive, or a second device
+/// under a hive's name.
+///
+/// Nothing is planned while a topology operation runs, and only `connected` hives are
+/// reconciled. Orphans are removed only when the registry was read completely, is not empty and
+/// every hive in it is connected and records its device: a join that stopped half-way keeps its
+/// device, and so does a hive's device that is named differently before its id is recorded.
+fn motherbee_peer_plan(
+    devices: &[SyncthingDeclaredDevice],
+    memberships: &BTreeMap<String, Vec<String>>,
+    local_device_id: &str,
+    registry: &RegistrySnapshot,
+    busy: bool,
+) -> MotherbeePeerPlan {
+    let mut plan = MotherbeePeerPlan::default();
+    if busy {
+        plan.busy = true;
+        return plan;
+    }
+    let recorded: BTreeMap<&str, &str> = registry
+        .hives
+        .iter()
+        .filter_map(|(hive_id, hive)| hive.device_id.as_deref().map(|id| (id, hive_id.as_str())))
+        .collect();
+    let remote: Vec<&SyncthingDeclaredDevice> =
+        devices.iter().filter(|d| d.id != local_device_id).collect();
+    let may_remove = registry.complete
+        && !registry.hives.is_empty()
+        && registry
+            .hives
+            .values()
+            .all(|hive| hive.connected && hive.device_id.is_some());
+    for device in &remote {
+        // Every edit below validates the id; one hand-edited id must not stop the whole round.
+        if !valid_syncthing_device_id(&device.id) {
+            plan.notes.push(format!(
+                "device {} has an invalid id '{}'; left alone",
+                device.name, device.id
+            ));
+            continue;
+        }
+        let owner = match recorded.get(device.id.as_str()) {
+            Some(hive_id) => Some((*hive_id, false)),
+            None => match registry.hives.get(&device.name) {
+                None => None,
+                Some(hive) => match hive.device_id.as_deref() {
+                    None => {
+                        let unrecorded = remote
+                            .iter()
+                            .filter(|d| {
+                                d.name == device.name && !recorded.contains_key(d.id.as_str())
+                            })
+                            .count();
+                        if unrecorded != 1 {
+                            plan.notes.push(format!(
+                                "{unrecorded} devices are named {} and its entry records none; kept",
+                                device.name
+                            ));
+                            continue;
+                        }
+                        Some((device.name.as_str(), true))
+                    }
+                    Some(recorded_id) if !remote.iter().any(|d| d.id == recorded_id) => {
+                        plan.notes.push(format!(
+                            "{} records device {recorded_id}, which is not declared; device {} kept",
+                            device.name, device.id
+                        ));
+                        continue;
+                    }
+                    // A second device under the name of a hive that records another.
+                    Some(_) => None,
+                },
+            },
+        };
+        let Some((hive_id, backfill)) = owner else {
+            if may_remove {
+                plan.orphans.push((device.id.clone(), device.name.clone()));
+            } else {
+                plan.notes.push(format!(
+                    "device {} ({}) is claimed by no hive; kept while the registry is unreadable or empty, or has a hive not connected or without a recorded device",
+                    device.name, device.id
+                ));
+            }
+            continue;
+        };
+        let Some(hive) = registry.hives.get(hive_id) else {
+            continue;
+        };
+        if !hive.connected {
+            plan.notes.push(format!(
+                "hive {hive_id} is not at rest ({}); its device is left alone",
+                hive.state
+            ));
+            continue;
+        }
+        if backfill {
+            plan.backfill.push((hive_id.to_string(), device.id.clone()));
+        }
+        if device.address != SyncthingPeerAddress::AcceptOnly.config_value() {
+            plan.accept_only
+                .push((device.id.clone(), device.name.clone()));
+        }
+        let Some(role) = hive.role else {
+            plan.notes.push(format!(
+                "hive {hive_id} has no spoke role in its entry; its folders are left as they are"
+            ));
+            continue;
+        };
+        for (folder_id, members) in memberships {
+            if members.iter().any(|m| *m == device.id) && folder_forbidden_for_role(folder_id, role)
+            {
+                plan.drop_memberships
+                    .push((folder_id.clone(), device.id.clone()));
+            }
+        }
+    }
+    plan
+}
+
+/// Applies a plan: accept-only addresses, the folder memberships to drop, and the orphans
+/// (out of every Fluxbee folder, then their declaration).
+fn apply_motherbee_peer_plan_xml(
+    config_xml: &str,
+    plan: &MotherbeePeerPlan,
+    memberships: &BTreeMap<String, Vec<String>>,
+) -> Result<(String, bool), OrchestratorError> {
+    let mut updated = config_xml.to_string();
+    let mut changed = false;
+    for (id, _) in &plan.accept_only {
+        let (next, c) =
+            set_top_level_device_address(&updated, id, SyncthingPeerAddress::AcceptOnly)?;
+        updated = next;
+        changed |= c;
+    }
+    for (folder_id, id) in &plan.drop_memberships {
+        let (next, c) = remove_syncthing_folder_device(&updated, folder_id, id)?;
+        updated = next;
+        changed |= c;
+    }
+    for (id, _) in &plan.orphans {
+        for (folder_id, members) in memberships {
+            if members.iter().any(|m| m == id) {
+                let (next, c) = remove_syncthing_folder_device(&updated, folder_id, id)?;
+                updated = next;
+                changed |= c;
+            }
+        }
+        let (next, c) = remove_top_level_device(&updated, id)?;
+        updated = next;
+        changed |= c;
+    }
+    Ok((updated, changed))
+}
+
+/// Records the Syncthing device id in a connected registry entry that records none. Skipped
+/// while a join or a removal holds that hive, and until the entry's join record says `done`: a
+/// join's tail writes its result without the topology lock, and this read-modify-write must not
+/// interleave with it. The next round retries.
+fn record_syncthing_device_id(
+    state: &OrchestratorState,
+    root: &Path,
+    hive_id: &str,
+    device_id: &str,
+) {
+    if !valid_syncthing_device_id(device_id) {
+        return;
+    }
+    let Some(_guard) = state.try_lock_hive_topology(hive_id) else {
+        return;
+    };
+    let Ok(mut info) = read_hive_info(root, hive_id) else {
+        return;
+    };
+    // An invalid recorded value counts as none, as it does in the snapshot.
+    let join_done = info
+        .get("join")
+        .and_then(|join| join.get("phase"))
+        .and_then(|v| v.as_str())
+        == Some("done");
+    if !hive_entry_at_rest(&info) || !join_done || recorded_syncthing_device_id(&info).is_some() {
+        return;
+    }
+    let Some(obj) = info.as_object_mut() else {
+        return;
+    };
+    obj.insert(
+        "syncthing_device_id".to_string(),
+        serde_json::Value::String(device_id.to_string()),
+    );
+    match write_hive_info(root, hive_id, &info) {
+        Ok(()) => tracing::info!(
+            hive_id = hive_id,
+            device_id = device_id,
+            "syncthing: device id recorded in the registry"
+        ),
+        Err(err) => {
+            tracing::warn!(hive_id = hive_id, error = %err, "syncthing: device id backfill failed")
+        }
+    }
+}
+
+/// On a spoke: the motherbee's static Syncthing address, the host of the first WAN uplink at
+/// port 22000. The error says why there is none.
+fn spoke_motherbee_static_address(uplinks: &[WanUplink]) -> Result<SyncthingPeerAddress, String> {
+    let uplink = uplinks
+        .first()
+        .ok_or("hive.yaml has no wan.uplinks, so the motherbee's address is unknown")?;
+    let (host, _) = parse_host_port(uplink.address.trim()).map_err(|err| err.to_string())?;
+    syncthing_tcp_address_for_host(&host)
+        .ok()
+        .and_then(|address| SyncthingPeerAddress::parse_static(&address))
+        .ok_or_else(|| {
+            format!("wan uplink host '{host}' is not an IP literal; the motherbee device keeps its address")
+        })
+}
+
+/// The local device id from the running Syncthing (`/rest/system/status`), bounded in time.
+/// Never guessed from config.xml: its first device can be a peer.
+fn syncthing_rest_my_id(sync: &BlobRuntimeConfig) -> Result<String, OrchestratorError> {
+    let api_key = syncthing_api_key(sync)?;
+    let endpoint = format!("http://127.0.0.1:{}/rest/system/status", sync.sync_api_port);
+    let mut cmd = Command::new("curl");
+    cmd.arg("-fsS")
+        .arg("--max-time")
+        .arg("5")
+        .arg("-H")
+        .arg(format!("X-API-Key: {api_key}"))
+        .arg(&endpoint);
+    let out = run_cmd_output(cmd, "syncthing system status")?;
+    let payload: serde_json::Value = serde_json::from_str(&out)
+        .map_err(|err| format!("invalid syncthing status payload: {err}"))?;
+    payload
+        .get("myID")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|id| valid_syncthing_device_id(id))
+        .map(str::to_string)
+        .ok_or_else(|| "syncthing status has no valid myID".into())
+}
+
+/// The last condition the reconcile reported: a state that lasts is logged once, not every
+/// minute.
+static SYNCTHING_RECONCILE_REPORT: std::sync::Mutex<String> = std::sync::Mutex::new(String::new());
+
+fn report_syncthing_reconcile(notes: &[String]) {
+    let mut notes = notes.to_vec();
+    notes.sort();
+    notes.dedup();
+    let report = notes.join("; ");
+    log_syncthing_reconcile_report(&report, &report);
+}
+
+fn report_syncthing_reconcile_failure(error: &str) {
+    let report = format!("failed, retrying next round: {error}");
+    // Compared without digits: a timeout's milliseconds must not make the same failure new.
+    let key: String = report
+        .chars()
+        .map(|c| if c.is_ascii_digit() { '#' } else { c })
+        .collect();
+    log_syncthing_reconcile_report(&report, &key);
+}
+
+/// Logs `report` unless the last one had the same `key`.
+fn log_syncthing_reconcile_report(report: &str, key: &str) {
+    let mut last = SYNCTHING_RECONCILE_REPORT
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if *last == key {
+        return;
+    }
+    if report.is_empty() {
+        tracing::info!("syncthing peer reconcile: nothing to report");
+    } else {
+        tracing::warn!(report = %report, "syncthing peer reconcile");
+    }
+    *last = key.to_string();
+}
+
+/// A topology operation longer than this is reported: a hung join would otherwise keep the
+/// reconcile waiting without a word.
+const SYNCTHING_RECONCILE_BUSY_REPORT_SECS: u64 = 15 * 60;
+
+static SYNCTHING_RECONCILE_BUSY_SINCE: std::sync::Mutex<Option<Instant>> =
+    std::sync::Mutex::new(None);
+
+/// How long the reconcile has been waiting on topology operations: `Some(now)` records a busy
+/// round, `None` a round that ran (and resets it).
+fn syncthing_reconcile_busy_for(now: Option<Instant>) -> Duration {
+    let mut since = SYNCTHING_RECONCILE_BUSY_SINCE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    match now {
+        None => {
+            *since = None;
+            Duration::ZERO
+        }
+        Some(now) => now.duration_since(*since.get_or_insert(now)),
+    }
+}
+
+/// How many ADD_HIVE_FINALIZE runs this hive has in flight. While any runs, the Syncthing reconcile
+/// leaves config.xml and the service alone: the finalize links the motherbee and then probes its
+/// Syncthing, and a stage-3 switch landing there would restart it under the probe.
+static SYNCTHING_FINALIZES_IN_FLIGHT: AtomicU64 = AtomicU64::new(0);
+
+/// Counts one finalize in flight until dropped, early returns included.
+struct SyncthingFinalizeInFlight;
+
+impl SyncthingFinalizeInFlight {
+    fn start() -> Self {
+        SYNCTHING_FINALIZES_IN_FLIGHT.fetch_add(1, Ordering::SeqCst);
+        Self
+    }
+}
+
+impl Drop for SyncthingFinalizeInFlight {
+    fn drop(&mut self) {
+        SYNCTHING_FINALIZES_IN_FLIGHT.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+/// Present while config.xml may hold a reconcile change that Syncthing has not been restarted
+/// with, so a later round restarts even though it finds nothing to change. A file, so it survives
+/// an orchestrator restart; written before the change is renamed into place, so a crash between
+/// the two still leads to a restart.
+fn syncthing_restart_pending_marker() -> PathBuf {
+    orchestrator_runtime_dir().join("syncthing-restart-pending")
+}
+
+/// Records the intent to restart. Best effort: this round restarts anyway when it wrote.
+fn mark_syncthing_restart_pending() {
+    let marker = syncthing_restart_pending_marker();
+    let written = marker
+        .parent()
+        .map_or(Ok(()), fs::create_dir_all)
+        .and_then(|_| fs::write(&marker, b""));
+    if let Err(err) = written {
+        tracing::warn!(error = %err, "could not record a pending syncthing restart");
+    }
+}
+
+/// Stage 2 reconcile, from the watchdog. On a spoke the motherbee device gets its static
+/// address. On the motherbee every registered spoke is accept-only, the existing egress gets its
+/// device id recorded, no spoke stays in a folder its role must never have (A-50), and devices no
+/// hive claims are removed. Returns the conditions to report; Syncthing restarts only on a
+/// change, and never while a topology operation runs.
+async fn reconcile_syncthing_peer_addresses(
+    state: &OrchestratorState,
+) -> Result<Option<Vec<String>>, OrchestratorError> {
+    let blob = current_blob_runtime_config(state);
+    let dist = current_dist_runtime_config(state);
+    let sync = effective_syncthing_runtime_config(&blob, &dist);
+    if !sync.sync_enabled
+        || !(blob_sync_tool_is_syncthing(&sync) || dist_sync_tool_is_syncthing(&dist))
+    {
+        return Ok(Some(Vec::new()));
+    }
+    let config_path = sync.sync_data_dir.join("config.xml");
+    if !config_path.exists() {
+        return Ok(Some(Vec::new()));
+    }
+    // A join restarts Syncthing itself; asking it for its id then would only report a failure.
+    if state.is_motherbee && state.any_hive_topology_busy() {
+        return Ok(None);
+    }
+    // On a spoke, a finalize links the motherbee and probes Syncthing: leave both alone.
+    if !state.is_motherbee && SYNCTHING_FINALIZES_IN_FLIGHT.load(Ordering::SeqCst) > 0 {
+        return Ok(None);
+    }
+    let marker = syncthing_restart_pending_marker();
+    // Blocking work (one REST call, the registry, the config write), off the async workers. The
+    // REST call happens before the config lock: nothing that can stall runs under it.
+    let (changed, notes) = tokio::task::block_in_place(
+        || -> Result<(bool, Option<Vec<String>>), OrchestratorError> {
+            let local_device_id = syncthing_rest_my_id(&sync)?;
+            if state.is_motherbee {
+                reconcile_motherbee_peers(state, &config_path, &local_device_id)
+            } else {
+                reconcile_spoke_motherbee_address(state, &config_path, &local_device_id)
+            }
+        },
+    )?;
+
+    if !changed && !marker.exists() {
+        return Ok(notes);
+    }
+    // A join waiting for its spoke to connect must not see the motherbee drop every link, and a
+    // finalize that started on this spoke since the check above must not see its Syncthing
+    // restart under its probe: the restart waits, the marker stays.
+    if state.any_hive_topology_busy() || SYNCTHING_FINALIZES_IN_FLIGHT.load(Ordering::SeqCst) > 0 {
+        return Ok(notes);
+    }
+    tracing::info!(
+        service = SYNCTHING_SERVICE_NAME,
+        "syncthing peer config reconciled; restarting service"
+    );
+    tokio::task::block_in_place(|| {
+        let mut restart = Command::new("systemctl");
+        restart.arg("restart").arg(SYNCTHING_SERVICE_NAME);
+        run_cmd(restart, "systemctl restart")
+    })?;
+    wait_for_service_active(
+        SYNCTHING_SERVICE_NAME,
+        Duration::from_secs(SYNCTHING_BOOTSTRAP_TIMEOUT_SECS),
+    )
+    .await?;
+    wait_for_syncthing_health(&sync).await?;
+    let _ = fs::remove_file(&marker);
+    Ok(notes)
+}
+
+/// Returns whether config.xml changed, and the notes to report (`None` while a topology
+/// operation runs: nothing was looked at).
+fn reconcile_motherbee_peers(
+    state: &OrchestratorState,
+    config_path: &Path,
+    local_device_id: &str,
+) -> Result<(bool, Option<Vec<String>>), OrchestratorError> {
+    let root = hives_root();
+    let mut plan = MotherbeePeerPlan::default();
+    // Stage 3: once the motherbee has switched, it keeps the owned options. An unreadable state
+    // is reported and enforces nothing; it never stops the peer reconcile.
+    let (switched, posture_note) = match read_syncthing_posture_state() {
+        Ok(posture) => (posture.switched_at_ms.is_some(), None),
+        Err(err) => (
+            false,
+            Some(format!("Syncthing options not reconciled: {err}")),
+        ),
+    };
+    let listen = syncthing_owned_listen_address(true);
+    let changed = update_syncthing_config(config_path, |current| {
+        // Read under the lock. A join creates its registry entry before it links its device,
+        // and links under this lock, so every device seen here has its entry visible.
+        let registry = read_registry_snapshot(&root);
+        let busy = state.any_hive_topology_busy();
+        let devices = syncthing_declared_devices(current)?;
+        let memberships = fluxbee_folder_memberships(current)?;
+        plan = motherbee_peer_plan(&devices, &memberships, local_device_id, &registry, busy);
+        let (updated, changed) = motherbee_reconcile_xml(
+            current,
+            &plan,
+            &memberships,
+            switched.then_some(listen.as_str()),
+        )?;
+        if changed && updated != current {
+            mark_syncthing_restart_pending();
+        }
+        Ok((updated, changed))
+    })?;
+    if changed {
+        for (id, name) in &plan.accept_only {
+            tracing::info!(device = %id, name = %name, "syncthing: spoke set to accept-only (the motherbee no longer dials it)");
+        }
+        for (folder, id) in &plan.drop_memberships {
+            tracing::info!(device = %id, folder = %folder, "syncthing: spoke taken out of a folder its role does not get");
+        }
+        for (id, name) in &plan.orphans {
+            tracing::info!(device = %id, name = %name, "syncthing: removed a device no registered hive claims");
+        }
+    }
+    for (hive_id, device_id) in &plan.backfill {
+        record_syncthing_device_id(state, &root, hive_id, device_id);
+    }
+    let mut notes = plan.notes;
+    notes.extend(posture_note);
+    Ok((changed, (!plan.busy).then_some(notes)))
+}
+
+fn reconcile_spoke_motherbee_address(
+    state: &OrchestratorState,
+    config_path: &Path,
+    local_device_id: &str,
+) -> Result<(bool, Option<Vec<String>>), OrchestratorError> {
+    let uplinks = load_hive(&state.config_dir)?
+        .wan
+        .and_then(|wan| wan.uplinks)
+        .unwrap_or_default();
+    let address = match spoke_motherbee_static_address(&uplinks) {
+        Ok(address) => address,
+        Err(reason) => return Ok((false, Some(vec![reason]))),
+    };
+    let mut updates = Vec::new();
+    let mut found = false;
+    let changed = update_syncthing_config(config_path, |current| {
+        let devices = syncthing_declared_devices(current)?;
+        found = devices
+            .iter()
+            .any(|d| d.id != local_device_id && d.name == PRIMARY_HIVE_ID);
+        updates =
+            spoke_motherbee_device_updates(&devices, local_device_id, PRIMARY_HIVE_ID, address);
+        let mut updated = current.to_string();
+        let mut changed = false;
+        for (id, _) in &updates {
+            let (next, c) = set_top_level_device_address(&updated, id, address)?;
+            updated = next;
+            changed |= c;
+        }
+        if changed && updated != current {
+            mark_syncthing_restart_pending();
+        }
+        Ok((updated, changed))
+    })?;
+    if changed {
+        for (id, _) in &updates {
+            tracing::info!(device = %id, address = %address.config_value(), "syncthing: the motherbee set to its static address");
+        }
+    }
+    let mut notes = if found {
+        Vec::new()
+    } else {
+        vec![format!(
+            "no device named {PRIMARY_HIVE_ID}; the motherbee's address was not set"
+        )]
+    };
+    // Stage 3, once the address is in place. Its failure never stops the address reconcile, nor
+    // the restart that applies it.
+    let options_changed =
+        match reconcile_spoke_syncthing_options(config_path, local_device_id, address) {
+            Ok((options_changed, options_notes)) => {
+                notes.extend(options_notes);
+                options_changed
+            }
+            Err(err) => {
+                notes.push(format!("Syncthing options not reconciled: {err}"));
+                false
+            }
+        };
+    Ok((changed || options_changed, Some(notes)))
+}
+
+// ===========================================================================
+// Host posture, stage 3: Syncthing options (FINDINGS A-47,
+// docs/host-posture-and-exposure-spec-v1.md §3.5). The orchestrator owns Syncthing's options: no
+// public discovery, relays, NAT, usage or crash reports, self-upgrades or STUN, and a listener
+// only where one is needed (every interface on the motherbee; loopback on spokes, which dial).
+// The switch is one-way and ordered so that no link depends on discovery when it goes off: a spoke
+// switches once its motherbee device is static and the motherbee answers on its Syncthing port;
+// the motherbee switches once every spoke with a registered device has reported both.
+// ===========================================================================
+
+/// The options the orchestrator owns once a hive has switched, as (element, value).
+const SYNCTHING_OWNED_OPTIONS: [(&str, &str); 9] = [
+    ("globalAnnounceEnabled", "false"),
+    ("localAnnounceEnabled", "false"),
+    ("relaysEnabled", "false"),
+    ("natEnabled", "false"),
+    ("crashReportingEnabled", "false"),
+    ("urAccepted", "-1"),
+    ("autoUpgradeIntervalH", "0"),
+    ("stunKeepaliveStartS", "0"),
+    ("reconnectionIntervalS", "10"),
+];
+
+/// The one listen address of a switched hive: the motherbee accepts on every interface (dual
+/// stack); a spoke only dials, so it listens on loopback.
+fn syncthing_owned_listen_address(is_motherbee: bool) -> String {
+    if is_motherbee {
+        format!("tcp://:{SYNCTHING_SYNC_PORT_TCP}")
+    } else {
+        format!("tcp://127.0.0.1:{SYNCTHING_SYNC_PORT_TCP}")
+    }
+}
+
+/// Sets the owned options inside `<options>`: each owned element to its value (added when
+/// missing) and exactly one `<listenAddress>`. Every other option is left as it is.
+fn apply_syncthing_owned_options_xml(
+    config_xml: &str,
+    listen_address: &str,
+) -> Result<(String, bool), OrchestratorError> {
+    let block_re = Regex::new(r#"(?s)<options>(.*?)</options>"#)?;
+    let body = block_re
+        .captures(config_xml)
+        .and_then(|caps| caps.get(1))
+        .ok_or("syncthing config.xml has no <options> block")?;
+    let indent = Regex::new(r#"\n([ \t]*)<"#)?
+        .captures(body.as_str())
+        .map(|caps| caps[1].to_string())
+        .unwrap_or_else(|| "        ".to_string());
+    let mut updated = body.as_str().to_string();
+    let insert = |text: &mut String, element: &str| {
+        // Before the newline that precedes `</options>`, so the closing tag keeps its line.
+        let at = text.rfind('\n').unwrap_or(text.len());
+        text.insert_str(at, &format!("\n{indent}{element}"));
+    };
+    for (name, value) in SYNCTHING_OWNED_OPTIONS {
+        let wanted = format!("<{name}>{value}</{name}>");
+        let element_re = Regex::new(&format!(r#"<{name}>[^<]*</{name}>"#))?;
+        if element_re.is_match(&updated) {
+            updated = element_re
+                .replace_all(&updated, wanted.as_str())
+                .into_owned();
+        } else {
+            insert(&mut updated, &wanted);
+        }
+    }
+    let listen_re = Regex::new(r#"<listenAddress>([^<]*)</listenAddress>"#)?;
+    let current: Vec<String> = listen_re
+        .captures_iter(&updated)
+        .map(|caps| caps[1].trim().to_string())
+        .collect();
+    if current != [listen_address] {
+        updated = Regex::new(r#"\n?[ \t]*<listenAddress>[^<]*</listenAddress>"#)?
+            .replace_all(&updated, "")
+            .into_owned();
+        let element = format!(
+            "<listenAddress>{}</listenAddress>",
+            xml_escape_attr(listen_address)
+        );
+        // First in the block, where Syncthing writes it.
+        updated.insert_str(0, &format!("\n{indent}{element}"));
+    }
+    if updated == body.as_str() {
+        return Ok((config_xml.to_string(), false));
+    }
+    let mut out = config_xml.to_string();
+    out.replace_range(body.start()..body.end(), &updated);
+    Ok((out, true))
+}
+
+/// This hive's stage-3 facts, persisted the first time they are true and never undone (D22): a
+/// later outage does not take a hive back to discovery.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+struct SyncthingPostureState {
+    /// Spoke: when its motherbee device was first seen with its static address (epoch ms).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    motherbee_static_at_ms: Option<u64>,
+    /// Spoke: when a plain TCP connect to the motherbee's Syncthing port first succeeded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    motherbee_reachable_at_ms: Option<u64>,
+    /// When this hive switched to the owned options.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    switched_at_ms: Option<u64>,
+}
+
+fn syncthing_posture_state_path() -> PathBuf {
+    orchestrator_runtime_dir().join("syncthing-posture.json")
+}
+
+/// The persisted facts at `path`. Missing means none yet; a file that does not decode (empty after
+/// a power loss, not UTF-8, not JSON) is an error here, for readers. Its writer moves it aside
+/// (`read_syncthing_posture_state_to_write`).
+fn read_syncthing_posture_state_at(
+    path: &Path,
+) -> Result<SyncthingPostureState, OrchestratorError> {
+    match fs::read(path) {
+        Ok(bytes) => serde_json::from_slice(&bytes)
+            .map_err(|err| format!("unreadable '{}': {err}", path.display()).into()),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            Ok(SyncthingPostureState::default())
+        }
+        Err(err) => Err(err.into()),
+    }
+}
+
+fn read_syncthing_posture_state() -> Result<SyncthingPostureState, OrchestratorError> {
+    read_syncthing_posture_state_at(&syncthing_posture_state_path())
+}
+
+/// For the one writer of the facts on this hive: a file that does not decode is moved aside and
+/// counts as none, so the facts are derived again (which only ever leads to the same switch). Any
+/// other read error stays an error, and nothing switches on it.
+fn read_syncthing_posture_state_to_write_at(
+    path: &Path,
+) -> Result<SyncthingPostureState, OrchestratorError> {
+    match fs::read(path) {
+        Ok(bytes) => match serde_json::from_slice(&bytes) {
+            Ok(posture) => Ok(posture),
+            Err(err) => {
+                tracing::warn!(path = %path.display(), error = %err, "syncthing posture state unreadable; moved aside, facts derived again");
+                fs::rename(path, path.with_extension("json.corrupt"))?;
+                Ok(SyncthingPostureState::default())
+            }
+        },
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            Ok(SyncthingPostureState::default())
+        }
+        Err(err) => Err(err.into()),
+    }
+}
+
+fn read_syncthing_posture_state_to_write() -> Result<SyncthingPostureState, OrchestratorError> {
+    read_syncthing_posture_state_to_write_at(&syncthing_posture_state_path())
+}
+
+/// Written durably (fsync of the file and of its directory): the facts gate a one-way switch.
+/// Temps a crash left behind are swept first; this is the only writer.
+fn write_syncthing_posture_state_at(
+    path: &Path,
+    posture: &SyncthingPostureState,
+) -> Result<(), OrchestratorError> {
+    let dir = path
+        .parent()
+        .ok_or("syncthing posture state path has no parent")?;
+    fs::create_dir_all(dir)?;
+    let prefix = format!(
+        ".{}.tmp-",
+        path.file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("posture")
+    );
+    if let Ok(entries) = fs::read_dir(dir) {
+        for entry in entries.flatten() {
+            if entry
+                .file_name()
+                .to_str()
+                .is_some_and(|n| n.starts_with(&prefix))
+            {
+                let _ = fs::remove_file(entry.path());
+            }
+        }
+    }
+    let tmp = dir.join(format!("{prefix}{:016x}", rand::random::<u64>()));
+    let written = (|| -> Result<(), OrchestratorError> {
+        let mut file = create_exclusive(&tmp)?;
+        file.write_all(&serde_json::to_vec_pretty(posture)?)?;
+        file.sync_all()?;
+        fs::rename(&tmp, path)?;
+        Ok(())
+    })();
+    if written.is_err() {
+        let _ = fs::remove_file(&tmp);
+        return written;
+    }
+    if let Err(err) = fs::File::open(dir).and_then(|d| d.sync_all()) {
+        tracing::warn!(error = %err, "could not fsync the orchestrator directory");
+    }
+    Ok(())
+}
+
+fn write_syncthing_posture_state(posture: &SyncthingPostureState) -> Result<(), OrchestratorError> {
+    write_syncthing_posture_state_at(&syncthing_posture_state_path(), posture)
+}
+
+/// The `/versions` section: whether this hive runs Syncthing, and its persisted facts (never live
+/// checks).
+fn syncthing_posture_section(
+    syncthing: bool,
+    posture: &Result<SyncthingPostureState, String>,
+) -> serde_json::Value {
+    match posture {
+        Ok(posture) => serde_json::json!({
+            "syncthing": syncthing,
+            "motherbee_static": posture.motherbee_static_at_ms.is_some(),
+            "motherbee_reachable": posture.motherbee_reachable_at_ms.is_some(),
+            "switched": posture.switched_at_ms.is_some(),
+        }),
+        Err(err) => serde_json::json!({ "syncthing": syncthing, "error": err }),
+    }
+}
+
+fn syncthing_posture_snapshot(state: &OrchestratorState) -> serde_json::Value {
+    let blob = current_blob_runtime_config(state);
+    let dist = current_dist_runtime_config(state);
+    let sync = effective_syncthing_runtime_config(&blob, &dist);
+    let syncthing = sync.sync_enabled
+        && (blob_sync_tool_is_syncthing(&sync) || dist_sync_tool_is_syncthing(&dist));
+    syncthing_posture_section(
+        syncthing,
+        &read_syncthing_posture_state().map_err(|err| err.to_string()),
+    )
+}
+
+/// A spoke's facts as its `/versions` snapshot reports them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SpokePostureFacts {
+    /// The spoke runs Syncthing at all; one that does not is never waited for.
+    syncthing: bool,
+    motherbee_static: bool,
+    motherbee_reachable: bool,
+}
+
+/// The facts in a GET_VERSIONS reply, or why there are none (each keeps the motherbee waiting).
+fn spoke_posture_facts(reply: &serde_json::Value) -> Result<SpokePostureFacts, String> {
+    if reply.get("status").and_then(|v| v.as_str()) != Some("ok") {
+        let field = |name: &str| reply.get(name).and_then(|v| v.as_str());
+        return Err(match (field("error_code"), field("message")) {
+            (Some(code), Some(message)) => format!("no answer: {code}: {message}"),
+            (Some(text), None) | (None, Some(text)) => format!("no answer: {text}"),
+            (None, None) => "no answer".to_string(),
+        });
+    }
+    let Some(section) = reply
+        .get("hive")
+        .and_then(|hive| hive.get("syncthing_posture"))
+    else {
+        return Err("no report: a release before stage 3".to_string());
+    };
+    if section.get("error").is_some() {
+        return Err("its posture state is unreadable".to_string());
+    }
+    let fact = |name: &str| section.get(name).and_then(|v| v.as_bool());
+    match (
+        fact("syncthing"),
+        fact("motherbee_static"),
+        fact("motherbee_reachable"),
+    ) {
+        (Some(syncthing), Some(motherbee_static), Some(motherbee_reachable)) => {
+            Ok(SpokePostureFacts {
+                syncthing,
+                motherbee_static,
+                motherbee_reachable,
+            })
+        }
+        _ => Err("incomplete report".to_string()),
+    }
+}
+
+/// What the motherbee must hear from before it switches: every registered spoke, and every device
+/// still linked in a Fluxbee folder that no registry entry records (only discovery may reach it).
+/// Returns (hives to ask, unclaimed linked devices as "name (id)").
+fn motherbee_switch_wait_set(
+    registry: &RegistrySnapshot,
+    config_xml: &str,
+    local_device_id: &str,
+) -> Result<(Vec<String>, Vec<String>), OrchestratorError> {
+    let hives: Vec<String> = registry.hives.keys().cloned().collect();
+    let recorded: BTreeSet<&str> = registry
+        .hives
+        .values()
+        .filter_map(|hive| hive.device_id.as_deref())
+        .collect();
+    let linked: BTreeSet<String> = fluxbee_folder_memberships(config_xml)?
+        .into_values()
+        .flatten()
+        .collect();
+    let names: BTreeMap<String, String> = syncthing_declared_devices(config_xml)?
+        .into_iter()
+        .map(|d| (d.id, d.name))
+        .collect();
+    let unclaimed = linked
+        .iter()
+        .filter(|id| id.as_str() != local_device_id && !recorded.contains(id.as_str()))
+        .map(|id| format!("{} ({id})", names.get(id).map_or("unnamed", String::as_str)))
+        .collect();
+    Ok((hives, unclaimed))
+}
+
+/// The spokes the motherbee still waits for, named with the reason; empty means it can switch.
+fn motherbee_switch_waiting_for(
+    reports: &BTreeMap<String, Result<SpokePostureFacts, String>>,
+    unclaimed: &[String],
+) -> Vec<String> {
+    let mut waiting: Vec<String> = reports
+        .iter()
+        .filter_map(|(hive_id, facts)| match facts {
+            Err(reason) => Some(format!("{hive_id} ({reason})")),
+            Ok(f) if !f.syncthing => None,
+            Ok(f) if !f.motherbee_static => {
+                Some(format!("{hive_id} (motherbee address not static)"))
+            }
+            Ok(f) if !f.motherbee_reachable => {
+                Some(format!("{hive_id} (motherbee Syncthing port not reached)"))
+            }
+            Ok(_) => None,
+        })
+        .collect();
+    waiting.extend(
+        unclaimed
+            .iter()
+            .map(|device| format!("device {device} is linked but no hive records it")),
+    );
+    waiting
+}
+
+/// The spoke's next facts from what it sees now. Facts only ever go from unset to set.
+fn spoke_posture_step(
+    mut posture: SyncthingPostureState,
+    motherbee_static_now: bool,
+    motherbee_reachable_now: bool,
+    now_ms: u64,
+) -> SyncthingPostureState {
+    if motherbee_static_now && posture.motherbee_static_at_ms.is_none() {
+        posture.motherbee_static_at_ms = Some(now_ms);
+    }
+    if motherbee_reachable_now && posture.motherbee_reachable_at_ms.is_none() {
+        posture.motherbee_reachable_at_ms = Some(now_ms);
+    }
+    posture
+}
+
+/// A spoke switches once both facts are recorded.
+fn spoke_may_switch(posture: &SyncthingPostureState) -> bool {
+    posture.motherbee_static_at_ms.is_some() && posture.motherbee_reachable_at_ms.is_some()
+}
+
+/// Whether the spoke's motherbee device (named after the motherbee, not the local one) has exactly
+/// the static address.
+fn spoke_motherbee_static_now(
+    config_xml: &str,
+    local_device_id: &str,
+    address: SyncthingPeerAddress,
+) -> Result<bool, OrchestratorError> {
+    let wanted = address.config_value();
+    Ok(syncthing_declared_devices(config_xml)?
+        .iter()
+        .any(|d| d.id != local_device_id && d.name == PRIMARY_HIVE_ID && d.address == wanted))
+}
+
+/// Spoke side of stage 3, after the address reconcile: record the facts, switch once both hold,
+/// and keep the owned options from then on. Returns whether config.xml changed and what to report.
+fn reconcile_spoke_syncthing_options(
+    config_path: &Path,
+    local_device_id: &str,
+    address: SyncthingPeerAddress,
+) -> Result<(bool, Vec<String>), OrchestratorError> {
+    let before = read_syncthing_posture_state_to_write()?;
+    let mut posture = before.clone();
+    if !spoke_may_switch(&posture) {
+        let (current, _) = read_syncthing_config(config_path, false)?;
+        let static_now = spoke_motherbee_static_now(&current, local_device_id, address)?;
+        let reachable_now = match address {
+            SyncthingPeerAddress::Static(socket) => {
+                std::net::TcpStream::connect_timeout(&socket, Duration::from_secs(3)).is_ok()
+            }
+            SyncthingPeerAddress::AcceptOnly => false,
+        };
+        posture = spoke_posture_step(posture, static_now, reachable_now, now_epoch_ms());
+    }
+    let mut notes = Vec::new();
+    let mut changed = false;
+    if spoke_may_switch(&posture) {
+        let listen = syncthing_owned_listen_address(false);
+        changed = update_syncthing_config(config_path, |current| {
+            let (updated, changed) = apply_syncthing_owned_options_xml(current, &listen)?;
+            if changed && updated != current {
+                mark_syncthing_restart_pending();
+            }
+            Ok((updated, changed))
+        })?;
+        if posture.switched_at_ms.is_none() {
+            posture.switched_at_ms = Some(now_epoch_ms());
+        }
+    } else if posture.motherbee_static_at_ms.is_none() {
+        notes.push(
+            "Syncthing keeps discovery on: the motherbee device has no static address yet"
+                .to_string(),
+        );
+    } else {
+        notes.push(format!(
+            "Syncthing keeps discovery on: {} does not answer yet",
+            address.config_value()
+        ));
+    }
+    if posture != before {
+        write_syncthing_posture_state(&posture)?;
+        if before.switched_at_ms.is_none() && posture.switched_at_ms.is_some() {
+            tracing::info!(
+                "syncthing: switched off public discovery, relays and NAT; listening on loopback"
+            );
+        }
+    } else if changed {
+        tracing::info!("syncthing: owned options restored");
+    }
+    Ok((changed, notes))
+}
+
+/// What one round of the motherbee's switch task found.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum SwitchRound {
+    /// The motherbee has switched (now or before); nothing to report.
+    Switched,
+    /// Nothing looked at this round (a topology operation, sync disabled).
+    Skipped,
+    /// Still waiting; the report names why.
+    Waiting(String),
+}
+
+/// The motherbee side of stage 3, in its own task: about once a minute, until it has switched, it
+/// reads the facts of every registered spoke through GET_VERSIONS, and once all of them report
+/// both (and no unclaimed device is linked) it records the switch. The watchdog's peer reconcile
+/// then writes the owned options and restarts Syncthing: one writer, one restart. An offline spoke
+/// keeps it waiting, and is named. The task keeps running after the switch, so a lost state file
+/// is switched again.
+async fn run_syncthing_options_switch_loop(state: Arc<OrchestratorState>) {
+    let mut ticker = time::interval(Duration::from_secs(60));
+    ticker.set_missed_tick_behavior(time::MissedTickBehavior::Delay);
+    let mut last_report = String::new();
+    loop {
+        ticker.tick().await;
+        let report = match motherbee_options_switch_round(&state).await {
+            Ok(SwitchRound::Skipped) => continue,
+            Ok(SwitchRound::Switched) => String::new(),
+            Ok(SwitchRound::Waiting(report)) => report,
+            Err(err) => format!("Syncthing options switch failed, retrying: {err}"),
+        };
+        if report != last_report {
+            if report.is_empty() {
+                tracing::info!("syncthing options switch: nothing to report");
+            } else {
+                tracing::warn!(report = %report, "syncthing options switch");
+            }
+            last_report = report;
+        }
+    }
+}
+
+async fn motherbee_options_switch_round(
+    state: &OrchestratorState,
+) -> Result<SwitchRound, OrchestratorError> {
+    let mut posture = read_syncthing_posture_state_to_write()?;
+    if posture.switched_at_ms.is_some() {
+        return Ok(SwitchRound::Switched);
+    }
+    let blob = current_blob_runtime_config(state);
+    let dist = current_dist_runtime_config(state);
+    let sync = effective_syncthing_runtime_config(&blob, &dist);
+    let config_path = sync.sync_data_dir.join("config.xml");
+    if !sync.sync_enabled || !config_path.exists() || state.any_hive_topology_busy() {
+        return Ok(SwitchRound::Skipped);
+    }
+    let registry = read_registry_snapshot(&hives_root());
+    if !registry.complete {
+        return Ok(SwitchRound::Waiting(
+            "Syncthing keeps discovery on: the hive registry could not be read".to_string(),
+        ));
+    }
+    let (current, _) = read_syncthing_config(&config_path, false)?;
+    // The switch is one-way: a lost record with the owned options already in place is recorded
+    // again, without waiting on every spoke to answer.
+    if !apply_syncthing_owned_options_xml(&current, &syncthing_owned_listen_address(true))?.1 {
+        posture.switched_at_ms = Some(now_epoch_ms());
+        write_syncthing_posture_state(&posture)?;
+        tracing::info!("syncthing: the owned options are in place; switch recorded again");
+        return Ok(SwitchRound::Switched);
+    }
+    let local_device_id = tokio::task::block_in_place(|| syncthing_rest_my_id(&sync))?;
+    let (hives, unclaimed) = motherbee_switch_wait_set(&registry, &current, &local_device_id)?;
+    let mut reports = BTreeMap::new();
+    for hive_id in hives {
+        let reply = get_versions_flow(state, &serde_json::json!({ "target": hive_id })).await;
+        reports.insert(hive_id, spoke_posture_facts(&reply));
+    }
+    let waiting = motherbee_switch_waiting_for(&reports, &unclaimed);
+    if !waiting.is_empty() {
+        return Ok(SwitchRound::Waiting(format!(
+            "Syncthing keeps discovery on, waiting for: {}",
+            waiting.join(", ")
+        )));
+    }
+    posture.switched_at_ms = Some(now_epoch_ms());
+    write_syncthing_posture_state(&posture)?;
+    tracing::info!(
+        spokes = reports.len(),
+        "syncthing: every spoke reported a static, reachable motherbee; switching off public discovery, relays and NAT"
+    );
+    Ok(SwitchRound::Switched)
+}
+
+/// The motherbee's reconcile write: the peer plan, and the owned options once it has switched
+/// (`switched_listen`), in one write so one restart covers both.
+fn motherbee_reconcile_xml(
+    current: &str,
+    plan: &MotherbeePeerPlan,
+    memberships: &BTreeMap<String, Vec<String>>,
+    switched_listen: Option<&str>,
+) -> Result<(String, bool), OrchestratorError> {
+    let (mut updated, mut changed) = apply_motherbee_peer_plan_xml(current, plan, memberships)?;
+    if let (Some(listen), false) = (switched_listen, plan.busy) {
+        let (next, options_changed) = apply_syncthing_owned_options_xml(&updated, listen)?;
+        updated = next;
+        changed |= options_changed;
+    }
+    Ok((updated, changed))
+}
+
 fn remove_syncthing_folder_device(
     config_xml: &str,
     folder_id: &str,
@@ -6351,7 +10161,7 @@ fn remove_syncthing_folder_device(
     }
     let folder_re = Regex::new(r#"(?s)<folder\b[^>]*\bid="([^"]+)"[^>]*>.*?</folder>"#)?;
     let device_re = Regex::new(&format!(
-        r#"(?s)\n?[ \t]*<device\b[^>]*\bid="{}"[^>]*(?:/>|>.*?</device>)[ \t]*\n?"#,
+        r#"(?s)\n?[ \t]*<device\b[^>/]*\bid="{}"[^>/]*(?:/>|>.*?</device>)[ \t]*\n?"#,
         regex::escape(normalized_id)
     ))?;
     for caps in folder_re.captures_iter(config_xml) {
@@ -6427,10 +10237,17 @@ fn reconcile_syncthing_peer_removal_xml(
     }
 
     if dist.sync_enabled && dist_sync_tool_is_syncthing(dist) {
-        let (next, folder_changed) =
-            remove_syncthing_folder_device(&updated, SYNCTHING_FOLDER_DIST_ID, peer_device_id)?;
-        updated = next;
-        changed |= folder_changed;
+        // Every dist folder PRESENT in the config, not a fixed id: the removed hive's role is
+        // not known here, and after the per-content split a hive may be attached to any of
+        // `fluxbee-dist-core-<role>`, `-vendor`, `-runtimes` (plus the legacy whole-dist folder
+        // on a config that has not been migrated yet). Leaving a stale device on any of them
+        // would keep shipping bytes to a hive that was removed.
+        for folder_id in dist_folder_ids_present_in_config(&updated) {
+            let (next, folder_changed) =
+                remove_syncthing_folder_device(&updated, &folder_id, peer_device_id)?;
+            updated = next;
+            changed |= folder_changed;
+        }
     }
 
     let (next, top_changed) =
@@ -6448,13 +10265,9 @@ fn ensure_local_syncthing_peer_unlink(
     peer_device_id: &str,
 ) -> Result<bool, OrchestratorError> {
     let config_path = sync.sync_data_dir.join("config.xml");
-    let current = fs::read_to_string(&config_path)?;
-    let (updated, changed) =
-        reconcile_syncthing_peer_removal_xml(&current, blob, dist, peer_device_id)?;
-    if changed {
-        fs::write(&config_path, updated)?;
-    }
-    Ok(changed)
+    update_syncthing_config(&config_path, |current| {
+        reconcile_syncthing_peer_removal_xml(current, blob, dist, peer_device_id)
+    })
 }
 
 async fn ensure_syncthing_peer_unlink_runtime(
@@ -6491,11 +10304,31 @@ async fn ensure_syncthing_peer_unlink_runtime(
     Ok(true)
 }
 
+/// Every `fluxbee-dist*` folder id declared in a syncthing config, in document order.
+///
+/// Used where the role is unknown (peer removal) or where the legacy folder may still be
+/// present alongside the new per-content ones.
+fn dist_folder_ids_present_in_config(config_xml: &str) -> Vec<String> {
+    let re = match Regex::new(r#"<folder\b[^>]*\bid="(fluxbee-dist[^"]*)""#) {
+        Ok(re) => re,
+        Err(_) => return Vec::new(),
+    };
+    let mut out = Vec::new();
+    for caps in re.captures_iter(config_xml) {
+        let id = caps[1].to_string();
+        if !out.contains(&id) {
+            out.push(id);
+        }
+    }
+    out
+}
+
 fn reconcile_syncthing_folders_xml(
     config_xml: &str,
     blob: &BlobRuntimeConfig,
     dist: &DistRuntimeConfig,
     is_motherbee: bool,
+    role: HiveRole,
 ) -> Result<(String, Vec<String>), OrchestratorError> {
     let mut updated = config_xml.to_string();
     let mut changed_folders = Vec::new();
@@ -6531,15 +10364,49 @@ fn reconcile_syncthing_folders_xml(
     }
 
     if dist.sync_enabled && dist_sync_tool_is_syncthing(dist) {
-        let (next, changed) = ensure_syncthing_folder_in_config_xml(
-            &updated,
-            SYNCTHING_FOLDER_DIST_ID,
-            &dist.path.display().to_string(),
-            "Fluxbee Dist",
-            dist_syncthing_folder_type(is_motherbee),
-        )?;
-        if changed {
-            changed_folders.push(SYNCTHING_FOLDER_DIST_ID.to_string());
+        // Motherbee declares the serving side for every spoke role it may host; a spoke
+        // declares only its own. Same ids on both ends, different local paths — that is what
+        // lets motherbee serve `dist/core/<role>` onto each spoke's own `dist/core`.
+        for folder in dist_sync_folders_for_hive(dist, role, is_motherbee) {
+            {
+                let (next, changed) = ensure_isolated_syncthing_folder_in_config_xml(
+                    &updated,
+                    &folder.id,
+                    &folder.path.display().to_string(),
+                    folder.label,
+                    dist_syncthing_folder_type(is_motherbee),
+                )?;
+                if changed {
+                    changed_folders.push(folder.id.clone());
+                }
+                updated = next;
+            }
+        }
+        // Policy goes to every role, like vendor, so it is shared with exactly vendor's peers.
+        // Peer links are written only when a hive joins (add_hive / finalize); without this a
+        // folder added by a later release would stay local on the hives that joined before it.
+        for device_id in syncthing_folder_device_ids(&updated, SYNCTHING_FOLDER_DIST_VENDOR_ID)? {
+            if !valid_syncthing_device_id(&device_id) {
+                continue;
+            }
+            let (next, changed) = ensure_syncthing_folder_has_device(
+                &updated,
+                SYNCTHING_FOLDER_DIST_POLICY_ID,
+                &device_id,
+            )?;
+            if changed
+                && !changed_folders
+                    .iter()
+                    .any(|id| id == SYNCTHING_FOLDER_DIST_POLICY_ID)
+            {
+                changed_folders.push(SYNCTHING_FOLDER_DIST_POLICY_ID.to_string());
+            }
+            updated = next;
+        }
+        let (next, legacy_removed) =
+            remove_syncthing_folder_from_config_xml(&updated, SYNCTHING_FOLDER_DIST_LEGACY_ID)?;
+        if legacy_removed {
+            changed_folders.push(SYNCTHING_FOLDER_DIST_LEGACY_ID.to_string());
         }
         updated = next;
     }
@@ -6547,35 +10414,99 @@ fn reconcile_syncthing_folders_xml(
     Ok((updated, changed_folders))
 }
 
+/// The devices a folder lists, in document order (the local device too, when config.xml lists it:
+/// a folder created by Fluxbee starts with no member).
+fn syncthing_folder_device_ids(
+    config_xml: &str,
+    folder_id: &str,
+) -> Result<Vec<String>, OrchestratorError> {
+    let folder_re = Regex::new(r#"(?s)<folder\b[^>]*\bid="([^"]+)"[^>]*>.*?</folder>"#)?;
+    let device_re = Regex::new(r#"<device\b[^>]*\bid="([^"]+)""#)?;
+    for caps in folder_re.captures_iter(config_xml) {
+        if caps.get(1).map(|m| m.as_str()) != Some(folder_id) {
+            continue;
+        }
+        let Some(full) = caps.get(0) else {
+            continue;
+        };
+        let mut out: Vec<String> = Vec::new();
+        for device in device_re.captures_iter(full.as_str()) {
+            let id = device[1].to_string();
+            if !out.contains(&id) {
+                out.push(id);
+            }
+        }
+        return Ok(out);
+    }
+    Ok(Vec::new())
+}
+
 fn reconcile_local_syncthing_folders(
     sync: &BlobRuntimeConfig,
     blob: &BlobRuntimeConfig,
     dist: &DistRuntimeConfig,
     is_motherbee: bool,
+    role: HiveRole,
 ) -> Result<Vec<String>, OrchestratorError> {
     let config_path = sync.sync_data_dir.join("config.xml");
-    let current = fs::read_to_string(&config_path)?;
-    let (updated, changed_folders) =
-        reconcile_syncthing_folders_xml(&current, blob, dist, is_motherbee)?;
-    if !changed_folders.is_empty() {
-        fs::write(&config_path, updated)?;
-    }
+    let mut changed_folders = Vec::new();
+    update_syncthing_config(&config_path, |current| {
+        let (updated, changed) =
+            reconcile_syncthing_folders_xml(current, blob, dist, is_motherbee, role)?;
+        let any = !changed.is_empty();
+        changed_folders = changed;
+        Ok((updated, any))
+    })?;
     Ok(changed_folders)
 }
 
+/// Creates the folder's `.stfolder` marker when it has none (FINDINGS A-51). The folder may belong
+/// to the Syncthing user: a folder that is not a directory is left alone (`ensure_dirs` reports
+/// it), so root never creates the marker where a symlink points; a symlink in the marker's place,
+/// dangling or not, is replaced, because Syncthing follows it and a dangling one stops the folder
+/// for good; the marker is created exclusively.
 fn ensure_syncthing_folder_marker(path: &Path) -> Result<bool, OrchestratorError> {
-    fs::create_dir_all(path)?;
-    let marker = path.join(".stfolder");
-    if marker.exists() {
-        return Ok(false);
+    match fs::symlink_metadata(path) {
+        Ok(meta) if !meta.is_dir() => {
+            tracing::error!(folder = %path.display(), "a Syncthing folder is not a directory (a symlink?); no marker written");
+            return Ok(false);
+        }
+        Ok(_) => {}
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => fs::create_dir_all(path)?,
+        Err(err) => return Err(err.into()),
     }
-    fs::write(&marker, b"fluxbee syncthing marker\n")?;
-    Ok(true)
+    let marker = path.join(".stfolder");
+    if fs::symlink_metadata(&marker).is_ok_and(|meta| meta.file_type().is_symlink()) {
+        fs::remove_file(&marker)?;
+        tracing::warn!(marker = %marker.display(), "replaced a symlink at a Syncthing folder marker");
+    }
+    match fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .custom_flags(nix::libc::O_NOFOLLOW)
+        .open(&marker)
+    {
+        Ok(mut file) => {
+            file.write_all(b"fluxbee syncthing marker\n")?;
+            // The marker belongs to whoever owns its folder, like everything Syncthing serves.
+            let folder = fs::symlink_metadata(path)?;
+            std::os::unix::fs::fchown(
+                &file,
+                Some(std::os::unix::fs::MetadataExt::uid(&folder)),
+                Some(std::os::unix::fs::MetadataExt::gid(&folder)),
+            )?;
+            Ok(true)
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => Ok(false),
+        Err(err) => Err(err.into()),
+    }
 }
 
 fn ensure_syncthing_folder_markers(
     blob: &BlobRuntimeConfig,
     dist: &DistRuntimeConfig,
+    is_motherbee: bool,
+    role: HiveRole,
 ) -> Result<Vec<String>, OrchestratorError> {
     let mut repaired = Vec::new();
 
@@ -6594,22 +10525,49 @@ fn ensure_syncthing_folder_markers(
     }
 
     if dist.sync_enabled && dist_sync_tool_is_syncthing(dist) {
-        if ensure_syncthing_folder_marker(&dist.path)? {
-            repaired.push(SYNCTHING_FOLDER_DIST_ID.to_string());
+        // One marker per dist folder, not one on the `dist/` root: after the per-content split
+        // each folder owns its own subtree, and syncthing needs `.stfolder` inside each of them.
+        for folder in dist_sync_folders_for_hive(dist, role, is_motherbee) {
+            if ensure_syncthing_folder_marker(&folder.path)? {
+                repaired.push(folder.id.clone());
+            }
         }
     }
 
     Ok(repaired)
 }
 
+/// What `ensure_blob_sync_runtime` did to the Syncthing service.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct SyncthingRuntimeOutcome {
+    /// The vendored binary differed from the installed one and was installed.
+    binary_updated: bool,
+    /// The service was restarted.
+    restarted: bool,
+}
+
+/// A running Syncthing keeps the binary and the unit it started with (A-57): it is stale when
+/// either changed under it. A replaced binary also shows on the process itself, so a restart a
+/// failed call never reached is caught by the next one.
+fn syncthing_runs_stale(
+    active: bool,
+    binary_updated: bool,
+    unit_changed: bool,
+    runs_replaced_binary: bool,
+) -> bool {
+    active && (binary_updated || unit_changed || runs_replaced_binary)
+}
+
 async fn ensure_blob_sync_runtime(
     blob: &BlobRuntimeConfig,
     dist: &DistRuntimeConfig,
     is_motherbee: bool,
-) -> Result<(), OrchestratorError> {
+    role: HiveRole,
+    hive_id: &str,
+) -> Result<SyncthingRuntimeOutcome, OrchestratorError> {
     let sync = effective_syncthing_runtime_config(blob, dist);
     if !sync.sync_enabled {
-        return Ok(());
+        return Ok(SyncthingRuntimeOutcome::default());
     }
     if !(blob_sync_tool_is_syncthing(&sync) || dist_sync_tool_is_syncthing(dist)) {
         return Err(format!(
@@ -6619,26 +10577,73 @@ async fn ensure_blob_sync_runtime(
         .into());
     }
 
-    let repaired_markers = ensure_syncthing_folder_markers(blob, dist)?;
+    let repaired_markers = ensure_syncthing_folder_markers(blob, dist, is_motherbee, role)?;
 
-    ensure_syncthing_installed()?;
-    let service_user = resolve_syncthing_service_user(&sync)?;
-    ensure_local_syncthing_vendor_layout(&service_user)?;
-    ensure_syncthing_unit(&sync)?;
-    ensure_syncthing_firewall_local();
-    tracing::info!(
-        service = SYNCTHING_SERVICE_NAME,
-        "starting blob sync service"
+    // Installed before anything is stopped: a vendor that cannot be installed now leaves the
+    // running Syncthing alone, and it is the one that brings the vendor (review F4).
+    let binary_updated = ensure_syncthing_installed()?;
+    // A-58: until 0.1.63 workers and the egress ran Syncthing as root. Moving it to its own user is
+    // one visible step: stop it, hand over the trees it wrote, and start it under the new unit
+    // below. Never while it runs, or it would keep writing root's files (its index, for one). It
+    // is decided from the unit, the home's own files and the running process, so a switch that
+    // stopped halfway runs again.
+    let (uid, _) = linux_user_ids(SYNCTHING_SERVICE_USER)?;
+    let switched_user = syncthing_needs_handover(
+        installed_syncthing_unit_user().as_deref(),
+        &syncthing_home_owners(&sync.sync_data_dir),
+        syncthing_process_uid(),
+        uid,
     );
-    systemd_start(SYNCTHING_SERVICE_NAME)?;
+    if switched_user {
+        tracing::warn!(
+            to = SYNCTHING_SERVICE_USER,
+            "Syncthing moves to its own user (A-58): stopping it and handing its trees over"
+        );
+        if systemd_is_active(SYNCTHING_SERVICE_NAME) {
+            systemd_stop(SYNCTHING_SERVICE_NAME)?;
+        }
+        hand_over_syncthing_trees(blob, dist, is_motherbee)?;
+    }
+    let unit_changed = ensure_syncthing_unit(&sync)?;
+    if switched_user && !unit_changed {
+        // The unit file already named the user but systemd may still hold the old definition.
+        let mut daemon_reload = Command::new("systemctl");
+        daemon_reload.arg("daemon-reload");
+        run_cmd(daemon_reload, "systemctl daemon-reload")?;
+    }
+    ensure_syncthing_firewall_local();
+    // Restart a stale Syncthing now, before the checks below: they already use the new unit's
+    // port and home.
+    let stale = syncthing_runs_stale(
+        systemd_is_active(SYNCTHING_SERVICE_NAME),
+        binary_updated,
+        unit_changed,
+        service_runs_replaced_binary(SYNCTHING_SERVICE_NAME),
+    );
+    if stale {
+        tracing::info!(
+            service = SYNCTHING_SERVICE_NAME,
+            binary_updated,
+            unit_changed,
+            "restarting syncthing onto its installed binary and unit (A-57)"
+        );
+        systemd_restart(SYNCTHING_SERVICE_NAME)?;
+    } else {
+        tracing::info!(
+            service = SYNCTHING_SERVICE_NAME,
+            "starting blob sync service"
+        );
+        systemd_start(SYNCTHING_SERVICE_NAME)?;
+    }
     wait_for_service_active(
         SYNCTHING_SERVICE_NAME,
         Duration::from_secs(SYNCTHING_BOOTSTRAP_TIMEOUT_SECS),
     )
     .await?;
     wait_for_syncthing_health(&sync).await?;
-    let changed_folders = reconcile_local_syncthing_folders(&sync, blob, dist, is_motherbee)?;
-    if !changed_folders.is_empty() || !repaired_markers.is_empty() {
+    let changed_folders = reconcile_local_syncthing_folders(&sync, blob, dist, is_motherbee, role)?;
+    let folders_repaired = !changed_folders.is_empty() || !repaired_markers.is_empty();
+    if folders_repaired {
         tracing::info!(
             service = SYNCTHING_SERVICE_NAME,
             folders = ?changed_folders,
@@ -6660,6 +10665,327 @@ async fn ensure_blob_sync_runtime(
         api_port = sync.sync_api_port,
         "blob sync service healthy"
     );
+    if switched_user {
+        append_drift_alert(
+            "posture",
+            "syncthing_user_switched",
+            "info",
+            hive_id,
+            format!(
+                "Syncthing was not running as {SYNCTHING_SERVICE_USER}: it was stopped, its home, \
+                 blob folders and dist were handed over, and it now runs healthy as \
+                 {SYNCTHING_SERVICE_USER} (A-58)"
+            ),
+            None,
+            None,
+            None,
+        );
+    }
+    Ok(SyncthingRuntimeOutcome {
+        binary_updated,
+        restarted: stale || folders_repaired || switched_user,
+    })
+}
+
+/// The blob folders Syncthing serves on this hive: `active/` with blob sync, `public/` with the
+/// public channel. Both belong to the Syncthing user (FINDINGS A-56).
+fn served_blob_folders(blob: &BlobRuntimeConfig, syncthing_runs: bool) -> Vec<PathBuf> {
+    let mut folders = Vec::new();
+    if !syncthing_runs || !blob_sync_tool_is_syncthing(blob) {
+        return folders;
+    }
+    if blob.enabled && blob.sync_enabled {
+        folders.push(blob_sync_folder_path(blob));
+    }
+    if blob.public_sync_enabled {
+        folders.push(blob_public_sync_folder_path(blob));
+    }
+    folders
+}
+
+/// What root left in the blob folders Syncthing serves, Syncthing can never read: blobs written
+/// before 0.1.63, or by a node still on an older SDK (FINDINGS A-56). At every boot, after the
+/// rebind (no old writer is left then), they go to the Syncthing user, and an alert says how many:
+/// the old postinst's chown -R did the same in silence. `chown -R` walks by descriptor and never
+/// follows a link; it runs only where hard links to another user's files are protected.
+fn hand_over_blob_folder_entries(
+    hive_id: &str,
+    blob: &BlobRuntimeConfig,
+    dist: &DistRuntimeConfig,
+) {
+    let syncthing_runs =
+        blob.sync_enabled || (dist.sync_enabled && dist_sync_tool_is_syncthing(dist));
+    let folders: Vec<PathBuf> = served_blob_folders(blob, syncthing_runs)
+        .into_iter()
+        .filter(|folder| fs::symlink_metadata(folder).is_ok_and(|meta| meta.is_dir()))
+        .collect();
+    if folders.is_empty() {
+        return;
+    }
+    if !hard_links_protected() {
+        append_drift_alert(
+            "posture",
+            "blob_handover_skipped",
+            "warning",
+            hive_id,
+            "fs.protected_hardlinks is not 1: the blob folders were not handed to the Syncthing user"
+                .to_string(),
+            None,
+            None,
+            None,
+        );
+        return;
+    }
+    for folder in folders {
+        let label = folder
+            .file_name()
+            .map(|name| name.to_string_lossy().to_string())
+            .unwrap_or_default();
+        let foreign = match count_entries_not_the_syncthing_users(&folder) {
+            Ok(count) => count,
+            Err(err) => {
+                tracing::warn!(folder = %folder.display(), error = %err, "could not count blob entries; retried at the next start");
+                continue;
+            }
+        };
+        if foreign == 0 {
+            continue;
+        }
+        // Each entry is changed from its own directory (`-execdir`, `chown -h`), never through a
+        // path a link could redirect. Entries that vanish mid-walk are fine; the recount judges.
+        let mut chown = Command::new("find");
+        chown
+            .arg("-P")
+            .arg(&folder)
+            .arg("-ignore_readdir_race")
+            .args(not_the_syncthing_users_predicate())
+            .arg("-execdir")
+            .arg("chown")
+            .arg("-h")
+            .arg(format!("{SYNCTHING_SERVICE_USER}:{SYNCTHING_SERVICE_USER}"))
+            .arg("{}")
+            .arg("+");
+        let _ = chown.status();
+        let left = count_entries_not_the_syncthing_users(&folder).unwrap_or(foreign);
+        let (kind, severity, message) = if left == 0 {
+            (
+                format!("blob_entries_handed_over:{label}"),
+                "warning",
+                format!(
+                    "{foreign} entries under {} were not the Syncthing user's (written by root \
+                     before 0.1.63, or by a node on an older SDK) and Syncthing could not read \
+                     them; handed over",
+                    folder.display()
+                ),
+            )
+        } else {
+            (
+                format!("blob_entries_not_handed_over:{label}"),
+                "critical",
+                format!(
+                    "{left} of {foreign} entries under {} are still not the Syncthing user's \
+                     after the hand-over",
+                    folder.display()
+                ),
+            )
+        };
+        tracing::warn!(folder = %folder.display(), entries = foreign, left, %kind, "blob folder entries were not the Syncthing user's");
+        append_drift_alert(
+            "posture", &kind, severity, hive_id, message, None, None, None,
+        );
+    }
+}
+
+/// Whether the kernel stops a user from hard-linking another user's files
+/// (`fs.protected_hardlinks`): a tree that user wrote can then be re-owned without reaching outside.
+fn hard_links_protected() -> bool {
+    fs::read_to_string("/proc/sys/fs/protected_hardlinks").is_ok_and(|v| v.trim() == "1")
+}
+
+/// `find` tests for an entry another user or group owns.
+fn not_the_syncthing_users_predicate() -> [&'static str; 9] {
+    [
+        "(",
+        "!",
+        "-user",
+        SYNCTHING_SERVICE_USER,
+        "-o",
+        "!",
+        "-group",
+        SYNCTHING_SERVICE_USER,
+        ")",
+    ]
+}
+
+/// The entries under `folder` that are not the Syncthing user's and group's. A walk that meets a
+/// vanished entry does not fail (`-ignore_readdir_race`).
+fn count_entries_not_the_syncthing_users(folder: &Path) -> Result<usize, OrchestratorError> {
+    let mut find = Command::new("find");
+    find.arg("-P")
+        .arg(folder)
+        .arg("-ignore_readdir_race")
+        .args(not_the_syncthing_users_predicate())
+        .args(["-printf", "."]);
+    Ok(
+        run_cmd_output(find, "count blob entries not the Syncthing user's")?
+            .trim()
+            .len(),
+    )
+}
+
+/// Syncthing's own per-file errors in the blob folders, reported once when they appear or their
+/// count changes (FINDINGS A-56): a file it cannot read never makes the folder unhealthy, so the
+/// folder health alone would never show it.
+fn report_blob_folder_errors(hive_id: &str, sync: &BlobRuntimeConfig, blob: &BlobRuntimeConfig) {
+    static REPORTED: OnceLock<std::sync::Mutex<HashMap<String, usize>>> = OnceLock::new();
+    let mut folders = Vec::new();
+    if blob.enabled && blob.sync_enabled && blob_sync_tool_is_syncthing(blob) {
+        folders.push(SYNCTHING_FOLDER_BLOB_ID);
+    }
+    if blob.public_sync_enabled && blob_sync_tool_is_syncthing(blob) {
+        folders.push(SYNCTHING_FOLDER_BLOB_PUBLIC_ID);
+    }
+    for folder in folders {
+        let (count, first) = match syncthing_folder_errors(sync, folder) {
+            Ok(errors) => errors,
+            Err(err) => {
+                tracing::debug!(folder, error = %err, "could not read Syncthing folder errors");
+                continue;
+            }
+        };
+        let before = REPORTED
+            .get_or_init(Default::default)
+            .lock()
+            .map(|mut reported| reported.insert(folder.to_string(), count))
+            .ok()
+            .flatten()
+            .unwrap_or(0);
+        if count > 0 && count != before {
+            tracing::warn!(folder, errors = count, first = ?first, "Syncthing reports file errors");
+            append_drift_alert(
+                "syncthing",
+                &format!("folder_errors:{folder}"),
+                "warning",
+                hive_id,
+                format!(
+                    "Syncthing reports {count} file errors in {folder}{}",
+                    first.map(|f| format!(", e.g. {f}")).unwrap_or_default()
+                ),
+                None,
+                None,
+                None,
+            );
+        } else if count == 0 && before > 0 {
+            tracing::info!(folder, "Syncthing folder errors cleared");
+        }
+    }
+}
+
+/// The number of per-file errors Syncthing reports for a folder (at most 100) and the first one.
+fn syncthing_folder_errors(
+    sync: &BlobRuntimeConfig,
+    folder_id: &str,
+) -> Result<(usize, Option<String>), OrchestratorError> {
+    let api_key = syncthing_api_key(sync)?;
+    let endpoint = format!(
+        "http://127.0.0.1:{}/rest/folder/errors?folder={}&perpage=100",
+        sync.sync_api_port, folder_id
+    );
+    let mut cmd = Command::new("curl");
+    cmd.arg("-fsS")
+        .arg("--max-time")
+        .arg("10")
+        .arg("-H")
+        .arg(format!("X-API-Key: {}", api_key))
+        .arg(&endpoint);
+    let out = run_cmd_output(cmd, &format!("syncthing folder errors folder={folder_id}"))?;
+    let payload: serde_json::Value = serde_json::from_str(&out).map_err(|err| {
+        format!("invalid syncthing folder/errors payload for folder '{folder_id}': {err}")
+    })?;
+    let errors = payload
+        .get("errors")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
+    let first = errors.first().map(|error| {
+        format!(
+            "{}: {}",
+            error.get("path").and_then(|v| v.as_str()).unwrap_or("?"),
+            error.get("error").and_then(|v| v.as_str()).unwrap_or("?")
+        )
+    });
+    Ok((errors.len(), first))
+}
+
+/// The `User=` of the installed Syncthing unit, when there is one.
+fn installed_syncthing_unit_user() -> Option<String> {
+    let unit_path =
+        Path::new("/etc/systemd/system").join(format!("{SYNCTHING_SERVICE_NAME}.service"));
+    syncthing_unit_user(&fs::read_to_string(unit_path).ok()?)
+}
+
+/// Whether Syncthing must move to its own user: the unit names another one, a file of its home
+/// belongs to someone else, or the running process is another user's (A-58).
+fn syncthing_needs_handover(
+    unit_user: Option<&str>,
+    home_owners: &[u32],
+    process_uid: Option<u32>,
+    syncthing_uid: u32,
+) -> bool {
+    unit_user.is_some_and(|user| user != SYNCTHING_SERVICE_USER)
+        || home_owners.iter().any(|owner| *owner != syncthing_uid)
+        || process_uid.is_some_and(|uid| uid != syncthing_uid)
+}
+
+/// The owners of the files Syncthing keeps in its home: its config and its identity.
+fn syncthing_home_owners(home: &Path) -> Vec<u32> {
+    ["config.xml", "cert.pem", "key.pem"]
+        .iter()
+        .filter_map(|name| fs::symlink_metadata(home.join(name)).ok())
+        .map(|meta| std::os::unix::fs::MetadataExt::uid(&meta))
+        .collect()
+}
+
+/// The real uid of the running Syncthing, when it runs. Only once the process is Syncthing itself:
+/// systemd sets MainPID at the fork, and its executor runs as root until it drops to the unit's
+/// user, which is not a Syncthing running as root.
+fn syncthing_process_uid() -> Option<u32> {
+    let props = systemd_unit_show(SYNCTHING_SERVICE_NAME, &["MainPID"]);
+    let pid = parse_systemd_u64(props.get("MainPID")).filter(|pid| *pid > 0)?;
+    if fs::read_to_string(format!("/proc/{pid}/comm")).ok()?.trim() != "syncthing" {
+        return None;
+    }
+    let status = fs::read_to_string(format!("/proc/{pid}/status")).ok()?;
+    status
+        .lines()
+        .find_map(|line| line.strip_prefix("Uid:"))?
+        .split_whitespace()
+        .next()?
+        .parse()
+        .ok()
+}
+
+fn syncthing_unit_user(unit: &str) -> Option<String> {
+    unit.lines()
+        .find_map(|line| line.trim().strip_prefix("User="))
+        .map(|user| user.trim().to_string())
+        .filter(|user| !user.is_empty())
+}
+
+/// The trees a root Syncthing wrote, handed to the Syncthing user before it runs as that user
+/// (A-58): its home, the blob folders it serves, and a spoke's dist.
+fn hand_over_syncthing_trees(
+    blob: &BlobRuntimeConfig,
+    dist: &DistRuntimeConfig,
+    is_motherbee: bool,
+) -> Result<(), OrchestratorError> {
+    ensure_owned_tree(&blob.sync_data_dir, SYNCTHING_SERVICE_USER)?;
+    for folder in served_blob_folders(blob, true) {
+        ensure_owned_tree(&folder, SYNCTHING_SERVICE_USER)?;
+    }
+    if !is_motherbee && dist.sync_enabled && dist_sync_tool_is_syncthing(dist) {
+        ensure_owned_tree(&dist.path, SYNCTHING_SERVICE_USER)?;
+    }
     Ok(())
 }
 
@@ -6694,9 +11020,6 @@ fn disable_blob_sync_runtime_local() -> Result<(), OrchestratorError> {
 }
 
 async fn watchdog_blob_sync(state: &OrchestratorState) -> Result<(), OrchestratorError> {
-    if state.role == HiveRole::Egress {
-        return Ok(());
-    }
     let desired_blob = current_blob_runtime_config(state);
     let desired_dist = current_dist_runtime_config(state);
     let desired_sync = effective_syncthing_runtime_config(&desired_blob, &desired_dist);
@@ -6727,7 +11050,14 @@ async fn watchdog_blob_sync(state: &OrchestratorState) -> Result<(), Orchestrato
 
     if changed {
         tracing::info!("blob/dist sync config changed in hive.yaml; reconciling syncthing runtime");
-        ensure_blob_sync_runtime(&desired_blob, &desired_dist, state.is_motherbee).await?;
+        ensure_blob_sync_runtime(
+            &desired_blob,
+            &desired_dist,
+            state.is_motherbee,
+            state.role,
+            &state.hive_id,
+        )
+        .await?;
         return Ok(());
     }
 
@@ -6739,7 +11069,7 @@ async fn watchdog_blob_sync(state: &OrchestratorState) -> Result<(), Orchestrato
             && desired_blob.sync_enabled
             && blob_sync_tool_is_syncthing(&desired_blob)
         {
-            match syncthing_folder_healthy(&desired_sync, SYNCTHING_FOLDER_BLOB_ID) {
+            match check_syncthing_folder(&desired_sync, SYNCTHING_FOLDER_BLOB_ID) {
                 Ok(true) => {}
                 Ok(false) => {
                     folders_healthy = false;
@@ -6759,7 +11089,7 @@ async fn watchdog_blob_sync(state: &OrchestratorState) -> Result<(), Orchestrato
             }
         }
         if desired_blob.public_sync_enabled && blob_sync_tool_is_syncthing(&desired_blob) {
-            match syncthing_folder_healthy(&desired_sync, SYNCTHING_FOLDER_BLOB_PUBLIC_ID) {
+            match check_syncthing_folder(&desired_sync, SYNCTHING_FOLDER_BLOB_PUBLIC_ID) {
                 Ok(true) => {}
                 Ok(false) => {
                     folders_healthy = false;
@@ -6779,25 +11109,31 @@ async fn watchdog_blob_sync(state: &OrchestratorState) -> Result<(), Orchestrato
             }
         }
         if desired_dist.sync_enabled && dist_sync_tool_is_syncthing(&desired_dist) {
-            match syncthing_folder_healthy(&desired_sync, SYNCTHING_FOLDER_DIST_ID) {
-                Ok(true) => {}
-                Ok(false) => {
-                    folders_healthy = false;
-                    tracing::warn!(
-                        folder = SYNCTHING_FOLDER_DIST_ID,
-                        "syncthing folder unhealthy; scheduling runtime reconcile"
-                    );
-                }
-                Err(err) => {
-                    folders_healthy = false;
-                    tracing::warn!(
-                        folder = SYNCTHING_FOLDER_DIST_ID,
-                        error = %err,
-                        "failed to verify syncthing folder health; scheduling runtime reconcile"
-                    );
+            for folder in dist_sync_folders_for_hive(&desired_dist, state.role, state.is_motherbee)
+            {
+                match check_syncthing_folder(&desired_sync, &folder.id) {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        folders_healthy = false;
+                        tracing::warn!(
+                            folder = %folder.id,
+                            "syncthing folder unhealthy; scheduling runtime reconcile"
+                        );
+                    }
+                    Err(err) => {
+                        folders_healthy = false;
+                        tracing::warn!(
+                            folder = %folder.id,
+                            error = %err,
+                            "failed to verify syncthing folder health; scheduling runtime reconcile"
+                        );
+                    }
                 }
             }
         }
+    }
+    if service_active && api_healthy {
+        report_blob_folder_errors(&state.hive_id, &desired_sync, &desired_blob);
     }
     if service_active && api_healthy && folders_healthy {
         return Ok(());
@@ -6810,7 +11146,14 @@ async fn watchdog_blob_sync(state: &OrchestratorState) -> Result<(), Orchestrato
         folders_healthy = folders_healthy,
         "syncthing unhealthy; restarting"
     );
-    ensure_blob_sync_runtime(&desired_blob, &desired_dist, state.is_motherbee).await?;
+    ensure_blob_sync_runtime(
+        &desired_blob,
+        &desired_dist,
+        state.is_motherbee,
+        state.role,
+        &state.hive_id,
+    )
+    .await?;
     Ok(())
 }
 
@@ -6890,12 +11233,19 @@ fn managed_node_inventory_with_root(
             let mut runtime_version: Option<String> = None;
             let mut identity_ilk_id: Option<String> = None;
             let mut identity_tenant_id: Option<String> = None;
+            let mut launched_by: Option<String> = None;
+            let mut relaunch_on_boot: Option<bool> = None;
             if config_exists {
                 if let Ok(config_payload) = load_node_effective_config(&config_path) {
                     config_valid = true;
                     config_version = Some(config_version_from_value(&config_payload));
                     if let Some(system) = config_payload.get("_system").and_then(|v| v.as_object())
                     {
+                        launched_by = system
+                            .get("launched_by")
+                            .and_then(|v| v.as_str())
+                            .map(str::to_string);
+                        relaunch_on_boot = system.get("relaunch_on_boot").and_then(|v| v.as_bool());
                         runtime_name = system
                             .get("runtime")
                             .and_then(|v| v.as_str())
@@ -6973,7 +11323,9 @@ fn managed_node_inventory_with_root(
                 "identity": {
                     "ilk_id": identity_ilk_id,
                     "tenant_id": identity_tenant_id,
-                }
+                },
+                "launched_by": launched_by,
+                "relaunch_on_boot": relaunch_on_boot,
             }));
         }
     }
@@ -7088,15 +11440,46 @@ fn persisted_managed_node_from_config_value(
     if require_relaunch_on_boot && !relaunch_on_boot {
         return Ok(None);
     }
+    // Absent on nodes spawned before U-10: default to "current". That is the right default
+    // because `fluxbee-firstboot` — which spawns every boot=true node — always asks for
+    // "current", so a config without the field was almost certainly one of those.
+    let requested_runtime_version = system
+        .get("requested_runtime_version")
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("current")
+        .to_string();
 
     Ok(Some(PersistedManagedNode {
         node_name: node_name.to_string(),
         kind: kind.to_string(),
         runtime: runtime.to_string(),
         runtime_version: runtime_version.to_string(),
+        requested_runtime_version,
         config_path,
         relaunch_on_boot,
     }))
+}
+
+/// The managed instances of this hive, those of one tenant only when `tenant_id` is given.
+fn managed_nodes_of_tenant(
+    state: &OrchestratorState,
+    tenant_id: Option<&str>,
+) -> Result<Vec<serde_json::Value>, OrchestratorError> {
+    let nodes = managed_node_inventory(state)?;
+    Ok(match tenant_id {
+        Some(tenant_id) => nodes
+            .into_iter()
+            .filter(|node| {
+                node.get("identity")
+                    .and_then(|identity| identity.get("tenant_id"))
+                    .and_then(|value| value.as_str())
+                    == Some(tenant_id)
+            })
+            .collect(),
+        None => nodes,
+    })
 }
 
 async fn list_nodes_flow(
@@ -7104,6 +11487,32 @@ async fn list_nodes_flow(
     payload: &serde_json::Value,
 ) -> serde_json::Value {
     let target_hive = target_hive_from_payload(payload, &state.hive_id);
+    // `managed`: the managed instances (what was launched here, running or not, with their
+    // runtime, identity and who launched them), of one tenant when `tenant_id` is given
+    // (`list_tenant_nodes`), instead of the nodes the router sees.
+    let managed = payload.get("managed").and_then(|value| value.as_bool()) == Some(true);
+    if target_hive == state.hive_id && managed {
+        let tenant_id = payload
+            .get("tenant_id")
+            .and_then(|value| value.as_str())
+            .map(str::trim)
+            .filter(|value| !value.is_empty());
+        return match managed_nodes_of_tenant(state, tenant_id) {
+            Ok(nodes) => serde_json::json!({
+                "status": "ok",
+                "target": state.hive_id,
+                "hive": state.hive_id,
+                "inventory_source": "managed_instances",
+                "node_count": nodes.len(),
+                "nodes": nodes,
+            }),
+            Err(err) => serde_json::json!({
+                "status": "error",
+                "error_code": "NODE_INVENTORY_READ_FAILED",
+                "message": err.to_string(),
+            }),
+        };
+    }
     if target_hive == state.hive_id {
         let inventory_payload = serde_json::json!({
             "scope": "hive",
@@ -7137,14 +11546,19 @@ async fn list_nodes_flow(
         };
     }
 
+    let mut forwarded_payload = serde_json::json!({ "target": target_hive });
+    if managed {
+        forwarded_payload["managed"] = serde_json::json!(true);
+        if let Some(tenant_id) = payload.get("tenant_id") {
+            forwarded_payload["tenant_id"] = tenant_id.clone();
+        }
+    }
     match forward_system_action_to_hive(
         state,
         &target_hive,
         "LIST_NODES",
         "LIST_NODES_RESPONSE",
-        serde_json::json!({
-            "target": target_hive,
-        }),
+        forwarded_payload,
     )
     .await
     {
@@ -7156,6 +11570,119 @@ async fn list_nodes_flow(
             "target": target_hive,
         }),
     }
+}
+
+/// The nodes charged to one tenant on every hive (Fluxbee Cloud's `list_nodes`, docs/ilk-tenant-
+/// model-v1.md §2.4): this hive's managed instances plus each connected hive's, asked with
+/// LIST_NODES. A hive that does not answer is listed in `unreachable_hives`, never left out
+/// silently.
+async fn list_tenant_nodes_flow(
+    state: &OrchestratorState,
+    payload: &serde_json::Value,
+) -> serde_json::Value {
+    let Some(tenant_id) = payload
+        .get("tenant_id")
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .filter(|value| value.starts_with("tnt:"))
+    else {
+        return serde_json::json!({
+            "status": "error",
+            "error_code": "INVALID_REQUEST",
+            "message": "list_tenant_nodes requires tenant_id (tnt:<uuid>)",
+        });
+    };
+    let mut nodes = match managed_nodes_of_tenant(state, Some(tenant_id)) {
+        Ok(nodes) => nodes,
+        Err(err) => {
+            return serde_json::json!({
+                "status": "error",
+                "error_code": "NODE_INVENTORY_READ_FAILED",
+                "message": err.to_string(),
+            });
+        }
+    };
+    // Every connected hive at once, each bounded: Fluxbee Cloud waits 20 s for the whole answer.
+    const PER_HIVE: Duration = Duration::from_secs(10);
+    let root = hives_root();
+    let mut unreachable = Vec::new();
+    let mut hives: Vec<String> = Vec::new();
+    for hive_id in list_managed_hive_ids() {
+        if hive_id == state.hive_id {
+            continue;
+        }
+        match hive_status(&root, &hive_id) {
+            Some(status) if status == "connected" => hives.push(hive_id),
+            status => unreachable.push(serde_json::json!({
+                "hive_id": hive_id,
+                "error_code": "HIVE_NOT_CONNECTED",
+                "message": format!("its join status is {}", status.as_deref().unwrap_or("unknown")),
+            })),
+        }
+    }
+    let answers = futures::future::join_all(hives.iter().map(|hive_id| {
+        forward_system_action_to_hive_with_timeout(
+            state,
+            hive_id,
+            "LIST_NODES",
+            "LIST_NODES_RESPONSE",
+            serde_json::json!({ "target": hive_id, "managed": true, "tenant_id": tenant_id }),
+            PER_HIVE,
+        )
+    }))
+    .await;
+    for (hive_id, answer) in hives.iter().zip(answers) {
+        let response = answer.unwrap_or_else(|err| {
+            serde_json::json!({
+                "status": "error",
+                "error_code": "NODE_LIST_FAILED",
+                "message": err.to_string(),
+            })
+        });
+        // A hive whose core predates the managed listing answers with what its router sees,
+        // every tenant's nodes: never passed on.
+        if response.get("status").and_then(|value| value.as_str()) == Some("ok")
+            && response
+                .get("inventory_source")
+                .and_then(|value| value.as_str())
+                != Some("managed_instances")
+        {
+            unreachable.push(serde_json::json!({
+                "hive_id": hive_id,
+                "error_code": "HIVE_OUTDATED",
+                "message": "its core predates the managed node listing: update its core",
+            }));
+            continue;
+        }
+        let remote_nodes = (response.get("status").and_then(|value| value.as_str()) == Some("ok"))
+            .then(|| {
+                response
+                    .get("nodes")
+                    .and_then(|value| value.as_array())
+                    .cloned()
+            })
+            .flatten();
+        match remote_nodes {
+            Some(remote_nodes) => nodes.extend(remote_nodes.into_iter().filter(|node| {
+                node.get("identity")
+                    .and_then(|identity| identity.get("tenant_id"))
+                    .and_then(|value| value.as_str())
+                    == Some(tenant_id)
+            })),
+            None => unreachable.push(serde_json::json!({
+                "hive_id": hive_id,
+                "error_code": response.get("error_code").cloned().unwrap_or(serde_json::Value::Null),
+                "message": response.get("message").cloned().unwrap_or(serde_json::Value::Null),
+            })),
+        }
+    }
+    serde_json::json!({
+        "status": "ok",
+        "tenant_id": tenant_id,
+        "count": nodes.len(),
+        "nodes": nodes,
+        "unreachable_hives": unreachable,
+    })
 }
 
 fn remote_router_name(entry: &RemoteHiveEntry) -> String {
@@ -7387,14 +11914,54 @@ fn inventory_flow(state: &OrchestratorState, payload: &serde_json::Value) -> ser
 }
 
 fn local_versions_snapshot(state: &OrchestratorState) -> serde_json::Value {
+    // What can this hive roll back to, newest first. Answering it here means `core_rollback`
+    // needs no discovery action of its own — GET /versions already covers both hops.
+    let rollback_generations: Vec<serde_json::Value> = {
+        let root = core_backup_root_dir();
+        let mut dirs: Vec<PathBuf> = fs::read_dir(&root)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| {
+                p.is_dir()
+                    && p.file_name()
+                        .and_then(|n| n.to_str())
+                        .is_some_and(|n| n.starts_with("update-"))
+            })
+            .collect();
+        dirs.sort();
+        dirs.reverse();
+        dirs.iter()
+            .filter_map(|dir| read_core_backup_generation(dir))
+            .map(|g| {
+                serde_json::json!({
+                    "generation": g.generation,
+                    "created_at_ms": g.created_at_ms,
+                    "replaced_manifest_hash": g.replaced_manifest_hash,
+                    "applied_manifest_hash": g.applied_manifest_hash,
+                    "components": g.components.len(),
+                })
+            })
+            .collect()
+    };
+
     let core = match load_core_manifest() {
         Ok(manifest) => {
             let manifest_hash = local_core_manifest_hash().ok().flatten();
             serde_json::json!({
                 "status": "ok",
                 "schema_version": manifest.schema_version,
+                // The hash of what DIST delivered. After a rollback this deliberately differs
+                // from what is running — see `installed`.
                 "manifest_hash": manifest_hash,
                 "components": manifest.components,
+                // What is actually in /usr/bin, and how it got there. `null` on a hive that has
+                // never been updated by this build.
+                "installed": read_core_installed_record(),
+                // The last core update: `phase` restarting|done, `status` ok|rollback, errors.
+                "last_update": read_core_update_last_record(),
+                "rollback_generations": rollback_generations,
             })
         }
         Err(err) => serde_json::json!({
@@ -7479,9 +12046,15 @@ fn local_versions_snapshot(state: &OrchestratorState) -> serde_json::Value {
 
     serde_json::json!({
         "hive_id": state.hive_id,
+        // Which sections this hive is even supposed to carry depends on its role: only workers
+        // (and motherbee, the source) get the runtimes tree. Without this the comparison reads
+        // a deliberately-absent section as drift.
+        "role": state.role.as_str(),
         "core": core,
         "runtimes": runtimes,
         "vendor": vendor,
+        // Host posture stage 3: the persisted Syncthing facts the motherbee waits on.
+        "syncthing_posture": syncthing_posture_snapshot(state),
     })
 }
 
@@ -7855,49 +12428,6 @@ async fn global_visible_runtime_usage_summary(
     })
 }
 
-fn runtime_dependents_summary(
-    manifest: &RuntimeManifest,
-    runtime: &str,
-) -> Result<Vec<serde_json::Value>, OrchestratorError> {
-    let runtimes = runtime_manifest_entry_map(manifest)?;
-    let mut dependents = Vec::new();
-    for (dependent_runtime, entry) in runtimes {
-        if !matches!(runtime_package_type(&entry), "config_only" | "workflow") {
-            continue;
-        }
-        let Some(runtime_base) = entry
-            .runtime_base
-            .as_deref()
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-        else {
-            continue;
-        };
-        if runtime_base != runtime {
-            continue;
-        }
-        dependents.push(serde_json::json!({
-            "runtime": dependent_runtime,
-            "type": runtime_package_type(&entry),
-            "runtime_base": runtime_base,
-            "current": entry.current,
-            "available": runtime_versions_from_manifest_entry(&entry),
-        }));
-    }
-    dependents.sort_by(|a, b| {
-        let a_runtime = a
-            .get("runtime")
-            .and_then(|value| value.as_str())
-            .unwrap_or("");
-        let b_runtime = b
-            .get("runtime")
-            .and_then(|value| value.as_str())
-            .unwrap_or("");
-        a_runtime.cmp(b_runtime)
-    });
-    Ok(dependents)
-}
-
 async fn get_versions_flow(
     state: &OrchestratorState,
     payload: &serde_json::Value,
@@ -7934,8 +12464,17 @@ async fn get_versions_flow(
 async fn list_versions_flow(state: &OrchestratorState) -> serde_json::Value {
     let mut hives = Vec::new();
     hives.push(local_versions_snapshot(state));
+    let root = hives_root();
     for hive_id in list_managed_hive_ids() {
         if hive_id == state.hive_id {
+            continue;
+        }
+        // Only hives that actually joined. `list_managed_hive_ids` filters on `is_dir` alone, so
+        // a hive whose join failed leaves a directory behind forever — and fanning out to it
+        // yields `unknown`, which pins the FLEET verdict at `unknown` permanently and makes
+        // /versions useless as an instrument. Same `status == "connected"` gate that the
+        // public-edge selection applies.
+        if hive_status(&root, &hive_id).as_deref() != Some("connected") {
             continue;
         }
         let response = get_versions_flow(
@@ -7972,9 +12511,149 @@ async fn list_versions_flow(state: &OrchestratorState) -> serde_json::Value {
             }));
         }
     }
+    let comparison = versions_comparison(&state.hive_id, &hives);
     serde_json::json!({
         "status": "ok",
         "hives": hives,
+        "comparison": comparison,
+    })
+}
+
+/// Compare every hive's snapshot against motherbee's and emit a VERDICT.
+///
+/// U-4a: `/versions` used to aggregate snapshots and leave the diffing to the reader — which
+/// means the one endpoint an operator opens mid-incident answered "here are some numbers"
+/// instead of "these two hives disagree".
+///
+/// A hive whose snapshot could not be fetched is `unknown`, never `differs`: not knowing is not
+/// the same as knowing they are different, and conflating them turns an unreachable spoke into
+/// a phantom drift report.
+/// The sections of a versions snapshot that carry a comparable `manifest_hash`.
+///
+/// These MUST be the literal keys `local_versions_snapshot` emits. They diverged once — the
+/// constant said `"runtime"` while the snapshot emits `"runtimes"` — and `/versions` could then
+/// never report `match` on an in-sync fleet, because the missing section folded to `unknown`.
+/// The unit fixtures hand-wrote the same wrong name, so they stayed green against the bug; they
+/// now build themselves from this constant so the two cannot drift apart again.
+const VERSION_COMPARISON_SECTIONS: [&str; 3] = ["core", "vendor", "runtimes"];
+
+/// Does a hive of this role receive this dist section at all?
+///
+/// `runtimes` is deliberately worker-only (`dist_sync_folders_for_role`): the DMZ contract keeps
+/// the runtime tree away from ingress and egress. Comparing a section a role never receives
+/// yielded `unknown` for those two hives, which pinned the FLEET verdict at `unknown` on a
+/// perfectly healthy four-role deployment — making /versions useless as an instrument.
+fn role_carries_section(role: &str, section: &str) -> bool {
+    match section {
+        "runtimes" => matches!(role, "worker" | "motherbee"),
+        _ => true,
+    }
+}
+
+fn versions_comparison(reference_hive: &str, hives: &[serde_json::Value]) -> serde_json::Value {
+    // X1: for `core`, prefer what is INSTALLED over what dist delivered. After a
+    // `core_rollback` a hive is deliberately off-manifest, and comparing dist hashes would
+    // report `match` for two hives running different binaries — a false "in sync" on the exact
+    // endpoint an operator opens mid-incident.
+    // Returns Err(()) for "installed, but we cannot name what" — which must read as UNKNOWN, not
+    // fall back to the dist hash. Rolling back the FIRST update of a build records
+    // `manifest_hash: null` (there was no prior record to name), and falling back there would
+    // report the dist hash and call a rolled-back hive `match`.
+    let dimension = |snapshot: &serde_json::Value, section: &str| -> Result<Option<String>, ()> {
+        let Some(section_value) = snapshot.get(section) else {
+            return Ok(None);
+        };
+        if section == "core" {
+            if let Some(installed) = section_value.get("installed") {
+                if !installed.is_null() {
+                    return match installed.get("manifest_hash").and_then(|h| h.as_str()) {
+                        Some(h) if !h.trim().is_empty() => {
+                            Ok(Some(h.trim().to_ascii_lowercase()))
+                        }
+                        // Installed something it cannot name: off-manifest, unknown which way.
+                        _ => Err(()),
+                    };
+                }
+            }
+        }
+        Ok(section_value
+            .get("manifest_hash")
+            .and_then(|h| h.as_str())
+            .map(|h| h.trim().to_ascii_lowercase())
+            .filter(|h| !h.is_empty()))
+    };
+
+    let reference = hives
+        .iter()
+        .find(|h| h.get("hive_id").and_then(|v| v.as_str()) == Some(reference_hive));
+    let Some(reference) = reference else {
+        return serde_json::json!({
+            "reference_hive": reference_hive,
+            "verdict": "unknown",
+            "detail": "no snapshot for the reference hive",
+        });
+    };
+
+    let mut entries = Vec::new();
+    let mut any_differs = false;
+    let mut any_unknown = false;
+
+    for snapshot in hives {
+        let hive_id = snapshot
+            .get("hive_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("<unknown>");
+        if hive_id == reference_hive {
+            continue;
+        }
+        let unreachable = snapshot.get("status").and_then(|v| v.as_str()) == Some("error");
+        let mut per_section = serde_json::Map::new();
+        let mut hive_verdict = "match";
+        for section in VERSION_COMPARISON_SECTIONS {
+            let hive_role = snapshot.get("role").and_then(|v| v.as_str());
+            let verdict = if unreachable {
+                "unknown"
+            } else if hive_role.is_some_and(|role| !role_carries_section(role, section)) {
+                // Not drift and not unknown: this role never receives this section.
+                "n/a"
+            } else {
+                match (dimension(reference, section), dimension(snapshot, section)) {
+                    (Ok(Some(a)), Ok(Some(b))) if a == b => "match",
+                    (Ok(Some(_)), Ok(Some(_))) => "differs",
+                    _ => "unknown",
+                }
+            };
+            if verdict == "differs" {
+                hive_verdict = "differs";
+            } else if verdict == "unknown" && hive_verdict == "match" {
+                hive_verdict = "unknown";
+            }
+            // "n/a" deliberately moves nothing.
+            per_section.insert(section.to_string(), serde_json::json!(verdict));
+        }
+        match hive_verdict {
+            "differs" => any_differs = true,
+            "unknown" => any_unknown = true,
+            _ => {}
+        }
+        entries.push(serde_json::json!({
+            "hive_id": hive_id,
+            "verdict": hive_verdict,
+            "sections": per_section,
+        }));
+    }
+
+    let verdict = if any_differs {
+        "differs"
+    } else if any_unknown {
+        "unknown"
+    } else {
+        "match"
+    };
+    serde_json::json!({
+        "reference_hive": reference_hive,
+        "verdict": verdict,
+        "hives": entries,
     })
 }
 
@@ -8425,6 +13104,101 @@ fn get_deployments_flow(
     }
 }
 
+/// How many drift alerts to keep on disk. Rotated, not truncated: the reader walks the file
+/// backwards and takes the newest `limit`, so an unbounded file would grow forever on a hive
+/// that keeps re-detecting the same drift.
+const DRIFT_ALERT_RETAIN_LINES: usize = 2000;
+
+/// Suppress a repeat of the same (hive, category, kind) within this window. The watchdog
+/// re-detects standing drift on every tick; without this the file would fill with one row per
+/// tick and the real history would scroll away.
+const DRIFT_ALERT_DEDUP_WINDOW_MS: u64 = 3_600_000;
+
+/// Serializes check -> rotate -> append. Held across the whole sequence so two detectors racing
+/// on different threads cannot interleave a rotation with an append and lose a row.
+static DRIFT_ALERT_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Record a drift alert. **Never fails, never blocks, never async.**
+///
+/// U-4b: `drift-alerts.jsonl` had a reader and no writer at all, so `GET /drift-alerts` could
+/// only ever answer with the synthesized current-state snapshot. This is the missing half,
+/// mirroring `append_deployment_history` — its sibling in the same directory.
+///
+/// Returning `()` rather than `Result` is deliberate and load-bearing: callers include
+/// `reconcile_egress`, whose `Err` aborts bootstrap and crash-loops the orchestrator. An
+/// observability feature must never take down the thing it observes, so every failure here
+/// becomes a `warn!` and nothing else.
+///
+/// Synchronous for the same reason its sibling is: the detection sites are plain `fn`s, and one
+/// of them runs inside `block_in_place`.
+fn append_drift_alert(
+    category: &str,
+    kind: &str,
+    severity: &str,
+    hive_id: &str,
+    message: String,
+    local_hash: Option<String>,
+    remote_hash_before: Option<String>,
+    remote_hash_after: Option<String>,
+) {
+    let Ok(_guard) = DRIFT_ALERT_LOCK.lock() else {
+        tracing::warn!("drift alert lock poisoned; not recording");
+        return;
+    };
+    let path = drift_alerts_path();
+    let now = now_epoch_ms() as u64;
+
+    // Dedup + rotation in one read: standing drift must not flood the file, and the file must
+    // not grow without bound.
+    let mut kept: Vec<String> = Vec::new();
+    if let Ok(existing) = fs::read_to_string(&path) {
+        for line in existing.lines() {
+            if line.trim().is_empty() {
+                continue;
+            }
+            if let Ok(entry) = serde_json::from_str::<DriftAlertEntry>(line) {
+                if entry.hive_id == hive_id
+                    && entry.category == category
+                    && entry.kind == kind
+                    && now.saturating_sub(entry.detected_at) < DRIFT_ALERT_DEDUP_WINDOW_MS
+                {
+                    // Already reported recently. The log still carries every occurrence.
+                    return;
+                }
+            }
+            kept.push(line.to_string());
+        }
+    }
+
+    let entry = DriftAlertEntry {
+        alert_id: format!("{category}-{kind}-{hive_id}-{now}"),
+        detected_at: now,
+        category: category.to_string(),
+        trigger: "detected".to_string(),
+        hive_id: hive_id.to_string(),
+        severity: severity.to_string(),
+        kind: kind.to_string(),
+        message,
+        local_hash,
+        remote_hash_before,
+        remote_hash_after,
+    };
+    let Ok(line) = serde_json::to_string(&entry) else {
+        tracing::warn!(kind = kind, "could not serialize a drift alert");
+        return;
+    };
+    kept.push(line);
+    if kept.len() > DRIFT_ALERT_RETAIN_LINES {
+        kept.drain(0..kept.len() - DRIFT_ALERT_RETAIN_LINES);
+    }
+
+    let mut body = kept.join("\n");
+    body.push('\n');
+    if let Err(err) = write_file_atomic(&path, body.as_bytes()) {
+        tracing::warn!(error = %err, "could not record a drift alert");
+    }
+}
+
 fn drift_alerts_path() -> PathBuf {
     json_router::paths::storage_root_dir()
         .join("orchestrator")
@@ -8498,78 +13272,6 @@ fn read_drift_alerts(
     Ok(entries)
 }
 
-fn local_drift_alert_history_snapshot_entries(state: &OrchestratorState) -> Vec<DriftAlertEntry> {
-    let mut entries = Vec::new();
-    let local_hive = state.hive_id.clone();
-
-    if let Some(core_path) = local_core_manifest_path() {
-        let detected_at = file_mtime_epoch_ms(&core_path).unwrap_or_else(now_epoch_ms);
-        entries.push(DriftAlertEntry {
-            alert_id: format!("local-drift-core-{}", local_hive),
-            detected_at,
-            category: "core".to_string(),
-            trigger: "local_current_state".to_string(),
-            hive_id: local_hive.clone(),
-            severity: "info".to_string(),
-            kind: "local_current_state".to_string(),
-            message: format!(
-                "Local hive current-state snapshot for {}. No historical drift alert entry was recorded for this category.",
-                local_hive
-            ),
-            local_hash: local_core_manifest_hash().ok().flatten(),
-            remote_hash_before: None,
-            remote_hash_after: None,
-        });
-    }
-
-    if let Some(runtime_path) = local_runtime_manifest_paths()
-        .into_iter()
-        .find(|path| path.exists())
-    {
-        let detected_at = file_mtime_epoch_ms(&runtime_path).unwrap_or_else(now_epoch_ms);
-        entries.push(DriftAlertEntry {
-            alert_id: format!("local-drift-runtime-{}", local_hive),
-            detected_at,
-            category: "runtime".to_string(),
-            trigger: "local_current_state".to_string(),
-            hive_id: local_hive.clone(),
-            severity: "info".to_string(),
-            kind: "local_current_state".to_string(),
-            message: format!(
-                "Local hive current-state snapshot for {}. No historical drift alert entry was recorded for this category.",
-                local_hive
-            ),
-            local_hash: local_runtime_manifest_hash().ok().flatten(),
-            remote_hash_before: None,
-            remote_hash_after: None,
-        });
-    }
-
-    if let Some(vendor_path) =
-        local_vendor_manifest_path().or_else(|| resolve_syncthing_vendor_source_path().ok())
-    {
-        let detected_at = file_mtime_epoch_ms(&vendor_path).unwrap_or_else(now_epoch_ms);
-        entries.push(DriftAlertEntry {
-            alert_id: format!("local-drift-vendor-{}", local_hive),
-            detected_at,
-            category: "vendor".to_string(),
-            trigger: "local_current_state".to_string(),
-            hive_id: local_hive.clone(),
-            severity: "info".to_string(),
-            kind: "local_current_state".to_string(),
-            message: format!(
-                "Local hive current-state snapshot for {}. No historical drift alert entry was recorded for this category.",
-                local_hive
-            ),
-            local_hash: local_syncthing_vendor_hash().ok().flatten(),
-            remote_hash_before: None,
-            remote_hash_after: None,
-        });
-    }
-
-    entries
-}
-
 fn enrich_drift_alert_history_entries(
     state: &OrchestratorState,
     mut entries: Vec<DriftAlertEntry>,
@@ -8579,39 +13281,16 @@ fn enrich_drift_alert_history_entries(
     kind_filter: Option<&str>,
     limit: usize,
 ) -> Vec<serde_json::Value> {
-    let local_hive = state.hive_id.as_str();
-    let should_include_local_snapshot = match hive_filter {
-        Some(hive) => hive == local_hive,
-        None => true,
-    };
-
-    if should_include_local_snapshot {
-        let local_already_present = entries.iter().any(|entry| entry.hive_id == local_hive);
-        if !local_already_present {
-            let synthetic = local_drift_alert_history_snapshot_entries(state)
-                .into_iter()
-                .filter(|entry| {
-                    if let Some(category) = category_filter {
-                        if entry.category != category {
-                            return false;
-                        }
-                    }
-                    if let Some(severity) = severity_filter {
-                        if entry.severity != severity {
-                            return false;
-                        }
-                    }
-                    if let Some(kind) = kind_filter {
-                        if entry.kind != kind {
-                            return false;
-                        }
-                    }
-                    true
-                });
-            entries.extend(synthetic);
-            entries.sort_by_key(|entry| std::cmp::Reverse(entry.detected_at));
-        }
-    }
+    // U-4b: the current-state synthesis is GONE. It was honest about itself — every row said
+    // "No historical drift alert entry was recorded" and carried `synthetic: true` — but it was
+    // gated on `entries` being empty AFTER filtering and truncation, so `severity=info` returned
+    // synthetic rows forever no matter how much real history accrued, and a large fleet could
+    // resurrect them by crowding the local hive out of `limit`. More decisively, the one
+    // consumer that matters is told to key on `entries: []`
+    // (`sy_architect.rs`, `cognitive_prompts.md`), and that branch was unreachable — so the
+    // self-declaration was never read. Now that a writer exists, the endpoint answers `[]`
+    // until something real is detected, which is exactly what that prompt already promises.
+    let _ = (state, hive_filter, category_filter, severity_filter, kind_filter);
 
     if entries.len() > limit {
         entries.truncate(limit);
@@ -8731,13 +13410,268 @@ fn node_kind_from_name(name: &str) -> String {
     }
 }
 
+/// The IO runtimes the core itself runs: shared platform resources, not something a solution asks
+/// for (operator decisions 2026-10-02/03, FINDINGS A-43). io.web is designed but not built yet.
+const CORE_IO_RUNTIMES: &[&str] = &["io.cloud", "io.blob", "io.web"];
+
+/// Whether a node is part of the core, the only thing born in the genesis (root) tenant. The
+/// orchestrator defines it, being who gives out the genesis tenant (operator, 2026-10-14;
+/// docs/ilk-tenant-model-v1.md D10): the SY.* nodes and the RT.* names, which belong to the router
+/// (neither is ever spawned by run_node), and the core IO runtimes. Everything else (AI, WF, any
+/// other IO node, or a core IO name on another runtime) is launched by a tenant.
+fn is_core_node(node_name: &str, runtime: &str) -> bool {
+    let local = node_name
+        .split_once('@')
+        .map(|(local, _)| local)
+        .unwrap_or(node_name)
+        .trim();
+    let runtime = runtime.trim().to_ascii_lowercase();
+    if local.starts_with("SY.") {
+        return true;
+    }
+    if local.starts_with("RT.") {
+        return true;
+    }
+    local.starts_with("IO.") && CORE_IO_RUNTIMES.iter().any(|core| *core == runtime)
+}
+
+/// Some(error reply) when `tenant_id` is the genesis (root) tenant and the node is not core (see
+/// `is_core_node`). Checked wherever a node is launched: run_node, start and restart, and the boot
+/// relaunch.
+fn genesis_refusal(
+    node_name: &str,
+    runtime: &str,
+    tenant_id: Option<&str>,
+) -> Option<serde_json::Value> {
+    let tenant_id = tenant_id?;
+    if !fluxbee_sdk::is_root_tenant(tenant_id) || is_core_node(node_name, runtime) {
+        return None;
+    }
+    Some(serde_json::json!({
+        "status": "error",
+        "error_code": "TENANT_ROOT_NOT_ALLOWED",
+        "message": format!(
+            "'{node_name}' (runtime '{runtime}') cannot run in the genesis (root) tenant: only the core is born there (SY.*, RT.* and the core IO runtimes {}); launch it from a tenant",
+            CORE_IO_RUNTIMES.join(", ")
+        ),
+        "node_name": node_name,
+        "runtime": runtime,
+        "tenant_id": tenant_id,
+    }))
+}
+
+/// What this hive's identity view says about a node's tenant, for the launch gate: a tenant that
+/// is not active cannot use the infrastructure (docs/ilk-tenant-model-v1.md §2.3).
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum TenantGate {
+    /// Active, the genesis tenant (always active), or no tenant to check.
+    Open,
+    /// Pending or suspended.
+    Closed(String),
+    /// Not in this hive's identity SHM (deleted, or not synced yet), or the SHM cannot be read.
+    Unknown(String),
+}
+
+fn tenant_gate(hive_id: &str, tenant_id: Option<&str>) -> TenantGate {
+    let Some(tenant_id) = tenant_id.map(str::trim).filter(|value| !value.is_empty()) else {
+        return TenantGate::Open;
+    };
+    if fluxbee_sdk::is_root_tenant(tenant_id) {
+        return TenantGate::Open;
+    }
+    tenant_gate_from_status(
+        fluxbee_sdk::identity::tenant_status_in_hive_id(hive_id, tenant_id)
+            .map_err(|err| err.to_string()),
+    )
+}
+
+fn tenant_gate_from_status(status: Result<Option<String>, String>) -> TenantGate {
+    match status {
+        Ok(Some(status)) if status == "active" => TenantGate::Open,
+        Ok(Some(status)) => TenantGate::Closed(status),
+        Ok(None) => TenantGate::Unknown(
+            "it is not in this hive's identity view: deleted, or not synced yet".to_string(),
+        ),
+        Err(err) => TenantGate::Unknown(format!("the identity SHM cannot be read: {err}")),
+    }
+}
+
+/// Some(error reply) when a node's tenant is known not to be active: run_node, start and restart
+/// refuse it (TENANT_NOT_ACTIVE). When this hive cannot tell, the launch goes on as before, said in
+/// the log: a deleted tenant is refused by SY.identity when the node registers (TENANT_DELETED),
+/// and SY.vault hands nothing to a tenant it does not know to be active. A node that already runs
+/// is never stopped for it: it gets no secrets while its tenant is not active, and the boot and
+/// periodic relaunches skip it until it is.
+fn tenant_gate_refusal(
+    node_name: &str,
+    tenant_id: Option<&str>,
+    gate: &TenantGate,
+) -> Option<serde_json::Value> {
+    let tenant = tenant_id.unwrap_or_default();
+    match gate {
+        TenantGate::Open => None,
+        TenantGate::Closed(status) => Some(serde_json::json!({
+            "status": "error",
+            "error_code": "TENANT_NOT_ACTIVE",
+            "message": format!(
+                "'{node_name}' is not started: its tenant {tenant} is {status}, and a tenant that is not active cannot use the infrastructure"
+            ),
+            "node_name": node_name,
+            "tenant_id": tenant,
+            "tenant_status": status,
+        })),
+        TenantGate::Unknown(reason) => {
+            tracing::warn!(
+                node_name = node_name,
+                tenant_id = tenant,
+                reason = reason.as_str(),
+                "cannot tell whether the node's tenant is active; launching it as before"
+            );
+            None
+        }
+    }
+}
+
+/// Who launched a node, as SY.admin stamps it on run_node (`cloud` for the Fluxbee Cloud relay,
+/// `archi`, `operator`); `system` when a system node asked the orchestrator itself (docs/ilk-tenant-
+/// model-v1.md §2.4). Kept in the node's `_system.launched_by`.
+fn launched_by_from_payload(payload: &serde_json::Value) -> String {
+    payload
+        .get("launched_by")
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .filter(|value| {
+            !value.is_empty()
+                && value.len() <= 128
+                && value
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-' | '@'))
+        })
+        .unwrap_or("system")
+        .to_string()
+}
+
+/// Whether a node meets what its caller requires of it: being charged to a tenant, and having been
+/// launched by someone. `None` requires nothing.
+fn node_requirements_met(
+    required_tenant: Option<&str>,
+    required_launcher: Option<&str>,
+    tenant: Option<&str>,
+    launched_by: Option<&str>,
+) -> bool {
+    required_tenant.is_none_or(|required| tenant == Some(required))
+        && required_launcher.is_none_or(|required| launched_by == Some(required))
+}
+
+/// SY.admin stamps `require_tenant_id` and `require_launched_by` on the node actions it relays for
+/// Fluxbee Cloud, which acts only on the nodes it launched in its tenant (docs/ilk-tenant-model-v1.md
+/// §2.4). Checked on the hive that holds the node, before anything else: a node that does not meet
+/// them is answered as missing, as another tenant's key is.
+/// `require_tenant_id` and `require_launched_by`, when the caller set them.
+fn node_requirements(payload: &serde_json::Value) -> (Option<&str>, Option<&str>) {
+    let required = |key: &str| {
+        payload
+            .get(key)
+            .and_then(|value| value.as_str())
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+    };
+    (
+        required("require_tenant_id"),
+        required("require_launched_by"),
+    )
+}
+
+fn node_not_found(node_name: &str) -> serde_json::Value {
+    serde_json::json!({
+        "status": "error",
+        "error_code": "NODE_NOT_FOUND",
+        "message": format!("node '{node_name}' not found"),
+        "node_name": node_name,
+    })
+}
+
+/// `node_requirements_refusal` for a node on another hive, checked here before the request is
+/// forwarded: a hive whose core predates the check would act on the node without it. It reads the
+/// node's config from its hive (NODE_CONFIG_GET, which every core answers); a node it cannot read
+/// is answered as missing.
+async fn remote_node_requirements_refusal(
+    state: &OrchestratorState,
+    target_hive: &str,
+    node_name: &str,
+    payload: &serde_json::Value,
+) -> Option<serde_json::Value> {
+    let (required_tenant, required_launcher) = node_requirements(payload);
+    if required_tenant.is_none() && required_launcher.is_none() {
+        return None;
+    }
+    let response = get_node_config_flow(
+        state,
+        &serde_json::json!({ "target": target_hive, "node_name": node_name }),
+    )
+    .await;
+    let config = (response.get("status").and_then(|value| value.as_str()) == Some("ok"))
+        .then(|| response.get("config").cloned())
+        .flatten();
+    let tenant = config.as_ref().and_then(config_tenant_id);
+    let launched_by = config
+        .as_ref()
+        .and_then(|config| config.get("_system"))
+        .and_then(|system| system.get("launched_by"))
+        .and_then(|value| value.as_str());
+    if node_requirements_met(
+        required_tenant,
+        required_launcher,
+        tenant.as_deref(),
+        launched_by,
+    ) {
+        None
+    } else {
+        Some(node_not_found(node_name))
+    }
+}
+
+fn node_requirements_refusal(
+    state: &OrchestratorState,
+    node_name: &str,
+    payload: &serde_json::Value,
+) -> Option<serde_json::Value> {
+    let (required_tenant, required_launcher) = node_requirements(payload);
+    if required_tenant.is_none() && required_launcher.is_none() {
+        return None;
+    }
+    let config = node_effective_config_path(state, node_name)
+        .ok()
+        .filter(|path| path.is_file())
+        .and_then(|path| load_node_effective_config(&path).ok());
+    let (_, persisted_tenant) = load_persisted_node_identity(state, node_name);
+    let tenant = persisted_tenant.or_else(|| config.as_ref().and_then(config_tenant_id));
+    let launched_by = config
+        .as_ref()
+        .and_then(|config| config.get("_system"))
+        .and_then(|system| system.get("launched_by"))
+        .and_then(|value| value.as_str())
+        .map(str::to_string);
+    if node_requirements_met(
+        required_tenant,
+        required_launcher,
+        tenant.as_deref(),
+        launched_by.as_deref(),
+    ) {
+        return None;
+    }
+    Some(node_not_found(node_name))
+}
+
+/// `RT.` is the router's own (operator, 2026-10-16, D12 of docs/router-stream-v1.md): the router
+/// itself and its streams (`RT.<router>.stream@<hive>`). No managed node takes such a name; the
+/// router also refuses a HELLO with one from any other process.
 fn managed_spawn_disallowed_reason(node_name: &str) -> Option<&'static str> {
-    let local = node_name.split('@').next().unwrap_or(node_name).trim();
     let kind = node_kind_from_name(node_name);
     match kind.as_str() {
         "SY" => Some("managed spawn does not support SY.* nodes"),
-        "RT" if local.eq_ignore_ascii_case("RT.gateway") => {
-            Some("managed spawn does not support RT.gateway; it is core hive infrastructure")
+        "RT" => {
+            Some("managed spawn does not support RT.* nodes; the RT. prefix is the router's own")
         }
         _ => None,
     }
@@ -8759,25 +13693,6 @@ fn node_l2_and_hive(name: &str, default_hive: &str) -> (String, String) {
     (l2, default_hive.to_string())
 }
 
-fn node_entry_to_json(entry: &NodeEntry, local_hive: &str) -> Option<serde_json::Value> {
-    if entry.name_len == 0 {
-        return None;
-    }
-    let name = node_name(entry);
-    let (node_name_l2, hive) = node_l2_and_hive(&name, local_hive);
-    let uuid = Uuid::from_slice(&entry.uuid).ok()?;
-    Some(serde_json::json!({
-        "uuid": uuid.to_string(),
-        "name": name,
-        "node_name": node_name_l2,
-        "hive": hive,
-        "kind": node_kind_from_name(&name),
-        "vpn_id": entry.vpn_id,
-        "connected_at": entry.connected_at,
-        "status": "active",
-    }))
-}
-
 /// Decodes a fixed-capacity SHM name buffer to a String, clamping the recorded
 /// length to the buffer size. name_len is a u16, so a torn/corrupt/buggy SHM
 /// writer can report a length past the buffer; without the clamp the slice
@@ -8790,113 +13705,6 @@ fn shm_name_to_string(name: &[u8], name_len: u16) -> String {
 
 fn node_name(entry: &NodeEntry) -> String {
     shm_name_to_string(&entry.name, entry.name_len)
-}
-
-fn remote_nodes_for_hive(snapshot: &LsaSnapshot, target_hive: &str) -> Vec<serde_json::Value> {
-    let now = now_epoch_ms();
-    let mut out = Vec::new();
-    for node in &snapshot.nodes {
-        let hive_idx = node.hive_index as usize;
-        let Some(hive_entry) = snapshot.hives.get(hive_idx) else {
-            continue;
-        };
-        let Some(hive_id) = remote_hive_name(hive_entry) else {
-            continue;
-        };
-        if hive_id != target_hive {
-            continue;
-        }
-        if remote_hive_is_stale(hive_entry, now) {
-            continue;
-        }
-        if node.flags & (FLAG_DELETED | FLAG_STALE) != 0 {
-            continue;
-        }
-        let Some(node_json) =
-            remote_node_to_json(node, hive_entry.last_updated, node.flags, target_hive)
-        else {
-            continue;
-        };
-        out.push(node_json);
-    }
-    out
-}
-
-fn remote_node_to_json(
-    entry: &RemoteNodeEntry,
-    connected_at: u64,
-    flags: u16,
-    remote_hive: &str,
-) -> Option<serde_json::Value> {
-    if entry.name_len == 0 {
-        return None;
-    }
-    let name = shm_name_to_string(&entry.name, entry.name_len);
-    let (node_name_l2, hive) = node_l2_and_hive(&name, remote_hive);
-    let uuid = Uuid::from_slice(&entry.uuid).ok()?;
-    Some(serde_json::json!({
-        "uuid": uuid.to_string(),
-        "name": name,
-        "node_name": node_name_l2,
-        "hive": hive,
-        "kind": node_kind_from_name(&name),
-        "vpn_id": entry.vpn_id,
-        "connected_at": connected_at,
-        "status": remote_flags_status(flags),
-    }))
-}
-
-async fn send_config_response(
-    sender: &NodeSender,
-    request: &Message,
-    subsystem: &str,
-    version: u64,
-    status: &str,
-    error_code: Option<String>,
-    error_detail: Option<String>,
-    hive: &str,
-) -> Result<(), OrchestratorError> {
-    let action_class = classify_system_message("CONFIG_SET");
-    let (action_result, result_origin) =
-        derive_action_outcome(action_class, Some(status), error_code.as_deref());
-    let mut payload = serde_json::json!({
-        "subsystem": subsystem,
-        "version": version,
-        "status": status,
-        "hive": hive,
-    });
-    if let Some(code) = error_code {
-        payload["error_code"] = serde_json::Value::String(code);
-    }
-    if let Some(detail) = error_detail {
-        payload["error_detail"] = serde_json::Value::String(detail);
-    }
-    let reply = Message {
-        routing: Routing {
-            src: sender.uuid().to_string(),
-            src_l2_name: None,
-            dst: Destination::Unicast(request.routing.src.clone()),
-            ttl: 16,
-            trace_id: request.routing.trace_id.clone(),
-        },
-        meta: Meta {
-            msg_type: SYSTEM_KIND.to_string(),
-            msg: Some("CONFIG_RESPONSE".to_string()),
-            src_ilk: None,
-            scope: None,
-            target: None,
-            action: Some("CONFIG_SET".to_string()),
-            action_class,
-            action_result,
-            result_origin: result_origin.map(str::to_string),
-            priority: None,
-            context: None,
-            ..Meta::default()
-        },
-        payload,
-    };
-    sender.send(reply).await?;
-    Ok(())
 }
 
 fn list_hives(state: &OrchestratorState) -> Result<Vec<serde_json::Value>, OrchestratorError> {
@@ -8949,7 +13757,7 @@ fn get_hive(_state_dir: &Path, hive_id: &str) -> Result<serde_json::Value, Orche
 }
 
 fn remove_hive_cleanup_script() -> &'static str {
-    "for s in rt-gateway sy-config-routes sy-opa-rules sy-identity sy-vault sy-cognition sy-policy sy-timer sy-wf-rules sy-orchestrator sy-admin sy-architect sy-storage sy-frontdesk-gov fluxbee-syncthing; do \
+    "for s in rt-gateway sy-config-routes sy-opa-rules sy-identity sy-vault sy-cognition sy-timer sy-wf-rules sy-orchestrator sy-admin sy-architect sy-storage sy-frontdesk-gov fluxbee-syncthing; do \
 systemctl stop --no-block \"$s\" >/dev/null 2>&1 || true; \
 systemctl disable \"$s\" >/dev/null 2>&1 || true; \
 systemctl kill -s KILL \"$s\" >/dev/null 2>&1 || true; \
@@ -9048,7 +13856,19 @@ async fn remove_hive_flow(state: &OrchestratorState, hive_id: &str) -> serde_jso
     }
     // F18: per-hive topology lock — serialize against a concurrent add_hive or a
     // second remove_hive on the same hive_id (closes the exists/remove TOCTOU).
-    let _topology_guard = state.lock_hive_topology(hive_id).await;
+    //
+    // TRY-lock: this runs on the serial admin worker, and a background join now holds this lock
+    // for minutes. Awaiting it would freeze the hive's whole control plane behind a join — the
+    // blockage PB-7 removed, sneaking back in through remove_hive.
+    let Some(_topology_guard) = state.try_lock_hive_topology(hive_id) else {
+        return serde_json::json!({
+            "status": "error",
+            "error_code": "JOIN_IN_PROGRESS",
+            "retryable": true,
+            "hive_id": hive_id,
+            "message": "a join or another topology operation for this hive is running; retry once it finishes",
+        });
+    };
     let root = hives_root();
     let dir = root.join(hive_id);
     if !dir.exists() {
@@ -9265,7 +14085,12 @@ fn write_hive_info(
 ) -> Result<(), OrchestratorError> {
     let path = root.join(hive_id).join("info.yaml");
     let yaml = serde_yaml::to_string(info)?;
-    fs::write(path, yaml)?;
+    // ATOMIC (tmp sibling + rename), not a bare `fs::write`. A background join rewrites this
+    // file several times to publish its phase, and a torn write is a dead end: `hive_exists`
+    // only checks that the file is there, `hive_status` returns None on a parse error, and the
+    // add_hive entry guard treats None as non-resumable — i.e. a permanent HIVE_EXISTS on a
+    // hive that never finished joining.
+    write_file_atomic(&path, yaml.as_bytes())?;
     Ok(())
 }
 
@@ -9674,24 +14499,12 @@ fn verify_runtime_artifacts_for_scope(
     Ok(errors)
 }
 
+#[cfg(test)]
 fn verify_runtime_current_artifacts_with_root(
     manifest: &RuntimeManifest,
     runtimes_root: &Path,
 ) -> Result<Vec<String>, OrchestratorError> {
     verify_runtime_artifacts_for_scope(manifest, runtimes_root, None, None)
-}
-
-fn apply_runtime_retention_with_roots(
-    manifest: &RuntimeManifest,
-    runtimes_root: &Path,
-    nodes_root: &Path,
-) -> Result<RuntimeRetentionStats, OrchestratorError> {
-    apply_runtime_retention_with_roots_and_protection(
-        manifest,
-        runtimes_root,
-        nodes_root,
-        &HashMap::new(),
-    )
 }
 
 fn apply_runtime_retention_with_roots_and_protection(
@@ -9780,12 +14593,6 @@ fn apply_runtime_retention_with_roots_and_protection(
     Ok(stats)
 }
 
-fn apply_runtime_retention(
-    manifest: &RuntimeManifest,
-) -> Result<RuntimeRetentionStats, OrchestratorError> {
-    apply_runtime_retention_with_roots(manifest, &runtimes_root(), &node_files_root())
-}
-
 fn runtimes_root() -> PathBuf {
     PathBuf::from(DIST_RUNTIME_ROOT_DIR)
 }
@@ -9821,11 +14628,12 @@ fn orchestrator_runtime_dir() -> PathBuf {
     json_router::paths::storage_root_dir().join("orchestrator")
 }
 
+#[cfg(test)]
 fn parse_runtime_manifest_file(
     path: &Path,
     data: &str,
 ) -> Result<RuntimeManifest, OrchestratorError> {
-    parse_runtime_manifest_file_shared(path, data).map_err(Into::into)
+    json_router::runtime_manifest::parse_runtime_manifest_file(path, data).map_err(Into::into)
 }
 
 fn load_runtime_manifest_result() -> Result<Option<RuntimeManifest>, OrchestratorError> {
@@ -9865,20 +14673,6 @@ fn local_runtime_manifest_ready_for_spawn() -> bool {
         .is_some_and(runtime_manifest_has_current_versions)
 }
 
-async fn wait_for_local_runtime_manifest_ready(timeout: Duration) -> bool {
-    if local_runtime_manifest_ready_for_spawn() {
-        return true;
-    }
-    let start = Instant::now();
-    while start.elapsed() < timeout {
-        time::sleep(Duration::from_millis(1000)).await;
-        if local_runtime_manifest_ready_for_spawn() {
-            return true;
-        }
-    }
-    false
-}
-
 async fn should_verify_runtimes(state: &OrchestratorState) -> bool {
     let mut guard = state.last_runtime_verify.lock().await;
     if guard.elapsed() < Duration::from_secs(RUNTIME_VERIFY_INTERVAL_SECS) {
@@ -9916,10 +14710,31 @@ fn run_blob_gc_housekeeping(
         name_max_chars: BLOB_NAME_MAX_CHARS,
         max_blob_bytes: None,
     })?;
+    // FIX-10: pin active blobs still referenced by io.blob's publication ledger so the mtime-based GC
+    // never reaps a source a live publication needs for verify/repair. The ledger lives OUTSIDE
+    // blob_root, so resolve it EXACTLY as io.blob does (IO_BLOB_LEDGER_PATH env, else the absolute
+    // DEFAULT_IO_BLOB_LEDGER_PATH) rather than deriving from blob.path — a custom blob_root must not
+    // silently point the pin lookup at a nonexistent ledger and let the GC reap live sources. A
+    // missing ledger still degrades to legacy mtime-only GC, but is now logged so it is observable.
+    const DEFAULT_IO_BLOB_LEDGER_PATH: &str = "/var/lib/fluxbee/state/io-blob/publications.json";
+    let ledger_path = std::env::var("IO_BLOB_LEDGER_PATH")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(DEFAULT_IO_BLOB_LEDGER_PATH));
+    if !ledger_path.exists() {
+        tracing::warn!(
+            ledger_path = %ledger_path.display(),
+            "io.blob publication ledger not found; blob GC runs without publication pins (set \
+             IO_BLOB_LEDGER_PATH on sy-orchestrator to match io.blob if it is relocated)"
+        );
+    }
+    let pinned_blob_names = fluxbee_sdk::blob::published_blob_names(&ledger_path);
     let report = toolkit.run_gc(BlobGcOptions {
         staging_ttl_hours: blob.gc_staging_ttl_hours,
         active_retain_days: blob.gc_active_retain_days,
         apply: blob.gc_apply,
+        pinned_blob_names,
     })?;
 
     if report.staging.candidate_files > 0 || report.active.candidate_files > 0 {
@@ -10144,33 +14959,6 @@ fn normalize_node_name_for_target(
     Ok(format!("{raw}@{target_hive}"))
 }
 
-fn validate_existing_node_name_literal(raw_node_name: &str) -> Result<String, OrchestratorError> {
-    let raw = raw_node_name.trim();
-    if raw.is_empty() {
-        return Err("missing node_name".into());
-    }
-
-    if let Some((local, hive)) = raw.rsplit_once('@') {
-        let local = local.trim();
-        let hive = hive.trim();
-        if local.is_empty() || hive.is_empty() {
-            return Err("invalid node_name".into());
-        }
-        if !valid_node_local_name(local) {
-            return Err("invalid node_name".into());
-        }
-        if !valid_hive_id(hive) {
-            return Err("invalid node_name hive".into());
-        }
-        return Ok(format!("{local}@{hive}"));
-    }
-
-    if !valid_node_local_name(raw) {
-        return Err("invalid node_name".into());
-    }
-    Ok(raw.to_string())
-}
-
 fn node_runtime_from_name(node_name: &str) -> Option<String> {
     let local = node_name.split('@').next().unwrap_or(node_name);
     let mut parts = local.split('.');
@@ -10378,17 +15166,6 @@ fn load_runtime_config_template_with_root(
     Ok(Some(object.clone()))
 }
 
-fn load_runtime_config_template(
-    runtime: &str,
-    runtime_version: &str,
-) -> Result<Option<serde_json::Map<String, serde_json::Value>>, OrchestratorError> {
-    load_runtime_config_template_with_root(
-        runtime,
-        runtime_version,
-        Path::new(DIST_RUNTIME_ROOT_DIR),
-    )
-}
-
 fn node_state_path(
     _state: &OrchestratorState,
     node_name: &str,
@@ -10443,11 +15220,102 @@ fn config_version_from_value(value: &serde_json::Value) -> u64 {
         .unwrap_or(1)
 }
 
+/// `requested_runtime_version` is the caller's words, `runtime_version` is what they resolved
+/// to. Persisting only the latter is what made a `.deb` upgrade orphan every node: the caller
+/// asked to follow `current`, the answer was frozen into the unit path, and when the upgrade
+/// replaced the runtime directory the path dangled (U-10).
+/// Rewrite `_system.runtime_version` in a node's persisted config, leaving everything else —
+/// including `requested_runtime_version`, the intent — untouched.
+///
+/// Used when a `current`-following node is rebound after the manifest pointer moved, so the
+/// config on disk reflects what is actually running.
+fn persist_node_runtime_version(
+    config_path: &Path,
+    version: &str,
+) -> Result<(), OrchestratorError> {
+    let raw = fs::read_to_string(config_path)?;
+    let mut config: serde_json::Value = serde_json::from_str(&raw)?;
+    let Some(system) = config
+        .get_mut("_system")
+        .and_then(|value| value.as_object_mut())
+    else {
+        return Err(format!("node config '{}' has no _system block", config_path.display()).into());
+    };
+    system.insert(
+        "runtime_version".to_string(),
+        serde_json::Value::String(version.to_string()),
+    );
+    system.insert(
+        "updated_at_ms".to_string(),
+        serde_json::Value::from(now_epoch_ms()),
+    );
+    write_json_atomic(config_path, &config)?;
+    Ok(())
+}
+
+/// Whether the boot and periodic relaunches bring a node back (`_system.relaunch_on_boot`). A stop
+/// clears it, so a stopped node stays stopped; a start or a restart sets it again. A node that dies
+/// on its own keeps it, and is relaunched (docs/ilk-tenant-model-v1.md §2.4).
+fn persist_node_relaunch_on_boot(
+    config_path: &Path,
+    relaunch: bool,
+) -> Result<(), OrchestratorError> {
+    let raw = fs::read_to_string(config_path)?;
+    let mut config: serde_json::Value = serde_json::from_str(&raw)?;
+    let Some(system) = config
+        .get_mut("_system")
+        .and_then(|value| value.as_object_mut())
+    else {
+        return Err(format!(
+            "node config '{}' has no _system block",
+            config_path.display()
+        )
+        .into());
+    };
+    if system
+        .get("relaunch_on_boot")
+        .and_then(|value| value.as_bool())
+        == Some(relaunch)
+    {
+        return Ok(());
+    }
+    system.insert(
+        "relaunch_on_boot".to_string(),
+        serde_json::Value::Bool(relaunch),
+    );
+    system.insert(
+        "updated_at_ms".to_string(),
+        serde_json::Value::from(now_epoch_ms()),
+    );
+    write_json_atomic(config_path, &config)?;
+    Ok(())
+}
+
+/// `persist_node_relaunch_on_boot` for a node of this hive, by name. Logged, never fatal: the stop
+/// or start already happened.
+fn set_node_relaunch_on_boot(state: &OrchestratorState, node_name: &str, relaunch: bool) -> bool {
+    let result = node_effective_config_path(state, node_name)
+        .and_then(|path| persist_node_relaunch_on_boot(&path, relaunch));
+    match result {
+        Ok(()) => true,
+        Err(err) => {
+            tracing::warn!(
+                node_name = node_name,
+                relaunch_on_boot = relaunch,
+                error = %err,
+                "could not record whether the relaunches bring this node back"
+            );
+            false
+        }
+    }
+}
+
 fn build_node_system_block(
     node_name: &str,
     hive_id: &str,
     runtime: Option<&str>,
     runtime_version: Option<&str>,
+    requested_runtime_version: Option<&str>,
     runtime_base: Option<&str>,
     package_path: Option<&str>,
     ilk_id: Option<&str>,
@@ -10469,6 +15337,13 @@ fn build_node_system_block(
     if let Some(runtime_version) = runtime_version.filter(|v| !v.trim().is_empty()) {
         out["runtime_version"] = serde_json::Value::String(runtime_version.to_string());
     }
+    // Default to "current": a caller who named no version wanted whatever is current, and every
+    // node `fluxbee-firstboot` spawns asks for exactly that.
+    let requested = requested_runtime_version
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .unwrap_or("current");
+    out["requested_runtime_version"] = serde_json::Value::String(requested.to_string());
     if let Some(runtime_base) = runtime_base.filter(|v| !v.trim().is_empty()) {
         out["runtime_base"] = serde_json::Value::String(runtime_base.to_string());
     }
@@ -10532,17 +15407,26 @@ fn ensure_node_effective_config_on_spawn_with_roots(
     let request_patch = parse_config_patch(payload, "config")?;
     let resolved_tenant_id = resolve_tenant_id_for_node(payload);
     let mut config = assemble_spawn_config_map(template, request_patch, resolved_tenant_id, None);
+    // The caller's own words, before resolution.
+    let requested_runtime_version = payload
+        .get("runtime_version")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|v| !v.is_empty());
     let system_block = build_node_system_block(
         node_name,
         target_hive,
         Some(runtime),
         Some(runtime_version),
+        requested_runtime_version,
         runtime_base,
         package_path,
         ilk_id,
         config.get("tenant_id").and_then(|v| v.as_str()),
         1,
     );
+    let mut system_block = system_block;
+    system_block["launched_by"] = serde_json::Value::String(launched_by_from_payload(payload));
     config.insert("_system".to_string(), system_block);
     write_json_atomic(&path, &serde_json::Value::Object(config))?;
 
@@ -10573,46 +15457,6 @@ fn assemble_spawn_config_map(
         config.insert("_system".to_string(), system);
     }
     config
-}
-
-async fn send_node_config_changed_signal(
-    sender: &NodeSender,
-    node_name: &str,
-    config_version: u64,
-    patch: serde_json::Value,
-) -> Result<(), OrchestratorError> {
-    let msg = Message {
-        routing: Routing {
-            src: sender.uuid().to_string(),
-            src_l2_name: None,
-            dst: Destination::Unicast(node_name.to_string()),
-            ttl: 16,
-            trace_id: Uuid::new_v4().to_string(),
-        },
-        meta: Meta {
-            msg_type: SYSTEM_KIND.to_string(),
-            msg: Some(MSG_CONFIG_CHANGED.to_string()),
-            src_ilk: None,
-            scope: Some(SCOPE_GLOBAL.to_string()),
-            target: Some(node_name.to_string()),
-            action: None,
-            priority: None,
-            context: None,
-            ..Meta::default()
-        },
-        payload: serde_json::to_value(ConfigChangedPayload {
-            subsystem: "node_config".to_string(),
-            action: Some("set".to_string()),
-            auto_apply: Some(true),
-            version: config_version,
-            config: serde_json::json!({
-                "node_name": node_name,
-                "patch": patch,
-            }),
-        })?,
-    };
-    sender.send(msg).await?;
-    Ok(())
 }
 
 fn unit_from_node_name(node_name: &str) -> String {
@@ -11159,6 +16003,14 @@ fn runtime_spawn_preflight_with_manifest_and_root(
             Some(&entrypoint.script_version),
         );
 
+        let package_version = match requested_version.trim() {
+            "" | "current" => requested_entry
+                .current
+                .as_deref()
+                .unwrap_or(requested_version),
+            version => version,
+        };
+        let package_materialization = requested_materialization.clone();
         runtime_base_start_script_preflight(
             requested_runtime,
             requested_version,
@@ -11185,7 +16037,16 @@ fn runtime_spawn_preflight_with_manifest_and_root(
                 obj.insert("global_runtime_health".to_string(), global_runtime_health);
             }
             payload
-        })
+        })?;
+        runtime_package_files_preflight(
+            runtimes_root,
+            requested_runtime,
+            package_version,
+            runtime_package_type(requested_entry),
+            target_hive,
+            node_name,
+            package_materialization,
+        )
     } else {
         runtime_start_script_preflight(
             &entrypoint.script_runtime,
@@ -11209,6 +16070,81 @@ fn runtime_spawn_preflight_with_manifest_and_root(
             payload
         })
     }
+}
+
+/// A package published on the motherbee reaches this hive through Syncthing, and the runtimes
+/// manifest can land before the package's own files (lab 2026-09-30: a WF node crash-looped on a
+/// missing flow/definition.json). Until they are here, refuse as RUNTIME_NOT_PRESENT — callers
+/// retry (SY.wf-rules waits for the sync) — instead of starting a node on a package that is not.
+/// A package is here with its package.json; a workflow package also with its flow/definition.json,
+/// since 0.1.70: the WF node no longer exits on a missing definition but waits in FAILED_CONFIG,
+/// so nothing would retry it (A-68). Checked on run_node, on every start and restart, and before
+/// set_node_config binds the version.
+fn runtime_package_files_preflight(
+    runtimes_root: &Path,
+    runtime: &str,
+    version: &str,
+    package_type: &str,
+    target_hive: &str,
+    node_name: &str,
+    materialization: serde_json::Value,
+) -> Result<(), serde_json::Value> {
+    let package_dir = runtimes_root.join(runtime).join(version);
+    let mut required = vec![package_dir.join("package.json")];
+    if package_type == "workflow" {
+        required.push(package_dir.join("flow").join("definition.json"));
+    }
+    let Some(missing) = required.iter().find(|path| !path.is_file()) else {
+        return Ok(());
+    };
+    Err(serde_json::json!({
+        "status": "error",
+        "error_code": "RUNTIME_NOT_PRESENT",
+        "message": format!(
+            "runtime package {runtime} {version} is not on this hive yet (no {})",
+            missing.display()
+        ),
+        "runtime": runtime,
+        "version": version,
+        "expected_path": missing.display().to_string(),
+        "hint": "The package syncs from the motherbee; retry once it has arrived",
+        "target": target_hive,
+        "node_name": node_name,
+        "requested_runtime_materialization": materialization,
+    }))
+}
+
+/// The package files preflight for the version a node would run, by the package type in the
+/// manifest: only packages that run on a base runtime (config_only, workflow) carry their own
+/// files; a full runtime's start script has its own preflight.
+fn node_package_files_preflight(
+    manifest: &RuntimeManifest,
+    runtimes_root: &Path,
+    runtime_key: &str,
+    version: &str,
+    target_hive: &str,
+    node_name: &str,
+) -> Result<(), serde_json::Value> {
+    let package_type = runtime_manifest_entry_map(manifest)
+        .ok()
+        .and_then(|entries| {
+            entries
+                .get(runtime_key)
+                .map(|entry| runtime_package_type(entry).to_string())
+        })
+        .unwrap_or_default();
+    if !matches!(package_type.as_str(), "config_only" | "workflow") {
+        return Ok(());
+    }
+    runtime_package_files_preflight(
+        runtimes_root,
+        runtime_key,
+        version,
+        &package_type,
+        target_hive,
+        node_name,
+        serde_json::json!({}),
+    )
 }
 
 fn runtime_versions_from_manifest_entry(entry: &RuntimeManifestEntry) -> Vec<String> {
@@ -11875,6 +16811,22 @@ fn derive_ilk_type_for_node(_node_name: &str) -> &'static str {
     "agent"
 }
 
+/// The tenant a node's effective config records: `_system.tenant_id`, else top-level `tenant_id`.
+fn config_tenant_id(config: &serde_json::Value) -> Option<String> {
+    [
+        config
+            .get("_system")
+            .and_then(|system| system.get("tenant_id")),
+        config.get("tenant_id"),
+    ]
+    .into_iter()
+    .flatten()
+    .filter_map(serde_json::Value::as_str)
+    .map(str::trim)
+    .find(|tenant| !tenant.is_empty())
+    .map(str::to_string)
+}
+
 fn resolve_tenant_id_for_node(payload: &serde_json::Value) -> Option<String> {
     let from_payload = payload
         .get("tenant_id")
@@ -12019,6 +16971,19 @@ async fn forward_system_action_to_hive(
         system_forward_timeout(),
     )
     .await
+}
+
+/// Window for a forwarded `core_rollback`. It restores binaries and then restarts up to eight
+/// services behind a 30 s health gate each, so the default `system_forward_timeout` cannot cover
+/// it — and a too-short window would surface an outer TIMEOUT instead of the inner layer's real
+/// error (the U-8b shape).
+fn core_rollback_forward_timeout() -> Duration {
+    Duration::from_secs(
+        std::env::var("JSR_ORCH_CORE_ROLLBACK_FORWARD_TIMEOUT_SECS")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .unwrap_or(240),
+    )
 }
 
 async fn forward_system_action_to_hive_with_timeout(
@@ -12316,15 +17281,23 @@ async fn ensure_node_identity_registered(
         .and_then(|v| v.as_str())
         .map(str::to_string)
         .unwrap_or_else(|| requested_ilk_id.clone());
-    if let Err(err) = persist_node_ilk_mapping(state, node_name, &resolved_ilk_id, &tenant_id) {
-        tracing::warn!(
-            node_name = node_name,
-            ilk_id = resolved_ilk_id,
-            tenant_id = tenant_id,
-            error = %err,
-            "failed to persist node->ilk mapping"
-        );
-    }
+    // FIX-5: a swallowed persist failure silently bricks this node on the NEXT host reboot —
+    // reconcile relaunches it from the on-disk map only, so it comes up with no tenant/ilk and every
+    // request 404s node_not_configured. Escalate to error AND surface it in the ok-response so the
+    // spawn caller can react (reconcile also has an identity-SHM fallback now, but re-persist here).
+    let identity_persist_failed =
+        if let Err(err) = persist_node_ilk_mapping(state, node_name, &resolved_ilk_id, &tenant_id) {
+            tracing::error!(
+                node_name = node_name,
+                ilk_id = resolved_ilk_id,
+                tenant_id = tenant_id,
+                error = %err,
+                "FAILED to persist node->ilk mapping — node loses its identity on reboot until re-spawned"
+            );
+            true
+        } else {
+            false
+        };
 
     Ok(Some(serde_json::json!({
         "status": "ok",
@@ -12332,6 +17305,7 @@ async fn ensure_node_identity_registered(
         "requested_ilk_id": requested_ilk_id,
         "ilk_type": ilk_type,
         "target": identity_target,
+        "identity_persist_failed": identity_persist_failed,
     })))
 }
 
@@ -12411,7 +17385,7 @@ async fn delete_node_ilk_for_spawn_rollback(
     ilk_id: &str,
 ) -> serde_json::Value {
     let identity_target = format!("SY.identity@{}", identity_primary_hive_id);
-    let response = orchestrator_identity_system_call_ok(
+    let mark = orchestrator_identity_system_call_ok(
         state,
         &identity_target,
         MSG_ILK_DELETE,
@@ -12419,6 +17393,19 @@ async fn delete_node_ilk_for_spawn_rollback(
         system_forward_timeout(),
     )
     .await;
+    let response = match mark {
+        Ok(_) => {
+            orchestrator_identity_system_call_ok(
+                state,
+                &identity_target,
+                MSG_ILK_PURGE,
+                serde_json::json!({ "ilk_id": ilk_id }),
+                system_forward_timeout(),
+            )
+            .await
+        }
+        Err(err) => Err(err),
+    };
     match response {
         Ok(payload) => serde_json::json!({
             "status": "ok",
@@ -12921,6 +17908,11 @@ async fn get_node_status_flow(
     };
 
     if target_hive != state.hive_id {
+        if let Some(refusal) =
+            remote_node_requirements_refusal(state, &target_hive, &node_name, payload).await
+        {
+            return refusal;
+        }
         let mut forwarded_payload = payload.clone();
         if let Some(obj) = forwarded_payload.as_object_mut() {
             obj.insert("target".to_string(), serde_json::json!(target_hive));
@@ -12946,6 +17938,9 @@ async fn get_node_status_flow(
         };
     }
 
+    if let Some(refusal) = node_requirements_refusal(state, &node_name, payload) {
+        return refusal;
+    }
     let config_path = match node_effective_config_path(state, &node_name) {
         Ok(path) => path,
         Err(err) => {
@@ -12996,12 +17991,19 @@ async fn get_node_status_flow(
     let mut runtime_version: Option<String> = None;
     let mut identity_ilk_id: Option<String> = None;
     let mut identity_tenant_id: Option<String> = None;
+    let mut launched_by: Option<String> = None;
+    let mut relaunch_on_boot: Option<bool> = None;
     if config_exists {
         match load_node_effective_config(&config_path) {
             Ok(config_payload) => {
                 config_valid = true;
                 config_version = Some(config_version_from_value(&config_payload));
                 if let Some(system) = config_payload.get("_system").and_then(|v| v.as_object()) {
+                    launched_by = system
+                        .get("launched_by")
+                        .and_then(|v| v.as_str())
+                        .map(str::to_string);
+                    relaunch_on_boot = system.get("relaunch_on_boot").and_then(|v| v.as_bool());
                     config_updated_at_ms = system.get("updated_at_ms").and_then(|v| v.as_u64());
                     runtime_requested_version = system
                         .get("requested_runtime_version")
@@ -13236,6 +18238,8 @@ async fn get_node_status_flow(
             "ilk_id": identity_ilk_id,
             "tenant_id": identity_tenant_id,
         },
+        "launched_by": launched_by,
+        "relaunch_on_boot": relaunch_on_boot,
     });
     if let Some(value) = last_error {
         node_status["last_error"] = value;
@@ -13254,7 +18258,6 @@ async fn get_node_status_flow(
 }
 
 async fn set_node_config_flow(
-    sender: &NodeSender,
     state: &OrchestratorState,
     payload: &serde_json::Value,
 ) -> serde_json::Value {
@@ -13349,10 +18352,6 @@ async fn set_node_config_flow(
         .get("replace")
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
-    let notify = payload
-        .get("notify")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(true);
     let runtime_patch = match parse_optional_string_field("runtime") {
         Ok(value) => value,
         Err(err) => {
@@ -13506,6 +18505,56 @@ async fn set_node_config_flow(
         system.insert("runtime".to_string(), serde_json::json!(runtime));
     }
     if let Some(runtime_version) = runtime_version_patch {
+        // Refuse to bind a version that is not installed.
+        //
+        // Without this the call answers `ok` and bumps config_version while pointing the node at
+        // something that does not exist, and the failure only surfaces at the next restart as
+        // RUNTIME_NOT_AVAILABLE — far from the request that caused it. Rebinding is the recovery
+        // path after a `.deb` upgrade moves a runtime version, so it has to be honest about
+        // whether it worked (U-10).
+        let effective_runtime = system
+            .get("runtime")
+            .and_then(|value| value.as_str())
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(|value| value.to_string());
+        if let Some(runtime_name) = effective_runtime {
+            match load_runtime_manifest_result() {
+                Ok(Some(manifest)) => {
+                    let resolved = resolve_runtime_key(&manifest, &runtime_name).and_then(|key| {
+                        resolve_runtime_version(&manifest, &key, &runtime_version)
+                            .map(|version| (key, version))
+                    });
+                    let (runtime_key, resolved_version) = match resolved {
+                        Ok(value) => value,
+                        Err(err) => {
+                            return serde_json::json!({
+                                "status": "error",
+                                "error_code": "RUNTIME_NOT_AVAILABLE",
+                                "message": err.to_string(),
+                                "target": target_hive,
+                                "node_name": node_name,
+                                "runtime": runtime_name,
+                                "runtime_version": runtime_version,
+                            });
+                        }
+                    };
+                    if let Err(payload) = node_package_files_preflight(
+                        &manifest,
+                        Path::new(DIST_RUNTIME_ROOT_DIR),
+                        &runtime_key,
+                        &resolved_version,
+                        &target_hive,
+                        &node_name,
+                    ) {
+                        return payload;
+                    }
+                }
+                // No manifest to check against: bind and let the spawn path be the gate, rather
+                // than blocking a legitimate rebind on a missing manifest.
+                Ok(None) | Err(_) => {}
+            }
+        }
         system.insert(
             "runtime_version".to_string(),
             serde_json::json!(runtime_version),
@@ -13536,27 +18585,6 @@ async fn set_node_config_flow(
         });
     }
 
-    let notify_status = if notify {
-        let patch_payload = payload
-            .get("config")
-            .cloned()
-            .unwrap_or_else(|| serde_json::json!({}));
-        match send_node_config_changed_signal(sender, &node_name, next_version, patch_payload).await
-        {
-            Ok(()) => "sent".to_string(),
-            Err(err) => {
-                tracing::warn!(
-                    node_name = node_name,
-                    error = %err,
-                    "failed to dispatch node CONFIG_CHANGED signal"
-                );
-                format!("dispatch_failed: {}", err)
-            }
-        }
-    } else {
-        "skipped".to_string()
-    };
-
     serde_json::json!({
         "status": "ok",
         "target": target_hive,
@@ -13564,7 +18592,6 @@ async fn set_node_config_flow(
         "node_name": node_name,
         "path": path.display().to_string(),
         "config_version": next_version,
-        "notify_status": notify_status,
     })
 }
 
@@ -13668,6 +18695,19 @@ async fn run_node_flow(
         });
     }
 
+    // The tenant this spawn would register and inject: the one both rules are about.
+    let spawn_tenant = resolve_tenant_id_for_node(payload);
+    if let Some(refusal) = genesis_refusal(&node_name, &runtime, spawn_tenant.as_deref()) {
+        return refusal;
+    }
+    if let Some(refusal) = tenant_gate_refusal(
+        &node_name,
+        spawn_tenant.as_deref(),
+        &tenant_gate(&state.hive_id, spawn_tenant.as_deref()),
+    ) {
+        return refusal;
+    }
+
     // SO-01: the systemd unit is ALWAYS derived from the validated, managed
     // node_name (`unit_from_node_name` prefixes `fluxbee-node-`), never taken
     // from the caller — so a lifecycle-authorized caller cannot spawn/register
@@ -13735,7 +18775,7 @@ async fn run_node_flow(
         }
     };
 
-    let version = match resolve_runtime_version(&manifest, &runtime_key, requested_version) {
+    let version = match resolve_runtime_version(&manifest, &runtime_key, &requested_version) {
         Ok(version) => version,
         Err(err) => {
             return serde_json::json!({
@@ -14017,7 +19057,13 @@ struct ManagedNodeLaunchPlan {
     unit: String,
     runtime_key: String,
     resolved_version: String,
+    /// What the node ASKED for ("current" or an explicit pin) — not the version it last ran.
+    /// Reported back to the operator so the answer distinguishes "you follow current, which is
+    /// now X" from "you are pinned to X".
+    requested_version: String,
     entrypoint: RuntimeSpawnEntrypoint,
+    /// The node's tenant: from the identity map, else from its config.
+    tenant: Option<String>,
 }
 
 fn managed_node_launch_plan(
@@ -14123,8 +19169,21 @@ fn managed_node_launch_plan(
             }));
         }
     };
+    // Resolve the INTENT, not the stored answer — the same rule the boot pass applies (U-10).
+    // A node whose `_system.requested_runtime_version` is "current" is declaring "whatever the
+    // manifest says now"; re-resolving its last CONCRETE answer pins it to a version the operator
+    // already moved past. That silently broke the whole "growth = publish + update, no new .deb"
+    // model for a node that is already running: publishing a new runtime and restarting the node
+    // relaunched it on the old version, and the response even reported the stale value back as
+    // `requested_version`. A node pinned to an explicit version still resolves to that version,
+    // and still fails loudly if it is gone — which is correct for a deliberate pin.
+    let requested_version: String = if node.follows_current() {
+        "current".to_string()
+    } else {
+        node.runtime_version.clone()
+    };
     let resolved_version =
-        match resolve_runtime_version(&manifest, &runtime_key, &node.runtime_version) {
+        match resolve_runtime_version(&manifest, &runtime_key, &requested_version) {
             Ok(value) => value,
             Err(err) => {
                 return Err(serde_json::json!({
@@ -14137,6 +19196,11 @@ fn managed_node_launch_plan(
                 }));
             }
         };
+    let (_, persisted_tenant) = load_persisted_node_identity(state, node_name);
+    let tenant = persisted_tenant.or_else(|| config_tenant_id(&config));
+    if let Some(refusal) = genesis_refusal(node_name, &runtime_key, tenant.as_deref()) {
+        return Err(refusal);
+    }
     validate_wf_runtime_spawn_contract(
         &manifest,
         &runtime_key,
@@ -14183,13 +19247,23 @@ fn managed_node_launch_plan(
     if let Some(payload) = preflight_error {
         return Err(payload);
     }
+    node_package_files_preflight(
+        &manifest,
+        Path::new(DIST_RUNTIME_ROOT_DIR),
+        &runtime_key,
+        &resolved_version,
+        &state.hive_id,
+        &node.node_name,
+    )?;
 
     Ok(ManagedNodeLaunchPlan {
         unit: unit_from_node_name(&node.node_name),
         node,
         runtime_key,
         resolved_version,
+        requested_version,
         entrypoint,
+        tenant,
     })
 }
 
@@ -14222,9 +19296,26 @@ fn managed_node_restart_command(
         tenant_id.as_deref(),
     );
     if unit_active {
+        // `systemctl restart` re-runs the unit's EXISTING ExecStart. The unit is created by
+        // `systemd-run` with the runtime version baked into the entrypoint path, so restarting a
+        // node after publishing a new runtime version relaunches the OLD binary — while this
+        // function's caller happily reports the newly resolved version back to the operator. That
+        // is a version claimed and not applied (the U-1 shape), and it is the second half of why
+        // "publish + restart" did not pick up a new runtime: resolving the right version is not
+        // enough if the unit still points at the old one.
+        //
+        // So: restart in place only when the live ExecStart already points at the planned
+        // entrypoint. Otherwise tear the unit down and re-create it at the new path.
         format!(
-            "systemctl restart {unit} || (systemctl reset-failed {unit} || true; sleep 1; {run_cmd})",
+            "if systemctl show -p ExecStart --value {unit} 2>/dev/null | grep -qF {script}; then \
+                systemctl restart {unit} || (systemctl reset-failed {unit} || true; sleep 1; {run_cmd}); \
+             else \
+                systemctl stop {unit} >/dev/null 2>&1 || true; \
+                systemctl reset-failed {unit} >/dev/null 2>&1 || true; \
+                {run_cmd}; \
+             fi",
             unit = shell_single_quote(&plan.unit),
+            script = shell_single_quote(&plan.entrypoint.script_path),
             run_cmd = run_cmd,
         )
     } else {
@@ -14280,6 +19371,11 @@ async fn start_or_restart_node_flow(
     };
 
     if target_hive != state.hive_id {
+        if let Some(refusal) =
+            remote_node_requirements_refusal(state, &target_hive, &node_name, payload).await
+        {
+            return refusal;
+        }
         let mut forwarded_payload = payload.clone();
         if let Some(obj) = forwarded_payload.as_object_mut() {
             obj.insert("target".to_string(), serde_json::json!(target_hive));
@@ -14305,6 +19401,9 @@ async fn start_or_restart_node_flow(
         };
     }
 
+    if let Some(refusal) = node_requirements_refusal(state, &node_name, payload) {
+        return refusal;
+    }
     let plan = match managed_node_launch_plan(state, &node_name) {
         Ok(value) => value,
         Err(payload) => return payload,
@@ -14313,6 +19412,8 @@ async fn start_or_restart_node_flow(
     let visible_in_router = local_inventory_has_node(state, &plan.node.node_name);
 
     if !restart && (unit_active || visible_in_router) {
+        // Asked to run: the relaunches keep it running from now on.
+        set_node_relaunch_on_boot(state, &plan.node.node_name, true);
         return serde_json::json!({
             "status": "ok",
             "state": "already_running",
@@ -14321,10 +19422,18 @@ async fn start_or_restart_node_flow(
             "node_name": plan.node.node_name,
             "runtime": plan.runtime_key,
             "version": plan.resolved_version,
-            "requested_version": plan.node.runtime_version,
+            "requested_version": plan.requested_version.clone(),
             "unit": plan.unit,
             "visible_in_router": visible_in_router,
         });
+    }
+    // Before anything is stopped or started: a restart refused here leaves the node running.
+    if let Some(refusal) = tenant_gate_refusal(
+        &plan.node.node_name,
+        plan.tenant.as_deref(),
+        &tenant_gate(&state.hive_id, plan.tenant.as_deref()),
+    ) {
+        return refusal;
     }
 
     let cmd = if restart {
@@ -14340,13 +19449,14 @@ async fn start_or_restart_node_flow(
     match execute_on_hive(state, &target_hive, &cmd, label) {
         Ok(()) => serde_json::json!({
             "status": "ok",
+            "relaunch_on_boot": set_node_relaunch_on_boot(state, &plan.node.node_name, true),
             "state": if restart { "restarted" } else { "started" },
             "target": target_hive,
             "hive": target_hive,
             "node_name": plan.node.node_name,
             "runtime": plan.runtime_key,
             "version": plan.resolved_version,
-            "requested_version": plan.node.runtime_version,
+            "requested_version": plan.requested_version.clone(),
             "unit": plan.unit,
             "visible_in_router": visible_in_router,
         }),
@@ -14358,7 +19468,7 @@ async fn start_or_restart_node_flow(
             "node_name": plan.node.node_name,
             "runtime": plan.runtime_key,
             "version": plan.resolved_version,
-            "requested_version": plan.node.runtime_version,
+            "requested_version": plan.requested_version.clone(),
             "unit": plan.unit,
         }),
     }
@@ -14463,6 +19573,11 @@ async fn kill_node_flow(
     };
 
     if target_hive != state.hive_id {
+        if let Some(refusal) =
+            remote_node_requirements_refusal(state, &target_hive, node_name_ref, payload).await
+        {
+            return refusal;
+        }
         let mut forwarded_payload = payload.clone();
         if let Some(obj) = forwarded_payload.as_object_mut() {
             obj.insert("target".to_string(), serde_json::json!(target_hive));
@@ -14498,8 +19613,40 @@ async fn kill_node_flow(
         };
     }
 
+    if let Some(refusal) = node_requirements_refusal(state, node_name_ref, payload) {
+        return refusal;
+    }
     let unit_was_active = match systemd_unit_is_active(&unit) {
         Ok(false) => {
+            // A stop of a node that is down right now still lasts. "Down" includes a node waiting
+            // for systemd's next automatic restart (a crash loop): the stop cancels that too.
+            if !purge_instance
+                && node_effective_config_path(state, node_name_ref).is_ok_and(|path| path.is_file())
+            {
+                if let Err(err) = execute_on_hive(state, &target_hive, &cmd, "kill_node") {
+                    return serde_json::json!({
+                        "status": "error",
+                        "error_code": "KILL_FAILED",
+                        "message": err.to_string(),
+                        "target": target_hive,
+                        "node_name": validated_node_name,
+                        "unit": unit,
+                        "purge_instance": purge_instance,
+                    });
+                }
+                let recorded = set_node_relaunch_on_boot(state, node_name_ref, false);
+                return serde_json::json!({
+                    "status": "ok",
+                    "state": "stopped",
+                    "hive": target_hive,
+                    "target": target_hive,
+                    "node_name": validated_node_name,
+                    "unit": unit,
+                    "purge_instance": purge_instance,
+                    "unit_was_active": false,
+                    "relaunch_on_boot": !recorded,
+                });
+            }
             if !should_purge_inactive_kill_target(purge_instance, validated_node_name.as_deref()) {
                 return serde_json::json!({
                     "status": "not_found",
@@ -14543,6 +19690,12 @@ async fn kill_node_flow(
                 "unit_was_active": unit_was_active,
                 "pre_stop_state": if unit_was_active { "active" } else { "inactive_or_not_found" },
             });
+            if !purge_instance {
+                // A stop lasts: the relaunches leave the node down until it is started again.
+                let recorded = set_node_relaunch_on_boot(state, node_name_ref, false);
+                response["state"] = serde_json::json!("stopped");
+                response["relaunch_on_boot"] = serde_json::json!(!recorded);
+            }
             if purge_instance {
                 if let Some(node_name) = validated_node_name.as_ref() {
                     let (persisted_ilk_id, _persisted_tenant_id) =
@@ -14570,6 +19723,7 @@ async fn kill_node_flow(
                             response["removed_path"] =
                                 serde_json::json!(removed_path.display().to_string());
                             response["removed_kind_dir"] = serde_json::json!(removed_kind_dir);
+                            response["uuid_file_removed"] = purge_node_uuid_file(node_name);
                             match remove_node_ilk_mapping(state, node_name) {
                                 Ok(removed) => {
                                     response["ilk_mapping_removed"] = serde_json::json!(removed);
@@ -14701,6 +19855,43 @@ fn remove_node_instance_dir_with_root(
         removed_kind_dir = true;
     }
     Ok((node_dir, removed_kind_dir))
+}
+
+/// The node's persisted L1 UUID (`<state>/nodes/<name without @hive>.uuid`, written by the SDK
+/// on the node's first start). A purged node takes it along, so a node created later under the
+/// same name gets a fresh one. Returns whether a file was removed.
+fn remove_node_uuid_file_with_root(
+    node_name: &str,
+    uuid_root: &Path,
+) -> Result<bool, OrchestratorError> {
+    let base = node_name
+        .split_once('@')
+        .map(|(base, _)| base)
+        .unwrap_or(node_name)
+        .trim();
+    if base.is_empty() || base.contains('/') || base.contains("..") {
+        return Err(format!("invalid node_name '{node_name}'").into());
+    }
+    match fs::remove_file(uuid_root.join(format!("{base}.uuid"))) {
+        Ok(()) => Ok(true),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(err) => Err(err.into()),
+    }
+}
+
+fn node_uuid_root() -> PathBuf {
+    json_router::paths::state_dir().join("nodes")
+}
+
+/// Purge step for the UUID file: reported, never fatal (the instance and the ILK are already gone).
+fn purge_node_uuid_file(node_name: &str) -> serde_json::Value {
+    match remove_node_uuid_file_with_root(node_name, &node_uuid_root()) {
+        Ok(removed) => serde_json::json!(removed),
+        Err(err) => {
+            tracing::warn!(node_name = %node_name, error = %err, "purge: could not remove the node UUID file");
+            serde_json::json!(false)
+        }
+    }
 }
 
 async fn remove_node_instance_flow(
@@ -14866,6 +20057,7 @@ async fn remove_node_instance_flow(
                 "removed_kind_dir": removed_kind_dir,
                 "timer_purge": timer_purge,
                 "ilk_mapping_removed": ilk_mapping_removed,
+                "uuid_file_removed": purge_node_uuid_file(&node_name),
             });
             append_optional_teardown_cleanup(
                 state,
@@ -14910,18 +20102,25 @@ async fn delete_ilk_for_teardown(
     _target_hive: &str,
 ) -> serde_json::Value {
     let admin_target = teardown_admin_target();
-    let response = orchestrator_admin_command(
-        state,
-        AdminCommandRequest {
-            admin_target: &admin_target,
-            action: "delete_ilk",
-            target: Some(PRIMARY_HIVE_ID),
-            params: serde_json::json!({ "ilk_id": ilk_id }),
-            request_id: None,
-            timeout: Duration::from_secs(15),
-        },
-    )
-    .await;
+    let admin_ilk_call = |action: &'static str| {
+        orchestrator_admin_command(
+            state,
+            AdminCommandRequest {
+                admin_target: &admin_target,
+                action,
+                target: Some(PRIMARY_HIVE_ID),
+                params: serde_json::json!({ "ilk_id": ilk_id }),
+                request_id: None,
+                timeout: Duration::from_secs(15),
+            },
+        )
+    };
+    // Mark first (idempotent), then purge: a node torn down with purge_instance must not leave
+    // its identity behind with its node_name reserved.
+    let response = match admin_ilk_call("delete_ilk").await {
+        Ok(resp) if resp.status == "ok" => admin_ilk_call("purge_ilk").await,
+        other => other,
+    };
 
     match response {
         Ok(resp) if resp.status == "ok" => serde_json::json!({
@@ -15000,7 +20199,28 @@ fn take_test_ilk_delete_result() -> Option<serde_json::Value> {
         .take()
 }
 
-/// Routes vault list+delete through the singleton primary Admin to purge every
+/// Each secret of a vault listing with the tenant it belongs to: a delete names that tenant, and
+/// SY.vault refuses one in another.
+fn vault_keys_with_tenant(listing: &serde_json::Value) -> Vec<(String, String)> {
+    listing
+        .get("secrets")
+        .and_then(|secrets| secrets.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|entry| {
+                    let key = entry.get("key").and_then(|key| key.as_str())?;
+                    let tenant_id = entry
+                        .get("metadata")
+                        .and_then(|metadata| metadata.get("tenant_id"))
+                        .and_then(|tenant| tenant.as_str())?;
+                    Some((key.to_string(), tenant_id.to_string()))
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Routes vault list+delete through the primary Admin to purge every
 /// secret whose metadata is dedicated to `ilk_id`. List is open in vault, but
 /// delete requires admin-class privileges (the doomed ILK no longer exists at
 /// teardown time and cannot self-delete), so this helper consistently uses the
@@ -15064,30 +20284,21 @@ async fn purge_vault_secrets_for_ilk(
         });
     }
 
-    let keys: Vec<String> = list_resp
-        .payload
-        .get("secrets")
-        .and_then(|secrets| secrets.as_array())
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|entry| entry.get("key").and_then(|key| key.as_str()))
-                .map(str::to_string)
-                .collect()
-        })
-        .unwrap_or_default();
+    let keys = vault_keys_with_tenant(&list_resp.payload);
 
     let scanned = keys.len();
     let mut deleted = 0usize;
     let mut errors: Vec<serde_json::Value> = Vec::new();
 
-    for key in keys {
+    for (key, tenant_id) in keys {
         let delete_resp = orchestrator_admin_command(
             state,
             AdminCommandRequest {
                 admin_target: &admin_target,
                 action: "vault_delete",
                 target: Some(PRIMARY_HIVE_ID),
-                params: serde_json::json!({ "key": key }),
+                // SY.vault deletes a key only in the tenant it belongs to.
+                params: serde_json::json!({ "key": key, "tenant_id": tenant_id }),
                 request_id: None,
                 timeout: Duration::from_secs(10),
             },
@@ -15397,7 +20608,7 @@ fn worker_remote_base_dirs_command(blob: &BlobRuntimeConfig) -> String {
     let blob_active_dir = blob.path.join("active");
     let blob_staging_dir = blob.path.join("staging");
     sudo_wrap(&format!(
-        "mkdir -p /etc/fluxbee /var/lib/fluxbee/state/nodes /var/lib/fluxbee/opa/current /var/lib/fluxbee/opa/staged /var/lib/fluxbee/opa/backup /var/lib/fluxbee/nats /var/lib/fluxbee/dist /var/lib/fluxbee/dist/runtimes /var/lib/fluxbee/dist/core/bin /var/lib/fluxbee/dist/vendor /var/run/fluxbee/routers '{}' '{}' '{}' '{}'",
+        "mkdir -p /etc/fluxbee /var/lib/fluxbee/state/nodes /var/lib/fluxbee/opa/current /var/lib/fluxbee/opa/staged /var/lib/fluxbee/opa/backup /var/lib/fluxbee/dist /var/lib/fluxbee/dist/runtimes /var/lib/fluxbee/dist/core/bin /var/lib/fluxbee/dist/vendor /var/run/fluxbee/routers '{}' '{}' '{}' '{}'",
         shell_single_quote_path(&blob.path),
         shell_single_quote_path(&blob_active_dir),
         shell_single_quote_path(&blob_staging_dir),
@@ -15405,17 +20616,18 @@ fn worker_remote_base_dirs_command(blob: &BlobRuntimeConfig) -> String {
     ))
 }
 
+/// No `chmod` on the blob directories: on a re-join they may be the Syncthing user's names, and
+/// chmod follows a symlink. The spoke's orchestrator sets their modes on the descriptor at start
+/// (FINDINGS A-51); `chown -R` acts on a symlink itself.
 fn ingress_remote_base_dirs_command(blob: &BlobRuntimeConfig) -> String {
     let public_dir = blob_public_sync_folder_path(blob);
     sudo_bash_wrap(&format!(
-        "getent passwd fluxbee >/dev/null 2>&1 || useradd --system --user-group --home-dir /var/lib/fluxbee --no-create-home --shell /usr/sbin/nologin fluxbee; mkdir -p /etc/fluxbee /var/lib/fluxbee/state/nodes /var/lib/fluxbee/state/sy-edge /var/lib/fluxbee/opa/current /var/lib/fluxbee/opa/staged /var/lib/fluxbee/opa/backup /var/lib/fluxbee/nats /var/lib/fluxbee/dist /var/lib/fluxbee/dist/runtimes /var/lib/fluxbee/dist/core/bin /var/lib/fluxbee/dist/vendor /var/run/fluxbee/routers '{}' '{}' '{}' && chown -R fluxbee:fluxbee '{}' '{}' && chmod 0750 '{}' '{}' /var/lib/fluxbee/state/sy-edge",
+        "getent passwd fluxbee >/dev/null 2>&1 || useradd --system --user-group --home-dir /var/lib/fluxbee --no-create-home --shell /usr/sbin/nologin fluxbee; mkdir -p /etc/fluxbee /var/lib/fluxbee/state/nodes /var/lib/fluxbee/state/sy-edge /var/lib/fluxbee/opa/current /var/lib/fluxbee/opa/staged /var/lib/fluxbee/opa/backup /var/lib/fluxbee/dist /var/lib/fluxbee/dist/runtimes /var/lib/fluxbee/dist/core/bin /var/lib/fluxbee/dist/vendor /var/run/fluxbee/routers '{}' '{}' '{}' && chown -R fluxbee:fluxbee '{}' '{}' && chmod 0750 /var/lib/fluxbee/state/sy-edge",
         shell_single_quote_path(&blob.path),
         shell_single_quote_path(&public_dir),
         shell_single_quote_path(&blob.sync_data_dir),
         shell_single_quote_path(&public_dir),
         shell_single_quote_path(&blob.sync_data_dir),
-        shell_single_quote_path(&blob.path),
-        shell_single_quote_path(&public_dir),
     ))
 }
 
@@ -15566,11 +20778,277 @@ fn core_bin_paths_for_role(
         .collect())
 }
 
+/// Motherbee-side per-role core distribution root: `dist/core/<role>/`.
+///
+/// Motherbee keeps its own full set in `dist/core/{bin,manifest.json}` and materializes
+/// one scoped subtree per spoke role beside it. Syncthing shares `dist/core/<role>` to the
+/// hives of that role, mapped onto their own `dist/core` — so a spoke still sees exactly
+/// `dist/core/bin/<c>` and `dist/core/manifest.json`, and no path constant changes.
+fn role_core_dist_dir(role: HiveRole) -> PathBuf {
+    Path::new(DIST_CORE_ROOT_DIR).join(role.as_str())
+}
+
+/// The spoke roles motherbee materializes a scoped core subtree for. Motherbee itself is
+/// excluded: it consumes `dist/core` directly and never syncs core to itself.
+const ROLE_CORE_DIST_ROLES: [HiveRole; 3] = [HiveRole::Worker, HiveRole::Ingress, HiveRole::Egress];
+
+/// Narrow a core manifest to one role's components.
+///
+/// NOT used for the manifest that ships — see `materialize_role_core_trees` for why that one
+/// stays whole. This exists to validate, on motherbee and before anything is copied, that every
+/// component a role claims actually exists in the build: a role asking for a binary the package
+/// does not contain must fail here, loudly, rather than produce a short tree that turns into a
+/// spoke crash-loop later.
+fn scope_core_manifest_to_components(
+    manifest: &CoreManifest,
+    components: &[String],
+) -> Result<CoreManifest, OrchestratorError> {
+    let mut scoped = std::collections::BTreeMap::new();
+    for name in components {
+        let entry = manifest.components.get(name).ok_or_else(|| {
+            format!("core manifest missing component '{name}' required by its role")
+        })?;
+        scoped.insert(name.clone(), entry.clone());
+    }
+    Ok(CoreManifest {
+        schema_version: manifest.schema_version,
+        components: scoped,
+    })
+}
+
+/// Motherbee: (re)materialize `dist/core/<role>/` for every spoke role.
+///
+/// WHY per-role and not one shared `dist/core`: a hive must only hold the executables it
+/// actually runs. The ingress — the DMZ door — otherwise receives all 17 core binaries
+/// (389 MB, including the 181 MB motherbee-only `sy_architect`) to run four of them, plus
+/// `runtimes/`, which is where tenant workflow packages live.
+///
+/// WHY the manifest ships WHOLE while the binaries are scoped: the `category=core` staleness
+/// gate compares the sha256 of `dist/core/manifest.json` between motherbee and the target hive
+/// (`local_core_manifest_hash`). A per-role manifest would differ from motherbee's by
+/// construction, so every update would be rejected as stale forever — the exact failure this
+/// work exists to remove. The manifest is metadata (component names, versions, hashes), not
+/// executables, so shipping it whole does not put anything on a DMZ box that it could run.
+///
+/// The spoke stays safe with a whole manifest because `validate_core_manifest_for_bins` only
+/// validates the paths it is GIVEN — its own role's set — and extra manifest entries are
+/// inert. What it does NOT tolerate is a binary it expects being absent: that check runs at
+/// BOOT (`bootstrap_local` → `core_bin_paths_for_role` → `validate_core_manifest_for_bins`,
+/// sha256ing each file) and `main` propagates it with `?`, so a short tree is not an update
+/// failure but an orchestrator crash-loop with no channel left to repair it. Both sides derive
+/// the role's set from the same `system_nodes.<role>` — motherbee's template, which it wrote
+/// into the spoke's hive.yaml at add_hive — so they agree unless that template is edited after
+/// the join: a spoke's hive.yaml is written once, at the join, and never re-emitted (the HANDBOOK
+/// recipe for a new system node in a role covers that order).
+///
+/// Copies, never hardlinks: `build-deb.sh` and `install.sh` write with `install -m0755`,
+/// which unlinks and recreates, so a hardlink would silently keep pointing at the previous
+/// inode while the manifest advertised the new hash.
+///
+/// Idempotent: a component is re-copied only when its bytes differ from the source, and the
+/// scoped manifest is rewritten only on a real diff — so syncthing sees no spurious churn.
+fn materialize_role_core_trees(
+    manifest: &CoreManifest,
+) -> Result<Vec<String>, OrchestratorError> {
+    let hive = load_hive(&json_router::paths::config_dir())?;
+    let mut changed_roles = Vec::new();
+
+    for role in ROLE_CORE_DIST_ROLES {
+        // A role with no `system_nodes.<role>` section in motherbee's hive.yaml is simply not
+        // deployable here; skip it rather than failing motherbee's boot over a role nobody uses.
+        let section = match system_nodes_for_role(&hive, role) {
+            Ok(section) => section,
+            Err(err) => {
+                tracing::debug!(role = %role.as_str(), error = %err, "no system_nodes section; skipping role core tree");
+                continue;
+            }
+        };
+        let components = core_component_names_from_section(&section, manifest)?;
+        // Validate up-front that the build actually contains everything this role claims.
+        // Failing here is cheap and visible; failing on the spoke is a crash-loop.
+        scope_core_manifest_to_components(manifest, &components)?;
+
+        let root = role_core_dist_dir(role);
+        let bin_dir = root.join("bin");
+        fs::create_dir_all(&bin_dir)?;
+
+        let mut role_changed = false;
+        for name in &components {
+            let src = local_core_bin_source_path(name);
+            let dst = bin_dir.join(name);
+            if !src.exists() {
+                return Err(format!(
+                    "core binary '{}' missing from '{}' — the installed package is incomplete",
+                    name,
+                    src.display()
+                )
+                .into());
+            }
+            // Compare against the manifest's sha rather than re-hashing the source twice: the
+            // manifest is authoritative and `validate_core_manifest_for_bins` will hold us to it.
+            let expected = &manifest
+                .components
+                .get(name)
+                .expect("component presence was validated above")
+                .sha256;
+            let dst_matches = dst.exists()
+                && sha256_file(&dst)
+                    .map(|h| h.eq_ignore_ascii_case(expected.trim()))
+                    .unwrap_or(false);
+            if dst_matches {
+                continue;
+            }
+            copy_exec_file(&src, &dst)?;
+            role_changed = true;
+        }
+
+        // Prune components this role no longer runs. Without this, a role that drops a service
+        // keeps shipping its binary forever, and the spoke would hold an executable it does not
+        // run — exactly what this whole subtree exists to prevent.
+        if let Ok(entries) = fs::read_dir(&bin_dir) {
+            for entry in entries.flatten() {
+                let name = entry.file_name().to_string_lossy().to_string();
+                if !components.iter().any(|c| c == &name) {
+                    fs::remove_file(entry.path())?;
+                    role_changed = true;
+                }
+            }
+        }
+
+        // The WHOLE manifest, byte-for-byte what motherbee serves itself, so the staleness gate
+        // sees identical hashes on both ends. Copied rather than re-serialized for exactly that
+        // reason: a re-render could differ by key order or whitespace and silently wedge the gate.
+        let manifest_path = root.join("manifest.json");
+        let rendered = fs::read_to_string(local_core_manifest_path().ok_or_else(|| {
+            format!("core manifest missing at '{DIST_CORE_MANIFEST_PATH}'")
+        })?)?;
+        let manifest_changed = match fs::read_to_string(&manifest_path) {
+            Ok(existing) => existing != rendered,
+            Err(_) => true,
+        };
+        if manifest_changed {
+            // Atomic: syncthing must never observe a half-written manifest, because a spoke
+            // that reads one fails `validate_core_manifest_for_bins` at boot.
+            write_file_atomic(&manifest_path, rendered.as_bytes())?;
+            role_changed = true;
+        }
+
+        if role_changed {
+            tracing::info!(
+                role = %role.as_str(),
+                components = components.len(),
+                "materialized per-role core distribution subtree"
+            );
+            changed_roles.push(role.as_str().to_string());
+        }
+    }
+
+    Ok(changed_roles)
+}
+
+/// Copy an executable as 0755, via a temp file + rename so a reader (syncthing, or a spoke
+/// mid-scan) never sees a partial binary.
+fn copy_exec_file(src: &Path, dst: &Path) -> Result<(), OrchestratorError> {
+    let bytes = fs::read(src)?;
+    write_new_file_atomic(dst, &bytes, 0o755)
+}
+
+/// Write `bytes` to `path` atomically (temp sibling + rename), mode 0644.
+fn write_file_atomic(path: &Path, bytes: &[u8]) -> Result<(), OrchestratorError> {
+    write_new_file_atomic(path, bytes, 0o644)
+}
+
+/// This run's token, in the name of every temp it writes. Only one orchestrator runs at a time,
+/// so a temp of ours with another run's token was left by a run that died mid-write, and the next
+/// write of that path sweeps it at once; this run's own temps are never swept. No clock decides.
+fn write_run_token() -> &'static str {
+    static TOKEN: OnceLock<String> = OnceLock::new();
+    TOKEN.get_or_init(|| format!("{:08x}", rand::random::<u32>()))
+}
+
+/// Writes `bytes` to a new temp sibling of `path` and renames it over `path` (FINDINGS A-51).
+///
+/// Parts of the dist tree belong to the Syncthing user on a spoke while the orchestrator is root,
+/// so the last component is not trusted to be what its name says: the temp is created exclusively
+/// (`O_EXCL`, never through a planted entry), mode 0600, under an unpredictable name, and gets
+/// `mode` on the open file before the rename, never on a path. It used to be a fixed `.name.tmp`
+/// written with `fs::write`, which follows a symlink, and a mode set afterwards with `chmod` on the
+/// path. A directory ABOVE the file that the Syncthing user can replace is still followed; on the
+/// motherbee that user owns none (it only reads dist), on a spoke root installs what Syncthing
+/// delivers anyway (A-51).
+///
+/// The temp is `.syncthing.<name>.fluxbee-<run>-<random>.tmp`: Syncthing skips that prefix in a
+/// shared folder (its own temps use it) and drops such a file after a day, so a temp is never sent
+/// to a peer, not even one a crash left behind.
+fn write_new_file_atomic(path: &Path, bytes: &[u8], mode: u32) -> Result<(), OrchestratorError> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| format!("path '{}' has no parent directory", path.display()))?;
+    fs::create_dir_all(parent)?;
+    let name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("fluxbee-write");
+    let prefix = format!(".syncthing.{name}.fluxbee-");
+    let own = format!("{prefix}{}-", write_run_token());
+    let legacy_tmp = format!(".{name}.tmp");
+    if let Ok(entries) = fs::read_dir(parent) {
+        for entry in entries.flatten() {
+            let leftover = entry.file_name().to_str().is_some_and(|n| {
+                (n.starts_with(&prefix) && n.ends_with(".tmp") && !n.starts_with(&own))
+                    || n == legacy_tmp
+            });
+            if leftover {
+                let _ = fs::remove_file(entry.path());
+            }
+        }
+    }
+    let mut created = None;
+    for _ in 0..8 {
+        let tmp = parent.join(format!("{own}{:016x}.tmp", rand::random::<u64>()));
+        match fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&tmp)
+        {
+            Ok(file) => {
+                created = Some((file, tmp));
+                break;
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(err) => return Err(err.into()),
+        }
+    }
+    let (mut file, tmp) = created
+        .ok_or_else(|| format!("could not create a temp file next to '{}'", path.display()))?;
+    let result = (|| -> Result<(), OrchestratorError> {
+        file.write_all(bytes)?;
+        file.set_permissions(fs::Permissions::from_mode(mode))?;
+        file.sync_all()?;
+        fs::rename(&tmp, path)?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&tmp);
+        return result;
+    }
+    let synced = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(nix::libc::O_DIRECTORY | nix::libc::O_NOFOLLOW)
+        .open(parent)
+        .and_then(|dir| dir.sync_all());
+    if let Err(err) = synced {
+        tracing::warn!(path = %path.display(), error = %err, "could not fsync the directory after a write");
+    }
+    Ok(())
+}
+
 /// add_hive: push the motherbee's vendor runtime (syncthing binary + manifest +
 /// optional config template) to the worker, so the worker's blob/dist-sync setup
 /// finds the vendored syncthing during finalize. Mirrors `sync_core_to_worker`.
-/// Best-effort by contract of its caller: if the motherbee has no vendor manifest
-/// there is nothing to push, so this returns Ok and the join proceeds.
+/// If the motherbee has no vendor manifest there is nothing to push, so this returns Ok and the
+/// join proceeds; any other failure fails the join in all three flows (VENDOR_SYNC_FAILED).
 fn sync_vendor_to_worker(
     hive_id: &str,
     address: &str,
@@ -15872,6 +21350,23 @@ fn sync_core_to_worker(
     if let Some(local_hash) = local_core_manifest_hash()? {
         let remote_hash = remote_core_manifest_hash(address, key_path, user)?;
         if remote_hash.as_deref() != Some(local_hash.as_str()) {
+            // Recorded from MOTHERBEE, which is the only hive whose drift store is readable:
+            // `get_drift_alerts` reads the local file and does not forward to the target.
+            // The remedy is `update`, never `core_rollback` — a rollback moves /usr/bin FURTHER
+            // from the manifest and would make this row permanent.
+            append_drift_alert(
+                "core",
+                "post_sync_mismatch",
+                "error",
+                hive_id,
+                format!(
+                    "core manifest hash still differs after pushing to '{hive_id}'. Re-run \
+                     `update category=core` for this hive."
+                ),
+                Some(local_hash.clone()),
+                None,
+                remote_hash.clone(),
+            );
             return Err(format!(
                 "core manifest hash mismatch after sync hive='{}' local={} remote={}",
                 hive_id,
@@ -16226,6 +21721,8 @@ async fn add_hive_finalize_local_flow(
     state: &OrchestratorState,
     payload: &serde_json::Value,
 ) -> serde_json::Value {
+    // The Syncthing reconcile stays away from config.xml and the service until this returns.
+    let _finalize_in_flight = SyncthingFinalizeInFlight::start();
     let desired_dist = current_dist_runtime_config(state);
     let desired_blob = current_blob_runtime_config(state);
     let desired_sync = effective_syncthing_runtime_config(&desired_blob, &desired_dist);
@@ -16257,16 +21754,20 @@ async fn add_hive_finalize_local_flow(
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(str::to_string);
-    if let Some(address) = syncthing_peer_address.as_deref() {
-        if !valid_syncthing_peer_address(address) {
+    let syncthing_peer_static = match finalize_peer_static_address(
+        syncthing_peer_device_id.as_deref(),
+        syncthing_peer_address.as_deref(),
+    ) {
+        Ok(address) => address,
+        Err(message) => {
             return serde_json::json!({
                 "status": "error",
                 "error_code": "INVALID_REQUEST",
-                "message": format!("invalid syncthing_peer_address '{address}'"),
+                "message": message,
                 "hive_id": state.hive_id,
             });
         }
-    }
+    };
     let mut updated: Vec<String> = Vec::new();
     let mut unchanged: Vec<String> = Vec::new();
     let mut restarted: Vec<String> = Vec::new();
@@ -16392,16 +21893,19 @@ async fn add_hive_finalize_local_flow(
     restarted.extend(vendor_result.restarted);
 
     let mut syncthing_peer_linked = false;
-    if let Some(peer_device_id) = syncthing_peer_device_id.as_deref() {
+    if let (Some(peer_device_id), Some(peer_address)) =
+        (syncthing_peer_device_id.as_deref(), syncthing_peer_static)
+    {
         if let Err(err) = ensure_syncthing_peer_link_runtime(
             &desired_sync,
             &desired_blob,
             &desired_dist,
             peer_device_id,
             &syncthing_peer_name,
-            syncthing_peer_address.as_deref(),
+            peer_address,
             state.is_motherbee,
-            state.role == HiveRole::Ingress,
+            // This link is the local hive's own; on a spoke that is its own role.
+            state.role,
         )
         .await
         {
@@ -16436,8 +21940,15 @@ async fn add_hive_finalize_local_flow(
     let public_probe_enabled = state.role == HiveRole::Ingress
         && desired_blob.public_sync_enabled
         && blob_sync_tool_is_syncthing(&desired_sync);
+    // The folder that answers "did this hive's core arrive?" is its own core folder; vendor and
+    // runtimes converge independently and must not stand in for it.
+    let dist_core_folder_id = format!(
+        "{}{}",
+        SYNCTHING_FOLDER_DIST_CORE_PREFIX,
+        state.role.as_str()
+    );
     let probe_folder_id = if dist_probe_enabled {
-        Some(SYNCTHING_FOLDER_DIST_ID)
+        Some(dist_core_folder_id.as_str())
     } else if public_probe_enabled {
         Some(SYNCTHING_FOLDER_BLOB_PUBLIC_ID)
     } else {
@@ -16685,6 +22196,27 @@ fn dist_sync_ready_from_finalize_payload(
         .unwrap_or(false)
 }
 
+/// The static address a spoke's finalize links the motherbee at (host posture stage 2, A-47): a
+/// spoke always reaches the motherbee at one, so the link never depends on discovery. `Ok(None)`
+/// when the finalize links no peer. A peer without an address, or with one that is not a
+/// `tcp://<ip>:<port>` literal, is refused instead of being written as `dynamic`.
+fn finalize_peer_static_address(
+    peer_device_id: Option<&str>,
+    peer_address: Option<&str>,
+) -> Result<Option<SyncthingPeerAddress>, String> {
+    match (peer_device_id, peer_address) {
+        (_, Some(address)) => SyncthingPeerAddress::parse_static(address)
+            .map(Some)
+            .ok_or_else(|| format!("invalid syncthing_peer_address '{address}'")),
+        (Some(_), None) => Err(
+            "syncthing_peer_address is required with syncthing_peer_device_id: \
+                                the spoke reaches the motherbee at a static address"
+                .to_string(),
+        ),
+        (None, None) => Ok(None),
+    }
+}
+
 fn syncthing_device_id_from_finalize_payload(finalize: &serde_json::Value) -> Option<String> {
     finalize
         .get("syncthing_device_id")
@@ -16694,13 +22226,484 @@ fn syncthing_device_id_from_finalize_payload(finalize: &serde_json::Value) -> Op
         .map(str::to_string)
 }
 
+/// Any hive left at `joining` at boot is by definition orphaned: `write_pid` guarantees one
+/// orchestrator per box, so nothing else can still be driving it.
+///
+/// A join is deliberately NOT auto-resumed. It needs the bootstrap credentials, and the contract
+/// is that those are never persisted — resuming across a restart would mean storing them. The
+/// operator re-POSTs instead, and the retry is key-first anyway, so in practice it resumes
+/// without the password.
+fn sweep_interrupted_joins() {
+    sweep_interrupted_joins_in(&hives_root())
+}
+
+fn sweep_interrupted_joins_in(root: &Path) {
+    let Ok(entries) = fs::read_dir(root) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let Some(hive_id) = entry.file_name().to_str().map(str::to_string) else {
+            continue;
+        };
+        if hive_status(root, &hive_id).as_deref() != Some("joining") {
+            continue;
+        }
+        tracing::warn!(
+            hive_id = %hive_id,
+            "hive was joining when the orchestrator stopped; marking it interrupted (re-POST add_hive to resume)"
+        );
+        update_join_state_in(root, &hive_id, "interrupted", "done", |info| {
+            info["join"]["error_code"] = serde_json::json!("JOIN_INTERRUPTED");
+            info["join"]["error_detail"] =
+                serde_json::json!("orchestrator restarted while the join was running");
+            info["join"]["finished_at_ms"] = serde_json::json!(now_epoch_ms().to_string());
+        });
+    }
+}
+
+/// Everything a background join needs, owned — nothing borrowed from the admin message.
+struct JoinParams {
+    hive_id: String,
+    address: String,
+    harden_ssh: bool,
+    restrict_ssh: bool,
+    require_dist_sync: bool,
+    dist_sync_probe_timeout_secs: u64,
+    /// Held in memory for the life of the join and never written anywhere: the contract is
+    /// that the bootstrap password / key is never logged nor persisted. That is also why a
+    /// join cannot be auto-resumed across an orchestrator restart.
+    creds: BootstrapCreds,
+    role: JoinRole,
+}
+
+enum JoinRole {
+    Worker,
+    Egress(EgressSection),
+    Ingress(IngressSection),
+}
+
+impl JoinRole {
+    fn as_str(&self) -> &'static str {
+        match self {
+            JoinRole::Worker => "worker",
+            JoinRole::Egress(_) => "egress",
+            JoinRole::Ingress(_) => "ingress",
+        }
+    }
+}
+
+/// Publish a join phase into `info.yaml` so `GET /hives/<id>` is a real progress surface.
+///
+/// Best-effort by design: failing to record a phase must never abort a join that is otherwise
+/// going fine.
+fn update_join_state(
+    hive_id: &str,
+    status: &str,
+    phase: &str,
+    mutate: impl FnOnce(&mut serde_json::Value),
+) {
+    update_join_state_in(&hives_root(), hive_id, status, phase, mutate)
+}
+
+/// Takes the root so it is testable without the real state dir (same seam as
+/// `prune_core_backup_generations_in`).
+fn update_join_state_in(
+    root: &Path,
+    hive_id: &str,
+    status: &str,
+    phase: &str,
+    mutate: impl FnOnce(&mut serde_json::Value),
+) {
+    // NEVER resurrect a hive that is gone. `write_hive_info` -> `write_file_atomic` calls
+    // `create_dir_all`, so without this guard the join's tail — which runs AFTER the flow
+    // released the topology lock — would recreate a directory `remove_hive` just deleted,
+    // leaving a zombie that answers HIVE_EXISTS forever and that nothing owns.
+    if !root.join(hive_id).is_dir() {
+        tracing::warn!(
+            hive_id = hive_id,
+            "hive directory is gone (removed mid-join?); not recording join state"
+        );
+        return;
+    }
+    let mut info = read_hive_info(root, hive_id).unwrap_or_else(|_| serde_json::json!({}));
+    info["status"] = serde_json::json!(status);
+    if !info["join"].is_object() {
+        info["join"] = serde_json::json!({});
+    }
+    info["join"]["phase"] = serde_json::json!(phase);
+    info["join"]["updated_at_ms"] = serde_json::json!(now_epoch_ms().to_string());
+    mutate(&mut info);
+    if let Err(err) = write_hive_info(root, hive_id, &info) {
+        tracing::warn!(hive_id = hive_id, error = %err, "could not record join phase");
+    }
+}
+
+/// Accept an `add_hive` and run it in the background.
+///
+/// PB-7/U-8a. A real join takes >6 minutes against a 180 s admin response window, so the caller
+/// used to get `TIMEOUT` on an operation that was still running and usually succeeded. Worse,
+/// every `ADMIN_COMMAND` goes to ONE serial channel that the join occupied end to end — so
+/// `get_hive`/`list_hives`/`hive_status` queued behind it, expired client-side at 30 s, and then
+/// executed late. The hive's whole control plane was blocked for the duration.
+///
+/// Now: validate synchronously (the operator still learns about a bad payload immediately),
+/// publish `status: joining`, hand the work to a blocking thread, and answer `accepted` at once.
+async fn accept_add_hive(
+    state: &Arc<OrchestratorState>,
+    payload: &serde_json::Value,
+) -> serde_json::Value {
+    let invalid = |message: String| {
+        serde_json::json!({
+            "status": "error",
+            "error_code": "INVALID_REQUEST",
+            "message": message,
+        })
+    };
+
+    let Some(hive_id) = payload
+        .get("hive_id")
+        .and_then(|v| v.as_str())
+        .map(str::to_string)
+    else {
+        return invalid("missing hive_id".to_string());
+    };
+    let address = payload
+        .get("address")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default()
+        .to_string();
+
+    // Everything below is pure resolution of the request: it must stay synchronous so a
+    // malformed payload is still an immediate, actionable error rather than a background failure.
+    let harden_ssh = resolve_add_hive_harden_ssh(payload);
+    let restrict_ssh = resolve_add_hive_restrict_ssh(payload, harden_ssh);
+    if let Err(message) = reject_removed_add_hive_fields(payload) {
+        return invalid(message);
+    }
+    let require_dist_sync = resolve_add_hive_require_dist_sync(payload);
+    let dist_sync_probe_timeout_secs = resolve_add_hive_dist_sync_probe_timeout_secs(payload);
+    let creds = match resolve_add_hive_ssh_creds(payload) {
+        Ok(creds) => creds,
+        Err(err) => return invalid(err.to_string()),
+    };
+    let role = match resolve_add_hive_role(payload) {
+        Ok(HiveRole::Egress) => match resolve_add_hive_egress_section(payload) {
+            Ok(section) => JoinRole::Egress(section),
+            Err(err) => return invalid(err.to_string()),
+        },
+        Ok(HiveRole::Ingress) => match resolve_add_hive_ingress_section(payload) {
+            Ok(section) => JoinRole::Ingress(section),
+            Err(err) => return invalid(err.to_string()),
+        },
+        Ok(_) => JoinRole::Worker,
+        Err(err) => return invalid(err.to_string()),
+    };
+
+    if !valid_hive_id(&hive_id) {
+        return serde_json::json!({
+            "status": "error",
+            "error_code": "INVALID_HIVE_ID",
+            "message": "hive_id must be 1-64 chars of [a-z0-9-_] (no '/', '.', '..')",
+        });
+    }
+    // These three used to be checked only INSIDE the flow — i.e. after acceptance had already
+    // created hives/<id>/ and published `joining`. A typo'd address or an unauthorized hive
+    // therefore left a permanent phantom directory that `list_versions` then fanned out to on
+    // every call. They are pure and cheap, so they belong here, where the operator learns about
+    // them synchronously.
+    if !valid_address(&address) {
+        return serde_json::json!({
+            "status": "error",
+            "error_code": "INVALID_ADDRESS",
+            "message": "invalid address",
+        });
+    }
+    if state.wan_listen.as_deref().unwrap_or("").is_empty() {
+        return serde_json::json!({
+            "status": "error",
+            "error_code": "MISSING_WAN_LISTEN",
+            "message": "wan.listen missing in hive.yaml",
+        });
+    }
+    if !state.wan_authorized_hives.is_empty()
+        && !state
+            .wan_authorized_hives
+            .iter()
+            .any(|allowed| allowed.trim() == hive_id)
+    {
+        return serde_json::json!({
+            "status": "error",
+            "error_code": "WAN_NOT_AUTHORIZED",
+            "message": format!(
+                "hive '{hive_id}' not present in wan.authorized_hives; update /etc/fluxbee/hive.yaml or leave authorized_hives empty"
+            ),
+        });
+    }
+
+    // In-flight protection lives HERE, not in the flows: hold the topology lock across the
+    // read-then-write so two concurrent accepts cannot both decide the hive is free.
+    //
+    // TRY-lock, never await. The background join holds this same lock for its whole ~6-minute
+    // run, so awaiting it here would park the single serial admin worker for that entire time —
+    // the exact blockage this change removes — and the JOIN_IN_PROGRESS answer below would be
+    // unreachable, because we would never get far enough to return it.
+    let root = hives_root();
+    let Some(guard) = state.try_lock_hive_topology(&hive_id) else {
+        return serde_json::json!({
+            "status": "error",
+            "error_code": "JOIN_IN_PROGRESS",
+            "retryable": true,
+            "hive_id": hive_id,
+            "message": "another topology operation for this hive is running; poll GET /hives/<hive_id>",
+        });
+    };
+    match hive_status(&root, &hive_id).as_deref() {
+        Some("connected") => {
+            return serde_json::json!({
+                "status": "error",
+                "error_code": "HIVE_EXISTS",
+                "message": "hive already exists",
+            })
+        }
+        Some("joining") => {
+            return serde_json::json!({
+                "status": "error",
+                "error_code": "JOIN_IN_PROGRESS",
+                "retryable": true,
+                "hive_id": hive_id,
+                "message": "a join for this hive is already running; poll GET /hives/<hive_id>",
+            })
+        }
+        _ => {}
+    }
+
+    let join_id = Uuid::new_v4().to_string();
+    let now = now_epoch_ms().to_string();
+    let resumed = hive_exists(&state.state_dir, &hive_id);
+    if let Err(err) = fs::create_dir_all(root.join(&hive_id)) {
+        return serde_json::json!({
+            "status": "error",
+            "error_code": "IO_ERROR",
+            "message": err.to_string(),
+        });
+    }
+    // Published BEFORE the work starts, which is also what makes the flows' `remove_dir_all`
+    // cleanup unreachable for a live join: that path only triggers when the directory exists
+    // WITHOUT an info.yaml.
+    update_join_state(&hive_id, "joining", "accepted", |info| {
+        // Clear the PREVIOUS attempt's terminal fields. Without this a retry shows a running
+        // join decorated with the old failure — the operator reads a stale error as current.
+        for stale in ["error_code", "error_detail", "finished_at_ms", "result"] {
+            if let Some(join) = info["join"].as_object_mut() {
+                join.remove(stale);
+            }
+        }
+        info["hive_id"] = serde_json::json!(hive_id);
+        info["address"] = serde_json::json!(address);
+        info["role"] = serde_json::json!(role.as_str());
+        info["ssh_user"] = serde_json::json!(creds.user);
+        if info["created_at"].is_null() {
+            info["created_at"] = serde_json::json!(now);
+        }
+        info["join"]["join_id"] = serde_json::json!(join_id);
+        info["join"]["owner_pid"] = serde_json::json!(std::process::id());
+        info["join"]["started_at_ms"] = serde_json::json!(now);
+        info["join"]["resumed"] = serde_json::json!(resumed);
+    });
+    drop(guard);
+
+    let params = JoinParams {
+        hive_id: hive_id.clone(),
+        address: address.clone(),
+        harden_ssh,
+        restrict_ssh,
+        require_dist_sync,
+        dist_sync_probe_timeout_secs,
+        creds,
+        role,
+    };
+    spawn_background_join(Arc::clone(state), params);
+
+    serde_json::json!({
+        "status": "accepted",
+        "hive_id": hive_id,
+        "address": address,
+        "join_id": join_id,
+        "resumed": resumed,
+        "poll": format!("GET /hives/{hive_id}"),
+        "message": "join accepted; running in background (a real join takes several minutes)",
+    })
+}
+
+/// Run the join off the admin worker.
+///
+/// `spawn_blocking` + its own `block_on`, rather than `tokio::spawn`: the add_hive path is full
+/// of genuinely blocking work — dozens of `ssh`/`scp` invocations, a ~35 MB vendor push, and
+/// several `std::thread::sleep`s. On a runtime worker thread those starve the executor; on a
+/// blocking thread they are exactly what that pool is for. It also means the flows keep their
+/// current shape instead of being cut into a dozen blocking regions.
+fn spawn_background_join(state: Arc<OrchestratorState>, params: JoinParams) {
+    tokio::task::spawn_blocking(move || {
+        let handle = tokio::runtime::Handle::current();
+        let hive_id = params.hive_id.clone();
+        // A panicking join must not leave the hive stuck at `joining` forever.
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            handle.block_on(run_background_join(&state, params))
+        }));
+        if outcome.is_err() {
+            tracing::error!(hive_id = %hive_id, "background join PANICKED");
+            update_join_state(&hive_id, "failed", "done", |info| {
+                info["join"]["error_code"] = serde_json::json!("JOIN_PANICKED");
+                info["join"]["error_detail"] = serde_json::json!("the join task panicked");
+                info["join"]["finished_at_ms"] = serde_json::json!(now_epoch_ms().to_string());
+            });
+        }
+    });
+}
+
+async fn run_background_join(state: &Arc<OrchestratorState>, params: JoinParams) {
+    let JoinParams {
+        hive_id,
+        address,
+        harden_ssh,
+        restrict_ssh,
+        require_dist_sync,
+        dist_sync_probe_timeout_secs,
+        creds,
+        role,
+    } = params;
+
+    update_join_state(&hive_id, "joining", "running", |_| {});
+
+    let mut result = match &role {
+        JoinRole::Egress(section) => {
+            add_egress_hive_flow(
+                state,
+                &hive_id,
+                &address,
+                harden_ssh,
+                restrict_ssh,
+                section.clone(),
+                &creds,
+            )
+            .await
+        }
+        JoinRole::Ingress(section) => {
+            add_ingress_hive_flow(
+                state,
+                &hive_id,
+                &address,
+                harden_ssh,
+                restrict_ssh,
+                section.clone(),
+                &creds,
+            )
+            .await
+        }
+        JoinRole::Worker => {
+            add_hive_flow(
+                state,
+                &hive_id,
+                &address,
+                harden_ssh,
+                restrict_ssh,
+                require_dist_sync,
+                dist_sync_probe_timeout_secs,
+                &creds,
+            )
+            .await
+        }
+    };
+
+    // B-2 — moved here WITH the join, not left behind in handle_admin. If this is ever
+    // separated from the flow again, a failed background join silently leaves the motherbee
+    // key and the NOPASSWD sudoers on the box forever.
+    //
+    // Skipped on a transient failure, so the retry stays key-first.
+    let ok = result.get("status").and_then(|v| v.as_str()) == Some("ok");
+    if !ok && !add_hive_result_is_transient(&result) {
+        let revoke =
+            best_effort_revoke_bootstrap(&address, creds.user.as_str(), creds.password.as_deref());
+        let ssh_key_removed = revoke.ssh_key_removed;
+        let sudoers_removed = revoke.sudoers_removed;
+        let still_open = !revoke.closed();
+        if still_open {
+            tracing::warn!(
+                hive_id = %hive_id,
+                "failed join: could NOT remove the motherbee bootstrap key — it is still on the box"
+            );
+        }
+        if let Some(obj) = result.as_object_mut() {
+            obj.insert(
+                "ssh_bootstrap_open".to_string(),
+                serde_json::json!(still_open),
+            );
+            obj.insert(
+                "ssh_key_removed".to_string(),
+                serde_json::json!(ssh_key_removed),
+            );
+            obj.insert(
+                "sudoers_removed".to_string(),
+                serde_json::json!(sudoers_removed),
+            );
+        }
+    } else if !ok && add_hive_result_is_transient(&result) {
+        if let Some(obj) = result.as_object_mut() {
+            obj.insert("ssh_bootstrap_open".to_string(), serde_json::json!(true));
+            obj.insert(
+                "revoke_skipped_transient".to_string(),
+                serde_json::json!(true),
+            );
+        }
+    }
+
+    let error_code = result
+        .get("error_code")
+        .and_then(|v| v.as_str())
+        .map(str::to_string);
+    let error_detail = result
+        .get("message")
+        .and_then(|v| v.as_str())
+        .map(str::to_string);
+
+    // The outcome used to live only in the RPC reply, which no longer exists — record it where
+    // `list_deployments` can find it.
+    append_single_deployment_history(
+        state,
+        "core",
+        "add_hive",
+        &hive_id,
+        if ok { "ok" } else { "error" },
+        error_code.clone(),
+        local_core_manifest_hash().ok().flatten(),
+    );
+
+    // The flow itself sets `connected` on success; only stamp the terminal join record.
+    let status = if ok {
+        hive_status(&hives_root(), &hive_id).unwrap_or_else(|| "connected".to_string())
+    } else {
+        "failed".to_string()
+    };
+    update_join_state(&hive_id, &status, "done", |info| {
+        info["join"]["finished_at_ms"] = serde_json::json!(now_epoch_ms().to_string());
+        info["join"]["error_code"] = serde_json::json!(error_code);
+        info["join"]["error_detail"] = serde_json::json!(error_detail);
+        info["join"]["result"] = result.clone();
+    });
+
+    if ok {
+        tracing::info!(hive_id = %hive_id, "background join finished OK");
+    } else {
+        tracing::warn!(hive_id = %hive_id, error_code = ?error_code, "background join FAILED");
+    }
+}
+
 async fn add_hive_flow(
     state: &OrchestratorState,
     hive_id: &str,
     address: &str,
     harden_ssh: bool,
     restrict_ssh: bool,
-    ssh_access: SshAccess,
     require_dist_sync: bool,
     dist_sync_probe_timeout_secs: u64,
     creds: &BootstrapCreds,
@@ -16753,6 +22756,26 @@ async fn add_hive_flow(
     } else {
         None
     };
+    // Host posture stage 2: the worker reaches the motherbee's Syncthing at the same address it
+    // dials for the WAN uplink, as egress and ingress joins already do (A-47).
+    let mother_syncthing_address = if syncthing_expected {
+        let wan_listen = state.wan_listen.clone().unwrap_or_default();
+        match resolve_worker_uplink_address(&wan_listen, address)
+            .and_then(|uplink| parse_host_port(&uplink))
+            .and_then(|(host, _)| syncthing_tcp_address_for_host(&host))
+        {
+            Ok(value) => Some(value),
+            Err(err) => {
+                return serde_json::json!({
+                    "status": "error",
+                    "error_code": "SYNC_SETUP_FAILED",
+                    "message": format!("motherbee Syncthing address unavailable: {err}"),
+                });
+            }
+        }
+    } else {
+        None
+    };
     let mut dist_sync_ready =
         !desired_dist.sync_enabled || !dist_sync_tool_is_syncthing(&desired_dist);
     let root = hives_root();
@@ -16762,7 +22785,7 @@ async fn add_hive_flow(
         // completed (peer-link / SSH controls / status=connected). Resume it via
         // the idempotent socket-first fast path below rather than dead-ending at
         // HIVE_EXISTS, which would leave the hive permanently half-provisioned (F9).
-        if hive_status(&root, hive_id).as_deref() == Some("pending") {
+        if hive_status_is_resumable(hive_status(&root, hive_id).as_deref()) {
             tracing::warn!(
                 hive_id = hive_id,
                 "hive is pending; resuming add_hive to complete finalize (idempotent)"
@@ -16877,7 +22900,7 @@ async fn add_hive_flow(
                 dist_sync_probe_timeout_secs,
                 mother_syncthing_device_id.as_deref(),
                 Some(&state.hive_id),
-                None,
+                mother_syncthing_address.as_deref(),
             )
             .await
             {
@@ -16955,9 +22978,9 @@ async fn add_hive_flow(
                         &desired_dist,
                         &peer_device_id,
                         hive_id,
-                        None,
+                        SyncthingPeerAddress::AcceptOnly,
                         state.is_motherbee,
-                        false,
+                        HiveRole::Worker,
                     )
                     .await
                     {
@@ -17005,6 +23028,7 @@ async fn add_hive_flow(
                     "address": address,
                     "created_at": now_epoch_ms().to_string(),
                     "status": "connected",
+                    "role": "worker",
                     "ssh_user": creds.user,
                 });
                 if let Some(device_id) = worker_syncthing_device_id.clone() {
@@ -17061,6 +23085,11 @@ async fn add_hive_flow(
         }
     }
 
+    // The leaf first: a CA that cannot issue fails the join before it installs anything.
+    let tls = match issue_hive_tls(hive_id) {
+        Ok(tls) => tls,
+        Err(payload) => return payload,
+    };
     let key_path = PathBuf::from(MOTHERBEE_SSH_KEY_PATH);
     if !key_path.exists() {
         return serde_json::json!({
@@ -17124,11 +23153,12 @@ async fn add_hive_flow(
                     creds.user.as_str(),
                     password,
                 ) {
-                    return serde_json::json!({
-                        "status": "error",
-                        "error_code": "SSH_KEY_FAILED",
-                        "message": format!("failed to seed bootstrap key via password channel: {err}"),
-                    });
+                    // F3-errnorm: a PASSWORD-channel failure is not a key failure — classify it
+                    // (SSH_AUTH_FAILED / SSH_TIMEOUT / SSH_CONNECTION_REFUSED) so a rejected password
+                    // (the cloud-init PasswordAuthentication=no trap) surfaces the right code + hint.
+                    return ssh_bootstrap_error_payload(&format!(
+                        "failed to seed bootstrap key via password channel: {err}"
+                    ));
                 }
             } else {
                 return ssh_bootstrap_error_payload(&format!(
@@ -17138,6 +23168,10 @@ async fn add_hive_flow(
         }
     }
 
+    if let Err(payload) = wait_for_host_to_settle(hive_id, address, &key_path, creds.user.as_str())
+    {
+        return payload;
+    }
     if let Err(err) = ensure_remote_orchestrator_sudoers_with_access(
         address,
         &key_path,
@@ -17293,11 +23327,25 @@ async fn add_hive_flow(
         });
     }
 
-    // Push the vendor runtime (syncthing) so the worker's finalize can set up
-    // blob/dist sync; best-effort — a hiccup must not fail the join (the mTLS
-    // link is already up by now), it just leaves sync unavailable until repaired.
+    // Push the vendor runtime (syncthing) so the worker's finalize can set up blob/dist sync.
+    // Fatal, as in the egress and ingress flows: the vendor arrives THROUGH syncthing, so a worker
+    // joined without it never gets syncthing and nothing can repair it. An SSH blip here is
+    // retryable (the message carries it), so the key stays for the retry.
     if let Err(err) = sync_vendor_to_worker(hive_id, address, &key_path, creds.user.as_str()) {
-        tracing::warn!(hive_id = hive_id, error = %err, "vendor sync to worker failed; blob/dist sync may be unavailable");
+        append_single_deployment_history(
+            state,
+            "vendor",
+            "add_hive",
+            hive_id,
+            "error",
+            Some("VENDOR_SYNC_FAILED".to_string()),
+            local_syncthing_vendor_hash().ok().flatten(),
+        );
+        return serde_json::json!({
+            "status": "error",
+            "error_code": "VENDOR_SYNC_FAILED",
+            "message": err.to_string(),
+        });
     }
 
     let wan_listen = state.wan_listen.clone().unwrap_or_default();
@@ -17377,7 +23425,7 @@ async fn add_hive_flow(
         state.ai.provider, state.ai.provider, state.ai.model
     );
     let hive_yaml = format!(
-        "hive_id: {}\nrole: worker\n{}wan:\n  gateway_name: RT.gateway\n  mtls: required\n  uplinks:\n    - address: \"{}\"\nnats:\n  mode: embedded\n  port: 4222\nstorage:\n  path: \"{}\"\ngovernment:\n  identity_frontdesk: \"{}\"\nidentity:\n  sync:\n    upstream: \"{}\"\n    auth: required\nblob:\n  enabled: {}\n  path: \"{}\"\n  sync:\n    enabled: {}\n    tool: \"{}\"\n    api_port: {}\n    data_dir: \"{}\"\n  gc:\n    enabled: {}\n    interval_secs: {}\n    apply: {}\n    staging_ttl_hours: {}\n    active_retain_days: {}\ndist:\n  path: \"{}\"\n  sync:\n    enabled: {}\n    tool: \"{}\"\n{}{}",
+        "hive_id: {}\nrole: worker\n{}wan:\n  gateway_name: RT.gateway\n  mtls: required\n  uplinks:\n    - address: \"{}\"\nstorage:\n  path: \"{}\"\ngovernment:\n  identity_frontdesk: \"{}\"\nidentity:\n  sync:\n    upstream: \"{}\"\n    auth: required\nblob:\n  enabled: {}\n  path: \"{}\"\n  sync:\n    enabled: {}\n    tool: \"{}\"\n    api_port: {}\n    data_dir: \"{}\"\n  gc:\n    enabled: {}\n    interval_secs: {}\n    apply: {}\n    staging_ttl_hours: {}\n    active_retain_days: {}\ndist:\n  path: \"{}\"\n  sync:\n    enabled: {}\n    tool: \"{}\"\n{}{}",
         hive_id,
         ai_yaml,
         worker_uplink,
@@ -17415,9 +23463,10 @@ async fn add_hive_flow(
         });
     }
 
-    // Distribute the mesh TLS material so this worker's router can present a cert
-    // when wan.mtls is enabled (best-effort; WAN degrades to plaintext without it).
-    distribute_hive_tls(address, &key_path, creds.user.as_str(), hive_id);
+    // The mesh TLS material: the worker's router requires it (fatal, D32).
+    if let Err(payload) = push_hive_tls(address, &key_path, creds.user.as_str(), hive_id, &tls) {
+        return payload;
+    }
     // Distribute the per-hive identity HMAC key so this worker's sy-identity can
     // authenticate to the motherbee's :9100. Fatal: the worker template ships
     // identity.sync.auth=required, so without the key its sy-identity fails
@@ -17585,6 +23634,7 @@ async fn add_hive_flow(
         "address": address,
         "created_at": now_epoch_ms().to_string(),
         "status": if wan_connected && orchestrator_connected { "connected" } else { "pending" },
+        "role": "worker",
         "ssh_user": creds.user,
     });
     if let Err(err) = write_hive_info(&root, hive_id, &info_payload) {
@@ -17650,7 +23700,7 @@ async fn add_hive_flow(
         dist_sync_probe_timeout_secs,
         mother_syncthing_device_id.as_deref(),
         Some(&state.hive_id),
-        None,
+        mother_syncthing_address.as_deref(),
     )
     .await
     {
@@ -17704,9 +23754,9 @@ async fn add_hive_flow(
             &desired_dist,
             &peer_device_id,
             hive_id,
-            None,
+            SyncthingPeerAddress::AcceptOnly,
             state.is_motherbee,
-            false,
+            HiveRole::Worker,
         )
         .await
         {
@@ -17750,77 +23800,50 @@ async fn add_hive_flow(
         });
     }
 
-    // key_only_persist replaces the controls+revoke pair with the per-spoke persist finalize
-    // (seed a per-spoke key, harden, verify-before-revoke, vault_put, remove only the MB key);
-    // default `revoke` keeps today's controls + full bootstrap revoke below.
-    let controls_result = if ssh_access == SshAccess::KeyOnlyPersist {
-        finalize_spoke_key_persist(
-            state,
-            address,
-            &key_path,
-            creds.user.as_str(),
-            &pub_key,
-            hive_id,
-        )
-        .await
-        .map(|r| {
-            (
-                AddHiveSshControlsResult {
-                    restrict_ssh_applied: r.restrict_ssh_applied,
-                    restrict_ssh_mode: r.restrict_ssh_mode,
-                },
-                r.ssh_access,
-                r.spoke_key_vault_ref,
-                Some(r.ssh_bootstrap_revoked),
-            )
-        })
-    } else {
-        apply_add_hive_ssh_controls_after_finalize(
-            address,
-            &key_path,
-            creds.user.as_str(),
-            &pub_key,
-            restrict_ssh,
-            harden_ssh,
-        )
-        .map(|result| (result, "revoke".to_string(), None::<String>, None::<bool>))
+    let ssh_controls = match apply_add_hive_ssh_controls_after_finalize(
+        address,
+        &key_path,
+        creds.user.as_str(),
+        &pub_key,
+        restrict_ssh,
+        harden_ssh,
+    ) {
+        Ok(controls) => controls,
+        Err(err) => {
+            let err_text = err.to_string();
+            let error_code = if err_text.to_ascii_lowercase().contains("harden") {
+                "SSH_HARDEN_FAILED"
+            } else {
+                "SSH_KEY_FAILED"
+            };
+            return serde_json::json!({
+                "status": "error",
+                "error_code": error_code,
+                "message": err_text,
+                "hive_id": hive_id,
+                "address": address,
+                "harden_ssh": harden_ssh,
+                "restrict_ssh": false,
+                "restrict_ssh_requested": restrict_ssh,
+                "require_dist_sync": require_dist_sync,
+                "dist_sync_probe_timeout_secs": dist_sync_probe_timeout_secs,
+                "wan_connected": true,
+                "orchestrator_connected": true,
+                "dist_sync_ready": dist_sync_ready,
+                "finalize": finalize,
+            });
+        }
     };
-    let (ssh_controls, ssh_access_mode, spoke_key_vault_ref, persist_revoked) =
-        match controls_result {
-            Ok(tuple) => tuple,
-            Err(err) => {
-                let err_text = err.to_string();
-                let error_code = if err_text.to_ascii_lowercase().contains("harden") {
-                    "SSH_HARDEN_FAILED"
-                } else {
-                    "SSH_KEY_FAILED"
-                };
-                return serde_json::json!({
-                    "status": "error",
-                    "error_code": error_code,
-                    "message": err_text,
-                    "hive_id": hive_id,
-                    "address": address,
-                    "harden_ssh": harden_ssh,
-                    "restrict_ssh": false,
-                    "restrict_ssh_requested": restrict_ssh,
-                    "require_dist_sync": require_dist_sync,
-                    "dist_sync_probe_timeout_secs": dist_sync_probe_timeout_secs,
-                    "wan_connected": true,
-                    "orchestrator_connected": true,
-                    "dist_sync_ready": dist_sync_ready,
-                    "finalize": finalize,
-                });
-            }
-        };
     restrict_ssh_applied = ssh_controls.restrict_ssh_applied;
     let restrict_ssh_mode = ssh_controls.restrict_ssh_mode;
+    let harden_ssh_applied = ssh_controls.harden_ssh_applied;
 
     let mut final_info_payload = serde_json::json!({
         "hive_id": hive_id,
         "address": address,
         "created_at": now_epoch_ms().to_string(),
         "status": "connected",
+        "role": "worker",
         "syncthing_peer_linked": syncthing_peer_linked,
         "ssh_user": creds.user,
     });
@@ -17839,18 +23862,16 @@ async fn add_hive_flow(
     // dist-sync, so revoke the bootstrap SSH access (strip the motherbee key from
     // authorized_keys + drop the sudoers NOPASSWD grant). This is the last SSH op.
     // Best-effort: a revoke failure must not fail an otherwise-successful join.
-    // key_only_persist already removed only the MB key (persist_revoked=Some); otherwise do the
-    // full SO-02 bootstrap revoke (MB key + sudoers).
-    let ssh_bootstrap_revoked = match persist_revoked {
-        Some(revoked) => revoked,
-        None => {
-            match revoke_bootstrap_ssh_access(address, &key_path, creds.user.as_str(), &pub_key) {
-                Ok(()) => true,
-                Err(err) => {
-                    tracing::warn!(hive_id = hive_id, error = %err, "SO-02: failed to revoke bootstrap SSH access; key/sudoers may remain on the worker");
-                    false
-                }
-            }
+    let ssh_bootstrap_revoked = match revoke_bootstrap_ssh_access(
+        address,
+        &key_path,
+        creds.user.as_str(),
+        &pub_key,
+    ) {
+        Ok(()) => true,
+        Err(err) => {
+            tracing::warn!(hive_id = hive_id, error = %err, "SO-02: failed to revoke bootstrap SSH access; key/sudoers may remain on the worker");
+            false
         }
     };
 
@@ -17859,13 +23880,11 @@ async fn add_hive_flow(
         "hive_id": hive_id,
         "address": address,
         "harden_ssh": harden_ssh,
-        "harden_ssh_applied": harden_ssh,
+        "harden_ssh_applied": harden_ssh_applied,
         "restrict_ssh": restrict_ssh_applied,
         "restrict_ssh_mode": restrict_ssh_mode,
         "restrict_ssh_requested": restrict_ssh,
         "ssh_bootstrap_revoked": ssh_bootstrap_revoked,
-        "ssh_access": ssh_access_mode,
-        "spoke_key_vault_ref": spoke_key_vault_ref,
         "require_dist_sync": require_dist_sync,
         "dist_sync_probe_timeout_secs": dist_sync_probe_timeout_secs,
         "wan_connected": true,
@@ -17888,7 +23907,6 @@ async fn add_egress_hive_flow(
     address: &str,
     harden_ssh: bool,
     restrict_ssh: bool,
-    ssh_access: SshAccess,
     egress: EgressSection,
     creds: &BootstrapCreds,
 ) -> serde_json::Value {
@@ -17923,7 +23941,7 @@ async fn add_egress_hive_flow(
         // The egress flow has no socket fast path, so resuming re-runs the
         // bootstrap, which is idempotent (sudoers from template, dedup keys,
         // restart) and applies the SSH controls the pending state never reached.
-        if hive_status(&root, hive_id).as_deref() == Some("pending") {
+        if hive_status_is_resumable(hive_status(&root, hive_id).as_deref()) {
             tracing::warn!(
                 hive_id = hive_id,
                 "egress hive is pending; resuming add_hive to complete finalize (idempotent)"
@@ -17971,6 +23989,11 @@ async fn add_egress_hive_flow(
         return err_payload("IO_ERROR", err.to_string());
     }
 
+    // The leaf first: a CA that cannot issue fails the join before it installs anything.
+    let tls = match issue_hive_tls(hive_id) {
+        Ok(tls) => tls,
+        Err(payload) => return payload,
+    };
     // SSH bootstrap: seed the motherbee key, then operate over the key channel.
     let key_path = PathBuf::from(MOTHERBEE_SSH_KEY_PATH);
     if !key_path.exists() {
@@ -18013,10 +24036,11 @@ async fn add_egress_hive_flow(
                     creds.user.as_str(),
                     password,
                 ) {
-                    return err_payload(
-                        "SSH_KEY_FAILED",
-                        format!("failed to seed bootstrap key: {err}"),
-                    );
+                    // F3-errnorm: password-channel failure -> classify (SSH_AUTH_FAILED + hint),
+                    // not a blanket SSH_KEY_FAILED.
+                    return ssh_bootstrap_error_payload(&format!(
+                        "failed to seed bootstrap key via password channel: {err}"
+                    ));
                 }
             } else {
                 return ssh_bootstrap_error_payload(&format!(
@@ -18024,6 +24048,10 @@ async fn add_egress_hive_flow(
                 ));
             }
         }
+    }
+    if let Err(payload) = wait_for_host_to_settle(hive_id, address, &key_path, creds.user.as_str())
+    {
+        return payload;
     }
     if let Err(err) = ensure_remote_orchestrator_sudoers_with_access(
         address,
@@ -18101,11 +24129,29 @@ async fn add_egress_hive_flow(
         return err_payload("CORE_SYNC_FAILED", err.to_string());
     }
 
+    // The egress was the ONLY one of the three join flows that never pushed the vendor bundle —
+    // worker and ingress both do. Without it the box never receives the syncthing binary, and
+    // since the vendor arrives THROUGH syncthing, nothing can ever repair it: the watchdog just
+    // restarts `fluxbee-syncthing` every few seconds forever and `/versions` reports the hive's
+    // vendor as unknown. De-divergence, mirroring add_ingress_hive_flow verbatim.
+    if let Err(err) = sync_vendor_to_worker(hive_id, address, &key_path, creds.user.as_str()) {
+        append_single_deployment_history(
+            state,
+            "vendor",
+            "add_hive",
+            hive_id,
+            "error",
+            Some("VENDOR_SYNC_FAILED".to_string()),
+            local_syncthing_vendor_hash().ok().flatten(),
+        );
+        return err_payload("VENDOR_SYNC_FAILED", err.to_string());
+    }
+
     if let Err(err) = ssh_with_key(
         address,
         &key_path,
         &sudo_wrap(
-            "mkdir -p /etc/fluxbee /var/lib/fluxbee/state/nodes /var/lib/fluxbee/opa/current /var/lib/fluxbee/opa/staged /var/lib/fluxbee/opa/backup /var/lib/fluxbee/nats /var/lib/fluxbee/dist /var/lib/fluxbee/dist/runtimes /var/lib/fluxbee/dist/core/bin /var/lib/fluxbee/dist/vendor /var/run/fluxbee/routers",
+            "mkdir -p /etc/fluxbee /var/lib/fluxbee/state/nodes /var/lib/fluxbee/opa/current /var/lib/fluxbee/opa/staged /var/lib/fluxbee/opa/backup /var/lib/fluxbee/dist /var/lib/fluxbee/dist/runtimes /var/lib/fluxbee/dist/core/bin /var/lib/fluxbee/dist/vendor /var/run/fluxbee/routers",
         ),
         creds.user.as_str(),
     ) {
@@ -18139,17 +24185,23 @@ async fn add_egress_hive_flow(
         (worker_uplink.as_str(), "wan uplink address"),
         (storage_path.as_str(), "storage.path"),
         (dist_path_str.as_str(), "dist.path"),
+        (state.dist.sync_tool.as_str(), "dist.sync.tool"),
     ] {
         if let Err(err) = validate_yaml_scalar(val, label) {
             return err_payload("CONFIG_FAILED", err.to_string());
         }
     }
+    // U-2: this was hardcoded `enabled: false`, which left the egress with no core channel and
+    // an `update category=core` that sat at 202 sync_pending forever without ever saying the
+    // folder did not exist. It now follows motherbee's dist config like the worker's writer.
     let hive_yaml = format!(
-        "hive_id: {hive_id}\nrole: egress\nwan:\n  gateway_name: RT.gateway\n  mtls: required\n  uplinks:\n    - address: \"{uplink}\"\nnats:\n  mode: embedded\n  port: 4222\nstorage:\n  path: \"{storage}\"\nblob:\n  enabled: false\n  sync:\n    enabled: false\ndist:\n  path: \"{dist_path}\"\n  sync:\n    enabled: false\negress:\n  enabled: true\n  lan_cidr: \"{lan_cidr}\"\n  edge_ip: \"{edge_ip}\"\n  wan_iface: \"{wan_iface}\"\n  lan_iface: \"{lan_iface}\"\n  ipv6: \"blocked\"\n{system_nodes}",
+        "hive_id: {hive_id}\nrole: egress\nwan:\n  gateway_name: RT.gateway\n  mtls: required\n  uplinks:\n    - address: \"{uplink}\"\nstorage:\n  path: \"{storage}\"\nblob:\n  enabled: false\n  sync:\n    enabled: false\ndist:\n  path: \"{dist_path}\"\n  sync:\n    enabled: {dist_sync_enabled}\n    tool: \"{dist_sync_tool}\"\negress:\n  enabled: true\n  lan_cidr: \"{lan_cidr}\"\n  edge_ip: \"{edge_ip}\"\n  wan_iface: \"{wan_iface}\"\n  lan_iface: \"{lan_iface}\"\n  ipv6: \"blocked\"\n{system_nodes}",
         hive_id = hive_id,
         uplink = worker_uplink,
         storage = storage_path,
         dist_path = state.dist.path.display(),
+        dist_sync_enabled = state.dist.sync_enabled,
+        dist_sync_tool = state.dist.sync_tool,
         lan_cidr = nat.lan_cidr,
         edge_ip = nat.edge_ip,
         wan_iface = nat.wan_iface,
@@ -18165,9 +24217,10 @@ async fn add_egress_hive_flow(
     ) {
         return err_payload("CONFIG_FAILED", err.to_string());
     }
-    // Distribute the mesh TLS material so the egress hive's router can present a
-    // cert when wan.mtls is enabled (best-effort; WAN degrades to plaintext).
-    distribute_hive_tls(address, &key_path, creds.user.as_str(), hive_id);
+    // The mesh TLS material: the egress' router requires it (fatal, D32).
+    if let Err(payload) = push_hive_tls(address, &key_path, creds.user.as_str(), hive_id, &tls) {
+        return payload;
+    }
     let config_routes_yaml = format!(
         "version: 1\nupdated_at: \"{}\"\nroutes: []\nvpns: []\ntaps: []\n",
         now_epoch_ms()
@@ -18251,6 +24304,88 @@ async fn add_egress_hive_flow(
         );
     }
 
+    // SYNCTHING PEER LINK — the egress flow was the only one of the three that never did this.
+    //
+    // Worker and ingress both finalize over the socket, take the spoke's device ID out of the
+    // reply, and link it into their per-role dist folders. Without it motherbee's
+    // `fluxbee-dist-core-egress` folder lists only motherbee, so syncthing has nobody to deliver
+    // to: the egress joins fine and then can NEVER be updated — `update category=core` finds its
+    // dist unchanged and does nothing, silently, forever. Verified on a live hive: that folder
+    // had 1 device while the worker's and ingress's had 2.
+    let desired_blob = current_blob_runtime_config(state);
+    let desired_dist = current_dist_runtime_config(state);
+    let desired_sync = effective_syncthing_runtime_config(&desired_blob, &desired_dist);
+    // The linked device is recorded in the registry like the worker's and the ingress's: the
+    // motherbee's reconcile identifies a hive's device by it (host posture stage 2).
+    let mut egress_syncthing_device_id: Option<String> = None;
+    if desired_dist.sync_enabled && dist_sync_tool_is_syncthing(&desired_dist) {
+        match (
+            parse_host_port(&worker_uplink)
+                .and_then(|(host, _)| syncthing_tcp_address_for_host(&host)),
+            local_syncthing_device_id(&desired_sync),
+        ) {
+            (Ok(mother_syncthing_address), Ok(mother_device_id)) => {
+                match add_hive_finalize_via_socket(
+                    state,
+                    hive_id,
+                    address,
+                    false,
+                    DIST_SYNC_PROBE_TIMEOUT_SECS,
+                    Some(&mother_device_id),
+                    Some(&state.hive_id),
+                    Some(&mother_syncthing_address),
+                )
+                .await
+                {
+                    Ok(finalize) => {
+                        match syncthing_device_id_from_finalize_payload(&finalize) {
+                            Some(device_id) => {
+                                if let Err(err) = ensure_syncthing_peer_link_runtime(
+                                    &desired_sync,
+                                    &desired_blob,
+                                    &desired_dist,
+                                    &device_id,
+                                    hive_id,
+                                    SyncthingPeerAddress::AcceptOnly,
+                                    state.is_motherbee,
+                                    HiveRole::Egress,
+                                )
+                                .await
+                                {
+                                    // Loud, not fatal: the hive is otherwise usable and the
+                                    // operator can re-run the join. Silence here is what let this
+                                    // go unnoticed in the first place.
+                                    tracing::error!(
+                                        hive_id = hive_id,
+                                        error = %err,
+                                        "egress joined but its Syncthing peer link FAILED — it will not receive core or vendor updates"
+                                    );
+                                } else {
+                                    egress_syncthing_device_id = Some(device_id);
+                                }
+                            }
+                            None => tracing::error!(
+                                hive_id = hive_id,
+                                "egress finalize returned no Syncthing device ID — it will not receive updates"
+                            ),
+                        }
+                    }
+                    Err(err) => tracing::error!(
+                        hive_id = hive_id,
+                        error = %err,
+                        "egress Syncthing finalize failed — it will not receive updates"
+                    ),
+                }
+            }
+            (mother_addr, device) => tracing::error!(
+                hive_id = hive_id,
+                addr_err = ?mother_addr.err().map(|e| e.to_string()),
+                device_err = ?device.err().map(|e| e.to_string()),
+                "could not resolve motherbee Syncthing identity for the egress peer link"
+            ),
+        }
+    }
+
     // Connectivity gates: WAN to motherbee + orchestrator visible in LSA.
     let mut wan_connected = true;
     if let Err(err) = wait_for_wan(&state.hive_id, hive_id, Duration::from_secs(60)) {
@@ -18270,7 +24405,7 @@ async fn add_egress_hive_flow(
     // the F9 resume guard would then refuse to re-run it. Leaving `pending` lets
     // a retry resume via the idempotent egress bootstrap. The success path below
     // promotes it to `connected` (D3).
-    let info_payload = serde_json::json!({
+    let mut info_payload = serde_json::json!({
         "hive_id": hive_id,
         "address": address,
         "role": "egress",
@@ -18278,6 +24413,9 @@ async fn add_egress_hive_flow(
         "status": "pending",
         "ssh_user": creds.user,
     });
+    if let Some(device_id) = &egress_syncthing_device_id {
+        info_payload["syncthing_device_id"] = serde_json::json!(device_id);
+    }
     if let Err(err) = write_hive_info(&root, hive_id, &info_payload) {
         return err_payload("IO_ERROR", err.to_string());
     }
@@ -18324,72 +24462,47 @@ async fn add_egress_hive_flow(
     // boundary exposed to the internet, so a failure to disable password auth or
     // restrict the bootstrap key must NOT be reported as success. info.yaml stays
     // `pending` (written above), so a retry resumes via the F9 egress guard.
-    let controls_result = if ssh_access == SshAccess::KeyOnlyPersist {
-        finalize_spoke_key_persist(
-            state,
-            address,
-            &key_path,
-            creds.user.as_str(),
-            &pub_key,
-            hive_id,
-        )
-        .await
-        .map(|r| {
-            (
-                AddHiveSshControlsResult {
-                    restrict_ssh_applied: r.restrict_ssh_applied,
-                    restrict_ssh_mode: r.restrict_ssh_mode,
-                },
-                r.ssh_access,
-                r.spoke_key_vault_ref,
-                Some(r.ssh_bootstrap_revoked),
-            )
-        })
-    } else {
-        apply_add_hive_ssh_controls_after_finalize(
-            address,
-            &key_path,
-            creds.user.as_str(),
-            &pub_key,
-            restrict_ssh,
-            harden_ssh,
-        )
-        .map(|c| (c, "revoke".to_string(), None::<String>, None::<bool>))
+    let ssh_controls = match apply_add_hive_ssh_controls_after_finalize(
+        address,
+        &key_path,
+        creds.user.as_str(),
+        &pub_key,
+        restrict_ssh,
+        harden_ssh,
+    ) {
+        Ok(controls) => controls,
+        Err(err) => {
+            let err_text = err.to_string();
+            let error_code = if err_text.to_ascii_lowercase().contains("harden") {
+                "SSH_HARDEN_FAILED"
+            } else {
+                "SSH_KEY_FAILED"
+            };
+            tracing::warn!(hive_id = hive_id, error = %err_text, "egress ssh hardening failed");
+            return serde_json::json!({
+                "status": "error",
+                "error_code": error_code,
+                "message": err_text,
+                "hive_id": hive_id,
+                "address": address,
+                "egress_role": "egress",
+                "harden_ssh": harden_ssh,
+                "harden_ssh_applied": false,
+                "restrict_ssh": false,
+                "restrict_ssh_requested": restrict_ssh,
+                "wan_connected": true,
+                "orchestrator_connected": true,
+            });
+        }
     };
-    let (ssh_controls, ssh_access_mode, spoke_key_vault_ref, persist_revoked) =
-        match controls_result {
-            Ok(tuple) => tuple,
-            Err(err) => {
-                let err_text = err.to_string();
-                let error_code = if err_text.to_ascii_lowercase().contains("harden") {
-                    "SSH_HARDEN_FAILED"
-                } else {
-                    "SSH_KEY_FAILED"
-                };
-                tracing::warn!(hive_id = hive_id, error = %err_text, "egress ssh hardening failed");
-                return serde_json::json!({
-                    "status": "error",
-                    "error_code": error_code,
-                    "message": err_text,
-                    "hive_id": hive_id,
-                    "address": address,
-                    "egress_role": "egress",
-                    "harden_ssh": harden_ssh,
-                    "harden_ssh_applied": false,
-                    "restrict_ssh": false,
-                    "restrict_ssh_requested": restrict_ssh,
-                    "wan_connected": true,
-                    "orchestrator_connected": true,
-                });
-            }
-        };
     let restrict_ssh_applied = ssh_controls.restrict_ssh_applied;
     let restrict_ssh_mode = ssh_controls.restrict_ssh_mode;
+    let harden_ssh_applied = ssh_controls.harden_ssh_applied;
 
     // Hardening succeeded — the node is closed. Promote the hive to `connected`
     // (D3), mirroring the worker's post-hardening write. Preserve `role: egress`
     // so list_hives / the F9 resume guard keep the role.
-    let connected_info = serde_json::json!({
+    let mut connected_info = serde_json::json!({
         "hive_id": hive_id,
         "address": address,
         "role": "egress",
@@ -18397,6 +24510,9 @@ async fn add_egress_hive_flow(
         "status": "connected",
         "ssh_user": creds.user,
     });
+    if let Some(device_id) = &egress_syncthing_device_id {
+        connected_info["syncthing_device_id"] = serde_json::json!(device_id);
+    }
     if let Err(err) = write_hive_info(&root, hive_id, &connected_info) {
         return err_payload("IO_ERROR", err.to_string());
     }
@@ -18424,16 +24540,16 @@ async fn add_egress_hive_flow(
     // the real value back here is the T-VER-1 follow-up.
     // SO-02: revoke bootstrap SSH access (key + sudoers) — especially important on
     // an egress boundary host. Best-effort. Post-bootstrap is socket + dist-sync.
-    let ssh_bootstrap_revoked = match persist_revoked {
-        Some(revoked) => revoked,
-        None => {
-            match revoke_bootstrap_ssh_access(address, &key_path, creds.user.as_str(), &pub_key) {
-                Ok(()) => true,
-                Err(err) => {
-                    tracing::warn!(hive_id = hive_id, error = %err, "SO-02: failed to revoke bootstrap SSH access on egress; key/sudoers may remain");
-                    false
-                }
-            }
+    let ssh_bootstrap_revoked = match revoke_bootstrap_ssh_access(
+        address,
+        &key_path,
+        creds.user.as_str(),
+        &pub_key,
+    ) {
+        Ok(()) => true,
+        Err(err) => {
+            tracing::warn!(hive_id = hive_id, error = %err, "SO-02: failed to revoke bootstrap SSH access on egress; key/sudoers may remain");
+            false
         }
     };
 
@@ -18449,13 +24565,11 @@ async fn add_egress_hive_flow(
         "egress_nat_applied": true,
         "egress_internet_reachable": serde_json::Value::Null,
         "harden_ssh": harden_ssh,
-        "harden_ssh_applied": harden_ssh,
+        "harden_ssh_applied": harden_ssh_applied,
         "restrict_ssh": restrict_ssh_applied,
         "restrict_ssh_mode": restrict_ssh_mode,
         "restrict_ssh_requested": restrict_ssh,
         "ssh_bootstrap_revoked": ssh_bootstrap_revoked,
-        "ssh_access": ssh_access_mode,
-        "spoke_key_vault_ref": spoke_key_vault_ref,
         "wan_connected": wan_connected,
         "orchestrator_connected": orchestrator_connected,
         "note": "egress orchestrator active implies NAT applied + ipv4_forwarding + ipv6_blocked (reconcile is fatal at its boot). internet_reachable is verified ONLY on the egress host (degrades to WARN in its journal + re-checked every drift tick); not transmitted to motherbee in v1 (T-VER-1). See the egress journal for live detail.",
@@ -18477,7 +24591,6 @@ async fn add_ingress_hive_flow(
     address: &str,
     harden_ssh: bool,
     restrict_ssh: bool,
-    ssh_access: SshAccess,
     ingress: IngressSection,
     creds: &BootstrapCreds,
 ) -> serde_json::Value {
@@ -18512,7 +24625,7 @@ async fn add_ingress_hive_flow(
     let root = hives_root();
     let hive_dir = root.join(hive_id);
     if hive_exists(&state.state_dir, hive_id) {
-        if hive_status(&root, hive_id).as_deref() == Some("pending") {
+        if hive_status_is_resumable(hive_status(&root, hive_id).as_deref()) {
             tracing::warn!(
                 hive_id = hive_id,
                 "ingress hive is pending; resuming add_hive to complete finalize (idempotent)"
@@ -18560,6 +24673,11 @@ async fn add_ingress_hive_flow(
         return err_payload("IO_ERROR", err.to_string());
     }
 
+    // The leaf first: a CA that cannot issue fails the join before it installs anything.
+    let tls = match issue_hive_tls(hive_id) {
+        Ok(tls) => tls,
+        Err(payload) => return payload,
+    };
     // SSH bootstrap (key-first probe, password fallback) — identical to egress.
     let key_path = PathBuf::from(MOTHERBEE_SSH_KEY_PATH);
     if !key_path.exists() {
@@ -18606,6 +24724,10 @@ async fn add_ingress_hive_flow(
                 ));
             }
         }
+    }
+    if let Err(payload) = wait_for_host_to_settle(hive_id, address, &key_path, creds.user.as_str())
+    {
+        return payload;
     }
     if let Err(err) = ensure_remote_orchestrator_sudoers_with_access(
         address,
@@ -18724,15 +24846,6 @@ async fn add_ingress_hive_flow(
             )
         }
     };
-    let ingress_syncthing_address = match syncthing_tcp_address_for_host(address) {
-        Ok(value) => value,
-        Err(err) => {
-            return err_payload(
-                "CONFIG_FAILED",
-                format!("resolve ingress Syncthing address failed: {err}"),
-            )
-        }
-    };
     let storage_path = state
         .storage_path
         .try_lock()
@@ -18766,6 +24879,7 @@ async fn add_ingress_hive_flow(
         (blob_path_str.as_str(), "blob.path"),
         (blob_sync_data_dir_str.as_str(), "blob.sync.data_dir"),
         (blob_sync_tool.as_str(), "blob.sync.tool"),
+        (state.dist.sync_tool.as_str(), "dist.sync.tool"),
         (edge_listen.as_str(), "edge.listen"),
     ] {
         if let Err(err) = validate_yaml_scalar(val, label) {
@@ -18773,11 +24887,13 @@ async fn add_ingress_hive_flow(
         }
     }
     let hive_yaml = format!(
-        "hive_id: {hive_id}\nrole: ingress\nwan:\n  gateway_name: RT.gateway\n  mtls: required\n  uplinks:\n    - address: \"{uplink}\"\nnats:\n  mode: embedded\n  port: 4222\nstorage:\n  path: \"{storage}\"\nblob:\n  enabled: false\n  path: \"{blob_path}\"\n  sync:\n    enabled: true\n    public_enabled: true\n    tool: \"{blob_sync_tool}\"\n    api_port: {blob_sync_api_port}\n    data_dir: \"{blob_sync_data_dir}\"\ndist:\n  path: \"{dist_path}\"\n  sync:\n    enabled: false\nedge:\n  listen: \"{edge_listen}\"\n  endpoints_path: \"/etc/fluxbee/edge.endpoints.json\"\n  publications_path: \"/var/lib/fluxbee/state/sy-edge/publications.json\"\n  blob_public_root: \"{blob_path}/public\"\n{edge_tls}{system_nodes}",
+        "hive_id: {hive_id}\nrole: ingress\nwan:\n  gateway_name: RT.gateway\n  mtls: required\n  uplinks:\n    - address: \"{uplink}\"\nstorage:\n  path: \"{storage}\"\nblob:\n  enabled: false\n  path: \"{blob_path}\"\n  sync:\n    enabled: true\n    public_enabled: true\n    tool: \"{blob_sync_tool}\"\n    api_port: {blob_sync_api_port}\n    data_dir: \"{blob_sync_data_dir}\"\ndist:\n  path: \"{dist_path}\"\n  sync:\n    enabled: {dist_sync_enabled}\n    tool: \"{dist_sync_tool}\"\nedge:\n  listen: \"{edge_listen}\"\n  endpoints_path: \"/etc/fluxbee/edge.endpoints.json\"\n  publications_path: \"/var/lib/fluxbee/state/sy-edge/publications.json\"\n  blob_public_root: \"{blob_path}/public\"\n{edge_tls}{system_nodes}",
         hive_id = hive_id,
         uplink = worker_uplink,
         storage = storage_path,
         dist_path = state.dist.path.display(),
+        dist_sync_enabled = state.dist.sync_enabled,
+        dist_sync_tool = state.dist.sync_tool,
         blob_path = state.blob.path.display(),
         blob_sync_tool = blob_sync_tool,
         blob_sync_api_port = state.blob.sync_api_port,
@@ -18805,7 +24921,10 @@ async fn add_ingress_hive_flow(
     ) {
         return err_payload("CONFIG_FAILED", err.to_string());
     }
-    distribute_hive_tls(address, &key_path, creds.user.as_str(), hive_id);
+    // The mesh TLS material: the ingress' router requires it (fatal, D32).
+    if let Err(payload) = push_hive_tls(address, &key_path, creds.user.as_str(), hive_id, &tls) {
+        return payload;
+    }
     let config_routes_yaml = format!(
         "version: 1\nupdated_at: \"{}\"\nroutes: []\nvpns: []\ntaps: []\n",
         now_epoch_ms()
@@ -18988,8 +25107,14 @@ async fn add_ingress_hive_flow(
     let desired_blob = current_blob_runtime_config(state);
     let desired_dist = current_dist_runtime_config(state);
     let desired_sync = effective_syncthing_runtime_config(&desired_blob, &desired_dist);
-    if let Err(err) =
-        ensure_blob_sync_runtime(&desired_blob, &desired_dist, state.is_motherbee).await
+    if let Err(err) = ensure_blob_sync_runtime(
+        &desired_blob,
+        &desired_dist,
+        state.is_motherbee,
+        state.role,
+        &state.hive_id,
+    )
+    .await
     {
         return err_payload(
             "SYNC_SETUP_FAILED",
@@ -19040,9 +25165,9 @@ async fn add_ingress_hive_flow(
         &desired_dist,
         &ingress_syncthing_device_id,
         hive_id,
-        Some(&ingress_syncthing_address),
+        SyncthingPeerAddress::AcceptOnly,
         state.is_motherbee,
-        true,
+        HiveRole::Ingress,
     )
     .await
     {
@@ -19054,7 +25179,7 @@ async fn add_ingress_hive_flow(
     if let Err(err) = wait_for_syncthing_device_connected(
         &desired_sync,
         &ingress_syncthing_device_id,
-        Duration::from_secs(SYNCTHING_BOOTSTRAP_TIMEOUT_SECS),
+        Duration::from_secs(SYNCTHING_PEER_CONNECT_TIMEOUT_SECS),
     )
     .await
     {
@@ -19095,68 +25220,43 @@ async fn add_ingress_hive_flow(
     }
 
     // SSH hardening (ingress is an internet-facing boundary; fatal, like egress).
-    let controls_result = if ssh_access == SshAccess::KeyOnlyPersist {
-        finalize_spoke_key_persist(
-            state,
-            address,
-            &key_path,
-            creds.user.as_str(),
-            &pub_key,
-            hive_id,
-        )
-        .await
-        .map(|r| {
-            (
-                AddHiveSshControlsResult {
-                    restrict_ssh_applied: r.restrict_ssh_applied,
-                    restrict_ssh_mode: r.restrict_ssh_mode,
-                },
-                r.ssh_access,
-                r.spoke_key_vault_ref,
-                Some(r.ssh_bootstrap_revoked),
-            )
-        })
-    } else {
-        apply_add_hive_ssh_controls_after_finalize(
-            address,
-            &key_path,
-            creds.user.as_str(),
-            &pub_key,
-            restrict_ssh,
-            harden_ssh,
-        )
-        .map(|c| (c, "revoke".to_string(), None::<String>, None::<bool>))
+    let ssh_controls = match apply_add_hive_ssh_controls_after_finalize(
+        address,
+        &key_path,
+        creds.user.as_str(),
+        &pub_key,
+        restrict_ssh,
+        harden_ssh,
+    ) {
+        Ok(controls) => controls,
+        Err(err) => {
+            let err_text = err.to_string();
+            let error_code = if err_text.to_ascii_lowercase().contains("harden") {
+                "SSH_HARDEN_FAILED"
+            } else {
+                "SSH_KEY_FAILED"
+            };
+            tracing::warn!(hive_id = hive_id, error = %err_text, "ingress ssh hardening failed");
+            return serde_json::json!({
+                "status": "error",
+                "error_code": error_code,
+                "message": err_text,
+                "hive_id": hive_id,
+                "address": address,
+                "ingress_role": "ingress",
+                "harden_ssh": harden_ssh,
+                "harden_ssh_applied": false,
+                "restrict_ssh": false,
+                "restrict_ssh_requested": restrict_ssh,
+                "wan_connected": true,
+                "orchestrator_connected": true,
+                "edge_service_active": edge_service_active,
+            });
+        }
     };
-    let (ssh_controls, ssh_access_mode, spoke_key_vault_ref, persist_revoked) =
-        match controls_result {
-            Ok(tuple) => tuple,
-            Err(err) => {
-                let err_text = err.to_string();
-                let error_code = if err_text.to_ascii_lowercase().contains("harden") {
-                    "SSH_HARDEN_FAILED"
-                } else {
-                    "SSH_KEY_FAILED"
-                };
-                tracing::warn!(hive_id = hive_id, error = %err_text, "ingress ssh hardening failed");
-                return serde_json::json!({
-                    "status": "error",
-                    "error_code": error_code,
-                    "message": err_text,
-                    "hive_id": hive_id,
-                    "address": address,
-                    "ingress_role": "ingress",
-                    "harden_ssh": harden_ssh,
-                    "harden_ssh_applied": false,
-                    "restrict_ssh": false,
-                    "restrict_ssh_requested": restrict_ssh,
-                    "wan_connected": true,
-                    "orchestrator_connected": true,
-                    "edge_service_active": edge_service_active,
-                });
-            }
-        };
     let restrict_ssh_applied = ssh_controls.restrict_ssh_applied;
     let restrict_ssh_mode = ssh_controls.restrict_ssh_mode;
+    let harden_ssh_applied = ssh_controls.harden_ssh_applied;
 
     let connected_info = serde_json::json!({
         "hive_id": hive_id,
@@ -19182,16 +25282,16 @@ async fn add_ingress_hive_flow(
         local_core_manifest_hash().ok().flatten(),
     );
 
-    let ssh_bootstrap_revoked = match persist_revoked {
-        Some(revoked) => revoked,
-        None => {
-            match revoke_bootstrap_ssh_access(address, &key_path, creds.user.as_str(), &pub_key) {
-                Ok(()) => true,
-                Err(err) => {
-                    tracing::warn!(hive_id = hive_id, error = %err, "SO-02: failed to revoke bootstrap SSH access on ingress; key/sudoers may remain");
-                    false
-                }
-            }
+    let ssh_bootstrap_revoked = match revoke_bootstrap_ssh_access(
+        address,
+        &key_path,
+        creds.user.as_str(),
+        &pub_key,
+    ) {
+        Ok(()) => true,
+        Err(err) => {
+            tracing::warn!(hive_id = hive_id, error = %err, "SO-02: failed to revoke bootstrap SSH access on ingress; key/sudoers may remain");
+            false
         }
     };
 
@@ -19202,13 +25302,11 @@ async fn add_ingress_hive_flow(
         "ingress_role": "ingress",
         "ingress_listen": edge_listen,
         "harden_ssh": harden_ssh,
-        "harden_ssh_applied": harden_ssh,
+        "harden_ssh_applied": harden_ssh_applied,
         "restrict_ssh": restrict_ssh_applied,
         "restrict_ssh_mode": restrict_ssh_mode,
         "restrict_ssh_requested": restrict_ssh,
         "ssh_bootstrap_revoked": ssh_bootstrap_revoked,
-        "ssh_access": ssh_access_mode,
-        "spoke_key_vault_ref": spoke_key_vault_ref,
         "wan_connected": wan_connected,
         "orchestrator_connected": orchestrator_connected,
         "edge_service_active": edge_service_active,
@@ -19230,11 +25328,25 @@ fn ssh_bootstrap_error_payload(error: &str) -> serde_json::Value {
     } else {
         "SSH_AUTH_FAILED"
     };
-    serde_json::json!({
+    let mut payload = serde_json::json!({
         "status": "error",
         "error_code": code,
         "message": error,
-    })
+    });
+    // F3-hint: the #1 clean-Ubuntu add_hive failure. A stock cloud image ships
+    // /etc/ssh/sshd_config.d/50-cloud-init.conf with PasswordAuthentication no, and sshd is
+    // first-match so a 99-*.conf drop-in cannot override it — password bootstrap then fails with
+    // "permission denied". Point the operator at the key-first channel (the cloud-init-injected key)
+    // or a low-numbered 00-*.conf drop-in.
+    if code == "SSH_AUTH_FAILED" && lower.contains("permission denied") {
+        payload["hint"] = serde_json::json!(
+            "auth rejected. On a stock Ubuntu cloud image PasswordAuthentication is 'no' \
+             (/etc/ssh/sshd_config.d/50-cloud-init.conf, first-match — a 99- drop-in will NOT \
+             override it). Use ssh_key (the cloud-init-injected key) instead of ssh_password, or \
+             add a 00-*.conf drop-in with PasswordAuthentication yes. See docs/07-operaciones.md §8.0/§8.1."
+        );
+    }
+    payload
 }
 
 fn hive_exists(state_dir: &Path, hive_id: &str) -> bool {
@@ -19258,6 +25370,22 @@ fn hive_status(root: &Path, hive_id: &str) -> Option<String> {
             .and_then(|s| s.as_str())
             .map(|s| s.to_string())
     })
+}
+
+/// Hive states from which a re-run of `add_hive` may resume instead of dead-ending at
+/// `HIVE_EXISTS`.
+///
+/// - `pending`: the worker bootstrapped but finalize did not complete (F9).
+/// - `joining`: the accept path wrote this immediately before dispatching the background join,
+///   so the flow itself always finds it. In-flight protection lives in the ACCEPT (it answers
+///   `JOIN_IN_PROGRESS`), not here — by the time a flow runs, the join is ours.
+/// - `interrupted`: the orchestrator restarted mid-join; the boot sweep marked it.
+/// - `failed`: a terminal failure the operator is retrying.
+fn hive_status_is_resumable(status: Option<&str>) -> bool {
+    matches!(
+        status,
+        Some("pending") | Some("joining") | Some("interrupted") | Some("failed")
+    )
 }
 
 fn valid_hive_id(value: &str) -> bool {
@@ -19320,30 +25448,17 @@ fn resolve_add_hive_harden_ssh(payload: &serde_json::Value) -> bool {
     false
 }
 
-/// Post-join SSH posture requested by `add_hive`.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum SshAccess {
-    /// SO-02 default: after a successful join, strip the motherbee bootstrap key AND the
-    /// sudoers grant — the spoke has no standing SSH access (management is router-socket +
-    /// dist-sync). This is the historical, unchanged behavior.
-    Revoke,
-    /// Opt-in (`ssh_access:"key_only_persist"`): leave SSH open KEY-ONLY (password auth off)
-    /// via a freshly generated PER-SPOKE key whose private half is stored in SY.vault under
-    /// `ssh/<hive_id>` for recovery. Only the motherbee bootstrap key is removed; the sudoers
-    /// grant and the per-spoke key are kept. Reverses the SO-02 revoke-everything invariant,
-    /// so it is off by default and gated by a verify-before-revoke that never strands a spoke.
-    KeyOnlyPersist,
-}
-
-/// `add_hive.ssh_access` — default `revoke` (unchanged). Only the exact string
-/// `"key_only_persist"` (case-insensitive) opts into the persistent per-spoke recovery key.
-fn resolve_add_hive_ssh_access(payload: &serde_json::Value) -> SshAccess {
-    match payload.get("ssh_access").and_then(|v| v.as_str()) {
-        Some(raw) if raw.trim().eq_ignore_ascii_case("key_only_persist") => {
-            SshAccess::KeyOnlyPersist
-        }
-        _ => SshAccess::Revoke,
+/// D32: SSH exists only inside `add_hive`, and the join revokes its access at the end; the
+/// persistent per-spoke key mode is gone (FINDINGS A-54). A request that still asks for a
+/// post-join SSH posture is refused, never silently ignored.
+fn reject_removed_add_hive_fields(payload: &serde_json::Value) -> Result<(), String> {
+    if payload.get("ssh_access").is_some() {
+        return Err(
+            "ssh_access was removed: SSH exists only inside add_hive and is always revoked at its end (D32)"
+                .to_string(),
+        );
     }
+    Ok(())
 }
 
 /// Role requested by `add_hive` (default worker). Egress provisioning takes a
@@ -19666,6 +25781,45 @@ fn systemd_start(service: &str) -> Result<(), OrchestratorError> {
     run_cmd(cmd, "systemctl start")
 }
 
+/// Unload a transient unit so its name can be reused by a fresh `systemd-run`.
+///
+/// Best-effort by design: every failure here is expected in the normal case (the unit may not
+/// exist at all), and none of them should stop a relaunch. `stop` unloads a loaded-but-inactive
+/// transient unit; `reset-failed` clears the name when it is stuck in a failed state.
+fn clear_stale_transient_unit(unit: &str) {
+    // `unit` is the BARE name (no `.service`) — `systemd_unit_exists` appends the suffix itself,
+    // and systemctl accepts either form. Passing an already-suffixed name here asks systemd about
+    // `<unit>.service.service`, which is always "not-found", so the guard returns early and the
+    // cleanup silently never runs.
+    let unit = unit.strip_suffix(".service").unwrap_or(unit);
+    if !systemd_unit_exists(unit) {
+        return;
+    }
+    for (verb, label) in [
+        ("stop", "systemctl stop"),
+        ("reset-failed", "systemctl reset-failed"),
+    ] {
+        let mut cmd = Command::new("systemctl");
+        cmd.arg(verb).arg(unit);
+        if let Err(err) = run_cmd(cmd, label) {
+            tracing::debug!(unit = %unit, verb = verb, error = %err, "clearing stale transient unit: step did not apply");
+        }
+    }
+    tracing::info!(unit = %unit, "freed stale transient unit name before relaunch");
+}
+
+/// `systemctl restart` — the only way to make an already-running service pick up a
+/// swapped binary. `systemd_start` is a NO-OP on a live unit (systemd reports success
+/// and the process keeps executing the old, now-unlinked inode), so a `category=core`
+/// update that used it reported `status: ok` with a full `restarted` list while nothing
+/// had actually changed. The remote/SSH core-sync path always used `systemctl restart`;
+/// the local path was the divergent one. See U-1 in lab/logbook/PENDING-BUGS.md.
+fn systemd_restart(service: &str) -> Result<(), OrchestratorError> {
+    let mut cmd = Command::new("systemctl");
+    cmd.arg("restart").arg(service);
+    run_cmd(cmd, "systemctl restart")
+}
+
 fn systemd_stop(service: &str) -> Result<(), OrchestratorError> {
     let mut cmd = Command::new("systemctl");
     cmd.arg("stop").arg(service);
@@ -19681,16 +25835,16 @@ fn systemd_disable(service: &str) -> Result<(), OrchestratorError> {
 struct AddHiveSshControlsResult {
     restrict_ssh_applied: bool,
     restrict_ssh_mode: String,
+    /// Measured, not requested: `add_hive` used to report `"harden_ssh_applied": harden_ssh`, a
+    /// literal echo of the flag.
+    harden_ssh_applied: bool,
 }
 
-/// Comment stamped on every per-spoke recovery key. Doubles as the authorized_keys dedup
-/// marker so a retried/failed persist never accumulates orphaned recovery entries.
-const SPOKE_RECOVERY_KEY_COMMENT: &str = "fluxbee-spoke-recovery";
-
-/// Monotonic suffix for per-spoke key scratch dirs, so two concurrent add_hive calls that land
-/// in the same millisecond can never clobber each other's private-key file.
+/// Monotonic suffix for a join's key scratch dirs, so two concurrent add_hive calls that land in
+/// the same millisecond can never clobber each other's private-key file.
 static SPOKE_KEY_SCRATCH_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+/// A scratch dir under the orchestrator runtime dir for key material a join holds briefly.
 fn spoke_key_scratch_dir(kind: &str) -> PathBuf {
     let seq = SPOKE_KEY_SCRATCH_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     orchestrator_runtime_dir().join(format!(
@@ -19698,242 +25852,6 @@ fn spoke_key_scratch_dir(kind: &str) -> PathBuf {
         std::process::id(),
         now_epoch_ms()
     ))
-}
-
-/// Generate an ephemeral per-spoke ed25519 keypair in a 0700 scratch dir under the
-/// orchestrator runtime dir and return (private_pem, public_openssh). The scratch dir is
-/// removed before returning — the caller holds the material in memory (and writes the private
-/// half to a 0600 temp only for the verify-before-revoke probe). Mirrors ensure_motherbee_ssh_key.
-fn generate_spoke_ssh_keypair() -> Result<(String, String), OrchestratorError> {
-    let dir = spoke_key_scratch_dir("keygen");
-    fs::create_dir_all(&dir)?;
-    let _ = fs::set_permissions(&dir, fs::Permissions::from_mode(0o700));
-    let key_path = dir.join("spoke.key");
-    let out = Command::new("ssh-keygen")
-        .args([
-            "-t",
-            "ed25519",
-            "-N",
-            "",
-            "-q",
-            "-C",
-            SPOKE_RECOVERY_KEY_COMMENT,
-            "-f",
-        ])
-        .arg(&key_path)
-        .output();
-    let result = (|| -> Result<(String, String), OrchestratorError> {
-        match out {
-            Ok(o) if o.status.success() => {
-                let priv_pem = fs::read_to_string(&key_path)?;
-                let pub_openssh = fs::read_to_string(dir.join("spoke.key.pub"))?
-                    .trim()
-                    .to_string();
-                if pub_openssh.split_whitespace().nth(1).is_none() {
-                    return Err("generated spoke public key has unexpected format".into());
-                }
-                Ok((priv_pem, pub_openssh))
-            }
-            Ok(o) => Err(format!(
-                "ssh-keygen failed for per-spoke key: {}",
-                String::from_utf8_lossy(&o.stderr)
-            )
-            .into()),
-            Err(err) => Err(format!("ssh-keygen unavailable: {err}").into()),
-        }
-    })();
-    let _ = fs::remove_dir_all(&dir);
-    result
-}
-
-/// Append the per-spoke public key to the target user's authorized_keys over motherbee's key
-/// access, WITHOUT disturbing the motherbee bootstrap key (dedups only the per-spoke material
-/// for idempotency). Unrestricted (no `from=`) — recovery access is by possession of the key.
-fn append_spoke_authorized_key_with_key(
-    address: &str,
-    key_path: &Path,
-    user: &str,
-    spoke_pub: &str,
-) -> Result<(), OrchestratorError> {
-    // Validate the key format up front (a malformed key would silently no-op the sshd match).
-    spoke_pub
-        .split_whitespace()
-        .nth(1)
-        .ok_or_else(|| "invalid spoke public key format: missing key material".to_string())?;
-    let entry =
-        format!("no-port-forwarding,no-X11-forwarding,no-agent-forwarding,no-pty {spoke_pub}");
-    // Dedup by the recovery-key marker (never the MB key's comment) so a retried or
-    // previously-failed persist never accumulates orphaned recovery keys, and the MB bootstrap
-    // key — the live channel here — is always preserved.
-    let script = format!(
-        "set -euo pipefail\n\
-user='{user}'\n\
-home_dir=\"$(getent passwd \"$user\" | cut -d: -f6)\"\n\
-if [[ -z \"$home_dir\" ]]; then home_dir=\"/home/$user\"; fi\n\
-ssh_dir=\"$home_dir/.ssh\"\n\
-auth_keys=\"$ssh_dir/authorized_keys\"\n\
-mkdir -p \"$ssh_dir\"\n\
-chown \"$user:$user\" \"$ssh_dir\"\n\
-chmod 700 \"$ssh_dir\"\n\
-touch \"$auth_keys\"\n\
-grep -Fv '{marker}' \"$auth_keys\" > \"$auth_keys.tmp\" || true\n\
-mv \"$auth_keys.tmp\" \"$auth_keys\"\n\
-printf '%s\\n' '{entry}' >> \"$auth_keys\"\n\
-chown \"$user:$user\" \"$auth_keys\"\n\
-chmod 600 \"$auth_keys\"\n",
-        user = user,
-        marker = SPOKE_RECOVERY_KEY_COMMENT,
-        entry = shell_single_quote(&entry),
-    );
-    let cmd = sudo_wrap(&format!("bash -lc '{}'", shell_single_quote(&script)));
-    ssh_with_key(address, key_path, &cmd, user)?;
-    Ok(())
-}
-
-/// Store a per-spoke SSH private key in SY.vault under `ssh/<hive_id>` via the SY.admin
-/// `vault_put` action over the mesh (the orchestrator has no in-process VaultClient; it reaches
-/// the vault exactly as purge_vault_secrets_for_ilk does). NEVER log the params — they carry
-/// the private key. resource_type "ssh" is an accepted Custom type (nothing auto-consumes it).
-#[cfg(not(test))]
-async fn vault_put_spoke_ssh_key(
-    state: &OrchestratorState,
-    hive_id: &str,
-    priv_pem: &str,
-) -> Result<String, OrchestratorError> {
-    let admin_target = teardown_admin_target();
-    let key = format!("ssh:{hive_id}");
-    // Pool secret (NO owner_node): the root-tenant pool is readable by SY system callers and by
-    // the admin, so an operator can retrieve the recovery key via the admin API during a
-    // break-glass. Scoping it to owner_node=SY.orchestrator makes it orchestrator-ILK-only —
-    // even the admin/operator gets UNAUTHORIZED — which defeats the whole recovery purpose.
-    let params = serde_json::json!({
-        "key": key,
-        "value": { "private_key": priv_pem, "format": "openssh" },
-        "metadata": {
-            "resource_type": "ssh",
-            "tenant_id": fluxbee_sdk::DEFAULT_ROOT_TENANT_ID,
-            "description": format!("per-spoke recovery ssh key for {hive_id}"),
-        }
-    });
-    let resp = orchestrator_admin_command(
-        state,
-        AdminCommandRequest {
-            admin_target: &admin_target,
-            action: "vault_put",
-            target: Some(PRIMARY_HIVE_ID),
-            params,
-            request_id: None,
-            timeout: Duration::from_secs(15),
-        },
-    )
-    .await?;
-    if resp.status != "ok" {
-        return Err(format!(
-            "vault_put {key} failed: {}",
-            resp.error_code.unwrap_or_else(|| "UNKNOWN".to_string())
-        )
-        .into());
-    }
-    Ok(key)
-}
-
-#[cfg(test)]
-async fn vault_put_spoke_ssh_key(
-    _state: &OrchestratorState,
-    hive_id: &str,
-    _priv_pem: &str,
-) -> Result<String, OrchestratorError> {
-    Ok(format!("ssh:{hive_id}"))
-}
-
-struct SpokeKeyPersistResult {
-    restrict_ssh_applied: bool,
-    restrict_ssh_mode: String,
-    ssh_bootstrap_revoked: bool,
-    ssh_access: String,
-    spoke_key_vault_ref: Option<String>,
-}
-
-/// `ssh_access=key_only_persist` finalize (replaces the controls + revoke pair for the three
-/// add_*_hive flows when opted in). Ordering IS the safety: seed a per-spoke key, disable
-/// password auth, then VERIFY the per-spoke key logs in and can `sudo -n` BEFORE removing
-/// motherbee's key. If the verify fails, motherbee's key is KEPT (no revoke) so the spoke is
-/// never stranded. On success the private half is stored in the vault (fail-soft) and only the
-/// motherbee bootstrap key is removed (sudoers + the per-spoke key are kept for recovery).
-async fn finalize_spoke_key_persist(
-    state: &OrchestratorState,
-    address: &str,
-    mb_key_path: &Path,
-    user: &str,
-    mb_pub_key: &str,
-    hive_id: &str,
-) -> Result<SpokeKeyPersistResult, OrchestratorError> {
-    let (priv_pem, spoke_pub) = generate_spoke_ssh_keypair()?;
-
-    append_spoke_authorized_key_with_key(address, mb_key_path, user, &spoke_pub)?;
-
-    disable_remote_password_auth_with_access(address, mb_key_path, user)
-        .map_err(|err| format!("ssh hardening failed: {err}"))?;
-    verify_remote_ssh_hardening_with_access(address, mb_key_path, user)
-        .map_err(|err| format!("ssh hardening verification failed: {err}"))?;
-
-    // VERIFY-BEFORE-REVOKE via the PER-SPOKE key: write the private half to a 0600 scratch,
-    // probe `sudo -n`, then ALWAYS remove the scratch — even if the write itself fails (so the
-    // private key never lingers on disk on an error path).
-    let verify_dir = spoke_key_scratch_dir("verify");
-    fs::create_dir_all(&verify_dir)?;
-    let _ = fs::set_permissions(&verify_dir, fs::Permissions::from_mode(0o700));
-    let verify_key = verify_dir.join("id");
-    let per_spoke_probe = (|| -> Result<bool, OrchestratorError> {
-        fs::write(&verify_key, &priv_pem)?;
-        let _ = fs::set_permissions(&verify_key, fs::Permissions::from_mode(0o600));
-        Ok(verify_remote_key_access_after_hardening(address, &verify_key, user).is_ok())
-    })();
-    let _ = fs::remove_dir_all(&verify_dir);
-    let per_spoke_ok = per_spoke_probe?;
-
-    if !per_spoke_ok {
-        tracing::warn!(
-            hive_id = hive_id,
-            "key_only_persist: per-spoke key did not verify; KEEPING the motherbee bootstrap key (no lock-out)"
-        );
-        return Ok(SpokeKeyPersistResult {
-            restrict_ssh_applied: false,
-            restrict_ssh_mode: "key_only_persist".to_string(),
-            ssh_bootstrap_revoked: false,
-            ssh_access: "degraded_kept_bootstrap".to_string(),
-            spoke_key_vault_ref: None,
-        });
-    }
-
-    let spoke_key_vault_ref = match vault_put_spoke_ssh_key(state, hive_id, &priv_pem).await {
-        Ok(reference) => Some(reference),
-        Err(err) => {
-            tracing::warn!(hive_id = hive_id, error = %err, "key_only_persist: vault_put of the per-spoke key failed; the key is live on the spoke but not backed up in the vault");
-            None
-        }
-    };
-
-    let ssh_bootstrap_revoked = match revoke_bootstrap_authorized_key_with_key(
-        address,
-        mb_key_path,
-        user,
-        mb_pub_key,
-    ) {
-        Ok(()) => true,
-        Err(err) => {
-            tracing::warn!(hive_id = hive_id, error = %err, "key_only_persist: failed to remove the motherbee bootstrap key; it may remain in authorized_keys");
-            false
-        }
-    };
-
-    Ok(SpokeKeyPersistResult {
-        restrict_ssh_applied: false,
-        restrict_ssh_mode: "key_only_persist".to_string(),
-        ssh_bootstrap_revoked,
-        ssh_access: "key_only".to_string(),
-        spoke_key_vault_ref,
-    })
 }
 
 fn apply_add_hive_ssh_controls_after_finalize(
@@ -19991,6 +25909,9 @@ fn apply_add_hive_ssh_controls_after_finalize(
     Ok(AddHiveSshControlsResult {
         restrict_ssh_applied,
         restrict_ssh_mode,
+        // Both calls above propagate with `?`, so reaching here with the flag set means
+        // password auth is off AND was verified off.
+        harden_ssh_applied: harden_ssh,
     })
 }
 
@@ -20258,6 +26179,24 @@ fn seed_motherbee_key_over_operator_key(
     result
 }
 
+/// The comment of a per-spoke recovery key the removed `ssh_access=key_only_persist` mode left in
+/// `authorized_keys` (D32). Every join's revoke strips it, so a box joined in that mode loses its
+/// standing SSH door at its next join.
+const RETIRED_SPOKE_RECOVERY_KEY_MARKER: &str = "fluxbee-spoke-recovery";
+
+/// The `authorized_keys` filter both revoke scripts run on `$auth_keys`: it drops the gate line,
+/// the motherbee's bootstrap key and a retired recovery key. The recovery key is matched on its
+/// comment field only (the line's last field), so an operator key that merely mentions the name
+/// stays.
+fn bootstrap_authorized_keys_filter(gate_path: &str, key_material: &str) -> String {
+    format!(
+        "grep -Fv '{gate_path}' \"$auth_keys\" | grep -Fv '{key_material}' | grep -Ev '[[:space:]]{retired}[[:space:]]*$'",
+        gate_path = shell_single_quote(gate_path),
+        key_material = shell_single_quote(key_material),
+        retired = shell_single_quote(RETIRED_SPOKE_RECOVERY_KEY_MARKER),
+    )
+}
+
 /// SO-02: revoke the bootstrap SSH access at the end of a successful add_hive.
 /// The deploy model is SSH-is-bootstrap-only (post-bootstrap is router socket +
 /// syncthing dist-sync; verified: no post-bootstrap path SSHes to a worker), so
@@ -20274,11 +26213,21 @@ fn revoke_bootstrap_ssh_access(
     user: &str,
     pub_key: &str,
 ) -> Result<(), OrchestratorError> {
+    let script = revoke_bootstrap_ssh_access_script(user, pub_key)?;
+    let cmd = sudo_wrap(&format!("bash -lc '{}'", shell_single_quote(&script)));
+    ssh_with_key(address, key_path, &cmd, user)?;
+    Ok(())
+}
+
+fn revoke_bootstrap_ssh_access_script(
+    user: &str,
+    pub_key: &str,
+) -> Result<String, OrchestratorError> {
     let key_material = pub_key
         .split_whitespace()
         .nth(1)
         .ok_or_else(|| "invalid public key format: missing key material".to_string())?;
-    let script = format!(
+    Ok(format!(
         "set -uo pipefail\n\
 user='{user}'\n\
 rm -f {sudoers} || true\n\
@@ -20286,19 +26235,15 @@ home_dir=\"$(getent passwd \"$user\" | cut -d: -f6)\"\n\
 if [[ -z \"$home_dir\" ]]; then home_dir=\"/home/$user\"; fi\n\
 auth_keys=\"$home_dir/.ssh/authorized_keys\"\n\
 if [[ -f \"$auth_keys\" ]]; then \
-{{ grep -Fv '{gate_path}' \"$auth_keys\" | grep -Fv '{key_material}' > \"$auth_keys.tmp\"; }} || true; \
+{{ {filter} > \"$auth_keys.tmp\"; }} || true; \
 mv \"$auth_keys.tmp\" \"$auth_keys\" 2>/dev/null || true; \
 chown \"$user:$user\" \"$auth_keys\" 2>/dev/null || true; \
 chmod 600 \"$auth_keys\" 2>/dev/null || true; \
 fi\n",
         user = user,
         sudoers = shell_single_quote(ORCH_SUDOERS_PATH),
-        gate_path = shell_single_quote(ORCH_SSH_GATE_PATH),
-        key_material = shell_single_quote(key_material),
-    );
-    let cmd = sudo_wrap(&format!("bash -lc '{}'", shell_single_quote(&script)));
-    ssh_with_key(address, key_path, &cmd, user)?;
-    Ok(())
+        filter = bootstrap_authorized_keys_filter(ORCH_SSH_GATE_PATH, key_material),
+    ))
 }
 
 fn bootstrap_authorized_key_cleanup_script(pub_key: &str) -> Result<String, OrchestratorError> {
@@ -20310,12 +26255,11 @@ fn bootstrap_authorized_key_cleanup_script(pub_key: &str) -> Result<String, Orch
         "set -uo pipefail\n\
 auth_keys=\"$HOME/.ssh/authorized_keys\"\n\
 if [[ -f \"$auth_keys\" ]]; then \
-{{ grep -Fv '{gate_path}' \"$auth_keys\" | grep -Fv '{key_material}' > \"$auth_keys.tmp\"; }} || true; \
+{{ {filter} > \"$auth_keys.tmp\"; }} || true; \
 mv \"$auth_keys.tmp\" \"$auth_keys\" 2>/dev/null || true; \
 chmod 600 \"$auth_keys\" 2>/dev/null || true; \
 fi\n",
-        gate_path = shell_single_quote(ORCH_SSH_GATE_PATH),
-        key_material = shell_single_quote(key_material),
+        filter = bootstrap_authorized_keys_filter(ORCH_SSH_GATE_PATH, key_material),
     ))
 }
 
@@ -21220,6 +27164,861 @@ fn is_ingress_role(role: Option<&str>) -> bool {
 mod tests {
     use super::*;
 
+    /// A-70 stage 2: a retired node leaves one role section at a time, by lines, comments kept;
+    /// the other sections stay as they are (the boot drops it from each section in turn).
+    #[test]
+    fn a_retired_node_leaves_one_role_section_at_a_time() {
+        let text = r#"hive_id: worker1
+system_nodes:
+  motherbee:
+    nodes:
+      - SY.config.routes
+      - SY.policy
+  worker:
+    # the worker's own nodes
+    nodes:
+      - SY.config.routes
+      - "SY.policy"
+      - SY.cognition
+    wait_for:
+      - SY.policy
+wan:
+  gateway_name: RT.gateway
+"#;
+        let (edited, removed) = drop_retired_from_role_section(text, "worker", &["SY.policy"]);
+        assert_eq!(
+            removed,
+            vec!["SY.policy".to_string(), "SY.policy".to_string()]
+        );
+        assert!(edited
+            .contains("  motherbee:\n    nodes:\n      - SY.config.routes\n      - SY.policy\n"));
+        assert!(edited.contains("    # the worker's own nodes\n"));
+        assert!(edited.contains("      - SY.config.routes\n      - SY.cognition\n    wait_for:\n"));
+        assert!(edited.ends_with("gateway_name: RT.gateway\n"));
+        let (again, removed) = drop_retired_from_role_section(&edited, "worker", &["SY.policy"]);
+        assert!(removed.is_empty());
+        assert_eq!(again, edited);
+        let section = without_retired_nodes(RoleSystemNodes {
+            nodes: vec!["SY.config.routes".to_string(), "SY.policy".to_string()],
+            wait_for: vec!["SY.policy".to_string()],
+        });
+        assert_eq!(section.nodes, vec!["SY.config.routes".to_string()]);
+        assert!(section.wait_for.is_empty());
+    }
+
+    /// A-70 stage 2b: the `nats:` section leaves hive.yaml with the comment that names it, and a
+    /// spoke's rendered file (no comment) loses it too; a file without it is left alone.
+    #[test]
+    fn the_nats_section_leaves_hive_yaml() {
+        let packaged = "hive_id: motherbee\nrole: motherbee\n\n# Local NATS broker for control/data plane.\nnats:\n  mode: embedded\n  port: 4222\n\n# Local admin HTTP API.\nadmin:\n  listen: \"127.0.0.1:8080\"\n";
+        assert_eq!(
+            drop_top_level_section(packaged, "nats").as_deref(),
+            Some("hive_id: motherbee\nrole: motherbee\n\n# Local admin HTTP API.\nadmin:\n  listen: \"127.0.0.1:8080\"\n")
+        );
+        let rendered = "hive_id: worker1\nrole: worker\nwan:\n  gateway_name: RT.gateway\nnats:\n  mode: embedded\n  port: 4222\nstorage:\n  path: \"/var/lib/fluxbee\"\n";
+        assert_eq!(
+            drop_top_level_section(rendered, "nats").as_deref(),
+            Some("hive_id: worker1\nrole: worker\nwan:\n  gateway_name: RT.gateway\nstorage:\n  path: \"/var/lib/fluxbee\"\n")
+        );
+        assert!(
+            drop_top_level_section("hive_id: x\nnatsy: 1\nstorage:\n  nats: 1\n", "nats").is_none()
+        );
+    }
+
+    #[test]
+    fn the_brokers_pending_messages_are_counted_by_subject() {
+        let state = serde_json::json!({
+            "streams": {
+                "storage.turns": {"messages": [{"seq": 1}, {"seq": 2}], "last_seq": 2},
+                "storage.cognition.threads": {"messages": [], "last_seq": 52}
+            },
+            "consumers": {}
+        });
+        let pending = nats_pending_by_subject(&state);
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending.get("storage.turns"), Some(&2));
+        assert!(nats_pending_by_subject(&serde_json::json!({})).is_empty());
+    }
+
+    #[test]
+    fn teardown_deletes_each_secret_in_its_own_tenant() {
+        let listing = serde_json::json!({
+            "status": "ok",
+            "count": 2,
+            "secrets": [
+                {"key": "slack:acme:bot", "version": 1, "access_count": 0,
+                 "metadata": {"tenant_id": "tnt:11111111-1111-4111-8111-111111111111", "ilk": "ilk:x"}},
+                {"key": "openai:node", "version": 3, "access_count": 2,
+                 "metadata": {"tenant_id": "tnt:00000000-0000-0000-0000-000000000001", "ilk": "ilk:x"}},
+            ]
+        });
+        assert_eq!(
+            vault_keys_with_tenant(&listing),
+            vec![
+                (
+                    "slack:acme:bot".to_string(),
+                    "tnt:11111111-1111-4111-8111-111111111111".to_string()
+                ),
+                (
+                    "openai:node".to_string(),
+                    "tnt:00000000-0000-0000-0000-000000000001".to_string()
+                ),
+            ]
+        );
+        assert!(vault_keys_with_tenant(&serde_json::json!({})).is_empty());
+    }
+
+    fn stamp_generation(
+        root: &Path,
+        id: &str,
+        replaced: Option<&str>,
+        components: &[(&str, &str)],
+    ) -> PathBuf {
+        let dir = root.join(id);
+        fs::create_dir_all(&dir).expect("gen dir");
+        let mut recorded = Vec::new();
+        for (name, body) in components {
+            let path = dir.join(name);
+            fs::write(&path, body).expect("component");
+            recorded.push(CoreBackupComponent {
+                name: (*name).to_string(),
+                sha256: sha256_file(&path).expect("hash"),
+                size: body.len() as u64,
+            });
+        }
+        let generation = CoreBackupGeneration {
+            schema_version: 1,
+            generation: id.to_string(),
+            created_at_ms: 1_700_000_000_000,
+            hive_id: "motherbee".to_string(),
+            role: "motherbee".to_string(),
+            replaced_manifest_hash: replaced.map(str::to_string),
+            applied_manifest_hash: Some("newhash".to_string()),
+            components: recorded,
+            created_without_backup: Vec::new(),
+        };
+        fs::write(
+            dir.join(CORE_GENERATION_MANIFEST_NAME),
+            serde_json::to_vec_pretty(&generation).expect("stamp"),
+        )
+        .expect("write stamp");
+        dir
+    }
+
+    /// U-5: every way a rollback can be wrong must be LOUD. The forbidden design — "restore the
+    /// most recent backup" — was unsafe precisely because each of these failed silently.
+    #[test]
+    fn core_rollback_selection_is_fail_loud_in_every_direction() {
+        let root = std::env::temp_dir().join(format!("fluxbee-rb-{}", Uuid::new_v4()));
+        fs::create_dir_all(&root).expect("root");
+
+        // Nothing stamped at all.
+        let (code, _) = select_core_backup_generation(&root, &CoreRollbackSelector::Latest)
+            .expect_err("empty store must fail");
+        assert_eq!(code, "NO_BACKUP");
+
+        stamp_generation(&root, "update-1700000000001", Some("hashA"), &[("sy-admin", "A")]);
+        stamp_generation(&root, "update-1700000000002", Some("hashB"), &[("sy-admin", "B")]);
+
+        // Latest is chronological, which lexical order gives us for a fixed-width epoch.
+        let (_, g) = select_core_backup_generation(&root, &CoreRollbackSelector::Latest).expect("latest");
+        assert_eq!(g.generation, "update-1700000000002");
+        assert_eq!(g.replaced_manifest_hash.as_deref(), Some("hashB"));
+
+        // By name, and by the hash the rollback returns you TO.
+        assert_eq!(
+            select_core_backup_generation(
+                &root,
+                &CoreRollbackSelector::Generation("update-1700000000001".into())
+            )
+            .expect("by name")
+            .1
+            .replaced_manifest_hash
+            .as_deref(),
+            Some("hashA")
+        );
+        assert_eq!(
+            select_core_backup_generation(
+                &root,
+                &CoreRollbackSelector::ToManifestHash("  HASHA  ".into())
+            )
+            .expect("by hash, normalized")
+            .1
+            .generation,
+            "update-1700000000001"
+        );
+
+        // An unknown name or hash is an error, never a silent fallback to `latest`.
+        for selector in [
+            CoreRollbackSelector::Generation("update-nope".into()),
+            CoreRollbackSelector::ToManifestHash("nosuchhash".into()),
+        ] {
+            let (code, _) =
+                select_core_backup_generation(&root, &selector).expect_err("must not fall back");
+            assert_eq!(code, "NO_BACKUP");
+        }
+
+        // An AMBIGUOUS hash must never be resolved by picking one.
+        stamp_generation(&root, "update-1700000000003", Some("hashA"), &[("sy-admin", "C")]);
+        let (code, detail) = select_core_backup_generation(
+            &root,
+            &CoreRollbackSelector::ToManifestHash("hashA".into()),
+        )
+        .expect_err("ambiguous must fail");
+        assert_eq!(code, "NO_BACKUP");
+        assert!(detail.contains("update-1700000000001") && detail.contains("update-1700000000003"));
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// The two shapes that made "restore the latest" a U-1 repeat: an EMPTY generation (every
+    /// no-op used to create one) and a CORRUPT component.
+    #[test]
+    fn an_empty_or_corrupt_generation_is_never_a_successful_rollback() {
+        let root = std::env::temp_dir().join(format!("fluxbee-rb-bad-{}", Uuid::new_v4()));
+
+        // Empty: a directory that restored nothing must not report success.
+        stamp_generation(&root, "update-1700000000001", Some("hashA"), &[]);
+        let (code, detail) = select_core_backup_generation(&root, &CoreRollbackSelector::Latest)
+            .expect_err("empty generation must fail");
+        assert_eq!(code, "NO_BACKUP");
+        assert!(detail.contains("restored nothing"));
+
+        // Corrupt: the stamp and the bytes disagree — caught BEFORE /usr/bin is touched.
+        let dir = stamp_generation(
+            &root,
+            "update-1700000000002",
+            Some("hashB"),
+            &[("sy-admin", "GOOD")],
+        );
+        fs::write(dir.join("sy-admin"), "TAMPERED").expect("tamper");
+        let (code, detail) = select_core_backup_generation(&root, &CoreRollbackSelector::Latest)
+            .expect_err("corrupt generation must fail");
+        assert_eq!(code, "BACKUP_CORRUPT");
+        assert!(detail.contains("sy-admin"));
+
+        // Missing file entirely.
+        fs::remove_file(dir.join("sy-admin")).expect("rm");
+        let (code, _) = select_core_backup_generation(&root, &CoreRollbackSelector::Latest)
+            .expect_err("missing component must fail");
+        assert_eq!(code, "BACKUP_CORRUPT");
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// THE U-1 TRAP. `rollback_local_core_binaries` used to fall through silently when it found
+    /// no backup and no "newly created" record — i.e. answer Ok() having restored nothing.
+    /// Unreachable from the in-flight callers, but `core_rollback` makes it reachable.
+    #[test]
+    fn a_rollback_that_restores_nothing_must_not_report_success() {
+        let backup_dir = std::env::temp_dir().join(format!("fluxbee-rb-empty-{}", Uuid::new_v4()));
+        fs::create_dir_all(&backup_dir).expect("dir");
+
+        let err = rollback_local_core_binaries(
+            &["sy-admin".to_string()],
+            &backup_dir,
+            &HashSet::new(),
+        )
+        .expect_err("must refuse to claim a rollback it did not perform");
+        let text = err.to_string();
+        assert!(text.contains("sy-admin"), "must name the component: {text}");
+        assert!(text.contains("restored nothing"), "must say why: {text}");
+
+        // A component the update CREATED has nothing to restore to; removing it is correct.
+        let mut created = HashSet::new();
+        created.insert("sy-admin".to_string());
+        assert!(rollback_local_core_binaries(
+            &["sy-admin".to_string()],
+            &backup_dir,
+            &created
+        )
+        .is_ok());
+
+        let _ = fs::remove_dir_all(&backup_dir);
+    }
+
+    /// X1: after a rollback the hive is deliberately off-manifest. Comparing DIST hashes would
+    /// call two hives running different binaries "match" — on the endpoint an operator opens
+    /// mid-incident.
+    #[test]
+    fn versions_comparison_prefers_what_is_installed_over_what_dist_delivered() {
+        let rolled_back = serde_json::json!({
+            "hive_id": "w1",
+            "core": { "manifest_hash": "aa", "installed": { "manifest_hash": "OLD" } },
+            "vendor": { "manifest_hash": "bb" },
+            "runtimes": { "manifest_hash": "cc" },
+        });
+        let normal = serde_json::json!({
+            "hive_id": "motherbee",
+            "core": { "manifest_hash": "aa", "installed": { "manifest_hash": "aa" } },
+            "vendor": { "manifest_hash": "bb" },
+            "runtimes": { "manifest_hash": "cc" },
+        });
+        let out = versions_comparison("motherbee", &[normal, rolled_back]);
+        assert_eq!(
+            out["hives"][0]["sections"]["core"], "differs",
+            "a rolled-back hive must not read as in sync"
+        );
+        assert_eq!(out["verdict"], "differs");
+
+        // Without an `installed` record (a hive never updated by this build) it falls back to
+        // the dist hash rather than reporting a phantom difference.
+        let legacy = serde_json::json!({
+            "hive_id": "w2",
+            "core": { "manifest_hash": "aa" },
+            "vendor": { "manifest_hash": "bb" },
+            "runtimes": { "manifest_hash": "cc" },
+        });
+        let reference = serde_json::json!({
+            "hive_id": "motherbee",
+            "core": { "manifest_hash": "aa", "installed": { "manifest_hash": "aa" } },
+            "vendor": { "manifest_hash": "bb" },
+            "runtimes": { "manifest_hash": "cc" },
+        });
+        let out = versions_comparison("motherbee", &[reference, legacy]);
+        assert_eq!(out["verdict"], "match");
+    }
+
+    /// The syncthing HOME is created whenever syncthing will RUN, not only when BLOB sync is on.
+    ///
+    /// `ensure_blob_sync_runtime` starts the service if EITHER blob sync or dist sync needs it,
+    /// so gating the directory on `blob.sync_enabled` alone left exactly one role broken: the
+    /// egress, the only one with dist sync ON and blob sync OFF. Its unit was started with a
+    /// WorkingDirectory that did not exist and failed 200/CHDIR forever, so the box could never
+    /// receive core or vendor. Found on a real egress, invisible to every test.
+    #[test]
+    fn the_syncthing_home_is_created_for_dist_sync_not_just_blob_sync() {
+        let src = include_str!("sy_orchestrator.rs");
+        let start = src.find("fn ensure_dirs(").expect("ensure_dirs");
+        let end = src[start..]
+            .find("\nfn blob_sync_folder_path")
+            .map(|o| start + o)
+            .unwrap_or(src.len());
+        let body = &src[start..end];
+        let gate = body
+            .find("ensure_dir_permissions_0750(&blob.sync_data_dir)")
+            .expect("la creacion del home de syncthing");
+        // Walk back to the `if` that guards it and assert dist is part of the condition, following
+        // a named condition to its definition.
+        let guard_start = body[..gate].rfind("if ").expect("su guard");
+        let mut guard = &body[guard_start..gate];
+        if guard.contains("if syncthing_runs") {
+            let def = body
+                .find("let syncthing_runs =")
+                .expect("syncthing_runs definition");
+            let def_end = def + body[def..].find(';').expect("end of the definition");
+            guard = &body[def..def_end];
+        }
+        assert!(
+            guard.contains("dist.sync_enabled"),
+            "el home de syncthing debe crearse tambien cuando lo unico que lo necesita es el \
+             sync de DIST — si no, el egress arranca el servicio sin su WorkingDirectory. \
+             guard actual: {guard}"
+        );
+    }
+
+    /// Found by regenerating a hive from scratch, not by any test: `add_egress_hive_flow` was
+    /// the only one of the three join flows that never pushed the vendor bundle. The egress
+    /// therefore never received the syncthing binary — and since the vendor arrives THROUGH
+    /// syncthing, nothing could ever repair it: the watchdog restarted `fluxbee-syncthing` every
+    /// few seconds forever and `/versions` reported that hive's vendor as `unknown`.
+    ///
+    /// This pins the symmetry by reading the source, because the three flows are ~1000 lines
+    /// apart and a divergence between them is invisible at a glance.
+    #[test]
+    fn every_join_flow_pushes_core_vendor_and_links_its_syncthing_peer() {
+        let src = include_str!("sy_orchestrator.rs");
+        for (flow, next) in [
+            ("async fn add_hive_flow", "async fn add_egress_hive_flow"),
+            ("async fn add_egress_hive_flow", "async fn add_ingress_hive_flow"),
+            ("async fn add_ingress_hive_flow", "fn resolve_add_hive_role"),
+        ] {
+            let start = src.find(flow).unwrap_or_else(|| panic!("no encontre {flow}"));
+            let end = src[start..]
+                .find(next)
+                .map(|o| start + o)
+                .unwrap_or(src.len());
+            let body = &src[start..end];
+            assert!(
+                body.contains("sync_core_to_worker("),
+                "{flow} must push core"
+            );
+            assert!(
+                body.contains("sync_vendor_to_worker("),
+                "{flow} must push vendor — without it the hive never gets syncthing, and the \
+                 vendor arrives THROUGH syncthing, so it can never self-repair"
+            );
+            assert!(
+                body.contains("\"VENDOR_SYNC_FAILED\""),
+                "{flow} must fail the join when the vendor push fails, for the same reason"
+            );
+            let issue_at = body
+                .find("issue_hive_tls(")
+                .unwrap_or_else(|| panic!("{flow} must issue the hive's leaf"));
+            let first_ssh = body
+                .find("ssh_with_key(")
+                .expect("each flow probes its key");
+            assert!(
+                issue_at < first_ssh,
+                "{flow} must issue the leaf before its first SSH session, so a CA that cannot \
+                 issue fails the join with nothing done on the box"
+            );
+            let wait_at = body
+                .find("wait_for_host_to_settle(")
+                .unwrap_or_else(|| panic!("{flow} must wait for the box to settle (A-52)"));
+            for later in [
+                "ensure_remote_orchestrator_sudoers_with_access(",
+                "sync_core_to_worker(",
+            ] {
+                let at = body.find(later).expect("each flow has it");
+                assert!(
+                    wait_at < at,
+                    "{flow} must wait for the box to settle before {later} (A-52)"
+                );
+            }
+            assert!(
+                body.contains("ensure_syncthing_peer_link_runtime("),
+                "{flow} must link the spoke's Syncthing device — without it motherbee's \
+                 per-role dist folder lists only motherbee, so the hive joins fine and can then \
+                 NEVER be updated: `update category=core` finds its dist unchanged and silently \
+                 does nothing, forever"
+            );
+        }
+    }
+
+    /// U-4b: the store had a reader and no writer, so `GET /drift-alerts` could only ever
+    /// answer with a synthesized snapshot. These pin the writer's three load-bearing
+    /// properties: it dedups standing drift, it bounds the file, and it NEVER fails — its
+    /// callers include `reconcile_egress`, whose `Err` crash-loops the orchestrator.
+    #[test]
+    fn drift_alerts_are_recorded_deduped_and_bounded() {
+        let dir = std::env::temp_dir().join(format!("fluxbee-drift-{}", Uuid::new_v4()));
+        fs::create_dir_all(&dir).expect("dir");
+        let path = dir.join("drift-alerts.jsonl");
+
+        let emit = |kind: &str, hive: &str, at: u64| {
+            // Exercise the same dedup+rotate+serialize shape against a temp path.
+            let mut kept: Vec<String> = fs::read_to_string(&path)
+                .unwrap_or_default()
+                .lines()
+                .filter(|l| !l.trim().is_empty())
+                .map(str::to_string)
+                .collect();
+            let dup = kept.iter().any(|l| {
+                serde_json::from_str::<DriftAlertEntry>(l).is_ok_and(|e| {
+                    e.hive_id == hive
+                        && e.kind == kind
+                        && at.saturating_sub(e.detected_at) < DRIFT_ALERT_DEDUP_WINDOW_MS
+                })
+            });
+            if dup {
+                return false;
+            }
+            kept.push(
+                serde_json::to_string(&DriftAlertEntry {
+                    alert_id: format!("a-{at}"),
+                    detected_at: at,
+                    category: "core".into(),
+                    trigger: "detected".into(),
+                    hive_id: hive.into(),
+                    severity: "error".into(),
+                    kind: kind.into(),
+                    message: "m".into(),
+                    local_hash: None,
+                    remote_hash_before: None,
+                    remote_hash_after: None,
+                })
+                .unwrap(),
+            );
+            fs::write(&path, kept.join("\n") + "\n").unwrap();
+            true
+        };
+
+        let base = 1_700_000_000_000u64;
+        assert!(emit("post_sync_mismatch", "w1", base), "first must record");
+        assert!(
+            !emit("post_sync_mismatch", "w1", base + 1000),
+            "standing drift must dedup — the watchdog re-detects it every tick"
+        );
+        assert!(
+            emit("post_sync_mismatch", "w2", base + 1000),
+            "a different hive is a different alert"
+        );
+        assert!(
+            emit("health_check_failed", "w1", base + 1000),
+            "a different kind is a different alert"
+        );
+        assert!(
+            emit("post_sync_mismatch", "w1", base + DRIFT_ALERT_DEDUP_WINDOW_MS + 1),
+            "past the window it must record again"
+        );
+
+        // Every row must parse back — the reader takes the newest `limit` and skips torn lines,
+        // so a malformed writer would silently lose history.
+        let rows: Vec<DriftAlertEntry> = fs::read_to_string(&path)
+            .unwrap()
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .map(|l| serde_json::from_str(l).expect("every row must round-trip"))
+            .collect();
+        assert_eq!(rows.len(), 4);
+        // Nothing may carry the retired synthesis trigger: `synthetic` is computed from it, so a
+        // real alert using it would publish itself flagged synthetic.
+        assert!(rows.iter().all(|r| r.trigger != "local_current_state"));
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// The writer must swallow everything. A path it cannot write is a `warn!`, never a panic
+    /// and never an `Err` — `reconcile_egress` propagates `Err` into a crash loop.
+    #[test]
+    fn recording_a_drift_alert_never_fails_the_caller() {
+        // Unwritable parent: the call must simply return.
+        append_drift_alert(
+            "core",
+            "sync_error",
+            "error",
+            "w1",
+            "message".to_string(),
+            None,
+            None,
+            None,
+        );
+    }
+
+    /// U-4a: `/versions` must emit a VERDICT, not just a pile of hashes — and "unreachable"
+    /// must never be reported as "differs".
+    #[test]
+    fn versions_comparison_emits_a_verdict_and_never_guesses() {
+        // Built FROM the constant on purpose: hand-writing the section names is how the
+        // `runtime`/`runtimes` divergence stayed green.
+        let snap = |hive: &str, core: &str, vendor: &str, runtime: &str| {
+            let mut o = serde_json::Map::new();
+            o.insert("hive_id".into(), serde_json::json!(hive));
+            for (section, hash) in VERSION_COMPARISON_SECTIONS.iter().zip([core, vendor, runtime]) {
+                o.insert(
+                    (*section).to_string(),
+                    serde_json::json!({ "manifest_hash": hash }),
+                );
+            }
+            serde_json::Value::Object(o)
+        };
+
+        // Everything in step.
+        let out = versions_comparison(
+            "motherbee",
+            &[snap("motherbee", "aa", "bb", "cc"), snap("w1", "aa", "bb", "cc")],
+        );
+        assert_eq!(out["verdict"], "match");
+        assert_eq!(out["hives"][0]["verdict"], "match");
+
+        // One dimension drifted: the hive AND the fleet must say so.
+        let out = versions_comparison(
+            "motherbee",
+            &[snap("motherbee", "aa", "bb", "cc"), snap("w1", "ZZ", "bb", "cc")],
+        );
+        assert_eq!(out["verdict"], "differs");
+        assert_eq!(out["hives"][0]["sections"]["core"], "differs");
+        assert_eq!(out["hives"][0]["sections"]["vendor"], "match");
+
+        // Hash comparison is case/whitespace insensitive — a formatting difference is not drift.
+        let out = versions_comparison(
+            "motherbee",
+            &[snap("motherbee", "AA", "bb", "cc"), snap("w1", " aa ", "bb", "cc")],
+        );
+        assert_eq!(out["verdict"], "match");
+
+        // An unreachable hive is UNKNOWN, never differs — otherwise a spoke that is merely down
+        // reads as a version incident.
+        let out = versions_comparison(
+            "motherbee",
+            &[
+                snap("motherbee", "aa", "bb", "cc"),
+                serde_json::json!({"hive_id": "w1", "status": "error", "message": "unreachable"}),
+            ],
+        );
+        assert_eq!(out["verdict"], "unknown");
+        assert_eq!(out["hives"][0]["verdict"], "unknown");
+        assert_eq!(out["hives"][0]["sections"]["core"], "unknown");
+
+        // A real difference outranks an unknown: the fleet verdict must not be softened.
+        let out = versions_comparison(
+            "motherbee",
+            &[
+                snap("motherbee", "aa", "bb", "cc"),
+                snap("w1", "ZZ", "bb", "cc"),
+                serde_json::json!({"hive_id": "w2", "status": "error"}),
+            ],
+        );
+        assert_eq!(out["verdict"], "differs");
+
+        // No reference snapshot at all -> unknown, never a false match.
+        let out = versions_comparison("motherbee", &[snap("w1", "aa", "bb", "cc")]);
+        assert_eq!(out["verdict"], "unknown");
+
+        // A role that never RECEIVES a section must read n/a, not unknown — ingress and egress
+        // deliberately do not get the runtimes tree, and calling that drift pinned the whole
+        // fleet verdict at `unknown` on a perfectly healthy deployment.
+        let mut reference = snap("motherbee", "aa", "bb", "cc");
+        reference["role"] = serde_json::json!("motherbee");
+        let mut ingress = serde_json::json!({
+            "hive_id": "ingress1",
+            "role": "ingress",
+            "core": { "manifest_hash": "aa" },
+            "vendor": { "manifest_hash": "bb" },
+            "runtimes": { "status": "missing" },
+        });
+        let out = versions_comparison("motherbee", &[reference.clone(), ingress.clone()]);
+        assert_eq!(out["hives"][0]["sections"]["runtimes"], "n/a");
+        assert_eq!(out["hives"][0]["verdict"], "match");
+        assert_eq!(out["verdict"], "match", "a healthy four-role fleet must read match");
+
+        // ...but a WORKER missing its runtimes really is drift.
+        ingress["role"] = serde_json::json!("worker");
+        ingress["hive_id"] = serde_json::json!("w1");
+        let out = versions_comparison("motherbee", &[reference, ingress]);
+        assert_eq!(out["hives"][0]["sections"]["runtimes"], "unknown");
+    }
+
+    /// The mesh protocol version must live in exactly one place, and it must be telemetry.
+    #[test]
+    fn mesh_protocol_version_is_a_single_constant() {
+        assert!(!fluxbee_sdk::protocol::MESH_PROTOCOL_VERSION.is_empty());
+        assert!(fluxbee_sdk::protocol::MESH_PROTOCOL_VERSION.starts_with("fluxbee/"));
+    }
+
+    /// THE regression guard for the panel's worst finding. `accept_add_hive` and
+    /// `remove_hive_flow` both run ON the single serial admin worker, while a background join
+    /// holds the per-hive topology lock for ~6 minutes. If either of them AWAITS that lock, the
+    /// hive's whole control plane freezes behind the join — the exact blockage PB-7 exists to
+    /// remove — and `JOIN_IN_PROGRESS` becomes unreachable, because the check never runs.
+    #[tokio::test]
+    async fn admin_worker_paths_never_await_a_lock_a_background_join_holds() {
+        let state = sample_orchestrator_state_for_tests();
+
+        // A join is running: it owns the lock for its whole duration.
+        let join_guard = state.lock_hive_topology("worker1").await;
+
+        // Both admin-worker paths must come back IMMEDIATELY rather than parking.
+        assert!(
+            state.try_lock_hive_topology("worker1").is_none(),
+            "must report contention, not wait for it"
+        );
+        // ...and must not be confused by an unrelated hive.
+        assert!(
+            state.try_lock_hive_topology("worker2").is_some(),
+            "a different hive must still be lockable"
+        );
+
+        drop(join_guard);
+        assert!(
+            state.try_lock_hive_topology("worker1").is_some(),
+            "the lock must be reusable once the join releases it"
+        );
+    }
+
+    /// PB-7: which recorded states a re-POST of `add_hive` may resume from.
+    ///
+    /// `joining` MUST be resumable: the accept path writes it immediately before dispatching,
+    /// so the flow itself always finds it. If this rejected `joining`, every backgrounded join
+    /// would dead-end at HIVE_EXISTS the moment it started. In-flight protection lives in the
+    /// accept (JOIN_IN_PROGRESS), not here.
+    #[test]
+    fn resumable_hive_states_include_the_ones_a_background_join_leaves_behind() {
+        for state in ["pending", "joining", "interrupted", "failed"] {
+            assert!(
+                hive_status_is_resumable(Some(state)),
+                "{state} must be resumable"
+            );
+        }
+        // A finished hive is not a resume target — that is a genuine HIVE_EXISTS.
+        assert!(!hive_status_is_resumable(Some("connected")));
+        // An unreadable/absent info.yaml is not a resume signal either.
+        assert!(!hive_status_is_resumable(None));
+        assert!(!hive_status_is_resumable(Some("")));
+    }
+
+    /// The join record must survive a read-modify-write cycle, because the background join
+    /// rewrites it several times to publish its phase.
+    #[test]
+    fn join_state_round_trips_and_write_hive_info_is_atomic() {
+        let root = std::env::temp_dir().join(format!("fluxbee-join-{}", Uuid::new_v4()));
+        let hive_id = "spoke1".to_string();
+        fs::create_dir_all(root.join(&hive_id)).expect("hive dir");
+
+        update_join_state_in(&root, &hive_id, "joining", "accepted", |info| {
+            info["hive_id"] = serde_json::json!(hive_id);
+            info["join"]["join_id"] = serde_json::json!("j-1");
+        });
+        assert_eq!(hive_status(&root, &hive_id).as_deref(), Some("joining"));
+
+        // A later phase write must preserve what the accept recorded.
+        update_join_state_in(&root, &hive_id, "joining", "running", |_| {});
+        let info = read_hive_info(&root, &hive_id).expect("info");
+        assert_eq!(info["join"]["join_id"], "j-1");
+        assert_eq!(info["join"]["phase"], "running");
+        assert_eq!(info["hive_id"], serde_json::json!(hive_id));
+
+        // The sweep must move an orphaned join off `joining` — otherwise a crash leaves the
+        // hive unretryable forever.
+        sweep_interrupted_joins_in(&root);
+        let info = read_hive_info(&root, &hive_id).expect("info");
+        assert_eq!(info["status"], "interrupted");
+        assert_eq!(info["join"]["error_code"], "JOIN_INTERRUPTED");
+        assert!(hive_status_is_resumable(Some("interrupted")));
+
+        // ...and it must leave a finished hive alone.
+        update_join_state_in(&root, &hive_id, "connected", "done", |_| {});
+        sweep_interrupted_joins_in(&root);
+        assert_eq!(
+            hive_status(&root, &hive_id).as_deref(),
+            Some("connected"),
+            "the sweep must only touch hives stuck at `joining`"
+        );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn default_gateway_is_the_token_after_via() {
+        assert_eq!(
+            parse_default_gateway("default via 10.10.10.1 dev eth0 proto static metric 100\n")
+                .as_deref(),
+            Some("10.10.10.1")
+        );
+        // Several routes: the first default wins, and non-default lines are skipped.
+        assert_eq!(
+            parse_default_gateway(
+                "10.10.10.0/24 dev eth0 proto kernel scope link src 10.10.10.10\n\
+                 default via 192.168.8.1 dev eth1\n\
+                 default via 10.10.10.40 dev eth0 metric 200\n"
+            )
+            .as_deref(),
+            Some("192.168.8.1")
+        );
+        // A default route with no `via` (directly-connected) has no gateway to report.
+        assert_eq!(parse_default_gateway("default dev tun0 scope link\n"), None);
+        assert_eq!(parse_default_gateway(""), None);
+        // Must not match a line that merely mentions the word.
+        assert_eq!(parse_default_gateway("10.0.0.0/8 via 10.0.0.1 dev eth0\n"), None);
+    }
+
+    /// PB-8: motherbee is where the nodes that call the internet run, but the egress model
+    /// never covered it. Fluxbee reports the mismatch; it must NEVER rewrite the control
+    /// plane's own route (that would be a lockout).
+    #[test]
+    fn motherbee_egress_verdict_reports_without_touching_anything() {
+        assert_eq!(
+            motherbee_egress_verdict("10.10.10.40", Some("10.10.10.40")),
+            MotherbeeEgressVerdict::Match
+        );
+        // Whitespace on either side must not read as a bypass.
+        assert_eq!(
+            motherbee_egress_verdict(" 10.10.10.40 ", Some("10.10.10.40\n")),
+            MotherbeeEgressVerdict::Match
+        );
+        // The real prod condition: declared egress, actually leaving via the hypervisor SNAT.
+        assert_eq!(
+            motherbee_egress_verdict("10.10.10.40", Some("10.10.10.1")),
+            MotherbeeEgressVerdict::Bypass {
+                observed: "10.10.10.1".to_string()
+            }
+        );
+        // Unreadable route table is "unknown", never a silent match.
+        assert_eq!(
+            motherbee_egress_verdict("10.10.10.40", None),
+            MotherbeeEgressVerdict::Unknown
+        );
+        assert_eq!(
+            motherbee_egress_verdict("10.10.10.40", Some("   ")),
+            MotherbeeEgressVerdict::Unknown
+        );
+    }
+
+    /// `route_applied` must stay false on the motherbee path: nothing was applied, and
+    /// claiming otherwise is exactly the class of lie this change removes.
+    #[test]
+    fn motherbee_verification_never_claims_a_route_was_applied() {
+        let verification = EgressVerification::default();
+        assert!(!verification.route_applied);
+        assert!(!verification.gateway_matches);
+    }
+
+    #[test]
+    fn core_backup_retention_keeps_the_newest_generations() {
+        let root = std::env::temp_dir().join(format!("fluxbee-core-backup-{}", now_epoch_ms()));
+        // Fixed-width epoch suffixes, so lexical order IS chronological order. STAMPED: an
+        // unstamped generation cannot be rolled back to, so retention collects it as junk.
+        for id in [
+            "update-1700000000001",
+            "update-1700000000002",
+            "update-1700000000003",
+        ] {
+            stamp_generation(&root, id, Some("h"), &[("sy-admin", "x")]);
+        }
+        // Anything that is not a generation must be left alone.
+        fs::create_dir_all(root.join("scratch")).unwrap();
+        // An unstamped `update-*` (a core update that died in Phase A/B) must NOT count against
+        // the budget — three of those would otherwise evict every usable generation.
+        fs::create_dir_all(root.join("update-1700000000009")).unwrap();
+
+        prune_core_backup_generations_in(&root, 2);
+
+        assert!(
+            !root.join("update-1700000000009").exists(),
+            "an unstamped generation is junk and must be collected"
+        );
+        assert!(!root.join("update-1700000000001").exists());
+        assert!(root.join("update-1700000000002").exists());
+        assert!(root.join("update-1700000000003").exists());
+        assert!(root.join("scratch").exists());
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn core_backup_retention_never_empties_the_store() {
+        let root = std::env::temp_dir().join(format!("fluxbee-core-backup-nb-{}", now_epoch_ms()));
+        stamp_generation(&root, "update-1700000000001", Some("h"), &[("sy-admin", "x")]);
+
+        // At or below the threshold nothing is touched — a rollback still needs its generation.
+        prune_core_backup_generations_in(&root, CORE_BACKUP_GENERATIONS_KEPT);
+        assert!(root.join("update-1700000000001").exists());
+
+        // A missing root is not an error: the pruner runs after a SUCCESSFUL update and must
+        // never turn tidying into a failure.
+        prune_core_backup_generations_in(&root.join("does-not-exist"), 1);
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    // F3: SSH bootstrap failures must classify by cause. A password-channel "permission denied"
+    // (the #1 clean-Ubuntu trap: cloud-init 50-*.conf sets PasswordAuthentication no) must surface
+    // SSH_AUTH_FAILED WITH the actionable hint — not a blanket SSH_KEY_FAILED with no guidance.
+    #[test]
+    fn ssh_bootstrap_error_classifies_and_hints() {
+        let denied = ssh_bootstrap_error_payload(
+            "failed to seed bootstrap key via password channel: Permission denied (publickey,password).",
+        );
+        assert_eq!(denied["error_code"], "SSH_AUTH_FAILED");
+        assert!(
+            denied["hint"].as_str().unwrap_or("").contains("PasswordAuthentication"),
+            "permission-denied auth failure must carry the cloud-init hint: {denied}"
+        );
+
+        let refused = ssh_bootstrap_error_payload("ssh: connect to host x: Connection refused");
+        assert_eq!(refused["error_code"], "SSH_CONNECTION_REFUSED");
+        assert!(refused.get("hint").is_none(), "no hint on non-auth failures");
+
+        let timeout = ssh_bootstrap_error_payload("ssh: connect to host x: Connection timed out");
+        assert_eq!(timeout["error_code"], "SSH_TIMEOUT");
+
+        // An auth failure that is NOT permission-denied stays AUTH_FAILED but carries no hint.
+        let other = ssh_bootstrap_error_payload("host key verification failed");
+        assert_eq!(other["error_code"], "SSH_AUTH_FAILED");
+        assert!(other.get("hint").is_none());
+    }
+
     const LOCAL_DEVICE_ID: &str = "V7TZE22-7TDF4XG-KXILPOJ-NXFPHYF-HPXR2AH-YCZKW5G-XAOGXS3-AKHUFAC";
     const PEER_DEVICE_ID: &str = "I7MM32M-LYH7OVN-TCPA6G4-MIFHRC6-T7RKRVN-Q35OZRX-MGZMVA3-X7Y24QF";
 
@@ -21613,7 +28412,10 @@ mod tests {
         assert!(cmd.starts_with("sudo -n bash -lc '"));
         assert!(cmd.contains("; mkdir -p /etc/fluxbee"));
         assert!(cmd.contains("&& chown -R fluxbee:fluxbee"));
-        assert!(cmd.contains("&& chmod 0750"));
+        // Only the edge's own state dir: never a blob dir, which may be the Syncthing user's name
+        // on a re-join and chmod follows a symlink (A-51).
+        assert!(cmd.contains("&& chmod 0750 /var/lib/fluxbee/state/sy-edge"));
+        assert_eq!(cmd.matches("chmod").count(), 1);
     }
 
     #[test]
@@ -21679,6 +28481,29 @@ mod tests {
         assert!(validate_system_nodes(&section, HiveRole::Egress).is_ok());
     }
 
+    /// The packaged hive.yaml: every role's system_nodes validates, and every role runs
+    /// SY.opa.rules — the one global user policy is enforced by the router of every hive.
+    #[test]
+    fn packaged_hive_yaml_runs_opa_rules_on_every_role() {
+        let hive: HiveFile =
+            serde_yaml::from_str(include_str!("../../packaging/hive.yaml.example"))
+                .expect("packaged hive.yaml parses");
+        for role in [
+            HiveRole::Motherbee,
+            HiveRole::Worker,
+            HiveRole::Ingress,
+            HiveRole::Egress,
+        ] {
+            let section = system_nodes_for_role(&hive, role)
+                .unwrap_or_else(|err| panic!("{}: {err}", role.as_str()));
+            assert!(
+                section.nodes.iter().any(|node| node == "SY.opa.rules"),
+                "{} must run SY.opa.rules",
+                role.as_str()
+            );
+        }
+    }
+
     #[test]
     fn ingress_role_accepts_sy_edge() {
         let section = RoleSystemNodes {
@@ -21689,7 +28514,9 @@ mod tests {
     }
 
     #[test]
-    fn motherbee_role_accepts_packaged_io_blob_worker() {
+    fn motherbee_role_rejects_io_blob_as_lifecycle_node() {
+        // IO.blob is a MANAGED runtime now (the orchestrator spawns it via run_node), NOT a
+        // hive.yaml lifecycle node — validate_system_nodes must reject it even on the motherbee.
         let section = RoleSystemNodes {
             nodes: vec![
                 "SY.config.routes".to_string(),
@@ -21697,21 +28524,23 @@ mod tests {
                 "IO.blob".to_string(),
                 "SY.vault".to_string(),
             ],
-            wait_for: vec!["IO.blob".to_string()],
+            wait_for: vec![],
         };
-        assert!(validate_system_nodes(&section, HiveRole::Motherbee).is_ok());
-        assert_eq!(name_to_service("IO.blob"), "io-blob");
+        assert!(validate_system_nodes(&section, HiveRole::Motherbee).is_err());
     }
 
     #[test]
-    fn packaged_io_blob_worker_is_motherbee_only_and_allowlist_is_exact() {
-        let worker = RoleSystemNodes {
+    fn io_runtimes_are_never_hive_yaml_lifecycle_nodes() {
+        // Neither IO.blob nor IO.cloud may appear in hive.yaml system_nodes on ANY role: they are
+        // managed runtimes, not lifecycle authorities.
+        let blob_mb = RoleSystemNodes {
             nodes: vec!["SY.config.routes".to_string(), "IO.blob".to_string()],
             wait_for: vec![],
         };
-        assert!(validate_system_nodes(&worker, HiveRole::Worker).is_err());
+        assert!(validate_system_nodes(&blob_mb, HiveRole::Motherbee).is_err());
+        assert!(validate_system_nodes(&blob_mb, HiveRole::Worker).is_err());
 
-        let unknown_io = RoleSystemNodes {
+        let cloud_mb = RoleSystemNodes {
             nodes: vec![
                 "SY.config.routes".to_string(),
                 "IO.cloud".to_string(),
@@ -21719,7 +28548,7 @@ mod tests {
             ],
             wait_for: vec![],
         };
-        assert!(validate_system_nodes(&unknown_io, HiveRole::Motherbee).is_err());
+        assert!(validate_system_nodes(&cloud_mb, HiveRole::Motherbee).is_err());
     }
 
     #[test]
@@ -21841,34 +28670,404 @@ mod tests {
         );
     }
 
+    /// D32: a request that still asks for a post-join SSH posture is refused, whatever it asks.
     #[test]
-    fn resolve_add_hive_ssh_access_defaults_to_revoke_and_opts_in() {
-        // Absent / unknown / explicit "revoke" all keep today's SO-02 revoke-everything.
-        assert_eq!(
-            resolve_add_hive_ssh_access(&serde_json::json!({})),
-            SshAccess::Revoke
+    fn add_hive_refuses_the_removed_ssh_access() {
+        assert!(reject_removed_add_hive_fields(&serde_json::json!({})).is_ok());
+        for value in [
+            serde_json::json!("revoke"),
+            serde_json::json!("key_only_persist"),
+            serde_json::json!(1),
+        ] {
+            let err = reject_removed_add_hive_fields(&serde_json::json!({ "ssh_access": value }))
+                .unwrap_err();
+            assert!(err.contains("D32"), "{err}");
+        }
+    }
+
+    /// The source with every comment and string content blanked (same length, so offsets hold),
+    /// and the string literals found, with the offset of their first character.
+    fn rust_code_and_literals(src: &str) -> (String, Vec<(usize, String)>) {
+        let b = src.as_bytes();
+        let mut out = b.to_vec();
+        let mut literals = Vec::new();
+        let blank = |out: &mut Vec<u8>, from: usize, to: usize| {
+            for byte in &mut out[from..to] {
+                if *byte != b'\n' {
+                    *byte = b' ';
+                }
+            }
+        };
+        let mut i = 0;
+        while i < b.len() {
+            let ident_before = i > 0 && (b[i - 1].is_ascii_alphanumeric() || b[i - 1] == b'_');
+            if b[i..].starts_with(b"//") {
+                let end = src[i..].find('\n').map_or(b.len(), |n| i + n);
+                blank(&mut out, i, end);
+                i = end;
+            } else if b[i..].starts_with(b"/*") {
+                let (mut depth, mut j) = (0usize, i);
+                while j < b.len() {
+                    if b[j..].starts_with(b"/*") {
+                        depth += 1;
+                        j += 2;
+                    } else if b[j..].starts_with(b"*/") {
+                        depth -= 1;
+                        j += 2;
+                        if depth == 0 {
+                            break;
+                        }
+                    } else {
+                        j += 1;
+                    }
+                }
+                blank(&mut out, i, j);
+                i = j;
+            } else if !ident_before && (b[i] == b'r' || b[i..].starts_with(b"br")) {
+                let mut j = i + if b[i] == b'b' { 2 } else { 1 };
+                let hashes = b[j..].iter().take_while(|c| **c == b'#').count();
+                j += hashes;
+                if j < b.len() && b[j] == b'"' {
+                    let close = format!("\"{}", "#".repeat(hashes));
+                    let end = src[j + 1..].find(&close).map_or(b.len(), |n| j + 1 + n);
+                    literals.push((j + 1, src[j + 1..end].to_string()));
+                    blank(&mut out, j + 1, end);
+                    i = end + close.len();
+                } else {
+                    i += 1;
+                }
+            } else if b[i] == b'"' {
+                let mut j = i + 1;
+                while j < b.len() && b[j] != b'"' {
+                    j += if b[j] == b'\\' { 2 } else { 1 };
+                }
+                let end = j.min(b.len());
+                literals.push((i + 1, src[i + 1..end].to_string()));
+                blank(&mut out, i + 1, end);
+                i = end + 1;
+            } else if b[i] == b'\'' && i + 1 < b.len() && b[i + 1] == b'\\' {
+                // An escaped char literal ('\n', '\'', '\u{e9}'): the escaped character is at
+                // i + 2, so the closing quote is looked for after it.
+                let end = src
+                    .get(i + 3..)
+                    .and_then(|rest| rest.find('\''))
+                    .map_or(b.len(), |n| i + 3 + n);
+                blank(&mut out, i + 1, end);
+                i = end + 1;
+            } else if let Some(width) = (b[i] == b'\'')
+                .then(|| src[i + 1..].chars().next())
+                .flatten()
+                .map(char::len_utf8)
+                .filter(|width| src[i + 1 + width..].starts_with('\''))
+            {
+                // A plain char literal, sized by its UTF-8 length ('é' is two bytes).
+                blank(&mut out, i + 1, i + 1 + width);
+                i += 2 + width;
+            } else {
+                i += 1;
+            }
+        }
+        (
+            String::from_utf8(out).expect("ascii blanks keep it utf-8"),
+            literals,
+        )
+    }
+
+    /// D32: SSH exists only inside `add_hive`. Every place that can start ssh is found: a
+    /// `Command::new` (whose argument must be a literal, and `Command` is never renamed), or any
+    /// string literal that names ssh, scp, sftp, rsync, sshpass, ssh-keyscan, ssh-copy-id or
+    /// autossh in command position (see `names_a_program`). From each, every use of the enclosing
+    /// function is followed upwards (calls, function pointers, turbofish) until `accept_add_hive`,
+    /// the only entry, which `handle_admin` alone calls. A use outside any function, or a function
+    /// nothing uses that is not `accept_add_hive`, fails with the chain that reaches it. The
+    /// boot-time TLS reconcile was such a chain (`main`).
+    ///
+    /// What a source walk cannot see: a closure stored in a static or a struct field and called
+    /// from elsewhere, a thread the join spawns that outlives it, a program name built at runtime.
+    /// Review covers those.
+    #[test]
+    fn ssh_happens_only_inside_add_hive() {
+        let full = include_str!("sy_orchestrator.rs");
+        let tests_at = full.find("\nmod tests {").expect("tests module");
+        let src = &full[..tests_at];
+        // Everything after `mod tests {` must be inside it, or it would escape the walk: a line
+        // of code at column 0 there can only be the module's closing brace (a multi-line
+        // literal's closing quote can sit there too).
+        let (all_code, _) = rust_code_and_literals(full);
+        let after_tests: Vec<&str> = all_code[tests_at + 1..]
+            .lines()
+            .skip(1)
+            .filter(|line| !line.is_empty() && !line.starts_with([' ', '\t', '"']))
+            .collect();
+        assert_eq!(after_tests, vec!["}"], "code after the tests module");
+        let (code, literals) = rust_code_and_literals(src);
+        assert!(
+            !Regex::new(r"\bCommand\s+as\b").unwrap().is_match(&code),
+            "`Command` renamed: the walk looks for `Command::new`"
         );
-        assert_eq!(
-            resolve_add_hive_ssh_access(&serde_json::json!({"ssh_access": "revoke"})),
-            SshAccess::Revoke
+        let fn_re = Regex::new(
+            r#"(?m)^[ \t]*(?:pub(?:\([^)]*\))?\s+)?(?:(?:async|unsafe|const|extern(?:\s+"[^"]*")?)\s+)*fn\s+([A-Za-z_][A-Za-z_0-9]*)"#,
+        )
+        .unwrap();
+        let item_re = Regex::new(
+            r"(?m)^(?:pub(?:\([^)]*\))?\s+)?(?:static\s|const\s+[A-Z_]|struct\s|enum\s|impl\b|trait\s|type\s|mod\s|union\s|macro_rules!|use\s)",
+        )
+        .unwrap();
+        let mut bounds: Vec<(usize, Option<String>)> = fn_re
+            .captures_iter(&code)
+            .map(|c| (c.get(0).unwrap().start(), Some(c[1].to_string())))
+            .chain(item_re.find_iter(&code).map(|m| (m.start(), None)))
+            .collect();
+        bounds.sort_by_key(|(at, name)| (*at, name.is_some()));
+        let owner = |at: usize| -> Option<String> {
+            bounds
+                .iter()
+                .rev()
+                .find(|(start, _)| *start <= at)
+                .and_then(|(_, name)| name.clone())
+        };
+        let mut problems: Vec<String> = Vec::new();
+        let mut frontier: Vec<(String, String)> = Vec::new();
+        let programs = [
+            "ssh",
+            "scp",
+            "sftp",
+            "rsync",
+            "sshpass",
+            "ssh-keyscan",
+            "ssh-copy-id",
+            "autossh",
+        ];
+        // Words that run a later word as a program.
+        let wrappers = [
+            "sudo",
+            "timeout",
+            "env",
+            "exec",
+            "nohup",
+            "setsid",
+            "command",
+            "nice",
+            "ionice",
+            "stdbuf",
+            "xargs",
+            "sh",
+            "bash",
+            "su",
+            "runuser",
+            "systemd-run",
+            "time",
+            "if",
+            "while",
+            "until",
+            "then",
+            "do",
+            "else",
+            "{",
+            "!",
+        ];
+        // A program in command position: the head of a shell segment (the literal, or a part of
+        // it after `;`, `|`, `&`, `(`, a backtick or a line break, real or escaped), past
+        // wrappers, flags, a flag's value, assignments and numbers (`sudo -n -u x ssh`,
+        // `timeout 5 ssh`, `env A=b ssh`, `bash -lc 'ssh`, `su -c \"ssh`, `if ssh`). A plain
+        // word that follows none of those ends the head: `systemctl restart ssh` names no
+        // program.
+        let names_a_program = |text: &str| {
+            text.replace("\\n", "\n")
+                .replace("\\\"", "\"")
+                .replace("\\'", "'")
+                .split(|c: char| ";|&(`\n".contains(c))
+                .any(|segment| {
+                    let mut after_flag = false;
+                    for word in segment.split_whitespace() {
+                        let word = word.trim_matches(|c| c == '\'' || c == '"');
+                        let word = word.rsplit('/').next().unwrap_or(word);
+                        if programs.contains(&word) {
+                            return true;
+                        }
+                        let is_flag = word.starts_with('-');
+                        if !(is_flag
+                            || after_flag
+                            || wrappers.contains(&word)
+                            || word.contains('=')
+                            || word
+                                .chars()
+                                .all(|c| c.is_ascii_digit() || ".sm".contains(c)))
+                        {
+                            return false;
+                        }
+                        after_flag = is_flag;
+                    }
+                    false
+                })
+        };
+        for (at, text) in &literals {
+            if names_a_program(text) {
+                match owner(*at) {
+                    Some(f) => frontier.push((f.clone(), format!("{f} (\"{text}\")"))),
+                    None => problems.push(format!("\"{text}\" outside any function")),
+                }
+            }
+        }
+        for m in code.match_indices("Command::new(") {
+            let arg = src[m.0 + "Command::new(".len()..].trim_start();
+            if !arg.starts_with('"') {
+                problems.push(format!(
+                    "Command::new with a non-literal program in {:?}",
+                    owner(m.0)
+                ));
+            }
+        }
+        assert!(
+            !frontier.is_empty(),
+            "no ssh found: the walk would prove nothing"
         );
-        assert_eq!(
-            resolve_add_hive_ssh_access(&serde_json::json!({"ssh_access": "bogus"})),
-            SshAccess::Revoke
+        let mut seen = BTreeSet::new();
+        while let Some((function, chain)) = frontier.pop() {
+            if !seen.insert(function.clone()) || function == "accept_add_hive" {
+                continue;
+            }
+            let uses = Regex::new(&format!(r"\b{}\b", regex::escape(&function))).unwrap();
+            let mut used = false;
+            for m in uses.find_iter(&code) {
+                if code[..m.start()].trim_end().ends_with("fn") {
+                    continue;
+                }
+                match owner(m.start()) {
+                    Some(user) if user == function => {}
+                    Some(user) => {
+                        used = true;
+                        frontier.push((user.clone(), format!("{user} <- {chain}")));
+                    }
+                    None => {
+                        used = true;
+                        problems.push(format!("used outside any function: {chain}"));
+                    }
+                }
+            }
+            if !used {
+                problems.push(format!("reached from outside add_hive: {chain}"));
+            }
+        }
+        assert!(
+            problems.is_empty(),
+            "SSH outside add_hive (D32):\n{}",
+            problems.join("\n")
         );
+        for flow in [
+            "add_hive_flow",
+            "add_egress_hive_flow",
+            "add_ingress_hive_flow",
+            "accept_add_hive",
+        ] {
+            assert!(seen.contains(flow), "the walk never reached {flow}");
+        }
+        // The walk stops at `accept_add_hive`, so it must be the admin action's alone.
+        let entry_uses: Vec<Option<String>> = Regex::new(r"\baccept_add_hive\b")
+            .unwrap()
+            .find_iter(&code)
+            .filter(|m| !code[..m.start()].trim_end().ends_with("fn"))
+            .map(|m| owner(m.start()))
+            .collect();
         assert_eq!(
-            resolve_add_hive_ssh_access(&serde_json::json!({"ssh_access": 1})),
-            SshAccess::Revoke
+            entry_uses,
+            vec![Some("handle_admin".to_string())],
+            "accept_add_hive must have one caller, the admin action"
         );
-        // Only the exact string (case-insensitive, trimmed) opts into persistence.
-        assert_eq!(
-            resolve_add_hive_ssh_access(&serde_json::json!({"ssh_access": "key_only_persist"})),
-            SshAccess::KeyOnlyPersist
+    }
+
+    /// D32: the revoke filter drops the gate line, the bootstrap key and a retired recovery key,
+    /// and keeps every other key, including one whose comment only mentions the recovery name.
+    /// Both revoke scripts run this filter.
+    #[test]
+    fn bootstrap_revoke_filter_keeps_operator_keys() {
+        let home = std::env::temp_dir().join(format!("fluxbee-revoke-filter-{}", Uuid::new_v4()));
+        fs::create_dir_all(home.join(".ssh")).unwrap();
+        let auth_keys = home.join(".ssh/authorized_keys");
+        let keep = [
+            "ssh-ed25519 AAAAoperator ops@laptop",
+            "ssh-ed25519 AAAAnotes notes-on-fluxbee-spoke-recovery",
+            "ssh-ed25519 AAAAmention fluxbee-spoke-recovery is retired",
+        ];
+        let drop = [
+            format!("command=\"{ORCH_SSH_GATE_PATH}\" ssh-ed25519 AAAAgate gate"),
+            "ssh-ed25519 AAAAbootstrap root@motherbee".to_string(),
+            "ssh-ed25519 AAAArecovery fluxbee-spoke-recovery".to_string(),
+            "restrict ssh-ed25519 AAAArecovery2 fluxbee-spoke-recovery  ".to_string(),
+        ];
+        let mut lines: Vec<String> = keep.iter().map(|l| l.to_string()).collect();
+        lines.extend(drop.iter().cloned());
+        fs::write(&auth_keys, lines.join("\n") + "\n").unwrap();
+        let script =
+            bootstrap_authorized_key_cleanup_script("ssh-ed25519 AAAAbootstrap root@motherbee")
+                .unwrap();
+        let status = Command::new("bash")
+            .arg("-c")
+            .arg(&script)
+            .env("HOME", &home)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let left = fs::read_to_string(&auth_keys).unwrap();
+        assert_eq!(left.lines().collect::<Vec<_>>(), keep.to_vec());
+        let revoke =
+            revoke_bootstrap_ssh_access_script("admin", "ssh-ed25519 AAAAbootstrap x").unwrap();
+        assert!(revoke.contains(&bootstrap_authorized_keys_filter(
+            ORCH_SSH_GATE_PATH,
+            "AAAAbootstrap"
+        )));
+        let _ = fs::remove_dir_all(&home);
+    }
+
+    /// The guard's tokenizer: char literals with an escaped quote or a multi-byte character do
+    /// not swallow the code after them.
+    #[test]
+    fn guard_tokenizer_keeps_code_after_tricky_char_literals() {
+        let snippet =
+            "let q = ['\\'', '\"', 'é', '\\u{e9}']; Command::new(\"ssh\"); let p = \"\\\"\";";
+        let (code, literals) = rust_code_and_literals(snippet);
+        assert!(code.contains("Command::new("), "{code}");
+        assert!(
+            literals.iter().any(|(_, text)| text == "ssh"),
+            "{literals:?}"
         );
-        assert_eq!(
-            resolve_add_hive_ssh_access(&serde_json::json!({"ssh_access": " KEY_ONLY_PERSIST "})),
-            SshAccess::KeyOnlyPersist
+        assert_eq!(code.len(), snippet.len());
+    }
+
+    /// D32: the admin action itself refuses the removed field, with nothing started.
+    #[tokio::test]
+    async fn accept_add_hive_answers_ssh_access_with_invalid_request() {
+        let state = Arc::new(sample_orchestrator_state_for_tests());
+        let reply = accept_add_hive(
+            &state,
+            &serde_json::json!({
+                "hive_id": "worker9",
+                "address": "10.0.0.9",
+                "ssh_access": "key_only_persist",
+            }),
+        )
+        .await;
+        assert_eq!(reply["error_code"], "INVALID_REQUEST", "{reply}");
+        assert!(
+            reply["message"].as_str().is_some_and(|m| m.contains("D32")),
+            "{reply}"
         );
+        assert!(!state.any_hive_topology_busy());
+    }
+
+    /// D32: a request with the removed field is refused before anything starts.
+    #[test]
+    fn add_hive_refuses_ssh_access_before_the_join_starts() {
+        let src = include_str!("sy_orchestrator.rs");
+        let start = src
+            .find("async fn accept_add_hive(")
+            .expect("accept_add_hive");
+        let body = &src[start..];
+        let refuse = body
+            .find("reject_removed_add_hive_fields(payload)")
+            .expect("refusal");
+        let spawn = body.find("spawn_background_join(").expect("spawn");
+        assert!(refuse < spawn);
     }
 
     #[test]
@@ -22070,13 +29269,6 @@ mod tests {
         assert!(resolve_add_hive_egress_section(&serde_json::json!({})).is_err());
     }
 
-    fn write_name(buf: &mut [u8], value: &str) -> u16 {
-        let bytes = value.as_bytes();
-        let len = bytes.len().min(buf.len());
-        buf[..len].copy_from_slice(&bytes[..len]);
-        len as u16
-    }
-
     fn sample_syncthing_config_with_peer() -> String {
         format!(
             "<configuration version=\"37\">
@@ -22096,7 +29288,7 @@ mod tests {
             local = LOCAL_DEVICE_ID,
             peer = PEER_DEVICE_ID,
             blob_id = SYNCTHING_FOLDER_BLOB_ID,
-            dist_id = SYNCTHING_FOLDER_DIST_ID
+            dist_id = SYNCTHING_FOLDER_DIST_LEGACY_ID
         )
     }
 
@@ -22109,8 +29301,6 @@ mod tests {
             sync_tool: "syncthing".to_string(),
             sync_api_port: 8384,
             sync_data_dir: PathBuf::from("/var/lib/fluxbee/syncthing"),
-            sync_service_user: DEFAULT_BLOB_SYNC_SERVICE_USER.to_string(),
-            sync_allow_root_fallback: DEFAULT_BLOB_SYNC_ALLOW_ROOT_FALLBACK,
             gc_enabled: DEFAULT_BLOB_GC_ENABLED,
             gc_interval_secs: DEFAULT_BLOB_GC_INTERVAL_SECS,
             gc_apply: DEFAULT_BLOB_GC_APPLY,
@@ -22119,8 +29309,16 @@ mod tests {
         }
     }
 
+    /// The DMZ invariant, restated precisely after the dist split.
+    ///
+    /// P5 (docs/io-blob-spec-v1.md:53) constrains BLOB content: the ingress receives only
+    /// `blob/public`, never `blob/active`. It says nothing about software distribution, and the
+    /// old code conflated the two — leaving the public door with no core channel at all. So the
+    /// invariant this test now guards is sharper: the ingress must still be absent from the
+    /// private BLOB folder, while being present on its own core folder and on vendor, and
+    /// absent from runtimes (where tenant workflow packages live).
     #[test]
-    fn ingress_public_peer_profile_never_attaches_private_folders() {
+    fn ingress_peer_profile_gets_core_and_vendor_but_no_private_blob_or_runtimes() {
         const INGRESS_DEVICE_ID: &str = "INGRESS-DEVICE-ID-1234567890";
         let base = sample_syncthing_config_with_peer();
         let blob = sample_blob_config();
@@ -22131,41 +29329,63 @@ mod tests {
             &dist,
             INGRESS_DEVICE_ID,
             "ingress-1",
-            Some("tcp://192.0.2.10:22000"),
+            SyncthingPeerAddress::AcceptOnly,
             true,
-            true,
+            HiveRole::Ingress,
         )
         .unwrap();
         assert!(changed);
-        assert!(mother.contains("<address>tcp://192.0.2.10:22000</address>"));
+        // Stage 2: the motherbee never dials a spoke; the ingress dials it.
+        assert!(mother.contains("<address>dynamic</address>"));
+        assert!(!mother.contains("tcp://192.0.2.10:22000"));
         assert!(mother.contains(&format!("id=\"{}\"", SYNCTHING_FOLDER_BLOB_PUBLIC_ID)));
-        assert!(mother.contains("type=\"sendonly\""));
-        let public_folder = Regex::new(&format!(
-            r#"(?s)<folder\b[^>]*\bid=\"{}\"[^>]*>.*?</folder>"#,
-            SYNCTHING_FOLDER_BLOB_PUBLIC_ID
-        ))
-        .unwrap()
-        .find(&mother)
-        .unwrap()
-        .as_str();
-        assert!(public_folder.contains(INGRESS_DEVICE_ID));
-        assert!(!public_folder.contains(PEER_DEVICE_ID));
-        for private_id in [SYNCTHING_FOLDER_BLOB_ID, SYNCTHING_FOLDER_DIST_ID] {
-            let private_folder = Regex::new(&format!(
+
+        let folder_block = |xml: &str, id: &str| -> Option<String> {
+            Regex::new(&format!(
                 r#"(?s)<folder\b[^>]*\bid=\"{}\"[^>]*>.*?</folder>"#,
-                private_id
+                regex::escape(id)
             ))
             .unwrap()
-            .find(&mother)
-            .unwrap()
-            .as_str();
-            assert!(!private_folder.contains(INGRESS_DEVICE_ID));
+            .find(xml)
+            .map(|m| m.as_str().to_string())
+        };
+
+        // Public blob: the ingress is on it, the ordinary worker peer is not.
+        let public_folder = folder_block(&mother, SYNCTHING_FOLDER_BLOB_PUBLIC_ID).unwrap();
+        assert!(public_folder.contains(INGRESS_DEVICE_ID));
+        assert!(!public_folder.contains(PEER_DEVICE_ID));
+
+        // Private blob (`blob/active`): the ingress must NEVER appear. This is P5 and it is
+        // non-negotiable.
+        let private_blob = folder_block(&mother, SYNCTHING_FOLDER_BLOB_ID).unwrap();
+        assert!(
+            !private_blob.contains(INGRESS_DEVICE_ID),
+            "P5: the DMZ ingress must never peer blob/active"
+        );
+
+        // Core: the ingress IS attached now — that is the whole fix.
+        let core_id = format!("{SYNCTHING_FOLDER_DIST_CORE_PREFIX}ingress");
+        let core_folder = folder_block(&mother, &core_id)
+            .expect("motherbee must declare the ingress core folder");
+        assert!(core_folder.contains(INGRESS_DEVICE_ID));
+        assert!(core_folder.contains("path=\"/var/lib/fluxbee/dist/core/ingress\""));
+
+        // Vendor: attached, so the ingress can upgrade its own syncthing.
+        let vendor_folder = folder_block(&mother, SYNCTHING_FOLDER_DIST_VENDOR_ID)
+            .expect("motherbee must declare the vendor folder");
+        assert!(vendor_folder.contains(INGRESS_DEVICE_ID));
+
+        // Runtimes: NOT attached, and not even declared for an ingress-only link.
+        if let Some(runtimes) = folder_block(&mother, SYNCTHING_FOLDER_DIST_RUNTIMES_ID) {
+            assert!(
+                !runtimes.contains(INGRESS_DEVICE_ID),
+                "tenant workflow packages must never reach the DMZ"
+            );
         }
 
+        // Now the ingress's own side of the link.
         let mut ingress_blob = blob.clone();
         ingress_blob.enabled = false;
-        let mut ingress_dist = dist.clone();
-        ingress_dist.sync_enabled = false;
         let ingress_base = format!(
             "<configuration version=\"37\">\n  <device id=\"{local}\" name=\"ingress-1\"></device>\n</configuration>",
             local = LOCAL_DEVICE_ID,
@@ -22173,17 +29393,20 @@ mod tests {
         let (ingress, _) = reconcile_syncthing_peer_xml(
             &ingress_base,
             &ingress_blob,
-            &ingress_dist,
+            &dist,
             INGRESS_DEVICE_ID,
             "motherbee",
-            Some("tcp://192.0.2.1:22000"),
+            SyncthingPeerAddress::Static("192.0.2.1:22000".parse().unwrap()),
             false,
-            true,
+            HiveRole::Ingress,
         )
         .unwrap();
         assert!(ingress.contains("type=\"receiveonly\""));
         assert!(!ingress.contains(&format!("id=\"{}\"", SYNCTHING_FOLDER_BLOB_ID)));
-        assert!(!ingress.contains(&format!("id=\"{}\"", SYNCTHING_FOLDER_DIST_ID)));
+        assert!(!ingress.contains(&format!("id=\"{}\"", SYNCTHING_FOLDER_DIST_RUNTIMES_ID)));
+        // Its core folder maps onto the plain `dist/core` path its own code reads.
+        assert!(ingress.contains(&format!("id=\"{core_id}\"")));
+        assert!(ingress.contains("path=\"/var/lib/fluxbee/dist/core\""));
     }
 
     #[test]
@@ -22199,7 +29422,7 @@ mod tests {
             &config,
             REMOTE_DEVICE_ID,
             "ingress-public-test",
-            Some("tcp://192.0.2.44:22000"),
+            SyncthingPeerAddress::Static("192.0.2.44:22000".parse().unwrap()),
         )
         .unwrap();
 
@@ -22217,11 +29440,1793 @@ mod tests {
             &updated,
             REMOTE_DEVICE_ID,
             "ingress-public-test",
-            Some("tcp://192.0.2.44:22000"),
+            SyncthingPeerAddress::Static("192.0.2.44:22000".parse().unwrap()),
         )
         .unwrap();
         assert!(!changed_again);
         assert_eq!(idempotent, updated);
+    }
+
+    // Host posture stage 2 fixtures: the motherbee's config.xml as captured read-only on PROD on
+    // 2026-10-06 (0.1.57), with made-up device ids (the repo is public): worker1 and egress1
+    // `dynamic`, ingress1 static, and egress1 in `fluxbee-blob` (A-50). Members appear in both
+    // forms on PROD: Syncthing's full one, and the self-closing one the orchestrator appends (the
+    // egress here). Added: a device left by an old removal and a stale second device under
+    // "worker1".
+    const ST_MB_LOCAL: &str = "MBLOCAL-AAAAAAA-BBBBBBB";
+    const ST_WORKER1: &str = "WORKER1-AAAAAAA-BBBBBBB";
+    const ST_WORKER1_STALE: &str = "WORKER1-STALEXX-BBBBBBB";
+    const ST_INGRESS1: &str = "INGRESS-AAAAAAA-BBBBBBB";
+    const ST_EGRESS1: &str = "EGRESS1-AAAAAAA-BBBBBBB";
+    const ST_OLDHIVE: &str = "OLDHIVE-AAAAAAA-BBBBBBB";
+
+    fn stage2_member(id: &str) -> String {
+        if id == ST_EGRESS1 {
+            format!("        <device id=\"{id}\" introducedBy=\"\"/>\n")
+        } else {
+            format!("        <device id=\"{id}\" introducedBy=\"\">\n            <encryptionPassword></encryptionPassword>\n        </device>\n")
+        }
+    }
+
+    fn stage2_folder(id: &str, path: &str, kind: &str, members: &[&str]) -> String {
+        let mut out = format!(
+            "    <folder id=\"{id}\" label=\"{id}\" path=\"{path}\" type=\"{kind}\" rescanIntervalS=\"3600\" fsWatcherEnabled=\"true\">\n        <filesystemType>basic</filesystemType>\n"
+        );
+        for member in members {
+            out.push_str(&stage2_member(member));
+        }
+        out.push_str("        <minDiskFree unit=\"%\">1</minDiskFree>\n    </folder>\n");
+        out
+    }
+
+    fn stage2_device(id: &str, name: &str, address: &str) -> String {
+        format!("    <device id=\"{id}\" name=\"{name}\" compression=\"metadata\" introducer=\"false\" skipIntroductionRemovals=\"false\" introducedBy=\"\">\n        <address>{address}</address>\n        <paused>false</paused>\n        <autoAcceptFolders>false</autoAcceptFolders>\n        <maxSendKbps>0</maxSendKbps>\n    </device>\n")
+    }
+
+    fn stage2_motherbee_config() -> String {
+        let (mb, w, ws, i, e, o) = (
+            ST_MB_LOCAL,
+            ST_WORKER1,
+            ST_WORKER1_STALE,
+            ST_INGRESS1,
+            ST_EGRESS1,
+            ST_OLDHIVE,
+        );
+        let root = "/var/lib/fluxbee";
+        let mut out = String::from("<configuration version=\"51\">\n");
+        out.push_str(&stage2_folder(
+            "fluxbee-blob",
+            &format!("{root}/blob/active"),
+            "sendreceive",
+            &[mb, e, w, ws, o],
+        ));
+        out.push_str(&stage2_folder(
+            "fluxbee-blob-public",
+            &format!("{root}/blob/public"),
+            "sendonly",
+            &[mb, i],
+        ));
+        out.push_str(&stage2_folder(
+            "fluxbee-dist-core-egress",
+            &format!("{root}/dist/core/egress"),
+            "sendonly",
+            &[mb, e],
+        ));
+        out.push_str(&stage2_folder(
+            "fluxbee-dist-core-ingress",
+            &format!("{root}/dist/core/ingress"),
+            "sendonly",
+            &[mb, i],
+        ));
+        out.push_str(&stage2_folder(
+            "fluxbee-dist-core-worker",
+            &format!("{root}/dist/core/worker"),
+            "sendonly",
+            &[mb, w],
+        ));
+        out.push_str(&stage2_folder(
+            "fluxbee-dist-policy",
+            &format!("{root}/dist/policy"),
+            "sendonly",
+            &[mb, i, e, w],
+        ));
+        out.push_str(&stage2_folder(
+            "fluxbee-dist-runtimes",
+            &format!("{root}/dist/runtimes"),
+            "sendonly",
+            &[mb, w],
+        ));
+        out.push_str(&stage2_folder(
+            "fluxbee-dist-vendor",
+            &format!("{root}/dist/vendor"),
+            "sendonly",
+            &[mb, i, e, w, ws, o],
+        ));
+        out.push_str(&stage2_device(mb, "fb-mb", "dynamic"));
+        out.push_str(&stage2_device(i, "ingress1", "tcp://10.10.10.30:22000"));
+        out.push_str(&stage2_device(e, "egress1", "dynamic"));
+        out.push_str(&stage2_device(w, "worker1", "dynamic"));
+        out.push_str(&stage2_device(ws, "worker1", "dynamic"));
+        out.push_str(&stage2_device(o, "old-worker", "dynamic"));
+        out.push_str("    <gui enabled=\"true\" tls=\"false\">\n        <address>127.0.0.1:8384</address>\n    </gui>\n");
+        out.push_str(
+            "    <defaults>\n        <folder id=\"\" label=\"\" path=\"~\" type=\"sendreceive\">\n",
+        );
+        out.push_str(&format!("            <device id=\"{mb}\" introducedBy=\"\">\n                <encryptionPassword></encryptionPassword>\n            </device>\n        </folder>\n"));
+        out.push_str("        <device id=\"\" compression=\"metadata\" introducer=\"false\">\n            <address>dynamic</address>\n        </device>\n    </defaults>\n</configuration>\n");
+        out
+    }
+
+    fn stage2_hive(device_id: Option<&str>, role: HiveRole, connected: bool) -> RegisteredHive {
+        RegisteredHive {
+            device_id: device_id.map(str::to_string),
+            role: Some(role),
+            connected,
+            state: if connected {
+                "status connected, join done".to_string()
+            } else {
+                "status joining, join running".to_string()
+            },
+        }
+    }
+
+    /// The PROD registry: the egress entry records no device id.
+    fn stage2_registry() -> RegistrySnapshot {
+        RegistrySnapshot {
+            hives: BTreeMap::from([
+                (
+                    "worker1".to_string(),
+                    stage2_hive(Some(ST_WORKER1), HiveRole::Worker, true),
+                ),
+                (
+                    "ingress1".to_string(),
+                    stage2_hive(Some(ST_INGRESS1), HiveRole::Ingress, true),
+                ),
+                (
+                    "egress1".to_string(),
+                    stage2_hive(None, HiveRole::Egress, true),
+                ),
+            ]),
+            complete: true,
+        }
+    }
+
+    fn stage2_recorded_registry() -> RegistrySnapshot {
+        let mut registry = stage2_registry();
+        registry.hives.get_mut("egress1").unwrap().device_id = Some(ST_EGRESS1.to_string());
+        registry
+    }
+
+    fn stage2_plan(config: &str, registry: &RegistrySnapshot, busy: bool) -> MotherbeePeerPlan {
+        motherbee_peer_plan(
+            &syncthing_declared_devices(config).unwrap(),
+            &fluxbee_folder_memberships(config).unwrap(),
+            ST_MB_LOCAL,
+            registry,
+            busy,
+        )
+    }
+
+    fn stage2_apply(config: &str, plan: &MotherbeePeerPlan) -> (String, bool) {
+        apply_motherbee_peer_plan_xml(config, plan, &fluxbee_folder_memberships(config).unwrap())
+            .unwrap()
+    }
+
+    fn folders_with(config: &str, device_id: &str) -> Vec<String> {
+        fluxbee_folder_memberships(config)
+            .unwrap()
+            .into_iter()
+            .filter(|(_, members)| members.iter().any(|m| m == device_id))
+            .map(|(folder, _)| folder)
+            .collect()
+    }
+
+    #[test]
+    fn syncthing_declared_devices_reads_only_peer_declarations() {
+        let devices = syncthing_declared_devices(&stage2_motherbee_config()).unwrap();
+        let names: Vec<&str> = devices.iter().map(|d| d.name.as_str()).collect();
+        assert_eq!(
+            names,
+            [
+                "fb-mb",
+                "ingress1",
+                "egress1",
+                "worker1",
+                "worker1",
+                "old-worker"
+            ]
+        );
+        let ingress = devices.iter().find(|d| d.id == ST_INGRESS1).unwrap();
+        assert_eq!(ingress.address, "tcp://10.10.10.30:22000");
+    }
+
+    #[test]
+    fn fluxbee_folder_memberships_skip_the_defaults_template() {
+        let memberships = fluxbee_folder_memberships(&stage2_motherbee_config()).unwrap();
+        assert_eq!(memberships.len(), 8);
+        assert_eq!(
+            memberships["fluxbee-dist-core-egress"],
+            vec![ST_MB_LOCAL.to_string(), ST_EGRESS1.to_string()]
+        );
+    }
+
+    /// A-50 and the per-role dist split, as the reconcile enforces them: by role only.
+    #[test]
+    fn folders_forbidden_by_role() {
+        use HiveRole::{Egress, Ingress, Worker};
+        let table = [
+            ("fluxbee-blob", [false, true, true]),
+            ("fluxbee-blob-public", [true, false, true]),
+            ("fluxbee-dist-runtimes", [false, true, true]),
+            ("fluxbee-dist-core-worker", [false, true, true]),
+            ("fluxbee-dist-core-ingress", [true, false, true]),
+            ("fluxbee-dist-core-egress", [true, true, false]),
+            ("fluxbee-dist-vendor", [false, false, false]),
+            ("fluxbee-dist-policy", [false, false, false]),
+            ("fluxbee-something-new", [false, false, false]),
+        ];
+        for (folder, expected) in table {
+            for (role, forbidden) in [Worker, Ingress, Egress].into_iter().zip(expected) {
+                assert_eq!(
+                    folder_forbidden_for_role(folder, role),
+                    forbidden,
+                    "{folder} for {}",
+                    role.as_str()
+                );
+            }
+        }
+    }
+
+    /// The joins are the only place that adds a spoke to a folder, and whatever hive.yaml's enable
+    /// flags say they never add one the reconcile would take back, so the two cannot flip-flop.
+    /// With the default flags each role gets exactly its folders.
+    #[test]
+    fn the_link_never_adds_a_forbidden_folder() {
+        const PEER: &str = "PEERDEV-AAAAAAA-BBBBBBB";
+        for flags in 0..16u8 {
+            let mut blob = sample_blob_config();
+            let mut dist = sample_dist_config();
+            blob.enabled = flags & 1 != 0;
+            blob.sync_enabled = flags & 2 != 0;
+            blob.public_sync_enabled = flags & 4 != 0;
+            dist.sync_enabled = flags & 8 != 0;
+            for role in [HiveRole::Worker, HiveRole::Ingress, HiveRole::Egress] {
+                let (linked, _) = reconcile_syncthing_peer_xml(
+                    &sample_syncthing_config_with_peer(),
+                    &blob,
+                    &dist,
+                    PEER,
+                    "spoke",
+                    SyncthingPeerAddress::AcceptOnly,
+                    true,
+                    role,
+                )
+                .unwrap();
+                let (linked, _) = reconcile_syncthing_folders_xml(
+                    &linked,
+                    &blob,
+                    &dist,
+                    true,
+                    HiveRole::Motherbee,
+                )
+                .unwrap();
+                for folder in folders_with(&linked, PEER) {
+                    assert!(
+                        !folder_forbidden_for_role(&folder, role),
+                        "flags {flags:04b}: {} linked into {folder}",
+                        role.as_str()
+                    );
+                }
+                if flags == 15 {
+                    let expected: &[&str] = match role {
+                        HiveRole::Worker => &[
+                            "fluxbee-blob",
+                            "fluxbee-dist-core-worker",
+                            "fluxbee-dist-policy",
+                            "fluxbee-dist-runtimes",
+                            "fluxbee-dist-vendor",
+                        ],
+                        HiveRole::Ingress => &[
+                            "fluxbee-blob-public",
+                            "fluxbee-dist-core-ingress",
+                            "fluxbee-dist-policy",
+                            "fluxbee-dist-vendor",
+                        ],
+                        _ => &[
+                            "fluxbee-dist-core-egress",
+                            "fluxbee-dist-policy",
+                            "fluxbee-dist-vendor",
+                        ],
+                    };
+                    assert_eq!(folders_with(&linked, PEER), expected, "{}", role.as_str());
+                }
+            }
+        }
+    }
+
+    /// First round on PROD: ingress1 becomes accept-only, egress1's id is backfilled and it leaves
+    /// `fluxbee-blob`. Nothing is removed yet, since the egress entry records no device.
+    #[test]
+    fn motherbee_plan_on_the_prod_shapes() {
+        let plan = stage2_plan(&stage2_motherbee_config(), &stage2_registry(), false);
+        assert_eq!(
+            plan.accept_only,
+            vec![(ST_INGRESS1.to_string(), "ingress1".to_string())]
+        );
+        assert_eq!(
+            plan.backfill,
+            vec![("egress1".to_string(), ST_EGRESS1.to_string())]
+        );
+        assert_eq!(
+            plan.drop_memberships,
+            vec![("fluxbee-blob".to_string(), ST_EGRESS1.to_string())]
+        );
+        assert!(plan.orphans.is_empty(), "{:?}", plan.orphans);
+        assert_eq!(plan.notes.len(), 2, "{:?}", plan.notes);
+        assert!(plan.notes.iter().any(|n| n.contains(ST_WORKER1_STALE)));
+        assert!(plan.notes.iter().any(|n| n.contains(ST_OLDHIVE)));
+    }
+
+    /// Round two, once the backfill recorded the egress: the stale device and the old hive's are
+    /// removed from every folder and from the declarations. Round three changes nothing.
+    /// Taking the self-closing egress member out of `fluxbee-blob` leaves the full-form member
+    /// that follows it in place.
+    #[test]
+    fn motherbee_plan_converges_in_two_rounds() {
+        let first = stage2_plan(&stage2_motherbee_config(), &stage2_registry(), false);
+        let (config, changed) = stage2_apply(&stage2_motherbee_config(), &first);
+        assert!(changed);
+        assert!(!config.contains("tcp://10.10.10.30:22000"));
+        assert_eq!(
+            folders_with(&config, ST_EGRESS1),
+            [
+                "fluxbee-dist-core-egress",
+                "fluxbee-dist-policy",
+                "fluxbee-dist-vendor"
+            ]
+        );
+        assert_eq!(folders_with(&config, ST_WORKER1).len(), 5);
+        assert_eq!(
+            fluxbee_folder_memberships(&config).unwrap()["fluxbee-blob"],
+            [ST_MB_LOCAL, ST_WORKER1, ST_WORKER1_STALE, ST_OLDHIVE]
+        );
+
+        let second = stage2_plan(&config, &stage2_recorded_registry(), false);
+        assert!(second.accept_only.is_empty() && second.backfill.is_empty());
+        assert!(second.drop_memberships.is_empty());
+        assert_eq!(
+            second.orphans,
+            vec![
+                (ST_WORKER1_STALE.to_string(), "worker1".to_string()),
+                (ST_OLDHIVE.to_string(), "old-worker".to_string()),
+            ]
+        );
+        let (config, changed) = stage2_apply(&config, &second);
+        assert!(changed);
+        assert!(!config.contains(ST_WORKER1_STALE) && !config.contains(ST_OLDHIVE));
+        assert_eq!(folders_with(&config, ST_WORKER1).len(), 5);
+        assert!(config.contains("<gui enabled") && config.contains("<defaults>"));
+
+        let third = stage2_plan(&config, &stage2_recorded_registry(), false);
+        assert_eq!(third, MotherbeePeerPlan::default());
+        let (unchanged, changed) = stage2_apply(&config, &third);
+        assert!(!changed);
+        assert_eq!(unchanged, config);
+    }
+
+    #[test]
+    fn motherbee_plan_does_nothing_while_a_topology_operation_runs() {
+        let plan = stage2_plan(&stage2_motherbee_config(), &stage2_registry(), true);
+        let expected = MotherbeePeerPlan {
+            busy: true,
+            ..MotherbeePeerPlan::default()
+        };
+        assert_eq!(plan, expected);
+    }
+
+    #[test]
+    fn a_long_topology_operation_is_measured_and_reset() {
+        let t0 = Instant::now();
+        syncthing_reconcile_busy_for(None);
+        assert_eq!(syncthing_reconcile_busy_for(Some(t0)), Duration::ZERO);
+        let later = t0 + Duration::from_secs(16 * 60);
+        assert_eq!(
+            syncthing_reconcile_busy_for(Some(later)),
+            Duration::from_secs(16 * 60)
+        );
+        syncthing_reconcile_busy_for(None);
+        assert_eq!(syncthing_reconcile_busy_for(Some(later)), Duration::ZERO);
+        syncthing_reconcile_busy_for(None);
+    }
+
+    /// A hive that is joining (or stopped half-way) is left alone, and with it in the registry
+    /// nothing is removed.
+    #[test]
+    fn motherbee_plan_leaves_a_hive_that_is_not_connected() {
+        let mut registry = stage2_recorded_registry();
+        registry.hives.insert(
+            "ingress1".to_string(),
+            stage2_hive(Some(ST_INGRESS1), HiveRole::Ingress, false),
+        );
+        let plan = stage2_plan(&stage2_motherbee_config(), &registry, false);
+        assert!(plan.accept_only.is_empty(), "ingress1 is not touched");
+        assert!(plan.orphans.is_empty());
+        assert!(plan
+            .notes
+            .iter()
+            .any(|n| n.contains("ingress1 is not at rest (status joining, join running)")));
+        assert_eq!(
+            plan.drop_memberships,
+            vec![("fluxbee-blob".to_string(), ST_EGRESS1.to_string())]
+        );
+    }
+
+    #[test]
+    fn motherbee_plan_removes_nothing_on_an_unreadable_or_empty_registry() {
+        let mut registry = stage2_recorded_registry();
+        registry.complete = false;
+        assert!(stage2_plan(&stage2_motherbee_config(), &registry, false)
+            .orphans
+            .is_empty());
+        let empty = RegistrySnapshot {
+            hives: BTreeMap::new(),
+            complete: true,
+        };
+        let plan = stage2_plan(&stage2_motherbee_config(), &empty, false);
+        assert!(plan.orphans.is_empty() && plan.accept_only.is_empty());
+    }
+
+    /// A hive's device is found by its recorded id, whatever its name (renamed in the GUI, or
+    /// re-added under another hive_id): it is never taken for an orphan.
+    #[test]
+    fn a_hive_device_is_found_by_its_recorded_id() {
+        let config = stage2_motherbee_config().replace(
+            &format!("id=\"{ST_INGRESS1}\" name=\"ingress1\""),
+            &format!("id=\"{ST_INGRESS1}\" name=\"renamed\""),
+        );
+        let plan = stage2_plan(&config, &stage2_recorded_registry(), false);
+        assert!(!plan.orphans.iter().any(|(id, _)| id == ST_INGRESS1));
+        assert_eq!(
+            plan.accept_only,
+            vec![(ST_INGRESS1.to_string(), "renamed".to_string())]
+        );
+    }
+
+    #[test]
+    fn two_unrecorded_devices_under_one_name_are_kept_and_reported() {
+        const SECOND: &str = "EGRESS2-AAAAAAA-BBBBBBB";
+        let config = stage2_motherbee_config().replace(
+            "    <gui enabled",
+            &format!(
+                "{}    <gui enabled",
+                stage2_device(SECOND, "egress1", "dynamic")
+            ),
+        );
+        let plan = stage2_plan(&config, &stage2_registry(), false);
+        assert!(plan.backfill.is_empty());
+        assert!(!plan
+            .orphans
+            .iter()
+            .any(|(id, _)| id == SECOND || id == ST_EGRESS1));
+        assert!(plan
+            .notes
+            .iter()
+            .any(|n| n.contains("2 devices are named egress1")));
+    }
+
+    #[test]
+    fn a_recorded_device_missing_from_the_config_keeps_the_named_one() {
+        let mut registry = stage2_registry();
+        registry.hives.get_mut("egress1").unwrap().device_id =
+            Some("GONEDEV-AAAAAAA-BBBBBBB".to_string());
+        let plan = stage2_plan(&stage2_motherbee_config(), &registry, false);
+        assert!(!plan.orphans.iter().any(|(id, _)| id == ST_EGRESS1));
+        assert!(plan.notes.iter().any(|n| n.contains("GONEDEV")));
+    }
+
+    /// Syncthing omits an empty name. Such a device is still a declaration: seen, and removed when
+    /// no hive claims it.
+    #[test]
+    fn a_device_without_a_name_is_seen_and_removed() {
+        const NAMELESS: &str = "NONAME1-AAAAAAA-BBBBBBB";
+        let config = stage2_motherbee_config()
+            .replace(
+                "    <gui enabled",
+                &format!("    <device id=\"{NAMELESS}\" compression=\"metadata\" introducer=\"false\">\n        <address>dynamic</address>\n    </device>\n    <gui enabled"),
+            )
+            .replace(
+                &stage2_member(ST_OLDHIVE),
+                &format!("{}{}", stage2_member(ST_OLDHIVE), stage2_member(NAMELESS)),
+            );
+        let devices = syncthing_declared_devices(&config).unwrap();
+        assert!(devices
+            .iter()
+            .any(|d| d.id == NAMELESS && d.name.is_empty()));
+        let plan = stage2_plan(&config, &stage2_recorded_registry(), false);
+        assert!(plan
+            .orphans
+            .contains(&(NAMELESS.to_string(), String::new())));
+        let (config, _) = stage2_apply(&config, &plan);
+        assert!(!config.contains(NAMELESS));
+    }
+
+    /// One hand-edited id must not stop the round: it is reported, and the rest is reconciled.
+    #[test]
+    fn a_device_with_an_invalid_id_is_left_alone() {
+        let config = stage2_motherbee_config()
+            .replace(
+                "    <gui enabled",
+                &format!(
+                    "{}    <gui enabled",
+                    stage2_device("not-a-valid-id", "stray", "dynamic")
+                ),
+            )
+            .replace(
+                &stage2_member(ST_OLDHIVE),
+                &format!(
+                    "{}        <device id=\"not-a-valid-id\" introducedBy=\"\"/>\n",
+                    stage2_member(ST_OLDHIVE)
+                ),
+            );
+        let plan = stage2_plan(&config, &stage2_recorded_registry(), false);
+        assert!(plan
+            .notes
+            .iter()
+            .any(|n| n.contains("invalid id 'not-a-valid-id'")));
+        assert!(!plan.orphans.iter().any(|(id, _)| id == "not-a-valid-id"));
+        assert_eq!(plan.orphans.len(), 2);
+        let (applied, changed) = stage2_apply(&config, &plan);
+        assert!(changed && applied.contains("not-a-valid-id"));
+    }
+
+    /// A folder is never created by cloning another one: that copied its members, so creating
+    /// `blob/active` after spokes had joined shared it with every peer of the first folder.
+    #[test]
+    fn a_new_folder_never_inherits_members() {
+        let blob = sample_blob_config();
+        let dist = sample_dist_config();
+        let config = format!(
+            "<configuration version=\"51\">\n{}{}{}{}</configuration>\n",
+            stage2_folder(
+                "fluxbee-dist-vendor",
+                "/var/lib/fluxbee/dist/vendor",
+                "sendonly",
+                &[ST_MB_LOCAL, ST_EGRESS1, ST_INGRESS1]
+            ),
+            stage2_device(ST_MB_LOCAL, "fb-mb", "dynamic"),
+            stage2_device(ST_EGRESS1, "egress1", "dynamic"),
+            stage2_device(ST_INGRESS1, "ingress1", "dynamic"),
+        );
+        let (linked, _) = reconcile_syncthing_peer_xml(
+            &config,
+            &blob,
+            &dist,
+            ST_WORKER1,
+            "worker1",
+            SyncthingPeerAddress::AcceptOnly,
+            true,
+            HiveRole::Worker,
+        )
+        .unwrap();
+        let (linked, _) =
+            reconcile_syncthing_folders_xml(&linked, &blob, &dist, true, HiveRole::Motherbee)
+                .unwrap();
+        let memberships = fluxbee_folder_memberships(&linked).unwrap();
+        assert_eq!(memberships["fluxbee-blob"], [ST_WORKER1]);
+        for (folder, members) in &memberships {
+            for (id, role) in [
+                (ST_EGRESS1, HiveRole::Egress),
+                (ST_INGRESS1, HiveRole::Ingress),
+            ] {
+                assert!(
+                    !(members.iter().any(|m| m == id) && folder_forbidden_for_role(folder, role)),
+                    "{id} in {folder}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn set_top_level_device_address_leaves_exactly_one() {
+        let accept = SyncthingPeerAddress::AcceptOnly;
+        // Several addresses: one is left.
+        let config = stage2_motherbee_config().replace(
+            "<address>tcp://10.10.10.30:22000</address>",
+            "<address>tcp://10.10.10.30:22000</address>\n        <address>dynamic</address>",
+        );
+        let devices = syncthing_declared_devices(&config).unwrap();
+        let ingress = devices.iter().find(|d| d.id == ST_INGRESS1).unwrap();
+        assert_eq!(ingress.address, "tcp://10.10.10.30:22000,dynamic");
+        let (updated, changed) =
+            set_top_level_device_address(&config, ST_INGRESS1, accept).unwrap();
+        assert!(changed);
+        let after = syncthing_declared_devices(&updated).unwrap();
+        assert_eq!(
+            after.iter().find(|d| d.id == ST_INGRESS1).unwrap().address,
+            "dynamic"
+        );
+        assert!(
+            !set_top_level_device_address(&updated, ST_INGRESS1, accept)
+                .unwrap()
+                .1
+        );
+        // The folder members and the other devices are untouched.
+        assert_eq!(
+            fluxbee_folder_memberships(&updated).unwrap(),
+            fluxbee_folder_memberships(&config).unwrap()
+        );
+        // No address element, and a self-closing declaration: both get exactly one.
+        let bare = "<configuration>\n    <device id=\"BAREDEV-AAAAAAA-BBBBBBB\" name=\"x\">\n    </device>\n    <device id=\"SELFCLO-AAAAAAA-BBBBBBB\" name=\"y\"/>\n</configuration>\n";
+        let (bare, _) =
+            set_top_level_device_address(bare, "BAREDEV-AAAAAAA-BBBBBBB", accept).unwrap();
+        let (bare, _) =
+            set_top_level_device_address(&bare, "SELFCLO-AAAAAAA-BBBBBBB", accept).unwrap();
+        let devices = syncthing_declared_devices(&bare).unwrap();
+        assert!(devices.iter().all(|d| d.address == "dynamic"), "{bare}");
+        // A device that is not declared is not invented.
+        assert!(
+            !set_top_level_device_address(&bare, ST_OLDHIVE, accept)
+                .unwrap()
+                .1
+        );
+    }
+
+    #[test]
+    fn registry_snapshot_reads_entries_and_flags_unreadable_ones() {
+        let root = std::env::temp_dir().join(format!("fluxbee-st-registry-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let entry = |hive: &str, body: &str| {
+            fs::create_dir_all(root.join(hive)).unwrap();
+            fs::write(root.join(hive).join("info.yaml"), body).unwrap();
+        };
+        entry(
+            "worker1",
+            &format!("hive_id: worker1\nrole: worker\nstatus: connected\njoin:\n  phase: done\nsyncthing_device_id: \" {ST_WORKER1} \"\n"),
+        );
+        entry(
+            "egress1",
+            "hive_id: egress1\nrole: egress\nstatus: pending\nsyncthing_device_id: not-an-id\n",
+        );
+        entry(
+            "worker2",
+            "hive_id: worker2\nrole: worker\nstatus: connected\njoin:\n  phase: running\n",
+        );
+        entry("odd", "hive_id: odd\nrole: motherbee\nstatus: connected\n");
+        entry("motherbee", "status: [not even yaml\n");
+        fs::create_dir_all(root.join("accepting")).unwrap();
+
+        let snapshot = read_registry_snapshot(&root);
+        assert!(
+            snapshot.complete,
+            "the motherbee's own directory is skipped"
+        );
+        assert_eq!(
+            snapshot.hives["worker1"],
+            stage2_hive(Some(ST_WORKER1), HiveRole::Worker, true)
+        );
+        let egress = &snapshot.hives["egress1"];
+        assert_eq!(
+            (egress.device_id.as_deref(), egress.role, egress.connected),
+            (None, Some(HiveRole::Egress), false)
+        );
+        assert_eq!(egress.state, "status pending, join none");
+        assert!(
+            !snapshot.hives["worker2"].connected,
+            "its join is still running"
+        );
+        assert_eq!(snapshot.hives["odd"].role, None);
+        assert!(!snapshot.hives.contains_key("accepting"));
+        assert!(!snapshot.hives.contains_key("motherbee"));
+
+        entry("broken", "status: [connected\n");
+        assert!(!read_registry_snapshot(&root).complete);
+        fs::remove_dir_all(&root).unwrap();
+        assert!(!read_registry_snapshot(&root).complete);
+    }
+
+    #[test]
+    fn a_hive_is_at_rest_only_once_its_join_is_done() {
+        let at_rest = |v: serde_json::Value| hive_entry_at_rest(&v);
+        assert!(at_rest(serde_json::json!({"status": "connected"})));
+        assert!(at_rest(
+            serde_json::json!({"status": "connected", "join": {"phase": "done"}})
+        ));
+        assert!(!at_rest(
+            serde_json::json!({"status": "connected", "join": {"phase": "running"}})
+        ));
+        assert!(!at_rest(
+            serde_json::json!({"status": "failed", "join": {"phase": "done"}})
+        ));
+        assert!(!at_rest(serde_json::json!({"status": "joining"})));
+    }
+
+    #[tokio::test]
+    async fn the_busy_check_sees_a_topology_operation() {
+        let state = sample_orchestrator_state_for_tests();
+        assert!(!state.any_hive_topology_busy());
+        let guard = state.lock_hive_topology("worker1").await;
+        assert!(state.any_hive_topology_busy());
+        // Looking never takes the lock away from an admin path.
+        assert!(state.try_lock_hive_topology("worker2").is_some());
+        drop(guard);
+        assert!(!state.any_hive_topology_busy());
+        assert!(state.try_lock_hive_topology("worker1").is_some());
+    }
+
+    #[test]
+    fn spoke_gets_the_motherbee_static_once() {
+        let worker1 = format!(
+            "<configuration version=\"51\">\n{}{}</configuration>\n",
+            stage2_device(ST_WORKER1, "fb-worker1", "dynamic"),
+            stage2_device(ST_MB_LOCAL, "motherbee", "dynamic"),
+        );
+        let address = SyncthingPeerAddress::Static("10.10.10.10:22000".parse().unwrap());
+        let devices = syncthing_declared_devices(&worker1).unwrap();
+        let updates =
+            spoke_motherbee_device_updates(&devices, ST_WORKER1, PRIMARY_HIVE_ID, address);
+        assert_eq!(
+            updates,
+            vec![(ST_MB_LOCAL.to_string(), "motherbee".to_string())]
+        );
+        let (updated, changed) =
+            set_top_level_device_address(&worker1, ST_MB_LOCAL, address).unwrap();
+        assert!(changed);
+        assert!(updated.contains("<address>tcp://10.10.10.10:22000</address>"));
+        let again = syncthing_declared_devices(&updated).unwrap();
+        assert!(
+            spoke_motherbee_device_updates(&again, ST_WORKER1, PRIMARY_HIVE_ID, address).is_empty()
+        );
+    }
+
+    #[test]
+    fn the_spoke_derives_the_motherbee_address_from_its_uplink() {
+        let uplink = |address: &str| {
+            vec![WanUplink {
+                address: address.to_string(),
+            }]
+        };
+        let value = |address: &str| {
+            spoke_motherbee_static_address(&uplink(address)).map(SyncthingPeerAddress::config_value)
+        };
+        assert_eq!(
+            value("10.10.10.10:9000").unwrap(),
+            "tcp://10.10.10.10:22000"
+        );
+        assert_eq!(value("[fd00::10]:9000").unwrap(), "tcp://[fd00::10]:22000");
+        // What `resolve_worker_uplink_address` writes for a bare IPv6 wan.listen.
+        assert_eq!(value("fd00::10:9000").unwrap(), "tcp://[fd00::10]:22000");
+        assert!(value("motherbee.lan:9000").is_err());
+        assert!(spoke_motherbee_static_address(&[]).is_err());
+    }
+
+    #[test]
+    fn finalize_needs_a_static_motherbee_address() {
+        let device = Some(ST_MB_LOCAL);
+        assert_eq!(finalize_peer_static_address(None, None), Ok(None));
+        assert!(finalize_peer_static_address(device, None).is_err());
+        assert!(finalize_peer_static_address(device, Some("dynamic")).is_err());
+        assert!(finalize_peer_static_address(device, Some("tcp://motherbee:22000")).is_err());
+        assert_eq!(
+            finalize_peer_static_address(device, Some("tcp://10.10.10.10:22000")),
+            Ok(Some(SyncthingPeerAddress::Static(
+                "10.10.10.10:22000".parse().unwrap()
+            )))
+        );
+    }
+
+    fn stage2_writer_dir(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("fluxbee-st-{tag}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn syncthing_config_writer_writes_only_on_change_and_keeps_the_mode() {
+        use std::os::unix::fs::MetadataExt;
+        let dir = stage2_writer_dir("writer");
+        let path = dir.join("config.xml");
+        fs::write(&path, "<configuration/>\n").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o640)).unwrap();
+        let unchanged =
+            update_syncthing_config(&path, |current| Ok((current.to_string(), false))).unwrap();
+        assert!(!unchanged);
+        let changed = update_syncthing_config(&path, |_| {
+            Ok(("<configuration>new</configuration>\n".to_string(), true))
+        })
+        .unwrap();
+        assert!(changed);
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            "<configuration>new</configuration>\n"
+        );
+        assert_eq!(fs::metadata(&path).unwrap().mode() & 0o7777, 0o640);
+        // Special bits are never carried over.
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o2640)).unwrap();
+        assert_eq!(fs::metadata(&path).unwrap().mode() & 0o7777, 0o2640);
+        update_syncthing_config(&path, |_| Ok(("<c/>\n".to_string(), true))).unwrap();
+        assert_eq!(fs::metadata(&path).unwrap().mode() & 0o7777, 0o640);
+        assert!(
+            fs::read_dir(&dir).unwrap().count() == 1,
+            "no temp file is left behind"
+        );
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// The directory belongs to the Syncthing user: config.xml swapped for a symlink, a FIFO or a
+    /// hard link is refused, and a planted temp is swept, never followed.
+    #[test]
+    fn syncthing_config_writer_never_follows_a_planted_entry() {
+        let dir = stage2_writer_dir("planted");
+        let victim = dir.join("victim");
+        fs::write(&victim, "root-owned contents\n").unwrap();
+        let path = dir.join("config.xml");
+        let write = |p: &Path| update_syncthing_config(p, |_| Ok(("x".to_string(), true)));
+
+        std::os::unix::fs::symlink(&victim, &path).unwrap();
+        assert!(write(&path).is_err());
+        fs::remove_file(&path).unwrap();
+
+        let status = std::process::Command::new("mkfifo")
+            .arg(&path)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        assert!(write(&path).is_err(), "a FIFO is refused without blocking");
+        fs::remove_file(&path).unwrap();
+
+        fs::hard_link(&victim, &path).unwrap();
+        assert!(write(&path).is_err());
+        fs::remove_file(&path).unwrap();
+        assert_eq!(
+            fs::read_to_string(&victim).unwrap(),
+            "root-owned contents\n"
+        );
+
+        fs::write(&path, "<configuration/>\n").unwrap();
+        let planted = dir.join(format!("{}planted", replace_temp_prefix(&path)));
+        std::os::unix::fs::symlink(&victim, &planted).unwrap();
+        assert!(update_syncthing_config(&path, |_| Ok(("<new/>\n".to_string(), true))).unwrap());
+        assert_eq!(fs::read_to_string(&path).unwrap(), "<new/>\n");
+        assert_eq!(
+            fs::read_to_string(&victim).unwrap(),
+            "root-owned contents\n"
+        );
+        assert!(
+            fs::symlink_metadata(&planted).is_err(),
+            "the planted temp was swept"
+        );
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Hard-link backups must not break Syncthing management: only the writer refuses a
+    /// hard-linked config.xml.
+    #[test]
+    fn only_the_writer_refuses_a_hard_linked_config() {
+        let dir = stage2_writer_dir("hardlink");
+        let path = dir.join("config.xml");
+        fs::write(
+            &path,
+            "<configuration><gui><apikey>k</apikey></gui></configuration>\n",
+        )
+        .unwrap();
+        fs::hard_link(&path, dir.join("backup.xml")).unwrap();
+        assert!(read_syncthing_config(&path, false).is_ok());
+        assert!(read_syncthing_config(&path, true).is_err());
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// The temp is created with O_EXCL: an entry already at its name, a symlink (dangling or not)
+    /// included, is never opened.
+    #[test]
+    fn the_temp_is_never_opened_through_an_existing_entry() {
+        let dir = stage2_writer_dir("excl");
+        let victim = dir.join("victim");
+        fs::write(&victim, "keep\n").unwrap();
+        let to_victim = dir.join("to-victim");
+        std::os::unix::fs::symlink(&victim, &to_victim).unwrap();
+        let dangling = dir.join("dangling");
+        std::os::unix::fs::symlink(dir.join("nowhere"), &dangling).unwrap();
+        for planted in [&to_victim, &dangling, &victim] {
+            let err = create_exclusive(planted).unwrap_err();
+            assert_eq!(err.kind(), std::io::ErrorKind::AlreadyExists);
+        }
+        assert_eq!(fs::read_to_string(&victim).unwrap(), "keep\n");
+        assert!(fs::symlink_metadata(dir.join("nowhere")).is_err());
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    // Host posture stage 3 fixture: the motherbee's `<options>` as captured read-only on PROD on
+    // 2026-10-06 (0.1.58): every public-infrastructure option still on.
+    const ST3_PROD_OPTIONS: &str = "<configuration version=\"51\">\n    <options>\n        <listenAddress>default</listenAddress>\n        <globalAnnounceServer>default</globalAnnounceServer>\n        <globalAnnounceEnabled>true</globalAnnounceEnabled>\n        <localAnnounceEnabled>true</localAnnounceEnabled>\n        <localAnnouncePort>21027</localAnnouncePort>\n        <localAnnounceMCAddr>[ff12::8384]:21027</localAnnounceMCAddr>\n        <reconnectionIntervalS>60</reconnectionIntervalS>\n        <relaysEnabled>true</relaysEnabled>\n        <natEnabled>true</natEnabled>\n        <natLeaseMinutes>60</natLeaseMinutes>\n        <urAccepted>0</urAccepted>\n        <autoUpgradeIntervalH>12</autoUpgradeIntervalH>\n        <crashReportingURL>https://crash.syncthing.net/newcrash</crashReportingURL>\n        <crashReportingEnabled>true</crashReportingEnabled>\n        <stunKeepaliveStartS>180</stunKeepaliveStartS>\n        <stunKeepaliveMinS>20</stunKeepaliveMinS>\n        <stunServer>default</stunServer>\n    </options>\n    <gui enabled=\"true\" tls=\"false\">\n        <address>127.0.0.1:8384</address>\n    </gui>\n</configuration>\n";
+
+    fn st3_option(config: &str, name: &str) -> Vec<String> {
+        let block = Regex::new(r#"(?s)<options>(.*?)</options>"#)
+            .unwrap()
+            .captures(config)
+            .unwrap()[1]
+            .to_string();
+        Regex::new(&format!(r#"<{name}>([^<]*)</{name}>"#))
+            .unwrap()
+            .captures_iter(&block)
+            .map(|caps| caps[1].to_string())
+            .collect()
+    }
+
+    #[test]
+    fn stage3_owned_options_on_the_prod_motherbee() {
+        let listen = syncthing_owned_listen_address(true);
+        assert_eq!(listen, "tcp://:22000");
+        let (updated, changed) =
+            apply_syncthing_owned_options_xml(ST3_PROD_OPTIONS, &listen).unwrap();
+        assert!(changed);
+        for (name, value) in SYNCTHING_OWNED_OPTIONS {
+            assert_eq!(st3_option(&updated, name), [value], "{name}");
+        }
+        assert_eq!(st3_option(&updated, "listenAddress"), ["tcp://:22000"]);
+        // Everything else is left as it is.
+        for (name, value) in [
+            ("globalAnnounceServer", "default"),
+            ("localAnnouncePort", "21027"),
+            ("natLeaseMinutes", "60"),
+            ("stunKeepaliveMinS", "20"),
+            ("stunServer", "default"),
+            ("crashReportingURL", "https://crash.syncthing.net/newcrash"),
+        ] {
+            assert_eq!(st3_option(&updated, name), [value], "{name}");
+        }
+        assert!(updated.contains("<address>127.0.0.1:8384</address>"));
+        assert!(updated.ends_with("    </options>\n    <gui enabled=\"true\" tls=\"false\">\n        <address>127.0.0.1:8384</address>\n    </gui>\n</configuration>\n"));
+        let (again, changed_again) = apply_syncthing_owned_options_xml(&updated, &listen).unwrap();
+        assert!(!changed_again);
+        assert_eq!(again, updated);
+    }
+
+    #[test]
+    fn stage3_owned_options_add_what_is_missing_and_keep_one_listener() {
+        let config = "<configuration>\n    <options>\n        <listenAddress>tcp://0.0.0.0:22000</listenAddress>\n        <listenAddress>quic://0.0.0.0:22000</listenAddress>\n        <listenAddress>dynamic+https://relays.syncthing.net/endpoint</listenAddress>\n        <maxSendKbps>0</maxSendKbps>\n    </options>\n</configuration>\n";
+        let listen = syncthing_owned_listen_address(false);
+        assert_eq!(listen, "tcp://127.0.0.1:22000");
+        let (updated, changed) = apply_syncthing_owned_options_xml(config, &listen).unwrap();
+        assert!(changed);
+        assert_eq!(
+            st3_option(&updated, "listenAddress"),
+            ["tcp://127.0.0.1:22000"]
+        );
+        for (name, value) in SYNCTHING_OWNED_OPTIONS {
+            assert_eq!(st3_option(&updated, name), [value], "{name}");
+        }
+        assert_eq!(st3_option(&updated, "maxSendKbps"), ["0"]);
+        assert!(updated.contains("\n    </options>\n</configuration>\n"));
+        assert!(
+            !apply_syncthing_owned_options_xml(&updated, &listen)
+                .unwrap()
+                .1
+        );
+        assert!(apply_syncthing_owned_options_xml("<configuration/>", &listen).is_err());
+    }
+
+    fn st3_versions_reply(section: Option<serde_json::Value>) -> serde_json::Value {
+        let mut hive = serde_json::json!({ "hive_id": "worker1", "role": "worker" });
+        if let Some(section) = section {
+            hive["syncthing_posture"] = section;
+        }
+        serde_json::json!({ "status": "ok", "hive": hive })
+    }
+
+    fn st3_facts(
+        syncthing: bool,
+        motherbee_static: bool,
+        motherbee_reachable: bool,
+    ) -> SpokePostureFacts {
+        SpokePostureFacts {
+            syncthing,
+            motherbee_static,
+            motherbee_reachable,
+        }
+    }
+
+    /// What a spoke writes in its snapshot is what the motherbee reads back.
+    #[test]
+    fn stage3_the_snapshot_section_is_what_the_motherbee_reads() {
+        let both = SyncthingPostureState {
+            motherbee_static_at_ms: Some(1),
+            motherbee_reachable_at_ms: Some(2),
+            switched_at_ms: Some(3),
+        };
+        let read = |syncthing, posture: Result<SyncthingPostureState, String>| {
+            spoke_posture_facts(&st3_versions_reply(Some(syncthing_posture_section(
+                syncthing, &posture,
+            ))))
+        };
+        assert_eq!(
+            read(true, Ok(both.clone())),
+            Ok(st3_facts(true, true, true))
+        );
+        assert_eq!(
+            read(true, Ok(SyncthingPostureState::default())),
+            Ok(st3_facts(true, false, false))
+        );
+        assert_eq!(read(false, Ok(both)), Ok(st3_facts(false, true, true)));
+        assert_eq!(
+            read(true, Err("unreadable".to_string())),
+            Err("its posture state is unreadable".to_string())
+        );
+    }
+
+    #[test]
+    fn stage3_spoke_facts_come_from_the_versions_reply() {
+        // A release before stage 3 has no section; a partial section, or no answer, counts as
+        // no report, each with its reason.
+        assert_eq!(
+            spoke_posture_facts(&st3_versions_reply(None)),
+            Err("no report: a release before stage 3".to_string())
+        );
+        assert_eq!(
+            spoke_posture_facts(&st3_versions_reply(Some(
+                serde_json::json!({"syncthing": true, "motherbee_static": true})
+            ))),
+            Err("incomplete report".to_string())
+        );
+        assert_eq!(
+            spoke_posture_facts(
+                &serde_json::json!({"status": "error", "error_code": "VERSIONS_FAILED"})
+            ),
+            Err("no answer: VERSIONS_FAILED".to_string())
+        );
+    }
+
+    /// PROD at the stage-3 deploy: the three spokes on the new release report both facts, and
+    /// worker2 is stopped on 0.1.57. The motherbee waits for it, by name.
+    #[test]
+    fn stage3_the_motherbee_waits_for_every_spoke() {
+        let both = Ok(st3_facts(true, true, true));
+        let mut reports = BTreeMap::from([
+            ("egress1".to_string(), both.clone()),
+            ("ingress1".to_string(), both.clone()),
+            ("worker1".to_string(), both.clone()),
+            (
+                "worker2".to_string(),
+                Err("no answer: VERSIONS_FAILED".to_string()),
+            ),
+        ]);
+        assert_eq!(
+            motherbee_switch_waiting_for(&reports, &[]),
+            ["worker2 (no answer: VERSIONS_FAILED)"]
+        );
+        reports.insert("worker2".to_string(), Ok(st3_facts(true, false, true)));
+        assert_eq!(
+            motherbee_switch_waiting_for(&reports, &[]),
+            ["worker2 (motherbee address not static)"]
+        );
+        reports.insert("worker2".to_string(), Ok(st3_facts(true, true, false)));
+        assert_eq!(
+            motherbee_switch_waiting_for(&reports, &[]),
+            ["worker2 (motherbee Syncthing port not reached)"]
+        );
+        // A spoke that runs no Syncthing needs no discovery: it is not waited for.
+        reports.insert("worker2".to_string(), Ok(st3_facts(false, false, false)));
+        assert!(motherbee_switch_waiting_for(&reports, &[]).is_empty());
+        reports.insert("worker2".to_string(), both);
+        assert!(motherbee_switch_waiting_for(&reports, &[]).is_empty());
+        assert_eq!(
+            motherbee_switch_waiting_for(&reports, &["stray (STRAYDV)".to_string()]),
+            ["device stray (STRAYDV) is linked but no hive records it"]
+        );
+        assert!(motherbee_switch_waiting_for(&BTreeMap::new(), &[]).is_empty());
+    }
+
+    /// Every registered spoke is asked, whether or not it records a device; a device linked in a
+    /// Fluxbee folder that no entry records is waited for too.
+    #[test]
+    fn stage3_the_wait_set_comes_from_the_registry_and_the_folders() {
+        let config = stage2_motherbee_config();
+        let (hives, unclaimed) =
+            motherbee_switch_wait_set(&stage2_registry(), &config, ST_MB_LOCAL).unwrap();
+        assert_eq!(hives, ["egress1", "ingress1", "worker1"]);
+        // The egress records no device yet, and the stale and old devices are still linked.
+        assert_eq!(
+            unclaimed,
+            [
+                format!("egress1 ({ST_EGRESS1})"),
+                format!("old-worker ({ST_OLDHIVE})"),
+                format!("worker1 ({ST_WORKER1_STALE})"),
+            ]
+        );
+        let first = stage2_plan(&config, &stage2_registry(), false);
+        let (config, _) = stage2_apply(&config, &first);
+        let second = stage2_plan(&config, &stage2_recorded_registry(), false);
+        let (config, _) = stage2_apply(&config, &second);
+        let (_, unclaimed) =
+            motherbee_switch_wait_set(&stage2_recorded_registry(), &config, ST_MB_LOCAL).unwrap();
+        assert!(unclaimed.is_empty(), "{unclaimed:?}");
+    }
+
+    /// The spoke's static fact on the PROD shapes: worker1 had the motherbee `dynamic` before
+    /// stage 2; the ingress and the egress had it static. IPv6 too; the local device never counts.
+    #[test]
+    fn stage3_the_spoke_static_fact_on_prod_shapes() {
+        let spoke = |address: &str| {
+            format!(
+                "<configuration version=\"51\">\n{}{}</configuration>\n",
+                stage2_device(ST_WORKER1, "fb-worker1", "dynamic"),
+                stage2_device(ST_MB_LOCAL, "motherbee", address),
+            )
+        };
+        let v4 = SyncthingPeerAddress::Static("10.10.10.10:22000".parse().unwrap());
+        assert!(!spoke_motherbee_static_now(&spoke("dynamic"), ST_WORKER1, v4).unwrap());
+        assert!(
+            spoke_motherbee_static_now(&spoke("tcp://10.10.10.10:22000"), ST_WORKER1, v4).unwrap()
+        );
+        assert!(
+            !spoke_motherbee_static_now(&spoke("tcp://10.10.10.11:22000"), ST_WORKER1, v4).unwrap()
+        );
+        let v6 = SyncthingPeerAddress::Static("[fd00::10]:22000".parse().unwrap());
+        assert!(
+            spoke_motherbee_static_now(&spoke("tcp://[fd00::10]:22000"), ST_WORKER1, v6).unwrap()
+        );
+        // The local device named like the motherbee is not the motherbee.
+        assert!(
+            !spoke_motherbee_static_now(&spoke("tcp://10.10.10.10:22000"), ST_MB_LOCAL, v4)
+                .unwrap()
+        );
+    }
+
+    /// The motherbee writes the owned options in the same write as the peer plan once it has
+    /// switched, and never while a topology operation runs.
+    #[test]
+    fn stage3_the_motherbee_writes_options_with_the_peer_plan() {
+        let config = format!(
+            "{}{}",
+            stage2_motherbee_config().replace("</configuration>\n", ""),
+            ST3_PROD_OPTIONS.replace("<configuration version=\"51\">\n", "").replace("    <gui enabled=\"true\" tls=\"false\">\n        <address>127.0.0.1:8384</address>\n    </gui>\n", "")
+        );
+        let memberships = fluxbee_folder_memberships(&config).unwrap();
+        let plan = stage2_plan(&config, &stage2_registry(), false);
+        let listen = syncthing_owned_listen_address(true);
+        let (not_switched, _) =
+            motherbee_reconcile_xml(&config, &plan, &memberships, None).unwrap();
+        assert_eq!(st3_option(&not_switched, "relaysEnabled"), ["true"]);
+        let (switched, changed) =
+            motherbee_reconcile_xml(&config, &plan, &memberships, Some(&listen)).unwrap();
+        assert!(changed);
+        assert_eq!(st3_option(&switched, "relaysEnabled"), ["false"]);
+        assert_eq!(st3_option(&switched, "listenAddress"), ["tcp://:22000"]);
+        assert!(
+            !switched.contains("tcp://10.10.10.30:22000"),
+            "the plan applied too"
+        );
+        let busy = stage2_plan(&config, &stage2_registry(), true);
+        let (untouched, changed) =
+            motherbee_reconcile_xml(&config, &busy, &memberships, Some(&listen)).unwrap();
+        assert!(!changed);
+        assert_eq!(untouched, config);
+    }
+
+    /// The facts are recorded the first time they hold and never undone; the spoke switches only
+    /// with both.
+    #[test]
+    fn stage3_spoke_facts_are_one_way() {
+        let none = SyncthingPostureState::default();
+        assert!(!spoke_may_switch(&none));
+        let only_static = spoke_posture_step(none.clone(), true, false, 10);
+        assert_eq!(only_static.motherbee_static_at_ms, Some(10));
+        assert!(!spoke_may_switch(&only_static));
+        let both = spoke_posture_step(only_static, false, true, 20);
+        assert_eq!(
+            both.motherbee_static_at_ms,
+            Some(10),
+            "a later outage undoes nothing"
+        );
+        assert_eq!(both.motherbee_reachable_at_ms, Some(20));
+        assert!(spoke_may_switch(&both));
+        assert_eq!(spoke_posture_step(both.clone(), false, false, 30), both);
+    }
+
+    /// The finalize counter goes back down on an early return and on a panic, so a spoke never
+    /// stays out of its reconcile for good.
+    #[test]
+    fn stage3_the_finalize_counter_always_goes_back_down() {
+        let before = SYNCTHING_FINALIZES_IN_FLIGHT.load(Ordering::SeqCst);
+        let early = || -> Result<(), ()> {
+            let _in_flight = SyncthingFinalizeInFlight::start();
+            assert!(SYNCTHING_FINALIZES_IN_FLIGHT.load(Ordering::SeqCst) > before);
+            Err(())
+        };
+        assert!(early().is_err());
+        assert_eq!(SYNCTHING_FINALIZES_IN_FLIGHT.load(Ordering::SeqCst), before);
+        let panicked = std::panic::catch_unwind(|| {
+            let _in_flight = SyncthingFinalizeInFlight::start();
+            panic!("finalize panicked");
+        });
+        assert!(panicked.is_err());
+        assert_eq!(SYNCTHING_FINALIZES_IN_FLIGHT.load(Ordering::SeqCst), before);
+    }
+
+    /// Readers report a state that does not decode; its writer moves it aside and derives the
+    /// facts again. The durable write sweeps the temps a crash left.
+    #[test]
+    fn stage3_the_state_file_on_disk() {
+        let dir = stage2_writer_dir("posture");
+        let path = dir.join("syncthing-posture.json");
+        assert_eq!(
+            read_syncthing_posture_state_at(&path).unwrap(),
+            SyncthingPostureState::default(),
+            "missing means none yet"
+        );
+        for broken in [&b""[..], &[0u8; 64][..], &[0xff, 0xfe, 0x00, 0x7b][..]] {
+            fs::write(&path, broken).unwrap();
+            assert!(read_syncthing_posture_state_at(&path).is_err());
+            assert!(path.exists(), "a reader never moves the file");
+            assert_eq!(
+                read_syncthing_posture_state_to_write_at(&path).unwrap(),
+                SyncthingPostureState::default()
+            );
+            assert!(!path.exists());
+            assert_eq!(
+                fs::read(path.with_extension("json.corrupt")).unwrap(),
+                broken
+            );
+        }
+        let leftover = dir.join(".syncthing-posture.json.tmp-leftover");
+        fs::write(&leftover, "partial").unwrap();
+        let posture = SyncthingPostureState {
+            motherbee_static_at_ms: Some(1),
+            motherbee_reachable_at_ms: Some(2),
+            switched_at_ms: None,
+        };
+        write_syncthing_posture_state_at(&path, &posture).unwrap();
+        assert!(!leftover.exists(), "the crash leftover was swept");
+        assert_eq!(read_syncthing_posture_state_at(&path).unwrap(), posture);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn stage3_state_file_roundtrip() {
+        let empty: SyncthingPostureState = serde_json::from_str("{}").unwrap();
+        assert_eq!(empty, SyncthingPostureState::default());
+        assert_eq!(serde_json::to_string(&empty).unwrap(), "{}");
+        let full = SyncthingPostureState {
+            motherbee_static_at_ms: Some(1),
+            motherbee_reachable_at_ms: Some(2),
+            switched_at_ms: Some(3),
+        };
+        let text = serde_json::to_string(&full).unwrap();
+        assert_eq!(
+            serde_json::from_str::<SyncthingPostureState>(&text).unwrap(),
+            full
+        );
+        assert!(serde_json::from_str::<SyncthingPostureState>("not json").is_err());
+    }
+
+    fn a51_dir(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("fluxbee-a51-{tag}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// A-51: a write never goes through what the Syncthing user can plant next to the file: not a
+    /// symlink at the old fixed temp name (the old writer wrote through it, chmodded what it
+    /// pointed at and renamed the link into place), nor one at the destination (replaced, as
+    /// before). The result is a plain file of exactly 0644, or 0755 for an executable.
+    #[test]
+    fn a51_writes_never_follow_a_planted_entry() {
+        use std::os::unix::fs::MetadataExt;
+        let dir = a51_dir("write");
+        let victim = dir.join("victim");
+        fs::write(&victim, "root-owned\n").unwrap();
+        fs::set_permissions(&victim, fs::Permissions::from_mode(0o600)).unwrap();
+        let untouched = |victim: &Path| {
+            assert_eq!(fs::read_to_string(victim).unwrap(), "root-owned\n");
+            assert_eq!(fs::metadata(victim).unwrap().mode() & 0o7777, 0o600);
+        };
+
+        let path = dir.join("manifest.json");
+        std::os::unix::fs::symlink(&victim, dir.join(".manifest.json.tmp")).unwrap();
+        std::os::unix::fs::symlink(&victim, &path).unwrap();
+        write_file_atomic(&path, b"{}\n").unwrap();
+        untouched(&victim);
+        assert!(fs::symlink_metadata(&path).unwrap().file_type().is_file());
+        assert_eq!(fs::read_to_string(&path).unwrap(), "{}\n");
+        assert_eq!(fs::metadata(&path).unwrap().mode() & 0o7777, 0o644);
+
+        let src = dir.join("binary-src");
+        fs::write(&src, b"\x7fELF").unwrap();
+        let exe = dir.join("rt-gateway");
+        std::os::unix::fs::symlink(&victim, dir.join(".rt-gateway.tmp")).unwrap();
+        copy_exec_file(&src, &exe).unwrap();
+        untouched(&victim);
+        assert!(fs::symlink_metadata(&exe).unwrap().file_type().is_file());
+        assert_eq!(fs::read(&exe).unwrap(), b"\x7fELF");
+        assert_eq!(fs::metadata(&exe).unwrap().mode() & 0o7777, 0o755);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A-51: a managed directory is opened as the directory it must be. A symlink or a file the
+    /// Syncthing user put in its place is left alone: never followed (what a symlink points at
+    /// keeps its mode), and never an error that would keep the orchestrator from starting. The
+    /// owner is looked up only for a real directory.
+    #[test]
+    fn a51_managed_dirs_leave_what_is_not_a_directory_alone() {
+        use std::os::unix::fs::MetadataExt;
+        let dir = a51_dir("dirs");
+        let victim = dir.join("victim-dir");
+        fs::create_dir(&victim).unwrap();
+        fs::set_permissions(&victim, fs::Permissions::from_mode(0o755)).unwrap();
+        let active = dir.join("active");
+        std::os::unix::fs::symlink(&victim, &active).unwrap();
+        ensure_dir_permissions_0750(&active).unwrap();
+        ensure_owned_dir(&active, "no-such-user-a51").unwrap();
+        ensure_owned_tree(&active, "no-such-user-a51").unwrap();
+        assert_eq!(fs::metadata(&victim).unwrap().mode() & 0o7777, 0o755);
+        assert!(fs::symlink_metadata(&active)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        let public = dir.join("public");
+        fs::write(&public, b"planted").unwrap();
+        ensure_dir_permissions_0750(&public).unwrap();
+        assert_eq!(fs::read(&public).unwrap(), b"planted");
+        let staging = dir.join("staging");
+        ensure_dir_permissions_0750(&staging).unwrap();
+        assert!(fs::symlink_metadata(&staging).unwrap().file_type().is_dir());
+        assert_eq!(fs::metadata(&staging).unwrap().mode() & 0o7777, 0o750);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A-51: the `.stfolder` marker is created where it is missing, never through a symlink. A
+    /// symlink in its place, dangling or not, is replaced by a real marker (Syncthing follows it);
+    /// a folder that is itself a symlink gets no marker, so nothing is created where it points.
+    #[test]
+    fn a51_folder_marker_never_follows_a_symlink() {
+        let dir = a51_dir("marker");
+        let folder = dir.join("folder");
+        fs::create_dir_all(&folder).unwrap();
+        let victim = dir.join("nologin");
+        std::os::unix::fs::symlink(&victim, folder.join(".stfolder")).unwrap();
+        assert!(ensure_syncthing_folder_marker(&folder).unwrap());
+        assert!(fs::symlink_metadata(&victim).is_err(), "nothing created");
+        assert!(fs::symlink_metadata(folder.join(".stfolder"))
+            .unwrap()
+            .file_type()
+            .is_file());
+        assert!(!ensure_syncthing_folder_marker(&folder).unwrap());
+        let target = dir.join("elsewhere");
+        fs::create_dir_all(&target).unwrap();
+        let linked = dir.join("linked");
+        std::os::unix::fs::symlink(&target, &linked).unwrap();
+        assert!(!ensure_syncthing_folder_marker(&linked).unwrap());
+        assert!(fs::symlink_metadata(target.join(".stfolder")).is_err());
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A-51: temps are named so Syncthing never sends them. A temp of ours from another run (one
+    /// that died mid-write) and the fixed `.name.tmp` of older releases are swept by the next write
+    /// of that path at once; this run's own temps and Syncthing's own are left alone. No clock
+    /// is involved.
+    #[test]
+    fn a51_temps_of_other_runs_are_swept_at_once() {
+        let dir = a51_dir("sweep");
+        let path = dir.join("drift-alerts.jsonl");
+        let own = format!(
+            ".syncthing.drift-alerts.jsonl.fluxbee-{}-inflight.tmp",
+            write_run_token()
+        );
+        let other_run = dir.join(".syncthing.drift-alerts.jsonl.fluxbee-otherrun-0001.tmp");
+        let legacy = dir.join(".drift-alerts.jsonl.tmp");
+        let syncthing_own = dir.join(".syncthing.drift-alerts.jsonl.tmp");
+        for tmp in [&other_run, &legacy, &dir.join(&own), &syncthing_own] {
+            fs::write(tmp, b"x").unwrap();
+        }
+        write_file_atomic(&path, b"line\n").unwrap();
+        assert!(!other_run.exists() && !legacy.exists());
+        assert_eq!(fs::read_to_string(&path).unwrap(), "line\n");
+        let mut names: Vec<String> = fs::read_dir(&dir)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        let mut expected = vec![
+            own,
+            ".syncthing.drift-alerts.jsonl.tmp".to_string(),
+            "drift-alerts.jsonl".to_string(),
+        ];
+        expected.sort();
+        assert_eq!(names, expected, "the write left no temp of its own");
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A-51: the motherbee's dist tree is root's and its group only reads it. The pass removes
+    /// every link inside (never following one), takes write away from group and other, gives the
+    /// group read (and search on directories), and closes the top directory to others. Run here
+    /// with this user's ids, since a test cannot chown to root.
+    #[test]
+    fn a51_the_motherbee_dist_is_root_s_and_its_group_only_reads_it() {
+        use std::os::unix::fs::MetadataExt;
+        let dir = a51_dir("tree");
+        let tree = dir.join("dist");
+        let elsewhere = dir.join("elsewhere");
+        fs::create_dir_all(tree.join("runtimes/x/current")).unwrap();
+        fs::create_dir_all(&elsewhere).unwrap();
+        let mode = |path: &Path| fs::symlink_metadata(path).unwrap().mode() & 0o7777;
+        let set = |path: &Path, mode: u32| {
+            fs::set_permissions(path, fs::Permissions::from_mode(mode)).unwrap()
+        };
+        let writable = tree.join("runtimes/x/current/config.json");
+        fs::write(&writable, b"{}").unwrap();
+        set(&writable, 0o666);
+        let private = tree.join("runtimes/manifest.json");
+        fs::write(&private, b"{}").unwrap();
+        set(&private, 0o600);
+        set(&tree.join("runtimes/x"), 0o700);
+        std::os::unix::fs::symlink(&elsewhere, tree.join("runtimes/x/current/escape")).unwrap();
+        let me = fs::metadata(&dir).unwrap();
+        own_tree_for_reading(&tree, me.uid(), me.gid()).unwrap();
+        assert!(fs::symlink_metadata(tree.join("runtimes/x/current/escape")).is_err());
+        assert!(elsewhere.is_dir(), "a link is removed, never followed");
+        assert_eq!(mode(&writable), 0o644);
+        assert_eq!(mode(&private), 0o640);
+        assert_eq!(mode(&tree.join("runtimes/x")), 0o750);
+        assert_eq!(mode(&tree), 0o750);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A-51: the package never hands the motherbee's dist back to the Syncthing user, and its
+    /// preinst switches an older install over before anything is unpacked.
+    #[test]
+    fn a51_the_package_keeps_the_motherbee_dist_root_s() {
+        let postinst = include_str!("../../packaging/deb-postinst");
+        for line in postinst.lines().filter(|line| line.contains("chown")) {
+            assert!(
+                !line.contains("/var/lib/fluxbee/dist") && !line.trim_end().ends_with('\\'),
+                "the postinst hands dist to someone: {line}"
+            );
+        }
+        let preinst = include_str!("../../packaging/deb-preinst");
+        assert!(preinst.contains("find \"$DIST\" -mindepth 1 -type l -delete"));
+        assert!(preinst.contains("chown -R root:"));
+    }
+
+    /// A-52: the wait is one single-quoted script, with no sudo (systemctl answers any user).
+    #[test]
+    fn a52_the_wait_is_one_quoted_script() {
+        let cmd = first_boot_wait_command(FIRST_BOOT_WAIT_SECS);
+        assert!(cmd.starts_with("/bin/bash -c '") && cmd.ends_with('\''));
+        assert_eq!(
+            cmd.matches('\'').count(),
+            2,
+            "no quote inside the script: {cmd}"
+        );
+        assert!(!cmd.contains("sudo"));
+    }
+
+    /// A-52: runs the wait script under bash with stand-ins for `systemctl`, `timeout` and
+    /// `sleep`. `states` gives, per unit, its answer to each successive `systemctl is-active`
+    /// (the last one for ever), and under `system` the answers to `is-system-running`; a unit not
+    /// listed answers "inactive", the system "running". Returns the exit code, stdout and how many
+    /// times cloud-final was asked.
+    fn a52_run_wait(tag: &str, secs: u64, states: &[(&str, &[&str])]) -> (i32, String, usize) {
+        let dir = a51_dir(&format!("a52-{tag}"));
+        let bin = dir.join("bin");
+        fs::create_dir_all(&bin).unwrap();
+        for (unit, answers) in states {
+            let file = if *unit == "jobs" {
+                "jobs".to_string()
+            } else {
+                format!("{unit}.states")
+            };
+            fs::write(dir.join(file), answers.join("\n") + "\n").unwrap();
+        }
+        let stand_in = |name: &str, body: String| {
+            let path = bin.join(name);
+            fs::write(&path, body).unwrap();
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+        };
+        stand_in(
+            "systemctl",
+            format!(
+                "#!/bin/sh\nif [ \"$1\" = list-jobs ]; then cat '{d}'/jobs 2>/dev/null; exit 0; fi\n\
+                 if [ \"$1\" = is-system-running ]; then u=system; none=running; \
+                 else u=${{2%.service}}; none=inactive; fi\n\
+                 f='{d}'/$u.states; c='{d}'/$u.count\n\
+                 n=$(cat \"$c\" 2>/dev/null || echo 0); n=$((n+1)); echo $n > \"$c\"\n\
+                 if [ ! -f \"$f\" ]; then echo $none; exit 3; fi\n\
+                 l=$(wc -l < \"$f\"); [ $n -gt $l ] && n=$l\nsed -n \"${{n}}p\" \"$f\"\n",
+                d = dir.display()
+            ),
+        );
+        stand_in("timeout", "#!/bin/sh\nshift\nexec \"$@\"\n".to_string());
+        stand_in("sleep", "#!/bin/sh\nexit 0\n".to_string());
+        let output = Command::new("/bin/bash")
+            .arg("-c")
+            .arg(first_boot_wait_script(secs))
+            .env("PATH", format!("{}:/usr/bin:/bin", bin.display()))
+            .output()
+            .unwrap();
+        let asked = fs::read_to_string(dir.join("cloud-final.count"))
+            .ok()
+            .and_then(|n| n.trim().parse().ok())
+            .unwrap_or(0);
+        fs::remove_dir_all(&dir).unwrap();
+        (
+            output.status.code().unwrap_or(-1),
+            String::from_utf8_lossy(&output.stdout).trim().to_string(),
+            asked,
+        )
+    }
+
+    /// A-52: the join waits while the box still boots or a cloud-init stage or an apt daily job
+    /// RUNS (systemd says `activating`), never on a cloud-init that will not run this boot or that
+    /// recorded an error, and gives up at the deadline naming what still runs. An empty answer
+    /// counts as busy.
+    #[test]
+    fn a52_waits_only_while_a_unit_runs() {
+        assert_eq!(a52_run_wait("idle", 0, &[]), (0, String::new(), 1));
+        for settled in ["active", "inactive", "failed", "unknown"] {
+            assert_eq!(
+                a52_run_wait("settled", 0, &[("cloud-final", &[settled])]),
+                (0, String::new(), 1),
+                "{settled}"
+            );
+        }
+        assert_eq!(
+            a52_run_wait(
+                "running",
+                FIRST_BOOT_WAIT_SECS,
+                &[("cloud-final", &["activating", "activating", "active"])]
+            ),
+            (0, String::new(), 3)
+        );
+        assert_eq!(
+            a52_run_wait("stuck", 0, &[("cloud-config", &["activating"])]),
+            (124, "still running: cloud-config".to_string(), 0)
+        );
+        assert_eq!(
+            a52_run_wait(
+                "apt",
+                FIRST_BOOT_WAIT_SECS,
+                &[("apt-daily-upgrade", &["activating", "inactive"])]
+            ),
+            (0, String::new(), 2)
+        );
+        assert_eq!(
+            a52_run_wait("apt-stuck", 0, &[("apt-daily", &["activating"])]),
+            (124, "still running: apt-daily".to_string(), 1)
+        );
+        assert_eq!(
+            a52_run_wait("silent", 0, &[("cloud-init-local", &[""])]),
+            (124, "still running: cloud-init-local".to_string(), 0)
+        );
+        // Between two stages the next one is only queued: the boot is not done.
+        assert_eq!(
+            a52_run_wait(
+                "queued",
+                FIRST_BOOT_WAIT_SECS,
+                &[("system", &["starting", "starting", "degraded"])]
+            ),
+            (0, String::new(), 1)
+        );
+        for busy in ["starting", "stopping", "initializing", ""] {
+            assert_eq!(
+                a52_run_wait("booting", 0, &[("system", &[busy])]),
+                (124, "still running: boot".to_string(), 0),
+                "{busy:?}"
+            );
+        }
+        // A boot that never finishes names its first queued jobs.
+        assert_eq!(
+            a52_run_wait(
+                "stuck-boot",
+                0,
+                &[
+                    ("system", &["starting"]),
+                    ("jobs", &["7 mnt-data.mount start running"])
+                ]
+            ),
+            (
+                124,
+                "still running: boot (7 mnt-data.mount start running)".to_string(),
+                0
+            )
+        );
+    }
+
+    fn a52_run(code: Option<i32>, stderr: &str) -> std::io::Result<FirstBootRun> {
+        Ok(FirstBootRun {
+            code,
+            stdout: if code == Some(124) {
+                "still running: cloud-final".to_string()
+            } else {
+                String::new()
+            },
+            stderr: stderr.to_string(),
+        })
+    }
+
+    /// A-52: every way ssh loses the box (exit 255: refused, closed by a reboot, a silent path cut
+    /// by the keepalive, nologin's "Permission denied"; or a signal) is tried again until the
+    /// deadline; the script's own codes are final, and anything else is a failed check.
+    #[test]
+    fn a52_the_loop_retries_a_lost_box_until_the_deadline() {
+        let mut lost = vec![
+            a52_run(
+                Some(255),
+                "Connection to 10.10.10.60 closed by remote host.",
+            ),
+            a52_run(Some(255), ""),
+            a52_run(None, ""),
+            a52_run(
+                Some(255),
+                "fluxops@10.10.10.60: Permission denied (publickey).",
+            ),
+            a52_run(Some(0), ""),
+        ]
+        .into_iter();
+        let mut calls = 0;
+        assert_eq!(
+            wait_first_boot_with(FIRST_BOOT_WAIT_SECS, Duration::ZERO, |_| {
+                calls += 1;
+                lost.next().unwrap()
+            }),
+            Ok(())
+        );
+        assert_eq!(calls, 5);
+
+        let mut calls = 0;
+        let gone = wait_first_boot_with(0, Duration::ZERO, |secs| {
+            calls += 1;
+            assert_eq!(secs, 0);
+            a52_run(
+                Some(255),
+                "ssh: connect to host 10.10.10.60 port 22: Connection refused",
+            )
+        });
+        assert!(
+            matches!(gone, Err(FirstBootWaitError::NotSettled(ref m)) if m.contains("Connection refused"))
+        );
+        assert_eq!(calls, 1, "never past the deadline");
+
+        let busy = wait_first_boot_with(FIRST_BOOT_WAIT_SECS, Duration::ZERO, |_| {
+            a52_run(Some(124), "")
+        });
+        assert!(
+            matches!(busy, Err(FirstBootWaitError::NotSettled(ref m)) if m.contains("cloud-final"))
+        );
+
+        let odd = wait_first_boot_with(FIRST_BOOT_WAIT_SECS, Duration::ZERO, |_| {
+            a52_run(Some(127), "/bin/bash: no such file")
+        });
+        assert!(matches!(odd, Err(FirstBootWaitError::CheckFailed(ref m)) if m.contains("127")));
+
+        let no_ssh = wait_first_boot_with(FIRST_BOOT_WAIT_SECS, Duration::ZERO, |_| {
+            Err(std::io::Error::from(std::io::ErrorKind::NotFound))
+        });
+        assert!(matches!(no_ssh, Err(FirstBootWaitError::CheckFailed(_))));
+    }
+
+    // `ss -H -tlnp` captured read-only on the PROD motherbee on 2026-10-05 (0.1.56): Archi on
+    // 0.0.0.0:3000 is the A-46 exposure; everything else there is expected.
+    const SS_TLNP_PROD_MOTHERBEE_0_1_56: &str = r#"LISTEN 0      4096         0.0.0.0:3000  0.0.0.0:* users:(("sy-architect",pid=2936175,fd=11))
+LISTEN 0      4096   127.0.0.53%lo:53    0.0.0.0:* users:(("systemd-resolve",pid=1722615,fd=15))
+LISTEN 0      4096       127.0.0.1:8384  0.0.0.0:* users:(("syncthing",pid=2013481,fd=44))
+LISTEN 0      4096         0.0.0.0:9100  0.0.0.0:* users:(("sy-identity",pid=2936268,fd=11))
+LISTEN 0      4096         0.0.0.0:9000  0.0.0.0:* users:(("rt-gateway",pid=2936036,fd=12))
+LISTEN 0      4096         0.0.0.0:22    0.0.0.0:* users:(("systemd",pid=1,fd=228))
+LISTEN 0      4096       127.0.0.1:8080  0.0.0.0:* users:(("sy-admin",pid=2936173,fd=10))
+LISTEN 0      4096      127.0.0.54:53    0.0.0.0:* users:(("systemd-resolve",pid=1722615,fd=17))
+LISTEN 0      4096       127.0.0.1:4222  0.0.0.0:* users:(("rt-gateway",pid=2936036,fd=9))
+LISTEN 0      200        127.0.0.1:5432  0.0.0.0:* users:(("postgres",pid=1722647,fd=7))
+LISTEN 0      200            [::1]:5432     [::]:* users:(("postgres",pid=1722647,fd=6))
+LISTEN 0      4096            [::]:22       [::]:* users:(("systemd",pid=1,fd=229))
+LISTEN 0      4096               *:22000       *:* users:(("syncthing",pid=2013481,fd=34))
+"#;
+
+    #[test]
+    fn listener_check_flags_archi_on_the_prod_motherbee() {
+        let listeners = parse_ss_tcp_listeners(SS_TLNP_PROD_MOTHERBEE_0_1_56);
+        assert_eq!(listeners.len(), 13);
+        assert_eq!(
+            loopback_only_exposures(&listeners),
+            vec![("sy-architect".to_string(), "0.0.0.0".to_string(), 3000)]
+        );
+    }
+
+    #[test]
+    fn listener_check_parses_scopes_brackets_and_users() {
+        let listeners = parse_ss_tcp_listeners(SS_TLNP_PROD_MOTHERBEE_0_1_56);
+        let resolver = &listeners[1];
+        assert_eq!((resolver.host.as_str(), resolver.port), ("127.0.0.53", 53));
+        let pg_v6 = &listeners[10];
+        assert_eq!((pg_v6.host.as_str(), pg_v6.port), ("::1", 5432));
+        assert_eq!(listeners[12].host, "*");
+        assert_eq!(
+            parse_ss_process_names(r#"users:(("sshd",pid=1,fd=3),("systemd",pid=1,fd=50))"#),
+            vec!["sshd".to_string(), "systemd".to_string()]
+        );
+    }
+
+    #[test]
+    fn the_motherbee_refuses_the_spoke_only_actions() {
+        for action in ["ADD_HIVE_FINALIZE", "REMOVE_HIVE_CLEANUP"] {
+            let refusal =
+                spoke_only_action_refusal(action, true).expect("refused on the motherbee");
+            assert_eq!(refusal["status"], "error");
+            assert_eq!(refusal["error_code"], "FORBIDDEN");
+            assert!(
+                spoke_only_action_refusal(action, false).is_none(),
+                "{action} runs on a spoke"
+            );
+        }
+        for action in ["SPAWN_NODE", "KILL_NODE", "GET_VERSIONS", "SYSTEM_UPDATE"] {
+            assert!(
+                spoke_only_action_refusal(action, true).is_none(),
+                "{action} is not spoke-only"
+            );
+        }
+    }
+
+    #[test]
+    fn listener_check_drops_the_scope_before_the_brackets() {
+        let output = r#"LISTEN 0 4096 [::1]%lo:3000 [::]:* users:(("sy-architect",pid=1,fd=1))
+LISTEN 0 4096 [fe80::1]%eth0:8080 [::]:* users:(("sy-admin",pid=2,fd=2))
+"#;
+        let listeners = parse_ss_tcp_listeners(output);
+        assert_eq!(listeners[0].host, "::1");
+        assert_eq!(listeners[1].host, "fe80::1");
+        assert_eq!(
+            loopback_only_exposures(&listeners),
+            vec![("sy-admin".to_string(), "fe80::1".to_string(), 8080)]
+        );
+        assert_eq!(listen_endpoint("::", 3000), "[::]:3000");
+        assert_eq!(listen_endpoint("0.0.0.0", 3000), "0.0.0.0:3000");
+    }
+
+    #[test]
+    fn listener_check_loopback_rule() {
+        for host in [
+            "127.0.0.1",
+            "127.0.0.2",
+            "127.0.0.53",
+            "::1",
+            "::ffff:127.0.0.1",
+        ] {
+            assert!(listen_host_is_loopback(host), "{host} is loopback");
+        }
+        for host in [
+            "0.0.0.0",
+            "::",
+            "*",
+            "10.10.10.10",
+            "fe80::1",
+            "",
+            "localhost",
+        ] {
+            assert!(!listen_host_is_loopback(host), "{host} is not loopback");
+        }
+    }
+
+    #[test]
+    fn listener_check_flags_every_exposed_shape_and_nothing_else() {
+        let output = r#"LISTEN 0 4096 [::]:3000 [::]:* users:(("sy-architect",pid=1,fd=1))
+LISTEN 0 4096 10.10.10.10:8080 0.0.0.0:* users:(("sy-admin",pid=2,fd=2))
+LISTEN 0 4096 *:3000 *:* users:(("sy-architect",pid=1,fd=3))
+LISTEN 0 4096 [::1]:3000 [::]:* users:(("sy-architect",pid=1,fd=4))
+LISTEN 0 4096 127.0.0.2:8080 0.0.0.0:* users:(("sy-admin",pid=2,fd=5))
+LISTEN 0 4096 0.0.0.0:9000 0.0.0.0:* users:(("rt-gateway",pid=3,fd=6))
+LISTEN 0 4096 0.0.0.0:3000 0.0.0.0:*
+not an ss line
+LISTEN 0 4096 0.0.0.0:notaport 0.0.0.0:* users:(("sy-architect",pid=1,fd=7))
+"#;
+        assert_eq!(
+            loopback_only_exposures(&parse_ss_tcp_listeners(output)),
+            vec![
+                ("sy-admin".to_string(), "10.10.10.10".to_string(), 8080),
+                ("sy-architect".to_string(), "*".to_string(), 3000),
+                ("sy-architect".to_string(), "::".to_string(), 3000),
+            ]
+        );
     }
 
     #[test]
@@ -22235,8 +31240,18 @@ mod tests {
             "tcp://[2001:db8::7]:22000"
         );
         assert!(syncthing_tcp_address_for_host("peer.example").is_err());
-        assert!(valid_syncthing_peer_address("tcp://192.0.2.7:22000"));
-        assert!(!valid_syncthing_peer_address("dynamic"));
+        assert_eq!(
+            SyncthingPeerAddress::parse_static("tcp://192.0.2.7:22000"),
+            Some(SyncthingPeerAddress::Static(
+                "192.0.2.7:22000".parse().unwrap()
+            ))
+        );
+        assert!(SyncthingPeerAddress::parse_static("tcp://[2001:db8::7]:22000").is_some());
+        assert_eq!(SyncthingPeerAddress::parse_static("dynamic"), None);
+        assert_eq!(
+            SyncthingPeerAddress::parse_static("tcp://peer.example:22000"),
+            None
+        );
     }
 
     fn sample_dist_config() -> DistRuntimeConfig {
@@ -22305,22 +31320,55 @@ mod tests {
         );
     }
 
+    /// A-58: Syncthing moves to its own user when the unit, a home file or the process is another
+    /// user's; never when all three are already the Syncthing user's (and nothing is installed).
     #[test]
-    fn resolve_syncthing_service_user_accepts_existing_user() {
-        let mut blob = sample_blob_config();
-        blob.sync_service_user = "root".to_string();
-        blob.sync_allow_root_fallback = false;
-        let effective = resolve_syncthing_service_user(&blob).expect("resolve user");
-        assert_eq!(effective, "root");
+    fn syncthing_moves_to_its_own_user_only_when_something_is_someone_elses() {
+        let uid = 110;
+        assert!(!syncthing_needs_handover(None, &[], None, uid));
+        assert!(!syncthing_needs_handover(
+            Some(SYNCTHING_SERVICE_USER),
+            &[uid, uid, uid],
+            Some(uid),
+            uid
+        ));
+        // A worker before 0.1.63: the unit says root.
+        assert!(syncthing_needs_handover(
+            Some("root"),
+            &[0, 0],
+            Some(0),
+            uid
+        ));
+        // A switch that stopped halfway: the unit was rewritten, a home file is still root's.
+        assert!(syncthing_needs_handover(
+            Some(SYNCTHING_SERVICE_USER),
+            &[uid, 0],
+            None,
+            uid
+        ));
+        // The unit was rewritten but systemd still runs the old one as root.
+        assert!(syncthing_needs_handover(
+            Some(SYNCTHING_SERVICE_USER),
+            &[uid],
+            Some(0),
+            uid
+        ));
     }
 
+    /// A-58: the switch reads the user of the installed unit; the unit always names `fluxbee`.
     #[test]
-    fn resolve_syncthing_service_user_rejects_missing_without_fallback() {
-        let mut blob = sample_blob_config();
-        blob.sync_service_user = format!("missing-{}", Uuid::new_v4());
-        blob.sync_allow_root_fallback = false;
-        let err = resolve_syncthing_service_user(&blob).expect_err("must fail");
-        assert!(err.to_string().contains("allow_root_fallback=false"));
+    fn the_syncthing_unit_names_its_own_user() {
+        let blob = sample_blob_config();
+        let unit = syncthing_unit_contents(&blob);
+        assert_eq!(
+            syncthing_unit_user(&unit).as_deref(),
+            Some(SYNCTHING_SERVICE_USER)
+        );
+        assert_eq!(
+            syncthing_unit_user("[Service]\nType=simple\nUser=root\nGroup=root\n").as_deref(),
+            Some("root")
+        );
+        assert_eq!(syncthing_unit_user("[Service]\nType=simple\n"), None);
     }
 
     #[test]
@@ -22359,27 +31407,11 @@ blob:
     }
 
     #[test]
-    fn remote_node_projection_reports_status_from_flags() {
-        let mut node = RemoteNodeEntry {
-            uuid: *Uuid::new_v4().as_bytes(),
-            name: [0u8; 256],
-            name_len: 0,
-            vpn_id: 20,
-            hive_index: 0,
-            flags: 0,
-            _reserved: [0u8; 6],
-        };
-        node.name_len = write_name(&mut node.name, "WF.echo@worker-220");
-
-        let active = remote_node_to_json(&node, 1000, 0, "worker-220").expect("active node");
-        assert_eq!(active["status"], "active");
-
-        let stale = remote_node_to_json(&node, 1000, FLAG_STALE, "worker-220").expect("stale node");
-        assert_eq!(stale["status"], "stale");
-
-        let deleted =
-            remote_node_to_json(&node, 1000, FLAG_DELETED, "worker-220").expect("deleted node");
-        assert_eq!(deleted["status"], "deleted");
+    fn remote_flags_status_reports_deleted_over_stale_over_active() {
+        assert_eq!(remote_flags_status(0), "active");
+        assert_eq!(remote_flags_status(FLAG_STALE), "stale");
+        assert_eq!(remote_flags_status(FLAG_DELETED), "deleted");
+        assert_eq!(remote_flags_status(FLAG_DELETED | FLAG_STALE), "deleted");
     }
 
     #[test]
@@ -22396,7 +31428,10 @@ blob:
         assert!(!updated.contains(PEER_DEVICE_ID));
         assert!(updated.contains(LOCAL_DEVICE_ID));
         assert!(updated.contains(SYNCTHING_FOLDER_BLOB_ID));
-        assert!(updated.contains(SYNCTHING_FOLDER_DIST_ID));
+        // The legacy whole-dist folder is still declared here (this fixture models a hive that
+        // has not been migrated); removal must strip the peer from it too, not just from the
+        // per-content folders — otherwise a removed hive keeps receiving bytes.
+        assert!(updated.contains(SYNCTHING_FOLDER_DIST_LEGACY_ID));
     }
 
     #[test]
@@ -22461,36 +31496,890 @@ blob:
         assert_eq!(updated, config);
     }
 
+    /// Motherbee serves every spoke role: one core folder per role, pointing at the
+    /// materialized per-role subtree, plus the shared vendor folder and the worker-only
+    /// runtimes folder. All sendonly — motherbee publishes, it never accepts remote edits.
     #[test]
-    fn reconcile_syncthing_folders_sets_dist_sendonly_on_motherbee() {
+    fn reconcile_syncthing_folders_declares_per_role_dist_on_motherbee() {
         let config = sample_syncthing_config_with_peer();
         let blob = sample_blob_config();
         let dist = sample_dist_config();
 
         let (updated, changed_folders) =
-            reconcile_syncthing_folders_xml(&config, &blob, &dist, true)
+            reconcile_syncthing_folders_xml(&config, &blob, &dist, true, HiveRole::Motherbee)
                 .expect("folder reconcile must succeed");
 
-        assert!(changed_folders.contains(&SYNCTHING_FOLDER_DIST_ID.to_string()));
+        for role in ["worker", "ingress", "egress"] {
+            let id = format!("{SYNCTHING_FOLDER_DIST_CORE_PREFIX}{role}");
+            assert!(
+                changed_folders.contains(&id),
+                "motherbee must declare the core folder for role {role}"
+            );
+            assert!(updated.contains(&format!(
+                "<folder id=\"{id}\" label=\"Fluxbee Dist Core\" path=\"/var/lib/fluxbee/dist/core/{role}\" type=\"sendonly\""
+            )));
+        }
+        assert!(changed_folders.contains(&SYNCTHING_FOLDER_DIST_VENDOR_ID.to_string()));
+        assert!(changed_folders.contains(&SYNCTHING_FOLDER_DIST_RUNTIMES_ID.to_string()));
+    }
+
+    /// A spoke declares only its own role's core folder, mapped onto its plain `dist/core` —
+    /// which is why no path constant had to change on the receiving side.
+    #[test]
+    fn reconcile_syncthing_folders_declares_only_own_role_on_spoke() {
+        let config = sample_syncthing_config_with_peer();
+        let blob = sample_blob_config();
+        let dist = sample_dist_config();
+
+        let (updated, changed_folders) =
+            reconcile_syncthing_folders_xml(&config, &blob, &dist, false, HiveRole::Ingress)
+                .expect("folder reconcile must succeed");
+
         assert!(updated.contains(
-            "<folder id=\"fluxbee-dist\" label=\"Fluxbee Dist\" path=\"/var/lib/fluxbee/dist\" type=\"sendonly\""
+            "<folder id=\"fluxbee-dist-core-ingress\" label=\"Fluxbee Dist Core\" path=\"/var/lib/fluxbee/dist/core\" type=\"receiveonly\""
         ));
+        assert!(!changed_folders
+            .iter()
+            .any(|f| f == "fluxbee-dist-core-worker"));
+    }
+
+    /// The whole point of the split: tenant workflow packages live in `runtimes/`, and the DMZ
+    /// door must never receive them. Vendor, by contrast, is mandatory everywhere — without it
+    /// `update category=vendor` can never be satisfied and the hive's syncthing freezes.
+    #[test]
+    fn ingress_and_egress_get_core_and_vendor_but_never_runtimes() {
+        let dist = sample_dist_config();
+        for role in [HiveRole::Ingress, HiveRole::Egress] {
+            let ids: Vec<String> = dist_sync_folders_for_role(&dist, role, true)
+                .into_iter()
+                .map(|f| f.id)
+                .collect();
+            assert!(ids.contains(&format!(
+                "{SYNCTHING_FOLDER_DIST_CORE_PREFIX}{}",
+                role.as_str()
+            )));
+            assert!(ids.contains(&SYNCTHING_FOLDER_DIST_VENDOR_ID.to_string()));
+            assert!(
+                !ids.contains(&SYNCTHING_FOLDER_DIST_RUNTIMES_ID.to_string()),
+                "{} must never peer the runtimes subtree",
+                role.as_str()
+            );
+        }
+        // The worker does get it — it is the ONLY delivery path for published packages
+        // (there is no sync_runtime_to_worker SSH push).
+        let worker_ids: Vec<String> = dist_sync_folders_for_role(&dist, HiveRole::Worker, true)
+            .into_iter()
+            .map(|f| f.id)
+            .collect();
+        assert!(worker_ids.contains(&SYNCTHING_FOLDER_DIST_RUNTIMES_ID.to_string()));
+    }
+
+    /// The global user OPA policy reaches EVERY hive (ingress and egress route with it too), on
+    /// the same `dist/policy` path at both ends: motherbee sends, the spoke receives.
+    #[test]
+    fn every_role_gets_the_policy_folder() {
+        let dist = sample_dist_config();
+        for role in [HiveRole::Worker, HiveRole::Ingress, HiveRole::Egress] {
+            for is_motherbee in [true, false] {
+                let policy: Vec<DistSyncFolder> =
+                    dist_sync_folders_for_role(&dist, role, is_motherbee)
+                        .into_iter()
+                        .filter(|f| f.id == SYNCTHING_FOLDER_DIST_POLICY_ID)
+                        .collect();
+                assert_eq!(
+                    policy.len(),
+                    1,
+                    "{} (motherbee side: {is_motherbee})",
+                    role.as_str()
+                );
+                assert_eq!(policy[0].path, dist.path.join("policy"));
+            }
+        }
+    }
+
+    /// A hive that joined before the policy folder existed gets it shared with the peers it
+    /// already shares vendor with — both ends, on the next local reconcile, without a re-join.
+    /// Only policy follows vendor: runtimes stays off a peer that never had it (the ingress).
+    #[test]
+    fn policy_folder_reaches_the_peers_that_joined_before_it() {
+        let dist = sample_dist_config();
+        let mut blob = sample_blob_config();
+        blob.public_sync_enabled = false;
+        let joined_before = format!(
+            "<configuration version=\"37\">
+  <device id=\"{local}\" name=\"sandbox\"></device>
+  <device id=\"{peer}\" name=\"ingress-1\"></device>
+  <folder id=\"{vendor}\" label=\"Fluxbee Dist Vendor\" path=\"/var/lib/fluxbee/dist/vendor\" type=\"sendonly\">
+    <device id=\"{local}\" introducedBy=\"\"/>
+    <device id=\"{peer}\" introducedBy=\"\"/>
+  </folder>
+</configuration>",
+            local = LOCAL_DEVICE_ID,
+            peer = PEER_DEVICE_ID,
+            vendor = SYNCTHING_FOLDER_DIST_VENDOR_ID,
+        );
+        for (is_motherbee, role) in [(true, HiveRole::Motherbee), (false, HiveRole::Ingress)] {
+            let (updated, changed) =
+                reconcile_syncthing_folders_xml(&joined_before, &blob, &dist, is_motherbee, role)
+                    .expect("folder reconcile must succeed");
+            assert!(changed.contains(&SYNCTHING_FOLDER_DIST_POLICY_ID.to_string()));
+            assert_eq!(
+                syncthing_folder_device_ids(&updated, SYNCTHING_FOLDER_DIST_POLICY_ID).unwrap(),
+                vec![LOCAL_DEVICE_ID.to_string(), PEER_DEVICE_ID.to_string()],
+                "motherbee side: {is_motherbee}"
+            );
+            if is_motherbee {
+                // Created with no member (Syncthing adds the local device itself); the peer that
+                // never had runtimes does not get it.
+                assert!(updated.contains(&format!(
+                    "<folder id=\"{SYNCTHING_FOLDER_DIST_RUNTIMES_ID}\""
+                )));
+                assert!(
+                    syncthing_folder_device_ids(&updated, SYNCTHING_FOLDER_DIST_RUNTIMES_ID)
+                        .unwrap()
+                        .is_empty()
+                );
+            }
+            let (again, changed_again) =
+                reconcile_syncthing_folders_xml(&updated, &blob, &dist, is_motherbee, role)
+                    .expect("second reconcile must succeed");
+            assert!(
+                changed_again.is_empty(),
+                "not idempotent: {changed_again:?}"
+            );
+            assert_eq!(again, updated);
+        }
+    }
+
+    /// Migration: the legacy whole-`dist/` folder must be REMOVED, never re-pointed. Re-pointing
+    /// it would rewrite the path of a live id, and a receive-only spoke then applies remote
+    /// deletes — the mechanism behind the recorded runtimes deletion incident.
+    #[test]
+    fn legacy_whole_dist_folder_is_removed_not_repointed() {
+        let config = sample_syncthing_config_with_peer();
+        assert!(config.contains(SYNCTHING_FOLDER_DIST_LEGACY_ID));
+        let blob = sample_blob_config();
+        let dist = sample_dist_config();
+
+        let (updated, _) =
+            reconcile_syncthing_folders_xml(&config, &blob, &dist, false, HiveRole::Worker)
+                .expect("folder reconcile must succeed");
+
+        assert!(
+            !updated.contains(&format!("id=\"{SYNCTHING_FOLDER_DIST_LEGACY_ID}\"")),
+            "the legacy folder must be gone, not renamed or re-pointed"
+        );
+    }
+
+    fn sample_core_manifest() -> CoreManifest {
+        let mut components = std::collections::BTreeMap::new();
+        for (name, sha, size) in [
+            ("rt-gateway", "aa11", 10u64),
+            ("sy-config-routes", "bb22", 20),
+            ("sy-orchestrator", "cc33", 30),
+            ("sy-edge", "dd44", 40),
+            ("sy-architect", "ee55", 181_123_776),
+        ] {
+            components.insert(
+                name.to_string(),
+                CoreManifestComponent {
+                    service: name.to_string(),
+                    version: "0.1.0".to_string(),
+                    build_id: "build-1".to_string(),
+                    sha256: sha.to_string(),
+                    size: Some(size),
+                },
+            );
+        }
+        CoreManifest {
+            schema_version: 1,
+            components,
+        }
+    }
+
+    /// Scoping copies entries verbatim — same sha256, size, version, build_id.
+    ///
+    /// This runs on motherbee as a PRE-FLIGHT: it proves every component a role claims exists
+    /// in the build before any file is copied. (The manifest that actually ships is the whole
+    /// one — see `materialize_role_core_trees` — because the staleness gate compares its sha
+    /// between motherbee and the spoke.)
+    #[test]
+    fn scoped_core_manifest_copies_entries_verbatim() {
+        let full = sample_core_manifest();
+        let wanted = vec!["rt-gateway".to_string(), "sy-edge".to_string()];
+        let scoped = scope_core_manifest_to_components(&full, &wanted).unwrap();
+
+        assert_eq!(scoped.schema_version, full.schema_version);
+        assert_eq!(scoped.components.len(), 2);
+        for name in &wanted {
+            let a = full.components.get(name).unwrap();
+            let b = scoped.components.get(name).unwrap();
+            assert_eq!(a.sha256, b.sha256);
+            assert_eq!(a.size, b.size);
+            assert_eq!(a.version, b.version);
+            assert_eq!(a.build_id, b.build_id);
+        }
+        // The 181 MB motherbee-only component is exactly what an ingress must not receive.
+        assert!(!scoped.components.contains_key("sy-architect"));
+    }
+
+    /// A role asking for a component the build does not contain must fail loudly at
+    /// materialization time, on motherbee — not silently ship an incomplete tree that turns
+    /// into a spoke crash-loop later.
+    #[test]
+    fn scoping_a_missing_component_fails_loudly() {
+        let full = sample_core_manifest();
+        let err = scope_core_manifest_to_components(&full, &["sy-nonexistent".to_string()])
+            .expect_err("must reject a component absent from the manifest");
+        assert!(err.to_string().contains("sy-nonexistent"));
+    }
+
+    /// SY.admin names the policy folder to have it scanned at once after a publish; a folder of
+    /// another channel is still refused.
+    #[test]
+    fn a_dist_sync_hint_may_name_one_dist_folder() {
+        let request = parse_system_sync_hint_payload(&serde_json::json!({
+            "channel": "dist",
+            "folder_id": SYNCTHING_FOLDER_DIST_POLICY_ID,
+        }))
+        .expect("a dist folder is valid for the dist channel");
+        assert_eq!(request.folder_id, SYNCTHING_FOLDER_DIST_POLICY_ID);
+        let channel_default =
+            parse_system_sync_hint_payload(&serde_json::json!({"channel": "dist"}))
+                .expect("the channel default stays valid");
+        assert_eq!(channel_default.folder_id, SYNCTHING_FOLDER_DIST_LEGACY_ID);
+        for (channel, folder) in [
+            ("dist", SYNCTHING_FOLDER_BLOB_ID),
+            ("blob", SYNCTHING_FOLDER_DIST_POLICY_ID),
+        ] {
+            assert!(
+                parse_system_sync_hint_payload(
+                    &serde_json::json!({"channel": channel, "folder_id": folder})
+                )
+                .is_err(),
+                "{folder} must be refused for channel {channel}"
+            );
+        }
+    }
+
+    /// Pins the CALLER, not the helper.
+    ///
+    /// The helper was always right; the defect was that this resolver called the other one. A
+    /// test that only checks `dist_sync_folders_for_hive` passes just as happily with the bug in
+    /// place — so read the source and assert which one the resolver actually reaches for, the
+    /// same way the join-flow symmetry test does.
+    #[test]
+    fn the_dist_sync_hint_resolves_through_the_hive_aware_helper() {
+        let src = include_str!("sy_orchestrator.rs");
+        let start = src
+            .find("fn dist_sync_hint_folder_ids(")
+            .expect("dist_sync_hint_folder_ids");
+        let end = src[start..]
+            .find("\n}")
+            .map(|o| start + o)
+            .expect("su cierre");
+        let body = &src[start..end];
+
+        assert!(
+            body.contains("dist_sync_folders_for_hive("),
+            "el hint tiene que resolver por el helper que sabe de motherbee"
+        );
+        assert!(
+            !body.contains("dist_sync_folders_for_role("),
+            "dist_sync_folders_for_role da fluxbee-dist-core-motherbee en motherbee: 404, y el \
+             primer no-ok hace fallar el hint entero"
+        );
+    }
+
+    /// D10: only the core is born in the genesis (root) tenant: SY.*, RT.* and the core IO
+    /// runtimes. Any other node (AI, WF, another IO) is refused there with TENANT_ROOT_NOT_ALLOWED;
+    /// in a tenant, or with no tenant known, it is not.
+    #[test]
+    fn only_the_core_is_born_in_the_genesis_tenant() {
+        let root = fluxbee_sdk::DEFAULT_ROOT_TENANT_ID;
+        let root_without_hyphens = "tnt:00000000000000000000000000000001";
+        let tenant = "tnt:8a0c3f8e-2f1b-4d3a-9c55-0f6e2b7d9a11";
+        for (name, runtime) in [
+            ("IO.cloud@motherbee", "io.cloud"),
+            ("IO.blob@motherbee", "io.blob"),
+            ("IO.web@motherbee", "io.web"),
+            ("SY.frontdesk.gov@motherbee", ""),
+            ("SY.architect@motherbee", "sy.architect"),
+            ("RT.gateway@motherbee", ""),
+        ] {
+            assert!(
+                genesis_refusal(name, runtime, Some(root)).is_none(),
+                "{name}"
+            );
+        }
+        for (name, runtime) in [
+            ("IO.api@motherbee", "io.api"),
+            ("IO.slack.acme@motherbee", "io.slack"),
+            ("IO.anything@motherbee", ""),
+            ("AI.sales@motherbee", "ai.generic"),
+            ("WF.flow@motherbee", "wf.engine"),
+            ("WF.oddly.named@motherbee", "io.cloud"),
+        ] {
+            let refusal = genesis_refusal(name, runtime, Some(root)).expect(name);
+            assert_eq!(refusal["error_code"], "TENANT_ROOT_NOT_ALLOWED");
+            assert!(genesis_refusal(name, runtime, Some(root_without_hyphens)).is_some());
+            assert!(
+                genesis_refusal(name, runtime, Some(tenant)).is_none(),
+                "{name} in a tenant"
+            );
+            assert!(genesis_refusal(name, runtime, None).is_none());
+        }
+    }
+
+    /// Stage 3 (docs/ilk-tenant-model-v1.md §2.3): a node of a tenant known not to be active is not
+    /// started; when the hive cannot tell, the launch goes on as before.
+    #[test]
+    fn a_tenant_that_is_not_active_starts_no_node() {
+        let tenant = "tnt:8a0c3f8e-2f1b-4d3a-9c55-0f6e2b7d9a11";
+        assert_eq!(
+            tenant_gate_from_status(Ok(Some("active".to_string()))),
+            TenantGate::Open
+        );
+        for status in ["suspended", "pending"] {
+            let gate = tenant_gate_from_status(Ok(Some(status.to_string())));
+            assert_eq!(gate, TenantGate::Closed(status.to_string()));
+            let refusal =
+                tenant_gate_refusal("IO.slack.acme@motherbee", Some(tenant), &gate).expect(status);
+            assert_eq!(refusal["error_code"], "TENANT_NOT_ACTIVE");
+            assert_eq!(refusal["tenant_status"], status);
+        }
+        for unknown in [Ok(None), Err("no shm".to_string())] {
+            let gate = tenant_gate_from_status(unknown);
+            assert!(matches!(gate, TenantGate::Unknown(_)), "{gate:?}");
+            assert!(tenant_gate_refusal("IO.slack.acme@motherbee", Some(tenant), &gate).is_none());
+        }
+        // The genesis tenant is always active, and no tenant means nothing to check: neither
+        // reads the identity SHM.
+        assert_eq!(
+            tenant_gate("motherbee", Some(fluxbee_sdk::DEFAULT_ROOT_TENANT_ID)),
+            TenantGate::Open
+        );
+        assert_eq!(tenant_gate("motherbee", None), TenantGate::Open);
+        assert_eq!(tenant_gate("motherbee", Some("  ")), TenantGate::Open);
+    }
+
+    /// Every launch path checks the tenant gate before it registers, forwards, stops or starts
+    /// anything, so a refused node is never stopped (its order in the source, which is the order it
+    /// runs in).
+    #[test]
+    fn every_launch_path_checks_the_tenant_gate_before_it_acts() {
+        let src = include_str!("sy_orchestrator.rs");
+        let body = |name: &str| {
+            let start = src.find(name).expect(name);
+            let end = src[start..]
+                .find("\n}\n")
+                .map(|o| start + o)
+                .expect("its end");
+            &src[start..end]
+        };
+        let in_order = |name: &str, marks: &[&str]| {
+            let body = body(name);
+            let at: Vec<usize> = marks
+                .iter()
+                .map(|mark| body.find(mark).unwrap_or_else(|| panic!("{name}: {mark}")))
+                .collect();
+            assert!(
+                at.windows(2).all(|w| w[0] < w[1]),
+                "{name}: {marks:?} at {at:?}"
+            );
+        };
+        in_order(
+            "async fn run_node_flow(",
+            &[
+                "genesis_refusal(",
+                "tenant_gate_refusal(",
+                "forward_system_action_to_hive(",
+                "ensure_node_identity_registered(",
+                "execute_on_hive(",
+            ],
+        );
+        in_order(
+            "async fn start_or_restart_node_flow(",
+            &[
+                "node_requirements_refusal(",
+                "managed_node_launch_plan(",
+                "\"already_running\"",
+                "tenant_gate_refusal(",
+                "managed_node_restart_command(",
+                "execute_on_hive(",
+            ],
+        );
+        in_order(
+            "async fn kill_node_flow(",
+            &[
+                "node_requirements_refusal(",
+                "systemd_unit_is_active(",
+                "execute_on_hive(",
+            ],
+        );
+        // A stop lasts on both ways out, the node already down (a crash loop waiting for its next
+        // restart included) and running: each stops the unit, then clears the flag.
+        let kill = body("async fn kill_node_flow(");
+        let clears: Vec<&str> = kill
+            .split("set_node_relaunch_on_boot(state, node_name_ref, false)")
+            .collect();
+        assert_eq!(clears.len(), 3, "two ways a stop clears the flag");
+        for before in &clears[..2] {
+            assert!(
+                before.contains("execute_on_hive("),
+                "a stop before the flag is cleared"
+            );
+        }
+        // A node on another hive is checked here before the request goes there: a hive whose core
+        // predates the check would act without it.
+        for name in [
+            "async fn kill_node_flow(",
+            "async fn start_or_restart_node_flow(",
+            "async fn get_node_status_flow(",
+        ] {
+            in_order(
+                name,
+                &[
+                    "remote_node_requirements_refusal(",
+                    "forward_system_action_to_hive(",
+                ],
+            );
+        }
+        in_order(
+            "async fn get_node_status_flow(",
+            &[
+                "forward_system_action_to_hive(",
+                "= node_requirements_refusal(state, &node_name, payload)",
+            ],
+        );
+        in_order(
+            "async fn reconcile_persisted_custom_nodes(",
+            &[
+                "genesis_refusal(",
+                "match tenant_gate(",
+                "persist_node_runtime_version(",
+                "clear_stale_transient_unit(",
+                "execute_on_hive(",
+            ],
+        );
+    }
+
+    /// A start or restart reads the node's tenant from the identity map, else from its config.
+    #[test]
+    fn a_nodes_config_names_its_tenant_in_system_or_at_the_top() {
+        let root = fluxbee_sdk::DEFAULT_ROOT_TENANT_ID;
+        assert_eq!(
+            config_tenant_id(&serde_json::json!({ "_system": { "tenant_id": root } })).as_deref(),
+            Some(root)
+        );
+        assert_eq!(
+            config_tenant_id(&serde_json::json!({ "_system": {}, "tenant_id": root })).as_deref(),
+            Some(root)
+        );
+        assert_eq!(
+            config_tenant_id(&serde_json::json!({ "_system": { "tenant_id": " " } })),
+            None
+        );
+    }
+
+    /// A-16: the watchdog reads a receive-only folder's local changes from its status, which
+    /// is what triggers the revert; a folder of another type reports none.
+    #[test]
+    fn a_receive_only_folders_local_changes_are_read_from_its_status() {
+        let touched = syncthing_folder_status_from_payload(&serde_json::json!({
+            "state": "idle",
+            "needTotalItems": 0,
+            "receiveOnlyTotalItems": 3,
+            "receiveOnlyChangedFiles": 2,
+            "error": "",
+            "invalid": ""
+        }));
+        assert_eq!(touched.receive_only_total_items, 3);
+        assert!(touched.is_healthy(), "local changes are not a sync error");
+        let send_receive = syncthing_folder_status_from_payload(&serde_json::json!({
+            "state": "idle",
+            "needTotalItems": 0
+        }));
+        assert_eq!(send_receive.receive_only_total_items, 0);
+    }
+
+    /// A-45: a service still running the binary dpkg replaced shows it in `/proc/<pid>/exe`.
+    #[test]
+    fn a_binary_replaced_on_disk_shows_as_deleted() {
+        assert!(exe_link_is_replaced(Path::new(
+            "/usr/bin/sy-identity (deleted)"
+        )));
+        assert!(!exe_link_is_replaced(Path::new("/usr/bin/sy-identity")));
+        assert!(!exe_link_is_replaced(Path::new("/usr/bin/sy-deleted")));
+    }
+
+    /// A-45: after a package upgrade the boot restarts the services on replaced binaries in its
+    /// own start order (rt-gateway first, SY.vault last), not in the order it found them.
+    #[test]
+    fn the_boot_restarts_replaced_services_in_start_order() {
+        let order: Vec<String> = [
+            "rt-gateway",
+            "sy-config-routes",
+            "sy-identity",
+            "sy-admin",
+            "sy-vault",
+        ]
+        .map(str::to_string)
+        .to_vec();
+        let replaced: HashSet<String> = ["sy-vault", "sy-identity", "rt-gateway"]
+            .map(str::to_string)
+            .into_iter()
+            .collect();
+        assert_eq!(
+            upgrade_restart_order(&order, &replaced),
+            ["rt-gateway", "sy-identity", "sy-vault"]
+        );
+        assert!(upgrade_restart_order(&order, &HashSet::new()).is_empty());
+    }
+
+    /// A-45: the outcome is `ok` only when every service it set out to restart restarted.
+    #[test]
+    fn a_boot_upgrade_restart_is_ok_only_when_every_service_restarted() {
+        let attempted = ["rt-gateway".to_string(), "sy-identity".to_string()];
+        let ok = boot_upgrade_restart_record("1", &attempted, &attempted, &[]);
+        assert_eq!(ok["status"], "ok");
+        assert_eq!(ok["phase"], "done");
+        assert_eq!(ok["via"], "package");
+        let failed = boot_upgrade_restart_record(
+            "1",
+            &attempted,
+            &attempted[..1],
+            &["sy-identity: systemctl restart failed".to_string()],
+        );
+        assert_eq!(failed["status"], "error");
+        assert_eq!(failed["restarted"], serde_json::json!(["rt-gateway"]));
+    }
+
+    /// A-39: after an upgrade, a running node that follows `current` moves to the version the
+    /// pointer names; a pinned or up-to-date node stays, and so does one whose runtime the
+    /// manifest cannot resolve (a running node is never torn down for that).
+    #[test]
+    fn only_a_node_following_a_moved_current_is_rebound() {
+        let manifest = RuntimeManifest {
+            schema_version: 1,
+            version: 1790000000000,
+            updated_at: None,
+            runtimes: serde_json::json!({
+                "io.api": {"available": ["0.1.52", "0.1.53"], "current": "0.1.53", "type": "full_runtime"}
+            }),
+            hash: None,
+        };
+        let node = |requested: &str, bound: &str, runtime: &str| PersistedManagedNode {
+            requested_runtime_version: requested.to_string(),
+            node_name: "IO.api@motherbee".to_string(),
+            kind: "IO".to_string(),
+            runtime: runtime.to_string(),
+            runtime_version: bound.to_string(),
+            config_path: PathBuf::from("/tmp/config.json"),
+            relaunch_on_boot: true,
+        };
+        assert_eq!(
+            moved_current_version(&manifest, &node("current", "0.1.52", "io.api")).as_deref(),
+            Some("0.1.53")
+        );
+        assert_eq!(
+            moved_current_version(&manifest, &node("current", "0.1.53", "io.api")),
+            None
+        );
+        assert_eq!(
+            moved_current_version(&manifest, &node("0.1.52", "0.1.52", "io.api")),
+            None
+        );
+        assert_eq!(
+            moved_current_version(&manifest, &node("current", "0.1.52", "io.gone")),
+            None
+        );
+    }
+
+    /// Reiniciar tiene que RECREAR la unit cuando cambio la ruta del entrypoint.
+    ///
+    /// `systemctl restart` re-ejecuta el ExecStart que ya tiene la unit, y esa ruta lleva la
+    /// version del runtime adentro. Asi que reiniciar despues de publicar una version nueva
+    /// relanzaba el binario VIEJO — mientras la respuesta le informaba al operador la version
+    /// nueva. Version prometida y no aplicada: la forma de U-1.
+    ///
+    /// Medido en vivo: `restart_node` devolvio `version: 0.1.14` y el proceso siguio siendo
+    /// `/var/lib/fluxbee/dist/runtimes/io.slack/0.1.13/bin/io-slack`.
+    #[test]
+    fn reiniciar_recrea_la_unit_si_cambio_la_ruta_del_entrypoint() {
+        let plan = ManagedNodeLaunchPlan {
+            node: PersistedManagedNode {
+                requested_runtime_version: "current".to_string(),
+                node_name: "IO.slack.default@motherbee".to_string(),
+                kind: "IO".to_string(),
+                runtime: "io.slack".to_string(),
+                runtime_version: "0.1.14".to_string(),
+                config_path: PathBuf::from("/tmp/config.json"),
+                relaunch_on_boot: true,
+            },
+            unit: unit_from_node_name("IO.slack.default@motherbee"),
+            runtime_key: "io.slack".to_string(),
+            resolved_version: "0.1.14".to_string(),
+            requested_version: "current".to_string(),
+            entrypoint: RuntimeSpawnEntrypoint {
+                script_runtime: "io.slack".to_string(),
+                script_version: "0.1.14".to_string(),
+                script_path: "/var/lib/fluxbee/dist/runtimes/io.slack/0.1.14/bin/start.sh"
+                    .to_string(),
+                runtime_base: None,
+            },
+            tenant: None,
+        };
+        let state = sample_orchestrator_state_for_tests();
+        let cmd = managed_node_restart_command(&state, &plan, true);
+
+        assert!(
+            cmd.contains("ExecStart") && cmd.contains("0.1.14/bin/start.sh"),
+            "tiene que comparar el ExecStart vivo contra la ruta planificada: {cmd}"
+        );
+        assert!(
+            cmd.contains("systemctl stop") && cmd.contains("systemd-run"),
+            "si no coincide, tiene que bajar la unit y recrearla: {cmd}"
+        );
+        assert!(
+            cmd.contains("systemctl restart"),
+            "si ya coincide, alcanza con reiniciar en el lugar: {cmd}"
+        );
+    }
+
+    /// Arrancar/reiniciar un nodo tiene que resolver la INTENCION, no la respuesta guardada.
+    ///
+    /// Es la misma regla que U-10 puso en el arranque del orquestador, y que este camino no
+    /// tenia: un nodo con `_system.requested_runtime_version = "current"` volvia a lanzarse sobre
+    /// su ultima version CONCRETA. Efecto real: publicar un runtime nuevo y reiniciar el nodo no
+    /// lo tomaba nunca — o sea que el modelo "crecer = publish + update, sin .deb nuevo" no
+    /// funcionaba para un nodo ya corriendo, y la respuesta encima devolvia la version vieja como
+    /// `requested_version`.
+    ///
+    /// Se fija leyendo la fuente porque la propiedad es de ORDEN: el calculo de la intencion tiene
+    /// que estar ANTES de la resolucion, y la resolucion tiene que usarlo a el.
+    #[test]
+    fn arrancar_un_nodo_resuelve_la_intencion_no_la_version_guardada() {
+        let src = include_str!("sy_orchestrator.rs");
+        let start = src
+            .find("fn managed_node_launch_plan(")
+            .expect("managed_node_launch_plan");
+        let body = &src[start..];
+        let end = body.find("\n}").expect("su cierre");
+        let body = &body[..end];
+
+        let intent = body
+            .find("node.follows_current()")
+            .expect("tiene que consultar la INTENCION del nodo");
+        let resolve = body
+            .find("resolve_runtime_version(&manifest, &runtime_key, &requested_version)")
+            .expect("la resolucion tiene que usar la intencion, no node.runtime_version");
+        assert!(
+            intent < resolve,
+            "la intencion se calcula antes de resolver, no despues"
+        );
+        assert!(
+            !body.contains("resolve_runtime_version(&manifest, &runtime_key, &node.runtime_version)"),
+            "resolver la version CONCRETA guardada re-pinnea un nodo que sigue a current"
+        );
+    }
+
+    /// IO.blob e IO.cloud son runtimes MANAGED, sin unit propia de systemd.
+    ///
+    /// Ya no tienen unit propia de systemd: el orquestador es su unico dueño (los instancia por
+    /// `run_node` y los relanza en `reconcile`), y se configuran por CONFIG_SET/GET. Por eso el
+    /// barrido de adopcion TIENE que relanzarlos — es su unico camino de arranque, como cualquier
+    /// runtime. El guard de doble-dueño (`managed_spawn_disallowed_reason`) bloquea SY.* y
+    /// RT.gateway; ningun runtime managed tiene unit de systemd que compita por el proceso.
+    #[test]
+    fn io_blob_y_io_cloud_ahora_se_adoptan_como_runtimes_gestionados() {
+        for nombre in [
+            "IO.cloud@motherbee",
+            "IO.blob@motherbee",
+            "io.cloud@motherbee",
+            "IO.slack.default@motherbee",
+            "AI.chat@motherbee",
+            "WF.router@motherbee",
+        ] {
+            assert!(
+                managed_spawn_disallowed_reason(nombre).is_none(),
+                "{nombre} es un runtime managed: el boot pass TIENE que relanzarlo"
+            );
+            assert!(managed_reconcile_candidate_allowed(nombre));
+        }
+    }
+
+    /// U-7, and the residual that outlived its fix.
+    ///
+    /// Motherbee does not sync to itself, so it never declares `fluxbee-dist-core-motherbee`.
+    /// Asking syncthing about it returns 404 — which is how the watchdog logged a warn every five
+    /// seconds forever. The watchdog was fixed by routing it through `dist_sync_folders_for_hive`,
+    /// but the `dist` sync-hint resolver was still on `dist_sync_folders_for_role`, and there the
+    /// same 404 is worse than noisy: a hint fans out over these ids and the first non-ok wins, so
+    /// the undeclared folder failed the whole hint — the exact thing `update category=core` waits
+    /// on.
+    #[test]
+    fn motherbee_never_resolves_a_dist_folder_it_does_not_declare() {
+        let dist = sample_dist_config();
+        let carried = dist_sync_folders_for_hive(&dist, HiveRole::Motherbee, true);
+        let ids: Vec<&str> = carried.iter().map(|f| f.id.as_str()).collect();
+
+        assert!(
+            !ids.iter().any(|id| id.contains("motherbee")),
+            "motherbee does not sync to itself; asking syncthing for its own core folder is a 404: {ids:?}"
+        );
+        for role in ROLE_CORE_DIST_ROLES {
+            let expected = format!("{SYNCTHING_FOLDER_DIST_CORE_PREFIX}{}", role.as_str());
+            assert!(
+                ids.contains(&expected.as_str()),
+                "motherbee serves one core folder per spoke role; {expected} missing from {ids:?}"
+            );
+        }
+
+        // A spoke carries only its own, and must NOT be handed its siblings' folders.
+        let spoke = dist_sync_folders_for_hive(&dist, HiveRole::Ingress, false);
+        let spoke_ids: Vec<&str> = spoke.iter().map(|f| f.id.as_str()).collect();
+        assert!(spoke_ids
+            .contains(&format!("{SYNCTHING_FOLDER_DIST_CORE_PREFIX}ingress").as_str()));
+        assert!(
+            !spoke_ids.iter().any(|id| id.ends_with("worker") || id.ends_with("egress")),
+            "a spoke must not be asked to settle another role's folder: {spoke_ids:?}"
+        );
+    }
+
+    /// The path asymmetry is the trick that keeps every spoke-side constant untouched:
+    /// motherbee serves `dist/core/<role>`, the spoke receives it as its own `dist/core`, and
+    /// both ends agree on the folder id.
+    #[test]
+    fn core_folder_path_is_role_scoped_on_motherbee_and_plain_on_the_spoke() {
+        let dist = sample_dist_config();
+        let on_mb = dist_sync_folders_for_role(&dist, HiveRole::Ingress, true);
+        let on_spoke = dist_sync_folders_for_role(&dist, HiveRole::Ingress, false);
+
+        assert_eq!(on_mb[0].id, on_spoke[0].id);
+        assert_eq!(
+            on_mb[0].path,
+            PathBuf::from("/var/lib/fluxbee/dist/core/ingress")
+        );
+        assert_eq!(on_spoke[0].path, PathBuf::from("/var/lib/fluxbee/dist/core"));
+    }
+
+    /// REGRESION (U-7): motherbee no se sincroniza consigo misma, asi que NUNCA declara
+    /// `fluxbee-dist-core-motherbee`. El watchdog de salud lo consultaba igual —porque derivaba el
+    /// set con el rol propio en vez de con la misma regla que la declaracion— y tiraba un 404 cada
+    /// cinco segundos, para siempre. Declaracion, marcadores `.stfolder` y chequeo de salud deben
+    /// salir todos de `dist_sync_folders_for_hive`.
+    #[test]
+    fn motherbee_never_polls_a_core_folder_for_itself() {
+        let dist = sample_dist_config();
+        let ids: Vec<String> = dist_sync_folders_for_hive(&dist, HiveRole::Motherbee, true)
+            .into_iter()
+            .map(|f| f.id)
+            .collect();
+        assert!(
+            !ids.iter().any(|id| id.ends_with("motherbee")),
+            "motherbee no debe declarar ni consultar una carpeta de core propia; obtuvo {ids:?}"
+        );
+        // Si sirve a los tres roles de spoke, mas vendor y runtimes.
+        for role in ["worker", "ingress", "egress"] {
+            assert!(ids.contains(&format!("{SYNCTHING_FOLDER_DIST_CORE_PREFIX}{role}")));
+        }
+        assert!(ids.contains(&SYNCTHING_FOLDER_DIST_VENDOR_ID.to_string()));
+        assert!(ids.contains(&SYNCTHING_FOLDER_DIST_RUNTIMES_ID.to_string()));
+    }
+
+    /// El id compartido (vendor) se declara UNA vez aunque lo usen los tres roles.
+    #[test]
+    fn shared_dist_folders_are_declared_once() {
+        let dist = sample_dist_config();
+        let ids: Vec<String> = dist_sync_folders_for_hive(&dist, HiveRole::Motherbee, true)
+            .into_iter()
+            .map(|f| f.id)
+            .collect();
+        let mut sorted = ids.clone();
+        sorted.sort();
+        sorted.dedup();
+        assert_eq!(sorted.len(), ids.len(), "ids duplicados en {ids:?}");
+    }
+
+    /// Un spoke solo carga lo suyo: su core, vendor, y runtimes unicamente si es worker.
+    #[test]
+    fn a_spoke_carries_only_its_own_dist_folders() {
+        let dist = sample_dist_config();
+        for (role, wants_runtimes) in [
+            (HiveRole::Worker, true),
+            (HiveRole::Ingress, false),
+            (HiveRole::Egress, false),
+        ] {
+            let ids: Vec<String> = dist_sync_folders_for_hive(&dist, role, false)
+                .into_iter()
+                .map(|f| f.id)
+                .collect();
+            assert!(ids.contains(&format!(
+                "{SYNCTHING_FOLDER_DIST_CORE_PREFIX}{}",
+                role.as_str()
+            )));
+            // y de ningun otro rol
+            for other in ["worker", "ingress", "egress"] {
+                if other != role.as_str() {
+                    assert!(
+                        !ids.contains(&format!("{SYNCTHING_FOLDER_DIST_CORE_PREFIX}{other}")),
+                        "{} no debe cargar la carpeta de {other}",
+                        role.as_str()
+                    );
+                }
+            }
+            assert_eq!(
+                ids.contains(&SYNCTHING_FOLDER_DIST_RUNTIMES_ID.to_string()),
+                wants_runtimes,
+                "runtimes para {}",
+                role.as_str()
+            );
+        }
+    }
+
+    /// Every dist folder must own a disjoint subtree. Two syncthing folders over one tree are
+    /// accepted silently by the daemon and then fight over a single index — the mechanism
+    /// behind the recorded `runtimes/ai.common/0.1.2` deletion.
+    #[test]
+    fn dist_folders_never_overlap() {
+        let dist = sample_dist_config();
+        for role in [HiveRole::Worker, HiveRole::Ingress, HiveRole::Egress] {
+            for is_mb in [true, false] {
+                let folders = dist_sync_folders_for_role(&dist, role, is_mb);
+                for (i, a) in folders.iter().enumerate() {
+                    for b in folders.iter().skip(i + 1) {
+                        assert_ne!(a.id, b.id, "duplicate folder id for {:?}", role);
+                        assert!(
+                            !a.path.starts_with(&b.path) && !b.path.starts_with(&a.path),
+                            "folders {} and {} overlap on disk ({} vs {})",
+                            a.id,
+                            b.id,
+                            a.path.display(),
+                            b.path.display()
+                        );
+                    }
+                }
+            }
+        }
     }
 
     #[test]
-    fn reconcile_syncthing_folders_sets_dist_receiveonly_on_worker() {
+    fn removing_a_syncthing_folder_is_idempotent_and_scoped() {
         let config = sample_syncthing_config_with_peer();
-        let blob = sample_blob_config();
-        let dist = sample_dist_config();
-
-        let (updated, changed_folders) =
-            reconcile_syncthing_folders_xml(&config, &blob, &dist, false)
-                .expect("folder reconcile must succeed");
-
-        assert!(changed_folders.contains(&SYNCTHING_FOLDER_DIST_ID.to_string()));
-        assert!(updated.contains(
-            "<folder id=\"fluxbee-dist\" label=\"Fluxbee Dist\" path=\"/var/lib/fluxbee/dist\" type=\"receiveonly\""
-        ));
+        let (once, removed) =
+            remove_syncthing_folder_from_config_xml(&config, SYNCTHING_FOLDER_DIST_LEGACY_ID)
+                .expect("removal must succeed");
+        assert!(removed);
+        assert!(!once.contains(&format!("id=\"{SYNCTHING_FOLDER_DIST_LEGACY_ID}\"")));
+        // Untouched neighbours.
+        assert!(once.contains(SYNCTHING_FOLDER_BLOB_ID));
+        // Second call is a no-op rather than an error.
+        let (twice, removed_again) =
+            remove_syncthing_folder_from_config_xml(&once, SYNCTHING_FOLDER_DIST_LEGACY_ID)
+                .expect("removal must succeed");
+        assert!(!removed_again);
+        assert_eq!(twice, once);
     }
 
     #[test]
@@ -22644,8 +32533,13 @@ blob:
             hash: None,
         };
 
-        let stats = apply_runtime_retention_with_roots(&manifest, &runtimes_root, &nodes_root)
-            .expect("retention should succeed");
+        let stats = apply_runtime_retention_with_roots_and_protection(
+            &manifest,
+            &runtimes_root,
+            &nodes_root,
+            &HashMap::new(),
+        )
+        .expect("retention should succeed");
 
         assert!(
             kept_runtime_dir.exists(),
@@ -22711,43 +32605,6 @@ blob:
     }
 
     #[test]
-    fn runtime_dependents_summary_detects_published_dependents() {
-        let manifest = RuntimeManifest {
-            schema_version: 1,
-            version: 1710000000000,
-            updated_at: Some("2026-03-16T00:00:00Z".to_string()),
-            runtimes: serde_json::json!({
-                "ai.base": {
-                    "available": ["1.0.0"],
-                    "current": "1.0.0",
-                    "type": "full_runtime"
-                },
-                "ai.child.config": {
-                    "available": ["2.0.0"],
-                    "current": "2.0.0",
-                    "type": "config_only",
-                    "runtime_base": "ai.base"
-                },
-                "wf.child.flow": {
-                    "available": ["3.0.0"],
-                    "current": "3.0.0",
-                    "type": "workflow",
-                    "runtime_base": "ai.base"
-                }
-            }),
-            hash: None,
-        };
-
-        let dependents = runtime_dependents_summary(&manifest, "ai.base").expect("dependents");
-        assert_eq!(dependents.len(), 2);
-        assert_eq!(
-            dependents[0]["runtime"],
-            serde_json::json!("ai.child.config")
-        );
-        assert_eq!(dependents[1]["runtime"], serde_json::json!("wf.child.flow"));
-    }
-
-    #[test]
     fn persisted_managed_node_from_config_value_allows_manual_start_without_relaunch_flag() {
         let config_path = PathBuf::from("/tmp/fluxbee-test/WF.invoice@motherbee/config.json");
         let config = serde_json::json!({
@@ -22780,6 +32637,7 @@ blob:
     fn managed_node_restart_command_uses_systemd_restart_with_systemd_run_fallback() {
         let plan = ManagedNodeLaunchPlan {
             node: PersistedManagedNode {
+                requested_runtime_version: "current".to_string(),
                 node_name: "WF.invoice@motherbee".to_string(),
                 kind: "WF".to_string(),
                 runtime: "wf.invoice".to_string(),
@@ -22787,6 +32645,7 @@ blob:
                 config_path: PathBuf::from("/tmp/config.json"),
                 relaunch_on_boot: true,
             },
+            requested_version: "current".to_string(),
             unit: unit_from_node_name("WF.invoice@motherbee"),
             runtime_key: "wf.invoice".to_string(),
             resolved_version: "4".to_string(),
@@ -22797,6 +32656,7 @@ blob:
                     .to_string(),
                 runtime_base: Some("wf.engine".to_string()),
             },
+            tenant: None,
         };
 
         let state = sample_orchestrator_state_for_tests();
@@ -22812,6 +32672,7 @@ blob:
             is_motherbee: true,
             role: HiveRole::Motherbee,
             started_at: Instant::now(),
+            booted: AtomicBool::new(true),
             config_dir: PathBuf::from("/tmp/fluxbee-test-config"),
             state_dir: PathBuf::from("/tmp/fluxbee-test-state"),
             gateway_name: "RT.gateway".to_string(),
@@ -22824,7 +32685,6 @@ blob:
             runtime_lifecycle_lock: Mutex::new(()),
             last_runtime_verify: Mutex::new(Instant::now()),
             last_blob_gc: Mutex::new(Instant::now()),
-            nats_endpoint: "nats://127.0.0.1:4222".to_string(),
             identity_sync_port: 0,
             system_nodes: RoleSystemNodes {
                 nodes: vec!["SY.config.routes".to_string(), "SY.timer".to_string()],
@@ -23498,7 +33358,9 @@ blob:
                 "_system": {
                     "runtime": "ai.persisted.test",
                     "runtime_version": "1.0.0-diag",
-                    "tenant_id": "tnt:test"
+                    "tenant_id": "tnt:test",
+                    "launched_by": "cloud",
+                    "relaunch_on_boot": false
                 }
             })
             .to_string(),
@@ -23513,7 +33375,76 @@ blob:
         assert_eq!(inventory[0]["lifecycle_state"], "STOPPED");
         assert_eq!(inventory[0]["runtime"]["name"], "ai.persisted.test");
         assert_eq!(inventory[0]["runtime"]["version"], "1.0.0-diag");
+        assert_eq!(inventory[0]["identity"]["tenant_id"], "tnt:test");
+        assert_eq!(inventory[0]["launched_by"], "cloud");
+        assert_eq!(inventory[0]["relaunch_on_boot"], false);
 
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Stage 4 (docs/ilk-tenant-model-v1.md §2.4): who launched a node comes from SY.admin's stamp;
+    /// a requirement is met only by a node that matches it; a stop lasts.
+    #[test]
+    fn who_launched_a_node_and_what_its_caller_requires() {
+        let launched = |payload: serde_json::Value| launched_by_from_payload(&payload);
+        assert_eq!(
+            launched(serde_json::json!({"launched_by": "cloud"})),
+            "cloud"
+        );
+        assert_eq!(launched(serde_json::json!({})), "system");
+        assert_eq!(launched(serde_json::json!({"launched_by": "  "})), "system");
+        assert_eq!(
+            launched(serde_json::json!({"launched_by": "x y;rm"})),
+            "system"
+        );
+        let t = Some("tnt:a");
+        assert!(node_requirements_met(None, None, None, None));
+        assert!(node_requirements_met(t, Some("cloud"), t, Some("cloud")));
+        assert!(!node_requirements_met(t, Some("cloud"), t, Some("archi")));
+        assert!(!node_requirements_met(
+            t,
+            Some("cloud"),
+            Some("tnt:b"),
+            Some("cloud")
+        ));
+        assert!(
+            !node_requirements_met(t, None, None, None),
+            "a missing node meets nothing"
+        );
+        assert!(!node_requirements_met(None, Some("cloud"), t, None));
+    }
+
+    #[test]
+    fn a_stop_clears_the_relaunch_and_a_start_sets_it() {
+        let root =
+            std::env::temp_dir().join(format!("fluxbee-relaunch-{}", Uuid::new_v4().simple()));
+        std::fs::create_dir_all(&root).expect("dir");
+        let path = root.join("config.json");
+        std::fs::write(
+            &path,
+            serde_json::json!({"a": 1, "_system": {"relaunch_on_boot": true}}).to_string(),
+        )
+        .expect("write");
+        let read = || -> serde_json::Value {
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap()
+        };
+        persist_node_relaunch_on_boot(&path, false).expect("stop");
+        assert_eq!(read()["_system"]["relaunch_on_boot"], false);
+        assert_eq!(read()["a"], 1);
+        // The relaunches only take nodes that keep the flag.
+        assert!(persisted_managed_node_from_config_value(
+            "IO.x@motherbee",
+            "IO",
+            path.clone(),
+            &serde_json::json!({"_system": {"runtime": "io.x", "runtime_version": "1", "relaunch_on_boot": false}}),
+            true,
+        )
+        .expect("parse")
+        .is_none());
+        persist_node_relaunch_on_boot(&path, true).expect("start");
+        assert_eq!(read()["_system"]["relaunch_on_boot"], true);
+        std::fs::write(&path, "{}").expect("no system block");
+        assert!(persist_node_relaunch_on_boot(&path, false).is_err());
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -23534,6 +33465,26 @@ blob:
         assert!(removed_kind_dir);
         assert!(!removed_path.exists());
         assert!(!root.join("AI").exists());
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_purged_node_takes_its_uuid_file_and_only_its_own() {
+        let root = std::env::temp_dir().join(format!(
+            "fluxbee-remove-node-uuid-{}",
+            Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&root).expect("create uuid root");
+        std::fs::write(root.join("AI.sales.uuid"), Uuid::new_v4().to_string()).expect("uuid 1");
+        std::fs::write(root.join("AI.support.uuid"), Uuid::new_v4().to_string()).expect("uuid 2");
+
+        assert!(remove_node_uuid_file_with_root("AI.sales@motherbee", &root).expect("remove"));
+        assert!(!root.join("AI.sales.uuid").exists());
+        assert!(root.join("AI.support.uuid").exists());
+        // Already gone: not an error.
+        assert!(!remove_node_uuid_file_with_root("AI.sales@motherbee", &root).expect("again"));
+        assert!(remove_node_uuid_file_with_root("../etc@motherbee", &root).is_err());
 
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -23696,31 +33647,38 @@ blob:
         .expect("write broken config");
 
         let nodes = persisted_custom_nodes_with_root(&root).expect("load persisted nodes");
-        assert_eq!(nodes.len(), 2);
+        // RT.* names are the router's own (D12): neither RT.gateway nor RT.edge.buffer relaunch.
+        assert_eq!(nodes.len(), 1);
         assert_eq!(nodes[0].node_name, "AI.keep.test@motherbee");
         assert_eq!(nodes[0].runtime, "ai.keep.test");
         assert_eq!(nodes[0].runtime_version, "1.0.0-diag");
-        assert_eq!(nodes[1].node_name, "RT.edge.buffer@motherbee");
-        assert_eq!(nodes[1].runtime, "rt.edge.buffer");
-        assert_eq!(nodes[1].runtime_version, "1.2.3");
 
         let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
-    fn managed_spawn_disallowed_reason_blocks_sy_and_rt_gateway_only() {
+    fn managed_spawn_disallowed_reason_blocks_sy_and_rt() {
         assert_eq!(
             managed_spawn_disallowed_reason("SY.admin@motherbee"),
             Some("managed spawn does not support SY.* nodes")
         );
-        assert_eq!(
-            managed_spawn_disallowed_reason("RT.gateway@motherbee"),
-            Some("managed spawn does not support RT.gateway; it is core hive infrastructure")
-        );
-        assert_eq!(
-            managed_spawn_disallowed_reason("RT.edge.buffer@motherbee"),
-            None
-        );
+        // The RT. prefix is the router's own (D12): a tenant's ai.generic node cannot pose as a
+        // router's stream, nor take its name first.
+        for name in [
+            "RT.gateway@motherbee",
+            "RT.edge.buffer@motherbee",
+            "RT.gateway.stream@worker1",
+            "RT.disguised@motherbee",
+        ] {
+            assert_eq!(
+                managed_spawn_disallowed_reason(name),
+                Some(
+                    "managed spawn does not support RT.* nodes; the RT. prefix is the router's own"
+                ),
+                "{name}"
+            );
+        }
+        assert_eq!(managed_spawn_disallowed_reason("AI.sales@worker1"), None);
         assert_eq!(
             managed_spawn_disallowed_reason("SY.frontdesk.gov@motherbee"),
             Some("managed spawn does not support SY.* nodes")
@@ -24477,6 +34435,41 @@ blob:
     }
 
     #[test]
+    fn runtime_package_files_preflight_waits_for_the_package_json() {
+        let root = std::env::temp_dir().join(format!("fluxbee-pkg-files-{}", Uuid::new_v4()));
+        let package_dir = root.join("wf.w1probe").join("0.0.1");
+        let check = |package_type: &str| {
+            runtime_package_files_preflight(
+                &root,
+                "wf.w1probe",
+                "0.0.1",
+                package_type,
+                "worker1",
+                "WF.w1probe@worker1",
+                serde_json::json!({}),
+            )
+        };
+        // The directory can land before its files: that is not "present" yet.
+        fs::create_dir_all(package_dir.join("flow")).expect("package dir");
+        let out = check("workflow").expect_err("no package.json yet must refuse the spawn");
+        assert_eq!(out["error_code"], "RUNTIME_NOT_PRESENT");
+
+        // A workflow package also waits for its definition (A-68): the WF node would otherwise
+        // start without one and wait in FAILED_CONFIG, with nothing to retry it.
+        fs::write(package_dir.join("package.json"), "{}").expect("package.json");
+        let out = check("workflow").expect_err("no definition yet must refuse the spawn");
+        assert_eq!(out["error_code"], "RUNTIME_NOT_PRESENT");
+        assert!(out["expected_path"]
+            .as_str()
+            .is_some_and(|path| path.ends_with("flow/definition.json")));
+        check("config_only").expect("a config-only package is here with its package.json");
+
+        fs::write(package_dir.join("flow").join("definition.json"), "{}").expect("definition");
+        check("workflow").expect("with its definition the workflow package is here");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn verify_runtime_current_artifacts_with_root_config_only_requires_runtime_base_start_script() {
         let root = std::env::temp_dir().join(format!("fluxbee-verify-{}", Uuid::new_v4()));
         let runtime = "ai.agent.config";
@@ -24936,6 +34929,7 @@ blob:
             &state,
             &serde_json::json!({
                 "tenant_id": "tnt:request",
+                "launched_by": "cloud",
                 "config": {
                     "temperature": 0.9,
                     "model": "gpt-5"
@@ -24979,6 +34973,12 @@ blob:
         assert_eq!(
             config["_system"]["package_path"],
             serde_json::json!(package_path)
+        );
+        // Who launched it, as SY.admin stamped it (stage 4, docs/ilk-tenant-model-v1.md §2.4).
+        assert_eq!(config["_system"]["launched_by"], serde_json::json!("cloud"));
+        assert_eq!(
+            config["_system"]["relaunch_on_boot"],
+            serde_json::json!(true)
         );
 
         let _ = fs::remove_dir_all(root);
@@ -25127,12 +35127,127 @@ blob:
         assert!(out.get("_system").is_none());
     }
 
+    /// REGRESION: `systemd_unit_exists` le agrega `.service` al nombre, asi que pasarle uno que
+    /// YA lo tiene pregunta por `<unit>.service.service` — siempre "not-found". Ese doble sufijo
+    /// hizo que `clear_stale_transient_unit` saliera por el guard sin limpiar nada, y el relanzamiento
+    /// siguio muriendo con "Unit ... was already loaded" en el upgrade 0.1.3 -> 0.1.4.
+    #[test]
+    fn unit_names_are_not_double_suffixed() {
+        // La forma que produce el codigo real, sin sufijo.
+        let bare = unit_from_node_name("IO.api@motherbee");
+        assert!(
+            !bare.ends_with(".service"),
+            "unit_from_node_name debe devolver el nombre pelado, obtuvo {bare}"
+        );
+        // Y si alguien igual pasa la forma con sufijo, debe normalizarse a una sola.
+        let suffixed = format!("{bare}.service");
+        assert_eq!(suffixed.strip_suffix(".service").unwrap_or(&suffixed), bare);
+    }
+
+    /// U-10: la INTENCION se persiste aparte de su resolucion.
+    ///
+    /// `fluxbee-firstboot` spawnea todo nodo boot=true con `runtime_version: "current"`. Antes,
+    /// esa palabra se resolvia una vez y se tiraba: solo quedaba la version concreta, horneada
+    /// en la ruta de la unit. Cuando un upgrade del .deb reemplazaba el directorio del runtime,
+    /// la ruta quedaba colgada (203/EXEC) y `restart_node` respondia RUNTIME_NOT_AVAILABLE.
+    #[test]
+    fn system_block_keeps_the_requested_version_apart_from_the_resolved_one() {
+        let system = build_node_system_block(
+            "IO.api@motherbee",
+            "motherbee",
+            Some("io.api"),
+            Some("0.1.2"),     // a lo que resolvio
+            Some("current"),   // lo que se pidio
+            None,
+            None,
+            None,
+            None,
+            1,
+        );
+        assert_eq!(system["runtime_version"], serde_json::json!("0.1.2"));
+        assert_eq!(
+            system["requested_runtime_version"],
+            serde_json::json!("current"),
+            "la palabra del que pidio no se puede perder"
+        );
+    }
+
+    /// Quien no nombra version quiso la current — y es lo que hace firstboot.
+    #[test]
+    fn an_unnamed_version_defaults_to_current() {
+        let system = build_node_system_block(
+            "AI.chat@motherbee",
+            "motherbee",
+            Some("ai.generic"),
+            Some("0.1.2"),
+            None,
+            None,
+            None,
+            None,
+            None,
+            1,
+        );
+        assert_eq!(
+            system["requested_runtime_version"],
+            serde_json::json!("current")
+        );
+    }
+
+    /// Un pin explicito se respeta: ese nodo NO sigue al puntero.
+    #[test]
+    fn an_explicit_pin_does_not_follow_the_pointer() {
+        let pinned = PersistedManagedNode {
+            node_name: "IO.api@motherbee".to_string(),
+            kind: "IO".to_string(),
+            runtime: "io.api".to_string(),
+            runtime_version: "0.1.1".to_string(),
+            requested_runtime_version: "0.1.1".to_string(),
+            config_path: PathBuf::from("/tmp/x/config.json"),
+            relaunch_on_boot: true,
+        };
+        assert!(!pinned.follows_current());
+
+        let following = PersistedManagedNode {
+            requested_runtime_version: "current".to_string(),
+            ..pinned.clone()
+        };
+        assert!(following.follows_current());
+    }
+
+    /// Un config viejo (anterior a U-10) no trae el campo. Debe leerse como "current", porque
+    /// esos nodos son justamente los que spawneo firstboot pidiendo current.
+    #[test]
+    fn a_config_without_the_field_is_read_as_following_current() {
+        let config = serde_json::json!({
+            "_system": {
+                "runtime": "io.api",
+                "runtime_version": "0.1.1",
+                "relaunch_on_boot": true,
+            }
+        });
+        let node = persisted_managed_node_from_config_value(
+            "IO.api@motherbee",
+            "IO",
+            PathBuf::from("/tmp/x/config.json"),
+            &config,
+            true,
+        )
+        .expect("parse must succeed")
+        .expect("node must be produced");
+        assert_eq!(node.runtime_version, "0.1.1");
+        assert!(
+            node.follows_current(),
+            "un nodo pre-U-10 debe volver a seguir el puntero, no quedar clavado en una version borrada"
+        );
+    }
+
     #[test]
     fn build_node_system_block_includes_runtime_base_and_package_path_when_provided() {
         let system = build_node_system_block(
             "AI.billing@worker-220",
             "worker-220",
             Some("ai.billing"),
+            Some("2.1.0"),
             Some("2.1.0"),
             Some("ai.generic"),
             Some("/var/lib/fluxbee/dist/runtimes/ai.billing/2.1.0"),
@@ -25153,6 +35268,7 @@ blob:
             "WF.demo.l1@worker-220",
             "worker-220",
             Some("wf.orch.diag"),
+            Some("current"),
             Some("current"),
             None,
             None,
@@ -25200,6 +35316,7 @@ blob:
             "AI.core@worker-220",
             "worker-220",
             Some("ai.core"),
+            Some("1.0.0"),
             Some("1.0.0"),
             None,
             None,
@@ -25501,5 +35618,36 @@ blob:
         ));
         assert!(!should_purge_inactive_kill_target(true, None));
         assert!(!should_purge_inactive_kill_target(true, Some("   ")));
+    }
+
+    #[test]
+    fn syncthing_restarts_only_a_running_service_left_on_an_old_binary_or_unit() {
+        // active, binary_updated, unit_changed, runs_replaced_binary
+        assert!(syncthing_runs_stale(true, true, false, false));
+        assert!(syncthing_runs_stale(true, false, true, false));
+        // A restart an earlier call lost: nothing changed now, but the process runs a deleted file.
+        assert!(syncthing_runs_stale(true, false, false, true));
+        assert!(!syncthing_runs_stale(true, false, false, false));
+        // A stopped service starts on what is on disk: nothing to restart.
+        assert!(!syncthing_runs_stale(false, true, true, true));
+    }
+
+    #[test]
+    fn vendor_update_reports_what_it_did() {
+        let installed_and_restarted = vendor_update_result(SyncthingRuntimeOutcome {
+            binary_updated: true,
+            restarted: true,
+        });
+        assert_eq!(installed_and_restarted.updated, vec!["syncthing"]);
+        assert!(installed_and_restarted.unchanged.is_empty());
+        assert_eq!(
+            installed_and_restarted.restarted,
+            vec![SYNCTHING_SERVICE_NAME]
+        );
+
+        let nothing_new = vendor_update_result(SyncthingRuntimeOutcome::default());
+        assert!(nothing_new.updated.is_empty());
+        assert_eq!(nothing_new.unchanged, vec!["syncthing"]);
+        assert!(nothing_new.restarted.is_empty());
     }
 }

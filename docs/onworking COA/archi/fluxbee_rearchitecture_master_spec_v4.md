@@ -263,7 +263,7 @@ Contains only information needed by the reconciler for the currently supported s
 - nodes
 - routing
 - WF deployment state that is part of the solution
-- OPA deployment state that is part of the solution
+- the user OPA policy, when the solution needs one (`desired_state.opa`: `rego_source`, `entrypoint`, `ownership`). There is one user policy for every hive, so it names no hive; when several solutions declare one, the last one applied wins (2026-10-01, `lab/logbook/FINDINGS.md` A-23)
 - ownership markers if needed
 
 Explicitly out of scope for this architecture version:
@@ -438,7 +438,7 @@ Snapshot v1 covers the exact solution scope supported by this architecture versi
 - routes
 - VPNs
 - WF deployed workflows / workflow status
-- OPA deployed policy state sufficient to decide apply / update / no-op
+- the user OPA policy running on every hive, read once from the motherbee, with the solution whose saved manifest declared it, sufficient to decide apply / update / clear / no-op
 
 Snapshot v1 explicitly excludes:
 
@@ -464,7 +464,7 @@ Recommended admin reads for snapshot v1:
 - `/hives/{hive}/vpns`
 - `wf_rules_list_workflows`
 - `wf_rules_get_status` for each workflow in scope when needed to disambiguate drift
-- canonical OPA read/status action(s) sufficient to decide whether desired OPA state is absent, matches, or must be reapplied
+- (global, once) `opa_get_policy` on the motherbee: the user policy is the same on every hive
 - optional `/hives/{hive}/versions` when runtime/version drift must be confirmed
 
 The concrete implementation may use direct admin actions rather than HTTP-like paths, but the snapshot contract must expose which source produced which section.
@@ -496,6 +496,13 @@ The concrete implementation may use direct admin actions rather than HTTP-like p
       "routes": {...},
       "vpns": {...}
     }
+  },
+  "opa": {
+    "version": 12,
+    "hash": "sha256:...",
+    "rego": "package router ...",
+    "entrypoint": "router/target",
+    "declared_by": "solution-a"
   },
   "completeness": {
     "is_partial": true,
@@ -636,8 +643,8 @@ This table must be treated as a frozen contract.
 | `WF_DEPLOY_APPLY` | workflow missing or changed and no restart required beyond deploy semantics | `wf_rules_compile_apply` |
 | `WF_DEPLOY_RESTART` | workflow change requires deploy plus explicit node restart semantics | `wf_rules_compile_apply` -> `restart_node` |
 | `WF_REMOVE` | workflow solution-owned deployment removed | canonical workflow remove/delete action when available, otherwise blocked until such action is defined |
-| `OPA_APPLY` | OPA state missing or changed | `opa_compile_apply` |
-| `OPA_REMOVE` | solution-owned OPA state removed | canonical OPA remove action when available, otherwise blocked until such action is defined |
+| `OPA_APPLY` | the declared user policy is not the one running (none running, or another rego) | `opa_compile_apply` (global: no hive) |
+| `OPA_REMOVE` | the solution no longer declares the user policy, and the running one is still its own | `opa_clear` (global: no hive) |
 
 ### 7.5 Deterministic semantics behind class selection
 

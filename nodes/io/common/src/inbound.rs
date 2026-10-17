@@ -20,6 +20,19 @@ pub struct InboundConfig {
     pub dst_node: Option<String>,
     pub provision_on_miss: bool,
     pub blob_runtime: Option<IoBlobRuntimeConfig>,
+    /// The tenant this node runs as. Every external user it lets in belongs to it.
+    ///
+    /// An external channel message carries no tenant of its own: a Slack user id or a phone
+    /// number says who wrote, not who pays. The owner is the tenant that launched the node, and
+    /// the external identity is part of that tenant's cost.
+    ///
+    /// It lives HERE, not at each call site, because the call sites got it wrong the same way:
+    /// io.slack and io.wapp both passed `tenant_id: None` with a `tenant_hint` that nothing ever
+    /// read, so `stable_ich_id` received an empty tenant and identity refused the seed —
+    /// provisioning could never succeed and EVERY external user entered the mesh with a null
+    /// src_ilk. Filling it in the shared processor makes that impossible to forget in the next
+    /// IO node too.
+    pub self_tenant_id: Option<String>,
 }
 
 impl Default for InboundConfig {
@@ -30,6 +43,7 @@ impl Default for InboundConfig {
             dedup_max_entries: 50_000,
             dst_node: None,
             provision_on_miss: true,
+            self_tenant_id: None,
             blob_runtime: Some(IoBlobRuntimeConfig::default()),
         }
     }
@@ -53,6 +67,7 @@ pub struct InboundProcessor {
     ttl: u32,
     dst_node: Option<String>,
     provision_on_miss: bool,
+    self_tenant_id: Option<String>,
     dedup: DedupCache,
     stats: InboundStats,
 }
@@ -75,6 +90,7 @@ impl InboundProcessor {
             ttl,
             dst_node,
             provision_on_miss: config.provision_on_miss,
+            self_tenant_id: config.self_tenant_id,
             dedup,
             stats: InboundStats::default(),
         }
@@ -148,6 +164,21 @@ impl InboundProcessor {
         meta_context: Value,
         payload: Value,
     ) -> InboundOutcome {
+        // The external identity belongs to the tenant that launched this node (see
+        // `InboundConfig::self_tenant_id`). An explicit tenant on the input still wins: io.api
+        // authenticates a principal and knows better than we do.
+        let mut identity_input = identity_input;
+        if identity_input
+            .tenant_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+            .is_none()
+        {
+            identity_input.tenant_id = self.self_tenant_id.clone();
+        }
+        let identity_input = identity_input;
+
         let trace_id = new_trace_id();
         let mut src_ilk = if let Some(src_ilk_override) = identity_input
             .src_ilk_override
@@ -259,6 +290,19 @@ mod tests {
     use crate::io_context::slack_inbound_io_context;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
+
+    /// Un provisionador que recuerda con que tenant lo llamaron.
+    struct CapturaTenant(std::sync::Mutex<Option<Option<String>>>);
+    #[async_trait::async_trait]
+    impl IdentityProvisioner for CapturaTenant {
+        async fn provision(
+            &self,
+            input: &ResolveOrCreateInput,
+        ) -> Result<Option<String>, IdentityError> {
+            *self.0.lock().unwrap() = Some(input.tenant_id.clone());
+            Ok(Some("ilk:provisionado".to_string()))
+        }
+    }
 
     struct AlwaysMiss;
     impl IdentityResolver for AlwaysMiss {
@@ -645,4 +689,86 @@ mod tests {
         assert_eq!(msg.meta.src_ilk.as_deref(), Some("ilk:override:test"));
         assert_eq!(calls.load(Ordering::SeqCst), 0);
     }
+
+    /// El usuario externo pertenece al tenant que lanzo el nodo.
+    ///
+    /// Un mensaje de un canal externo no trae tenant propio: un user id de Slack o un telefono
+    /// dicen quien escribio, no quien paga. Antes io.slack e io.wapp mandaban `tenant_id: None`
+    /// con un `tenant_hint` que nadie leia, asi que la semilla del ICH llegaba con tenant vacio,
+    /// identity la rechazaba, y TODO usuario externo entraba con src_ilk nulo.
+    #[tokio::test]
+    async fn el_usuario_externo_hereda_el_tenant_del_nodo() {
+        let captura = CapturaTenant(std::sync::Mutex::new(None));
+        let mut proc = InboundProcessor::new(
+            "uuid-test",
+            InboundConfig {
+                self_tenant_id: Some("tnt:1111".to_string()),
+                ..InboundConfig::default()
+            },
+        );
+        let input = ResolveOrCreateInput {
+            channel: "slack".to_string(),
+            external_id: "T:U".to_string(),
+            src_ilk_override: None,
+            tenant_id: None,
+            tenant_hint: Some("T0WORKSPACE".to_string()),
+            attributes: serde_json::json!({}),
+            ilk_type: Some("human".to_string()),
+        };
+        let _ = proc
+            .process_message_parts(
+                &AlwaysMiss,
+                Some(&captura),
+                input,
+                None,
+                serde_json::json!({}),
+                serde_json::json!({"type":"text","content":"hola"}),
+            )
+            .await;
+
+        let visto = captura.0.lock().unwrap().clone();
+        assert_eq!(
+            visto,
+            Some(Some("tnt:1111".to_string())),
+            "el provisioning tiene que recibir el tenant del nodo, no vacio"
+        );
+    }
+
+    /// Un tenant explicito en el input GANA: io.api autentica un principal y sabe mejor.
+    #[tokio::test]
+    async fn un_tenant_explicito_le_gana_al_del_nodo() {
+        let captura = CapturaTenant(std::sync::Mutex::new(None));
+        let mut proc = InboundProcessor::new(
+            "uuid-test",
+            InboundConfig {
+                self_tenant_id: Some("tnt:1111".to_string()),
+                ..InboundConfig::default()
+            },
+        );
+        let input = ResolveOrCreateInput {
+            channel: "api".to_string(),
+            external_id: "principal".to_string(),
+            src_ilk_override: None,
+            tenant_id: Some("tnt:9999".to_string()),
+            tenant_hint: None,
+            attributes: serde_json::json!({}),
+            ilk_type: Some("human".to_string()),
+        };
+        let _ = proc
+            .process_message_parts(
+                &AlwaysMiss,
+                Some(&captura),
+                input,
+                None,
+                serde_json::json!({}),
+                serde_json::json!({"type":"text","content":"hola"}),
+            )
+            .await;
+
+        assert_eq!(
+            captura.0.lock().unwrap().clone(),
+            Some(Some("tnt:9999".to_string()))
+        );
+    }
+
 }

@@ -449,7 +449,7 @@ The resulting zip is the file you upload in Step 4.
 
 Open Archi in your browser (default `http://127.0.0.1:3000`).
 
-The left rail switches between sections; pick the chat-bubble icon (default landing) to access the operator chat. The list-with-lightning icon below it opens **Messages**, a read-only viewer of the system-wide ILK message log persisted by storage in `storage_inbox`. Messages requires a one-time CONFIG SET pointing at storage's database (`fluxbee_storage`); see [docs/onworking COA/archi/handbook_fluxbee.md §6.5](docs/onworking%20COA/archi/handbook_fluxbee.md) and [admin_help_reference.md `architect_local_config_set`](docs/onworking%20COA/archi/admin_help_reference.md) for the field shape.
+The left rail switches between sections; pick the chat-bubble icon (default landing) to access the operator chat. The list-with-lightning icon below it opens **Messages**, a read-only viewer of the system-wide ILK message log persisted by storage in `turns`. Messages requires a one-time CONFIG SET pointing at storage's database (`fluxbee_storage`); see [docs/onworking COA/archi/handbook_fluxbee.md §6.5](docs/onworking%20COA/archi/handbook_fluxbee.md) and [admin_help_reference.md `architect_local_config_set`](docs/onworking%20COA/archi/admin_help_reference.md) for the field shape.
 
 In the left sidebar of the chat section, scroll to the **Publish Package** panel at the bottom.
 
@@ -845,12 +845,10 @@ Useful status fields:
 ```bash
 curl -sS "$BASE/config/storage"
 
-curl -sS -X PUT "$BASE/config/vpns" \
+# routes, VPN rules and taps are per hive: one rule per call
+curl -sS -X POST "$BASE/hives/motherbee/vpns" \
   -H "Content-Type: application/json" \
-  -d '{"vpns":[
-    {"pattern":"WF.echo","match_kind":"PREFIX","vpn_id":20},
-    {"pattern":"WF.listen","match_kind":"PREFIX","vpn_id":20}
-  ]}'
+  -d '{"pattern":"WF.echo","match_kind":"PREFIX","vpn_id":20}'
 ```
 
 For a larger command matrix and error smoke checks, see:
@@ -927,22 +925,15 @@ Current HTTP surface exposed by `SY.admin`.
 | `GET` | `/versions` | Effective versions (local or `?hive=`) |
 | `GET` | `/deployments` | Historical deployment entries (`?hive=`, `?category=`, `?limit=`) |
 | `GET` | `/drift-alerts` | Historical drift alert entries (`?hive=`, `?category=`, `?limit=`) |
-| `GET` | `/routes` | Read global routes |
-| `POST` | `/routes` | Add/update route entry |
-| `DELETE` | `/routes` | Delete route entry |
-| `GET` | `/vpns` | Read global VPN rules |
-| `POST` | `/vpns` | Add/update VPN rule |
-| `DELETE` | `/vpns` | Delete VPN rule |
-| `PUT` | `/config/routes` | Replace routes config |
-| `PUT` | `/config/vpns` | Replace VPN config |
 | `GET` | `/config/storage` | Read storage config |
 | `PUT` | `/config/storage` | Update storage config |
-| `GET` | `/config/storage/metrics` | Storage metrics passthrough |
-| `POST` | `/opa/policy` | Upload policy bundle |
-| `POST` | `/opa/policy/compile` | Compile policy |
-| `POST` | `/opa/policy/apply` | Apply compiled policy |
-| `POST` | `/opa/policy/rollback` | Roll back policy |
-| `POST` | `/opa/policy/check` | Validate policy inputs |
+| `GET` | `/config/storage/metrics` | SY.storage inbox metrics (`STORAGE_METRICS_GET` over the mesh) |
+| `POST` | `/opa/policy` | Compile the user OPA policy on the motherbee and apply it on every hive |
+| `POST` | `/opa/policy/compile` | Compile the user policy (motherbee) |
+| `POST` | `/opa/policy/apply` | Apply a compiled version on every hive |
+| `POST` | `/opa/policy/rollback` | Roll the user policy back on every hive |
+| `POST` | `/opa/policy/clear` | Remove the user policy from every hive |
+| `POST` | `/opa/policy/check` | Validate a policy without applying it |
 | `GET` | `/opa/policy` | Read current policy state |
 | `GET` | `/opa/status` | OPA runtime status |
 | `GET` | `/modules` | List modules |
@@ -962,6 +953,9 @@ Current HTTP surface exposed by `SY.admin`.
 | `GET` | `/hives/{hive}/vpns` | List VPN rules for hive |
 | `POST` | `/hives/{hive}/vpns` | Add/update VPN rule on hive |
 | `DELETE` | `/hives/{hive}/vpns/{pattern}` | Delete VPN rule by pattern |
+| `GET` | `/hives/{hive}/taps` | List taps for hive |
+| `POST` | `/hives/{hive}/taps` | Add a tap on hive |
+| `DELETE` | `/hives/{hive}/taps` | Delete a tap (`?match_src=&match_dst=&target=`) |
 | `GET` | `/hives/{hive}/nodes` | List nodes on hive |
 | `POST` | `/hives/{hive}/nodes` | Spawn node on hive |
 | `DELETE` | `/hives/{hive}/nodes/{name}` | Kill node on hive |
@@ -972,6 +966,7 @@ Current HTTP surface exposed by `SY.admin`.
 | `POST` | `/hives/{hive}/nodes/{name}/messages` | Send a direct debug message to one node |
 | `POST` | `/hives/{hive}/nodes/{name}/control/config-get` | Request node-owned control-plane contract/config (`CONFIG_GET`) |
 | `POST` | `/hives/{hive}/nodes/{name}/control/config-set` | Apply node-owned control-plane config (`CONFIG_SET`) |
+| `GET` | `/hives/{hive}/streams` | Status of the hive's router streams (`STREAM_STATUS` of each `RT.*.stream@<hive>`) |
 | `GET` | `/hives/{hive}/identity/ilks` | List ILKs on hive (compact identity view) |
 | `GET` | `/hives/{hive}/identity/ilks/{ilk_id}` | Read one ILK with resolved tenant/alias detail |
 | `POST` | `/hives/{hive}/identity/ilks/{ilk_id}/definition` | Set cognitive definition hashes for one agent ILK |
@@ -985,13 +980,8 @@ Current HTTP surface exposed by `SY.admin`.
 | `GET` | `/hives/{hive}/versions` | Effective versions for hive |
 | `GET` | `/hives/{hive}/deployments` | Historical deployment entries targeting hive |
 | `GET` | `/hives/{hive}/drift-alerts` | Historical drift alert entries for hive |
-| `POST` | `/hives/{hive}/opa/policy` | Upload policy for hive |
-| `POST` | `/hives/{hive}/opa/policy/compile` | Compile policy for hive |
-| `POST` | `/hives/{hive}/opa/policy/apply` | Apply policy on hive |
-| `POST` | `/hives/{hive}/opa/policy/rollback` | Roll back policy on hive |
-| `POST` | `/hives/{hive}/opa/policy/check` | Validate policy on hive |
-| `GET` | `/hives/{hive}/opa/policy` | Read policy state on hive |
-| `GET` | `/hives/{hive}/opa/status` | OPA status on hive |
+| `GET` | `/hives/{hive}/opa/policy` | User policy the hive runs: version and hash (the rego on the motherbee only) |
+| `GET` | `/hives/{hive}/opa/status` | User policy status on the hive (`in_sync`, `waiting`, …; see `docs/opa-distribution.md`) |
 
 Notes:
 
@@ -1024,7 +1014,6 @@ This is the effective port map for current deployments.
 | `21027` | UDP | LAN discovery | Syncthing local discovery | peer-to-peer LAN |
 | `8080` | TCP | local | `SY.admin` HTTP API | local host (`127.0.0.1` by default) |
 | `8384` | TCP | local | Syncthing API/GUI | local host (`127.0.0.1` by default) |
-| `4222` | TCP | local | Embedded NATS | local host (`127.0.0.1` by default) |
 | `22` | TCP | ops/bootstrap | SSH bootstrap/maintenance channel | worker host SSH daemon |
 
 **Firewall behavior in `SY.orchestrator`:**
@@ -1159,10 +1148,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 | Tool | Path | Purpose |
 |---|---|---|
 | Node connection | `fluxbee_sdk::{connect, NodeConfig}` | Connect node to router (split sender/receiver) |
-| Tunable connection config | `fluxbee_sdk::ClientConfig` + `connect_with_client_config` | Configure retry/backoff/keepalive/timeouts for node-router sessions |
 | Protocol types | `fluxbee_sdk::protocol` | Build/route messages (`Message`, `Routing`, `Destination`, `Meta`) |
 | Typed payloads | `fluxbee_sdk::payload::TextV1Payload` | Canonical `text/v1` payload (`content`, `content_ref`, `attachments`) |
-| NATS client wrappers | `fluxbee_sdk::nats` | Request/reply, publish/subscribe and timeout/reconnect-aware helpers |
+| Router stream | `fluxbee_sdk::stream` | `append` sends `STREAM_APPEND` to the node's own router (fire and forget; the router keeps only the subjects that producer may append), plus the `STREAM_BATCH`/`STREAM_ACK` wire contract |
 | Blob toolkit | `fluxbee_sdk::blob::BlobToolkit` | `put`, `put_bytes`, `promote`, `resolve`, `resolve_with_retry`, GC |
 | Blob confirmed publish | `fluxbee_sdk::blob::PublishBlobRequest` | `publish_blob_and_confirm` (`SYSTEM_SYNC_HINT` gate before emitting `blob_ref`) |
 | Blob metrics snapshot | `fluxbee_sdk::blob::BlobToolkit::metrics_snapshot` | Operational counters (`put/resolve/retry/errors/bytes`) |
@@ -1189,20 +1177,22 @@ Recommended for every new node/scaffold:
 - keep it enabled unless the runtime provides a custom status handler with the same contract.
 - this makes `GET /hives/{hive}/nodes/{name}/status` report `health_source=NODE_REPORTED` in normal operation.
 
-### Cognitive Data Access: Carrier vs NATS vs SHM
+### Cognitive Data Access: Carrier vs Router Stream vs SHM
 
-For the current cognition v2 implementation, cognitive data is exposed in three different ways:
+Cognition is per communication, `(thread_id, agent ILK)`: the thread between an interlocutor and the agent (`AI.*` node) that serves it. Cognitive data is exposed in three different ways:
 
 **1. Message carrier**, automatic for normal nodes:
 
 - `meta.thread_id`
-- `meta.thread_seq`
-- `meta.memory_package` (when local router enrichment finds data for that thread)
+- `meta.memory_package` (only on delivery to an `AI.*` node, when its router finds the memory of that communication)
 
-**2. NATS durable streams**, explicit subscription required:
+The message carries no sequence: the order of a communication is `SY.cognition`'s turn number.
 
-- `storage.turns`
-- `storage.cognition.*`
+**2. The router stream** (`RT.<router>.stream@<hive>`), the log plane: fixed sinks per subject, no subscription:
+
+- `storage.turns` → `SY.storage@motherbee` (table `turns`, the message log)
+- `cognition.turns` → `SY.cognition` of the same hive
+- `storage.cognition.batch` → `SY.storage@motherbee` (the `cognition_*` tables)
 
 **3. Local SHM** (`jsr-memory-<hive>`), not a normal application-node contract:
 
@@ -1212,18 +1202,18 @@ For the current cognition v2 implementation, cognitive data is exposed in three 
 
 **Practical rule:**
 
-- If you are writing a normal AI/IO/WF node, consume cognitive context from the delivered message (`meta.thread_id`, `meta.thread_seq`, `meta.memory_package`).
-- If you need raw durable cognition entities or replay semantics, subscribe explicitly with `fluxbee_sdk::nats`.
-- Do not assume that `storage.cognition.*` or SHM content is injected automatically into every node message.
+- If you are writing a normal AI/IO/WF node, consume cognitive context from the delivered message (`meta.thread_id`, `meta.memory_package`).
+- Raw durable cognition entities live in `SY.storage`'s `cognition_*` tables; only `SY.cognition` reads them back (`COGNITION_STATE_GET` over the mesh).
+- Do not assume that cognition entities or SHM content are injected automatically into every node message.
 - Do not use PostgreSQL as the primary integration surface for normal nodes.
 
 The canonical cognition boundary today is:
 
-- router publishes immutable input to `storage.turns`
-- `SY.cognition` consumes `storage.turns`
-- `SY.cognition` publishes derived durable entities to `storage.cognition.*`
-- `SY.storage` consumes those durable streams
-- router reads `jsr-memory` and attaches `memory_package` on local delivery
+- the router where a message enters copies it to its stream as `storage.turns`
+- the router where an agent is attached copies both directions of each turn with a `thread_id` to `cognition.turns`, for its hive's `SY.cognition`
+- `SY.cognition` appends its derived entities with `STREAM_APPEND` (`storage.cognition.batch`), and at start reloads its communications from `SY.storage` over the mesh
+- `SY.storage` takes the streams' batches into `storage_inbox` and writes `turns` and the `cognition_*` tables
+- router reads `jsr-memory` and attaches the communication's `memory_package` per destination, only to `AI.*` nodes; a package the sender put in is dropped
 
 ### Admin Internal Gateway from SDK (`ADMIN_COMMAND`)
 

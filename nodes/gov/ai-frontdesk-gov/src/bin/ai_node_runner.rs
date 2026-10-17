@@ -1,44 +1,42 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::fs;
-use std::fs::OpenOptions;
-use std::io::Write;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 use async_trait::async_trait;
 use fluxbee_ai_sdk::{
     build_model_user_content_parts, build_reply_message_runtime_src, build_text_response,
     create_function_calling_model, create_llm_client, extract_response_envelope, extract_text,
-    resolve_model_input_from_payload_with_options, AiNode, AiProvider, FunctionCallingConfig,
-    FunctionCallingRunner, FunctionRunInput, FunctionTool, FunctionToolDefinition,
-    FunctionToolProvider, FunctionToolRegistry, HiveAiConfig, ImmediateConversationMemory,
-    LanceDbThreadStateStore, Message, ModelInputOptions, ModelSettings, NodeRuntime,
-    ResolvedModelInput, RetryPolicy, RuntimeConfig, ThreadStateStore, ThreadStateToolsProvider,
+    resolve_model_input_from_payload_with_options, AiAccount, AiNode, AiProvider,
+    FunctionCallingConfig, FunctionCallingRunner, FunctionRunInput, FunctionTool,
+    FunctionToolDefinition, FunctionToolProvider, FunctionToolRegistry, HiveAiConfig,
+    ImmediateConversationMemory, LanceDbThreadStateStore, Message, ModelInputOptions,
+    ModelSettings, NodeRuntime, ResolvedModelInput, RuntimeConfig, TenantSource, ThreadStateStore,
+    ThreadStateToolsProvider, UsageRecorder,
 };
 use fluxbee_sdk::protocol::{
     Destination, Meta, Routing, VaultSecretChangedPayload, VaultSecretInterest, MSG_TTL_EXCEEDED,
     MSG_UNREACHABLE, MSG_VAULT_SECRET_CHANGED, SYSTEM_KIND,
 };
 use fluxbee_sdk::{
-    managed_node_config_path, managed_node_name, NodeConfig, NodeUuidMode, OperationalRouteProfile,
-    RouteMatch, RouteTarget, RouterDispatcher, VaultCallerOwned, VaultClient,
+    managed_node_name, IdentityError, NodeConfig, NodeUuidMode, OperationalRouteProfile,
+    RouteMatch, RouteTarget, RouterDispatcher, RpcError, VaultCallerOwned, VaultClient,
+    MSG_ILK_REGISTER,
 };
-use fluxbee_sdk::{MSG_ILK_REGISTER, MSG_TNT_CREATE};
 use gov_common::{
     frontdesk_contract::{
         frontdesk_result_payload, parse_frontdesk_handoff_payload, FrontdeskHandoffPayload,
         FrontdeskResultPayload,
     },
-    gov_identity_config_from_env, identity_error_to_tool_payload, looks_like_tenant_id,
-    resolve_tenant_id_for_register, tenant_resolution_source, GovIdentityConfig,
-    GOV_IDENTITY_TENANT_ID_ENV,
+    gov_identity_config_from_env, identity_error_is_transient, identity_error_log_summary,
+    identity_error_to_tool_payload, resolve_case_tenant, GovIdentityConfig, CASE_TENANT_MISMATCH,
+    CASE_TENANT_MISSING, TENANT_ROOT_NOT_REGISTRABLE,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tokio::fs as tokio_fs;
 use tokio::sync::{Mutex, OwnedMutexGuard, RwLock};
-use tokio::task::JoinSet;
 use tracing_subscriber::EnvFilter;
 use uuid::Uuid;
 
@@ -93,10 +91,11 @@ STRICT NO-LOOP RULE:
   - If register_attempted==false:
     a) Call ilk_register with:
        - src_ilk (from context)
-       - identity_candidate {name,email,phone}
+       - identity_candidate {name,email,phone,company_name}
     b) If tool returns status=ok:
-       - call thread_state_delete
-       - send final success message
+       - set status=completed
+       - call thread_state_put
+       - send final success message (if merged=true: the person was already registered with that email, and this channel is now linked to that registration)
        - stop (do not ask confirmation again)
     c) If tool returns status=error:
        - set status=completed_error
@@ -123,7 +122,7 @@ ANTI-RECONFIRM RULE:
 - If status==awaiting_confirmation and the user reply is positive, do not restate the collected data and do not ask for confirmation again; call ilk_register immediately.
 - If registration already succeeded or failed terminally in the current turn, stop after the final message.
 
-Do not invent src_ilk or thread_id.
+Do not invent src_ilk.
 Keep replies short in Spanish.
 "#;
 
@@ -157,37 +156,24 @@ fn frontdesk_default_instructions_snapshot() -> Value {
 }
 
 #[derive(Debug, Deserialize)]
-struct RunnerConfig {
-    node: NodeSection,
-    #[serde(default)]
-    runtime: RuntimeSection,
-    behavior: BehaviorSection,
-}
-
-#[derive(Debug, Deserialize)]
 struct FrontdeskBootstrapHiveFile {
     hive_id: String,
     #[serde(default)]
     ai: Option<HiveAiConfig>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug)]
 struct NodeSection {
     name: String,
-    #[serde(default = "default_version")]
     version: String,
-    #[serde(default = "default_router_socket")]
     router_socket: String,
-    #[serde(default = "default_state_dir")]
     uuid_persistence_dir: String,
-    #[serde(default = "default_config_dir")]
     config_dir: String,
-    #[serde(default = "default_dynamic_config_dir")]
     dynamic_config_dir: String,
 }
 
-#[derive(Debug, Deserialize)]
-#[serde(default)]
+/// Runtime defaults materialized into the effective config (`materialize_runtime_defaults`).
+#[derive(Debug)]
 struct RuntimeSection {
     read_timeout_ms: u64,
     handler_timeout_ms: u64,
@@ -198,7 +184,6 @@ struct RuntimeSection {
     retry_initial_backoff_ms: u64,
     retry_max_backoff_ms: u64,
     metrics_log_interval_ms: u64,
-    #[serde(default)]
     immediate_memory: ImmediateMemorySection,
 }
 
@@ -211,26 +196,6 @@ struct ImmediateMemorySection {
     summary_max_chars: usize,
     summary_refresh_every_turns: usize,
     trim_noise_enabled: bool,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
-enum BehaviorSection {
-    Echo,
-    AiChat(OpenAiChatSection),
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct OpenAiChatSection {
-    #[serde(default)]
-    instructions: Option<InstructionsSourceConfig>,
-    #[serde(default)]
-    model_settings: Option<RunnerModelSettings>,
-    #[serde(default)]
-    base_url: Option<String>,
-    #[serde(default)]
-    capabilities: Option<BehaviorCapabilities>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -249,51 +214,8 @@ struct RunnerModelSettings {
     max_output_tokens: Option<u32>,
 }
 
-#[derive(Debug, Deserialize)]
-#[serde(untagged)]
-enum InstructionsSourceConfig {
-    // Backward-compatible short form:
-    // instructions: "You are concise"
-    Inline(String),
-    // Structured strategy:
-    // instructions:
-    //   source: file|env|inline|none
-    //   value: /path/file.txt | ENV_VAR | inline text
-    //   trim: true|false (default true)
-    Strategy(InstructionsStrategy),
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct InstructionsStrategy {
-    source: InstructionsSourceKind,
-    #[serde(default)]
-    value: Option<String>,
-    #[serde(default = "default_trim_true")]
-    trim: bool,
-}
-
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-enum InstructionsSourceKind {
-    Inline,
-    File,
-    Env,
-    None,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct EffectiveStateFile {
-    schema_version: u32,
-    config_version: u64,
-    node_name: String,
-    config: EffectiveConfigDocument,
-    updated_at: String,
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 struct EffectiveConfigDocument {
-    #[serde(default)]
-    tenant_id: Option<String>,
     #[serde(default)]
     node: Option<EffectiveNodeSection>,
     #[serde(default)]
@@ -425,10 +347,6 @@ fn default_multimodal_for_runtime() -> bool {
     false
 }
 
-fn default_trim_true() -> bool {
-    true
-}
-
 #[derive(Debug, Clone)]
 enum NodeBehavior {
     Echo,
@@ -447,7 +365,6 @@ struct OpenAiChatRuntime {
 }
 
 struct GenericAiNode {
-    mode: RunnerMode,
     node_name: String,
     /// Deterministic self ILK resolved at boot via
     /// `fluxbee_sdk::identity::wait_for_self_system_ilk_id` from identity
@@ -457,20 +374,92 @@ struct GenericAiNode {
     /// `None` if SHM lookup failed at boot (degraded).
     self_ilk_id: Option<String>,
     behavior: Arc<RwLock<Option<NodeBehavior>>>,
-    config_dir: PathBuf,
-    dynamic_config_dir: PathBuf,
-    /// Router socket directory — kept for tracing/debug purposes only.
-    router_socket: PathBuf,
-    /// UUID persistence root — kept for tracing/debug purposes only.
-    state_dir: PathBuf,
     thread_state_store: Option<Arc<dyn ThreadStateStore>>,
     immediate_memory_store: Option<Arc<ImmediateMemoryStore>>,
     gov_identity: GovIdentityConfig,
     gov_identity_bridge: Option<Arc<GovIdentityBridge>>,
+    /// Where the tenant of a case comes from: the tenant SY.identity holds for its ILK.
+    ilk_tenant: IlkTenantLookup,
     /// Vault accessor over the canonical `Arc<RouterDispatcher>`.
     /// `None` when `self_ilk_id` / hive suffix is missing (degraded boot).
     vault: Option<VaultClient>,
     control_plane: Arc<RwLock<ControlPlaneState>>,
+    /// Where each model call's usage record goes (docs/router-stream-v1.md §7.2).
+    usage: UsageRecorder,
+}
+
+/// The tenant SY.identity holds for an ILK, `None` when it cannot be read. Production reads the
+/// identity SHM (`identity_shm_ilk_tenant`); tests stub it.
+type IlkTenantLookup = Arc<dyn Fn(&str) -> Option<String> + Send + Sync>;
+
+/// Reads the identity SHM of this node's hive, which SY.identity writes before it answers the
+/// ILK_PROVISION that created the temporary ILK.
+fn identity_shm_ilk_tenant(node_name: &str) -> IlkTenantLookup {
+    let hive_id = node_name
+        .split('@')
+        .nth(1)
+        .map(str::trim)
+        .filter(|hive_id| !hive_id.is_empty())
+        .map(ToString::to_string);
+    Arc::new(move |ilk_id: &str| {
+        let hive_id = hive_id.as_deref()?;
+        match fluxbee_sdk::identity::list_ilks_from_hive_id(hive_id) {
+            Ok(snapshot) => snapshot
+                .ilks
+                .into_iter()
+                .find(|ilk| ilk.ilk_id == ilk_id)
+                .map(|ilk| ilk.tenant_id),
+            Err(err) => {
+                tracing::warn!(
+                    ilk_id,
+                    error = %err,
+                    "identity SHM unreadable: the tenant of the case is unknown"
+                );
+                None
+            }
+        }
+    })
+}
+
+/// The tenant of a case (`resolve_case_tenant`): the one its ILK has, checked against the tenant a
+/// handoff informed.
+fn case_tenant_of(
+    ilk_tenant: &IlkTenantLookup,
+    src_ilk: Option<&str>,
+    informed_tenant: Option<&str>,
+) -> Result<String, &'static str> {
+    let tenant = src_ilk
+        .map(str::trim)
+        .filter(|ilk_id| !ilk_id.is_empty())
+        .and_then(|ilk_id| ilk_tenant(ilk_id));
+    resolve_case_tenant(tenant.as_deref(), informed_tenant)
+}
+
+/// The tool's answer when the case has no tenant to register into (unknown, contradicted, or the
+/// root tenant): no ILK_REGISTER is sent and no tenant is created.
+fn case_tenant_error_payload(error_code: &str) -> Value {
+    let message = if error_code == CASE_TENANT_MISMATCH {
+        "the tenant informed with the case is not the tenant of its ILK; nothing was registered"
+    } else if error_code == TENANT_ROOT_NOT_REGISTRABLE {
+        "the case belongs to the root tenant, where nobody registers; nothing was registered and the ILK stays temporary"
+    } else {
+        "the tenant of the case is unknown (its ILK's tenant could not be read); nothing was registered and no tenant was created"
+    };
+    json!({
+        "status": "error",
+        "error_code": error_code,
+        "message": message,
+        "retryable": false
+    })
+}
+
+fn missing_src_ilk_payload() -> Value {
+    json!({
+        "status": "error",
+        "error_code": "missing_src_ilk",
+        "message": "src_ilk is required",
+        "retryable": false
+    })
 }
 
 struct GovIdentityBridge {
@@ -487,51 +476,30 @@ impl GovIdentityBridge {
         identity: &GovIdentityConfig,
         action: &str,
         payload: Value,
-    ) -> std::result::Result<fluxbee_sdk::IdentitySystemResult, String> {
+    ) -> std::result::Result<fluxbee_sdk::IdentitySystemResult, IdentityError> {
         let first = self
             .send_action_once(&identity.target, action, payload.clone(), identity.timeout)
             .await;
-
-        match first {
+        // One retry on the fallback target when the target is not the identity primary or is not
+        // on the router. The fallback's reply goes through the same status check as the first one.
+        let use_fallback = match &first {
             Ok(out) => {
-                let status = out.payload.get("status").and_then(Value::as_str);
-                let error_code = out.payload.get("error_code").and_then(Value::as_str);
-                if status == Some("error") && error_code == Some("NOT_PRIMARY") {
-                    if let Some(fallback) = identity.fallback_target.as_deref() {
-                        if !fallback.trim().is_empty() && fallback != identity.target {
-                            return self
-                                .send_action_once(fallback, action, payload, identity.timeout)
-                                .await;
-                        }
-                    }
-                }
-                if status == Some("ok") {
-                    Ok(out)
-                } else {
-                    Err(format!(
-                        "identity action rejected: action={action}, error_code={}, message={}",
-                        error_code.unwrap_or("UNKNOWN"),
-                        out.payload
-                            .get("message")
-                            .and_then(Value::as_str)
-                            .unwrap_or("identity returned non-ok status")
-                    ))
-                }
+                out.payload.get("status").and_then(Value::as_str) == Some("error")
+                    && out.payload.get("error_code").and_then(Value::as_str) == Some("NOT_PRIMARY")
             }
-            Err(err) => {
-                let use_fallback = err.contains("original_dst=") && err.contains("NODE_NOT_FOUND");
-                if use_fallback {
-                    if let Some(fallback) = identity.fallback_target.as_deref() {
-                        if !fallback.trim().is_empty() && fallback != identity.target {
-                            return self
-                                .send_action_once(fallback, action, payload, identity.timeout)
-                                .await;
-                        }
-                    }
-                }
-                Err(err)
+            Err(IdentityError::Unreachable { reason, .. }) => reason == "NODE_NOT_FOUND",
+            Err(_) => false,
+        };
+        let reply = match identity.fallback_target.as_deref() {
+            Some(fallback)
+                if use_fallback && !fallback.trim().is_empty() && fallback != identity.target =>
+            {
+                self.send_action_once(fallback, action, payload, identity.timeout)
+                    .await
             }
-        }
+            _ => first,
+        };
+        identity_reply_outcome(action, reply?)
     }
 
     async fn send_action_once(
@@ -540,7 +508,7 @@ impl GovIdentityBridge {
         action: &str,
         payload: Value,
         timeout: Duration,
-    ) -> std::result::Result<fluxbee_sdk::IdentitySystemResult, String> {
+    ) -> std::result::Result<fluxbee_sdk::IdentitySystemResult, IdentityError> {
         let trace_id = Uuid::new_v4().to_string();
         let req = Message {
             routing: Routing {
@@ -571,7 +539,7 @@ impl GovIdentityBridge {
             .dispatcher
             .send_with_matcher(req, matcher, labels, timeout)
             .await
-            .map_err(|err| format!("identity send failed: {err}"))?;
+            .map_err(map_rpc_error_to_identity)?;
         Self::parse_identity_reply(msg, &expected_msg, target, trace_id)
     }
 
@@ -580,7 +548,7 @@ impl GovIdentityBridge {
         expected_msg: &str,
         target: &str,
         trace_id: String,
-    ) -> std::result::Result<fluxbee_sdk::IdentitySystemResult, String> {
+    ) -> std::result::Result<fluxbee_sdk::IdentitySystemResult, IdentityError> {
         if msg.meta.msg.as_deref() == Some(expected_msg) {
             return Ok(fluxbee_sdk::IdentitySystemResult {
                 payload: msg.payload,
@@ -599,9 +567,10 @@ impl GovIdentityBridge {
                 .get("reason")
                 .and_then(Value::as_str)
                 .unwrap_or("unknown");
-            return Err(format!(
-                "identity transport unreachable: reason={reason}, original_dst={original_dst}"
-            ));
+            return Err(IdentityError::Unreachable {
+                reason: reason.to_string(),
+                original_dst: original_dst.to_string(),
+            });
         }
         if msg.meta.msg.as_deref() == Some(MSG_TTL_EXCEEDED) {
             let original_dst = msg
@@ -614,15 +583,82 @@ impl GovIdentityBridge {
                 .get("last_hop")
                 .and_then(Value::as_str)
                 .unwrap_or_default();
-            return Err(format!(
-                "identity transport ttl exceeded: original_dst={original_dst}, last_hop={last_hop}"
-            ));
+            return Err(IdentityError::TtlExceeded {
+                original_dst: original_dst.to_string(),
+                last_hop: last_hop.to_string(),
+            });
         }
-        Err(format!(
+        Err(IdentityError::InvalidResponse(format!(
             "invalid identity response: expected {expected_msg} trace_id={trace_id}, got msg={:?}",
             msg.meta.msg
-        ))
+        )))
     }
+}
+
+/// SY.identity answered: `status:"ok"` is the success; any other status is a rejection carrying
+/// SY.identity's own `error_code` verbatim, so the caller classifies the code instead of guessing
+/// it from text.
+fn identity_reply_outcome(
+    action: &str,
+    out: fluxbee_sdk::IdentitySystemResult,
+) -> std::result::Result<fluxbee_sdk::IdentitySystemResult, IdentityError> {
+    if out.payload.get("status").and_then(Value::as_str) == Some("ok") {
+        return Ok(out);
+    }
+    Err(IdentityError::SystemRejected {
+        action: action.to_string(),
+        error_code: out
+            .payload
+            .get("error_code")
+            .and_then(Value::as_str)
+            .unwrap_or("UNKNOWN")
+            .to_string(),
+        message: out
+            .payload
+            .get("message")
+            .and_then(Value::as_str)
+            .unwrap_or("identity returned non-ok status")
+            .to_string(),
+    })
+}
+
+/// Same mapping as SY.orchestrator's identity calls.
+fn map_rpc_error_to_identity(err: RpcError) -> IdentityError {
+    match err {
+        RpcError::Node(err) => IdentityError::Node(err),
+        RpcError::Unreachable {
+            reason,
+            original_dst,
+        } => IdentityError::Unreachable {
+            reason,
+            original_dst,
+        },
+        RpcError::TtlExceeded {
+            original_dst,
+            last_hop,
+        } => IdentityError::TtlExceeded {
+            original_dst,
+            last_hop,
+        },
+        RpcError::Timeout {
+            trace_id,
+            target,
+            request_msg,
+            timeout_ms,
+            ..
+        } => IdentityError::ActionTimeout {
+            action: request_msg,
+            trace_id,
+            target,
+            timeout_ms,
+        },
+        RpcError::InvalidRequest(message) => IdentityError::InvalidRequest(message),
+        other => IdentityError::InvalidResponse(other.to_string()),
+    }
+}
+
+fn identity_bridge_missing() -> IdentityError {
+    IdentityError::InvalidRequest("identity bridge not initialized".to_string())
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -632,23 +668,27 @@ struct IlkRegisterIdentityCandidate {
     #[serde(default)]
     phone: Option<String>,
     #[serde(default)]
-    tenant_hint: Option<String>,
+    company_name: Option<String>,
+    /// Free-form extras (structured data Cloud supplies for a human). Stored verbatim into the
+    /// ilk's free-form JSONB `identification.attributes` — future ad-hoc fields go here.
+    #[serde(default)]
+    attributes: Option<Value>,
 }
 
+/// What the LLM (or the handoff path) passes. No tenant: it is the case's, never the person's.
 #[derive(Debug, Clone, Deserialize)]
 struct IlkRegisterArgs {
     src_ilk: String,
     identity_candidate: IlkRegisterIdentityCandidate,
-    #[serde(default)]
-    tenant_id: Option<String>,
-    #[serde(default)]
-    thread_id: Option<String>,
 }
 
 #[derive(Clone)]
 struct IlkRegisterTool {
     scoped_src_ilk: Option<String>,
-    default_tenant_id: Option<String>,
+    /// The tenant a `frontdesk_handoff` informed; it only has to agree with the ILK's tenant.
+    /// `None` on the conversational path.
+    informed_tenant_id: Option<String>,
+    ilk_tenant: IlkTenantLookup,
     identity: GovIdentityConfig,
     bridge: Option<Arc<GovIdentityBridge>>,
 }
@@ -657,6 +697,7 @@ struct IlkRegisterTool {
 struct BehaviorContext {
     thread_id: Option<String>,
     src_ilk: Option<String>,
+    trace_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -685,6 +726,8 @@ struct FrontdeskCollectedState {
     phone: Option<String>,
     #[serde(default)]
     company_name: Option<String>,
+    #[serde(default)]
+    attributes: Option<serde_json::Map<String, Value>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -852,6 +895,46 @@ impl AiNode for GenericAiNode {
         if is_control_plane(&msg) {
             return self.handle_control_plane(msg).await;
         }
+        let behavior_ctx = BehaviorContext {
+            thread_id: extract_thread_id(&msg),
+            src_ilk: extract_src_ilk(&msg),
+            trace_id: Some(msg.routing.trace_id.clone()),
+        };
+        // The human-registration flow has TWO methods, distinguished by the METHOD (not by being a
+        // human): the "auto" method arrives as a structured JSON `frontdesk_handoff` and runs
+        // DETERMINISTICALLY (ILK_REGISTER, no LLM); the conversational method is a human chatting so
+        // the frontdesk's LLM collects the data. The deterministic method must run even when the node
+        // has no behavior configured — a Cloud register_human cannot depend on an LLM being set up —
+        // so it is handled HERE, BEFORE the Configured/behavior gate that guards the LLM path.
+        if msg.meta.msg_type.eq_ignore_ascii_case("user") {
+            if let Some(handoff) = parse_frontdesk_handoff_payload(&msg.payload) {
+                tracing::info!(
+                    node_name = %self.node_name,
+                    trace_id = %msg.routing.trace_id,
+                    operation = %handoff.operation,
+                    "frontdesk: structured handoff → deterministic path (no LLM required)"
+                );
+                return Ok(Some(
+                    self.handle_frontdesk_handoff(&msg, &behavior_ctx, handoff)
+                        .await?,
+                ));
+            }
+            // A case of the root tenant can never be registered (nobody registers there), so the
+            // conversation does not start: the answer is final and needs neither the LLM nor
+            // SY.identity.
+            if let Some(result) = self.root_tenant_case_result(&behavior_ctx) {
+                tracing::warn!(
+                    node_name = %self.node_name,
+                    trace_id = %msg.routing.trace_id,
+                    src_ilk = ?behavior_ctx.src_ilk,
+                    error_code = TENANT_ROOT_NOT_REGISTRABLE,
+                    "frontdesk: a case of the root tenant (ilk NOT registered, stays temporary)"
+                );
+                return Ok(Some(build_frontdesk_result_reply(&msg, result)?));
+            }
+        }
+        // Everything past here is the conversational/LLM method, which DOES require the node
+        // Configured (a behavior/LLM) and a thread_id to track the data-collection dialogue.
         if msg.meta.msg_type.eq_ignore_ascii_case("user") {
             let state = self.control_plane.read().await.current_state;
             if state != NodeLifecycleState::Configured {
@@ -862,19 +945,28 @@ impl AiNode for GenericAiNode {
                 let payload = invalid_payload_missing_thread_id();
                 return Ok(Some(build_reply_message_runtime_src(&msg, payload)));
             }
-        }
-        let behavior_ctx = BehaviorContext {
-            thread_id: extract_thread_id(&msg),
-            src_ilk: extract_src_ilk(&msg),
-        };
-        if msg.meta.msg_type.eq_ignore_ascii_case("user") {
-            if self.mode == RunnerMode::Gov {
-                if let Some(handoff) = parse_frontdesk_handoff_payload(&msg.payload) {
-                    return Ok(Some(
-                        self.handle_frontdesk_handoff(&msg, &behavior_ctx, handoff)
-                            .await?,
-                    ));
-                }
+            // A user message that LOOKS like a handoff (type/subject/operation) but did NOT parse
+            // fell through to the conversational path — surface it loudly, else a Cloud register_human
+            // whose shape is off would be silently chatted at by the LLM instead of registered.
+            let looks_like_handoff = msg
+                .payload
+                .as_object()
+                .map(|o| {
+                    o.contains_key("type")
+                        || o.contains_key("subject")
+                        || o.contains_key("operation")
+                })
+                .unwrap_or(false);
+            if looks_like_handoff {
+                tracing::warn!(
+                    node_name = %self.node_name,
+                    trace_id = %msg.routing.trace_id,
+                    payload_keys = ?msg
+                        .payload
+                        .as_object()
+                        .map(|o| o.keys().cloned().collect::<Vec<_>>()),
+                    "frontdesk: payload looks like a handoff but did NOT parse → conversational path (check the handoff shape)"
+                );
             }
             let src_ilk_source = src_ilk_source(&msg);
             if behavior_ctx.src_ilk.is_none() {
@@ -922,23 +1014,23 @@ impl AiNode for GenericAiNode {
             (extract_text(&msg.payload).unwrap_or_default(), None)
         };
         if msg.meta.msg_type.eq_ignore_ascii_case("user") {
+            // No text preview and no sender id: the messages a frontdesk receives are the person's
+            // own identity data (name, email, phone).
             tracing::info!(
                 node_name = %self.node_name,
                 trace_id = %msg.routing.trace_id,
                 src_ilk = ?behavior_ctx.src_ilk,
-                sender = ?incoming_sender_hint(&msg),
+                sender_kind = ?incoming_sender_kind(&msg),
                 thread_id = ?behavior_ctx.thread_id,
                 input_len = input.len(),
-                input_preview = %text_preview(&input, 240),
                 "incoming user message"
             );
         }
-        let prior_frontdesk_state =
-            if self.mode == RunnerMode::Gov && msg.meta.msg_type.eq_ignore_ascii_case("user") {
-                Some(self.load_frontdesk_thread_state(&behavior_ctx).await?)
-            } else {
-                None
-            };
+        let prior_frontdesk_state = if msg.meta.msg_type.eq_ignore_ascii_case("user") {
+            Some(self.load_frontdesk_thread_state(&behavior_ctx).await?)
+        } else {
+            None
+        };
         let output = match &behavior {
             NodeBehavior::Echo => format!("Echo: {input}"),
             NodeBehavior::OpenAiChat(openai) => {
@@ -1029,7 +1121,7 @@ impl AiNode for GenericAiNode {
             }
         };
 
-        if self.mode == RunnerMode::Gov && msg.meta.msg_type.eq_ignore_ascii_case("user") {
+        if msg.meta.msg_type.eq_ignore_ascii_case("user") {
             let payload = self
                 .build_frontdesk_result_for_conversation(
                     &behavior_ctx,
@@ -1062,7 +1154,13 @@ impl GenericAiNode {
                     openai.provider
                 ))
             })?;
-        let client = create_llm_client(openai.provider, api_key.clone(), openai.base_url.clone());
+        let account = self.usage_account(ctx);
+        let client = create_llm_client(
+            openai.provider,
+            api_key.clone(),
+            openai.base_url.clone(),
+            account.clone(),
+        );
         let tool_registry = self.build_tool_registry(ctx)?;
         if !tool_registry.definitions().is_empty() {
             let model = create_function_calling_model(
@@ -1072,6 +1170,7 @@ impl GenericAiNode {
                 openai.model.clone(),
                 openai.instructions.clone(),
                 openai.model_settings.clone(),
+                account,
             );
             let runner = FunctionCallingRunner::new(FunctionCallingConfig::default());
             let immediate_memory = self.load_immediate_memory_for_input(openai, ctx).await;
@@ -1288,9 +1387,7 @@ impl GenericAiNode {
     ) -> fluxbee_ai_sdk::Result<FunctionToolRegistry> {
         let mut registry = FunctionToolRegistry::new();
         self.register_common_tools(&mut registry, ctx)?;
-        if self.mode == RunnerMode::Gov {
-            self.register_gov_tools(&mut registry, ctx)?;
-        }
+        self.register_gov_tools(&mut registry, ctx)?;
         Ok(registry)
     }
 
@@ -1318,9 +1415,11 @@ impl GenericAiNode {
         registry: &mut FunctionToolRegistry,
         ctx: &BehaviorContext,
     ) -> fluxbee_ai_sdk::Result<()> {
+        // Conversational: the tenant is only the ILK's (the thread state is the LLM's to write).
         let tool = IlkRegisterTool {
             scoped_src_ilk: ctx.src_ilk.clone(),
-            default_tenant_id: self.resolve_effective_tenant_id(),
+            informed_tenant_id: None,
+            ilk_tenant: self.ilk_tenant.clone(),
             identity: self.gov_identity.clone(),
             bridge: self.gov_identity_bridge.clone(),
         };
@@ -1376,6 +1475,36 @@ impl GenericAiNode {
         store.delete(src_ilk).await
     }
 
+    /// The final answer to a case of the root tenant, where nobody registers. `None` for any other
+    /// case, including one whose tenant cannot be read (its registration answers that).
+    /// The case's tenant pays for a conversation's calls (docs/router-stream-v1.md §7.3); the root
+    /// tenant, as `fallback_root`, while the case has none yet.
+    fn usage_account(&self, ctx: &BehaviorContext) -> AiAccount {
+        let case_tenant = case_tenant_of(&self.ilk_tenant, ctx.src_ilk.as_deref(), None).ok();
+        AiAccount::charge(
+            self.usage.clone(),
+            &self.node_name,
+            case_tenant,
+            TenantSource::Case,
+        )
+        .with_node_ilk(self.self_ilk_id.clone())
+        .with_counterpart(ctx.src_ilk.clone())
+        .with_trace(ctx.trace_id.clone())
+        .with_thread(ctx.thread_id.clone())
+    }
+
+    fn root_tenant_case_result(&self, ctx: &BehaviorContext) -> Option<FrontdeskResultPayload> {
+        match case_tenant_of(&self.ilk_tenant, ctx.src_ilk.as_deref(), None) {
+            Err(TENANT_ROOT_NOT_REGISTRABLE) => {
+                Some(build_frontdesk_result_from_register_response(
+                    &case_tenant_error_payload(TENANT_ROOT_NOT_REGISTRABLE),
+                    ctx.src_ilk.clone(),
+                ))
+            }
+            _ => None,
+        }
+    }
+
     async fn handle_frontdesk_handoff(
         &self,
         msg: &Message,
@@ -1397,6 +1526,12 @@ impl GenericAiNode {
                 "Unsupported frontdesk handoff operation: {}",
                 handoff.operation
             ));
+            tracing::warn!(
+                node_name = %self.node_name,
+                trace_id = %msg.routing.trace_id,
+                operation = %handoff.operation,
+                "frontdesk handoff: unsupported operation (not registered)"
+            );
             return build_frontdesk_result_reply(msg, result);
         }
 
@@ -1449,20 +1584,61 @@ impl GenericAiNode {
                     .as_ref()
                     .and_then(|state| state.collected.company_name.clone())
             });
-        let tenant_id = handoff
+        // The tenant of the case is the one SY.identity holds for its ILK; the handoff's tenant_id
+        // only has to agree with it. Without one, or when it is the root tenant (where nobody
+        // registers), nothing is registered and no tenant is created.
+        let informed_tenant_id = handoff
             .tenant_id
             .as_deref()
             .map(str::trim)
             .filter(|value| !value.is_empty())
-            .map(ToString::to_string)
-            .or_else(|| {
-                previous_state
-                    .as_ref()
-                    .and_then(|state| state.tenant_id.clone())
-            });
+            .map(ToString::to_string);
+        let tenant_id = match case_tenant_of(
+            &self.ilk_tenant,
+            ctx.src_ilk.as_deref(),
+            informed_tenant_id.as_deref(),
+        ) {
+            Ok(tenant_id) => tenant_id,
+            Err(error_code) => {
+                // Without src_ilk there is no case at all: that is an invalid request.
+                let error = if ctx.src_ilk.is_some() {
+                    case_tenant_error_payload(error_code)
+                } else {
+                    missing_src_ilk_payload()
+                };
+                tracing::warn!(
+                    node_name = %self.node_name,
+                    trace_id = %msg.routing.trace_id,
+                    src_ilk = ?ctx.src_ilk,
+                    informed_tenant_id = ?informed_tenant_id,
+                    error_code = error["error_code"].as_str().unwrap_or_default(),
+                    "frontdesk handoff: no tenant to register the case into (ilk NOT registered, no tenant created)"
+                );
+                let result =
+                    build_frontdesk_result_from_register_response(&error, ctx.src_ilk.clone());
+                return build_frontdesk_result_reply(msg, result);
+            }
+        };
+
+        // Merge free-form attributes across turns, symmetric with company_name: current handoff
+        // wins, else recover from the partial state collected on an earlier (incomplete) turn.
+        let attributes = handoff.subject.attributes.clone().or_else(|| {
+            previous_state
+                .as_ref()
+                .and_then(|state| state.collected.attributes.clone())
+        });
 
         let missing_fields = frontdesk_missing_fields(name.as_deref(), email.as_deref());
         if !missing_fields.is_empty() {
+            tracing::info!(
+                node_name = %self.node_name,
+                trace_id = %msg.routing.trace_id,
+                tenant_id = %tenant_id,
+                missing = ?missing_fields,
+                has_name = name.is_some(),
+                has_email = email.is_some(),
+                "frontdesk handoff incomplete → needs_input (ilk NOT registered)"
+            );
             let state = FrontdeskThreadState {
                 status: Some("collecting".to_string()),
                 collected: FrontdeskCollectedState {
@@ -1470,8 +1646,9 @@ impl GenericAiNode {
                     email: email.take(),
                     phone,
                     company_name,
+                    attributes,
                 },
-                tenant_id: tenant_id.clone(),
+                tenant_id: Some(tenant_id.clone()),
                 registration_status: previous_state
                     .as_ref()
                     .and_then(|state| state.registration_status.clone())
@@ -1487,14 +1664,15 @@ impl GenericAiNode {
             );
             payload.missing_fields = missing_fields;
             payload.ilk_id = ctx.src_ilk.clone();
-            payload.tenant_id = tenant_id;
+            payload.tenant_id = Some(tenant_id);
             payload.registration_status = Some("temporary".to_string());
             return build_frontdesk_result_reply(msg, payload);
         }
 
         let tool = IlkRegisterTool {
             scoped_src_ilk: ctx.src_ilk.clone(),
-            default_tenant_id: self.resolve_effective_tenant_id(),
+            informed_tenant_id,
+            ilk_tenant: self.ilk_tenant.clone(),
             identity: self.gov_identity.clone(),
             bridge: self.gov_identity_bridge.clone(),
         };
@@ -1510,17 +1688,37 @@ impl GenericAiNode {
                 "name": registered_name,
                 "email": registered_email,
                 "phone": phone,
-                "tenant_hint": Value::Null
-            },
-            "tenant_id": tenant_id,
-            "thread_id": ctx.thread_id.clone()
+                "company_name": company_name,
+                "attributes": attributes
+            }
         });
         let register_payload = tool.call(register_arguments).await?;
-        let result =
+        let mut result =
             build_frontdesk_result_from_register_response(&register_payload, ctx.src_ilk.clone());
         if result.status == "ok" {
+            tracing::info!(
+                node_name = %self.node_name,
+                trace_id = %msg.routing.trace_id,
+                result_code = %result.result_code,
+                src_ilk = ?ctx.src_ilk,
+                ilk_id = ?result.ilk_id,
+                tenant_id = ?result.tenant_id,
+                registration_status = ?result.registration_status,
+                "frontdesk handoff REGISTERED (ILK_REGISTER complete)"
+            );
             self.delete_frontdesk_thread_state(ctx).await?;
         } else {
+            result.tenant_id.get_or_insert_with(|| tenant_id.clone());
+            // error_detail is not logged: it carries SY.identity's message, which can echo the
+            // submitted identification.
+            tracing::warn!(
+                node_name = %self.node_name,
+                trace_id = %msg.routing.trace_id,
+                result_code = %result.result_code,
+                error_code = ?result.error_code,
+                tenant_id = ?result.tenant_id,
+                "frontdesk handoff register FAILED (ilk stays temporary)"
+            );
             let state = FrontdeskThreadState {
                 status: Some("completed_error".to_string()),
                 collected: FrontdeskCollectedState {
@@ -1528,8 +1726,10 @@ impl GenericAiNode {
                     email,
                     phone,
                     company_name,
+                    attributes,
                 },
-                tenant_id: result.tenant_id.clone(),
+                // The case keeps its tenant, so a retried handoff still reports it.
+                tenant_id: Some(tenant_id),
                 registration_status: result.registration_status.clone(),
                 register_attempted: true,
                 register_error: Some(FrontdeskRegisterErrorState {
@@ -1596,10 +1796,16 @@ impl GenericAiNode {
             return Ok(payload);
         }
 
-        let mut payload = frontdesk_result_payload("ok", "REGISTERED", human_message);
+        // No thread_state was written this turn: the LLM chatted (greeting / asked for a field) but
+        // NO registration happened. Report the TRUTH — a non-terminal in-conversation turn — NOT a
+        // phantom REGISTERED. A genuine success persists status="completed" (prompt: put, not delete)
+        // and is caught by the Some(state)=="completed" branch above, so None here unambiguously
+        // means "no registration this turn". frontdesk_structured_response_payload maps any non-"ok"
+        // status to success:false, so no consumer can read this as a completed registration.
+        let mut payload = frontdesk_result_payload("needs_input", "IN_CONVERSATION", human_message);
         payload.ilk_id = ctx.src_ilk.clone();
         payload.tenant_id = prior_state.and_then(|state| state.tenant_id);
-        payload.registration_status = Some("complete".to_string());
+        payload.registration_status = Some("temporary".to_string());
         Ok(payload)
     }
 
@@ -1663,6 +1869,52 @@ impl GenericAiNode {
         }
     }
 
+    /// Autonomous boot self-configure (SY.* pattern, cf. build_architect_ai_runtime): resolve the AI
+    /// token from SY.vault (Model D', root tenant) and flip to Configured when it is present — the
+    /// baked ai_chat behavior is already live, only the token decides the LLM gate. No token => stay
+    /// Unconfigured (degraded: the deterministic JSON handoff still works; the LLM path enables when a
+    /// VAULT_SECRET_CHANGED carries the token).
+    /// Re-resolve the AI token from SY.vault (Model D', root tenant) and set the LLM gate live —
+    /// Configured when the token resolves, Unconfigured when it does not; returns whether it resolved.
+    /// A no-behavior FAILED_CONFIG node (broken hive.yaml) is left untouched — a token cannot help it.
+    /// This is the frontdesk analog of `refresh_architect_ai_runtime`: the ONE resolve+set-state seam
+    /// used at boot, on VAULT_SECRET_CHANGED, and on the CONFIG_SET refresh knob.
+    async fn refresh_ai_gate(&self) -> bool {
+        if self.behavior.read().await.is_none() {
+            return false;
+        }
+        let provider = self.configured_ai_provider().await;
+        let resolved = self.resolve_ai_api_key(provider).await.is_some();
+        self.control_plane.write().await.current_state = if resolved {
+            NodeLifecycleState::Configured
+        } else {
+            NodeLifecycleState::Unconfigured
+        };
+        resolved
+    }
+
+    async fn boot_self_configure(&self) {
+        // No baked behavior (FAILED_CONFIG — e.g. hive.yaml broken) → a token cannot enable the LLM
+        // path; leave the state (the deterministic handoff still works).
+        if self.behavior.read().await.is_none() {
+            return;
+        }
+        let provider = self.configured_ai_provider().await;
+        if self.refresh_ai_gate().await {
+            tracing::info!(
+                node_name = %self.node_name,
+                provider = %provider,
+                "frontdesk-gov autonomous bootstrap: AI token resolved from vault → Configured (LLM conversational path enabled)"
+            );
+        } else {
+            tracing::warn!(
+                node_name = %self.node_name,
+                provider = %provider,
+                "frontdesk-gov autonomous bootstrap: no AI token in vault → degraded (Unconfigured); deterministic handoff works, LLM path enables on VAULT_SECRET_CHANGED"
+            );
+        }
+    }
+
     async fn handle_vault_secret_changed(&self, msg: &Message) {
         let payload: VaultSecretChangedPayload = match serde_json::from_value(msg.payload.clone()) {
             Ok(payload) => payload,
@@ -1698,26 +1950,38 @@ impl GenericAiNode {
             return;
         }
 
+        // No baked behavior (FAILED_CONFIG) → a token change/delete cannot enable the LLM path; leave
+        // the state (the deterministic handoff still works regardless).
+        if self.behavior.read().await.is_none() {
+            tracing::warn!(
+                node_name = %self.node_name,
+                trace_id = %msg.routing.trace_id,
+                "frontdesk-gov AI vault secret changed but no baked behavior (FAILED_CONFIG); LLM path stays disabled"
+            );
+            return;
+        }
         if matches!(payload.op, fluxbee_sdk::protocol::VaultSecretOp::Delete) {
+            self.control_plane.write().await.current_state = NodeLifecycleState::Unconfigured;
             tracing::warn!(
                 node_name = %self.node_name,
                 trace_id = %msg.routing.trace_id,
                 key = %payload.key,
                 version = payload.version,
-                "frontdesk-gov OpenAI vault secret delete matched; next OpenAI call will fail until secret is restored"
+                "frontdesk-gov AI vault secret deleted → degraded (Unconfigured); deterministic handoff still works, LLM path re-enables when the secret is restored"
             );
             return;
         }
 
-        let resolved = self.resolve_ai_api_key(provider).await.is_some();
-        if resolved {
+        // Autonomous refresh (cf. refresh_architect_ai_runtime): ACT on the broadcast — re-resolve the
+        // token and flip the LLM gate live via the shared seam.
+        if self.refresh_ai_gate().await {
             tracing::info!(
                 node_name = %self.node_name,
                 trace_id = %msg.routing.trace_id,
                 op = %payload.op.as_str(),
                 key = %payload.key,
                 version = payload.version,
-                "frontdesk-gov OpenAI vault secret changed; vault probe succeeded"
+                "frontdesk-gov AI vault secret changed → resolved → Configured (LLM conversational path live)"
             );
         } else {
             tracing::warn!(
@@ -1726,23 +1990,9 @@ impl GenericAiNode {
                 op = %payload.op.as_str(),
                 key = %payload.key,
                 version = payload.version,
-                "frontdesk-gov OpenAI vault secret changed but vault probe did not resolve a usable api_key"
+                "frontdesk-gov AI vault secret changed but no usable api_key → degraded (Unconfigured)"
             );
         }
-    }
-
-    fn resolve_effective_tenant_id(&self) -> Option<String> {
-        let Ok(state) = self.control_plane.try_read() else {
-            return None;
-        };
-        state
-            .effective_config
-            .as_ref()
-            .and_then(|v| v.get("tenant_id"))
-            .and_then(Value::as_str)
-            .map(str::trim)
-            .filter(|v| looks_like_tenant_id(v))
-            .map(ToString::to_string)
     }
 
     async fn handle_control_plane(&self, msg: Message) -> fluxbee_ai_sdk::Result<Option<Message>> {
@@ -1876,127 +2126,29 @@ impl GenericAiNode {
             );
         }
 
-        let config = match msg.payload.get("config") {
-            Some(Value::Object(_)) => msg.payload.get("config").cloned().unwrap_or(Value::Null),
-            Some(_) => {
-                return self.invalid_config_response(
-                    Some(schema_version),
-                    Some(config_version),
-                    "Invalid payload.config: must be an object".to_string(),
-                );
-            }
-            None => {
-                return self.invalid_config_response(
-                    Some(schema_version),
-                    Some(config_version),
-                    "Missing required field: payload.config".to_string(),
-                );
-            }
-        };
-        if let Some(field) = first_secret_bearing_config_field(&config) {
-            return self.invalid_config_response(
-                Some(schema_version),
-                Some(config_version),
-                format!(
-                    "{field} is not accepted; load OpenAI credentials via SY.vault with resource_type=openai"
-                ),
-            );
-        }
-        let mut config_doc = match parse_effective_config_doc(&config) {
-            Ok(v) => v,
-            Err(err) => {
-                return self.invalid_config_response(
-                    Some(schema_version),
-                    Some(config_version),
-                    format!("Invalid payload.config schema: {err}"),
-                );
-            }
-        };
-        config_doc = materialize_effective_defaults(&self.node_name, config_doc);
-        let next_behavior = match build_behavior_from_effective_config(&config_doc) {
-            Ok(v) => v,
-            Err(err) => {
-                return self.invalid_config_response(
-                    Some(schema_version),
-                    Some(config_version),
-                    format!("Invalid payload.config behavior: {err}"),
-                );
-            }
-        };
-        let materialized_config = match serde_json::to_value(&config_doc) {
-            Ok(v) => v,
-            Err(err) => {
-                return self.invalid_config_response(
-                    Some(schema_version),
-                    Some(config_version),
-                    format!("Failed to serialize effective config: {err}"),
-                );
-            }
-        };
-
-        let mut state = self.control_plane.write().await;
-        if config_version < state.config_version {
+        let _ = subsystem;
+        // Autonomous node (Model D', like SY.architect's CONFIG_SET): the AI runtime is baked and
+        // driven by the SY.vault token — NOTHING on the CONFIG_SET surface is settable. Reject any
+        // config/secret/behavior field, then treat CONFIG_SET as a manual VAULT-REFRESH trigger:
+        // re-resolve the token via the shared seam and report the resulting state. Nothing is persisted.
+        if let Some(field) = frontdesk_rejected_config_field(&msg.payload) {
             return self.error_response(
-                "stale_config_version",
+                "config_not_accepted",
                 format!(
-                    "Stale config_version: received {}, current {}",
-                    config_version, state.config_version
+                    "{field} is not accepted: SY.frontdesk.gov is autonomous — AI provider/model are hive-wide (hive.yaml) and the credential lives in SY.vault (resource_type=openai); CONFIG_SET only re-resolves the vault token."
                 ),
-                state.schema_version,
-                state.config_version,
-                state.current_state.as_str(),
+                schema_version,
+                config_version,
+                self.control_plane.read().await.current_state.as_str(),
             );
         }
-        if config_version == state.config_version && state.effective_config.is_some() {
-            return self.ok_response(
-                subsystem,
-                state.schema_version,
-                state.config_version,
-                state.current_state.as_str(),
-                state.effective_config.as_ref(),
-            );
-        }
-
-        let prev_state = state.current_state;
-        let prev_source = state.config_source;
-        let prev_effective = state.effective_config.clone();
-        let prev_schema = state.schema_version;
-        let prev_version = state.config_version;
-
-        state.current_state = NodeLifecycleState::Configured;
-        state.config_source = "persisted";
-        state.effective_config = Some(materialized_config);
-        state.schema_version = schema_version;
-        state.config_version = config_version;
-        if let Err(err) = persist_dynamic_config(
-            &self.dynamic_config_dir,
-            &self.node_name,
-            state.schema_version,
-            state.config_version,
-            &config_doc,
-        ) {
-            state.current_state = prev_state;
-            state.config_source = prev_source;
-            state.effective_config = prev_effective;
-            state.schema_version = prev_schema;
-            state.config_version = prev_version;
-            return self.error_response(
-                "config_persist_error",
-                format!("Failed to persist dynamic config: {err}"),
-                prev_schema,
-                prev_version,
-                prev_state.as_str(),
-            );
-        }
-        *self.behavior.write().await = Some(next_behavior);
-
-        self.ok_response(
-            subsystem,
-            state.schema_version,
-            state.config_version,
-            state.current_state.as_str(),
-            state.effective_config.as_ref(),
-        )
+        let resolved = self.refresh_ai_gate().await;
+        tracing::info!(
+            node_name = %self.node_name,
+            resolved,
+            "frontdesk-gov CONFIG_SET: Model D' vault re-resolve (no config accepted, nothing persisted)"
+        );
+        self.build_config_get_response().await
     }
 
     fn invalid_config_response(
@@ -2012,26 +2164,6 @@ impl GenericAiNode {
             config_version.unwrap_or(0),
             NodeLifecycleState::Unconfigured.as_str(),
         )
-    }
-
-    fn ok_response(
-        &self,
-        subsystem: &str,
-        schema_version: u32,
-        config_version: u64,
-        state: &str,
-        effective_config: Option<&Value>,
-    ) -> Value {
-        json!({
-            "subsystem": subsystem,
-            "node_name": self.node_name.as_str(),
-            "ok": true,
-            "state": state,
-            "schema_version": schema_version,
-            "config_version": config_version,
-            "error": Value::Null,
-            "effective_config": effective_config.map(redact_secrets),
-        })
     }
 
     fn error_response(
@@ -2066,62 +2198,61 @@ impl GenericAiNode {
     }
 
     async fn build_config_get_response(&self) -> Value {
-        let (ok, config_source, state_name, schema_version, config_version, effective_config) = {
+        let (state_name, config_source, schema_version, config_version, effective_config) = {
             let state = self.control_plane.read().await;
-            let ok = state.effective_config.is_some();
             (
-                ok,
-                if ok { state.config_source } else { "none" },
                 state.current_state.as_str().to_string(),
+                state.config_source,
                 state.schema_version,
                 state.config_version,
                 state.effective_config.clone(),
             )
         };
+        // `ok` reflects the LLM gate (token resolved), NOT config presence: effective_config is always
+        // Some (baked), so the truthful diagnostic is whether the node is Configured (token live).
+        let configured = state_name == NodeLifecycleState::Configured.as_str();
         let provider = self.configured_ai_provider().await;
-        let api_key_source = if ok {
-            self.resolve_ai_api_key_with_source(provider).await.1
-        } else {
-            OpenAiApiKeySource::Missing
+        let api_key_source = self.resolve_ai_api_key_with_source(provider).await.1;
+        // Baked engine (hive-wide provider/model from hive.yaml) — reported for diagnostics, mirroring
+        // architect's config.ai block.
+        let (engine_provider, engine_model) = match self.behavior.read().await.as_ref() {
+            Some(NodeBehavior::OpenAiChat(rt)) => (rt.provider.to_string(), rt.model.clone()),
+            _ => (provider.to_string(), String::new()),
         };
-        let error = if ok {
+        let error = if configured {
             Value::Null
         } else {
-            json!({"code":"node_not_configured","message":"No effective config available"})
+            json!({"code":"missing_secret","message":"AI token not resolved from SY.vault; degraded (the deterministic handoff still works). Load resource_type=openai in SY.vault."})
         };
         json!({
             "subsystem": "ai_node",
             "node_name": self.node_name.as_str(),
-            "ok": ok,
+            "ok": configured,
             "state": state_name,
             "config_source": config_source,
             "api_key_source": api_key_source.as_str(),
             "schema_version": schema_version,
             "config_version": config_version,
+            "config": {
+                "ai": { "default_provider": engine_provider, "model": engine_model }
+            },
             "contract": {
                 "node_family": "SY",
                 "node_kind": "SY.frontdesk.gov",
                 "supports": ["CONFIG_GET", "CONFIG_SET"],
-                "required_fields": [
-                    "config.behavior.kind"
-                ],
-                "optional_fields": [
-                    "config.behavior.instructions",
-                    "config.behavior.model_settings",
-                    "config.behavior.base_url",
-                    "config.behavior.capabilities.multimodal"
-                ],
-                "secrets": [{
+                "required_fields": [],
+                "optional_fields": [],
+                "resources": [{
                     "resource_type": provider.to_string(),
+                    "required": true,
                     "source": "SY.vault",
                     "tenant_id": fluxbee_sdk::DEFAULT_ROOT_TENANT_ID,
                     "configured": api_key_source == OpenAiApiKeySource::Vault
                 }],
                 "notes": [
-                    "SY.frontdesk.gov ships a runtime-owned default prompt when behavior.instructions is omitted.",
-                    "The AI provider/model are hive-wide and configured in hive.yaml.",
-                    "Credentials are resolved from SY.vault using the selected provider resource_type.",
-                    "SY.frontdesk.gov defaults behavior.capabilities.multimodal=false unless explicitly overridden.",
+                    "SY.frontdesk.gov is autonomous: its behavior is a baked ai_chat frontdesk (runtime-owned prompt) and is NOT settable via CONFIG_SET.",
+                    "The AI provider/model are hive-wide and configured only in hive.yaml (a baked fallback applies otherwise).",
+                    "The AI credential is resolved from SY.vault (resource_type=openai) at boot and on VAULT_SECRET_CHANGED; CONFIG_SET only RE-RESOLVES it — no config accepted, nothing persisted.",
                     "Secret plaintext is never persisted in node-local config or returned by CONFIG_GET."
                 ]
             },
@@ -2193,19 +2324,12 @@ fn env_bool(key: &str, default: bool) -> bool {
         .unwrap_or(default)
 }
 
-fn env_nonempty(key: &str) -> Option<String> {
-    std::env::var(key)
-        .ok()
-        .map(|v| v.trim().to_string())
-        .filter(|v| !v.is_empty())
-}
-
 #[async_trait]
 impl FunctionTool for IlkRegisterTool {
     fn definition(&self) -> FunctionToolDefinition {
         FunctionToolDefinition {
             name: "ilk_register".to_string(),
-            description: "Register identity completion for a temporary ILK (gov mode only)."
+            description: "Register the person of this conversation (its temporary ILK) in SY.identity. The organization (tenant) comes with the case: never ask for one."
                 .to_string(),
             parameters_json_schema: json!({
                 "type": "object",
@@ -2217,13 +2341,12 @@ impl FunctionTool for IlkRegisterTool {
                             "name": { "type": "string", "minLength": 1 },
                             "email": { "type": "string", "minLength": 3 },
                             "phone": { "type": "string" },
-                            "tenant_hint": { "type": "string" }
+                            "company_name": { "type": "string" },
+                            "attributes": { "type": "object" }
                         },
                         "required": ["name", "email"],
-                        "additionalProperties": true
-                    },
-                    "tenant_id": { "type": "string" },
-                    "thread_id": { "type": "string" }
+                        "additionalProperties": false
+                    }
                 },
                 "required": ["src_ilk", "identity_candidate"],
                 "additionalProperties": false
@@ -2241,12 +2364,7 @@ impl FunctionTool for IlkRegisterTool {
         let src_ilk_owned = self.scoped_src_ilk.clone().unwrap_or(args.src_ilk);
         let src_ilk = src_ilk_owned.trim();
         if src_ilk.is_empty() {
-            return Ok(json!({
-                "status": "error",
-                "error_code": "missing_src_ilk",
-                "message": "src_ilk is required",
-                "retryable": false
-            }));
+            return Ok(missing_src_ilk_payload());
         }
 
         if args.identity_candidate.name.trim().is_empty()
@@ -2260,116 +2378,30 @@ impl FunctionTool for IlkRegisterTool {
             }));
         }
 
-        let explicit_tenant = args.tenant_id.as_deref().map(str::trim);
-        let tenant_hint = args
-            .identity_candidate
-            .tenant_hint
-            .as_deref()
-            .map(str::trim);
-        let cfg_tenant = self.default_tenant_id.as_deref().map(str::trim);
-        let env_tenant = env_nonempty(GOV_IDENTITY_TENANT_ID_ENV);
-        let mut tenant_source = tenant_resolution_source(explicit_tenant, tenant_hint, cfg_tenant);
-        let mut resolved_tenant_id =
-            resolve_tenant_id_for_register(explicit_tenant, tenant_hint, cfg_tenant);
-
-        if resolved_tenant_id.is_none() {
-            if let Some(tenant_name) = tenant_hint.filter(|value| !value.is_empty()) {
-                tracing::info!(
-                    op = "tenant_resolve",
+        // The tenant of the case, never one the person or the LLM gives, never a new one, and
+        // never the root tenant.
+        let tenant_id = match case_tenant_of(
+            &self.ilk_tenant,
+            Some(src_ilk),
+            self.informed_tenant_id.as_deref(),
+        ) {
+            Ok(tenant_id) => tenant_id,
+            Err(error_code) => {
+                tracing::warn!(
+                    op = "ilk_register",
                     src_ilk = %src_ilk,
-                    target = %self.identity.target,
-                    tenant_hint = %tenant_name,
-                    "tenant_id missing; attempting TNT_CREATE from tenant_hint"
+                    informed_tenant_id = ?self.informed_tenant_id,
+                    error_code,
+                    "no tenant to register the case into: ILK_REGISTER not sent, no tenant created"
                 );
-                let create_payload = json!({
-                    "name": tenant_name,
-                    "status": "active"
-                });
-                tracing::info!(
-                    op = "tenant_resolve",
-                    target = %self.identity.target,
-                    msg = %MSG_TNT_CREATE,
-                    payload = %create_payload,
-                    "sending TNT_CREATE to identity"
-                );
-                let create_result = if let Some(bridge) = &self.bridge {
-                    bridge
-                        .call_ok(&self.identity, MSG_TNT_CREATE, create_payload)
-                        .await
-                } else {
-                    Err("identity bridge not initialized".to_string())
-                };
-
-                match create_result {
-                    Ok(out) => {
-                        let created_tenant_id = out
-                            .payload
-                            .get("tenant_id")
-                            .and_then(Value::as_str)
-                            .map(str::trim)
-                            .filter(|value| looks_like_tenant_id(value))
-                            .map(ToString::to_string);
-                        tracing::info!(
-                            op = "tenant_resolve",
-                            trace_id = %out.trace_id,
-                            effective_target = %out.effective_target,
-                            response_payload = %out.payload,
-                            "received TNT_CREATE response from identity"
-                        );
-                        if created_tenant_id.is_none() {
-                            tracing::warn!(
-                                op = "tenant_resolve",
-                                target = %self.identity.target,
-                                response_payload = %out.payload,
-                                "TNT_CREATE response missing valid tenant_id"
-                            );
-                            return Ok(json!({
-                                "status": "error",
-                                "error_code": "invalid_tnt_create_response",
-                                "message": "TNT_CREATE response did not include a valid tenant_id",
-                                "retryable": false
-                            }));
-                        }
-                        resolved_tenant_id = created_tenant_id;
-                        tenant_source = "tnt_create";
-                    }
-                    Err(err) => {
-                        tracing::warn!(
-                            op = "tenant_resolve",
-                            target = %self.identity.target,
-                            error = %err,
-                            "TNT_CREATE failed"
-                        );
-                        return Ok(identity_error_to_tool_payload(err));
-                    }
-                }
+                return Ok(case_tenant_error_payload(error_code));
             }
-        }
-
-        let Some(tenant_id) = resolved_tenant_id else {
-            tracing::warn!(
-                op = "ilk_register",
-                src_ilk = %src_ilk,
-                target = %self.identity.target,
-                explicit_tenant_id = ?explicit_tenant,
-                tenant_hint = ?tenant_hint,
-                effective_config_tenant_id = ?cfg_tenant,
-                env_tenant_id = ?env_tenant,
-                "missing tenant_id for ILK_REGISTER"
-            );
-            return Ok(json!({
-                "status": "error",
-                "error_code": "missing_tenant_id",
-                "message": "tenant_id is required for ILK_REGISTER (set tenant_id as tnt:<uuid>, use identity_candidate.tenant_hint=tnt:<uuid>, or set GOV_IDENTITY_TENANT_ID)",
-                "retryable": false
-            }));
         };
 
         tracing::info!(
             op = "ilk_register",
             src_ilk = %src_ilk,
             tenant_id = %tenant_id,
-            tenant_source = %tenant_source,
             target = %self.identity.target,
             has_fallback = self.identity.fallback_target.is_some(),
             "dispatching identity registration request"
@@ -2383,14 +2415,19 @@ impl FunctionTool for IlkRegisterTool {
                 "display_name": args.identity_candidate.name,
                 "email": args.identity_candidate.email,
                 "phone": args.identity_candidate.phone,
-                "tenant_hint": args.identity_candidate.tenant_hint,
+                "company_name": args.identity_candidate.company_name,
+                "attributes": args.identity_candidate.attributes,
             }
         });
+        // Only non-personal fields: the identification VALUES (name, email, phone, company,
+        // attributes) never reach the logs, only which fields are present.
         tracing::info!(
             op = "ilk_register",
             target = %self.identity.target,
             msg = %MSG_ILK_REGISTER,
-            payload = %payload,
+            ilk_id = %src_ilk,
+            tenant_id = %tenant_id,
+            identification_fields = ?present_identification_fields(&payload["identification"]),
             "sending ILK_REGISTER to identity"
         );
         let result = if let Some(bridge) = &self.bridge {
@@ -2398,21 +2435,39 @@ impl FunctionTool for IlkRegisterTool {
                 .call_ok(&self.identity, MSG_ILK_REGISTER, payload)
                 .await
         } else {
-            Err("identity bridge not initialized".to_string())
+            Err(identity_bridge_missing())
         };
 
         match result {
             Ok(out) => {
+                // The ilk the person ended on: this one, or after a merge by email the one that
+                // already had that email.
+                let ilk_id = out
+                    .payload
+                    .get("ilk_id")
+                    .and_then(Value::as_str)
+                    .unwrap_or(src_ilk)
+                    .to_string();
+                let merged = out
+                    .payload
+                    .get("merged")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
                 tracing::info!(
                     op = "ilk_register",
                     trace_id = %out.trace_id,
                     effective_target = %out.effective_target,
+                    ilk_id = %ilk_id,
+                    merged,
                     response_payload = %out.payload,
                     "received ILK_REGISTER response from identity"
                 );
                 Ok(json!({
                     "status": "ok",
                     "registered": true,
+                    "merged": merged,
+                    "ilk_id": ilk_id,
+                    "tenant_id": tenant_id,
                     "effective_target": out.effective_target,
                     "trace_id": out.trace_id,
                     "identity_payload": out.payload
@@ -2422,13 +2477,32 @@ impl FunctionTool for IlkRegisterTool {
                 tracing::warn!(
                     op = "ilk_register",
                     target = %self.identity.target,
-                    error = %err,
+                    error = %identity_error_log_summary(&err),
                     "ILK_REGISTER failed"
                 );
-                Ok(identity_error_to_tool_payload(err))
+                Ok(identity_error_to_tool_payload(&err))
             }
         }
     }
+}
+
+/// Names of the identification fields that carry a value — what a log may say about the person.
+fn present_identification_fields(identification: &Value) -> Vec<String> {
+    identification
+        .as_object()
+        .map(|fields| {
+            fields
+                .iter()
+                .filter(|(_, value)| match value {
+                    Value::Null => false,
+                    Value::String(text) => !text.trim().is_empty(),
+                    Value::Object(map) => !map.is_empty(),
+                    _ => true,
+                })
+                .map(|(name, _)| name.clone())
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 impl NodeBehavior {
@@ -2443,7 +2517,7 @@ impl NodeBehavior {
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let log_filter = std::env::var("RUST_LOG").unwrap_or_else(|_| "info".to_string());
-    tracing_subscriber::fmt()
+    fluxbee_sdk::logging::fmt()
         .with_env_filter(EnvFilter::new(log_filter))
         .init();
 
@@ -2466,154 +2540,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     };
 
     let args = parse_runner_args()?;
-    let config_paths = args.config_paths;
-    let mut loaded = Vec::with_capacity(config_paths.len());
-    for path in &config_paths {
-        let raw = fs::read_to_string(path)?;
-        let cfg: RunnerConfig = serde_yaml::from_str(&raw)?;
-        loaded.push((path.clone(), cfg));
-    }
-
-    ensure_unique_node_names(&loaded)?;
-
-    if loaded.is_empty() {
-        let bootstrap_node = bootstrap_node_from_args(&args.bootstrap)?;
-        tracing::info!(
-            node_name = %bootstrap_node.name,
-            mode = %args.mode.as_str(),
-            "starting ai_node_runner without YAML config (UNCONFIGURED mode)"
-        );
-        run_unconfigured_bootstrap(bootstrap_node, args.mode, frontdesk_self_ilk_id).await?;
-        return Ok(());
-    }
-
-    let mut runners = JoinSet::new();
-    let mode = args.mode;
-    for (config_path, cfg) in loaded {
-        let self_ilk_id = frontdesk_self_ilk_id.clone();
-        runners.spawn(async move { run_one_config(config_path, cfg, mode, self_ilk_id).await });
-    }
-
-    while let Some(result) = runners.join_next().await {
-        match result {
-            Ok(Ok(())) => {}
-            Ok(Err(err)) => return Err(err),
-            Err(err) => return Err(format!("runner task join error: {err}").into()),
-        }
-    }
-    Ok(())
-}
-
-fn with_jitter(base: Duration) -> Duration {
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|value| value.subsec_nanos() as u64)
-        .unwrap_or(0);
-    let jitter_factor_percent = nanos % 25;
-    let jitter = base
-        .as_millis()
-        .saturating_mul(jitter_factor_percent as u128)
-        / 100;
-    let total = base.as_millis().saturating_add(jitter);
-    Duration::from_millis(total as u64)
-}
-
-async fn run_one_config(
-    config_path: PathBuf,
-    cfg: RunnerConfig,
-    mode: RunnerMode,
-    self_ilk_id: Option<String>,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let startup_effective_doc = build_startup_effective_config_doc(&cfg);
-    let startup_effective_doc =
-        materialize_effective_defaults(&cfg.node.name, startup_effective_doc);
-    let startup_effective_config = serde_json::to_value(&startup_effective_doc)?;
-    let persisted_dynamic =
-        load_persisted_dynamic_config(&PathBuf::from(&cfg.node.dynamic_config_dir), &cfg.node.name);
-    let behavior = build_behavior(&cfg)?;
-    let runner_node_name = cfg.node.name.clone();
-    let runner_router_socket = PathBuf::from(cfg.node.router_socket);
-    let runner_uuid_persistence_dir = PathBuf::from(cfg.node.uuid_persistence_dir);
-    let runner_config_dir = PathBuf::from(cfg.node.config_dir);
-    let runner_node_config = NodeConfig {
-        name: runner_node_name.clone(),
-        router_socket: runner_router_socket.clone(),
-        uuid_persistence_dir: runner_uuid_persistence_dir.clone(),
-        uuid_mode: NodeUuidMode::Persistent,
-        config_dir: runner_config_dir.clone(),
-        version: cfg.node.version.clone(),
-    };
-
-    let runtime_config = RuntimeConfig {
-        read_timeout: Duration::from_millis(cfg.runtime.read_timeout_ms),
-        handler_timeout: Duration::from_millis(cfg.runtime.handler_timeout_ms),
-        write_timeout: Duration::from_millis(cfg.runtime.write_timeout_ms),
-        queue_capacity: cfg.runtime.queue_capacity,
-        worker_pool_size: cfg.runtime.worker_pool_size,
-        retry_policy: RetryPolicy {
-            max_attempts: cfg.runtime.retry_max_attempts,
-            initial_backoff: Duration::from_millis(cfg.runtime.retry_initial_backoff_ms),
-            max_backoff: Duration::from_millis(cfg.runtime.retry_max_backoff_ms),
-        },
-        metrics_log_interval: Duration::from_millis(cfg.runtime.metrics_log_interval_ms),
-    };
-
-    tracing::info!(
-        config = %config_path.display(),
-        node_name = %runner_node_name,
-        mode = %mode.as_str(),
-        "starting ai_node_runner node instance"
-    );
-
-    let node_name = runner_node_name.clone();
-    let gov_identity = gov_identity_config_from_env();
-    let thread_state_store =
-        init_thread_state_store(&node_name, &PathBuf::from(&cfg.node.dynamic_config_dir)).await;
-    let immediate_memory_store =
-        init_immediate_memory_store(&node_name, &PathBuf::from(&cfg.node.dynamic_config_dir)).await;
-
-    let profile = build_frontdesk_gov_rpc_profile()
-        .map_err(|err| format!("frontdesk-gov rpc profile invalid: {err}"))?;
-    let dispatcher =
-        RouterDispatcher::connect_with_retry(runner_node_config, Duration::from_secs(1), profile)
-            .await?;
-    let vault = vault_client_for(dispatcher.clone(), &node_name, self_ilk_id.as_deref());
-    let gov_identity_bridge = if mode == RunnerMode::Gov {
-        Some(Arc::new(GovIdentityBridge::new(dispatcher.clone())))
-    } else {
-        None
-    };
-    let node = GenericAiNode {
-        mode,
-        node_name,
-        self_ilk_id,
-        behavior: Arc::new(RwLock::new(Some(behavior))),
-        config_dir: runner_config_dir,
-        dynamic_config_dir: PathBuf::from(&cfg.node.dynamic_config_dir),
-        router_socket: runner_router_socket,
-        state_dir: runner_uuid_persistence_dir,
-        thread_state_store,
-        immediate_memory_store,
-        gov_identity,
-        gov_identity_bridge,
-        vault,
-        control_plane: Arc::new(RwLock::new(ControlPlaneState {
-            current_state: NodeLifecycleState::Configured,
-            config_source: "yaml",
-            effective_config: Some(startup_effective_config),
-            schema_version: persisted_dynamic
-                .as_ref()
-                .map(|v| v.schema_version)
-                .unwrap_or(1),
-            config_version: persisted_dynamic
-                .as_ref()
-                .map(|v| v.config_version)
-                .unwrap_or(1),
-            ..ControlPlaneState::default()
-        })),
-    };
-    let runtime = NodeRuntime::new(dispatcher, node);
-    runtime.run_with_config(runtime_config).await?;
+    let bootstrap_node = bootstrap_node_from_args(&args)?;
+    run_unconfigured_bootstrap(bootstrap_node, frontdesk_self_ilk_id).await?;
     Ok(())
 }
 
@@ -2633,160 +2561,79 @@ fn vault_client_for(
     self_ilk_id: Option<&str>,
 ) -> Option<VaultClient> {
     let ilk = self_ilk_id.map(str::trim).filter(|v| !v.is_empty())?;
-    let hive = node_name.split('@').nth(1).filter(|v| !v.is_empty())?;
-    Some(VaultClient::new(
+    // The name must still be a full L2 name, but the vault is the motherbee's, whatever hive
+    // this node runs on.
+    node_name.split('@').nth(1).filter(|v| !v.is_empty())?;
+    Some(VaultClient::for_primary(
         dispatcher,
-        hive.to_string(),
         VaultCallerOwned::new(ilk.to_string(), node_name.to_string()),
     ))
 }
 
 async fn run_unconfigured_bootstrap(
     node: NodeSection,
-    mode: RunnerMode,
     self_ilk_id: Option<String>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let node_name = node.name.clone();
     let dynamic_dir = PathBuf::from(node.dynamic_config_dir.clone());
     let thread_state_store = init_thread_state_store(&node_name, &dynamic_dir).await;
     let immediate_memory_store = init_immediate_memory_store(&node_name, &dynamic_dir).await;
-    let persisted_dynamic = load_persisted_dynamic_config(&dynamic_dir, &node_name);
-    let spawn_effective = if persisted_dynamic.is_none() {
-        load_effective_config_from_spawn(&node_name)
-    } else {
-        None
+    // SY.frontdesk.gov is an AUTONOMOUS system node — same pattern as SY.architect and SY.admin's
+    // executor (build_architect_ai_runtime / refresh_architect_ai_runtime): its AI runtime is BAKED
+    // (it is ALWAYS an ai_chat frontdesk — prompt via frontdesk_default_instructions, engine via
+    // load_hive_ai_engine's hive.yaml-or-baked-fallback), and the ONLY external input is the AI token
+    // in SY.vault. It reads NO spawn/persisted/CONFIG_SET config for the AI runtime. The token is
+    // resolved after the dispatcher exists (boot_self_configure) and decides Configured (LLM
+    // conversational path) vs Unconfigured (degraded — the deterministic JSON-handoff path still works
+    // with no LLM). The baked behavior is Some in BOTH states; only the token toggles the gate.
+    let baked_doc = materialize_effective_defaults(
+        &node_name,
+        EffectiveConfigDocument {
+            node: Some(EffectiveNodeSection {
+                config_dir: Some(node.config_dir.clone()),
+                ..EffectiveNodeSection::default()
+            }),
+            behavior: EffectiveBehaviorSection {
+                kind: "ai_chat".to_string(),
+                ..EffectiveBehaviorSection::default()
+            },
+            ..EffectiveConfigDocument::default()
+        },
+    );
+    let (behavior, boot_state) = match build_behavior_from_effective_config(&baked_doc) {
+        // Behavior baked OK — boot Unconfigured; boot_self_configure flips to Configured when the vault
+        // token is present, else stays Unconfigured (degraded: the deterministic handoff still works).
+        Ok(behavior) => (Some(behavior), NodeLifecycleState::Unconfigured),
+        // The baked behavior could not be built (e.g. hive.yaml missing/invalid) — a real
+        // misconfiguration, so boot FAILED_CONFIG. The deterministic handoff still runs (it is gated
+        // before the behavior); the LLM conversational path stays disabled.
+        Err(err) => {
+            tracing::warn!(
+                node_name = %node_name,
+                error = %err,
+                "frontdesk-gov: baked ai_chat behavior could not be built (hive.yaml/engine?); booting FAILED_CONFIG (deterministic handoff still works, LLM path disabled)"
+            );
+            (None, NodeLifecycleState::FailedConfig)
+        }
     };
-    let (behavior, state) = match persisted_dynamic.as_ref() {
-        Some(stored) => {
-            let materialized = materialize_effective_defaults(&node_name, stored.config.clone());
-            match build_behavior_from_effective_config(&materialized) {
-                Ok(behavior) => {
-                    tracing::info!(
-                        node_name = %node_name,
-                        config_version = stored.config_version,
-                        "loaded effective JSON config at bootstrap"
-                    );
-                    (
-                        Some(behavior),
-                        ControlPlaneState {
-                            current_state: NodeLifecycleState::Configured,
-                            config_source: "persisted",
-                            effective_config: Some(
-                                serde_json::to_value(materialized).unwrap_or(Value::Null),
-                            ),
-                            schema_version: stored.schema_version,
-                            config_version: stored.config_version,
-                        },
-                    )
-                }
-                Err(err) => {
-                    tracing::warn!(
-                        node_name = %node_name,
-                        error = %err,
-                        "persisted JSON config is invalid; booting FAILED_CONFIG"
-                    );
-                    (
-                        None,
-                        ControlPlaneState {
-                            current_state: NodeLifecycleState::FailedConfig,
-                            config_source: "persisted",
-                            effective_config: Some(
-                                serde_json::to_value(materialized).unwrap_or(Value::Null),
-                            ),
-                            schema_version: stored.schema_version,
-                            config_version: stored.config_version,
-                        },
-                    )
-                }
-            }
-        }
-        None => {
-            if let Some(spawn_cfg) = spawn_effective {
-                let spawn_config = spawn_cfg.config.clone();
-                match build_behavior_from_effective_config(&spawn_config) {
-                    Ok(behavior) => {
-                        tracing::info!(
-                            node_name = %node_name,
-                            path = %spawn_cfg.path.display(),
-                            "loaded spawn config at bootstrap"
-                        );
-                        if let Err(err) = persist_dynamic_config(
-                            &dynamic_dir,
-                            &node_name,
-                            spawn_cfg.schema_version,
-                            spawn_cfg.config_version,
-                            &spawn_config,
-                        ) {
-                            tracing::warn!(
-                                node_name = %node_name,
-                                error = %err,
-                                "failed to persist bootstrap config from spawn file"
-                            );
-                        }
-                        (
-                            Some(behavior),
-                            ControlPlaneState {
-                                current_state: NodeLifecycleState::Configured,
-                                config_source: "spawn",
-                                effective_config: Some(
-                                    serde_json::to_value(spawn_config).unwrap_or(Value::Null),
-                                ),
-                                schema_version: spawn_cfg.schema_version,
-                                config_version: spawn_cfg.config_version,
-                            },
-                        )
-                    }
-                    Err(err) => {
-                        tracing::warn!(
-                            node_name = %node_name,
-                            path = %spawn_cfg.path.display(),
-                            error = %err,
-                            "spawn config exists but is invalid for AI effective config"
-                        );
-                        (
-                            None,
-                            ControlPlaneState {
-                                current_state: NodeLifecycleState::FailedConfig,
-                                config_source: "spawn",
-                                effective_config: Some(
-                                    serde_json::to_value(spawn_config).unwrap_or(Value::Null),
-                                ),
-                                schema_version: spawn_cfg.schema_version,
-                                config_version: spawn_cfg.config_version,
-                            },
-                        )
-                    }
-                }
-            } else {
-                (
-                    None,
-                    ControlPlaneState {
-                        current_state: NodeLifecycleState::Unconfigured,
-                        config_source: "none",
-                        effective_config: None,
-                        schema_version: 0,
-                        config_version: 0,
-                    },
-                )
-            }
-        }
+    let state = ControlPlaneState {
+        current_state: boot_state,
+        config_source: "baked",
+        effective_config: Some(serde_json::to_value(&baked_doc).unwrap_or(Value::Null)),
+        schema_version: 0,
+        config_version: 0,
     };
 
-    let runner_node_name = node.name.clone();
-    let runner_router_socket = PathBuf::from(node.router_socket);
-    let runner_uuid_persistence_dir = PathBuf::from(node.uuid_persistence_dir);
-    let runner_config_dir = PathBuf::from(node.config_dir);
     let runner_node_config = NodeConfig {
-        name: runner_node_name.clone(),
-        router_socket: runner_router_socket.clone(),
-        uuid_persistence_dir: runner_uuid_persistence_dir.clone(),
+        name: node.name,
+        router_socket: PathBuf::from(node.router_socket),
+        uuid_persistence_dir: PathBuf::from(node.uuid_persistence_dir),
         uuid_mode: NodeUuidMode::Persistent,
-        config_dir: runner_config_dir.clone(),
-        version: node.version.clone(),
+        config_dir: PathBuf::from(node.config_dir),
+        version: node.version,
     };
     tracing::info!(
         node_name = %node_name,
-        mode = %mode.as_str(),
         "starting ai_node_runner bootstrap instance"
     );
     let gov_identity = gov_identity_config_from_env();
@@ -2795,35 +2642,36 @@ async fn run_unconfigured_bootstrap(
     let dispatcher =
         RouterDispatcher::connect_with_retry(runner_node_config, Duration::from_secs(1), profile)
             .await?;
-    tracing::info!(
-        node_name = %node_name,
-        mode = %mode.as_str(),
-        "frontdesk-gov connected to router"
-    );
+    tracing::info!(node_name = %node_name, "frontdesk-gov connected to router");
     let vault = vault_client_for(dispatcher.clone(), &node_name, self_ilk_id.as_deref());
-    let gov_identity_bridge = if mode == RunnerMode::Gov {
-        Some(Arc::new(GovIdentityBridge::new(dispatcher.clone())))
-    } else {
-        None
-    };
+    let gov_identity_bridge = Some(Arc::new(GovIdentityBridge::new(dispatcher.clone())));
+    let usage = UsageRecorder::start(dispatcher.clone());
     let ai_node = GenericAiNode {
-        mode,
         node_name: node_name.clone(),
-        self_ilk_id,
+        self_ilk_id: self_ilk_id.clone(),
         behavior: Arc::new(RwLock::new(behavior)),
-        config_dir: runner_config_dir,
-        dynamic_config_dir: dynamic_dir,
-        router_socket: runner_router_socket,
-        state_dir: runner_uuid_persistence_dir,
         thread_state_store,
         immediate_memory_store,
         gov_identity,
         gov_identity_bridge,
+        ilk_tenant: identity_shm_ilk_tenant(&node_name),
         vault,
         control_plane: Arc::new(RwLock::new(state)),
+        usage,
     };
+    // Now that the dispatcher/vault exist, resolve the AI token from SY.vault and flip to Configured
+    // when present (autonomous SY.* pattern, cf. build_architect_ai_runtime). No token => stay
+    // Unconfigured (degraded — the deterministic handoff still works).
+    ai_node.boot_self_configure().await;
     let runtime = NodeRuntime::new(dispatcher, ai_node);
-    runtime.run_with_config(RuntimeConfig::default()).await?;
+    // Its replies carry its own ILK (docs/router-stream-v1.md §6.2); a SY unit has no
+    // FLUXBEE_NODE_ILK_ID, so the default would leave them without one.
+    runtime
+        .run_with_config(RuntimeConfig {
+            self_ilk_id: self_ilk_id.clone(),
+            ..RuntimeConfig::default()
+        })
+        .await?;
     Ok(())
 }
 
@@ -2837,72 +2685,31 @@ struct BootstrapArgs {
     dynamic_config_dir: Option<String>,
 }
 
-#[derive(Debug, Default)]
-struct RunnerArgs {
-    config_paths: Vec<PathBuf>,
-    bootstrap: BootstrapArgs,
-    mode: RunnerMode,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-enum RunnerMode {
-    #[default]
-    Default,
-    Gov,
-}
-
-impl RunnerMode {
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::Default => "default",
-            Self::Gov => "gov",
-        }
-    }
-
-    fn parse(raw: &str) -> Option<Self> {
-        match raw.trim().to_ascii_lowercase().as_str() {
-            "default" => Some(Self::Default),
-            "gov" => Some(Self::Gov),
-            _ => None,
-        }
-    }
-}
-
-fn parse_runner_args() -> Result<RunnerArgs, Box<dyn std::error::Error + Send + Sync>> {
+fn parse_runner_args() -> Result<BootstrapArgs, Box<dyn std::error::Error + Send + Sync>> {
     let args = std::env::args().skip(1).collect::<Vec<_>>();
-    let mut parsed = RunnerArgs {
-        mode: RunnerMode::Gov,
-        ..RunnerArgs::default()
-    };
+    let mut parsed = BootstrapArgs::default();
     let mut i = 0usize;
     while i < args.len() {
         match args[i].as_str() {
-            "--config" => {
-                let Some(path) = args.get(i + 1) else {
-                    return Err("missing path after --config".to_string().into());
-                };
-                parsed.config_paths.push(PathBuf::from(path));
-                i += 2;
-            }
             "--node-name" => {
                 let Some(value) = args.get(i + 1) else {
                     return Err("missing value after --node-name".to_string().into());
                 };
-                parsed.bootstrap.node_name = Some(value.clone());
+                parsed.node_name = Some(value.clone());
                 i += 2;
             }
             "--version" => {
                 let Some(value) = args.get(i + 1) else {
                     return Err("missing value after --version".to_string().into());
                 };
-                parsed.bootstrap.version = Some(value.clone());
+                parsed.version = Some(value.clone());
                 i += 2;
             }
             "--router-socket" => {
                 let Some(value) = args.get(i + 1) else {
                     return Err("missing value after --router-socket".to_string().into());
                 };
-                parsed.bootstrap.router_socket = Some(value.clone());
+                parsed.router_socket = Some(value.clone());
                 i += 2;
             }
             "--uuid-persistence-dir" => {
@@ -2911,14 +2718,14 @@ fn parse_runner_args() -> Result<RunnerArgs, Box<dyn std::error::Error + Send + 
                         .to_string()
                         .into());
                 };
-                parsed.bootstrap.uuid_persistence_dir = Some(value.clone());
+                parsed.uuid_persistence_dir = Some(value.clone());
                 i += 2;
             }
             "--config-dir" => {
                 let Some(value) = args.get(i + 1) else {
                     return Err("missing value after --config-dir".to_string().into());
                 };
-                parsed.bootstrap.config_dir = Some(value.clone());
+                parsed.config_dir = Some(value.clone());
                 i += 2;
             }
             "--dynamic-config-dir" => {
@@ -2927,21 +2734,7 @@ fn parse_runner_args() -> Result<RunnerArgs, Box<dyn std::error::Error + Send + 
                         .to_string()
                         .into());
                 };
-                parsed.bootstrap.dynamic_config_dir = Some(value.clone());
-                i += 2;
-            }
-            "--mode" => {
-                let Some(value) = args.get(i + 1) else {
-                    return Err("missing value after --mode".to_string().into());
-                };
-                let normalized = value.trim().to_ascii_lowercase();
-                if normalized != "gov" {
-                    return Err(format!(
-                        "--mode={value} is not supported in SY.frontdesk.gov runtime (only gov)"
-                    )
-                    .into());
-                }
-                parsed.mode = RunnerMode::Gov;
+                parsed.dynamic_config_dir = Some(value.clone());
                 i += 2;
             }
             other => {
@@ -2986,7 +2779,7 @@ fn bootstrap_node_from_args(
             inferred
         })
         .ok_or_else(|| {
-            "when no --config is provided, pass --node-name (or FLUXBEE_NODE_NAME/AI_NODE_NAME env var), or provide hive.yaml with hive_id for SY.frontdesk.gov bootstrap".to_string()
+            "pass --node-name (or FLUXBEE_NODE_NAME/AI_NODE_NAME env var), or provide hive.yaml with hive_id for SY.frontdesk.gov bootstrap".to_string()
         })?;
     tracing::info!(
         node_name = %name,
@@ -3033,60 +2826,6 @@ fn infer_frontdesk_node_name_from_hive(config_dir: &std::path::Path) -> Option<S
         "bootstrapping SY.frontdesk.gov node_name from hive.yaml"
     );
     Some(format!("SY.frontdesk.gov@{hive_id}"))
-}
-
-fn ensure_unique_node_names(
-    configs: &[(PathBuf, RunnerConfig)],
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let mut names = HashSet::new();
-    for (path, cfg) in configs {
-        if !names.insert(cfg.node.name.clone()) {
-            return Err(format!(
-                "duplicate node name '{}' found in config {}",
-                cfg.node.name,
-                path.display()
-            )
-            .into());
-        }
-    }
-    Ok(())
-}
-
-fn build_behavior(
-    cfg: &RunnerConfig,
-) -> Result<NodeBehavior, Box<dyn std::error::Error + Send + Sync>> {
-    let engine = load_hive_ai_engine(&cfg.node.config_dir)?;
-    let behavior = match &cfg.behavior {
-        BehaviorSection::Echo => NodeBehavior::Echo,
-        BehaviorSection::AiChat(openai) => {
-            let instructions = resolve_instructions(&openai.instructions)?
-                .or_else(|| Some(frontdesk_default_instructions()));
-            let model_settings = openai
-                .model_settings
-                .as_ref()
-                .map(|v| ModelSettings {
-                    temperature: v.temperature,
-                    top_p: v.top_p,
-                    max_output_tokens: v.max_output_tokens,
-                })
-                .unwrap_or_default();
-            let multimodal = openai
-                .capabilities
-                .as_ref()
-                .and_then(|caps| caps.multimodal)
-                .unwrap_or_else(default_multimodal_for_runtime);
-            NodeBehavior::OpenAiChat(OpenAiChatRuntime {
-                provider: engine.provider,
-                model: engine.model,
-                instructions,
-                model_settings,
-                base_url: openai.base_url.clone(),
-                immediate_memory: cfg.runtime.immediate_memory.clone(),
-                multimodal,
-            })
-        }
-    };
-    Ok(behavior)
 }
 
 fn build_behavior_from_effective_config(
@@ -3151,201 +2890,6 @@ fn load_hive_ai_engine(
         .map(|engine| engine.unwrap_or_else(HiveAiConfig::fallback))
 }
 
-fn resolve_instructions(
-    cfg: &Option<InstructionsSourceConfig>,
-) -> Result<Option<String>, Box<dyn std::error::Error + Send + Sync>> {
-    let Some(cfg) = cfg else {
-        return Ok(None);
-    };
-
-    match cfg {
-        InstructionsSourceConfig::Inline(value) => Ok(Some(value.clone())),
-        InstructionsSourceConfig::Strategy(strategy) => match strategy.source {
-            InstructionsSourceKind::Inline => {
-                let Some(value) = strategy.value.clone() else {
-                    return Err("instructions.source=inline requires instructions.value".into());
-                };
-                Ok(Some(maybe_trim(value, strategy.trim)))
-            }
-            InstructionsSourceKind::File => {
-                let Some(path) = strategy.value.clone() else {
-                    return Err(
-                        "instructions.source=file requires instructions.value (path)".into(),
-                    );
-                };
-                let content = fs::read_to_string(path)?;
-                Ok(Some(maybe_trim(content, strategy.trim)))
-            }
-            InstructionsSourceKind::Env => {
-                let Some(env_name) = strategy.value.clone() else {
-                    return Err(
-                        "instructions.source=env requires instructions.value (env var)".into(),
-                    );
-                };
-                let value = std::env::var(&env_name).map_err(|_| {
-                    format!("missing env var for instructions source env: {}", env_name)
-                })?;
-                Ok(Some(maybe_trim(value, strategy.trim)))
-            }
-            InstructionsSourceKind::None => Ok(None),
-        },
-    }
-}
-
-fn maybe_trim(value: String, trim: bool) -> String {
-    if trim {
-        value.trim().to_string()
-    } else {
-        value
-    }
-}
-
-fn build_startup_effective_config_doc(cfg: &RunnerConfig) -> EffectiveConfigDocument {
-    let behavior = match &cfg.behavior {
-        BehaviorSection::Echo => EffectiveBehaviorSection {
-            kind: "echo".to_string(),
-            ..EffectiveBehaviorSection::default()
-        },
-        BehaviorSection::AiChat(openai) => EffectiveBehaviorSection {
-            kind: "ai_chat".to_string(),
-            instructions: Some(if openai.instructions.is_some() {
-                format_instructions_snapshot(&openai.instructions)
-            } else {
-                frontdesk_default_instructions_snapshot()
-            }),
-            model_settings: openai.model_settings.clone(),
-            base_url: openai.base_url.clone(),
-            capabilities: Some(BehaviorCapabilities {
-                multimodal: Some(
-                    openai
-                        .capabilities
-                        .as_ref()
-                        .and_then(|caps| caps.multimodal)
-                        .unwrap_or_else(default_multimodal_for_runtime),
-                ),
-            }),
-            ..EffectiveBehaviorSection::default()
-        },
-    };
-
-    EffectiveConfigDocument {
-        tenant_id: None,
-        node: Some(EffectiveNodeSection {
-            name: Some(cfg.node.name.clone()),
-            version: Some(cfg.node.version.clone()),
-            router_socket: Some(cfg.node.router_socket.clone()),
-            uuid_persistence_dir: Some(cfg.node.uuid_persistence_dir.clone()),
-            config_dir: Some(cfg.node.config_dir.clone()),
-            dynamic_config_dir: Some(cfg.node.dynamic_config_dir.clone()),
-        }),
-        behavior,
-        runtime: Some(EffectiveRuntimeSection {
-            read_timeout_ms: Some(cfg.runtime.read_timeout_ms),
-            handler_timeout_ms: Some(cfg.runtime.handler_timeout_ms),
-            write_timeout_ms: Some(cfg.runtime.write_timeout_ms),
-            queue_capacity: Some(cfg.runtime.queue_capacity),
-            worker_pool_size: Some(cfg.runtime.worker_pool_size),
-            retry_max_attempts: Some(cfg.runtime.retry_max_attempts),
-            retry_initial_backoff_ms: Some(cfg.runtime.retry_initial_backoff_ms),
-            retry_max_backoff_ms: Some(cfg.runtime.retry_max_backoff_ms),
-            metrics_log_interval_ms: Some(cfg.runtime.metrics_log_interval_ms),
-            immediate_memory: Some(cfg.runtime.immediate_memory.clone()),
-        }),
-    }
-}
-
-fn dynamic_config_path(base_dir: &std::path::Path, node_name: &str) -> PathBuf {
-    let safe_name = node_name.replace(['/', '\\'], "_");
-    base_dir.join(format!("{safe_name}.json"))
-}
-
-fn load_persisted_dynamic_config(
-    base_dir: &std::path::Path,
-    node_name: &str,
-) -> Option<EffectiveStateFile> {
-    let path = dynamic_config_path(base_dir, node_name);
-    let raw = fs::read_to_string(path).ok()?;
-    serde_json::from_str::<EffectiveStateFile>(&raw).ok()
-}
-
-fn persist_dynamic_config(
-    base_dir: &std::path::Path,
-    node_name: &str,
-    schema_version: u32,
-    config_version: u64,
-    config: &EffectiveConfigDocument,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    fs::create_dir_all(base_dir)?;
-    let path = dynamic_config_path(base_dir, node_name);
-    let payload = EffectiveStateFile {
-        schema_version,
-        config_version,
-        node_name: node_name.to_string(),
-        config: config.clone(),
-        updated_at: chrono::Utc::now().to_rfc3339(),
-    };
-    let json = serde_json::to_string_pretty(&payload)?;
-    write_json_atomic(&path, &json)?;
-    Ok(())
-}
-
-fn write_json_atomic(
-    path: &std::path::Path,
-    content: &str,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let parent = path
-        .parent()
-        .ok_or_else(|| "target path has no parent directory".to_string())?;
-    fs::create_dir_all(parent)?;
-
-    let tmp_name = format!(
-        ".{}.tmp.{}.{}",
-        path.file_name().and_then(|s| s.to_str()).unwrap_or("state"),
-        std::process::id(),
-        chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
-    );
-    let tmp_path = parent.join(tmp_name);
-
-    let mut file = OpenOptions::new()
-        .create_new(true)
-        .write(true)
-        .open(&tmp_path)?;
-    file.write_all(content.as_bytes())?;
-    file.flush()?;
-    file.sync_all()?;
-    drop(file);
-
-    if path.exists() {
-        fs::remove_file(path)?;
-    }
-    fs::rename(&tmp_path, path)?;
-
-    if let Ok(dir_file) = OpenOptions::new().read(true).open(parent) {
-        let _ = dir_file.sync_all();
-    }
-
-    Ok(())
-}
-
-fn format_instructions_snapshot(cfg: &Option<InstructionsSourceConfig>) -> Value {
-    match cfg {
-        None => Value::Null,
-        Some(InstructionsSourceConfig::Inline(value)) => {
-            json!({ "source": "inline", "value": value, "trim": true })
-        }
-        Some(InstructionsSourceConfig::Strategy(strategy)) => json!({
-            "source": match strategy.source {
-                InstructionsSourceKind::Inline => "inline",
-                InstructionsSourceKind::File => "file",
-                InstructionsSourceKind::Env => "env",
-                InstructionsSourceKind::None => "none"
-            },
-            "value": strategy.value,
-            "trim": strategy.trim
-        }),
-    }
-}
-
 /// Model D' — extract the openai api_key from a vault `value`. Vault may
 /// return either a bare string or an object with `api_key` field; both are
 /// accepted (matches what SY consumers do).
@@ -3361,68 +2905,21 @@ fn extract_openai_api_key_from_value(value: &Value) -> Option<String> {
         .map(ToString::to_string)
 }
 
-fn first_secret_bearing_config_field(config: &Value) -> Option<&'static str> {
-    if config.pointer("/secrets/openai/api_key").is_some() {
-        return Some("config.secrets.openai.api_key");
+/// Model D' (cf. `reject_architect_secret_fields`): SY.frontdesk.gov accepts NO config on CONFIG_SET —
+/// its behavior is baked (ai_chat + the frontdesk prompt), its provider/model are hive-wide (hive.yaml),
+/// and its credential lives in SY.vault. Returns the first offending config field, if any.
+fn frontdesk_rejected_config_field(payload: &Value) -> Option<&'static str> {
+    let config = payload.get("config").unwrap_or(payload);
+    if config.get("ai").is_some() || config.get("ai_providers").is_some() {
+        return Some("config.ai / config.ai_providers");
     }
-    if config.pointer("/secrets/openai/api_key_env").is_some() {
-        return Some("config.secrets.openai.api_key_env");
+    if config.get("behavior").is_some() {
+        return Some("config.behavior");
     }
-    if config.pointer("/behavior/openai/api_key").is_some() {
-        return Some("config.behavior.openai.api_key");
-    }
-    if config.pointer("/behavior/api_key").is_some() {
-        return Some("config.behavior.api_key");
-    }
-    if config.pointer("/behavior/api_key_env").is_some() {
-        return Some("config.behavior.api_key_env");
+    if config.get("api_key").is_some() || config.get("api_key_ref").is_some() {
+        return Some("config.api_key");
     }
     None
-}
-
-fn parse_effective_config_doc(
-    config: &Value,
-) -> Result<EffectiveConfigDocument, Box<dyn std::error::Error + Send + Sync>> {
-    Ok(serde_json::from_value::<EffectiveConfigDocument>(
-        config.clone(),
-    )?)
-}
-
-#[derive(Debug)]
-struct SpawnEffectiveConfig {
-    path: PathBuf,
-    schema_version: u32,
-    config_version: u64,
-    config: EffectiveConfigDocument,
-}
-
-fn load_effective_config_from_spawn(node_name: &str) -> Option<SpawnEffectiveConfig> {
-    let path = managed_node_config_path(node_name).ok()?;
-    let raw = fs::read_to_string(&path).ok()?;
-    let root: Value = serde_json::from_str(&raw).ok()?;
-    let schema_version = root
-        .get("_system")
-        .and_then(|v| v.get("config_version"))
-        .and_then(Value::as_u64)
-        .and_then(|v| u32::try_from(v).ok())
-        .unwrap_or(1);
-    let config_version = root
-        .get("_system")
-        .and_then(|v| v.get("updated_at_ms"))
-        .and_then(Value::as_u64)
-        .unwrap_or(1);
-    let mut candidate = root.get("config").cloned().unwrap_or(root);
-    if let Some(obj) = candidate.as_object_mut() {
-        obj.remove("_system");
-    }
-    let parsed = parse_effective_config_doc(&candidate).ok()?;
-    let config = materialize_effective_defaults(node_name, parsed);
-    Some(SpawnEffectiveConfig {
-        path,
-        schema_version,
-        config_version,
-        config,
-    })
 }
 
 fn materialize_effective_defaults(
@@ -3698,7 +3195,7 @@ fn build_frontdesk_result_reply(
     let value = if let Some(contract) = extract_response_envelope(&msg.meta)? {
         validate_frontdesk_response_envelope(&contract)?;
         build_text_response(serde_json::to_string(
-            &frontdesk_structured_response_payload(&payload),
+            &frontdesk_structured_response_payload(&payload, &contract),
         )?)?
     } else {
         build_text_response(payload.human_message.clone())?
@@ -3780,6 +3277,8 @@ fn validate_frontdesk_response_envelope(contract: &Value) -> fluxbee_ai_sdk::Res
             "success" => field_type == "boolean",
             "human_message" => field_type == "string",
             "error_code" => field_type == "string",
+            "ilk_id" => field_type == "string",
+            "merged" => field_type == "boolean",
             _ => false,
         };
         if !supported {
@@ -3794,15 +3293,27 @@ fn validate_frontdesk_response_envelope(contract: &Value) -> fluxbee_ai_sdk::Res
     Ok(())
 }
 
-fn frontdesk_structured_response_payload(payload: &FrontdeskResultPayload) -> Value {
+/// The structured verdict, with the optional fields the caller's contract asks for: `ilk_id` is the
+/// ILK the person ended up on (after a merge, the one that already had the email, not the
+/// temporary), and `merged` says that happened.
+fn frontdesk_structured_response_payload(payload: &FrontdeskResultPayload, contract: &Value) -> Value {
+    let requested = |field: &str| {
+        contract
+            .get("properties")
+            .and_then(Value::as_object)
+            .is_some_and(|properties| properties.contains_key(field))
+    };
     let success = payload.status == "ok";
     let error_code = if success {
         None
     } else {
         Some(match payload.result_code.as_str() {
             "MISSING_REQUIRED_FIELDS" => "missing_required_fields",
+            "IN_CONVERSATION" => "in_conversation",
             "INVALID_REQUEST" => "invalid_request",
             "IDENTITY_UNAVAILABLE" => "identity_unavailable",
+            "TENANT_UNRESOLVED" => "tenant_unresolved",
+            "TENANT_NOT_REGISTRABLE" => "tenant_not_registrable",
             "REGISTER_FAILED" => "register_failed",
             _ => "unknown",
         })
@@ -3817,6 +3328,17 @@ fn frontdesk_structured_response_payload(payload: &FrontdeskResultPayload) -> Va
         obj.insert(
             "error_code".to_string(),
             Value::String(error_code.to_string()),
+        );
+    }
+    if requested("ilk_id") {
+        if let Some(ilk_id) = payload.ilk_id.as_deref().filter(|id| !id.is_empty()) {
+            obj.insert("ilk_id".to_string(), Value::String(ilk_id.to_string()));
+        }
+    }
+    if requested("merged") {
+        obj.insert(
+            "merged".to_string(),
+            Value::Bool(payload.result_code == "MERGED"),
         );
     }
     Value::Object(obj)
@@ -3854,17 +3376,27 @@ fn build_frontdesk_result_from_register_response(
         .and_then(Value::as_str)
         .unwrap_or("error");
     if status.eq_ignore_ascii_case("ok") {
-        let mut payload =
-            frontdesk_result_payload("ok", "REGISTERED", "Registro completado correctamente.");
-        payload.ilk_id = src_ilk.or_else(|| {
-            register_payload
-                .get("identity_payload")
-                .and_then(|value| value.get("ilk_id"))
-                .and_then(Value::as_str)
-                .map(ToString::to_string)
-        });
-        payload.tenant_id = register_payload
-            .get("identity_payload")
+        let identity = register_payload.get("identity_payload");
+        let merged = identity
+            .and_then(|value| value.get("merged"))
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let mut payload = if merged {
+            frontdesk_result_payload(
+                "ok",
+                "MERGED",
+                "Ya estabas registrado con ese email: este canal quedó asociado a tu registro.",
+            )
+        } else {
+            frontdesk_result_payload("ok", "REGISTERED", "Registro completado correctamente.")
+        };
+        // The ilk the person ended on, as SY.identity answered: after a merge it is not src_ilk.
+        payload.ilk_id = identity
+            .and_then(|value| value.get("ilk_id"))
+            .and_then(Value::as_str)
+            .map(ToString::to_string)
+            .or(src_ilk);
+        payload.tenant_id = identity
             .and_then(|value| value.get("tenant_id"))
             .and_then(Value::as_str)
             .map(ToString::to_string);
@@ -3876,18 +3408,38 @@ fn build_frontdesk_result_from_register_response(
         .get("error_code")
         .and_then(Value::as_str)
         .unwrap_or("IDENTITY_ERROR");
-    let result_code = match error_code {
-        "UNREACHABLE" | "TIMEOUT" | "TTL_EXCEEDED" | "NOT_PRIMARY" | "IDENTITY_ERROR" => {
-            "IDENTITY_UNAVAILABLE"
-        }
-        "INVALID_REQUEST" | "missing_src_ilk" | "invalid_identity_candidate" => "INVALID_REQUEST",
-        _ => "REGISTER_FAILED",
+    // Only a transient failure is IDENTITY_UNAVAILABLE. A code SY.identity answered with is a final
+    // verdict (TENANT_PENDING, ILK_DELETED, SYSTEM_ILK_PROTECTED, DUPLICATE_EMAIL, ...) and keeps
+    // its own error_code.
+    let (result_code, human_message) = if identity_error_is_transient(error_code) {
+        (
+            "IDENTITY_UNAVAILABLE",
+            "No pude completar el registro en este momento.",
+        )
+    } else if error_code == CASE_TENANT_MISSING {
+        // No tenant for the case: nothing to register into, and the frontdesk creates none.
+        (
+            "TENANT_UNRESOLVED",
+            "No pude completar el registro: este contacto no tiene una organización asignada.",
+        )
+    } else if error_code == TENANT_ROOT_NOT_REGISTRABLE {
+        // The case is of the root tenant, where nobody registers: the same final answer whether
+        // the frontdesk saw it or SY.identity did.
+        (
+            "TENANT_NOT_REGISTRABLE",
+            "No puedo completar el registro por este canal: no pertenece a ninguna organización.",
+        )
+    } else if error_code.starts_with("INVALID_")
+        || matches!(
+            error_code,
+            "missing_src_ilk" | "invalid_identity_candidate" | CASE_TENANT_MISMATCH
+        )
+    {
+        ("INVALID_REQUEST", "No pude completar el registro.")
+    } else {
+        ("REGISTER_FAILED", "No pude completar el registro.")
     };
-    let mut payload = frontdesk_result_payload(
-        "error",
-        result_code,
-        "No pude completar el registro en este momento.",
-    );
+    let mut payload = frontdesk_result_payload("error", result_code, human_message);
     payload.error_code = Some(error_code.to_string());
     payload.error_detail = register_payload
         .get("message")
@@ -4139,30 +3691,18 @@ fn src_ilk_source(msg: &Message) -> &'static str {
     "missing"
 }
 
-fn incoming_sender_hint(msg: &Message) -> Option<String> {
-    let ctx = msg.meta.context.as_ref()?;
-    let io = ctx.get("io")?;
-    let sender = io.get("sender")?;
-    let kind = sender.get("kind").and_then(Value::as_str).map(str::trim);
-    let id = sender.get("id").and_then(Value::as_str).map(str::trim);
-    match (kind, id) {
-        (Some(k), Some(i)) if !k.is_empty() && !i.is_empty() => Some(format!("{k}:{i}")),
-        (_, Some(i)) if !i.is_empty() => Some(i.to_string()),
-        _ => None,
-    }
-}
-
-fn text_preview(text: &str, max_chars: usize) -> String {
-    let compact = text.split_whitespace().collect::<Vec<_>>().join(" ");
-    if compact.chars().count() <= max_chars {
-        return compact;
-    }
-    let mut out = String::new();
-    for ch in compact.chars().take(max_chars) {
-        out.push(ch);
-    }
-    out.push_str("...");
-    out
+/// The IO sender's kind only: its id is the person's handle (a phone number, a user id).
+fn incoming_sender_kind(msg: &Message) -> Option<String> {
+    msg.meta
+        .context
+        .as_ref()?
+        .get("io")?
+        .get("sender")?
+        .get("kind")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|kind| !kind.is_empty())
+        .map(ToString::to_string)
 }
 
 #[allow(dead_code)]
@@ -4174,6 +3714,21 @@ fn require_src_ilk(ctx: &BehaviorContext) -> fluxbee_ai_sdk::Result<&str> {
 
 #[cfg(test)]
 mod tests {
+    /// The contract the IO producers send (io_common::frontdesk_gate::frontdesk_response_contract).
+    fn producer_contract() -> Value {
+        json!({
+            "kind": "json_object_v1",
+            "required": ["success", "human_message"],
+            "properties": {
+                "success": {"type": "boolean"},
+                "human_message": {"type": "string"},
+                "error_code": {"type": "string"},
+                "ilk_id": {"type": "string"},
+                "merged": {"type": "boolean"}
+            }
+        })
+    }
+
     use super::*;
     use fluxbee_ai_sdk::{Destination, Meta, Routing};
     use gov_common::frontdesk_contract::FRONTDESK_RESULT_PAYLOAD_TYPE;
@@ -4241,18 +3796,14 @@ mod tests {
     fn test_node() -> GenericAiNode {
         let gov_identity = GovIdentityConfig::default();
         GenericAiNode {
-            mode: RunnerMode::Gov,
             node_name: "SY.frontdesk.gov".to_string(),
             self_ilk_id: None,
             behavior: Arc::new(RwLock::new(None)),
-            config_dir: PathBuf::from("/tmp"),
-            dynamic_config_dir: PathBuf::from("/tmp"),
-            router_socket: PathBuf::from("/tmp"),
-            state_dir: PathBuf::from("/tmp"),
             thread_state_store: None,
             immediate_memory_store: None,
             gov_identity,
             gov_identity_bridge: None,
+            ilk_tenant: test_ilk_tenant(),
             vault: None,
             control_plane: Arc::new(RwLock::new(ControlPlaneState {
                 current_state: NodeLifecycleState::Unconfigured,
@@ -4261,6 +3812,7 @@ mod tests {
                 schema_version: 0,
                 config_version: 0,
             })),
+            usage: UsageRecorder::disabled(),
         }
     }
 
@@ -4392,6 +3944,60 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn frontdesk_handoff_runs_deterministically_even_when_unconfigured() {
+        // The deterministic (JSON handoff) method must NOT require the node Configured — a Cloud
+        // register_human cannot depend on the frontdesk having an LLM behavior. test_node() is
+        // UNCONFIGURED by default; the handoff must still reach handle_frontdesk_handoff (here it is
+        // incomplete → needs_input) rather than being rejected with node_not_configured.
+        let node = test_node();
+        // NOTE: intentionally NOT setting Configured.
+        let mut msg = sample_user_request_with_context(
+            json!({
+                "thread_id": "frontdesk-thread-unconfigured-1",
+                "response_envelope": {
+                    "kind": "json_object_v1",
+                    "required": ["success", "human_message"],
+                    "properties": {
+                        "success": { "type": "boolean" },
+                        "human_message": { "type": "string" },
+                        "error_code": { "type": "string" }
+                    }
+                }
+            }),
+            Some("ilk:11111111-1111-4111-8111-111111111111"),
+        );
+        msg.payload = json!({
+            "type": "frontdesk_handoff",
+            "schema_version": 1,
+            "operation": "complete_registration",
+            "subject": { "display_name": "Juan Perez" }
+        });
+
+        let response = node
+            .on_message(msg)
+            .await
+            .expect("handoff should not fail")
+            .expect("response should exist");
+        // Must NOT be the node-not-configured rejection: the deterministic path ran despite no config.
+        assert_ne!(
+            response.payload.get("code").and_then(Value::as_str),
+            Some("node_not_configured"),
+            "unconfigured node must still handle the deterministic handoff, not reject it"
+        );
+        // It reached handle_frontdesk_handoff → structured needs_input (success:false, email missing).
+        assert_eq!(
+            response.payload.get("type").and_then(Value::as_str),
+            Some("text")
+        );
+        let content = extract_text(&response.payload).expect("structured text");
+        let structured: Value = serde_json::from_str(&content).expect("valid structured json");
+        assert_eq!(
+            structured.get("success").and_then(Value::as_bool),
+            Some(false)
+        );
+    }
+
+    #[tokio::test]
     async fn frontdesk_handoff_with_response_envelope_returns_structured_text_payload() {
         let node = test_node();
         {
@@ -4517,15 +4123,21 @@ mod tests {
         );
         let content = extract_text(&response.payload).expect("structured text");
         let structured: Value = serde_json::from_str(&content).expect("valid structured json");
+        // A plain conversational turn (Echo: no tool call, no thread_state written) must NOT be
+        // reported as a completed registration — that was the false-REGISTERED bug. The response is
+        // structured (envelope present) but success=false with error_code=in_conversation.
         assert_eq!(
             structured.get("success").and_then(Value::as_bool),
-            Some(true)
+            Some(false)
         );
         assert_eq!(
             structured.get("human_message").and_then(Value::as_str),
             Some("Echo: hola")
         );
-        assert!(structured.get("error_code").is_none());
+        assert_eq!(
+            structured.get("error_code").and_then(Value::as_str),
+            Some("in_conversation")
+        );
     }
 
     #[tokio::test]
@@ -4638,6 +4250,7 @@ mod tests {
             .build_tool_registry(&BehaviorContext {
                 thread_id: None,
                 src_ilk: None,
+                trace_id: None,
             })
             .expect("registry");
         let names = registry
@@ -4709,54 +4322,33 @@ mod tests {
         let ctx = BehaviorContext {
             thread_id: None,
             src_ilk: None,
+            trace_id: None,
         };
         let err = require_src_ilk(&ctx).expect_err("missing src_ilk should fail");
         assert!(err.to_string().contains("missing_src_ilk"));
     }
 
     #[test]
-    fn frontdesk_rejects_secret_bearing_config_fields() {
-        let config = json!({
-            "behavior": {
-                "kind": "ai_chat",
-                "openai": {
-                    "api_key": "sk-test"
-                }
-            }
-        });
-
+    fn frontdesk_config_set_rejects_all_config_fields() {
+        // Autonomous node (Model D'): CONFIG_SET accepts NO config — the behavior is baked and the
+        // credential lives in SY.vault. Any config/secret/behavior field is rejected; an empty config
+        // (a bare vault re-resolve trigger) is accepted.
         assert_eq!(
-            first_secret_bearing_config_field(&config),
-            Some("config.behavior.openai.api_key")
+            frontdesk_rejected_config_field(&json!({"config": {"behavior": {"kind": "ai_chat"}}})),
+            Some("config.behavior")
         );
-
-        let config = json!({
-            "secrets": {
-                "openai": {
-                    "api_key": "sk-test"
-                }
-            }
-        });
-
         assert_eq!(
-            first_secret_bearing_config_field(&config),
-            Some("config.secrets.openai.api_key")
+            frontdesk_rejected_config_field(&json!({"config": {"ai": {"model": "gpt-5.5"}}})),
+            Some("config.ai / config.ai_providers")
         );
-    }
-
-    #[test]
-    fn resolve_tenant_id_prefers_explicit_over_hint() {
-        let explicit = "tnt:11111111-1111-4111-8111-111111111111";
-        let hint = "tnt:22222222-2222-4222-8222-222222222222";
-        let out = resolve_tenant_id_for_register(Some(explicit), Some(hint), None);
-        assert_eq!(out.as_deref(), Some(explicit));
-    }
-
-    #[test]
-    fn resolve_tenant_id_uses_hint_when_explicit_missing() {
-        let hint = "tnt:22222222-2222-4222-8222-222222222222";
-        let out = resolve_tenant_id_for_register(None, Some(hint), None);
-        assert_eq!(out.as_deref(), Some(hint));
+        assert_eq!(
+            frontdesk_rejected_config_field(&json!({"config": {"api_key": "sk-x"}})),
+            Some("config.api_key")
+        );
+        assert_eq!(
+            frontdesk_rejected_config_field(&json!({"config": {}})),
+            None
+        );
     }
 
     #[test]
@@ -4847,7 +4439,7 @@ mod tests {
             registration_status: Some("complete".to_string()),
         };
 
-        let structured = frontdesk_structured_response_payload(&payload);
+        let structured = frontdesk_structured_response_payload(&payload, &producer_contract());
         assert_eq!(
             structured.get("success").and_then(Value::as_bool),
             Some(true)
@@ -4875,7 +4467,7 @@ mod tests {
             registration_status: Some("temporary".to_string()),
         };
 
-        let structured = frontdesk_structured_response_payload(&payload);
+        let structured = frontdesk_structured_response_payload(&payload, &producer_contract());
         assert_eq!(
             structured.get("success").and_then(Value::as_bool),
             Some(false)
@@ -4884,5 +4476,671 @@ mod tests {
             structured.get("error_code").and_then(Value::as_str),
             Some("register_failed")
         );
+    }
+
+    const TEST_ILK: &str = "ilk:11111111-1111-4111-8111-111111111111";
+    const TEST_TENANT: &str = "tnt:22222222-2222-4222-8222-222222222222";
+    const OTHER_TENANT: &str = "tnt:33333333-3333-4333-8333-333333333333";
+    const UNKNOWN_ILK: &str = "ilk:44444444-4444-4444-8444-444444444444";
+    const REGISTERED_ILK: &str = "ilk:55555555-5555-4555-8555-555555555555";
+    const ROOT_ILK: &str = "ilk:66666666-6666-4666-8666-666666666666";
+
+    /// The identity SHM of the tests: TEST_ILK is a temporary ILK of TEST_TENANT, and ROOT_ILK one
+    /// a root-tenant IO node provisioned.
+    fn test_ilk_tenant() -> IlkTenantLookup {
+        Arc::new(|ilk_id: &str| match ilk_id {
+            TEST_ILK => Some(TEST_TENANT.to_string()),
+            ROOT_ILK => Some(fluxbee_sdk::DEFAULT_ROOT_TENANT_ID.to_string()),
+            _ => None,
+        })
+    }
+
+    fn register_failure(error_code: &str) -> FrontdeskResultPayload {
+        let reply = fluxbee_sdk::IdentitySystemResult {
+            payload: json!({
+                "status": "error",
+                "error_code": error_code,
+                "message": "failed to register ilk"
+            }),
+            effective_target: "SY.identity@motherbee".to_string(),
+            trace_id: "trace-identity-1".to_string(),
+        };
+        let err = identity_reply_outcome(MSG_ILK_REGISTER, reply)
+            .expect_err("a non-ok identity reply is a rejection");
+        build_frontdesk_result_from_register_response(
+            &identity_error_to_tool_payload(&err),
+            Some(TEST_ILK.to_string()),
+        )
+    }
+
+    #[test]
+    fn final_identity_rejections_are_register_failed_not_identity_unavailable() {
+        for code in [
+            "TENANT_PENDING",
+            "TENANT_SUSPENDED",
+            "TENANT_DELETED",
+            "ILK_DELETED",
+            "ILK_NOT_FOUND",
+            "SYSTEM_ILK_PROTECTED",
+            "DUPLICATE_EMAIL",
+            "UNAUTHORIZED_REGISTRAR",
+        ] {
+            let result = register_failure(code);
+            assert_eq!(result.status, "error");
+            assert_eq!(result.result_code, "REGISTER_FAILED", "{code}");
+            assert_eq!(result.error_code.as_deref(), Some(code));
+            assert_eq!(result.registration_status.as_deref(), Some("temporary"));
+            assert_eq!(
+                frontdesk_structured_response_payload(&result, &producer_contract())["error_code"],
+                "register_failed"
+            );
+        }
+        let invalid = register_failure("INVALID_TENANT");
+        assert_eq!(invalid.result_code, "INVALID_REQUEST");
+        assert_eq!(invalid.error_code.as_deref(), Some("INVALID_TENANT"));
+    }
+
+    #[test]
+    fn transient_identity_failures_stay_identity_unavailable() {
+        for code in ["NOT_PRIMARY", "DB_NOT_READY", "DB_WRITE_FAILED"] {
+            let result = register_failure(code);
+            assert_eq!(result.result_code, "IDENTITY_UNAVAILABLE", "{code}");
+            assert_eq!(result.error_code.as_deref(), Some(code));
+        }
+        let unreachable = identity_error_to_tool_payload(&IdentityError::Unreachable {
+            reason: "NODE_NOT_FOUND".to_string(),
+            original_dst: "SY.identity@motherbee".to_string(),
+        });
+        let result = build_frontdesk_result_from_register_response(&unreachable, None);
+        assert_eq!(result.result_code, "IDENTITY_UNAVAILABLE");
+        assert_eq!(
+            frontdesk_structured_response_payload(&result, &producer_contract())["error_code"],
+            "identity_unavailable"
+        );
+    }
+
+    #[test]
+    fn identity_reply_outcome_accepts_only_status_ok() {
+        let reply = |payload: Value| fluxbee_sdk::IdentitySystemResult {
+            payload,
+            effective_target: "SY.identity@motherbee".to_string(),
+            trace_id: "trace-identity-2".to_string(),
+        };
+        assert!(identity_reply_outcome(
+            MSG_ILK_REGISTER,
+            reply(json!({"status": "ok", "ilk_id": TEST_ILK}))
+        )
+        .is_ok());
+        let err = identity_reply_outcome(MSG_ILK_REGISTER, reply(json!({"status": "error"})))
+            .expect_err("status error is a rejection");
+        assert!(matches!(
+            err,
+            IdentityError::SystemRejected { ref action, ref error_code, .. }
+                if action == MSG_ILK_REGISTER && error_code == "UNKNOWN"
+        ));
+    }
+
+    fn test_tool(
+        scoped_src_ilk: Option<&str>,
+        informed_tenant_id: Option<&str>,
+    ) -> IlkRegisterTool {
+        IlkRegisterTool {
+            scoped_src_ilk: scoped_src_ilk.map(ToString::to_string),
+            informed_tenant_id: informed_tenant_id.map(ToString::to_string),
+            ilk_tenant: test_ilk_tenant(),
+            identity: GovIdentityConfig::default(),
+            bridge: None,
+        }
+    }
+
+    #[test]
+    fn ilk_register_schema_has_no_thread_id() {
+        let schema = test_tool(None, None).definition().parameters_json_schema;
+        assert!(schema["properties"].get("thread_id").is_none());
+    }
+
+    #[test]
+    fn ilk_register_schema_takes_no_tenant() {
+        let schema = test_tool(None, None).definition().parameters_json_schema;
+        assert!(schema["properties"].get("tenant_id").is_none());
+        let candidate = &schema["properties"]["identity_candidate"];
+        assert!(candidate["properties"].get("tenant_hint").is_none());
+        assert_eq!(candidate["additionalProperties"], false);
+    }
+
+    /// Collects what the fmt layer writes on this thread while its guard lives.
+    #[derive(Clone, Default)]
+    struct LogCapture(Arc<Mutex<Vec<u8>>>);
+
+    thread_local! {
+        static THREAD_CAPTURE: std::cell::RefCell<Option<LogCapture>> =
+            const { std::cell::RefCell::new(None) };
+    }
+
+    /// The writer of the one global test subscriber: this thread's capture, if any. A global
+    /// subscriber that takes every level keeps tracing's per-callsite interest cache from
+    /// silencing a capture when parallel tests hit the same callsites (as `set_default` did).
+    struct ThreadCaptureWriter;
+
+    impl std::io::Write for ThreadCaptureWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            THREAD_CAPTURE.with(|capture| {
+                if let Some(capture) = capture.borrow().as_ref() {
+                    capture
+                        .0
+                        .lock()
+                        .expect("log capture")
+                        .extend_from_slice(buf);
+                }
+            });
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Ends this thread's capture.
+    struct LogCaptureGuard;
+
+    impl Drop for LogCaptureGuard {
+        fn drop(&mut self) {
+            THREAD_CAPTURE.with(|capture| *capture.borrow_mut() = None);
+        }
+    }
+
+    impl LogCapture {
+        fn start() -> (Self, LogCaptureGuard) {
+            static GLOBAL_SUBSCRIBER: OnceLock<()> = OnceLock::new();
+            GLOBAL_SUBSCRIBER.get_or_init(|| {
+                let subscriber = tracing_subscriber::fmt()
+                    .with_writer(|| ThreadCaptureWriter)
+                    .with_ansi(false)
+                    .with_max_level(tracing::Level::TRACE)
+                    .finish();
+                tracing::subscriber::set_global_default(subscriber)
+                    .expect("the test log subscriber is the only global one");
+            });
+            // A callsite registered while the subscriber was being installed keeps no stale
+            // "never" interest.
+            tracing::callsite::rebuild_interest_cache();
+            let capture = Self::default();
+            THREAD_CAPTURE.with(|slot| *slot.borrow_mut() = Some(capture.clone()));
+            (capture, LogCaptureGuard)
+        }
+
+        fn text(&self) -> String {
+            String::from_utf8_lossy(&self.0.lock().expect("log capture")).into_owned()
+        }
+    }
+
+    const PERSONAL_VALUES: [&str; 6] = [
+        "Juana Secreta",
+        "juana.secreta@example.com",
+        "+5491100009999",
+        "Empresa Secreta SA",
+        "crm-secret-42",
+        "Hint Secreto SRL",
+    ];
+
+    fn assert_no_personal_data(logs: &str) {
+        assert!(!logs.is_empty(), "expected captured logs");
+        for value in PERSONAL_VALUES {
+            assert!(
+                !logs.contains(value),
+                "personal data {value:?} leaked into the logs:\n{logs}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn ilk_register_tool_logs_carry_no_personal_data() {
+        let tool = test_tool(Some(TEST_ILK), None);
+        let candidate = json!({
+            "name": "Juana Secreta",
+            "email": "juana.secreta@example.com",
+            "phone": "+5491100009999",
+            "company_name": "Empresa Secreta SA",
+            "attributes": { "crm_customer_id": "crm-secret-42" },
+            "tenant_hint": "Hint Secreto SRL"
+        });
+        let (logs, _guard) = LogCapture::start();
+        // Straight to ILK_REGISTER with the case's tenant (it then fails: no identity bridge).
+        let registered = tool
+            .call(json!({ "src_ilk": TEST_ILK, "identity_candidate": candidate }))
+            .await
+            .expect("tool call");
+        assert_eq!(registered["status"], "error");
+
+        let text = logs.text();
+        assert_no_personal_data(&text);
+        assert!(text.contains("sending ILK_REGISTER to identity"));
+        assert!(text.contains(TEST_ILK));
+        assert!(text.contains(TEST_TENANT));
+        assert!(
+            text.contains("\"email\""),
+            "field names are logged:\n{text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn ilk_register_takes_the_tenant_of_the_case_never_the_llms() {
+        // The LLM (or the person through it) names a tenant: it is not a parameter, and it is not
+        // followed. The registration goes to the tenant of the case's ILK.
+        let tool = test_tool(Some(TEST_ILK), None);
+        let (logs, _guard) = LogCapture::start();
+        let out = tool
+            .call(json!({
+                "src_ilk": TEST_ILK,
+                "tenant_id": OTHER_TENANT,
+                "identity_candidate": {
+                    "name": "Ana", "email": "ana@example.com", "tenant_hint": OTHER_TENANT
+                }
+            }))
+            .await
+            .expect("tool call");
+        assert_eq!(
+            out["error_code"], "IDENTITY_ERROR",
+            "it reached ILK_REGISTER"
+        );
+
+        let text = logs.text();
+        assert!(text.contains("sending ILK_REGISTER to identity"));
+        assert!(text.contains(TEST_TENANT));
+        assert!(!text.contains(OTHER_TENANT), "{text}");
+        assert!(!text.contains("TNT_CREATE"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn ilk_register_without_the_case_tenant_sends_nothing_and_creates_no_tenant() {
+        // An ILK whose tenant cannot be read: whatever the LLM says, nothing goes to identity.
+        let tool = test_tool(Some(UNKNOWN_ILK), None);
+        let (logs, _guard) = LogCapture::start();
+        let out = tool
+            .call(json!({
+                "src_ilk": UNKNOWN_ILK,
+                "tenant_id": TEST_TENANT,
+                "identity_candidate": {
+                    "name": "Ana", "email": "ana@example.com", "company_name": "Acme SA"
+                }
+            }))
+            .await
+            .expect("tool call");
+        assert_eq!(out["status"], "error");
+        assert_eq!(out["error_code"], CASE_TENANT_MISSING);
+        let text = logs.text();
+        assert!(!text.contains("sending ILK_REGISTER"), "{text}");
+        assert!(!text.contains("TNT_CREATE"), "{text}");
+    }
+
+    #[test]
+    fn tenant_errors_are_explicit_results() {
+        let missing = build_frontdesk_result_from_register_response(
+            &case_tenant_error_payload(CASE_TENANT_MISSING),
+            Some(UNKNOWN_ILK.to_string()),
+        );
+        assert_eq!(missing.status, "error");
+        assert_eq!(missing.result_code, "TENANT_UNRESOLVED");
+        assert_eq!(missing.error_code.as_deref(), Some(CASE_TENANT_MISSING));
+        assert_eq!(
+            frontdesk_structured_response_payload(&missing, &producer_contract())["error_code"],
+            "tenant_unresolved"
+        );
+        let mismatch = build_frontdesk_result_from_register_response(
+            &case_tenant_error_payload(CASE_TENANT_MISMATCH),
+            Some(TEST_ILK.to_string()),
+        );
+        assert_eq!(mismatch.result_code, "INVALID_REQUEST");
+        assert_eq!(mismatch.error_code.as_deref(), Some(CASE_TENANT_MISMATCH));
+    }
+
+    #[test]
+    fn a_root_tenant_case_is_a_final_tenant_not_registrable() {
+        // The same answer whether the frontdesk sees the root tenant or SY.identity answers it.
+        for result in [
+            build_frontdesk_result_from_register_response(
+                &case_tenant_error_payload(TENANT_ROOT_NOT_REGISTRABLE),
+                Some(ROOT_ILK.to_string()),
+            ),
+            register_failure(TENANT_ROOT_NOT_REGISTRABLE),
+        ] {
+            assert_eq!(result.status, "error");
+            assert_eq!(result.result_code, "TENANT_NOT_REGISTRABLE");
+            assert_eq!(
+                result.error_code.as_deref(),
+                Some(TENANT_ROOT_NOT_REGISTRABLE)
+            );
+            assert_eq!(result.registration_status.as_deref(), Some("temporary"));
+            assert!(result.human_message.contains("ninguna organización"));
+            let structured = frontdesk_structured_response_payload(&result, &producer_contract());
+            assert_eq!(structured["success"], false);
+            assert_eq!(structured["error_code"], "tenant_not_registrable");
+        }
+    }
+
+    #[tokio::test]
+    async fn ilk_register_never_registers_into_the_root_tenant() {
+        let tool = test_tool(Some(ROOT_ILK), None);
+        let (logs, _guard) = LogCapture::start();
+        let out = tool
+            .call(json!({
+                "src_ilk": ROOT_ILK,
+                "identity_candidate": { "name": "Ana", "email": "ana@example.com" }
+            }))
+            .await
+            .expect("tool call");
+        assert_eq!(out["status"], "error");
+        assert_eq!(out["error_code"], TENANT_ROOT_NOT_REGISTRABLE);
+        assert_eq!(out["retryable"], false);
+        let text = logs.text();
+        assert!(!text.contains("sending ILK_REGISTER"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn a_handoff_of_a_root_tenant_case_registers_nothing() {
+        let (node, state) = test_node_with_state();
+        for informed in [None, Some(fluxbee_sdk::DEFAULT_ROOT_TENANT_ID)] {
+            let reply = structured_reply(&node, structured_handoff(ROOT_ILK, informed)).await;
+            assert_eq!(reply["success"], false);
+            assert_eq!(reply["error_code"], "tenant_not_registrable");
+        }
+        // Not even asked for missing data (the IO first-contact gate sends none).
+        let mut first_contact = structured_handoff(ROOT_ILK, None);
+        first_contact.payload["subject"] = json!({ "attributes": { "channel_type": "slack" } });
+        let reply = structured_reply(&node, first_contact).await;
+        assert_eq!(reply["error_code"], "tenant_not_registrable");
+        assert!(state.0.lock().expect("thread state").is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_conversation_of_a_root_tenant_case_ends_before_the_llm() {
+        // No LLM configured: a case of the root tenant still gets its final answer.
+        let (node, state) = test_node_with_state();
+        let mut msg = sample_user_request_with_context(
+            json!({
+                "thread_id": "frontdesk-thread-root",
+                "response_envelope": producer_contract()
+            }),
+            Some(ROOT_ILK),
+        );
+        msg.payload = json!({ "type": "text", "content": "hola, quiero registrarme" });
+        let reply = structured_reply(&node, msg).await;
+        assert_eq!(reply["success"], false);
+        assert_eq!(reply["error_code"], "tenant_not_registrable");
+        assert!(state.0.lock().expect("thread state").is_empty());
+
+        // Without an envelope the person reads the human message.
+        let plain = sample_user_request_with_context(
+            json!({ "thread_id": "frontdesk-thread-root" }),
+            Some(ROOT_ILK),
+        );
+        let response = node
+            .on_message(plain)
+            .await
+            .expect("on_message")
+            .expect("response");
+        let text = extract_text(&response.payload).expect("text");
+        assert!(
+            text.contains("no pertenece a ninguna organización"),
+            "{text}"
+        );
+
+        // Any other case goes on to the conversation, which here needs the LLM.
+        let other = sample_user_request_with_context(
+            json!({ "thread_id": "frontdesk-thread-other" }),
+            Some(TEST_ILK),
+        );
+        let response = node
+            .on_message(other)
+            .await
+            .expect("on_message")
+            .expect("response");
+        assert_eq!(response.payload["code"], "node_not_configured");
+    }
+
+    #[test]
+    fn a_merge_is_reported_with_the_ilk_the_person_ended_on() {
+        let tool_output = |identity_payload: Value| {
+            json!({
+                "status": "ok",
+                "registered": true,
+                "identity_payload": identity_payload
+            })
+        };
+        let merged = build_frontdesk_result_from_register_response(
+            &tool_output(json!({
+                "status": "ok", "ilk_id": REGISTERED_ILK, "tenant_id": TEST_TENANT,
+                "registration_status": "complete", "merged": true, "merged_from_ilk_id": TEST_ILK
+            })),
+            Some(TEST_ILK.to_string()),
+        );
+        assert_eq!(merged.status, "ok");
+        assert_eq!(merged.result_code, "MERGED");
+        assert_eq!(merged.ilk_id.as_deref(), Some(REGISTERED_ILK));
+        assert_eq!(merged.tenant_id.as_deref(), Some(TEST_TENANT));
+        assert_eq!(merged.registration_status.as_deref(), Some("complete"));
+        let structured = frontdesk_structured_response_payload(&merged, &producer_contract());
+        assert_eq!(structured["success"], true);
+        assert!(structured.get("error_code").is_none());
+        // The caller learns where the person ended up, not the temporary it provisioned.
+        assert_eq!(structured["ilk_id"], REGISTERED_ILK);
+        assert_eq!(structured["merged"], true);
+        // A caller that did not ask for them does not get them.
+        let minimal = json!({
+            "kind": "json_object_v1",
+            "required": ["success", "human_message"],
+            "properties": {"success": {"type": "boolean"}, "human_message": {"type": "string"}}
+        });
+        let structured_minimal = frontdesk_structured_response_payload(&merged, &minimal);
+        assert!(structured_minimal.get("ilk_id").is_none());
+        assert!(structured_minimal.get("merged").is_none());
+        assert!(structured["human_message"]
+            .as_str()
+            .is_some_and(|text| text.contains("Ya estabas registrado")));
+
+        let registered = build_frontdesk_result_from_register_response(
+            &tool_output(json!({
+                "status": "ok", "ilk_id": TEST_ILK, "tenant_id": TEST_TENANT,
+                "registration_status": "complete", "merged": false
+            })),
+            Some(TEST_ILK.to_string()),
+        );
+        assert_eq!(registered.result_code, "REGISTERED");
+        assert_eq!(registered.ilk_id.as_deref(), Some(TEST_ILK));
+        assert_eq!(registered.tenant_id.as_deref(), Some(TEST_TENANT));
+    }
+
+    /// Thread state in memory, so a test can see what a handoff left for the case.
+    #[derive(Default)]
+    struct MemoryThreadState(Mutex<HashMap<String, Value>>);
+
+    #[async_trait]
+    impl ThreadStateStore for MemoryThreadState {
+        async fn get(
+            &self,
+            key: &str,
+        ) -> fluxbee_ai_sdk::Result<Option<fluxbee_ai_sdk::ThreadStateRecord>> {
+            let state = self.0.lock().expect("thread state");
+            Ok(state
+                .get(key)
+                .map(|data| fluxbee_ai_sdk::ThreadStateRecord {
+                    thread_id: key.to_string(),
+                    data: data.clone(),
+                    updated_at: String::new(),
+                    ttl_seconds: None,
+                }))
+        }
+
+        async fn put(
+            &self,
+            key: &str,
+            data: Value,
+            _ttl_seconds: Option<u64>,
+        ) -> fluxbee_ai_sdk::Result<()> {
+            self.0
+                .lock()
+                .expect("thread state")
+                .insert(key.to_string(), data);
+            Ok(())
+        }
+
+        async fn delete(&self, key: &str) -> fluxbee_ai_sdk::Result<()> {
+            self.0.lock().expect("thread state").remove(key);
+            Ok(())
+        }
+    }
+
+    fn test_node_with_state() -> (GenericAiNode, Arc<MemoryThreadState>) {
+        let state = Arc::new(MemoryThreadState::default());
+        let mut node = test_node();
+        node.thread_state_store = Some(state.clone() as Arc<dyn ThreadStateStore>);
+        (node, state)
+    }
+
+    fn structured_handoff(src_ilk: &str, tenant_id: Option<&str>) -> Message {
+        let mut msg = sample_user_request_with_context(
+            json!({
+                "thread_id": "frontdesk-thread-tenant",
+                "response_envelope": {
+                    "kind": "json_object_v1",
+                    "required": ["success", "human_message"],
+                    "properties": {
+                        "success": { "type": "boolean" },
+                        "human_message": { "type": "string" },
+                        "error_code": { "type": "string" }
+                    }
+                }
+            }),
+            Some(src_ilk),
+        );
+        msg.payload = json!({
+            "type": "frontdesk_handoff",
+            "schema_version": 1,
+            "operation": "complete_registration",
+            "subject": { "display_name": "Ana", "email": "ana@example.com" },
+            "tenant_id": tenant_id
+        });
+        msg
+    }
+
+    async fn structured_reply(node: &GenericAiNode, msg: Message) -> Value {
+        let response = node
+            .on_message(msg)
+            .await
+            .expect("handoff should not fail")
+            .expect("response should exist");
+        let content = extract_text(&response.payload).expect("structured text");
+        serde_json::from_str(&content).expect("valid structured json")
+    }
+
+    #[tokio::test]
+    async fn handoff_with_a_tenant_that_contradicts_the_ilk_registers_nothing() {
+        let (node, state) = test_node_with_state();
+        let reply = structured_reply(&node, structured_handoff(TEST_ILK, Some(OTHER_TENANT))).await;
+        assert_eq!(reply["success"], false);
+        assert_eq!(reply["error_code"], "invalid_request");
+        assert!(state.0.lock().expect("thread state").is_empty());
+    }
+
+    #[tokio::test]
+    async fn handoff_without_a_case_tenant_answers_tenant_unresolved() {
+        // A handoff tenant alone does not make one: the ILK's tenant cannot be read.
+        let (node, state) = test_node_with_state();
+        let reply =
+            structured_reply(&node, structured_handoff(UNKNOWN_ILK, Some(TEST_TENANT))).await;
+        assert_eq!(reply["success"], false);
+        assert_eq!(reply["error_code"], "tenant_unresolved");
+        assert!(state.0.lock().expect("thread state").is_empty());
+    }
+
+    #[tokio::test]
+    async fn handoff_without_src_ilk_is_an_invalid_request() {
+        let (node, state) = test_node_with_state();
+        let mut msg = structured_handoff(TEST_ILK, Some(TEST_TENANT));
+        msg.meta.src_ilk = None;
+        let reply = structured_reply(&node, msg).await;
+        assert_eq!(reply["success"], false);
+        assert_eq!(reply["error_code"], "invalid_request");
+        assert!(state.0.lock().expect("thread state").is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_failed_handoff_keeps_the_tenant_of_its_case() {
+        // No tenant_id in the handoff: the case's comes from its ILK. The registration fails (no
+        // identity bridge here) and the case keeps its tenant for the retry.
+        let (node, state) = test_node_with_state();
+        let reply = structured_reply(&node, structured_handoff(TEST_ILK, None)).await;
+        assert_eq!(reply["success"], false);
+        assert_eq!(reply["error_code"], "identity_unavailable");
+        let kept = state.0.lock().expect("thread state").get(TEST_ILK).cloned();
+        let kept = kept.expect("the failed case keeps its state");
+        assert_eq!(kept["status"], "completed_error");
+        assert_eq!(kept["tenant_id"], TEST_TENANT);
+
+        // The retry, again without tenant_id, still knows its tenant.
+        let retry = structured_reply(&node, structured_handoff(TEST_ILK, None)).await;
+        assert_eq!(retry["error_code"], "identity_unavailable");
+        let kept = state.0.lock().expect("thread state").get(TEST_ILK).cloned();
+        assert_eq!(kept.expect("state")["tenant_id"], TEST_TENANT);
+    }
+
+    #[tokio::test]
+    async fn frontdesk_handoff_logs_carry_no_personal_data() {
+        let node = test_node();
+        let mut msg = sample_user_request_with_context(
+            json!({ "thread_id": "frontdesk-thread-privacy-1" }),
+            Some(TEST_ILK),
+        );
+        msg.payload = json!({
+            "type": "frontdesk_handoff",
+            "schema_version": 1,
+            "operation": "complete_registration",
+            "subject": {
+                "display_name": "Juana Secreta",
+                "email": "juana.secreta@example.com",
+                "phone": "+5491100009999",
+                "company_name": "Empresa Secreta SA",
+                "attributes": { "crm_customer_id": "crm-secret-42" }
+            },
+            "tenant_id": TEST_TENANT
+        });
+        let (logs, _guard) = LogCapture::start();
+        node.on_message(msg)
+            .await
+            .expect("handoff should not fail")
+            .expect("response should exist");
+
+        let text = logs.text();
+        assert_no_personal_data(&text);
+        assert!(text.contains("frontdesk handoff register FAILED"));
+    }
+
+    #[tokio::test]
+    async fn incoming_user_message_log_has_no_text_or_sender_id() {
+        let node = test_node();
+        node.control_plane.write().await.current_state = NodeLifecycleState::Configured;
+        *node.behavior.write().await = Some(NodeBehavior::Echo);
+        let mut msg = sample_user_request_with_context(
+            json!({
+                "thread_id": "frontdesk-thread-privacy-2",
+                "io": { "sender": { "kind": "whatsapp", "id": "+5491100009999" } }
+            }),
+            Some(TEST_ILK),
+        );
+        msg.payload = json!({
+            "type": "text",
+            "content": "soy Juana Secreta, juana.secreta@example.com"
+        });
+        let (logs, _guard) = LogCapture::start();
+        node.on_message(msg)
+            .await
+            .expect("on_message should not fail")
+            .expect("response should exist");
+
+        let text = logs.text();
+        assert_no_personal_data(&text);
+        assert!(text.contains("incoming user message"));
+        assert!(text.contains("whatsapp"));
     }
 }

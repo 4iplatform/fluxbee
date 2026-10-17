@@ -18,20 +18,17 @@ wan:
   uplinks:
     - address: "192.168.8.220:9000"
 
-# Local NATS broker for control/data plane.
-nats:
-  mode: embedded
-  port: 4222
-
 # Local admin HTTP API.
 admin:
   listen: "127.0.0.1:8080"
   # Optional absolute content origin returned alongside /public/<key>.
   # public_base_url: "https://content.example.com"
 
-# Local architect HTTP UI/API (typically exposed through reverse proxy).
+# Archi's HTTP UI/API. Loopback only: it has no authentication (FINDINGS A-46). Use it on the
+# motherbee itself, or from another machine through an SSH tunnel:
+#   ssh -L 3000:127.0.0.1:3000 <user>@<motherbee>
 architect:
-  listen: "0.0.0.0:3000"
+  listen: "127.0.0.1:3000"
 
 # Shared filesystem root used by admin/orchestrator.
 storage:
@@ -71,9 +68,9 @@ dist:
 
 # Declarative packaged platform topology per hive role. `nodes` is the start order;
 # `wait_for` is the subset the orchestrator blocks on before continuing
-# bootstrap. IO.blob is a motherbee worker managed by this lifecycle, not a
-# system authority; Identity seeds deterministic ILKs only for the SY.* entries.
-# Workers do not run SY.vault.
+# bootstrap. Only SY.* system authorities are listed: the managed IO/AI runtimes
+# (io.blob, io.cloud, ...) are spawned by the orchestrator via run_node, and
+# validate_system_nodes rejects any other entry. Workers do not run SY.vault.
 system_nodes:
   motherbee:
     # Model D' boot order (enforced by sy_orchestrator::validate_system_nodes):
@@ -83,7 +80,7 @@ system_nodes:
     #    don't depend on its SHM being populated to register, but having
     #    it first guarantees routes exist before any cross-hive traffic.
     # 2. All vault consumers SECOND (identity, admin, architect, storage,
-    #    cognition, opa.rules, policy, timer, wf-rules, frontdesk-gov)
+    #    cognition, opa.rules, timer, wf-rules, frontdesk-gov)
     #    so they REGISTER WITH THE ROUTER before vault emits its
     #    bootstrap broadcast. Each consumer tolerates VAULT_UNAVAILABLE
     #    at its initial lookup — it logs degraded and waits for the
@@ -105,11 +102,9 @@ system_nodes:
       - SY.identity
       - SY.opa.rules
       - SY.admin
-      - IO.blob
       - SY.architect
       - SY.storage
       - SY.cognition
-      - SY.policy
       - SY.timer
       - SY.wf-rules
       - SY.frontdesk.gov
@@ -119,9 +114,7 @@ system_nodes:
       - SY.identity
       - SY.opa.rules
       - SY.admin
-      - IO.blob
       - SY.cognition
-      - SY.policy
       - SY.timer
       - SY.vault
   worker:
@@ -130,7 +123,6 @@ system_nodes:
       - SY.identity
       - SY.opa.rules
       - SY.cognition
-      - SY.policy
       - SY.timer
       - SY.wf-rules
     wait_for:
@@ -138,11 +130,14 @@ system_nodes:
       - SY.identity
       - SY.opa.rules
       - SY.cognition
-      - SY.policy
       - SY.timer
+  # SY.opa.rules runs on EVERY role: the router of each hive enforces the one global user
+  # policy, compiled on the motherbee and synced to all hives (dist/policy). It needs no
+  # SY.identity (its ILK is deterministic), and it is not a readiness gate here.
   egress:
     nodes:
       - SY.config.routes
+      - SY.opa.rules
     wait_for:
       - SY.config.routes
   # ingress hive: the public HTTP(S) door. SY.edge binds :443 (fail-closed on
@@ -151,6 +146,7 @@ system_nodes:
   ingress:
     nodes:
       - SY.config.routes
+      - SY.opa.rules
       - SY.edge
     wait_for:
       - SY.config.routes

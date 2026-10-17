@@ -11,12 +11,13 @@ mod reconciler;
 use failure_classifier::{classify_failure_deterministic, route_failure, FailureContext};
 use pipeline_types::{
     compiler_class_admin_steps, compiler_class_risk, cookbook_paths,
-    desired_state_unknown_sections, is_valid_ownership_label, manifest_path, ActualStateSnapshot,
-    ArtifactBundle, AuditSeverity, BuildTaskPacket, ChangeType, CookbookEntryV2, CookbookLayer,
-    DeltaReport, DeltaReportStatus, DesiredHive, DesiredNode, DesiredOpaDeployment, DesiredRoute,
-    DesiredRuntime, DesiredVpn, DesiredWfDeployment, FailureClass, PipelineRunRecord,
-    PipelineRunStatus, PipelineStage, RepairPacket, RiskClass, SolutionManifestV2,
-    MAX_DESIGN_ITERATIONS, MIN_DESIGN_SCORE_IMPROVEMENT, UNSUPPORTED_DESIRED_STATE_SECTIONS,
+    desired_state_unknown_sections, is_valid_ownership_label, manifest_path, ActualOpaPolicy,
+    ActualStateSnapshot, ArtifactBundle, AuditSeverity, BuildTaskPacket, ChangeType,
+    CookbookEntryV2, CookbookLayer, DeltaReport, DeltaReportStatus, DesiredHive, DesiredNode,
+    DesiredOpaPolicy, DesiredRoute, DesiredRuntime, DesiredVpn, DesiredWfDeployment, FailureClass,
+    PipelineRunRecord, PipelineRunStatus, PipelineStage, RepairPacket, RiskClass,
+    SolutionManifestV2, MAX_DESIGN_ITERATIONS, MIN_DESIGN_SCORE_IMPROVEMENT,
+    UNSUPPORTED_DESIRED_STATE_SECTIONS,
 };
 
 use std::collections::{hash_map::DefaultHasher, BTreeMap, HashMap};
@@ -41,19 +42,22 @@ use axum::routing::any;
 use axum::{Json, Router};
 use fluxbee_ai_sdk::{
     build_model_user_content_parts, create_function_calling_model, extract_text,
-    resolve_model_input_from_payload_with_options, AiProvider, ConversationSummary,
+    resolve_model_input_from_payload_with_options, AiAccount, AiProvider, ConversationSummary,
     FunctionCallingConfig, FunctionCallingRunner, FunctionLoopItem, FunctionRunInput, FunctionTool,
     FunctionToolDefinition, FunctionToolProvider, FunctionToolRegistry, HiveAiConfig,
     ImmediateConversationMemory, ImmediateInteraction, ImmediateInteractionKind,
-    ImmediateOperation, ImmediateRole, ModelInputOptions, ModelSettings,
+    ImmediateOperation, ImmediateRole, ModelInputOptions, ModelSettings, UsageRecorder, UsageWork,
 };
 use fluxbee_sdk::blob::{BlobConfig, BlobRef, BlobToolkit};
 use fluxbee_sdk::payload::TextV1Payload;
 use fluxbee_sdk::protocol::{
     is_system_kind, Destination, Message, Meta, Routing, VaultSecretChangedPayload,
-    VaultSecretInterest, MSG_VAULT_SECRET_CHANGED, SYSTEM_KIND,
+    VaultSecretInterest, MSG_VAULT_SECRET_CHANGED, PRIMARY_HIVE_ID, SYSTEM_KIND,
 };
-use fluxbee_sdk::rpc::{AdminCommandRequest, OperationalRouteProfile, RouterDispatcher};
+use fluxbee_sdk::rpc::{
+    AdminCommandRequest, OperationalRouteProfile, RouterDispatcher, RpcError,
+    MSG_ADMIN_COMMAND_RESPONSE,
+};
 use fluxbee_sdk::{
     build_node_config_response_message, list_ich_options_from_hive_id,
     try_handle_default_node_status, IdentityIchOption, NodeConfig, RouteMatch, RouteTarget,
@@ -78,7 +82,6 @@ use uuid::Uuid;
 type ArchitectError = Box<dyn std::error::Error + Send + Sync>;
 
 const DEFAULT_ARCHITECT_LISTEN: &str = "127.0.0.1:3000";
-const ROUTER_RECONNECT_DELAY_SECS: u64 = 2;
 const CHAT_SESSIONS_TABLE: &str = "sessions";
 const CHAT_MESSAGES_TABLE: &str = "messages";
 const CHAT_OPERATIONS_TABLE: &str = "operations";
@@ -116,6 +119,7 @@ You are a coordinator, not an executor. You read system state and route all muta
 
 - For all nodes across the system: use `/inventory` or `/inventory/summary`. Use `/hives/{hive}/nodes` only for a single explicit hive.
 - For software versions: use `/versions` or `/hives/{hive}/versions`. Do not infer versions from `/hives/{hive}/nodes`.
+- For LLM token usage: `/hives/motherbee/usage?from=<RFC 3339>&to=<RFC 3339>&group_by=day|model|node|tenant` (a period of at most 92 days; add `tenant_id=tnt:<uuid>` for one tenant).
 - For runtime/package info: use `/hives/{hive}/runtimes` or `/hives/{hive}/runtimes/{runtime}`, not `/hives/{hive}/nodes`.
 - For deployments and drift: use `/hives/{hive}/deployments` or `/hives/{hive}/drift-alerts`. If these return `entries: []`, report zero entries — do not infer data from broader endpoints.
 - Stored node config: `GET /hives/{hive}/nodes/{node_name}/config` (persisted snapshot). Live node contract: `POST /hives/{hive}/nodes/{node_name}/control/config-get`. Prefer GET first; use control/config-get only when the live contract is needed.
@@ -228,12 +232,15 @@ struct ArchitectAdminToolContext {
     hive_id: String,
     config_dir: PathBuf,
     state_dir: PathBuf,
-    socket_dir: PathBuf,
     /// Canonical architect dispatcher — used by
     /// `execute_admin_action_with_context` and `fetch_inventory_status_data`
     /// for every outbound admin RPC. No per-call ephemeral `NodeConfig`.
     rpc: Arc<RouterDispatcher>,
     ai_runtime: Arc<Mutex<Option<ArchitectAiRuntime>>>,
+    /// Who spends, for the usage records (docs/router-stream-v1.md §7.3).
+    node_name: String,
+    self_ilk_id: String,
+    usage: UsageRecorder,
     session_id: Option<String>,
     admin_actions_cache: Arc<Mutex<Option<AdminActionsCache>>>,
     plan_compile_pending: Arc<Mutex<HashMap<String, PlanCompilePending>>>,
@@ -318,12 +325,13 @@ struct ArchitectState {
     listen: String,
     config_dir: PathBuf,
     state_dir: PathBuf,
-    socket_dir: PathBuf,
     /// Canonical dispatcher for all router traffic — admin RPC, system
     /// channel, incoming impersonation messages, and Vault lookups.
     /// Replaces the bespoke `router_connect_loop` + `router_recv_loop` +
     /// `router_sender` + `router_connected` quartet.
     rpc: Arc<RouterDispatcher>,
+    /// Where each model call's usage record goes (docs/router-stream-v1.md §7.2).
+    usage: UsageRecorder,
     ai_configured: AtomicBool,
     ai_runtime: Arc<Mutex<Option<ArchitectAiRuntime>>>,
     messages_db_configured: AtomicBool,
@@ -959,6 +967,7 @@ impl FunctionTool for ArchitectSystemGetTool {
                 /hives/{{hive}}/nodes/{{name}}/control/config-get (live contract), \
                 /hives/{{hive}}/wf-rules, /hives/{{hive}}/drift-alerts, \
                 /hives/{{hive}}/routes, /hives/{{hive}}/vpns, /hives/{{hive}}/taps, \
+                /hives/motherbee/usage?from=&to=&group_by= (LLM token usage), \
                 /admin/actions/{{action}} (schema + example_scmd). \
                 Never execute paths with literal {{placeholders}}. \
                 For admin action schemas, prefer example_scmd over guessing. \
@@ -980,7 +989,7 @@ impl FunctionTool for ArchitectSystemGetTool {
                     },
                     "body": {
                         "type": "object",
-                        "description": "Optional JSON object for safe POST checks such as /hives/{hive}/opa/policy/check or /hives/{hive}/nodes/{node_name}/control/config-get"
+                        "description": "Optional JSON object for safe POST checks such as /opa/policy/check or /hives/{hive}/nodes/{node_name}/control/config-get"
                     }
                 },
                 "required": ["path"]
@@ -2000,6 +2009,7 @@ fn seed_cookbooks_from_defaults(state_dir: &Path) {
 // Always returns a FailureClass — falls back to UnknownResidual if AI is unavailable.
 async fn classify_failure_with_ai(
     state: &ArchitectState,
+    tool_ctx: &ArchitectAdminToolContext,
     error_text: &str,
     ctx: &failure_classifier::FailureContext,
 ) -> FailureClass {
@@ -2030,6 +2040,7 @@ async fn classify_failure_with_ai(
         runtime.model.clone(),
         None,
         runtime.model_settings.clone(),
+        tool_ctx.usage_account("failure_classifier", None).await,
     );
     let tools = FunctionToolRegistry::new();
     let runner = FunctionCallingRunner::new(FunctionCallingConfig::default());
@@ -2267,7 +2278,7 @@ Use these facts only to select and validate planning intent. Do not treat them a
 ### Naming
 
 - A full L2 node identity is composed as `<node_name>@<hive>`.
-- `node_name` must include a functional prefix such as `AI.*`, `IO.*`, `WF.*`, `SY.*`, or supported `RT.*`.
+- `node_name` must include a functional prefix such as `AI.*`, `IO.*` or `WF.*`. `SY.*` names are the system's and `RT.*` names are the router's own (its streams included): never use them for a node you create.
 - The hive in the node identity suffix must match the target hive argument when creating or operating that node.
 - Runtime names do not include `@hive`. Node instances do.
 - Example: `AI.support@motherbee` is a node instance. `ai.generic` is a runtime/package name.
@@ -2306,7 +2317,9 @@ Use these facts only to select and validate planning intent. Do not treat them a
 - First-spawn `run_node` for `AI.*` and `IO.*` managed nodes requires root-level `tenant_id`.
 - Do not invent `tenant_id`.
 - Discover tenant candidates through identity reads first: `list_tenants` for discovery and `get_tenant` for exact sponsor/default detail.
-- In legacy direct-task mode, if the operator asks to create an `AI.*` or `IO.*` node and does not provide a tenant, query `list_tenants`; if exactly one active root/default tenant exists, use that `tenant_id`, otherwise block with `missing_fields:["tenant_id"]`.
+- Only `IO.cloud` and `IO.blob` (runtimes `io.cloud`, `io.blob`) run in the root tenant `tnt:00000000-0000-0000-0000-000000000001`. Every other `IO.*` node runs in a tenant other than the root one; the orchestrator refuses it in the root tenant with `TENANT_ROOT_NOT_ALLOWED`.
+- In legacy direct-task mode, if the operator asks to create an `IO.*` node and does not name its tenant, block with `missing_fields:["tenant_id"]`; never pick the root tenant for it.
+- In legacy direct-task mode, if the operator asks to create an `AI.*` node and does not provide a tenant, query `list_tenants`; if exactly one active root/default tenant exists, use that `tenant_id`, otherwise block with `missing_fields:["tenant_id"]`.
 - If the operator says "same tenant as node X", read node config/live config to recover the exact `tenant_id`, then validate it with `get_tenant`.
 - If a required `tenant_id` is missing and cannot be read from reliable context, block with a clear missing-field reason.
 - If a later step needs a value produced by an earlier step, use a formal executor output reference: `$steps.<step_id>.payload.<field>`.
@@ -2325,6 +2338,7 @@ Use these facts only to select and validate planning intent. Do not treat them a
 - If the operator describes message fan-out, mirroring, relay, echo, or branching between known nodes, first consider routing/workflow tools before inventing new intermediate nodes.
 - OPA is for policy-based target resolution and enforcement when the destination is not explicit. It is not the primary tool for deterministic business-process orchestration between named nodes.
 - If the target nodes are already explicitly named, prefer routes/workflows over OPA unless the operator explicitly asks for policy-driven routing.
+- There is ONE user OPA policy for every hive: the motherbee compiles and publishes it and every hive installs it. `opa_*` steps take no hive; `opa_clear` removes it from every hive.
 
 ### IO and SY node boundaries
 
@@ -2442,7 +2456,7 @@ After all six `assess_layer` calls, call `submit_solution_manifest` once with th
   - nodes
   - routing
   - wf_deployments
-  - opa_deployments
+  - opa
   - ownership
 - Never include policy or identity in desired_state.
 - Nodes must use Fluxbee names like AI.name@hive, WF.name@hive, IO.name@hive, SY.name@hive.
@@ -2454,6 +2468,12 @@ Every resource you declare must include an `ownership` field:
 - `"ownership": "solution"` — for resources this solution owns. The reconciler will create, update, and delete these to match desired_state.
 - `"ownership": "external"` — for pre-existing resources that must not be touched. The reconciler will not delete or modify these.
 - Default when omitted: `"external"` (conservative — never use the omission for resources you intend to manage).
+
+## OPA rules
+
+- `desired_state.opa` is ONE user policy for every hive: `{"rego_source": "<rego>", "entrypoint": "router/target", "ownership": "solution"}`. It takes no hive: the motherbee compiles it and every hive installs it.
+- There is one user policy in the whole system. If another solution already declares one, the last one applied replaces it on every hive.
+- Omit `opa` when the solution does not need policy-based routing.
 
 ## Runtime package_source rules
 
@@ -2643,7 +2663,7 @@ fn designer_manifest_section_count(manifest: &SolutionManifestV2) -> usize {
         desired.nodes.as_ref().map(|_| ()),
         desired.routing.as_ref().map(|_| ()),
         desired.wf_deployments.as_ref().map(|_| ()),
-        desired.opa_deployments.as_ref().map(|_| ()),
+        desired.opa.as_ref().map(|_| ()),
         desired.ownership.as_ref().map(|_| ()),
     ];
     sections.into_iter().flatten().count()
@@ -3566,6 +3586,7 @@ async fn run_designer_with_context(
         runtime.model.clone(),
         Some(system_prompt),
         runtime.model_settings.clone(),
+        context.usage_account("designer", solution_id).await,
     );
 
     let layer_store = Arc::new(LayerAssessmentStore::new());
@@ -3791,6 +3812,7 @@ async fn run_design_auditor_with_context(
         runtime.model.clone(),
         Some(system_prompt),
         runtime.model_settings.clone(),
+        context.usage_account("design_auditor", None).await,
     );
 
     let mut tools = FunctionToolRegistry::new();
@@ -3929,6 +3951,7 @@ async fn run_real_programmer_with_context(
         runtime.model.clone(),
         Some(system_prompt),
         runtime.model_settings.clone(),
+        context.usage_account("programmer", None).await,
     );
 
     let mut tools = FunctionToolRegistry::new();
@@ -5344,6 +5367,7 @@ async fn run_plan_compiler_with_context(
         runtime.model.clone(),
         Some(system_prompt),
         runtime.model_settings.clone(),
+        context.usage_account("plan_compiler", None).await,
     );
 
     let mut tools = FunctionToolRegistry::new();
@@ -5808,9 +5832,10 @@ impl FunctionTool for PlanCompilerLiveQueryTool {
             .cloned()
             .unwrap_or_else(|| json!({}));
 
+        // There is one SY.admin, on the motherbee; the hive is the target (FINDINGS A-24).
         execute_admin_action_with_context(
             &self.context,
-            &format!("SY.admin@{hive}"),
+            &format!("SY.admin@{PRIMARY_HIVE_ID}"),
             &action,
             Some(&hive),
             params,
@@ -5897,7 +5922,7 @@ async fn main() -> Result<(), ArchitectError> {
     }
 
     let log_level = std::env::var("JSR_LOG_LEVEL").unwrap_or_else(|_| "info".to_string());
-    tracing_subscriber::fmt()
+    fluxbee_sdk::logging::fmt()
         .with_env_filter(EnvFilter::new(log_level))
         .init();
 
@@ -5937,8 +5962,25 @@ async fn main() -> Result<(), ArchitectError> {
     let incoming_rx = rpc.take_command_receiver("incoming").await?;
     tracing::info!(node = %node_name, "sy.architect canonical RouterDispatcher connected");
 
-    let ai_runtime =
-        build_architect_ai_runtime(Arc::clone(&rpc), &node_name, &self_ilk_id, &hive).await;
+    // On an upgrade the whole hive restarts at once and the vault may not answer yet. Pull until
+    // it does (the SDK's `resolve_resource_awaiting_vault`, as SY.storage and SY.identity do;
+    // FINDINGS A-26), both secrets at once; VAULT_SECRET_CHANGED still covers later changes.
+    let (ai_runtime, initial_messages_db_url) = tokio::join!(
+        build_architect_ai_runtime(
+            Arc::clone(&rpc),
+            &node_name,
+            &self_ilk_id,
+            &hive,
+            VaultWait::UntilReachable,
+        ),
+        resolve_messages_db_url_from_vault(
+            Arc::clone(&rpc),
+            &hive.hive_id,
+            &node_name,
+            &self_ilk_id,
+            VaultWait::UntilReachable,
+        ),
+    );
     let agent_asset_catalog = bootstrap_agent_asset_catalog_from_config_dir(&config_dir)
         .unwrap_or_else(|err| {
             tracing::warn!(error = %err, "failed to bootstrap agent asset catalog");
@@ -5970,13 +6012,6 @@ async fn main() -> Result<(), ArchitectError> {
         components: default_component_statuses(),
         error: None,
     };
-    let initial_messages_db_url = resolve_messages_db_url_from_vault(
-        Arc::clone(&rpc),
-        &hive.hive_id,
-        &node_name,
-        &self_ilk_id,
-    )
-    .await;
     let initial_messages_db_configured = initial_messages_db_url.is_some();
     let initial_messages_db = match initial_messages_db_url.as_deref() {
         Some(url) => {
@@ -5997,8 +6032,8 @@ async fn main() -> Result<(), ArchitectError> {
         listen: listen.clone(),
         config_dir,
         state_dir,
-        socket_dir,
         rpc: Arc::clone(&rpc),
+        usage: UsageRecorder::start(Arc::clone(&rpc)),
         ai_configured: AtomicBool::new(ai_runtime.is_some()),
         ai_runtime: Arc::new(Mutex::new(ai_runtime)),
         messages_db_configured: AtomicBool::new(initial_messages_db_configured),
@@ -6092,11 +6127,49 @@ fn architect_node_name(hive_id: &str) -> String {
     format!("SY.architect@{hive_id}")
 }
 
+/// Whether a vault lookup waits out a vault that is not reachable yet.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum VaultWait {
+    /// At boot: retry transport failures for up to `VAULT_BOOT_WAIT`.
+    UntilReachable,
+    /// On a refresh (a VAULT_SECRET_CHANGED or a CONFIG_SET): the vault is up, ask once.
+    Once,
+}
+
+async fn resolve_architect_vault_resource(
+    vault_client: &fluxbee_sdk::VaultClient,
+    resource: fluxbee_sdk::ResourceType,
+    node_name: &str,
+    wait: VaultWait,
+) -> Result<Option<Value>, fluxbee_sdk::VaultError> {
+    let tenant = fluxbee_sdk::DEFAULT_ROOT_TENANT_ID;
+    let timeout = Duration::from_secs(5);
+    match wait {
+        VaultWait::UntilReachable => {
+            vault_client
+                .resolve_resource_awaiting_vault(
+                    resource,
+                    tenant,
+                    timeout,
+                    fluxbee_sdk::VAULT_BOOT_WAIT,
+                    node_name,
+                )
+                .await
+        }
+        VaultWait::Once => {
+            vault_client
+                .resolve_resource(resource, tenant, timeout)
+                .await
+        }
+    }
+}
+
 async fn build_architect_ai_runtime(
     rpc: Arc<RouterDispatcher>,
     node_name: &str,
     self_ilk_id: &str,
     hive: &HiveFile,
+    wait: VaultWait,
 ) -> Option<ArchitectAiRuntime> {
     let engine = match hive.ai.as_ref().map(HiveAiConfig::effective).transpose() {
         Ok(Some(engine)) => engine,
@@ -6112,6 +6185,7 @@ async fn build_architect_ai_runtime(
         node_name,
         self_ilk_id,
         engine.provider,
+        wait,
     )
     .await
     {
@@ -6141,15 +6215,12 @@ async fn resolve_architect_ai_api_key_from_vault(
     node_name: &str,
     self_ilk_id: &str,
     provider: AiProvider,
+    wait: VaultWait,
 ) -> Result<Option<String>, ArchitectError> {
     let vault_client = architect_vault_client(rpc, &hive.hive_id, node_name, self_ilk_id);
-    let value = vault_client
-        .resolve_resource(
-            provider.resource_type(),
-            fluxbee_sdk::DEFAULT_ROOT_TENANT_ID,
-            Duration::from_secs(5),
-        )
-        .await;
+    let value =
+        resolve_architect_vault_resource(&vault_client, provider.resource_type(), node_name, wait)
+            .await;
     let Some(value) = value? else {
         return Ok(None);
     };
@@ -6195,6 +6266,7 @@ async fn refresh_architect_ai_runtime(state: &ArchitectState) -> Result<bool, Ar
         &state.node_name,
         &state.self_ilk_id,
         &hive,
+        VaultWait::Once,
     )
     .await;
     state
@@ -6214,15 +6286,16 @@ async fn resolve_messages_db_url_from_vault(
     hive_id: &str,
     node_name: &str,
     self_ilk_id: &str,
+    wait: VaultWait,
 ) -> Option<String> {
     let vault_client = architect_vault_client(rpc, hive_id, node_name, self_ilk_id);
-    let result = vault_client
-        .resolve_resource(
-            fluxbee_sdk::ResourceType::Postgres,
-            fluxbee_sdk::DEFAULT_ROOT_TENANT_ID,
-            Duration::from_secs(5),
-        )
-        .await;
+    let result = resolve_architect_vault_resource(
+        &vault_client,
+        fluxbee_sdk::ResourceType::Postgres,
+        node_name,
+        wait,
+    )
+    .await;
     match result {
         Ok(Some(value)) => extract_messages_db_url_from_vault_value(&value),
         Ok(None) => None,
@@ -6252,6 +6325,7 @@ async fn refresh_architect_messages_db_url(state: &ArchitectState) -> (bool, boo
         &state.hive_id,
         &state.node_name,
         &state.self_ilk_id,
+        VaultWait::Once,
     )
     .await;
     let url_present = url.is_some();
@@ -6285,6 +6359,38 @@ fn load_identity_ich_options(
     list_ich_options_from_hive_id(&state.hive_id).map_err(|err| -> ArchitectError { Box::new(err) })
 }
 
+impl ArchitectAdminToolContext {
+    /// The root tenant pays for Archi's calls; each record keeps what the work belongs to: the
+    /// session and, while one runs in it, its pipeline run and solution (docs/router-stream-v1.md
+    /// §7.3), the place for the client's tenant later.
+    async fn usage_account(&self, stage: &str, solution_id: Option<&str>) -> AiAccount {
+        let run = match self.session_id.as_deref() {
+            Some(session_id) => self
+                .active_pipeline_runs
+                .lock()
+                .await
+                .values()
+                .filter(|run| {
+                    run.session_id == session_id && !is_terminal_pipeline_status(&run.status)
+                })
+                .max_by_key(|run| (run.updated_at_ms, run.created_at_ms))
+                .cloned(),
+            None => None,
+        };
+        AiAccount::root(self.usage.clone(), &self.node_name)
+            .with_node_ilk(Some(self.self_ilk_id.clone()))
+            .with_work(UsageWork {
+                session_id: self.session_id.clone(),
+                pipeline_run_id: run.as_ref().map(|run| run.pipeline_run_id.clone()),
+                solution_id: solution_id
+                    .map(str::to_string)
+                    .or_else(|| run.as_ref().and_then(|run| run.solution_id.clone())),
+                stage: Some(stage.to_string()),
+                ..UsageWork::default()
+            })
+    }
+}
+
 fn admin_tool_context(
     state: &ArchitectState,
     session_id: Option<&str>,
@@ -6293,9 +6399,11 @@ fn admin_tool_context(
         hive_id: state.hive_id.clone(),
         config_dir: state.config_dir.clone(),
         state_dir: state.state_dir.clone(),
-        socket_dir: state.socket_dir.clone(),
         rpc: Arc::clone(&state.rpc),
         ai_runtime: Arc::clone(&state.ai_runtime),
+        node_name: state.node_name.clone(),
+        self_ilk_id: state.self_ilk_id.clone(),
+        usage: state.usage.clone(),
         session_id: session_id.map(str::to_string),
         admin_actions_cache: Arc::clone(&state.admin_actions_cache),
         plan_compile_pending: Arc::clone(&state.plan_compile_pending),
@@ -7730,11 +7838,11 @@ async fn handle_messages_stream(state: &ArchitectState, query: &str) -> Response
         query_param(query, "after_dk"),
     ) {
         (Some(ts), Some(dk)) => messages_db::MessagesCursor {
-            received_at_iso: ts,
+            at_iso: ts,
             dedupe_key: dk,
         },
         (None, None) => messages_db::MessagesCursor {
-            received_at_iso: current_messages_iso_timestamp(),
+            at_iso: current_messages_iso_timestamp(),
             dedupe_key: String::new(),
         },
         _ => {
@@ -7852,7 +7960,7 @@ async fn messages_stream_task(
                 }
                 if let Some(last) = items.last() {
                     cursor = messages_db::MessagesCursor {
-                        received_at_iso: last.received_at.clone(),
+                        at_iso: last.stored_at.clone(),
                         dedupe_key: last.dedupe_key.clone(),
                     };
                 }
@@ -7905,14 +8013,12 @@ async fn handle_messages_list(state: &ArchitectState, query: &str) -> Response {
         },
         None => messages_db::TimeWindow::All,
     };
-    let with_error = query_bool_param(query, "with_error");
-
     let cursor = match (
         query_param(query, "cursor_ts"),
         query_param(query, "cursor_dk"),
     ) {
         (Some(ts), Some(dk)) => Some(messages_db::MessagesCursor {
-            received_at_iso: ts,
+            at_iso: ts,
             dedupe_key: dk,
         }),
         (None, None) => None,
@@ -7940,14 +8046,15 @@ async fn handle_messages_list(state: &ArchitectState, query: &str) -> Response {
             .into_response();
     };
 
-    let filters = messages_db::MessagesFilters { since, with_error };
+    let filters = messages_db::MessagesFilters { since };
     match client
         .list_messages(cursor.as_ref(), &filters, limit)
         .await
     {
-        Ok((items, next_cursor)) => Json(json!({
+        Ok((items, next_cursor, tail_cursor)) => Json(json!({
             "items": items,
-            "next_cursor": next_cursor.map(|c| json!({ "ts": c.received_at_iso, "dk": c.dedupe_key })),
+            "next_cursor": next_cursor.map(|c| json!({ "ts": c.at_iso, "dk": c.dedupe_key })),
+            "tail_cursor": tail_cursor.map(|c| json!({ "ts": c.at_iso, "dk": c.dedupe_key })),
         }))
         .into_response(),
         Err(err) => {
@@ -10153,6 +10260,10 @@ async fn handle_ai_chat(
                 .into()
         })?;
     let tool_context = admin_tool_context(state, Some(&session.session_id));
+    let account = tool_context
+        .usage_account("chat", None)
+        .await
+        .with_thread(Some(session.thread_id.clone()));
     let tool_provider = ArchitectAdminReadToolsProvider::new(tool_context);
     let mut tools = FunctionToolRegistry::new();
     tool_provider
@@ -10169,6 +10280,7 @@ async fn handle_ai_chat(
         runtime.model.clone(),
         Some(runtime.instructions.clone()),
         runtime.model_settings.clone(),
+        account,
     );
     let runner = FunctionCallingRunner::new(FunctionCallingConfig::default());
     let current_user_parts =
@@ -10655,8 +10767,8 @@ async fn enrich_interaction_with_blob_content(
         parts.push(base_content.to_string());
     }
     for attachment in attachments {
-        let path = toolkit.resolve(&attachment.blob_ref);
-        let bytes = match tokio::fs::read(&path).await {
+        // Read checked against the BlobRef, never through a path under active/ (FINDINGS A-56).
+        let bytes = match toolkit.read_blob_async(&attachment.blob_ref).await {
             Ok(b) => b,
             Err(_) => {
                 parts.push(format!(
@@ -11214,8 +11326,8 @@ fn handle_meta_scmd(raw: &str) -> Option<Value> {
             "syntax": "SCMD: curl -X METHOD /relative/path [-d '{...}']",
             "notes": [
                 "Usa siempre paths relativos a SY.admin, por ejemplo /hives/motherbee/nodes.",
-                "Para descubrir el catÃ¡logo dinÃ¡mico completo, usÃ¡ GET /admin/actions.",
-                "Para ayuda detallada de una acciÃ³n, usÃ¡ GET /admin/actions/{action}."
+                "Para descubrir el catálogo dinámico completo, usá GET /admin/actions.",
+                "Para ayuda detallada de una acción, usá GET /admin/actions/{action}."
             ],
             "examples": [
                 "SCMD: curl -X GET /admin/actions",
@@ -11223,11 +11335,11 @@ fn handle_meta_scmd(raw: &str) -> Option<Value> {
                 "SCMD: curl -X GET /hives",
                 "SCMD: curl -X GET /inventory/summary",
                 "SCMD: curl -X GET /hives/motherbee/versions",
-                "SCMD: curl -X GET /hives/motherbee/runtimes/ai.chat",
+                "SCMD: curl -X GET /hives/motherbee/runtimes/ai.generic",
                 "SCMD: curl -X GET /hives/motherbee/nodes",
-                "SCMD: curl -X GET /hives/motherbee/nodes/AI.chat@motherbee/status",
+                "SCMD: curl -X GET /hives/motherbee/nodes/AI.sales@motherbee/status",
                 "SCMD: curl -X GET /hives/motherbee/nodes/SY.frontdesk.gov@motherbee/config",
-                "SCMD: curl -X POST /hives/motherbee/nodes/AI.chat@motherbee/control/config-get -d '{\"requested_by\":\"archi\"}'",
+                "SCMD: curl -X POST /hives/motherbee/nodes/AI.sales@motherbee/control/config-get -d '{\"requested_by\":\"archi\"}'",
                 "SCMD: curl -X GET /hives/motherbee/identity/ilks",
                 "SCMD: curl -X GET /hives/motherbee/identity/ilks/ilk:550e8400-e29b-41d4-a716-446655440000",
                 "SCMD: curl -X GET /hives/motherbee/deployments",
@@ -11241,7 +11353,7 @@ fn handle_meta_scmd(raw: &str) -> Option<Value> {
             "mutation_examples": [
                 "SCMD: curl -X POST /hives -d '{\"hive_id\":\"worker-220\",\"address\":\"192.168.8.220\"}'",
                 "SCMD: curl -X POST /hives/motherbee/sync-hint -d '{\"channel\":\"blob\",\"wait_for_idle\":true,\"timeout_ms\":30000}'",
-                "SCMD: curl -X POST /hives/motherbee/nodes -d '{\"node_name\":\"AI.chat@motherbee\",\"runtime_version\":\"current\"}'",
+                "SCMD: curl -X POST /hives/motherbee/nodes -d '{\"node_name\":\"AI.sales@motherbee\",\"runtime\":\"ai.generic\",\"runtime_version\":\"current\"}'",
                 "SCMD: curl -X POST /hives/motherbee/identity/ilks/ilk:550e8400-e29b-41d4-a716-446655440000/definition -d '{\"definition\":{\"role_hash\":\"1111111111111111111111111111111111111111111111111111111111111111\",\"skill_hashes\":[],\"handbook_hashes\":[],\"personality_hash\":\"4444444444444444444444444444444444444444444444444444444444444444\"}}'",
                 "Configure the hive-wide ai.default_provider and ai.providers.<provider>.model in hive.yaml."
             ]
@@ -11439,6 +11551,10 @@ fn admin_action_allows_ai_write(action: &str) -> bool {
             | "remove_runtime_version"
             | "set_ilk_definition"
             | "delete_ilk"
+            // reversible lifecycle only: purge_ilk / purge_tenant are operator-only
+            | "restore_ilk"
+            | "delete_tenant"
+            | "restore_tenant"
             | "set_node_config"
             | "node_control_config_set"
             | "send_node_message"
@@ -11461,7 +11577,13 @@ async fn reconcile_timeout_unknown_operation(
     state: &ArchitectState,
     record: &mut ChatOperationRecord,
 ) -> Result<bool, ArchitectError> {
-    if record.status != "timeout_unknown" {
+    // Two non-terminal states resolve the same way — by asking the hive what actually
+    // happened. `timeout_unknown`: the reply expired, outcome genuinely unknown.
+    // `accepted` (PB-7): add_hive now returns immediately and joins in the background, so the
+    // operation is open BY DESIGN. Without this arm the record never closes, and
+    // `find_equivalent_operation` then rejects every identical retry with
+    // OPERATION_ALREADY_TRACKED — forever.
+    if record.status != "timeout_unknown" && record.status != "accepted" {
         return Ok(false);
     }
 
@@ -11479,16 +11601,76 @@ async fn reconcile_timeout_unknown_operation(
                 },
             )
             .await?;
+            // The hive is GONE (removed, or the join never created it). Nothing will ever
+            // resolve this record, and leaving it open blocks every identical retry with
+            // OPERATION_ALREADY_TRACKED forever. Close it as failed.
+            if output
+                .get("status")
+                .and_then(Value::as_str)
+                .is_some_and(|v| v.eq_ignore_ascii_case("not_found"))
+                || output
+                    .get("error_code")
+                    .and_then(Value::as_str)
+                    .is_some_and(|v| v.eq_ignore_ascii_case("NOT_FOUND"))
+            {
+                record.status = "failed".to_string();
+                record.error_summary =
+                    format!("hive '{hive_id}' no longer exists; the operation cannot be resolved");
+                record.updated_at_ms = now_epoch_ms();
+                record.completed_at_ms = record.updated_at_ms;
+                save_operation(state, record).await?;
+                return Ok(true);
+            }
             if output
                 .get("status")
                 .and_then(Value::as_str)
                 .map(|value| value.eq_ignore_ascii_case("ok"))
                 .unwrap_or(false)
             {
-                record.status = "succeeded_after_timeout".to_string();
+                // The hive's own recorded status is the source of truth for a background join.
+                // `payload.hive.status`, NOT `payload.status`. get_hive answers
+                // {"status":"ok","hive":<info.yaml>} and the admin nests that whole object under
+                // "payload", so `payload.status` is the literal envelope "ok" on every call —
+                // reading it sent a failed or still-running join straight to the catch-all and
+                // recorded it as succeeded, with the error summary cleared.
+                let hive_status = output
+                    .get("payload")
+                    .and_then(|p| p.get("hive"))
+                    .and_then(|h| h.get("status"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("");
+                let join_phase = output
+                    .get("payload")
+                    .and_then(|p| p.get("hive"))
+                    .and_then(|h| h.get("join"))
+                    .and_then(|j| j.get("phase"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("");
+
+                // POSITIVE test for success, never a catch-all. A catch-all here recorded a
+                // `pending` hive — one whose join failed during finalize or SSH hardening — as
+                // `succeeded_after_timeout` with the error summary CLEARED. And `connected` is
+                // written well before the flow ends, so it alone does not mean done.
+                if hive_status == "connected" && join_phase == "done" {
+                    record.status = "succeeded_after_timeout".to_string();
+                    record.error_summary.clear();
+                } else if matches!(hive_status, "failed" | "interrupted") {
+                    record.status = "failed".to_string();
+                    record.error_summary = output
+                        .get("payload")
+                        .and_then(|p| p.get("hive"))
+                        .and_then(|h| h.get("join"))
+                        .and_then(|j| j.get("error_detail"))
+                        .and_then(Value::as_str)
+                        .unwrap_or("the background join did not complete")
+                        .to_string();
+                } else {
+                    // joining, pending, connected-but-not-done, or an unrecognised state: still
+                    // open. Leave the record alone and look again next time.
+                    return Ok(false);
+                }
                 record.updated_at_ms = now_epoch_ms();
                 record.completed_at_ms = record.updated_at_ms;
-                record.error_summary.clear();
                 save_operation(state, record).await?;
                 return Ok(true);
             }
@@ -11507,6 +11689,12 @@ fn operation_status_from_output(output: &Value) -> String {
         Some(status) if status == "ok" => "succeeded".to_string(),
         Some(status) if status == "not_found" => "not_found".to_string(),
         Some(status) if status == "error" => "failed".to_string(),
+        // `sync_pending` is a SUCCESS on the wire (the target correctly refused a stale update),
+        // but persisted verbatim it became a non-terminal status nothing could ever resolve —
+        // the record stayed open and blocked identical retries forever.
+        Some(status) if status == "sync_pending" => "succeeded".to_string(),
+        // `accepted` stays verbatim ON PURPOSE: it is genuinely non-terminal and
+        // `reconcile_timeout_unknown_operation` closes it against the hive's real state.
         Some(status) => status,
         None => "succeeded".to_string(),
     }
@@ -11633,6 +11821,28 @@ fn scmd_query_params(raw_query: Option<&str>) -> serde_json::Map<String, Value> 
     params
 }
 
+/// `GET /hives/{hive}/usage?tenant_id=&from=&to=&group_by=&since=&after=&limit=`, read as the
+/// admin's HTTP route reads it: without a tenant_id it is about every tenant. The admin checks the
+/// rest, so a limit that is not a number goes as it came.
+fn scmd_usage_params(raw_query: Option<&str>) -> Value {
+    let mut params = scmd_query_params(raw_query);
+    for value in params.values_mut() {
+        if let Value::String(text) = value {
+            *text = percent_decode_simple(text);
+        }
+    }
+    if let Some(limit) = params
+        .get("limit")
+        .and_then(Value::as_str)
+        .and_then(|limit| limit.parse::<u32>().ok())
+    {
+        params.insert("limit".to_string(), json!(limit));
+    }
+    let all_tenants = !params.contains_key("tenant_id");
+    params.insert("all_tenants".to_string(), json!(all_tenants));
+    Value::Object(params)
+}
+
 fn scmd_vault_list_params(raw_query: Option<&str>) -> Value {
     let mut filter = serde_json::Map::new();
     let Some(query) = raw_query else {
@@ -11690,6 +11900,27 @@ fn architect_admin_action_timeout(action: &str) -> Duration {
         "sync_hint" => {
             Duration::from_secs(env_timeout_secs("JSR_ADMIN_SYNC_HINT_TIMEOUT_SECS").unwrap_or(45))
         }
+        // A global OPA write waits for the motherbee's compile and apply (up to 30 s each when it
+        // does not answer) and then for the other hives (10 s): wait longer than the admin does,
+        // or a write that succeeded is reported as a timeout.
+        "opa_compile_apply" | "opa_compile" | "opa_apply" | "opa_rollback" | "opa_clear"
+        | "opa_check" => {
+            Duration::from_secs(env_timeout_secs("JSR_ADMIN_OPA_TIMEOUT_SECS").unwrap_or(80))
+        }
+        // A workflow deploy runs in SY.wf-rules under a 60 s deadline (publish, purge, waiting
+        // for the package to reach a worker, the node's rebind and restart or launch) and the
+        // admin waits 75 s for it: wait longer than both, or a deploy that succeeded is reported
+        // as a timeout (A-68).
+        "wf_rules_compile_apply"
+        | "wf_rules_compile"
+        | "wf_rules_apply"
+        | "wf_rules_rollback"
+        | "wf_rules_delete"
+        | "wf_rules_get_workflow"
+        | "wf_rules_get_status"
+        | "wf_rules_list_workflows" => Duration::from_secs(
+            env_timeout_secs("JSR_ARCHITECT_WF_RULES_TIMEOUT_SECS").unwrap_or(90),
+        ),
         "list_admin_actions" | "get_admin_action_help" | "hive_status" => {
             Duration::from_secs(env_timeout_secs("JSR_ADMIN_TIMEOUT_SECS").unwrap_or(5))
         }
@@ -12254,6 +12485,12 @@ fn translate_scmd(
             target_hive: (*hive_id).to_string(),
             params: json!({}),
         }),
+        ("GET", ["hives", hive_id, "usage"]) => Ok(AdminTranslation {
+            admin_target,
+            action: "get_llm_usage".to_string(),
+            target_hive: (*hive_id).to_string(),
+            params: scmd_usage_params(raw_query),
+        }),
         ("GET", ["hives", hive_id, "wf-rules"]) => {
             let params = Value::Object(scmd_query_params(raw_query));
             let action = if params
@@ -12592,63 +12829,30 @@ fn translate_scmd(
                 params,
             })
         }
-        ("POST", ["hives", hive_id, "opa", "policy", "check"]) => {
+        // One global user policy: every write goes to the motherbee's SY.opa.rules (the admin
+        // refuses any other hive). Reads stay per hive (GET /hives/{hive}/opa/...).
+        ("POST", ["opa", "policy", rest @ ..]) => {
+            let action = match rest {
+                [] => "opa_compile_apply",
+                ["compile"] => "opa_compile",
+                ["apply"] => "opa_apply",
+                ["rollback"] => "opa_rollback",
+                ["clear"] => "opa_clear",
+                ["check"] => "opa_check",
+                _ => {
+                    return Err(
+                        format!("unsupported SCMD path: {} {}", parsed.method, parsed.path).into(),
+                    )
+                }
+            };
             let params = parsed.body.unwrap_or_else(|| json!({}));
             if !params.is_object() {
-                return Err("SCMD body for opa check must be a JSON object".into());
+                return Err(format!("SCMD body for {action} must be a JSON object").into());
             }
             Ok(AdminTranslation {
                 admin_target,
-                action: "opa_check".to_string(),
-                target_hive: (*hive_id).to_string(),
-                params,
-            })
-        }
-        ("POST", ["hives", hive_id, "opa", "policy"]) => {
-            let params = parsed.body.unwrap_or_else(|| json!({}));
-            if !params.is_object() {
-                return Err("SCMD body for opa compile_apply must be a JSON object".into());
-            }
-            Ok(AdminTranslation {
-                admin_target,
-                action: "opa_compile_apply".to_string(),
-                target_hive: (*hive_id).to_string(),
-                params,
-            })
-        }
-        ("POST", ["hives", hive_id, "opa", "policy", "compile"]) => {
-            let params = parsed.body.unwrap_or_else(|| json!({}));
-            if !params.is_object() {
-                return Err("SCMD body for opa compile must be a JSON object".into());
-            }
-            Ok(AdminTranslation {
-                admin_target,
-                action: "opa_compile".to_string(),
-                target_hive: (*hive_id).to_string(),
-                params,
-            })
-        }
-        ("POST", ["hives", hive_id, "opa", "policy", "apply"]) => {
-            let params = parsed.body.unwrap_or_else(|| json!({}));
-            if !params.is_object() {
-                return Err("SCMD body for opa apply must be a JSON object".into());
-            }
-            Ok(AdminTranslation {
-                admin_target,
-                action: "opa_apply".to_string(),
-                target_hive: (*hive_id).to_string(),
-                params,
-            })
-        }
-        ("POST", ["hives", hive_id, "opa", "policy", "rollback"]) => {
-            let params = parsed.body.unwrap_or_else(|| json!({}));
-            if !params.is_object() {
-                return Err("SCMD body for opa rollback must be a JSON object".into());
-            }
-            Ok(AdminTranslation {
-                admin_target,
-                action: "opa_rollback".to_string(),
-                target_hive: (*hive_id).to_string(),
+                action: action.to_string(),
+                target_hive: PRIMARY_HIVE_ID.to_string(),
                 params,
             })
         }
@@ -12748,7 +12952,6 @@ fn translate_scmd(
                     "node_name": node_name,
                     "config": config,
                     "replace": false,
-                    "notify": true,
                 }),
             })
         }
@@ -12776,6 +12979,37 @@ async fn execute_admin_translation(
         .await
 }
 
+/// Did this admin call expire without a verdict?
+///
+/// The distinction is the whole point of `timeout_unknown`: an expired
+/// `ADMIN_COMMAND` is **unknown**, not failed. The hive very likely finished the
+/// work anyway — a real `add_hive` runs well past the 180 s admin window — so the
+/// operation must stay non-terminal for `reconcile_timeout_unknown_operation` to
+/// resolve it against reality later.
+///
+/// Matched on the TYPE, never on the Display. The previous string sniff looked for
+/// `"timeout waiting ADMIN_COMMAND_RESPONSE"`, a substring `RpcError::Timeout` has
+/// never rendered — it reads `timeout waiting response … request_msg=… \
+/// response_msg=ADMIN_COMMAND_RESPONSE …`. So the predicate was permanently false:
+/// every timed-out operation was persisted as terminally `failed`, and the entire
+/// reconciliation path was unreachable code.
+///
+/// Walks the source chain because the executor boxes the `RpcError` as
+/// `Box<dyn Error>` (`execute_admin_action_with_context`), and a future layer may
+/// wrap rather than propagate it.
+fn admin_error_is_admin_timeout(err: &(dyn std::error::Error + 'static)) -> bool {
+    let mut current = Some(err);
+    while let Some(cause) = current {
+        if let Some(rpc) = cause.downcast_ref::<RpcError>() {
+            return rpc
+                .timeout_response_msg()
+                .is_some_and(|msg| msg.eq_ignore_ascii_case(MSG_ADMIN_COMMAND_RESPONSE));
+        }
+        current = cause.source();
+    }
+    false
+}
+
 async fn execute_tracked_admin_translation(
     state: &ArchitectState,
     session_id: &str,
@@ -12797,7 +13031,11 @@ async fn execute_tracked_admin_translation(
         let existing_id = existing.operation_id.clone();
         let current_id = existing_operation_id.as_deref();
         if current_id != Some(existing_id.as_str()) {
-            if existing.status == "timeout_unknown" {
+            // Both non-terminal states resolve by asking the hive. Gating on
+            // `timeout_unknown` alone left the `accepted` arm unreachable from production, so a
+            // backgrounded add_hive stayed open forever and every identical retry bounced with
+            // OPERATION_ALREADY_TRACKED.
+            if existing.status == "timeout_unknown" || existing.status == "accepted" {
                 let _ = reconcile_timeout_unknown_operation(state, &mut existing).await;
             }
             if !is_terminal_operation_status(&existing.status) {
@@ -12882,7 +13120,7 @@ async fn execute_tracked_admin_translation(
         }
         Err(err) => {
             let err_text = err.to_string();
-            operation.status = if err_text.contains("timeout waiting ADMIN_COMMAND_RESPONSE") {
+            operation.status = if admin_error_is_admin_timeout(err.as_ref()) {
                 "timeout_unknown".to_string()
             } else {
                 "failed".to_string()
@@ -15196,10 +15434,6 @@ fn architect_index_html(state: &ArchitectState) -> String {
       font-size: 0.84rem;
       color: var(--text);
     }}
-    .messages-filter-toggle {{
-      cursor: pointer;
-      user-select: none;
-    }}
     .messages-status-pill {{
       font-size: 0.7rem;
       font-weight: 700;
@@ -15277,7 +15511,7 @@ fn architect_index_html(state: &ArchitectState) -> String {
       font-size: 0.78rem;
       flex: none;
     }}
-    .messages-row-subject {{
+    .messages-row-route {{
       font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
       font-size: 0.82rem;
       color: var(--text);
@@ -15311,18 +15545,8 @@ fn architect_index_html(state: &ArchitectState) -> String {
     .messages-row-meta-size {{
       flex: none;
     }}
-    .messages-row-status {{
+    .messages-row-kind {{
       flex: none;
-      font-weight: 700;
-    }}
-    .messages-row-status.ok {{
-      color: #15803d;
-    }}
-    .messages-row-status.pending {{
-      color: var(--muted);
-    }}
-    .messages-row-status.err {{
-      color: #b91c1c;
     }}
     .messages-load-more {{
       border: none;
@@ -15396,9 +15620,6 @@ fn architect_index_html(state: &ArchitectState) -> String {
       font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
       word-break: break-all;
       color: var(--text);
-    }}
-    .messages-detail-meta-value.err {{
-      color: #b91c1c;
     }}
     .messages-detail-json-head {{
       display: flex;
@@ -16943,7 +17164,7 @@ fn architect_index_html(state: &ArchitectState) -> String {
         <div class="messages-toolbar">
           <div class="messages-toolbar-left">
             <h1 class="messages-title">Messages</h1>
-            <span class="messages-toolbar-meta">System message log &middot; storage_inbox</span>
+            <span class="messages-toolbar-meta">Message log &middot; turns</span>
           </div>
           <div class="messages-toolbar-right">
             <label class="messages-filter">
@@ -16954,10 +17175,6 @@ fn architect_index_html(state: &ArchitectState) -> String {
                 <option value="1h">1h</option>
                 <option value="15m">15m</option>
               </select>
-            </label>
-            <label class="messages-filter messages-filter-toggle">
-              <input type="checkbox" id="messages-with-error" />
-              <span>Only errors</span>
             </label>
             <span id="messages-status-pill" class="messages-status-pill" data-state="paused">paused</span>
           </div>
@@ -16978,7 +17195,7 @@ fn architect_index_html(state: &ArchitectState) -> String {
         <div id="messages-unconfigured" class="messages-unconfigured" hidden>
           <div class="messages-unconfigured-card">
             <h2>messages_db not configured</h2>
-            <p>archi needs a Postgres connection (credentials + host only — <strong>no dbname</strong>) to read storage's inbox. archi internally hardcodes the dbname (<code>fluxbee_storage</code>); the secret is the same one storage and cognition use.</p>
+            <p>archi needs a Postgres connection (credentials + host only — <strong>no dbname</strong>) to read storage's message log (<code>turns</code>). archi internally hardcodes the dbname (<code>fluxbee_storage</code>); the secret is the same one storage and cognition use.</p>
             <p class="messages-unconfigured-label">Operator flow (Phase J' — vault):</p>
             <code>curl -sS -X POST http://MOTHERBEE:8080/hives/HIVE/vault/secrets \
   -H 'Content-Type: application/json' \
@@ -19457,7 +19674,6 @@ fn architect_index_html(state: &ArchitectState) -> String {
         const loadMoreBtn = document.getElementById('messages-load-more');
         const newPillBtn = document.getElementById('messages-new-pill');
         const sinceSelect = document.getElementById('messages-since');
-        const errorToggle = document.getElementById('messages-with-error');
         const statusPill = document.getElementById('messages-status-pill');
         const unconfiguredEl = document.getElementById('messages-unconfigured');
         const bodyEl = document.querySelector('.messages-view .messages-body');
@@ -19466,6 +19682,9 @@ fn architect_index_html(state: &ArchitectState) -> String {
         let initialLoaded = false;
         let rows = [];
         let nextCursor = null;
+        // Where the live tail goes on: the last row written (the list is in message time, the tail
+        // in the order SY.storage wrote them, since a stream's batch can arrive late).
+        let tailCursor = null;
         let selectedKey = null;
         let eventSource = null;
         let pendingNew = 0;
@@ -19500,25 +19719,13 @@ fn architect_index_html(state: &ArchitectState) -> String {
         function formatTimeOnly(iso) {{
           const t = iso.indexOf('T');
           if (t < 0) return iso;
-          return iso.slice(t + 1).replace('Z', '');
+          return iso.slice(t + 1, t + 13);
         }}
 
         function formatSize(bytes) {{
           if (bytes < 1024) return bytes + ' B';
           if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(1) + ' KB';
           return (bytes / (1024 * 1024)).toFixed(2) + ' MB';
-        }}
-
-        function statusClass(item) {{
-          if (item.has_error) return 'err';
-          if (!item.processed_at) return 'pending';
-          return 'ok';
-        }}
-
-        function statusGlyph(item) {{
-          if (item.has_error) return '!';
-          if (!item.processed_at) return '…';
-          return '✓';
         }}
 
         function identifierFor(item) {{
@@ -19529,17 +19736,17 @@ fn architect_index_html(state: &ArchitectState) -> String {
 
         function rowHtml(item) {{
           const id = identifierFor(item);
-          const subject = escapeHtml(item.subject);
+          const route = escapeHtml(item.from + ' → ' + (item.to || '(resolved)'));
           const idText = escapeHtml(id.text);
           return ''
             + '<div class="messages-row-head">'
-            + '<span class="messages-row-time">' + formatTimeOnly(item.received_at) + '</span>'
-            + '<span class="messages-row-subject" title="' + subject + '">' + subject + '</span>'
+            + '<span class="messages-row-time">' + formatTimeOnly(item.ts) + '</span>'
+            + '<span class="messages-row-route" title="' + route + '">' + route + '</span>'
             + '</div>'
             + '<div class="messages-row-meta">'
             + '<span class="messages-row-meta-id ' + id.cls + '" title="' + idText + '">' + idText + '</span>'
+            + '<span class="messages-row-kind">' + escapeHtml(item.msg_type) + '</span>'
             + '<span class="messages-row-meta-size">' + formatSize(item.size_bytes) + '</span>'
-            + '<span class="messages-row-status ' + statusClass(item) + '">' + statusGlyph(item) + '</span>'
             + '</div>';
         }}
 
@@ -19565,35 +19772,32 @@ fn architect_index_html(state: &ArchitectState) -> String {
             return;
           }}
           const meta = [
-            ['Subject', detail.subject],
-            ['Received', detail.received_at],
-            ['Dedupe key', detail.dedupe_key],
+            ['Time', detail.ts],
+            ['Stored', detail.stored_at],
+            ['From', detail.from],
+            ['To', detail.to || '(resolved)'],
+            ['Kind', detail.msg_type],
             ['ICH', detail.ich || '(none)'],
             ['Thread', detail.thread_id || '(none)'],
-            ['Attempts', String(detail.attempts)],
-            ['Processed', detail.processed_at || '(pending)'],
-            ['Size', formatSize(detail.size_bytes)]
+            ['Trace', detail.trace_id || '(none)'],
+            ['From ILK', detail.from_ilk],
+            ['To ILK', detail.to_ilk || '(none)'],
+            ['Size', formatSize(detail.size_bytes)],
+            ['Key', detail.dedupe_key]
           ];
-          if (detail.last_error) meta.push(['Error', detail.last_error]);
+          if (detail.tags && detail.tags.length) meta.push(['Tags', detail.tags.join(', ')]);
           const metaHtml = meta.map(function(pair) {{
-            const k = pair[0];
-            const v = pair[1];
-            const errCls = k === 'Error' ? ' err' : '';
-            return '<div class="messages-detail-meta-key">' + escapeHtml(k) + '</div>'
-              + '<div class="messages-detail-meta-value' + errCls + '">' + escapeHtml(v) + '</div>';
+            return '<div class="messages-detail-meta-key">' + escapeHtml(pair[0]) + '</div>'
+              + '<div class="messages-detail-meta-value">' + escapeHtml(pair[1]) + '</div>';
           }}).join('');
-          let payloadDisplay;
-          if (detail.payload_json !== null && detail.payload_json !== undefined) {{
-            payloadDisplay = JSON.stringify(detail.payload_json, null, 2);
-          }} else if (detail.payload_text) {{
-            payloadDisplay = detail.payload_text;
-          }} else {{
-            payloadDisplay = '(empty)';
-          }}
+          // Rows written before 0.1.76 keep only the payload.
+          const whole = detail.message !== null && detail.message !== undefined;
+          const payloadDisplay = JSON.stringify(whole ? detail.message : detail.content, null, 2);
+          const payloadTitle = whole ? 'Message' : 'Payload (this row keeps only the payload)';
           detailEl.innerHTML = ''
             + '<div class="messages-detail-meta">' + metaHtml + '</div>'
             + '<div class="messages-detail-json-head">'
-            + '<span class="messages-detail-json-title">Payload</span>'
+            + '<span class="messages-detail-json-title">' + escapeHtml(payloadTitle) + '</span>'
             + '<button class="messages-detail-copy" id="messages-detail-copy" type="button">Copy JSON</button>'
             + '</div>'
             + '<pre class="messages-detail-json" id="messages-detail-json"></pre>';
@@ -19609,7 +19813,6 @@ fn architect_index_html(state: &ArchitectState) -> String {
           const params = new URLSearchParams();
           params.set('limit', '200');
           params.set('since', sinceSelect.value);
-          if (errorToggle.checked) params.set('with_error', 'true');
           if (extra && extra.cursor) {{
             params.set('cursor_ts', extra.cursor.ts);
             params.set('cursor_dk', extra.cursor.dk);
@@ -19633,6 +19836,7 @@ fn architect_index_html(state: &ArchitectState) -> String {
             const data = await resp.json();
             rows = data.items || [];
             nextCursor = data.next_cursor || null;
+            tailCursor = data.tail_cursor || null;
             initialLoaded = true;
             pendingNew = 0;
             newPillBtn.hidden = true;
@@ -19685,7 +19889,8 @@ fn architect_index_html(state: &ArchitectState) -> String {
         }}
 
         function handleStreamEvent(item) {{
-          if (rows.length > 0 && rows[0].dedupe_key === item.dedupe_key) return;
+          tailCursor = {{ ts: item.stored_at, dk: item.dedupe_key }};
+          if (rows.some(function(r) {{ return r.dedupe_key === item.dedupe_key; }})) return;
           if (atTop) {{
             rows.unshift(item);
             if (rows.length > 1000) rows.length = 1000;
@@ -19699,11 +19904,10 @@ fn architect_index_html(state: &ArchitectState) -> String {
 
         function startStream() {{
           if (eventSource) return;
-          const top = rows[0];
           const params = new URLSearchParams();
-          if (top) {{
-            params.set('after_ts', top.received_at);
-            params.set('after_dk', top.dedupe_key);
+          if (tailCursor) {{
+            params.set('after_ts', tailCursor.ts);
+            params.set('after_dk', tailCursor.dk);
           }}
           const url = MESSAGES_STREAM_URL + (params.toString() ? ('?' + params.toString()) : '');
           try {{
@@ -19770,13 +19974,6 @@ fn architect_index_html(state: &ArchitectState) -> String {
           flushPending();
         }});
         sinceSelect.addEventListener('change', async function() {{
-          stopStream();
-          selectedKey = null;
-          renderDetail(null);
-          const ok = await loadInitial();
-          if (ok) startStream();
-        }});
-        errorToggle.addEventListener('change', async function() {{
           stopStream();
           selectedKey = null;
           renderDetail(null);
@@ -19955,23 +20152,22 @@ fn validate_manifest_v2(manifest: &SolutionManifestV2) -> Result<(), String> {
         }
     }
 
-    if let Some(policies) = &manifest.desired_state.opa_deployments {
-        for (idx, item) in policies.iter().enumerate() {
-            let opa: DesiredOpaDeployment = serde_json::from_value(item.clone())
-                .map_err(|err| format!("desired_state.opa_deployments[{idx}] invalid: {err}"))?;
-            if opa.hive.trim().is_empty()
-                || opa.policy_id.trim().is_empty()
-                || opa.rego_source.trim().is_empty()
-            {
-                return Err(format!(
-                    "desired_state.opa_deployments[{idx}] requires non-empty hive, policy_id, and rego_source"
-                ));
-            }
-            if !is_valid_ownership_label(&opa.ownership) {
-                return Err(format!(
-                    "desired_state.opa_deployments[{idx}].ownership must be one of solution/system/external"
-                ));
-            }
+    if let Some(opa) = &manifest.desired_state.opa {
+        if opa.get("hive").is_some() {
+            return Err(
+                "desired_state.opa is the one user policy for every hive; it takes no 'hive'"
+                    .to_string(),
+            );
+        }
+        let policy: DesiredOpaPolicy = serde_json::from_value(opa.clone())
+            .map_err(|err| format!("desired_state.opa invalid: {err}"))?;
+        if policy.rego_source.trim().is_empty() {
+            return Err("desired_state.opa requires a non-empty rego_source".to_string());
+        }
+        if !is_valid_ownership_label(&policy.ownership) {
+            return Err(
+                "desired_state.opa.ownership must be one of solution/system/external".to_string(),
+            );
         }
     }
 
@@ -21021,6 +21217,65 @@ fn pipeline_state_from_run(run: &PipelineRunRecord) -> serde_json::Value {
     serde_json::from_str(&run.state_json).unwrap_or_else(|_| json!({}))
 }
 
+/// The plan compiler's context for a pipeline run: the declared user policy, which an
+/// `opa_compile_apply` step must carry exactly (`pin_opa_plan_steps` enforces it afterwards).
+fn pipeline_plan_compiler_context(run_state: &Value) -> String {
+    let Some(policy) = run_state
+        .get("desired_opa")
+        .and_then(|value| serde_json::from_value::<DesiredOpaPolicy>(value.clone()).ok())
+    else {
+        return String::new();
+    };
+    format!(
+        "desired_state.opa is the user policy for every hive. An opa_compile_apply step takes exactly these args, and no hive: {}",
+        json!({ "rego": policy.rego_source, "entrypoint": policy.entrypoint })
+    )
+}
+
+/// Pins the plan's OPA steps to what the manifest declares: `opa_compile_apply` carries exactly the
+/// declared rego and entrypoint, `opa_clear` nothing, and neither names a hive (there is one user
+/// policy for every hive). Steps follow the delta's operations in order (validate_plan_against_delta).
+fn pin_opa_plan_steps(
+    plan: &mut Value,
+    delta: &DeltaReport,
+    run_state: &Value,
+) -> Result<(), String> {
+    let desired = run_state
+        .get("desired_opa")
+        .filter(|value| !value.is_null())
+        .map(|value| serde_json::from_value::<DesiredOpaPolicy>(value.clone()))
+        .transpose()
+        .map_err(|err| format!("desired_state.opa invalid: {err}"))?;
+    let steps = plan
+        .pointer_mut("/execution/steps")
+        .and_then(Value::as_array_mut)
+        .ok_or("executor plan execution.steps must be an array")?;
+    let mut next = 0;
+    for op in &delta.operations {
+        if op.change_type == ChangeType::Noop {
+            continue;
+        }
+        let count = compiler_class_admin_steps(&op.compiler_class).map_or(0, |steps| steps.len());
+        let args = match op.compiler_class {
+            pipeline_types::CompilerClass::OpaApply => {
+                let policy = desired.as_ref().ok_or(
+                    "the plan applies a user policy the manifest does not declare (desired_state.opa)",
+                )?;
+                Some(json!({ "rego": policy.rego_source, "entrypoint": policy.entrypoint }))
+            }
+            pipeline_types::CompilerClass::OpaRemove => Some(json!({})),
+            _ => None,
+        };
+        if let Some(args) = args {
+            for step in steps.iter_mut().skip(next).take(count) {
+                step["args"] = args.clone();
+            }
+        }
+        next += count;
+    }
+    Ok(())
+}
+
 fn pipeline_task_summary(
     run_state: &Value,
     solution_id: Option<&str>,
@@ -21254,6 +21509,12 @@ fn build_confirm2_payload(
 ) -> Value {
     let (destructive_actions, restarting_actions, blocked_actions) =
         summarize_delta_operations_by_risk(delta_report);
+    // One user policy for every hive: what the plan does to it, and whose policy it replaces.
+    let user_policy = delta_report
+        .operations
+        .iter()
+        .find(|op| op.resource_type == reconciler::OPA_POLICY_RESOURCE_TYPE)
+        .map(|op| json!({ "change_type": op.change_type, "notes": op.notes }));
     json!({
         "message": "Plan compiled and validated. Reply CONFIRM to execute or CANCEL to discard.",
         "pipeline_run_id": pipeline_run_id,
@@ -21268,6 +21529,7 @@ fn build_confirm2_payload(
         "destructive_actions": destructive_actions,
         "restarting_actions": restarting_actions,
         "blocked_actions": blocked_actions,
+        "user_policy": user_policy,
     })
 }
 
@@ -22376,7 +22638,7 @@ async fn handle_pipeline_plan_compile(
         &tool_ctx,
         &task,
         &state.hive_id,
-        "",
+        &pipeline_plan_compiler_context(&run_state),
         Some(&delta_report),
         expanded_approved_artifacts.as_ref(),
         plan_initial_tokens,
@@ -22392,7 +22654,7 @@ async fn handle_pipeline_plan_compile(
             };
             let failure_class = match classify_failure_deterministic(&err_text, &ctx) {
                 Some(c) => c,
-                None => classify_failure_with_ai(state, &err_text, &ctx).await,
+                None => classify_failure_with_ai(state, &tool_ctx, &err_text, &ctx).await,
             };
             let route = route_failure(
                 &failure_class,
@@ -22524,10 +22786,30 @@ async fn handle_pipeline_plan_compile(
     }
     let human_summary = output.human_summary.clone();
     let plan_compile_tokens = output.tokens_used;
-    let plan = output
+    let mut plan = output
         .plan
         .clone()
         .expect("plan_ready pipeline output must include a plan");
+    if let Err(err) = pin_opa_plan_steps(&mut plan, &delta_report, &run_state) {
+        let _ = block_pipeline_run(
+            state,
+            &pipeline_run.pipeline_run_id,
+            &format!("plan OPA steps could not be pinned: {err}"),
+            &FailureClass::PlanContractInvalid,
+        )
+        .await;
+        return ChatResponse {
+            status: "blocked".to_string(),
+            mode: "pipeline".to_string(),
+            output: json!({
+                "message": format!("Pipeline blocked: {err}"),
+                "pipeline_run_id": pipeline_run.pipeline_run_id,
+                "stage": "blocked",
+            }),
+            session_id: Some(session.session_id.clone()),
+            session_title: Some(session.title.clone()),
+        };
+    }
     let confirm2_payload = build_confirm2_payload(
         &pipeline_run.pipeline_run_id,
         &delta_report,
@@ -22730,7 +23012,7 @@ async fn compile_pipeline_plan_with_context(
         context,
         &task,
         &context.hive_id,
-        "",
+        &pipeline_plan_compiler_context(&run_state),
         Some(&delta_report),
         expanded_approved_artifacts.as_ref(),
         design_tokens_used.saturating_add(artifact_tokens_used),
@@ -22868,10 +23150,25 @@ async fn compile_pipeline_plan_with_context(
     }
     let human_summary = output.human_summary.clone();
     let plan_compile_tokens = output.tokens_used;
-    let plan = output
+    let mut plan = output
         .plan
         .clone()
         .expect("plan_ready pipeline output must include a plan");
+    if let Err(err) = pin_opa_plan_steps(&mut plan, &delta_report, &run_state) {
+        let _ = block_pipeline_run_with_context(
+            context,
+            &pipeline_run.pipeline_run_id,
+            &format!("plan OPA steps could not be pinned: {err}"),
+            &FailureClass::PlanContractInvalid,
+        )
+        .await;
+        return Ok(json!({
+            "status": "blocked",
+            "message": format!("Pipeline blocked: {err}"),
+            "pipeline_run_id": pipeline_run.pipeline_run_id,
+            "stage": "blocked",
+        }));
+    }
     let total_tokens = design_tokens_used
         .saturating_add(artifact_tokens_used)
         .saturating_add(plan_compile_tokens);
@@ -23010,14 +23307,11 @@ async fn continue_pipeline_after_design_with_context(
         .as_ref()
         .map(|items| !items.is_empty())
         .unwrap_or(false);
-    let include_opa = manifest
-        .desired_state
-        .opa_deployments
-        .as_ref()
-        .map(|items| !items.is_empty())
-        .unwrap_or(false);
+    let opa_declarations = saved_opa_declarations(&context.state_dir);
+    let opa_scope = opa_in_scope(&manifest, &solution_id, &opa_declarations)
+        .then_some(opa_declarations.as_slice());
     let snapshot =
-        match build_actual_state_snapshot(context, &target_hives, include_wf, include_opa).await {
+        match build_actual_state_snapshot(context, &target_hives, include_wf, opa_scope).await {
             Ok(snapshot) => snapshot,
             Err(err) => {
                 let _ = block_pipeline_run_with_context(
@@ -23037,24 +23331,25 @@ async fn continue_pipeline_after_design_with_context(
         };
 
     let manifest_ref = format!("manifest://{solution_id}/current");
-    let reconciler_output = match reconciler::run_reconciler(&manifest, &snapshot, &manifest_ref) {
-        Ok(output) => output,
-        Err(err) => {
-            let _ = block_pipeline_run_with_context(
-                context,
-                &pipeline_run.pipeline_run_id,
-                &format!("reconciler failed: {err}"),
-                &FailureClass::DeltaUnsupported,
-            )
-            .await;
-            return Ok(json!({
-                "status": "blocked",
-                "message": format!("Pipeline blocked during reconcile: {err}"),
-                "pipeline_run_id": pipeline_run.pipeline_run_id,
-                "stage": "blocked",
-            }));
-        }
-    };
+    let reconciler_output =
+        match reconciler::run_reconciler(&manifest, &snapshot, &manifest_ref, &solution_id) {
+            Ok(output) => output,
+            Err(err) => {
+                let _ = block_pipeline_run_with_context(
+                    context,
+                    &pipeline_run.pipeline_run_id,
+                    &format!("reconciler failed: {err}"),
+                    &FailureClass::DeltaUnsupported,
+                )
+                .await;
+                return Ok(json!({
+                    "status": "blocked",
+                    "message": format!("Pipeline blocked during reconcile: {err}"),
+                    "pipeline_run_id": pipeline_run.pipeline_run_id,
+                    "stage": "blocked",
+                }));
+            }
+        };
 
     let next_stage = if reconciler_output.delta_report.status != DeltaReportStatus::Ready {
         PipelineStage::Blocked
@@ -23071,6 +23366,8 @@ async fn continue_pipeline_after_design_with_context(
         "delta_report": reconciler_output.delta_report,
         "build_task_packets": reconciler_output.build_task_packets,
         "reconciler_diagnostics": reconciler_output.diagnostics,
+        // The plan compiler gets the declared rego from here and its steps are pinned to it.
+        "desired_opa": manifest.desired_state.opa,
     });
     let mut current_run = advance_pipeline_run_with_context(
         context,
@@ -23250,68 +23547,60 @@ async fn handle_pipeline_confirm1(
         .as_ref()
         .map(|items| !items.is_empty())
         .unwrap_or(false);
-    let include_opa = manifest
-        .desired_state
-        .opa_deployments
-        .as_ref()
-        .map(|items| !items.is_empty())
-        .unwrap_or(false);
+    let opa_declarations = saved_opa_declarations(&state.state_dir);
+    let opa_scope = opa_in_scope(&manifest, &solution_id, &opa_declarations)
+        .then_some(opa_declarations.as_slice());
     let tool_ctx = admin_tool_context(state, Some(&session.session_id));
-    let snapshot = match build_actual_state_snapshot(
-        &tool_ctx,
-        &target_hives,
-        include_wf,
-        include_opa,
-    )
-    .await
-    {
-        Ok(snapshot) => snapshot,
-        Err(err) => {
-            let _ = block_pipeline_run(
-                state,
-                &pipeline_run.pipeline_run_id,
-                &format!("snapshot build failed: {err}"),
-                &FailureClass::SnapshotPartialBlocking,
-            )
-            .await;
-            return ChatResponse {
-                status: "error".to_string(),
-                mode: "pipeline".to_string(),
-                output: json!({
-                    "message": format!("Pipeline blocked during snapshot build: {err}"),
-                    "pipeline_run_id": pipeline_run.pipeline_run_id,
-                    "stage": "reconcile",
-                }),
-                session_id: Some(session.session_id.clone()),
-                session_title: Some(session.title.clone()),
-            };
-        }
-    };
+    let snapshot =
+        match build_actual_state_snapshot(&tool_ctx, &target_hives, include_wf, opa_scope).await {
+            Ok(snapshot) => snapshot,
+            Err(err) => {
+                let _ = block_pipeline_run(
+                    state,
+                    &pipeline_run.pipeline_run_id,
+                    &format!("snapshot build failed: {err}"),
+                    &FailureClass::SnapshotPartialBlocking,
+                )
+                .await;
+                return ChatResponse {
+                    status: "error".to_string(),
+                    mode: "pipeline".to_string(),
+                    output: json!({
+                        "message": format!("Pipeline blocked during snapshot build: {err}"),
+                        "pipeline_run_id": pipeline_run.pipeline_run_id,
+                        "stage": "reconcile",
+                    }),
+                    session_id: Some(session.session_id.clone()),
+                    session_title: Some(session.title.clone()),
+                };
+            }
+        };
 
     let manifest_ref = format!("manifest://{solution_id}/current");
-    let reconciler_output = match reconciler::run_reconciler(&manifest, &snapshot, &manifest_ref) {
-        Ok(output) => output,
-        Err(err) => {
-            let _ = block_pipeline_run(
-                state,
-                &pipeline_run.pipeline_run_id,
-                &format!("reconciler failed: {err}"),
-                &FailureClass::DeltaUnsupported,
-            )
-            .await;
-            return ChatResponse {
-                status: "error".to_string(),
-                mode: "pipeline".to_string(),
-                output: json!({
-                    "message": format!("Pipeline blocked during reconcile: {err}"),
-                    "pipeline_run_id": pipeline_run.pipeline_run_id,
-                    "stage": "reconcile",
-                }),
-                session_id: Some(session.session_id.clone()),
-                session_title: Some(session.title.clone()),
-            };
-        }
-    };
+    let reconciler_output =
+        match reconciler::run_reconciler(&manifest, &snapshot, &manifest_ref, &solution_id) {
+            Ok(output) => output,
+            Err(err) => {
+                let _ = block_pipeline_run(
+                    state,
+                    &pipeline_run.pipeline_run_id,
+                    &format!("reconciler failed: {err}"),
+                    &FailureClass::DeltaUnsupported,
+                )
+                .await;
+                return ChatResponse {
+                    status: "error".to_string(),
+                    mode: "pipeline".to_string(),
+                    output: json!({
+                        "message": format!("Pipeline blocked during reconcile: {err}"),
+                        "pipeline_run_id": pipeline_run.pipeline_run_id,
+                        "stage": "reconcile",
+                    }),
+                    session_id: Some(session.session_id.clone()),
+                    session_title: Some(session.title.clone()),
+                };
+            }
+        };
 
     let next_stage = if reconciler_output.delta_report.status != DeltaReportStatus::Ready {
         PipelineStage::Blocked
@@ -23328,6 +23617,8 @@ async fn handle_pipeline_confirm1(
         "delta_report": reconciler_output.delta_report,
         "build_task_packets": reconciler_output.build_task_packets,
         "reconciler_diagnostics": reconciler_output.diagnostics,
+        // The plan compiler gets the declared rego from here and its steps are pinned to it.
+        "desired_opa": manifest.desired_state.opa,
     });
     if let Err(err) = advance_pipeline_run(
         state,
@@ -23822,11 +24113,119 @@ async fn handle_pipeline_confirm2(
 
 // ── TB-1/TB-2: snapshot builder ───────────────────────────────────────────
 
+/// One saved manifest's declaration of the user policy.
+#[derive(Debug, Clone, PartialEq)]
+struct OpaDeclaration {
+    solution_id: String,
+    version: String,
+    rego: String,
+}
+
+/// Every user-policy declaration in the saved manifests (`manifests/<solution>/<version>.json`).
+/// Read as raw JSON so one manifest saved under an older schema does not hide the others.
+fn saved_opa_declarations(state_dir: &Path) -> Vec<OpaDeclaration> {
+    let mut found = Vec::new();
+    let Ok(solutions) = fs::read_dir(state_dir.join("manifests")) else {
+        return found;
+    };
+    for solution in solutions.flatten() {
+        let solution_id = solution.file_name().to_string_lossy().into_owned();
+        let Ok(versions) = fs::read_dir(solution.path()) else {
+            continue;
+        };
+        for entry in versions.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|ext| ext.to_str()) != Some("json") {
+                continue;
+            }
+            let Some(version) = path.file_stem().and_then(|stem| stem.to_str()) else {
+                continue;
+            };
+            let Some(manifest) = fs::read_to_string(&path)
+                .ok()
+                .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
+            else {
+                continue;
+            };
+            if let Some(rego) = manifest
+                .pointer("/desired_state/opa/rego_source")
+                .and_then(Value::as_str)
+            {
+                found.push(OpaDeclaration {
+                    solution_id: solution_id.clone(),
+                    version: version.to_string(),
+                    rego: rego.to_string(),
+                });
+            }
+        }
+    }
+    found
+}
+
+/// The solution whose saved manifest most recently declared exactly `rego` (versions are
+/// `v<epoch ms>`). That solution owns the running policy: the last one applied wins.
+fn opa_policy_declared_by(declarations: &[OpaDeclaration], rego: &str) -> Option<String> {
+    let saved_at = |version: &str| version.trim_start_matches('v').parse::<u64>().unwrap_or(0);
+    declarations
+        .iter()
+        .filter(|declaration| !rego.is_empty() && declaration.rego == rego)
+        .max_by_key(|declaration| saved_at(&declaration.version))
+        .map(|declaration| declaration.solution_id.clone())
+}
+
+/// OPA is in scope when the manifest declares a policy, or when a saved version of this solution
+/// did: then the reconciler may have to clear the policy the solution no longer declares.
+fn opa_in_scope(
+    manifest: &SolutionManifestV2,
+    solution_id: &str,
+    declarations: &[OpaDeclaration],
+) -> bool {
+    manifest.desired_state.opa.is_some()
+        || declarations
+            .iter()
+            .any(|declaration| declaration.solution_id == solution_id)
+}
+
+/// The motherbee's `opa_get_policy` answer as the running user policy, with the solution that
+/// declared it.
+fn running_opa_policy(
+    response: &Value,
+    declarations: &[OpaDeclaration],
+) -> Option<ActualOpaPolicy> {
+    let entry = response
+        .pointer("/payload/responses")?
+        .as_array()?
+        .iter()
+        .find(|entry| entry.get("hive").and_then(Value::as_str) == Some(PRIMARY_HIVE_ID))?;
+    let policy = entry.get("payload")?;
+    let text = |key: &str| {
+        policy
+            .get(key)
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string()
+    };
+    let (hash, rego) = (text("hash"), text("rego"));
+    let declared_by = if hash.is_empty() {
+        None
+    } else {
+        opa_policy_declared_by(declarations, &rego)
+    };
+    Some(ActualOpaPolicy {
+        version: policy.get("version").and_then(Value::as_u64).unwrap_or(0),
+        hash,
+        rego,
+        entrypoint: text("entrypoint"),
+        declared_by,
+    })
+}
+
+/// `opa_declarations`: Some when OPA is in scope (see `opa_in_scope`).
 async fn build_actual_state_snapshot(
     context: &ArchitectAdminToolContext,
     hives: &[String],
     include_wf: bool,
-    include_opa: bool,
+    opa_declarations: Option<&[OpaDeclaration]>,
 ) -> Result<ActualStateSnapshot, ArchitectError> {
     use pipeline_types::{
         HiveResources, HiveSnapshotStatus, SnapshotAtomicity, SnapshotCompleteness, SnapshotScope,
@@ -23862,8 +24261,10 @@ async fn build_actual_state_snapshot(
     )
     .await;
 
+    // There is one SY.admin, on the motherbee; each read names its hive as the target (FINDINGS
+    // A-24: asking SY.admin@<hive> failed for every hive but the motherbee).
+    let admin_target = format!("SY.admin@{PRIMARY_HIVE_ID}");
     for hive in hives {
-        let admin_target = format!("SY.admin@{hive}");
         let mut hive_res = HiveResources::default();
         let mut section_failed = false;
 
@@ -23969,28 +24370,6 @@ async fn build_actual_state_snapshot(
             }
         }
 
-        // opa_get_status (required when opa is in scope)
-        if include_opa {
-            match execute_admin_action_with_context(
-                context,
-                &admin_target,
-                "opa_get_status",
-                Some(hive),
-                serde_json::json!({}),
-                "snapshot.opa",
-            )
-            .await
-            {
-                Ok(v) if v.get("status").and_then(|s| s.as_str()) == Some("ok") => {
-                    hive_res.opa_state = v.get("payload").cloned();
-                }
-                _ => {
-                    missing_sections.push(format!("{hive}.opa_state"));
-                    section_failed = true;
-                }
-            }
-        }
-
         hive_status.insert(
             hive.clone(),
             HiveSnapshotStatus {
@@ -24003,6 +24382,29 @@ async fn build_actual_state_snapshot(
             },
         );
         resources.insert(hive.clone(), hive_res);
+    }
+
+    // The user policy is the same on every hive: read it once, from the motherbee.
+    let mut opa = None;
+    if let Some(declarations) = opa_declarations {
+        let response = execute_admin_action_with_context(
+            context,
+            &format!("SY.admin@{PRIMARY_HIVE_ID}"),
+            "opa_get_policy",
+            Some(PRIMARY_HIVE_ID),
+            serde_json::json!({}),
+            "snapshot.opa",
+        )
+        .await;
+        opa = match response {
+            Ok(v) if v.get("status").and_then(|s| s.as_str()) == Some("ok") => {
+                running_opa_policy(&v, declarations)
+            }
+            _ => None,
+        };
+        if opa.is_none() {
+            missing_sections.push("global.opa".to_string());
+        }
     }
 
     let is_partial = !missing_sections.is_empty();
@@ -24021,7 +24423,7 @@ async fn build_actual_state_snapshot(
                 if include_wf {
                     s.push("wf");
                 }
-                if include_opa {
+                if opa_declarations.is_some() {
                     s.push("opa");
                 }
                 s.iter().map(|r| r.to_string()).collect()
@@ -24033,6 +24435,7 @@ async fn build_actual_state_snapshot(
         },
         hive_status,
         resources,
+        opa,
         completeness: SnapshotCompleteness {
             is_partial,
             missing_sections,
@@ -24048,6 +24451,58 @@ mod tests {
     };
     use super::*;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn admin_timeout_error(response_msg: &str) -> RpcError {
+        RpcError::Timeout {
+            trace_id: "trace-1".to_string(),
+            target: "SY.admin@motherbee".to_string(),
+            request_msg: "ADMIN_COMMAND".to_string(),
+            response_msg: response_msg.to_string(),
+            timeout_ms: 180_000,
+        }
+    }
+
+    /// THE regression guard. This assertion is what was missing: the classifier
+    /// used to sniff for a substring the Display cannot produce, so every expired
+    /// admin operation was recorded as terminally `failed` and the whole
+    /// `timeout_unknown` reconciliation path never ran.
+    #[test]
+    fn admin_timeout_display_never_contained_the_substring_we_used_to_match() {
+        let rendered = admin_timeout_error(MSG_ADMIN_COMMAND_RESPONSE).to_string();
+        assert!(
+            !rendered.contains("timeout waiting ADMIN_COMMAND_RESPONSE"),
+            "the old predicate would silently start matching again: {rendered}"
+        );
+        assert!(rendered.contains("timeout waiting response"));
+        assert!(rendered.contains("response_msg=ADMIN_COMMAND_RESPONSE"));
+    }
+
+    #[test]
+    fn admin_command_timeout_classifies_as_timeout_unknown() {
+        let err = admin_timeout_error(MSG_ADMIN_COMMAND_RESPONSE);
+        assert!(admin_error_is_admin_timeout(&err));
+
+        // ...and it survives the boxing the executor actually does.
+        let boxed: ArchitectError = Box::new(admin_timeout_error(MSG_ADMIN_COMMAND_RESPONSE));
+        assert!(admin_error_is_admin_timeout(boxed.as_ref()));
+    }
+
+    #[test]
+    fn non_admin_timeouts_and_other_failures_stay_failed() {
+        // A timeout on a different exchange is not an unknown ADMIN_COMMAND.
+        assert!(!admin_error_is_admin_timeout(&admin_timeout_error(
+            "ILK_PROVISION_RESPONSE"
+        )));
+        // A genuine rejection is terminal: reconciling it would be wrong.
+        assert!(!admin_error_is_admin_timeout(&RpcError::Rejected {
+            action: "add_hive".to_string(),
+            error_code: "HIVE_EXISTS".to_string(),
+            message: "already joined".to_string(),
+        }));
+        // And a plain stringly error must not be promoted to "unknown".
+        let flattened: ArchitectError = "timeout waiting response for something".into();
+        assert!(!admin_error_is_admin_timeout(flattened.as_ref()));
+    }
 
     fn sample_blob_ref(filename: &str, mime: &str, size: u64) -> BlobRef {
         BlobRef {
@@ -24357,6 +24812,299 @@ mod tests {
         .expect("manifest parses");
         let err = validate_manifest_v2(&manifest).expect_err("runtime is required");
         assert!(err.contains("requires non-empty node_name, hive, and runtime"));
+    }
+
+    fn manifest_with_opa(opa: Value) -> SolutionManifestV2 {
+        serde_json::from_value(json!({
+            "manifest_version": "2.0",
+            "solution": { "name": "demo" },
+            "desired_state": { "opa": opa },
+            "advisory": {}
+        }))
+        .expect("manifest parses")
+    }
+
+    #[test]
+    fn a_solution_declares_one_user_policy_without_a_hive() {
+        let rego = "package router\n\ndefault target = null\n";
+        assert!(validate_manifest_v2(&manifest_with_opa(json!({ "rego_source": rego }))).is_ok());
+
+        let err = validate_manifest_v2(&manifest_with_opa(
+            json!({ "hive": "worker1", "rego_source": rego }),
+        ))
+        .expect_err("a hive is refused");
+        assert!(err.contains("takes no 'hive'"), "{err}");
+        let err = validate_manifest_v2(&manifest_with_opa(json!({ "rego_source": " " })))
+            .expect_err("an empty rego is refused");
+        assert!(err.contains("non-empty rego_source"), "{err}");
+
+        // The per-hive list is gone: it is an unknown section now.
+        let old: SolutionManifestV2 = serde_json::from_value(json!({
+            "manifest_version": "2.0",
+            "solution": { "name": "demo" },
+            "desired_state": { "opa_deployments": [] },
+            "advisory": {}
+        }))
+        .expect("manifest parses");
+        assert!(validate_manifest_v2(&old).is_err());
+    }
+
+    fn write_saved_manifest(state_dir: &Path, solution: &str, version: &str, desired: Value) {
+        let dir = state_dir.join("manifests").join(solution);
+        std::fs::create_dir_all(&dir).expect("manifest dir");
+        let manifest = json!({ "manifest_version": "2.0", "solution": {}, "desired_state": desired, "advisory": {} });
+        std::fs::write(dir.join(format!("{version}.json")), manifest.to_string()).expect("write");
+    }
+
+    #[test]
+    fn the_running_policy_belongs_to_the_solution_that_declared_it_last() {
+        let state_dir = test_temp_dir("opa-owner");
+        let first = "package router\n\ndefault target = null\n";
+        let second = "package router\n\ndefault target = \"AI.b@motherbee\"\n";
+        write_saved_manifest(
+            &state_dir,
+            "sol-a",
+            "v1000000000100",
+            json!({ "opa": { "rego_source": first } }),
+        );
+        write_saved_manifest(
+            &state_dir,
+            "sol-a",
+            "v1000000000300",
+            json!({ "nodes": [] }),
+        );
+        write_saved_manifest(
+            &state_dir,
+            "sol-b",
+            "v1000000000200",
+            json!({ "opa": { "rego_source": first } }),
+        );
+        write_saved_manifest(
+            &state_dir,
+            "sol-b",
+            "v1000000000400",
+            json!({ "opa": { "rego_source": second } }),
+        );
+        write_saved_manifest(
+            &state_dir,
+            "sol-old",
+            "v1000000000500",
+            json!({ "opa_deployments": [{ "hive": "motherbee" }] }),
+        );
+        std::fs::write(
+            state_dir.join("manifests/sol-a/notes.txt"),
+            "not a manifest",
+        )
+        .expect("write");
+
+        let declarations = saved_opa_declarations(&state_dir);
+        assert_eq!(declarations.len(), 3);
+        assert_eq!(
+            opa_policy_declared_by(&declarations, first),
+            Some("sol-b".to_string())
+        );
+        assert_eq!(
+            opa_policy_declared_by(&declarations, second),
+            Some("sol-b".to_string())
+        );
+        assert_eq!(
+            opa_policy_declared_by(&declarations, "package router\n"),
+            None
+        );
+        assert_eq!(opa_policy_declared_by(&declarations, ""), None);
+
+        // In scope when the manifest declares a policy or the solution declared one before.
+        let without = manifest_with_opa(Value::Null);
+        assert!(!opa_in_scope(&without, "sol-c", &declarations));
+        assert!(opa_in_scope(&without, "sol-a", &declarations));
+        assert!(opa_in_scope(
+            &manifest_with_opa(json!({ "rego_source": first })),
+            "sol-c",
+            &declarations
+        ));
+        assert!(saved_opa_declarations(&state_dir.join("missing")).is_empty());
+        let _ = std::fs::remove_dir_all(&state_dir);
+    }
+
+    #[test]
+    fn the_snapshot_reads_the_running_policy_from_the_motherbee() {
+        let rego = "package router\n\ndefault target = null\n";
+        let declarations = vec![OpaDeclaration {
+            solution_id: "sol-a".to_string(),
+            version: "v1".to_string(),
+            rego: rego.to_string(),
+        }];
+        let answer = |payload: Value| {
+            json!({ "status": "ok", "payload": { "responses": [
+                { "hive": "motherbee", "status": "ok", "payload": payload }
+            ] } })
+        };
+        let running = running_opa_policy(
+            &answer(json!({ "version": 7, "hash": "sha256:ab", "rego": rego, "entrypoint": "router/target" })),
+            &declarations,
+        )
+        .expect("policy");
+        assert_eq!(
+            running,
+            ActualOpaPolicy {
+                version: 7,
+                hash: "sha256:ab".to_string(),
+                rego: rego.to_string(),
+                entrypoint: "router/target".to_string(),
+                declared_by: Some("sol-a".to_string()),
+            }
+        );
+        let none = running_opa_policy(
+            &answer(json!({ "version": 0, "hash": "", "rego": "" })),
+            &declarations,
+        )
+        .expect("no policy is an answer too");
+        assert_eq!(none, ActualOpaPolicy::default());
+        assert!(
+            running_opa_policy(&json!({ "status": "ok", "payload": {} }), &declarations).is_none()
+        );
+    }
+
+    #[test]
+    fn the_snapshot_parses_the_admin_reply_as_it_arrives_from_the_motherbee() {
+        // GET /hives/motherbee/opa/policy on 8.x (0.1.47, 2026-10-01): the body the admin returns
+        // for opa_get_policy, which reaches the architect through the SDK's admin reply parser.
+        let body = json!({
+            "action": "get_policy", "error_code": null, "error_detail": null,
+            "expected_hives_policy": ["motherbee"], "expected_hives_topology": ["motherbee"],
+            "pending": [], "pending_hives_policy": [], "pending_hives_topology": [],
+            "responses": [{ "hive": "motherbee", "status": "ok", "payload": {
+                "compiled_at": "2026-10-01T20:53:03Z", "entrypoint": "router/target",
+                "hash": "sha256:88cd27963b1daf93e2ed7ff3bd47cdcaaf9e775edbf1b602b97e2704c49205bc",
+                "hive": "motherbee", "rego": "package router\n\ndefault target = null\n",
+                "status": "ok", "version": 19
+            } }],
+            "status": "ok"
+        });
+        let reply = json!({
+            "status": "ok",
+            "payload": fluxbee_sdk::admin_response_payload_value(&body),
+        });
+        let running = running_opa_policy(&reply, &[]).expect("policy");
+        assert_eq!(running.version, 19);
+        assert_eq!(running.rego, "package router\n\ndefault target = null\n");
+        assert_eq!(running.entrypoint, "router/target");
+        assert!(running.hash.starts_with("sha256:88cd"));
+        assert_eq!(running.declared_by, None);
+    }
+
+    fn opa_delta(classes: &[pipeline_types::CompilerClass]) -> DeltaReport {
+        DeltaReport {
+            delta_report_version: "0.1".to_string(),
+            status: DeltaReportStatus::Ready,
+            manifest_ref: "manifest://sol-a/current".to_string(),
+            snapshot_ref: "snap".to_string(),
+            summary: DeltaSummary::default(),
+            operations: classes
+                .iter()
+                .map(|class| DeltaOperation {
+                    op_id: format!("op-{class:?}"),
+                    resource_type: "x".to_string(),
+                    resource_id: "x".to_string(),
+                    change_type: ChangeType::Update,
+                    ownership: "solution".to_string(),
+                    compiler_class: class.clone(),
+                    desired_ref: None,
+                    actual_ref: None,
+                    blocking: false,
+                    payload_ref: None,
+                    notes: vec![],
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn opa_steps_carry_exactly_the_declared_policy_and_no_hive() {
+        let rego = "package router\n\ndefault target = null\n";
+        let run_state = json!({ "desired_opa": { "rego_source": rego } });
+        let mut plan = json!({ "execution": { "steps": [
+            { "id": "s1", "action": "add_route", "args": { "prefix": "AI.a" } },
+            { "id": "s2", "action": "opa_compile_apply", "args": { "rego": "package router", "hive": "worker1" } }
+        ] } });
+        let delta = opa_delta(&[
+            pipeline_types::CompilerClass::RouteAdd,
+            pipeline_types::CompilerClass::OpaApply,
+        ]);
+        pin_opa_plan_steps(&mut plan, &delta, &run_state).expect("pinned");
+        assert_eq!(
+            plan["execution"]["steps"][0]["args"],
+            json!({ "prefix": "AI.a" })
+        );
+        assert_eq!(
+            plan["execution"]["steps"][1]["args"],
+            json!({ "rego": rego, "entrypoint": "router/target" })
+        );
+
+        let mut clear = json!({ "execution": { "steps": [
+            { "id": "s1", "action": "opa_clear", "args": { "hive": "worker1" } }
+        ] } });
+        let delta = opa_delta(&[pipeline_types::CompilerClass::OpaRemove]);
+        pin_opa_plan_steps(&mut clear, &delta, &json!({})).expect("pinned");
+        assert_eq!(clear["execution"]["steps"][0]["args"], json!({}));
+
+        let mut plan = json!({ "execution": { "steps": [
+            { "id": "s1", "action": "opa_compile_apply", "args": { "rego": "x" } }
+        ] } });
+        let delta = opa_delta(&[pipeline_types::CompilerClass::OpaApply]);
+        assert!(pin_opa_plan_steps(&mut plan, &delta, &json!({})).is_err());
+
+        assert!(pipeline_plan_compiler_context(&run_state).contains("router/target"));
+        assert!(pipeline_plan_compiler_context(&json!({})).is_empty());
+    }
+
+    #[test]
+    fn the_admin_is_always_asked_on_the_motherbee() {
+        // There is one SY.admin, on the motherbee; a read about another hive names that hive as
+        // the target (FINDINGS A-24). Built with concat! so this test does not match itself.
+        let source = include_str!("sy_architect.rs");
+        for addressed_by_hive in [
+            concat!("SY.admin@", "{hive}"),
+            concat!("SY.admin@{}\", ", "hive)"),
+        ] {
+            assert!(
+                !source.contains(addressed_by_hive),
+                "found {addressed_by_hive}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_confirmation_says_whose_policy_the_plan_replaces() {
+        let trace = build_plan_compile_trace(
+            "task",
+            "motherbee",
+            None,
+            "ok",
+            None,
+            None,
+            vec![],
+            None,
+            vec![],
+            0,
+            0,
+            None,
+            0,
+        );
+        let mut delta = opa_delta(&[pipeline_types::CompilerClass::OpaApply]);
+        delta.operations[0].resource_type = reconciler::OPA_POLICY_RESOURCE_TYPE.to_string();
+        delta.operations[0].notes =
+            vec!["replaces the user policy declared by solution 'sol-b'".to_string()];
+        let payload = build_confirm2_payload("run-1", &delta, "summary", &trace);
+        assert_eq!(payload["user_policy"]["change_type"], json!("update"));
+        assert!(payload["user_policy"]["notes"][0]
+            .as_str()
+            .unwrap()
+            .contains("'sol-b'"));
+
+        let delta = opa_delta(&[pipeline_types::CompilerClass::RouteAdd]);
+        let payload = build_confirm2_payload("run-1", &delta, "summary", &trace);
+        assert!(payload["user_policy"].is_null());
     }
 
     #[test]
@@ -25545,6 +26293,52 @@ mod tests {
     }
 
     #[test]
+    fn opa_writes_translate_to_the_global_policy_on_the_primary() {
+        for (path, action) in [
+            ("/opa/policy", "opa_compile_apply"),
+            ("/opa/policy/compile", "opa_compile"),
+            ("/opa/policy/apply", "opa_apply"),
+            ("/opa/policy/rollback", "opa_rollback"),
+            ("/opa/policy/clear", "opa_clear"),
+            ("/opa/policy/check", "opa_check"),
+        ] {
+            let translated = translate_scmd(
+                "motherbee",
+                parse(&format!("curl -X POST {path} -d '{{\"version\":3}}'")),
+            )
+            .unwrap_or_else(|err| panic!("{path}: {err}"));
+            assert_eq!(translated.action, action, "{path}");
+            assert_eq!(translated.target_hive, PRIMARY_HIVE_ID, "{path}");
+            assert_eq!(translated.params, json!({"version": 3}), "{path}");
+        }
+        // Per-hive writes are gone: there is one policy for every hive.
+        assert!(
+            translate_scmd("motherbee", parse("curl -X POST /hives/worker1/opa/policy")).is_err()
+        );
+        // Reads stay per hive.
+        let read =
+            translate_scmd("motherbee", parse("curl -X GET /hives/worker1/opa/status")).unwrap();
+        assert_eq!(read.target_hive, "worker1");
+    }
+
+    /// Contract: every OPA example the admin's catalog advertises must be one the architect can
+    /// run (they drifted apart once: the catalog moved to /opa/policy* and this translator did not).
+    #[test]
+    fn every_opa_example_in_the_admin_catalog_translates() {
+        let admin_src = include_str!("sy_admin.rs");
+        let mut checked = 0;
+        for (idx, _) in admin_src.match_indices("r#\"curl -X POST /opa/policy") {
+            let raw = &admin_src[idx + 3..];
+            let example = &raw[..raw.find("\"#").expect("raw string end")];
+            let translated = translate_scmd("motherbee", parse(example))
+                .unwrap_or_else(|err| panic!("{example}: {err}"));
+            assert!(translated.action.starts_with("opa_"), "{example}");
+            checked += 1;
+        }
+        assert_eq!(checked, 6, "the admin catalog has six OPA write examples");
+    }
+
+    #[test]
     fn translate_wf_rules_list_workflows_scmd() {
         let translated =
             translate_scmd("motherbee", parse("curl -X GET /hives/motherbee/wf-rules"))
@@ -25610,6 +26404,45 @@ mod tests {
         assert_eq!(translated.action, "list_taps");
         assert_eq!(translated.target_hive, "motherbee");
         assert_eq!(translated.params, json!({}));
+    }
+
+    #[test]
+    fn translate_llm_usage_scmd() {
+        // Without a tenant_id the question is about every tenant, as on the admin's HTTP route.
+        let every = translate_scmd(
+            "motherbee",
+            parse("curl -X GET /hives/motherbee/usage?from=2026-10-01T00:00:00Z&to=2026-11-01T00:00:00Z&group_by=model&limit=50"),
+        )
+        .expect("translation should succeed");
+        assert_eq!(every.action, "get_llm_usage");
+        assert_eq!(every.target_hive, "motherbee");
+        assert_eq!(
+            every.params,
+            json!({
+                "from": "2026-10-01T00:00:00Z",
+                "to": "2026-11-01T00:00:00Z",
+                "group_by": "model",
+                "limit": 50,
+                "all_tenants": true
+            })
+        );
+        let one = translate_scmd(
+            "motherbee",
+            parse("curl -X GET /hives/motherbee/usage?tenant_id=tnt:43d576a3-d712-4d91-9245-5d5463dd693e&since=2026-10-17T10:00:00.000001Z%7Cr1"),
+        )
+        .expect("translation should succeed");
+        assert_eq!(
+            one.params,
+            json!({
+                "tenant_id": "tnt:43d576a3-d712-4d91-9245-5d5463dd693e",
+                "since": "2026-10-17T10:00:00.000001Z|r1",
+                "all_tenants": false
+            })
+        );
+        // The params are the admin's question, field for field.
+        for params in [every.params, one.params] {
+            serde_json::from_value::<fluxbee_sdk::UsageQuery>(params).expect("a UsageQuery");
+        }
     }
 
     #[test]
@@ -26321,6 +27154,7 @@ mod tests {
             },
             hive_status,
             resources,
+            opa: None,
             completeness: SnapshotCompleteness {
                 is_partial: true,
                 missing_sections: vec!["worker-220".to_string()],
@@ -26328,7 +27162,7 @@ mod tests {
             },
         };
 
-        let output = run_reconciler(&manifest, &snapshot, "manifest-tg7")
+        let output = run_reconciler(&manifest, &snapshot, "manifest-tg7", "tg7")
             .expect("reconciler must not error on partial snapshot");
 
         assert_eq!(
@@ -27001,6 +27835,8 @@ mod tests {
             resource_type: "openai".to_string(),
             tenant_id: fluxbee_sdk::DEFAULT_ROOT_TENANT_ID.to_string(),
             ilk: None,
+            assigned_ilks: Vec::new(),
+            general: true,
             version: 1,
             key: "secret/openai".to_string(),
             hive_id: "motherbee".to_string(),

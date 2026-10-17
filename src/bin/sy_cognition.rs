@@ -1,26 +1,29 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::{self, OpenOptions};
+use std::future::Future;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
-use tokio::sync::Mutex;
+use tokio::sync::{mpsc, Mutex};
 use tokio::time;
-use tokio_postgres::{Config as PgConfig, NoTls, Row};
 use tracing_subscriber::EnvFilter;
 use uuid::Uuid;
 
-use fluxbee_ai_sdk::{AiProvider, HiveAiConfig};
-use fluxbee_sdk::nats::{publish_local, resolve_local_nats_endpoint};
+use fluxbee_ai_sdk::{AiAccount, AiProvider, HiveAiConfig, TenantSource, UsageRecorder};
 use fluxbee_sdk::payload::TextV1Payload;
 use fluxbee_sdk::protocol::{
     is_system_kind, Destination, EpisodeSummary, MemoryContextSummary, MemoryPackage,
     MemoryPackageTruncated, MemoryReasonSummary, MemorySummary, Message, Meta, Routing,
     VaultSecretChangedPayload, VaultSecretInterest, MSG_VAULT_SECRET_CHANGED, SYSTEM_KIND,
+};
+use fluxbee_sdk::rpc::SystemRpcRequest;
+use fluxbee_sdk::stream::{
+    is_stream_node_name, stream_hive, StreamBatch, MSG_STREAM_ACK, MSG_STREAM_BATCH,
+    SUBJECT_COGNITION_TURNS, SUBJECT_STORAGE_COGNITION_BATCH,
 };
 use fluxbee_sdk::{
     build_node_config_response_message, managed_node_config_path, managed_node_instance_dir,
@@ -29,16 +32,16 @@ use fluxbee_sdk::{
     VaultClient, NODE_CONFIG_APPLY_MODE_REPLACE,
 };
 use fluxbee_sdk::{
-    CognitionContextData, CognitionCooccurrenceData, CognitionDurableEntity,
-    CognitionDurableEnvelope, CognitionDurableOp, CognitionEpisodeData, CognitionIlkProfile,
-    CognitionMemoryData, CognitionReasonData, CognitionScopeData, CognitionScopeInstanceData,
-    CognitionThreadData, SUBJECT_STORAGE_COGNITION_CONTEXTS,
-    SUBJECT_STORAGE_COGNITION_COOCCURRENCES, SUBJECT_STORAGE_COGNITION_EPISODES,
-    SUBJECT_STORAGE_COGNITION_MEMORIES, SUBJECT_STORAGE_COGNITION_REASONS,
-    SUBJECT_STORAGE_COGNITION_SCOPES, SUBJECT_STORAGE_COGNITION_SCOPE_INSTANCES,
-    SUBJECT_STORAGE_COGNITION_THREADS,
+    CognitionCommunicationRef, CognitionContextData, CognitionCooccurrenceData,
+    CognitionDurableEntity, CognitionDurableEnvelope, CognitionDurableOp, CognitionEnvelopeBatch,
+    CognitionEpisodeData, CognitionIlkProfile, CognitionMemoryData, CognitionReasonData,
+    CognitionScopeData, CognitionScopeInstanceData, CognitionStateGet, CognitionStateResponse,
+    CognitionThreadData, MSG_COGNITION_STATE_GET, MSG_COGNITION_STATE_RESPONSE,
+    SUBJECT_STORAGE_COGNITION_CONTEXTS, SUBJECT_STORAGE_COGNITION_COOCCURRENCES,
+    SUBJECT_STORAGE_COGNITION_EPISODES, SUBJECT_STORAGE_COGNITION_MEMORIES,
+    SUBJECT_STORAGE_COGNITION_REASONS, SUBJECT_STORAGE_COGNITION_SCOPES,
+    SUBJECT_STORAGE_COGNITION_SCOPE_INSTANCES, SUBJECT_STORAGE_COGNITION_THREADS,
 };
-use json_router::nats::{NatsSubscriber as RouterNatsSubscriber, SUBJECT_STORAGE_TURNS};
 use json_router::shm::{
     memory_shm_name_for_hive, MemoryRegionWriter, MemoryShmSnapshot, MemoryShmThreadEntry,
     MEMORY_MAX_DATA_SIZE,
@@ -49,7 +52,9 @@ mod narrative_summarizer_ai;
 #[path = "sy_cognition/semantic_tagger_ai.rs"]
 mod semantic_tagger_ai;
 
-use narrative_summarizer_ai::run_narrative_summarizer_ai;
+use narrative_summarizer_ai::{
+    run_narrative_summarizer_ai, EpisodeNarrative, NarrativeSummaries, NarrativeSummarizerAiInput,
+};
 use semantic_tagger_ai::run_semantic_tagger_ai;
 
 type CognitionError = Box<dyn std::error::Error + Send + Sync>;
@@ -57,11 +62,21 @@ type CognitionError = Box<dyn std::error::Error + Send + Sync>;
 const COGNITION_NODE_BASE_NAME: &str = "SY.cognition";
 const COGNITION_NODE_VERSION: &str = "2.0";
 const COGNITION_CONFIG_SCHEMA_VERSION: u32 = 1;
-const STORAGE_DB_NAME: &str = "fluxbee_storage";
-const COGNITION_TURNS_SID: u32 = 27;
-const DURABLE_QUEUE_TURNS: &str = "durable.sy-cognition.turns";
-const COGNITION_DEFAULT_CONTEXT_OPEN_THRESHOLD: f64 = 0.5;
-const COGNITION_DEFAULT_REASON_OPEN_THRESHOLD: f64 = 0.5;
+/// The most bytes of envelopes one `storage.cognition.batch` append carries: under the stream's
+/// 96 KB record limit with room for the record's own fields (docs/router-stream-v1.md §6.2).
+const COGNITION_APPEND_MAX_BYTES: usize = 64 * 1024;
+/// How long one page of a communication's state may take to come back from SY.storage.
+const COGNITION_STATE_PAGE_TIMEOUT: Duration = Duration::from_secs(5);
+/// How many communications the startup reload asks SY.storage for at once.
+const COGNITION_RELOAD_CONCURRENCY: usize = 4;
+/// How long an agent node's ILK and tenant are trusted when the identity shared memory's sequence
+/// cannot be read; while it can, they are trusted until it changes.
+const COGNITION_AGENT_ILK_TTL: Duration = Duration::from_secs(60);
+/// A communication held but idle this long is checked against SY.storage before its next turn:
+/// its agent may have moved to another hive and back meanwhile (§6.2).
+const COGNITION_HELD_STALE_AFTER: Duration = Duration::from_secs(300);
+const COGNITION_DEFAULT_CONTEXT_CLOSE_THRESHOLD: f64 = 0.25;
+const COGNITION_DEFAULT_REASON_CLOSE_THRESHOLD: f64 = 0.25;
 const COGNITION_DEFAULT_SEMANTIC_TAGGER_TIMEOUT_MS: u64 = 8_000;
 const COGNITION_CONTEXT_DECAY_FACTOR: f64 = 0.85;
 const COGNITION_REASON_DECAY_FACTOR: f64 = 0.75;
@@ -77,7 +92,6 @@ const COGNITION_EPISODE_MIN_INTENSITY: f64 = 7.0;
 const COGNITION_EPISODE_MIN_EVIDENCE_STRENGTH: f64 = 8.0;
 const COGNITION_MAX_TAGS: usize = 12;
 const COGNITION_MAX_REASON_SIGNALS: usize = 4;
-const NATS_ERROR_LOG_EVERY: u64 = 20;
 const COGNITION_REASON_CANONICAL_SIGNALS: [&str; 8] = [
     "resolve",
     "inform",
@@ -109,6 +123,27 @@ struct ThreadUpdateResult {
     narrative: NarrativeOutcome,
 }
 
+/// The narrative step of a turn (memory and episode text). Production asks the AI; tests
+/// answer from the input, so the whole turn path runs without a network.
+trait NarrativeSummarizer {
+    fn summarize<'a>(
+        &'a self,
+        input: NarrativeSummarizerAiInput<'a>,
+    ) -> impl Future<Output = Result<NarrativeSummaries, fluxbee_ai_sdk::AiSdkError>> + Send + 'a;
+}
+
+struct AiNarrativeSummarizer;
+
+impl NarrativeSummarizer for AiNarrativeSummarizer {
+    fn summarize<'a>(
+        &'a self,
+        input: NarrativeSummarizerAiInput<'a>,
+    ) -> impl Future<Output = Result<NarrativeSummaries, fluxbee_ai_sdk::AiSdkError>> + Send + 'a
+    {
+        run_narrative_summarizer_ai(input)
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CognitionAiSecretSource {
     /// `openai_api_key_ref` persisted locally; resolution to plaintext via
@@ -128,17 +163,22 @@ impl CognitionAiSecretSource {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// `config.thresholds`. An open context or reason that a turn does not reinforce decays, and
+/// closes once its weight is under its close threshold; a co-occurrence closes under the
+/// average of the two. Nothing gates opening: every candidate the tagger names opens (score
+/// 1.0). The keys were `context_open`/`reason_open` until 2026-10-02, and their value, halved,
+/// was the close threshold: the 0.25 defaults keep what their 0.5 defaults did.
+#[derive(Debug, Clone)]
 struct CognitionThresholds {
-    context_open: f64,
-    reason_open: f64,
+    context_close: f64,
+    reason_close: f64,
 }
 
 impl Default for CognitionThresholds {
     fn default() -> Self {
         Self {
-            context_open: COGNITION_DEFAULT_CONTEXT_OPEN_THRESHOLD,
-            reason_open: COGNITION_DEFAULT_REASON_OPEN_THRESHOLD,
+            context_close: COGNITION_DEFAULT_CONTEXT_CLOSE_THRESHOLD,
+            reason_close: COGNITION_DEFAULT_REASON_CLOSE_THRESHOLD,
         }
     }
 }
@@ -200,11 +240,12 @@ struct RuntimePaths {
 struct CognitionRuntimeState {
     processed_turns_total: u64,
     invalid_turns_total: u64,
+    /// Turns dropped because the queue between their delivery and their processing was full.
+    dropped_turns_queue_full_total: u64,
     published_entities_total: u64,
     publish_errors_total: u64,
     last_trace_id: Option<String>,
     last_thread_id: Option<String>,
-    last_thread_seq: Option<u64>,
     last_src_ilk: Option<String>,
     last_ich: Option<String>,
     last_tags: Vec<String>,
@@ -224,6 +265,14 @@ struct CognitionRuntimeState {
     last_rebuild_status: Option<String>,
     last_rebuild_source: Option<String>,
     last_rebuild_at: Option<String>,
+    /// Turns whose agent node has no ILK in the identity shared memory: no memory for them.
+    no_agent_ilk_total: u64,
+    /// Records of a stream batch at or below the last seq taken for that stream and epoch.
+    stream_repeats_skipped_total: u64,
+    /// `COGNITION_STATE_GET` exchanges with SY.storage (one per communication loaded), and the
+    /// ones that failed; a turn whose communication could not load is skipped.
+    state_fetches_total: u64,
+    state_fetch_failures_total: u64,
     shm_hot_threads_total: u64,
     shm_pruned_threads_total: u64,
     shm_payload_bytes: u64,
@@ -240,29 +289,49 @@ struct CognitionRuntimeState {
     last_narrative_model: Option<String>,
 }
 
-#[derive(Debug)]
 struct CognitionAppState {
-    config_dir: PathBuf,
-    state_dir: PathBuf,
-    socket_dir: PathBuf,
     hive_id: String,
     node_name: String,
     self_ilk_id: String,
-    use_durable_consumer: bool,
     runtime_paths: RuntimePaths,
     control_state: Arc<Mutex<CognitionControlState>>,
     runtime_state: Arc<Mutex<CognitionRuntimeState>>,
-    nats_subscribe_errors: Arc<AtomicU64>,
-    thread_states: Arc<Mutex<HashMap<String, ThreadCognitionState>>>,
+    /// The communications this cognition holds, each owned by one of its hive's agents (§6.1).
+    thread_states: Arc<Mutex<HashMap<CommunicationKey, ThreadCognitionState>>>,
     memory_region: Arc<Mutex<Option<MemoryRegionWriter>>>,
     vault: VaultClient,
+    dispatcher: Arc<RouterDispatcher>,
+    /// Agent node → its ILK and tenant, read from the identity shared memory.
+    agent_ilks: Mutex<HashMap<String, AgentIdentity>>,
+    /// Where each model call's usage record goes (docs/router-stream-v1.md §7.2).
+    usage: UsageRecorder,
+    /// The last record seq taken from each stream, by stream name and epoch.
+    stream_seen: Mutex<HashMap<(String, u64), u64>>,
+}
+
+/// A communication (docs/router-stream-v1.md §6.2): the thread between its interlocutors, owned by
+/// the agent that serves it. Memory and its references are per communication, never per hive or
+/// node.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+struct CommunicationKey {
+    thread_id: String,
+    agent_ilk: String,
+}
+
+/// A copy of a turn its router made for this cognition: the message, and the local agent node that
+/// owns its communication.
+#[derive(Debug)]
+struct CognitionTurn {
+    message: Message,
+    agent_node: String,
 }
 
 #[derive(Debug, Clone, Default)]
 struct ThreadCognitionState {
+    /// The agent node its router delivers to, where the memory package is read (mechanism only).
+    agent_node: String,
     first_seen_at: Option<String>,
     last_seen_at: Option<String>,
-    latest_thread_seq: Option<u64>,
     turn_count: u64,
     contexts: HashMap<String, ContextState>,
     reasons: HashMap<String, ReasonState>,
@@ -340,7 +409,7 @@ struct ScopeBindingState {
     binding_energy_ema: f64,
     opened_at: String,
     last_seen_at: String,
-    start_thread_seq: Option<u64>,
+    start_turn: Option<u64>,
     unbind_streak: u32,
 }
 
@@ -376,26 +445,15 @@ struct EpisodeState {
     created_at: String,
 }
 
+/// The deterministic half of an episode. Its summary and reason come from the narrative
+/// summarizer, which must return both whenever a candidate exists.
 #[derive(Debug, Clone)]
 struct EpisodeCandidate {
     affect_id: String,
     title: String,
-    summary: String,
     base_intensity: f64,
     evidence_strength: f64,
     evidence_signals: Vec<String>,
-    reason: String,
-}
-
-#[derive(Debug, Clone, Default)]
-struct RebuildSnapshot {
-    threads: HashMap<String, ThreadCognitionState>,
-    total_contexts: u64,
-    total_reasons: u64,
-    total_cooccurrences: u64,
-    total_scopes: u64,
-    total_memories: u64,
-    total_episodes: u64,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -408,18 +466,19 @@ struct MemoryHotSetStats {
 #[derive(Debug)]
 struct MemoryHotSetBuild {
     snapshot: MemoryShmSnapshot,
-    selected_thread_ids: HashSet<String>,
+    selected_thread_ids: HashSet<CommunicationKey>,
     stats: MemoryHotSetStats,
 }
 
 #[derive(Debug)]
 struct MemoryHotThreadCandidate {
+    key: CommunicationKey,
     entry: MemoryShmThreadEntry,
     serialized_bytes: usize,
+    updated_by_this_turn: bool,
     has_active_scope: bool,
     live_entities_total: usize,
     last_seen_epoch_ms: i64,
-    latest_thread_seq: u64,
     turn_count: u64,
 }
 
@@ -431,9 +490,7 @@ struct ScopeInstancePayload {
     #[serde(default)]
     dominant_reason_id: Option<String>,
     #[serde(default)]
-    start_thread_seq: Option<u64>,
-    #[serde(default)]
-    end_thread_seq: Option<u64>,
+    start_turn: Option<u64>,
     #[serde(default)]
     opened_at: Option<String>,
     #[serde(default)]
@@ -459,15 +516,7 @@ struct ReasonCandidate {
 struct HiveFile {
     hive_id: String,
     #[serde(default)]
-    nats: Option<NatsSection>,
-    #[serde(default)]
     ai: Option<HiveAiConfig>,
-}
-
-#[derive(Debug, Deserialize)]
-struct NatsSection {
-    #[serde(default)]
-    mode: Option<String>,
 }
 
 #[tokio::main]
@@ -478,7 +527,7 @@ async fn main() -> Result<(), CognitionError> {
     }
 
     let log_level = std::env::var("JSR_LOG_LEVEL").unwrap_or_else(|_| "info".to_string());
-    tracing_subscriber::fmt()
+    fluxbee_sdk::logging::fmt()
         .with_env_filter(EnvFilter::new(log_level))
         .init();
 
@@ -495,15 +544,6 @@ async fn main() -> Result<(), CognitionError> {
     let self_ilk_id =
         fluxbee_sdk::deterministic_system_ilk_id(&format!("SY.cognition@{}", hive.hive_id));
     tracing::info!(self_ilk_id = %self_ilk_id, "self system ILK computed deterministically");
-    let state_dir = json_router::paths::state_dir();
-    let socket_dir = json_router::paths::router_socket_dir();
-    let endpoint = resolve_local_nats_endpoint(&config_dir)?;
-    let use_durable_consumer = hive
-        .nats
-        .as_ref()
-        .and_then(|n| n.mode.as_deref())
-        .map(|mode| mode.trim().eq_ignore_ascii_case("embedded"))
-        .unwrap_or(true);
     let node_base_name = managed_node_name(COGNITION_NODE_BASE_NAME, &["SY_COGNITION_NODE_NAME"]);
     let node_name = ensure_l2_name(&node_base_name, &hive.hive_id);
     let runtime_paths = ensure_runtime_paths(&node_name)?;
@@ -518,7 +558,6 @@ async fn main() -> Result<(), CognitionError> {
     initial_control_state.semantic_tagger.model = ai_engine.model;
     let control_state = Arc::new(Mutex::new(initial_control_state));
     let runtime_state = Arc::new(Mutex::new(CognitionRuntimeState::default()));
-    let nats_subscribe_errors = Arc::new(AtomicU64::new(0));
 
     let node_config = NodeConfig {
         name: node_base_name,
@@ -535,27 +574,26 @@ async fn main() -> Result<(), CognitionError> {
     let sender = dispatcher.sender_snapshot();
     tracing::info!(node_name = %sender.full_name(), "sy.cognition connected to router");
 
-    let vault_client = VaultClient::new(
+    // SY.cognition also runs on workers; the vault only on the motherbee.
+    let vault_client = VaultClient::for_primary(
         dispatcher.clone(),
-        hive.hive_id.clone(),
         VaultCallerOwned::new(self_ilk_id.clone(), node_name.clone()),
     );
 
     let app_state = Arc::new(CognitionAppState {
-        config_dir: config_dir.clone(),
-        state_dir: state_dir.clone(),
-        socket_dir: socket_dir.clone(),
         hive_id: hive.hive_id.clone(),
         node_name: node_name.clone(),
         self_ilk_id: self_ilk_id.clone(),
-        use_durable_consumer,
         runtime_paths: runtime_paths.clone(),
         control_state: Arc::clone(&control_state),
         runtime_state: Arc::clone(&runtime_state),
-        nats_subscribe_errors: Arc::clone(&nats_subscribe_errors),
         thread_states: Arc::new(Mutex::new(HashMap::new())),
         memory_region: Arc::new(Mutex::new(None)),
         vault: vault_client,
+        dispatcher: Arc::clone(&dispatcher),
+        agent_ilks: Mutex::new(HashMap::new()),
+        usage: UsageRecorder::start(Arc::clone(&dispatcher)),
+        stream_seen: Mutex::new(HashMap::new()),
     });
 
     if let Ok(owner_uuid) = Uuid::parse_str(sender.uuid()) {
@@ -570,25 +608,39 @@ async fn main() -> Result<(), CognitionError> {
         }
     }
 
-    rebuild_from_durable_on_startup(Arc::clone(&app_state)).await;
-
-    std::mem::drop(tokio::spawn(run_turns_loop(
-        endpoint.clone(),
-        Arc::clone(&app_state),
-    )));
+    // The worker's task first resolves the AI key and brings back the communications the shared
+    // memory holds, then takes turns. Meanwhile the main loop keeps acking its routers' batches and
+    // the turns wait in the queue, inside the streams' window (§6.2).
+    let (turn_tx, turn_rx) = mpsc::channel::<CognitionTurn>(COGNITION_TURN_QUEUE);
+    let worker_state = Arc::clone(&app_state);
+    std::mem::drop(tokio::spawn(async move {
+        // Resolved once here, as SY.architect and SY.frontdesk.gov do at startup, so the state this
+        // node reports is true from the start (A-69). Each turn still resolves it again.
+        if resolve_cognition_ai_api_key(&worker_state, VaultWait::UntilReachable)
+            .await
+            .is_some()
+        {
+            worker_state.control_state.lock().await.ai_secret_source =
+                CognitionAiSecretSource::LocalFile;
+        }
+        let ai_secret_source = worker_state.control_state.lock().await.ai_secret_source;
+        tracing::info!(
+            ai_secret_source = %ai_secret_source.as_str(),
+            "sy.cognition looked up its AI key"
+        );
+        // Before the first turn, so a restart neither blanks the packages the agents read nor
+        // starts them over.
+        reload_communications_from_shared_memory(&worker_state).await;
+        run_turn_worker(turn_rx, worker_state).await;
+    }));
 
     // Vault state changes arrive event-driven via VAULT_SECRET_CHANGED
     // broadcasts from SY.vault — no polling loop needed. See
     // `handle_vault_secret_changed_cognition` in process_router_message.
 
-    let startup_ai_secret_source = control_state.lock().await.ai_secret_source;
-
     tracing::info!(
         hive = %hive.hive_id,
         node_name = %node_name,
-        endpoint = %endpoint,
-        durable_turns = use_durable_consumer,
-        ai_secret_source = %startup_ai_secret_source.as_str(),
         state_dir = %runtime_paths.state_dir.display(),
         "sy.cognition started"
     );
@@ -617,6 +669,10 @@ async fn main() -> Result<(), CognitionError> {
                     tracing::warn!("sy.cognition system channel closed; exiting main loop");
                     return Ok(());
                 };
+                if msg.meta.msg.as_deref() == Some(MSG_STREAM_BATCH) {
+                    take_stream_batch(&app_state, &turn_tx, &msg).await;
+                    continue;
+                }
                 let sender = dispatcher.sender_snapshot();
                 if let Err(err) = process_router_message(
                     &sender,
@@ -630,66 +686,109 @@ async fn main() -> Result<(), CognitionError> {
     }
 }
 
-async fn run_turns_loop(endpoint: String, app_state: Arc<CognitionAppState>) {
-    loop {
-        let subscriber = if app_state.use_durable_consumer {
-            RouterNatsSubscriber::new(
-                endpoint.clone(),
-                SUBJECT_STORAGE_TURNS.to_string(),
-                COGNITION_TURNS_SID,
-            )
-            .with_queue(DURABLE_QUEUE_TURNS)
-        } else {
-            RouterNatsSubscriber::new(
-                endpoint.clone(),
-                SUBJECT_STORAGE_TURNS.to_string(),
-                COGNITION_TURNS_SID,
-            )
-        };
-        let run_app_state = Arc::clone(&app_state);
-        let run_result = subscriber
-            .run(move |payload| {
-                let app_state = Arc::clone(&run_app_state);
-                async move { handle_turn_payload(payload, app_state).await }
-            })
-            .await;
-        if let Err(err) = run_result {
-            let count = app_state
-                .nats_subscribe_errors
-                .fetch_add(1, Ordering::Relaxed)
-                + 1;
-            if count == 1 || count % NATS_ERROR_LOG_EVERY == 0 {
-                tracing::warn!(
-                    subject = SUBJECT_STORAGE_TURNS,
-                    error = %err,
-                    failures = count,
-                    "sy.cognition turns subscribe loop failed; retrying"
-                );
-            }
-        }
-        time::sleep(Duration::from_secs(1)).await;
+/// How many delivered turns may wait for their processing. Past it, a turn is dropped and counted.
+const COGNITION_TURN_QUEUE: usize = 256;
+
+/// Takes the turns its router copied for it (`cognition.turns`, §6.2), in order, one at a time.
+async fn run_turn_worker(mut rx: mpsc::Receiver<CognitionTurn>, app_state: Arc<CognitionAppState>) {
+    while let Some(turn) = rx.recv().await {
+        handle_turn(turn, Arc::clone(&app_state)).await;
     }
 }
 
-async fn handle_turn_payload(
-    payload: Vec<u8>,
-    app_state: Arc<CognitionAppState>,
-) -> Result<(), std::io::Error> {
-    let msg: Message = match serde_json::from_slice(&payload) {
-        Ok(msg) => msg,
+/// A `STREAM_BATCH` from one of its hive's routers: each new record goes to the turn queue, and the
+/// batch is acked at once (best effort, §2.7). A record at or below the last one taken from that
+/// stream and epoch is a repeat; a full queue drops a turn and counts it.
+async fn take_stream_batch(
+    app_state: &CognitionAppState,
+    turn_tx: &mpsc::Sender<CognitionTurn>,
+    msg: &Message,
+) {
+    let from = msg.routing.src_l2_name.as_deref().unwrap_or("");
+    if !is_stream_node_name(from) || stream_hive(from) != Some(app_state.hive_id.as_str()) {
+        tracing::warn!(
+            from,
+            "sy.cognition dropped a STREAM_BATCH not from its hive's routers"
+        );
+        return;
+    }
+    let batch: StreamBatch = match serde_json::from_value(msg.payload.clone()) {
+        Ok(batch) => batch,
         Err(err) => {
-            let mut state = app_state.runtime_state.lock().await;
-            state.invalid_turns_total = state.invalid_turns_total.saturating_add(1);
-            tracing::warn!(
-                error = %err,
-                payload_bytes = payload.len(),
-                "sy.cognition received invalid storage.turns payload"
-            );
-            return Ok(());
+            tracing::warn!(from, error = %err, "sy.cognition dropped an unreadable STREAM_BATCH");
+            return;
         }
     };
+    let Some(last_seq) = batch.records.last().map(|record| record.seq) else {
+        return;
+    };
+    let seen_key = (from.to_string(), batch.epoch);
+    let mut seen = app_state
+        .stream_seen
+        .lock()
+        .await
+        .get(&seen_key)
+        .copied()
+        .unwrap_or(0);
+    let (mut repeats, mut dropped) = (0u64, 0u64);
+    for record in batch.records {
+        if record.seq <= seen {
+            repeats += 1;
+            continue;
+        }
+        seen = record.seq;
+        if record.subject != SUBJECT_COGNITION_TURNS {
+            continue;
+        }
+        let message: Message = match serde_json::from_value(record.payload) {
+            Ok(message) => message,
+            Err(_) => {
+                app_state.runtime_state.lock().await.invalid_turns_total += 1;
+                continue;
+            }
+        };
+        let turn = CognitionTurn {
+            message,
+            agent_node: record.producer,
+        };
+        match turn_tx.try_send(turn) {
+            Ok(()) => {}
+            Err(mpsc::error::TrySendError::Full(_)) => dropped += 1,
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                tracing::error!("sy.cognition turn worker is gone; exiting so systemd restarts it");
+                std::process::exit(1);
+            }
+        }
+    }
+    app_state.stream_seen.lock().await.insert(seen_key, seen);
+    if repeats > 0 || dropped > 0 {
+        let mut state = app_state.runtime_state.lock().await;
+        state.stream_repeats_skipped_total += repeats;
+        state.dropped_turns_queue_full_total += dropped;
+    }
+    let sender = app_state.dispatcher.sender_snapshot();
+    let ack = build_system_reply(
+        &sender,
+        msg,
+        MSG_STREAM_ACK,
+        json!({ "up_to_seq": last_seq }),
+    );
+    if let Err(err) = sender.send(ack).await {
+        tracing::warn!(error = %err, "sy.cognition could not ack a stream batch");
+    }
+}
 
-    let Some(thread_id) = msg.meta.thread_id.clone() else {
+/// One turn of a communication (§6.2): the ILK of the agent that owns it, its state (loaded from
+/// SY.storage the first time this cognition sees it), the tagger and the derivations, the envelopes
+/// appended to its router's stream for SY.storage, and the agent's memory package.
+async fn handle_turn(turn: CognitionTurn, app_state: Arc<CognitionAppState>) {
+    let msg = turn.message;
+    let Some(thread_id) = msg
+        .meta
+        .thread_id
+        .clone()
+        .filter(|thread_id| !thread_id.trim().is_empty())
+    else {
         let mut state = app_state.runtime_state.lock().await;
         state.invalid_turns_total = state.invalid_turns_total.saturating_add(1);
         state.last_trace_id = Some(msg.routing.trace_id.clone());
@@ -697,8 +796,71 @@ async fn handle_turn_payload(
             trace_id = %msg.routing.trace_id,
             "sy.cognition skipping turn without thread_id"
         );
-        return Ok(());
+        return;
     };
+    let Some(agent) = agent_identity_of(&app_state, &turn.agent_node).await else {
+        app_state.runtime_state.lock().await.no_agent_ilk_total += 1;
+        tracing::debug!(
+            agent_node = %turn.agent_node,
+            thread_id = %thread_id,
+            "sy.cognition skipping a turn of an agent without an ILK in the identity shared memory"
+        );
+        return;
+    };
+    let agent_ilk = agent.ilk.clone();
+    let key = CommunicationKey {
+        thread_id: thread_id.clone(),
+        agent_ilk: agent_ilk.clone(),
+    };
+    let held_turn = app_state
+        .thread_states
+        .lock()
+        .await
+        .get(&key)
+        .map(|state| (state.turn_count, thread_last_seen_epoch_ms(state)));
+    match held_turn {
+        None => {
+            // Its state may be in SY.storage: after a restart, or when its agent moved here.
+            match fetch_communication_state(&app_state, &key).await {
+                Ok(state) => {
+                    let mut state = state.unwrap_or_default();
+                    state.agent_node = turn.agent_node.clone();
+                    app_state
+                        .thread_states
+                        .lock()
+                        .await
+                        .insert(key.clone(), state);
+                }
+                Err(err) => {
+                    tracing::warn!(
+                        thread_id = %thread_id,
+                        agent_ilk = %agent_ilk,
+                        error = %err,
+                        "sy.cognition could not load a communication from SY.storage; turn skipped"
+                    );
+                    return;
+                }
+            }
+        }
+        Some((held_turns, last_seen_ms))
+            if chrono::Utc::now().timestamp_millis() - last_seen_ms
+                > COGNITION_HELD_STALE_AFTER.as_millis() as i64 =>
+        {
+            // Held but idle: its agent may have moved away and back meanwhile, and another
+            // hive's cognition carried it on. The stored state wins when it is further along.
+            if let Ok(Some(mut stored)) = fetch_communication_state(&app_state, &key).await {
+                if stored.turn_count > held_turns {
+                    stored.agent_node = turn.agent_node.clone();
+                    app_state
+                        .thread_states
+                        .lock()
+                        .await
+                        .insert(key.clone(), stored);
+                }
+            }
+        }
+        Some(_) => {}
+    }
 
     let text = extract_turn_text(&msg.payload).unwrap_or_default();
     let (thresholds, semantic_tagger_config) = {
@@ -709,7 +871,6 @@ async fn handle_turn_payload(
         )
     };
     let ts = chrono::Utc::now().to_rfc3339();
-    let thread_seq = msg.meta.thread_seq;
     let src_ilk = msg.meta.src_ilk.clone();
     let dst_ilk = msg.meta.dst_ilk.clone();
     let ich = msg.meta.ich.clone();
@@ -720,7 +881,7 @@ async fn handle_turn_payload(
         state.last_semantic_impl = Some(format!("{}_sdk", semantic_tagger_config.provider));
     }
 
-    let Some(api_key) = resolve_cognition_ai_api_key(&app_state).await else {
+    let Some(api_key) = resolve_cognition_ai_api_key(&app_state, VaultWait::Once).await else {
         {
             let mut control = app_state.control_state.lock().await;
             control.ai_secret_source = CognitionAiSecretSource::Missing;
@@ -730,7 +891,6 @@ async fn handle_turn_payload(
             state.semantic_tagger_failures_total.saturating_add(1);
         state.last_trace_id = Some(msg.routing.trace_id.clone());
         state.last_thread_id = Some(thread_id.clone());
-        state.last_thread_seq = thread_seq;
         state.last_src_ilk = src_ilk.clone();
         state.last_ich = ich.clone();
         tracing::warn!(
@@ -739,15 +899,27 @@ async fn handle_turn_payload(
             provider = %semantic_tagger_config.provider,
             "sy.cognition semantic tagger skipped turn because AI api key is not resolvable from vault"
         );
-        return Ok(());
+        return;
     };
     {
         let mut control = app_state.control_state.lock().await;
         control.ai_secret_source = CognitionAiSecretSource::LocalFile;
     }
 
+    // The communication's agent's tenant pays for the turn's calls (§7.3).
+    let account = AiAccount::charge(
+        app_state.usage.clone(),
+        &app_state.node_name,
+        agent.tenant.clone(),
+        TenantSource::Agent,
+    )
+    .with_node_ilk(Some(app_state.self_ilk_id.clone()))
+    .with_counterpart(Some(agent_ilk.clone()))
+    .with_trace(Some(msg.routing.trace_id.clone()))
+    .with_thread(Some(thread_id.clone()));
     let tagger = match run_semantic_tagger_ai(semantic_tagger_ai::SemanticTaggerAiInput {
         api_key: &api_key,
+        account: &account,
         text: &text,
         src_ilk: src_ilk.as_deref(),
         dst_ilk: dst_ilk.as_deref(),
@@ -773,7 +945,6 @@ async fn handle_turn_payload(
             }
             state.last_trace_id = Some(msg.routing.trace_id.clone());
             state.last_thread_id = Some(thread_id.clone());
-            state.last_thread_seq = thread_seq;
             state.last_src_ilk = src_ilk.clone();
             state.last_ich = ich.clone();
             tracing::warn!(
@@ -782,52 +953,37 @@ async fn handle_turn_payload(
                 error = %err,
                 "sy.cognition semantic tagger failed; turn skipped"
             );
-            return Ok(());
+            return;
         }
     };
 
     let update_result = {
         let mut threads = app_state.thread_states.lock().await;
-        let thread_state = threads
-            .entry(thread_id.clone())
-            .or_insert_with(ThreadCognitionState::default);
+        let thread_state = threads.entry(key.clone()).or_default();
+        thread_state.agent_node = turn.agent_node.clone();
         update_thread_state_and_build_envelopes(
             &app_state.hive_id,
             &app_state.node_name,
             &thread_id,
-            thread_seq,
+            &agent_ilk,
             src_ilk.as_deref(),
             dst_ilk.as_deref(),
             ich.as_deref(),
             &tagger,
             &thresholds,
             &api_key,
+            &account,
             &semantic_tagger_config,
             &ts,
             thread_state,
+            &AiNarrativeSummarizer,
         )
         .await
     };
-    let envelopes = update_result.envelopes;
+    let (published, publish_errors) =
+        append_envelopes(&app_state, update_result.envelopes, &msg.routing.trace_id).await;
 
-    let mut published = 0u64;
-    let mut publish_errors = 0u64;
-    for (subject, body) in envelopes {
-        if let Err(err) = publish_local(&app_state.config_dir, subject, &body).await {
-            publish_errors = publish_errors.saturating_add(1);
-            tracing::warn!(
-                subject = subject,
-                error = %err,
-                trace_id = %msg.routing.trace_id,
-                thread_id = %thread_id,
-                "sy.cognition failed to publish derived cognition entity"
-            );
-        } else {
-            published = published.saturating_add(1);
-        }
-    }
-
-    if let Err(err) = sync_memory_shm(&app_state).await {
+    if let Err(err) = sync_memory_shm(&app_state, Some(&key)).await {
         tracing::warn!(
             error = %err,
             trace_id = %msg.routing.trace_id,
@@ -906,7 +1062,6 @@ async fn handle_turn_payload(
     state.publish_errors_total = state.publish_errors_total.saturating_add(publish_errors);
     state.last_trace_id = Some(msg.routing.trace_id.clone());
     state.last_thread_id = Some(thread_id);
-    state.last_thread_seq = thread_seq;
     state.last_src_ilk = src_ilk;
     state.last_ich = ich;
     state.last_tags = tagger.tags;
@@ -933,30 +1088,144 @@ async fn handle_turn_payload(
     state.active_scopes_total = active_scopes_total;
     state.active_memories_total = active_memories_total;
     state.active_episodes_total = active_episodes_total;
-    Ok(())
 }
 
-async fn sync_memory_shm(app_state: &CognitionAppState) -> Result<(), json_router::shm::ShmError> {
-    let hot_set = {
-        let threads = app_state.thread_states.lock().await;
-        build_memory_hot_set_snapshot(&threads)?
+/// The envelopes of a turn, packed into `storage.cognition.batch` appends of at most
+/// `COGNITION_APPEND_MAX_BYTES` each, on this node's router's stream for SY.storage (§6.2).
+/// Returns how many envelopes went out and how many could not.
+async fn append_envelopes(
+    app_state: &CognitionAppState,
+    envelopes: Vec<(&'static str, Vec<u8>)>,
+    trace_id: &str,
+) -> (u64, u64) {
+    let values: Vec<Value> = envelopes
+        .into_iter()
+        .filter_map(|(_, body)| serde_json::from_slice(&body).ok())
+        .collect();
+    let sender = app_state.dispatcher.sender_snapshot();
+    let (mut appended, mut failed) = (0u64, 0u64);
+    for pack in pack_envelopes(values, COGNITION_APPEND_MAX_BYTES) {
+        let count = pack.envelopes.len() as u64;
+        let payload = serde_json::to_value(&pack).unwrap_or(Value::Null);
+        match fluxbee_sdk::stream::append(&sender, SUBJECT_STORAGE_COGNITION_BATCH, payload).await {
+            Ok(()) => appended += count,
+            Err(err) => {
+                failed += count;
+                tracing::warn!(
+                    error = %err,
+                    trace_id,
+                    "sy.cognition could not append its envelopes to the stream"
+                );
+            }
+        }
+    }
+    (appended, failed)
+}
+
+/// Envelopes in packs of at most `max_bytes` serialized (one alone may pass it: the stream counts
+/// it as oversize rather than this dropping it).
+fn pack_envelopes(envelopes: Vec<Value>, max_bytes: usize) -> Vec<CognitionEnvelopeBatch> {
+    let mut packs = Vec::new();
+    let mut current = CognitionEnvelopeBatch::default();
+    let mut bytes = 0usize;
+    for envelope in envelopes {
+        let size = serde_json::to_vec(&envelope).map(|v| v.len()).unwrap_or(0) + 1;
+        if !current.envelopes.is_empty() && bytes + size > max_bytes {
+            packs.push(std::mem::take(&mut current));
+            bytes = 0;
+        }
+        bytes += size;
+        current.envelopes.push(envelope);
+    }
+    if !current.envelopes.is_empty() {
+        packs.push(current);
+    }
+    packs
+}
+
+/// The agent a turn's communication belongs to: its ILK and the tenant that pays for the turn's
+/// calls (§7.3), as the identity shared memory of this hive holds them.
+#[derive(Debug, Clone)]
+struct AgentIdentity {
+    ilk: String,
+    tenant: Option<String>,
+    /// The identity shared memory's sequence when it was read.
+    seq: u64,
+    read_at: std::time::Instant,
+}
+
+/// The agent of a turn's communication, from the identity shared memory (`handler_node`): the node
+/// is mechanism, the ILK is the interlocutor (§6.1, D14). A cached answer holds while the region's
+/// sequence is unchanged, so a node name reused by another agent is never answered from the cache;
+/// when the sequence cannot be read, for `COGNITION_AGENT_ILK_TTL`.
+async fn agent_identity_of(
+    app_state: &CognitionAppState,
+    agent_node: &str,
+) -> Option<AgentIdentity> {
+    let current_seq = fluxbee_sdk::identity::identity_shm_seq_from_hive_id(&app_state.hive_id).ok();
+    if let Some(cached) = app_state.agent_ilks.lock().await.get(agent_node) {
+        let fresh = match current_seq {
+            Some(seq) => seq == cached.seq,
+            None => cached.read_at.elapsed() < COGNITION_AGENT_ILK_TTL,
+        };
+        if fresh {
+            return Some(cached.clone());
+        }
+    }
+    let (seq, ilk) = fluxbee_sdk::identity::find_ilk_by_handler_node_from_hive_id(
+        &app_state.hive_id,
+        agent_node,
+    )
+    .ok()
+    .flatten()?;
+    if ilk.ilk_id.trim().is_empty() {
+        return None;
+    }
+    let found = AgentIdentity {
+        ilk: ilk.ilk_id,
+        tenant: Some(ilk.tenant_id).filter(|tenant| !tenant.trim().is_empty()),
+        seq,
+        read_at: std::time::Instant::now(),
     };
+    app_state
+        .agent_ilks
+        .lock()
+        .await
+        .insert(agent_node.to_string(), found.clone());
+    Some(found)
+}
+
+/// Writes the memory region: the packages of the communications this cognition holds, ranked, and
+/// after them the entries the region had for communications it has not loaded (a restart before
+/// their reload, or a reload that failed), so a restart never blanks what the agents read (§6.2).
+/// `turn`: the communication the current turn updated, which always stays.
+async fn sync_memory_shm(
+    app_state: &CognitionAppState,
+    turn: Option<&CommunicationKey>,
+) -> Result<(), json_router::shm::ShmError> {
+    let mut memory_region = app_state.memory_region.lock().await;
+    let Some(region) = memory_region.as_mut() else {
+        let mut state = app_state.runtime_state.lock().await;
+        state.last_shm_sync_status = Some("skipped_missing_region".to_string());
+        state.last_shm_sync_at = Some(chrono::Utc::now().to_rfc3339());
+        return Ok(());
+    };
+    let carried: Vec<MemoryShmThreadEntry> = region
+        .read_snapshot()
+        .map(|snapshot| snapshot.threads)
+        .unwrap_or_default();
+    let hot_set = {
+        let mut threads = app_state.thread_states.lock().await;
+        retain_memory_hot_set(&mut threads, turn, carried)?
+    };
+    region.write_snapshot(&hot_set.snapshot)?;
+    drop(memory_region);
 
     let sync_status = if hot_set.stats.pruned_threads_total > 0 {
         "ok_pruned"
     } else {
         "ok"
     };
-    let mut memory_region = app_state.memory_region.lock().await;
-    if let Some(region) = memory_region.as_mut() {
-        region.write_snapshot(&hot_set.snapshot)?;
-    } else {
-        let mut state = app_state.runtime_state.lock().await;
-        state.last_shm_sync_status = Some("skipped_missing_region".to_string());
-        state.last_shm_sync_at = Some(chrono::Utc::now().to_rfc3339());
-        return Ok(());
-    }
-
     let mut state = app_state.runtime_state.lock().await;
     state.shm_hot_threads_total = hot_set.stats.selected_threads_total;
     state.shm_pruned_threads_total = hot_set.stats.pruned_threads_total;
@@ -966,43 +1235,54 @@ async fn sync_memory_shm(app_state: &CognitionAppState) -> Result<(), json_route
     Ok(())
 }
 
+/// Ranks the communications this cognition holds and keeps, in rank order, each one whose entry
+/// still fits the region; then, in the region's previous order, the carried entries of the ones
+/// it does not hold. The communication the current turn updated goes first, so it is never the
+/// one dropped. Then recency (`last_seen_at`), an active scope, live entities, `turn_count` and
+/// the key. Ranked by live entities ahead of recency, a new thread in a full region was dropped
+/// right after its own turn and started over, with a new scope written to storage, on every turn.
 fn build_memory_hot_set_snapshot(
-    threads: &HashMap<String, ThreadCognitionState>,
+    threads: &HashMap<CommunicationKey, ThreadCognitionState>,
+    turn: Option<&CommunicationKey>,
+    carried: Vec<MemoryShmThreadEntry>,
 ) -> Result<MemoryHotSetBuild, json_router::shm::ShmError> {
     let updated_at = json_router::shm::now_epoch_ms();
     let base_snapshot = MemoryShmSnapshot {
-        schema_version: 1,
+        schema_version: 2,
         updated_at,
         threads: Vec::new(),
     };
     let base_size = serde_json::to_vec(&base_snapshot)?.len();
     let mut candidates = Vec::with_capacity(threads.len());
-    for (thread_id, thread_state) in threads {
+    for (key, thread_state) in threads {
         let entry = MemoryShmThreadEntry {
-            thread_id: thread_id.clone(),
-            package: build_memory_package_for_thread(thread_id, thread_state),
+            thread_id: key.thread_id.clone(),
+            agent_ilk: key.agent_ilk.clone(),
+            agent_node: thread_state.agent_node.clone(),
+            package: build_memory_package_for_thread(&key.thread_id, thread_state),
         };
         let serialized_bytes = serde_json::to_vec(&entry)?.len();
         candidates.push(MemoryHotThreadCandidate {
+            key: key.clone(),
             entry,
             serialized_bytes,
+            updated_by_this_turn: turn == Some(key),
             has_active_scope: thread_state.active_scope.is_some(),
             live_entities_total: thread_live_entities_total(thread_state),
             last_seen_epoch_ms: thread_last_seen_epoch_ms(thread_state),
-            latest_thread_seq: thread_state.latest_thread_seq.unwrap_or(0),
             turn_count: thread_state.turn_count,
         });
     }
 
     candidates.sort_by(|left, right| {
         right
-            .has_active_scope
-            .cmp(&left.has_active_scope)
-            .then_with(|| right.live_entities_total.cmp(&left.live_entities_total))
+            .updated_by_this_turn
+            .cmp(&left.updated_by_this_turn)
             .then_with(|| right.last_seen_epoch_ms.cmp(&left.last_seen_epoch_ms))
-            .then_with(|| right.latest_thread_seq.cmp(&left.latest_thread_seq))
+            .then_with(|| right.has_active_scope.cmp(&left.has_active_scope))
+            .then_with(|| right.live_entities_total.cmp(&left.live_entities_total))
             .then_with(|| right.turn_count.cmp(&left.turn_count))
-            .then_with(|| left.entry.thread_id.cmp(&right.entry.thread_id))
+            .then_with(|| left.key.cmp(&right.key))
     });
 
     let mut selected_thread_ids = HashSet::with_capacity(candidates.len());
@@ -1014,15 +1294,35 @@ fn build_memory_hot_set_snapshot(
             continue;
         }
         payload_bytes = payload_bytes.saturating_add(extra_bytes);
-        selected_thread_ids.insert(candidate.entry.thread_id.clone());
+        selected_thread_ids.insert(candidate.key);
         selected_entries.push(candidate.entry);
     }
-
     let selected_threads_total = selected_entries.len() as u64;
     let pruned_threads_total = threads.len().saturating_sub(selected_entries.len()) as u64;
+    for entry in carried {
+        // An entry written before 0.1.77 has no agent and matches no delivery.
+        if entry.agent_ilk.is_empty() {
+            continue;
+        }
+        let key = CommunicationKey {
+            thread_id: entry.thread_id.clone(),
+            agent_ilk: entry.agent_ilk.clone(),
+        };
+        if threads.contains_key(&key) {
+            continue;
+        }
+        let extra_bytes =
+            serde_json::to_vec(&entry)?.len() + usize::from(!selected_entries.is_empty());
+        if payload_bytes.saturating_add(extra_bytes) > MEMORY_MAX_DATA_SIZE {
+            continue;
+        }
+        payload_bytes = payload_bytes.saturating_add(extra_bytes);
+        selected_entries.push(entry);
+    }
+
     Ok(MemoryHotSetBuild {
         snapshot: MemoryShmSnapshot {
-            schema_version: 1,
+            schema_version: 2,
             updated_at,
             threads: selected_entries,
         },
@@ -1035,48 +1335,18 @@ fn build_memory_hot_set_snapshot(
     })
 }
 
-fn apply_memory_hot_set_to_rebuild_snapshot(
-    snapshot: &mut RebuildSnapshot,
-) -> Result<MemoryHotSetStats, json_router::shm::ShmError> {
-    let hot_set = build_memory_hot_set_snapshot(&snapshot.threads)?;
-    snapshot
-        .threads
-        .retain(|thread_id, _| hot_set.selected_thread_ids.contains(thread_id));
-    recount_rebuild_snapshot_totals(snapshot);
-    Ok(hot_set.stats)
-}
-
-fn recount_rebuild_snapshot_totals(snapshot: &mut RebuildSnapshot) {
-    snapshot.total_contexts = snapshot
-        .threads
-        .values()
-        .map(|thread| thread.contexts.len() as u64)
-        .sum();
-    snapshot.total_reasons = snapshot
-        .threads
-        .values()
-        .map(|thread| thread.reasons.len() as u64)
-        .sum();
-    snapshot.total_cooccurrences = snapshot
-        .threads
-        .values()
-        .map(|thread| thread.cooccurrences.len() as u64)
-        .sum();
-    snapshot.total_scopes = snapshot
-        .threads
-        .values()
-        .filter(|thread| thread.active_scope.is_some())
-        .count() as u64;
-    snapshot.total_memories = snapshot
-        .threads
-        .values()
-        .map(|thread| thread.memories.len() as u64)
-        .sum();
-    snapshot.total_episodes = snapshot
-        .threads
-        .values()
-        .map(|thread| thread.episodes.len() as u64)
-        .sum();
+/// The one retention rule for local cognition state: build the jsr-memory hot set and drop every
+/// communication that did not make it. Applied after every live turn (with the turn's
+/// communication, which always stays) and after a reload, so memory stays bounded by the SHM
+/// capacity. A dropped communication reloads from SY.storage if it comes back.
+fn retain_memory_hot_set(
+    threads: &mut HashMap<CommunicationKey, ThreadCognitionState>,
+    turn: Option<&CommunicationKey>,
+    carried: Vec<MemoryShmThreadEntry>,
+) -> Result<MemoryHotSetBuild, json_router::shm::ShmError> {
+    let hot_set = build_memory_hot_set_snapshot(threads, turn, carried)?;
+    threads.retain(|key, _| hot_set.selected_thread_ids.contains(key));
+    Ok(hot_set)
 }
 
 fn thread_live_entities_total(thread_state: &ThreadCognitionState) -> usize {
@@ -1123,313 +1393,271 @@ fn parse_rfc3339_epoch_ms(value: &str) -> Option<i64> {
         .map(|dt| dt.timestamp_millis())
 }
 
-async fn rebuild_from_durable_on_startup(app_state: Arc<CognitionAppState>) {
-    let started_at = chrono::Utc::now().to_rfc3339();
-    {
-        let mut state = app_state.runtime_state.lock().await;
-        state.rebuild_attempts_total = state.rebuild_attempts_total.saturating_add(1);
-        state.last_rebuild_at = Some(started_at.clone());
-    }
-
-    let should_rebuild = app_state.thread_states.lock().await.is_empty();
-    if !should_rebuild {
-        let mut state = app_state.runtime_state.lock().await;
-        state.last_rebuild_status = Some("skipped_nonempty_local_state".to_string());
-        state.last_rebuild_source = Some("startup".to_string());
-        return;
-    }
-
-    let Some(base_database_url) = resolve_storage_database_url(&app_state).await else {
-        let mut state = app_state.runtime_state.lock().await;
-        state.last_rebuild_status = Some("skipped_missing_storage_db".to_string());
-        state.last_rebuild_source = Some("startup".to_string());
-        tracing::info!(
-            node_name = %app_state.node_name,
-            "sy.cognition startup rebuild skipped; no durable storage DB configured"
-        );
-        return;
+/// At start, before the first turn: the communications the memory region holds come back from
+/// SY.storage over the mesh, at most `COGNITION_RELOAD_CONCURRENCY` at once (§6.2). One that could
+/// not load, or that SY.storage has no state for yet (its last envelopes may still be on their way),
+/// stays in the region as it was and loads on its next turn.
+async fn reload_communications_from_shared_memory(app_state: &Arc<CognitionAppState>) {
+    use futures::stream::{self, StreamExt};
+    let entries: Vec<MemoryShmThreadEntry> = {
+        let region = app_state.memory_region.lock().await;
+        region
+            .as_ref()
+            .and_then(|region| region.read_snapshot().ok())
+            .map(|snapshot| snapshot.threads)
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|entry| !entry.agent_ilk.is_empty())
+            .collect()
     };
-
-    let mut snapshot = match load_rebuild_snapshot_from_storage(&base_database_url).await {
-        Ok(snapshot) => snapshot,
-        Err(err) => {
-            let mut state = app_state.runtime_state.lock().await;
-            state.rebuild_failures_total = state.rebuild_failures_total.saturating_add(1);
-            state.last_rebuild_status = Some(format!("failed:{err}"));
-            state.last_rebuild_source = Some("storage_durable".to_string());
-            tracing::warn!(
-                node_name = %app_state.node_name,
-                error = %err,
-                "sy.cognition startup rebuild from durable failed; continuing live"
-            );
-            return;
-        }
-    };
-
-    let hot_set_stats = match apply_memory_hot_set_to_rebuild_snapshot(&mut snapshot) {
-        Ok(stats) => stats,
-        Err(err) => {
-            let mut state = app_state.runtime_state.lock().await;
-            state.rebuild_failures_total = state.rebuild_failures_total.saturating_add(1);
-            state.last_rebuild_status = Some(format!("failed:{err}"));
-            state.last_rebuild_source = Some("storage_durable".to_string());
-            tracing::warn!(
-                node_name = %app_state.node_name,
-                error = %err,
-                "sy.cognition startup rebuild failed while bounding jsr-memory hot set; continuing live"
-            );
-            return;
-        }
-    };
-
-    let rebuilt_threads_total = snapshot.threads.len() as u64;
+    let results: Vec<_> = stream::iter(entries)
+        .map(|entry| async move {
+            let key = CommunicationKey {
+                thread_id: entry.thread_id,
+                agent_ilk: entry.agent_ilk,
+            };
+            let state = fetch_communication_state(app_state, &key).await;
+            (entry.agent_node, key, state)
+        })
+        .buffer_unordered(COGNITION_RELOAD_CONCURRENCY)
+        .collect()
+        .await;
+    let (mut loaded, mut without_state, mut failed) = (0u64, 0u64, 0u64);
     {
         let mut threads = app_state.thread_states.lock().await;
-        *threads = snapshot.threads;
-    }
-    if let Err(err) = sync_memory_shm(&app_state).await {
-        tracing::warn!(
-            node_name = %app_state.node_name,
-            error = %err,
-            "sy.cognition startup rebuild loaded durable state but failed to sync jsr-memory"
-        );
-    }
-    refresh_runtime_totals(
-        &app_state,
-        RuntimeRefreshDelta {
-            rebuilt_threads_total,
-            rebuild_source: Some("storage_durable".to_string()),
-            rebuild_status: Some(if hot_set_stats.pruned_threads_total > 0 {
-                "ok_hot_set_pruned".to_string()
-            } else {
-                "ok".to_string()
-            }),
-            rebuild_success: true,
-            ..RuntimeRefreshDelta::default()
-        },
-    )
-    .await;
-    tracing::info!(
-        node_name = %app_state.node_name,
-        rebuilt_threads_total,
-        contexts = snapshot.total_contexts,
-        reasons = snapshot.total_reasons,
-        cooccurrences = snapshot.total_cooccurrences,
-        scopes = snapshot.total_scopes,
-        memories = snapshot.total_memories,
-        episodes = snapshot.total_episodes,
-        shm_hot_threads_total = hot_set_stats.selected_threads_total,
-        shm_pruned_threads_total = hot_set_stats.pruned_threads_total,
-        shm_payload_bytes = hot_set_stats.payload_bytes,
-        "sy.cognition startup rebuild from durable completed"
-    );
-}
-
-async fn load_rebuild_snapshot_from_storage(
-    base_database_url: &str,
-) -> Result<RebuildSnapshot, CognitionError> {
-    let base_config: PgConfig = base_database_url.parse()?;
-    if !base_config
-        .get_dbname()
-        .map(str::trim)
-        .unwrap_or("")
-        .is_empty()
-    {
-        return Err(format!(
-            "postgres secret must not include a dbname (got '{}'); load only credentials + host (postgresql://user:pass@host:port)",
-            base_config.get_dbname().unwrap_or("")
-        ).into());
-    }
-    let storage_config = with_dbname(&base_config, STORAGE_DB_NAME);
-    let (client, connection) = storage_config.connect(NoTls).await?;
-    tokio::spawn(async move {
-        if let Err(err) = connection.await {
-            tracing::warn!(error = %err, "sy.cognition rebuild postgres connection closed");
-        }
-    });
-
-    let thread_rows = client
-        .query(
-            "SELECT thread_id, payload FROM cognition_threads ORDER BY updated_at ASC",
-            &[],
-        )
-        .await?;
-    let mut snapshot = RebuildSnapshot::default();
-    for row in thread_rows {
-        let thread_id: String = row.get("thread_id");
-        let payload: CognitionThreadData = row_payload(&row)?;
-        let entry = snapshot
-            .threads
-            .entry(thread_id)
-            .or_insert_with(ThreadCognitionState::default);
-        entry.first_seen_at = payload.first_seen_at;
-        entry.last_seen_at = payload.last_seen_at;
-        entry.latest_thread_seq = payload.latest_thread_seq;
-        entry.turn_count = payload.turn_count.unwrap_or(0);
-    }
-
-    for row in client
-        .query(
-            "SELECT context_id, thread_id, payload FROM cognition_contexts ORDER BY updated_at ASC",
-            &[],
-        )
-        .await?
-    {
-        let context_id: String = row.get("context_id");
-        let thread_id: String = row.get("thread_id");
-        let payload: CognitionContextData = row_payload(&row)?;
-        let thread = snapshot
-            .threads
-            .entry(thread_id)
-            .or_insert_with(ThreadCognitionState::default);
-        thread.contexts.insert(
-            context_id.clone(),
-            context_state_from_payload(context_id, payload),
-        );
-        snapshot.total_contexts = snapshot.total_contexts.saturating_add(1);
-    }
-
-    for row in client
-        .query(
-            "SELECT reason_id, thread_id, payload FROM cognition_reasons ORDER BY updated_at ASC",
-            &[],
-        )
-        .await?
-    {
-        let reason_id: String = row.get("reason_id");
-        let thread_id: String = row.get("thread_id");
-        let payload: CognitionReasonData = row_payload(&row)?;
-        let thread = snapshot
-            .threads
-            .entry(thread_id)
-            .or_insert_with(ThreadCognitionState::default);
-        thread.reasons.insert(
-            reason_id.clone(),
-            reason_state_from_payload(reason_id, payload),
-        );
-        snapshot.total_reasons = snapshot.total_reasons.saturating_add(1);
-    }
-
-    for row in client
-        .query(
-            "SELECT cooccurrence_id, thread_id, payload FROM cognition_cooccurrences ORDER BY updated_at ASC",
-            &[],
-        )
-        .await?
-    {
-        let cooccurrence_id: String = row.get("cooccurrence_id");
-        let thread_id: String = row.get("thread_id");
-        let payload: CognitionCooccurrenceData = row_payload(&row)?;
-        let thread = snapshot
-            .threads
-            .entry(thread_id)
-            .or_insert_with(ThreadCognitionState::default);
-        thread.cooccurrences.insert(
-            cooccurrence_id.clone(),
-            cooccurrence_state_from_payload(cooccurrence_id, payload),
-        );
-        snapshot.total_cooccurrences = snapshot.total_cooccurrences.saturating_add(1);
-    }
-
-    let mut scope_payloads = HashMap::new();
-    for row in client
-        .query(
-            "SELECT scope_id, payload FROM cognition_scopes ORDER BY updated_at ASC",
-            &[],
-        )
-        .await?
-    {
-        let scope_id: String = row.get("scope_id");
-        let payload: CognitionScopeData = row_payload(&row)?;
-        scope_payloads.insert(scope_id, payload);
-    }
-
-    let mut open_scope_instances: HashMap<String, (String, ScopeInstancePayload)> = HashMap::new();
-    for row in client
-        .query(
-            "SELECT scope_instance_id, thread_id, payload FROM cognition_scope_instances ORDER BY updated_at ASC",
-            &[],
-        )
-        .await?
-    {
-        let scope_instance_id: String = row.get("scope_instance_id");
-        let thread_id: String = row.get("thread_id");
-        let payload: ScopeInstancePayload = row_payload(&row)?;
-        snapshot.total_scopes = snapshot.total_scopes.saturating_add(1);
-        if payload.closed_at.is_some() {
-            continue;
-        }
-        let replace = match open_scope_instances.get(&thread_id) {
-            None => true,
-            Some((_, current)) => payload.start_thread_seq >= current.start_thread_seq,
-        };
-        if replace {
-            open_scope_instances.insert(thread_id, (scope_instance_id, payload));
-        }
-    }
-
-    for row in client
-        .query(
-            "SELECT memory_id, thread_id, payload FROM cognition_memories ORDER BY updated_at ASC",
-            &[],
-        )
-        .await?
-    {
-        let memory_id: String = row.get("memory_id");
-        let thread_id: String = row.get("thread_id");
-        let payload: CognitionMemoryData = row_payload(&row)?;
-        let thread = snapshot
-            .threads
-            .entry(thread_id)
-            .or_insert_with(ThreadCognitionState::default);
-        thread.memories.insert(
-            memory_id.clone(),
-            memory_state_from_payload(memory_id, payload),
-        );
-        snapshot.total_memories = snapshot.total_memories.saturating_add(1);
-    }
-
-    for row in client
-        .query(
-            "SELECT episode_id, thread_id, payload FROM cognition_episodes ORDER BY updated_at ASC",
-            &[],
-        )
-        .await?
-    {
-        let episode_id: String = row.get("episode_id");
-        let thread_id: String = row.get("thread_id");
-        let payload: CognitionEpisodeData = row_payload(&row)?;
-        let thread = snapshot
-            .threads
-            .entry(thread_id.clone())
-            .or_insert_with(ThreadCognitionState::default);
-        let scope_instance_id = open_scope_instances
-            .get(&thread_id)
-            .map(|(id, _)| id.clone())
-            .unwrap_or_else(|| payload.scope_id.clone().unwrap_or_default());
-        let episode_key = format!("{}|{}", scope_instance_id, payload.affect_id);
-        thread.episodes.insert(
-            episode_key,
-            episode_state_from_payload(episode_id, scope_instance_id, payload),
-        );
-        snapshot.total_episodes = snapshot.total_episodes.saturating_add(1);
-    }
-
-    for (thread_id, thread_state) in snapshot.threads.iter_mut() {
-        if let Some((scope_instance_id, scope_payload)) = open_scope_instances.get(thread_id) {
-            if let Some(scope) = scope_binding_state_from_payload(
-                scope_instance_id,
-                scope_payload,
-                scope_payloads.get(&scope_payload.scope_id),
-                &thread_state.contexts,
-                &thread_state.reasons,
-            ) {
-                thread_state.active_scope = Some(scope);
+        for (agent_node, key, state) in results {
+            match state {
+                Ok(Some(mut state)) => {
+                    state.agent_node = agent_node;
+                    threads.insert(key, state);
+                    loaded += 1;
+                }
+                Ok(None) => without_state += 1,
+                Err(_) => failed += 1,
             }
         }
     }
+    if let Err(err) = sync_memory_shm(app_state, None).await {
+        tracing::warn!(error = %err, "sy.cognition could not write jsr-memory after its reload");
+    }
+    let status = format!("ok loaded {loaded}, without state {without_state}, failed {failed}");
+    {
+        let mut state = app_state.runtime_state.lock().await;
+        state.rebuild_attempts_total += 1;
+        if failed == 0 {
+            state.rebuild_successes_total += 1;
+        } else {
+            state.rebuild_failures_total += 1;
+        }
+        state.rebuilt_threads_total = loaded;
+        state.last_rebuild_status = Some(status.clone());
+        state.last_rebuild_source = Some("storage_mesh".to_string());
+        state.last_rebuild_at = Some(chrono::Utc::now().to_rfc3339());
+    }
+    tracing::info!(node_name = %app_state.node_name, %status, "sy.cognition reloaded its communications");
+}
 
-    Ok(snapshot)
+/// One communication's state from SY.storage (`COGNITION_STATE_GET`, page by page): `None` when it
+/// has none (a new communication, or one emptied), an error when SY.storage could not answer.
+async fn fetch_communication_state(
+    app_state: &CognitionAppState,
+    key: &CommunicationKey,
+) -> Result<Option<ThreadCognitionState>, CognitionError> {
+    app_state.runtime_state.lock().await.state_fetches_total += 1;
+    let envelopes = match fetch_communication_envelopes(app_state, key).await {
+        Ok(envelopes) => envelopes,
+        Err(err) => {
+            app_state
+                .runtime_state
+                .lock()
+                .await
+                .state_fetch_failures_total += 1;
+            return Err(err);
+        }
+    };
+    if envelopes.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(build_communication_state(
+        key,
+        rebuild_rows_from_envelopes(envelopes),
+    )))
+}
+
+async fn fetch_communication_envelopes(
+    app_state: &CognitionAppState,
+    key: &CommunicationKey,
+) -> Result<Vec<Value>, CognitionError> {
+    let target = format!("SY.storage@{}", fluxbee_sdk::protocol::PRIMARY_HIVE_ID);
+    let mut envelopes = Vec::new();
+    let mut after: Option<(String, String)> = None;
+    loop {
+        let request = CognitionStateGet {
+            thread_id: key.thread_id.clone(),
+            agent_ilk: key.agent_ilk.clone(),
+            after: after.clone(),
+        };
+        let reply = app_state
+            .dispatcher
+            .send_system_rpc(SystemRpcRequest {
+                target: &target,
+                request_msg: MSG_COGNITION_STATE_GET,
+                response_msg: MSG_COGNITION_STATE_RESPONSE,
+                payload: serde_json::to_value(&request)?,
+                timeout: COGNITION_STATE_PAGE_TIMEOUT,
+            })
+            .await?;
+        let page: CognitionStateResponse = serde_json::from_value(reply.payload)?;
+        if !page.ok {
+            return Err(page
+                .error
+                .unwrap_or_else(|| "SY.storage did not answer the state".to_string())
+                .into());
+        }
+        envelopes.extend(page.envelopes);
+        match page.next {
+            Some(next) if Some(&next) != after.as_ref() => after = Some(next),
+            Some(_) => return Err("SY.storage repeated a page of the state".into()),
+            None => return Ok(envelopes),
+        }
+    }
+}
+
+/// A communication's durable rows, by entity, from the envelopes SY.storage returned.
+#[derive(Debug, Default)]
+struct RebuildRows {
+    thread: Option<CognitionThreadData>,
+    contexts: Vec<(String, CognitionContextData)>,
+    reasons: Vec<(String, CognitionReasonData)>,
+    cooccurrences: Vec<(String, CognitionCooccurrenceData)>,
+    scopes: Vec<(String, CognitionScopeData)>,
+    scope_instances: Vec<(String, ScopeInstancePayload)>,
+    memories: Vec<(String, CognitionMemoryData)>,
+    episodes: Vec<(String, CognitionEpisodeData)>,
+}
+
+fn rebuild_rows_from_envelopes(envelopes: Vec<Value>) -> RebuildRows {
+    let mut rows = RebuildRows::default();
+    for envelope in envelopes {
+        let Ok(envelope) = serde_json::from_value::<CognitionDurableEnvelope<Value>>(envelope)
+        else {
+            continue;
+        };
+        let id = envelope.entity_id;
+        let data = envelope.data;
+        match envelope.entity {
+            CognitionDurableEntity::Thread => rows.thread = serde_json::from_value(data).ok(),
+            CognitionDurableEntity::Context => rows
+                .contexts
+                .extend(serde_json::from_value(data).ok().map(|d| (id, d))),
+            CognitionDurableEntity::Reason => rows
+                .reasons
+                .extend(serde_json::from_value(data).ok().map(|d| (id, d))),
+            CognitionDurableEntity::Cooccurrence => rows
+                .cooccurrences
+                .extend(serde_json::from_value(data).ok().map(|d| (id, d))),
+            CognitionDurableEntity::Scope => rows
+                .scopes
+                .extend(serde_json::from_value(data).ok().map(|d| (id, d))),
+            CognitionDurableEntity::ScopeInstance => rows
+                .scope_instances
+                .extend(serde_json::from_value(data).ok().map(|d| (id, d))),
+            CognitionDurableEntity::Memory => rows
+                .memories
+                .extend(serde_json::from_value(data).ok().map(|d| (id, d))),
+            CognitionDurableEntity::Episode => rows
+                .episodes
+                .extend(serde_json::from_value(data).ok().map(|d| (id, d))),
+        }
+    }
+    rows
+}
+
+/// Assembles one communication's state from its durable rows, keyed exactly like the live path:
+/// contexts and reasons by label, co-occurrences by `"<context label>|<reason label>"`, memories by
+/// scope id, episodes by `"<scope instance id>|<affect id>"`. Keyed by entity id instead, every
+/// lookup of the next live turn missed and it re-created each entity, under the same id, next to
+/// the rebuilt one. The active scope is the open instance with the latest start turn.
+fn build_communication_state(key: &CommunicationKey, rows: RebuildRows) -> ThreadCognitionState {
+    let mut state = ThreadCognitionState::default();
+    if let Some(thread) = rows.thread {
+        state.first_seen_at = thread.first_seen_at;
+        state.last_seen_at = thread.last_seen_at;
+        state.turn_count = thread.turn_count.unwrap_or(0);
+    }
+    for (context_id, payload) in rows.contexts {
+        let context = context_state_from_payload(context_id, payload);
+        state.contexts.insert(context.label.clone(), context);
+    }
+    for (reason_id, payload) in rows.reasons {
+        let reason = reason_state_from_payload(reason_id, payload);
+        state.reasons.insert(reason.label.clone(), reason);
+    }
+    for (cooccurrence_id, payload) in rows.cooccurrences {
+        let cooccurrence = cooccurrence_state_from_payload(cooccurrence_id, payload);
+        let pair_key = format!(
+            "{}|{}",
+            cooccurrence.context_label, cooccurrence.reason_label
+        );
+        state.cooccurrences.insert(pair_key, cooccurrence);
+    }
+    let scope_payloads: HashMap<String, CognitionScopeData> = rows.scopes.into_iter().collect();
+    let mut open_instance: Option<(String, ScopeInstancePayload)> = None;
+    let mut instance_ids = Vec::new();
+    for (scope_instance_id, payload) in rows.scope_instances {
+        instance_ids.push(scope_instance_id.clone());
+        if payload.closed_at.is_some() {
+            continue;
+        }
+        let replace = match &open_instance {
+            None => true,
+            Some((_, current)) => payload.start_turn >= current.start_turn,
+        };
+        if replace {
+            open_instance = Some((scope_instance_id, payload));
+        }
+    }
+    for (memory_id, payload) in rows.memories {
+        let memory = memory_state_from_payload(memory_id, payload);
+        state.memories.insert(memory.scope_id.clone(), memory);
+    }
+    for (episode_id, payload) in rows.episodes {
+        // The live path derives an episode id from (communication, scope instance, affect), so the
+        // instance an episode belongs to is the one that reproduces its id.
+        let scope_instance_id = instance_ids
+            .iter()
+            .find(|id| {
+                stable_entity_id(
+                    "episode",
+                    &[
+                        key.thread_id.as_str(),
+                        key.agent_ilk.as_str(),
+                        id.as_str(),
+                        payload.affect_id.as_str(),
+                    ],
+                ) == episode_id
+            })
+            .cloned();
+        // Without its instance row the episode keeps its own id as key, which no live turn
+        // produces: it stays visible but is never mistaken for the open instance's episode.
+        let episode_key = match &scope_instance_id {
+            Some(instance_id) => format!("{}|{}", instance_id, payload.affect_id),
+            None => episode_id.clone(),
+        };
+        let episode =
+            episode_state_from_payload(episode_id, scope_instance_id.unwrap_or_default(), payload);
+        state.episodes.insert(episode_key, episode);
+    }
+    if let Some((scope_instance_id, scope_payload)) = &open_instance {
+        state.active_scope = scope_binding_state_from_payload(
+            scope_instance_id,
+            scope_payload,
+            scope_payloads.get(&scope_payload.scope_id),
+            &state.contexts,
+            &state.reasons,
+        );
+    }
+    state
 }
 
 fn context_state_from_payload(context_id: String, data: CognitionContextData) -> ContextState {
@@ -1546,8 +1774,13 @@ fn scope_binding_state_from_payload(
         .clone()
         .or_else(|| scope.and_then(|value| value.dominant_reason_id.clone()))
         .unwrap_or_default();
-    let dominant_context = contexts.get(&dominant_context_id)?;
-    let dominant_reason = reasons.get(&dominant_reason_id)?;
+    // The maps are keyed by label (as live); the scope names its dominants by id.
+    let dominant_context = contexts
+        .values()
+        .find(|context| context.context_id == dominant_context_id)?;
+    let dominant_reason = reasons
+        .values()
+        .find(|reason| reason.reason_id == dominant_reason_id)?;
     Some(ScopeBindingState {
         scope_id: instance.scope_id.clone(),
         scope_instance_id: scope_instance_id.to_string(),
@@ -1573,7 +1806,7 @@ fn scope_binding_state_from_payload(
             .and_then(|value| value.last_seen_at.clone())
             .or_else(|| instance.opened_at.clone())
             .unwrap_or_default(),
-        start_thread_seq: instance.start_thread_seq,
+        start_turn: instance.start_turn,
         unbind_streak: 0,
     })
 }
@@ -1586,32 +1819,27 @@ fn merged_scope_ilk_weights(context: &ContextState, reason: &ReasonState) -> BTr
     out
 }
 
-fn row_payload<T: for<'de> Deserialize<'de>>(row: &Row) -> Result<T, CognitionError> {
-    let payload: Value = row.get("payload");
-    Ok(serde_json::from_value(payload)?)
-}
-
-/// Model D' — resolve cognition's view of storage's Postgres credentials via
-/// `resolve_resource(Postgres)`. Returns `Some(url)` when the postgres
-/// resource is reachable from cognition's (ilk, tenant) pool match.
-/// Credentials + host only; each consumer adds the dbname.
-async fn resolve_storage_database_url(app_state: &CognitionAppState) -> Option<String> {
-    resolve_cognition_resource(
-        app_state,
-        fluxbee_sdk::ResourceType::Postgres,
-        "postgres_url",
-    )
-    .await
-}
-
-async fn resolve_cognition_ai_api_key(app_state: &CognitionAppState) -> Option<String> {
+async fn resolve_cognition_ai_api_key(
+    app_state: &CognitionAppState,
+    wait: VaultWait,
+) -> Option<String> {
     let provider = app_state
         .control_state
         .lock()
         .await
         .semantic_tagger
         .provider;
-    resolve_cognition_resource(app_state, provider.resource_type(), "api_key").await
+    resolve_cognition_resource(app_state, provider.resource_type(), "api_key", wait).await
+}
+
+/// Whether a vault lookup waits out a vault that is not reachable yet (as SY.architect,
+/// SY.storage and SY.identity do; FINDINGS A-26).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum VaultWait {
+    /// At boot: retry transport failures for up to `VAULT_BOOT_WAIT`.
+    UntilReachable,
+    /// After boot (a turn, a VAULT_SECRET_CHANGED): the vault is up, ask once.
+    Once,
 }
 
 /// Discover the named resource via the shared `VaultClient` (Model D' pool
@@ -1621,16 +1849,31 @@ async fn resolve_cognition_resource(
     app_state: &CognitionAppState,
     resource: fluxbee_sdk::ResourceType,
     nested_field: &str,
+    wait: VaultWait,
 ) -> Option<String> {
     let resource_label = resource.as_str().to_string();
-    let result = app_state
-        .vault
-        .resolve_resource(
-            resource,
-            fluxbee_sdk::DEFAULT_ROOT_TENANT_ID,
-            Duration::from_secs(5),
-        )
-        .await;
+    let tenant = fluxbee_sdk::DEFAULT_ROOT_TENANT_ID;
+    let timeout = Duration::from_secs(5);
+    let result = match wait {
+        VaultWait::UntilReachable => {
+            app_state
+                .vault
+                .resolve_resource_awaiting_vault(
+                    resource,
+                    tenant,
+                    timeout,
+                    fluxbee_sdk::VAULT_BOOT_WAIT,
+                    &app_state.node_name,
+                )
+                .await
+        }
+        VaultWait::Once => {
+            app_state
+                .vault
+                .resolve_resource(resource, tenant, timeout)
+                .await
+        }
+    };
     match result {
         Ok(Some(value)) => {
             if let Some(s) = value.as_str().map(str::trim).filter(|v| !v.is_empty()) {
@@ -1652,155 +1895,6 @@ async fn resolve_cognition_resource(
             );
             None
         }
-    }
-}
-
-fn with_dbname(base: &PgConfig, dbname: &str) -> PgConfig {
-    let mut cfg = base.clone();
-    cfg.dbname(dbname);
-    cfg
-}
-
-#[derive(Default)]
-struct RuntimeRefreshDelta {
-    processed_turns_delta: u64,
-    published_entities_delta: u64,
-    publish_errors_delta: u64,
-    invalid_turns_delta: u64,
-    last_trace_id: Option<String>,
-    last_thread_id: Option<String>,
-    last_thread_seq: Option<u64>,
-    last_src_ilk: Option<String>,
-    last_ich: Option<String>,
-    last_tags: Option<Vec<String>>,
-    last_reason_signals_canonical: Option<Vec<String>>,
-    last_reason_signals_extra: Option<Vec<String>>,
-    rebuilt_threads_total: u64,
-    rebuild_source: Option<String>,
-    rebuild_status: Option<String>,
-    rebuild_success: bool,
-}
-
-async fn refresh_runtime_totals(app_state: &CognitionAppState, delta: RuntimeRefreshDelta) {
-    let (
-        active_threads_total,
-        open_contexts_total,
-        open_reasons_total,
-        open_cooccurrences_total,
-        active_scopes_total,
-        active_memories_total,
-        active_episodes_total,
-    ) = {
-        let threads = app_state.thread_states.lock().await;
-        let active_threads = threads.len() as u64;
-        let open_contexts = threads
-            .values()
-            .map(|thread| {
-                thread
-                    .contexts
-                    .values()
-                    .filter(|context| context.status == "open")
-                    .count() as u64
-            })
-            .sum();
-        let open_reasons = threads
-            .values()
-            .map(|thread| {
-                thread
-                    .reasons
-                    .values()
-                    .filter(|reason| reason.status == "open")
-                    .count() as u64
-            })
-            .sum();
-        let open_cooccurrences = threads
-            .values()
-            .map(|thread| {
-                thread
-                    .cooccurrences
-                    .values()
-                    .filter(|cooccurrence| cooccurrence.status == "open")
-                    .count() as u64
-            })
-            .sum();
-        let active_scopes = threads
-            .values()
-            .filter(|thread| thread.active_scope.is_some())
-            .count() as u64;
-        let active_memories = threads
-            .values()
-            .map(|thread| thread.memories.len() as u64)
-            .sum();
-        let active_episodes = threads
-            .values()
-            .map(|thread| thread.episodes.len() as u64)
-            .sum();
-        (
-            active_threads,
-            open_contexts,
-            open_reasons,
-            open_cooccurrences,
-            active_scopes,
-            active_memories,
-            active_episodes,
-        )
-    };
-
-    let mut state = app_state.runtime_state.lock().await;
-    state.processed_turns_total = state
-        .processed_turns_total
-        .saturating_add(delta.processed_turns_delta);
-    state.invalid_turns_total = state
-        .invalid_turns_total
-        .saturating_add(delta.invalid_turns_delta);
-    state.published_entities_total = state
-        .published_entities_total
-        .saturating_add(delta.published_entities_delta);
-    state.publish_errors_total = state
-        .publish_errors_total
-        .saturating_add(delta.publish_errors_delta);
-    if let Some(value) = delta.last_trace_id {
-        state.last_trace_id = Some(value);
-    }
-    if let Some(value) = delta.last_thread_id {
-        state.last_thread_id = Some(value);
-    }
-    if delta.last_thread_seq.is_some() {
-        state.last_thread_seq = delta.last_thread_seq;
-    }
-    if let Some(value) = delta.last_src_ilk {
-        state.last_src_ilk = Some(value);
-    }
-    if let Some(value) = delta.last_ich {
-        state.last_ich = Some(value);
-    }
-    if let Some(value) = delta.last_tags {
-        state.last_tags = value;
-    }
-    if let Some(value) = delta.last_reason_signals_canonical {
-        state.last_reason_signals_canonical = value;
-    }
-    if let Some(value) = delta.last_reason_signals_extra {
-        state.last_reason_signals_extra = value;
-    }
-    state.active_threads_total = active_threads_total;
-    state.open_contexts_total = open_contexts_total;
-    state.open_reasons_total = open_reasons_total;
-    state.open_cooccurrences_total = open_cooccurrences_total;
-    state.active_scopes_total = active_scopes_total;
-    state.active_memories_total = active_memories_total;
-    state.active_episodes_total = active_episodes_total;
-    if delta.rebuilt_threads_total > 0 || delta.rebuild_status.is_some() {
-        state.rebuilt_threads_total = delta.rebuilt_threads_total;
-    }
-    if let Some(value) = delta.rebuild_source {
-        state.last_rebuild_source = Some(value);
-    }
-    if let Some(value) = delta.rebuild_status {
-        state.last_rebuild_status = Some(value);
-    }
-    if delta.rebuild_success {
-        state.rebuild_successes_total = state.rebuild_successes_total.saturating_add(1);
     }
 }
 
@@ -1910,11 +2004,8 @@ fn build_memory_package_for_thread(
     }
 }
 
-/// Handle `VAULT_SECRET_CHANGED` for cognition. Both cognition resources
-/// (openai for semantic tagger, postgres for rebuild) are resolved lazily
-/// per-call, so the reaction is simply to probe the new value and update
-/// the in-memory `ai_secret_source` flag for openai. Postgres is consulted
-/// fresh on the next rebuild attempt — no state to update here.
+/// Handle `VAULT_SECRET_CHANGED` for cognition. Its AI key is resolved lazily per call, so the
+/// reaction is simply to probe the new value and update `ai_secret_source`.
 async fn handle_vault_secret_changed_cognition(msg: &Message, app_state: &CognitionAppState) {
     tracing::info!(
         node_name = %app_state.node_name,
@@ -1942,15 +2033,8 @@ async fn handle_vault_secret_changed_cognition(msg: &Message, app_state: &Cognit
         my_ilk: Some(app_state.self_ilk_id.as_str()),
         system_caller: true,
     };
-    let interest_postgres = VaultSecretInterest {
-        resource_type: "postgres",
-        my_tenant: fluxbee_sdk::DEFAULT_ROOT_TENANT_ID,
-        my_ilk: Some(app_state.self_ilk_id.as_str()),
-        system_caller: true,
-    };
     let matched_ai = payload.matches_interest(&interest_ai);
-    let matched_postgres = payload.matches_interest(&interest_postgres);
-    if !matched_ai && !matched_postgres {
+    if !matched_ai {
         tracing::info!(
             node_name = %app_state.node_name,
             resource_type = %payload.resource_type,
@@ -1958,17 +2042,20 @@ async fn handle_vault_secret_changed_cognition(msg: &Message, app_state: &Cognit
             payload_ilk = %payload.ilk.as_deref().unwrap_or(""),
             my_tenant = %fluxbee_sdk::DEFAULT_ROOT_TENANT_ID,
             my_ilk = %app_state.self_ilk_id,
-            "sy.cognition VAULT_SECRET_CHANGED matches neither AI nor postgres interest; ignoring"
+            "sy.cognition VAULT_SECRET_CHANGED does not match its AI interest; ignoring"
         );
     }
     if matched_ai {
         tracing::info!(
             node_name = %app_state.node_name,
+            resource_type = %ai_resource_type,
             op = %payload.op.as_str(),
             version = payload.version,
-            "VAULT_SECRET_CHANGED (openai) matches; probing fresh value"
+            "VAULT_SECRET_CHANGED for the AI provider matches; probing fresh value"
         );
-        let resolved = resolve_cognition_ai_api_key(app_state).await.is_some();
+        let resolved = resolve_cognition_ai_api_key(app_state, VaultWait::Once)
+            .await
+            .is_some();
         let next_source = if resolved {
             CognitionAiSecretSource::LocalFile
         } else {
@@ -1983,16 +2070,6 @@ async fn handle_vault_secret_changed_cognition(msg: &Message, app_state: &Cognit
             );
             control.ai_secret_source = next_source;
         }
-    }
-    if matched_postgres {
-        // Postgres for cognition is consulted lazily during rebuild; nothing
-        // to update in-memory. Log the event so operators can correlate.
-        tracing::info!(
-            node_name = %app_state.node_name,
-            op = %payload.op.as_str(),
-            version = payload.version,
-            "VAULT_SECRET_CHANGED (postgres) matches; next rebuild will use fresh value"
-        );
     }
 }
 
@@ -2033,8 +2110,6 @@ async fn process_router_message(
                 &control_state,
                 &snapshot,
                 &app_state.runtime_paths,
-                app_state.use_durable_consumer,
-                app_state.nats_subscribe_errors.load(Ordering::Relaxed),
                 None,
             );
             let response = build_node_config_response_message(msg, sender.uuid(), payload);
@@ -2047,7 +2122,6 @@ async fn process_router_message(
                 &app_state.node_name,
                 &mut control_state,
                 &app_state.runtime_paths,
-                app_state.use_durable_consumer,
             )?;
             let response = build_node_config_response_message(msg, sender.uuid(), payload);
             sender.send(response).await?;
@@ -2065,8 +2139,6 @@ async fn process_router_message(
                         &control_state,
                         &snapshot,
                         &app_state.runtime_paths,
-                        app_state.use_durable_consumer,
-                        app_state.nats_subscribe_errors.load(Ordering::Relaxed),
                     ),
                 ))
                 .await?;
@@ -2084,8 +2156,6 @@ async fn process_router_message(
                         &control_state,
                         &snapshot,
                         &app_state.runtime_paths,
-                        app_state.use_durable_consumer,
-                        app_state.nats_subscribe_errors.load(Ordering::Relaxed),
                     ),
                 ))
                 .await?;
@@ -2129,8 +2199,6 @@ fn build_status_payload(
     control_state: &CognitionControlState,
     runtime_state: &CognitionRuntimeState,
     runtime_paths: &RuntimePaths,
-    use_durable_consumer: bool,
-    nats_subscribe_errors: u64,
 ) -> Value {
     let degraded_reasons = cognition_degraded_reasons(control_state);
     let ai_provider = json!({
@@ -2162,21 +2230,19 @@ fn build_status_payload(
         ]
     });
     let turns_consumer = json!({
-        "subject": SUBJECT_STORAGE_TURNS,
-        "mode": if use_durable_consumer { "durable" } else { "volatile" },
-        "durable_queue": if use_durable_consumer {
-            Value::String(DURABLE_QUEUE_TURNS.to_string())
-        } else {
-            Value::Null
-        },
+        "subject": SUBJECT_COGNITION_TURNS,
+        "source": "its hive's router streams (RT.*.stream@<hive>): both directions of its agents' communications",
         "processed_turns_total": runtime_state.processed_turns_total,
         "invalid_turns_total": runtime_state.invalid_turns_total,
-        "subscribe_failures": nats_subscribe_errors,
+        "dropped_turns_queue_full_total": runtime_state.dropped_turns_queue_full_total,
+        "stream_repeats_skipped_total": runtime_state.stream_repeats_skipped_total,
+        "no_agent_ilk_total": runtime_state.no_agent_ilk_total,
+        "state_fetches_total": runtime_state.state_fetches_total,
+        "state_fetch_failures_total": runtime_state.state_fetch_failures_total,
         "published_entities_total": runtime_state.published_entities_total,
         "publish_errors_total": runtime_state.publish_errors_total,
         "last_trace_id": runtime_state.last_trace_id,
         "last_thread_id": runtime_state.last_thread_id,
-        "last_thread_seq": runtime_state.last_thread_seq,
         "last_src_ilk": runtime_state.last_src_ilk,
         "last_ich": runtime_state.last_ich,
         "last_tags": runtime_state.last_tags,
@@ -2244,8 +2310,6 @@ fn build_cognition_config_get_payload(
     control_state: &CognitionControlState,
     runtime_state: &CognitionRuntimeState,
     runtime_paths: &RuntimePaths,
-    use_durable_consumer: bool,
-    nats_subscribe_errors: u64,
     note: Option<&str>,
 ) -> Value {
     let configured = control_state.ai_secret_source != CognitionAiSecretSource::Missing;
@@ -2256,24 +2320,16 @@ fn build_cognition_config_get_payload(
             "configured": configured,
             "scope": "pool (tenant or root)",
             "purpose": "semantic tagger + narrative summarizer"
-        },
-        {
-            "resource_type": "postgres",
-            "required": false,
-            "configured": null,
-            "scope": "pool (tenant or root)",
-            "consumer_dbname": "fluxbee_storage",
-            "purpose": "cognition rebuild snapshot from storage durable tables (probed on demand)"
         }
     ]);
 
     let mut notes = vec![
         Value::String(
-            "SY.cognition currently runs as a live skeleton: router control-plane plus storage.turns consumer."
+            "SY.cognition keeps one memory per communication (the thread and the agent that serves it). Its router hands it both directions of its hive's agents' communications on the cognition.turns subject of its stream."
                 .to_string(),
         ),
         Value::String(
-            "AI + postgres credentials live entirely in SY.vault. The hive-wide AI provider selects resource_type=openai|anthropic."
+            "AI credentials live in SY.vault. The hive-wide AI provider selects resource_type=openai|anthropic."
                 .to_string(),
         ),
         Value::String(
@@ -2285,7 +2341,11 @@ fn build_cognition_config_get_payload(
                 .to_string(),
         ),
         Value::String(
-            "Cold start rebuild from durable storage is attempted only when local cognition state is empty; when storage durable is unavailable the node stays fail-open and continues live."
+            "A communication's state comes back from SY.storage over the mesh (COGNITION_STATE_GET): at start for the communications in jsr-memory, and on the first turn of one it does not hold. A turn whose communication cannot load is skipped and counted."
+                .to_string(),
+        ),
+        Value::String(
+            "config.thresholds.context_close / reason_close (0 to 1, default 0.25) are the weights under which an open context / reason closes once turns stop reinforcing it; a co-occurrence closes under their average. Nothing gates opening: every tag the tagger returns opens a context, every canonical signal a reason. They replace context_open / reason_open, which only ever set this, at half their value."
                 .to_string(),
         ),
     ];
@@ -2293,19 +2353,13 @@ fn build_cognition_config_get_payload(
         notes.push(Value::String(note.to_string()));
     }
     let config = json!({
-        "nats": {
-            "input_subject": SUBJECT_STORAGE_TURNS,
-            "consumer_mode": if use_durable_consumer { "durable" } else { "volatile" },
-            "durable_queue": if use_durable_consumer {
-                Value::String(DURABLE_QUEUE_TURNS.to_string())
-            } else {
-                Value::Null
-            }
+        "turns": {
+            "subject": SUBJECT_COGNITION_TURNS,
+            "source": "router stream"
         },
         "storage": {
-            "write_subject_prefix": "storage.cognition",
-            "enabled": true,
-            "resolved_from": "vault://resource_type=postgres"
+            "write_subject": SUBJECT_STORAGE_COGNITION_BATCH,
+            "state_from": format!("{MSG_COGNITION_STATE_GET} to SY.storage@{}", fluxbee_sdk::protocol::PRIMARY_HIVE_ID)
         },
         "ai": {
             "default_provider": control_state.semantic_tagger.provider,
@@ -2331,8 +2385,8 @@ fn build_cognition_config_get_payload(
             "turn_behavior_on_narrative_summarizer_failure": "skip_narrative_update_fail_open"
         },
         "thresholds": {
-            "context_open": control_state.thresholds.context_open,
-            "reason_open": control_state.thresholds.reason_open
+            "context_close": control_state.thresholds.context_close,
+            "reason_close": control_state.thresholds.reason_close
         },
         "paths": {
             "state_dir": runtime_paths.state_dir,
@@ -2344,11 +2398,12 @@ fn build_cognition_config_get_payload(
     let runtime = json!({
         "processed_turns_total": runtime_state.processed_turns_total,
         "invalid_turns_total": runtime_state.invalid_turns_total,
+        "dropped_turns_queue_full_total": runtime_state.dropped_turns_queue_full_total,
         "published_entities_total": runtime_state.published_entities_total,
         "publish_errors_total": runtime_state.publish_errors_total,
-        "subscribe_failures": nats_subscribe_errors,
+        "no_agent_ilk_total": runtime_state.no_agent_ilk_total,
+        "state_fetch_failures_total": runtime_state.state_fetch_failures_total,
         "last_thread_id": runtime_state.last_thread_id,
-        "last_thread_seq": runtime_state.last_thread_seq,
         "last_tags": runtime_state.last_tags,
         "last_reason_signals_canonical": runtime_state.last_reason_signals_canonical,
         "last_reason_signals_extra": runtime_state.last_reason_signals_extra,
@@ -2390,8 +2445,8 @@ fn build_cognition_config_get_payload(
             "config.semantic_tagger.timeout_ms",
             "config.semantic_tagger.max_tags",
             "config.semantic_tagger.max_reason_signals",
-            "config.thresholds.context_open",
-            "config.thresholds.reason_open"
+            "config.thresholds.context_close",
+            "config.thresholds.reason_close"
         ],
         "resources": resources,
         "notes": notes
@@ -2414,14 +2469,12 @@ fn apply_cognition_config_set(
     node_name: &str,
     control_state: &mut CognitionControlState,
     runtime_paths: &RuntimePaths,
-    use_durable_consumer: bool,
 ) -> Result<Value, CognitionError> {
     let Some(requested_node_name) = msg.payload.get("node_name").and_then(Value::as_str) else {
         return Ok(config_error_response(
             node_name,
             control_state,
             runtime_paths,
-            use_durable_consumer,
             "invalid_config",
             "config-set requires node_name",
         ));
@@ -2431,7 +2484,6 @@ fn apply_cognition_config_set(
             node_name,
             control_state,
             runtime_paths,
-            use_durable_consumer,
             "invalid_config",
             "config-set node_name does not match this node",
         ));
@@ -2445,7 +2497,6 @@ fn apply_cognition_config_set(
                 node_name,
                 control_state,
                 runtime_paths,
-                use_durable_consumer,
                 "unsupported_apply_mode",
                 "SY.cognition currently supports only apply_mode=replace",
             ));
@@ -2459,7 +2510,6 @@ fn apply_cognition_config_set(
             node_name,
             control_state,
             runtime_paths,
-            use_durable_consumer,
             "invalid_config",
             &err.to_string(),
         ));
@@ -2471,7 +2521,6 @@ fn apply_cognition_config_set(
                 node_name,
                 control_state,
                 runtime_paths,
-                use_durable_consumer,
                 "invalid_config",
                 &err.to_string(),
             ));
@@ -2487,7 +2536,6 @@ fn apply_cognition_config_set(
                 node_name,
                 control_state,
                 runtime_paths,
-                use_durable_consumer,
                 "invalid_config",
                 &err.to_string(),
             ));
@@ -2521,11 +2569,11 @@ fn apply_cognition_config_set(
                 "implementation_status": "provider_neutral_sdk"
             },
             "thresholds": {
-                "context_open": control_state.thresholds.context_open,
-                "reason_open": control_state.thresholds.reason_open
+                "context_close": control_state.thresholds.context_close,
+                "reason_close": control_state.thresholds.reason_close
             }
         },
-        "message": "SY.cognition non-secret config persisted (Model D': openai + postgres credentials live in vault under resource_type=<openai|postgres>)."
+        "message": "SY.cognition non-secret config persisted (Model D': AI credentials live in vault under resource_type=<openai|anthropic>)."
     }))
 }
 
@@ -2533,7 +2581,6 @@ fn config_error_response(
     node_name: &str,
     control_state: &CognitionControlState,
     runtime_paths: &RuntimePaths,
-    use_durable_consumer: bool,
     code: &str,
     message: &str,
 ) -> Value {
@@ -2542,8 +2589,6 @@ fn config_error_response(
         control_state,
         &CognitionRuntimeState::default(),
         runtime_paths,
-        use_durable_consumer,
-        0,
         Some(message),
     )
     .as_object()
@@ -2600,16 +2645,22 @@ fn bootstrap_cognition_control_state(
         .as_ref()
         .map(|value| value.config_version)
         .unwrap_or(0);
-    let thresholds = persisted
+    // Read like a CONFIG_SET, so persisted thresholds the parser refuses (keys from before
+    // a rename) are reported instead of silently replaced by the defaults.
+    let thresholds = match persisted
         .as_ref()
-        .and_then(|value| {
-            value
-                .config
-                .get("thresholds")
-                .cloned()
-                .and_then(|value| serde_json::from_value::<CognitionThresholds>(value).ok())
-        })
-        .unwrap_or_default();
+        .and_then(|value| value.config.get("thresholds"))
+    {
+        Some(value) => parse_cognition_thresholds(value).unwrap_or_else(|err| {
+            tracing::warn!(
+                node_name = %node_name,
+                error = %err,
+                "sy.cognition persisted thresholds refused; the defaults apply"
+            );
+            CognitionThresholds::default()
+        }),
+        None => CognitionThresholds::default(),
+    };
     let semantic_tagger = persisted
         .as_ref()
         .and_then(|value| {
@@ -2657,8 +2708,8 @@ fn persist_cognition_config_state(
                 "max_reason_signals": state.semantic_tagger.max_reason_signals
             },
             "thresholds": {
-                "context_open": state.thresholds.context_open,
-                "reason_open": state.thresholds.reason_open
+                "context_close": state.thresholds.context_close,
+                "reason_close": state.thresholds.reason_close
             }
         }),
         updated_at: chrono::Utc::now().to_rfc3339(),
@@ -2718,29 +2769,65 @@ fn reject_cognition_secret_fields(body: &Value) -> Result<(), CognitionError> {
 fn extract_cognition_thresholds(
     body: &Value,
 ) -> Result<Option<CognitionThresholds>, CognitionError> {
-    let Some(thresholds) = body.get("config").and_then(|value| value.get("thresholds")) else {
-        return Ok(None);
+    body.get("config")
+        .and_then(|value| value.get("thresholds"))
+        .map(parse_cognition_thresholds)
+        .transpose()
+}
+
+/// `config.thresholds`, from a CONFIG_SET or the persisted config: `context_close` and
+/// `reason_close`, a key left out takes its default. Any other key is refused, the retired
+/// `context_open`/`reason_open` by name: they never gated opening, they only set the close
+/// threshold, at half their value.
+fn parse_cognition_thresholds(thresholds: &Value) -> Result<CognitionThresholds, CognitionError> {
+    let Some(fields) = thresholds.as_object() else {
+        return Err("config.thresholds must be an object (context_close, reason_close)".into());
     };
-    let context_open = thresholds
-        .get("context_open")
-        .and_then(Value::as_f64)
-        .unwrap_or(COGNITION_DEFAULT_CONTEXT_OPEN_THRESHOLD);
-    let reason_open = thresholds
-        .get("reason_open")
-        .and_then(Value::as_f64)
-        .unwrap_or(COGNITION_DEFAULT_REASON_OPEN_THRESHOLD);
-    if !context_open.is_finite() || !(0.0..=1.0).contains(&context_open) {
-        return Err(
-            "config.thresholds.context_open must be a finite number between 0 and 1".into(),
-        );
+    if let Some(key) = fields
+        .keys()
+        .find(|key| !matches!(key.as_str(), "context_close" | "reason_close"))
+    {
+        let message = match key.as_str() {
+            "context_open" | "reason_open" => {
+                let entity = key.trim_end_matches("_open");
+                format!(
+                    "config.thresholds.{key} is no longer accepted: it never gated opening, and half its value was the weight under which an open {entity} closes. Set that weight as config.thresholds.{entity}_close"
+                )
+            }
+            _ => format!(
+                "config.thresholds.{key} is not a cognition threshold; the keys are context_close and reason_close"
+            ),
+        };
+        return Err(message.into());
     }
-    if !reason_open.is_finite() || !(0.0..=1.0).contains(&reason_open) {
-        return Err("config.thresholds.reason_open must be a finite number between 0 and 1".into());
-    }
-    Ok(Some(CognitionThresholds {
-        context_open,
-        reason_open,
-    }))
+    Ok(CognitionThresholds {
+        context_close: close_threshold(
+            fields,
+            "context_close",
+            COGNITION_DEFAULT_CONTEXT_CLOSE_THRESHOLD,
+        )?,
+        reason_close: close_threshold(
+            fields,
+            "reason_close",
+            COGNITION_DEFAULT_REASON_CLOSE_THRESHOLD,
+        )?,
+    })
+}
+
+fn close_threshold(
+    fields: &serde_json::Map<String, Value>,
+    key: &str,
+    default: f64,
+) -> Result<f64, CognitionError> {
+    let Some(value) = fields.get(key) else {
+        return Ok(default);
+    };
+    value
+        .as_f64()
+        .filter(|value| value.is_finite() && (0.0..=1.0).contains(value))
+        .ok_or_else(|| {
+            format!("config.thresholds.{key} must be a finite number between 0 and 1").into()
+        })
 }
 
 fn extract_cognition_semantic_tagger_config(
@@ -2788,27 +2875,37 @@ fn extract_turn_text(payload: &Value) -> Option<String> {
         .filter(|value| !value.is_empty())
 }
 
-async fn update_thread_state_and_build_envelopes(
+/// One turn of a communication (`thread_id`, the agent `agent_ilk` that owns it, §6.2): its state
+/// moves on, and the envelopes of what changed come back. The turn is numbered here; the number
+/// orders the communication and guards its rows in SY.storage.
+#[allow(clippy::too_many_arguments)]
+async fn update_thread_state_and_build_envelopes<S: NarrativeSummarizer>(
     hive_id: &str,
     writer: &str,
     thread_id: &str,
-    thread_seq: Option<u64>,
+    agent_ilk: &str,
     src_ilk: Option<&str>,
     dst_ilk: Option<&str>,
     ich: Option<&str>,
     tagger: &SemanticTaggerOutput,
     thresholds: &CognitionThresholds,
     api_key: &str,
+    account: &AiAccount,
     semantic_tagger_config: &CognitionSemanticTaggerConfig,
     ts: &str,
     thread_state: &mut ThreadCognitionState,
+    narrative: &S,
 ) -> ThreadUpdateResult {
     if thread_state.first_seen_at.is_none() {
         thread_state.first_seen_at = Some(ts.to_string());
     }
     thread_state.last_seen_at = Some(ts.to_string());
-    thread_state.latest_thread_seq = thread_seq;
     thread_state.turn_count = thread_state.turn_count.saturating_add(1);
+    let comm = &CognitionCommunicationRef {
+        thread_id: thread_id.to_string(),
+        agent_ilk: agent_ilk.to_string(),
+        turn: thread_state.turn_count,
+    };
 
     let context_candidates = build_context_candidates(tagger);
     let reason_candidates = build_reason_candidates(tagger);
@@ -2817,10 +2914,9 @@ async fn update_thread_state_and_build_envelopes(
     if let Some(body) = build_thread_envelope_body(
         hive_id,
         writer,
-        thread_id,
+        comm,
         ts,
         thread_state,
-        thread_seq,
         src_ilk,
         dst_ilk,
         ich,
@@ -2831,31 +2927,32 @@ async fn update_thread_state_and_build_envelopes(
     out.extend(update_contexts_for_thread(
         hive_id,
         writer,
-        thread_id,
+        comm,
         ts,
         src_ilk,
         dst_ilk,
-        thresholds.context_open,
+        thresholds.context_close,
         &context_candidates,
         &mut thread_state.contexts,
     ));
     out.extend(update_reasons_for_thread(
         hive_id,
         writer,
-        thread_id,
+        comm,
         ts,
         src_ilk,
         dst_ilk,
-        thresholds.reason_open,
+        thresholds.reason_close,
         &reason_candidates,
         &mut thread_state.reasons,
     ));
+    // A co-occurrence pairs a context with a reason, so it closes under the average of the two.
     out.extend(update_cooccurrences_for_thread(
         hive_id,
         writer,
-        thread_id,
+        comm,
         ts,
-        (thresholds.context_open + thresholds.reason_open) * 0.5,
+        (thresholds.context_close + thresholds.reason_close) * 0.5,
         &context_candidates,
         &reason_candidates,
         &thread_state.contexts,
@@ -2865,9 +2962,8 @@ async fn update_thread_state_and_build_envelopes(
     out.extend(update_scope_binding_for_thread(
         hive_id,
         writer,
-        thread_id,
+        comm,
         ts,
-        thread_seq,
         src_ilk,
         dst_ilk,
         thread_state.turn_count,
@@ -2878,18 +2974,20 @@ async fn update_thread_state_and_build_envelopes(
     let memory_episode_result = update_memories_and_episodes_for_thread(
         hive_id,
         writer,
-        thread_id,
+        comm,
         ts,
         src_ilk,
         dst_ilk,
         tagger,
         api_key,
+        account,
         semantic_tagger_config,
         &thread_state.contexts,
         &thread_state.reasons,
         &thread_state.active_scope,
         &mut thread_state.memories,
         &mut thread_state.episodes,
+        narrative,
     )
     .await;
     out.extend(memory_episode_result.envelopes);
@@ -2974,16 +3072,14 @@ fn build_reason_candidates(tagger: &SemanticTaggerOutput) -> Vec<ReasonCandidate
 fn build_thread_envelope_body(
     hive_id: &str,
     writer: &str,
-    thread_id: &str,
+    comm: &CognitionCommunicationRef,
     ts: &str,
     thread_state: &ThreadCognitionState,
-    thread_seq: Option<u64>,
     src_ilk: Option<&str>,
     dst_ilk: Option<&str>,
     ich: Option<&str>,
 ) -> Option<Vec<u8>> {
     let data = CognitionThreadData {
-        latest_thread_seq: thread_seq,
         src_ilk: src_ilk.map(ToString::to_string),
         dst_ilk: dst_ilk.map(ToString::to_string),
         ich: ich.map(ToString::to_string),
@@ -2995,8 +3091,8 @@ fn build_thread_envelope_body(
     let envelope = CognitionDurableEnvelope::new(
         CognitionDurableEntity::Thread,
         CognitionDurableOp::Upsert,
-        thread_id.to_string(),
-        Some(thread_id.to_string()),
+        communication_entity_id(comm),
+        Some(comm),
         hive_id.to_string(),
         writer.to_string(),
         ts.to_string(),
@@ -3008,11 +3104,11 @@ fn build_thread_envelope_body(
 fn update_contexts_for_thread(
     hive_id: &str,
     writer: &str,
-    thread_id: &str,
+    comm: &CognitionCommunicationRef,
     ts: &str,
     src_ilk: Option<&str>,
     dst_ilk: Option<&str>,
-    open_threshold: f64,
+    close_threshold: f64,
     candidates: &[ContextCandidate],
     contexts: &mut HashMap<String, ContextState>,
 ) -> Vec<(&'static str, Vec<u8>)> {
@@ -3026,7 +3122,10 @@ fn update_contexts_for_thread(
         let context = contexts
             .entry(candidate.label.clone())
             .or_insert_with(|| ContextState {
-                context_id: stable_entity_id("context", &[thread_id, &candidate.label]),
+                context_id: stable_entity_id(
+                    "context",
+                    &[&comm.thread_id, &comm.agent_ilk, &candidate.label],
+                ),
                 label: candidate.label.clone(),
                 weight: 0.0,
                 weight_avg_cumulative: 0.0,
@@ -3083,7 +3182,7 @@ fn update_contexts_for_thread(
             CognitionDurableEntity::Context,
             CognitionDurableOp::Upsert,
             context.context_id.clone(),
-            Some(thread_id.to_string()),
+            Some(comm),
             hive_id.to_string(),
             writer.to_string(),
             ts.to_string(),
@@ -3099,7 +3198,7 @@ fn update_contexts_for_thread(
         }
         context.weight *= COGNITION_CONTEXT_DECAY_FACTOR;
         context.last_seen_at = ts.to_string();
-        if context.weight < (open_threshold * 0.5) {
+        if context.weight < close_threshold {
             context.status = "closed".to_string();
             context.closed_at = Some(ts.to_string());
             let data = CognitionContextData {
@@ -3121,7 +3220,7 @@ fn update_contexts_for_thread(
                 CognitionDurableEntity::Context,
                 CognitionDurableOp::Close,
                 context.context_id.clone(),
-                Some(thread_id.to_string()),
+                Some(comm),
                 hive_id.to_string(),
                 writer.to_string(),
                 ts.to_string(),
@@ -3138,11 +3237,11 @@ fn update_contexts_for_thread(
 fn update_reasons_for_thread(
     hive_id: &str,
     writer: &str,
-    thread_id: &str,
+    comm: &CognitionCommunicationRef,
     ts: &str,
     src_ilk: Option<&str>,
     dst_ilk: Option<&str>,
-    open_threshold: f64,
+    close_threshold: f64,
     candidates: &[ReasonCandidate],
     reasons: &mut HashMap<String, ReasonState>,
 ) -> Vec<(&'static str, Vec<u8>)> {
@@ -3156,7 +3255,10 @@ fn update_reasons_for_thread(
         let reason = reasons
             .entry(candidate.label.clone())
             .or_insert_with(|| ReasonState {
-                reason_id: stable_entity_id("reason", &[thread_id, &candidate.label]),
+                reason_id: stable_entity_id(
+                    "reason",
+                    &[&comm.thread_id, &comm.agent_ilk, &candidate.label],
+                ),
                 label: candidate.label.clone(),
                 weight: 0.0,
                 weight_avg_cumulative: 0.0,
@@ -3216,7 +3318,7 @@ fn update_reasons_for_thread(
             CognitionDurableEntity::Reason,
             CognitionDurableOp::Upsert,
             reason.reason_id.clone(),
-            Some(thread_id.to_string()),
+            Some(comm),
             hive_id.to_string(),
             writer.to_string(),
             ts.to_string(),
@@ -3232,7 +3334,7 @@ fn update_reasons_for_thread(
         }
         reason.weight *= COGNITION_REASON_DECAY_FACTOR;
         reason.last_seen_at = ts.to_string();
-        if reason.weight < (open_threshold * 0.5) {
+        if reason.weight < close_threshold {
             reason.status = "closed".to_string();
             reason.closed_at = Some(ts.to_string());
             let data = CognitionReasonData {
@@ -3255,7 +3357,7 @@ fn update_reasons_for_thread(
                 CognitionDurableEntity::Reason,
                 CognitionDurableOp::Close,
                 reason.reason_id.clone(),
-                Some(thread_id.to_string()),
+                Some(comm),
                 hive_id.to_string(),
                 writer.to_string(),
                 ts.to_string(),
@@ -3272,9 +3374,9 @@ fn update_reasons_for_thread(
 fn update_cooccurrences_for_thread(
     hive_id: &str,
     writer: &str,
-    thread_id: &str,
+    comm: &CognitionCommunicationRef,
     ts: &str,
-    open_threshold: f64,
+    close_threshold: f64,
     context_candidates: &[ContextCandidate],
     reason_candidates: &[ReasonCandidate],
     contexts: &HashMap<String, ContextState>,
@@ -3307,7 +3409,12 @@ fn update_cooccurrences_for_thread(
                 .or_insert_with(|| CooccurrenceState {
                     cooccurrence_id: stable_entity_id(
                         "cooccurrence",
-                        &[thread_id, &context.context_id, &reason.reason_id],
+                        &[
+                            &comm.thread_id,
+                            &comm.agent_ilk,
+                            &context.context_id,
+                            &reason.reason_id,
+                        ],
                     ),
                     context_id: context.context_id.clone(),
                     context_label: context.label.clone(),
@@ -3364,7 +3471,7 @@ fn update_cooccurrences_for_thread(
                 CognitionDurableEntity::Cooccurrence,
                 CognitionDurableOp::Upsert,
                 cooccurrence.cooccurrence_id.clone(),
-                Some(thread_id.to_string()),
+                Some(comm),
                 hive_id.to_string(),
                 writer.to_string(),
                 ts.to_string(),
@@ -3381,7 +3488,7 @@ fn update_cooccurrences_for_thread(
         }
         cooccurrence.weight *= COGNITION_COOCCURRENCE_DECAY_FACTOR;
         cooccurrence.last_seen_at = ts.to_string();
-        if cooccurrence.weight < (open_threshold * 0.5) {
+        if cooccurrence.weight < close_threshold {
             cooccurrence.status = "closed".to_string();
             cooccurrence.closed_at = Some(ts.to_string());
             let data = CognitionCooccurrenceData {
@@ -3404,7 +3511,7 @@ fn update_cooccurrences_for_thread(
                 CognitionDurableEntity::Cooccurrence,
                 CognitionDurableOp::Close,
                 cooccurrence.cooccurrence_id.clone(),
-                Some(thread_id.to_string()),
+                Some(comm),
                 hive_id.to_string(),
                 writer.to_string(),
                 ts.to_string(),
@@ -3421,9 +3528,8 @@ fn update_cooccurrences_for_thread(
 fn update_scope_binding_for_thread(
     hive_id: &str,
     writer: &str,
-    thread_id: &str,
+    comm: &CognitionCommunicationRef,
     ts: &str,
-    thread_seq: Option<u64>,
     src_ilk: Option<&str>,
     dst_ilk: Option<&str>,
     turn_count: u64,
@@ -3432,10 +3538,19 @@ fn update_scope_binding_for_thread(
     active_scope: &mut Option<ScopeBindingState>,
 ) -> Vec<(&'static str, Vec<u8>)> {
     let mut out = Vec::new();
-    let Some(context) = select_dominant_context(contexts) else {
+    // On a weight tie the scope's own context/reason stays dominant. HashMap order used to
+    // pick one, so a tag reinforced together with the incumbent could pose as a topic change.
+    let incumbent = active_scope.as_ref();
+    let Some(context) = select_dominant_context(
+        contexts,
+        incumbent.map(|scope| scope.dominant_context_id.as_str()),
+    ) else {
         return out;
     };
-    let Some(reason) = select_dominant_reason(reasons) else {
+    let Some(reason) = select_dominant_reason(
+        reasons,
+        incumbent.map(|scope| scope.dominant_reason_id.as_str()),
+    ) else {
         return out;
     };
 
@@ -3458,11 +3573,11 @@ fn update_scope_binding_for_thread(
                 binding_energy_ema: 1.0,
                 opened_at: ts.to_string(),
                 last_seen_at: ts.to_string(),
-                start_thread_seq: thread_seq,
+                start_turn: Some(comm.turn),
                 unbind_streak: 0,
             };
             out.extend(build_scope_upsert_events(
-                hive_id, writer, thread_id, ts, thread_seq, &opened,
+                hive_id, writer, comm, ts, &opened,
             ));
             *active_scope = Some(opened);
         }
@@ -3490,9 +3605,7 @@ fn update_scope_binding_for_thread(
             }
 
             if candidate_shift && scope.unbind_streak >= COGNITION_SCOPE_SUSTAIN_COUNT {
-                out.extend(build_scope_close_events(
-                    hive_id, writer, thread_id, ts, thread_seq, scope,
-                ));
+                out.extend(build_scope_close_events(hive_id, writer, comm, ts, scope));
                 let opened = ScopeBindingState {
                     scope_id: format!("scope:{}", Uuid::new_v4()),
                     scope_instance_id: format!("scope_instance:{}", Uuid::new_v4()),
@@ -3507,13 +3620,20 @@ fn update_scope_binding_for_thread(
                     binding_energy_ema: binding,
                     opened_at: ts.to_string(),
                     last_seen_at: ts.to_string(),
-                    start_thread_seq: thread_seq,
+                    start_turn: Some(comm.turn),
                     unbind_streak: 0,
                 };
                 out.extend(build_scope_upsert_events(
-                    hive_id, writer, thread_id, ts, thread_seq, &opened,
+                    hive_id, writer, comm, ts, &opened,
                 ));
                 *scope = opened;
+            } else if candidate_shift && binding < COGNITION_SCOPE_UNBIND_THRESHOLD {
+                // The candidate does not bind to this scope: the shift is pending. The scope
+                // keeps its own context/reason so the next turns keep measuring the divergence
+                // until the sustain count cuts it (§3.2, §7.2). Relabeling here reset the
+                // streak, so a lasting topic change renamed the scope instead of cutting it.
+                scope.last_seen_at = ts.to_string();
+                out.extend(build_scope_upsert_events(hive_id, writer, comm, ts, scope));
             } else {
                 scope.label = current_label;
                 scope.dominant_context_id = context.context_id.clone();
@@ -3524,9 +3644,7 @@ fn update_scope_binding_for_thread(
                 scope.dominant_reason_signals = reason.signals_canonical.clone();
                 scope.ilk_weights = current_ilk_weights;
                 scope.last_seen_at = ts.to_string();
-                out.extend(build_scope_upsert_events(
-                    hive_id, writer, thread_id, ts, thread_seq, scope,
-                ));
+                out.extend(build_scope_upsert_events(hive_id, writer, comm, ts, scope));
             }
         }
     }
@@ -3534,21 +3652,23 @@ fn update_scope_binding_for_thread(
     out
 }
 
-async fn update_memories_and_episodes_for_thread(
+async fn update_memories_and_episodes_for_thread<S: NarrativeSummarizer>(
     hive_id: &str,
     writer: &str,
-    thread_id: &str,
+    comm: &CognitionCommunicationRef,
     ts: &str,
     src_ilk: Option<&str>,
     dst_ilk: Option<&str>,
     tagger: &SemanticTaggerOutput,
     api_key: &str,
+    account: &AiAccount,
     semantic_tagger_config: &CognitionSemanticTaggerConfig,
     contexts: &HashMap<String, ContextState>,
     reasons: &HashMap<String, ReasonState>,
     active_scope: &Option<ScopeBindingState>,
     memories: &mut HashMap<String, MemoryState>,
     episodes: &mut HashMap<String, EpisodeState>,
+    narrative: &S,
 ) -> ThreadUpdateResult {
     let mut out = Vec::new();
     let Some(scope) = active_scope.as_ref() else {
@@ -3561,17 +3681,18 @@ async fn update_memories_and_episodes_for_thread(
         return ThreadUpdateResult::default();
     };
 
-    let episode_candidate = build_episode_candidate(tagger, context, reason);
+    let episode_candidate = build_episode_candidate(tagger, context);
     let episode_existing = episode_candidate.as_ref().and_then(|candidate| {
         let episode_key = format!("{}|{}", scope.scope_instance_id, candidate.affect_id);
         episodes.get(&episode_key)
     });
 
-    let narrative_result = match run_narrative_summarizer_ai(
-        narrative_summarizer_ai::NarrativeSummarizerAiInput {
+    let narrative_result = match narrative
+        .summarize(NarrativeSummarizerAiInput {
             api_key,
+            account,
             config: semantic_tagger_config,
-            thread_id,
+            thread_id: &comm.thread_id,
             context_label: &context.label,
             context_tags: &context.tags,
             reason_label: &reason.label,
@@ -3582,14 +3703,13 @@ async fn update_memories_and_episodes_for_thread(
             episode_title: episode_candidate.as_ref().map(|c| c.title.as_str()),
             previous_episode_summary: episode_existing.map(|episode| episode.summary.as_str()),
             previous_episode_reason: episode_existing.map(|episode| episode.reason.as_str()),
-        },
-    )
-    .await
+        })
+        .await
     {
         Ok(value) => value,
         Err(err) => {
             tracing::warn!(
-                thread_id = %thread_id,
+                thread_id = %comm.thread_id,
                 context = %context.label,
                 reason = %reason.label,
                 error = %err,
@@ -3618,7 +3738,7 @@ async fn update_memories_and_episodes_for_thread(
     out.extend(update_memories_for_thread(
         hive_id,
         writer,
-        thread_id,
+        comm,
         ts,
         scope,
         context,
@@ -3627,18 +3747,24 @@ async fn update_memories_and_episodes_for_thread(
         &current_ilk_weights,
         memories,
     ));
-    out.extend(update_episodes_for_thread(
-        hive_id,
-        writer,
-        thread_id,
-        ts,
-        episode_candidate,
-        &narrative_result,
-        scope,
-        context,
-        reason,
-        episodes,
-    ));
+    // The summarizer must return the episode text whenever a candidate was sent (else the
+    // call fails above), so an episode is the candidate's gate fields plus the AI's text.
+    if let Some((candidate, episode_narrative)) =
+        episode_candidate.zip(narrative_result.episode.as_ref())
+    {
+        out.extend(update_episodes_for_thread(
+            hive_id,
+            writer,
+            comm,
+            ts,
+            candidate,
+            episode_narrative,
+            scope,
+            context,
+            reason,
+            episodes,
+        ));
+    }
     ThreadUpdateResult {
         envelopes: out,
         narrative: NarrativeOutcome {
@@ -3652,7 +3778,7 @@ async fn update_memories_and_episodes_for_thread(
 fn update_memories_for_thread(
     hive_id: &str,
     writer: &str,
-    thread_id: &str,
+    comm: &CognitionCommunicationRef,
     ts: &str,
     scope: &ScopeBindingState,
     context: &ContextState,
@@ -3667,7 +3793,10 @@ fn update_memories_for_thread(
     let memory = memories
         .entry(memory_key.clone())
         .or_insert_with(|| MemoryState {
-            memory_id: stable_entity_id("memory", &[thread_id, &scope.scope_id]),
+            memory_id: stable_entity_id(
+                "memory",
+                &[&comm.thread_id, &comm.agent_ilk, &scope.scope_id],
+            ),
             scope_id: scope.scope_id.clone(),
             summary: summary.clone(),
             weight: 0.0,
@@ -3703,7 +3832,7 @@ fn update_memories_for_thread(
         CognitionDurableEntity::Memory,
         CognitionDurableOp::Upsert,
         memory.memory_id.clone(),
-        Some(thread_id.to_string()),
+        Some(comm),
         hive_id.to_string(),
         writer.to_string(),
         ts.to_string(),
@@ -3733,7 +3862,7 @@ fn update_memories_for_thread(
             CognitionDurableEntity::Memory,
             CognitionDurableOp::Upsert,
             other_memory.memory_id.clone(),
-            Some(thread_id.to_string()),
+            Some(comm),
             hive_id.to_string(),
             writer.to_string(),
             ts.to_string(),
@@ -3749,57 +3878,50 @@ fn update_memories_for_thread(
 fn update_episodes_for_thread(
     hive_id: &str,
     writer: &str,
-    thread_id: &str,
+    comm: &CognitionCommunicationRef,
     ts: &str,
-    episode_candidate: Option<EpisodeCandidate>,
-    narrative_result: &narrative_summarizer_ai::NarrativeSummaries,
+    candidate: EpisodeCandidate,
+    episode_narrative: &EpisodeNarrative,
     scope: &ScopeBindingState,
     context: &ContextState,
     reason: &ReasonState,
     episodes: &mut HashMap<String, EpisodeState>,
 ) -> Vec<(&'static str, Vec<u8>)> {
     let mut out = Vec::new();
-    let Some(mut candidate) = episode_candidate else {
-        return out;
-    };
-    candidate.summary = narrative_result
-        .episode_summary
-        .clone()
-        .unwrap_or(candidate.summary);
-    candidate.reason = narrative_result
-        .episode_reason
-        .clone()
-        .unwrap_or(candidate.reason);
-
     let episode_key = format!("{}|{}", scope.scope_instance_id, candidate.affect_id);
     let episode = episodes.entry(episode_key).or_insert_with(|| EpisodeState {
         episode_id: stable_entity_id(
             "episode",
-            &[thread_id, &scope.scope_instance_id, &candidate.affect_id],
+            &[
+                &comm.thread_id,
+                &comm.agent_ilk,
+                &scope.scope_instance_id,
+                &candidate.affect_id,
+            ],
         ),
         scope_id: scope.scope_id.clone(),
         scope_instance_id: scope.scope_instance_id.clone(),
         affect_id: candidate.affect_id.clone(),
         title: candidate.title.clone(),
-        summary: candidate.summary.clone(),
+        summary: episode_narrative.summary.clone(),
         base_intensity: candidate.base_intensity,
         evidence_strength: candidate.evidence_strength,
         evidence_context_ids: vec![context.context_id.clone()],
         evidence_reason_ids: vec![reason.reason_id.clone()],
         evidence_signals: candidate.evidence_signals.clone(),
         intensity: candidate.base_intensity,
-        reason: candidate.reason.clone(),
+        reason: episode_narrative.reason.clone(),
         created_at: ts.to_string(),
     });
 
     episode.scope_id = scope.scope_id.clone();
     episode.scope_instance_id = scope.scope_instance_id.clone();
     episode.title = candidate.title.clone();
-    episode.summary = candidate.summary.clone();
+    episode.summary = episode_narrative.summary.clone();
     episode.base_intensity = episode.base_intensity.max(candidate.base_intensity);
     episode.evidence_strength = episode.evidence_strength.max(candidate.evidence_strength);
     episode.intensity = episode.intensity.max(candidate.base_intensity);
-    episode.reason = candidate.reason.clone();
+    episode.reason = episode_narrative.reason.clone();
     for context_id in [context.context_id.clone()] {
         if !episode.evidence_context_ids.contains(&context_id) {
             episode.evidence_context_ids.push(context_id);
@@ -3834,7 +3956,7 @@ fn update_episodes_for_thread(
         CognitionDurableEntity::Episode,
         CognitionDurableOp::Upsert,
         episode.episode_id.clone(),
-        Some(thread_id.to_string()),
+        Some(comm),
         hive_id.to_string(),
         writer.to_string(),
         ts.to_string(),
@@ -3846,26 +3968,11 @@ fn update_episodes_for_thread(
     out
 }
 
-fn summarize_scope_memory(
-    context: &ContextState,
-    reason: &ReasonState,
-    reason_signals_extra: &[String],
-) -> String {
-    let mut summary = format!(
-        "The thread recurrently centers on {} with a dominant drive of {}.",
-        context.label, reason.label
-    );
-    if let Some(evidence_clause) = build_reason_signals_extra_clause(reason_signals_extra) {
-        summary.push(' ');
-        summary.push_str(&evidence_clause);
-    }
-    summary
-}
-
+/// The deterministic episode gate: an affect fires only on these canonical + extra signal
+/// combinations. The summary and reason are the narrative summarizer's.
 fn build_episode_candidate(
     tagger: &SemanticTaggerOutput,
     context: &ContextState,
-    reason: &ReasonState,
 ) -> Option<EpisodeCandidate> {
     let extra_signals: HashSet<&str> = tagger
         .reason_signals_extra
@@ -3880,24 +3987,15 @@ fn build_episode_candidate(
 
     let mut affect_id = None;
     let mut title = String::new();
-    let mut summary = String::new();
-    let mut reason_text = String::new();
     let mut evidence_signals = Vec::new();
     let mut base_intensity = 0.0;
     let mut evidence_strength = 0.0;
-    let narrative_clause = build_reason_signals_extra_clause(&tagger.reason_signals_extra);
 
     if extra_signals.contains("frustration")
         && (canonical_signals.contains("challenge") || canonical_signals.contains("resolve"))
     {
         affect_id = Some("anger".to_string());
         title = format!("Friction around {}", context.label);
-        summary = format!(
-            "Strong friction emerged around {} with the drive of {}.",
-            context.label, reason.label
-        );
-        reason_text =
-            "Frustration aligned with a confrontational or urgent resolution drive".to_string();
         evidence_signals.extend(["frustration".to_string(), "challenge".to_string()]);
         base_intensity = 8.0;
         evidence_strength = 9.0;
@@ -3906,11 +4004,6 @@ fn build_episode_candidate(
     {
         affect_id = Some("escalation".to_string());
         title = format!("Escalation around {}", context.label);
-        summary = format!(
-            "Escalation pressure appeared around {} with the drive of {}.",
-            context.label, reason.label
-        );
-        reason_text = "Escalation signal with protective or confrontational framing".to_string();
         evidence_signals.extend(["escalation".to_string(), "protect".to_string()]);
         base_intensity = 8.0;
         evidence_strength = 9.0;
@@ -3920,12 +4013,6 @@ fn build_episode_candidate(
     {
         affect_id = Some("urgency".to_string());
         title = format!("Urgent push on {}", context.label);
-        summary = format!(
-            "Urgent pressure formed around {} while seeking {}.",
-            context.label, reason.label
-        );
-        reason_text =
-            "Urgency combined with explicit assistance and resolution seeking".to_string();
         evidence_signals.extend([
             "urgency".to_string(),
             "request".to_string(),
@@ -3941,84 +4028,20 @@ fn build_episode_candidate(
         return None;
     }
 
-    if let Some(clause) = narrative_clause {
-        summary.push(' ');
-        summary.push_str(&clause);
-        reason_text.push_str(". ");
-        reason_text.push_str(&clause);
-    }
-
     Some(EpisodeCandidate {
         affect_id: affect_id?,
         title,
-        summary,
         base_intensity,
         evidence_strength,
         evidence_signals,
-        reason: reason_text,
     })
-}
-
-fn build_reason_signals_extra_clause(reason_signals_extra: &[String]) -> Option<String> {
-    let normalized = dedup_reason_signal_extras(reason_signals_extra);
-    if normalized.is_empty() {
-        return None;
-    }
-    let descriptors = normalized
-        .iter()
-        .filter_map(|signal| match signal.as_str() {
-            "urgency" => Some("clear urgency"),
-            "frustration" => Some("visible frustration"),
-            "gratitude" => Some("moments of gratitude"),
-            "confusion" => Some("signs of confusion"),
-            "escalation" => Some("escalation pressure"),
-            _ => None,
-        })
-        .collect::<Vec<_>>();
-    if descriptors.is_empty() {
-        return None;
-    }
-    Some(format!(
-        "Narrative evidence includes {}.",
-        join_human_list(&descriptors)
-    ))
-}
-
-fn dedup_reason_signal_extras(reason_signals_extra: &[String]) -> Vec<String> {
-    let mut seen = HashSet::new();
-    let mut out = Vec::new();
-    for signal in reason_signals_extra {
-        let normalized = signal.trim().to_lowercase();
-        if normalized.is_empty() {
-            continue;
-        }
-        if seen.insert(normalized.clone()) {
-            out.push(normalized);
-        }
-    }
-    out
-}
-
-fn join_human_list(values: &[&str]) -> String {
-    match values.len() {
-        0 => String::new(),
-        1 => values[0].to_string(),
-        2 => format!("{} and {}", values[0], values[1]),
-        _ => {
-            let mut out = values[..values.len() - 1].join(", ");
-            out.push_str(", and ");
-            out.push_str(values[values.len() - 1]);
-            out
-        }
-    }
 }
 
 fn build_scope_upsert_events(
     hive_id: &str,
     writer: &str,
-    thread_id: &str,
+    comm: &CognitionCommunicationRef,
     ts: &str,
-    thread_seq: Option<u64>,
     scope: &ScopeBindingState,
 ) -> Vec<(&'static str, Vec<u8>)> {
     let mut out = Vec::new();
@@ -4036,7 +4059,7 @@ fn build_scope_upsert_events(
         CognitionDurableEntity::Scope,
         CognitionDurableOp::Upsert,
         scope.scope_id.clone(),
-        None,
+        Some(comm),
         hive_id.to_string(),
         writer.to_string(),
         ts.to_string(),
@@ -4049,8 +4072,8 @@ fn build_scope_upsert_events(
         scope_id: scope.scope_id.clone(),
         dominant_context_id: Some(scope.dominant_context_id.clone()),
         dominant_reason_id: Some(scope.dominant_reason_id.clone()),
-        start_thread_seq: scope.start_thread_seq,
-        end_thread_seq: thread_seq,
+        start_turn: scope.start_turn,
+        end_turn: Some(comm.turn),
         opened_at: Some(scope.opened_at.clone()),
         closed_at: None,
     };
@@ -4058,7 +4081,7 @@ fn build_scope_upsert_events(
         CognitionDurableEntity::ScopeInstance,
         CognitionDurableOp::Upsert,
         scope.scope_instance_id.clone(),
-        Some(thread_id.to_string()),
+        Some(comm),
         hive_id.to_string(),
         writer.to_string(),
         ts.to_string(),
@@ -4072,9 +4095,8 @@ fn build_scope_upsert_events(
 fn build_scope_close_events(
     hive_id: &str,
     writer: &str,
-    thread_id: &str,
+    comm: &CognitionCommunicationRef,
     ts: &str,
-    thread_seq: Option<u64>,
     scope: &ScopeBindingState,
 ) -> Vec<(&'static str, Vec<u8>)> {
     let mut out = Vec::new();
@@ -4092,7 +4114,7 @@ fn build_scope_close_events(
         CognitionDurableEntity::Scope,
         CognitionDurableOp::Close,
         scope.scope_id.clone(),
-        None,
+        Some(comm),
         hive_id.to_string(),
         writer.to_string(),
         ts.to_string(),
@@ -4105,8 +4127,8 @@ fn build_scope_close_events(
         scope_id: scope.scope_id.clone(),
         dominant_context_id: Some(scope.dominant_context_id.clone()),
         dominant_reason_id: Some(scope.dominant_reason_id.clone()),
-        start_thread_seq: scope.start_thread_seq,
-        end_thread_seq: thread_seq,
+        start_turn: scope.start_turn,
+        end_turn: Some(comm.turn),
         opened_at: Some(scope.opened_at.clone()),
         closed_at: Some(ts.to_string()),
     };
@@ -4114,7 +4136,7 @@ fn build_scope_close_events(
         CognitionDurableEntity::ScopeInstance,
         CognitionDurableOp::Close,
         scope.scope_instance_id.clone(),
-        Some(thread_id.to_string()),
+        Some(comm),
         hive_id.to_string(),
         writer.to_string(),
         ts.to_string(),
@@ -4127,31 +4149,68 @@ fn build_scope_close_events(
 
 fn select_dominant_context<'a>(
     contexts: &'a HashMap<String, ContextState>,
+    incumbent_id: Option<&str>,
 ) -> Option<&'a ContextState> {
     contexts
         .values()
         .filter(|context| context.status == "open")
-        .max_by(|left, right| left.weight.total_cmp(&right.weight))
+        .max_by(|left, right| {
+            dominance_order(
+                (left.weight, &left.context_id, &left.label),
+                (right.weight, &right.context_id, &right.label),
+                incumbent_id,
+            )
+        })
 }
 
 fn select_dominant_reason<'a>(
     reasons: &'a HashMap<String, ReasonState>,
+    incumbent_id: Option<&str>,
 ) -> Option<&'a ReasonState> {
     reasons
         .values()
         .filter(|reason| reason.status == "open")
-        .max_by(|left, right| left.weight.total_cmp(&right.weight))
+        .max_by(|left, right| {
+            dominance_order(
+                (left.weight, &left.reason_id, &left.label),
+                (right.weight, &right.reason_id, &right.label),
+                incumbent_id,
+            )
+        })
 }
 
+/// Higher weight dominates. On a tie the incumbent (the active scope's own entity) keeps it,
+/// then the smaller label: deterministic, where HashMap order used to decide.
+fn dominance_order(
+    (left_weight, left_id, left_label): (f64, &str, &str),
+    (right_weight, right_id, right_label): (f64, &str, &str),
+    incumbent_id: Option<&str>,
+) -> std::cmp::Ordering {
+    left_weight
+        .total_cmp(&right_weight)
+        .then_with(|| (Some(left_id) == incumbent_id).cmp(&(Some(right_id) == incumbent_id)))
+        .then_with(|| right_label.cmp(left_label))
+}
+
+/// The interlocutors of a turn, weighing the same whichever spoke: a reply carries the agent's ILK
+/// as sender (§6.2), and weighing the sender higher would make every reply look like a topic shift
+/// to the scope binding.
 fn current_turn_ilk_weights(src_ilk: Option<&str>, dst_ilk: Option<&str>) -> BTreeMap<String, f64> {
     let mut out = BTreeMap::new();
-    if let Some(src_ilk) = src_ilk.map(str::trim).filter(|value| !value.is_empty()) {
-        *out.entry(src_ilk.to_string()).or_insert(0.0) += 1.0;
-    }
-    if let Some(dst_ilk) = dst_ilk.map(str::trim).filter(|value| !value.is_empty()) {
-        *out.entry(dst_ilk.to_string()).or_insert(0.0) += 0.5;
+    for ilk in [src_ilk, dst_ilk]
+        .into_iter()
+        .flatten()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        out.insert(ilk.to_string(), 1.0);
     }
     out
+}
+
+/// A communication's thread row id: the thread and the agent that owns it (§6.2).
+fn communication_entity_id(comm: &CognitionCommunicationRef) -> String {
+    stable_entity_id("thread", &[&comm.thread_id, &comm.agent_ilk])
 }
 
 fn jaccard_similarity(left: &[String], right: &[String]) -> f64 {
@@ -4311,94 +4370,713 @@ fn write_json_atomic(path: &Path, body: &str) -> Result<(), CognitionError> {
 mod tests {
     use super::*;
 
-    #[test]
-    fn summarize_scope_memory_includes_reason_signal_evidence_clause() {
-        let context = ContextState {
-            context_id: "context:1".to_string(),
-            label: "billing".to_string(),
-            tags: vec!["billing".to_string()],
-            weight: 1.0,
-            weight_avg_cumulative: 1.0,
-            weight_avg_ema: 1.0,
-            weight_samples: 1,
-            ilk_weights: BTreeMap::new(),
-            ilk_profile: BTreeMap::new(),
-            opened_at: "2026-01-01T00:00:00Z".to_string(),
-            last_seen_at: "2026-01-01T00:00:00Z".to_string(),
-            closed_at: None,
-            status: "open".to_string(),
-        };
-        let reason = ReasonState {
-            reason_id: "reason:1".to_string(),
-            label: "seeking urgent resolution".to_string(),
-            signals_canonical: vec!["resolve".to_string(), "challenge".to_string()],
-            signals_extra: vec!["urgency".to_string(), "frustration".to_string()],
-            weight: 1.0,
-            weight_avg_cumulative: 1.0,
-            weight_avg_ema: 1.0,
-            weight_samples: 1,
-            ilk_weights: BTreeMap::new(),
-            ilk_profile: BTreeMap::new(),
-            opened_at: "2026-01-01T00:00:00Z".to_string(),
-            last_seen_at: "2026-01-01T00:00:00Z".to_string(),
-            closed_at: None,
-            status: "open".to_string(),
-        };
+    const TEST_THREAD: &str = "thread:sha256:test";
+    const TEST_AGENT: &str = "ilk:agent";
 
-        let summary = summarize_scope_memory(
-            &context,
-            &reason,
-            &["urgency".to_string(), "frustration".to_string()],
+    fn key(thread_id: &str) -> CommunicationKey {
+        CommunicationKey {
+            thread_id: thread_id.to_string(),
+            agent_ilk: TEST_AGENT.to_string(),
+        }
+    }
+
+    /// Answers like the AI does, from the input: memory text always, episode text exactly when
+    /// the turn carries an episode candidate (the contract `parse_narrative_summaries` enforces).
+    struct CannedNarrative;
+
+    impl NarrativeSummarizer for CannedNarrative {
+        fn summarize<'a>(
+            &'a self,
+            input: NarrativeSummarizerAiInput<'a>,
+        ) -> impl Future<Output = Result<NarrativeSummaries, fluxbee_ai_sdk::AiSdkError>> + Send + 'a
+        {
+            let memory_summary = format!(
+                "Memory of {} driven by {}.",
+                input.context_label, input.reason_label
+            );
+            let episode = input.episode_affect_id.map(|affect| EpisodeNarrative {
+                summary: format!("AI episode summary ({affect})."),
+                reason: format!("AI episode reason ({affect})."),
+            });
+            async move {
+                Ok(NarrativeSummaries {
+                    memory_summary,
+                    episode,
+                })
+            }
+        }
+    }
+
+    fn strings(values: &[&str]) -> Vec<String> {
+        values.iter().map(|value| value.to_string()).collect()
+    }
+
+    /// One turn through the live path, with a canned narrative instead of the AI.
+    async fn live_turn(
+        thread: &mut ThreadCognitionState,
+        seq: u64,
+        tags: &[&str],
+        canonical: &[&str],
+        extra: &[&str],
+    ) -> Vec<(&'static str, Vec<u8>)> {
+        live_turn_with(
+            &CognitionThresholds::default(),
+            thread,
+            seq,
+            tags,
+            canonical,
+            extra,
+        )
+        .await
+    }
+
+    async fn live_turn_with(
+        thresholds: &CognitionThresholds,
+        thread: &mut ThreadCognitionState,
+        seq: u64,
+        tags: &[&str],
+        canonical: &[&str],
+        extra: &[&str],
+    ) -> Vec<(&'static str, Vec<u8>)> {
+        let tagger = SemanticTaggerOutput {
+            tags: strings(tags),
+            reason_signals_canonical: strings(canonical),
+            reason_signals_extra: strings(extra),
+        };
+        let ts = format!("2026-01-01T{:02}:{:02}:00Z", seq / 60, seq % 60);
+        update_thread_state_and_build_envelopes(
+            "motherbee",
+            "SY.cognition@motherbee",
+            TEST_THREAD,
+            TEST_AGENT,
+            Some("ilk:juan"),
+            Some("ilk:agent"),
+            Some("ich:test"),
+            &tagger,
+            thresholds,
+            "test-key",
+            &AiAccount::root(UsageRecorder::disabled(), "SY.cognition@motherbee"),
+            &CognitionSemanticTaggerConfig::default(),
+            &ts,
+            thread,
+            &CannedNarrative,
+        )
+        .await
+        .envelopes
+    }
+
+    fn envelopes_of(
+        out: &[(&'static str, Vec<u8>)],
+        subject: &str,
+    ) -> Vec<CognitionDurableEnvelope<Value>> {
+        out.iter()
+            .filter(|(published_to, _)| *published_to == subject)
+            .map(|(_, body)| serde_json::from_slice(body).expect("envelope"))
+            .collect()
+    }
+
+    fn closed_scope_ids(out: &[(&'static str, Vec<u8>)]) -> Vec<String> {
+        envelopes_of(out, SUBJECT_STORAGE_COGNITION_SCOPES)
+            .into_iter()
+            .filter(|envelope| envelope.op == CognitionDurableOp::Close)
+            .map(|envelope| envelope.entity_id)
+            .collect()
+    }
+
+    fn sorted_keys<V>(map: &HashMap<String, V>) -> Vec<String> {
+        let mut keys: Vec<String> = map.keys().cloned().collect();
+        keys.sort();
+        keys
+    }
+
+    /// What SY.storage keeps of the published envelopes and returns for a communication: one row
+    /// per entity id, the last write winning (`persist_cognition_*`).
+    fn durable_rows(published: &[(&'static str, Vec<u8>)]) -> RebuildRows {
+        let mut rows: Vec<(String, Value)> = Vec::new();
+        for (_, body) in published {
+            let envelope: Value = serde_json::from_slice(body).expect("envelope");
+            let id = envelope["entity_id"]
+                .as_str()
+                .expect("entity id")
+                .to_string();
+            rows.retain(|(existing, _)| *existing != id);
+            rows.push((id, envelope));
+        }
+        rebuild_rows_from_envelopes(rows.into_iter().map(|(_, envelope)| envelope).collect())
+    }
+
+    fn context_state(label: &str) -> ContextState {
+        ContextState {
+            context_id: format!("context:{label}"),
+            label: label.to_string(),
+            weight: 1.0,
+            weight_avg_cumulative: 1.0,
+            weight_avg_ema: 1.0,
+            weight_samples: 1,
+            tags: vec![label.to_string()],
+            ilk_weights: BTreeMap::new(),
+            ilk_profile: BTreeMap::new(),
+            opened_at: "2026-01-01T00:00:00Z".to_string(),
+            last_seen_at: "2026-01-01T00:00:00Z".to_string(),
+            closed_at: None,
+            status: "open".to_string(),
+        }
+    }
+
+    /// A thread after one turn on `tags` at `seq`, with a memory summary of a fifth of the
+    /// jsr-memory region: four such threads fill it, the JSON framing leaves no room for a fifth.
+    async fn thread_of_a_fifth_of_the_region(seq: u64, tags: &[&str]) -> ThreadCognitionState {
+        let mut thread = ThreadCognitionState::default();
+        live_turn(&mut thread, seq, tags, &["inform"], &[]).await;
+        for memory in thread.memories.values_mut() {
+            memory.summary = "x".repeat(MEMORY_MAX_DATA_SIZE / 5);
+        }
+        thread
+    }
+
+    fn test_control_state() -> CognitionControlState {
+        CognitionControlState {
+            schema_version: COGNITION_CONFIG_SCHEMA_VERSION,
+            config_version: 1,
+            ai_secret_source: CognitionAiSecretSource::Missing,
+            thresholds: CognitionThresholds::default(),
+            semantic_tagger: CognitionSemanticTaggerConfig::default(),
+        }
+    }
+
+    fn test_runtime_paths() -> RuntimePaths {
+        RuntimePaths {
+            state_dir: PathBuf::from("/var/lib/fluxbee/test"),
+            shm_dir: PathBuf::from("/var/lib/fluxbee/test/shm"),
+            cache_dir: PathBuf::from("/var/lib/fluxbee/test/cache"),
+            memory_lance_path: PathBuf::from("/var/lib/fluxbee/test/memory.lance"),
+        }
+    }
+
+    fn config_set_message(config: Value) -> Message {
+        Message {
+            routing: Routing {
+                src: "SY.admin@motherbee".to_string(),
+                src_l2_name: None,
+                dst: Destination::Unicast("SY.cognition@motherbee".to_string()),
+                ttl: 1,
+                trace_id: "trace:test".to_string(),
+            },
+            meta: Meta {
+                msg_type: SYSTEM_KIND.to_string(),
+                msg: Some("CONFIG_SET".to_string()),
+                ..Meta::default()
+            },
+            payload: json!({ "node_name": "SY.cognition@motherbee", "config": config }),
+        }
+    }
+
+    /// A restart (durable rows, then rebuild) must leave state the next live turn continues.
+    /// Keyed by entity id, the rebuild made every lookup of that turn miss: it re-created
+    /// each context, reason, co-occurrence, memory and episode from zero, under the same id,
+    /// next to the rebuilt one.
+    #[tokio::test]
+    async fn rebuild_keys_state_like_the_live_path() {
+        let turn = (
+            &["billing"][..],
+            &["resolve", "challenge"][..],
+            &["frustration"][..],
         );
-        assert!(summary.contains("Narrative evidence includes"));
-        assert!(summary.contains("clear urgency"));
-        assert!(summary.contains("visible frustration"));
+        let mut reference = ThreadCognitionState::default();
+        let mut published = Vec::new();
+        for seq in 1..=3 {
+            published.extend(live_turn(&mut reference, seq, turn.0, turn.1, turn.2).await);
+        }
+
+        let mut rebuilt = build_communication_state(&key(TEST_THREAD), durable_rows(&published));
+        let scope = rebuilt.active_scope.clone().expect("open scope rebuilt");
+        assert_eq!(
+            Some(&scope.scope_id),
+            reference.active_scope.as_ref().map(|open| &open.scope_id)
+        );
+        assert!(rebuilt.contexts.contains_key(&scope.dominant_context_label));
+        assert!(rebuilt.reasons.contains_key(&scope.dominant_reason_label));
+        assert!(rebuilt.memories.contains_key(&scope.scope_id));
+        assert!(!rebuilt.episodes.is_empty());
+
+        live_turn(&mut reference, 4, turn.0, turn.1, turn.2).await;
+        live_turn(&mut rebuilt, 4, turn.0, turn.1, turn.2).await;
+
+        assert_eq!(
+            sorted_keys(&rebuilt.contexts),
+            sorted_keys(&reference.contexts)
+        );
+        assert_eq!(
+            sorted_keys(&rebuilt.reasons),
+            sorted_keys(&reference.reasons)
+        );
+        assert_eq!(
+            sorted_keys(&rebuilt.cooccurrences),
+            sorted_keys(&reference.cooccurrences)
+        );
+        assert_eq!(
+            sorted_keys(&rebuilt.memories),
+            sorted_keys(&reference.memories)
+        );
+        assert_eq!(
+            sorted_keys(&rebuilt.episodes),
+            sorted_keys(&reference.episodes)
+        );
+        // Continued, not re-created: four samples and the same accumulated weight.
+        let billing = &rebuilt.contexts["billing"];
+        assert_eq!(billing.weight_samples, 4);
+        assert!((billing.weight - reference.contexts["billing"].weight).abs() < 1e-9);
+        assert_eq!(rebuilt.memories[&scope.scope_id].occurrences, 4);
+        assert_eq!(
+            rebuilt.active_scope.as_ref().map(|open| &open.scope_id),
+            Some(&scope.scope_id)
+        );
+        // No entity lives twice in a map.
+        let unique = |ids: Vec<&String>| ids.iter().collect::<HashSet<_>>().len() == ids.len();
+        assert!(unique(
+            rebuilt.contexts.values().map(|c| &c.context_id).collect()
+        ));
+        assert!(unique(
+            rebuilt.reasons.values().map(|r| &r.reason_id).collect()
+        ));
+        assert!(unique(
+            rebuilt
+                .cooccurrences
+                .values()
+                .map(|c| &c.cooccurrence_id)
+                .collect()
+        ));
+        assert!(unique(
+            rebuilt.memories.values().map(|m| &m.memory_id).collect()
+        ));
+        assert!(unique(
+            rebuilt.episodes.values().map(|e| &e.episode_id).collect()
+        ));
+    }
+
+    /// After a restart the region keeps the entries of communications not loaded yet, after the
+    /// ones in memory; an entry of a communication in memory is replaced, never doubled, and one
+    /// written before 0.1.77 (no agent) goes.
+    #[tokio::test]
+    async fn the_region_keeps_what_it_has_not_loaded() {
+        let mut threads = HashMap::new();
+        let mut loaded = ThreadCognitionState::default();
+        live_turn(&mut loaded, 1, &["billing"], &["inform"], &[]).await;
+        loaded.agent_node = "AI.sales@motherbee".to_string();
+        threads.insert(key("thread:loaded"), loaded.clone());
+        let entry = |thread: &str, agent: &str| MemoryShmThreadEntry {
+            thread_id: thread.to_string(),
+            agent_ilk: agent.to_string(),
+            agent_node: "AI.sales@motherbee".to_string(),
+            package: build_memory_package_for_thread(thread, &loaded),
+        };
+        let carried = vec![
+            entry("thread:loaded", TEST_AGENT),
+            entry("thread:not-loaded", TEST_AGENT),
+            entry("thread:old", ""),
+        ];
+        let hot_set = build_memory_hot_set_snapshot(&threads, None, carried).expect("hot set");
+        let kept: Vec<(&str, &str)> = hot_set
+            .snapshot
+            .threads
+            .iter()
+            .map(|entry| (entry.thread_id.as_str(), entry.agent_node.as_str()))
+            .collect();
+        assert_eq!(
+            kept,
+            vec![
+                ("thread:loaded", "AI.sales@motherbee"),
+                ("thread:not-loaded", "AI.sales@motherbee"),
+            ]
+        );
+    }
+
+    /// Live state follows the rebuild's retention rule: a thread outside the jsr-memory hot
+    /// set leaves local state too, so memory stays bounded by the SHM capacity.
+    #[test]
+    fn live_state_keeps_only_the_jsr_memory_hot_set() {
+        // Five threads of a fifth of the region each cannot all fit with the JSON framing.
+        let mut threads = HashMap::new();
+        for index in 0..5u8 {
+            let scope_id = format!("scope:{index}");
+            let mut thread = ThreadCognitionState {
+                last_seen_at: Some(format!("2026-01-01T00:00:0{index}Z")),
+                turn_count: 1,
+                ..ThreadCognitionState::default()
+            };
+            thread.memories.insert(
+                scope_id.clone(),
+                MemoryState {
+                    memory_id: format!("memory:{index}"),
+                    scope_id,
+                    summary: "x".repeat(MEMORY_MAX_DATA_SIZE / 5),
+                    weight: 1.0,
+                    occurrences: 1,
+                    dominant_context_id: String::new(),
+                    dominant_reason_id: String::new(),
+                    ilk_weights: BTreeMap::new(),
+                    created_at: String::new(),
+                    last_seen_at: String::new(),
+                },
+            );
+            threads.insert(key(&format!("thread:{index}")), thread);
+        }
+
+        let hot_set = retain_memory_hot_set(&mut threads, None, Vec::new()).expect("hot set");
+        assert_eq!(hot_set.stats.pruned_threads_total, 1);
+        assert_eq!(threads.len() as u64, hot_set.stats.selected_threads_total);
+        // The oldest thread goes.
+        assert!(!threads.contains_key(&key("thread:0")));
+        assert!(threads
+            .keys()
+            .all(|thread_id| hot_set.selected_thread_ids.contains(thread_id)));
+    }
+
+    /// With the region full, recency ranks ahead of live entities: a new thread with one
+    /// topic stays and the oldest goes, however much more state the older threads carry.
+    /// Ranked by live entities first, a new thread was dropped right after its own turn and
+    /// started over, with a new scope written to storage, on every turn.
+    #[tokio::test]
+    async fn a_full_region_keeps_the_newest_thread() {
+        let topics = ["billing", "refund", "invoice", "charge", "card", "bank"];
+        let mut threads = HashMap::new();
+        for seq in 1..=4u64 {
+            threads.insert(
+                key(&format!("thread:old:{seq}")),
+                thread_of_a_fifth_of_the_region(seq, &topics).await,
+            );
+        }
+        let full = retain_memory_hot_set(&mut threads, None, Vec::new()).expect("hot set");
+        assert_eq!(full.stats.pruned_threads_total, 0);
+
+        threads.insert(
+            key("thread:new"),
+            thread_of_a_fifth_of_the_region(5, &["shipping"]).await,
+        );
+        assert!(
+            thread_live_entities_total(&threads[&key("thread:new")])
+                < thread_live_entities_total(&threads[&key("thread:old:1")])
+        );
+        // No turn thread: the ranking alone keeps it, as after a reload.
+        let hot_set = retain_memory_hot_set(&mut threads, None, Vec::new()).expect("hot set");
+        assert_eq!(hot_set.stats.pruned_threads_total, 1);
+        assert!(threads.contains_key(&key("thread:new")));
+        assert!(!threads.contains_key(&key("thread:old:1")));
+    }
+
+    /// The thread the current turn updated is never the one dropped, even when it does not
+    /// rank as the most recent: here its turn is dated before the others (the clock stepped
+    /// back).
+    #[tokio::test]
+    async fn the_thread_of_the_turn_is_never_dropped() {
+        let mut threads = HashMap::new();
+        for seq in 2..=5u64 {
+            threads.insert(
+                key(&format!("thread:{seq}")),
+                thread_of_a_fifth_of_the_region(seq, &["billing"]).await,
+            );
+        }
+        threads.insert(
+            key("thread:turn"),
+            thread_of_a_fifth_of_the_region(1, &["shipping"]).await,
+        );
+        let hot_set = retain_memory_hot_set(&mut threads, Some(&key("thread:turn")), Vec::new())
+            .expect("hot set");
+        assert_eq!(hot_set.stats.pruned_threads_total, 1);
+        assert!(threads.contains_key(&key("thread:turn")));
+        assert!(!threads.contains_key(&key("thread:2")));
+    }
+
+    /// §3.2/§7.2/§8.3: a lasting change of topic and drive cuts the scope once the shift is
+    /// sustained: on the fifth turn after the dominant pair changes, which for a scope two to
+    /// five turns old is the 6th divergent message (a scope one turn old cuts on the 5th, a
+    /// long-reinforced one on the 7th). The scope used to adopt the new topic on the first
+    /// divergent turn, which reset the unbind streak, so it was renamed instead of cut.
+    #[tokio::test]
+    async fn a_sustained_topic_change_cuts_the_scope() {
+        // (turns on the first topic, the divergent message that cuts)
+        for (history, cut_on) in [(1u64, 5u64), (3, 6), (12, 7)] {
+            let mut thread = ThreadCognitionState::default();
+            for seq in 1..=history {
+                live_turn(&mut thread, seq, &["billing"], &["inform"], &[]).await;
+            }
+            let first = thread.active_scope.clone().expect("scope opened");
+            assert_eq!(first.dominant_context_label, "billing");
+
+            let mut cut = None;
+            for divergent in 1..=20 {
+                let seq = history + divergent;
+                let out = live_turn(&mut thread, seq, &["shipping"], &["protect"], &[]).await;
+                let scope = thread.active_scope.as_ref().expect("scope");
+                if closed_scope_ids(&out).contains(&first.scope_id) {
+                    assert_ne!(scope.scope_id, first.scope_id);
+                    assert_eq!(scope.dominant_context_label, "shipping");
+                    assert_eq!(scope.dominant_reason_label, "risk containment");
+                    cut = Some(divergent);
+                    break;
+                }
+                // Until the cut the scope keeps its identity and its anchor.
+                assert_eq!(scope.scope_id, first.scope_id);
+                assert_eq!(scope.dominant_context_label, "billing");
+                assert_eq!(scope.dominant_reason_label, "information exchange");
+            }
+            assert_eq!(cut, Some(cut_on), "turns on the first topic: {history}");
+        }
+    }
+
+    /// Tags told together tie on weight. The scope's own context keeps a tie, so a tag
+    /// reinforced with it never poses as a topic change, however the map is laid out.
+    #[tokio::test]
+    async fn co_reinforced_tags_keep_the_scope() {
+        let tags = [
+            "billing",
+            "refund",
+            "invoice",
+            "charge",
+            "card",
+            "bank",
+            "statement",
+            "fee",
+            "receipt",
+            "account",
+        ];
+        let mut thread = ThreadCognitionState::default();
+        live_turn(&mut thread, 1, &tags[..2], &["inform"], &[]).await;
+        let first = thread.active_scope.clone().expect("scope opened");
+        for seq in 2..=12u64 {
+            // The same two tags every turn, plus new ones that keep growing the map.
+            let told = &tags[..(seq as usize).min(tags.len())];
+            let out = live_turn(&mut thread, seq, told, &["inform"], &[]).await;
+            assert!(closed_scope_ids(&out).is_empty());
+            let scope = thread.active_scope.as_ref().expect("scope");
+            assert_eq!(scope.scope_id, first.scope_id);
+            assert_eq!(scope.dominant_context_label, first.dominant_context_label);
+        }
+    }
+
+    /// What ships for an episode: the gate's affect, title, intensity and evidence, and the
+    /// summarizer's summary and reason. The summarizer must return both whenever there is a
+    /// candidate, so there is no deterministic text behind them.
+    #[tokio::test]
+    async fn an_episode_ships_the_gate_fields_and_the_narrative_text() {
+        let mut thread = ThreadCognitionState::default();
+        let out = live_turn(
+            &mut thread,
+            1,
+            &["billing"],
+            &["resolve", "challenge"],
+            &["frustration"],
+        )
+        .await;
+        let episodes = envelopes_of(&out, SUBJECT_STORAGE_COGNITION_EPISODES);
+        assert_eq!(episodes.len(), 1);
+        let episode: CognitionEpisodeData =
+            serde_json::from_value(episodes[0].data.clone()).expect("episode data");
+        assert_eq!(episode.affect_id, "anger");
+        assert_eq!(episode.title, "Friction around billing");
+        assert_eq!(episode.summary, "AI episode summary (anger).");
+        assert_eq!(
+            episode.reason.as_deref(),
+            Some("AI episode reason (anger).")
+        );
+        assert_eq!(episode.base_intensity, Some(8.0));
+        assert_eq!(episode.evidence_strength, Some(9.0));
+        assert!(episode
+            .evidence_signals
+            .contains(&"frustration".to_string()));
     }
 
     #[test]
-    fn build_episode_candidate_uses_reason_signal_extras_as_narrative_evidence() {
-        let tagger = SemanticTaggerOutput {
-            tags: vec!["billing".to_string()],
-            reason_signals_canonical: vec!["resolve".to_string(), "challenge".to_string()],
-            reason_signals_extra: vec!["frustration".to_string(), "escalation".to_string()],
+    fn the_episode_gate_needs_its_signal_combination() {
+        let context = context_state("billing");
+        let tagger = |canonical: &[&str], extra: &[&str]| SemanticTaggerOutput {
+            tags: strings(&["billing"]),
+            reason_signals_canonical: strings(canonical),
+            reason_signals_extra: strings(extra),
         };
-        let context = ContextState {
-            context_id: "context:1".to_string(),
-            label: "billing".to_string(),
-            tags: vec!["billing".to_string()],
-            weight: 1.0,
-            weight_avg_cumulative: 1.0,
-            weight_avg_ema: 1.0,
-            weight_samples: 1,
-            ilk_weights: BTreeMap::new(),
-            ilk_profile: BTreeMap::new(),
-            opened_at: "2026-01-01T00:00:00Z".to_string(),
-            last_seen_at: "2026-01-01T00:00:00Z".to_string(),
-            closed_at: None,
-            status: "open".to_string(),
-        };
-        let reason = ReasonState {
-            reason_id: "reason:1".to_string(),
-            label: "confrontational pushback".to_string(),
-            signals_canonical: vec!["challenge".to_string()],
-            signals_extra: vec!["frustration".to_string(), "escalation".to_string()],
-            weight: 1.0,
-            weight_avg_cumulative: 1.0,
-            weight_avg_ema: 1.0,
-            weight_samples: 1,
-            ilk_weights: BTreeMap::new(),
-            ilk_profile: BTreeMap::new(),
-            opened_at: "2026-01-01T00:00:00Z".to_string(),
-            last_seen_at: "2026-01-01T00:00:00Z".to_string(),
-            closed_at: None,
-            status: "open".to_string(),
-        };
+        assert!(
+            build_episode_candidate(&tagger(&["inform"], &["frustration"]), &context).is_none()
+        );
+        assert!(
+            build_episode_candidate(&tagger(&["resolve", "challenge"], &[]), &context).is_none()
+        );
+        let candidate =
+            build_episode_candidate(&tagger(&["resolve", "request"], &["urgency"]), &context)
+                .expect("urgency candidate");
+        assert_eq!(candidate.affect_id, "urgency");
+        assert_eq!(candidate.title, "Urgent push on billing");
+        assert_eq!(candidate.base_intensity, 7.0);
+        assert_eq!(candidate.evidence_strength, 8.0);
+    }
 
-        let candidate = build_episode_candidate(&tagger, &context, &reason).expect("candidate");
-        assert!(candidate.summary.contains("Narrative evidence includes"));
-        assert!(candidate.reason.contains("Narrative evidence includes"));
-        assert!(candidate
-            .evidence_signals
-            .contains(&"frustration".to_string()));
+    /// A close threshold is the weight under which an open entity closes, taken as set; a
+    /// co-occurrence closes under the average of the two. Counted in turns that leave a
+    /// one-turn topic unreinforced, from weight 1.0 decaying by 0.85 (context), 0.75 (reason)
+    /// and 0.80 (co-occurrence). The defaults close where `*_open` at 0.5, halved, did.
+    #[tokio::test]
+    async fn a_close_threshold_applies_as_set() {
+        async fn misses_until_closed(thresholds: CognitionThresholds) -> [Option<u64>; 3] {
+            let mut thread = ThreadCognitionState::default();
+            live_turn_with(&thresholds, &mut thread, 1, &["billing"], &["inform"], &[]).await;
+            let mut closed = [None; 3];
+            for miss in 1..=20u64 {
+                live_turn_with(
+                    &thresholds,
+                    &mut thread,
+                    1 + miss,
+                    &["shipping"],
+                    &["protect"],
+                    &[],
+                )
+                .await;
+                let statuses = [
+                    &thread.contexts["billing"].status,
+                    &thread.reasons["information exchange"].status,
+                    &thread.cooccurrences["billing|information exchange"].status,
+                ];
+                for (slot, status) in closed.iter_mut().zip(statuses) {
+                    if slot.is_none() && status == "closed" {
+                        *slot = Some(miss);
+                    }
+                }
+            }
+            closed
+        }
+
+        // 0.85 < 0.9; 0.5625 >= 0.5 > 0.4219; 0.8 >= (0.9 + 0.5) / 2 > 0.64.
+        let set = CognitionThresholds {
+            context_close: 0.9,
+            reason_close: 0.5,
+        };
+        assert_eq!(misses_until_closed(set).await, [Some(1), Some(3), Some(2)]);
+        // 0.85^9, 0.75^5 and 0.8^7 are the first powers under 0.25.
+        assert_eq!(
+            misses_until_closed(CognitionThresholds::default()).await,
+            [Some(9), Some(5), Some(7)]
+        );
+    }
+
+    /// The thresholds are named for what they do. CONFIG_GET shows `context_close` and
+    /// `reason_close`; CONFIG_SET refuses the retired `*_open` keys by name, pointing at the
+    /// close key, and takes the close keys as set (a key left out takes its default).
+    #[test]
+    fn the_thresholds_are_named_for_what_they_do() {
+        let payload = build_cognition_config_get_payload(
+            "SY.cognition@motherbee",
+            &test_control_state(),
+            &CognitionRuntimeState::default(),
+            &test_runtime_paths(),
+            None,
+        );
+        assert_eq!(
+            payload["config"]["thresholds"],
+            json!({ "context_close": 0.25, "reason_close": 0.25 })
+        );
+        let optional_fields = payload["contract"]["optional_fields"].to_string();
+        assert!(optional_fields.contains("config.thresholds.context_close"));
+        assert!(optional_fields.contains("config.thresholds.reason_close"));
+        assert!(!optional_fields.contains("_open"));
+
+        for (retired, current) in [
+            ("context_open", "context_close"),
+            ("reason_open", "reason_close"),
+        ] {
+            let mut control = test_control_state();
+            let response = apply_cognition_config_set(
+                &config_set_message(json!({ "thresholds": { retired: 0.5 } })),
+                "SY.cognition@motherbee",
+                &mut control,
+                &test_runtime_paths(),
+            )
+            .expect("CONFIG_SET answers");
+            assert_eq!(response["ok"], json!(false));
+            assert_eq!(response["error"]["code"], json!("invalid_config"));
+            let message = response["error"]["message"].as_str().expect("message");
+            assert!(
+                message.contains(&format!("config.thresholds.{retired} ")),
+                "{message}"
+            );
+            assert!(
+                message.contains(&format!("config.thresholds.{current}")),
+                "{message}"
+            );
+            assert_eq!(control.config_version, 1, "nothing applied");
+        }
+
+        let thresholds = extract_cognition_thresholds(&json!({
+            "config": { "thresholds": { "context_close": 0.4 } }
+        }))
+        .expect("valid")
+        .expect("present");
+        assert_eq!(thresholds.context_close, 0.4);
+        assert_eq!(
+            thresholds.reason_close,
+            COGNITION_DEFAULT_REASON_CLOSE_THRESHOLD
+        );
+    }
+
+    /// CONFIG_GET names where the turns come from and where its state is read: the router stream
+    /// and SY.storage over the mesh, with no postgres resource of its own (§6.2).
+    #[test]
+    fn config_get_names_the_stream_and_the_mesh() {
+        let payload = build_cognition_config_get_payload(
+            "SY.cognition@motherbee",
+            &test_control_state(),
+            &CognitionRuntimeState::default(),
+            &test_runtime_paths(),
+            None,
+        );
+        assert_eq!(
+            payload["config"]["turns"]["subject"],
+            json!("cognition.turns")
+        );
+        assert_eq!(
+            payload["config"]["storage"]["write_subject"],
+            json!("storage.cognition.batch")
+        );
+        let resources = payload["contract"]["resources"].to_string();
+        assert!(!resources.contains("postgres"), "{resources}");
+    }
+
+    #[test]
+    fn a_turns_envelopes_pack_under_the_append_limit() {
+        let envelope =
+            |n: usize| json!({ "entity_id": format!("context:{n}"), "pad": "x".repeat(900) });
+        let packs = pack_envelopes((0..90).map(envelope).collect(), COGNITION_APPEND_MAX_BYTES);
+        assert!(packs.len() >= 2);
+        assert_eq!(packs.iter().map(|p| p.envelopes.len()).sum::<usize>(), 90);
+        for pack in &packs {
+            assert!(serde_json::to_vec(pack).unwrap().len() <= COGNITION_APPEND_MAX_BYTES + 64);
+        }
+        // An envelope alone past the limit still goes, alone: the stream counts it oversize.
+        let big = vec![json!({ "pad": "x".repeat(COGNITION_APPEND_MAX_BYTES * 2) })];
+        assert_eq!(pack_envelopes(big, COGNITION_APPEND_MAX_BYTES).len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_communications_references_carry_its_agent() {
+        let mut thread = ThreadCognitionState::default();
+        let out = live_turn(&mut thread, 1, &["billing"], &["inform"], &[]).await;
+        let contexts = envelopes_of(&out, SUBJECT_STORAGE_COGNITION_CONTEXTS);
+        let context = &contexts[0];
+        assert_eq!(context.agent_ilk.as_deref(), Some(TEST_AGENT));
+        assert_eq!(context.turn, Some(1));
+        assert_eq!(
+            context.entity_id,
+            stable_entity_id("context", &[TEST_THREAD, TEST_AGENT, "billing"])
+        );
+        let threads = envelopes_of(&out, SUBJECT_STORAGE_COGNITION_THREADS);
+        assert_eq!(
+            threads[0].entity_id,
+            stable_entity_id("thread", &[TEST_THREAD, TEST_AGENT])
+        );
+        // Both interlocutors weigh the same.
+        assert_eq!(
+            current_turn_ilk_weights(Some("ilk:agent"), Some("ilk:juan")),
+            BTreeMap::from([
+                ("ilk:agent".to_string(), 1.0),
+                ("ilk:juan".to_string(), 1.0)
+            ])
+        );
     }
 }

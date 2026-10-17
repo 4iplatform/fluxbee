@@ -25,15 +25,15 @@ type sender interface {
 }
 
 type Service struct {
-	cfg          NodeConfig
-	store        *Store
-	sender       sender
-	dispatcher   *fluxbeesdk.RouterDispatcher
-	incoming     <-chan fluxbeesdk.Message
-	admin        adminClient
-	orchestrator orchestratorClient
-	wfNodes      wfNodeClient
-	clock        ClockFunc
+	cfg        NodeConfig
+	store      *Store
+	sender     sender
+	dispatcher *fluxbeesdk.RouterDispatcher
+	incoming   <-chan fluxbeesdk.Message
+	admin      adminClient
+	nodes      nodeClient
+	wfNodes    wfNodeClient
+	clock      ClockFunc
 }
 
 func NewService(
@@ -50,15 +50,15 @@ func NewService(
 		snd = dispatcher.SenderSnapshot()
 	}
 	return &Service{
-		cfg:          cfg,
-		store:        NewStore(cfg.StateDir),
-		sender:       snd,
-		dispatcher:   dispatcher,
-		incoming:     incoming,
-		admin:        newAdminClient(cfg, dispatcher),
-		orchestrator: newOrchestratorClient(dispatcher),
-		wfNodes:      newWFNodeClient(dispatcher),
-		clock:        clock,
+		cfg:        cfg,
+		store:      NewStore(cfg.StateDir),
+		sender:     snd,
+		dispatcher: dispatcher,
+		incoming:   incoming,
+		admin:      newAdminClient(cfg, dispatcher),
+		nodes:      newNodeClient(dispatcher, cfg.HiveID),
+		wfNodes:    newWFNodeClient(dispatcher),
+		clock:      clock,
 	}
 }
 
@@ -158,9 +158,33 @@ func (s *Service) handleMessage(msg fluxbeesdk.Message) {
 	case fluxbeesdk.SYSTEMKind:
 		s.handleSystemMessage(msg)
 	case "command":
+		if !fromAdmin(msg) {
+			s.sendCommandResponse(msg, stringValue(msg.Meta.Action), notFromAdmin(msg))
+			return
+		}
 		s.handleCommand(msg)
 	case "query":
+		if !fromAdmin(msg) {
+			s.sendQueryResponse(msg, stringValue(msg.Meta.Action), notFromAdmin(msg))
+			return
+		}
 		s.handleQuery(msg)
+	}
+}
+
+// fromAdmin reports whether a request comes from SY.admin. Workflow operations are user actions,
+// and every user action goes through the admin; the router stamps the sender, so no other node can
+// claim to be it. Without this, any node could have SY.wf-rules deploy or delete WF nodes, which it
+// does through the admin under its own authority (A-68).
+func fromAdmin(msg fluxbeesdk.Message) bool {
+	return msg.SourceL2Name() == fluxbeesdk.PrimaryAdminNode
+}
+
+func notFromAdmin(msg fluxbeesdk.Message) map[string]any {
+	return map[string]any{
+		"status":       "error",
+		"error_code":   "UNAUTHORIZED",
+		"error_detail": fmt.Sprintf("SY.wf-rules takes workflow operations from %s only, not %q", fluxbeesdk.PrimaryAdminNode, msg.SourceL2Name()),
 	}
 }
 

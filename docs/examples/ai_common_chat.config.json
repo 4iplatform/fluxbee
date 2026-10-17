@@ -1,11 +1,12 @@
-﻿{
-  "node": {
-    "name": "AI.common@motherbee",
-    "version": "0.1.0",
-    "router_socket": "/var/run/fluxbee/routers",
-    "uuid_persistence_dir": "/var/lib/fluxbee/state/nodes",
-    "config_dir": "/etc/fluxbee",
-    "dynamic_config_dir": "/var/lib/fluxbee/state/ai-nodes/common"
+{
+  "behavior": {
+    "kind": "ai_chat",
+    "model": "gpt-5.5",
+    "instructions": {
+      "source": "inline",
+      "value": "Respond briefly and clearly in Spanish.",
+      "trim": true
+    }
   },
   "runtime": {
     "read_timeout_ms": 3600000,
@@ -24,16 +25,6 @@
       "summary_max_chars": 1600,
       "summary_refresh_every_turns": 3,
       "trim_noise_enabled": true
-    }
-  },
-  "behavior": {
-    "kind": "ai_chat",
-    "vault_key": "ai/common",
-    "model": "gpt-5.5",
-    "instructions": {
-      "source": "inline",
-      "value": "Respond briefly and clearly in Spanish.",
-      "trim": true
     }
   }
 }

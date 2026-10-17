@@ -11,6 +11,7 @@ serde_yaml = "0.9"
 uuid = { version = "1.7", features = ["v4", "v5", "serde"] }
 thiserror = "1.0"
 tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 sha2 = "0.10"
 mime_guess = "2.0"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }

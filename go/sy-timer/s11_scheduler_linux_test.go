@@ -98,7 +98,7 @@ func TestReplayPendingFireIfWithinFiresInsideWindow(t *testing.T) {
 		t.Fatalf("replay fire_if_within inside window: %v", err)
 	}
 
-	frame := <-tx
+	frame := mustReadSentFrame(t, tx)
 	var msg fluxbeesdk.Message
 	if err := json.Unmarshal(frame, &msg); err != nil {
 		t.Fatalf("decode fired event: %v", err)
@@ -126,9 +126,12 @@ func TestProcessDueRecurringFiresAndRequeues(t *testing.T) {
 	})
 
 	scheduler := newTimerScheduler(service)
+	// processDue works off the scheduler's queue, which scheduling (or a replay) fills; this row was
+	// written straight to the DB, so it is queued here.
+	scheduler.push("timer-recurring-due", now.Add(-2*time.Minute).UnixMilli())
 	scheduler.processDue(context.Background(), now)
 
-	frame := <-tx
+	frame := mustReadSentFrame(t, tx)
 	var msg fluxbeesdk.Message
 	if err := json.Unmarshal(frame, &msg); err != nil {
 		t.Fatalf("decode fired event: %v", err)

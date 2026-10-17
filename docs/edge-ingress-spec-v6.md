@@ -180,9 +180,10 @@ Opening/closing a URL is a **verified service directive**, not the edge's config
 an **addressed request/response**: `EDGE_OPEN_URL` / `EDGE_CLOSE_URL` (Unicast to the edge, acked with
 `*_RESPONSE`). Consequences:
 - **Cross-hive works with zero router changes.** An addressed command routes like any node RPC
-  (`ForwardHive`); it is NOT a `CONFIG_CHANGED` broadcast, which the peer router intentionally
-  swallows (`mod.rs:3578`) — that swallow is correct for route/OPA config but silently dropped the
-  endpoint push to a remote edge (the bug the ingress lab surfaced).
+  (`ForwardHive`); it is NOT a `CONFIG_CHANGED` broadcast, which the peer router used to swallow
+  — that silently dropped the endpoint push to a remote edge (the bug the ingress lab surfaced).
+  (Since 0.1.44 the router gives CONFIG_CHANGED no special treatment, and it carries only the user
+  OPA policy.)
 - **Synchronous confirmation.** Admin blocks on the ack, so the IO node is told `ok` only after the
   edge actually holds the row. No fire-and-forget.
 - **Per-URL, not whole-table-replace.** Each `EDGE_OPEN_URL` upserts one `ich`; `EDGE_CLOSE_URL`
@@ -286,8 +287,9 @@ changed live; `config-set listen` → `restart_required:[listen]`; `config-get` 
 - **Agente acotado, no admin general.** Permanece en ilk/ICH-space y no necesita una vista SHM completa
   de identity. Las respuestas no exponen lecturas de vault ni secretos.
 - Lives **inside the mesh, not in the DMZ hive** — must not share blast radius with the edge.
-- Deferred para producción: el end-user ilk/subject dentro del comando y `SY.policy` sobre
-  `(IO.cloud transport principal) + (user ilk subject)`.
+- Deferred para producción: el end-user ilk/subject dentro del comando y una policy sobre
+  `(IO.cloud transport principal) + (user ilk subject)` (pensada para `SY.policy`, que se retiró:
+  solo contaba turns; se paró en 0.1.77 y su binario y su unit se borraron en 0.1.78).
 
 ### 10.1 `IO.api` - instancias publicas sobre el mismo circuito
 

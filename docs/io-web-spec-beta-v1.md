@@ -282,7 +282,7 @@ sin bindings, pero Fases 2-4 no cumplen el modelo de seguridad de esta spec.
 
 ### 6.1 Rol y lifecycle
 
-Beta define `IO.web@motherbee` como singleton empaquetado, similar operacionalmente a `IO.blob` e
+Beta define `IO.web@motherbee` como runtime managed motherbee-only (boot=true), similar operacionalmente a `IO.blob` e
 `IO.cloud`, pero con un listener privado adicional.
 
 - binario: `/usr/bin/io-web`;
@@ -1431,7 +1431,10 @@ Audit registra actor router-stamped/Admin/Cloud authority y trace/request IDs.
 - congelar access token encoding/signing rotation;
 - definir binding catalog inicial;
 - definir row/messages/actions y authority gates;
-- cerrar el binding autoritativo `src_l2_name -> src_ilk` de Router/Vault y probar impersonation deny;
+- cerrar el binding autoritativo `src_l2_name -> src_ilk` de Router/Vault y probar impersonation deny
+  (Vault: hecho en 0.1.67, FINDINGS A-65; en el mismo hive el nombre sigue siendo el que el proceso
+  declara en su HELLO hasta P-1, ver A-22; el router no lo necesita, porque en un mensaje de usuario
+  `src_ilk` es la persona y no el nodo);
 - threat review del proxy y DB connector.
 
 ### Fase 1 - IO.web static + proxy fijo

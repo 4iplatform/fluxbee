@@ -6,6 +6,7 @@ license.workspace = true
 
 [dependencies]
 fluxbee-sdk.workspace = true
+io-common = { path = "../common" }
 nix.workspace = true
 serde.workspace = true
 serde_json.workspace = true

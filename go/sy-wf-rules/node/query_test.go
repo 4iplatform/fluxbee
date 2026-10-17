@@ -45,15 +45,7 @@ func TestGetWorkflowRequiresCurrentDefinition(t *testing.T) {
 }
 
 type fakeWFNodeClient struct {
-	getNodeStatusFunc         func(nodeName string) (wfNodeStatusProbe, error)
 	countRunningInstancesFunc func(nodeName string) (int, error)
-}
-
-func (f *fakeWFNodeClient) GetNodeStatus(_ context.Context, nodeName string) (wfNodeStatusProbe, error) {
-	if f.getNodeStatusFunc != nil {
-		return f.getNodeStatusFunc(nodeName)
-	}
-	return wfNodeStatusProbe{HealthState: "HEALTHY"}, nil
 }
 
 func (f *fakeWFNodeClient) CountRunningInstances(_ context.Context, nodeName string) (int, error) {
@@ -71,27 +63,27 @@ func TestGetWorkflowStatusReturnsNodeState(t *testing.T) {
 	if _, err := svc.ApplyWorkflow(ApplyRequest{WorkflowName: "invoice"}); err != nil {
 		t.Fatalf("ApplyWorkflow: %v", err)
 	}
-	svc.orchestrator = &fakeOrchestratorClient{
-		getNodeConfigFunc: func(_ context.Context, targetNode, nodeName string) (map[string]any, error) {
+	svc.nodes = &fakeNodeClient{
+		getNodeConfigFunc: func(_ context.Context, nodeName string) (map[string]any, error) {
 			return map[string]any{
 				"status": "ok",
 				"config": map[string]any{
 					"_system": map[string]any{
 						"runtime":         "wf.invoice",
-						"runtime_version": "1",
-						"package_path":    "/var/lib/fluxbee/dist/runtimes/wf.invoice/1",
+						"runtime_version": "0.0.1",
+						"package_path":    "/var/lib/fluxbee/dist/runtimes/wf.invoice/0.0.1",
 					},
 				},
 			}, nil
 		},
 	}
+	svc.nodes.(*fakeNodeClient).getNodeStatusFunc = func(_ context.Context, nodeName string) (map[string]any, error) {
+		if nodeName != "WF.invoice@motherbee" {
+			t.Fatalf("unexpected node %q", nodeName)
+		}
+		return map[string]any{"lifecycle_state": "RUNNING", "health_state": "HEALTHY"}, nil
+	}
 	svc.wfNodes = &fakeWFNodeClient{
-		getNodeStatusFunc: func(nodeName string) (wfNodeStatusProbe, error) {
-			if nodeName != "WF.invoice@motherbee" {
-				t.Fatalf("unexpected node %q", nodeName)
-			}
-			return wfNodeStatusProbe{HealthState: "HEALTHY"}, nil
-		},
 		countRunningInstancesFunc: func(nodeName string) (int, error) {
 			if nodeName != "WF.invoice@motherbee" {
 				t.Fatalf("unexpected node %q", nodeName)
@@ -110,7 +102,7 @@ func TestGetWorkflowStatusReturnsNodeState(t *testing.T) {
 	if status.WFNode.ActiveInstances == nil || *status.WFNode.ActiveInstances != 12 {
 		t.Fatalf("unexpected active instances %#v", status.WFNode.ActiveInstances)
 	}
-	if !status.WFNode.Running || !status.WFNode.StatusReachable || status.WFNode.HealthState != "HEALTHY" || status.WFNode.RuntimeVersion != "1" {
+	if !status.WFNode.Running || !status.WFNode.StatusReachable || status.WFNode.HealthState != "HEALTHY" || status.WFNode.RuntimeVersion != "0.0.1" {
 		t.Fatalf("unexpected wf node snapshot %#v", status.WFNode)
 	}
 }
@@ -120,22 +112,19 @@ func TestGetWorkflowStatusTreatsInstanceQueryTimeoutAsNonFatal(t *testing.T) {
 	if _, err := svc.CompileWorkflow(CompileRequest{WorkflowName: "invoice", Definition: validWorkflowDefinition()}); err != nil {
 		t.Fatalf("CompileWorkflow: %v", err)
 	}
-	svc.orchestrator = &fakeOrchestratorClient{
-		getNodeConfigFunc: func(_ context.Context, targetNode, nodeName string) (map[string]any, error) {
+	svc.nodes = &fakeNodeClient{
+		getNodeConfigFunc: func(_ context.Context, nodeName string) (map[string]any, error) {
 			return map[string]any{
 				"status": "ok",
 				"config": map[string]any{
 					"_system": map[string]any{
-						"runtime_version": "1",
+						"runtime_version": "0.0.1",
 					},
 				},
 			}, nil
 		},
 	}
 	svc.wfNodes = &fakeWFNodeClient{
-		getNodeStatusFunc: func(nodeName string) (wfNodeStatusProbe, error) {
-			return wfNodeStatusProbe{HealthState: "HEALTHY"}, nil
-		},
 		countRunningInstancesFunc: func(nodeName string) (int, error) {
 			return 0, errors.New("timeout")
 		},
@@ -155,22 +144,20 @@ func TestGetWorkflowStatusTreatsNodeStatusTimeoutAsNonFatal(t *testing.T) {
 	if _, err := svc.CompileWorkflow(CompileRequest{WorkflowName: "invoice", Definition: validWorkflowDefinition()}); err != nil {
 		t.Fatalf("CompileWorkflow: %v", err)
 	}
-	svc.orchestrator = &fakeOrchestratorClient{
-		getNodeConfigFunc: func(_ context.Context, targetNode, nodeName string) (map[string]any, error) {
+	svc.nodes = &fakeNodeClient{
+		getNodeConfigFunc: func(_ context.Context, nodeName string) (map[string]any, error) {
 			return map[string]any{
 				"status": "ok",
 				"config": map[string]any{
 					"_system": map[string]any{
-						"runtime_version": "1",
+						"runtime_version": "0.0.1",
 					},
 				},
 			}, nil
 		},
 	}
-	svc.wfNodes = &fakeWFNodeClient{
-		getNodeStatusFunc: func(nodeName string) (wfNodeStatusProbe, error) {
-			return wfNodeStatusProbe{}, context.DeadlineExceeded
-		},
+	svc.nodes.(*fakeNodeClient).getNodeStatusFunc = func(_ context.Context, nodeName string) (map[string]any, error) {
+		return nil, context.DeadlineExceeded
 	}
 
 	status, err := svc.GetWorkflowStatus(GetStatusRequest{WorkflowName: "invoice"})
@@ -187,22 +174,19 @@ func TestGetWorkflowStatusUsesNodeStatusForRunningEvenWhenInstanceQueryTimesOut(
 	if _, err := svc.CompileWorkflow(CompileRequest{WorkflowName: "invoice", Definition: validWorkflowDefinition()}); err != nil {
 		t.Fatalf("CompileWorkflow: %v", err)
 	}
-	svc.orchestrator = &fakeOrchestratorClient{
-		getNodeConfigFunc: func(_ context.Context, targetNode, nodeName string) (map[string]any, error) {
+	svc.nodes = &fakeNodeClient{
+		getNodeConfigFunc: func(_ context.Context, nodeName string) (map[string]any, error) {
 			return map[string]any{
 				"status": "ok",
 				"config": map[string]any{
 					"_system": map[string]any{
-						"runtime_version": "1",
+						"runtime_version": "0.0.1",
 					},
 				},
 			}, nil
 		},
 	}
 	svc.wfNodes = &fakeWFNodeClient{
-		getNodeStatusFunc: func(nodeName string) (wfNodeStatusProbe, error) {
-			return wfNodeStatusProbe{HealthState: "HEALTHY"}, nil
-		},
 		countRunningInstancesFunc: func(nodeName string) (int, error) {
 			return 0, errors.New("timeout")
 		},
@@ -228,8 +212,8 @@ func TestGetWorkflowStatusTreatsOrchestratorTimeoutAsNonFatal(t *testing.T) {
 	if _, err := svc.ApplyWorkflow(ApplyRequest{WorkflowName: "invoice"}); err != nil {
 		t.Fatalf("ApplyWorkflow: %v", err)
 	}
-	svc.orchestrator = &fakeOrchestratorClient{
-		getNodeConfigFunc: func(_ context.Context, targetNode, nodeName string) (map[string]any, error) {
+	svc.nodes = &fakeNodeClient{
+		getNodeConfigFunc: func(_ context.Context, nodeName string) (map[string]any, error) {
 			return nil, context.DeadlineExceeded
 		},
 	}
@@ -254,22 +238,19 @@ func TestListWorkflowStatusesReturnsStructuredItems(t *testing.T) {
 	if _, err := svc.ApplyWorkflow(ApplyRequest{WorkflowName: "invoice"}); err != nil {
 		t.Fatalf("ApplyWorkflow: %v", err)
 	}
-	svc.orchestrator = &fakeOrchestratorClient{
-		getNodeConfigFunc: func(_ context.Context, targetNode, nodeName string) (map[string]any, error) {
+	svc.nodes = &fakeNodeClient{
+		getNodeConfigFunc: func(_ context.Context, nodeName string) (map[string]any, error) {
 			return map[string]any{
 				"status": "ok",
 				"config": map[string]any{
 					"_system": map[string]any{
-						"runtime_version": "1",
+						"runtime_version": "0.0.1",
 					},
 				},
 			}, nil
 		},
 	}
 	svc.wfNodes = &fakeWFNodeClient{
-		getNodeStatusFunc: func(nodeName string) (wfNodeStatusProbe, error) {
-			return wfNodeStatusProbe{HealthState: "HEALTHY"}, nil
-		},
 		countRunningInstancesFunc: func(nodeName string) (int, error) {
 			return 3, nil
 		},

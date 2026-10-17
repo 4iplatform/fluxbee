@@ -473,9 +473,12 @@ impl ResponseItem {
 #[tokio::main]
 async fn main() -> Result<()> {
     let mut config = Config::from_env();
-    let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info,io_linkedhelper=info,fluxbee_sdk=info"));
-    tracing_subscriber::fmt().with_env_filter(env_filter).init();
+    let env_filter = tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+        tracing_subscriber::EnvFilter::new("info,io_linkedhelper=info,fluxbee_sdk=info")
+    });
+    fluxbee_sdk::logging::fmt()
+        .with_env_filter(env_filter)
+        .init();
 
     // Phase J'-0a: self ILK + tenant from orchestrator-injected env vars.
     let self_ilk_id = fluxbee_sdk::read_self_ilk_from_env();
@@ -518,9 +521,9 @@ async fn main() -> Result<()> {
             .map(str::trim)
             .filter(|value| !value.is_empty()),
     ) {
-        (Some(self_ilk), Some(hive_id)) => Some(Arc::new(VaultClient::new(
+        // The hive only validates the L2 name: the vault is the motherbee's wherever we run.
+        (Some(self_ilk), Some(_hive)) => Some(Arc::new(VaultClient::for_primary(
             dispatcher.clone(),
-            hive_id.to_string(),
             VaultCallerOwned::new(self_ilk.to_string(), config.node_name.clone()),
         ))),
         _ => None,
@@ -528,8 +531,9 @@ async fn main() -> Result<()> {
 
     let adapter_contract: Arc<dyn IoAdapterConfigContract> =
         Arc::new(IoLinkedHelperAdapterConfigContract);
-    let mut boot_state = bootstrap_io_control_plane_state(&config.state_dir, &config.node_name)
-        .unwrap_or_else(|err| {
+    let mut boot_state =
+        bootstrap_io_control_plane_state(&config.node_name, adapter_contract.as_ref())
+            .unwrap_or_else(|err| {
             tracing::warn!(
                 error = %err,
                 state_dir = %config.state_dir.display(),
@@ -1111,7 +1115,7 @@ async fn apply_linkedhelper_config_set(
     state.effective_config = Some(candidate);
     state.last_error = None;
 
-    if let Err(err) = persist_io_control_plane_state(state_dir, node_name, &state) {
+    if let Err(err) = persist_io_control_plane_state(node_name, &state) {
         let code = "persist_failed";
         let message = err.to_string();
         state.last_error = Some(IoControlPlaneErrorInfo {
@@ -2741,7 +2745,6 @@ fn build_system_reply(
             dst_ilk: incoming.meta.dst_ilk.clone(),
             ich: incoming.meta.ich.clone(),
             thread_id: incoming.meta.thread_id.clone(),
-            thread_seq: incoming.meta.thread_seq,
             ctx: None,
             ctx_seq: None,
             ctx_window: None,

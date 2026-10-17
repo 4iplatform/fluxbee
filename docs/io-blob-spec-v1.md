@@ -112,6 +112,14 @@ Producer request:
 Prohibido en params: `tenant_id`, `publisher_l2_name`, path, public key, sha256 filename, CSP crudo,
 headers crudos o edge row. Admin deriva/minta todo eso.
 
+**Superficie del productor AI (D1):** publicar es una **acción invocada por el modelo**, no un hook
+automático — no todo HTML generado termina publicado. `ai.generic` expone la tool
+`publish_html_page {filename, content}` (registrada sólo cuando el nodo tiene identidad resuelta):
+valida el HTML con el mismo gate que `generate_html_artifact`, escribe el blob (`put_bytes` +
+`promote`) y ejecuta `publish_artifact` contra `SY.admin` por el socket de malla, devolviendo la URL
+capability al modelo para que la entregue en su respuesta. Un IO/WF productor haría lo análogo con su
+propio disparador; el contrato admin es idéntico.
+
 ### 4.2 Admin -> IO.blob worker RPC
 
 Commands SYSTEM:
@@ -214,7 +222,7 @@ HTML+JS arbitrario sigue permitido dentro del sandbox; no obtiene APIs Fluxbee.
 
 ## 7. IO.blob worker
 
-`IO.blob` es singleton motherbee y no externaliza ICH. Config:
+`IO.blob` es un runtime managed motherbee-only y no externaliza ICH. Config:
 
 - `IO_BLOB_NODE_NAME` default `IO.blob`;
 - `IO_BLOB_ADMIN_HIVE` default hive local;
@@ -237,7 +245,8 @@ Responsabilidades:
 - resolver solo mediante `BlobToolkit`, nunca aceptar paths;
 - rechazar symlink/no-regular y size mismatch;
 - SHA-256 completo calculado por streaming;
-- escritura atomica y permisos `0640`;
+- escritura atómica por descriptor dentro de `blob/public` (temporal exclusivo y `linkat`), con el
+  dueño de esa carpeta y permisos `0640` (FINDINGS A-56);
 - ledger atomico, idempotencia y refcount;
 - release seguro y status operacional;
 - no Identity SHM, no tenant decision, no edge call, no public HTTP.
@@ -273,7 +282,9 @@ stream. HTML recibe la CSP fija de la seccion 6; ningun header viene del produce
 
 - Folder id nuevo: `fluxbee-blob-public`.
 - Source: motherbee `<blob.path>/public`, `sendonly`.
-- Destination: ingress `edge.blob_public_root`, `receiveonly`.
+- Destination: ingress `edge.blob_public_root`, `receiveonly`. Si la replica tiene cambios locales,
+  el watchdog del orchestrator del ingress los loguea y los revierte (`/rest/db/revert`): la carpeta
+  vuelve a la copia de la motherbee (A-16).
 - Peer point-to-point; no discovery/relay/NAT traversal automatico.
 - Nunca agregar ingress como device del folder `fluxbee-blob` (`active/`).
 - Un publish no termina hasta que edge puede abrir/verificar el archivo.
@@ -301,7 +312,7 @@ stream. HTML recibe la CSP fija de la seccion 6; ningun header viene del produce
 ## 11. Orden de implementacion
 
 1. **[IMPLEMENTADO LOCAL]** `IO.blob` curator worker: RPC admin-only, full SHA-256, atomic public copy,
-   ledger/refcount, unidad singleton y packaging.
+   ledger/refcount, y packaging como runtime managed.
 2. **[IMPLEMENTADO LOCAL]** `SY.admin publish_artifact/unpublish_artifact`: direct producer gate,
    Identity tenant resolve, command a IO.blob, durable publication ledger y help mesh-only en el
    catalogo Admin (fuera del executor HTTP).
@@ -309,9 +320,14 @@ stream. HTML recibe la CSP fija de la seccion 6; ningun header viene del produce
 4. **[IMPLEMENTADO LOCAL]** `SY.edge /public/:key` + BlobRow + readiness/hash ACK + headers/sandbox.
 5. **[VALIDADO LAB]** Infra E2E: `add_ingress` limpio, peer TCP conectado, replica one-way de HTML
    interactivo, reinicio, `GET`/`HEAD`/range/ETag/CSP y `remove_hive` sin drift de Syncthing.
-6. **[PENDIENTE SMOKE PRODUCTOR]** AI/IO real genera HTML y PDF y recorre
-   `publish_artifact`, expiry y `unpublish_artifact` sobre la malla instalada.
-7. **[FUTURO]** `mint_artifact_access` para validacion tenant por acceso mediante Cloud.
+6. **[IMPLEMENTADO]** Superficie productor + ciclo de vida completo (código compila, smoke en vivo
+   pendiente): tool `publish_html_page` en `ai.generic` (§4.1); GC de expiración admin-side
+   `run_publication_expiry_sweep` (cada 600s: `MSG_EDGE_UNPUBLISH_BLOB` + `MSG_BLOB_RELEASE`,
+   ledger→`expired`, idempotente); ruta operador `POST /artifacts/unpublish` (revoca cualquier
+   tenant, D2); y auditoría durable de `publish_artifact`/`unpublish_artifact` en el command-log.
+7. **[PENDIENTE SMOKE PRODUCTOR]** AI/IO real genera HTML y recorre `publish_artifact`, expiry y
+   `unpublish_artifact` sobre la malla instalada. Runbook: `lab/blob-public-smoke.md`.
+8. **[FUTURO]** `mint_artifact_access` para validacion tenant por acceso mediante Cloud.
 
 ## 12. Fuera de v1
 

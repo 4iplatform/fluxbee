@@ -1,4 +1,4 @@
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -6,7 +6,8 @@ use serde_json::{json, Value};
 use std::sync::Arc;
 
 use crate::protocol::{
-    Destination, Message, Meta, Routing, MSG_TTL_EXCEEDED, MSG_UNREACHABLE, SYSTEM_KIND,
+    Destination, Message, Meta, Routing, MSG_TTL_EXCEEDED, MSG_UNREACHABLE, PRIMARY_HIVE_ID,
+    SYSTEM_KIND,
 };
 use crate::rpc::{PendingMatcher, RouteMatch, RouterDispatcher, RpcError, RpcRequestLabels};
 use crate::NodeError;
@@ -27,6 +28,10 @@ pub const MSG_VAULT_ROTATE: &str = "VAULT_ROTATE";
 pub const MSG_VAULT_ROTATE_RESPONSE: &str = "VAULT_ROTATE_RESPONSE";
 pub const MSG_VAULT_ROLLBACK: &str = "VAULT_ROLLBACK";
 pub const MSG_VAULT_ROLLBACK_RESPONSE: &str = "VAULT_ROLLBACK_RESPONSE";
+/// Replace the nodes a secret is assigned to, without touching its value (docs/ilk-tenant-model-v1.md
+/// §2.2). Administrative: SY.admin (which relays Fluxbee Cloud) and SY.architect.
+pub const MSG_VAULT_ASSIGN: &str = "VAULT_ASSIGN";
+pub const MSG_VAULT_ASSIGN_RESPONSE: &str = "VAULT_ASSIGN_RESPONSE";
 
 /// Canonical resource types vault knows about. Drives the consumer-side
 /// match in Model D' (`resolve_resource(ResourceType::Openai, ...)` → vault
@@ -302,10 +307,15 @@ pub struct VaultMetadata {
     /// Model D' write paths; `None` only for legacy reads of older secrets.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resource_type: Option<String>,
-    /// Owner ILK in Model D'. `None` means the secret lives in the tenant's
-    /// pool and any caller of the same tenant can read it.
+    /// Owner ILK in Model D': a node, which reads it, or a person, whose secret it is (read by
+    /// the nodes it is assigned to). With no owner and no assigned node the secret is its tenant's
+    /// general secret: any node charged to the tenant reads it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ilk: Option<String>,
+    /// The nodes (ILKs) the secret is assigned to, besides its owner (docs/ilk-tenant-model-v1.md
+    /// §2.2). Each is charged to the secret's tenant.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub assigned_ilks: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -316,6 +326,17 @@ pub struct VaultMetadata {
     pub updated_at: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tags: Vec<String>,
+}
+
+/// `VAULT_ASSIGN`: replace the nodes a secret is assigned to (empty: none), in the tenant the
+/// request names; the value and the owner stay.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct VaultAssignRequest {
+    pub key: String,
+    pub tenant_id: String,
+    #[serde(default)]
+    pub assigned_ilks: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -378,10 +399,13 @@ pub struct VaultFilter {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resource_type: Option<String>,
     /// Filter by owner ILK. Pass `Some("ilk:<uuid>")` to match secrets
-    /// dedicated to that ILK; pass `Some("")` to match pool secrets
-    /// explicitly. `None` means "don't filter by owner".
+    /// dedicated to that ILK; pass `Some("")` to match general secrets (no owner and no assigned
+    /// node). `None` means "don't filter by owner".
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ilk: Option<String>,
+    /// Keep only the secrets assigned to this ILK.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub assigned_ilk: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tags: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -421,9 +445,21 @@ pub struct VaultKeyRequest {
     pub key: String,
 }
 
+/// VAULT_DELETE and VAULT_ROLLBACK: the key and the tenant the caller acts for. Every write names
+/// its tenant (a put through `metadata.tenant_id`): SY.vault refuses to touch a key that belongs to
+/// another tenant and answers as if it did not exist, so one tenant can never delete, roll back or
+/// rotate another's credential by naming it. Infrastructure keys live in the root tenant.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VaultScopedKeyRequest {
+    pub key: String,
+    pub tenant_id: String,
+}
+
+/// VAULT_ROTATE: like [`VaultScopedKeyRequest`], with the new value.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VaultRotateRequest {
     pub key: String,
+    pub tenant_id: String,
     pub value: Value,
 }
 
@@ -500,12 +536,109 @@ pub enum VaultError {
         target: String,
         timeout_ms: u64,
     },
+    /// The request never reached the vault: no route, no gateway, peer down.
+    ///
+    /// Distinct from [`VaultError::Service`] on purpose. Collapsing transport failures into
+    /// `Service` told every consumer "the vault reached a verdict" when in fact nothing came
+    /// back — and SY.edge, reading that, refused to retry a cert reload that a one-second WAN
+    /// blip had interrupted, abandoning a legitimate rotation until the certificate expired.
+    #[error("vault unreachable: reason={reason} original_dst={original_dst}")]
+    Unreachable {
+        reason: String,
+        original_dst: String,
+    },
+    /// The request expired in the mesh before arriving. Also transport, also not a verdict.
+    #[error("vault ttl exceeded: original_dst={original_dst} last_hop={last_hop}")]
+    TtlExceeded {
+        original_dst: String,
+        last_hop: String,
+    },
     #[error("vault returned error code={code} message={message}")]
     Service { code: String, message: String },
     #[error("invalid vault ref")]
     InvalidVaultRef,
     #[error("vault response missing value field for key={key}")]
     EmptyValue { key: String },
+}
+
+/// How long a boot-time consumer waits for the vault to become REACHABLE before starting
+/// degraded. Generous on purpose: the cost of waiting is a slower boot, while the cost of
+/// giving up too early is a node that stays broken until someone notices and restarts it.
+pub const VAULT_BOOT_WAIT: Duration = Duration::from_secs(60);
+/// Gap between reachability attempts while inside [`VAULT_BOOT_WAIT`].
+pub const VAULT_BOOT_RETRY_INTERVAL: Duration = Duration::from_millis(750);
+
+/// The charset SY.vault accepts for a secret key: `[a-z0-9:_-]`, first char `[a-z0-9]`, 1..=256
+/// bytes.
+///
+/// Lives here because the rule has TWO sides that ship in different cargo workspaces: SY.vault
+/// enforces it, and every consumer that names a key in config (IO.slack's `slack.auth.key`, and
+/// anything that follows the vault_ref family pattern) has to respect it. When only one side knew
+/// the rule, the io.slack test fixtures modelled `slack/IO.slack@motherbee` — four illegal
+/// characters — and stayed green forever because a unit test never calls the vault. Copying that
+/// example into a real hive gets `INVALID_REQUEST: invalid key format`.
+pub fn vault_key_is_valid(key: &str) -> bool {
+    let bytes = key.as_bytes();
+    if bytes.is_empty() || bytes.len() > 256 {
+        return false;
+    }
+    if !bytes[0].is_ascii_lowercase() && !bytes[0].is_ascii_digit() {
+        return false;
+    }
+    bytes
+        .iter()
+        .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || matches!(*b, b':' | b'_' | b'-'))
+}
+
+/// Vault key namespaces RESERVED for hive infrastructure — the Fluxbee Cloud provisioning relay
+/// (io.cloud `put_token` -> `vault_put`) must NEVER write one. These keys protect the mesh itself,
+/// so letting a semi-trusted (or compromised) Cloud caller overwrite one is a DoS/takeover surface,
+/// not the "store a provider token" operation put_token is for (io.cloud audit, MEDIUM):
+/// - `edge_channel_secret:<ich>` — the shared-secret bearer guarding each externalized endpoint,
+///   INCLUDING io.cloud's own Cloud endpoint; overwriting it breaks/hijacks the very door the
+///   request came through.
+/// - `edge_tls` — the edge's TLS material.
+/// - `ssh:<hive_id>` — held per-spoke SSH recovery keys until D32 removed that mode; nothing
+///   writes it now, and it stays reserved so no Cloud caller takes the name.
+/// - `edge_fanout_verify:<ich>` — the token the edge answers a fanout endpoint's verification
+///   challenge with (Meta's `hub.challenge`); overwriting it breaks or re-points that webhook.
+///
+/// This is NOT a general vault ACL: only the Cloud-relay origin is bound, for writes and deletes
+/// alike (enforced SERVER-SIDE in SY.admin's `enforce_cloud_relay_content`, mirrored in io.cloud
+/// for a clean early error). SY.* internals still write the edge keys normally. Lives here because both sides ship in different cargo
+/// workspaces and must agree — same reason as [`vault_key_is_valid`].
+pub const CLOUD_RESERVED_VAULT_KEY_PREFIXES: &[&str] = &[
+    "edge_channel_secret:",
+    "edge_tls",
+    "ssh:",
+    "edge_fanout_verify:",
+];
+
+/// True when `key` falls in a hive-infrastructure namespace the Cloud relay may never write
+/// ([`CLOUD_RESERVED_VAULT_KEY_PREFIXES`]). Prefix match (so `edge_tls` also covers `edge_tls:*`),
+/// case- and whitespace-insensitive so a stray-cased variant cannot slip past the guard.
+pub fn is_cloud_reserved_vault_key(key: &str) -> bool {
+    let key = key.trim().to_ascii_lowercase();
+    CLOUD_RESERVED_VAULT_KEY_PREFIXES
+        .iter()
+        .any(|prefix| key.starts_with(prefix))
+}
+
+/// True when nothing came back, as opposed to the vault answering.
+///
+/// Only these are worth retrying. Keep this the single definition of that split: SY.edge's TLS
+/// reload and the boot-time DB lookups all depend on "no verdict" meaning the same thing.
+pub fn vault_failure_is_transport(err: &VaultError) -> bool {
+    match err {
+        VaultError::Node(_)
+        | VaultError::ActionTimeout { .. }
+        | VaultError::Unreachable { .. }
+        | VaultError::TtlExceeded { .. } => true,
+        VaultError::Json(_)
+        | VaultError::Service { .. }
+        | VaultError::InvalidVaultRef
+        | VaultError::EmptyValue { .. } => false,
+    }
 }
 
 /// Identity of the caller of a vault L2 action.
@@ -549,6 +682,19 @@ fn ensure_ok(
             .unwrap_or("vault returned non-ok status")
             .to_string(),
     })
+}
+
+/// The vault's verdict, read from the raw reply BEFORE it is parsed as a success. An error reply
+/// carries only `status` / `error_code` / `message`, so parsing it first as a value or list
+/// response failed on the missing `key` / `count` and turned KEY_NOT_FOUND (or FORBIDDEN) into a
+/// JSON error — callers matching on the code never saw it.
+fn ensure_raw_ok(raw: &Value) -> Result<(), VaultError> {
+    let field = |name: &str| raw.get(name).and_then(Value::as_str);
+    ensure_ok(
+        field("status").unwrap_or_default(),
+        field("error_code"),
+        field("message"),
+    )
 }
 
 /// Owned variant of [`VaultCaller`]. The dispatcher-backed [`VaultClient`]
@@ -622,12 +768,26 @@ impl VaultClient {
         }
     }
 
+    /// Client for THE vault: `SY.vault@<primary hive>`. SY.vault runs only on the motherbee, so
+    /// a node on a worker/ingress/egress must not derive the target from its own hive (there is
+    /// no `SY.vault@worker1`; every lookup would go UNREACHABLE).
+    pub fn for_primary(dispatcher: Arc<RouterDispatcher>, caller: VaultCallerOwned) -> Self {
+        Self::new(dispatcher, PRIMARY_HIVE_ID, caller)
+    }
+
     pub fn caller(&self) -> VaultCaller<'_> {
         self.caller.as_borrowed()
     }
 
     pub fn hive_id(&self) -> &str {
         &self.hive_id
+    }
+
+    /// The canonical router dispatcher this client rides on. Exposed so in-mesh tools
+    /// (e.g. the AI publish action) can send an `ADMIN_COMMAND` to `SY.admin` over the
+    /// same socket without the node threading a second dispatcher handle.
+    pub fn dispatcher(&self) -> &std::sync::Arc<RouterDispatcher> {
+        &self.dispatcher
     }
 
     /// Vault target node for this client's hive: `SY.vault@<hive>`.
@@ -702,12 +862,8 @@ impl VaultClient {
         let raw = self
             .send_vault_action(MSG_VAULT_GET, MSG_VAULT_GET_RESPONSE, payload, timeout)
             .await?;
+        ensure_raw_ok(&raw)?;
         let parsed: VaultGetResponse = serde_json::from_value(raw)?;
-        ensure_ok(
-            &parsed.status,
-            parsed.error_code.as_deref(),
-            parsed.message.as_deref(),
-        )?;
         Ok(parsed)
     }
 
@@ -721,12 +877,8 @@ impl VaultClient {
         let raw = self
             .send_vault_action(MSG_VAULT_LIST, MSG_VAULT_LIST_RESPONSE, payload, timeout)
             .await?;
+        ensure_raw_ok(&raw)?;
         let parsed: VaultListResponse = serde_json::from_value(raw)?;
-        ensure_ok(
-            &parsed.status,
-            parsed.error_code.as_deref(),
-            parsed.message.as_deref(),
-        )?;
         Ok(parsed)
     }
 
@@ -735,6 +887,62 @@ impl VaultClient {
     /// 1. Dedicated secret for the caller's ILK (skipped when no ILK).
     /// 2. Pool secret for the caller's tenant.
     /// 3. Root-tenant pool secret (skipped when caller is already root).
+    /// [`Self::resolve_resource`], but waiting out a vault that is not up YET.
+    ///
+    /// Boot-time consumers (SY.storage, SY.identity) need a secret before they can serve
+    /// anything, and on a `.deb` upgrade systemd restarts the whole hive at once — so losing the
+    /// race against `sy-vault` is normal, not exceptional. The push-based rescue those consumers
+    /// already have (react to a later `VAULT_SECRET_CHANGED`) does not cover it: the vault's
+    /// bootstrap announcements are a ONE-SHOT event, and a consumer that was not yet listening
+    /// never gets a second one. It then sits degraded until a human restarts it — which is
+    /// exactly how a hive's admin plane stayed down behind `STORAGE_NOT_READY`.
+    ///
+    /// So: PULL until the vault actually answers, and only then let the caller judge the answer.
+    ///
+    /// Retries transport failures only. A vault that reached a verdict — "no such secret",
+    /// "denied", an unusable payload — will reach the same one on the next attempt, and spinning
+    /// on it would only delay an honest degraded start.
+    pub async fn resolve_resource_awaiting_vault(
+        &self,
+        resource: ResourceType,
+        my_tenant: &str,
+        timeout: Duration,
+        budget: Duration,
+        who: &str,
+    ) -> Result<Option<Value>, VaultError> {
+        let started_at = Instant::now();
+        loop {
+            let attempt = self
+                .resolve_resource(resource.clone(), my_tenant, timeout)
+                .await;
+            let err = match attempt {
+                Err(err) if vault_failure_is_transport(&err) => err,
+                other => return other,
+            };
+            let waited = started_at.elapsed();
+            if waited >= budget {
+                tracing::warn!(
+                    who = %who,
+                    waited_secs = waited.as_secs(),
+                    error = %err,
+                    "vault never became reachable within the boot budget; giving up"
+                );
+                return Err(err);
+            }
+            tracing::warn!(
+                who = %who,
+                waited_secs = waited.as_secs(),
+                budget_secs = budget.as_secs(),
+                error = %err,
+                "vault not reachable yet; retrying"
+            );
+            tokio::time::sleep(VAULT_BOOT_RETRY_INTERVAL).await;
+        }
+    }
+
+    /// The secret of `resource` this node uses (docs/ilk-tenant-model-v1.md §2.2): one it owns, else
+    /// one assigned to it, else its tenant's general secret. Never another tenant's: the genesis
+    /// tenant's general secrets are the core's, read by the core with the genesis tenant as theirs.
     pub async fn resolve_resource(
         &self,
         resource: ResourceType,
@@ -744,41 +952,19 @@ impl VaultClient {
         let resource_str = resource.as_str().to_string();
 
         if !self.caller.src_ilk.is_empty() {
-            if let Some(value) = self
-                .list_then_get_first(
-                    &resource_str,
-                    my_tenant,
-                    Some(self.caller.src_ilk.clone()),
-                    timeout,
-                )
-                .await?
-            {
-                return Ok(Some(value));
+            let me = self.caller.src_ilk.clone();
+            for (owner, assigned) in [(Some(me.clone()), None), (None, Some(me))] {
+                if let Some(value) = self
+                    .list_then_get_first(&resource_str, my_tenant, owner, assigned, timeout)
+                    .await?
+                {
+                    return Ok(Some(value));
+                }
             }
         }
 
-        if let Some(value) = self
-            .list_then_get_first(&resource_str, my_tenant, Some(String::new()), timeout)
-            .await?
-        {
-            return Ok(Some(value));
-        }
-
-        if my_tenant != crate::identity::DEFAULT_ROOT_TENANT_ID {
-            if let Some(value) = self
-                .list_then_get_first(
-                    &resource_str,
-                    crate::identity::DEFAULT_ROOT_TENANT_ID,
-                    Some(String::new()),
-                    timeout,
-                )
-                .await?
-            {
-                return Ok(Some(value));
-            }
-        }
-
-        Ok(None)
+        self.list_then_get_first(&resource_str, my_tenant, Some(String::new()), None, timeout)
+            .await
     }
 
     async fn list_then_get_first(
@@ -786,6 +972,7 @@ impl VaultClient {
         resource_type: &str,
         tenant_id: &str,
         ilk_filter: Option<String>,
+        assigned_filter: Option<String>,
         timeout: Duration,
     ) -> Result<Option<Value>, VaultError> {
         let filter = VaultFilter {
@@ -793,6 +980,7 @@ impl VaultClient {
             tenant_id: Some(tenant_id.to_string()),
             resource_type: Some(resource_type.to_string()),
             ilk: ilk_filter,
+            assigned_ilk: assigned_filter,
             tags: Vec::new(),
             limit: Some(1),
         };
@@ -823,6 +1011,20 @@ fn map_rpc_error(err: RpcError) -> VaultError {
             target,
             timeout_ms,
         },
+        RpcError::Unreachable {
+            reason,
+            original_dst,
+        } => VaultError::Unreachable {
+            reason,
+            original_dst,
+        },
+        RpcError::TtlExceeded {
+            original_dst,
+            last_hop,
+        } => VaultError::TtlExceeded {
+            original_dst,
+            last_hop,
+        },
         other => VaultError::Service {
             code: "VAULT_RPC_ERROR".to_string(),
             message: other.to_string(),
@@ -833,6 +1035,37 @@ fn map_rpc_error(err: RpcError) -> VaultError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cloud_reserved_vault_keys_are_blocked_but_provider_tokens_pass() {
+        // The concrete exploit surface: an endpoint's own bearer, edge TLS, and spoke recovery keys.
+        for reserved in [
+            "edge_channel_secret:ich:14b66389-d425-531c-a140-a591d25e8f39",
+            "edge_tls",
+            "edge_tls:motherbee",
+            "ssh:motherbee",
+            "edge_fanout_verify:ich:14b66389-d425-531c-a140-a591d25e8f39",
+            "  EDGE_CHANNEL_SECRET:ich:abc  ", // stray case/whitespace must not slip past
+        ] {
+            assert!(
+                is_cloud_reserved_vault_key(reserved),
+                "expected {reserved:?} to be reserved"
+            );
+        }
+        // Legitimate provider tokens the Cloud relay is MEANT to store must still pass.
+        for ok in [
+            "slack:auth:bot",
+            "openai",
+            "bearer_token",
+            "acme:stripe:key",
+            "sshkey_for_tenant", // does not start with the reserved `ssh:` namespace
+        ] {
+            assert!(
+                !is_cloud_reserved_vault_key(ok),
+                "expected {ok:?} to be allowed"
+            );
+        }
+    }
 
     #[test]
     fn resource_type_known_values_round_trip_as_wire_strings() {
@@ -1056,6 +1289,69 @@ mod tests {
         }
     }
 
+    /// SY.vault's real error reply (`error_payload` in sy_vault.rs): status, error_code, message —
+    /// no key, no count. Seen live on 2026-09-30 as "json error: missing field `key`", which hid
+    /// KEY_NOT_FOUND from io-slack / io-wapp.
+    #[tokio::test]
+    async fn vault_error_reply_keeps_the_verdict() {
+        let (dispatcher, mut harness) =
+            crate::rpc::RouterDispatcherTestHarness::new("SY.test@motherbee", vault_test_profile());
+        let client = VaultClient::new(dispatcher.clone(), "motherbee".to_string(), caller());
+        let error_reply = |trace_id: &str, msg: &str| Message {
+            routing: Routing {
+                src: "vault-uuid".to_string(),
+                src_l2_name: Some("SY.vault@motherbee".to_string()),
+                dst: Destination::Unicast("SY.test@motherbee".to_string()),
+                ttl: 16,
+                trace_id: trace_id.to_string(),
+            },
+            meta: Meta {
+                msg_type: SYSTEM_KIND.to_string(),
+                msg: Some(msg.to_string()),
+                ..Meta::default()
+            },
+            payload: json!({
+                "status": "error",
+                "error_code": "KEY_NOT_FOUND",
+                "message": "key not found",
+            }),
+        };
+
+        let get = tokio::spawn({
+            let client = client.clone();
+            async move { client.get("openai_api_key", Duration::from_secs(2)).await }
+        });
+        let out = harness
+            .next_outgoing_within(Duration::from_secs(2))
+            .await
+            .expect("get reaches the wire");
+        harness
+            .inject(error_reply(&out.routing.trace_id, MSG_VAULT_GET_RESPONSE))
+            .await
+            .expect("inject get reply");
+        match get.await.expect("get task") {
+            Err(VaultError::Service { code, .. }) => assert_eq!(code, "KEY_NOT_FOUND"),
+            other => panic!("expected the vault's KEY_NOT_FOUND, got {other:?}"),
+        }
+
+        let list = tokio::spawn({
+            let client = client.clone();
+            async move { client.list(None, Duration::from_secs(2)).await }
+        });
+        let out = harness
+            .next_outgoing_within(Duration::from_secs(2))
+            .await
+            .expect("list reaches the wire");
+        harness
+            .inject(error_reply(&out.routing.trace_id, MSG_VAULT_LIST_RESPONSE))
+            .await
+            .expect("inject list reply");
+        match list.await.expect("list task") {
+            Err(VaultError::Service { code, .. }) => assert_eq!(code, "KEY_NOT_FOUND"),
+            other => panic!("expected the vault's verdict, got {other:?}"),
+        }
+    }
+
     #[test]
     fn vault_response_serialization_parses_standard_error_shape() {
         let raw = r#"{
@@ -1070,5 +1366,79 @@ mod tests {
         assert_eq!(response.error_code.as_deref(), Some("UNAUTHORIZED"));
         assert_eq!(response.message.as_deref(), Some("denied"));
         assert!(response.secrets.is_empty());
+    }
+
+    /// The two failures SY.storage ACTUALLY hit on the live motherbee, verbatim from its
+    /// journal, on a `.deb` upgrade that restarted vault and storage at the same instant:
+    ///
+    ///   vault resource lookup for postgres failed: vault unreachable:
+    ///     reason=NODE_NOT_FOUND original_dst=SY.vault@motherbee
+    ///   vault resource lookup for postgres failed: node error: disconnected
+    ///
+    /// Both mean "the vault had not announced yet", and both must be retryable. Six occurrences
+    /// in one journal — losing this race is the NORMAL outcome of a simultaneous restart, not a
+    /// rare one, and each left the hive's admin plane down behind STORAGE_NOT_READY until a
+    /// human intervened.
+    #[test]
+    fn the_boot_race_failures_observed_in_production_are_retryable() {
+        let node_not_found = VaultError::Unreachable {
+            reason: "NODE_NOT_FOUND".to_string(),
+            original_dst: "SY.vault@motherbee".to_string(),
+        };
+        assert!(
+            vault_failure_is_transport(&node_not_found),
+            "NODE_NOT_FOUND is the router saying the vault has not announced yet, not a verdict"
+        );
+        assert!(
+            node_not_found.to_string().contains("NODE_NOT_FOUND"),
+            "the journal line this test is pinned to must stay recognizable"
+        );
+
+        let disconnected = VaultError::Node(NodeError::Disconnected);
+        assert!(
+            vault_failure_is_transport(&disconnected),
+            "a dropped connection carries no verdict either"
+        );
+    }
+
+    /// The other half: a vault that ANSWERED must not be retried. Spinning on a settled verdict
+    /// would only delay an honest degraded start, and would turn "there is no secret" — a real
+    /// operator condition — into a node that hangs for the whole boot budget on every start.
+    #[test]
+    fn a_vault_that_answered_is_never_retried() {
+        for settled in [
+            VaultError::Service {
+                code: "FORBIDDEN".to_string(),
+                message: "denied".to_string(),
+            },
+            VaultError::InvalidVaultRef,
+            VaultError::EmptyValue {
+                key: "postgres".to_string(),
+            },
+        ] {
+            assert!(
+                !vault_failure_is_transport(&settled),
+                "{settled} is a verdict; retrying it would just stall the boot"
+            );
+        }
+    }
+
+    /// Waiting must be bounded. A vault that never comes up has to end in a degraded start, not
+    /// a process that hangs forever holding the hive's admin plane hostage.
+    #[test]
+    fn the_boot_wait_is_bounded_and_polls_more_than_once() {
+        assert!(
+            VAULT_BOOT_WAIT >= Duration::from_secs(30),
+            "too short a budget re-creates the bug on a slow boot"
+        );
+        assert!(
+            VAULT_BOOT_WAIT <= Duration::from_secs(300),
+            "the wait must stay bounded so a vaultless hive still finishes booting"
+        );
+        assert!(
+            VAULT_BOOT_RETRY_INTERVAL > Duration::ZERO
+                && VAULT_BOOT_RETRY_INTERVAL * 10 <= VAULT_BOOT_WAIT,
+            "the budget must allow many attempts, not one or two"
+        );
     }
 }

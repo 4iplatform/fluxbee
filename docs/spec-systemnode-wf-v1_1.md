@@ -877,13 +877,22 @@ Completed / cancelled / failed instances remain in the database for read-only in
 
 ### 14.1 Node startup
 
-1. Connect to local router via `fluxbee-go-sdk`.
-2. Register identity via `ILK_REGISTER` (orchestrator-mediated at spawn time).
-3. Load workflow definition from config (the workflow definition JSON for this node type).
-4. Compile against CEL environment. Fail startup if validation fails.
-5. Open `wf_instances.db`, restore running instances.
-6. Start receive loop.
-7. Start periodic GC task (sweeps terminated instances older than retention).
+The WF node runs on the managed control plane of the Go SDK (`go/fluxbee-go-sdk/managed_control_plane.go`), the same model as the AI and IO nodes (`docs/wf-standard-path-v1.md`, since 0.1.70):
+
+1. Read `config.json` (`nodes/WF/<node@hive>/config.json`, from `FLUXBEE_NODE_NAME`). Its identity was registered by the orchestrator at spawn (`ILK_REGISTER`).
+2. Validate it: the operator's config (unknown keys are refused), made concrete with what `_system` says (the package, the hive), and the workflow definition, loaded from `_system.package_path/flow/definition.json` and compiled against the CEL environment. The node reads `_system` leniently and never rewrites it, so a key the orchestrator adds never stops it.
+3. Connect to the local router via `fluxbee-go-sdk`, **whatever the result**.
+4. With a config in use (`CONFIGURED`): open `wf_instances.db`, restore running instances, start the periodic GC task (it sweeps terminated instances older than retention), and enter the receive loop.
+5. With a config the node cannot use (`FAILED_CONFIG`: `invalid_config`, or `invalid_definition` for a missing or broken definition), it stays up and answers control messages only:
+   - `NODE_STATUS_GET`: `DEGRADED` plus `last_error`;
+   - `CONFIG_GET`: the state and the error;
+   - `CONFIG_SET`: validated and persisted;
+   - `WF_*` requests: `node_not_configured`;
+   - workflow traffic: logged and dropped.
+
+   A restart applies a corrected config. A redeploy through SY.wf-rules does that: it rebinds the node and restarts it. Before 0.1.70 the node exited and systemd relaunched it every 5 s, so the reason reached only journald.
+
+Opening the store and recovering instances are still fatal at startup.
 
 ### 14.2 Event processing loop
 
@@ -897,7 +906,7 @@ loop {
 
 Handlers:
 
-- `NODE_STATUS_GET` — standard, responds with health.
+- `NODE_STATUS_GET` — the health of its config state: `HEALTHY` when `CONFIGURED`, `DEGRADED` with `last_error` otherwise (the orchestrator's `get_node_status` reports both).
 - `WF_HELP` — returns the workflow HELP descriptor.
 - `WF_CANCEL_INSTANCE` — initiates soft abort.
 - `WF_GET_INSTANCE` — returns instance info (state, status, variables, recent log).
@@ -1591,7 +1600,7 @@ These are not arbitrary — they reflect what a sane workflow should stay within
 | Control plane (CONFIG_GET/SET) | `node-config-control-plane-spec.md` |
 | Conceptual model for claims (future) | `fluxbee_identity_claims_normative_model.md` |
 
-Operational note: for managed `WF.*` nodes, `GET /hives/{hive}/nodes/{node_name}/config` reads the persisted effective `config.json`, while `POST /hives/{hive}/nodes/{node_name}/control/config-get` / `config-set` is the live node-owned control-plane path. In `WF v1`, `CONFIG_SET` is boot-time only and returns `restart_required`.
+Operational note: for managed `WF.*` nodes, `GET /hives/{hive}/nodes/{node_name}/config` reads the persisted effective `config.json`, while `POST /hives/{hive}/nodes/{node_name}/control/config-get` / `config-set` is the live node-owned control-plane path. In `WF v1`, `CONFIG_SET` is boot-time only: it validates and persists the config and answers `restart_required: true`; `CONFIG_GET` shows it under `pending_restart` until a restart applies it. Errors are `{code, message}` with the IO family's codes (`invalid_config`, `invalid_definition`, `stale_config_version`, `unsupported_apply_mode`, `managed_package_path_locked`, `config_persist_error`); a `config_version` must be newer than the node's, `0` meaning the next one.
 
 ---
 

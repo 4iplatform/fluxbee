@@ -1,11 +1,7 @@
 package node
 
 import (
-	"bytes"
-	"encoding/json"
 	"fmt"
-	"os"
-	"path/filepath"
 	"strings"
 
 	sdk "github.com/4iplatform/json-router/fluxbee-go-sdk"
@@ -13,131 +9,62 @@ import (
 
 const wfConfigSchemaVersion uint32 = 1
 
-func cloneConfig(cfg *Config) *Config {
-	if cfg == nil {
-		return nil
+// Codes of the CONFIG_GET / CONFIG_SET replies, the IO family's (lowercase, in {code, message}).
+const (
+	errCodeUnsupportedApplyMode = "unsupported_apply_mode"
+	errCodeStaleConfigVersion   = "stale_config_version"
+	errCodeConfigPersistError   = "config_persist_error"
+	errCodeNodeNotConfigured    = "node_not_configured"
+)
+
+// buildWFConfigGetPayload answers CONFIG_GET: the node's config state and what it runs with.
+func buildWFConfigGetPayload(nodeName string, plane *ControlPlane) map[string]any {
+	materialized := plane.Configured()
+	var effective any
+	if materialized != nil {
+		effective = effectiveConfigView(&materialized.Config)
 	}
-	copy := *cfg
-	copy.System = cloneManagedSystemConfig(cfg.System)
-	return &copy
+	var lastError any
+	if plane.State.LastError != nil {
+		lastError = plane.State.LastError
+	}
+	payload := map[string]any{
+		"ok":               materialized != nil,
+		"node_name":        nodeName,
+		"state":            plane.State.CurrentState,
+		"schema_version":   wfConfigSchemaVersion,
+		"config_version":   plane.State.ConfigVersion,
+		"effective_config": effective,
+		"contract":         wfConfigContract(plane.PackagePath),
+		"error":            lastError,
+	}
+	if plane.pendingVersion > plane.State.ConfigVersion {
+		payload["pending_restart"] = map[string]any{"config_version": plane.pendingVersion}
+	}
+	return payload
 }
 
-func cloneManagedSystemConfig(system *ManagedSystemConfig) *ManagedSystemConfig {
-	if system == nil {
-		return nil
+func effectiveConfigView(cfg *Config) map[string]any {
+	source := "config"
+	if cfg.IsManagedPackageMode() {
+		source = "managed_package"
 	}
-	copy := *system
-	return &copy
+	return map[string]any{
+		"workflow_definition_path":   cfg.WorkflowDefinitionPath,
+		"workflow_definition_source": source,
+		"db_path":                    cfg.DBPath,
+		"sy_timer_l2_name":           cfg.SYTimerL2Name,
+		"tenant_id":                  cfg.TenantID,
+		"gc_retention_days":          cfg.GCRetentionDays,
+		"gc_interval_seconds":        cfg.GCIntervalSeconds,
+		"managed_package_mode":       cfg.IsManagedPackageMode(),
+		"package_path":               cfg.PackagePath,
+		"package_definition_path":    cfg.PackageDefinitionPath(),
+	}
 }
 
-func loadConfigFromPayload(payload []byte, configPath string, system *ManagedSystemConfig) (*Config, error) {
-	var cfg Config
-	dec := json.NewDecoder(bytes.NewReader(payload))
-	dec.DisallowUnknownFields()
-	if err := dec.Decode(&cfg); err != nil {
-		return nil, err
-	}
-	if cfg.System == nil {
-		cfg.System = cloneManagedSystemConfig(system)
-	} else if system != nil {
-		merged := *cloneManagedSystemConfig(system)
-		if cfg.System.ManagedBy != "" {
-			merged.ManagedBy = cfg.System.ManagedBy
-		}
-		if cfg.System.NodeName != "" {
-			merged.NodeName = cfg.System.NodeName
-		}
-		if cfg.System.HiveID != "" {
-			merged.HiveID = cfg.System.HiveID
-		}
-		if cfg.System.RelaunchOnBoot {
-			merged.RelaunchOnBoot = true
-		}
-		if cfg.System.ConfigVersion != 0 {
-			merged.ConfigVersion = cfg.System.ConfigVersion
-		}
-		if cfg.System.CreatedAtMS != 0 {
-			merged.CreatedAtMS = cfg.System.CreatedAtMS
-		}
-		if cfg.System.UpdatedAtMS != 0 {
-			merged.UpdatedAtMS = cfg.System.UpdatedAtMS
-		}
-		if cfg.System.Runtime != "" {
-			merged.Runtime = cfg.System.Runtime
-		}
-		if cfg.System.RuntimeVersion != "" {
-			merged.RuntimeVersion = cfg.System.RuntimeVersion
-		}
-		if cfg.System.RuntimeBase != "" {
-			merged.RuntimeBase = cfg.System.RuntimeBase
-		}
-		if cfg.System.PackagePath != "" {
-			merged.PackagePath = cfg.System.PackagePath
-		}
-		if cfg.System.IlkID != "" {
-			merged.IlkID = cfg.System.IlkID
-		}
-		if cfg.System.TenantID != "" {
-			merged.TenantID = cfg.System.TenantID
-		}
-		cfg.System = &merged
-	}
-	if err := finalizeConfig(&cfg, configPath); err != nil {
-		return nil, err
-	}
-	if cfg.GCRetentionDays <= 0 {
-		cfg.GCRetentionDays = 7
-	}
-	if cfg.GCIntervalSeconds <= 0 {
-		cfg.GCIntervalSeconds = 3600
-	}
-	return &cfg, nil
-}
-
-func configVersion(cfg *Config) uint64 {
-	if cfg == nil || cfg.System == nil {
-		return 0
-	}
-	return cfg.System.ConfigVersion
-}
-
-func setConfigVersion(cfg *Config, version uint64) {
-	if cfg == nil {
-		return
-	}
-	if cfg.System == nil {
-		cfg.System = &ManagedSystemConfig{}
-	}
-	cfg.System.ConfigVersion = version
-}
-
-func buildWFConfigGetPayload(nodeName string, cfg *Config) map[string]any {
-	version := configVersion(cfg)
-	state := "configured"
-	if cfg == nil {
-		state = "unconfigured"
-	}
-	managedPackage := IsManagedPackageMode(cfg)
-	workflowSource := "config"
-	packagePath := ""
-	packageDefPath := ""
-	if managedPackage {
-		workflowSource = "managed_package"
-		packagePath = managedPackagePath(cfg)
-		packageDefPath = PackageDefinitionPath(cfg)
-	}
-	effectiveConfig := map[string]any{
-		"workflow_definition_path":        stringOrEmpty(cfg, func(c *Config) string { return c.WorkflowDefinitionPath }),
-		"workflow_definition_source":      workflowSource,
-		"db_path":                         stringOrEmpty(cfg, func(c *Config) string { return c.DBPath }),
-		"sy_timer_l2_name":                stringOrEmpty(cfg, func(c *Config) string { return c.SYTimerL2Name }),
-		"tenant_id":                       stringOrEmpty(cfg, func(c *Config) string { return c.TenantID }),
-		"gc_retention_days":               intOrZero(cfg, func(c *Config) int { return c.GCRetentionDays }),
-		"gc_interval_seconds":             intOrZero(cfg, func(c *Config) int { return c.GCIntervalSeconds }),
-		"managed_package_mode":            managedPackage,
-		"package_path":                    packagePath,
-		"package_definition_path":         packageDefPath,
-	}
+func wfConfigContract(packagePath string) map[string]any {
+	managedPackage := packagePath != ""
 	contract := map[string]any{
 		"supports":               []string{sdk.MSGConfigGet, sdk.MSGConfigSet},
 		"target":                 sdk.NodeConfigControlTarget,
@@ -152,155 +79,92 @@ func buildWFConfigGetPayload(nodeName string, cfg *Config) map[string]any {
 		contract["workflow_definition_path_locked"] = true
 		contract["notes"] = []string{
 			"workflow_definition_path is package-native in managed mode: derived from _system.package_path/flow/definition.json.",
-			"CONFIG_SET attempts to mutate workflow_definition_path are rejected with MANAGED_PACKAGE_PATH_LOCKED.",
+			"A CONFIG_SET that points workflow_definition_path elsewhere is refused with " + ErrCodeManagedPackagePathLocked + ".",
 			"Operator-facing source of truth in managed mode is the workflow package, not the local config field.",
 		}
 	}
-	return map[string]any{
-		"ok":               true,
-		"node_name":        nodeName,
-		"state":            state,
-		"schema_version":   wfConfigSchemaVersion,
-		"config_version":   version,
-		"effective_config": effectiveConfig,
-		"contract":         contract,
-	}
+	return contract
 }
 
-func applyWFConfigSet(configPath, nodeName string, current *Config, request *sdk.NodeConfigSetPayload) (map[string]any, *Config, error) {
-	if request == nil {
-		return nil, nil, fmt.Errorf("config set request is nil")
-	}
+// applyWFConfigSet validates a CONFIG_SET and persists it, and returns the reply. WF applies its
+// config at boot, so the running config does not change: the reply says a restart applies it. A
+// rejected CONFIG_SET changes nothing.
+func applyWFConfigSet(nodeName string, plane *ControlPlane, request *sdk.NodeConfigSetPayload) map[string]any {
 	if request.ApplyMode != "" && request.ApplyMode != sdk.NodeConfigApplyModeReplace {
-		return wfConfigErrorPayload(nodeName, "UNSUPPORTED_APPLY_MODE", fmt.Sprintf("unsupported apply_mode: %s", request.ApplyMode), request.ConfigVersion), nil, nil
+		return wfConfigErrorPayload(nodeName, plane, errCodeUnsupportedApplyMode, fmt.Sprintf("unsupported apply_mode %q; this node supports replace", request.ApplyMode))
 	}
-	configMap, ok := request.Config.(map[string]any)
+	candidate, ok := request.Config.(map[string]any)
 	if !ok {
-		return wfConfigErrorPayload(nodeName, "INVALID_CONFIG_SET", "config must be a JSON object", request.ConfigVersion), nil, nil
+		return wfConfigErrorPayload(nodeName, plane, sdk.ErrCodeInvalidConfig, "config must be a JSON object")
 	}
-	if _, exists := configMap["_system"]; exists {
-		return wfConfigErrorPayload(nodeName, "INVALID_CONFIG_SET", "_system is managed by orchestrator and cannot be changed via CONFIG_SET", request.ConfigVersion), nil, nil
+	if _, present := candidate["_system"]; present {
+		return wfConfigErrorPayload(nodeName, plane, sdk.ErrCodeInvalidConfig, "_system is the orchestrator's and cannot be set via CONFIG_SET")
 	}
-	// Package-native binding: when running as a managed workflow package the
-	// definition path is derived from `_system.package_path/flow/definition.json`
-	// and is not operator-controlled. A CONFIG_SET attempt to mutate it (to a
-	// value other than the package-resolved path) is rejected up-front so the
-	// operator gets a clear error instead of a silently-ignored field.
-	if IsManagedPackageMode(current) {
-		if raw, exists := configMap["workflow_definition_path"]; exists {
-			supplied, _ := raw.(string)
-			supplied = strings.TrimSpace(supplied)
-			expected := PackageDefinitionPath(current)
-			if supplied != "" && supplied != expected {
-				return wfConfigErrorPayload(
-					nodeName,
-					"MANAGED_PACKAGE_PATH_LOCKED",
-					fmt.Sprintf("workflow_definition_path is package-native in managed mode (expected %q, got %q); CONFIG_SET cannot mutate it. Republish the workflow package to change the definition.", expected, supplied),
-					request.ConfigVersion,
-				), nil, nil
-			}
+	if len(candidate) == 0 {
+		return wfConfigErrorPayload(nodeName, plane, sdk.ErrCodeInvalidConfig, "config must not be empty")
+	}
+	latest := plane.latestVersion()
+	next := request.ConfigVersion
+	if next == 0 {
+		next = latest + 1
+	} else if next <= latest {
+		return wfConfigErrorPayload(nodeName, plane, errCodeStaleConfigVersion, fmt.Sprintf("config_version %d is not newer than %d", next, latest))
+	}
+
+	system := readSystemBlock(plane.ConfigPath)
+	packagePath := sdk.ManagedSystemString(system, "package_path")
+	if packagePath != "" {
+		if supplied, _ := candidate["workflow_definition_path"].(string); strings.TrimSpace(supplied) != "" && strings.TrimSpace(supplied) != packageDefinitionPath(packagePath) {
+			return wfConfigErrorPayload(nodeName, plane, ErrCodeManagedPackagePathLocked, fmt.Sprintf(
+				"workflow_definition_path is the workflow package's in managed mode (%q, got %q); republish the workflow package to change the definition",
+				packageDefinitionPath(packagePath), strings.TrimSpace(supplied)))
 		}
 	}
-	if len(configMap) == 0 {
-		return wfConfigErrorPayload(nodeName, "INVALID_CONFIG_SET", "config must not be empty", request.ConfigVersion), nil, nil
-	}
-
-	payload, err := json.Marshal(configMap)
+	accepted, err := plane.contract.ValidateAndMaterialize(candidate, system)
 	if err != nil {
-		return nil, nil, fmt.Errorf("marshal config set payload: %w", err)
-	}
-	nextCfg, err := loadConfigFromPayload(payload, configPath, cloneManagedSystemConfig(current.System))
-	if err != nil {
-		return wfConfigErrorPayload(nodeName, "INVALID_CONFIG_SET", err.Error(), request.ConfigVersion), nil, nil
-	}
-
-	nextVersion := request.ConfigVersion
-	if nextVersion == 0 {
-		nextVersion = configVersion(current) + 1
-		if nextVersion == 0 {
-			nextVersion = 1
+		code, message := sdk.ErrCodeInvalidConfig, err.Error()
+		if planeErr, ok := err.(*sdk.ControlPlaneError); ok {
+			code, message = planeErr.Code, planeErr.Message
 		}
+		return wfConfigErrorPayload(nodeName, plane, code, message)
 	}
-	setConfigVersion(nextCfg, nextVersion)
-	if err := persistConfigFile(configPath, nextCfg); err != nil {
-		return nil, nil, fmt.Errorf("persist config set: %w", err)
+	materialized := accepted.(*Materialized)
+	persisted, err := persistableOperatorConfig(materialized.Operator, materialized.Config.IsManagedPackageMode())
+	if err == nil {
+		err = sdk.PersistManagedConfig(plane.ConfigPath, next, persisted)
 	}
+	if err != nil {
+		return wfConfigErrorPayload(nodeName, plane, errCodeConfigPersistError, err.Error())
+	}
+	plane.pendingVersion = next
 
+	// The node's own state does not change until a restart applies the config: a node in
+	// FAILED_CONFIG stays there (and DEGRADED), it is not healthy yet.
 	return map[string]any{
 		"ok":               true,
 		"node_name":        nodeName,
-		"state":            "restart_required",
+		"state":            plane.State.CurrentState,
 		"schema_version":   wfConfigSchemaVersion,
-		"config_version":   nextVersion,
+		"config_version":   next,
+		"effective_config": effectiveConfigView(&materialized.Config),
+		"contract":         wfConfigContract(materialized.Config.PackagePath),
+		"error":            nil,
 		"restart_required": true,
 		"applied":          false,
-		"effective_config": buildWFConfigGetPayload(nodeName, nextCfg)["effective_config"],
-		"contract":         buildWFConfigGetPayload(nodeName, nextCfg)["contract"],
-	}, nextCfg, nil
+		"pending_restart":  map[string]any{"config_version": next},
+	}
 }
 
-func persistConfigFile(path string, cfg *Config) error {
-	if strings.TrimSpace(path) == "" {
-		return fmt.Errorf("config path is required")
-	}
-	raw := map[string]any{}
-	if data, err := os.ReadFile(path); err == nil && len(data) > 0 {
-		_ = json.Unmarshal(data, &raw)
-	}
-
-	raw["workflow_definition_path"] = cfg.WorkflowDefinitionPath
-	raw["db_path"] = cfg.DBPath
-	raw["sy_timer_l2_name"] = cfg.SYTimerL2Name
-	raw["gc_retention_days"] = cfg.GCRetentionDays
-	raw["gc_interval_seconds"] = cfg.GCIntervalSeconds
-	if strings.TrimSpace(cfg.TenantID) != "" {
-		raw["tenant_id"] = cfg.TenantID
-	} else {
-		delete(raw, "tenant_id")
-	}
-	if cfg.System != nil {
-		raw["_system"] = cfg.System
-		raw["config_version"] = cfg.System.ConfigVersion
-	}
-
-	data, err := json.MarshalIndent(raw, "", "  ")
-	if err != nil {
-		return fmt.Errorf("marshal config file: %w", err)
-	}
-	data = append(data, '\n')
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
-		return fmt.Errorf("create config dir: %w", err)
-	}
-	if err := os.WriteFile(path, data, 0o644); err != nil {
-		return fmt.Errorf("write config file: %w", err)
-	}
-	return nil
-}
-
-func wfConfigErrorPayload(nodeName, code, detail string, version uint64) map[string]any {
+// wfConfigErrorPayload is a refused CONFIG_GET or CONFIG_SET: the node's own state and version,
+// and why ({code, message}, which SY.admin reports).
+func wfConfigErrorPayload(nodeName string, plane *ControlPlane, code, message string) map[string]any {
 	return map[string]any{
-		"ok":             false,
-		"node_name":      nodeName,
-		"state":          "error",
-		"schema_version": wfConfigSchemaVersion,
-		"config_version": version,
-		"error": map[string]any{
-			"code":   code,
-			"detail": detail,
-		},
+		"ok":               false,
+		"node_name":        nodeName,
+		"state":            plane.State.CurrentState,
+		"schema_version":   wfConfigSchemaVersion,
+		"config_version":   plane.State.ConfigVersion,
+		"effective_config": nil,
+		"error":            sdk.ControlPlaneError{Code: code, Message: message},
 	}
-}
-
-func stringOrEmpty(cfg *Config, fn func(*Config) string) string {
-	if cfg == nil {
-		return ""
-	}
-	return fn(cfg)
-}
-
-func intOrZero(cfg *Config, fn func(*Config) int) int {
-	if cfg == nil {
-		return 0
-	}
-	return fn(cfg)
 }

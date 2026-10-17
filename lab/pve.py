@@ -27,7 +27,9 @@ Examples:
   pve.py exec 201 -- 'fluxbee-firstboot'
   pve.py exec 201 -- 'curl -s localhost:8080/hives'
   pve.py push 201 ./packaging/fluxbee-firstboot /usr/local/bin/x
-  pve.py snapshot 201 clean-install
+  pve.py snapshots 201                        # oldest first, with dates
+  pve.py snapshot 201 clean-install           # refuses a 4th (rule: max 3 per VM)
+  pve.py delsnapshot 201 <oldest>             # irreversible: always on purpose
   pve.py rollback 201 clean-install
   pve.py ip 201
   pve.py destroy 201
@@ -58,6 +60,13 @@ def _need_env():
                  "\nexport PVE_HOST=... PVE_TOKEN='user@realm!tokenid=secret'")
 
 
+# pveproxy sometimes closes a connection without answering (2026-09-25, polling exec-status and
+# tasks/status: http.client.RemoteDisconnected, a ConnectionResetError). A GET is idempotent, so it
+# is retried. Anything else may already have been APPLIED (a DELETE of a snapshot did), so it fails
+# loud and the caller looks at the state before trying again.
+_GET_RETRIES = 3
+
+
 def api(method, path, data=None, timeout=30, quiet_errors=False):
     """One API call. Returns parsed 'data', or raises SystemExit with the body."""
     _need_env()
@@ -66,20 +75,32 @@ def api(method, path, data=None, timeout=30, quiet_errors=False):
     if data is not None:
         body = urllib.parse.urlencode(data, doseq=True).encode()
         headers["Content-Type"] = "application/x-www-form-urlencoded"
-    req = urllib.request.Request(url, data=body, headers=headers, method=method)
-    try:
-        with urllib.request.urlopen(req, context=_ctx, timeout=timeout) as r:
-            return json.loads(r.read().decode()).get("data")
-    except urllib.error.HTTPError as e:
-        if quiet_errors:
-            raise
-        sys.exit("API %s %s -> HTTP %s: %s" % (method, path, e.code, e.read().decode("utf-8", "replace")))
-    except urllib.error.URLError as e:
-        sys.exit("API %s %s -> connection error: %s\n"
-                 "Is %s:%s reachable from here? If Proxmox is on a LAN this sandbox "
-                 "cannot reach, tunnel it from your machine:\n"
-                 "  ssh -N -L %s:%s:%s <jump-host>\n"
-                 "then set PVE_HOST=127.0.0.1." % (method, path, e.reason, HOST, PORT, PORT, HOST, PORT))
+    attempts = 1 + (_GET_RETRIES if method == "GET" else 0)
+    for attempt in range(attempts):
+        req = urllib.request.Request(url, data=body, headers=headers, method=method)
+        try:
+            with urllib.request.urlopen(req, context=_ctx, timeout=timeout) as r:
+                return json.loads(r.read().decode()).get("data")
+        except urllib.error.HTTPError as e:
+            if quiet_errors:
+                raise
+            sys.exit("API %s %s -> HTTP %s: %s" % (method, path, e.code, e.read().decode("utf-8", "replace")))
+        except (ConnectionResetError, urllib.error.URLError) as e:
+            dropped = isinstance(e, ConnectionResetError) or isinstance(getattr(e, "reason", None), ConnectionResetError)
+            if dropped and attempt + 1 < attempts:
+                time.sleep(1 + attempt)
+                continue
+            if quiet_errors:
+                raise
+            if dropped:
+                sys.exit("API %s %s -> connection dropped without a response (%s). %s" % (
+                    method, path, e, "Gave up after %d retries." % _GET_RETRIES if method == "GET"
+                    else "It may have been APPLIED: check the state before retrying."))
+            sys.exit("API %s %s -> connection error: %s\n"
+                     "Is %s:%s reachable from here? If Proxmox is on a LAN this sandbox "
+                     "cannot reach, tunnel it from your machine:\n"
+                     "  ssh -N -L %s:%s:%s <jump-host>\n"
+                     "then set PVE_HOST=127.0.0.1." % (method, path, e.reason, HOST, PORT, PORT, HOST, PORT))
 
 
 def node():
@@ -95,7 +116,11 @@ def node():
 def wait_task(upid, timeout=600):
     if not upid:
         return
-    n, t0 = node(), time.time()
+    # A task runs on the node written in its UPID ("UPID:<node>:..."), which is not always
+    # PVE_NODE: a migration runs on the SOURCE node. Ask that node, and don't demand PVE_NODE.
+    parts = upid.split(":")
+    n = parts[1] if len(parts) > 2 and parts[0] == "UPID" and parts[1] else node()
+    t0 = time.time()
     sys.stderr.write("  task %s\n" % upid)
     while True:
         st = api("GET", "/nodes/%s/tasks/%s/status" % (n, urllib.parse.quote(upid, safe="")))
@@ -200,13 +225,37 @@ def cmd_destroy(a):
     print("  destroyed %s" % a.id)
 
 
+# Operator rule (2026-09-25): never more than 3 snapshots per VM. On LVM-thin each snapshot keeps
+# every block the VM has changed since it was taken, in the pool that ALL the VMs share (fb-mb had
+# 14, one per release: deleting 11 freed 19 GiB). So `snapshot` refuses a 4th. Deleting the oldest
+# is irreversible, so it stays an explicit step (`delsnapshot`), never a side effect of creating.
+MAX_SNAPSHOTS = 3
+
+
+def _snapshots_by_age(n, vmid):
+    snaps = [s for s in (api("GET", "/nodes/%s/qemu/%s/snapshot" % (n, vmid)) or [])
+             if s.get("name") != "current"]
+    return sorted(snaps, key=lambda s: s.get("snaptime", 0))
+
+
 def cmd_snapshot(a):
     n = node()
+    have = _snapshots_by_age(n, a.id)
+    if len(have) >= MAX_SNAPSHOTS:
+        sys.exit("  vm%s already has %d snapshots (rule: max %d). Delete the oldest first, on purpose:\n"
+                 "    pve.py delsnapshot %s %s"
+                 % (a.id, len(have), MAX_SNAPSHOTS, a.id, have[0]["name"]))
     name = a.name or ("snap-%d" % int(time.time()))
     upid = api("POST", "/nodes/%s/qemu/%s/snapshot" % (n, a.id),
                {"snapname": name, "vmstate": 1 if a.vmstate else 0})
     wait_task(upid)
     print("  snapshot %s of %s" % (name, a.id))
+
+
+def cmd_delsnapshot(a):
+    n = node()
+    wait_task(api("DELETE", "/nodes/%s/qemu/%s/snapshot/%s" % (n, a.id, a.name)))
+    print("  deleted snapshot %s of %s" % (a.name, a.id))
 
 
 def cmd_rollback(a):
@@ -218,8 +267,9 @@ def cmd_rollback(a):
 
 def cmd_snapshots(a):
     n = node()
-    for s in api("GET", "/nodes/%s/qemu/%s/snapshot" % (n, a.id)) or []:
-        print("%-24s %s" % (s.get("name", ""), s.get("description", "")))
+    for s in _snapshots_by_age(n, a.id):
+        print("%s  %-34s %s" % (time.strftime("%Y-%m-%d %H:%M", time.localtime(s.get("snaptime", 0))),
+                                s.get("name", ""), s.get("description", "")))
 
 
 def cmd_ip(a):
@@ -242,16 +292,46 @@ def cmd_wait_agent(a):
             api("POST", "/nodes/%s/qemu/%s/agent/ping" % (n, a.id), {}, timeout=8, quiet_errors=True)
             print("  agent up on %s" % a.id)
             return
-        except (urllib.error.HTTPError, urllib.error.URLError):
+        except (urllib.error.HTTPError, urllib.error.URLError, ConnectionResetError, TimeoutError):
             pass
         if time.time() - t0 > a.timeout:
             sys.exit("  agent did not come up within %ss" % a.timeout)
         time.sleep(3)
 
 
+# Proxmox's Perl API writes the guest-exec arguments to the agent channel without encoding
+# characters above U+00FF: a single one (an em-dash in a comment, a "→" in an echo) leaves the
+# QEMU guest agent WEDGED — every later call, even guest-ping, times out ("QEMU guest agent is
+# not running") until the agent restarts. Proven A/B on VM110, 2026-09-25: "é" (Latin-1) passes,
+# "—" (U+2014) wedges it. This was the real cause of the "qga flaky under load" episodes. So
+# non-ASCII argv never travels raw: each arg is base64-encoded (pure ASCII) and decoded back in
+# the guest by a tiny ASCII-only bootstrap that execs the ORIGINAL argv exactly (the `.`
+# sentinel keeps trailing newlines that `$(...)` would strip). ASCII argv is sent unchanged.
+_EXEC_B64_BOOTSTRAP = (
+    'a=(); for b in "$@"; do x="$(printf %s "$b" | base64 -d; printf .)"; a+=("${x%.}"); done; '
+    'exec "${a[@]}"'
+)
+
+
+def _ascii_safe_argv(argv):
+    if all(arg.isascii() for arg in argv):
+        return argv
+    encoded = [base64.b64encode(arg.encode("utf-8")).decode("ascii") for arg in argv]
+    return ["/bin/bash", "-c", _EXEC_B64_BOOTSTRAP, "pve-exec"] + encoded
+
+
+def _undo_latin1_mojibake(s):
+    """Proxmox hands back the guest's UTF-8 output bytes as Latin-1 characters ("—" arrives as
+    "â€”", "é" as "Ã©"). Round-trip them; leave text alone if it was not such a mis-decode."""
+    try:
+        return s.encode("latin-1").decode("utf-8")
+    except (UnicodeEncodeError, UnicodeDecodeError):
+        return s
+
+
 def _agent_exec(n, vmid, argv, input_data=None):
     """Run argv (list) in the VM via guest agent (as root). Returns (exitcode, out, err)."""
-    data = {"command": argv}
+    data = {"command": _ascii_safe_argv(argv)}
     if input_data is not None:
         data["input-data"] = input_data
     started = api("POST", "/nodes/%s/qemu/%s/agent/exec" % (n, vmid), data)
@@ -259,15 +339,19 @@ def _agent_exec(n, vmid, argv, input_data=None):
     while True:
         st = api("GET", "/nodes/%s/qemu/%s/agent/exec-status?pid=%s" % (n, vmid, pid))
         if st.get("exited"):
-            return st.get("exitcode", 0), st.get("out-data", ""), st.get("err-data", "")
+            return (st.get("exitcode", 0),
+                    _undo_latin1_mojibake(st.get("out-data", "")),
+                    _undo_latin1_mojibake(st.get("err-data", "")))
         time.sleep(1)
 
 
 def cmd_exec(a):
     n = node()
-    # everything after `--` is the command; wrap in bash -lc unless --raw
+    # everything after `--` is the command; wrap in bash -lc unless --raw. The guest agent runs
+    # without HOME (FINDINGS B-7): /root/.profile then sources "/.cargo/env" and every command
+    # carries that error on stderr (it broke pollers). Set HOME explicitly, as B-7 prescribes.
     cmdline = " ".join(a.cmd)
-    argv = a.cmd if a.raw else ["/bin/bash", "-lc", cmdline]
+    argv = a.cmd if a.raw else ["/usr/bin/env", "HOME=/root", "/bin/bash", "-lc", cmdline]
     code, out, err = _agent_exec(n, a.id, argv, a.input)
     if out:
         sys.stdout.write(out if out.endswith("\n") else out + "\n")
@@ -279,22 +363,21 @@ def cmd_exec(a):
 def cmd_push(a):
     """Write a local file into the VM via agent file-write (small files only).
 
-    Proxmox's `encode=1` means *Proxmox* base64-encodes the content we send
-    before handing it to the QEMU guest agent (which decodes it). So we send the
-    RAW text content, not pre-encoded — pre-encoding would double-encode and the
-    file would land as a literal base64 blob.
+    The QEMU guest agent takes base64. We base64-encode the RAW BYTES here and
+    pass `encode=0` ("content is already encoded"). Letting Proxmox encode it
+    (`encode=1`) breaks on any non-Latin-1 character: its Perl `encode_base64`
+    dies with "Wide character in subroutine entry" (hit pushing a script whose
+    comments contain an em-dash). Encoding the bytes ourselves also makes binary
+    files work, and never double-encodes (Proxmox only encodes when encode=1).
     """
     n = node()
     raw = open(a.local, "rb").read()
     if len(raw) > 900_000:
         sys.exit("  file too big for agent file-write (%d bytes). Serve it over HTTP "
                  "and `exec <id> -- curl -o %s <url>` instead." % (len(raw), a.remote))
-    try:
-        content = raw.decode("utf-8")
-    except UnicodeDecodeError:
-        sys.exit("  binary file — agent file-write here only supports text. Use an HTTP fetch.")
+    content = base64.b64encode(raw).decode("ascii")
     api("POST", "/nodes/%s/qemu/%s/agent/file-write" % (n, a.id),
-        {"file": a.remote, "content": content, "encode": 1})
+        {"file": a.remote, "content": content, "encode": 0})
     print("  wrote %s (%d bytes) -> %s:%s" % (a.local, len(raw), a.id, a.remote))
 
 
@@ -332,6 +415,7 @@ def main():
 
     s = sub.add_parser("snapshot"); s.add_argument("id"); s.add_argument("name", nargs="?")
     s.add_argument("--vmstate", action="store_true"); s.set_defaults(fn=cmd_snapshot)
+    s = sub.add_parser("delsnapshot"); s.add_argument("id"); s.add_argument("name"); s.set_defaults(fn=cmd_delsnapshot)
     s = sub.add_parser("rollback"); s.add_argument("id"); s.add_argument("name"); s.set_defaults(fn=cmd_rollback)
     s = sub.add_parser("snapshots"); s.add_argument("id"); s.set_defaults(fn=cmd_snapshots)
 

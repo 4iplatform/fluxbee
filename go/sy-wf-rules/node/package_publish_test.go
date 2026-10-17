@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -41,7 +42,7 @@ func TestPublishWorkflowPackageWritesDefaultConfigTemplate(t *testing.T) {
 			return &PackagePublishResult{
 				RuntimeName: fmt.Sprintf("%v", packageMeta["name"]),
 				Version:     fmt.Sprintf("%v", packageMeta["version"]),
-				PackagePath: filepath.Join(svc.cfg.DistRuntimeRoot, "wf.invoice", "1"),
+				PackagePath: filepath.Join(svc.cfg.DistRuntimeRoot, "wf.invoice", "0.0.1"),
 			}, nil
 		},
 	}
@@ -66,7 +67,7 @@ func TestPublishWorkflowPackageWritesDefaultConfigTemplate(t *testing.T) {
 	if fakeAdmin.publishCalls != 1 {
 		t.Fatalf("expected one admin publish call, got %d", fakeAdmin.publishCalls)
 	}
-	if publish.RuntimeName != "wf.invoice" || publish.Version != "1" {
+	if publish.RuntimeName != "wf.invoice" || publish.Version != "0.0.1" {
 		t.Fatalf("unexpected publish result %#v", publish)
 	}
 }
@@ -110,13 +111,13 @@ func TestPurgeWorkflowPackagesKeepsCurrentBackupAndBoundVersion(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("WriteSlot backup: %v", err)
 	}
-	svc.orchestrator = &fakeOrchestratorClient{
-		getNodeConfigFunc: func(_ context.Context, targetNode, nodeName string) (map[string]any, error) {
+	svc.nodes = &fakeNodeClient{
+		getNodeConfigFunc: func(_ context.Context, nodeName string) (map[string]any, error) {
 			return map[string]any{
 				"status": "ok",
 				"config": map[string]any{
 					"_system": map[string]any{
-						"runtime_version": "1",
+						"runtime_version": "0.0.1",
 					},
 				},
 			}, nil
@@ -127,13 +128,85 @@ func TestPurgeWorkflowPackagesKeepsCurrentBackupAndBoundVersion(t *testing.T) {
 		t.Fatalf("PurgeWorkflowPackages: %v", err)
 	}
 
-	for _, version := range []string{"1", "3", "4"} {
+	// Current (4), backup (3) and the version the node is bound to (1) stay; 2 goes, through
+	// SY.admin, which writes the motherbee's dist and manifest (A-68): wf-rules does not, even on
+	// the motherbee.
+	admin := svc.admin.(*fakeAdminClient)
+	if strings.Join(admin.removedVersions, ",") != "wf.invoice@0.0.2" {
+		t.Fatalf("want only 0.0.2 removed through the admin, got %v", admin.removedVersions)
+	}
+	for _, version := range []string{"0.0.1", "0.0.2", "0.0.3", "0.0.4"} {
 		if _, err := os.Stat(filepath.Join(svc.cfg.DistRuntimeRoot, "wf.invoice", version)); err != nil {
-			t.Fatalf("expected version %s kept: %v", version, err)
+			t.Fatalf("wf-rules leaves the dist tree to the admin, %s gone: %v", version, err)
 		}
 	}
-	if _, err := os.Stat(filepath.Join(svc.cfg.DistRuntimeRoot, "wf.invoice", "2")); !os.IsNotExist(err) {
-		t.Fatalf("expected version 2 purged, err=%v", err)
+}
+
+// On a worker the dist tree is a receive-only mirror of the motherbee's: purging must ask SY.admin
+// to remove the obsolete versions there and leave the local copy alone (lab 2026-09-30: a local
+// delete on worker1 was never restored, and the next deploy of that version found no files).
+func TestPurgeWorkflowPackagesOnAMirrorHiveGoesThroughTheAdmin(t *testing.T) {
+	svc := newTestService(t)
+	definitionBytes, err := normalizeDefinitionBytes(validWorkflowDefinition())
+	if err != nil {
+		t.Fatalf("normalizeDefinitionBytes: %v", err)
+	}
+	for version := uint64(1); version <= 3; version++ {
+		meta := WfRulesMetadata{
+			Version:         version,
+			Hash:            HashDefinition(definitionBytes),
+			WorkflowName:    "invoice",
+			WorkflowType:    "invoice",
+			WFSchemaVersion: "1",
+			CompiledAt:      "2026-04-16T12:00:00Z",
+		}
+		if _, err := svc.PublishWorkflowPackage("invoice", meta, definitionBytes); err != nil {
+			t.Fatalf("PublishWorkflowPackage(%d): %v", version, err)
+		}
+	}
+	manifestPath := filepath.Join(svc.cfg.DistRuntimeRoot, "manifest.json")
+	manifestBefore, err := os.ReadFile(manifestPath)
+	if err != nil {
+		t.Fatalf("read manifest: %v", err)
+	}
+	// The motherbee refuses to remove the current version while others remain: make 0.0.1 the
+	// current one and expect it last. And 0.0.2 is already gone there (a directory the manifest
+	// no longer lists): that counts as removed.
+	manifest, err := loadRuntimeManifest(manifestPath)
+	if err != nil {
+		t.Fatalf("load manifest: %v", err)
+	}
+	entry := manifest.Runtimes["wf.invoice"]
+	entry.Current = "0.0.1"
+	manifest.Runtimes["wf.invoice"] = entry
+	if err := writeRuntimeManifest(manifestPath, manifest); err != nil {
+		t.Fatalf("write manifest: %v", err)
+	}
+	manifestBefore, err = os.ReadFile(manifestPath)
+	if err != nil {
+		t.Fatalf("read manifest: %v", err)
+	}
+	svc.cfg.HiveID = "worker1"
+	admin := svc.admin.(*fakeAdminClient)
+	admin.removeErr = map[string]error{
+		"0.0.2": &adminActionError{Status: "error", Code: "RUNTIME_VERSION_NOT_FOUND", Message: "gone"},
+	}
+
+	if err := svc.PurgeWorkflowPackages("invoice", false); err != nil {
+		t.Fatalf("PurgeWorkflowPackages: %v", err)
+	}
+
+	want := []string{"wf.invoice@0.0.2", "wf.invoice@0.0.3", "wf.invoice@0.0.1"}
+	if strings.Join(admin.removedVersions, ",") != strings.Join(want, ",") {
+		t.Fatalf("want removals %v through the admin, got %v", want, admin.removedVersions)
+	}
+	for _, version := range []string{"0.0.1", "0.0.2", "0.0.3"} {
+		if _, err := os.Stat(filepath.Join(svc.cfg.DistRuntimeRoot, "wf.invoice", version)); err != nil {
+			t.Fatalf("the local mirror must be left alone, %s gone: %v", version, err)
+		}
+	}
+	if manifestAfter, _ := os.ReadFile(manifestPath); string(manifestAfter) != string(manifestBefore) {
+		t.Fatal("the local manifest must be left alone on a mirror hive")
 	}
 }
 
@@ -141,6 +214,32 @@ type fakeAdminClient struct {
 	publishRuntimePackageFunc func(ctx context.Context, packageFiles map[string]string) (*PackagePublishResult, error)
 	publishCalls              int
 	lastPackageFiles          map[string]string
+	removedVersions           []string
+	removeErr                 map[string]error
+	// currentOnPrimary is refused with RUNTIME_CURRENT_CONFLICT while other versions remain, as
+	// the motherbee's admin does.
+	currentOnPrimary  string
+	versionsOnPrimary int
+	syncHints         []string
+}
+
+func (f *fakeAdminClient) SyncRuntimes(_ context.Context, hive string, waitMs int) error {
+	f.syncHints = append(f.syncHints, fmt.Sprintf("%s/%d", hive, waitMs))
+	return nil
+}
+
+func (f *fakeAdminClient) RemoveRuntimeVersion(_ context.Context, runtimeName, version string) error {
+	f.removedVersions = append(f.removedVersions, runtimeName+"@"+version)
+	if version == f.currentOnPrimary && f.versionsOnPrimary > 1 {
+		return &adminActionError{Status: "error", Code: "RUNTIME_CURRENT_CONFLICT", Message: "cannot delete current version"}
+	}
+	if err := f.removeErr[version]; err != nil {
+		return err
+	}
+	if f.versionsOnPrimary > 0 {
+		f.versionsOnPrimary--
+	}
+	return nil
 }
 
 func (f *fakeAdminClient) PublishRuntimePackage(ctx context.Context, packageFiles map[string]string) (*PackagePublishResult, error) {
@@ -185,4 +284,34 @@ func installWorkflowPackageViaFakeAdmin(svc *Service, packageFiles map[string]st
 		Version:     packageMeta.Version,
 		PackagePath: packageDir,
 	}, nil
+}
+
+// A worker's copy of the manifest can lag behind the motherbee's: after a rollback the motherbee's
+// current version is the older one. A version the admin refuses as current is removed once the
+// others are gone (0.1.70 gate on 8.x, A-68).
+func TestPurgeRemovesTheCurrentVersionLastEvenWithALaggingManifest(t *testing.T) {
+	svc := newTestService(t)
+	definitionBytes, err := normalizeDefinitionBytes(validWorkflowDefinition())
+	if err != nil {
+		t.Fatal(err)
+	}
+	for version := uint64(1); version <= 2; version++ {
+		meta := WfRulesMetadata{Version: version, Hash: HashDefinition(definitionBytes), WorkflowName: "invoice", WorkflowType: "invoice", WFSchemaVersion: "1", CompiledAt: "2026-04-16T12:00:00Z"}
+		if _, err := svc.PublishWorkflowPackage("invoice", meta, definitionBytes); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// This hive's copy says 0.0.2 is current; on the motherbee it is 0.0.1.
+	svc.cfg.HiveID = "worker1"
+	admin := svc.admin.(*fakeAdminClient)
+	admin.currentOnPrimary = "0.0.1"
+	admin.versionsOnPrimary = 2
+
+	if err := svc.PurgeWorkflowPackages("invoice", false); err != nil {
+		t.Fatalf("PurgeWorkflowPackages: %v", err)
+	}
+	want := "wf.invoice@0.0.1,wf.invoice@0.0.2,wf.invoice@0.0.1"
+	if got := strings.Join(admin.removedVersions, ","); got != want {
+		t.Fatalf("removals = %s, want %s", got, want)
+	}
 }

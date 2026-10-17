@@ -1,0 +1,44 @@
+#!/bin/sh
+# fluxbee .deb preinst: snapshot the live runtimes manifest before dpkg unpacks.
+#
+# WHY THIS EXISTS (U-3). Until now dist/runtimes/manifest.json was PACKAGE PAYLOAD, so an
+# upgrade clobbered operator state: every hot-published runtime vanished from the manifest,
+# the watchdog's retention pass (RUNTIME_VERIFY_INTERVAL_SECS=300) then garbage-collected it,
+# and any node bound to it became unstartable — the U-10 fix does not rescue those, because
+# reconcile resolves the runtime KEY before the version.
+#
+# The fix stops shipping the manifest. But dropping a file from the payload makes dpkg treat
+# it as an OBSOLETE FILE and DELETE it on the very first upgrade to the fixed package — turning
+# today's clobber into an outright loss. Only the NEW package's preinst runs early enough to
+# save it (the already-deployed old package's maintainer scripts cannot be changed
+# retroactively), so this snapshot is mandatory, not defensive.
+#
+# fluxbee-seed-runtimes restores it after unpack and merges the base runtimes back in.
+set -e
+
+MANIFEST=/var/lib/fluxbee/dist/runtimes/manifest.json
+STATE_DIR=/var/lib/fluxbee/state
+SNAPSHOT="$STATE_DIR/runtime-manifest.preupgrade.json"
+
+if [ "$1" = "upgrade" ] && [ -f "$MANIFEST" ]; then
+    # Deliberately NOT `|| true`. Aborting here happens before dpkg touches anything, so the
+    # box keeps running the version it already has — the one place where failing closed
+    # strands nobody. Silently continuing would lose the operator's manifest.
+    mkdir -p "$STATE_DIR"
+    cp -p "$MANIFEST" "$SNAPSHOT"
+    echo "fluxbee: snapshotted runtimes manifest -> $SNAPSHOT"
+fi
+
+# A-51: the motherbee's dist is root's and the Syncthing user only reads it (the orchestrator sets
+# that at every start). Switch an older install over BEFORE this package unpacks, so dpkg and the
+# postinst never consume files that user could still rewrite. A link there is never legitimate and
+# is removed, never followed. Best effort: the orchestrator does it again at its start.
+DIST=/var/lib/fluxbee/dist
+if [ -d "$DIST" ] && [ ! -L "$DIST" ]; then
+    find "$DIST" -mindepth 1 -type l -delete 2>/dev/null || true
+    chown -R root:fluxbee "$DIST" 2>/dev/null || chown -R root:root "$DIST" 2>/dev/null || true
+    chmod -R g+rX,go-w "$DIST" 2>/dev/null || true
+    chmod 0750 "$DIST" 2>/dev/null || true
+fi
+
+exit 0

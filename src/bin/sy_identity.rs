@@ -50,8 +50,10 @@ const IDENTITY_SYNC_VERSION: u32 = 1;
 const SYNC_OP_FULL_SYNC_REQUEST: &str = "IDENTITY_FULL_SYNC_REQUEST";
 const SYNC_OP_FULL_SYNC: &str = "full_sync";
 const SYNC_OP_DELTA_SUBSCRIBE: &str = "IDENTITY_DELTA_SUBSCRIBE";
+const SYNC_OP_DELTA_SUBSCRIBED: &str = "IDENTITY_DELTA_SUBSCRIBED";
 const SYNC_OP_DELTA: &str = "IDENTITY_DELTA";
 const SYNC_OP_DELTA_ACK: &str = "IDENTITY_DELTA_ACK";
+const SYNC_OP_HEARTBEAT: &str = "IDENTITY_SYNC_HEARTBEAT";
 // Upstream push (replica → primary): a replica publishes its own `@hive` ilks so
 // motherbee converges to the additive union of the whole mesh ("who exists").
 const SYNC_OP_DELTA_PUBLISH: &str = "IDENTITY_DELTA_PUBLISH";
@@ -73,7 +75,16 @@ const MAX_SYNC_LINE_BYTES: usize = 16 * 1024 * 1024;
 // Idle read timeout for post-handshake sync frames: a peer that stops sending
 // mid-stream is dropped rather than pinning a reader task forever (G-4). Sized
 // generously for large full-syncs over a slow WAN link (per-frame, not total).
+// A replica reads its delta subscription with it too (P7-1).
 const IDENTITY_SYNC_READ_IDLE_SECS: u64 = 60;
+// The primary writes a heartbeat on a delta subscription after this long without
+// a frame, so a quiet mesh still sends on it. A replica that hears nothing for
+// IDENTITY_SYNC_READ_IDLE_SECS (three heartbeats) resubscribes from a full
+// snapshot. Before this, a subscription that a stateful firewall stopped tracking
+// (a table loaded after it opened, or 5 quiet days) lost every later delta and
+// the FIN, and the replica waited on it forever (P7-1).
+const IDENTITY_SYNC_HEARTBEAT_SECS: u64 = 20;
+const _: () = assert!(IDENTITY_SYNC_HEARTBEAT_SECS * 3 <= IDENTITY_SYNC_READ_IDLE_SECS);
 // Upper bound on the advertised full-sync chunk count, checked before allocating
 // the reassembly buffer, so a crafted/corrupted total_chunks (u32, up to ~4.3e9)
 // cannot drive a multi-hundred-GB allocation that aborts a booting replica
@@ -109,7 +120,6 @@ const SHM_REG_STATUS_COMPLETE: u8 = 2;
 const SHM_TENANT_STATUS_PENDING: u8 = 0;
 const SHM_TENANT_STATUS_ACTIVE: u8 = 1;
 const SHM_TENANT_STATUS_SUSPENDED: u8 = 2;
-const MOTHERBEE_PACKAGED_NON_SYSTEM_NODES: &[&str] = &["IO.blob"];
 
 const MSG_ILK_PROVISION: &str = "ILK_PROVISION";
 const MSG_ILK_PROVISION_RESPONSE: &str = "ILK_PROVISION_RESPONSE";
@@ -141,6 +151,20 @@ const MSG_TNT_SET_SPONSOR: &str = "TNT_SET_SPONSOR";
 const MSG_TNT_SET_SPONSOR_RESPONSE: &str = "TNT_SET_SPONSOR_RESPONSE";
 const MSG_TNT_APPROVE: &str = "TNT_APPROVE";
 const MSG_TNT_APPROVE_RESPONSE: &str = "TNT_APPROVE_RESPONSE";
+// Lifecycle (2026-09-28): ILK_DELETE / TNT_DELETE only MARK; restore undoes the mark; purge is
+// the physical, final removal and requires the mark first.
+const MSG_ILK_RESTORE: &str = "ILK_RESTORE";
+const MSG_ILK_RESTORE_RESPONSE: &str = "ILK_RESTORE_RESPONSE";
+const MSG_ILK_PURGE: &str = "ILK_PURGE";
+const MSG_ILK_PURGE_RESPONSE: &str = "ILK_PURGE_RESPONSE";
+const MSG_ILK_SET_TENANT: &str = "ILK_SET_TENANT";
+const MSG_ILK_SET_TENANT_RESPONSE: &str = "ILK_SET_TENANT_RESPONSE";
+const MSG_TNT_DELETE: &str = "TNT_DELETE";
+const MSG_TNT_DELETE_RESPONSE: &str = "TNT_DELETE_RESPONSE";
+const MSG_TNT_RESTORE: &str = "TNT_RESTORE";
+const MSG_TNT_RESTORE_RESPONSE: &str = "TNT_RESTORE_RESPONSE";
+const MSG_TNT_PURGE: &str = "TNT_PURGE";
+const MSG_TNT_PURGE_RESPONSE: &str = "TNT_PURGE_RESPONSE";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum IdentityDbSecretSource {
@@ -185,13 +209,9 @@ struct HiveFile {
     #[serde(default)]
     role: Option<String>,
     #[serde(default)]
-    wan: Option<WanSection>,
-    #[serde(default)]
     government: Option<GovernmentSection>,
     #[serde(default)]
     identity: Option<IdentitySection>,
-    #[serde(default)]
-    database: Option<DatabaseSection>,
     #[serde(default)]
     system_nodes: Option<SystemNodesSection>,
 }
@@ -217,12 +237,6 @@ struct RoleSystemNodes {
 struct GovernmentSection {
     #[serde(default)]
     identity_frontdesk: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-struct WanSection {
-    #[serde(default)]
-    gateway_name: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -255,12 +269,6 @@ struct IdentitySyncSection {
 }
 
 #[derive(Debug, Deserialize)]
-struct DatabaseSection {
-    #[serde(default)]
-    url: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct IlkProvisionRequest {
     ich_id: String,
@@ -274,12 +282,22 @@ struct IlkProvisionRequest {
     /// for SY-internal creation paths and is rejected here.
     #[serde(default)]
     ilk_type: Option<String>,
+    /// The namespace the channel's address lives in (docs/ilk-tenant-model-v1.md §2.1). Absent:
+    /// the request's tenant. Only IO.cloud may name the installation-wide scope, for its `cloud`
+    /// channel: a Fluxbee Cloud account's email.
+    #[serde(default)]
+    scope: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct IlkGetRequest {
     ilk_id: String,
+    /// Optional scope: when present the ilk must belong to this tenant, and one of another tenant
+    /// answers NOT_FOUND, exactly like a missing one. SY.admin always sends it for Fluxbee Cloud, so
+    /// Cloud reads only its own identities and learns nothing about the others.
+    #[serde(default)]
+    tenant_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -298,6 +316,9 @@ struct ChannelInput {
     #[serde(rename = "type")]
     channel_type: String,
     address: String,
+    /// As in ILK_PROVISION. Absent: the target ILK's current tenant.
+    #[serde(default)]
+    scope: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -339,6 +360,62 @@ struct IlkSetDefinitionRequest {
 #[serde(deny_unknown_fields)]
 struct IlkDeleteRequest {
     ilk_id: String,
+    /// Optional scope for ILK_DELETE / ILK_RESTORE / ILK_PURGE: when present the ilk must be
+    /// charged to this tenant (ILK_TENANT_MISMATCH otherwise). The operator may use it; Fluxbee
+    /// Cloud no longer sends it: deleting an account is not tenant-scoped.
+    #[serde(default)]
+    tenant_id: Option<String>,
+    /// Optional guard: when present the ilk must be of this type (ILK_TYPE_MISMATCH otherwise).
+    /// SY.admin always sends `human` for Fluxbee Cloud: Cloud deletes and restores people only;
+    /// node identities are the orchestrator's (operator decision 2026-10-14, D4).
+    #[serde(default)]
+    ilk_type: Option<String>,
+}
+
+/// ILK_SET_TENANT: charge an ILK to another tenant, its cost center (docs/ilk-tenant-model-v1.md).
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct IlkSetTenantRequest {
+    ilk_id: String,
+    tenant_id: String,
+    /// Who the change is for, as SY.admin relays it: `operator`, or the Cloud relay's name.
+    #[serde(default)]
+    on_behalf_of: Option<String>,
+}
+
+/// TNT_DELETE / TNT_RESTORE / TNT_PURGE.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TntLifecycleRequest {
+    tenant_id: String,
+}
+
+/// Why an ilk is marked deleted (persisted in identity_ilks.deleted_reason). Its own delete is the
+/// only reason: deleting a tenant marks no ILK (docs/ilk-tenant-model-v1.md §2.3).
+const DELETED_REASON_DIRECT: &str = "direct";
+
+/// Everything a lifecycle op (mark / restore / purge, ilk or tenant) changed, so the handler
+/// persists it in ONE transaction and emits the matching deltas.
+#[derive(Debug, Default)]
+struct LifecycleChanges {
+    /// marked or restored (full records -> TenantUpsert / IlkUpsert)
+    tenants: Vec<TenantRecord>,
+    ilks: Vec<IlkRecord>,
+    /// channels a restore moved to the installation-wide scope (ich ids; their ILK is in `ilks`)
+    rescoped_ichs: Vec<String>,
+    /// ILKs charged elsewhere that lost the channels a purged tenant's scope held (full records ->
+    /// IlkUpsert; their rows go with the tenant's)
+    trimmed_ilks: Vec<IlkRecord>,
+    /// physically removed
+    purged_ilks: Vec<String>,
+    purged_aliases: Vec<String>,
+    purged_tenants: Vec<String>,
+}
+
+/// Error code + human detail in one String (`CODE|detail`); the handler splits it so the caller
+/// sees WHAT blocked the op (e.g. which node identities are still in the tenant).
+fn lifecycle_error(code: &str, detail: &str) -> String {
+    format!("{code}|{detail}")
 }
 
 #[derive(Debug, Deserialize)]
@@ -399,6 +476,9 @@ struct TenantRecord {
     status: String,
     settings: Value,
     sponsor_tenant_id: Option<String>,
+    /// Marked deleted (reversible, hidden, its name/domain stay reserved) until purged.
+    #[serde(default)]
+    deleted_at_ms: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -408,6 +488,22 @@ struct ChannelRecord {
     address: String,
     owner_l2_name: Option<String>,
     enabled: bool,
+    /// The namespace the address lives in, fixed when the channel is created: the tenant of the
+    /// node that saw it, or the installation-wide scope for a Fluxbee Cloud account's email. Every
+    /// lookup key uses it, never the ILK's current tenant, so charging an ILK to another tenant
+    /// moves no key (docs/ilk-tenant-model-v1.md §2.1). Empty only in a record from an older peer,
+    /// until `fill_channel_scopes` gives it the ILK's tenant on arrival.
+    #[serde(default)]
+    scope: String,
+}
+
+/// A change of the tenant an ILK is charged to, for the history table.
+#[derive(Debug, Clone, PartialEq)]
+struct TenantChange {
+    ilk_id: String,
+    from_tenant_id: String,
+    to_tenant_id: String,
+    changed_by: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -420,6 +516,9 @@ struct IlkRecord {
     definition: Value,
     channels: Vec<ChannelRecord>,
     deleted_at_ms: Option<u64>,
+    /// Why it is marked: `direct`, its own delete.
+    #[serde(default)]
+    deleted_reason: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -435,6 +534,10 @@ struct IdentityStore {
     // (channel_type_lower, address_lower, tenant_id_lower) -> ilk_id
     ich_lookup: HashMap<(String, String, String), String>,
     aliases: HashMap<String, AliasRecord>,
+    /// Fluxbee Cloud account emails the scope migration could not move to the installation-wide
+    /// scope because several people hold them (lowercased). Provisioning one answers
+    /// ACCOUNT_AMBIGUOUS until the operator resolves it (docs/ilk-tenant-model-v1.md §2.1).
+    ambiguous_account_emails: HashSet<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -494,6 +597,8 @@ struct IdentitySyncError {
 #[serde(tag = "type", rename_all = "snake_case")]
 enum IdentityDelta {
     TenantUpsert { tenant: TenantRecord },
+    /// Purge of a tenant (its ilks go as IlkDelete first). Primary-only.
+    TenantDelete { tenant_id: String },
     IlkUpsert { ilk: IlkRecord },
     IlkDelete { ilk_id: String },
     AliasUpsert { alias: AliasSnapshotRecord },
@@ -526,6 +631,10 @@ impl IdentityStore {
     fn tenant_summary_value(&self, tenant: &TenantRecord) -> Value {
         let child_count = self.tenant_child_count(&tenant.tenant_id);
         let ilk_count = self.tenant_ilk_count(&tenant.tenant_id);
+        // What is charged to it: people (not marked) and node identities (docs/ilk-tenant-model-v1.md
+        // §2.4, what Fluxbee Cloud reads).
+        let people_count = self.tenant_people(&tenant.tenant_id).len();
+        let node_count = self.tenant_node_ilks(&tenant.tenant_id).len();
         let is_root = tenant.sponsor_tenant_id.is_none();
         let is_sponsor = child_count > 0;
         json!({
@@ -537,8 +646,11 @@ impl IdentityStore {
             "sponsor_tenant_id": tenant.sponsor_tenant_id,
             "child_count": child_count,
             "ilk_count": ilk_count,
+            "people_count": people_count,
+            "node_count": node_count,
             "is_root": is_root,
             "is_sponsor": is_sponsor,
+            "deleted_at_ms": tenant.deleted_at_ms,
         })
     }
 
@@ -578,7 +690,11 @@ impl IdentityStore {
         None
     }
 
-    fn get_ilk_payload(&self, requested_ilk_id: &str) -> Result<Value, String> {
+    fn get_ilk_payload(
+        &self,
+        requested_ilk_id: &str,
+        tenant_scope: Option<&str>,
+    ) -> Result<Value, String> {
         let requested_ilk_id = requested_ilk_id.trim();
         if requested_ilk_id.is_empty() {
             return Err("INVALID_REQUEST".to_string());
@@ -594,6 +710,11 @@ impl IdentityStore {
         let Some(ilk) = self.ilks.get(&canonical_ilk_id).cloned() else {
             return Err("NOT_FOUND".to_string());
         };
+        if let Some(scope) = tenant_scope.map(str::trim).filter(|v| !v.is_empty()) {
+            if ilk.tenant_id != scope {
+                return Err("NOT_FOUND".to_string());
+            }
+        }
 
         let tenant = self.tenants.get(&ilk.tenant_id).cloned();
         let merged_aliases: Vec<Value> = self
@@ -622,12 +743,16 @@ impl IdentityStore {
                 "expires_at_ms": entry.expires_at_ms,
             })),
             "merged_aliases": merged_aliases,
+            "pending_signup": ilk.deleted_at_ms.is_none() && is_pending_signup(&ilk),
             "ilk": ilk,
             "tenant": tenant,
         }))
     }
 
-    fn list_ilks_payload(&self) -> Value {
+    /// Every ILK, or only the pending signups (`pending_only`): a temporary person holding a Fluxbee
+    /// Cloud account's key, wherever it is charged, deleted tenants included (docs/ilk-tenant-model-v1.md
+    /// D11).
+    fn list_ilks_payload(&self, include_deleted: bool, pending_only: bool) -> Value {
         let mut ilk_ids: Vec<&String> = self.ilks.keys().collect();
         ilk_ids.sort_unstable();
 
@@ -635,6 +760,13 @@ impl IdentityStore {
             .into_iter()
             .filter_map(|ilk_id| {
                 let ilk = self.ilks.get(ilk_id)?;
+                if ilk.deleted_at_ms.is_some() && !include_deleted {
+                    return None;
+                }
+                let pending_signup = ilk.deleted_at_ms.is_none() && is_pending_signup(ilk);
+                if pending_only && !pending_signup {
+                    return None;
+                }
                 let tenant = self.tenants.get(&ilk.tenant_id);
                 let display_name =
                     identification_str(&ilk.identification, "display_name").map(str::to_string);
@@ -649,15 +781,18 @@ impl IdentityStore {
                     "display_name": display_name,
                     "node_name": node_name,
                     "definition_present": agent_definition_present(&ilk.definition),
+                    "pending_signup": pending_signup,
                     "channel_count": ilk.channels.len(),
                     "channels": ilk.channels.iter().map(|channel| json!({
                         "ich_id": channel.ich_id,
                         "channel_type": channel.channel_type,
                         "address": channel.address,
+                        "scope": channel_scope(channel, &ilk.tenant_id),
                         "owner_l2_name": channel.owner_l2_name,
                         "enabled": channel.enabled,
                     })).collect::<Vec<_>>(),
                     "deleted_at_ms": ilk.deleted_at_ms,
+                    "deleted_reason": ilk.deleted_reason,
                 }))
             })
             .collect();
@@ -685,6 +820,8 @@ impl IdentityStore {
             .and_then(|sponsor_id| self.tenants.get(sponsor_id).cloned());
         let child_count = self.tenant_child_count(tenant_id);
         let ilk_count = self.tenant_ilk_count(tenant_id);
+        let people_count = self.tenant_people(tenant_id).len();
+        let node_count = self.tenant_node_ilks(tenant_id).len();
         let is_root = tenant.sponsor_tenant_id.is_none();
         let is_sponsor = child_count > 0;
         let mut child_tenants: Vec<TenantRecord> = self
@@ -706,13 +843,17 @@ impl IdentityStore {
             "sponsor": sponsor,
             "child_count": child_count,
             "ilk_count": ilk_count,
+            "people_count": people_count,
+            "node_count": node_count,
             "is_root": is_root,
             "is_sponsor": is_sponsor,
             "children": children,
         }))
     }
 
-    fn list_tenants_payload(&self) -> Value {
+    /// `exclude_root` leaves the genesis tenant out: Fluxbee Cloud manages every tenant but that one
+    /// (docs/ilk-tenant-model-v1.md §2.4).
+    fn list_tenants_payload(&self, include_deleted: bool, exclude_root: bool) -> Value {
         let mut tenant_ids: Vec<&String> = self.tenants.keys().collect();
         tenant_ids.sort_unstable();
 
@@ -720,6 +861,12 @@ impl IdentityStore {
             .into_iter()
             .filter_map(|tenant_id| {
                 let tenant = self.tenants.get(tenant_id)?;
+                if tenant.deleted_at_ms.is_some() && !include_deleted {
+                    return None;
+                }
+                if exclude_root && tenant.tenant_id == DEFAULT_ROOT_TENANT_ID {
+                    return None;
+                }
                 Some(self.tenant_summary_value(tenant))
             })
             .collect();
@@ -752,6 +899,23 @@ impl IdentityStore {
                 None
             }
         })
+    }
+
+    /// The ilk of `tenant_id` that holds `email`, which is unique within a tenant (the scope of
+    /// its DB index): the active one, or with `deleted` a marked one that keeps it reserved.
+    fn ilk_holding_email(&self, tenant_id: &str, email: &str, deleted: bool) -> Option<String> {
+        let email = email.trim();
+        if email.is_empty() {
+            return None;
+        }
+        self.ilks
+            .values()
+            .find(|ilk| {
+                ilk.deleted_at_ms.is_some() == deleted
+                    && ilk.tenant_id == tenant_id
+                    && identification_str(&ilk.identification, "email") == Some(email)
+            })
+            .map(|ilk| ilk.ilk_id.clone())
     }
 
     fn with_default_tenant() -> Self {
@@ -790,6 +954,7 @@ impl IdentityStore {
                 self.tenants.insert(
                     DEFAULT_ROOT_TENANT_ID.to_string(),
                     TenantRecord {
+                        deleted_at_ms: None,
                         tenant_id: DEFAULT_ROOT_TENANT_ID.to_string(),
                         name: DEFAULT_DEFAULT_TENANT_NAME.to_string(),
                         domain: None,
@@ -832,6 +997,7 @@ impl IdentityStore {
                 definition: json!({}),
                 channels: Vec::new(),
                 deleted_at_ms: None,
+                deleted_reason: None,
             };
             let needs_upsert = self
                 .ilks
@@ -852,7 +1018,17 @@ impl IdentityStore {
         Ok(changed)
     }
 
-    fn provision_temporary_ilk(&mut self, req: IlkProvisionRequest) -> Result<Value, String> {
+    /// ILK_PROVISION: find the ILK that holds (channel, address, scope), or mint a temporary one
+    /// charged to the request's tenant. Answers `{ilk_id, registration_status, tenant_id,
+    /// created}`. A temporary that a shared scope finds charged to another tenant (an abandoned
+    /// Cloud signup) is charged to the requesting tenant instead, and the change is returned for
+    /// the history table, so an abandoned signup never locks an email out.
+    fn provision_temporary_ilk(
+        &mut self,
+        req: IlkProvisionRequest,
+        caller: Option<&str>,
+        cloud_relay: &str,
+    ) -> Result<(Value, Option<TenantChange>), String> {
         let _ = parse_prefixed_uuid(&req.ich_id, "ich")?;
         validate_non_empty("channel_type", &req.channel_type)?;
         validate_non_empty("address", &req.address)?;
@@ -872,27 +1048,85 @@ impl IdentityStore {
             .clone()
             .or_else(|| self.default_tenant_id())
             .ok_or_else(|| "missing default tenant".to_string())?;
-        let key = canonical_ich_key(&req.channel_type, &req.address, &tenant_id);
-        if let Some(existing) = self.ich_lookup.get(&key) {
-            let status = self
+        if self.tenant_is_deleted(&tenant_id) {
+            return Err("TENANT_DELETED".to_string());
+        }
+        let scope = resolve_channel_scope(
+            &req.channel_type,
+            req.scope.as_deref(),
+            &tenant_id,
+            caller,
+            cloud_relay,
+        )?;
+        let key = canonical_ich_key(&req.channel_type, &req.address, &scope);
+        // A Fluxbee Cloud account's key: the `cloud` channel in the installation-wide scope.
+        let account_key =
+            scope == INSTALLATION_SCOPE && is_cloud_account_channel(&req.channel_type);
+        if account_key
+            && self
+                .ambiguous_account_emails
+                .contains(&req.address.trim().to_ascii_lowercase())
+        {
+            return Err("ACCOUNT_AMBIGUOUS".to_string());
+        }
+        if let Some(existing) = self.ich_lookup.get(&key).cloned() {
+            let mut change = None;
+            if let Some(ilk) = self.ilks.get_mut(&existing) {
+                // A node's own `cloud` channel answers no signup of a person.
+                if account_key && ilk_type == "human" && ilk.ilk_type.trim() != "human" {
+                    return Err("CLOUD_CHANNEL_RESERVED".to_string());
+                }
+                // The installation-wide scope is the only one shared across tenants: a temporary
+                // there is an abandoned signup, and the relay's next signup of that email charges
+                // it to the tenant asking. A complete account keeps its tenant (reassigning it is
+                // ILK_SET_TENANT).
+                if account_key
+                    && caller.map(str::trim) == Some(cloud_relay)
+                    && ilk.tenant_id != tenant_id
+                    && ilk.registration_status == "temporary"
+                    && ilk.ilk_type.trim() == "human"
+                {
+                    fill_channel_scopes(ilk);
+                    change = Some(TenantChange {
+                        ilk_id: existing.clone(),
+                        from_tenant_id: ilk.tenant_id.clone(),
+                        to_tenant_id: tenant_id.clone(),
+                        changed_by: caller.unwrap_or("SY.identity").to_string(),
+                    });
+                    ilk.tenant_id = tenant_id.clone();
+                }
+            }
+            let (status, charged_to) = self
                 .ilks
-                .get(existing)
-                .map(|ilk| ilk.registration_status.as_str())
-                .unwrap_or("temporary");
-            return Ok(json!({
-                "status": "ok",
-                "ilk_id": existing,
-                "registration_status": status,
-            }));
+                .get(&existing)
+                .map(|ilk| (ilk.registration_status.clone(), ilk.tenant_id.clone()))
+                .unwrap_or_else(|| ("temporary".to_string(), tenant_id.clone()));
+            return Ok((
+                json!({
+                    "status": "ok",
+                    "ilk_id": existing,
+                    "registration_status": status,
+                    "tenant_id": charged_to,
+                    "created": false,
+                }),
+                change,
+            ));
         }
 
+        if self
+            .deleted_ilk_holding_channel(&req.channel_type, &req.address, &scope)
+            .is_some()
+        {
+            return Err("ILK_DELETED".to_string());
+        }
+        self.check_ich_id_free(&req.ich_id, &[])?;
         let ilk_id = format!("ilk:{}", Uuid::new_v4());
 
         let ilk = IlkRecord {
             ilk_id: ilk_id.clone(),
             ilk_type,
             registration_status: "temporary".to_string(),
-            tenant_id,
+            tenant_id: tenant_id.clone(),
             identification: json!({}),
             definition: json!({}),
             channels: vec![ChannelRecord {
@@ -901,28 +1135,93 @@ impl IdentityStore {
                 address: req.address,
                 owner_l2_name: None,
                 enabled: false,
+                scope,
             }],
             deleted_at_ms: None,
+            deleted_reason: None,
         };
         self.ich_lookup.insert(key, ilk_id.clone());
         self.ilks.insert(ilk_id.clone(), ilk);
 
-        Ok(json!({
-            "status": "ok",
-            "ilk_id": ilk_id,
-            "registration_status": "temporary",
-        }))
+        Ok((
+            json!({
+                "status": "ok",
+                "ilk_id": ilk_id,
+                "registration_status": "temporary",
+                "tenant_id": tenant_id,
+                "created": true,
+            }),
+            None,
+        ))
     }
 
-    fn register_ilk(&mut self, req: IlkRegisterRequest) -> Result<Value, String> {
+    /// Nobody registers into the root tenant (operator decision 2026-10-02): it holds the system
+    /// and its nodes, never a person. A registration is a person's when it says `human` or when
+    /// the ilk it registers is a human one, such as the temporary a root-tenant IO node
+    /// provisioned for someone who wrote in: provisioning there still works, and that person
+    /// stays temporary. Node ilks (`agent`) still register in the root tenant.
+    fn registers_a_person_into_the_root_tenant(&self, req: &IlkRegisterRequest) -> bool {
+        req.tenant_id == DEFAULT_ROOT_TENANT_ID
+            && (req.ilk_type.trim() == "human"
+                || self
+                    .ilks
+                    .get(&req.ilk_id)
+                    .is_some_and(|ilk| ilk.ilk_type.trim() == "human"))
+    }
+
+    fn register_ilk(
+        &mut self,
+        req: IlkRegisterRequest,
+        merge_alias_ttl_secs: u64,
+    ) -> Result<Value, String> {
         let _ = parse_prefixed_uuid(&req.ilk_id, "ilk")?;
         let _ = parse_prefixed_uuid(&req.tenant_id, "tnt")?;
         validate_ilk_type(&req.ilk_type)?;
         let Some(target_tenant) = self.tenants.get(&req.tenant_id) else {
             return Err("INVALID_TENANT".to_string());
         };
+        if target_tenant.deleted_at_ms.is_some() {
+            return Err("TENANT_DELETED".to_string());
+        }
+        // Only an active tenant takes registrations.
         if target_tenant.status.eq_ignore_ascii_case("pending") {
             return Err("TENANT_PENDING".to_string());
+        }
+        if target_tenant.status.eq_ignore_ascii_case("suspended") {
+            return Err("TENANT_SUSPENDED".to_string());
+        }
+        if self.registers_a_person_into_the_root_tenant(&req) {
+            return Err("TENANT_ROOT_NOT_REGISTRABLE".to_string());
+        }
+        // Keys of a marked ilk stay reserved until purge, in the scope of their unique index:
+        // node_name across the mesh, email within its tenant.
+        if let Some(node_name) = identification_str(&req.identification, "node_name") {
+            if self
+                .find_active_ilk_by_identification_key("node_name", node_name)
+                .is_none()
+                && self
+                    .deleted_ilk_holding_identification("node_name", node_name)
+                    .is_some()
+            {
+                return Err("ILK_DELETED".to_string());
+            }
+        }
+        if let Some(email) = identification_str(&req.identification, "email").map(str::to_string) {
+            match self.ilk_holding_email(&req.tenant_id, &email, false) {
+                // The email is already registered in this tenant: the person is known.
+                Some(holder) if holder != req.ilk_id => {
+                    return self.merge_registration(req, holder, merge_alias_ttl_secs);
+                }
+                Some(_) => {}
+                None => {
+                    if self
+                        .ilk_holding_email(&req.tenant_id, &email, true)
+                        .is_some()
+                    {
+                        return Err("ILK_DELETED".to_string());
+                    }
+                }
+            }
         }
 
         let requested_ilk_id = req.ilk_id.clone();
@@ -950,13 +1249,18 @@ impl IdentityStore {
                 if existing.ilk_type.trim() == "system" {
                     return Err("SYSTEM_ILK_PROTECTED".to_string());
                 }
-                let tenant_change = existing.tenant_id != req.tenant_id;
-                if tenant_change && !existing.registration_status.eq("temporary") {
+                // An ILK's tenant changes only through ILK_SET_TENANT, which records it and takes
+                // people only: a node is born and dies in its tenant (D6), its temporary included.
+                if existing.tenant_id != req.tenant_id {
                     return Err("INVALID_TENANT_TRANSITION".to_string());
                 }
+                // Its channels keep the scope they were created with.
+                fill_channel_scopes(existing);
                 existing.ilk_type = req.ilk_type;
-                existing.tenant_id = req.tenant_id;
+                existing.tenant_id = req.tenant_id.clone();
                 existing.registration_status = "complete".to_string();
+                // A registration of the ilk itself is an update: its identification is replaced
+                // whole (last write wins).
                 existing.identification = req.identification;
             }
             None => {
@@ -966,11 +1270,12 @@ impl IdentityStore {
                         ilk_id: canonical_ilk_id.clone(),
                         ilk_type: req.ilk_type,
                         registration_status: "complete".to_string(),
-                        tenant_id: req.tenant_id,
+                        tenant_id: req.tenant_id.clone(),
                         identification: req.identification,
                         definition: json!({}),
                         channels: Vec::new(),
                         deleted_at_ms: None,
+                        deleted_reason: None,
                     },
                 );
             }
@@ -979,7 +1284,143 @@ impl IdentityStore {
         Ok(json!({
             "status": "ok",
             "ilk_id": canonical_ilk_id,
+            "tenant_id": req.tenant_id,
+            "registration_status": "complete",
+            "merged": false,
         }))
+    }
+
+    /// ILK_REGISTER with an email that `holder_id` already has in the same tenant: the person is
+    /// already registered. Their temporary ilk merges into `holder_id` (the same merge as
+    /// ILK_ADD_CHANNEL `merge_from_ilk_id`), and the registration only fills the identification
+    /// fields `holder_id` has empty: a value already there is kept. Validates before it mutates.
+    fn merge_registration(
+        &mut self,
+        req: IlkRegisterRequest,
+        holder_id: String,
+        merge_alias_ttl_secs: u64,
+    ) -> Result<Value, String> {
+        let Some(source) = self.ilks.get(&req.ilk_id) else {
+            // A new ilk cannot take an email someone in the tenant already has.
+            return Err("DUPLICATE_EMAIL".to_string());
+        };
+        if source.deleted_at_ms.is_some() {
+            return Err("ILK_NOT_FOUND".to_string());
+        }
+        if source.ilk_type.trim() == "system" {
+            return Err("SYSTEM_ILK_PROTECTED".to_string());
+        }
+        // Only a temporary human of this same tenant merges: a complete ilk keeps its channels,
+        // and a merge never moves a channel to another tenant.
+        let holder_is_human = self
+            .ilks
+            .get(&holder_id)
+            .is_some_and(|holder| holder.ilk_type == "human");
+        if req.ilk_type.trim() != "human"
+            || !holder_is_human
+            || source.registration_status != "temporary"
+            || source.tenant_id != req.tenant_id
+        {
+            return Err("DUPLICATE_EMAIL".to_string());
+        }
+        self.merge_temporary_ilk(&req.ilk_id, &holder_id, merge_alias_ttl_secs)?;
+        let holder = self
+            .ilks
+            .get_mut(&holder_id)
+            .ok_or_else(|| "ILK_NOT_FOUND".to_string())?;
+        fill_missing_identification(&mut holder.identification, &req.identification);
+        Ok(json!({
+            "status": "ok",
+            "ilk_id": holder_id,
+            "tenant_id": holder.tenant_id,
+            "registration_status": holder.registration_status,
+            "merged": true,
+            "merged_from_ilk_id": req.ilk_id,
+        }))
+    }
+
+    /// Can the temporary `old_ilk_id` merge into `canonical_ilk_id`?
+    fn check_merge_source(&self, old_ilk_id: &str, canonical_ilk_id: &str) -> Result<(), String> {
+        let _ = parse_prefixed_uuid(old_ilk_id, "ilk")?;
+        if old_ilk_id == canonical_ilk_id {
+            return Err("INVALID_MERGE_SOURCE".to_string());
+        }
+        let source = self
+            .ilks
+            .get(old_ilk_id)
+            .ok_or_else(|| "INVALID_MERGE_SOURCE".to_string())?;
+        if source.deleted_at_ms.is_some() || source.registration_status != "temporary" {
+            return Err("INVALID_MERGE_SOURCE".to_string());
+        }
+        match self.ilks.get(canonical_ilk_id) {
+            // Both charged to the same tenant, as merge_registration requires: joining identities
+            // across tenants needs its own explicit step (docs/ilk-tenant-model-v1.md §2.1).
+            Some(canonical) if canonical.deleted_at_ms.is_none() => {
+                if canonical.tenant_id != source.tenant_id {
+                    return Err("ILK_TENANT_MISMATCH".to_string());
+                }
+                Ok(())
+            }
+            _ => Err("ILK_NOT_FOUND".to_string()),
+        }
+    }
+
+    /// Merge the temporary `old_ilk_id` into `canonical_ilk_id`: its channels MOVE to the
+    /// canonical ilk (their lookups follow), and it stays as an alias of it for
+    /// `merge_alias_ttl_secs`, after which the alias GC marks it deleted. Validates before it
+    /// mutates.
+    fn merge_temporary_ilk(
+        &mut self,
+        old_ilk_id: &str,
+        canonical_ilk_id: &str,
+        merge_alias_ttl_secs: u64,
+    ) -> Result<(), String> {
+        self.check_merge_source(old_ilk_id, canonical_ilk_id)?;
+        let Some(source) = self.ilks.get_mut(old_ilk_id) else {
+            return Err("INVALID_MERGE_SOURCE".to_string());
+        };
+        fill_channel_scopes(source);
+        let source_tenant_id = source.tenant_id.clone();
+        let moved = std::mem::take(&mut source.channels);
+        for channel in &moved {
+            self.ich_lookup.insert(
+                channel_key(channel, &source_tenant_id),
+                canonical_ilk_id.to_string(),
+            );
+        }
+        if let Some(canonical) = self.ilks.get_mut(canonical_ilk_id) {
+            for channel in moved {
+                if !canonical
+                    .channels
+                    .iter()
+                    .any(|existing| existing.ich_id == channel.ich_id)
+                {
+                    canonical.channels.push(channel);
+                }
+            }
+        }
+
+        let ttl_ms = merge_alias_ttl_secs.saturating_mul(1000);
+        let expires_at_ms = now_epoch_ms().saturating_add(ttl_ms);
+        self.aliases.insert(
+            old_ilk_id.to_string(),
+            AliasRecord {
+                canonical_ilk_id: canonical_ilk_id.to_string(),
+                expires_at_ms,
+            },
+        );
+        Ok(())
+    }
+
+    /// The alias a merge left for `old_ilk_id`, as it is persisted and replicated.
+    fn alias_snapshot(&self, old_ilk_id: &str) -> Option<AliasSnapshotRecord> {
+        self.aliases
+            .get(old_ilk_id)
+            .map(|alias| AliasSnapshotRecord {
+                old_ilk_id: old_ilk_id.to_string(),
+                canonical_ilk_id: alias.canonical_ilk_id.clone(),
+                expires_at_ms: alias.expires_at_ms,
+            })
     }
 
     fn add_channel(
@@ -987,26 +1428,62 @@ impl IdentityStore {
         req: IlkAddChannelRequest,
         owner_l2_name: Option<&str>,
         merge_alias_ttl_secs: u64,
+        cloud_relay: &str,
     ) -> Result<Value, String> {
         let _ = parse_prefixed_uuid(&req.ilk_id, "ilk")?;
         validate_channel_input(&req.channel)?;
         let normalized_owner_l2_name = normalize_optional_owner_l2_name(owner_l2_name)?;
+        let target_tenant_id = self
+            .ilks
+            .get(&req.ilk_id)
+            .map(|ilk| ilk.tenant_id.clone())
+            .ok_or_else(|| "ILK_NOT_FOUND".to_string())?;
+        let scope = resolve_channel_scope(
+            &req.channel.channel_type,
+            req.channel.scope.as_deref(),
+            &target_tenant_id,
+            owner_l2_name,
+            cloud_relay,
+        )?;
+        if self
+            .deleted_ilk_holding_channel(&req.channel.channel_type, &req.channel.address, &scope)
+            .is_some()
+        {
+            return Err("ILK_DELETED".to_string());
+        }
 
         let canonical_ilk_id = req.ilk_id.clone();
         let response_ich_id = req.channel.ich_id.clone();
+        match self.ilks.get(&canonical_ilk_id) {
+            Some(target) if target.deleted_at_ms.is_none() => {}
+            _ => return Err("ILK_NOT_FOUND".to_string()),
+        }
+        if let Some(old_ilk) = req.merge_from_ilk_id.as_deref() {
+            self.check_merge_source(old_ilk, &canonical_ilk_id)?;
+            // A Fluxbee Cloud account moves with the relay or a frontdesk only: a tenant's IO
+            // node must not carry an abandoned signup's email onto an ILK it names.
+            let io_node = owner_l2_name
+                .map(str::trim)
+                .is_some_and(|caller| caller.starts_with("IO.") && caller != cloud_relay);
+            let holds_account = self.ilks.get(old_ilk).is_some_and(|source| {
+                source
+                    .channels
+                    .iter()
+                    .any(|channel| is_cloud_account_channel(&channel.channel_type))
+            });
+            if io_node && holds_account {
+                return Err("CLOUD_CHANNEL_RESERVED".to_string());
+            }
+        }
+        let mut joined = vec![canonical_ilk_id.as_str()];
+        joined.extend(req.merge_from_ilk_id.as_deref());
+        self.check_ich_id_free(&req.channel.ich_id, &joined)?;
         let target = self
             .ilks
             .get_mut(&canonical_ilk_id)
             .ok_or_else(|| "ILK_NOT_FOUND".to_string())?;
-        if target.deleted_at_ms.is_some() {
-            return Err("ILK_NOT_FOUND".to_string());
-        }
 
-        let key = canonical_ich_key(
-            &req.channel.channel_type,
-            &req.channel.address,
-            &target.tenant_id,
-        );
+        let key = canonical_ich_key(&req.channel.channel_type, &req.channel.address, &scope);
         self.ich_lookup.insert(key, canonical_ilk_id.clone());
 
         let already = target
@@ -1020,55 +1497,12 @@ impl IdentityStore {
                 address: req.channel.address,
                 owner_l2_name: normalized_owner_l2_name.clone(),
                 enabled: false,
+                scope,
             });
         }
 
-        if let Some(old_ilk) = req.merge_from_ilk_id {
-            let _ = parse_prefixed_uuid(&old_ilk, "ilk")?;
-            if old_ilk == canonical_ilk_id {
-                return Err("INVALID_MERGE_SOURCE".to_string());
-            }
-            let source = self
-                .ilks
-                .get(&old_ilk)
-                .ok_or_else(|| "INVALID_MERGE_SOURCE".to_string())?;
-            if source.deleted_at_ms.is_some() || source.registration_status != "temporary" {
-                return Err("INVALID_MERGE_SOURCE".to_string());
-            }
-
-            let source_tenant_id = source.tenant_id.clone();
-            let source_channels = source.channels.clone();
-            let source_keys: Vec<(String, String, String)> = source_channels
-                .iter()
-                .map(|ch| canonical_ich_key(&ch.channel_type, &ch.address, &source_tenant_id))
-                .collect();
-
-            let canonical = self
-                .ilks
-                .get_mut(&canonical_ilk_id)
-                .ok_or_else(|| "ILK_NOT_FOUND".to_string())?;
-            for ch in source_channels {
-                if !canonical
-                    .channels
-                    .iter()
-                    .any(|existing| existing.ich_id == ch.ich_id)
-                {
-                    canonical.channels.push(ch);
-                }
-            }
-            for key in source_keys {
-                self.ich_lookup.insert(key, canonical_ilk_id.clone());
-            }
-
-            let ttl_ms = merge_alias_ttl_secs.saturating_mul(1000);
-            let expires_at_ms = now_epoch_ms().saturating_add(ttl_ms);
-            self.aliases.insert(
-                old_ilk.clone(),
-                AliasRecord {
-                    canonical_ilk_id: canonical_ilk_id.clone(),
-                    expires_at_ms,
-                },
-            );
+        if let Some(old_ilk) = req.merge_from_ilk_id.as_deref() {
+            self.merge_temporary_ilk(old_ilk, &canonical_ilk_id, merge_alias_ttl_secs)?;
         }
 
         Ok(json!({
@@ -1084,16 +1518,33 @@ impl IdentityStore {
     fn update_ilk(&mut self, req: IlkUpdateRequest) -> Result<Value, String> {
         let _ = parse_prefixed_uuid(&req.ilk_id, "ilk")?;
 
+        let tenant_id = match self.ilks.get(&req.ilk_id) {
+            Some(entry) if entry.deleted_at_ms.is_none() => entry.tenant_id.clone(),
+            _ => return Err("ILK_NOT_FOUND".to_string()),
+        };
+        // The orchestrator adds a node's own channels: they live in the node's tenant, and a
+        // Fluxbee Cloud account is never one of them. All checked before anything changes.
+        for ch in &req.add_channels {
+            validate_channel_input(ch)?;
+            if is_cloud_account_channel(&ch.channel_type) {
+                return Err("CLOUD_CHANNEL_RESERVED".to_string());
+            }
+            if ch
+                .scope
+                .as_deref()
+                .map(str::trim)
+                .is_some_and(|scope| scope != tenant_id)
+            {
+                return Err("INVALID_SCOPE".to_string());
+            }
+            self.check_ich_id_free(&ch.ich_id, &[req.ilk_id.as_str()])?;
+        }
+
         let entry = self
             .ilks
             .get_mut(&req.ilk_id)
             .ok_or_else(|| "ILK_NOT_FOUND".to_string())?;
-        if entry.deleted_at_ms.is_some() {
-            return Err("ILK_NOT_FOUND".to_string());
-        }
-
         for ch in &req.add_channels {
-            validate_channel_input(ch)?;
             let key = canonical_ich_key(&ch.channel_type, &ch.address, &entry.tenant_id);
             self.ich_lookup.insert(key, req.ilk_id.clone());
             let exists = entry.channels.iter().any(|c| c.ich_id == ch.ich_id);
@@ -1104,6 +1555,7 @@ impl IdentityStore {
                     address: ch.address.clone(),
                     owner_l2_name: None,
                     enabled: false,
+                    scope: entry.tenant_id.clone(),
                 });
             }
         }
@@ -1136,11 +1588,364 @@ impl IdentityStore {
         }))
     }
 
+    // ---- lifecycle: active -> deleted (marked: reversible, hidden, keys RESERVED) -> purged ----
+    // Operator decision (2026-09-28): a normal delete only MARKS; purge is a separate,
+    // deliberate step that requires the mark first. A tenant mark disables the tenant and marks no
+    // ILK (2026-10-14, docs/ilk-tenant-model-v1.md §2.3). Every op VALIDATES before it mutates,
+    // and the handler restores a snapshot on any error.
+
+    fn tenant_is_deleted(&self, tenant_id: &str) -> bool {
+        self.tenants
+            .get(tenant_id)
+            .map(|tenant| tenant.deleted_at_ms.is_some())
+            .unwrap_or(false)
+    }
+
+    /// A new channel's `ich_id` must be nobody else's: the DB keys channels by it, and a second
+    /// channel with the same id would quietly move the first one's row (a channel the scope
+    /// migration moved keeps the id seeded from its old scope). `allowed` are the ILKs a merge
+    /// joins, which may already hold it.
+    fn check_ich_id_free(&self, ich_id: &str, allowed: &[&str]) -> Result<(), String> {
+        let ich_id = ich_id.trim();
+        let holder = self.ilks.values().find(|ilk| {
+            ilk.channels
+                .iter()
+                .any(|channel| channel.ich_id.trim().eq_ignore_ascii_case(ich_id))
+        });
+        match holder {
+            Some(ilk) if !allowed.contains(&ilk.ilk_id.as_str()) => {
+                Err("ICH_ID_CONFLICT".to_string())
+            }
+            _ => Ok(()),
+        }
+    }
+
+    /// A marked ilk keeps its channels RESERVED until purged: provisioning or adding the same
+    /// (channel, address, scope) answers ILK_DELETED instead of minting a new identity.
+    fn deleted_ilk_holding_channel(
+        &self,
+        channel_type: &str,
+        address: &str,
+        scope: &str,
+    ) -> Option<String> {
+        let key = canonical_ich_key(channel_type, address, scope);
+        self.ilks
+            .values()
+            .find(|ilk| {
+                ilk.deleted_at_ms.is_some()
+                    && ilk
+                        .channels
+                        .iter()
+                        .any(|channel| channel_key(channel, &ilk.tenant_id) == key)
+            })
+            .map(|ilk| ilk.ilk_id.clone())
+    }
+
+    /// Same reservation for identification keys (node_name, email).
+    fn deleted_ilk_holding_identification(&self, key: &str, expected: &str) -> Option<String> {
+        let expected = expected.trim();
+        if expected.is_empty() {
+            return None;
+        }
+        self.ilks
+            .values()
+            .find(|ilk| {
+                ilk.deleted_at_ms.is_some()
+                    && identification_str(&ilk.identification, key) == Some(expected)
+            })
+            .map(|ilk| ilk.ilk_id.clone())
+    }
+
+    fn check_ilk_tenant_scope(&self, req: &IlkDeleteRequest) -> Result<(), String> {
+        let expected_tenant = req
+            .tenant_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|v| !v.is_empty());
+        let expected_type = req
+            .ilk_type
+            .as_deref()
+            .map(str::trim)
+            .filter(|v| !v.is_empty());
+        if expected_tenant.is_none() && expected_type.is_none() {
+            return Ok(());
+        }
+        let entry = self
+            .ilks
+            .get(&req.ilk_id)
+            .ok_or_else(|| "ILK_NOT_FOUND".to_string())?;
+        if expected_tenant.is_some_and(|expected| entry.tenant_id != expected) {
+            return Err("ILK_TENANT_MISMATCH".to_string());
+        }
+        if expected_type.is_some_and(|expected| entry.ilk_type.trim() != expected) {
+            return Err("ILK_TYPE_MISMATCH".to_string());
+        }
+        Ok(())
+    }
+
+    /// The people charged to `tenant_id` and not marked: accounts, temporaries and pending
+    /// signups alike. Nothing that happens to their tenant marks or removes them; purging it waits
+    /// until they are charged elsewhere (operator, 2026-10-14: *"no quiero borrar ni desaparecer
+    /// ilk de humanos"*).
+    /// A temporary merged into another ILK is not one: it is an alias of that ILK until the alias
+    /// expires, and it goes with a purge.
+    fn tenant_people(&self, tenant_id: &str) -> Vec<String> {
+        let mut out: Vec<String> = self
+            .ilks
+            .values()
+            .filter(|ilk| {
+                ilk.tenant_id == tenant_id
+                    && ilk.deleted_at_ms.is_none()
+                    && ilk.ilk_type.trim() == "human"
+                    && !self.aliases.contains_key(&ilk.ilk_id)
+            })
+            .map(|ilk| ilk.ilk_id.clone())
+            .collect();
+        out.sort_unstable();
+        out
+    }
+
+    /// ILK_SET_TENANT: charge a person to another tenant, their cost center
+    /// (docs/ilk-tenant-model-v1.md §2.1); never a node (D6). An account moves from anywhere. A
+    /// temporary is a contact of the tenant it wrote to, whose frontdesk registers it in that
+    /// tenant's case, so it moves only out of a deleted tenant: that is how a tenant is emptied
+    /// before its purge (stage 3). Every check runs before anything changes; channels keep their
+    /// scope, so no key moves. Answers the change for the history table, or none when the ILK is
+    /// already charged there.
+    fn set_ilk_tenant(
+        &mut self,
+        req: &IlkSetTenantRequest,
+        changed_by: &str,
+    ) -> Result<(Value, Option<TenantChange>), String> {
+        let _ = parse_prefixed_uuid(&req.ilk_id, "ilk")?;
+        let target = req.tenant_id.trim().to_string();
+        let _ = parse_prefixed_uuid(&target, "tnt")?;
+        if target == DEFAULT_ROOT_TENANT_ID {
+            return Err("TENANT_ROOT_PROTECTED".to_string());
+        }
+        let tenant = self
+            .tenants
+            .get(&target)
+            .ok_or_else(|| "TENANT_NOT_FOUND".to_string())?;
+        if tenant.deleted_at_ms.is_some() {
+            return Err("TENANT_DELETED".to_string());
+        }
+        if tenant.status.trim() != "active" {
+            return Err("TENANT_NOT_ACTIVE".to_string());
+        }
+        let ilk = self
+            .ilks
+            .get(&req.ilk_id)
+            .filter(|ilk| ilk.deleted_at_ms.is_none())
+            .ok_or_else(|| "ILK_NOT_FOUND".to_string())?;
+        if ilk.ilk_type.trim() != "human" {
+            return Err("ILK_TYPE_MISMATCH".to_string());
+        }
+        let previous = ilk.tenant_id.clone();
+        if previous == target {
+            return Ok((
+                json!({"status": "ok", "ilk_id": req.ilk_id, "tenant_id": target,
+                       "previous_tenant_id": previous, "changed": false}),
+                None,
+            ));
+        }
+        if ilk.registration_status != "complete" && !self.tenant_is_deleted(&previous) {
+            return Err(lifecycle_error(
+                "INVALID_TENANT_TRANSITION",
+                &format!(
+                    "a temporary is registered in the case of {previous}, the tenant it wrote to; \
+                     it is charged elsewhere only once that tenant is deleted"
+                ),
+            ));
+        }
+        // Email is still unique per tenant (in memory and in the DB): another person holding it
+        // in the target refuses the move before anything changes.
+        if let Some(email) = identification_str(&ilk.identification, "email") {
+            let email = email.to_string();
+            for deleted in [false, true] {
+                if let Some(other) = self.ilk_holding_email(&target, &email, deleted) {
+                    if other != req.ilk_id {
+                        return Err("DUPLICATE_EMAIL".to_string());
+                    }
+                }
+            }
+        }
+        let ilk = self
+            .ilks
+            .get_mut(&req.ilk_id)
+            .ok_or_else(|| "ILK_NOT_FOUND".to_string())?;
+        fill_channel_scopes(ilk);
+        ilk.tenant_id = target.clone();
+        Ok((
+            json!({"status": "ok", "ilk_id": req.ilk_id, "tenant_id": target,
+                   "previous_tenant_id": previous, "changed": true}),
+            Some(TenantChange {
+                ilk_id: req.ilk_id.clone(),
+                from_tenant_id: previous,
+                to_tenant_id: target,
+                changed_by: changed_by.to_string(),
+            }),
+        ))
+    }
+
+    fn check_ilk_markable(&self, ilk_id: &str) -> Result<&IlkRecord, String> {
+        let entry = self
+            .ilks
+            .get(ilk_id)
+            .ok_or_else(|| "ILK_NOT_FOUND".to_string())?;
+        if is_well_known_system_ilk(entry) || entry.ilk_type.trim() == "system" {
+            return Err("SYSTEM_ILK_PROTECTED".to_string());
+        }
+        Ok(entry)
+    }
+
+    /// Mark one ilk (validated by the caller). Hidden at once: out of the ich lookup (and so out
+    /// of the identity SHM), but every row stays so its keys remain reserved.
+    fn mark_ilk_unchecked(&mut self, ilk_id: &str, reason: &str, now_ms: u64) -> Option<IlkRecord> {
+        let entry = self.ilks.get_mut(ilk_id)?;
+        if entry.deleted_at_ms.is_some() {
+            return None;
+        }
+        entry.deleted_at_ms = Some(now_ms);
+        entry.deleted_reason = Some(reason.to_string());
+        let record = entry.clone();
+        self.ich_lookup.retain(|_, mapped_ilk| mapped_ilk != ilk_id);
+        Some(record)
+    }
+
+    /// Would un-marking this ilk collide with a key an ACTIVE ilk holds now? (Keys are reserved
+    /// while marked, so this only trips on data that predates the reservation.)
+    fn check_ilk_restorable(&self, ilk_id: &str) -> Result<(), String> {
+        let entry = self
+            .ilks
+            .get(ilk_id)
+            .ok_or_else(|| "ILK_NOT_FOUND".to_string())?;
+        for channel in &entry.channels {
+            let mut keys = vec![channel_key(channel, &entry.tenant_id)];
+            // A person's Cloud account left in its old scope (marked before the scope migration)
+            // must not come back as a second account next to the installation-wide one.
+            if is_cloud_account_channel(&channel.channel_type) && entry.ilk_type.trim() == "human" {
+                keys.push(canonical_ich_key(
+                    &channel.channel_type,
+                    &channel.address,
+                    INSTALLATION_SCOPE,
+                ));
+            }
+            for key in keys {
+                if let Some(other) = self.ich_lookup.get(&key) {
+                    if other != ilk_id {
+                        return Err(lifecycle_error(
+                            "ILK_KEY_CONFLICT",
+                            &format!(
+                                "{ilk_id}: channel {}:{} is now held by {other}",
+                                channel.channel_type, channel.address
+                            ),
+                        ));
+                    }
+                }
+            }
+        }
+        for key in ["node_name", "email"] {
+            if let Some(value) = identification_str(&entry.identification, key) {
+                if let Some(other) = self.find_active_ilk_by_identification_key(key, value) {
+                    if other != ilk_id {
+                        return Err(lifecycle_error(
+                            "ILK_KEY_CONFLICT",
+                            &format!("{ilk_id}: {key} {value} is now held by {other}"),
+                        ));
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Un-mark one ilk (validated by the caller) into `changes`: its keys back in the lookup, and a
+    /// person's Fluxbee Cloud account left in its old scope moved to the installation-wide one.
+    fn unmark_ilk_unchecked(&mut self, ilk_id: &str, changes: &mut LifecycleChanges) {
+        let Some(entry) = self.ilks.get_mut(ilk_id) else {
+            return;
+        };
+        entry.deleted_at_ms = None;
+        entry.deleted_reason = None;
+        let record = entry.clone();
+        for channel in &record.channels {
+            self.ich_lookup
+                .insert(channel_key(channel, &record.tenant_id), ilk_id.to_string());
+        }
+        changes
+            .rescoped_ichs
+            .extend(self.move_account_to_installation_scope(ilk_id));
+        changes.ilks.extend(self.ilks.get(ilk_id).cloned());
+    }
+
+    /// A complete person marked before the scope migration comes back with their `cloud` channel in
+    /// their old scope, where provisioning never looks: move it to the installation-wide scope when
+    /// that key is free (nobody holds it, marked or not, and the email is not ambiguous), as the
+    /// migration would have. Answers the channels moved.
+    fn move_account_to_installation_scope(&mut self, ilk_id: &str) -> Vec<String> {
+        let Some(ilk) = self.ilks.get(ilk_id) else {
+            return Vec::new();
+        };
+        if ilk.ilk_type.trim() != "human" || ilk.registration_status != "complete" {
+            return Vec::new();
+        }
+        let tenant_id = ilk.tenant_id.clone();
+        let candidates: Vec<ChannelRecord> = ilk
+            .channels
+            .iter()
+            .filter(|channel| {
+                is_cloud_account_channel(&channel.channel_type)
+                    && channel_scope(channel, &tenant_id) != INSTALLATION_SCOPE
+            })
+            .cloned()
+            .collect();
+        let mut moved = Vec::new();
+        for channel in candidates {
+            let to = canonical_ich_key(&channel.channel_type, &channel.address, INSTALLATION_SCOPE);
+            let free = !self.ich_lookup.contains_key(&to)
+                && self
+                    .deleted_ilk_holding_channel(
+                        &channel.channel_type,
+                        &channel.address,
+                        INSTALLATION_SCOPE,
+                    )
+                    .is_none()
+                && !self
+                    .ambiguous_account_emails
+                    .contains(&channel.address.trim().to_ascii_lowercase());
+            if !free {
+                continue;
+            }
+            let from = channel_key(&channel, &tenant_id);
+            if self.ich_lookup.get(&from).map(String::as_str) == Some(ilk_id) {
+                self.ich_lookup.remove(&from);
+            }
+            self.ich_lookup.insert(to, ilk_id.to_string());
+            if let Some(held) = self
+                .ilks
+                .get_mut(ilk_id)
+                .and_then(|ilk| ilk.channels.iter_mut().find(|c| c.ich_id == channel.ich_id))
+            {
+                held.scope = INSTALLATION_SCOPE.to_string();
+            }
+            moved.push(channel.ich_id);
+        }
+        if !moved.is_empty() {
+            tracing::info!(
+                ilk_id,
+                channels = moved.len(),
+                "a restored person's Fluxbee Cloud account moved to the installation-wide scope"
+            );
+        }
+        moved
+    }
+
     /// Enumerate alias `old_ilk_id`s that reference `ilk_id` either as their
-    /// own key or as their canonical target. Used by the `MSG_ILK_DELETE`
-    /// handler to emit explicit `AliasDelete` deltas so replicas and the
-    /// identity SHM converge — `apply_identity_shm_event`'s `IlkDelete` arm
-    /// only clears ich/ilk entries, never aliases.
+    /// own key or as their canonical target. Purge emits explicit `AliasDelete`
+    /// deltas for them so replicas and the identity SHM converge —
+    /// `apply_identity_shm_event`'s `IlkDelete` arm only clears ich/ilk entries,
+    /// never aliases.
     fn alias_old_ids_referencing(&self, ilk_id: &str) -> Vec<String> {
         self.aliases
             .iter()
@@ -1151,27 +1956,333 @@ impl IdentityStore {
             .collect()
     }
 
-    fn delete_ilk(&mut self, req: IlkDeleteRequest) -> Result<Value, String> {
-        let _ = parse_prefixed_uuid(&req.ilk_id, "ilk")?;
-        let entry = self
-            .ilks
-            .get(&req.ilk_id)
-            .ok_or_else(|| "ILK_NOT_FOUND".to_string())?;
-        if is_well_known_system_ilk(entry) {
-            return Err("SYSTEM_ILK_PROTECTED".to_string());
-        }
-        let removed_aliases = self.alias_old_ids_referencing(&req.ilk_id);
+    /// Physical removal (the old delete_ilk): the ilk, its ich lookups and its aliases.
+    fn remove_ilk_physically(&mut self, ilk_id: &str) -> Vec<String> {
+        let removed_aliases = self.alias_old_ids_referencing(ilk_id);
         for old_ilk_id in &removed_aliases {
             self.aliases.remove(old_ilk_id);
         }
         self.ich_lookup
-            .retain(|_, mapped_ilk| mapped_ilk != &req.ilk_id);
-        self.ilks.remove(&req.ilk_id);
-        Ok(json!({
-            "status": "ok",
-            "ilk_id": req.ilk_id,
-            "removed_alias_count": removed_aliases.len(),
-        }))
+            .retain(|_, mapped_ilk| mapped_ilk != ilk_id);
+        self.ilks.remove(ilk_id);
+        removed_aliases
+    }
+
+    /// ILK_DELETE: MARK (reversible). Idempotent: an already-marked ilk answers ok.
+    fn delete_ilk(
+        &mut self,
+        req: IlkDeleteRequest,
+        now_ms: u64,
+    ) -> Result<(Value, LifecycleChanges), String> {
+        let _ = parse_prefixed_uuid(&req.ilk_id, "ilk")?;
+        self.check_ilk_markable(&req.ilk_id)?;
+        self.check_ilk_tenant_scope(&req)?;
+        let mut changes = LifecycleChanges::default();
+        let marked = self.mark_ilk_unchecked(&req.ilk_id, DELETED_REASON_DIRECT, now_ms);
+        let already_deleted = marked.is_none();
+        changes.ilks.extend(marked);
+        Ok((
+            json!({
+                "status": "ok",
+                "ilk_id": req.ilk_id,
+                "state": "deleted",
+                "already_deleted": already_deleted,
+            }),
+            changes,
+        ))
+    }
+
+    /// ILK_RESTORE: un-mark. A person also comes back while their tenant is marked, still charged
+    /// to it, and can then be charged elsewhere (`set_ilk_tenant`): what happens to a tenant never
+    /// strands a person. Any other ILK waits for its tenant to be restored (a node is born and dies
+    /// in its tenant, D6).
+    fn restore_ilk(&mut self, req: IlkDeleteRequest) -> Result<(Value, LifecycleChanges), String> {
+        let _ = parse_prefixed_uuid(&req.ilk_id, "ilk")?;
+        self.check_ilk_tenant_scope(&req)?;
+        let entry = self
+            .ilks
+            .get(&req.ilk_id)
+            .ok_or_else(|| "ILK_NOT_FOUND".to_string())?;
+        if entry.deleted_at_ms.is_none() {
+            return Err("ILK_NOT_DELETED".to_string());
+        }
+        if entry.ilk_type.trim() != "human" && self.tenant_is_deleted(&entry.tenant_id) {
+            return Err(lifecycle_error(
+                "TENANT_DELETED",
+                &format!("tenant {} is marked deleted; restore the tenant", entry.tenant_id),
+            ));
+        }
+        self.check_ilk_restorable(&req.ilk_id)?;
+        let mut changes = LifecycleChanges::default();
+        self.unmark_ilk_unchecked(&req.ilk_id, &mut changes);
+        Ok((
+            json!({"status": "ok", "ilk_id": req.ilk_id, "state": "active"}),
+            changes,
+        ))
+    }
+
+    /// ILK_PURGE: physical and final. Only a MARKED ilk can be purged.
+    fn purge_ilk(&mut self, req: IlkDeleteRequest) -> Result<(Value, LifecycleChanges), String> {
+        let _ = parse_prefixed_uuid(&req.ilk_id, "ilk")?;
+        self.check_ilk_tenant_scope(&req)?;
+        let entry = self.check_ilk_markable(&req.ilk_id)?;
+        if entry.deleted_at_ms.is_none() {
+            return Err(lifecycle_error(
+                "ILK_NOT_DELETED",
+                "purge requires the ilk to be marked deleted first (ILK_DELETE)",
+            ));
+        }
+        let mut changes = LifecycleChanges::default();
+        changes.purged_aliases = self.remove_ilk_physically(&req.ilk_id);
+        changes.purged_ilks.push(req.ilk_id.clone());
+        Ok((
+            json!({
+                "status": "ok",
+                "ilk_id": req.ilk_id,
+                "state": "purged",
+                "removed_alias_count": changes.purged_aliases.len(),
+            }),
+            changes,
+        ))
+    }
+
+    fn tenant_record_for_lifecycle(&self, tenant_id: &str) -> Result<&TenantRecord, String> {
+        let _ = parse_prefixed_uuid(tenant_id, "tnt")?;
+        let tenant = self
+            .tenants
+            .get(tenant_id)
+            .ok_or_else(|| "TENANT_NOT_FOUND".to_string())?;
+        if tenant_id == DEFAULT_ROOT_TENANT_ID {
+            return Err("TENANT_ROOT_PROTECTED".to_string());
+        }
+        Ok(tenant)
+    }
+
+    /// Ilks a tenant mark/purge must not take down: running nodes belong to the orchestrator.
+    fn tenant_node_ilks(&self, tenant_id: &str) -> Vec<String> {
+        let mut out: Vec<String> = self
+            .ilks
+            .values()
+            .filter(|ilk| {
+                ilk.tenant_id == tenant_id
+                    && ilk.deleted_at_ms.is_none()
+                    && (ilk.ilk_type.trim() == "system"
+                        || identification_str(&ilk.identification, "node_name").is_some())
+            })
+            .map(|ilk| {
+                identification_str(&ilk.identification, "node_name")
+                    .unwrap_or(&ilk.ilk_id)
+                    .to_string()
+            })
+            .collect();
+        out.sort_unstable();
+        out
+    }
+
+    fn tenant_children(&self, tenant_id: &str, include_deleted: bool) -> Vec<String> {
+        let mut out: Vec<String> = self
+            .tenants
+            .values()
+            .filter(|tenant| {
+                tenant.sponsor_tenant_id.as_deref() == Some(tenant_id)
+                    && (include_deleted || tenant.deleted_at_ms.is_none())
+            })
+            .map(|tenant| tenant.tenant_id.clone())
+            .collect();
+        out.sort_unstable();
+        out
+    }
+
+    /// TNT_DELETE: mark the tenant, i.e. disable it (docs/ilk-tenant-model-v1.md §2.3). No ILK is
+    /// marked: its people stay usable and can be charged elsewhere, and restoring the tenant brings
+    /// it back as it was. Refused while it still runs nodes or sponsors active tenants. Answers how
+    /// many people are still charged to it (they block its purge).
+    fn delete_tenant(
+        &mut self,
+        req: TntLifecycleRequest,
+        now_ms: u64,
+    ) -> Result<(Value, LifecycleChanges), String> {
+        let tenant = self.tenant_record_for_lifecycle(&req.tenant_id)?;
+        let people_charged = self.tenant_people(&req.tenant_id).len();
+        if tenant.deleted_at_ms.is_some() {
+            return Ok((
+                json!({"status": "ok", "tenant_id": req.tenant_id, "state": "deleted",
+                       "already_deleted": true, "people_charged": people_charged}),
+                LifecycleChanges::default(),
+            ));
+        }
+        let children = self.tenant_children(&req.tenant_id, false);
+        if !children.is_empty() {
+            return Err(lifecycle_error(
+                "TENANT_HAS_CHILDREN",
+                &format!("sponsors active tenants: {}", children.join(", ")),
+            ));
+        }
+        let nodes = self.tenant_node_ilks(&req.tenant_id);
+        if !nodes.is_empty() {
+            return Err(lifecycle_error(
+                "TENANT_HAS_NODES",
+                &format!(
+                    "node identities still in the tenant (kill+purge them first): {}",
+                    nodes.join(", ")
+                ),
+            ));
+        }
+        let mut changes = LifecycleChanges::default();
+        if let Some(tenant) = self.tenants.get_mut(&req.tenant_id) {
+            tenant.deleted_at_ms = Some(now_ms);
+            changes.tenants.push(tenant.clone());
+        }
+        Ok((
+            json!({"status": "ok", "tenant_id": req.tenant_id, "state": "deleted",
+                   "already_deleted": false, "people_charged": people_charged}),
+            changes,
+        ))
+    }
+
+    /// TNT_RESTORE: un-mark the tenant. Its people were never marked, so it comes back as it was.
+    fn restore_tenant(
+        &mut self,
+        req: TntLifecycleRequest,
+    ) -> Result<(Value, LifecycleChanges), String> {
+        let tenant = self.tenant_record_for_lifecycle(&req.tenant_id)?;
+        if tenant.deleted_at_ms.is_none() {
+            return Err("TENANT_NOT_DELETED".to_string());
+        }
+        if let Some(sponsor) = tenant.sponsor_tenant_id.as_deref() {
+            if self.tenant_is_deleted(sponsor) {
+                return Err(lifecycle_error(
+                    "TENANT_DELETED",
+                    &format!("its sponsor {sponsor} is marked deleted; restore the sponsor first"),
+                ));
+            }
+        }
+        let mut changes = LifecycleChanges::default();
+        if let Some(tenant) = self.tenants.get_mut(&req.tenant_id) {
+            tenant.deleted_at_ms = None;
+            changes.tenants.push(tenant.clone());
+        }
+        Ok((
+            json!({"status": "ok", "tenant_id": req.tenant_id, "state": "active",
+                   "people_charged": self.tenant_people(&req.tenant_id).len()}),
+            changes,
+        ))
+    }
+
+    /// TNT_PURGE: physical and final -- the tenant and every ilk in it. Only a MARKED tenant;
+    /// never one that still sponsors tenants (deleted or not), runs nodes or has people charged to
+    /// it: a person is moved out first (`set_ilk_tenant`), never removed with the tenant. A person
+    /// already marked on their own goes with it. Vault references are checked by SY.admin before it
+    /// calls this (identity cannot see the vault).
+    fn purge_tenant(
+        &mut self,
+        req: TntLifecycleRequest,
+    ) -> Result<(Value, LifecycleChanges), String> {
+        let tenant = self.tenant_record_for_lifecycle(&req.tenant_id)?;
+        if tenant.deleted_at_ms.is_none() {
+            return Err(lifecycle_error(
+                "TENANT_NOT_DELETED",
+                "purge requires the tenant to be marked deleted first (TNT_DELETE)",
+            ));
+        }
+        let children = self.tenant_children(&req.tenant_id, true);
+        if !children.is_empty() {
+            return Err(lifecycle_error(
+                "TENANT_HAS_CHILDREN",
+                &format!("sponsors tenants (purge them first): {}", children.join(", ")),
+            ));
+        }
+        let nodes = self.tenant_node_ilks(&req.tenant_id);
+        if !nodes.is_empty() {
+            return Err(lifecycle_error(
+                "TENANT_HAS_NODES",
+                &format!("node identities still in the tenant: {}", nodes.join(", ")),
+            ));
+        }
+        let people = self.tenant_people(&req.tenant_id);
+        if !people.is_empty() {
+            const SHOWN: usize = 20;
+            let more = people.len().saturating_sub(SHOWN);
+            return Err(lifecycle_error(
+                "TENANT_HAS_PEOPLE",
+                &format!(
+                    "{} people are still charged to the tenant; charge them elsewhere first \
+                     (set_ilk_tenant): {}{}",
+                    people.len(),
+                    people[..people.len().min(SHOWN)].join(", "),
+                    if more > 0 {
+                        format!(" and {more} more")
+                    } else {
+                        String::new()
+                    }
+                ),
+            ));
+        }
+        let mut ilk_ids: Vec<String> = self
+            .ilks
+            .values()
+            .filter(|ilk| ilk.tenant_id == req.tenant_id)
+            .map(|ilk| ilk.ilk_id.clone())
+            .collect();
+        ilk_ids.sort_unstable();
+        for ilk_id in &ilk_ids {
+            if self.ilks.get(ilk_id).map(is_well_known_system_ilk).unwrap_or(false) {
+                return Err("SYSTEM_ILK_PROTECTED".to_string());
+            }
+        }
+        let mut changes = LifecycleChanges::default();
+        for ilk_id in &ilk_ids {
+            changes
+                .purged_aliases
+                .extend(self.remove_ilk_physically(ilk_id));
+            changes.purged_ilks.push(ilk_id.clone());
+        }
+        let dropped_channels = self.drop_channels_in_scope(&req.tenant_id, &mut changes);
+        self.tenants.remove(&req.tenant_id);
+        changes.purged_tenants.push(req.tenant_id.clone());
+        Ok((
+            json!({"status": "ok", "tenant_id": req.tenant_id, "state": "purged",
+                   "purged_ilks": changes.purged_ilks.len(),
+                   "dropped_channels": dropped_channels}),
+            changes,
+        ))
+    }
+
+    /// The channels other ILKs still hold in a purged tenant's scope (a person charged elsewhere
+    /// keeps the keys of the tenant they left) go with it: their namespace is gone, and no node of
+    /// that tenant is left to look them up (TENANT_HAS_NODES). Answers how many.
+    fn drop_channels_in_scope(&mut self, scope: &str, changes: &mut LifecycleChanges) -> usize {
+        let mut holders: Vec<String> = self
+            .ilks
+            .values()
+            .filter(|ilk| {
+                ilk.channels
+                    .iter()
+                    .any(|channel| channel_scope(channel, &ilk.tenant_id) == scope)
+            })
+            .map(|ilk| ilk.ilk_id.clone())
+            .collect();
+        holders.sort_unstable();
+        let mut dropped = 0;
+        for ilk_id in holders {
+            let Some(ilk) = self.ilks.get_mut(&ilk_id) else {
+                continue;
+            };
+            let (gone, kept): (Vec<ChannelRecord>, Vec<ChannelRecord>) =
+                std::mem::take(&mut ilk.channels)
+                    .into_iter()
+                    .partition(|channel| channel_scope(channel, &ilk.tenant_id) == scope);
+            ilk.channels = kept;
+            for channel in &gone {
+                let key = channel_key(channel, &ilk.tenant_id);
+                if self.ich_lookup.get(&key) == Some(&ilk_id) {
+                    self.ich_lookup.remove(&key);
+                }
+            }
+            dropped += gone.len();
+            changes.trimmed_ilks.push(ilk.clone());
+        }
+        dropped
     }
 
     fn create_tenant(&mut self, req: TntCreateRequest) -> Result<Value, String> {
@@ -1180,6 +2291,9 @@ impl IdentityStore {
             let _ = parse_prefixed_uuid(sponsor_tenant_id, "tnt")?;
             if !self.tenants.contains_key(sponsor_tenant_id) {
                 return Err("INVALID_SPONSOR_TENANT".to_string());
+            }
+            if self.tenant_is_deleted(sponsor_tenant_id) {
+                return Err("TENANT_DELETED".to_string());
             }
         }
         let normalized_name = req.name.trim().to_string();
@@ -1201,6 +2315,9 @@ impl IdentityStore {
         if let Some((tenant, matched_by)) =
             self.find_tenant_by_hint(&normalized_name, normalized_domain.as_deref())
         {
+            if tenant.deleted_at_ms.is_some() {
+                return Err("TENANT_DELETED".to_string());
+            }
             return Ok(json!({
                 "status": "ok",
                 "tenant_id": tenant.tenant_id,
@@ -1215,6 +2332,7 @@ impl IdentityStore {
         self.tenants.insert(
             tenant_id.clone(),
             TenantRecord {
+                deleted_at_ms: None,
                 tenant_id: tenant_id.clone(),
                 name: normalized_name,
                 domain: normalized_domain,
@@ -1288,26 +2406,86 @@ impl IdentityStore {
     fn update_tenant(&mut self, req: TntUpdateRequest) -> Result<Value, String> {
         let tenant_id = req.tenant_id.trim().to_string();
         let _ = parse_prefixed_uuid(&tenant_id, "tnt")?;
+        // The root tenant is the system's own: SY.identity rewrites it at every boot and resync
+        // (`ensure_default_root_tenant`), so an edit would be undone later without a word. Refused
+        // up front, like delete, restore and purge.
+        if tenant_id == DEFAULT_ROOT_TENANT_ID {
+            return Err("TENANT_ROOT_PROTECTED".to_string());
+        }
         let sponsor_update =
             self.parse_optional_sponsor_update(&tenant_id, req.sponsor_tenant_id)?;
+        if let Some(Some(sponsor)) = sponsor_update.as_ref() {
+            if self.tenant_is_deleted(sponsor) {
+                return Err("TENANT_DELETED".to_string());
+            }
+        }
+
+        let current = self
+            .tenants
+            .get(&tenant_id)
+            .ok_or_else(|| "TENANT_NOT_FOUND".to_string())?;
+        if current.deleted_at_ms.is_some() {
+            return Err("TENANT_DELETED".to_string());
+        }
+
+        // Every field is checked before any changes, so a refused update leaves the tenant as it
+        // was.
+        let name = match req.name {
+            Some(name) => {
+                validate_non_empty("name", &name)?;
+                Some(name.trim().to_string())
+            }
+            None => None,
+        };
+        // `Some(None)` clears the domain (an empty string).
+        let domain = req
+            .domain
+            .map(|domain| normalize_tenant_domain(Some(&domain)));
+        let status = match req.status {
+            Some(status) => {
+                let status = status.trim().to_ascii_lowercase();
+                if !matches!(status.as_str(), "pending" | "active" | "suspended") {
+                    return Err("INVALID_REQUEST".to_string());
+                }
+                Some(status)
+            }
+            None => None,
+        };
+        // create_tenant finds a tenant by its domain, then by its name, so two tenants must never
+        // share either. Another tenant holding it, marked deleted or not (a deleted tenant keeps
+        // its name and domain reserved), refuses the change; keeping the current value is no change.
+        if let Some(name) = name.as_deref() {
+            if normalize_tenant_name(name) != normalize_tenant_name(&current.name)
+                && self.another_tenant_holds(&tenant_id, |other| {
+                    normalize_tenant_name(&other.name) == normalize_tenant_name(name)
+                })
+            {
+                return Err("TENANT_NAME_TAKEN".to_string());
+            }
+        }
+        if let Some(Some(domain)) = domain.as_ref() {
+            if normalize_tenant_domain(current.domain.as_deref()).as_deref()
+                != Some(domain.as_str())
+                && self.another_tenant_holds(&tenant_id, |other| {
+                    normalize_tenant_domain(other.domain.as_deref()).as_deref()
+                        == Some(domain.as_str())
+                })
+            {
+                return Err("TENANT_DOMAIN_TAKEN".to_string());
+            }
+        }
 
         let tenant = self
             .tenants
             .get_mut(&tenant_id)
             .ok_or_else(|| "TENANT_NOT_FOUND".to_string())?;
-
-        if let Some(name) = req.name {
-            validate_non_empty("name", &name)?;
-            tenant.name = name.trim().to_string();
+        if let Some(name) = name {
+            tenant.name = name;
         }
-        if let Some(domain) = req.domain {
-            tenant.domain = normalize_tenant_domain(Some(&domain));
+        if let Some(domain) = domain {
+            tenant.domain = domain;
         }
-        if let Some(status) = req.status {
-            let status = status.trim().to_ascii_lowercase();
-            if !matches!(status.as_str(), "pending" | "active" | "suspended") {
-                return Err("INVALID_REQUEST".to_string());
-            }
+        if let Some(status) = status {
             tenant.status = status;
         }
         if let Some(settings) = req.settings {
@@ -1322,6 +2500,13 @@ impl IdentityStore {
             "tenant_id": tenant_id,
             "sponsor_tenant_id": tenant.sponsor_tenant_id,
         }))
+    }
+
+    /// Whether a tenant other than `tenant_id` matches `holds`.
+    fn another_tenant_holds(&self, tenant_id: &str, holds: impl Fn(&TenantRecord) -> bool) -> bool {
+        self.tenants
+            .values()
+            .any(|other| other.tenant_id != tenant_id && holds(other))
     }
 
     fn set_tenant_sponsor(&mut self, req: TntSetSponsorRequest) -> Result<Value, String> {
@@ -1384,6 +2569,9 @@ impl IdentityStore {
             .tenants
             .get_mut(&req.tenant_id)
             .ok_or_else(|| "INVALID_TENANT".to_string())?;
+        if tenant.deleted_at_ms.is_some() {
+            return Err("TENANT_DELETED".to_string());
+        }
         tenant.status = "active".to_string();
 
         Ok(json!({
@@ -1482,7 +2670,9 @@ impl IdentityStore {
                     .insert(tenant.tenant_id.clone(), tenant.clone());
             }
             for ilk in &chunk.ilks {
-                store.ilks.insert(ilk.ilk_id.clone(), ilk.clone());
+                let mut ilk = ilk.clone();
+                fill_channel_scopes(&mut ilk);
+                store.ilks.insert(ilk.ilk_id.clone(), ilk);
             }
             for alias in &chunk.aliases {
                 store.aliases.insert(
@@ -1500,9 +2690,9 @@ impl IdentityStore {
                 continue;
             }
             for channel in &ilk.channels {
-                let key =
-                    canonical_ich_key(&channel.channel_type, &channel.address, &ilk.tenant_id);
-                store.ich_lookup.insert(key, ilk_id.clone());
+                store
+                    .ich_lookup
+                    .insert(channel_key(channel, &ilk.tenant_id), ilk_id.clone());
             }
         }
 
@@ -1517,18 +2707,18 @@ impl IdentityStore {
             IdentityDelta::TenantUpsert { tenant } => {
                 self.tenants.insert(tenant.tenant_id.clone(), tenant);
             }
-            IdentityDelta::IlkUpsert { ilk } => {
+            IdentityDelta::TenantDelete { tenant_id } => {
+                self.tenants.remove(&tenant_id);
+            }
+            IdentityDelta::IlkUpsert { mut ilk } => {
+                fill_channel_scopes(&mut ilk);
                 let ilk_id = ilk.ilk_id.clone();
                 self.ich_lookup
                     .retain(|_, mapped_ilk| mapped_ilk != &ilk_id);
                 if ilk.deleted_at_ms.is_none() {
                     for channel in &ilk.channels {
-                        let key = canonical_ich_key(
-                            &channel.channel_type,
-                            &channel.address,
-                            &ilk.tenant_id,
-                        );
-                        self.ich_lookup.insert(key, ilk_id.clone());
+                        self.ich_lookup
+                            .insert(channel_key(channel, &ilk.tenant_id), ilk_id.clone());
                     }
                 }
                 self.ilks.insert(ilk_id, ilk);
@@ -1591,7 +2781,30 @@ impl IdentityStore {
         hive_id: &str,
         incoming: Vec<IlkRecord>,
     ) -> Vec<IdentityDelta> {
+        // Every id the replica pushed counts as present, even one refused below: a refused push
+        // leaves the primary's record as it is, never removes it.
         let incoming_ids: HashSet<String> = incoming.iter().map(|ilk| ilk.ilk_id.clone()).collect();
+        // A replica on an older version sends no channel scope: fill it before comparing, or every
+        // push would look changed. Then only channels a replica may hold (see
+        // `replica_channels_acceptable`).
+        let incoming: Vec<IlkRecord> = incoming
+            .into_iter()
+            .map(|mut ilk| {
+                fill_channel_scopes(&mut ilk);
+                ilk
+            })
+            .filter(|ilk| {
+                let acceptable = replica_push_acceptable(ilk, self.ilks.get(&ilk.ilk_id));
+                if !acceptable {
+                    tracing::warn!(
+                        ilk_id = %ilk.ilk_id,
+                        hive_id = %hive_id,
+                        "replica push ignored: it changes the ILK's tenant, or a node channel names another scope or a Fluxbee Cloud account"
+                    );
+                }
+                acceptable
+            })
+            .collect();
         let stale: Vec<String> = self
             .ilks
             .values()
@@ -1705,6 +2918,9 @@ fn delta_authorized_for_hive(
             if !ingest_ilk_type_authorized(ilk, publisher_hive) {
                 return false;
             }
+            if !replica_push_acceptable(ilk, store.ilks.get(&ilk.ilk_id)) {
+                return false;
+            }
             match store.ilks.get(&ilk.ilk_id) {
                 Some(existing) => ilk_owning_hive(existing).as_deref() == Some(publisher_hive),
                 None => true,
@@ -1713,6 +2929,8 @@ fn delta_authorized_for_hive(
         IdentityDelta::IlkDelete { ilk_id } => {
             store.ilks.get(ilk_id).and_then(ilk_owning_hive).as_deref() == Some(publisher_hive)
         }
+        // Tenant lifecycle is primary-only, like TenantUpsert.
+        IdentityDelta::TenantDelete { .. } => false,
         IdentityDelta::AliasUpsert { alias } => {
             // Both the redirected source id (`old_ilk_id`, the key the alias is
             // stored under and the id whose resolution it hijacks) AND the
@@ -1757,6 +2975,9 @@ struct IdentityRuntime {
     // special full names allowed are represented as exacts in `allowed_exacts`.
     allowed_prefixes: HashMap<&'static str, Vec<&'static str>>,
     allowed_exacts: HashMap<&'static str, HashSet<String>>,
+    /// The Fluxbee Cloud relay, the only caller that may write a `cloud` channel (an account's
+    /// email) and the installation-wide scope. IO.cloud runs on the primary's hive.
+    cloud_relay: String,
 }
 
 impl IdentityRuntime {
@@ -1784,19 +3005,22 @@ impl IdentityRuntime {
             MSG_ICH_SET_ENABLED,
             vec!["IO.", "SY.admin@", "SY.architect@", "SY.frontdesk.gov@"],
         );
-        allowed_prefixes.insert(
-            MSG_TNT_CREATE,
-            vec!["SY.admin@", "SY.architect@", "SY.frontdesk.gov@"],
-        );
-        allowed_prefixes.insert(
-            MSG_TNT_UPDATE,
-            vec!["SY.admin@", "SY.architect@", "SY.frontdesk.gov@"],
-        );
-        allowed_prefixes.insert(
-            MSG_TNT_SET_SPONSOR,
-            vec!["SY.admin@", "SY.architect@", "SY.frontdesk.gov@"],
-        );
+        // Tenants come from the operator (SY.admin, which also relays Fluxbee Cloud) and from
+        // Archi. The frontdesk never creates or changes one: a registration goes into the tenant
+        // its case already has (operator decision 2026-10-02).
+        allowed_prefixes.insert(MSG_TNT_CREATE, vec!["SY.admin@", "SY.architect@"]);
+        allowed_prefixes.insert(MSG_TNT_UPDATE, vec!["SY.admin@", "SY.architect@"]);
+        allowed_prefixes.insert(MSG_TNT_SET_SPONSOR, vec!["SY.admin@", "SY.architect@"]);
         allowed_prefixes.insert(MSG_TNT_APPROVE, vec!["SY.admin@"]);
+        allowed_prefixes.insert(MSG_ILK_RESTORE, vec!["SY.admin@"]);
+        // Charging a person to another tenant: the operator and Fluxbee Cloud (both through
+        // SY.admin) and Archi.
+        allowed_prefixes.insert(MSG_ILK_SET_TENANT, vec!["SY.admin@", "SY.architect@"]);
+        // The orchestrator purges the ilk of a node it kills with purge_instance.
+        allowed_prefixes.insert(MSG_ILK_PURGE, vec!["SY.admin@", "SY.orchestrator@"]);
+        allowed_prefixes.insert(MSG_TNT_DELETE, vec!["SY.admin@"]);
+        allowed_prefixes.insert(MSG_TNT_RESTORE, vec!["SY.admin@"]);
+        allowed_prefixes.insert(MSG_TNT_PURGE, vec!["SY.admin@"]);
         allowed_prefixes.insert("CONFIG_GET", vec!["SY.admin@"]);
         allowed_prefixes.insert("CONFIG_SET", vec!["SY.admin@"]);
 
@@ -1819,18 +3043,6 @@ impl IdentityRuntime {
             allowed_exacts
                 .entry(MSG_ICH_SET_ENABLED)
                 .or_default()
-                .insert(frontdesk_node.clone());
-            allowed_exacts
-                .entry(MSG_TNT_CREATE)
-                .or_default()
-                .insert(frontdesk_node.clone());
-            allowed_exacts
-                .entry(MSG_TNT_UPDATE)
-                .or_default()
-                .insert(frontdesk_node.clone());
-            allowed_exacts
-                .entry(MSG_TNT_SET_SPONSOR)
-                .or_default()
                 .insert(frontdesk_node);
         }
 
@@ -1848,7 +3060,107 @@ impl IdentityRuntime {
             store: IdentityStore::with_default_tenant(),
             allowed_prefixes,
             allowed_exacts,
+            cloud_relay: format!("IO.cloud@{}", hive.hive_id),
         }
+    }
+
+    /// Run one lifecycle op: snapshot -> op -> persist in ONE transaction -> deltas. Any error
+    /// (validation or DB) restores the snapshot, so a half-applied op never survives in memory.
+    async fn run_lifecycle_op(
+        &mut self,
+        deltas: &mut Vec<IdentityDeltaEnvelope>,
+        context: &str,
+        op: impl FnOnce(&mut IdentityStore) -> Result<(Value, LifecycleChanges), String>,
+    ) -> Value {
+        let snapshot = self.store.clone();
+        let (ok, changes) = match op(&mut self.store) {
+            Ok(done) => done,
+            Err(code) => {
+                self.store = snapshot;
+                return op_error_payload(&code, context);
+            }
+        };
+        if self.is_primary {
+            if let Some(database_config) = self.db_config.as_ref() {
+                if let Err(err) = persist_lifecycle_in_db(database_config, &changes).await {
+                    self.store = snapshot;
+                    return db_write_error_payload(context, err.as_ref());
+                }
+            }
+        }
+        for tenant in changes.tenants {
+            deltas.push(delta_envelope(IdentityDelta::TenantUpsert { tenant }));
+        }
+        for ilk in changes.ilks.into_iter().chain(changes.trimmed_ilks) {
+            deltas.push(delta_envelope(IdentityDelta::IlkUpsert { ilk }));
+        }
+        for old_ilk_id in changes.purged_aliases {
+            deltas.push(delta_envelope(IdentityDelta::AliasDelete { old_ilk_id }));
+        }
+        for ilk_id in changes.purged_ilks {
+            deltas.push(delta_envelope(IdentityDelta::IlkDelete { ilk_id }));
+        }
+        for tenant_id in changes.purged_tenants {
+            deltas.push(delta_envelope(IdentityDelta::TenantDelete { tenant_id }));
+        }
+        ok
+    }
+
+    /// Persist (on the primary) the ilks one action changed, with the alias a merge left, in ONE
+    /// transaction, then queue their deltas. A DB error restores `snapshot` and answers the error
+    /// instead of `ok`.
+    async fn commit_ilk_changes(
+        &mut self,
+        deltas: &mut Vec<IdentityDeltaEnvelope>,
+        snapshot: Option<IdentityStore>,
+        ilk_ids: &[String],
+        alias: Option<AliasSnapshotRecord>,
+        context: &str,
+        ok: Value,
+    ) -> Value {
+        self.commit_ilk_changes_with_history(deltas, snapshot, ilk_ids, alias, None, context, ok)
+            .await
+    }
+
+    /// Persist changed ilks (plus a merge's alias and a tenant change's history row) in one
+    /// transaction, then queue their deltas; on a DB error the store goes back to `snapshot`.
+    #[allow(clippy::too_many_arguments)]
+    async fn commit_ilk_changes_with_history(
+        &mut self,
+        deltas: &mut Vec<IdentityDeltaEnvelope>,
+        snapshot: Option<IdentityStore>,
+        ilk_ids: &[String],
+        alias: Option<AliasSnapshotRecord>,
+        history: Option<&TenantChange>,
+        context: &str,
+        ok: Value,
+    ) -> Value {
+        let ilks: Vec<IlkRecord> = ilk_ids
+            .iter()
+            .filter_map(|ilk_id| self.store.ilks.get(ilk_id).cloned())
+            .collect();
+        if ilks.is_empty() {
+            return ok;
+        }
+        if self.is_primary {
+            if let Some(database_config) = self.db_config.as_ref() {
+                if let Err(err) =
+                    persist_ilks_state_in_db(database_config, &ilks, alias.as_ref(), history).await
+                {
+                    if let Some(snapshot) = snapshot {
+                        self.store = snapshot;
+                    }
+                    return db_write_error_payload(context, err.as_ref());
+                }
+            }
+        }
+        for ilk in ilks {
+            deltas.push(delta_envelope(IdentityDelta::IlkUpsert { ilk }));
+        }
+        if let Some(alias) = alias {
+            deltas.push(delta_envelope(IdentityDelta::AliasUpsert { alias }));
+        }
+        ok
     }
 
     async fn process_system_message(
@@ -1870,12 +3182,24 @@ impl IdentityRuntime {
         let src_l2_name = msg.routing.src_l2_name.as_deref();
 
         if action == MSG_ILK_PROVISION {
+            // Not the payload: its `address` is the person's own handle (phone, email, user id).
+            let ich_id = msg
+                .payload
+                .get("ich_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let channel_type = msg
+                .payload
+                .get("channel_type")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
             tracing::info!(
                 action,
                 trace_id = %trace_id,
                 src_uuid = %msg.routing.src,
                 src_l2_name = src_l2_name.unwrap_or("<unknown>"),
-                payload = %msg.payload,
+                ich_id,
+                channel_type,
                 "identity received ILK_PROVISION request"
             );
         }
@@ -1978,15 +3302,24 @@ impl IdentityRuntime {
 
         let mut deltas: Vec<IdentityDeltaEnvelope> = Vec::new();
         let payload = match action {
-            MSG_ILK_LIST => self.store.list_ilks_payload(),
+            MSG_ILK_LIST => self.store.list_ilks_payload(
+                payload_include_deleted(&msg.payload),
+                msg.payload.get("pending_signup").and_then(Value::as_bool) == Some(true),
+            ),
             MSG_ILK_GET => match serde_json::from_value::<IlkGetRequest>(msg.payload.clone()) {
-                Ok(req) => match self.store.get_ilk_payload(&req.ilk_id) {
+                Ok(req) => match self
+                    .store
+                    .get_ilk_payload(&req.ilk_id, req.tenant_id.as_deref())
+                {
                     Ok(ok) => ok,
                     Err(code) => error_payload(&code, "failed to get ilk"),
                 },
                 Err(err) => error_payload("INVALID_REQUEST", &err.to_string()),
             },
-            MSG_TNT_LIST => self.store.list_tenants_payload(),
+            MSG_TNT_LIST => self.store.list_tenants_payload(
+                payload_include_deleted(&msg.payload),
+                msg.payload.get("exclude_root").and_then(Value::as_bool) == Some(true),
+            ),
             MSG_TNT_GET => match serde_json::from_value::<TntGetRequest>(msg.payload.clone()) {
                 Ok(req) => match self.store.get_tenant_payload(&req.tenant_id) {
                     Ok(ok) => ok,
@@ -2003,59 +3336,92 @@ impl IdentityRuntime {
                             None
                         };
                         let provision_started = Instant::now();
-                        match self.store.provision_temporary_ilk(req) {
-                            Ok(ok) => {
+                        match self.store.provision_temporary_ilk(
+                            req,
+                            src_l2_name,
+                            &self.cloud_relay,
+                        ) {
+                            Ok((ok, change)) => {
                                 tracing::info!(
                                     action,
                                     trace_id = %trace_id,
                                     elapsed_us = provision_started.elapsed().as_micros() as u64,
                                     response = %ok,
+                                    recharged = change.is_some(),
                                     "identity store provision completed"
                                 );
-                                if let Some(ilk_id) = ok.get("ilk_id").and_then(Value::as_str) {
-                                    if let Some(ilk) = self.store.ilks.get(ilk_id).cloned() {
-                                        if self.is_primary {
-                                            if let Some(database_config) = self.db_config.as_ref() {
-                                                if let Err(err) = persist_ilk_state_in_db(
-                                                    database_config,
-                                                    &ilk,
-                                                    None,
-                                                )
-                                                .await
-                                                {
-                                                    if let Some(snapshot) = snapshot {
-                                                        self.store = snapshot;
-                                                    }
-                                                    db_write_error_payload(
-                                                        "failed to persist provisioned ilk",
-                                                        err.as_ref(),
-                                                    )
-                                                } else {
-                                                    deltas.push(delta_envelope(
-                                                        IdentityDelta::IlkUpsert { ilk },
-                                                    ));
-                                                    ok
-                                                }
-                                            } else {
-                                                deltas.push(delta_envelope(
-                                                    IdentityDelta::IlkUpsert { ilk },
-                                                ));
-                                                ok
-                                            }
-                                        } else {
-                                            deltas.push(delta_envelope(IdentityDelta::IlkUpsert {
-                                                ilk,
-                                            }));
-                                            ok
-                                        }
-                                    } else {
-                                        ok
-                                    }
-                                } else {
-                                    ok
+                                if let Some(change) = change.as_ref() {
+                                    tracing::info!(
+                                        trace_id = %trace_id,
+                                        ilk_id = %change.ilk_id,
+                                        from_tenant_id = %change.from_tenant_id,
+                                        to_tenant_id = %change.to_tenant_id,
+                                        changed_by = %change.changed_by,
+                                        "a temporary from an abandoned signup is charged to the requesting tenant"
+                                    );
                                 }
+                                // Nothing changed on a plain hit: no write, no delta.
+                                let created =
+                                    ok.get("created").and_then(Value::as_bool) == Some(true);
+                                let changed: Vec<String> = ok
+                                    .get("ilk_id")
+                                    .and_then(Value::as_str)
+                                    .filter(|_| created || change.is_some())
+                                    .map(str::to_string)
+                                    .into_iter()
+                                    .collect();
+                                self.commit_ilk_changes_with_history(
+                                    &mut deltas,
+                                    snapshot,
+                                    &changed,
+                                    None,
+                                    change.as_ref(),
+                                    "failed to persist provisioned ilk",
+                                    ok,
+                                )
+                                .await
                             }
                             Err(code) => error_payload(&code, "failed to provision ilk"),
+                        }
+                    }
+                    Err(err) => error_payload("INVALID_REQUEST", &err.to_string()),
+                }
+            }
+            MSG_ILK_SET_TENANT => {
+                match serde_json::from_value::<IlkSetTenantRequest>(msg.payload.clone()) {
+                    Ok(req) => {
+                        let snapshot = if self.is_primary && self.db_config.is_some() {
+                            Some(self.store.clone())
+                        } else {
+                            None
+                        };
+                        let changed_by = match req.on_behalf_of.as_deref().map(str::trim) {
+                            Some(on_behalf_of) if !on_behalf_of.is_empty() => {
+                                format!("{} for {on_behalf_of}", src_l2_name.unwrap_or("unknown"))
+                            }
+                            _ => src_l2_name.unwrap_or("unknown").to_string(),
+                        };
+                        match self.store.set_ilk_tenant(&req, &changed_by) {
+                            Ok((ok, change)) => {
+                                let changed: Vec<String> = change
+                                    .as_ref()
+                                    .map(|change| change.ilk_id.clone())
+                                    .into_iter()
+                                    .collect();
+                                self.commit_ilk_changes_with_history(
+                                    &mut deltas,
+                                    snapshot,
+                                    &changed,
+                                    None,
+                                    change.as_ref(),
+                                    "failed to persist the tenant change",
+                                    ok,
+                                )
+                                .await
+                            }
+                            Err(code) => {
+                                op_error_payload(&code, "failed to change the ilk's tenant")
+                            }
                         }
                     }
                     Err(err) => error_payload("INVALID_REQUEST", &err.to_string()),
@@ -2069,50 +3435,32 @@ impl IdentityRuntime {
                         } else {
                             None
                         };
-                        match self.store.register_ilk(req) {
+                        match self.store.register_ilk(req, self.merge_alias_ttl_secs) {
                             Ok(ok) => {
-                                if let Some(ilk_id) = ok.get("ilk_id").and_then(Value::as_str) {
-                                    if let Some(ilk) = self.store.ilks.get(ilk_id).cloned() {
-                                        if self.is_primary {
-                                            if let Some(database_config) = self.db_config.as_ref() {
-                                                if let Err(err) = persist_ilk_state_in_db(
-                                                    database_config,
-                                                    &ilk,
-                                                    None,
-                                                )
-                                                .await
-                                                {
-                                                    if let Some(snapshot) = snapshot {
-                                                        self.store = snapshot;
-                                                    }
-                                                    db_write_error_payload(
-                                                        "failed to persist registered ilk",
-                                                        err.as_ref(),
-                                                    )
-                                                } else {
-                                                    deltas.push(delta_envelope(
-                                                        IdentityDelta::IlkUpsert { ilk },
-                                                    ));
-                                                    ok
-                                                }
-                                            } else {
-                                                deltas.push(delta_envelope(
-                                                    IdentityDelta::IlkUpsert { ilk },
-                                                ));
-                                                ok
-                                            }
-                                        } else {
-                                            deltas.push(delta_envelope(IdentityDelta::IlkUpsert {
-                                                ilk,
-                                            }));
-                                            ok
-                                        }
-                                    } else {
-                                        ok
-                                    }
-                                } else {
-                                    ok
-                                }
+                                // A merge by email also changed the temporary ilk it absorbed.
+                                let merged_from = ok
+                                    .get("merged_from_ilk_id")
+                                    .and_then(Value::as_str)
+                                    .map(str::to_string);
+                                let changed: Vec<String> = ok
+                                    .get("ilk_id")
+                                    .and_then(Value::as_str)
+                                    .map(str::to_string)
+                                    .into_iter()
+                                    .chain(merged_from.clone())
+                                    .collect();
+                                let alias = merged_from
+                                    .as_deref()
+                                    .and_then(|old_ilk_id| self.store.alias_snapshot(old_ilk_id));
+                                self.commit_ilk_changes(
+                                    &mut deltas,
+                                    snapshot,
+                                    &changed,
+                                    alias,
+                                    "failed to persist registered ilk",
+                                    ok,
+                                )
+                                .await
                             }
                             Err(code) => error_payload(&code, "failed to register ilk"),
                         }
@@ -2132,75 +3480,30 @@ impl IdentityRuntime {
                             req.clone(),
                             src_l2_name,
                             self.merge_alias_ttl_secs,
+                            &self.cloud_relay,
                         ) {
                             Ok(ok) => {
-                                let alias_delta =
-                                    req.merge_from_ilk_id.as_ref().and_then(|old_ilk_id| {
-                                        self.store.aliases.get(old_ilk_id).map(|alias| {
-                                            AliasSnapshotRecord {
-                                                old_ilk_id: old_ilk_id.clone(),
-                                                canonical_ilk_id: alias.canonical_ilk_id.clone(),
-                                                expires_at_ms: alias.expires_at_ms,
-                                            }
-                                        })
-                                    });
-                                if let Some(ilk_id) = ok.get("ilk_id").and_then(Value::as_str) {
-                                    if let Some(ilk) = self.store.ilks.get(ilk_id).cloned() {
-                                        if self.is_primary {
-                                            if let Some(database_config) = self.db_config.as_ref() {
-                                                if let Err(err) = persist_ilk_state_in_db(
-                                                    database_config,
-                                                    &ilk,
-                                                    alias_delta.as_ref(),
-                                                )
-                                                .await
-                                                {
-                                                    if let Some(snapshot) = snapshot {
-                                                        self.store = snapshot;
-                                                    }
-                                                    db_write_error_payload(
-                                                        "failed to persist channel/merge update",
-                                                        err.as_ref(),
-                                                    )
-                                                } else {
-                                                    deltas.push(delta_envelope(
-                                                        IdentityDelta::IlkUpsert { ilk },
-                                                    ));
-                                                    if let Some(alias) = alias_delta {
-                                                        deltas.push(delta_envelope(
-                                                            IdentityDelta::AliasUpsert { alias },
-                                                        ));
-                                                    }
-                                                    ok
-                                                }
-                                            } else {
-                                                deltas.push(delta_envelope(
-                                                    IdentityDelta::IlkUpsert { ilk },
-                                                ));
-                                                if let Some(alias) = alias_delta {
-                                                    deltas.push(delta_envelope(
-                                                        IdentityDelta::AliasUpsert { alias },
-                                                    ));
-                                                }
-                                                ok
-                                            }
-                                        } else {
-                                            deltas.push(delta_envelope(IdentityDelta::IlkUpsert {
-                                                ilk,
-                                            }));
-                                            if let Some(alias) = alias_delta {
-                                                deltas.push(delta_envelope(
-                                                    IdentityDelta::AliasUpsert { alias },
-                                                ));
-                                            }
-                                            ok
-                                        }
-                                    } else {
-                                        ok
-                                    }
-                                } else {
-                                    ok
-                                }
+                                // A merge also changed the temporary ilk it absorbed.
+                                let changed: Vec<String> = ok
+                                    .get("ilk_id")
+                                    .and_then(Value::as_str)
+                                    .map(str::to_string)
+                                    .into_iter()
+                                    .chain(req.merge_from_ilk_id.clone())
+                                    .collect();
+                                let alias = req
+                                    .merge_from_ilk_id
+                                    .as_deref()
+                                    .and_then(|old_ilk_id| self.store.alias_snapshot(old_ilk_id));
+                                self.commit_ilk_changes(
+                                    &mut deltas,
+                                    snapshot,
+                                    &changed,
+                                    alias,
+                                    "failed to persist channel/merge update",
+                                    ok,
+                                )
+                                .await
                             }
                             Err(code) => error_payload(&code, "failed to add channel"),
                         }
@@ -2399,65 +3702,62 @@ impl IdentityRuntime {
                     Err(err) => error_payload("INVALID_REQUEST", &err.to_string()),
                 }
             }
-            MSG_ILK_DELETE => {
-                match serde_json::from_value::<IlkDeleteRequest>(msg.payload.clone()) {
-                    Ok(req) => {
-                        let snapshot = if self.is_primary && self.db_config.is_some() {
-                            Some(self.store.clone())
-                        } else {
-                            None
-                        };
-                        let ilk_id = req.ilk_id.clone();
-                        // Capture alias old_ilk_ids whose removal we'll need to
-                        // propagate to replicas/SHM. The store consumes them
-                        // when delete_ilk runs; without explicit AliasDelete
-                        // deltas the SHM layer would keep stale alias entries
-                        // because apply_identity_shm_event's IlkDelete arm only
-                        // clears ich/ilk entries, not aliases.
-                        let removed_alias_old_ids = self.store.alias_old_ids_referencing(&ilk_id);
-                        match self.store.delete_ilk(req) {
-                            Ok(ok) => {
-                                let mut emit_deltas = || {
-                                    for old_ilk_id in &removed_alias_old_ids {
-                                        deltas.push(delta_envelope(IdentityDelta::AliasDelete {
-                                            old_ilk_id: old_ilk_id.clone(),
-                                        }));
-                                    }
-                                    deltas.push(delta_envelope(IdentityDelta::IlkDelete {
-                                        ilk_id: ilk_id.clone(),
-                                    }));
-                                };
-                                if self.is_primary {
-                                    if let Some(database_config) = self.db_config.as_ref() {
-                                        if let Err(err) =
-                                            delete_ilk_in_db(database_config, &ilk_id).await
-                                        {
-                                            if let Some(snapshot) = snapshot {
-                                                self.store = snapshot;
-                                            }
-                                            db_write_error_payload(
-                                                "failed to delete ilk",
-                                                err.as_ref(),
-                                            )
-                                        } else {
-                                            emit_deltas();
-                                            ok
-                                        }
-                                    } else {
-                                        emit_deltas();
-                                        ok
-                                    }
-                                } else {
-                                    emit_deltas();
-                                    ok
-                                }
-                            }
-                            Err(code) => error_payload(&code, "failed to delete ilk"),
-                        }
-                    }
-                    Err(err) => error_payload("INVALID_REQUEST", &err.to_string()),
+            MSG_ILK_DELETE => match serde_json::from_value::<IlkDeleteRequest>(msg.payload.clone()) {
+                Ok(req) => {
+                    let now_ms = now_epoch_ms();
+                    self.run_lifecycle_op(&mut deltas, "failed to delete ilk", |store| {
+                        store.delete_ilk(req, now_ms)
+                    })
+                    .await
                 }
-            }
+                Err(err) => error_payload("INVALID_REQUEST", &err.to_string()),
+            },
+            MSG_ILK_RESTORE => match serde_json::from_value::<IlkDeleteRequest>(msg.payload.clone()) {
+                Ok(req) => {
+                    self.run_lifecycle_op(&mut deltas, "failed to restore ilk", |store| {
+                        store.restore_ilk(req)
+                    })
+                    .await
+                }
+                Err(err) => error_payload("INVALID_REQUEST", &err.to_string()),
+            },
+            MSG_ILK_PURGE => match serde_json::from_value::<IlkDeleteRequest>(msg.payload.clone()) {
+                Ok(req) => {
+                    self.run_lifecycle_op(&mut deltas, "failed to purge ilk", |store| {
+                        store.purge_ilk(req)
+                    })
+                    .await
+                }
+                Err(err) => error_payload("INVALID_REQUEST", &err.to_string()),
+            },
+            MSG_TNT_DELETE => match serde_json::from_value::<TntLifecycleRequest>(msg.payload.clone()) {
+                Ok(req) => {
+                    let now_ms = now_epoch_ms();
+                    self.run_lifecycle_op(&mut deltas, "failed to delete tenant", |store| {
+                        store.delete_tenant(req, now_ms)
+                    })
+                    .await
+                }
+                Err(err) => error_payload("INVALID_REQUEST", &err.to_string()),
+            },
+            MSG_TNT_RESTORE => match serde_json::from_value::<TntLifecycleRequest>(msg.payload.clone()) {
+                Ok(req) => {
+                    self.run_lifecycle_op(&mut deltas, "failed to restore tenant", |store| {
+                        store.restore_tenant(req)
+                    })
+                    .await
+                }
+                Err(err) => error_payload("INVALID_REQUEST", &err.to_string()),
+            },
+            MSG_TNT_PURGE => match serde_json::from_value::<TntLifecycleRequest>(msg.payload.clone()) {
+                Ok(req) => {
+                    self.run_lifecycle_op(&mut deltas, "failed to purge tenant", |store| {
+                        store.purge_tenant(req)
+                    })
+                    .await
+                }
+                Err(err) => error_payload("INVALID_REQUEST", &err.to_string()),
+            },
             MSG_TNT_CREATE => match serde_json::from_value::<TntCreateRequest>(msg.payload.clone())
             {
                 Ok(req) => {
@@ -2866,7 +4166,7 @@ impl IdentityRuntime {
         // Same-hive-only roles: a privileged SY control-plane identity from ANOTHER hive must
         // not administer THIS hive's identity authority (F-07). The same-hive scoping LOGIC now
         // lives in system_policy::prefix_allowed_same_hive_scoped — shared with the router's
-        // authority() rule so the two can't drift; only the per-message allowlist DATA stays
+        // authorize_system rule so the two can't drift; only the per-message allowlist DATA stays
         // here. IO.* (worker IO provisioning against the sole motherbee authority) and
         // SY.orchestrator@ (cross-hive control plane) are legitimately cross-hive.
         const SAME_HIVE_ONLY_PREFIXES: [&str; 3] =
@@ -2903,7 +4203,7 @@ async fn main() -> Result<(), IdentityError> {
     }
 
     let log_level = std::env::var("JSR_LOG_LEVEL").unwrap_or_else(|_| "info".to_string());
-    tracing_subscriber::fmt()
+    fluxbee_sdk::logging::fmt()
         .with_env_filter(EnvFilter::new(log_level))
         .init();
 
@@ -2957,9 +4257,8 @@ async fn main() -> Result<(), IdentityError> {
     let sender = dispatcher.sender_snapshot();
     tracing::info!(node_name = %sender.full_name(), "sy.identity connected to router");
 
-    let vault_client = VaultClient::new(
+    let vault_client = VaultClient::for_primary(
         dispatcher.clone(),
-        hive.hive_id.clone(),
         VaultCallerOwned::new(self_ilk_id.clone(), node_name.clone()),
     );
 
@@ -3020,6 +4319,7 @@ async fn main() -> Result<(), IdentityError> {
                             }
                         }
                     }
+                    report_account_scopes(&mut store);
                     let metrics = store.metrics();
                     runtime.store = store;
                     tracing::info!(metrics = %metrics, "loaded identity store from primary db");
@@ -3091,12 +4391,19 @@ async fn main() -> Result<(), IdentityError> {
     } else {
         None
     };
+    // A replica's store only speaks for this hive once it holds the primary's state. Its periodic
+    // self-owned snapshot is AUTHORITATIVE upstream (the primary drops this hive's ILKs missing
+    // from it), so publishing before any baseline — a boot while the primary was unreachable,
+    // with only the seeded system ILKs in memory — deleted every node ILK of this hive on the
+    // primary (lab 2026-09-30). Set by the boot full sync or by the first subscription snapshot.
+    let mut replica_has_baseline = is_primary;
     if !is_primary {
         if let Some(upstream) = sync_upstream.as_deref() {
             match fetch_full_sync_from_primary(upstream, self_auth_key.as_ref(), &self_hive).await {
                 Ok(store) => {
                     let metrics = store.metrics();
                     runtime.store = store;
+                    replica_has_baseline = true;
                     tracing::info!(upstream = %upstream, metrics = %metrics, "identity full sync bootstrap applied");
                 }
                 Err(err) => {
@@ -3147,7 +4454,7 @@ async fn main() -> Result<(), IdentityError> {
     // Identity is the SHM writer; it derives its own ILK locally rather than
     // waiting on the SHM read path it just populated.
     tracing::info!(self_ilk_id = %self_ilk_id, "resolved self system ILK");
-    let (delta_event_tx, mut delta_event_rx) = mpsc::unbounded_channel::<IdentityDeltaEnvelope>();
+    let (delta_event_tx, mut delta_event_rx) = mpsc::unbounded_channel::<ReplicaSyncEvent>();
     // Upstream publish (replica → primary): local ilk deltas a replica pushes up.
     let (upstream_tx, upstream_rx) = mpsc::unbounded_channel::<UpstreamFrame>();
     // Ingest (primary): frames received from replicas' publish connections.
@@ -3193,9 +4500,9 @@ async fn main() -> Result<(), IdentityError> {
     let mut next_delta_seq: u64 = 1;
     // F-02: each accepted :9100 connection is handled in its own task so a slow
     // reader cannot pin the event loop. The semaphore caps concurrent handlers;
-    // handlers return a registered subscriber over `new_sub_rx` and request an
-    // on-demand full-sync snapshot over `chunks_req_rx` (built here, on the loop,
-    // only for authenticated FULL_SYNC requests — G-9).
+    // handlers queue a new subscriber over `new_sub_rx` before answering it, and
+    // request an on-demand full-sync snapshot over `chunks_req_rx` (built here, on
+    // the loop, only for authenticated FULL_SYNC requests — G-9).
     let sync_conn_sem = Arc::new(Semaphore::new(MAX_CONCURRENT_SYNC_CONNS));
     let (new_sub_tx, mut new_sub_rx) =
         mpsc::unbounded_channel::<mpsc::Sender<IdentityDeltaEnvelope>>();
@@ -3217,9 +4524,11 @@ async fn main() -> Result<(), IdentityError> {
                 // Replica: push the full self-owned ilk set upstream so the
                 // primary reconciles to it (additive across hives; recovers
                 // upserts + hard-deletes). No-op on the primary.
-                if !is_primary {
+                if !is_primary && replica_has_baseline {
                     let snapshot = runtime.store.self_owned_ilks(&hive.hive_id);
                     let _ = upstream_tx.send(UpstreamFrame::Snapshot(snapshot));
+                } else if !is_primary {
+                    tracing::warn!("identity replica has no baseline from the primary yet; holding its self-owned snapshot");
                 }
             }
             maybe_ingest = ingest_rx.recv() => {
@@ -3278,7 +4587,14 @@ async fn main() -> Result<(), IdentityError> {
                                             persist_ilk_state_in_db(cfg, ilk, None).await
                                         }
                                         IdentityDelta::IlkDelete { ilk_id } => {
-                                            delete_ilk_in_db(cfg, ilk_id).await
+                                            persist_lifecycle_in_db(
+                                                cfg,
+                                                &LifecycleChanges {
+                                                    purged_ilks: vec![ilk_id.clone()],
+                                                    ..LifecycleChanges::default()
+                                                },
+                                            )
+                                            .await
                                         }
                                         _ => Ok(()),
                                     };
@@ -3326,12 +4642,25 @@ async fn main() -> Result<(), IdentityError> {
                     }
                 }
             }
-            maybe_delta = delta_event_rx.recv() => {
-                if let Some(envelope) = maybe_delta {
-                    runtime.store.apply_delta(envelope.delta);
+            maybe_event = delta_event_rx.recv() => {
+                if let Some(event) = maybe_event {
+                    match event {
+                        ReplicaSyncEvent::Snapshot(store) => {
+                            // Same as the boot bootstrap: adopt the primary's state, then
+                            // re-seed this hive's deterministic system ILKs on top of it.
+                            let metrics = store.metrics();
+                            runtime.store = *store;
+                            replica_has_baseline = true;
+                            if let Err(err) = runtime.store.ensure_system_ilks_from_hive(&hive) {
+                                tracing::warn!(error = %err, "failed to re-seed system ILKs after identity resync");
+                            }
+                            tracing::info!(metrics = %metrics, "identity full sync applied (delta stream subscribed)");
+                        }
+                        ReplicaSyncEvent::Delta(envelope) => runtime.store.apply_delta(envelope.delta),
+                    }
                     if let Some(writer) = identity_shm.as_mut() {
                         if let Err(err) = sync_identity_shm_mappings(writer, &runtime.store) {
-                            tracing::warn!(error = %err, "identity shm sync failed after delta apply");
+                            tracing::warn!(error = %err, "identity shm sync failed after replica sync");
                         }
                     }
                 }
@@ -3354,24 +4683,16 @@ async fn main() -> Result<(), IdentityError> {
                             let new_sub_tx2 = new_sub_tx.clone();
                             tokio::spawn(async move {
                                 let _permit = permit;
-                                match handle_sync_connection(
+                                if let Err(err) = handle_sync_connection(
                                     stream,
                                     chunks_req_tx2,
+                                    new_sub_tx2,
                                     ingest_tx2,
                                     auth_required,
                                 )
                                 .await
                                 {
-                                    Ok(Some(subscriber)) => {
-                                        // Registration happens on the main loop
-                                        // (new_sub branch) so delta_subscribers is
-                                        // only ever touched there.
-                                        let _ = new_sub_tx2.send(subscriber);
-                                    }
-                                    Ok(None) => {}
-                                    Err(err) => {
-                                        tracing::warn!(remote = %remote_addr, error = %err, "identity sync request failed");
-                                    }
+                                    tracing::warn!(remote = %remote_addr, error = %err, "identity sync request failed");
                                 }
                             });
                         }
@@ -3387,21 +4708,18 @@ async fn main() -> Result<(), IdentityError> {
             }
             maybe_new_sub = new_sub_rx.recv() => {
                 if let Some(subscriber) = maybe_new_sub {
-                    if delta_subscribers.len() >= MAX_DELTA_SUBSCRIBERS {
-                        // Cap fan-out (G-5): drop the sender (its task exits when
-                        // the channel closes). The peer retries later.
-                        tracing::warn!(
-                            cap = MAX_DELTA_SUBSCRIBERS,
-                            "identity delta subscriber cap reached; rejecting new subscriber"
-                        );
-                    } else {
-                        tracing::info!("identity delta subscriber connected");
-                        delta_subscribers.push(subscriber);
-                    }
+                    register_delta_subscriber(&mut delta_subscribers, subscriber);
                 }
             }
             maybe_chunks_req = chunks_req_rx.recv() => {
                 if let Some(reply) = maybe_chunks_req {
+                    // A replica asks for its snapshot only after its subscription answered, and
+                    // that subscriber was queued before the answer. Register every queued one
+                    // first: a delta broadcast between this snapshot and a later registration
+                    // would be in neither, and the replica would never know.
+                    while let Ok(subscriber) = new_sub_rx.try_recv() {
+                        register_delta_subscriber(&mut delta_subscribers, subscriber);
+                    }
                     // On-demand full-sync snapshot for an authenticated FULL_SYNC
                     // request (G-9): bounded CPU (clone+sort), no I/O — the
                     // streaming to the peer happens in the spawned handler task.
@@ -3591,6 +4909,43 @@ fn identification_str<'a>(identification: &'a Value, key: &str) -> Option<&'a st
         .filter(|value| !value.is_empty())
 }
 
+/// Merge of a registration into an ilk that already has identification data: fill what `target`
+/// lacks from `incoming` and never overwrite a value already there. Objects merge key by key; a
+/// value is missing when it is absent, null, a blank string or an empty object or list.
+fn fill_missing_identification(target: &mut Value, incoming: &Value) {
+    if target.is_null() {
+        *target = json!({});
+    }
+    let (Some(target), Some(incoming)) = (target.as_object_mut(), incoming.as_object()) else {
+        return;
+    };
+    for (key, value) in incoming {
+        if identification_value_is_empty(value) {
+            continue;
+        }
+        match target.get_mut(key) {
+            Some(existing) if !identification_value_is_empty(existing) => {
+                if existing.is_object() && value.is_object() {
+                    fill_missing_identification(existing, value);
+                }
+            }
+            _ => {
+                target.insert(key.clone(), value.clone());
+            }
+        }
+    }
+}
+
+fn identification_value_is_empty(value: &Value) -> bool {
+    match value {
+        Value::Null => true,
+        Value::String(text) => text.trim().is_empty(),
+        Value::Object(map) => map.is_empty(),
+        Value::Array(items) => items.is_empty(),
+        _ => false,
+    }
+}
+
 fn sync_identity_shm_mappings(
     writer: &mut IdentityRegionWriter,
     store: &IdentityStore,
@@ -3608,6 +4963,9 @@ fn sync_identity_shm_mappings(
         let Some(tenant) = store.tenants.get(&tenant_id) else {
             continue;
         };
+        if tenant.deleted_at_ms.is_some() {
+            continue;
+        }
         let Ok(tenant_uuid) = parse_prefixed_uuid(&tenant.tenant_id, "tnt") else {
             tracing::warn!(
                 tenant_id = %tenant.tenant_id,
@@ -3693,10 +5051,19 @@ fn sync_identity_shm_mappings(
                 );
                 continue;
             };
+            let scope = channel_scope(channel, &ilk.tenant_id);
+            let Ok(scope_uuid) = parse_prefixed_uuid(scope, "tnt") else {
+                tracing::warn!(
+                    ilk_id = %ilk.ilk_id,
+                    ich_id = %channel.ich_id,
+                    "skipping a channel with an invalid scope during identity shm sync"
+                );
+                continue;
+            };
             let mut ich_entry = IchEntry {
                 ich_id: *ich_uuid.as_bytes(),
                 ilk_id: *ilk_uuid.as_bytes(),
-                tenant_id: *tenant_uuid.as_bytes(),
+                tenant_id: *scope_uuid.as_bytes(),
                 channel_type: [0u8; ICH_CHANNEL_TYPE_MAX_LEN],
                 address: [0u8; ICH_ADDRESS_MAX_LEN],
                 flags: FLAG_ACTIVE,
@@ -3714,11 +5081,7 @@ fn sync_identity_shm_mappings(
             ich_entries.push(ich_entry);
             ich_count = ich_count.saturating_add(1);
             channel_to_ich.insert(
-                (
-                    channel_type,
-                    address,
-                    ilk.tenant_id.trim().to_ascii_lowercase(),
-                ),
+                (channel_type, address, scope.trim().to_ascii_lowercase()),
                 *ich_uuid.as_bytes(),
             );
         }
@@ -3823,13 +5186,14 @@ fn sync_identity_shm_mappings(
             );
             continue;
         };
-        let Some(ilk_record) = store.ilks.get(ilk_id) else {
+        if !store.ilks.contains_key(ilk_id) {
             continue;
-        };
-        let Ok(tenant_uuid) = parse_prefixed_uuid(&ilk_record.tenant_id, "tnt") else {
+        }
+        // The mapping is keyed by the channel's scope, the lookup key's third part.
+        let Ok(scope_uuid) = parse_prefixed_uuid(&tenant_id_key, "tnt") else {
             tracing::warn!(
                 ilk_id = %ilk_id,
-                "skipping invalid tenant_id during identity shm mapping sync"
+                "skipping invalid scope during identity shm mapping sync"
             );
             continue;
         };
@@ -3838,7 +5202,7 @@ fn sync_identity_shm_mappings(
             &address,
             ich_id,
             *ilk_uuid.as_bytes(),
-            *tenant_uuid.as_bytes(),
+            *scope_uuid.as_bytes(),
         ) {
             tracing::warn!(
                 ilk_id = %ilk_id,
@@ -3951,7 +5315,10 @@ fn ich_entries_from_ilk_record(
         let mut entry = IchEntry {
             ich_id: *ich_uuid.as_bytes(),
             ilk_id: *ilk_uuid.as_bytes(),
-            tenant_id: parse_prefixed_uuid(&ilk.tenant_id, "tnt")?.into_bytes(),
+            // The channel's scope (docs/ilk-tenant-model-v1.md §2.1); the ILK's own entry carries
+            // the tenant it is charged to.
+            tenant_id: parse_prefixed_uuid(channel_scope(channel, &ilk.tenant_id), "tnt")?
+                .into_bytes(),
             channel_type: [0u8; ICH_CHANNEL_TYPE_MAX_LEN],
             address: [0u8; ICH_ADDRESS_MAX_LEN],
             flags: FLAG_ACTIVE,
@@ -3991,9 +5358,11 @@ fn apply_identity_shm_delta(
         IdentityDelta::TenantUpsert { tenant } => {
             writer.upsert_tenant_entry(tenant_entry_from_record(tenant)?)?;
         }
+        IdentityDelta::TenantDelete { .. } => {
+            return Err("tenant purge rebuilds the full identity snapshot".into());
+        }
         IdentityDelta::IlkUpsert { ilk } => {
             let ilk_uuid = parse_prefixed_uuid(&ilk.ilk_id, "ilk")?;
-            let tenant_uuid = parse_prefixed_uuid(&ilk.tenant_id, "tnt")?;
             writer.upsert_ilk_entry(ilk_entry_from_record(ilk)?)?;
             writer.clear_ich_mappings_for_ilk(*ilk_uuid.as_bytes())?;
             let ich_entries = ich_entries_from_ilk_record(ilk)?;
@@ -4006,7 +5375,7 @@ fn apply_identity_shm_delta(
                     &address,
                     entry.ich_id,
                     *ilk_uuid.as_bytes(),
-                    *tenant_uuid.as_bytes(),
+                    entry.tenant_id,
                 )?;
             }
         }
@@ -4073,9 +5442,16 @@ fn apply_identity_shm_deltas(
     action: &str,
     deltas: &[IdentityDeltaEnvelope],
 ) -> Result<(), IdentityError> {
-    if deltas
-        .iter()
-        .any(|delta| matches!(&delta.delta, IdentityDelta::IlkDelete { .. }))
+    // Lifecycle changes always rebuild the full snapshot, whatever action carried them (a
+    // replica applies the primary's deltas under its own action): the full sync is what skips
+    // marked ilks/tenants, and the incremental IlkUpsert/TenantUpsert paths would re-publish them.
+    if is_lifecycle_action(action)
+        || deltas.iter().any(|delta| match &delta.delta {
+            IdentityDelta::IlkDelete { .. } | IdentityDelta::TenantDelete { .. } => true,
+            IdentityDelta::IlkUpsert { ilk } => ilk.deleted_at_ms.is_some(),
+            IdentityDelta::TenantUpsert { tenant } => tenant.deleted_at_ms.is_some(),
+            _ => false,
+        })
     {
         sync_identity_shm_mappings(writer, store)?;
         return Ok(());
@@ -4410,9 +5786,10 @@ async fn connect_and_auth(
 async fn handle_sync_connection(
     stream: TcpStream,
     chunks_req_tx: mpsc::UnboundedSender<oneshot::Sender<Arc<Vec<IdentityFullSyncChunk>>>>,
+    new_sub_tx: mpsc::UnboundedSender<mpsc::Sender<IdentityDeltaEnvelope>>,
     ingest_tx: mpsc::Sender<IngestFrame>,
     auth_required: bool,
-) -> Result<Option<mpsc::Sender<IdentityDeltaEnvelope>>, IdentityError> {
+) -> Result<(), IdentityError> {
     let (read_half, mut write_half) = stream.into_split();
     let mut reader = BufReader::new(read_half);
     // Per-hive HMAC handshake before any protocol message (when required).
@@ -4444,71 +5821,35 @@ async fn handle_sync_connection(
                 write_timed(&mut write_half, b"\n").await?;
             }
             flush_timed(&mut write_half).await?;
-            Ok(None)
+            Ok(())
         }
         SYNC_OP_DELTA_SUBSCRIBE => {
             // Bounded (G-5): a slow subscriber whose queue fills is dropped by
             // broadcast_deltas (it recovers via full-sync on reconnect) instead
             // of buffering deltas without bound and exhausting primary memory.
-            let (tx, mut rx) =
-                mpsc::channel::<IdentityDeltaEnvelope>(IDENTITY_SUBSCRIBER_CHANNEL_CAP);
+            let (tx, rx) = mpsc::channel::<IdentityDeltaEnvelope>(IDENTITY_SUBSCRIBER_CHANNEL_CAP);
+            // Queue the registration (on the main loop, the only place that touches the
+            // subscriber list) BEFORE answering: the replica asks for its snapshot only after the
+            // answer, and the main loop registers queued subscribers before it builds a snapshot,
+            // so no delta falls between the two. Deltas queued before the task below starts wait
+            // in the channel and go out after the answer.
+            new_sub_tx.send(tx).map_err(|_| -> IdentityError {
+                "identity main loop unavailable for delta subscribe".into()
+            })?;
             let ack = json!({
                 "status": "ok",
-                "operation": "IDENTITY_DELTA_SUBSCRIBED"
+                "operation": SYNC_OP_DELTA_SUBSCRIBED
             });
             write_timed(&mut write_half, serde_json::to_string(&ack)?.as_bytes()).await?;
             write_timed(&mut write_half, b"\n").await?;
             flush_timed(&mut write_half).await?;
-            tokio::spawn(async move {
-                while let Some(envelope) = rx.recv().await {
-                    let encoded = match serde_json::to_string(&envelope) {
-                        Ok(encoded) => encoded,
-                        Err(err) => {
-                            tracing::warn!(error = %err, seq = envelope.seq, "failed to encode identity delta frame");
-                            continue;
-                        }
-                    };
-                    let mut acked = false;
-                    for attempt in 1..=IDENTITY_DELTA_MAX_RETRIES {
-                        if write_timed(&mut write_half, encoded.as_bytes())
-                            .await
-                            .is_err()
-                        {
-                            return;
-                        }
-                        if write_timed(&mut write_half, b"\n").await.is_err() {
-                            return;
-                        }
-                        if flush_timed(&mut write_half).await.is_err() {
-                            return;
-                        }
-                        match wait_for_delta_ack(&mut reader, envelope.seq).await {
-                            Ok(()) => {
-                                acked = true;
-                                break;
-                            }
-                            Err(err) => {
-                                tracing::warn!(
-                                    seq = envelope.seq,
-                                    attempt,
-                                    max_retries = IDENTITY_DELTA_MAX_RETRIES,
-                                    error = %err,
-                                    "identity delta ack not received; retrying"
-                                );
-                            }
-                        }
-                    }
-                    if !acked {
-                        tracing::warn!(
-                            seq = envelope.seq,
-                            max_retries = IDENTITY_DELTA_MAX_RETRIES,
-                            "identity delta ack retries exhausted; closing subscriber stream"
-                        );
-                        return;
-                    }
-                }
-            });
-            Ok(Some(tx))
+            tokio::spawn(serve_delta_subscriber(
+                reader,
+                write_half,
+                rx,
+                Duration::from_secs(IDENTITY_SYNC_HEARTBEAT_SECS),
+            ));
+            Ok(())
         }
         SYNC_OP_DELTA_PUBLISH => {
             // A replica publishes its own `@hive` ilks upstream. Require the
@@ -4530,7 +5871,7 @@ async fn handle_sync_connection(
                     .await?;
                 write_half.write_all(b"\n").await?;
                 write_half.flush().await?;
-                return Ok(None);
+                return Ok(());
             };
             // Bind the HMAC-authenticated identity to the published-as hive_id:
             // a peer must not authenticate as one hive and push another's ilks.
@@ -4548,7 +5889,7 @@ async fn handle_sync_connection(
                         .await?;
                     write_half.write_all(b"\n").await?;
                     write_half.flush().await?;
-                    return Ok(None);
+                    return Ok(());
                 }
             }
             let ack = json!({ "status": "ok", "operation": SYNC_OP_PUBLISH_OK });
@@ -4571,7 +5912,7 @@ async fn handle_sync_connection(
                     tracing::warn!(hive = %publisher_hive, error = %err, "identity publish reader ended");
                 }
             });
-            Ok(None)
+            Ok(())
         }
         _ => {
             let payload = IdentitySyncError {
@@ -4583,7 +5924,85 @@ async fn handle_sync_connection(
             write_half.write_all(encoded.as_bytes()).await?;
             write_half.write_all(b"\n").await?;
             write_half.flush().await?;
-            Ok(None)
+            Ok(())
+        }
+    }
+}
+
+/// Primary side of one delta subscription: write each delta and wait for the
+/// replica's ack (retried), and write a heartbeat whenever no frame went out for
+/// `heartbeat_every`. Returns, closing the stream, on a write error, when the acks
+/// run out, or when the main loop drops the subscriber; the replica then
+/// resubscribes from a full snapshot.
+async fn serve_delta_subscriber(
+    mut reader: BufReader<tokio::net::tcp::OwnedReadHalf>,
+    mut write_half: tokio::net::tcp::OwnedWriteHalf,
+    mut rx: mpsc::Receiver<IdentityDeltaEnvelope>,
+    heartbeat_every: Duration,
+) {
+    let heartbeat = json!({ "operation": SYNC_OP_HEARTBEAT }).to_string();
+    loop {
+        let envelope = match time::timeout(heartbeat_every, rx.recv()).await {
+            Ok(Some(envelope)) => envelope,
+            Ok(None) => return,
+            Err(_) => {
+                // A quiet stream: the replica only needs to hear the primary
+                // (P7-1). Heartbeats carry no seq and get no ack.
+                if write_timed(&mut write_half, heartbeat.as_bytes())
+                    .await
+                    .is_err()
+                    || write_timed(&mut write_half, b"\n").await.is_err()
+                    || flush_timed(&mut write_half).await.is_err()
+                {
+                    return;
+                }
+                continue;
+            }
+        };
+        let encoded = match serde_json::to_string(&envelope) {
+            Ok(encoded) => encoded,
+            Err(err) => {
+                tracing::warn!(error = %err, seq = envelope.seq, "failed to encode identity delta frame");
+                continue;
+            }
+        };
+        let mut acked = false;
+        for attempt in 1..=IDENTITY_DELTA_MAX_RETRIES {
+            if write_timed(&mut write_half, encoded.as_bytes())
+                .await
+                .is_err()
+            {
+                return;
+            }
+            if write_timed(&mut write_half, b"\n").await.is_err() {
+                return;
+            }
+            if flush_timed(&mut write_half).await.is_err() {
+                return;
+            }
+            match wait_for_delta_ack(&mut reader, envelope.seq).await {
+                Ok(()) => {
+                    acked = true;
+                    break;
+                }
+                Err(err) => {
+                    tracing::warn!(
+                        seq = envelope.seq,
+                        attempt,
+                        max_retries = IDENTITY_DELTA_MAX_RETRIES,
+                        error = %err,
+                        "identity delta ack not received; retrying"
+                    );
+                }
+            }
+        }
+        if !acked {
+            tracing::warn!(
+                seq = envelope.seq,
+                max_retries = IDENTITY_DELTA_MAX_RETRIES,
+                "identity delta ack retries exhausted; closing subscriber stream"
+            );
+            return;
         }
     }
 }
@@ -4725,6 +6144,30 @@ fn push_local_deltas_upstream(
     }
 }
 
+/// Registers a delta subscriber, first dropping those whose stream ended (their task exits on a
+/// write error or a closed channel), so the cap counts live subscribers only.
+fn register_delta_subscriber(
+    subscribers: &mut Vec<mpsc::Sender<IdentityDeltaEnvelope>>,
+    subscriber: mpsc::Sender<IdentityDeltaEnvelope>,
+) {
+    subscribers.retain(|tx| !tx.is_closed());
+    if subscriber.is_closed() {
+        // Its handler failed after queueing it (the answer never went out).
+        return;
+    }
+    if subscribers.len() >= MAX_DELTA_SUBSCRIBERS {
+        // Cap fan-out (G-5): drop the sender (its task exits when the channel closes). The peer
+        // retries later.
+        tracing::warn!(
+            cap = MAX_DELTA_SUBSCRIBERS,
+            "identity delta subscriber cap reached; rejecting new subscriber"
+        );
+    } else {
+        tracing::info!("identity delta subscriber registered");
+        subscribers.push(subscriber);
+    }
+}
+
 fn broadcast_deltas(
     subscribers: &mut Vec<mpsc::Sender<IdentityDeltaEnvelope>>,
     deltas: &[IdentityDeltaEnvelope],
@@ -4745,9 +6188,16 @@ fn broadcast_deltas(
     });
 }
 
+/// What a replica's delta-subscription task hands the main loop, IN ORDER on one channel: a
+/// full snapshot at the start of every subscription, then that subscription's deltas.
+enum ReplicaSyncEvent {
+    Snapshot(Box<IdentityStore>),
+    Delta(IdentityDeltaEnvelope),
+}
+
 async fn run_delta_subscription_loop(
     upstream: String,
-    sink: mpsc::UnboundedSender<IdentityDeltaEnvelope>,
+    sink: mpsc::UnboundedSender<ReplicaSyncEvent>,
     auth_key: Option<json_router::mesh_hmac::MeshHmacKey>,
     self_hive: String,
 ) {
@@ -4766,7 +6216,7 @@ async fn run_delta_subscription_loop(
 
 async fn stream_deltas_from_primary(
     upstream: &str,
-    sink: &mpsc::UnboundedSender<IdentityDeltaEnvelope>,
+    sink: &mpsc::UnboundedSender<ReplicaSyncEvent>,
     auth_key: Option<&json_router::mesh_hmac::MeshHmacKey>,
     self_hive: &str,
 ) -> Result<(), IdentityError> {
@@ -4781,12 +6231,74 @@ async fn stream_deltas_from_primary(
     write_half.flush().await?;
 
     let mut line = String::new();
+    read_sync_line(
+        &mut reader,
+        &mut line,
+        MAX_SYNC_LINE_BYTES,
+        Some(Duration::from_secs(IDENTITY_SYNC_READ_IDLE_SECS)),
+    )
+    .await?;
+    let ack: serde_json::Value = serde_json::from_str(line.trim())
+        .map_err(|err| format!("delta subscribe: unreadable reply: {err}"))?;
+    if ack.get("operation").and_then(|v| v.as_str()) != Some(SYNC_OP_DELTA_SUBSCRIBED) {
+        return Err(format!("delta subscribe rejected: {}", line.trim()).into());
+    }
+
+    // Subscribed: every change from now on arrives on this stream. The primary keeps no backlog,
+    // so whatever happened while we were NOT subscribed (a dropped stream, a boot while the
+    // primary was down) is only recoverable from a full snapshot — take one now, before the
+    // stream's deltas. Replaying a delta the snapshot already contains is harmless: deltas carry
+    // whole records and arrive in order, so the store still ends at the primary's state.
+    let snapshot = fetch_full_sync_from_primary(upstream, auth_key, self_hive).await?;
+    if sink
+        .send(ReplicaSyncEvent::Snapshot(Box::new(snapshot)))
+        .is_err()
+    {
+        return Err("delta sink dropped".into());
+    }
+
+    read_delta_stream(
+        &mut reader,
+        &mut write_half,
+        sink,
+        Duration::from_secs(IDENTITY_SYNC_READ_IDLE_SECS),
+    )
+    .await
+}
+
+/// Replica side of a delta subscription, after its snapshot: hand each delta to
+/// the main loop in order and ack it. Returns Ok when the primary closes the
+/// stream, and Err on a rejection, a sequence gap, or `idle` without any frame;
+/// either way the caller resubscribes from a full snapshot.
+async fn read_delta_stream(
+    reader: &mut BufReader<tokio::net::tcp::OwnedReadHalf>,
+    write_half: &mut tokio::net::tcp::OwnedWriteHalf,
+    sink: &mpsc::UnboundedSender<ReplicaSyncEvent>,
+    idle: Duration,
+) -> Result<(), IdentityError> {
+    let mut line = String::new();
     let mut last_seq: Option<u64> = None;
     loop {
         line.clear();
-        // Size-capped (G-4) but NO idle timeout: this is a long-poll for deltas
-        // that may be sparse on a quiet mesh; a timeout would churn reconnects.
-        let n = read_sync_line(&mut reader, &mut line, MAX_SYNC_LINE_BYTES, None).await?;
+        // Size-capped (G-4), with an idle deadline: the primary writes at least
+        // a heartbeat every IDENTITY_SYNC_HEARTBEAT_SECS, so silence means the
+        // link is gone even when no FIN or RST ever arrives (P7-1). A heartbeat
+        // matches neither frame below; reading it only renews the deadline.
+        let n = match time::timeout(
+            idle,
+            read_capped_line(reader, &mut line, MAX_SYNC_LINE_BYTES),
+        )
+        .await
+        {
+            Ok(read) => read?,
+            Err(_) => {
+                return Err(format!(
+                    "no frame from the primary for {idle:?} (heartbeats stopped); \
+                     resubscribing from a full snapshot"
+                )
+                .into())
+            }
+        };
         if n == 0 {
             return Ok(());
         }
@@ -4812,34 +6324,28 @@ async fn stream_deltas_from_primary(
                 }
                 if let Some(last) = last_seq {
                     if envelope.seq == last {
-                        send_delta_ack(&mut write_half, envelope.seq).await?;
+                        send_delta_ack(write_half, envelope.seq).await?;
                         continue;
                     }
                     if envelope.seq != last.saturating_add(1) {
-                        // F-05: a sequence gap means we missed one or more deltas
-                        // — possibly a revocation/demotion, which vault trusts
-                        // (lost => privilege RETENTION on this replica). The
-                        // replica store lives on the main loop and cannot be
-                        // swapped from this task, so recover the same way the
-                        // vault-secret path does: exit(0) and let systemd restart
-                        // us, which re-runs the boot full-sync and rebuilds a
-                        // consistent store. Silently re-subscribing (the old
-                        // behavior) would adopt the gap as a fresh baseline and
-                        // keep serving stale identity indefinitely.
-                        tracing::error!(
-                            prev = last,
-                            current = envelope.seq,
-                            "identity delta stream sequence gap; exiting for a clean full-sync \
-                             re-bootstrap on systemd-managed restart"
-                        );
-                        std::process::exit(0);
+                        // F-05: a sequence gap means we missed one or more deltas — possibly
+                        // a revocation/demotion, which vault trusts (lost => privilege
+                        // RETENTION on this replica). Drop the stream: the next subscription
+                        // starts from a full snapshot, so the gap is never adopted as a
+                        // baseline.
+                        return Err(format!(
+                            "identity delta stream sequence gap (prev={last}, current={}); \
+                             resubscribing from a full snapshot",
+                            envelope.seq
+                        )
+                        .into());
                     }
                 }
-                if sink.send(envelope.clone()).is_err() {
+                if sink.send(ReplicaSyncEvent::Delta(envelope.clone())).is_err() {
                     return Err("delta sink dropped".into());
                 }
                 last_seq = Some(envelope.seq);
-                send_delta_ack(&mut write_half, envelope.seq).await?;
+                send_delta_ack(write_half, envelope.seq).await?;
             }
         }
     }
@@ -5150,7 +6656,7 @@ fn system_nodes_for_hive(hive: &HiveFile) -> Result<Vec<String>, String> {
             return Err(format!("duplicate system node '{name}'"));
         }
         if !name.starts_with("SY.") {
-            if is_primary && MOTHERBEE_PACKAGED_NON_SYSTEM_NODES.contains(&name) {
+            if is_primary && fluxbee_sdk::is_allowed_non_sy_lifecycle_node(name) {
                 continue;
             }
             return Err(format!(
@@ -5186,6 +6692,7 @@ use fluxbee_sdk::deterministic_system_ilk_id;
 fn response_name(action: &str) -> &'static str {
     match action {
         MSG_ILK_PROVISION => MSG_ILK_PROVISION_RESPONSE,
+        MSG_ILK_SET_TENANT => MSG_ILK_SET_TENANT_RESPONSE,
         MSG_ILK_LIST => MSG_ILK_LIST_RESPONSE,
         MSG_ILK_GET => MSG_ILK_GET_RESPONSE,
         MSG_TNT_LIST => MSG_TNT_LIST_RESPONSE,
@@ -5200,6 +6707,11 @@ fn response_name(action: &str) -> &'static str {
         MSG_TNT_UPDATE => MSG_TNT_UPDATE_RESPONSE,
         MSG_TNT_SET_SPONSOR => MSG_TNT_SET_SPONSOR_RESPONSE,
         MSG_TNT_APPROVE => MSG_TNT_APPROVE_RESPONSE,
+        MSG_ILK_RESTORE => MSG_ILK_RESTORE_RESPONSE,
+        MSG_ILK_PURGE => MSG_ILK_PURGE_RESPONSE,
+        MSG_TNT_DELETE => MSG_TNT_DELETE_RESPONSE,
+        MSG_TNT_RESTORE => MSG_TNT_RESTORE_RESPONSE,
+        MSG_TNT_PURGE => MSG_TNT_PURGE_RESPONSE,
         "IDENTITY_METRICS" => "IDENTITY_METRICS_RESPONSE",
         "CONFIG_GET" | "CONFIG_SET" => "CONFIG_RESPONSE",
         _ => "SYSTEM_ERROR",
@@ -5211,6 +6723,7 @@ fn action_requires_primary(action: &str) -> bool {
         action,
         MSG_ILK_PROVISION
             | MSG_ILK_REGISTER
+            | MSG_ILK_SET_TENANT
             | MSG_ILK_ADD_CHANNEL
             | MSG_ILK_UPDATE
             | MSG_ILK_SET_DEFINITION
@@ -5220,6 +6733,23 @@ fn action_requires_primary(action: &str) -> bool {
             | MSG_TNT_UPDATE
             | MSG_TNT_SET_SPONSOR
             | MSG_TNT_APPROVE
+            | MSG_ILK_RESTORE
+            | MSG_ILK_PURGE
+            | MSG_TNT_DELETE
+            | MSG_TNT_RESTORE
+            | MSG_TNT_PURGE
+    )
+}
+
+fn is_lifecycle_action(action: &str) -> bool {
+    matches!(
+        action,
+        MSG_ILK_DELETE
+            | MSG_ILK_RESTORE
+            | MSG_ILK_PURGE
+            | MSG_TNT_DELETE
+            | MSG_TNT_RESTORE
+            | MSG_TNT_PURGE
     )
 }
 
@@ -5310,9 +6840,28 @@ fn error_payload(error_code: &str, message: &str) -> Value {
     })
 }
 
+/// The reply for an op's error: a `CODE|detail` (`lifecycle_error`) is split so the caller sees the
+/// code alone in `error_code`; a plain code keeps `fallback` as its message.
+fn op_error_payload(error: &str, fallback: &str) -> Value {
+    let (code, detail) = error.split_once('|').unwrap_or((error, fallback));
+    error_payload(code, detail)
+}
+
 fn db_write_error_payload(context: &str, err: &(dyn std::error::Error + 'static)) -> Value {
     let code = map_db_write_error_code(err);
-    error_payload(code, &format!("{}: {}", context, err))
+    error_payload(code, &format!("{}: {}", context, db_error_summary(err)))
+}
+
+/// A DB error as a caller may see it: Postgres' own message, without its DETAIL, which echoes the
+/// row's values (a unique violation's DETAIL carries the email of the person being registered).
+fn db_error_summary(err: &(dyn std::error::Error + 'static)) -> String {
+    match err
+        .downcast_ref::<tokio_postgres::Error>()
+        .and_then(tokio_postgres::Error::as_db_error)
+    {
+        Some(db_err) => format!("{}: {}", db_err.severity(), db_err.message()),
+        None => err.to_string(),
+    }
 }
 
 fn map_db_write_error_code(err: &(dyn std::error::Error + 'static)) -> &'static str {
@@ -5361,6 +6910,106 @@ fn map_unique_constraint_code(constraint: &str) -> &'static str {
     }
 }
 
+/// After the primary loads: the Fluxbee Cloud account emails the scope migration left out
+/// (docs/ilk-tenant-model-v1.md §2.1), reported once per boot and kept so provisioning one answers
+/// ACCOUNT_AMBIGUOUS. An email is ambiguous when more than one active, complete person holds it
+/// as a `cloud` channel, or when one does outside the installation-wide scope while another ILK
+/// (a temporary, a node, a marked one) holds it there. People still charged to the root tenant
+/// with an account are listed too: IO.cloud answers ACCOUNT_IN_ROOT_TENANT for them until the
+/// operator reassigns or purges them. So are the pending signups left charged to a deleted tenant:
+/// the next signup of their email takes them over, or they are charged elsewhere before the tenant
+/// is purged. The report names ILK ids, never the emails.
+fn report_account_scopes(store: &mut IdentityStore) {
+    let mut holders: HashMap<String, HashSet<String>> = HashMap::new();
+    let mut root_charged: Vec<String> = Vec::new();
+    // Who holds each email's installation-wide key, whatever the ILK.
+    let mut installation_holder: HashMap<String, String> = HashMap::new();
+    for ilk in store.ilks.values() {
+        for channel in &ilk.channels {
+            if is_cloud_account_channel(&channel.channel_type)
+                && channel_scope(channel, &ilk.tenant_id) == INSTALLATION_SCOPE
+            {
+                installation_holder.insert(
+                    channel.address.trim().to_ascii_lowercase(),
+                    ilk.ilk_id.clone(),
+                );
+            }
+        }
+    }
+    for ilk in store.ilks.values() {
+        if ilk.deleted_at_ms.is_some()
+            || ilk.ilk_type.trim() != "human"
+            || ilk.registration_status != "complete"
+        {
+            continue;
+        }
+        let mut has_account = false;
+        for channel in &ilk.channels {
+            if is_cloud_account_channel(&channel.channel_type) {
+                has_account = true;
+                holders
+                    .entry(channel.address.trim().to_ascii_lowercase())
+                    .or_default()
+                    .insert(ilk.ilk_id.clone());
+            }
+        }
+        if has_account && ilk.tenant_id == DEFAULT_ROOT_TENANT_ID {
+            root_charged.push(ilk.ilk_id.clone());
+        }
+    }
+    let mut ambiguous_ilks: Vec<String> = Vec::new();
+    store.ambiguous_account_emails = holders
+        .into_iter()
+        .filter(|(email, ilks)| {
+            ilks.len() > 1
+                || installation_holder
+                    .get(email)
+                    .is_some_and(|holder| !ilks.contains(holder))
+        })
+        .map(|(email, mut ilks)| {
+            ilks.extend(installation_holder.get(&email).cloned());
+            ambiguous_ilks.extend(ilks);
+            email
+        })
+        .collect();
+    ambiguous_ilks.sort_unstable();
+    root_charged.sort_unstable();
+    let mut stranded_signups: Vec<String> = store
+        .ilks
+        .values()
+        .filter(|ilk| {
+            ilk.deleted_at_ms.is_none()
+                && is_pending_signup(ilk)
+                && store
+                    .tenants
+                    .get(&ilk.tenant_id)
+                    .is_none_or(|tenant| tenant.deleted_at_ms.is_some())
+        })
+        .map(|ilk| ilk.ilk_id.clone())
+        .collect();
+    stranded_signups.sort_unstable();
+    if store.ambiguous_account_emails.is_empty()
+        && root_charged.is_empty()
+        && stranded_signups.is_empty()
+    {
+        tracing::info!(
+            "cloud account scopes: no ambiguous email, no account charged to the root tenant, \
+             no pending signup charged to a deleted tenant"
+        );
+        return;
+    }
+    tracing::warn!(
+        ambiguous_emails = store.ambiguous_account_emails.len(),
+        ambiguous_ilks = ?ambiguous_ilks,
+        root_charged_accounts = ?root_charged,
+        pending_signups_in_deleted_tenants = ?stranded_signups,
+        "cloud account scopes need the operator: delete and purge the extra ILKs of each ambiguous \
+         email (the next boot moves it), and reassign or purge the accounts charged to the root tenant. \
+         A pending signup in a deleted tenant waits: the next signup of its email takes it over, or \
+         it is charged elsewhere before the tenant is purged"
+    );
+}
+
 fn canonical_ich_key(
     channel_type: &str,
     address: &str,
@@ -5371,6 +7020,128 @@ fn canonical_ich_key(
         address.trim().to_ascii_lowercase(),
         tenant_id.trim().to_ascii_lowercase(),
     )
+}
+
+/// The installation-wide scope: the root tenant's namespace, where a Fluxbee Cloud account's email
+/// lives, so one email is one account (docs/ilk-tenant-model-v1.md §2.1).
+const INSTALLATION_SCOPE: &str = DEFAULT_ROOT_TENANT_ID;
+
+/// The channel type of a Fluxbee Cloud account: its address is the account's email. Only IO.cloud
+/// writes it.
+const CLOUD_ACCOUNT_CHANNEL: &str = "cloud";
+
+/// The namespace a channel's address lives in: its recorded scope, or its ILK's tenant for a
+/// record that arrived without one (see `fill_channel_scopes`).
+fn channel_scope<'a>(channel: &'a ChannelRecord, ilk_tenant_id: &'a str) -> &'a str {
+    let scope = channel.scope.trim();
+    if scope.is_empty() {
+        ilk_tenant_id
+    } else {
+        scope
+    }
+}
+
+/// A channel's lookup key: (type, address, scope), trimmed and lowercased. Never the ILK's
+/// current tenant, so charging an ILK to another tenant moves no key.
+fn channel_key(channel: &ChannelRecord, ilk_tenant_id: &str) -> (String, String, String) {
+    canonical_ich_key(
+        &channel.channel_type,
+        &channel.address,
+        channel_scope(channel, ilk_tenant_id),
+    )
+}
+
+/// A record from an older peer carries no channel scope: each channel takes its ILK's tenant once,
+/// here, when the record arrives. Never later, so a reassigned ILK's keys never follow its new
+/// tenant.
+fn fill_channel_scopes(ilk: &mut IlkRecord) {
+    for channel in &mut ilk.channels {
+        if channel.scope.trim().is_empty() {
+            channel.scope = ilk.tenant_id.clone();
+        }
+    }
+}
+
+fn is_cloud_account_channel(channel_type: &str) -> bool {
+    channel_type
+        .trim()
+        .eq_ignore_ascii_case(CLOUD_ACCOUNT_CHANNEL)
+}
+
+/// Does this ILK hold a Fluxbee Cloud account's key (a `cloud` channel in the installation-wide
+/// scope)?
+fn holds_installation_account(ilk: &IlkRecord) -> bool {
+    ilk.channels.iter().any(|channel| {
+        is_cloud_account_channel(&channel.channel_type)
+            && channel_scope(channel, &ilk.tenant_id) == INSTALLATION_SCOPE
+    })
+}
+
+/// A pending Fluxbee Cloud signup: a temporary person holding an account's key. It is nobody's
+/// account yet: the relay's next signup of that email takes it over, wherever it is charged. Like
+/// any person, it is never marked by its tenant's delete and it blocks the tenant's purge until it
+/// is charged elsewhere.
+fn is_pending_signup(ilk: &IlkRecord) -> bool {
+    ilk.ilk_type.trim() == "human"
+        && ilk.registration_status == "temporary"
+        && holds_installation_account(ilk)
+}
+
+/// What a replica may push for one of its ILKs: never another tenant for an ILK the primary holds
+/// (a node is born and dies in its tenant, D6), and only channels it may hold (see
+/// `replica_channels_acceptable`).
+fn replica_push_acceptable(incoming: &IlkRecord, existing: Option<&IlkRecord>) -> bool {
+    existing.is_none_or(|existing| existing.tenant_id == incoming.tenant_id)
+        && replica_channels_acceptable(incoming, existing)
+}
+
+/// A replica's ILKs are its nodes': their channels live in their own tenant, and neither the
+/// installation-wide scope nor a `cloud` channel (a Fluxbee Cloud account) is ever theirs. A channel
+/// the primary already holds exactly as pushed passes as it is: the replica echoes what it was told.
+fn replica_channels_acceptable(incoming: &IlkRecord, existing: Option<&IlkRecord>) -> bool {
+    incoming.channels.iter().all(|channel| {
+        let key = channel_key(channel, &incoming.tenant_id);
+        let known = existing.is_some_and(|existing| {
+            existing.channels.iter().any(|held| {
+                held.ich_id == channel.ich_id && channel_key(held, &existing.tenant_id) == key
+            })
+        });
+        let scope = channel_scope(channel, &incoming.tenant_id);
+        known
+            || (scope == incoming.tenant_id
+                && scope != INSTALLATION_SCOPE
+                && !is_cloud_account_channel(&channel.channel_type))
+    })
+}
+
+/// The scope a new channel gets, and who may name which. `default_scope` is the tenant the
+/// request or the target ILK carries (today's value). The installation-wide scope belongs to the
+/// Cloud relay, for the `cloud` channel only; and a `cloud` channel from anyone else is refused, so
+/// no node can take a Cloud account's email.
+fn resolve_channel_scope(
+    channel_type: &str,
+    requested: Option<&str>,
+    default_scope: &str,
+    caller: Option<&str>,
+    cloud_relay: &str,
+) -> Result<String, String> {
+    let from_cloud_relay = caller.map(str::trim) == Some(cloud_relay);
+    if is_cloud_account_channel(channel_type) && caller.is_some() && !from_cloud_relay {
+        return Err("CLOUD_CHANNEL_RESERVED".to_string());
+    }
+    let requested = requested.map(str::trim).filter(|value| !value.is_empty());
+    match requested {
+        None => Ok(default_scope.to_string()),
+        Some(scope) if scope == default_scope => Ok(scope.to_string()),
+        Some(scope)
+            if scope == INSTALLATION_SCOPE
+                && is_cloud_account_channel(channel_type)
+                && from_cloud_relay =>
+        {
+            Ok(scope.to_string())
+        }
+        Some(_) => Err("INVALID_SCOPE".to_string()),
+    }
 }
 
 fn normalize_tenant_name(value: &str) -> String {
@@ -5630,7 +7401,7 @@ fn normalize_optional_owner_l2_name(owner_l2_name: Option<&str>) -> Result<Optio
 }
 
 async fn ensure_primary_schema(database_config: &PgConfig) -> Result<(), IdentityError> {
-    let (client, connection) = database_config.connect(NoTls).await?;
+    let (mut client, connection) = database_config.connect(NoTls).await?;
     tokio::spawn(async move {
         if let Err(err) = connection.await {
             tracing::error!(error = %err, "identity postgres connection closed");
@@ -5787,6 +7558,154 @@ CREATE INDEX IF NOT EXISTS idx_identity_ichs_owner
             &[],
         )
         .await?;
+
+    // v2 -- lifecycle: mark deleted (reversible) vs purge (physical). Tenants get a
+    // deleted_at like ilks already had; ilks record WHY they are marked (`direct` or `tenant`
+    // cascade) so a tenant restore only brings back what its cascade took. Keys of marked rows
+    // stay reserved until purge -- enforced by SY.identity (the single writer), which answers
+    // ILK_DELETED / TENANT_DELETED instead of reusing them.
+    {
+        let tx = client.transaction().await?;
+        tx.batch_execute(
+            "ALTER TABLE identity_tenants ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMPTZ;\n\
+             ALTER TABLE identity_ilks ADD COLUMN IF NOT EXISTS deleted_reason VARCHAR(16);\n\
+             INSERT INTO identity_schema_migrations (version, name) VALUES (2, 'lifecycle_mark_purge') \
+             ON CONFLICT (version) DO NOTHING;",
+        )
+        .await?;
+        tx.commit().await?;
+    }
+
+    // v3 -- the channel scope (docs/ilk-tenant-model-v1.md §2.1). identity_ichs.tenant_id is a
+    // channel's scope, and a Fluxbee Cloud account's email lives in the installation-wide scope
+    // (the root tenant's), so one email is one account. Every boot, before the store loads (so
+    // memory loads what this leaves): move the `cloud` channels of active, complete people there,
+    // unless the email is ambiguous -- held by more than one of them, or already held in the
+    // installation-wide scope by another ILK, marked or not -- in which case it stays where it is
+    // and SY.identity reports it after loading. One channel per email moves. Idempotent.
+    {
+        let tx = client.transaction().await?;
+        tx.batch_execute(&format!(
+            r#"
+CREATE TABLE IF NOT EXISTS identity_ilk_tenant_history (
+    id BIGSERIAL PRIMARY KEY,
+    ilk_id UUID NOT NULL REFERENCES identity_ilks(ilk_id) ON DELETE CASCADE,
+    from_tenant_id UUID NOT NULL,
+    to_tenant_id UUID NOT NULL,
+    changed_by VARCHAR(256) NOT NULL,
+    changed_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_identity_ilk_tenant_history_ilk
+    ON identity_ilk_tenant_history(ilk_id);
+
+WITH accounts AS (
+    SELECT c.ich_id, c.ilk_id, lower(trim(c.address)) AS email, c.tenant_id AS scope
+    FROM identity_ichs c
+    JOIN identity_ilks i ON i.ilk_id = c.ilk_id
+    WHERE c.channel_type = '{channel}'
+      AND i.ilk_type = 'human'
+      AND i.registration_status = 'complete'
+      AND i.deleted_at IS NULL
+),
+ambiguous AS (
+    SELECT email FROM accounts GROUP BY email HAVING count(DISTINCT ilk_id) > 1
+),
+installation_held AS (
+    SELECT lower(trim(address)) AS email
+    FROM identity_ichs
+    WHERE channel_type = '{channel}' AND tenant_id = '{scope}'::uuid
+),
+movable AS (
+    SELECT DISTINCT ON (a.email) a.ich_id
+    FROM accounts a
+    WHERE a.scope <> '{scope}'::uuid
+      AND EXISTS (SELECT 1 FROM identity_tenants WHERE tenant_id = '{scope}'::uuid)
+      AND a.email NOT IN (SELECT email FROM ambiguous)
+      AND a.email NOT IN (SELECT email FROM installation_held)
+    ORDER BY a.email, a.ich_id
+)
+UPDATE identity_ichs
+SET tenant_id = '{scope}'::uuid
+WHERE ich_id IN (SELECT ich_id FROM movable);
+
+INSERT INTO identity_schema_migrations (version, name) VALUES (3, 'channel_scope')
+ON CONFLICT (version) DO NOTHING;
+"#,
+            channel = CLOUD_ACCOUNT_CHANNEL,
+            scope = INSTALLATION_SCOPE.trim_start_matches("tnt:"),
+        ))
+        .await?;
+        tx.commit().await?;
+    }
+    // v4 -- deleting a tenant marks no ILK (docs/ilk-tenant-model-v1.md §2.3, stage 3). Until 0.1.66
+    // it marked the ILKs charged to it (reason `tenant`): they come back, still charged to their
+    // tenant, as if it had been deleted under today's rule. Every boot, before the store loads;
+    // idempotent. A channel key is unique in the DB counting marked rows, so un-marking collides
+    // with none; an email is unique among active rows only, so an ILK whose email another active
+    // ILK of its tenant now holds stays marked (one per email), and both lists are logged by id.
+    let (unmarked, left_marked) = {
+        let tx = client.transaction().await?;
+        let unmarked = tx
+            .query(
+                r#"
+WITH free AS (
+    SELECT DISTINCT ON (coalesce(i.email, i.ilk_id::text), i.tenant_id) i.ilk_id
+    FROM identity_ilks i
+    WHERE i.deleted_reason = 'tenant'
+      AND i.node_name IS NULL
+      AND NOT EXISTS (
+          SELECT 1 FROM identity_ilks o
+          WHERE o.deleted_at IS NULL
+            AND i.email IS NOT NULL
+            AND o.email = i.email
+            AND o.tenant_id = i.tenant_id)
+    ORDER BY coalesce(i.email, i.ilk_id::text), i.tenant_id, i.ilk_id
+)
+UPDATE identity_ilks
+SET deleted_at = NULL, deleted_reason = NULL
+WHERE ilk_id IN (SELECT ilk_id FROM free)
+RETURNING ilk_id::text
+"#,
+                &[],
+            )
+            .await?;
+        let left_marked = tx
+            .query(
+                "SELECT ilk_id::text FROM identity_ilks WHERE deleted_reason = 'tenant' ORDER BY 1",
+                &[],
+            )
+            .await?;
+        tx.execute(
+            "INSERT INTO identity_schema_migrations (version, name) VALUES (4, 'tenant_marks_no_ilk') \
+             ON CONFLICT (version) DO NOTHING",
+            &[],
+        )
+        .await?;
+        tx.commit().await?;
+        let ids = |rows: Vec<tokio_postgres::Row>| -> Vec<String> {
+            rows.iter()
+                .map(|row| format!("ilk:{}", row.get::<_, String>(0)))
+                .collect()
+        };
+        (ids(unmarked), ids(left_marked))
+    };
+    if !unmarked.is_empty() {
+        tracing::warn!(
+            count = unmarked.len(),
+            ilks = ?unmarked,
+            "migration v4: un-marked the ILKs an old tenant delete had marked; they stay charged \
+             to their tenant"
+        );
+    }
+    if !left_marked.is_empty() {
+        tracing::warn!(
+            count = left_marked.len(),
+            ilks = ?left_marked,
+            "migration v4: these ILKs an old tenant delete marked stay marked, because an active \
+             ILK of their tenant now holds their email; restore or purge them on purpose"
+        );
+    }
     let _ = client
         .execute(
             "SELECT pg_advisory_unlock($1)",
@@ -5794,7 +7713,7 @@ CREATE INDEX IF NOT EXISTS idx_identity_ichs_owner
         )
         .await;
 
-    tracing::info!("identity primary schema ensured (baseline v1)");
+    tracing::info!("identity primary schema ensured (migrations through v4, tenant_marks_no_ilk)");
     Ok(())
 }
 
@@ -5885,17 +7804,17 @@ async fn persist_ilk_state_in_db(
     ilk: &IlkRecord,
     alias: Option<&AliasSnapshotRecord>,
 ) -> Result<(), IdentityError> {
-    let ilk_uuid = parse_prefixed_uuid(&ilk.ilk_id, "ilk")?.to_string();
-    let tenant_uuid = parse_prefixed_uuid(&ilk.tenant_id, "tnt")?.to_string();
-    let email = optional_identification_string(&ilk.identification, "email", 256)?;
-    let node_name = optional_identification_string(&ilk.identification, "node_name", 128)?;
-    let association = association_json_from_ilk(ilk);
-    let definition = definition_json_from_ilk(ilk);
-    let deleted_at_ms = ilk
-        .deleted_at_ms
-        .and_then(|value| i64::try_from(value).ok());
-    let registered_by: Option<String> = None;
+    persist_ilks_state_in_db(database_config, std::slice::from_ref(ilk), alias, None).await
+}
 
+/// Upsert ilks (their row and ICH rows) and the alias a merge left, in ONE transaction: a merge
+/// moves ICH rows from the temporary ilk to the canonical one, so it lands whole or not at all.
+async fn persist_ilks_state_in_db(
+    database_config: &PgConfig,
+    ilks: &[IlkRecord],
+    alias: Option<&AliasSnapshotRecord>,
+    history: Option<&TenantChange>,
+) -> Result<(), IdentityError> {
     let (mut client, connection) = database_config.connect(NoTls).await?;
     tokio::spawn(async move {
         if let Err(err) = connection.await {
@@ -5904,113 +7823,21 @@ async fn persist_ilk_state_in_db(
     });
 
     let tx = client.transaction().await?;
-    tx.execute(
-        r#"
-INSERT INTO identity_ilks (
-    ilk_id,
-    ilk_type,
-    registration_status,
-    tenant_id,
-    email,
-    node_name,
-    identification,
-    association,
-    definition,
-    registered_by,
-    deleted_at,
-    updated_at
-)
-VALUES (
-    $1::text::uuid,
-    $2,
-    $3,
-    $4::text::uuid,
-    $5,
-    $6,
-    $7::jsonb,
-    $8::jsonb,
-    $9::jsonb,
-    $10::text::uuid,
-    CASE WHEN $11::BIGINT IS NULL THEN NULL ELSE to_timestamp(($11::DOUBLE PRECISION) / 1000.0) END,
-    NOW()
-)
-ON CONFLICT (ilk_id) DO UPDATE
-SET
-    ilk_type = EXCLUDED.ilk_type,
-    registration_status = EXCLUDED.registration_status,
-    tenant_id = EXCLUDED.tenant_id,
-    email = EXCLUDED.email,
-    node_name = EXCLUDED.node_name,
-    identification = EXCLUDED.identification,
-    association = EXCLUDED.association,
-    definition = EXCLUDED.definition,
-    registered_by = EXCLUDED.registered_by,
-    deleted_at = EXCLUDED.deleted_at,
-    updated_at = NOW()
-"#,
-        &[
-            &ilk_uuid,
-            &ilk.ilk_type,
-            &ilk.registration_status,
-            &tenant_uuid,
-            &email,
-            &node_name,
-            &ilk.identification,
-            &association,
-            &definition,
-            &registered_by,
-            &deleted_at_ms,
-        ],
-    )
-    .await?;
-
-    if ilk.deleted_at_ms.is_some() {
+    for ilk in ilks {
+        upsert_ilk_rows(&tx, ilk).await?;
+    }
+    if let Some(change) = history {
         tx.execute(
-            "DELETE FROM identity_ichs WHERE ilk_id = $1::text::uuid",
-            &[&ilk_uuid],
+            "INSERT INTO identity_ilk_tenant_history (ilk_id, from_tenant_id, to_tenant_id, changed_by) \
+             VALUES ($1::text::uuid, $2::text::uuid, $3::text::uuid, $4)",
+            &[
+                &parse_prefixed_uuid(&change.ilk_id, "ilk")?.to_string(),
+                &parse_prefixed_uuid(&change.from_tenant_id, "tnt")?.to_string(),
+                &parse_prefixed_uuid(&change.to_tenant_id, "tnt")?.to_string(),
+                &change.changed_by,
+            ],
         )
         .await?;
-    } else {
-        for (index, channel) in ilk.channels.iter().enumerate() {
-            let ich_uuid = parse_prefixed_uuid(&channel.ich_id, "ich")?.to_string();
-            let is_primary = index == 0;
-            tx.execute(
-                r#"
-INSERT INTO identity_ichs (
-    ich_id,
-    ilk_id,
-    tenant_id,
-    channel_type,
-    address,
-    owner_l2_name,
-    is_primary,
-    enabled,
-    added_at
-)
-VALUES ($1::text::uuid, $2::text::uuid, $3::text::uuid, $4, $5, $6, $7, $8, NOW())
-ON CONFLICT (ich_id) DO UPDATE
-SET
-    ilk_id = EXCLUDED.ilk_id,
-    tenant_id = EXCLUDED.tenant_id,
-    channel_type = EXCLUDED.channel_type,
-    address = EXCLUDED.address,
-    owner_l2_name = EXCLUDED.owner_l2_name,
-    is_primary = EXCLUDED.is_primary,
-    enabled = EXCLUDED.enabled
-"#,
-                &[
-                    &ich_uuid,
-                    &ilk_uuid,
-                    &tenant_uuid,
-                    &channel.channel_type,
-                    &channel.address,
-                    &channel.owner_l2_name,
-                    &is_primary,
-                    &channel.enabled,
-                ],
-            )
-            .await?;
-        }
     }
 
     if let Some(alias_record) = alias {
@@ -6041,32 +7868,225 @@ SET
     Ok(())
 }
 
-async fn delete_ilk_in_db(database_config: &PgConfig, ilk_id: &str) -> Result<(), IdentityError> {
-    let ilk_uuid = parse_prefixed_uuid(ilk_id, "ilk")?.to_string();
+/// One ilk's row and its ICH rows (an ICH row follows its channel to whichever ilk holds it now).
+async fn upsert_ilk_rows(
+    tx: &tokio_postgres::Transaction<'_>,
+    ilk: &IlkRecord,
+) -> Result<(), IdentityError> {
+    let ilk_uuid = parse_prefixed_uuid(&ilk.ilk_id, "ilk")?.to_string();
+    let tenant_uuid = parse_prefixed_uuid(&ilk.tenant_id, "tnt")?.to_string();
+    let email = optional_identification_string(&ilk.identification, "email", 256)?;
+    let node_name = optional_identification_string(&ilk.identification, "node_name", 128)?;
+    let association = association_json_from_ilk(ilk);
+    let definition = definition_json_from_ilk(ilk);
+    let deleted_at_ms = ilk
+        .deleted_at_ms
+        .and_then(|value| i64::try_from(value).ok());
+    let registered_by: Option<String> = None;
+
+    tx.execute(
+        r#"
+INSERT INTO identity_ilks (
+    ilk_id,
+    ilk_type,
+    registration_status,
+    tenant_id,
+    email,
+    node_name,
+    identification,
+    association,
+    definition,
+    registered_by,
+    deleted_at,
+    deleted_reason,
+    updated_at
+)
+VALUES (
+    $1::text::uuid,
+    $2,
+    $3,
+    $4::text::uuid,
+    $5,
+    $6,
+    $7::jsonb,
+    $8::jsonb,
+    $9::jsonb,
+    $10::text::uuid,
+    CASE WHEN $11::BIGINT IS NULL THEN NULL ELSE to_timestamp(($11::DOUBLE PRECISION) / 1000.0) END,
+    $12,
+    NOW()
+)
+ON CONFLICT (ilk_id) DO UPDATE
+SET
+    ilk_type = EXCLUDED.ilk_type,
+    registration_status = EXCLUDED.registration_status,
+    tenant_id = EXCLUDED.tenant_id,
+    email = EXCLUDED.email,
+    node_name = EXCLUDED.node_name,
+    identification = EXCLUDED.identification,
+    association = EXCLUDED.association,
+    definition = EXCLUDED.definition,
+    registered_by = EXCLUDED.registered_by,
+    deleted_at = EXCLUDED.deleted_at,
+    deleted_reason = EXCLUDED.deleted_reason,
+    updated_at = NOW()
+"#,
+        &[
+            &ilk_uuid,
+            &ilk.ilk_type,
+            &ilk.registration_status,
+            &tenant_uuid,
+            &email,
+            &node_name,
+            &ilk.identification,
+            &association,
+            &definition,
+            &registered_by,
+            &deleted_at_ms,
+            &ilk.deleted_reason,
+        ],
+    )
+    .await?;
+
+    if ilk.deleted_at_ms.is_some() {
+        tx.execute(
+            "DELETE FROM identity_ichs WHERE ilk_id = $1::text::uuid",
+            &[&ilk_uuid],
+        )
+        .await?;
+    } else {
+        for (index, channel) in ilk.channels.iter().enumerate() {
+            let ich_uuid = parse_prefixed_uuid(&channel.ich_id, "ich")?.to_string();
+            // identity_ichs.tenant_id is the channel's scope (docs/ilk-tenant-model-v1.md §2.1).
+            let scope_uuid =
+                parse_prefixed_uuid(channel_scope(channel, &ilk.tenant_id), "tnt")?.to_string();
+            let is_primary = index == 0;
+            tx.execute(
+                r#"
+INSERT INTO identity_ichs (
+    ich_id,
+    ilk_id,
+    tenant_id,
+    channel_type,
+    address,
+    owner_l2_name,
+    is_primary,
+    enabled,
+    added_at
+)
+VALUES ($1::text::uuid, $2::text::uuid, $3::text::uuid, $4, $5, $6, $7, $8, NOW())
+ON CONFLICT (ich_id) DO UPDATE
+SET
+    ilk_id = EXCLUDED.ilk_id,
+    tenant_id = EXCLUDED.tenant_id,
+    channel_type = EXCLUDED.channel_type,
+    address = EXCLUDED.address,
+    owner_l2_name = EXCLUDED.owner_l2_name,
+    is_primary = EXCLUDED.is_primary,
+    enabled = EXCLUDED.enabled
+"#,
+                &[
+                    &ich_uuid,
+                    &ilk_uuid,
+                    &scope_uuid,
+                    &channel.channel_type,
+                    &channel.address,
+                    &channel.owner_l2_name,
+                    &is_primary,
+                    &channel.enabled,
+                ],
+            )
+            .await?;
+        }
+    }
+    Ok(())
+}
+
+/// Persist what a lifecycle op changed in ONE transaction: marks/restores are column updates
+/// (the rest of the row is untouched); purges delete ichs, aliases and ilks, then tenants.
+async fn persist_lifecycle_in_db(
+    database_config: &PgConfig,
+    changes: &LifecycleChanges,
+) -> Result<(), IdentityError> {
     let (mut client, connection) = database_config.connect(NoTls).await?;
     tokio::spawn(async move {
         if let Err(err) = connection.await {
-            tracing::warn!(error = %err, "identity ilk delete postgres connection closed");
+            tracing::warn!(error = %err, "identity lifecycle postgres connection closed");
         }
     });
     let tx = client.transaction().await?;
-    tx.execute(
-        "DELETE FROM identity_ichs WHERE ilk_id = $1::text::uuid",
-        &[&ilk_uuid],
-    )
-    .await?;
-    tx.execute(
-        "DELETE FROM identity_ilk_aliases WHERE old_ilk_id = $1::text::uuid OR canonical_ilk_id = $1::text::uuid",
-        &[&ilk_uuid],
-    )
-    .await?;
-    tx.execute(
-        "DELETE FROM identity_ilks WHERE ilk_id = $1::text::uuid",
-        &[&ilk_uuid],
-    )
-    .await?;
+    for tenant in &changes.tenants {
+        let tenant_uuid = parse_prefixed_uuid(&tenant.tenant_id, "tnt")?.to_string();
+        let deleted_at_ms = tenant.deleted_at_ms.and_then(|value| i64::try_from(value).ok());
+        tx.execute(
+            "UPDATE identity_tenants SET deleted_at = CASE WHEN $2::BIGINT IS NULL THEN NULL \
+             ELSE to_timestamp(($2::DOUBLE PRECISION) / 1000.0) END, updated_at = NOW() \
+             WHERE tenant_id = $1::text::uuid",
+            &[&tenant_uuid, &deleted_at_ms],
+        )
+        .await?;
+    }
+    for ilk in &changes.ilks {
+        let ilk_uuid = parse_prefixed_uuid(&ilk.ilk_id, "ilk")?.to_string();
+        let deleted_at_ms = ilk.deleted_at_ms.and_then(|value| i64::try_from(value).ok());
+        tx.execute(
+            "UPDATE identity_ilks SET deleted_at = CASE WHEN $2::BIGINT IS NULL THEN NULL \
+             ELSE to_timestamp(($2::DOUBLE PRECISION) / 1000.0) END, deleted_reason = $3, \
+             updated_at = NOW() WHERE ilk_id = $1::text::uuid",
+            &[&ilk_uuid, &deleted_at_ms, &ilk.deleted_reason],
+        )
+        .await?;
+    }
+    for ich_id in &changes.rescoped_ichs {
+        let ich_uuid = parse_prefixed_uuid(ich_id, "ich")?.to_string();
+        let scope_uuid = parse_prefixed_uuid(INSTALLATION_SCOPE, "tnt")?.to_string();
+        tx.execute(
+            "UPDATE identity_ichs SET tenant_id = $2::text::uuid WHERE ich_id = $1::text::uuid",
+            &[&ich_uuid, &scope_uuid],
+        )
+        .await?;
+    }
+    for ilk_id in &changes.purged_ilks {
+        let ilk_uuid = parse_prefixed_uuid(ilk_id, "ilk")?.to_string();
+        tx.execute(
+            "DELETE FROM identity_ichs WHERE ilk_id = $1::text::uuid",
+            &[&ilk_uuid],
+        )
+        .await?;
+        tx.execute(
+            "DELETE FROM identity_ilk_aliases WHERE old_ilk_id = $1::text::uuid OR canonical_ilk_id = $1::text::uuid",
+            &[&ilk_uuid],
+        )
+        .await?;
+        tx.execute(
+            "DELETE FROM identity_ilks WHERE ilk_id = $1::text::uuid",
+            &[&ilk_uuid],
+        )
+        .await?;
+    }
+    for tenant_id in &changes.purged_tenants {
+        let tenant_uuid = parse_prefixed_uuid(tenant_id, "tnt")?.to_string();
+        // The channels other ILKs still held in its scope (`trimmed_ilks`).
+        tx.execute(
+            "DELETE FROM identity_ichs WHERE tenant_id = $1::text::uuid",
+            &[&tenant_uuid],
+        )
+        .await?;
+        tx.execute(
+            "DELETE FROM identity_tenants WHERE tenant_id = $1::text::uuid",
+            &[&tenant_uuid],
+        )
+        .await?;
+    }
     tx.commit().await?;
     Ok(())
+}
+
+fn payload_include_deleted(payload: &Value) -> bool {
+    payload
+        .get("include_deleted")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
 }
 
 async fn load_identity_store_from_db(
@@ -6088,7 +8108,11 @@ SELECT
     domain,
     status,
     settings,
-    sponsor_tenant_id::text AS sponsor_tenant_id
+    sponsor_tenant_id::text AS sponsor_tenant_id,
+    CASE
+        WHEN deleted_at IS NULL THEN NULL
+        ELSE (EXTRACT(EPOCH FROM deleted_at) * 1000)::BIGINT
+    END AS deleted_at_ms
 FROM identity_tenants
 ORDER BY created_at ASC
 "#,
@@ -6114,6 +8138,9 @@ ORDER BY created_at ASC
                 status,
                 settings,
                 sponsor_tenant_id: sponsor_tenant_uuid.map(|uuid| format!("tnt:{uuid}")),
+                deleted_at_ms: row
+                    .get::<_, Option<i64>>("deleted_at_ms")
+                    .and_then(|value| u64::try_from(value).ok()),
             },
         );
     }
@@ -6131,7 +8158,8 @@ SELECT
     CASE
         WHEN deleted_at IS NULL THEN NULL
         ELSE (EXTRACT(EPOCH FROM deleted_at) * 1000)::BIGINT
-    END AS deleted_at_ms
+    END AS deleted_at_ms,
+    deleted_reason
 FROM identity_ilks
 ORDER BY created_at ASC
 "#,
@@ -6155,6 +8183,7 @@ ORDER BY created_at ASC
                 definition: normalize_definition_for_ilk_type(&ilk_type, definition),
                 channels: Vec::new(),
                 deleted_at_ms: deleted_at_ms.and_then(|value| u64::try_from(value).ok()),
+                deleted_reason: row.get("deleted_reason"),
             },
         );
     }
@@ -6165,6 +8194,7 @@ ORDER BY created_at ASC
 SELECT
     ich_id::text AS ich_id,
     ilk_id::text AS ilk_id,
+    tenant_id::text AS scope,
     channel_type,
     address,
     owner_l2_name,
@@ -6183,6 +8213,9 @@ ORDER BY added_at ASC
             address: row.get("address"),
             owner_l2_name: row.get("owner_l2_name"),
             enabled: row.get("enabled"),
+            // The stored scope, never the ILK's current tenant: a reassigned person keeps their
+            // keys across a restart.
+            scope: format!("tnt:{}", row.get::<_, String>("scope")),
         };
         if let Some(ilk) = store.ilks.get_mut(&ilk_id) {
             if !ilk
@@ -6193,9 +8226,9 @@ ORDER BY added_at ASC
                 ilk.channels.push(channel.clone());
             }
             if ilk.deleted_at_ms.is_none() {
-                let key =
-                    canonical_ich_key(&channel.channel_type, &channel.address, &ilk.tenant_id);
-                store.ich_lookup.insert(key, ilk_id.clone());
+                store
+                    .ich_lookup
+                    .insert(channel_key(&channel, &ilk.tenant_id), ilk_id.clone());
             }
         }
     }
@@ -6256,9 +8289,14 @@ INSERT INTO identity_tenants (
     status,
     settings,
     sponsor_tenant_id,
+    deleted_at,
     updated_at
 )
-VALUES ($1::text::uuid, $2, $3, $4, $5::jsonb, $6::text::uuid, NOW())
+VALUES (
+    $1::text::uuid, $2, $3, $4, $5::jsonb, $6::text::uuid,
+    CASE WHEN $7::BIGINT IS NULL THEN NULL ELSE to_timestamp(($7::DOUBLE PRECISION) / 1000.0) END,
+    NOW()
+)
 ON CONFLICT (tenant_id) DO UPDATE
 SET
     name = EXCLUDED.name,
@@ -6266,6 +8304,7 @@ SET
     status = EXCLUDED.status,
     settings = EXCLUDED.settings,
     sponsor_tenant_id = EXCLUDED.sponsor_tenant_id,
+    deleted_at = EXCLUDED.deleted_at,
     updated_at = NOW()
 "#,
             &[
@@ -6275,6 +8314,7 @@ SET
                 &tenant.status,
                 &tenant.settings,
                 &sponsor_tenant_uuid,
+                &tenant.deleted_at_ms.and_then(|value| i64::try_from(value).ok()),
             ],
         )
         .await?;
@@ -6624,33 +8664,19 @@ async fn resolve_database_url(
     // before calling this, so that if vault boots after us its bootstrap
     // VAULT_SECRET_CHANGED broadcast lands in the dispatcher's system
     // channel (rescued by `handle_vault_secret_changed`).
-    let mut last_error = None;
-    let started_at = Instant::now();
-    let result = loop {
-        match vault
-            .resolve_resource(
-                fluxbee_sdk::ResourceType::Postgres,
-                my_tenant,
-                Duration::from_secs(5),
-            )
-            .await
-        {
-            Ok(value) => break Ok(value),
-            Err(err) => {
-                let err_text = err.to_string();
-                last_error = Some(err_text.clone());
-                if started_at.elapsed() >= Duration::from_secs(15) {
-                    break Err(err_text);
-                }
-                tracing::warn!(
-                    node_name = %node_name,
-                    error = %err_text,
-                    "identity vault postgres lookup failed during boot; retrying"
-                );
-                time::sleep(Duration::from_millis(750)).await;
-            }
-        }
-    };
+    // The retry itself lives in the SDK (`resolve_resource_awaiting_vault`) so identity and
+    // SY.storage wait for the vault the same way — storage used not to wait at all, and a lost
+    // boot race left the hive's admin plane down behind STORAGE_NOT_READY.
+    let result = vault
+        .resolve_resource_awaiting_vault(
+            fluxbee_sdk::ResourceType::Postgres,
+            my_tenant,
+            Duration::from_secs(5),
+            fluxbee_sdk::VAULT_BOOT_WAIT,
+            node_name,
+        )
+        .await
+        .map_err(|err| err.to_string());
     match result {
         Ok(Some(value)) => match extract_postgres_url_from_vault_value(&value) {
             Some(url) => (Some(url), IdentityDbSecretSource::LocalFile, None),
@@ -6665,8 +8691,7 @@ async fn resolve_database_url(
             None,
             IdentityDbSecretSource::Missing,
             Some(format!(
-                "vault resource lookup for postgres failed after boot retries: {}",
-                last_error.unwrap_or(err)
+                "vault resource lookup for postgres failed after boot retries: {err}"
             )),
         ),
     }
@@ -6892,16 +8917,16 @@ fn is_worker_role(role: Option<&str>) -> bool {
 mod tests {
     use super::*;
 
+    const TEST_CLOUD_RELAY: &str = "IO.cloud@motherbee";
+
     fn test_hive(identity_frontdesk: Option<&str>) -> HiveFile {
         HiveFile {
             hive_id: "motherbee".to_string(),
             role: Some("motherbee".to_string()),
-            wan: None,
             government: Some(GovernmentSection {
                 identity_frontdesk: identity_frontdesk.map(str::to_string),
             }),
             identity: None,
-            database: None,
             system_nodes: Some(SystemNodesSection {
                 motherbee: Some(RoleSystemNodes {
                     nodes: vec!["SY.identity".to_string(), "SY.architect".to_string()],
@@ -6928,9 +8953,21 @@ mod tests {
 
         assert!(runtime.is_authorized(MSG_ILK_REGISTER, Some("SY.frontdesk.gov@motherbee")));
         assert!(runtime.is_authorized(MSG_ILK_ADD_CHANNEL, Some("SY.frontdesk.gov@motherbee")));
-        assert!(runtime.is_authorized(MSG_TNT_CREATE, Some("SY.frontdesk.gov@motherbee")));
         assert!(runtime.is_authorized(MSG_TNT_CREATE, Some("SY.admin@motherbee")));
         assert!(runtime.is_authorized(MSG_TNT_CREATE, Some("SY.architect@motherbee")));
+    }
+
+    #[test]
+    fn identity_runtime_never_lets_the_frontdesk_create_or_change_a_tenant() {
+        let hive = test_hive(Some("SY.frontdesk.gov@motherbee"));
+        let runtime = IdentityRuntime::new(&hive, PathBuf::from("/tmp"), true, None);
+
+        for action in [MSG_TNT_CREATE, MSG_TNT_UPDATE, MSG_TNT_SET_SPONSOR] {
+            assert!(
+                !runtime.is_authorized(action, Some("SY.frontdesk.gov@motherbee")),
+                "{action}"
+            );
+        }
     }
 
     #[test]
@@ -6979,6 +9016,7 @@ mod tests {
         store.tenants.insert(
             "tnt:11111111-1111-1111-1111-111111111111".to_string(),
             TenantRecord {
+                deleted_at_ms: None,
                 tenant_id: "tnt:11111111-1111-1111-1111-111111111111".to_string(),
                 name: "tenant-a".to_string(),
                 domain: Some("tenant-a.local".to_string()),
@@ -7002,8 +9040,10 @@ mod tests {
                     address: "U123".to_string(),
                     owner_l2_name: Some("IO.slack@motherbee".to_string()),
                     enabled: true,
+                    scope: String::new(),
                 }],
                 deleted_at_ms: None,
+                deleted_reason: None,
             },
         );
         store.aliases.insert(
@@ -7015,7 +9055,7 @@ mod tests {
         );
 
         let payload = store
-            .get_ilk_payload("ilk:44444444-4444-4444-4444-444444444444")
+            .get_ilk_payload("ilk:44444444-4444-4444-4444-444444444444", None)
             .expect("payload");
 
         assert_eq!(
@@ -7033,6 +9073,160 @@ mod tests {
                 .and_then(Value::as_str),
             Some("tnt:11111111-1111-1111-1111-111111111111")
         );
+
+        // Scoped to its own tenant (through the alias too): the same payload.
+        assert!(store
+            .get_ilk_payload(
+                "ilk:44444444-4444-4444-4444-444444444444",
+                Some("tnt:11111111-1111-1111-1111-111111111111"),
+            )
+            .is_ok());
+        // Scoped to another tenant: NOT_FOUND, exactly like an ilk that does not exist.
+        for requested in [
+            "ilk:22222222-2222-2222-2222-222222222222",
+            "ilk:44444444-4444-4444-4444-444444444444",
+        ] {
+            assert_eq!(
+                store.get_ilk_payload(requested, Some("tnt:99999999-9999-4999-8999-999999999999")),
+                Err("NOT_FOUND".to_string())
+            );
+        }
+        assert_eq!(
+            store.get_ilk_payload(
+                "ilk:55555555-5555-4555-8555-555555555555",
+                Some("tnt:99999999-9999-4999-8999-999999999999"),
+            ),
+            Err("NOT_FOUND".to_string())
+        );
+    }
+
+    fn update_fixture() -> IdentityStore {
+        let mut store = IdentityStore::with_default_tenant();
+        for (tenant_id, name, domain, deleted) in [
+            (
+                "tnt:aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+                "Acme",
+                Some("acme.com"),
+                None,
+            ),
+            (
+                "tnt:bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+                "Globex",
+                Some("globex.com"),
+                None,
+            ),
+            (
+                "tnt:cccccccc-cccc-4ccc-8ccc-cccccccccccc",
+                "Initech",
+                Some("initech.com"),
+                Some(1),
+            ),
+        ] {
+            store.tenants.insert(
+                tenant_id.to_string(),
+                TenantRecord {
+                    tenant_id: tenant_id.to_string(),
+                    name: name.to_string(),
+                    domain: domain.map(str::to_string),
+                    status: "active".to_string(),
+                    settings: json!({}),
+                    sponsor_tenant_id: None,
+                    deleted_at_ms: deleted,
+                },
+            );
+        }
+        store
+    }
+
+    fn tenant_update(
+        tenant_id: &str,
+        name: Option<&str>,
+        domain: Option<&str>,
+    ) -> TntUpdateRequest {
+        TntUpdateRequest {
+            tenant_id: tenant_id.to_string(),
+            name: name.map(str::to_string),
+            domain: domain.map(str::to_string),
+            status: None,
+            settings: None,
+            sponsor_tenant_id: None,
+        }
+    }
+
+    #[test]
+    fn update_tenant_never_takes_another_tenants_name_or_domain() {
+        let acme = "tnt:aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+        let mut store = update_fixture();
+        let refused = [
+            // Another active tenant's name or domain, whatever the case and spaces.
+            (
+                tenant_update(acme, Some("  globex "), None),
+                "TENANT_NAME_TAKEN",
+            ),
+            (
+                tenant_update(acme, None, Some("GLOBEX.com")),
+                "TENANT_DOMAIN_TAKEN",
+            ),
+            // A tenant marked deleted keeps its name and domain reserved.
+            (
+                tenant_update(acme, Some("Initech"), None),
+                "TENANT_NAME_TAKEN",
+            ),
+            (
+                tenant_update(acme, None, Some("initech.com")),
+                "TENANT_DOMAIN_TAKEN",
+            ),
+            // The root tenant's name too.
+            (
+                tenant_update(acme, Some(DEFAULT_DEFAULT_TENANT_NAME), None),
+                "TENANT_NAME_TAKEN",
+            ),
+        ];
+        for (req, code) in refused {
+            assert_eq!(store.update_tenant(req), Err(code.to_string()));
+        }
+        let tenant = store.tenants.get(acme).unwrap();
+        assert_eq!(
+            (tenant.name.as_str(), tenant.domain.as_deref()),
+            ("Acme", Some("acme.com"))
+        );
+
+        // Its own current values (another spelling of them) and new free ones are fine.
+        store
+            .update_tenant(tenant_update(acme, Some("ACME"), Some("Acme.com")))
+            .unwrap();
+        store
+            .update_tenant(tenant_update(acme, Some("Acme S.A."), Some("acme.example")))
+            .unwrap();
+        let tenant = store.tenants.get(acme).unwrap();
+        assert_eq!(
+            (tenant.name.as_str(), tenant.domain.as_deref()),
+            ("Acme S.A.", Some("acme.example"))
+        );
+        // An empty domain clears it.
+        store
+            .update_tenant(tenant_update(acme, None, Some("")))
+            .unwrap();
+        assert_eq!(store.tenants.get(acme).unwrap().domain, None);
+    }
+
+    #[test]
+    fn update_tenant_refuses_the_root_and_changes_nothing_when_refused() {
+        let acme = "tnt:aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+        let mut store = update_fixture();
+        assert_eq!(
+            store.update_tenant(tenant_update(DEFAULT_ROOT_TENANT_ID, Some("Other"), None)),
+            Err("TENANT_ROOT_PROTECTED".to_string())
+        );
+        // A bad status after a good name: nothing changes (it used to keep the new name).
+        let mut req = tenant_update(acme, Some("Renamed"), Some("renamed.com"));
+        req.status = Some("bogus".to_string());
+        assert_eq!(store.update_tenant(req), Err("INVALID_REQUEST".to_string()));
+        let tenant = store.tenants.get(acme).unwrap();
+        assert_eq!(
+            (tenant.name.as_str(), tenant.domain.as_deref()),
+            ("Acme", Some("acme.com"))
+        );
     }
 
     #[test]
@@ -7041,6 +9235,7 @@ mod tests {
         store.tenants.insert(
             "tnt:aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa".to_string(),
             TenantRecord {
+                deleted_at_ms: None,
                 tenant_id: "tnt:aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa".to_string(),
                 name: "root".to_string(),
                 domain: Some("root.local".to_string()),
@@ -7052,6 +9247,7 @@ mod tests {
         store.tenants.insert(
             "tnt:bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb".to_string(),
             TenantRecord {
+                deleted_at_ms: None,
                 tenant_id: "tnt:bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb".to_string(),
                 name: "child".to_string(),
                 domain: Some("child.local".to_string()),
@@ -7071,6 +9267,7 @@ mod tests {
                 definition: json!({}),
                 channels: Vec::new(),
                 deleted_at_ms: None,
+                deleted_reason: None,
             },
         );
 
@@ -7111,6 +9308,7 @@ mod tests {
         store.tenants.insert(
             "tnt:bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb".to_string(),
             TenantRecord {
+                deleted_at_ms: None,
                 tenant_id: "tnt:bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb".to_string(),
                 name: "child".to_string(),
                 domain: None,
@@ -7122,6 +9320,7 @@ mod tests {
         store.tenants.insert(
             "tnt:aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa".to_string(),
             TenantRecord {
+                deleted_at_ms: None,
                 tenant_id: "tnt:aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa".to_string(),
                 name: "root".to_string(),
                 domain: None,
@@ -7131,7 +9330,7 @@ mod tests {
             },
         );
 
-        let payload = store.list_tenants_payload();
+        let payload = store.list_tenants_payload(false, false);
         let tenants = payload
             .get("tenants")
             .and_then(Value::as_array)
@@ -7169,6 +9368,7 @@ mod tests {
         store.tenants.insert(
             "tnt:aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa".to_string(),
             TenantRecord {
+                deleted_at_ms: None,
                 tenant_id: "tnt:aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa".to_string(),
                 name: "4iPlatform".to_string(),
                 domain: Some("4iplatform.com".to_string()),
@@ -7243,6 +9443,7 @@ mod tests {
         store.tenants.insert(
             DEFAULT_ROOT_TENANT_ID.to_string(),
             TenantRecord {
+                deleted_at_ms: None,
                 tenant_id: DEFAULT_ROOT_TENANT_ID.to_string(),
                 name: "other".to_string(),
                 domain: Some("example.invalid".to_string()),
@@ -7267,6 +9468,7 @@ mod tests {
         store.tenants.insert(
             "tnt:bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb".to_string(),
             TenantRecord {
+                deleted_at_ms: None,
                 tenant_id: "tnt:bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb".to_string(),
                 name: "child".to_string(),
                 domain: None,
@@ -7278,6 +9480,7 @@ mod tests {
         store.tenants.insert(
             "tnt:aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa".to_string(),
             TenantRecord {
+                deleted_at_ms: None,
                 tenant_id: "tnt:aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa".to_string(),
                 name: "root".to_string(),
                 domain: None,
@@ -7330,7 +9533,9 @@ mod tests {
     }
 
     #[test]
-    fn packaged_io_blob_is_lifecycle_managed_without_system_ilk() {
+    fn io_blob_is_no_longer_an_allowlisted_hive_yaml_lifecycle_node() {
+        // IO.blob was promoted from a packaged systemd unit to a managed runtime, so it is no longer
+        // allowed in hive.yaml system_nodes — Identity rejects the hive config, same as io.cloud.
         let mut hive = test_hive(Some("SY.frontdesk.gov@motherbee"));
         hive.system_nodes
             .as_mut()
@@ -7339,20 +9544,7 @@ mod tests {
             .nodes
             .push("IO.blob".to_string());
 
-        let system_nodes = system_nodes_for_hive(&hive).expect("read system authorities");
-        assert_eq!(system_nodes, vec!["SY.identity", "SY.architect"]);
-
-        let mut store = IdentityStore::default();
-        let changed = store
-            .ensure_system_ilks_from_hive(&hive)
-            .expect("seed only system authorities");
-        assert_eq!(changed.len(), 2);
-        assert!(!store.ilks.values().any(|ilk| {
-            ilk.identification
-                .get("system_node")
-                .and_then(Value::as_str)
-                == Some("IO.blob")
-        }));
+        assert!(system_nodes_for_hive(&hive).is_err());
     }
 
     #[test]
@@ -7374,6 +9566,7 @@ mod tests {
         store.tenants.insert(
             "tnt:aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa".to_string(),
             TenantRecord {
+                deleted_at_ms: None,
                 tenant_id: "tnt:aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa".to_string(),
                 name: "root".to_string(),
                 domain: None,
@@ -7385,6 +9578,7 @@ mod tests {
         store.tenants.insert(
             "tnt:bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb".to_string(),
             TenantRecord {
+                deleted_at_ms: None,
                 tenant_id: "tnt:bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb".to_string(),
                 name: "child".to_string(),
                 domain: None,
@@ -7423,6 +9617,7 @@ mod tests {
         store.tenants.insert(
             "tnt:aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa".to_string(),
             TenantRecord {
+                deleted_at_ms: None,
                 tenant_id: "tnt:aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa".to_string(),
                 name: "root".to_string(),
                 domain: None,
@@ -7434,6 +9629,7 @@ mod tests {
         store.tenants.insert(
             "tnt:bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb".to_string(),
             TenantRecord {
+                deleted_at_ms: None,
                 tenant_id: "tnt:bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb".to_string(),
                 name: "child".to_string(),
                 domain: None,
@@ -7470,6 +9666,7 @@ mod tests {
         store.tenants.insert(
             "tnt:aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa".to_string(),
             TenantRecord {
+                deleted_at_ms: None,
                 tenant_id: "tnt:aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa".to_string(),
                 name: "fluxbee".to_string(),
                 domain: None,
@@ -7493,8 +9690,10 @@ mod tests {
                     address: "U123".to_string(),
                     owner_l2_name: Some("IO.slack.support@motherbee".to_string()),
                     enabled: false,
+                    scope: String::new(),
                 }],
                 deleted_at_ms: None,
+                deleted_reason: None,
             },
         );
 
@@ -7527,8 +9726,10 @@ mod tests {
                     address: "demo".to_string(),
                     owner_l2_name: Some("IO.cloud@motherbee".to_string()),
                     enabled: false,
+                    scope: String::new(),
                 }],
                 deleted_at_ms: None,
+                deleted_reason: None,
             },
         );
 
@@ -7562,6 +9763,7 @@ mod tests {
         store.tenants.insert(
             "tnt:aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa".to_string(),
             TenantRecord {
+                deleted_at_ms: None,
                 tenant_id: "tnt:aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa".to_string(),
                 name: "fluxbee".to_string(),
                 domain: None,
@@ -7581,6 +9783,7 @@ mod tests {
                 definition: json!({}),
                 channels: Vec::new(),
                 deleted_at_ms: None,
+                deleted_reason: None,
             },
         );
 
@@ -7648,6 +9851,7 @@ mod tests {
                 definition: json!({}),
                 channels: Vec::new(),
                 deleted_at_ms: None,
+                deleted_reason: None,
             },
         );
 
@@ -7694,6 +9898,7 @@ mod tests {
                 definition: json!({"role_hash": "a".repeat(64)}),
                 channels: Vec::new(),
                 deleted_at_ms: None,
+                deleted_reason: None,
             },
         );
 
@@ -7725,6 +9930,7 @@ mod tests {
                 definition: json!({}),
                 channels: Vec::new(),
                 deleted_at_ms: None,
+                deleted_reason: None,
             },
         );
 
@@ -7759,6 +9965,7 @@ mod tests {
                 definition: json!({}),
                 channels: Vec::new(),
                 deleted_at_ms: None,
+                deleted_reason: None,
             },
         );
 
@@ -7780,7 +9987,7 @@ mod tests {
     }
 
     #[test]
-    fn delete_ilk_removes_agent_and_purges_ich_lookup() {
+    fn delete_marks_then_purge_removes_agent_aliases_and_lookup() {
         let mut store = IdentityStore::default();
         let ilk_id = "ilk:bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb".to_string();
         let tenant_id = "tnt:aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa".to_string();
@@ -7795,6 +10002,7 @@ mod tests {
                 definition: json!({}),
                 channels: Vec::new(),
                 deleted_at_ms: None,
+                deleted_reason: None,
             },
         );
         store.ich_lookup.insert(
@@ -7823,16 +10031,36 @@ mod tests {
             },
         );
 
-        let ok = store
-            .delete_ilk(IlkDeleteRequest {
-                ilk_id: ilk_id.clone(),
-            })
+        // delete = MARK: the row stays (keys reserved), hidden from the lookup, aliases kept.
+        let (marked, _) = store
+            .delete_ilk(
+                IlkDeleteRequest {
+                    ilk_id: ilk_id.clone(),
+                    tenant_id: None,
+                    ilk_type: None,
+                },
+                1_000,
+            )
             .expect("delete ok");
+        assert_eq!(marked.get("state").and_then(Value::as_str), Some("deleted"));
+        assert_eq!(store.ilks.get(&ilk_id).and_then(|ilk| ilk.deleted_at_ms), Some(1_000));
+        assert!(!store.ich_lookup.values().any(|mapped| mapped == &ilk_id));
+        assert!(store.aliases.contains_key(&ilk_id));
+
+        // purge = physical: ilk, lookups and aliases referencing it.
+        let (ok, changes) = store
+            .purge_ilk(IlkDeleteRequest {
+                ilk_id: ilk_id.clone(),
+                tenant_id: None,
+                ilk_type: None,
+            })
+            .expect("purge ok");
         assert_eq!(ok.get("status").and_then(Value::as_str), Some("ok"));
         assert_eq!(
             ok.get("removed_alias_count").and_then(Value::as_u64),
             Some(2)
         );
+        assert_eq!(changes.purged_ilks, vec![ilk_id.clone()]);
         assert!(!store.ilks.contains_key(&ilk_id));
         assert!(!store.ich_lookup.values().any(|mapped| mapped == &ilk_id));
         assert!(!store.aliases.contains_key(&ilk_id));
@@ -7940,13 +10168,19 @@ mod tests {
                 definition: json!({}),
                 channels: Vec::new(),
                 deleted_at_ms: None,
+                deleted_reason: None,
             },
         );
 
         let err = store
-            .delete_ilk(IlkDeleteRequest {
-                ilk_id: ilk_id.clone(),
-            })
+            .delete_ilk(
+                IlkDeleteRequest {
+                    ilk_id: ilk_id.clone(),
+                    tenant_id: None,
+                    ilk_type: None,
+                },
+                1,
+            )
             .expect_err("must refuse system ilk");
         assert_eq!(err, "SYSTEM_ILK_PROTECTED");
         assert!(store.ilks.contains_key(&ilk_id));
@@ -7956,9 +10190,14 @@ mod tests {
     fn delete_ilk_not_found_returns_specific_error() {
         let mut store = IdentityStore::default();
         let err = store
-            .delete_ilk(IlkDeleteRequest {
-                ilk_id: "ilk:cccccccc-cccc-cccc-cccc-cccccccccccc".to_string(),
-            })
+            .delete_ilk(
+                IlkDeleteRequest {
+                    ilk_id: "ilk:cccccccc-cccc-cccc-cccc-cccccccccccc".to_string(),
+                    tenant_id: None,
+                    ilk_type: None,
+                },
+                1,
+            )
             .expect_err("not found");
         assert_eq!(err, "ILK_NOT_FOUND");
     }
@@ -7969,6 +10208,7 @@ mod tests {
         store.tenants.insert(
             "tnt:aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa".to_string(),
             TenantRecord {
+                deleted_at_ms: None,
                 tenant_id: "tnt:aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa".to_string(),
                 name: "fluxbee".to_string(),
                 domain: None,
@@ -7992,12 +10232,14 @@ mod tests {
                     address: "U123".to_string(),
                     owner_l2_name: Some("IO.slack.support@motherbee".to_string()),
                     enabled: false,
+                    scope: String::new(),
                 }],
                 deleted_at_ms: None,
+                deleted_reason: None,
             },
         );
 
-        let payload = store.list_ilks_payload();
+        let payload = store.list_ilks_payload(false, false);
         assert_eq!(payload.get("count").and_then(Value::as_u64), Some(1));
         let rows = payload
             .get("ilks")
@@ -8031,6 +10273,7 @@ mod tests {
             definition: json!({}),
             channels: vec![],
             deleted_at_ms: None,
+            deleted_reason: None,
         }
     }
 
@@ -8076,6 +10319,7 @@ mod tests {
         assert!(!delta_authorized_for_hive(
             &IdentityDelta::TenantUpsert {
                 tenant: TenantRecord {
+                    deleted_at_ms: None,
                     tenant_id: "tnt:x".into(),
                     name: "x".into(),
                     domain: None,
@@ -8424,5 +10668,2178 @@ mod tests {
         assert!(validate_ilk_type("system").is_err());
         assert!(validate_ilk_type("System").is_err());
         assert!(validate_ilk_type(" system ").is_err());
+    }
+
+
+    // ---- lifecycle: mark (reversible, keys reserved) / restore / purge ----
+
+    const LC_TENANT: &str = "tnt:11111111-1111-1111-1111-111111111111";
+
+    fn lc_store_with_tenant() -> IdentityStore {
+        let mut store = IdentityStore::with_default_tenant();
+        store.tenants.insert(
+            LC_TENANT.to_string(),
+            TenantRecord {
+                tenant_id: LC_TENANT.to_string(),
+                name: "Acme".to_string(),
+                domain: Some("acme.com".to_string()),
+                status: "active".to_string(),
+                settings: json!({}),
+                sponsor_tenant_id: None,
+                deleted_at_ms: None,
+            },
+        );
+        store
+    }
+
+    fn lc_provision(store: &mut IdentityStore, address: &str) -> String {
+        let out = store
+            .provision_temporary_ilk(
+                IlkProvisionRequest {
+                    ich_id: format!("ich:{}", Uuid::new_v4()),
+                    channel_type: "cloud".to_string(),
+                    address: address.to_string(),
+                    tenant_id: Some(LC_TENANT.to_string()),
+                    ilk_type: None,
+                    scope: None,
+                },
+                None,
+                TEST_CLOUD_RELAY,
+            )
+            .map(|(ok, _)| ok)
+            .expect("provision");
+        out.get("ilk_id").and_then(Value::as_str).unwrap().to_string()
+    }
+
+    fn lc_ilk(id: &str) -> IlkDeleteRequest {
+        IlkDeleteRequest {
+            ilk_id: id.to_string(),
+            tenant_id: None,
+            ilk_type: None,
+        }
+    }
+
+    fn lc_tenant(id: &str) -> TntLifecycleRequest {
+        TntLifecycleRequest { tenant_id: id.to_string() }
+    }
+
+    fn lc_code(err: String) -> String {
+        err.split_once('|').map(|(code, _)| code.to_string()).unwrap_or(err)
+    }
+
+    #[test]
+    fn lifecycle_marked_ilk_is_hidden_and_its_channel_stays_reserved() {
+        let mut store = lc_store_with_tenant();
+        let ilk = lc_provision(&mut store, "ana@acme.com");
+        store.delete_ilk(lc_ilk(&ilk), 5).expect("mark");
+
+        // hidden: not listed by default, listed with include_deleted
+        let listed = store.list_ilks_payload(false, false);
+        assert!(!listed.to_string().contains(&ilk));
+        assert!(store
+            .list_ilks_payload(true, false)
+            .to_string()
+            .contains(&ilk));
+
+        // reserved: the same channel does not mint a new identity
+        let err = store
+            .provision_temporary_ilk(
+                IlkProvisionRequest {
+                    ich_id: format!("ich:{}", Uuid::new_v4()),
+                    channel_type: "cloud".to_string(),
+                    address: "ana@acme.com".to_string(),
+                    tenant_id: Some(LC_TENANT.to_string()),
+                    ilk_type: None,
+                    scope: None,
+                },
+                None,
+                TEST_CLOUD_RELAY,
+            )
+            .map(|(ok, _)| ok)
+            .expect_err("reserved");
+        assert_eq!(err, "ILK_DELETED");
+
+        // mark is idempotent
+        let (again, changes) = store.delete_ilk(lc_ilk(&ilk), 9).expect("idempotent");
+        assert_eq!(again.get("already_deleted").and_then(Value::as_bool), Some(true));
+        assert!(changes.ilks.is_empty());
+        assert_eq!(store.ilks[&ilk].deleted_at_ms, Some(5));
+    }
+
+    #[test]
+    fn lifecycle_purge_requires_the_mark_and_restore_brings_the_lookup_back() {
+        let mut store = lc_store_with_tenant();
+        let ilk = lc_provision(&mut store, "bob@acme.com");
+        let err = store.purge_ilk(lc_ilk(&ilk)).expect_err("active cannot be purged");
+        assert_eq!(lc_code(err), "ILK_NOT_DELETED");
+        assert_eq!(
+            lc_code(store.restore_ilk(lc_ilk(&ilk)).expect_err("not marked")),
+            "ILK_NOT_DELETED"
+        );
+
+        store.delete_ilk(lc_ilk(&ilk), 5).expect("mark");
+        let (restored, changes) = store.restore_ilk(lc_ilk(&ilk)).expect("restore");
+        assert_eq!(restored.get("state").and_then(Value::as_str), Some("active"));
+        assert_eq!(changes.ilks.len(), 1);
+        assert_eq!(store.ilks[&ilk].deleted_at_ms, None);
+        assert!(store.ich_lookup.values().any(|mapped| mapped == &ilk));
+    }
+
+    #[test]
+    fn lifecycle_reserved_node_name_blocks_register() {
+        let mut store = lc_store_with_tenant();
+        let ilk = "ilk:22222222-2222-2222-2222-222222222222".to_string();
+        store.ilks.insert(
+            ilk.clone(),
+            IlkRecord {
+                ilk_id: ilk.clone(),
+                ilk_type: "agent".to_string(),
+                registration_status: "complete".to_string(),
+                tenant_id: LC_TENANT.to_string(),
+                identification: json!({"node_name": "AI.bot@motherbee"}),
+                definition: json!({}),
+                channels: Vec::new(),
+                deleted_at_ms: Some(7),
+                deleted_reason: Some(DELETED_REASON_DIRECT.to_string()),
+            },
+        );
+        let err = store
+            .register_ilk(
+                IlkRegisterRequest {
+                    ilk_id: "ilk:33333333-3333-3333-3333-333333333333".to_string(),
+                    ilk_type: "agent".to_string(),
+                    tenant_id: LC_TENANT.to_string(),
+                    identification: json!({"node_name": "AI.bot@motherbee"}),
+                },
+                MERGE_TTL_SECS,
+            )
+            .expect_err("node_name reserved");
+        assert_eq!(err, "ILK_DELETED");
+    }
+
+    #[test]
+    fn deleting_a_tenant_marks_no_one_and_restoring_brings_it_back() {
+        let mut store = lc_store_with_tenant();
+        let gone = lc_provision(&mut store, "gone@acme.com");
+        let kept = lc_provision(&mut store, "kept@acme.com");
+        store.delete_ilk(lc_ilk(&gone), 3).expect("direct mark");
+
+        let (out, changes) = store.delete_tenant(lc_tenant(LC_TENANT), 10).expect("tenant mark");
+        assert_eq!(out["people_charged"], 1);
+        assert!(changes.ilks.is_empty(), "no ILK is marked");
+        assert_eq!(changes.tenants.len(), 1);
+        assert_eq!(store.ilks[&kept].deleted_at_ms, None);
+        assert!(store.ich_lookup.values().any(|mapped| mapped == &kept));
+        // A person deleted on their own comes back while the tenant is marked, still charged to it.
+        store
+            .restore_ilk(lc_ilk(&gone))
+            .expect("a person is never stranded");
+        assert_eq!(store.ilks[&gone].tenant_id, LC_TENANT);
+        // Its name stays reserved.
+        let err = store
+            .create_tenant(TntCreateRequest {
+                name: "Acme".to_string(),
+                domain: None,
+                status: None,
+                settings: None,
+                sponsor_tenant_id: None,
+            })
+            .expect_err("name reserved");
+        assert_eq!(err, "TENANT_DELETED");
+
+        let (restored, changes) = store.restore_tenant(lc_tenant(LC_TENANT)).expect("restore");
+        assert_eq!(restored["people_charged"], 2);
+        assert!(changes.ilks.is_empty());
+        assert_eq!(store.tenants[LC_TENANT].deleted_at_ms, None);
+    }
+
+    #[test]
+    fn lifecycle_tenant_guards_root_nodes_and_children() {
+        let mut store = lc_store_with_tenant();
+        assert_eq!(
+            lc_code(store.delete_tenant(lc_tenant(DEFAULT_ROOT_TENANT_ID), 1).expect_err("root")),
+            "TENANT_ROOT_PROTECTED"
+        );
+        let node = "ilk:44444444-4444-4444-4444-444444444444".to_string();
+        store.ilks.insert(
+            node.clone(),
+            IlkRecord {
+                ilk_id: node.clone(),
+                ilk_type: "agent".to_string(),
+                registration_status: "complete".to_string(),
+                tenant_id: LC_TENANT.to_string(),
+                identification: json!({"node_name": "AI.acme@motherbee"}),
+                definition: json!({}),
+                channels: Vec::new(),
+                deleted_at_ms: None,
+                deleted_reason: None,
+            },
+        );
+        let err = store.delete_tenant(lc_tenant(LC_TENANT), 1).expect_err("has nodes");
+        assert!(err.starts_with("TENANT_HAS_NODES|") && err.contains("AI.acme@motherbee"), "{err}");
+        assert!(store.tenants[LC_TENANT].deleted_at_ms.is_none());
+        store.ilks.remove(&node);
+
+        let child = "tnt:55555555-5555-5555-5555-555555555555".to_string();
+        store.tenants.insert(
+            child.clone(),
+            TenantRecord {
+                tenant_id: child.clone(),
+                name: "Acme Child".to_string(),
+                domain: None,
+                status: "active".to_string(),
+                settings: json!({}),
+                sponsor_tenant_id: Some(LC_TENANT.to_string()),
+                deleted_at_ms: None,
+            },
+        );
+        assert_eq!(
+            lc_code(store.delete_tenant(lc_tenant(LC_TENANT), 1).expect_err("children")),
+            "TENANT_HAS_CHILDREN"
+        );
+    }
+
+    #[test]
+    fn purging_a_tenant_waits_for_its_people_and_takes_the_marked_ones() {
+        let mut store = sc_store();
+        let zoe = lc_provision(&mut store, "zoe@acme.com");
+        let gone = lc_provision(&mut store, "gone@acme.com");
+        store.delete_ilk(lc_ilk(&gone), 3).expect("direct mark");
+        assert_eq!(
+            lc_code(store.purge_tenant(lc_tenant(LC_TENANT)).expect_err("not marked")),
+            "TENANT_NOT_DELETED"
+        );
+        store.delete_tenant(lc_tenant(LC_TENANT), 10).expect("mark");
+        let err = store
+            .purge_tenant(lc_tenant(LC_TENANT))
+            .expect_err("zoe is charged");
+        assert!(
+            err.starts_with("TENANT_HAS_PEOPLE|") && err.contains(&zoe),
+            "{err}"
+        );
+        assert!(
+            !err.contains(&gone),
+            "a marked person does not block: {err}"
+        );
+        assert!(store.tenants.contains_key(LC_TENANT));
+
+        store
+            .set_ilk_tenant(&sc_set_tenant(&zoe, SC_OTHER), "x")
+            .expect("charged elsewhere");
+        let (out, changes) = store.purge_tenant(lc_tenant(LC_TENANT)).expect("purge");
+        assert_eq!(out["purged_ilks"], 1);
+        assert_eq!(changes.purged_tenants, vec![LC_TENANT.to_string()]);
+        assert!(
+            !store.ilks.contains_key(&gone),
+            "the marked person goes with the tenant"
+        );
+        assert_eq!(store.ilks[&zoe].tenant_id, SC_OTHER);
+        assert!(!store.tenants.contains_key(LC_TENANT));
+        // After the purge the name is free again.
+        let created = store
+            .create_tenant(TntCreateRequest {
+                name: "Acme".to_string(),
+                domain: None,
+                status: Some("active".to_string()),
+                settings: None,
+                sponsor_tenant_id: None,
+            })
+            .expect("name free after purge");
+        assert_eq!(created.get("created").and_then(Value::as_bool), Some(true));
+    }
+
+    #[test]
+    fn lifecycle_ilk_ops_respect_the_expected_tenant_scope() {
+        let mut store = lc_store_with_tenant();
+        let ilk = lc_provision(&mut store, "scope@acme.com");
+        let foreign = IlkDeleteRequest {
+            ilk_id: ilk.clone(),
+            tenant_id: Some("tnt:99999999-9999-9999-9999-999999999999".to_string()),
+            ilk_type: None,
+        };
+        assert_eq!(store.delete_ilk(foreign, 1).expect_err("other tenant"), "ILK_TENANT_MISMATCH");
+        assert!(store.ilks[&ilk].deleted_at_ms.is_none());
+        let own = IlkDeleteRequest {
+            ilk_id: ilk.clone(),
+            tenant_id: Some(LC_TENANT.to_string()),
+            ilk_type: None,
+        };
+        store.delete_ilk(own, 1).expect("own tenant");
+        assert!(store.ilks[&ilk].deleted_at_ms.is_some());
+    }
+
+    #[test]
+    fn lifecycle_tenant_delete_delta_is_primary_only_and_applies_on_replicas() {
+        let mut store = lc_store_with_tenant();
+        let delta = IdentityDelta::TenantDelete { tenant_id: LC_TENANT.to_string() };
+        assert!(!delta_authorized_for_hive(&delta, "worker1", &store));
+        store.apply_delta(delta);
+        assert!(!store.tenants.contains_key(LC_TENANT));
+    }
+
+    // ---- ILK_REGISTER: active tenants only, and merge by email (operator, 2026-10-02) ----
+
+    const MERGE_TTL_SECS: u64 = 3600;
+    const OTHER_TENANT: &str = "tnt:22222222-2222-2222-2222-222222222222";
+
+    fn rg_store() -> IdentityStore {
+        let mut store = lc_store_with_tenant();
+        store.tenants.insert(
+            OTHER_TENANT.to_string(),
+            TenantRecord {
+                tenant_id: OTHER_TENANT.to_string(),
+                name: "Other".to_string(),
+                domain: None,
+                status: "active".to_string(),
+                settings: json!({}),
+                sponsor_tenant_id: None,
+                deleted_at_ms: None,
+            },
+        );
+        store
+    }
+
+    fn rg_provision(
+        store: &mut IdentityStore,
+        tenant_id: &str,
+        channel: &str,
+        address: &str,
+    ) -> String {
+        let out = store
+            .provision_temporary_ilk(
+                IlkProvisionRequest {
+                    ich_id: format!("ich:{}", Uuid::new_v4()),
+                    channel_type: channel.to_string(),
+                    address: address.to_string(),
+                    tenant_id: Some(tenant_id.to_string()),
+                    ilk_type: None,
+                    scope: None,
+                },
+                None,
+                TEST_CLOUD_RELAY,
+            )
+            .map(|(ok, _)| ok)
+            .expect("provision");
+        out["ilk_id"].as_str().expect("ilk_id").to_string()
+    }
+
+    fn rg_register(
+        store: &mut IdentityStore,
+        ilk_id: &str,
+        tenant_id: &str,
+        identification: Value,
+    ) -> Result<Value, String> {
+        store.register_ilk(
+            IlkRegisterRequest {
+                ilk_id: ilk_id.to_string(),
+                ilk_type: "human".to_string(),
+                tenant_id: tenant_id.to_string(),
+                identification,
+            },
+            MERGE_TTL_SECS,
+        )
+    }
+
+    /// Ana, registered through the cloud channel of LC_TENANT.
+    fn rg_with_ana(store: &mut IdentityStore) -> String {
+        let ana = rg_provision(store, LC_TENANT, "cloud", "ana@acme.com");
+        let reply = rg_register(
+            store,
+            &ana,
+            LC_TENANT,
+            json!({"display_name": "Ana Perez", "email": "ana@acme.com", "phone": "",
+                   "attributes": {"crm_id": "c-1"}}),
+        )
+        .expect("first registration");
+        assert_eq!(reply["merged"], false);
+        ana
+    }
+
+    #[test]
+    fn register_refuses_a_tenant_that_is_not_active() {
+        for (status, code) in [
+            ("pending", "TENANT_PENDING"),
+            ("suspended", "TENANT_SUSPENDED"),
+        ] {
+            let mut store = rg_store();
+            let temp = rg_provision(&mut store, LC_TENANT, "slack", "U1");
+            store.tenants.get_mut(LC_TENANT).unwrap().status = status.to_string();
+            let err = rg_register(&mut store, &temp, LC_TENANT, json!({"email": "a@acme.com"}))
+                .expect_err(status);
+            assert_eq!(err, code);
+            assert_eq!(store.ilks[&temp].registration_status, "temporary");
+        }
+        let mut store = rg_store();
+        let temp = rg_provision(&mut store, LC_TENANT, "slack", "U1");
+        store.tenants.get_mut(LC_TENANT).unwrap().deleted_at_ms = Some(1);
+        let err = rg_register(&mut store, &temp, LC_TENANT, json!({"email": "a@acme.com"}))
+            .expect_err("deleted");
+        assert_eq!(err, "TENANT_DELETED");
+    }
+
+    #[test]
+    fn nobody_registers_a_person_into_the_root_tenant() {
+        let mut store = rg_store();
+        // A root-tenant IO node still provisions whoever writes in: a temporary of the root
+        // tenant, which is also where a provision without a tenant lands.
+        let temp = rg_provision(&mut store, DEFAULT_ROOT_TENANT_ID, "slack", "UROOT");
+        let defaulted = store
+            .provision_temporary_ilk(
+                IlkProvisionRequest {
+                    ich_id: format!("ich:{}", Uuid::new_v4()),
+                    channel_type: "whatsapp".to_string(),
+                    address: "+5491100000009".to_string(),
+                    tenant_id: None,
+                    ilk_type: None,
+                    scope: None,
+                },
+                None,
+                TEST_CLOUD_RELAY,
+            )
+            .map(|(ok, _)| ok)
+            .expect("provision without a tenant");
+        let defaulted = defaulted["ilk_id"].as_str().expect("ilk_id").to_string();
+        assert_eq!(store.ilks[&defaulted].tenant_id, DEFAULT_ROOT_TENANT_ID);
+        // A person registered in the root tenant before the rule.
+        let legacy = "ilk:66666666-6666-4666-8666-666666666666";
+        store.ilks.insert(
+            legacy.to_string(),
+            IlkRecord {
+                ilk_id: legacy.to_string(),
+                ilk_type: "human".to_string(),
+                registration_status: "complete".to_string(),
+                tenant_id: DEFAULT_ROOT_TENANT_ID.to_string(),
+                identification: json!({"display_name": "Legacy", "email": "legacy@acme.com"}),
+                definition: json!({}),
+                channels: Vec::new(),
+                deleted_at_ms: None,
+                deleted_reason: None,
+            },
+        );
+        let new_ilk = "ilk:77777777-7777-4777-8777-777777777777";
+        let ilks = store.ilks.clone();
+        let lookup = store.ich_lookup.clone();
+
+        for (ilk_id, ilk_type, email) in [
+            // The temporary of a root-tenant IO node, and one provisioned without a tenant.
+            (temp.as_str(), "human", "uroot@acme.com"),
+            (defaulted.as_str(), "human", "wa@acme.com"),
+            // A person's temporary registered as an agent is still a person.
+            (temp.as_str(), "agent", "uroot@acme.com"),
+            (new_ilk, "human", "new@acme.com"),
+            // A merge into the person already there, and an update of that person.
+            (temp.as_str(), "human", "legacy@acme.com"),
+            (legacy, "human", "legacy@acme.com"),
+        ] {
+            let err = store
+                .register_ilk(
+                    IlkRegisterRequest {
+                        ilk_id: ilk_id.to_string(),
+                        ilk_type: ilk_type.to_string(),
+                        tenant_id: DEFAULT_ROOT_TENANT_ID.to_string(),
+                        identification: json!({"display_name": "Root", "email": email}),
+                    },
+                    MERGE_TTL_SECS,
+                )
+                .expect_err("refused");
+            assert_eq!(err, "TENANT_ROOT_NOT_REGISTRABLE", "{ilk_id} as {ilk_type}");
+        }
+        // Nothing changed: the temporaries stay temporary, and nothing merged.
+        assert_eq!(store.ilks, ilks);
+        assert_eq!(store.ich_lookup, lookup);
+        assert!(store.aliases.is_empty());
+        assert_eq!(store.ilks[&temp].registration_status, "temporary");
+    }
+
+    #[test]
+    fn nodes_still_register_into_the_root_tenant() {
+        let mut store = rg_store();
+        let node = "ilk:88888888-8888-4888-8888-888888888888";
+        let request = |ilk_id: &str| IlkRegisterRequest {
+            ilk_id: ilk_id.to_string(),
+            ilk_type: "agent".to_string(),
+            tenant_id: DEFAULT_ROOT_TENANT_ID.to_string(),
+            identification: json!({"display_name": "IO.api@motherbee", "node_name": "IO.api@motherbee"}),
+        };
+        let first = store
+            .register_ilk(request(node), MERGE_TTL_SECS)
+            .expect("base node");
+        assert_eq!(first["ilk_id"], node);
+        assert_eq!(first["tenant_id"], DEFAULT_ROOT_TENANT_ID);
+        assert_eq!(first["registration_status"], "complete");
+        // Its respawn keeps the node's ilk.
+        let again = store
+            .register_ilk(
+                request("ilk:99999999-9999-4999-8999-999999999990"),
+                MERGE_TTL_SECS,
+            )
+            .expect("respawn");
+        assert_eq!(again["ilk_id"], node);
+        // An agent a root-tenant IO node provisioned registers there too.
+        let bot = store
+            .provision_temporary_ilk(
+                IlkProvisionRequest {
+                    ich_id: format!("ich:{}", Uuid::new_v4()),
+                    channel_type: "slack".to_string(),
+                    address: "UBOT".to_string(),
+                    tenant_id: None,
+                    ilk_type: Some("agent".to_string()),
+                    scope: None,
+                },
+                None,
+                TEST_CLOUD_RELAY,
+            )
+            .map(|(ok, _)| ok)
+            .expect("provision an agent");
+        let bot = bot["ilk_id"].as_str().expect("ilk_id").to_string();
+        let registered = store
+            .register_ilk(
+                IlkRegisterRequest {
+                    ilk_id: bot.clone(),
+                    ilk_type: "agent".to_string(),
+                    tenant_id: DEFAULT_ROOT_TENANT_ID.to_string(),
+                    identification: json!({"display_name": "Bot"}),
+                },
+                MERGE_TTL_SECS,
+            )
+            .expect("agent");
+        assert_eq!(registered["ilk_id"], bot.as_str());
+        assert_eq!(store.ilks[&bot].registration_status, "complete");
+    }
+
+    #[test]
+    fn register_with_a_registered_email_merges_into_that_ilk() {
+        let mut store = rg_store();
+        let ana = rg_with_ana(&mut store);
+        // Ana writes from WhatsApp: a new temporary ilk, registered with the same email.
+        let temp = rg_provision(&mut store, LC_TENANT, "whatsapp", "+5491100000001");
+        let reply = rg_register(
+            &mut store,
+            &temp,
+            LC_TENANT,
+            json!({"display_name": "Ana P", "email": "ana@acme.com", "phone": "+5491100000001",
+                   "company_name": "Acme", "attributes": {"crm_id": "c-2", "plan": "pro"}}),
+        )
+        .expect("merge");
+        assert_eq!(reply["status"], "ok");
+        assert_eq!(reply["ilk_id"], ana.as_str());
+        assert_eq!(reply["tenant_id"], LC_TENANT);
+        assert_eq!(reply["registration_status"], "complete");
+        assert_eq!(reply["merged"], true);
+        assert_eq!(reply["merged_from_ilk_id"], temp.as_str());
+
+        // The registered ilk keeps its id and its data, and only gains what it lacked.
+        let registered = &store.ilks[&ana];
+        assert_eq!(registered.registration_status, "complete");
+        assert_eq!(registered.identification["display_name"], "Ana Perez");
+        assert_eq!(registered.identification["phone"], "+5491100000001");
+        assert_eq!(registered.identification["company_name"], "Acme");
+        assert_eq!(
+            registered.identification["attributes"],
+            json!({"crm_id": "c-1", "plan": "pro"})
+        );
+        // The WhatsApp channel moved to her and resolves to her.
+        assert!(registered
+            .channels
+            .iter()
+            .any(|ch| ch.address == "+5491100000001"));
+        assert!(store.ilks[&temp].channels.is_empty());
+        let key = canonical_ich_key("whatsapp", "+5491100000001", LC_TENANT);
+        assert_eq!(store.ich_lookup[&key], ana);
+        // The temporary ilk stays, empty, as an alias of hers until the alias GC.
+        assert_eq!(store.ilks[&temp].registration_status, "temporary");
+        assert_eq!(store.ilks[&temp].identification, json!({}));
+        assert_eq!(store.aliases[&temp].canonical_ilk_id, ana);
+    }
+
+    #[test]
+    fn a_merge_reaches_replicas_and_full_syncs_with_the_channel_on_the_registered_ilk() {
+        let mut primary = rg_store();
+        let ana = rg_with_ana(&mut primary);
+        let temp = rg_provision(&mut primary, LC_TENANT, "slack", "U777");
+        let mut replica = primary.clone();
+        rg_register(
+            &mut primary,
+            &temp,
+            LC_TENANT,
+            json!({"email": "ana@acme.com"}),
+        )
+        .expect("merge");
+
+        // What the ILK_REGISTER handler replicates: both ilks, then the alias.
+        for delta in [
+            IdentityDelta::IlkUpsert {
+                ilk: primary.ilks[&ana].clone(),
+            },
+            IdentityDelta::IlkUpsert {
+                ilk: primary.ilks[&temp].clone(),
+            },
+            IdentityDelta::AliasUpsert {
+                alias: primary.alias_snapshot(&temp).expect("alias"),
+            },
+        ] {
+            replica.apply_delta(delta);
+        }
+        let key = canonical_ich_key("slack", "U777", LC_TENANT);
+        assert_eq!(replica.ich_lookup[&key], ana);
+        assert_eq!(replica.aliases[&temp].canonical_ilk_id, ana);
+
+        // A cold replica rebuilds its lookup from the ilks: only Ana holds the channel.
+        let rebuilt = IdentityStore::from_full_sync_chunks(&primary.build_full_sync_chunks(2))
+            .expect("full sync");
+        assert_eq!(rebuilt.ich_lookup[&key], ana);
+        let holders = rebuilt
+            .ilks
+            .values()
+            .filter(|ilk| ilk.channels.iter().any(|ch| ch.address == "U777"))
+            .count();
+        assert_eq!(holders, 1);
+    }
+
+    #[test]
+    fn a_registered_email_that_cannot_merge_is_a_duplicate_and_changes_nothing() {
+        let mut store = rg_store();
+        let ana = rg_with_ana(&mut store);
+        // A complete ilk does not give up its channels.
+        let bob = rg_provision(&mut store, LC_TENANT, "slack", "UBOB");
+        rg_register(
+            &mut store,
+            &bob,
+            LC_TENANT,
+            json!({"email": "bob@acme.com"}),
+        )
+        .expect("bob");
+        // A merge never moves a channel to another tenant.
+        let foreign = rg_provision(&mut store, OTHER_TENANT, "slack", "UFOREIGN");
+        let ilks = store.ilks.clone();
+        let lookup = store.ich_lookup.clone();
+
+        for (ilk_id, why) in [
+            (bob.as_str(), "complete ilk"),
+            (foreign.as_str(), "temporary ilk of another tenant"),
+            ("ilk:99999999-9999-4999-8999-999999999999", "new ilk"),
+        ] {
+            let err = rg_register(
+                &mut store,
+                ilk_id,
+                LC_TENANT,
+                json!({"email": "ana@acme.com"}),
+            )
+            .expect_err(why);
+            assert_eq!(err, "DUPLICATE_EMAIL", "{why}");
+        }
+        assert_eq!(store.ilks, ilks);
+        assert_eq!(store.ich_lookup, lookup);
+        assert!(store.aliases.is_empty());
+        assert_eq!(store.ilks[&ana].channels.len(), 1);
+    }
+
+    #[test]
+    fn the_same_email_in_another_tenant_is_another_person() {
+        let mut store = rg_store();
+        let ana = rg_with_ana(&mut store);
+        let other = rg_provision(&mut store, OTHER_TENANT, "slack", "U2");
+        let reply = rg_register(
+            &mut store,
+            &other,
+            OTHER_TENANT,
+            json!({"email": "ana@acme.com"}),
+        )
+        .expect("other tenant");
+        assert_eq!(reply["ilk_id"], other.as_str());
+        assert_eq!(reply["merged"], false);
+        assert_eq!(store.ilks[&other].registration_status, "complete");
+        assert_eq!(store.ilks[&ana].channels.len(), 1);
+    }
+
+    #[test]
+    fn a_marked_ilk_reserves_its_email_only_in_its_tenant() {
+        let mut store = rg_store();
+        let gone = rg_provision(&mut store, OTHER_TENANT, "slack", "UGONE");
+        rg_register(
+            &mut store,
+            &gone,
+            OTHER_TENANT,
+            json!({"email": "zoe@acme.com"}),
+        )
+        .expect("register");
+        store.delete_ilk(lc_ilk(&gone), 5).expect("mark");
+
+        // Reserved in its own tenant...
+        let again = rg_provision(&mut store, OTHER_TENANT, "slack", "UAGAIN");
+        let err = rg_register(
+            &mut store,
+            &again,
+            OTHER_TENANT,
+            json!({"email": "zoe@acme.com"}),
+        )
+        .expect_err("reserved");
+        assert_eq!(err, "ILK_DELETED");
+        // ...and free in any other.
+        let temp = rg_provision(&mut store, LC_TENANT, "slack", "UZOE");
+        let reply = rg_register(
+            &mut store,
+            &temp,
+            LC_TENANT,
+            json!({"email": "zoe@acme.com"}),
+        )
+        .expect("free in another tenant");
+        assert_eq!(reply["ilk_id"], temp.as_str());
+    }
+
+    #[test]
+    fn registering_the_ilk_itself_replaces_its_identification() {
+        // The explicit update: last write wins, unlike the merge, which only fills gaps.
+        let mut store = rg_store();
+        let ana = rg_with_ana(&mut store);
+        let reply = rg_register(
+            &mut store,
+            &ana,
+            LC_TENANT,
+            json!({"display_name": "Ana Maria", "email": "ana@acme.com"}),
+        )
+        .expect("update");
+        assert_eq!(reply["ilk_id"], ana.as_str());
+        assert_eq!(reply["merged"], false);
+        assert_eq!(
+            store.ilks[&ana].identification,
+            json!({"display_name": "Ana Maria", "email": "ana@acme.com"})
+        );
+    }
+
+    #[test]
+    fn node_registration_is_untouched_by_the_email_merge() {
+        let mut store = rg_store();
+        let node = "ilk:33333333-3333-4333-8333-333333333333";
+        let request = |ilk_id: &str| IlkRegisterRequest {
+            ilk_id: ilk_id.to_string(),
+            ilk_type: "agent".to_string(),
+            tenant_id: LC_TENANT.to_string(),
+            identification: json!({"display_name": "AI.bot@motherbee", "node_name": "AI.bot@motherbee"}),
+        };
+        let first = store
+            .register_ilk(request(node), MERGE_TTL_SECS)
+            .expect("node");
+        assert_eq!(first["ilk_id"], node);
+        assert_eq!(first["merged"], false);
+        // A respawn under another requested id keeps the node's ilk (node_name match).
+        let again = store
+            .register_ilk(
+                request("ilk:44444444-4444-4444-8444-444444444444"),
+                MERGE_TTL_SECS,
+            )
+            .expect("respawn");
+        assert_eq!(again["ilk_id"], node);
+        assert_eq!(again["merged"], false);
+        assert!(store.aliases.is_empty());
+    }
+
+    #[test]
+    fn add_channel_merge_moves_the_channels_and_validates_before_it_mutates() {
+        let mut store = rg_store();
+        let ana = rg_with_ana(&mut store);
+        let temp = rg_provision(&mut store, LC_TENANT, "slack", "U9");
+        let request = |merge_from: &str| IlkAddChannelRequest {
+            ilk_id: ana.clone(),
+            channel: ChannelInput {
+                ich_id: "ich:55555555-5555-4555-8555-555555555555".to_string(),
+                channel_type: "email".to_string(),
+                address: "ana@mail.com".to_string(),
+                scope: None,
+            },
+            merge_from_ilk_id: Some(merge_from.to_string()),
+            change_reason: None,
+        };
+
+        // A bad merge source leaves everything as it was.
+        let ilks = store.ilks.clone();
+        let lookup = store.ich_lookup.clone();
+        let err = store
+            .add_channel(request(&ana), None, MERGE_TTL_SECS, TEST_CLOUD_RELAY)
+            .expect_err("an ilk cannot merge into itself");
+        assert_eq!(err, "INVALID_MERGE_SOURCE");
+        assert_eq!(store.ilks, ilks);
+        assert_eq!(store.ich_lookup, lookup);
+
+        // A good one moves the temporary ilk's channels.
+        store
+            .add_channel(request(&temp), None, MERGE_TTL_SECS, TEST_CLOUD_RELAY)
+            .expect("merge");
+        assert!(store.ilks[&temp].channels.is_empty());
+        let channels = &store.ilks[&ana].channels;
+        assert!(channels.iter().any(|ch| ch.address == "U9"));
+        assert!(channels.iter().any(|ch| ch.address == "ana@mail.com"));
+        assert_eq!(store.aliases[&temp].canonical_ilk_id, ana);
+    }
+
+    #[test]
+    fn fill_missing_identification_never_overwrites_a_value() {
+        let mut target = json!({"display_name": "Ana", "phone": null, "company_name": "  ",
+                                "attributes": {"crm_id": "c-1"}, "tags": []});
+        fill_missing_identification(
+            &mut target,
+            &json!({"display_name": "Other", "phone": "+54", "company_name": "Acme",
+                    "attributes": {"crm_id": "c-2", "plan": "pro"}, "tags": ["vip"], "email": ""}),
+        );
+        assert_eq!(
+            target,
+            json!({"display_name": "Ana", "phone": "+54", "company_name": "Acme",
+                   "attributes": {"crm_id": "c-1", "plan": "pro"}, "tags": ["vip"]})
+        );
+        let mut empty = Value::Null;
+        fill_missing_identification(&mut empty, &json!({"email": "ana@acme.com"}));
+        assert_eq!(empty, json!({"email": "ana@acme.com"}));
+    }
+
+    type SyncHalves = (
+        BufReader<tokio::net::tcp::OwnedReadHalf>,
+        tokio::net::tcp::OwnedWriteHalf,
+    );
+
+    /// A connected loopback pair: (the primary's end, the replica's end).
+    async fn sync_link() -> (SyncHalves, SyncHalves) {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind loopback");
+        let addr = listener.local_addr().expect("local addr");
+        let (replica, primary) = tokio::join!(TcpStream::connect(addr), listener.accept());
+        let (p_read, p_write) = primary.expect("accept").0.into_split();
+        let (r_read, r_write) = replica.expect("connect").into_split();
+        (
+            (BufReader::new(p_read), p_write),
+            (BufReader::new(r_read), r_write),
+        )
+    }
+
+    fn ilk_delete_envelope(seq: u64) -> IdentityDeltaEnvelope {
+        IdentityDeltaEnvelope {
+            version: IDENTITY_SYNC_VERSION,
+            operation: SYNC_OP_DELTA.to_string(),
+            seq,
+            delta: IdentityDelta::IlkDelete {
+                ilk_id: "ilk:00000000-0000-0000-0000-0000000000aa".to_string(),
+            },
+        }
+    }
+
+    async fn next_frame(reader: &mut BufReader<tokio::net::tcp::OwnedReadHalf>) -> Value {
+        let mut line = String::new();
+        let n = time::timeout(
+            Duration::from_secs(5),
+            read_capped_line(reader, &mut line, MAX_SYNC_LINE_BYTES),
+        )
+        .await
+        .expect("a frame within 5 s")
+        .expect("read a frame");
+        assert!(n > 0, "the stream closed");
+        serde_json::from_str(line.trim()).expect("a JSON frame")
+    }
+
+    #[test]
+    fn registering_a_subscriber_drops_the_ones_whose_stream_ended() {
+        let mut subscribers = Vec::new();
+        let (live, _live_rx) = mpsc::channel(1);
+        let (dead, dead_rx) = mpsc::channel(1);
+        subscribers.push(live);
+        subscribers.push(dead);
+        drop(dead_rx);
+        let (new, _new_rx) = mpsc::channel(1);
+        register_delta_subscriber(&mut subscribers, new);
+        assert_eq!(subscribers.len(), 2);
+        assert!(subscribers.iter().all(|tx| !tx.is_closed()));
+    }
+
+    #[tokio::test]
+    async fn primary_heartbeats_a_quiet_subscription_and_still_delivers_deltas() {
+        let ((p_reader, p_writer), (mut r_reader, mut r_writer)) = sync_link().await;
+        let (tx, rx) = mpsc::channel(4);
+        let primary = tokio::spawn(serve_delta_subscriber(
+            p_reader,
+            p_writer,
+            rx,
+            Duration::from_millis(50),
+        ));
+
+        assert_eq!(
+            next_frame(&mut r_reader).await,
+            json!({ "operation": SYNC_OP_HEARTBEAT })
+        );
+
+        tx.send(ilk_delete_envelope(1))
+            .await
+            .expect("queue a delta");
+        let delta = loop {
+            let frame = next_frame(&mut r_reader).await;
+            if frame["operation"] != SYNC_OP_HEARTBEAT {
+                break frame;
+            }
+        };
+        assert_eq!(delta["operation"], SYNC_OP_DELTA);
+        assert_eq!(delta["seq"], 1);
+        send_delta_ack(&mut r_writer, 1).await.expect("ack");
+
+        // Acked: the stream stays up and keeps beating.
+        assert_eq!(
+            next_frame(&mut r_reader).await["operation"],
+            SYNC_OP_HEARTBEAT
+        );
+        assert!(!primary.is_finished());
+        drop(tx);
+        time::timeout(Duration::from_secs(5), primary)
+            .await
+            .expect("the subscriber ends with its channel")
+            .expect("no panic");
+    }
+
+    #[tokio::test]
+    async fn replica_drops_a_subscription_that_goes_silent() {
+        // The primary's end stays open and writes nothing: what a replica sees
+        // when a firewall drops the stream's packets and its FIN (P7-1).
+        let ((_p_reader, _p_writer), (mut r_reader, mut r_writer)) = sync_link().await;
+        let (sink, _events) = mpsc::unbounded_channel();
+        let started = Instant::now();
+        let err = time::timeout(
+            Duration::from_secs(5),
+            read_delta_stream(
+                &mut r_reader,
+                &mut r_writer,
+                &sink,
+                Duration::from_millis(200),
+            ),
+        )
+        .await
+        .expect("returns on its own idle deadline")
+        .expect_err("silence is an error, so the caller resubscribes");
+        assert!(
+            err.to_string().contains("no frame from the primary"),
+            "{err}"
+        );
+        assert!(started.elapsed() >= Duration::from_millis(200));
+    }
+
+    #[tokio::test]
+    async fn heartbeats_keep_a_quiet_replica_subscribed() {
+        let ((p_reader, p_writer), (mut r_reader, mut r_writer)) = sync_link().await;
+        let (tx, rx) = mpsc::channel(4);
+        tokio::spawn(serve_delta_subscriber(
+            p_reader,
+            p_writer,
+            rx,
+            Duration::from_millis(50),
+        ));
+        let (sink, mut events) = mpsc::unbounded_channel();
+        let replica = tokio::spawn(async move {
+            read_delta_stream(
+                &mut r_reader,
+                &mut r_writer,
+                &sink,
+                Duration::from_millis(500),
+            )
+            .await
+        });
+
+        // Quiet for three idle deadlines: only the heartbeats keep it subscribed.
+        time::sleep(Duration::from_millis(1_500)).await;
+        assert!(
+            !replica.is_finished(),
+            "a quiet but live stream must stay subscribed"
+        );
+
+        tx.send(ilk_delete_envelope(1))
+            .await
+            .expect("queue a delta");
+        match time::timeout(Duration::from_secs(5), events.recv())
+            .await
+            .expect("a delta within 5 s")
+        {
+            Some(ReplicaSyncEvent::Delta(envelope)) => assert_eq!(envelope.seq, 1),
+            _ => panic!("expected the delta"),
+        }
+
+        // The primary dropping the subscriber closes the stream cleanly.
+        drop(tx);
+        let ended = time::timeout(Duration::from_secs(5), replica)
+            .await
+            .expect("ends after the close")
+            .expect("no panic");
+        assert!(ended.is_ok(), "a closed stream is not an error: {ended:?}");
+    }
+    // ---- The channel scope and the tenant as a cost center (docs/ilk-tenant-model-v1.md §2.1) ----
+
+    const SC_OTHER: &str = "tnt:22222222-2222-4222-8222-222222222222";
+    const SC_SUSPENDED: &str = "tnt:33333333-3333-4333-8333-333333333333";
+
+    fn sc_store() -> IdentityStore {
+        let mut store = lc_store_with_tenant();
+        for (tenant_id, name, status) in [
+            (SC_OTHER, "Globex", "active"),
+            (SC_SUSPENDED, "Initech", "suspended"),
+        ] {
+            store.tenants.insert(
+                tenant_id.to_string(),
+                TenantRecord {
+                    tenant_id: tenant_id.to_string(),
+                    name: name.to_string(),
+                    domain: None,
+                    status: status.to_string(),
+                    settings: json!({}),
+                    sponsor_tenant_id: None,
+                    deleted_at_ms: None,
+                },
+            );
+        }
+        store
+    }
+
+    fn sc_provision(
+        store: &mut IdentityStore,
+        caller: Option<&str>,
+        channel: &str,
+        address: &str,
+        tenant_id: &str,
+        scope: Option<&str>,
+    ) -> Result<(Value, Option<TenantChange>), String> {
+        store.provision_temporary_ilk(
+            IlkProvisionRequest {
+                ich_id: format!("ich:{}", Uuid::new_v4()),
+                channel_type: channel.to_string(),
+                address: address.to_string(),
+                tenant_id: Some(tenant_id.to_string()),
+                ilk_type: Some("human".to_string()),
+                scope: scope.map(str::to_string),
+            },
+            caller,
+            TEST_CLOUD_RELAY,
+        )
+    }
+
+    /// What IO.cloud does for a Cloud account: the `cloud` channel in the installation-wide
+    /// scope, the person charged to `tenant_id`.
+    fn sc_account_provision(
+        store: &mut IdentityStore,
+        tenant_id: &str,
+        email: &str,
+    ) -> Result<(Value, Option<TenantChange>), String> {
+        sc_provision(
+            store,
+            Some(TEST_CLOUD_RELAY),
+            "cloud",
+            email,
+            tenant_id,
+            Some(INSTALLATION_SCOPE),
+        )
+    }
+
+    fn sc_account(store: &mut IdentityStore, tenant_id: &str, email: &str) -> String {
+        let (ok, _) = sc_account_provision(store, tenant_id, email).expect("provision the account");
+        let ilk = ok["ilk_id"].as_str().expect("ilk_id").to_string();
+        rg_register(
+            store,
+            &ilk,
+            tenant_id,
+            json!({"display_name": "Someone", "email": email}),
+        )
+        .expect("register the account");
+        ilk
+    }
+
+    fn sc_keys_of(store: &IdentityStore, ilk_id: &str) -> Vec<(String, String, String)> {
+        let mut keys: Vec<(String, String, String)> = store
+            .ich_lookup
+            .iter()
+            .filter(|(_, holder)| holder.as_str() == ilk_id)
+            .map(|(key, _)| key.clone())
+            .collect();
+        keys.sort();
+        keys
+    }
+
+    fn sc_set_tenant(ilk_id: &str, tenant_id: &str) -> IlkSetTenantRequest {
+        IlkSetTenantRequest {
+            ilk_id: ilk_id.to_string(),
+            tenant_id: tenant_id.to_string(),
+            on_behalf_of: None,
+        }
+    }
+
+    #[test]
+    fn only_the_cloud_relay_writes_an_account_or_the_installation_scope() {
+        let mut store = sc_store();
+        // Another IO node writes no `cloud` channel at all: an account's email is not its to take.
+        let err = sc_provision(
+            &mut store,
+            Some("IO.slack@motherbee"),
+            "cloud",
+            "ana@acme.com",
+            LC_TENANT,
+            None,
+        )
+        .expect_err("not the relay");
+        assert_eq!(err, "CLOUD_CHANNEL_RESERVED");
+        // The installation-wide scope is for the `cloud` channel, and the relay's only.
+        for (caller, channel) in [
+            (Some(TEST_CLOUD_RELAY), "slack"),
+            (Some("IO.slack@motherbee"), "slack"),
+        ] {
+            let err = sc_provision(
+                &mut store,
+                caller,
+                channel,
+                "U1",
+                LC_TENANT,
+                Some(INSTALLATION_SCOPE),
+            )
+            .expect_err("not this scope");
+            assert_eq!(err, "INVALID_SCOPE", "{caller:?} {channel}");
+        }
+        // Naming the default scope is fine.
+        let (ok, _) = sc_provision(
+            &mut store,
+            Some("IO.slack@motherbee"),
+            "slack",
+            "U1",
+            LC_TENANT,
+            Some(LC_TENANT),
+        )
+        .expect("the default scope");
+        assert_eq!(ok["created"], true);
+        // The relay's account: the channel in the installation-wide scope, the person charged to
+        // the tenant that asked.
+        let (ok, change) =
+            sc_account_provision(&mut store, LC_TENANT, "Ana@Acme.com").expect("account");
+        assert_eq!(
+            (ok["created"].clone(), ok["tenant_id"].clone()),
+            (json!(true), json!(LC_TENANT))
+        );
+        assert!(change.is_none());
+        let ilk = ok["ilk_id"].as_str().unwrap().to_string();
+        assert_eq!(store.ilks[&ilk].tenant_id, LC_TENANT);
+        assert_eq!(store.ilks[&ilk].channels[0].scope, INSTALLATION_SCOPE);
+        assert_eq!(
+            store.ich_lookup.get(&canonical_ich_key(
+                "cloud",
+                "ana@acme.com",
+                INSTALLATION_SCOPE
+            )),
+            Some(&ilk)
+        );
+    }
+
+    #[test]
+    fn one_email_is_one_account_whatever_tenant_asks() {
+        let mut store = sc_store();
+        let ana = sc_account(&mut store, LC_TENANT, "ana@acme.com");
+        let (ok, change) =
+            sc_account_provision(&mut store, SC_OTHER, " ANA@acme.com ").expect("the same account");
+        assert_eq!(ok["ilk_id"], ana.as_str());
+        assert_eq!(ok["created"], false);
+        assert_eq!(ok["registration_status"], "complete");
+        // Still charged where it was: charging it elsewhere is ILK_SET_TENANT.
+        assert_eq!(ok["tenant_id"], LC_TENANT);
+        assert!(change.is_none());
+        let people = store
+            .ilks
+            .values()
+            .filter(|ilk| ilk.ilk_type == "human")
+            .count();
+        assert_eq!(people, 1);
+    }
+
+    #[test]
+    fn an_abandoned_signup_follows_the_tenant_that_asks_again() {
+        let mut store = sc_store();
+        let (ok, _) = sc_account_provision(&mut store, LC_TENANT, "bob@acme.com").expect("signup");
+        let temp = ok["ilk_id"].as_str().unwrap().to_string();
+        // Never registered; another tenant signs the same email up.
+        let (ok, change) =
+            sc_account_provision(&mut store, SC_OTHER, "bob@acme.com").expect("again");
+        assert_eq!(ok["ilk_id"], temp.as_str());
+        assert_eq!(ok["created"], false);
+        assert_eq!(ok["tenant_id"], SC_OTHER);
+        let change = change.expect("a history row");
+        assert_eq!(
+            (
+                change.from_tenant_id.as_str(),
+                change.to_tenant_id.as_str(),
+                change.changed_by.as_str()
+            ),
+            (LC_TENANT, SC_OTHER, TEST_CLOUD_RELAY)
+        );
+        assert_eq!(store.ilks[&temp].channels[0].scope, INSTALLATION_SCOPE);
+        // It registers into the tenant that asked.
+        rg_register(
+            &mut store,
+            &temp,
+            SC_OTHER,
+            json!({"display_name": "Bob", "email": "bob@acme.com"}),
+        )
+        .expect("register");
+    }
+
+    #[test]
+    fn an_ambiguous_account_email_is_refused_until_resolved() {
+        let mut store = sc_store();
+        store
+            .ambiguous_account_emails
+            .insert("carl@acme.com".to_string());
+        let err =
+            sc_account_provision(&mut store, LC_TENANT, " Carl@Acme.com ").expect_err("ambiguous");
+        assert_eq!(err, "ACCOUNT_AMBIGUOUS");
+        // Another email is not affected.
+        assert!(sc_account_provision(&mut store, LC_TENANT, "dora@acme.com").is_ok());
+    }
+
+    #[test]
+    fn report_account_scopes_finds_the_emails_several_people_hold() {
+        let mut store = sc_store();
+        // Two people with the same account email in two tenants (per-tenant scopes, before v3).
+        for tenant_id in [LC_TENANT, SC_OTHER] {
+            let ilk = rg_provision(&mut store, tenant_id, "cloud", "dup@acme.com");
+            rg_register(
+                &mut store,
+                &ilk,
+                tenant_id,
+                json!({"display_name": "Dup", "email": "dup@acme.com"}),
+            )
+            .expect("register");
+        }
+        // One person alone, and a temporary that does not count.
+        let one = rg_provision(&mut store, LC_TENANT, "cloud", "one@acme.com");
+        rg_register(
+            &mut store,
+            &one,
+            LC_TENANT,
+            json!({"display_name": "One", "email": "one@acme.com"}),
+        )
+        .expect("register");
+        rg_provision(&mut store, SC_OTHER, "cloud", "one@acme.com");
+        report_account_scopes(&mut store);
+        assert_eq!(
+            store.ambiguous_account_emails,
+            HashSet::from(["dup@acme.com".to_string()])
+        );
+    }
+
+    #[test]
+    fn set_ilk_tenant_moves_the_cost_center_and_no_key() {
+        let mut store = sc_store();
+        let ana = sc_account(&mut store, LC_TENANT, "ana@acme.com");
+        // Ana also writes from a Slack workspace of her tenant: that channel lives in its scope.
+        store
+            .add_channel(
+                IlkAddChannelRequest {
+                    ilk_id: ana.clone(),
+                    channel: ChannelInput {
+                        ich_id: format!("ich:{}", Uuid::new_v4()),
+                        channel_type: "slack".to_string(),
+                        address: "U42".to_string(),
+                        scope: None,
+                    },
+                    merge_from_ilk_id: None,
+                    change_reason: None,
+                },
+                Some("IO.slack@motherbee"),
+                MERGE_TTL_SECS,
+                TEST_CLOUD_RELAY,
+            )
+            .expect("slack channel");
+        let keys_before = sc_keys_of(&store, &ana);
+        assert_eq!(keys_before.len(), 2);
+
+        let (ok, change) = store
+            .set_ilk_tenant(
+                &sc_set_tenant(&ana, SC_OTHER),
+                "SY.admin@motherbee for operator",
+            )
+            .expect("reassign");
+        assert_eq!(
+            (ok["changed"].clone(), ok["previous_tenant_id"].clone()),
+            (json!(true), json!(LC_TENANT))
+        );
+        assert_eq!(store.ilks[&ana].tenant_id, SC_OTHER);
+        assert_eq!(
+            change.expect("history").changed_by,
+            "SY.admin@motherbee for operator"
+        );
+        // Not one key moved: her account and her Slack identity still resolve.
+        assert_eq!(sc_keys_of(&store, &ana), keys_before);
+
+        // Already there: nothing changes, no history row.
+        let (ok, change) = store
+            .set_ilk_tenant(&sc_set_tenant(&ana, SC_OTHER), "x")
+            .expect("again");
+        assert_eq!(ok["changed"], false);
+        assert!(change.is_none());
+    }
+
+    #[test]
+    fn set_ilk_tenant_refuses_before_changing_anything() {
+        let mut store = sc_store();
+        let ana = sc_account(&mut store, LC_TENANT, "ana@acme.com");
+        for (tenant_id, code) in [
+            (DEFAULT_ROOT_TENANT_ID, "TENANT_ROOT_PROTECTED"),
+            (SC_SUSPENDED, "TENANT_NOT_ACTIVE"),
+            (
+                "tnt:44444444-4444-4444-8444-444444444444",
+                "TENANT_NOT_FOUND",
+            ),
+        ] {
+            assert_eq!(
+                store
+                    .set_ilk_tenant(&sc_set_tenant(&ana, tenant_id), "x")
+                    .unwrap_err(),
+                code
+            );
+        }
+        // Another person in the target already holds her email.
+        let other = rg_provision(&mut store, SC_OTHER, "slack", "U5");
+        rg_register(
+            &mut store,
+            &other,
+            SC_OTHER,
+            json!({"display_name": "Ana 2", "email": "ana@acme.com"}),
+        )
+        .expect("register");
+        assert_eq!(
+            store
+                .set_ilk_tenant(&sc_set_tenant(&ana, SC_OTHER), "x")
+                .unwrap_err(),
+            "DUPLICATE_EMAIL"
+        );
+        assert_eq!(store.ilks[&ana].tenant_id, LC_TENANT);
+        // A temporary of an active tenant stays: its frontdesk registers it in that tenant's case.
+        let temp = rg_provision(&mut store, LC_TENANT, "slack", "U6");
+        let err = store
+            .set_ilk_tenant(&sc_set_tenant(&temp, SC_OTHER), "x")
+            .unwrap_err();
+        assert!(err.starts_with("INVALID_TENANT_TRANSITION|"), "{err}");
+        assert_eq!(store.ilks[&temp].tenant_id, LC_TENANT);
+        // A node never is (D6).
+        let mut node = ilk_for(
+            "IO.slack@motherbee",
+            "ilk:55555555-5555-4555-8555-555555555555",
+        );
+        node.tenant_id = LC_TENANT.to_string();
+        store.ilks.insert(node.ilk_id.clone(), node.clone());
+        assert_eq!(
+            store
+                .set_ilk_tenant(&sc_set_tenant(&node.ilk_id, SC_OTHER), "x")
+                .unwrap_err(),
+            "ILK_TYPE_MISMATCH"
+        );
+    }
+
+    /// Stage 4 (§2.4): what Fluxbee Cloud reads of a tenant: how many people and node identities
+    /// are charged to it, and every tenant but the genesis one.
+    #[test]
+    fn a_tenant_read_counts_its_people_and_nodes() {
+        let mut store = sc_store();
+        let ana = sc_account(&mut store, LC_TENANT, "ana@acme.com");
+        rg_provision(&mut store, LC_TENANT, "slack", "U11");
+        let mut node = ilk_for(
+            "IO.slack.acme@motherbee",
+            "ilk:88888888-8888-4888-8888-888888888888",
+        );
+        node.tenant_id = LC_TENANT.to_string();
+        store.ilks.insert(node.ilk_id.clone(), node);
+        store
+            .delete_ilk(lc_ilk(&ana), 1)
+            .expect("a deleted person is not counted");
+        let summary = store.tenant_summary_value(&store.tenants[LC_TENANT].clone());
+        assert_eq!(
+            (
+                summary["people_count"].clone(),
+                summary["node_count"].clone()
+            ),
+            (json!(1), json!(1))
+        );
+        let got = store.get_tenant_payload(LC_TENANT).expect("get");
+        assert_eq!(
+            (got["people_count"].clone(), got["node_count"].clone()),
+            (json!(1), json!(1))
+        );
+        let ids = |payload: Value| -> Vec<String> {
+            payload["tenants"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|tenant| tenant["tenant_id"].as_str().unwrap().to_string())
+                .collect()
+        };
+        assert!(ids(store.list_tenants_payload(false, false))
+            .contains(&DEFAULT_ROOT_TENANT_ID.to_string()));
+        let without_root = ids(store.list_tenants_payload(false, true));
+        assert!(!without_root.contains(&DEFAULT_ROOT_TENANT_ID.to_string()));
+        assert!(without_root.contains(&LC_TENANT.to_string()));
+    }
+
+    /// An op's `CODE|detail` reaches the caller as the code alone, with the detail as its message
+    /// (live on 0.1.67: set_ilk_tenant answered `INVALID_TENANT_TRANSITION|…` as the code).
+    #[test]
+    fn an_op_error_answers_its_code_alone() {
+        let split = op_error_payload("INVALID_TENANT_TRANSITION|why it is refused", "fallback");
+        assert_eq!(split["error_code"], "INVALID_TENANT_TRANSITION");
+        assert_eq!(split["message"], "why it is refused");
+        let plain = op_error_payload("TENANT_NOT_ACTIVE", "failed to change the ilk's tenant");
+        assert_eq!(plain["error_code"], "TENANT_NOT_ACTIVE");
+        assert_eq!(plain["message"], "failed to change the ilk's tenant");
+    }
+
+    /// Stage 3: a temporary is charged elsewhere only out of a deleted tenant, to empty it before
+    /// its purge; its channel keeps its scope.
+    #[test]
+    fn a_temporary_moves_only_out_of_a_deleted_tenant() {
+        let mut store = sc_store();
+        let temp = rg_provision(&mut store, LC_TENANT, "slack", "U8");
+        assert!(store
+            .set_ilk_tenant(&sc_set_tenant(&temp, SC_OTHER), "x")
+            .unwrap_err()
+            .starts_with("INVALID_TENANT_TRANSITION|"));
+        store
+            .delete_tenant(lc_tenant(LC_TENANT), 1)
+            .expect("delete");
+        let (ok, change) = store
+            .set_ilk_tenant(&sc_set_tenant(&temp, SC_OTHER), "x")
+            .expect("out of a deleted tenant");
+        assert_eq!(
+            (ok["changed"].clone(), change.is_some()),
+            (json!(true), true)
+        );
+        assert_eq!(
+            store
+                .ich_lookup
+                .get(&canonical_ich_key("slack", "U8", LC_TENANT)),
+            Some(&temp)
+        );
+    }
+
+    /// A temporary merged into another ILK is an alias, not a person: it neither counts nor blocks
+    /// its tenant's purge.
+    #[test]
+    fn a_merged_temporary_is_not_one_of_the_tenants_people() {
+        let mut store = sc_store();
+        let shell = rg_provision(&mut store, LC_TENANT, "slack", "U10");
+        store.aliases.insert(
+            shell.clone(),
+            AliasRecord {
+                canonical_ilk_id: "ilk:77777777-7777-4777-8777-777777777777".to_string(),
+                expires_at_ms: u64::MAX,
+            },
+        );
+        assert!(store.tenant_people(LC_TENANT).is_empty());
+        store
+            .delete_tenant(lc_tenant(LC_TENANT), 1)
+            .expect("delete");
+        let (ok, _) = store.purge_tenant(lc_tenant(LC_TENANT)).expect("purge");
+        assert_eq!(ok["purged_ilks"], 1);
+    }
+
+    #[test]
+    fn a_person_never_changes_tenant_through_a_registration() {
+        let mut store = sc_store();
+        let temp = rg_provision(&mut store, LC_TENANT, "slack", "U7");
+        assert_eq!(
+            rg_register(&mut store, &temp, SC_OTHER, json!({"display_name": "Dan"})).unwrap_err(),
+            "INVALID_TENANT_TRANSITION"
+        );
+        assert_eq!(store.ilks[&temp].tenant_id, LC_TENANT);
+    }
+
+    #[test]
+    fn a_merge_stays_within_one_tenant() {
+        let mut store = sc_store();
+        let ana = rg_with_ana(&mut store);
+        let temp = rg_provision(&mut store, SC_OTHER, "slack", "U8");
+        let err = store
+            .add_channel(
+                IlkAddChannelRequest {
+                    ilk_id: ana.clone(),
+                    channel: ChannelInput {
+                        ich_id: format!("ich:{}", Uuid::new_v4()),
+                        channel_type: "email".to_string(),
+                        address: "ana@mail.com".to_string(),
+                        scope: None,
+                    },
+                    merge_from_ilk_id: Some(temp.clone()),
+                    change_reason: None,
+                },
+                None,
+                MERGE_TTL_SECS,
+                TEST_CLOUD_RELAY,
+            )
+            .expect_err("another tenant");
+        assert_eq!(err, "ILK_TENANT_MISMATCH");
+        // Checked before anything changed.
+        assert_eq!(store.ilks[&temp].channels.len(), 1);
+        assert!(!store.ilks[&ana]
+            .channels
+            .iter()
+            .any(|c| c.address == "ana@mail.com"));
+    }
+
+    #[test]
+    fn cloud_deletes_and_restores_people_only() {
+        let mut store = sc_store();
+        let ana = sc_account(&mut store, LC_TENANT, "ana@acme.com");
+        let mut node = ilk_for(
+            "IO.slack@motherbee",
+            "ilk:66666666-6666-4666-8666-666666666666",
+        );
+        node.tenant_id = LC_TENANT.to_string();
+        store.ilks.insert(node.ilk_id.clone(), node.clone());
+        let people_only = |ilk_id: &str| IlkDeleteRequest {
+            ilk_id: ilk_id.to_string(),
+            tenant_id: None,
+            ilk_type: Some("human".to_string()),
+        };
+        assert_eq!(
+            store.delete_ilk(people_only(&node.ilk_id), 1).unwrap_err(),
+            "ILK_TYPE_MISMATCH"
+        );
+        assert!(store.ilks[&node.ilk_id].deleted_at_ms.is_none());
+        store.delete_ilk(people_only(&ana), 1).expect("a person");
+        store
+            .restore_ilk(people_only(&ana))
+            .expect("restore a person");
+    }
+
+    #[test]
+    fn deleting_a_tenant_leaves_its_people_usable() {
+        let mut store = sc_store();
+        let ana = sc_account(&mut store, LC_TENANT, "ana@acme.com");
+        let contact = rg_provision(&mut store, LC_TENANT, "slack", "U9");
+        let (ok, changes) = store
+            .delete_tenant(lc_tenant(LC_TENANT), 1)
+            .expect("people do not block a delete");
+        assert_eq!(ok["people_charged"], 2);
+        assert!(changes.ilks.is_empty());
+        for person in [&ana, &contact] {
+            assert!(store.ilks[person].deleted_at_ms.is_none());
+        }
+        // Both still resolve: the account by its installation-wide key, the contact in the scope.
+        assert_eq!(
+            store.ich_lookup.get(&canonical_ich_key(
+                "cloud",
+                "ana@acme.com",
+                INSTALLATION_SCOPE
+            )),
+            Some(&ana)
+        );
+        assert_eq!(
+            store
+                .ich_lookup
+                .get(&canonical_ich_key("slack", "U9", LC_TENANT)),
+            Some(&contact)
+        );
+        // Charged elsewhere out of the deleted tenant, the purge goes and takes the scope's keys.
+        for person in [&ana, &contact] {
+            store
+                .set_ilk_tenant(&sc_set_tenant(person, SC_OTHER), "x")
+                .expect("move out");
+        }
+        let (ok, _) = store.purge_tenant(lc_tenant(LC_TENANT)).expect("purge");
+        assert_eq!(
+            (ok["purged_ilks"].clone(), ok["dropped_channels"].clone()),
+            (json!(0), json!(1))
+        );
+        assert_eq!(
+            store.ich_lookup.get(&canonical_ich_key(
+                "cloud",
+                "ana@acme.com",
+                INSTALLATION_SCOPE
+            )),
+            Some(&ana)
+        );
+    }
+
+    #[test]
+    fn restoring_never_brings_back_a_second_account() {
+        let mut store = sc_store();
+        // An account from before the scope: its `cloud` channel in its tenant's scope, then marked.
+        let old = rg_provision(&mut store, LC_TENANT, "cloud", "eve@acme.com");
+        rg_register(
+            &mut store,
+            &old,
+            LC_TENANT,
+            json!({"display_name": "Eve", "email": "eve@acme.com"}),
+        )
+        .expect("register");
+        store.delete_ilk(lc_ilk(&old), 1).expect("mark");
+        // Her account now, in the installation-wide scope.
+        sc_account(&mut store, SC_OTHER, "eve@acme.com");
+        let err = store
+            .restore_ilk(lc_ilk(&old))
+            .expect_err("a second account");
+        assert_eq!(lc_code(err), "ILK_KEY_CONFLICT");
+    }
+
+    #[test]
+    fn a_record_without_scopes_takes_its_tenant_on_arrival_and_keeps_it() {
+        let mut store = sc_store();
+        let ilk_id = "ilk:77777777-7777-4777-8777-777777777777".to_string();
+        let legacy = IlkRecord {
+            ilk_id: ilk_id.clone(),
+            ilk_type: "human".to_string(),
+            registration_status: "complete".to_string(),
+            tenant_id: LC_TENANT.to_string(),
+            identification: json!({"display_name": "Old peer"}),
+            definition: json!({}),
+            channels: vec![ChannelRecord {
+                ich_id: "ich:88888888-8888-4888-8888-888888888888".to_string(),
+                channel_type: "slack".to_string(),
+                address: "U1".to_string(),
+                owner_l2_name: None,
+                enabled: false,
+                scope: String::new(),
+            }],
+            deleted_at_ms: None,
+            deleted_reason: None,
+        };
+        store.apply_delta(IdentityDelta::IlkUpsert { ilk: legacy });
+        assert_eq!(store.ilks[&ilk_id].channels[0].scope, LC_TENANT);
+        let key = canonical_ich_key("slack", "U1", LC_TENANT);
+        assert_eq!(store.ich_lookup.get(&key), Some(&ilk_id));
+        // Reassigned later: the key stays where it was.
+        store
+            .set_ilk_tenant(&sc_set_tenant(&ilk_id, SC_OTHER), "x")
+            .expect("reassign");
+        assert_eq!(store.ich_lookup.get(&key), Some(&ilk_id));
+    }
+
+    #[test]
+    fn a_replica_push_keeps_node_channels_in_their_own_tenant() {
+        let mut store = sc_store();
+        let mut node = ilk_for(
+            "IO.slack@worker1",
+            "ilk:99999999-9999-4999-8999-999999999999",
+        );
+        node.tenant_id = LC_TENANT.to_string();
+        node.channels = vec![ChannelRecord {
+            ich_id: "ich:aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa".to_string(),
+            channel_type: "slack".to_string(),
+            address: "ws-1".to_string(),
+            owner_l2_name: None,
+            enabled: true,
+            scope: INSTALLATION_SCOPE.to_string(),
+        }];
+        // A node channel naming another scope (the installation-wide one) is not taken.
+        assert!(store
+            .reconcile_hive_ilks("worker1", vec![node.clone()])
+            .is_empty());
+        assert!(!store.ilks.contains_key(&node.ilk_id));
+        // An older replica sends no scope: taken, with the node's tenant.
+        node.channels[0].scope = String::new();
+        assert_eq!(
+            store
+                .reconcile_hive_ilks("worker1", vec![node.clone()])
+                .len(),
+            1
+        );
+        assert_eq!(store.ilks[&node.ilk_id].channels[0].scope, LC_TENANT);
+        // And the same push again is not a change.
+        assert!(store.reconcile_hive_ilks("worker1", vec![node]).is_empty());
+    }
+
+    #[test]
+    fn shm_channel_entries_carry_the_scope_and_the_ilk_its_tenant() {
+        let mut store = sc_store();
+        let ana = sc_account(&mut store, LC_TENANT, "ana@acme.com");
+        store
+            .set_ilk_tenant(&sc_set_tenant(&ana, SC_OTHER), "x")
+            .expect("reassign");
+        let ilk = store.ilks[&ana].clone();
+        let entries = ich_entries_from_ilk_record(&ilk).expect("entries");
+        assert_eq!(entries.len(), 1);
+        let installation = parse_prefixed_uuid(INSTALLATION_SCOPE, "tnt").unwrap();
+        assert_eq!(entries[0].0.tenant_id, *installation.as_bytes());
+        let charged = parse_prefixed_uuid(SC_OTHER, "tnt").unwrap();
+        assert_eq!(
+            ilk_entry_from_record(&ilk).expect("ilk entry").tenant_id,
+            *charged.as_bytes()
+        );
+    }
+
+    fn sc_channel(ich_id: &str, channel_type: &str, address: &str, scope: &str) -> ChannelRecord {
+        ChannelRecord {
+            ich_id: ich_id.to_string(),
+            channel_type: channel_type.to_string(),
+            address: address.to_string(),
+            owner_l2_name: None,
+            enabled: false,
+            scope: scope.to_string(),
+        }
+    }
+
+    fn sc_slack_channel(address: &str) -> ChannelInput {
+        ChannelInput {
+            ich_id: format!("ich:{}", Uuid::new_v4()),
+            channel_type: "slack".to_string(),
+            address: address.to_string(),
+            scope: None,
+        }
+    }
+
+    #[test]
+    fn purging_a_tenant_drops_the_channels_left_in_its_scope() {
+        let mut store = sc_store();
+        let ana = sc_account(&mut store, LC_TENANT, "ana@acme.com");
+        store
+            .add_channel(
+                IlkAddChannelRequest {
+                    ilk_id: ana.clone(),
+                    channel: sc_slack_channel("U42"),
+                    merge_from_ilk_id: None,
+                    change_reason: None,
+                },
+                Some("IO.slack@motherbee"),
+                MERGE_TTL_SECS,
+                TEST_CLOUD_RELAY,
+            )
+            .expect("slack channel");
+        // She moves to another tenant: her Slack key stays in the one she left.
+        store
+            .set_ilk_tenant(&sc_set_tenant(&ana, SC_OTHER), "x")
+            .expect("reassign");
+        store.delete_tenant(lc_tenant(LC_TENANT), 1).expect("mark");
+        let (ok, changes) = store.purge_tenant(lc_tenant(LC_TENANT)).expect("purge");
+        assert_eq!(ok["dropped_channels"], 1);
+        // The Slack key went with the tenant; her account and her ILK stay.
+        assert_eq!(
+            sc_keys_of(&store, &ana),
+            vec![canonical_ich_key(
+                "cloud",
+                "ana@acme.com",
+                INSTALLATION_SCOPE
+            )]
+        );
+        assert_eq!(store.ilks[&ana].channels.len(), 1);
+        assert_eq!(changes.trimmed_ilks.len(), 1);
+        assert_eq!(changes.trimmed_ilks[0], store.ilks[&ana]);
+        assert_eq!(changes.purged_tenants, vec![LC_TENANT.to_string()]);
+    }
+
+    #[test]
+    fn a_refused_replica_push_leaves_the_record_as_it_is() {
+        let mut store = sc_store();
+        let mut node = ilk_for(
+            "IO.slack@worker1",
+            "ilk:bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+        );
+        node.tenant_id = LC_TENANT.to_string();
+        node.channels = vec![sc_channel(
+            "ich:cccccccc-cccc-4ccc-8ccc-cccccccccccc",
+            "slack",
+            "ws-2",
+            LC_TENANT,
+        )];
+        assert_eq!(
+            store
+                .reconcile_hive_ilks("worker1", vec![node.clone()])
+                .len(),
+            1
+        );
+        // The same node pushed with a Fluxbee Cloud account on it: refused, and not taken for a
+        // removal either.
+        let mut squat = node.clone();
+        squat.channels.push(sc_channel(
+            "ich:dddddddd-dddd-4ddd-8ddd-dddddddddddd",
+            "cloud",
+            "victim@acme.com",
+            LC_TENANT,
+        ));
+        assert!(store
+            .reconcile_hive_ilks("worker1", vec![squat.clone()])
+            .is_empty());
+        assert_eq!(store.ilks[&node.ilk_id], node);
+        // The delta path refuses it too, in the node's own scope or the installation-wide one.
+        for scope in [LC_TENANT, INSTALLATION_SCOPE] {
+            squat.channels[1].scope = scope.to_string();
+            assert!(
+                !delta_authorized_for_hive(
+                    &IdentityDelta::IlkUpsert { ilk: squat.clone() },
+                    "worker1",
+                    &store
+                ),
+                "{scope}"
+            );
+        }
+        // A channel the primary already holds in another scope is echoed back as it is.
+        store.ilks.get_mut(&node.ilk_id).unwrap().channels[0].scope = SC_OTHER.to_string();
+        let mut echo = store.ilks[&node.ilk_id].clone();
+        echo.definition = json!({"note": "changed on the worker"});
+        assert!(delta_authorized_for_hive(
+            &IdentityDelta::IlkUpsert { ilk: echo.clone() },
+            "worker1",
+            &store
+        ));
+        assert_eq!(store.reconcile_hive_ilks("worker1", vec![echo]).len(), 1);
+    }
+
+    #[test]
+    fn ilk_update_takes_no_account_and_no_one_elses_ich_id() {
+        let mut store = sc_store();
+        let ana = sc_account(&mut store, LC_TENANT, "ana@acme.com");
+        let anas_ich = store.ilks[&ana].channels[0].ich_id.clone();
+        let mut node = ilk_for(
+            "IO.slack@motherbee",
+            "ilk:eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee",
+        );
+        node.tenant_id = LC_TENANT.to_string();
+        store.ilks.insert(node.ilk_id.clone(), node.clone());
+        let update = |channel_type: &str, address: &str, ich_id: &str| IlkUpdateRequest {
+            ilk_id: node.ilk_id.clone(),
+            add_channels: vec![ChannelInput {
+                ich_id: ich_id.to_string(),
+                channel_type: channel_type.to_string(),
+                address: address.to_string(),
+                scope: None,
+            }],
+            change_reason: None,
+        };
+        let fresh = format!("ich:{}", Uuid::new_v4());
+        assert_eq!(
+            store
+                .update_ilk(update("cloud", "x@acme.com", &fresh))
+                .unwrap_err(),
+            "CLOUD_CHANNEL_RESERVED"
+        );
+        assert_eq!(
+            store
+                .update_ilk(update("slack", "ws-3", &anas_ich))
+                .unwrap_err(),
+            "ICH_ID_CONFLICT"
+        );
+        assert_eq!(store.ilks[&node.ilk_id], node);
+        assert_eq!(store.ilks[&ana].channels.len(), 1);
+        store
+            .update_ilk(update("slack", "ws-3", &fresh))
+            .expect("the node's own channel");
+    }
+
+    #[test]
+    fn a_tenants_io_node_never_merges_an_account_away() {
+        let mut store = sc_store();
+        // A signup nobody finished, charged to the tenant, and a person of that tenant.
+        let (ok, _) = sc_account_provision(&mut store, LC_TENANT, "zoe@acme.com").expect("signup");
+        let signup = ok["ilk_id"].as_str().unwrap().to_string();
+        let person = rg_provision(&mut store, LC_TENANT, "slack", "U10");
+        rg_register(
+            &mut store,
+            &person,
+            LC_TENANT,
+            json!({"display_name": "Mal"}),
+        )
+        .expect("register");
+        let account = canonical_ich_key("cloud", "zoe@acme.com", INSTALLATION_SCOPE);
+        let merge = |store: &mut IdentityStore, caller: &str| {
+            store.add_channel(
+                IlkAddChannelRequest {
+                    ilk_id: person.clone(),
+                    channel: sc_slack_channel("U11"),
+                    merge_from_ilk_id: Some(signup.clone()),
+                    change_reason: None,
+                },
+                Some(caller),
+                MERGE_TTL_SECS,
+                TEST_CLOUD_RELAY,
+            )
+        };
+        assert_eq!(
+            merge(&mut store, "IO.slack@motherbee").unwrap_err(),
+            "CLOUD_CHANNEL_RESERVED"
+        );
+        assert_eq!(store.ich_lookup.get(&account), Some(&signup));
+        // A frontdesk joins a signup into the person it belongs to.
+        merge(&mut store, "SY.frontdesk.gov@motherbee").expect("frontdesk");
+        assert_eq!(store.ich_lookup.get(&account), Some(&person));
+    }
+
+    #[test]
+    fn only_the_relays_signup_recharges_and_a_node_key_answers_no_signup() {
+        let mut store = sc_store();
+        // A Slack temporary charged elsewhere: the tenant's own IO node asking again moves
+        // nothing (only the installation-wide scope is shared across tenants).
+        let temp = rg_provision(&mut store, LC_TENANT, "slack", "U12");
+        store.ilks.get_mut(&temp).unwrap().tenant_id = SC_OTHER.to_string();
+        let (ok, change) = sc_provision(
+            &mut store,
+            Some("IO.slack@motherbee"),
+            "slack",
+            "U12",
+            LC_TENANT,
+            None,
+        )
+        .expect("hit");
+        assert_eq!(ok["ilk_id"], temp.as_str());
+        assert_eq!(ok["tenant_id"], SC_OTHER);
+        assert!(change.is_none());
+        // IO.cloud's own `cloud` channel: no person's signup lands on it; its own provisioning
+        // still does.
+        let mut relay = ilk_for(TEST_CLOUD_RELAY, "ilk:f0f0f0f0-f0f0-4f0f-8f0f-f0f0f0f0f0f0");
+        relay.channels = vec![sc_channel(
+            "ich:f1f1f1f1-f1f1-4f1f-8f1f-f1f1f1f1f1f1",
+            "cloud",
+            "demo",
+            INSTALLATION_SCOPE,
+        )];
+        store.apply_delta(IdentityDelta::IlkUpsert { ilk: relay.clone() });
+        assert_eq!(
+            sc_account_provision(&mut store, LC_TENANT, "demo").unwrap_err(),
+            "CLOUD_CHANNEL_RESERVED"
+        );
+        let (ok, change) = store
+            .provision_temporary_ilk(
+                IlkProvisionRequest {
+                    ich_id: format!("ich:{}", Uuid::new_v4()),
+                    channel_type: "cloud".to_string(),
+                    address: "demo".to_string(),
+                    tenant_id: Some(DEFAULT_ROOT_TENANT_ID.to_string()),
+                    ilk_type: Some("agent".to_string()),
+                    scope: None,
+                },
+                Some(TEST_CLOUD_RELAY),
+                TEST_CLOUD_RELAY,
+            )
+            .expect("its own");
+        assert_eq!(ok["ilk_id"], relay.ilk_id.as_str());
+        assert!(change.is_none());
+    }
+
+    #[test]
+    fn provisioning_never_reuses_another_channels_ich_id() {
+        let mut store = sc_store();
+        let ana = sc_account(&mut store, LC_TENANT, "ana@acme.com");
+        let anas_ich = store.ilks[&ana].channels[0].ich_id.clone();
+        // What an older IO.cloud sends after the migration: her old scope, her channel's id.
+        let err = store
+            .provision_temporary_ilk(
+                IlkProvisionRequest {
+                    ich_id: anas_ich,
+                    channel_type: "cloud".to_string(),
+                    address: "ana@acme.com".to_string(),
+                    tenant_id: Some(LC_TENANT.to_string()),
+                    ilk_type: None,
+                    scope: None,
+                },
+                Some(TEST_CLOUD_RELAY),
+                TEST_CLOUD_RELAY,
+            )
+            .expect_err("taken");
+        assert_eq!(err, "ICH_ID_CONFLICT");
+        let people = store
+            .ilks
+            .values()
+            .filter(|ilk| ilk.ilk_type == "human")
+            .count();
+        assert_eq!(people, 1);
+    }
+
+    #[test]
+    fn an_email_another_ilk_holds_installation_wide_is_ambiguous() {
+        let mut store = sc_store();
+        // Before the migration: Fay's account in her tenant's scope.
+        let fay = rg_provision(&mut store, LC_TENANT, "cloud", "fay@acme.com");
+        rg_register(
+            &mut store,
+            &fay,
+            LC_TENANT,
+            json!({"display_name": "Fay", "email": "fay@acme.com"}),
+        )
+        .expect("register");
+        // A signup of the same email already waits in the installation-wide scope.
+        sc_account_provision(&mut store, SC_OTHER, "fay@acme.com").expect("signup");
+        report_account_scopes(&mut store);
+        assert_eq!(
+            store.ambiguous_account_emails,
+            HashSet::from(["fay@acme.com".to_string()])
+        );
+        // Until the operator resolves it, no signup of that email lands on either.
+        assert_eq!(
+            sc_account_provision(&mut store, SC_OTHER, "fay@acme.com").unwrap_err(),
+            "ACCOUNT_AMBIGUOUS"
+        );
+    }
+
+    #[test]
+    fn a_restored_account_comes_back_installation_wide_when_its_key_is_free() {
+        let mut store = sc_store();
+        let legacy_account = |store: &mut IdentityStore, email: &str| {
+            let ilk = rg_provision(store, LC_TENANT, "cloud", email);
+            rg_register(
+                store,
+                &ilk,
+                LC_TENANT,
+                json!({"display_name": "Old", "email": email}),
+            )
+            .expect("register");
+            store.delete_ilk(lc_ilk(&ilk), 1).expect("mark");
+            ilk
+        };
+        // Marked before the migration, with the account in her tenant's scope.
+        let gil = legacy_account(&mut store, "gil@acme.com");
+        let (_, changes) = store.restore_ilk(lc_ilk(&gil)).expect("restore");
+        assert_eq!(
+            changes.rescoped_ichs,
+            vec![store.ilks[&gil].channels[0].ich_id.clone()]
+        );
+        assert_eq!(changes.ilks[0].channels[0].scope, INSTALLATION_SCOPE);
+        assert_eq!(
+            sc_keys_of(&store, &gil),
+            vec![canonical_ich_key(
+                "cloud",
+                "gil@acme.com",
+                INSTALLATION_SCOPE
+            )]
+        );
+        let (ok, _) =
+            sc_account_provision(&mut store, SC_OTHER, "gil@acme.com").expect("her account");
+        assert_eq!(ok["ilk_id"], gil.as_str());
+        // A marked ILK holds that key: she comes back where she was.
+        let hal = legacy_account(&mut store, "hal@acme.com");
+        let (ok, _) = sc_account_provision(&mut store, SC_OTHER, "hal@acme.com").expect("signup");
+        let signup = ok["ilk_id"].as_str().unwrap().to_string();
+        store
+            .delete_ilk(lc_ilk(&signup), 1)
+            .expect("mark the signup");
+        let (_, changes) = store.restore_ilk(lc_ilk(&hal)).expect("restore");
+        assert!(changes.rescoped_ichs.is_empty());
+        assert_eq!(store.ilks[&hal].channels[0].scope, LC_TENANT);
+    }
+
+    #[test]
+    fn deleting_a_tenant_leaves_a_pending_signup_pending() {
+        let mut store = sc_store();
+        let signup = |store: &mut IdentityStore, email: &str| {
+            let (ok, _) = sc_account_provision(store, LC_TENANT, email).expect("signup");
+            ok["ilk_id"].as_str().unwrap().to_string()
+        };
+        let ivy = signup(&mut store, "ivy@acme.com");
+        let jon = signup(&mut store, "jon@acme.com");
+        let (ok, changes) = store
+            .delete_tenant(lc_tenant(LC_TENANT), 1)
+            .expect("delete");
+        assert_eq!(ok["people_charged"], 2);
+        assert!(changes.ilks.is_empty());
+        assert!(store.ilks[&ivy].deleted_at_ms.is_none());
+        // Another tenant signs Ivy up: she is charged there now.
+        let (ok, change) =
+            sc_account_provision(&mut store, SC_OTHER, "ivy@acme.com").expect("again");
+        assert_eq!(ok["ilk_id"], ivy.as_str());
+        assert_eq!(ok["tenant_id"], SC_OTHER);
+        assert!(change.is_some());
+        // Jon is still charged there: the purge waits for him like for anyone.
+        let err = store.purge_tenant(lc_tenant(LC_TENANT)).expect_err("jon");
+        assert!(
+            err.starts_with("TENANT_HAS_PEOPLE|") && err.contains(&jon),
+            "{err}"
+        );
+        store
+            .set_ilk_tenant(&sc_set_tenant(&jon, SC_OTHER), "x")
+            .expect("a pending signup moves");
+        let (ok, _) = store.purge_tenant(lc_tenant(LC_TENANT)).expect("purge");
+        assert_eq!(ok["purged_ilks"], 0);
+        assert!(store.ilks.contains_key(&jon) && store.ilks.contains_key(&ivy));
+    }
+
+    #[test]
+    fn pending_signups_are_readable_wherever_they_are_charged() {
+        let mut store = sc_store();
+        let (ok, _) = sc_account_provision(&mut store, LC_TENANT, "kim@acme.com").expect("signup");
+        let kim = ok["ilk_id"].as_str().unwrap().to_string();
+        let lee = sc_account(&mut store, SC_OTHER, "lee@acme.com");
+        let slack = rg_provision(&mut store, LC_TENANT, "slack", "U20");
+        let listed = |store: &IdentityStore| -> Vec<(String, bool)> {
+            store.list_ilks_payload(false, false)["ilks"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|row| {
+                    (
+                        row["ilk_id"].as_str().unwrap().to_string(),
+                        row["pending_signup"].as_bool().unwrap(),
+                    )
+                })
+                .collect()
+        };
+        let rows = listed(&store);
+        for (ilk, pending) in [(&kim, true), (&lee, false), (&slack, false)] {
+            assert!(rows.contains(&(ilk.clone(), pending)), "{ilk} {pending}");
+        }
+        // The filter keeps only the pending ones; the channel shows where its address lives.
+        let only = store.list_ilks_payload(false, true);
+        assert_eq!(only["count"], 1);
+        assert_eq!(only["ilks"][0]["ilk_id"], kim.as_str());
+        assert_eq!(only["ilks"][0]["channels"][0]["scope"], INSTALLATION_SCOPE);
+        assert_eq!(
+            store.get_ilk_payload(&kim, None).unwrap()["pending_signup"],
+            true
+        );
+        // Its tenant deleted, it stays pending and listed.
+        store
+            .delete_tenant(lc_tenant(LC_TENANT), 1)
+            .expect("delete the tenant");
+        assert_eq!(store.list_ilks_payload(false, true)["count"], 1);
+        // Marked, it is no longer pending.
+        store.delete_ilk(lc_ilk(&kim), 2).expect("mark the signup");
+        assert_eq!(store.list_ilks_payload(true, true)["count"], 0);
+    }
+
+    #[test]
+    fn a_node_is_born_and_dies_in_its_tenant() {
+        let mut store = sc_store();
+        // A node's temporary is registered into its own tenant, never another.
+        let temp = store
+            .provision_temporary_ilk(
+                IlkProvisionRequest {
+                    ich_id: format!("ich:{}", Uuid::new_v4()),
+                    channel_type: "api".to_string(),
+                    address: "bot-1".to_string(),
+                    tenant_id: Some(LC_TENANT.to_string()),
+                    ilk_type: Some("agent".to_string()),
+                    scope: None,
+                },
+                Some("IO.api@motherbee"),
+                TEST_CLOUD_RELAY,
+            )
+            .map(|(ok, _)| ok["ilk_id"].as_str().unwrap().to_string())
+            .expect("provision an agent");
+        let register = |store: &mut IdentityStore, tenant_id: &str| {
+            store.register_ilk(
+                IlkRegisterRequest {
+                    ilk_id: temp.clone(),
+                    ilk_type: "agent".to_string(),
+                    tenant_id: tenant_id.to_string(),
+                    identification: json!({"node_name": "IO.api.bot@motherbee"}),
+                },
+                MERGE_TTL_SECS,
+            )
+        };
+        assert_eq!(
+            register(&mut store, SC_OTHER).unwrap_err(),
+            "INVALID_TENANT_TRANSITION"
+        );
+        assert_eq!(store.ilks[&temp].tenant_id, LC_TENANT);
+        register(&mut store, LC_TENANT).expect("its own tenant");
+        // A replica cannot move one either.
+        let mut node = ilk_for(
+            "IO.slack@worker1",
+            "ilk:abababab-abab-4bab-8bab-abababababab",
+        );
+        node.tenant_id = LC_TENANT.to_string();
+        assert_eq!(
+            store
+                .reconcile_hive_ilks("worker1", vec![node.clone()])
+                .len(),
+            1
+        );
+        let mut moved = node.clone();
+        moved.tenant_id = SC_OTHER.to_string();
+        assert!(!delta_authorized_for_hive(
+            &IdentityDelta::IlkUpsert { ilk: moved.clone() },
+            "worker1",
+            &store
+        ));
+        assert!(store.reconcile_hive_ilks("worker1", vec![moved]).is_empty());
+        assert_eq!(store.ilks[&node.ilk_id].tenant_id, LC_TENANT);
     }
 }

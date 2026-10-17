@@ -25,20 +25,22 @@ wan:
   gateway_name: "RT.gateway"
   mtls: required
 
-# Local NATS broker for control/data plane.
-nats:
-  mode: embedded
-  port: 4222
-
 # Local admin HTTP API.
 admin:
   listen: "127.0.0.1:8080"
-  # Optional absolute content origin returned alongside /public/<key>.
-  # public_base_url: "https://content.example.com"
+  # The SY.edge this hive publishes public artifacts / Cloud endpoints on.
+  # public_edge_node: "SY.edge@<ingress-hive>"
+  # Absolute public origin for /public/<key> URLs and the base external clients use.
+  # MUST be a DNS HOSTNAME that the edge TLS cert covers (e.g. this hive's opaque
+  # hive-<hash>.<domain> name), NEVER a bare IP — an IP fails cert validation and TLS
+  # aborts (handshake eof) for any client that verifies the cert. One per hive.
+  # public_base_url: "https://hive-<hash>.example.com"
 
-# Local architect HTTP UI/API (typically exposed through reverse proxy).
+# Archi's HTTP UI/API. Loopback only: it has no authentication (FINDINGS A-46). Use it on the
+# motherbee itself, or from another machine through an SSH tunnel:
+#   ssh -L 3000:127.0.0.1:3000 <user>@<motherbee>
 architect:
-  listen: "0.0.0.0:3000"
+  listen: "127.0.0.1:3000"
 
 # Shared filesystem root used by admin/orchestrator.
 storage:
@@ -77,8 +79,10 @@ dist:
 
 # Declarative packaged platform topology per hive role. `nodes` is the start order;
 # `wait_for` is the subset the orchestrator blocks on before continuing
-# bootstrap. IO.blob is a motherbee worker managed by this lifecycle, not a
-# system authority; Identity seeds deterministic ILKs only for the SY.* entries.
+# bootstrap. Only SY.* system authorities are listed here; the managed IO/AI
+# runtimes (io.api, io.blob, io.cloud, io.slack, ai.generic, ...) are NOT lifecycle
+# nodes — the orchestrator spawns them via run_node (fluxbee-firstboot boot_runtimes)
+# after the hive is ready. Identity seeds deterministic ILKs only for the SY.* entries.
 # Workers do not run SY.vault.
 system_nodes:
   motherbee:
@@ -92,11 +96,9 @@ system_nodes:
       - SY.identity
       - SY.opa.rules
       - SY.admin
-      - IO.blob
       - SY.architect
       - SY.storage
       - SY.cognition
-      - SY.policy
       - SY.timer
       - SY.wf-rules
       - SY.frontdesk.gov
@@ -106,9 +108,7 @@ system_nodes:
       - SY.identity
       - SY.opa.rules
       - SY.admin
-      - IO.blob
       - SY.cognition
-      - SY.policy
       - SY.timer
       - SY.vault
   worker:
@@ -117,7 +117,6 @@ system_nodes:
       - SY.identity
       - SY.opa.rules
       - SY.cognition
-      - SY.policy
       - SY.timer
       - SY.wf-rules
     wait_for:
@@ -125,11 +124,14 @@ system_nodes:
       - SY.identity
       - SY.opa.rules
       - SY.cognition
-      - SY.policy
       - SY.timer
+  # SY.opa.rules runs on EVERY role: the router of each hive enforces the one global user
+  # policy, compiled on the motherbee and synced to all hives (dist/policy). It needs no
+  # SY.identity (its ILK is deterministic), and it is not a readiness gate here.
   egress:
     nodes:
       - SY.config.routes
+      - SY.opa.rules
     wait_for:
       - SY.config.routes
   # ingress hive: the public HTTP(S) door. SY.edge binds :443 (fail-closed on
@@ -138,6 +140,7 @@ system_nodes:
   ingress:
     nodes:
       - SY.config.routes
+      - SY.opa.rules
       - SY.edge
     wait_for:
       - SY.config.routes
@@ -156,3 +159,23 @@ system_nodes:
 #   tls_vault_key: "edge_tls_fluxbee_ai"
 #   vault_hive: "motherbee"
 #   endpoints_path: "/etc/fluxbee/edge.endpoints.json"
+
+# --- egress (root-level section; NOT the `system_nodes.egress` list above) ------------
+# The managed internet chokepoint. `gateway_ip` means, BY CONTRACT, "where the WORKERS
+# egress": add_hive injects that default route into workers provisioned AFTER it is set.
+#
+# It does NOT route motherbee. That is deliberate — Fluxbee never rewrites the control
+# plane's own default route (doing it from a yaml field, on every boot and every watchdog
+# tick, with no rollback, on the box that provisions the egress, is a lockout). But
+# motherbee is where the nodes that call the internet run (IO.slack.*, IO.wapp.*, AI.*),
+# so the orchestrator VERIFIES motherbee's route against this value and logs
+# EGRESS_MOTHERBEE_BYPASS when they differ. Put motherbee on the egress path at the
+# host/network level if you want it there — or accept the bypass knowingly (PB-8).
+#
+# egress:
+#   enabled: true
+#   gateway_ip: "10.10.10.40"     # the egress hive's LAN address
+#   lan_cidr: "10.10.10.0/24"
+#   lan_iface: "ens19"            # the egress box's INTERNAL nic
+#   wan_iface: "ens18"            # the egress box's UPLINK nic
+#   ipv6: "block"

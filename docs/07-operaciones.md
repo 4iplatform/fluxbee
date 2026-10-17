@@ -24,7 +24,7 @@ ingress) son cajas Linux limpias (solo SSH) que la motherbee **empuja** ("vendor
    apt-get install  │  (único nodo instalado con el .deb)        │
    ./fluxbee.deb ──▶ │  PostgreSQL (Depends del paquete)          │
    sudo fluxbee-    │  SY.* core + SY.vault + SY.admin           │
-   firstboot        │  IO.cloud / IO.blob (singletons)           │
+   firstboot        │  IO.cloud / IO.blob (runtimes managed)           │
                     │  RT.gateway :9000 (WAN, mtls=required)     │
                     │  /var/lib/fluxbee/ssh/motherbee.key        │
                     └──────────────────────────────────────────┘
@@ -45,9 +45,10 @@ Puntos clave (todos verificados contra el código):
 - **DB centralizada en la motherbee.** Los spokes NO tienen PostgreSQL. `SY.storage` y
   `SY.vault` corren solo en motherbee; `SY.identity` corre en motherbee (primary, escribe DB) y
   en worker (réplica en SHM, sin DB).
-- **SSH es solo bootstrap.** Tras un join exitoso el default (`ssh_access:"revoke"`) borra la
-  llave de bootstrap de la motherbee y el grant de sudoers del spoke. La gestión diaria es por
-  socket del router + dist-sync, no por SSH.
+- **SSH es solo bootstrap (D32).** Fluxbee usa SSH solo dentro de `add_hive`: al terminar el join
+  borra la llave de bootstrap de la motherbee y el grant de sudoers del spoke, siempre. La gestión
+  diaria es por socket del router + dist-sync, nunca por SSH. Un spoke que pierde su certificado
+  de malla se vuelve a unir (`DELETE /hives/{id}` + `POST /hives`).
 - **WAN mTLS requerido por default** (`wan.mtls: required` en el template de motherbee).
 
 ---
@@ -64,8 +65,8 @@ packaging/build-deb.sh 0.1.0
 
 `build-deb.sh` separa BUILD (aquí) de INSTALL (en el target). Compila el core Rust
 (`rt-gateway`, `sy-admin`, `sy-config-routes`, `sy-architect`, `sy-vault`, `sy-orchestrator`,
-`sy-storage`, `sy-identity`, `sy-cognition`, `sy-policy`, `sy-edge`), los binarios Go
-(`sy-opa-rules`, `sy-timer`, `sy-wf-rules`, `wf-generic`), `sy-frontdesk-gov`, los singletons
+`sy-storage`, `sy-identity`, `sy-cognition`, `sy-edge`), los binarios Go
+(`sy-opa-rules`, `sy-timer`, `sy-wf-rules`, `wf-generic`), `sy-frontdesk-gov`, los runtimes managed
 `io-cloud`/`io-blob`, y siembra el runtime instanciado `io.api` bajo `dist/runtimes`. **Hornea los
 hashes del manifiesto `dist/core` en build-time** (evita el crash-loop de "manifest hash
 mismatch" que causaba una copia manual de binarios).
@@ -76,11 +77,12 @@ mismatch" que causaba una copia manual de binarios).
 sudo apt-get install ./fluxbee_0.1.0_amd64.deb
 ```
 
-El control del `.deb` declara `Depends: adduser, openssl, libc6 (>= 2.39), postgresql` — **PostgreSQL
+El control del `.deb` declara `Depends: adduser, openssl, libc6 (>= 2.39), postgresql, curl, python3` — **PostgreSQL
 es ahora un `Depends` duro**, así que `apt-get install` lo trae automáticamente. El `postinst`:
 - crea el usuario de sistema `fluxbee` y los directorios de estado;
 - copia `hive.yaml.example` → `hive.yaml` si no existe (el operador lo edita antes de firstboot);
-- `daemon-reload` + `enable` de `sy-orchestrator`, `io-cloud`, `io-blob`;
+- `daemon-reload` + `enable` de `sy-orchestrator` (IO.cloud e IO.blob no tienen unit en el paquete:
+  son runtimes managed);
 - en una **instalación fresca NO arranca servicios** (arranca solo en upgrade, cuando dpkg pasa el
   argumento de versión previa). El transition a "encendido" lo hace `fluxbee-firstboot`.
 
@@ -105,7 +107,7 @@ orchestrator arriba para recibirlo). Pasos (idempotente):
 4. **Reconecta los consumidores de DB** — reinicia `sy-vault` PRIMERO (arranca con el secreto ya
    persistido), luego `sy-storage`/`sy-identity` (cada uno hace *pull* del secreto del vault vivo
    al arrancar), y re-patea el orchestrator hasta que el hive quede ready.
-5. **Espera hive ready y arranca los singletons** `io-cloud`, `io-blob`.
+5. **Espera hive ready y auto-spawnea los runtimes managed de boot** `io-cloud`, `io-blob`.
 
 Variables de entorno del firstboot: `FLUXBEE_DB_USER`/`FLUXBEE_DB_PASSWORD` (default
 `fluxbee`/`fluxbee`), `FLUXBEE_ADMIN` (default `127.0.0.1:8080`).
@@ -138,15 +140,11 @@ wan:
   gateway_name: "RT.gateway"
   mtls: required          # disabled | permissive | required (default del template)
 
-nats:
-  mode: embedded
-  port: 4222
-
 admin:
   listen: "127.0.0.1:8080"
 
 architect:
-  listen: "0.0.0.0:3000"
+  listen: "127.0.0.1:3000"   # solo loopback: Archi no tiene autenticación (A-46); desde otra máquina, túnel SSH
 
 storage:
   path: "/var/lib/fluxbee"
@@ -182,6 +180,12 @@ system_nodes:
   ingress:    { nodes: [SY.config.routes, SY.edge], wait_for: [SY.config.routes] }
 ```
 
+Desde 0.1.78 no hay sección `nats:` (el broker NATS embebido se borró; el plano de log es el
+stream de cada router, ver `13-storage.md`). Al arrancar, el orchestrator borra una vez
+`/var/lib/fluxbee/nats` y la sección `nats:` de un `hive.yaml` viejo, y loguea cuántos mensajes
+tenía pendientes el broker. SY.policy (solo contaba turns) se paró en 0.1.77 y en 0.1.78 se
+borraron su binario y su unit; el orchestrator lo saca de las listas de `system_nodes` al arrancar.
+
 ### 3.1 WAN mTLS
 
 `wan.mtls` controla la autenticación del transporte inter-hive:
@@ -209,8 +213,8 @@ El orden de `system_nodes.motherbee` es cargado por `sy_orchestrator`:
 
 | Rol | Cómo se crea | PostgreSQL | Nodos de sistema (start order) |
 |-----|--------------|:----------:|--------------------------------|
-| **motherbee** | `.deb` + `fluxbee-firstboot` | ✓ (Depends) | config.routes, identity, opa.rules, admin, IO.blob, architect, storage, cognition, policy, timer, wf-rules, frontdesk.gov, vault |
-| **worker** | `add_hive role=worker` | ✗ | config.routes, identity(réplica SHM), opa.rules, cognition, policy, timer, wf-rules |
+| **motherbee** | `.deb` + `fluxbee-firstboot` | ✓ (Depends) | config.routes, identity, opa.rules, admin, architect, storage, cognition, timer, wf-rules, frontdesk.gov, vault |
+| **worker** | `add_hive role=worker` | ✗ | config.routes, identity(réplica SHM), opa.rules, cognition, timer, wf-rules |
 | **egress** | `add_hive role=egress` + `egress{}` | ✗ | config.routes (+ NAT saliente por nft) |
 | **ingress** | `add_hive role=ingress` + `ingress{}` | ✗ | config.routes, SY.edge (:443 público, fail-closed) |
 
@@ -251,7 +255,6 @@ Ruteo interno: `SY.admin` → `SY.orchestrator@motherbee` (action `add_hive`).
 |-------|------|-------------|
 | `ssh_password` | string | Password admin para el bootstrap de una caja vacía. Solo se consulta si la llave de bootstrap aún no está sembrada y no se pasó `ssh_key`. Nunca se loguea ni se persiste. |
 | `ssh_key` | string | Llave privada SSH de bootstrap (PEM, **sin cifrar**). Canal key-first para una imagen cloud (authorized key inyectada por cloud-init, `PasswordAuthentication` OFF en el server): siembra la llave de la malla sin password del server. Rechaza llaves con passphrase (`ENCRYPTED`). Nunca se loguea ni se persiste. |
-| `ssh_access` | string | Postura SSH post-join. `revoke` (default) = SSH es solo-bootstrap: se borra la llave de la motherbee + el grant de sudoers. `key_only_persist` = deja SSH abierto solo-por-llave (password off) vía una **llave per-spoke de recuperación** guardada en `SY.vault` bajo `ssh:<hive_id>`. |
 | `role` | string | `worker` (default), `egress`, `ingress`. |
 | `egress` | object | Requerido si `role=egress`: `lan_cidr` (req), `wan_iface` (req), `lan_iface` (req), `edge_ip` (opt, default = primera IP usable de `lan_cidr`), `ipv6` (opt, solo `"blocked"`). |
 | `ingress` | object | Requerido si `role=ingress`: `listen` (req, `host:port`), `tls_vault_key` + `vault_hive` para HTTPS, o `allow_plaintext=true` solo para un listener de desarrollo explícito fuera de :443. |
@@ -271,8 +274,12 @@ El orchestrator siempre intenta **primero la llave** (`/var/lib/fluxbee/ssh/moth
      `PasswordAuthentication=no`), o
    - `ssh_password` (canal password), o
    - si no hay ninguno → error `SSH_KEY_FAILED` (nunca hay fallback hardcodeado).
-3. Asegura el sudoers del orchestrator remoto, verifica `sudo -n`, y ya opera todo por la llave.
-4. Empuja los binarios del core (desde `dist/core/bin` + manifiesto), escribe `hive.yaml` del
+3. Verifica que la llave abre la caja y **espera a que la caja se asiente** (A-52): mientras
+   systemd no terminó de arrancar, o corre una etapa de cloud-init o un job diario de apt
+   (unattended-upgrades), hasta 15 min en total; el join muestra la fase `waiting_for_host`. Si
+   sigue ocupada al final responde `HOST_NOT_SETTLED` (reintentable, la llave queda).
+4. Asegura el sudoers del orchestrator remoto, verifica `sudo -n`, y ya opera todo por la llave.
+5. Empuja los binarios del core (desde `dist/core/bin` + manifiesto), escribe `hive.yaml` del
    spoke (uplink a la motherbee, sin `wan.listen`, sin `sy-admin`), instala units y arranca
    `sy-orchestrator` remoto, que conecta por WAN.
 
@@ -282,16 +289,14 @@ para que el retry siga siendo key-first en vez de dejar el spoke a medio-hacer.
 
 ### 5.4 Postura post-join
 
-- **`revoke` (default):** tras join exitoso, `best_effort_revoke_bootstrap` borra la llave de la
-  motherbee de `authorized_keys` del spoke y remueve el grant de sudoers. El spoke queda sin
-  acceso SSH permanente. La reconciliación posterior llega por socket del router.
-- **`key_only_persist`:** `finalize_spoke_key_persist` genera una llave **per-spoke** nueva,
-  la agrega a `authorized_keys`, apaga password auth, y hace un **verify-before-revoke**: escribe
-  la privada a un scratch 0600, prueba `sudo -n` con ella, y solo entonces persiste la privada en
-  `SY.vault` bajo `ssh:<hive_id>` y borra la llave de la motherbee. Si el verify falla, **mantiene
-  la llave de la motherbee** (nunca deja al spoke sin acceso) y responde en modo
-  `degraded_kept_bootstrap`. La reconciliación de un hive `key_only_persist` lee esa llave
-  per-spoke del vault (cierra la contradicción reconcile↔revoke).
+Tras el join, la motherbee borra su llave de `authorized_keys` del spoke y remueve el grant de
+sudoers. El spoke queda sin acceso SSH de Fluxbee; todo lo posterior llega por socket del router y
+dist-sync (D32). El modo `ssh_access=key_only_persist` (llave per-spoke de recuperación en el
+vault) se eliminó: un pedido con `ssh_access` se rechaza con `INVALID_REQUEST`.
+
+Una excepción a propósito: si el join falla de forma reintentable (`HOST_NOT_SETTLED`,
+`TLS_PUSH_FAILED` por un corte de SSH, un corte de transporte), la llave de la motherbee queda para
+que el reintento entre por llave. Si se abandona el join, hay que completarlo o sacarla por consola.
 
 ### 5.5 Egress e ingress (particularidades)
 
@@ -314,9 +319,21 @@ para que el retry siga siendo key-first en vez de dejar el spoke a medio-hacer.
 sudo apt-get install ./fluxbee_<nueva-version>_amd64.deb
 ```
 
-- `prerm` para y deshabilita el orchestrator + singletons + todos los `sy-*` en orden inverso.
+- `prerm` para solo a los que escriben el manifest de runtimes de dist: `sy-orchestrator`,
+  `sy-admin` y `sy-wf-rules`. Router, identity, vault y el resto siguen sirviendo con los binarios
+  viejos mientras dpkg desempaqueta (A-45; antes paraba todo el core y la motherbee quedaba
+  70–86 s sin router, identity ni admin). En una desinstalación para todo y deshabilita lo que el
+  paquete habilitó.
 - `postinst` instala binarios + units nuevos y, **como es upgrade** (dpkg pasa la versión previa),
-  arranca de nuevo `sy-orchestrator`, `io-cloud`, `io-blob`.
+  arranca `sy-orchestrator`. Su boot reinicia cada servicio del core que corre un binario
+  reemplazado (`/proc/<pid>/exe` termina en `(deleted)`), en el orden de arranque Model D'
+  (`rt-gateway` primero, `SY.vault` último), y después los componentes del core que el `hive.yaml`
+  no lista en `system_nodes`. El resultado queda registrado como un core update: `/versions` →
+  `core.last_update`, `via: "package"`.
+- needrestart deja `rt-gateway` y `sy-*` al orchestrator (además de los `fluxbee-node-*`, A-39).
+  Costo: un update de una librería fuera de fluxbee les llega en el próximo upgrade o reboot.
+- dpkg corre el `prerm` del paquete **viejo**: el upgrade que instala 0.1.56 todavía para todo el
+  core; el reinicio corto se ve desde el upgrade siguiente.
 - Los units tienen `TimeoutStopSec=15`, así que un stop/restart/upgrade no cuelga 90 s hasta el
   SIGKILL del default de systemd. Los binarios salen rápido con SIGTERM y **`sy-orchestrator` ya
   no tira el hive abajo al salir** — el resto de la malla sigue arriba durante el upgrade.
@@ -327,7 +344,14 @@ sudo apt-get install ./fluxbee_<nueva-version>_amd64.deb
 Un spoke no se re-instala; recibe binarios nuevos por dist-sync:
 1. La motherbee publica el core nuevo en `/var/lib/fluxbee/dist/core/bin` + `manifest.json`
    (hashes reales).
-2. Syncthing replica `dist/` a los spokes (`sendonly` en motherbee, `receiveonly` en spokes).
+2. Syncthing replica `dist/` a los spokes en carpetas por contenido, `sendonly` en motherbee y
+   `receiveonly` en spokes: `fluxbee-dist-core-<rol>` (el `dist/core/<rol>` que la motherbee arma
+   para cada rol), `fluxbee-dist-vendor` y `fluxbee-dist-policy` (todos), y `fluxbee-dist-runtimes`
+   (solo workers).
+   Una carpeta `receiveonly` no manda ni deshace cambios locales: si el watchdog del orchestrator
+   ve alguno (`receiveOnlyTotalItems` > 0, en un espejo de `dist/` o en el `public/` de blob del
+   ingress), loguea un WARN y llama a `/rest/db/revert`, y la carpeta vuelve a la copia de la
+   motherbee (A-16).
 3. `POST /hives/{id}/update {category:"core", manifest_version, manifest_hash}` envía
    `SYSTEM_UPDATE` al `SY.orchestrator@{hive}`.
 4. El orchestrator del spoke valida el manifiesto local, **swap-ea los binarios, re-renderiza los
@@ -341,9 +365,10 @@ Categorías de update: `runtime`, `core`, `vendor`. El único contrato de update
 
 ### 6.3 Recuperación por reboot (sin re-firstboot)
 
-- **Motherbee:** los units están `enabled`; al bootear, `sy-orchestrator` arranca solo, levanta
-  el core en orden Model D', el vault ya tiene el secreto de postgres persistido, storage/identity
-  hacen pull. **No** hace falta re-correr `fluxbee-firstboot`.
+- **Motherbee:** el postinst deja `enabled` **solo** `sy-orchestrator` (io-cloud/io-blob son runtimes managed que el orchestrator auto-spawnea al boot
+  `io-cloud`/`io-blob`); al bootear, `sy-orchestrator` arranca solo y **levanta el resto del core**
+  (`systemctl start`) en orden Model D'. El vault ya tiene el secreto de postgres persistido,
+  storage/identity hacen pull. **No** hace falta re-correr `fluxbee-firstboot`.
 - **Spoke:** `sy-orchestrator` está `enabled`; al bootear reconecta por WAN a la motherbee
   (~15 s típico) y re-sincroniza identity/config/opa. Sin estado que reconstruir salvo caches
   locales (LanceDB/jsr-memory) que se regeneran.
@@ -375,10 +400,8 @@ curl -sS -X POST "$BASE/hives" -H 'content-type: application/json' -d "{
   \"address\": \"10.0.0.30\",
   \"ssh_user\": \"ubuntu\",
   \"ssh_key\": \"$(sed ':a;N;$!ba;s/\n/\\n/g' ~/.ssh/cloud_image_key)\",
-  \"role\": \"worker\",
-  \"ssh_access\": \"key_only_persist\"
+  \"role\": \"worker\"
 }" | jq .
-# key_only_persist → llave per-spoke de recuperación queda en SY.vault bajo ssh:worker-2
 
 # --- 3. Egress (NAT saliente) ---
 curl -sS -X POST "$BASE/hives" -H 'content-type: application/json' -d '{
@@ -424,24 +447,38 @@ curl -sS "$BASE/versions?hive=worker-1" | jq .      # core/runtime/vendor
 - `ssh_key` debe ser PEM **sin cifrar** (un key con passphrase se rechaza: el bootstrap no
   interactivo no puede aportar la passphrase).
 - Fallo transitorio de socket: el flujo reintenta (4x, base 800 ms) manteniéndose key-first.
+- **`ssh_password` "no anda" en imagen cloud:** Ubuntu cloud-image trae
+  `/etc/ssh/sshd_config.d/50-cloud-init.conf` con `PasswordAuthentication no`, y sshd es
+  *first-match*: un drop-in `99-*.conf` **no** lo pisa. Preferí `ssh_key` (la llave que cloud-init
+  ya inyectó); si insistís con password, poné un drop-in de número **menor** (`00-*.conf`). El
+  bootstrap ahora reporta `SSH_AUTH_FAILED` con este hint (antes decía `SSH_KEY_FAILED` aun usando
+  password).
 
-### 8.2 Recuperar un spoke `key_only_persist`
-La llave per-spoke de recuperación está en `SY.vault` bajo `ssh:<hive_id>`. La reconciliación del
-orchestrator la usa automáticamente para alcanzar el spoke (el bootstrap de la motherbee ya fue
-revocado). Para acceso manual, materializarla desde el vault a un scratch 0600 y
-`ssh -i <scratch> <ssh_user>@<address>`.
+### 8.0 Contrato del clean box (spoke) — prerequisitos
 
-### 8.3 Recuperar un spoke `revoke` (SSH cerrado)
-No hay llave permanente. Recuperar por consola out-of-band (hipervisor), reinstalar la pública de
-la motherbee en `authorized_keys` del `ssh_user`, y re-reconciliar por API
-(`DELETE /hives/{id}` seguido de `POST /hives` con las mismas credenciales).
+Un spoke es una **caja Linux limpia con SOLO SSH**, bootstrapeada por la motherbee. Antes del
+`add_hive` la caja debe tener:
+- **sshd activo** y alcanzable desde la motherbee en el `address` indicado.
+- **un usuario sudo** (`ssh_user`) con sudo passwordless.
+- **acceso (elegí uno):** *(recomendado)* la **pubkey del operador/cloud-init en
+  `authorized_keys`** → bootstrap **key-first** (ejemplo worker-2 arriba), independiente de
+  `PasswordAuthentication`; **o** `PasswordAuthentication yes` (drop-in `00-*.conf` que gane al
+  `50-cloud-init.conf`) + `ssh_password`.
+- Una **imagen cloud estándar de Ubuntu** ya cumple esto (sshd on + usuario `ubuntu` + llave
+  inyectada). Una imagen/plantilla propia debe habilitar sshd + crear el usuario (ver
+  `lab/template-prep.sh` para el patrón del lab).
 
-### 8.4 El hive no queda ready tras firstboot
+### 8.2 Recuperar un spoke (SSH cerrado)
+No hay llave permanente (D32). Recuperar por consola out-of-band (hipervisor): dar de nuevo acceso
+de bootstrap al `ssh_user` (su llave o password) y volver a unirlo por API, como una máquina nueva
+(`DELETE /hives/{id}` seguido de `POST /hives`).
+
+### 8.3 El hive no queda ready tras firstboot
 `fluxbee-firstboot` es idempotente: re-correrlo. Revisar postgres (`systemctl status postgresql`),
 que el secreto esté en el vault (`GET /hives/<hive>/vault/secrets`), y los logs
 (`journalctl -u sy-orchestrator -f`, `-u sy-vault`, `-u sy-storage`).
 
-### 8.5 Comandos de diagnóstico
+### 8.4 Comandos de diagnóstico
 ```bash
 journalctl -u sy-orchestrator -f
 systemctl is-active rt-gateway sy-orchestrator sy-identity sy-admin sy-vault sy-storage
@@ -490,20 +527,28 @@ Runbook de status por nodo (campos de `payload.node_status`):
 /etc/fluxbee/
 ├── hive.yaml                 # ÚNICO archivo que edita el operador
 ├── hive.yaml.example         # template (conffile del .deb)
-├── io-cloud.env / io-blob.env(.example)
+├── handbook_fluxbee.md       # handbook de SY.architect (se reemplaza en cada upgrade)
+├── vault.master.key          # solo motherbee: la clave maestra de SY.vault
 
 /var/lib/fluxbee/
 ├── ssh/motherbee.key(.pub)   # 0700 dir; llave de bootstrap ed25519
 ├── tls/<hive_id>             # CA de malla + cert (wan.mtls)
 ├── state/{nodes,cookbook,sy-admin,sy-edge,io-blob}
+├── state/RT.<router>@<hive>/stream/   # log del stream del router: segmentos + state.json
 ├── hives/                    # repo de spokes (info por hive)
 ├── opa/{current,staged,backup}
-├── wf-rules/  modules/  nats/
-├── blob/{,public}            # public = canal one-way a ingress
+├── wf-rules/  modules/
+├── blob/                     # root:fluxbee 0750 (A-56)
+│   ├── staging/              # solo root: los nodos dejan ahí los blobs antes de promoverlos
+│   ├── active/               # del usuario fluxbee (Syncthing la sirve); cada blob toma ese dueño
+│   └── public/               # del usuario fluxbee; canal one-way a ingress
 ├── syncthing/                # home gestionado del syncthing (user fluxbee)
-└── dist/
-    ├── core/{bin,manifest.json}    # binarios del core + hashes (sendonly→spokes)
-    ├── runtimes/                   # io.api, ai.generic, wf.engine, io.slack, io.linkedhelper
+└── dist/                     # motherbee: de root, el usuario fluxbee solo lee (A-51)
+    ├── core/{bin,manifest.json}    # binarios del core + hashes
+    ├── core/<rol>/                 # árbol por rol que la motherbee arma (sendonly→spokes)
+    ├── policy/opa/                 # policy OPA global compilada (todos los hives)
+    ├── runtimes/                   # los de base-nodes.json: io.api, io.blob, io.cloud, io.slack,
+    │                               # io.wapp, ai.generic, wf.engine, io.linkedhelper
     └── vendor/syncthing/           # binario + manifest del syncthing vendorizado
 
 /run/fluxbee/routers/          # sockets del router (volátil)
@@ -519,7 +564,7 @@ Runbook de status por nodo (campos de `payload.node_status`):
 | RT.gateway | ❌ | Router raíz del hive |
 | SY.orchestrator | ❌ | Proceso raíz |
 | SY.admin / SY.vault | ❌ | Sin ellos no hay control/secreto |
-| SY.config.routes / SY.opa.rules / SY.identity / SY.policy | ❌ | Críticos para routing/policy/identidad |
+| SY.config.routes / SY.opa.rules / SY.identity | ❌ | Críticos para routing/policy/identidad |
 | AI.* / WF.* / IO.* (instanciados) | ✅ | Nodos de aplicación |
 
 ---

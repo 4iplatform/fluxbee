@@ -1,9 +1,8 @@
 # add_hive `ssh_access=key_only_persist` — per-spoke recovery key in the vault (spec v1)
 
-Status: **DESIGN LOCKED, NOT BUILT.** Grounded against `src/bin/sy_orchestrator.rs`
-(line numbers as of commit `71cb08a`). This reverses the deliberate SO-02
-"SSH-is-bootstrap-only" invariant, so it is gated behind an **off-by-default** flag and a
-**verify-before-revoke** safety that makes a lock-out impossible.
+Status: **WITHDRAWN (operator, 2026-10-06, D32).** Built 2026-07-20 and removed in 0.1.61: SSH
+exists only inside `add_hive`, and the join always revokes its access at the end (see
+`docs/host-posture-and-exposure-spec-v1.md` D32 and FINDINGS A-54). Kept as history.
 
 ## Why (user decision, 2026-07-20)
 

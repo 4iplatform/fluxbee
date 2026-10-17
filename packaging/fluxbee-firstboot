@@ -64,10 +64,18 @@ systemctl restart sy-orchestrator
 echo "== [3/5] wait admin + vault_put postgres secret =="
 for _ in $(seq 1 60); do curl -s -m3 "$ADMIN/hives" >/dev/null 2>&1 && break; sleep 2; done
 body="{\"key\":\"storage_postgres_url\",\"value\":{\"postgres_url\":\"$PG_URL\"},\"metadata\":{\"tenant_id\":\"$ROOT_TENANT\",\"resource_type\":\"postgres\"}}"
+vault_ok=0
 for _ in $(seq 1 20); do
   r="$(curl -s -m10 -X POST "$ADMIN/hives/$HIVE_ID/vault/secrets" -H 'content-type: application/json' -d "$body" 2>/dev/null || true)"
-  case "$r" in *'"status":"ok"'*) echo "  vault_put OK"; break;; *) sleep 3;; esac
+  case "$r" in *'"status":"ok"'*) echo "  vault_put OK"; vault_ok=1; break;; *) sleep 3;; esac
 done
+if [ "$vault_ok" != 1 ]; then
+  # Do NOT echo $body (it carries the postgres URL); the response $r is safe (no secret).
+  echo "ERROR: vault_put storage_postgres_url failed after 20 tries — postgres secret NOT stored." >&2
+  echo "       DB consumers (storage/identity) will stay 'not initialized' and the hive will not become ready." >&2
+  echo "       Last admin response: ${r:-<no response / admin unreachable>}" >&2
+  exit 1
+fi
 
 # The DB consumers (storage/identity) connect to postgres at startup; if they
 # came up before the secret was in the vault they stay "not initialized". The
@@ -102,16 +110,15 @@ if [ "$HIVE_READY" != "1" ]; then
   echo "first-boot failed: hive did not become ready." >&2
   exit 1
 fi
-# Start the singleton infra nodes (IO.blob, IO.cloud) from the manifest; fall back to the known
-# two if the manifest is missing.
-SINGLETON_UNITS="$(mf singleton_units)"
-[ -n "$SINGLETON_UNITS" ] || SINGLETON_UNITS=$'io-cloud\nio-blob'
-for u in $SINGLETON_UNITS; do systemctl start "$u" 2>/dev/null || true; done
+# IO.blob and IO.cloud are no longer systemd singletons: they are boot=true managed runtimes,
+# spawned below by the boot_runtimes loop (they come up degraded until configured via
+# CONFIG_SET). Nothing to start here anymore.
 
 echo "== [6/6] spawn base node instances (running, degraded until configured) =="
-# Auto-spawn one default instance of each boot=true runtime at the root tenant. They come up
-# RUNNING but degraded/unconfigured (no secret/config yet) — deliberate, so a fresh backend has
-# basic nodes alive out of the box; the operator loads secrets into SY.vault to make them work.
+# Auto-spawn one default instance of each boot=true runtime at the root tenant: the system IO
+# nodes (IO.cloud, IO.blob), the only IO nodes that run there (FINDINGS A-43). They come up
+# RUNNING but degraded/unconfigured until the operator configures them. Every other runtime
+# (io.api, io.wapp, io.slack, ai.generic, ...) is baked but not started: a tenant launches it.
 while IFS=$'\t' read -r rt inst; do
   [ -n "$rt" ] && [ -n "$inst" ] || continue
   body="{\"node_name\":\"$inst\",\"runtime\":\"$rt\",\"runtime_version\":\"current\",\"tenant_id\":\"$ROOT_TENANT\"}"
@@ -128,16 +135,29 @@ cat <<EOF
  Fluxbee backend is UP. Core (SY.*) + base nodes are RUNNING.
  Some nodes are DEGRADED until you load their secret into SY.vault:
 
-  - AI (ai.generic / architect / admin / cognition) needs a provider key.
-    Load an OpenAI (or "anthropic") key:
+  - The core's AI (architect / admin / cognition / frontdesk) needs a provider key.
+    Load an OpenAI (or "anthropic") key in the root tenant (a tenant's ai.generic nodes use
+    their own tenant's key, never this one):
       curl -sS -X POST $ADMIN/hives/$HIVE_ID/vault/secrets -H 'content-type: application/json' \\
         -d '{"key":"openai_root_pool","value":{"api_key":"sk-..."},"metadata":{"tenant_id":"$ROOT_TENANT","resource_type":"openai"}}'
+    NOTE: the default provider is 'openai'. For an Anthropic key (resource_type "anthropic"),
+    also set 'ai.default_provider: anthropic' in /etc/fluxbee/hive.yaml and restart the AI nodes,
+    or the AI nodes keep resolving the openai pool and stay degraded.
 
-  - IO.slack needs its tokens (resource_type "slack", value {app_token, bot_token}).
+  - IO channel nodes are not started here, and none runs in the root tenant: each one
+    (IO.api.<label>, IO.slack.<label>, IO.wapp.<label>, ...) is launched with run_node by the
+    tenant that needs it, and its secret goes to SY.vault for that tenant.
+    Slack: resource_type "slack", {app_token, bot_token}.
+    WhatsApp: resource_type "whatsapp", {access_token, app_secret, verify_token}, plus ONE
+    edge endpoint for the Meta app with the family glob "IO.wapp.*@$HIVE_ID" and each node's
+    io.phone_number_id set via CONFIG_SET (one IO.wapp.<label> node per number).
 
   Any other node secret is loaded into SY.vault the same way (POST .../vault/secrets).
 
- Architect (Archi): http://<this-host>:3000    Admin API: $ADMIN
+ Architect (Archi): http://127.0.0.1:3000    Admin API: $ADMIN
+   Both listen on loopback only (no authentication). From another machine use an SSH
+   tunnel: ssh -L 3000:127.0.0.1:3000 -L 8080:127.0.0.1:8080 <user>@<this-host>, then open
+   http://127.0.0.1:3000
 ============================================================
 EOF
 echo "first-boot done."

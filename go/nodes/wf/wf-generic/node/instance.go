@@ -181,10 +181,16 @@ func (inst *WFInstance) RunTransition(ctx context.Context, event sdk.Message, ac
 		return fmt.Errorf("instance %s: target state %q not found", inst.InstanceID, chosen.TargetState)
 	}
 
-	// Step 2: execute exit_actions → transition.actions → entry_actions
+	// Step 2: execute exit_actions → transition.actions → entry_actions. A fatal action failure
+	// (gap-2) at any step routes the instance to a loud terminal failure instead of advancing with
+	// inconsistent state; internal events emitted before the failure are cleared by routeToFailed.
 	var emitted []InternalEventRow
-	inst.executeActions(ctx, stateDef.ExitActions, event, actx, &emitted)
-	inst.executeActions(ctx, chosen.Actions, event, actx, &emitted)
+	if err := inst.executeActions(ctx, stateDef.ExitActions, event, actx, &emitted); err != nil {
+		return inst.routeToFailed(ctx, event, actx, err, consumedInternalEventID)
+	}
+	if err := inst.executeActions(ctx, chosen.Actions, event, actx, &emitted); err != nil {
+		return inst.routeToFailed(ctx, event, actx, err, consumedInternalEventID)
+	}
 
 	// Step 3: apply set_variable actions to StateVars before entry_actions fire
 	// (already done inline in executeActions via set_variable handler)
@@ -193,7 +199,9 @@ func (inst *WFInstance) RunTransition(ctx context.Context, event sdk.Message, ac
 	prevState := inst.CurrentState
 	inst.CurrentState = chosen.TargetState
 
-	inst.executeActions(ctx, targetStateDef.EntryActions, event, actx, &emitted)
+	if err := inst.executeActions(ctx, targetStateDef.EntryActions, event, actx, &emitted); err != nil {
+		return inst.routeToFailed(ctx, event, actx, err, consumedInternalEventID)
+	}
 
 	// Step 4: persist new state
 	inst.CurrentTraceID = ""
@@ -248,13 +256,14 @@ func (inst *WFInstance) runCancelTransition(ctx context.Context, event sdk.Messa
 		return fmt.Errorf("persist trace_id for cancel: %w", err)
 	}
 
-	// Run current state's exit_actions then cancelled entry_actions
+	// Run current state's exit_actions then cancelled entry_actions. Best-effort: the instance is
+	// already terminating into cancelled, so an action failure here is logged, not routed to failed.
 	var emitted []InternalEventRow
 	if stateDef := inst.findState(prevState); stateDef != nil {
-		inst.executeActions(ctx, stateDef.ExitActions, event, actx, &emitted)
+		inst.executeActionsBestEffort(ctx, stateDef.ExitActions, event, actx, &emitted)
 	}
 	inst.CurrentState = "cancelled"
-	inst.executeActions(ctx, cancelledState.EntryActions, event, actx, &emitted)
+	inst.executeActionsBestEffort(ctx, cancelledState.EntryActions, event, actx, &emitted)
 
 	now := nowMS(actx.Clock)
 	inst.Status = "cancelled"
@@ -268,17 +277,36 @@ func (inst *WFInstance) runCancelTransition(ctx context.Context, event sdk.Messa
 	})
 }
 
-// executeActions runs a slice of actions, logging each result.
-// Action failures are logged but do NOT halt execution.
-func (inst *WFInstance) executeActions(ctx context.Context, actions []ActionDefinition, event sdk.Message, actx ActionContext, emitted *[]InternalEventRow) {
+// executeActions runs a slice of actions, logging each result. On the FIRST action whose effective
+// on_error policy is "fail", the failure STOPS the slice and is returned, so the caller routes the
+// instance to a loud terminal failure instead of silently advancing with inconsistent state (gap-2).
+// Actions with on_error=continue are logged and skipped, as before.
+func (inst *WFInstance) executeActions(ctx context.Context, actions []ActionDefinition, event sdk.Message, actx ActionContext, emitted *[]InternalEventRow) error {
+	return inst.runActions(ctx, actions, event, actx, emitted, false)
+}
+
+// executeActionsBestEffort runs every action, logging failures but never halting — for paths where
+// routing to failure is impossible or undesirable: the cancel path (already terminating) and the
+// failed-state's OWN entry actions (so failure handling can never recurse).
+func (inst *WFInstance) executeActionsBestEffort(ctx context.Context, actions []ActionDefinition, event sdk.Message, actx ActionContext, emitted *[]InternalEventRow) {
+	_ = inst.runActions(ctx, actions, event, actx, emitted, true)
+}
+
+func (inst *WFInstance) runActions(ctx context.Context, actions []ActionDefinition, event sdk.Message, actx ActionContext, emitted *[]InternalEventRow, bestEffort bool) error {
 	for i, action := range actions {
 		path := fmt.Sprintf("action[%d]", i)
 		err := executeAction(ctx, path, action, inst, event, actx, emitted)
 		ok := err == nil
 		detail := ""
+		fatal := false
 		if err != nil {
 			detail = err.Error()
-			log.Printf("instance %s: %s (%s) error: %v", inst.InstanceID, path, action.Type, err)
+			fatal = !bestEffort && action.EffectiveOnError() == OnErrorFail
+			if fatal {
+				log.Printf("instance %s: %s (%s) FAILED (on_error=fail): %v", inst.InstanceID, path, action.Type, err)
+			} else {
+				log.Printf("instance %s: %s (%s) error (on_error=continue): %v", inst.InstanceID, path, action.Type, err)
+			}
 		}
 		_ = actx.Store.AppendLog(ctx, WFLogEntry{
 			InstanceID:  inst.InstanceID,
@@ -288,7 +316,48 @@ func (inst *WFInstance) executeActions(ctx context.Context, actions []ActionDefi
 			OK:          ok,
 			ErrorDetail: detail,
 		})
+		if fatal {
+			return fmt.Errorf("%s (%s): %w", path, action.Type, err)
+		}
 	}
+	return nil
+}
+
+// routeToFailed terminates the instance in a loud "failed" state after a fatal action error, instead
+// of silently advancing with inconsistent state (gap-2). If the definition declares a "failed" state,
+// the instance moves there and its entry_actions run best-effort (never fatal, so failure handling
+// can't recurse); otherwise the instance is simply marked failed. Either way Status=failed, the
+// instance terminates, timers are cancelled, pending internal events are cleared, and the cause is
+// logged loudly.
+func (inst *WFInstance) routeToFailed(ctx context.Context, event sdk.Message, actx ActionContext, cause error, consumedInternalEventID *int64) error {
+	prevState := inst.CurrentState
+	now := nowMS(actx.Clock)
+	log.Printf("instance %s: fatal action failure in state %q — routing to failed: %v", inst.InstanceID, prevState, cause)
+
+	var emitted []InternalEventRow
+	if failedState := inst.findState("failed"); failedState != nil && prevState != "failed" {
+		inst.CurrentState = "failed"
+		inst.executeActionsBestEffort(ctx, failedState.EntryActions, event, actx, &emitted)
+	}
+	inst.Status = "failed"
+	inst.TerminatedAtMS = &now
+	inst.CurrentTraceID = ""
+	inst.UpdatedAtMS = now
+	inst.cancelAllTimers(ctx, actx)
+
+	_ = actx.Store.AppendLog(ctx, WFLogEntry{
+		InstanceID:  inst.InstanceID,
+		LoggedAtMS:  now,
+		ActionType:  "transition",
+		Summary:     fmt.Sprintf("FAILED in %s", prevState),
+		OK:          false,
+		ErrorDetail: cause.Error(),
+	})
+
+	return actx.Store.CommitInstanceMutation(ctx, mustToRow(inst, actx.Clock), InstanceCommitMutation{
+		ConsumedInternalEventID: consumedInternalEventID,
+		ClearInternalEvents:     true,
+	})
 }
 
 func (inst *WFInstance) drainInternalEvents(ctx context.Context, actx ActionContext) error {
@@ -329,6 +398,9 @@ func (inst *WFInstance) cancelAllTimers(ctx context.Context, actx ActionContext)
 }
 
 func (inst *WFInstance) findState(name string) *StateDefinition {
+	if inst.def == nil {
+		return nil
+	}
 	for i := range inst.def.States {
 		if inst.def.States[i].Name == name {
 			return &inst.def.States[i]
@@ -374,7 +446,15 @@ func matchesEvent(match EventMatch, msg sdk.Message) bool {
 }
 
 // messageToMap converts an sdk.Message to a plain map for use in CEL evaluation
-// and $ref resolution. The map has keys: "msg", "type", "thread_id", "trace_id", "payload".
+// and $ref resolution. The map has keys: "msg", "type", "thread_id", "trace_id",
+// "payload", and — for messages that carry them — "src" (the router-stamped source
+// L2 name) and "context" (the parsed meta.context object).
+//
+// "src" + "context" let a workflow read WHO sent an ingress message and its
+// io_context (channel/conversation/reply_target...) so it can decide routing and
+// reply back to the originating IO node. Both are exposed under the single "event"
+// root (there is no dedicated $ref root for them), and because this one map is what
+// both $ref resolution and CEL evaluation consume, they light up in both at once.
 func messageToMap(msg sdk.Message) map[string]any {
 	m := map[string]any{
 		"trace_id": msg.Routing.TraceID,
@@ -385,6 +465,15 @@ func messageToMap(msg sdk.Message) map[string]any {
 	m["type"] = msg.Meta.MsgType
 	if msg.Meta.ThreadID != nil {
 		m["thread_id"] = *msg.Meta.ThreadID
+	}
+	if src := msg.SourceL2Name(); src != "" {
+		m["src"] = src
+	}
+	if len(msg.Meta.Context) > 0 {
+		var context map[string]any
+		if err := json.Unmarshal(msg.Meta.Context, &context); err == nil {
+			m["context"] = context
+		}
 	}
 	if len(msg.Payload) > 0 {
 		var payload map[string]any

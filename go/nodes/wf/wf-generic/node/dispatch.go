@@ -28,7 +28,8 @@ const (
 	MsgTimerRescheduleResponse = "TIMER_RESCHEDULE_RESPONSE"
 )
 
-// Dispatcher holds all runtime state needed to dispatch inbound messages.
+// NodeRuntime holds all runtime state needed to dispatch inbound messages. Def, Registry and
+// Store are set only while the node's config is in use (Plane.Configured() != nil).
 type NodeRuntime struct {
 	Def        *WorkflowDefinition
 	DefJSON    string // raw JSON of the definition (for WF_GET_CODE)
@@ -37,9 +38,18 @@ type NodeRuntime struct {
 	ActCtx     ActionContext
 	NodeUUID   string
 	NodeName   string
-	Config     *Config
-	ConfigPath string
+	Plane      *ControlPlane
 	VersionStr string
+}
+
+// wfControlRequests maps each WF control request to its response, so a node without a config in
+// use can still answer it.
+var wfControlRequests = map[string]string{
+	MsgWFHelp:           MsgWFHelpResponse,
+	MsgWFGetInstance:    MsgWFGetInstanceResponse,
+	MsgWFListInstances:  MsgWFListInstancesResponse,
+	MsgWFGetCode:        MsgWFGetCodeResponse,
+	MsgWFCancelInstance: MsgWFCancelInstanceResponse,
 }
 
 // Dispatch routes a single inbound message to the appropriate handler.
@@ -58,7 +68,14 @@ func Dispatch(ctx context.Context, msg sdk.Message, rt *NodeRuntime) error {
 
 	case sdk.IsNodeConfigSetMessage(&msg):
 		return handleNodeConfigSet(ctx, msg, rt)
+	}
 
+	// The engine runs (Def is set) only with a config in use.
+	if rt.Def == nil {
+		return dispatchWithoutConfig(ctx, msg, msgName, rt)
+	}
+
+	switch {
 	case msgName == MsgWFHelp:
 		return handleWFHelp(ctx, msg, rt)
 
@@ -91,8 +108,22 @@ func Dispatch(ctx context.Context, msg sdk.Message, rt *NodeRuntime) error {
 	}
 }
 
+// dispatchWithoutConfig serves a node whose config is not in use: a WF control request gets a
+// node_not_configured answer, and workflow traffic is logged and dropped, as IO nodes do with
+// traffic they cannot serve.
+func dispatchWithoutConfig(ctx context.Context, msg sdk.Message, msgName string, rt *NodeRuntime) error {
+	if responseMsg, ok := wfControlRequests[msgName]; ok {
+		return sendErrorReply(ctx, msg, responseMsg, errCodeNodeNotConfigured, rt.Plane.notConfiguredReason(), rt)
+	}
+	if shouldIgnoreInfrastructureMessage(msg) {
+		return nil
+	}
+	log.Printf("wf: dropping msg_type=%s msg=%q trace_id=%s: %s", msg.Meta.MsgType, msgName, msg.Routing.TraceID, rt.Plane.notConfiguredReason())
+	return nil
+}
+
 func shouldIgnoreInfrastructureMessage(msg sdk.Message) bool {
-	if msg.Meta.MsgType != sdk.SYSTEMKind {
+	if !sdk.IsSystemKind(msg.Meta.MsgType) {
 		return false
 	}
 	msgName := ""
@@ -121,7 +152,7 @@ func shouldIgnoreInfrastructureMessage(msg sdk.Message) bool {
 // --- Control verb handlers ---
 
 func handleNodeStatusGet(ctx context.Context, msg sdk.Message, rt *NodeRuntime) error {
-	resp, err := sdk.BuildDefaultNodeStatusResponse(&msg, rt.NodeUUID, "ok")
+	resp, err := sdk.BuildManagedNodeStatusResponse(&msg, rt.NodeUUID, rt.Plane.State)
 	if err != nil {
 		return err
 	}
@@ -131,36 +162,25 @@ func handleNodeStatusGet(ctx context.Context, msg sdk.Message, rt *NodeRuntime) 
 func handleNodeConfigGet(ctx context.Context, msg sdk.Message, rt *NodeRuntime) error {
 	reqMsg, err := sdk.ParseNodeConfigRequest(&msg)
 	if err != nil || reqMsg == nil || reqMsg.Get == nil {
-		return sendNodeConfigResponse(ctx, msg, wfConfigErrorPayload(rt.NodeName, "INVALID_CONFIG_GET", errorString(err, "invalid CONFIG_GET request"), configVersion(rt.Config)), rt)
+		return sendNodeConfigResponse(ctx, msg, wfConfigErrorPayload(rt.NodeName, rt.Plane, sdk.ErrCodeInvalidConfig, errorString(err, "invalid CONFIG_GET request")), rt)
 	}
 	req := reqMsg.Get
 	if req.NodeName != "" && rt.NodeName != "" && req.NodeName != rt.NodeName {
-		return sendNodeConfigResponse(ctx, msg, wfConfigErrorPayload(rt.NodeName, "INVALID_CONFIG_GET", fmt.Sprintf("request node_name %q does not match runtime node %q", req.NodeName, rt.NodeName), configVersion(rt.Config)), rt)
+		return sendNodeConfigResponse(ctx, msg, wfConfigErrorPayload(rt.NodeName, rt.Plane, sdk.ErrCodeInvalidConfig, fmt.Sprintf("request node_name %q does not match runtime node %q", req.NodeName, rt.NodeName)), rt)
 	}
-	return sendNodeConfigResponse(ctx, msg, buildWFConfigGetPayload(rt.NodeName, rt.Config), rt)
+	return sendNodeConfigResponse(ctx, msg, buildWFConfigGetPayload(rt.NodeName, rt.Plane), rt)
 }
 
 func handleNodeConfigSet(ctx context.Context, msg sdk.Message, rt *NodeRuntime) error {
 	reqMsg, err := sdk.ParseNodeConfigRequest(&msg)
 	if err != nil || reqMsg == nil || reqMsg.Set == nil {
-		return sendNodeConfigResponse(ctx, msg, wfConfigErrorPayload(rt.NodeName, "INVALID_CONFIG_SET", errorString(err, "invalid CONFIG_SET request"), configVersion(rt.Config)), rt)
+		return sendNodeConfigResponse(ctx, msg, wfConfigErrorPayload(rt.NodeName, rt.Plane, sdk.ErrCodeInvalidConfig, errorString(err, "invalid CONFIG_SET request")), rt)
 	}
 	req := reqMsg.Set
 	if req.NodeName != "" && rt.NodeName != "" && req.NodeName != rt.NodeName {
-		return sendNodeConfigResponse(ctx, msg, wfConfigErrorPayload(rt.NodeName, "INVALID_CONFIG_SET", fmt.Sprintf("request node_name %q does not match runtime node %q", req.NodeName, rt.NodeName), req.ConfigVersion), rt)
+		return sendNodeConfigResponse(ctx, msg, wfConfigErrorPayload(rt.NodeName, rt.Plane, sdk.ErrCodeInvalidConfig, fmt.Sprintf("request node_name %q does not match runtime node %q", req.NodeName, rt.NodeName)), rt)
 	}
-	if rt.Config == nil || rt.ConfigPath == "" {
-		return sendNodeConfigResponse(ctx, msg, wfConfigErrorPayload(rt.NodeName, "CONFIG_UNAVAILABLE", "runtime config path is unavailable", req.ConfigVersion), rt)
-	}
-
-	payload, nextCfg, applyErr := applyWFConfigSet(rt.ConfigPath, rt.NodeName, rt.Config, req)
-	if applyErr != nil {
-		return sendNodeConfigResponse(ctx, msg, wfConfigErrorPayload(rt.NodeName, "CONFIG_WRITE_FAILED", applyErr.Error(), req.ConfigVersion), rt)
-	}
-	if nextCfg != nil {
-		rt.Config = nextCfg
-	}
-	return sendNodeConfigResponse(ctx, msg, payload, rt)
+	return sendNodeConfigResponse(ctx, msg, applyWFConfigSet(rt.NodeName, rt.Plane, req), rt)
 }
 
 func handleWFHelp(ctx context.Context, msg sdk.Message, rt *NodeRuntime) error {

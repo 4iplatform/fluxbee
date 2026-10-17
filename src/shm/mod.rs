@@ -375,9 +375,16 @@ pub struct MemoryShmSnapshot {
     pub threads: Vec<MemoryShmThreadEntry>,
 }
 
+/// One communication's memory package (docs/router-stream-v1.md §6.2): the communication is
+/// `(thread_id, agent_ilk)`; `agent_node` is where its router delivers, the key the router looks it
+/// up by. An entry written before 0.1.77 has neither and matches no delivery.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MemoryShmThreadEntry {
     pub thread_id: String,
+    #[serde(default)]
+    pub agent_ilk: String,
+    #[serde(default)]
+    pub agent_node: String,
     pub package: MemoryPackage,
 }
 
@@ -631,7 +638,6 @@ struct IdentityRegionLayout {
     ich_mapping_offset: usize,
     ilk_alias_offset: usize,
     vocabulary_offset: usize,
-    variable_offset: usize,
     total_len: usize,
     limits: IdentityRegionLimits,
 }
@@ -753,73 +759,61 @@ pub struct MemoryHeaderSnapshot {
 }
 
 pub struct RouterRegionWriter {
-    name: String,
     mmap: MmapMut,
     layout: RegionLayout,
 }
 
 pub struct RouterRegionReader {
-    name: String,
     mmap: Mmap,
     layout: RegionLayout,
 }
 
 pub struct ConfigRegionWriter {
-    name: String,
     mmap: MmapMut,
     layout: RegionLayout,
 }
 
 pub struct ConfigRegionReader {
-    name: String,
     mmap: Mmap,
     layout: RegionLayout,
 }
 
 pub struct LsaRegionWriter {
-    name: String,
     mmap: MmapMut,
     layout: RegionLayout,
 }
 
 pub struct LsaRegionReader {
-    name: String,
     mmap: Mmap,
     layout: RegionLayout,
 }
 
 pub struct OpaRegionReader {
-    name: String,
     mmap: Mmap,
 }
 
 pub struct OpaRegionWriter {
-    name: String,
     mmap: MmapMut,
 }
 
 pub struct IdentityRegionWriter {
-    name: String,
     mmap: MmapMut,
     layout: IdentityRegionLayout,
 }
 
 pub struct IdentityRegionReader {
-    name: String,
     mmap: Mmap,
     layout: IdentityRegionLayout,
 }
 
 #[derive(Debug)]
 pub struct MemoryRegionWriter {
-    name: String,
     mmap: MmapMut,
     layout: RegionLayout,
 }
 
 #[derive(Debug)]
 pub struct MemoryRegionReader {
-    name: String,
     mmap: Mmap,
     layout: RegionLayout,
 }
@@ -890,11 +884,7 @@ impl RouterRegionWriter {
             initialize_router_header(mmap, router_uuid, hive_id, router_name, is_gateway);
         })?;
         normalize_seq_header::<ShmHeader>(&mut mmap, layout.header_offset, "router shm")?;
-        Ok(Self {
-            name: name.to_string(),
-            mmap,
-            layout,
-        })
+        Ok(Self { mmap, layout })
     }
 
     pub fn read_snapshot(&self) -> Option<ShmSnapshot> {
@@ -939,18 +929,17 @@ impl RouterRegionWriter {
         let (header, nodes): (&mut ShmHeader, &mut [NodeEntry]) =
             router_header_and_nodes_mut(&mut self.mmap, &self.layout)
                 .ok_or(ShmError::InvalidHeader)?;
-        let mut slot = None;
-        for entry in nodes.iter_mut() {
-            if entry.flags & FLAG_ACTIVE == 0 {
-                slot = Some(entry);
-                break;
-            }
-            if entry.uuid == *node_uuid.as_bytes() {
-                slot = Some(entry);
-                break;
-            }
-        }
-        let Some(entry) = slot else {
+        // A node registered again keeps its own slot; only a new one takes the first free slot.
+        // Unregistering leaves holes, so a free slot can come before the node's own.
+        let own_slot = nodes.iter().position(|entry| {
+            entry.flags & FLAG_ACTIVE != 0 && entry.uuid == *node_uuid.as_bytes()
+        });
+        let slot = own_slot.or_else(|| {
+            nodes
+                .iter()
+                .position(|entry| entry.flags & FLAG_ACTIVE == 0)
+        });
+        let Some(entry) = slot.map(|index| &mut nodes[index]) else {
             return Err(ShmError::SlotFull);
         };
 
@@ -1022,11 +1011,6 @@ impl RouterRegionWriter {
     fn header_mut(&mut self) -> Option<&mut ShmHeader> {
         header_mut::<ShmHeader>(&mut self.mmap, self.layout.header_offset)
     }
-
-    fn nodes_mut(&mut self) -> Option<&mut [NodeEntry]> {
-        let offset = self.layout.node_offset;
-        slice_mut::<NodeEntry>(&mut self.mmap, offset, MAX_NODES as usize)
-    }
 }
 
 impl RouterRegionReader {
@@ -1034,11 +1018,7 @@ impl RouterRegionReader {
         validate_name(name)?;
         let layout = layout_router();
         let mmap = open_read_only_region(name, layout.total_len)?;
-        Ok(Self {
-            name: name.to_string(),
-            mmap,
-            layout,
-        })
+        Ok(Self { mmap, layout })
     }
 
     pub fn read_snapshot(&self) -> Option<ShmSnapshot> {
@@ -1059,11 +1039,7 @@ impl ConfigRegionWriter {
             initialize_config_header(mmap, owner_uuid, hive_id);
         })?;
         normalize_seq_header::<ConfigHeader>(&mut mmap, layout.header_offset, "config shm")?;
-        Ok(Self {
-            name: name.to_string(),
-            mmap,
-            layout,
-        })
+        Ok(Self { mmap, layout })
     }
 
     pub fn read_snapshot(&self) -> Option<ConfigSnapshot> {
@@ -1174,16 +1150,6 @@ impl ConfigRegionWriter {
     fn header_mut(&mut self) -> Option<&mut ConfigHeader> {
         header_mut::<ConfigHeader>(&mut self.mmap, self.layout.header_offset)
     }
-
-    fn routes_mut(&mut self) -> Option<&mut [StaticRouteEntry]> {
-        let offset = self.layout.static_offset;
-        slice_mut::<StaticRouteEntry>(&mut self.mmap, offset, MAX_STATIC_ROUTES as usize)
-    }
-
-    fn vpns_mut(&mut self) -> Option<&mut [VpnAssignment]> {
-        let offset = self.layout.vpn_offset;
-        slice_mut::<VpnAssignment>(&mut self.mmap, offset, MAX_VPN_ASSIGNMENTS as usize)
-    }
 }
 
 impl ConfigRegionReader {
@@ -1191,11 +1157,7 @@ impl ConfigRegionReader {
         validate_name(name)?;
         let layout = layout_config();
         let mmap = open_read_only_region(name, layout.total_len)?;
-        Ok(Self {
-            name: name.to_string(),
-            mmap,
-            layout,
-        })
+        Ok(Self { mmap, layout })
     }
 
     pub fn read_snapshot(&self) -> Option<ConfigSnapshot> {
@@ -1227,11 +1189,7 @@ impl LsaRegionWriter {
             initialize_lsa_header(mmap, gateway_uuid, hive_id);
         })?;
         normalize_seq_header::<LsaHeader>(&mut mmap, layout.header_offset, "lsa shm")?;
-        Ok(Self {
-            name: name.to_string(),
-            mmap,
-            layout,
-        })
+        Ok(Self { mmap, layout })
     }
 
     pub fn read_snapshot(&self) -> Option<LsaSnapshot> {
@@ -1344,26 +1302,6 @@ impl LsaRegionWriter {
     fn header_mut(&mut self) -> Option<&mut LsaHeader> {
         header_mut::<LsaHeader>(&mut self.mmap, self.layout.header_offset)
     }
-
-    fn hives_mut(&mut self) -> Option<&mut [RemoteHiveEntry]> {
-        let offset = self.layout.hive_offset;
-        slice_mut::<RemoteHiveEntry>(&mut self.mmap, offset, MAX_REMOTE_HIVES as usize)
-    }
-
-    fn remote_nodes_mut(&mut self) -> Option<&mut [RemoteNodeEntry]> {
-        let offset = self.layout.remote_node_offset;
-        slice_mut::<RemoteNodeEntry>(&mut self.mmap, offset, MAX_REMOTE_NODES as usize)
-    }
-
-    fn remote_routes_mut(&mut self) -> Option<&mut [RemoteRouteEntry]> {
-        let offset = self.layout.remote_route_offset;
-        slice_mut::<RemoteRouteEntry>(&mut self.mmap, offset, MAX_REMOTE_ROUTES as usize)
-    }
-
-    fn remote_vpns_mut(&mut self) -> Option<&mut [RemoteVpnEntry]> {
-        let offset = self.layout.remote_vpn_offset;
-        slice_mut::<RemoteVpnEntry>(&mut self.mmap, offset, MAX_REMOTE_VPNS as usize)
-    }
 }
 
 impl LsaRegionReader {
@@ -1371,11 +1309,7 @@ impl LsaRegionReader {
         validate_name(name)?;
         let layout = layout_lsa();
         let mmap = open_read_only_region(name, layout.total_len)?;
-        Ok(Self {
-            name: name.to_string(),
-            mmap,
-            layout,
-        })
+        Ok(Self { mmap, layout })
     }
 
     pub fn read_snapshot(&self) -> Option<LsaSnapshot> {
@@ -1400,10 +1334,7 @@ impl OpaRegionWriter {
             initialize_opa_header(mmap, owner_uuid);
         })?;
         normalize_seq_header::<OpaHeader>(&mut mmap, 0, "opa shm")?;
-        Ok(Self {
-            name: name.to_string(),
-            mmap,
-        })
+        Ok(Self { mmap })
     }
 
     pub fn read_snapshot(&self) -> Option<OpaSnapshot> {
@@ -1469,10 +1400,7 @@ impl OpaRegionReader {
     pub fn open_read_only(name: &str) -> Result<Self, ShmError> {
         validate_name(name)?;
         let mmap = open_read_only_opa_region(name)?;
-        Ok(Self {
-            name: name.to_string(),
-            mmap,
-        })
+        Ok(Self { mmap })
     }
 
     pub fn read_snapshot(&self) -> Option<OpaSnapshot> {
@@ -1504,11 +1432,7 @@ impl IdentityRegionWriter {
             initialize_identity_header(mmap, owner_uuid, hive_id, is_primary, limits);
         })?;
         normalize_seq_header::<IdentityHeader>(&mut mmap, layout.header_offset, "identity shm")?;
-        Ok(Self {
-            name: name.to_string(),
-            mmap,
-            layout,
-        })
+        Ok(Self { mmap, layout })
     }
 
     pub fn read_snapshot(&self) -> Option<IdentitySnapshot> {
@@ -1881,14 +1805,16 @@ impl IdentityRegionWriter {
                     if channel_type.is_empty() || address.is_empty() {
                         continue;
                     }
+                    // Keyed by the channel's scope, which the channel entry carries; the ILK
+                    // entry carries the tenant it is charged to (docs/ilk-tenant-model-v1.md).
                     let inserted = upsert_ich_mapping_entry(
                         mappings,
-                        compute_ich_hash(&channel_type, &address, ilk.tenant_id),
+                        compute_ich_hash(&channel_type, &address, entry.tenant_id),
                         &channel_type,
                         &address,
                         entry.ich_id,
                         entry.ilk_id,
-                        ilk.tenant_id,
+                        entry.tenant_id,
                     )?;
                     if inserted {
                         header.ich_mapping_count = header.ich_mapping_count.saturating_add(1);
@@ -2040,11 +1966,7 @@ impl IdentityRegionReader {
         validate_name(name)?;
         let layout = layout_identity(limits);
         let mmap = open_read_only_region(name, layout.total_len)?;
-        Ok(Self {
-            name: name.to_string(),
-            mmap,
-            layout,
-        })
+        Ok(Self { mmap, layout })
     }
 
     /// Opens the identity region by discovering limits from the SHM header.
@@ -2084,11 +2006,7 @@ impl IdentityRegionReader {
         if layout.total_len > stat.st_size as usize {
             return Err(ShmError::InvalidHeader);
         }
-        Ok(Self {
-            name: name.to_string(),
-            mmap,
-            layout,
-        })
+        Ok(Self { mmap, layout })
     }
 
     pub fn read_snapshot(&self) -> Option<IdentitySnapshot> {
@@ -2135,11 +2053,7 @@ impl MemoryRegionWriter {
             initialize_memory_header(mmap, owner_uuid, hive_id);
         })?;
         normalize_seq_header::<MemoryHeader>(&mut mmap, layout.header_offset, "memory shm")?;
-        Ok(Self {
-            name: name.to_string(),
-            mmap,
-            layout,
-        })
+        Ok(Self { mmap, layout })
     }
 
     pub fn read_snapshot(&self) -> Result<MemoryShmSnapshot, ShmError> {
@@ -2190,11 +2104,7 @@ impl MemoryRegionReader {
         validate_name(name)?;
         let layout = layout_memory();
         let mmap = open_read_only_region(name, layout.total_len)?;
-        Ok(Self {
-            name: name.to_string(),
-            mmap,
-            layout,
-        })
+        Ok(Self { mmap, layout })
     }
 
     pub fn read_snapshot(&self) -> Result<MemoryShmSnapshot, ShmError> {
@@ -2466,8 +2376,7 @@ fn layout_identity(limits: IdentityRegionLimits) -> IdentityRegionLayout {
     let ich_mapping_offset = align_up(ich_offset + ich_size, REGION_ALIGNMENT);
     let ilk_alias_offset = align_up(ich_mapping_offset + mapping_size, REGION_ALIGNMENT);
     let vocabulary_offset = align_up(ilk_alias_offset + alias_size, REGION_ALIGNMENT);
-    let variable_offset = align_up(vocabulary_offset + vocabulary_size, REGION_ALIGNMENT);
-    let total_len = variable_offset;
+    let total_len = align_up(vocabulary_offset + vocabulary_size, REGION_ALIGNMENT);
 
     IdentityRegionLayout {
         header_offset,
@@ -2477,7 +2386,6 @@ fn layout_identity(limits: IdentityRegionLimits) -> IdentityRegionLayout {
         ich_mapping_offset,
         ilk_alias_offset,
         vocabulary_offset,
-        variable_offset,
         total_len,
         limits,
     }
@@ -2828,9 +2736,16 @@ fn read_router_snapshot(
         atomic::fence(Ordering::Acquire);
         let node_count = header.node_count as usize;
         let nodes = read_slice::<NodeEntry>(mmap, layout.node_offset, MAX_NODES as usize)?;
-        let mut snapshot = Vec::new();
-        for node in nodes.iter().take(node_count) {
-            snapshot.push(*node);
+        // The active nodes, wherever their slots are: unregistering leaves holes, so the first
+        // `node_count` slots can hold deleted entries and miss the last nodes.
+        let mut snapshot = Vec::with_capacity(node_count);
+        for node in nodes.iter() {
+            if snapshot.len() >= node_count {
+                break;
+            }
+            if node.flags & FLAG_ACTIVE != 0 {
+                snapshot.push(*node);
+            }
         }
         atomic::fence(Ordering::Acquire);
         let s2 = header.seq.load(Ordering::Acquire);
@@ -3275,15 +3190,6 @@ fn read_slice<T: Copy>(mmap: &[u8], offset: usize, len: usize) -> Option<&[T]> {
         return None;
     }
     Some(unsafe { std::slice::from_raw_parts(ptr, len) })
-}
-
-fn slice_mut<T: Copy>(mmap: &mut MmapMut, offset: usize, len: usize) -> Option<&mut [T]> {
-    let bytes = len.checked_mul(size_of::<T>())?;
-    if offset + bytes > mmap.len() {
-        return None;
-    }
-    let ptr = mmap.as_mut_ptr().wrapping_add(offset) as *mut T;
-    Some(unsafe { std::slice::from_raw_parts_mut(ptr, len) })
 }
 
 fn header_ref<T>(mmap: &[u8], offset: usize) -> Option<&T> {
@@ -4026,6 +3932,8 @@ mod tests {
             updated_at: 123,
             threads: vec![MemoryShmThreadEntry {
                 thread_id: "thread:sha256:test".to_string(),
+                agent_ilk: "ilk:agent".to_string(),
+                agent_node: "AI.test@sandbox".to_string(),
                 package: MemoryPackage {
                     package_version: 2,
                     thread_id: "thread:sha256:test".to_string(),
@@ -4498,6 +4406,75 @@ mod tests {
             writer.resolve_ich_mapping("whatsapp", "+549111111", [0u8; 16]),
             None
         );
+
+        cleanup_shm(&name);
+    }
+
+    fn router_region_for_test(prefix: &str) -> (String, RouterRegionWriter) {
+        let name = format!("/{prefix}-{}", &Uuid::new_v4().simple().to_string()[..8]);
+        cleanup_shm(&name);
+        let writer = RouterRegionWriter::open_or_create(
+            &name,
+            Uuid::new_v4(),
+            "sandbox",
+            "RT.test@sandbox",
+            true,
+        )
+        .expect("open router region");
+        (name, writer)
+    }
+
+    fn router_node_names(writer: &RouterRegionWriter) -> Vec<String> {
+        let snapshot = writer.read_snapshot().expect("router snapshot");
+        assert_eq!(snapshot.header.node_count as usize, snapshot.nodes.len());
+        snapshot
+            .nodes
+            .iter()
+            .map(|node| read_string(&node.name, node.name_len as usize))
+            .collect()
+    }
+
+    #[test]
+    fn router_snapshot_lists_the_nodes_past_a_hole() {
+        let (name, mut writer) = router_region_for_test("jsr-hole");
+        let (a, b, c) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+        writer
+            .register_node(a, "IO.a@sandbox", 0, 1)
+            .expect("register a");
+        writer
+            .register_node(b, "IO.b@sandbox", 0, 2)
+            .expect("register b");
+        writer
+            .register_node(c, "IO.c@sandbox", 0, 3)
+            .expect("register c");
+        // a's slot, the first one, is now a hole before b and c.
+        writer.unregister_node(a).expect("unregister a");
+
+        assert_eq!(router_node_names(&writer), ["IO.b@sandbox", "IO.c@sandbox"]);
+
+        cleanup_shm(&name);
+    }
+
+    #[test]
+    fn a_node_registered_again_keeps_its_one_slot() {
+        let (name, mut writer) = router_region_for_test("jsr-again");
+        let (a, b) = (Uuid::new_v4(), Uuid::new_v4());
+        writer
+            .register_node(a, "IO.a@sandbox", 0, 1)
+            .expect("register a");
+        writer
+            .register_node(b, "IO.b@sandbox", 0, 2)
+            .expect("register b");
+        writer.unregister_node(a).expect("unregister a");
+        // b reconnects: the free slot a left comes before b's own.
+        writer
+            .register_node(b, "IO.b@sandbox", 0, 3)
+            .expect("register b again");
+
+        assert_eq!(router_node_names(&writer), ["IO.b@sandbox"]);
+        // When b leaves, no copy of it stays behind.
+        writer.unregister_node(b).expect("unregister b");
+        assert!(router_node_names(&writer).is_empty());
 
         cleanup_shm(&name);
     }

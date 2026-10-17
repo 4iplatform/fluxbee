@@ -65,7 +65,7 @@ That older model was only partially implemented. `SY.identity` can currently acc
 For this implementation:
 
 - `identity_ilks.definition` becomes the cognitive definition document shown below.
-- Legacy `roles` and `capabilities` in `ILK_REGISTER` / `ILK_UPDATE` are removed or ignored during this alpha cleanup.
+- Legacy `roles` and `capabilities` in `ILK_REGISTER` / `ILK_UPDATE` are removed: SY.identity rejects them as unknown fields (`INVALID_REQUEST`). The controlled vocabulary of `10-identity-v2.md` §8 goes with them (superseded, never implemented).
 - OPA/routing consumes the new hash facts projected from SHM.
 - `behavior.capabilities.*` in AI node config remains operational runtime config and is unrelated to identity cognitive definition.
 

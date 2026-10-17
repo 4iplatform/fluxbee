@@ -12,9 +12,6 @@ const DEFAULT_DEAD_INTERVAL_MS: u64 = 40_000;
 const DEFAULT_HEARTBEAT_INTERVAL_MS: u64 = 5_000;
 const DEFAULT_HEARTBEAT_STALE_MS: u64 = 30_000;
 const DEFAULT_HIVE_ROLE: &str = "worker";
-const DEFAULT_NATS_MODE: &str = "embedded";
-const DEFAULT_NATS_PORT: u16 = 4222;
-const DEFAULT_NATS_STORAGE_DIR: &str = "/var/lib/fluxbee/nats";
 const DEFAULT_BLOB_ENABLED: bool = true;
 const DEFAULT_BLOB_PATH: &str = "/var/lib/fluxbee/blob";
 const DEFAULT_BLOB_SYNC_ENABLED: bool = false;
@@ -63,10 +60,6 @@ pub struct RouterConfig {
     /// cert.key) — `/var/lib/fluxbee/tls/<hive_id>`.
     pub tls_dir: PathBuf,
     pub hive_role: String,
-    pub nats_mode: String,
-    pub nats_port: u16,
-    pub nats_url: String,
-    pub nats_storage_dir: PathBuf,
     pub blob_enabled: bool,
     pub blob_path: PathBuf,
     pub blob_sync_enabled: bool,
@@ -82,7 +75,6 @@ struct HiveFile {
     hive_id: String,
     role: Option<String>,
     wan: Option<WanSection>,
-    nats: Option<NatsSection>,
     blob: Option<BlobSection>,
     government: Option<GovernmentSection>,
     ai: Option<HiveAiConfig>,
@@ -109,14 +101,6 @@ struct WanUplink {
 }
 
 #[derive(Debug, Deserialize)]
-struct NatsSection {
-    mode: Option<String>,
-    port: Option<u16>,
-    url: Option<String>,
-    storage_dir: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
 struct BlobSection {
     enabled: Option<bool>,
     path: Option<String>,
@@ -134,19 +118,12 @@ struct BlobSyncSection {
 #[derive(Debug, Deserialize)]
 struct IdentityFile {
     layer1: IdentityLayer1,
-    layer2: IdentityLayer2,
     shm: IdentityShm,
-    created_at: String,
 }
 
 #[derive(Debug, Deserialize)]
 struct IdentityLayer1 {
     uuid: String,
-}
-
-#[derive(Debug, Deserialize)]
-struct IdentityLayer2 {
-    name: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -169,10 +146,6 @@ impl RouterConfig {
         let mut wan_authorized_hives = Vec::new();
         let mut wan_mtls_mode = "disabled".to_string();
         let mut hive_role = DEFAULT_HIVE_ROLE.to_string();
-        let mut nats_mode = DEFAULT_NATS_MODE.to_string();
-        let mut nats_port = DEFAULT_NATS_PORT;
-        let mut nats_url = String::new();
-        let mut nats_storage_dir = PathBuf::from(DEFAULT_NATS_STORAGE_DIR);
         let mut blob_enabled = DEFAULT_BLOB_ENABLED;
         let mut blob_path = PathBuf::from(DEFAULT_BLOB_PATH);
         let mut blob_sync_enabled = DEFAULT_BLOB_SYNC_ENABLED;
@@ -223,29 +196,6 @@ impl RouterConfig {
                 }
             }
         }
-        if let Some(nats) = hive.nats {
-            if let Some(mode) = nats.mode {
-                let mode = mode.trim().to_ascii_lowercase();
-                if !mode.is_empty() {
-                    nats_mode = mode;
-                }
-            }
-            if let Some(port) = nats.port {
-                nats_port = port;
-            }
-            if let Some(url) = nats.url {
-                let url = url.trim().to_string();
-                if !url.is_empty() {
-                    nats_url = url;
-                }
-            }
-            if let Some(storage_dir) = nats.storage_dir {
-                let storage_dir = storage_dir.trim();
-                if !storage_dir.is_empty() {
-                    nats_storage_dir = PathBuf::from(storage_dir);
-                }
-            }
-        }
         if let Some(blob) = hive.blob {
             if let Some(enabled) = blob.enabled {
                 blob_enabled = enabled;
@@ -289,9 +239,6 @@ impl RouterConfig {
                 }
             }
         }
-        if nats_url.is_empty() {
-            nats_url = format!("nats://127.0.0.1:{nats_port}");
-        }
 
         let router_name = std::env::var("JSR_ROUTER_NAME").unwrap_or_else(|_| gateway_name.clone());
         let is_gateway = is_gateway_name(&router_name, &gateway_name);
@@ -334,10 +281,6 @@ impl RouterConfig {
             wan_mtls_mode,
             tls_dir,
             hive_role,
-            nats_mode,
-            nats_port,
-            nats_url,
-            nats_storage_dir,
             blob_enabled,
             blob_path,
             blob_sync_enabled,

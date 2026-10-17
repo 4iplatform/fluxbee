@@ -22,8 +22,10 @@ Options:
                                SYSTEM_UPDATE scope (default: targeted)
   --tenant-id <id>             Tenant ID for spawn identity registration (required in some hives)
   --config-json <file>         JSON file with spawn config object
-  --app-token <xapp-...>       Convenience: build spawn config with inline Slack app token
-  --bot-token <xoxb-...>       Convenience: build spawn config with inline Slack bot token
+  --vault-key <clave>          SY.vault key holding {app_token, bot_token} (REQUIRED to spawn)
+  --workspace-id <T...>        Slack workspace/team id  (REQUIRED)
+  --conversation-id <C...>     Slack channel id         (REQUIRED)
+  --app-token / --bot-token    REMOVED: tokens go to the vault, never into the node config
   --identity-target <name>     Convenience: add identity_target to spawn config
   --identity-timeout-ms <ms>   Convenience: add identity_timeout_ms to spawn config
   --spawn                      Force spawn step (requires --node-name and config source)
@@ -65,6 +67,9 @@ NODE_NAME=""
 CONFIG_JSON=""
 APP_TOKEN=""
 BOT_TOKEN=""
+VAULT_KEY=""
+WORKSPACE_ID=""
+CONVERSATION_ID=""
 IDENTITY_TARGET=""
 IDENTITY_TIMEOUT_MS=""
 DO_SPAWN=0
@@ -94,6 +99,9 @@ while [[ $# -gt 0 ]]; do
     --config-json) CONFIG_JSON="${2:-}"; shift 2 ;;
     --app-token) APP_TOKEN="${2:-}"; shift 2 ;;
     --bot-token) BOT_TOKEN="${2:-}"; shift 2 ;;
+    --vault-key) VAULT_KEY="${2:-}"; shift 2 ;;
+    --workspace-id) WORKSPACE_ID="${2:-}"; shift 2 ;;
+    --conversation-id) CONVERSATION_ID="${2:-}"; shift 2 ;;
     --identity-target) IDENTITY_TARGET="${2:-}"; shift 2 ;;
     --identity-timeout-ms) IDENTITY_TIMEOUT_MS="${2:-}"; shift 2 ;;
     --spawn) DO_SPAWN=1; shift ;;
@@ -219,8 +227,25 @@ build_spawn_config_json() {
     return
   fi
 
-  if [[ -z "$APP_TOKEN" || -z "$BOT_TOKEN" ]]; then
-    echo "Error: spawn requires either --config-json or both --app-token and --bot-token" >&2
+  # io.slack NO acepta tokens inline. El contrato es una REFERENCIA al vault:
+  # slack.auth.type debe ser "vault_ref" (nodes/io/common/src/io_slack_adapter_config.rs).
+  # Mandar los tokens dentro del config deja el nodo en FAILED_CONFIG — que es exactamente
+  # lo que hacia este script antes de este arreglo, y por eso no habia forma de desplegarlo.
+  if [[ -n "$APP_TOKEN" || -n "$BOT_TOKEN" ]]; then
+    echo "Error: --app-token/--bot-token ya no se usan: los tokens van al VAULT, no al config." >&2
+    echo "       Cargalos y pasa la clave con --vault-key." >&2
+    exit 1
+  fi
+  if [[ -z "$VAULT_KEY" ]]; then
+    echo "Error: spawn requires --vault-key (la clave de SY.vault con {app_token, bot_token})" >&2
+    echo "       Cargala primero:  POST /hives/<hive>/vault/secrets" >&2
+    echo "         key=<clave>  value={app_token, bot_token}" >&2
+    echo "         metadata={resource_type:slack, owner_node:IO.slack.<label>@<hive>}" >&2
+    echo "       ...o dejaselo a Fluxbee Cloud via put_token." >&2
+    exit 1
+  fi
+  if [[ -z "$WORKSPACE_ID" || -z "$CONVERSATION_ID" ]]; then
+    echo "Error: spawn requires --workspace-id y --conversation-id (el nodo los exige)" >&2
     exit 1
   fi
 
@@ -229,9 +254,16 @@ import json
 
 cfg = {
     "slack": {
-        "app_token": "${APP_TOKEN}",
-        "bot_token": "${BOT_TOKEN}",
-    }
+        "auth": {
+            "type": "vault_ref",
+            "resource_type": "slack",
+            "key": "${VAULT_KEY}",
+        }
+    },
+    "io": {
+        "workspace_id": "${WORKSPACE_ID}",
+        "conversation_id": "${CONVERSATION_ID}",
+    },
 }
 
 if "${IDENTITY_TARGET}":

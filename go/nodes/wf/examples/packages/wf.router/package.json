@@ -1,0 +1,8 @@
+{
+  "name": "wf.router",
+  "version": "0.0.4",
+  "type": "workflow",
+  "description": "Ingress host/specialist router: accepts a text/v1 relay from an IO node, triages via a host AI, dynamically escalates to a specialist AI, and replies back to the originating IO node.",
+  "runtime_base": "wf.engine",
+  "config_template": "config/default-config.json"
+}

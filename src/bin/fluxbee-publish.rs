@@ -1,18 +1,12 @@
 use std::error::Error;
 use std::fs;
-use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::path::PathBuf;
 use std::process::Command;
 
-use json_router::runtime_manifest::{
-    load_runtime_manifest_from_paths, write_runtime_manifest_file_atomic, RuntimeManifest,
-    RuntimeManifestEntry,
-};
 use json_router::runtime_package::{
-    build_dry_run_plan, install_validated_package, package_type_label,
-    update_runtime_manifest_with_package, validate_package, PackageMetadata, PackageType,
-    ValidatedPackage, DIST_RUNTIME_MANIFEST_PATH, DIST_RUNTIME_ROOT_DIR,
+    build_dry_run_plan, install_validated_package, package_type_label, validate_package,
+    DIST_RUNTIME_MANIFEST_PATH, DIST_RUNTIME_ROOT_DIR,
 };
 use sha2::{Digest, Sha256};
 
@@ -439,6 +433,14 @@ fn main() -> Result<(), CliError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use json_router::runtime_manifest::{
+        load_runtime_manifest_from_paths, write_runtime_manifest_file_atomic, RuntimeManifest,
+        RuntimeManifestEntry,
+    };
+    use json_router::runtime_package::{
+        update_runtime_manifest_with_package, PackageMetadata, PackageType, ValidatedPackage,
+    };
+    use std::os::unix::fs::PermissionsExt;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     fn test_temp_dir(prefix: &str) -> PathBuf {

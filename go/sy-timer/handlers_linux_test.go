@@ -96,7 +96,14 @@ func TestRespondTimerGetAllowsReadingForeignTimer(t *testing.T) {
 	if err := service.respondTimerGet(msg); err != nil {
 		t.Fatalf("get timer: %v", err)
 	}
-	response := mustReadTimerResponse(t, tx)
+	// TIMER_GET answers {ok, verb, timer}: decoded the way the SDK's TimerClient.Get decodes it.
+	var response struct {
+		OK    bool                  `json:"ok"`
+		Timer *fluxbeesdk.TimerInfo `json:"timer"`
+	}
+	if err := json.Unmarshal(mustReadResponsePayload(t, tx), &response); err != nil {
+		t.Fatalf("decode get response: %v", err)
+	}
 	if !response.OK || response.Timer == nil || response.Timer.UUID != "timer-1" {
 		t.Fatalf("unexpected get response: %+v", response)
 	}
@@ -161,9 +168,8 @@ func TestRespondTimerScheduleReturnsExistingPendingTimerByClientRef(t *testing.T
 	if *first.TimerUUID != *second.TimerUUID {
 		t.Fatalf("expected idempotent schedule to reuse timer uuid: first=%s second=%s", *first.TimerUUID, *second.TimerUUID)
 	}
-	alreadyExisted, ok := second.Extra["already_existed"].(bool)
-	if !ok || !alreadyExisted {
-		t.Fatalf("expected already_existed=true, got %+v", second.Extra)
+	if second.AlreadyExisted == nil || !*second.AlreadyExisted {
+		t.Fatalf("expected already_existed=true, got %+v", second)
 	}
 }
 
@@ -240,9 +246,8 @@ func TestRespondTimerCancelByClientRefReturnsFoundFalseWhenMissing(t *testing.T)
 	if !response.OK {
 		t.Fatalf("unexpected cancel missing response: %+v", response)
 	}
-	found, ok := response.Extra["found"].(bool)
-	if !ok || found {
-		t.Fatalf("expected found=false, got %+v", response.Extra)
+	if response.Found == nil || *response.Found {
+		t.Fatalf("expected found=false, got %+v", response)
 	}
 }
 
@@ -484,9 +489,8 @@ func TestRespondTimerCancelByClientRefDoesNotAffectOtherOwner(t *testing.T) {
 	if !response.OK {
 		t.Fatalf("unexpected foreign cancel response: %+v", response)
 	}
-	found, ok := response.Extra["found"].(bool)
-	if !ok || found {
-		t.Fatalf("expected found=false, got %+v", response.Extra)
+	if response.Found == nil || *response.Found {
+		t.Fatalf("expected found=false, got %+v", response)
 	}
 	row, err := getTimer(context.Background(), service.db, "timer-owned")
 	if err != nil {
@@ -840,9 +844,22 @@ func mustReadTimerResponse(t *testing.T, tx chan []byte) *fluxbeesdk.TimerRespon
 	return &response
 }
 
+// mustReadSentFrame returns the next frame the service sent, and fails the test instead of hanging
+// the package when nothing comes.
+func mustReadSentFrame(t *testing.T, tx chan []byte) []byte {
+	t.Helper()
+	select {
+	case frame := <-tx:
+		return frame
+	case <-time.After(5 * time.Second):
+		t.Fatal("the service sent nothing within 5 s")
+		return nil
+	}
+}
+
 func mustReadResponsePayload(t *testing.T, tx chan []byte) []byte {
 	t.Helper()
-	frame := <-tx
+	frame := mustReadSentFrame(t, tx)
 	var msg fluxbeesdk.Message
 	if err := json.Unmarshal(frame, &msg); err != nil {
 		t.Fatalf("decode sent message: %v", err)

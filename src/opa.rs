@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 
 use serde_json::Value;
-use wasmtime::{Caller, Engine, Instance, Linker, Memory, Module, Store, TypedFunc};
+use wasmtime::{Caller, Engine, Linker, Memory, Module, Store, TypedFunc};
 
 use fluxbee_sdk::protocol::Message;
 
@@ -48,7 +48,6 @@ struct OpaRuntimeState {
 
 struct OpaWasm {
     store: Store<OpaRuntimeState>,
-    instance: Instance,
     memory: Memory,
     entrypoints: HashMap<String, i32>,
     opa_malloc: TypedFunc<i32, i32>,
@@ -81,11 +80,13 @@ impl OpaDumpSource {
 }
 
 impl OpaResolver {
+    /// No user policy: the state a fresh install and a clear (`unload`) share, so a router reports
+    /// the same `ok` for both (it used to start in `error`; FINDINGS A-21).
     pub fn new() -> Self {
         Self {
             policy_loaded: false,
             policy_version: 0,
-            opa_load_status: OPA_STATUS_ERROR,
+            opa_load_status: OPA_STATUS_OK,
             logged_missing: false,
             entrypoint: None,
             base_data_bundle: None,
@@ -165,6 +166,25 @@ impl OpaResolver {
 
     pub fn status(&self) -> (u64, u8) {
         (self.policy_version, self.opa_load_status)
+    }
+
+    /// Drop the USER policy (SY.opa.rules cleared it with `opa_clear`): back to the state of a
+    /// fresh install, where routing runs without user OPA. Never used for the SYSTEM authority
+    /// policy, which lives in its own resolver (router/system_policy.rs).
+    pub fn unload(&mut self) {
+        self.module = None;
+        self.wasm = None;
+        self.policy_loaded = false;
+        self.policy_version = 0;
+        self.entrypoint = None;
+        self.base_data_bundle = None;
+        self.opa_load_status = OPA_STATUS_OK;
+        self.logged_missing = false;
+        tracing::info!("opa user policy unloaded (cleared by SY.opa.rules)");
+    }
+
+    pub fn has_policy(&self) -> bool {
+        self.policy_loaded
     }
 
     /// Run the loaded policy for `input` and return the raw result JSON + its dump source.
@@ -532,7 +552,6 @@ impl OpaWasm {
 
         let mut out = Self {
             store,
-            instance,
             memory,
             entrypoints,
             opa_malloc,
@@ -1379,75 +1398,28 @@ fn json_to_opa_value(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn unload_returns_to_the_no_user_policy_state() {
+        let mut resolver = super::OpaResolver::new();
+        resolver.unload();
+        assert!(!resolver.has_policy());
+        assert_eq!(resolver.status(), (0, crate::shm::OPA_STATUS_OK));
+    }
+
+    /// A router that starts without a user policy reports what one does after a clear.
+    #[test]
+    fn a_new_resolver_reports_no_policy_like_a_cleared_one() {
+        let fresh = super::OpaResolver::new();
+        let mut cleared = super::OpaResolver::new();
+        cleared.unload();
+        assert!(!fresh.has_policy());
+        assert_eq!(fresh.status(), cleared.status());
+    }
+
     use super::{
         build_opa_input, merge_opa_data, parse_target_from_result, OpaDumpSource, OpaError,
     };
     use fluxbee_sdk::protocol::{Destination, Message, Meta, Routing, SYSTEM_KIND};
-
-    #[test]
-    fn system_opa_allow_matches_rust_authority_shadow() {
-        // Shadow-verify: the compiled SYSTEM policy (policy/system.wasm ← policy/system.rego)
-        // must produce the SAME allow/deny as the Rust system_policy::authority() table across a
-        // matrix of protected actions × origin names × hives. This byte-identity proof is what
-        // gates swapping authority()'s backing to OPA.
-        use super::OpaResolver;
-        use crate::router::system_policy::authority;
-
-        const WASM: &[u8] = include_bytes!("../policy/system.wasm");
-        let mut resolver = OpaResolver::new();
-        resolver
-            .reload(1, Some("fluxbee/system/allow".to_string()), WASM, None)
-            .expect("load system.wasm");
-
-        let actions = [
-            "EDGE_OPEN_URL",
-            "EDGE_CLOSE_URL",
-            "EDGE_LIST_URLS",
-            "EDGE_PUBLISH_BLOB",
-            "EDGE_UNPUBLISH_BLOB",
-            "SPAWN_NODE",
-            "KILL_NODE",
-            "NODE_STATUS_GET",
-            "NODE_CONFIG_SET",
-            "ADD_HIVE_FINALIZE",
-            "SYSTEM_UPDATE",
-        ];
-        let names: [Option<&str>; 14] = [
-            Some("SY.admin@motherbee"),
-            Some("SY.admin@worker1"),
-            Some("SY.admin@edge-1"),
-            Some("SY.orchestrator@motherbee"),
-            Some("SY.orchestrator@worker1"),
-            Some("SY.orchestrator@"),
-            Some("SY.wf-rules@motherbee"),
-            Some("WF.orch.diag@motherbee"),
-            Some("SY.config-routes@motherbee"),
-            Some("SY.vault@motherbee"),
-            Some("IO.cloud@motherbee"),
-            Some("  SY.admin@motherbee  "),
-            Some(""),
-            None,
-        ];
-        let hives = ["motherbee", "ingress1"];
-
-        for action in actions {
-            for name in names {
-                for hive in hives {
-                    let rust = authority(action, name, hive);
-                    let input = serde_json::json!({
-                        "action": action,
-                        "src_l2_name": name,
-                        "hive_id": hive,
-                    });
-                    let opa = resolver.evaluate_allow(&input, None).expect("eval allow");
-                    assert_eq!(
-                        opa, rust,
-                        "OPA/authority mismatch: action={action} name={name:?} hive={hive} (opa={opa} rust={rust})"
-                    );
-                }
-            }
-        }
-    }
 
     #[test]
     fn build_opa_input_golden_shape_is_additive() {
@@ -1455,7 +1427,7 @@ mod tests {
             routing: Routing {
                 src: "uuid-123".to_string(),
                 src_l2_name: Some("SY.orchestrator@motherbee".to_string()),
-                dst: Destination::Unicast("SY.policy@motherbee".to_string()),
+                dst: Destination::Unicast("SY.storage@motherbee".to_string()),
                 ttl: 16,
                 trace_id: "t".to_string(),
             },

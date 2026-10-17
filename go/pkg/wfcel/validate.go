@@ -112,13 +112,24 @@ func ValidateDefinition(def *WorkflowDefinition, clock ClockFunc) ValidationErro
 	if _, ok := stateIndex[def.InitialState]; !ok {
 		errs = append(errs, ValidationError{Path: "initial_state", Message: "must reference an existing state"})
 	}
+	terminalSet := make(map[string]bool, len(def.TerminalStates))
 	for i, name := range def.TerminalStates {
+		terminalSet[name] = true
 		if _, ok := stateIndex[name]; !ok {
 			errs = append(errs, ValidationError{
 				Path:    fmt.Sprintf("terminal_states[%d]", i),
 				Message: "must reference an existing state",
 			})
 		}
+	}
+	// gap-2: "failed" is the reserved error-sink state name routeToFailed drives an instance into on a
+	// fatal action failure (terminating it). If a definition declares a state named "failed" it MUST be
+	// terminal, so the reservation can never silently hijack an author's non-terminal "failed" state.
+	if _, ok := stateIndex["failed"]; ok && !terminalSet["failed"] {
+		errs = append(errs, ValidationError{
+			Path:    "states",
+			Message: `a state named "failed" is reserved as the fatal-error sink and must be listed in terminal_states`,
+		})
 	}
 	for i, state := range def.States {
 		for j, transition := range state.Transitions {
@@ -169,6 +180,36 @@ func IsValidL2Name(value string) bool {
 	return l2NamePattern.MatchString(strings.TrimSpace(value))
 }
 
+// IsForbiddenSystemTarget reports whether an L2 name is a SY.* / RT.* system/router node — which a WF
+// send_message must never target (those names bypass VPN isolation at the router). Exported so the
+// runtime send path can re-block a dynamically-resolved target, not just publish-time validation.
+func IsForbiddenSystemTarget(name string) bool {
+	// Case-INSENSITIVE: block "sy.vault" / "rt.gateway" evasion attempts too. (Node-name casing is not
+	// a reliable isolation boundary, so do not let a lowercased system name slip through.)
+	n := strings.ToUpper(strings.TrimSpace(name))
+	return strings.HasPrefix(n, "SY.") || strings.HasPrefix(n, "RT.")
+}
+
+// isValidRefPath reports whether s is a well-formed $ref dot-path rooted at state/input/event with at
+// least one field (e.g. "state.chosen_target") — the form a dynamic target_ref is resolved against.
+func isValidRefPath(s string) bool {
+	parts := strings.Split(strings.TrimSpace(s), ".")
+	if len(parts) < 2 {
+		return false
+	}
+	switch parts[0] {
+	case "state", "input", "event":
+	default:
+		return false
+	}
+	for _, p := range parts {
+		if strings.TrimSpace(p) == "" {
+			return false
+		}
+	}
+	return true
+}
+
 func compileJSONSchema(schema map[string]any) (*jsonschema.Schema, error) {
 	data, err := json.Marshal(schema)
 	if err != nil {
@@ -195,16 +236,53 @@ func validateActions(path string, actions []ActionDefinition, clock ClockFunc) V
 
 func validateAction(path string, action ActionDefinition, clock ClockFunc) ValidationErrors {
 	var errs ValidationErrors
+	// gap-2: on_error, when present, must be a known policy.
+	if action.OnError != "" && action.OnError != OnErrorContinue && action.OnError != OnErrorFail {
+		errs = append(errs, ValidationError{Path: path + ".on_error", Message: `must be "continue" or "fail" when present`})
+	}
 	switch action.Type {
 	case "send_message":
-		if !IsValidL2Name(action.Target) {
-			errs = append(errs, ValidationError{Path: path + ".target", Message: "must be a valid L2 name"})
+		// Exactly one of target (static literal) / target_ref (dynamic $ref dot-path). A WF may NOT
+		// message SY.*/RT.* system nodes via send_message (that path bypasses VPN isolation in the
+		// router; timers use schedule_timer, not send_message). For a dynamic target the meta.type
+		// must be "user" so a runtime-computed destination can never emit a VPN-bypassing system frame;
+		// the resolved value is re-validated + SY./RT.-blocked again at send time (execSendMessage).
+		hasTarget := strings.TrimSpace(action.Target) != ""
+		hasTargetRef := strings.TrimSpace(action.TargetRef) != ""
+		switch {
+		case hasTarget && hasTargetRef:
+			errs = append(errs, ValidationError{Path: path + ".target", Message: "set exactly one of target or target_ref, not both"})
+		case !hasTarget && !hasTargetRef:
+			errs = append(errs, ValidationError{Path: path + ".target", Message: "must set target (static) or target_ref (dynamic)"})
+		case hasTarget:
+			if !IsValidL2Name(action.Target) {
+				errs = append(errs, ValidationError{Path: path + ".target", Message: "must be a valid L2 name"})
+			} else if IsForbiddenSystemTarget(action.Target) {
+				errs = append(errs, ValidationError{Path: path + ".target", Message: "must not target a SY.* / RT.* system node"})
+			}
+		case hasTargetRef:
+			if !isValidRefPath(action.TargetRef) {
+				errs = append(errs, ValidationError{Path: path + ".target_ref", Message: `must be a $ref dot-path rooted at state/input/event (e.g. "state.chosen_target")`})
+			}
+			if action.Meta == nil || action.Meta.Type != "user" {
+				errs = append(errs, ValidationError{Path: path + ".meta.type", Message: `must be "user" when target_ref (dynamic target) is set`})
+			}
+		}
+		// gap-5: thread_id_ref, when set, must be a well-formed $ref dot-path (resolved at send time to
+		// the external caller's thread_id for a terminal reply).
+		if strings.TrimSpace(action.ThreadIDRef) != "" && !isValidRefPath(action.ThreadIDRef) {
+			errs = append(errs, ValidationError{Path: path + ".thread_id_ref", Message: `must be a $ref dot-path rooted at state/input/event (e.g. "event.payload.thread_id")`})
 		}
 		if action.Meta == nil || strings.TrimSpace(action.Meta.Msg) == "" {
 			errs = append(errs, ValidationError{Path: path + ".meta.msg", Message: "must not be empty"})
 		}
 		if action.Meta != nil && action.Meta.Type != "" && action.Meta.Type != "system" && action.Meta.Type != "user" {
 			errs = append(errs, ValidationError{Path: path + ".meta.type", Message: `must be "system" or "user" when present`})
+		}
+		// gap-3: meta.context (used for response_envelope) is resolved like a payload — validate its
+		// $ref shape the same way so a bad ref is caught at publish, not silently dropped at send.
+		if action.Meta != nil && action.Meta.Context != nil {
+			errs = append(errs, validateRefPayload(path+".meta.context", action.Meta.Context)...)
 		}
 		errs = append(errs, validateRefPayload(path+".payload", action.Payload)...)
 	case "emit_internal_event":

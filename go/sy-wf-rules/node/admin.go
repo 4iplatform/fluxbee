@@ -16,10 +16,16 @@ const (
 	adminCommandMsg             = "ADMIN_COMMAND"
 	adminCommandResponseMsg     = "ADMIN_COMMAND_RESPONSE"
 	publishRuntimePackageAction = "publish_runtime_package"
+	removeRuntimeVersionAction  = "remove_runtime_version"
 )
 
 type adminClient interface {
 	PublishRuntimePackage(ctx context.Context, packageFiles map[string]string) (*PackagePublishResult, error)
+	// RemoveRuntimeVersion deletes one published version from the motherbee's dist and manifest.
+	RemoveRuntimeVersion(ctx context.Context, runtimeName, version string) error
+	// SyncRuntimes asks a hive's Syncthing to scan its runtimes folder now (sync_hint), and
+	// waits for the folder to settle when waitMs > 0.
+	SyncRuntimes(ctx context.Context, hive string, waitMs int) error
 }
 
 type adminActionError struct {
@@ -60,7 +66,8 @@ func newAdminClient(cfg NodeConfig, dispatcher *fluxbeesdk.RouterDispatcher) adm
 	}
 	return &l2AdminClient{
 		dispatcher: dispatcher,
-		targetNode: fmt.Sprintf("SY.admin@%s", cfg.HiveID),
+		// SY.admin runs only on the motherbee; a worker's SY.wf-rules publishes there too.
+		targetNode: fluxbeesdk.PrimaryAdminNode,
 		distRoot:   cfg.DistRuntimeRoot,
 	}
 }
@@ -76,7 +83,7 @@ func (c *l2AdminClient) PublishRuntimePackage(ctx context.Context, packageFiles 
 		},
 		"set_current": true,
 	}
-	response, err := c.request(ctx, params)
+	response, err := c.request(ctx, publishRuntimePackageAction, "", params)
 	if err != nil {
 		return nil, err
 	}
@@ -100,12 +107,49 @@ func (c *l2AdminClient) PublishRuntimePackage(ctx context.Context, packageFiles 
 	}, nil
 }
 
-func (c *l2AdminClient) request(ctx context.Context, params map[string]any) (map[string]any, error) {
+func (c *l2AdminClient) RemoveRuntimeVersion(ctx context.Context, runtimeName, version string) error {
+	if c == nil || c.dispatcher == nil {
+		return fmt.Errorf("admin client unavailable")
+	}
+	// The admin runs this on a hive's orchestrator: the dist being purged is the motherbee's.
+	_, err := c.request(ctx, removeRuntimeVersionAction, fluxbeesdk.PrimaryHiveID, map[string]any{
+		"runtime":         runtimeName,
+		"runtime_version": version,
+	})
+	return err
+}
+
+// runtimesFolderID is the Syncthing folder of dist/runtimes: sendonly on the motherbee, a
+// receive-only mirror on every worker.
+const runtimesFolderID = "fluxbee-dist-runtimes"
+
+func (c *l2AdminClient) SyncRuntimes(ctx context.Context, hive string, waitMs int) error {
+	if c == nil || c.dispatcher == nil {
+		return fmt.Errorf("admin client unavailable")
+	}
+	params := map[string]any{
+		"channel":       "dist",
+		"folder_id":     runtimesFolderID,
+		"wait_for_idle": waitMs > 0,
+		"timeout_ms":    max(waitMs, 1000),
+	}
+	callCtx, cancel := context.WithTimeout(ctx, time.Duration(max(waitMs, 1000))*time.Millisecond+adminRPCTimeout)
+	defer cancel()
+	_, err := c.requestWithTimeout(callCtx, "sync_hint", hive, params, time.Duration(max(waitMs, 1000))*time.Millisecond+adminRPCTimeout)
+	return err
+}
+
+func (c *l2AdminClient) request(ctx context.Context, action, target string, params map[string]any) (map[string]any, error) {
+	return c.requestWithTimeout(ctx, action, target, params, adminRPCTimeout)
+}
+
+func (c *l2AdminClient) requestWithTimeout(ctx context.Context, action, target string, params map[string]any, timeout time.Duration) (map[string]any, error) {
 	msg, err := c.dispatcher.SendAdminRPC(ctx, fluxbeesdk.AdminRpcRequest{
 		AdminTarget: c.targetNode,
-		Action:      publishRuntimePackageAction,
+		Action:      action,
+		Target:      target,
 		Params:      params,
-		Timeout:     adminRPCTimeout,
+		Timeout:     timeout,
 	})
 	if err != nil {
 		return nil, err

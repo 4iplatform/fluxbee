@@ -75,11 +75,10 @@ func TestCompileWorkflowRejectsInvalidDefinitionAndDoesNotWriteStaged(t *testing
 func newTestService(t *testing.T) *Service {
 	t.Helper()
 	cfg := NodeConfig{
-		HiveID:             "motherbee",
-		NodeName:           "SY.wf-rules@motherbee",
-		OrchestratorTarget: "SY.orchestrator@motherbee",
-		StateDir:           t.TempDir(),
-		DistRuntimeRoot:    filepath.Join(t.TempDir(), "dist", "runtimes"),
+		HiveID:          "motherbee",
+		NodeName:        "SY.wf-rules@motherbee",
+		StateDir:        t.TempDir(),
+		DistRuntimeRoot: filepath.Join(t.TempDir(), "dist", "runtimes"),
 	}
 	svc := NewService(cfg, nil, nil, func() time.Time {
 		return time.Date(2026, 4, 16, 12, 0, 0, 0, time.UTC)
@@ -110,10 +109,10 @@ func TestApplyWorkflowRotatesAndPublishesPackage(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(svc.store.Root(), "invoice", "current", "metadata.json")); err != nil {
 		t.Fatalf("missing current metadata: %v", err)
 	}
-	if _, err := os.Stat(filepath.Join(svc.cfg.DistRuntimeRoot, "wf.invoice", "1", "package.json")); err != nil {
+	if _, err := os.Stat(filepath.Join(svc.cfg.DistRuntimeRoot, "wf.invoice", "0.0.1", "package.json")); err != nil {
 		t.Fatalf("missing package.json: %v", err)
 	}
-	if _, err := os.Stat(filepath.Join(svc.cfg.DistRuntimeRoot, "wf.invoice", "1", "flow", "definition.json")); err != nil {
+	if _, err := os.Stat(filepath.Join(svc.cfg.DistRuntimeRoot, "wf.invoice", "0.0.1", "flow", "definition.json")); err != nil {
 		t.Fatalf("missing flow/definition.json: %v", err)
 	}
 	manifestPath := filepath.Join(svc.cfg.DistRuntimeRoot, "manifest.json")

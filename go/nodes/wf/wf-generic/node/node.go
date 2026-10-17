@@ -1,400 +1,157 @@
 package node
 
 import (
-	"bytes"
 	"context"
 	"crypto/sha256"
-	"encoding/json"
 	"fmt"
 	"log"
-	"os"
-	"path/filepath"
-	"strings"
 	"time"
 
 	sdk "github.com/4iplatform/json-router/fluxbee-go-sdk"
 )
 
-// Config is the runtime configuration for a wf-generic node instance.
-type Config struct {
-	WorkflowDefinitionPath string               `json:"workflow_definition_path"`
-	DBPath                 string               `json:"db_path"`
-	SYTimerL2Name          string               `json:"sy_timer_l2_name"`
-	TenantID               string               `json:"tenant_id,omitempty"`
-	GCRetentionDays        int                  `json:"gc_retention_days"`
-	GCIntervalSeconds      int                  `json:"gc_interval_seconds"`
-	System                 *ManagedSystemConfig `json:"_system,omitempty"`
-}
-
-type ManagedSystemConfig struct {
-	ManagedBy      string `json:"managed_by,omitempty"`
-	NodeName       string `json:"node_name,omitempty"`
-	HiveID         string `json:"hive_id,omitempty"`
-	RelaunchOnBoot bool   `json:"relaunch_on_boot,omitempty"`
-	ConfigVersion  uint64 `json:"config_version,omitempty"`
-	CreatedAtMS    int64  `json:"created_at_ms,omitempty"`
-	UpdatedAtMS    int64  `json:"updated_at_ms,omitempty"`
-	Runtime        string `json:"runtime,omitempty"`
-	RuntimeVersion          string `json:"runtime_version,omitempty"`
-	RequestedRuntimeVersion string `json:"requested_runtime_version,omitempty"`
-	RuntimeBase             string `json:"runtime_base,omitempty"`
-	PackagePath    string `json:"package_path,omitempty"`
-	IlkID          string `json:"ilk_id,omitempty"`
-	TenantID       string `json:"tenant_id,omitempty"`
-}
-
-// LoadConfig reads and validates a config.json file.
-func LoadConfig(path string) (*Config, error) {
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return nil, fmt.Errorf("read config %q: %w", path, err)
-	}
-	payload, err := extractConfigPayload(data)
-	if err != nil {
-		return nil, fmt.Errorf("parse config %q: %w", path, err)
-	}
-	var cfg Config
-	dec := json.NewDecoder(bytes.NewReader(payload))
-	dec.DisallowUnknownFields()
-	if err := dec.Decode(&cfg); err != nil {
-		return nil, fmt.Errorf("parse config %q: %w", path, err)
-	}
-	if err := finalizeConfig(&cfg, path); err != nil {
-		return nil, err
-	}
-	if cfg.GCRetentionDays <= 0 {
-		cfg.GCRetentionDays = 7
-	}
-	if cfg.GCIntervalSeconds <= 0 {
-		cfg.GCIntervalSeconds = 3600
-	}
-	return &cfg, nil
-}
-
-func finalizeConfig(cfg *Config, configPath string) error {
-	if cfg == nil {
-		return fmt.Errorf("config must be non-nil")
-	}
-
-	cfg.WorkflowDefinitionPath = strings.TrimSpace(cfg.WorkflowDefinitionPath)
-	cfg.DBPath = strings.TrimSpace(cfg.DBPath)
-	cfg.SYTimerL2Name = strings.TrimSpace(cfg.SYTimerL2Name)
-	cfg.TenantID = strings.TrimSpace(cfg.TenantID)
-	if cfg.System != nil {
-		cfg.System.NodeName = strings.TrimSpace(cfg.System.NodeName)
-		cfg.System.HiveID = strings.TrimSpace(cfg.System.HiveID)
-		cfg.System.PackagePath = strings.TrimSpace(cfg.System.PackagePath)
-		cfg.System.TenantID = strings.TrimSpace(cfg.System.TenantID)
-		if cfg.TenantID == "" {
-			cfg.TenantID = cfg.System.TenantID
-		}
-	}
-
-	// In managed package mode (`_system.package_path` set), the workflow
-	// definition is package-native: `<package_path>/flow/definition.json` is
-	// the single source of truth. Any `workflow_definition_path` value in
-	// the config is ignored (compat-only; the operator should not be setting
-	// it). Local-dev / smoke mode (no `_system.package_path`) still uses
-	// `workflow_definition_path` as the canonical control.
-	if pkgPath := managedPackagePath(cfg); pkgPath != "" {
-		packageDefPath := filepath.Join(pkgPath, "flow", "definition.json")
-		if cfg.WorkflowDefinitionPath != "" && cfg.WorkflowDefinitionPath != packageDefPath {
-			log.Printf("wf-generic: managed package mode active; ignoring workflow_definition_path=%q and using package-native %q", cfg.WorkflowDefinitionPath, packageDefPath)
-		}
-		cfg.WorkflowDefinitionPath = packageDefPath
-	}
-	if cfg.DBPath == "" && configPath != "" {
-		cfg.DBPath = filepath.Join(filepath.Dir(configPath), "wf_instances.db")
-	}
-	if cfg.SYTimerL2Name == "" {
-		if hiveID := managedHiveID(cfg); hiveID != "" {
-			cfg.SYTimerL2Name = "SY.timer@" + hiveID
-		}
-	}
-	if cfg.WorkflowDefinitionPath == "" {
-		return fmt.Errorf("config: workflow_definition_path is required (or set _system.package_path for managed mode)")
-	}
-	if cfg.DBPath == "" {
-		return fmt.Errorf("config: db_path is required")
-	}
-	if cfg.SYTimerL2Name == "" {
-		return fmt.Errorf("config: sy_timer_l2_name is required")
-	}
-	return nil
-}
-
-func extractConfigPayload(data []byte) ([]byte, error) {
-	var raw map[string]json.RawMessage
-	if err := json.Unmarshal(data, &raw); err != nil {
-		return nil, err
-	}
-
-	configPayload, hasWrappedConfig := raw["config"]
-	if !hasWrappedConfig {
-		if _, hasTopLevelConfigVersion := raw["config_version"]; !hasTopLevelConfigVersion {
-			return data, nil
-		}
-	}
-
-	cfgMap := make(map[string]json.RawMessage)
-	if hasWrappedConfig {
-		if err := json.Unmarshal(configPayload, &cfgMap); err != nil {
-			return nil, fmt.Errorf("parse wrapped config payload: %w", err)
-		}
-	}
-
-	for _, key := range []string{
-		"workflow_definition_path",
-		"db_path",
-		"sy_timer_l2_name",
-		"gc_retention_days",
-		"gc_interval_seconds",
-		"tenant_id",
-		"_system",
-	} {
-		if _, ok := cfgMap[key]; ok {
-			continue
-		}
-		if value, exists := raw[key]; exists {
-			cfgMap[key] = value
-		}
-	}
-
-	if len(cfgMap) == 0 {
-		return data, nil
-	}
-	merged, err := json.Marshal(cfgMap)
-	if err != nil {
-		return nil, fmt.Errorf("marshal wrapped config payload: %w", err)
-	}
-	return merged, nil
-}
-
-func ResolveManagedNodeName(cfg *Config) (string, error) {
-	if value := managedNodeName(cfg); value != "" {
-		return value, nil
-	}
-	return "", fmt.Errorf("managed node name unavailable: set _system.node_name in config or FLUXBEE_NODE_NAME in environment")
-}
-
-func ManagedConfigPathFromEnv() (string, error) {
-	nodeName := strings.TrimSpace(os.Getenv("FLUXBEE_NODE_NAME"))
-	if nodeName == "" {
-		return "", fmt.Errorf("FLUXBEE_NODE_NAME is not set")
-	}
-	kind := managedNodeKind(nodeName)
-	if kind == "" {
-		return "", fmt.Errorf("cannot derive node kind from %q", nodeName)
-	}
-	return filepath.Join("/var/lib/fluxbee/nodes", kind, nodeName, "config.json"), nil
-}
-
-func managedNodeKind(nodeName string) string {
-	base := strings.TrimSpace(nodeName)
-	if at := strings.Index(base, "@"); at >= 0 {
-		base = base[:at]
-	}
-	if dot := strings.Index(base, "."); dot >= 0 {
-		base = base[:dot]
-	}
-	return strings.TrimSpace(base)
-}
-
-func managedNodeName(cfg *Config) string {
-	if cfg != nil && cfg.System != nil && cfg.System.NodeName != "" {
-		return cfg.System.NodeName
-	}
-	return strings.TrimSpace(os.Getenv("FLUXBEE_NODE_NAME"))
-}
-
-func managedHiveID(cfg *Config) string {
-	if cfg != nil && cfg.System != nil && cfg.System.HiveID != "" {
-		return cfg.System.HiveID
-	}
-	nodeName := managedNodeName(cfg)
-	if nodeName == "" {
-		return ""
-	}
-	_, hiveID, ok := strings.Cut(nodeName, "@")
-	if !ok {
-		return ""
-	}
-	return strings.TrimSpace(hiveID)
-}
-
-func managedPackagePath(cfg *Config) string {
-	if cfg == nil || cfg.System == nil {
-		return ""
-	}
-	return strings.TrimSpace(cfg.System.PackagePath)
-}
-
-// IsManagedPackageMode reports whether the node is running as a managed
-// workflow package — i.e. orchestrator stamped `_system.package_path` and
-// the workflow definition is `<package_path>/flow/definition.json` (not
-// operator-controlled via `workflow_definition_path`).
-func IsManagedPackageMode(cfg *Config) bool {
-	return managedPackagePath(cfg) != ""
-}
-
-// PackageDefinitionPath returns the package-native definition.json path
-// for managed mode, or "" when not in managed mode.
-func PackageDefinitionPath(cfg *Config) string {
-	pkg := managedPackagePath(cfg)
-	if pkg == "" {
-		return ""
-	}
-	return filepath.Join(pkg, "flow", "definition.json")
-}
-
 // RunOptions is the full set of options for node.Run().
 type RunOptions struct {
 	// ConfigPath is the path to config.json (used by the real entrypoint).
 	ConfigPath string
-	// Config can be supplied directly (used in tests / embedded use).
-	Config *Config
+	// NodeName is the managed node name (FLUXBEE_NODE_NAME); "" in local dev.
+	NodeName string
+	// Plane is the node's control plane when the caller already bootstrapped it; otherwise Run
+	// bootstraps it from ConfigPath.
+	Plane *ControlPlane
 	// Clock overrides time.Now for deterministic testing.
 	Clock ClockFunc
-	// SDKConfig is the SDK connection config. If zero-value, Run skips SDK connect.
+	// SDKConfig is the SDK connection config. If nil, Run only checks the config and returns.
 	SDKConfig *sdk.NodeConfig
 }
 
 // Run is the main lifecycle function. It:
-//  1. Loads config + definition
-//  2. Opens SQLite
-//  3. Connects to the router (if SDKConfig provided)
-//  4. Recovers running instances + reconciles timers
-//  5. Starts the GC goroutine
-//  6. Enters the receive loop
+//  1. Bootstraps the control plane (config + workflow definition)
+//  2. Connects to the router, whatever the config state
+//  3. With a config in use: opens SQLite, recovers running instances, reconciles timers and starts
+//     the GC goroutine
+//  4. Enters the receive loop; without a config in use it answers control messages only, saying
+//     why, and a restart applies a corrected config
 func Run(ctx context.Context, opts RunOptions) error {
-	// --- Config ---
-	cfg := opts.Config
-	configPath := opts.ConfigPath
-	if cfg == nil {
-		if configPath == "" {
-			return fmt.Errorf("either ConfigPath or Config is required")
-		}
-		var err error
-		cfg, err = LoadConfig(configPath)
-		if err != nil {
-			return err
-		}
-	}
-
 	clock := opts.Clock
 	if clock == nil {
 		clock = defaultClock
 	}
-
-	// --- Workflow definition ---
-	defData, err := os.ReadFile(cfg.WorkflowDefinitionPath)
-	if err != nil {
-		return fmt.Errorf("read definition: %w", err)
+	plane := opts.Plane
+	if plane == nil {
+		if opts.ConfigPath == "" {
+			return fmt.Errorf("either ConfigPath or Plane is required")
+		}
+		var err error
+		plane, err = BootstrapControlPlane(opts.ConfigPath, opts.NodeName, clock)
+		if err != nil {
+			return err
+		}
 	}
-	def, err := LoadDefinitionBytes(defData, cfg.WorkflowDefinitionPath, clock)
-	if err != nil {
-		return fmt.Errorf("load definition: %w", err)
+	materialized := plane.Configured()
+	if materialized != nil {
+		log.Printf("wf: loaded definition workflow_type=%s states=%d", materialized.Definition.WorkflowType, len(materialized.Definition.States))
+	} else {
+		log.Printf("wf: config state %s (%s): answering control messages only; a restart applies a corrected config", plane.State.CurrentState, plane.notConfiguredReason())
 	}
-	defHash := fmt.Sprintf("%x", sha256.Sum256(defData))
-	log.Printf("wf: loaded definition workflow_type=%s states=%d", def.WorkflowType, len(def.States))
 
-	// --- SQLite ---
+	// No SDK config: only the config check (tests, dry run).
+	if opts.SDKConfig == nil {
+		if materialized == nil {
+			return fmt.Errorf("config not in use: %s", plane.notConfiguredReason())
+		}
+		log.Printf("wf: no SDK config, exiting after the config check")
+		return nil
+	}
+
+	profile, err := sdk.NewOperationalRouteProfile().
+		CommandChannel("incoming").
+		PostPendingRule(
+			sdk.RouteAny{},
+			sdk.RouteCommand{Channel: "incoming"},
+		).
+		Build()
+	if err != nil {
+		return fmt.Errorf("wf rpc profile invalid: %w", err)
+	}
+	routerDispatcher, err := sdk.ConnectWithRetry(*opts.SDKConfig, time.Second, profile)
+	if err != nil {
+		return fmt.Errorf("sdk connect: %w", err)
+	}
+	defer func() { _ = routerDispatcher.Close() }()
+	sender := routerDispatcher.SenderSnapshot()
+	incoming, err := routerDispatcher.TakeCommandReceiver("incoming")
+	if err != nil {
+		return fmt.Errorf("take incoming receiver: %w", err)
+	}
+
+	rt := &NodeRuntime{
+		ActCtx:     ActionContext{Dispatcher: NewSDKDispatcher(sender), Clock: clock},
+		NodeUUID:   sender.UUID(),
+		NodeName:   sender.FullName(),
+		Plane:      plane,
+		VersionStr: "1.0",
+	}
+	defer func() {
+		if rt.Store != nil {
+			rt.Store.Close()
+		}
+	}()
+	if materialized != nil {
+		if err := startEngine(ctx, rt, materialized, routerDispatcher, clock); err != nil {
+			return err
+		}
+	}
+
+	log.Printf("wf: entering receive loop for %s", sender.FullName())
+	for {
+		select {
+		case <-ctx.Done():
+			return nil
+		case msg, ok := <-incoming:
+			if !ok {
+				log.Printf("wf: incoming channel closed; exiting")
+				return nil
+			}
+			if err := Dispatch(ctx, msg, rt); err != nil {
+				log.Printf("wf: dispatch error: %v", err)
+			}
+		}
+	}
+}
+
+// startEngine opens the instance store, recovers the running instances and starts the GC: what a
+// node with a config in use runs on top of the control plane. The caller closes rt.Store.
+func startEngine(ctx context.Context, rt *NodeRuntime, materialized *Materialized, routerDispatcher *sdk.RouterDispatcher, clock ClockFunc) error {
+	cfg := materialized.Config
 	store, err := OpenStore(cfg.DBPath)
 	if err != nil {
 		return fmt.Errorf("open store: %w", err)
 	}
-	defer store.Close()
-
-	// Persist the definition
-	if err := store.UpsertDefinition(ctx, def.WorkflowType, string(defData), defHash, clock); err != nil {
+	rt.Store = store
+	def := materialized.Definition
+	defHash := fmt.Sprintf("%x", sha256.Sum256(materialized.DefinitionBytes))
+	if err := store.UpsertDefinition(ctx, def.WorkflowType, string(materialized.DefinitionBytes), defHash, clock); err != nil {
 		return fmt.Errorf("upsert definition: %w", err)
 	}
-
-	// --- SDK connection (optional for tests) ---
-	var dispatcher Dispatcher
-	var timerSender TimerSender
-	var nodeUUID string
-
-	if opts.SDKConfig != nil {
-		profile, err := sdk.NewOperationalRouteProfile().
-			CommandChannel("incoming").
-			PostPendingRule(
-				sdk.RouteAny{},
-				sdk.RouteCommand{Channel: "incoming"},
-			).
-			Build()
-		if err != nil {
-			return fmt.Errorf("wf rpc profile invalid: %w", err)
-		}
-		routerDispatcher, err := sdk.ConnectWithRetry(*opts.SDKConfig, time.Second, profile)
-		if err != nil {
-			return fmt.Errorf("sdk connect: %w", err)
-		}
-		defer func() { _ = routerDispatcher.Close() }()
-		sender := routerDispatcher.SenderSnapshot()
-		incoming, err := routerDispatcher.TakeCommandReceiver("incoming")
-		if err != nil {
-			return fmt.Errorf("take incoming receiver: %w", err)
-		}
-
-		nodeUUID = sender.UUID()
-		dispatcher = NewSDKDispatcher(sender)
-
-		timerSender, err = NewSDKTimerSender(routerDispatcher, cfg.SYTimerL2Name)
-		if err != nil {
-			return fmt.Errorf("create timer sender: %w", err)
-		}
-
-		// Recovery
-		reg := NewInstanceRegistry()
-		actx := ActionContext{
-			Store:      store,
-			Dispatcher: dispatcher,
-			Timer:      timerSender,
-			Clock:      clock,
-		}
-		if err := Recover(ctx, def, store, reg, actx, RecoverOptions{
-			OwnerL2Name: sender.FullName(),
-		}); err != nil {
-			return fmt.Errorf("recovery failed: %w", err)
-		}
-
-		// GC
-		gcInterval := time.Duration(cfg.GCIntervalSeconds) * time.Second
-		StartGC(ctx, store, cfg.GCRetentionDays, gcInterval, clock)
-
-		// Runtime
-		rt := &NodeRuntime{
-			Def:        def,
-			DefJSON:    string(defData),
-			Registry:   reg,
-			Store:      store,
-			ActCtx:     actx,
-			NodeUUID:   nodeUUID,
-			NodeName:   sender.FullName(),
-			Config:     cloneConfig(cfg),
-			ConfigPath: configPath,
-			VersionStr: "1.0",
-		}
-
-		log.Printf("wf: entering receive loop for %s", sender.FullName())
-		for {
-			select {
-			case <-ctx.Done():
-				return nil
-			case msg, ok := <-incoming:
-				if !ok {
-					log.Printf("wf: incoming channel closed; exiting")
-					return nil
-				}
-				if err := Dispatch(ctx, msg, rt); err != nil {
-					log.Printf("wf: dispatch error: %v", err)
-				}
-			}
-		}
+	timerSender, err := NewSDKTimerSender(routerDispatcher, cfg.SYTimerL2Name)
+	if err != nil {
+		return fmt.Errorf("create timer sender: %w", err)
 	}
 
-	// No SDK config — just validate definition and return (useful for tests / dry-run)
-	log.Printf("wf: no SDK config, exiting after definition load")
+	reg := NewInstanceRegistry()
+	rt.ActCtx.Store = store
+	rt.ActCtx.Timer = timerSender
+	if err := Recover(ctx, def, store, reg, rt.ActCtx, RecoverOptions{
+		OwnerL2Name: rt.NodeName,
+	}); err != nil {
+		return fmt.Errorf("recovery failed: %w", err)
+	}
+
+	StartGC(ctx, store, cfg.GCRetentionDays, time.Duration(cfg.GCIntervalSeconds)*time.Second, clock)
+
+	rt.Def = def
+	rt.DefJSON = string(materialized.DefinitionBytes)
+	rt.Registry = reg
 	return nil
 }

@@ -22,7 +22,6 @@ fn sample_message() -> Message {
             src_ilk: Some("ilk:11111111-1111-4111-8111-111111111111".to_string()),
             ich: Some("io://probe-1".to_string()),
             thread_id: Some("thread:canonical-1".to_string()),
-            thread_seq: Some(7),
             ctx: Some("legacy-ctx-1".to_string()),
             ctx_seq: Some(9),
             ctx_window: Some(vec![]),
@@ -101,12 +100,14 @@ fn contract_reply_message_reuses_meta_and_sets_payload() {
     let reply = build_reply_message(&message, "node-ai-999", payload.clone());
     assert_eq!(reply.meta.msg_type, "user");
     assert_eq!(reply.meta.thread_id.as_deref(), Some("thread:canonical-1"));
+    // A reply goes to whoever spoke; the agent's own ILK is stamped by the runtime when it sends
+    // it, never the human's (docs/router-stream-v1.md §6.2).
+    assert_eq!(reply.meta.src_ilk, None);
     assert_eq!(
-        reply.meta.src_ilk.as_deref(),
+        reply.meta.dst_ilk.as_deref(),
         Some("ilk:11111111-1111-4111-8111-111111111111")
     );
     assert_eq!(reply.meta.ich.as_deref(), Some("io://probe-1"));
-    assert_eq!(reply.meta.thread_seq, None);
     assert_eq!(reply.meta.ctx, None);
     assert_eq!(reply.meta.ctx_seq, None);
     assert!(reply.meta.ctx_window.is_none());
@@ -144,7 +145,6 @@ fn contract_reply_message_runtime_src_leaves_src_for_runtime_assignment() {
     let reply = build_reply_message_runtime_src(&message, payload.clone());
     assert_eq!(reply.meta.msg_type, "user");
     assert_eq!(reply.meta.thread_id.as_deref(), Some("thread:canonical-1"));
-    assert_eq!(reply.meta.thread_seq, None);
     assert_eq!(reply.meta.ctx, None);
     assert!(reply.meta.memory_package.is_none());
     assert_eq!(reply.payload, payload);

@@ -42,6 +42,42 @@ pub fn managed_node_instance_dir_with_root(
     Ok(root.into().join(kind).join(node_name))
 }
 
+/// Los unicos nodos NO-`SY.*` que `hive.yaml` acepta en su lista de nodos de ciclo de vida.
+///
+/// **VACÍO a proposito.** Los runtimes managed (io.api, io.blob, io.cloud, io.slack, ...) NO se
+/// declaran en `hive.yaml` `system_nodes`: nacen por `run_node` y el orquestador los reconcilia.
+pub const HIVE_YAML_NON_SY_LIFECYCLE_NODES: &[&str] = &[];
+
+/// True cuando `hive.yaml` puede listarlo como nodo de ciclo de vida sin ser `SY.*`.
+pub fn is_allowed_non_sy_lifecycle_node(node_name: &str) -> bool {
+    node_matches(node_name, HIVE_YAML_NON_SY_LIFECYCLE_NODES)
+}
+
+fn node_matches(node_name: &str, known: &[&str]) -> bool {
+    let local = node_name
+        .split_once('@')
+        .map(|(local, _)| local)
+        .unwrap_or(node_name)
+        .trim();
+    known.iter().any(|k| k.eq_ignore_ascii_case(local))
+}
+
+/// The root tenant, in any spelling of `tnt:<uuid>` that parses to it (with or without hyphens).
+pub fn is_root_tenant(tenant_id: &str) -> bool {
+    let uuid_of = |raw: &str| {
+        raw.trim()
+            .strip_prefix("tnt:")
+            .and_then(|uuid| uuid::Uuid::parse_str(uuid).ok())
+    };
+    match (
+        uuid_of(tenant_id),
+        uuid_of(crate::identity::DEFAULT_ROOT_TENANT_ID),
+    ) {
+        (Some(tenant), Some(root)) => tenant == root,
+        _ => false,
+    }
+}
+
 pub fn managed_node_config_path(node_name: &str) -> Result<PathBuf, ManagedNodeError> {
     Ok(managed_node_instance_dir(node_name)?.join("config.json"))
 }
@@ -72,6 +108,15 @@ mod tests {
         assert_eq!(name, "AI.managed@motherbee");
         unsafe { std::env::remove_var(FLUXBEE_NODE_NAME_ENV) };
         unsafe { std::env::remove_var("GOV_NODE_NAME") };
+    }
+
+    #[test]
+    fn the_root_tenant_reads_in_any_spelling_of_its_uuid() {
+        assert!(is_root_tenant(crate::identity::DEFAULT_ROOT_TENANT_ID));
+        assert!(is_root_tenant("tnt:00000000000000000000000000000001"));
+        assert!(!is_root_tenant("tnt:8a0c3f8e-2f1b-4d3a-9c55-0f6e2b7d9a11"));
+        assert!(!is_root_tenant("tnt:not-a-uuid"));
+        assert!(!is_root_tenant(""));
     }
 
     #[test]

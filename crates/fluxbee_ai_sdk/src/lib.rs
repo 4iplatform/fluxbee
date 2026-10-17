@@ -11,9 +11,11 @@ pub mod summary_refresh;
 pub mod text_payload;
 pub mod thread_state;
 pub mod thread_state_tools;
+pub mod usage;
 
 pub use agent::Agent;
 pub use errors::{AiSdkError, Result};
+pub use fluxbee_sdk::{TenantSource, UsageWork};
 pub use function_calling::{
     dispatch_tool_calls, FunctionCallingConfig, FunctionCallingModel, FunctionCallingRunner,
     FunctionLoopItem, FunctionLoopRunResult, FunctionModelTurnRequest, FunctionModelTurnResponse,
@@ -26,10 +28,9 @@ pub use immediate_memory::{
 };
 pub use llm::{
     build_output_schema_fallback_instruction, create_function_calling_model, create_llm_client,
-    AiProvider, AiProviderConfigs, AiProviderModelConfig, AnthropicFunctionCallingModel,
-    AnthropicMessagesClient, EffectiveAiEngine, HiveAiConfig, LlmClient, LlmRequest, LlmResponse,
-    LlmStreamEvent, MockLlmClient, ModelSettings, OpenAiFunctionCallingModel,
-    OpenAiResponsesClient, OutputSchemaSpec, DEFAULT_HIVE_AI_PROVIDER, DEFAULT_HIVE_OPENAI_MODEL,
+    AiProvider, AiProviderConfigs, AiProviderModelConfig, EffectiveAiEngine, HiveAiConfig,
+    LlmClient, LlmRequest, LlmResponse, LlmStreamEvent, MockLlmClient, ModelSettings,
+    OutputSchemaSpec, DEFAULT_HIVE_AI_PROVIDER, DEFAULT_HIVE_OPENAI_MODEL,
 };
 pub use message::{
     build_reply_message, build_reply_message_runtime_src,
@@ -60,3 +61,4 @@ pub use thread_state::{LanceDbThreadStateStore, ThreadStateRecord, ThreadStateSt
 pub use thread_state_tools::{
     ThreadStateDeleteTool, ThreadStateGetTool, ThreadStatePutTool, ThreadStateToolsProvider,
 };
+pub use usage::{AiAccount, UsageRecorder, UsageRecorderStats, USAGE_RECORDER_QUEUE};

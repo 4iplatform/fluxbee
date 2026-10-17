@@ -33,7 +33,7 @@ SY.cognition does NOT handle:
 - Identity management (SY.identity).
 - Message persistence to PostgreSQL (SY.storage).
 - Routing decisions (router + OPA). Cognitive data does NOT feed OPA.
-- Normative evaluation (SY.policy responsibility). Cognitive does NOT judge compliance.
+- Normative evaluation. Cognitive does NOT judge compliance. (`SY.policy`, the node named for it, only counted turns: stopped in 0.1.77, its binary and unit removed in 0.1.78.)
 
 ---
 
@@ -93,7 +93,7 @@ Interpretation note:
 The IO node chooses the rule because it knows the channel type. The SDK provides a canonical `compute_thread_id(channel_type, params)` function.
 The current canonical format uses versioned input material plus stable `sha256`, producing identifiers like `thread:sha256:<hex>`.
 
-**Sequencing:** every message that belongs to a thread also carries `meta.thread_seq`. Unlike `thread_id`, this value is **not** assigned by the IO node. It is assigned by the router when the message enters the local conversation flow for that thread, so the system has a deterministic per-thread order for persistence, replay, scope cuts, and evidence ranges.
+**Sequencing:** the message carries no sequence. Cognition works per communication, `(thread_id, agent ILK)`: a thread and the agent (`AI.*` node) that serves it. The order of a communication is SY.cognition's turn number (`turn_count`): all of a communication's turns are copied by its agent's router, whose stream keeps them in order, and cognition numbers them. Scope instances start and end at a turn, and the turn guards the durable rows (a row is replaced only by an equal or later turn). The router stopped assigning `meta.thread_seq` in 0.1.77; the field left the protocol in 0.1.78.
 
 **Rules:**
 
@@ -101,7 +101,7 @@ The current canonical format uses versioned input material plus stable `sha256`,
 - Thread can be long-lived (months, years). That is a feature, not a bug — the meaning is tracked by contexts, reasons, and scopes, not by the thread itself.
 - For groups, participants entering or leaving do not create a new thread. The channel identity (ICH) is stable.
 - All messages, contexts, reasons, memories, and episodes are associated with a thread.
-- `thread_id` is computed by SDK/IO. `thread_seq` is assigned by the router.
+- `thread_id` is computed by SDK/IO. The message carries no sequence.
 
 ### 3.2 Scope
 
@@ -194,7 +194,7 @@ Memory is narrative, not exact. Like human memory, it captures the essence with 
 }
 ```
 
-The `summary` is the narrative fusion. The `dominant_context_id` and `dominant_reason_id` are structured metadata available for AI node enrichment via memory_package. OPA does not read these fields. SY.policy may read them as supporting evidence in the future but does not depend on them in v1.
+The `summary` is the narrative fusion. The `dominant_context_id` and `dominant_reason_id` are structured metadata available for AI node enrichment via memory_package. OPA does not read these fields.
 
 ### 3.6 Episode
 
@@ -253,7 +253,7 @@ These are the minimum reason signals the tagger should recognize. They are inten
 - If the tagger detects nuances beyond the 8, they go to a separate `reason_signals_extra` field as free-text evidence. This evidence is available for narrative memory generation but does NOT feed the reason evaluator.
 - The reason evaluator (same mechanics as context evaluator) groups canonical signals into reasons with labels, weights, and ILK profiles.
 - Reasons do not refine labels (same additive rule as contexts).
-- **OPA does not read reason signals.** SY.policy may read them independently from the message stream for normative evaluation, but that is SY.policy's concern, not cognitive's.
+- **OPA does not read reason signals.**
 
 **Canonical kernel vs periferia:**
 
@@ -280,7 +280,7 @@ General commandments let the AI interpret freely while giving the deterministic 
 ### 5.1 Overview
 
 ```
-Message arrives (via NATS from router)
+Turn arrives (cognition.turns, from the router stream)
   │
   ▼
 1. TAGGER (single AI call)
@@ -324,16 +324,15 @@ Message arrives (via NATS from router)
    Update LanceDB + jsr-memory SHM.
   │
   ▼
-8. PUBLISH TO NATS (fire & forget)
+8. APPEND TO THE ROUTER STREAM (STREAM_APPEND, storage.cognition.batch, for SY.storage)
 ```
 
 ### 5.2 Where Cognitive Gets Messages
 
-SY.cognition consumes from NATS (`storage.turns` stream). Same stream as SY.storage. Fire & forget from router (~1ms).
+SY.cognition is a sink of its own hive's router streams (`RT.*.stream@<hive>`), subject `cognition.turns`. The router where an agent (`AI.*` node) is attached copies both directions of each turn with a `thread_id` (never a tap copy nor a broadcast); the record's producer is the agent's node, which cognition maps to the agent's ILK through the identity SHM. Cognition acks each `STREAM_BATCH` on receipt into a bounded queue and skips the records it already accepted from that stream and epoch. Best effort: what waits longer than the stream's window is lost and counted.
 
 The canonical turn carrier for cognition v2 is:
 - `meta.thread_id`
-- `meta.thread_seq`
 - `meta.ich`
 - `meta.src_ilk`
 - `meta.dst_ilk` when known
@@ -352,7 +351,6 @@ The message protocol may still contain legacy fields during migration, but the *
     "dst_ilk": "ilk:...",
     "ich": "ich:...",
     "thread_id": "thread:...",
-    "thread_seq": 47,
     "memory_package": {
       "package_version": 2,
       "...": "..."
@@ -363,23 +361,22 @@ The message protocol may still contain legacy fields during migration, but the *
 
 Rules:
 - `thread_id` is computed by SDK/IO.
-- `thread_seq` is assigned by the router.
-- `thread_seq` is monotonic **within a thread**, not globally.
+- the message carries no sequence: the order of a communication is SY.cognition's turn number.
 - `ctx`, `ctx_seq`, and `ctx_window` are not part of the v2 canonical model.
 - During migration, old producers/consumers may still read `ctx*`, but new canonical paths should not depend on them.
 
 Temporary migration note:
-- router, IO, and AI repo paths now read only top-level `meta.thread_id` for active thread routing/sequencing behavior.
+- router, IO, and AI repo paths now read only top-level `meta.thread_id` for active thread routing behavior.
 - any legacy `meta.context.thread_id` still present in old payloads is no longer part of the runtime carrier contract.
 
 ### 5.3 Message Enrichment
 
-Router reads `jsr-memory-<hive>` SHM to attach `memory_package` to messages. The router enriches, not SY.cognition. SY.cognition writes the data; the router reads and attaches it.
+Router reads `jsr-memory-<hive>` SHM to attach `memory_package` to messages it delivers to agent (`AI.*`) nodes, per destination. The router enriches, not SY.cognition. SY.cognition writes the data; the router reads and attaches it. A `memory_package` the sender put in is dropped.
 
 Current implementation note:
 - `jsr-memory-<hive>` is implemented as a seqlock-protected SHM region with a versioned JSON snapshot.
-- the lookup key is `thread_id`
-- each snapshot entry already contains a truncated `memory_package` v2 for that thread
+- the lookup key is the communication: `thread_id` and the agent node the message is delivered to
+- each snapshot entry already contains a truncated `memory_package` v2 for that communication
 
 **Important:** Enrichment happens AFTER the routing decision. OPA decides where the message goes based on identity data only. Then, before delivery to the destination node, the router attaches the memory_package so the AI node has cognitive context. The memory_package does not influence routing.
 
@@ -437,7 +434,7 @@ This enriched form is what the Context Evaluator and Reason Evaluator receive. T
 
 ### 6.1.1 Operational Contract of `AI.tagger`
 
-`AI.tagger` is an internal component of `SY.cognition`. It is not a separate node, does not publish its own NATS subject, and does not alter the external carrier contract.
+`AI.tagger` is an internal component of `SY.cognition`. It is not a separate node, does not append its own stream subject, and does not alter the external carrier contract.
 
 Operational role:
 - run once per turn before context/reason structural evaluation
@@ -681,9 +678,23 @@ Same structural algorithm as Context Update, but using **reason-specific paramet
 
 Context update and reason update run concurrently on the same message but do not influence each other. They share no state — only the originating message.
 
+Current implementation (per thread; contexts, reasons and their co-occurrences):
+
+- Nothing gates opening: there is no evaluator score yet (§6.2, §6.3). Every tag the tagger returns opens or reinforces its context, every reason its canonical signals map to opens or reinforces that reason, each with score 1.0, and each context/reason pair of the turn does the same for its co-occurrence.
+- A reinforced entity's weight becomes `weight × decay + 1.0`. An open one the turn does not reinforce decays (`× decay`: 0.85 contexts, 0.75 reasons, 0.80 co-occurrences) and closes once its weight is under its close threshold: `config.thresholds.context_close` / `config.thresholds.reason_close` (CONFIG_SET, 0 to 1, default 0.25). A co-occurrence closes under the average of the two. With the defaults, a context told once closes on the 9th turn without it, a reason on the 5th, a co-occurrence on the 7th.
+- Until 2026-10-02 the keys were `context_open` / `reason_open`. They never gated opening: their value, halved, was the close threshold, so the 0.25 defaults keep what their 0.5 defaults did. CONFIG_SET refuses them by name.
+
 ### 8.3 Scope Binding Energy
 
 Extended with reason similarity as described in section 7.
+
+Current implementation (anchor-based, per thread):
+
+- The active scope is anchored to its dominant context and dominant reason. Each turn compares the thread's current dominant pair with that anchor: `binding = S_ctx × S_rsn × S_ilk`, smoothed with `SCOPE_ENERGY_ALPHA`. The binding is a similarity in [0, 1], so the unbind threshold is 0.35, not the energy-scale −0.05 of §9.4.
+- A shift is a different dominant pair. The unbind streak grows while a shift persists with the EMA under the threshold. The scope instance cuts when the streak reaches `SCOPE_ENERGY_SUSTAIN_COUNT`.
+- While a shift whose binding is under the threshold is pending, the scope keeps its anchor, so the following turns keep measuring the divergence until the cut. A candidate that still binds (at or over the threshold) is drift inside the scope and becomes the new anchor. Before 2026-10-02 the anchor was always replaced at once, which reset the streak: a lasting topic change renamed the scope and never cut it.
+- On a weight tie the anchor stays dominant (otherwise the smaller label wins), so tags reinforced together never count as a shift.
+- Cut sensitivity (`SCOPE_ENERGY_ALPHA` 0.25, threshold 0.35, `SCOPE_ENERGY_SUSTAIN_COUNT` 2; kept as is by the operator on 2026-10-02): a complete change of topic and drive cuts on the **6th divergent message** for a scope two to five turns old. The cut comes on the fifth turn after the dominant pair changes: from a scope that bound fully, the EMA goes 0.75, 0.56, 0.42, then 0.32 (under the threshold, streak 1) and 0.24 (streak 2, the cut). The pair changes once the new reason outweighs the anchor's, which takes longer the longer the anchor was reinforced: a scope one turn old cuts on the 5th divergent message, a long-reinforced one on the 7th (reasons decay by 0.75 per turn, so a new one overtakes any anchor by the 3rd). A change of topic alone takes longer, because contexts decay slower (0.85). The test `a_sustained_topic_change_cuts_the_scope` pins the 5th, 6th and 7th.
 
 ### 8.4 Period Detection
 
@@ -764,7 +775,7 @@ Context and reason ILK weights start identical but are independently configurabl
 
 ### 10.1 One Per Hive
 
-SY.cognition runs on every hive. Each instance processes messages from its local NATS stream.
+SY.cognition runs on the motherbee and the workers, next to the agents. Each instance processes the communications of its own hive's agents, which its routers' streams copy to it (`cognition.turns`); no cognition traffic crosses hives.
 
 ### 10.2 Storage Layers
 
@@ -778,7 +789,7 @@ SY.cognition runs on every hive. Each instance processes messages from its local
 
 The durable model for cognition v2 should be explicit and should not reuse the old `events/items/reactivation` semantics as its conceptual base.
 
-`storage.turns` remains the immutable input stream. Everything else belongs to the cognition v2 domain.
+Turns remain the immutable input: `storage.turns` is the message log (table `turns`), and cognition reads its own copies (`cognition.turns`). Everything else belongs to the cognition v2 domain.
 
 Recommended durable entities:
 
@@ -811,10 +822,10 @@ Durable source-of-truth policy:
   - local enrichment indexes
   - local hot caches
 
-Recommended transport to `SY.storage`:
+Transport to `SY.storage` (as built): SY.cognition packs a turn's envelopes into `storage.cognition.batch` records of at most 64 KB (`STREAM_APPEND` to its router's stream), and SY.storage expands each envelope into an inbox row under its entity subject:
 
 - explicit cognition subjects, not the old v1 semantic subjects
-- for example:
+- the entity subjects:
   - `storage.cognition.threads`
   - `storage.cognition.contexts`
   - `storage.cognition.reasons`
@@ -826,7 +837,7 @@ Recommended transport to `SY.storage`:
 
 This keeps the domain typed, inspectable, and migration-safe.
 
-### 10.2.2 NATS Transport Envelope for Cognition v2
+### 10.2.2 Transport Envelope for Cognition v2
 
 The transport contract to `SY.storage` should be explicit and uniform across cognition entities.
 
@@ -834,12 +845,14 @@ Recommended envelope:
 
 ```json
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "entity_version": 1,
   "entity": "context",
   "op": "upsert",
   "entity_id": "context:uuid",
   "thread_id": "thread:sha256:...",
+  "agent_ilk": "ilk:...",
+  "turn": 12,
   "hive": "motherbee",
   "writer": "SY.cognition@motherbee",
   "ts": "2026-03-31T12:34:56Z",
@@ -852,6 +865,7 @@ Recommended envelope:
 Rules:
 - subject defines the domain stream; `entity` and `entity_id` make the payload self-describing.
 - `thread_id` is required for thread-scoped entities (`threads`, `contexts`, `reasons`, `cooccurrences`, `scope_instances`, `memories`, `episodes`).
+- `thread_id` and `agent_ilk` identify the communication; `turn` is its turn number when the envelope was written: a stored row is replaced only by an envelope of an equal or later turn.
 - `op` should start as a closed deterministic set for v1:
   - `upsert`
   - `close`
@@ -860,18 +874,16 @@ Rules:
 - `entity_version` is the durable shape version for that entity.
 - `writer` identifies the emitting node instance and helps trace rebuild/drift issues.
 
-Router / JetStream boundary:
-- the router publishes only the immutable input stream (`storage.turns`).
+Router stream boundary:
+- the router copies only turns: `storage.turns` (to SY.storage) and `cognition.turns` (to its hive's SY.cognition).
 - the router is not the writer of derived cognition entities.
-- `storage.cognition.*` subjects belong to the `SY.cognition -> SY.storage` durable path.
-- the embedded broker/JetStream layer must therefore support both:
-  - durable replay of `storage.turns` for `SY.storage` and `SY.cognition`
-  - durable replay of `storage.cognition.*` for storage-side ingestion/rebuild flows
+- `storage.cognition.*` subjects belong to the `SY.cognition -> SY.storage` path; the router accepts them only from `SY.cognition@<its hive>`.
+- the stream is best effort, with a short window (120 s / 32 MB per router); there is no durable replay of turns.
 
-Open transport items still to freeze in implementation:
-- canonical durable consumer names / queue names
-- replay/start semantics after restart
-- ack/redelivery/poison-message policy
+Transport semantics (as built):
+- each sink has its own cursor and acks with `STREAM_ACK`; a batch without an ack is sent again, so every sink takes repeats (SY.storage by its inbox key, SY.cognition by stream, epoch and seq)
+- what a sink does not take within the window is lost and counted
+- SY.storage retries a failed inbox row every 60 s, up to 10 attempts
 
 Recommended subject-to-entity mapping:
 - `storage.cognition.threads` → thread snapshots / thread-level state
@@ -886,11 +898,11 @@ Recommended subject-to-entity mapping:
 Turns remain special:
 - `storage.turns` is append-only immutable input
 - cognition entities are durable derived state
-- rebuilding cognition means replaying `storage.turns` into these typed cognition subjects / tables
+- rebuilding cognition means loading a communication's rows back from SY.storage over the mesh (`COGNITION_STATE_GET`), not replaying turns
 
 ### 10.3 Cold Start
 
-Rebuild from PostgreSQL via SY.storage socket. Replay turns through pipeline to reconstruct contexts, reasons, memories, episodes.
+At start, before the first turn, SY.cognition reloads the communications its `jsr-memory` region holds from SY.storage over the mesh (`COGNITION_STATE_GET`, paged). A communication it does not hold loads on its first turn. Cognition does not read PostgreSQL and does not replay turns.
 
 ### 10.4 SHM Region: jsr-memory-\<hive\>
 
@@ -926,7 +938,6 @@ Recommended contents:
 
 3. **Thread Summary Entries**
    - `thread_id`
-   - latest `thread_seq`
    - dominant context ref
    - dominant reason ref
    - top-N context refs
@@ -1093,32 +1104,30 @@ The evaluator contract itself stays closed and deterministic over the 8 canonica
 
 **Resolved.** Thread computation uses three rules by channel type (see section 3.1). The SDK provides `compute_thread_id(channel_type, params)`. Current hash function/format: versioned canonical material + `sha256`, output as `thread:sha256:<hex>`.
 
-**Additional resolved rule:** `thread_seq` is assigned by the router, not by IO. The router is the only component that should serialize message order within a thread for cognition and durable replay.
+**Additional resolved rule:** the message carries no sequence. The order of a communication is SY.cognition's turn number: the agent's router copies all of a communication's turns, so its stream keeps them in order. The router stopped assigning `meta.thread_seq` in 0.1.77; the field left the protocol in 0.1.78.
 
 ### 13.6 Feed/Stream Processing
 
 Continuous feeds deferred. System assumes discrete messages. IO handles segmentation.
 
-### 13.7 Relationship to SY.policy and OPA
+### 13.7 Relationship to OPA (and the retired SY.policy)
 
-**SY.cognition has no relationship to OPA.** OPA does not read any cognitive data — not contexts, not reasons, not memories, not episodes, not reason signals. OPA reads identity data (from jsr-identity SHM) and active restrictions (from SY.policy). That's it.
+**SY.cognition has no relationship to OPA.** OPA does not read any cognitive data — not contexts, not reasons, not memories, not episodes, not reason signals. OPA reads identity data (from jsr-identity SHM). That's it.
 
-**SY.cognition has no direct relationship to SY.policy.** SY.policy is a separate NATS consumer that reads the same message stream as cognitive. SY.policy may independently read reason signals from the original message (the tagger output that travels in the message metadata) to inform its normative evaluation. But SY.policy does not depend on cognitive having processed the message first. They run in parallel, not in series.
+**SY.policy was retired.** It read the same turns as cognition but only counted them (missing `action_class` / `action_result` / `result_origin`); 0.1.77 stopped it and 0.1.78 removed its binary and unit. Normative evaluation has no runtime today.
 
 **The architecture is:**
 
 ```
-Message → NATS
-  ├──► SY.cognition (describes: contexts, reasons, memories, episodes)
-  │         └──► jsr-memory SHM (for router enrichment of AI nodes)
+Turn → router stream (RT.<router>.stream@<hive>)
+  ├──► SY.storage@motherbee (storage.turns → turns, the message log)
   │
-  └──► SY.policy (evaluates: normative compliance, post-facto)
-           └──► restrictions → jsr-identity SHM (for OPA to read)
+  └──► SY.cognition of the agent's hive (cognition.turns → contexts, reasons, memories, episodes)
+           ├──► jsr-memory SHM (for router enrichment of AI nodes)
+           └──► storage.cognition.batch → SY.storage (cognition_* tables)
 ```
 
-Cognitive and policy are parallel consumers. Cognitive enriches AI nodes. Policy feeds OPA. They don't feed each other in v1.
-
-**Future possibility:** SY.policy may eventually read cognitive output (memories, episodes) as supporting evidence for normative evaluation. But that is additive — cognitive does not change to accommodate policy, and policy does not depend on cognitive for its core function.
+Cognitive enriches AI nodes. OPA reads identity only.
 
 ---
 
@@ -1130,7 +1139,7 @@ Cognitive and policy are parallel consumers. Cognitive enriches AI nodes. Policy
 | Horizon | Last 10-12 interactions | Days, weeks, months |
 | Owner | Each AI node | SY.cognition (system-wide) |
 | Content | What am I doing right now | What do I know + with what drive |
-| Consumed by | The AI node itself | Router (enrichment → AI nodes via memory_package). NOT consumed by OPA or SY.policy in v1 |
+| Consumed by | The AI node itself | Router (enrichment → AI nodes via memory_package). NOT consumed by OPA |
 
 Both coexist. Neither replaces the other.
 
@@ -1149,8 +1158,8 @@ Operational alignment note:
 
 - [x] COG-T1. Implement `compute_thread_id(channel_type, params)` in SDK with three rules (DM, group, native).
 - [ ] COG-T2. IO nodes include `thread_id` in message metadata using SDK function.
-- [ ] COG-T2b. Router assigns `thread_seq` per `thread_id` and includes it in message metadata.
-- [ ] COG-T3. SY.cognition consumes from NATS `storage.turns`.
+- [x] COG-T2b. ~~Router assigns `thread_seq` per `thread_id`~~ Dropped: the message carries no sequence; the order of a communication is SY.cognition's turn number (`thread_seq` left the protocol in 0.1.78).
+- [x] COG-T3. SY.cognition consumes `cognition.turns` from its hive's router streams.
 - [ ] COG-T4. Implement tagger (extended: tags + reason_signals_canonical + reason_signals_extra in single call).
 - [ ] COG-T5. Implement context evaluator.
 - [ ] COG-T6. Implement deterministic context update.
@@ -1166,7 +1175,7 @@ Operational alignment note:
 - [ ] COG-T10. Implement scope creation and thread-scope association.
 - [ ] COG-T11. Implement binding energy with two-variable coupling (context + reason similarity).
 - [ ] COG-T12. Implement energy EMA and scope instance transitions.
-- [ ] COG-T13. Emit scope events to NATS.
+- [ ] COG-T13. Emit scope events to SY.storage through the router stream.
 
 ### Phase 4 — Memories (Narrative Fusion)
 
@@ -1179,7 +1188,7 @@ Operational alignment note:
 
 - [ ] COG-T18. Implement episode gate (conservative, multi-condition).
 - [ ] COG-T19. Include `evidence_reason_ids` in episode evidence.
-- [ ] COG-T20. Publish memory and episode events to NATS.
+- [ ] COG-T20. Publish memory and episode events to SY.storage through the router stream.
 
 ### Phase 6 — Storage and SHM
 
@@ -1199,16 +1208,22 @@ Validation note:
 - The canonical E2E for cognition v2 must enter through the router path with real/disposable nodes.
 - The old direct publish-to-`storage.turns` smoke was removed from the repo to avoid confusing it with the normative path.
 - PostgreSQL is not the primary oracle for the cognition E2E. The primary oracle is delivery to the destination node plus `jsr-memory` and `SY.cognition` runtime counters.
-- Cold start rebuild is startup-only and fail-open: rebuild is attempted only when local cognition state is empty, and missing/unreachable durable storage does not block live processing.
+- Cold start rebuild is fail-open and only fills an empty local cognition state:
+  - it runs at startup, before the first turn: the communications the `jsr-memory` region holds come back from SY.storage over the mesh (`COGNITION_STATE_GET`)
+  - one that cannot load, or that SY.storage has no state for yet, stays in the region as it was and loads on its next turn
+  - missing/unreachable durable storage never blocks live processing
+  - rebuilt state is keyed exactly like the live path (contexts and reasons by label, co-occurrences by context|reason label, memories by scope, episodes by scope instance|affect), so the next live turn continues the rebuilt entities instead of re-creating them
 - Current bounded hot-set note:
   - `jsr-memory` is now emitted as a bounded hot set sized to `MEMORY_MAX_DATA_SIZE`
   - selection priority is:
+    - the thread the current turn updated, which is therefore never the one dropped
+    - recency by `last_seen_at`
     - `active_scope`
     - count of live cognitive entities
-    - recency by `last_seen_at`
-    - `latest_thread_seq`
-  - `turn_count`
+    - `turn_count`
+  - recency ranks ahead of live entities since 2026-10-02: ranked by entity count first, a new thread in a full region was dropped right after its own turn and started over, writing a new scope to storage, on every turn
   - startup rebuild from durable now rehydrates only that selected hot set into local cognition memory before resuming live processing
+  - live processing applies the same rule after every turn: a thread that leaves the hot set leaves local memory too, and starts over if it comes back
   - if the snapshot exceeds SHM capacity, lower-priority threads are pruned before the write
   - deferred optimization: the durable read path is still hive-scoped and applies the hot-set filter in runtime; there is no SQL-side / query-side filter yet
   - future backlog item:
@@ -1295,7 +1310,7 @@ pub const MEMORY_VERSION: u32 = 2;
 | Topic | Document |
 |-------|----------|
 | Identity (ILK, ICH, TNT) | `10-identity-v2.md` |
-| Storage (NATS, PostgreSQL) | `13-storage.md` |
+| Storage (router stream, PostgreSQL) | `13-storage.md` |
 | Protocol (message format) | `02-protocolo.md` |
 | SHM regions | `03-shm.md` |
 | Routing | `04-routing.md` |
@@ -1304,4 +1319,4 @@ pub const MEMORY_VERSION: u32 = 2;
 | Immediate memory (AI SDK) | `immediate-conversation-memory-spec.md` |
 | SY nodes catalog | `SY_nodes_spec.md` |
 | Identity v3 direction (claims) | `identity-v3-direction.md` |
-| Normative evaluation (SY.policy) | `sy-policy-beta.md` |
+| Normative evaluation (future; the SY.policy node was retired) | `sy-policy-beta.md` |

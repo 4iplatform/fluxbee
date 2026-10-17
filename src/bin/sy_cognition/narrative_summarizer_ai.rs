@@ -1,16 +1,22 @@
 use std::time::Duration;
 
 use fluxbee_ai_sdk::errors::AiSdkError;
-use fluxbee_ai_sdk::{create_llm_client, LlmClient, LlmRequest, ModelSettings};
+use fluxbee_ai_sdk::{create_llm_client, AiAccount, LlmClient, LlmRequest, ModelSettings};
 use serde::Deserialize;
 use serde_json::json;
 use tokio::time;
 
 use crate::CognitionSemanticTaggerConfig;
 
+/// The summaries are two or three sentences of JSON; the cap only bounds a runaway answer. A
+/// model that reasons spends part of it before it answers (A-69).
+const NARRATIVE_SUMMARIZER_MAX_OUTPUT_TOKENS: u32 = 1024;
+
 #[derive(Debug, Clone)]
 pub(super) struct NarrativeSummarizerAiInput<'a> {
     pub(super) api_key: &'a str,
+    /// Who pays for the call: the communication's agent's tenant (docs/router-stream-v1.md §7.3).
+    pub(super) account: &'a AiAccount,
     pub(super) config: &'a CognitionSemanticTaggerConfig,
     pub(super) thread_id: &'a str,
     pub(super) context_label: &'a str,
@@ -37,8 +43,15 @@ struct RawNarrativeSummaries {
 #[derive(Debug, Clone)]
 pub(super) struct NarrativeSummaries {
     pub(super) memory_summary: String,
-    pub(super) episode_summary: Option<String>,
-    pub(super) episode_reason: Option<String>,
+    /// Present exactly when the input carried an episode candidate: the parser rejects an
+    /// answer that leaves it out, and drops one the input did not ask for.
+    pub(super) episode: Option<EpisodeNarrative>,
+}
+
+#[derive(Debug, Clone)]
+pub(super) struct EpisodeNarrative {
+    pub(super) summary: String,
+    pub(super) reason: String,
 }
 
 pub(super) async fn run_narrative_summarizer_ai(
@@ -49,16 +62,22 @@ pub(super) async fn run_narrative_summarizer_ai(
         system: Some(build_system_prompt(input.episode_affect_id.is_some())),
         input: build_user_prompt(&input),
         input_parts: None,
-        max_output_tokens: Some(220),
+        max_output_tokens: Some(NARRATIVE_SUMMARIZER_MAX_OUTPUT_TOKENS),
+        // No temperature: the current models of both providers reject it (A-69).
         model_settings: Some(ModelSettings {
-            temperature: Some(0.2),
+            temperature: None,
             top_p: None,
-            max_output_tokens: Some(220),
+            max_output_tokens: Some(NARRATIVE_SUMMARIZER_MAX_OUTPUT_TOKENS),
         }),
         output_schema: None,
     };
 
-    let client = create_llm_client(input.config.provider, input.api_key, None);
+    let client = create_llm_client(
+        input.config.provider,
+        input.api_key,
+        None,
+        input.account.clone(),
+    );
     let response = time::timeout(
         Duration::from_millis(input.config.timeout_ms),
         LlmClient::generate(client.as_ref(), request),
@@ -141,12 +160,15 @@ fn parse_narrative_summaries(
         ));
     }
 
-    let episode_summary = parsed.episode_summary.map(|v| normalize_sentence(&v));
-    let episode_reason = parsed.episode_reason.map(|v| normalize_sentence(&v));
-    if expect_episode
-        && (episode_summary.as_deref().unwrap_or_default().is_empty()
-            || episode_reason.as_deref().unwrap_or_default().is_empty())
-    {
+    if !expect_episode {
+        return Ok(NarrativeSummaries {
+            memory_summary,
+            episode: None,
+        });
+    }
+    let summary = normalize_sentence(parsed.episode_summary.as_deref().unwrap_or_default());
+    let reason = normalize_sentence(parsed.episode_reason.as_deref().unwrap_or_default());
+    if summary.is_empty() || reason.is_empty() {
         return Err(AiSdkError::Protocol(
             "narrative summarizer returned incomplete episode narrative".into(),
         ));
@@ -154,8 +176,7 @@ fn parse_narrative_summaries(
 
     Ok(NarrativeSummaries {
         memory_summary,
-        episode_summary: episode_summary.filter(|value| !value.is_empty()),
-        episode_reason: episode_reason.filter(|value| !value.is_empty()),
+        episode: Some(EpisodeNarrative { summary, reason }),
     })
 }
 
@@ -211,7 +232,7 @@ mod tests {
             parsed.memory_summary,
             "Recurring billing friction with pressure for resolution."
         );
-        assert_eq!(parsed.episode_summary, None);
+        assert!(parsed.episode.is_none());
     }
 
     #[test]
@@ -238,10 +259,9 @@ mod tests {
             for expected in case.episode_summary_contains {
                 assert!(
                     parsed
-                        .episode_summary
-                        .as_deref()
-                        .unwrap_or_default()
-                        .contains(&expected),
+                        .episode
+                        .as_ref()
+                        .is_some_and(|episode| episode.summary.contains(&expected)),
                     "narrative case {} missing episode summary fragment {}",
                     case.name,
                     expected
@@ -250,10 +270,9 @@ mod tests {
             for expected in case.episode_reason_contains {
                 assert!(
                     parsed
-                        .episode_reason
-                        .as_deref()
-                        .unwrap_or_default()
-                        .contains(&expected),
+                        .episode
+                        .as_ref()
+                        .is_some_and(|episode| episode.reason.contains(&expected)),
                     "narrative case {} missing episode reason fragment {}",
                     case.name,
                     expected

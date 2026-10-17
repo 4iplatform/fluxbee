@@ -35,7 +35,7 @@ PY
 node_bin_src() { # <workspace> <bin> -> path to the built binary
   case "$1" in
     nodes/io) echo "nodes/io/target/release/$2" ;;
-    nodes/ai) echo "target/release/$2" ;;            # nodes/ai is a ROOT workspace member (built by --bins)
+    nodes/ai) echo "target/release/$2" ;;            # nodes/ai member -> root target/; built explicitly in [1/5]
     go) echo "go/nodes/wf/wf-generic/$2" ;;
     *) echo "target/release/$2" ;;
   esac
@@ -44,21 +44,28 @@ node_bin_src() { # <workspace> <bin> -> path to the built binary
 # core service binaries: <installed-name>=<cargo --bin or go marker>
 RUST_BINS=(rt-gateway:json-router sy-admin:sy_admin sy-config-routes:sy_config_routes
   sy-architect:sy_architect sy-vault:sy_vault sy-orchestrator:sy_orchestrator
-  sy-storage:sy_storage sy-identity:sy_identity sy-cognition:sy_cognition sy-policy:sy_policy
+  sy-storage:sy_storage sy-identity:sy_identity sy-cognition:sy_cognition
   sy-edge:sy_edge)
 GO_BINS=(sy-opa-rules:go/sy-opa-rules sy-timer:go/sy-timer sy-wf-rules:go/sy-wf-rules
   wf-generic:go/nodes/wf/wf-generic)
 # units: every core service EXCEPT wf-generic (a runtime the orchestrator spawns).
 # sy-edge gets a dedicated unit below (custom rt-gateway ordering).
 UNITS=(rt-gateway sy-config-routes sy-opa-rules sy-admin sy-architect sy-vault
-  sy-orchestrator sy-storage sy-identity sy-cognition sy-policy sy-timer sy-wf-rules sy-frontdesk-gov)
+  sy-orchestrator sy-storage sy-identity sy-cognition sy-timer sy-wf-rules sy-frontdesk-gov)
 
 echo "== [1/5] build rust =="
 cargo build --release --bins
 cargo build --release -p sy-frontdesk-gov --bin sy-frontdesk-gov
+# ai.generic: `cargo build --bins` does NOT build this. The root Cargo.toml has BOTH a [package]
+# (json-router) and a [workspace], and without --workspace `--bins` only builds the ROOT package's
+# bins — workspace MEMBERS are skipped. That is why sy-frontdesk-gov above (also a member) needs its
+# own line, and ai-generic needs one too. scripts/install.sh already builds it; this line closes the
+# divergence base-nodes.json requires ("read by BOTH ... they must not diverge").
+# Without it the .deb build dies at [3/5] with "binary does not exist: target/release/ai_node_runner"
+# on any clean box — it only ever "worked" where a previous manual build had left the binary behind.
+cargo build --release -p fluxbee-ai-nodes --bin ai_node_runner
 # Build every nodes/io crate the base-node manifest references (singleton infra nodes +
-# io.* runtimes). ai.generic (nodes/ai) is a root workspace member already built by --bins;
-# wf-generic (go) is built in the go step below.
+# io.* runtimes). wf-generic (go) is built in the go step below.
 IO_PKGS="$( { mf singletons; mf runtimes; } | awk -F'\t' '$4=="nodes/io"{print $2}' | sort -u )"
 [ -n "$IO_PKGS" ] && cargo build --release --manifest-path nodes/io/Cargo.toml $(printf -- '-p %s ' $IO_PKGS)
 echo "== [2/5] build go =="
@@ -83,7 +90,7 @@ stage_bin sy-frontdesk-gov "target/release/sy-frontdesk-gov"
 for pair in "${GO_BINS[@]}"; do
   stage_bin "${pair%%:*}" "${pair##*:}/$(basename "${pair##*:}")"
 done
-# Singletons (motherbee-only infra nodes, e.g. IO.blob/IO.cloud) install to /usr/bin ONLY
+# Singletons (motherbee-only infra nodes with a baked systemd unit; the list is EMPTY today) install to /usr/bin ONLY
 # (not dist/core/bin): they are not role-synced core components, so they must not enter the
 # core manifest the orchestrator ships to workers. Their systemd units are defined below.
 # Driven by packaging/base-nodes.json.
@@ -105,6 +112,13 @@ while IFS=$'\t' read -r rt crate bin ws lang boot inst; do
     --dist-root "$DEST/var/lib/fluxbee/dist" \
     --set-current
 done < <(mf runtimes)
+
+# U-3: the runtimes manifest is OPERATOR STATE, never payload. Shipping it made every upgrade
+# replace the live manifest, orphaning hot-published runtimes (and the U-10 fix does not rescue
+# them: reconcile resolves the runtime KEY before the version). The .deb ships only the artifact
+# tree above; packaging/fluxbee-seed-runtimes registers it into the LIVE manifest at install
+# time, via the same merger scripts/install.sh has always used.
+rm -f "$DEST/var/lib/fluxbee/dist/runtimes/manifest.json"
 
 # dist/core manifest with the staged binaries' real hashes (baked in).
 python3 - "$DEST/var/lib/fluxbee/dist/core" "$VERSION" "$BUILD_ID" <<'PY'
@@ -154,8 +168,15 @@ json.dump({"schema_version": 1, "version": int(build_id), "components": comps},
           open(os.path.join(vroot, "manifest.json"), "w"), indent=2, sort_keys=True)
 print("vendor manifest: syncthing %s (%d components)" % (ver, len(comps)))
 PY
+elif [ "${FLUXBEE_ALLOW_NO_SYNCTHING:-0}" = "1" ]; then
+  echo "WARN: no vendored syncthing under vendor/ (FLUXBEE_ALLOW_NO_SYNCTHING=1) — blob/dist sync will be non-operational; add_hive with require_dist_sync will FAIL far from this cause"
 else
-  echo "WARN: no vendored syncthing under vendor/ — blob sync will be non-operational"
+  # Fail-closed (mirrors scripts/install.sh): a .deb without syncthing ships an
+  # orchestrator whose blob/dist-sync is dead, and a later add_hive with
+  # require_dist_sync fails far from the cause. Opt out with FLUXBEE_ALLOW_NO_SYNCTHING=1.
+  echo "ERROR: no vendored syncthing under vendor/ (expected vendor/syncthing/syncthing or vendor/<bundle>/syncthing)." >&2
+  echo "       Set FLUXBEE_ALLOW_NO_SYNCTHING=1 to build anyway (blob/dist sync will be non-operational)." >&2
+  exit 1
 fi
 
 # systemd units (mirrors scripts/install.sh install_unit). Not enabled here; the
@@ -196,64 +217,42 @@ gen_unit sy-frontdesk-gov "network.target rt-gateway.service sy-identity.service
 gen_unit sy-edge "network.target rt-gateway.service" \
   "rt-gateway.service"
 
-# io-cloud: the singleton in-mesh Fluxbee Cloud adapter — one per SYSTEM, on motherbee.
-# Custom unit (not gen_unit): it needs SY.identity (register its own ICH) + SY.admin
-# (externalize) up first, an optional EnvironmentFile for deployment overrides (e.g.
-# IO_CLOUD_EDGE_NODE to publish a URL), and an ExecCondition that gates it to
-# `role: motherbee` — so even though the unit is enabled, it only runs on the motherbee.
-cat > "$DEST/lib/systemd/system/io-cloud.service" <<'UNIT'
-[Unit]
-Description=Fluxbee IO.cloud (singleton in-mesh Fluxbee Cloud adapter, motherbee only)
-After=network.target rt-gateway.service sy-identity.service sy-admin.service
-Wants=rt-gateway.service sy-identity.service sy-admin.service
-
-[Service]
-Type=simple
-EnvironmentFile=-/etc/fluxbee/io-cloud.env
-ExecCondition=/bin/sh -c 'grep -qE "^role:[[:space:]]*motherbee" /etc/fluxbee/hive.yaml'
-ExecStart=/usr/bin/io-cloud
-Restart=always
-RestartSec=5
-TimeoutStopSec=15
-
-[Install]
-WantedBy=multi-user.target
-UNIT
-
-# io-blob: the motherbee-local public artifact curator. SY.admin is the only
-# accepted mesh caller; the node has no ICH and exposes no network listener.
-cat > "$DEST/lib/systemd/system/io-blob.service" <<'UNIT'
-[Unit]
-Description=Fluxbee IO.blob (public artifact curator, motherbee only)
-After=network.target rt-gateway.service sy-admin.service
-Wants=rt-gateway.service sy-admin.service
-
-[Service]
-Type=simple
-EnvironmentFile=-/etc/fluxbee/io-blob.env
-ExecCondition=/bin/sh -c 'grep -qE "^role:[[:space:]]*motherbee" /etc/fluxbee/hive.yaml'
-Group=fluxbee
-UMask=0027
-ExecStart=/usr/bin/io-blob
-Restart=always
-RestartSec=5
-TimeoutStopSec=15
-
-[Install]
-WantedBy=multi-user.target
-UNIT
+# IO.cloud and IO.blob are NOT singletons anymore: they are first-class MANAGED runtimes
+# (base-nodes.json runtimes[], boot=true), baked into dist/runtimes and spawned by the
+# orchestrator like io.api. They configure via CONFIG_SET/GET (no env, no EnvironmentFile)
+# and enforce motherbee-only with a fail-closed self-check in the binary — so there is NO
+# packaged systemd unit and NO .env for them here.
 
 # config template + first-boot helper. The packaging template is a clean
 # fresh-motherbee config (no lab uplink; wan.mtls set) — distinct from the dev
 # config/hive.yaml the lab uses.
 install -m0644 packaging/hive.yaml.example "$DEST/etc/fluxbee/hive.yaml.example"
-install -m0600 packaging/io-cloud.env.example "$DEST/etc/fluxbee/io-cloud.env.example"
-install -m0600 packaging/io-blob.env.example "$DEST/etc/fluxbee/io-blob.env.example"
+# SY.architect adds this handbook to its prompts, from where install.sh puts it. A static doc,
+# not config: replaced on every upgrade, so it is not a conffile.
+install -m0644 "docs/onworking COA/archi/handbook_fluxbee.md" "$DEST/etc/fluxbee/handbook_fluxbee.md"
+# needrestart (Ubuntu) must not restart managed node units after an apt upgrade: the old runtime
+# directory is gone by then, and the orchestrator rebinds them itself (FINDINGS A-39).
+install -d "$DEST/etc/needrestart/conf.d"
+install -m0644 packaging/needrestart-fluxbee.conf "$DEST/etc/needrestart/conf.d/fluxbee.conf"
 install -m0755 packaging/fluxbee-firstboot "$DEST/usr/share/fluxbee/fluxbee-firstboot"
 ln -sf ../share/fluxbee/fluxbee-firstboot "$DEST/usr/bin/fluxbee-firstboot"
 # The base-node manifest travels to the target too: fluxbee-firstboot reads it to know which
 # runtimes to auto-spawn as default instances at boot (boot=true) and under which names.
 install -m0644 packaging/base-nodes.json "$DEST/usr/share/fluxbee/base-nodes.json"
+# The factory reset reads that same manifest to know which nodes are SYSTEM (kept) and which
+# were launched by users (removed). Dry-run by default: `sudo fluxbee-factory-reset`.
+install -m0755 packaging/fluxbee-factory-reset "$DEST/usr/share/fluxbee/fluxbee-factory-reset"
+ln -sf ../share/fluxbee/fluxbee-factory-reset "$DEST/usr/bin/fluxbee-factory-reset"
+# U-3: the install-time runtime registrar and the merger it calls. Same shape as
+# fluxbee-firstboot above (shipped under /usr/share/fluxbee with a /usr/bin symlink) — it is
+# also the operator's repair surface: `sudo fluxbee-seed-runtimes`.
+install -m0755 scripts/publish-runtime.sh "$DEST/usr/share/fluxbee/publish-runtime.sh"
+install -m0755 packaging/fluxbee-seed-runtimes "$DEST/usr/share/fluxbee/fluxbee-seed-runtimes"
+ln -sf ../share/fluxbee/fluxbee-seed-runtimes "$DEST/usr/bin/fluxbee-seed-runtimes"
+# The postinst runs it on every install to fix values older packages shipped wrong (A-46).
+install -m0755 packaging/fluxbee-migrate-config "$DEST/usr/share/fluxbee/fluxbee-migrate-config"
+printf '%s\n' "$VERSION" > "$DEST/usr/share/fluxbee/base-runtime-version"
+chmod 0644 "$DEST/usr/share/fluxbee/base-runtime-version"
 
 echo "== [4/5] debian metadata =="
 INSTALLED_KB="$(du -sk "$DEST" | awk '{print $1}')"
@@ -263,26 +262,65 @@ Version: ${VERSION}
 Section: net
 Priority: optional
 Architecture: ${ARCH}
-Depends: adduser, openssl, libc6 (>= 2.39), postgresql
+Depends: adduser, openssl, libc6 (>= 2.39), postgresql, curl, python3
 Installed-Size: ${INSTALLED_KB}
 Maintainer: 4i Platform <ops@4iplatform.com>
 Description: Fluxbee internal-network orchestration mesh
  Core services (router, orchestrator, identity, vault, storage, admin,
- architect, cognition, policy, timer, wf-rules, opa-rules, frontdesk, edge)
- plus the singleton IO.cloud adapter and IO.blob public artifact curator (motherbee),
- and the instanced IO/AI runtimes (io.api, io.slack, ai.generic, wf.engine,
- io.linkedhelper) seeded under dist/runtimes per packaging/base-nodes.json.
+ architect, cognition, timer, wf-rules, opa-rules, frontdesk, edge)
+ plus the managed IO/AI runtimes (io.api, io.blob, io.cloud, io.slack, io.wapp,
+ ai.generic, wf.engine, io.linkedhelper) seeded under dist/runtimes per
+ packaging/base-nodes.json (io.blob + io.cloud are motherbee-only managed nodes).
  Binaries + dist/core manifest (hashes baked at build), systemd units, and a
  first-boot helper. Run 'sudo fluxbee-firstboot' after install.
 EOF
 # /etc/fluxbee/* is config — track example as conffile so upgrades don't clobber.
 echo "/etc/fluxbee/hive.yaml.example" > "$DEST/DEBIAN/conffiles"
+install -m0755 packaging/deb-preinst "$DEST/DEBIAN/preinst"
 install -m0755 packaging/deb-postinst "$DEST/DEBIAN/postinst"
 install -m0755 packaging/deb-prerm "$DEST/DEBIAN/prerm"
 
 echo "== [5/5] dpkg-deb =="
 install -d "$ROOT_DIR/dist"
 OUT="$ROOT_DIR/dist/fluxbee_${VERSION}_${ARCH}.deb"
+
+# Preflight: dpkg-deb needs room for the compressed .deb PLUS xz working space next to the ~1GB
+# staged tree. On a full disk it can exit 0 while writing a truncated (data-less) .deb — so refuse
+# to build unless there is comfortable headroom, and fail LOUD (a silent 1806-byte .deb once shipped
+# a "successful" build that could never install). Threshold: staged size + 1 GiB margin.
+DEST_KB="$(du -sk "$DEST" | awk '{print $1}')"
+NEED_KB=$(( DEST_KB + 1048576 ))
+FREE_KB="$(df -Pk "$ROOT_DIR/dist" | awk 'NR==2{print $4}')"
+if [ "$FREE_KB" -lt "$NEED_KB" ]; then
+  echo "ERROR: insufficient disk to build the .deb: need ~$((NEED_KB/1024)) MB free on $(dirname "$OUT"), have $((FREE_KB/1024)) MB." >&2
+  echo "       Free space (old .debs in dist/, cargo target/, /tmp) and retry." >&2
+  exit 1
+fi
+
 dpkg-deb --root-owner-group --build "$DEST" "$OUT"
-echo "built: $OUT"
+
+# Post-build integrity: a healthy fluxbee .deb is ~250 MB with a listable data archive. A tiny .deb
+# (only control.tar, no data.tar) means dpkg-deb was truncated (e.g. ENOSPC swallowed by xz). Catch
+# it here instead of "publishing" a package that installs to nothing.
+OUT_BYTES="$(stat -c %s "$OUT" 2>/dev/null || echo 0)"
+if [ "$OUT_BYTES" -lt $((50 * 1024 * 1024)) ] || ! dpkg-deb -c "$OUT" >/dev/null 2>&1; then
+  echo "ERROR: built .deb is broken (size=${OUT_BYTES} bytes, data archive unreadable) — likely a" >&2
+  echo "       truncated dpkg-deb write (disk full during xz). Removing it; NOT a usable package." >&2
+  rm -f "$OUT"
+  exit 1
+fi
+# U-3 guard: the runtimes manifest must NEVER be payload again (that is exactly how it got
+# there in 23c4175). Capture instead of piping into grep -q: under `set -o pipefail` a SIGPIPE
+# to dpkg-deb would make the pipeline non-zero even on a HIT, silently disarming the check.
+payload_manifest="$(dpkg-deb -c "$OUT" | awk '{print $NF}' | grep -x './var/lib/fluxbee/dist/runtimes/manifest.json' || true)"
+if [ -n "$payload_manifest" ]; then
+  echo "ERROR: dist/runtimes/manifest.json is in the package payload (U-3)." >&2
+  echo "       It is operator state: shipping it clobbers hot-published runtimes on upgrade." >&2
+  echo "       The artifact tree ships; the manifest is merged at install time by" >&2
+  echo "       packaging/fluxbee-seed-runtimes. Removing the package; NOT usable." >&2
+  rm -f "$OUT"
+  exit 1
+fi
+
+echo "built: $OUT ($((OUT_BYTES/1024/1024)) MB)"
 dpkg-deb --info "$OUT" | sed -n '1,12p'

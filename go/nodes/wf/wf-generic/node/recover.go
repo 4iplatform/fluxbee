@@ -147,9 +147,44 @@ func Recover(ctx context.Context, def *WorkflowDefinition, store *Store, reg *In
 			_ = store.DeleteTimer(ctx, row.InstanceID, row.TimerKey)
 
 		case !existsInSY:
-			// Case C: WF expects timer but SY.timer doesn't know about it.
-			log.Printf("recover: expected timer %s/%s missing from SY.timer, cleaning up", row.InstanceID, row.TimerKey)
-			_ = store.DeleteTimer(ctx, row.InstanceID, row.TimerKey)
+			// Case C (G3): WF expects a timer but SY.timer no longer has it. If its expected fire
+			// time is already PAST, it fired-and-was-lost while wf.engine was down — SY.timer
+			// delivers TIMER_FIRED best-effort (dropped, since we were down) and then removes the
+			// one-shot from its pending set. Simply deleting the WF index here (the old behavior)
+			// STRANDS the instance forever, silently killing a self-rescheduling ticker. Inject a
+			// synthetic TIMER_FIRED to advance the instance (mirrors Case B). A future-dated missing
+			// timer is a different, rare case (SY.timer lost a not-yet-fired timer) — plain-delete it.
+			if row.FireAtMS <= now {
+				log.Printf("recover: expected timer %s/%s past fire_at but missing from SY.timer — fired while down; injecting synthetic TIMER_FIRED", row.InstanceID, row.TimerKey)
+				if inst, ok := reg.Get(row.InstanceID); ok {
+					info := sdk.TimerInfo{OwnerL2Name: opts.OwnerL2Name, ClientRef: &ref, FireAtUTCMS: row.FireAtMS}
+					synthMsg := buildSyntheticTimerFired(row.InstanceID, row.TimerKey, ref, info, actx.Clock)
+					inst.Lock()
+					if err := inst.RunTransition(ctx, synthMsg, actx, nil); err != nil {
+						log.Printf("recover: synthetic TIMER_FIRED (Case C) for %s/%s: %v", row.InstanceID, row.TimerKey, err)
+					} else if err := inst.drainInternalEvents(ctx, actx); err != nil {
+						log.Printf("recover: drain internal events after synthetic TIMER_FIRED (Case C) for %s/%s: %v", row.InstanceID, row.TimerKey, err)
+					}
+					if inst.Status != "running" && inst.Status != "cancelling" {
+						reg.Remove(inst.InstanceID)
+					}
+					inst.Unlock()
+				} else {
+					log.Printf("recover: instance %s not in registry, skipping synthetic fire", row.InstanceID)
+				}
+				// The synthetic fire may have re-armed a NEW timer under the same key; only delete
+				// the OLD index if the transition did not replace it.
+				currentRow, existsAfter, err := store.GetTimerForInstance(ctx, row.InstanceID, row.TimerKey)
+				if err != nil {
+					log.Printf("recover: reload timer row %s/%s: %v", row.InstanceID, row.TimerKey, err)
+				}
+				if !existsAfter || currentRow.FireAtMS == row.FireAtMS {
+					_ = store.DeleteTimer(ctx, row.InstanceID, row.TimerKey)
+				}
+			} else {
+				log.Printf("recover: expected timer %s/%s missing from SY.timer (fire_at still future), cleaning up", row.InstanceID, row.TimerKey)
+				_ = store.DeleteTimer(ctx, row.InstanceID, row.TimerKey)
+			}
 		}
 
 		// Remove from syView so we can detect orphans below.

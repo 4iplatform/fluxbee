@@ -14,7 +14,7 @@ use std::future;
 use tar::{Archive, Builder};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
-use tokio::sync::{broadcast, mpsc, oneshot, Mutex};
+use tokio::sync::{broadcast, Mutex};
 use tokio::time;
 use tracing_subscriber::EnvFilter;
 use uuid::Uuid;
@@ -22,12 +22,12 @@ use zip::ZipArchive;
 
 use async_trait::async_trait;
 use fluxbee_ai_sdk::{
-    create_function_calling_model, AiProvider, FunctionCallingConfig, FunctionCallingRunner,
-    FunctionLoopItem, FunctionRunInput, FunctionTool, FunctionToolDefinition, FunctionToolRegistry,
-    HiveAiConfig, ModelSettings,
+    create_function_calling_model, AiAccount, AiProvider, FunctionCallingConfig,
+    FunctionCallingRunner, FunctionLoopItem, FunctionRunInput, FunctionTool,
+    FunctionToolDefinition, FunctionToolRegistry, HiveAiConfig, ModelSettings, UsageRecorder,
+    UsageWork,
 };
 use fluxbee_sdk::blob::{BlobRef, BlobToolkit};
-use fluxbee_sdk::nats::{NatsClient, NatsRequestEnvelope, NatsResponseEnvelope};
 use fluxbee_sdk::protocol::{
     is_system_kind, ConfigChangedPayload, Destination, Message, Meta, Routing,
     VaultSecretChangedPayload, VaultSecretInterest, MSG_BLOB_CURATE, MSG_BLOB_CURATE_RESPONSE,
@@ -40,13 +40,16 @@ use fluxbee_sdk::protocol::{
 };
 use fluxbee_sdk::{
     build_node_config_response_message, classify_admin_action, classify_system_message,
-    derive_action_outcome, try_handle_default_node_status, ClientConfig, NodeConfig,
-    OperationalRouteProfile, PendingMatcher, RouteMatch, RouteTarget, RouterDispatcher,
-    RpcCommandReceiver, RpcRequestLabels, MSG_VAULT_DELETE, MSG_VAULT_DELETE_RESPONSE,
-    MSG_VAULT_GET, MSG_VAULT_GET_METADATA, MSG_VAULT_GET_METADATA_RESPONSE, MSG_VAULT_GET_RESPONSE,
-    MSG_VAULT_LIST, MSG_VAULT_LIST_RESPONSE, MSG_VAULT_PUT, MSG_VAULT_PUT_RESPONSE,
-    MSG_VAULT_ROLLBACK, MSG_VAULT_ROLLBACK_RESPONSE, MSG_VAULT_ROTATE, MSG_VAULT_ROTATE_RESPONSE,
-    NODE_SECRET_REDACTION_TOKEN,
+    derive_action_outcome, try_handle_default_node_status, NodeConfig, OperationalRouteProfile,
+    PendingMatcher, RouteMatch, RouteTarget, RouterDispatcher, RpcCommandReceiver,
+    RpcRequestLabels, StorageMetricsResponse, UsageGroupBy, UsageQuery, UsageQueryResponse,
+    MSG_STORAGE_METRICS_GET, MSG_STORAGE_METRICS_RESPONSE, MSG_USAGE_QUERY,
+    MSG_USAGE_QUERY_RESPONSE, MSG_VAULT_ASSIGN, MSG_VAULT_ASSIGN_RESPONSE, MSG_VAULT_DELETE,
+    MSG_VAULT_DELETE_RESPONSE, MSG_VAULT_GET, MSG_VAULT_GET_METADATA,
+    MSG_VAULT_GET_METADATA_RESPONSE, MSG_VAULT_GET_RESPONSE, MSG_VAULT_LIST,
+    MSG_VAULT_LIST_RESPONSE, MSG_VAULT_PUT, MSG_VAULT_PUT_RESPONSE, MSG_VAULT_ROLLBACK,
+    MSG_VAULT_ROLLBACK_RESPONSE, MSG_VAULT_ROTATE, MSG_VAULT_ROTATE_RESPONSE,
+    NODE_SECRET_REDACTION_TOKEN, USAGE_QUERY_MAX_DAYS, USAGE_QUERY_MAX_LIMIT,
 };
 use json_router::runtime_manifest::{
     load_runtime_manifest_from_paths, runtime_manifest_write_v2_gate_enabled_from_env,
@@ -68,6 +71,10 @@ const PUBLICATION_LEDGER_SCHEMA_VERSION: u32 = 1;
 const PUBLICATION_DEFAULT_EXPIRES_SECS: u64 = 86_400;
 const PUBLICATION_MAX_EXPIRES_SECS: u64 = 30 * 86_400;
 const PUBLICATION_MIN_EXPIRES_SECS: u64 = 60;
+/// How often the admin-side expiry reaper (`run_publication_expiry_sweep`) wakes to retire
+/// publications whose `expires_at` has passed. 10 min — coarse on purpose: TTLs are ≥60s but
+/// measured in hours/days, so a late reap is harmless and a tight loop would only add churn.
+const PUBLICATION_EXPIRY_SWEEP_SECS: u64 = 600;
 const MSG_ADMIN_COMMAND: &str = "ADMIN_COMMAND";
 const MSG_ADMIN_COMMAND_RESPONSE: &str = "ADMIN_COMMAND_RESPONSE";
 const ADMIN_EXECUTOR_CONFIG_SCHEMA_VERSION: u32 = 1;
@@ -78,6 +85,7 @@ const ADMIN_EXECUTOR_SCHEMA_OVERRIDE_ACTIONS: &[&str] = &["get_admin_action_help
 const ADMIN_EXECUTOR_PILOT_ACTIONS: &[&str] = &[
     "list_admin_actions",
     "get_admin_action_help",
+    "list_recent_commands",
     "get_runtime",
     "list_nodes",
     "list_tenants",
@@ -92,9 +100,15 @@ const ADMIN_EXECUTOR_PILOT_ACTIONS: &[&str] = &[
     "vault_delete",
     "vault_rotate",
     "vault_rollback",
+    "vault_assign",
     "set_ilk_definition",
     "delete_ilk",
+    "restore_ilk",
+    "set_ilk_tenant",
+    "delete_tenant",
+    "restore_tenant",
     "publish_runtime_package",
+    "publish_cloud_endpoint",
     "sync_hint",
     "update",
     "add_route",
@@ -120,7 +134,11 @@ const ADMIN_EXECUTOR_PILOT_ACTIONS: &[&str] = &[
 /// advertised" == "what is permitted"; they cannot drift). Tier-1 provisioning set
 /// (io-cloud-spec-v1 §3.2): create the tenant, store provider tokens in vault and spawn the IO node.
 /// A subset of ADMIN_EXECUTOR_PILOT_ACTIONS.
-const IO_CLOUD_EXPOSED_ACTIONS: &[&str] = &["create_tenant", "vault_put", "run_node"];
+// Single source of truth in fluxbee_sdk::cloud (shared with IO.cloud, which lives in a separate
+// cargo workspace); a test there pins it to the CLOUD_OP_ACTIONS map so the relay gate and Cloud's
+// op translation can never drift (FIX-12).
+use fluxbee_sdk::cloud::CLOUD_EXPOSED_ACTIONS as IO_CLOUD_EXPOSED_ACTIONS;
+use fluxbee_sdk::stream::{is_stream_node_name, MSG_STREAM_STATUS, MSG_STREAM_STATUS_RESPONSE};
 
 #[derive(Debug, Deserialize)]
 struct HiveFile {
@@ -273,7 +291,6 @@ struct AdminExecutorFailure {
 struct AdminContext {
     config_dir: PathBuf,
     state_dir: PathBuf,
-    socket_dir: PathBuf,
     blob_root: PathBuf,
     node_name: String,
     hive_id: String,
@@ -281,21 +298,26 @@ struct AdminContext {
     /// by SY.identity and resolved here at boot from identity SHM. Use as
     /// `meta.src_ilk` for outgoing vault/identity calls and any other path where
     /// L3 identity is required.
-    #[allow(dead_code)] // wired into outgoing calls in the follow-up vault work
     self_ilk_id: String,
     authorized_hives: Vec<String>,
-    nats_endpoint: String,
-    nats_client: Arc<NatsClient>,
     executor_runtime: Arc<Mutex<Option<AdminExecutorAiRuntime>>>,
     executor_configured: Arc<AtomicBool>,
     /// Canonical admin dispatcher — reused by the executor's Vault
     /// hot-refresh path so refreshes flow through the same router
     /// connection as ordinary admin/system traffic.
     rpc: Arc<RouterDispatcher>,
+    /// Where each model call's usage record goes (docs/router-stream-v1.md §7.2).
+    usage: UsageRecorder,
     public_edge_node: Option<String>,
     public_base_url: Option<String>,
     publication_ledger_path: PathBuf,
     publication_lock: Arc<Mutex<()>>,
+    /// Serializes the writers of the motherbee's runtime manifest (publish_runtime_package,
+    /// remove_runtime_version), held across their awaits: each reads, decides and rewrites the
+    /// whole file, and since every mesh command runs in its own task (A-68) two can overlap.
+    runtime_manifest_lock: Arc<Mutex<()>>,
+    /// Serializes rotate+append on the command audit log (see `append_admin_command_log_locked`).
+    command_log_lock: Arc<std::sync::Mutex<()>>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -434,25 +456,6 @@ struct VpnConfig {
     priority: Option<u16>,
 }
 
-#[derive(Debug, Deserialize, Serialize, Clone, PartialEq)]
-struct TapConfig {
-    match_src: String,
-    match_dst: String,
-    target: String,
-    #[serde(default = "default_tap_mode")]
-    mode: String,
-    #[serde(default = "default_true")]
-    enabled: bool,
-}
-
-fn default_tap_mode() -> String {
-    "best_effort".to_string()
-}
-
-fn default_true() -> bool {
-    true
-}
-
 fn default_debug_msg_type() -> String {
     "user".to_string()
 }
@@ -480,6 +483,11 @@ struct DebugNodeMessageRequest {
     priority: Option<String>,
     #[serde(default)]
     context: Option<serde_json::Value>,
+    // Optional thread correlation id. Without it a send_node_message can START a WF instance (no
+    // thread_id → new instance) but cannot DRIVE a thread-scoped node (e.g. an AI node round-trip),
+    // which keys replies by thread_id. (gap-6)
+    #[serde(default)]
+    thread_id: Option<String>,
     #[serde(default = "default_debug_payload")]
     payload: serde_json::Value,
     #[serde(default)]
@@ -488,12 +496,37 @@ struct DebugNodeMessageRequest {
 
 #[tokio::main]
 async fn main() -> Result<(), AdminError> {
+    // Answer --help/--version BEFORE any runtime init. sy_admin is the SY.admin daemon, not an
+    // interactive CLI: past this point it connects to the router (connect_with_retry loops), so
+    // without this guard `sy-admin --help` hangs forever waiting for a socket that only exists
+    // when the mesh is up. (F4b: from-scratch-installer surprise.)
+    for arg in std::env::args().skip(1) {
+        match arg.as_str() {
+            "-h" | "--help" => {
+                println!(
+                    "sy_admin — SY.admin daemon (motherbee-only; NOT an interactive CLI).\n\
+                     Serves the admin HTTP API (default 127.0.0.1:8080) and the admin.sock action set.\n\
+                     Started by systemd (sy-admin.service); the operator uses the HTTP API, e.g.:\n  \
+                       curl -sS http://127.0.0.1:8080/hives\n\n\
+                     Env: JSR_ADMIN_LISTEN (HTTP listen addr), JSR_LOG_LEVEL (info|debug|...),\n     \
+                     SY_ADMIN_PUBLIC_EDGE_NODE, SY_ADMIN_PUBLIC_BASE_URL.\n\
+                     See docs/07-operaciones.md."
+                );
+                return Ok(());
+            }
+            "-V" | "--version" => {
+                println!("sy_admin {}", env!("CARGO_PKG_VERSION"));
+                return Ok(());
+            }
+            _ => {}
+        }
+    }
     if cfg!(not(target_os = "linux")) {
         eprintln!("sy_admin supports only Linux targets.");
         std::process::exit(1);
     }
     let log_level = std::env::var("JSR_LOG_LEVEL").unwrap_or_else(|_| "info".to_string());
-    tracing_subscriber::fmt()
+    fluxbee_sdk::logging::fmt()
         .with_env_filter(EnvFilter::new(log_level))
         .init();
 
@@ -541,7 +574,6 @@ async fn main() -> Result<(), AdminError> {
         config_dir: config_dir.clone(),
         version: "1.0".to_string(),
     };
-    let client_config = ClientConfig::new(node_config.clone());
     let rpc_profile = build_admin_rpc_profile()?;
     let router_client =
         RouterDispatcher::connect_with_retry(node_config, Duration::from_secs(1), rpc_profile)
@@ -551,9 +583,6 @@ async fn main() -> Result<(), AdminError> {
                 err
             })?;
 
-    let (broadcast_tx, broadcast_rx) = mpsc::unbounded_channel::<BroadcastRequest>();
-    let http_tx = broadcast_tx.clone();
-    let nats_client = Arc::new(NatsClient::from_client_config(&client_config)?);
     let node_name = admin_node_name(&hive.hive_id);
     // Model D': self-ILK is deterministic from L2 name (no SHM wait).
     let self_ilk_id = fluxbee_sdk::deterministic_system_ilk_id(&node_name);
@@ -597,34 +626,30 @@ async fn main() -> Result<(), AdminError> {
     let http_ctx = AdminContext {
         config_dir: config_dir.clone(),
         state_dir: state_dir.clone(),
-        socket_dir: socket_dir.clone(),
         blob_root,
         node_name,
         hive_id,
         self_ilk_id,
         authorized_hives,
-        nats_endpoint: nats_client.endpoint().to_string(),
-        nats_client,
         executor_runtime,
         executor_configured,
         rpc: Arc::clone(&router_client),
+        usage: UsageRecorder::start(Arc::clone(&router_client)),
         public_edge_node,
         public_base_url,
         publication_ledger_path: state_dir.join("sy-admin/publications.json"),
         publication_lock: Arc::new(Mutex::new(())),
+        runtime_manifest_lock: Arc::new(Mutex::new(())),
+        command_log_lock: Arc::new(std::sync::Mutex::new(())),
     };
     let internal_ctx = http_ctx.clone();
     let system_ctx = http_ctx.clone();
+    let sweep_ctx = http_ctx.clone();
     let http_client = router_client.clone();
     tokio::spawn(async move {
-        if let Err(err) = run_http_server(&admin_listen, &http_tx, http_ctx, http_client).await {
+        if let Err(err) = run_http_server(&admin_listen, http_ctx, http_client).await {
             tracing::error!("http server error: {err}");
         }
-    });
-
-    let loop_client = router_client.clone();
-    tokio::spawn(async move {
-        run_broadcast_loop(broadcast_rx, loop_client).await;
     });
 
     let status_client = router_client.clone();
@@ -655,26 +680,13 @@ async fn main() -> Result<(), AdminError> {
     // `handle_system_command` (`handle_vault_secret_changed_admin`). No
     // polling loop.
 
+    let sweep_client = router_client.clone();
+    tokio::spawn(async move {
+        run_publication_expiry_sweep(sweep_ctx, sweep_client).await;
+    });
+
     future::pending::<()>().await;
     Ok(())
-}
-
-enum BroadcastRequest {
-    Routes {
-        routes: Vec<RouteConfig>,
-        version: u64,
-        ack: oneshot::Sender<Result<(), String>>,
-    },
-    Vpns {
-        vpns: Vec<VpnConfig>,
-        version: u64,
-        ack: oneshot::Sender<Result<(), String>>,
-    },
-    Taps {
-        taps: Vec<TapConfig>,
-        version: u64,
-        ack: oneshot::Sender<Result<(), String>>,
-    },
 }
 
 #[derive(Debug, Deserialize)]
@@ -685,8 +697,6 @@ struct OpaRequest {
     entrypoint: Option<String>,
     #[serde(default)]
     version: Option<u64>,
-    #[serde(default)]
-    action: Option<String>,
     #[serde(default, alias = "target")]
     hive: Option<String>,
 }
@@ -697,116 +707,6 @@ struct WfRulesRequest {
     payload: serde_json::Map<String, serde_json::Value>,
     #[serde(default, alias = "target")]
     hive: Option<String>,
-}
-
-async fn run_broadcast_loop(
-    mut rx: mpsc::UnboundedReceiver<BroadcastRequest>,
-    client: Arc<RouterDispatcher>,
-) {
-    while let Some(req) = rx.recv().await {
-        let result = match req {
-            BroadcastRequest::Routes {
-                routes,
-                version,
-                ack,
-            } => {
-                match broadcast_config_changed(
-                    &client,
-                    "routes",
-                    None,
-                    None,
-                    version,
-                    serde_json::json!({ "routes": routes }),
-                    None,
-                )
-                .await
-                {
-                    Ok(()) => {
-                        let _ = ack.send(Ok(()));
-                        Ok(())
-                    }
-                    Err(err) => {
-                        let err_msg = err.to_string();
-                        let _ = ack.send(Err(err_msg.clone()));
-                        tracing::warn!(error = %err, "broadcast failed");
-                        Err(err_msg)
-                    }
-                }
-            }
-            BroadcastRequest::Vpns { vpns, version, ack } => {
-                match broadcast_config_changed(
-                    &client,
-                    "vpn",
-                    None,
-                    None,
-                    version,
-                    serde_json::json!({ "vpns": vpns }),
-                    None,
-                )
-                .await
-                {
-                    Ok(()) => {
-                        let _ = ack.send(Ok(()));
-                        Ok(())
-                    }
-                    Err(err) => {
-                        let err_msg = err.to_string();
-                        let _ = ack.send(Err(err_msg.clone()));
-                        tracing::warn!(error = %err, "broadcast failed");
-                        Err(err_msg)
-                    }
-                }
-            }
-            BroadcastRequest::Taps { taps, version, ack } => {
-                match broadcast_config_changed(
-                    &client,
-                    "taps",
-                    None,
-                    None,
-                    version,
-                    serde_json::json!({ "taps": taps }),
-                    None,
-                )
-                .await
-                {
-                    Ok(()) => {
-                        let _ = ack.send(Ok(()));
-                        Ok(())
-                    }
-                    Err(err) => {
-                        let err_msg = err.to_string();
-                        let _ = ack.send(Err(err_msg.clone()));
-                        tracing::warn!(error = %err, "broadcast failed");
-                        Err(err_msg)
-                    }
-                }
-            }
-        };
-        if let Err(err) = result {
-            tracing::warn!(error = %err, "broadcast failed; message dropped");
-        }
-    }
-}
-
-async fn send_broadcast_request<F>(
-    tx: &mpsc::UnboundedSender<BroadcastRequest>,
-    build: F,
-    label: &str,
-) -> Result<(), AdminError>
-where
-    F: FnOnce(oneshot::Sender<Result<(), String>>) -> BroadcastRequest,
-{
-    let (ack_tx, ack_rx) = oneshot::channel::<Result<(), String>>();
-    tx.send(build(ack_tx))
-        .map_err(|_| format!("broadcast queue closed for {label}"))?;
-
-    let timeout_secs = env_timeout_secs("JSR_ADMIN_BROADCAST_TIMEOUT_SECS").unwrap_or(5);
-    match time::timeout(Duration::from_secs(timeout_secs), ack_rx).await {
-        Ok(Ok(Ok(()))) => Ok(()),
-        Ok(Ok(Err(err))) => Err(format!("broadcast failed for {label}: {err}").into()),
-        Ok(Err(_)) => Err(format!("broadcast ack channel closed for {label}").into()),
-        Err(_) => Err(format!("broadcast ack timeout for {label} ({timeout_secs}s)").into()),
-    }
 }
 
 fn load_hive(config_dir: &Path) -> Result<HiveFile, AdminError> {
@@ -851,6 +751,249 @@ fn admin_executor_log_dir(state_dir: &Path, hive_id: &str) -> PathBuf {
         .join("executions")
 }
 
+// --- Admin command audit log ---------------------------------------------------------------
+//
+// Admin commands (HTTP/curl, internal L2 — architect etc. — and executor-plan steps) flow through
+// `handle_admin_command`, so one append there gives a "what was done to this backend lately" audit
+// trail, queryable via `list_recent_commands` (GET /hives/{hive}/commands). Storage is an append-only
+// JSONL ring (`commands.jsonl` + rotations) — greppable on disk, size-bounded, params redacted with
+// the shared `redact_executor_log_value` (secret-like field names + vault values NEVER written).
+// SECOND seam (`append_internal_dispatch_log`): publish/unpublish/externalize/unexternalize
+// deliberately bypass `handle_admin_command` (they route straight through
+// `dispatch_internal_admin_command` or they'd time out at SY.config.routes), so they append
+// there instead — same entry shape, same lock, so the trail stays uniform and single-per-command.
+// NOT captured (separate code paths, documented in list_recent_commands help): runtime rollout
+// `update`/`sync_hint`, and orchestrator-AUTONOMOUS actions (respawn/reconcile) that never pass
+// through admin.
+
+/// Rotate by COMMAND COUNT (operator-decided): the active file holds up to this many entries, then
+/// rotates. With the rotations kept, the queryable window is up to 4x this (still tiny on disk).
+const ADMIN_COMMAND_LOG_ROTATE_ENTRIES: usize = 100;
+const ADMIN_COMMAND_LOG_ROTATIONS: u32 = 3;
+/// Cap the redacted params blob per entry so one giant CONFIG_SET can't bloat the log.
+const ADMIN_COMMAND_LOG_PARAMS_MAX_BYTES: usize = 2048;
+const ADMIN_COMMAND_LOG_DEFAULT_LIMIT: usize = 50;
+const ADMIN_COMMAND_LOG_MAX_LIMIT: usize = 500;
+
+#[derive(Debug, Serialize, Deserialize)]
+struct AdminCommandLogEntry {
+    ts_ms: u64,
+    /// RFC3339 copy of ts_ms so the log reads on sight (auditoría humana).
+    ts: String,
+    action: String,
+    /// Target hive of the command (`None` = hive-less action, e.g. add_hive/inventory).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    hive: Option<String>,
+    /// Who issued it: "http" (operator curl/UI), "l2:<src_l2_name>" (internal mesh caller such as
+    /// SY.architect), or "executor" (an admin executor-plan step).
+    origin: String,
+    /// Redacted, size-capped copy of the request params — enough to see WHAT was done, never a secret.
+    params: serde_json::Value,
+    /// "ok" | "error" parsed from the response envelope.
+    status: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error_code: Option<String>,
+    http_status: u16,
+    duration_ms: u64,
+}
+
+fn admin_command_log_dir(state_dir: &Path) -> PathBuf {
+    state_dir.join("sy-admin").join("command-log")
+}
+
+fn admin_command_log_path(state_dir: &Path) -> PathBuf {
+    admin_command_log_dir(state_dir).join("commands.jsonl")
+}
+
+/// Redact + size-cap the params for the audit entry. Reuses the executor-log redactor (secret-like
+/// fields + vault payload `value`s become "<redacted>"); anything still huge is truncated to a
+/// preview so the entry stays audit-sized.
+fn admin_command_log_params(params: &serde_json::Value) -> serde_json::Value {
+    let redacted = redact_executor_log_value(params);
+    let serialized = redacted.to_string();
+    if serialized.len() <= ADMIN_COMMAND_LOG_PARAMS_MAX_BYTES {
+        return redacted;
+    }
+    let mut cut = ADMIN_COMMAND_LOG_PARAMS_MAX_BYTES;
+    while cut > 0 && !serialized.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    serde_json::json!({
+        "_truncated": true,
+        "bytes": serialized.len(),
+        "preview": &serialized[..cut],
+    })
+}
+
+/// Append one entry, rotating `commands.jsonl -> .1 -> .2 -> ...` at the size cap. The caller holds
+/// `ctx.command_log_lock`, so rotate+append is atomic against concurrent commands. Failures are
+/// logged and swallowed: the audit log must never fail the command itself.
+fn append_admin_command_log_locked(state_dir: &Path, entry: &AdminCommandLogEntry) {
+    let dir = admin_command_log_dir(state_dir);
+    if let Err(err) = fs::create_dir_all(&dir) {
+        tracing::warn!(error = %err, "command-log: cannot create dir; entry dropped");
+        return;
+    }
+    let path = admin_command_log_path(state_dir);
+    // Count-based rotation: ~100 entries per file. The file is tiny (≤ ~200KB), so counting lines
+    // per append is negligible next to the admin command it trails.
+    let needs_rotate = fs::read_to_string(&path)
+        .map(|raw| raw.lines().count() >= ADMIN_COMMAND_LOG_ROTATE_ENTRIES)
+        .unwrap_or(false);
+    if needs_rotate {
+        for idx in (1..=ADMIN_COMMAND_LOG_ROTATIONS).rev() {
+            let from = if idx == 1 {
+                path.clone()
+            } else {
+                dir.join(format!("commands.jsonl.{}", idx - 1))
+            };
+            let to = dir.join(format!("commands.jsonl.{idx}"));
+            if from.exists() {
+                let _ = fs::rename(&from, &to);
+            }
+        }
+    }
+    let line = match serde_json::to_string(entry) {
+        Ok(line) => line,
+        Err(err) => {
+            tracing::warn!(error = %err, "command-log: serialize failed; entry dropped");
+            return;
+        }
+    };
+    let result = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+        .and_then(|mut file| writeln!(file, "{line}"));
+    if let Err(err) = result {
+        tracing::warn!(error = %err, "command-log: append failed; entry dropped");
+    }
+}
+
+/// Audit origin string for the command log: the router-stamped caller when the command arrived over
+/// L2 (`l2:<src>`), else the trusted internal path (operator HTTP / executor). Single source for both
+/// the `InternalActionRoute::Command` seam and the direct-dispatch actions below.
+fn command_log_origin(caller_l2_name: Option<&str>) -> String {
+    caller_l2_name
+        .map(|src| format!("l2:{src}"))
+        .unwrap_or_else(|| "internal".to_string())
+}
+
+/// Command-log append for an action that bypasses `handle_admin_command` — publish/unpublish/
+/// externalize/unexternalize go STRAIGHT through `dispatch_internal_admin_command` (they would time
+/// out if shipped to SY.config.routes), so the single append point in `handle_admin_command` never
+/// sees them. This is their audit hook: same entry shape, same lock, same swallow-on-error contract
+/// as the main seam, so the trail stays uniform. Reads `status`/`error_code` off the dispatch
+/// envelope (top-level on every `internal_*` helper) exactly like the `handle_admin_command` tail.
+fn append_internal_dispatch_log(
+    ctx: &AdminContext,
+    action: &str,
+    caller_l2_name: Option<&str>,
+    logged_params: serde_json::Value,
+    started: Instant,
+    result: &Result<InternalAdminDispatchResult, AdminError>,
+) {
+    let (http_status, status, error_code) = match result {
+        Ok(dispatch) => {
+            let status = dispatch
+                .envelope
+                .get("status")
+                .and_then(|v| v.as_str())
+                .unwrap_or(if dispatch.http_status < 400 { "ok" } else { "error" })
+                .to_string();
+            let error_code = dispatch
+                .envelope
+                .get("error_code")
+                .and_then(|v| v.as_str())
+                .map(ToString::to_string);
+            (dispatch.http_status, status, error_code)
+        }
+        Err(err) => (500u16, "error".to_string(), Some(err.to_string())),
+    };
+    let entry = AdminCommandLogEntry {
+        ts_ms: now_epoch_ms(),
+        ts: Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true),
+        action: action.to_string(),
+        hive: Some(ctx.hive_id.clone()),
+        origin: command_log_origin(caller_l2_name),
+        params: logged_params,
+        status,
+        error_code,
+        http_status,
+        duration_ms: started.elapsed().as_millis() as u64,
+    };
+    let _guard = ctx
+        .command_log_lock
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    append_admin_command_log_locked(&ctx.state_dir, &entry);
+}
+
+#[derive(Debug, Default, Clone)]
+struct AdminCommandLogQuery {
+    limit: usize,
+    action: Option<String>,
+    status: Option<String>,
+    hive: Option<String>,
+    since_ms: Option<u64>,
+}
+
+/// Read the most recent entries (newest first), walking the current file then rotations until the
+/// limit fills. Filters: exact action, status ok|error, target hive, since_ms.
+fn read_recent_admin_commands(
+    state_dir: &Path,
+    query: &AdminCommandLogQuery,
+) -> Vec<serde_json::Value> {
+    let dir = admin_command_log_dir(state_dir);
+    let limit = query.limit.clamp(1, ADMIN_COMMAND_LOG_MAX_LIMIT);
+    let mut out: Vec<serde_json::Value> = Vec::new();
+    let mut files = vec![admin_command_log_path(state_dir)];
+    for idx in 1..=ADMIN_COMMAND_LOG_ROTATIONS {
+        files.push(dir.join(format!("commands.jsonl.{idx}")));
+    }
+    for file in files {
+        if out.len() >= limit {
+            break;
+        }
+        let Ok(raw) = fs::read_to_string(&file) else {
+            continue;
+        };
+        for line in raw.lines().rev() {
+            if out.len() >= limit {
+                break;
+            }
+            let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
+                continue;
+            };
+            let matches = query
+                .action
+                .as_deref()
+                .is_none_or(|a| value.get("action").and_then(|v| v.as_str()) == Some(a))
+                && query
+                    .status
+                    .as_deref()
+                    .is_none_or(|s| value.get("status").and_then(|v| v.as_str()) == Some(s))
+                && query.hive.as_deref().is_none_or(|h| {
+                    // Hive-less commands (add_hive/remove_hive/inventory — hive: None) are GLOBAL:
+                    // always shown, even under a hive-scoped query, so they are never hidden.
+                    match value.get("hive").and_then(|v| v.as_str()) {
+                        Some(entry_hive) => entry_hive == h,
+                        None => true,
+                    }
+                })
+                && query
+                    .since_ms
+                    .is_none_or(|since| {
+                        value.get("ts_ms").and_then(|v| v.as_u64()).unwrap_or(0) >= since
+                    });
+            if matches {
+                out.push(value);
+            }
+        }
+    }
+    out
+}
+
 fn load_admin_executor_node_config(
     hive_id: &str,
 ) -> Result<Option<AdminExecutorNodeConfigFile>, AdminError> {
@@ -876,7 +1019,7 @@ fn save_admin_executor_node_config(
 }
 
 /// Build the admin executor AI runtime by discovering the `openai` resource
-/// in SY.vault (Model D' pool match: dedicated → tenant pool → root-tenant pool).
+/// in SY.vault (owned → assigned → its tenant's general secret; admin's tenant is the root one).
 /// Returns `Ok(None)` (degraded) on any of:
 /// - vault has no openai secret reachable from our (ilk, tenant) match;
 /// - vault unreachable or denies access;
@@ -1158,33 +1301,44 @@ fn build_admin_executor_function_catalog(
         .collect()
 }
 
+/// True if a (lowercased) field name names a secret whose VALUE must never be persisted to a log.
+/// Mirrors the SY.architect `key_looks_secret` peer (single de-diverged policy) and additionally
+/// covers the bootstrap-credential field names the add_hive contract promises never to log
+/// (`ssh_password` via `_password`; `ssh_key`/`private_key` via the explicit names + `_key`).
+fn redaction_field_is_secret(lower: &str) -> bool {
+    matches!(
+        lower,
+        "api_key"
+            | "apikey"
+            | "token"
+            | "access_token"
+            | "client_secret"
+            | "secret"
+            | "password"
+            | "authorization"
+            | "ssh_key"
+            | "ssh_password"
+            | "private_key"
+    ) || lower.ends_with("_api_key")
+        || lower.ends_with("_token")
+        || lower.ends_with("_secret")
+        || lower.ends_with("_password")
+        || lower.ends_with("_private_key")
+}
+
 fn redact_executor_log_value(value: &serde_json::Value) -> serde_json::Value {
     match value {
         serde_json::Value::Object(map) => {
             let mut redacted = serde_json::Map::new();
-            let looks_like_vault_payload = map.contains_key("key")
-                && map.contains_key("value")
-                && (map.contains_key("metadata")
-                    || map.contains_key("version")
-                    || map.get("action").and_then(serde_json::Value::as_str) == Some("vault_get")
-                    || map.get("action").and_then(serde_json::Value::as_str) == Some("vault_put")
-                    || map
-                        .get("key")
-                        .and_then(serde_json::Value::as_str)
-                        .is_some_and(|key| {
-                            key.contains(':')
-                                && key.bytes().all(|b| {
-                                    b.is_ascii_lowercase()
-                                        || b.is_ascii_digit()
-                                        || matches!(b, b':' | b'_' | b'-')
-                                })
-                        }));
+            // A vault-shaped `{key, value, ...}` object: redact `value` unconditionally. (Previously
+            // this required metadata/version/an embedded action/a colon-key heuristic — a colon-less
+            // valid key like `slack-tokens` defeated it and leaked the value. `key`+`value` together
+            // is vault-specific enough; over-redacting a benign pair in an audit log is acceptable.)
+            let looks_like_vault_payload = map.contains_key("key") && map.contains_key("value");
             for (key, entry) in map {
                 let lower = key.to_ascii_lowercase();
-                if matches!(
-                    lower.as_str(),
-                    "api_key" | "token" | "secret" | "password" | "authorization"
-                ) || (looks_like_vault_payload && lower == "value")
+                if redaction_field_is_secret(&lower)
+                    || (looks_like_vault_payload && lower == "value")
                 {
                     redacted.insert(
                         key.clone(),
@@ -1680,83 +1834,21 @@ fn executor_dispatch_target_and_params(
     Ok((target, serde_json::Value::Object(params)))
 }
 
-fn config_changed_version_channel(subsystem: &str) -> &'static str {
-    match subsystem {
-        // routes + vpn share version stream because SY.config.routes keeps one config version.
-        "routes" | "vpn" | "vpns" => "routes-vpns",
-        "storage" => "storage",
-        _ => "general",
-    }
-}
-
-fn config_changed_version_path(state_dir: &Path, subsystem: &str) -> PathBuf {
-    state_dir
-        .join("config_versions")
-        .join(format!("{}.txt", config_changed_version_channel(subsystem)))
-}
-
-fn allocate_config_changed_versions(
-    state_dir: &Path,
-    subsystem: &str,
-    count: usize,
-    requested_start: Option<u64>,
-) -> Result<Vec<u64>, AdminError> {
-    if count == 0 {
-        return Ok(Vec::new());
-    }
-    let path = config_changed_version_path(state_dir, subsystem);
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    let current = fs::read_to_string(&path)
-        .ok()
-        .and_then(|data| data.trim().parse::<u64>().ok())
-        .unwrap_or(0);
-
-    let start = match requested_start {
-        Some(requested) => {
-            if requested <= current {
-                return Err(
-                    format!("version must be greater than current (current={current})").into(),
-                );
-            }
-            requested
-        }
-        None => current.saturating_add(1),
-    };
-    let end = start.saturating_add(count as u64 - 1);
-    fs::write(&path, end.to_string())?;
-    Ok((start..=end).collect())
-}
-
-fn next_config_changed_version(
-    state_dir: &Path,
-    subsystem: &str,
-    requested: Option<u64>,
-) -> Result<u64, AdminError> {
-    let mut versions = allocate_config_changed_versions(state_dir, subsystem, 1, requested)?;
-    Ok(versions.remove(0))
-}
-
-async fn broadcast_config_changed(
+/// Hand a user-policy write to the motherbee's SY.opa.rules, the only one that compiles and applies
+/// (one global policy; the other hives install what it publishes).
+async fn send_opa_config_changed(
     client: &RouterDispatcher,
-    subsystem: &str,
-    action: Option<String>,
+    action: &str,
     auto_apply: Option<bool>,
     version: u64,
     config: serde_json::Value,
-    target_hive: Option<String>,
 ) -> Result<(), AdminError> {
     let sender = client.sender_snapshot();
-    let dst = match target_hive {
-        Some(hive) => Destination::Unicast(format!("SY.opa.rules@{}", hive)),
-        None => Destination::Broadcast,
-    };
     let msg = Message {
         routing: Routing {
             src: sender.uuid().to_string(),
             src_l2_name: None,
-            dst,
+            dst: Destination::Unicast(format!("SY.opa.rules@{PRIMARY_HIVE_ID}")),
             ttl: 16,
             trace_id: Uuid::new_v4().to_string(),
         },
@@ -1772,40 +1864,22 @@ async fn broadcast_config_changed(
             ..Meta::default()
         },
         payload: serde_json::to_value(ConfigChangedPayload {
-            subsystem: subsystem.to_string(),
-            action: action.clone(),
+            subsystem: "opa".to_string(),
+            action: Some(action.to_string()),
             auto_apply,
             version,
             config,
+            hive: Some(PRIMARY_HIVE_ID.to_string()),
         })?,
     };
     sender.send(msg).await?;
-    tracing::info!(
-        subsystem = subsystem,
-        action = action.as_deref().unwrap_or(""),
-        version = version,
-        "config changed broadcast sent"
-    );
+    tracing::info!(action, version, "opa write sent to the motherbee");
     Ok(())
-}
-
-#[derive(Debug, Deserialize)]
-struct ConfigUpdate {
-    #[serde(default)]
-    routes: Option<Vec<RouteConfig>>,
-    #[serde(default)]
-    vpns: Option<Vec<VpnConfig>>,
-    #[serde(default)]
-    taps: Option<Vec<TapConfig>>,
-    #[serde(default)]
-    version: Option<u64>,
 }
 
 #[derive(Debug, Deserialize)]
 struct StorageUpdate {
     path: String,
-    #[serde(default)]
-    version: Option<u64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1839,9 +1913,17 @@ async fn run_internal_admin_loop(
     mut rx: RpcCommandReceiver,
 ) {
     while let Some(msg) = rx.recv().await {
-        if let Err(err) = handle_internal_admin_command(&ctx, &client, &msg).await {
-            tracing::warn!(error = %err, "internal admin command handling failed");
-        }
+        // Every command runs in its own task, as the operator's HTTP requests do (one task per
+        // connection). A handler that calls this admin back must never wait behind its own
+        // caller: a node teardown (delete_ilk, vault_delete), SY.wf-rules publishing and launching
+        // a workflow, an executor plan. Run inline, each deadlocked until a timeout: Cloud's
+        // delete_node (0.1.68 gate, A-67) and every workflow deploy from Archi (A-68).
+        let (ctx, client) = (ctx.clone(), client.clone());
+        tokio::spawn(async move {
+            if let Err(err) = handle_internal_admin_command(&ctx, &client, &msg).await {
+                tracing::warn!(error = %err, "internal admin command handling failed");
+            }
+        });
     }
 }
 
@@ -2012,9 +2094,28 @@ impl FunctionTool for PlanStepReviewTool {
     }
 }
 
+/// The root tenant pays for SY.admin's executor; each record keeps its run and the router-stamped
+/// name of who asked for it (docs/router-stream-v1.md §7.3).
+fn executor_usage_account(
+    ctx: &AdminContext,
+    execution_id: Option<&str>,
+    caller: Option<&str>,
+    stage: &str,
+) -> AiAccount {
+    AiAccount::root(ctx.usage.clone(), &ctx.node_name)
+        .with_node_ilk(Some(ctx.self_ilk_id.clone()))
+        .with_work(UsageWork {
+            execution_id: execution_id.map(str::to_string),
+            caller: caller.map(str::to_string),
+            stage: Some(stage.to_string()),
+            ..UsageWork::default()
+        })
+}
+
 async fn semantic_review_executor_plan(
     runtime: &AdminExecutorAiRuntime,
     plan: &AdminExecutorPlan,
+    account: &AiAccount,
 ) -> Result<(), String> {
     let mut all_issues: Vec<String> = Vec::new();
 
@@ -2059,6 +2160,7 @@ Step to review:\n{}",
             runtime.model.clone(),
             Some(prompt),
             runtime.model_settings.clone(),
+            account.clone(),
         );
         let runner = FunctionCallingRunner::new(FunctionCallingConfig::default());
         let _ = runner
@@ -2343,7 +2445,9 @@ async fn execute_admin_executor_step_fallback(
         }
     };
     let (_http_status, body) =
-        match handle_admin_command(ctx, client, &step.action, params, target).await {
+        match handle_admin_command_with_origin(ctx, client, &step.action, params, target, "executor")
+            .await
+        {
             Ok(values) => values,
             Err(err) => {
                 let failure = failure_from_detail(err.to_string(), "admin_action_failure");
@@ -2459,7 +2563,9 @@ async fn execute_admin_executor_plan(
     ctx: &AdminContext,
     client: &Arc<RouterDispatcher>,
     request: &AdminExecutorRunRequest,
+    caller: Option<&str>,
 ) -> Result<serde_json::Value, AdminError> {
+    let account = executor_usage_account(ctx, Some(&request.execution_id), caller, "executor");
     validate_executor_plan(&request.plan).map_err(|detail| -> AdminError { detail.into() })?;
     let runtime = ctx
         .executor_runtime
@@ -2539,6 +2645,7 @@ async fn execute_admin_executor_plan(
             runtime.model.clone(),
             Some(admin_executor_prompt(&resolved_step, &request.plan)),
             runtime.model_settings.clone(),
+            account.clone(),
         );
         let runner = FunctionCallingRunner::new(FunctionCallingConfig::default());
         let result = runner
@@ -2895,13 +3002,11 @@ async fn handle_internal_admin_command(
         }
     };
 
-    // No global command_lock here: this loop is already a single async task
-    // serialised by `rx.recv()` in run_internal_admin_loop. Holding a shared
-    // lock across an external `.await` deadlocks when the forwarded command
-    // causes the target node (e.g. architect) to call back to admin with a
-    // nested ADMIN_COMMAND (e.g. vault_put) — the callback then blocks waiting
-    // for the lock the HTTP handler still holds.
-    let internal = dispatch_internal_admin_command(
+    // No global command_lock here: each command runs in its own task (run_internal_admin_loop),
+    // as each HTTP request does. Holding a shared lock across an external `.await` deadlocks when
+    // the forwarded command causes the target node (e.g. architect) to call back to admin with a
+    // nested ADMIN_COMMAND (e.g. vault_put) — the callback then blocks waiting for the lock.
+    let internal = match dispatch_internal_admin_command(
         ctx,
         client,
         &action,
@@ -2911,7 +3016,26 @@ async fn handle_internal_admin_command(
         // cross-hive). This is the authz origin — never the payload.
         msg.routing.src_l2_name.as_deref(),
     )
-    .await?;
+    .await
+    {
+        Ok(internal) => internal,
+        // A failure before any reply was built (a request it could not parse, a transport error)
+        // still answers: a caller over the mesh would otherwise wait for its own timeout.
+        Err(err) => {
+            let detail = serde_json::json!({ "message": err.to_string() });
+            return send_admin_command_response(
+                client,
+                msg,
+                &action,
+                "error",
+                serde_json::Value::Null,
+                Some("INTERNAL_ERROR".to_string()),
+                Some(detail),
+                parsed.request_id,
+            )
+            .await;
+        }
+    };
     let status = internal
         .envelope
         .get("status")
@@ -3046,6 +3170,10 @@ enum InternalActionRoute {
     WfRulesHttp(WfRulesAction),
     WfRulesQuery(&'static str),
     TimerRpc(&'static str),
+    /// Admin asks every router stream of the hive itself (A-70).
+    StreamStatus,
+    /// Admin asks SY.storage for the LLM usage records (A-70 stage 3).
+    LlmUsage,
 }
 
 #[derive(Clone, Copy)]
@@ -3056,7 +3184,7 @@ struct InternalActionSpec {
     allow_legacy_hive_id: bool,
 }
 
-const INTERNAL_ACTION_REGISTRY_VERSION: &str = "9";
+const INTERNAL_ACTION_REGISTRY_VERSION: &str = "13";
 
 const INTERNAL_ACTION_REGISTRY: &[InternalActionSpec] = &[
     InternalActionSpec {
@@ -3152,6 +3280,18 @@ const INTERNAL_ACTION_REGISTRY: &[InternalActionSpec] = &[
     InternalActionSpec {
         action: "list_nodes",
         route: InternalActionRoute::Query("list_nodes"),
+        requires_target: true,
+        allow_legacy_hive_id: false,
+    },
+    InternalActionSpec {
+        action: "list_streams",
+        route: InternalActionRoute::StreamStatus,
+        requires_target: true,
+        allow_legacy_hive_id: false,
+    },
+    InternalActionSpec {
+        action: "get_llm_usage",
+        route: InternalActionRoute::LlmUsage,
         requires_target: true,
         allow_legacy_hive_id: false,
     },
@@ -3276,9 +3416,22 @@ const INTERNAL_ACTION_REGISTRY: &[InternalActionSpec] = &[
         allow_legacy_hive_id: false,
     },
     InternalActionSpec {
+        action: "list_tenant_nodes",
+        route: InternalActionRoute::Query("list_tenant_nodes"),
+        requires_target: true,
+        allow_legacy_hive_id: false,
+    },
+    InternalActionSpec {
         action: "send_node_message",
         route: InternalActionRoute::Command("send_node_message"),
         requires_target: true,
+        allow_legacy_hive_id: false,
+    },
+    InternalActionSpec {
+        action: "list_recent_commands",
+        route: InternalActionRoute::Command("list_recent_commands"),
+        // The log lives on THIS admin; target (hive) is only a filter, so it is optional.
+        requires_target: false,
         allow_legacy_hive_id: false,
     },
     InternalActionSpec {
@@ -3314,6 +3467,42 @@ const INTERNAL_ACTION_REGISTRY: &[InternalActionSpec] = &[
     InternalActionSpec {
         action: "delete_ilk",
         route: InternalActionRoute::Command("delete_ilk"),
+        requires_target: true,
+        allow_legacy_hive_id: false,
+    },
+    InternalActionSpec {
+        action: "restore_ilk",
+        route: InternalActionRoute::Command("restore_ilk"),
+        requires_target: true,
+        allow_legacy_hive_id: false,
+    },
+    InternalActionSpec {
+        action: "set_ilk_tenant",
+        route: InternalActionRoute::Command("set_ilk_tenant"),
+        requires_target: true,
+        allow_legacy_hive_id: false,
+    },
+    InternalActionSpec {
+        action: "purge_ilk",
+        route: InternalActionRoute::Command("purge_ilk"),
+        requires_target: true,
+        allow_legacy_hive_id: false,
+    },
+    InternalActionSpec {
+        action: "delete_tenant",
+        route: InternalActionRoute::Command("delete_tenant"),
+        requires_target: true,
+        allow_legacy_hive_id: false,
+    },
+    InternalActionSpec {
+        action: "restore_tenant",
+        route: InternalActionRoute::Command("restore_tenant"),
+        requires_target: true,
+        allow_legacy_hive_id: false,
+    },
+    InternalActionSpec {
+        action: "purge_tenant",
+        route: InternalActionRoute::Command("purge_tenant"),
         requires_target: true,
         allow_legacy_hive_id: false,
     },
@@ -3384,8 +3573,20 @@ const INTERNAL_ACTION_REGISTRY: &[InternalActionSpec] = &[
         allow_legacy_hive_id: false,
     },
     InternalActionSpec {
+        action: "vault_assign",
+        route: InternalActionRoute::Command("vault_assign"),
+        requires_target: true,
+        allow_legacy_hive_id: false,
+    },
+    InternalActionSpec {
         action: "vault_rollback",
         route: InternalActionRoute::Command("vault_rollback"),
+        requires_target: true,
+        allow_legacy_hive_id: false,
+    },
+    InternalActionSpec {
+        action: "core_rollback",
+        route: InternalActionRoute::Command("core_rollback"),
         requires_target: true,
         allow_legacy_hive_id: false,
     },
@@ -3426,6 +3627,12 @@ const INTERNAL_ACTION_REGISTRY: &[InternalActionSpec] = &[
         allow_legacy_hive_id: false,
     },
     InternalActionSpec {
+        action: "publish_cloud_endpoint",
+        route: InternalActionRoute::Command("publish_cloud_endpoint"),
+        requires_target: false,
+        allow_legacy_hive_id: false,
+    },
+    InternalActionSpec {
         action: "sync_hint",
         route: InternalActionRoute::SyncHint,
         requires_target: true,
@@ -3458,6 +3665,12 @@ const INTERNAL_ACTION_REGISTRY: &[InternalActionSpec] = &[
     InternalActionSpec {
         action: "opa_rollback",
         route: InternalActionRoute::OpaHttp(OpaAction::Rollback),
+        requires_target: false,
+        allow_legacy_hive_id: false,
+    },
+    InternalActionSpec {
+        action: "opa_clear",
+        route: InternalActionRoute::OpaHttp(OpaAction::Clear),
         requires_target: false,
         allow_legacy_hive_id: false,
     },
@@ -3817,9 +4030,17 @@ async fn handle_unpublish_artifact(
     caller_l2_name: Option<&str>,
 ) -> Result<InternalAdminDispatchResult, AdminError> {
     let action = "unpublish_artifact";
-    let caller = match authorize_artifact_publisher(caller_l2_name) {
-        Ok(caller) => caller,
-        Err(detail) => return Ok(internal_unauthorized(action, &detail)),
+    // Producer path (mesh, caller_l2_name = Some): gated to an IO./AI./WF. node and
+    // owner-checked below. Operator path (caller_l2_name = None, the trusted localhost HTTP
+    // server): may unpublish ANY publication (D2 — a deliberate operator escape hatch so a
+    // retired/renamed producer's publication can still be revoked; mirrors the None-bypass of
+    // the channel/externalize seams).
+    let caller: Option<String> = match caller_l2_name {
+        Some(_) => match authorize_artifact_publisher(caller_l2_name) {
+            Ok(caller) => Some(caller),
+            Err(detail) => return Ok(internal_unauthorized(action, &detail)),
+        },
+        None => None,
     };
     let request: UnpublishArtifactParams = match serde_json::from_value(params) {
         Ok(request) => request,
@@ -3839,13 +4060,19 @@ async fn handle_unpublish_artifact(
     let Some(mut record) = ledger.publications.get(&request.publication_id).cloned() else {
         return Ok(internal_invalid_request(action, "publication not found"));
     };
-    if record.publisher_l2_name != caller {
-        return Ok(internal_unauthorized(
-            action,
-            "a node may unpublish only its own publication",
-        ));
+    if let Some(caller) = &caller {
+        if record.publisher_l2_name != *caller {
+            return Ok(internal_unauthorized(
+                action,
+                "a node may unpublish only its own publication",
+            ));
+        }
     }
-    if record.status == "unpublished" {
+    // Both retired states are terminal no-ops: "unpublished" (explicit revoke) AND "expired" (the
+    // TTL sweep already reclaimed edge row + blob). Re-running the edge/blob RPCs on an expired
+    // record would be wasteful and would overwrite its terminal "expired" audit status with
+    // "unpublished".
+    if record.status == "unpublished" || record.status == "expired" {
         return Ok(InternalAdminDispatchResult {
             http_status: 200,
             envelope: serde_json::json!({
@@ -3931,15 +4158,55 @@ fn resolve_artifact_publisher(
     Ok((option.tenant_id, caller.to_string()))
 }
 
+/// The hives this motherbee joined: one `<hive>/info.yaml` each, written by the orchestrator.
+fn hives_registry_root(ctx: &AdminContext) -> PathBuf {
+    ctx.state_dir
+        .parent()
+        .unwrap_or(ctx.state_dir.as_path())
+        .join("hives")
+}
+
+/// Every hive a global write must reach: the motherbee plus each joined hive the registry calls
+/// `connected`, reachable right now or not. The LSA only says who is reachable now; a hive cut off
+/// keeps enforcing its last policy, so it has to show up as pending, not drop out of the report.
+fn opa_rollout_hives(ctx: &AdminContext) -> Vec<String> {
+    connected_hives_with(&ctx.hive_id, &hives_registry_root(ctx))
+}
+
+fn connected_hives_with(self_hive: &str, registry_root: &Path) -> Vec<String> {
+    let mut hives = vec![self_hive.to_string()];
+    if let Ok(entries) = fs::read_dir(registry_root) {
+        for entry in entries.flatten() {
+            let Ok(raw) = fs::read_to_string(entry.path().join("info.yaml")) else {
+                continue;
+            };
+            let Ok(info) = serde_yaml::from_str::<serde_json::Value>(&raw) else {
+                continue;
+            };
+            if info.get("status").and_then(|value| value.as_str()) != Some("connected") {
+                continue;
+            }
+            if let Some(hive) = info
+                .get("hive_id")
+                .and_then(|value| value.as_str())
+                .map(str::trim)
+                .filter(|hive| !hive.is_empty())
+            {
+                if !hives.iter().any(|known| known == hive) {
+                    hives.push(hive.to_string());
+                }
+            }
+        }
+    }
+    hives.sort();
+    hives
+}
+
 fn resolve_public_edge_node(ctx: &AdminContext) -> Result<String, String> {
     if let Some(edge) = ctx.public_edge_node.as_deref() {
         return validate_public_edge_node(edge).map(str::to_string);
     }
-    let hives_root = ctx
-        .state_dir
-        .parent()
-        .unwrap_or(ctx.state_dir.as_path())
-        .join("hives");
+    let hives_root = hives_registry_root(ctx);
     let mut candidates = Vec::new();
     let entries = fs::read_dir(&hives_root).map_err(|err| {
         format!(
@@ -4169,6 +4436,121 @@ async fn unpublish_edge_blob(
     }
 }
 
+/// Publication expiry GC (D4). Every publication carries a finite `expires_at` (always set —
+/// clamped `MIN..MAX` at publish, there is no "never" case), so this background reaper is what
+/// actually retires them. On a fixed interval it retires every publication whose deadline has
+/// passed, driving the SAME `edge_removed -> released` transition as an operator
+/// `unpublish_artifact` so both the edge allowlist row and the curated `public/` blob are
+/// reclaimed. It NEVER deletes ledger rows: a reaped publication settles at status `"expired"`
+/// (vs `"unpublished"` for an explicit revoke) so the audit trail survives.
+async fn run_publication_expiry_sweep(ctx: AdminContext, client: Arc<RouterDispatcher>) {
+    let mut ticker = tokio::time::interval(Duration::from_secs(PUBLICATION_EXPIRY_SWEEP_SECS));
+    // A stalled tick (io.blob/edge transiently down) must not stack up a burst of catch-up
+    // sweeps — one late run covers the same backlog.
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        ticker.tick().await;
+        if let Err(err) = sweep_expired_publications_once(&ctx, &client).await {
+            tracing::warn!("publication expiry sweep failed: {err}");
+        }
+    }
+}
+
+/// One reaper pass. Idempotent + crash-safe: each retirement mirrors `handle_unpublish_artifact`
+/// (edge unpublish -> persist `edge_removed` -> blob release -> persist `expired`), the ledger is
+/// written after every state change, and a row already at `unpublished`/`expired` — or already at
+/// `edge_removed` from a prior crash — resumes from where it stopped. A single record failing to
+/// retire (edge/io.blob transiently down) is logged and left for the next tick; it never blocks
+/// the rest of the batch. Returns `Err` only for a ledger load/persist failure (whole pass aborts).
+async fn sweep_expired_publications_once(
+    ctx: &AdminContext,
+    client: &Arc<RouterDispatcher>,
+) -> Result<(), String> {
+    // Snapshot the due set under a SHORT lock, then RELEASE it — never hold publication_lock across
+    // the network RPCs. The serial internal-admin loop (run_internal_admin_loop) and
+    // handle_publish/unpublish_artifact all contend on this lock; holding it across an unbounded
+    // batch of 30s edge/blob RPCs would head-of-line-block the whole admin control plane (a mesh
+    // publish issued mid-sweep would stall and blow its 120s RPC timeout). Each retirement below
+    // re-acquires the lock for ONE op only (bounded like handle_unpublish_artifact) and re-checks
+    // the record against the freshly-loaded ledger.
+    let due: Vec<String> = {
+        let _publication_guard = ctx.publication_lock.lock().await;
+        let ledger = load_admin_publication_ledger(&ctx.publication_ledger_path)?;
+        let now = Utc::now().timestamp().max(0) as u64;
+        ledger
+            .publications
+            .values()
+            .filter(|record| {
+                record.expires_at <= now
+                    && record.status != "unpublished"
+                    && record.status != "expired"
+            })
+            .map(|record| record.publication_id.clone())
+            .collect()
+    };
+    if due.is_empty() {
+        return Ok(());
+    }
+    let mut retired = 0usize;
+    for publication_id in due {
+        match retire_expired_publication(ctx, client, &publication_id).await {
+            Ok(true) => retired += 1,
+            Ok(false) => {}
+            Err(err) => {
+                tracing::warn!("expiry sweep: retire deferred for {publication_id}: {err}")
+            }
+        }
+    }
+    if retired > 0 {
+        tracing::info!("publication expiry sweep retired {retired} publication(s)");
+    }
+    Ok(())
+}
+
+/// Retire ONE expired publication, holding `publication_lock` for only this single retirement
+/// (edge unpublish -> persist `edge_removed` -> blob release -> persist `expired`) — the same
+/// per-op hold as `handle_unpublish_artifact`, so the sweep never monopolizes the lock across the
+/// whole batch. The ledger is re-loaded UNDER the lock and the record re-checked, so a publication
+/// that a concurrent operator/producer unpublish already retired (status `unpublished`), that the
+/// previous sweep already expired, or that is no longer due, is skipped — never clobbered. Returns
+/// `Ok(true)` if it advanced the record to `expired`, `Ok(false)` if there was nothing to do.
+async fn retire_expired_publication(
+    ctx: &AdminContext,
+    client: &Arc<RouterDispatcher>,
+    publication_id: &str,
+) -> Result<bool, String> {
+    let _publication_guard = ctx.publication_lock.lock().await;
+    let mut ledger = load_admin_publication_ledger(&ctx.publication_ledger_path)?;
+    let now = Utc::now().timestamp().max(0) as u64;
+    let Some(mut record) = ledger.publications.get(publication_id).cloned() else {
+        return Ok(false);
+    };
+    // Re-check under the lock: a concurrent unpublish may have retired it, a prior tick may have
+    // expired it, or its TTL may no longer be due (defensive — the snapshot filter already screened).
+    if record.status == "unpublished" || record.status == "expired" || record.expires_at > now {
+        return Ok(false);
+    }
+    // Edge allowlist row first — skip if a prior crash already got past it (idempotent: the edge
+    // replies removed:false for a row it already reaped, which unpublish_edge_blob treats as ok).
+    if record.status != "edge_removed" {
+        unpublish_edge_blob(client, &record.edge_node, publication_id).await?;
+        record.status = "edge_removed".to_string();
+        ledger
+            .publications
+            .insert(publication_id.to_string(), record.clone());
+        persist_admin_publication_ledger(&ctx.publication_ledger_path, &ledger)?;
+    }
+    // Curated public/ blob refcount release (idempotent on io.blob's side by publication_id).
+    release_curated_blob(client, ctx, publication_id).await?;
+    record.status = "expired".to_string();
+    record.released_at = Some(now);
+    ledger
+        .publications
+        .insert(publication_id.to_string(), record.clone());
+    persist_admin_publication_ledger(&ctx.publication_ledger_path, &ledger)?;
+    Ok(true)
+}
+
 /// `externalize` — an IO node self-exposes one of its channels (`ICH`) as a public
 /// URL on the edge (v6 §7). Resolves `ICH -> owner_l2_name` from identity SHM (admin
 /// runs where identity lives) and OPENS the URL on the edge via the `EDGE_OPEN_URL`
@@ -4182,9 +4564,144 @@ async fn unpublish_edge_blob(
 /// Still deferred (v6 §12): the durable `ICH` "externalized" attribute in `SY.identity`
 /// for reconstruction after an Edge reimage. Shared-secret token minting and Edge-owned Vault
 /// persistence are implemented below.
+/// Abre la puerta publica de Fluxbee Cloud y devuelve el token UNA sola vez.
+///
+/// `IO.cloud` es el relay de aprovisionamiento de Fluxbee Cloud: su endpoint expone
+/// `create_tenant`, `vault_put` y `run_node`, protegidos por un unico bearer. Esta accion es el
+/// bootstrap de esa puerta, y esta acotada a eso a proposito — no es un externalize generico.
+///
+/// # Por que devuelve el token en vez de dejarlo leer despues
+///
+/// El secreto del canal se guarda en el vault bajo `edge_channel_secret:{ich}`, DEDICADO al ILK de
+/// SY.edge, y `authorize_read` no tiene bypass de admin: eso esta escrito a proposito y no se toca.
+/// Asi que el operador no LEE el token — lo ACUÑA y se lo lleva en el momento, que es el mismo
+/// camino que el codigo ya bendice para cualquier llamador del mint.
+///
+/// Consecuencia asumida y explicita: **el token se ve una sola vez**. Si se pierde, se vuelve a
+/// publicar y rota (la ventana de gracia del edge cubre a los clientes en vuelo). Que un secreto no
+/// se pueda releer y solo se pueda rotar es sano, no una limitacion.
+///
+/// No manda `secret`: dejar que admin lo acuñe es el camino por defecto, y el unico que garantiza
+/// que el valor nazca fuerte y viva solo en el vault. Pasar uno propio es el "explicit opt-out"
+/// documentado en `handle_externalize`, y esta accion deliberadamente no lo ofrece.
+async fn handle_publish_cloud_endpoint(
+    ctx: &AdminContext,
+    client: &RouterDispatcher,
+    params: serde_json::Value,
+) -> Result<InternalAdminDispatchResult, AdminError> {
+    let get_str = |key: &str| {
+        params
+            .get(key)
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+            .map(ToString::to_string)
+    };
+
+    let cloud_node = get_str("cloud_node")
+        .unwrap_or_else(|| format!("IO.cloud@{}", ctx.hive_id));
+    let Some(edge_node) = get_str("edge_node") else {
+        return Ok(internal_invalid_request(
+            "publish_cloud_endpoint",
+            "missing edge_node (the SY.edge L2 name to publish on, e.g. SY.edge@ingress1)",
+        ));
+    };
+
+    // El operador nombra el NODO; el ICH lo resolvemos nosotros.
+    let ich = match fluxbee_sdk::identity::list_ich_options_from_hive_config(&ctx.config_dir) {
+        Ok(options) => match resolve_ich_owned_by(options, &cloud_node) {
+            Ok(value) => value,
+            Err(detail) => {
+                return Ok(internal_invalid_request("publish_cloud_endpoint", &detail))
+            }
+        },
+        Err(err) => {
+            return Ok(internal_invalid_request(
+                "publish_cloud_endpoint",
+                &format!("identity SHM unavailable for channel resolve: {err}"),
+            ))
+        }
+    };
+
+    tracing::info!(
+        cloud_node = %cloud_node,
+        edge_node = %edge_node,
+        ich = %ich,
+        "publish_cloud_endpoint: abriendo la puerta publica de Fluxbee Cloud"
+    );
+
+    // Reusa el camino real (acuña -> guarda en vault -> manda solo el secret_ref al edge). El
+    // `caller_l2_name: None` es el camino interno confiable del servidor HTTP del operador, ya
+    // contemplado por authorize_channel_command.
+    let externalize = handle_externalize(
+        ctx,
+        client,
+        serde_json::json!({
+            "ich": ich,
+            "edge_node": edge_node.clone(),
+            "auth_mode": "shared-secret",
+            "inbound_family": "user",
+            "methods": ["POST"],
+        }),
+        None,
+    )
+    .await?;
+
+    // Record the edge into IO.cloud's MANAGED config so the node trusts it for inbound traffic —
+    // the contract's happy path ("publish_cloud_endpoint publica el endpoint Y deja asentado el
+    // edge_node"). io.cloud reads config.io.edge_node LIVE from its control plane, so this takes
+    // effect with no restart and no token rotation. Only when the externalize actually succeeded:
+    // there is nothing to trust otherwise. This replaces the old poison IO_CLOUD_EDGE_NODE env.
+    let externalized_ok =
+        externalize.envelope.get("status").and_then(|v| v.as_str()) == Some("ok");
+    if externalized_ok {
+        let record = handle_admin_command(
+            ctx,
+            client,
+            "set_node_config",
+            serde_json::json!({
+                "node_name": cloud_node.clone(),
+                "config": { "io": { "edge_node": edge_node.clone() } },
+            }),
+            Some(ctx.hive_id.clone()),
+        )
+        .await;
+        match record {
+            Ok((status, _)) if status < 400 => {
+                tracing::info!(
+                    cloud_node = %cloud_node,
+                    edge_node = %edge_node,
+                    "publish_cloud_endpoint: edge_node asentado en el config de IO.cloud"
+                );
+            }
+            Ok((status, body)) => {
+                return Ok(internal_service_error(
+                    "publish_cloud_endpoint",
+                    "CONFIG_RECORD_FAILED",
+                    &format!(
+                        "endpoint published but recording edge_node into {cloud_node} config failed \
+                         (HTTP {status}): {body}. Re-run publish_cloud_endpoint to re-record."
+                    ),
+                ));
+            }
+            Err(err) => {
+                return Ok(internal_service_error(
+                    "publish_cloud_endpoint",
+                    "CONFIG_RECORD_FAILED",
+                    &format!(
+                        "endpoint published but recording edge_node into {cloud_node} config failed: \
+                         {err}. Re-run publish_cloud_endpoint to re-record."
+                    ),
+                ));
+            }
+        }
+    }
+    Ok(externalize)
+}
+
 async fn handle_externalize(
     ctx: &AdminContext,
-    client: &Arc<RouterDispatcher>,
+    client: &RouterDispatcher,
     params: serde_json::Value,
     caller_l2_name: Option<&str>,
 ) -> Result<InternalAdminDispatchResult, AdminError> {
@@ -4217,6 +4734,114 @@ async fn handle_externalize(
             .collect::<Vec<String>>()
     });
 
+    // FANOUT variant (IO.wapp, docs/io-wapp-design.md §5): a provider whose single mandatory webhook
+    // must reach a FAMILY of nodes (glob), each verifying + self-selecting. No single channel owner
+    // exists, so the owner-only gate (I8) cannot authorize it — RESTRICTED to the trusted operator
+    // path (caller == None), and created ONCE per provider app. The `ich` is an operator-chosen
+    // opaque URL key (no identity ICH resolve: there is no owning channel to look up).
+    if let Some(fanout_family) = get_str("fanout_family") {
+        if caller_l2_name.is_some() {
+            return Ok(internal_unauthorized(
+                "externalize",
+                "externalize-as-fanout is operator-only (a family has no single channel owner)",
+            ));
+        }
+        if let Err(detail) = validate_fanout_family_glob(&fanout_family) {
+            return Ok(internal_invalid_request("externalize", &detail));
+        }
+        // The provider connection-handshake token (Meta `hub.verify_token`): operator-supplied (the
+        // value they configured in the provider dashboard) or admin-minted (returned so they can paste
+        // it there). Stored in vault OWNED BY THE EDGE; only the ref ships to the edge, which
+        // re-fetches the value at boot/open (mirrors the shared-secret path — never on the edge disk).
+        let verify_token = get_str("verify_token").unwrap_or_else(mint_entry_token);
+        let verify_token_ref = format!("edge_fanout_verify:{ich}");
+        let (status, body) = handle_vault_command(
+            ctx,
+            client,
+            "vault_put",
+            serde_json::json!({
+                "key": verify_token_ref,
+                "value": { "secret": verify_token },
+                "metadata": { "resource_type": "bearer_token", "owner_node": edge_node },
+            }),
+            Some(ctx.hive_id.clone()),
+        )
+        .await?;
+        if status != 200 {
+            return Ok(internal_invalid_request(
+                "externalize",
+                &format!("failed to store fanout verify-token in vault (owner {edge_node}): {body}"),
+            ));
+        }
+        let row = serde_json::json!({
+            "ich": ich,
+            // A fanout row has no single owner; the edge's fanout validation branch ignores this.
+            "owner_l2_name": "",
+            "inbound_family": inbound_family,
+            "auth_mode": "public",
+            "fanout_family": fanout_family,
+            "verify_token_ref": verify_token_ref,
+            // Default: the provider's verification GET + its event POSTs.
+            "methods": methods.clone().unwrap_or_else(|| vec!["GET".to_string(), "POST".to_string()]),
+        });
+        return match send_system_request_with_meta(
+            client,
+            &edge_node,
+            MSG_EDGE_OPEN_URL,
+            MSG_EDGE_OPEN_URL_RESPONSE,
+            row,
+            16,
+            None,
+            None,
+            Some(edge_node.clone()),
+            None,
+            None,
+            Duration::from_secs(15),
+        )
+        .await
+        {
+            Ok(payload) if payload.get("status").and_then(|v| v.as_str()) == Some("ok") => {
+                tracing::info!(
+                    ich = %ich,
+                    fanout_family = %fanout_family,
+                    edge = %edge_node,
+                    "externalize-as-fanout: edge opened URL (ACKed)"
+                );
+                Ok(InternalAdminDispatchResult {
+                    http_status: 200,
+                    envelope: serde_json::json!({
+                        "status": "ok",
+                        "action": "externalize",
+                        "payload": {
+                            "url": format!("/e/{ich}"),
+                            "ich": ich,
+                            "fanout_family": fanout_family,
+                            "edge_node": edge_node,
+                            // The webhook verify-token: the operator configures this exact value in
+                            // the provider dashboard (Meta: hub.verify_token). Minted by admin unless
+                            // supplied.
+                            "verify_token": verify_token,
+                        }
+                    }),
+                })
+            }
+            Ok(payload) => {
+                let err = payload
+                    .get("error")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("edge rejected open_url");
+                Ok(internal_invalid_request(
+                    "externalize",
+                    &format!("edge did not open fanout URL '{ich}': {err}"),
+                ))
+            }
+            Err(err) => Ok(internal_invalid_request(
+                "externalize",
+                &format!("edge unreachable / open_url failed for fanout '{ich}': {err}"),
+            )),
+        };
+    }
+
     // Resolve ICH -> owner_l2_name from identity SHM, and require the channel to
     // be enabled before it can become public.
     let owner_l2_name =
@@ -4243,8 +4868,8 @@ async fn handle_externalize(
     // Build the endpoint row (the EDGE_OPEN_URL payload IS one row) and OPEN the URL on
     // the edge via a verified service command (§7) — NOT a config push. We BLOCK on the
     // edge's ack: the URL is "published" only once the edge confirms it holds the row.
-    // As an addressed request/response it routes cross-hive like any node RPC (no router
-    // special-casing, unlike CONFIG_CHANGED which the peer router swallows).
+    // As an addressed request/response it routes cross-hive like any node RPC (the router
+    // special-cases no config message since 0.1.44).
     // For a shared-secret channel: the entry token (§8). Admin MINTS a strong random token when
     // the caller did not supply one (a caller-chosen `secret` is honored as an explicit opt-out).
     // Either way the token is stored in VAULT owned by the edge (so the edge re-fetches it by ref
@@ -4255,6 +4880,14 @@ async fn handle_externalize(
             Some(supplied) => supplied.clone(),
             None => mint_entry_token(), // §8: admin-minted strong token
         };
+        // FIX-4 residual (deferred): a re-externalize after io.api restart + edge ROW-LOSS mints a
+        // fresh token here, stranding clients holding the old bearer. Admin CANNOT reuse the stored
+        // token: edge_channel_secret:{ich} is a dedicated secret owned by SY.edge's ilk, and
+        // authorize_read has "No admin bypass" by design (sy_vault.rs:1391) — admin can neither read
+        // the value nor its metadata. Closing this needs a design call (admin/edge co-owned token,
+        // or a scoped admin read-back for edge_channel_secret:*), NOT a silent security downgrade.
+        // The edge's grace-window (SHARED_SECRET_GRACE_MS) already covers LIVE rotation — the common
+        // case; the row-loss residual is a rare reimage/vault-purge event.
         let secret_ref = format!("edge_channel_secret:{ich}");
         let (status, body) = handle_vault_command(
             ctx,
@@ -4348,6 +4981,36 @@ async fn handle_externalize(
             &format!("edge unreachable / open_url failed for '{ich}': {err}"),
         )),
     }
+}
+
+/// El ICH que posee un nodo, buscando por dueño (el inverso de `resolve_externalize_owner`).
+///
+/// Existe para `publish_cloud_endpoint`: el operador abre la puerta de Fluxbee Cloud nombrando el
+/// NODO, no un `ich:<uuid>` que no tiene por que conocer. Aplica el mismo requisito de canal
+/// habilitado, para que la puerta publica nunca se abra sobre un canal deshabilitado.
+fn resolve_ich_owned_by(
+    options: Vec<fluxbee_sdk::identity::IdentityIchOption>,
+    owner_l2_name: &str,
+) -> Result<String, String> {
+    let mut seen_disabled = false;
+    for option in options {
+        if option.owner_l2_name.as_deref() != Some(owner_l2_name) {
+            continue;
+        }
+        if !option.enabled {
+            seen_disabled = true;
+            continue;
+        }
+        return Ok(option.ich_id);
+    }
+    if seen_disabled {
+        return Err(format!(
+            "'{owner_l2_name}' has a channel but it is disabled; enable it before publishing"
+        ));
+    }
+    Err(format!(
+        "'{owner_l2_name}' has no registered channel in identity — is the node running?"
+    ))
 }
 
 fn resolve_externalize_owner(
@@ -4585,9 +5248,18 @@ async fn dispatch_internal_admin_command(
     // EDGE-06 (scoped to the Fluxbee Cloud relay): the provisioning actions IO.cloud relays are
     // exposed behind an internet token via io.cloud, so over the MESH they may only originate from
     // IO.cloud. The operator HTTP path + the internal executor are caller==None and stay trusted.
+    if let Err(detail) = authorize_wf_rules_caller(caller_l2_name, action, target, &params) {
+        return Ok(internal_unauthorized(action, &detail));
+    }
     if let Err(detail) = authorize_cloud_relay(caller_l2_name, action, &ctx.hive_id) {
         return Ok(internal_unauthorized(action, &detail));
     }
+    // FIX-2: server-side re-enforcement of io.cloud's translate content restrictions (do not trust
+    // the bypassable relay to have sanitized its own payload).
+    if let Err(detail) = enforce_cloud_relay_content(caller_l2_name, action, &ctx.hive_id, &params) {
+        return Ok(internal_unauthorized(action, &detail));
+    }
+    let params = stamp_relay_facts(action, params, caller_l2_name, &ctx.hive_id);
     match action {
         "publish_artifact" => {
             if target.is_some() {
@@ -4596,7 +5268,11 @@ async fn dispatch_internal_admin_command(
                     "payload.target is not accepted for publish_artifact",
                 ));
             }
-            return handle_publish_artifact(ctx, client, params, caller_l2_name).await;
+            let logged_params = admin_command_log_params(&params);
+            let started = Instant::now();
+            let result = handle_publish_artifact(ctx, client, params, caller_l2_name).await;
+            append_internal_dispatch_log(ctx, action, caller_l2_name, logged_params, started, &result);
+            return result;
         }
         "unpublish_artifact" => {
             if target.is_some() {
@@ -4605,7 +5281,11 @@ async fn dispatch_internal_admin_command(
                     "payload.target is not accepted for unpublish_artifact",
                 ));
             }
-            return handle_unpublish_artifact(ctx, client, params, caller_l2_name).await;
+            let logged_params = admin_command_log_params(&params);
+            let started = Instant::now();
+            let result = handle_unpublish_artifact(ctx, client, params, caller_l2_name).await;
+            append_internal_dispatch_log(ctx, action, caller_l2_name, logged_params, started, &result);
+            return result;
         }
         "executor_validate_plan" => {
             let plan = match parse_executor_plan(params) {
@@ -4614,7 +5294,9 @@ async fn dispatch_internal_admin_command(
             };
             let runtime = ctx.executor_runtime.lock().await.clone();
             if let Some(runtime) = runtime {
-                if let Err(detail) = semantic_review_executor_plan(&runtime, &plan).await {
+                let account = executor_usage_account(ctx, None, caller_l2_name, "executor_review");
+                if let Err(detail) = semantic_review_executor_plan(&runtime, &plan, &account).await
+                {
                     return Ok(InternalAdminDispatchResult {
                         http_status: 422,
                         envelope: serde_json::json!({
@@ -4643,10 +5325,29 @@ async fn dispatch_internal_admin_command(
         // externalize — an IO node self-exposes its own channel (ICH) on the edge
         // (v6 §7). Authz gate CLOSED (v6 §11.1): IO.* + owner==caller, enforced in the handler.
         "externalize" => {
-            return handle_externalize(ctx, client, params, caller_l2_name).await;
+            let logged_params = admin_command_log_params(&params);
+            let started = Instant::now();
+            let result = handle_externalize(ctx, client, params, caller_l2_name).await;
+            append_internal_dispatch_log(ctx, action, caller_l2_name, logged_params, started, &result);
+            return result;
+        }
+        // publish_cloud_endpoint — el bootstrap de la puerta publica de Fluxbee Cloud. Vive al lado
+        // de externalize porque lo reusa; acotado a IO.cloud y devuelve el token UNA vez. Se audita
+        // igual que sus hermanas bypass (el token minteado NO viaja en params, solo en la respuesta,
+        // y admin_command_log_params redacta igual campos secret-like).
+        "publish_cloud_endpoint" => {
+            let logged_params = admin_command_log_params(&params);
+            let started = Instant::now();
+            let result = handle_publish_cloud_endpoint(ctx, client, params).await;
+            append_internal_dispatch_log(ctx, action, caller_l2_name, logged_params, started, &result);
+            return result;
         }
         "unexternalize" => {
-            return handle_unexternalize(ctx, client, params, caller_l2_name).await;
+            let logged_params = admin_command_log_params(&params);
+            let started = Instant::now();
+            let result = handle_unexternalize(ctx, client, params, caller_l2_name).await;
+            append_internal_dispatch_log(ctx, action, caller_l2_name, logged_params, started, &result);
+            return result;
         }
         "list_externalized" => {
             return handle_list_externalized(client, params, caller_l2_name).await;
@@ -4667,21 +5368,22 @@ async fn dispatch_internal_admin_command(
                     ))
                 }
             };
-            let payload = match execute_admin_executor_plan(ctx, client, &request).await {
-                Ok(payload) => payload,
-                Err(err) => {
-                    return Ok(InternalAdminDispatchResult {
-                        http_status: 409,
-                        envelope: serde_json::json!({
-                            "status": "error",
-                            "action": action,
-                            "payload": serde_json::Value::Null,
-                            "error_code": "EXECUTOR_UNAVAILABLE",
-                            "error_detail": err.to_string(),
-                        }),
-                    })
-                }
-            };
+            let payload =
+                match execute_admin_executor_plan(ctx, client, &request, caller_l2_name).await {
+                    Ok(payload) => payload,
+                    Err(err) => {
+                        return Ok(InternalAdminDispatchResult {
+                            http_status: 409,
+                            envelope: serde_json::json!({
+                                "status": "error",
+                                "action": action,
+                                "payload": serde_json::Value::Null,
+                                "error_code": "EXECUTOR_UNAVAILABLE",
+                                "error_detail": err.to_string(),
+                            }),
+                        })
+                    }
+                };
             return Ok(InternalAdminDispatchResult {
                 http_status: if payload.get("status").and_then(serde_json::Value::as_str)
                     == Some("done")
@@ -4745,7 +5447,13 @@ async fn dispatch_internal_admin_command(
                     "missing target (payload.target required for this action)",
                 ));
             }
-            handle_admin_command(ctx, client, canonical, params, hive).await?
+            {
+                // Audit origin: the router-stamped caller when the command came over L2 (e.g.
+                // SY.architect), else the trusted internal path.
+                let origin = command_log_origin(caller_l2_name);
+                handle_admin_command_with_origin(ctx, client, canonical, params, hive, &origin)
+                    .await?
+            }
         }
         InternalActionRoute::Update => {
             let hive = resolve_internal_action_hive("update", target, &params);
@@ -4782,12 +5490,20 @@ async fn dispatch_internal_admin_command(
             let hive = resolve_internal_action_hive(action, target, &params);
             let req = parse_internal_wf_rules_request(params, hive)
                 .map_err(|detail| -> AdminError { detail.into() })?;
-            handle_wf_rules_http(ctx, client, req, wf_action).await?
+            let launched_by = launched_by_for_caller(caller_l2_name, &ctx.hive_id);
+            handle_wf_rules_http(ctx, client, req, wf_action, &launched_by).await?
         }
         InternalActionRoute::WfRulesQuery(query_action) => {
             let hive = resolve_internal_action_hive(action, target, &params);
             let req = parse_internal_wf_rules_request(params, hive)
                 .map_err(|detail| -> AdminError { detail.into() })?;
+            // Without a hive the query has no SY.wf-rules to ask: answer so, rather than not at all.
+            if normalize_wf_rules_target(req.hive.clone(), "").is_empty() {
+                return Ok(internal_invalid_request(
+                    action,
+                    "missing target (payload.target or params.hive)",
+                ));
+            }
             handle_wf_rules_query(ctx, client, query_action, req).await?
         }
         InternalActionRoute::TimerRpc(timer_msg) => {
@@ -4799,6 +5515,32 @@ async fn dispatch_internal_admin_command(
                 ));
             };
             handle_timer_rpc(ctx, client, action, timer_msg, params, hive_id).await?
+        }
+        InternalActionRoute::StreamStatus => {
+            let hive = resolve_internal_action_hive(action, target, &params);
+            let Some(hive_id) = hive else {
+                return Ok(internal_invalid_request(
+                    action,
+                    "missing target (payload.target required for this action)",
+                ));
+            };
+            handle_list_streams(ctx, client, hive_id).await?
+        }
+        InternalActionRoute::LlmUsage => {
+            let Some(hive_id) = resolve_internal_action_hive(action, target, &params) else {
+                return Ok(internal_invalid_request(
+                    action,
+                    "missing target (payload.target required for this action)",
+                ));
+            };
+            let query = match llm_usage_query_from_params(params) {
+                Ok(query) => query,
+                Err(detail) => return Ok(internal_invalid_request(action, &detail)),
+            };
+            if let Err(detail) = authorize_llm_usage_scope(caller_l2_name, &ctx.hive_id, &query) {
+                return Ok(internal_unauthorized(action, &detail));
+            }
+            handle_llm_usage(client, &hive_id, query).await?
         }
     };
 
@@ -4894,7 +5636,6 @@ fn parse_internal_opa_request(
             rego: None,
             entrypoint: None,
             version: None,
-            action: None,
             hive: None,
         }
     } else {
@@ -4982,6 +5723,34 @@ fn mint_entry_token() -> String {
     format!("{}{}", Uuid::new_v4().simple(), Uuid::new_v4().simple())
 }
 
+/// A fanout target must be a fully-qualified IO.* L2 GLOB (e.g. `IO.wapp.*@motherbee`): IO.-prefixed
+/// (the frontier only fans to IO nodes, mirroring I1), hive-qualified, and actually a pattern — a
+/// glob-free literal would be a unicast in disguise (use plain externalize for that).
+fn validate_fanout_family_glob(fanout_family: &str) -> Result<(), String> {
+    let value = fanout_family.trim();
+    if !value.starts_with("IO.") {
+        return Err(format!(
+            "fanout_family must target IO.* nodes, got '{value}'"
+        ));
+    }
+    if !value.contains('@') {
+        return Err(format!(
+            "fanout_family must be hive-qualified (e.g. IO.wapp.*@motherbee), got '{value}'"
+        ));
+    }
+    if !value.contains('*') {
+        return Err(format!(
+            "fanout_family must be a glob (contain '*'); for a single node use plain externalize, got '{value}'"
+        ));
+    }
+    Ok(())
+}
+
+/// Channel commands a node may issue for ITSELF. Gated by `authorize_channel_command`, which
+/// enforces `IO.*` origin and `channel owner == router-stamped caller` — so this list widens WHO
+/// may ask, never WHAT they may reach: a node still cannot act on someone else's channel.
+const CHANNEL_SELF_SERVICE_ACTIONS: &[&str] = &["externalize", "unexternalize"];
+
 fn authorize_channel_command(
     caller_l2_name: Option<&str>,
     owner_l2_name: &str,
@@ -5002,9 +5771,26 @@ fn authorize_channel_command(
     Ok(())
 }
 
+/// What an orchestrator's node teardown calls from the Cloud surface: the node's ILK and the
+/// secrets it owns.
+const ORCHESTRATOR_TEARDOWN_ACTIONS: &[&str] = &["delete_ilk", "vault_list", "vault_delete"];
+
+/// Actions Fluxbee Cloud relays since stage 4 (docs/ilk-tenant-model-v1.md §2.4) that every other
+/// mesh caller could already call, or reads like them: putting them on the Cloud surface must not
+/// take them away from anyone else (the stage-4 review found the lab's diagnostic nodes cut off).
+/// For IO.cloud they stay bounded by enforce_cloud_relay_content and stamp_relay_facts.
+const CLOUD_SHARED_ACTIONS: &[&str] = &[
+    "get_tenant",
+    "list_tenants",
+    "list_tenant_nodes",
+    "get_node_status",
+    "start_node",
+    "kill_node",
+];
+
 /// Relay gate for the Fluxbee Cloud provisioning actions (`IO_CLOUD_EXPOSED_ACTIONS`). These are
 /// reachable from the internet (Cloud -> edge -> IO.cloud -> here), so over the MESH they may ONLY
-/// originate from the singleton IO.cloud in this admin's hive — the internal relay. `caller==None`
+/// originate from IO.cloud in this admin's hive — the internal relay. `caller==None`
 /// is a trusted internal path (the operator HTTP server / the executor) and is allowed. Non-exposed actions are untouched. This
 /// closes the EDGE-06 confused-deputy for the relay: the SAME `IO_CLOUD_EXPOSED_ACTIONS` the
 /// `list_cloud_actions` capability query advertises is what this gate enforces (advertised ==
@@ -5014,26 +5800,513 @@ fn authorize_cloud_relay(
     action: &str,
     admin_hive: &str,
 ) -> Result<(), String> {
-    if !IO_CLOUD_EXPOSED_ACTIONS.contains(&action) {
+    let expected = format!("IO.cloud@{admin_hive}");
+    // FIX-1 (HIGH): IO.cloud is the internet-facing provisioning relay and the node this gate exists
+    // to CONTAIN. It may relay ONLY the exposed provisioning actions — DEFAULT-DENY everything else,
+    // so a compromised IO.cloud cannot become a confused deputy for vault_get / vault_list /
+    // delete_ilk / add_route / kill_node / add_hive / … (all of which the generic dispatch would
+    // otherwise run under admin's own privileged ilk). Previously the gate only guarded the 3
+    // exposed actions and let IO.cloud relay ANY OTHER action unchecked.
+    if caller_l2_name == Some(expected.as_str()) {
+        if IO_CLOUD_EXPOSED_ACTIONS.contains(&action) {
+            return Ok(());
+        }
+        // RELAYING is not the same as ACTING ON ONE'S OWN CHANNEL, and this gate must only
+        // contain the first.
+        //
+        // The allowlist above bounds what IO.cloud may relay ON BEHALF OF Fluxbee Cloud — that is
+        // the confused-deputy this gate exists to prevent. A channel command is a different thing:
+        // the node acting for ITSELF, on a resource it owns. It has its own gate,
+        // `authorize_channel_command`, which requires the caller to be an `IO.*` node (I1) AND the
+        // channel's owner to equal the caller (I8) — with the owner read from IDENTITY and the
+        // caller stamped by the ROUTER, so neither is forgeable from params.
+        //
+        // Denying these here was blocking IO.cloud from publishing its OWN endpoint at boot, which
+        // is the documented self-service path (io-cloud/src/main.rs:118-123, spec v6 §11.1). The
+        // node created its ICH, asked to externalize it, and was refused by the very gate meant to
+        // contain its relaying — leaving Fluxbee Cloud unreachable until an operator published the
+        // channel by hand on every install (U-11).
+        //
+        // Letting them through does NOT widen the relay: `authorize_channel_command` still runs in
+        // the handler, and a compromised IO.cloud still cannot touch a channel it does not own,
+        // nor relay anything outside the allowlist.
+        if CHANNEL_SELF_SERVICE_ACTIONS.contains(&action) {
+            return Ok(());
+        }
+        return Err(format!(
+            "IO.cloud may relay only {IO_CLOUD_EXPOSED_ACTIONS:?} over the mesh, not '{action}' (Fluxbee Cloud provisioning gate)"
+        ));
+    }
+    // All OTHER callers: a non-exposed action is not this gate's concern (other per-action gates /
+    // trusted internal paths apply), and neither is one Cloud shares with everyone else. The
+    // exposed provisioning actions may originate over the mesh ONLY from IO.cloud (handled above),
+    // apart from an orchestrator's node teardown (below).
+    if !IO_CLOUD_EXPOSED_ACTIONS.contains(&action) || CLOUD_SHARED_ACTIONS.contains(&action) {
         return Ok(());
     }
     let Some(caller) = caller_l2_name else {
         return Ok(());
     };
-    let expected = format!("IO.cloud@{admin_hive}");
-    if caller == expected {
+    // The system nodes that call some of these actions themselves. Adding an action to the Cloud
+    // surface must not take it away from them (it did twice: delete_ilk on 2026-09-28, which left
+    // orphan node identities behind, and the vault and tenant actions on 2026-10-13). Router-stamped
+    // names, never params.
+    //
+    // Node teardown (kill_node / remove_node_instance with purge_instance) marks the node's ILK
+    // through delete_ilk and deletes the secrets that ILK owns (vault_list + vault_delete). ANY
+    // hive's orchestrator: a spoke tears down its own nodes. Never vault_put: the per-spoke SSH
+    // recovery key it stored is gone with key_only_persist (D32).
+    if ORCHESTRATOR_TEARDOWN_ACTIONS.contains(&action) && caller.starts_with("SY.orchestrator@") {
         return Ok(());
     }
-    // The primary orchestrator persists per-spoke recovery SSH keys during add_hive
-    // (ssh_access=key_only_persist) via vault_put. It is a trusted system singleton on the
-    // primary hive, co-resident with admin — allow it, but ONLY for vault_put (never the other
-    // Fluxbee Cloud provisioning relay actions create_tenant / run_node).
-    if action == "vault_put" && caller == format!("SY.orchestrator@{admin_hive}") {
+    // Archi is the operator's own agent, next to admin; its commands reach these actions over the
+    // mesh like every other admin action it runs.
+    if caller == format!("SY.architect@{admin_hive}") {
+        return Ok(());
+    }
+    // SY.wf-rules launches the WF nodes of its own hive when a workflow is deployed;
+    // authorize_wf_rules_caller bounds it to them.
+    if action == "run_node" && caller.starts_with(WF_RULES_ROLE_PREFIX) {
         return Ok(());
     }
     Err(format!(
         "only {expected} may relay '{action}' over the mesh (Fluxbee Cloud provisioning gate); caller={caller}"
     ))
+}
+
+/// The node actions SY.wf-rules runs to deploy, restart and delete the WF nodes of its hive
+/// (docs/wf-standard-path-v1.md).
+const WF_RULES_NODE_ACTIONS: &[&str] = &[
+    "run_node",
+    "restart_node",
+    "kill_node",
+    "set_node_config",
+    "get_node_config",
+    "get_node_status",
+];
+
+const WF_RULES_ROLE_PREFIX: &str = "SY.wf-rules@";
+
+/// SY.wf-rules goes through the admin like every other launcher, and the admin lets it act only on
+/// the `WF.*` nodes of its own hive: the node name and, when given, the target must both name the
+/// caller's hive (the router-stamped name, never the params). Other actions and other callers are
+/// not this gate's business.
+fn authorize_wf_rules_caller(
+    caller_l2_name: Option<&str>,
+    action: &str,
+    target: Option<&str>,
+    params: &serde_json::Value,
+) -> Result<(), String> {
+    let Some(caller) = caller_l2_name else {
+        return Ok(());
+    };
+    let Some(caller_hive) = caller.strip_prefix(WF_RULES_ROLE_PREFIX) else {
+        return Ok(());
+    };
+    if !WF_RULES_NODE_ACTIONS.contains(&action) {
+        return Ok(());
+    }
+    let node_name = params
+        .get("node_name")
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .unwrap_or("");
+    let refusal = || {
+        Err(format!(
+            "{caller} may act only on the WF.* nodes of hive '{caller_hive}', not '{action}' on '{node_name}'"
+        ))
+    };
+    let Some((local, node_hive)) = node_name.rsplit_once('@') else {
+        return refusal();
+    };
+    if !local.starts_with("WF.") || local.len() <= "WF.".len() || node_hive.trim() != caller_hive {
+        return refusal();
+    }
+    let targets = [
+        normalize_internal_target_hive(target),
+        normalize_internal_target_hive(params.get("target").and_then(|value| value.as_str())),
+    ];
+    if targets.iter().flatten().any(|hive| hive != caller_hive) {
+        return refusal();
+    }
+    // What it binds or launches is the node's own workflow package, on the WF engine: never
+    // another runtime under a WF.* name.
+    let workflow_runtime = format!("wf.{}", &local["WF.".len()..]);
+    let field = |key: &str| {
+        params
+            .get(key)
+            .and_then(|value| value.as_str())
+            .map(str::trim)
+    };
+    let runtime_ok = match field("runtime") {
+        Some(runtime) => runtime == workflow_runtime,
+        None => action != "run_node",
+    };
+    let base_ok = field("runtime_base").is_none_or(|base| base == "wf.engine");
+    let package_ok = field("package_path").is_none_or(|path| {
+        let root = format!("{DIST_RUNTIME_ROOT_DIR}/{workflow_runtime}/");
+        path.starts_with(&root) && !path.contains("..")
+    });
+    if !(runtime_ok && base_ok && package_ok) {
+        return Err(format!(
+            "{caller} may bind or launch only {workflow_runtime} on wf.engine for '{node_name}'"
+        ));
+    }
+    Ok(())
+}
+
+/// Who launched a node, as the admin records it in `_system.launched_by`: `cloud` for the Fluxbee
+/// Cloud relay, `archi`, `operator` for the operator and the executor, else the caller's name.
+fn launched_by_for_caller(caller_l2_name: Option<&str>, admin_hive: &str) -> String {
+    match caller_l2_name {
+        Some(caller) if caller == format!("IO.cloud@{admin_hive}") => "cloud".to_string(),
+        Some(caller) if caller == format!("SY.architect@{admin_hive}") => "archi".to_string(),
+        Some(caller) => caller.to_string(),
+        None => "operator".to_string(),
+    }
+}
+
+/// The launcher SY.wf-rules carries for a workflow deploy: `operator` or `archi`, the two the admin
+/// stamps on the wf_rules requests that reach it (the operator's HTTP and executor plans, Archi).
+/// Anything else, `cloud` above all (it would give Fluxbee Cloud's relay start and kill rights on
+/// the node), is not carried: the admin records SY.wf-rules itself.
+fn launcher_carried_by_wf_rules(
+    params: &serde_json::Map<String, serde_json::Value>,
+) -> Option<String> {
+    match params.get("launched_by")?.as_str()?.trim() {
+        launcher @ ("operator" | "archi") => Some(launcher.to_string()),
+        _ => None,
+    }
+}
+
+/// What admin stamps on a command from the router-stamped caller, never from what the params say:
+/// - `set_ilk_tenant`: who the tenant change is for, for its history row (the caller, or the
+///   executor for an internal plan);
+/// - `run_node`: who launched the node, kept in its `_system.launched_by` (`cloud` for the Fluxbee
+///   Cloud relay, `archi`, `operator` for the operator and the executor, else the caller; for
+///   SY.wf-rules, whoever asked for the workflow deploy);
+/// - for the Cloud relay, which acts only on the nodes it launched in the tenant it claims
+///   (docs/ilk-tenant-model-v1.md §2.4): `start_node` and `kill_node` require such a node,
+///   `get_node_status` a node of that tenant, and the hive that holds the node answers
+///   NODE_NOT_FOUND otherwise; `list_tenants` leaves the genesis tenant out and shows the deleted
+///   ones, so Cloud can restore them.
+fn stamp_relay_facts(
+    action: &str,
+    mut params: serde_json::Value,
+    caller_l2_name: Option<&str>,
+    admin_hive: &str,
+) -> serde_json::Value {
+    let cloud_relay = caller_l2_name == Some(format!("IO.cloud@{admin_hive}").as_str());
+    let Some(object) = params.as_object_mut() else {
+        return params;
+    };
+    match action {
+        "set_ilk_tenant" => {
+            object.insert(
+                "on_behalf_of".to_string(),
+                serde_json::Value::String(caller_l2_name.unwrap_or("executor").to_string()),
+            );
+        }
+        "run_node" => {
+            // SY.wf-rules launches a deployed workflow's node for whoever asked for the deploy;
+            // the admin stamped that on the wf_rules request (handle_wf_rules_http).
+            let carried = match caller_l2_name {
+                Some(caller) if caller.starts_with(WF_RULES_ROLE_PREFIX) => {
+                    launcher_carried_by_wf_rules(object)
+                }
+                _ => None,
+            };
+            let launched_by =
+                carried.unwrap_or_else(|| launched_by_for_caller(caller_l2_name, admin_hive));
+            object.insert(
+                "launched_by".to_string(),
+                serde_json::Value::String(launched_by),
+            );
+        }
+        "start_node" | "kill_node" | "get_node_status" if cloud_relay => {
+            // The claimed tenant (checked by enforce_cloud_relay_content) becomes a requirement on
+            // the node; the node actions themselves take no tenant.
+            if let Some(tenant_id) = object.remove("tenant_id") {
+                object.insert("require_tenant_id".to_string(), tenant_id);
+            }
+            if action != "get_node_status" {
+                object.insert(
+                    "require_launched_by".to_string(),
+                    serde_json::Value::String("cloud".to_string()),
+                );
+            }
+        }
+        "list_tenants" if cloud_relay => {
+            object.insert("include_deleted".to_string(), serde_json::Value::Bool(true));
+            object.insert("exclude_root".to_string(), serde_json::Value::Bool(true));
+        }
+        _ => {}
+    }
+    params
+}
+
+/// FIX-2: re-enforce io.cloud's `translate_cloud_op` content restrictions SERVER-SIDE. Those checks
+/// live first inside io.cloud, which a compromised relay bypasses; admin must not trust the relay
+/// to have sanitized its own payload. Applies ONLY to the IO.cloud@hive mesh origin — operator
+/// (caller=None) and every other caller are unaffected. Runs right after `authorize_cloud_relay`
+/// (so it only ever sees the exposed actions from this origin).
+///
+/// Rule 3 of the Cloud contract, held here: every action on a tenant names the tenant Cloud
+/// claims (canonical, never the root tenant, which holds the system), and the stores refuse
+/// anything of another tenant (SY.vault: KEY_TAKEN / KEY_NOT_FOUND; SY.identity: NOT_FOUND /
+/// ILK_TENANT_MISMATCH).
+fn enforce_cloud_relay_content(
+    caller_l2_name: Option<&str>,
+    action: &str,
+    admin_hive: &str,
+    params: &serde_json::Value,
+) -> Result<(), String> {
+    if caller_l2_name != Some(format!("IO.cloud@{admin_hive}").as_str()) {
+        return Ok(());
+    }
+    let owner_node_ok = |v: Option<&serde_json::Value>| -> Result<(), String> {
+        if let Some(owner_node) = v.and_then(|x| x.as_str()).map(str::trim).filter(|s| !s.is_empty()) {
+            if !owner_node.starts_with("IO.") {
+                return Err("IO.cloud vault_put owner_node must be an IO.* node".to_string());
+            }
+        }
+        Ok(())
+    };
+    // Reserved infra namespaces (endpoint bearers `edge_channel_secret:*`, `edge_tls`, `ssh:*`,
+    // fanout verify tokens): the Cloud relay stores and deletes PROVIDER tokens, never the keys
+    // that protect the mesh itself. Single source: fluxbee_sdk::vault (io.cloud mirrors it for a
+    // clean early error).
+    let not_reserved = |key: &str| -> Result<(), String> {
+        if fluxbee_sdk::vault::is_cloud_reserved_vault_key(key) {
+            return Err(format!(
+                "IO.cloud {action} may not touch the reserved infrastructure key '{key}'"
+            ));
+        }
+        Ok(())
+    };
+    let only_fields =
+        |object: Option<&serde_json::Value>, allowed: &[&str]| -> Result<(), String> {
+            let Some(object) = object.and_then(|value| value.as_object()) else {
+                return Ok(());
+            };
+            if let Some(extra) = object.keys().find(|key| !allowed.contains(&key.as_str())) {
+                return Err(format!(
+                    "IO.cloud {action} may carry only {allowed:?}, not '{extra}'"
+                ));
+            }
+            Ok(())
+        };
+    match action {
+        // create_tenant has no tenant yet: the one tenant-free write.
+        "create_tenant" => {}
+        // A tenant's own lifecycle (mark / restore; purge is not in the allowlist): the claimed
+        // tenant.
+        "delete_tenant" | "restore_tenant" => {
+            cloud_claimed_tenant(params.get("tenant_id"), action)?;
+        }
+        // Deleting an account is not tenant-scoped (a tenant is a cost center, not a boundary,
+        // docs/ilk-tenant-model-v1.md), but Cloud deletes and restores people only (operator
+        // decision 2026-10-14, D4): SY.identity refuses another type with ILK_TYPE_MISMATCH.
+        "delete_ilk" | "restore_ilk" => {
+            if params.get("ilk_type").and_then(|v| v.as_str()) != Some("human") {
+                return Err(format!(
+                    "IO.cloud {action} must carry ilk_type \"human\": Cloud deletes and restores people only"
+                ));
+            }
+            only_fields(Some(params), &["ilk_id", "ilk_type", "tenant_id"])?;
+        }
+        // Reads by id are not tenant-filtered (§2.1).
+        "get_ilk" => {}
+        // Charging a person to another tenant: the target is the claimed tenant, never the root
+        // one. Who it is for is stamped by admin (dispatch), not taken from the relay.
+        "set_ilk_tenant" => {
+            cloud_claimed_tenant(params.get("tenant_id"), action)?;
+            only_fields(Some(params), &["ilk_id", "tenant_id", "on_behalf_of"])?;
+        }
+        "update_tenant" => {
+            cloud_claimed_tenant(params.get("tenant_id"), action)?;
+            // Everything about the tenant (operator, 2026-10-15) but `pending`, which stays the
+            // operator's; a sponsor is another canonical tenant, never the root one.
+            only_fields(
+                Some(params),
+                &[
+                    "tenant_id",
+                    "name",
+                    "domain",
+                    "status",
+                    "settings",
+                    "sponsor_tenant_id",
+                ],
+            )?;
+            if let Some(status) = params.get("status") {
+                if !matches!(status.as_str(), Some("active") | Some("suspended")) {
+                    return Err(format!(
+                        "IO.cloud {action} may set status to active or suspended only, not {status}"
+                    ));
+                }
+            }
+            if let Some(sponsor) = params.get("sponsor_tenant_id").filter(|v| !v.is_null()) {
+                cloud_claimed_tenant(Some(sponsor), action)?;
+            }
+            if params
+                .get("settings")
+                .is_some_and(|settings| !settings.is_object())
+            {
+                return Err(format!("IO.cloud {action} settings must be an object"));
+            }
+        }
+        // Reads of a tenant: the claimed one; the list is stamped (stamp_relay_facts).
+        "get_tenant" | "list_tenant_nodes" => {
+            cloud_claimed_tenant(params.get("tenant_id"), action)?;
+            only_fields(Some(params), &["tenant_id"])?;
+        }
+        "list_tenants" => {
+            only_fields(Some(params), &[])?;
+        }
+        // The claimed tenant's LLM usage (docs/router-stream-v1.md §7.6), never every tenant's:
+        // the root tenant's spending (Archi, the admin's executor) stays with the operator.
+        "get_llm_usage" => {
+            cloud_claimed_tenant(params.get("tenant_id"), action)?;
+            if params
+                .get("all_tenants")
+                .is_some_and(|all| *all != serde_json::Value::Bool(false))
+            {
+                return Err(format!(
+                    "IO.cloud {action} reads its claimed tenant only, never all_tenants"
+                ));
+            }
+            only_fields(
+                Some(params),
+                &[
+                    "tenant_id",
+                    "all_tenants",
+                    "from",
+                    "to",
+                    "group_by",
+                    "since",
+                    "after",
+                    "limit",
+                ],
+            )?;
+        }
+        // An IO node of the claimed tenant; start and kill also need one Cloud launched, which
+        // the hive that holds it checks (stamp_relay_facts).
+        "get_node_status" | "start_node" | "kill_node" => {
+            cloud_claimed_tenant(params.get("tenant_id"), action)?;
+            let node_name = params
+                .get("node_name")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            if !node_name.starts_with("IO.") {
+                return Err(format!(
+                    "IO.cloud {action} acts only on IO.* nodes, not '{node_name}'"
+                ));
+            }
+            let allowed: &[&str] = if action == "kill_node" {
+                &["tenant_id", "node_name", "purge_instance", "force"]
+            } else {
+                &["tenant_id", "node_name"]
+            };
+            only_fields(Some(params), allowed)?;
+        }
+        "run_node" => {
+            cloud_claimed_tenant(params.get("tenant_id"), action)?;
+            let node_name = params.get("node_name").and_then(|v| v.as_str()).unwrap_or("");
+            if !node_name.starts_with("IO.") {
+                return Err(format!(
+                    "IO.cloud may provision only IO.* nodes, not '{node_name}'"
+                ));
+            }
+        }
+        "vault_put" => {
+            // The key's tenant. SY.vault refuses a key another tenant holds (KEY_TAKEN).
+            cloud_claimed_tenant(
+                params.get("metadata").and_then(|md| md.get("tenant_id")),
+                action,
+            )?;
+            // Ownership-authority fields io.cloud must NEVER set (translate strips them); reject so a
+            // compromised relay cannot plant a secret under a victim's ilk/owner.
+            if let Some(md) = params.get("metadata").and_then(|v| v.as_object()) {
+                for authority in ["ilk", "owner_ilk", "owner_l2"] {
+                    if md.contains_key(authority) {
+                        return Err(format!(
+                            "IO.cloud vault_put must not set the authority field metadata.{authority}"
+                        ));
+                    }
+                }
+                owner_node_ok(md.get("owner_node"))?;
+            }
+            // translate reads owner_node from params OR metadata — check the top-level too.
+            owner_node_ok(params.get("owner_node"))?;
+            not_reserved(
+                params
+                    .get("key")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default(),
+            )?;
+        }
+        "vault_list" => {
+            // Never an unfiltered listing: always the claimed tenant, and no owner or tag filter.
+            let filter = params.get("filter");
+            cloud_claimed_tenant(filter.and_then(|f| f.get("tenant_id")), action)?;
+            only_fields(filter, &["tenant_id", "resource_type", "prefix", "limit"])?;
+            only_fields(Some(params), &["filter"])?;
+        }
+        "vault_assign" => {
+            // The key's tenant; the nodes are checked against it (resolve_assigned_ilks).
+            cloud_claimed_tenant(params.get("tenant_id"), action)?;
+            not_reserved(
+                params
+                    .get("key")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default(),
+            )?;
+            only_fields(
+                Some(params),
+                &["key", "tenant_id", "assigned_nodes", "assigned_ilks"],
+            )?;
+        }
+        "vault_delete" => {
+            // SY.vault answers KEY_NOT_FOUND for a key of another tenant.
+            cloud_claimed_tenant(params.get("tenant_id"), action)?;
+            not_reserved(
+                params
+                    .get("key")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default(),
+            )?;
+            only_fields(Some(params), &["key", "tenant_id"])?;
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+/// The tenant a Cloud action claims: canonical, and never the root tenant, which holds the system
+/// and its nodes.
+fn cloud_claimed_tenant(value: Option<&serde_json::Value>, action: &str) -> Result<(), String> {
+    let tenant_id = value.and_then(|v| v.as_str()).unwrap_or("");
+    if !is_canonical_tenant_id(tenant_id) {
+        return Err(format!(
+            "IO.cloud {action} must be scoped to the claimed tenant (tenant_id tnt:<uuid>)"
+        ));
+    }
+    if tenant_id == fluxbee_sdk::DEFAULT_ROOT_TENANT_ID {
+        return Err(format!("IO.cloud {action} may not act on the root tenant"));
+    }
+    Ok(())
+}
+
+/// `tnt:<uuid>` with the UUID hyphenated and lowercase: the one spelling the stores compare.
+fn is_canonical_tenant_id(tenant_id: &str) -> bool {
+    tenant_id
+        .strip_prefix("tnt:")
+        .and_then(|raw| {
+            uuid::Uuid::parse_str(raw)
+                .ok()
+                .filter(|uuid| uuid.to_string() == raw)
+        })
+        .is_some()
 }
 
 #[derive(Clone, Copy)]
@@ -5043,6 +6316,9 @@ enum OpaAction {
     Apply,
     Rollback,
     Check,
+    /// Remove the USER policy on the target hive(s) -- current, staged and backup -- back to the
+    /// state of a fresh install; routers unload it. Final: there is no rollback of a clear.
+    Clear,
 }
 
 #[derive(Clone, Copy)]
@@ -5084,6 +6360,16 @@ impl WfRulesAction {
 }
 
 impl OpaAction {
+    /// The write the caller asked for, as reported back. as_str() is the step sent to
+    /// SY.opa.rules ("compile" for compile + apply and for check).
+    fn write_name(&self) -> &'static str {
+        match self {
+            OpaAction::CompileApply => "compile_apply",
+            OpaAction::Check => "check",
+            other => other.as_str(),
+        }
+    }
+
     fn as_str(&self) -> &'static str {
         match self {
             OpaAction::Compile => "compile",
@@ -5091,6 +6377,7 @@ impl OpaAction {
             OpaAction::Apply => "apply",
             OpaAction::Rollback => "rollback",
             OpaAction::Check => "compile",
+            OpaAction::Clear => "clear",
         }
     }
 
@@ -5128,8 +6415,7 @@ struct ConfigResponsePayload {
     version: Option<u64>,
     #[serde(default)]
     status: Option<String>,
-    #[serde(default)]
-    hive: Option<String>,
+    // The answering hive is taken from the router-stamped sender, never from the payload.
     #[serde(default)]
     compile_time_ms: Option<u64>,
     #[serde(default)]
@@ -5142,7 +6428,7 @@ struct ConfigResponsePayload {
     error_detail: Option<String>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 struct OpaResponseEntry {
     hive: String,
     status: String,
@@ -5167,21 +6453,298 @@ struct OpaQueryEntry {
     payload: serde_json::Value,
 }
 
-#[derive(Debug, Deserialize, Serialize)]
-struct StorageInboxMetrics {
-    pending: i64,
-    pending_with_error: i64,
-    oldest_pending_age_s: i64,
-    processed_total: i64,
-    max_attempts: i32,
+const STORAGE_METRICS_TIMEOUT_SECS: u64 = 8;
+
+/// SY.storage's inbox metrics, asked over the mesh (A-70 stage 2b; until then on the embedded NATS
+/// broker's `storage.metrics.get`).
+async fn handle_storage_metrics_http(ctx: &AdminContext) -> (u16, String) {
+    let action = "get_storage_metrics";
+    let error = |status: u16, error_code: &str, detail: String| {
+        (
+            status,
+            serde_json::json!({
+                "status": "error",
+                "action": action,
+                "payload": {
+                    "status": "error",
+                    "error_code": error_code,
+                    "message": detail,
+                },
+                "error_code": error_code,
+                "error_detail": detail,
+            })
+            .to_string(),
+        )
+    };
+    let reply = match send_system_request(
+        &ctx.rpc,
+        &format!("SY.storage@{PRIMARY_HIVE_ID}"),
+        MSG_STORAGE_METRICS_GET,
+        MSG_STORAGE_METRICS_RESPONSE,
+        serde_json::json!({}),
+        Duration::from_secs(STORAGE_METRICS_TIMEOUT_SECS),
+    )
+    .await
+    {
+        Ok(reply) => reply,
+        Err(err) => return error(503, "STORAGE_METRICS_UNAVAILABLE", err.to_string()),
+    };
+    let response: StorageMetricsResponse = match serde_json::from_value(reply) {
+        Ok(response) => response,
+        Err(err) => return error(502, "TRANSPORT_ERROR", err.to_string()),
+    };
+    match (response.ok, response.metrics) {
+        (true, Some(metrics)) => (
+            200,
+            serde_json::json!({
+                "status": "ok",
+                "action": action,
+                "payload": {
+                    "status": "ok",
+                    "metrics": metrics,
+                },
+                "error_code": serde_json::Value::Null,
+                "error_detail": serde_json::Value::Null,
+            })
+            .to_string(),
+        ),
+        _ => error(
+            503,
+            "STORAGE_METRICS_UNAVAILABLE",
+            response
+                .error
+                .unwrap_or_else(|| "SY.storage did not return its metrics".to_string()),
+        ),
+    }
 }
 
-const SUBJECT_STORAGE_METRICS_GET: &str = "storage.metrics.get";
-const STORAGE_METRICS_NATS_TIMEOUT_SECS: u64 = 8;
+/// `get_llm_usage` (A-70 stage 3, docs/router-stream-v1.md §7.6): the LLM usage records, one per
+/// model call, asked from SY.storage on the motherbee, where they live. A period comes back grouped
+/// (`groups`) or record by record (`records`), a `since` question record by record; `next` is the
+/// cursor for the next page (`after`) or the next sync (`since`).
+async fn handle_llm_usage(
+    client: &RouterDispatcher,
+    hive_id: &str,
+    query: UsageQuery,
+) -> Result<(u16, String), AdminError> {
+    let action = "get_llm_usage";
+    if let Err(detail) = check_llm_usage_query(hive_id, &query) {
+        return Ok(llm_usage_error(400, "INVALID_REQUEST", &detail));
+    }
+    let reply = match send_system_request(
+        client,
+        &format!("SY.storage@{PRIMARY_HIVE_ID}"),
+        MSG_USAGE_QUERY,
+        MSG_USAGE_QUERY_RESPONSE,
+        serde_json::to_value(&query)?,
+        admin_action_timeout(action),
+    )
+    .await
+    {
+        Ok(reply) => reply,
+        Err(err) => return Ok(llm_usage_error(503, "USAGE_UNAVAILABLE", &err.to_string())),
+    };
+    let response: UsageQueryResponse = match serde_json::from_value(reply) {
+        Ok(response) => response,
+        Err(err) => return Ok(llm_usage_error(502, "TRANSPORT_ERROR", &err.to_string())),
+    };
+    if !response.ok {
+        // A question SY.storage refused (a cursor, a period) is the caller's; anything else is
+        // SY.storage's.
+        let code = response
+            .error_code
+            .as_deref()
+            .unwrap_or("USAGE_UNAVAILABLE");
+        let status = if code == "INVALID_REQUEST" { 400 } else { 503 };
+        return Ok(llm_usage_error(
+            status,
+            code,
+            response
+                .error
+                .as_deref()
+                .unwrap_or("SY.storage did not answer the usage query"),
+        ));
+    }
+    let mut payload = serde_json::json!({ "status": "ok", "next": response.next });
+    if query.group_by.is_some() {
+        payload["groups"] = serde_json::to_value(response.groups)?;
+    } else {
+        payload["records"] = serde_json::Value::Array(response.records);
+    }
+    Ok((
+        200,
+        serde_json::json!({
+            "status": "ok",
+            "action": action,
+            "payload": payload,
+            "error_code": serde_json::Value::Null,
+            "error_detail": serde_json::Value::Null,
+        })
+        .to_string(),
+    ))
+}
+
+fn llm_usage_error(status: u16, error_code: &str, detail: &str) -> (u16, String) {
+    (
+        status,
+        serde_json::json!({
+            "status": "error",
+            "action": "get_llm_usage",
+            "payload": serde_json::Value::Null,
+            "error_code": error_code,
+            "error_detail": detail,
+        })
+        .to_string(),
+    )
+}
+
+/// What the admin checks before it asks (§7.5): the motherbee, where the records live; one tenant,
+/// canonical, or every tenant; a page of 1 to `USAGE_QUERY_MAX_LIMIT` rows; and either a period
+/// (`from` and `to`, RFC 3339, at most `USAGE_QUERY_MAX_DAYS` days), grouped or not, or a `since`
+/// cursor, which lists the records stored after it. SY.storage checks what the cursors say.
+fn check_llm_usage_query(hive_id: &str, query: &UsageQuery) -> Result<(), String> {
+    if hive_id != PRIMARY_HIVE_ID {
+        return Err(format!(
+            "the usage records live on {PRIMARY_HIVE_ID}: ask /hives/{PRIMARY_HIVE_ID}/usage"
+        ));
+    }
+    match (query.tenant_id.as_deref(), query.all_tenants) {
+        (Some(_), true) => {
+            return Err("name a tenant_id or ask for all_tenants, not both".to_string())
+        }
+        (None, false) => {
+            return Err("name a tenant_id (tnt:<uuid>) or ask for all_tenants".to_string())
+        }
+        (Some(tenant_id), false) if !is_canonical_tenant_id(tenant_id) => {
+            return Err(
+                "tenant_id must be canonical: tnt:<uuid>, hyphenated and lowercase".to_string(),
+            )
+        }
+        _ => {}
+    }
+    if query
+        .limit
+        .is_some_and(|limit| !(1..=USAGE_QUERY_MAX_LIMIT).contains(&limit))
+    {
+        return Err(format!("limit must be from 1 to {USAGE_QUERY_MAX_LIMIT}"));
+    }
+    if [&query.since, &query.after]
+        .into_iter()
+        .flatten()
+        .any(|cursor| cursor.trim().is_empty())
+    {
+        return Err("since and after take a cursor; they cannot be blank".to_string());
+    }
+    let instant = |field: &str, value: Option<&str>| {
+        value
+            .map(|value| {
+                chrono::DateTime::parse_from_rfc3339(value).map_err(|_| {
+                    format!("{field} must be an RFC 3339 instant, like 2026-10-01T00:00:00Z")
+                })
+            })
+            .transpose()
+    };
+    let from = instant("from", query.from.as_deref())?;
+    let to = instant("to", query.to.as_deref())?;
+    if query.since.is_some() {
+        if from.is_some() || to.is_some() || query.group_by.is_some() {
+            return Err(
+                "since lists the records stored after a cursor: it takes no from, to or group_by"
+                    .to_string(),
+            );
+        }
+        return Ok(());
+    }
+    let (Some(from), Some(to)) = (from, to) else {
+        return Err(
+            "ask for a period (from and to) or for the records stored after a cursor (since)"
+                .to_string(),
+        );
+    };
+    if to <= from {
+        return Err("to must come after from".to_string());
+    }
+    if to - from > chrono::TimeDelta::days(USAGE_QUERY_MAX_DAYS) {
+        return Err(format!(
+            "a period covers at most {USAGE_QUERY_MAX_DAYS} days"
+        ));
+    }
+    Ok(())
+}
+
+/// `GET /hives/{hive}/usage?tenant_id=&from=&to=&group_by=&since=&after=&limit=`: the operator's
+/// question. Without a tenant_id it is about every tenant.
+fn llm_usage_query_from_http(query: &HashMap<String, String>) -> Result<UsageQuery, String> {
+    let text = |key: &str| {
+        query
+            .get(key)
+            .map(|value| value.trim())
+            .filter(|value| !value.is_empty())
+            .map(str::to_string)
+    };
+    let group_by = match text("group_by") {
+        Some(group_by) => Some(
+            UsageGroupBy::parse(&group_by).ok_or("group_by must be day, model, node or tenant")?,
+        ),
+        None => None,
+    };
+    let limit =
+        match text("limit") {
+            Some(limit) => Some(limit.parse::<u32>().map_err(|_| {
+                format!("limit must be a number from 1 to {USAGE_QUERY_MAX_LIMIT}")
+            })?),
+            None => None,
+        };
+    let tenant_id = text("tenant_id");
+    Ok(UsageQuery {
+        all_tenants: tenant_id.is_none(),
+        tenant_id,
+        from: text("from"),
+        to: text("to"),
+        group_by,
+        since: text("since"),
+        after: text("after"),
+        limit,
+    })
+}
+
+/// The question an ADMIN_COMMAND asks, from its params. A null field is an absent one: the
+/// executor sends null for what a plan leaves out.
+fn llm_usage_query_from_params(params: serde_json::Value) -> Result<UsageQuery, String> {
+    let mut fields = match params {
+        serde_json::Value::Object(fields) => fields,
+        serde_json::Value::Null => serde_json::Map::new(),
+        _ => return Err("get_llm_usage params must be a JSON object".to_string()),
+    };
+    fields.retain(|_, value| !value.is_null());
+    serde_json::from_value(serde_json::Value::Object(fields))
+        .map_err(|err| format!("invalid get_llm_usage params: {err}"))
+}
+
+/// Every tenant's usage at once is the operator's (the HTTP route and the executor, no caller) and
+/// Archi's, who works for the operator. Any other mesh caller names one tenant; IO.cloud, the one
+/// it claims (enforce_cloud_relay_content). The router-stamped caller, never the params.
+fn authorize_llm_usage_scope(
+    caller_l2_name: Option<&str>,
+    admin_hive: &str,
+    query: &UsageQuery,
+) -> Result<(), String> {
+    let Some(caller) = caller_l2_name else {
+        return Ok(());
+    };
+    if caller == format!("SY.architect@{admin_hive}") {
+        return Ok(());
+    }
+    if query.all_tenants || query.tenant_id.is_none() {
+        return Err(format!(
+            "{caller} may read the usage of one tenant (tenant_id): every tenant at once is the operator's and Archi's"
+        ));
+    }
+    Ok(())
+}
 
 async fn run_http_server(
     listen: &str,
-    tx: &mpsc::UnboundedSender<BroadcastRequest>,
     ctx: AdminContext,
     client: Arc<RouterDispatcher>,
 ) -> Result<(), AdminError> {
@@ -5189,11 +6752,10 @@ async fn run_http_server(
     tracing::info!(addr = %listen, "sy.admin http listening");
     loop {
         let (mut stream, _) = listener.accept().await?;
-        let tx = tx.clone();
         let ctx = ctx.clone();
         let client = client.clone();
         tokio::spawn(async move {
-            if let Err(err) = handle_http(&mut stream, &tx, &ctx, &client).await {
+            if let Err(err) = handle_http(&mut stream, &ctx, &client).await {
                 tracing::warn!("http handler error: {err}");
             }
         });
@@ -5202,9 +6764,11 @@ async fn run_http_server(
 
 async fn handle_http(
     stream: &mut tokio::net::TcpStream,
-    tx: &mpsc::UnboundedSender<BroadcastRequest>,
     ctx: &AdminContext,
-    client: &RouterDispatcher,
+    // &Arc so the localhost REST layer can call dispatch_internal_admin_command directly (F4a:
+    // /channels/* verbs). handle_admin_command/handle_admin_query calls below still work via Deref
+    // coercion (&Arc<RouterDispatcher> -> &RouterDispatcher).
+    client: &Arc<RouterDispatcher>,
 ) -> Result<(), AdminError> {
     let (method, path, headers, body) = read_http_request(stream).await?;
     let (path, query) = split_path_query(&path);
@@ -5325,9 +6889,52 @@ async fn handle_http(
                 handle_admin_command(ctx, client, "publish_runtime_package", payload, None).await?;
             respond_json(stream, status, &resp).await?;
         }
+        // F4a: operator surface for the edge-channel (externalize) family. Localhost-only, and
+        // caller_l2_name=None is the established trusted-internal operator semantics — the SAME
+        // 127.0.0.1 surface already exposes stronger None-privileged mutations (add_hive, run_node,
+        // vault_put). MUST go through dispatch_internal_admin_command directly: handle_admin_command
+        // would ship these to SY.config.routes (which does not implement them) and time out silently.
+        ("POST", "/channels/externalize") => {
+            let payload: serde_json::Value =
+                if body.is_empty() { serde_json::json!({}) } else { serde_json::from_slice(&body)? };
+            let internal =
+                dispatch_internal_admin_command(ctx, client, "externalize", None, payload, None).await?;
+            respond_json(stream, internal.http_status, &internal.envelope.to_string()).await?;
+        }
+        ("POST", "/channels/unexternalize") => {
+            let payload: serde_json::Value =
+                if body.is_empty() { serde_json::json!({}) } else { serde_json::from_slice(&body)? };
+            let internal =
+                dispatch_internal_admin_command(ctx, client, "unexternalize", None, payload, None).await?;
+            respond_json(stream, internal.http_status, &internal.envelope.to_string()).await?;
+        }
+        // Operator revoke of a public artifact (D2). caller_l2_name = None routes to
+        // handle_unpublish_artifact's operator escape hatch: the localhost HTTP path may
+        // unpublish ANY tenant's publication (a retired/renamed producer can't be asked to).
+        // Body: {"publication_id":"pub:<uuid>"}.
+        ("POST", "/artifacts/unpublish") => {
+            let payload: serde_json::Value =
+                if body.is_empty() { serde_json::json!({}) } else { serde_json::from_slice(&body)? };
+            let internal =
+                dispatch_internal_admin_command(ctx, client, "unpublish_artifact", None, payload, None).await?;
+            respond_json(stream, internal.http_status, &internal.envelope.to_string()).await?;
+        }
+        ("GET", "/channels/externalized") => {
+            // edge_node comes from ?edge_node=SY.edge@<hive> (the edge to query).
+            let payload = match query.get("edge_node") {
+                Some(edge_node) => serde_json::json!({ "edge_node": edge_node }),
+                None => serde_json::json!({}),
+            };
+            let internal =
+                dispatch_internal_admin_command(ctx, client, "list_externalized", None, payload, None).await?;
+            respond_json(stream, internal.http_status, &internal.envelope.to_string()).await?;
+        }
         ("GET", path) if path.starts_with("/admin/actions/") => {
+            // Unreachable: the arm guard already established the prefix. Kept in the
+            // family envelope anyway so no bare `{"error": ...}` survives on the surface.
             let Some(action_name) = path.strip_prefix("/admin/actions/") else {
-                respond_json(stream, 404, r#"{"error":"not_found"}"#).await?;
+                let (status, body) = admin_unknown_route_response(method.as_str(), path);
+                respond_json(stream, status, &body).await?;
                 return Ok(());
             };
             let payload = serde_json::json!({ "action_name": decode_percent(action_name) });
@@ -5375,237 +6982,6 @@ async fn handle_http(
                 respond_json(stream, status, &resp).await?;
             }
         }
-        ("GET", "/routes") => {
-            let hive = query.get("hive").cloned();
-            let (status, resp) = handle_admin_query(ctx, client, "list_routes", hive).await?;
-            respond_json(stream, status, &resp).await?;
-        }
-        ("POST", "/routes") => {
-            let route: RouteConfig = serde_json::from_slice(&body)?;
-            let hive = query.get("hive").cloned();
-            let (status, resp) =
-                handle_admin_command(ctx, client, "add_route", serde_json::to_value(route)?, hive)
-                    .await?;
-            respond_json(stream, status, &resp).await?;
-        }
-        ("DELETE", "/routes") => {
-            let prefix = query.get("prefix").cloned().unwrap_or_default();
-            let hive = query.get("hive").cloned();
-            let payload = serde_json::json!({ "prefix": prefix });
-            let (status, resp) =
-                handle_admin_command(ctx, client, "delete_route", payload, hive).await?;
-            respond_json(stream, status, &resp).await?;
-        }
-        ("GET", "/vpns") => {
-            let hive = query.get("hive").cloned();
-            let (status, resp) = handle_admin_query(ctx, client, "list_vpns", hive).await?;
-            respond_json(stream, status, &resp).await?;
-        }
-        ("POST", "/vpns") => {
-            let vpn: VpnConfig = serde_json::from_slice(&body)?;
-            let hive = query.get("hive").cloned();
-            let (status, resp) =
-                handle_admin_command(ctx, client, "add_vpn", serde_json::to_value(vpn)?, hive)
-                    .await?;
-            respond_json(stream, status, &resp).await?;
-        }
-        ("DELETE", "/vpns") => {
-            let pattern = query.get("pattern").cloned().unwrap_or_default();
-            let hive = query.get("hive").cloned();
-            let payload = serde_json::json!({ "pattern": pattern });
-            let (status, resp) =
-                handle_admin_command(ctx, client, "delete_vpn", payload, hive).await?;
-            respond_json(stream, status, &resp).await?;
-        }
-        ("GET", "/taps") => {
-            let hive = query.get("hive").cloned();
-            let (status, resp) = handle_admin_query(ctx, client, "list_taps", hive).await?;
-            respond_json(stream, status, &resp).await?;
-        }
-        ("POST", "/taps") => {
-            // ROUTER-TAP-5: install a new tap on the target hive. Body shape
-            // mirrors `TapConfig` in sy_config_routes (match_src, match_dst,
-            // target, mode, enabled).
-            let tap: serde_json::Value = serde_json::from_slice(&body)?;
-            let hive = query.get("hive").cloned();
-            let (status, resp) = handle_admin_command(ctx, client, "add_tap", tap, hive).await?;
-            respond_json(stream, status, &resp).await?;
-        }
-        ("DELETE", "/taps") => {
-            let match_src = query.get("match_src").cloned().unwrap_or_default();
-            let match_dst = query.get("match_dst").cloned().unwrap_or_default();
-            let target = query.get("target").cloned().unwrap_or_default();
-            let hive = query.get("hive").cloned();
-            let payload = serde_json::json!({
-                "match_src": match_src,
-                "match_dst": match_dst,
-                "target": target,
-            });
-            let (status, resp) =
-                handle_admin_command(ctx, client, "delete_tap", payload, hive).await?;
-            respond_json(stream, status, &resp).await?;
-        }
-        ("PUT", "/config/routes") => {
-            let update: ConfigUpdate = serde_json::from_slice(&body)?;
-            let mut broadcasts = usize::from(update.routes.is_some());
-            broadcasts += usize::from(update.vpns.is_some());
-            broadcasts += usize::from(update.taps.is_some());
-            let mut versions = match allocate_config_changed_versions(
-                &ctx.state_dir,
-                "routes",
-                broadcasts,
-                update.version,
-            ) {
-                Ok(versions) => versions,
-                Err(err) => {
-                    let body = serde_json::json!({
-                        "status": "error",
-                        "error_code": "VERSION_MISMATCH",
-                        "error_detail": err.to_string(),
-                    })
-                    .to_string();
-                    respond_json(stream, 409, &body).await?;
-                    return Ok(());
-                }
-            };
-            if let Some(routes) = update.routes {
-                let version = versions.remove(0);
-                if let Err(err) = send_broadcast_request(
-                    tx,
-                    |ack| BroadcastRequest::Routes {
-                        routes,
-                        version,
-                        ack,
-                    },
-                    "routes",
-                )
-                .await
-                {
-                    let body = serde_json::json!({
-                        "status": "error",
-                        "error_code": "CONFIG_BROADCAST_FAILED",
-                        "error_detail": err.to_string(),
-                    })
-                    .to_string();
-                    respond_json(stream, 502, &body).await?;
-                    return Ok(());
-                }
-            }
-            if let Some(vpns) = update.vpns {
-                let version = versions.remove(0);
-                if let Err(err) = send_broadcast_request(
-                    tx,
-                    |ack| BroadcastRequest::Vpns { vpns, version, ack },
-                    "vpns",
-                )
-                .await
-                {
-                    let body = serde_json::json!({
-                        "status": "error",
-                        "error_code": "CONFIG_BROADCAST_FAILED",
-                        "error_detail": err.to_string(),
-                    })
-                    .to_string();
-                    respond_json(stream, 502, &body).await?;
-                    return Ok(());
-                }
-            }
-            if let Some(taps) = update.taps {
-                let version = versions.remove(0);
-                if let Err(err) = send_broadcast_request(
-                    tx,
-                    |ack| BroadcastRequest::Taps { taps, version, ack },
-                    "taps",
-                )
-                .await
-                {
-                    let body = serde_json::json!({
-                        "status": "error",
-                        "error_code": "CONFIG_BROADCAST_FAILED",
-                        "error_detail": err.to_string(),
-                    })
-                    .to_string();
-                    respond_json(stream, 502, &body).await?;
-                    return Ok(());
-                }
-            }
-            tracing::info!("config routes update received");
-            respond_json(stream, 200, r#"{"status":"ok"}"#).await?;
-        }
-        ("PUT", "/config/vpns") => {
-            let update: ConfigUpdate = serde_json::from_slice(&body)?;
-            if let Some(vpns) = update.vpns {
-                let version =
-                    match next_config_changed_version(&ctx.state_dir, "vpn", update.version) {
-                        Ok(version) => version,
-                        Err(err) => {
-                            let body = serde_json::json!({
-                                "status": "error",
-                                "error_code": "VERSION_MISMATCH",
-                                "error_detail": err.to_string(),
-                            })
-                            .to_string();
-                            respond_json(stream, 409, &body).await?;
-                            return Ok(());
-                        }
-                    };
-                if let Err(err) = send_broadcast_request(
-                    tx,
-                    |ack| BroadcastRequest::Vpns { vpns, version, ack },
-                    "vpns",
-                )
-                .await
-                {
-                    let body = serde_json::json!({
-                        "status": "error",
-                        "error_code": "CONFIG_BROADCAST_FAILED",
-                        "error_detail": err.to_string(),
-                    })
-                    .to_string();
-                    respond_json(stream, 502, &body).await?;
-                    return Ok(());
-                }
-            }
-            tracing::info!("config vpns update received");
-            respond_json(stream, 200, r#"{"status":"ok"}"#).await?;
-        }
-        ("PUT", "/config/taps") => {
-            let update: ConfigUpdate = serde_json::from_slice(&body)?;
-            if let Some(taps) = update.taps {
-                let version =
-                    match next_config_changed_version(&ctx.state_dir, "taps", update.version) {
-                        Ok(version) => version,
-                        Err(err) => {
-                            let body = serde_json::json!({
-                                "status": "error",
-                                "error_code": "VERSION_MISMATCH",
-                                "error_detail": err.to_string(),
-                            })
-                            .to_string();
-                            respond_json(stream, 409, &body).await?;
-                            return Ok(());
-                        }
-                    };
-                if let Err(err) = send_broadcast_request(
-                    tx,
-                    |ack| BroadcastRequest::Taps { taps, version, ack },
-                    "taps",
-                )
-                .await
-                {
-                    let body = serde_json::json!({
-                        "status": "error",
-                        "error_code": "CONFIG_BROADCAST_FAILED",
-                        "error_detail": err.to_string(),
-                    })
-                    .to_string();
-                    respond_json(stream, 502, &body).await?;
-                    return Ok(());
-                }
-            }
-            tracing::info!("config taps update received");
-            respond_json(stream, 200, r#"{"status":"ok"}"#).await?;
-        }
         ("GET", "/config/storage") => {
             let (status, resp) = handle_admin_query(ctx, client, "get_storage", None).await?;
             respond_json(stream, status, &resp).await?;
@@ -5616,41 +6992,12 @@ async fn handle_http(
         }
         ("PUT", "/config/storage") => {
             let update: StorageUpdate = serde_json::from_slice(&body)?;
-            let version =
-                match next_config_changed_version(&ctx.state_dir, "storage", update.version) {
-                    Ok(version) => version,
-                    Err(err) => {
-                        let body = serde_json::json!({
-                            "status": "error",
-                            "error_code": "VERSION_MISMATCH",
-                            "error_detail": err.to_string(),
-                        })
-                        .to_string();
-                        respond_json(stream, 409, &body).await?;
-                        return Ok(());
-                    }
-                };
             let storage_payload = serde_json::json!({ "path": update.path });
             let (status, resp) =
-                handle_admin_command(ctx, client, "set_storage", storage_payload.clone(), None)
-                    .await?;
+                handle_admin_command(ctx, client, "set_storage", storage_payload, None).await?;
             if status != 200 {
                 respond_json(stream, status, &resp).await?;
                 return Ok(());
-            }
-
-            if let Err(err) = broadcast_config_changed(
-                client,
-                "storage",
-                None,
-                None,
-                version,
-                storage_payload,
-                None,
-            )
-            .await
-            {
-                tracing::warn!("config storage broadcast failed after set_storage: {err}");
             }
             tracing::info!("config storage update received");
             respond_json(stream, 200, &resp).await?;
@@ -5673,6 +7020,11 @@ async fn handle_http(
         ("POST", "/opa/policy/rollback") => {
             let req: OpaRequest = serde_json::from_slice(&body)?;
             let (status, resp) = handle_opa_http(ctx, client, req, OpaAction::Rollback).await?;
+            respond_json(stream, status, &resp).await?;
+        }
+        ("POST", "/opa/policy/clear") => {
+            let req: OpaRequest = serde_json::from_slice(&body)?;
+            let (status, resp) = handle_opa_http(ctx, client, req, OpaAction::Clear).await?;
             respond_json(stream, status, &resp).await?;
         }
         ("POST", "/opa/policy/check") => {
@@ -5703,31 +7055,32 @@ async fn handle_http(
         ("POST", "/wf-rules") => {
             let req: WfRulesRequest = serde_json::from_slice(&body)?;
             let (status, resp) =
-                handle_wf_rules_http(ctx, client, req, WfRulesAction::CompileApply).await?;
+                handle_wf_rules_http(ctx, client, req, WfRulesAction::CompileApply, "operator")
+                    .await?;
             respond_json(stream, status, &resp).await?;
         }
         ("POST", "/wf-rules/compile") => {
             let req: WfRulesRequest = serde_json::from_slice(&body)?;
             let (status, resp) =
-                handle_wf_rules_http(ctx, client, req, WfRulesAction::Compile).await?;
+                handle_wf_rules_http(ctx, client, req, WfRulesAction::Compile, "operator").await?;
             respond_json(stream, status, &resp).await?;
         }
         ("POST", "/wf-rules/apply") => {
             let req: WfRulesRequest = serde_json::from_slice(&body)?;
             let (status, resp) =
-                handle_wf_rules_http(ctx, client, req, WfRulesAction::Apply).await?;
+                handle_wf_rules_http(ctx, client, req, WfRulesAction::Apply, "operator").await?;
             respond_json(stream, status, &resp).await?;
         }
         ("POST", "/wf-rules/rollback") => {
             let req: WfRulesRequest = serde_json::from_slice(&body)?;
             let (status, resp) =
-                handle_wf_rules_http(ctx, client, req, WfRulesAction::Rollback).await?;
+                handle_wf_rules_http(ctx, client, req, WfRulesAction::Rollback, "operator").await?;
             respond_json(stream, status, &resp).await?;
         }
         ("POST", "/wf-rules/delete") => {
             let req: WfRulesRequest = serde_json::from_slice(&body)?;
             let (status, resp) =
-                handle_wf_rules_http(ctx, client, req, WfRulesAction::Delete).await?;
+                handle_wf_rules_http(ctx, client, req, WfRulesAction::Delete, "operator").await?;
             respond_json(stream, status, &resp).await?;
         }
         ("GET", "/wf-rules") => {
@@ -5747,7 +7100,8 @@ async fn handle_http(
         }
         _ => {
             let _ = headers;
-            respond_json(stream, 404, r#"{"error":"not_found"}"#).await?;
+            let (status, body) = admin_unknown_route_response(method.as_str(), path);
+            respond_json(stream, status, &body).await?;
         }
     }
     Ok(())
@@ -5881,6 +7235,32 @@ async fn handle_hive_paths(
             let (status, resp) = handle_admin_query(ctx, client, "list_taps", Some(hive)).await?;
             Ok(Some((status, resp)))
         }
+        ("GET", ["commands"]) => {
+            // Command audit log: what was done to this backend lately (redacted). Filters via query
+            // string; `hive` in the path narrows to commands targeting that hive.
+            let mut payload = serde_json::Map::new();
+            if let Some(limit) = query.get("limit").and_then(|v| v.parse::<u64>().ok()) {
+                payload.insert("limit".to_string(), serde_json::json!(limit));
+            }
+            if let Some(action) = query.get("action") {
+                payload.insert("action".to_string(), serde_json::json!(action));
+            }
+            if let Some(status) = query.get("status") {
+                payload.insert("status".to_string(), serde_json::json!(status));
+            }
+            if let Some(since) = query.get("since_ms").and_then(|v| v.parse::<u64>().ok()) {
+                payload.insert("since_ms".to_string(), serde_json::json!(since));
+            }
+            let (status, resp) = handle_admin_command(
+                ctx,
+                client,
+                "list_recent_commands",
+                serde_json::Value::Object(payload),
+                Some(hive),
+            )
+            .await?;
+            Ok(Some((status, resp)))
+        }
         ("POST", ["taps"]) => {
             // ROUTER-TAP-5: install a new tap on the target hive. Body shape
             // mirrors `TapConfig` in sy_config_routes (match_src, match_dst,
@@ -5908,11 +7288,18 @@ async fn handle_hive_paths(
             Ok(Some((status, resp)))
         }
         ("POST", ["nodes"]) => {
-            let payload = if body.is_empty() {
+            let mut payload = if body.is_empty() {
                 serde_json::json!({})
             } else {
                 serde_json::from_slice(body)?
             };
+            // Who launched it: the operator (stamp_relay_facts does it for the mesh).
+            if let Some(object) = payload.as_object_mut() {
+                object.insert(
+                    "launched_by".to_string(),
+                    serde_json::Value::String("operator".to_string()),
+                );
+            }
             let (status, resp) =
                 handle_admin_command(ctx, client, "run_node", payload, Some(hive)).await?;
             Ok(Some((status, resp)))
@@ -6001,16 +7388,45 @@ async fn handle_hive_paths(
                 .get("replace")
                 .map(|value| value == "1" || value.eq_ignore_ascii_case("true"))
                 .unwrap_or(false);
-            let notify = query
-                .get("notify")
-                .map(|value| !(value == "0" || value.eq_ignore_ascii_case("false")))
-                .unwrap_or(true);
-            let payload = serde_json::json!({
+            // Lift the `_system` binding fields out of the body.
+            //
+            // The body is otherwise the node's config patch, and `set_node_config` reads these
+            // five at the TOP level of the payload — so wrapping the whole body under "config"
+            // meant a caller sending {"runtime_version":"0.1.3"} got `status: ok` and a bumped
+            // config_version while nothing rebound, and the next restart_node still failed with
+            // RUNTIME_NOT_AVAILABLE. Silently storing a binding request as an inert config key is
+            // worse than refusing it: it is the only recovery path after a `.deb` upgrade moves a
+            // runtime version, and it was answering "done" without doing anything (U-10).
+            let mut config_payload = config_payload;
+            let mut payload = serde_json::json!({
                 "node_name": decode_percent(name),
-                "config": config_payload,
                 "replace": replace,
-                "notify": notify,
             });
+            let mut lifted: Vec<&str> = Vec::new();
+            if let (Some(config_obj), Some(payload_obj)) =
+                (config_payload.as_object_mut(), payload.as_object_mut())
+            {
+                for field in [
+                    "runtime",
+                    "runtime_version",
+                    "requested_runtime_version",
+                    "runtime_base",
+                    "package_path",
+                ] {
+                    if let Some(value) = config_obj.remove(field) {
+                        payload_obj.insert(field.to_string(), value);
+                        lifted.push(field);
+                    }
+                }
+            }
+            if !lifted.is_empty() {
+                tracing::info!(
+                    node = %decode_percent(name),
+                    fields = ?lifted,
+                    "set_node_config: treating reserved fields as _system bindings, not config keys"
+                );
+            }
+            payload["config"] = config_payload;
             let (status, resp) =
                 handle_admin_command(ctx, client, "set_node_config", payload, Some(hive)).await?;
             Ok(Some((status, resp)))
@@ -6095,6 +7511,25 @@ async fn handle_hive_paths(
             Ok(Some((status, resp)))
         }
         ("GET", ["identity", "ilks"]) => {
+            // ?include_deleted=true adds the marked ILKs; ?pending_signup=true keeps only the
+            // signups nobody finished, wherever they are charged.
+            let mut filter = serde_json::Map::new();
+            for flag in ["include_deleted", "pending_signup"] {
+                if query_flag(query, flag) {
+                    filter.insert(flag.to_string(), serde_json::Value::Bool(true));
+                }
+            }
+            if !filter.is_empty() {
+                let (status, resp) = handle_identity_query(
+                    ctx,
+                    client,
+                    "list_ilks",
+                    serde_json::Value::Object(filter),
+                    Some(hive),
+                )
+                .await?;
+                return Ok(Some((status, resp)));
+            }
             let (status, resp) = handle_admin_query(ctx, client, "list_ilks", Some(hive)).await?;
             Ok(Some((status, resp)))
         }
@@ -6139,7 +7574,64 @@ async fn handle_hive_paths(
                 handle_admin_command(ctx, client, "delete_ilk", payload, Some(hive)).await?;
             Ok(Some((status, resp)))
         }
+        ("POST", ["identity", "ilks", ilk_id, "restore"]) => {
+            let payload = serde_json::json!({ "ilk_id": decode_percent(ilk_id) });
+            let (status, resp) =
+                handle_admin_command(ctx, client, "restore_ilk", payload, Some(hive)).await?;
+            Ok(Some((status, resp)))
+        }
+        ("PUT", ["identity", "ilks", ilk_id, "tenant"]) => {
+            let body: serde_json::Value = if body.is_empty() {
+                serde_json::json!({})
+            } else {
+                serde_json::from_slice(body)?
+            };
+            // The operator's own request: who it is for is stamped here, never taken from the body.
+            let payload = serde_json::json!({
+                "ilk_id": decode_percent(ilk_id),
+                "tenant_id": body.get("tenant_id").cloned().unwrap_or(serde_json::Value::Null),
+                "on_behalf_of": "operator",
+            });
+            let (status, resp) =
+                handle_admin_command(ctx, client, "set_ilk_tenant", payload, Some(hive)).await?;
+            Ok(Some((status, resp)))
+        }
+        ("POST", ["identity", "ilks", ilk_id, "purge"]) => {
+            let payload = serde_json::json!({ "ilk_id": decode_percent(ilk_id) });
+            let (status, resp) =
+                handle_admin_command(ctx, client, "purge_ilk", payload, Some(hive)).await?;
+            Ok(Some((status, resp)))
+        }
+        ("DELETE", ["identity", "tenants", tenant_id]) => {
+            let payload = serde_json::json!({ "tenant_id": decode_percent(tenant_id) });
+            let (status, resp) =
+                handle_admin_command(ctx, client, "delete_tenant", payload, Some(hive)).await?;
+            Ok(Some((status, resp)))
+        }
+        ("POST", ["identity", "tenants", tenant_id, "restore"]) => {
+            let payload = serde_json::json!({ "tenant_id": decode_percent(tenant_id) });
+            let (status, resp) =
+                handle_admin_command(ctx, client, "restore_tenant", payload, Some(hive)).await?;
+            Ok(Some((status, resp)))
+        }
+        ("POST", ["identity", "tenants", tenant_id, "purge"]) => {
+            let payload = serde_json::json!({ "tenant_id": decode_percent(tenant_id) });
+            let (status, resp) =
+                handle_admin_command(ctx, client, "purge_tenant", payload, Some(hive)).await?;
+            Ok(Some((status, resp)))
+        }
         ("GET", ["identity", "tenants"]) => {
+            if query_flag(query, "include_deleted") {
+                let (status, resp) = handle_identity_query(
+                    ctx,
+                    client,
+                    "list_tenants",
+                    serde_json::json!({"include_deleted": true}),
+                    Some(hive),
+                )
+                .await?;
+                return Ok(Some((status, resp)));
+            }
             let (status, resp) =
                 handle_admin_query(ctx, client, "list_tenants", Some(hive)).await?;
             Ok(Some((status, resp)))
@@ -6165,6 +7657,18 @@ async fn handle_hive_paths(
             }
             let (status, resp) =
                 handle_admin_command(ctx, client, "create_tenant", payload, Some(hive)).await?;
+            Ok(Some((status, resp)))
+        }
+        ("GET", ["identity", "tenants", tenant_id, "nodes"]) => {
+            let payload = serde_json::json!({ "tenant_id": decode_percent(tenant_id) });
+            let (status, resp) = handle_admin_query_with_payload(
+                ctx,
+                client,
+                "list_tenant_nodes",
+                payload,
+                Some(hive),
+            )
+            .await?;
             Ok(Some((status, resp)))
         }
         ("GET", ["identity", "tenants", tenant_id]) => {
@@ -6321,11 +7825,41 @@ async fn handle_hive_paths(
             Ok(Some((status, resp)))
         }
         ("DELETE", ["vault", "secrets", key]) => {
-            let payload = serde_json::json!({
+            let mut payload = serde_json::json!({
                 "key": decode_percent(key),
             });
+            if let Some(tenant_id) = query.get("tenant_id") {
+                payload["tenant_id"] = serde_json::Value::String(tenant_id.to_string());
+            }
             let (status, resp) =
                 handle_admin_command(ctx, client, "vault_delete", payload, Some(hive)).await?;
+            Ok(Some((status, resp)))
+        }
+        ("PUT", ["vault", "secrets", key, "assigned"]) => {
+            let mut payload = if body.is_empty() {
+                serde_json::json!({})
+            } else {
+                serde_json::from_slice(body)?
+            };
+            let Some(object) = payload.as_object_mut() else {
+                return Ok(Some((
+                    400,
+                    serde_json::json!({
+                        "status": "error",
+                        "action": "vault_assign",
+                        "payload": serde_json::Value::Null,
+                        "error_code": "INVALID_REQUEST",
+                        "error_detail": "the body must be a JSON object",
+                    })
+                    .to_string(),
+                )));
+            };
+            object.insert(
+                "key".to_string(),
+                serde_json::Value::String(decode_percent(key)),
+            );
+            let (status, resp) =
+                handle_admin_command(ctx, client, "vault_assign", payload, Some(hive)).await?;
             Ok(Some((status, resp)))
         }
         ("POST", ["vault", "secrets", key, "rotate"]) => {
@@ -6348,14 +7882,20 @@ async fn handle_hive_paths(
                 )));
             }
             payload["key"] = serde_json::Value::String(decode_percent(key));
+            if let Some(tenant_id) = query.get("tenant_id") {
+                payload["tenant_id"] = serde_json::Value::String(tenant_id.to_string());
+            }
             let (status, resp) =
                 handle_admin_command(ctx, client, "vault_rotate", payload, Some(hive)).await?;
             Ok(Some((status, resp)))
         }
         ("POST", ["vault", "secrets", key, "rollback"]) => {
-            let payload = serde_json::json!({
+            let mut payload = serde_json::json!({
                 "key": decode_percent(key),
             });
+            if let Some(tenant_id) = query.get("tenant_id") {
+                payload["tenant_id"] = serde_json::Value::String(tenant_id.to_string());
+            }
             let (status, resp) =
                 handle_admin_command(ctx, client, "vault_rollback", payload, Some(hive)).await?;
             Ok(Some((status, resp)))
@@ -6363,6 +7903,17 @@ async fn handle_hive_paths(
         ("GET", ["versions"]) => {
             let (status, resp) =
                 handle_admin_query(ctx, client, "get_versions", Some(hive)).await?;
+            Ok(Some((status, resp)))
+        }
+        ("GET", ["streams"]) => {
+            let (status, resp) = handle_list_streams(ctx, client, hive).await?;
+            Ok(Some((status, resp)))
+        }
+        ("GET", ["usage"]) => {
+            let (status, resp) = match llm_usage_query_from_http(query) {
+                Ok(usage_query) => handle_llm_usage(client, &hive, usage_query).await?,
+                Err(detail) => llm_usage_error(400, "INVALID_REQUEST", &detail),
+            };
             Ok(Some((status, resp)))
         }
         ("GET", ["runtimes"]) => {
@@ -6417,6 +7968,22 @@ async fn handle_hive_paths(
             let (status, resp) = handle_hive_update_command(ctx, client, hive, payload).await?;
             Ok(Some((status, resp)))
         }
+        ("POST", ["cloud", "endpoint"]) => {
+            let payload = if body.is_empty() {
+                serde_json::json!({})
+            } else {
+                serde_json::from_slice(body)?
+            };
+            // Operator path (caller=None). This route calls the handler directly (it does NOT go
+            // through dispatch_internal_admin_command), so it carries its own audit append to match
+            // the mesh arm — a token mint must always leave a command-log entry.
+            let logged_params = admin_command_log_params(&payload);
+            let started = Instant::now();
+            let result = handle_publish_cloud_endpoint(ctx, client, payload).await;
+            append_internal_dispatch_log(ctx, "publish_cloud_endpoint", None, logged_params, started, &result);
+            let result = result?;
+            Ok(Some((result.http_status, result.envelope.to_string())))
+        }
         ("POST", ["sync-hint"]) => {
             let payload = if body.is_empty() {
                 serde_json::json!({})
@@ -6426,39 +7993,14 @@ async fn handle_hive_paths(
             let (status, resp) = handle_hive_sync_hint_command(ctx, client, hive, payload).await?;
             Ok(Some((status, resp)))
         }
-        ("POST", ["opa", "policy"]) => {
-            let req: OpaRequest = serde_json::from_slice(body)?;
-            let mut req = req;
-            req.hive = Some(hive);
-            let (status, resp) = handle_opa_http(ctx, client, req, OpaAction::CompileApply).await?;
-            Ok(Some((status, resp)))
-        }
-        ("POST", ["opa", "policy", "compile"]) => {
-            let req: OpaRequest = serde_json::from_slice(body)?;
-            let mut req = req;
-            req.hive = Some(hive);
-            let (status, resp) = handle_opa_http(ctx, client, req, OpaAction::Compile).await?;
-            Ok(Some((status, resp)))
-        }
-        ("POST", ["opa", "policy", "apply"]) => {
-            let req: OpaRequest = serde_json::from_slice(body)?;
-            let mut req = req;
-            req.hive = Some(hive);
-            let (status, resp) = handle_opa_http(ctx, client, req, OpaAction::Apply).await?;
-            Ok(Some((status, resp)))
-        }
-        ("POST", ["opa", "policy", "rollback"]) => {
-            let req: OpaRequest = serde_json::from_slice(body)?;
-            let mut req = req;
-            req.hive = Some(hive);
-            let (status, resp) = handle_opa_http(ctx, client, req, OpaAction::Rollback).await?;
-            Ok(Some((status, resp)))
-        }
-        ("POST", ["opa", "policy", "check"]) => {
-            let req: OpaRequest = serde_json::from_slice(body)?;
-            let mut req = req;
-            req.hive = Some(hive);
-            let (status, resp) = handle_opa_http(ctx, client, req, OpaAction::Check).await?;
+        ("POST", ["core", "rollback"]) => {
+            let payload: serde_json::Value = if body.is_empty() {
+                serde_json::json!({})
+            } else {
+                serde_json::from_slice(body)?
+            };
+            let (status, resp) =
+                handle_admin_command(ctx, client, "core_rollback", payload, Some(hive)).await?;
             Ok(Some((status, resp)))
         }
         ("GET", ["opa", "policy"]) => {
@@ -6474,7 +8016,8 @@ async fn handle_hive_paths(
             let mut req = req;
             req.hive = Some(hive);
             let (status, resp) =
-                handle_wf_rules_http(ctx, client, req, WfRulesAction::CompileApply).await?;
+                handle_wf_rules_http(ctx, client, req, WfRulesAction::CompileApply, "operator")
+                    .await?;
             Ok(Some((status, resp)))
         }
         ("POST", ["wf-rules", "compile"]) => {
@@ -6482,7 +8025,7 @@ async fn handle_hive_paths(
             let mut req = req;
             req.hive = Some(hive);
             let (status, resp) =
-                handle_wf_rules_http(ctx, client, req, WfRulesAction::Compile).await?;
+                handle_wf_rules_http(ctx, client, req, WfRulesAction::Compile, "operator").await?;
             Ok(Some((status, resp)))
         }
         ("POST", ["wf-rules", "apply"]) => {
@@ -6490,7 +8033,7 @@ async fn handle_hive_paths(
             let mut req = req;
             req.hive = Some(hive);
             let (status, resp) =
-                handle_wf_rules_http(ctx, client, req, WfRulesAction::Apply).await?;
+                handle_wf_rules_http(ctx, client, req, WfRulesAction::Apply, "operator").await?;
             Ok(Some((status, resp)))
         }
         ("POST", ["wf-rules", "rollback"]) => {
@@ -6498,7 +8041,7 @@ async fn handle_hive_paths(
             let mut req = req;
             req.hive = Some(hive);
             let (status, resp) =
-                handle_wf_rules_http(ctx, client, req, WfRulesAction::Rollback).await?;
+                handle_wf_rules_http(ctx, client, req, WfRulesAction::Rollback, "operator").await?;
             Ok(Some((status, resp)))
         }
         ("POST", ["wf-rules", "delete"]) => {
@@ -6506,7 +8049,7 @@ async fn handle_hive_paths(
             let mut req = req;
             req.hive = Some(hive);
             let (status, resp) =
-                handle_wf_rules_http(ctx, client, req, WfRulesAction::Delete).await?;
+                handle_wf_rules_http(ctx, client, req, WfRulesAction::Delete, "operator").await?;
             Ok(Some((status, resp)))
         }
         ("GET", ["wf-rules"]) => {
@@ -6853,6 +8396,9 @@ fn split_path_query(path: &str) -> (&str, HashMap<String, String>) {
     }
 }
 
+/// Query parameters, percent-decoded: a client that encodes `@` as `%40` (Python's urlencode does)
+/// must match the same tap or route as one that sends it raw. `+` stays literal: raw `+` values
+/// (an offset, a GMT+3 zone) are commoner here than form-encoded spaces.
 fn parse_query(query: &str) -> HashMap<String, String> {
     let mut params = HashMap::new();
     for pair in query.split('&') {
@@ -6863,9 +8409,30 @@ fn parse_query(query: &str) -> HashMap<String, String> {
             Some(parts) => parts,
             None => (pair, ""),
         };
-        params.insert(key.to_string(), value.to_string());
+        params.insert(decode_query_component(key), decode_query_component(value));
     }
     params
+}
+
+fn decode_query_component(input: &str) -> String {
+    if !input.contains('%') {
+        return input.to_string();
+    }
+    let bytes = input.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            if let (Some(h), Some(l)) = (from_hex(bytes[i + 1]), from_hex(bytes[i + 2])) {
+                out.push(h << 4 | l);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
 }
 
 fn deployments_payload_from_query(query: &HashMap<String, String>) -> serde_json::Value {
@@ -6913,6 +8480,7 @@ fn http_status_line(status: u16) -> &'static str {
         200 => "HTTP/1.1 200 OK",
         202 => "HTTP/1.1 202 Accepted",
         400 => "HTTP/1.1 400 Bad Request",
+        403 => "HTTP/1.1 403 Forbidden",
         404 => "HTTP/1.1 404 Not Found",
         409 => "HTTP/1.1 409 Conflict",
         422 => "HTTP/1.1 422 Unprocessable Entity",
@@ -6937,18 +8505,33 @@ fn error_code_to_http_status(error_code: &str) -> u16 {
         // Worker orchestrator is online but a socket op failed transiently
         // (add_hive did not fall back to SSH); the client should retry.
         "WORKER_SOCKET_UNREACHABLE" => 503,
+        // A join found the box still settling (cloud-init or apt's daily jobs still running after
+        // the wait): retry once it has (A-52).
+        "HOST_NOT_SETTLED" => 503,
         "INVALID_REQUEST" | "INVALID_ADDRESS" | "INVALID_ARCHIVE" | "INVALID_HIVE_ID"
         | "INVALID_ZIP" | "INVALID_KEY_FORMAT" | "INVALID_VALUE" => 400,
-        "UNAUTHORIZED" | "SYSTEM_ILK_PROTECTED" => 403,
+        "UNAUTHORIZED"
+        | "SYSTEM_ILK_PROTECTED"
+        | "TENANT_ROOT_PROTECTED"
+        // Only the core is born in the genesis tenant, and nobody registers there (D10).
+        | "TENANT_ROOT_NOT_ALLOWED"
+        | "TENANT_ROOT_NOT_REGISTRABLE" => 403,
         "NOT_FOUND"
         | "ILK_NOT_FOUND"
+        | "TENANT_NOT_FOUND"
         | "NODE_NOT_FOUND"
         | "BLOB_NOT_FOUND"
         | "KEY_NOT_FOUND"
         | "RUNTIME_NOT_AVAILABLE"
         | "RUNTIME_NOT_FOUND"
         | "RUNTIME_VERSION_NOT_FOUND" => 404,
-        "HIVE_EXISTS"
+        // The work probably succeeded but the reply was lost — a conflict-with-current-state
+        // answer, retryable once the operator has verified.
+        "FORWARD_UNKNOWN"
+        | "HIVE_EXISTS"
+        // A join for this hive is already running in the background (PB-7): a conflict with
+        // current state, and retryable once it finishes.
+        | "JOIN_IN_PROGRESS"
         | "MODULE_EXISTS"
         | "VERSION_MISMATCH"
         | "VERSION_CONFLICT"
@@ -6964,12 +8547,29 @@ fn error_code_to_http_status(error_code: &str) -> u16 {
         | "RUNTIME_IN_USE"
         | "RUNTIME_HAS_DEPENDENTS"
         | "RUNTIME_CURRENT_CONFLICT"
+        // A name another tenant holds: a vault key (one namespace for the hive), a tenant name or
+        // domain.
+        | "KEY_TAKEN"
+        | "TENANT_NAME_TAKEN"
+        | "TENANT_DOMAIN_TAKEN"
+        // An identity lifecycle step the current state refuses: what blocks it is in the detail.
+        | "TENANT_HAS_NODES"
+        | "TENANT_HAS_CHILDREN"
+        | "TENANT_HAS_PEOPLE"
+        | "TENANT_NOT_DELETED"
+        // A node of a tenant that is not active is not started (docs/ilk-tenant-model-v1.md §2.3).
+        | "TENANT_NOT_ACTIVE"
+        | "TENANT_DELETED"
+        | "ILK_NOT_DELETED"
+        | "ILK_KEY_CONFLICT"
         | "BUSY" => 409,
         "COMPILE_ERROR"
         | "INVALID_CONFIG"
         | "INVALID_PACKAGE_LAYOUT"
         | "UNSUPPORTED_APPLY_MODE"
-        | "PACKAGE_PUBLISH_FAILED" => 422,
+        | "PACKAGE_PUBLISH_FAILED"
+        // the stamped backup does not match its bytes: refuse rather than restore garbage
+        | "BACKUP_CORRUPT" => 422,
         "INVALID_WORKFLOW_NAME" | "INVALID_CONFIG_SET" | "UNSUPPORTED_OPERATION" => 400,
         "WORKFLOW_NOT_FOUND" => 404,
         "NOT_IMPLEMENTED" => 501,
@@ -6979,7 +8579,6 @@ fn error_code_to_http_status(error_code: &str) -> u16 {
         | "REMOVE_FAILED"
         | "COPY_FAILED"
         | "CONFIG_FAILED"
-        | "CONFIG_BROADCAST_FAILED"
         | "RUNTIME_ERROR"
         | "RUNTIME_COMMAND_FAILED"
         | "RUNTIME_UNAVAILABLE"
@@ -6988,7 +8587,11 @@ fn error_code_to_http_status(error_code: &str) -> u16 {
         | "RESTART_FAILED"
         | "STORAGE_ERROR"
         | "ENCRYPTION_ERROR"
-        | "TRANSPORT_ERROR" => 502,
+        | "TRANSPORT_ERROR"
+        // add_hive could not check whether the box had settled (A-52); not about settling.
+        | "HOST_SETTLE_CHECK_FAILED"
+        // add_hive could not push the spoke's mesh TLS material (D32); fatal for the join.
+        | "TLS_PUSH_FAILED" => 502,
         "SHM_NOT_FOUND"
         | "RUNTIME_MANIFEST_MISSING"
         | "MISSING_WAN_LISTEN"
@@ -7044,282 +8647,14 @@ fn payload_error_detail(payload: &serde_json::Value) -> Option<String> {
         })
 }
 
-async fn handle_storage_metrics_http(ctx: &AdminContext) -> (u16, String) {
-    let action = "get_storage_metrics";
-    let trace_id = Uuid::new_v4().to_string();
-    let reply_subject = ctx.nats_client.inbox_reply_subject(&trace_id);
-    let request_envelope = NatsRequestEnvelope::<serde_json::Value>::new(
-        SUBJECT_STORAGE_METRICS_GET,
-        trace_id.clone(),
-        reply_subject.clone(),
-        None,
-    );
-    let request_body = match serde_json::to_vec(&request_envelope) {
-        Ok(body) => body,
-        Err(err) => {
-            let error_detail = err.to_string();
-            return (
-                500,
-                serde_json::json!({
-                    "status": "error",
-                    "action": action,
-                    "payload": {
-                        "status": "error",
-                        "error_code": "INVALID_REQUEST",
-                        "message": error_detail,
-                    },
-                    "error_code": "INVALID_REQUEST",
-                    "error_detail": error_detail,
-                })
-                .to_string(),
-            );
-        }
-    };
-    let sid = 0u32;
-    let request_started = Instant::now();
-    tracing::info!(
-        trace_id = %trace_id,
-        endpoint = %ctx.nats_endpoint,
-        request_subject = SUBJECT_STORAGE_METRICS_GET,
-        reply_subject = %reply_subject,
-        sid = sid,
-        timeout_secs = STORAGE_METRICS_NATS_TIMEOUT_SECS,
-        request_bytes = request_body.len(),
-        "storage metrics nats request send"
-    );
-    let response_body = match ctx
-        .nats_client
-        .request_with_session_inbox(
-            SUBJECT_STORAGE_METRICS_GET,
-            &request_body,
-            &reply_subject,
-            Duration::from_secs(STORAGE_METRICS_NATS_TIMEOUT_SECS),
-        )
-        .await
-    {
-        Ok(body) => {
-            let elapsed_ms = request_started.elapsed().as_millis() as u64;
-            tracing::info!(
-                trace_id = %trace_id,
-                endpoint = %ctx.nats_endpoint,
-                request_subject = SUBJECT_STORAGE_METRICS_GET,
-                reply_subject = %reply_subject,
-                sid = sid,
-                elapsed_ms = elapsed_ms,
-                response_bytes = body.len(),
-                "storage metrics nats response received"
-            );
-            body
-        }
-        Err(err) => {
-            let error_detail = err.to_string();
-            let elapsed_ms = request_started.elapsed().as_millis() as u64;
-            tracing::warn!(
-                trace_id = %trace_id,
-                endpoint = %ctx.nats_endpoint,
-                request_subject = SUBJECT_STORAGE_METRICS_GET,
-                reply_subject = %reply_subject,
-                sid = sid,
-                elapsed_ms = elapsed_ms,
-                error = %error_detail,
-                "storage metrics nats request failed"
-            );
-            return (
-                503,
-                serde_json::json!({
-                    "status": "error",
-                    "action": action,
-                    "payload": {
-                        "status": "error",
-                        "error_code": "STORAGE_METRICS_UNAVAILABLE",
-                        "message": error_detail,
-                    },
-                    "error_code": "STORAGE_METRICS_UNAVAILABLE",
-                    "error_detail": error_detail,
-                })
-                .to_string(),
-            );
-        }
-    };
-    let response: NatsResponseEnvelope<StorageInboxMetrics> =
-        match serde_json::from_slice(&response_body) {
-            Ok(resp) => resp,
-            Err(err) => {
-                let error_detail = err.to_string();
-                let elapsed_ms = request_started.elapsed().as_millis() as u64;
-                tracing::warn!(
-                    trace_id = %trace_id,
-                    endpoint = %ctx.nats_endpoint,
-                    request_subject = SUBJECT_STORAGE_METRICS_GET,
-                    reply_subject = %reply_subject,
-                    sid = sid,
-                    elapsed_ms = elapsed_ms,
-                    error = %error_detail,
-                    "storage metrics nats response decode failed"
-                );
-                return (
-                    502,
-                    serde_json::json!({
-                        "status": "error",
-                        "action": action,
-                        "payload": {
-                            "status": "error",
-                            "error_code": "TRANSPORT_ERROR",
-                            "message": error_detail,
-                        },
-                        "error_code": "TRANSPORT_ERROR",
-                        "error_detail": error_detail,
-                    })
-                    .to_string(),
-                );
-            }
-        };
-    tracing::info!(
-        trace_id = %trace_id,
-        endpoint = %ctx.nats_endpoint,
-        request_subject = SUBJECT_STORAGE_METRICS_GET,
-        reply_subject = %reply_subject,
-        sid = sid,
-        elapsed_ms = request_started.elapsed().as_millis() as u64,
-        response_status = %response.status,
-        has_metrics = response.payload.is_some(),
-        response_error_code = ?response.error_code,
-        response_error_detail = ?response.error_detail,
-        "storage metrics nats response decoded"
-    );
-    if response.action != SUBJECT_STORAGE_METRICS_GET {
-        let error_detail = format!(
-            "action mismatch expected={} got={}",
-            SUBJECT_STORAGE_METRICS_GET, response.action
-        );
-        let elapsed_ms = request_started.elapsed().as_millis() as u64;
-        tracing::warn!(
-            trace_id = %trace_id,
-            endpoint = %ctx.nats_endpoint,
-            request_subject = SUBJECT_STORAGE_METRICS_GET,
-            reply_subject = %reply_subject,
-            sid = sid,
-            elapsed_ms = elapsed_ms,
-            error = %error_detail,
-            "storage metrics nats response action mismatch"
-        );
-        return (
-            502,
-            serde_json::json!({
-                "status": "error",
-                "action": action,
-                "payload": {
-                    "status": "error",
-                    "error_code": "TRANSPORT_ERROR",
-                    "message": error_detail,
-                },
-                "error_code": "TRANSPORT_ERROR",
-                "error_detail": error_detail,
-            })
-            .to_string(),
-        );
-    }
-    if response.trace_id != trace_id {
-        let error_detail = format!(
-            "trace_id mismatch expected={} got={}",
-            trace_id, response.trace_id
-        );
-        let elapsed_ms = request_started.elapsed().as_millis() as u64;
-        tracing::warn!(
-            trace_id = %trace_id,
-            endpoint = %ctx.nats_endpoint,
-            request_subject = SUBJECT_STORAGE_METRICS_GET,
-            reply_subject = %reply_subject,
-            sid = sid,
-            elapsed_ms = elapsed_ms,
-            error = %error_detail,
-            "storage metrics nats response trace mismatch"
-        );
-        return (
-            502,
-            serde_json::json!({
-                "status": "error",
-                "action": action,
-                "payload": {
-                    "status": "error",
-                    "error_code": "TRANSPORT_ERROR",
-                    "message": error_detail,
-                },
-                "error_code": "TRANSPORT_ERROR",
-                "error_detail": error_detail,
-            })
-            .to_string(),
-        );
-    }
-
-    match (response.status.as_str(), response.payload) {
-        ("ok", Some(metrics)) => {
-            tracing::info!(
-                trace_id = %trace_id,
-                endpoint = %ctx.nats_endpoint,
-                request_subject = SUBJECT_STORAGE_METRICS_GET,
-                reply_subject = %reply_subject,
-                sid = sid,
-                elapsed_ms = request_started.elapsed().as_millis() as u64,
-                pending = metrics.pending,
-                pending_with_error = metrics.pending_with_error,
-                oldest_pending_age_s = metrics.oldest_pending_age_s,
-                max_attempts = metrics.max_attempts,
-                processed_total = metrics.processed_total,
-                "storage metrics nats request success"
-            );
-            (
-                200,
-                serde_json::json!({
-                    "status": "ok",
-                    "action": action,
-                    "payload": {
-                        "status": "ok",
-                        "metrics": metrics,
-                    },
-                    "error_code": serde_json::Value::Null,
-                    "error_detail": serde_json::Value::Null,
-                })
-                .to_string(),
-            )
-        }
-        _ => {
-            let error_code = response
-                .error_code
-                .unwrap_or_else(|| "STORAGE_METRICS_UNAVAILABLE".to_string());
-            let error_detail = response
-                .error_detail
-                .unwrap_or_else(|| "storage metrics request failed".to_string());
-            tracing::warn!(
-                trace_id = %trace_id,
-                endpoint = %ctx.nats_endpoint,
-                request_subject = SUBJECT_STORAGE_METRICS_GET,
-                reply_subject = %reply_subject,
-                sid = sid,
-                elapsed_ms = request_started.elapsed().as_millis() as u64,
-                error_code = %error_code,
-                error_detail = %error_detail,
-                "storage metrics nats request returned error payload"
-            );
-            (
-                503,
-                serde_json::json!({
-                    "status": "error",
-                    "action": action,
-                    "payload": {
-                        "status": "error",
-                        "error_code": error_code,
-                        "message": error_detail,
-                    },
-                    "error_code": error_code,
-                    "error_detail": error_detail,
-                })
-                .to_string(),
-            )
-        }
-    }
-}
-
+/// The statuses that count as SUCCESS on the wire, i.e. not an error envelope.
+///
+/// Three are not literally `"ok"`, and each is deliberate:
+/// - `not_found`: a well-formed query whose answer is "nothing here".
+/// - `sync_pending`: the target correctly refused a stale update; the caller must re-sync.
+/// - `accepted`: the work was taken but is NOT finished — `add_hive` runs in the background
+///   (PB-7) and the caller polls `GET /hives/<id>`. Anything else answering `accepted` inherits
+///   the same 202 contract, so add it here only if that is what you mean.
 fn is_ok_status(status: Option<&str>) -> bool {
     matches!(
         status,
@@ -7327,6 +8662,7 @@ fn is_ok_status(status: Option<&str>) -> bool {
             if value.eq_ignore_ascii_case("ok")
                 || value.eq_ignore_ascii_case("not_found")
                 || value.eq_ignore_ascii_case("sync_pending")
+                || value.eq_ignore_ascii_case("accepted")
     )
 }
 
@@ -7401,6 +8737,22 @@ async fn handle_opa_http(
     mut req: OpaRequest,
     action: OpaAction,
 ) -> Result<(u16, String), AdminError> {
+    // One user policy for every hive (decided 2026-09-30): the motherbee's SY.opa.rules compiles,
+    // applies and publishes it; every other hive installs what it publishes. There is no
+    // per-hive policy to write.
+    if let Some(hive) = normalize_opa_target(req.hive.take()) {
+        if hive != PRIMARY_HIVE_ID {
+            let resp = serde_json::json!({
+                "status": "error",
+                "error_code": "INVALID_REQUEST",
+                "error_detail": format!(
+                    "there is one user policy for every hive; '{hive}' cannot have its own (use /opa/policy)"
+                ),
+            });
+            return Ok((400, resp.to_string()));
+        }
+    }
+    let primary = Some(PRIMARY_HIVE_ID.to_string());
     let version = match action {
         OpaAction::Apply => {
             let Some(version) = req.version else {
@@ -7414,13 +8766,13 @@ async fn handle_opa_http(
             version
         }
         OpaAction::Rollback => req.version.unwrap_or(0),
+        OpaAction::Clear => 0,
         _ => next_opa_version(req.version)?,
     };
     let entrypoint = req
         .entrypoint
         .clone()
         .unwrap_or_else(|| "router/target".to_string());
-    let target = normalize_opa_target(req.hive.take());
 
     if action.needs_rego() && req.rego.as_deref().unwrap_or("").is_empty() {
         let resp = serde_json::json!({
@@ -7444,54 +8796,164 @@ async fn handle_opa_http(
             req.rego.clone(),
             Some(entrypoint.clone()),
             action.auto_apply_flag(),
-            target.clone(),
         )
         .await?;
-        if responses.is_empty() || responses.iter().any(|r| r.status != "ok") {
+        let compiled = !responses.is_empty() && responses.iter().all(|r| r.status == "ok");
+        if !compiled || !action.apply_after() {
             return Ok(build_opa_http_response(
-                ctx, action, version, responses, target,
+                ctx, action, version, responses, primary,
             ));
         }
     }
 
-    if action.apply_after() {
-        let apply_responses = send_opa_action(
-            ctx,
-            client,
-            "apply",
-            version,
-            None,
-            None,
-            None,
-            target.clone(),
-        )
-        .await?;
-        if apply_responses.is_empty() || apply_responses.iter().any(|r| r.status != "ok") {
-            let mut combined = responses;
-            combined.extend(apply_responses);
-            return Ok(build_opa_http_response(
-                ctx, action, version, combined, target,
-            ));
+    // The step that changes the running policy, on the motherbee.
+    let step = if action.apply_after() {
+        "apply"
+    } else {
+        action.as_str()
+    };
+    let step_responses = send_opa_action(ctx, client, step, version, None, None, None).await?;
+    let step_answered = !step_responses.is_empty();
+    let applied = step_responses
+        .iter()
+        .find(|r| r.hive == PRIMARY_HIVE_ID && r.status.eq_ignore_ascii_case("ok"))
+        .cloned();
+    responses.extend(step_responses);
+    let Some(applied) = applied else {
+        if !step_answered {
+            // The compile answer must not make this look like a success: the step that changes
+            // the running policy got no answer, so nobody knows whether it changed.
+            let body = serde_json::json!({
+                "status": "error",
+                "version": version,
+                "action": action.write_name(),
+                "responses": responses,
+                "error_code": "TIMEOUT",
+                "error_detail": format!(
+                    "SY.opa.rules@{PRIMARY_HIVE_ID} did not answer the {step} within {OPA_PRIMARY_WAIT_SECS} s; \
+                     the policy may or may not have changed (check GET /hives/{PRIMARY_HIVE_ID}/opa/status)"
+                ),
+            })
+            .to_string();
+            return Ok((error_code_to_http_status("TIMEOUT"), body));
         }
-        responses.extend(apply_responses);
-    } else if matches!(action, OpaAction::Apply | OpaAction::Rollback) {
-        let apply_action = action.as_str();
-        responses = send_opa_action(
-            ctx,
-            client,
-            apply_action,
-            version,
-            None,
-            None,
-            None,
-            target.clone(),
-        )
-        .await?;
-    }
+        return Ok(build_opa_http_response(
+            ctx, action, version, responses, primary,
+        ));
+    };
 
-    Ok(build_opa_http_response(
-        ctx, action, version, responses, target,
+    // Applied and published on the motherbee: tell every hive, and report who runs it already.
+    // The others are pending, not failed — they install it when the published file reaches them.
+    let hash = applied.hash.clone().unwrap_or_default();
+    scan_published_opa_policy(client).await;
+    let expected = opa_rollout_hives(ctx);
+    let reachable = topology_hives_from_lsa(ctx);
+    let mut receiver = client.subscribe(RPC_BC_CONFIG_RESPONSE)?;
+    send_opa_sync_notice(client, version, &hash).await?;
+    let synced = collect_opa_responses(
+        &mut receiver,
+        "sync",
+        version,
+        Some(&hash),
+        &expected,
+        Duration::from_secs(OPA_SYNC_WAIT_SECS),
+    )
+    .await;
+    Ok(build_opa_rollout_response(
+        action, version, &hash, responses, synced, &expected, &reachable,
     ))
+}
+
+/// How long a write waits for the motherbee's SY.opa.rules, and then for the other hives to report
+/// they run the published policy. A reachable hive answers in a few seconds (it re-checks every
+/// second after the notice); one that does not is reported pending — it converges later on its
+/// own — instead of holding the caller past its own timeout.
+const OPA_PRIMARY_WAIT_SECS: u64 = 30;
+const OPA_SYNC_WAIT_SECS: u64 = 10;
+/// The Syncthing folder that carries the published policy, how long the orchestrator may spend on
+/// its scan, and how long a write waits for that answer (a hint, never a gate).
+const OPA_POLICY_SYNC_FOLDER: &str = "fluxbee-dist-policy";
+const OPA_POLICY_SCAN_TIMEOUT_MS: u64 = 3_000;
+const OPA_POLICY_SCAN_WAIT_SECS: u64 = 5;
+
+/// Have the motherbee's Syncthing pick up the policy just published now, not when its filesystem
+/// watcher gets to it: a clear only renames and deletes files, which the watcher holds for its
+/// full timeout (measured: 60 s, against 10 s when a new wasm is written). The orchestrator owns
+/// Syncthing; its sync hint scans the folder and waits until it is idle — the same step a runtime
+/// publish takes. Best effort: without it the hives still converge, later.
+async fn scan_published_opa_policy(client: &RouterDispatcher) {
+    let request = serde_json::json!({
+        "channel": "dist",
+        "folder_id": OPA_POLICY_SYNC_FOLDER,
+        "wait_for_idle": true,
+        "timeout_ms": OPA_POLICY_SCAN_TIMEOUT_MS,
+    });
+    // Bounded: with Syncthing unhealthy the orchestrator may take long on this hint, and the
+    // write must not wait for it — the hives still find the file on their own checks.
+    match send_system_request(
+        client,
+        &format!("SY.orchestrator@{PRIMARY_HIVE_ID}"),
+        "SYSTEM_SYNC_HINT",
+        "SYSTEM_SYNC_HINT_RESPONSE",
+        request,
+        Duration::from_secs(OPA_POLICY_SCAN_WAIT_SECS),
+    )
+    .await
+    {
+        Ok(payload) if payload.get("status").and_then(|v| v.as_str()) == Some("ok") => {
+            tracing::info!("opa: published policy scanned on the motherbee")
+        }
+        Ok(payload) => tracing::warn!(
+            payload = %payload,
+            "opa: scan of the published policy did not complete; the hives get it on the next scan"
+        ),
+        Err(err) => tracing::warn!(
+            error = %err,
+            "opa: no answer to the scan of the published policy; the hives get it on the next scan"
+        ),
+    }
+}
+
+fn build_opa_rollout_response(
+    action: OpaAction,
+    version: u64,
+    hash: &str,
+    responses: Vec<OpaResponseEntry>,
+    synced: Vec<OpaResponseEntry>,
+    expected: &[String],
+    reachable: &[String],
+) -> (u16, String) {
+    let running: Vec<String> = synced
+        .iter()
+        .filter(|entry| entry.status.eq_ignore_ascii_case("ok"))
+        .map(|entry| entry.hive.clone())
+        .collect();
+    let pending: Vec<String> = expected
+        .iter()
+        .filter(|hive| !running.contains(hive))
+        .cloned()
+        .collect();
+    // Pending hives the motherbee cannot reach now: they keep their last policy until they
+    // reconnect and Syncthing catches up.
+    let unreachable: Vec<String> = pending
+        .iter()
+        .filter(|hive| !reachable.contains(hive))
+        .cloned()
+        .collect();
+    let body = serde_json::json!({
+        "status": "ok",
+        "version": version,
+        "action": action.write_name(),
+        "hash": hash,
+        "responses": responses,
+        "hives": synced,
+        "running_hives": running,
+        "pending": pending,
+        "unreachable": unreachable,
+        "converged": pending.is_empty(),
+    })
+    .to_string();
+    (200, body)
 }
 
 async fn handle_opa_query(
@@ -7504,17 +8966,31 @@ async fn handle_opa_query(
     Ok(build_opa_query_response(ctx, action, responses, target))
 }
 
+/// The config SY.wf-rules gets for an operation: the request, the operation, and who asked for it
+/// (`launched_by`, stamped by the admin, never taken from the request), which SY.wf-rules carries
+/// into the run_node of a first deploy.
+fn wf_rules_operation_config(
+    mut payload: serde_json::Map<String, serde_json::Value>,
+    operation: &str,
+    launched_by: &str,
+) -> serde_json::Value {
+    payload.insert("operation".to_string(), serde_json::json!(operation));
+    payload.insert("launched_by".to_string(), serde_json::json!(launched_by));
+    serde_json::Value::Object(payload)
+}
+
+/// `launched_by`: who asked (`operator` on the HTTP API; launched_by_for_caller over the mesh).
 async fn handle_wf_rules_http(
     ctx: &AdminContext,
     client: &RouterDispatcher,
     req: WfRulesRequest,
     action: WfRulesAction,
+    launched_by: &str,
 ) -> Result<(u16, String), AdminError> {
     let target_hive = normalize_wf_rules_target(req.hive.clone(), &ctx.hive_id);
     let target_node = format!("SY.wf-rules@{}", target_hive);
     let response = if let Some(operation) = action.operation() {
-        let mut payload = req.payload;
-        payload.insert("operation".to_string(), serde_json::json!(operation));
+        let config = wf_rules_operation_config(req.payload, operation, launched_by);
         send_system_request_with_meta(
             client,
             &target_node,
@@ -7525,7 +9001,7 @@ async fn handle_wf_rules_http(
                 "schema_version": 1,
                 "config_version": 0,
                 "apply_mode": "replace",
-                "config": serde_json::Value::Object(payload),
+                "config": config,
             }),
             16,
             None,
@@ -7533,7 +9009,7 @@ async fn handle_wf_rules_http(
             Some(target_node.clone()),
             Some("CONFIG_SET".to_string()),
             None,
-            admin_action_timeout(action.action_name()),
+            wf_rules_request_timeout(),
         )
         .await
     } else if let Some(command) = action.command() {
@@ -7543,13 +9019,21 @@ async fn handle_wf_rules_http(
             "command",
             command,
             serde_json::Value::Object(req.payload),
-            admin_action_timeout(action.action_name()),
+            wf_rules_request_timeout(),
         )
         .await
     } else {
         Err("unsupported wf-rules action".into())
     };
     Ok(build_admin_http_response(action.action_name(), response))
+}
+
+/// How long the admin waits for SY.wf-rules: longer than the deadline SY.wf-rules gives a request
+/// end to end (60 s: publish, purge, waiting for the package to reach a worker, the node's rebind
+/// and restart or launch), so the answer is never lost to a timeout while the deploy goes on; Archi
+/// waits longer still (90 s). A-68.
+fn wf_rules_request_timeout() -> Duration {
+    Duration::from_secs(env_timeout_secs("JSR_ADMIN_WF_RULES_TIMEOUT_SECS").unwrap_or(75))
 }
 
 async fn handle_wf_rules_query(
@@ -7570,7 +9054,7 @@ async fn handle_wf_rules_query(
         "query",
         action,
         serde_json::Value::Object(req.payload),
-        admin_action_timeout(action),
+        wf_rules_request_timeout(),
     )
     .await;
     Ok(build_admin_http_response(action, response))
@@ -7712,6 +9196,96 @@ async fn handle_timer_rpc(
     Ok(build_admin_http_response(action, response))
 }
 
+/// `GET /hives/{hive}/streams` (A-70, docs/router-stream-v1.md §2.10): asks every router stream of
+/// the hive, the `RT.<router>.stream@<hive>` nodes the LSA lists for it, for its status. A stream
+/// that does not answer is listed with its error.
+async fn handle_list_streams(
+    ctx: &AdminContext,
+    client: &RouterDispatcher,
+    hive_id: String,
+) -> Result<(u16, String), AdminError> {
+    let action = "list_streams";
+    let Some(streams) = stream_nodes_from_lsa(ctx, &hive_id) else {
+        return Ok((
+            404,
+            serde_json::json!({
+                "status": "error",
+                "action": action,
+                "payload": serde_json::Value::Null,
+                "error_code": "HIVE_NOT_FOUND",
+                "error_detail": format!("hive '{hive_id}' is not in this router's LSA"),
+            })
+            .to_string(),
+        ));
+    };
+    let timeout_window = admin_action_timeout(action);
+    let answers = futures::future::join_all(streams.iter().map(|node| {
+        send_system_request(
+            client,
+            node,
+            MSG_STREAM_STATUS,
+            MSG_STREAM_STATUS_RESPONSE,
+            serde_json::json!({}),
+            timeout_window,
+        )
+    }))
+    .await;
+    let items: Vec<serde_json::Value> = streams
+        .iter()
+        .zip(answers)
+        .map(|(node, answer)| match answer {
+            Ok(status) => serde_json::json!({ "node": node, "status": status }),
+            Err(err) => serde_json::json!({
+                "node": node,
+                "status": serde_json::Value::Null,
+                "error": err.to_string(),
+            }),
+        })
+        .collect();
+    Ok((
+        200,
+        serde_json::json!({
+            "status": "ok",
+            "action": action,
+            "payload": { "hive": hive_id, "streams": items },
+            "error_code": serde_json::Value::Null,
+            "error_detail": serde_json::Value::Null,
+        })
+        .to_string(),
+    ))
+}
+
+/// The router streams the LSA lists for `hive_id`, by L2 name; None when the hive is not in it.
+fn stream_nodes_from_lsa(ctx: &AdminContext, hive_id: &str) -> Option<Vec<String>> {
+    let shm_name = format!("/jsr-lsa-{}", ctx.hive_id);
+    let snapshot = LsaRegionReader::open_read_only(&shm_name)
+        .ok()?
+        .read_snapshot()?;
+    let hive_index = snapshot
+        .hives
+        .iter()
+        .position(|entry| remote_hive_name(entry).as_deref() == Some(hive_id))?;
+    let mut streams: Vec<String> = snapshot
+        .nodes
+        .iter()
+        .filter(|node| node.hive_index as usize == hive_index)
+        .filter(|node| node.name_len > 0 && node.flags & FLAG_DELETED == 0)
+        .map(|node| {
+            let len = (node.name_len as usize).min(node.name.len());
+            let name = String::from_utf8_lossy(&node.name[..len]).into_owned();
+            if name.contains('@') {
+                name
+            } else {
+                format!("{name}@{hive_id}")
+            }
+        })
+        .filter(|name| is_stream_node_name(name))
+        .collect();
+    streams.sort();
+    streams.dedup();
+    Some(streams)
+}
+
 async fn handle_admin_query(
     ctx: &AdminContext,
     client: &RouterDispatcher,
@@ -7725,7 +9299,7 @@ async fn handle_admin_query(
         return Ok(build_cloud_actions_catalog_response());
     }
     if matches!(action, "list_ilks" | "list_tenants") {
-        return handle_identity_query(ctx, client, action, hive).await;
+        return handle_identity_query(ctx, client, action, serde_json::json!({}), hive).await;
     }
     let payload = normalize_admin_payload(action, serde_json::json!({}), hive.as_deref());
     let request = build_admin_request(ctx, action, payload, hive);
@@ -7748,6 +9322,11 @@ async fn handle_admin_query_with_payload(
 ) -> Result<(u16, String), AdminError> {
     if action == "list_cloud_actions" {
         return Ok(build_cloud_actions_catalog_response());
+    }
+    // The identity listings take their filters (include_deleted, pending_signup) straight to
+    // SY.identity, as the HTTP route does.
+    if matches!(action, "list_ilks" | "list_tenants") {
+        return handle_identity_query(ctx, client, action, payload, hive).await;
     }
     let payload = normalize_admin_payload(action, payload, hive.as_deref());
     let request = build_admin_request(ctx, action, payload, hive);
@@ -8157,6 +9736,8 @@ fn build_admin_action_doc(spec: &InternalActionSpec) -> serde_json::Value {
         InternalActionRoute::WfRulesHttp(_) => ("wf_rules_http", None),
         InternalActionRoute::WfRulesQuery(canonical) => ("wf_rules_query", Some(canonical)),
         InternalActionRoute::TimerRpc(canonical) => ("timer_rpc", Some(canonical)),
+        InternalActionRoute::StreamStatus => ("stream_status", None),
+        InternalActionRoute::LlmUsage => ("llm_usage", None),
     };
     serde_json::json!({
         "name": spec.action,
@@ -8201,6 +9782,8 @@ fn admin_action_executor_contract(spec: &InternalActionSpec) -> serde_json::Valu
             | "vault_delete"
             | "vault_rotate"
             | "vault_rollback"
+            | "vault_assign"
+            | "core_rollback"
     ) {
         vec![
             "Executor plans must put path params and JSON body fields directly under step.args.",
@@ -8280,12 +9863,15 @@ fn admin_action_is_read_only(action: &str) -> bool {
             | "vault_delete"
             | "vault_rotate"
             | "vault_rollback"
+            | "vault_assign"
+            | "core_rollback"
             | "update"
             | "sync_hint"
             | "opa_compile_apply"
             | "opa_compile"
             | "opa_apply"
             | "opa_rollback"
+            | "opa_clear"
             | "wf_rules_compile_apply"
             | "wf_rules_compile"
             | "wf_rules_apply"
@@ -8307,6 +9893,12 @@ fn admin_action_requires_confirmation(action: &str) -> bool {
             | "remove_runtime_version"
             | "set_ilk_definition"
             | "delete_ilk"
+            | "restore_ilk"
+            | "set_ilk_tenant"
+            | "purge_ilk"
+            | "delete_tenant"
+            | "restore_tenant"
+            | "purge_tenant"
             | "set_node_config"
             | "node_control_config_set"
             | "set_storage"
@@ -8318,12 +9910,15 @@ fn admin_action_requires_confirmation(action: &str) -> bool {
             | "vault_delete"
             | "vault_rotate"
             | "vault_rollback"
+            | "vault_assign"
+            | "core_rollback"
             | "update"
             | "sync_hint"
             | "opa_compile_apply"
             | "opa_compile"
             | "opa_apply"
             | "opa_rollback"
+            | "opa_clear"
     )
 }
 
@@ -8335,6 +9930,7 @@ fn admin_action_summary(action: &str) -> &'static str {
         }
         "get_admin_action_help" => "Return help metadata for one admin action.",
         "publish_runtime_package" => "Publish one runtime package into dist/manifest on motherbee.",
+        "publish_cloud_endpoint" => "Open IO.cloud's public Fluxbee Cloud endpoint on an edge and return its bearer token ONCE (admin mints it, the vault stores it, the edge only ever gets a reference). The token cannot be read back afterwards: if it is lost, publish again to rotate.",
         "publish_artifact" => {
             "Publish an existing BlobRef through SY.edge. Mesh-only: the router-stamped AI.*, IO.* or WF.* caller becomes the publication owner."
         }
@@ -8347,6 +9943,15 @@ fn admin_action_summary(action: &str) -> &'static str {
         "list_nodes" => {
             "List nodes for one hive only. Use inventory for system-wide node visibility."
         }
+        "list_streams" => {
+            "Read the status of every router stream of one hive: backlog, deliveries and drops."
+        }
+        "get_llm_usage" => {
+            "Read the LLM usage records, one per model call, of one tenant or of every tenant: a period grouped by day, model, node or tenant or record by record, or the records stored since a cursor."
+        }
+        "list_tenant_nodes" => {
+            "List the managed nodes charged to one tenant on every hive, with their runtime, state and who launched them."
+        }
         "get_node_status" => "Read the effective runtime status of one node.",
         "get_node_state" => "Read the persisted state payload of one node.",
         "get_node_config" => "Read the stored effective config.json payload for a managed node.",
@@ -8356,13 +9961,25 @@ fn admin_action_summary(action: &str) -> &'static str {
         "node_control_config_set" => {
             "Send CONFIG_SET to a node that participates in live control-plane config and return its CONFIG_RESPONSE."
         }
-        "list_ilks" => "List identity ilks in a hive.",
+        "list_ilks" => "List identity ilks in a hive. ?include_deleted=true adds the marked ones; ?pending_signup=true lists only the Fluxbee Cloud signups nobody finished (pending_signup), wherever they are charged.",
         "get_ilk" => "Read one identity ilk.",
         "set_ilk_definition" => {
             "Set the cognitive definition hashes for one identity agent ILK."
         }
         "delete_ilk" => {
-            "Delete one identity ILK and its ICH mappings. Refuses well-known SY system ILKs (SYSTEM_ILK_PROTECTED)."
+            "Mark one identity ILK deleted (reversible: hidden, its keys stay reserved until purge). Refuses well-known SY system ILKs (SYSTEM_ILK_PROTECTED)."
+        }
+        "restore_ilk" => "Undo the deleted mark of one identity ILK (a person also while their tenant is marked; any other ILK waits for its tenant).",
+        "set_ilk_tenant" => "Charge one person to another tenant, its cost center (a temporary only out of a deleted tenant); channels keep their scope.",
+        "purge_ilk" => {
+            "Physically and finally remove one identity ILK that is ALREADY marked deleted (ILK_NOT_DELETED otherwise)."
+        }
+        "delete_tenant" => {
+            "Mark one identity tenant deleted, i.e. disable it (reversible; name/domain stay reserved). No ILK is marked: its people stay usable."
+        }
+        "restore_tenant" => "Undo the deleted mark of one tenant: it comes back as it was.",
+        "purge_tenant" => {
+            "Physically and finally remove one tenant ALREADY marked deleted and the ILKs marked in it. Refused while people are charged to it, or it has vault secrets, node identities or sponsored tenants."
         }
         "list_tenants" => "List identity tenants in a hive.",
         "get_tenant" => "Read one identity tenant in a hive.",
@@ -8376,8 +9993,12 @@ fn admin_action_summary(action: &str) -> &'static str {
         "vault_get_metadata" => "Read one SY.vault secret metadata record without returning the secret value.",
         "vault_get" => "Read one SY.vault secret value. Secret-sensitive; prefer metadata inspection when possible.",
         "vault_delete" => "Delete one encrypted secret from SY.vault.",
+        "vault_assign" => "Replace the nodes one secret is assigned to (who uses it besides its owner), without touching its value.",
         "vault_rotate" => "Rotate one encrypted secret value while keeping the previous version for rollback.",
         "vault_rollback" => "Rollback one encrypted secret to its previous version.",
+        "core_rollback" => {
+            "Restore this hive's core binaries from a stamped backup generation (undo a core update)."
+        }
         "inventory" => "Read global or per-hive inventory, including system-wide node visibility.",
         "list_versions" => "List core and runtime versions across hives.",
         "get_versions" => "Read core and runtime versions for one hive.",
@@ -8393,7 +10014,7 @@ fn admin_action_summary(action: &str) -> &'static str {
         "get_deployments" => "List historical deployments targeting one hive.",
         "list_drift_alerts" => "List historical drift alerts globally.",
         "get_drift_alerts" => "List historical drift alerts for one hive.",
-        "opa_get_policy" => "Read current OPA policy text for a hive.",
+        "opa_get_policy" => "Read the user OPA policy a hive runs: version and hash, and the rego on the motherbee only (the other hives receive just the wasm).",
         "opa_get_status" => "Read OPA status for a hive.",
         "wf_rules_get_workflow" => "Read the current workflow definition managed by SY.wf-rules for a hive.",
         "wf_rules_get_status" => "Read workflow status from SY.wf-rules for a hive.",
@@ -8422,14 +10043,20 @@ fn admin_action_summary(action: &str) -> &'static str {
         "add_vpn" => "Add a VPN pattern to a hive.",
         "delete_vpn" => "Delete a VPN pattern from a hive.",
         "list_taps" => "List router-level taps installed on a hive. Read-only.",
+        "list_recent_commands" => {
+            "Audit log: list the most recent admin commands executed on this backend (all origins — \
+             operator HTTP, internal L2 callers like SY.architect, and executor-plan steps), with \
+             redacted params, result status and duration. Read-only."
+        }
         "add_tap" => "Add a router-level tap on a hive. When a unicast message matches (match_src, match_dst), the router enqueues a fire-and-forget secondary copy to `target` with `meta.via_tap=true`. mode defaults to `best_effort` when omitted. enabled defaults to true. Exact L2 name match.",
         "delete_tap" => "Delete an installed router-level tap by its (match_src, match_dst, target) natural key.",
         "update" => "Run hive update workflow.",
         "sync_hint" => "Trigger a sync hint workflow.",
-        "opa_compile_apply" => "Compile and apply OPA policy.",
+        "opa_compile_apply" => "Compile the user OPA policy on the motherbee and apply it on every hive (one global policy).",
         "opa_compile" => "Compile OPA policy.",
-        "opa_apply" => "Apply OPA policy.",
-        "opa_rollback" => "Rollback OPA policy.",
+        "opa_apply" => "Apply the staged user OPA policy on every hive.",
+        "opa_rollback" => "Roll every hive back to the previous user OPA policy.",
+        "opa_clear" => "Remove the user OPA policy on every hive (current, staged, backup): back to a fresh install; routers unload it.",
         "wf_rules_compile_apply" => "Compile and apply a workflow definition through SY.wf-rules.",
         "wf_rules_compile" => "Compile a workflow definition without applying it.",
         "wf_rules_apply" => "Apply the staged workflow definition.",
@@ -8439,15 +10066,125 @@ fn admin_action_summary(action: &str) -> &'static str {
     }
 }
 
+/// Routes that exist on the HTTP surface but have no entry in
+/// `INTERNAL_ACTION_REGISTRY`, so deriving the route table from the action catalog
+/// alone cannot see them.
+///
+/// Keeping them here is deliberate: adding the three channel actions to the registry
+/// would change dispatch and authz, which is a separate decision. This table is used
+/// ONLY for 404-vs-405 diagnostics.
+const ADMIN_ROUTES_OUTSIDE_ACTION_REGISTRY: &[&str] = &[
+    "POST /channels/externalize",
+    "POST /channels/unexternalize",
+    "GET /channels/externalized",
+];
+
+/// Does a concrete request path match a `{placeholder}`-style route pattern?
+fn admin_route_pattern_matches(pattern_path: &str, request_path: &str) -> bool {
+    let pattern: Vec<&str> = pattern_path.trim_matches('/').split('/').collect();
+    let actual: Vec<&str> = request_path.trim_matches('/').split('/').collect();
+    if pattern.len() != actual.len() {
+        return false;
+    }
+    pattern.iter().zip(actual.iter()).all(|(p, a)| {
+        if p.starts_with('{') && p.ends_with('}') {
+            !a.is_empty()
+        } else {
+            p == a
+        }
+    })
+}
+
+/// Methods some route accepts on `request_path`. Non-empty means the caller reached a
+/// real endpoint with the wrong verb — a 405, not a 404.
+///
+/// Advisory only: never consulted for dispatch or authz. If this drifts from the real
+/// match arms the worst case is that a 405 degrades back to a plain 404, which is
+/// exactly the behaviour that preceded it.
+fn admin_methods_allowed_for_path(request_path: &str) -> Vec<&'static str> {
+    fn consider(methods: &mut Vec<&'static str>, entry: &'static str, request_path: &str) {
+        let Some((method, pattern_path)) = entry.split_once(' ') else {
+            return;
+        };
+        if admin_route_pattern_matches(pattern_path, request_path) && !methods.contains(&method) {
+            methods.push(method);
+        }
+    }
+
+    let mut methods = Vec::new();
+    for spec in INTERNAL_ACTION_REGISTRY {
+        for entry in admin_action_path_patterns(spec.action) {
+            consider(&mut methods, entry, request_path);
+        }
+    }
+    for entry in ADMIN_ROUTES_OUTSIDE_ACTION_REGISTRY {
+        consider(&mut methods, entry, request_path);
+    }
+    methods.sort_unstable();
+    methods
+}
+
+/// Body for a request that matched no route.
+///
+/// Two defects fixed here. First the envelope: every other admin response is
+/// `{status, action, payload, error_code, error_detail}`, and this was the one shape on
+/// the surface emitting a bare `{"error": ...}` — a client reading `error_code` got
+/// `null`. Second, and worse, the same arm swallowed a wrong METHOD on a route that
+/// does exist (`PUT /hives`), answering "not found" about something that is very much
+/// there.
+///
+/// The hint is a pointer, not a dump: the listener defaults to loopback but is
+/// overrideable and reverse-proxied in some deployments, and `GET /admin/actions` has
+/// its own exposure decision already.
+fn admin_unknown_route_response(method: &str, path: &str) -> (u16, String) {
+    // Echoed back to the caller, so bound the length and drop control characters.
+    let safe_path: String = path.chars().filter(|c| !c.is_control()).take(256).collect();
+    let allowed = admin_methods_allowed_for_path(path);
+    let (status, error_code, error_detail) = if allowed.is_empty() {
+        (
+            404,
+            "UNKNOWN_ROUTE",
+            format!("no admin route matches {method} {safe_path}"),
+        )
+    } else {
+        (
+            405,
+            "METHOD_NOT_ALLOWED",
+            format!(
+                "{safe_path} exists but does not accept {method}; allowed: {}",
+                allowed.join(", ")
+            ),
+        )
+    };
+
+    (
+        status,
+        serde_json::json!({
+            "status": "error",
+            "action": serde_json::Value::Null,
+            "payload": serde_json::Value::Null,
+            "error_code": error_code,
+            "error_detail": error_detail,
+            "allowed_methods": allowed,
+            "see": "GET /admin/actions",
+        })
+        .to_string(),
+    )
+}
+
 fn admin_action_path_patterns(action: &str) -> Vec<&'static str> {
     match action {
         "list_admin_actions" => vec!["GET /admin/actions"],
         "get_admin_action_help" => vec!["GET /admin/actions/{action}"],
         "publish_runtime_package" => vec!["POST /admin/runtime-packages/publish"],
+        "publish_cloud_endpoint" => vec!["POST /hives/{hive}/cloud/endpoint"],
         "hive_status" => vec!["GET /hive/status"],
         "list_hives" => vec!["GET /hives"],
         "get_hive" => vec!["GET /hives/{hive}"],
         "list_nodes" => vec!["GET /hives/{hive}/nodes"],
+        "list_streams" => vec!["GET /hives/{hive}/streams"],
+        "get_llm_usage" => vec!["GET /hives/{hive}/usage"],
+        "list_tenant_nodes" => vec!["GET /hives/{hive}/identity/tenants/{tenant_id}/nodes"],
         "get_node_status" => vec!["GET /hives/{hive}/nodes/{node_name}/status"],
         "get_node_state" => vec!["GET /hives/{hive}/nodes/{node_name}/state"],
         "get_node_config" => vec!["GET /hives/{hive}/nodes/{node_name}/config"],
@@ -8463,6 +10200,12 @@ fn admin_action_path_patterns(action: &str) -> Vec<&'static str> {
             vec!["POST /hives/{hive}/identity/ilks/{ilk_id}/definition"]
         }
         "delete_ilk" => vec!["DELETE /hives/{hive}/identity/ilks/{ilk_id}"],
+        "restore_ilk" => vec!["POST /hives/{hive}/identity/ilks/{ilk_id}/restore"],
+        "set_ilk_tenant" => vec!["PUT /hives/{hive}/identity/ilks/{ilk_id}/tenant"],
+        "purge_ilk" => vec!["POST /hives/{hive}/identity/ilks/{ilk_id}/purge"],
+        "delete_tenant" => vec!["DELETE /hives/{hive}/identity/tenants/{tenant_id}"],
+        "restore_tenant" => vec!["POST /hives/{hive}/identity/tenants/{tenant_id}/restore"],
+        "purge_tenant" => vec!["POST /hives/{hive}/identity/tenants/{tenant_id}/purge"],
         "list_tenants" => vec!["GET /hives/{hive}/identity/tenants"],
         "get_tenant" => vec!["GET /hives/{hive}/identity/tenants/{tenant_id}"],
         "create_tenant" => vec!["POST /hives/{hive}/identity/tenants"],
@@ -8475,8 +10218,10 @@ fn admin_action_path_patterns(action: &str) -> Vec<&'static str> {
         "vault_get_metadata" => vec!["GET /hives/{hive}/vault/secrets/{key}/metadata"],
         "vault_get" => vec!["GET /hives/{hive}/vault/secrets/{key}"],
         "vault_delete" => vec!["DELETE /hives/{hive}/vault/secrets/{key}"],
+        "vault_assign" => vec!["PUT /hives/{hive}/vault/secrets/{key}/assigned"],
         "vault_rotate" => vec!["POST /hives/{hive}/vault/secrets/{key}/rotate"],
         "vault_rollback" => vec!["POST /hives/{hive}/vault/secrets/{key}/rollback"],
+        "core_rollback" => vec!["POST /hives/{hive}/core/rollback"],
         "inventory" => vec![
             "GET /inventory",
             "GET /inventory/summary",
@@ -8511,7 +10256,7 @@ fn admin_action_path_patterns(action: &str) -> Vec<&'static str> {
         "timer_convert" => vec!["POST /hives/{hive}/timer/convert"],
         "timer_parse" => vec!["POST /hives/{hive}/timer/parse"],
         "timer_format" => vec!["POST /hives/{hive}/timer/format"],
-        "opa_check" => vec!["POST /hives/{hive}/opa/policy/check"],
+        "opa_check" => vec!["POST /opa/policy/check"],
         "run_node" => vec!["POST /hives/{hive}/nodes"],
         "start_node" => vec!["POST /hives/{hive}/nodes/{node_name}/start"],
         "restart_node" => vec!["POST /hives/{hive}/nodes/{node_name}/restart"],
@@ -8526,15 +10271,17 @@ fn admin_action_path_patterns(action: &str) -> Vec<&'static str> {
         "delete_route" => vec!["DELETE /hives/{hive}/routes/{prefix}"],
         "add_vpn" => vec!["POST /hives/{hive}/vpns"],
         "list_taps" => vec!["GET /hives/{hive}/taps"],
+        "list_recent_commands" => vec!["GET /hives/{hive}/commands"],
         "add_tap" => vec!["POST /hives/{hive}/taps"],
         "delete_tap" => vec!["DELETE /hives/{hive}/taps?match_src=...&match_dst=...&target=..."],
         "delete_vpn" => vec!["DELETE /hives/{hive}/vpns/{pattern}"],
         "update" => vec!["POST /hives/{hive}/update"],
         "sync_hint" => vec!["POST /hives/{hive}/sync-hint"],
-        "opa_compile_apply" => vec!["POST /hives/{hive}/opa/policy"],
-        "opa_compile" => vec!["POST /hives/{hive}/opa/policy/compile"],
-        "opa_apply" => vec!["POST /hives/{hive}/opa/policy/apply"],
-        "opa_rollback" => vec!["POST /hives/{hive}/opa/policy/rollback"],
+        "opa_compile_apply" => vec!["POST /opa/policy"],
+        "opa_compile" => vec!["POST /opa/policy/compile"],
+        "opa_apply" => vec!["POST /opa/policy/apply"],
+        "opa_rollback" => vec!["POST /opa/policy/rollback"],
+        "opa_clear" => vec!["POST /opa/policy/clear"],
         "wf_rules_compile_apply" => vec!["POST /hives/{hive}/wf-rules"],
         "wf_rules_compile" => vec!["POST /hives/{hive}/wf-rules/compile"],
         "wf_rules_apply" => vec!["POST /hives/{hive}/wf-rules/apply"],
@@ -8619,13 +10366,17 @@ fn admin_action_path_params(action: &str) -> Vec<serde_json::Value> {
             "string",
             "Hive id, for example worker-220.",
         )],
-        "list_nodes" | "list_ilks" | "list_tenants" | "get_versions" | "list_runtimes" | "list_routes"
+        "get_llm_usage" => vec![admin_action_path_param(
+            "hive",
+            "string",
+            "The motherbee, where the usage records live.",
+        )],
+        "list_nodes" | "list_streams" | "list_ilks" | "list_tenants" | "get_versions" | "list_runtimes" | "list_routes"
         | "list_vpns" | "list_taps" | "get_deployments" | "get_drift_alerts" | "opa_get_policy"
         | "opa_get_status" | "wf_rules_get_workflow" | "wf_rules_get_status"
         | "wf_rules_list_workflows" | "timer_help" | "timer_list" | "timer_now"
         | "timer_now_in" | "timer_convert" | "timer_parse" | "timer_format" | "update"
-        | "sync_hint" | "opa_compile_apply" | "opa_compile" | "opa_apply"
-        | "opa_rollback" | "opa_check" | "wf_rules_compile_apply" | "wf_rules_compile"
+        | "sync_hint" | "wf_rules_compile_apply" | "wf_rules_compile"
         | "wf_rules_apply" | "wf_rules_rollback" | "wf_rules_delete" => vec![
             admin_action_path_param(
             "hive",
@@ -8666,14 +10417,15 @@ fn admin_action_path_params(action: &str) -> Vec<serde_json::Value> {
         ],
         "get_runtime" => vec![
             admin_action_path_param("hive", "string", "Target hive id in the URL path."),
-            admin_action_path_param("runtime", "string", "Runtime name, for example ai.chat."),
+            admin_action_path_param("runtime", "string", "Runtime name, for example ai.generic."),
         ],
         "remove_runtime_version" => vec![
             admin_action_path_param("hive", "string", "Target hive id in the URL path."),
-            admin_action_path_param("runtime", "string", "Runtime name, for example ai.chat."),
+            admin_action_path_param("runtime", "string", "Runtime name, for example ai.generic."),
             admin_action_path_param("version", "string", "Runtime version to delete."),
         ],
-        "get_ilk" | "set_ilk_definition" | "delete_ilk" => vec![
+        "get_ilk" | "set_ilk_definition" | "delete_ilk" | "restore_ilk" | "set_ilk_tenant"
+        | "purge_ilk" => vec![
             admin_action_path_param("hive", "string", "Target hive id in the URL path."),
             admin_action_path_param(
                 "ilk_id",
@@ -8690,7 +10442,8 @@ fn admin_action_path_params(action: &str) -> Vec<serde_json::Value> {
         | "vault_get_metadata"
         | "vault_delete"
         | "vault_rotate"
-        | "vault_rollback" => vec![
+        | "vault_rollback"
+        | "vault_assign" => vec![
             admin_action_path_param("hive", "string", "Target hive id in the URL path."),
             admin_action_path_param(
                 "key",
@@ -8825,6 +10578,18 @@ fn admin_action_body_required_fields(action: &str) -> Vec<serde_json::Value> {
                 "Admin SSH login on the empty target box for the initial bootstrap. Required (no default). The orchestrator uses it key-first, falling back to the password channel (ssh_password) only on a fresh box; it is never stored.",
             ),
         ],
+        "publish_cloud_endpoint" => vec![
+            admin_action_body_field(
+                "edge_node",
+                "string",
+                "Required. The SY.edge L2 name to publish on (e.g. SY.edge@ingress1).",
+            ),
+            admin_action_body_field(
+                "cloud_node",
+                "string",
+                "Optional. The IO.cloud instance to publish; defaults to IO.cloud@<hive>.",
+            ),
+        ],
         "publish_runtime_package" => vec![admin_action_body_field(
             "source",
             "object",
@@ -8836,7 +10601,7 @@ fn admin_action_body_required_fields(action: &str) -> Vec<serde_json::Value> {
             "Fully-qualified node name to start.",
         )],
         "add_route" => vec![
-            admin_action_body_field("prefix", "string", "Route prefix matched against message destinations, for example AI.chat or tenant.acme."),
+            admin_action_body_field("prefix", "string", "Route prefix matched against message destinations, for example AI.sales or tenant.acme."),
             admin_action_body_field(
                 "action",
                 "string",
@@ -8985,6 +10750,11 @@ fn admin_action_body_required_fields(action: &str) -> Vec<serde_json::Value> {
                 "New secret JSON value. This field is secret-sensitive and redacted in previews/logs. Same shape rules as vault_put for the chosen resource_type (openai → api_key; postgres → postgres_url credentials+host only, no dbname; slack → app_token+bot_token).",
             ),
         ],
+        "set_ilk_tenant" => vec![admin_action_body_field(
+            "tenant_id",
+            "string",
+            "The tenant to charge the person to: an active tenant, never the root one, canonical tnt:<uuid>.",
+        )],
         "set_ilk_definition" => vec![admin_action_body_field(
             "definition",
             "object",
@@ -8996,6 +10766,28 @@ fn admin_action_body_required_fields(action: &str) -> Vec<serde_json::Value> {
 
 fn admin_action_body_optional_fields(action: &str) -> Vec<serde_json::Value> {
     match action {
+        "vault_delete" | "vault_rotate" | "vault_rollback" => vec![admin_action_body_field(
+                "tenant_id",
+                "string",
+                "Tenant the key belongs to, canonical tnt:<uuid> (metadata.tenant_id in vault_list). Defaults to the hive's root tenant (infrastructure keys). A key of another tenant answers KEY_NOT_FOUND.",
+            )],
+        "vault_assign" => vec![
+            admin_action_body_field(
+                "tenant_id",
+                "string",
+                "Tenant the key belongs to, canonical tnt:<uuid>. Defaults to the hive's root tenant. A key of another tenant answers KEY_NOT_FOUND.",
+            ),
+            admin_action_body_field(
+                "assigned_nodes",
+                "array<string>",
+                "Node names (IO.slack.sales@motherbee) the secret is assigned to; each must be charged to the key's tenant.",
+            ),
+            admin_action_body_field(
+                "assigned_ilks",
+                "array<string>",
+                "ILK ids of nodes the secret is assigned to; each must be charged to the key's tenant. Both lists together replace the assignment; none leaves the secret unassigned (its tenant's general secret if it has no owner).",
+            ),
+        ],
         "publish_artifact" => vec![
             admin_action_body_field(
                 "presentation",
@@ -9035,11 +10827,6 @@ fn admin_action_body_optional_fields(action: &str) -> Vec<serde_json::Value> {
                 "ssh_key",
                 "string",
                 "Optional bootstrap SSH PRIVATE key (PEM). Key-first channel for a fresh box: on a stock cloud image (authorized key injected by cloud-init, server PasswordAuthentication OFF) this seeds the mesh bootstrap key without needing server-side password auth. Assumes ssh_user has passwordless sudo (cloud-init default) or that ssh_password is also supplied for sudo escalation. Never logged, never stored.",
-            ),
-            admin_action_body_field(
-                "ssh_access",
-                "string",
-                "Post-join SSH posture. Default \"revoke\" (SSH is bootstrap-only: the motherbee key + sudoers grant are stripped after join). \"key_only_persist\" instead leaves SSH open key-only (password off) via a per-spoke recovery key stored in SY.vault under ssh:<hive_id>.",
             ),
             admin_action_body_field(
                 "role",
@@ -9219,11 +11006,6 @@ fn admin_action_body_optional_fields(action: &str) -> Vec<serde_json::Value> {
                 "bool",
                 "Replace full config instead of patch/merge.",
             ),
-            admin_action_body_field(
-                "notify",
-                "bool",
-                "Notify runtime after persisting the config.",
-            ),
         ],
         "node_control_config_get" | "node_control_config_set" => vec![
             admin_action_body_field(
@@ -9257,6 +11039,54 @@ fn admin_action_body_optional_fields(action: &str) -> Vec<serde_json::Value> {
                 "Optional metadata context forwarded with the message.",
             ),
             admin_action_body_field("ttl", "u16", "Optional TTL, default 16."),
+        ],
+        "get_llm_usage" => vec![
+            admin_action_body_field(
+                "tenant_id",
+                "string",
+                "The tenant whose records to read, canonical tnt:<uuid>. Over HTTP, leaving it out reads every tenant.",
+            ),
+            admin_action_body_field(
+                "all_tenants",
+                "bool",
+                "Every tenant's records at once, instead of a tenant_id. The operator and Archi only.",
+            ),
+            admin_action_body_field(
+                "from",
+                "string",
+                &format!("Start of the period, by the time of the call (ts), RFC 3339. With to; at most {USAGE_QUERY_MAX_DAYS} days."),
+            ),
+            admin_action_body_field(
+                "to",
+                "string",
+                "End of the period, RFC 3339, after from.",
+            ),
+            admin_action_body_field(
+                "group_by",
+                "enum(day|model|node|tenant)",
+                "Group the period's records: calls and the five token sums per group. Without it, the records themselves.",
+            ),
+            admin_action_body_field(
+                "since",
+                "string",
+                "Instead of a period: the records stored after a cursor, an RFC 3339 instant to start and then the next of each answer. Records only.",
+            ),
+            admin_action_body_field(
+                "after",
+                "string",
+                "The next page of the same question: the next of the previous answer.",
+            ),
+            admin_action_body_field(
+                "limit",
+                "u32",
+                &format!("Rows per page, 1 to {USAGE_QUERY_MAX_LIMIT}; a page also stays under 64 KB."),
+            ),
+        ],
+        "list_recent_commands" => vec![
+            admin_action_body_field("limit", "u32", "Max entries returned (default 50, max 500)."),
+            admin_action_body_field("action", "string", "Filter: exact admin action name."),
+            admin_action_body_field("status", "string", "Filter: 'ok' or 'error'."),
+            admin_action_body_field("since_ms", "u64", "Filter: only entries at/after this epoch-ms."),
         ],
         "send_node_message" => vec![
             admin_action_body_field("msg", "string", "Optional message name."),
@@ -9326,11 +11156,6 @@ fn admin_action_body_optional_fields(action: &str) -> Vec<serde_json::Value> {
                 "Optional explicit version. Otherwise a new version is assigned.",
             ),
         ],
-        "opa_apply" | "opa_rollback" => vec![admin_action_body_field(
-            "hive",
-            "string",
-            "Optional explicit hive override for OPA broadcast targeting.",
-        )],
         "wf_rules_compile_apply" => vec![
             admin_action_body_field(
                 "auto_spawn",
@@ -9470,28 +11295,28 @@ fn admin_action_example_payload(action: &str) -> serde_json::Value {
             "ssh_password": "<bootstrap-password-or-omit-if-key-seeded>"
         }),
         "run_node" => serde_json::json!({
-            "node_name": "AI.chat@motherbee",
+            "node_name": "AI.sales@motherbee",
             "runtime": "ai.generic",
             "runtime_version": "current",
             "tenant_id": "tnt:43d576a3-d712-4d91-9245-5d5463dd693e"
         }),
         "start_node" => serde_json::json!({
-            "node_name": "AI.chat@motherbee"
+            "node_name": "AI.sales@motherbee"
         }),
         "restart_node" => serde_json::json!({
-            "node_name": "AI.chat@motherbee"
+            "node_name": "AI.sales@motherbee"
         }),
         "kill_node" => serde_json::json!({
             "force": false,
             "purge_instance": true
         }),
         "add_route" => serde_json::json!({
-            "prefix": "AI.chat.",
+            "prefix": "AI.sales.",
             "action": "FORWARD",
             "next_hop_hive": "worker-220"
         }),
         "delete_route" => serde_json::json!({
-            "prefix": "AI.chat."
+            "prefix": "AI.sales."
         }),
         "add_vpn" => serde_json::json!({
             "pattern": "worker-*",
@@ -9516,12 +11341,10 @@ fn admin_action_example_payload(action: &str) -> serde_json::Value {
             "config": {
                 "behavior": {
                     "kind": "ai_chat",
-                    "vault_key": "ai/sales",
                     "model": "gpt-5.5"
                 }
             },
-            "replace": false,
-            "notify": true
+            "replace": false
         }),
         "node_control_config_get" => serde_json::json!({
             "requested_by": "archi"
@@ -9552,6 +11375,16 @@ fn admin_action_example_payload(action: &str) -> serde_json::Value {
             "layout": "2006-01-02 15:04 MST",
             "tz": "America/Argentina/Buenos_Aires"
         }),
+        "list_recent_commands" => serde_json::json!({
+            "limit": 20,
+            "status": "error"
+        }),
+        "get_llm_usage" => serde_json::json!({
+            "tenant_id": "tnt:43d576a3-d712-4d91-9245-5d5463dd693e",
+            "from": "2026-10-01T00:00:00Z",
+            "to": "2026-11-01T00:00:00Z",
+            "group_by": "day"
+        }),
         "send_node_message" => serde_json::json!({
             "msg_type": "PING",
             "payload": {
@@ -9565,7 +11398,7 @@ fn admin_action_example_payload(action: &str) -> serde_json::Value {
             "manifest_hash": "sha256:deadbeef",
             "category": "runtime",
             "manifest_version": 42,
-            "runtime": "ai.common",
+            "runtime": "ai.generic",
             "runtime_version": "0.1.2"
         }),
         "sync_hint" => serde_json::json!({
@@ -9583,6 +11416,7 @@ fn admin_action_example_payload(action: &str) -> serde_json::Value {
         "opa_rollback" => serde_json::json!({
             "version": 11
         }),
+        "opa_clear" => serde_json::json!({}),
         "wf_rules_compile_apply" => serde_json::json!({
             "workflow_name": "invoice",
             "definition": {
@@ -9707,6 +11541,11 @@ fn admin_action_example_payload(action: &str) -> serde_json::Value {
                 "key": "infra:openai-api-key"
             })
         }
+        "vault_assign" => serde_json::json!({
+            "key": "slack:acme:bot",
+            "tenant_id": "tnt:11111111-1111-4111-8111-111111111111",
+            "assigned_nodes": ["IO.slack.sales@motherbee", "IO.slack.support@motherbee"]
+        }),
         "vault_rotate" => serde_json::json!({
             "key": "infra:openai-api-key",
             "value": {
@@ -9743,23 +11582,31 @@ fn admin_action_example_scmd(action: &str) -> Option<String> {
         }
         "remove_hive" => "curl -X DELETE /hives/worker-220",
         "list_nodes" => "curl -X GET /hives/motherbee/nodes",
+        "list_streams" => "curl -X GET /hives/worker-220/streams",
+        "get_llm_usage" => {
+            "curl -X GET '/hives/motherbee/usage?tenant_id=tnt:43d576a3-d712-4d91-9245-5d5463dd693e&from=2026-10-01T00:00:00Z&to=2026-11-01T00:00:00Z&group_by=day'"
+        }
+        "list_tenant_nodes" => "curl -X GET /hives/motherbee/identity/tenants/tnt:.../nodes",
         "get_node_status" => "curl -X GET /hives/motherbee/nodes/SY.admin@motherbee/status",
         "get_node_state" => "curl -X GET /hives/motherbee/nodes/SY.admin@motherbee/state",
-        "get_node_config" => "curl -X GET /hives/motherbee/nodes/AI.chat@motherbee/config",
+        "get_node_config" => "curl -X GET /hives/motherbee/nodes/AI.sales@motherbee/config",
         "run_node" => {
-            r#"curl -X POST /hives/motherbee/nodes -d '{"node_name":"AI.chat@motherbee","runtime":"ai.generic","runtime_version":"current","tenant_id":"tnt:43d576a3-d712-4d91-9245-5d5463dd693e"}'"#
+            r#"curl -X POST /hives/motherbee/nodes -d '{"node_name":"AI.sales@motherbee","runtime":"ai.generic","runtime_version":"current","tenant_id":"tnt:43d576a3-d712-4d91-9245-5d5463dd693e"}'"#
         }
         "start_node" => {
-            r#"curl -X POST /hives/motherbee/nodes/AI.chat@motherbee/start -d '{"node_name":"AI.chat@motherbee"}'"#
+            r#"curl -X POST /hives/motherbee/nodes/AI.sales@motherbee/start -d '{"node_name":"AI.sales@motherbee"}'"#
         }
         "restart_node" => {
-            r#"curl -X POST /hives/motherbee/nodes/AI.chat@motherbee/restart -d '{"node_name":"AI.chat@motherbee"}'"#
+            r#"curl -X POST /hives/motherbee/nodes/AI.sales@motherbee/restart -d '{"node_name":"AI.sales@motherbee"}'"#
         }
         "kill_node" => {
-            r#"curl -X DELETE /hives/motherbee/nodes/AI.chat@motherbee -d '{"force":false,"purge_instance":true}'"#
+            r#"curl -X DELETE /hives/motherbee/nodes/AI.sales@motherbee -d '{"force":false,"purge_instance":true}'"#
         }
         "remove_node_instance" => {
-            "curl -X DELETE /hives/motherbee/nodes/AI.chat@motherbee/instance"
+            "curl -X DELETE /hives/motherbee/nodes/AI.sales@motherbee/instance"
+        }
+        "list_recent_commands" => {
+            "curl -X GET '/hives/motherbee/commands?limit=20&status=error'"
         }
         "send_node_message" => {
             r#"curl -X POST /hives/motherbee/nodes/SY.admin@motherbee/messages -d '{"msg_type":"PING","payload":{"ping":true}}'"#
@@ -9779,6 +11626,24 @@ fn admin_action_example_scmd(action: &str) -> Option<String> {
         }
         "delete_ilk" => {
             "curl -X DELETE /hives/motherbee/identity/ilks/ilk:550e8400-e29b-41d4-a716-446655440000"
+        }
+        "restore_ilk" => {
+            "curl -X POST /hives/motherbee/identity/ilks/ilk:550e8400-e29b-41d4-a716-446655440000/restore"
+        }
+        "set_ilk_tenant" => {
+            r#"curl -X PUT /hives/motherbee/identity/ilks/ilk:550e8400-e29b-41d4-a716-446655440000/tenant -d '{"tenant_id":"tnt:550e8400-e29b-41d4-a716-446655440001"}'"#
+        }
+        "purge_ilk" => {
+            "curl -X POST /hives/motherbee/identity/ilks/ilk:550e8400-e29b-41d4-a716-446655440000/purge"
+        }
+        "delete_tenant" => {
+            "curl -X DELETE /hives/motherbee/identity/tenants/tnt:550e8400-e29b-41d4-a716-446655440000"
+        }
+        "restore_tenant" => {
+            "curl -X POST /hives/motherbee/identity/tenants/tnt:550e8400-e29b-41d4-a716-446655440000/restore"
+        }
+        "purge_tenant" => {
+            "curl -X POST /hives/motherbee/identity/tenants/tnt:550e8400-e29b-41d4-a716-446655440000/purge"
         }
         "list_tenants" => "curl -X GET /hives/motherbee/identity/tenants",
         "get_tenant" => {
@@ -9802,6 +11667,7 @@ fn admin_action_example_scmd(action: &str) -> Option<String> {
         }
         "vault_get" => "curl -X GET /hives/motherbee/vault/secrets/infra:openai-api-key",
         "vault_delete" => "curl -X DELETE /hives/motherbee/vault/secrets/infra:openai-api-key",
+        "vault_assign" => r#"curl -X PUT /hives/motherbee/vault/secrets/slack:acme:bot/assigned -d '{"tenant_id":"tnt:...","assigned_nodes":["IO.slack.sales@motherbee"]}'"#,
         "vault_rotate" => {
             r#"curl -X POST /hives/motherbee/vault/secrets/infra:openai-api-key/rotate -d '{"value":{"api_key":"sk-rotated-..."}}'"#
         }
@@ -9812,15 +11678,15 @@ fn admin_action_example_scmd(action: &str) -> Option<String> {
         "list_versions" => "curl -X GET /versions",
         "get_versions" => "curl -X GET /hives/motherbee/versions",
         "list_runtimes" => "curl -X GET /hives/motherbee/runtimes",
-        "get_runtime" => "curl -X GET /hives/motherbee/runtimes/ai.chat",
+        "get_runtime" => "curl -X GET /hives/motherbee/runtimes/ai.generic",
         "remove_runtime_version" => {
-            "curl -X DELETE /hives/motherbee/runtimes/ai.chat/versions/1.2.3"
+            "curl -X DELETE /hives/motherbee/runtimes/ai.generic/versions/1.2.3"
         }
         "list_routes" => "curl -X GET /hives/motherbee/routes",
         "add_route" => {
-            r#"curl -X POST /hives/motherbee/routes -d '{"prefix":"AI.chat.","action":"FORWARD","next_hop_hive":"worker-220"}'"#
+            r#"curl -X POST /hives/motherbee/routes -d '{"prefix":"AI.sales.","action":"FORWARD","next_hop_hive":"worker-220"}'"#
         }
-        "delete_route" => "curl -X DELETE /hives/motherbee/routes/AI.chat.",
+        "delete_route" => "curl -X DELETE /hives/motherbee/routes/AI.sales.",
         "list_vpns" => "curl -X GET /hives/motherbee/vpns",
         "add_vpn" => {
             r#"curl -X POST /hives/motherbee/vpns -d '{"pattern":"worker-*","vpn_id":220}'"#
@@ -9840,7 +11706,7 @@ fn admin_action_example_scmd(action: &str) -> Option<String> {
         "list_drift_alerts" => "curl -X GET /drift-alerts",
         "get_drift_alerts" => "curl -X GET /hives/motherbee/drift-alerts",
         "update" => {
-            r#"curl -X POST /hives/motherbee/update -d '{"manifest_hash":"sha256:deadbeef","category":"runtime","manifest_version":42,"runtime":"ai.common","runtime_version":"0.1.2"}'"#
+            r#"curl -X POST /hives/motherbee/update -d '{"manifest_hash":"sha256:deadbeef","category":"runtime","manifest_version":42,"runtime":"ai.generic","runtime_version":"0.1.2"}'"#
         }
         "sync_hint" => {
             r#"curl -X POST /hives/motherbee/sync-hint -d '{"channel":"blob","wait_for_idle":true,"timeout_ms":30000}'"#
@@ -9866,17 +11732,18 @@ fn admin_action_example_scmd(action: &str) -> Option<String> {
             r#"curl -X POST /hives/motherbee/timer/format -d '{"instant_utc_ms":1775771100000,"layout":"2006-01-02 15:04 MST","tz":"America/Argentina/Buenos_Aires"}'"#
         }
         "opa_compile_apply" => {
-            r#"curl -X POST /hives/motherbee/opa/policy -d '{"rego":"package router\n\ndefault target = null\n","entrypoint":"router/target"}'"#
+            r#"curl -X POST /opa/policy -d '{"rego":"package router\n\ndefault target = null\n","entrypoint":"router/target"}'"#
         }
         "opa_compile" => {
-            r#"curl -X POST /hives/motherbee/opa/policy/compile -d '{"rego":"package router\n\ndefault target = null\n","entrypoint":"router/target"}'"#
+            r#"curl -X POST /opa/policy/compile -d '{"rego":"package router\n\ndefault target = null\n","entrypoint":"router/target"}'"#
         }
-        "opa_apply" => r#"curl -X POST /hives/motherbee/opa/policy/apply -d '{"version":12}'"#,
+        "opa_apply" => r#"curl -X POST /opa/policy/apply -d '{"version":12}'"#,
         "opa_rollback" => {
-            r#"curl -X POST /hives/motherbee/opa/policy/rollback -d '{"version":11}'"#
+            r#"curl -X POST /opa/policy/rollback -d '{"version":11}'"#
         }
+        "opa_clear" => r#"curl -X POST /opa/policy/clear -d '{}'"#,
         "opa_check" => {
-            r#"curl -X POST /hives/motherbee/opa/policy/check -d '{"rego":"package router\n\ndefault target = null\n","entrypoint":"router/target"}'"#
+            r#"curl -X POST /opa/policy/check -d '{"rego":"package router\n\ndefault target = null\n","entrypoint":"router/target"}'"#
         }
         "wf_rules_get_workflow" => {
             "curl -X GET '/hives/motherbee/wf-rules?workflow_name=invoice'"
@@ -9916,6 +11783,13 @@ fn admin_action_request_notes(action: &str) -> Vec<&'static str> {
             "A /public/<key> URL is a bearer capability: anyone with the link can read it until expiry or unpublish.",
             "Inline HTML may contain self-contained JavaScript, but edge applies sandboxed-html-v1 with network access disabled.",
         ],
+        "list_recent_commands" => vec![
+            "Reads the local admin command audit log (state/sy-admin/command-log/, JSONL, rotates every ~100 entries; oldest rotations are dropped).",
+            "Records every admin command that flows through the admin command handler — creates/mutations/queries (run_node, vault_*, config, taps, routes, hives, nodes, ...) — with `origin` = 'http' (operator), 'l2:<src_l2_name>' (router-stamped mesh caller, e.g. SY.architect), 'executor' (executor-plan step) or 'internal'.",
+            "Entry params are REDACTED (secret-like field names + vault values are never written) and size-capped; entries also carry status, error_code, http_status and duration_ms.",
+            "The {hive} path segment FILTERS by target hive; hive-less commands (add_hive/remove_hive/inventory) are global and always shown.",
+            "NOT captured (separate paths): runtime rollout `update`/`sync_hint` (their own admin routes, not the command handler), and orchestrator-AUTONOMOUS actions (respawn/reconcile) which never pass through admin.",
+        ],
         "unpublish_artifact" => vec![
             "Mesh-only producer operation; there is no HTTP, SCMD or admin-executor unpublish endpoint.",
             "Only the same router-stamped producer L2 name that created the publication may revoke it.",
@@ -9933,6 +11807,16 @@ fn admin_action_request_notes(action: &str) -> Vec<&'static str> {
             "Motherbee-only operation.",
             "For HTTP usage the hive id is in the body for add_hive and in the path for remove_hive.",
         ],
+        "get_llm_usage" => vec![
+            "One record per model call (docs/router-stream-v1.md §7.4), kept by SY.storage on the motherbee: only /hives/motherbee/usage answers.",
+            "A period (from and to, by the time of the call) comes back grouped (groups: key, calls, uncached_input, cache_read, cache_write, output, reasoning) or record by record (records: the record plus stored_at, verified and claimed_tenant_id). since lists the records stored after a cursor instead, for a reader that syncs as they arrive.",
+            "Records arrive late by design (the streams' window, SY.storage's retries): a period is final only after them. next is the cursor for the next page (after) or for the next sync (since).",
+            "Without tenant_id the HTTP route reads every tenant (all_tenants). Over the mesh only Archi and the operator's executor may set all_tenants; Fluxbee Cloud reads its own tenant (get_usage), never the root tenant's.",
+        ],
+        "list_tenant_nodes" => vec![
+            "Every managed node charged to the tenant, on every connected hive: node_name, hive, runtime, lifecycle_state, health_state, identity (ilk_id, tenant_id), launched_by (cloud, archi, operator, system) and relaunch_on_boot (false once stopped).",
+            "A hive that does not answer is listed in unreachable_hives. Fluxbee Cloud reads its tenant's nodes this way (list_nodes).",
+        ],
         "list_nodes" => vec![
             "This endpoint is hive-scoped only.",
             "For all nodes across the system, use GET /inventory or GET /inventory/summary instead.",
@@ -9942,20 +11826,31 @@ fn admin_action_request_notes(action: &str) -> Vec<&'static str> {
             "Use this only when creating/spawning a new managed instance.",
             "runtime can be omitted when it is derivable from node_name.",
             "AI.* and IO.* managed nodes require root-level tenant_id on first spawn. Discover it with list_tenants/get_tenant or from an existing node config; do not place it only under config.",
+            "Only IO.cloud and IO.blob (runtimes io.cloud, io.blob) run in the root tenant. Launch any other IO.* node with the tenant it serves; in the root tenant it is refused with TENANT_ROOT_NOT_ALLOWED.",
+            "A tenant that is not active (pending or suspended) starts no node: TENANT_NOT_ACTIVE.",
             "WF.* managed nodes must use an already published workflow package runtime, for example wf.invoice. Do not spawn WF.* directly with the base runtime wf.engine; use wf_rules_compile_apply with auto_spawn=true to publish and deploy workflows.",
             "For internal ADMIN_COMMAND dispatch, the hive target is encoded via payload.target; in HTTP it comes from /hives/{hive}.",
         ],
         "start_node" => vec![
             "Use this when the persisted managed node instance already exists and needs to be started again.",
             "This reuses the stored config.json and runtime metadata instead of creating a new instance.",
+            "Refused with TENANT_NOT_ACTIVE while the node's tenant is pending or suspended.",
+            "It also sets relaunch_on_boot again, which a stop (kill_node without purge_instance) clears.",
             "The hive target comes from the /hives/{hive} path in HTTP.",
         ],
         "restart_node" => vec![
             "Use this when the managed node instance already exists and should be restarted.",
             "If the transient systemd unit is missing or inactive, orchestrator can fall back to the start path for the persisted instance.",
+            "Refused with TENANT_NOT_ACTIVE while the node's tenant is pending or suspended; a node that already runs is never stopped for it.",
             "The hive target comes from the /hives/{hive} path in HTTP.",
         ],
-        "kill_node" | "remove_node_instance" | "set_node_config" | "send_node_message" => vec![
+        "kill_node" => vec![
+            "The hive target comes from the /hives/{hive} path in HTTP.",
+            "The node_name path segment should be a fully-qualified Fluxbee node name.",
+            "Without purge_instance it is a stop that lasts: the boot and periodic relaunches leave the node down (relaunch_on_boot false) until start_node or restart_node. A node that dies on its own is still relaunched.",
+            "With purge_instance it is the full teardown: its timers, the secrets it owns and its identity go, and the name is free again.",
+        ],
+        "remove_node_instance" | "set_node_config" | "send_node_message" => vec![
             "The hive target comes from the /hives/{hive} path in HTTP.",
             "The node_name path segment should be a fully-qualified Fluxbee node name.",
         ],
@@ -9987,7 +11882,7 @@ fn admin_action_request_notes(action: &str) -> Vec<&'static str> {
             "The payload.config object is node-defined and is not interpreted by SY.admin.",
             "Before mutating AI.* or IO.*, call node_control_config_get and set config_version to response.config_version + 1. A smaller value is stale; an equal value is idempotent and will not apply a change.",
             "Do not use config_version from get_node_config/_system as a substitute unless it exactly matches the live CONFIG_GET response; the canonical source is node_control_config_get.",
-            "For ai.generic chat, use config.behavior.kind=ai_chat with both vault_key and model. Vault metadata selects the provider; the key never selects the model.",
+            "For ai.generic chat, use config.behavior.kind=ai_chat with a model. The key is not config: the node reads the hive AI provider's key from SY.vault (resource_type openai|anthropic): one it owns, one assigned to it, or its tenant's general one. A tenant's node never falls back to the root tenant's key (that one is the core's).",
             "Do not put cognitive assets under CONFIG_SET config.assets. Apply role_hash, skill_hashes, handbook_hashes, and personality_hash with set_ilk_definition against the agent ILK.",
             "For WF.* v1, CONFIG_SET is persist-only and returns restart_required; it does not hot-apply CONFIG_CHANGED.",
             "For WF.* v1, do not mutate _system through CONFIG_SET. Managed package/runtime metadata remains owned by orchestrator.",
@@ -10040,9 +11935,34 @@ fn admin_action_request_notes(action: &str) -> Vec<&'static str> {
             "This does not create the blob assets; Archi must write canonical role/skill/handbook/personality assets to blob before applying the hashes.",
         ],
         "delete_ilk" => vec![
-            "Hard-deletes one ILK record and its ICH mappings; the SHM update propagates to all SY.identity replicas via delta broadcast.",
-            "Refuses to delete a well-known SY system ILK (identification.source == hive.system_nodes) with SYSTEM_ILK_PROTECTED.",
-            "Primary use case: orchestrator-driven tabula-rasa of a node instance during purge teardown.",
+            "MARKS one ILK deleted: hidden from lookups/SHM/listings (list with ?include_deleted=true), reversible with restore_ilk.",
+            "Its keys (channels, node_name, email) stay RESERVED until purge: provisioning/registering them answers ILK_DELETED.",
+            "Idempotent (already_deleted:true). Refuses a well-known SY system ILK with SYSTEM_ILK_PROTECTED.",
+            "Physical removal is purge_ilk, which requires this mark first (the orchestrator's purge teardown does both).",
+        ],
+        "set_ilk_tenant" => vec![
+            "A tenant is a cost center: changing it grants and revokes nothing (docs/ilk-tenant-model-v1.md).",
+            "People only (a node is born and dies in its tenant): an account from anywhere, a temporary only out of a deleted tenant (INVALID_TENANT_TRANSITION otherwise), which is how a tenant is emptied before its purge. The target must be active and never the root tenant.",
+            "Refused with DUPLICATE_EMAIL when another person in the target holds the same email. Channels keep their scope, so every lookup still resolves; each change writes a history row.",
+        ],
+        "restore_ilk" => vec![
+            "Undoes delete_ilk: the ILK resolves again with the same keys.",
+            "A person comes back even while their tenant is marked, still charged to it; any other ILK answers TENANT_DELETED until its tenant is restored. ILK_NOT_DELETED if it is not marked.",
+        ],
+        "purge_ilk" => vec![
+            "Final: removes the ILK row, its ICHs and aliases; replicas get IlkDelete deltas.",
+            "Requires the ILK to be marked first (ILK_NOT_DELETED otherwise). Operator-only: not offered to Archi's executor nor to Fluxbee Cloud.",
+        ],
+        "delete_tenant" => vec![
+            "MARKS the tenant deleted, i.e. disables it: no ILK is marked, its people stay usable and can be charged elsewhere (set_ilk_tenant). Its name/domain stay reserved: create_tenant answers TENANT_DELETED.",
+            "Answers people_charged, the people still charged to it. Refused for the root tenant (TENANT_ROOT_PROTECTED), while node identities live in it (TENANT_HAS_NODES) or while it sponsors active tenants (TENANT_HAS_CHILDREN).",
+        ],
+        "restore_tenant" => vec![
+            "Undoes delete_tenant: the tenant comes back as it was, since nobody in it was marked.",
+        ],
+        "purge_tenant" => vec![
+            "Final: removes the tenant, the ILKs marked in it and the channels other ILKs hold in its scope. Requires the tenant to be marked first (TENANT_NOT_DELETED otherwise).",
+            "Refused while people are charged to it (TENANT_HAS_PEOPLE: charge them elsewhere first), while SY.vault still holds secrets of the tenant (TENANT_HAS_SECRETS, keys listed), node identities remain or it sponsors tenants. Operator-only.",
         ],
         "list_tenants" => vec![
             "Lists the identity tenants currently known by SY.identity for one hive.",
@@ -10083,6 +12003,7 @@ fn admin_action_request_notes(action: &str) -> Vec<&'static str> {
             "Writes plaintext to SY.vault over L2; SY.vault encrypts at rest and writes local audit.",
             "value is secret-sensitive and must be redacted in previews/history.",
             "Model D' metadata contract: metadata.resource_type is REQUIRED (canonical lowercase snake_case). metadata.tenant_id is optional (defaults to the hive's root tenant — infrastructure-wide secret; values must be in canonical tnt:<uuid> form). metadata.owner_node is optional (friendly L2 name like 'SY.architect' — admin resolves the ILK); omit owner_node entirely for a pool secret. metadata.owner_ilk is REJECTED — never include it.",
+            "Keys share one namespace for the whole hive: a put of a key another tenant holds answers KEY_TAKEN, and never moves the key to the new tenant.",
             "Same-value PUT is idempotent: the vault returns changed=false and does not increment version.",
         ],
         "vault_get_metadata" => vec![
@@ -10094,17 +12015,26 @@ fn admin_action_request_notes(action: &str) -> Vec<&'static str> {
             "Use only when the operator explicitly needs the plaintext value; prefer vault_get_metadata for inspection.",
             "Executor previews/history must redact the returned value.",
         ],
+        "vault_assign" => vec![
+            "Replaces the nodes the secret is assigned to; the value, its version and its owner stay.",
+            "Each node must be charged to the key's tenant; a person is never assigned (a person owns secrets, nodes use them).",
+            "A secret with no owner and no assigned node is its tenant's general secret: every node of the tenant uses it.",
+            "Every node that had it or has it now is told (VAULT_SECRET_CHANGED, op assign).",
+        ],
         "vault_delete" => vec![
             "Deletes one secret. Admin/Architect only.",
             "Use metadata/list first when you need to inspect before delete.",
+            "Pass tenant_id = the key's metadata.tenant_id; omitted means the root tenant, and a key of another tenant answers KEY_NOT_FOUND.",
         ],
         "vault_rotate" => vec![
             "Rotates one secret value and preserves the immediately previous version for rollback.",
             "value is secret-sensitive and must be redacted in previews/history.",
+            "Pass tenant_id = the key's metadata.tenant_id; omitted means the root tenant, and a key of another tenant answers KEY_NOT_FOUND.",
         ],
         "vault_rollback" => vec![
             "Rolls one secret back to the immediately previous version.",
             "Fails with NO_PREVIOUS_VERSION when no previous encrypted value is available.",
+            "Pass tenant_id = the key's metadata.tenant_id; omitted means the root tenant, and a key of another tenant answers KEY_NOT_FOUND.",
         ],
         "inventory" => vec![
             "Use GET /inventory for the full global inventory view.",
@@ -10115,7 +12045,7 @@ fn admin_action_request_notes(action: &str) -> Vec<&'static str> {
             "These endpoints report core component versions and runtime availability/current selections.",
             "They describe versions available to a hive, not the state of one node instance.",
             "For SY nodes, map node names to core components: for example SY.identity@motherbee -> core.components['sy-identity'].version.",
-            "For runtime-backed nodes, map the node runtime family to runtimes.runtimes[<runtime>].current: for example AI.chat@motherbee -> runtimes.runtimes['ai.chat'].current.",
+            "For runtime-backed nodes, use the runtime the node was spawned from (get_node_config -> config._system.runtime): every AI.* node runs ai.generic, so AI.sales@motherbee -> runtimes.runtimes['ai.generic'].current.",
             "For IO or WF nodes with instance suffixes, use the runtime family/prefix, for example IO.slack.T123@motherbee -> io.slack and WF.blob.consume.diag.x@y -> wf.blob.consume.diag when present.",
             "Use GET /versions for cross-hive comparisons and GET /hives/{hive}/versions for one hive.",
         ],
@@ -10138,6 +12068,11 @@ fn admin_action_request_notes(action: &str) -> Vec<&'static str> {
         ],
         "opa_rollback" => vec![
             "If version is omitted, rollback uses the implementation default (currently 0).",
+        ],
+        "opa_clear" => vec![
+            "Removes the USER policy on EVERY hive: there is one global policy.",
+            "Final: current, staged AND backup are removed, so there is no rollback of a clear.",
+            "Routers unload the policy they hold in memory (the SYSTEM authority policy is baked into the router and untouched).",
         ],
         "wf_rules_compile_apply" => vec![
             "workflow_name and definition are required.",
@@ -11066,6 +13001,7 @@ async fn handle_publish_runtime_package(
         ));
     }
 
+    let _manifest_guard = ctx.runtime_manifest_lock.lock().await;
     let req: PublishRuntimePackageRequest = match serde_json::from_value(payload) {
         Ok(req) => req,
         Err(err) => {
@@ -11285,6 +13221,7 @@ async fn handle_remove_runtime_version(
         ));
     }
 
+    let _manifest_guard = ctx.runtime_manifest_lock.lock().await;
     let runtime = payload
         .get("runtime")
         .and_then(|value| value.as_str())
@@ -11707,7 +13644,121 @@ async fn handle_remove_runtime_version(
     ))
 }
 
+/// The single choke-point for admin commands. All entry paths land here — HTTP handlers call it
+/// directly (origin "http"); the internal L2 dispatch and the executor call
+/// `handle_admin_command_with_origin` with their identity. Every call is appended to the command
+/// audit log (redacted) so `list_recent_commands` can answer "what was done to this backend lately".
 async fn handle_admin_command(
+    ctx: &AdminContext,
+    client: &RouterDispatcher,
+    action: &str,
+    payload: serde_json::Value,
+    hive: Option<String>,
+) -> Result<(u16, String), AdminError> {
+    handle_admin_command_with_origin(ctx, client, action, payload, hive, "http").await
+}
+
+async fn handle_admin_command_with_origin(
+    ctx: &AdminContext,
+    client: &RouterDispatcher,
+    action: &str,
+    payload: serde_json::Value,
+    hive: Option<String>,
+    origin: &str,
+) -> Result<(u16, String), AdminError> {
+    // The audit-log reader is handled locally (the log lives on THIS admin; every hive's commands
+    // flow through it) — `hive` acts as a filter, not routing.
+    if matches!(action, "list_recent_commands") {
+        let query = AdminCommandLogQuery {
+            limit: payload
+                .get("limit")
+                .and_then(|v| v.as_u64())
+                .map(|v| v as usize)
+                .unwrap_or(ADMIN_COMMAND_LOG_DEFAULT_LIMIT),
+            action: payload
+                .get("action")
+                .and_then(|v| v.as_str())
+                .map(str::trim)
+                .filter(|v| !v.is_empty())
+                .map(ToString::to_string),
+            status: payload
+                .get("status")
+                .and_then(|v| v.as_str())
+                .map(str::trim)
+                .filter(|v| !v.is_empty())
+                .map(ToString::to_string),
+            hive: hive.clone().filter(|v| !v.is_empty()),
+            since_ms: payload.get("since_ms").and_then(|v| v.as_u64()),
+        };
+        // Read under the same lock as rotate+append so a concurrent rotation can't make one response
+        // miss or duplicate an entry across the file/rotation boundary.
+        let commands = {
+            let _guard = ctx
+                .command_log_lock
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            read_recent_admin_commands(&ctx.state_dir, &query)
+        };
+        return Ok((
+            200u16,
+            serde_json::json!({
+                "status": "ok",
+                "action": "list_recent_commands",
+                "error_code": serde_json::Value::Null,
+                "error_detail": serde_json::Value::Null,
+                "payload": { "count": commands.len(), "commands": commands },
+            })
+            .to_string(),
+        ));
+    }
+
+    let started = Instant::now();
+    let logged_params = admin_command_log_params(&payload);
+    let result = handle_admin_command_inner(ctx, client, action, payload, hive.clone()).await;
+
+    // Audit append — never fails the command; a hard AdminError is logged as status=error too.
+    let (http_status, status, error_code) = match &result {
+        Ok((code, body)) => {
+            let parsed: serde_json::Value =
+                serde_json::from_str(body).unwrap_or(serde_json::Value::Null);
+            (
+                *code,
+                parsed
+                    .get("status")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or(if *code < 400 { "ok" } else { "error" })
+                    .to_string(),
+                parsed
+                    .get("error_code")
+                    .and_then(|v| v.as_str())
+                    .map(ToString::to_string),
+            )
+        }
+        Err(err) => (500u16, "error".to_string(), Some(err.to_string())),
+    };
+    let entry = AdminCommandLogEntry {
+        ts_ms: now_epoch_ms(),
+        ts: Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true),
+        action: action.to_string(),
+        hive,
+        origin: origin.to_string(),
+        params: logged_params,
+        status,
+        error_code,
+        http_status,
+        duration_ms: started.elapsed().as_millis() as u64,
+    };
+    {
+        let _guard = ctx
+            .command_log_lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        append_admin_command_log_locked(&ctx.state_dir, &entry);
+    }
+    result
+}
+
+async fn handle_admin_command_inner(
     ctx: &AdminContext,
     client: &RouterDispatcher,
     action: &str,
@@ -11742,10 +13793,16 @@ async fn handle_admin_command(
         "get_ilk"
             | "set_ilk_definition"
             | "delete_ilk"
+            | "restore_ilk"
+            | "set_ilk_tenant"
+            | "purge_ilk"
             | "get_tenant"
             | "create_tenant"
             | "update_tenant"
             | "set_tenant_sponsor"
+            | "delete_tenant"
+            | "restore_tenant"
+            | "purge_tenant"
     ) {
         return handle_identity_command(ctx, client, action, payload, hive).await;
     }
@@ -11758,6 +13815,7 @@ async fn handle_admin_command(
             | "vault_delete"
             | "vault_rotate"
             | "vault_rollback"
+            | "vault_assign"
     ) {
         return handle_vault_command(ctx, client, action, payload, hive).await;
     }
@@ -11778,41 +13836,15 @@ async fn handle_admin_command(
 
     let payload = normalize_admin_payload(action, payload, hive.as_deref());
     let request = build_admin_request(ctx, action, payload, hive);
-    let target_hive = extract_hive_from_target(&request.target);
-    let mut response = send_admin_request(
+    // Routes, VPNs and taps: SY.config.routes of that hive applies the change and writes its config
+    // region, which the routers of that hive read on the next message. Nothing else to tell anyone.
+    let response = send_admin_request(
         client,
         request,
         admin_action_timeout(action),
         &admin_node_name(&ctx.hive_id),
     )
     .await;
-    if let Ok(ref payload) = response {
-        if let Some(status) = payload.get("status").and_then(|v| v.as_str()) {
-            if status == "ok" {
-                if matches!(
-                    action,
-                    "add_route"
-                        | "delete_route"
-                        | "add_vpn"
-                        | "delete_vpn"
-                        | "add_tap"
-                        | "delete_tap"
-                ) {
-                    if let Err(err) =
-                        broadcast_full_config(ctx, client, action, target_hive.as_deref()).await
-                    {
-                        let detail = format!("action applied but broadcast failed: {err}");
-                        tracing::warn!(error = %detail, "broadcast after admin action failed");
-                        response = Ok(serde_json::json!({
-                            "status": "error",
-                            "error_code": "CONFIG_BROADCAST_FAILED",
-                            "message": detail,
-                        }));
-                    }
-                }
-            }
-        }
-    }
     Ok(build_admin_http_response(action, response))
 }
 
@@ -11874,6 +13906,10 @@ async fn handle_send_node_message(
             action: req.meta_action,
             priority: req.priority,
             context: req.context,
+            thread_id: req.thread_id.and_then(|value| {
+                let trimmed = value.trim().to_string();
+                (!trimmed.is_empty()).then_some(trimmed)
+            }),
             ..Meta::default()
         },
         payload: req.payload,
@@ -12119,6 +14155,7 @@ async fn handle_identity_query(
     ctx: &AdminContext,
     client: &RouterDispatcher,
     action: &str,
+    payload: serde_json::Value,
     hive: Option<String>,
 ) -> Result<(u16, String), AdminError> {
     let target_hive = hive.unwrap_or_else(|| ctx.hive_id.clone());
@@ -12133,11 +14170,89 @@ async fn handle_identity_query(
         &target,
         request_msg,
         response_msg,
-        serde_json::json!({}),
+        payload,
         admin_action_timeout(action),
     )
     .await;
     Ok(build_admin_http_response(action, response))
+}
+
+/// `?key=true` / `?key=1` on an admin GET.
+fn query_flag(query: &HashMap<String, String>, key: &str) -> bool {
+    query
+        .get(key)
+        .map(|value| matches!(value.trim().to_ascii_lowercase().as_str(), "true" | "1" | "yes"))
+        .unwrap_or(false)
+}
+
+/// purge_tenant is refused while SY.vault still holds secrets of that tenant (operator
+/// decision 2026-09-28: purge never cascades into other stores; clean them first). Identity
+/// cannot see the vault, so SY.admin checks it before forwarding TNT_PURGE. Fail closed: if the
+/// vault cannot be listed, the purge does not go through.
+async fn purge_tenant_vault_block(
+    client: &RouterDispatcher,
+    target_hive: &str,
+    payload: &serde_json::Value,
+) -> Option<(u16, String)> {
+    let tenant_id = payload
+        .get("tenant_id")
+        .and_then(|value| value.as_str())
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+    let blocked = |code: &str, detail: String| {
+        Some((
+            409,
+            serde_json::json!({
+                "status": "error",
+                "action": "purge_tenant",
+                "payload": serde_json::Value::Null,
+                "error_code": code,
+                "error_detail": detail,
+            })
+            .to_string(),
+        ))
+    };
+    let response = send_system_request(
+        client,
+        &format!("SY.vault@{}", target_hive),
+        MSG_VAULT_LIST,
+        MSG_VAULT_LIST_RESPONSE,
+        serde_json::json!({"filter": {"tenant_id": tenant_id, "limit": 1000}}),
+        Duration::from_secs(15),
+    )
+    .await;
+    match response {
+        Ok(listing) => {
+            let keys: Vec<String> = listing
+                .get("secrets")
+                .and_then(|value| value.as_array())
+                .map(|secrets| {
+                    secrets
+                        .iter()
+                        .filter_map(|secret| secret.get("key").and_then(|k| k.as_str()))
+                        .map(str::to_string)
+                        .collect()
+                })
+                .unwrap_or_default();
+            if keys.is_empty() {
+                None
+            } else {
+                blocked(
+                    "TENANT_HAS_SECRETS",
+                    format!(
+                        "SY.vault still holds {} secret(s) of {tenant_id}; delete them first: {}",
+                        keys.len(),
+                        keys.join(", ")
+                    ),
+                )
+            }
+        }
+        Err(err) => blocked(
+            "VAULT_CHECK_FAILED",
+            format!("could not list SY.vault secrets of {tenant_id} (refusing to purge): {err}"),
+        ),
+    }
 }
 
 async fn handle_identity_command(
@@ -12148,11 +14263,24 @@ async fn handle_identity_command(
     hive: Option<String>,
 ) -> Result<(u16, String), AdminError> {
     let target_hive = hive.unwrap_or_else(|| ctx.hive_id.clone());
+    if action == "purge_tenant" {
+        if let Some(blocked) =
+            purge_tenant_vault_block(client, &target_hive, &payload).await
+        {
+            return Ok(blocked);
+        }
+    }
     let target = format!("SY.identity@{}", target_hive);
     let (request_msg, response_msg) = match action {
         "get_ilk" => ("ILK_GET", "ILK_GET_RESPONSE"),
         "set_ilk_definition" => ("ILK_SET_DEFINITION", "ILK_SET_DEFINITION_RESPONSE"),
         "delete_ilk" => ("ILK_DELETE", "ILK_DELETE_RESPONSE"),
+        "restore_ilk" => ("ILK_RESTORE", "ILK_RESTORE_RESPONSE"),
+        "set_ilk_tenant" => ("ILK_SET_TENANT", "ILK_SET_TENANT_RESPONSE"),
+        "purge_ilk" => ("ILK_PURGE", "ILK_PURGE_RESPONSE"),
+        "delete_tenant" => ("TNT_DELETE", "TNT_DELETE_RESPONSE"),
+        "restore_tenant" => ("TNT_RESTORE", "TNT_RESTORE_RESPONSE"),
+        "purge_tenant" => ("TNT_PURGE", "TNT_PURGE_RESPONSE"),
         "get_tenant" => ("TNT_GET", "TNT_GET_RESPONSE"),
         "create_tenant" => ("TNT_CREATE", "TNT_CREATE_RESPONSE"),
         "update_tenant" => ("TNT_UPDATE", "TNT_UPDATE_RESPONSE"),
@@ -12188,10 +14316,24 @@ async fn handle_vault_command(
         "vault_delete" => (MSG_VAULT_DELETE, MSG_VAULT_DELETE_RESPONSE),
         "vault_rotate" => (MSG_VAULT_ROTATE, MSG_VAULT_ROTATE_RESPONSE),
         "vault_rollback" => (MSG_VAULT_ROLLBACK, MSG_VAULT_ROLLBACK_RESPONSE),
+        "vault_assign" => (MSG_VAULT_ASSIGN, MSG_VAULT_ASSIGN_RESPONSE),
         _ => return Err(format!("unsupported vault admin action: {action}").into()),
     };
-    let normalized_payload = if action == "vault_put" {
-        match normalize_vault_put_payload(ctx, &target_hive, payload) {
+    let normalized = match action {
+        "vault_put" => Some(normalize_vault_put_payload(
+            ctx,
+            &target_hive,
+            payload.clone(),
+        )),
+        "vault_assign" => Some(normalize_vault_assign_payload(
+            ctx,
+            &target_hive,
+            payload.clone(),
+        )),
+        _ => None,
+    };
+    let normalized_payload = if let Some(normalized) = normalized {
+        match normalized {
             Ok(value) => value,
             Err(detail) => {
                 return Ok((
@@ -12207,6 +14349,8 @@ async fn handle_vault_command(
                 ));
             }
         }
+    } else if matches!(action, "vault_delete" | "vault_rotate" | "vault_rollback") {
+        default_vault_request_tenant(payload)
     } else {
         payload
     };
@@ -12232,6 +14376,27 @@ async fn handle_vault_command(
     )
     .await;
     Ok(build_admin_http_response(action, response))
+}
+
+/// Every delete, rotate and rollback names the tenant its key belongs to, and SY.vault refuses a
+/// key of another tenant as if it did not exist. When the caller names none it is the hive's root
+/// tenant, where infrastructure keys live: the same default `vault_put` applies to
+/// `metadata.tenant_id`.
+fn default_vault_request_tenant(mut payload: serde_json::Value) -> serde_json::Value {
+    if let Some(object) = payload.as_object_mut() {
+        let named = object
+            .get("tenant_id")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .is_some_and(|v| !v.is_empty());
+        if !named {
+            object.insert(
+                "tenant_id".to_string(),
+                serde_json::Value::String(fluxbee_sdk::DEFAULT_ROOT_TENANT_ID.to_string()),
+            );
+        }
+    }
+    payload
 }
 
 /// Normalize a vault_put HTTP payload to the Model D' contract before
@@ -12349,7 +14514,146 @@ fn normalize_vault_put_payload(
         metadata.remove("ilk");
     }
 
+    // The nodes it is assigned to (docs/ilk-tenant-model-v1.md §2.2): names and ILK ids, resolved
+    // and checked against its tenant.
+    let tenant_id = metadata
+        .get("tenant_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default()
+        .to_string();
+    let nodes = string_list(metadata.remove("assigned_nodes"), "metadata.assigned_nodes")?;
+    let ilks = string_list(metadata.remove("assigned_ilks"), "metadata.assigned_ilks")?;
+    let assigned = resolve_assigned_ilks(ctx, target_hive, &tenant_id, &nodes, &ilks)?;
+    if !assigned.is_empty() {
+        metadata.insert("assigned_ilks".to_string(), serde_json::json!(assigned));
+    }
+
     Ok(payload)
+}
+
+/// `vault_assign`: `{key, tenant_id?, assigned_nodes?, assigned_ilks?}` to the VAULT_ASSIGN request
+/// `{key, tenant_id, assigned_ilks}`. The tenant defaults to the root one, as for a delete; an empty
+/// list leaves the secret with no assigned node.
+fn normalize_vault_assign_payload(
+    ctx: &AdminContext,
+    target_hive: &str,
+    payload: serde_json::Value,
+) -> Result<serde_json::Value, String> {
+    let mut payload = default_vault_request_tenant(payload);
+    let Some(object) = payload.as_object_mut() else {
+        return Err("vault_assign requires a JSON object".to_string());
+    };
+    let key = object
+        .get("key")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .ok_or_else(|| "vault_assign requires key".to_string())?
+        .to_string();
+    let tenant_id = object
+        .get("tenant_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default()
+        .to_string();
+    let nodes = string_list(object.remove("assigned_nodes"), "assigned_nodes")?;
+    let ilks = string_list(object.remove("assigned_ilks"), "assigned_ilks")?;
+    if let Some(extra) = object
+        .keys()
+        .find(|field| !["key", "tenant_id"].contains(&field.as_str()))
+    {
+        return Err(format!("vault_assign does not take '{extra}'"));
+    }
+    let assigned = resolve_assigned_ilks(ctx, target_hive, &tenant_id, &nodes, &ilks)?;
+    Ok(serde_json::json!({"key": key, "tenant_id": tenant_id, "assigned_ilks": assigned}))
+}
+
+/// A list of strings from an optional JSON value: absent or null is empty.
+fn string_list(value: Option<serde_json::Value>, field: &str) -> Result<Vec<String>, String> {
+    match value {
+        None | Some(serde_json::Value::Null) => Ok(Vec::new()),
+        Some(serde_json::Value::Array(items)) => items
+            .into_iter()
+            .map(|item| {
+                item.as_str()
+                    .map(str::trim)
+                    .filter(|v| !v.is_empty())
+                    .map(str::to_string)
+                    .ok_or_else(|| format!("{field} must hold non-empty strings"))
+            })
+            .collect(),
+        Some(_) => Err(format!("{field} must be a list")),
+    }
+}
+
+/// The ILKs a secret is assigned to (docs/ilk-tenant-model-v1.md §2.2), from node names (resolved
+/// against the identity SHM, like `owner_node`) and ILK ids. Each is a node charged to the secret's
+/// tenant: no secret is assigned across tenants, and a person is never assigned (a person owns
+/// secrets; nodes use them).
+fn resolve_assigned_ilks(
+    ctx: &AdminContext,
+    target_hive: &str,
+    tenant_id: &str,
+    nodes: &[String],
+    ilks: &[String],
+) -> Result<Vec<String>, String> {
+    if nodes.is_empty() && ilks.is_empty() {
+        return Ok(Vec::new());
+    }
+    let snapshot = fluxbee_sdk::identity::list_ilks_from_hive_config(&ctx.config_dir)
+        .map_err(|err| format!("identity SHM read failed: {err}"))?;
+    check_assigned_ilks(&snapshot.ilks, target_hive, tenant_id, nodes, ilks)
+}
+
+/// The decision of `resolve_assigned_ilks`, over the identity's ILK list.
+fn check_assigned_ilks(
+    known: &[fluxbee_sdk::identity::IdentityIlkOption],
+    target_hive: &str,
+    tenant_id: &str,
+    nodes: &[String],
+    ilks: &[String],
+) -> Result<Vec<String>, String> {
+    let tenant = tenant_id.trim().to_ascii_lowercase();
+    let mut found: Vec<&fluxbee_sdk::identity::IdentityIlkOption> = Vec::new();
+    for node in nodes {
+        let handler_node = if node.contains('@') {
+            node.clone()
+        } else {
+            format!("{node}@{target_hive}")
+        };
+        let ilk = known
+            .iter()
+            .find(|ilk| ilk.handler_node.as_deref() == Some(handler_node.as_str()))
+            .ok_or_else(|| {
+                format!("assigned node '{handler_node}' is not registered in identity")
+            })?;
+        found.push(ilk);
+    }
+    for ilk_id in ilks {
+        let ilk = known
+            .iter()
+            .find(|ilk| ilk.ilk_id == ilk_id.trim())
+            .ok_or_else(|| format!("assigned ILK '{ilk_id}' is not in identity"))?;
+        found.push(ilk);
+    }
+    let mut assigned = Vec::new();
+    for ilk in found {
+        if ilk.tenant_id.trim().to_ascii_lowercase() != tenant {
+            return Err(format!(
+                "{} is charged to another tenant than the secret's ({tenant_id})",
+                ilk.ilk_id
+            ));
+        }
+        if ilk.ilk_type == "human" {
+            return Err(format!(
+                "{} is a person: a secret is assigned to nodes (a person owns secrets)",
+                ilk.ilk_id
+            ));
+        }
+        assigned.push(ilk.ilk_id.clone());
+    }
+    assigned.sort_unstable();
+    assigned.dedup();
+    Ok(assigned)
 }
 
 fn owner_node_has_deterministic_ilk(handler_node: &str) -> bool {
@@ -12719,7 +15023,9 @@ fn build_admin_request(
         | "set_node_config"
         | "get_node_state"
         | "get_node_status"
+        | "list_tenant_nodes"
         | "remove_hive"
+        | "core_rollback"
         | "add_hive" => "SY.orchestrator",
         _ => "SY.config.routes",
     };
@@ -12927,15 +15233,29 @@ fn env_timeout_secs(name: &str) -> Option<u64> {
 
 fn admin_action_timeout(action: &str) -> Duration {
     match action {
-        // add_hive runs remote bootstrap + WAN wait and is expected to be long.
+        // add_hive now ACCEPTS and returns (PB-7): the join runs in the orchestrator's
+        // background, so this window covers only validation + the accept write, not the
+        // multi-minute bootstrap. The old 180 s was a contract the real join always blew
+        // through — it produced TIMEOUT on operations that were still running and usually
+        // succeeded. `JSR_ADMIN_ADD_HIVE_TIMEOUT_SECS` still overrides, for a loaded box.
         "add_hive" => {
-            Duration::from_secs(env_timeout_secs("JSR_ADMIN_ADD_HIVE_TIMEOUT_SECS").unwrap_or(180))
+            Duration::from_secs(env_timeout_secs("JSR_ADMIN_ADD_HIVE_TIMEOUT_SECS").unwrap_or(30))
         }
         "update" => {
             Duration::from_secs(env_timeout_secs("JSR_ADMIN_UPDATE_TIMEOUT_SECS").unwrap_or(60))
         }
         "sync_hint" => {
             Duration::from_secs(env_timeout_secs("JSR_ADMIN_SYNC_HINT_TIMEOUT_SECS").unwrap_or(45))
+        }
+        // Restores binaries and then restarts up to 8 services behind a 30 s health gate each.
+        // Deliberately generous: if this window is shorter than the work, the caller gets an
+        // outer TIMEOUT instead of the inner layer's real error (the U-8b shape).
+        "core_rollback" => Duration::from_secs(
+            env_timeout_secs("JSR_ADMIN_CORE_ROLLBACK_TIMEOUT_SECS").unwrap_or(300),
+        ),
+        // SY.storage answers one usage query at a time, each under a 15 s statement timeout.
+        "get_llm_usage" => {
+            Duration::from_secs(env_timeout_secs("JSR_ADMIN_USAGE_TIMEOUT_SECS").unwrap_or(20))
         }
         "list_admin_actions"
         | "get_admin_action_help"
@@ -12945,7 +15265,8 @@ fn admin_action_timeout(action: &str) -> Duration {
         | "timer_now_in"
         | "timer_convert"
         | "timer_parse"
-        | "timer_format" => {
+        | "timer_format"
+        | "list_streams" => {
             Duration::from_secs(env_timeout_secs("JSR_ADMIN_TIMEOUT_SECS").unwrap_or(5))
         }
         _ => Duration::from_secs(env_timeout_secs("JSR_ADMIN_ORCH_TIMEOUT_SECS").unwrap_or(30)),
@@ -12963,15 +15284,15 @@ fn build_admin_http_response(
                 .and_then(|value| value.as_str())
                 .unwrap_or("ok");
             if payload_is_ok(&payload) {
-                let http_status = if status.eq_ignore_ascii_case("sync_pending") {
-                    202
-                } else {
-                    200
-                };
+                // 202 = taken but not finished. `sync_pending` and `accepted` (a backgrounded
+                // add_hive, PB-7) are both "come back and check", not "done".
+                let deferred = status.eq_ignore_ascii_case("sync_pending")
+                    || status.eq_ignore_ascii_case("accepted");
+                let http_status = if deferred { 202 } else { 200 };
                 return (
                     http_status,
                     serde_json::json!({
-                        "status": if status.eq_ignore_ascii_case("sync_pending") { "sync_pending" } else { "ok" },
+                        "status": if deferred { status } else { "ok" },
                         "action": action,
                         "payload": payload,
                         "error_code": serde_json::Value::Null,
@@ -13016,14 +15337,11 @@ fn build_admin_http_response(
     }
 }
 
-fn extract_hive_from_target(target: &str) -> Option<String> {
-    target.split_once('@').map(|(_, hive)| hive.to_string())
-}
-
 fn action_routes_via_local_orchestrator(action: &str) -> bool {
     matches!(
         action,
         "list_nodes"
+            | "list_tenant_nodes"
             | "run_node"
             | "start_node"
             | "restart_node"
@@ -13036,6 +15354,7 @@ fn action_routes_via_local_orchestrator(action: &str) -> bool {
             | "get_hive"
             | "list_versions"
             | "get_versions"
+            | "core_rollback"
             | "list_runtimes"
             | "get_runtime"
             | "remove_runtime_version"
@@ -13155,59 +15474,6 @@ fn admin_payload_contract_error(action: &str, payload: &serde_json::Value) -> Op
     })
 }
 
-async fn broadcast_full_config(
-    ctx: &AdminContext,
-    client: &RouterDispatcher,
-    action: &str,
-    target_hive: Option<&str>,
-) -> Result<(), AdminError> {
-    let (list_action, item_key, subsystem) = config_domain_for_mutation(action)
-        .ok_or_else(|| format!("unsupported config mutation action '{action}'"))?;
-    let list_req = build_admin_request(
-        ctx,
-        list_action,
-        serde_json::json!({}),
-        target_hive.map(|s| s.to_string()),
-    );
-    let response = send_admin_request(
-        client,
-        list_req,
-        admin_action_timeout(list_action),
-        &admin_node_name(&ctx.hive_id),
-    )
-    .await?;
-    let payload = response
-        .get("status")
-        .and_then(|v| v.as_str())
-        .filter(|v| *v == "ok")
-        .and_then(|_| list_config_items_payload(&response, item_key))
-        .ok_or_else(|| format!("list response missing {item_key}"))?;
-    let config = serde_json::json!({ item_key: payload });
-
-    let version = next_config_changed_version(&ctx.state_dir, subsystem, None)?;
-    broadcast_config_changed(client, subsystem, None, None, version, config, None).await?;
-    Ok(())
-}
-
-fn config_domain_for_mutation(action: &str) -> Option<(&'static str, &'static str, &'static str)> {
-    match action {
-        "add_route" | "delete_route" => Some(("list_routes", "routes", "routes")),
-        "add_vpn" | "delete_vpn" => Some(("list_vpns", "vpns", "vpn")),
-        "add_tap" | "delete_tap" => Some(("list_taps", "taps", "taps")),
-        _ => None,
-    }
-}
-
-fn list_config_items_payload<'a>(
-    response: &'a serde_json::Value,
-    item_key: &str,
-) -> Option<&'a serde_json::Value> {
-    response
-        .get("payload")
-        .and_then(|payload| payload.get(item_key))
-        .or_else(|| response.get(item_key))
-}
-
 async fn send_opa_action(
     ctx: &AdminContext,
     client: &RouterDispatcher,
@@ -13216,7 +15482,6 @@ async fn send_opa_action(
     rego: Option<String>,
     entrypoint: Option<String>,
     auto_apply: Option<bool>,
-    target: Option<String>,
 ) -> Result<Vec<OpaResponseEntry>, AdminError> {
     let mut cfg = serde_json::json!({});
     if let Some(rego) = rego {
@@ -13225,22 +15490,64 @@ async fn send_opa_action(
             "entrypoint": entrypoint.unwrap_or_else(|| "router/target".to_string()),
         });
     }
-    let expected = expected_hive_sets(ctx, target.as_deref()).effective;
+    let expected = expected_hive_sets(ctx, Some(PRIMARY_HIVE_ID)).effective;
     let mut receiver = client.subscribe(RPC_BC_CONFIG_RESPONSE)?;
 
-    broadcast_config_changed(
-        client,
-        "opa",
-        Some(action.to_string()),
-        auto_apply,
-        version,
-        cfg,
-        target.clone(),
-    )
-    .await?;
+    send_opa_config_changed(client, action, auto_apply, version, cfg).await?;
 
-    let responses = collect_opa_responses(&mut receiver, action, version, &expected).await;
+    let responses = collect_opa_responses(
+        &mut receiver,
+        action,
+        version,
+        None,
+        &expected,
+        Duration::from_secs(OPA_PRIMARY_WAIT_SECS),
+    )
+    .await;
     Ok(responses)
+}
+
+/// Announce a newly published user policy to every hive's SY.opa.rules — one broadcast that only
+/// they receive (meta.target). Each answers once it runs `hash` ("" = no user policy).
+async fn send_opa_sync_notice(
+    client: &RouterDispatcher,
+    version: u64,
+    hash: &str,
+) -> Result<(), AdminError> {
+    let sender = client.sender_snapshot();
+    let msg = opa_sync_notice(&sender.uuid().to_string(), version, hash)?;
+    sender.send(msg).await?;
+    tracing::info!(version, hash, "opa sync notice sent to every hive");
+    Ok(())
+}
+
+/// The notice every hive's SY.opa.rules acts on: a contract with the Go side, pinned by
+/// `go/sy-opa-rules/testdata/opa_sync_notice.json` (both suites read it).
+fn opa_sync_notice(src: &str, version: u64, hash: &str) -> Result<Message, AdminError> {
+    Ok(Message {
+        routing: Routing {
+            src: src.to_string(),
+            src_l2_name: None,
+            dst: Destination::Broadcast,
+            ttl: 16,
+            trace_id: Uuid::new_v4().to_string(),
+        },
+        meta: Meta {
+            msg_type: SYSTEM_KIND.to_string(),
+            msg: Some(MSG_CONFIG_CHANGED.to_string()),
+            scope: Some(SCOPE_GLOBAL.to_string()),
+            target: Some("SY.opa.rules@*".to_string()),
+            ..Meta::default()
+        },
+        payload: serde_json::to_value(ConfigChangedPayload {
+            subsystem: "opa".to_string(),
+            action: Some("sync".to_string()),
+            auto_apply: None,
+            version,
+            config: serde_json::json!({ "hash": hash }),
+            hive: None,
+        })?,
+    })
 }
 
 async fn send_opa_query(
@@ -13384,15 +15691,21 @@ fn expected_hive_sets(ctx: &AdminContext, target: Option<&str>) -> OpaExpectedHi
     }
 }
 
+/// Collects SY.opa.rules answers for `action`/`version` until every expected hive answered or
+/// `wait` passed. The hive is the one the router stamped on the sender (`SY.opa.rules@<hive>`),
+/// never the payload's own claim. With `hash`, only answers reporting that policy count — a late
+/// answer to an earlier notice of the same version (clear and rollback are both version 0) does not.
 async fn collect_opa_responses(
     receiver: &mut broadcast::Receiver<Message>,
     action: &str,
     version: u64,
+    hash: Option<&str>,
     expected: &[String],
+    wait: Duration,
 ) -> Vec<OpaResponseEntry> {
     use tokio::time::{timeout, Instant};
 
-    let deadline = Instant::now() + Duration::from_secs(30);
+    let deadline = Instant::now() + wait;
     let mut responses: HashMap<String, OpaResponseEntry> = HashMap::new();
 
     while responses.len() < expected.len() && Instant::now() < deadline {
@@ -13425,10 +15738,20 @@ async fn collect_opa_responses(
         if payload.version.unwrap_or(version) != version {
             continue;
         }
-        let hive = payload
-            .hive
-            .clone()
-            .unwrap_or_else(|| "unknown".to_string());
+        let Some(hive) = msg
+            .routing
+            .src_l2_name
+            .as_deref()
+            .and_then(|name| name.strip_prefix("SY.opa.rules@"))
+            .map(str::to_string)
+        else {
+            continue;
+        };
+        if let Some(hash) = hash {
+            if payload.hash.as_deref().unwrap_or("") != hash {
+                continue;
+            }
+        }
         let entry = OpaResponseEntry {
             hive: hive.clone(),
             status: payload.status.unwrap_or_else(|| "error".to_string()),
@@ -13560,7 +15883,7 @@ fn build_opa_http_response(
     let body = serde_json::json!({
         "status": if status == 200 { "ok" } else { "error" },
         "version": version,
-        "action": action.as_str(),
+        "action": action.write_name(),
         "check_only": action.check_only(),
         "responses": responses,
         "pending": pending,
@@ -13651,21 +15974,736 @@ fn build_opa_query_response(
 mod tests {
     use super::*;
     use serde_json::{json, Value};
+
+    /// A tap deleted with `@` sent as `%40` (as Python's urlencode sends it) matches the same tap;
+    /// `+` and a stray `%` stay as they are.
+    #[test]
+    fn query_parameters_are_percent_decoded() {
+        let params = parse_query(
+            "match_src=IO.a%40motherbee&target=IO.c@motherbee&tz=Etc/GMT+3&odd=50%&k%65y=v",
+        );
+        assert_eq!(params["match_src"], "IO.a@motherbee");
+        assert_eq!(params["target"], "IO.c@motherbee");
+        assert_eq!(params["tz"], "Etc/GMT+3");
+        assert_eq!(params["odd"], "50%");
+        assert_eq!(params["key"], "v");
+    }
+
+    #[test]
+    fn unknown_route_uses_the_family_envelope() {
+        let (status, body) = admin_unknown_route_response("GET", "/nope");
+        let parsed: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(status, 404);
+        assert_eq!(parsed["error_code"], "UNKNOWN_ROUTE");
+        assert_eq!(parsed["status"], "error");
+        // The whole point: a client reading error_code no longer gets null.
+        assert!(parsed.get("error_code").is_some_and(|v| !v.is_null()));
+        assert_eq!(parsed["see"], "GET /admin/actions");
+        // And the old bare shape is gone.
+        assert!(parsed.get("error").is_none());
+    }
+
+    #[test]
+    fn wrong_method_on_a_real_route_is_405_not_404() {
+        // `/hives` exists for GET (list_hives) and POST (add_hive); PUT does not.
+        // Answering "not found" here told the operator a route that exists does not.
+        let (status, body) = admin_unknown_route_response("PUT", "/hives");
+        let parsed: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(status, 405);
+        assert_eq!(parsed["error_code"], "METHOD_NOT_ALLOWED");
+        assert_eq!(parsed["allowed_methods"], json!(["GET", "POST"]));
+
+        // A path with a placeholder segment resolves too: GET is list_nodes and POST is
+        // run_node, so DELETE is the only verb missing.
+        let (status, body) = admin_unknown_route_response("DELETE", "/hives/motherbee/nodes");
+        let parsed: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(status, 405);
+        assert_eq!(parsed["allowed_methods"], json!(["GET", "POST"]));
+    }
+
+    #[test]
+    fn placeholder_segments_match_and_do_not_over_match() {
+        assert!(admin_route_pattern_matches("/hives/{hive}", "/hives/motherbee"));
+        assert!(!admin_route_pattern_matches("/hives/{hive}", "/hives"));
+        assert!(!admin_route_pattern_matches(
+            "/hives/{hive}",
+            "/hives/motherbee/nodes"
+        ));
+        // A concrete segment must still match exactly.
+        assert!(!admin_route_pattern_matches("/hive/status", "/hive/health"));
+    }
+
+    #[test]
+    fn channel_routes_missing_from_the_registry_are_still_known() {
+        // These have REST routes but no INTERNAL_ACTION_REGISTRY entry, so deriving the
+        // table from the catalog alone would miss them.
+        let (status, _) = admin_unknown_route_response("GET", "/channels/externalize");
+        assert_eq!(status, 405);
+    }
+
+    #[test]
+    fn echoed_path_is_bounded_and_stripped_of_control_characters() {
+        let (_, body) = admin_unknown_route_response("GET", "/a\nb\u{0}c");
+        let parsed: Value = serde_json::from_str(&body).unwrap();
+        let detail = parsed["error_detail"].as_str().unwrap();
+        assert!(!detail.contains('\n') && !detail.contains('\u{0}'));
+
+        let long_path = format!("/{}", "x".repeat(4000));
+        let (_, body) = admin_unknown_route_response("GET", &long_path);
+        let parsed: Value = serde_json::from_str(&body).unwrap();
+        assert!(parsed["error_detail"].as_str().unwrap().len() < 400);
+    }
+
+    #[test]
+    fn fanout_family_glob_validation() {
+        // valid: IO.-prefixed, hive-qualified, an actual glob
+        assert!(validate_fanout_family_glob("IO.wapp.*@motherbee").is_ok());
+        assert!(validate_fanout_family_glob(" IO.wapp.*@motherbee ").is_ok());
+        // not IO.* -> rejected (frontier only fans to IO nodes)
+        assert!(validate_fanout_family_glob("AI.wapp.*@motherbee").is_err());
+        // not hive-qualified -> rejected
+        assert!(validate_fanout_family_glob("IO.wapp.*").is_err());
+        // glob-free literal -> rejected (that's a unicast in disguise; use plain externalize)
+        assert!(validate_fanout_family_glob("IO.wapp@motherbee").is_err());
+    }
     use std::io::Write;
     use std::time::{SystemTime, UNIX_EPOCH};
     use tokio::sync::broadcast;
     use zip::write::FileOptions;
 
     #[test]
+    fn cloud_relay_gate_lets_every_orchestrator_mark_node_ilks_for_teardown() {
+        for caller in ["SY.orchestrator@motherbee", "SY.orchestrator@worker1"] {
+            // The node's ILK and the secrets it owns (purge_vault_secrets_for_ilk).
+            for teardown in ["delete_ilk", "vault_list", "vault_delete"] {
+                assert!(
+                    authorize_cloud_relay(Some(caller), teardown, "motherbee").is_ok(),
+                    "{caller} {teardown}"
+                );
+            }
+            // ...but nothing else from the Cloud surface
+            for other in [
+                "delete_tenant",
+                "create_tenant",
+                "vault_put",
+                "update_tenant",
+                "run_node",
+            ] {
+                assert!(
+                    authorize_cloud_relay(Some(caller), other, "motherbee").is_err(),
+                    "{caller} {other}"
+                );
+            }
+        }
+        assert!(
+            authorize_cloud_relay(Some("AI.chat@motherbee"), "delete_ilk", "motherbee").is_err()
+        );
+        assert!(
+            authorize_cloud_relay(Some("AI.chat@motherbee"), "vault_delete", "motherbee").is_err()
+        );
+    }
+
+    #[test]
+    fn cloud_relay_gate_keeps_archi_actions_on_the_cloud_surface() {
+        // Archi's commands reach admin over the mesh: putting an action on the Cloud surface must
+        // not take it from Archi (vault_list and update_tenant were Archi's before 2026-10-13).
+        for action in IO_CLOUD_EXPOSED_ACTIONS {
+            assert!(
+                authorize_cloud_relay(Some("SY.architect@motherbee"), action, "motherbee").is_ok(),
+                "{action}"
+            );
+            // Only the admin hive's Archi, but for what Cloud shares with every mesh caller.
+            if !CLOUD_SHARED_ACTIONS.contains(action) {
+                assert!(
+                    authorize_cloud_relay(Some("SY.architect@worker1"), action, "motherbee")
+                        .is_err(),
+                    "{action}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn cloud_relay_lifecycle_requires_the_claimed_tenant_server_side() {
+        let relay = Some("IO.cloud@motherbee");
+        let ilk = serde_json::json!({"ilk_id": "ilk:22222222-2222-4222-8222-222222222222"});
+        // A tenant's own lifecycle names the claimed tenant.
+        for action in ["delete_tenant", "restore_tenant"] {
+            assert!(
+                enforce_cloud_relay_content(relay, action, "motherbee", &ilk).is_err(),
+                "{action} without tenant_id must be refused for IO.cloud"
+            );
+        }
+        // An account is not tenant-scoped, but Cloud deletes and restores people only.
+        for action in ["delete_ilk", "restore_ilk"] {
+            assert!(
+                enforce_cloud_relay_content(relay, action, "motherbee", &ilk).is_err(),
+                "{action}"
+            );
+            let people = serde_json::json!({
+                "ilk_id": "ilk:22222222-2222-4222-8222-222222222222",
+                "ilk_type": "human",
+            });
+            assert!(
+                enforce_cloud_relay_content(relay, action, "motherbee", &people).is_ok(),
+                "{action}"
+            );
+            let agent = serde_json::json!({
+                "ilk_id": "ilk:22222222-2222-4222-8222-222222222222",
+                "ilk_type": "agent",
+            });
+            assert!(
+                enforce_cloud_relay_content(relay, action, "motherbee", &agent).is_err(),
+                "{action}"
+            );
+        }
+        // Reads by id are not tenant-filtered.
+        assert!(enforce_cloud_relay_content(relay, "get_ilk", "motherbee", &ilk).is_ok());
+        // the operator (caller None) is not scoped
+        assert!(enforce_cloud_relay_content(None, "delete_ilk", "motherbee", &ilk).is_ok());
+    }
+
+    #[test]
+    fn cloud_relay_assigns_a_credential_of_its_own_tenant_only() {
+        let relay = Some("IO.cloud@motherbee");
+        let t = "tnt:11111111-1111-4111-8111-111111111111";
+        let assign = |tenant: &str, key: &str| serde_json::json!({"key": key, "tenant_id": tenant, "assigned_nodes": ["IO.slack.s@motherbee"]});
+        assert!(enforce_cloud_relay_content(
+            relay,
+            "vault_assign",
+            "motherbee",
+            &assign(t, "slack:t:bot")
+        )
+        .is_ok());
+        // Never the root tenant, never an infrastructure key, nothing else in the request.
+        assert!(enforce_cloud_relay_content(
+            relay,
+            "vault_assign",
+            "motherbee",
+            &assign(fluxbee_sdk::DEFAULT_ROOT_TENANT_ID, "slack:t:bot")
+        )
+        .is_err());
+        assert!(enforce_cloud_relay_content(
+            relay,
+            "vault_assign",
+            "motherbee",
+            &assign(
+                t,
+                "edge_channel_secret:ich:00000000-0000-0000-0000-000000000000"
+            )
+        )
+        .is_err());
+        let mut extra = assign(t, "slack:t:bot");
+        extra["metadata"] = serde_json::json!({"ilk": "ilk:victim"});
+        assert!(enforce_cloud_relay_content(relay, "vault_assign", "motherbee", &extra).is_err());
+    }
+
+    #[test]
+    fn assigned_nodes_are_nodes_of_the_secrets_tenant() {
+        let t = "tnt:11111111-1111-4111-8111-111111111111";
+        let other = "tnt:22222222-2222-4222-8222-222222222222";
+        let ilk = |id: &str, kind: &str, tenant: &str, node: Option<&str>| {
+            fluxbee_sdk::identity::IdentityIlkOption {
+                ilk_id: id.to_string(),
+                tenant_id: tenant.to_string(),
+                display_name: None,
+                handler_node: node.map(str::to_string),
+                registration_status: "complete".to_string(),
+                ilk_type: kind.to_string(),
+                role_hash: None,
+                skill_hashes: Vec::new(),
+                handbook_hashes: Vec::new(),
+                personality_hash: None,
+            }
+        };
+        let known = vec![
+            ilk("ilk:sales", "agent", t, Some("IO.slack.sales@motherbee")),
+            ilk(
+                "ilk:support",
+                "agent",
+                t,
+                Some("IO.slack.support@motherbee"),
+            ),
+            ilk(
+                "ilk:theirs",
+                "agent",
+                other,
+                Some("IO.slack.theirs@motherbee"),
+            ),
+            ilk("ilk:person", "human", t, None),
+        ];
+        let strings = |items: &[&str]| items.iter().map(|v| v.to_string()).collect::<Vec<_>>();
+        // Names (with or without the hive) and ids, sorted and deduplicated.
+        assert_eq!(
+            check_assigned_ilks(
+                &known,
+                "motherbee",
+                &t.to_ascii_uppercase().replace("TNT:", "tnt:"),
+                &strings(&["IO.slack.support", "IO.slack.sales@motherbee"]),
+                &strings(&["ilk:sales"]),
+            )
+            .unwrap(),
+            vec!["ilk:sales", "ilk:support"]
+        );
+        // Another tenant's node, a person, an unknown name or id: refused.
+        for (nodes, ilks) in [
+            (strings(&["IO.slack.theirs@motherbee"]), Vec::new()),
+            (Vec::new(), strings(&["ilk:theirs"])),
+            (Vec::new(), strings(&["ilk:person"])),
+            (strings(&["IO.slack.nobody@motherbee"]), Vec::new()),
+            (Vec::new(), strings(&["ilk:nobody"])),
+        ] {
+            assert!(
+                check_assigned_ilks(&known, "motherbee", t, &nodes, &ilks).is_err(),
+                "{nodes:?} {ilks:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn assigned_lists_take_strings_only() {
+        assert_eq!(string_list(None, "x").unwrap(), Vec::<String>::new());
+        assert_eq!(
+            string_list(Some(serde_json::json!([" a ", "b"])), "x").unwrap(),
+            vec!["a".to_string(), "b".to_string()]
+        );
+        assert!(string_list(Some(serde_json::json!("a")), "x").is_err());
+        assert!(string_list(Some(serde_json::json!(["a", 3])), "x").is_err());
+        assert!(string_list(Some(serde_json::json!([""])), "x").is_err());
+    }
+
+    #[test]
+    fn cloud_relay_set_ilk_tenant_names_the_target_and_admin_stamps_who_for() {
+        let relay = Some("IO.cloud@motherbee");
+        let t = "tnt:11111111-1111-4111-8111-111111111111";
+        let set = |tenant: &str| serde_json::json!({"ilk_id":"ilk:22222222-2222-4222-8222-222222222222","tenant_id":tenant});
+        assert!(enforce_cloud_relay_content(relay, "set_ilk_tenant", "motherbee", &set(t)).is_ok());
+        assert!(enforce_cloud_relay_content(
+            relay,
+            "set_ilk_tenant",
+            "motherbee",
+            &set(fluxbee_sdk::DEFAULT_ROOT_TENANT_ID)
+        )
+        .is_err());
+        let mut extra = set(t);
+        extra["status"] = serde_json::json!("x");
+        assert!(enforce_cloud_relay_content(relay, "set_ilk_tenant", "motherbee", &extra).is_err());
+        // Who it is for is the router-stamped caller, whatever the params claim; the executor for
+        // an internal plan. Other actions are left alone.
+        let mut forged = set(t);
+        forged["on_behalf_of"] = serde_json::json!("operator");
+        assert_eq!(
+            stamp_relay_facts("set_ilk_tenant", forged.clone(), relay, "motherbee")["on_behalf_of"],
+            "IO.cloud@motherbee"
+        );
+        assert_eq!(
+            stamp_relay_facts("set_ilk_tenant", set(t), None, "motherbee")["on_behalf_of"],
+            "executor"
+        );
+        assert_eq!(
+            stamp_relay_facts("get_ilk", forged.clone(), relay, "motherbee"),
+            forged
+        );
+    }
+
+    /// Stage 4 (docs/ilk-tenant-model-v1.md §2.4): who launched a node is stamped from the
+    /// router-stamped caller, never the params; the Cloud relay's node actions carry the
+    /// requirement that the hive holding the node checks.
+    #[test]
+    fn the_relay_facts_come_from_the_caller() {
+        let relay = Some("IO.cloud@motherbee");
+        let t = "tnt:11111111-1111-4111-8111-111111111111";
+        let forged =
+            serde_json::json!({"node_name": "IO.slack.a@motherbee", "launched_by": "archi"});
+        for (caller, expected) in [
+            (relay, "cloud"),
+            (Some("SY.architect@motherbee"), "archi"),
+            (None, "operator"),
+            (Some("AI.chat@motherbee"), "AI.chat@motherbee"),
+            // SY.wf-rules carries the launcher the admin stamped on the workflow deploy.
+            (Some("SY.wf-rules@motherbee"), "archi"),
+        ] {
+            assert_eq!(
+                stamp_relay_facts("run_node", forged.clone(), caller, "motherbee")["launched_by"],
+                expected
+            );
+        }
+        // …but only `operator` or `archi`, the two the admin stamps on a workflow deploy; anything
+        // else, `cloud` above all, is recorded as SY.wf-rules.
+        for carried in [
+            serde_json::json!({"launched_by": "cloud"}),
+            serde_json::json!({"launched_by": "WF.admin.internal.diag@motherbee"}),
+            serde_json::json!({"launched_by": "system"}),
+            serde_json::json!({"launched_by": ""}),
+            serde_json::json!({}),
+        ] {
+            assert_eq!(
+                stamp_relay_facts(
+                    "run_node",
+                    carried,
+                    Some("SY.wf-rules@worker1"),
+                    "motherbee"
+                )["launched_by"],
+                "SY.wf-rules@worker1"
+            );
+        }
+        let node = serde_json::json!({"node_name": "IO.slack.a@motherbee", "tenant_id": t});
+        for action in ["start_node", "kill_node"] {
+            let stamped = stamp_relay_facts(action, node.clone(), relay, "motherbee");
+            assert_eq!(stamped["require_tenant_id"], t);
+            assert_eq!(stamped["require_launched_by"], "cloud");
+            assert!(stamped.get("tenant_id").is_none());
+            // Anyone else's node actions are left as they come.
+            assert_eq!(
+                stamp_relay_facts(
+                    action,
+                    node.clone(),
+                    Some("SY.architect@motherbee"),
+                    "motherbee"
+                ),
+                node
+            );
+        }
+        let status = stamp_relay_facts("get_node_status", node.clone(), relay, "motherbee");
+        assert_eq!(status["require_tenant_id"], t);
+        assert!(status.get("require_launched_by").is_none());
+        let tenants = stamp_relay_facts("list_tenants", serde_json::json!({}), relay, "motherbee");
+        assert_eq!(
+            tenants,
+            serde_json::json!({"include_deleted": true, "exclude_root": true})
+        );
+    }
+
+    #[test]
+    fn cloud_relay_content_for_the_stage_four_actions() {
+        let relay = Some("IO.cloud@motherbee");
+        let t = "tnt:11111111-1111-4111-8111-111111111111";
+        let root = fluxbee_sdk::DEFAULT_ROOT_TENANT_ID;
+        let check = |action: &str, params: serde_json::Value| {
+            enforce_cloud_relay_content(relay, action, "motherbee", &params)
+        };
+        // The whole tenant but pending, a root sponsor or an unknown field.
+        assert!(check(
+            "update_tenant",
+            serde_json::json!({"tenant_id": t, "status": "suspended", "settings": {}, "sponsor_tenant_id": null})
+        )
+        .is_ok());
+        for bad in [
+            serde_json::json!({"tenant_id": t, "status": "pending"}),
+            serde_json::json!({"tenant_id": t, "sponsor_tenant_id": root}),
+            serde_json::json!({"tenant_id": t, "settings": "x"}),
+            serde_json::json!({"tenant_id": t, "approved_by": "x"}),
+            serde_json::json!({"tenant_id": root, "name": "x"}),
+        ] {
+            assert!(check("update_tenant", bad.clone()).is_err(), "{bad}");
+        }
+        assert!(check("get_tenant", serde_json::json!({"tenant_id": t})).is_ok());
+        assert!(check("get_tenant", serde_json::json!({"tenant_id": root})).is_err());
+        assert!(check("list_tenant_nodes", serde_json::json!({"tenant_id": t})).is_ok());
+        assert!(check("list_tenants", serde_json::json!({})).is_ok());
+        assert!(check("list_tenants", serde_json::json!({"exclude_root": false})).is_err());
+        // Node actions: an IO.* node of the claimed tenant; a kill may purge.
+        let node = |name: &str| serde_json::json!({"tenant_id": t, "node_name": name});
+        for action in ["get_node_status", "start_node", "kill_node"] {
+            assert!(
+                check(action, node("IO.slack.a@motherbee")).is_ok(),
+                "{action}"
+            );
+            assert!(check(action, node("AI.x@motherbee")).is_err(), "{action}");
+            assert!(check(
+                action,
+                serde_json::json!({"node_name": "IO.slack.a@motherbee"})
+            )
+            .is_err());
+        }
+        let mut purge = node("IO.slack.a@motherbee");
+        purge["purge_instance"] = serde_json::json!(true);
+        assert!(check("kill_node", purge.clone()).is_ok());
+        assert!(check("start_node", purge).is_err());
+        let mut planted = node("IO.slack.a@motherbee");
+        planted["require_launched_by"] = serde_json::json!("archi");
+        assert!(check("kill_node", planted).is_err());
+    }
+
+    /// Every mesh command runs in its own task (A-68): a handler that calls this admin back — a
+    /// node teardown, SY.wf-rules publishing and launching a workflow, an executor plan — must
+    /// never wait behind its own caller (Cloud's delete_node in the 0.1.68 gate; every workflow
+    /// deploy from Archi before 0.1.70).
+    #[test]
+    fn every_mesh_command_runs_off_the_loop() {
+        let source = include_str!("sy_admin.rs");
+        let start = source
+            .find("async fn run_internal_admin_loop(")
+            .expect("the mesh loop");
+        let body = &source[start..start + source[start..].find("\n}\n").expect("loop end")];
+        let spawn = body
+            .find("tokio::spawn")
+            .expect("the loop spawns each command");
+        assert_eq!(body.matches("handle_internal_admin_command(").count(), 1);
+        assert!(
+            body.find("handle_internal_admin_command(")
+                .expect("the handler")
+                > spawn
+        );
+    }
+
+    /// SY.wf-rules goes through the admin for its WF nodes, and only for the WF.* nodes of its own
+    /// hive (docs/wf-standard-path-v1.md).
+    #[test]
+    fn wf_rules_acts_only_on_the_wf_nodes_of_its_hive() {
+        let node = |name: &str| serde_json::json!({ "node_name": name });
+        for action in WF_RULES_NODE_ACTIONS {
+            for caller in ["SY.wf-rules@motherbee", "SY.wf-rules@worker1"] {
+                let hive = caller.trim_start_matches(WF_RULES_ROLE_PREFIX);
+                let mut own = node(&format!("WF.invoice@{hive}"));
+                if *action == "run_node" {
+                    own["runtime"] = serde_json::json!("wf.invoice");
+                }
+                assert!(
+                    authorize_wf_rules_caller(Some(caller), action, Some(hive), &own).is_ok(),
+                    "{caller} {action} on its own WF node"
+                );
+                assert!(authorize_wf_rules_caller(Some(caller), action, None, &own).is_ok());
+                for (target, params) in [
+                    (Some(hive), node(&format!("IO.slack.a@{hive}"))),
+                    (Some(hive), node(&format!("AI.chat@{hive}"))),
+                    (Some(hive), node(&format!("SY.admin@{hive}"))),
+                    (Some(hive), node(&format!("WF.@{hive}"))),
+                    (Some("elsewhere"), own.clone()),
+                    (None, node("WF.invoice@elsewhere")),
+                    (Some(hive), node("WF.invoice")),
+                    (Some(hive), serde_json::json!({})),
+                    (
+                        None,
+                        serde_json::json!({"node_name": format!("WF.invoice@{hive}"), "target": "elsewhere"}),
+                    ),
+                ] {
+                    assert!(
+                        authorize_wf_rules_caller(Some(caller), action, target, &params).is_err(),
+                        "{caller} {action} {target:?} {params}"
+                    );
+                }
+            }
+        }
+        // What it binds or launches is the node's own workflow package, on the WF engine.
+        let caller = Some("SY.wf-rules@worker1");
+        let package = format!("{DIST_RUNTIME_ROOT_DIR}/wf.invoice/3");
+        let launch = |runtime: &str| serde_json::json!({"node_name": "WF.invoice@worker1", "runtime": runtime, "runtime_version": "3"});
+        assert!(authorize_wf_rules_caller(
+            caller,
+            "run_node",
+            Some("worker1"),
+            &launch("wf.invoice")
+        )
+        .is_ok());
+        for runtime in ["io.slack", "wf.other", "ai.generic", "wf.engine"] {
+            assert!(
+                authorize_wf_rules_caller(caller, "run_node", Some("worker1"), &launch(runtime))
+                    .is_err(),
+                "{runtime}"
+            );
+        }
+        assert!(authorize_wf_rules_caller(
+            caller,
+            "run_node",
+            Some("worker1"),
+            &serde_json::json!({"node_name": "WF.invoice@worker1"})
+        )
+        .is_err());
+        let rebind = |base: &str, path: &str| {
+            serde_json::json!({
+                "node_name": "WF.invoice@worker1",
+                "config": {},
+                "runtime": "wf.invoice",
+                "runtime_version": "3",
+                "runtime_base": base,
+                "package_path": path,
+            })
+        };
+        assert!(authorize_wf_rules_caller(
+            caller,
+            "set_node_config",
+            Some("worker1"),
+            &rebind("wf.engine", &package)
+        )
+        .is_ok());
+        for (base, path) in [
+            ("io.cloud", package.clone()),
+            ("wf.engine", format!("{DIST_RUNTIME_ROOT_DIR}/io.slack/1")),
+            (
+                "wf.engine",
+                format!("{DIST_RUNTIME_ROOT_DIR}/wf.invoice/../io.slack/1"),
+            ),
+            ("wf.engine", "/tmp/wf.invoice/3".to_string()),
+        ] {
+            assert!(
+                authorize_wf_rules_caller(
+                    caller,
+                    "set_node_config",
+                    Some("worker1"),
+                    &rebind(base, &path)
+                )
+                .is_err(),
+                "{base} {path}"
+            );
+        }
+        // Its other actions, and every other caller, are other gates' business.
+        assert!(authorize_wf_rules_caller(
+            Some("SY.wf-rules@motherbee"),
+            "publish_runtime_package",
+            None,
+            &serde_json::json!({})
+        )
+        .is_ok());
+        for caller in [
+            None,
+            Some("SY.architect@motherbee"),
+            Some("IO.cloud@motherbee"),
+        ] {
+            assert!(authorize_wf_rules_caller(
+                caller,
+                "run_node",
+                None,
+                &node("IO.slack.a@motherbee")
+            )
+            .is_ok());
+        }
+        // The Cloud relay gate lets SY.wf-rules launch (bounded above), and nothing else of the
+        // Cloud surface.
+        for caller in ["SY.wf-rules@motherbee", "SY.wf-rules@worker1"] {
+            assert!(authorize_cloud_relay(Some(caller), "run_node", "motherbee").is_ok());
+            for cloud_only in ["vault_put", "create_tenant", "delete_ilk", "set_ilk_tenant"] {
+                assert!(
+                    authorize_cloud_relay(Some(caller), cloud_only, "motherbee").is_err(),
+                    "{caller} {cloud_only}"
+                );
+            }
+        }
+    }
+
+    /// A workflow deploy launches its node for whoever asked: the admin stamps the requester on
+    /// the wf_rules request, never what the request claims, and SY.wf-rules carries it.
+    #[test]
+    fn a_workflow_node_is_launched_for_whoever_asked_for_the_deploy() {
+        for (caller, expected) in [
+            (None, "operator"),
+            (Some("SY.architect@motherbee"), "archi"),
+            (Some("IO.cloud@motherbee"), "cloud"),
+            (
+                Some("WF.admin.internal.diag@motherbee"),
+                "WF.admin.internal.diag@motherbee",
+            ),
+        ] {
+            assert_eq!(launched_by_for_caller(caller, "motherbee"), expected);
+        }
+        let forged = serde_json::json!({"workflow_name": "invoice", "launched_by": "cloud"});
+        let config = wf_rules_operation_config(
+            forged.as_object().cloned().expect("object"),
+            "compile_apply",
+            "archi",
+        );
+        assert_eq!(config["launched_by"], "archi");
+        assert_eq!(config["operation"], "compile_apply");
+        assert_eq!(config["workflow_name"], "invoice");
+    }
+
+    #[test]
     fn cloud_relay_gate_allows_only_iocloud_over_mesh() {
-        // A non-exposed action is untouched regardless of caller.
+        // A non-exposed action is untouched for a NON-io.cloud caller.
         assert!(
             authorize_cloud_relay(Some("AI.worker@motherbee"), "list_nodes", "motherbee").is_ok()
         );
-        for action in IO_CLOUD_EXPOSED_ACTIONS {
+        // FIX-1 (HIGH): IO.cloud is DEFAULT-DENY beyond the exposed set — a compromised relay
+        // cannot be a confused deputy for these privileged actions. (delete_ilk left this list on
+        // 2026-09-28: it now only MARKS and is tenant-scoped; the physical purges stay denied.
+        // kill_node left it on 2026-10-15, D14: only for the IO nodes Cloud launched in its
+        // tenant, which stamp_relay_facts requires and the hive holding the node checks.)
+        for evil in [
+            "vault_get",
+            "vault_get_metadata",
+            "vault_rotate",
+            "vault_rollback",
+            "purge_ilk",
+            "purge_tenant",
+            "add_route",
+            "add_vpn",
+            "restart_node",
+            "remove_node_instance",
+            "add_hive",
+            "set_node_config",
+            "list_nodes",
+        ] {
+            assert!(
+                authorize_cloud_relay(Some("IO.cloud@motherbee"), evil, "motherbee").is_err(),
+                "IO.cloud must be denied non-exposed action '{evil}'"
+            );
+        }
+        // U-11: a channel command is NOT a relay — it is the node acting for ITSELF. The gate
+        // must let it reach `authorize_channel_command`, which enforces owner == caller. Without
+        // this, IO.cloud could not publish its own endpoint at boot and Fluxbee Cloud stayed
+        // unreachable until an operator externalized the channel by hand on every install.
+        for self_service in CHANNEL_SELF_SERVICE_ACTIONS {
+            assert!(
+                authorize_cloud_relay(Some("IO.cloud@motherbee"), self_service, "motherbee")
+                    .is_ok(),
+                "IO.cloud must reach the channel gate for its own '{self_service}'"
+            );
+        }
+        // …and letting them through must NOT have widened the relay: everything outside the
+        // allowlist plus the two channel commands is still denied. `list_nodes` above already
+        // covers a privileged read; these pin the boundary itself.
+        for still_denied in ["add_hive", "vault_get", "publish_artifact", "sync_hint"] {
+            assert!(
+                authorize_cloud_relay(Some("IO.cloud@motherbee"), still_denied, "motherbee")
+                    .is_err(),
+                "the channel exception must not open '{still_denied}'"
+            );
+        }
+        // The actions Cloud shares since stage 4 stay open to the other mesh callers, as before;
+        // the rest of the Cloud surface stays IO.cloud's.
+        for shared in CLOUD_SHARED_ACTIONS {
+            assert!(
+                authorize_cloud_relay(
+                    Some("WF.admin.internal.diag@motherbee"),
+                    shared,
+                    "motherbee"
+                )
+                .is_ok(),
+                "{shared} must stay open to the other mesh callers"
+            );
+            assert!(IO_CLOUD_EXPOSED_ACTIONS.contains(shared), "{shared}");
+        }
+        for cloud_only in [
+            "run_node",
+            "vault_put",
+            "create_tenant",
+            "update_tenant",
+            "delete_tenant",
+        ] {
+            assert!(
+                authorize_cloud_relay(
+                    Some("WF.admin.internal.diag@motherbee"),
+                    cloud_only,
+                    "motherbee"
+                )
+                .is_err(),
+                "{cloud_only}"
+            );
+        }
+        // A channel command from a NON-IO caller is not this gate's business (it has no relay
+        // privilege to contain) — `authorize_channel_command` rejects it downstream on the I1 rule.
+        assert!(
+            authorize_cloud_relay(Some("AI.worker@motherbee"), "externalize", "motherbee").is_ok()
+        );
+
+        // What Cloud shares with every mesh caller is checked above.
+        for action in IO_CLOUD_EXPOSED_ACTIONS
+            .iter()
+            .filter(|action| !CLOUD_SHARED_ACTIONS.contains(*action))
+        {
             // Trusted internal path (caller==None: HTTP operator / executor) — allowed.
             assert!(authorize_cloud_relay(None, action, "motherbee").is_ok());
-            // Over the mesh, ONLY the singleton IO.cloud in the admin's hive may relay it.
+            // Over the mesh, ONLY IO.cloud in the admin's hive may relay it.
             assert!(authorize_cloud_relay(Some("IO.cloud@motherbee"), action, "motherbee").is_ok());
             assert!(authorize_cloud_relay(Some("IO.cloud@worker1"), action, "motherbee").is_err());
             // Any other mesh caller is denied — this is the EDGE-06 close for the relay.
@@ -13675,29 +16713,550 @@ mod tests {
             assert!(
                 authorize_cloud_relay(Some("AI.worker@motherbee"), action, "motherbee").is_err()
             );
-            // The primary orchestrator may relay ONLY vault_put (per-spoke recovery key during
-            // add_hive); it is denied the other exposed actions (create_tenant / run_node).
-            if *action == "vault_put" {
-                assert!(authorize_cloud_relay(
-                    Some("SY.orchestrator@motherbee"),
-                    action,
-                    "motherbee"
-                )
-                .is_ok());
-            } else {
-                assert!(authorize_cloud_relay(
-                    Some("SY.orchestrator@motherbee"),
-                    action,
-                    "motherbee"
-                )
-                .is_err());
+            // An orchestrator only for its node teardown. Never vault_put: the per-spoke SSH
+            // recovery key it stored is gone with key_only_persist (D32).
+            for orchestrator in ["SY.orchestrator@motherbee", "SY.orchestrator@worker1"] {
+                assert_eq!(
+                    authorize_cloud_relay(Some(orchestrator), action, "motherbee").is_ok(),
+                    ORCHESTRATOR_TEARDOWN_ACTIONS.contains(action),
+                    "{orchestrator} on '{action}'"
+                );
             }
-            // A spoke orchestrator is never allowed, even for vault_put.
+        }
+    }
+
+    #[test]
+    fn cloud_relay_content_reenforced_server_side() {
+        let io = Some("IO.cloud@motherbee");
+        let t = "tnt:11111111-1111-4111-8111-111111111111";
+        let check = |action: &str, params: serde_json::Value| {
+            enforce_cloud_relay_content(io, action, "motherbee", &params)
+        };
+        // run_node: IO.* only, in the claimed tenant.
+        assert!(check(
+            "run_node",
+            serde_json::json!({"node_name":"IO.api.x@motherbee","tenant_id":t})
+        )
+        .is_ok());
+        assert!(check(
+            "run_node",
+            serde_json::json!({"node_name":"AI.worker@motherbee","tenant_id":t})
+        )
+        .is_err());
+        assert!(check(
+            "run_node",
+            serde_json::json!({"node_name":"IO.api.x@motherbee"})
+        )
+        .is_err());
+        // vault_put: no caller-set ownership-authority fields.
+        for bad in ["ilk", "owner_ilk", "owner_l2"] {
             assert!(
-                authorize_cloud_relay(Some("SY.orchestrator@worker1"), action, "motherbee")
-                    .is_err()
+                check(
+                    "vault_put",
+                    serde_json::json!({"key":"k","metadata":{"tenant_id":t,bad:"x"}})
+                )
+                .is_err(),
+                "vault_put must reject metadata.{bad} from io.cloud"
             );
         }
+        // owner_node must be IO.* (top-level or in metadata).
+        assert!(check("vault_put", serde_json::json!({"key":"k","metadata":{"tenant_id":t,"owner_node":"SY.identity@motherbee"}})).is_err());
+        assert!(check(
+            "vault_put",
+            serde_json::json!({"key":"k","owner_node":"AI.x@motherbee","metadata":{"tenant_id":t}})
+        )
+        .is_err());
+        // Reserved INFRA key namespaces (endpoint bearers, edge TLS, the retired spoke keys, fanout
+        // verify tokens): a Cloud relay stores and deletes provider tokens, never the keys that
+        // guard the mesh.
+        for reserved in [
+            "edge_channel_secret:ich:14b66389-d425-531c-a140-a591d25e8f39",
+            "edge_tls",
+            "edge_tls_fluxbee_ai",
+            "ssh:motherbee",
+            "edge_fanout_verify:ich:14b66389-d425-531c-a140-a591d25e8f39",
+        ] {
+            assert!(check("vault_put", serde_json::json!({"key":reserved,"metadata":{"tenant_id":t,"resource_type":"bearer_token"}})).is_err(),
+                "vault_put must reject reserved infra key {reserved} from io.cloud");
+            assert!(
+                check(
+                    "vault_delete",
+                    serde_json::json!({"key":reserved,"tenant_id":t})
+                )
+                .is_err(),
+                "vault_delete must reject reserved infra key {reserved} from io.cloud"
+            );
+        }
+        // Legit: clean metadata + IO.* owner_node + the claimed tenant is fine.
+        assert!(check("vault_put", serde_json::json!({"key":"slack:auth:bot","metadata":{"resource_type":"openai","tenant_id":t,"owner_node":"IO.api.x@motherbee"}})).is_ok());
+        // Not enforced for the operator path or other callers.
+        assert!(enforce_cloud_relay_content(None, "run_node", "motherbee",
+            &serde_json::json!({"node_name":"AI.worker@motherbee"})).is_ok());
+        assert!(enforce_cloud_relay_content(Some("SY.orchestrator@motherbee"), "vault_put", "motherbee",
+            &serde_json::json!({"metadata":{"ilk":"x"}})).is_ok());
+    }
+
+    #[test]
+    fn cloud_relay_every_tenant_action_names_the_claimed_tenant_never_the_root() {
+        let io = Some("IO.cloud@motherbee");
+        let t = "tnt:11111111-1111-4111-8111-111111111111";
+        let root = fluxbee_sdk::DEFAULT_ROOT_TENANT_ID;
+        // (action, params with the tenant set to TENANT)
+        type Shape = fn(&str) -> serde_json::Value;
+        let shapes: Vec<(&str, Shape)> = vec![
+            ("delete_tenant", |tn| serde_json::json!({"tenant_id":tn})),
+            (
+                "set_ilk_tenant",
+                |tn| serde_json::json!({"ilk_id":"ilk:22222222-2222-4222-8222-222222222222","tenant_id":tn}),
+            ),
+            (
+                "update_tenant",
+                |tn| serde_json::json!({"tenant_id":tn,"name":"Acme"}),
+            ),
+            (
+                "run_node",
+                |tn| serde_json::json!({"node_name":"IO.api.x@motherbee","tenant_id":tn}),
+            ),
+            (
+                "vault_put",
+                |tn| serde_json::json!({"key":"google:a:b","metadata":{"tenant_id":tn,"resource_type":"gmail"}}),
+            ),
+            (
+                "vault_list",
+                |tn| serde_json::json!({"filter":{"tenant_id":tn}}),
+            ),
+            (
+                "vault_delete",
+                |tn| serde_json::json!({"key":"google:a:b","tenant_id":tn}),
+            ),
+        ];
+        for (action, params) in shapes {
+            let check = |tenant: &str| {
+                enforce_cloud_relay_content(io, action, "motherbee", &params(tenant))
+            };
+            assert!(check(t).is_ok(), "{action} with the claimed tenant");
+            assert!(check(root).is_err(), "{action} on the root tenant");
+            assert!(
+                check("tnt:acme").is_err(),
+                "{action} with a non-canonical tenant"
+            );
+            assert!(check("").is_err(), "{action} without a tenant");
+            // Other spellings of a UUID, the root's included, are not canonical.
+            for spelling in [
+                "tnt:00000000000000000000000000000001",
+                "tnt:{00000000-0000-0000-0000-000000000001}",
+                "tnt:11111111-1111-4111-8111-11111111111A",
+                " tnt:11111111-1111-4111-8111-111111111111",
+            ] {
+                assert!(check(spelling).is_err(), "{action} with {spelling:?}");
+            }
+        }
+        // create_tenant: no tenant yet, nothing to scope.
+        assert!(enforce_cloud_relay_content(
+            io,
+            "create_tenant",
+            "motherbee",
+            &serde_json::json!({"name":"Acme"})
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn cloud_relay_reads_and_edits_stay_narrow() {
+        let io = Some("IO.cloud@motherbee");
+        let t = "tnt:11111111-1111-4111-8111-111111111111";
+        let check = |action: &str, params: serde_json::Value| {
+            enforce_cloud_relay_content(io, action, "motherbee", &params)
+        };
+        // vault_list: the tenant, a resource type, a prefix and a limit; never an owner or tags.
+        assert!(check("vault_list", serde_json::json!({"filter":{"tenant_id":t,"resource_type":"gmail","prefix":"google:","limit":50}})).is_ok());
+        for extra in ["ilk", "tags"] {
+            assert!(
+                check(
+                    "vault_list",
+                    serde_json::json!({"filter":{"tenant_id":t, extra:"x"}})
+                )
+                .is_err(),
+                "{extra}"
+            );
+        }
+        assert!(
+            check("vault_list", serde_json::json!({})).is_err(),
+            "never unfiltered"
+        );
+        // vault_delete: the key and the tenant only.
+        assert!(check(
+            "vault_delete",
+            serde_json::json!({"key":"google:a:b","tenant_id":t,"force":true})
+        )
+        .is_err());
+        // update_tenant: name and domain only; status, settings and the sponsor are the operator's.
+        assert!(check(
+            "update_tenant",
+            serde_json::json!({"tenant_id":t,"name":"Acme","domain":""})
+        )
+        .is_ok());
+        for field in ["status", "settings", "sponsor_tenant_id"] {
+            assert!(
+                check(
+                    "update_tenant",
+                    serde_json::json!({"tenant_id":t, field:"x"})
+                )
+                .is_err(),
+                "{field}"
+            );
+        }
+    }
+
+    /// A-70 stage 3 (docs/router-stream-v1.md §7.6): Cloud reads the usage of the tenant it
+    /// claims, never the root tenant's nor every tenant's, and nothing outside the question.
+    #[test]
+    fn cloud_relay_reads_only_its_claimed_tenants_llm_usage() {
+        let io = Some("IO.cloud@motherbee");
+        let t = "tnt:11111111-1111-4111-8111-111111111111";
+        let check = |params: serde_json::Value| {
+            enforce_cloud_relay_content(io, "get_llm_usage", "motherbee", &params)
+        };
+        assert!(check(serde_json::json!({
+            "tenant_id": t, "from": "2026-10-01T00:00:00Z", "to": "2026-11-01T00:00:00Z",
+            "group_by": "day", "limit": 50
+        }))
+        .is_ok());
+        assert!(check(
+            serde_json::json!({"tenant_id": t, "since": "c", "after": "c", "all_tenants": false})
+        )
+        .is_ok());
+        for bad in [
+            serde_json::json!({"since": "c"}),
+            serde_json::json!({"tenant_id": fluxbee_sdk::DEFAULT_ROOT_TENANT_ID, "since": "c"}),
+            serde_json::json!({"tenant_id": "tnt:11111111-1111-4111-8111-11111111111A", "since": "c"}),
+            serde_json::json!({"tenant_id": t, "all_tenants": true}),
+            serde_json::json!({"all_tenants": true}),
+            serde_json::json!({"tenant_id": t, "all_tenants": "true"}),
+            serde_json::json!({"tenant_id": t, "tenants": ["tnt:22222222-2222-4222-8222-222222222222"]}),
+            serde_json::json!({"tenant_id": t, "node_name": "AI.sales@motherbee"}),
+        ] {
+            assert!(check(bad.clone()).is_err(), "{bad}");
+        }
+        // The operator and Archi are not held to it.
+        let every = serde_json::json!({"all_tenants": true});
+        assert!(enforce_cloud_relay_content(None, "get_llm_usage", "motherbee", &every).is_ok());
+        assert!(enforce_cloud_relay_content(
+            Some("SY.architect@motherbee"),
+            "get_llm_usage",
+            "motherbee",
+            &every
+        )
+        .is_ok());
+        // A Cloud-only action: over the mesh, IO.cloud and Archi, nobody else.
+        assert!(!CLOUD_SHARED_ACTIONS.contains(&"get_llm_usage"));
+        assert!(authorize_cloud_relay(io, "get_llm_usage", "motherbee").is_ok());
+        assert!(authorize_cloud_relay(
+            Some("SY.architect@motherbee"),
+            "get_llm_usage",
+            "motherbee"
+        )
+        .is_ok());
+        assert!(
+            authorize_cloud_relay(Some("AI.sales@motherbee"), "get_llm_usage", "motherbee")
+                .is_err()
+        );
+    }
+
+    /// Every tenant's usage at once is the operator's and Archi's; any other mesh caller names one
+    /// tenant. The router-stamped caller decides, never the params.
+    #[test]
+    fn every_tenants_llm_usage_is_the_operators_and_archis() {
+        let one = UsageQuery {
+            tenant_id: Some("tnt:11111111-1111-4111-8111-111111111111".to_string()),
+            ..UsageQuery::default()
+        };
+        let all = UsageQuery {
+            all_tenants: true,
+            ..UsageQuery::default()
+        };
+        let neither = UsageQuery::default();
+        for caller in [None, Some("SY.architect@motherbee")] {
+            assert!(
+                authorize_llm_usage_scope(caller, "motherbee", &all).is_ok(),
+                "{caller:?}"
+            );
+            assert!(
+                authorize_llm_usage_scope(caller, "motherbee", &one).is_ok(),
+                "{caller:?}"
+            );
+        }
+        for caller in [
+            "SY.architect@worker1",
+            "IO.cloud@motherbee",
+            "AI.sales@motherbee",
+            "WF.admin.internal.diag@motherbee",
+        ] {
+            assert!(
+                authorize_llm_usage_scope(Some(caller), "motherbee", &all).is_err(),
+                "{caller}"
+            );
+            assert!(
+                authorize_llm_usage_scope(Some(caller), "motherbee", &neither).is_err(),
+                "{caller}"
+            );
+            assert!(
+                authorize_llm_usage_scope(Some(caller), "motherbee", &one).is_ok(),
+                "{caller}"
+            );
+        }
+    }
+
+    /// `GET /hives/motherbee/usage`: the operator's question; without a tenant_id, every tenant.
+    #[test]
+    fn the_usage_route_reads_its_query_string() {
+        let t = "tnt:11111111-1111-4111-8111-111111111111";
+        let query = parse_query(&format!(
+            "tenant_id={t}&from=2026-10-01T00%3A00%3A00Z&to=2026-10-08T00:00:00+02:00&group_by=model&limit=50&after=c1"
+        ));
+        assert_eq!(
+            llm_usage_query_from_http(&query).unwrap(),
+            UsageQuery {
+                tenant_id: Some(t.to_string()),
+                all_tenants: false,
+                from: Some("2026-10-01T00:00:00Z".to_string()),
+                to: Some("2026-10-08T00:00:00+02:00".to_string()),
+                group_by: Some(UsageGroupBy::Model),
+                since: None,
+                after: Some("c1".to_string()),
+                limit: Some(50),
+            }
+        );
+        // No tenant: every tenant. A blank value is an absent one.
+        let every =
+            llm_usage_query_from_http(&parse_query("since=2026-10-01T00:00:00Z&tenant_id=&limit="))
+                .unwrap();
+        assert!(every.all_tenants && every.tenant_id.is_none() && every.limit.is_none());
+        assert_eq!(every.since.as_deref(), Some("2026-10-01T00:00:00Z"));
+        // A grouping outside the closed list, a limit that is not a number.
+        for bad in [
+            "group_by=week",
+            "group_by=model;drop",
+            "limit=ten",
+            "limit=-1",
+        ] {
+            assert!(
+                llm_usage_query_from_http(&parse_query(bad)).is_err(),
+                "{bad}"
+            );
+        }
+    }
+
+    /// Over the mesh the params are the question; the nulls the executor sends are absent fields.
+    #[test]
+    fn usage_params_over_the_mesh_are_the_question() {
+        let t = "tnt:11111111-1111-4111-8111-111111111111";
+        let query = llm_usage_query_from_params(serde_json::json!({
+            "tenant_id": t, "all_tenants": null, "from": "2026-10-01T00:00:00Z",
+            "to": "2026-11-01T00:00:00Z", "group_by": "node", "since": null, "limit": 10
+        }))
+        .unwrap();
+        assert_eq!(query.tenant_id.as_deref(), Some(t));
+        assert!(!query.all_tenants && query.since.is_none());
+        assert_eq!(query.group_by, Some(UsageGroupBy::Node));
+        assert_eq!(query.limit, Some(10));
+        assert_eq!(
+            llm_usage_query_from_params(serde_json::Value::Null).unwrap(),
+            UsageQuery::default()
+        );
+        for bad in [
+            serde_json::json!("x"),
+            serde_json::json!({"group_by": "week"}),
+            serde_json::json!({"limit": -1}),
+            serde_json::json!({"all_tenants": "yes"}),
+        ] {
+            assert!(llm_usage_query_from_params(bad.clone()).is_err(), "{bad}");
+        }
+    }
+
+    /// What the admin refuses before it asks SY.storage (§7.5).
+    #[test]
+    fn a_usage_question_is_checked_before_storage_is_asked() {
+        let period = UsageQuery {
+            tenant_id: Some("tnt:11111111-1111-4111-8111-111111111111".to_string()),
+            from: Some("2026-10-01T00:00:00Z".to_string()),
+            to: Some("2026-11-01T00:00:00Z".to_string()),
+            group_by: Some(UsageGroupBy::Day),
+            limit: Some(USAGE_QUERY_MAX_LIMIT),
+            ..UsageQuery::default()
+        };
+        let sync = UsageQuery {
+            all_tenants: true,
+            since: Some("2026-10-01T00:00:00Z".to_string()),
+            ..UsageQuery::default()
+        };
+        assert_eq!(check_llm_usage_query("motherbee", &period), Ok(()));
+        assert_eq!(check_llm_usage_query("motherbee", &sync), Ok(()));
+        // 92 days is a period.
+        let longest = UsageQuery {
+            to: Some("2027-01-01T00:00:00Z".to_string()),
+            ..period.clone()
+        };
+        assert_eq!(check_llm_usage_query("motherbee", &longest), Ok(()));
+        // The records live on the motherbee only.
+        assert!(check_llm_usage_query("worker1", &period).is_err());
+        for (case, query) in [
+            (
+                "a tenant and every tenant",
+                UsageQuery {
+                    all_tenants: true,
+                    ..period.clone()
+                },
+            ),
+            (
+                "no tenant",
+                UsageQuery {
+                    tenant_id: None,
+                    ..period.clone()
+                },
+            ),
+            (
+                "a tenant that is not canonical",
+                UsageQuery {
+                    tenant_id: Some("tnt:11111111-1111-4111-8111-11111111111A".to_string()),
+                    ..period.clone()
+                },
+            ),
+            (
+                "an empty page",
+                UsageQuery {
+                    limit: Some(0),
+                    ..period.clone()
+                },
+            ),
+            (
+                "a page too long",
+                UsageQuery {
+                    limit: Some(USAGE_QUERY_MAX_LIMIT + 1),
+                    ..period.clone()
+                },
+            ),
+            (
+                "a date without a time",
+                UsageQuery {
+                    from: Some("2026-10-01".to_string()),
+                    ..period.clone()
+                },
+            ),
+            (
+                "half a period",
+                UsageQuery {
+                    to: None,
+                    ..period.clone()
+                },
+            ),
+            (
+                "an empty period",
+                UsageQuery {
+                    to: period.from.clone(),
+                    ..period.clone()
+                },
+            ),
+            (
+                "a second over 92 days",
+                UsageQuery {
+                    to: Some("2027-01-01T00:00:01Z".to_string()),
+                    ..period.clone()
+                },
+            ),
+            (
+                "since with a period",
+                UsageQuery {
+                    since: Some("2026-10-01T00:00:00Z".to_string()),
+                    ..period.clone()
+                },
+            ),
+            (
+                "a blank cursor",
+                UsageQuery {
+                    after: Some(" ".to_string()),
+                    ..period.clone()
+                },
+            ),
+            (
+                "since with a grouping",
+                UsageQuery {
+                    group_by: Some(UsageGroupBy::Model),
+                    ..sync.clone()
+                },
+            ),
+            (
+                "neither a period nor a cursor",
+                UsageQuery {
+                    all_tenants: true,
+                    ..UsageQuery::default()
+                },
+            ),
+        ] {
+            assert!(
+                check_llm_usage_query("motherbee", &query).is_err(),
+                "{case}"
+            );
+        }
+    }
+
+    /// The catalog Archi and the executor read: a read on the motherbee's usage route, the question
+    /// as optional fields.
+    #[test]
+    fn get_llm_usage_is_a_read_on_the_usage_route() {
+        let spec = resolve_internal_action_spec("get_llm_usage").unwrap();
+        let doc = build_admin_action_doc(spec);
+        assert_eq!(doc["handler"], "llm_usage");
+        assert_eq!(doc["read_only"], true);
+        assert_eq!(doc["confirmation_required"], false);
+        assert_eq!(
+            doc["path_patterns"],
+            serde_json::json!(["GET /hives/{hive}/usage"])
+        );
+        let schema = build_admin_executor_function_definition(spec).parameters_json_schema;
+        assert_eq!(schema["required"], serde_json::json!(["hive"]));
+        for field in [
+            "tenant_id",
+            "all_tenants",
+            "from",
+            "to",
+            "group_by",
+            "since",
+            "after",
+            "limit",
+        ] {
+            assert!(schema["properties"].get(field).is_some(), "{field}");
+        }
+        assert_eq!(
+            admin_methods_allowed_for_path("/hives/motherbee/usage"),
+            vec!["GET"]
+        );
+    }
+
+    #[test]
+    fn names_held_by_another_tenant_are_conflicts_and_the_root_is_protected() {
+        for code in ["KEY_TAKEN", "TENANT_NAME_TAKEN", "TENANT_DOMAIN_TAKEN"] {
+            assert_eq!(error_code_to_http_status(code), 409, "{code}");
+        }
+        assert_eq!(error_code_to_http_status("TENANT_ROOT_PROTECTED"), 403);
+    }
+
+    #[test]
+    fn every_vault_delete_rotate_and_rollback_names_a_tenant() {
+        let root = fluxbee_sdk::DEFAULT_ROOT_TENANT_ID;
+        let t = "tnt:11111111-1111-4111-8111-111111111111";
+        // Unnamed or blank: the root tenant, where infrastructure keys live (vault_put's default).
+        for payload in [
+            serde_json::json!({"key":"k"}),
+            serde_json::json!({"key":"k","tenant_id":"  "}),
+        ] {
+            assert_eq!(default_vault_request_tenant(payload)["tenant_id"], root);
+        }
+        // Named: kept as given.
+        assert_eq!(
+            default_vault_request_tenant(serde_json::json!({"key":"k","tenant_id":t}))["tenant_id"],
+            t
+        );
     }
 
     #[test]
@@ -13712,10 +17271,30 @@ mod tests {
 
     #[test]
     fn cloud_actions_catalog_is_the_exposed_registry_subset() {
-        let expected_surface: std::collections::HashSet<&str> =
-            ["create_tenant", "vault_put", "run_node"]
-                .into_iter()
-                .collect();
+        let expected_surface: std::collections::HashSet<&str> = [
+            "create_tenant",
+            "vault_put",
+            "run_node",
+            "get_ilk",
+            "delete_ilk",
+            "restore_ilk",
+            "delete_tenant",
+            "restore_tenant",
+            "vault_list",
+            "vault_delete",
+            "update_tenant",
+            "set_ilk_tenant",
+            "vault_assign",
+            "get_tenant",
+            "list_tenants",
+            "list_tenant_nodes",
+            "get_node_status",
+            "start_node",
+            "kill_node",
+            "get_llm_usage",
+        ]
+        .into_iter()
+        .collect();
         let configured_surface: std::collections::HashSet<&str> =
             IO_CLOUD_EXPOSED_ACTIONS.iter().copied().collect();
         assert_eq!(configured_surface, expected_surface);
@@ -13769,6 +17348,7 @@ mod tests {
             ich_id: ich_id.to_string(),
             channel_type: "http".to_string(),
             address: "addr".to_string(),
+            scope: "tnt:00000000-0000-0000-0000-000000000001".to_string(),
             is_primary: false,
             owner_l2_name: owner_l2_name.map(ToString::to_string),
             enabled,
@@ -13948,13 +17528,379 @@ mod tests {
         })
         .unwrap();
 
-        let responses =
-            collect_opa_responses(&mut rx, "compile", 7, &["motherbee".to_string()]).await;
+        let responses = collect_opa_responses(
+            &mut rx,
+            "compile",
+            7,
+            None,
+            &["motherbee".to_string()],
+            Duration::from_secs(30),
+        )
+        .await;
         assert_eq!(responses.len(), 1);
         assert_eq!(responses[0].hive, "motherbee");
         assert_eq!(responses[0].status, "ok");
         assert_eq!(responses[0].version, Some(7));
         assert_eq!(responses[0].hash.as_deref(), Some("sha256:test"));
+    }
+
+    fn opa_sync_answer(src_l2_name: &str, payload_hive: &str, hash: &str) -> Message {
+        Message {
+            routing: Routing {
+                src: Uuid::new_v4().to_string(),
+                src_l2_name: Some(src_l2_name.to_string()),
+                dst: Destination::Unicast("SY.admin@motherbee".to_string()),
+                ttl: 16,
+                trace_id: Uuid::new_v4().to_string(),
+            },
+            meta: Meta {
+                msg_type: SYSTEM_KIND.to_string(),
+                msg: Some("CONFIG_RESPONSE".to_string()),
+                ..Meta::default()
+            },
+            payload: json!({
+                "subsystem": "opa",
+                "action": "sync",
+                "version": 0,
+                "status": "ok",
+                "hive": payload_hive,
+                "hash": hash
+            }),
+        }
+    }
+
+    const OPA_SYNC_NOTICE_FIXTURE: &str =
+        include_str!("../../go/sy-opa-rules/testdata/opa_sync_notice.json");
+
+    /// The sync notice as it reaches a hive (the router stamps src_l2_name): the Go suite feeds this
+    /// same file to SY.opa.rules, so a key moved on either side fails one of the two.
+    #[test]
+    fn the_opa_sync_notice_matches_the_contract_shared_with_go() {
+        let mut delivered = opa_sync_notice(
+            "admin-uuid",
+            0,
+            "sha256:5f1d8b7c0e2a4d6f8b0c2e4a6d8f0b2c4e6a8d0f2b4c6e8a0d2f4b6c8e0a2d4f",
+        )
+        .expect("notice");
+        delivered.routing.src_l2_name = Some(format!("SY.admin@{PRIMARY_HIVE_ID}"));
+        delivered.routing.trace_id = "trace-opa-sync".to_string();
+        let fixture: Value = serde_json::from_str(OPA_SYNC_NOTICE_FIXTURE).expect("fixture json");
+        assert_eq!(
+            serde_json::to_value(&delivered).expect("serialize"),
+            fixture,
+            "actual: {}",
+            serde_json::to_string_pretty(&delivered).unwrap()
+        );
+    }
+
+    /// An admin wired to the in-process test dispatcher, with an empty hives registry (so a write
+    /// expects the motherbee only).
+    fn opa_test_admin(prefix: &str) -> (AdminContext, fluxbee_sdk::RouterDispatcherTestHarness) {
+        let profile = build_admin_rpc_profile().expect("admin rpc profile");
+        let (client, harness) = fluxbee_sdk::RouterDispatcherTestHarness::new_with_uuid(
+            "admin-test-uuid",
+            &format!("SY.admin@{PRIMARY_HIVE_ID}"),
+            profile,
+        );
+        let root = test_temp_dir(prefix);
+        let state_dir = root.join("state");
+        let ctx = AdminContext {
+            config_dir: root.join("config"),
+            state_dir: state_dir.clone(),
+            blob_root: root.join("blob"),
+            node_name: format!("SY.admin@{PRIMARY_HIVE_ID}"),
+            hive_id: PRIMARY_HIVE_ID.to_string(),
+            self_ilk_id: String::new(),
+            authorized_hives: Vec::new(),
+            executor_runtime: Arc::new(Mutex::new(None)),
+            executor_configured: Arc::new(AtomicBool::new(false)),
+            rpc: client,
+            usage: UsageRecorder::disabled(),
+            public_edge_node: None,
+            public_base_url: None,
+            publication_ledger_path: state_dir.join("sy-admin/publications.json"),
+            publication_lock: Arc::new(Mutex::new(())),
+            runtime_manifest_lock: Arc::new(Mutex::new(())),
+            command_log_lock: Arc::new(std::sync::Mutex::new(())),
+        };
+        (ctx, harness)
+    }
+
+    fn opa_rules_answer(action: &str, version: u64, status: &str, hash: &str) -> Message {
+        let mut answer = opa_sync_answer(
+            &format!("SY.opa.rules@{PRIMARY_HIVE_ID}"),
+            PRIMARY_HIVE_ID,
+            hash,
+        );
+        answer.payload["action"] = json!(action);
+        answer.payload["version"] = json!(version);
+        answer.payload["status"] = json!(status);
+        answer
+    }
+
+    fn reply_to(request: &Message, msg: &str, payload: Value) -> Message {
+        Message {
+            routing: Routing {
+                src: Uuid::new_v4().to_string(),
+                src_l2_name: None,
+                dst: Destination::Unicast(format!("SY.admin@{PRIMARY_HIVE_ID}")),
+                ttl: 16,
+                trace_id: request.routing.trace_id.clone(),
+            },
+            meta: Meta {
+                msg_type: SYSTEM_KIND.to_string(),
+                msg: Some(msg.to_string()),
+                ..Meta::default()
+            },
+            payload,
+        }
+    }
+
+    fn dst_of(msg: &Message) -> Value {
+        serde_json::to_value(&msg.routing.dst).expect("dst")
+    }
+
+    fn no_opa_request() -> OpaRequest {
+        OpaRequest {
+            rego: None,
+            entrypoint: None,
+            version: None,
+            hive: None,
+        }
+    }
+
+    /// A global write: the change goes to the motherbee's SY.opa.rules; once it applied, the
+    /// motherbee's Syncthing scans the policy folder, and only then every hive gets the notice
+    /// (listening for the answers before it goes out).
+    #[tokio::test]
+    async fn a_global_write_changes_the_motherbee_then_scans_then_tells_every_hive() {
+        let (ctx, mut harness) = opa_test_admin("opa-write-sequence");
+        let write = handle_opa_http(&ctx, &ctx.rpc, no_opa_request(), OpaAction::Clear);
+        let drive = async {
+            let wait = Duration::from_secs(5);
+            let step = harness.next_outgoing_within(wait).await.expect("the clear");
+            assert_eq!(step.meta.msg.as_deref(), Some("CONFIG_CHANGED"));
+            assert_eq!(
+                dst_of(&step),
+                json!(format!("SY.opa.rules@{PRIMARY_HIVE_ID}"))
+            );
+            assert_eq!(step.payload["action"], json!("clear"));
+            harness
+                .inject(opa_rules_answer("clear", 0, "ok", ""))
+                .await
+                .unwrap();
+
+            let scan = harness.next_outgoing_within(wait).await.expect("the scan");
+            assert_eq!(scan.meta.msg.as_deref(), Some("SYSTEM_SYNC_HINT"));
+            assert_eq!(
+                dst_of(&scan),
+                json!(format!("SY.orchestrator@{PRIMARY_HIVE_ID}"))
+            );
+            assert_eq!(scan.payload["channel"], json!("dist"));
+            assert_eq!(scan.payload["folder_id"], json!(OPA_POLICY_SYNC_FOLDER));
+            let done = reply_to(
+                &scan,
+                "SYSTEM_SYNC_HINT_RESPONSE",
+                json!({ "status": "ok" }),
+            );
+            harness.inject(done).await.unwrap();
+
+            let notice = harness
+                .next_outgoing_within(wait)
+                .await
+                .expect("the notice");
+            assert_eq!(notice.meta.msg.as_deref(), Some("CONFIG_CHANGED"));
+            assert_eq!(dst_of(&notice), json!("broadcast"));
+            assert_eq!(notice.meta.target.as_deref(), Some("SY.opa.rules@*"));
+            assert_eq!(notice.payload["action"], json!("sync"));
+            assert_eq!(notice.payload["config"]["hash"], json!(""));
+            harness
+                .inject(opa_sync_answer(
+                    &format!("SY.opa.rules@{PRIMARY_HIVE_ID}"),
+                    PRIMARY_HIVE_ID,
+                    "",
+                ))
+                .await
+                .unwrap();
+        };
+        let (result, ()) = tokio::join!(write, drive);
+        let (status, body) = result.expect("write");
+        let body: Value = serde_json::from_str(&body).expect("body");
+        assert_eq!(status, 200, "{body}");
+        assert_eq!(body["converged"], json!(true), "{body}");
+        assert_eq!(body["running_hives"], json!([PRIMARY_HIVE_ID]), "{body}");
+    }
+
+    /// If the motherbee did not apply the change, nothing is scanned and no hive is told.
+    #[tokio::test]
+    async fn a_change_the_motherbee_refused_is_not_announced() {
+        let (ctx, mut harness) = opa_test_admin("opa-write-refused");
+        let write = handle_opa_http(&ctx, &ctx.rpc, no_opa_request(), OpaAction::Clear);
+        let drive = async {
+            let step = harness
+                .next_outgoing_within(Duration::from_secs(5))
+                .await
+                .expect("the clear");
+            assert_eq!(step.payload["action"], json!("clear"));
+            harness
+                .inject(opa_rules_answer("clear", 0, "error", ""))
+                .await
+                .unwrap();
+        };
+        let (result, ()) = tokio::join!(write, drive);
+        let (status, _) = result.expect("write");
+        assert_ne!(status, 200);
+        assert!(
+            harness
+                .next_outgoing_within(Duration::from_millis(300))
+                .await
+                .is_none(),
+            "nothing may follow a change the motherbee refused"
+        );
+    }
+
+    /// There is one user policy for every hive: a write that names another hive is refused before
+    /// anything is sent.
+    #[tokio::test]
+    async fn a_policy_write_for_one_hive_is_refused_before_anything_is_sent() {
+        let (ctx, mut harness) = opa_test_admin("opa-write-per-hive");
+        let mut req = no_opa_request();
+        req.hive = Some("worker1".to_string());
+        let (status, body) = handle_opa_http(&ctx, &ctx.rpc, req, OpaAction::Clear)
+            .await
+            .expect("write");
+        assert_eq!(status, 400, "{body}");
+        assert!(harness
+            .next_outgoing_within(Duration::from_millis(200))
+            .await
+            .is_none());
+    }
+
+    /// The rollout counts a hive only when SY.opa.rules of that hive (the name the router stamped)
+    /// reports the announced policy: a node claiming another hive in its payload, or a late answer
+    /// to an earlier version-0 notice (a clear right after a rollback), does not count.
+    #[tokio::test]
+    async fn sync_answers_count_only_from_that_hives_opa_rules_with_the_announced_hash() {
+        let (tx, mut rx) = broadcast::channel(8);
+        // forged: any node can send a CONFIG_RESPONSE claiming to be worker1
+        tx.send(opa_sync_answer("AI.rogue@motherbee", "worker1", ""))
+            .unwrap();
+        // late answer to the previous notice (a rollback, also version 0)
+        tx.send(opa_sync_answer(
+            "SY.opa.rules@egress1",
+            "egress1",
+            "sha256:old",
+        ))
+        .unwrap();
+        // real answers to this notice (a clear: hash "")
+        tx.send(opa_sync_answer("SY.opa.rules@worker1", "anything", ""))
+            .unwrap();
+        tx.send(opa_sync_answer("SY.opa.rules@motherbee", "motherbee", ""))
+            .unwrap();
+        let expected = vec![
+            "egress1".to_string(),
+            "motherbee".to_string(),
+            "worker1".to_string(),
+        ];
+        let responses = collect_opa_responses(
+            &mut rx,
+            "sync",
+            0,
+            Some(""),
+            &expected,
+            Duration::from_millis(200),
+        )
+        .await;
+        let mut hives: Vec<String> = responses.into_iter().map(|r| r.hive).collect();
+        hives.sort();
+        assert_eq!(hives, vec!["motherbee".to_string(), "worker1".to_string()]);
+    }
+
+    /// A joined hive is expected by a rollout whether or not it is reachable now.
+    #[test]
+    fn opa_rollout_expects_every_connected_hive_in_the_registry() {
+        let root = std::env::temp_dir().join(format!("opa-rollout-hives-{}", Uuid::new_v4()));
+        for (dir, info) in [
+            (
+                "worker1",
+                "hive_id: worker1\nrole: worker\nstatus: connected\n",
+            ),
+            (
+                "egress1",
+                "hive_id: egress1\nrole: egress\nstatus: connected\n",
+            ),
+            (
+                "half",
+                "hive_id: half\nrole: worker\nstatus: provisioning\n",
+            ),
+        ] {
+            fs::create_dir_all(root.join(dir)).unwrap();
+            fs::write(root.join(dir).join("info.yaml"), info).unwrap();
+        }
+        assert_eq!(
+            connected_hives_with("motherbee", &root),
+            vec![
+                "egress1".to_string(),
+                "motherbee".to_string(),
+                "worker1".to_string()
+            ]
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    /// One global policy, eventual convergence: the motherbee applied it, a hive still syncing is
+    /// pending — reported, not an error.
+    #[test]
+    fn opa_rollout_reports_pending_hives_without_failing() {
+        let entry = |hive: &str| OpaResponseEntry {
+            hive: hive.to_string(),
+            status: "ok".to_string(),
+            version: Some(7),
+            compile_time_ms: None,
+            wasm_size_bytes: None,
+            hash: Some("sha256:x".to_string()),
+            error_code: None,
+            error_detail: None,
+        };
+        let expected = vec![
+            "egress1".to_string(),
+            "motherbee".to_string(),
+            "worker1".to_string(),
+        ];
+        let (status, body) = build_opa_rollout_response(
+            OpaAction::Apply,
+            7,
+            "sha256:x",
+            vec![entry("motherbee")],
+            vec![entry("motherbee"), entry("worker1")],
+            &expected,
+            &["motherbee".to_string(), "worker1".to_string()],
+        );
+        assert_eq!(status, 200);
+        let body: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(body["status"], json!("ok"));
+        assert_eq!(body["hash"], json!("sha256:x"));
+        assert_eq!(body["pending"], json!(["egress1"]));
+        // egress1 is not in the LSA right now: pending because it cannot be reached.
+        assert_eq!(body["unreachable"], json!(["egress1"]));
+        assert_eq!(body["converged"], json!(false));
+    }
+
+    /// POST /opa/policy sends a "compile" step with apply after it; the rollout reports the write.
+    #[test]
+    fn opa_rollout_names_the_write_not_the_step() {
+        let (_, body) = build_opa_rollout_response(
+            OpaAction::CompileApply,
+            7,
+            "sha256:x",
+            vec![],
+            vec![],
+            &[],
+            &[],
+        );
+        let body: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(body["action"], json!("compile_apply"));
+        assert_eq!(body["converged"], json!(true));
     }
 
     #[tokio::test]
@@ -13988,38 +17934,6 @@ mod tests {
         assert_eq!(responses[0].hive, "motherbee");
         assert_eq!(responses[0].status, "ok");
         assert_eq!(responses[0].payload["current_version"], json!(4));
-    }
-
-    #[test]
-    fn list_config_items_payload_prefers_nested_payload_shape() {
-        let response = json!({
-            "status": "ok",
-            "action": "list_routes",
-            "payload": {
-                "config_version": 7,
-                "routes": [{ "prefix": "alpha/**" }]
-            },
-            "config_version": 7,
-            "routes": [{ "prefix": "legacy/**" }]
-        });
-
-        assert_eq!(
-            list_config_items_payload(&response, "routes"),
-            Some(&json!([{ "prefix": "alpha/**" }]))
-        );
-    }
-
-    #[test]
-    fn list_config_items_payload_falls_back_to_legacy_top_level_shape() {
-        let response = json!({
-            "status": "ok",
-            "vpns": [{ "pattern": "ops/*" }]
-        });
-
-        assert_eq!(
-            list_config_items_payload(&response, "vpns"),
-            Some(&json!([{ "pattern": "ops/*" }]))
-        );
     }
 
     #[test]
@@ -14291,7 +18205,18 @@ mod tests {
     #[test]
     fn identity_delete_errors_map_to_operator_http_statuses() {
         assert_eq!(error_code_to_http_status("ILK_NOT_FOUND"), 404);
+        assert_eq!(error_code_to_http_status("TENANT_NOT_FOUND"), 404);
         assert_eq!(error_code_to_http_status("SYSTEM_ILK_PROTECTED"), 403);
+        assert_eq!(error_code_to_http_status("TENANT_ROOT_NOT_ALLOWED"), 403);
+        for refused in [
+            "TENANT_HAS_NODES",
+            "TENANT_HAS_PEOPLE",
+            "TENANT_NOT_DELETED",
+            "TENANT_NOT_ACTIVE",
+            "ILK_KEY_CONFLICT",
+        ] {
+            assert_eq!(error_code_to_http_status(refused), 409, "{refused}");
+        }
     }
 
     #[test]
@@ -14456,6 +18381,168 @@ mod tests {
             json!(NODE_SECRET_REDACTION_TOKEN)
         );
         assert_eq!(redacted["payload"]["key"], json!("infra:openai-api-key"));
+    }
+
+    fn command_log_test_state_dir(tag: &str) -> PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        std::env::temp_dir().join(format!("sy-admin-cmdlog-{tag}-{nanos}"))
+    }
+
+    fn command_log_entry(action: &str, hive: Option<&str>, status: &str, ts_ms: u64) -> AdminCommandLogEntry {
+        AdminCommandLogEntry {
+            ts_ms,
+            ts: format!("t{ts_ms}"),
+            action: action.to_string(),
+            hive: hive.map(ToString::to_string),
+            origin: "http".to_string(),
+            params: json!({}),
+            status: status.to_string(),
+            error_code: (status == "error").then(|| "SOME_ERROR".to_string()),
+            http_status: if status == "ok" { 200 } else { 500 },
+            duration_ms: 1,
+        }
+    }
+
+    #[test]
+    fn command_log_appends_and_reads_newest_first() {
+        let dir = command_log_test_state_dir("basic");
+        for i in 0..5u64 {
+            append_admin_command_log_locked(&dir, &command_log_entry("run_node", Some("motherbee"), "ok", i));
+        }
+        let out = read_recent_admin_commands(
+            &dir,
+            &AdminCommandLogQuery { limit: 3, ..Default::default() },
+        );
+        assert_eq!(out.len(), 3);
+        // newest first
+        assert_eq!(out[0]["ts_ms"], json!(4));
+        assert_eq!(out[2]["ts_ms"], json!(2));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn command_log_rotates_by_entry_count_and_reads_across_rotations() {
+        let dir = command_log_test_state_dir("rotate");
+        let total = ADMIN_COMMAND_LOG_ROTATE_ENTRIES as u64 + 10;
+        for i in 0..total {
+            append_admin_command_log_locked(&dir, &command_log_entry("update", None, "ok", i));
+        }
+        // the active file rotated once: commands.jsonl.1 exists and the active file is small
+        assert!(admin_command_log_dir(&dir).join("commands.jsonl.1").exists());
+        let active = fs::read_to_string(admin_command_log_path(&dir)).expect("active log");
+        assert_eq!(active.lines().count(), 10);
+        // reading spans the rotation: ask for more than the active file holds
+        let out = read_recent_admin_commands(
+            &dir,
+            &AdminCommandLogQuery { limit: 20, ..Default::default() },
+        );
+        assert_eq!(out.len(), 20);
+        assert_eq!(out[0]["ts_ms"], json!(total - 1));
+        assert_eq!(out[19]["ts_ms"], json!(total - 20));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn command_log_query_filters_by_action_status_hive_and_since() {
+        let dir = command_log_test_state_dir("filters");
+        append_admin_command_log_locked(&dir, &command_log_entry("run_node", Some("motherbee"), "ok", 10));
+        append_admin_command_log_locked(&dir, &command_log_entry("run_node", Some("worker-220"), "error", 20));
+        append_admin_command_log_locked(&dir, &command_log_entry("vault_put", Some("motherbee"), "ok", 30));
+        let by_action = read_recent_admin_commands(
+            &dir,
+            &AdminCommandLogQuery { limit: 10, action: Some("run_node".into()), ..Default::default() },
+        );
+        assert_eq!(by_action.len(), 2);
+        let by_status = read_recent_admin_commands(
+            &dir,
+            &AdminCommandLogQuery { limit: 10, status: Some("error".into()), ..Default::default() },
+        );
+        assert_eq!(by_status.len(), 1);
+        assert_eq!(by_status[0]["action"], json!("run_node"));
+        let by_hive = read_recent_admin_commands(
+            &dir,
+            &AdminCommandLogQuery { limit: 10, hive: Some("motherbee".into()), ..Default::default() },
+        );
+        assert_eq!(by_hive.len(), 2);
+        let by_since = read_recent_admin_commands(
+            &dir,
+            &AdminCommandLogQuery { limit: 10, since_ms: Some(21), ..Default::default() },
+        );
+        assert_eq!(by_since.len(), 1);
+        assert_eq!(by_since[0]["action"], json!("vault_put"));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn command_log_params_redact_vault_value_and_truncate_huge_payloads() {
+        // a vault_put must never log its value
+        let vault = json!({
+            "action": "vault_put",
+            "key": "infra:slack-tokens",
+            "value": { "app_token": "xapp-secret" },
+            "metadata": { "tenant_id": "tnt:x" }
+        });
+        let redacted = admin_command_log_params(&vault);
+        assert_eq!(redacted["value"], json!(NODE_SECRET_REDACTION_TOKEN));
+        assert_eq!(redacted["key"], json!("infra:slack-tokens"));
+        // a huge CONFIG_SET payload gets truncated to a preview, never stored whole
+        let huge = json!({ "config": { "blob": "x".repeat(3 * ADMIN_COMMAND_LOG_PARAMS_MAX_BYTES) } });
+        let capped = admin_command_log_params(&huge);
+        assert_eq!(capped["_truncated"], json!(true));
+        let preview = capped["preview"].as_str().expect("preview string");
+        assert!(preview.len() <= ADMIN_COMMAND_LOG_PARAMS_MAX_BYTES);
+    }
+
+    #[test]
+    fn command_log_redacts_ssh_and_colonless_vault_secrets() {
+        // add_hive bootstrap creds (the contract promises these are never logged)
+        let add_hive = json!({
+            "hive_id": "worker-220",
+            "ssh_user": "administrator",
+            "ssh_password": "Hunter2!",
+            "ssh_key": "-----BEGIN OPENSSH PRIVATE KEY-----\nabc\n-----END-----"
+        });
+        let r = admin_command_log_params(&add_hive);
+        assert_eq!(r["ssh_password"], json!(NODE_SECRET_REDACTION_TOKEN));
+        assert_eq!(r["ssh_key"], json!(NODE_SECRET_REDACTION_TOKEN));
+        assert_eq!(r["ssh_user"], json!("administrator")); // non-secret kept for audit
+        assert_eq!(r["hive_id"], json!("worker-220"));
+        // vault_rotate on a colon-less (but valid) key: value must still be redacted
+        let rotate = json!({ "key": "slack-tokens", "value": { "app_token": "xapp-secret" } });
+        let rr = admin_command_log_params(&rotate);
+        assert_eq!(rr["value"], json!(NODE_SECRET_REDACTION_TOKEN));
+        assert_eq!(rr["key"], json!("slack-tokens")); // the key NAME is not a secret
+    }
+
+    #[test]
+    fn command_log_hive_filter_keeps_hive_less_commands_visible() {
+        let dir = command_log_test_state_dir("hiveless");
+        append_admin_command_log_locked(&dir, &command_log_entry("run_node", Some("motherbee"), "ok", 10));
+        append_admin_command_log_locked(&dir, &command_log_entry("add_hive", None, "ok", 20));
+        // querying a specific hive must STILL surface hive-less (global) commands like add_hive
+        let out = read_recent_admin_commands(
+            &dir,
+            &AdminCommandLogQuery { limit: 10, hive: Some("motherbee".into()), ..Default::default() },
+        );
+        let actions: Vec<&str> = out.iter().filter_map(|c| c["action"].as_str()).collect();
+        assert!(actions.contains(&"add_hive"), "hive-less add_hive must be visible: {actions:?}");
+        assert!(actions.contains(&"run_node"));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn list_recent_commands_is_a_registered_admin_action() {
+        let spec = resolve_internal_action_spec("list_recent_commands")
+            .expect("list_recent_commands registered");
+        assert!(!spec.requires_target);
+        assert_eq!(
+            admin_action_path_patterns("list_recent_commands"),
+            vec!["GET /hives/{hive}/commands"]
+        );
+        assert!(!admin_action_summary("list_recent_commands").is_empty());
     }
 
     #[test]
@@ -15234,6 +19321,53 @@ mod tests {
         assert_eq!(entry["available"], serde_json::json!(["1.0.0"]));
     }
 
+    // The guard behind remove_runtime_version's 409 RUNTIME_HAS_DEPENDENTS.
+    #[test]
+    fn runtime_dependents_summary_local_lists_packages_built_on_the_runtime() {
+        let manifest = RuntimeManifest {
+            schema_version: 1,
+            version: 1710000000000,
+            updated_at: Some("2026-03-16T00:00:00Z".to_string()),
+            runtimes: serde_json::json!({
+                "ai.base": {
+                    "available": ["1.0.0"],
+                    "current": "1.0.0",
+                    "type": "full_runtime"
+                },
+                "ai.child.config": {
+                    "available": ["2.0.0"],
+                    "current": "2.0.0",
+                    "type": "config_only",
+                    "runtime_base": "ai.base"
+                },
+                "wf.child.flow": {
+                    "available": ["3.0.0"],
+                    "current": "3.0.0",
+                    "type": "workflow",
+                    "runtime_base": "AI.Base"
+                },
+                "io.other": {
+                    "available": ["1.0.0"],
+                    "current": "1.0.0",
+                    "type": "full_runtime"
+                }
+            }),
+            hash: None,
+        };
+
+        let dependents =
+            runtime_dependents_summary_local(&manifest, "ai.base").expect("dependents");
+        let names: Vec<&str> = dependents
+            .iter()
+            .filter_map(|dependent| dependent["runtime"].as_str())
+            .collect();
+        assert_eq!(names, vec!["ai.child.config", "wf.child.flow"]);
+        assert_eq!(dependents[1]["type"], serde_json::json!("workflow"));
+        assert!(runtime_dependents_summary_local(&manifest, "io.other")
+            .expect("dependents")
+            .is_empty());
+    }
+
     #[test]
     fn materialize_inline_runtime_package_rejects_parent_dir_component() {
         let staging_root = test_temp_dir("sy-admin-inline-bad-path");
@@ -15796,7 +19930,11 @@ mod tests {
         let (status, body) = build_admin_action_help_response("unpublish_artifact");
         assert_eq!(status, 200);
         let body: Value = serde_json::from_str(&body).expect("valid action help response");
-        assert_eq!(body["payload"]["registry_version"], json!("9"));
+        assert_eq!(
+            body["payload"]["registry_version"],
+            json!(INTERNAL_ACTION_REGISTRY_VERSION),
+            "el help tiene que reportar la version viva del registry"
+        );
         assert_eq!(
             body["payload"]["entry"]["request_contract"]["admin_rpc"]["action"],
             json!("unpublish_artifact")
@@ -15883,6 +20021,8 @@ mod tests {
             resource_type: "openai".to_string(),
             tenant_id: fluxbee_sdk::DEFAULT_ROOT_TENANT_ID.to_string(),
             ilk: None,
+            assigned_ilks: Vec::new(),
+            general: true,
             version: 1,
             key: "secret/openai".to_string(),
             hive_id: "motherbee".to_string(),

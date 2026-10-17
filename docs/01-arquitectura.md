@@ -202,7 +202,7 @@ El sistema tiene una jerarquía de islas con una **mother hive** (isla madre) en
 |---------------|---------------|-----------|
 | SY.admin | ✅ Único global | ❌ No tiene |
 | Internet | ✅ Via reverse proxy | ❌ Red interna |
-| CONFIG_CHANGED | ✅ Emite broadcast | Solo escucha |
+| CONFIG_CHANGED | ✅ Emite (OPA de usuario) | Recibe (OPA; desde 0.1.44 rutas no lo usan) |
 | add_hive | ✅ Puede crear hijas | ❌ No puede |
 | wan.listen | ✅ Recibe conexiones | ❌ No recibe |
 | wan.uplinks | ❌ Vacío | ✅ Apunta a mother |

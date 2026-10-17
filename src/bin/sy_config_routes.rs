@@ -8,8 +8,8 @@ use tracing_subscriber::EnvFilter;
 use uuid::Uuid;
 
 use fluxbee_sdk::protocol::{
-    ConfigChangedPayload, Destination, Message, Meta, Routing, MSG_CONFIG_CHANGED, MSG_CONFIG_GET,
-    is_system_kind, MSG_CONFIG_SET, SYSTEM_KIND,
+    is_system_kind, Destination, Message, Meta, Routing, MSG_CONFIG_GET, MSG_CONFIG_SET,
+    SYSTEM_KIND,
 };
 use fluxbee_sdk::{
     build_node_config_response_message, parse_node_config_request, try_handle_default_node_status,
@@ -17,6 +17,7 @@ use fluxbee_sdk::{
     OperationalRouteProfile, RouteMatch, RouteTarget, RouterDispatcher, ADMIN_KIND,
     NODE_CONFIG_APPLY_MODE_REPLACE, NODE_CONFIG_CONTROL_TARGET,
 };
+use json_router::router::system_policy::PRIMARY_HIVE_ID;
 use json_router::shm::{
     copy_bytes_with_len, now_epoch_ms, ConfigRegionWriter, StaticRouteEntry, TapEntry,
     VpnAssignment, ACTION_DROP, ACTION_FORWARD, FLAG_ACTIVE, FLAG_FROZEN, MATCH_EXACT, MATCH_GLOB,
@@ -112,7 +113,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         std::process::exit(1);
     }
     let log_level = std::env::var("JSR_LOG_LEVEL").unwrap_or_else(|_| "info".to_string());
-    tracing_subscriber::fmt()
+    fluxbee_sdk::logging::fmt()
         .with_env_filter(EnvFilter::new(log_level))
         .init();
 
@@ -223,176 +224,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                     continue;
                 }
-                if !is_system_kind(&msg.meta.msg_type) || msg.meta.msg.as_deref() != Some(MSG_CONFIG_CHANGED) {
-                    continue;
-                }
-                let payload_value = msg.payload.clone();
-                let payload: ConfigChangedPayload = match serde_json::from_value(payload_value) {
-                    Ok(payload) => payload,
-                    Err(err) => {
-                        tracing::warn!("invalid config changed payload: {err}");
-                        let _ = send_config_response(
-                            &sender,
-                            &msg,
-                            "unknown",
-                            0,
-                            "error",
-                            Some("INVALID_PAYLOAD".to_string()),
-                            Some(err.to_string()),
-                            &hive_id,
-                        ).await;
-                        continue;
-                    }
-                };
-                tracing::info!(
-                    subsystem = %payload.subsystem,
-                    payload_version = payload.version,
-                    current_version = sy_config.version,
-                    "config changed received"
-                );
-                if payload.version != 0 && payload.version <= sy_config.version {
-                    tracing::info!(
-                        payload_version = payload.version,
-                        current_version = sy_config.version,
-                        "config version not newer; skipping"
-                    );
-                    continue;
-                }
-                let mut next_config = sy_config.clone();
-                match payload.subsystem.as_str() {
-                    "routes" => {
-                        let routes = match parse_routes(&payload.config) {
-                            Ok(routes) => routes,
-                            Err(err) => {
-                                tracing::warn!("invalid routes payload: {err}");
-                                let _ = send_config_response(
-                                    &sender,
-                                    &msg,
-                                    "routes",
-                                    payload.version,
-                                    "error",
-                                    Some("INVALID_CONFIG".to_string()),
-                                    Some(err.to_string()),
-                                    &hive_id,
-                                ).await;
-                                continue;
-                            }
-                        };
-                        if let Some(routes) = routes {
-                            next_config.routes = routes;
-                        }
-                    }
-                    "vpn" | "vpns" => {
-                        let vpns = match parse_vpns(&payload.config) {
-                            Ok(vpns) => vpns,
-                            Err(err) => {
-                                tracing::warn!("invalid vpns payload: {err}");
-                                let _ = send_config_response(
-                                    &sender,
-                                    &msg,
-                                    "vpn",
-                                    payload.version,
-                                    "error",
-                                    Some("INVALID_CONFIG".to_string()),
-                                    Some(err.to_string()),
-                                    &hive_id,
-                                ).await;
-                                continue;
-                            }
-                        };
-                        if let Some(vpns) = vpns {
-                            next_config.vpns = vpns;
-                        }
-                    }
-                    "tap" | "taps" => {
-                        let taps = match parse_taps(&payload.config) {
-                            Ok(taps) => taps,
-                            Err(err) => {
-                                tracing::warn!("invalid taps payload: {err}");
-                                let _ = send_config_response(
-                                    &sender,
-                                    &msg,
-                                    "tap",
-                                    payload.version,
-                                    "error",
-                                    Some("INVALID_CONFIG".to_string()),
-                                    Some(err.to_string()),
-                                    &hive_id,
-                                )
-                                .await;
-                                continue;
-                            }
-                        };
-                        if let Some(taps) = taps {
-                            next_config.taps = taps;
-                        }
-                    }
-                    _ => {
-                        continue;
-                    }
-                }
-                if next_config.routes == sy_config.routes
-                    && next_config.vpns == sy_config.vpns
-                    && next_config.taps == sy_config.taps
-                {
-                    tracing::info!(
-                        subsystem = %payload.subsystem,
-                        version = payload.version,
-                        "config unchanged; skipping apply"
-                    );
-                    continue;
-                }
-                if payload.version == 0 {
-                    next_config.version = sy_config.version.saturating_add(1);
-                } else {
-                    next_config.version = payload.version;
-                }
-                next_config.updated_at = now_epoch_ms().to_string();
-                if let Err(err) = apply_config(&mut writer, &hive_id, &next_config) {
-                    tracing::warn!("apply config failed: {err}");
-                    let _ = send_config_response(
-                        &sender,
-                        &msg,
-                        payload.subsystem.as_str(),
-                        next_config.version,
-                        "error",
-                        Some("APPLY_FAILED".to_string()),
-                        Some(err.to_string()),
-                        &hive_id,
-                    ).await;
-                    continue;
-                }
-                if let Err(err) = write_config(&config_dir, &next_config) {
-                    tracing::warn!("persist config failed: {err}");
-                    let _ = send_config_response(
-                        &sender,
-                        &msg,
-                        payload.subsystem.as_str(),
-                        next_config.version,
-                        "error",
-                        Some("PERSIST_FAILED".to_string()),
-                        Some(err.to_string()),
-                        &hive_id,
-                    ).await;
-                    continue;
-                }
-                sy_config = next_config;
-                tracing::info!(
-                    subsystem = %payload.subsystem,
-                    payload_version = payload.version,
-                    applied_version = sy_config.version,
-                    "config changed applied"
-                );
-                let _ = send_config_response(
-                    &sender,
-                    &msg,
-                    payload.subsystem.as_str(),
-                    sy_config.version,
-                    "ok",
-                    None,
-                    None,
-                    &hive_id,
-                ).await;
+                // Routes, VPNs and taps change only through the admin actions above (this hive,
+                // origin-gated); the routers of this hive read the config region they write.
             }
         }
     }
@@ -559,53 +392,6 @@ async fn send_node_config_control_response(
     Ok(())
 }
 
-async fn send_config_response(
-    sender: &NodeSender,
-    request: &Message,
-    subsystem: &str,
-    version: u64,
-    status: &str,
-    error_code: Option<String>,
-    error_detail: Option<String>,
-    hive: &str,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let mut payload = serde_json::json!({
-        "subsystem": subsystem,
-        "version": version,
-        "status": status,
-        "hive": hive,
-    });
-    if let Some(code) = error_code {
-        payload["error_code"] = serde_json::Value::String(code);
-    }
-    if let Some(detail) = error_detail {
-        payload["error_detail"] = serde_json::Value::String(detail);
-    }
-    let reply = Message {
-        routing: Routing {
-            src: sender.uuid().to_string(),
-            src_l2_name: None,
-            dst: Destination::Unicast(request.routing.src.clone()),
-            ttl: 16,
-            trace_id: request.routing.trace_id.clone(),
-        },
-        meta: Meta {
-            msg_type: SYSTEM_KIND.to_string(),
-            msg: Some("CONFIG_RESPONSE".to_string()),
-            src_ilk: None,
-            scope: None,
-            target: None,
-            action: None,
-            priority: None,
-            context: None,
-            ..Meta::default()
-        },
-        payload,
-    };
-    sender.send(reply).await?;
-    Ok(())
-}
-
 fn build_node_config_get_payload(
     node_name: &str,
     hive_id: &str,
@@ -651,6 +437,24 @@ async fn handle_admin_action(
     writer: &mut ConfigRegionWriter,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let action = msg.meta.action.as_deref().unwrap_or("");
+    // A mutation rewrites what this hive's router enforces (routes, VPNs, taps): accept it
+    // only from the primary SY.admin, which reaches every hive's SY.config.routes directly.
+    // src_l2_name is router-stamped. Same gate as the orchestrator's F8.
+    if admin_action_mutates(action) && !is_primary_admin_origin(msg.routing.src_l2_name.as_deref())
+    {
+        tracing::warn!(
+            action = action,
+            src_uuid = %msg.routing.src,
+            src_l2_name = ?msg.routing.src_l2_name,
+            "blocked admin action from unauthorized origin"
+        );
+        let payload = admin_error_payload(
+            action,
+            "FORBIDDEN",
+            "admin action origin not allowed".to_string(),
+        );
+        return send_admin_reply(sender, msg, action, payload).await;
+    }
     let reply_payload = match action {
         "list_routes" => admin_success_payload(
             action,
@@ -846,7 +650,26 @@ async fn handle_admin_action(
             format!("Unsupported admin action '{}'", action),
         ),
     };
+    send_admin_reply(sender, msg, action, reply_payload).await
+}
 
+fn admin_action_mutates(action: &str) -> bool {
+    matches!(
+        action,
+        "add_route" | "delete_route" | "add_vpn" | "delete_vpn" | "add_tap" | "delete_tap"
+    )
+}
+
+fn is_primary_admin_origin(src_l2_name: Option<&str>) -> bool {
+    src_l2_name.map(str::trim) == Some(format!("SY.admin@{PRIMARY_HIVE_ID}").as_str())
+}
+
+async fn send_admin_reply(
+    sender: &NodeSender,
+    msg: &Message,
+    action: &str,
+    reply_payload: serde_json::Value,
+) -> Result<(), Box<dyn std::error::Error>> {
     let reply = Message {
         routing: Routing {
             src: sender.uuid().to_string(),
@@ -957,16 +780,14 @@ fn write_config(
 /// OBSERVABILITY only: they carry FLAG_ACTIVE (so config readers surface them) and
 /// FLAG_FROZEN (so the router FIB skips them — they never affect forwarding).
 ///
-/// Enforcement is the router's `system_policy::authority` gate (the single source of
+/// Enforcement is the router's `system_policy::authorize_system` gate (the single source of
 /// truth); these entries are the visible mirror of that rule set and must be kept
 /// in sync with it by hand. `SY.orchestrator@*` is any-hive (cross-hive forwards);
-/// the rest are this hive's control plane.
+/// `SY.admin@<hive>` is this hive's control plane (SY.wf-rules and WF.orch.diag left it in A-68).
 fn frozen_system_authority_routes(hive_id: &str) -> Vec<StaticRouteEntry> {
     let patterns = [
         ("SY.orchestrator@*".to_string(), MATCH_GLOB),
         (format!("SY.admin@{hive_id}"), MATCH_EXACT),
-        (format!("SY.wf-rules@{hive_id}"), MATCH_EXACT),
-        (format!("WF.orch.diag@{hive_id}"), MATCH_EXACT),
     ];
     patterns
         .into_iter()
@@ -1274,8 +1095,6 @@ fn empty_tap_entry() -> TapEntry {
     }
 }
 
-// CONFIG_CHANGED lo emite SY.admin (motherbee).
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1403,6 +1222,35 @@ mod tests {
         };
         let err = apply_node_config_set_request(&current, &request).unwrap_err();
         assert!(err.to_string().contains("JSON object"));
+    }
+
+    #[test]
+    fn config_mutations_require_the_primary_admin() {
+        for action in [
+            "add_route",
+            "delete_route",
+            "add_vpn",
+            "delete_vpn",
+            "add_tap",
+            "delete_tap",
+        ] {
+            assert!(admin_action_mutates(action), "{action}");
+        }
+        for action in ["list_routes", "list_vpns", "list_taps", ""] {
+            assert!(!admin_action_mutates(action), "{action}");
+        }
+        assert!(is_primary_admin_origin(Some("SY.admin@motherbee")));
+        assert!(is_primary_admin_origin(Some(" SY.admin@motherbee ")));
+        for bad in [
+            None,
+            Some(""),
+            Some("SY.admin@worker1"),
+            Some("SY.orchestrator@motherbee"),
+            Some("AI.chat@motherbee"),
+            Some("SY.admin"),
+        ] {
+            assert!(!is_primary_admin_origin(bad), "{bad:?}");
+        }
     }
 
     #[test]

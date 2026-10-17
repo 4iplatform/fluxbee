@@ -1,5 +1,9 @@
 # IO.cloud — spec v1 (el representante interno de Fluxbee Cloud)
 
+> **Para el equipo de Fluxbee Cloud, la referencia operativa es
+> [`io-cloud-api.md`](io-cloud-api.md)** — probada contra producción y con la procedencia de cada
+> dato. Este documento es la especificación de diseño interna.
+
 Estado: **alpha implementada para provisioning**. Fecha de actualización: 2026-07-17. Branch:
 `daily_onworking_coa`.
 Alcance: define QUÉ es `IO.cloud`, su rol de provisioning, el seam `IO.cloud → SY.admin`, el
@@ -17,19 +21,19 @@ todavía, se marca explícito.
 ## 1. Rol y posición
 
 `IO.cloud` es **el representante interno de Fluxbee Cloud dentro de la malla**: un nodo IO que vive
-en un worker, recibe lo que el edge le reenvía desde internet, y **provisiona recursos de backend**
+en **motherbee** (runtime managed motherbee-only), recibe lo que el edge le reenvía desde internet, y **provisiona recursos de backend**
 (tenant, ilk, secretos, spawn de nodos IO, externalize) en nombre de Cloud, hablándole a `SY.admin`.
 Cada nodo IO que provisiona (p.ej. `IO.wapp@<tenant>`) después **tiene su propia vida** — su propio
 adaptador, canal y seguridad.
 
-- Es un **singleton baked en el `.deb` core** (binario + `io-cloud.service` con `ExecCondition`
+- Es un **runtime MANAGED** publicado en el `.deb` core (boot=true; el orquestador lo instancia por `run_node`, configurado por CONFIG_SET/GET — ya no hay `io-cloud.service`
   gateado a `role: motherbee`), a diferencia de los adaptadores per-tenant (`io-api`/`io-slack`) que
   son runtime packages publicados y spawneados por instancia. (`docs/edge-ingress-spec-v6.md` §10)
 
 ### 1.1 El EDGE es la puerta, no la autoridad
 - Diseño invariante: **el edge es la única puerta de entrada**. Está en un hive `ingress`
   (red física separada), resuelve el **perímetro** (TLS, verificación del token/código, límites,
-  filtrado de headers). `IO.cloud` vive en un worker y **nunca sale directo a internet**.
+  filtrado de headers). `IO.cloud` vive en **motherbee** —runtime managed motherbee-only (self-check fail-closed), no un nodo instanciable en un worker— y **nunca sale directo a internet**.
 - El edge es un **firewall**, no una autoridad: autentica *que el caller es válido* y transporta,
   pero **no** decide *qué puede hacer* (no conoce tenants ni acciones). La **autorización por-tenant**
   vive downstream (`IO.cloud`/`SY.admin`). Esto **no implica tocar el edge** — ya está endurecido
@@ -95,7 +99,7 @@ Fluxbee Cloud (OAuth Google)                INTERNET
       ▼
   ┌─────────┐   HTTPS      ┌──────────────┐  malla (Unicast user-family)  ┌──────────┐
   │  Cliente│─────────────▶│  SY.edge     │──────────────────────────────▶│ IO.cloud │
-  │  Cloud  │◀─────────────│  (ingress)   │◀──────────────────────────────│ (worker) │
+  │  Cloud  │◀─────────────│  (ingress)   │◀──────────────────────────────│(motherbee)│
   └─────────┘   response   │  = firewall  │        response (mismo trace)  └────┬─────┘
                            └──────────────┘                                     │ ADMIN_COMMAND
                                                                                 ▼
@@ -130,7 +134,7 @@ El subconjunto acotado que `IO.cloud` expone (NO "todo admin"). Cada acción, su
 |---|---|---|---|
 | `create_tenant` | Command | `SY.identity` (`TNT_CREATE`) | tenant_id = `tnt:<uuid>` |
 | `put_token` → `vault_put` | Command | `SY.vault` | pool del tenant u owner `IO.*` ya registrado; descarta `ilk`/ownership crudo (ver §4) |
-| `provision_node` → `run_node` | Command | `SY.orchestrator` | spawn de un nodo `IO.*`; **requiere tenant** |
+| `provision_node` → `run_node` | Command | `SY.orchestrator` | spawn de un nodo `IO.*`; **requiere tenant**, que no puede ser el raíz (`TENANT_ROOT_NOT_ALLOWED`, ver §6) |
 
 `externalize` se usa internamente durante el bootstrap de `IO.cloud`, pero no forma parte del API
 público de Cloud. `set_ilk_definition`, `start_node`, lecturas de vault y el resto de admin tampoco se
@@ -139,6 +143,64 @@ exponen. `IO_CLOUD_EXPOSED_ACTIONS` en `SY.admin` contiene exactamente las tres 
 Fuera del catálogo día-1 (NO exponer al token público): `add_hive` (toma `ssh_user`/`ssh_password`),
 `vault_get`/lectura cruda de secretos, `executor_execute_plan` (LLM → acciones = prompt-injection→root),
 `set_node_config`, rutas/VPNs. Se agregan solo si el log muestra que Cloud los necesita, y con gate.
+
+### 3.3 Dos categorías de acción Cloud: relay-a-admin + io.cloud-local (2026-08-21, DISEÑO)
+
+> **Estado: diseño acordado, pendiente de implementar.** La acción `register_human` YA está deployada
+> (0.1.21/0.1.22) pero como una **rama ad-hoc**; esta sección define cómo volverla de **primera clase**
+> siguiendo el camino ya marcado. Se implementa **después de charlarlo**, luego prod.
+
+El catálogo §3.2 asume UN modelo: **acción Cloud = relay a `SY.admin`** (`translate_cloud_op` mapea el
+`op` a una acción admin, `dispatch_cloud_op` la manda por `ADMIN_COMMAND`, y
+`SY.admin::authorize_cloud_relay` la autoriza sobre el mismo allowlist `CLOUD_EXPOSED_ACTIONS`;
+contrato EDGE-06 **advertised == enforced**, `fluxbee_sdk::cloud::CLOUD_OP_ACTIONS` es la fuente única).
+Las tres de día-1 encajan porque el "trabajo" lo hace admin (crear tenant, vault_put, run_node).
+
+**Pero hay acciones que admin NO puede hacer**, y que por diseño le tocan al nodo IO. La primera es
+**`register_human`** (onboarding humano Cloud→frontdesk):
+- El trabajo es **provisionar un ilk humano `temporary`** (`ILK_PROVISION`, autorizado SOLO para prefijo
+  `IO.`) + **entregárselo al frontdesk** (Unicast a `SY.frontdesk.gov`, que hace `ILK_REGISTER`).
+  **`SY.admin` no puede** ni provisionar (IO-only) ni registrar (frontdesk/orch-only) → el relay-a-admin
+  **no aplica**.
+- **Generar el ilk es responsabilidad del nodo IO** —como en cualquier IO (io.slack/io.wapp/io.api
+  provisionan en primer contacto)—; io.cloud lo hace con el mismo `strict_provision_ilk` compartido.
+  El identity ya está resuelto (0.1.21/0.1.22), no se re-abre.
+
+⇒ **Hay DOS categorías de acción Cloud:**
+
+| Categoría | Ejemplos | Quién hace el trabajo | Authz | Terminus |
+|---|---|---|---|---|
+| **relay-a-admin** | create_tenant, put_token, provision_node | `SY.admin` | `authorize_cloud_relay` (allowlist `CLOUD_EXPOSED_ACTIONS`) | `ADMIN_COMMAND` |
+| **io.cloud-local** | `register_human` | **io.cloud** (provisiona + relaya al frontdesk) | el gate edge-origin+ich de io.cloud | mesh (Unicast al frontdesk) |
+
+**El "algo raro" a corregir (hoy):** `register_human` funciona en prod pero como **rama ad-hoc**
+(`op == "register_human"` en `run_loop`), NO declarada: no está en `CLOUD_OP_ACTIONS`, no la advertisa
+`list_cloud_actions`, y su `tenant_id` viaja **dentro de `params`** en vez de en la raíz (contra la
+convención de las otras tres, `io-cloud-api.md` §4). ⇒ Cloud no la puede **descubrir** y rompe la
+simetría del sobre.
+
+**Diseño de primera clase (a implementar tras la charla → prod):**
+1. **Declarar las ops locales en el SDK** — un const nuevo (p.ej. `CLOUD_LOCAL_OPS`) al lado de
+   `CLOUD_OP_ACTIONS` (`crates/fluxbee_sdk/src/cloud.rs`), fuente única compartida. El dispatch de
+   io.cloud ramifica **por el set declarado**, no por un string mágico.
+2. **`list_cloud_actions` alcanzable desde Cloud, estilo-admin con `help`** — que advertise AMBAS
+   categorías (relay + local) con su ayuda, para que Cloud **descubra** su superficie
+   programáticamente (hoy `io-cloud-api.md` §7.2: "este documento ES el catálogo", no hay
+   descubrimiento). El contrato **advertised == enforced** se mantiene: lo advertisado como *local* =
+   lo que io.cloud maneja local (gate edge+ich); lo advertisado como *relay* = lo que
+   `authorize_cloud_relay` enforcea.
+3. **Alinear el sobre** — `register_human` usa `{op, tenant_id (raíz), params, request_id}` como las
+   otras tres; io.cloud inyecta el `tenant_id` de la raíz en el handoff antes de relayar (hoy lo lee de
+   `params`).
+
+**Mecanismo para crecer:**
+- **Más acciones locales** se agregan igual (una fila en `CLOUD_LOCAL_OPS` + su handler en io.cloud),
+  sin tocar admin.
+- **A futuro (idea del operador, "lo más normal"):** un **relay genérico/directo a `SY.admin`** — que
+  io.cloud **herede** las acciones admin como pasamanos, sin trabajo por-acción (hoy cada op de relay
+  necesita su fila en `CLOUD_OP_ACTIONS` + su traducción de params). Achicaría el mantenimiento del
+  lado relay; requiere resolver el allowlist/authz genérico **sin abrir el dispatcher admin entero**
+  (EDGE-06 sigue vigente). Charla aparte.
 
 ---
 
@@ -209,7 +271,9 @@ que `IO.cloud` orquesta:
 - **Spawn:** `run_node` (admin) → `SY.orchestrator :: run_node_flow` → `SPAWN_NODE`. Runtime = primeros
   2 segmentos del nombre (`IO.wapp.<x>` → `io.wapp`). **Requiere `tenant_id`** para `IO.`/`AI.`
   (`run_node_args_require_tenant`). Inyecta `FLUXBEE_NODE_ILK_ID`/`FLUXBEE_NODE_TENANT_ID` al unit y
-  registra workloads managed (`AI`/`IO`/`WF`/`RT`) como principals `agent`.
+  registra workloads managed (`AI`/`IO`/`WF`/`RT`) como principals `agent`. En el tenant raíz solo
+  corren `io.cloud` e `io.blob`: `run_node_flow` rechaza cualquier otro nodo `IO.*` ahí con
+  `TENANT_ROOT_NOT_ALLOWED`, antes de crear nada (decisión del operador 2026-10-02).
 - **Namespacing:** `ilk_id` es `ilk:<uuid>` (random para IO/AI); el `node@hive` va en
   `identification.node_name`/`ChannelRecord.owner_l2_name`. Solo los SY.* tienen ilk determinista
   (SHA256 del nombre).

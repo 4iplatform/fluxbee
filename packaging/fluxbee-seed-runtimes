@@ -1,0 +1,170 @@
+#!/usr/bin/env bash
+# Register the .deb's base runtimes into the LIVE dist manifest (idempotent).
+#
+# WHY THIS EXISTS (U-3). The package used to ship dist/runtimes/manifest.json as payload, so
+# every upgrade replaced operator state wholesale and orphaned hot-published runtimes. The
+# manifest is operator state, not payload: the .deb now ships only the artifact tree
+# (dist/runtimes/<runtime>/<version>/bin/) and REGISTERS it here, at install time, against the
+# live root — merging instead of replacing.
+#
+# It does not merge anything itself. It calls scripts/publish-runtime.sh, the merger that
+# already existed and that scripts/install.sh has always used this way; the .deb was the
+# outlier, running that same loop at BUILD time against the staged tree (where there is never
+# anything to merge with). There are already two mergers in this tree — do not write a third.
+#
+#   sudo fluxbee-seed-runtimes        # also the operator's repair/re-run surface
+#
+# Env (all default-with-override, same idiom as fluxbee-firstboot):
+#   FLUXBEE_BASE_NODES, FLUXBEE_DIST_ROOT, FLUXBEE_PUBLISH_RUNTIME,
+#   FLUXBEE_BASE_RUNTIME_VERSION, FLUXBEE_MANIFEST_SNAPSHOT
+set -uo pipefail
+
+MANIFEST="${FLUXBEE_BASE_NODES:-/usr/share/fluxbee/base-nodes.json}"
+DIST_ROOT="${FLUXBEE_DIST_ROOT:-/var/lib/fluxbee/dist}"
+PUBLISH="${FLUXBEE_PUBLISH_RUNTIME:-/usr/share/fluxbee/publish-runtime.sh}"
+VERSION_FILE="${FLUXBEE_BASE_RUNTIME_VERSION_FILE:-/usr/share/fluxbee/base-runtime-version}"
+SNAPSHOT="${FLUXBEE_MANIFEST_SNAPSHOT:-/var/lib/fluxbee/state/runtime-manifest.preupgrade.json}"
+
+RUNTIMES_ROOT="$DIST_ROOT/runtimes"
+LIVE_MANIFEST="$RUNTIMES_ROOT/manifest.json"
+
+VER="${FLUXBEE_BASE_RUNTIME_VERSION:-}"
+[ -n "$VER" ] || VER="$(cat "$VERSION_FILE" 2>/dev/null || true)"
+if [ -z "$VER" ]; then
+  echo "fluxbee-seed-runtimes: cannot determine the base runtime version (no \$FLUXBEE_BASE_RUNTIME_VERSION, no $VERSION_FILE)" >&2
+  exit 1
+fi
+if [ ! -f "$MANIFEST" ]; then
+  echo "fluxbee-seed-runtimes: base node manifest not found: $MANIFEST" >&2
+  exit 1
+fi
+if [ ! -f "$PUBLISH" ]; then
+  echo "fluxbee-seed-runtimes: runtime publisher not found: $PUBLISH" >&2
+  exit 1
+fi
+
+# Same view-reader shape as fluxbee-firstboot:22-35.
+mf() { # runtimes -> "<runtime>\t<bin>" for every entry that names a runtime
+  python3 - "$MANIFEST" <<'PY'
+import json, sys
+m = json.load(open(sys.argv[1]))
+for e in m.get("runtimes", []):
+    rt = e.get("runtime") or ""
+    if rt:
+        print("%s\t%s" % (rt, e.get("bin", "")))
+PY
+}
+
+# Read one runtime's currently-recorded `current`, so a demotion can be reported.
+current_of() {
+  python3 - "$LIVE_MANIFEST" "$1" <<'PY' 2>/dev/null || true
+import json, sys
+try:
+    doc = json.load(open(sys.argv[1]))
+except Exception:
+    raise SystemExit(0)
+entry = (doc.get("runtimes") or {}).get(sys.argv[2]) or {}
+print(entry.get("current") or "")
+PY
+}
+
+install -d "$RUNTIMES_ROOT" 2>/dev/null || true
+
+# (1) Restore the pre-upgrade snapshot ONLY when dpkg removed the manifest as an obsolete
+#     file. Never overwrite a manifest that is present — that would be the clobber again.
+manifest_is_usable() { # a manifest that does not PARSE is worse than one that is missing
+  [ -f "$1" ] || return 1
+  python3 -c "
+import json,sys
+try:
+    d = json.load(open(sys.argv[1]))
+except Exception:
+    raise SystemExit(1)
+raise SystemExit(0 if isinstance(d, dict) else 1)
+" "$1" 2>/dev/null
+}
+
+# Decide on VALIDITY, not existence. The merger swallows a parse error and starts from a blank
+# document, so a corrupt-but-present manifest would silently erase every hot-published runtime —
+# and then the snapshot would be deleted on the way out, taking the only copy with it.
+if ! manifest_is_usable "$LIVE_MANIFEST" && [ -f "$SNAPSHOT" ]; then
+  if [ -f "$LIVE_MANIFEST" ]; then
+    cp -p "$LIVE_MANIFEST" "$LIVE_MANIFEST.corrupt.$(date +%s)" 2>/dev/null || true
+    echo "fluxbee-seed-runtimes: the live runtimes manifest does not parse; kept a .corrupt copy" >&2
+  fi
+  install -m 0644 "$SNAPSHOT" "$LIVE_MANIFEST"
+  echo "fluxbee-seed-runtimes: restored the pre-upgrade runtimes manifest from $SNAPSHOT"
+elif ! manifest_is_usable "$LIVE_MANIFEST" && [ -f "$LIVE_MANIFEST" ]; then
+  # Present, unparseable, and no snapshot to fall back on. Refuse: merging would silently drop
+  # whatever it holds.
+  echo "fluxbee-seed-runtimes: ERROR $LIVE_MANIFEST does not parse and there is no snapshot to" >&2
+  echo "  restore from. Refusing to merge over it (that would erase hot-published runtimes)." >&2
+  echo "  Inspect it, fix or move it aside, then re-run: sudo fluxbee-seed-runtimes" >&2
+  exit 1
+fi
+
+rc=0
+demotions=""
+published=0
+
+while IFS=$'\t' read -r rt bin; do
+  [ -n "${rt:-}" ] && [ -n "${bin:-}" ] || continue
+  was="$(current_of "$rt")"
+  bin_path="$RUNTIMES_ROOT/$rt/$VER/bin/$bin"
+  if [ ! -f "$bin_path" ]; then
+    echo "fluxbee-seed-runtimes: ERROR missing artifact for $rt $VER: $bin_path" >&2
+    rc=1
+    continue
+  fi
+
+  # `current` is only FORCED when what it points at is gone. The reason to force it is that
+  # dpkg deleted the previous PACKAGE version during unpack, leaving `current` dangling and
+  # every base node unstartable (U-10 for the whole base set). That reason does not apply to a
+  # version the operator hot-published and that is still on disk — snapping it back to the
+  # package build would silently undo their deployment on every upgrade.
+  set_current_args="--set-current --prune-missing"
+  if [ -n "$was" ] && [ "$was" != "$VER" ] && [ -d "$RUNTIMES_ROOT/$rt/$was" ]; then
+    set_current_args=""
+    echo "  NOTE: base runtime $rt keeps its hot-published current $was (its directory is intact);" \
+         "publishing $VER as available only"
+  fi
+  if bash "$PUBLISH" \
+      --runtime "$rt" \
+      --version "$VER" \
+      --binary "$bin_path" \
+      --dist-root "$DIST_ROOT" \
+      $set_current_args >/dev/null; then
+    published=$((published + 1))
+    # ONLY when current was actually moved. Guarded by the same condition as the decision
+    # above, otherwise the run prints "current moved" immediately after printing that it was
+    # deliberately kept — two contradictory lines about the same runtime.
+    if [ -n "$was" ] && [ "$was" != "$VER" ] && [ -n "$set_current_args" ]; then
+      demotions="$demotions  NOTE: base runtime $rt 'current' moved $was -> $VER (package authority)"$'\n'
+    fi
+  else
+    echo "fluxbee-seed-runtimes: ERROR publish failed for $rt $VER" >&2
+    rc=1
+  fi
+done < <(mf runtimes)
+
+[ -n "$demotions" ] && printf '%s' "$demotions"
+
+# Registering ZERO runtimes is never success. `rc` only moves inside the loop, so an unreadable
+# base-nodes.json (whose `mf` failure is invisible through `done < <(...)`) or a manifest with no
+# runtime entries would otherwise print a cheerful success line, exit 0, and DELETE the snapshot.
+if [ "$published" -eq 0 ]; then
+  echo "fluxbee-seed-runtimes: ERROR registered 0 base runtimes — refusing to report success." >&2
+  echo "  Check that $MANIFEST parses and lists runtimes[] entries." >&2
+  rc=1
+fi
+
+echo "fluxbee-seed-runtimes: registered $published base runtime(s) at $VER into $LIVE_MANIFEST"
+
+# Keep the snapshot on failure so the run stays retryable with the pre-upgrade state intact.
+if [ "$rc" -eq 0 ]; then
+  rm -f "$SNAPSHOT"
+else
+  echo "fluxbee-seed-runtimes: FAILED (rc=$rc). Snapshot kept at $SNAPSHOT." >&2
+  echo "  repair:  sudo fluxbee-seed-runtimes && sudo systemctl restart sy-orchestrator" >&2
+fi
+exit "$rc"

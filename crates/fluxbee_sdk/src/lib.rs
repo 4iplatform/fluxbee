@@ -1,10 +1,11 @@
 pub mod blob;
-pub mod client_config;
+pub mod cloud;
 pub mod cognition;
 pub mod comm;
 pub mod identity;
+pub mod logging;
 pub mod managed_node;
-pub mod nats;
+pub mod managed_control_plane;
 pub mod node_client;
 pub mod node_config;
 pub mod node_secret;
@@ -17,20 +18,24 @@ mod send_normalization;
 pub mod socket;
 pub mod split;
 pub mod status;
+pub mod storage;
+pub mod stream;
 pub mod thread;
 pub mod timer;
+pub mod usage;
 pub mod vault;
 
-pub use client_config::ClientConfig;
 pub use cognition::{
-    CognitionContextData, CognitionCooccurrenceData, CognitionDurableEntity,
-    CognitionDurableEnvelope, CognitionDurableOp, CognitionEpisodeData, CognitionIlkProfile,
-    CognitionMemoryData, CognitionReasonData, CognitionScopeData, CognitionScopeInstanceData,
+    CognitionCommunicationRef, CognitionContextData, CognitionCooccurrenceData,
+    CognitionDurableEntity, CognitionDurableEnvelope, CognitionDurableOp, CognitionEnvelopeBatch,
+    CognitionEpisodeData, CognitionIlkProfile, CognitionMemoryData, CognitionReasonData,
+    CognitionScopeData, CognitionScopeInstanceData, CognitionStateGet, CognitionStateResponse,
     CognitionThreadData, COGNITION_DURABLE_ENTITY_VERSION_V1, COGNITION_DURABLE_SCHEMA_VERSION,
-    SUBJECT_STORAGE_COGNITION_CONTEXTS, SUBJECT_STORAGE_COGNITION_COOCCURRENCES,
-    SUBJECT_STORAGE_COGNITION_EPISODES, SUBJECT_STORAGE_COGNITION_MEMORIES,
-    SUBJECT_STORAGE_COGNITION_REASONS, SUBJECT_STORAGE_COGNITION_SCOPES,
-    SUBJECT_STORAGE_COGNITION_SCOPE_INSTANCES, SUBJECT_STORAGE_COGNITION_THREADS,
+    MSG_COGNITION_STATE_GET, MSG_COGNITION_STATE_RESPONSE, SUBJECT_STORAGE_COGNITION_CONTEXTS,
+    SUBJECT_STORAGE_COGNITION_COOCCURRENCES, SUBJECT_STORAGE_COGNITION_EPISODES,
+    SUBJECT_STORAGE_COGNITION_MEMORIES, SUBJECT_STORAGE_COGNITION_REASONS,
+    SUBJECT_STORAGE_COGNITION_SCOPES, SUBJECT_STORAGE_COGNITION_SCOPE_INSTANCES,
+    SUBJECT_STORAGE_COGNITION_THREADS,
 };
 pub use identity::{
     deterministic_system_ilk_id, identity_shm_name_for_hive, list_ich_options_from_hive_config,
@@ -47,9 +52,11 @@ pub use identity::{
     MSG_ILK_UPDATE, MSG_TNT_APPROVE, MSG_TNT_CREATE, MSG_TNT_SET_SPONSOR, MSG_TNT_UPDATE,
 };
 pub use managed_node::{
-    managed_node_config_path, managed_node_config_path_with_root, managed_node_instance_dir,
-    managed_node_instance_dir_with_root, managed_node_name, ManagedNodeError,
-    DEFAULT_MANAGED_NODE_ROOT, FLUXBEE_NODE_NAME_ENV,
+    is_allowed_non_sy_lifecycle_node, is_root_tenant, managed_node_config_path,
+    managed_node_config_path_with_root, managed_node_instance_dir,
+    managed_node_instance_dir_with_root, managed_node_name,
+    ManagedNodeError, DEFAULT_MANAGED_NODE_ROOT, FLUXBEE_NODE_NAME_ENV,
+    HIVE_YAML_NON_SY_LIFECYCLE_NODES,
 };
 pub use node_client::{NodeConfig, NodeError, NodeUuidMode};
 pub use node_config::{
@@ -84,6 +91,10 @@ pub use rpc::{
 };
 pub use split::NodeSender;
 pub use status::try_handle_default_node_status;
+pub use storage::{
+    StorageInboxMetrics, StorageMetricsResponse, MSG_STORAGE_METRICS_GET,
+    MSG_STORAGE_METRICS_RESPONSE,
+};
 pub use thread::{compute_thread_id, ThreadIdError, ThreadIdInput};
 pub use timer::{
     build_timer_system_request, build_timer_system_request_with_target,
@@ -103,14 +114,21 @@ pub use timer::{
     TIMER_DEFAULT_RPC_TIMEOUT_MS, TIMER_DEFAULT_TIME_RETRY_SCHEDULE_MS, TIMER_LIST_DEFAULT_LIMIT,
     TIMER_LIST_MAX_LIMIT, TIMER_MIN_DURATION_MS, TIMER_NODE_FAMILY, TIMER_NODE_KIND,
 };
+pub use usage::{
+    TenantSource, UsageGroup, UsageGroupBy, UsageKind, UsageOutcome, UsageQuery,
+    UsageQueryResponse, UsageRecord, UsageWork, MSG_USAGE_QUERY, MSG_USAGE_QUERY_RESPONSE,
+    USAGE_FIELD_MAX_CHARS, USAGE_QUERY_DEFAULT_LIMIT, USAGE_QUERY_MAX_DAYS, USAGE_QUERY_MAX_LIMIT,
+    USAGE_RAW_MAX_BYTES,
+};
 pub use vault::{
-    normalize_resource_type, ResourceType, VaultCaller, VaultCallerOwned, VaultClient,
+    normalize_resource_type, vault_failure_is_transport, vault_key_is_valid, ResourceType, VaultCaller, VaultCallerOwned, VaultClient,
     VaultDeleteResponse, VaultError, VaultFilter, VaultGetMetadataRequest,
-    VaultGetMetadataResponse, VaultGetRequest, VaultGetResponse, VaultKeyRequest, VaultListRequest,
+    VaultGetMetadataResponse, VaultGetRequest, VaultGetResponse, VaultKeyRequest, VaultListRequest, VaultScopedKeyRequest,
     VaultListResponse, VaultMetadata, VaultPutRequest, VaultPutResponse, VaultRetryPolicy,
-    VaultRollbackResponse, VaultRotateRequest, VaultRotateResponse, VaultSecretSummary,
-    VaultValueResponse, MSG_VAULT_DELETE, MSG_VAULT_DELETE_RESPONSE, MSG_VAULT_GET,
+    VaultAssignRequest, VaultRollbackResponse, VaultRotateRequest, VaultRotateResponse, VaultSecretSummary,
+    VaultValueResponse, VAULT_BOOT_RETRY_INTERVAL, VAULT_BOOT_WAIT, MSG_VAULT_DELETE, MSG_VAULT_DELETE_RESPONSE, MSG_VAULT_GET,
     MSG_VAULT_GET_METADATA, MSG_VAULT_GET_METADATA_RESPONSE, MSG_VAULT_GET_RESPONSE,
     MSG_VAULT_LIST, MSG_VAULT_LIST_RESPONSE, MSG_VAULT_PUT, MSG_VAULT_PUT_RESPONSE,
-    MSG_VAULT_ROLLBACK, MSG_VAULT_ROLLBACK_RESPONSE, MSG_VAULT_ROTATE, MSG_VAULT_ROTATE_RESPONSE,
+    MSG_VAULT_ASSIGN, MSG_VAULT_ASSIGN_RESPONSE, MSG_VAULT_ROLLBACK, MSG_VAULT_ROLLBACK_RESPONSE,
+    MSG_VAULT_ROTATE, MSG_VAULT_ROTATE_RESPONSE,
 };

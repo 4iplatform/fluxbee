@@ -34,7 +34,7 @@
 
 ### Mensajes de Sistema
 
-- **CONFIG_CHANGED**: Broadcast emitido por SY.admin para distribuir cambios de configuración. Contiene `subsystem`, `version` y `config`.
+- **CONFIG_CHANGED**: mensaje SYSTEM protegido con `subsystem`, `version` y `config`. Hoy lo usa solo SY.admin, para la policy OPA de usuario (ver `opa-distribution.md`); rutas/VPN/taps ya no (desde 0.1.44) y el `node_config` de los orquestadores se eliminó en 0.1.45.
 
 - **CONFIG_RESPONSE**: Unicast de respuesta a CONFIG_CHANGED. Confirma aplicación (`status: ok`) o reporta error (`status: error`). Obligatorio para todos los nodos SY que reciben configuración.
 
@@ -44,7 +44,7 @@
 
 - **Motherbee**: Isla madre. Contiene PostgreSQL, SY.storage, SY.orchestrator, SY.admin. Cerebro del cluster.
 
-- **Worker**: Isla hija. Stateless, reconstruible. Contiene router, NATS, SY.cognition, nodos AI/IO/WF. Músculo del cluster.
+- **Worker**: Isla hija. Stateless, reconstruible. Contiene router (con su stream), SY.cognition, nodos AI/IO/WF. Músculo del cluster.
 
 - **hive.yaml**: Archivo que define la identidad de la isla. Campo `role: motherbee` o `role: worker`.
 
@@ -66,7 +66,7 @@
 
 - **jsr-identity-<hive>**: Región de identidad. Contiene ILKs, ICHs, modules, degrees. Writer: SY.identity.
 
-- **jsr-memory-<hive>**: Región SHM cognitiva. Contiene snapshot por `thread_id` con `memory_package` v2 truncado. Writer: SY.cognition.
+- **jsr-memory-<hive>**: Región SHM cognitiva. Contiene snapshot por comunicación (`thread_id` + agente) con `memory_package` v2 truncado. Writer: SY.cognition.
 
 - **Seqlock**: Mecanismo de sincronización para un writer y múltiples readers. El writer incrementa un contador de secuencia antes y después de escribir (impar = escritura en curso); el reader lee el contador, lee el dato in-place, y reintenta si el contador cambió o quedó impar. Readers nunca copian ni bloquean.
 
@@ -96,11 +96,11 @@
 
 - **thread_id**: Identificador físico/canónico de la conversación. Lo calcula SDK/IO y viaja en `meta.thread_id`.
 
-- **thread_seq**: Secuencia monotónica por `thread_id`. La asigna el router.
+- **Turno de una comunicación**: el orden de una comunicación es el número de turno que lleva SY.cognition; el mensaje no lleva secuencia (`meta.thread_seq` salió del protocolo en 0.1.78).
 
 - **ctx / ctx_seq / ctx_window**: Campos legacy/históricos del protocolo. Ya no forman parte del carrier conversacional activo del repo.
 
-- **Persistencia de turns**: El router publica cada mensaje en `storage.turns`; `SY.storage` lo materializa en durable.
+- **Persistencia de turns**: El router donde entra cada mensaje lo copia a su stream (`storage.turns`); `SY.storage` lo escribe en `turns`, el log de mensajes.
 
 ### Cognición y Memoria
 
@@ -116,33 +116,31 @@
 
 - **context_inhibition**: Supresión contextual de un evento/item. Permite reemplazo funcional sin borrado.
 
-- **jsr-memory-<hive>**: Región SHM con snapshot `thread_id` → `memory_package` v2. Writer: SY.cognition.
+- **jsr-memory-<hive>**: Región SHM con snapshot (`thread_id`, agente) → `memory_package` v2. Writer: SY.cognition.
 
 - **LanceDB**: Base de datos embebida para episodios y items. Cache reconstruible desde PostgreSQL.
 
-- **MemoryPackage**: Paquete de antecedentes relevantes que el router agrega al mensaje.
+- **MemoryPackage**: Paquete de antecedentes relevantes que el router agrega al mensaje que entrega a un nodo `AI.*` (el de esa comunicación; uno que puso el emisor se descarta).
 
 - **SY.cognition**: Proceso que consolida evidencia en memoria episódica. Single-writer de `jsr-memory` y durable cognition storage; LanceDB sigue diferido.
 
 - **Cold Start**: Reconstrucción de memoria desde PostgreSQL cuando LanceDB está vacío/corrupto.
 
-### Persistencia y NATS
+### Persistencia y stream del router
 
-- **NATS embebido**: Servidor NATS JetStream embebido en el router (si config). Buffer local con persistencia.
+- **Stream del router**: Log corto en disco de cada router, que es también un nodo: `RT.<router>.stream@<hive>`. Entrega sus registros en lotes con ack (`STREAM_BATCH` / `STREAM_ACK`) a sus sinks por el socket de fluxbee, por el routing normal (local, IRP, WAN). Reemplazó al broker NATS embebido, que se borró en 0.1.78.
 
-- **JetStream**: Capa de persistencia de NATS. Garantiza entrega at-least-once.
+- **Ventana**: 120 s y 32 MB por router. Mejor esfuerzo: lo que un sink no toma a tiempo se pierde y se cuenta (una línea de alarma cada 30 s; `streamlost` en `ops.py health`).
 
-- **fire & forget**: Patrón donde el router publica a NATS sin esperar confirmación de PostgreSQL (~1ms).
+- **fire & forget**: El router deja la copia en una cola acotada del stream y nunca espera al log ni a PostgreSQL.
 
-- **SY.storage**: Proceso que consume NATS y escribe a PostgreSQL. Solo corre en isla madre.
+- **STREAM_APPEND**: Mensaje de sistema con el que un nodo agrega un registro al stream de su router (`fluxbee_sdk::stream::append`); el router solo acepta los subjects permitidos a ese productor.
 
-- **WAN bridge**: Funcionalidad del router que consume NATS local y forward por TCP a isla madre.
-
-- **WorkQueue**: Tipo de stream NATS donde cada mensaje es entregado a un solo consumer.
+- **SY.storage**: Proceso que toma los lotes de los streams en `storage_inbox` y escribe a PostgreSQL. Solo corre en isla madre.
 
 - **Idempotencia**: Propiedad de las escrituras: `ON CONFLICT DO NOTHING` permite re-envíos sin duplicados.
 
-- **Batch**: Agrupación de turns antes de enviar por WAN (100 turns o 100ms).
+- **Batch**: Lote del stream (`STREAM_BATCH`): como mucho 256 registros y 96 KB, uno en vuelo por sink.
 
 ---
 
@@ -164,11 +162,11 @@
 | LanceDB local por isla | Latencia baja, serverless, cache reconstruible |
 | Tags exactos + semánticos async | Router no bloquea; SY.cognition enriquece después |
 | Prioridad dinámica sin borrado | Evidencia inmutable, solo cambia activación/inhibición |
-| NATS embebido en router | Sin servidor externo, mismo binario, config decide |
-| Router no espera a DB | Fire & forget a NATS (~1ms), SY.storage persiste async |
+| Stream por router (`RT.<router>.stream@<hive>`) | Sin servidor externo, mismo binario; el socket de fluxbee es el caño (NATS se borró en 0.1.78) |
+| Router no espera a DB | La copia va a una cola acotada del stream, SY.storage persiste async |
 | SY.storage solo en madre | Único punto de escritura a PostgreSQL, simplicidad |
-| WAN bridge en router con config | Mismo binario, NATS consume → forward TCP |
-| Múltiples NATS independientes OK | DB deduplica por (ctx, seq), idempotencia |
+| Lotes del stream por el routing normal | Sin bridge aparte: un lote viaja como cualquier mensaje (local, IRP, WAN) |
+| Un stream por router OK | SY.storage deduplica por `dedupe_key` (hash de subject y payload), idempotencia |
 | Orchestrator solo en Motherbee | Workers son stateless, systemd local basta |
 | Workers reconstruibles | LanceDB/jsr-memory se regeneran desde PostgreSQL |
 
@@ -180,7 +178,7 @@
 | SY.storage | ✓ | - |
 | SY.orchestrator | ✓ | - |
 | SY.admin | ✓ | - |
-| Router + NATS | ✓ | ✓ |
+| Router + stream | ✓ | ✓ |
 | Syncthing (opcional, blobs) | ✓ | ✓ |
 | SY.identity/config/opa | ✓ | ✓ (cache) |
 | SY.cognition + LanceDB | ✓ | ✓ |
@@ -270,11 +268,13 @@ pub const MAX_EVENTS_PER_TENANT: usize = 65536;
 pub const MEMORY_FETCH_TIMEOUT_MS: u64 = 50;
 pub const MEMORY_PACKAGE_MAX_BYTES: usize = 32 * 1024;  // 32KB
 
-// NATS
-pub const NATS_DEFAULT_PORT: u16 = 4222;
-pub const NATS_STREAM_MAX_AGE_DAYS: u64 = 7;
-pub const WAN_BATCH_SIZE: usize = 100;
-pub const WAN_BATCH_TIMEOUT_MS: u64 = 100;
+// Stream del router (src/router/stream.rs)
+pub const STREAM_MAX_AGE_SECS: u64 = 120;
+pub const STREAM_MAX_BYTES: u64 = 32 * 1024 * 1024;
+pub const STREAM_QUEUE_MAX_BYTES: u64 = 16 * 1024 * 1024;
+pub const STREAM_BATCH_MAX_RECORDS: usize = 256;
+pub const STREAM_BATCH_MAX_BYTES: usize = 96 * 1024;
+pub const STREAM_ALARM_INTERVAL_SECS: u64 = 30;
 ```
 
 ---
@@ -295,7 +295,7 @@ pub const WAN_BATCH_TIMEOUT_MS: u64 = 100;
 | 10 | `10-identity-layer3.md` | **ILK, SY.identity, routing L3** |
 | 11 | `11-context.md` | **Documento histórico del modelo CTX/ctx_window** |
 | 12 | `12-cognition.md` | **Documento histórico v1 de cognition** |
-| 13 | `13-storage.md` | **NATS embebido, SY.storage, persistencia** |
+| 13 | `13-storage.md` | **Stream del router, SY.storage, persistencia** |
 | -- | `SY_nodes_spec.md` | Nodos SY (config.routes, opa.rules, identity, cognition, storage) |
 
 ---
@@ -312,5 +312,3 @@ pub const WAN_BATCH_TIMEOUT_MS: u64 = 100;
 - [sqlx (Rust)](https://github.com/launchbadge/sqlx)
 - [tokio-postgres](https://docs.rs/tokio-postgres/)
 - [LanceDB](https://lancedb.github.io/lancedb/)
-- [NATS JetStream](https://docs.nats.io/nats-concepts/jetstream)
-- [async-nats (Rust)](https://docs.rs/async-nats/)

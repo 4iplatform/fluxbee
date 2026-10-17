@@ -7,7 +7,7 @@ Estado: Acordado para ejecución
 
 1. `SY.storage` no participa en blobs.
 - Ownership de blobs: toolkit transversal + procesos productores/consumidores.
-- `SY.storage` sigue limitado a NATS + PostgreSQL.
+- `SY.storage` sigue limitado a lo que le llega por el stream de los routers + PostgreSQL.
 
 2. El blob es agnóstico del medio de almacenamiento.
 - Para la capa blob, `NFS` y `Syncthing` son equivalentes: ambos terminan en un path local.
@@ -15,7 +15,7 @@ Estado: Acordado para ejecución
 
 3. No habrá API de blobs por red como camino de producto.
 - Se elimina el track de `POST/GET /blob` como fallback operativo.
-- El transporte de mensajes sigue en router/NATS; el archivo se resuelve por filesystem sincronizado/compartido.
+- El transporte de mensajes sigue en el router; el archivo se resuelve por filesystem sincronizado/compartido.
 
 4. Syncthing queda como herramienta de sincronización externa.
 - El orchestrator la instala, inicia, monitorea y reinicia si corresponde.
@@ -128,7 +128,7 @@ Salida:
 
 Tareas:
 1. Métricas base: `blob_put_total`, `blob_get_total`, bytes, errores.
-2. Diagnóstico E2E blob similar a suites NATS.
+2. Diagnóstico E2E blob.
 3. Documentación en `docs/onworking/diagnostics_tasks.md`.
 
 Salida:

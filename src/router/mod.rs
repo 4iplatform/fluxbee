@@ -1,3 +1,4 @@
+pub mod stream;
 pub mod system_policy;
 
 use std::collections::HashMap;
@@ -15,10 +16,6 @@ use tokio::time::{self, Duration};
 use uuid::Uuid;
 
 use crate::config::RouterConfig;
-use crate::nats::{
-    check_endpoint as nats_check_endpoint, start_embedded_broker_with_storage, NatsPublisher,
-    SUBJECT_STORAGE_TURNS,
-};
 use crate::opa::OpaResolver;
 use crate::shm::{
     copy_bytes_with_len, memory_shm_name_for_hive, now_epoch_ms, sha256_bytes_is_zero,
@@ -27,21 +24,21 @@ use crate::shm::{
     OpaSnapshot, RemoteHiveEntry, RemoteNodeEntry, RemoteRouteEntry, RemoteTapEntry,
     RemoteVpnEntry, RouterRegionReader, RouterRegionWriter, TapEntry, VpnAssignment, ACTION_DROP,
     ACTION_FORWARD, FLAG_ACTIVE, FLAG_DELETED, FLAG_FROZEN, FLAG_STALE, HEARTBEAT_STALE_MS,
-    HIVE_FLAG_SELF, MATCH_EXACT, MATCH_GLOB, MATCH_PREFIX, OPA_STATUS_ERROR, OPA_STATUS_LOADING,
+    HIVE_FLAG_SELF, MATCH_EXACT, MATCH_GLOB, MATCH_PREFIX, OPA_STATUS_ERROR, OPA_STATUS_LOADING, OPA_STATUS_OK,
 };
 use fluxbee_sdk::protocol::{
     build_announce, build_lsa, build_router_hello, build_ttl_exceeded, build_unreachable,
     build_wan_accept, build_wan_hello, build_wan_reachability, build_wan_reject, Destination,
-    LsaNode, LsaPayload, LsaRoute, LsaTap, LsaVpn, Message, Meta, NodeAnnouncePayload,
-    NodeHelloPayload, OpaReloadPayload, RouterHelloPayload, WanAcceptPayload, WanHelloPayload,
-    WanNegotiated, WanReachabilityEntry, WanReachabilityPayload, WanRejectPayload, WanTimers,
-    MSG_CONFIG_CHANGED, MSG_EDGE_CLOSE_URL, MSG_EDGE_CLOSE_URL_RESPONSE, MSG_EDGE_LIST_URLS,
-    MSG_EDGE_LIST_URLS_RESPONSE, MSG_EDGE_OPEN_URL, MSG_EDGE_OPEN_URL_RESPONSE,
+    LsaNode, LsaPayload, LsaRoute, LsaTap, LsaVpn, MemoryPackage, Message, Meta,
+    NodeAnnouncePayload, NodeHelloPayload, OpaReloadPayload, RouterHelloPayload, WanAcceptPayload,
+    WanHelloPayload, WanNegotiated, WanReachabilityEntry, WanReachabilityPayload, WanRejectPayload,
+    WanTimers, MESH_PROTOCOL_VERSION, MSG_EDGE_CLOSE_URL, MSG_EDGE_CLOSE_URL_RESPONSE,
+    MSG_EDGE_LIST_URLS, MSG_EDGE_LIST_URLS_RESPONSE, MSG_EDGE_OPEN_URL, MSG_EDGE_OPEN_URL_RESPONSE,
     MSG_EDGE_PUBLISH_BLOB, MSG_EDGE_PUBLISH_BLOB_RESPONSE, MSG_EDGE_UNPUBLISH_BLOB,
     MSG_EDGE_UNPUBLISH_BLOB_RESPONSE, MSG_HELLO, MSG_LSA, MSG_OPA_RELOAD, MSG_TTL_EXCEEDED,
     MSG_UNREACHABLE, MSG_WAN_REACHABILITY, MSG_WITHDRAW, SCOPE_GLOBAL, SYSTEM_KIND,
 };
-use fluxbee_sdk::socket::connection::{read_frame, write_frame};
+use fluxbee_sdk::socket::connection::{read_frame, write_frame, MAX_FRAME_SIZE};
 use fluxbee_sdk::{classify_routed_message, MSG_VAULT_GET, MSG_VAULT_GET_RESPONSE};
 
 #[derive(Debug, thiserror::Error)]
@@ -84,15 +81,13 @@ pub struct Router {
     /// hub's `MSG_WAN_REACHABILITY` advertisements. Kept separate from `lsa_state`/the LSA snapshot.
     reachability: Arc<Mutex<std::collections::HashMap<Uuid, ReachabilityEntry>>>,
     lsa_seq: Arc<Mutex<u64>>,
-    thread_sequences: Arc<Mutex<HashMap<String, u64>>>,
-    nats_publisher: Option<Arc<NatsPublisher>>,
-    nats_publish_errors: Arc<AtomicU64>,
+    /// This router's stream (docs/router-stream-v1.md, A-70): the turn copies and the nodes'
+    /// appends go here, for SY.storage.
+    stream: stream::StreamHandle,
+    /// The stream's node, started once the router listens.
+    stream_runtime: std::sync::Mutex<Option<stream::StreamRuntime>>,
 }
 
-const NATS_READY_TIMEOUT_SECS: u64 = 20;
-const NATS_READY_RETRY_MS: u64 = 250;
-const NATS_EMBEDDED_RECOVERY_INTERVAL_SECS: u64 = 5;
-const NATS_PUBLISH_ERROR_LOG_EVERY: u64 = 25;
 const LSA_REJECT_HIVE_MISMATCH: &str = "hive_mismatch";
 const LSA_REJECT_STALE_SEQ: &str = "stale_seq";
 const LSA_REJECT_PARSE_ERROR: &str = "parse_error";
@@ -132,10 +127,14 @@ impl Router {
             Ok(name) => MemoryRegionReader::open_read_only(&name).ok(),
             Err(_) => None,
         };
-        let nats_publisher = Some(Arc::new(NatsPublisher::new(
-            cfg.nats_url.clone(),
-            SUBJECT_STORAGE_TURNS.to_string(),
-        )));
+        let (stream, stream_runtime) = stream::open(
+            &cfg.router_l2_name,
+            &cfg.hive_id,
+            &cfg.hive_role,
+            &cfg.state_dir,
+            &cfg.config_dir,
+            &cfg.node_socket_path,
+        );
         Self {
             cfg,
             shm: Arc::new(Mutex::new(shm)),
@@ -160,22 +159,32 @@ impl Router {
             lsa_state: Arc::new(Mutex::new(std::collections::HashMap::new())),
             reachability: Arc::new(Mutex::new(std::collections::HashMap::new())),
             lsa_seq: Arc::new(Mutex::new(0)),
-            thread_sequences: Arc::new(Mutex::new(HashMap::new())),
-            nats_publisher,
-            nats_publish_errors: Arc::new(AtomicU64::new(0)),
+            stream,
+            stream_runtime: std::sync::Mutex::new(Some(stream_runtime)),
         }
     }
 
     pub async fn run(&self) -> Result<(), RouterError> {
-        prepare_nats_runtime(&self.cfg).await?;
-        wait_for_nats_ready(&self.cfg, Duration::from_secs(NATS_READY_TIMEOUT_SECS)).await?;
-        if self.cfg.nats_mode == "embedded" {
-            spawn_embedded_nats_recovery_loop(&self.cfg);
-        }
+        // Fail closed: the SYSTEM authority + routing policies are baked into the binary
+        // (policy/system.wasm + policy/system_route.wasm). If either cannot load/evaluate, the
+        // router has no business running — there is no Rust fallback table, the Rego is the single
+        // source of truth. Refuse to start rather than silently degrade.
+        system_policy::ensure_system_policy_loaded().map_err(RouterError::Startup)?;
+
         ensure_parent_dir(&self.cfg.node_socket_path)?;
         let _ = std::fs::remove_file(&self.cfg.node_socket_path);
         let listener = UnixListener::bind(&self.cfg.node_socket_path)?;
         set_socket_mode(&self.cfg.node_socket_path, 0o666)?;
+        // The stream joins this router as a node once it listens; never awaited here, since the
+        // router accepts nodes only at the end of `run` (§2.1).
+        if let Some(runtime) = self
+            .stream_runtime
+            .lock()
+            .ok()
+            .and_then(|mut slot| slot.take())
+        {
+            std::mem::drop(tokio::spawn(stream::run_node(runtime)));
+        }
         tracing::info!(
             router = %self.cfg.router_l2_name,
             socket = %self.cfg.node_socket_path.display(),
@@ -198,11 +207,40 @@ impl Router {
         let opa_reader = Arc::clone(&self.opa_reader);
         let hive_id = self.cfg.hive_id.clone();
         let heartbeat_interval = self.cfg.heartbeat_interval_ms;
+        let config_reader = Arc::clone(&self.config_reader);
+        let static_routes = Arc::clone(&self.static_routes);
+        let vpn_rules = Arc::clone(&self.vpn_rules);
+        let tap_rules = Arc::clone(&self.tap_rules);
+        let config_version = Arc::clone(&self.config_version);
+        let nodes_hb = Arc::clone(&self.nodes);
+        let peer_nodes_hb = Arc::clone(&self.peer_nodes);
+        let fib_hb = Arc::clone(&self.fib);
+        let lsa_snapshot_hb = Arc::clone(&self.lsa_snapshot);
+        let reachability_hb = Arc::clone(&self.reachability);
         tokio::spawn(async move {
             let mut ticker = time::interval(Duration::from_millis(heartbeat_interval));
             loop {
                 ticker.tick().await;
                 maybe_refresh_opa_from_shm(&opa_reader, &opa, &shm, &hive_id).await;
+                // Routes, VPNs and taps are otherwise re-read only on frames from this router's
+                // own nodes: a router with none (a pure gateway on a hive with several routers)
+                // would route and advertise stale config. Version-gated: a no-op when unchanged.
+                let _ = refresh_config(
+                    &config_reader,
+                    &static_routes,
+                    &vpn_rules,
+                    &tap_rules,
+                    &config_version,
+                    &hive_id,
+                    &nodes_hb,
+                    &peer_nodes_hb,
+                    &shm,
+                    &fib_hb,
+                    &lsa_snapshot_hb,
+                    &reachability_hb,
+                    false,
+                )
+                .await;
                 let (policy_version, load_status) = {
                     let opa = opa.lock().await;
                     opa.status()
@@ -219,14 +257,10 @@ impl Router {
         let nodes_pd = Arc::clone(&self.nodes);
         let wan_peers_pd = Arc::clone(&self.wan_peers);
         let static_routes_pd = Arc::clone(&self.static_routes);
-        let vpn_rules_pd = Arc::clone(&self.vpn_rules);
-        let tap_rules_pd = Arc::clone(&self.tap_rules);
         let lsa_snapshot_pd = Arc::clone(&self.lsa_snapshot);
         let reachability_pd = Arc::clone(&self.reachability);
         let fib_pd = Arc::clone(&self.fib);
-        let config_reader_pd = Arc::clone(&self.config_reader);
         let lsa_reader_pd = Arc::clone(&self.lsa_reader);
-        let config_version_pd = Arc::clone(&self.config_version);
         let shm_pd = Arc::clone(&self.shm);
         let opa_pd = Arc::clone(&self.opa);
         let opa_reader_pd = Arc::clone(&self.opa_reader);
@@ -237,7 +271,7 @@ impl Router {
         let identity_frontdesk_node_name = self.cfg.identity_frontdesk_node_name.clone();
         let is_gateway = self.cfg.is_gateway;
         let peer_socket_dir = self.cfg.node_socket_dir.clone();
-        let thread_sequences_pd = Arc::clone(&self.thread_sequences);
+        let log_stream_pd = self.stream.clone();
         let memory_reader_pd = Arc::clone(&self.memory_reader);
         tokio::spawn(async move {
             peer_discovery_loop(
@@ -252,12 +286,8 @@ impl Router {
                 peer_routers_pd,
                 nodes_pd,
                 wan_peers_pd,
-                config_reader_pd,
                 lsa_reader_pd,
                 static_routes_pd,
-                vpn_rules_pd,
-                tap_rules_pd,
-                config_version_pd,
                 shm_pd,
                 opa_pd,
                 opa_reader_pd,
@@ -265,7 +295,7 @@ impl Router {
                 lsa_snapshot_pd,
                 reachability_pd,
                 fib_pd,
-                thread_sequences_pd,
+                log_stream_pd,
                 is_gateway,
             )
             .await;
@@ -298,12 +328,8 @@ impl Router {
         let peer_routers = Arc::clone(&self.peer_routers);
         let nodes = Arc::clone(&self.nodes);
         let fib = Arc::clone(&self.fib);
-        let config_reader = Arc::clone(&self.config_reader);
         let lsa_reader = Arc::clone(&self.lsa_reader);
         let static_routes = Arc::clone(&self.static_routes);
-        let vpn_rules = Arc::clone(&self.vpn_rules);
-        let tap_rules = Arc::clone(&self.tap_rules);
-        let config_version = Arc::clone(&self.config_version);
         let shm = Arc::clone(&self.shm);
         let opa = Arc::clone(&self.opa);
         let opa_reader = Arc::clone(&self.opa_reader);
@@ -313,7 +339,7 @@ impl Router {
         let wan_peers = Arc::clone(&self.wan_peers);
         let lsa_snapshot = Arc::clone(&self.lsa_snapshot);
         let reachability = Arc::clone(&self.reachability);
-        let thread_sequences = Arc::clone(&self.thread_sequences);
+        let log_stream = self.stream.clone();
         let is_gateway = self.cfg.is_gateway;
         let router_uuid = self.cfg.router_uuid;
         tokio::spawn(async move {
@@ -330,11 +356,7 @@ impl Router {
                 let peer_routers = Arc::clone(&peer_routers);
                 let nodes = Arc::clone(&nodes);
                 let fib = Arc::clone(&fib);
-                let config_reader = Arc::clone(&config_reader);
                 let static_routes = Arc::clone(&static_routes);
-                let vpn_rules = Arc::clone(&vpn_rules);
-                let tap_rules = Arc::clone(&tap_rules);
-                let config_version = Arc::clone(&config_version);
                 let shm = Arc::clone(&shm);
                 let opa = Arc::clone(&opa);
                 let opa_reader = Arc::clone(&opa_reader);
@@ -345,7 +367,7 @@ impl Router {
                 let lsa_reader = Arc::clone(&lsa_reader);
                 let lsa_snapshot = Arc::clone(&lsa_snapshot);
                 let reachability = Arc::clone(&reachability);
-                let thread_sequences = Arc::clone(&thread_sequences);
+                let log_stream = log_stream.clone();
                 let is_gateway = is_gateway;
                 tokio::spawn(async move {
                     if let Err(err) = handle_peer_incoming(
@@ -356,12 +378,8 @@ impl Router {
                         peer_routers,
                         nodes,
                         fib,
-                        config_reader,
                         lsa_reader,
                         static_routes,
-                        vpn_rules,
-                        tap_rules,
-                        config_version,
                         shm,
                         opa,
                         opa_reader,
@@ -371,7 +389,7 @@ impl Router {
                         wan_peers,
                         lsa_snapshot,
                         reachability,
-                        thread_sequences,
+                        log_stream,
                         is_gateway,
                     )
                     .await
@@ -421,7 +439,7 @@ impl Router {
                             tracing::error!(
                                 error = %err,
                                 dir = %self.cfg.tls_dir.display(),
-                                "wan.mtls=required but no TLS material on disk; WAN FAIL-CLOSED (all peers rejected). Provision certs (add_hive / cert reconcile)."
+                                "wan.mtls=required but no TLS material on disk; WAN FAIL-CLOSED (all peers rejected). A hive without its leaf is joined again (add_hive)."
                             );
                         } else {
                             tracing::warn!(
@@ -461,7 +479,7 @@ impl Router {
                 fib: Arc::clone(&self.fib),
                 broadcast_cache: Arc::clone(&self.broadcast_cache),
                 lsa_seq: Arc::clone(&self.lsa_seq),
-                thread_sequences: Arc::clone(&self.thread_sequences),
+                log_stream: self.stream.clone(),
                 memory_reader: Arc::clone(&self.memory_reader),
                 opa: Arc::clone(&self.opa),
                 wan_session_epochs: Arc::new(Mutex::new(std::collections::HashMap::new())),
@@ -516,10 +534,8 @@ impl Router {
             let opa_reader = Arc::clone(&self.opa_reader);
             let broadcast_cache = Arc::clone(&self.broadcast_cache);
             let lsa_seq = Arc::clone(&self.lsa_seq);
-            let thread_sequences = Arc::clone(&self.thread_sequences);
             let memory_reader = Arc::clone(&self.memory_reader);
-            let nats_publisher = self.nats_publisher.clone();
-            let nats_publish_errors = Arc::clone(&self.nats_publish_errors);
+            let log_stream = self.stream.clone();
             let is_gateway = self.cfg.is_gateway;
             let identity_frontdesk_node_name = self.cfg.identity_frontdesk_node_name.clone();
             tokio::spawn(async move {
@@ -545,9 +561,7 @@ impl Router {
                     broadcast_cache,
                     lsa_seq,
                     memory_reader,
-                    thread_sequences,
-                    nats_publisher,
-                    nats_publish_errors,
+                    log_stream,
                     router_uuid,
                     &router_name,
                     &hive_id,
@@ -585,33 +599,24 @@ async fn handle_node(
     broadcast_cache: Arc<Mutex<BroadcastCache>>,
     lsa_seq: Arc<Mutex<u64>>,
     memory_reader: Arc<Mutex<Option<MemoryRegionReader>>>,
-    thread_sequences: Arc<Mutex<HashMap<String, u64>>>,
-    nats_publisher: Option<Arc<NatsPublisher>>,
-    nats_publish_errors: Arc<AtomicU64>,
+    log_stream: stream::StreamHandle,
     router_uuid: Uuid,
     router_name: &str,
     hive_id: &str,
     identity_frontdesk_node_name: &str,
     is_gateway: bool,
 ) -> Result<(), RouterError> {
-    let (mut reader, mut writer) = stream.into_split();
-    let (tx, mut rx) = mpsc::unbounded_channel::<Vec<u8>>();
-    let writer_task = tokio::spawn(async move {
-        while let Some(frame) = rx.recv().await {
-            if let Err(err) = write_frame(&mut writer, &frame).await {
-                if err.kind() == std::io::ErrorKind::InvalidData {
-                    tracing::error!(
-                        frame_len = frame.len(),
-                        max = 128 * 1024,
-                        "FRAME_TOO_LARGE — router rejected oversized frame to node; disconnecting"
-                    );
-                } else {
-                    tracing::warn!(error = %err, frame_len = frame.len(), "router: node write error");
-                }
-                break;
-            }
-        }
-    });
+    // Who opened this socket, for the `RT.` names only the router's own process may take.
+    let peer_pid = stream.peer_cred().ok().and_then(|cred| cred.pid());
+    let (mut reader, writer) = stream.into_split();
+    let (tx, rx) = mpsc::unbounded_channel::<Vec<u8>>();
+    let link_peer = Arc::new(std::sync::OnceLock::<String>::new());
+    let writer_task = tokio::spawn(write_link_frames(
+        writer,
+        rx,
+        "node",
+        Arc::clone(&link_peer),
+    ));
     let frame = read_frame(&mut reader)
         .await?
         .ok_or_else(|| io::Error::new(io::ErrorKind::UnexpectedEof, "missing HELLO"))?;
@@ -637,6 +642,19 @@ async fn handle_node(
     }
 
     let node_name = normalize_name(&payload.name, hive_id);
+    if !rt_name_allowed(&node_name, peer_pid, std::process::id()) {
+        tracing::warn!(
+            node = %node_name,
+            peer_pid = ?peer_pid,
+            "HELLO rejected: RT.* names belong to the router's own process"
+        );
+        writer_task.abort();
+        return Err(RouterError::Io(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "RT.* names are reserved for the router's own process",
+        )));
+    }
+    let _ = link_peer.set(node_name.clone());
     tracing::info!(node = %node_name, "loading config snapshot");
     let snapshot = refresh_config(
         &config_reader,
@@ -680,24 +698,41 @@ async fn handle_node(
     let vpn_id = assign_vpn(&node_name, snapshot.as_ref());
     tracing::info!(node = %node_name, vpn_id = vpn_id, "vpn assigned");
     let connected_at = now_epoch_ms();
+    let handle = NodeHandle {
+        name: node_name.clone(),
+        vpn_id,
+        sender: tx.clone(),
+        connected_at,
+    };
+    if let Err(holder) = claim_node_uuid(&nodes, node_uuid, handle, DUPLICATE_HELLO_GRACE).await {
+        tracing::warn!(
+            node = %node_name,
+            uuid = %node_uuid,
+            connected_as = %holder,
+            "HELLO rejected: this node UUID already has a live connection"
+        );
+        writer_task.abort();
+        return Err(RouterError::Io(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            format!("node uuid {node_uuid} already connected as {holder}"),
+        )));
+    }
     {
         let mut shm = shm.lock().await;
-        shm.register_node(node_uuid, &node_name, vpn_id, connected_at)
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+        if let Err(err) = shm.register_node(node_uuid, &node_name, vpn_id, connected_at) {
+            drop(shm);
+            let mut nodes = nodes.lock().await;
+            if nodes
+                .get(&node_uuid)
+                .is_some_and(|handle| handle.connected_at == connected_at)
+            {
+                nodes.remove(&node_uuid);
+            }
+            writer_task.abort();
+            return Err(io::Error::new(io::ErrorKind::Other, err).into());
+        }
     }
     tracing::info!(node = %node_uuid, "node registered in shm");
-    {
-        let mut nodes = nodes.lock().await;
-        nodes.insert(
-            node_uuid,
-            NodeHandle {
-                name: node_name.clone(),
-                vpn_id,
-                sender: tx.clone(),
-                connected_at,
-            },
-        );
-    }
     rebuild_fib(
         &fib,
         &nodes,
@@ -724,6 +759,8 @@ async fn handle_node(
     }
 
     tracing::info!(node = %node_uuid, name = %node_name, "node registered");
+    // The name this socket registered with: the authenticated origin of everything it sends.
+    let conn_node_name = node_name.clone();
     let announce = build_announce(
         &router_uuid.to_string(),
         &msg.routing.src,
@@ -743,24 +780,43 @@ async fn handle_node(
         tracing::info!("announce queued");
     }
 
-    loop {
+    // The connection ends only on EOF, WITHDRAW or a read error, and every end runs the cleanup
+    // below (A-44): an end that skipped it left the node registered with its writer alive, so a
+    // node that was still running stayed connected while nobody read its frames, and its next
+    // HELLO found the UUID taken. A message that cannot be handled is logged and skipped.
+    let exit: Result<(), RouterError> = loop {
         let frame = match read_frame(&mut reader).await {
             Ok(Some(f)) => f,
             Ok(None) => {
                 tracing::info!(node = %node_uuid, "router: node closed connection (EOF)");
-                break;
+                break Ok(());
             }
             Err(err) => {
                 if err.kind() == std::io::ErrorKind::InvalidData {
                     tracing::error!(node = %node_uuid, error = %err, "FRAME_TOO_LARGE — node sent oversized frame; disconnecting");
                 }
-                return Err(err.into());
+                break Err(err.into());
             }
         };
         {
             let frame = frame;
-            if let Ok(mut msg) = serde_json::from_slice::<Message>(&frame) {
-                assign_thread_seq_if_missing(&mut msg, &thread_sequences).await;
+            if let Ok(msg) = serde_json::from_slice::<Message>(&frame) {
+                if !frame_is_from_connection(&msg, node_uuid) {
+                    tracing::warn!(
+                        node = %conn_node_name,
+                        claimed_src = %msg.routing.src,
+                        "router dropped a message whose routing.src is not the sending node"
+                    );
+                    continue;
+                }
+                // A node's append to this router's stream: the router consumes it and routes it
+                // to no node.
+                if is_system_kind(&msg.meta.msg_type)
+                    && msg.meta.msg.as_deref() == Some(fluxbee_sdk::stream::MSG_STREAM_APPEND)
+                {
+                    take_stream_append(&log_stream, &msg, &conn_node_name, hive_id);
+                    continue;
+                }
                 tracing::info!(
                     src = %msg.routing.src,
                     dst = ?msg.routing.dst,
@@ -768,116 +824,43 @@ async fn handle_node(
                     msg = ?msg.meta.msg,
                     "message received"
                 );
-                maybe_publish_turn(&nats_publisher, &nats_publish_errors, &msg);
+                if should_publish_turn(&msg) {
+                    if let Some(copy) = turn_copy(&msg, &conn_node_name) {
+                        log_stream.append_turn(&conn_node_name, copy);
+                    }
+                }
+                // A local agent's send, for its cognition (§6.2): what it receives is copied at
+                // delivery.
+                if is_agent_node(&conn_node_name) && is_communication_turn(&msg) {
+                    if let Some(copy) = cognition_copy(&msg, &conn_node_name) {
+                        log_stream.append_cognition_turn(&conn_node_name, copy);
+                    }
+                }
                 if is_system_kind(&msg.meta.msg_type) {
                     if msg.meta.msg.as_deref() == Some(MSG_WITHDRAW) {
-                        break;
-                    }
-                    if msg.meta.msg.as_deref() == Some(MSG_CONFIG_CHANGED) {
-                        let _ = refresh_config(
-                            &config_reader,
-                            &static_routes,
-                            &vpn_rules,
-                            &tap_rules,
-                            &config_version,
-                            hive_id,
-                            &nodes,
-                            &peer_nodes,
-                            &shm,
-                            &fib,
-                            &lsa_snapshot,
-                            &reachability,
-                            true,
-                        )
-                        .await;
-                        tracing::info!("config changed applied");
-                        if msg
-                            .meta
-                            .action
-                            .as_deref()
-                            .is_some_and(|v| v == "compile" || v == "apply" || v == "rollback")
-                        {
-                            let version = msg
-                                .payload
-                                .get("version")
-                                .and_then(|v| v.as_u64())
-                                .unwrap_or(0);
-                            tracing::info!(
-                                action = ?msg.meta.action,
-                                version = version,
-                                "opa config changed received"
-                            );
-                        }
-                        let src_uuid = Uuid::parse_str(&msg.routing.src).ok();
-                        let local_senders: Vec<mpsc::UnboundedSender<Vec<u8>>> = {
-                            let nodes_guard = nodes.lock().await;
-                            nodes_guard
-                                .iter()
-                                .filter_map(|(uuid, handle)| {
-                                    if src_uuid.is_some_and(|value| value == *uuid) {
-                                        None
-                                    } else {
-                                        Some(handle.sender.clone())
-                                    }
-                                })
-                                .collect()
-                        };
-                        if !local_senders.is_empty() {
-                            let data = serde_json::to_vec(&msg)?;
-                            for sender in local_senders {
-                                let _ = sender.send(data.clone());
-                            }
-                            tracing::info!("config changed forwarded to local nodes");
-                        }
-                        if msg.routing.ttl >= 2 {
-                            broadcast_to_peers(&peers, &msg).await?;
-                            tracing::info!("config changed forwarded to peers");
-                        }
-                        if is_gateway {
-                            let _ = broadcast_lsa_direct(
-                                router_uuid,
-                                router_name,
-                                hive_id,
-                                &nodes,
-                                &peer_nodes,
-                                &static_routes,
-                                &vpn_rules,
-                                &tap_rules,
-                                &wan_peers,
-                                &lsa_seq,
-                            )
-                            .await;
-                        }
-                        continue;
+                        break Ok(());
                     }
                     if msg.meta.msg.as_deref() == Some(MSG_OPA_RELOAD) {
-                        let payload: OpaReloadPayload =
-                            serde_json::from_value(msg.payload.clone())?;
-                        apply_opa_reload(&opa, &opa_reader, &shm, hive_id, &payload).await;
-                        let src_uuid = Uuid::parse_str(&msg.routing.src).ok();
-                        let local_senders: Vec<mpsc::UnboundedSender<Vec<u8>>> = {
-                            let nodes_guard = nodes.lock().await;
-                            nodes_guard
-                                .iter()
-                                .filter_map(|(uuid, handle)| {
-                                    if src_uuid.is_some_and(|value| value == *uuid) {
-                                        None
-                                    } else {
-                                        Some(handle.sender.clone())
+                        // SY.opa.rules installed a policy: load it now, and tell the other routers
+                        // of this hive. No node consumes OPA_RELOAD, so it goes to none of them.
+                        match serde_json::from_value::<OpaReloadPayload>(msg.payload.clone()) {
+                            Ok(payload) => {
+                                apply_opa_reload(&opa, &opa_reader, &shm, hive_id, &payload).await;
+                                if msg.routing.ttl >= 2 {
+                                    match broadcast_to_peers(&peers, &msg).await {
+                                        Ok(()) => tracing::info!("opa reload forwarded to peers"),
+                                        Err(err) => tracing::warn!(
+                                            error = %err,
+                                            "opa reload could not be forwarded to peers"
+                                        ),
                                     }
-                                })
-                                .collect()
-                        };
-                        if !local_senders.is_empty() {
-                            let data = serde_json::to_vec(&msg)?;
-                            for sender in local_senders {
-                                let _ = sender.send(data.clone());
+                                }
                             }
-                            tracing::info!("opa reload forwarded to local nodes");
-                        }
-                        if msg.routing.ttl >= 2 {
-                            broadcast_to_peers(&peers, &msg).await?;
-                            tracing::info!("opa reload forwarded to peers");
+                            Err(err) => tracing::warn!(
+                                node = %conn_node_name,
+                                error = %err,
+                                "router ignored an OPA_RELOAD with an invalid payload"
+                            ),
                         }
                         continue;
                     }
@@ -909,7 +892,7 @@ async fn handle_node(
                     &reachability,
                 )
                 .await;
-                handle_message(
+                if let Err(err) = handle_message(
                     &msg,
                     &nodes,
                     &fib,
@@ -920,7 +903,7 @@ async fn handle_node(
                     &opa,
                     &broadcast_cache,
                     &memory_reader,
-                    &thread_sequences,
+                    &log_stream,
                     &hive_id,
                     identity_frontdesk_node_name,
                     router_uuid,
@@ -929,12 +912,20 @@ async fn handle_node(
                     &reachability,
                     snapshot.as_ref(),
                 )
-                .await?;
+                .await
+                {
+                    tracing::warn!(
+                        node = %conn_node_name,
+                        trace_id = %msg.routing.trace_id,
+                        error = %err,
+                        "router could not handle a message from this node"
+                    );
+                }
             } else {
                 tracing::warn!("received invalid message frame");
             }
         }
-    }
+    };
 
     {
         let mut nodes = nodes.lock().await;
@@ -974,7 +965,51 @@ async fn handle_node(
     }
     writer_task.abort();
     tracing::info!(node = %node_uuid, "node disconnected");
-    Ok(())
+    exit
+}
+
+/// How long a HELLO waits for an earlier connection with its UUID to go before it is refused
+/// (A-44). A node that restarts or reconnects, and every Go node's second HELLO at startup, can
+/// arrive before the router has processed the close of the connection it replaces.
+const DUPLICATE_HELLO_GRACE: Duration = Duration::from_secs(1);
+const DUPLICATE_HELLO_POLL: Duration = Duration::from_millis(50);
+
+/// Registers `handle` as the connection of `uuid`, one live connection per node UUID. While
+/// another connection holds the UUID it waits up to `grace` for it to go; Err carries the name
+/// that connection registered with. A second live process with a node's UUID is refused instead
+/// of taking its route.
+async fn claim_node_uuid(
+    nodes: &Mutex<std::collections::HashMap<Uuid, NodeHandle>>,
+    uuid: Uuid,
+    handle: NodeHandle,
+    grace: Duration,
+) -> Result<(), String> {
+    let deadline = time::Instant::now() + grace;
+    loop {
+        let mut guard = nodes.lock().await;
+        match guard.get(&uuid).map(|holder| holder.name.clone()) {
+            None => {
+                guard.insert(uuid, handle);
+                return Ok(());
+            }
+            Some(holder) => {
+                drop(guard);
+                if time::Instant::now() >= deadline {
+                    return Err(holder);
+                }
+                time::sleep(DUPLICATE_HELLO_POLL).await;
+            }
+        }
+    }
+}
+
+/// A node speaks only as itself. `handle_message` takes the sender's authoritative L2 name from
+/// `routing.src`, and the delivery gate decides protected SYSTEM actions on that name, so a frame
+/// read from a node's socket must carry that node's own UUID. UUIDs travel in every message: a node
+/// that could set another's would send as it (as the Admin on the motherbee, as the orchestrator on
+/// a worker — seen live on 8.x, 2026-09-30).
+fn frame_is_from_connection(msg: &Message, node_uuid: Uuid) -> bool {
+    Uuid::parse_str(&msg.routing.src).ok() == Some(node_uuid)
 }
 
 async fn handle_message(
@@ -988,7 +1023,7 @@ async fn handle_message(
     opa: &Arc<Mutex<OpaResolver>>,
     broadcast_cache: &Arc<Mutex<BroadcastCache>>,
     memory_reader: &Arc<Mutex<Option<MemoryRegionReader>>>,
-    thread_sequences: &Arc<Mutex<HashMap<String, u64>>>,
+    log_stream: &stream::StreamHandle,
     hive_id: &str,
     identity_frontdesk_node_name: &str,
     router_uuid: Uuid,
@@ -998,12 +1033,11 @@ async fn handle_message(
     snapshot: Option<&ConfigSnapshot>,
 ) -> Result<(), RouterError> {
     let mut msg = msg.clone();
-    assign_thread_seq_if_missing(&mut msg, thread_sequences).await;
     let src_uuid = match Uuid::parse_str(&msg.routing.src) {
         Ok(uuid) => uuid,
         Err(_) => return Ok(()),
     };
-    let mut senders: Vec<mpsc::UnboundedSender<Vec<u8>>> = Vec::new();
+    let mut senders: Vec<LocalDelivery> = Vec::new();
     let src_handle = {
         let nodes_guard = nodes.lock().await;
         nodes_guard.get(&src_uuid).cloned()
@@ -1036,7 +1070,7 @@ async fn handle_message(
                         &dst_handle.name,
                         dst_handle.vpn_id,
                     ) {
-                        senders.push(dst_handle.sender);
+                        senders.push(LocalDelivery::to(&dst_handle.name, dst_handle.sender));
                     } else {
                         send_unreachable_to(&msg, &src_handle.sender, router_uuid, "VPN_BLOCKED")?;
                     }
@@ -1138,7 +1172,10 @@ async fn handle_message(
                                 &dst_handle.name,
                                 dst_handle.vpn_id,
                             ) {
-                                senders.push(dst_handle.sender.clone());
+                                senders.push(LocalDelivery::to(
+                                    &dst_handle.name,
+                                    dst_handle.sender.clone(),
+                                ));
                             } else {
                                 send_unreachable_to(
                                     &msg,
@@ -1248,7 +1285,7 @@ async fn handle_message(
                     trace_id = %msg.routing.trace_id,
                     "router enqueueing broadcast for delivery"
                 );
-                senders.push(handle.sender.clone());
+                senders.push(LocalDelivery::to(&handle.name, handle.sender.clone()));
             }
             tracing::info!(
                 src = %src_handle.name,
@@ -1313,7 +1350,10 @@ async fn handle_message(
                             &dst_handle.name,
                             dst_handle.vpn_id,
                         ) {
-                            senders.push(dst_handle.sender.clone());
+                            senders.push(LocalDelivery::to(
+                                &dst_handle.name,
+                                dst_handle.sender.clone(),
+                            ));
                         } else {
                             send_unreachable_to(
                                 &msg,
@@ -1358,15 +1398,7 @@ async fn handle_message(
         }
     }
 
-    if !senders.is_empty() {
-        if let Some(data) =
-            serialize_for_local_delivery(memory_reader, hive_id, &msg, false).await?
-        {
-            for sender in senders {
-                let _ = sender.send(data.clone());
-            }
-        }
-    }
+    deliver_locally(senders, &msg, memory_reader, hive_id, false, log_stream).await?;
 
     // ROUTER-TAP-3: tap fanout. After primary unicast delivery is done,
     // scan installed taps and enqueue fire-and-forget secondary copies to
@@ -1587,8 +1619,14 @@ async fn fanout_taps_for_unicast(
                     );
                     continue;
                 }
-                let data = match serialize_for_local_delivery(memory_reader, hive_id, &copy, false)
-                    .await
+                let data = match serialize_for_local_delivery(
+                    memory_reader,
+                    hive_id,
+                    &copy,
+                    false,
+                    &target_handle.name,
+                )
+                .await
                 {
                     Ok(Some(data)) => data,
                     Ok(None) => continue, // suppressed: protected SYSTEM from unauthorized origin
@@ -1652,30 +1690,6 @@ async fn fanout_taps_for_unicast(
             }
         }
     }
-}
-
-async fn assign_thread_seq_if_missing(
-    msg: &mut Message,
-    thread_sequences: &Arc<Mutex<HashMap<String, u64>>>,
-) {
-    let Some(thread_id) = canonical_thread_id_from_meta(&msg.meta) else {
-        return;
-    };
-
-    if msg.meta.thread_id.is_none() {
-        msg.meta.thread_id = Some(thread_id.clone());
-    }
-    if msg.meta.thread_seq.is_some() {
-        return;
-    }
-
-    let next_seq = {
-        let mut guard = thread_sequences.lock().await;
-        let entry = guard.entry(thread_id).or_insert(0);
-        *entry = entry.saturating_add(1);
-        *entry
-    };
-    msg.meta.thread_seq = Some(next_seq);
 }
 
 fn canonical_thread_id_from_meta(meta: &Meta) -> Option<String> {
@@ -2182,7 +2196,6 @@ async fn apply_wan_reachability(ctx: &WanContext, peer_hive: &str, msg: &Message
                     origin_hive: entry.hive_id,
                     next_hop_hive: peer_hive.to_string(),
                     vpn_id: entry.vpn_id,
-                    last_seq: payload.seq,
                     last_updated: now,
                 },
             );
@@ -2797,19 +2810,13 @@ async fn handle_wan_connection<S>(
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
-    let (mut reader, mut writer) = tokio::io::split(stream);
-    let (tx, mut rx) = mpsc::unbounded_channel::<Vec<u8>>();
-    let writer_task = tokio::spawn(async move {
-        while let Some(frame) = rx.recv().await {
-            if let Err(err) = write_frame(&mut writer, &frame).await {
-                tracing::warn!("wan write error: {err}");
-                break;
-            }
-        }
-    });
+    let (mut reader, writer) = tokio::io::split(stream);
+    let (tx, rx) = mpsc::unbounded_channel::<Vec<u8>>();
+    let link_peer = Arc::new(std::sync::OnceLock::<String>::new());
+    let writer_task = tokio::spawn(write_link_frames(writer, rx, "wan", Arc::clone(&link_peer)));
 
     let hello_payload = WanHelloPayload {
-        protocol: "fluxbee/1.16".to_string(),
+        protocol: MESH_PROTOCOL_VERSION.to_string(),
         router_id: ctx.router_uuid.to_string(),
         router_name: ctx.router_name.clone(),
         hive_id: ctx.hive_id.clone(),
@@ -2874,6 +2881,7 @@ where
             return Ok(());
         }
     }
+    let _ = link_peer.set(peer_hello.hive_id.clone());
 
     if !initiator {
         let hello = build_wan_hello(
@@ -2882,6 +2890,21 @@ where
             hello_payload,
         );
         let _ = tx.send(serde_json::to_vec(&hello)?);
+    }
+
+    // U-4a: the HELLO has always carried a protocol version and nobody ever looked at it — the
+    // field existed and was dead, which is worse than absent because it reads like a guarantee.
+    // REPORT ONLY. Rejecting the peer would be self-fencing: the cross-hive SYSTEM_UPDATE rides
+    // this mesh and needs LSA visibility of its target, so cutting off an outdated hive severs
+    // the very channel that could update it. Hash gates, version reports.
+    if peer_hello.protocol != MESH_PROTOCOL_VERSION {
+        tracing::warn!(
+            peer_hive = %peer_hello.hive_id,
+            peer_protocol = %peer_hello.protocol,
+            local_protocol = %MESH_PROTOCOL_VERSION,
+            "MESH_PROTOCOL_SKEW: peer advertises a different mesh protocol; accepting the session \
+             anyway (a version difference is telemetry, not a gate). Bring the fleet to one build."
+        );
     }
 
     let peer_uuid = Uuid::parse_str(&peer_hello.router_id)?;
@@ -2902,7 +2925,7 @@ where
         WanAcceptPayload {
             peer_router_id: peer_hello.router_id.clone(),
             negotiated: WanNegotiated {
-                protocol: "fluxbee/1.16".to_string(),
+                protocol: MESH_PROTOCOL_VERSION.to_string(),
                 hello_interval_ms: ctx.hello_interval_ms,
                 dead_interval_ms: ctx.dead_interval_ms,
             },
@@ -2970,8 +2993,7 @@ async fn handle_wan_message(
     peer_router_name: &str,
     session_epoch: u64,
 ) -> Result<(), RouterError> {
-    let mut msg = msg.clone();
-    assign_thread_seq_if_missing(&mut msg, &ctx.thread_sequences).await;
+    let msg = msg.clone();
     if is_system_kind(&msg.meta.msg_type) {
         if msg.meta.msg.as_deref() == Some(MSG_LSA) {
             let payload: LsaPayload = match serde_json::from_value(msg.payload.clone()) {
@@ -3077,7 +3099,7 @@ async fn handle_wan_message(
     // and apply_lsa_payload only lets a peer write nodes into its OWN (cert-bound) bucket,
     // so a hive authenticated as P can only assert identities of the form `role@P`. Rewrite
     // any name whose `@hive` suffix disagrees with the bucket: a forged "SY.admin@motherbee"
-    // advertised by an attacker hive becomes "SY.admin@<attacker>", which authority() denies.
+    // advertised by an attacker hive becomes "SY.admin@<attacker>", which authorize_system denies.
     // Legitimate names (suffix already == bucket) are unchanged. Correct-and-continue + warn
     // (availability over fail-closed; the origin gate still denies the forged identity).
     let canonical_src_name = canonical_wan_src_name(&src_info.name, &src_info.hive_id);
@@ -3108,7 +3130,7 @@ async fn handle_wan_message(
         return Ok(());
     }
 
-    let mut senders: Vec<mpsc::UnboundedSender<Vec<u8>>> = Vec::new();
+    let mut senders: Vec<LocalDelivery> = Vec::new();
     match &msg.routing.dst {
         Destination::Unicast(dst) => {
             if let Ok(dst_uuid) = Uuid::parse_str(dst) {
@@ -3124,7 +3146,7 @@ async fn handle_wan_message(
                         &dst_handle.name,
                         dst_handle.vpn_id,
                     ) {
-                        senders.push(dst_handle.sender);
+                        senders.push(LocalDelivery::to(&dst_handle.name, dst_handle.sender));
                     } else {
                         send_unreachable_to(&msg, sender, ctx.router_uuid, "VPN_BLOCKED")?;
                     }
@@ -3217,7 +3239,10 @@ async fn handle_wan_message(
                                 &dst_handle.name,
                                 dst_handle.vpn_id,
                             ) {
-                                senders.push(dst_handle.sender.clone());
+                                senders.push(LocalDelivery::to(
+                                    &dst_handle.name,
+                                    dst_handle.sender.clone(),
+                                ));
                             } else {
                                 send_unreachable_to(&msg, sender, ctx.router_uuid, "VPN_BLOCKED")?;
                             }
@@ -3282,7 +3307,7 @@ async fn handle_wan_message(
                         continue;
                     }
                 }
-                senders.push(handle.sender.clone());
+                senders.push(LocalDelivery::to(&handle.name, handle.sender.clone()));
             }
             if msg.routing.ttl >= 2 {
                 broadcast_to_peers(&ctx.peers, &msg).await?;
@@ -3339,7 +3364,10 @@ async fn handle_wan_message(
                             &dst_handle.name,
                             dst_handle.vpn_id,
                         ) {
-                            senders.push(dst_handle.sender.clone());
+                            senders.push(LocalDelivery::to(
+                                &dst_handle.name,
+                                dst_handle.sender.clone(),
+                            ));
                         } else {
                             send_unreachable_to(&msg, sender, ctx.router_uuid, "VPN_BLOCKED")?;
                         }
@@ -3374,16 +3402,15 @@ async fn handle_wan_message(
         }
     }
 
-    if !senders.is_empty() {
-        if let Some(data) =
-            serialize_for_local_delivery(&ctx.memory_reader, &ctx.hive_id, &msg, src_via_hub)
-                .await?
-        {
-            for sender in senders {
-                let _ = sender.send(data.clone());
-            }
-        }
-    }
+    deliver_locally(
+        senders,
+        &msg,
+        &ctx.memory_reader,
+        &ctx.hive_id,
+        src_via_hub,
+        &ctx.log_stream,
+    )
+    .await?;
     Ok(())
 }
 
@@ -3404,12 +3431,8 @@ async fn peer_discovery_loop(
     peer_routers: Arc<Mutex<std::collections::HashMap<Uuid, PeerRouter>>>,
     nodes: Arc<Mutex<std::collections::HashMap<Uuid, NodeHandle>>>,
     wan_peers: Arc<Mutex<std::collections::HashMap<String, WanPeer>>>,
-    config_reader: Arc<Mutex<Option<ConfigRegionReader>>>,
     lsa_reader: Arc<Mutex<Option<LsaRegionReader>>>,
     static_routes: Arc<Mutex<Vec<StaticRoute>>>,
-    vpn_rules: Arc<Mutex<Vec<VpnAssignment>>>,
-    tap_rules: Arc<Mutex<Vec<TapEntry>>>,
-    config_version: Arc<Mutex<u64>>,
     shm: Arc<Mutex<RouterRegionWriter>>,
     opa: Arc<Mutex<OpaResolver>>,
     opa_reader: Arc<Mutex<Option<OpaRegionReader>>>,
@@ -3417,7 +3440,7 @@ async fn peer_discovery_loop(
     lsa_snapshot: Arc<Mutex<Option<LsaSnapshot>>>,
     reachability: Arc<Mutex<std::collections::HashMap<Uuid, ReachabilityEntry>>>,
     fib: Arc<Mutex<Vec<FibEntry>>>,
-    thread_sequences: Arc<Mutex<HashMap<String, u64>>>,
+    log_stream: stream::StreamHandle,
     is_gateway: bool,
 ) {
     let mut ticker = time::interval(Duration::from_secs(5));
@@ -3432,7 +3455,6 @@ async fn peer_discovery_loop(
                 region.router_uuid,
                 PeerRouter {
                     uuid: region.router_uuid,
-                    name: region.router_name.clone(),
                     is_gateway: region.is_gateway,
                 },
             );
@@ -3471,10 +3493,8 @@ async fn peer_discovery_loop(
                     let nodes = Arc::clone(&nodes);
                     let wan_peers = Arc::clone(&wan_peers);
                     let fib = Arc::clone(&fib);
-                    let config_reader = Arc::clone(&config_reader);
                     let lsa_reader = Arc::clone(&lsa_reader);
                     let static_routes = Arc::clone(&static_routes);
-                    let config_version = Arc::clone(&config_version);
                     let shm = Arc::clone(&shm);
                     let opa = Arc::clone(&opa);
                     let opa_reader = Arc::clone(&opa_reader);
@@ -3482,11 +3502,9 @@ async fn peer_discovery_loop(
                     let hive_id = hive_id.to_string();
                     let self_router_name = self_router_name.to_string();
                     let self_shm_name = self_shm_name.to_string();
-                    let vpn_rules = Arc::clone(&vpn_rules);
-                    let tap_rules = Arc::clone(&tap_rules);
                     let lsa_snapshot = Arc::clone(&lsa_snapshot);
                     let reachability = Arc::clone(&reachability);
-                    let thread_sequences = Arc::clone(&thread_sequences);
+                    let log_stream = log_stream.clone();
                     let is_gateway = is_gateway;
                     let socket_dir = socket_dir.clone();
                     let identity_frontdesk_node_name = identity_frontdesk_node_name.to_string();
@@ -3502,12 +3520,8 @@ async fn peer_discovery_loop(
                             peer_routers,
                             nodes,
                             wan_peers,
-                            config_reader,
                             lsa_reader,
                             static_routes,
-                            vpn_rules,
-                            tap_rules,
-                            config_version,
                             shm,
                             opa,
                             opa_reader,
@@ -3517,7 +3531,7 @@ async fn peer_discovery_loop(
                             lsa_snapshot,
                             reachability,
                             fib,
-                            thread_sequences,
+                            log_stream,
                             is_gateway,
                         )
                         .await;
@@ -3587,7 +3601,6 @@ fn discover_peer_regions(self_uuid: Uuid, self_shm_name: &str, hive_id: &str) ->
         }
         regions.push(PeerRegion {
             router_uuid: snapshot.header.router_uuid,
-            router_name: snapshot.header.router_name.clone(),
             is_gateway: snapshot.header.is_gateway,
             nodes: peer_nodes,
         });
@@ -3606,12 +3619,8 @@ async fn connect_to_peer(
     peer_routers: Arc<Mutex<std::collections::HashMap<Uuid, PeerRouter>>>,
     nodes: Arc<Mutex<std::collections::HashMap<Uuid, NodeHandle>>>,
     wan_peers: Arc<Mutex<std::collections::HashMap<String, WanPeer>>>,
-    config_reader: Arc<Mutex<Option<ConfigRegionReader>>>,
     lsa_reader: Arc<Mutex<Option<LsaRegionReader>>>,
     static_routes: Arc<Mutex<Vec<StaticRoute>>>,
-    vpn_rules: Arc<Mutex<Vec<VpnAssignment>>>,
-    tap_rules: Arc<Mutex<Vec<TapEntry>>>,
-    config_version: Arc<Mutex<u64>>,
     shm: Arc<Mutex<RouterRegionWriter>>,
     opa: Arc<Mutex<OpaResolver>>,
     opa_reader: Arc<Mutex<Option<OpaRegionReader>>>,
@@ -3621,13 +3630,13 @@ async fn connect_to_peer(
     lsa_snapshot: Arc<Mutex<Option<LsaSnapshot>>>,
     reachability: Arc<Mutex<std::collections::HashMap<Uuid, ReachabilityEntry>>>,
     fib: Arc<Mutex<Vec<FibEntry>>>,
-    thread_sequences: Arc<Mutex<HashMap<String, u64>>>,
+    log_stream: stream::StreamHandle,
     is_gateway: bool,
 ) -> Result<(), RouterError> {
     let socket_path = peer_socket_path(socket_dir, peer_uuid);
     let stream = UnixStream::connect(&socket_path).await?;
-    let (mut reader, mut writer) = stream.into_split();
-    let (tx, mut rx) = mpsc::unbounded_channel::<Vec<u8>>();
+    let (mut reader, writer) = stream.into_split();
+    let (tx, rx) = mpsc::unbounded_channel::<Vec<u8>>();
     {
         let mut peers_guard = peers.lock().await;
         if peers_guard.contains_key(&peer_uuid) {
@@ -3635,14 +3644,8 @@ async fn connect_to_peer(
         }
         peers_guard.insert(peer_uuid, PeerHandle { sender: tx.clone() });
     }
-    let writer_task = tokio::spawn(async move {
-        while let Some(frame) = rx.recv().await {
-            if let Err(err) = write_frame(&mut writer, &frame).await {
-                tracing::warn!("peer write error: {err}");
-                break;
-            }
-        }
-    });
+    let link_peer = Arc::new(std::sync::OnceLock::from(peer_uuid.to_string()));
+    let writer_task = tokio::spawn(write_link_frames(writer, rx, "irp", link_peer));
 
     let hello = build_router_hello(
         &self_uuid.to_string(),
@@ -3668,12 +3671,8 @@ async fn connect_to_peer(
                         &peer_routers,
                         &nodes,
                         &wan_peers,
-                        &config_reader,
                         &lsa_reader,
                         &static_routes,
-                        &vpn_rules,
-                        &tap_rules,
-                        &config_version,
                         &shm,
                         &opa,
                         &opa_reader,
@@ -3685,7 +3684,7 @@ async fn connect_to_peer(
                         is_gateway,
                         &lsa_snapshot,
                         &reachability,
-                        &thread_sequences,
+                        &log_stream,
                     )
                     .await?;
                 }
@@ -3709,12 +3708,8 @@ async fn handle_peer_incoming(
     peer_routers: Arc<Mutex<std::collections::HashMap<Uuid, PeerRouter>>>,
     nodes: Arc<Mutex<std::collections::HashMap<Uuid, NodeHandle>>>,
     fib: Arc<Mutex<Vec<FibEntry>>>,
-    config_reader: Arc<Mutex<Option<ConfigRegionReader>>>,
     lsa_reader: Arc<Mutex<Option<LsaRegionReader>>>,
     static_routes: Arc<Mutex<Vec<StaticRoute>>>,
-    vpn_rules: Arc<Mutex<Vec<VpnAssignment>>>,
-    tap_rules: Arc<Mutex<Vec<TapEntry>>>,
-    config_version: Arc<Mutex<u64>>,
     shm: Arc<Mutex<RouterRegionWriter>>,
     opa: Arc<Mutex<OpaResolver>>,
     opa_reader: Arc<Mutex<Option<OpaRegionReader>>>,
@@ -3724,10 +3719,10 @@ async fn handle_peer_incoming(
     wan_peers: Arc<Mutex<std::collections::HashMap<String, WanPeer>>>,
     lsa_snapshot: Arc<Mutex<Option<LsaSnapshot>>>,
     reachability: Arc<Mutex<std::collections::HashMap<Uuid, ReachabilityEntry>>>,
-    thread_sequences: Arc<Mutex<HashMap<String, u64>>>,
+    log_stream: stream::StreamHandle,
     is_gateway: bool,
 ) -> Result<(), RouterError> {
-    let (mut reader, mut writer) = stream.into_split();
+    let (mut reader, writer) = stream.into_split();
     let frame = read_frame(&mut reader)
         .await?
         .ok_or_else(|| io::Error::new(io::ErrorKind::UnexpectedEof, "missing HELLO"))?;
@@ -3743,19 +3738,13 @@ async fn handle_peer_incoming(
             return Ok(());
         }
     }
-    let (tx, mut rx) = mpsc::unbounded_channel::<Vec<u8>>();
+    let (tx, rx) = mpsc::unbounded_channel::<Vec<u8>>();
     {
         let mut peers_guard = peers.lock().await;
         peers_guard.insert(peer_uuid, PeerHandle { sender: tx.clone() });
     }
-    let writer_task = tokio::spawn(async move {
-        while let Some(frame) = rx.recv().await {
-            if let Err(err) = write_frame(&mut writer, &frame).await {
-                tracing::warn!("peer write error: {err}");
-                break;
-            }
-        }
-    });
+    let link_peer = Arc::new(std::sync::OnceLock::from(peer_uuid.to_string()));
+    let writer_task = tokio::spawn(write_link_frames(writer, rx, "irp", link_peer));
 
     loop {
         match read_frame(&mut reader).await? {
@@ -3769,12 +3758,8 @@ async fn handle_peer_incoming(
                         &peer_routers,
                         &nodes,
                         &wan_peers,
-                        &config_reader,
                         &lsa_reader,
                         &static_routes,
-                        &vpn_rules,
-                        &tap_rules,
-                        &config_version,
                         &shm,
                         &opa,
                         &opa_reader,
@@ -3786,7 +3771,7 @@ async fn handle_peer_incoming(
                         is_gateway,
                         &lsa_snapshot,
                         &reachability,
-                        &thread_sequences,
+                        &log_stream,
                     )
                     .await?;
                 }
@@ -3802,6 +3787,124 @@ async fn handle_peer_incoming(
     Ok(())
 }
 
+/// Frames skipped for being over the socket's size limit, process-wide, across every link. Each
+/// warn line about them carries the total.
+static OVERSIZE_FRAMES_SKIPPED: AtomicU64 = AtomicU64::new(0);
+/// At most one log line per link and interval about the frames it skipped.
+const OVERSIZE_FRAME_LOG_INTERVAL: Duration = Duration::from_secs(30);
+
+/// Writes the frames queued for one link (a node, a WAN peer, a sibling router) until the link
+/// ends. A frame over the socket's 128 KB limit is skipped and counted, and the link goes on: until
+/// 0.1.74 the writer stopped while the link stayed registered, so every later frame to it was lost
+/// for good (A-70, D11 of docs/router-stream-v1.md). Any other write error ends the link.
+async fn write_link_frames<W>(
+    mut writer: W,
+    mut rx: mpsc::UnboundedReceiver<Vec<u8>>,
+    link: &'static str,
+    peer: Arc<std::sync::OnceLock<String>>,
+) where
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    let mut skipped_unlogged = 0u64;
+    let mut last_logged: Option<Instant> = None;
+    while let Some(frame) = rx.recv().await {
+        if frame.len() > MAX_FRAME_SIZE {
+            let skipped_total = OVERSIZE_FRAMES_SKIPPED.fetch_add(1, Ordering::Relaxed) + 1;
+            skipped_unlogged += 1;
+            if last_logged.is_none_or(|at| at.elapsed() >= OVERSIZE_FRAME_LOG_INTERVAL) {
+                tracing::warn!(
+                    link,
+                    peer = peer.get().map(String::as_str).unwrap_or("-"),
+                    frame_len = frame.len(),
+                    max = MAX_FRAME_SIZE,
+                    skipped = skipped_unlogged,
+                    skipped_total,
+                    "router skipped a frame over the size limit; the link goes on"
+                );
+                skipped_unlogged = 0;
+                last_logged = Some(Instant::now());
+            }
+            continue;
+        }
+        if let Err(err) = write_frame(&mut writer, &frame).await {
+            tracing::warn!(
+                link,
+                peer = peer.get().map(String::as_str).unwrap_or("-"),
+                error = %err,
+                frame_len = frame.len(),
+                "router: link write error; closing the link"
+            );
+            break;
+        }
+    }
+}
+
+/// `RT.` names are the router's own (operator, 2026-10-16, D12 of docs/router-stream-v1.md): a
+/// HELLO with one is accepted only from the router's own process. Anything else could pose as a
+/// router's stream and feed records to SY.storage, or take a stream's name first and lock it out.
+fn rt_name_allowed(node_name: &str, peer_pid: Option<i32>, own_pid: u32) -> bool {
+    let local = node_name.split('@').next().unwrap_or(node_name).trim();
+    if !local
+        .get(..3)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("RT."))
+    {
+        return true;
+    }
+    peer_pid.is_some_and(|pid| u32::try_from(pid).is_ok_and(|pid| pid == own_pid))
+}
+
+/// At most one log line per interval about frames from the gateway whose sender this router does
+/// not know.
+const UNKNOWN_REMOTE_SOURCE_LOG_INTERVAL_MS: u64 = 30_000;
+static UNKNOWN_REMOTE_SOURCE_LAST_LOG_MS: AtomicU64 = AtomicU64::new(0);
+
+/// A frame a sibling router hands over IRP comes from one of its own nodes or, when that router is
+/// the hive's gateway, from a node of another hive that the gateway took in from the WAN. Until
+/// 0.1.74 only the first was accepted, so a message from another hive to a node on a non-gateway
+/// router was dropped (A-70).
+///
+/// The sender must be in this router's LSA, a directly learned node: the gateway's reachability
+/// plane (hub-vouched nodes) lives only on the gateway, so a node relayed spoke to hub to spoke
+/// cannot reach a non-gateway router (known limit). Its name is derived here, canonical to its
+/// hive like the gateway's WAN ingress does (EDGE-01), not taken from the frame.
+async fn remote_source_from_gateway(
+    msg: &Message,
+    peer_uuid: &Uuid,
+    src_uuid: Uuid,
+    peer_routers: &Arc<Mutex<std::collections::HashMap<Uuid, PeerRouter>>>,
+    lsa_snapshot: &Arc<Mutex<Option<LsaSnapshot>>>,
+) -> Option<PeerNode> {
+    let from_gateway = peer_routers
+        .lock()
+        .await
+        .get(peer_uuid)
+        .is_some_and(|router| router.is_gateway);
+    if !from_gateway {
+        return None;
+    }
+    let remote = {
+        let snapshot = lsa_snapshot.lock().await;
+        find_remote_node(&snapshot, src_uuid)
+    }?;
+    let name = canonical_wan_src_name(&remote.name, &remote.hive_id);
+    if let Some(stamped) = msg.routing.src_l2_name.as_deref() {
+        if stamped != name {
+            tracing::warn!(
+                src = %src_uuid,
+                stamped,
+                canonical = %name,
+                "router: the gateway handed over a frame whose name differs from the LSA's; using the LSA's"
+            );
+        }
+    }
+    Some(PeerNode {
+        uuid: src_uuid,
+        name,
+        vpn_id: remote.vpn_id,
+        router_uuid: *peer_uuid,
+    })
+}
+
 async fn handle_peer_message(
     msg: &Message,
     peer_uuid: &Uuid,
@@ -3810,12 +3913,8 @@ async fn handle_peer_message(
     peer_routers: &Arc<Mutex<std::collections::HashMap<Uuid, PeerRouter>>>,
     nodes: &Arc<Mutex<std::collections::HashMap<Uuid, NodeHandle>>>,
     wan_peers: &Arc<Mutex<std::collections::HashMap<String, WanPeer>>>,
-    config_reader: &Arc<Mutex<Option<ConfigRegionReader>>>,
     lsa_reader: &Arc<Mutex<Option<LsaRegionReader>>>,
     static_routes: &Arc<Mutex<Vec<StaticRoute>>>,
-    vpn_rules: &Arc<Mutex<Vec<VpnAssignment>>>,
-    tap_rules: &Arc<Mutex<Vec<TapEntry>>>,
-    config_version: &Arc<Mutex<u64>>,
     shm: &Arc<Mutex<RouterRegionWriter>>,
     opa: &Arc<Mutex<OpaResolver>>,
     opa_reader: &Arc<Mutex<Option<OpaRegionReader>>>,
@@ -3827,34 +3926,13 @@ async fn handle_peer_message(
     is_gateway: bool,
     lsa_snapshot: &Arc<Mutex<Option<LsaSnapshot>>>,
     reachability: &Arc<Mutex<std::collections::HashMap<Uuid, ReachabilityEntry>>>,
-    thread_sequences: &Arc<Mutex<HashMap<String, u64>>>,
+    log_stream: &stream::StreamHandle,
 ) -> Result<(), RouterError> {
     let mut msg = msg.clone();
-    assign_thread_seq_if_missing(&mut msg, thread_sequences).await;
     let src_uuid = match Uuid::parse_str(&msg.routing.src) {
         Ok(uuid) => uuid,
         Err(_) => return Ok(()),
     };
-    if is_system_kind(&msg.meta.msg_type) && msg.meta.msg.as_deref() == Some(MSG_CONFIG_CHANGED) {
-        let _ = refresh_config(
-            config_reader,
-            static_routes,
-            vpn_rules,
-            tap_rules,
-            config_version,
-            hive_id,
-            nodes,
-            peer_nodes,
-            shm,
-            fib,
-            lsa_snapshot,
-            reachability,
-            true,
-        )
-        .await;
-        tracing::info!("config changed applied (peer)");
-        return Ok(());
-    }
     if is_system_kind(&msg.meta.msg_type) && msg.meta.msg.as_deref() == Some(MSG_OPA_RELOAD) {
         let payload: OpaReloadPayload = serde_json::from_value(msg.payload.clone())?;
         apply_opa_reload(opa, opa_reader, shm, hive_id, &payload).await;
@@ -3864,6 +3942,54 @@ async fn handle_peer_message(
     let src_node = {
         let peer_guard = peer_nodes.lock().await;
         peer_guard.get(&src_uuid).cloned()
+    };
+    let src_node = match src_node {
+        Some(node) => Some(node),
+        None => {
+            let mut found =
+                remote_source_from_gateway(&msg, peer_uuid, src_uuid, peer_routers, lsa_snapshot)
+                    .await;
+            let from_gateway = peer_routers
+                .lock()
+                .await
+                .get(peer_uuid)
+                .is_some_and(|router| router.is_gateway);
+            if found.is_none() && from_gateway {
+                // A node the gateway just learned may not be in this router's snapshot yet.
+                let _ = refresh_lsa(
+                    lsa_reader,
+                    lsa_snapshot,
+                    hive_id,
+                    nodes,
+                    peer_nodes,
+                    static_routes,
+                    fib,
+                    reachability,
+                )
+                .await;
+                found = remote_source_from_gateway(
+                    &msg,
+                    peer_uuid,
+                    src_uuid,
+                    peer_routers,
+                    lsa_snapshot,
+                )
+                .await;
+                if found.is_none() {
+                    let now = now_epoch_ms();
+                    let last = UNKNOWN_REMOTE_SOURCE_LAST_LOG_MS.load(Ordering::Relaxed);
+                    if now.saturating_sub(last) >= UNKNOWN_REMOTE_SOURCE_LOG_INTERVAL_MS {
+                        UNKNOWN_REMOTE_SOURCE_LAST_LOG_MS.store(now, Ordering::Relaxed);
+                        tracing::warn!(
+                            src = %src_uuid,
+                            src_l2_name = ?msg.routing.src_l2_name,
+                            "router dropped a frame from the gateway: its sender is not in this router's LSA"
+                        );
+                    }
+                }
+            }
+            found
+        }
     };
     let Some(src_node) = src_node else {
         if is_system_kind(&msg.meta.msg_type) {
@@ -3902,7 +4028,7 @@ async fn handle_peer_message(
         reachability,
     )
     .await;
-    let mut senders: Vec<mpsc::UnboundedSender<Vec<u8>>> = Vec::new();
+    let mut senders: Vec<LocalDelivery> = Vec::new();
     if msg.routing.ttl == 0 {
         if let Some(peer) = peers.lock().await.get(peer_uuid).cloned() {
             send_ttl_exceeded_to(&msg, &peer.sender, router_uuid)?;
@@ -3925,7 +4051,7 @@ async fn handle_peer_message(
                         &dst_handle.name,
                         dst_handle.vpn_id,
                     ) {
-                        senders.push(dst_handle.sender);
+                        senders.push(LocalDelivery::to(&dst_handle.name, dst_handle.sender));
                     } else if let Some(peer) = peers.lock().await.get(peer_uuid).cloned() {
                         send_unreachable_to(&msg, &peer.sender, router_uuid, "VPN_BLOCKED")?;
                     }
@@ -3997,7 +4123,10 @@ async fn handle_peer_message(
                                 &dst_handle.name,
                                 dst_handle.vpn_id,
                             ) {
-                                senders.push(dst_handle.sender.clone());
+                                senders.push(LocalDelivery::to(
+                                    &dst_handle.name,
+                                    dst_handle.sender.clone(),
+                                ));
                             } else if let Some(peer) = peers.lock().await.get(peer_uuid).cloned() {
                                 send_unreachable_to(
                                     &msg,
@@ -4068,7 +4197,7 @@ async fn handle_peer_message(
                         continue;
                     }
                 }
-                senders.push(handle.sender.clone());
+                senders.push(LocalDelivery::to(&handle.name, handle.sender.clone()));
             }
             if msg.routing.ttl >= 3 {
                 if let Some(peer) = peers.lock().await.get(peer_uuid).cloned() {
@@ -4139,7 +4268,10 @@ async fn handle_peer_message(
                             &dst_handle.name,
                             dst_handle.vpn_id,
                         ) {
-                            senders.push(dst_handle.sender.clone());
+                            senders.push(LocalDelivery::to(
+                                &dst_handle.name,
+                                dst_handle.sender.clone(),
+                            ));
                         } else if let Some(peer) = peers.lock().await.get(peer_uuid).cloned() {
                             send_unreachable_to(&msg, &peer.sender, router_uuid, "VPN_BLOCKED")?;
                         }
@@ -4180,15 +4312,7 @@ async fn handle_peer_message(
         }
     }
 
-    if !senders.is_empty() {
-        if let Some(data) =
-            serialize_for_local_delivery(memory_reader, hive_id, &msg, false).await?
-        {
-            for sender in senders {
-                let _ = sender.send(data.clone());
-            }
-        }
-    }
+    deliver_locally(senders, &msg, memory_reader, hive_id, false, log_stream).await?;
     Ok(())
 }
 
@@ -4241,8 +4365,6 @@ struct ReachabilityEntry {
     /// The vouching hub to forward toward (a direct WAN peer of this router).
     next_hop_hive: String,
     vpn_id: u32,
-    /// Advertisement sequence from the vouching hub, for out-of-order / staleness dedup.
-    last_seq: u64,
     /// Local receive time (ms); entries expire when no advertisement refreshes them.
     last_updated: u64,
 }
@@ -4347,7 +4469,6 @@ struct PeerNode {
 #[derive(Clone, Debug)]
 struct PeerRouter {
     uuid: Uuid,
-    name: String,
     is_gateway: bool,
 }
 
@@ -4399,7 +4520,7 @@ struct WanContext {
     fib: Arc<Mutex<Vec<FibEntry>>>,
     broadcast_cache: Arc<Mutex<BroadcastCache>>,
     lsa_seq: Arc<Mutex<u64>>,
-    thread_sequences: Arc<Mutex<HashMap<String, u64>>>,
+    log_stream: stream::StreamHandle,
     memory_reader: Arc<Mutex<Option<MemoryRegionReader>>>,
     opa: Arc<Mutex<OpaResolver>>,
     wan_session_epochs: Arc<Mutex<std::collections::HashMap<String, u64>>>,
@@ -4477,7 +4598,6 @@ enum ResolvedRoute {
 
 struct PeerRegion {
     router_uuid: Uuid,
-    router_name: String,
     is_gateway: bool,
     nodes: Vec<PeerNode>,
 }
@@ -4647,6 +4767,15 @@ async fn read_config_snapshot_for_routing(
     guard.as_ref().and_then(|reader| reader.read_snapshot())
 }
 
+async fn unload_opa_user_policy(
+    opa: &Arc<Mutex<OpaResolver>>,
+    shm: &Arc<Mutex<RouterRegionWriter>>,
+) {
+    opa.lock().await.unload();
+    let mut shm_guard = shm.lock().await;
+    shm_guard.update_opa_status(0, OPA_STATUS_OK);
+}
+
 async fn apply_opa_reload(
     opa: &Arc<Mutex<OpaResolver>>,
     opa_reader: &Arc<Mutex<Option<OpaRegionReader>>>,
@@ -4721,6 +4850,14 @@ async fn maybe_refresh_opa_from_shm(
     let Some(header) = header else {
         return;
     };
+    if header.policy_version == 0 && header.wasm_size == 0 && header.status == OPA_STATUS_OK {
+        // Cleared (opa_clear) -- also caught here if the OPA_RELOAD broadcast was missed.
+        let holds_policy = opa.lock().await.has_policy();
+        if holds_policy {
+            unload_opa_user_policy(opa, shm).await;
+        }
+        return;
+    }
     if header.policy_version == 0 || header.wasm_size == 0 {
         return;
     }
@@ -4824,6 +4961,13 @@ async fn apply_opa_snapshot(
     snapshot: &OpaSnapshot,
 ) {
     if snapshot.wasm.is_empty() {
+        // Version 0 + no wasm is SY.opa.rules saying "no user policy" (opa_clear): unload what
+        // this router still holds in memory. Before this, an empty region was ignored and the
+        // router kept enforcing the old policy until restarted.
+        if snapshot.header.policy_version == 0 {
+            unload_opa_user_policy(opa, shm).await;
+            return;
+        }
         tracing::warn!(
             version = snapshot.header.policy_version,
             "opa reload skipped: empty policy"
@@ -4994,6 +5138,20 @@ async fn resolve_target_with_identity(
         identity_frontdesk_node_name = %identity_frontdesk_node_name,
         "router starting identity-aware resolve"
     );
+    // SYSTEM route (selection), OPA-backed (policy/system.rego frontdesk_route) — short-circuits
+    // before the USER OPA policy. Case A: NO src_ilk at all. Decided here, WITHOUT the identity
+    // snapshot, because it needs no identity data and must still force the frontdesk even when the
+    // identity SHM is unavailable (the common cause of a missing ilk is a provisioning failure with
+    // identity down). The present-ilk case (B) is handled below after canonicalization.
+    if src_ilk.is_none() && system_policy::route_to_frontdesk(None, false) {
+        tracing::info!(
+            trace_id = %msg.routing.trace_id,
+            forced_target = %identity_frontdesk_node_name,
+            elapsed_us = resolve_started.elapsed().as_micros() as u64,
+            "identity pre-resolve forced frontdesk target (no src_ilk)"
+        );
+        return Ok(Some(identity_frontdesk_node_name.to_string()));
+    }
     let mut dynamic_opa_data: Option<serde_json::Value> = None;
     match read_identity_snapshot(hive_id) {
         Ok(snapshot) => {
@@ -5058,7 +5216,10 @@ fn apply_identity_pre_resolve(
         if canonical != src_ilk {
             set_src_ilk_in_meta(&mut msg.meta, &canonical);
         }
-        if registration_status.as_deref() == Some("temporary") {
+        // Case B: a PRESENT src_ilk. The routing DECISION lives in policy (system.rego
+        // frontdesk_route); the router only substitutes the per-hive frontdesk NODE NAME here.
+        // Present ilk => src_ilk_present = true, so only registration_status == "temporary" forces.
+        if system_policy::route_to_frontdesk(registration_status.as_deref(), true) {
             return Some(identity_frontdesk_node_name.to_string());
         }
     }
@@ -5955,136 +6116,51 @@ fn match_any_hive(base: &str, full_name: &str) -> bool {
     name_base == base
 }
 
-async fn wait_for_nats_endpoint(endpoint: &str, timeout: Duration) -> Result<(), RouterError> {
-    let start = time::Instant::now();
-    loop {
-        match nats_check_endpoint(endpoint, Duration::from_secs(2)).await {
-            Ok(()) => {
-                tracing::info!(endpoint = %endpoint, "nats endpoint ready");
-                return Ok(());
-            }
-            Err(err) => {
-                if start.elapsed() >= timeout {
-                    return Err(RouterError::Startup(format!(
-                        "nats readiness timeout endpoint={} error={}",
-                        endpoint, err
-                    )));
-                }
-            }
-        }
-        time::sleep(Duration::from_millis(NATS_READY_RETRY_MS)).await;
+/// The router's copy of a turn for its stream: the message as routed, with its action class and
+/// the sender's real name. The node's own `src_l2_name` is never kept:
+/// the router stamps it only later, on delivery.
+fn turn_copy(msg: &Message, conn_node_name: &str) -> Option<Vec<u8>> {
+    let mut copy = msg.clone();
+    if copy.meta.action_class.is_none() {
+        copy.meta.action_class = classify_routed_message(&copy.meta.msg_type);
     }
+    copy.routing.src_l2_name = Some(conn_node_name.to_string());
+    serde_json::to_vec(&copy).ok()
 }
 
-async fn wait_for_nats_ready(cfg: &RouterConfig, timeout: Duration) -> Result<(), RouterError> {
-    wait_for_nats_endpoint(&cfg.nats_url, timeout).await
-}
+/// At most one log line per interval about the appends this router refused.
+const REFUSED_APPEND_LOG_INTERVAL_MS: u64 = 30_000;
+static REFUSED_APPEND_LAST_LOG_MS: AtomicU64 = AtomicU64::new(0);
 
-fn spawn_embedded_nats_recovery_loop(cfg: &RouterConfig) {
-    let endpoint = cfg.nats_url.clone();
-    let storage_dir = cfg.nats_storage_dir.clone();
-    tokio::spawn(async move {
-        let mut ticker = time::interval(Duration::from_secs(NATS_EMBEDDED_RECOVERY_INTERVAL_SECS));
-        loop {
-            ticker.tick().await;
-            if nats_check_endpoint(&endpoint, Duration::from_secs(2))
-                .await
-                .is_ok()
-            {
-                continue;
-            }
-            tracing::warn!(
-                endpoint = %endpoint,
-                "embedded nats health-check failed; attempting recovery"
-            );
-            if let Err(err) =
-                start_embedded_broker_with_storage(&endpoint, Some(storage_dir.as_path())).await
-            {
+/// A node's `STREAM_APPEND`: appended under its subject when that node may append it (§2.2), the
+/// producer being the node's connection name.
+fn take_stream_append(stream: &stream::StreamHandle, msg: &Message, producer: &str, hive_id: &str) {
+    let append: Option<fluxbee_sdk::stream::StreamAppend> =
+        serde_json::from_value(msg.payload.clone()).ok();
+    let allowed = append
+        .as_ref()
+        .is_some_and(|append| {
+            stream::subject_allowed(&append.subject, producer, hive_id, stream.role())
+        });
+    match (append, allowed) {
+        (Some(append), true) => match serde_json::to_vec(&append.payload) {
+            Ok(payload) => stream.append_from_node(&append.subject, producer, payload),
+            Err(_) => stream.count_refused(),
+        },
+        (append, _) => {
+            stream.count_refused();
+            let now = now_epoch_ms();
+            let last = REFUSED_APPEND_LAST_LOG_MS.load(Ordering::Relaxed);
+            if now.saturating_sub(last) >= REFUSED_APPEND_LOG_INTERVAL_MS {
+                REFUSED_APPEND_LAST_LOG_MS.store(now, Ordering::Relaxed);
                 tracing::warn!(
-                    endpoint = %endpoint,
-                    error = %err,
-                    "embedded nats recovery start failed"
-                );
-                continue;
-            }
-            if let Err(err) =
-                wait_for_nats_endpoint(&endpoint, Duration::from_secs(NATS_READY_TIMEOUT_SECS))
-                    .await
-            {
-                tracing::warn!(
-                    endpoint = %endpoint,
-                    error = %err,
-                    "embedded nats recovery health-check failed"
-                );
-                continue;
-            }
-            tracing::info!(
-                endpoint = %endpoint,
-                "embedded nats recovery succeeded"
-            );
-        }
-    });
-}
-
-async fn prepare_nats_runtime(cfg: &RouterConfig) -> Result<(), RouterError> {
-    if cfg.nats_mode == "embedded" {
-        fs::create_dir_all(&cfg.nats_storage_dir)?;
-        start_embedded_broker_with_storage(&cfg.nats_url, Some(cfg.nats_storage_dir.as_path()))
-            .await?;
-        tracing::info!(
-            mode = %cfg.nats_mode,
-            port = cfg.nats_port,
-            storage_dir = %cfg.nats_storage_dir.display(),
-            endpoint = %cfg.nats_url,
-            "embedded nats broker started"
-        );
-    } else {
-        tracing::info!(
-            mode = %cfg.nats_mode,
-            endpoint = %cfg.nats_url,
-            "nats configured"
-        );
-    }
-    Ok(())
-}
-
-fn maybe_publish_turn(
-    nats_publisher: &Option<Arc<NatsPublisher>>,
-    nats_publish_errors: &Arc<AtomicU64>,
-    msg: &Message,
-) {
-    if !should_publish_turn(msg) {
-        return;
-    }
-    let Some(publisher) = nats_publisher else {
-        return;
-    };
-    let publisher = Arc::clone(publisher);
-    let nats_publish_errors = Arc::clone(nats_publish_errors);
-    let mut enriched = msg.clone();
-    if enriched.meta.action_class.is_none() {
-        enriched.meta.action_class = classify_routed_message(&enriched.meta.msg_type);
-    }
-    let payload = match serde_json::to_vec(&enriched) {
-        Ok(payload) => payload,
-        Err(err) => {
-            tracing::warn!(error = %err, "turn serialize failed");
-            return;
-        }
-    };
-    tokio::spawn(async move {
-        if let Err(err) = publisher.publish(&payload).await {
-            let count = nats_publish_errors.fetch_add(1, Ordering::Relaxed) + 1;
-            if count == 1 || count % NATS_PUBLISH_ERROR_LOG_EVERY == 0 {
-                tracing::warn!(
-                    error = %err,
-                    failures = count,
-                    subject = SUBJECT_STORAGE_TURNS,
-                    "nats publish failed"
+                    producer,
+                    subject = ?append.map(|append| append.subject),
+                    "router refused a STREAM_APPEND: not a subject this node may append"
                 );
             }
         }
-    });
+    }
 }
 
 fn should_publish_turn(msg: &Message) -> bool {
@@ -6107,27 +6183,154 @@ fn should_enrich_with_memory_package(msg: &Message) -> bool {
     true
 }
 
-/// Serialize a message for delivery to a local node, enforcing SYSTEM
-/// origin-authority. Returns `Ok(None)` when delivery must be SUPPRESSED (a
-/// protected SYSTEM action from an unauthorized origin) — callers skip the send.
-/// An `Err` would tear down the connection, so suppression uses `None`, not `Err`.
+/// A local node a message is delivered to.
+struct LocalDelivery {
+    node: String,
+    sender: mpsc::UnboundedSender<Vec<u8>>,
+}
+
+impl LocalDelivery {
+    fn to(node: &str, sender: mpsc::UnboundedSender<Vec<u8>>) -> Self {
+        Self {
+            node: node.to_string(),
+            sender,
+        }
+    }
+}
+
+/// Whether a node is an agent: the interlocutor that owns its communications (§6.1, D15 of
+/// docs/router-stream-v1.md). Agents run as `AI.*` nodes.
+fn is_agent_node(name: &str) -> bool {
+    name.get(..3)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("AI."))
+}
+
+/// Whether a message is a turn of a communication: a kind that counts as a turn, with a thread,
+/// neither a tap copy nor a broadcast (§6.2).
+fn is_communication_turn(msg: &Message) -> bool {
+    should_publish_turn(msg)
+        && !msg.meta.via_tap
+        && !matches!(msg.routing.dst, Destination::Broadcast)
+        && canonical_thread_id_from_meta(&msg.meta).is_some()
+}
+
+/// The copy of a turn for its agent's cognition: the message as routed, with its sender's real
+/// name, without any memory package (§6.2).
+fn cognition_copy(msg: &Message, sender_name: &str) -> Option<Vec<u8>> {
+    let mut copy = msg.clone();
+    copy.routing.src_l2_name = Some(sender_name.to_string());
+    copy.meta.memory_package = None;
+    if copy.meta.action_class.is_none() {
+        copy.meta.action_class = classify_routed_message(&copy.meta.msg_type);
+    }
+    serde_json::to_vec(&copy).ok()
+}
+
+/// Delivers a message to local nodes (§6.2). A system message passes the authority gate once; a
+/// package the sender set is dropped for every destination. An agent destination gets the memory
+/// package of its communication, and its router's copy of the turn for its cognition: with the
+/// copy its agent's sends make at entry, the agent's router hands its cognition both directions.
+async fn deliver_locally(
+    deliveries: Vec<LocalDelivery>,
+    msg: &Message,
+    memory_reader: &Arc<Mutex<Option<MemoryRegionReader>>>,
+    hive_id: &str,
+    src_via_hub: bool,
+    log_stream: &stream::StreamHandle,
+) -> Result<(), RouterError> {
+    if deliveries.is_empty() {
+        return Ok(());
+    }
+    let Some(prepared) = prepare_local_delivery(hive_id, msg, src_via_hub) else {
+        return Ok(());
+    };
+    let turn = is_communication_turn(&prepared);
+    let sender_name = prepared.routing.src_l2_name.clone().unwrap_or_default();
+    let mut plain: Option<Vec<u8>> = None;
+    let mut memory: Option<Option<MemoryShmSnapshot>> = None;
+    for delivery in deliveries {
+        let agent = is_agent_node(&delivery.node);
+        if agent && turn {
+            if let Some(copy) = cognition_copy(&prepared, &sender_name) {
+                log_stream.append_cognition_turn(&delivery.node, copy);
+            }
+        }
+        let package = if agent
+            && should_enrich_with_memory_package(&prepared)
+            && canonical_thread_id_from_meta(&prepared.meta).is_some()
+        {
+            if memory.is_none() {
+                memory = Some(
+                    read_memory_snapshot_for_delivery(memory_reader, hive_id, HEARTBEAT_STALE_MS)
+                        .await,
+                );
+            }
+            package_for(
+                memory.as_ref().and_then(Option::as_ref),
+                &prepared,
+                &delivery.node,
+            )
+        } else {
+            None
+        };
+        let data = match package {
+            Some(package) => {
+                let mut enriched = prepared.clone();
+                enriched.meta.memory_package = Some(package);
+                serde_json::to_vec(&enriched)?
+            }
+            None => match &plain {
+                Some(data) => data.clone(),
+                None => {
+                    let data = serde_json::to_vec(&prepared)?;
+                    plain = Some(data.clone());
+                    data
+                }
+            },
+        };
+        let _ = delivery.sender.send(data);
+    }
+    Ok(())
+}
+
+/// One message to one local node (a tap copy, the tests): the same gate, stamps and package as
+/// `deliver_locally`, without a copy for cognition.
 async fn serialize_for_local_delivery(
     memory_reader: &Arc<Mutex<Option<MemoryRegionReader>>>,
     hive_id: &str,
     msg: &Message,
     src_via_hub: bool,
+    dst_node: &str,
 ) -> Result<Option<Vec<u8>>, RouterError> {
+    let Some(mut prepared) = prepare_local_delivery(hive_id, msg, src_via_hub) else {
+        return Ok(None);
+    };
+    if is_agent_node(dst_node)
+        && should_enrich_with_memory_package(&prepared)
+        && canonical_thread_id_from_meta(&prepared.meta).is_some()
+    {
+        let memory =
+            read_memory_snapshot_for_delivery(memory_reader, hive_id, HEARTBEAT_STALE_MS).await;
+        prepared.meta.memory_package = package_for(memory.as_ref(), &prepared, dst_node);
+    }
+    Ok(Some(serde_json::to_vec(&prepared)?))
+}
+
+/// The authority gate for a system message, and the delivery's own stamps: the action class, and
+/// no memory package from the sender (nothing legitimate sets one, and a node could otherwise put
+/// one in an agent's prompt, §6.2). None when the gate drops it.
+fn prepare_local_delivery(hive_id: &str, msg: &Message, src_via_hub: bool) -> Option<Message> {
     if is_system_kind(&msg.meta.msg_type) {
         // OPA-dual SYSTEM (authority) layer: the baked, non-user-editable Rego policy
-        // (policy/system.rego -> system.wasm), evaluated via authorize_system() with the Rust
-        // authority() table as the byte-identical load-failure fallback. System DENY is final.
-        // (The user/OPA layer handles routing and, in future, may only narrow this — never
-        // broaden it.)
+        // (policy/system.rego -> system.wasm), evaluated via authorize_system() — the SINGLE
+        // source of truth, no Rust fallback (the router fails closed at startup if the wasm cannot
+        // load). System DENY is final. (The user/OPA layer handles routing and, in future, may
+        // only narrow this — never broaden it.)
         let action = msg.meta.msg.as_deref().unwrap_or_default();
         if system_policy::is_protected_system_action(action) {
             // Option B security invariant: a src learned TRANSITIVELY via the hub's reachability
             // vouch (`src_via_hub`) is admitted for DATA delivery but NEVER granted SYSTEM
-            // authority — it is denied here WITHOUT consulting authority()/the allow policy, so a
+            // authority — it is denied here WITHOUT consulting the allow policy at all, so a
             // compromised hub cannot fabricate cross-hive control-plane authority between spokes.
             // A directly-authenticated src still goes through the normal authority gate.
             let authorized = !src_via_hub
@@ -6144,44 +6347,31 @@ async fn serialize_for_local_delivery(
                     src_via_hub = src_via_hub,
                     "router dropped protected SYSTEM action from unauthorized origin"
                 );
-                return Ok(None);
+                return None;
             }
         }
     }
-    let mut enriched = msg.clone();
-    if enriched.meta.action_class.is_none() {
-        enriched.meta.action_class = classify_routed_message(&enriched.meta.msg_type);
+    let mut prepared = msg.clone();
+    if prepared.meta.action_class.is_none() {
+        prepared.meta.action_class = classify_routed_message(&prepared.meta.msg_type);
     }
-    maybe_attach_memory_package(memory_reader, hive_id, &mut enriched).await;
-    Ok(Some(serde_json::to_vec(&enriched)?))
+    prepared.meta.memory_package = None;
+    Some(prepared)
 }
 
-async fn maybe_attach_memory_package(
-    memory_reader: &Arc<Mutex<Option<MemoryRegionReader>>>,
-    hive_id: &str,
-    msg: &mut Message,
-) {
-    if !should_enrich_with_memory_package(msg) || msg.meta.memory_package.is_some() {
-        return;
-    }
-    let Some(thread_id) = canonical_thread_id_from_meta(&msg.meta) else {
-        return;
-    };
-    let snapshot =
-        match read_memory_snapshot_for_delivery(memory_reader, hive_id, HEARTBEAT_STALE_MS).await {
-            Some(snapshot) => snapshot,
-            None => return,
-        };
-    if let Some(entry) = snapshot
+/// The memory package of the communication between this message's thread and the agent node it is
+/// delivered to.
+fn package_for(
+    memory: Option<&MemoryShmSnapshot>,
+    msg: &Message,
+    agent_node: &str,
+) -> Option<MemoryPackage> {
+    let thread_id = canonical_thread_id_from_meta(&msg.meta)?;
+    memory?
         .threads
         .iter()
-        .find(|entry| entry.thread_id == thread_id)
-    {
-        msg.meta.memory_package = Some(entry.package.clone());
-        if msg.meta.thread_id.is_none() {
-            msg.meta.thread_id = Some(thread_id);
-        }
-    }
+        .find(|entry| entry.thread_id == thread_id && entry.agent_node == agent_node)
+        .map(|entry| entry.package.clone())
 }
 
 async fn read_memory_snapshot_for_delivery(
@@ -6749,7 +6939,6 @@ mod tests {
                 origin_hive: "worker1".to_string(),
                 next_hop_hive: "motherbee".to_string(),
                 vpn_id: 0,
-                last_seq: 1,
                 last_updated: 0,
             },
         );
@@ -6781,16 +6970,28 @@ mod tests {
             },
             payload: serde_json::json!({}),
         };
-        let direct = serialize_for_local_delivery(&memory_reader, "motherbee", &msg, false)
-            .await
-            .unwrap();
+        let direct = serialize_for_local_delivery(
+            &memory_reader,
+            "motherbee",
+            &msg,
+            false,
+            "SY.orchestrator@motherbee",
+        )
+        .await
+        .unwrap();
         assert!(
             direct.is_some(),
             "directly-authenticated orchestrator is allowed"
         );
-        let vouched = serialize_for_local_delivery(&memory_reader, "motherbee", &msg, true)
-            .await
-            .unwrap();
+        let vouched = serialize_for_local_delivery(
+            &memory_reader,
+            "motherbee",
+            &msg,
+            true,
+            "SY.orchestrator@motherbee",
+        )
+        .await
+        .unwrap();
         assert!(
             vouched.is_none(),
             "hub-vouched (via_hub) origin must be denied SYSTEM authority"
@@ -6823,17 +7024,17 @@ mod tests {
 
     #[test]
     fn edge01_wan_canonicalization_defeats_cross_hive_name_forgery() {
-        use system_policy::authority;
+        use system_policy::authorize_system;
         let receiving_hive = "ingress1";
 
         // ATTACK: a hive authenticated as "attacker" advertises a node NAMED
         // "SY.admin@motherbee" in its OWN LSA bucket. Pre-fix the WAN handler stamped the
-        // raw name and authority() authorized EDGE_OPEN_URL; post-fix the name is rebound to
+        // raw name and authorize_system() authorized EDGE_OPEN_URL; post-fix the name is rebound to
         // the authenticated bucket, so the forged motherbee attribution is destroyed.
         let forged_admin = canonical_wan_src_name("SY.admin@motherbee", "attacker");
         assert_eq!(forged_admin, "SY.admin@attacker");
         assert!(
-            !authority("EDGE_OPEN_URL", Some(&forged_admin), receiving_hive),
+            !authorize_system("EDGE_OPEN_URL", Some(&forged_admin), receiving_hive),
             "forged SY.admin@motherbee from an attacker bucket must be denied"
         );
 
@@ -6849,7 +7050,7 @@ mod tests {
         // bucket over the direct motherbee<->ingress session) is unchanged and still allowed.
         let legit_admin = canonical_wan_src_name("SY.admin@motherbee", "motherbee");
         assert_eq!(legit_admin, "SY.admin@motherbee");
-        assert!(authority(
+        assert!(authorize_system(
             "EDGE_OPEN_URL",
             Some(&legit_admin),
             receiving_hive
@@ -6859,7 +7060,7 @@ mod tests {
         // still authorized for a protected action.
         let legit_orch = canonical_wan_src_name("SY.orchestrator@worker1", "worker1");
         assert_eq!(legit_orch, "SY.orchestrator@worker1");
-        assert!(authority("SPAWN_NODE", Some(&legit_orch), receiving_hive));
+        assert!(authorize_system("SPAWN_NODE", Some(&legit_orch), receiving_hive));
     }
 
     #[test]
@@ -7126,75 +7327,6 @@ mod tests {
         assert_eq!(legacy, None);
     }
 
-    #[tokio::test]
-    async fn assign_thread_seq_requires_canonical_thread_id_and_monotonic_sequence() {
-        let sequences = Arc::new(Mutex::new(HashMap::<String, u64>::new()));
-
-        let mut first = Message {
-            routing: Routing {
-                src: Uuid::new_v4().to_string(),
-                src_l2_name: None,
-                dst: Destination::Resolve,
-                ttl: 16,
-                trace_id: Uuid::new_v4().to_string(),
-            },
-            meta: Meta {
-                msg_type: "user".to_string(),
-                context: Some(serde_json::json!({ "thread_id": "thread:legacy" })),
-                ..Meta::default()
-            },
-            payload: serde_json::json!({}),
-        };
-        assign_thread_seq_if_missing(&mut first, &sequences).await;
-        assert_eq!(first.meta.thread_id, None);
-        assert_eq!(first.meta.thread_seq, None);
-        assert!(sequences.lock().await.is_empty());
-
-        let mut second = Message {
-            routing: Routing {
-                src: Uuid::new_v4().to_string(),
-                src_l2_name: None,
-                dst: Destination::Resolve,
-                ttl: 16,
-                trace_id: Uuid::new_v4().to_string(),
-            },
-            meta: Meta {
-                msg_type: "user".to_string(),
-                thread_id: Some("thread:legacy".to_string()),
-                ..Meta::default()
-            },
-            payload: serde_json::json!({}),
-        };
-        assign_thread_seq_if_missing(&mut second, &sequences).await;
-        assert_eq!(second.meta.thread_seq, Some(1));
-    }
-
-    #[tokio::test]
-    async fn assign_thread_seq_preserves_existing_sequence() {
-        let sequences = Arc::new(Mutex::new(HashMap::<String, u64>::new()));
-        let mut msg = Message {
-            routing: Routing {
-                src: Uuid::new_v4().to_string(),
-                src_l2_name: None,
-                dst: Destination::Resolve,
-                ttl: 16,
-                trace_id: Uuid::new_v4().to_string(),
-            },
-            meta: Meta {
-                msg_type: "user".to_string(),
-                thread_id: Some("thread:existing".to_string()),
-                thread_seq: Some(41),
-                ..Meta::default()
-            },
-            payload: serde_json::json!({}),
-        };
-
-        assign_thread_seq_if_missing(&mut msg, &sequences).await;
-
-        assert_eq!(msg.meta.thread_seq, Some(41));
-        assert!(sequences.lock().await.is_empty());
-    }
-
     fn message_with_src_ilk(src_ilk: &str) -> Message {
         Message {
             routing: Routing {
@@ -7362,6 +7494,59 @@ mod tests {
         );
     }
 
+    /// The stamped src_l2_name is only as good as the UUID it is looked up by: a node's socket may
+    /// only carry that node's own `routing.src`. Seen live on 8.x (2026-09-30): a probe node sent a
+    /// protected NODE_STATUS_GET with the Admin's UUID and SY.config.routes answered it.
+    #[test]
+    fn a_node_cannot_send_as_another_node() {
+        let node = Uuid::new_v4();
+        let mut msg = Message {
+            routing: Routing {
+                src: node.to_string(),
+                src_l2_name: None,
+                dst: Destination::Unicast("SY.config.routes@motherbee".to_string()),
+                ttl: 16,
+                trace_id: Uuid::new_v4().to_string(),
+            },
+            meta: Meta {
+                msg_type: SYSTEM_KIND.to_string(),
+                ..Meta::default()
+            },
+            payload: serde_json::json!({}),
+        };
+        assert!(frame_is_from_connection(&msg, node));
+        msg.routing.src = node.to_string().to_uppercase();
+        assert!(
+            frame_is_from_connection(&msg, node),
+            "same UUID, other spelling"
+        );
+        for claimed in [
+            Uuid::new_v4().to_string(),
+            "SY.admin@motherbee".to_string(),
+            String::new(),
+        ] {
+            msg.routing.src = claimed.clone();
+            assert!(
+                !frame_is_from_connection(&msg, node),
+                "{claimed:?} must be refused"
+            );
+        }
+    }
+
+    /// Pins the CALLER: the node loop must check the frame before anything routes it.
+    #[test]
+    fn the_node_loop_checks_the_sender_before_routing() {
+        let src = include_str!("mod.rs");
+        let start = src.find("async fn handle_node(").expect("handle_node");
+        let end = start + src[start..].find("\n}\n").expect("end of handle_node");
+        let body = &src[start..end];
+        let check = body
+            .find("frame_is_from_connection(&msg, node_uuid)")
+            .expect("handle_node checks routing.src against its connection");
+        let route = body.find("handle_message(").expect("handle_node routes");
+        assert!(check < route, "the check must come before routing");
+    }
+
     // L2-LOOKUP-21: Spoof test — sender-supplied src_l2_name is overwritten by the router.
     #[tokio::test]
     async fn router_overwrites_spoofed_src_l2_name() {
@@ -7420,7 +7605,7 @@ mod tests {
             &Arc::new(Mutex::new(OpaResolver::new())),
             &Arc::new(Mutex::new(BroadcastCache::new())),
             &Arc::new(Mutex::new(None::<MemoryRegionReader>)),
-            &Arc::new(Mutex::new(HashMap::<String, u64>::new())),
+            &stream::StreamHandle::detached(),
             "motherbee",
             "SY.frontdesk.gov@motherbee",
             Uuid::new_v4(),
@@ -7439,6 +7624,842 @@ mod tests {
             Some("WF.demo@motherbee"),
             "router must overwrite spoofed src_l2_name with the authenticated NodeHandle name"
         );
+    }
+
+    /// The A-22 check driven through a real socket (panel DTAP T-1): after its HELLO, a node that
+    /// sends a frame claiming another node's UUID as routing.src has it dropped; its frames with
+    /// its own UUID are delivered, stamped with the name it registered.
+    #[tokio::test]
+    async fn a_node_frame_claiming_another_nodes_uuid_is_dropped_at_the_socket() {
+        use nix::sys::mman::shm_unlink;
+        use std::ffi::CString;
+
+        let id = Uuid::new_v4().simple().to_string();
+        let shm_name = format!("/rt-a22-{}", &id[..8]);
+        let cleanup = |name: &str| {
+            if let Ok(cstr) = CString::new(name) {
+                let _ = shm_unlink(cstr.as_c_str());
+            }
+        };
+        cleanup(&shm_name);
+        let router_uuid = Uuid::new_v4();
+        let shm = Arc::new(Mutex::new(
+            RouterRegionWriter::open_or_create(
+                &shm_name,
+                router_uuid,
+                "motherbee",
+                "RT.gateway@motherbee",
+                false,
+            )
+            .expect("create test shm"),
+        ));
+
+        // The node it targets, and the node whose UUID it claims.
+        let receiver_uuid = Uuid::new_v4();
+        let victim_uuid = Uuid::new_v4();
+        let (receiver_tx, mut receiver_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+        let (victim_tx, _victim_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+        let nodes: Arc<Mutex<HashMap<Uuid, NodeHandle>>> = Arc::new(Mutex::new(HashMap::new()));
+        {
+            let mut g = nodes.lock().await;
+            for (uuid, name, sender) in [
+                (receiver_uuid, "SY.timer@motherbee", receiver_tx),
+                (victim_uuid, "SY.admin@motherbee", victim_tx),
+            ] {
+                g.insert(
+                    uuid,
+                    NodeHandle {
+                        name: name.to_string(),
+                        vpn_id: 0,
+                        sender,
+                        connected_at: 0,
+                    },
+                );
+            }
+        }
+
+        let (mut client, server) = UnixStream::pair().expect("socket pair");
+        let router = tokio::spawn(handle_node(
+            server,
+            shm,
+            Arc::clone(&nodes),
+            Arc::new(Mutex::new(HashMap::new())),
+            Arc::new(Mutex::new(HashMap::new())),
+            Arc::new(Mutex::new(HashMap::new())),
+            Arc::new(Mutex::new(HashMap::new())),
+            Arc::new(Mutex::new(None)),
+            Arc::new(Mutex::new(None)),
+            Arc::new(Mutex::new(None)),
+            Arc::new(Mutex::new(HashMap::new())),
+            Arc::new(Mutex::new(Vec::new())),
+            Arc::new(Mutex::new(Vec::new())),
+            Arc::new(Mutex::new(Vec::new())),
+            Arc::new(Mutex::new(Vec::new())),
+            Arc::new(Mutex::new(0)),
+            Arc::new(Mutex::new(OpaResolver::new())),
+            Arc::new(Mutex::new(None)),
+            Arc::new(Mutex::new(BroadcastCache::new())),
+            Arc::new(Mutex::new(0)),
+            Arc::new(Mutex::new(None)),
+            stream::StreamHandle::detached(),
+            router_uuid,
+            "RT.gateway@motherbee",
+            "motherbee",
+            "SY.frontdesk.gov@motherbee",
+            false,
+        ));
+
+        let probe_uuid = Uuid::new_v4();
+        let frame = |src: Uuid, msg_type: &str, msg: Option<&str>, payload: serde_json::Value| {
+            serde_json::to_vec(&Message {
+                routing: Routing {
+                    src: src.to_string(),
+                    src_l2_name: None,
+                    dst: if msg == Some(MSG_HELLO) {
+                        Destination::Broadcast
+                    } else {
+                        Destination::Unicast(receiver_uuid.to_string())
+                    },
+                    ttl: 16,
+                    trace_id: Uuid::new_v4().to_string(),
+                },
+                meta: Meta {
+                    msg_type: msg_type.to_string(),
+                    msg: msg.map(str::to_string),
+                    ..Meta::default()
+                },
+                payload,
+            })
+            .expect("frame")
+        };
+        let hello = frame(
+            probe_uuid,
+            SYSTEM_KIND,
+            Some(MSG_HELLO),
+            serde_json::json!({ "uuid": probe_uuid.to_string(), "name": "AI.probe", "version": "1" }),
+        );
+        write_frame(&mut client, &hello).await.expect("hello");
+        let announce = time::timeout(Duration::from_secs(5), read_frame(&mut client))
+            .await
+            .expect("announce in time")
+            .expect("read")
+            .expect("announce");
+        assert!(!announce.is_empty());
+
+        let claimed = frame(
+            victim_uuid,
+            "user",
+            None,
+            serde_json::json!({ "n": "claimed" }),
+        );
+        let own = frame(probe_uuid, "user", None, serde_json::json!({ "n": "own" }));
+        write_frame(&mut client, &claimed)
+            .await
+            .expect("claimed frame");
+        write_frame(&mut client, &own).await.expect("own frame");
+
+        let delivered = time::timeout(Duration::from_secs(5), receiver_rx.recv())
+            .await
+            .expect("delivery in time")
+            .expect("delivered");
+        let delivered: Message = serde_json::from_slice(&delivered).expect("message");
+        assert_eq!(
+            delivered.payload["n"], "own",
+            "the claimed frame must not be routed"
+        );
+        assert_eq!(delivered.routing.src, probe_uuid.to_string());
+        assert_eq!(
+            delivered.routing.src_l2_name.as_deref(),
+            Some("AI.probe@motherbee")
+        );
+        assert!(
+            time::timeout(Duration::from_millis(200), receiver_rx.recv())
+                .await
+                .is_err(),
+            "nothing else may arrive"
+        );
+
+        drop(client);
+        let _ = time::timeout(Duration::from_secs(5), router).await;
+        cleanup(&shm_name);
+    }
+
+    /// A router SHM for one test, removed when dropped.
+    struct TestShm {
+        name: String,
+        writer: Arc<Mutex<RouterRegionWriter>>,
+    }
+
+    impl TestShm {
+        fn new(prefix: &str) -> Self {
+            let name = format!("/{prefix}-{}", &Uuid::new_v4().simple().to_string()[..8]);
+            unlink_test_shm(&name);
+            let writer = RouterRegionWriter::open_or_create(
+                &name,
+                Uuid::new_v4(),
+                "motherbee",
+                "RT.gateway@motherbee",
+                false,
+            )
+            .expect("create test shm");
+            Self {
+                name,
+                writer: Arc::new(Mutex::new(writer)),
+            }
+        }
+    }
+
+    impl Drop for TestShm {
+        fn drop(&mut self) {
+            unlink_test_shm(&self.name);
+        }
+    }
+
+    fn unlink_test_shm(name: &str) {
+        if let Ok(cstr) = std::ffi::CString::new(name) {
+            let _ = nix::sys::mman::shm_unlink(cstr.as_c_str());
+        }
+    }
+
+    /// `handle_node` on `server` for a motherbee router with no peers, config or policy.
+    fn spawn_node_connection(
+        server: UnixStream,
+        shm: &TestShm,
+        nodes: &Arc<Mutex<HashMap<Uuid, NodeHandle>>>,
+    ) -> tokio::task::JoinHandle<Result<(), RouterError>> {
+        spawn_node_connection_with_stream(server, shm, nodes, stream::StreamHandle::detached())
+    }
+
+    fn spawn_node_connection_with_stream(
+        server: UnixStream,
+        shm: &TestShm,
+        nodes: &Arc<Mutex<HashMap<Uuid, NodeHandle>>>,
+        log_stream: stream::StreamHandle,
+    ) -> tokio::task::JoinHandle<Result<(), RouterError>> {
+        tokio::spawn(handle_node(
+            server,
+            Arc::clone(&shm.writer),
+            Arc::clone(nodes),
+            Arc::new(Mutex::new(HashMap::new())),
+            Arc::new(Mutex::new(HashMap::new())),
+            Arc::new(Mutex::new(HashMap::new())),
+            Arc::new(Mutex::new(HashMap::new())),
+            Arc::new(Mutex::new(None)),
+            Arc::new(Mutex::new(None)),
+            Arc::new(Mutex::new(None)),
+            Arc::new(Mutex::new(HashMap::new())),
+            Arc::new(Mutex::new(Vec::new())),
+            Arc::new(Mutex::new(Vec::new())),
+            Arc::new(Mutex::new(Vec::new())),
+            Arc::new(Mutex::new(Vec::new())),
+            Arc::new(Mutex::new(0)),
+            Arc::new(Mutex::new(OpaResolver::new())),
+            Arc::new(Mutex::new(None)),
+            Arc::new(Mutex::new(BroadcastCache::new())),
+            Arc::new(Mutex::new(0)),
+            Arc::new(Mutex::new(None)),
+            log_stream,
+            Uuid::new_v4(),
+            "RT.gateway@motherbee",
+            "motherbee",
+            "SY.frontdesk.gov@motherbee",
+            false,
+        ))
+    }
+
+    fn test_frame(
+        src: Uuid,
+        msg_type: &str,
+        msg: Option<&str>,
+        dst: Destination,
+        payload: serde_json::Value,
+    ) -> Vec<u8> {
+        serde_json::to_vec(&Message {
+            routing: Routing {
+                src: src.to_string(),
+                src_l2_name: None,
+                dst,
+                ttl: 16,
+                trace_id: Uuid::new_v4().to_string(),
+            },
+            meta: Meta {
+                msg_type: msg_type.to_string(),
+                msg: msg.map(str::to_string),
+                ..Meta::default()
+            },
+            payload,
+        })
+        .expect("frame")
+    }
+
+    /// Connects a node as `name` with `uuid`: Some(stream) once the router announced it, None if
+    /// the router closed the connection instead.
+    async fn hello(
+        shm: &TestShm,
+        nodes: &Arc<Mutex<HashMap<Uuid, NodeHandle>>>,
+        uuid: Uuid,
+        name: &str,
+    ) -> (
+        Option<UnixStream>,
+        tokio::task::JoinHandle<Result<(), RouterError>>,
+    ) {
+        let (mut client, server) = UnixStream::pair().expect("socket pair");
+        let connection = spawn_node_connection(server, shm, nodes);
+        let frame = test_frame(
+            uuid,
+            SYSTEM_KIND,
+            Some(MSG_HELLO),
+            Destination::Broadcast,
+            serde_json::json!({ "uuid": uuid.to_string(), "name": name, "version": "1" }),
+        );
+        write_frame(&mut client, &frame).await.expect("hello");
+        let answer = time::timeout(Duration::from_secs(5), read_frame(&mut client))
+            .await
+            .expect("an answer in time");
+        match answer {
+            Ok(Some(_announce)) => (Some(client), connection),
+            _ => (None, connection),
+        }
+    }
+
+    async fn holder_name(
+        nodes: &Arc<Mutex<HashMap<Uuid, NodeHandle>>>,
+        uuid: Uuid,
+    ) -> Option<String> {
+        nodes
+            .lock()
+            .await
+            .get(&uuid)
+            .map(|handle| handle.name.clone())
+    }
+
+    /// A-70 (stage 1b): the router copies a node's message to its stream under the name it
+    /// registered, takes the node's `STREAM_APPEND` for a subject it may append, refuses the rest,
+    /// and routes neither append to any node.
+    #[tokio::test]
+    async fn the_router_copies_turns_and_takes_appends_without_routing_them() {
+        let shm = TestShm::new("rt-stream");
+        let nodes: Arc<Mutex<HashMap<Uuid, NodeHandle>>> = Arc::new(Mutex::new(HashMap::new()));
+        let receiver_uuid = Uuid::new_v4();
+        let (receiver_tx, mut receiver_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+        nodes.lock().await.insert(
+            receiver_uuid,
+            NodeHandle {
+                name: "SY.timer@motherbee".to_string(),
+                vpn_id: 0,
+                sender: receiver_tx,
+                connected_at: 0,
+            },
+        );
+        let (log_stream, observed) = stream::StreamHandle::observed();
+        let (mut client, server) = UnixStream::pair().expect("socket pair");
+        let _connection = spawn_node_connection_with_stream(server, &shm, &nodes, log_stream);
+        let uuid = Uuid::new_v4();
+        let frame = test_frame(
+            uuid,
+            SYSTEM_KIND,
+            Some(MSG_HELLO),
+            Destination::Broadcast,
+            serde_json::json!({ "uuid": uuid.to_string(), "name": "AI.sales", "version": "1" }),
+        );
+        write_frame(&mut client, &frame).await.expect("hello");
+        time::timeout(Duration::from_secs(5), read_frame(&mut client))
+            .await
+            .expect("announce in time")
+            .expect("read")
+            .expect("announce");
+
+        let to_receiver = Destination::Unicast(receiver_uuid.to_string());
+        let usage = test_frame(
+            uuid,
+            SYSTEM_KIND,
+            Some(fluxbee_sdk::stream::MSG_STREAM_APPEND),
+            to_receiver.clone(),
+            serde_json::json!({ "subject": "storage.usage", "payload": { "tokens": 12 } }),
+        );
+        let forged_turn = test_frame(
+            uuid,
+            SYSTEM_KIND,
+            Some(fluxbee_sdk::stream::MSG_STREAM_APPEND),
+            to_receiver.clone(),
+            serde_json::json!({ "subject": "storage.turns", "payload": { "fake": true } }),
+        );
+        let turn = test_frame(
+            uuid,
+            "user",
+            None,
+            to_receiver,
+            serde_json::json!({ "n": "hola" }),
+        );
+        for frame in [&usage, &forged_turn, &turn] {
+            write_frame(&mut client, frame).await.expect("frame");
+        }
+
+        let delivered = time::timeout(Duration::from_secs(5), receiver_rx.recv())
+            .await
+            .expect("delivery in time")
+            .expect("delivered");
+        let delivered: Message = serde_json::from_slice(&delivered).expect("message");
+        assert_eq!(
+            delivered.payload["n"], "hola",
+            "only the user message is routed"
+        );
+        assert!(
+            time::timeout(Duration::from_millis(200), receiver_rx.recv())
+                .await
+                .is_err(),
+            "no append reaches a node"
+        );
+
+        let appends = observed.drain();
+        assert_eq!(appends.len(), 2, "{appends:?}");
+        assert_eq!(appends[0].0, "storage.usage");
+        assert_eq!(appends[0].1, "AI.sales@motherbee");
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&appends[0].2).unwrap(),
+            serde_json::json!({ "tokens": 12 })
+        );
+        assert_eq!(appends[1].0, "storage.turns");
+        assert_eq!(appends[1].1, "AI.sales@motherbee");
+        let copy: Message = serde_json::from_slice(&appends[1].2).expect("the turn copy");
+        assert_eq!(copy.payload["n"], "hola");
+        assert_eq!(
+            copy.routing.src_l2_name.as_deref(),
+            Some("AI.sales@motherbee")
+        );
+        assert_eq!(observed.refused(), 1, "a node never appends a turn");
+    }
+
+    /// A-70 stage 2a (§6.2): the agent's router hands its cognition both directions of the agent's
+    /// communication: what reaches the agent, copied at delivery (owner = that agent), and what the
+    /// agent sends, copied at entry. A message without a thread, or between non-agents, is not
+    /// copied; a package the sender set never reaches the agent.
+    #[tokio::test]
+    async fn the_agents_router_copies_both_directions_for_its_cognition() {
+        let shm = TestShm::new("rt-cog");
+        let nodes: Arc<Mutex<HashMap<Uuid, NodeHandle>>> = Arc::new(Mutex::new(HashMap::new()));
+        let agent_uuid = Uuid::new_v4();
+        let web_uuid = Uuid::new_v4();
+        let (agent_tx, mut agent_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+        let (web_tx, mut web_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+        {
+            let mut guard = nodes.lock().await;
+            for (uuid, name, sender) in [
+                (agent_uuid, "AI.sales@motherbee", agent_tx),
+                (web_uuid, "IO.web@motherbee", web_tx),
+            ] {
+                guard.insert(
+                    uuid,
+                    NodeHandle {
+                        name: name.to_string(),
+                        vpn_id: 0,
+                        sender,
+                        connected_at: 0,
+                    },
+                );
+            }
+        }
+        let (log_stream, observed) = stream::StreamHandle::observed();
+        let threaded = |src: Uuid, dst: Uuid, thread: Option<&str>, n: u32| {
+            let mut msg: Message = serde_json::from_slice(&test_frame(
+                src,
+                "user",
+                None,
+                Destination::Unicast(dst.to_string()),
+                serde_json::json!({ "n": n }),
+            ))
+            .unwrap();
+            msg.meta.thread_id = thread.map(str::to_string);
+            msg.meta.memory_package = Some(fluxbee_sdk::protocol::MemoryPackage {
+                package_version: 2,
+                thread_id: "forged".to_string(),
+                dominant_context: None,
+                dominant_reason: None,
+                contexts: Vec::new(),
+                reasons: Vec::new(),
+                memories: Vec::new(),
+                episodes: Vec::new(),
+                truncated: None,
+            });
+            serde_json::to_vec(&msg).unwrap()
+        };
+        let connect = |name: &'static str| {
+            let shm = &shm;
+            let nodes = &nodes;
+            let log_stream = log_stream.clone();
+            async move {
+                let uuid = Uuid::new_v4();
+                let (mut client, server) = UnixStream::pair().expect("socket pair");
+                let _ = spawn_node_connection_with_stream(server, shm, nodes, log_stream);
+                let hello = test_frame(
+                    uuid,
+                    SYSTEM_KIND,
+                    Some(MSG_HELLO),
+                    Destination::Broadcast,
+                    serde_json::json!({ "uuid": uuid.to_string(), "name": name, "version": "1" }),
+                );
+                write_frame(&mut client, &hello).await.expect("hello");
+                time::timeout(Duration::from_secs(5), read_frame(&mut client))
+                    .await
+                    .expect("announce in time")
+                    .expect("read")
+                    .expect("announce");
+                (uuid, client)
+            }
+        };
+
+        // A user (through an IO node) to the agent: copied at delivery, for the agent.
+        let (user_uuid, mut user) = connect("IO.wapp").await;
+        write_frame(
+            &mut user,
+            &threaded(user_uuid, agent_uuid, Some("thread:t1"), 1),
+        )
+        .await
+        .expect("to the agent");
+        // Without a thread, and to a node that is not an agent: no cognition copy.
+        write_frame(&mut user, &threaded(user_uuid, agent_uuid, None, 2))
+            .await
+            .expect("no thread");
+        write_frame(
+            &mut user,
+            &threaded(user_uuid, web_uuid, Some("thread:t1"), 3),
+        )
+        .await
+        .expect("to a non-agent");
+        for _ in 0..2 {
+            let got = time::timeout(Duration::from_secs(5), agent_rx.recv())
+                .await
+                .expect("delivery in time")
+                .expect("delivered");
+            let got: Message = serde_json::from_slice(&got).unwrap();
+            assert!(
+                got.meta.memory_package.is_none(),
+                "the sender's package is dropped"
+            );
+        }
+        let got = time::timeout(Duration::from_secs(5), web_rx.recv())
+            .await
+            .expect("delivery in time")
+            .expect("delivered");
+        let got: Message = serde_json::from_slice(&got).unwrap();
+        assert!(got.meta.memory_package.is_none());
+
+        // The agent replies: copied at entry, for the agent.
+        let (bot_uuid, mut bot) = connect("AI.bot").await;
+        write_frame(
+            &mut bot,
+            &threaded(bot_uuid, web_uuid, Some("thread:t2"), 4),
+        )
+        .await
+        .expect("from an agent");
+        time::timeout(Duration::from_secs(5), web_rx.recv())
+            .await
+            .expect("delivery in time")
+            .expect("delivered");
+
+        let cognition: Vec<(String, String, Message)> = observed
+            .drain()
+            .into_iter()
+            .filter(|(subject, _, _)| subject == fluxbee_sdk::stream::SUBJECT_COGNITION_TURNS)
+            .map(|(subject, producer, payload)| {
+                (subject, producer, serde_json::from_slice(&payload).unwrap())
+            })
+            .collect();
+        assert_eq!(cognition.len(), 2, "{cognition:?}");
+        assert_eq!(cognition[0].1, "AI.sales@motherbee");
+        assert_eq!(cognition[0].2.payload["n"], 1);
+        assert_eq!(
+            cognition[0].2.routing.src_l2_name.as_deref(),
+            Some("IO.wapp@motherbee")
+        );
+        assert!(cognition[0].2.meta.memory_package.is_none());
+        assert_eq!(cognition[1].1, "AI.bot@motherbee");
+        assert_eq!(cognition[1].2.payload["n"], 4);
+    }
+
+    #[test]
+    fn an_agent_gets_the_package_of_its_own_communication() {
+        let package = |label: &str| fluxbee_sdk::protocol::MemoryPackage {
+            package_version: 2,
+            thread_id: "thread:t".to_string(),
+            dominant_context: Some(fluxbee_sdk::protocol::MemoryContextSummary {
+                context_id: format!("context:{label}"),
+                label: label.to_string(),
+                weight: 1.0,
+            }),
+            dominant_reason: None,
+            contexts: Vec::new(),
+            reasons: Vec::new(),
+            memories: Vec::new(),
+            episodes: Vec::new(),
+            truncated: None,
+        };
+        let entry = |thread: &str, node: &str, label: &str| crate::shm::MemoryShmThreadEntry {
+            thread_id: thread.to_string(),
+            agent_ilk: format!("ilk:{node}"),
+            agent_node: node.to_string(),
+            package: package(label),
+        };
+        let memory = MemoryShmSnapshot {
+            schema_version: 2,
+            updated_at: 1,
+            threads: vec![
+                entry("thread:t", "AI.a@motherbee", "a"),
+                entry("thread:t", "AI.b@motherbee", "b"),
+                entry("thread:u", "AI.b@motherbee", "u"),
+            ],
+        };
+        let mut msg: Message = serde_json::from_slice(&test_frame(
+            Uuid::new_v4(),
+            "user",
+            None,
+            Destination::Resolve,
+            serde_json::json!({}),
+        ))
+        .unwrap();
+        msg.meta.thread_id = Some("thread:t".to_string());
+        let label = |node: &str| {
+            package_for(Some(&memory), &msg, node)
+                .and_then(|package| package.dominant_context)
+                .map(|context| context.label)
+        };
+        assert_eq!(label("AI.b@motherbee").as_deref(), Some("b"));
+        assert_eq!(label("AI.a@motherbee").as_deref(), Some("a"));
+        assert_eq!(label("AI.c@motherbee"), None);
+        assert!(is_agent_node("ai.sales@worker1") && !is_agent_node("SY.frontdesk.gov@motherbee"));
+    }
+
+    /// A-44: a second live process with a node's UUID does not take its route. Its HELLO waits
+    /// the grace for the first connection to go, and is refused while it stays.
+    #[tokio::test]
+    async fn a_hello_with_a_uuid_that_is_still_connected_is_refused() {
+        let shm = TestShm::new("rt-dup");
+        let nodes: Arc<Mutex<HashMap<Uuid, NodeHandle>>> = Arc::new(Mutex::new(HashMap::new()));
+        let uuid = Uuid::new_v4();
+        let (first, _first_conn) = hello(&shm, &nodes, uuid, "AI.first").await;
+        assert!(first.is_some(), "the first connection is announced");
+
+        let started = time::Instant::now();
+        let (second, second_conn) = hello(&shm, &nodes, uuid, "AI.second").await;
+        assert!(second.is_none(), "the second connection gets no ANNOUNCE");
+        assert!(
+            started.elapsed() >= DUPLICATE_HELLO_GRACE,
+            "it waited the grace first"
+        );
+        let refused = time::timeout(Duration::from_secs(5), second_conn)
+            .await
+            .expect("the refused connection ends")
+            .expect("join");
+        assert!(refused.is_err());
+        assert_eq!(
+            holder_name(&nodes, uuid).await.as_deref(),
+            Some("AI.first@motherbee"),
+            "the first connection keeps the route"
+        );
+        drop(first);
+    }
+
+    /// A node that reconnects right after its connection closed (a restart, the Go SDK's second
+    /// HELLO) is accepted: its HELLO waits until the router cleaned up the old connection.
+    #[tokio::test]
+    async fn a_node_reconnecting_right_after_closing_is_accepted() {
+        let shm = TestShm::new("rt-recon");
+        let nodes: Arc<Mutex<HashMap<Uuid, NodeHandle>>> = Arc::new(Mutex::new(HashMap::new()));
+        let uuid = Uuid::new_v4();
+        let (first, first_conn) = hello(&shm, &nodes, uuid, "AI.node").await;
+        drop(first.expect("announced"));
+        let (second, _second_conn) = hello(&shm, &nodes, uuid, "AI.node").await;
+        assert!(second.is_some(), "the reconnect is announced");
+        assert!(time::timeout(Duration::from_secs(5), first_conn)
+            .await
+            .expect("the first connection ended")
+            .expect("join")
+            .is_ok());
+        assert_eq!(
+            holder_name(&nodes, uuid).await.as_deref(),
+            Some("AI.node@motherbee")
+        );
+    }
+
+    /// A-44: a connection that ends in a read error is cleaned up like one that ends in EOF.
+    /// Before, the node stayed registered with its writer alive.
+    #[tokio::test]
+    async fn a_connection_that_ends_in_a_read_error_is_cleaned_up() {
+        use tokio::io::AsyncWriteExt;
+
+        let shm = TestShm::new("rt-rderr");
+        let nodes: Arc<Mutex<HashMap<Uuid, NodeHandle>>> = Arc::new(Mutex::new(HashMap::new()));
+        let uuid = Uuid::new_v4();
+        let (client, connection) = hello(&shm, &nodes, uuid, "AI.node").await;
+        let mut client = client.expect("announced");
+        // A frame header for 100 bytes, then 10 bytes and the close: a partial frame.
+        client
+            .write_all(&100u32.to_be_bytes())
+            .await
+            .expect("header");
+        client
+            .write_all(&[0u8; 10])
+            .await
+            .expect("part of the body");
+        drop(client);
+
+        let ended = time::timeout(Duration::from_secs(5), connection)
+            .await
+            .expect("the connection ends")
+            .expect("join");
+        assert!(ended.is_err(), "a partial frame is a read error");
+        assert_eq!(
+            holder_name(&nodes, uuid).await,
+            None,
+            "the node is unregistered"
+        );
+        let snapshot = shm.writer.lock().await.read_snapshot().expect("snapshot");
+        assert!(
+            snapshot
+                .nodes
+                .iter()
+                .all(|node| node.uuid != *uuid.as_bytes()),
+            "and its SHM slot is freed"
+        );
+    }
+
+    /// A message the router cannot handle is skipped; the connection stays up.
+    #[tokio::test]
+    async fn a_message_the_router_cannot_handle_does_not_end_the_connection() {
+        let shm = TestShm::new("rt-badmsg");
+        let receiver_uuid = Uuid::new_v4();
+        let (receiver_tx, mut receiver_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+        let nodes: Arc<Mutex<HashMap<Uuid, NodeHandle>>> = Arc::new(Mutex::new(HashMap::new()));
+        nodes.lock().await.insert(
+            receiver_uuid,
+            NodeHandle {
+                name: "SY.timer@motherbee".to_string(),
+                vpn_id: 0,
+                sender: receiver_tx,
+                connected_at: 0,
+            },
+        );
+        let uuid = Uuid::new_v4();
+        let (client, connection) = hello(&shm, &nodes, uuid, "AI.node").await;
+        let mut client = client.expect("announced");
+        // An OPA_RELOAD whose payload is not one ended the connection before.
+        let bad = test_frame(
+            uuid,
+            SYSTEM_KIND,
+            Some(MSG_OPA_RELOAD),
+            Destination::Broadcast,
+            serde_json::json!({ "not": "an opa reload" }),
+        );
+        write_frame(&mut client, &bad).await.expect("bad frame");
+        let good = test_frame(
+            uuid,
+            "user",
+            None,
+            Destination::Unicast(receiver_uuid.to_string()),
+            serde_json::json!({ "n": "after" }),
+        );
+        write_frame(&mut client, &good).await.expect("good frame");
+
+        let delivered = time::timeout(Duration::from_secs(5), receiver_rx.recv())
+            .await
+            .expect("delivery in time")
+            .expect("delivered");
+        let delivered: Message = serde_json::from_slice(&delivered).expect("message");
+        assert_eq!(delivered.payload["n"], "after");
+        assert!(!connection.is_finished(), "the connection is still up");
+        drop(client);
+    }
+
+    /// The admin's OPA sync notice (panel DTAP T-8): a broadcast with meta.target
+    /// `SY.opa.rules@*` reaches SY.opa.rules and no other local node; the same notice from any
+    /// sender but the primary admin reaches nobody (CONFIG_CHANGED is protected).
+    #[tokio::test]
+    async fn the_opa_sync_notice_reaches_only_opa_rules_and_only_from_the_primary_admin() {
+        for (sender_name, reaches_opa_rules) in [
+            ("SY.admin@motherbee", true),
+            ("SY.orchestrator@motherbee", false),
+        ] {
+            let sender_uuid = Uuid::new_v4();
+            let (sender_tx, _sender_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+            let nodes: Arc<Mutex<HashMap<Uuid, NodeHandle>>> = Arc::new(Mutex::new(HashMap::new()));
+            let mut inboxes = Vec::new();
+            {
+                let mut g = nodes.lock().await;
+                g.insert(
+                    sender_uuid,
+                    NodeHandle {
+                        name: sender_name.to_string(),
+                        vpn_id: 0,
+                        sender: sender_tx,
+                        connected_at: 0,
+                    },
+                );
+                for name in [
+                    "SY.opa.rules@motherbee",
+                    "AI.chat@motherbee",
+                    "SY.timer@motherbee",
+                ] {
+                    let (tx, rx) = mpsc::unbounded_channel::<Vec<u8>>();
+                    g.insert(
+                        Uuid::new_v4(),
+                        NodeHandle {
+                            name: name.to_string(),
+                            vpn_id: 0,
+                            sender: tx,
+                            connected_at: 0,
+                        },
+                    );
+                    inboxes.push((name, rx));
+                }
+            }
+            let notice = Message {
+                routing: Routing {
+                    src: sender_uuid.to_string(),
+                    src_l2_name: None,
+                    dst: Destination::Broadcast,
+                    ttl: 16,
+                    trace_id: Uuid::new_v4().to_string(),
+                },
+                meta: Meta {
+                    msg_type: SYSTEM_KIND.to_string(),
+                    msg: Some("CONFIG_CHANGED".to_string()),
+                    scope: Some("global".to_string()),
+                    target: Some("SY.opa.rules@*".to_string()),
+                    ..Meta::default()
+                },
+                payload: serde_json::json!({
+                    "subsystem": "opa", "action": "sync", "version": 0,
+                    "config": { "hash": "" }
+                }),
+            };
+            handle_message(
+                &notice,
+                &nodes,
+                &Arc::new(Mutex::new(Vec::<FibEntry>::new())),
+                &Arc::new(Mutex::new(HashMap::<Uuid, PeerNode>::new())),
+                &Arc::new(Mutex::new(HashMap::<Uuid, PeerRouter>::new())),
+                &Arc::new(Mutex::new(HashMap::<Uuid, PeerHandle>::new())),
+                &Arc::new(Mutex::new(HashMap::<String, WanPeer>::new())),
+                &Arc::new(Mutex::new(OpaResolver::new())),
+                &Arc::new(Mutex::new(BroadcastCache::new())),
+                &Arc::new(Mutex::new(None::<MemoryRegionReader>)),
+                &stream::StreamHandle::detached(),
+                "motherbee",
+                "SY.frontdesk.gov@motherbee",
+                Uuid::new_v4(),
+                false,
+                &Arc::new(Mutex::new(None)),
+                &Arc::new(Mutex::new(HashMap::<Uuid, ReachabilityEntry>::new())),
+                None,
+            )
+            .await
+            .unwrap();
+            for (name, mut inbox) in inboxes {
+                let delivered = inbox.try_recv().is_ok();
+                let want = reaches_opa_rules && name == "SY.opa.rules@motherbee";
+                assert_eq!(delivered, want, "{sender_name} -> {name}");
+            }
+        }
     }
 
     // L2-LOOKUP-22: Local end-to-end — receiver observes correct src UUID and src_l2_name.
@@ -7499,7 +8520,7 @@ mod tests {
             &Arc::new(Mutex::new(OpaResolver::new())),
             &Arc::new(Mutex::new(BroadcastCache::new())),
             &Arc::new(Mutex::new(None::<MemoryRegionReader>)),
-            &Arc::new(Mutex::new(HashMap::<String, u64>::new())),
+            &stream::StreamHandle::detached(),
             "motherbee",
             "SY.frontdesk.gov@motherbee",
             Uuid::new_v4(),
@@ -7620,12 +8641,8 @@ mod tests {
             &Arc::new(Mutex::new(HashMap::<Uuid, PeerRouter>::new())),
             &nodes,
             &Arc::new(Mutex::new(HashMap::<String, WanPeer>::new())),
-            &Arc::new(Mutex::new(None::<ConfigRegionReader>)),
             &Arc::new(Mutex::new(None::<LsaRegionReader>)),
             &Arc::new(Mutex::new(Vec::<StaticRoute>::new())),
-            &Arc::new(Mutex::new(Vec::<VpnAssignment>::new())),
-            &Arc::new(Mutex::new(Vec::<TapEntry>::new())),
-            &Arc::new(Mutex::new(0u64)),
             &shm,
             &Arc::new(Mutex::new(OpaResolver::new())),
             &Arc::new(Mutex::new(None::<OpaRegionReader>)),
@@ -7637,7 +8654,7 @@ mod tests {
             false,
             &Arc::new(Mutex::new(None)),
             &Arc::new(Mutex::new(HashMap::<Uuid, ReachabilityEntry>::new())),
-            &Arc::new(Mutex::new(HashMap::<String, u64>::new())),
+            &stream::StreamHandle::detached(),
         )
         .await
         .unwrap();
@@ -7657,6 +8674,245 @@ mod tests {
             delivered_msg.routing.src_l2_name.as_deref(),
             Some("WF.external@worker-hive"),
             "delivered message must carry the L2 name from this router's peer_nodes, not whatever the remote router sent"
+        );
+    }
+
+    #[test]
+    fn rt_names_belong_to_the_routers_own_process() {
+        let own = 4242u32;
+        assert!(rt_name_allowed(
+            "RT.gateway.stream@worker1",
+            Some(4242),
+            own
+        ));
+        assert!(rt_name_allowed(
+            "rt.gateway.stream@worker1",
+            Some(4242),
+            own
+        ));
+        assert!(!rt_name_allowed(
+            "RT.gateway.stream@worker1",
+            Some(4243),
+            own
+        ));
+        assert!(!rt_name_allowed("RT.x.stream@worker1", None, own));
+        assert!(!rt_name_allowed("rt.edge.buffer@motherbee", Some(1), own));
+        // Every other name is untouched, whoever opened the socket.
+        assert!(rt_name_allowed("SY.storage@motherbee", None, own));
+        assert!(rt_name_allowed("AI.sales@worker1", Some(1), own));
+        assert!(rt_name_allowed("RTX.thing@worker1", Some(1), own));
+    }
+
+    #[tokio::test]
+    async fn an_oversize_frame_is_skipped_and_the_link_goes_on() {
+        let (writer, mut reader) = tokio::io::duplex(4 * MAX_FRAME_SIZE);
+        let (tx, rx) = mpsc::unbounded_channel::<Vec<u8>>();
+        let task = tokio::spawn(write_link_frames(
+            writer,
+            rx,
+            "node",
+            Arc::new(std::sync::OnceLock::from(
+                "SY.storage@motherbee".to_string(),
+            )),
+        ));
+        tx.send(vec![b'x'; MAX_FRAME_SIZE + 1]).unwrap();
+        tx.send(b"next".to_vec()).unwrap();
+        drop(tx);
+        task.await.unwrap();
+        let frame = read_frame(&mut reader)
+            .await
+            .unwrap()
+            .expect("a frame after the skip");
+        assert_eq!(frame, b"next".to_vec());
+        assert!(
+            read_frame(&mut reader).await.unwrap().is_none(),
+            "nothing else was written"
+        );
+    }
+
+    /// An LSA snapshot with one remote hive and one node of it.
+    fn lsa_with_remote_node(hive: &str, node_uuid: Uuid, node_name: &str) -> LsaSnapshot {
+        let mut hive_id = [0u8; 64];
+        hive_id[..hive.len()].copy_from_slice(hive.as_bytes());
+        let mut name = [0u8; 256];
+        name[..node_name.len()].copy_from_slice(node_name.as_bytes());
+        LsaSnapshot {
+            header: crate::shm::LsaHeaderSnapshot {
+                hive_count: 1,
+                total_node_count: 1,
+                total_route_count: 0,
+                total_vpn_count: 0,
+                total_tap_count: 0,
+                heartbeat: 0,
+            },
+            hives: vec![crate::shm::RemoteHiveEntry {
+                hive_id,
+                hive_id_len: hive.len() as u16,
+                router_uuid: [0u8; 16],
+                router_name: [0u8; 64],
+                router_name_len: 0,
+                last_lsa_seq: 1,
+                last_updated: 0,
+                flags: 0,
+                node_count: 1,
+                route_count: 0,
+                vpn_count: 0,
+                tap_count: 0,
+            }],
+            nodes: vec![crate::shm::RemoteNodeEntry {
+                uuid: *node_uuid.as_bytes(),
+                name,
+                name_len: node_name.len() as u16,
+                vpn_id: 0,
+                hive_index: 0,
+                flags: 0,
+                _reserved: [0u8; 6],
+            }],
+            routes: Vec::new(),
+            vpns: Vec::new(),
+            taps: Vec::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_hello_from_the_routers_own_process_may_take_an_rt_name() {
+        // The plumbing the HELLO check relies on: a socket's peer is this very process.
+        let (a, _b) = tokio::net::UnixStream::pair().unwrap();
+        let pid = a.peer_cred().unwrap().pid();
+        assert!(rt_name_allowed(
+            "RT.gateway.stream@motherbee",
+            pid,
+            std::process::id()
+        ));
+    }
+
+    async fn deliver_from_peer(peer_is_gateway: bool) -> Option<Message> {
+        use nix::sys::mman::shm_unlink;
+        use std::ffi::CString;
+
+        let id = Uuid::new_v4().simple().to_string();
+        let shm_name = format!("/rt-gw-{}", &id[..8]);
+        let cleanup = |name: &str| {
+            if let Ok(cstr) = CString::new(name) {
+                let _ = shm_unlink(cstr.as_c_str());
+            }
+        };
+        cleanup(&shm_name);
+
+        let remote_sender_uuid = Uuid::new_v4();
+        let gateway_uuid = Uuid::new_v4();
+        let local_receiver_uuid = Uuid::new_v4();
+        let (receiver_tx, mut receiver_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+        let nodes: Arc<Mutex<HashMap<Uuid, NodeHandle>>> = Arc::new(Mutex::new(HashMap::new()));
+        nodes.lock().await.insert(
+            local_receiver_uuid,
+            NodeHandle {
+                name: "RT.switch1.stream@worker1".to_string(),
+                vpn_id: 0,
+                sender: receiver_tx,
+                connected_at: 0,
+            },
+        );
+        // The sender is a node of another hive: not one of this router's siblings' nodes, but in
+        // the LSA this router reads.
+        let peer_nodes: Arc<Mutex<HashMap<Uuid, PeerNode>>> = Arc::new(Mutex::new(HashMap::new()));
+        let lsa_snapshot = Arc::new(Mutex::new(Some(lsa_with_remote_node(
+            "motherbee",
+            remote_sender_uuid,
+            "SY.storage@motherbee",
+        ))));
+        let peer_routers: Arc<Mutex<HashMap<Uuid, PeerRouter>>> =
+            Arc::new(Mutex::new(HashMap::new()));
+        peer_routers.lock().await.insert(
+            gateway_uuid,
+            PeerRouter {
+                uuid: gateway_uuid,
+                is_gateway: peer_is_gateway,
+            },
+        );
+        let reachability: Arc<Mutex<HashMap<Uuid, ReachabilityEntry>>> =
+            Arc::new(Mutex::new(HashMap::new()));
+        let (peer_tx, _peer_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+        let peers: Arc<Mutex<HashMap<Uuid, PeerHandle>>> = Arc::new(Mutex::new(HashMap::new()));
+        peers
+            .lock()
+            .await
+            .insert(gateway_uuid, PeerHandle { sender: peer_tx });
+        let msg = Message {
+            routing: Routing {
+                src: remote_sender_uuid.to_string(),
+                // Whatever the frame says, the name comes from this router's LSA.
+                src_l2_name: Some("SY.forged@motherbee".to_string()),
+                dst: Destination::Unicast(local_receiver_uuid.to_string()),
+                ttl: 16,
+                trace_id: Uuid::new_v4().to_string(),
+            },
+            meta: Meta {
+                msg_type: "system".to_string(),
+                msg: Some("STREAM_ACK".to_string()),
+                ..Meta::default()
+            },
+            payload: serde_json::json!({"up_to_seq": 7}),
+        };
+        let router_uuid = Uuid::new_v4();
+        let shm_writer = RouterRegionWriter::open_or_create(
+            &shm_name,
+            router_uuid,
+            "worker1",
+            "RT.switch1@worker1",
+            false,
+        )
+        .expect("create test shm");
+        let shm = Arc::new(Mutex::new(shm_writer));
+        handle_peer_message(
+            &msg,
+            &gateway_uuid,
+            &peers,
+            &peer_nodes,
+            &peer_routers,
+            &nodes,
+            &Arc::new(Mutex::new(HashMap::<String, WanPeer>::new())),
+            &Arc::new(Mutex::new(None::<LsaRegionReader>)),
+            &Arc::new(Mutex::new(Vec::<StaticRoute>::new())),
+            &shm,
+            &Arc::new(Mutex::new(OpaResolver::new())),
+            &Arc::new(Mutex::new(None::<OpaRegionReader>)),
+            &Arc::new(Mutex::new(None::<MemoryRegionReader>)),
+            "worker1",
+            "SY.frontdesk.gov@worker1",
+            &Arc::new(Mutex::new(Vec::<FibEntry>::new())),
+            router_uuid,
+            false,
+            &lsa_snapshot,
+            &reachability,
+            &stream::StreamHandle::detached(),
+        )
+        .await
+        .unwrap();
+        cleanup(&shm_name);
+        receiver_rx
+            .try_recv()
+            .ok()
+            .map(|frame| serde_json::from_slice(&frame).unwrap())
+    }
+
+    #[tokio::test]
+    async fn a_message_from_another_hive_reaches_a_node_on_a_non_gateway_router() {
+        let delivered = deliver_from_peer(true)
+            .await
+            .expect("the gateway's hand-over is delivered");
+        assert_eq!(
+            delivered.routing.src_l2_name.as_deref(),
+            Some("SY.storage@motherbee"),
+            "the name comes from this router's LSA, not from the frame"
+        );
+    }
+
+    #[tokio::test]
+    async fn only_the_gateway_hands_over_another_hives_nodes() {
+        assert!(
+            deliver_from_peer(false).await.is_none(),
+            "a sibling that is not the gateway cannot speak for another hive's node"
         );
     }
 
@@ -7715,6 +8971,8 @@ mod tests {
                 updated_at: 1,
                 threads: vec![crate::shm::MemoryShmThreadEntry {
                     thread_id: thread_id.clone(),
+                    agent_ilk: "ilk:agent".to_string(),
+                    agent_node: "AI.test@sandbox".to_string(),
                     package: old_package,
                 }],
             })
@@ -7735,6 +8993,8 @@ mod tests {
                 updated_at: 2,
                 threads: vec![crate::shm::MemoryShmThreadEntry {
                     thread_id: thread_id.clone(),
+                    agent_ilk: "ilk:agent".to_string(),
+                    agent_node: "AI.test@sandbox".to_string(),
                     package: fresh_package,
                 }],
             })

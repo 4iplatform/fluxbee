@@ -65,11 +65,31 @@ pub(crate) fn parse_api_message_request(
         .and_then(Value::as_str)
         .map(str::trim)
         .unwrap_or_default();
+    // FIX-15: check attachments at the ENVELOPE level first — if a caller sends attachments without
+    // a message object, the actionable "use Blob" guidance should win over a generic message-required.
+    if envelope.contains_key("attachments") {
+        return Err(ApiIngressError::new(
+            "attachments_not_supported",
+            "IO.api Edge ingress accepts inline JSON only; publish large data through Blob",
+        ));
+    }
     let message = envelope
         .get("message")
         .and_then(Value::as_object)
-        .ok_or_else(|| ApiIngressError::new("invalid_payload", "field 'message' is required"))?;
-    if message.contains_key("attachments") || envelope.contains_key("attachments") {
+        .ok_or_else(|| {
+            // FIX-15: self-documenting — show the required envelope shape and catch the common
+            // top-level {"text":...} mistake (the live-probe symptom).
+            let hint = if envelope.contains_key("text") {
+                " (a top-level \"text\" was sent — wrap it: {\"message\":{\"text\":\"...\"}})"
+            } else {
+                ""
+            };
+            ApiIngressError::new(
+                "invalid_payload",
+                format!("field 'message' is required — expected {{\"message\":{{\"text\":\"...\"}}}}{hint}"),
+            )
+        })?;
+    if message.contains_key("attachments") {
         return Err(ApiIngressError::new(
             "attachments_not_supported",
             "IO.api Edge ingress accepts inline JSON only; publish large data through Blob",

@@ -65,6 +65,8 @@ type HiveConfig struct {
 type OpaConfigPayload struct {
 	Rego       string `json:"rego"`
 	Entrypoint string `json:"entrypoint"`
+	// Hash of the published policy, on a "sync" notice ("" = cleared).
+	Hash string `json:"hash,omitempty"`
 }
 
 type ConfigChangedPayload struct {
@@ -73,6 +75,9 @@ type ConfigChangedPayload struct {
 	AutoApply *bool             `json:"auto_apply,omitempty"`
 	Version   uint64            `json:"version"`
 	Config    *OpaConfigPayload `json:"config,omitempty"`
+	// Hive the change is addressed to; empty = every hive. A change addressed to another
+	// hive must not run here.
+	Hive string `json:"hive,omitempty"`
 }
 
 type CompileRequest struct {
@@ -164,7 +169,21 @@ type Service struct {
 	lastPeer           string
 	opaRegion          *OpaRegion
 
-	lastError string
+	// What get_status reports about this hive's sync. statusMu guards it and is never held across
+	// I/O, so a status query never waits behind a compile or an install.
+	statusMu   sync.Mutex
+	syncStatus syncStatus
+	// The last failure to re-publish (motherbee): logged only when it changes. Under policyMu.
+	lastPublishErr string
+
+	// policyMu serializes every change to the running policy: the message loop and the
+	// published-policy sync loop both make them.
+	policyMu     sync.Mutex
+	pendingSyncs []pendingSync
+	syncKick     chan struct{}
+
+	// testSend captures outgoing messages in unit tests, which run without a router.
+	testSend func(fluxbeesdk.Message)
 }
 
 type RouterStatus struct {
@@ -203,16 +222,10 @@ func main() {
 	if err != nil {
 		log.Fatalf("failed to load hive.yaml: %v", err)
 	}
-	selfIlkID, err := fluxbeesdk.WaitForSelfSystemIlkID(
-		hiveID,
-		defaultNodeBaseName,
-		30*time.Second,
-		250*time.Millisecond,
-	)
-	if err != nil {
-		log.Fatalf("failed to resolve self system ILK from identity SHM: %v", err)
-	}
-	log.Printf("resolved self system ILK from identity SHM: %s", selfIlkID)
+	// Model D' (as the Rust SY nodes): the self ILK is derived from the L2 name, so this node also
+	// starts on hives without SY.identity (ingress, egress), where the identity SHM never appears.
+	selfIlkID := fluxbeesdk.DeterministicSystemIlkID(fmt.Sprintf("%s@%s", defaultNodeBaseName, hiveID))
+	log.Printf("self system ILK computed deterministically: %s", selfIlkID)
 	_ = selfIlkID // cached for future outgoing meta.src_ilk use
 
 	if err := ensureDirs(); err != nil {
@@ -243,11 +256,20 @@ func main() {
 		nodeUUID:  nodeUUID,
 		nodeName:  nodeName,
 		opaRegion: opaRegion,
+		syncKick:  make(chan struct{}, 1),
 	}
 
+	// Every hive starts on its own last policy, whether or not the motherbee is reachable.
 	if err := service.loadCurrentPolicy(); err != nil {
 		log.Printf("failed to load current policy: %v", err)
 	}
+	if service.isPrimary() {
+		// Keep the hand-off in step with what runs here (e.g. first start after an upgrade).
+		if err := service.publishPolicy(); err != nil {
+			log.Printf("failed to publish the current policy: %v", err)
+		}
+	}
+	go service.policySyncLoop()
 
 	go service.runRouter()
 
@@ -256,21 +278,46 @@ func main() {
 	select {}
 }
 
+// The policy (rego and compiled wasm) is what every router on this hive enforces: readable and
+// writable by root only, like the SY.* SHM regions written from Rust (0600).
+const (
+	opaPrivateDirMode  = 0o700
+	opaPrivateFileMode = 0o600
+)
+
 func ensureDirs() error {
-	paths := []string{
+	for _, path := range []string{
+		stateDir,
 		filepath.Join(stateDir, "current"),
 		filepath.Join(stateDir, "staged"),
 		filepath.Join(stateDir, "backup"),
-		nodesDir,
-		"/var/run/fluxbee",
-		routerSockDir,
+	} {
+		if err := ensurePrivateDir(path); err != nil {
+			return err
+		}
 	}
-	for _, path := range paths {
+	for _, path := range []string{nodesDir, routerSockDir} { // MkdirAll creates /var/run/fluxbee too
 		if err := os.MkdirAll(path, 0o755); err != nil {
 			return err
 		}
 	}
 	return nil
+}
+
+// ensurePrivateDir creates dir 0700, and tightens it if an older build left it 0755.
+func ensurePrivateDir(dir string) error {
+	if err := os.MkdirAll(dir, opaPrivateDirMode); err != nil {
+		return err
+	}
+	return os.Chmod(dir, opaPrivateDirMode)
+}
+
+// writePrivateFile writes path 0600, and tightens it if an older build left it 0644.
+func writePrivateFile(path string, data []byte) error {
+	if err := os.WriteFile(path, data, opaPrivateFileMode); err != nil {
+		return err
+	}
+	return os.Chmod(path, opaPrivateFileMode)
 }
 
 func loadHiveID() (string, error) {
@@ -306,9 +353,11 @@ func loadOrCreateUUID(dir, base string) (uuid.UUID, error) {
 
 func openOrCreateOpaRegion(name string, owner uuid.UUID) (*OpaRegion, error) {
 	filePath := filepath.Join("/dev/shm", strings.TrimPrefix(name, "/"))
-	fd, err := openFileFd(filePath, unix.O_RDWR, 0o666)
+	fd, err := openFileFd(filePath, unix.O_RDWR, opaPrivateFileMode)
 	if err == nil {
-		_ = unix.Fchmod(fd, 0o666)
+		// Older builds created this region 0666: any local process could read the policy or
+		// write one for the router to load.
+		_ = unix.Fchmod(fd, opaPrivateFileMode)
 		if err := ensureShmSize(fd, opaHeaderSize+opaMaxWasmSize); err == nil {
 			mmap, err := unix.Mmap(fd, 0, opaHeaderSize+opaMaxWasmSize, unix.PROT_READ|unix.PROT_WRITE, unix.MAP_SHARED)
 			if err == nil {
@@ -329,11 +378,11 @@ func openOrCreateOpaRegion(name string, owner uuid.UUID) (*OpaRegion, error) {
 		_ = os.Remove(filePath)
 	}
 
-	fd, err = openFileFd(filePath, unix.O_RDWR|unix.O_CREAT|unix.O_EXCL, 0o666)
+	fd, err = openFileFd(filePath, unix.O_RDWR|unix.O_CREAT|unix.O_EXCL, opaPrivateFileMode)
 	if err != nil {
 		return nil, err
 	}
-	_ = unix.Fchmod(fd, 0o666)
+	_ = unix.Fchmod(fd, opaPrivateFileMode)
 	if err := ensureShmSize(fd, opaHeaderSize+opaMaxWasmSize); err != nil {
 		_ = unix.Close(fd)
 		_ = os.Remove(filePath)
@@ -568,16 +617,17 @@ func (s *Service) loadCurrentPolicy() error {
 		return nil
 	}
 	if err := validateWasm(wasm); err != nil {
-		s.lastError = err.Error()
+		s.setLastError(err.Error())
 		s.opaRegion.writeStatus(opaStatusError)
 		log.Printf("opa wasm error: %v", err)
 		return err
 	}
 	if !wasmHasExport(wasm, "opa_eval") {
-		s.lastError = "opa wasm missing export: opa_eval"
+		const detail = "opa wasm missing export: opa_eval"
+		s.setLastError(detail)
 		s.opaRegion.writeStatus(opaStatusError)
-		log.Printf("opa wasm error: %s", s.lastError)
-		return errors.New(s.lastError)
+		log.Printf("opa wasm error: %s", detail)
+		return errors.New(detail)
 	}
 	entrypoint := meta.Entrypoint
 	if entrypoint == "" {
@@ -618,6 +668,36 @@ func (s *Service) handleMessage(msg fluxbeesdk.Message) {
 				return
 			}
 			if payload.Subsystem != "opa" {
+				return
+			}
+			// Only the primary admin emits CONFIG_CHANGED (protocol), and a policy written here is
+			// published to every hive. The router's gate checks the same (system policy rule 2);
+			// this second check is the command path's rule.
+			if origin := derefString(msg.Routing.SrcL2Name); origin != fluxbeesdk.PrimaryAdminNode {
+				log.Printf("opa config change from %q refused: accepted only from %s", origin, fluxbeesdk.PrimaryAdminNode)
+				if !strings.EqualFold(payload.Action, "sync") {
+					s.sendSystemMessage(msg.Routing.Src, "CONFIG_RESPONSE", map[string]any{
+						"subsystem":    "opa",
+						"action":       payload.Action,
+						"version":      payload.Version,
+						"status":       "error",
+						"hive":         s.hiveID,
+						"error_code":   "UNAUTHORIZED",
+						"error_detail": "opa config changes are accepted only from " + fluxbeesdk.PrimaryAdminNode,
+					})
+				}
+				return
+			}
+			if hive := strings.TrimSpace(payload.Hive); hive != "" && hive != s.hiveID {
+				log.Printf("opa config change addressed to hive %s; ignoring (local hive %s)", hive, s.hiveID)
+				return
+			}
+			if strings.EqualFold(payload.Action, "sync") {
+				hash := ""
+				if payload.Config != nil {
+					hash = payload.Config.Hash
+				}
+				s.handleSyncNotice(msg.Routing.Src, payload.Version, hash)
 				return
 			}
 			autoApply := false
@@ -683,12 +763,12 @@ func (s *Service) handleNodeConfigGet(msg fluxbeesdk.Message) {
 			},
 		},
 		"contract": map[string]any{
-			"supports":              []string{fluxbeesdk.MSGConfigGet, fluxbeesdk.MSGConfigSet},
+			"supports":              []string{fluxbeesdk.MSGConfigGet},
 			"target":                fluxbeesdk.NodeConfigControlTarget,
 			"schema_version":        1,
-			"apply_modes":           []string{fluxbeesdk.NodeConfigApplyModeReplace},
 			"config_schema":         "opa_control_v1",
-			"supported_operations":  []string{"check", "compile", "compile_apply", "apply", "rollback"},
+			"supported_operations":  []string{},
+			"policy_writes":         "SY.admin: POST /opa/policy[/compile|/apply|/rollback|/clear|/check]",
 			"requested_node_name":   req.NodeName,
 			"preserves_opa_actions": true,
 			"preserves_opa_queries": true,
@@ -725,8 +805,7 @@ func (s *Service) handleNodeConfigSet(msg fluxbeesdk.Message) {
 		return
 	}
 
-	configMap, ok := req.Config.(map[string]any)
-	if !ok {
+	if _, ok := req.Config.(map[string]any); !ok {
 		s.sendNodeConfigResponse(msg, map[string]any{
 			"ok":        false,
 			"node_name": s.nodeName,
@@ -738,82 +817,17 @@ func (s *Service) handleNodeConfigSet(msg fluxbeesdk.Message) {
 		})
 		return
 	}
-
-	operation, _ := configMap["operation"].(string)
-	operation = strings.TrimSpace(strings.ToLower(operation))
-	if operation == "" {
-		operation = "check"
-	}
-	version := req.ConfigVersion
-	if rawVersion, ok := configMap["version"].(float64); ok && uint64(rawVersion) != 0 {
-		version = uint64(rawVersion)
-	}
-	rego, _ := configMap["rego"].(string)
-	entrypoint, _ := configMap["entrypoint"].(string)
-	autoApply, _ := configMap["auto_apply"].(bool)
-
-	var opaCfg *OpaConfigPayload
-	if rego != "" || entrypoint != "" {
-		opaCfg = &OpaConfigPayload{
-			Rego:       rego,
-			Entrypoint: entrypoint,
-		}
-	}
-
-	handled, err := s.handleOpaAction(msg.Routing.Src, operation, version, opaCfg, autoApply, false)
-	if err != nil {
-		s.sendNodeConfigResponse(msg, map[string]any{
-			"ok":             false,
-			"node_name":      s.nodeName,
-			"state":          "error",
-			"schema_version": req.SchemaVersion,
-			"config_version": version,
-			"error": map[string]any{
-				"code":   inferOpaErrorCode(err),
-				"detail": err.Error(),
-			},
-		})
-		return
-	}
-	if !handled {
-		s.sendNodeConfigResponse(msg, map[string]any{
-			"ok":             false,
-			"node_name":      s.nodeName,
-			"state":          "error",
-			"schema_version": req.SchemaVersion,
-			"config_version": version,
-			"error": map[string]any{
-				"code":   "UNSUPPORTED_OPERATION",
-				"detail": fmt.Sprintf("unsupported OPA config operation: %s", operation),
-			},
-		})
-		return
-	}
-
-	currentMeta, _ := readMetadata(filepath.Join(stateDir, "current", "metadata.json"))
-	if operation == "check" || operation == "compile" || operation == "compile_apply" {
-		stagedMeta, _ := readMetadata(filepath.Join(stateDir, "staged", "metadata.json"))
-		s.sendNodeConfigResponse(msg, map[string]any{
-			"ok":             true,
-			"node_name":      s.nodeName,
-			"state":          "configured",
-			"schema_version": req.SchemaVersion,
-			"config_version": stagedMeta.Version,
-			"effective_config": map[string]any{
-				"staged": buildPolicySnapshot(stagedMeta),
-			},
-		})
-		return
-	}
-
+	// One write path for the one global policy: SY.admin's /opa/policy*, which applies it on the
+	// motherbee, publishes it and tells every hive. CONFIG_SET here would change and publish the
+	// policy with none of that — and even a "check" stages a policy a later apply would install.
 	s.sendNodeConfigResponse(msg, map[string]any{
-		"ok":             true,
+		"ok":             false,
 		"node_name":      s.nodeName,
-		"state":          "configured",
+		"state":          "error",
 		"schema_version": req.SchemaVersion,
-		"config_version": currentMeta.Version,
-		"effective_config": map[string]any{
-			"current": buildPolicySnapshot(currentMeta),
+		"error": map[string]any{
+			"code":   "UNSUPPORTED_OPERATION",
+			"detail": "the user policy is written only through SY.admin (POST /opa/policy*); CONFIG_SET on SY.opa.rules is read-only",
 		},
 	})
 }
@@ -838,21 +852,6 @@ func buildPolicySnapshot(meta PolicyMetadata) map[string]any {
 	}
 }
 
-func inferOpaErrorCode(err error) string {
-	if err == nil {
-		return ""
-	}
-	var oe OpaError
-	if errors.As(err, &oe) {
-		return oe.Code
-	}
-	var oePtr *OpaError
-	if errors.As(err, &oePtr) && oePtr != nil {
-		return oePtr.Code
-	}
-	return "OPA_CONFIG_ERROR"
-}
-
 func errorString(err error, fallback string) string {
 	if err == nil {
 		return fallback
@@ -869,6 +868,17 @@ func derefString(value *string) string {
 
 func (s *Service) handleCommand(msg fluxbeesdk.Message) {
 	action := strings.ToLower(derefString(msg.Meta.Action))
+	// Policy commands change what every router on this hive enforces: only the primary
+	// SY.admin may issue them. src_l2_name is stamped by the router, never the sender.
+	if origin := derefString(msg.Routing.SrcL2Name); origin != fluxbeesdk.PrimaryAdminNode {
+		log.Printf("policy command %s refused from origin %q", action, origin)
+		s.sendCommandResponse(msg, action, map[string]any{
+			"status":       "error",
+			"error_code":   "UNAUTHORIZED",
+			"error_detail": "policy commands are accepted only from " + fluxbeesdk.PrimaryAdminNode,
+		})
+		return
+	}
 	switch action {
 	case "compile_policy":
 		var req CompileRequest
@@ -931,26 +941,22 @@ func (s *Service) handleQuery(msg fluxbeesdk.Message) {
 		}
 		s.sendQueryResponse(msg, action, resp)
 	case "get_status":
-		current, _ := readMetadata(filepath.Join(stateDir, "current", "metadata.json"))
-		staged, _ := readMetadata(filepath.Join(stateDir, "staged", "metadata.json"))
-		resp := map[string]any{
-			"hive":            s.hiveID,
-			"current_version": current.Version,
-			"current_hash":    current.Hash,
-			"staged_version":  staged.Version,
-			"status":          "ok",
-			"last_error":      s.lastError,
-			"wasm_size_bytes": current.WasmSize,
-			"routers":         listRouterStatuses(),
-		}
-		s.sendQueryResponse(msg, action, resp)
+		s.sendQueryResponse(msg, action, s.statusView())
 	}
 }
 
 func (s *Service) handleOpaAction(src string, action string, version uint64, cfg *OpaConfigPayload, autoApply bool, broadcast bool) (bool, error) {
 	action = strings.ToLower(action)
+	// One user policy for every hive: the motherbee compiles, applies and publishes it; the other
+	// hives only install what it publishes (syncFromPublishedPolicy) and never compile.
+	if !s.isPrimary() {
+		return s.respondConfigError(src, action, version, "NOT_PRIMARY",
+			"the user policy is compiled and published by "+fluxbeesdk.PrimaryHiveID+" only", broadcast)
+	}
+	s.policyMu.Lock()
+	defer s.policyMu.Unlock()
 	switch action {
-	case "compile", "compile_apply":
+	case "compile", "compile_apply", "check":
 		if cfg == nil || cfg.Rego == "" {
 			return s.respondConfigError(src, action, version, "COMPILE_ERROR", "rego missing", broadcast)
 		}
@@ -972,58 +978,42 @@ func (s *Service) handleOpaAction(src string, action string, version uint64, cfg
 		if err := writePolicyFiles(filepath.Join(stateDir, "staged"), wasm, meta, cfg.Rego); err != nil {
 			return s.respondConfigError(src, action, version, "SHM_ERROR", err.Error(), broadcast)
 		}
-		if action == "compile_apply" || autoApply {
+		if action != "check" && (action == "compile_apply" || autoApply) {
 			if err := s.applyPolicy(version); err != nil {
 				code, detail := classifyOpaError(err)
 				return s.respondConfigError(src, "apply", version, code, detail, broadcast)
+			}
+			if err := s.publishPolicy(); err != nil {
+				return s.respondConfigError(src, action, version, "PUBLISH_FAILED", publishFailedDetail(err), broadcast)
 			}
 		}
 		if broadcast {
 			s.sendConfigResponse(src, action, version, "ok", meta, compileMs)
 		}
 		return true, nil
-	case "apply":
-		if err := s.applyPolicy(version); err != nil {
-			code, detail := classifyOpaError(err)
-			return s.respondConfigError(src, action, version, code, detail, broadcast)
+	case "apply", "rollback", "clear":
+		var err error
+		switch action {
+		case "apply":
+			err = s.applyPolicy(version)
+		case "rollback":
+			err = s.rollbackPolicy()
+		default:
+			err = s.clearPolicy()
+			version = 0
 		}
-		if broadcast {
-			s.sendConfigResponse(src, action, version, "ok", PolicyMetadata{Version: version}, 0)
-		}
-		return true, nil
-	case "rollback":
-		if err := s.rollbackPolicy(); err != nil {
-			code, detail := classifyOpaError(err)
-			return s.respondConfigError(src, action, version, code, detail, broadcast)
-		}
-		if broadcast {
-			s.sendConfigResponse(src, action, version, "ok", PolicyMetadata{Version: version}, 0)
-		}
-		return true, nil
-	case "check":
-		if cfg == nil || cfg.Rego == "" {
-			return s.respondConfigError(src, action, version, "COMPILE_ERROR", "rego missing", broadcast)
-		}
-		entrypoint := cfg.Entrypoint
-		if entrypoint == "" {
-			entrypoint = defaultEntrypoint
-		}
-		wasm, hash, compileMs, err := compileRego(cfg.Rego, entrypoint)
 		if err != nil {
-			return s.respondConfigError(src, action, version, "COMPILE_ERROR", err.Error(), broadcast)
+			code, detail := classifyOpaError(err)
+			return s.respondConfigError(src, action, version, code, detail, broadcast)
 		}
-		meta := PolicyMetadata{
-			Version:    version,
-			Hash:       hash,
-			Entrypoint: entrypoint,
-			CompiledAt: time.Now().UTC().Format(time.RFC3339),
-			WasmSize:   len(wasm),
-		}
-		if err := writePolicyFiles(filepath.Join(stateDir, "staged"), wasm, meta, cfg.Rego); err != nil {
-			return s.respondConfigError(src, action, version, "SHM_ERROR", err.Error(), broadcast)
+		if err := s.publishPolicy(); err != nil {
+			return s.respondConfigError(src, action, version, "PUBLISH_FAILED", publishFailedDetail(err), broadcast)
 		}
 		if broadcast {
-			s.sendConfigResponse(src, action, version, "ok", meta, compileMs)
+			// "version" echoes the request (the admin correlates on it); the hash names the
+			// policy now running ("" after a clear).
+			current, _ := currentPolicy()
+			s.sendConfigResponse(src, action, version, "ok", current, 0)
 		}
 		return true, nil
 	}
@@ -1118,7 +1108,7 @@ func (s *Service) rollbackPolicy() error {
 }
 
 func (s *Service) respondConfigError(src, action string, version uint64, code, detail string, broadcast bool) (bool, error) {
-	s.lastError = detail
+	s.setLastError(detail)
 	if broadcast {
 		payload := map[string]any{
 			"subsystem":    "opa",
@@ -1202,6 +1192,34 @@ func (s *Service) sendSystemMessage(dst, msg string, payload map[string]any) {
 	s.sendSDK(resp)
 }
 
+// clearPolicy removes the USER policy entirely -- current, staged and backup -- and goes back to
+// the state of a fresh install (no user policy; the router's SYSTEM policy is baked in and not
+// touched). Operator decision 2026-09-28 (factory reset): a clear is final, there is no rollback
+// of it. The region drops to version 0 / no wasm and the OPA_RELOAD carries the zero hash, which
+// makes every router unload what it still holds in memory.
+func (s *Service) clearPolicy() error {
+	for _, dir := range []string{"current", "staged", "backup"} {
+		path := filepath.Join(stateDir, dir)
+		entries, err := os.ReadDir(path)
+		if err != nil {
+			if os.IsNotExist(err) {
+				continue
+			}
+			return OpaError{Code: "SHM_ERROR", Detail: err.Error()}
+		}
+		for _, entry := range entries {
+			if err := os.RemoveAll(filepath.Join(path, entry.Name())); err != nil {
+				return OpaError{Code: "SHM_ERROR", Detail: err.Error()}
+			}
+		}
+	}
+	s.opaRegion.writePolicy(0, nil, "")
+	s.setLastError("")
+	s.broadcastOpaReload(0, noPolicyRegionHash)
+	log.Printf("cleared user opa policy (current, staged, backup)")
+	return nil
+}
+
 func (s *Service) broadcastOpaReload(version uint64, hash string) {
 	payload := map[string]any{
 		"version": version,
@@ -1274,6 +1292,10 @@ func (s *Service) lastRouterPeer() string {
 }
 
 func (s *Service) sendSDK(msg fluxbeesdk.Message) {
+	if s.testSend != nil {
+		s.testSend(msg)
+		return
+	}
 	s.routerDispatcherMu.RLock()
 	dispatcher := s.routerDispatcher
 	s.routerDispatcherMu.RUnlock()
@@ -1515,16 +1537,21 @@ func validateWasm(wasm []byte) error {
 }
 
 func writePolicyFiles(dir string, wasm []byte, meta PolicyMetadata, rego string) error {
-	if err := os.MkdirAll(dir, 0o755); err != nil {
+	if err := ensurePrivateDir(dir); err != nil {
 		return err
 	}
-	if err := os.WriteFile(filepath.Join(dir, "policy.wasm"), wasm, 0o644); err != nil {
+	if err := writePrivateFile(filepath.Join(dir, "policy.wasm"), wasm); err != nil {
 		return err
 	}
+	regoPath := filepath.Join(dir, "policy.rego")
 	if rego != "" {
-		if err := os.WriteFile(filepath.Join(dir, "policy.rego"), []byte(rego), 0o644); err != nil {
+		if err := writePrivateFile(regoPath, []byte(rego)); err != nil {
 			return err
 		}
+	} else if err := os.Remove(regoPath); err != nil && !os.IsNotExist(err) {
+		// A policy installed from the motherbee carries no rego: drop one left by an earlier
+		// policy, or it would be served (get_policy) as this policy's source.
+		return err
 	}
 	return writeMetadata(filepath.Join(dir, "metadata.json"), meta)
 }
@@ -1534,7 +1561,7 @@ func writeMetadata(path string, meta PolicyMetadata) error {
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(path, data, 0o644)
+	return writePrivateFile(path, data)
 }
 
 func readMetadata(path string) (PolicyMetadata, error) {
@@ -1557,7 +1584,7 @@ func copyDir(src, dst string) error {
 	if _, err := os.Stat(src); err != nil {
 		return nil
 	}
-	if err := os.MkdirAll(dst, 0o755); err != nil {
+	if err := ensurePrivateDir(dst); err != nil {
 		return err
 	}
 	entries, err := os.ReadDir(src)
@@ -1574,7 +1601,7 @@ func copyDir(src, dst string) error {
 		if err != nil {
 			return err
 		}
-		if err := os.WriteFile(to, data, 0o644); err != nil {
+		if err := writePrivateFile(to, data); err != nil {
 			return err
 		}
 	}

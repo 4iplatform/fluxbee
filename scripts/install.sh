@@ -25,6 +25,10 @@ IO_SLACK_RUNTIME_NAME="${IO_SLACK_RUNTIME_NAME:-io.slack}"
 IO_SLACK_RUNTIME_VERSION="${IO_SLACK_RUNTIME_VERSION:-1.0.0}"
 IO_LINKEDHELPER_RUNTIME_NAME="${IO_LINKEDHELPER_RUNTIME_NAME:-io.linkedhelper}"
 IO_LINKEDHELPER_RUNTIME_VERSION="${IO_LINKEDHELPER_RUNTIME_VERSION:-1.0.0}"
+IO_BLOB_RUNTIME_NAME="${IO_BLOB_RUNTIME_NAME:-io.blob}"
+IO_BLOB_RUNTIME_VERSION="${IO_BLOB_RUNTIME_VERSION:-1.0.0}"
+IO_CLOUD_RUNTIME_NAME="${IO_CLOUD_RUNTIME_NAME:-io.cloud}"
+IO_CLOUD_RUNTIME_VERSION="${IO_CLOUD_RUNTIME_VERSION:-1.0.0}"
 REQUESTED_BIN_DIR="${BIN_DIR:-}"
 BIN_DIR="$ROOT_DIR/target/release"
 STATE_ROOT_DIR="$STATE_DIR/state"
@@ -197,13 +201,14 @@ INSTALL_RESTART_SERVICES=(
   "sy-storage"
   "sy-identity"
   "sy-cognition"
-  "sy-policy"
   "sy-timer"
   "sy-frontdesk-gov"
   "sy-vault"
   "fluxbee-syncthing"
 )
-INSTALL_SINGLETON_SERVICES=("io-cloud" "io-blob")
+# Empty: IO.cloud and IO.blob are managed runtimes now (no systemd unit). Kept as an array so the
+# stop/restart loops that reference it stay valid no-ops.
+INSTALL_SINGLETON_SERVICES=()
 
 # SY.frontdesk.gov depends on the router and then on SY.identity for registration
 # handoffs. During install we tear down volatile router/SHM state, so restoring
@@ -245,7 +250,25 @@ cargo build --release -p sy-frontdesk-gov --bin sy-frontdesk-gov
 echo "Building ai.generic runtime binary..."
 cargo build --release -p fluxbee-ai-nodes --bin ai_node_runner
 echo "Building IO runtime binaries and motherbee singletons..."
-cargo build --release --manifest-path nodes/io/Cargo.toml -p io-api -p io-slack -p io-linkedhelper -p io-cloud -p io-blob
+# FIX-13: build exactly the nodes/io crates that packaging/base-nodes.json declares (the same single
+# source of truth build-deb.sh uses), so a node added to the manifest is built by BOTH the .deb path
+# and this source-install path — no drift. (Currently: io-api io-blob io-cloud io-linkedhelper io-slack.)
+IO_PKGS="$(python3 - "$ROOT_DIR/packaging/base-nodes.json" <<'PY'
+import json, sys
+m = json.load(open(sys.argv[1]))
+pkgs = sorted({e["crate"] for sec in ("singletons", "runtimes")
+               for e in m.get(sec, []) if e.get("workspace") == "nodes/io"})
+print(" ".join(pkgs))
+PY
+)"
+if [[ -z "${IO_PKGS// }" ]]; then
+  echo "ERROR: no nodes/io crates found in packaging/base-nodes.json" >&2
+  exit 1
+fi
+echo "  base-nodes.json nodes/io crates: $IO_PKGS"
+io_pkg_args=()
+for p in $IO_PKGS; do io_pkg_args+=(-p "$p"); done
+cargo build --release --manifest-path nodes/io/Cargo.toml "${io_pkg_args[@]}"
 
 go_required=0
 for go_dir in "go/sy-opa-rules" "go/sy-timer" "go/sy-wf-rules" "go/nodes/wf/wf-generic"; do
@@ -310,7 +333,6 @@ sudo install -d "$STATE_DIR/state/io-blob"
 sudo install -d "$STATE_DIR/syncthing"
 sudo install -d "$STATE_DIR/vendor"
 sudo install -d "$STATE_DIR/vendor/bin"
-sudo install -d "$STATE_DIR/nats"
 sudo install -d "$STATE_DIR/dist"
 sudo install -d "$STATE_DIR/dist/runtimes"
 sudo install -d "$STATE_DIR/dist/core"
@@ -322,8 +344,8 @@ sudo install -d "$RUN_DIR/routers"
 sudo install -d "$STATE_ROOT_DIR"
 ensure_fluxbee_system_user
 sudo chown -R fluxbee:fluxbee "$STATE_DIR/syncthing"
-sudo chown -R fluxbee:fluxbee "$STATE_DIR/blob"
-sudo chown -R fluxbee:fluxbee "$STATE_DIR/dist"
+# Not dist or blob: the orchestrator sets their owners at every start (dist by role, A-51; blob/
+# and its folders, A-56), and the nodes give each blob the owner of the folder it lands in.
 
 if [[ "$CLEAN_RUNTIME_VOLATILE_ON_INSTALL" == "1" ]]; then
   stop_install_service "sy-orchestrator"
@@ -386,7 +408,6 @@ sy_orch_bin="$(pick_bin sy_orchestrator)" || { echo "Missing binary: $BIN_DIR/sy
 sy_storage_bin="$(pick_bin sy_storage)" || { echo "Missing binary: $BIN_DIR/sy_storage" >&2; missing=1; }
 sy_identity_bin="$(pick_bin sy_identity)" || { echo "Missing binary: $BIN_DIR/sy_identity" >&2; missing=1; }
 sy_cognition_bin="$(pick_bin sy_cognition)" || { echo "Missing binary: $BIN_DIR/sy_cognition" >&2; missing=1; }
-sy_policy_bin="$(pick_bin sy_policy)" || { echo "Missing binary: $BIN_DIR/sy_policy" >&2; missing=1; }
 sy_edge_bin="$(pick_bin sy_edge)" || { echo "Missing binary: $BIN_DIR/sy_edge" >&2; missing=1; }
 sy_frontdesk_gov_bin="$(pick_bin sy-frontdesk-gov)" || { echo "Missing binary: $BIN_DIR/sy-frontdesk-gov" >&2; missing=1; }
 sy_opa_rules_bin=""
@@ -446,18 +467,14 @@ sudo install -m 0755 "$sy_orch_bin" /usr/bin/sy-orchestrator
 sudo install -m 0755 "$sy_storage_bin" /usr/bin/sy-storage
 sudo install -m 0755 "$sy_identity_bin" /usr/bin/sy-identity
 sudo install -m 0755 "$sy_cognition_bin" /usr/bin/sy-cognition
-sudo install -m 0755 "$sy_policy_bin" /usr/bin/sy-policy
 sudo install -m 0755 "$sy_edge_bin" /usr/bin/sy-edge
 sudo install -m 0755 "$sy_opa_rules_bin" /usr/bin/sy-opa-rules
 sudo install -m 0755 "$sy_timer_bin" /usr/bin/sy-timer
 sudo install -m 0755 "$sy_wf_rules_bin" /usr/bin/sy-wf-rules
 sudo install -m 0755 "$sy_frontdesk_gov_bin" /usr/bin/sy-frontdesk-gov
-# io-cloud: the singleton in-mesh Fluxbee Cloud adapter (motherbee only), baked like a
-# SY node — NOT published as a runtime package (unlike io-api/io-slack above).
-sudo install -m 0755 "$ROOT_DIR/nodes/io/target/release/io-cloud" /usr/bin/io-cloud
-sudo install -m 0600 "$ROOT_DIR/packaging/io-cloud.env.example" /etc/fluxbee/io-cloud.env.example
-sudo install -m 0755 "$ROOT_DIR/nodes/io/target/release/io-blob" /usr/bin/io-blob
-sudo install -m 0600 "$ROOT_DIR/packaging/io-blob.env.example" /etc/fluxbee/io-blob.env.example
+# io-cloud + io-blob are managed runtimes now (like io-api/io-slack): published into
+# dist/runtimes below (see the io.blob/io.cloud publish blocks), NOT copied to /usr/bin and
+# NOT given a .env — they configure via CONFIG_SET and enforce motherbee via a binary self-check.
 sudo install -m 0755 "$wf_generic_bin" /usr/bin/wf-generic
 
 echo "Updating core source repo in $STATE_DIR/dist/core/bin..."
@@ -470,7 +487,6 @@ sudo install -m 0755 "$sy_orch_bin" "$STATE_DIR/dist/core/bin/sy-orchestrator"
 sudo install -m 0755 "$sy_storage_bin" "$STATE_DIR/dist/core/bin/sy-storage"
 sudo install -m 0755 "$sy_identity_bin" "$STATE_DIR/dist/core/bin/sy-identity"
 sudo install -m 0755 "$sy_cognition_bin" "$STATE_DIR/dist/core/bin/sy-cognition"
-sudo install -m 0755 "$sy_policy_bin" "$STATE_DIR/dist/core/bin/sy-policy"
 sudo install -m 0755 "$sy_edge_bin" "$STATE_DIR/dist/core/bin/sy-edge"
 sudo install -m 0755 "$sy_opa_rules_bin" "$STATE_DIR/dist/core/bin/sy-opa-rules"
 sudo install -m 0755 "$sy_timer_bin" "$STATE_DIR/dist/core/bin/sy-timer"
@@ -496,8 +512,6 @@ sy_storage_sha="$(sha256sum "$STATE_DIR/dist/core/bin/sy-storage" | awk '{print 
 sy_storage_size="$(stat -c %s "$STATE_DIR/dist/core/bin/sy-storage")"
 sy_cognition_sha="$(sha256sum "$STATE_DIR/dist/core/bin/sy-cognition" | awk '{print $1}')"
 sy_cognition_size="$(stat -c %s "$STATE_DIR/dist/core/bin/sy-cognition")"
-sy_policy_sha="$(sha256sum "$STATE_DIR/dist/core/bin/sy-policy" | awk '{print $1}')"
-sy_policy_size="$(stat -c %s "$STATE_DIR/dist/core/bin/sy-policy")"
 sy_edge_sha="$(sha256sum "$STATE_DIR/dist/core/bin/sy-edge" | awk '{print $1}')"
 sy_edge_size="$(stat -c %s "$STATE_DIR/dist/core/bin/sy-edge")"
 sy_timer_sha="$(sha256sum "$STATE_DIR/dist/core/bin/sy-timer" | awk '{print $1}')"
@@ -535,7 +549,6 @@ cat >"$core_manifest_tmp" <<EOF
     "sy-orchestrator": {"service": "sy-orchestrator", "version": "$core_version", "build_id": "$core_build_id", "sha256": "$sy_orch_sha", "size": $sy_orch_size},
     "sy-storage": {"service": "sy-storage", "version": "$core_version", "build_id": "$core_build_id", "sha256": "$sy_storage_sha", "size": $sy_storage_size},
     "sy-cognition": {"service": "sy-cognition", "version": "$core_version", "build_id": "$core_build_id", "sha256": "$sy_cognition_sha", "size": $sy_cognition_size},
-    "sy-policy": {"service": "sy-policy", "version": "$core_version", "build_id": "$core_build_id", "sha256": "$sy_policy_sha", "size": $sy_policy_size},
     "sy-edge": {"service": "sy-edge", "version": "$core_version", "build_id": "$core_build_id", "sha256": "$sy_edge_sha", "size": $sy_edge_size},
     "sy-timer": {"service": "sy-timer", "version": "$core_version", "build_id": "$core_build_id", "sha256": "$sy_timer_sha", "size": $sy_timer_size},
     "sy-wf-rules": {"service": "sy-wf-rules", "version": "$core_version", "build_id": "$core_build_id", "sha256": "$sy_wf_rules_sha", "size": $sy_wf_rules_size},
@@ -591,7 +604,6 @@ verify_core_component "sy-identity" "$sy_identity_sha" "$sy_identity_size"
 verify_core_component "sy-orchestrator" "$sy_orch_sha" "$sy_orch_size"
 verify_core_component "sy-storage" "$sy_storage_sha" "$sy_storage_size"
 verify_core_component "sy-cognition" "$sy_cognition_sha" "$sy_cognition_size"
-verify_core_component "sy-policy" "$sy_policy_sha" "$sy_policy_size"
 verify_core_component "sy-edge" "$sy_edge_sha" "$sy_edge_size"
 verify_core_component "sy-timer" "$sy_timer_sha" "$sy_timer_size"
 verify_core_component "sy-wf-rules" "$sy_wf_rules_sha" "$sy_wf_rules_size"
@@ -948,6 +960,36 @@ bash "$ROOT_DIR/scripts/publish-io-linkedhelper-runtime.sh" \
   --sudo \
   --skip-build
 
+# io.blob + io.cloud: managed runtimes now (promoted from systemd singletons). Published with the
+# generic publisher (auto-generates start.sh), same as the manifest-driven build-deb.sh path.
+io_blob_bin="$ROOT_DIR/nodes/io/target/release/io-blob"
+if [[ ! -f "$io_blob_bin" ]]; then
+  echo "Error: io.blob build completed but binary is missing: $io_blob_bin" >&2
+  exit 1
+fi
+echo "Publishing base runtime $IO_BLOB_RUNTIME_NAME@$IO_BLOB_RUNTIME_VERSION into $STATE_DIR/dist/runtimes..."
+bash "$ROOT_DIR/scripts/publish-runtime.sh" \
+  --runtime "$IO_BLOB_RUNTIME_NAME" \
+  --version "$IO_BLOB_RUNTIME_VERSION" \
+  --binary "$io_blob_bin" \
+  --dist-root "$STATE_DIR/dist" \
+  --set-current \
+  --sudo
+
+io_cloud_bin="$ROOT_DIR/nodes/io/target/release/io-cloud"
+if [[ ! -f "$io_cloud_bin" ]]; then
+  echo "Error: io.cloud build completed but binary is missing: $io_cloud_bin" >&2
+  exit 1
+fi
+echo "Publishing base runtime $IO_CLOUD_RUNTIME_NAME@$IO_CLOUD_RUNTIME_VERSION into $STATE_DIR/dist/runtimes..."
+bash "$ROOT_DIR/scripts/publish-runtime.sh" \
+  --runtime "$IO_CLOUD_RUNTIME_NAME" \
+  --version "$IO_CLOUD_RUNTIME_VERSION" \
+  --binary "$io_cloud_bin" \
+  --dist-root "$STATE_DIR/dist" \
+  --set-current \
+  --sudo
+
 if [[ "$SEED_RUNTIME_FIXTURE" == "1" ]]; then
   echo "Seeding runtime fixture in $STATE_DIR/dist/runtimes: $RUNTIME_FIXTURE_NAME@$RUNTIME_FIXTURE_VERSION"
   runtime_fixture_dir="$STATE_DIR/dist/runtimes/$RUNTIME_FIXTURE_NAME/$RUNTIME_FIXTURE_VERSION"
@@ -1120,7 +1162,6 @@ install_unit "sy-orchestrator" "/usr/bin/sy-orchestrator"
 install_unit "sy-storage" "/usr/bin/sy-storage" "network.target" "" "motherbee"
 install_unit "sy-identity" "/usr/bin/sy-identity" "network.target" "" "motherbee|worker"
 install_unit "sy-cognition" "/usr/bin/sy-cognition"
-install_unit "sy-policy" "/usr/bin/sy-policy"
 install_unit "sy-timer" "/usr/bin/sy-timer"
 install_unit "sy-wf-rules" "/usr/bin/sy-wf-rules"
 install_unit \
@@ -1136,49 +1177,9 @@ install_unit \
   "/usr/bin/sy-edge" \
   "network.target rt-gateway.service" \
   "rt-gateway.service"
-# io-cloud: custom unit (install_unit can't express ExecCondition/EnvironmentFile). Singleton,
-# gated to role: motherbee so it only runs on the motherbee even though enabled everywhere.
-cat <<'IOUNIT' | sudo tee /etc/systemd/system/io-cloud.service >/dev/null
-[Unit]
-Description=Fluxbee IO.cloud (singleton in-mesh Fluxbee Cloud adapter, motherbee only)
-After=network.target rt-gateway.service sy-identity.service sy-admin.service
-Wants=rt-gateway.service sy-identity.service sy-admin.service
-
-[Service]
-Type=simple
-EnvironmentFile=-/etc/fluxbee/io-cloud.env
-ExecCondition=/bin/sh -c 'grep -qE "^role:[[:space:]]*motherbee" /etc/fluxbee/hive.yaml'
-ExecStart=/usr/bin/io-cloud
-Restart=always
-RestartSec=5
-
-[Install]
-WantedBy=multi-user.target
-IOUNIT
-# io-blob: no ICH and no public listener. It accepts only router-stamped worker
-# commands from SY.admin in the configured motherbee hive.
-cat <<'IOUNIT' | sudo tee /etc/systemd/system/io-blob.service >/dev/null
-[Unit]
-Description=Fluxbee IO.blob (public artifact curator, motherbee only)
-After=network.target rt-gateway.service sy-admin.service
-Wants=rt-gateway.service sy-admin.service
-
-[Service]
-Type=simple
-EnvironmentFile=-/etc/fluxbee/io-blob.env
-ExecCondition=/bin/sh -c 'grep -qE "^role:[[:space:]]*motherbee" /etc/fluxbee/hive.yaml'
-Group=fluxbee
-UMask=0027
-ExecStart=/usr/bin/io-blob
-Restart=always
-RestartSec=5
-
-[Install]
-WantedBy=multi-user.target
-IOUNIT
+# IO.cloud and IO.blob are managed runtimes now (baked into dist/runtimes above, spawned by the
+# orchestrator, configured via CONFIG_SET) — no systemd unit, no .env. Nothing to install here.
 sudo systemctl daemon-reload
-sudo systemctl enable io-cloud.service >/dev/null 2>&1 || true
-sudo systemctl enable io-blob.service >/dev/null 2>&1 || true
 
 for svc in "${INSTALL_SINGLETON_SERVICES[@]}"; do
   if [[ "${INSTALL_WAS_ACTIVE[$svc]:-0}" == "1" ]] && install_service_exists "$svc"; then
@@ -1268,7 +1269,13 @@ if [[ "$APPLY_DEV_OWNERSHIP" == "1" ]]; then
   echo "Applying ownership for test/dev user: $INSTALL_OWNER"
   sudo chown -R "$INSTALL_OWNER":"$INSTALL_OWNER" "$CONFIG_DIR" "$STATE_DIR" "$RUN_DIR"
   sudo chown "$INSTALL_OWNER":"$INSTALL_OWNER" "$CONFIG_DIR/sy-config-routes.yaml" "$CONFIG_DIR/hive.yaml" 2>/dev/null || true
-  sudo chown -R fluxbee:fluxbee "$STATE_DIR/syncthing" "$STATE_DIR/blob" "$STATE_DIR/dist"
+  # The dev chown above gave everything to the dev user. The folders Syncthing serves go back to
+  # fluxbee; blob/, staging/ and agent-assets/ are root's, which the orchestrator sets at its
+  # next start (A-56).
+  sudo chown -R fluxbee:fluxbee "$STATE_DIR/syncthing"
+  for served in "$STATE_DIR/blob/active" "$STATE_DIR/blob/public"; do
+    if [[ -d "$served" ]]; then sudo chown -R fluxbee:fluxbee "$served"; fi
+  done
 fi
 
 echo "Installed config to $CONFIG_DIR, binaries to /usr/bin, core source repo to $STATE_DIR/dist/core/bin, systemd units, and runtime directories."

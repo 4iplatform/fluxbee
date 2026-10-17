@@ -233,10 +233,6 @@ wan:
     - worker-1
     - worker-2
 
-nats:
-  mode: embedded
-  port: 4222
-
 database:
   url: "postgresql://..."
 
@@ -263,10 +259,6 @@ wan:
   uplinks:
     - address: "{mother_wan_ip}:{mother_wan_port}"
 
-nats:
-  mode: embedded
-  port: 4222
-
 blob:
   enabled: true
   path: "/var/lib/fluxbee/blob"
@@ -287,9 +279,8 @@ blob:
 | `wan.authorized_hives` | Sí (controla quién conecta) | No |
 | `database` | Sí (PostgreSQL) | No |
 | `blob.sync` | Igual | Igual (si habilitado) |
-| `nats` | Igual | Igual |
 
-El orchestrator toma los datos de la motherbee (IP WAN, puerto, config de blob/nats) y genera el hive.yaml del worker con los valores correctos para su rol.
+El orchestrator toma los datos de la motherbee (IP WAN, puerto, config de blob) y genera el hive.yaml del worker con los valores correctos para su rol.
 
 ---
 
@@ -319,7 +310,6 @@ PASO 7 (revisado): Generar hive.yaml según rol
       - hive_id del worker
       - role: worker
       - wan.uplinks apuntando a motherbee
-      - nats config copiada de motherbee
       - blob config copiada de motherbee (si habilitado)
       - SIN database, SIN wan.listen, SIN authorized_hives
 ```

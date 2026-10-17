@@ -26,7 +26,6 @@
       <nav class="desktop-nav" aria-label="Principal">
         <a href="#possibilities" data-es="Qué podés crear" data-en="What you can build">Qué podés crear</a>
         <a href="#how" data-es="Cómo funciona" data-en="How it works">Cómo funciona</a>
-        <a href="#start" data-es="Empezar" data-en="Get started">Empezar</a>
         <a href="#build" data-es="Crear un nodo" data-en="Build a node">Crear un nodo</a>
       </nav>
 
@@ -47,7 +46,6 @@
     <nav class="mobile-menu" id="mobile-menu" aria-label="Mobile">
       <a href="#possibilities" data-es="Qué podés crear" data-en="What you can build">Qué podés crear</a>
       <a href="#how" data-es="Cómo funciona" data-en="How it works">Cómo funciona</a>
-      <a href="#start" data-es="Empezar" data-en="Get started">Empezar</a>
       <a href="#build" data-es="Crear un nodo" data-en="Build a node">Crear un nodo</a>
       <a href="https://github.com/4iplatform/fluxbee" target="_blank" rel="noreferrer">GitHub ↗</a>
     </nav>
@@ -63,8 +61,7 @@
           <h1 data-es="Agentes, workflows y personas. Un solo sistema." data-en="Agents, workflows, and people. One system.">Agentes, workflows y personas. Un solo sistema.</h1>
           <p data-es="Fluxbee conecta cada conversación con la identidad, el conocimiento y las herramientas correctas. Así, un conjunto de agentes deja de ser una colección de bots y empieza a trabajar como un equipo." data-en="Fluxbee connects every conversation to the right identity, knowledge, and tools. A collection of agents stops behaving like isolated bots and starts working as a team.">Fluxbee conecta cada conversación con la identidad, el conocimiento y las herramientas correctas. Así, un conjunto de agentes deja de ser una colección de bots y empieza a trabajar como un equipo.</p>
           <div class="hero-actions">
-            <a class="button button-primary" href="#start"><span data-es="Probar el lab" data-en="Try the lab">Probar el lab</span><span aria-hidden="true">↓</span></a>
-            <a class="button button-light" href="https://github.com/4iplatform/fluxbee" target="_blank" rel="noreferrer"><span data-es="Ver el código" data-en="View source">Ver el código</span><span aria-hidden="true">↗</span></a>
+            <a class="button button-primary" href="https://github.com/4iplatform/fluxbee" target="_blank" rel="noreferrer"><span data-es="Ver el código" data-en="View source">Ver el código</span><span aria-hidden="true">↗</span></a>
           </div>
           <p class="hero-note"><span class="pulse"></span><span data-es="MIT · Rust + Go · desarrollo activo" data-en="MIT · Rust + Go · active development">MIT · Rust + Go · desarrollo activo</span></p>
         </div>
@@ -188,41 +185,6 @@
             <div class="hive worker"><header><span class="hive-dot"></span><b>support-hive</b></header><div class="hive-nodes"><span class="io">IO.channel</span><span class="ai">AI.support</span><span class="wf">WF.ticket</span></div></div>
           </div>
           <div class="map-note"><span class="pulse"></span><span data-es="Cada hive enruta localmente y sigue operando como unidad." data-en="Each hive routes locally and keeps operating as a unit.">Cada hive enruta localmente y sigue operando como unidad.</span></div>
-        </div>
-      </div>
-    </section>
-
-    <section class="section start-section" id="start">
-      <div class="container">
-        <div class="section-head reveal">
-          <span class="section-label" data-es="Probalo localmente" data-en="Try it locally">Probalo localmente</span>
-          <h2 data-es="Una malla real, en dos comandos." data-en="A real mesh, in two commands.">Una malla real, en dos comandos.</h2>
-          <p data-es="El lab levanta motherbee y un worker en Docker usando el mismo instalador y ciclo de servicios del sistema real." data-en="The lab runs motherbee and one worker in Docker using the same installer and service lifecycle as the real system.">El lab levanta motherbee y un worker en Docker usando el mismo instalador y ciclo de servicios del sistema real.</p>
-        </div>
-        <div class="terminal-wrap reveal">
-          <div class="terminal">
-            <div class="terminal-bar"><div class="window-dots"><span></span><span></span><span></span></div><span>fluxbee / quickstart</span><button class="copy-button" type="button" data-copy-target="quickstart"><span data-es="Copiar" data-en="Copy">Copiar</span></button></div>
-            <pre id="quickstart"><code><span class="comment"># 1. Clone the repository</span>
-git clone https://github.com/4iplatform/fluxbee.git
-cd fluxbee
-
-<span class="comment"># 2. Start motherbee + worker</span>
-docker compose -f lab/docker-compose.yml pull
-docker compose -f lab/docker-compose.yml up -d
-
-<span class="comment"># 3. Ask the control plane what is alive</span>
-curl -s localhost:8080/hives | jq .</code></pre>
-          </div>
-          <aside class="requirements">
-            <h3 data-es="Antes de empezar" data-en="Before you start">Antes de empezar</h3>
-            <ul>
-              <li><span>✓</span><p><b>Docker</b><small data-es="Desktop o Engine con cgroup v2" data-en="Desktop or Engine with cgroup v2">Desktop o Engine con cgroup v2</small></p></li>
-              <li><span>✓</span><p><b>linux/amd64</b><small data-es="Arquitectura soportada por el lab actual" data-en="Architecture supported by the current lab">Arquitectura soportada por el lab actual</small></p></li>
-              <li><span>✓</span><p><b>10–12 GB RAM</b><small data-es="Asignados a Docker" data-en="Allocated to Docker">Asignados a Docker</small></p></li>
-            </ul>
-            <div class="notice"><b data-es="Estado del lab" data-en="Lab status">Estado del lab</b><p data-es="Motherbee + worker están disponibles. Egress/NAT requiere una VM Linux para validación completa." data-en="Motherbee + worker are available. Egress/NAT requires a Linux VM for full validation.">Motherbee + worker están disponibles. Egress/NAT requiere una VM Linux para validación completa.</p></div>
-            <a class="text-link" href="https://github.com/4iplatform/fluxbee/blob/main/lab/README.md" target="_blank" rel="noreferrer"><span data-es="Guía completa del lab" data-en="Full lab guide">Guía completa del lab</span> ↗</a>
-          </aside>
         </div>
       </div>
     </section>

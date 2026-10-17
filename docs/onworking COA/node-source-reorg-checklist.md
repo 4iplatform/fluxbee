@@ -43,10 +43,10 @@ Objetivo: reorganizar solo los fuentes de nodos bajo `nodes/`, sin tocar por aho
 
 ## Pendiente para dev
 
-- [ ] Limpiar duplicación entre `nodes/ai/ai-generic` y `nodes/gov/ai-frontdesk-gov`
-- [ ] Reintroducir comportamiento GOV real dentro de `nodes/gov/ai-frontdesk-gov`
+- [ ] Limpiar duplicación entre `nodes/ai/ai-generic` y `nodes/gov/ai-frontdesk-gov` (2026-10-02: ai-generic ya no lleva el código gov; queda duplicado el runner común)
+- [x] Reintroducir comportamiento GOV real dentro de `nodes/gov/ai-frontdesk-gov` (es `SY.frontdesk.gov`)
 - [x] Revisar documentación que todavía referencia `crates/fluxbee_ai_nodes`
-- [ ] Seguir corrigiendo documentación funcional que todavía asume `AI.chat` como runtime en vez de instancia
+- [x] Seguir corrigiendo documentación funcional que todavía asume `AI.chat` como runtime en vez de instancia (2026-10-02: todo apunta a `ai.generic`; AI.chat ya no arranca con la base)
 - [ ] Migrar nodos no-`SY` para usar los helpers de `fluxbee_sdk::node_config` en vez de construir metadata de control-plane a mano
 - [ ] Decidir si `nodes/ai/common` y `nodes/wf/common` pasan a crates reales
 - [ ] Decidir si `nodes/test` se mantiene dentro de `nodes/` o se mueve a otro árbol

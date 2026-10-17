@@ -32,7 +32,7 @@ These are design tasks, not code tasks. Output is a frozen decision document per
 
 ### [x] CFZ-1 — solution_manifest desired_state / advisory schema
 **Deliverable:** JSON schema or typed Rust definition for `desired_state` v1 scope.
-- Must enumerate allowed top-level sections: topology, runtimes, nodes, routing, wf_deployments, opa_deployments, ownership
+- Must enumerate allowed top-level sections: topology, runtimes, nodes, routing, wf_deployments, opa, ownership (`opa_deployments` per hive became the single global `opa` in 0.1.48)
 - Must enumerate rejected sections: policy, identity
 - Must enumerate allowed fields per section with types and optionality
 - Must define ownership marker format per resource class
@@ -248,7 +248,7 @@ All four cookbooks (design, artifact, plan_compile, repair) use this exact shape
 
 ### [x] TA-1 — Rust types for solution_manifest v2
 - Add `SolutionManifestV2` struct with `manifest_version`, `solution`, `desired_state: DesiredStateV2`, `advisory: AdvisoryV2`
-- `DesiredStateV2`: topology, runtimes, nodes, routing, wf_deployments, opa_deployments, ownership_config
+- `DesiredStateV2`: topology, runtimes, nodes, routing, wf_deployments, opa, ownership_config
 - `AdvisoryV2`: `serde_json::Value` (free-form, not reconciler-facing)
 - Add `validate_manifest_v2(manifest: &SolutionManifestV2) -> Result<(), ManifestValidationError>`:
   - Rejects unknown top-level `desired_state` keys (policy, identity, etc.)
@@ -996,7 +996,7 @@ This is the largest missing track. TG-1 needs a designer agent and a design_audi
 - Forbidden: `get_admin_action_help`, any mutating tool, executor tools
 - System prompt (`DESIGNER_SYSTEM_PROMPT`):
   - Role: produce a `solution_manifest` in the v2 `desired_state` + `advisory` format
-  - Think in desired state: topology, runtimes, nodes, routing, wf_deployments, opa_deployments
+  - Think in desired state: topology, runtimes, nodes, routing, wf_deployments, opa
   - Do not produce executor_plan, SCMD, admin calls, or operational payloads
   - Must call `submit_solution_manifest` exactly once
   - May call `query_hive` multiple times to understand current environment

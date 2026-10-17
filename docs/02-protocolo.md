@@ -47,6 +47,9 @@ Usado por el router para decisiones de capa 1. El router DEBE poder tomar decisi
 Reglas:
 - el sender no controla `routing.src_l2_name`
 - el router DEBE ignorar o sobrescribir cualquier `src_l2_name` provisto por el sender
+- un nodo solo emite con su propio `routing.src` (el UUID con el que hizo HELLO en ese socket): el
+  router descarta el frame si no coincide (desde 0.1.44; antes un nodo que conociera el UUID de
+  otro podía emitir como él)
 - en mensajes emitidos por un nodo hacia el router, `src_l2_name` puede omitirse
 - en mensajes entregados por el router a un nodo, `src_l2_name` debe reflejar el L2 canónico del origen real
 
@@ -82,7 +85,6 @@ Usado por OPA para decisiones de capa 2/3, por el router para broadcast filtrado
     "dst_ilk": "ilk:7c9e6679-7425-40de-944b-e07fc1f90ae7",
     "ich": "ich:a1b2c3d4-5678-90ab-cdef-1234567890ab",
     "thread_id": "thread:abc123def456789012345678901234ab",
-    "thread_seq": 47,
     "memory_package": {
       "package_version": 2,
       "thread_id": "thread:abc123def456789012345678901234ab",
@@ -111,11 +113,10 @@ Usado por OPA para decisiones de capa 2/3, por el router para broadcast filtrado
 | `dst_ilk` | string | No | ILK del interlocutor destino (si se conoce) |
 | `ich` | string | Sí (L3) | ICH (Interlocutor Channel) local/sistémico por el cual ingresó o debe salir la comunicación |
 | `thread_id` | string | Sí (L3 canónico) | ID físico del hilo conversacional. Calculado por SDK/IO según tipo de canal |
-| `thread_seq` | integer | Sí (L3 canónico) | Secuencia monotónica dentro de `thread_id`. Asignada por el router |
 | `ctx` | string | Legacy | Carrier viejo de contexto conversacional. Solo compat temporal |
 | `ctx_seq` | integer | Legacy | Carrier viejo de secuencia contextual. Solo compat temporal |
 | `ctx_window` | array | Legacy | Carrier viejo de turns recientes. Solo compat temporal |
-| `memory_package` | object | No | Paquete cognitivo v2. Agregado por router después del routing |
+| `memory_package` | object | No | Paquete cognitivo v2. Agregado por router después del routing, solo al entregar a un nodo `AI.*` |
 | `priority` | string | No | Hint de prioridad para OPA |
 | `context` | object | No | Datos adicionales para reglas OPA |
 | `action` | string | No | Para mensajes admin: acción a ejecutar |
@@ -138,7 +139,7 @@ Nota de contrato:
 
 ### 3.2 Campos de Contexto (ich, ctx, ctx_seq, ctx_window)
 
-### 3.2 Campos Canónicos de Conversación (`ich`, `thread_id`, `thread_seq`)
+### 3.2 Campos Canónicos de Conversación (`ich`, `thread_id`)
 
 Estos campos forman el carrier canónico de conversación para cognition v2:
 
@@ -147,7 +148,6 @@ Estos campos forman el carrier canónico de conversación para cognition v2:
   - se obtiene con `compute_thread_id(...)`
   - usa material canónico versionado + `sha256`
   - formato actual: `thread:sha256:<hex>`
-- **`thread_seq`**: Secuencia monotónica asignada por router dentro de `thread_id`
 
 Reglas:
 - `thread_id` lo calcula el productor que conoce el medium, típicamente el IO node.
@@ -156,13 +156,11 @@ Reglas:
   - `DirectPair`
   - `PersistentChannel`
   - `NativeThread`
-- `thread_seq` lo asigna el router.
-- `thread_seq` no es global; solo tiene orden dentro del thread.
-- cognition v2 usa `thread_id` y `thread_seq` como carrier canónico.
-- En los paths IO nuevos, `ich + thread_id + thread_seq` debe leerse como:
+- el mensaje no lleva secuencia: el orden de una comunicación es el número de turno de SY.cognition. El router dejó de asignar `meta.thread_seq` en 0.1.77 y el campo salió del protocolo en 0.1.78.
+- cognition v2 usa `thread_id` como carrier canónico.
+- En los paths IO nuevos, `ich + thread_id` debe leerse como:
   - canal local/sistémico
   - hilo físico/relacional del medio
-  - secuencia monotónica por thread
 
 ### 3.2.1 Compatibilidad legacy con `ctx*`
 
@@ -174,14 +172,14 @@ Durante la migración pueden seguir apareciendo:
 Pero esos campos ya no representan el carrier canónico del modelo cognitivo.
 
 Regla de migración:
-- paths nuevos deben producir `thread_id` + `thread_seq`
+- paths nuevos deben producir `thread_id`
 - el runtime activo del repo ya no lee `ctx*` como carrier conversacional
 - `ctx*` queda solo como compatibilidad histórica/documental para payloads viejos
 - `ctx_window` deja de ser obligatorio en el modelo canónico
 
 ### 3.3 Antecedentes Cognitivos (memory_package)
 
-El router consulta `jsr-memory` para construir `memory_package` antes de entregar al nodo destino. El lookup principal de v2 es por `thread_id`.
+El router consulta `jsr-memory` para construir `memory_package` antes de entregar a un nodo `AI.*`. El lookup es por comunicación: `thread_id` y el agente destino.
 
 El paquete cognitivo v2 debe incluir, como mínimo:
 
@@ -196,7 +194,8 @@ El paquete cognitivo v2 debe incluir, como mínimo:
 - `truncated`
 
 Reglas:
-- el router enriquece después del routing
+- el router enriquece después del routing, por destino, solo a nodos `AI.*`
+- un `memory_package` que puso el emisor se descarta
 - OPA no lee `memory_package`
 - `memory_package.thread_id` debe coincidir con `meta.thread_id`
 - `dominant_context` y `dominant_reason` deben estar presentes cuando el paquete no está vacío
@@ -302,10 +301,6 @@ pub struct Meta {
     /// Thread físico de conversación. Canónico para cognition v2.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub thread_id: Option<String>,
-
-    /// Secuencia monotónica dentro del thread. La asigna el router.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub thread_seq: Option<u64>,
 
     /// Legacy: carrier viejo de contexto conversacional
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -506,9 +501,17 @@ socket.on('data', (chunk) => {
 
 | Mensaje | Origen | Destino | Propósito |
 |---------|--------|---------|-----------|
-| `CONFIG_CHANGED` | SY.admin | Broadcast (todos) | Notificar cambio de configuración |
+| `CONFIG_CHANGED` | SY.admin@motherbee | SY.opa.rules (unicast al motherbee; el aviso `sync` con `meta.target SY.opa.rules@*`) | Policy OPA de usuario |
 
-**CONFIG_CHANGED** es el mensaje unificado para todos los cambios de configuración del sistema. SY.admin (único, en mother hive) es el único que lo emite.
+**CONFIG_CHANGED** era el mensaje unificado para todos los cambios de configuración del sistema; hoy queda solo para la policy OPA de usuario (nota de abajo). SY.admin (único, en mother hive) es el único que lo emite.
+
+> **Desde 0.1.41 (0.1.44):** CONFIG_CHANGED viaja por el ruteo normal (respeta `dst` y
+> `meta.target`, cruza hives) y es una acción SYSTEM protegida más: el router no le da trato
+> especial. Lo manda solo `SY.admin@motherbee` (OPA de usuario; desde 0.1.45 los orquestadores
+> no mandan ninguno). Rutas/VPN/taps no usan CONFIG_CHANGED: se cambian con las
+> acciones admin de cada hive y los routers de ese hive leen su región de config (SHM). OPA de
+> usuario es una sola policy global y SY.opa.rules solo acepta CONFIG_CHANGED de
+> `SY.admin@motherbee` — ver [`opa-distribution.md`](opa-distribution.md).
 
 #### 7.4.1 Formato
 
@@ -534,13 +537,17 @@ socket.on('data', (chunk) => {
 
 #### 7.4.2 Subsystems
 
+> **Hoy solo existe `opa`.** `routes` y `vpn` se cambian con acciones admin por hive (0.1.41–0.1.44);
+> el broadcast de `storage` se borró en 0.1.41 y su CONFIG_RESPONSE en 0.1.45; `hives` no tiene
+> emisor. La tabla y los ejemplos de abajo, salvo `opa`, son historia.
+
 | Subsystem | Quién actúa | Contenido de `config` |
 |-----------|-------------|----------------------|
-| `routes` | SY.config.routes, RT.* | Rutas estáticas |
-| `vpn` | SY.config.routes, RT.* | Tabla VPN |
-| `opa` | SY.opa.rules, RT.* | Policies OPA |
-| `storage` | SY.orchestrator | Path del storage |
-| `hives` | SY.orchestrator | Lista de islas |
+| `routes` | (historia) | Rutas estáticas |
+| `vpn` | (historia) | Tabla VPN |
+| `opa` | SY.opa.rules | Policy OPA de usuario (ver `opa-distribution.md`) |
+| `storage` | (historia; borrado en 0.1.41) | Path del storage |
+| `hives` | (historia) | Lista de islas |
 
 #### 7.4.3 Ejemplos
 
@@ -1252,6 +1259,13 @@ Nodo                                    Router
   │         (operación normal)             │
 ```
 
+**Una conexión viva por UUID** (desde 0.1.56, A-44). Si el UUID del HELLO ya tiene una conexión
+viva, el router espera hasta 1 s a que esa conexión se cierre: un reinicio, una reconexión o el
+segundo HELLO que todo nodo Go manda al arrancar pueden llegar antes de que el router procese el
+cierre de la anterior. Si la anterior sigue viva, el router rechaza el HELLO: cierra la conexión
+nueva sin mandar ANNOUNCE y loguea el WARN `HELLO rejected: this node UUID already has a live
+connection`. La conexión anterior conserva su registro y su ruta.
+
 ### 8.2 Mensaje HELLO
 
 ```json
@@ -1506,7 +1520,7 @@ pub enum NodeError {
 
 > **Un nodo = Un UUID = Una conexión**
 
-El router asocia cada UUID a exactamente una conexión. Si un proceso abre dos conexiones con el mismo UUID, el router desconecta la anterior.
+El router asocia cada UUID a exactamente una conexión. Si llega un HELLO con un UUID que ya tiene una conexión viva, el router espera hasta 1 s a que esa conexión se cierre y, si sigue viva, rechaza la nueva sin ANNOUNCE (§8.1). La conexión que ya estaba no se toca (antes de 0.1.56 la nueva se quedaba con la ruta y la anterior seguía conectada, sin ruta).
 
 ### 10.6 Reconexión Automática
 
@@ -1518,6 +1532,7 @@ La librería maneja la reconexión de forma transparente:
 | Intento fallido | Backoff exponencial (100ms → 200ms → 400ms → ... → 30s max) |
 | Conexión OK | Enviar HELLO, esperar ANNOUNCE |
 | ANNOUNCE recibido | Estado = Connected |
+| HELLO rechazado (otra conexión viva tiene el UUID, §8.1) | Primera conexión: `connect()` devuelve el error. Reconexión: WARN `router handshake failed; retrying` y sigue el backoff |
 
 **Importante:** Al reconectar se vacía la cola TX. Los mensajes pendientes se pierden. Es responsabilidad del nodo re-enviar si es necesario (el nodo puede detectar desconexión via `is_connected()`).
 
@@ -1575,6 +1590,8 @@ El router al recibir WITHDRAW remueve el nodo de su tabla inmediatamente.
 
 **Nota:** Si el nodo hace `drop()` sin llamar `close()`, no se envía WITHDRAW. El router detectará la desconexión por el socket cerrado.
 
+Todo fin de la conexión (WITHDRAW, EOF o error de lectura) desregistra el nodo y cierra su socket del lado del router. Un mensaje que el router no puede procesar se loguea y se descarta: no corta la conexión (A-44).
+
 ### 10.8 Patrón Request/Response (responsabilidad del nodo)
 
 La librería NO implementa request/response. El nodo que necesite este patrón debe implementarlo usando `trace_id` para correlación:
@@ -1627,7 +1644,7 @@ impl MyNode {
 | Handshake HELLO/ANNOUNCE | Librería |
 | Reconexión automática con backoff | Librería |
 | Envío de WITHDRAW en close() | Librería |
-| Resolver UUID L1 (persistente o efÃ­mero) | Librería |
+| Resolver UUID L1 (persistente o efímero) | Librería |
 | Agregar @isla al nombre | Librería |
 | Request/response (correlación) | **Nodo** |
 | Qué hacer post-reconexión | **Nodo** |

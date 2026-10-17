@@ -25,7 +25,7 @@ Use this section first. If the task is clear here, do not overcomplicate it.
 | Deterministic choreography between known nodes | `wf_deployments` / `wf_rules_compile_apply` |
 | Prefix- or hive-based forwarding between known destinations | `routing` / `add_route` |
 | Secondary copy of unicast traffic to an additional node | `router taps` / `add_tap` |
-| Policy-based target resolution when destination is not explicit | `opa_deployments` / OPA |
+| Policy-based target resolution when destination is not explicit | `opa` (one user policy for every hive) / `opa_compile_apply` |
 
 Rules:
 - If the operator already names the participating nodes, do **not** default to OPA.
@@ -88,7 +88,7 @@ Rules:
 Pattern: `TYPE.name@hive`
 
 Examples:
-- `AI.chat@motherbee`
+- `AI.sales@motherbee`
 - `WF.invoice@motherbee`
 - `IO.api.support@motherbee`
 - `SY.admin@motherbee`
@@ -102,13 +102,14 @@ Examples:
 - `wf.engine`
 - `io.api`
 - `io.slack`
-- `sy.frontdesk.gov`
+- `io.wapp`
 
 Rules:
 - Do not create new mixed-case runtime names.
 - Node identity and runtime key are different concepts.
-- `AI.chat@motherbee` is a node.
+- `AI.sales@motherbee` is a node (an instance of `ai.generic`).
 - `ai.generic` is a runtime.
+- `SY.*` nodes are core services, not runtimes: never `run_node` them.
 
 ### 2.3 Creating an Internet-facing `IO.api`
 
@@ -117,7 +118,9 @@ instance owns one ICH and publishes `/e/<ich>` through the configured `SY.edge`.
 
 Required sequence:
 
-1. Choose a tenant, unique node name, `api_channel_id`, fixed `dst_node` and Edge node.
+1. Choose the tenant the API serves (never the hive's root tenant
+   `tnt:00000000-0000-0000-0000-000000000001`, see §8.2), a unique node name, `api_channel_id`,
+   fixed `dst_node` and Edge node.
 2. Spawn `runtime=io.api` through `run_node`; Orchestrator injects the instance ILK/tenant.
 3. Apply the Edge-native config without credentials. IO.api self-externalizes and `SY.admin` mints
    and stores the Edge bearer through the canonical ingress flow.
@@ -163,9 +166,15 @@ If a worker hive does not exist yet, include topology/VPN creation in desired st
 
 Use when the work is conversational, interpretive, or agentic.
 
-Common runtime bases:
-- `ai.generic` for generic new AI nodes
-- `ai.chat` is an existing chat runtime, not the default base for cloning new AI behavior
+Every AI node is an instance of the `ai.generic` runtime; there is no other AI runtime, and no AI
+node boots with the base install. To make one:
+- `run_node` with `runtime: ai.generic` and the node's tenant;
+- `CONFIG_SET` its behavior: `behavior.kind: ai_chat`, `model`, and instructions;
+- give it a role, skills and handbook with `set_ilk_definition` on its ILK.
+
+The node does not name a Vault key: it uses the AI provider key SY.vault gives it (resource_type
+`openai` or `anthropic`): one it owns, one assigned to it, or its tenant's general one (no owner, no
+assigned node). The root tenant's keys are the core's; a tenant's node never falls back to them.
 
 ### 4.2 WF nodes and workflows
 
@@ -289,7 +298,7 @@ Examples:
 - the operator is describing a business flow, not just a network path
 
 Examples:
-- inbound from `IO.api.support@motherbee` goes to `AI.chat@motherbee`
+- inbound from `IO.api.support@motherbee` goes to `AI.support@motherbee`
 - the same interaction is mirrored to `IO.slack.support@motherbee`
 - AI response should also be echoed to Slack
 
@@ -339,7 +348,7 @@ Valid `desired_state` sections:
 - `nodes`
 - `routing`
 - `wf_deployments`
-- `opa_deployments`
+- `opa`: one user OPA policy for every hive (`rego_source`, `entrypoint`, `ownership`), no hive. If several solutions declare one, the last one applied wins.
 
 Not supported here:
 - `policy`
@@ -488,12 +497,13 @@ Notes:
 - `node_name` uses type prefix + `@hive`
 - `runtime` is lowercase and has no `@hive`
 - `tenant_id` is root-level and required for `AI.*` / `IO.*` first spawn; do not bury it inside `config`
+- an `IO.*` node other than `IO.cloud` / `IO.blob` never runs in the hive's root tenant `tnt:00000000-0000-0000-0000-000000000001`: `run_node` with that tenant fails with `TENANT_ROOT_NOT_ALLOWED` (§8.2)
 - For `WF.*`, do not use `runtime: "wf.engine"` in `run_node`; first publish/apply the workflow through `wf_rules_compile_apply` and spawn the resulting concrete runtime (`wf.<workflow_name>`).
 
 ### 8.1.1 Tenant discovery before first spawn
 
 When the operator says things like:
-- "use the same tenant as `AI.chat@motherbee`"
+- "use the same tenant as `AI.sales@motherbee`"
 - "associate this tenant to that sponsor"
 - "create the client under the same sponsor as another tenant"
 
@@ -520,7 +530,8 @@ Rules:
 - never use non-executable placeholders like `<tenant_id_from_s1>`
 - in tenant reads, treat `is_root=true` as a root/default tenant candidate and `is_sponsor=true` as a tenant that currently sponsors child tenants
 - if the task says "same tenant as an existing node", prefer reading the node config/live config to find the exact `tenant_id`, then validate that tenant with `get_tenant`
-- run client-facing `AI.*` / `IO.*` nodes with the client `tenant_id`, not the sponsor/admin tenant, unless the operator explicitly asks for an internal admin node
+- run client-facing `AI.*` / `IO.*` nodes with the client `tenant_id`, not the sponsor/admin tenant, unless the operator explicitly asks for an internal admin node, which runs in the admin/company tenant
+- run an `IO.*` node in the tenant the operator names, or in the one you read from an existing node (as above); if there is none, block with `missing_fields:["tenant_id"]`. Never pick the hive's root tenant `tnt:00000000-0000-0000-0000-000000000001` for it, even when it is the only `is_root=true` tenant: only `IO.cloud` and `IO.blob` run there
 - if no reliable tenant can be found, block and ask for exactly one missing tenant clarification
 
 ### 8.1.2 Agent cognitive definition
@@ -552,11 +563,15 @@ Rules:
 
 ### 8.2 IO tenant naming
 
-Single-tenant IO node:
-- `IO.slack@motherbee`
+An IO channel node (`io.api`, `io.slack`, `io.wapp`, `io.linkedhelper`, ...) is launched by the
+tenant that needs it, or by an operator for that tenant, and runs with that tenant. None runs in the
+hive's root tenant `tnt:00000000-0000-0000-0000-000000000001`: only `IO.cloud` and `IO.blob` run
+there, and they are the only IO nodes the base install starts (operator decision 2026-10-02). The
+orchestrator refuses any other IO node in the root tenant with `TENANT_ROOT_NOT_ALLOWED`. Every
+binding is its own instance of its runtime:
 
-One IO node per tenant:
-- `IO.slack.T126@motherbee`
+- `IO.slack.T126@motherbee` — one Slack binding, named after its tenant or workspace token
+- `IO.wapp.acme@motherbee` — one WhatsApp number of the tenant `acme`
 
 Use the same short tenant token consistently across related nodes.
 
@@ -600,6 +615,7 @@ Ask one short clarification only when a critical input cannot be inferred safely
 For read-only diagnostics, inspect before asking:
 - If the operator names a family, count, role, or partial description instead of exact resource names, read inventory/list endpoints and resolve the concrete targets yourself.
 - If the resulting candidates are clear, continue with persisted config, live config, status, runtime, route, or vault metadata reads as needed in the same turn.
+- When state looks unexpected (a node changed, appeared, or broke "on its own"), read `list_recent_commands` first — the admin command audit log answers "what was done to this backend lately, by whom" (redacted params, all origins) before you reverse-engineer it from infra.
 - Do not ask for permission to read non-secret system state. Ask only when the live state still leaves multiple unsafe interpretations or no viable candidate.
 
 Examples of acceptable one-question clarifications:

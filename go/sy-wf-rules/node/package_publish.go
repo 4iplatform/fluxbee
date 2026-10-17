@@ -3,16 +3,30 @@ package node
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 	"sort"
-	"strconv"
 	"strings"
 	"time"
+
+	fluxbeesdk "github.com/4iplatform/json-router/fluxbee-go-sdk"
 )
 
 const workflowRuntimeBase = "wf.engine"
+
+// workflowRuntimeVersion encodes the monotonic uint64 workflow version as a
+// semver-valid string. Runtime packages (including type=workflow) are validated
+// against strict MAJOR.MINOR.PATCH by the runtime-package publisher
+// (src/runtime_package.rs), so the raw integer ("1") is rejected. The uint64
+// counter stays the source of truth; only its string encoding changes. It is the
+// SINGLE place the version string is derived, so the package.json version, the
+// dist directory name, the manifest entry, the purge keep-set, and the spawned
+// node's runtime_version all agree byte-for-byte.
+func workflowRuntimeVersion(v uint64) string {
+	return fmt.Sprintf("0.0.%d", v)
+}
 
 type PackagePublishResult struct {
 	RuntimeName string
@@ -36,6 +50,12 @@ type runtimeManifestEntry struct {
 }
 
 func (s *Service) PublishWorkflowPackage(workflowName string, meta WfRulesMetadata, definitionBytes []byte) (*PackagePublishResult, error) {
+	ctx, cancel := newRequestContext()
+	defer cancel()
+	return s.publishWorkflowPackage(ctx, workflowName, meta, definitionBytes)
+}
+
+func (s *Service) publishWorkflowPackage(ctx context.Context, workflowName string, meta WfRulesMetadata, definitionBytes []byte) (*PackagePublishResult, error) {
 	packageFiles, err := buildWorkflowPackageFiles(s.cfg.HiveID, workflowName, meta, definitionBytes)
 	if err != nil {
 		return nil, err
@@ -43,14 +63,14 @@ func (s *Service) PublishWorkflowPackage(workflowName string, meta WfRulesMetada
 	if s.admin == nil {
 		return nil, fmt.Errorf("admin client unavailable")
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), adminRPCTimeout)
+	callCtx, cancel := context.WithTimeout(ctx, adminRPCTimeout)
 	defer cancel()
-	return s.admin.PublishRuntimePackage(ctx, packageFiles)
+	return s.admin.PublishRuntimePackage(callCtx, packageFiles)
 }
 
 func buildWorkflowPackageFiles(hiveID, workflowName string, meta WfRulesMetadata, definitionBytes []byte) (map[string]string, error) {
 	runtimeName := "wf." + workflowName
-	version := strconv.FormatUint(meta.Version, 10)
+	version := workflowRuntimeVersion(meta.Version)
 
 	packageJSON := map[string]any{
 		"name":         runtimeName,
@@ -83,7 +103,7 @@ func buildWorkflowPackageFiles(hiveID, workflowName string, meta WfRulesMetadata
 
 func (s *Service) publishWorkflowPackageLocal(workflowName string, meta WfRulesMetadata, definitionBytes []byte) (*PackagePublishResult, error) {
 	runtimeName := workflowRuntimeName(workflowName)
-	version := strconv.FormatUint(meta.Version, 10)
+	version := workflowRuntimeVersion(meta.Version)
 	packageFiles, err := buildWorkflowPackageFiles(s.cfg.HiveID, workflowName, meta, definitionBytes)
 	if err != nil {
 		return nil, err
@@ -110,6 +130,12 @@ func (s *Service) publishWorkflowPackageLocal(workflowName string, meta WfRulesM
 }
 
 func (s *Service) PurgeWorkflowPackages(workflowName string, preserveBoundVersion bool) error {
+	ctx, cancel := newRequestContext()
+	defer cancel()
+	return s.purgeWorkflowPackages(ctx, workflowName, preserveBoundVersion)
+}
+
+func (s *Service) purgeWorkflowPackages(ctx context.Context, workflowName string, preserveBoundVersion bool) error {
 	runtimeName := workflowRuntimeName(workflowName)
 	runtimeDir := filepath.Join(s.cfg.DistRuntimeRoot, runtimeName)
 	entries, err := os.ReadDir(runtimeDir)
@@ -122,13 +148,13 @@ func (s *Service) PurgeWorkflowPackages(workflowName string, preserveBoundVersio
 
 	keep := map[string]struct{}{}
 	if meta, err := s.store.ReadCurrentMetadata(workflowName); err == nil {
-		keep[strconv.FormatUint(meta.Version, 10)] = struct{}{}
+		keep[workflowRuntimeVersion(meta.Version)] = struct{}{}
 	}
 	if meta, err := s.store.ReadBackupMetadata(workflowName); err == nil {
-		keep[strconv.FormatUint(meta.Version, 10)] = struct{}{}
+		keep[workflowRuntimeVersion(meta.Version)] = struct{}{}
 	}
 	if preserveBoundVersion {
-		boundVersion, err := s.boundRuntimeVersionForWorkflow(workflowName)
+		boundVersion, err := s.boundRuntimeVersionForWorkflow(ctx, workflowName)
 		if err != nil {
 			return err
 		}
@@ -137,6 +163,12 @@ func (s *Service) PurgeWorkflowPackages(workflowName string, preserveBoundVersio
 		}
 	}
 
+	// The dist tree and its manifest are the motherbee's, and only SY.admin writes them: obsolete
+	// versions are removed through it on every hive (A-68). On any other hive the tree is a
+	// Syncthing receive-only mirror, where a local delete is never restored and a manifest edit
+	// only diverges from the source; on the motherbee, a write of its own raced the admin's
+	// publishes now that the admin serves the mesh concurrently.
+	var obsolete []string
 	for _, entry := range entries {
 		if !entry.IsDir() {
 			continue
@@ -145,19 +177,61 @@ func (s *Service) PurgeWorkflowPackages(workflowName string, preserveBoundVersio
 		if _, ok := keep[version]; ok {
 			continue
 		}
-		if err := os.RemoveAll(filepath.Join(runtimeDir, version)); err != nil {
+		obsolete = append(obsolete, version)
+	}
+	return s.purgeOnPrimary(ctx, runtimeName, obsolete)
+}
+
+// purgeOnPrimary removes versions from the motherbee's dist. The admin refuses to remove a
+// runtime's current version while other versions remain (RUNTIME_CURRENT_CONFLICT), so the current
+// one goes last: first by this hive's copy of the manifest, and a version refused as current is
+// tried again once the others are gone, since a worker's copy can lag behind the motherbee's (a
+// rollback moves the current version back; 0.1.70 gate, A-68).
+func (s *Service) purgeOnPrimary(ctx context.Context, runtimeName string, versions []string) error {
+	current := ""
+	if manifest, err := loadRuntimeManifest(filepath.Join(s.cfg.DistRuntimeRoot, "manifest.json")); err == nil {
+		current = manifest.Runtimes[runtimeName].Current
+	}
+	sort.SliceStable(versions, func(i, j int) bool {
+		return versions[i] != current && versions[j] == current
+	})
+	var refusedAsCurrent []string
+	for _, version := range versions {
+		err := s.removeRuntimeVersionOnPrimary(ctx, runtimeName, version)
+		var actionErr *adminActionError
+		if errors.As(err, &actionErr) && actionErr.Code == "RUNTIME_CURRENT_CONFLICT" {
+			refusedAsCurrent = append(refusedAsCurrent, version)
+			continue
+		}
+		if err != nil {
 			return err
 		}
 	}
+	for _, version := range refusedAsCurrent {
+		if err := s.removeRuntimeVersionOnPrimary(ctx, runtimeName, version); err != nil {
+			return err
+		}
+	}
+	return nil
+}
 
-	remaining, err := runtimeVersionsOnDisk(runtimeDir)
-	if err != nil {
-		return err
+func (s *Service) removeRuntimeVersionOnPrimary(ctx context.Context, runtimeName, version string) error {
+	if s.admin == nil {
+		return fmt.Errorf("admin client unavailable")
 	}
-	if len(remaining) == 0 {
-		_ = os.Remove(runtimeDir)
+	callCtx, cancel := context.WithTimeout(ctx, adminRPCTimeout)
+	defer cancel()
+	if err := s.admin.RemoveRuntimeVersion(callCtx, runtimeName, version); err != nil {
+		var actionErr *adminActionError
+		if errors.As(err, &actionErr) &&
+			(actionErr.Code == "RUNTIME_NOT_FOUND" || actionErr.Code == "RUNTIME_VERSION_NOT_FOUND") {
+			// Already gone from the motherbee (e.g. a directory the manifest no longer lists):
+			// exactly the state the purge wants.
+			return nil
+		}
+		return fmt.Errorf("remove %s %s on %s: %w", runtimeName, version, fluxbeesdk.PrimaryAdminNode, err)
 	}
-	return s.updateRuntimeManifestAfterPurge(runtimeName, remaining, preferredCurrentVersion(keep))
+	return nil
 }
 
 func (s *Service) updateRuntimeManifest(runtimeName, version string) error {
@@ -173,32 +247,6 @@ func (s *Service) updateRuntimeManifest(runtimeName, version string) error {
 	entry.Available = appendIfMissing(entry.Available, version)
 	sort.Strings(entry.Available)
 	manifest.Runtimes[runtimeName] = entry
-	manifest.SchemaVersion = 2
-	manifest.Version = nextManifestVersion(manifest.Version, uint64(time.Now().UTC().UnixMilli()))
-	manifest.UpdatedAt = time.Now().UTC().Format(timeRFC3339)
-	manifest.Hash = nil
-	return writeRuntimeManifest(manifestPath, manifest)
-}
-
-func (s *Service) updateRuntimeManifestAfterPurge(runtimeName string, available []string, preferredCurrent string) error {
-	manifestPath := filepath.Join(s.cfg.DistRuntimeRoot, "manifest.json")
-	manifest, err := loadRuntimeManifest(manifestPath)
-	if err != nil {
-		return err
-	}
-	entry, ok := manifest.Runtimes[runtimeName]
-	if !ok && len(available) == 0 {
-		return nil
-	}
-	if len(available) == 0 {
-		delete(manifest.Runtimes, runtimeName)
-	} else {
-		entry.Available = available
-		entry.Current = chooseManifestCurrent(available, preferredCurrent, entry.Current)
-		entry.PackageType = "workflow"
-		entry.RuntimeBase = workflowRuntimeBase
-		manifest.Runtimes[runtimeName] = entry
-	}
 	manifest.SchemaVersion = 2
 	manifest.Version = nextManifestVersion(manifest.Version, uint64(time.Now().UTC().UnixMilli()))
 	manifest.UpdatedAt = time.Now().UTC().Format(timeRFC3339)
@@ -247,37 +295,6 @@ func appendIfMissing(values []string, target string) []string {
 		}
 	}
 	return append(values, target)
-}
-
-func runtimeVersionsOnDisk(runtimeDir string) ([]string, error) {
-	entries, err := os.ReadDir(runtimeDir)
-	if err != nil {
-		if os.IsNotExist(err) {
-			return nil, nil
-		}
-		return nil, err
-	}
-	versions := make([]string, 0, len(entries))
-	for _, entry := range entries {
-		if !entry.IsDir() {
-			continue
-		}
-		versions = append(versions, entry.Name())
-	}
-	sort.Strings(versions)
-	return versions, nil
-}
-
-func preferredCurrentVersion(keep map[string]struct{}) string {
-	if len(keep) == 0 {
-		return ""
-	}
-	versions := make([]string, 0, len(keep))
-	for version := range keep {
-		versions = append(versions, version)
-	}
-	sort.Strings(versions)
-	return versions[len(versions)-1]
 }
 
 func chooseManifestCurrent(available []string, preferredCurrent string, fallbackCurrent string) string {

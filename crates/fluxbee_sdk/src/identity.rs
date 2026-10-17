@@ -136,6 +136,10 @@ pub struct IdentityIchOption {
     pub ich_id: String,
     pub channel_type: String,
     pub address: String,
+    /// The namespace the address lives in (`tnt:<uuid>`): the tenant whose IO nodes look it up, or
+    /// the root tenant's for a Fluxbee Cloud account (docs/ilk-tenant-model-v1.md §2.1).
+    #[serde(default)]
+    pub scope: String,
     pub is_primary: bool,
     pub owner_l2_name: Option<String>,
     pub enabled: bool,
@@ -265,9 +269,6 @@ struct IdentityRegionLayout {
     ilk_offset: usize,
     ich_offset: usize,
     ich_mapping_offset: usize,
-    ilk_alias_offset: usize,
-    vocabulary_offset: usize,
-    variable_offset: usize,
     total_len: usize,
     limits: IdentityRegionLimits,
 }
@@ -491,11 +492,38 @@ pub fn resolve_ilk_from_hive_config(
 
 /// Resolve the full identity option from identity SHM by `(channel_type, address, tenant_id)`.
 /// Returns the matched ICH plus canonical ILK metadata when found.
+///
+/// LENIENT permission semantics (F-09): a present-but-unreadable SHM (EACCES/EPERM misinstall)
+/// degrades to `Ok(None)` — built for io.api's inbound path, where a miss falls through to
+/// provisioning. An AUTHORITATIVE read API must NOT report "does not exist" for a permission
+/// fault: use the `_strict` variant, which surfaces those errors as `Err`.
 pub fn resolve_identity_option_from_shm_name(
     identity_shm_name: &str,
     channel_type: &str,
     address: &str,
     tenant_id: &str,
+) -> Result<Option<ResolvedIdentityOption>, IdentityShmError> {
+    resolve_identity_option_from_shm_name_impl(identity_shm_name, channel_type, address, tenant_id, true)
+}
+
+/// [`resolve_identity_option_from_shm_name`] with STRICT permission semantics: an unreadable
+/// SHM is an `Err`, never a silent miss. For authoritative read APIs (io.cloud's Cloud
+/// `get_ilk`-by-email) where `Ok(None)` means "this identity genuinely does not exist".
+pub fn resolve_identity_option_from_shm_name_strict(
+    identity_shm_name: &str,
+    channel_type: &str,
+    address: &str,
+    tenant_id: &str,
+) -> Result<Option<ResolvedIdentityOption>, IdentityShmError> {
+    resolve_identity_option_from_shm_name_impl(identity_shm_name, channel_type, address, tenant_id, false)
+}
+
+fn resolve_identity_option_from_shm_name_impl(
+    identity_shm_name: &str,
+    channel_type: &str,
+    address: &str,
+    tenant_id: &str,
+    lenient_permissions: bool,
 ) -> Result<Option<ResolvedIdentityOption>, IdentityShmError> {
     let normalized_channel = channel_type.trim().to_ascii_lowercase();
     let normalized_address = address.trim().to_ascii_lowercase();
@@ -505,7 +533,9 @@ pub fn resolve_identity_option_from_shm_name(
     }
     let reader = match open_identity_shm_reader(identity_shm_name) {
         Ok(reader) => reader,
-        Err(err) if is_permission_lookup_unavailable(&err) => return Ok(None),
+        Err(err) if lenient_permissions && is_permission_lookup_unavailable(&err) => {
+            return Ok(None)
+        }
         Err(err) => return Err(err),
     };
     let resolved = match reader.resolve_identity_option(
@@ -514,14 +544,17 @@ pub fn resolve_identity_option_from_shm_name(
         &normalized_tenant,
     ) {
         Ok(value) => value,
-        Err(err) if is_permission_lookup_unavailable(&err) => return Ok(None),
+        Err(err) if lenient_permissions && is_permission_lookup_unavailable(&err) => {
+            return Ok(None)
+        }
         Err(err) => return Err(err),
     };
     Ok(resolved)
 }
 
 /// Resolve the full identity option via explicit hive id (`/jsr-identity-<hive_id>`)
-/// using tenant-aware ICH lookup.
+/// using tenant-aware ICH lookup. Lenient permission semantics — see
+/// [`resolve_identity_option_from_shm_name`]; authoritative readers use the `_strict` variant.
 pub fn resolve_identity_option_from_hive_id(
     hive_id: &str,
     channel_type: &str,
@@ -530,6 +563,18 @@ pub fn resolve_identity_option_from_hive_id(
 ) -> Result<Option<ResolvedIdentityOption>, IdentityShmError> {
     let shm_name = identity_shm_name_for_hive(hive_id)?;
     resolve_identity_option_from_shm_name(&shm_name, channel_type, address, tenant_id)
+}
+
+/// [`resolve_identity_option_from_hive_id`] with STRICT permission semantics (unreadable SHM
+/// = `Err`, never a silent miss). For authoritative read APIs.
+pub fn resolve_identity_option_from_hive_id_strict(
+    hive_id: &str,
+    channel_type: &str,
+    address: &str,
+    tenant_id: &str,
+) -> Result<Option<ResolvedIdentityOption>, IdentityShmError> {
+    let shm_name = identity_shm_name_for_hive(hive_id)?;
+    resolve_identity_option_from_shm_name_strict(&shm_name, channel_type, address, tenant_id)
 }
 
 /// Resolve the full identity option using `hive.yaml` from config dir
@@ -575,6 +620,37 @@ pub fn tenant_exists_in_hive_config(
 ) -> Result<bool, IdentityShmError> {
     let hive_id = load_hive_id(config_dir)?;
     tenant_exists_in_hive_id(&hive_id, tenant_id)
+}
+
+/// A tenant's status in the identity SHM (`pending`, `active`, `suspended`), or `None` when it is
+/// not there: it does not exist, or it is marked deleted (the SHM leaves those out).
+pub fn tenant_status_in_shm_name(
+    identity_shm_name: &str,
+    tenant_id: &str,
+) -> Result<Option<String>, IdentityShmError> {
+    let tenant_uuid = parse_prefixed_uuid(tenant_id, "tnt")?;
+    let reader = open_identity_shm_reader(identity_shm_name)?;
+    Ok(reader
+        .tenant_status(tenant_uuid.into_bytes())?
+        .map(tenant_status_from_shm))
+}
+
+/// A tenant's status for one hive (see `tenant_status_in_shm_name`).
+pub fn tenant_status_in_hive_id(
+    hive_id: &str,
+    tenant_id: &str,
+) -> Result<Option<String>, IdentityShmError> {
+    let shm_name = identity_shm_name_for_hive(hive_id)?;
+    tenant_status_in_shm_name(&shm_name, tenant_id)
+}
+
+/// A tenant's status using `hive.yaml` from config dir (see `tenant_status_in_shm_name`).
+pub fn tenant_status_in_hive_config(
+    config_dir: &Path,
+    tenant_id: &str,
+) -> Result<Option<String>, IdentityShmError> {
+    let hive_id = load_hive_id(config_dir)?;
+    tenant_status_in_hive_id(&hive_id, tenant_id)
 }
 
 /// Check whether an ILK exists in identity SHM by canonical ilk id (`ilk:<uuid>`).
@@ -883,9 +959,13 @@ impl IdentityShmReader {
     }
 
     fn tenant_exists(&self, tenant_id: [u8; 16]) -> Result<bool, IdentityShmError> {
+        Ok(self.tenant_status(tenant_id)?.is_some())
+    }
+
+    fn tenant_status(&self, tenant_id: [u8; 16]) -> Result<Option<u8>, IdentityShmError> {
         let header = header_ref::<IdentityHeader>(self.mmap.as_ref(), self.layout.header_offset)
             .ok_or(IdentityShmError::InvalidShmHeader)?;
-        read_tenant_exists_from_region(header, self.mmap.as_ref(), &self.layout, tenant_id)
+        read_tenant_status_from_region(header, self.mmap.as_ref(), &self.layout, tenant_id)
     }
 
     fn ilk_exists(&self, ilk_id: [u8; 16]) -> Result<bool, IdentityShmError> {
@@ -1023,6 +1103,15 @@ fn read_ich_options_from_region(
     let start = StdInstant::now();
     loop {
         if start.elapsed() > StdDuration::from_millis(SEQLOCK_READ_TIMEOUT_MS) {
+            // Same loud timeout its sibling reader (resolve_ich_mapping) emits — this listing
+            // backs io.cloud's email-only first-login lookup, and a silent SeqLockTimeout there
+            // reads as an undiagnosable outage during identity write churn.
+            tracing::warn!(
+                elapsed_us = start.elapsed().as_micros() as u64,
+                ilk_count = header.ilk_count,
+                ich_count = header.ich_count,
+                "sdk identity shm ich-options read timed out under seqlock"
+            );
             return Err(IdentityShmError::SeqLockTimeout);
         }
         let s1 = header.seq.load(Ordering::Acquire);
@@ -1135,12 +1224,13 @@ fn read_resolved_identity_option_from_region(
     }
 }
 
-fn read_tenant_exists_from_region(
+/// The status byte of the tenant's live entry, or `None` when it has none.
+fn read_tenant_status_from_region(
     header: &IdentityHeader,
     mmap: &[u8],
     layout: &IdentityRegionLayout,
     tenant_id: [u8; 16],
-) -> Result<bool, IdentityShmError> {
+) -> Result<Option<u8>, IdentityShmError> {
     let start = StdInstant::now();
     loop {
         if start.elapsed() > StdDuration::from_millis(SEQLOCK_READ_TIMEOUT_MS) {
@@ -1163,14 +1253,15 @@ fn read_tenant_exists_from_region(
             layout.limits.max_tenants as usize,
         )
         .ok_or(IdentityShmError::InvalidShmHeader)?;
-        let exists = tenants[..max_tenants]
+        let status = tenants[..max_tenants]
             .iter()
-            .any(|entry| entry.flags & FLAG_ACTIVE != 0 && entry.tenant_id == tenant_id);
+            .find(|entry| entry.flags & FLAG_ACTIVE != 0 && entry.tenant_id == tenant_id)
+            .map(|entry| entry.status);
 
         atomic::fence(Ordering::Acquire);
         let s2 = header.seq.load(Ordering::Acquire);
         if s1 == s2 {
-            return Ok(exists);
+            return Ok(status);
         }
     }
 }
@@ -1355,6 +1446,17 @@ fn ilk_type_from_shm(value: u8) -> String {
     .to_string()
 }
 
+/// The tenant status codes SY.identity writes (0 pending, 1 active, 2 suspended).
+fn tenant_status_from_shm(value: u8) -> String {
+    match value {
+        0 => "pending",
+        1 => "active",
+        2 => "suspended",
+        _ => "unknown",
+    }
+    .to_string()
+}
+
 fn registration_status_from_shm(value: u8) -> String {
     match value {
         SHM_REG_STATUS_TEMPORARY => "temporary",
@@ -1394,6 +1496,7 @@ fn build_ich_options(ilks: &[IlkEntry], ichs: &[IchEntry]) -> Vec<IdentityIchOpt
                 ich_id: ich_id.clone(),
                 channel_type: channel_type.clone(),
                 address: address.clone(),
+                scope: prefixed_uuid_from_bytes("tnt", ich.tenant_id),
                 is_primary: ich.is_primary != 0,
                 owner_l2_name: {
                     let value = fixed_str_to_string(&ich.owner_l2_name);
@@ -1524,8 +1627,7 @@ fn layout_identity(limits: IdentityRegionLimits) -> IdentityRegionLayout {
     let ich_mapping_offset = align_up(ich_offset + ich_size, REGION_ALIGNMENT);
     let ilk_alias_offset = align_up(ich_mapping_offset + mapping_size, REGION_ALIGNMENT);
     let vocabulary_offset = align_up(ilk_alias_offset + alias_size, REGION_ALIGNMENT);
-    let variable_offset = align_up(vocabulary_offset + vocabulary_size, REGION_ALIGNMENT);
-    let total_len = variable_offset;
+    let total_len = align_up(vocabulary_offset + vocabulary_size, REGION_ALIGNMENT);
 
     IdentityRegionLayout {
         header_offset,
@@ -1533,9 +1635,6 @@ fn layout_identity(limits: IdentityRegionLimits) -> IdentityRegionLayout {
         ilk_offset,
         ich_offset,
         ich_mapping_offset,
-        ilk_alias_offset,
-        vocabulary_offset,
-        variable_offset,
         total_len,
         limits,
     }
@@ -1586,6 +1685,23 @@ fn parse_prefixed_uuid(value: &str, prefix: &str) -> Result<Uuid, IdentityShmErr
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Shared with the Go SDK (go/fluxbee-go-sdk/testdata/system_ilk): a node that derives its own
+    /// ILK in Go must get the one SY.identity seeds here, untrimmed.
+    #[test]
+    fn deterministic_system_ilk_id_matches_the_vectors_shared_with_go() {
+        let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../go/fluxbee-go-sdk/testdata/system_ilk/vectors.json");
+        let raw = std::fs::read_to_string(path).expect("read vectors");
+        let fixture: serde_json::Value = serde_json::from_str(&raw).expect("decode vectors");
+        let vectors = fixture["vectors"].as_array().expect("vectors");
+        assert!(!vectors.is_empty());
+        for vector in vectors {
+            let name = vector["node_name"].as_str().expect("node_name");
+            let ilk = vector["ilk"].as_str().expect("ilk");
+            assert_eq!(deterministic_system_ilk_id(name), ilk, "{name:?}");
+        }
+    }
 
     #[test]
     fn permission_denied_lookup_is_treated_as_not_found() {
@@ -1818,9 +1934,16 @@ mod tests {
         write_struct(&mut mmap, layout.header_offset, &header);
         write_struct(&mut mmap, layout.tenant_offset, &tenant);
 
-        let exists =
-            read_tenant_exists_from_region(&header, &mmap, &layout, tenant.tenant_id).unwrap();
-        assert!(exists);
+        let status =
+            read_tenant_status_from_region(&header, &mmap, &layout, tenant.tenant_id).unwrap();
+        assert_eq!(
+            status.map(tenant_status_from_shm),
+            Some(tenant_status_from_shm(tenant.status))
+        );
+        assert_eq!(
+            read_tenant_status_from_region(&header, &mmap, &layout, [9u8; 16]).unwrap(),
+            None
+        );
     }
 
     #[test]

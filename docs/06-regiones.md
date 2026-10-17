@@ -136,6 +136,13 @@ vpns:
 
 ### 2.5 Flujo de Actualización
 
+> **Reemplazado (0.1.41–0.1.45), §2.5 a §2.7:** no hay broadcast de rutas. El admin manda la
+> acción (`add_route`, …) al SY.config.routes **de ese hive**, que escribe su región; los routers
+> del hive la releen con el próximo mensaje y la anuncian a los demás hives por LSA.
+> SY.config.routes ya no atiende CONFIG_CHANGED, y CONFIG_CHANGED quedó solo para la policy OPA de
+> usuario (`SY.admin@motherbee` → SY.opa.rules; ver `opa-distribution.md`). El flujo de abajo, el
+> mensaje de §2.6 y el CONFIG_RESPONSE obligatorio de §2.7 son historia.
+
 ```
 1. SY.admin recibe request HTTP (ej: POST /routes)
 2. SY.admin valida formato básico
@@ -152,6 +159,8 @@ vpns:
 **IMPORTANTE:** No hay trato especial para el local. El mismo broadcast llega a todas las islas y cada SY.config.routes actúa igual.
 
 ### 2.6 Notificación y Aplicación de Cambios
+
+> **Historia:** ver la nota de §2.5.
 
 **Mensaje CONFIG_CHANGED (emitido por SY.admin):**
 
@@ -221,6 +230,9 @@ fn handle_config_changed(&mut self, payload: &ConfigChangedPayload, trace_id: &s
 ```
 
 ### 2.7 CONFIG_RESPONSE (confirmación/error)
+
+> **Historia:** ver la nota de §2.5. Hoy solo SY.opa.rules responde CONFIG_RESPONSE, a los
+> CONFIG_CHANGED de OPA.
 
 Todo proceso que recibe CONFIG_CHANGED **DEBE** responder con CONFIG_RESPONSE para confirmar aplicación o reportar errores.
 
@@ -434,6 +446,13 @@ impl Router {
 ### 5.1 Semántica
 
 La tabla VPN define a qué zona pertenece cada nodo basado en pattern matching de su nombre L2.
+
+> **La VPN es por hive (decisión del operador, 2026-10-01).** Cada router asigna la VPN de sus
+> nodos solo con las reglas de **su propio hive**; las reglas de otros hives viajan por LSA pero no
+> se usan para asignar. La entrega exige la misma VPN en origen y destino, y el `vpn_id` de un nodo
+> remoto llega por LSA. Para que nodos de hives distintos compartan una VPN, hay que cargar la misma
+> regla en cada hive y mantenerlas iguales. No falla abierto: si un hive se corta, sus nodos salen
+> del LSA. (Las rutas estáticas y los taps sí se aplican en todos los hives vía LSA.)
 
 ### 5.2 Evaluación
 

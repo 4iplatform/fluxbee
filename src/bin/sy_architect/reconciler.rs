@@ -12,7 +12,7 @@ use super::pipeline_types::{
     desired_state_unknown_sections, is_valid_ownership_label, restart_policy_for_node,
     ActualStateSnapshot, BuildTaskKnownContext, BuildTaskPacket, ChangeType, CompilerClass,
     DeltaOperation, DeltaReport, DeltaReportStatus, DeltaSummary, DesiredHive, DesiredNode,
-    DesiredOpaDeployment, DesiredRoute, DesiredRuntime, DesiredVpn, DesiredWfDeployment,
+    DesiredOpaPolicy, DesiredRoute, DesiredRuntime, DesiredVpn, DesiredWfDeployment,
     ReconcilerOutput, RestartPolicy, SolutionManifestV2, MAX_ARTIFACT_ATTEMPTS,
     UNSUPPORTED_DESIRED_STATE_SECTIONS,
 };
@@ -680,108 +680,82 @@ pub fn reconcile_wf(
     ops
 }
 
-// ── TB-9 — OPA deployments ────────────────────────────────────────────────────
+// ── TB-9 — the user OPA policy ───────────────────────────────────────────────
+// One user policy for every hive: the snapshot reads it once from the motherbee and the plan writes
+// it with one global opa_compile_apply / opa_clear. When several solutions declare one, the last
+// one applied wins (operator decision 2026-10-01, FINDINGS A-23): a solution re-applies its policy
+// when the running one differs, and clears it only while the running policy is still its own.
+
+pub const OPA_POLICY_RESOURCE_TYPE: &str = "opa_policy";
+pub const OPA_POLICY_RESOURCE_ID: &str = "global";
 
 pub fn reconcile_opa(
-    desired_opa: &[serde_json::Value],
+    desired: Option<&serde_json::Value>,
     snapshot: &ActualStateSnapshot,
+    solution_id: &str,
 ) -> Vec<DeltaOperation> {
-    let mut ops = Vec::new();
+    // Not in scope for this run: nothing was read, so nothing can be decided.
+    let Some(actual) = snapshot.opa.as_ref() else {
+        return Vec::new();
+    };
+    let running = !actual.hash.is_empty();
+    let desired =
+        desired.and_then(|value| serde_json::from_value::<DesiredOpaPolicy>(value.clone()).ok());
 
-    let desired: Vec<DesiredOpaDeployment> = desired_opa
-        .iter()
-        .filter_map(|item| serde_json::from_value::<DesiredOpaDeployment>(item.clone()).ok())
-        .collect();
-
-    let mut snapshot_opa: HashMap<String, serde_json::Value> = HashMap::new();
-    for (hive_id, hive_res) in &snapshot.resources {
-        for item in snapshot_item_values(hive_res.opa_state.as_ref()) {
-            let policy_id = item
-                .get("policy_id")
-                .or_else(|| item.get("id"))
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string();
-            if policy_id.is_empty() {
-                continue;
-            }
-            let key = format!("{hive_id}:{policy_id}");
-            snapshot_opa.insert(key, item);
-        }
-    }
-
-    for (idx, opa) in desired.iter().enumerate() {
-        let key = format!("{}:{}", opa.hive, opa.policy_id);
-        match snapshot_opa.get(&key) {
-            None => {
-                ops.push(DeltaOperation {
-                    op_id: new_op_id(),
-                    resource_type: "opa_deployment".to_string(),
-                    resource_id: key,
-                    change_type: ChangeType::Create,
-                    ownership: opa.ownership.clone(),
-                    compiler_class: CompilerClass::OpaApply,
-                    desired_ref: Some(format!("desired_state.opa_deployments[{idx}]")),
-                    actual_ref: None,
-                    blocking: false,
-                    payload_ref: None,
-                    notes: vec![],
-                });
-            }
-            Some(actual) => {
-                let actual_hash = actual
-                    .get("rego_hash")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("");
-                if actual_hash != opa.rego_hash() {
-                    ops.push(DeltaOperation {
-                        op_id: new_op_id(),
-                        resource_type: "opa_deployment".to_string(),
-                        resource_id: key,
-                        change_type: ChangeType::Update,
-                        ownership: opa.ownership.clone(),
-                        compiler_class: CompilerClass::OpaApply,
-                        desired_ref: Some(format!("desired_state.opa_deployments[{idx}]")),
-                        actual_ref: Some(format!("snapshot.opa.{}", opa.policy_id)),
-                        blocking: false,
-                        payload_ref: None,
-                        notes: vec!["rego source changed".to_string()],
-                    });
-                }
-            }
-        }
-    }
-
-    let desired_opa_keys: HashSet<String> = desired
-        .iter()
-        .map(|opa| format!("{}:{}", opa.hive, opa.policy_id))
-        .collect();
-    for (key, actual) in &snapshot_opa {
-        if desired_opa_keys.contains(key) {
-            continue;
-        }
-        let ownership = actual
-            .get("ownership")
-            .and_then(|v| v.as_str())
-            .unwrap_or("unknown");
-        if ownership == "solution" {
-            ops.push(DeltaOperation {
+    let Some(policy) = desired else {
+        if running && actual.declared_by.as_deref() == Some(solution_id) {
+            return vec![DeltaOperation {
                 op_id: new_op_id(),
-                resource_type: "opa_deployment".to_string(),
-                resource_id: key.clone(),
+                resource_type: OPA_POLICY_RESOURCE_TYPE.to_string(),
+                resource_id: OPA_POLICY_RESOURCE_ID.to_string(),
                 change_type: ChangeType::Delete,
                 ownership: "solution".to_string(),
                 compiler_class: CompilerClass::OpaRemove,
                 desired_ref: None,
-                actual_ref: Some(format!("snapshot.opa.{key}")),
-                blocking: true,
+                actual_ref: Some("snapshot.opa".to_string()),
+                blocking: false,
                 payload_ref: None,
-                notes: vec!["solution-owned OPA deployment absent from desired_state; canonical remove action still unavailable".to_string()],
-            });
+                notes: vec![
+                    "this solution no longer declares the user policy it applied; it is cleared on every hive"
+                        .to_string(),
+                ],
+            }];
         }
-    }
+        return Vec::new();
+    };
 
-    ops
+    let same_entrypoint = actual.entrypoint.is_empty() || actual.entrypoint == policy.entrypoint;
+    if running && actual.rego == policy.rego_source && same_entrypoint {
+        return Vec::new();
+    }
+    let (change_type, note) = if !running {
+        (ChangeType::Create, "no user policy is running".to_string())
+    } else {
+        let note = match actual.declared_by.as_deref() {
+            Some(owner) if owner == solution_id => {
+                "updates the user policy this solution declared".to_string()
+            }
+            Some(owner) => format!(
+                "replaces the user policy declared by solution '{owner}' on every hive (the last one applied wins)"
+            ),
+            None => "replaces a user policy that no solution declared (written by hand) on every hive"
+                .to_string(),
+        };
+        (ChangeType::Update, note)
+    };
+    vec![DeltaOperation {
+        op_id: new_op_id(),
+        resource_type: OPA_POLICY_RESOURCE_TYPE.to_string(),
+        resource_id: OPA_POLICY_RESOURCE_ID.to_string(),
+        change_type,
+        ownership: policy.ownership,
+        compiler_class: CompilerClass::OpaApply,
+        desired_ref: Some("desired_state.opa".to_string()),
+        actual_ref: running.then(|| "snapshot.opa".to_string()),
+        blocking: false,
+        payload_ref: None,
+        notes: vec![note],
+    }]
 }
 
 // ── TB-10 — Artifact gap detection ───────────────────────────────────────────
@@ -794,6 +768,7 @@ pub fn run_reconciler(
     manifest: &SolutionManifestV2,
     snapshot: &ActualStateSnapshot,
     manifest_ref: &str,
+    solution_id: &str,
 ) -> Result<ReconcilerOutput, String> {
     validate_manifest_sections(manifest)?;
 
@@ -863,10 +838,7 @@ pub fn run_reconciler(
     }
 
     // OPA
-    if let Some(opa) = &ds.opa_deployments {
-        let ops = reconcile_opa(opa, snapshot);
-        all_ops.extend(ops);
-    }
+    all_ops.extend(reconcile_opa(ds.opa.as_ref(), snapshot, solution_id));
 
     // Summary
     let mut summary = DeltaSummary::default();
@@ -937,6 +909,7 @@ mod tests {
             },
             hive_status,
             resources,
+            opa: None,
             completeness: SnapshotCompleteness {
                 is_partial: false,
                 missing_sections: vec![],
@@ -1225,34 +1198,99 @@ mod tests {
 
     // ── OPA ──
 
+    fn running_policy(rego: &str, declared_by: Option<&str>) -> ActualOpaPolicy {
+        ActualOpaPolicy {
+            version: 7,
+            hash: "sha256:abc".to_string(),
+            rego: rego.to_string(),
+            entrypoint: "router/target".to_string(),
+            declared_by: declared_by.map(str::to_string),
+        }
+    }
+
+    const REGO: &str = "package router\n\ndefault target = null\n";
+
     #[test]
-    fn missing_opa_deployment_emits_opa_apply() {
-        let desired = vec![json!({
-            "hive": "motherbee",
-            "policy_id": "solution-policy",
-            "rego_source": "package fluxbee\nallow = true"
-        })];
+    fn opa_out_of_scope_emits_nothing() {
+        let desired = json!({ "rego_source": REGO });
         let snapshot = empty_snapshot(&["motherbee"]);
-        let ops = reconcile_opa(&desired, &snapshot);
-        assert_eq!(ops.len(), 1);
-        assert_eq!(ops[0].compiler_class, CompilerClass::OpaApply);
+        assert!(reconcile_opa(Some(&desired), &snapshot, "sol-a").is_empty());
     }
 
     #[test]
-    fn missing_desired_solution_owned_opa_emits_opa_remove_blocked() {
-        let desired: Vec<serde_json::Value> = vec![];
+    fn a_declared_policy_with_none_running_is_applied_to_every_hive() {
+        let desired = json!({ "rego_source": REGO });
         let mut snapshot = empty_snapshot(&["motherbee"]);
-        snapshot.resources.get_mut("motherbee").unwrap().opa_state = Some(json!([
-            {
-                "policy_id": "solution-policy",
-                "rego_hash": "deadbeef",
-                "ownership": "solution"
-            }
-        ]));
-        let ops = reconcile_opa(&desired, &snapshot);
+        snapshot.opa = Some(ActualOpaPolicy::default());
+        let ops = reconcile_opa(Some(&desired), &snapshot, "sol-a");
+        assert_eq!(ops.len(), 1);
+        assert_eq!(ops[0].compiler_class, CompilerClass::OpaApply);
+        assert_eq!(ops[0].change_type, ChangeType::Create);
+        assert_eq!(ops[0].resource_id, "global");
+        assert_eq!(ops[0].desired_ref.as_deref(), Some("desired_state.opa"));
+        assert_eq!(ops[0].notes, vec!["no user policy is running".to_string()]);
+    }
+
+    #[test]
+    fn the_same_policy_running_is_left_alone() {
+        let desired = json!({ "rego_source": REGO });
+        let mut snapshot = empty_snapshot(&["motherbee"]);
+        snapshot.opa = Some(running_policy(REGO, Some("sol-b")));
+        assert!(reconcile_opa(Some(&desired), &snapshot, "sol-a").is_empty());
+    }
+
+    #[test]
+    fn replacing_a_running_policy_says_whose_it_was() {
+        let desired = json!({ "rego_source": REGO });
+        let mut snapshot = empty_snapshot(&["motherbee"]);
+        for (declared_by, says) in [
+            (Some("sol-b"), "declared by solution 'sol-b'"),
+            (Some("sol-a"), "this solution declared"),
+            (None, "no solution declared"),
+        ] {
+            snapshot.opa = Some(running_policy("package router\n", declared_by));
+            let ops = reconcile_opa(Some(&desired), &snapshot, "sol-a");
+            assert_eq!(ops.len(), 1);
+            assert_eq!(ops[0].compiler_class, CompilerClass::OpaApply);
+            assert_eq!(ops[0].change_type, ChangeType::Update);
+            assert!(ops[0].notes[0].contains(says), "{:?}", ops[0].notes);
+        }
+    }
+
+    #[test]
+    fn a_solution_clears_the_running_policy_only_while_it_is_its_own() {
+        let mut snapshot = empty_snapshot(&["motherbee"]);
+        snapshot.opa = Some(running_policy(REGO, Some("sol-a")));
+        let ops = reconcile_opa(None, &snapshot, "sol-a");
         assert_eq!(ops.len(), 1);
         assert_eq!(ops[0].compiler_class, CompilerClass::OpaRemove);
-        assert!(ops[0].blocking);
+        assert_eq!(ops[0].change_type, ChangeType::Delete);
+        assert!(!ops[0].blocking);
+
+        for running in [
+            running_policy(REGO, Some("sol-b")),
+            running_policy(REGO, None),
+            ActualOpaPolicy::default(),
+        ] {
+            snapshot.opa = Some(running);
+            assert!(reconcile_opa(None, &snapshot, "sol-a").is_empty());
+        }
+    }
+
+    #[test]
+    fn opa_steps_are_one_global_write() {
+        assert_eq!(
+            compiler_class_admin_steps(&CompilerClass::OpaApply),
+            Some(vec!["opa_compile_apply"])
+        );
+        assert_eq!(
+            compiler_class_admin_steps(&CompilerClass::OpaRemove),
+            Some(vec!["opa_clear"])
+        );
+        assert_eq!(
+            compiler_class_risk(&CompilerClass::OpaRemove),
+            RiskClass::Destructive
+        );
     }
 
     #[test]
@@ -1293,8 +1331,8 @@ mod tests {
             "nodes": [{ "node_name": "AI.coa@motherbee", "hive": "motherbee", "runtime": "AI.common" }]
         }));
         let snapshot = empty_snapshot(&["motherbee"]);
-        let out1 = run_reconciler(&manifest, &snapshot, "manifest://test/1.0").unwrap();
-        let out2 = run_reconciler(&manifest, &snapshot, "manifest://test/1.0").unwrap();
+        let out1 = run_reconciler(&manifest, &snapshot, "manifest://test/1.0", "test").unwrap();
+        let out2 = run_reconciler(&manifest, &snapshot, "manifest://test/1.0", "test").unwrap();
         assert_eq!(
             out1.delta_report.summary.creates, out2.delta_report.summary.creates,
             "reconciler must be idempotent"
@@ -1313,7 +1351,7 @@ mod tests {
         snapshot.completeness.blocking = true;
         snapshot.completeness.missing_sections = vec!["worker-220.nodes".to_string()];
 
-        let out = run_reconciler(&manifest, &snapshot, "manifest://test/1.0").unwrap();
+        let out = run_reconciler(&manifest, &snapshot, "manifest://test/1.0", "test").unwrap();
         assert_eq!(
             out.delta_report.status,
             DeltaReportStatus::BlockedPartialSnapshot,
