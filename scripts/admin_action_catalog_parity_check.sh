@@ -76,7 +76,8 @@ wf_rules_http_map = {
     "Delete": "wf_rules_delete",
 }
 for variant, action in wf_rules_http_map.items():
-    if re.search(rf'handle_wf_rules_http\([\s\S]*?WfRulesAction::{variant}\)', surface):
+    # The call also names who asked for the deploy (A-68): match the variant, not the paren.
+    if re.search(rf'handle_wf_rules_http\([\s\S]*?WfRulesAction::{variant}\b', surface):
         http_actions.add(action)
 for query in ("get_status", "get_workflow", "list_workflows"):
     if "handle_wf_rules_query(" in surface and f'"{query}"' in surface:
@@ -88,6 +89,8 @@ if "handle_hive_sync_hint_command(" in surface:
     http_actions.add("sync_hint")
 if "handle_inventory_http(" in surface:
     http_actions.add("inventory")
+if "handle_list_streams(" in surface:
+    http_actions.add("list_streams")
 
 opa_http_map = {
     "CompileApply": "opa_compile_apply",

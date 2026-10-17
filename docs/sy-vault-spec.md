@@ -33,7 +33,7 @@ The design prioritizes simplicity and operability over cryptographic completenes
 
 **2.4 Authorization in vault.** Until OPA integration is ready, the vault implements its own authorization rules based on the requester's identity. These rules are hardcoded in v1 and migrate to OPA later.
 
-**2.5 Self-contained secret storage.** Vault has its own SQLite database, its own master key, and its own audit log. Secret storage does not depend on `SY.storage`, Postgres, NATS persistence, or any node-local `secrets.json`. Vault does read identity SHM for authorization metadata (`tenant_id`, `ilk_type`, status) because the current L2 protocol does not carry `src_tenant_id`.
+**2.5 Self-contained secret storage.** Vault has its own SQLite database, its own master key, and its own audit log. Secret storage does not depend on `SY.storage`, Postgres, the router stream, or any node-local `secrets.json`. Vault does read identity SHM for authorization metadata (`tenant_id`, `ilk_type`, status) because the current L2 protocol does not carry `src_tenant_id`.
 
 **2.6 Append-only audit.** Every operation is logged with full context. Audit log is tamper-evident in design (append-only table) but not cryptographically signed in v1.
 
@@ -525,7 +525,7 @@ The transition is non-breaking: as long as OPA's decisions match the current har
 
 ### 8.1 Logged operations
 
-Every vault operation, regardless of result, generates an audit log entry in the local SQLite database at `/var/lib/fluxbee/vault.db`. Audit is not sent through NATS, `SY.storage`, or a separate external database.
+Every vault operation, regardless of result, generates an audit log entry in the local SQLite database at `/var/lib/fluxbee/vault.db`. Audit is not sent through the router stream, `SY.storage`, or a separate external database.
 
 ```sql
 INSERT INTO audit_log (timestamp, operation, key, caller_l2_name, caller_ilk, caller_tenant_id, result, error_code)
@@ -542,7 +542,7 @@ VALUES (?, ?, ?, ?, ?, ?, ?, ?);
 
 In v1, the audit log grows indefinitely. The vault provides no automatic rotation or archival. If the log grows too large, the operator manually archives old entries (e.g., copy to file and delete from table).
 
-A future improvement is automatic rotation by date or by row count, with archived entries moved to compressed log files. This remains local to the vault; it is not a NATS stream.
+A future improvement is automatic rotation by date or by row count, with archived entries moved to compressed log files. This remains local to the vault; it does not go through the router stream.
 
 ### 8.4 Audit log query
 
@@ -940,7 +940,7 @@ This intentionally destroys vault contents. The next vault boot generates a new 
 | No mTLS / certificates in v1 | Vault doesn't have direct connections; canonicalization is sufficient |
 | Hardcoded authorization in v1 | OPA integration deferred; logic is straightforward enough to hardcode |
 | Audit log in same SQLite | Transactional with operations; single file to backup |
-| No NATS audit persistence | Avoids dependency/circularity; vault remains locally auditable even if other services are degraded |
+| No audit through the router stream | Avoids dependency/circularity; vault remains locally auditable even if other services are degraded |
 | Versioning: current + previous | Simple rollback; full history available via audit log |
 | Encryption at rest only | Channel encryption is router's responsibility |
 | Master key at first boot | No external setup; vault is self-bootstrapping |

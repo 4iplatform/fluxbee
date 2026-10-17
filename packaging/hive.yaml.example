@@ -25,11 +25,6 @@ wan:
   gateway_name: "RT.gateway"
   mtls: required
 
-# Local NATS broker for control/data plane.
-nats:
-  mode: embedded
-  port: 4222
-
 # Local admin HTTP API.
 admin:
   listen: "127.0.0.1:8080"
@@ -104,7 +99,6 @@ system_nodes:
       - SY.architect
       - SY.storage
       - SY.cognition
-      - SY.policy
       - SY.timer
       - SY.wf-rules
       - SY.frontdesk.gov
@@ -115,7 +109,6 @@ system_nodes:
       - SY.opa.rules
       - SY.admin
       - SY.cognition
-      - SY.policy
       - SY.timer
       - SY.vault
   worker:
@@ -124,7 +117,6 @@ system_nodes:
       - SY.identity
       - SY.opa.rules
       - SY.cognition
-      - SY.policy
       - SY.timer
       - SY.wf-rules
     wait_for:
@@ -132,7 +124,6 @@ system_nodes:
       - SY.identity
       - SY.opa.rules
       - SY.cognition
-      - SY.policy
       - SY.timer
   # SY.opa.rules runs on EVERY role: the router of each hive enforces the one global user
   # policy, compiled on the motherbee and synced to all hives (dist/policy). It needs no

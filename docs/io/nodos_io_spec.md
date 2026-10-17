@@ -64,7 +64,7 @@ The Router is the **sole owner** of conversational history.
 IO nodes **MUST follow Router v1.16 protocol** exactly.
 
 Notably:
-- `thread_id/thread_seq` are the active canonical carriers for conversational continuity in the current repo
+- `thread_id` is the active canonical carrier for conversational continuity in the current repo (the message carries no sequence)
 - `meta.ctx` belongs to historical/legacy context semantics and must not be reintroduced as the primary carrier in new IO paths
 - `meta.context` is reserved for OPA input and extra metadata
 - `meta.ich` identifies the local/system channel of the IO node, not the remote external handle
@@ -111,7 +111,7 @@ Según la especificación del Router v1.16:
 
 ✅ **Canónico (protocolo Fluxbee)**:
 - Mensajes `user` deben incluir identidad y material conversacional canónico.
-- En el repo actual, `ich` debe leerse como **canal local/sistémico** y `thread_id/thread_seq` como carrier conversacional activo.
+- En el repo actual, `ich` debe leerse como **canal local/sistémico** y `thread_id` como carrier conversacional activo.
 
 ⚠️ **Estado actual (core/SDK)**:
 - `ctx_window` no está garantizado en runtime hoy; `ctx_seq` puede no venir en algunos flujos.

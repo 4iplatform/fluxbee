@@ -274,7 +274,7 @@ else
   echo "SKIP: /config/storage write/read/restore disabled (RUN_STORAGE_CONFIG_CYCLE=0)"
 fi
 
-# 6) /config/storage/metrics via SY.admin -> NATS -> SY.storage
+# 6) /config/storage/metrics via SY.admin -> SY.storage (over the mesh)
 if [[ "$RUN_STORAGE_METRICS_CHECK" == "1" ]]; then
   storage_metrics_body="$tmpdir/storage_metrics.json"
   metrics_ok="0"

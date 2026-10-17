@@ -12,7 +12,7 @@ Let me compile all the decisions and changes we've discussed:
 
 Orchestrator is LOCAL - always runs on its own machine
 add_hive/remove_hive only on motherbee (`add_hive` usa SSH bootstrap; `remove_hive` es socket-first/local-only)
-All commands via socket unicast L2 (not NATS, not SSH)
+All commands via socket unicast L2 (not SSH)
 Software sync via Syncthing to /var/lib/fluxbee/dist/
 RUNTIME_UPDATE renamed to SYSTEM_UPDATE for broader applicability
 Admin needs a new endpoint to handle updates
@@ -123,18 +123,18 @@ sy-orchestrator arranca:
 
 ## 4. Comunicación
 
-### 4.1 Canal: socket L2 (no NATS)
+### 4.1 Canal: socket L2
 
 Toda comunicación de control usa el canal de socket existente (nodo ↔ router). El router resuelve nombres L2 y reenvía inter-isla por WAN cuando corresponde.
 
-**No se usa NATS/JetStream para comandos de control.** NATS queda reservado para datos que requieren persistencia (turns de conversación, eventos para SY.storage).
+**Los comandos de control no pasan por el stream del router.** El stream (`RT.<router>.stream@<hive>`) es el plano de log: lleva a sus sinks, con mejor esfuerzo, los turns de conversación y lo que deriva SY.cognition (ver `13-storage.md`). Reemplazó al broker NATS embebido, que se borró en 0.1.78.
 
 Razones:
 
 - Socket es rápido y directo
 - Socket tiene broadcast (necesario para CONFIG_CHANGED, OPA_RELOAD)
 - Los comandos de control no necesitan garantía at-least-once
-- NATS agregaría complejidad innecesaria a una operación que es básicamente "ejecutá esto y decime cómo salió"
+- Un log con ventana y reintentos agregaría complejidad innecesaria a una operación que es básicamente "ejecutá esto y decime cómo salió"
 
 ### 4.2 Flujo de comandos (post-bootstrap)
 
@@ -992,10 +992,6 @@ wan:
   gateway_name: RT.gateway
   uplinks:
     - address: "192.168.8.1:9000"
-
-nats:
-  mode: embedded
-  port: 4222
 
 blob:
   enabled: true

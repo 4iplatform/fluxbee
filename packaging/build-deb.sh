@@ -44,14 +44,14 @@ node_bin_src() { # <workspace> <bin> -> path to the built binary
 # core service binaries: <installed-name>=<cargo --bin or go marker>
 RUST_BINS=(rt-gateway:json-router sy-admin:sy_admin sy-config-routes:sy_config_routes
   sy-architect:sy_architect sy-vault:sy_vault sy-orchestrator:sy_orchestrator
-  sy-storage:sy_storage sy-identity:sy_identity sy-cognition:sy_cognition sy-policy:sy_policy
+  sy-storage:sy_storage sy-identity:sy_identity sy-cognition:sy_cognition
   sy-edge:sy_edge)
 GO_BINS=(sy-opa-rules:go/sy-opa-rules sy-timer:go/sy-timer sy-wf-rules:go/sy-wf-rules
   wf-generic:go/nodes/wf/wf-generic)
 # units: every core service EXCEPT wf-generic (a runtime the orchestrator spawns).
 # sy-edge gets a dedicated unit below (custom rt-gateway ordering).
 UNITS=(rt-gateway sy-config-routes sy-opa-rules sy-admin sy-architect sy-vault
-  sy-orchestrator sy-storage sy-identity sy-cognition sy-policy sy-timer sy-wf-rules sy-frontdesk-gov)
+  sy-orchestrator sy-storage sy-identity sy-cognition sy-timer sy-wf-rules sy-frontdesk-gov)
 
 echo "== [1/5] build rust =="
 cargo build --release --bins
@@ -267,7 +267,7 @@ Installed-Size: ${INSTALLED_KB}
 Maintainer: 4i Platform <ops@4iplatform.com>
 Description: Fluxbee internal-network orchestration mesh
  Core services (router, orchestrator, identity, vault, storage, admin,
- architect, cognition, policy, timer, wf-rules, opa-rules, frontdesk, edge)
+ architect, cognition, timer, wf-rules, opa-rules, frontdesk, edge)
  plus the managed IO/AI runtimes (io.api, io.blob, io.cloud, io.slack, io.wapp,
  ai.generic, wf.engine, io.linkedhelper) seeded under dist/runtimes per
  packaging/base-nodes.json (io.blob + io.cloud are motherbee-only managed nodes).

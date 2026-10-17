@@ -287,8 +287,9 @@ changed live; `config-set listen` → `restart_required:[listen]`; `config-get` 
 - **Agente acotado, no admin general.** Permanece en ilk/ICH-space y no necesita una vista SHM completa
   de identity. Las respuestas no exponen lecturas de vault ni secretos.
 - Lives **inside the mesh, not in the DMZ hive** — must not share blast radius with the edge.
-- Deferred para producción: el end-user ilk/subject dentro del comando y `SY.policy` sobre
-  `(IO.cloud transport principal) + (user ilk subject)`.
+- Deferred para producción: el end-user ilk/subject dentro del comando y una policy sobre
+  `(IO.cloud transport principal) + (user ilk subject)` (pensada para `SY.policy`, que se retiró:
+  solo contaba turns; se paró en 0.1.77 y su binario y su unit se borraron en 0.1.78).
 
 ### 10.1 `IO.api` - instancias publicas sobre el mismo circuito
 

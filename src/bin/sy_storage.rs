@@ -1,10 +1,9 @@
 use std::collections::hash_map::DefaultHasher;
 use std::fs::{self, OpenOptions};
 use std::hash::{Hash, Hasher};
-use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::path::Path;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -12,11 +11,6 @@ use tokio::time;
 use tokio_postgres::{error::SqlState, Client, Config as PgConfig, GenericClient, NoTls};
 use tracing_subscriber::EnvFilter;
 
-use fluxbee_sdk::nats::{
-    publish_local as client_nats_publish_local, resolve_local_nats_endpoint, subscribe_local,
-    NatsError as ClientNatsError, NatsRequestEnvelope, NatsResponseEnvelope,
-    NATS_ENVELOPE_SCHEMA_VERSION,
-};
 use fluxbee_sdk::protocol::{
     Destination, Message, Meta, Routing, VaultSecretChangedPayload, VaultSecretInterest,
     is_system_kind, MSG_VAULT_SECRET_CHANGED, SYSTEM_KIND,
@@ -31,16 +25,13 @@ use fluxbee_sdk::{
     CognitionContextData, CognitionCooccurrenceData, CognitionDurableEntity,
     CognitionDurableEnvelope, CognitionDurableOp, CognitionEnvelopeBatch, CognitionEpisodeData,
     CognitionMemoryData, CognitionReasonData, CognitionScopeData, CognitionScopeInstanceData,
-    CognitionStateGet, CognitionStateResponse, CognitionThreadData,
-    COGNITION_DURABLE_SCHEMA_VERSION, MSG_COGNITION_STATE_GET, MSG_COGNITION_STATE_RESPONSE,
+    CognitionStateGet, CognitionStateResponse, CognitionThreadData, StorageInboxMetrics,
+    StorageMetricsResponse, COGNITION_DURABLE_SCHEMA_VERSION, MSG_COGNITION_STATE_GET,
+    MSG_COGNITION_STATE_RESPONSE, MSG_STORAGE_METRICS_GET, MSG_STORAGE_METRICS_RESPONSE,
     SUBJECT_STORAGE_COGNITION_CONTEXTS, SUBJECT_STORAGE_COGNITION_COOCCURRENCES,
     SUBJECT_STORAGE_COGNITION_EPISODES, SUBJECT_STORAGE_COGNITION_MEMORIES,
     SUBJECT_STORAGE_COGNITION_REASONS, SUBJECT_STORAGE_COGNITION_SCOPES,
     SUBJECT_STORAGE_COGNITION_SCOPE_INSTANCES, SUBJECT_STORAGE_COGNITION_THREADS,
-};
-use json_router::nats::{
-    NatsSubscriber as RouterNatsSubscriber, SUBJECT_STORAGE_EVENTS, SUBJECT_STORAGE_ITEMS,
-    SUBJECT_STORAGE_REACTIVATION, SUBJECT_STORAGE_TURNS,
 };
 
 type StorageError = Box<dyn std::error::Error + Send + Sync>;
@@ -48,10 +39,9 @@ use json_router::router::system_policy::PRIMARY_HIVE_ID;
 use fluxbee_sdk::stream::{
     is_stream_node_name, stream_hive, StreamBatch, MSG_STREAM_ACK, MSG_STREAM_BATCH,
     SUBJECT_STORAGE_COGNITION_BATCH,
-    SUBJECT_STORAGE_COGNITION_PREFIX as STREAM_SUBJECT_COGNITION_PREFIX,
+    SUBJECT_STORAGE_COGNITION_PREFIX as STREAM_SUBJECT_COGNITION_PREFIX, SUBJECT_STORAGE_TURNS,
 };
 
-const NATS_ERROR_LOG_EVERY: u64 = 20;
 const INBOX_REPLAY_BATCH_SIZE: i64 = 200;
 const INBOX_REPLAY_MAX_ROUNDS: u32 = 20;
 const INBOX_ERROR_MAX_LEN: usize = 1024;
@@ -370,20 +360,6 @@ END $$;
 const STORAGE_METRICS_LOG_INTERVAL_SECS: u64 = 30;
 const STORAGE_METRICS_WARN_PENDING: i64 = 100;
 const STORAGE_METRICS_WARN_AGE_SECS: i64 = 120;
-const DURABLE_QUEUE_EVENTS: &str = "durable.sy-storage.events";
-const DURABLE_QUEUE_ITEMS: &str = "durable.sy-storage.items";
-const DURABLE_QUEUE_REACTIVATION: &str = "durable.sy-storage.reactivation";
-const DURABLE_QUEUE_COGNITION_THREADS: &str = "durable.sy-storage.cognition.threads";
-const DURABLE_QUEUE_COGNITION_CONTEXTS: &str = "durable.sy-storage.cognition.contexts";
-const DURABLE_QUEUE_COGNITION_REASONS: &str = "durable.sy-storage.cognition.reasons";
-const DURABLE_QUEUE_COGNITION_COOCCURRENCES: &str = "durable.sy-storage.cognition.cooccurrences";
-const DURABLE_QUEUE_COGNITION_SCOPES: &str = "durable.sy-storage.cognition.scopes";
-const DURABLE_QUEUE_COGNITION_SCOPE_INSTANCES: &str =
-    "durable.sy-storage.cognition.scope_instances";
-const DURABLE_QUEUE_COGNITION_MEMORIES: &str = "durable.sy-storage.cognition.memories";
-const DURABLE_QUEUE_COGNITION_EPISODES: &str = "durable.sy-storage.cognition.episodes";
-const SUBJECT_STORAGE_METRICS_GET: &str = "storage.metrics.get";
-const STORAGE_METRICS_QUERY_SID: u32 = 19;
 const STORAGE_DB_NAME: &str = "fluxbee_storage";
 const STORAGE_NODE_BASE_NAME: &str = "SY.storage";
 const STORAGE_NODE_VERSION: &str = "2.0";
@@ -433,12 +409,6 @@ struct StorageConfigStateFile {
 struct HiveFile {
     hive_id: String,
     role: Option<String>,
-    nats: Option<NatsSection>,
-}
-
-#[derive(Debug, Deserialize)]
-struct NatsSection {
-    mode: Option<String>,
 }
 
 struct Storage {
@@ -462,42 +432,6 @@ struct TurnRecord {
     trace_id: String,
     /// The whole message, as the router copied it: `turns` is the message log (Archi reads it).
     message: Value,
-}
-
-#[derive(Debug)]
-struct EventRecord {
-    event_id: Option<i64>,
-    ctx: String,
-    start_seq: i64,
-    end_seq: i64,
-    boundary_reason: String,
-    cues_agg: Vec<String>,
-    outcome_status: Option<String>,
-    outcome_duration_ms: Option<i64>,
-    activation_strength: f64,
-    context_inhibition: f64,
-    use_count: i32,
-    success_count: i32,
-}
-
-#[derive(Debug)]
-struct MemoryItemRecord {
-    memory_id: String,
-    event_id: Option<i64>,
-    item_type: String,
-    content: Value,
-    confidence: f64,
-    cues_signature: Vec<String>,
-    activation_strength: f64,
-}
-
-#[derive(Debug, Serialize)]
-struct StorageInboxMetricsSnapshot {
-    pending: i64,
-    pending_with_error: i64,
-    oldest_pending_age_s: i64,
-    processed_total: i64,
-    max_attempts: i32,
 }
 
 #[tokio::main]
@@ -539,13 +473,6 @@ async fn main() -> Result<(), StorageError> {
         .into());
     }
 
-    let endpoint = resolve_local_nats_endpoint(&config_dir)?;
-    let use_durable_consumer = hive
-        .nats
-        .as_ref()
-        .and_then(|n| n.mode.as_deref())
-        .map(|mode| mode.trim().eq_ignore_ascii_case("embedded"))
-        .unwrap_or(true);
     let node_base_name = managed_node_name(STORAGE_NODE_BASE_NAME, &["SY_STORAGE_NODE_NAME"]);
     let node_name = ensure_l2_name(&node_base_name, &hive.hive_id);
     let node_config = NodeConfig {
@@ -618,108 +545,18 @@ async fn main() -> Result<(), StorageError> {
         hive = %hive.hive_id,
         node_name = %node_name,
         db_secret_source = %db_secret_source.as_str(),
-        endpoint = %endpoint,
         storage_ready = storage.is_some(),
         "sy.storage started"
     );
 
-    let nats_subscribe_errors = Arc::new(AtomicU64::new(0));
-    let storage_handler_errors = Arc::new(AtomicU64::new(0));
-
-    // Turns come from the routers' streams since 0.1.76, as STREAM_BATCH (A-70): not from NATS.
+    // Everything reaches SY.storage over the mesh (A-70): the routers' streams bring turns and
+    // cognition's outputs as STREAM_BATCH; SY.admin and SY.orchestrator ask for the inbox metrics.
     if let Some(storage) = storage.as_ref() {
-        std::mem::drop(tokio::spawn(run_events_loop(
-            endpoint.clone(),
-            use_durable_consumer,
-            Arc::clone(storage),
-            Arc::clone(&nats_subscribe_errors),
-            Arc::clone(&storage_handler_errors),
-        )));
-        std::mem::drop(tokio::spawn(run_items_loop(
-            endpoint.clone(),
-            use_durable_consumer,
-            Arc::clone(storage),
-            Arc::clone(&nats_subscribe_errors),
-            Arc::clone(&storage_handler_errors),
-        )));
-        std::mem::drop(tokio::spawn(run_reactivation_loop(
-            endpoint.clone(),
-            use_durable_consumer,
-            Arc::clone(storage),
-            Arc::clone(&nats_subscribe_errors),
-            Arc::clone(&storage_handler_errors),
-        )));
-        std::mem::drop(tokio::spawn(run_cognition_threads_loop(
-            endpoint.clone(),
-            use_durable_consumer,
-            Arc::clone(storage),
-            Arc::clone(&nats_subscribe_errors),
-            Arc::clone(&storage_handler_errors),
-        )));
-        std::mem::drop(tokio::spawn(run_cognition_contexts_loop(
-            endpoint.clone(),
-            use_durable_consumer,
-            Arc::clone(storage),
-            Arc::clone(&nats_subscribe_errors),
-            Arc::clone(&storage_handler_errors),
-        )));
-        std::mem::drop(tokio::spawn(run_cognition_reasons_loop(
-            endpoint.clone(),
-            use_durable_consumer,
-            Arc::clone(storage),
-            Arc::clone(&nats_subscribe_errors),
-            Arc::clone(&storage_handler_errors),
-        )));
-        std::mem::drop(tokio::spawn(run_cognition_cooccurrences_loop(
-            endpoint.clone(),
-            use_durable_consumer,
-            Arc::clone(storage),
-            Arc::clone(&nats_subscribe_errors),
-            Arc::clone(&storage_handler_errors),
-        )));
-        std::mem::drop(tokio::spawn(run_cognition_scopes_loop(
-            endpoint.clone(),
-            use_durable_consumer,
-            Arc::clone(storage),
-            Arc::clone(&nats_subscribe_errors),
-            Arc::clone(&storage_handler_errors),
-        )));
-        std::mem::drop(tokio::spawn(run_cognition_scope_instances_loop(
-            endpoint.clone(),
-            use_durable_consumer,
-            Arc::clone(storage),
-            Arc::clone(&nats_subscribe_errors),
-            Arc::clone(&storage_handler_errors),
-        )));
-        std::mem::drop(tokio::spawn(run_cognition_memories_loop(
-            endpoint.clone(),
-            use_durable_consumer,
-            Arc::clone(storage),
-            Arc::clone(&nats_subscribe_errors),
-            Arc::clone(&storage_handler_errors),
-        )));
-        std::mem::drop(tokio::spawn(run_cognition_episodes_loop(
-            endpoint.clone(),
-            use_durable_consumer,
-            Arc::clone(storage),
-            Arc::clone(&nats_subscribe_errors),
-            Arc::clone(&storage_handler_errors),
-        )));
-        std::mem::drop(tokio::spawn(run_storage_metrics_loop(
-            Arc::clone(storage),
-            Arc::clone(&nats_subscribe_errors),
-            Arc::clone(&storage_handler_errors),
-        )));
+        std::mem::drop(tokio::spawn(run_storage_metrics_loop(Arc::clone(storage))));
         std::mem::drop(tokio::spawn(run_inbox_maintenance_loop(Arc::clone(
             storage,
         ))));
     }
-    std::mem::drop(tokio::spawn(run_storage_metrics_query_loop(
-        config_dir.clone(),
-        storage.clone(),
-        Arc::clone(&nats_subscribe_errors),
-        Arc::clone(&storage_handler_errors),
-    )));
 
     // Vault changes arrive event-driven via VAULT_SECRET_CHANGED
     // broadcasts from SY.vault — no polling loop. See
@@ -739,6 +576,8 @@ async fn main() -> Result<(), StorageError> {
         .take_command_receiver(RPC_CH_SYSTEM)
         .await
         .map_err(|err| format!("sy.storage system receiver: {err}"))?;
+    // One inbox metrics scan at a time; a request that finds one running is told so.
+    let metrics_gate = Arc::new(tokio::sync::Semaphore::new(1));
     loop {
         tokio::select! {
             _ = heartbeat.tick() => {
@@ -780,6 +619,15 @@ async fn main() -> Result<(), StorageError> {
                             let _ = sender.send(reply).await;
                         }
                     }
+                    continue;
+                }
+                if msg.meta.msg.as_deref() == Some(MSG_STORAGE_METRICS_GET) {
+                    std::mem::drop(tokio::spawn(answer_storage_metrics(
+                        storage.clone(),
+                        Arc::clone(&metrics_gate),
+                        Arc::clone(&dispatcher),
+                        msg,
+                    )));
                     continue;
                 }
                 if msg.meta.msg.as_deref() == Some(MSG_STREAM_BATCH) {
@@ -1311,7 +1159,7 @@ WHERE processed_at IS NULL
         })
     }
 
-    async fn inbox_metrics_snapshot(&self) -> Result<StorageInboxMetricsSnapshot, StorageError> {
+    async fn inbox_metrics_snapshot(&self) -> Result<StorageInboxMetrics, StorageError> {
         let row = self
             .client
             .query_one(
@@ -1327,53 +1175,13 @@ FROM storage_inbox
                 &[],
             )
             .await?;
-        Ok(StorageInboxMetricsSnapshot {
+        Ok(StorageInboxMetrics {
             pending: row.get::<_, i64>(0),
             pending_with_error: row.get::<_, i64>(1),
             oldest_pending_age_s: row.get::<_, i64>(2),
             processed_total: row.get::<_, i64>(3),
             max_attempts: row.get::<_, i32>(4),
         })
-    }
-
-    async fn ingest_message(
-        &self,
-        subject: &str,
-        kind: HandlerKind,
-        payload: &[u8],
-    ) -> Result<(), StorageError> {
-        let dedupe_key = message_dedupe_key(subject, payload);
-        let already_processed = self
-            .upsert_inbox_message(&dedupe_key, subject, payload)
-            .await?;
-        if already_processed {
-            return Ok(());
-        }
-        self.process_inbox_message(&dedupe_key, subject, kind, payload, None)
-            .await
-    }
-
-    async fn upsert_inbox_message(
-        &self,
-        dedupe_key: &str,
-        subject: &str,
-        payload: &[u8],
-    ) -> Result<bool, StorageError> {
-        let row = self
-            .client
-            .query_one(
-                r#"
-INSERT INTO storage_inbox (dedupe_key, subject, payload, attempts, last_error)
-VALUES ($1, $2, $3, 1, NULL)
-ON CONFLICT (dedupe_key) DO UPDATE SET
-    attempts = storage_inbox.attempts + 1,
-    last_error = NULL
-RETURNING processed_at IS NOT NULL
-"#,
-                &[&dedupe_key, &subject, &payload],
-            )
-            .await?;
-        Ok(row.get::<_, bool>(0))
     }
 
     async fn process_inbox_message(
@@ -1436,22 +1244,6 @@ WHERE dedupe_key = $1
                 let value: Value = serde_json::from_slice(payload)?;
                 let turn = parse_turn(value)?;
                 self.persist_turn(&self.client, dedupe_key, &turn, source_ts)
-                    .await
-            }
-            HandlerKind::Events => {
-                let value: Value = serde_json::from_slice(payload)?;
-                let event = parse_event(value)?;
-                self.persist_event(&self.client, &event).await
-            }
-            HandlerKind::Items => {
-                let value: Value = serde_json::from_slice(payload)?;
-                let item = parse_memory_item(value)?;
-                self.persist_item(&self.client, &item).await
-            }
-            HandlerKind::Reactivation => {
-                let value: Value = serde_json::from_slice(payload)?;
-                let parsed = parse_reactivation_payload(value)?;
-                self.apply_reactivation(&self.client, dedupe_key, &parsed)
                     .await
             }
             HandlerKind::CognitionThreads => {
@@ -1539,161 +1331,6 @@ ON CONFLICT (dedupe_key) DO NOTHING
             ],
         )
         .await?;
-        Ok(())
-    }
-
-    async fn persist_event<C>(&self, db: &C, event: &EventRecord) -> Result<(), StorageError>
-    where
-        C: GenericClient + Sync,
-    {
-        let activation_strength = event.activation_strength as f32;
-        let context_inhibition = event.context_inhibition as f32;
-        if let Some(event_id) = event.event_id {
-            db.execute(
-                r#"
-INSERT INTO events (
-    event_id, ctx, start_seq, end_seq, boundary_reason, cues_agg,
-    outcome_status, outcome_duration_ms, activation_strength, context_inhibition,
-    use_count, success_count
-)
-VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
-ON CONFLICT (event_id) DO UPDATE SET
-    ctx = EXCLUDED.ctx,
-    start_seq = EXCLUDED.start_seq,
-    end_seq = EXCLUDED.end_seq,
-    boundary_reason = EXCLUDED.boundary_reason,
-    cues_agg = EXCLUDED.cues_agg,
-    outcome_status = EXCLUDED.outcome_status,
-    outcome_duration_ms = EXCLUDED.outcome_duration_ms,
-    activation_strength = EXCLUDED.activation_strength,
-    context_inhibition = EXCLUDED.context_inhibition,
-    use_count = EXCLUDED.use_count,
-    success_count = EXCLUDED.success_count
-"#,
-                &[
-                    &event_id,
-                    &event.ctx,
-                    &event.start_seq,
-                    &event.end_seq,
-                    &event.boundary_reason,
-                    &event.cues_agg,
-                    &event.outcome_status,
-                    &event.outcome_duration_ms,
-                    &activation_strength,
-                    &context_inhibition,
-                    &event.use_count,
-                    &event.success_count,
-                ],
-            )
-            .await?;
-        } else {
-            db.execute(
-                r#"
-WITH updated AS (
-    UPDATE events
-    SET
-        cues_agg = $5,
-        outcome_status = $6,
-        outcome_duration_ms = $7,
-        activation_strength = $8,
-        context_inhibition = $9,
-        use_count = $10,
-        success_count = $11
-    WHERE
-        ctx = $1
-        AND start_seq = $2
-        AND end_seq = $3
-        AND boundary_reason = $4
-    RETURNING event_id
-)
-INSERT INTO events (
-    ctx, start_seq, end_seq, boundary_reason, cues_agg,
-    outcome_status, outcome_duration_ms, activation_strength, context_inhibition,
-    use_count, success_count
-)
-SELECT $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11
-WHERE NOT EXISTS (SELECT 1 FROM updated)
-"#,
-                &[
-                    &event.ctx,
-                    &event.start_seq,
-                    &event.end_seq,
-                    &event.boundary_reason,
-                    &event.cues_agg,
-                    &event.outcome_status,
-                    &event.outcome_duration_ms,
-                    &activation_strength,
-                    &context_inhibition,
-                    &event.use_count,
-                    &event.success_count,
-                ],
-            )
-            .await?;
-        }
-        Ok(())
-    }
-
-    async fn persist_item<C>(&self, db: &C, item: &MemoryItemRecord) -> Result<(), StorageError>
-    where
-        C: GenericClient + Sync,
-    {
-        let confidence = item.confidence as f32;
-        let activation_strength = item.activation_strength as f32;
-        db.execute(
-            r#"
-INSERT INTO memory_items (
-    memory_id, event_id, item_type, content, confidence, cues_signature, activation_strength
-)
-VALUES ($1,$2,$3,$4,$5,$6,$7)
-ON CONFLICT (memory_id) DO NOTHING
-"#,
-            &[
-                &item.memory_id,
-                &item.event_id,
-                &item.item_type,
-                &item.content,
-                &confidence,
-                &item.cues_signature,
-                &activation_strength,
-            ],
-        )
-        .await?;
-        Ok(())
-    }
-
-    async fn apply_reactivation<C>(
-        &self,
-        db: &C,
-        dedupe_key: &str,
-        parsed: &ReactivationPayload,
-    ) -> Result<(), StorageError>
-    where
-        C: GenericClient + Sync,
-    {
-        for ev in &parsed.events {
-            db.execute(
-                r#"
-WITH marker AS (
-    INSERT INTO storage_reactivation_applied (dedupe_key, event_id, used, outcome_ok)
-    VALUES ($1, $2, $3, $4)
-    ON CONFLICT (dedupe_key, event_id) DO NOTHING
-    RETURNING 1
-)
-UPDATE events SET
-    activation_strength = CASE
-        WHEN $3 THEN LEAST(COALESCE(activation_strength, 0.5) * 1.1, 1.0)
-        ELSE GREATEST(COALESCE(activation_strength, 0.5) * 0.95, 0.1)
-    END,
-    use_count = COALESCE(use_count, 0) + CASE WHEN $3 THEN 1 ELSE 0 END,
-    success_count = COALESCE(success_count, 0) + CASE WHEN $3 AND $4 THEN 1 ELSE 0 END,
-    last_used_at = CASE WHEN $3 THEN now() ELSE last_used_at END
-WHERE event_id = $2
-  AND EXISTS (SELECT 1 FROM marker)
-"#,
-                &[&dedupe_key, &ev.event_id, &ev.used, &parsed.outcome_ok],
-            )
-            .await?;
-        }
         Ok(())
     }
 
@@ -2313,232 +1950,9 @@ WHERE cognition_episodes.source_turn <= EXCLUDED.source_turn
     }
 }
 
-async fn run_events_loop(
-    endpoint: String,
-    use_durable_consumer: bool,
-    storage: Arc<Storage>,
-    nats_subscribe_errors: Arc<AtomicU64>,
-    storage_handler_errors: Arc<AtomicU64>,
-) {
-    run_subject_loop(
-        endpoint,
-        SUBJECT_STORAGE_EVENTS,
-        11,
-        use_durable_consumer.then_some(DURABLE_QUEUE_EVENTS),
-        storage,
-        HandlerKind::Events,
-        nats_subscribe_errors,
-        storage_handler_errors,
-    )
-    .await;
-}
-
-async fn run_items_loop(
-    endpoint: String,
-    use_durable_consumer: bool,
-    storage: Arc<Storage>,
-    nats_subscribe_errors: Arc<AtomicU64>,
-    storage_handler_errors: Arc<AtomicU64>,
-) {
-    run_subject_loop(
-        endpoint,
-        SUBJECT_STORAGE_ITEMS,
-        12,
-        use_durable_consumer.then_some(DURABLE_QUEUE_ITEMS),
-        storage,
-        HandlerKind::Items,
-        nats_subscribe_errors,
-        storage_handler_errors,
-    )
-    .await;
-}
-
-async fn run_reactivation_loop(
-    endpoint: String,
-    use_durable_consumer: bool,
-    storage: Arc<Storage>,
-    nats_subscribe_errors: Arc<AtomicU64>,
-    storage_handler_errors: Arc<AtomicU64>,
-) {
-    run_subject_loop(
-        endpoint,
-        SUBJECT_STORAGE_REACTIVATION,
-        13,
-        use_durable_consumer.then_some(DURABLE_QUEUE_REACTIVATION),
-        storage,
-        HandlerKind::Reactivation,
-        nats_subscribe_errors,
-        storage_handler_errors,
-    )
-    .await;
-}
-
-async fn run_cognition_threads_loop(
-    endpoint: String,
-    use_durable_consumer: bool,
-    storage: Arc<Storage>,
-    nats_subscribe_errors: Arc<AtomicU64>,
-    storage_handler_errors: Arc<AtomicU64>,
-) {
-    run_subject_loop(
-        endpoint,
-        SUBJECT_STORAGE_COGNITION_THREADS,
-        14,
-        use_durable_consumer.then_some(DURABLE_QUEUE_COGNITION_THREADS),
-        storage,
-        HandlerKind::CognitionThreads,
-        nats_subscribe_errors,
-        storage_handler_errors,
-    )
-    .await;
-}
-
-async fn run_cognition_contexts_loop(
-    endpoint: String,
-    use_durable_consumer: bool,
-    storage: Arc<Storage>,
-    nats_subscribe_errors: Arc<AtomicU64>,
-    storage_handler_errors: Arc<AtomicU64>,
-) {
-    run_subject_loop(
-        endpoint,
-        SUBJECT_STORAGE_COGNITION_CONTEXTS,
-        15,
-        use_durable_consumer.then_some(DURABLE_QUEUE_COGNITION_CONTEXTS),
-        storage,
-        HandlerKind::CognitionContexts,
-        nats_subscribe_errors,
-        storage_handler_errors,
-    )
-    .await;
-}
-
-async fn run_cognition_reasons_loop(
-    endpoint: String,
-    use_durable_consumer: bool,
-    storage: Arc<Storage>,
-    nats_subscribe_errors: Arc<AtomicU64>,
-    storage_handler_errors: Arc<AtomicU64>,
-) {
-    run_subject_loop(
-        endpoint,
-        SUBJECT_STORAGE_COGNITION_REASONS,
-        16,
-        use_durable_consumer.then_some(DURABLE_QUEUE_COGNITION_REASONS),
-        storage,
-        HandlerKind::CognitionReasons,
-        nats_subscribe_errors,
-        storage_handler_errors,
-    )
-    .await;
-}
-
-async fn run_cognition_cooccurrences_loop(
-    endpoint: String,
-    use_durable_consumer: bool,
-    storage: Arc<Storage>,
-    nats_subscribe_errors: Arc<AtomicU64>,
-    storage_handler_errors: Arc<AtomicU64>,
-) {
-    run_subject_loop(
-        endpoint,
-        SUBJECT_STORAGE_COGNITION_COOCCURRENCES,
-        17,
-        use_durable_consumer.then_some(DURABLE_QUEUE_COGNITION_COOCCURRENCES),
-        storage,
-        HandlerKind::CognitionCooccurrences,
-        nats_subscribe_errors,
-        storage_handler_errors,
-    )
-    .await;
-}
-
-async fn run_cognition_scopes_loop(
-    endpoint: String,
-    use_durable_consumer: bool,
-    storage: Arc<Storage>,
-    nats_subscribe_errors: Arc<AtomicU64>,
-    storage_handler_errors: Arc<AtomicU64>,
-) {
-    run_subject_loop(
-        endpoint,
-        SUBJECT_STORAGE_COGNITION_SCOPES,
-        18,
-        use_durable_consumer.then_some(DURABLE_QUEUE_COGNITION_SCOPES),
-        storage,
-        HandlerKind::CognitionScopes,
-        nats_subscribe_errors,
-        storage_handler_errors,
-    )
-    .await;
-}
-
-async fn run_cognition_scope_instances_loop(
-    endpoint: String,
-    use_durable_consumer: bool,
-    storage: Arc<Storage>,
-    nats_subscribe_errors: Arc<AtomicU64>,
-    storage_handler_errors: Arc<AtomicU64>,
-) {
-    run_subject_loop(
-        endpoint,
-        SUBJECT_STORAGE_COGNITION_SCOPE_INSTANCES,
-        19,
-        use_durable_consumer.then_some(DURABLE_QUEUE_COGNITION_SCOPE_INSTANCES),
-        storage,
-        HandlerKind::CognitionScopeInstances,
-        nats_subscribe_errors,
-        storage_handler_errors,
-    )
-    .await;
-}
-
-async fn run_cognition_memories_loop(
-    endpoint: String,
-    use_durable_consumer: bool,
-    storage: Arc<Storage>,
-    nats_subscribe_errors: Arc<AtomicU64>,
-    storage_handler_errors: Arc<AtomicU64>,
-) {
-    run_subject_loop(
-        endpoint,
-        SUBJECT_STORAGE_COGNITION_MEMORIES,
-        20,
-        use_durable_consumer.then_some(DURABLE_QUEUE_COGNITION_MEMORIES),
-        storage,
-        HandlerKind::CognitionMemories,
-        nats_subscribe_errors,
-        storage_handler_errors,
-    )
-    .await;
-}
-
-async fn run_cognition_episodes_loop(
-    endpoint: String,
-    use_durable_consumer: bool,
-    storage: Arc<Storage>,
-    nats_subscribe_errors: Arc<AtomicU64>,
-    storage_handler_errors: Arc<AtomicU64>,
-) {
-    run_subject_loop(
-        endpoint,
-        SUBJECT_STORAGE_COGNITION_EPISODES,
-        21,
-        use_durable_consumer.then_some(DURABLE_QUEUE_COGNITION_EPISODES),
-        storage,
-        HandlerKind::CognitionEpisodes,
-        nats_subscribe_errors,
-        storage_handler_errors,
-    )
-    .await;
-}
-
 #[derive(Clone, Copy)]
 enum HandlerKind {
     Turns,
-    Events,
-    Items,
-    Reactivation,
     CognitionThreads,
     CognitionContexts,
     CognitionReasons,
@@ -2558,9 +1972,6 @@ struct InboxMetrics {
 fn handler_kind_for_subject(subject: &str) -> Option<HandlerKind> {
     match subject {
         SUBJECT_STORAGE_TURNS => Some(HandlerKind::Turns),
-        SUBJECT_STORAGE_EVENTS => Some(HandlerKind::Events),
-        SUBJECT_STORAGE_ITEMS => Some(HandlerKind::Items),
-        SUBJECT_STORAGE_REACTIVATION => Some(HandlerKind::Reactivation),
         SUBJECT_STORAGE_COGNITION_THREADS => Some(HandlerKind::CognitionThreads),
         SUBJECT_STORAGE_COGNITION_CONTEXTS => Some(HandlerKind::CognitionContexts),
         SUBJECT_STORAGE_COGNITION_REASONS => Some(HandlerKind::CognitionReasons),
@@ -2732,6 +2143,53 @@ async fn answer_cognition_state(
     );
     if let Err(err) = sender.send(reply).await {
         tracing::warn!(error = %err, "sy.storage could not answer a COGNITION_STATE_GET");
+    }
+}
+
+/// The inbox metrics over the mesh (A-70 stage 2b): SY.admin's storage metrics and
+/// SY.orchestrator's boot wait for the database ask here. Read-only counts, so any node may ask;
+/// each answer scans the inbox, so one runs at a time and a request that finds one running is
+/// told so (its caller asks again).
+async fn answer_storage_metrics(
+    storage: Option<Arc<Storage>>,
+    gate: Arc<tokio::sync::Semaphore>,
+    dispatcher: Arc<RouterDispatcher>,
+    msg: Message,
+) {
+    let permit = gate.try_acquire_owned();
+    let response = match (storage, permit) {
+        (_, Err(_)) => StorageMetricsResponse {
+            ok: false,
+            metrics: None,
+            error: Some("sy.storage is answering another metrics request".to_string()),
+        },
+        (Some(storage), Ok(_permit)) => match storage.inbox_metrics_snapshot().await {
+            Ok(metrics) => StorageMetricsResponse {
+                ok: true,
+                metrics: Some(metrics),
+                error: None,
+            },
+            Err(err) => StorageMetricsResponse {
+                ok: false,
+                metrics: None,
+                error: Some(err.to_string()),
+            },
+        },
+        (None, Ok(_)) => StorageMetricsResponse {
+            ok: false,
+            metrics: None,
+            error: Some("sy.storage has no database".to_string()),
+        },
+    };
+    let sender = dispatcher.sender_snapshot();
+    let reply = build_system_reply(
+        &sender,
+        &msg,
+        MSG_STORAGE_METRICS_RESPONSE,
+        serde_json::to_value(response).unwrap_or(Value::Null),
+    );
+    if let Err(err) = sender.send(reply).await {
+        tracing::warn!(error = %err, "sy.storage could not answer a STORAGE_METRICS_GET");
     }
 }
 
@@ -2931,354 +2389,12 @@ fn truncate_error(input: &str, max_len: usize) -> String {
     input.chars().take(max_len).collect()
 }
 
-async fn run_subject_loop(
-    endpoint: String,
-    subject: &str,
-    sid: u32,
-    durable_queue: Option<&'static str>,
-    storage: Arc<Storage>,
-    kind: HandlerKind,
-    nats_subscribe_errors: Arc<AtomicU64>,
-    storage_handler_errors: Arc<AtomicU64>,
-) {
-    loop {
-        let subscriber = if let Some(queue) = durable_queue {
-            RouterNatsSubscriber::new(endpoint.clone(), subject.to_string(), sid).with_queue(queue)
-        } else {
-            RouterNatsSubscriber::new(endpoint.clone(), subject.to_string(), sid)
-        };
-        let worker = Arc::clone(&storage);
-        let subject_name = subject.to_string();
-        let nats_subscribe_errors = Arc::clone(&nats_subscribe_errors);
-        let storage_handler_errors = Arc::clone(&storage_handler_errors);
-        let run_result = subscriber
-            .run(move |payload| {
-                let worker = Arc::clone(&worker);
-                let subject_name = subject_name.clone();
-                let storage_handler_errors = Arc::clone(&storage_handler_errors);
-                async move {
-                    let result = worker.ingest_message(&subject_name, kind, &payload).await;
-                    if let Err(err) = result {
-                        let count = storage_handler_errors.fetch_add(1, Ordering::Relaxed) + 1;
-                        if count == 1 || count % NATS_ERROR_LOG_EVERY == 0 {
-                            tracing::warn!(
-                                subject = %subject_name,
-                                error = %err,
-                                failures = count,
-                                "storage handler failed"
-                            );
-                        }
-                        return Err(std::io::Error::new(
-                            std::io::ErrorKind::Other,
-                            err.to_string(),
-                        ));
-                    }
-                    Ok(())
-                }
-            })
-            .await;
-        if let Err(err) = run_result {
-            let count = nats_subscribe_errors.fetch_add(1, Ordering::Relaxed) + 1;
-            if count == 1 || count % NATS_ERROR_LOG_EVERY == 0 {
-                tracing::warn!(
-                    subject = %subject,
-                    error = %err,
-                    failures = count,
-                    "nats subscribe loop failed; retrying"
-                );
-            }
-        }
-        time::sleep(Duration::from_secs(1)).await;
-    }
-}
-
-async fn run_storage_metrics_query_loop(
-    config_dir: PathBuf,
-    storage: Option<Arc<Storage>>,
-    nats_subscribe_errors: Arc<AtomicU64>,
-    storage_handler_errors: Arc<AtomicU64>,
-) {
-    loop {
-        let subscriber = match subscribe_local(
-            &config_dir,
-            SUBJECT_STORAGE_METRICS_GET.to_string(),
-            STORAGE_METRICS_QUERY_SID,
-        ) {
-            Ok(subscriber) => subscriber,
-            Err(err) => {
-                let count = nats_subscribe_errors.fetch_add(1, Ordering::Relaxed) + 1;
-                if count == 1 || count % NATS_ERROR_LOG_EVERY == 0 {
-                    tracing::warn!(
-                        subject = SUBJECT_STORAGE_METRICS_GET,
-                        error = %err,
-                        failures = count,
-                        "storage metrics nats subscribe setup failed; retrying"
-                    );
-                }
-                time::sleep(Duration::from_secs(1)).await;
-                continue;
-            }
-        };
-        let storage = storage.clone();
-        let config_dir_out = config_dir.clone();
-        let nats_subscribe_errors = Arc::clone(&nats_subscribe_errors);
-        let storage_handler_errors = Arc::clone(&storage_handler_errors);
-        let run_result = subscriber
-            .run(move |msg| {
-                let storage = storage.clone();
-                let config_dir_out = config_dir_out.clone();
-                let storage_handler_errors = Arc::clone(&storage_handler_errors);
-                async move {
-                    tracing::info!(
-                        request_subject = SUBJECT_STORAGE_METRICS_GET,
-                        message_subject = %msg.subject,
-                        sid = %msg.sid,
-                        reply_to = ?msg.reply_to,
-                        payload_bytes = msg.payload.len(),
-                        "storage metrics nats raw message received"
-                    );
-                    let req: NatsRequestEnvelope<Value> = match serde_json::from_slice(&msg.payload)
-                    {
-                        Ok(req) => req,
-                        Err(err) => {
-                            tracing::warn!(
-                                error = %err,
-                                subject = SUBJECT_STORAGE_METRICS_GET,
-                                payload_bytes = msg.payload.len(),
-                                "invalid storage metrics request payload"
-                            );
-                            return Ok(());
-                        }
-                    };
-                    if req.schema_version != NATS_ENVELOPE_SCHEMA_VERSION {
-                        tracing::warn!(
-                            trace_id = %req.trace_id,
-                            subject = SUBJECT_STORAGE_METRICS_GET,
-                            schema_version = req.schema_version,
-                            expected_schema_version = NATS_ENVELOPE_SCHEMA_VERSION,
-                            "storage metrics request rejected due to schema version mismatch"
-                        );
-                        if !req.reply_subject.trim().is_empty() {
-                            let response =
-                                NatsResponseEnvelope::<StorageInboxMetricsSnapshot>::error(
-                                    SUBJECT_STORAGE_METRICS_GET,
-                                    req.trace_id.clone(),
-                                    "UNSUPPORTED_SCHEMA_VERSION",
-                                    format!(
-                                        "unsupported schema_version={} expected={}",
-                                        req.schema_version, NATS_ENVELOPE_SCHEMA_VERSION
-                                    ),
-                                );
-                            if let Ok(body) = serde_json::to_vec(&response) {
-                                let _ = client_nats_publish_local(
-                                    &config_dir_out,
-                                    &req.reply_subject,
-                                    &body,
-                                )
-                                .await;
-                            }
-                        }
-                        return Ok(());
-                    }
-                    if req.action != SUBJECT_STORAGE_METRICS_GET {
-                        tracing::warn!(
-                            trace_id = %req.trace_id,
-                            subject = SUBJECT_STORAGE_METRICS_GET,
-                            action = %req.action,
-                            "storage metrics request rejected due to action mismatch"
-                        );
-                        if !req.reply_subject.trim().is_empty() {
-                            let response =
-                                NatsResponseEnvelope::<StorageInboxMetricsSnapshot>::error(
-                                    SUBJECT_STORAGE_METRICS_GET,
-                                    req.trace_id.clone(),
-                                    "ACTION_MISMATCH",
-                                    format!(
-                                        "action mismatch expected={} got={}",
-                                        SUBJECT_STORAGE_METRICS_GET, req.action
-                                    ),
-                                );
-                            if let Ok(body) = serde_json::to_vec(&response) {
-                                let _ = client_nats_publish_local(
-                                    &config_dir_out,
-                                    &req.reply_subject,
-                                    &body,
-                                )
-                                .await;
-                            }
-                        }
-                        return Ok(());
-                    }
-                    if req.reply_subject.trim().is_empty() {
-                        tracing::warn!(
-                            subject = SUBJECT_STORAGE_METRICS_GET,
-                            "storage metrics request missing reply_subject"
-                        );
-                        return Ok(());
-                    }
-                    let request_started = Instant::now();
-                    let trace_id = req.trace_id.clone();
-                    let reply_subject = req.reply_subject.clone();
-                    tracing::info!(
-                        trace_id = %trace_id,
-                        request_subject = SUBJECT_STORAGE_METRICS_GET,
-                        reply_subject = %reply_subject,
-                        payload_bytes = msg.payload.len(),
-                        "storage metrics nats request received"
-                    );
-
-                    let db_started = Instant::now();
-                    tracing::debug!(
-                        trace_id = %trace_id,
-                        request_subject = SUBJECT_STORAGE_METRICS_GET,
-                        reply_subject = %reply_subject,
-                        "storage metrics db snapshot start"
-                    );
-                    let (response, response_status) = match storage.as_ref() {
-                        Some(storage) => match storage.inbox_metrics_snapshot().await {
-                            Ok(metrics) => {
-                                tracing::debug!(
-                                    trace_id = %trace_id,
-                                    request_subject = SUBJECT_STORAGE_METRICS_GET,
-                                    reply_subject = %reply_subject,
-                                    pending = metrics.pending,
-                                    pending_with_error = metrics.pending_with_error,
-                                    oldest_pending_age_s = metrics.oldest_pending_age_s,
-                                    max_attempts = metrics.max_attempts,
-                                    processed_total = metrics.processed_total,
-                                    "storage metrics db snapshot success"
-                                );
-                                (
-                                    NatsResponseEnvelope::ok(
-                                        SUBJECT_STORAGE_METRICS_GET,
-                                        trace_id.clone(),
-                                        metrics,
-                                    ),
-                                    "ok",
-                                )
-                            }
-                            Err(err) => {
-                                tracing::warn!(
-                                    trace_id = %trace_id,
-                                    request_subject = SUBJECT_STORAGE_METRICS_GET,
-                                    reply_subject = %reply_subject,
-                                    error = %err,
-                                    "storage metrics db snapshot failed"
-                                );
-                                (
-                                    NatsResponseEnvelope::<StorageInboxMetricsSnapshot>::error(
-                                        SUBJECT_STORAGE_METRICS_GET,
-                                        trace_id.clone(),
-                                        "STORAGE_METRICS_UNAVAILABLE",
-                                        err.to_string(),
-                                    ),
-                                    "error",
-                                )
-                            }
-                        },
-                        None => (
-                            NatsResponseEnvelope::<StorageInboxMetricsSnapshot>::error(
-                                SUBJECT_STORAGE_METRICS_GET,
-                                trace_id.clone(),
-                                "STORAGE_NOT_READY",
-                                "storage backend not initialized; configure DB secret and restart sy-storage".to_string(),
-                            ),
-                            "error",
-                        ),
-                    };
-                    let db_elapsed_ms = db_started.elapsed().as_millis() as u64;
-                    tracing::info!(
-                        trace_id = %trace_id,
-                        request_subject = SUBJECT_STORAGE_METRICS_GET,
-                        reply_subject = %reply_subject,
-                        status = response_status,
-                        db_elapsed_ms = db_elapsed_ms,
-                        "storage metrics db snapshot finished"
-                    );
-                    let body = serde_json::to_vec(&response)
-                        .map_err(|err| ClientNatsError::Protocol(err.to_string()))?;
-                    tracing::debug!(
-                        trace_id = %trace_id,
-                        request_subject = SUBJECT_STORAGE_METRICS_GET,
-                        reply_subject = %reply_subject,
-                        response_bytes = body.len(),
-                        status = response_status,
-                        "storage metrics response serialized"
-                    );
-                    let publish_started = Instant::now();
-                    tracing::debug!(
-                        trace_id = %trace_id,
-                        request_subject = SUBJECT_STORAGE_METRICS_GET,
-                        reply_subject = %reply_subject,
-                        response_bytes = body.len(),
-                        "storage metrics response publish start"
-                    );
-                    if let Err(err) =
-                        client_nats_publish_local(&config_dir_out, &reply_subject, &body).await
-                    {
-                        let count = storage_handler_errors.fetch_add(1, Ordering::Relaxed) + 1;
-                        let publish_elapsed_ms = publish_started.elapsed().as_millis() as u64;
-                        let total_elapsed_ms = request_started.elapsed().as_millis() as u64;
-                        if count == 1 || count % NATS_ERROR_LOG_EVERY == 0 {
-                            tracing::warn!(
-                                trace_id = %trace_id,
-                                error = %err,
-                                failures = count,
-                                request_subject = SUBJECT_STORAGE_METRICS_GET,
-                                reply_subject = %reply_subject,
-                                db_elapsed_ms = db_elapsed_ms,
-                                publish_elapsed_ms = publish_elapsed_ms,
-                                total_elapsed_ms = total_elapsed_ms,
-                                subject = SUBJECT_STORAGE_METRICS_GET,
-                                "storage metrics response publish failed"
-                            );
-                        }
-                        return Err(err);
-                    }
-                    let publish_elapsed_ms = publish_started.elapsed().as_millis() as u64;
-                    let total_elapsed_ms = request_started.elapsed().as_millis() as u64;
-                    tracing::debug!(
-                        trace_id = %trace_id,
-                        request_subject = SUBJECT_STORAGE_METRICS_GET,
-                        reply_subject = %reply_subject,
-                        status = response_status,
-                        db_elapsed_ms = db_elapsed_ms,
-                        publish_elapsed_ms = publish_elapsed_ms,
-                        total_elapsed_ms = total_elapsed_ms,
-                        "storage metrics nats response sent"
-                    );
-                    Ok(())
-                }
-            })
-            .await;
-
-        if let Err(err) = run_result {
-            let count = nats_subscribe_errors.fetch_add(1, Ordering::Relaxed) + 1;
-            if count == 1 || count % NATS_ERROR_LOG_EVERY == 0 {
-                tracing::warn!(
-                    subject = SUBJECT_STORAGE_METRICS_GET,
-                    error = %err,
-                    failures = count,
-                    "storage metrics nats loop failed; retrying"
-                );
-            }
-        }
-        time::sleep(Duration::from_secs(1)).await;
-    }
-}
-
-async fn run_storage_metrics_loop(
-    storage: Arc<Storage>,
-    nats_subscribe_errors: Arc<AtomicU64>,
-    storage_handler_errors: Arc<AtomicU64>,
-) {
+async fn run_storage_metrics_loop(storage: Arc<Storage>) {
     let mut ticker = time::interval(Duration::from_secs(STORAGE_METRICS_LOG_INTERVAL_SECS));
     loop {
         ticker.tick().await;
         match storage.inbox_metrics().await {
             Ok(metrics) => {
-                let subscribe_failures = nats_subscribe_errors.load(Ordering::Relaxed);
-                let handler_failures = storage_handler_errors.load(Ordering::Relaxed);
                 if metrics.pending >= STORAGE_METRICS_WARN_PENDING
                     || metrics.oldest_pending_age_s >= STORAGE_METRICS_WARN_AGE_SECS
                     || metrics.pending_with_error > 0
@@ -3287,8 +2403,6 @@ async fn run_storage_metrics_loop(
                         pending = metrics.pending,
                         pending_with_error = metrics.pending_with_error,
                         oldest_pending_age_s = metrics.oldest_pending_age_s,
-                        nats_subscribe_failures = subscribe_failures,
-                        storage_handler_failures = handler_failures,
                         "storage inbox lag is above threshold"
                     );
                 } else {
@@ -3296,8 +2410,6 @@ async fn run_storage_metrics_loop(
                         pending = metrics.pending,
                         pending_with_error = metrics.pending_with_error,
                         oldest_pending_age_s = metrics.oldest_pending_age_s,
-                        nats_subscribe_failures = subscribe_failures,
-                        storage_handler_failures = handler_failures,
                         "storage inbox metrics"
                     );
                 }
@@ -3362,7 +2474,6 @@ async fn resolve_database_url(
         ),
     }
 }
-
 
 fn extract_postgres_url_from_vault_value(value: &Value) -> Option<String> {
     if let Some(s) = value.as_str().map(str::trim).filter(|v| !v.is_empty()) {
@@ -3507,120 +2618,6 @@ fn parse_turn(value: Value) -> Result<TurnRecord, StorageError> {
     })
 }
 
-fn parse_event(value: Value) -> Result<EventRecord, StorageError> {
-    let event_root = if value.get("event").is_some() {
-        value.get("event").cloned().unwrap_or(Value::Null)
-    } else {
-        value
-    };
-    if !event_root.is_object() {
-        return Err(missing_field("event"));
-    }
-
-    let ctx = required_str(&event_root, &["ctx"], "ctx")?;
-    let start_seq = required_i64(&event_root, &["start_seq"], "start_seq")?;
-    let end_seq = required_i64(&event_root, &["end_seq"], "end_seq")?;
-    if end_seq < start_seq {
-        return Err("invalid payload: end_seq < start_seq".into());
-    }
-    let boundary_reason = required_str(&event_root, &["boundary_reason"], "boundary_reason")?;
-
-    let mut cues_agg = get_string_vec(&event_root, &["cues_agg"])
-        .or_else(|| get_string_vec(&event_root, &["tags"]))
-        .unwrap_or_default();
-    if cues_agg.is_empty() {
-        return Err(missing_field("cues_agg|tags"));
-    }
-    dedup_sort(&mut cues_agg);
-
-    Ok(EventRecord {
-        event_id: get_i64(&event_root, &["event_id"]),
-        ctx,
-        start_seq,
-        end_seq,
-        boundary_reason,
-        cues_agg,
-        outcome_status: get_str(&event_root, &["outcome_status"]),
-        outcome_duration_ms: get_i64(&event_root, &["outcome_duration_ms"]),
-        activation_strength: get_f64(&event_root, &["activation_strength"]).unwrap_or(0.5),
-        context_inhibition: get_f64(&event_root, &["context_inhibition"]).unwrap_or(0.0),
-        use_count: get_i64(&event_root, &["use_count"]).unwrap_or(0) as i32,
-        success_count: get_i64(&event_root, &["success_count"]).unwrap_or(0) as i32,
-    })
-}
-
-fn parse_memory_item(value: Value) -> Result<MemoryItemRecord, StorageError> {
-    let item_root = if value.get("item").is_some() {
-        value.get("item").cloned().unwrap_or(Value::Null)
-    } else {
-        value
-    };
-    if !item_root.is_object() {
-        return Err(missing_field("item"));
-    }
-
-    let content = required_value(&item_root, &["content"], "content")?.clone();
-    let item_type = required_str(&item_root, &["item_type"], "item_type")?;
-    let confidence = required_f64(&item_root, &["confidence"], "confidence")?;
-
-    let mut cues_signature = get_string_vec(&item_root, &["cues_signature"])
-        .or_else(|| get_string_vec(&item_root, &["tags"]))
-        .unwrap_or_default();
-    if cues_signature.is_empty() {
-        return Err(missing_field("cues_signature|tags"));
-    }
-    dedup_sort(&mut cues_signature);
-
-    let memory_id = get_str(&item_root, &["memory_id"]).unwrap_or_else(|| {
-        let canonical = serde_json::to_string(&item_root).unwrap_or_else(|_| "item".to_string());
-        format!("mid-{:x}", stable_u64(&canonical))
-    });
-
-    Ok(MemoryItemRecord {
-        memory_id,
-        event_id: get_i64(&item_root, &["event_id"]),
-        item_type,
-        content,
-        confidence,
-        cues_signature,
-        activation_strength: get_f64(&item_root, &["activation_strength"]).unwrap_or(0.5),
-    })
-}
-
-#[derive(Debug)]
-struct ReactivationEventUse {
-    event_id: i64,
-    used: bool,
-}
-
-#[derive(Debug)]
-struct ReactivationPayload {
-    outcome_ok: bool,
-    events: Vec<ReactivationEventUse>,
-}
-
-fn parse_reactivation_payload(value: Value) -> Result<ReactivationPayload, StorageError> {
-    let outcome_ok =
-        get_str(&value, &["outcome", "status"]).is_some_and(|s| s.eq_ignore_ascii_case("resolved"));
-
-    let events = get_array(&value, &["reactivated", "events"])
-        .or_else(|| get_array(&value, &["events"]))
-        .ok_or_else(|| missing_field("reactivated.events|events"))?;
-
-    let mut parsed = Vec::with_capacity(events.len());
-    for (idx, ev) in events.iter().enumerate() {
-        let field = format!("events[{idx}].event_id");
-        let event_id = required_i64(ev, &["event_id"], &field)?;
-        let used = get_bool(ev, &["used"]).unwrap_or(false);
-        parsed.push(ReactivationEventUse { event_id, used });
-    }
-
-    Ok(ReactivationPayload {
-        outcome_ok,
-        events: parsed,
-    })
-}
-
 fn parse_cognition_envelope<T>(
     payload: &[u8],
     expected: CognitionDurableEntity,
@@ -3674,24 +2671,8 @@ fn missing_field(field: &str) -> StorageError {
     format!("invalid payload: missing or invalid {field}").into()
 }
 
-fn required_value<'a>(
-    value: &'a Value,
-    path: &[&str],
-    field: &str,
-) -> Result<&'a Value, StorageError> {
-    get_value(value, path).ok_or_else(|| missing_field(field))
-}
-
 fn required_str(value: &Value, path: &[&str], field: &str) -> Result<String, StorageError> {
     get_str(value, path).ok_or_else(|| missing_field(field))
-}
-
-fn required_i64(value: &Value, path: &[&str], field: &str) -> Result<i64, StorageError> {
-    get_i64(value, path).ok_or_else(|| missing_field(field))
-}
-
-fn required_f64(value: &Value, path: &[&str], field: &str) -> Result<f64, StorageError> {
-    get_f64(value, path).ok_or_else(|| missing_field(field))
 }
 
 fn get_value<'a>(value: &'a Value, path: &[&str]) -> Option<&'a Value> {
@@ -3718,27 +2699,6 @@ fn get_i64(value: &Value, path: &[&str]) -> Option<i64> {
     v.as_str()?.parse::<i64>().ok()
 }
 
-fn get_f64(value: &Value, path: &[&str]) -> Option<f64> {
-    let v = get_value(value, path)?;
-    if let Some(f) = v.as_f64() {
-        return Some(f);
-    }
-    v.as_str()?.parse::<f64>().ok()
-}
-
-fn get_bool(value: &Value, path: &[&str]) -> Option<bool> {
-    let v = get_value(value, path)?;
-    if let Some(b) = v.as_bool() {
-        return Some(b);
-    }
-    let s = v.as_str()?.trim().to_ascii_lowercase();
-    match s.as_str() {
-        "true" | "1" | "yes" => Some(true),
-        "false" | "0" | "no" => Some(false),
-        _ => None,
-    }
-}
-
 fn get_string_vec(value: &Value, path: &[&str]) -> Option<Vec<String>> {
     let array = get_value(value, path)?.as_array()?;
     let mut out = Vec::new();
@@ -3751,10 +2711,6 @@ fn get_string_vec(value: &Value, path: &[&str]) -> Option<Vec<String>> {
         }
     }
     Some(out)
-}
-
-fn get_array<'a>(value: &'a Value, path: &[&str]) -> Option<&'a Vec<Value>> {
-    get_value(value, path)?.as_array()
 }
 
 fn dedup_sort(values: &mut Vec<String>) {
@@ -3798,11 +2754,11 @@ fn build_storage_rpc_profile() -> Result<OperationalRouteProfile, fluxbee_sdk::R
 /// stayed disconnected).
 ///
 /// Exit-based reconnect is chosen over hot-swap because the storage
-/// backend is plumbed into 13 workers (`run_turns_loop`, `run_events_loop`,
-/// ...) by Arc-cloned ownership at boot. Restart is one line; hot-swap
-/// would require an Arc<RwLock<Option<...>>> migration across all
-/// workers. For rotations, restart momentarily interrupts traffic but is
-/// idempotent on the inbox-replay path.
+/// backend is handed to its tasks (the stream ingest, the inbox maintenance,
+/// the metrics and state answers) by Arc-cloned ownership at boot. Restart is
+/// one line; hot-swap would require an Arc<RwLock<Option<...>>> migration
+/// across all of them. For rotations, a restart only pauses the streams'
+/// deliveries, which wait on disk for the next ack.
 fn handle_vault_secret_changed(
     msg: &Message,
     control_state: &StorageControlState,

@@ -2,8 +2,8 @@
 //!
 //! A short, best-effort log of what this router copies (turns) and what its nodes append, kept on
 //! disk for a small window and delivered in acked batches to its sinks over the fluxbee socket. It
-//! replaces the embedded NATS broker for the log plane: the router only hands a record to a bounded
-//! queue and never waits (D6); the disk work runs on a thread of its own (D13); delivery runs on
+//! is the log plane: the router only hands a record to a bounded queue and never waits (D6); the
+//! disk work runs on a thread of its own (D13); delivery runs on
 //! tasks of a node of this router, `RT.<router>.stream@<hive>` (D3), so it goes through the normal
 //! routing paths and the gateway's LSA announces it.
 

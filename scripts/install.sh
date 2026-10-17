@@ -201,7 +201,6 @@ INSTALL_RESTART_SERVICES=(
   "sy-storage"
   "sy-identity"
   "sy-cognition"
-  "sy-policy"
   "sy-timer"
   "sy-frontdesk-gov"
   "sy-vault"
@@ -334,7 +333,6 @@ sudo install -d "$STATE_DIR/state/io-blob"
 sudo install -d "$STATE_DIR/syncthing"
 sudo install -d "$STATE_DIR/vendor"
 sudo install -d "$STATE_DIR/vendor/bin"
-sudo install -d "$STATE_DIR/nats"
 sudo install -d "$STATE_DIR/dist"
 sudo install -d "$STATE_DIR/dist/runtimes"
 sudo install -d "$STATE_DIR/dist/core"
@@ -410,7 +408,6 @@ sy_orch_bin="$(pick_bin sy_orchestrator)" || { echo "Missing binary: $BIN_DIR/sy
 sy_storage_bin="$(pick_bin sy_storage)" || { echo "Missing binary: $BIN_DIR/sy_storage" >&2; missing=1; }
 sy_identity_bin="$(pick_bin sy_identity)" || { echo "Missing binary: $BIN_DIR/sy_identity" >&2; missing=1; }
 sy_cognition_bin="$(pick_bin sy_cognition)" || { echo "Missing binary: $BIN_DIR/sy_cognition" >&2; missing=1; }
-sy_policy_bin="$(pick_bin sy_policy)" || { echo "Missing binary: $BIN_DIR/sy_policy" >&2; missing=1; }
 sy_edge_bin="$(pick_bin sy_edge)" || { echo "Missing binary: $BIN_DIR/sy_edge" >&2; missing=1; }
 sy_frontdesk_gov_bin="$(pick_bin sy-frontdesk-gov)" || { echo "Missing binary: $BIN_DIR/sy-frontdesk-gov" >&2; missing=1; }
 sy_opa_rules_bin=""
@@ -470,7 +467,6 @@ sudo install -m 0755 "$sy_orch_bin" /usr/bin/sy-orchestrator
 sudo install -m 0755 "$sy_storage_bin" /usr/bin/sy-storage
 sudo install -m 0755 "$sy_identity_bin" /usr/bin/sy-identity
 sudo install -m 0755 "$sy_cognition_bin" /usr/bin/sy-cognition
-sudo install -m 0755 "$sy_policy_bin" /usr/bin/sy-policy
 sudo install -m 0755 "$sy_edge_bin" /usr/bin/sy-edge
 sudo install -m 0755 "$sy_opa_rules_bin" /usr/bin/sy-opa-rules
 sudo install -m 0755 "$sy_timer_bin" /usr/bin/sy-timer
@@ -491,7 +487,6 @@ sudo install -m 0755 "$sy_orch_bin" "$STATE_DIR/dist/core/bin/sy-orchestrator"
 sudo install -m 0755 "$sy_storage_bin" "$STATE_DIR/dist/core/bin/sy-storage"
 sudo install -m 0755 "$sy_identity_bin" "$STATE_DIR/dist/core/bin/sy-identity"
 sudo install -m 0755 "$sy_cognition_bin" "$STATE_DIR/dist/core/bin/sy-cognition"
-sudo install -m 0755 "$sy_policy_bin" "$STATE_DIR/dist/core/bin/sy-policy"
 sudo install -m 0755 "$sy_edge_bin" "$STATE_DIR/dist/core/bin/sy-edge"
 sudo install -m 0755 "$sy_opa_rules_bin" "$STATE_DIR/dist/core/bin/sy-opa-rules"
 sudo install -m 0755 "$sy_timer_bin" "$STATE_DIR/dist/core/bin/sy-timer"
@@ -517,8 +512,6 @@ sy_storage_sha="$(sha256sum "$STATE_DIR/dist/core/bin/sy-storage" | awk '{print 
 sy_storage_size="$(stat -c %s "$STATE_DIR/dist/core/bin/sy-storage")"
 sy_cognition_sha="$(sha256sum "$STATE_DIR/dist/core/bin/sy-cognition" | awk '{print $1}')"
 sy_cognition_size="$(stat -c %s "$STATE_DIR/dist/core/bin/sy-cognition")"
-sy_policy_sha="$(sha256sum "$STATE_DIR/dist/core/bin/sy-policy" | awk '{print $1}')"
-sy_policy_size="$(stat -c %s "$STATE_DIR/dist/core/bin/sy-policy")"
 sy_edge_sha="$(sha256sum "$STATE_DIR/dist/core/bin/sy-edge" | awk '{print $1}')"
 sy_edge_size="$(stat -c %s "$STATE_DIR/dist/core/bin/sy-edge")"
 sy_timer_sha="$(sha256sum "$STATE_DIR/dist/core/bin/sy-timer" | awk '{print $1}')"
@@ -556,7 +549,6 @@ cat >"$core_manifest_tmp" <<EOF
     "sy-orchestrator": {"service": "sy-orchestrator", "version": "$core_version", "build_id": "$core_build_id", "sha256": "$sy_orch_sha", "size": $sy_orch_size},
     "sy-storage": {"service": "sy-storage", "version": "$core_version", "build_id": "$core_build_id", "sha256": "$sy_storage_sha", "size": $sy_storage_size},
     "sy-cognition": {"service": "sy-cognition", "version": "$core_version", "build_id": "$core_build_id", "sha256": "$sy_cognition_sha", "size": $sy_cognition_size},
-    "sy-policy": {"service": "sy-policy", "version": "$core_version", "build_id": "$core_build_id", "sha256": "$sy_policy_sha", "size": $sy_policy_size},
     "sy-edge": {"service": "sy-edge", "version": "$core_version", "build_id": "$core_build_id", "sha256": "$sy_edge_sha", "size": $sy_edge_size},
     "sy-timer": {"service": "sy-timer", "version": "$core_version", "build_id": "$core_build_id", "sha256": "$sy_timer_sha", "size": $sy_timer_size},
     "sy-wf-rules": {"service": "sy-wf-rules", "version": "$core_version", "build_id": "$core_build_id", "sha256": "$sy_wf_rules_sha", "size": $sy_wf_rules_size},
@@ -612,7 +604,6 @@ verify_core_component "sy-identity" "$sy_identity_sha" "$sy_identity_size"
 verify_core_component "sy-orchestrator" "$sy_orch_sha" "$sy_orch_size"
 verify_core_component "sy-storage" "$sy_storage_sha" "$sy_storage_size"
 verify_core_component "sy-cognition" "$sy_cognition_sha" "$sy_cognition_size"
-verify_core_component "sy-policy" "$sy_policy_sha" "$sy_policy_size"
 verify_core_component "sy-edge" "$sy_edge_sha" "$sy_edge_size"
 verify_core_component "sy-timer" "$sy_timer_sha" "$sy_timer_size"
 verify_core_component "sy-wf-rules" "$sy_wf_rules_sha" "$sy_wf_rules_size"
@@ -1171,7 +1162,6 @@ install_unit "sy-orchestrator" "/usr/bin/sy-orchestrator"
 install_unit "sy-storage" "/usr/bin/sy-storage" "network.target" "" "motherbee"
 install_unit "sy-identity" "/usr/bin/sy-identity" "network.target" "" "motherbee|worker"
 install_unit "sy-cognition" "/usr/bin/sy-cognition"
-install_unit "sy-policy" "/usr/bin/sy-policy"
 install_unit "sy-timer" "/usr/bin/sy-timer"
 install_unit "sy-wf-rules" "/usr/bin/sy-wf-rules"
 install_unit \

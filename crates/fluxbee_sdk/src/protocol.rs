@@ -58,8 +58,6 @@ pub struct Meta {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub thread_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub thread_seq: Option<u64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     /// Legacy/historical field from the pre-thread cognition model.
     pub ctx: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -616,7 +614,6 @@ pub fn build_system_message(
             dst_ilk: None,
             ich: None,
             thread_id: None,
-            thread_seq: None,
             ctx: None,
             ctx_seq: None,
             ctx_window: None,

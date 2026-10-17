@@ -82,7 +82,7 @@ fn assign_vpn(&self, node_name: &str) -> u32 {
 
 Nota de semántica conversacional vigente:
 
-- el router usa `thread_id/thread_seq` como carrier conversacional canónico;
+- el router usa `thread_id` como carrier conversacional canónico; el mensaje no lleva secuencia (el orden de una comunicación es el número de turno de SY.cognition);
 - `meta.ich` identifica el canal local/sistémico involucrado y puede ser relevante para routing o dispatch;
 - `meta.ich` no representa el handle remoto del interlocutor externo.
 
@@ -733,11 +733,12 @@ Cuando no se encuentra destino:
 
 ### 11.1 Rol del Router
 
-El router hoy hace tres cosas relevantes para la conversación:
+El router hoy hace tres cosas relevantes para la conversación. Las copias van al stream del
+propio router (`RT.<router>.stream@<hive>`, ver `13-storage.md`), sin esperar:
 
-1. publica el mensaje en `storage.turns` como evidencia durable
-2. asigna `meta.thread_seq` cuando entra un mensaje con `meta.thread_id` y todavía no tiene secuencia
-3. antes de la entrega local, consulta `jsr-memory-<hive>` para adjuntar `memory_package` si existe snapshot para ese `thread_id`
+1. donde entra un mensaje (salvo los tipos `system`, `admin` y `query_response`), lo copia como `storage.turns`, que va a `SY.storage@motherbee` (el log de mensajes)
+2. donde está conectado un agente (nodo `AI.*`), copia como `cognition.turns` cada turno con `meta.thread_id` que el agente envía o recibe, para el `SY.cognition` de su hive (ni copias de tap ni broadcasts)
+3. antes de la entrega local a un nodo `AI.*`, consulta `jsr-memory-<hive>` para adjuntar el `memory_package` de esa comunicación (`thread_id` + agente), si existe; un paquete que puso el emisor se descarta
 
 ### 11.2 Flujo actual
 
@@ -745,25 +746,17 @@ El router hoy hace tres cosas relevantes para la conversación:
 Mensaje llega
       │
       ▼
-¿Tiene meta.thread_id?
-      │
-  ┌───┴───┐
-  │       │
- NO      SÍ
-  │       │
-  │       ▼
-  │   Asignar thread_seq si falta
-  │       │
-  └───┬───┘
+Copia storage.turns al stream (sin esperar)
       │
       ▼
-Publicar en storage.turns (async)
-      │
+¿Lo envía un nodo AI.* local y tiene meta.thread_id?
+      │ SÍ → copia cognition.turns al stream
       ▼
 Routing / OPA
       │
       ▼
-Intentar enrichment desde jsr-memory
+Entrega local a un nodo AI.* con meta.thread_id:
+  copia cognition.turns + enrichment desde jsr-memory
       │
       ▼
 Forward normal (con o sin memory_package)
@@ -771,7 +764,7 @@ Forward normal (con o sin memory_package)
 
 ### 11.3 Contrato operativo
 
-- `thread_id` y `thread_seq` son el carrier conversacional canónico
+- `thread_id` es el carrier conversacional canónico; `meta.thread_seq` salió del protocolo en 0.1.78
 - `ctx`, `ctx_seq`, `ctx_window` quedan solo como campos legacy/históricos del protocolo
 - el enrichment es fail-open:
   - si `jsr-memory` no está disponible, el router entrega igual

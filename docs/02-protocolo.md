@@ -85,7 +85,6 @@ Usado por OPA para decisiones de capa 2/3, por el router para broadcast filtrado
     "dst_ilk": "ilk:7c9e6679-7425-40de-944b-e07fc1f90ae7",
     "ich": "ich:a1b2c3d4-5678-90ab-cdef-1234567890ab",
     "thread_id": "thread:abc123def456789012345678901234ab",
-    "thread_seq": 47,
     "memory_package": {
       "package_version": 2,
       "thread_id": "thread:abc123def456789012345678901234ab",
@@ -114,11 +113,10 @@ Usado por OPA para decisiones de capa 2/3, por el router para broadcast filtrado
 | `dst_ilk` | string | No | ILK del interlocutor destino (si se conoce) |
 | `ich` | string | Sí (L3) | ICH (Interlocutor Channel) local/sistémico por el cual ingresó o debe salir la comunicación |
 | `thread_id` | string | Sí (L3 canónico) | ID físico del hilo conversacional. Calculado por SDK/IO según tipo de canal |
-| `thread_seq` | integer | Sí (L3 canónico) | Secuencia monotónica dentro de `thread_id`. Asignada por el router |
 | `ctx` | string | Legacy | Carrier viejo de contexto conversacional. Solo compat temporal |
 | `ctx_seq` | integer | Legacy | Carrier viejo de secuencia contextual. Solo compat temporal |
 | `ctx_window` | array | Legacy | Carrier viejo de turns recientes. Solo compat temporal |
-| `memory_package` | object | No | Paquete cognitivo v2. Agregado por router después del routing |
+| `memory_package` | object | No | Paquete cognitivo v2. Agregado por router después del routing, solo al entregar a un nodo `AI.*` |
 | `priority` | string | No | Hint de prioridad para OPA |
 | `context` | object | No | Datos adicionales para reglas OPA |
 | `action` | string | No | Para mensajes admin: acción a ejecutar |
@@ -141,7 +139,7 @@ Nota de contrato:
 
 ### 3.2 Campos de Contexto (ich, ctx, ctx_seq, ctx_window)
 
-### 3.2 Campos Canónicos de Conversación (`ich`, `thread_id`, `thread_seq`)
+### 3.2 Campos Canónicos de Conversación (`ich`, `thread_id`)
 
 Estos campos forman el carrier canónico de conversación para cognition v2:
 
@@ -150,7 +148,6 @@ Estos campos forman el carrier canónico de conversación para cognition v2:
   - se obtiene con `compute_thread_id(...)`
   - usa material canónico versionado + `sha256`
   - formato actual: `thread:sha256:<hex>`
-- **`thread_seq`**: Secuencia monotónica asignada por router dentro de `thread_id`
 
 Reglas:
 - `thread_id` lo calcula el productor que conoce el medium, típicamente el IO node.
@@ -159,13 +156,11 @@ Reglas:
   - `DirectPair`
   - `PersistentChannel`
   - `NativeThread`
-- `thread_seq` lo asigna el router.
-- `thread_seq` no es global; solo tiene orden dentro del thread.
-- cognition v2 usa `thread_id` y `thread_seq` como carrier canónico.
-- En los paths IO nuevos, `ich + thread_id + thread_seq` debe leerse como:
+- el mensaje no lleva secuencia: el orden de una comunicación es el número de turno de SY.cognition. El router dejó de asignar `meta.thread_seq` en 0.1.77 y el campo salió del protocolo en 0.1.78.
+- cognition v2 usa `thread_id` como carrier canónico.
+- En los paths IO nuevos, `ich + thread_id` debe leerse como:
   - canal local/sistémico
   - hilo físico/relacional del medio
-  - secuencia monotónica por thread
 
 ### 3.2.1 Compatibilidad legacy con `ctx*`
 
@@ -177,14 +172,14 @@ Durante la migración pueden seguir apareciendo:
 Pero esos campos ya no representan el carrier canónico del modelo cognitivo.
 
 Regla de migración:
-- paths nuevos deben producir `thread_id` + `thread_seq`
+- paths nuevos deben producir `thread_id`
 - el runtime activo del repo ya no lee `ctx*` como carrier conversacional
 - `ctx*` queda solo como compatibilidad histórica/documental para payloads viejos
 - `ctx_window` deja de ser obligatorio en el modelo canónico
 
 ### 3.3 Antecedentes Cognitivos (memory_package)
 
-El router consulta `jsr-memory` para construir `memory_package` antes de entregar al nodo destino. El lookup principal de v2 es por `thread_id`.
+El router consulta `jsr-memory` para construir `memory_package` antes de entregar a un nodo `AI.*`. El lookup es por comunicación: `thread_id` y el agente destino.
 
 El paquete cognitivo v2 debe incluir, como mínimo:
 
@@ -199,7 +194,8 @@ El paquete cognitivo v2 debe incluir, como mínimo:
 - `truncated`
 
 Reglas:
-- el router enriquece después del routing
+- el router enriquece después del routing, por destino, solo a nodos `AI.*`
+- un `memory_package` que puso el emisor se descarta
 - OPA no lee `memory_package`
 - `memory_package.thread_id` debe coincidir con `meta.thread_id`
 - `dominant_context` y `dominant_reason` deben estar presentes cuando el paquete no está vacío
@@ -305,10 +301,6 @@ pub struct Meta {
     /// Thread físico de conversación. Canónico para cognition v2.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub thread_id: Option<String>,
-
-    /// Secuencia monotónica dentro del thread. La asigna el router.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub thread_seq: Option<u64>,
 
     /// Legacy: carrier viejo de contexto conversacional
     #[serde(skip_serializing_if = "Option::is_none")]

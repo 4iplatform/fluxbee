@@ -69,7 +69,7 @@ Las operaciones owner-bound de mutación siguen fuera de `SY.admin` y se mantien
 
 `TIMER_GET` y `TIMER_LIST` sí pueden exponerse por `SY.admin` porque la lectura es abierta en v1. La razón para mantener scheduling y mutaciones fuera de admin es arquitectónica: `SY.timer` autoriza esas operaciones por identidad efectiva del requester (`routing.src_l2_name`, estampado por router), y `SY.admin` no actúa como proxy transparente de ownership.
 
-Nodos futuros con interacción directa (por ejemplo `WF.*`, `SY.policy`, capabilities invocables) deben implementar su propia operación `HELP` equivalente. La generalización del protocolo, los campos comunes y el naming se formalizarán en un documento aparte cuando aparezca el segundo o tercer caso.
+Nodos futuros con interacción directa (por ejemplo `WF.*`, capabilities invocables) deben implementar su propia operación `HELP` equivalente. La generalización del protocolo, los campos comunes y el naming se formalizarán en un documento aparte cuando aparezca el segundo o tercer caso.
 
 ---
 

@@ -94,7 +94,6 @@ fn build_reply_meta(meta: &Meta, options: ReplyContextOptions) -> Meta {
     let mut reply = meta.clone();
     reply.dst_ilk = meta.src_ilk.clone();
     reply.src_ilk = None;
-    reply.thread_seq = None;
     reply.ctx = None;
     reply.ctx_seq = None;
     reply.ctx_window = None;

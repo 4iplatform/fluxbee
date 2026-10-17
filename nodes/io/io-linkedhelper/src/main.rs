@@ -2745,7 +2745,6 @@ fn build_system_reply(
             dst_ilk: incoming.meta.dst_ilk.clone(),
             ich: incoming.meta.ich.clone(),
             thread_id: incoming.meta.thread_id.clone(),
-            thread_seq: incoming.meta.thread_seq,
             ctx: None,
             ctx_seq: None,
             ctx_window: None,

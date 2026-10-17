@@ -1427,7 +1427,7 @@ mod tests {
             routing: Routing {
                 src: "uuid-123".to_string(),
                 src_l2_name: Some("SY.orchestrator@motherbee".to_string()),
-                dst: Destination::Unicast("SY.policy@motherbee".to_string()),
+                dst: Destination::Unicast("SY.storage@motherbee".to_string()),
                 ttl: 16,
                 trace_id: "t".to_string(),
             },

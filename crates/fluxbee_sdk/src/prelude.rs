@@ -13,8 +13,8 @@ pub use crate::cognition::{
     SUBJECT_STORAGE_COGNITION_REASONS, SUBJECT_STORAGE_COGNITION_SCOPES,
     SUBJECT_STORAGE_COGNITION_SCOPE_INSTANCES, SUBJECT_STORAGE_COGNITION_THREADS,
 };
-pub use crate::comm::{nats, protocol};
-pub use crate::comm::{ClientConfig, NodeConfig, NodeError, NodeSender, NodeUuidMode};
+pub use crate::comm::protocol;
+pub use crate::comm::{NodeConfig, NodeError, NodeSender, NodeUuidMode};
 pub use crate::identity::{
     identity_shm_name_for_hive, load_hive_id, read_self_ilk_from_env, read_self_tenant_from_env,
     resolve_ilk_from_hive_config, resolve_ilk_from_hive_id, resolve_ilk_from_shm_name,

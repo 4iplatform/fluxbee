@@ -63,7 +63,6 @@ async fn main() -> Result<(), DynError> {
     let dispatcher =
         RouterDispatcher::connect_with_retry(cfg, Duration::from_secs(1), profile).await?;
 
-    let mut first_observation = None;
     let mut final_observation = None;
     let mut success_step = None;
     let mut trace_ok_all = true;
@@ -116,9 +115,6 @@ async fn main() -> Result<(), DynError> {
             "IO.test.cognition received reply"
         );
 
-        if first_observation.is_none() {
-            first_observation = Some(observation.clone());
-        }
         final_observation = Some(observation.clone());
         if memory_package_present {
             success_step = Some(step);
@@ -151,24 +147,6 @@ async fn main() -> Result<(), DynError> {
     println!("THREAD_ID_OK={thread_id_ok_all}");
     println!("RECEIVER_OK={receiver_ok_all}");
     println!("CONTEXT_OK={context_ok_all}");
-    if let Some(observation) = first_observation {
-        println!(
-            "FIRST_THREAD_SEQ={}",
-            observation
-                .get("thread_seq")
-                .and_then(Value::as_u64)
-                .map(|value| value.to_string())
-                .unwrap_or_default()
-        );
-    }
-    println!(
-        "FINAL_THREAD_SEQ={}",
-        final_observation
-            .get("thread_seq")
-            .and_then(Value::as_u64)
-            .map(|value| value.to_string())
-            .unwrap_or_default()
-    );
     println!(
         "DOMINANT_CONTEXT={}",
         final_observation

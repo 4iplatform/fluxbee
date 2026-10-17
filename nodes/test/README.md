@@ -13,19 +13,18 @@ Incluye dos runtimes mí­nimos:
 - `IO.test.cognition`: emisor disposable para E2E de cognition por router con
   `thread_id` canónico.
 - `AI.test.cognition`: receptor disposable que captura
-  `trace_id/ich/thread_id/thread_seq/context/memory_package` y responde con observaciones.
+  `trace_id/ich/thread_id/context/memory_package` y responde con observaciones.
 
 ### E2E cognition por router: qué valida hoy
 
 El par `IO.test.cognition` + `AI.test.cognition` valida el carrier real por
-router, no un publish lateral a NATS. El chequeo actual cubre:
+router. El chequeo actual cubre:
 
 - preservación de `trace_id`
 - preservación de `ich`
 - entrega al receptor esperado
 - `msg_type=user`
 - preservación de `thread_id`
-- asignación monotónica de `thread_seq`
 - presencia de `meta.context.probe_id/probe_step`
 - enrichment posterior con `memory_package`
 
@@ -262,10 +261,9 @@ Comportamiento esperado:
 
 1. `IO.test.cognition` calcula un `thread_id` canónico y enví­a un primer turn
    unicast a `AI.test.cognition@<hive>`.
-2. El router asigna `thread_seq` y entrega al nodo receptor.
+2. El router entrega al nodo receptor.
 3. `AI.test.cognition` devuelve en el reply su observación del mensaje recibido:
    - `thread_id`
-   - `thread_seq`
    - presencia/ausencia de `memory_package`
 4. `IO.test.cognition` enví­a turns adicionales sobre el mismo thread hasta
    observar `memory_package` o agotar el máximo configurado.
@@ -283,8 +281,6 @@ Variables útiles:
 Salida útil del emisor:
 
 - `THREAD_ID`
-- `FIRST_THREAD_SEQ`
-- `FINAL_THREAD_SEQ`
 - `MEMORY_PACKAGE_PRESENT`
 - `DOMINANT_CONTEXT`
 - `DOMINANT_REASON`

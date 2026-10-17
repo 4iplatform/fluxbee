@@ -104,7 +104,6 @@ type Meta struct {
 	DstIlk           *string         `json:"dst_ilk,omitempty"`
 	Ich              *string         `json:"ich,omitempty"`
 	ThreadID         *string         `json:"thread_id,omitempty"`
-	ThreadSeq        *uint64         `json:"thread_seq,omitempty"`
 	Ctx              *string         `json:"ctx,omitempty"`
 	CtxSeq           *uint64         `json:"ctx_seq,omitempty"`
 	CtxWindow        []CtxTurn       `json:"ctx_window,omitempty"`

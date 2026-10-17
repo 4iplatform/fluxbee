@@ -2,7 +2,7 @@
 
 Status: design reviewed once (2026-10-16); stages 1a and 1b validated on 8.x (0.1.75, 0.1.76);
 stage 2 designed with the operator and reviewed (2026-10-17, §6), 2a validated on 8.x (0.1.77,
-§6.8); 2b and stage 3 pending. Finding A-70 (`lab/logbook/FINDINGS.md`).
+§6.8), 2b built for 0.1.78 (§6.9); stage 3 pending. Finding A-70 (`lab/logbook/FINDINGS.md`).
 
 The router gets a small stream of its own. It replaces the embedded NATS broker, and carries three
 kinds of data to SY.storage:
@@ -797,3 +797,31 @@ Every 2a gate of §6.4 passed (details in `lab/DEPLOYMENTS.md`):
 
 For 2b: SY.cognition's start line reports `ai_secret_source=missing`, because the key is now
 resolved afterwards on the turn worker.
+
+### 6.9 2b as built, and its code review (one round, 2026-10-17)
+
+As §6.3 planned, about 9,000 lines go: the broker, the SDK client, the two diags, eight scripts,
+SY.policy, `meta.thread_seq`, the ingest of the three subjects without a producer (their tables
+stay). Where the build differs from the plan, or adds to it:
+- **The orchestrator joins its router first,** then waits for SY.storage's database with
+  `STORAGE_METRICS_GET` (no ephemeral connection). Its workers start with the join: system
+  messages are taken as they come, as the periodic reconcile already allows, and admin commands get
+  `ORCHESTRATOR_BOOTING` until the boot ends, so callers fail fast as they did while the
+  orchestrator was not on its router yet (`fluxbee-firstboot` waits on exactly that).
+- **`STORAGE_METRICS_GET`** is open to any node (read-only counts); one inbox scan runs at a time,
+  and a request that finds one running is told so.
+- **One-time transitions at boot, logged:** the broker's pending messages per subject, then
+  `/var/lib/fluxbee/nats` and the `nats:` section of `hive.yaml` (after the router runs the new
+  binary: the old one, stopping, flushes its broker to disk); SY.policy out of every role section
+  of `hive.yaml` and its unit and binary removed where left. `system_nodes_for_role` leaves retired
+  nodes out for every reader (the boot, the core components a spoke installs, a join's templates),
+  even where the rewrite failed. These go once every hive booted 0.1.78.
+- SY.cognition reports its AI key source once it looked it up (§6.8).
+
+The review (two lenses: the upgrade path, what the removal left) found no HIGH. One MEDIUM: the
+motherbee's old router, stopping during the boot, wrote the broker's state back after the clean-up
+→ the clean-up runs after the router restarts. LOW, all fixed: retired nodes filtered for every
+reader of a role section; admin commands queued during the boot → `ORCHESTRATOR_BOOTING`; metrics
+scans could stack → one at a time; leftover unit and binary on a motherbee installed by
+`scripts/install.sh`; stale comments; the admin catalog parity check had missed `list_streams`
+(1b) and the WF deploy's new argument (A-68).

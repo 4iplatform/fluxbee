@@ -27,7 +27,6 @@ use fluxbee_ai_sdk::{
     HiveAiConfig, ModelSettings,
 };
 use fluxbee_sdk::blob::{BlobRef, BlobToolkit};
-use fluxbee_sdk::nats::{NatsClient, NatsRequestEnvelope, NatsResponseEnvelope};
 use fluxbee_sdk::protocol::{
     is_system_kind, ConfigChangedPayload, Destination, Message, Meta, Routing,
     VaultSecretChangedPayload, VaultSecretInterest, MSG_BLOB_CURATE, MSG_BLOB_CURATE_RESPONSE,
@@ -40,10 +39,11 @@ use fluxbee_sdk::protocol::{
 };
 use fluxbee_sdk::{
     build_node_config_response_message, classify_admin_action, classify_system_message,
-    derive_action_outcome, try_handle_default_node_status, ClientConfig, NodeConfig,
-    OperationalRouteProfile, PendingMatcher, RouteMatch, RouteTarget, RouterDispatcher,
-    RpcCommandReceiver, RpcRequestLabels, MSG_VAULT_ASSIGN, MSG_VAULT_ASSIGN_RESPONSE,
-    MSG_VAULT_DELETE, MSG_VAULT_DELETE_RESPONSE, MSG_VAULT_GET, MSG_VAULT_GET_METADATA,
+    derive_action_outcome, try_handle_default_node_status, NodeConfig, OperationalRouteProfile,
+    PendingMatcher, RouteMatch, RouteTarget, RouterDispatcher, RpcCommandReceiver,
+    RpcRequestLabels, StorageMetricsResponse, MSG_STORAGE_METRICS_GET,
+    MSG_STORAGE_METRICS_RESPONSE, MSG_VAULT_ASSIGN, MSG_VAULT_ASSIGN_RESPONSE, MSG_VAULT_DELETE,
+    MSG_VAULT_DELETE_RESPONSE, MSG_VAULT_GET, MSG_VAULT_GET_METADATA,
     MSG_VAULT_GET_METADATA_RESPONSE, MSG_VAULT_GET_RESPONSE, MSG_VAULT_LIST,
     MSG_VAULT_LIST_RESPONSE, MSG_VAULT_PUT, MSG_VAULT_PUT_RESPONSE, MSG_VAULT_ROLLBACK,
     MSG_VAULT_ROLLBACK_RESPONSE, MSG_VAULT_ROTATE, MSG_VAULT_ROTATE_RESPONSE,
@@ -299,8 +299,6 @@ struct AdminContext {
     #[allow(dead_code)] // wired into outgoing calls in the follow-up vault work
     self_ilk_id: String,
     authorized_hives: Vec<String>,
-    nats_endpoint: String,
-    nats_client: Arc<NatsClient>,
     executor_runtime: Arc<Mutex<Option<AdminExecutorAiRuntime>>>,
     executor_configured: Arc<AtomicBool>,
     /// Canonical admin dispatcher — reused by the executor's Vault
@@ -573,7 +571,6 @@ async fn main() -> Result<(), AdminError> {
         config_dir: config_dir.clone(),
         version: "1.0".to_string(),
     };
-    let client_config = ClientConfig::new(node_config.clone());
     let rpc_profile = build_admin_rpc_profile()?;
     let router_client =
         RouterDispatcher::connect_with_retry(node_config, Duration::from_secs(1), rpc_profile)
@@ -583,7 +580,6 @@ async fn main() -> Result<(), AdminError> {
                 err
             })?;
 
-    let nats_client = Arc::new(NatsClient::from_client_config(&client_config)?);
     let node_name = admin_node_name(&hive.hive_id);
     // Model D': self-ILK is deterministic from L2 name (no SHM wait).
     let self_ilk_id = fluxbee_sdk::deterministic_system_ilk_id(&node_name);
@@ -632,8 +628,6 @@ async fn main() -> Result<(), AdminError> {
         hive_id,
         self_ilk_id,
         authorized_hives,
-        nats_endpoint: nats_client.endpoint().to_string(),
-        nats_client,
         executor_runtime,
         executor_configured,
         rpc: Arc::clone(&router_client),
@@ -6375,17 +6369,70 @@ struct OpaQueryEntry {
     payload: serde_json::Value,
 }
 
-#[derive(Debug, Deserialize, Serialize)]
-struct StorageInboxMetrics {
-    pending: i64,
-    pending_with_error: i64,
-    oldest_pending_age_s: i64,
-    processed_total: i64,
-    max_attempts: i32,
-}
+const STORAGE_METRICS_TIMEOUT_SECS: u64 = 8;
 
-const SUBJECT_STORAGE_METRICS_GET: &str = "storage.metrics.get";
-const STORAGE_METRICS_NATS_TIMEOUT_SECS: u64 = 8;
+/// SY.storage's inbox metrics, asked over the mesh (A-70 stage 2b; until then on the embedded NATS
+/// broker's `storage.metrics.get`).
+async fn handle_storage_metrics_http(ctx: &AdminContext) -> (u16, String) {
+    let action = "get_storage_metrics";
+    let error = |status: u16, error_code: &str, detail: String| {
+        (
+            status,
+            serde_json::json!({
+                "status": "error",
+                "action": action,
+                "payload": {
+                    "status": "error",
+                    "error_code": error_code,
+                    "message": detail,
+                },
+                "error_code": error_code,
+                "error_detail": detail,
+            })
+            .to_string(),
+        )
+    };
+    let reply = match send_system_request(
+        &ctx.rpc,
+        &format!("SY.storage@{PRIMARY_HIVE_ID}"),
+        MSG_STORAGE_METRICS_GET,
+        MSG_STORAGE_METRICS_RESPONSE,
+        serde_json::json!({}),
+        Duration::from_secs(STORAGE_METRICS_TIMEOUT_SECS),
+    )
+    .await
+    {
+        Ok(reply) => reply,
+        Err(err) => return error(503, "STORAGE_METRICS_UNAVAILABLE", err.to_string()),
+    };
+    let response: StorageMetricsResponse = match serde_json::from_value(reply) {
+        Ok(response) => response,
+        Err(err) => return error(502, "TRANSPORT_ERROR", err.to_string()),
+    };
+    match (response.ok, response.metrics) {
+        (true, Some(metrics)) => (
+            200,
+            serde_json::json!({
+                "status": "ok",
+                "action": action,
+                "payload": {
+                    "status": "ok",
+                    "metrics": metrics,
+                },
+                "error_code": serde_json::Value::Null,
+                "error_detail": serde_json::Value::Null,
+            })
+            .to_string(),
+        ),
+        _ => error(
+            503,
+            "STORAGE_METRICS_UNAVAILABLE",
+            response
+                .error
+                .unwrap_or_else(|| "SY.storage did not return its metrics".to_string()),
+        ),
+    }
+}
 
 async fn run_http_server(
     listen: &str,
@@ -8282,282 +8329,6 @@ fn payload_error_detail(payload: &serde_json::Value) -> Option<String> {
                 .and_then(|value| value.as_str())
                 .map(|value| value.to_string())
         })
-}
-
-async fn handle_storage_metrics_http(ctx: &AdminContext) -> (u16, String) {
-    let action = "get_storage_metrics";
-    let trace_id = Uuid::new_v4().to_string();
-    let reply_subject = ctx.nats_client.inbox_reply_subject(&trace_id);
-    let request_envelope = NatsRequestEnvelope::<serde_json::Value>::new(
-        SUBJECT_STORAGE_METRICS_GET,
-        trace_id.clone(),
-        reply_subject.clone(),
-        None,
-    );
-    let request_body = match serde_json::to_vec(&request_envelope) {
-        Ok(body) => body,
-        Err(err) => {
-            let error_detail = err.to_string();
-            return (
-                500,
-                serde_json::json!({
-                    "status": "error",
-                    "action": action,
-                    "payload": {
-                        "status": "error",
-                        "error_code": "INVALID_REQUEST",
-                        "message": error_detail,
-                    },
-                    "error_code": "INVALID_REQUEST",
-                    "error_detail": error_detail,
-                })
-                .to_string(),
-            );
-        }
-    };
-    let sid = 0u32;
-    let request_started = Instant::now();
-    tracing::info!(
-        trace_id = %trace_id,
-        endpoint = %ctx.nats_endpoint,
-        request_subject = SUBJECT_STORAGE_METRICS_GET,
-        reply_subject = %reply_subject,
-        sid = sid,
-        timeout_secs = STORAGE_METRICS_NATS_TIMEOUT_SECS,
-        request_bytes = request_body.len(),
-        "storage metrics nats request send"
-    );
-    let response_body = match ctx
-        .nats_client
-        .request_with_session_inbox(
-            SUBJECT_STORAGE_METRICS_GET,
-            &request_body,
-            &reply_subject,
-            Duration::from_secs(STORAGE_METRICS_NATS_TIMEOUT_SECS),
-        )
-        .await
-    {
-        Ok(body) => {
-            let elapsed_ms = request_started.elapsed().as_millis() as u64;
-            tracing::info!(
-                trace_id = %trace_id,
-                endpoint = %ctx.nats_endpoint,
-                request_subject = SUBJECT_STORAGE_METRICS_GET,
-                reply_subject = %reply_subject,
-                sid = sid,
-                elapsed_ms = elapsed_ms,
-                response_bytes = body.len(),
-                "storage metrics nats response received"
-            );
-            body
-        }
-        Err(err) => {
-            let error_detail = err.to_string();
-            let elapsed_ms = request_started.elapsed().as_millis() as u64;
-            tracing::warn!(
-                trace_id = %trace_id,
-                endpoint = %ctx.nats_endpoint,
-                request_subject = SUBJECT_STORAGE_METRICS_GET,
-                reply_subject = %reply_subject,
-                sid = sid,
-                elapsed_ms = elapsed_ms,
-                error = %error_detail,
-                "storage metrics nats request failed"
-            );
-            return (
-                503,
-                serde_json::json!({
-                    "status": "error",
-                    "action": action,
-                    "payload": {
-                        "status": "error",
-                        "error_code": "STORAGE_METRICS_UNAVAILABLE",
-                        "message": error_detail,
-                    },
-                    "error_code": "STORAGE_METRICS_UNAVAILABLE",
-                    "error_detail": error_detail,
-                })
-                .to_string(),
-            );
-        }
-    };
-    let response: NatsResponseEnvelope<StorageInboxMetrics> =
-        match serde_json::from_slice(&response_body) {
-            Ok(resp) => resp,
-            Err(err) => {
-                let error_detail = err.to_string();
-                let elapsed_ms = request_started.elapsed().as_millis() as u64;
-                tracing::warn!(
-                    trace_id = %trace_id,
-                    endpoint = %ctx.nats_endpoint,
-                    request_subject = SUBJECT_STORAGE_METRICS_GET,
-                    reply_subject = %reply_subject,
-                    sid = sid,
-                    elapsed_ms = elapsed_ms,
-                    error = %error_detail,
-                    "storage metrics nats response decode failed"
-                );
-                return (
-                    502,
-                    serde_json::json!({
-                        "status": "error",
-                        "action": action,
-                        "payload": {
-                            "status": "error",
-                            "error_code": "TRANSPORT_ERROR",
-                            "message": error_detail,
-                        },
-                        "error_code": "TRANSPORT_ERROR",
-                        "error_detail": error_detail,
-                    })
-                    .to_string(),
-                );
-            }
-        };
-    tracing::info!(
-        trace_id = %trace_id,
-        endpoint = %ctx.nats_endpoint,
-        request_subject = SUBJECT_STORAGE_METRICS_GET,
-        reply_subject = %reply_subject,
-        sid = sid,
-        elapsed_ms = request_started.elapsed().as_millis() as u64,
-        response_status = %response.status,
-        has_metrics = response.payload.is_some(),
-        response_error_code = ?response.error_code,
-        response_error_detail = ?response.error_detail,
-        "storage metrics nats response decoded"
-    );
-    if response.action != SUBJECT_STORAGE_METRICS_GET {
-        let error_detail = format!(
-            "action mismatch expected={} got={}",
-            SUBJECT_STORAGE_METRICS_GET, response.action
-        );
-        let elapsed_ms = request_started.elapsed().as_millis() as u64;
-        tracing::warn!(
-            trace_id = %trace_id,
-            endpoint = %ctx.nats_endpoint,
-            request_subject = SUBJECT_STORAGE_METRICS_GET,
-            reply_subject = %reply_subject,
-            sid = sid,
-            elapsed_ms = elapsed_ms,
-            error = %error_detail,
-            "storage metrics nats response action mismatch"
-        );
-        return (
-            502,
-            serde_json::json!({
-                "status": "error",
-                "action": action,
-                "payload": {
-                    "status": "error",
-                    "error_code": "TRANSPORT_ERROR",
-                    "message": error_detail,
-                },
-                "error_code": "TRANSPORT_ERROR",
-                "error_detail": error_detail,
-            })
-            .to_string(),
-        );
-    }
-    if response.trace_id != trace_id {
-        let error_detail = format!(
-            "trace_id mismatch expected={} got={}",
-            trace_id, response.trace_id
-        );
-        let elapsed_ms = request_started.elapsed().as_millis() as u64;
-        tracing::warn!(
-            trace_id = %trace_id,
-            endpoint = %ctx.nats_endpoint,
-            request_subject = SUBJECT_STORAGE_METRICS_GET,
-            reply_subject = %reply_subject,
-            sid = sid,
-            elapsed_ms = elapsed_ms,
-            error = %error_detail,
-            "storage metrics nats response trace mismatch"
-        );
-        return (
-            502,
-            serde_json::json!({
-                "status": "error",
-                "action": action,
-                "payload": {
-                    "status": "error",
-                    "error_code": "TRANSPORT_ERROR",
-                    "message": error_detail,
-                },
-                "error_code": "TRANSPORT_ERROR",
-                "error_detail": error_detail,
-            })
-            .to_string(),
-        );
-    }
-
-    match (response.status.as_str(), response.payload) {
-        ("ok", Some(metrics)) => {
-            tracing::info!(
-                trace_id = %trace_id,
-                endpoint = %ctx.nats_endpoint,
-                request_subject = SUBJECT_STORAGE_METRICS_GET,
-                reply_subject = %reply_subject,
-                sid = sid,
-                elapsed_ms = request_started.elapsed().as_millis() as u64,
-                pending = metrics.pending,
-                pending_with_error = metrics.pending_with_error,
-                oldest_pending_age_s = metrics.oldest_pending_age_s,
-                max_attempts = metrics.max_attempts,
-                processed_total = metrics.processed_total,
-                "storage metrics nats request success"
-            );
-            (
-                200,
-                serde_json::json!({
-                    "status": "ok",
-                    "action": action,
-                    "payload": {
-                        "status": "ok",
-                        "metrics": metrics,
-                    },
-                    "error_code": serde_json::Value::Null,
-                    "error_detail": serde_json::Value::Null,
-                })
-                .to_string(),
-            )
-        }
-        _ => {
-            let error_code = response
-                .error_code
-                .unwrap_or_else(|| "STORAGE_METRICS_UNAVAILABLE".to_string());
-            let error_detail = response
-                .error_detail
-                .unwrap_or_else(|| "storage metrics request failed".to_string());
-            tracing::warn!(
-                trace_id = %trace_id,
-                endpoint = %ctx.nats_endpoint,
-                request_subject = SUBJECT_STORAGE_METRICS_GET,
-                reply_subject = %reply_subject,
-                sid = sid,
-                elapsed_ms = request_started.elapsed().as_millis() as u64,
-                error_code = %error_code,
-                error_detail = %error_detail,
-                "storage metrics nats request returned error payload"
-            );
-            (
-                503,
-                serde_json::json!({
-                    "status": "error",
-                    "action": action,
-                    "payload": {
-                        "status": "error",
-                        "error_code": error_code,
-                        "message": error_detail,
-                    },
-                    "error_code": error_code,
-                    "error_detail": error_detail,
-                })
-                .to_string(),
-            )
-        }
-    }
 }
 
 /// The statuses that count as SUCCESS on the wire, i.e. not an error envelope.
@@ -17128,8 +16899,6 @@ mod tests {
             hive_id: PRIMARY_HIVE_ID.to_string(),
             self_ilk_id: String::new(),
             authorized_hives: Vec::new(),
-            nats_endpoint: "nats://127.0.0.1:4222".to_string(),
-            nats_client: Arc::new(NatsClient::new("nats://127.0.0.1:4222")),
             executor_runtime: Arc::new(Mutex::new(None)),
             executor_configured: Arc::new(AtomicBool::new(false)),
             rpc: client,

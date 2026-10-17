@@ -65,7 +65,7 @@ packaging/build-deb.sh 0.1.0
 
 `build-deb.sh` separa BUILD (aquí) de INSTALL (en el target). Compila el core Rust
 (`rt-gateway`, `sy-admin`, `sy-config-routes`, `sy-architect`, `sy-vault`, `sy-orchestrator`,
-`sy-storage`, `sy-identity`, `sy-cognition`, `sy-policy`, `sy-edge`), los binarios Go
+`sy-storage`, `sy-identity`, `sy-cognition`, `sy-edge`), los binarios Go
 (`sy-opa-rules`, `sy-timer`, `sy-wf-rules`, `wf-generic`), `sy-frontdesk-gov`, los runtimes managed
 `io-cloud`/`io-blob`, y siembra el runtime instanciado `io.api` bajo `dist/runtimes`. **Hornea los
 hashes del manifiesto `dist/core` en build-time** (evita el crash-loop de "manifest hash
@@ -140,10 +140,6 @@ wan:
   gateway_name: "RT.gateway"
   mtls: required          # disabled | permissive | required (default del template)
 
-nats:
-  mode: embedded
-  port: 4222
-
 admin:
   listen: "127.0.0.1:8080"
 
@@ -184,6 +180,12 @@ system_nodes:
   ingress:    { nodes: [SY.config.routes, SY.edge], wait_for: [SY.config.routes] }
 ```
 
+Desde 0.1.78 no hay sección `nats:` (el broker NATS embebido se borró; el plano de log es el
+stream de cada router, ver `13-storage.md`). Al arrancar, el orchestrator borra una vez
+`/var/lib/fluxbee/nats` y la sección `nats:` de un `hive.yaml` viejo, y loguea cuántos mensajes
+tenía pendientes el broker. SY.policy (solo contaba turns) se paró en 0.1.77 y en 0.1.78 se
+borraron su binario y su unit; el orchestrator lo saca de las listas de `system_nodes` al arrancar.
+
 ### 3.1 WAN mTLS
 
 `wan.mtls` controla la autenticación del transporte inter-hive:
@@ -211,8 +213,8 @@ El orden de `system_nodes.motherbee` es cargado por `sy_orchestrator`:
 
 | Rol | Cómo se crea | PostgreSQL | Nodos de sistema (start order) |
 |-----|--------------|:----------:|--------------------------------|
-| **motherbee** | `.deb` + `fluxbee-firstboot` | ✓ (Depends) | config.routes, identity, opa.rules, admin, architect, storage, cognition, policy, timer, wf-rules, frontdesk.gov, vault |
-| **worker** | `add_hive role=worker` | ✗ | config.routes, identity(réplica SHM), opa.rules, cognition, policy, timer, wf-rules |
+| **motherbee** | `.deb` + `fluxbee-firstboot` | ✓ (Depends) | config.routes, identity, opa.rules, admin, architect, storage, cognition, timer, wf-rules, frontdesk.gov, vault |
+| **worker** | `add_hive role=worker` | ✗ | config.routes, identity(réplica SHM), opa.rules, cognition, timer, wf-rules |
 | **egress** | `add_hive role=egress` + `egress{}` | ✗ | config.routes (+ NAT saliente por nft) |
 | **ingress** | `add_hive role=ingress` + `ingress{}` | ✗ | config.routes, SY.edge (:443 público, fail-closed) |
 
@@ -532,9 +534,10 @@ Runbook de status por nodo (campos de `payload.node_status`):
 ├── ssh/motherbee.key(.pub)   # 0700 dir; llave de bootstrap ed25519
 ├── tls/<hive_id>             # CA de malla + cert (wan.mtls)
 ├── state/{nodes,cookbook,sy-admin,sy-edge,io-blob}
+├── state/RT.<router>@<hive>/stream/   # log del stream del router: segmentos + state.json
 ├── hives/                    # repo de spokes (info por hive)
 ├── opa/{current,staged,backup}
-├── wf-rules/  modules/  nats/
+├── wf-rules/  modules/
 ├── blob/                     # root:fluxbee 0750 (A-56)
 │   ├── staging/              # solo root: los nodos dejan ahí los blobs antes de promoverlos
 │   ├── active/               # del usuario fluxbee (Syncthing la sirve); cada blob toma ese dueño
@@ -561,7 +564,7 @@ Runbook de status por nodo (campos de `payload.node_status`):
 | RT.gateway | ❌ | Router raíz del hive |
 | SY.orchestrator | ❌ | Proceso raíz |
 | SY.admin / SY.vault | ❌ | Sin ellos no hay control/secreto |
-| SY.config.routes / SY.opa.rules / SY.identity / SY.policy | ❌ | Críticos para routing/policy/identidad |
+| SY.config.routes / SY.opa.rules / SY.identity | ❌ | Críticos para routing/policy/identidad |
 | AI.* / WF.* / IO.* (instanciados) | ✅ | Nodos de aplicación |
 
 ---

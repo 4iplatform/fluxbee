@@ -1344,7 +1344,7 @@ async fn apply_node_config(
 // ---------------------------------------------------------------------------
 
 /// The `role` + optional `edge:` section of `hive.yaml`, the ONLY fields sy_edge
-/// needs from it. Other sections (wan/nats/blob/…) are ignored — NO
+/// needs from it. Other sections (wan/blob/…) are ignored — NO
 /// `deny_unknown_fields`, or the whole file would fail to parse.
 #[derive(Debug, Clone, Deserialize)]
 struct HiveEdgeFile {

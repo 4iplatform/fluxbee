@@ -22,8 +22,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .init();
 
     let cfg = RouterConfig::load_from_env()?;
-    let nats_mode = cfg.nats_mode.clone();
-    let nats_url = cfg.nats_url.clone();
     let router = Router::new(cfg);
     let mut router_task = tokio::spawn(async move { router.run().await });
 
@@ -37,21 +35,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         _ = sigterm.recv() => {
             tracing::warn!("SIGTERM received; shutting down rt-gateway");
-            if nats_mode == "embedded" {
-                if let Err(err) = json_router::nats::stop_embedded_broker(&nats_url).await {
-                    tracing::warn!(endpoint = %nats_url, error = %err, "embedded nats stop failed");
-                }
-            }
             router_task.abort();
             let _ = router_task.await;
         }
         _ = sigint.recv() => {
             tracing::warn!("SIGINT received; shutting down rt-gateway");
-            if nats_mode == "embedded" {
-                if let Err(err) = json_router::nats::stop_embedded_broker(&nats_url).await {
-                    tracing::warn!(endpoint = %nats_url, error = %err, "embedded nats stop failed");
-                }
-            }
             router_task.abort();
             let _ = router_task.await;
         }

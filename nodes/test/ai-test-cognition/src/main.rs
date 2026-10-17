@@ -77,7 +77,6 @@ async fn run_loop(sender: &NodeSender, incoming: &mut RpcCommandReceiver) -> Res
             "msg_type": msg.meta.msg_type,
             "ich": msg.meta.ich,
             "thread_id": msg.meta.thread_id,
-            "thread_seq": msg.meta.thread_seq,
             "context": msg.meta.context,
             "text": text,
             "memory_package_present": memory_package.is_some(),
@@ -105,7 +104,6 @@ async fn run_loop(sender: &NodeSender, incoming: &mut RpcCommandReceiver) -> Res
             probe_id = %probe_id,
             probe_step,
             thread_id = ?msg.meta.thread_id,
-            thread_seq = ?msg.meta.thread_seq,
             memory_package = msg.meta.memory_package.is_some(),
             "AI.test.cognition received routed message"
         );
@@ -128,7 +126,6 @@ async fn run_loop(sender: &NodeSender, incoming: &mut RpcCommandReceiver) -> Res
                     dst_ilk: None,
                     ich: msg.meta.ich.clone(),
                     thread_id: msg.meta.thread_id.clone(),
-                    thread_seq: None,
                     ctx: msg.meta.ctx.clone(),
                     ctx_seq: None,
                     ctx_window: None,

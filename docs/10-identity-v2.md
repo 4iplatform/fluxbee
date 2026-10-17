@@ -318,10 +318,10 @@ SY.identity PRIMARY writes directly to PostgreSQL for its own domain tables. Thi
 
 | Writer | Domain | Tables |
 |--------|--------|--------|
-| SY.storage | Cognitive persistence | turns, events, memory_items |
+| SY.storage | Message log and cognitive persistence | turns, cognition_* |
 | SY.identity | Identity registry | identity_tenants, identity_ilks, identity_ichs, identity_vocabulary |
 
-This exception exists because identity registration requires synchronous confirmation (orchestrator cannot spawn a node until the ILK is confirmed in DB), making async fire-and-forget via NATS unsuitable.
+This exception exists because identity registration requires synchronous confirmation (orchestrator cannot spawn a node until the ILK is confirmed in DB), making the router stream's asynchronous, best-effort path to SY.storage unsuitable.
 
 ### 5.3 SHM: Full Dataset in Every Worker
 
@@ -340,7 +340,7 @@ SY.identity sizes the SHM region from `identity.max_ilks` in `hive.yaml` (defaul
 
 ### 5.4 Synchronization
 
-Identity synchronization uses direct socket connections between SY.identity instances. It does NOT use router broadcasts, CONFIG_CHANGED messages, or NATS. This is because:
+Identity synchronization uses direct socket connections between SY.identity instances. It does NOT use router broadcasts, CONFIG_CHANGED messages, or the router stream. This is because:
 
 - Identity deltas can exceed 64KB (full ILK with history).
 - Identity traffic should not load the router path.

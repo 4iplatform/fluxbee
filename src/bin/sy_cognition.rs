@@ -619,6 +619,11 @@ async fn main() -> Result<(), CognitionError> {
             worker_state.control_state.lock().await.ai_secret_source =
                 CognitionAiSecretSource::LocalFile;
         }
+        let ai_secret_source = worker_state.control_state.lock().await.ai_secret_source;
+        tracing::info!(
+            ai_secret_source = %ai_secret_source.as_str(),
+            "sy.cognition looked up its AI key"
+        );
         // Before the first turn, so a restart neither blanks the packages the agents read nor
         // starts them over.
         reload_communications_from_shared_memory(&worker_state).await;
@@ -629,12 +634,9 @@ async fn main() -> Result<(), CognitionError> {
     // broadcasts from SY.vault — no polling loop needed. See
     // `handle_vault_secret_changed_cognition` in process_router_message.
 
-    let startup_ai_secret_source = control_state.lock().await.ai_secret_source;
-
     tracing::info!(
         hive = %hive.hive_id,
         node_name = %node_name,
-        ai_secret_source = %startup_ai_secret_source.as_str(),
         state_dir = %runtime_paths.state_dir.display(),
         "sy.cognition started"
     );
@@ -4981,7 +4983,6 @@ mod tests {
             payload["config"]["storage"]["write_subject"],
             json!("storage.cognition.batch")
         );
-        assert!(payload["config"].get("nats").is_none());
         let resources = payload["contract"]["resources"].to_string();
         assert!(!resources.contains("postgres"), "{resources}");
     }

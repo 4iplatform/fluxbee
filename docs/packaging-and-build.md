@@ -14,7 +14,7 @@ Fluxbee se distribuye como **UN solo paquete Debian integrado** (`fluxbee_<ver>_
 solo motherbee — ver [07-operaciones.md](07-operaciones.md) para el modelo de deploy). El paquete trae:
 
 - El **core** (`SY.*`): rt-gateway, sy-admin, sy-config-routes, sy-architect, sy-vault,
-  sy-orchestrator, sy-storage, sy-identity, sy-cognition, sy-policy, sy-edge (Rust) +
+  sy-orchestrator, sy-storage, sy-identity, sy-cognition, sy-edge (Rust) +
   sy-opa-rules, sy-timer, sy-wf-rules, wf-generic (Go) + sy-frontdesk-gov. Cada binario del
   core viaja en `/usr/bin` **y** en `/var/lib/fluxbee/dist/core/bin` (esta copia es la que el
   dist-sync replica a los spokes; sus hashes se hornean en `dist/core/manifest.json`).

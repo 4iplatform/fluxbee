@@ -1,5 +1,4 @@
 pub mod blob;
-pub mod client_config;
 pub mod cloud;
 pub mod cognition;
 pub mod comm;
@@ -7,7 +6,6 @@ pub mod identity;
 pub mod logging;
 pub mod managed_node;
 pub mod managed_control_plane;
-pub mod nats;
 pub mod node_client;
 pub mod node_config;
 pub mod node_secret;
@@ -20,12 +18,12 @@ mod send_normalization;
 pub mod socket;
 pub mod split;
 pub mod status;
+pub mod storage;
 pub mod stream;
 pub mod thread;
 pub mod timer;
 pub mod vault;
 
-pub use client_config::ClientConfig;
 pub use cognition::{
     CognitionCommunicationRef, CognitionContextData, CognitionCooccurrenceData,
     CognitionDurableEntity, CognitionDurableEnvelope, CognitionDurableOp, CognitionEnvelopeBatch,
@@ -92,6 +90,10 @@ pub use rpc::{
 };
 pub use split::NodeSender;
 pub use status::try_handle_default_node_status;
+pub use storage::{
+    StorageInboxMetrics, StorageMetricsResponse, MSG_STORAGE_METRICS_GET,
+    MSG_STORAGE_METRICS_RESPONSE,
+};
 pub use thread::{compute_thread_id, ThreadIdError, ThreadIdInput};
 pub use timer::{
     build_timer_system_request, build_timer_system_request_with_target,

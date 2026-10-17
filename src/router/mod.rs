@@ -16,7 +16,6 @@ use tokio::time::{self, Duration};
 use uuid::Uuid;
 
 use crate::config::RouterConfig;
-use crate::nats::{check_endpoint as nats_check_endpoint, start_embedded_broker_with_storage};
 use crate::opa::OpaResolver;
 use crate::shm::{
     copy_bytes_with_len, memory_shm_name_for_hive, now_epoch_ms, sha256_bytes_is_zero,
@@ -89,9 +88,6 @@ pub struct Router {
     stream_runtime: std::sync::Mutex<Option<stream::StreamRuntime>>,
 }
 
-const NATS_READY_TIMEOUT_SECS: u64 = 20;
-const NATS_READY_RETRY_MS: u64 = 250;
-const NATS_EMBEDDED_RECOVERY_INTERVAL_SECS: u64 = 5;
 const LSA_REJECT_HIVE_MISMATCH: &str = "hive_mismatch";
 const LSA_REJECT_STALE_SEQ: &str = "stale_seq";
 const LSA_REJECT_PARSE_ERROR: &str = "parse_error";
@@ -175,23 +171,6 @@ impl Router {
         // source of truth. Refuse to start rather than silently degrade.
         system_policy::ensure_system_policy_loaded().map_err(RouterError::Startup)?;
 
-        prepare_nats_runtime(&self.cfg).await?;
-        wait_for_nats_ready(&self.cfg, Duration::from_secs(NATS_READY_TIMEOUT_SECS)).await?;
-        if self.cfg.nats_mode == "embedded" {
-            spawn_embedded_nats_recovery_loop(&self.cfg);
-            // SY.storage takes turns from the stream since 0.1.76: its old NATS consumer would
-            // keep every turn in the broker up to the 50,000 cap (A-70). The broker refuses it
-            // from now on.
-            for (consumer, pending) in
-                crate::nats::remove_retired_durable_consumers(&self.cfg.nats_url).await
-            {
-                tracing::info!(
-                    consumer = %consumer,
-                    pending,
-                    "removed a retired durable consumer from the local broker; the stream delivers turns now"
-                );
-            }
-        }
         ensure_parent_dir(&self.cfg.node_socket_path)?;
         let _ = std::fs::remove_file(&self.cfg.node_socket_path);
         let listener = UnixListener::bind(&self.cfg.node_socket_path)?;
@@ -6135,99 +6114,6 @@ fn match_any_hive(base: &str, full_name: &str) -> bool {
         return wildcard_match(base.as_bytes(), name_base.as_bytes());
     }
     name_base == base
-}
-
-async fn wait_for_nats_endpoint(endpoint: &str, timeout: Duration) -> Result<(), RouterError> {
-    let start = time::Instant::now();
-    loop {
-        match nats_check_endpoint(endpoint, Duration::from_secs(2)).await {
-            Ok(()) => {
-                tracing::info!(endpoint = %endpoint, "nats endpoint ready");
-                return Ok(());
-            }
-            Err(err) => {
-                if start.elapsed() >= timeout {
-                    return Err(RouterError::Startup(format!(
-                        "nats readiness timeout endpoint={} error={}",
-                        endpoint, err
-                    )));
-                }
-            }
-        }
-        time::sleep(Duration::from_millis(NATS_READY_RETRY_MS)).await;
-    }
-}
-
-async fn wait_for_nats_ready(cfg: &RouterConfig, timeout: Duration) -> Result<(), RouterError> {
-    wait_for_nats_endpoint(&cfg.nats_url, timeout).await
-}
-
-fn spawn_embedded_nats_recovery_loop(cfg: &RouterConfig) {
-    let endpoint = cfg.nats_url.clone();
-    let storage_dir = cfg.nats_storage_dir.clone();
-    tokio::spawn(async move {
-        let mut ticker = time::interval(Duration::from_secs(NATS_EMBEDDED_RECOVERY_INTERVAL_SECS));
-        loop {
-            ticker.tick().await;
-            if nats_check_endpoint(&endpoint, Duration::from_secs(2))
-                .await
-                .is_ok()
-            {
-                continue;
-            }
-            tracing::warn!(
-                endpoint = %endpoint,
-                "embedded nats health-check failed; attempting recovery"
-            );
-            if let Err(err) =
-                start_embedded_broker_with_storage(&endpoint, Some(storage_dir.as_path())).await
-            {
-                tracing::warn!(
-                    endpoint = %endpoint,
-                    error = %err,
-                    "embedded nats recovery start failed"
-                );
-                continue;
-            }
-            if let Err(err) =
-                wait_for_nats_endpoint(&endpoint, Duration::from_secs(NATS_READY_TIMEOUT_SECS))
-                    .await
-            {
-                tracing::warn!(
-                    endpoint = %endpoint,
-                    error = %err,
-                    "embedded nats recovery health-check failed"
-                );
-                continue;
-            }
-            tracing::info!(
-                endpoint = %endpoint,
-                "embedded nats recovery succeeded"
-            );
-        }
-    });
-}
-
-async fn prepare_nats_runtime(cfg: &RouterConfig) -> Result<(), RouterError> {
-    if cfg.nats_mode == "embedded" {
-        fs::create_dir_all(&cfg.nats_storage_dir)?;
-        start_embedded_broker_with_storage(&cfg.nats_url, Some(cfg.nats_storage_dir.as_path()))
-            .await?;
-        tracing::info!(
-            mode = %cfg.nats_mode,
-            port = cfg.nats_port,
-            storage_dir = %cfg.nats_storage_dir.display(),
-            endpoint = %cfg.nats_url,
-            "embedded nats broker started"
-        );
-    } else {
-        tracing::info!(
-            mode = %cfg.nats_mode,
-            endpoint = %cfg.nats_url,
-            "nats configured"
-        );
-    }
-    Ok(())
 }
 
 /// The router's copy of a turn for its stream: the message as routed, with its action class and

@@ -488,7 +488,6 @@ Códigos recomendados (no exhaustivo):
 - si esos fields aparecen en payloads viejos, deben tratarse como metadata opaca/legacy, no como fuente canónica de contexto.
 - el contexto canónico relevante para AI Nodes hoy entra por:
   - `meta.thread_id`
-  - `meta.thread_seq`
   - `meta.src_ilk`
   - `meta.memory_package`
 

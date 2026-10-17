@@ -26,7 +26,6 @@ use fluxbee_sdk::blob::{
     BLOB_NAME_MAX_CHARS, BLOB_STAGING_TTL_HOURS,
 };
 use fluxbee_sdk::identity::IdentityError;
-use fluxbee_sdk::nats::{request_local, NatsRequestEnvelope, NatsResponseEnvelope};
 use fluxbee_sdk::protocol::{Destination, Message, Meta, Routing, SYSTEM_KIND};
 #[cfg(not(test))]
 use fluxbee_sdk::rpc::{AdminCommandRequest, AdminCommandResult};
@@ -36,7 +35,8 @@ use fluxbee_sdk::rpc::{
 };
 use fluxbee_sdk::{
     classify_admin_action, classify_system_message, derive_action_outcome, ActionClass, NodeConfig,
-    NodeSender, NodeUuidMode, ADMIN_KIND, MSG_ADMIN_COMMAND,
+    NodeSender, NodeUuidMode, StorageMetricsResponse, ADMIN_KIND, MSG_ADMIN_COMMAND,
+    MSG_STORAGE_METRICS_GET, MSG_STORAGE_METRICS_RESPONSE,
 };
 use json_router::{
     runtime_manifest::{
@@ -61,11 +61,9 @@ const ORCH_SUDOERS_PATH: &str = "/etc/sudoers.d/fluxbee-orchestrator";
 const ORCH_SSH_GATE_PATH: &str = "/usr/local/bin/fluxbee-ssh-gate.sh";
 const RUNTIME_VERIFY_INTERVAL_SECS: u64 = 300;
 const RUNTIME_RETENTION_PROTECTION_WINDOW_SECS: u64 = 600;
-const NATS_BOOTSTRAP_TIMEOUT_SECS: u64 = 20;
 const STORAGE_BOOTSTRAP_TIMEOUT_SECS: u64 = 30;
 const STORAGE_DB_READINESS_TIMEOUT_SECS: u64 = 30;
 const STORAGE_DB_READINESS_REQUEST_TIMEOUT_SECS: u64 = 3;
-const SUBJECT_STORAGE_METRICS_GET: &str = "storage.metrics.get";
 const RPC_CH_ADMIN: &str = "admin";
 const RPC_CH_SYSTEM: &str = "system";
 const MSG_ILK_REGISTER: &str = "ILK_REGISTER";
@@ -165,7 +163,6 @@ struct HiveFile {
     hive_id: String,
     role: Option<String>,
     wan: Option<WanSection>,
-    nats: Option<NatsSection>,
     storage: Option<StorageSection>,
     blob: Option<BlobSection>,
     dist: Option<DistSection>,
@@ -371,13 +368,6 @@ struct WanSection {
 #[derive(Debug, Deserialize)]
 struct WanUplink {
     address: String,
-}
-
-#[derive(Debug, Deserialize)]
-struct NatsSection {
-    mode: Option<String>,
-    port: Option<u16>,
-    url: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -600,6 +590,9 @@ struct OrchestratorState {
     is_motherbee: bool,
     role: HiveRole,
     started_at: Instant,
+    /// Set once the boot ended (`finish_bootstrap`). Until then admin commands get
+    /// ORCHESTRATOR_BOOTING: the orchestrator is on its router before its boot ends.
+    booted: AtomicBool,
     config_dir: PathBuf,
     state_dir: PathBuf,
     gateway_name: String,
@@ -612,7 +605,6 @@ struct OrchestratorState {
     runtime_lifecycle_lock: Mutex<()>,
     last_runtime_verify: Mutex<Instant>,
     last_blob_gc: Mutex<Instant>,
-    nats_endpoint: String,
     identity_sync_port: u16,
     system_nodes: RoleSystemNodes,
     egress: Option<EgressSection>,
@@ -845,14 +837,13 @@ async fn main() -> Result<(), OrchestratorError> {
         .as_ref()
         .and_then(|wan| wan.authorized_hives.clone())
         .unwrap_or_default();
-    let nats_endpoint = nats_endpoint_from_hive(&hive);
     let identity_sync_port = identity_sync_port_from_hive(&hive);
     let blob_runtime = blob_runtime_from_hive(&hive);
     let dist_runtime = dist_runtime_from_hive(&hive);
     let storage_path = storage_path_from_hive(&hive);
     // A retired node runs nowhere, even while this hive's hive.yaml still names it.
-    retire_system_nodes(&config_dir, role);
-    let system_nodes = without_retired_nodes(system_nodes_for_role(&hive, role)?);
+    retire_system_nodes(&config_dir);
+    let system_nodes = system_nodes_for_role(&hive, role)?;
     let ai = hive
         .ai
         .as_ref()
@@ -866,6 +857,7 @@ async fn main() -> Result<(), OrchestratorError> {
         is_motherbee,
         role,
         started_at: Instant::now(),
+        booted: AtomicBool::new(false),
         config_dir: config_dir.clone(),
         state_dir: state_dir.clone(),
         gateway_name,
@@ -878,7 +870,6 @@ async fn main() -> Result<(), OrchestratorError> {
         runtime_lifecycle_lock: Mutex::new(()),
         last_runtime_verify: Mutex::new(Instant::now()),
         last_blob_gc: Mutex::new(Instant::now()),
-        nats_endpoint,
         identity_sync_port,
         system_nodes,
         egress: hive.egress.clone(),
@@ -939,15 +930,6 @@ async fn main() -> Result<(), OrchestratorError> {
         return Err("orchestrator rpc client already initialized".into());
     }
     tracing::info!("connected to router");
-    tracing::info!(hive = %hive.hive_id, "hive ready");
-    tracing::info!(
-        mode = if state.is_motherbee {
-            "motherbee-control-plane"
-        } else {
-            "worker-agent"
-        },
-        "orchestrator role mode"
-    );
 
     // Long-lived workers serializing admin/system command delivery. Each one
     // owns its `RpcCommandReceiver` so we keep ordering inside a category
@@ -990,6 +972,21 @@ async fn main() -> Result<(), OrchestratorError> {
         let state = Arc::clone(&state);
         tokio::spawn(run_syncthing_options_switch_loop(state));
     }
+
+    // The boot's last steps run with the workers up: system messages are taken as they come (as
+    // the periodic reconcile already allows), and admin commands get ORCHESTRATOR_BOOTING until
+    // the boot ends, so a caller is not left waiting on a hive that is not ready.
+    finish_bootstrap(&state, &rpc_client).await?;
+    state.booted.store(true, Ordering::Release);
+    tracing::info!(hive = %hive.hive_id, "hive ready");
+    tracing::info!(
+        mode = if state.is_motherbee {
+            "motherbee-control-plane"
+        } else {
+            "worker-agent"
+        },
+        "orchestrator role mode"
+    );
 
     let mut sigterm = signal(SignalKind::terminate())?;
     let mut sigint = signal(SignalKind::interrupt())?;
@@ -1044,6 +1041,21 @@ async fn run_admin_worker(
 ) {
     while let Some(msg) = rx.recv().await {
         let sender = client.sender_snapshot();
+        if !state.booted.load(Ordering::Acquire) {
+            let action = msg.meta.action.as_deref().unwrap_or("");
+            if let Err(err) = send_admin_error(
+                &sender,
+                &msg,
+                action,
+                "ORCHESTRATOR_BOOTING",
+                "the orchestrator is still booting; retry shortly",
+            )
+            .await
+            {
+                tracing::warn!("admin action error: {err}");
+            }
+            continue;
+        }
         if let Err(err) = handle_admin(&sender, &msg, &state).await {
             tracing::warn!("admin action error: {err}");
         }
@@ -1457,11 +1469,8 @@ async fn bootstrap_local(
     tracing::info!("starting rt-gateway");
     start_core_service("rt-gateway", &replaced, &mut upgrade_restart)?;
     wait_for_router_ready(state, socket_dir, Duration::from_secs(30)).await?;
-    wait_for_nats_ready(
-        &state.nats_endpoint,
-        Duration::from_secs(NATS_BOOTSTRAP_TIMEOUT_SECS),
-    )
-    .await?;
+    // Only now: an upgraded hive's old router, stopping above, flushed its broker to disk.
+    retire_nats_state(&state.config_dir);
     ensure_core_firewall_local(state);
     if let Err(err) = reconcile_egress(state) {
         if state.role == HiveRole::Egress {
@@ -1537,6 +1546,16 @@ async fn bootstrap_local(
         );
     }
     upgrade_restart.finish();
+    Ok(())
+}
+
+/// The boot's last steps, once this orchestrator is on its router: on the motherbee, the wait for
+/// SY.storage's database, asked over the mesh (A-70 stage 2b); then the persisted nodes'
+/// reconcile and the blob hand-over. Meanwhile admin commands get ORCHESTRATOR_BOOTING.
+async fn finish_bootstrap(
+    state: &OrchestratorState,
+    rpc: &RouterDispatcher,
+) -> Result<(), OrchestratorError> {
     if state.is_motherbee {
         wait_for_service_active(
             "sy-storage",
@@ -1544,7 +1563,8 @@ async fn bootstrap_local(
         )
         .await?;
         wait_for_storage_db_ready(
-            &state.config_dir,
+            rpc,
+            &format!("SY.storage@{}", state.hive_id),
             Duration::from_secs(STORAGE_DB_READINESS_TIMEOUT_SECS),
         )
         .await?;
@@ -1682,75 +1702,54 @@ fn boot_upgrade_restart_record(
     })
 }
 
+/// Waits until SY.storage answers its inbox metrics, which it does once it reads its database:
+/// `STORAGE_METRICS_GET` over the mesh (A-70 stage 2b; it was `storage.metrics.get` on the embedded
+/// NATS broker).
 async fn wait_for_storage_db_ready(
-    config_dir: &Path,
+    rpc: &RouterDispatcher,
+    target: &str,
     timeout: Duration,
 ) -> Result<(), OrchestratorError> {
     let started = Instant::now();
     let mut attempts: u64 = 0;
     loop {
         attempts = attempts.saturating_add(1);
-        let trace_id = Uuid::new_v4().to_string();
-        let reply_subject = format!("storage.metrics.reply.orchestrator.{trace_id}");
-        let sid = 40_019;
-        let request = NatsRequestEnvelope::<serde_json::Value>::new(
-            SUBJECT_STORAGE_METRICS_GET,
-            trace_id.clone(),
-            reply_subject.clone(),
-            None,
-        );
-        let request_body = serde_json::to_vec(&request)?;
-
-        match request_local(
-            config_dir,
-            SUBJECT_STORAGE_METRICS_GET,
-            &request_body,
-            &reply_subject,
-            sid,
-            Duration::from_secs(STORAGE_DB_READINESS_REQUEST_TIMEOUT_SECS),
-        )
-        .await
-        {
-            Ok(body) => {
-                match serde_json::from_slice::<NatsResponseEnvelope<serde_json::Value>>(&body) {
-                    Ok(response) if response.status == "ok" => {
-                        tracing::info!(
-                            attempts = attempts,
-                            elapsed_ms = started.elapsed().as_millis() as u64,
-                            "sy-storage DB readiness confirmed via storage.metrics.get"
-                        );
-                        return Ok(());
-                    }
-                    Ok(response) => {
-                        tracing::warn!(
-                            attempts = attempts,
-                            elapsed_ms = started.elapsed().as_millis() as u64,
-                            status = %response.status,
-                            error_code = ?response.error_code,
-                            error_detail = ?response.error_detail,
-                            "sy-storage readiness probe returned non-ok status; retrying"
-                        );
-                    }
-                    Err(err) => {
-                        tracing::warn!(
-                            attempts = attempts,
-                            elapsed_ms = started.elapsed().as_millis() as u64,
-                            error = %err,
-                            "sy-storage readiness probe decode failed; retrying"
-                        );
-                    }
-                }
-            }
-            Err(err) => {
-                tracing::warn!(
-                    attempts = attempts,
+        let answer = rpc
+            .send_system_rpc(SystemRpcRequest {
+                target,
+                request_msg: MSG_STORAGE_METRICS_GET,
+                response_msg: MSG_STORAGE_METRICS_RESPONSE,
+                payload: serde_json::json!({}),
+                timeout: Duration::from_secs(STORAGE_DB_READINESS_REQUEST_TIMEOUT_SECS),
+            })
+            .await
+            .map_err(|err| err.to_string())
+            .and_then(|reply| {
+                serde_json::from_value::<StorageMetricsResponse>(reply.payload)
+                    .map_err(|err| err.to_string())
+            });
+        match answer {
+            Ok(response) if response.ok => {
+                tracing::info!(
+                    attempts,
                     elapsed_ms = started.elapsed().as_millis() as u64,
-                    error = %err,
-                    "sy-storage readiness probe failed; retrying"
+                    "sy-storage DB readiness confirmed over the mesh"
                 );
+                return Ok(());
             }
+            Ok(response) => tracing::warn!(
+                attempts,
+                elapsed_ms = started.elapsed().as_millis() as u64,
+                error = ?response.error,
+                "sy-storage has no database yet; retrying"
+            ),
+            Err(err) => tracing::warn!(
+                attempts,
+                elapsed_ms = started.elapsed().as_millis() as u64,
+                error = %err,
+                "sy-storage readiness probe failed; retrying"
+            ),
         }
-
         if started.elapsed() >= timeout {
             return Err(format!(
                 "sy-storage DB readiness timeout after {}s (attempts={})",
@@ -2506,12 +2505,23 @@ async fn send_admin_forbidden(
     action: &str,
     reason: &str,
 ) -> Result<(), OrchestratorError> {
+    send_admin_error(sender, msg, action, "FORBIDDEN", reason).await
+}
+
+/// An admin command's error answer, before any flow ran.
+async fn send_admin_error(
+    sender: &NodeSender,
+    msg: &Message,
+    action: &str,
+    error_code: &str,
+    reason: &str,
+) -> Result<(), OrchestratorError> {
     let action_class = classify_admin_action(action);
     let (action_result, result_origin) =
-        derive_action_outcome(action_class, Some("error"), Some("FORBIDDEN"));
+        derive_action_outcome(action_class, Some("error"), Some(error_code));
     let payload = serde_json::json!({
         "status": "error",
-        "error_code": "FORBIDDEN",
+        "error_code": error_code,
         "message": reason,
     });
     let reply = Message {
@@ -4900,28 +4910,6 @@ async fn send_system_action_response(
     Ok(())
 }
 
-async fn wait_for_nats_ready(endpoint: &str, timeout: Duration) -> Result<(), OrchestratorError> {
-    let start = Instant::now();
-    loop {
-        match json_router::nats::check_endpoint(endpoint, Duration::from_secs(2)).await {
-            Ok(()) => {
-                tracing::info!(endpoint = %endpoint, "nats endpoint ready");
-                return Ok(());
-            }
-            Err(err) => {
-                if start.elapsed() >= timeout {
-                    return Err(format!(
-                        "nats bootstrap timeout endpoint={} error={}",
-                        endpoint, err
-                    )
-                    .into());
-                }
-            }
-        }
-        time::sleep(Duration::from_millis(250)).await;
-    }
-}
-
 async fn wait_for_service_active(
     service: &str,
     timeout: Duration,
@@ -4936,32 +4924,6 @@ async fn wait_for_service_active(
             return Err(format!("{} bootstrap timeout (systemd inactive)", service).into());
         }
         time::sleep(Duration::from_millis(250)).await;
-    }
-}
-
-fn nats_endpoint_from_hive(hive: &HiveFile) -> String {
-    let Some(nats) = hive.nats.as_ref() else {
-        return "nats://127.0.0.1:4222".to_string();
-    };
-
-    if let Some(url) = nats.url.as_ref() {
-        let url = url.trim();
-        if !url.is_empty() {
-            return url.to_string();
-        }
-    }
-
-    let mode = nats
-        .mode
-        .as_deref()
-        .unwrap_or("embedded")
-        .trim()
-        .to_ascii_lowercase();
-    let port = nats.port.unwrap_or(4222);
-    if mode == "embedded" || mode == "client" {
-        format!("nats://127.0.0.1:{port}")
-    } else {
-        "nats://127.0.0.1:4222".to_string()
     }
 }
 
@@ -5087,10 +5049,12 @@ fn load_hive(config_dir: &Path) -> Result<HiveFile, OrchestratorError> {
     Ok(serde_yaml::from_str(&data)?)
 }
 
-/// System nodes that no longer run, with their units (A-70 stage 2a, docs/router-stream-v1.md
-/// §6.2): SY.policy only counted turns. Their binaries and units stay one more release: a hive
-/// whose orchestrator is still the old one rejects a core manifest without a component its
-/// hive.yaml lists, so the motherbee's templates keep naming them until stage 2b.
+/// System nodes that no longer run, with their units (A-70 stage 2, docs/router-stream-v1.md
+/// §6.2): SY.policy only counted turns. Retired over two releases, because a hive whose
+/// orchestrator is older rejects a core manifest without a component its hive.yaml lists: 0.1.77
+/// stopped it and took it out of each hive's own section; since 0.1.78 no package ships it, and it
+/// leaves every section, the motherbee's templates for the spokes too. This list and its clean-up
+/// go once every hive booted 0.1.78.
 const RETIRED_SYSTEM_NODES: &[(&str, &str)] = &[("SY.policy", "sy-policy")];
 
 fn without_retired_nodes(mut section: RoleSystemNodes) -> RoleSystemNodes {
@@ -5100,23 +5064,29 @@ fn without_retired_nodes(mut section: RoleSystemNodes) -> RoleSystemNodes {
     section
 }
 
-/// At boot, before the node list is read: each retired node's unit is stopped and disabled, and
-/// the node leaves this hive's own role section of hive.yaml (`nodes` and `wait_for`), once and
-/// logged. The file is edited by lines, so its comments stay; the other roles' sections, the
-/// motherbee's templates for the spokes, are left alone. Best effort: a failure is logged and the
-/// boot goes on (`without_retired_nodes` keeps the node from starting anyway).
-fn retire_system_nodes(config_dir: &Path, role: HiveRole) {
+/// At boot, before the node list is read: each retired node leaves every role section of
+/// hive.yaml (`nodes` and `wait_for`), this hive's own and, on the motherbee, its templates for the
+/// spokes; its unit is stopped and disabled; its unit file and binary go where they are left (a
+/// spoke's, a motherbee installed by scripts/install.sh; a package's are gone with the package).
+/// Once and logged. The file is edited by lines, so its comments stay. Best effort: a failure is
+/// logged and the boot goes on (`system_nodes_for_role` leaves the node out anyway).
+fn retire_system_nodes(config_dir: &Path) {
     let path = config_dir.join("hive.yaml");
     let retired: Vec<&str> = RETIRED_SYSTEM_NODES.iter().map(|(node, _)| *node).collect();
     match fs::read_to_string(&path) {
         Ok(text) => {
-            let (edited, removed) = drop_retired_from_role_section(&text, role.as_str(), &retired);
+            let mut edited = text;
+            let mut removed = Vec::new();
+            for section in ["motherbee", "worker", "ingress", "egress"] {
+                let (next, dropped) = drop_retired_from_role_section(&edited, section, &retired);
+                edited = next;
+                removed.extend(dropped.into_iter().map(|node| format!("{section}: {node}")));
+            }
             if !removed.is_empty() {
                 match write_file_atomic(&path, edited.as_bytes()) {
                     Ok(()) => tracing::info!(
-                        role = role.as_str(),
                         removed = ?removed,
-                        "retired system nodes left this hive's node list in hive.yaml"
+                        "retired system nodes left the node lists in hive.yaml"
                     ),
                     Err(err) => {
                         tracing::warn!(error = %err, "could not rewrite hive.yaml to drop retired system nodes")
@@ -5135,16 +5105,146 @@ fn retire_system_nodes(config_dir: &Path, role: HiveRole) {
                 .status()
                 .is_ok_and(|status| status.success())
         };
-        if !is("is-active") && !is("is-enabled") {
+        if is("is-active") || is("is-enabled") {
+            let _ = Command::new("systemctl")
+                .args(["disable", "--now", service])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status();
+            tracing::info!(node, service, "retired system node stopped and disabled");
+        }
+        let unit = PathBuf::from(format!("/etc/systemd/system/{service}.service"));
+        let binary = PathBuf::from(service_to_exec(service));
+        let mut gone = Vec::new();
+        for file in [&unit, &binary] {
+            if !file.exists() {
+                continue;
+            }
+            match fs::remove_file(file) {
+                Ok(()) => gone.push(file.display().to_string()),
+                Err(err) => tracing::warn!(
+                    file = %file.display(),
+                    error = %err,
+                    "could not remove a retired system node's file"
+                ),
+            }
+        }
+        if gone.is_empty() {
             continue;
         }
-        let _ = Command::new("systemctl")
-            .args(["disable", "--now", service])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status();
-        tracing::info!(node, service, "retired system node stopped and disabled");
+        if gone.contains(&unit.display().to_string()) {
+            let _ = Command::new("systemctl")
+                .arg("daemon-reload")
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status();
+        }
+        tracing::info!(node, files = ?gone, "retired system node's unit and binary removed");
     }
+}
+
+/// The embedded NATS broker is gone (A-70 stage 2b). Once at boot, and logged: what its state
+/// file still held (messages nobody reads any more; on the ingress, the edge's old turns), then
+/// its directory, and the `nats:` section of hive.yaml with the comment above it. Best effort.
+/// This clean-up goes once every hive booted 0.1.78.
+fn retire_nats_state(config_dir: &Path) {
+    let dir = json_router::paths::storage_root_dir().join("nats");
+    if dir.is_dir() {
+        for entry in fs::read_dir(&dir).into_iter().flatten().flatten() {
+            let path = entry.path();
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if !name.starts_with("embedded-js-") || !name.ends_with(".json") {
+                continue;
+            }
+            let pending = fs::read(&path)
+                .ok()
+                .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+                .map(|state| nats_pending_by_subject(&state))
+                .unwrap_or_default();
+            tracing::info!(
+                file = %path.display(),
+                pending = ?pending,
+                "the embedded NATS broker's messages go with it"
+            );
+        }
+        match fs::remove_dir_all(&dir) {
+            Ok(()) => {
+                tracing::info!(dir = %dir.display(), "removed the embedded NATS broker's directory")
+            }
+            Err(err) => tracing::warn!(
+                dir = %dir.display(),
+                error = %err,
+                "could not remove the embedded NATS broker's directory"
+            ),
+        }
+    }
+    let path = config_dir.join("hive.yaml");
+    let Ok(text) = fs::read_to_string(&path) else {
+        return;
+    };
+    if let Some(edited) = drop_top_level_section(&text, "nats") {
+        match write_file_atomic(&path, edited.as_bytes()) {
+            Ok(()) => tracing::info!("removed the nats section from hive.yaml"),
+            Err(err) => {
+                tracing::warn!(error = %err, "could not remove the nats section from hive.yaml")
+            }
+        }
+    }
+}
+
+/// Messages per subject in the broker's state file (`streams.<subject>.messages`), the empty
+/// subjects left out.
+fn nats_pending_by_subject(state: &serde_json::Value) -> BTreeMap<String, usize> {
+    let Some(streams) = state.get("streams").and_then(|streams| streams.as_object()) else {
+        return BTreeMap::new();
+    };
+    streams
+        .iter()
+        .filter_map(|(subject, stream)| {
+            let messages = stream
+                .get("messages")
+                .and_then(|messages| messages.as_array())
+                .map_or(0, Vec::len);
+            (messages > 0).then(|| (subject.clone(), messages))
+        })
+        .collect()
+}
+
+/// hive.yaml without a top-level section: its key line, the lines indented under it, and the
+/// comment lines right above it that name it; `None` when there is no such section.
+fn drop_top_level_section(text: &str, key: &str) -> Option<String> {
+    let lines: Vec<&str> = text.lines().collect();
+    let header = format!("{key}:");
+    let start = lines.iter().position(|line| {
+        line.strip_prefix(header.as_str())
+            .is_some_and(|rest| rest.is_empty() || rest.starts_with(' '))
+    })?;
+    let mut first = start;
+    while first > 0
+        && lines[first - 1].starts_with('#')
+        && lines[first - 1].to_ascii_lowercase().contains(key)
+    {
+        first -= 1;
+    }
+    let mut end = start + 1;
+    while end < lines.len() && (lines[end].starts_with(' ') || lines[end].starts_with('\t')) {
+        end += 1;
+    }
+    // One blank line is enough between the sections around it.
+    if end < lines.len()
+        && lines[end].trim().is_empty()
+        && (first == 0 || lines[first - 1].trim().is_empty())
+    {
+        end += 1;
+    }
+    let mut out = lines[..first].to_vec();
+    out.extend_from_slice(&lines[end..]);
+    let mut edited = out.join("\n");
+    if text.ends_with('\n') {
+        edited.push('\n');
+    }
+    Some(edited)
 }
 
 /// hive.yaml without the retired nodes in `system_nodes.<role>`, by lines; and what it removed.
@@ -5212,8 +5312,11 @@ fn system_nodes_for_role(
             role.as_str()
         )
     })?;
-    validate_system_nodes(role_section, role)?;
-    Ok(role_section.clone())
+    // A retired node is left out for every reader: the boot, the core components a spoke
+    // installs, the templates of a join; even where the hive.yaml rewrite failed.
+    let role_section = without_retired_nodes(role_section.clone());
+    validate_system_nodes(&role_section, role)?;
+    Ok(role_section)
 }
 
 fn validate_system_nodes(
@@ -5484,7 +5587,6 @@ fn ensure_dirs(
     fs::create_dir_all(opa_root.join("current"))?;
     fs::create_dir_all(opa_root.join("staged"))?;
     fs::create_dir_all(opa_root.join("backup"))?;
-    fs::create_dir_all(storage_root.join("nats"))?;
     ensure_syncthing_user()?;
     // blob/ is root's and the Syncthing user only traverses it to its folders; staging/ is root's
     // alone, links inside removed: nodes stage blobs there before they hand them to the folder
@@ -13655,7 +13757,7 @@ fn get_hive(_state_dir: &Path, hive_id: &str) -> Result<serde_json::Value, Orche
 }
 
 fn remove_hive_cleanup_script() -> &'static str {
-    "for s in rt-gateway sy-config-routes sy-opa-rules sy-identity sy-vault sy-cognition sy-policy sy-timer sy-wf-rules sy-orchestrator sy-admin sy-architect sy-storage sy-frontdesk-gov fluxbee-syncthing; do \
+    "for s in rt-gateway sy-config-routes sy-opa-rules sy-identity sy-vault sy-cognition sy-timer sy-wf-rules sy-orchestrator sy-admin sy-architect sy-storage sy-frontdesk-gov fluxbee-syncthing; do \
 systemctl stop --no-block \"$s\" >/dev/null 2>&1 || true; \
 systemctl disable \"$s\" >/dev/null 2>&1 || true; \
 systemctl kill -s KILL \"$s\" >/dev/null 2>&1 || true; \
@@ -20506,7 +20608,7 @@ fn worker_remote_base_dirs_command(blob: &BlobRuntimeConfig) -> String {
     let blob_active_dir = blob.path.join("active");
     let blob_staging_dir = blob.path.join("staging");
     sudo_wrap(&format!(
-        "mkdir -p /etc/fluxbee /var/lib/fluxbee/state/nodes /var/lib/fluxbee/opa/current /var/lib/fluxbee/opa/staged /var/lib/fluxbee/opa/backup /var/lib/fluxbee/nats /var/lib/fluxbee/dist /var/lib/fluxbee/dist/runtimes /var/lib/fluxbee/dist/core/bin /var/lib/fluxbee/dist/vendor /var/run/fluxbee/routers '{}' '{}' '{}' '{}'",
+        "mkdir -p /etc/fluxbee /var/lib/fluxbee/state/nodes /var/lib/fluxbee/opa/current /var/lib/fluxbee/opa/staged /var/lib/fluxbee/opa/backup /var/lib/fluxbee/dist /var/lib/fluxbee/dist/runtimes /var/lib/fluxbee/dist/core/bin /var/lib/fluxbee/dist/vendor /var/run/fluxbee/routers '{}' '{}' '{}' '{}'",
         shell_single_quote_path(&blob.path),
         shell_single_quote_path(&blob_active_dir),
         shell_single_quote_path(&blob_staging_dir),
@@ -20520,7 +20622,7 @@ fn worker_remote_base_dirs_command(blob: &BlobRuntimeConfig) -> String {
 fn ingress_remote_base_dirs_command(blob: &BlobRuntimeConfig) -> String {
     let public_dir = blob_public_sync_folder_path(blob);
     sudo_bash_wrap(&format!(
-        "getent passwd fluxbee >/dev/null 2>&1 || useradd --system --user-group --home-dir /var/lib/fluxbee --no-create-home --shell /usr/sbin/nologin fluxbee; mkdir -p /etc/fluxbee /var/lib/fluxbee/state/nodes /var/lib/fluxbee/state/sy-edge /var/lib/fluxbee/opa/current /var/lib/fluxbee/opa/staged /var/lib/fluxbee/opa/backup /var/lib/fluxbee/nats /var/lib/fluxbee/dist /var/lib/fluxbee/dist/runtimes /var/lib/fluxbee/dist/core/bin /var/lib/fluxbee/dist/vendor /var/run/fluxbee/routers '{}' '{}' '{}' && chown -R fluxbee:fluxbee '{}' '{}' && chmod 0750 /var/lib/fluxbee/state/sy-edge",
+        "getent passwd fluxbee >/dev/null 2>&1 || useradd --system --user-group --home-dir /var/lib/fluxbee --no-create-home --shell /usr/sbin/nologin fluxbee; mkdir -p /etc/fluxbee /var/lib/fluxbee/state/nodes /var/lib/fluxbee/state/sy-edge /var/lib/fluxbee/opa/current /var/lib/fluxbee/opa/staged /var/lib/fluxbee/opa/backup /var/lib/fluxbee/dist /var/lib/fluxbee/dist/runtimes /var/lib/fluxbee/dist/core/bin /var/lib/fluxbee/dist/vendor /var/run/fluxbee/routers '{}' '{}' '{}' && chown -R fluxbee:fluxbee '{}' '{}' && chmod 0750 /var/lib/fluxbee/state/sy-edge",
         shell_single_quote_path(&blob.path),
         shell_single_quote_path(&public_dir),
         shell_single_quote_path(&blob.sync_data_dir),
@@ -23323,7 +23425,7 @@ async fn add_hive_flow(
         state.ai.provider, state.ai.provider, state.ai.model
     );
     let hive_yaml = format!(
-        "hive_id: {}\nrole: worker\n{}wan:\n  gateway_name: RT.gateway\n  mtls: required\n  uplinks:\n    - address: \"{}\"\nnats:\n  mode: embedded\n  port: 4222\nstorage:\n  path: \"{}\"\ngovernment:\n  identity_frontdesk: \"{}\"\nidentity:\n  sync:\n    upstream: \"{}\"\n    auth: required\nblob:\n  enabled: {}\n  path: \"{}\"\n  sync:\n    enabled: {}\n    tool: \"{}\"\n    api_port: {}\n    data_dir: \"{}\"\n  gc:\n    enabled: {}\n    interval_secs: {}\n    apply: {}\n    staging_ttl_hours: {}\n    active_retain_days: {}\ndist:\n  path: \"{}\"\n  sync:\n    enabled: {}\n    tool: \"{}\"\n{}{}",
+        "hive_id: {}\nrole: worker\n{}wan:\n  gateway_name: RT.gateway\n  mtls: required\n  uplinks:\n    - address: \"{}\"\nstorage:\n  path: \"{}\"\ngovernment:\n  identity_frontdesk: \"{}\"\nidentity:\n  sync:\n    upstream: \"{}\"\n    auth: required\nblob:\n  enabled: {}\n  path: \"{}\"\n  sync:\n    enabled: {}\n    tool: \"{}\"\n    api_port: {}\n    data_dir: \"{}\"\n  gc:\n    enabled: {}\n    interval_secs: {}\n    apply: {}\n    staging_ttl_hours: {}\n    active_retain_days: {}\ndist:\n  path: \"{}\"\n  sync:\n    enabled: {}\n    tool: \"{}\"\n{}{}",
         hive_id,
         ai_yaml,
         worker_uplink,
@@ -24049,7 +24151,7 @@ async fn add_egress_hive_flow(
         address,
         &key_path,
         &sudo_wrap(
-            "mkdir -p /etc/fluxbee /var/lib/fluxbee/state/nodes /var/lib/fluxbee/opa/current /var/lib/fluxbee/opa/staged /var/lib/fluxbee/opa/backup /var/lib/fluxbee/nats /var/lib/fluxbee/dist /var/lib/fluxbee/dist/runtimes /var/lib/fluxbee/dist/core/bin /var/lib/fluxbee/dist/vendor /var/run/fluxbee/routers",
+            "mkdir -p /etc/fluxbee /var/lib/fluxbee/state/nodes /var/lib/fluxbee/opa/current /var/lib/fluxbee/opa/staged /var/lib/fluxbee/opa/backup /var/lib/fluxbee/dist /var/lib/fluxbee/dist/runtimes /var/lib/fluxbee/dist/core/bin /var/lib/fluxbee/dist/vendor /var/run/fluxbee/routers",
         ),
         creds.user.as_str(),
     ) {
@@ -24093,7 +24195,7 @@ async fn add_egress_hive_flow(
     // an `update category=core` that sat at 202 sync_pending forever without ever saying the
     // folder did not exist. It now follows motherbee's dist config like the worker's writer.
     let hive_yaml = format!(
-        "hive_id: {hive_id}\nrole: egress\nwan:\n  gateway_name: RT.gateway\n  mtls: required\n  uplinks:\n    - address: \"{uplink}\"\nnats:\n  mode: embedded\n  port: 4222\nstorage:\n  path: \"{storage}\"\nblob:\n  enabled: false\n  sync:\n    enabled: false\ndist:\n  path: \"{dist_path}\"\n  sync:\n    enabled: {dist_sync_enabled}\n    tool: \"{dist_sync_tool}\"\negress:\n  enabled: true\n  lan_cidr: \"{lan_cidr}\"\n  edge_ip: \"{edge_ip}\"\n  wan_iface: \"{wan_iface}\"\n  lan_iface: \"{lan_iface}\"\n  ipv6: \"blocked\"\n{system_nodes}",
+        "hive_id: {hive_id}\nrole: egress\nwan:\n  gateway_name: RT.gateway\n  mtls: required\n  uplinks:\n    - address: \"{uplink}\"\nstorage:\n  path: \"{storage}\"\nblob:\n  enabled: false\n  sync:\n    enabled: false\ndist:\n  path: \"{dist_path}\"\n  sync:\n    enabled: {dist_sync_enabled}\n    tool: \"{dist_sync_tool}\"\negress:\n  enabled: true\n  lan_cidr: \"{lan_cidr}\"\n  edge_ip: \"{edge_ip}\"\n  wan_iface: \"{wan_iface}\"\n  lan_iface: \"{lan_iface}\"\n  ipv6: \"blocked\"\n{system_nodes}",
         hive_id = hive_id,
         uplink = worker_uplink,
         storage = storage_path,
@@ -24785,7 +24887,7 @@ async fn add_ingress_hive_flow(
         }
     }
     let hive_yaml = format!(
-        "hive_id: {hive_id}\nrole: ingress\nwan:\n  gateway_name: RT.gateway\n  mtls: required\n  uplinks:\n    - address: \"{uplink}\"\nnats:\n  mode: embedded\n  port: 4222\nstorage:\n  path: \"{storage}\"\nblob:\n  enabled: false\n  path: \"{blob_path}\"\n  sync:\n    enabled: true\n    public_enabled: true\n    tool: \"{blob_sync_tool}\"\n    api_port: {blob_sync_api_port}\n    data_dir: \"{blob_sync_data_dir}\"\ndist:\n  path: \"{dist_path}\"\n  sync:\n    enabled: {dist_sync_enabled}\n    tool: \"{dist_sync_tool}\"\nedge:\n  listen: \"{edge_listen}\"\n  endpoints_path: \"/etc/fluxbee/edge.endpoints.json\"\n  publications_path: \"/var/lib/fluxbee/state/sy-edge/publications.json\"\n  blob_public_root: \"{blob_path}/public\"\n{edge_tls}{system_nodes}",
+        "hive_id: {hive_id}\nrole: ingress\nwan:\n  gateway_name: RT.gateway\n  mtls: required\n  uplinks:\n    - address: \"{uplink}\"\nstorage:\n  path: \"{storage}\"\nblob:\n  enabled: false\n  path: \"{blob_path}\"\n  sync:\n    enabled: true\n    public_enabled: true\n    tool: \"{blob_sync_tool}\"\n    api_port: {blob_sync_api_port}\n    data_dir: \"{blob_sync_data_dir}\"\ndist:\n  path: \"{dist_path}\"\n  sync:\n    enabled: {dist_sync_enabled}\n    tool: \"{dist_sync_tool}\"\nedge:\n  listen: \"{edge_listen}\"\n  endpoints_path: \"/etc/fluxbee/edge.endpoints.json\"\n  publications_path: \"/var/lib/fluxbee/state/sy-edge/publications.json\"\n  blob_public_root: \"{blob_path}/public\"\n{edge_tls}{system_nodes}",
         hive_id = hive_id,
         uplink = worker_uplink,
         storage = storage_path,
@@ -27062,10 +27164,10 @@ fn is_ingress_role(role: Option<&str>) -> bool {
 mod tests {
     use super::*;
 
-    /// A-70 stage 2a: SY.policy leaves this hive's own role section, by lines, comments kept; the
-    /// other roles' sections (the motherbee's templates for the spokes) keep it until stage 2b.
+    /// A-70 stage 2: a retired node leaves one role section at a time, by lines, comments kept;
+    /// the other sections stay as they are (the boot drops it from each section in turn).
     #[test]
-    fn a_retired_node_leaves_only_this_hives_own_section() {
+    fn a_retired_node_leaves_one_role_section_at_a_time() {
         let text = r#"hive_id: worker1
 system_nodes:
   motherbee:
@@ -27102,6 +27204,40 @@ wan:
         });
         assert_eq!(section.nodes, vec!["SY.config.routes".to_string()]);
         assert!(section.wait_for.is_empty());
+    }
+
+    /// A-70 stage 2b: the `nats:` section leaves hive.yaml with the comment that names it, and a
+    /// spoke's rendered file (no comment) loses it too; a file without it is left alone.
+    #[test]
+    fn the_nats_section_leaves_hive_yaml() {
+        let packaged = "hive_id: motherbee\nrole: motherbee\n\n# Local NATS broker for control/data plane.\nnats:\n  mode: embedded\n  port: 4222\n\n# Local admin HTTP API.\nadmin:\n  listen: \"127.0.0.1:8080\"\n";
+        assert_eq!(
+            drop_top_level_section(packaged, "nats").as_deref(),
+            Some("hive_id: motherbee\nrole: motherbee\n\n# Local admin HTTP API.\nadmin:\n  listen: \"127.0.0.1:8080\"\n")
+        );
+        let rendered = "hive_id: worker1\nrole: worker\nwan:\n  gateway_name: RT.gateway\nnats:\n  mode: embedded\n  port: 4222\nstorage:\n  path: \"/var/lib/fluxbee\"\n";
+        assert_eq!(
+            drop_top_level_section(rendered, "nats").as_deref(),
+            Some("hive_id: worker1\nrole: worker\nwan:\n  gateway_name: RT.gateway\nstorage:\n  path: \"/var/lib/fluxbee\"\n")
+        );
+        assert!(
+            drop_top_level_section("hive_id: x\nnatsy: 1\nstorage:\n  nats: 1\n", "nats").is_none()
+        );
+    }
+
+    #[test]
+    fn the_brokers_pending_messages_are_counted_by_subject() {
+        let state = serde_json::json!({
+            "streams": {
+                "storage.turns": {"messages": [{"seq": 1}, {"seq": 2}], "last_seq": 2},
+                "storage.cognition.threads": {"messages": [], "last_seq": 52}
+            },
+            "consumers": {}
+        });
+        let pending = nats_pending_by_subject(&state);
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending.get("storage.turns"), Some(&2));
+        assert!(nats_pending_by_subject(&serde_json::json!({})).is_empty());
     }
 
     #[test]
@@ -32536,6 +32672,7 @@ blob:
             is_motherbee: true,
             role: HiveRole::Motherbee,
             started_at: Instant::now(),
+            booted: AtomicBool::new(true),
             config_dir: PathBuf::from("/tmp/fluxbee-test-config"),
             state_dir: PathBuf::from("/tmp/fluxbee-test-state"),
             gateway_name: "RT.gateway".to_string(),
@@ -32548,7 +32685,6 @@ blob:
             runtime_lifecycle_lock: Mutex::new(()),
             last_runtime_verify: Mutex::new(Instant::now()),
             last_blob_gc: Mutex::new(Instant::now()),
-            nats_endpoint: "nats://127.0.0.1:4222".to_string(),
             identity_sync_port: 0,
             system_nodes: RoleSystemNodes {
                 nodes: vec!["SY.config.routes".to_string(), "SY.timer".to_string()],

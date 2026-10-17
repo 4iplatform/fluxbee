@@ -18,7 +18,7 @@ if [ -d /run/systemd/system ]; then
             done
             ;;
         *)
-            for s in sy-orchestrator io-cloud io-blob sy-edge sy-frontdesk-gov sy-wf-rules sy-timer sy-policy \
+            for s in sy-orchestrator io-cloud io-blob sy-edge sy-frontdesk-gov sy-wf-rules sy-timer \
                      sy-cognition sy-identity sy-storage sy-vault sy-architect sy-admin \
                      sy-opa-rules sy-config-routes rt-gateway; do
                 systemctl stop "$s.service" >/dev/null 2>&1 || true

@@ -24,37 +24,27 @@ Para un nodo AI normal, cognition no entra por una única vía.
 
 ### Lo que llega automáticamente en el mensaje
 
-Si el router tiene enrichment disponible para ese thread, el nodo recibe en `meta`:
+El router del agente le adjunta en `meta` el paquete de memoria de su comunicación (el `thread_id`
+con el ILK del agente), cuando SY.cognition ya armó uno:
 
 - `thread_id`
-- `thread_seq`
 - `memory_package`
 
-Ese es el camino canónico para consumo cognitivo online en un `AI.*`.
+Ese es el camino canónico para consumo cognitivo online en un `AI.*`. El orden de la comunicación
+lo lleva SY.cognition con el número de turno; el mensaje no trae una secuencia.
 
 ### Lo que NO llega automáticamente
 
-Los subjects durables de cognition no se inyectan solos en el carrier:
-
-- `storage.turns`
-- `storage.cognition.threads`
-- `storage.cognition.contexts`
-- `storage.cognition.reasons`
-- `storage.cognition.cooccurrences`
-- `storage.cognition.scopes`
-- `storage.cognition.scope_instances`
-- `storage.cognition.memories`
-- `storage.cognition.episodes`
-
-Si un nodo AI quiere consumirlos, tiene que suscribirse explícitamente por NATS con `fluxbee_sdk::nats`.
+Las entidades durables de cognition (threads, contexts, reasons, cooccurrences, scopes,
+scope_instances, memories, episodes) y el log de mensajes (`turns`) viven en SY.storage. Un nodo AI
+no las lee: hoy solo SY.cognition pide el estado de una comunicación (`COGNITION_STATE_GET`).
 
 ### Qué hacer y qué no hacer
 
 - Usar `meta.memory_package` para enrichment conversacional normal.
-- Usar `meta.thread_id` / `meta.thread_seq` como metadata conversacional.
+- Usar `meta.thread_id` como metadata conversacional.
 - Mantener state e immediate memory keyed por `src_ilk`.
-- Ir a NATS solo si el nodo necesita replay, durable entities crudas o un rol de observador/processor.
-- No asumir acceso automático a `storage.cognition.*`.
+- No asumir acceso a las entidades de cognition.
 - No usar SHM (`jsr-memory`) como interfaz normal de nodo AI.
 - No usar PostgreSQL como superficie primaria para un nodo AI normal.
 

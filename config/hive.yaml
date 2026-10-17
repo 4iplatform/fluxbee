@@ -18,11 +18,6 @@ wan:
   uplinks:
     - address: "192.168.8.220:9000"
 
-# Local NATS broker for control/data plane.
-nats:
-  mode: embedded
-  port: 4222
-
 # Local admin HTTP API.
 admin:
   listen: "127.0.0.1:8080"
@@ -85,7 +80,7 @@ system_nodes:
     #    don't depend on its SHM being populated to register, but having
     #    it first guarantees routes exist before any cross-hive traffic.
     # 2. All vault consumers SECOND (identity, admin, architect, storage,
-    #    cognition, opa.rules, policy, timer, wf-rules, frontdesk-gov)
+    #    cognition, opa.rules, timer, wf-rules, frontdesk-gov)
     #    so they REGISTER WITH THE ROUTER before vault emits its
     #    bootstrap broadcast. Each consumer tolerates VAULT_UNAVAILABLE
     #    at its initial lookup — it logs degraded and waits for the
@@ -110,7 +105,6 @@ system_nodes:
       - SY.architect
       - SY.storage
       - SY.cognition
-      - SY.policy
       - SY.timer
       - SY.wf-rules
       - SY.frontdesk.gov
@@ -121,7 +115,6 @@ system_nodes:
       - SY.opa.rules
       - SY.admin
       - SY.cognition
-      - SY.policy
       - SY.timer
       - SY.vault
   worker:
@@ -130,7 +123,6 @@ system_nodes:
       - SY.identity
       - SY.opa.rules
       - SY.cognition
-      - SY.policy
       - SY.timer
       - SY.wf-rules
     wait_for:
@@ -138,7 +130,6 @@ system_nodes:
       - SY.identity
       - SY.opa.rules
       - SY.cognition
-      - SY.policy
       - SY.timer
   # SY.opa.rules runs on EVERY role: the router of each hive enforces the one global user
   # policy, compiled on the motherbee and synced to all hives (dist/policy). It needs no

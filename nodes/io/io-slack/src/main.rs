@@ -2485,7 +2485,6 @@ mod tests {
                 dst_ilk: Some("ilk:dst".to_string()),
                 ich: Some("slack://T123".to_string()),
                 thread_id: Some("thread:canonical-1".to_string()),
-                thread_seq: Some(7),
                 context: Some(json!({
                     "io": {
                         "reply_target": {
@@ -2509,7 +2508,6 @@ mod tests {
 
         assert_eq!(reply.meta.ich.as_deref(), Some("slack://T123"));
         assert_eq!(reply.meta.thread_id.as_deref(), Some("thread:canonical-1"));
-        assert_eq!(reply.meta.thread_seq, Some(7));
         assert_eq!(
             reply
                 .meta
@@ -3437,7 +3435,6 @@ fn build_system_reply(
             dst_ilk: incoming.meta.dst_ilk.clone(),
             ich: incoming.meta.ich.clone(),
             thread_id: incoming.meta.thread_id.clone(),
-            thread_seq: incoming.meta.thread_seq,
             ctx: None,
             ctx_seq: None,
             ctx_window: None,
