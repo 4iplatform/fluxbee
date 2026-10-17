@@ -995,7 +995,7 @@ Visto al arreglar los e2e de A-37, leyendo `src/router/mod.rs` y `src/shm/mod.rs
   binario generaría uno como root); si no, el `myID` del Syncthing en marcha. Nunca `config.xml`.
 - **Estado:** construido; lo ejercita el próximo join (el de A-48).
 
-### A-70 🟡 ETAPAS 1a Y 1b VALIDADAS EN 8.x (0.1.75 y 0.1.76, 2026-10-16); 2 Y 3 PENDIENTES — El "NATS" de los registros vive dentro del router, pierde datos y solo guarda lo del motherbee
+### A-70 🟡 ETAPAS 1a, 1b Y 2a VALIDADAS EN 8.x (0.1.75, 0.1.76 y 0.1.77, 2026-10-16/17); 2b Y 3 PENDIENTES — El "NATS" de los registros vive dentro del router, pierde datos y solo guarda lo del motherbee
 
 - **Cómo salió:** diseñando la etapa 5 (tokens), el registro iba a viajar por NATS. El operador
   pidió revisar NATS en general y entre hives. Diseño: `docs/router-stream-v1.md`.
@@ -1114,11 +1114,56 @@ Visto al arreglar los e2e de A-37, leyendo `src/router/mod.rs` y `src/shm/mod.rs
 
   Para probarlo hubo que enmascarar `sy-storage`: el watchdog de SY.orchestrator lo levanta a los 2
   s de un `stop`. Detalle en `lab/DEPLOYMENTS.md`.
+- **Etapa 2, conversada con el operador (2026-10-17, doc §6.1):**
+  - **la cognición es de los interlocutores** (*"la parte cognitiva es de los interlocutores no
+    de que hive está o que nodo es... los nodos son mecanismos, igual que el router"*): memoria y
+    referencias por comunicación entre ILKs, nunca por hive o nodo;
+  - **el dueño del turno es el dueño de la comunicación:** el agente que la atiende;
+  - **cognition sigue junto a los agentes** (motherbee y workers), para que lean su memoria por
+    SHM local (*"no quiero cambiar eso"*). El router del agente le pasa los dos sentidos a su
+    cognition local;
+  - SY.policy se va (*"si no hace nada sacalo. molesta"*); NATS se borra entero, sin legado; los
+    597 turnos del ingress se tiran; los datos de prueba se pueden borrar;
+  - el costo de LLM queda como está; lo transversal entre hives es para después.
+
+  Una revisión del diseño (una ronda) encontró un HIGH: sacar SY.policy en una sola versión
+  bloqueaba el core-update de todos los workers. Va en dos versiones. Los MEDIUM se incorporaron:
+  una comunicación es `(thread_id, ILK del agente)`, el número de turno reemplaza a `thread_seq`,
+  la época del stream, los sobres empaquetados, la región que sobrevive reinicios, la recarga por
+  la malla y pesos iguales para los dos ILKs.
+- **Etapa 2a, el código:** cognition por comunicación, SY.policy retirado (primera versión) y el
+  router sin NATS para turnos. Una revisión del código (una ronda), sin HIGH. Se arregló antes del
+  build:
+  - **MEDIUM:** una comunicación cargada se quedaba vieja si su agente se iba a otro hive y
+    volvía, y la otra cognition la había seguido. Ahora, después de 5 min sin turnos, se vuelve a
+    pedir a SY.storage, y gana la que va más adelante;
+  - **LOW:**
+    - el nodo del agente se fija apenas se trae el estado;
+    - la recarga conserva lo que SY.storage todavía no tiene, y corre fuera del loop principal;
+    - sin hilo no se lee la región de memoria;
+    - el `hive.yaml` se escribe atómico;
+    - los scopes también los protege el número de turno;
+    - SY.frontdesk.gov contesta con su ILK;
+    - comentarios y pasajes del doc viejos.
+- **La etapa 2a, validada en 8.x (0.1.77):**
+  - **dos hives, una comunicación:** un interlocutor en worker1 y el agente en el motherbee. La
+    cognition del motherbee recibió los dos sentidos, la de worker1 nada; una sola comunicación
+    en la base, escrita por una cognition, con el ILK del agente;
+  - **las respuestas salen con el ILK del agente;**
+  - **el agente recibe el paquete de su comunicación,** y el que manda el emisor se descarta;
+  - **un reinicio de cognition** recarga por la malla y la memoria queda; la numeración sigue;
+  - **el refetch por inactividad** pide el estado una vez, después de 5 min sin turnos;
+  - **un agente en worker1:** la cognition de worker1 escribe en postgres por el stream. Antes no
+    tenía base;
+  - **SY.policy** no corre en ningún hive; NATS no recibió nada; health limpio.
+
+  Detalle en `lab/DEPLOYMENTS.md`.
 - **Etapas:**
   1. **1a:** los bugs vivos ✅;
   2. **1b:** el stream con SY.storage ✅;
-  3. **2:** cognition y policy como destinos, el diseño de Q1, y NATS borrado;
-  4. **3:** los tokens.
+  3. **2a:** cognition por comunicación, SY.policy retirado ✅;
+  4. **2b:** NATS borrado, y SY.policy fuera del todo;
+  5. **3:** los tokens.
 
 ### A-69 ✅ VALIDADO EN 8.x (0.1.73 y 0.1.74, 2026-10-16) — SY.cognition fallaba en cada turno con los dos proveedores: mandaba `temperature`
 

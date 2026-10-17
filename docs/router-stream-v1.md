@@ -1,8 +1,8 @@
 # Router stream — v1
 
 Status: design reviewed once (2026-10-16); stages 1a and 1b validated on 8.x (0.1.75, 0.1.76);
-stage 2 designed with the operator and reviewed (2026-10-17, §6), 2a built for 0.1.77; 2b and
-stage 3 pending. Finding A-70 (`lab/logbook/FINDINGS.md`).
+stage 2 designed with the operator and reviewed (2026-10-17, §6), 2a validated on 8.x (0.1.77,
+§6.8); 2b and stage 3 pending. Finding A-70 (`lab/logbook/FINDINGS.md`).
 
 The router gets a small stream of its own. It replaces the embedded NATS broker, and carries three
 kinds of data to SY.storage:
@@ -781,3 +781,19 @@ the idle refetch above. LOW, all fixed: the agent node set right after a fetch; 
 what SY.storage has no state for yet and runs off the main loop; no memory region read for a
 message without a thread; the hive.yaml edit written atomically; scopes guarded by the turn too;
 SY.frontdesk.gov's replies carry its own ILK; stale comments and doc passages.
+
+### 6.8 2a on 8.x (0.1.77, 2026-10-17)
+
+Every 2a gate of §6.4 passed (details in `lab/DEPLOYMENTS.md`):
+- a test sender on worker1 and an agent on the motherbee: the motherbee's cognition got both
+  directions, worker1's nothing; one communication in postgres, with the agent's ILK;
+- the replies carry the agent's ILK; the agent gets its communication's package, and a package
+  the sender put in is dropped;
+- a cognition restart reloads over the mesh and keeps the region; a held communication idle for
+  5 minutes is fetched once before its next turn;
+- an agent on worker1: worker1's cognition outputs reach postgres through the stream;
+- SY.policy runs nowhere (the motherbee's `worker` section still names it until 2b); nothing
+  reached NATS; health clean.
+
+For 2b: SY.cognition's start line reports `ai_secret_source=missing`, because the key is now
+resolved afterwards on the turn worker.

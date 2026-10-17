@@ -21,7 +21,8 @@
 
 | Versión | Fecha (ART) | Commit | Alcance | Estado | Rollback |
 |---|---|---|---|---|---|
-| **0.1.76** | 2026-10-16 | `e24e7d3` | motherbee + spokes (core) | ✅ live | snap `pre-stream1b-0-1-76` (las 4 VMs); `apt install fluxbee=0.1.75` pierde la inbox purgada (ver la entrada) |
+| **0.1.77** | 2026-10-17 | `377945a` | motherbee + spokes (core) | ✅ live | snap `pre-stream2a-0-1-77` (las 4 VMs); `apt` solo no alcanza (ver la entrada) |
+| **0.1.76** | 2026-10-16 | `e24e7d3` | motherbee + spokes (core) | ✅ reemplazado por 0.1.77 | snap `pre-stream1b-0-1-76` (las 4 VMs); `apt install fluxbee=0.1.75` pierde la inbox purgada (ver la entrada) |
 | **0.1.75** | 2026-10-16 | `1c00389` | motherbee + spokes (core) | ✅ reemplazado por 0.1.76 | snap `pre-stream1a-0-1-75` (las 4 VMs); `apt` solo no alcanza (ver la entrada) |
 | **0.1.74** | 2026-10-16 | `0d69329` | motherbee + spokes (core) | ✅ reemplazado por 0.1.75 | snap `pre-sdk-0-1-74` (las 4 VMs) · `apt install fluxbee=0.1.73` |
 | **0.1.73** | 2026-10-16 | `822f237` | motherbee + spokes (core) + `hive.yaml` (IA: Claude) | ✅ reemplazado por 0.1.74 | snap `pre-cognition-0-1-73` (las 4 VMs) · `apt install fluxbee=0.1.72` · `hive.yaml.pre-claude-0-1-72` |
@@ -85,6 +86,123 @@
 > (`dpkg-scanpackages -m`) para rollback, pero su detalle vive en la bitácora, no acá.
 
 ---
+
+## 0.1.77 — Cognition por comunicación: el router del agente le pasa los dos sentidos a su cognition local (A-70, etapa 2a)
+
+- **Fecha:** 2026-10-17 (ART) · **Versión anterior:** 0.1.76 · **Commit:** `377945a`.
+  - Diseño: `docs/router-stream-v1.md` §6, conversado con el operador y revisado una vez.
+  - Una revisión del código: ningún HIGH. El MEDIUM (una comunicación cargada se quedaba vieja si
+    su agente se iba y volvía) y los LOW, arreglados antes del build.
+- **Alcance:** motherbee + los tres spokes (core-update).
+- **Qué cambió:**
+  - **El modelo (decisión del operador):** la memoria es de la comunicación entre ILKs, nunca de
+    un hive o un nodo. Una comunicación es `(thread_id, ILK del agente)`, y su dueño es el agente
+    que la atiende. El número de turno la ordena; el router ya no asigna `thread_seq`.
+  - **Router:**
+    - ya no copia turnos a NATS;
+    - copia a `cognition.turns` cada turno con `thread_id` que manda un nodo `AI.*` local, o que
+      le entrega a uno (local, después de la WAN, después de IRP; nunca copias de tap ni
+      broadcasts). El destino es `SY.cognition@<su hive>`, en el motherbee y los workers;
+    - adjunta el paquete de memoria por destino, solo a los `AI.*`, el de `(thread_id, nodo
+      agente)`; el que trae el emisor se descarta;
+    - los lotes del stream llevan una época (`state.json`), para distinguir un log reiniciado de
+      repetidos.
+  - **SY.cognition:**
+    - lee `cognition.turns` del stream de su router; el ILK del agente sale de identity por
+      `handler_node` (en caché 60 s);
+    - sus sobres (esquema v2, con `agent_ilk` y `turn`) salen como un registro
+      `storage.cognition.batch` por turno, por el stream;
+    - al arrancar recarga desde SY.storage, por la malla, las comunicaciones que tiene la región
+      de memoria (`COGNITION_STATE_GET`, paginado);
+    - una comunicación cargada que estuvo 5 min sin turnos se vuelve a pedir antes del próximo, y
+      gana el estado guardado si va más adelante;
+    - ya no usa NATS ni postgres.
+  - **SY.storage:**
+    - las tablas de cognition se rearman una vez (marca `cognition_reset_v1`; los datos de prueba
+      se tiran, decisión del operador), con la comunicación como clave: `agent_ilk` y
+      `source_turn`;
+    - una fila solo la reemplaza un turno igual o posterior, también los scopes;
+    - expande `storage.cognition.batch` a una fila de inbox por sobre, después de verificar el
+      productor;
+    - contesta `COGNITION_STATE_GET`, solo a `SY.cognition@*`, en páginas de 64 KB.
+  - **SDK de IA:** la respuesta lleva el ILK del agente como `src_ilk` y al interlocutor como
+    `dst_ilk`. ai.generic y SY.frontdesk.gov pasan el suyo.
+  - **SY.policy se retira (primera de dos versiones):**
+    - inactivo y deshabilitado;
+    - fuera de la sección propia de cada `hive.yaml` (escritura atómica);
+    - el motherbee lo deja en su sección `worker` hasta 2b, porque si no los orquestadores viejos
+      de los workers rechazan el core-update.
+  - **El broker** borra al arrancar, y rechaza después, los consumidores de turnos de SY.storage,
+    SY.cognition y SY.policy.
+- **Deploy:**
+  - build de `377945a` en 25 min, publish en 14 s, deploy en 230 s;
+  - snapshots `pre-stream2a-0-1-77` en las 4 VMs (se borró `pre-sdk-0-1-74`);
+  - 0.1.77 en los 4, health `failed=0 streamlost=0`.
+- **Gate:**
+  - **El upgrade:**
+    - SY.policy inactivo y deshabilitado en el motherbee y worker1. El `hive.yaml` del
+      motherbee lo nombra solo en la sección `worker`; el de worker1, en ninguna;
+    - ningún broker tiene consumidores de `storage.turns`. Los 597 turnos del ingress siguen ahí
+      hasta 2b;
+    - los streams del motherbee y worker1 suman `SY.cognition@<hive>` como destino; el ingress y
+      el egress no;
+    - las tablas de cognition quedaron en v2 y vacías;
+    - las dos cognitions recargaron por la malla ("ok loaded 0"). La de worker1 antes fallaba
+      por no tener base.
+  - **Una conversación con el agente en el motherbee** (`AI.gate77@motherbee`, ai.generic 0.1.77,
+    en un tenant de prueba) desde un interlocutor de prueba en worker1 (un probe por socket),
+    3 turnos:
+    - las respuestas salen con el ILK del agente como `src_ilk` y el del interlocutor como
+      `dst_ilk`;
+    - la cognition del motherbee procesó 6 turnos (3 de ida, 3 de vuelta), ninguno sin ILK de
+      agente, con 6 + 6 llamados al modelo (etiquetador y resumidor) y 119 entidades, sin
+      errores. La de worker1 no recibió nada;
+    - una sola comunicación en la base: la del agente, turno 6, escrita por
+      `SY.cognition@motherbee`; todas sus filas llevan el ILK del agente;
+    - `turns` tiene las 6 filas, en los dos sentidos;
+    - la región de memoria tiene la entrada con el nodo y el ILK del agente;
+    - el agente no tenía clave en su tenant (desde 0.1.66 no hay caída a la clave raíz), así que
+      contestó con el error `missing_ai_api_key`. Cognition evaluó esas respuestas con la clave
+      del core. El gate no depende de lo que contesta el agente, y no se copió la clave del
+      operador a un tenant de prueba.
+  - **El paquete:** con el nodo real detenido, un probe por socket tomó su nombre, y el
+    interlocutor le mandó un turno con un paquete falso. El probe recibió el paquete real de su
+    comunicación (contextos, una memoria, razones) y no el falso.
+  - **La recarga:**
+    - `sy-cognition` del motherbee reiniciado: recargó por la malla en 0,3 s ("loaded 1, without
+      state 0, failed 0") y la entrada de la región quedó;
+    - el turno siguiente siguió en los turnos 9 y 10, sobre las mismas filas.
+  - **El refetch por inactividad:**
+    - un turno dentro de los 5 min no pidió nada;
+    - después de 5,5 min sin turnos, el siguiente pidió el estado una vez y siguió en el turno 14.
+  - **Un agente en worker1** (`AI.gate77w@worker1`), con 2 turnos desde el motherbee:
+    - la cognition de worker1 procesó 4 y sus 80 entidades llegaron a postgres, escritas por
+      `SY.cognition@worker1` con el ILK de ese agente;
+    - la del motherbee no las tocó;
+    - cada región tiene solo la comunicación de su propio agente.
+  - **Los streams** entregaron todo una vez (cursores iguales, nada perdido). NATS no se tocó: el
+    `last_seq` de `storage.turns` siguió en 974 y 310.
+  - **Health:** `failed=0 denials=0 srcdrops=0 streamlost=0` en los 4.
+  - **Limpieza:**
+    - los dos nodos purgados con su identidad (identity volvió a 28 ILKs);
+    - el tenant borrado y purgado;
+    - las regiones de memoria vaciadas (cognition detenida con `mask --runtime`; no quedó ninguna
+      máscara);
+    - de la base se borraron 18 turnos, sus 18 filas de inbox, 415 sobres de cognition de la
+      inbox y todas las filas de cognition (no queda ninguna).
+  - **Para probar:**
+    - `kill_node` seguido de `remove_node_instance` falla (`NODE_INSTANCE_RUNNING`): la baja
+      completa es `kill_node` con `purge_instance: true`, que además libera la identidad;
+    - `state_fetches_total` sale en el STATUS de SY.cognition (un mensaje de sistema `STATUS`),
+      no en CONFIG_GET.
+- **Pendiente para 2b:**
+  - la línea "sy.cognition started" dice `ai_secret_source=missing`, porque la clave ahora se
+    resuelve después, en la tarea de turnos. Es cosmético;
+  - el ejemplo de `config-set` del admin todavía nombra `vault_key`, rechazado desde 0.1.53. Va
+    a la pasada de limpieza.
+- **Rollback:** snapshot `pre-stream2a-0-1-77`. `apt install fluxbee=0.1.76` sola no alcanza:
+  - las tablas de cognition quedaron en v2, y el SY.storage de 0.1.76 no puede escribirlas;
+  - SY.policy salió de la sección propia de cada `hive.yaml`.
 
 ## 0.1.76 — El stream del router lleva los turnos de todos los hives a SY.storage (A-70, etapa 1b)
 
