@@ -2,7 +2,8 @@
 
 Status: design reviewed once (2026-10-16); stages 1a and 1b validated on 8.x (0.1.75, 0.1.76);
 stage 2 designed with the operator and reviewed (2026-10-17, §6), validated on 8.x (2a in 0.1.77,
-§6.8; 2b in 0.1.78, §6.9: NATS is gone); stage 3 pending. Finding A-70 (`lab/logbook/FINDINGS.md`).
+§6.8; 2b in 0.1.78, §6.9: NATS is gone); stage 3 designed with the operator and reviewed once
+(2026-10-17, §7). Finding A-70 (`lab/logbook/FINDINGS.md`).
 
 The router gets a small stream of its own. It replaces the embedded NATS broker, and carries three
 kinds of data to SY.storage:
@@ -444,6 +445,9 @@ The stream depends on these, so they come first.
 
 ### 2.14 Stage 3: LLM usage records
 
+Superseded in its details by §7 (designed with the operator and reviewed, 2026-10-17).
+
+
 - **One AI function.**
   - Every model call goes through the AI SDK's two factories (`create_llm_client`,
     `create_function_calling_model`). That is 14 call sites in 6 files, each building its client
@@ -522,14 +526,15 @@ the ledger and the logbook.
 - **A sink away longer than the window:** what it misses is lost and counted (D10).
 - **The ingress:** it ships its turns like any hive, and keeps their content on its disk only until
   SY.storage acks. A special mode for the DMZ is for later (D9).
-- **SY.cognition's rebuild on a worker:** it reads postgres directly, and a worker has no
-  database. The stream carries data to the database, not back.
 - **A local process can still HELLO with any other node's name** (P-1, postponed with A-22). The
   streams are out of it: an `RT.*` name needs the router's own process (§2.1).
 - **An Anthropic retry after a transport error can be billed twice:** one record, two charges.
 - **Cognition loses its queue on a restart:** up to 256 turns acked but not processed yet, and,
   with a backlog, the newest past the queue. Best effort (D4).
 - **Hub-vouched senders and non-gateway routers** (§2.12).
+- **Usage records (stage 3, §7):** a node killed with model calls in flight is billed with no
+  record; on one host any process may register a `SY.*` name (P-1), so a record from a charging
+  `SY.*` producer is trusted within the hives §7.5 allows.
 
 ## 5. Open questions (for the operator)
 
@@ -543,7 +548,9 @@ the ledger and the logbook.
   - Operator's direction (2026-10-16), to design after stage 1: *"la idea es que los mensajes y los
     cognitions trabajen juntos, que sean un solo sistema, que el generador del mensaje, evaluador,
     sea el dueño y no se duplique"*.
-- **Q2 (stage 3): who is charged.**
+- **Q2 (stage 3): who is charged.** *Decided (operator, 2026-10-17): a tenant's node charges its
+  own tenant; SY.cognition charges the tenant of the communication's agent; SY.frontdesk.gov
+  charges the tenant of the case it registers ("OK todo").*
   - A message carries no tenant. Its `src_ilk` is what the sender declared, and the frontdesk
     works exactly on messages without one.
   - Proposal:
@@ -553,14 +560,22 @@ the ledger and the logbook.
       authenticated for that turn, else its destination's, else the root tenant;
     - `tenant_source` says which applied.
   - This needs an indexed ILK → tenant lookup that also resolves aliases.
-- **Q3 (stage 3): a caller's timeout.** Cognition wraps each call in an 8 s timeout, and the
+- **Q3 (stage 3): a caller's timeout.** *Decided (operator, 2026-10-17): recorded as `abandoned`,
+  without tokens, for now ("después vemos qué cambiamos si no sirve así").* Cognition wraps each
+  call in an 8 s timeout, and the
   provider bills a call that is dropped midway. Should the SDK detach the HTTP call so its
   response is still recorded, or count those calls as abandoned, without tokens?
-- **Q4 (stage 3): Archi's spending.** Root tenant, or the tenant whose solution it builds? If the
+- **Q4 (stage 3): Archi's spending.** *Decided (operator, 2026-10-17): the root tenant pays
+  ("cobranza será a raíz"); each record keeps what Archi's work belongs to when Archi knows it
+  (session, pipeline run, solution), the place for the client tenant later. Archi's solutions are a
+  topic of their own, for later.* Root tenant, or the tenant whose solution it builds? If the
   latter, the plan request must carry that tenant.
-- **Q5 (stage 3): retention.** Keep usage forever, with a purge by period only when Cloud asks?
+- **Q5 (stage 3): retention.** *Decided (operator, 2026-10-17): nothing is deleted for now; a
+  general database policy comes later, by date ("sin dudas necesita fechas").* Keep usage
+  forever, with a purge by period only when Cloud asks?
   Does io.cloud show the root tenant's spending (Archi, SY.admin)?
-- **Q6 (stage 3): `ai_local_probe`.** It builds an OpenAI client directly and has no router. Delete
+- **Q6 (stage 3): `ai_local_probe`.** *Decided (operator, 2026-10-17): deleted in the repo
+  cleanup.* It builds an OpenAI client directly and has no router. Delete
   it (repo cleanup)?
 - **Q7 (after stage 1): where the message log lives.** *Decided (operator, 2026-10-16): Archi
   reads `turns` — "que lea turn es integrado mas que lo otro, si es asi hacerlo". Built in 1b:*
@@ -831,3 +846,224 @@ its 597 unread turns before its broker went; storage metrics and the orchestrato
 work over the mesh; with SY.storage held, admin commands got `ORCHESTRATOR_BOOTING` within 0.01 s
 during the boot; a cognition conversation still works; health clean. Details in
 `lab/DEPLOYMENTS.md`.
+
+## 7. Stage 3: LLM usage records (designed 2026-10-17)
+
+It builds §2.14 on what stages 1 and 2 left: every hive's stream already delivers `storage.usage`
+to SY.storage, and a communication's agent is known at each turn. Reviewed once (§7.8); where §7
+and §2.14 differ, §7 holds.
+
+### 7.0 Facts (verified in code at 0.1.78)
+
+- **The calls:** 14 sites in 6 files build a client per operation through the AI SDK's two
+  factories:
+  - `create_llm_client`: the plain `generate` path, used by SY.cognition's tagger and summarizer,
+    and as a fallback by ai.generic and SY.frontdesk.gov;
+  - `create_function_calling_model`: the tool-loop `run_turn` path, used by ai.generic,
+    SY.frontdesk.gov, SY.architect (all six sites) and SY.admin's executor.
+  - Only `ai_local_probe`, a dev tool, builds a provider client directly.
+- **Usage today:**
+  - `generate` reads none;
+  - OpenAI's `run_turn` reads `total_tokens`, Anthropic's `input + output`, with no cache fields;
+  - the runner returns the sum only on success: a failed or overlong run loses it.
+- **Timeouts:** the SDK sets none and spawns nothing, so a caller that drops the future aborts the
+  HTTP request and nothing parses the answer. Callers:
+  - SY.cognition wraps each call in 8 s;
+  - the AI runtime wraps `on_message` in 60 s and runs it up to 3 times in all; for ai.generic and
+    SY.frontdesk.gov only the timeout re-runs it (model errors become a reply), so one message can
+    cost three full runs;
+  - SY.architect and SY.admin's executor set none.
+- **Who is at each call** (all one step away at most):
+  - ai.generic: its tenant and ILK (env from the orchestrator), the message's `trace_id`,
+    `thread_id`, `src_ilk`;
+  - SY.frontdesk.gov: the case's tenant (`case_tenant_of`, computable before the call; a root case
+    stops before any call);
+  - SY.cognition: the agent ILK's tenant, in the same identity record it already reads for the
+    agent ILK; an agent ILK never changes tenant;
+  - SY.architect: its session; in the pipeline stages also the run (`PipelineRunRecord`:
+    `pipeline_run_id`, `session_id`, `solution_id`, stage);
+  - SY.admin's executor: its `execution_id` (not on `executor_validate_plan`), and the caller's
+    router-stamped name (not forwarded to the executor today).
+- **The transport is ready:** the router accepts `storage.usage` from any producer and sends it to
+  SY.storage@motherbee. SY.storage acks it and drops it today (no handler, debug log only).
+- **Trust inputs:**
+  - the producer is the name the connection registered; only `RT.*` names are reserved (A-65, P-1);
+  - SY.storage runs on the motherbee as root and can read `/jsr-identity-motherbee`:
+    `find_ilk_by_handler_node_from_hive_id` gives a node's ILK and its tenant; the orchestrator
+    registers a node's ILK there before it spawns the node, also for a worker's node;
+  - the identity SHM drops deleted ILKs, and a motherbee whose SY.identity could not load its
+    database holds only the system ILKs until a restart;
+  - SY.admin has no database client; a mesh reply must fit 128 KB.
+- **Cloud:** io.cloud claims a tenant per request, never the root one, and SY.admin re-checks the
+  relayed content per action.
+
+### 7.1 Decisions (operator, 2026-10-17, §5 Q2–Q6)
+
+- A tenant's node pays its own tenant; SY.cognition pays with the communication's agent's tenant;
+  SY.frontdesk.gov with the case's tenant.
+- A call its caller abandoned is recorded as `abandoned`, without tokens.
+- SY.architect and SY.admin's executor pay with the root tenant; each record keeps what Archi's work
+  belongs to (session, pipeline run, solution), the place for the client tenant later.
+- Nothing is deleted for now; a general database policy by date comes later.
+- `ai_local_probe` goes. It must go now: the provider clients become private to the SDK.
+- Earlier (2026-10-16): Fluxbee only records; Cloud owns and reads the data; delivery during a long
+  motherbee outage is not addressed now.
+
+### 7.2 The AI SDK: one way to call a model
+
+- **`AiAccount`, required by both factories:**
+  - `recorder`: the process's usage recorder (below);
+  - `node_name`, `node_ilk`;
+  - `tenant_id` and `tenant_source`: `node`, `agent`, `case`, `root`, or `fallback_root` when the
+    tenant a rule names is unknown (then the tenant is the root one);
+  - `counterpart_ilk`, `trace_id`, `thread_id`, all optional;
+  - `work`: optional, fixed keys with short values (Archi: `session_id`, `pipeline_run_id`,
+    `solution_id`, `stage`; SY.admin's executor: `execution_id`, `caller`).
+- **The recorder:** one task per process, fed by a bounded channel through a synchronous
+  `try_send`. It appends each record to the node's router stream with the dispatcher's current
+  sender. A full channel or a failed append is counted, never returned to the caller. The AI
+  runtime starts it and hands it to its node; SY.* nodes start their own.
+- **One record per 2xx response,** on both paths, queued as soon as the body is parsed and before
+  any check: truncation, missing text or a failed schema still cost money.
+  - `run_turn` records each turn as it answers, so a run that fails later keeps its earlier turns.
+  - Anthropic's retries record only the attempt that answered 2xx.
+  - A 2xx whose body cannot be read is recorded `unreadable`, without tokens.
+  - Non-2xx and transport errors carry no usage: no record.
+- **`abandoned`:** a guard is armed while a request is outstanding and disarmed on every return;
+  if the caller drops the call while it is armed, the guard's `Drop` queues `abandoned`, without
+  tokens, with the same `try_send`.
+- **`outcome`** comes from the response body: `ok`, `truncated` (OpenAI `status` incomplete /
+  `incomplete_details`; Anthropic `stop_reason` `max_tokens`), `refused` (Anthropic `refusal`),
+  plus `unreadable` and `abandoned`.
+- **The counts, normalized** (a null or missing field counts 0):
+  - OpenAI (Responses): `uncached_input` = `input_tokens` − `input_tokens_details.cached_tokens`;
+    `cache_read` = the cached tokens; `cache_write` = 0; `output` = `output_tokens` (reasoning
+    included); `reasoning` = `output_tokens_details.reasoning_tokens`;
+  - Anthropic (Messages): `uncached_input` = `input_tokens`; `cache_read` =
+    `cache_read_input_tokens`; `cache_write` = `cache_creation_input_tokens` (its 5-minute and
+    1-hour split stays in the raw usage); `output` = `output_tokens` (thinking included);
+    `reasoning` absent;
+  - the provider's raw `usage` (capped at 2 KB), the provider's response `id`, the model it served
+    and OpenAI's `service_tier` are kept. Pricing is Cloud's, per record.
+- **What Archi's budget sees does not change:** the runner still sums what the provider reports.
+- The provider clients become private; the factories are the only way in. The mock client stays
+  for tests.
+
+### 7.3 Who pays, per site
+
+| Node | Sites | `tenant_id` | `tenant_source` | Also |
+|---|---|---|---|---|
+| ai.generic | 2 | its own (`FLUXBEE_NODE_TENANT_ID`) | `node` | counterpart = the message's `src_ilk`; trace, thread |
+| SY.frontdesk.gov | 2 | the case's (`case_tenant_of`, before the call) | `case` | counterpart, trace, thread |
+| SY.cognition | 2 | the agent ILK's (cached with it; the cache follows the identity SHM's `seq`) | `agent` | counterpart = the agent ILK; trace, thread |
+| SY.architect | 6 | root | `root` | `work` = session, pipeline run, solution, stage, as known |
+| SY.admin executor | 2 | root | `root` | `work` = `execution_id`, the caller's router-stamped name |
+
+Where a rule's tenant is unknown (no case tenant yet, an agent without a tenant), the call is
+still made and recorded against the root tenant, `fallback_root`. What SY.storage does with these
+values is §7.5: for `node` and `agent` it takes the tenant from identity itself.
+
+### 7.4 The record and the stream
+
+- **One `storage.usage` record per call,** through `stream::append`, about 1–2 KB:
+  `record_id` (a UUID), `provider_response_id`, `ts` (when the answer arrived, the producer's
+  clock), `hive`, `node_name`, `node_ilk`, `tenant_id`, `tenant_source`, `counterpart_ilk`,
+  `provider`, `model`, `served_model`, `service_tier`, `kind` (`generate`, `function_turn`),
+  `outcome`, `uncached_input`, `cache_read`, `cache_write`, `output`, `reasoning`, `raw_usage`,
+  `trace_id`, `thread_id`, `work`.
+- **Volume:** a human↔agent exchange makes about 5–7 records (cognition's 2 calls per direction,
+  ai.generic's tool turns and its `generate` fallback): about 6 KB, against about 160 KB of
+  cognition's envelopes.
+- **A reserve in the stream:** `storage.usage` keeps 1 MB of the nodes' 8 MB disk share and 128
+  slots of the nodes' queue, so cognition's packs cannot crowd it out; its losses are counted apart
+  and reported as `usagelost`. Its window stays 120 s, like every record.
+
+### 7.5 SY.storage
+
+- **Into the inbox like every subject,** checked when the row is processed. A check that cannot be
+  answered (identity unreadable, the ILK not there yet) is a processing error, so the inbox retries
+  it (10 × 60 s).
+- **Checks,** on top of the stream's (the producer belongs to the stream's hive):
+  - `node_name` must be the producer;
+  - **a node outside `SY.*`** pays its own tenant: SY.storage takes the tenant from the motherbee's
+    identity (the producer's ILK by `handler_node`), not from the record. A record that claims
+    another tenant is stored with the identity's tenant and counted as a mismatch;
+  - **SY.cognition** (motherbee and worker hives only): the tenant is taken from the
+    `counterpart_ilk` (the agent ILK) in identity;
+  - **SY.frontdesk.gov** (motherbee only): the case's tenant is taken as recorded;
+  - **SY.architect and SY.admin** (motherbee only): the root tenant only;
+  - `fallback_root` means the root tenant; any other `SY.*` producer is refused.
+
+  The identity snapshot is read once per batch of rows, so a node name reused by another tenant is
+  never charged from a stale cache.
+- **When identity never answers** (still unresolved on the last retry: a deleted node, a degraded
+  SY.identity): the record is stored with the tenant it claims, `verified = false`, and counted.
+  Spend is never dropped for a lookup.
+- **Refused records** (a wrong name, a foreign `SY.*`, a malformed or oversized record, a negative
+  count) are acked and dropped, and counted. One WARN line every 30 s gives the counts (refused,
+  mismatched, unverified); `ops.py health` shows them as `usagerej`.
+- **Table `llm_usage`:** the record's fields plus `stored_at` and `verified`; key `record_id`, and
+  `provider_response_id` unique where present (`ON CONFLICT DO NOTHING`: one response lands once);
+  indexes `(tenant_id, ts)`, `(node_name, ts)`, `(ts)` and `(stored_at, record_id)`; no foreign key
+  to the tenants (a purge stays free). Nothing is purged.
+- **`USAGE_QUERY` over the mesh,** from `SY.admin@motherbee` only, one at a time, on its own
+  database connection with a 15 s statement timeout, every filter a bound parameter:
+  - a tenant, or every tenant only with an explicit `all_tenants` that SY.admin sets for the
+    operator and Archi, never for a relayed Cloud request;
+  - a period by `ts`, at most 92 days;
+  - either a grouping from a closed list (`day`, `model`, `node`, `tenant`) with calls and the five
+    sums per group, or the records themselves; both paged under 64 KB with a cursor;
+  - records also by `stored_at` with a `since` cursor, so a reader can sync incrementally: rows
+    arrive late by design (the stream's window, the inbox retries), and a period is final only
+    after them.
+
+### 7.6 Reads
+
+- **SY.admin:** `get_llm_usage` (`GET /hives/motherbee/usage?tenant_id=&from=&to=&group_by=&since=&after=&limit=`),
+  for the operator and Archi.
+- **Cloud:** a Cloud op `get_usage` → `get_llm_usage` with io.cloud's claimed tenant, never the root
+  one. It is a Cloud-only action (not shared with other nodes), and SY.admin's relay rule for it
+  requires the claimed tenant and only the known fields. Cloud sees its tenant's spending; the root
+  tenant's (Archi, SY.admin) stays with the operator. A tenant's records name another tenant's
+  people only as ai.generic's counterpart, an ILK the agent already received.
+
+### 7.7 Gates on 8.x
+
+- An agent in the `pruebas` tenant, with a role, answers two turns: its records are charged to
+  `pruebas` (`node`); cognition's for the same turns to `pruebas` (`agent`); counts above zero; the
+  provider response ids unique.
+- An Archi chat turn: a record charged to the root tenant, with its session in `work`.
+- A turn through SY.frontdesk.gov charges the case's tenant.
+- A probe node appending a record that claims another tenant: stored with its own tenant, counted
+  as a mismatch; a probe under a foreign `SY.*` name: refused; both in the WARN line and `usagerej`.
+- SY.cognition's tagger timeout set to 50 ms: its calls are recorded `abandoned`, without tokens;
+  the timeout restored.
+- `GET /hives/motherbee/usage` by tenant, by day, by model, the paged records and the `since`
+  cursor; the Cloud op for `pruebas` answers, and a request for the root tenant through io.cloud is
+  refused.
+- Nothing lost in the streams (`usagelost` 0); health clean.
+
+### 7.8 Review (one round, 2026-10-17)
+
+Two lenses (accounting; trust and Cloud). One HIGH, seven MEDIUM, nine LOW; all folded in above:
+- **HIGH:** refusing a producer that identity does not know dropped real spend (a degraded
+  SY.identity holds only the system ILKs; deleted nodes; a name reused inside a cache) → checks at
+  processing time with the inbox's retries, the tenant taken from identity, and `verified = false`
+  instead of a drop.
+- **MEDIUM:**
+  - the record rode on the caller's future, and a `Drop` cannot send → a per-process recorder fed
+    by `try_send`, the record queued before any check, the guard armed only while a request is
+    outstanding;
+  - cognition's packs could crowd usage records out of the stream → a reserve, `usagelost`;
+  - reads by `ts` missed late rows → paging by `stored_at`, a `since` cursor;
+  - `USAGE_QUERY` could stall SY.storage → its own connection, one at a time, a statement timeout,
+    a bounded period, a closed grouping list;
+  - cognition's agent cache and a reused node name → the tenant from identity, the cache on `seq`.
+- **LOW:** `outcome` from the body (OpenAI's tool turns had no truncation check); `unreadable`;
+  the provider's response id as a unique key; nulls as 0, the served model and service tier kept,
+  pricing per record; grouped answers paged, `work` and `raw_usage` capped, negative counts
+  refused; an explicit `all_tenants`; Cloud-only action with its own relay rule; charging `SY.*`
+  producers accepted only from their hives; doc fixes.
+- **Known limits (§4):** a node killed with calls in flight (an upgrade, an OOM) is billed with no
+  record, not even `abandoned`; on one host a process can still register a `SY.*` name (P-1), so the
+  hive narrowing above is the cheap part of that fix.
