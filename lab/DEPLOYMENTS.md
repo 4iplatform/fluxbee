@@ -21,7 +21,8 @@
 
 | Versión | Fecha (ART) | Commit | Alcance | Estado | Rollback |
 |---|---|---|---|---|---|
-| **0.1.75** | 2026-10-16 | `1c00389` | motherbee + spokes (core) | ✅ live | snap `pre-stream1a-0-1-75` (las 4 VMs); `apt` solo no alcanza (ver la entrada) |
+| **0.1.76** | 2026-10-16 | `e24e7d3` | motherbee + spokes (core) | ✅ live | snap `pre-stream1b-0-1-76` (las 4 VMs); `apt install fluxbee=0.1.75` pierde la inbox purgada (ver la entrada) |
+| **0.1.75** | 2026-10-16 | `1c00389` | motherbee + spokes (core) | ✅ reemplazado por 0.1.76 | snap `pre-stream1a-0-1-75` (las 4 VMs); `apt` solo no alcanza (ver la entrada) |
 | **0.1.74** | 2026-10-16 | `0d69329` | motherbee + spokes (core) | ✅ reemplazado por 0.1.75 | snap `pre-sdk-0-1-74` (las 4 VMs) · `apt install fluxbee=0.1.73` |
 | **0.1.73** | 2026-10-16 | `822f237` | motherbee + spokes (core) + `hive.yaml` (IA: Claude) | ✅ reemplazado por 0.1.74 | snap `pre-cognition-0-1-73` (las 4 VMs) · `apt install fluxbee=0.1.72` · `hive.yaml.pre-claude-0-1-72` |
 | **0.1.72** | 2026-10-16 | `17e1edd` | motherbee + spokes (core) | ✅ reemplazado por 0.1.73 | snap `pre-sync-0-1-72` (las 4 VMs) · `apt install fluxbee=0.1.71` |
@@ -84,6 +85,82 @@
 > (`dpkg-scanpackages -m`) para rollback, pero su detalle vive en la bitácora, no acá.
 
 ---
+
+## 0.1.76 — El stream del router lleva los turnos de todos los hives a SY.storage (A-70, etapa 1b)
+
+- **Fecha:** 2026-10-16 (ART) · **Versión anterior:** 0.1.75 · **Commit:** `e24e7d3`.
+  - Diseño: `docs/router-stream-v1.md`. Una revisión del código: ningún HIGH, los dos MEDIUM y los
+    LOW arreglados antes del build.
+- **Alcance:** motherbee + los tres spokes (core-update).
+- **Qué cambió:**
+  - **Router:** cada router tiene su stream, un nodo propio `RT.<router>.stream@<hive>`:
+    - copia cada turno y toma los `STREAM_APPEND` de sus nodos;
+    - los guarda en disco una ventana de 120 s y 32 MB, y los entrega en lotes con ack a
+      `SY.storage@motherbee`;
+    - el router nunca espera: una cola acotada por cantidad y por bytes, y el disco en su propio
+      hilo;
+    - lo que se pierde (vencido, demasiado grande, cola o tope llenos) se cuenta una vez y sale en
+      una línea de alarma cada 30 s;
+    - un registro queda en disco solo hasta que lo tomaron;
+    - los turnos van a NATS solo en el motherbee y los workers, donde todavía los leen cognition y
+      policy (etapa 2);
+    - el broker borra el consumidor viejo `durable.sy-storage.turns` al arrancar y lo rechaza
+      después.
+  - **SY.storage:**
+    - toma los lotes del stream con su propia conexión: una transacción a la inbox, el ack y
+      después el procesamiento, en otra tarea; ya no lee turnos de NATS;
+    - cada registro tiene que venir de un nodo del hive del stream, y un turno tiene que nombrar a
+      su productor como remitente;
+    - `turns` es el log de mensajes: guarda el mensaje entero, `thread_id`, `trace_id`, `ts` (la
+      hora del router) y `stored_at`;
+    - un backfill único copia los mensajes de la inbox a `turns` (marca en `storage_migrations`);
+    - después, la inbox borra lo procesado de más de 24 h.
+  - **Archi:** la página Messages lee `turns`. La lista va por `ts`, el tail en vivo por
+    `stored_at`, y el detalle muestra el mensaje entero.
+  - **SY.admin:** `list_streams`, `GET /hives/{hive}/streams`.
+  - **`ops.py health`:** suma `streamlost`, lo que las alarmas de los streams dicen perdido.
+- **Deploy:**
+  - build de `e24e7d3` en 23 min, publish en 12 s, deploy en 224 s;
+  - snapshots `pre-stream1b-0-1-76` en las 4 VMs (se borró `pre-cognition-0-1-73`);
+  - 0.1.76 en los 4, health `failed=0 streamlost=0`.
+- **Gate (con un nodo de prueba por socket, `AI.gate76probe`, que se manda turnos a sí mismo sin
+  `thread_id`, así cognition no gasta):**
+  - **La migración:**
+    - el backfill completó 5 filas de 0.1.75, re-enlazó las 542 `legacy:` e insertó 35 respuestas
+      que `turns` había descartado; 0 ilegibles;
+    - `turns` quedó con 582 filas, todas con su mensaje;
+    - la inbox borró 435 filas procesadas de más de 24 h;
+    - el broker del motherbee ya no tiene `durable.sy-storage.turns`, y su `storage.turns` quedó
+      en 0 mensajes.
+  - **Los cuatro hives llegan a la base,** 20 de 20 cada uno, con el remitente real y una demora
+    de 0,2 s. Antes solo llegaba lo del motherbee.
+  - **Archi** lista, abre el detalle (también de la fila más vieja del backfill) y el tail en vivo
+    mostró tres turnos de worker1 a 0,15 s.
+  - **SY.storage ausente 71 s** mientras worker1 y el ingress mandaban 40 turnos cada uno:
+    - el backlog se vio (31 registros en cada stream);
+    - al volver se entregó todo, 40 de 40, una sola vez, con la hora original.
+  - **SY.storage ausente más de 3 min:**
+    - los 10 turnos de worker1 vencieron, contados una vez (`expired=10`), con la línea de alarma;
+    - el ruteo siguió;
+    - en la base no hay nada de ellos.
+  - **El router de worker1 reiniciado con 10 pendientes:** los recuperó del disco y los entregó
+    cuando volvió SY.storage.
+  - **El router y SY.storage del motherbee reiniciados** mientras worker1 mandaba 120 turnos en
+    60 s: llegaron los 120, una vez.
+  - **Health:**
+    - `streamlost=10` solo en worker1, en la ventana del vencimiento inducido;
+    - limpio después.
+  - **Para la prueba:** el watchdog de SY.orchestrator levanta un `sy-storage` detenido en 2 s, así
+    que la ausencia se hizo con `systemctl mask --runtime` y `unmask`. No quedó ninguna máscara.
+  - **Limpieza:** se borraron de `turns` y de la inbox las 373 filas de prueba. No quedan nodos de
+    prueba.
+- **Rollback:** snapshot `pre-stream1b-0-1-76`. `apt install fluxbee=0.1.75` anda, pero no
+  devuelve todo:
+  - las columnas nuevas de `turns` no molestan, y el SY.storage viejo vuelve a crear su
+    consumidor de NATS;
+  - los turnos de los spokes dejan de llegar a la base;
+  - el Archi viejo lee la inbox, que ya no tiene lo procesado de más de 24 h. La historia
+    completa vuelve solo con el snapshot.
 
 ## 0.1.75 — Los bugs vivos bajo el plano del log (A-70, etapa 1a)
 

@@ -1,7 +1,7 @@
 # Router stream — v1
 
-Status: design reviewed once (2026-10-16); stage 1a validated on 8.x (0.1.75); stage 1b built for
-0.1.76. Finding A-70 (`lab/logbook/FINDINGS.md`).
+Status: design reviewed once (2026-10-16); stages 1a and 1b validated on 8.x (0.1.75, 0.1.76);
+stages 2 and 3 pending. Finding A-70 (`lab/logbook/FINDINGS.md`).
 
 The router gets a small stream of its own. It replaces the embedded NATS broker, and carries three
 kinds of data to SY.storage:

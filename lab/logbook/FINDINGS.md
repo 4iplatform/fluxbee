@@ -995,7 +995,7 @@ Visto al arreglar los e2e de A-37, leyendo `src/router/mod.rs` y `src/shm/mod.rs
   binario generaría uno como root); si no, el `myID` del Syncthing en marcha. Nunca `config.xml`.
 - **Estado:** construido; lo ejercita el próximo join (el de A-48).
 
-### A-70 🟡 ETAPA 1a VALIDADA EN 8.x (0.1.75, 2026-10-16); 1b EN ADELANTE PENDIENTE — El "NATS" de los registros vive dentro del router, pierde datos y solo guarda lo del motherbee
+### A-70 🟡 ETAPAS 1a Y 1b VALIDADAS EN 8.x (0.1.75 y 0.1.76, 2026-10-16); 2 Y 3 PENDIENTES — El "NATS" de los registros vive dentro del router, pierde datos y solo guarda lo del motherbee
 
 - **Cómo salió:** diseñando la etapa 5 (tokens), el registro iba a viajar por NATS. El operador
   pidió revisar NATS en general y entre hives. Diseño: `docs/router-stream-v1.md`.
@@ -1074,10 +1074,50 @@ Visto al arreglar los e2e de A-37, leyendo `src/router/mod.rs` y `src/shm/mod.rs
   - `RT.` queda reservado.
 
   Detalle en `lab/DEPLOYMENTS.md`.
+- **Q7, decidida por el operador (2026-10-16):** Archi lee `turns` (*"que lea turn es integrado
+  mas que lo otro, si es asi hacerlo"*). `turns` pasa a ser el log de mensajes, y la inbox se
+  purga.
+- **Etapa 1b, el código:** el stream en cada router, con SY.storage como destino. Comprende:
+  - `turns` como log de mensajes, con backfill único y purga de la inbox;
+  - Archi sobre `turns`;
+  - `list_streams` en el admin;
+  - `streamlost` en `ops.py health`.
+
+  Una revisión del código (una ronda) no encontró ningún HIGH. Se arregló todo antes del build:
+  - **los contadores de pérdida mentían en las dos direcciones:**
+    - el recorte sacaba lo vencido sin contarlo;
+    - cada reintento de un lote volvía a contar lo salteado.
+
+    Ahora se cuenta una vez: cuando el cursor lo pasa, o cuando sale del log sin que el destino lo
+    haya tomado. Lo que está en un lote en vuelo espera su ack;
+  - **el orden del upgrade revivía el consumidor viejo:** el router nuevo arranca antes que el
+    SY.storage viejo, que volvía a suscribirse. Habría retenido `storage.turns` y guardado cada
+    turno dos veces mientras tanto. Ahora el broker rechaza ese consumidor;
+  - **menores:**
+    - el disco se escribe fuera del lock que usan los hilos del router;
+    - una escritura fallida abre un segmento nuevo en vez de cortar el que estaba;
+    - la cola tiene tope en bytes;
+    - el último segmento se borra cuando no queda nada por entregar;
+    - el procesamiento de SY.storage sale del camino del ack;
+    - cada registro tiene que venir de un nodo del hive de su stream;
+    - Archi lee el cursor del tail antes que la lista.
+- **La etapa 1b, validada en 8.x (0.1.76):**
+  - **los cuatro hives llegan a la base:** worker1, el ingress y el egress por primera vez;
+  - **el backfill dejó las 582 filas de `turns` con su mensaje,** y la inbox borró 435 filas
+    viejas;
+  - **Archi muestra `turns`,** con el tail en vivo;
+  - **SY.storage ausente 71 s:** el backlog se vio y se entregó todo una vez;
+  - **ausente más de 3 min:** 10 vencidos contados una vez, con la alarma, y el ruteo siguió;
+  - **un router reiniciado con pendientes** los recuperó del disco;
+  - **el motherbee reiniciado bajo tráfico** no perdió nada;
+  - **health limpio** fuera del vencimiento inducido.
+
+  Para probarlo hubo que enmascarar `sy-storage`: el watchdog de SY.orchestrator lo levanta a los 2
+  s de un `stop`. Detalle en `lab/DEPLOYMENTS.md`.
 - **Etapas:**
-  1. **1a:** los bugs vivos;
-  2. **1b:** el stream con SY.storage;
-  3. **2:** cognition y policy, y NATS borrado;
+  1. **1a:** los bugs vivos ✅;
+  2. **1b:** el stream con SY.storage ✅;
+  3. **2:** cognition y policy como destinos, el diseño de Q1, y NATS borrado;
   4. **3:** los tokens.
 
 ### A-69 ✅ VALIDADO EN 8.x (0.1.73 y 0.1.74, 2026-10-16) — SY.cognition fallaba en cada turno con los dos proveedores: mandaba `temperature`
