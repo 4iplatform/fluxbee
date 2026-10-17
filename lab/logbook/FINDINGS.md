@@ -995,7 +995,7 @@ Visto al arreglar los e2e de A-37, leyendo `src/router/mod.rs` y `src/shm/mod.rs
   binario generaría uno como root); si no, el `myID` del Syncthing en marcha. Nunca `config.xml`.
 - **Estado:** construido; lo ejercita el próximo join (el de A-48).
 
-### A-70 🟡 ETAPAS 1 Y 2 VALIDADAS EN 8.x (0.1.75 a 0.1.78, 2026-10-16/17): NATS BORRADO; ETAPA 3 (TOKENS) PENDIENTE — El "NATS" de los registros vive dentro del router, pierde datos y solo guarda lo del motherbee
+### A-70 ✅ VALIDADO EN 8.x (0.1.75 a 0.1.79, 2026-10-16/17): NATS BORRADO Y USO DE LLM REGISTRADO — El "NATS" de los registros vivía dentro del router, perdía datos y solo guardaba lo del motherbee
 
 - **Cómo salió:** diseñando la etapa 5 (tokens), el registro iba a viajar por NATS. El operador
   pidió revisar NATS en general y entre hives. Diseño: `docs/router-stream-v1.md`.
@@ -1184,12 +1184,57 @@ Visto al arreglar los e2e de A-37, leyendo `src/router/mod.rs` y `src/shm/mod.rs
   - **health limpio.**
 
   Detalle en `lab/DEPLOYMENTS.md`.
+- **Etapa 3, conversada con el operador (2026-10-17, doc §7.1):**
+  - el nodo de un tenant paga su tenant; cognition, el del agente de la comunicación; el
+    frontdesk, el del caso (*"OK todo"*);
+  - una llamada que su llamador abandona queda `abandoned`, sin tokens (*"después vemos qué
+    cambiamos si no sirve así"*);
+  - Archi y el ejecutor del admin pagan con el raíz (*"cobranza será a raíz"*). Cada registro
+    guarda a qué trabajo de Archi pertenece: sesión, corrida del pipeline y solución. Ese es el
+    lugar para el tenant del cliente, más adelante;
+  - no se borra nada por ahora; una política general de la base por fechas, después;
+  - `ai_local_probe` se borra;
+  - las lecturas para Cloud, aprobadas (*"en todo caso evolucionará después"*).
+- **Etapa 3, el código:**
+  - **qué hace:**
+    - cada llamada a un modelo deja un registro, cobrado a un tenant, en `llm_usage`;
+    - el AI SDK lo anota en el stream del router;
+    - SY.storage lo chequea contra identity;
+    - el admin, Archi y Cloud lo leen.
+  - **La revisión del código,** con dos miradas:
+    - **HIGH:** el router comparaba con mayúsculas los nombres `SY.*` que cobran a otros tenants,
+      y SY.storage sin ellas. Un proceso con `sy.frontdesk.gov` desde cualquier hive podía cobrarle
+      a cualquier tenant;
+    - **MEDIUM:** un registro anotado mientras el router del nodo reiniciaba se perdía sin
+      contarse. Ahora la anotación espera a que el nodo esté conectado;
+    - **LOW, arreglados:** el clasificador de fallas de Archi sin sesión, un pipeline terminado
+      nombrado en el trabajo de turnos posteriores, y el índice de la sincronización por tenant;
+    - **LOW, queda con A-62:** el ejecutor deja leer el uso de todos los tenants a cualquier nodo
+      de la malla, como cualquier otra acción.
+- **La etapa 3, validada en 8.x (0.1.79),** con un agente en el tenant de prueba `pruebas`:
+  - **cada nodo cobra a quien debe:**
+    - el agente, a `pruebas`;
+    - cognition, a `pruebas` por el agente;
+    - el frontdesk, al tenant del caso, o al raíz como respaldo;
+    - Archi, al raíz con su sesión.
+  - **Las sondas:**
+    - un tenant ajeno reclamado quedó como desajuste;
+    - un `SY.*` ajeno fue rechazado;
+    - `sy.frontdesk.gov` en minúsculas desde worker1 lo rechazó el router;
+    - un nodo sin identidad quedó sin verificar a los 10 minutos.
+  - **`abandoned`:** cognition con 50 ms dejó registros `abandoned` sin tokens.
+  - **Lecturas:** el operador, Archi y Cloud las leyeron. Cloud ve solo su tenant, y el raíz le
+    da `TENANT_ROOT_PROTECTED`.
+  - **Health:** `usagelost` en 0. Lo único rechazado fueron las sondas.
+  - **Limpieza:** todo lo de prueba quedó borrado, también las claves y el tenant `pruebas`.
+
+  Detalle en `lab/DEPLOYMENTS.md`.
 - **Etapas:**
   1. **1a:** los bugs vivos ✅;
   2. **1b:** el stream con SY.storage ✅;
   3. **2a:** cognition por comunicación, SY.policy retirado ✅;
   4. **2b:** NATS borrado, y SY.policy fuera del todo ✅;
-  5. **3:** los tokens. Se conversa con el operador (*"cuando termine etapa 2 hablamos de 3"*).
+  5. **3:** el uso de LLM, registrado por llamada y cobrado a un tenant ✅.
 
 ### A-69 ✅ VALIDADO EN 8.x (0.1.73 y 0.1.74, 2026-10-16) — SY.cognition fallaba en cada turno con los dos proveedores: mandaba `temperature`
 
@@ -1738,6 +1783,10 @@ Visto al arreglar los e2e de A-37, leyendo `src/router/mod.rs` y `src/shm/mod.rs
   quien lo compromete ya es root en el host.
 - **Cuándo mirarlo:** junto con A-60 (nodos sin root). Ahí sí pasa a importar quién puede pedir qué.
   Forma probable: una lista por prefijo de rol, con lo de sistema solo para `SY.*`.
+- **Desde 0.1.79 (A-70, etapa 3):** por la malla, `get_llm_usage` solo lo piden Archi e IO.cloud,
+  pero el ejecutor (`executor_execute_plan`) corre cualquier plan como el operador para cualquier
+  nodo. Un plan de un paso lee el uso de LLM de todos los tenants. Lo encontró la revisión del código
+  de la etapa 3 y queda acá: leer el uso no cambia nada de lo que el ejecutor ya permite.
 
 ### A-61 ✅ RESUELTO (0.1.64, validado en 8.x) — Cloud podía pisar claves de otro tenant y leer identidades de cualquier tenant
 

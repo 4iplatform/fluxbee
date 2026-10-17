@@ -21,7 +21,8 @@
 
 | Versión | Fecha (ART) | Commit | Alcance | Estado | Rollback |
 |---|---|---|---|---|---|
-| **0.1.78** | 2026-10-17 | `104fa65` | motherbee + spokes (core) | ✅ live | snap `pre-stream2b-0-1-78` (las 4 VMs) · `apt install fluxbee=0.1.77` + core-update de los spokes |
+| **0.1.79** | 2026-10-17 | `0bc85e3` | motherbee + spokes (core) | ✅ live | snap `pre-stream3-0-1-79` (las 4 VMs) · `apt install fluxbee=0.1.78` + core-update de los spokes |
+| **0.1.78** | 2026-10-17 | `104fa65` | motherbee + spokes (core) | ✅ reemplazado por 0.1.79 | snap `pre-stream2b-0-1-78` (las 4 VMs) · `apt install fluxbee=0.1.77` + core-update de los spokes |
 | **0.1.77** | 2026-10-17 | `377945a` | motherbee + spokes (core) | ✅ reemplazado por 0.1.78 | snap `pre-stream2a-0-1-77` (las 4 VMs); `apt` solo no alcanza (ver la entrada) |
 | **0.1.76** | 2026-10-16 | `e24e7d3` | motherbee + spokes (core) | ✅ reemplazado por 0.1.77 | snap `pre-stream1b-0-1-76` (las 4 VMs); `apt install fluxbee=0.1.75` pierde la inbox purgada (ver la entrada) |
 | **0.1.75** | 2026-10-16 | `1c00389` | motherbee + spokes (core) | ✅ reemplazado por 0.1.76 | snap `pre-stream1a-0-1-75` (las 4 VMs); `apt` solo no alcanza (ver la entrada) |
@@ -87,6 +88,111 @@
 > (`dpkg-scanpackages -m`) para rollback, pero su detalle vive en la bitácora, no acá.
 
 ---
+
+## 0.1.79 — Registro de uso de LLM: cada llamada a un modelo, cobrada a un tenant (A-70, etapa 3)
+
+- **Fecha:** 2026-10-17 (ART) · **Versión anterior:** 0.1.78 · **Commit:** `0bc85e3`.
+  - Diseño: `docs/router-stream-v1.md` §7, conversado con el operador y revisado una vez; cómo
+    quedó construido en §7.2–§7.6.
+  - Una revisión del código con dos miradas (la contabilidad; confianza, almacenamiento y
+    lecturas), §7.9. El HIGH, el MEDIUM y tres LOW se arreglaron antes del build; uno queda con
+    A-62.
+- **Alcance:** motherbee + los tres spokes (core-update).
+- **Qué cambió:**
+  - **Cada llamada a un modelo deja un registro** en la tabla `llm_usage` de SY.storage, cobrado
+    a un tenant:
+    - ai.generic paga su tenant (`node`);
+    - SY.frontdesk.gov, el del caso (`case`);
+    - SY.cognition, el del agente de la comunicación (`agent`);
+    - Archi y el ejecutor del admin, el raíz (`root`). En `work` va la sesión, la corrida del
+      pipeline, la solución y la etapa, o la ejecución y quién llamó.
+  - **Qué se registra:**
+    - una respuesta 2xx, antes de cualquier chequeo, con los conteos normalizados entre OpenAI y
+      Anthropic;
+    - una llamada que su llamador abandona, como `abandoned` y sin tokens.
+  - **El AI SDK:**
+    - las dos fábricas de clientes piden un `AiAccount`;
+    - un recorder por proceso anota los registros en el stream del router (`storage.usage`);
+    - los clientes de proveedor quedan privados al SDK, y `ai_local_probe` se borró.
+  - **El router:**
+    - una reserva del stream para los registros de uso (1 MB y 128 lugares de la cola), con sus
+      pérdidas aparte (`usagelost`);
+    - los nombres `SY.*` que cobran a otros tenants, solo en los hives donde corren y sin
+      distinguir mayúsculas;
+    - `stream::append` espera a que el nodo esté conectado con su router.
+  - **SY.storage:**
+    - chequea cada registro;
+    - para un nodo y para el agente de cognition, toma el tenant de identity;
+    - reintenta por la inbox, y el último intento se guarda sin verificar;
+    - cada 30 s, una línea WARN con lo rechazado, lo desajustado y lo no verificado (`usagerej`).
+  - **`USAGE_QUERY`,** solo desde SY.admin:
+    - de a una consulta, en su propia conexión, con 15 s de límite;
+    - un período de hasta 92 días, o un cursor `since`;
+    - agrupaciones de una lista cerrada, y errores con código.
+  - **Lecturas:**
+    - `get_llm_usage` del admin (`GET /hives/motherbee/usage`), para el operador y Archi;
+    - la op de Cloud `get_usage`, con el tenant de io.cloud y nunca el raíz
+      (`docs/io-cloud-api.md` §5.5);
+    - Archi la lee con `fluxbee_system_get`.
+  - **`ops.py health`** suma `usagelost` y `usagerej`.
+- **Deploy:**
+  - build de `0bc85e3` en 23 min, publish en 14 s, deploy en 245 s;
+  - snapshots `pre-stream3-0-1-79` en las 4 VMs (se borró `pre-stream1b-0-1-76`);
+  - 0.1.79 en los 4, health limpio (`usagelost=0 usagerej=0`).
+- **Gate (§7.7),** con un agente `AI.gate79@motherbee` en el tenant `pruebas`, con las claves de
+  prueba del operador:
+  - **la tabla nació vacía,** con la clave primaria y los seis índices, incluido el de la
+    sincronización por tenant.
+  - **El agente:**
+    - sin rol contestó el JSON de "unconfigured". Igual son llamadas reales: 2 registros;
+    - con un rol y una skill de `agent-assets` en la definición de su ILK, contestó en serio;
+    - sus 5 registros son de `pruebas` como `node`, con el ILK del humano como contraparte.
+  - **Cognition:**
+    - 4 llamadas por intercambio: el etiquetador y el resumidor, en cada sentido;
+    - 18 registros de `pruebas` como `agent`, con el ILK del agente como contraparte.
+  - **El frontdesk:**
+    - un caso con un ILK de `pruebas` cobró a `pruebas` (`case`);
+    - un caso con un ILK desconocido cobró al raíz (`fallback_root`).
+  - **Archi:**
+    - un turno de chat cobró al raíz con la sesión y la etapa `chat` en `work`;
+    - contestó la pregunta de uso por la ruta nueva, con totales que cuadran.
+  - **Ids del proveedor:** todos los `ok` tienen uno, ninguno repetido.
+  - **Las sondas:**
+    - un registro con el nombre de un nodo de `pruebas` que reclamaba el raíz se guardó con
+      `pruebas`, contado como desajuste;
+    - `SY.gate79` fue rechazado (`foreign_sy`);
+    - `sy.frontdesk.gov` en minúsculas desde worker1 lo rechazó el router (el HIGH de la
+      revisión), y contó en el `streamlost` de worker1;
+    - un nodo sin ILK: la inbox reintentó 10 minutos y el registro quedó con el tenant que
+      decía, `verified=false`, contado como no verificado.
+  - **`abandoned`:** con el timeout de cognition en 50 ms, el etiquetador cortó en cada sentido
+    y saltó el turno. Quedaron 2 registros `abandoned`, sin tokens ni id. El timeout volvió a
+    8000.
+  - **El operador (`GET /hives/motherbee/usage`):**
+    - por día, modelo, nodo y tenant;
+    - los 26 registros de `pruebas`, de a dos, en 13 páginas;
+    - la sincronización por `since` trajo los 26 y terminó con `next` nulo;
+    - cinco preguntas malas dieron 400 `INVALID_REQUEST`. Las dos de cursores vienen con el
+      código de SY.storage.
+  - **Cloud, por la puerta pública:**
+    - ve solo `pruebas`: 26 registros, de `agent`, `case` y `node`;
+    - el raíz da `TENANT_ROOT_PROTECTED`;
+    - `all_tenants` u otro tenant en `params` dan `INVALID_REQUEST`.
+  - **Health del gate:**
+    - `usagelost=0` en los 4;
+    - `usagerej=3` en el motherbee y `streamlost=1` en worker1, exactamente las sondas;
+    - después, todo en 0.
+  - **Visto al probar:** la metadata de una clave de un tenant que no es el raíz da `UNAUTHORIZED`
+    por la ruta HTTP del admin (esa ruta no pasa `tenant_id`). El borrado sí lo pasa.
+- **Limpieza:**
+  - los dos nodos de prueba con su identidad: identity volvió a 28 ILKs;
+  - la región de memoria del motherbee y la sesión de Archi del gate;
+  - las filas del gate: 14 turnos con su inbox, 288 sobres, todas las filas de cognition, y los 31
+    registros de `llm_usage` con su inbox. La tabla había nacido vacía y quedó vacía;
+  - las dos claves de `pruebas` y el tenant, borrado y purgado (pedido del operador);
+  - ninguna máscara quedó.
+- **Rollback:** snapshot `pre-stream3-0-1-79`, o `apt install fluxbee=0.1.78` más el core-update
+  de los spokes. La tabla `llm_usage` queda: 0.1.78 no la usa.
 
 ## 0.1.78 — NATS borrado y SY.policy fuera (A-70, etapa 2b)
 

@@ -3,7 +3,8 @@
 Status: design reviewed once (2026-10-16); stages 1a and 1b validated on 8.x (0.1.75, 0.1.76);
 stage 2 designed with the operator and reviewed (2026-10-17, §6), validated on 8.x (2a in 0.1.77,
 §6.8; 2b in 0.1.78, §6.9: NATS is gone); stage 3 designed with the operator and reviewed once
-(2026-10-17, §7), built and its code reviewed once (§7.9). Finding A-70 (`lab/logbook/FINDINGS.md`).
+(2026-10-17, §7), built and its code reviewed once (§7.9), validated on 8.x (0.1.79, §7.10). Finding
+A-70 (`lab/logbook/FINDINGS.md`).
 
 The router gets a small stream of its own. It replaces the embedded NATS broker, and carries three
 kinds of data to SY.storage:
@@ -1119,3 +1120,16 @@ Two lenses (accounting on the producer side; trust, storage and reads), on the c
   - the contract the same in SY.storage, SY.admin, io.cloud, Archi and `docs/io-cloud-api.md`
     §5.5;
   - `ops.py health` reads the router's and SY.storage's lines.
+
+### 7.10 Validated on 8.x (0.1.79, 2026-10-17)
+
+With an agent in the test tenant `pruebas`:
+- **Each producer charged the right tenant:** the agent (`node`), cognition for it (`agent`), the
+  frontdesk (`case`, or `fallback_root` for an unknown ILK), Archi (`root`, with its session).
+- **The probes:** a claimed foreign tenant was stored as a mismatch; a foreign `SY.*` name was
+  refused; a lower-case `sy.frontdesk.gov` on worker1 was refused by its router; a node without an
+  identity was stored unverified after the inbox's 10 minutes.
+- **`abandoned`:** cognition at 50 ms left records without tokens.
+- **The reads:** the operator's queries and paging, Archi's chat answer from
+  `/hives/motherbee/usage`, and Cloud's `get_usage`, which sees only its tenant.
+- **The streams:** no usage record lost. Details in `lab/DEPLOYMENTS.md`.
