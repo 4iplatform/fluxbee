@@ -1,7 +1,8 @@
 # Router stream — v1
 
 Status: design reviewed once (2026-10-16); stages 1a and 1b validated on 8.x (0.1.75, 0.1.76);
-stages 2 and 3 pending. Finding A-70 (`lab/logbook/FINDINGS.md`).
+stage 2 designed with the operator (2026-10-17, §6), to review; stage 3 pending. Finding A-70
+(`lab/logbook/FINDINGS.md`).
 
 The router gets a small stream of its own. It replaces the embedded NATS broker, and carries three
 kinds of data to SY.storage:
@@ -504,7 +505,8 @@ The stream depends on these, so they come first.
 |---|---|---|
 | 1a | The live bugs (§2.12, §2.13), on today's NATS: frames, IRP, `RT.` reserved, the `turns` key, cognition's duplicates, SY.storage's database, the inbox retry | a request and its reply (one trace_id) both land in `turns`; one turn costs one tagger call; SY.storage restarts when its database connection is cut; a process that is not the router cannot HELLO as `RT.*`; health clean. The oversize skip and the IRP hand-over are unit tests: PROD cannot produce them (one router per hive, the SDK refuses oversize sends) |
 | 1b | The stream in every router; SY.storage as the sink of `storage.turns`; `STREAM_STATUS`, the admin endpoint and the health count. On the motherbee, SY.storage drops only its NATS turns loop; the router removes `durable.sy-storage.turns` once at start; ingress and egress stop copying turns to NATS | worker1's and the ingress's turns reach the database; SY.storage stopped 60 s under traffic: backlog visible, then all delivered, nothing twice; stopped 3 min: expired counted, the alarm logged, routing unaffected; a router restarted with a backlog resumes; a motherbee deploy loses nothing inside the window; health clean |
-| 2 | Cognition and policy as sinks; cognition's outputs by `STREAM_APPEND`; `STORAGE_METRICS_GET` over the mesh; NATS removed everywhere (§2.11) | cognition on the motherbee and worker1 tags turns; worker1's cognition outputs reach the database; nothing listens on 4222; a new worker join renders a `hive.yaml` without `nats`; health clean |
+| 2a | Cognition per communication (§6): the agent's router feeds its local cognition both directions; cognition as a stream sink, its outputs by `STREAM_APPEND`; its rebuild over the mesh; replies carry the agent's ILK; SY.policy removed | see §6.4 |
+| 2b | NATS deleted everywhere (§2.11, §6.3): `STORAGE_METRICS_GET` over the mesh, the three subjects without a producer, the `nats` directory and `hive.yaml` sections | see §6.4 |
 | 3 | The AI function and the usage records (§2.14). The SDK part may be built during stages 1 and 2. | one call from each kind of consumer leaves a record with the right tenant, node, model and tokens; a forged record is refused; the admin answers by tenant and period; Cloud reads it through io.cloud |
 
 Each stage: code and unit tests, one adversarial review, release, validation on 8.x, then FINDINGS,
@@ -526,7 +528,7 @@ the ledger and the logbook.
 
 ## 5. Open questions (for the operator)
 
-- **Q1 (stage 2): two cognitions write the same rows.**
+- **Q1 (stage 2): two cognitions write the same rows.** *Decided (operator, 2026-10-17): §6.*
   - Cognition's entity ids do not include the hive. Each hive's cognition sees its own half of a
     cross-hive thread, numbered by its own router.
   - The upserts are last-writer-wins, and the rebuild reads every writer's rows.
@@ -569,3 +571,196 @@ the ledger and the logbook.
     The inbox keeps only what dedupe and retries need.
   - Archi's Messages page shows time, from, to, kind, ICH and thread; the detail shows the whole
     message, or the payload alone on rows older than the backfill can reach.
+
+## 6. Stage 2: cognition per communication, NATS deleted (designed 2026-10-17)
+
+### 6.0 Facts (verified in code at 0.1.76 and on 8.x, 2026-10-17)
+
+- **What cognition does:** per turn with a `thread_id`, up to two LLM calls (the tagger on that
+  message alone; the narrative summarizer on most turns after the first) and a vault lookup of its
+  AI key. It derives a thread, contexts, reasons, cooccurrences, a scope and its instance, a memory
+  and episodes, with decaying weights. It writes up to ~100 entity envelopes per turn
+  (`storage.cognition.*`) and rewrites `/dev/shm/jsr-memory-<hive>` (4 MB, one memory package per
+  hot thread).
+- **Who uses it:** only ai.generic. The router attaches a thread's package to a message it
+  delivers to a local node, by exact `thread_id`, from its hive's region; ai.generic puts it in its
+  prompt. The router attaches it to any destination, keeps one the sender set, and serves the last
+  snapshot indefinitely when cognition stops.
+- **What each cognition sees:** the router copies a turn where the message enters, so in a
+  conversation between an IO node on one hive and an AI node on another, each hive's cognition sees
+  one direction. The AI's memory is built from its own replies.
+- **References:** `sha256(prefix|thread_id|label…)`, per thread, without hive. Two cognitions on
+  the same thread overwrite each other (last writer wins, `writer` keeps only the last one) and
+  each makes its own scopes. A worker's outputs never reached postgres (its NATS has no consumer),
+  and its rebuild always fails: it reads postgres directly and a worker has no database.
+- **Order:** `thread_seq` is an in-memory counter per router, reset to 1 when the router restarts.
+  Only cognition reads it.
+- **Replies:** the AI SDK copies the incoming meta, so an AI's reply carries the human's
+  `src_ilk` (a contract test pins it). For cognition, the reply reads as the human speaking.
+- **SY.policy:** reads turns and only counts missing `action_class`/`action_result`/
+  `result_origin` in a 30 s log line. No LLM, no outputs.
+- **8.x data:** test data only (19 threads, mostly probes).
+
+### 6.1 Decisions (operator, 2026-10-17)
+
+- **D14. Cognition belongs to the interlocutors.** *"la parte cognitiva es de los interlocutores
+  no de que hive está o que nodo es... Cognitive necesita referencia y armado de los mensajes entre
+  ilk, los nodos son mecanismos, igual que el router."* Memory and its references are per
+  communication (the thread between ILKs). No hive and no node in the cognitive model: a
+  hive-keyed memory would fork when an agent's node moves.
+- **D15. The owner of a turn is the owner of the communication:** the agent that serves it, the
+  one that generates and evaluates. One evaluation per communication.
+- **D16. Cognition stays next to the agents** (motherbee and workers), so ai.generic reads its
+  memory from the local shared memory at delivery, as today. It is not centralized.
+- **D17. The agent's router feeds its local cognition both directions** of its agents'
+  communications.
+- **D18. The order carries the router's name.**
+- **D19. Rebuild as needed; the test data can be wiped.**
+- **D20. SY.policy is removed** (*"nació como una extensión que no ocurrió"*).
+- **D21. NATS is deleted entirely, no legacy.** The ingress's 597 turns stuck in its broker go
+  with it.
+- **D22. The LLM cost stays as is for now** (two calls per turn, replies included).
+
+### 6.2 Stage 2a: cognition per communication
+
+- **A communication is the thread between a human (or another interlocutor) and the agent that
+  serves it:** `(thread_id, agent ILK)`. That follows from D14 and D15: two agents in one IO
+  conversation are two communications, each with its owner and its memory. Entity references
+  become `sha256(prefix|thread_id|agent_ilk|label…)`, still without hive or node.
+- **The cognition copy (router).** Every message an agent sends enters through its router, and
+  every message it receives is delivered by that router. That router copies, into its stream under
+  a new subject `cognition.turns`, one copy per local agent end of the message:
+  - **out:** a local agent node (`AI.*`) sends a message with a `thread_id`, of a kind that counts
+    as a turn (not system, admin or query_response): copied at entry, owner = that agent;
+  - **in:** the router delivers such a message to a local agent node: copied at delivery, owner =
+    that agent. The three delivery sites (local, after the WAN, after IRP) serialize one buffer for
+    several destinations today; the copy is per destination. Never a tap copy (`meta.via_tap`) nor
+    a broadcast;
+  - a message between two agents is copied twice, once per owner: each agent's communication sees
+    both directions;
+  - the copy is taken before the memory package is attached, and carries the owner's node name in
+    the record (`producer`). Cognition maps it to the agent's ILK through the identity shared
+    memory (`handler_node`), so the node stays mechanism. An agent with no ILK there gets no memory,
+    counted (`no_agent_ilk`);
+  - `cognition.turns` goes only to `SY.cognition@<own hive>`, on the roles that run it (motherbee,
+    worker), and is added to the stream's fixed sink list; no node may append it.
+  - The `storage.turns` copy (the message log, at entry, to SY.storage) does not change.
+- **The order (D18).** A communication's turns are all copied by its agent's router, so that
+  router's stream orders them. Cognition numbers them with the communication's turn number
+  (`turn_count`), which it already keeps, persists and restores: it replaces `thread_seq` in the
+  hot-set ranking, the scope instances' start and end, and the choice of the open scope at
+  rebuild. No clock is involved, and an agent that moves continues the numbering after its
+  rebuild.
+  - The router stops assigning `meta.thread_seq`. The field leaves the protocol in 2b, with its
+    echoes (io-slack, io-linkedhelper, the test nodes, the AI SDK, the Go struct).
+- **SY.cognition as a sink.** It takes `STREAM_BATCH` only from its own hive's streams
+  (`RT.*.stream@<own hive>`) and acks on receipt into its bounded queue (§2.7).
+  - **Repeats:** it skips any record at or below the last seq it accepted into the queue for that
+    stream and epoch. The epoch is new in every batch: a random number the stream keeps in
+    `state.json` and draws again when that file is missing or the stream runs in memory. Without
+    it, a stream whose seq restarts at 1 would be ignored until it passed the old seq.
+- **Its outputs.** `STREAM_APPEND` under `storage.cognition.batch`, packing a turn's envelopes
+  into appends of at most 64 KB (a rich turn makes ~80 KB, and the stream skips a record over
+  96 KB). SY.storage expands each into one inbox row per envelope (`storage.cognition.<entity>`),
+  so the per-entity handlers and the producer check (`SY.cognition@<the stream's hive>`) stay.
+  - Each envelope carries the communication's turn number; a row is overwritten only by an equal
+    or higher one, so a late retry or a cognition that restarted empty cannot roll it back.
+- **The memory package** keeps its mechanism (local shared memory, attached at delivery), with
+  three fixes: attached only to agent destinations (`AI.*`), per destination; a package the sender
+  set is dropped on all three delivery paths (nothing legitimate sets one); keyed by the
+  communication (thread and the destination agent).
+- **Shared memory survives restarts.** Cognition no longer rewrites the region from its in-memory
+  set alone: it keeps the entries of communications it has not loaded yet, within the capacity
+  ranking, and drops one only when SY.storage answers that the communication has no state.
+- **The rebuild over the mesh (D19).** Cognition stops reading postgres.
+  - `COGNITION_STATE_GET {thread_id, agent_ilk}` to `SY.storage@motherbee`, accepted only from
+    `SY.cognition@*` as stamped by the router. It returns the communication's open entities and its
+    memories, paged by key within a frame. Scopes have no `thread_id` column: through their
+    instances.
+  - When: at start, for the communications in the shared memory, before the first turn, with
+    bounded concurrency and a timeout per call; and on the first turn of a communication it does
+    not hold (an agent that moved), with a short timeout.
+  - Workers rebuild like the motherbee.
+  - The `cognition_*` tables are emptied once (marker `cognition_reset_v1`).
+- **Replies between ILKs.** The AI SDK's reply carries `src_ilk` = the agent's own ILK
+  (`self_ilk_id`) and `dst_ilk` = the incoming `src_ilk`; an agent booted without an ILK sends no
+  `src_ilk`, never the human's. SY.frontdesk.gov uses the same builders. Nothing routes on a
+  reply's `src_ilk` (IO nodes reply by `meta.context.io.reply_target`; the identity pre-resolve
+  only runs on Resolve). Archi labels replies by `src_ilk` and will show the agent.
+  - Cognition's binding compares ILK weights: both participants weigh 1.0 whatever the direction,
+    or every reply would look like a topic shift.
+- **NATS loses its last turn readers.** 2a stops the router's NATS copy of turns everywhere and
+  retires the `durable.sy-cognition.turns` and `durable.sy-policy.turns` consumers (§2.13's
+  retired list), so nothing piles up until 2b.
+- **SY.policy retired over two releases** (D20). Removing it in one release would block every
+  worker's core update: a worker's orchestrator rejects a manifest that lacks a component its
+  `hive.yaml` lists, and the core update does not rewrite that file.
+  - **2a:** the binary, the manifest entry and the template's sections stay. Each orchestrator, at
+    boot and before reading its node list, stops and disables SY.policy and drops it from its own
+    role's `nodes` and `wait_for`, in one write, logged once.
+  - **2b:** the binary, unit, manifest entry, build lists, stop scripts and every template section
+    go.
+
+### 6.3 Stage 2b: NATS deleted
+
+Inventory verified at 0.1.76 (about 8,900 lines go):
+- **Whole files:** the broker `src/nats/mod.rs` (1,823 lines), the SDK client `nats.rs` and
+  `client_config.rs` (2,815, plus its re-exports in `comm/mod.rs` and `prelude.rs`), the diags
+  `wf_nats_diag` and `jetstream_envelope_diag` (628), eight scripts (1,706).
+- **Inside files:** SY.storage (~1,000: the subject loops, `storage.metrics.get` over NATS, the
+  ingest of `storage.events`/`items`/`reactivation`, which have no producer), SY.admin (~300),
+  the router (~190: start, readiness wait, recovery loop, publisher, retired-consumer purge, stop
+  on signals in `main.rs`), the orchestrator (~150), cognition, config.
+- **New work:**
+  - `STORAGE_METRICS_GET` over the mesh in four places: the SDK constant, SY.storage's responder,
+    SY.admin's `/config/storage/metrics`, and the orchestrator's boot wait for the database. That
+    wait runs before the orchestrator joins the router today: it uses an ephemeral connection
+    (`NodeUuidMode::Ephemeral`) or moves after the join;
+  - renders without `nats:` (worker, ingress, egress joins) and no `nats` directory (postinst,
+    install, joins);
+  - on upgrade, once and logged: the pending counts of `embedded-js-*.json`, then the `nats`
+    directory and the `hive.yaml` `nats:` section removed;
+  - `meta.thread_seq` out of the protocol (§6.2);
+  - SY.policy deleted (§6.2).
+- Port 4222 has no firewall rule or unit to change.
+
+### 6.4 Gates on 8.x
+
+- **2a:**
+  - a conversation with its two ends on different hives (a test sender on worker1, an AI node on
+    the motherbee): the motherbee's cognition receives both directions, in order; worker1's
+    cognition receives nothing of it;
+  - one set of rows per communication in postgres, written by one cognition;
+  - the AI's reply carries the agent's ILK; the next message reaches the AI with a package built
+    from the human's side too;
+  - a temporary ai.generic on worker1: worker1's cognition processes its communication and the
+    outputs reach postgres;
+  - a cognition restart rebuilds over the mesh, and the packages stay meanwhile;
+  - SY.policy runs nowhere and no hive lists it; nothing reads NATS turns; health clean.
+  - Unit tests for what PROD cannot produce (one router per hive): the copy across routers of a
+    hive, the epoch, two agents in one conversation.
+- **2b:** nothing listens on 4222; no `nats` directory or section anywhere; no SY.policy binary or
+  unit; the admin's storage metrics and the orchestrator's boot wait work over the mesh; a new
+  worker join renders a `hive.yaml` without `nats`; health clean.
+
+### 6.5 Open, for later
+
+- **Cognition throughput:** one turn at a time, two LLM calls each. Processing several
+  communications in parallel (each in order) when traffic asks for it.
+
+### 6.6 Review (one round, 2026-10-17)
+
+One HIGH, seven MEDIUM and six LOW, all folded in above:
+- **HIGH:** removing SY.policy in one release blocks every worker's core update → two releases.
+- **MEDIUM:**
+  - a restart blanked the shared memory before the reload → the region keeps what is not loaded;
+  - `thread_seq` had no replacement and the overwrite guard leaned on wall clocks → the turn
+    number;
+  - one append per turn could pass the 96 KB record limit, and `storage.cognition` missed the
+    producer checks → packed `storage.cognition.batch`;
+  - attributing replies to the agent would split every scope → equal ILK weights;
+  - two agents on one `thread_id` collided → the communication is `(thread_id, agent ILK)`;
+  - a stream whose seq restarts left cognition deaf → the epoch;
+  - the orchestrator's database wait over the mesh ran before its join → an ephemeral connection.
+- **LOW:** NATS turns piling up between 2a and 2b; the state query's caller check and paging;
+  per-destination copies and packages; replies without an ILK; the SDK re-exports; the gates.
