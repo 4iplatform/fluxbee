@@ -3,7 +3,7 @@
 Status: design reviewed once (2026-10-16); stages 1a and 1b validated on 8.x (0.1.75, 0.1.76);
 stage 2 designed with the operator and reviewed (2026-10-17, §6), validated on 8.x (2a in 0.1.77,
 §6.8; 2b in 0.1.78, §6.9: NATS is gone); stage 3 designed with the operator and reviewed once
-(2026-10-17, §7). Finding A-70 (`lab/logbook/FINDINGS.md`).
+(2026-10-17, §7), built and its code reviewed once (§7.9). Finding A-70 (`lab/logbook/FINDINGS.md`).
 
 The router gets a small stream of its own. It replaces the embedded NATS broker, and carries three
 kinds of data to SY.storage:
@@ -534,7 +534,8 @@ the ledger and the logbook.
 - **Hub-vouched senders and non-gateway routers** (§2.12).
 - **Usage records (stage 3, §7):** a node killed with model calls in flight is billed with no
   record; on one host any process may register a `SY.*` name (P-1), so a record from a charging
-  `SY.*` producer is trusted within the hives §7.5 allows.
+  `SY.*` producer is trusted within the hives §7.5 allows. A node whose router stays down keeps
+  1,024 records waiting; past that it drops them, counted only in its own journal.
 
 ## 5. Open questions (for the operator)
 
@@ -847,11 +848,11 @@ work over the mesh; with SY.storage held, admin commands got `ORCHESTRATOR_BOOTI
 during the boot; a cognition conversation still works; health clean. Details in
 `lab/DEPLOYMENTS.md`.
 
-## 7. Stage 3: LLM usage records (designed 2026-10-17)
+## 7. Stage 3: LLM usage records (designed and built 2026-10-17)
 
 It builds §2.14 on what stages 1 and 2 left: every hive's stream already delivers `storage.usage`
 to SY.storage, and a communication's agent is known at each turn. Reviewed once (§7.8); where §7
-and §2.14 differ, §7 holds.
+and §2.14 differ, §7 holds. §7.2–§7.6 describe the code as built; its review is §7.9.
 
 ### 7.0 Facts (verified in code at 0.1.78)
 
@@ -919,10 +920,14 @@ and §2.14 differ, §7 holds.
   - `counterpart_ilk`, `trace_id`, `thread_id`, all optional;
   - `work`: optional, fixed keys with short values (Archi: `session_id`, `pipeline_run_id`,
     `solution_id`, `stage`; SY.admin's executor: `execution_id`, `caller`).
-- **The recorder:** one task per process, fed by a bounded channel through a synchronous
-  `try_send`. It appends each record to the node's router stream with the dispatcher's current
-  sender. A full channel or a failed append is counted, never returned to the caller. The AI
-  runtime starts it and hands it to its node; SY.* nodes start their own.
+- **The recorder:** one task per process, fed by a bounded channel (1,024 records) through a
+  synchronous `try_send`. It appends each record to the node's router stream with the dispatcher's
+  current sender. A full channel or a failed append is counted and logged in the node's journal,
+  never returned to the caller. The AI runtime starts it and hands it to its node; SY.* nodes
+  start their own.
+- **An append waits for the node's link** (`stream::append`, for cognition's packs too): the SDK
+  drops what was queued for a link it is reconnecting, so a record made while the router restarts
+  waits in the recorder's channel instead.
 - **One record per 2xx response,** on both paths, queued as soon as the body is parsed and before
   any check: truncation, missing text or a failed schema still cost money.
   - `run_turn` records each turn as it answers, so a run that fails later keeps its earlier turns.
@@ -1002,10 +1007,14 @@ values is §7.5: for `node` and `agent` it takes the tenant from identity itself
 - **Refused records** (a wrong name, a foreign `SY.*`, a malformed or oversized record, a negative
   count) are acked and dropped, and counted. One WARN line every 30 s gives the counts (refused,
   mismatched, unverified); `ops.py health` shows them as `usagerej`.
-- **Table `llm_usage`:** the record's fields plus `stored_at` and `verified`; key `record_id`, and
-  `provider_response_id` unique where present (`ON CONFLICT DO NOTHING`: one response lands once);
-  indexes `(tenant_id, ts)`, `(node_name, ts)`, `(ts)` and `(stored_at, record_id)`; no foreign key
-  to the tenants (a purge stays free). Nothing is purged.
+- **Table `llm_usage`:** the record's fields plus `claimed_tenant_id`, `stored_at` and `verified`;
+  key `record_id`, and `provider_response_id` unique where present (`ON CONFLICT DO NOTHING`: one
+  response lands once); indexes `(tenant_id, ts)`, `(node_name, ts)`, `(ts)`, `(stored_at,
+  record_id)` and `(tenant_id, stored_at, record_id)`; no foreign key to the tenants (a purge stays
+  free). Nothing is purged.
+  - `stored_at` is the `now()` of an autocommit insert on SY.storage's one shared connection, so it
+    follows commit order and a `since` cursor never passes a row that commits later. Inserting from
+    another connection or inside a transaction would break that.
 - **`USAGE_QUERY` over the mesh,** from `SY.admin@motherbee` only, one at a time, on its own
   database connection with a 15 s statement timeout, every filter a bound parameter:
   - a tenant, or every tenant only with an explicit `all_tenants` that SY.admin sets for the
@@ -1017,10 +1026,28 @@ values is §7.5: for `node` and `agent` it takes the tenant from identity itself
     arrive late by design (the stream's window, the inbox retries), and a period is final only
     after them.
 
+  As built:
+  - a period is `[from, to)`; a page holds 1 to 1,000 rows (500 by default) and stays under 62 KiB
+    with at least one row; the limits are `fluxbee_sdk::usage`'s;
+  - a records cursor is `<instant, µs>|<record_id>` (`ts` in a period, `stored_at` in a sync); a
+    groups cursor is the last key; `since` also takes a bare RFC 3339 instant to start;
+  - `next` is absent when a period has no more pages, and in a sync when nothing new arrived (the
+    reader keeps its cursor);
+  - groups come in key order; a `day` is `YYYY-MM-DD` in UTC;
+  - a refusal carries `error_code`: `INVALID_REQUEST` (the question, a cursor), `FORBIDDEN` (a
+    caller other than SY.admin@motherbee), `USAGE_UNAVAILABLE` (no database, a failed query or
+    another one running).
+
 ### 7.6 Reads
 
 - **SY.admin:** `get_llm_usage` (`GET /hives/motherbee/usage?tenant_id=&from=&to=&group_by=&since=&after=&limit=`),
   for the operator and Archi.
+  - Without a `tenant_id` the HTTP route asks for every tenant. Every tenant at once is for the
+    operator (the HTTP route, the executor) and `SY.architect@motherbee`; over the mesh only Archi
+    and IO.cloud may ask (the relay rule refuses the rest).
+  - The admin checks the question first (400 `INVALID_REQUEST`), then maps SY.storage's
+    `error_code`: `INVALID_REQUEST` → 400, the rest → 503.
+  - Archi reads it with `fluxbee_system_get` on `/hives/motherbee/usage?…`, the same query string.
 - **Cloud:** a Cloud op `get_usage` → `get_llm_usage` with io.cloud's claimed tenant, never the root
   one. It is a Cloud-only action (not shared with other nodes), and SY.admin's relay rule for it
   requires the claimed tenant and only the known fields. Cloud sees its tenant's spending; the root
@@ -1067,3 +1094,28 @@ Two lenses (accounting; trust and Cloud). One HIGH, seven MEDIUM, nine LOW; all 
 - **Known limits (§4):** a node killed with calls in flight (an upgrade, an OOM) is billed with no
   record, not even `abandoned`; on one host a process can still register a `SY.*` name (P-1), so the
   hive narrowing above is the cheap part of that fix.
+
+### 7.9 Code review (one round, 2026-10-17)
+
+Two lenses (accounting on the producer side; trust, storage and reads), on the code before 0.1.79:
+- **HIGH (trust):** the router narrowed the charging `SY.*` names with exact case and SY.storage read
+  them without case, so a process registering `sy.frontdesk.gov@<ingress>` could charge any tenant
+  as verified → the router reads them without case too.
+- **MEDIUM:** a record appended while the node's router restarted was queued, then dropped by the
+  SDK on reconnect, and counted nowhere → `stream::append` waits for the link (§7.2).
+- **LOW, fixed:**
+  - Archi's failure classifier recorded no session or run → it uses its pipeline's context;
+  - a finished pipeline run was named in the work of later chat turns → only a running one;
+  - Cloud's per-tenant sync had no matching index → `(tenant_id, stored_at, record_id)`.
+- **LOW, left to A-62:** the executor runs any plan as the operator for any mesh node (A-62), so a
+  plan can read every tenant's usage. The usage read changes nothing there.
+- **Checked:**
+  - one record per 2xx on every path, `abandoned` only while a request is outstanding;
+  - the counts as §7.2 says, and every site as §7.3;
+  - no other way to a provider;
+  - the reserve;
+  - the query's parameters, connection, timeout and one-at-a-time rule;
+  - cursors round-trip at µs;
+  - the contract the same in SY.storage, SY.admin, io.cloud, Archi and `docs/io-cloud-api.md`
+    §5.5;
+  - `ops.py health` reads the router's and SY.storage's lines.

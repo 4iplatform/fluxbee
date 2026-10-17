@@ -53,6 +53,9 @@ pub const CLOUD_OP_ACTIONS: &[(&str, &str)] = &[
     ("start_node", "start_node"),
     ("stop_node", "kill_node"),
     ("delete_node", "kill_node"),
+    // The tenant's LLM usage, one record per model call (docs/router-stream-v1.md §7.6): a read,
+    // always of the tenant Cloud claims, never every tenant's nor the root tenant's.
+    ("get_usage", "get_llm_usage"),
 ];
 
 /// The admin actions IO.cloud may relay over the mesh — the security allowlist SY.admin enforces in
@@ -79,6 +82,7 @@ pub const CLOUD_EXPOSED_ACTIONS: &[&str] = &[
     "get_node_status",
     "start_node",
     "kill_node",
+    "get_llm_usage",
 ];
 
 /// The [`CLOUD_EXPOSED_ACTIONS`] set computed from [`CLOUD_OP_ACTIONS`] (deduped, first-seen order).
@@ -174,7 +178,9 @@ pub fn cloud_action_catalog() -> Value {
         { "op": "delete_tenant", "category": "relay",
           "summary": "Disable YOUR tenant (the envelope tenant_id): it is marked deleted, reversibly, and its name/domain stay reserved. No person is marked: the people charged to it stay usable and set_ilk_tenant charges them elsewhere. Answers people_charged. Refused while node identities live in it (kill them first) or while it sponsors tenants." },
         { "op": "restore_tenant", "category": "relay",
-          "summary": "Undo delete_tenant for YOUR tenant: it comes back as it was." }
+          "summary": "Undo delete_tenant for YOUR tenant: it comes back as it was." },
+        { "op": "get_usage", "category": "relay",
+          "summary": "Read YOUR tenant's LLM usage (the envelope tenant_id), one record per model call: a period (params.from + params.to, RFC 3339, at most 92 days) grouped by params.group_by (day, model or node) or record by record, or params.since for the records stored after a cursor, to sync as they arrive (they arrive late: a period is final only later). The answer's next is params.after for the next page or params.since for the next sync; params.limit 1 to 1000. Never another tenant's records, nor the root tenant's." }
     ])
 }
 
@@ -206,7 +212,8 @@ mod tests {
                 "list_tenant_nodes",
                 "get_node_status",
                 "start_node",
-                "kill_node"
+                "kill_node",
+                "get_llm_usage"
             ]
         );
     }
@@ -243,9 +250,14 @@ mod tests {
         assert_eq!(admin_action_for_cloud_op("list_nodes"), Some("list_tenant_nodes"));
         assert_eq!(admin_action_for_cloud_op("stop_node"), Some("kill_node"));
         assert_eq!(admin_action_for_cloud_op("delete_node"), Some("kill_node"));
+        assert_eq!(
+            admin_action_for_cloud_op("get_usage"),
+            Some("get_llm_usage")
+        );
         // Cloud names its node ops; the admin action names are not Cloud ops.
         assert_eq!(admin_action_for_cloud_op("kill_node"), None);
         assert_eq!(admin_action_for_cloud_op("list_tenant_nodes"), None);
+        assert_eq!(admin_action_for_cloud_op("get_llm_usage"), None);
     }
 
     #[test]

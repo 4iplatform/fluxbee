@@ -91,6 +91,8 @@ if "handle_inventory_http(" in surface:
     http_actions.add("inventory")
 if "handle_list_streams(" in surface:
     http_actions.add("list_streams")
+if "handle_llm_usage(" in surface:
+    http_actions.add("get_llm_usage")
 
 opa_http_map = {
     "CompileApply": "opa_compile_apply",

@@ -8,11 +8,12 @@ use async_trait::async_trait;
 use fluxbee_ai_sdk::{
     build_model_user_content_parts, build_reply_message_runtime_src, build_text_response,
     create_function_calling_model, create_llm_client, extract_response_envelope, extract_text,
-    resolve_model_input_from_payload_with_options, AiNode, AiProvider, FunctionCallingConfig,
-    FunctionCallingRunner, FunctionRunInput, FunctionTool, FunctionToolDefinition,
-    FunctionToolProvider, FunctionToolRegistry, HiveAiConfig, ImmediateConversationMemory,
-    LanceDbThreadStateStore, Message, ModelInputOptions, ModelSettings, NodeRuntime,
-    ResolvedModelInput, RuntimeConfig, ThreadStateStore, ThreadStateToolsProvider,
+    resolve_model_input_from_payload_with_options, AiAccount, AiNode, AiProvider,
+    FunctionCallingConfig, FunctionCallingRunner, FunctionRunInput, FunctionTool,
+    FunctionToolDefinition, FunctionToolProvider, FunctionToolRegistry, HiveAiConfig,
+    ImmediateConversationMemory, LanceDbThreadStateStore, Message, ModelInputOptions,
+    ModelSettings, NodeRuntime, ResolvedModelInput, RuntimeConfig, TenantSource, ThreadStateStore,
+    ThreadStateToolsProvider, UsageRecorder,
 };
 use fluxbee_sdk::protocol::{
     Destination, Meta, Routing, VaultSecretChangedPayload, VaultSecretInterest, MSG_TTL_EXCEEDED,
@@ -383,6 +384,8 @@ struct GenericAiNode {
     /// `None` when `self_ilk_id` / hive suffix is missing (degraded boot).
     vault: Option<VaultClient>,
     control_plane: Arc<RwLock<ControlPlaneState>>,
+    /// Where each model call's usage record goes (docs/router-stream-v1.md §7.2).
+    usage: UsageRecorder,
 }
 
 /// The tenant SY.identity holds for an ILK, `None` when it cannot be read. Production reads the
@@ -694,6 +697,7 @@ struct IlkRegisterTool {
 struct BehaviorContext {
     thread_id: Option<String>,
     src_ilk: Option<String>,
+    trace_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -894,6 +898,7 @@ impl AiNode for GenericAiNode {
         let behavior_ctx = BehaviorContext {
             thread_id: extract_thread_id(&msg),
             src_ilk: extract_src_ilk(&msg),
+            trace_id: Some(msg.routing.trace_id.clone()),
         };
         // The human-registration flow has TWO methods, distinguished by the METHOD (not by being a
         // human): the "auto" method arrives as a structured JSON `frontdesk_handoff` and runs
@@ -1149,7 +1154,13 @@ impl GenericAiNode {
                     openai.provider
                 ))
             })?;
-        let client = create_llm_client(openai.provider, api_key.clone(), openai.base_url.clone());
+        let account = self.usage_account(ctx);
+        let client = create_llm_client(
+            openai.provider,
+            api_key.clone(),
+            openai.base_url.clone(),
+            account.clone(),
+        );
         let tool_registry = self.build_tool_registry(ctx)?;
         if !tool_registry.definitions().is_empty() {
             let model = create_function_calling_model(
@@ -1159,6 +1170,7 @@ impl GenericAiNode {
                 openai.model.clone(),
                 openai.instructions.clone(),
                 openai.model_settings.clone(),
+                account,
             );
             let runner = FunctionCallingRunner::new(FunctionCallingConfig::default());
             let immediate_memory = self.load_immediate_memory_for_input(openai, ctx).await;
@@ -1465,6 +1477,22 @@ impl GenericAiNode {
 
     /// The final answer to a case of the root tenant, where nobody registers. `None` for any other
     /// case, including one whose tenant cannot be read (its registration answers that).
+    /// The case's tenant pays for a conversation's calls (docs/router-stream-v1.md §7.3); the root
+    /// tenant, as `fallback_root`, while the case has none yet.
+    fn usage_account(&self, ctx: &BehaviorContext) -> AiAccount {
+        let case_tenant = case_tenant_of(&self.ilk_tenant, ctx.src_ilk.as_deref(), None).ok();
+        AiAccount::charge(
+            self.usage.clone(),
+            &self.node_name,
+            case_tenant,
+            TenantSource::Case,
+        )
+        .with_node_ilk(self.self_ilk_id.clone())
+        .with_counterpart(ctx.src_ilk.clone())
+        .with_trace(ctx.trace_id.clone())
+        .with_thread(ctx.thread_id.clone())
+    }
+
     fn root_tenant_case_result(&self, ctx: &BehaviorContext) -> Option<FrontdeskResultPayload> {
         match case_tenant_of(&self.ilk_tenant, ctx.src_ilk.as_deref(), None) {
             Err(TENANT_ROOT_NOT_REGISTRABLE) => {
@@ -2617,6 +2645,7 @@ async fn run_unconfigured_bootstrap(
     tracing::info!(node_name = %node_name, "frontdesk-gov connected to router");
     let vault = vault_client_for(dispatcher.clone(), &node_name, self_ilk_id.as_deref());
     let gov_identity_bridge = Some(Arc::new(GovIdentityBridge::new(dispatcher.clone())));
+    let usage = UsageRecorder::start(dispatcher.clone());
     let ai_node = GenericAiNode {
         node_name: node_name.clone(),
         self_ilk_id: self_ilk_id.clone(),
@@ -2628,6 +2657,7 @@ async fn run_unconfigured_bootstrap(
         ilk_tenant: identity_shm_ilk_tenant(&node_name),
         vault,
         control_plane: Arc::new(RwLock::new(state)),
+        usage,
     };
     // Now that the dispatcher/vault exist, resolve the AI token from SY.vault and flip to Configured
     // when present (autonomous SY.* pattern, cf. build_architect_ai_runtime). No token => stay
@@ -3782,6 +3812,7 @@ mod tests {
                 schema_version: 0,
                 config_version: 0,
             })),
+            usage: UsageRecorder::disabled(),
         }
     }
 
@@ -4219,6 +4250,7 @@ mod tests {
             .build_tool_registry(&BehaviorContext {
                 thread_id: None,
                 src_ilk: None,
+                trace_id: None,
             })
             .expect("registry");
         let names = registry
@@ -4290,6 +4322,7 @@ mod tests {
         let ctx = BehaviorContext {
             thread_id: None,
             src_ilk: None,
+            trace_id: None,
         };
         let err = require_src_ilk(&ctx).expect_err("missing src_ilk should fail");
         assert!(err.to_string().contains("missing_src_ilk"));

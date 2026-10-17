@@ -1327,6 +1327,40 @@ fn translate_cloud_op(
             };
             Ok((action, request))
         }
+        // The claimed tenant's LLM usage, one record per model call (docs/router-stream-v1.md
+        // §7.6). Only the question's own fields: anything else is refused, never dropped in
+        // silence. SY.admin checks the values, SY.storage the cursors.
+        "get_usage" => {
+            let tenant_id = claimed_tenant(tenant_id, op)?;
+            const FIELDS: &str = "params.from, params.to, params.group_by, params.since, params.after and params.limit";
+            let mut query = serde_json::Map::new();
+            query.insert("tenant_id".to_string(), json!(tenant_id));
+            for (field, value) in params.as_object().into_iter().flatten() {
+                if value.is_null() {
+                    continue;
+                }
+                match field.as_str() {
+                    "from" | "to" | "group_by" | "since" | "after" => {
+                        let text = value.as_str().ok_or_else(|| {
+                            cloud_error(&format!("params.{field} must be a string"))
+                        })?;
+                        query.insert(field.clone(), json!(text));
+                    }
+                    "limit" => {
+                        let limit = value
+                            .as_u64()
+                            .ok_or_else(|| cloud_error("params.limit must be a whole number"))?;
+                        query.insert(field.clone(), json!(limit));
+                    }
+                    other => {
+                        return Err(cloud_error(&format!(
+                            "get_usage takes only {FIELDS}, not params.{other}"
+                        )))
+                    }
+                }
+            }
+            Ok(("get_llm_usage", Value::Object(query)))
+        }
         "" => Err(cloud_error("missing 'op'")),
         other => Err(cloud_error(&format!("unknown op '{other}'"))),
     }
@@ -1417,9 +1451,10 @@ async fn dispatch_cloud_op(
             target: hive.as_deref(),
             params: admin_params,
             request_id,
-            // Launching a node and tearing one down take the longest; both stay under the edge's 30 s.
+            // Launching a node, tearing one down and reading the usage records (SY.admin waits up to
+            // 20 s for SY.storage) take the longest; all stay under the edge's 30 s.
             timeout: Duration::from_secs(match action {
-                "run_node" | "kill_node" => 25,
+                "run_node" | "kill_node" | "get_llm_usage" => 25,
                 _ => 20,
             }),
         })
@@ -2275,7 +2310,7 @@ mod tests {
         };
         let tenant = "tnt:11111111-1111-4111-8111-111111111111";
         // Superset of every exposed op's required params, so one loop body drives them all
-        // (update_tenant takes name and domain only).
+        // (update_tenant and get_usage take only their own fields).
         let params = json!({
             "name": "acme",
             "key": "k", "value": {"t": "1"}, "resource_type": "bearer_token",
@@ -2284,10 +2319,10 @@ mod tests {
             "nodes": [],
         });
         for (op, expected_action) in CLOUD_OP_ACTIONS {
-            let op_params = if *op == "update_tenant" {
-                json!({"name": "acme"})
-            } else {
-                params.clone()
+            let op_params = match *op {
+                "update_tenant" => json!({"name": "acme"}),
+                "get_usage" => json!({"since": "2026-10-01T00:00:00Z"}),
+                _ => params.clone(),
             };
             let (action, _) = translate_cloud_op(op, Some(tenant), &op_params)
                 .unwrap_or_else(|e| panic!("op {op} should translate: {e:?}"));
@@ -2859,6 +2894,53 @@ mod tests {
             &json!({})
         )
         .is_err());
+    }
+
+    /// A-70 stage 3: the claimed tenant's LLM usage through SY.admin's get_llm_usage, with the
+    /// question's own fields only: never without the claim, never the root tenant, another tenant
+    /// or every tenant.
+    #[test]
+    fn translate_get_usage_reads_the_claimed_tenant_only() {
+        let tenant = "tnt:11111111-1111-4111-8111-111111111111";
+        let period = json!({"from": "2026-10-01T00:00:00Z", "to": "2026-11-01T00:00:00Z",
+                            "group_by": "day", "limit": 50, "after": null});
+        assert_eq!(
+            translate_cloud_op("get_usage", Some(tenant), &period).unwrap(),
+            (
+                "get_llm_usage",
+                json!({"tenant_id": tenant, "from": "2026-10-01T00:00:00Z",
+                       "to": "2026-11-01T00:00:00Z", "group_by": "day", "limit": 50})
+            )
+        );
+        let sync = json!({"since": "2026-10-01T00:00:00Z", "after": "cursor"});
+        assert_eq!(
+            translate_cloud_op("get_usage", Some(tenant), &sync)
+                .unwrap()
+                .1,
+            json!({"tenant_id": tenant, "since": "2026-10-01T00:00:00Z", "after": "cursor"})
+        );
+        let refused = |tenant: Option<&str>| {
+            translate_cloud_op("get_usage", tenant, &sync).unwrap_err()["error_code"].clone()
+        };
+        assert_eq!(refused(None), "INVALID_REQUEST");
+        assert_eq!(
+            refused(Some(fluxbee_sdk::DEFAULT_ROOT_TENANT_ID)),
+            "TENANT_ROOT_PROTECTED"
+        );
+        assert_eq!(refused(Some("tnt:acme")), "INVALID_REQUEST");
+        for bad in [
+            json!({"tenant_id": "tnt:99999999-9999-4999-8999-999999999999"}),
+            json!({"all_tenants": true}),
+            json!({"since": "2026-10-01T00:00:00Z", "node_name": "IO.x@motherbee"}),
+            json!({"from": 20261001}),
+            json!({"limit": "50"}),
+            json!({"limit": -1}),
+        ] {
+            assert!(
+                translate_cloud_op("get_usage", Some(tenant), &bad).is_err(),
+                "{bad}"
+            );
+        }
     }
 
     #[test]

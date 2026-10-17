@@ -6139,7 +6139,9 @@ fn take_stream_append(stream: &stream::StreamHandle, msg: &Message, producer: &s
         serde_json::from_value(msg.payload.clone()).ok();
     let allowed = append
         .as_ref()
-        .is_some_and(|append| stream::subject_allowed(&append.subject, producer, hive_id));
+        .is_some_and(|append| {
+            stream::subject_allowed(&append.subject, producer, hive_id, stream.role())
+        });
     match (append, allowed) {
         (Some(append), true) => match serde_json::to_vec(&append.payload) {
             Ok(payload) => stream.append_from_node(&append.subject, producer, payload),

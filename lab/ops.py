@@ -14,7 +14,7 @@ Commands
   versions                         core version and manifest hash per hive
   opa-status [HIVE...]             user OPA policy per hive: version, in_sync, published, router
   health [--since HH:MM]           per VM: failed units, gate denials, routing.src drops, records
-                                   the router stream lost (UTC)
+                                   the router stream lost, usage records lost or rejected (UTC)
   build VERSION [--wait]           pull and build the .deb on the build VM (log /root/build-V.log)
   publish VERSION                  publish the built .deb to the apt repo on the build VM
   deploy VERSION --snapshot NAME [--drop OLD]
@@ -161,17 +161,30 @@ def cmd_opa_status(a):
 # Gate denials, routing.src drops and the stream's losses are logged by the router only: reading
 # its unit alone also keeps out the guest agent's own log of this command (which contains the
 # patterns). The stream logs at most one line per 30 s with its losses by reason ("expired: 12");
-# `streamlost` sums them. A journal that cannot be read is reported, never counted as zero.
+# `streamlost` sums them. The usage records among them come again in a line of their own,
+# `usagelost` (A-70 stage 3). SY.storage (the motherbee only) logs at most one line per 30 s with
+# the usage records it refused, stored under another tenant than they claimed, or could not verify;
+# `usagerej` sums them. A journal that cannot be read is reported, never counted as zero.
 HEALTH_SCRIPT = r"""
 if ! log=$(journalctl -u rt-gateway --since "%s" --no-pager -o cat 2>&1); then
   echo "journal unreadable: $(printf '%%s' "$log" | head -1)"; exit 1
+fi
+if ! storage=$(journalctl -u sy-storage --since "%s" --no-pager -o cat 2>&1); then
+  echo "journal unreadable: $(printf '%%s' "$storage" | head -1)"; exit 1
 fi
 echo "failed=$(systemctl --failed --no-legend --plain | wc -l)" \
      "denials=$(printf '%%s\n' "$log" | grep -c 'dropped protected SYSTEM action')" \
      "srcdrops=$(printf '%%s\n' "$log" | grep -c 'routing.src is not the sending node')" \
      "streamlost=$(printf '%%s\n' "$log" | grep 'router stream lost records' \
                    | sed 's/.*router stream lost records in the last [0-9]* s//' \
-                   | grep -oE ': [0-9]+' | awk '{s+=$2} END {print s+0}')"
+                   | grep -oE ': [0-9]+' | awk '{s+=$2} END {print s+0}')" \
+     "usagelost=$(printf '%%s\n' "$log" | grep 'router stream lost usage records' \
+                  | sed 's/.*router stream lost usage records in the last [0-9]* s//' \
+                  | grep -oE ': [0-9]+' | awk '{s+=$2} END {print s+0}')" \
+     "usagerej=$(printf '%%s\n' "$storage" \
+                 | grep 'usage records refused, mismatched or unverified' \
+                 | grep -oE '(refused|mismatched|unverified)=[0-9]+' | cut -d= -f2 \
+                 | awk '{s+=$1} END {print s+0}')"
 """
 
 
@@ -179,7 +192,7 @@ def health(since):
     rows, threads = {}, []
 
     def one(hive, vm):
-        _, out, _ = vm_bash(vm, HEALTH_SCRIPT % since, quiet=True)
+        _, out, _ = vm_bash(vm, HEALTH_SCRIPT % (since, since), quiet=True)
         rows[hive] = out.strip()
 
     for hive, vm in hives().items():
@@ -191,7 +204,8 @@ def health(since):
     ok = True
     for hive in hives():
         print("%-10s %s" % (hive, rows.get(hive, "no answer")))
-        ok = ok and rows.get(hive, "") == "failed=0 denials=0 srcdrops=0 streamlost=0"
+        ok = ok and rows.get(hive, "") == (
+            "failed=0 denials=0 srcdrops=0 streamlost=0 usagelost=0 usagerej=0")
     return ok
 
 

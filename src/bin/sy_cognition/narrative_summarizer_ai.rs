@@ -1,7 +1,7 @@
 use std::time::Duration;
 
 use fluxbee_ai_sdk::errors::AiSdkError;
-use fluxbee_ai_sdk::{create_llm_client, LlmClient, LlmRequest, ModelSettings};
+use fluxbee_ai_sdk::{create_llm_client, AiAccount, LlmClient, LlmRequest, ModelSettings};
 use serde::Deserialize;
 use serde_json::json;
 use tokio::time;
@@ -15,6 +15,8 @@ const NARRATIVE_SUMMARIZER_MAX_OUTPUT_TOKENS: u32 = 1024;
 #[derive(Debug, Clone)]
 pub(super) struct NarrativeSummarizerAiInput<'a> {
     pub(super) api_key: &'a str,
+    /// Who pays for the call: the communication's agent's tenant (docs/router-stream-v1.md §7.3).
+    pub(super) account: &'a AiAccount,
     pub(super) config: &'a CognitionSemanticTaggerConfig,
     pub(super) thread_id: &'a str,
     pub(super) context_label: &'a str,
@@ -70,7 +72,12 @@ pub(super) async fn run_narrative_summarizer_ai(
         output_schema: None,
     };
 
-    let client = create_llm_client(input.config.provider, input.api_key, None);
+    let client = create_llm_client(
+        input.config.provider,
+        input.api_key,
+        None,
+        input.account.clone(),
+    );
     let response = time::timeout(
         Duration::from_millis(input.config.timeout_ms),
         LlmClient::generate(client.as_ref(), request),

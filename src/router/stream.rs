@@ -49,6 +49,10 @@ pub const STREAM_NODE_APPEND_QUEUE: usize = 1_024;
 /// The most payload bytes waiting for the disk thread, both queues together: past it a record is
 /// dropped like on a full queue, so a stalled disk cannot grow the router's memory.
 pub const STREAM_QUEUE_MAX_BYTES: u64 = 16 * 1024 * 1024;
+/// What the nodes' share keeps for `storage.usage`, on disk and in the queue, so cognition's packs
+/// cannot crowd the usage records out (docs/router-stream-v1.md §7.4).
+pub const STREAM_USAGE_RESERVE_BYTES: u64 = 1024 * 1024;
+pub const STREAM_USAGE_QUEUE_RESERVE: usize = 128;
 /// At most one alarm line per interval, with the counts since the last one (D5, "log reducido").
 pub const STREAM_ALARM_INTERVAL_SECS: u64 = 30;
 /// How often the disk thread trims what every sink took and saves the cursors.
@@ -94,14 +98,32 @@ impl Source {
 
 /// Which producer may append which subject (§2.2). Turns, and their copies for cognition, only
 /// come from the router itself.
-pub fn subject_allowed(subject: &str, producer: &str, hive_id: &str) -> bool {
+pub fn subject_allowed(subject: &str, producer: &str, hive_id: &str, role: &str) -> bool {
     if subject == SUBJECT_STORAGE_TURNS || subject == SUBJECT_COGNITION_TURNS {
         return false;
     }
     if subject.starts_with(SUBJECT_STORAGE_COGNITION_PREFIX) {
         return producer.eq_ignore_ascii_case(&format!("SY.cognition@{hive_id}"));
     }
-    subject == SUBJECT_STORAGE_USAGE
+    subject == SUBJECT_STORAGE_USAGE && usage_producer_allowed(producer, role)
+}
+
+/// A usage record from a node that may charge other tenants, only on a hive where that node runs
+/// (§7.5): SY.cognition next to the agents; SY.frontdesk.gov, SY.architect and SY.admin on the
+/// motherbee. A process that registered such a name anywhere else (P-1) cannot charge through it.
+fn usage_producer_allowed(producer: &str, role: &str) -> bool {
+    let name = producer
+        .split('@')
+        .next()
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    match name.as_str() {
+        "sy.cognition" => role_runs_cognition(role),
+        "sy.frontdesk.gov" | "sy.architect" | "sy.admin" => {
+            role.trim().eq_ignore_ascii_case("motherbee")
+        }
+        _ => true,
+    }
 }
 
 /// Whether SY.cognition runs on a hive of this role: next to the agents (§6.1, D16).
@@ -289,6 +311,9 @@ struct Counters {
     dropped_cap_nodes: AtomicU64,
     refused: AtomicU64,
     disk_errors: AtomicU64,
+    /// `storage.usage` records dropped before the log (a full queue, the cap); the ones a sink
+    /// lost later are in `Shared::usage_lost`.
+    usage_lost: AtomicU64,
 }
 
 /// The router's side of the stream: append and forget (D6).
@@ -299,9 +324,15 @@ pub struct StreamHandle {
     nodes_in_queue: Arc<AtomicUsize>,
     queued_bytes: Arc<AtomicU64>,
     counters: Arc<Counters>,
+    /// The hive's role, for the producers it accepts (`subject_allowed`).
+    role: Arc<str>,
 }
 
 impl StreamHandle {
+    pub fn role(&self) -> &str {
+        &self.role
+    }
+
     /// A handle whose stream is gone: every append is dropped and counted. For tests that drive a
     /// node connection without a stream.
     #[cfg(test)]
@@ -313,6 +344,7 @@ impl StreamHandle {
             nodes_in_queue: Arc::new(AtomicUsize::new(0)),
             queued_bytes: Arc::new(AtomicU64::new(0)),
             counters: Arc::new(Counters::default()),
+            role: Arc::from("motherbee"),
         }
     }
 
@@ -329,6 +361,7 @@ impl StreamHandle {
                 nodes_in_queue: Arc::new(AtomicUsize::new(0)),
                 queued_bytes: Arc::new(AtomicU64::new(0)),
                 counters: Arc::clone(&counters),
+                role: Arc::from("motherbee"),
             },
             ObservedStream { rx, counters },
         )
@@ -356,28 +389,41 @@ impl StreamHandle {
     }
 
     fn append(&self, source: Source, subject: &str, producer: &str, payload: Vec<u8>) {
+        let usage = subject == SUBJECT_STORAGE_USAGE;
         let (in_queue, limit, dropped) = match source {
             Source::Turns => (
                 &self.turns_in_queue,
                 STREAM_TURN_QUEUE,
                 &self.counters.dropped_queue_turns,
             ),
-            Source::Nodes => (
+            // Usage records may take the whole queue; other appends leave them their reserve.
+            Source::Nodes if usage => (
                 &self.nodes_in_queue,
                 STREAM_NODE_APPEND_QUEUE,
                 &self.counters.dropped_queue_nodes,
             ),
+            Source::Nodes => (
+                &self.nodes_in_queue,
+                STREAM_NODE_APPEND_QUEUE - STREAM_USAGE_QUEUE_RESERVE,
+                &self.counters.dropped_queue_nodes,
+            ),
+        };
+        let drop_it = || {
+            dropped.fetch_add(1, Ordering::Relaxed);
+            if usage {
+                self.counters.usage_lost.fetch_add(1, Ordering::Relaxed);
+            }
         };
         let bytes = payload.len() as u64;
         if in_queue.fetch_add(1, Ordering::Relaxed) >= limit {
             in_queue.fetch_sub(1, Ordering::Relaxed);
-            dropped.fetch_add(1, Ordering::Relaxed);
+            drop_it();
             return;
         }
         if self.queued_bytes.fetch_add(bytes, Ordering::Relaxed) + bytes > STREAM_QUEUE_MAX_BYTES {
             self.queued_bytes.fetch_sub(bytes, Ordering::Relaxed);
             in_queue.fetch_sub(1, Ordering::Relaxed);
-            dropped.fetch_add(1, Ordering::Relaxed);
+            drop_it();
             return;
         }
         let incoming = Incoming {
@@ -390,7 +436,7 @@ impl StreamHandle {
         if self.tx.try_send(incoming).is_err() {
             self.queued_bytes.fetch_sub(bytes, Ordering::Relaxed);
             in_queue.fetch_sub(1, Ordering::Relaxed);
-            dropped.fetch_add(1, Ordering::Relaxed);
+            drop_it();
         }
     }
 }
@@ -416,6 +462,8 @@ struct Shared {
     records: VecDeque<Record>,
     turn_bytes: u64,
     node_bytes: u64,
+    /// `storage.usage` records a sink lost: past the window, or too big for a frame (§7.4).
+    usage_lost: u64,
     next_seq: u64,
     fsynced_seq: u64,
     sinks: HashMap<String, SinkState>,
@@ -454,6 +502,9 @@ impl Shared {
                 if let Some(state) = self.sinks.get_mut(&sink) {
                     if state.cursor < record.seq {
                         state.expired += 1;
+                        if &*record.subject == SUBJECT_STORAGE_USAGE {
+                            self.usage_lost += 1;
+                        }
                     }
                 }
             }
@@ -468,15 +519,22 @@ impl Shared {
             .unwrap_or(self.next_seq)
     }
 
-    /// Whether a record of this size fits in its source's share of the cap.
-    fn fits(&self, source: Source, size: u64) -> bool {
+    /// Whether a record of this size fits in its source's share of the cap; usage records may use
+    /// the reserve the nodes' other appends leave them.
+    fn fits(&self, source: Source, subject: &str, size: u64) -> bool {
         let node_cap = STREAM_MAX_BYTES * STREAM_NODE_APPENDS_SHARE_PERCENT / 100;
         let total = self.turn_bytes + self.node_bytes + size;
         match source {
             Source::Turns => {
                 total <= STREAM_MAX_BYTES && self.turn_bytes + size <= STREAM_MAX_BYTES - node_cap
             }
-            Source::Nodes => total <= STREAM_MAX_BYTES && self.node_bytes + size <= node_cap,
+            Source::Nodes if subject == SUBJECT_STORAGE_USAGE => {
+                total <= STREAM_MAX_BYTES && self.node_bytes + size <= node_cap
+            }
+            Source::Nodes => {
+                total <= STREAM_MAX_BYTES
+                    && self.node_bytes + size <= node_cap - STREAM_USAGE_RESERVE_BYTES
+            }
         }
     }
 }
@@ -509,6 +567,7 @@ fn plan_batch(shared: &mut Shared, sink: &str, now: u64) -> BatchPlan {
     let mut bytes = BATCH_ENVELOPE_BYTES;
     let mut expired = 0u64;
     let mut oversize = 0u64;
+    let mut usage_lost = 0u64;
     for record in shared.records.iter() {
         if record.seq <= cursor {
             continue;
@@ -538,6 +597,9 @@ fn plan_batch(shared: &mut Shared, sink: &str, now: u64) -> BatchPlan {
             } else {
                 oversize += 1;
             }
+            if &*record.subject == SUBJECT_STORAGE_USAGE {
+                usage_lost += 1;
+            }
             passed = record.seq;
             scanned = record.seq;
             continue;
@@ -551,6 +613,7 @@ fn plan_batch(shared: &mut Shared, sink: &str, now: u64) -> BatchPlan {
         scanned = record.seq;
         out.push(record.clone());
     }
+    shared.usage_lost += usage_lost;
     let state = shared.sinks.entry(sink.to_string()).or_default();
     state.expired += expired;
     state.oversize += oversize;
@@ -860,6 +923,7 @@ pub fn open(
         records: VecDeque::new(),
         turn_bytes: 0,
         node_bytes: 0,
+        usage_lost: 0,
         next_seq: recovered.next_seq,
         fsynced_seq: recovered.next_seq.saturating_sub(1),
         sinks: HashMap::new(),
@@ -895,6 +959,7 @@ pub fn open(
         nodes_in_queue: Arc::new(AtomicUsize::new(0)),
         queued_bytes: Arc::new(AtomicU64::new(0)),
         counters: Arc::clone(&counters),
+        role: Arc::from(role),
     };
     let thread_shared = Arc::clone(&shared);
     let thread_notify = Arc::clone(&notify);
@@ -1050,6 +1115,9 @@ fn run_disk(
             if let Some(line) = now.since(&alarm_seen) {
                 tracing::warn!(stream = %stream_name, "{line}");
             }
+            if let Some(line) = now.usage_since(&alarm_seen) {
+                tracing::warn!(stream = %stream_name, "{line}");
+            }
             alarm_seen = now;
         }
     }
@@ -1077,15 +1145,18 @@ fn take_incoming(
             payload: Arc::from(incoming.payload),
         };
         let size = record.size();
-        if !state.fits(record.source, size) {
+        if !state.fits(record.source, &record.subject, size) {
             // Make room first from what every sink already took or what aged out; never from
             // records still waiting (D5: past the cap, new records are the ones dropped).
             state.trim(now_ms());
-            if !state.fits(record.source, size) {
+            if !state.fits(record.source, &record.subject, size) {
                 match record.source {
                     Source::Turns => counters.dropped_cap_turns.fetch_add(1, Ordering::Relaxed),
                     Source::Nodes => counters.dropped_cap_nodes.fetch_add(1, Ordering::Relaxed),
                 };
+                if &*record.subject == SUBJECT_STORAGE_USAGE {
+                    counters.usage_lost.fetch_add(1, Ordering::Relaxed);
+                }
                 return;
             }
         }
@@ -1119,18 +1190,21 @@ struct AlarmSnapshot {
     disk_errors: u64,
     expired: u64,
     oversize: u64,
+    /// Of those, `storage.usage` records (§7.4).
+    usage_lost: u64,
 }
 
 impl AlarmSnapshot {
     fn take(counters: &Counters, shared: &Arc<StdMutex<Shared>>) -> Self {
-        let (expired, oversize) = shared
+        let (expired, oversize, sink_usage_lost) = shared
             .lock()
             .map(|shared| {
-                shared.sinks.values().fold((0, 0), |(e, o), state| {
+                let (expired, oversize) = shared.sinks.values().fold((0, 0), |(e, o), state| {
                     (e + state.expired, o + state.oversize)
-                })
+                });
+                (expired, oversize, shared.usage_lost)
             })
-            .unwrap_or((0, 0));
+            .unwrap_or((0, 0, 0));
         Self {
             dropped_queue: counters.dropped_queue_turns.load(Ordering::Relaxed)
                 + counters.dropped_queue_nodes.load(Ordering::Relaxed),
@@ -1140,7 +1214,19 @@ impl AlarmSnapshot {
             disk_errors: counters.disk_errors.load(Ordering::Relaxed),
             expired,
             oversize,
+            usage_lost: counters.usage_lost.load(Ordering::Relaxed) + sink_usage_lost,
         }
+    }
+
+    /// A line of its own for the usage records lost since `before`: they are already counted by
+    /// reason in the main line, so `ops.py health` keeps them apart (`usagelost`).
+    fn usage_since(&self, before: &Self) -> Option<String> {
+        (self.usage_lost > before.usage_lost).then(|| {
+            format!(
+                "router stream lost usage records in the last {STREAM_ALARM_INTERVAL_SECS} s: {}",
+                self.usage_lost - before.usage_lost
+            )
+        })
     }
 
     /// One line with what grew since `before`, or nothing when nothing did.
@@ -1327,7 +1413,7 @@ async fn run_sink(
 
 fn status_payload(stream_name: &str, shared: &Arc<StdMutex<Shared>>, counters: &Counters) -> Value {
     let now = now_ms();
-    let (backlog, sinks, next_seq, fsynced_seq) = match shared.lock() {
+    let (backlog, sinks, next_seq, fsynced_seq, sink_usage_lost) = match shared.lock() {
         Ok(shared) => {
             let oldest_age_ms = shared
                 .records
@@ -1369,9 +1455,10 @@ fn status_payload(stream_name: &str, shared: &Arc<StdMutex<Shared>>, counters: &
                 Value::Object(sinks),
                 shared.next_seq,
                 shared.fsynced_seq,
+                shared.usage_lost,
             )
         }
-        Err(_) => (Value::Null, Value::Null, 0, 0),
+        Err(_) => (Value::Null, Value::Null, 0, 0, 0),
     };
     json!({
         "status": "ok",
@@ -1389,6 +1476,7 @@ fn status_payload(stream_name: &str, shared: &Arc<StdMutex<Shared>>, counters: &
             "refused": counters.refused.load(Ordering::Relaxed),
             "disk_errors": counters.disk_errors.load(Ordering::Relaxed),
         },
+        "usage_lost": counters.usage_lost.load(Ordering::Relaxed) + sink_usage_lost,
         "backlog": backlog,
         "sinks": sinks,
         "next_seq": next_seq,
@@ -1399,6 +1487,7 @@ fn status_payload(stream_name: &str, shared: &Arc<StdMutex<Shared>>, counters: &
 #[cfg(test)]
 mod tests {
     use super::*;
+    use fluxbee_sdk::stream::SUBJECT_STORAGE_COGNITION_BATCH;
 
     fn record(seq: u64, ts_ms: u64, subject: &str, payload: &str) -> Record {
         Record {
@@ -1416,6 +1505,7 @@ mod tests {
             records: VecDeque::new(),
             turn_bytes: 0,
             node_bytes: 0,
+            usage_lost: 0,
             next_seq: records.last().map(|r| r.seq + 1).unwrap_or(1),
             fsynced_seq: 0,
             sinks: HashMap::new(),
@@ -1455,33 +1545,102 @@ mod tests {
         assert!(!subject_allowed(
             SUBJECT_STORAGE_TURNS,
             "AI.sales@worker1",
-            "worker1"
+            "worker1",
+            "worker"
         ));
         assert!(subject_allowed(
             "storage.cognition.threads",
             "SY.cognition@worker1",
-            "worker1"
+            "worker1",
+            "worker"
         ));
         assert!(!subject_allowed(
             "storage.cognition.threads",
             "AI.sales@worker1",
-            "worker1"
+            "worker1",
+            "worker"
         ));
         assert!(!subject_allowed(
             "storage.cognition.threads",
             "SY.cognition@motherbee",
-            "worker1"
+            "worker1",
+            "worker"
         ));
         assert!(subject_allowed(
             SUBJECT_STORAGE_USAGE,
             "AI.sales@worker1",
-            "worker1"
+            "worker1",
+            "worker"
         ));
         assert!(!subject_allowed(
             "storage.anything",
             "AI.sales@worker1",
-            "worker1"
+            "worker1",
+            "worker"
         ));
+    }
+
+    /// A usage record from a node that charges other tenants is taken only on a hive where that
+    /// node runs (§7.5).
+    #[test]
+    fn usage_records_from_charging_sy_nodes_only_where_they_run() {
+        let allowed = |producer: &str, role: &str| {
+            subject_allowed(SUBJECT_STORAGE_USAGE, producer, "h", role)
+        };
+        assert!(allowed("AI.sales@h", "ingress"));
+        assert!(allowed("SY.cognition@h", "worker"));
+        assert!(allowed("SY.cognition@h", "motherbee"));
+        assert!(!allowed("SY.cognition@h", "ingress"));
+        assert!(allowed("SY.architect@h", "motherbee"));
+        assert!(!allowed("SY.architect@h", "worker"));
+        assert!(!allowed("SY.admin@h", "egress"));
+        assert!(!allowed("SY.frontdesk.gov@h", "worker"));
+        // SY.storage reads these names without case, so the router does too.
+        assert!(!allowed("sy.frontdesk.gov@h", "worker"));
+        assert!(!allowed("Sy.Cognition@h", "ingress"));
+    }
+
+    /// The nodes' queue keeps its last slots for usage records, and a lost one is counted apart.
+    #[test]
+    fn the_node_queue_keeps_a_reserve_for_usage_records() {
+        let (handle, _observed) = StreamHandle::observed();
+        handle.nodes_in_queue.store(
+            STREAM_NODE_APPEND_QUEUE - STREAM_USAGE_QUEUE_RESERVE,
+            Ordering::Relaxed,
+        );
+        handle.append_from_node(SUBJECT_STORAGE_COGNITION_BATCH, "SY.cognition@h", vec![1]);
+        assert_eq!(
+            handle.counters.dropped_queue_nodes.load(Ordering::Relaxed),
+            1
+        );
+        assert_eq!(handle.counters.usage_lost.load(Ordering::Relaxed), 0);
+        handle.append_from_node(SUBJECT_STORAGE_USAGE, "AI.sales@h", vec![1]);
+        assert_eq!(
+            handle.counters.dropped_queue_nodes.load(Ordering::Relaxed),
+            1
+        );
+        handle
+            .nodes_in_queue
+            .store(STREAM_NODE_APPEND_QUEUE, Ordering::Relaxed);
+        handle.append_from_node(SUBJECT_STORAGE_USAGE, "AI.sales@h", vec![1]);
+        assert_eq!(handle.counters.usage_lost.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn usage_losses_get_a_line_of_their_own() {
+        let before = AlarmSnapshot::default();
+        let after = AlarmSnapshot {
+            expired: 3,
+            usage_lost: 2,
+            ..AlarmSnapshot::default()
+        };
+        assert_eq!(
+            after.usage_since(&before).as_deref(),
+            Some("router stream lost usage records in the last 30 s: 2")
+        );
+        assert_eq!(before.usage_since(&before), None);
+        let main = after.since(&before).unwrap();
+        assert!(main.starts_with("router stream lost records"), "{main}");
     }
 
     #[test]
@@ -1643,10 +1802,22 @@ mod tests {
     fn past_the_cap_new_records_are_dropped() {
         let shared = shared_with(Vec::new());
         let node_cap = STREAM_MAX_BYTES * STREAM_NODE_APPENDS_SHARE_PERCENT / 100;
-        assert!(shared.fits(Source::Nodes, node_cap));
-        assert!(!shared.fits(Source::Nodes, node_cap + 1));
-        assert!(shared.fits(Source::Turns, STREAM_MAX_BYTES - node_cap));
-        assert!(!shared.fits(Source::Turns, STREAM_MAX_BYTES - node_cap + 1));
+        assert!(shared.fits(Source::Nodes, SUBJECT_STORAGE_USAGE, node_cap));
+        assert!(!shared.fits(Source::Nodes, SUBJECT_STORAGE_USAGE, node_cap + 1));
+        // Other node appends leave the usage records their reserve (§7.4).
+        let others = node_cap - STREAM_USAGE_RESERVE_BYTES;
+        assert!(shared.fits(Source::Nodes, SUBJECT_STORAGE_COGNITION_BATCH, others));
+        assert!(!shared.fits(Source::Nodes, SUBJECT_STORAGE_COGNITION_BATCH, others + 1));
+        assert!(shared.fits(
+            Source::Turns,
+            SUBJECT_STORAGE_TURNS,
+            STREAM_MAX_BYTES - node_cap
+        ));
+        assert!(!shared.fits(
+            Source::Turns,
+            SUBJECT_STORAGE_TURNS,
+            STREAM_MAX_BYTES - node_cap + 1
+        ));
     }
 
     #[test]
@@ -1735,12 +1906,14 @@ mod tests {
         assert!(!subject_allowed(
             SUBJECT_COGNITION_TURNS,
             "SY.cognition@worker1",
-            "worker1"
+            "worker1",
+            "worker"
         ));
         assert!(subject_allowed(
             fluxbee_sdk::stream::SUBJECT_STORAGE_COGNITION_BATCH,
             "SY.cognition@worker1",
-            "worker1"
+            "worker1",
+            "worker"
         ));
     }
 

@@ -192,6 +192,7 @@ The service codes of each op are in §5.
 | `list_nodes` | relay | yes | your tenant's nodes on every hive, with their state |
 | `get_node_status` | relay | yes | one node's status |
 | `start_node` / `stop_node` / `delete_node` | relay | yes | start, stop (it stays stopped) or delete a node you launched |
+| `get_usage` | relay | yes | your tenant's model calls, one record each: by period, or as they arrive |
 | `list_cloud_actions` | local | none | this list, from the hive itself |
 
 *relay* = IO.cloud turns it into a hive admin action; *local* = IO.cloud answers it itself, the fast
@@ -673,7 +674,109 @@ how: no unit, signal or host path.
 To cut a node's access without stopping it, take its credential away (`assign_token`) or delete
 the credential (`delete_token`); to cut a whole tenant, suspend it (`update_tenant`).
 
-### 5.5 `list_cloud_actions` (local)
+### 5.5 Model usage
+
+The hive records **every call its nodes make to a model**: one record per call, charged to a
+tenant. Your tenant's records are the calls of its nodes and the calls the hive makes for them: its
+memory of a conversation is charged to the tenant of the agent in it, its frontdesk to the case's
+tenant. **The hive's own spending (Archi, the admin) is charged to the root tenant, which no op
+reads.** Pricing is yours, record by record.
+
+#### `get_usage`
+
+`tenant_id` at the root: **that tenant's records only.** Two ways to ask:
+
+- **a period**, by the time of each call: grouped (`group_by`), or record by record;
+- **since a cursor**, by the time each record was stored: to sync as the records arrive.
+
+| field | | |
+|---|---|---|
+| `params.from`, `params.to` | a period | RFC 3339 instants, at most 92 days apart: from `from`, included, to `to`, not included |
+| `params.group_by` | optional, with a period | `day`, `model` or `node`; without it, the records themselves |
+| `params.since` | instead of a period | an RFC 3339 instant to start, then the `next` of each answer. Records only |
+| `params.after` | optional | the `next` of the previous answer: the next page of the same period |
+| `params.limit` | optional | rows per page, 1–1000; every page also stays under 64 KB |
+
+**Any other field is refused**, and so is a period with `since`.
+
+A period, grouped (`"group_by":"model"`):
+
+```json
+{"status":"ok","op":"get_usage","result":{"status":"ok","next":null,"groups":[
+ {"key":"claude-sonnet-5-5","calls":412,"uncached_input":381220,"cache_read":95000,
+  "cache_write":12000,"output":40310,"reasoning":0}]}}
+```
+
+`key` is the day (`YYYY-MM-DD`, UTC), the model or the node; `calls` counts the calls, and the other
+five are the sums of their counts (below). Groups come sorted by `key`.
+
+Record by record (a period without `group_by`, or `since`):
+
+```json
+{"status":"ok","op":"get_usage","result":{"status":"ok","next":"…","records":[{
+ "record_id":"8b6b3c1e-…","provider_response_id":"msg_01…",
+ "ts":"2026-10-17T12:00:00Z","stored_at":"2026-10-17T12:00:03Z","verified":true,
+ "hive":"motherbee","node_name":"AI.sales@motherbee","node_ilk":"ilk:…",
+ "tenant_id":"tnt:…","tenant_source":"node","counterpart_ilk":"ilk:…",
+ "provider":"anthropic","model":"claude-sonnet-5-5","served_model":"claude-sonnet-5-5",
+ "kind":"function_turn","outcome":"ok",
+ "uncached_input":1200,"cache_read":0,"cache_write":0,"output":80,
+ "raw_usage":{"input_tokens":1200,"output_tokens":80},"trace_id":"…","thread_id":"…"}]}}
+```
+
+| field | what |
+|---|---|
+| `record_id` | the call; unique |
+| `provider_response_id` | the provider's id of the answer, when it gave one: one answer is stored once |
+| `ts` | when the answer arrived (or the node gave up), RFC 3339 UTC, by the node's clock. Periods go by it |
+| `stored_at` | when the hive stored the record. `since` goes by it |
+| `hive`, `node_name`, `node_ilk` | the node that made the call |
+| `tenant_id` | the tenant charged |
+| `tenant_source` | why: `node` (your node), `agent` (the hive's memory, for your agent's conversation), `case` (the frontdesk, for your case) |
+| `claimed_tenant_id` | the tenant the node's record named. It differs from `tenant_id` when the hive charged the node's own tenant instead |
+| `verified` | `false` when the hive could not check the tenant against its identity registry and kept the one the record named |
+| `counterpart_ilk` | who the call was for: the person your agent answered, or your agent for the hive's memory |
+| `provider`, `model`, `served_model`, `service_tier` | the provider, the model asked for, the model that answered, and OpenAI's service tier |
+| `kind` | `generate` (one answer) or `function_turn` (one turn of a tool loop) |
+| `outcome` | `ok`; `truncated` (cut at the output limit); `refused` (the model refused); `unreadable` (an answer paid for whose counts could not be read); `abandoned` (the node stopped waiting: maybe paid for) |
+| `uncached_input`, `cache_read`, `cache_write`, `output`, `reasoning` | the counts (below); none for `unreadable` and `abandoned` |
+| `raw_usage` | the provider's own usage object, up to 2 KB |
+| `trace_id`, `thread_id` | the message and the conversation, when there is one |
+| `work` | what the work belongs to, for the hive's own tools; yours have none |
+
+**The counts are the same for every provider:** `uncached_input` + `cache_read` + `cache_write` is
+every input token, and `output` includes the reasoning. `reasoning` is the part of `output` the
+provider reports as such (OpenAI), absent otherwise. Anthropic's split of cache writes by lifetime
+(5 minutes, 1 hour) stays in `raw_usage`.
+
+**Pricing is per record:** by its `model` (`served_model` says what actually answered), its
+`service_tier` and its counts; `raw_usage` holds anything else a price needs. An `unreadable` or
+`abandoned` record has no counts: it says a call happened that may have been paid for.
+
+**Records arrive late, by design.** A record travels through its hive's stream, which holds it up
+to 2 minutes while the store is busy or out of reach, and the store retries one it cannot check yet
+for up to 10 minutes. So a period is final only about 12 minutes after it ends. To bill, sync
+rather than re-read periods:
+
+1. `{"op":"get_usage","tenant_id":…,"params":{"since":"2026-10-01T00:00:00Z"}}`;
+2. keep the answer's `next` and ask again with `"since"` set to it, until an answer brings no
+   records;
+3. later, ask again from the last `next` you kept. An answer without records comes with
+   `next: null`: keep yours.
+
+Records can still be missing: a call in flight when its node is killed, or records held past the
+stream's 2 minutes while the motherbee is down. The hive counts what it loses; the operator sees it.
+
+**Paging a period:** send the same question with `params.after` set to the answer's `next`;
+`next: null` means there are no more pages.
+
+| `error_code` | when |
+|---|---|
+| `INVALID_REQUEST` | a field outside the list or of the wrong type, a bad instant, a period over 92 days or with `to` not after `from`, a period or `after` with `since`, a `limit` outside 1–1000, a cursor that is not a `next` the hive gave |
+| `TENANT_ROOT_PROTECTED` | the root tenant |
+| `USAGE_UNAVAILABLE` | the store did not answer in time or could not run the question (the detail says why): retry later |
+
+### 5.6 `list_cloud_actions` (local)
 
 No tenant, no params. `result: {"actions":[{"op":…,"category":"relay"|"local","summary":…}, …]}`:
 every op of §5 with a one-line summary, from the hive itself.
@@ -684,13 +787,14 @@ every op of §5 with a one-line summary, from the hive itself.
 
 ```text
 you / the edge wait   30 s
-IO.cloud waits        20 s for the hive (25 s for provision_node, stop_node and delete_node)
+IO.cloud waits        20 s for the hive (25 s for provision_node, stop_node, delete_node and get_usage)
 ```
 
 A request that takes between 20 (25) and 30 s answers `ADMIN_UNAVAILABLE` **while it may still be
 completing inside**. Treat it as **unknown**, not failed:
 
 - `create_tenant`, `update_tenant`, `put_token` (same value), `delete_*`, `restore_*`: safe to retry.
+- `get_usage`: a read, safe to retry.
 - `delete_token`: a retry of a delete that did complete answers `KEY_NOT_FOUND`.
 - `provision_node`: a retry answers `NODE_ALREADY_EXISTS`, which may mean the timed-out attempt
   worked. There is no idempotency key (`request_id` is for traces only); ask the operator.
@@ -752,11 +856,18 @@ post '{"op":"list_cloud_actions"}'
    health per credential.
 8. **Companies and members are Cloud's.** Fluxbee knows each person once and the tenant they are
    charged to now; which companies a person belongs to, and which one they act for, is Cloud's
-   (`docs/ilk-tenant-model-v1.md`). Token spending per tenant is not recorded yet (stage 5 there).
+   (`docs/ilk-tenant-model-v1.md`). Model spending is recorded per call and read with `get_usage`
+   (§5.5); pricing it is Cloud's.
 
 ---
 
 ## 9. What changed for Cloud
+
+### 0.1.79
+
+- **New op `get_usage`** (§5.5): your tenant's model calls, one record each, with their tokens.
+  A period grouped by day, model or node, or record by record; or the records stored since a
+  cursor, to sync as they arrive. Pricing is yours, per record.
 
 ### 0.1.68
 

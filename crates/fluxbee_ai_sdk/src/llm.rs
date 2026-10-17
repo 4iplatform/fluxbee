@@ -16,6 +16,8 @@ use crate::function_calling::{
     FunctionToolCall,
 };
 use crate::text_payload::ModelContentPart;
+use crate::usage::AiAccount;
+use fluxbee_sdk::UsageKind;
 
 pub const DEFAULT_HIVE_AI_PROVIDER: AiProvider = AiProvider::OpenAi;
 pub const DEFAULT_HIVE_OPENAI_MODEL: &str = "gpt-5.5";
@@ -349,27 +351,30 @@ impl LlmClient for MockLlmClient {
 }
 
 #[derive(Clone)]
-pub struct OpenAiResponsesClient {
+/// Private to the SDK: every call goes through the factories, with its `AiAccount` (§7.2).
+pub(crate) struct OpenAiResponsesClient {
     http: reqwest::Client,
     base_url: String,
     api_key: String,
+    account: AiAccount,
 }
 
 impl OpenAiResponsesClient {
-    pub fn new(api_key: impl Into<String>) -> Self {
+    pub(crate) fn new(api_key: impl Into<String>, account: AiAccount) -> Self {
         Self {
             http: reqwest::Client::new(),
             base_url: "https://api.openai.com/v1/responses".to_string(),
             api_key: api_key.into(),
+            account,
         }
     }
 
-    pub fn with_base_url(mut self, base_url: impl Into<String>) -> Self {
+    pub(crate) fn with_base_url(mut self, base_url: impl Into<String>) -> Self {
         self.base_url = base_url.into();
         self
     }
 
-    pub fn function_model(
+    pub(crate) fn function_model(
         self,
         model: impl Into<String>,
         system: Option<String>,
@@ -412,17 +417,26 @@ impl LlmClient for OpenAiResponsesClient {
         }
 
         let auth = format!("Bearer {}", self.api_key);
-        let response = self
+        let mut call = self
+            .account
+            .begin(AiProvider::OpenAi, &request.model, UsageKind::Generate);
+        let response = match self
             .http
             .post(&self.base_url)
             .header(AUTHORIZATION, auth)
             .header(CONTENT_TYPE, "application/json")
             .json(&body)
             .send()
-            .await?;
+            .await
+        {
+            Ok(response) => response,
+            Err(err) => {
+                call.failed();
+                return Err(err.into());
+            }
+        };
 
-        let status = response.status();
-        let value: serde_json::Value = response.json().await?;
+        let (status, value) = openai_read_answer(&mut call, response).await?;
         if !status.is_success() {
             return Err(openai_status_error(status.as_u16(), &value));
         }
@@ -438,6 +452,23 @@ impl LlmClient for OpenAiResponsesClient {
 
         Ok(LlmResponse { content: text })
     }
+}
+
+/// An OpenAI answer's body. A 2xx is recorded as soon as its body is read (§7.2), `unreadable`
+/// when it cannot be; anything else is no call that costs, settled before its body is read.
+async fn openai_read_answer(
+    call: &mut crate::usage::CallGuard<'_>,
+    response: reqwest::Response,
+) -> Result<(reqwest::StatusCode, Value)> {
+    let status = response.status();
+    if !status.is_success() {
+        call.failed();
+    }
+    let body = response.json::<Value>().await;
+    if status.is_success() {
+        call.answered(body.as_ref().ok());
+    }
+    Ok((status, body?))
 }
 
 /// The answer of a Responses payload: `output_text` when the server sends it (the official SDKs
@@ -709,8 +740,7 @@ fn validate_field_against_schema(field_name: &str, value: &Value, schema: &Value
     Ok(())
 }
 
-#[derive(Clone)]
-pub struct OpenAiFunctionCallingModel {
+pub(crate) struct OpenAiFunctionCallingModel {
     client: OpenAiResponsesClient,
     model: String,
     system: Option<String>,
@@ -809,7 +839,11 @@ impl FunctionCallingModel for OpenAiFunctionCallingModel {
         }
 
         let auth = format!("Bearer {}", self.client.api_key);
-        let response = self
+        let mut call =
+            self.client
+                .account
+                .begin(AiProvider::OpenAi, &self.model, UsageKind::FunctionTurn);
+        let response = match self
             .client
             .http
             .post(&self.client.base_url)
@@ -817,10 +851,16 @@ impl FunctionCallingModel for OpenAiFunctionCallingModel {
             .header(CONTENT_TYPE, "application/json")
             .json(&body)
             .send()
-            .await?;
+            .await
+        {
+            Ok(response) => response,
+            Err(err) => {
+                call.failed();
+                return Err(err.into());
+            }
+        };
 
-        let status = response.status();
-        let value: Value = response.json().await?;
+        let (status, value) = openai_read_answer(&mut call, response).await?;
         if !status.is_success() {
             // Same clean format as the Responses path (audit B6/M3): no raw body (key echo), and
             // it carries type/param/message so the consumer can classify + scrub.
@@ -970,28 +1010,31 @@ const ANTHROPIC_VERSION: &str = "2023-06-01";
 const ANTHROPIC_DEFAULT_MAX_TOKENS: u32 = 4096;
 const ANTHROPIC_MAX_ATTEMPTS: usize = 3;
 
+/// Private to the SDK: every call goes through the factories, with its `AiAccount` (§7.2).
 #[derive(Clone)]
-pub struct AnthropicMessagesClient {
+pub(crate) struct AnthropicMessagesClient {
     http: reqwest::Client,
     api_key: String,
     base_url: String,
+    account: AiAccount,
 }
 
 impl AnthropicMessagesClient {
-    pub fn new(api_key: impl Into<String>) -> Self {
+    pub(crate) fn new(api_key: impl Into<String>, account: AiAccount) -> Self {
         Self {
             http: reqwest::Client::new(),
             api_key: api_key.into(),
             base_url: ANTHROPIC_MESSAGES_URL.to_string(),
+            account,
         }
     }
 
-    pub fn with_base_url(mut self, base_url: impl Into<String>) -> Self {
+    pub(crate) fn with_base_url(mut self, base_url: impl Into<String>) -> Self {
         self.base_url = base_url.into();
         self
     }
 
-    pub fn function_model(
+    pub(crate) fn function_model(
         self,
         model: impl Into<String>,
         system: Option<String>,
@@ -1005,8 +1048,16 @@ impl AnthropicMessagesClient {
         }
     }
 
-    async fn send(&self, body: &Value) -> Result<Value> {
+    /// One request, retried as Anthropic advises. Each attempt is a call of its own for the usage
+    /// records (§7.2): only the one that answers 2xx is recorded, and a retry's wait is no call.
+    async fn send(&self, body: &Value, kind: UsageKind) -> Result<Value> {
+        let model = body
+            .get("model")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
         for attempt in 0..ANTHROPIC_MAX_ATTEMPTS {
+            let mut call = self.account.begin(AiProvider::Anthropic, &model, kind);
             let response = match self
                 .http
                 .post(&self.base_url)
@@ -1023,11 +1074,15 @@ impl AnthropicMessagesClient {
             {
                 Ok(response) => response,
                 Err(err) if attempt + 1 < ANTHROPIC_MAX_ATTEMPTS => {
+                    call.failed();
                     tokio::time::sleep(anthropic_retry_delay(attempt, None)).await;
                     tracing::warn!(attempt = attempt + 1, error = %err, "retrying Anthropic transport error");
                     continue;
                 }
-                Err(err) => return Err(err.into()),
+                Err(err) => {
+                    call.failed();
+                    return Err(err.into());
+                }
             };
             let status = response.status();
             let headers = response.headers().clone();
@@ -1044,17 +1099,27 @@ impl AnthropicMessagesClient {
                 && attempt + 1 < ANTHROPIC_MAX_ATTEMPTS
                 && anthropic_should_retry(status.as_u16(), &headers)
             {
+                call.failed();
                 let retry_after = anthropic_retry_after(&headers);
                 tokio::time::sleep(anthropic_retry_delay(attempt, retry_after)).await;
                 tracing::warn!(attempt = attempt + 1, status = %status, request_id = %request_id, "retrying Anthropic response");
                 continue;
             }
             if status.is_success() {
-                let value: Value = response.json().await?;
-                return Ok(value);
+                return match response.json::<Value>().await {
+                    Ok(value) => {
+                        call.answered(Some(&value));
+                        Ok(value)
+                    }
+                    Err(err) => {
+                        call.answered(None);
+                        Err(err.into())
+                    }
+                };
             }
             // Non-retryable (or last attempt): parse tolerantly so a non-JSON error body
             // surfaces the status/request-id instead of a masking decode error.
+            call.failed();
             let value: Value = response.json().await.unwrap_or(Value::Null);
             let error_type = value
                 .pointer("/error/type")
@@ -1276,7 +1341,10 @@ impl LlmClient for AnthropicMessagesClient {
         // does not support structured outputs answers 400. Instead of surfacing that raw 400,
         // retry ONCE without output_config, steering the schema via a system instruction — the
         // local validate_structured_output below still enforces the contract on the result.
-        let value = match self.send(&Value::Object(body.clone())).await {
+        let value = match self
+            .send(&Value::Object(body.clone()), UsageKind::Generate)
+            .await
+        {
             Ok(value) => value,
             Err(err)
                 if request.output_schema.is_some()
@@ -1298,7 +1366,7 @@ impl LlmClient for AnthropicMessagesClient {
                 tracing::warn!(
                     "anthropic model rejected output_config; retrying with prompt-instruction structured-output fallback"
                 );
-                self.send(&Value::Object(body)).await?
+                self.send(&Value::Object(body), UsageKind::Generate).await?
             }
             Err(err) => return Err(err),
         };
@@ -1374,7 +1442,7 @@ fn anthropic_response_text(value: &Value) -> Result<String> {
 }
 
 #[derive(Clone)]
-pub struct AnthropicFunctionCallingModel {
+pub(crate) struct AnthropicFunctionCallingModel {
     client: AnthropicMessagesClient,
     model: String,
     system: Option<String>,
@@ -1420,7 +1488,10 @@ impl FunctionCallingModel for AnthropicFunctionCallingModel {
         if let Some(top_p) = self.model_settings.top_p {
             body.insert("top_p".to_string(), Value::from(top_p));
         }
-        let value = self.client.send(&Value::Object(body)).await?;
+        let value = self
+            .client
+            .send(&Value::Object(body), UsageKind::FunctionTurn)
+            .await?;
         anthropic_check_truncation(&value)?;
         let mut assistant_text = Vec::new();
         let mut tool_calls = Vec::new();
@@ -1568,22 +1639,26 @@ fn build_anthropic_function_messages(
     Ok((system_parts.join("\n\n"), messages))
 }
 
+/// The plain-path client. Every model call of the system goes through this or
+/// `create_function_calling_model`, with the account that says who spends and who pays (§7.2):
+/// each answer leaves one usage record.
 pub fn create_llm_client(
     provider: AiProvider,
     api_key: impl Into<String>,
     base_url: Option<String>,
+    account: AiAccount,
 ) -> Arc<dyn LlmClient> {
     let api_key = api_key.into();
     match provider {
         AiProvider::OpenAi => {
-            let mut client = OpenAiResponsesClient::new(api_key);
+            let mut client = OpenAiResponsesClient::new(api_key, account);
             if let Some(base_url) = base_url {
                 client = client.with_base_url(base_url);
             }
             Arc::new(client)
         }
         AiProvider::Anthropic => {
-            let mut client = AnthropicMessagesClient::new(api_key);
+            let mut client = AnthropicMessagesClient::new(api_key, account);
             if let Some(base_url) = base_url {
                 client = client.with_base_url(base_url);
             }
@@ -1592,6 +1667,7 @@ pub fn create_llm_client(
     }
 }
 
+/// The tool-loop client; see `create_llm_client`.
 pub fn create_function_calling_model(
     provider: AiProvider,
     api_key: impl Into<String>,
@@ -1599,19 +1675,20 @@ pub fn create_function_calling_model(
     model: impl Into<String>,
     system: Option<String>,
     model_settings: ModelSettings,
+    account: AiAccount,
 ) -> Arc<dyn FunctionCallingModel> {
     let api_key = api_key.into();
     let model = model.into();
     match provider {
         AiProvider::OpenAi => {
-            let mut client = OpenAiResponsesClient::new(api_key);
+            let mut client = OpenAiResponsesClient::new(api_key, account);
             if let Some(base_url) = base_url {
                 client = client.with_base_url(base_url);
             }
             Arc::new(client.function_model(model, system, model_settings))
         }
         AiProvider::Anthropic => {
-            let mut client = AnthropicMessagesClient::new(api_key);
+            let mut client = AnthropicMessagesClient::new(api_key, account);
             if let Some(base_url) = base_url {
                 client = client.with_base_url(base_url);
             }
@@ -1724,7 +1801,18 @@ mod tests {
         }
     }
 
+    fn test_account() -> AiAccount {
+        AiAccount::root(crate::usage::UsageRecorder::disabled(), "SY.test@motherbee")
+    }
+
     fn spawn_single_response_server(
+        response_body: Value,
+    ) -> (String, mpsc::Receiver<Value>, thread::JoinHandle<()>) {
+        spawn_response_server("200 OK", response_body)
+    }
+
+    fn spawn_response_server(
+        status_line: &'static str,
         response_body: Value,
     ) -> (String, mpsc::Receiver<Value>, thread::JoinHandle<()>) {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind test server");
@@ -1774,7 +1862,7 @@ mod tests {
 
             let response_json = serde_json::to_vec(&response_body).expect("serialize response");
             let response = format!(
-                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                "HTTP/1.1 {status_line}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
                 response_json.len()
             );
             stream
@@ -2056,7 +2144,7 @@ mod tests {
         let (base_url, body_rx, handle) = spawn_single_response_server(json!({
             "output_text": "{\"ok\":true}"
         }));
-        let client = OpenAiResponsesClient::new("test-key").with_base_url(base_url);
+        let client = OpenAiResponsesClient::new("test-key", test_account()).with_base_url(base_url);
         let request = LlmRequest {
             model: "gpt-4.1-mini".to_string(),
             system: Some("sys".to_string()),
@@ -2102,7 +2190,7 @@ mod tests {
         let (base_url, body_rx, handle) = spawn_single_response_server(json!({
             "output_text": "plain text"
         }));
-        let client = OpenAiResponsesClient::new("test-key").with_base_url(base_url);
+        let client = OpenAiResponsesClient::new("test-key", test_account()).with_base_url(base_url);
         let request = LlmRequest {
             model: "gpt-4.1-mini".to_string(),
             system: Some("sys".to_string()),
@@ -2134,7 +2222,7 @@ mod tests {
                  "content": [{"type": "output_text", "text": "{\"tags\":[\"billing\"]}", "annotations": []}]}
             ]
         }));
-        let client = OpenAiResponsesClient::new("test-key").with_base_url(base_url);
+        let client = OpenAiResponsesClient::new("test-key", test_account()).with_base_url(base_url);
         let request = LlmRequest {
             model: "gpt-5.5".to_string(),
             system: Some("sys".to_string()),
@@ -2151,6 +2239,72 @@ mod tests {
             .expect("generate should succeed");
         assert_eq!(response.content, "{\"tags\":[\"billing\"]}");
         handle.join().expect("server thread");
+    }
+
+    #[tokio::test]
+    async fn a_2xx_answer_leaves_one_usage_record_and_an_error_none() {
+        let (recorder, mut records) = crate::usage::UsageRecorder::for_test();
+        let account = AiAccount::charge(
+            recorder,
+            "AI.sales@motherbee",
+            Some("tnt:22222222-2222-4222-8222-222222222222".to_string()),
+            fluxbee_sdk::TenantSource::Node,
+        )
+        .with_thread(Some("thread-1".to_string()));
+        let request = || LlmRequest {
+            model: "gpt-5.5".to_string(),
+            system: None,
+            input: "hola".to_string(),
+            input_parts: None,
+            output_schema: None,
+            max_output_tokens: None,
+            model_settings: None,
+        };
+
+        let (base_url, _body_rx, handle) = spawn_single_response_server(json!({
+            "id": "resp_1",
+            "model": "gpt-5.5-2026-04-01",
+            "service_tier": "default",
+            "status": "completed",
+            "output_text": "hola",
+            "usage": {"input_tokens": 20, "input_tokens_details": {"cached_tokens": 5},
+                      "output_tokens": 9, "output_tokens_details": {"reasoning_tokens": 4}}
+        }));
+        let client =
+            OpenAiResponsesClient::new("test-key", account.clone()).with_base_url(base_url);
+        client
+            .generate(request())
+            .await
+            .expect("generate should succeed");
+        handle.join().expect("server thread");
+        let record = records.try_recv().expect("one usage record");
+        assert_eq!(record.provider_response_id.as_deref(), Some("resp_1"));
+        assert_eq!(record.served_model.as_deref(), Some("gpt-5.5-2026-04-01"));
+        assert_eq!(record.service_tier.as_deref(), Some("default"));
+        assert_eq!(record.kind, UsageKind::Generate);
+        assert_eq!(record.outcome, fluxbee_sdk::UsageOutcome::Ok);
+        assert_eq!(
+            (
+                record.uncached_input,
+                record.cache_read,
+                record.output,
+                record.reasoning
+            ),
+            (Some(15), Some(5), Some(9), Some(4))
+        );
+        assert_eq!(record.thread_id.as_deref(), Some("thread-1"));
+
+        let (base_url, _body_rx, handle) = spawn_response_server(
+            "400 Bad Request",
+            json!({"error": {"type": "invalid_request_error", "message": "bad"}}),
+        );
+        let client = OpenAiResponsesClient::new("test-key", account).with_base_url(base_url);
+        assert!(client.generate(request()).await.is_err());
+        handle.join().expect("server thread");
+        assert!(
+            records.try_recv().is_err(),
+            "a non-2xx answer leaves no record"
+        );
     }
 
     #[test]
@@ -2216,7 +2370,8 @@ providers:
             "content": [{"type":"text", "text":"hola"}],
             "usage": {"input_tokens": 3, "output_tokens": 2}
         }));
-        let client = AnthropicMessagesClient::new("test-key").with_base_url(base_url);
+        let client =
+            AnthropicMessagesClient::new("test-key", test_account()).with_base_url(base_url);
         let response = client
             .generate(LlmRequest {
                 model: "claude-sonnet-4-5".to_string(),

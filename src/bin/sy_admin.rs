@@ -22,9 +22,10 @@ use zip::ZipArchive;
 
 use async_trait::async_trait;
 use fluxbee_ai_sdk::{
-    create_function_calling_model, AiProvider, FunctionCallingConfig, FunctionCallingRunner,
-    FunctionLoopItem, FunctionRunInput, FunctionTool, FunctionToolDefinition, FunctionToolRegistry,
-    HiveAiConfig, ModelSettings,
+    create_function_calling_model, AiAccount, AiProvider, FunctionCallingConfig,
+    FunctionCallingRunner, FunctionLoopItem, FunctionRunInput, FunctionTool,
+    FunctionToolDefinition, FunctionToolRegistry, HiveAiConfig, ModelSettings, UsageRecorder,
+    UsageWork,
 };
 use fluxbee_sdk::blob::{BlobRef, BlobToolkit};
 use fluxbee_sdk::protocol::{
@@ -41,13 +42,14 @@ use fluxbee_sdk::{
     build_node_config_response_message, classify_admin_action, classify_system_message,
     derive_action_outcome, try_handle_default_node_status, NodeConfig, OperationalRouteProfile,
     PendingMatcher, RouteMatch, RouteTarget, RouterDispatcher, RpcCommandReceiver,
-    RpcRequestLabels, StorageMetricsResponse, MSG_STORAGE_METRICS_GET,
-    MSG_STORAGE_METRICS_RESPONSE, MSG_VAULT_ASSIGN, MSG_VAULT_ASSIGN_RESPONSE, MSG_VAULT_DELETE,
+    RpcRequestLabels, StorageMetricsResponse, UsageGroupBy, UsageQuery, UsageQueryResponse,
+    MSG_STORAGE_METRICS_GET, MSG_STORAGE_METRICS_RESPONSE, MSG_USAGE_QUERY,
+    MSG_USAGE_QUERY_RESPONSE, MSG_VAULT_ASSIGN, MSG_VAULT_ASSIGN_RESPONSE, MSG_VAULT_DELETE,
     MSG_VAULT_DELETE_RESPONSE, MSG_VAULT_GET, MSG_VAULT_GET_METADATA,
     MSG_VAULT_GET_METADATA_RESPONSE, MSG_VAULT_GET_RESPONSE, MSG_VAULT_LIST,
     MSG_VAULT_LIST_RESPONSE, MSG_VAULT_PUT, MSG_VAULT_PUT_RESPONSE, MSG_VAULT_ROLLBACK,
     MSG_VAULT_ROLLBACK_RESPONSE, MSG_VAULT_ROTATE, MSG_VAULT_ROTATE_RESPONSE,
-    NODE_SECRET_REDACTION_TOKEN,
+    NODE_SECRET_REDACTION_TOKEN, USAGE_QUERY_MAX_DAYS, USAGE_QUERY_MAX_LIMIT,
 };
 use json_router::runtime_manifest::{
     load_runtime_manifest_from_paths, runtime_manifest_write_v2_gate_enabled_from_env,
@@ -296,7 +298,6 @@ struct AdminContext {
     /// by SY.identity and resolved here at boot from identity SHM. Use as
     /// `meta.src_ilk` for outgoing vault/identity calls and any other path where
     /// L3 identity is required.
-    #[allow(dead_code)] // wired into outgoing calls in the follow-up vault work
     self_ilk_id: String,
     authorized_hives: Vec<String>,
     executor_runtime: Arc<Mutex<Option<AdminExecutorAiRuntime>>>,
@@ -305,6 +306,8 @@ struct AdminContext {
     /// hot-refresh path so refreshes flow through the same router
     /// connection as ordinary admin/system traffic.
     rpc: Arc<RouterDispatcher>,
+    /// Where each model call's usage record goes (docs/router-stream-v1.md §7.2).
+    usage: UsageRecorder,
     public_edge_node: Option<String>,
     public_base_url: Option<String>,
     publication_ledger_path: PathBuf,
@@ -631,6 +634,7 @@ async fn main() -> Result<(), AdminError> {
         executor_runtime,
         executor_configured,
         rpc: Arc::clone(&router_client),
+        usage: UsageRecorder::start(Arc::clone(&router_client)),
         public_edge_node,
         public_base_url,
         publication_ledger_path: state_dir.join("sy-admin/publications.json"),
@@ -2090,9 +2094,28 @@ impl FunctionTool for PlanStepReviewTool {
     }
 }
 
+/// The root tenant pays for SY.admin's executor; each record keeps its run and the router-stamped
+/// name of who asked for it (docs/router-stream-v1.md §7.3).
+fn executor_usage_account(
+    ctx: &AdminContext,
+    execution_id: Option<&str>,
+    caller: Option<&str>,
+    stage: &str,
+) -> AiAccount {
+    AiAccount::root(ctx.usage.clone(), &ctx.node_name)
+        .with_node_ilk(Some(ctx.self_ilk_id.clone()))
+        .with_work(UsageWork {
+            execution_id: execution_id.map(str::to_string),
+            caller: caller.map(str::to_string),
+            stage: Some(stage.to_string()),
+            ..UsageWork::default()
+        })
+}
+
 async fn semantic_review_executor_plan(
     runtime: &AdminExecutorAiRuntime,
     plan: &AdminExecutorPlan,
+    account: &AiAccount,
 ) -> Result<(), String> {
     let mut all_issues: Vec<String> = Vec::new();
 
@@ -2137,6 +2160,7 @@ Step to review:\n{}",
             runtime.model.clone(),
             Some(prompt),
             runtime.model_settings.clone(),
+            account.clone(),
         );
         let runner = FunctionCallingRunner::new(FunctionCallingConfig::default());
         let _ = runner
@@ -2539,7 +2563,9 @@ async fn execute_admin_executor_plan(
     ctx: &AdminContext,
     client: &Arc<RouterDispatcher>,
     request: &AdminExecutorRunRequest,
+    caller: Option<&str>,
 ) -> Result<serde_json::Value, AdminError> {
+    let account = executor_usage_account(ctx, Some(&request.execution_id), caller, "executor");
     validate_executor_plan(&request.plan).map_err(|detail| -> AdminError { detail.into() })?;
     let runtime = ctx
         .executor_runtime
@@ -2619,6 +2645,7 @@ async fn execute_admin_executor_plan(
             runtime.model.clone(),
             Some(admin_executor_prompt(&resolved_step, &request.plan)),
             runtime.model_settings.clone(),
+            account.clone(),
         );
         let runner = FunctionCallingRunner::new(FunctionCallingConfig::default());
         let result = runner
@@ -3145,6 +3172,8 @@ enum InternalActionRoute {
     TimerRpc(&'static str),
     /// Admin asks every router stream of the hive itself (A-70).
     StreamStatus,
+    /// Admin asks SY.storage for the LLM usage records (A-70 stage 3).
+    LlmUsage,
 }
 
 #[derive(Clone, Copy)]
@@ -3155,7 +3184,7 @@ struct InternalActionSpec {
     allow_legacy_hive_id: bool,
 }
 
-const INTERNAL_ACTION_REGISTRY_VERSION: &str = "12";
+const INTERNAL_ACTION_REGISTRY_VERSION: &str = "13";
 
 const INTERNAL_ACTION_REGISTRY: &[InternalActionSpec] = &[
     InternalActionSpec {
@@ -3257,6 +3286,12 @@ const INTERNAL_ACTION_REGISTRY: &[InternalActionSpec] = &[
     InternalActionSpec {
         action: "list_streams",
         route: InternalActionRoute::StreamStatus,
+        requires_target: true,
+        allow_legacy_hive_id: false,
+    },
+    InternalActionSpec {
+        action: "get_llm_usage",
+        route: InternalActionRoute::LlmUsage,
         requires_target: true,
         allow_legacy_hive_id: false,
     },
@@ -5259,7 +5294,9 @@ async fn dispatch_internal_admin_command(
             };
             let runtime = ctx.executor_runtime.lock().await.clone();
             if let Some(runtime) = runtime {
-                if let Err(detail) = semantic_review_executor_plan(&runtime, &plan).await {
+                let account = executor_usage_account(ctx, None, caller_l2_name, "executor_review");
+                if let Err(detail) = semantic_review_executor_plan(&runtime, &plan, &account).await
+                {
                     return Ok(InternalAdminDispatchResult {
                         http_status: 422,
                         envelope: serde_json::json!({
@@ -5331,21 +5368,22 @@ async fn dispatch_internal_admin_command(
                     ))
                 }
             };
-            let payload = match execute_admin_executor_plan(ctx, client, &request).await {
-                Ok(payload) => payload,
-                Err(err) => {
-                    return Ok(InternalAdminDispatchResult {
-                        http_status: 409,
-                        envelope: serde_json::json!({
-                            "status": "error",
-                            "action": action,
-                            "payload": serde_json::Value::Null,
-                            "error_code": "EXECUTOR_UNAVAILABLE",
-                            "error_detail": err.to_string(),
-                        }),
-                    })
-                }
-            };
+            let payload =
+                match execute_admin_executor_plan(ctx, client, &request, caller_l2_name).await {
+                    Ok(payload) => payload,
+                    Err(err) => {
+                        return Ok(InternalAdminDispatchResult {
+                            http_status: 409,
+                            envelope: serde_json::json!({
+                                "status": "error",
+                                "action": action,
+                                "payload": serde_json::Value::Null,
+                                "error_code": "EXECUTOR_UNAVAILABLE",
+                                "error_detail": err.to_string(),
+                            }),
+                        })
+                    }
+                };
             return Ok(InternalAdminDispatchResult {
                 http_status: if payload.get("status").and_then(serde_json::Value::as_str)
                     == Some("done")
@@ -5487,6 +5525,22 @@ async fn dispatch_internal_admin_command(
                 ));
             };
             handle_list_streams(ctx, client, hive_id).await?
+        }
+        InternalActionRoute::LlmUsage => {
+            let Some(hive_id) = resolve_internal_action_hive(action, target, &params) else {
+                return Ok(internal_invalid_request(
+                    action,
+                    "missing target (payload.target required for this action)",
+                ));
+            };
+            let query = match llm_usage_query_from_params(params) {
+                Ok(query) => query,
+                Err(detail) => return Ok(internal_invalid_request(action, &detail)),
+            };
+            if let Err(detail) = authorize_llm_usage_scope(caller_l2_name, &ctx.hive_id, &query) {
+                return Ok(internal_unauthorized(action, &detail));
+            }
+            handle_llm_usage(client, &hive_id, query).await?
         }
     };
 
@@ -6109,6 +6163,32 @@ fn enforce_cloud_relay_content(
         "list_tenants" => {
             only_fields(Some(params), &[])?;
         }
+        // The claimed tenant's LLM usage (docs/router-stream-v1.md §7.6), never every tenant's:
+        // the root tenant's spending (Archi, the admin's executor) stays with the operator.
+        "get_llm_usage" => {
+            cloud_claimed_tenant(params.get("tenant_id"), action)?;
+            if params
+                .get("all_tenants")
+                .is_some_and(|all| *all != serde_json::Value::Bool(false))
+            {
+                return Err(format!(
+                    "IO.cloud {action} reads its claimed tenant only, never all_tenants"
+                ));
+            }
+            only_fields(
+                Some(params),
+                &[
+                    "tenant_id",
+                    "all_tenants",
+                    "from",
+                    "to",
+                    "group_by",
+                    "since",
+                    "after",
+                    "limit",
+                ],
+            )?;
+        }
         // An IO node of the claimed tenant; start and kill also need one Cloud launched, which
         // the hive that holds it checks (stamp_relay_facts).
         "get_node_status" | "start_node" | "kill_node" => {
@@ -6202,19 +6282,11 @@ fn enforce_cloud_relay_content(
     Ok(())
 }
 
-/// The tenant a Cloud action claims: canonical `tnt:<uuid>` (hyphenated and lowercase, the one
-/// spelling the stores compare), and never the root tenant, which holds the system and its nodes.
+/// The tenant a Cloud action claims: canonical, and never the root tenant, which holds the system
+/// and its nodes.
 fn cloud_claimed_tenant(value: Option<&serde_json::Value>, action: &str) -> Result<(), String> {
     let tenant_id = value.and_then(|v| v.as_str()).unwrap_or("");
-    let canonical = tenant_id
-        .strip_prefix("tnt:")
-        .and_then(|raw| {
-            uuid::Uuid::parse_str(raw)
-                .ok()
-                .filter(|uuid| uuid.to_string() == raw)
-        })
-        .is_some();
-    if !canonical {
+    if !is_canonical_tenant_id(tenant_id) {
         return Err(format!(
             "IO.cloud {action} must be scoped to the claimed tenant (tenant_id tnt:<uuid>)"
         ));
@@ -6223,6 +6295,18 @@ fn cloud_claimed_tenant(value: Option<&serde_json::Value>, action: &str) -> Resu
         return Err(format!("IO.cloud {action} may not act on the root tenant"));
     }
     Ok(())
+}
+
+/// `tnt:<uuid>` with the UUID hyphenated and lowercase: the one spelling the stores compare.
+fn is_canonical_tenant_id(tenant_id: &str) -> bool {
+    tenant_id
+        .strip_prefix("tnt:")
+        .and_then(|raw| {
+            uuid::Uuid::parse_str(raw)
+                .ok()
+                .filter(|uuid| uuid.to_string() == raw)
+        })
+        .is_some()
 }
 
 #[derive(Clone, Copy)]
@@ -6432,6 +6516,231 @@ async fn handle_storage_metrics_http(ctx: &AdminContext) -> (u16, String) {
                 .unwrap_or_else(|| "SY.storage did not return its metrics".to_string()),
         ),
     }
+}
+
+/// `get_llm_usage` (A-70 stage 3, docs/router-stream-v1.md §7.6): the LLM usage records, one per
+/// model call, asked from SY.storage on the motherbee, where they live. A period comes back grouped
+/// (`groups`) or record by record (`records`), a `since` question record by record; `next` is the
+/// cursor for the next page (`after`) or the next sync (`since`).
+async fn handle_llm_usage(
+    client: &RouterDispatcher,
+    hive_id: &str,
+    query: UsageQuery,
+) -> Result<(u16, String), AdminError> {
+    let action = "get_llm_usage";
+    if let Err(detail) = check_llm_usage_query(hive_id, &query) {
+        return Ok(llm_usage_error(400, "INVALID_REQUEST", &detail));
+    }
+    let reply = match send_system_request(
+        client,
+        &format!("SY.storage@{PRIMARY_HIVE_ID}"),
+        MSG_USAGE_QUERY,
+        MSG_USAGE_QUERY_RESPONSE,
+        serde_json::to_value(&query)?,
+        admin_action_timeout(action),
+    )
+    .await
+    {
+        Ok(reply) => reply,
+        Err(err) => return Ok(llm_usage_error(503, "USAGE_UNAVAILABLE", &err.to_string())),
+    };
+    let response: UsageQueryResponse = match serde_json::from_value(reply) {
+        Ok(response) => response,
+        Err(err) => return Ok(llm_usage_error(502, "TRANSPORT_ERROR", &err.to_string())),
+    };
+    if !response.ok {
+        // A question SY.storage refused (a cursor, a period) is the caller's; anything else is
+        // SY.storage's.
+        let code = response
+            .error_code
+            .as_deref()
+            .unwrap_or("USAGE_UNAVAILABLE");
+        let status = if code == "INVALID_REQUEST" { 400 } else { 503 };
+        return Ok(llm_usage_error(
+            status,
+            code,
+            response
+                .error
+                .as_deref()
+                .unwrap_or("SY.storage did not answer the usage query"),
+        ));
+    }
+    let mut payload = serde_json::json!({ "status": "ok", "next": response.next });
+    if query.group_by.is_some() {
+        payload["groups"] = serde_json::to_value(response.groups)?;
+    } else {
+        payload["records"] = serde_json::Value::Array(response.records);
+    }
+    Ok((
+        200,
+        serde_json::json!({
+            "status": "ok",
+            "action": action,
+            "payload": payload,
+            "error_code": serde_json::Value::Null,
+            "error_detail": serde_json::Value::Null,
+        })
+        .to_string(),
+    ))
+}
+
+fn llm_usage_error(status: u16, error_code: &str, detail: &str) -> (u16, String) {
+    (
+        status,
+        serde_json::json!({
+            "status": "error",
+            "action": "get_llm_usage",
+            "payload": serde_json::Value::Null,
+            "error_code": error_code,
+            "error_detail": detail,
+        })
+        .to_string(),
+    )
+}
+
+/// What the admin checks before it asks (§7.5): the motherbee, where the records live; one tenant,
+/// canonical, or every tenant; a page of 1 to `USAGE_QUERY_MAX_LIMIT` rows; and either a period
+/// (`from` and `to`, RFC 3339, at most `USAGE_QUERY_MAX_DAYS` days), grouped or not, or a `since`
+/// cursor, which lists the records stored after it. SY.storage checks what the cursors say.
+fn check_llm_usage_query(hive_id: &str, query: &UsageQuery) -> Result<(), String> {
+    if hive_id != PRIMARY_HIVE_ID {
+        return Err(format!(
+            "the usage records live on {PRIMARY_HIVE_ID}: ask /hives/{PRIMARY_HIVE_ID}/usage"
+        ));
+    }
+    match (query.tenant_id.as_deref(), query.all_tenants) {
+        (Some(_), true) => {
+            return Err("name a tenant_id or ask for all_tenants, not both".to_string())
+        }
+        (None, false) => {
+            return Err("name a tenant_id (tnt:<uuid>) or ask for all_tenants".to_string())
+        }
+        (Some(tenant_id), false) if !is_canonical_tenant_id(tenant_id) => {
+            return Err(
+                "tenant_id must be canonical: tnt:<uuid>, hyphenated and lowercase".to_string(),
+            )
+        }
+        _ => {}
+    }
+    if query
+        .limit
+        .is_some_and(|limit| !(1..=USAGE_QUERY_MAX_LIMIT).contains(&limit))
+    {
+        return Err(format!("limit must be from 1 to {USAGE_QUERY_MAX_LIMIT}"));
+    }
+    if [&query.since, &query.after]
+        .into_iter()
+        .flatten()
+        .any(|cursor| cursor.trim().is_empty())
+    {
+        return Err("since and after take a cursor; they cannot be blank".to_string());
+    }
+    let instant = |field: &str, value: Option<&str>| {
+        value
+            .map(|value| {
+                chrono::DateTime::parse_from_rfc3339(value).map_err(|_| {
+                    format!("{field} must be an RFC 3339 instant, like 2026-10-01T00:00:00Z")
+                })
+            })
+            .transpose()
+    };
+    let from = instant("from", query.from.as_deref())?;
+    let to = instant("to", query.to.as_deref())?;
+    if query.since.is_some() {
+        if from.is_some() || to.is_some() || query.group_by.is_some() {
+            return Err(
+                "since lists the records stored after a cursor: it takes no from, to or group_by"
+                    .to_string(),
+            );
+        }
+        return Ok(());
+    }
+    let (Some(from), Some(to)) = (from, to) else {
+        return Err(
+            "ask for a period (from and to) or for the records stored after a cursor (since)"
+                .to_string(),
+        );
+    };
+    if to <= from {
+        return Err("to must come after from".to_string());
+    }
+    if to - from > chrono::TimeDelta::days(USAGE_QUERY_MAX_DAYS) {
+        return Err(format!(
+            "a period covers at most {USAGE_QUERY_MAX_DAYS} days"
+        ));
+    }
+    Ok(())
+}
+
+/// `GET /hives/{hive}/usage?tenant_id=&from=&to=&group_by=&since=&after=&limit=`: the operator's
+/// question. Without a tenant_id it is about every tenant.
+fn llm_usage_query_from_http(query: &HashMap<String, String>) -> Result<UsageQuery, String> {
+    let text = |key: &str| {
+        query
+            .get(key)
+            .map(|value| value.trim())
+            .filter(|value| !value.is_empty())
+            .map(str::to_string)
+    };
+    let group_by = match text("group_by") {
+        Some(group_by) => Some(
+            UsageGroupBy::parse(&group_by).ok_or("group_by must be day, model, node or tenant")?,
+        ),
+        None => None,
+    };
+    let limit =
+        match text("limit") {
+            Some(limit) => Some(limit.parse::<u32>().map_err(|_| {
+                format!("limit must be a number from 1 to {USAGE_QUERY_MAX_LIMIT}")
+            })?),
+            None => None,
+        };
+    let tenant_id = text("tenant_id");
+    Ok(UsageQuery {
+        all_tenants: tenant_id.is_none(),
+        tenant_id,
+        from: text("from"),
+        to: text("to"),
+        group_by,
+        since: text("since"),
+        after: text("after"),
+        limit,
+    })
+}
+
+/// The question an ADMIN_COMMAND asks, from its params. A null field is an absent one: the
+/// executor sends null for what a plan leaves out.
+fn llm_usage_query_from_params(params: serde_json::Value) -> Result<UsageQuery, String> {
+    let mut fields = match params {
+        serde_json::Value::Object(fields) => fields,
+        serde_json::Value::Null => serde_json::Map::new(),
+        _ => return Err("get_llm_usage params must be a JSON object".to_string()),
+    };
+    fields.retain(|_, value| !value.is_null());
+    serde_json::from_value(serde_json::Value::Object(fields))
+        .map_err(|err| format!("invalid get_llm_usage params: {err}"))
+}
+
+/// Every tenant's usage at once is the operator's (the HTTP route and the executor, no caller) and
+/// Archi's, who works for the operator. Any other mesh caller names one tenant; IO.cloud, the one
+/// it claims (enforce_cloud_relay_content). The router-stamped caller, never the params.
+fn authorize_llm_usage_scope(
+    caller_l2_name: Option<&str>,
+    admin_hive: &str,
+    query: &UsageQuery,
+) -> Result<(), String> {
+    let Some(caller) = caller_l2_name else {
+        return Ok(());
+    };
+    if caller == format!("SY.architect@{admin_hive}") {
+        return Ok(());
+    }
+    if query.all_tenants || query.tenant_id.is_none() {
+        return Err(format!(
+            "{caller} may read the usage of one tenant (tenant_id): every tenant at once is the operator's and Archi's"
+        ));
+    }
+    Ok(())
 }
 
 async fn run_http_server(
@@ -7598,6 +7907,13 @@ async fn handle_hive_paths(
         }
         ("GET", ["streams"]) => {
             let (status, resp) = handle_list_streams(ctx, client, hive).await?;
+            Ok(Some((status, resp)))
+        }
+        ("GET", ["usage"]) => {
+            let (status, resp) = match llm_usage_query_from_http(query) {
+                Ok(usage_query) => handle_llm_usage(client, &hive, usage_query).await?,
+                Err(detail) => llm_usage_error(400, "INVALID_REQUEST", &detail),
+            };
             Ok(Some((status, resp)))
         }
         ("GET", ["runtimes"]) => {
@@ -9421,6 +9737,7 @@ fn build_admin_action_doc(spec: &InternalActionSpec) -> serde_json::Value {
         InternalActionRoute::WfRulesQuery(canonical) => ("wf_rules_query", Some(canonical)),
         InternalActionRoute::TimerRpc(canonical) => ("timer_rpc", Some(canonical)),
         InternalActionRoute::StreamStatus => ("stream_status", None),
+        InternalActionRoute::LlmUsage => ("llm_usage", None),
     };
     serde_json::json!({
         "name": spec.action,
@@ -9628,6 +9945,9 @@ fn admin_action_summary(action: &str) -> &'static str {
         }
         "list_streams" => {
             "Read the status of every router stream of one hive: backlog, deliveries and drops."
+        }
+        "get_llm_usage" => {
+            "Read the LLM usage records, one per model call, of one tenant or of every tenant: a period grouped by day, model, node or tenant or record by record, or the records stored since a cursor."
         }
         "list_tenant_nodes" => {
             "List the managed nodes charged to one tenant on every hive, with their runtime, state and who launched them."
@@ -9863,6 +10183,7 @@ fn admin_action_path_patterns(action: &str) -> Vec<&'static str> {
         "get_hive" => vec!["GET /hives/{hive}"],
         "list_nodes" => vec!["GET /hives/{hive}/nodes"],
         "list_streams" => vec!["GET /hives/{hive}/streams"],
+        "get_llm_usage" => vec!["GET /hives/{hive}/usage"],
         "list_tenant_nodes" => vec!["GET /hives/{hive}/identity/tenants/{tenant_id}/nodes"],
         "get_node_status" => vec!["GET /hives/{hive}/nodes/{node_name}/status"],
         "get_node_state" => vec!["GET /hives/{hive}/nodes/{node_name}/state"],
@@ -10044,6 +10365,11 @@ fn admin_action_path_params(action: &str) -> Vec<serde_json::Value> {
             "hive",
             "string",
             "Hive id, for example worker-220.",
+        )],
+        "get_llm_usage" => vec![admin_action_path_param(
+            "hive",
+            "string",
+            "The motherbee, where the usage records live.",
         )],
         "list_nodes" | "list_streams" | "list_ilks" | "list_tenants" | "get_versions" | "list_runtimes" | "list_routes"
         | "list_vpns" | "list_taps" | "get_deployments" | "get_drift_alerts" | "opa_get_policy"
@@ -10714,6 +11040,48 @@ fn admin_action_body_optional_fields(action: &str) -> Vec<serde_json::Value> {
             ),
             admin_action_body_field("ttl", "u16", "Optional TTL, default 16."),
         ],
+        "get_llm_usage" => vec![
+            admin_action_body_field(
+                "tenant_id",
+                "string",
+                "The tenant whose records to read, canonical tnt:<uuid>. Over HTTP, leaving it out reads every tenant.",
+            ),
+            admin_action_body_field(
+                "all_tenants",
+                "bool",
+                "Every tenant's records at once, instead of a tenant_id. The operator and Archi only.",
+            ),
+            admin_action_body_field(
+                "from",
+                "string",
+                &format!("Start of the period, by the time of the call (ts), RFC 3339. With to; at most {USAGE_QUERY_MAX_DAYS} days."),
+            ),
+            admin_action_body_field(
+                "to",
+                "string",
+                "End of the period, RFC 3339, after from.",
+            ),
+            admin_action_body_field(
+                "group_by",
+                "enum(day|model|node|tenant)",
+                "Group the period's records: calls and the five token sums per group. Without it, the records themselves.",
+            ),
+            admin_action_body_field(
+                "since",
+                "string",
+                "Instead of a period: the records stored after a cursor, an RFC 3339 instant to start and then the next of each answer. Records only.",
+            ),
+            admin_action_body_field(
+                "after",
+                "string",
+                "The next page of the same question: the next of the previous answer.",
+            ),
+            admin_action_body_field(
+                "limit",
+                "u32",
+                &format!("Rows per page, 1 to {USAGE_QUERY_MAX_LIMIT}; a page also stays under 64 KB."),
+            ),
+        ],
         "list_recent_commands" => vec![
             admin_action_body_field("limit", "u32", "Max entries returned (default 50, max 500)."),
             admin_action_body_field("action", "string", "Filter: exact admin action name."),
@@ -11011,6 +11379,12 @@ fn admin_action_example_payload(action: &str) -> serde_json::Value {
             "limit": 20,
             "status": "error"
         }),
+        "get_llm_usage" => serde_json::json!({
+            "tenant_id": "tnt:43d576a3-d712-4d91-9245-5d5463dd693e",
+            "from": "2026-10-01T00:00:00Z",
+            "to": "2026-11-01T00:00:00Z",
+            "group_by": "day"
+        }),
         "send_node_message" => serde_json::json!({
             "msg_type": "PING",
             "payload": {
@@ -11209,6 +11583,9 @@ fn admin_action_example_scmd(action: &str) -> Option<String> {
         "remove_hive" => "curl -X DELETE /hives/worker-220",
         "list_nodes" => "curl -X GET /hives/motherbee/nodes",
         "list_streams" => "curl -X GET /hives/worker-220/streams",
+        "get_llm_usage" => {
+            "curl -X GET '/hives/motherbee/usage?tenant_id=tnt:43d576a3-d712-4d91-9245-5d5463dd693e&from=2026-10-01T00:00:00Z&to=2026-11-01T00:00:00Z&group_by=day'"
+        }
         "list_tenant_nodes" => "curl -X GET /hives/motherbee/identity/tenants/tnt:.../nodes",
         "get_node_status" => "curl -X GET /hives/motherbee/nodes/SY.admin@motherbee/status",
         "get_node_state" => "curl -X GET /hives/motherbee/nodes/SY.admin@motherbee/state",
@@ -11429,6 +11806,12 @@ fn admin_action_request_notes(action: &str) -> Vec<&'static str> {
         "add_hive" | "remove_hive" => vec![
             "Motherbee-only operation.",
             "For HTTP usage the hive id is in the body for add_hive and in the path for remove_hive.",
+        ],
+        "get_llm_usage" => vec![
+            "One record per model call (docs/router-stream-v1.md §7.4), kept by SY.storage on the motherbee: only /hives/motherbee/usage answers.",
+            "A period (from and to, by the time of the call) comes back grouped (groups: key, calls, uncached_input, cache_read, cache_write, output, reasoning) or record by record (records: the record plus stored_at, verified and claimed_tenant_id). since lists the records stored after a cursor instead, for a reader that syncs as they arrive.",
+            "Records arrive late by design (the streams' window, SY.storage's retries): a period is final only after them. next is the cursor for the next page (after) or for the next sync (since).",
+            "Without tenant_id the HTTP route reads every tenant (all_tenants). Over the mesh only Archi and the operator's executor may set all_tenants; Fluxbee Cloud reads its own tenant (get_usage), never the root tenant's.",
         ],
         "list_tenant_nodes" => vec![
             "Every managed node charged to the tenant, on every connected hive: node_name, hive, runtime, lifecycle_state, health_state, identity (ilk_id, tenant_id), launched_by (cloud, archi, operator, system) and relaunch_on_boot (false once stopped).",
@@ -14870,6 +15253,10 @@ fn admin_action_timeout(action: &str) -> Duration {
         "core_rollback" => Duration::from_secs(
             env_timeout_secs("JSR_ADMIN_CORE_ROLLBACK_TIMEOUT_SECS").unwrap_or(300),
         ),
+        // SY.storage answers one usage query at a time, each under a 15 s statement timeout.
+        "get_llm_usage" => {
+            Duration::from_secs(env_timeout_secs("JSR_ADMIN_USAGE_TIMEOUT_SECS").unwrap_or(20))
+        }
         "list_admin_actions"
         | "get_admin_action_help"
         | "hive_status"
@@ -16521,6 +16908,331 @@ mod tests {
         }
     }
 
+    /// A-70 stage 3 (docs/router-stream-v1.md §7.6): Cloud reads the usage of the tenant it
+    /// claims, never the root tenant's nor every tenant's, and nothing outside the question.
+    #[test]
+    fn cloud_relay_reads_only_its_claimed_tenants_llm_usage() {
+        let io = Some("IO.cloud@motherbee");
+        let t = "tnt:11111111-1111-4111-8111-111111111111";
+        let check = |params: serde_json::Value| {
+            enforce_cloud_relay_content(io, "get_llm_usage", "motherbee", &params)
+        };
+        assert!(check(serde_json::json!({
+            "tenant_id": t, "from": "2026-10-01T00:00:00Z", "to": "2026-11-01T00:00:00Z",
+            "group_by": "day", "limit": 50
+        }))
+        .is_ok());
+        assert!(check(
+            serde_json::json!({"tenant_id": t, "since": "c", "after": "c", "all_tenants": false})
+        )
+        .is_ok());
+        for bad in [
+            serde_json::json!({"since": "c"}),
+            serde_json::json!({"tenant_id": fluxbee_sdk::DEFAULT_ROOT_TENANT_ID, "since": "c"}),
+            serde_json::json!({"tenant_id": "tnt:11111111-1111-4111-8111-11111111111A", "since": "c"}),
+            serde_json::json!({"tenant_id": t, "all_tenants": true}),
+            serde_json::json!({"all_tenants": true}),
+            serde_json::json!({"tenant_id": t, "all_tenants": "true"}),
+            serde_json::json!({"tenant_id": t, "tenants": ["tnt:22222222-2222-4222-8222-222222222222"]}),
+            serde_json::json!({"tenant_id": t, "node_name": "AI.sales@motherbee"}),
+        ] {
+            assert!(check(bad.clone()).is_err(), "{bad}");
+        }
+        // The operator and Archi are not held to it.
+        let every = serde_json::json!({"all_tenants": true});
+        assert!(enforce_cloud_relay_content(None, "get_llm_usage", "motherbee", &every).is_ok());
+        assert!(enforce_cloud_relay_content(
+            Some("SY.architect@motherbee"),
+            "get_llm_usage",
+            "motherbee",
+            &every
+        )
+        .is_ok());
+        // A Cloud-only action: over the mesh, IO.cloud and Archi, nobody else.
+        assert!(!CLOUD_SHARED_ACTIONS.contains(&"get_llm_usage"));
+        assert!(authorize_cloud_relay(io, "get_llm_usage", "motherbee").is_ok());
+        assert!(authorize_cloud_relay(
+            Some("SY.architect@motherbee"),
+            "get_llm_usage",
+            "motherbee"
+        )
+        .is_ok());
+        assert!(
+            authorize_cloud_relay(Some("AI.sales@motherbee"), "get_llm_usage", "motherbee")
+                .is_err()
+        );
+    }
+
+    /// Every tenant's usage at once is the operator's and Archi's; any other mesh caller names one
+    /// tenant. The router-stamped caller decides, never the params.
+    #[test]
+    fn every_tenants_llm_usage_is_the_operators_and_archis() {
+        let one = UsageQuery {
+            tenant_id: Some("tnt:11111111-1111-4111-8111-111111111111".to_string()),
+            ..UsageQuery::default()
+        };
+        let all = UsageQuery {
+            all_tenants: true,
+            ..UsageQuery::default()
+        };
+        let neither = UsageQuery::default();
+        for caller in [None, Some("SY.architect@motherbee")] {
+            assert!(
+                authorize_llm_usage_scope(caller, "motherbee", &all).is_ok(),
+                "{caller:?}"
+            );
+            assert!(
+                authorize_llm_usage_scope(caller, "motherbee", &one).is_ok(),
+                "{caller:?}"
+            );
+        }
+        for caller in [
+            "SY.architect@worker1",
+            "IO.cloud@motherbee",
+            "AI.sales@motherbee",
+            "WF.admin.internal.diag@motherbee",
+        ] {
+            assert!(
+                authorize_llm_usage_scope(Some(caller), "motherbee", &all).is_err(),
+                "{caller}"
+            );
+            assert!(
+                authorize_llm_usage_scope(Some(caller), "motherbee", &neither).is_err(),
+                "{caller}"
+            );
+            assert!(
+                authorize_llm_usage_scope(Some(caller), "motherbee", &one).is_ok(),
+                "{caller}"
+            );
+        }
+    }
+
+    /// `GET /hives/motherbee/usage`: the operator's question; without a tenant_id, every tenant.
+    #[test]
+    fn the_usage_route_reads_its_query_string() {
+        let t = "tnt:11111111-1111-4111-8111-111111111111";
+        let query = parse_query(&format!(
+            "tenant_id={t}&from=2026-10-01T00%3A00%3A00Z&to=2026-10-08T00:00:00+02:00&group_by=model&limit=50&after=c1"
+        ));
+        assert_eq!(
+            llm_usage_query_from_http(&query).unwrap(),
+            UsageQuery {
+                tenant_id: Some(t.to_string()),
+                all_tenants: false,
+                from: Some("2026-10-01T00:00:00Z".to_string()),
+                to: Some("2026-10-08T00:00:00+02:00".to_string()),
+                group_by: Some(UsageGroupBy::Model),
+                since: None,
+                after: Some("c1".to_string()),
+                limit: Some(50),
+            }
+        );
+        // No tenant: every tenant. A blank value is an absent one.
+        let every =
+            llm_usage_query_from_http(&parse_query("since=2026-10-01T00:00:00Z&tenant_id=&limit="))
+                .unwrap();
+        assert!(every.all_tenants && every.tenant_id.is_none() && every.limit.is_none());
+        assert_eq!(every.since.as_deref(), Some("2026-10-01T00:00:00Z"));
+        // A grouping outside the closed list, a limit that is not a number.
+        for bad in [
+            "group_by=week",
+            "group_by=model;drop",
+            "limit=ten",
+            "limit=-1",
+        ] {
+            assert!(
+                llm_usage_query_from_http(&parse_query(bad)).is_err(),
+                "{bad}"
+            );
+        }
+    }
+
+    /// Over the mesh the params are the question; the nulls the executor sends are absent fields.
+    #[test]
+    fn usage_params_over_the_mesh_are_the_question() {
+        let t = "tnt:11111111-1111-4111-8111-111111111111";
+        let query = llm_usage_query_from_params(serde_json::json!({
+            "tenant_id": t, "all_tenants": null, "from": "2026-10-01T00:00:00Z",
+            "to": "2026-11-01T00:00:00Z", "group_by": "node", "since": null, "limit": 10
+        }))
+        .unwrap();
+        assert_eq!(query.tenant_id.as_deref(), Some(t));
+        assert!(!query.all_tenants && query.since.is_none());
+        assert_eq!(query.group_by, Some(UsageGroupBy::Node));
+        assert_eq!(query.limit, Some(10));
+        assert_eq!(
+            llm_usage_query_from_params(serde_json::Value::Null).unwrap(),
+            UsageQuery::default()
+        );
+        for bad in [
+            serde_json::json!("x"),
+            serde_json::json!({"group_by": "week"}),
+            serde_json::json!({"limit": -1}),
+            serde_json::json!({"all_tenants": "yes"}),
+        ] {
+            assert!(llm_usage_query_from_params(bad.clone()).is_err(), "{bad}");
+        }
+    }
+
+    /// What the admin refuses before it asks SY.storage (§7.5).
+    #[test]
+    fn a_usage_question_is_checked_before_storage_is_asked() {
+        let period = UsageQuery {
+            tenant_id: Some("tnt:11111111-1111-4111-8111-111111111111".to_string()),
+            from: Some("2026-10-01T00:00:00Z".to_string()),
+            to: Some("2026-11-01T00:00:00Z".to_string()),
+            group_by: Some(UsageGroupBy::Day),
+            limit: Some(USAGE_QUERY_MAX_LIMIT),
+            ..UsageQuery::default()
+        };
+        let sync = UsageQuery {
+            all_tenants: true,
+            since: Some("2026-10-01T00:00:00Z".to_string()),
+            ..UsageQuery::default()
+        };
+        assert_eq!(check_llm_usage_query("motherbee", &period), Ok(()));
+        assert_eq!(check_llm_usage_query("motherbee", &sync), Ok(()));
+        // 92 days is a period.
+        let longest = UsageQuery {
+            to: Some("2027-01-01T00:00:00Z".to_string()),
+            ..period.clone()
+        };
+        assert_eq!(check_llm_usage_query("motherbee", &longest), Ok(()));
+        // The records live on the motherbee only.
+        assert!(check_llm_usage_query("worker1", &period).is_err());
+        for (case, query) in [
+            (
+                "a tenant and every tenant",
+                UsageQuery {
+                    all_tenants: true,
+                    ..period.clone()
+                },
+            ),
+            (
+                "no tenant",
+                UsageQuery {
+                    tenant_id: None,
+                    ..period.clone()
+                },
+            ),
+            (
+                "a tenant that is not canonical",
+                UsageQuery {
+                    tenant_id: Some("tnt:11111111-1111-4111-8111-11111111111A".to_string()),
+                    ..period.clone()
+                },
+            ),
+            (
+                "an empty page",
+                UsageQuery {
+                    limit: Some(0),
+                    ..period.clone()
+                },
+            ),
+            (
+                "a page too long",
+                UsageQuery {
+                    limit: Some(USAGE_QUERY_MAX_LIMIT + 1),
+                    ..period.clone()
+                },
+            ),
+            (
+                "a date without a time",
+                UsageQuery {
+                    from: Some("2026-10-01".to_string()),
+                    ..period.clone()
+                },
+            ),
+            (
+                "half a period",
+                UsageQuery {
+                    to: None,
+                    ..period.clone()
+                },
+            ),
+            (
+                "an empty period",
+                UsageQuery {
+                    to: period.from.clone(),
+                    ..period.clone()
+                },
+            ),
+            (
+                "a second over 92 days",
+                UsageQuery {
+                    to: Some("2027-01-01T00:00:01Z".to_string()),
+                    ..period.clone()
+                },
+            ),
+            (
+                "since with a period",
+                UsageQuery {
+                    since: Some("2026-10-01T00:00:00Z".to_string()),
+                    ..period.clone()
+                },
+            ),
+            (
+                "a blank cursor",
+                UsageQuery {
+                    after: Some(" ".to_string()),
+                    ..period.clone()
+                },
+            ),
+            (
+                "since with a grouping",
+                UsageQuery {
+                    group_by: Some(UsageGroupBy::Model),
+                    ..sync.clone()
+                },
+            ),
+            (
+                "neither a period nor a cursor",
+                UsageQuery {
+                    all_tenants: true,
+                    ..UsageQuery::default()
+                },
+            ),
+        ] {
+            assert!(
+                check_llm_usage_query("motherbee", &query).is_err(),
+                "{case}"
+            );
+        }
+    }
+
+    /// The catalog Archi and the executor read: a read on the motherbee's usage route, the question
+    /// as optional fields.
+    #[test]
+    fn get_llm_usage_is_a_read_on_the_usage_route() {
+        let spec = resolve_internal_action_spec("get_llm_usage").unwrap();
+        let doc = build_admin_action_doc(spec);
+        assert_eq!(doc["handler"], "llm_usage");
+        assert_eq!(doc["read_only"], true);
+        assert_eq!(doc["confirmation_required"], false);
+        assert_eq!(
+            doc["path_patterns"],
+            serde_json::json!(["GET /hives/{hive}/usage"])
+        );
+        let schema = build_admin_executor_function_definition(spec).parameters_json_schema;
+        assert_eq!(schema["required"], serde_json::json!(["hive"]));
+        for field in [
+            "tenant_id",
+            "all_tenants",
+            "from",
+            "to",
+            "group_by",
+            "since",
+            "after",
+            "limit",
+        ] {
+            assert!(schema["properties"].get(field).is_some(), "{field}");
+        }
+        assert_eq!(
+            admin_methods_allowed_for_path("/hives/motherbee/usage"),
+            vec!["GET"]
+        );
+    }
+
     #[test]
     fn names_held_by_another_tenant_are_conflicts_and_the_root_is_protected() {
         for code in ["KEY_TAKEN", "TENANT_NAME_TAKEN", "TENANT_DOMAIN_TAKEN"] {
@@ -16579,6 +17291,7 @@ mod tests {
             "get_node_status",
             "start_node",
             "kill_node",
+            "get_llm_usage",
         ]
         .into_iter()
         .collect();
@@ -16902,6 +17615,7 @@ mod tests {
             executor_runtime: Arc::new(Mutex::new(None)),
             executor_configured: Arc::new(AtomicBool::new(false)),
             rpc: client,
+            usage: UsageRecorder::disabled(),
             public_edge_node: None,
             public_base_url: None,
             publication_ledger_path: state_dir.join("sy-admin/publications.json"),

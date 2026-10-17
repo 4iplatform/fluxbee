@@ -13,7 +13,7 @@ use tokio::time;
 use tracing_subscriber::EnvFilter;
 use uuid::Uuid;
 
-use fluxbee_ai_sdk::{AiProvider, HiveAiConfig};
+use fluxbee_ai_sdk::{AiAccount, AiProvider, HiveAiConfig, TenantSource, UsageRecorder};
 use fluxbee_sdk::payload::TextV1Payload;
 use fluxbee_sdk::protocol::{
     is_system_kind, Destination, EpisodeSummary, MemoryContextSummary, MemoryPackage,
@@ -69,7 +69,8 @@ const COGNITION_APPEND_MAX_BYTES: usize = 64 * 1024;
 const COGNITION_STATE_PAGE_TIMEOUT: Duration = Duration::from_secs(5);
 /// How many communications the startup reload asks SY.storage for at once.
 const COGNITION_RELOAD_CONCURRENCY: usize = 4;
-/// How long an agent node's ILK is trusted before the identity shared memory is read again.
+/// How long an agent node's ILK and tenant are trusted when the identity shared memory's sequence
+/// cannot be read; while it can, they are trusted until it changes.
 const COGNITION_AGENT_ILK_TTL: Duration = Duration::from_secs(60);
 /// A communication held but idle this long is checked against SY.storage before its next turn:
 /// its agent may have moved to another hive and back meanwhile (§6.2).
@@ -300,8 +301,10 @@ struct CognitionAppState {
     memory_region: Arc<Mutex<Option<MemoryRegionWriter>>>,
     vault: VaultClient,
     dispatcher: Arc<RouterDispatcher>,
-    /// Agent node → its ILK, read from the identity shared memory, with when it was read.
-    agent_ilks: Mutex<HashMap<String, (String, std::time::Instant)>>,
+    /// Agent node → its ILK and tenant, read from the identity shared memory.
+    agent_ilks: Mutex<HashMap<String, AgentIdentity>>,
+    /// Where each model call's usage record goes (docs/router-stream-v1.md §7.2).
+    usage: UsageRecorder,
     /// The last record seq taken from each stream, by stream name and epoch.
     stream_seen: Mutex<HashMap<(String, u64), u64>>,
 }
@@ -589,6 +592,7 @@ async fn main() -> Result<(), CognitionError> {
         vault: vault_client,
         dispatcher: Arc::clone(&dispatcher),
         agent_ilks: Mutex::new(HashMap::new()),
+        usage: UsageRecorder::start(Arc::clone(&dispatcher)),
         stream_seen: Mutex::new(HashMap::new()),
     });
 
@@ -794,7 +798,7 @@ async fn handle_turn(turn: CognitionTurn, app_state: Arc<CognitionAppState>) {
         );
         return;
     };
-    let Some(agent_ilk) = agent_ilk_of(&app_state, &turn.agent_node).await else {
+    let Some(agent) = agent_identity_of(&app_state, &turn.agent_node).await else {
         app_state.runtime_state.lock().await.no_agent_ilk_total += 1;
         tracing::debug!(
             agent_node = %turn.agent_node,
@@ -803,6 +807,7 @@ async fn handle_turn(turn: CognitionTurn, app_state: Arc<CognitionAppState>) {
         );
         return;
     };
+    let agent_ilk = agent.ilk.clone();
     let key = CommunicationKey {
         thread_id: thread_id.clone(),
         agent_ilk: agent_ilk.clone(),
@@ -901,8 +906,20 @@ async fn handle_turn(turn: CognitionTurn, app_state: Arc<CognitionAppState>) {
         control.ai_secret_source = CognitionAiSecretSource::LocalFile;
     }
 
+    // The communication's agent's tenant pays for the turn's calls (§7.3).
+    let account = AiAccount::charge(
+        app_state.usage.clone(),
+        &app_state.node_name,
+        agent.tenant.clone(),
+        TenantSource::Agent,
+    )
+    .with_node_ilk(Some(app_state.self_ilk_id.clone()))
+    .with_counterpart(Some(agent_ilk.clone()))
+    .with_trace(Some(msg.routing.trace_id.clone()))
+    .with_thread(Some(thread_id.clone()));
     let tagger = match run_semantic_tagger_ai(semantic_tagger_ai::SemanticTaggerAiInput {
         api_key: &api_key,
+        account: &account,
         text: &text,
         src_ilk: src_ilk.as_deref(),
         dst_ilk: dst_ilk.as_deref(),
@@ -955,6 +972,7 @@ async fn handle_turn(turn: CognitionTurn, app_state: Arc<CognitionAppState>) {
             &tagger,
             &thresholds,
             &api_key,
+            &account,
             &semantic_tagger_config,
             &ts,
             thread_state,
@@ -1125,27 +1143,55 @@ fn pack_envelopes(envelopes: Vec<Value>, max_bytes: usize) -> Vec<CognitionEnvel
     packs
 }
 
-/// The ILK of the agent a turn's communication belongs to, from the identity shared memory
-/// (`handler_node`), cached for `COGNITION_AGENT_ILK_TTL`: the node is mechanism, the ILK is the
-/// interlocutor (§6.1, D14).
-async fn agent_ilk_of(app_state: &CognitionAppState, agent_node: &str) -> Option<String> {
-    if let Some((ilk, read_at)) = app_state.agent_ilks.lock().await.get(agent_node) {
-        if read_at.elapsed() < COGNITION_AGENT_ILK_TTL {
-            return Some(ilk.clone());
+/// The agent a turn's communication belongs to: its ILK and the tenant that pays for the turn's
+/// calls (§7.3), as the identity shared memory of this hive holds them.
+#[derive(Debug, Clone)]
+struct AgentIdentity {
+    ilk: String,
+    tenant: Option<String>,
+    /// The identity shared memory's sequence when it was read.
+    seq: u64,
+    read_at: std::time::Instant,
+}
+
+/// The agent of a turn's communication, from the identity shared memory (`handler_node`): the node
+/// is mechanism, the ILK is the interlocutor (§6.1, D14). A cached answer holds while the region's
+/// sequence is unchanged, so a node name reused by another agent is never answered from the cache;
+/// when the sequence cannot be read, for `COGNITION_AGENT_ILK_TTL`.
+async fn agent_identity_of(
+    app_state: &CognitionAppState,
+    agent_node: &str,
+) -> Option<AgentIdentity> {
+    let current_seq = fluxbee_sdk::identity::identity_shm_seq_from_hive_id(&app_state.hive_id).ok();
+    if let Some(cached) = app_state.agent_ilks.lock().await.get(agent_node) {
+        let fresh = match current_seq {
+            Some(seq) => seq == cached.seq,
+            None => cached.read_at.elapsed() < COGNITION_AGENT_ILK_TTL,
+        };
+        if fresh {
+            return Some(cached.clone());
         }
     }
-    let found = fluxbee_sdk::identity::find_ilk_by_handler_node_from_hive_id(
+    let (seq, ilk) = fluxbee_sdk::identity::find_ilk_by_handler_node_from_hive_id(
         &app_state.hive_id,
         agent_node,
     )
     .ok()
-    .flatten()
-    .map(|(_, ilk)| ilk.ilk_id)
-    .filter(|ilk| !ilk.trim().is_empty())?;
-    app_state.agent_ilks.lock().await.insert(
-        agent_node.to_string(),
-        (found.clone(), std::time::Instant::now()),
-    );
+    .flatten()?;
+    if ilk.ilk_id.trim().is_empty() {
+        return None;
+    }
+    let found = AgentIdentity {
+        ilk: ilk.ilk_id,
+        tenant: Some(ilk.tenant_id).filter(|tenant| !tenant.trim().is_empty()),
+        seq,
+        read_at: std::time::Instant::now(),
+    };
+    app_state
+        .agent_ilks
+        .lock()
+        .await
+        .insert(agent_node.to_string(), found.clone());
     Some(found)
 }
 
@@ -2844,6 +2890,7 @@ async fn update_thread_state_and_build_envelopes<S: NarrativeSummarizer>(
     tagger: &SemanticTaggerOutput,
     thresholds: &CognitionThresholds,
     api_key: &str,
+    account: &AiAccount,
     semantic_tagger_config: &CognitionSemanticTaggerConfig,
     ts: &str,
     thread_state: &mut ThreadCognitionState,
@@ -2933,6 +2980,7 @@ async fn update_thread_state_and_build_envelopes<S: NarrativeSummarizer>(
         dst_ilk,
         tagger,
         api_key,
+        account,
         semantic_tagger_config,
         &thread_state.contexts,
         &thread_state.reasons,
@@ -3613,6 +3661,7 @@ async fn update_memories_and_episodes_for_thread<S: NarrativeSummarizer>(
     dst_ilk: Option<&str>,
     tagger: &SemanticTaggerOutput,
     api_key: &str,
+    account: &AiAccount,
     semantic_tagger_config: &CognitionSemanticTaggerConfig,
     contexts: &HashMap<String, ContextState>,
     reasons: &HashMap<String, ReasonState>,
@@ -3641,6 +3690,7 @@ async fn update_memories_and_episodes_for_thread<S: NarrativeSummarizer>(
     let narrative_result = match narrative
         .summarize(NarrativeSummarizerAiInput {
             api_key,
+            account,
             config: semantic_tagger_config,
             thread_id: &comm.thread_id,
             context_label: &context.label,
@@ -4405,6 +4455,7 @@ mod tests {
             &tagger,
             thresholds,
             "test-key",
+            &AiAccount::root(UsageRecorder::disabled(), "SY.cognition@motherbee"),
             &CognitionSemanticTaggerConfig::default(),
             &ts,
             thread,

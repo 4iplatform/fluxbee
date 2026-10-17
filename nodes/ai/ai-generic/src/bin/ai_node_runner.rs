@@ -13,12 +13,12 @@ use fluxbee_ai_sdk::{
     build_output_schema_fallback_instruction, build_reply_message_runtime_src,
     create_function_calling_model, create_llm_client, extract_text,
     resolve_model_input_from_payload_with_options, resolve_response_envelope_output_schema,
-    AiBehaviorOutput, AiFinalOutput, AiNode, AiProvider, AiUserArtifact, FunctionCallingConfig,
-    FunctionCallingRunner, FunctionLoopItem, FunctionLoopRunResult, FunctionRunInput, FunctionTool,
-    FunctionToolDefinition, FunctionToolProvider, FunctionToolRegistry, HiveAiConfig,
-    ImmediateConversationMemory, LanceDbThreadStateStore, Message, ModelInputOptions,
-    ModelSettings, NodeRuntime, ResolvedModelInput, RetryPolicy, RuntimeConfig, ThreadStateStore,
-    ThreadStateToolsProvider,
+    AiAccount, AiBehaviorOutput, AiFinalOutput, AiNode, AiProvider, AiUserArtifact,
+    FunctionCallingConfig, FunctionCallingRunner, FunctionLoopItem, FunctionLoopRunResult,
+    FunctionRunInput, FunctionTool, FunctionToolDefinition, FunctionToolProvider,
+    FunctionToolRegistry, HiveAiConfig, ImmediateConversationMemory, LanceDbThreadStateStore,
+    Message, ModelInputOptions, ModelSettings, NodeRuntime, ResolvedModelInput, RetryPolicy,
+    RuntimeConfig, TenantSource, ThreadStateStore, ThreadStateToolsProvider, UsageRecorder,
 };
 use fluxbee_sdk::identity::{find_ilk_by_handler_node_from_hive_config, IdentityIlkOption};
 use fluxbee_sdk::managed_control_plane::{
@@ -412,6 +412,8 @@ struct GenericAiNode {
     /// `self_ilk_id` / hive suffix is missing — the node still boots in a
     /// degraded state.
     vault: Option<VaultClient>,
+    /// Where each model call's usage record goes (docs/router-stream-v1.md §7.2).
+    usage: UsageRecorder,
     control_plane: Arc<RwLock<ControlPlaneState>>,
     cognitive_definition: Arc<RwLock<CognitiveDefinitionRuntimeState>>,
 }
@@ -459,6 +461,7 @@ struct GenerateJpegArtifactTool;
 struct BehaviorContext {
     thread_id: Option<String>,
     src_ilk: Option<String>,
+    trace_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -846,6 +849,7 @@ impl AiNode for GenericAiNode {
         let behavior_ctx = BehaviorContext {
             thread_id: extract_thread_id(&msg),
             src_ilk: extract_src_ilk(&msg),
+            trace_id: Some(msg.routing.trace_id.clone()),
         };
         if msg.meta.msg_type.eq_ignore_ascii_case("user") {
             let src_ilk_source = src_ilk_source(&msg);
@@ -1027,10 +1031,12 @@ impl GenericAiNode {
             .resolve_ai_credential()
             .await
             .map_err(fluxbee_ai_sdk::errors::AiSdkError::Protocol)?;
+        let account = self.usage_account(ctx);
         let client = create_llm_client(
             credential.provider,
             credential.api_key.clone(),
             ai.base_url.clone(),
+            account.clone(),
         );
         let output_schema = resolve_response_envelope_output_schema(meta)?;
         let tool_registry = self.build_tool_registry(ctx)?;
@@ -1067,6 +1073,7 @@ impl GenericAiNode {
                 ai.model.clone(),
                 system,
                 ai.model_settings.clone(),
+                account,
             );
             let runner = FunctionCallingRunner::new(FunctionCallingConfig::default());
             let immediate_memory = self.load_immediate_memory_for_input(ai, ctx).await;
@@ -1114,6 +1121,21 @@ impl GenericAiNode {
         self.persist_immediate_turn(ai, ctx, &current_user_input, &response.content)
             .await;
         Ok(AiBehaviorOutput::text(response.content))
+    }
+
+    /// Its own tenant pays for its calls (docs/router-stream-v1.md §7.3); the root tenant, as
+    /// `fallback_root`, only for a node started without `FLUXBEE_NODE_TENANT_ID`.
+    fn usage_account(&self, ctx: &BehaviorContext) -> AiAccount {
+        AiAccount::charge(
+            self.usage.clone(),
+            &self.node_name,
+            self.self_tenant_id.clone(),
+            TenantSource::Node,
+        )
+        .with_node_ilk(self.self_ilk_id.clone())
+        .with_counterpart(ctx.src_ilk.clone())
+        .with_trace(ctx.trace_id.clone())
+        .with_thread(ctx.thread_id.clone())
     }
 
     async fn effective_ai_instructions(&self, ai: &AiChatRuntime) -> Option<String> {
@@ -4095,6 +4117,7 @@ async fn run_one_config(
         RouterDispatcher::connect_with_retry(runner_node_config, Duration::from_secs(1), profile)
             .await?;
     let vault = vault_client_for(dispatcher.clone(), &node_name, self_ilk_id.as_deref());
+    let usage = UsageRecorder::start(dispatcher.clone());
     let node = GenericAiNode {
         node_name,
         self_ilk_id,
@@ -4104,6 +4127,7 @@ async fn run_one_config(
         thread_state_store,
         immediate_memory_store,
         vault,
+        usage,
         control_plane: Arc::new(RwLock::new(ControlPlaneState {
             current_state: NodeLifecycleState::Configured,
             config_source: "yaml",
@@ -4307,6 +4331,7 @@ async fn run_unconfigured_bootstrap(
         RouterDispatcher::connect_with_retry(runner_node_config, Duration::from_secs(1), profile)
             .await?;
     let vault = vault_client_for(dispatcher.clone(), &node_name, self_ilk_id.as_deref());
+    let usage = UsageRecorder::start(dispatcher.clone());
     let ai_node = GenericAiNode {
         node_name,
         self_ilk_id,
@@ -4316,6 +4341,7 @@ async fn run_unconfigured_bootstrap(
         thread_state_store,
         immediate_memory_store,
         vault,
+        usage,
         control_plane: Arc::new(RwLock::new(state)),
         cognitive_definition: cognitive_definition.clone(),
     };
@@ -5612,6 +5638,7 @@ mod tests {
             thread_state_store: None,
             immediate_memory_store: None,
             vault: None,
+            usage: UsageRecorder::disabled(),
             control_plane: Arc::new(RwLock::new(ControlPlaneState {
                 current_state: NodeLifecycleState::Unconfigured,
                 config_source: "none",
@@ -6292,6 +6319,7 @@ mod tests {
             .build_tool_registry(&BehaviorContext {
                 thread_id: None,
                 src_ilk: None,
+                trace_id: None,
             })
             .expect("registry");
         let names = registry
@@ -6321,6 +6349,7 @@ mod tests {
             .build_tool_registry(&BehaviorContext {
                 thread_id: Some("legacy-thread-1".to_string()),
                 src_ilk: Some("ilk:11111111-1111-4111-8111-111111111111".to_string()),
+                trace_id: None,
             })
             .expect("registry");
 
@@ -6400,6 +6429,7 @@ mod tests {
         let ctx = BehaviorContext {
             thread_id: None,
             src_ilk: None,
+            trace_id: None,
         };
         let err = require_src_ilk(&ctx).expect_err("missing src_ilk should fail");
         assert!(err.to_string().contains("missing_src_ilk"));

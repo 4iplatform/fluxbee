@@ -22,6 +22,7 @@ pub mod storage;
 pub mod stream;
 pub mod thread;
 pub mod timer;
+pub mod usage;
 pub mod vault;
 
 pub use cognition::{
@@ -112,6 +113,12 @@ pub use timer::{
     MSG_TIMER_RESPONSE, MSG_TIMER_SCHEDULE, MSG_TIMER_SCHEDULE_RECURRING,
     TIMER_DEFAULT_RPC_TIMEOUT_MS, TIMER_DEFAULT_TIME_RETRY_SCHEDULE_MS, TIMER_LIST_DEFAULT_LIMIT,
     TIMER_LIST_MAX_LIMIT, TIMER_MIN_DURATION_MS, TIMER_NODE_FAMILY, TIMER_NODE_KIND,
+};
+pub use usage::{
+    TenantSource, UsageGroup, UsageGroupBy, UsageKind, UsageOutcome, UsageQuery,
+    UsageQueryResponse, UsageRecord, UsageWork, MSG_USAGE_QUERY, MSG_USAGE_QUERY_RESPONSE,
+    USAGE_FIELD_MAX_CHARS, USAGE_QUERY_DEFAULT_LIMIT, USAGE_QUERY_MAX_DAYS, USAGE_QUERY_MAX_LIMIT,
+    USAGE_RAW_MAX_BYTES,
 };
 pub use vault::{
     normalize_resource_type, vault_failure_is_transport, vault_key_is_valid, ResourceType, VaultCaller, VaultCallerOwned, VaultClient,

@@ -42,11 +42,11 @@ use axum::routing::any;
 use axum::{Json, Router};
 use fluxbee_ai_sdk::{
     build_model_user_content_parts, create_function_calling_model, extract_text,
-    resolve_model_input_from_payload_with_options, AiProvider, ConversationSummary,
+    resolve_model_input_from_payload_with_options, AiAccount, AiProvider, ConversationSummary,
     FunctionCallingConfig, FunctionCallingRunner, FunctionLoopItem, FunctionRunInput, FunctionTool,
     FunctionToolDefinition, FunctionToolProvider, FunctionToolRegistry, HiveAiConfig,
     ImmediateConversationMemory, ImmediateInteraction, ImmediateInteractionKind,
-    ImmediateOperation, ImmediateRole, ModelInputOptions, ModelSettings,
+    ImmediateOperation, ImmediateRole, ModelInputOptions, ModelSettings, UsageRecorder, UsageWork,
 };
 use fluxbee_sdk::blob::{BlobConfig, BlobRef, BlobToolkit};
 use fluxbee_sdk::payload::TextV1Payload;
@@ -119,6 +119,7 @@ You are a coordinator, not an executor. You read system state and route all muta
 
 - For all nodes across the system: use `/inventory` or `/inventory/summary`. Use `/hives/{hive}/nodes` only for a single explicit hive.
 - For software versions: use `/versions` or `/hives/{hive}/versions`. Do not infer versions from `/hives/{hive}/nodes`.
+- For LLM token usage: `/hives/motherbee/usage?from=<RFC 3339>&to=<RFC 3339>&group_by=day|model|node|tenant` (a period of at most 92 days; add `tenant_id=tnt:<uuid>` for one tenant).
 - For runtime/package info: use `/hives/{hive}/runtimes` or `/hives/{hive}/runtimes/{runtime}`, not `/hives/{hive}/nodes`.
 - For deployments and drift: use `/hives/{hive}/deployments` or `/hives/{hive}/drift-alerts`. If these return `entries: []`, report zero entries — do not infer data from broader endpoints.
 - Stored node config: `GET /hives/{hive}/nodes/{node_name}/config` (persisted snapshot). Live node contract: `POST /hives/{hive}/nodes/{node_name}/control/config-get`. Prefer GET first; use control/config-get only when the live contract is needed.
@@ -236,6 +237,10 @@ struct ArchitectAdminToolContext {
     /// for every outbound admin RPC. No per-call ephemeral `NodeConfig`.
     rpc: Arc<RouterDispatcher>,
     ai_runtime: Arc<Mutex<Option<ArchitectAiRuntime>>>,
+    /// Who spends, for the usage records (docs/router-stream-v1.md §7.3).
+    node_name: String,
+    self_ilk_id: String,
+    usage: UsageRecorder,
     session_id: Option<String>,
     admin_actions_cache: Arc<Mutex<Option<AdminActionsCache>>>,
     plan_compile_pending: Arc<Mutex<HashMap<String, PlanCompilePending>>>,
@@ -325,6 +330,8 @@ struct ArchitectState {
     /// Replaces the bespoke `router_connect_loop` + `router_recv_loop` +
     /// `router_sender` + `router_connected` quartet.
     rpc: Arc<RouterDispatcher>,
+    /// Where each model call's usage record goes (docs/router-stream-v1.md §7.2).
+    usage: UsageRecorder,
     ai_configured: AtomicBool,
     ai_runtime: Arc<Mutex<Option<ArchitectAiRuntime>>>,
     messages_db_configured: AtomicBool,
@@ -960,6 +967,7 @@ impl FunctionTool for ArchitectSystemGetTool {
                 /hives/{{hive}}/nodes/{{name}}/control/config-get (live contract), \
                 /hives/{{hive}}/wf-rules, /hives/{{hive}}/drift-alerts, \
                 /hives/{{hive}}/routes, /hives/{{hive}}/vpns, /hives/{{hive}}/taps, \
+                /hives/motherbee/usage?from=&to=&group_by= (LLM token usage), \
                 /admin/actions/{{action}} (schema + example_scmd). \
                 Never execute paths with literal {{placeholders}}. \
                 For admin action schemas, prefer example_scmd over guessing. \
@@ -2001,6 +2009,7 @@ fn seed_cookbooks_from_defaults(state_dir: &Path) {
 // Always returns a FailureClass — falls back to UnknownResidual if AI is unavailable.
 async fn classify_failure_with_ai(
     state: &ArchitectState,
+    tool_ctx: &ArchitectAdminToolContext,
     error_text: &str,
     ctx: &failure_classifier::FailureContext,
 ) -> FailureClass {
@@ -2031,6 +2040,7 @@ async fn classify_failure_with_ai(
         runtime.model.clone(),
         None,
         runtime.model_settings.clone(),
+        tool_ctx.usage_account("failure_classifier", None).await,
     );
     let tools = FunctionToolRegistry::new();
     let runner = FunctionCallingRunner::new(FunctionCallingConfig::default());
@@ -3576,6 +3586,7 @@ async fn run_designer_with_context(
         runtime.model.clone(),
         Some(system_prompt),
         runtime.model_settings.clone(),
+        context.usage_account("designer", solution_id).await,
     );
 
     let layer_store = Arc::new(LayerAssessmentStore::new());
@@ -3801,6 +3812,7 @@ async fn run_design_auditor_with_context(
         runtime.model.clone(),
         Some(system_prompt),
         runtime.model_settings.clone(),
+        context.usage_account("design_auditor", None).await,
     );
 
     let mut tools = FunctionToolRegistry::new();
@@ -3939,6 +3951,7 @@ async fn run_real_programmer_with_context(
         runtime.model.clone(),
         Some(system_prompt),
         runtime.model_settings.clone(),
+        context.usage_account("programmer", None).await,
     );
 
     let mut tools = FunctionToolRegistry::new();
@@ -5354,6 +5367,7 @@ async fn run_plan_compiler_with_context(
         runtime.model.clone(),
         Some(system_prompt),
         runtime.model_settings.clone(),
+        context.usage_account("plan_compiler", None).await,
     );
 
     let mut tools = FunctionToolRegistry::new();
@@ -6019,6 +6033,7 @@ async fn main() -> Result<(), ArchitectError> {
         config_dir,
         state_dir,
         rpc: Arc::clone(&rpc),
+        usage: UsageRecorder::start(Arc::clone(&rpc)),
         ai_configured: AtomicBool::new(ai_runtime.is_some()),
         ai_runtime: Arc::new(Mutex::new(ai_runtime)),
         messages_db_configured: AtomicBool::new(initial_messages_db_configured),
@@ -6344,6 +6359,38 @@ fn load_identity_ich_options(
     list_ich_options_from_hive_id(&state.hive_id).map_err(|err| -> ArchitectError { Box::new(err) })
 }
 
+impl ArchitectAdminToolContext {
+    /// The root tenant pays for Archi's calls; each record keeps what the work belongs to: the
+    /// session and, while one runs in it, its pipeline run and solution (docs/router-stream-v1.md
+    /// §7.3), the place for the client's tenant later.
+    async fn usage_account(&self, stage: &str, solution_id: Option<&str>) -> AiAccount {
+        let run = match self.session_id.as_deref() {
+            Some(session_id) => self
+                .active_pipeline_runs
+                .lock()
+                .await
+                .values()
+                .filter(|run| {
+                    run.session_id == session_id && !is_terminal_pipeline_status(&run.status)
+                })
+                .max_by_key(|run| (run.updated_at_ms, run.created_at_ms))
+                .cloned(),
+            None => None,
+        };
+        AiAccount::root(self.usage.clone(), &self.node_name)
+            .with_node_ilk(Some(self.self_ilk_id.clone()))
+            .with_work(UsageWork {
+                session_id: self.session_id.clone(),
+                pipeline_run_id: run.as_ref().map(|run| run.pipeline_run_id.clone()),
+                solution_id: solution_id
+                    .map(str::to_string)
+                    .or_else(|| run.as_ref().and_then(|run| run.solution_id.clone())),
+                stage: Some(stage.to_string()),
+                ..UsageWork::default()
+            })
+    }
+}
+
 fn admin_tool_context(
     state: &ArchitectState,
     session_id: Option<&str>,
@@ -6354,6 +6401,9 @@ fn admin_tool_context(
         state_dir: state.state_dir.clone(),
         rpc: Arc::clone(&state.rpc),
         ai_runtime: Arc::clone(&state.ai_runtime),
+        node_name: state.node_name.clone(),
+        self_ilk_id: state.self_ilk_id.clone(),
+        usage: state.usage.clone(),
         session_id: session_id.map(str::to_string),
         admin_actions_cache: Arc::clone(&state.admin_actions_cache),
         plan_compile_pending: Arc::clone(&state.plan_compile_pending),
@@ -10210,6 +10260,10 @@ async fn handle_ai_chat(
                 .into()
         })?;
     let tool_context = admin_tool_context(state, Some(&session.session_id));
+    let account = tool_context
+        .usage_account("chat", None)
+        .await
+        .with_thread(Some(session.thread_id.clone()));
     let tool_provider = ArchitectAdminReadToolsProvider::new(tool_context);
     let mut tools = FunctionToolRegistry::new();
     tool_provider
@@ -10226,6 +10280,7 @@ async fn handle_ai_chat(
         runtime.model.clone(),
         Some(runtime.instructions.clone()),
         runtime.model_settings.clone(),
+        account,
     );
     let runner = FunctionCallingRunner::new(FunctionCallingConfig::default());
     let current_user_parts =
@@ -11766,6 +11821,28 @@ fn scmd_query_params(raw_query: Option<&str>) -> serde_json::Map<String, Value> 
     params
 }
 
+/// `GET /hives/{hive}/usage?tenant_id=&from=&to=&group_by=&since=&after=&limit=`, read as the
+/// admin's HTTP route reads it: without a tenant_id it is about every tenant. The admin checks the
+/// rest, so a limit that is not a number goes as it came.
+fn scmd_usage_params(raw_query: Option<&str>) -> Value {
+    let mut params = scmd_query_params(raw_query);
+    for value in params.values_mut() {
+        if let Value::String(text) = value {
+            *text = percent_decode_simple(text);
+        }
+    }
+    if let Some(limit) = params
+        .get("limit")
+        .and_then(Value::as_str)
+        .and_then(|limit| limit.parse::<u32>().ok())
+    {
+        params.insert("limit".to_string(), json!(limit));
+    }
+    let all_tenants = !params.contains_key("tenant_id");
+    params.insert("all_tenants".to_string(), json!(all_tenants));
+    Value::Object(params)
+}
+
 fn scmd_vault_list_params(raw_query: Option<&str>) -> Value {
     let mut filter = serde_json::Map::new();
     let Some(query) = raw_query else {
@@ -12407,6 +12484,12 @@ fn translate_scmd(
             action: "get_versions".to_string(),
             target_hive: (*hive_id).to_string(),
             params: json!({}),
+        }),
+        ("GET", ["hives", hive_id, "usage"]) => Ok(AdminTranslation {
+            admin_target,
+            action: "get_llm_usage".to_string(),
+            target_hive: (*hive_id).to_string(),
+            params: scmd_usage_params(raw_query),
         }),
         ("GET", ["hives", hive_id, "wf-rules"]) => {
             let params = Value::Object(scmd_query_params(raw_query));
@@ -22571,7 +22654,7 @@ async fn handle_pipeline_plan_compile(
             };
             let failure_class = match classify_failure_deterministic(&err_text, &ctx) {
                 Some(c) => c,
-                None => classify_failure_with_ai(state, &err_text, &ctx).await,
+                None => classify_failure_with_ai(state, &tool_ctx, &err_text, &ctx).await,
             };
             let route = route_failure(
                 &failure_class,
@@ -26321,6 +26404,45 @@ mod tests {
         assert_eq!(translated.action, "list_taps");
         assert_eq!(translated.target_hive, "motherbee");
         assert_eq!(translated.params, json!({}));
+    }
+
+    #[test]
+    fn translate_llm_usage_scmd() {
+        // Without a tenant_id the question is about every tenant, as on the admin's HTTP route.
+        let every = translate_scmd(
+            "motherbee",
+            parse("curl -X GET /hives/motherbee/usage?from=2026-10-01T00:00:00Z&to=2026-11-01T00:00:00Z&group_by=model&limit=50"),
+        )
+        .expect("translation should succeed");
+        assert_eq!(every.action, "get_llm_usage");
+        assert_eq!(every.target_hive, "motherbee");
+        assert_eq!(
+            every.params,
+            json!({
+                "from": "2026-10-01T00:00:00Z",
+                "to": "2026-11-01T00:00:00Z",
+                "group_by": "model",
+                "limit": 50,
+                "all_tenants": true
+            })
+        );
+        let one = translate_scmd(
+            "motherbee",
+            parse("curl -X GET /hives/motherbee/usage?tenant_id=tnt:43d576a3-d712-4d91-9245-5d5463dd693e&since=2026-10-17T10:00:00.000001Z%7Cr1"),
+        )
+        .expect("translation should succeed");
+        assert_eq!(
+            one.params,
+            json!({
+                "tenant_id": "tnt:43d576a3-d712-4d91-9245-5d5463dd693e",
+                "since": "2026-10-17T10:00:00.000001Z|r1",
+                "all_tenants": false
+            })
+        );
+        // The params are the admin's question, field for field.
+        for params in [every.params, one.params] {
+            serde_json::from_value::<fluxbee_sdk::UsageQuery>(params).expect("a UsageQuery");
+        }
     }
 
     #[test]

@@ -1,4 +1,5 @@
 use std::collections::hash_map::DefaultHasher;
+use std::collections::BTreeMap;
 use std::fs::{self, OpenOptions};
 use std::hash::{Hash, Hasher};
 use std::path::Path;
@@ -8,7 +9,7 @@ use std::time::Duration;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use serde_json::{json, Value};
 use tokio::time;
-use tokio_postgres::{error::SqlState, Client, Config as PgConfig, GenericClient, NoTls};
+use tokio_postgres::{error::SqlState, Client, Config as PgConfig, GenericClient, NoTls, Row};
 use tracing_subscriber::EnvFilter;
 
 use fluxbee_sdk::protocol::{
@@ -33,6 +34,11 @@ use fluxbee_sdk::{
     SUBJECT_STORAGE_COGNITION_REASONS, SUBJECT_STORAGE_COGNITION_SCOPES,
     SUBJECT_STORAGE_COGNITION_SCOPE_INSTANCES, SUBJECT_STORAGE_COGNITION_THREADS,
 };
+use fluxbee_sdk::{
+    TenantSource, UsageGroup, UsageGroupBy, UsageQuery, UsageQueryResponse, UsageRecord,
+    DEFAULT_ROOT_TENANT_ID, MSG_USAGE_QUERY, MSG_USAGE_QUERY_RESPONSE, USAGE_QUERY_DEFAULT_LIMIT,
+    USAGE_QUERY_MAX_DAYS, USAGE_QUERY_MAX_LIMIT,
+};
 
 type StorageError = Box<dyn std::error::Error + Send + Sync>;
 use json_router::router::system_policy::PRIMARY_HIVE_ID;
@@ -40,6 +46,7 @@ use fluxbee_sdk::stream::{
     is_stream_node_name, stream_hive, StreamBatch, MSG_STREAM_ACK, MSG_STREAM_BATCH,
     SUBJECT_STORAGE_COGNITION_BATCH,
     SUBJECT_STORAGE_COGNITION_PREFIX as STREAM_SUBJECT_COGNITION_PREFIX, SUBJECT_STORAGE_TURNS,
+    SUBJECT_STORAGE_USAGE,
 };
 
 const INBOX_REPLAY_BATCH_SIZE: i64 = 200;
@@ -77,6 +84,10 @@ const COGNITION_STATE_ORDER: [CognitionDurableEntity; 8] = [
     CognitionDurableEntity::Memory,
     CognitionDurableEntity::Episode,
 ];
+/// `USAGE_QUERY`'s page when the question names none, and the largest it may name.
+/// The most bytes of records or groups one `USAGE_QUERY_RESPONSE` carries: with its cursor (a time
+/// and a field of at most `USAGE_FIELD_MAX_CHARS` characters) the answer stays under 64 KiB.
+const USAGE_QUERY_PAGE_BYTES: usize = 62 * 1024;
 /// The one-time copy of the old turns' whole messages from the inbox into `turns` (A-70, Q7).
 const TURNS_BACKFILL_MIGRATION: &str = "turns_backfill_from_inbox_v1";
 const TURNS_BACKFILL_PAGE: i64 = 500;
@@ -357,6 +368,50 @@ BEGIN
     END IF;
 END $$;
 "#;
+/// LLM usage records (A-70 stage 3, docs/router-stream-v1.md §7.5), one row per model call:
+/// `claimed_tenant_id` is the tenant the record named, `tenant_id` the one SY.storage charged, and
+/// `verified` is false when identity never answered. A response lands once (`record_id`, and the
+/// provider's response id where there is one). No foreign key to the tenants, so a purge of one
+/// stays free; nothing is purged from it. `stored_at` is the `now()` of an autocommit insert on the
+/// one shared connection, so it follows commit order: a `since` cursor never passes a row that
+/// commits later. Inserting from another connection or inside a transaction would break that.
+const USAGE_SCHEMA_SQL: &str = r#"
+CREATE TABLE IF NOT EXISTS llm_usage (
+    record_id            TEXT PRIMARY KEY,
+    provider_response_id TEXT,
+    ts                   TIMESTAMPTZ NOT NULL,
+    stored_at            TIMESTAMPTZ NOT NULL DEFAULT now(),
+    hive                 TEXT NOT NULL,
+    node_name            TEXT NOT NULL,
+    node_ilk             TEXT,
+    tenant_id            TEXT NOT NULL,
+    tenant_source        TEXT NOT NULL,
+    claimed_tenant_id    TEXT NOT NULL,
+    verified             BOOLEAN NOT NULL DEFAULT TRUE,
+    counterpart_ilk      TEXT,
+    provider             TEXT NOT NULL,
+    model                TEXT NOT NULL,
+    served_model         TEXT,
+    service_tier         TEXT,
+    kind                 TEXT NOT NULL,
+    outcome              TEXT NOT NULL,
+    uncached_input       BIGINT,
+    cache_read           BIGINT,
+    cache_write          BIGINT,
+    output               BIGINT,
+    reasoning            BIGINT,
+    raw_usage            JSONB,
+    trace_id             TEXT,
+    thread_id            TEXT,
+    work                 JSONB
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_llm_usage_provider_response ON llm_usage (provider_response_id) WHERE provider_response_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_llm_usage_tenant_ts ON llm_usage (tenant_id, ts);
+CREATE INDEX IF NOT EXISTS idx_llm_usage_node_ts ON llm_usage (node_name, ts);
+CREATE INDEX IF NOT EXISTS idx_llm_usage_ts ON llm_usage (ts);
+CREATE INDEX IF NOT EXISTS idx_llm_usage_stored ON llm_usage (stored_at, record_id);
+CREATE INDEX IF NOT EXISTS idx_llm_usage_tenant_stored ON llm_usage (tenant_id, stored_at, record_id);
+"#;
 const STORAGE_METRICS_LOG_INTERVAL_SECS: u64 = 30;
 const STORAGE_METRICS_WARN_PENDING: i64 = 100;
 const STORAGE_METRICS_WARN_AGE_SECS: i64 = 120;
@@ -416,6 +471,14 @@ struct Storage {
     /// Its own connection for the stream's batches, one transaction each: the shared client
     /// cannot run a transaction, and a `BEGIN` on it would take in the other loops' statements.
     ingest: tokio::sync::Mutex<Client>,
+    /// The database, for `USAGE_QUERY`'s connection.
+    database_config: PgConfig,
+    /// `USAGE_QUERY`'s own connection (§7.5), so a slow question never holds the others': opened at
+    /// the first question and again after one failed. A question holds it until it is answered, so
+    /// they run one at a time.
+    usage_reader: tokio::sync::Mutex<Option<Client>>,
+    /// What the usage records' checks found since the last report.
+    usage_counts: std::sync::Mutex<UsageCounts>,
 }
 
 #[derive(Debug)]
@@ -549,8 +612,9 @@ async fn main() -> Result<(), StorageError> {
         "sy.storage started"
     );
 
-    // Everything reaches SY.storage over the mesh (A-70): the routers' streams bring turns and
-    // cognition's outputs as STREAM_BATCH; SY.admin and SY.orchestrator ask for the inbox metrics.
+    // Everything reaches SY.storage over the mesh (A-70): the routers' streams bring turns,
+    // cognition's outputs and the usage records as STREAM_BATCH; SY.admin and SY.orchestrator ask
+    // for the inbox metrics, and SY.admin for the usage records.
     if let Some(storage) = storage.as_ref() {
         std::mem::drop(tokio::spawn(run_storage_metrics_loop(Arc::clone(storage))));
         std::mem::drop(tokio::spawn(run_inbox_maintenance_loop(Arc::clone(
@@ -630,6 +694,14 @@ async fn main() -> Result<(), StorageError> {
                     )));
                     continue;
                 }
+                if msg.meta.msg.as_deref() == Some(MSG_USAGE_QUERY) {
+                    std::mem::drop(tokio::spawn(answer_usage_query(
+                        storage.clone(),
+                        Arc::clone(&dispatcher),
+                        msg,
+                    )));
+                    continue;
+                }
                 if msg.meta.msg.as_deref() == Some(MSG_STREAM_BATCH) {
                     // To the ingest task. Without a database, or with its queue full, the batch is
                     // not acked and its stream sends it again.
@@ -685,7 +757,52 @@ impl Storage {
         Ok(Self {
             client,
             ingest: tokio::sync::Mutex::new(ingest),
+            database_config: database_config.clone(),
+            usage_reader: tokio::sync::Mutex::new(None),
+            usage_counts: std::sync::Mutex::new(UsageCounts::default()),
         })
+    }
+
+    fn usage_counts(&self) -> std::sync::MutexGuard<'_, UsageCounts> {
+        self.usage_counts
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// `USAGE_QUERY`'s connection, its statements cut at 15 s. Unlike the others, its end does not
+    /// end SY.storage: the next question opens another.
+    async fn connect_usage_reader(&self) -> Result<Client, StorageError> {
+        let (client, connection) = self.database_config.connect(NoTls).await?;
+        tokio::spawn(async move {
+            if let Err(err) = connection.await {
+                tracing::warn!(error = %err, "sy.storage usage query connection closed");
+            }
+        });
+        client
+            .batch_execute("SET statement_timeout = '15s'")
+            .await?;
+        Ok(client)
+    }
+
+    /// Answers a checked `USAGE_QUERY` on its own connection (§7.5); a question that finds another
+    /// running is told so.
+    async fn query_usage(&self, plan: &UsageQueryPlan) -> Result<UsageQueryResponse, String> {
+        let Ok(mut reader) = self.usage_reader.try_lock() else {
+            return Err("sy.storage is answering another usage query".to_string());
+        };
+        let client = match reader.take() {
+            Some(client) if !client.is_closed() => client,
+            _ => self
+                .connect_usage_reader()
+                .await
+                .map_err(|err| err.to_string())?,
+        };
+        let answer = usage_query_page(&client, plan).await;
+        // A connection whose question failed is dropped: the next question opens another.
+        if answer.is_ok() {
+            *reader = Some(client);
+        }
+        answer.map_err(|err| err.to_string())
     }
 
     async fn ensure_schema(&self) -> Result<(), StorageError> {
@@ -765,6 +882,7 @@ CREATE INDEX IF NOT EXISTS idx_storage_inbox_pending ON storage_inbox(processed_
         self.client.batch_execute(MESSAGE_LOG_MIGRATION_SQL).await?;
         self.client.batch_execute(COGNITION_RESET_SQL).await?;
         self.client.batch_execute(COGNITION_SCHEMA_SQL).await?;
+        self.client.batch_execute(USAGE_SCHEMA_SQL).await?;
         Ok(())
     }
 
@@ -788,7 +906,7 @@ CREATE INDEX IF NOT EXISTS idx_storage_inbox_pending ON storage_inbox(processed_
                 .client
                 .query(
                     r#"
-SELECT dedupe_key, subject, payload, received_at, source_ts
+SELECT dedupe_key, subject, payload, received_at, source_ts, attempts
 FROM storage_inbox
 WHERE processed_at IS NULL
   AND attempts < $2
@@ -816,6 +934,8 @@ LIMIT $1
                 let payload: Vec<u8> = row.get(2);
                 after = Some((row.get(3), dedupe_key.clone()));
                 let source_ts: Option<std::time::SystemTime> = row.get(4);
+                // This retry is one more attempt: a failure counts it below.
+                let attempt = row.get::<_, i32>(5) + 1;
                 let Some(kind) = handler_kind_for_subject(&subject) else {
                     let err_msg = format!("unsupported subject in inbox replay: {subject}");
                     self.client
@@ -832,7 +952,14 @@ WHERE dedupe_key = $1
                 };
 
                 if let Err(err) = self
-                    .process_inbox_message(&dedupe_key, &subject, kind, &payload, source_ts)
+                    .process_inbox_message(
+                        &dedupe_key,
+                        &subject,
+                        kind,
+                        &payload,
+                        source_ts,
+                        attempt,
+                    )
                     .await
                 {
                     // A retry counts as an attempt, so a row that keeps failing stops at
@@ -861,8 +988,12 @@ WHERE dedupe_key = $1
     }
 
     /// A stream batch's records into the inbox, in one transaction on the ingest connection.
-    /// Returns, per row, whether it was processed already: a repeat of a processed row is absorbed.
-    async fn upsert_stream_rows(&self, rows: &[StreamRow]) -> Result<Vec<bool>, StorageError> {
+    /// Returns, per row, its attempts with this delivery, or `None` when it was processed already:
+    /// a repeat of a processed row is absorbed.
+    async fn upsert_stream_rows(
+        &self,
+        rows: &[StreamRow],
+    ) -> Result<Vec<Option<i32>>, StorageError> {
         let mut client = self.ingest.lock().await;
         let tx = client.transaction().await?;
         let stmt = tx
@@ -873,23 +1004,22 @@ VALUES ($1, $2, $3, 1, NULL, $4)
 ON CONFLICT (dedupe_key) DO UPDATE SET
     attempts = storage_inbox.attempts + 1,
     last_error = NULL
-RETURNING processed_at IS NOT NULL
+RETURNING processed_at IS NOT NULL, attempts
 "#,
             )
             .await?;
-        let mut processed = Vec::with_capacity(rows.len());
+        let mut attempts = Vec::with_capacity(rows.len());
         for row in rows {
-            processed.push(
-                tx.query_one(
+            let upserted = tx
+                .query_one(
                     &stmt,
                     &[&row.dedupe_key, &row.subject, &row.payload, &row.source_ts],
                 )
-                .await?
-                .get::<_, bool>(0),
-            );
+                .await?;
+            attempts.push((!upserted.get::<_, bool>(0)).then(|| upserted.get::<_, i32>(1)));
         }
         tx.commit().await?;
-        Ok(processed)
+        Ok(attempts)
     }
 
     /// One communication's state for its cognition's rebuild (§6.2): every row it wrote, as the
@@ -1184,6 +1314,9 @@ FROM storage_inbox
         })
     }
 
+    /// `attempt` counts this one. A row that fails its `INBOX_MAX_ATTEMPTS`th is never retried, so
+    /// on that one a handler that waits on another service stops waiting: a usage record whose
+    /// tenant identity cannot give is stored unverified (§7.5).
     async fn process_inbox_message(
         &self,
         dedupe_key: &str,
@@ -1191,9 +1324,11 @@ FROM storage_inbox
         kind: HandlerKind,
         payload: &[u8],
         source_ts: Option<std::time::SystemTime>,
+        attempt: i32,
     ) -> Result<(), StorageError> {
+        let last_attempt = attempt >= INBOX_MAX_ATTEMPTS;
         let result = self
-            .process_subject_payload(kind, payload, dedupe_key, source_ts)
+            .process_subject_payload(kind, payload, dedupe_key, source_ts, last_attempt)
             .await;
         match result {
             Ok(()) => {
@@ -1238,6 +1373,7 @@ WHERE dedupe_key = $1
         payload: &[u8],
         dedupe_key: &str,
         source_ts: Option<std::time::SystemTime>,
+        last_attempt: bool,
     ) -> Result<(), StorageError> {
         match kind {
             HandlerKind::Turns => {
@@ -1288,6 +1424,11 @@ WHERE dedupe_key = $1
                 let envelope: CognitionDurableEnvelope<CognitionEpisodeData> =
                     parse_cognition_envelope(payload, CognitionDurableEntity::Episode)?;
                 self.persist_cognition_episode(&self.client, &envelope)
+                    .await
+            }
+            HandlerKind::Usage => {
+                let record: UsageRecord = serde_json::from_slice(payload)?;
+                self.persist_usage(&self.client, &record, last_attempt)
                     .await
             }
         }
@@ -1948,6 +2089,79 @@ WHERE cognition_episodes.source_turn <= EXCLUDED.source_turn
         .await?;
         Ok(())
     }
+
+    /// A usage record into `llm_usage`, charged as `decide_usage_tenant` decides (§7.5). A record
+    /// lands once: a repeat of its `record_id`, or of its provider's response id, is absorbed, and
+    /// counted only the time it landed.
+    async fn persist_usage<C>(
+        &self,
+        db: &C,
+        record: &UsageRecord,
+        last_attempt: bool,
+    ) -> Result<(), StorageError>
+    where
+        C: GenericClient + Sync,
+    {
+        let charge = decide_usage_tenant(record, last_attempt, identity_tenant)?;
+        let ts: std::time::SystemTime = chrono::DateTime::parse_from_rfc3339(&record.ts)?.into();
+        let work = record
+            .work
+            .as_ref()
+            .filter(|work| !work.is_empty())
+            .map(json_value)
+            .transpose()?;
+        let inserted = db
+            .execute(
+                r#"
+INSERT INTO llm_usage (
+    record_id, provider_response_id, ts, hive, node_name, node_ilk, tenant_id, tenant_source,
+    claimed_tenant_id, verified, counterpart_ilk, provider, model, served_model, service_tier,
+    kind, outcome, uncached_input, cache_read, cache_write, output, reasoning, raw_usage,
+    trace_id, thread_id, work
+)
+VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26)
+ON CONFLICT DO NOTHING
+"#,
+                &[
+                    &record.record_id,
+                    &record.provider_response_id,
+                    &ts,
+                    &record.hive,
+                    &record.node_name,
+                    &record.node_ilk,
+                    &charge.tenant_id,
+                    &record.tenant_source.as_str(),
+                    &record.tenant_id,
+                    &charge.verified,
+                    &record.counterpart_ilk,
+                    &record.provider,
+                    &record.model,
+                    &record.served_model,
+                    &record.service_tier,
+                    &record.kind.as_str(),
+                    &record.outcome.as_str(),
+                    &opt_i64(record.uncached_input),
+                    &opt_i64(record.cache_read),
+                    &opt_i64(record.cache_write),
+                    &opt_i64(record.output),
+                    &opt_i64(record.reasoning),
+                    &record.raw_usage,
+                    &record.trace_id,
+                    &record.thread_id,
+                    &work,
+                ],
+            )
+            .await?;
+        if inserted > 0 {
+            let mut counts = self.usage_counts();
+            if !charge.verified {
+                counts.unverified += 1;
+            } else if charge.tenant_id != record.tenant_id {
+                counts.mismatched += 1;
+            }
+        }
+        Ok(())
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -1961,6 +2175,16 @@ enum HandlerKind {
     CognitionScopeInstances,
     CognitionMemories,
     CognitionEpisodes,
+    Usage,
+}
+
+/// What the checks of the usage records found since the last report (§7.5): the records refused,
+/// by reason; those charged to another tenant than they claimed; those stored unverified.
+#[derive(Debug, Default)]
+struct UsageCounts {
+    refused: BTreeMap<&'static str, u64>,
+    mismatched: u64,
+    unverified: u64,
 }
 
 struct InboxMetrics {
@@ -1980,6 +2204,7 @@ fn handler_kind_for_subject(subject: &str) -> Option<HandlerKind> {
         SUBJECT_STORAGE_COGNITION_SCOPE_INSTANCES => Some(HandlerKind::CognitionScopeInstances),
         SUBJECT_STORAGE_COGNITION_MEMORIES => Some(HandlerKind::CognitionMemories),
         SUBJECT_STORAGE_COGNITION_EPISODES => Some(HandlerKind::CognitionEpisodes),
+        SUBJECT_STORAGE_USAGE => Some(HandlerKind::Usage),
         _ => None,
     }
 }
@@ -2193,6 +2418,396 @@ async fn answer_storage_metrics(
     }
 }
 
+/// `USAGE_QUERY` (§7.5): the usage records, for SY.admin@motherbee only, as its router stamped it;
+/// the operator, Archi and Cloud ask through it.
+async fn answer_usage_query(
+    storage: Option<Arc<Storage>>,
+    dispatcher: Arc<RouterDispatcher>,
+    msg: Message,
+) {
+    let response = usage_query_answer(storage.as_deref(), &msg)
+        .await
+        .unwrap_or_else(|(code, error)| UsageQueryResponse {
+            error: Some(error),
+            error_code: Some(code.to_string()),
+            ..UsageQueryResponse::default()
+        });
+    let sender = dispatcher.sender_snapshot();
+    let reply = build_system_reply(
+        &sender,
+        &msg,
+        MSG_USAGE_QUERY_RESPONSE,
+        serde_json::to_value(response).unwrap_or(Value::Null),
+    );
+    if let Err(err) = sender.send(reply).await {
+        tracing::warn!(error = %err, "sy.storage could not answer a USAGE_QUERY");
+    }
+}
+
+/// The answer to a `USAGE_QUERY`, or its error with the code `UsageQueryResponse` documents.
+async fn usage_query_answer(
+    storage: Option<&Storage>,
+    msg: &Message,
+) -> Result<UsageQueryResponse, (&'static str, String)> {
+    let from = msg.routing.src_l2_name.as_deref().unwrap_or("");
+    if from != format!("SY.admin@{PRIMARY_HIVE_ID}") {
+        tracing::warn!(
+            from,
+            "sy.storage refused a USAGE_QUERY not from SY.admin@motherbee"
+        );
+        return Err((
+            "FORBIDDEN",
+            "only SY.admin@motherbee may query the usage records".to_string(),
+        ));
+    }
+    let storage = storage.ok_or((
+        "USAGE_UNAVAILABLE",
+        "sy.storage has no database".to_string(),
+    ))?;
+    let query: UsageQuery = serde_json::from_value(msg.payload.clone())
+        .map_err(|err| ("INVALID_REQUEST", format!("invalid USAGE_QUERY: {err}")))?;
+    let plan = plan_usage_query(&query).map_err(|err| ("INVALID_REQUEST", err))?;
+    storage
+        .query_usage(&plan)
+        .await
+        .map_err(|err| ("USAGE_UNAVAILABLE", err))
+}
+
+/// A `USAGE_QUERY`, checked: what it asks, every value ready to bind.
+#[derive(Debug, PartialEq)]
+struct UsageQueryPlan {
+    /// `None`: every tenant.
+    tenant_id: Option<String>,
+    mode: UsageQueryMode,
+    limit: u32,
+}
+
+#[derive(Debug, PartialEq)]
+enum UsageQueryMode {
+    /// The records stored after a cursor, by `(stored_at, record_id)`: a reader's sync, which takes
+    /// the rows that arrive late (the streams' window, the inbox's retries).
+    Since {
+        stored_at: std::time::SystemTime,
+        record_id: String,
+    },
+    /// A period's records, by `(ts, record_id)`, after a cursor.
+    Records {
+        from: std::time::SystemTime,
+        to: std::time::SystemTime,
+        after: Option<(std::time::SystemTime, String)>,
+    },
+    /// A period's groups, by key, after a key.
+    Groups {
+        from: std::time::SystemTime,
+        to: std::time::SystemTime,
+        group_by: UsageGroupBy,
+        after: Option<String>,
+    },
+}
+
+/// Checks a `USAGE_QUERY` (§7.5): exactly one of `tenant_id` and `all_tenants`; then either `since`
+/// alone, or a period `[from, to)` of at most `USAGE_QUERY_MAX_DAYS`, grouped by `group_by` or
+/// record by record. A blank field counts as absent.
+fn plan_usage_query(query: &UsageQuery) -> Result<UsageQueryPlan, String> {
+    let given = |value: &Option<String>| {
+        value
+            .as_deref()
+            .filter(|value| !value.trim().is_empty())
+            .map(str::to_string)
+    };
+    let tenant_id = match (given(&query.tenant_id), query.all_tenants) {
+        (Some(tenant_id), false) => Some(tenant_id),
+        (None, true) => None,
+        _ => {
+            return Err("a usage query takes exactly one of tenant_id and all_tenants".to_string())
+        }
+    };
+    let limit = query
+        .limit
+        .unwrap_or(USAGE_QUERY_DEFAULT_LIMIT)
+        .clamp(1, USAGE_QUERY_MAX_LIMIT);
+    let after = given(&query.after);
+    if let Some(since) = given(&query.since) {
+        if given(&query.from).is_some()
+            || given(&query.to).is_some()
+            || query.group_by.is_some()
+            || after.is_some()
+        {
+            return Err("since takes no period, grouping or after".to_string());
+        }
+        let (stored_at, record_id) = parse_usage_cursor(&since)
+            .ok_or("since is neither a usage cursor nor an RFC 3339 time")?;
+        return Ok(UsageQueryPlan {
+            tenant_id,
+            mode: UsageQueryMode::Since {
+                stored_at,
+                record_id,
+            },
+            limit,
+        });
+    }
+    let (Some(from), Some(to)) = (given(&query.from), given(&query.to)) else {
+        return Err("a usage query takes since, or a period from and to".to_string());
+    };
+    let time = |name: &str, value: &str| {
+        chrono::DateTime::parse_from_rfc3339(value)
+            .map_err(|err| format!("{name} is not an RFC 3339 time: {err}"))
+    };
+    let (from, to) = (time("from", &from)?, time("to", &to)?);
+    if to <= from {
+        return Err("to must be after from".to_string());
+    }
+    if to - from > chrono::Duration::days(USAGE_QUERY_MAX_DAYS) {
+        return Err(format!(
+            "a usage query's period is at most {USAGE_QUERY_MAX_DAYS} days"
+        ));
+    }
+    let (from, to) = (from.into(), to.into());
+    let mode = match query.group_by {
+        Some(group_by) => UsageQueryMode::Groups {
+            from,
+            to,
+            group_by,
+            after,
+        },
+        None => UsageQueryMode::Records {
+            from,
+            to,
+            after: after
+                .map(|after| parse_usage_cursor(&after).ok_or("after is not a usage cursor"))
+                .transpose()?,
+        },
+    };
+    Ok(UsageQueryPlan {
+        tenant_id,
+        mode,
+        limit,
+    })
+}
+
+/// A record's place in an order, as `next` gives it: `<RFC 3339 time>|<record_id>`, the time to
+/// the microsecond, as stored.
+fn usage_cursor(time: std::time::SystemTime, record_id: &str) -> String {
+    format!("{}|{record_id}", rfc3339_micros(time))
+}
+
+/// A cursor `usage_cursor` made, or a bare RFC 3339 time (where a reader's first sync starts).
+fn parse_usage_cursor(cursor: &str) -> Option<(std::time::SystemTime, String)> {
+    let (time, record_id) = cursor.split_once('|').unwrap_or((cursor, ""));
+    let time = chrono::DateTime::parse_from_rfc3339(time).ok()?;
+    Some((time.into(), record_id.to_string()))
+}
+
+fn rfc3339_micros(time: std::time::SystemTime) -> String {
+    chrono::DateTime::<chrono::Utc>::from(time).to_rfc3339_opts(chrono::SecondsFormat::Micros, true)
+}
+
+/// The fixed SQL expression each grouping groups by: never the caller's text.
+fn usage_group_key(group_by: UsageGroupBy) -> &'static str {
+    match group_by {
+        UsageGroupBy::Day => "to_char(date_trunc('day', ts AT TIME ZONE 'UTC'), 'YYYY-MM-DD')",
+        UsageGroupBy::Model => "model",
+        UsageGroupBy::Node => "node_name",
+        UsageGroupBy::Tenant => "tenant_id",
+    }
+}
+
+/// A period's groups: calls and the five sums per key, in key order, after a key. Built from the
+/// grouping alone; every value is a parameter.
+fn usage_groups_sql(group_by: UsageGroupBy) -> String {
+    format!(
+        r#"
+SELECT group_key, calls, uncached_input, cache_read, cache_write, output, reasoning FROM (
+    SELECT {key} AS group_key,
+           COUNT(*) AS calls,
+           COALESCE(SUM(uncached_input), 0)::BIGINT AS uncached_input,
+           COALESCE(SUM(cache_read), 0)::BIGINT AS cache_read,
+           COALESCE(SUM(cache_write), 0)::BIGINT AS cache_write,
+           COALESCE(SUM(output), 0)::BIGINT AS output,
+           COALESCE(SUM(reasoning), 0)::BIGINT AS reasoning
+    FROM llm_usage
+    WHERE ($1::text IS NULL OR tenant_id = $1) AND ts >= $2 AND ts < $3
+    GROUP BY 1
+) AS usage_groups
+WHERE ($4::text IS NULL OR group_key > $4)
+ORDER BY group_key
+LIMIT $5
+"#,
+        key = usage_group_key(group_by)
+    )
+}
+
+/// One page of a checked `USAGE_QUERY`. It fetches one row past the limit, to know whether more
+/// remain.
+async fn usage_query_page(
+    client: &Client,
+    plan: &UsageQueryPlan,
+) -> Result<UsageQueryResponse, StorageError> {
+    let fetch = i64::from(plan.limit) + 1;
+    let mut response = UsageQueryResponse {
+        ok: true,
+        ..UsageQueryResponse::default()
+    };
+    match &plan.mode {
+        UsageQueryMode::Groups {
+            from,
+            to,
+            group_by,
+            after,
+        } => {
+            let rows = client
+                .query(
+                    usage_groups_sql(*group_by).as_str(),
+                    &[&plan.tenant_id, from, to, after, &fetch],
+                )
+                .await?;
+            let groups = rows
+                .iter()
+                .map(|row| {
+                    let sum = |index: usize| u64::try_from(row.get::<_, i64>(index)).unwrap_or(0);
+                    let key: String = row.get(0);
+                    let group = UsageGroup {
+                        key: key.clone(),
+                        calls: sum(1),
+                        uncached_input: sum(2),
+                        cache_read: sum(3),
+                        cache_write: sum(4),
+                        output: sum(5),
+                        reasoning: sum(6),
+                    };
+                    (key, group)
+                })
+                .collect();
+            let (groups, last, more) = page_usage(groups, plan.limit);
+            response.groups = groups;
+            response.next = last.filter(|_| more);
+        }
+        UsageQueryMode::Records { from, to, after } => {
+            let (after_ts, after_id) = after.clone().unzip();
+            let rows = client
+                .query(
+                    r#"
+SELECT * FROM llm_usage
+WHERE ($1::text IS NULL OR tenant_id = $1) AND ts >= $2 AND ts < $3
+  AND ($4::timestamptz IS NULL OR (ts, record_id) > ($4::timestamptz, $5::text))
+ORDER BY ts, record_id
+LIMIT $6
+"#,
+                    &[&plan.tenant_id, from, to, &after_ts, &after_id, &fetch],
+                )
+                .await?;
+            let records = rows
+                .iter()
+                .map(|row| {
+                    (
+                        usage_cursor(row.get("ts"), row.get("record_id")),
+                        usage_record_json(row),
+                    )
+                })
+                .collect();
+            let (records, last, more) = page_usage(records, plan.limit);
+            response.records = records;
+            response.next = last.filter(|_| more);
+        }
+        UsageQueryMode::Since {
+            stored_at,
+            record_id,
+        } => {
+            let rows = client
+                .query(
+                    r#"
+SELECT * FROM llm_usage
+WHERE ($1::text IS NULL OR tenant_id = $1)
+  AND (stored_at, record_id) > ($2::timestamptz, $3::text)
+ORDER BY stored_at, record_id
+LIMIT $4
+"#,
+                    &[&plan.tenant_id, stored_at, record_id, &fetch],
+                )
+                .await?;
+            let records = rows
+                .iter()
+                .map(|row| {
+                    (
+                        usage_cursor(row.get("stored_at"), row.get("record_id")),
+                        usage_record_json(row),
+                    )
+                })
+                .collect();
+            // A sync keeps the last record's cursor, whether more remain or not.
+            let (records, last, _) = page_usage(records, plan.limit);
+            response.records = records;
+            response.next = last;
+        }
+    }
+    Ok(response)
+}
+
+/// One page of an answer: the items in order, at most `limit` and `USAGE_QUERY_PAGE_BYTES` (always
+/// at least one), the cursor of the last one taken, and whether any were left out. Each item comes
+/// with its cursor.
+fn page_usage<T: Serialize>(items: Vec<(String, T)>, limit: u32) -> (Vec<T>, Option<String>, bool) {
+    let total = items.len();
+    let mut page = Vec::new();
+    let mut last = None;
+    let mut bytes = 0usize;
+    for (cursor, item) in items {
+        // Its bytes and a separator.
+        let size = serde_json::to_vec(&item).map_or(0, |item| item.len()) + 1;
+        if page.len() >= limit as usize
+            || (!page.is_empty() && bytes + size > USAGE_QUERY_PAGE_BYTES)
+        {
+            break;
+        }
+        bytes += size;
+        page.push(item);
+        last = Some(cursor);
+    }
+    let more = page.len() < total;
+    (page, last, more)
+}
+
+/// A stored usage record as `USAGE_QUERY` answers it: its columns, `ts` and `stored_at` in RFC 3339
+/// (to the microsecond, as stored), the null ones left out.
+fn usage_record_json(row: &Row) -> Value {
+    let time = |column: &str| rfc3339_micros(row.get(column));
+    let text = |column: &str| row.get::<_, Option<String>>(column);
+    let count = |column: &str| row.get::<_, Option<i64>>(column);
+    let mut record = json!({
+        "record_id": text("record_id"),
+        "provider_response_id": text("provider_response_id"),
+        "ts": time("ts"),
+        "stored_at": time("stored_at"),
+        "hive": text("hive"),
+        "node_name": text("node_name"),
+        "node_ilk": text("node_ilk"),
+        "tenant_id": text("tenant_id"),
+        "tenant_source": text("tenant_source"),
+        "claimed_tenant_id": text("claimed_tenant_id"),
+        "verified": row.get::<_, bool>("verified"),
+        "counterpart_ilk": text("counterpart_ilk"),
+        "provider": text("provider"),
+        "model": text("model"),
+        "served_model": text("served_model"),
+        "service_tier": text("service_tier"),
+        "kind": text("kind"),
+        "outcome": text("outcome"),
+        "uncached_input": count("uncached_input"),
+        "cache_read": count("cache_read"),
+        "cache_write": count("cache_write"),
+        "output": count("output"),
+        "reasoning": count("reasoning"),
+        "raw_usage": row.get::<_, Option<Value>>("raw_usage"),
+        "trace_id": text("trace_id"),
+        "thread_id": text("thread_id"),
+        "work": row.get::<_, Option<Value>>("work"),
+    });
+    if let Some(fields) = record.as_object_mut() {
+        fields.retain(|_, value| !value.is_null());
+    }
+    record
+}
+
 /// One record of a stream batch, ready for the inbox.
 struct StreamRow {
     dedupe_key: String,
@@ -2202,18 +2817,22 @@ struct StreamRow {
     source_ts: std::time::SystemTime,
 }
 
-/// The records of a batch SY.storage takes, and how many it drops: a subject it has no handler for
-/// (usage, until stage 3); a record whose producer is not a node of the stream's hive (a router
-/// copies and takes only what its own nodes send); a cognition record not from that hive's
-/// SY.cognition; a turn whose message names another sender than its producer (Archi shows that
-/// name). SY.cognition's packed envelopes (`storage.cognition.batch`) become one row each, as if
-/// each had come alone. A resent record lands on the same keys: the same subject and payload, the
-/// same row.
-fn stream_rows(batch: &StreamBatch, from: &str) -> Result<(Vec<StreamRow>, usize), StorageError> {
+/// The records of a batch SY.storage takes, how many it drops, and why it refused each usage record
+/// it dropped. It drops a subject it has no handler for; a record whose producer is not a node of
+/// the stream's hive (a router copies and takes only what its own nodes send); a cognition record
+/// not from that hive's SY.cognition; a turn whose message names another sender than its producer
+/// (Archi shows that name); a usage record `check_usage_record` refuses. SY.cognition's packed
+/// envelopes (`storage.cognition.batch`) become one row each, as if each had come alone. A resent
+/// record lands on the same keys: the same subject and payload, the same row.
+fn stream_rows(
+    batch: &StreamBatch,
+    from: &str,
+) -> Result<(Vec<StreamRow>, usize, Vec<&'static str>), StorageError> {
     let hive = stream_hive(from).unwrap_or_default();
     let cognition_producer = format!("SY.cognition@{hive}");
     let mut rows = Vec::with_capacity(batch.records.len());
     let mut dropped = 0usize;
+    let mut usage_refused = Vec::new();
     for record in &batch.records {
         let producer_hive = record.producer.rsplit_once('@').map(|(_, hive)| hive);
         if producer_hive != Some(hive) {
@@ -2269,6 +2888,13 @@ fn stream_rows(batch: &StreamBatch, from: &str) -> Result<(Vec<StreamRow>, usize
             dropped += 1;
             continue;
         }
+        if record.subject == SUBJECT_STORAGE_USAGE {
+            if let Err(reason) = check_usage_record(&record.producer, &record.payload) {
+                dropped += 1;
+                usage_refused.push(reason);
+                continue;
+            }
+        }
         let payload = serde_json::to_vec(&record.payload)?;
         rows.push(StreamRow {
             dedupe_key: message_dedupe_key(&record.subject, &payload),
@@ -2278,7 +2904,84 @@ fn stream_rows(batch: &StreamBatch, from: &str) -> Result<(Vec<StreamRow>, usize
             source_ts: std::time::UNIX_EPOCH + Duration::from_millis(record.ts_ms),
         });
     }
-    Ok((rows, dropped))
+    Ok((rows, dropped, usage_refused))
+}
+
+/// Who may record usage, by the producer's name (§7.3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UsageProducer {
+    /// A node outside `SY.*`: it pays its own tenant.
+    Node,
+    /// SY.cognition: the communication's agent's tenant.
+    Cognition,
+    /// SY.frontdesk.gov: the case's tenant.
+    Frontdesk,
+    /// SY.architect and SY.admin's executor: the root tenant.
+    Root,
+}
+
+/// `None`: an `SY.*` name that may not record usage.
+fn usage_producer(name: &str) -> Option<UsageProducer> {
+    let base = name
+        .split_once('@')
+        .map_or(name, |(base, _)| base)
+        .to_ascii_lowercase();
+    if !base.starts_with("sy.") {
+        return Some(UsageProducer::Node);
+    }
+    match base.as_str() {
+        "sy.cognition" => Some(UsageProducer::Cognition),
+        "sy.frontdesk.gov" => Some(UsageProducer::Frontdesk),
+        "sy.architect" | "sy.admin" => Some(UsageProducer::Root),
+        _ => None,
+    }
+}
+
+/// The checks a usage record passes before it enters the inbox (§7.5), on top of the stream's (its
+/// producer is a node of the stream's hive; the routers decide which hives may produce each `SY.*`
+/// name). `Err` names why it is refused. Its tenant is decided when it is processed.
+fn check_usage_record(producer: &str, payload: &Value) -> Result<(), &'static str> {
+    let role = usage_producer(producer).ok_or("foreign_sy")?;
+    let record = UsageRecord::deserialize(payload).map_err(|_| "malformed")?;
+    // Its time and counts must fit their columns; a negative count does not parse.
+    let counts = [
+        record.uncached_input,
+        record.cache_read,
+        record.cache_write,
+        record.output,
+        record.reasoning,
+    ];
+    if chrono::DateTime::parse_from_rfc3339(&record.ts).is_err()
+        || counts
+            .into_iter()
+            .flatten()
+            .any(|count| i64::try_from(count).is_err())
+    {
+        return Err("malformed");
+    }
+    if record.defect().is_some() {
+        return Err("defective");
+    }
+    if record.node_name != producer {
+        return Err("not_producer");
+    }
+    let fits = match record.tenant_source {
+        TenantSource::Node => role == UsageProducer::Node,
+        // The agent's tenant is looked up by the agent's ILK.
+        TenantSource::Agent => role == UsageProducer::Cognition && record.counterpart_ilk.is_some(),
+        TenantSource::Case => role == UsageProducer::Frontdesk,
+        TenantSource::Root => role == UsageProducer::Root,
+        TenantSource::FallbackRoot => true,
+    };
+    if !fits {
+        return Err("wrong_source");
+    }
+    if (role == UsageProducer::Root || record.tenant_source == TenantSource::FallbackRoot)
+        && record.tenant_id != DEFAULT_ROOT_TENANT_ID
+    {
+        return Err("not_root");
+    }
+    Ok(())
 }
 
 /// Takes the stream batches the main loop hands over, one at a time, in arrival order, and hands
@@ -2289,11 +2992,11 @@ async fn run_stream_ingest(
     mut rx: tokio::sync::mpsc::Receiver<Message>,
 ) {
     let (process_tx, mut process_rx) =
-        tokio::sync::mpsc::channel::<Vec<StreamRow>>(STREAM_PROCESS_QUEUE);
+        tokio::sync::mpsc::channel::<Vec<(StreamRow, i32)>>(STREAM_PROCESS_QUEUE);
     let processor = Arc::clone(&storage);
     std::mem::drop(tokio::spawn(async move {
         while let Some(rows) = process_rx.recv().await {
-            for row in rows {
+            for (row, attempt) in rows {
                 // A failure is recorded on the row, which the inbox retry takes again.
                 let _ = processor
                     .process_inbox_message(
@@ -2302,6 +3005,7 @@ async fn run_stream_ingest(
                         row.kind,
                         &row.payload,
                         Some(row.source_ts),
+                        attempt,
                     )
                     .await;
             }
@@ -2323,13 +3027,14 @@ async fn run_stream_ingest(
 }
 
 /// A batch from a router's stream (docs/router-stream-v1.md §2.7): into the inbox in one
-/// transaction, then acked. Returns the rows not processed yet, for the processing task. A record
-/// SY.storage does not take (see `stream_rows`) is acked and dropped.
+/// transaction, then acked. Returns the rows not processed yet, with their attempts, for the
+/// processing task. A record SY.storage does not take (see `stream_rows`) is acked and dropped; a
+/// refused usage record is counted once acked.
 async fn ingest_stream_batch(
     storage: &Storage,
     dispatcher: &RouterDispatcher,
     msg: &Message,
-) -> Result<Vec<StreamRow>, StorageError> {
+) -> Result<Vec<(StreamRow, i32)>, StorageError> {
     let from = msg.routing.src_l2_name.as_deref().unwrap_or("");
     if !is_stream_node_name(from) {
         tracing::warn!(
@@ -2342,8 +3047,8 @@ async fn ingest_stream_batch(
     let Some(last_seq) = batch.records.last().map(|record| record.seq) else {
         return Ok(Vec::new());
     };
-    let (rows, dropped) = stream_rows(&batch, from)?;
-    let processed = storage.upsert_stream_rows(&rows).await?;
+    let (rows, dropped, usage_refused) = stream_rows(&batch, from)?;
+    let attempts = storage.upsert_stream_rows(&rows).await?;
     let sender = dispatcher.sender_snapshot();
     let ack = build_system_reply(
         &sender,
@@ -2352,6 +3057,12 @@ async fn ingest_stream_batch(
         json!({ "up_to_seq": last_seq }),
     );
     sender.send(ack).await?;
+    if !usage_refused.is_empty() {
+        let mut counts = storage.usage_counts();
+        for reason in usage_refused {
+            *counts.refused.entry(reason).or_default() += 1;
+        }
+    }
     tracing::debug!(
         stream = from,
         records = batch.records.len(),
@@ -2362,9 +3073,8 @@ async fn ingest_stream_batch(
     );
     Ok(rows
         .into_iter()
-        .zip(processed)
-        .filter(|(_, processed)| !processed)
-        .map(|(row, _)| row)
+        .zip(attempts)
+        .filter_map(|(row, attempt)| attempt.map(|attempt| (row, attempt)))
         .collect())
 }
 
@@ -2382,6 +3092,93 @@ fn envelope_communication<T>(
     Ok((agent_ilk.to_string(), turn))
 }
 
+/// The ILK whose tenant pays for a usage record, as SY.storage finds it in identity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum IdentityLookup<'a> {
+    /// A node's own ILK, by its `handler_node`.
+    HandlerNode(&'a str),
+    /// The ILK of the agent SY.cognition served.
+    Ilk(&'a str),
+}
+
+/// The tenant a usage record is stored with.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct UsageCharge {
+    tenant_id: String,
+    /// False when identity never answered and the record keeps the tenant it claims.
+    verified: bool,
+}
+
+/// Decides the tenant a usage record is charged to (§7.5). A node outside `SY.*` pays its own
+/// tenant and SY.cognition its agent's, both as identity holds them (`tenant_of` gives an ILK's
+/// tenant, `None` when identity does not hold it); SY.frontdesk.gov's case tenant is taken as
+/// recorded; `fallback_root`, SY.architect and SY.admin pay with the root tenant, which the ingest
+/// checks held them to. Identity that cannot answer is an error, which the inbox retries; on the
+/// row's last attempt the record keeps the tenant it claims, unverified: spend is never dropped
+/// for a lookup.
+fn decide_usage_tenant(
+    record: &UsageRecord,
+    last_attempt: bool,
+    tenant_of: impl FnOnce(IdentityLookup<'_>) -> Result<Option<String>, StorageError>,
+) -> Result<UsageCharge, StorageError> {
+    let role = usage_producer(&record.node_name)
+        .ok_or_else(|| format!("{} may not record usage", record.node_name))?;
+    let lookup = match (role, record.tenant_source) {
+        (UsageProducer::Node, _) => IdentityLookup::HandlerNode(&record.node_name),
+        (UsageProducer::Cognition, TenantSource::Agent) => IdentityLookup::Ilk(
+            record
+                .counterpart_ilk
+                .as_deref()
+                .ok_or_else(|| missing_field("counterpart_ilk"))?,
+        ),
+        (UsageProducer::Frontdesk, TenantSource::Case) => {
+            return Ok(UsageCharge {
+                tenant_id: record.tenant_id.clone(),
+                verified: true,
+            })
+        }
+        _ => {
+            return Ok(UsageCharge {
+                tenant_id: DEFAULT_ROOT_TENANT_ID.to_string(),
+                verified: true,
+            })
+        }
+    };
+    match tenant_of(lookup) {
+        Ok(Some(tenant_id)) => Ok(UsageCharge {
+            tenant_id,
+            verified: true,
+        }),
+        Ok(None) | Err(_) if last_attempt => Ok(UsageCharge {
+            tenant_id: record.tenant_id.clone(),
+            verified: false,
+        }),
+        Ok(None) => Err(format!("identity holds no tenant for {lookup:?} yet").into()),
+        Err(err) => Err(err),
+    }
+}
+
+/// The tenant of an ILK in the motherbee's identity region, read for each record: never from a
+/// cache, so a node name that another tenant took since is never charged to the old one.
+fn identity_tenant(lookup: IdentityLookup<'_>) -> Result<Option<String>, StorageError> {
+    Ok(match lookup {
+        IdentityLookup::HandlerNode(node_name) => {
+            fluxbee_sdk::identity::find_ilk_by_handler_node_from_hive_id(
+                PRIMARY_HIVE_ID,
+                node_name,
+            )?
+            .map(|(_, ilk)| ilk.tenant_id)
+        }
+        IdentityLookup::Ilk(ilk_id) => {
+            fluxbee_sdk::identity::list_ilks_from_hive_id(PRIMARY_HIVE_ID)?
+                .ilks
+                .into_iter()
+                .find(|ilk| ilk.ilk_id == ilk_id)
+                .map(|ilk| ilk.tenant_id)
+        }
+    })
+}
+
 fn truncate_error(input: &str, max_len: usize) -> String {
     if input.len() <= max_len {
         return input.to_string();
@@ -2393,6 +3190,7 @@ async fn run_storage_metrics_loop(storage: Arc<Storage>) {
     let mut ticker = time::interval(Duration::from_secs(STORAGE_METRICS_LOG_INTERVAL_SECS));
     loop {
         ticker.tick().await;
+        report_usage_counts(&storage);
         match storage.inbox_metrics().await {
             Ok(metrics) => {
                 if metrics.pending >= STORAGE_METRICS_WARN_PENDING
@@ -2419,6 +3217,29 @@ async fn run_storage_metrics_loop(storage: Arc<Storage>) {
             }
         }
     }
+}
+
+/// One WARN line when usage records were refused, charged to another tenant than they claimed, or
+/// stored unverified since the last (§7.5); `ops.py health` counts it as `usagerej`.
+fn report_usage_counts(storage: &Storage) {
+    let counts = std::mem::take(&mut *storage.usage_counts());
+    let refused: u64 = counts.refused.values().sum();
+    if refused + counts.mismatched + counts.unverified == 0 {
+        return;
+    }
+    let reasons = counts
+        .refused
+        .iter()
+        .map(|(reason, count)| format!("{reason}={count}"))
+        .collect::<Vec<_>>()
+        .join(",");
+    tracing::warn!(
+        refused,
+        mismatched = counts.mismatched,
+        unverified = counts.unverified,
+        reasons = %reasons,
+        "sy.storage usage records refused, mismatched or unverified in the last 30 s"
+    );
 }
 
 async fn load_hive(config_dir: &Path) -> Result<HiveFile, StorageError> {
@@ -3271,6 +4092,7 @@ fn write_json_atomic(path: &Path, content: &str) -> Result<(), StorageError> {
 mod tests {
     use super::*;
     use fluxbee_sdk::stream::StreamRecord;
+    use fluxbee_sdk::{UsageKind, UsageOutcome};
 
     fn message(trace_id: &str, src: &str, text: &str) -> Value {
         serde_json::json!({
@@ -3344,7 +4166,7 @@ mod tests {
                 turn.clone(),
             )],
         };
-        let (rows, dropped) = stream_rows(&batch, "RT.gateway.stream@worker1").unwrap();
+        let (rows, dropped, _) = stream_rows(&batch, "RT.gateway.stream@worker1").unwrap();
         assert_eq!(dropped, 0);
         assert_eq!(rows.len(), 1);
         let bytes = serde_json::to_vec(&turn).unwrap();
@@ -3359,7 +4181,7 @@ mod tests {
             rows[0].source_ts,
             std::time::UNIX_EPOCH + Duration::from_millis(1_700_000_000_007)
         );
-        let (again, _) = stream_rows(&batch, "RT.gateway.stream@worker1").unwrap();
+        let (again, _, _) = stream_rows(&batch, "RT.gateway.stream@worker1").unwrap();
         assert_eq!(
             again[0].dedupe_key, rows[0].dedupe_key,
             "a resent batch lands on the same rows"
@@ -3400,7 +4222,7 @@ mod tests {
                 ),
             ],
         };
-        let (rows, dropped) = stream_rows(&batch, "RT.gateway.stream@worker1").unwrap();
+        let (rows, dropped, _) = stream_rows(&batch, "RT.gateway.stream@worker1").unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].subject, subject);
         assert!(matches!(rows[0].kind, HandlerKind::CognitionThreads));
@@ -3441,7 +4263,7 @@ mod tests {
                 ),
             ],
         };
-        let (rows, dropped) = stream_rows(&batch, stream).unwrap();
+        let (rows, dropped, _) = stream_rows(&batch, stream).unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(dropped, 3);
         let kept: Value = serde_json::from_slice(&rows[0].payload).unwrap();
@@ -3484,7 +4306,7 @@ mod tests {
                 .unwrap(),
             )],
         };
-        let (rows, dropped) =
+        let (rows, dropped, _) =
             stream_rows(&packed("SY.cognition@worker1"), "RT.gateway.stream@worker1").unwrap();
         assert_eq!(dropped, 1, "an envelope of no known entity");
         assert_eq!(
@@ -3501,7 +4323,7 @@ mod tests {
             rows[0].dedupe_key,
             message_dedupe_key(SUBJECT_STORAGE_COGNITION_CONTEXTS, &rows[0].payload)
         );
-        let (rows, dropped) =
+        let (rows, dropped, _) =
             stream_rows(&packed("AI.sales@worker1"), "RT.gateway.stream@worker1").unwrap();
         assert!(rows.is_empty());
         assert_eq!(
@@ -3582,5 +4404,481 @@ mod tests {
         assert!(MESSAGE_LOG_MIGRATION_SQL.contains(
             "CREATE INDEX IF NOT EXISTS idx_turns_stored_at ON turns (stored_at, dedupe_key)"
         ));
+    }
+
+    const TENANT: &str = "tnt:22222222-2222-4222-8222-222222222222";
+    const OTHER_TENANT: &str = "tnt:33333333-3333-4333-8333-333333333333";
+
+    fn usage_record(node_name: &str, tenant_id: &str, tenant_source: TenantSource) -> UsageRecord {
+        UsageRecord {
+            record_id: "8b6b3c1e-0000-4000-8000-000000000001".to_string(),
+            provider_response_id: Some("msg_01".to_string()),
+            ts: "2026-10-17T12:00:00.000Z".to_string(),
+            hive: node_name.rsplit_once('@').unwrap().1.to_string(),
+            node_name: node_name.to_string(),
+            node_ilk: None,
+            tenant_id: tenant_id.to_string(),
+            tenant_source,
+            counterpart_ilk: None,
+            provider: "anthropic".to_string(),
+            model: "claude-sonnet-5-5".to_string(),
+            served_model: None,
+            service_tier: None,
+            kind: UsageKind::FunctionTurn,
+            outcome: UsageOutcome::Ok,
+            uncached_input: Some(1200),
+            cache_read: Some(0),
+            cache_write: Some(0),
+            output: Some(80),
+            reasoning: None,
+            raw_usage: None,
+            trace_id: None,
+            thread_id: None,
+            work: None,
+        }
+    }
+
+    fn with_agent(mut record: UsageRecord) -> UsageRecord {
+        record.counterpart_ilk = Some("ilk:44444444-4444-4444-8444-444444444444".to_string());
+        record
+    }
+
+    #[test]
+    fn a_usage_record_fits_its_producer() {
+        let root = DEFAULT_ROOT_TENANT_ID;
+        let cases = [
+            (
+                "a tenant's node",
+                usage_record("AI.sales@worker1", TENANT, TenantSource::Node),
+                Ok(()),
+            ),
+            (
+                "a node that knows no tenant",
+                usage_record("AI.sales@worker1", root, TenantSource::FallbackRoot),
+                Ok(()),
+            ),
+            (
+                "SY.cognition, its agent's",
+                with_agent(usage_record(
+                    "SY.cognition@worker1",
+                    TENANT,
+                    TenantSource::Agent,
+                )),
+                Ok(()),
+            ),
+            (
+                "SY.cognition, an agent with no tenant",
+                usage_record("SY.cognition@worker1", root, TenantSource::FallbackRoot),
+                Ok(()),
+            ),
+            (
+                "SY.frontdesk.gov, the case's",
+                usage_record("SY.frontdesk.gov@motherbee", TENANT, TenantSource::Case),
+                Ok(()),
+            ),
+            (
+                "SY.architect",
+                usage_record("SY.architect@motherbee", root, TenantSource::Root),
+                Ok(()),
+            ),
+            (
+                "SY.admin",
+                usage_record("SY.admin@motherbee", root, TenantSource::FallbackRoot),
+                Ok(()),
+            ),
+            (
+                "another SY.* name",
+                usage_record("SY.policy@motherbee", root, TenantSource::Root),
+                Err("foreign_sy"),
+            ),
+            (
+                "SY.architect charging a tenant",
+                usage_record("SY.architect@motherbee", TENANT, TenantSource::Root),
+                Err("not_root"),
+            ),
+            (
+                "fallback_root charging a tenant",
+                usage_record("AI.sales@worker1", TENANT, TenantSource::FallbackRoot),
+                Err("not_root"),
+            ),
+            (
+                "a node claiming a case",
+                usage_record("AI.sales@worker1", TENANT, TenantSource::Case),
+                Err("wrong_source"),
+            ),
+            (
+                "a node claiming root",
+                usage_record("AI.sales@worker1", root, TenantSource::Root),
+                Err("wrong_source"),
+            ),
+            (
+                "SY.cognition as a node",
+                usage_record("SY.cognition@worker1", TENANT, TenantSource::Node),
+                Err("wrong_source"),
+            ),
+            (
+                "SY.cognition, an agent it does not name",
+                usage_record("SY.cognition@worker1", TENANT, TenantSource::Agent),
+                Err("wrong_source"),
+            ),
+            (
+                "SY.frontdesk.gov as an agent",
+                with_agent(usage_record(
+                    "SY.frontdesk.gov@motherbee",
+                    TENANT,
+                    TenantSource::Agent,
+                )),
+                Err("wrong_source"),
+            ),
+        ];
+        for (case, record, expected) in cases {
+            let payload = serde_json::to_value(&record).unwrap();
+            assert_eq!(
+                check_usage_record(&record.node_name, &payload),
+                expected,
+                "{case}"
+            );
+        }
+        let record =
+            serde_json::to_value(usage_record("AI.sales@worker1", TENANT, TenantSource::Node))
+                .unwrap();
+        assert_eq!(
+            check_usage_record("AI.other@worker1", &record),
+            Err("not_producer")
+        );
+        let refused = |field: &str, value: Value| {
+            let mut record = record.clone();
+            record[field] = value;
+            check_usage_record("AI.sales@worker1", &record)
+        };
+        assert_eq!(refused("output", json!(-1)), Err("malformed"));
+        assert_eq!(refused("output", json!(u64::MAX)), Err("malformed"));
+        assert_eq!(refused("ts", json!("yesterday")), Err("malformed"));
+        assert_eq!(refused("tenant_source", json!("cloud")), Err("malformed"));
+        assert_eq!(refused("model", json!(" ")), Err("defective"));
+        assert_eq!(
+            check_usage_record("AI.sales@worker1", &json!({"tokens": 12})),
+            Err("malformed")
+        );
+    }
+
+    #[test]
+    fn a_batch_keeps_its_usage_records_and_names_the_refused() {
+        let stream = "RT.gateway.stream@motherbee";
+        let usage = |seq: u64, producer: &str, usage: &UsageRecord| {
+            record(
+                seq,
+                SUBJECT_STORAGE_USAGE,
+                producer,
+                serde_json::to_value(usage).unwrap(),
+            )
+        };
+        let kept = usage_record("AI.sales@motherbee", TENANT, TenantSource::Node);
+        let batch = StreamBatch {
+            stream: stream.to_string(),
+            epoch: 1,
+            records: vec![
+                usage(1, "AI.sales@motherbee", &kept),
+                usage(
+                    2,
+                    "SY.policy@motherbee",
+                    &usage_record("SY.policy@motherbee", TENANT, TenantSource::Node),
+                ),
+                usage(3, "AI.other@motherbee", &kept),
+                // Another hive's node: the stream's own check, not a usage refusal.
+                usage(
+                    4,
+                    "AI.sales@worker1",
+                    &usage_record("AI.sales@worker1", TENANT, TenantSource::Node),
+                ),
+            ],
+        };
+        let (rows, dropped, refused) = stream_rows(&batch, stream).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].subject, SUBJECT_STORAGE_USAGE);
+        assert!(matches!(rows[0].kind, HandlerKind::Usage));
+        assert_eq!(
+            rows[0].payload,
+            serde_json::to_vec(&serde_json::to_value(&kept).unwrap()).unwrap()
+        );
+        assert_eq!(dropped, 3);
+        assert_eq!(refused, vec!["foreign_sy", "not_producer"]);
+    }
+
+    /// An identity that holds `answer` for `expected`, and is asked nothing else.
+    fn identity(
+        expected: IdentityLookup<'static>,
+        answer: Result<Option<&'static str>, &'static str>,
+    ) -> impl FnOnce(IdentityLookup<'_>) -> Result<Option<String>, StorageError> {
+        move |lookup| {
+            assert_eq!(lookup, expected);
+            answer
+                .map(|tenant| tenant.map(str::to_string))
+                .map_err(StorageError::from)
+        }
+    }
+
+    fn not_asked(_: IdentityLookup<'_>) -> Result<Option<String>, StorageError> {
+        panic!("identity is not asked for this tenant")
+    }
+
+    #[test]
+    fn a_usage_records_tenant_comes_from_identity_where_it_can() {
+        let charge = |tenant_id: &str, verified: bool| UsageCharge {
+            tenant_id: tenant_id.to_string(),
+            verified,
+        };
+        let node = IdentityLookup::HandlerNode("AI.sales@worker1");
+        // A tenant's node pays identity's tenant, whatever it claims: a mismatch is stored with
+        // identity's (and counted, `persist_usage`).
+        for (claimed, source) in [
+            (TENANT, TenantSource::Node),
+            (OTHER_TENANT, TenantSource::Node),
+            (DEFAULT_ROOT_TENANT_ID, TenantSource::FallbackRoot),
+        ] {
+            let record = usage_record("AI.sales@worker1", claimed, source);
+            let decided =
+                decide_usage_tenant(&record, false, identity(node, Ok(Some(TENANT)))).unwrap();
+            assert_eq!(decided, charge(TENANT, true), "{claimed}");
+        }
+        // Identity without the ILK, or unreadable: an error the inbox retries, until the last
+        // attempt keeps the claimed tenant, unverified.
+        let record = usage_record("AI.sales@worker1", OTHER_TENANT, TenantSource::Node);
+        for answer in [Ok(None), Err("identity SHM seqlock read timeout")] {
+            assert!(decide_usage_tenant(&record, false, identity(node, answer)).is_err());
+            assert_eq!(
+                decide_usage_tenant(&record, true, identity(node, answer)).unwrap(),
+                charge(OTHER_TENANT, false)
+            );
+        }
+        // SY.cognition pays its agent's tenant, by the agent's ILK.
+        let agent = with_agent(usage_record(
+            "SY.cognition@worker1",
+            OTHER_TENANT,
+            TenantSource::Agent,
+        ));
+        let agent_ilk = IdentityLookup::Ilk("ilk:44444444-4444-4444-8444-444444444444");
+        assert_eq!(
+            decide_usage_tenant(&agent, false, identity(agent_ilk, Ok(Some(TENANT)))).unwrap(),
+            charge(TENANT, true)
+        );
+        // The case's tenant as recorded; the root tenant for the rest; identity not asked.
+        for (record, tenant) in [
+            (
+                usage_record("SY.frontdesk.gov@motherbee", TENANT, TenantSource::Case),
+                TENANT,
+            ),
+            (
+                with_agent(usage_record(
+                    "SY.cognition@worker1",
+                    DEFAULT_ROOT_TENANT_ID,
+                    TenantSource::FallbackRoot,
+                )),
+                DEFAULT_ROOT_TENANT_ID,
+            ),
+            (
+                usage_record(
+                    "SY.architect@motherbee",
+                    DEFAULT_ROOT_TENANT_ID,
+                    TenantSource::Root,
+                ),
+                DEFAULT_ROOT_TENANT_ID,
+            ),
+            (
+                usage_record(
+                    "SY.admin@motherbee",
+                    DEFAULT_ROOT_TENANT_ID,
+                    TenantSource::Root,
+                ),
+                DEFAULT_ROOT_TENANT_ID,
+            ),
+        ] {
+            assert_eq!(
+                decide_usage_tenant(&record, false, not_asked).unwrap(),
+                charge(tenant, true),
+                "{}",
+                record.node_name
+            );
+        }
+        let foreign = usage_record(
+            "SY.policy@motherbee",
+            DEFAULT_ROOT_TENANT_ID,
+            TenantSource::Root,
+        );
+        assert!(decide_usage_tenant(&foreign, true, not_asked).is_err());
+    }
+
+    #[test]
+    fn a_usage_query_is_checked_before_it_runs() {
+        let plan =
+            |value: Value| plan_usage_query(&serde_json::from_value::<UsageQuery>(value).unwrap());
+        let time = |value: &str| {
+            std::time::SystemTime::from(chrono::DateTime::parse_from_rfc3339(value).unwrap())
+        };
+        let (from, to) = ("2026-07-01T00:00:00Z", "2026-10-01T00:00:00Z");
+        // Exactly one of a tenant and every tenant; a blank field is absent.
+        assert!(plan(json!({"from": from, "to": to})).is_err());
+        assert!(plan(json!({"tenant_id": " ", "from": from, "to": to})).is_err());
+        assert!(
+            plan(json!({"tenant_id": TENANT, "all_tenants": true, "from": from, "to": to}))
+                .is_err()
+        );
+        // A period of at most 92 days, `to` after `from`; records by default.
+        assert_eq!(
+            plan(json!({"all_tenants": true, "from": from, "to": to})).unwrap(),
+            UsageQueryPlan {
+                tenant_id: None,
+                mode: UsageQueryMode::Records {
+                    from: time(from),
+                    to: time(to),
+                    after: None
+                },
+                limit: USAGE_QUERY_DEFAULT_LIMIT,
+            }
+        );
+        for (from, to) in [
+            (from, "2026-10-01T00:00:01Z"),
+            (to, to),
+            (to, from),
+            (from, "2026-10-01"),
+        ] {
+            assert!(
+                plan(json!({"tenant_id": TENANT, "from": from, "to": to})).is_err(),
+                "{from} {to}"
+            );
+        }
+        assert!(plan(json!({"tenant_id": TENANT, "from": from})).is_err());
+        // Grouped: the key it is after as given. Record by record: a cursor.
+        assert_eq!(
+            plan(
+                json!({"tenant_id": TENANT, "from": from, "to": to, "group_by": "day",
+                        "after": "2026-07-02", "limit": 5000})
+            )
+            .unwrap(),
+            UsageQueryPlan {
+                tenant_id: Some(TENANT.to_string()),
+                mode: UsageQueryMode::Groups {
+                    from: time(from),
+                    to: time(to),
+                    group_by: UsageGroupBy::Day,
+                    after: Some("2026-07-02".to_string()),
+                },
+                limit: USAGE_QUERY_MAX_LIMIT,
+            }
+        );
+        let after = format!("{}|8b6b3c1e", "2026-07-02T10:00:00.000001Z");
+        let records =
+            plan(json!({"tenant_id": TENANT, "from": from, "to": to, "after": after})).unwrap();
+        assert_eq!(
+            records.mode,
+            UsageQueryMode::Records {
+                from: time(from),
+                to: time(to),
+                after: Some((time("2026-07-02T10:00:00.000001Z"), "8b6b3c1e".to_string())),
+            }
+        );
+        assert!(
+            plan(json!({"tenant_id": TENANT, "from": from, "to": to, "after": "page 2"})).is_err()
+        );
+        // A sync: `since` alone, a cursor or a bare time; no period bound.
+        assert_eq!(
+            plan(json!({"all_tenants": true, "since": "2020-01-01T00:00:00Z", "limit": 0}))
+                .unwrap(),
+            UsageQueryPlan {
+                tenant_id: None,
+                mode: UsageQueryMode::Since {
+                    stored_at: time("2020-01-01T00:00:00Z"),
+                    record_id: String::new(),
+                },
+                limit: 1,
+            }
+        );
+        for extra in [
+            json!({"from": from}),
+            json!({"to": to}),
+            json!({"group_by": "model"}),
+            json!({"after": after}),
+        ] {
+            let mut query = json!({"tenant_id": TENANT, "since": after});
+            query
+                .as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            assert!(plan(query.clone()).is_err(), "{query}");
+        }
+        assert!(plan(json!({"tenant_id": TENANT, "since": "yesterday"})).is_err());
+    }
+
+    #[test]
+    fn a_grouping_is_a_fixed_sql_expression() {
+        for (group_by, key) in [
+            (
+                UsageGroupBy::Day,
+                "to_char(date_trunc('day', ts AT TIME ZONE 'UTC'), 'YYYY-MM-DD')",
+            ),
+            (UsageGroupBy::Model, "model"),
+            (UsageGroupBy::Node, "node_name"),
+            (UsageGroupBy::Tenant, "tenant_id"),
+        ] {
+            assert_eq!(usage_group_key(group_by), key);
+            // Built from the grouping alone: the tenant, the period, the cursor and the limit are
+            // parameters.
+            let sql = usage_groups_sql(group_by);
+            assert!(
+                sql.contains(&format!("SELECT {key} AS group_key,")),
+                "{sql}"
+            );
+            for bound in [
+                "($1::text IS NULL OR tenant_id = $1)",
+                "ts >= $2 AND ts < $3",
+                "($4::text IS NULL OR group_key > $4)",
+                "LIMIT $5",
+            ] {
+                assert!(sql.contains(bound), "{bound}");
+            }
+            assert!(!sql.contains("$6"));
+        }
+    }
+
+    #[test]
+    fn a_usage_answer_is_paged_by_count_and_size() {
+        let items = |sizes: &[usize]| {
+            sizes
+                .iter()
+                .enumerate()
+                .map(|(index, size)| (format!("c{index}"), json!({"pad": "x".repeat(*size)})))
+                .collect::<Vec<_>>()
+        };
+        let (page, last, more) = page_usage(items(&[10, 10, 10]), 2);
+        assert_eq!((page.len(), last.as_deref(), more), (2, Some("c1"), true));
+        let (page, last, more) = page_usage(items(&[10, 10]), 2);
+        assert_eq!((page.len(), last.as_deref(), more), (2, Some("c1"), false));
+        // Cut by size, and always at least one.
+        let third = USAGE_QUERY_PAGE_BYTES / 3;
+        let (page, last, more) = page_usage(items(&[third, third, third]), 1000);
+        assert_eq!((page.len(), last.as_deref(), more), (2, Some("c1"), true));
+        let (page, last, more) = page_usage(items(&[2 * USAGE_QUERY_PAGE_BYTES, 10]), 1000);
+        assert_eq!((page.len(), last.as_deref(), more), (1, Some("c0"), true));
+        let (page, last, more) = page_usage(items(&[]), 10);
+        assert_eq!((page.len(), last, more), (0, None, false));
+    }
+
+    #[test]
+    fn a_usage_cursor_comes_back_as_it_went() {
+        let time = std::time::UNIX_EPOCH + Duration::from_micros(1_760_000_000_123_456);
+        let cursor = usage_cursor(time, "id|with|bars");
+        assert_eq!(cursor, "2025-10-09T08:53:20.123456Z|id|with|bars");
+        assert_eq!(
+            parse_usage_cursor(&cursor),
+            Some((time, "id|with|bars".to_string()))
+        );
+        assert_eq!(
+            parse_usage_cursor("2025-10-09T08:53:20Z"),
+            Some((
+                std::time::UNIX_EPOCH + Duration::from_secs(1_760_000_000),
+                String::new()
+            ))
+        );
+        assert_eq!(parse_usage_cursor("page 2|x"), None);
     }
 }

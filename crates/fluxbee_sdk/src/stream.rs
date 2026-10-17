@@ -74,8 +74,10 @@ pub struct StreamAck {
 
 /// A node's `STREAM_APPEND` to its own router: fire and forget, no reply. The router takes it before
 /// routing, whatever the destination, and appends it only if this node may append that subject
-/// (§2.2).
+/// (§2.2). It waits while the node's link is down: the SDK drops what was queued for a link it is
+/// reconnecting, and a record must outlive a router restart.
 pub async fn append(sender: &NodeSender, subject: &str, payload: Value) -> Result<(), NodeError> {
+    sender.wait_connected().await;
     let msg = Message {
         routing: Routing {
             src: sender.uuid().to_string(),
