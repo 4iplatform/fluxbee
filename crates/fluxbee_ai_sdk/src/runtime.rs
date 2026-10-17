@@ -27,6 +27,9 @@ pub struct RuntimeConfig {
     pub worker_pool_size: usize,
     pub retry_policy: RetryPolicy,
     pub metrics_log_interval: Duration,
+    /// The agent's own ILK, stamped as the sender of its replies (docs/router-stream-v1.md §6.2:
+    /// cognition reads who says what). None leaves a reply without `src_ilk`, never the human's.
+    pub self_ilk_id: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -46,6 +49,7 @@ impl Default for RuntimeConfig {
             worker_pool_size: 4,
             retry_policy: RetryPolicy::default(),
             metrics_log_interval: Duration::from_secs(30),
+            self_ilk_id: fluxbee_sdk::read_self_ilk_from_env(),
         }
     }
 }
@@ -403,6 +407,9 @@ async fn process_one<N: AiNode>(
 
     if let Some(mut response) = maybe_response {
         response.routing.src = writer.uuid().to_string();
+        if response.meta.src_ilk.is_none() {
+            response.meta.src_ilk = config.self_ilk_id.clone();
+        }
         execute_with_retry(
             || async {
                 timeout(config.write_timeout, writer.send(response.clone()))

@@ -87,8 +87,13 @@ pub fn build_reply_message_runtime_src_with_options(
     }
 }
 
+/// A reply goes from the agent to whoever spoke (§6.2 of docs/router-stream-v1.md): its `dst_ilk`
+/// is the incoming `src_ilk`, and its `src_ilk` is the agent's own, which the runtime stamps when it
+/// sends it. It never carries the human's as its own.
 fn build_reply_meta(meta: &Meta, options: ReplyContextOptions) -> Meta {
     let mut reply = meta.clone();
+    reply.dst_ilk = meta.src_ilk.clone();
+    reply.src_ilk = None;
     reply.thread_seq = None;
     reply.ctx = None;
     reply.ctx_seq = None;

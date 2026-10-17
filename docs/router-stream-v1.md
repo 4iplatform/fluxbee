@@ -1,8 +1,8 @@
 # Router stream — v1
 
 Status: design reviewed once (2026-10-16); stages 1a and 1b validated on 8.x (0.1.75, 0.1.76);
-stage 2 designed with the operator (2026-10-17, §6), to review; stage 3 pending. Finding A-70
-(`lab/logbook/FINDINGS.md`).
+stage 2 designed with the operator and reviewed (2026-10-17, §6), 2a built for 0.1.77; 2b and
+stage 3 pending. Finding A-70 (`lab/logbook/FINDINGS.md`).
 
 The router gets a small stream of its own. It replaces the embedded NATS broker, and carries three
 kinds of data to SY.storage:
@@ -173,9 +173,13 @@ constants; the router starts reading `hive_role` for it.
 
 | Subject | motherbee | worker | ingress, egress |
 |---|---|---|---|
-| `storage.turns` | `SY.storage@motherbee`, `SY.cognition@motherbee`, `SY.policy@motherbee` | `SY.storage@motherbee`, `SY.cognition@<hive>`, `SY.policy@<hive>` | `SY.storage@motherbee` |
+| `storage.turns` | `SY.storage@motherbee` | `SY.storage@motherbee` | `SY.storage@motherbee` |
+| `cognition.turns` (stage 2a, §6.2) | `SY.cognition@motherbee` | `SY.cognition@<hive>` | — |
 | `storage.cognition.*` | `SY.storage@motherbee` | `SY.storage@motherbee` | — |
 | `storage.usage` | `SY.storage@motherbee` | `SY.storage@motherbee` | `SY.storage@motherbee` |
+
+The table is as built in 2a: SY.cognition takes the copies its router makes of its agents'
+communications, not every turn, and SY.policy is retired (§6).
 
 Each sink has its own cursor. A slow or absent sink falls behind on its own and holds back no
 other sink.
@@ -303,13 +307,14 @@ is dropped like on a full queue.
     - `storage.cognition.*` must come from `SY.cognition@<the stream's hive>`;
     - usage records are checked as §2.14 says.
   - **Its INFO log line per system message** drops to debug for `STREAM_BATCH`.
-- **SY.cognition and SY.policy (local, `storage.turns`, best effort):**
-  - **They ack on receipt.** They process from a bounded queue in their own task, and a full queue
+- **SY.cognition (local, `cognition.turns`, best effort; §6.2 as built in 2a):**
+  - **It acks on receipt.** It processes from a bounded queue in its own task, and a full queue
     drops and counts.
-  - **They skip any seq at or below the last one they applied for that stream,** so a repeat costs
-    nothing. Today a repeat is processed again, and every pass pays the LLM again.
-  - **Cognition sends its outputs with `STREAM_APPEND`** (`storage.cognition.*`). From a worker
-    they reach the database for the first time (Q1).
+  - **It skips any record at or below the last one it accepted from that stream and epoch,** so a
+    repeat costs nothing and a stream whose seq restarted is not ignored.
+  - **It sends its outputs with `STREAM_APPEND`** (`storage.cognition.batch`). From a worker they
+    reach the database for the first time (Q1).
+  - SY.policy is retired (§6.2).
 
 ### 2.8 The SDK
 
@@ -674,12 +679,16 @@ the ledger and the logbook.
   ranking, and drops one only when SY.storage answers that the communication has no state.
 - **The rebuild over the mesh (D19).** Cognition stops reading postgres.
   - `COGNITION_STATE_GET {thread_id, agent_ilk}` to `SY.storage@motherbee`, accepted only from
-    `SY.cognition@*` as stamped by the router. It returns the communication's open entities and its
-    memories, paged by key within a frame. Scopes have no `thread_id` column: through their
+    `SY.cognition@*` as stamped by the router. It returns every row of the communication (closed
+    ones too, as the live path keeps them), paged by key within a frame. Scopes have no `thread_id` column: through their
     instances.
   - When: at start, for the communications in the shared memory, before the first turn, with
-    bounded concurrency and a timeout per call; and on the first turn of a communication it does
-    not hold (an agent that moved), with a short timeout.
+    bounded concurrency and a timeout per call, on the worker's task (the main loop keeps acking
+    the streams meanwhile); on the first turn of a communication it does not hold (an agent that
+    moved here); and before the next turn of one held but idle for 5 minutes (its agent may have
+    moved away and back), whose stored state wins when it is further along.
+  - A communication SY.storage has no state for yet stays in the region as it was: its last
+    envelopes may still be on their way.
   - Workers rebuild like the motherbee.
   - The `cognition_*` tables are emptied once (marker `cognition_reset_v1`).
 - **Replies between ILKs.** The AI SDK's reply carries `src_ilk` = the agent's own ILK
@@ -764,3 +773,11 @@ One HIGH, seven MEDIUM and six LOW, all folded in above:
   - the orchestrator's database wait over the mesh ran before its join → an ephemeral connection.
 - **LOW:** NATS turns piling up between 2a and 2b; the state query's caller check and paging;
   per-destination copies and packages; replies without an ILK; the SDK re-exports; the gates.
+
+### 6.7 Code review of 2a (one round, 2026-10-17)
+
+No HIGH. One MEDIUM: a communication held while its agent moved away and back went stale →
+the idle refetch above. LOW, all fixed: the agent node set right after a fetch; the reload keeps
+what SY.storage has no state for yet and runs off the main loop; no memory region read for a
+message without a thread; the hive.yaml edit written atomically; scopes guarded by the turn too;
+SY.frontdesk.gov's replies carry its own ILK; stale comments and doc passages.

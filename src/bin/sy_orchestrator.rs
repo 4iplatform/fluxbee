@@ -850,7 +850,9 @@ async fn main() -> Result<(), OrchestratorError> {
     let blob_runtime = blob_runtime_from_hive(&hive);
     let dist_runtime = dist_runtime_from_hive(&hive);
     let storage_path = storage_path_from_hive(&hive);
-    let system_nodes = system_nodes_for_role(&hive, role)?;
+    // A retired node runs nowhere, even while this hive's hive.yaml still names it.
+    retire_system_nodes(&config_dir, role);
+    let system_nodes = without_retired_nodes(system_nodes_for_role(&hive, role)?);
     let ai = hive
         .ai
         .as_ref()
@@ -5083,6 +5085,111 @@ fn dist_runtime_from_hive(hive: &HiveFile) -> DistRuntimeConfig {
 fn load_hive(config_dir: &Path) -> Result<HiveFile, OrchestratorError> {
     let data = fs::read_to_string(config_dir.join("hive.yaml"))?;
     Ok(serde_yaml::from_str(&data)?)
+}
+
+/// System nodes that no longer run, with their units (A-70 stage 2a, docs/router-stream-v1.md
+/// §6.2): SY.policy only counted turns. Their binaries and units stay one more release: a hive
+/// whose orchestrator is still the old one rejects a core manifest without a component its
+/// hive.yaml lists, so the motherbee's templates keep naming them until stage 2b.
+const RETIRED_SYSTEM_NODES: &[(&str, &str)] = &[("SY.policy", "sy-policy")];
+
+fn without_retired_nodes(mut section: RoleSystemNodes) -> RoleSystemNodes {
+    let retired = |name: &String| RETIRED_SYSTEM_NODES.iter().any(|(node, _)| node == name);
+    section.nodes.retain(|name| !retired(name));
+    section.wait_for.retain(|name| !retired(name));
+    section
+}
+
+/// At boot, before the node list is read: each retired node's unit is stopped and disabled, and
+/// the node leaves this hive's own role section of hive.yaml (`nodes` and `wait_for`), once and
+/// logged. The file is edited by lines, so its comments stay; the other roles' sections, the
+/// motherbee's templates for the spokes, are left alone. Best effort: a failure is logged and the
+/// boot goes on (`without_retired_nodes` keeps the node from starting anyway).
+fn retire_system_nodes(config_dir: &Path, role: HiveRole) {
+    let path = config_dir.join("hive.yaml");
+    let retired: Vec<&str> = RETIRED_SYSTEM_NODES.iter().map(|(node, _)| *node).collect();
+    match fs::read_to_string(&path) {
+        Ok(text) => {
+            let (edited, removed) = drop_retired_from_role_section(&text, role.as_str(), &retired);
+            if !removed.is_empty() {
+                match write_file_atomic(&path, edited.as_bytes()) {
+                    Ok(()) => tracing::info!(
+                        role = role.as_str(),
+                        removed = ?removed,
+                        "retired system nodes left this hive's node list in hive.yaml"
+                    ),
+                    Err(err) => {
+                        tracing::warn!(error = %err, "could not rewrite hive.yaml to drop retired system nodes")
+                    }
+                }
+            }
+        }
+        Err(err) => {
+            tracing::warn!(error = %err, "could not read hive.yaml to drop retired system nodes")
+        }
+    }
+    for (node, service) in RETIRED_SYSTEM_NODES {
+        let is = |what: &str| {
+            Command::new("systemctl")
+                .args([what, "--quiet", service])
+                .status()
+                .is_ok_and(|status| status.success())
+        };
+        if !is("is-active") && !is("is-enabled") {
+            continue;
+        }
+        let _ = Command::new("systemctl")
+            .args(["disable", "--now", service])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+        tracing::info!(node, service, "retired system node stopped and disabled");
+    }
+}
+
+/// hive.yaml without the retired nodes in `system_nodes.<role>`, by lines; and what it removed.
+fn drop_retired_from_role_section(
+    text: &str,
+    role: &str,
+    retired: &[&str],
+) -> (String, Vec<String>) {
+    let role_key = format!("{role}:");
+    let mut out = Vec::new();
+    let mut removed = Vec::new();
+    let mut system_nodes_indent: Option<usize> = None;
+    let mut role_indent: Option<usize> = None;
+    for line in text.lines() {
+        let trimmed = line.trim_start();
+        let indent = line.len() - trimmed.len();
+        if !trimmed.is_empty() && !trimmed.starts_with('#') {
+            if role_indent.is_some_and(|role_indent| indent <= role_indent) {
+                role_indent = None;
+            }
+            if system_nodes_indent.is_some_and(|nodes_indent| indent <= nodes_indent) {
+                system_nodes_indent = None;
+            }
+            if trimmed.starts_with("system_nodes:") {
+                system_nodes_indent = Some(indent);
+            } else if system_nodes_indent.is_some() && role_indent.is_none() && trimmed == role_key
+            {
+                role_indent = Some(indent);
+            } else if role_indent.is_some() {
+                if let Some(item) = trimmed.strip_prefix("- ") {
+                    let item = item.trim().trim_matches(|c| c == '"' || c == '\'');
+                    if retired.contains(&item) {
+                        removed.push(item.to_string());
+                        continue;
+                    }
+                }
+            }
+        }
+        out.push(line);
+    }
+    let mut edited = out.join("\n");
+    if text.ends_with('\n') {
+        edited.push('\n');
+    }
+    (edited, removed)
 }
 
 fn system_nodes_for_role(
@@ -26954,6 +27061,48 @@ fn is_ingress_role(role: Option<&str>) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A-70 stage 2a: SY.policy leaves this hive's own role section, by lines, comments kept; the
+    /// other roles' sections (the motherbee's templates for the spokes) keep it until stage 2b.
+    #[test]
+    fn a_retired_node_leaves_only_this_hives_own_section() {
+        let text = r#"hive_id: worker1
+system_nodes:
+  motherbee:
+    nodes:
+      - SY.config.routes
+      - SY.policy
+  worker:
+    # the worker's own nodes
+    nodes:
+      - SY.config.routes
+      - "SY.policy"
+      - SY.cognition
+    wait_for:
+      - SY.policy
+wan:
+  gateway_name: RT.gateway
+"#;
+        let (edited, removed) = drop_retired_from_role_section(text, "worker", &["SY.policy"]);
+        assert_eq!(
+            removed,
+            vec!["SY.policy".to_string(), "SY.policy".to_string()]
+        );
+        assert!(edited
+            .contains("  motherbee:\n    nodes:\n      - SY.config.routes\n      - SY.policy\n"));
+        assert!(edited.contains("    # the worker's own nodes\n"));
+        assert!(edited.contains("      - SY.config.routes\n      - SY.cognition\n    wait_for:\n"));
+        assert!(edited.ends_with("gateway_name: RT.gateway\n"));
+        let (again, removed) = drop_retired_from_role_section(&edited, "worker", &["SY.policy"]);
+        assert!(removed.is_empty());
+        assert_eq!(again, edited);
+        let section = without_retired_nodes(RoleSystemNodes {
+            nodes: vec!["SY.config.routes".to_string(), "SY.policy".to_string()],
+            wait_for: vec!["SY.policy".to_string()],
+        });
+        assert_eq!(section.nodes, vec!["SY.config.routes".to_string()]);
+        assert!(section.wait_for.is_empty());
+    }
 
     #[test]
     fn teardown_deletes_each_secret_in_its_own_tenant() {

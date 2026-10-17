@@ -375,9 +375,16 @@ pub struct MemoryShmSnapshot {
     pub threads: Vec<MemoryShmThreadEntry>,
 }
 
+/// One communication's memory package (docs/router-stream-v1.md §6.2): the communication is
+/// `(thread_id, agent_ilk)`; `agent_node` is where its router delivers, the key the router looks it
+/// up by. An entry written before 0.1.77 has neither and matches no delivery.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MemoryShmThreadEntry {
     pub thread_id: String,
+    #[serde(default)]
+    pub agent_ilk: String,
+    #[serde(default)]
+    pub agent_node: String,
     pub package: MemoryPackage,
 }
 
@@ -3925,6 +3932,8 @@ mod tests {
             updated_at: 123,
             threads: vec![MemoryShmThreadEntry {
                 thread_id: "thread:sha256:test".to_string(),
+                agent_ilk: "ilk:agent".to_string(),
+                agent_node: "AI.test@sandbox".to_string(),
                 package: MemoryPackage {
                     package_version: 2,
                     thread_id: "thread:sha256:test".to_string(),

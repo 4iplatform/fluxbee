@@ -4038,6 +4038,8 @@ async fn run_one_config(
             max_backoff: Duration::from_millis(cfg.runtime.retry_max_backoff_ms),
         },
         metrics_log_interval: Duration::from_millis(cfg.runtime.metrics_log_interval_ms),
+        // The agent's ILK is the sender of its replies (docs/router-stream-v1.md §6.2).
+        self_ilk_id: fluxbee_sdk::read_self_ilk_from_env(),
     };
 
     tracing::info!(

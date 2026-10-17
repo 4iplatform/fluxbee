@@ -16,10 +16,7 @@ use tokio::time::{self, Duration};
 use uuid::Uuid;
 
 use crate::config::RouterConfig;
-use crate::nats::{
-    check_endpoint as nats_check_endpoint, start_embedded_broker_with_storage, NatsPublisher,
-    SUBJECT_STORAGE_TURNS,
-};
+use crate::nats::{check_endpoint as nats_check_endpoint, start_embedded_broker_with_storage};
 use crate::opa::OpaResolver;
 use crate::shm::{
     copy_bytes_with_len, memory_shm_name_for_hive, now_epoch_ms, sha256_bytes_is_zero,
@@ -33,11 +30,11 @@ use crate::shm::{
 use fluxbee_sdk::protocol::{
     build_announce, build_lsa, build_router_hello, build_ttl_exceeded, build_unreachable,
     build_wan_accept, build_wan_hello, build_wan_reachability, build_wan_reject, Destination,
-    LsaNode, LsaPayload, LsaRoute, LsaTap, LsaVpn, Message, Meta, NodeAnnouncePayload,
-    NodeHelloPayload, OpaReloadPayload, RouterHelloPayload, WanAcceptPayload, WanHelloPayload,
-    WanNegotiated, WanReachabilityEntry, WanReachabilityPayload, WanRejectPayload, WanTimers,
-    MESH_PROTOCOL_VERSION, MSG_EDGE_CLOSE_URL, MSG_EDGE_CLOSE_URL_RESPONSE, MSG_EDGE_LIST_URLS,
-    MSG_EDGE_LIST_URLS_RESPONSE, MSG_EDGE_OPEN_URL, MSG_EDGE_OPEN_URL_RESPONSE,
+    LsaNode, LsaPayload, LsaRoute, LsaTap, LsaVpn, MemoryPackage, Message, Meta,
+    NodeAnnouncePayload, NodeHelloPayload, OpaReloadPayload, RouterHelloPayload, WanAcceptPayload,
+    WanHelloPayload, WanNegotiated, WanReachabilityEntry, WanReachabilityPayload, WanRejectPayload,
+    WanTimers, MESH_PROTOCOL_VERSION, MSG_EDGE_CLOSE_URL, MSG_EDGE_CLOSE_URL_RESPONSE,
+    MSG_EDGE_LIST_URLS, MSG_EDGE_LIST_URLS_RESPONSE, MSG_EDGE_OPEN_URL, MSG_EDGE_OPEN_URL_RESPONSE,
     MSG_EDGE_PUBLISH_BLOB, MSG_EDGE_PUBLISH_BLOB_RESPONSE, MSG_EDGE_UNPUBLISH_BLOB,
     MSG_EDGE_UNPUBLISH_BLOB_RESPONSE, MSG_HELLO, MSG_LSA, MSG_OPA_RELOAD, MSG_TTL_EXCEEDED,
     MSG_UNREACHABLE, MSG_WAN_REACHABILITY, MSG_WITHDRAW, SCOPE_GLOBAL, SYSTEM_KIND,
@@ -85,9 +82,6 @@ pub struct Router {
     /// hub's `MSG_WAN_REACHABILITY` advertisements. Kept separate from `lsa_state`/the LSA snapshot.
     reachability: Arc<Mutex<std::collections::HashMap<Uuid, ReachabilityEntry>>>,
     lsa_seq: Arc<Mutex<u64>>,
-    thread_sequences: Arc<Mutex<HashMap<String, u64>>>,
-    nats_publisher: Option<Arc<NatsPublisher>>,
-    nats_publish_errors: Arc<AtomicU64>,
     /// This router's stream (docs/router-stream-v1.md, A-70): the turn copies and the nodes'
     /// appends go here, for SY.storage.
     stream: stream::StreamHandle,
@@ -98,7 +92,6 @@ pub struct Router {
 const NATS_READY_TIMEOUT_SECS: u64 = 20;
 const NATS_READY_RETRY_MS: u64 = 250;
 const NATS_EMBEDDED_RECOVERY_INTERVAL_SECS: u64 = 5;
-const NATS_PUBLISH_ERROR_LOG_EVERY: u64 = 25;
 const LSA_REJECT_HIVE_MISMATCH: &str = "hive_mismatch";
 const LSA_REJECT_STALE_SEQ: &str = "stale_seq";
 const LSA_REJECT_PARSE_ERROR: &str = "parse_error";
@@ -138,15 +131,6 @@ impl Router {
             Ok(name) => MemoryRegionReader::open_read_only(&name).ok(),
             Err(_) => None,
         };
-        // Turns still go to the local NATS where SY.cognition and SY.policy read them (the motherbee
-        // and the workers) until stage 2; nothing reads them on the ingress or the egress, whose
-        // brokers only piled them up (A-70). SY.storage takes them from the stream.
-        let nats_publisher = turns_go_to_nats(&cfg.hive_role).then(|| {
-            Arc::new(NatsPublisher::new(
-                cfg.nats_url.clone(),
-                SUBJECT_STORAGE_TURNS.to_string(),
-            ))
-        });
         let (stream, stream_runtime) = stream::open(
             &cfg.router_l2_name,
             &cfg.hive_id,
@@ -179,9 +163,6 @@ impl Router {
             lsa_state: Arc::new(Mutex::new(std::collections::HashMap::new())),
             reachability: Arc::new(Mutex::new(std::collections::HashMap::new())),
             lsa_seq: Arc::new(Mutex::new(0)),
-            thread_sequences: Arc::new(Mutex::new(HashMap::new())),
-            nats_publisher,
-            nats_publish_errors: Arc::new(AtomicU64::new(0)),
             stream,
             stream_runtime: std::sync::Mutex::new(Some(stream_runtime)),
         }
@@ -311,7 +292,7 @@ impl Router {
         let identity_frontdesk_node_name = self.cfg.identity_frontdesk_node_name.clone();
         let is_gateway = self.cfg.is_gateway;
         let peer_socket_dir = self.cfg.node_socket_dir.clone();
-        let thread_sequences_pd = Arc::clone(&self.thread_sequences);
+        let log_stream_pd = self.stream.clone();
         let memory_reader_pd = Arc::clone(&self.memory_reader);
         tokio::spawn(async move {
             peer_discovery_loop(
@@ -335,7 +316,7 @@ impl Router {
                 lsa_snapshot_pd,
                 reachability_pd,
                 fib_pd,
-                thread_sequences_pd,
+                log_stream_pd,
                 is_gateway,
             )
             .await;
@@ -379,7 +360,7 @@ impl Router {
         let wan_peers = Arc::clone(&self.wan_peers);
         let lsa_snapshot = Arc::clone(&self.lsa_snapshot);
         let reachability = Arc::clone(&self.reachability);
-        let thread_sequences = Arc::clone(&self.thread_sequences);
+        let log_stream = self.stream.clone();
         let is_gateway = self.cfg.is_gateway;
         let router_uuid = self.cfg.router_uuid;
         tokio::spawn(async move {
@@ -407,7 +388,7 @@ impl Router {
                 let lsa_reader = Arc::clone(&lsa_reader);
                 let lsa_snapshot = Arc::clone(&lsa_snapshot);
                 let reachability = Arc::clone(&reachability);
-                let thread_sequences = Arc::clone(&thread_sequences);
+                let log_stream = log_stream.clone();
                 let is_gateway = is_gateway;
                 tokio::spawn(async move {
                     if let Err(err) = handle_peer_incoming(
@@ -429,7 +410,7 @@ impl Router {
                         wan_peers,
                         lsa_snapshot,
                         reachability,
-                        thread_sequences,
+                        log_stream,
                         is_gateway,
                     )
                     .await
@@ -519,7 +500,7 @@ impl Router {
                 fib: Arc::clone(&self.fib),
                 broadcast_cache: Arc::clone(&self.broadcast_cache),
                 lsa_seq: Arc::clone(&self.lsa_seq),
-                thread_sequences: Arc::clone(&self.thread_sequences),
+                log_stream: self.stream.clone(),
                 memory_reader: Arc::clone(&self.memory_reader),
                 opa: Arc::clone(&self.opa),
                 wan_session_epochs: Arc::new(Mutex::new(std::collections::HashMap::new())),
@@ -574,10 +555,7 @@ impl Router {
             let opa_reader = Arc::clone(&self.opa_reader);
             let broadcast_cache = Arc::clone(&self.broadcast_cache);
             let lsa_seq = Arc::clone(&self.lsa_seq);
-            let thread_sequences = Arc::clone(&self.thread_sequences);
             let memory_reader = Arc::clone(&self.memory_reader);
-            let nats_publisher = self.nats_publisher.clone();
-            let nats_publish_errors = Arc::clone(&self.nats_publish_errors);
             let log_stream = self.stream.clone();
             let is_gateway = self.cfg.is_gateway;
             let identity_frontdesk_node_name = self.cfg.identity_frontdesk_node_name.clone();
@@ -604,9 +582,6 @@ impl Router {
                     broadcast_cache,
                     lsa_seq,
                     memory_reader,
-                    thread_sequences,
-                    nats_publisher,
-                    nats_publish_errors,
                     log_stream,
                     router_uuid,
                     &router_name,
@@ -645,9 +620,6 @@ async fn handle_node(
     broadcast_cache: Arc<Mutex<BroadcastCache>>,
     lsa_seq: Arc<Mutex<u64>>,
     memory_reader: Arc<Mutex<Option<MemoryRegionReader>>>,
-    thread_sequences: Arc<Mutex<HashMap<String, u64>>>,
-    nats_publisher: Option<Arc<NatsPublisher>>,
-    nats_publish_errors: Arc<AtomicU64>,
     log_stream: stream::StreamHandle,
     router_uuid: Uuid,
     router_name: &str,
@@ -849,7 +821,7 @@ async fn handle_node(
         };
         {
             let frame = frame;
-            if let Ok(mut msg) = serde_json::from_slice::<Message>(&frame) {
+            if let Ok(msg) = serde_json::from_slice::<Message>(&frame) {
                 if !frame_is_from_connection(&msg, node_uuid) {
                     tracing::warn!(
                         node = %conn_node_name,
@@ -859,14 +831,13 @@ async fn handle_node(
                     continue;
                 }
                 // A node's append to this router's stream: the router consumes it and routes it
-                // to no node. Before the thread sequence, so it never takes a conversation's seq.
+                // to no node.
                 if is_system_kind(&msg.meta.msg_type)
                     && msg.meta.msg.as_deref() == Some(fluxbee_sdk::stream::MSG_STREAM_APPEND)
                 {
                     take_stream_append(&log_stream, &msg, &conn_node_name, hive_id);
                     continue;
                 }
-                assign_thread_seq_if_missing(&mut msg, &thread_sequences).await;
                 tracing::info!(
                     src = %msg.routing.src,
                     dst = ?msg.routing.dst,
@@ -874,10 +845,16 @@ async fn handle_node(
                     msg = ?msg.meta.msg,
                     "message received"
                 );
-                maybe_publish_turn(&nats_publisher, &nats_publish_errors, &msg);
                 if should_publish_turn(&msg) {
                     if let Some(copy) = turn_copy(&msg, &conn_node_name) {
                         log_stream.append_turn(&conn_node_name, copy);
+                    }
+                }
+                // A local agent's send, for its cognition (§6.2): what it receives is copied at
+                // delivery.
+                if is_agent_node(&conn_node_name) && is_communication_turn(&msg) {
+                    if let Some(copy) = cognition_copy(&msg, &conn_node_name) {
+                        log_stream.append_cognition_turn(&conn_node_name, copy);
                     }
                 }
                 if is_system_kind(&msg.meta.msg_type) {
@@ -947,7 +924,7 @@ async fn handle_node(
                     &opa,
                     &broadcast_cache,
                     &memory_reader,
-                    &thread_sequences,
+                    &log_stream,
                     &hive_id,
                     identity_frontdesk_node_name,
                     router_uuid,
@@ -1067,7 +1044,7 @@ async fn handle_message(
     opa: &Arc<Mutex<OpaResolver>>,
     broadcast_cache: &Arc<Mutex<BroadcastCache>>,
     memory_reader: &Arc<Mutex<Option<MemoryRegionReader>>>,
-    thread_sequences: &Arc<Mutex<HashMap<String, u64>>>,
+    log_stream: &stream::StreamHandle,
     hive_id: &str,
     identity_frontdesk_node_name: &str,
     router_uuid: Uuid,
@@ -1077,12 +1054,11 @@ async fn handle_message(
     snapshot: Option<&ConfigSnapshot>,
 ) -> Result<(), RouterError> {
     let mut msg = msg.clone();
-    assign_thread_seq_if_missing(&mut msg, thread_sequences).await;
     let src_uuid = match Uuid::parse_str(&msg.routing.src) {
         Ok(uuid) => uuid,
         Err(_) => return Ok(()),
     };
-    let mut senders: Vec<mpsc::UnboundedSender<Vec<u8>>> = Vec::new();
+    let mut senders: Vec<LocalDelivery> = Vec::new();
     let src_handle = {
         let nodes_guard = nodes.lock().await;
         nodes_guard.get(&src_uuid).cloned()
@@ -1115,7 +1091,7 @@ async fn handle_message(
                         &dst_handle.name,
                         dst_handle.vpn_id,
                     ) {
-                        senders.push(dst_handle.sender);
+                        senders.push(LocalDelivery::to(&dst_handle.name, dst_handle.sender));
                     } else {
                         send_unreachable_to(&msg, &src_handle.sender, router_uuid, "VPN_BLOCKED")?;
                     }
@@ -1217,7 +1193,10 @@ async fn handle_message(
                                 &dst_handle.name,
                                 dst_handle.vpn_id,
                             ) {
-                                senders.push(dst_handle.sender.clone());
+                                senders.push(LocalDelivery::to(
+                                    &dst_handle.name,
+                                    dst_handle.sender.clone(),
+                                ));
                             } else {
                                 send_unreachable_to(
                                     &msg,
@@ -1327,7 +1306,7 @@ async fn handle_message(
                     trace_id = %msg.routing.trace_id,
                     "router enqueueing broadcast for delivery"
                 );
-                senders.push(handle.sender.clone());
+                senders.push(LocalDelivery::to(&handle.name, handle.sender.clone()));
             }
             tracing::info!(
                 src = %src_handle.name,
@@ -1392,7 +1371,10 @@ async fn handle_message(
                             &dst_handle.name,
                             dst_handle.vpn_id,
                         ) {
-                            senders.push(dst_handle.sender.clone());
+                            senders.push(LocalDelivery::to(
+                                &dst_handle.name,
+                                dst_handle.sender.clone(),
+                            ));
                         } else {
                             send_unreachable_to(
                                 &msg,
@@ -1437,15 +1419,7 @@ async fn handle_message(
         }
     }
 
-    if !senders.is_empty() {
-        if let Some(data) =
-            serialize_for_local_delivery(memory_reader, hive_id, &msg, false).await?
-        {
-            for sender in senders {
-                let _ = sender.send(data.clone());
-            }
-        }
-    }
+    deliver_locally(senders, &msg, memory_reader, hive_id, false, log_stream).await?;
 
     // ROUTER-TAP-3: tap fanout. After primary unicast delivery is done,
     // scan installed taps and enqueue fire-and-forget secondary copies to
@@ -1666,8 +1640,14 @@ async fn fanout_taps_for_unicast(
                     );
                     continue;
                 }
-                let data = match serialize_for_local_delivery(memory_reader, hive_id, &copy, false)
-                    .await
+                let data = match serialize_for_local_delivery(
+                    memory_reader,
+                    hive_id,
+                    &copy,
+                    false,
+                    &target_handle.name,
+                )
+                .await
                 {
                     Ok(Some(data)) => data,
                     Ok(None) => continue, // suppressed: protected SYSTEM from unauthorized origin
@@ -1731,30 +1711,6 @@ async fn fanout_taps_for_unicast(
             }
         }
     }
-}
-
-async fn assign_thread_seq_if_missing(
-    msg: &mut Message,
-    thread_sequences: &Arc<Mutex<HashMap<String, u64>>>,
-) {
-    let Some(thread_id) = canonical_thread_id_from_meta(&msg.meta) else {
-        return;
-    };
-
-    if msg.meta.thread_id.is_none() {
-        msg.meta.thread_id = Some(thread_id.clone());
-    }
-    if msg.meta.thread_seq.is_some() {
-        return;
-    }
-
-    let next_seq = {
-        let mut guard = thread_sequences.lock().await;
-        let entry = guard.entry(thread_id).or_insert(0);
-        *entry = entry.saturating_add(1);
-        *entry
-    };
-    msg.meta.thread_seq = Some(next_seq);
 }
 
 fn canonical_thread_id_from_meta(meta: &Meta) -> Option<String> {
@@ -3058,8 +3014,7 @@ async fn handle_wan_message(
     peer_router_name: &str,
     session_epoch: u64,
 ) -> Result<(), RouterError> {
-    let mut msg = msg.clone();
-    assign_thread_seq_if_missing(&mut msg, &ctx.thread_sequences).await;
+    let msg = msg.clone();
     if is_system_kind(&msg.meta.msg_type) {
         if msg.meta.msg.as_deref() == Some(MSG_LSA) {
             let payload: LsaPayload = match serde_json::from_value(msg.payload.clone()) {
@@ -3196,7 +3151,7 @@ async fn handle_wan_message(
         return Ok(());
     }
 
-    let mut senders: Vec<mpsc::UnboundedSender<Vec<u8>>> = Vec::new();
+    let mut senders: Vec<LocalDelivery> = Vec::new();
     match &msg.routing.dst {
         Destination::Unicast(dst) => {
             if let Ok(dst_uuid) = Uuid::parse_str(dst) {
@@ -3212,7 +3167,7 @@ async fn handle_wan_message(
                         &dst_handle.name,
                         dst_handle.vpn_id,
                     ) {
-                        senders.push(dst_handle.sender);
+                        senders.push(LocalDelivery::to(&dst_handle.name, dst_handle.sender));
                     } else {
                         send_unreachable_to(&msg, sender, ctx.router_uuid, "VPN_BLOCKED")?;
                     }
@@ -3305,7 +3260,10 @@ async fn handle_wan_message(
                                 &dst_handle.name,
                                 dst_handle.vpn_id,
                             ) {
-                                senders.push(dst_handle.sender.clone());
+                                senders.push(LocalDelivery::to(
+                                    &dst_handle.name,
+                                    dst_handle.sender.clone(),
+                                ));
                             } else {
                                 send_unreachable_to(&msg, sender, ctx.router_uuid, "VPN_BLOCKED")?;
                             }
@@ -3370,7 +3328,7 @@ async fn handle_wan_message(
                         continue;
                     }
                 }
-                senders.push(handle.sender.clone());
+                senders.push(LocalDelivery::to(&handle.name, handle.sender.clone()));
             }
             if msg.routing.ttl >= 2 {
                 broadcast_to_peers(&ctx.peers, &msg).await?;
@@ -3427,7 +3385,10 @@ async fn handle_wan_message(
                             &dst_handle.name,
                             dst_handle.vpn_id,
                         ) {
-                            senders.push(dst_handle.sender.clone());
+                            senders.push(LocalDelivery::to(
+                                &dst_handle.name,
+                                dst_handle.sender.clone(),
+                            ));
                         } else {
                             send_unreachable_to(&msg, sender, ctx.router_uuid, "VPN_BLOCKED")?;
                         }
@@ -3462,16 +3423,15 @@ async fn handle_wan_message(
         }
     }
 
-    if !senders.is_empty() {
-        if let Some(data) =
-            serialize_for_local_delivery(&ctx.memory_reader, &ctx.hive_id, &msg, src_via_hub)
-                .await?
-        {
-            for sender in senders {
-                let _ = sender.send(data.clone());
-            }
-        }
-    }
+    deliver_locally(
+        senders,
+        &msg,
+        &ctx.memory_reader,
+        &ctx.hive_id,
+        src_via_hub,
+        &ctx.log_stream,
+    )
+    .await?;
     Ok(())
 }
 
@@ -3501,7 +3461,7 @@ async fn peer_discovery_loop(
     lsa_snapshot: Arc<Mutex<Option<LsaSnapshot>>>,
     reachability: Arc<Mutex<std::collections::HashMap<Uuid, ReachabilityEntry>>>,
     fib: Arc<Mutex<Vec<FibEntry>>>,
-    thread_sequences: Arc<Mutex<HashMap<String, u64>>>,
+    log_stream: stream::StreamHandle,
     is_gateway: bool,
 ) {
     let mut ticker = time::interval(Duration::from_secs(5));
@@ -3565,7 +3525,7 @@ async fn peer_discovery_loop(
                     let self_shm_name = self_shm_name.to_string();
                     let lsa_snapshot = Arc::clone(&lsa_snapshot);
                     let reachability = Arc::clone(&reachability);
-                    let thread_sequences = Arc::clone(&thread_sequences);
+                    let log_stream = log_stream.clone();
                     let is_gateway = is_gateway;
                     let socket_dir = socket_dir.clone();
                     let identity_frontdesk_node_name = identity_frontdesk_node_name.to_string();
@@ -3592,7 +3552,7 @@ async fn peer_discovery_loop(
                             lsa_snapshot,
                             reachability,
                             fib,
-                            thread_sequences,
+                            log_stream,
                             is_gateway,
                         )
                         .await;
@@ -3691,7 +3651,7 @@ async fn connect_to_peer(
     lsa_snapshot: Arc<Mutex<Option<LsaSnapshot>>>,
     reachability: Arc<Mutex<std::collections::HashMap<Uuid, ReachabilityEntry>>>,
     fib: Arc<Mutex<Vec<FibEntry>>>,
-    thread_sequences: Arc<Mutex<HashMap<String, u64>>>,
+    log_stream: stream::StreamHandle,
     is_gateway: bool,
 ) -> Result<(), RouterError> {
     let socket_path = peer_socket_path(socket_dir, peer_uuid);
@@ -3745,7 +3705,7 @@ async fn connect_to_peer(
                         is_gateway,
                         &lsa_snapshot,
                         &reachability,
-                        &thread_sequences,
+                        &log_stream,
                     )
                     .await?;
                 }
@@ -3780,7 +3740,7 @@ async fn handle_peer_incoming(
     wan_peers: Arc<Mutex<std::collections::HashMap<String, WanPeer>>>,
     lsa_snapshot: Arc<Mutex<Option<LsaSnapshot>>>,
     reachability: Arc<Mutex<std::collections::HashMap<Uuid, ReachabilityEntry>>>,
-    thread_sequences: Arc<Mutex<HashMap<String, u64>>>,
+    log_stream: stream::StreamHandle,
     is_gateway: bool,
 ) -> Result<(), RouterError> {
     let (mut reader, writer) = stream.into_split();
@@ -3832,7 +3792,7 @@ async fn handle_peer_incoming(
                         is_gateway,
                         &lsa_snapshot,
                         &reachability,
-                        &thread_sequences,
+                        &log_stream,
                     )
                     .await?;
                 }
@@ -3987,10 +3947,9 @@ async fn handle_peer_message(
     is_gateway: bool,
     lsa_snapshot: &Arc<Mutex<Option<LsaSnapshot>>>,
     reachability: &Arc<Mutex<std::collections::HashMap<Uuid, ReachabilityEntry>>>,
-    thread_sequences: &Arc<Mutex<HashMap<String, u64>>>,
+    log_stream: &stream::StreamHandle,
 ) -> Result<(), RouterError> {
     let mut msg = msg.clone();
-    assign_thread_seq_if_missing(&mut msg, thread_sequences).await;
     let src_uuid = match Uuid::parse_str(&msg.routing.src) {
         Ok(uuid) => uuid,
         Err(_) => return Ok(()),
@@ -4090,7 +4049,7 @@ async fn handle_peer_message(
         reachability,
     )
     .await;
-    let mut senders: Vec<mpsc::UnboundedSender<Vec<u8>>> = Vec::new();
+    let mut senders: Vec<LocalDelivery> = Vec::new();
     if msg.routing.ttl == 0 {
         if let Some(peer) = peers.lock().await.get(peer_uuid).cloned() {
             send_ttl_exceeded_to(&msg, &peer.sender, router_uuid)?;
@@ -4113,7 +4072,7 @@ async fn handle_peer_message(
                         &dst_handle.name,
                         dst_handle.vpn_id,
                     ) {
-                        senders.push(dst_handle.sender);
+                        senders.push(LocalDelivery::to(&dst_handle.name, dst_handle.sender));
                     } else if let Some(peer) = peers.lock().await.get(peer_uuid).cloned() {
                         send_unreachable_to(&msg, &peer.sender, router_uuid, "VPN_BLOCKED")?;
                     }
@@ -4185,7 +4144,10 @@ async fn handle_peer_message(
                                 &dst_handle.name,
                                 dst_handle.vpn_id,
                             ) {
-                                senders.push(dst_handle.sender.clone());
+                                senders.push(LocalDelivery::to(
+                                    &dst_handle.name,
+                                    dst_handle.sender.clone(),
+                                ));
                             } else if let Some(peer) = peers.lock().await.get(peer_uuid).cloned() {
                                 send_unreachable_to(
                                     &msg,
@@ -4256,7 +4218,7 @@ async fn handle_peer_message(
                         continue;
                     }
                 }
-                senders.push(handle.sender.clone());
+                senders.push(LocalDelivery::to(&handle.name, handle.sender.clone()));
             }
             if msg.routing.ttl >= 3 {
                 if let Some(peer) = peers.lock().await.get(peer_uuid).cloned() {
@@ -4327,7 +4289,10 @@ async fn handle_peer_message(
                             &dst_handle.name,
                             dst_handle.vpn_id,
                         ) {
-                            senders.push(dst_handle.sender.clone());
+                            senders.push(LocalDelivery::to(
+                                &dst_handle.name,
+                                dst_handle.sender.clone(),
+                            ));
                         } else if let Some(peer) = peers.lock().await.get(peer_uuid).cloned() {
                             send_unreachable_to(&msg, &peer.sender, router_uuid, "VPN_BLOCKED")?;
                         }
@@ -4368,15 +4333,7 @@ async fn handle_peer_message(
         }
     }
 
-    if !senders.is_empty() {
-        if let Some(data) =
-            serialize_for_local_delivery(memory_reader, hive_id, &msg, false).await?
-        {
-            for sender in senders {
-                let _ = sender.send(data.clone());
-            }
-        }
-    }
+    deliver_locally(senders, &msg, memory_reader, hive_id, false, log_stream).await?;
     Ok(())
 }
 
@@ -4584,7 +4541,7 @@ struct WanContext {
     fib: Arc<Mutex<Vec<FibEntry>>>,
     broadcast_cache: Arc<Mutex<BroadcastCache>>,
     lsa_seq: Arc<Mutex<u64>>,
-    thread_sequences: Arc<Mutex<HashMap<String, u64>>>,
+    log_stream: stream::StreamHandle,
     memory_reader: Arc<Mutex<Option<MemoryRegionReader>>>,
     opa: Arc<Mutex<OpaResolver>>,
     wan_session_epochs: Arc<Mutex<std::collections::HashMap<String, u64>>>,
@@ -6273,56 +6230,8 @@ async fn prepare_nats_runtime(cfg: &RouterConfig) -> Result<(), RouterError> {
     Ok(())
 }
 
-fn maybe_publish_turn(
-    nats_publisher: &Option<Arc<NatsPublisher>>,
-    nats_publish_errors: &Arc<AtomicU64>,
-    msg: &Message,
-) {
-    if !should_publish_turn(msg) {
-        return;
-    }
-    let Some(publisher) = nats_publisher else {
-        return;
-    };
-    let publisher = Arc::clone(publisher);
-    let nats_publish_errors = Arc::clone(nats_publish_errors);
-    let mut enriched = msg.clone();
-    if enriched.meta.action_class.is_none() {
-        enriched.meta.action_class = classify_routed_message(&enriched.meta.msg_type);
-    }
-    let payload = match serde_json::to_vec(&enriched) {
-        Ok(payload) => payload,
-        Err(err) => {
-            tracing::warn!(error = %err, "turn serialize failed");
-            return;
-        }
-    };
-    tokio::spawn(async move {
-        if let Err(err) = publisher.publish(&payload).await {
-            let count = nats_publish_errors.fetch_add(1, Ordering::Relaxed) + 1;
-            if count == 1 || count % NATS_PUBLISH_ERROR_LOG_EVERY == 0 {
-                tracing::warn!(
-                    error = %err,
-                    failures = count,
-                    subject = SUBJECT_STORAGE_TURNS,
-                    "nats publish failed"
-                );
-            }
-        }
-    });
-}
-
-/// Whether this hive's local NATS still gets the turn copies: where SY.cognition and SY.policy
-/// read them, until they take them from the stream (stage 2 of docs/router-stream-v1.md).
-fn turns_go_to_nats(hive_role: &str) -> bool {
-    matches!(
-        hive_role.trim().to_ascii_lowercase().as_str(),
-        "motherbee" | "worker"
-    )
-}
-
-/// The router's copy of a turn for its stream: the message as routed (thread sequence assigned),
-/// with its action class and the sender's real name. The node's own `src_l2_name` is never kept:
+/// The router's copy of a turn for its stream: the message as routed, with its action class and
+/// the sender's real name. The node's own `src_l2_name` is never kept:
 /// the router stamps it only later, on delivery.
 fn turn_copy(msg: &Message, conn_node_name: &str) -> Option<Vec<u8>> {
     let mut copy = msg.clone();
@@ -6386,16 +6295,143 @@ fn should_enrich_with_memory_package(msg: &Message) -> bool {
     true
 }
 
-/// Serialize a message for delivery to a local node, enforcing SYSTEM
-/// origin-authority. Returns `Ok(None)` when delivery must be SUPPRESSED (a
-/// protected SYSTEM action from an unauthorized origin) — callers skip the send.
-/// An `Err` would tear down the connection, so suppression uses `None`, not `Err`.
+/// A local node a message is delivered to.
+struct LocalDelivery {
+    node: String,
+    sender: mpsc::UnboundedSender<Vec<u8>>,
+}
+
+impl LocalDelivery {
+    fn to(node: &str, sender: mpsc::UnboundedSender<Vec<u8>>) -> Self {
+        Self {
+            node: node.to_string(),
+            sender,
+        }
+    }
+}
+
+/// Whether a node is an agent: the interlocutor that owns its communications (§6.1, D15 of
+/// docs/router-stream-v1.md). Agents run as `AI.*` nodes.
+fn is_agent_node(name: &str) -> bool {
+    name.get(..3)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("AI."))
+}
+
+/// Whether a message is a turn of a communication: a kind that counts as a turn, with a thread,
+/// neither a tap copy nor a broadcast (§6.2).
+fn is_communication_turn(msg: &Message) -> bool {
+    should_publish_turn(msg)
+        && !msg.meta.via_tap
+        && !matches!(msg.routing.dst, Destination::Broadcast)
+        && canonical_thread_id_from_meta(&msg.meta).is_some()
+}
+
+/// The copy of a turn for its agent's cognition: the message as routed, with its sender's real
+/// name, without any memory package (§6.2).
+fn cognition_copy(msg: &Message, sender_name: &str) -> Option<Vec<u8>> {
+    let mut copy = msg.clone();
+    copy.routing.src_l2_name = Some(sender_name.to_string());
+    copy.meta.memory_package = None;
+    if copy.meta.action_class.is_none() {
+        copy.meta.action_class = classify_routed_message(&copy.meta.msg_type);
+    }
+    serde_json::to_vec(&copy).ok()
+}
+
+/// Delivers a message to local nodes (§6.2). A system message passes the authority gate once; a
+/// package the sender set is dropped for every destination. An agent destination gets the memory
+/// package of its communication, and its router's copy of the turn for its cognition: with the
+/// copy its agent's sends make at entry, the agent's router hands its cognition both directions.
+async fn deliver_locally(
+    deliveries: Vec<LocalDelivery>,
+    msg: &Message,
+    memory_reader: &Arc<Mutex<Option<MemoryRegionReader>>>,
+    hive_id: &str,
+    src_via_hub: bool,
+    log_stream: &stream::StreamHandle,
+) -> Result<(), RouterError> {
+    if deliveries.is_empty() {
+        return Ok(());
+    }
+    let Some(prepared) = prepare_local_delivery(hive_id, msg, src_via_hub) else {
+        return Ok(());
+    };
+    let turn = is_communication_turn(&prepared);
+    let sender_name = prepared.routing.src_l2_name.clone().unwrap_or_default();
+    let mut plain: Option<Vec<u8>> = None;
+    let mut memory: Option<Option<MemoryShmSnapshot>> = None;
+    for delivery in deliveries {
+        let agent = is_agent_node(&delivery.node);
+        if agent && turn {
+            if let Some(copy) = cognition_copy(&prepared, &sender_name) {
+                log_stream.append_cognition_turn(&delivery.node, copy);
+            }
+        }
+        let package = if agent
+            && should_enrich_with_memory_package(&prepared)
+            && canonical_thread_id_from_meta(&prepared.meta).is_some()
+        {
+            if memory.is_none() {
+                memory = Some(
+                    read_memory_snapshot_for_delivery(memory_reader, hive_id, HEARTBEAT_STALE_MS)
+                        .await,
+                );
+            }
+            package_for(
+                memory.as_ref().and_then(Option::as_ref),
+                &prepared,
+                &delivery.node,
+            )
+        } else {
+            None
+        };
+        let data = match package {
+            Some(package) => {
+                let mut enriched = prepared.clone();
+                enriched.meta.memory_package = Some(package);
+                serde_json::to_vec(&enriched)?
+            }
+            None => match &plain {
+                Some(data) => data.clone(),
+                None => {
+                    let data = serde_json::to_vec(&prepared)?;
+                    plain = Some(data.clone());
+                    data
+                }
+            },
+        };
+        let _ = delivery.sender.send(data);
+    }
+    Ok(())
+}
+
+/// One message to one local node (a tap copy, the tests): the same gate, stamps and package as
+/// `deliver_locally`, without a copy for cognition.
 async fn serialize_for_local_delivery(
     memory_reader: &Arc<Mutex<Option<MemoryRegionReader>>>,
     hive_id: &str,
     msg: &Message,
     src_via_hub: bool,
+    dst_node: &str,
 ) -> Result<Option<Vec<u8>>, RouterError> {
+    let Some(mut prepared) = prepare_local_delivery(hive_id, msg, src_via_hub) else {
+        return Ok(None);
+    };
+    if is_agent_node(dst_node)
+        && should_enrich_with_memory_package(&prepared)
+        && canonical_thread_id_from_meta(&prepared.meta).is_some()
+    {
+        let memory =
+            read_memory_snapshot_for_delivery(memory_reader, hive_id, HEARTBEAT_STALE_MS).await;
+        prepared.meta.memory_package = package_for(memory.as_ref(), &prepared, dst_node);
+    }
+    Ok(Some(serde_json::to_vec(&prepared)?))
+}
+
+/// The authority gate for a system message, and the delivery's own stamps: the action class, and
+/// no memory package from the sender (nothing legitimate sets one, and a node could otherwise put
+/// one in an agent's prompt, §6.2). None when the gate drops it.
+fn prepare_local_delivery(hive_id: &str, msg: &Message, src_via_hub: bool) -> Option<Message> {
     if is_system_kind(&msg.meta.msg_type) {
         // OPA-dual SYSTEM (authority) layer: the baked, non-user-editable Rego policy
         // (policy/system.rego -> system.wasm), evaluated via authorize_system() — the SINGLE
@@ -6423,44 +6459,31 @@ async fn serialize_for_local_delivery(
                     src_via_hub = src_via_hub,
                     "router dropped protected SYSTEM action from unauthorized origin"
                 );
-                return Ok(None);
+                return None;
             }
         }
     }
-    let mut enriched = msg.clone();
-    if enriched.meta.action_class.is_none() {
-        enriched.meta.action_class = classify_routed_message(&enriched.meta.msg_type);
+    let mut prepared = msg.clone();
+    if prepared.meta.action_class.is_none() {
+        prepared.meta.action_class = classify_routed_message(&prepared.meta.msg_type);
     }
-    maybe_attach_memory_package(memory_reader, hive_id, &mut enriched).await;
-    Ok(Some(serde_json::to_vec(&enriched)?))
+    prepared.meta.memory_package = None;
+    Some(prepared)
 }
 
-async fn maybe_attach_memory_package(
-    memory_reader: &Arc<Mutex<Option<MemoryRegionReader>>>,
-    hive_id: &str,
-    msg: &mut Message,
-) {
-    if !should_enrich_with_memory_package(msg) || msg.meta.memory_package.is_some() {
-        return;
-    }
-    let Some(thread_id) = canonical_thread_id_from_meta(&msg.meta) else {
-        return;
-    };
-    let snapshot =
-        match read_memory_snapshot_for_delivery(memory_reader, hive_id, HEARTBEAT_STALE_MS).await {
-            Some(snapshot) => snapshot,
-            None => return,
-        };
-    if let Some(entry) = snapshot
+/// The memory package of the communication between this message's thread and the agent node it is
+/// delivered to.
+fn package_for(
+    memory: Option<&MemoryShmSnapshot>,
+    msg: &Message,
+    agent_node: &str,
+) -> Option<MemoryPackage> {
+    let thread_id = canonical_thread_id_from_meta(&msg.meta)?;
+    memory?
         .threads
         .iter()
-        .find(|entry| entry.thread_id == thread_id)
-    {
-        msg.meta.memory_package = Some(entry.package.clone());
-        if msg.meta.thread_id.is_none() {
-            msg.meta.thread_id = Some(thread_id);
-        }
-    }
+        .find(|entry| entry.thread_id == thread_id && entry.agent_node == agent_node)
+        .map(|entry| entry.package.clone())
 }
 
 async fn read_memory_snapshot_for_delivery(
@@ -7059,16 +7082,28 @@ mod tests {
             },
             payload: serde_json::json!({}),
         };
-        let direct = serialize_for_local_delivery(&memory_reader, "motherbee", &msg, false)
-            .await
-            .unwrap();
+        let direct = serialize_for_local_delivery(
+            &memory_reader,
+            "motherbee",
+            &msg,
+            false,
+            "SY.orchestrator@motherbee",
+        )
+        .await
+        .unwrap();
         assert!(
             direct.is_some(),
             "directly-authenticated orchestrator is allowed"
         );
-        let vouched = serialize_for_local_delivery(&memory_reader, "motherbee", &msg, true)
-            .await
-            .unwrap();
+        let vouched = serialize_for_local_delivery(
+            &memory_reader,
+            "motherbee",
+            &msg,
+            true,
+            "SY.orchestrator@motherbee",
+        )
+        .await
+        .unwrap();
         assert!(
             vouched.is_none(),
             "hub-vouched (via_hub) origin must be denied SYSTEM authority"
@@ -7404,75 +7439,6 @@ mod tests {
         assert_eq!(legacy, None);
     }
 
-    #[tokio::test]
-    async fn assign_thread_seq_requires_canonical_thread_id_and_monotonic_sequence() {
-        let sequences = Arc::new(Mutex::new(HashMap::<String, u64>::new()));
-
-        let mut first = Message {
-            routing: Routing {
-                src: Uuid::new_v4().to_string(),
-                src_l2_name: None,
-                dst: Destination::Resolve,
-                ttl: 16,
-                trace_id: Uuid::new_v4().to_string(),
-            },
-            meta: Meta {
-                msg_type: "user".to_string(),
-                context: Some(serde_json::json!({ "thread_id": "thread:legacy" })),
-                ..Meta::default()
-            },
-            payload: serde_json::json!({}),
-        };
-        assign_thread_seq_if_missing(&mut first, &sequences).await;
-        assert_eq!(first.meta.thread_id, None);
-        assert_eq!(first.meta.thread_seq, None);
-        assert!(sequences.lock().await.is_empty());
-
-        let mut second = Message {
-            routing: Routing {
-                src: Uuid::new_v4().to_string(),
-                src_l2_name: None,
-                dst: Destination::Resolve,
-                ttl: 16,
-                trace_id: Uuid::new_v4().to_string(),
-            },
-            meta: Meta {
-                msg_type: "user".to_string(),
-                thread_id: Some("thread:legacy".to_string()),
-                ..Meta::default()
-            },
-            payload: serde_json::json!({}),
-        };
-        assign_thread_seq_if_missing(&mut second, &sequences).await;
-        assert_eq!(second.meta.thread_seq, Some(1));
-    }
-
-    #[tokio::test]
-    async fn assign_thread_seq_preserves_existing_sequence() {
-        let sequences = Arc::new(Mutex::new(HashMap::<String, u64>::new()));
-        let mut msg = Message {
-            routing: Routing {
-                src: Uuid::new_v4().to_string(),
-                src_l2_name: None,
-                dst: Destination::Resolve,
-                ttl: 16,
-                trace_id: Uuid::new_v4().to_string(),
-            },
-            meta: Meta {
-                msg_type: "user".to_string(),
-                thread_id: Some("thread:existing".to_string()),
-                thread_seq: Some(41),
-                ..Meta::default()
-            },
-            payload: serde_json::json!({}),
-        };
-
-        assign_thread_seq_if_missing(&mut msg, &sequences).await;
-
-        assert_eq!(msg.meta.thread_seq, Some(41));
-        assert!(sequences.lock().await.is_empty());
-    }
-
     fn message_with_src_ilk(src_ilk: &str) -> Message {
         Message {
             routing: Routing {
@@ -7751,7 +7717,7 @@ mod tests {
             &Arc::new(Mutex::new(OpaResolver::new())),
             &Arc::new(Mutex::new(BroadcastCache::new())),
             &Arc::new(Mutex::new(None::<MemoryRegionReader>)),
-            &Arc::new(Mutex::new(HashMap::<String, u64>::new())),
+            &stream::StreamHandle::detached(),
             "motherbee",
             "SY.frontdesk.gov@motherbee",
             Uuid::new_v4(),
@@ -7847,9 +7813,6 @@ mod tests {
             Arc::new(Mutex::new(BroadcastCache::new())),
             Arc::new(Mutex::new(0)),
             Arc::new(Mutex::new(None)),
-            Arc::new(Mutex::new(HashMap::new())),
-            None,
-            Arc::new(AtomicU64::new(0)),
             stream::StreamHandle::detached(),
             router_uuid,
             "RT.gateway@motherbee",
@@ -8007,9 +7970,6 @@ mod tests {
             Arc::new(Mutex::new(BroadcastCache::new())),
             Arc::new(Mutex::new(0)),
             Arc::new(Mutex::new(None)),
-            Arc::new(Mutex::new(HashMap::new())),
-            None,
-            Arc::new(AtomicU64::new(0)),
             log_stream,
             Uuid::new_v4(),
             "RT.gateway@motherbee",
@@ -8180,6 +8140,205 @@ mod tests {
             Some("AI.sales@motherbee")
         );
         assert_eq!(observed.refused(), 1, "a node never appends a turn");
+    }
+
+    /// A-70 stage 2a (§6.2): the agent's router hands its cognition both directions of the agent's
+    /// communication: what reaches the agent, copied at delivery (owner = that agent), and what the
+    /// agent sends, copied at entry. A message without a thread, or between non-agents, is not
+    /// copied; a package the sender set never reaches the agent.
+    #[tokio::test]
+    async fn the_agents_router_copies_both_directions_for_its_cognition() {
+        let shm = TestShm::new("rt-cog");
+        let nodes: Arc<Mutex<HashMap<Uuid, NodeHandle>>> = Arc::new(Mutex::new(HashMap::new()));
+        let agent_uuid = Uuid::new_v4();
+        let web_uuid = Uuid::new_v4();
+        let (agent_tx, mut agent_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+        let (web_tx, mut web_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+        {
+            let mut guard = nodes.lock().await;
+            for (uuid, name, sender) in [
+                (agent_uuid, "AI.sales@motherbee", agent_tx),
+                (web_uuid, "IO.web@motherbee", web_tx),
+            ] {
+                guard.insert(
+                    uuid,
+                    NodeHandle {
+                        name: name.to_string(),
+                        vpn_id: 0,
+                        sender,
+                        connected_at: 0,
+                    },
+                );
+            }
+        }
+        let (log_stream, observed) = stream::StreamHandle::observed();
+        let threaded = |src: Uuid, dst: Uuid, thread: Option<&str>, n: u32| {
+            let mut msg: Message = serde_json::from_slice(&test_frame(
+                src,
+                "user",
+                None,
+                Destination::Unicast(dst.to_string()),
+                serde_json::json!({ "n": n }),
+            ))
+            .unwrap();
+            msg.meta.thread_id = thread.map(str::to_string);
+            msg.meta.memory_package = Some(fluxbee_sdk::protocol::MemoryPackage {
+                package_version: 2,
+                thread_id: "forged".to_string(),
+                dominant_context: None,
+                dominant_reason: None,
+                contexts: Vec::new(),
+                reasons: Vec::new(),
+                memories: Vec::new(),
+                episodes: Vec::new(),
+                truncated: None,
+            });
+            serde_json::to_vec(&msg).unwrap()
+        };
+        let connect = |name: &'static str| {
+            let shm = &shm;
+            let nodes = &nodes;
+            let log_stream = log_stream.clone();
+            async move {
+                let uuid = Uuid::new_v4();
+                let (mut client, server) = UnixStream::pair().expect("socket pair");
+                let _ = spawn_node_connection_with_stream(server, shm, nodes, log_stream);
+                let hello = test_frame(
+                    uuid,
+                    SYSTEM_KIND,
+                    Some(MSG_HELLO),
+                    Destination::Broadcast,
+                    serde_json::json!({ "uuid": uuid.to_string(), "name": name, "version": "1" }),
+                );
+                write_frame(&mut client, &hello).await.expect("hello");
+                time::timeout(Duration::from_secs(5), read_frame(&mut client))
+                    .await
+                    .expect("announce in time")
+                    .expect("read")
+                    .expect("announce");
+                (uuid, client)
+            }
+        };
+
+        // A user (through an IO node) to the agent: copied at delivery, for the agent.
+        let (user_uuid, mut user) = connect("IO.wapp").await;
+        write_frame(
+            &mut user,
+            &threaded(user_uuid, agent_uuid, Some("thread:t1"), 1),
+        )
+        .await
+        .expect("to the agent");
+        // Without a thread, and to a node that is not an agent: no cognition copy.
+        write_frame(&mut user, &threaded(user_uuid, agent_uuid, None, 2))
+            .await
+            .expect("no thread");
+        write_frame(
+            &mut user,
+            &threaded(user_uuid, web_uuid, Some("thread:t1"), 3),
+        )
+        .await
+        .expect("to a non-agent");
+        for _ in 0..2 {
+            let got = time::timeout(Duration::from_secs(5), agent_rx.recv())
+                .await
+                .expect("delivery in time")
+                .expect("delivered");
+            let got: Message = serde_json::from_slice(&got).unwrap();
+            assert!(
+                got.meta.memory_package.is_none(),
+                "the sender's package is dropped"
+            );
+        }
+        let got = time::timeout(Duration::from_secs(5), web_rx.recv())
+            .await
+            .expect("delivery in time")
+            .expect("delivered");
+        let got: Message = serde_json::from_slice(&got).unwrap();
+        assert!(got.meta.memory_package.is_none());
+
+        // The agent replies: copied at entry, for the agent.
+        let (bot_uuid, mut bot) = connect("AI.bot").await;
+        write_frame(
+            &mut bot,
+            &threaded(bot_uuid, web_uuid, Some("thread:t2"), 4),
+        )
+        .await
+        .expect("from an agent");
+        time::timeout(Duration::from_secs(5), web_rx.recv())
+            .await
+            .expect("delivery in time")
+            .expect("delivered");
+
+        let cognition: Vec<(String, String, Message)> = observed
+            .drain()
+            .into_iter()
+            .filter(|(subject, _, _)| subject == fluxbee_sdk::stream::SUBJECT_COGNITION_TURNS)
+            .map(|(subject, producer, payload)| {
+                (subject, producer, serde_json::from_slice(&payload).unwrap())
+            })
+            .collect();
+        assert_eq!(cognition.len(), 2, "{cognition:?}");
+        assert_eq!(cognition[0].1, "AI.sales@motherbee");
+        assert_eq!(cognition[0].2.payload["n"], 1);
+        assert_eq!(
+            cognition[0].2.routing.src_l2_name.as_deref(),
+            Some("IO.wapp@motherbee")
+        );
+        assert!(cognition[0].2.meta.memory_package.is_none());
+        assert_eq!(cognition[1].1, "AI.bot@motherbee");
+        assert_eq!(cognition[1].2.payload["n"], 4);
+    }
+
+    #[test]
+    fn an_agent_gets_the_package_of_its_own_communication() {
+        let package = |label: &str| fluxbee_sdk::protocol::MemoryPackage {
+            package_version: 2,
+            thread_id: "thread:t".to_string(),
+            dominant_context: Some(fluxbee_sdk::protocol::MemoryContextSummary {
+                context_id: format!("context:{label}"),
+                label: label.to_string(),
+                weight: 1.0,
+            }),
+            dominant_reason: None,
+            contexts: Vec::new(),
+            reasons: Vec::new(),
+            memories: Vec::new(),
+            episodes: Vec::new(),
+            truncated: None,
+        };
+        let entry = |thread: &str, node: &str, label: &str| crate::shm::MemoryShmThreadEntry {
+            thread_id: thread.to_string(),
+            agent_ilk: format!("ilk:{node}"),
+            agent_node: node.to_string(),
+            package: package(label),
+        };
+        let memory = MemoryShmSnapshot {
+            schema_version: 2,
+            updated_at: 1,
+            threads: vec![
+                entry("thread:t", "AI.a@motherbee", "a"),
+                entry("thread:t", "AI.b@motherbee", "b"),
+                entry("thread:u", "AI.b@motherbee", "u"),
+            ],
+        };
+        let mut msg: Message = serde_json::from_slice(&test_frame(
+            Uuid::new_v4(),
+            "user",
+            None,
+            Destination::Resolve,
+            serde_json::json!({}),
+        ))
+        .unwrap();
+        msg.meta.thread_id = Some("thread:t".to_string());
+        let label = |node: &str| {
+            package_for(Some(&memory), &msg, node)
+                .and_then(|package| package.dominant_context)
+                .map(|context| context.label)
+        };
+        assert_eq!(label("AI.b@motherbee").as_deref(), Some("b"));
+        assert_eq!(label("AI.a@motherbee").as_deref(), Some("a"));
+        assert_eq!(label("AI.c@motherbee"), None);
+        assert!(is_agent_node("ai.sales@worker1") && !is_agent_node("SY.frontdesk.gov@motherbee"));
     }
 
     /// A-44: a second live process with a node's UUID does not take its route. Its HELLO waits
@@ -8396,7 +8555,7 @@ mod tests {
                 &Arc::new(Mutex::new(OpaResolver::new())),
                 &Arc::new(Mutex::new(BroadcastCache::new())),
                 &Arc::new(Mutex::new(None::<MemoryRegionReader>)),
-                &Arc::new(Mutex::new(HashMap::<String, u64>::new())),
+                &stream::StreamHandle::detached(),
                 "motherbee",
                 "SY.frontdesk.gov@motherbee",
                 Uuid::new_v4(),
@@ -8473,7 +8632,7 @@ mod tests {
             &Arc::new(Mutex::new(OpaResolver::new())),
             &Arc::new(Mutex::new(BroadcastCache::new())),
             &Arc::new(Mutex::new(None::<MemoryRegionReader>)),
-            &Arc::new(Mutex::new(HashMap::<String, u64>::new())),
+            &stream::StreamHandle::detached(),
             "motherbee",
             "SY.frontdesk.gov@motherbee",
             Uuid::new_v4(),
@@ -8607,7 +8766,7 @@ mod tests {
             false,
             &Arc::new(Mutex::new(None)),
             &Arc::new(Mutex::new(HashMap::<Uuid, ReachabilityEntry>::new())),
-            &Arc::new(Mutex::new(HashMap::<String, u64>::new())),
+            &stream::StreamHandle::detached(),
         )
         .await
         .unwrap();
@@ -8838,7 +8997,7 @@ mod tests {
             false,
             &lsa_snapshot,
             &reachability,
-            &Arc::new(Mutex::new(HashMap::<String, u64>::new())),
+            &stream::StreamHandle::detached(),
         )
         .await
         .unwrap();
@@ -8924,6 +9083,8 @@ mod tests {
                 updated_at: 1,
                 threads: vec![crate::shm::MemoryShmThreadEntry {
                     thread_id: thread_id.clone(),
+                    agent_ilk: "ilk:agent".to_string(),
+                    agent_node: "AI.test@sandbox".to_string(),
                     package: old_package,
                 }],
             })
@@ -8944,6 +9105,8 @@ mod tests {
                 updated_at: 2,
                 threads: vec![crate::shm::MemoryShmThreadEntry {
                     thread_id: thread_id.clone(),
+                    agent_ilk: "ilk:agent".to_string(),
+                    agent_node: "AI.test@sandbox".to_string(),
                     package: fresh_package,
                 }],
             })

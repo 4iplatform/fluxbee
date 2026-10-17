@@ -1281,12 +1281,16 @@ fn parse_sub_command(line: &str) -> Result<(String, String, Option<String>), io:
     Ok((subject.to_string(), sid.to_string(), queue))
 }
 
-/// Durable consumers no node reads any more: SY.storage takes turns from the router stream since
-/// 0.1.76 (A-70). The router drops them from its broker once at start, and the broker refuses them
-/// after, so an old binary still running during an upgrade cannot bring one back: it would pin its
-/// subject up to the 50,000 cap, and store a second copy of each turn meanwhile.
-const RETIRED_DURABLE_CONSUMERS: &[(&str, &str)] =
-    &[(SUBJECT_STORAGE_TURNS, "durable.sy-storage.turns")];
+/// Durable consumers no node reads any more (A-70): SY.storage takes turns from the router stream
+/// since 0.1.76, and SY.cognition from its router's cognition copies since 0.1.77, when the router
+/// stopped publishing turns here and SY.policy stopped running. The router drops them from its
+/// broker once at start, and the broker refuses them after, so an old binary still running during
+/// an upgrade cannot bring one back: it would pin its subject up to the 50,000 cap.
+const RETIRED_DURABLE_CONSUMERS: &[(&str, &str)] = &[
+    (SUBJECT_STORAGE_TURNS, "durable.sy-storage.turns"),
+    (SUBJECT_STORAGE_TURNS, "durable.sy-cognition.turns"),
+    (SUBJECT_STORAGE_TURNS, "durable.sy-policy.turns"),
+];
 
 fn is_retired_durable_consumer(subject: &str, queue: &str) -> bool {
     RETIRED_DURABLE_CONSUMERS
@@ -1786,7 +1790,7 @@ mod tests {
         let calls = Arc::new(AtomicU64::new(0));
         let subscriber =
             NatsSubscriber::new(endpoint.clone(), SUBJECT_STORAGE_TURNS.to_string(), 10)
-                .with_queue("durable.sy-cognition.turns");
+                .with_queue("durable.test.turns");
         let calls_for_task = Arc::clone(&calls);
         let subscriber_task = tokio::spawn(async move {
             let _ = subscriber

@@ -29,8 +29,10 @@ use fluxbee_sdk::{
 };
 use fluxbee_sdk::{
     CognitionContextData, CognitionCooccurrenceData, CognitionDurableEntity,
-    CognitionDurableEnvelope, CognitionDurableOp, CognitionEpisodeData, CognitionMemoryData,
-    CognitionReasonData, CognitionScopeData, CognitionScopeInstanceData, CognitionThreadData,
+    CognitionDurableEnvelope, CognitionDurableOp, CognitionEnvelopeBatch, CognitionEpisodeData,
+    CognitionMemoryData, CognitionReasonData, CognitionScopeData, CognitionScopeInstanceData,
+    CognitionStateGet, CognitionStateResponse, CognitionThreadData,
+    COGNITION_DURABLE_SCHEMA_VERSION, MSG_COGNITION_STATE_GET, MSG_COGNITION_STATE_RESPONSE,
     SUBJECT_STORAGE_COGNITION_CONTEXTS, SUBJECT_STORAGE_COGNITION_COOCCURRENCES,
     SUBJECT_STORAGE_COGNITION_EPISODES, SUBJECT_STORAGE_COGNITION_MEMORIES,
     SUBJECT_STORAGE_COGNITION_REASONS, SUBJECT_STORAGE_COGNITION_SCOPES,
@@ -45,6 +47,7 @@ type StorageError = Box<dyn std::error::Error + Send + Sync>;
 use json_router::router::system_policy::PRIMARY_HIVE_ID;
 use fluxbee_sdk::stream::{
     is_stream_node_name, stream_hive, StreamBatch, MSG_STREAM_ACK, MSG_STREAM_BATCH,
+    SUBJECT_STORAGE_COGNITION_BATCH,
     SUBJECT_STORAGE_COGNITION_PREFIX as STREAM_SUBJECT_COGNITION_PREFIX,
 };
 
@@ -71,6 +74,19 @@ const STREAM_INGEST_QUEUE: usize = 64;
 /// How many acked batches may wait for their rows to be processed, off the ack's path. Past it the
 /// rows wait in the inbox for the retry (`INBOX_RETRY_MIN_AGE_SECS`).
 const STREAM_PROCESS_QUEUE: usize = 64;
+/// The most bytes of envelopes one `COGNITION_STATE_RESPONSE` carries: well inside a frame.
+const COGNITION_STATE_PAGE_BYTES: usize = 64 * 1024;
+/// The order a communication's state is paged in, entity by entity (§6.2).
+const COGNITION_STATE_ORDER: [CognitionDurableEntity; 8] = [
+    CognitionDurableEntity::Thread,
+    CognitionDurableEntity::Context,
+    CognitionDurableEntity::Reason,
+    CognitionDurableEntity::Cooccurrence,
+    CognitionDurableEntity::Scope,
+    CognitionDurableEntity::ScopeInstance,
+    CognitionDurableEntity::Memory,
+    CognitionDurableEntity::Episode,
+];
 /// The one-time copy of the old turns' whole messages from the inbox into `turns` (A-70, Q7).
 const TURNS_BACKFILL_MIGRATION: &str = "turns_backfill_from_inbox_v1";
 const TURNS_BACKFILL_PAGE: i64 = 500;
@@ -135,6 +151,221 @@ CREATE TABLE IF NOT EXISTS storage_migrations (
     applied_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
     detail      TEXT
 );
+"#;
+/// Cognition's tables, v2 (A-70 stage 2a, docs/router-stream-v1.md §6.2): a communication is
+/// `(thread_id, agent_ilk)`; every row of one carries both, and the turn it was written at
+/// (`source_turn`), which orders it. A thread row is keyed by its communication.
+const COGNITION_SCHEMA_SQL: &str = r#"
+CREATE TABLE IF NOT EXISTS cognition_threads (
+    communication_id TEXT PRIMARY KEY,
+    thread_id        TEXT NOT NULL,
+    agent_ilk        TEXT NOT NULL,
+    source_turn      BIGINT NOT NULL DEFAULT 0,
+    entity_version   INT NOT NULL,
+    writer           TEXT NOT NULL,
+    source_ts        TEXT NOT NULL,
+    src_ilk          TEXT,
+    dst_ilk          TEXT,
+    ich              TEXT,
+    status           TEXT,
+    first_seen_at    TEXT,
+    last_seen_at     TEXT,
+    turn_count       BIGINT,
+    payload          JSONB NOT NULL,
+    updated_at       TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE TABLE IF NOT EXISTS cognition_contexts (
+    context_id       TEXT PRIMARY KEY,
+    thread_id        TEXT NOT NULL,
+    agent_ilk        TEXT NOT NULL,
+    source_turn      BIGINT NOT NULL DEFAULT 0,
+    scope_id         TEXT,
+    entity_version   INT NOT NULL,
+    writer           TEXT NOT NULL,
+    source_ts        TEXT NOT NULL,
+    label            TEXT NOT NULL,
+    status           TEXT NOT NULL,
+    score            DOUBLE PRECISION,
+    weight           DOUBLE PRECISION,
+    weight_avg_cumulative DOUBLE PRECISION,
+    weight_avg_ema   DOUBLE PRECISION,
+    weight_samples   BIGINT,
+    tags             TEXT[],
+    ilk_weights      JSONB,
+    ilk_profile      JSONB,
+    opened_at        TEXT,
+    last_seen_at     TEXT,
+    closed_at        TEXT,
+    payload          JSONB NOT NULL,
+    updated_at       TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE TABLE IF NOT EXISTS cognition_reasons (
+    reason_id        TEXT PRIMARY KEY,
+    thread_id        TEXT NOT NULL,
+    agent_ilk        TEXT NOT NULL,
+    source_turn      BIGINT NOT NULL DEFAULT 0,
+    scope_id         TEXT,
+    entity_version   INT NOT NULL,
+    writer           TEXT NOT NULL,
+    source_ts        TEXT NOT NULL,
+    label            TEXT NOT NULL,
+    status           TEXT NOT NULL,
+    score            DOUBLE PRECISION,
+    weight           DOUBLE PRECISION,
+    weight_avg_cumulative DOUBLE PRECISION,
+    weight_avg_ema   DOUBLE PRECISION,
+    weight_samples   BIGINT,
+    signals_canonical TEXT[],
+    signals_extra    TEXT[],
+    ilk_weights      JSONB,
+    ilk_profile      JSONB,
+    opened_at        TEXT,
+    last_seen_at     TEXT,
+    closed_at        TEXT,
+    payload          JSONB NOT NULL,
+    updated_at       TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE TABLE IF NOT EXISTS cognition_cooccurrences (
+    cooccurrence_id  TEXT PRIMARY KEY,
+    thread_id        TEXT NOT NULL,
+    agent_ilk        TEXT NOT NULL,
+    source_turn      BIGINT NOT NULL DEFAULT 0,
+    context_id       TEXT NOT NULL,
+    context_label    TEXT NOT NULL,
+    reason_id        TEXT NOT NULL,
+    reason_label     TEXT NOT NULL,
+    entity_version   INT NOT NULL,
+    writer           TEXT NOT NULL,
+    source_ts        TEXT NOT NULL,
+    status           TEXT NOT NULL,
+    score            DOUBLE PRECISION,
+    weight           DOUBLE PRECISION,
+    weight_avg_cumulative DOUBLE PRECISION,
+    weight_avg_ema   DOUBLE PRECISION,
+    weight_samples   BIGINT,
+    occurrences      BIGINT,
+    opened_at        TEXT,
+    last_seen_at     TEXT,
+    closed_at        TEXT,
+    payload          JSONB NOT NULL,
+    updated_at       TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE TABLE IF NOT EXISTS cognition_scopes (
+    scope_id         TEXT PRIMARY KEY,
+    source_turn      BIGINT NOT NULL DEFAULT 0,
+    entity_version   INT NOT NULL,
+    writer           TEXT NOT NULL,
+    source_ts        TEXT NOT NULL,
+    label            TEXT,
+    status           TEXT NOT NULL,
+    dominant_context_id TEXT,
+    dominant_reason_id TEXT,
+    binding_energy_ema DOUBLE PRECISION,
+    opened_at        TEXT,
+    last_seen_at     TEXT,
+    closed_at        TEXT,
+    payload          JSONB NOT NULL,
+    updated_at       TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE TABLE IF NOT EXISTS cognition_scope_instances (
+    scope_instance_id TEXT PRIMARY KEY,
+    thread_id        TEXT NOT NULL,
+    agent_ilk        TEXT NOT NULL,
+    source_turn      BIGINT NOT NULL DEFAULT 0,
+    scope_id         TEXT NOT NULL,
+    entity_version   INT NOT NULL,
+    writer           TEXT NOT NULL,
+    source_ts        TEXT NOT NULL,
+    dominant_context_id TEXT,
+    dominant_reason_id TEXT,
+    start_turn       BIGINT,
+    end_turn         BIGINT,
+    opened_at        TEXT,
+    closed_at        TEXT,
+    payload          JSONB NOT NULL,
+    updated_at       TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE TABLE IF NOT EXISTS cognition_memories (
+    memory_id        TEXT PRIMARY KEY,
+    thread_id        TEXT NOT NULL,
+    agent_ilk        TEXT NOT NULL,
+    source_turn      BIGINT NOT NULL DEFAULT 0,
+    scope_id         TEXT,
+    entity_version   INT NOT NULL,
+    writer           TEXT NOT NULL,
+    source_ts        TEXT NOT NULL,
+    summary          TEXT NOT NULL,
+    weight           DOUBLE PRECISION,
+    occurrences      BIGINT,
+    dominant_context_id TEXT,
+    dominant_reason_id TEXT,
+    ilk_weights      JSONB,
+    created_at       TEXT,
+    last_seen_at     TEXT,
+    payload          JSONB NOT NULL,
+    updated_at       TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE TABLE IF NOT EXISTS cognition_episodes (
+    episode_id       TEXT PRIMARY KEY,
+    thread_id        TEXT NOT NULL,
+    agent_ilk        TEXT NOT NULL,
+    source_turn      BIGINT NOT NULL DEFAULT 0,
+    scope_id         TEXT,
+    entity_version   INT NOT NULL,
+    writer           TEXT NOT NULL,
+    source_ts        TEXT NOT NULL,
+    affect_id        TEXT NOT NULL,
+    title            TEXT NOT NULL,
+    summary          TEXT NOT NULL,
+    base_intensity   DOUBLE PRECISION,
+    evidence_strength DOUBLE PRECISION,
+    evidence_context_ids TEXT[],
+    evidence_reason_ids TEXT[],
+    evidence_signals TEXT[],
+    intensity        DOUBLE PRECISION,
+    reason           TEXT,
+    created_at       TEXT,
+    payload          JSONB NOT NULL,
+    updated_at       TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS idx_cognition_contexts_scope ON cognition_contexts(scope_id);
+CREATE INDEX IF NOT EXISTS idx_cognition_reasons_scope ON cognition_reasons(scope_id);
+CREATE INDEX IF NOT EXISTS idx_cognition_cooccurrences_context ON cognition_cooccurrences(context_id);
+CREATE INDEX IF NOT EXISTS idx_cognition_cooccurrences_reason ON cognition_cooccurrences(reason_id);
+CREATE INDEX IF NOT EXISTS idx_cognition_scope_instances_scope ON cognition_scope_instances(scope_id);
+CREATE INDEX IF NOT EXISTS idx_cognition_memories_scope ON cognition_memories(scope_id);
+CREATE INDEX IF NOT EXISTS idx_cognition_episodes_scope ON cognition_episodes(scope_id);
+CREATE INDEX IF NOT EXISTS idx_cognition_threads_communication ON cognition_threads(thread_id, agent_ilk);
+CREATE INDEX IF NOT EXISTS idx_cognition_contexts_communication ON cognition_contexts(thread_id, agent_ilk);
+CREATE INDEX IF NOT EXISTS idx_cognition_reasons_communication ON cognition_reasons(thread_id, agent_ilk);
+CREATE INDEX IF NOT EXISTS idx_cognition_cooccurrences_communication ON cognition_cooccurrences(thread_id, agent_ilk);
+CREATE INDEX IF NOT EXISTS idx_cognition_scope_instances_communication ON cognition_scope_instances(thread_id, agent_ilk);
+CREATE INDEX IF NOT EXISTS idx_cognition_memories_communication ON cognition_memories(thread_id, agent_ilk);
+CREATE INDEX IF NOT EXISTS idx_cognition_episodes_communication ON cognition_episodes(thread_id, agent_ilk);
+"#;
+
+/// The tables of the per-thread model (before 0.1.77) are dropped once, marked
+/// `cognition_reset_v1`: their data were tests, and their rows had no agent (operator, 2026-10-17,
+/// D19).
+const COGNITION_RESET_SQL: &str = r#"
+DO $$
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM storage_migrations WHERE name = 'cognition_reset_v1') THEN
+        DROP TABLE IF EXISTS cognition_threads, cognition_contexts, cognition_reasons,
+            cognition_cooccurrences, cognition_scopes, cognition_scope_instances,
+            cognition_memories, cognition_episodes;
+        INSERT INTO storage_migrations (name, detail)
+        VALUES ('cognition_reset_v1', 'cognition tables of the per-thread model dropped');
+    END IF;
+END $$;
 "#;
 const STORAGE_METRICS_LOG_INTERVAL_SECS: u64 = 30;
 const STORAGE_METRICS_WARN_PENDING: i64 = 100;
@@ -523,6 +754,34 @@ async fn main() -> Result<(), StorageError> {
                     tracing::warn!("sy.storage system channel closed; exiting main loop");
                     return Ok(());
                 };
+                if msg.meta.msg.as_deref() == Some(MSG_COGNITION_STATE_GET) {
+                    // Answered on a task of its own: a page is a few queries, and the main loop
+                    // keeps taking the streams' batches meanwhile.
+                    match storage.as_ref() {
+                        Some(storage) => {
+                            std::mem::drop(tokio::spawn(answer_cognition_state(
+                                Arc::clone(storage),
+                                Arc::clone(&dispatcher),
+                                msg,
+                            )));
+                        }
+                        None => {
+                            let sender = dispatcher.sender_snapshot();
+                            let reply = build_system_reply(
+                                &sender,
+                                &msg,
+                                MSG_COGNITION_STATE_RESPONSE,
+                                serde_json::to_value(CognitionStateResponse {
+                                    error: Some("sy.storage has no database".to_string()),
+                                    ..CognitionStateResponse::default()
+                                })
+                                .unwrap_or(Value::Null),
+                            );
+                            let _ = sender.send(reply).await;
+                        }
+                    }
+                    continue;
+                }
                 if msg.meta.msg.as_deref() == Some(MSG_STREAM_BATCH) {
                     // To the ingest task. Without a database, or with its queue full, the batch is
                     // not acked and its stream sends it again.
@@ -651,189 +910,13 @@ CREATE INDEX IF NOT EXISTS idx_events_natural_key ON events(ctx, start_seq, end_
 CREATE INDEX IF NOT EXISTS idx_items_cues ON memory_items USING GIN(cues_signature);
 CREATE INDEX IF NOT EXISTS idx_storage_inbox_pending ON storage_inbox(processed_at, received_at);
 
-CREATE TABLE IF NOT EXISTS cognition_threads (
-    thread_id        TEXT PRIMARY KEY,
-    entity_version   INT NOT NULL,
-    writer           TEXT NOT NULL,
-    source_ts        TEXT NOT NULL,
-    latest_thread_seq BIGINT,
-    src_ilk          TEXT,
-    dst_ilk          TEXT,
-    ich              TEXT,
-    status           TEXT,
-    first_seen_at    TEXT,
-    last_seen_at     TEXT,
-    turn_count       BIGINT,
-    payload          JSONB NOT NULL,
-    updated_at       TIMESTAMPTZ NOT NULL DEFAULT now()
-);
-
-CREATE TABLE IF NOT EXISTS cognition_contexts (
-    context_id       TEXT PRIMARY KEY,
-    thread_id        TEXT NOT NULL,
-    scope_id         TEXT,
-    entity_version   INT NOT NULL,
-    writer           TEXT NOT NULL,
-    source_ts        TEXT NOT NULL,
-    label            TEXT NOT NULL,
-    status           TEXT NOT NULL,
-    score            DOUBLE PRECISION,
-    weight           DOUBLE PRECISION,
-    weight_avg_cumulative DOUBLE PRECISION,
-    weight_avg_ema   DOUBLE PRECISION,
-    weight_samples   BIGINT,
-    tags             TEXT[],
-    ilk_weights      JSONB,
-    ilk_profile      JSONB,
-    opened_at        TEXT,
-    last_seen_at     TEXT,
-    closed_at        TEXT,
-    payload          JSONB NOT NULL,
-    updated_at       TIMESTAMPTZ NOT NULL DEFAULT now()
-);
-
-CREATE TABLE IF NOT EXISTS cognition_reasons (
-    reason_id        TEXT PRIMARY KEY,
-    thread_id        TEXT NOT NULL,
-    scope_id         TEXT,
-    entity_version   INT NOT NULL,
-    writer           TEXT NOT NULL,
-    source_ts        TEXT NOT NULL,
-    label            TEXT NOT NULL,
-    status           TEXT NOT NULL,
-    score            DOUBLE PRECISION,
-    weight           DOUBLE PRECISION,
-    weight_avg_cumulative DOUBLE PRECISION,
-    weight_avg_ema   DOUBLE PRECISION,
-    weight_samples   BIGINT,
-    signals_canonical TEXT[],
-    signals_extra    TEXT[],
-    ilk_weights      JSONB,
-    ilk_profile      JSONB,
-    opened_at        TEXT,
-    last_seen_at     TEXT,
-    closed_at        TEXT,
-    payload          JSONB NOT NULL,
-    updated_at       TIMESTAMPTZ NOT NULL DEFAULT now()
-);
-
-CREATE TABLE IF NOT EXISTS cognition_cooccurrences (
-    cooccurrence_id  TEXT PRIMARY KEY,
-    thread_id        TEXT NOT NULL,
-    context_id       TEXT NOT NULL,
-    context_label    TEXT NOT NULL,
-    reason_id        TEXT NOT NULL,
-    reason_label     TEXT NOT NULL,
-    entity_version   INT NOT NULL,
-    writer           TEXT NOT NULL,
-    source_ts        TEXT NOT NULL,
-    status           TEXT NOT NULL,
-    score            DOUBLE PRECISION,
-    weight           DOUBLE PRECISION,
-    weight_avg_cumulative DOUBLE PRECISION,
-    weight_avg_ema   DOUBLE PRECISION,
-    weight_samples   BIGINT,
-    occurrences      BIGINT,
-    opened_at        TEXT,
-    last_seen_at     TEXT,
-    closed_at        TEXT,
-    payload          JSONB NOT NULL,
-    updated_at       TIMESTAMPTZ NOT NULL DEFAULT now()
-);
-
-CREATE TABLE IF NOT EXISTS cognition_scopes (
-    scope_id         TEXT PRIMARY KEY,
-    entity_version   INT NOT NULL,
-    writer           TEXT NOT NULL,
-    source_ts        TEXT NOT NULL,
-    label            TEXT,
-    status           TEXT NOT NULL,
-    dominant_context_id TEXT,
-    dominant_reason_id TEXT,
-    binding_energy_ema DOUBLE PRECISION,
-    opened_at        TEXT,
-    last_seen_at     TEXT,
-    closed_at        TEXT,
-    payload          JSONB NOT NULL,
-    updated_at       TIMESTAMPTZ NOT NULL DEFAULT now()
-);
-
-CREATE TABLE IF NOT EXISTS cognition_scope_instances (
-    scope_instance_id TEXT PRIMARY KEY,
-    thread_id        TEXT NOT NULL,
-    scope_id         TEXT NOT NULL,
-    entity_version   INT NOT NULL,
-    writer           TEXT NOT NULL,
-    source_ts        TEXT NOT NULL,
-    dominant_context_id TEXT,
-    dominant_reason_id TEXT,
-    start_thread_seq BIGINT,
-    end_thread_seq   BIGINT,
-    opened_at        TEXT,
-    closed_at        TEXT,
-    payload          JSONB NOT NULL,
-    updated_at       TIMESTAMPTZ NOT NULL DEFAULT now()
-);
-
-CREATE TABLE IF NOT EXISTS cognition_memories (
-    memory_id        TEXT PRIMARY KEY,
-    thread_id        TEXT NOT NULL,
-    scope_id         TEXT,
-    entity_version   INT NOT NULL,
-    writer           TEXT NOT NULL,
-    source_ts        TEXT NOT NULL,
-    summary          TEXT NOT NULL,
-    weight           DOUBLE PRECISION,
-    occurrences      BIGINT,
-    dominant_context_id TEXT,
-    dominant_reason_id TEXT,
-    ilk_weights      JSONB,
-    created_at       TEXT,
-    last_seen_at     TEXT,
-    payload          JSONB NOT NULL,
-    updated_at       TIMESTAMPTZ NOT NULL DEFAULT now()
-);
-
-CREATE TABLE IF NOT EXISTS cognition_episodes (
-    episode_id       TEXT PRIMARY KEY,
-    thread_id        TEXT NOT NULL,
-    scope_id         TEXT,
-    entity_version   INT NOT NULL,
-    writer           TEXT NOT NULL,
-    source_ts        TEXT NOT NULL,
-    affect_id        TEXT NOT NULL,
-    title            TEXT NOT NULL,
-    summary          TEXT NOT NULL,
-    base_intensity   DOUBLE PRECISION,
-    evidence_strength DOUBLE PRECISION,
-    evidence_context_ids TEXT[],
-    evidence_reason_ids TEXT[],
-    evidence_signals TEXT[],
-    intensity        DOUBLE PRECISION,
-    reason           TEXT,
-    created_at       TEXT,
-    payload          JSONB NOT NULL,
-    updated_at       TIMESTAMPTZ NOT NULL DEFAULT now()
-);
-
-CREATE INDEX IF NOT EXISTS idx_cognition_contexts_thread ON cognition_contexts(thread_id);
-CREATE INDEX IF NOT EXISTS idx_cognition_contexts_scope ON cognition_contexts(scope_id);
-CREATE INDEX IF NOT EXISTS idx_cognition_reasons_thread ON cognition_reasons(thread_id);
-CREATE INDEX IF NOT EXISTS idx_cognition_reasons_scope ON cognition_reasons(scope_id);
-CREATE INDEX IF NOT EXISTS idx_cognition_cooccurrences_thread ON cognition_cooccurrences(thread_id);
-CREATE INDEX IF NOT EXISTS idx_cognition_cooccurrences_context ON cognition_cooccurrences(context_id);
-CREATE INDEX IF NOT EXISTS idx_cognition_cooccurrences_reason ON cognition_cooccurrences(reason_id);
-CREATE INDEX IF NOT EXISTS idx_cognition_scope_instances_thread ON cognition_scope_instances(thread_id);
-CREATE INDEX IF NOT EXISTS idx_cognition_scope_instances_scope ON cognition_scope_instances(scope_id);
-CREATE INDEX IF NOT EXISTS idx_cognition_memories_thread ON cognition_memories(thread_id);
-CREATE INDEX IF NOT EXISTS idx_cognition_memories_scope ON cognition_memories(scope_id);
-CREATE INDEX IF NOT EXISTS idx_cognition_episodes_thread ON cognition_episodes(thread_id);
-CREATE INDEX IF NOT EXISTS idx_cognition_episodes_scope ON cognition_episodes(scope_id);
 	"#,
             )
             .await?;
         self.client.batch_execute(TURNS_KEY_MIGRATION_SQL).await?;
         self.client.batch_execute(MESSAGE_LOG_MIGRATION_SQL).await?;
+        self.client.batch_execute(COGNITION_RESET_SQL).await?;
+        self.client.batch_execute(COGNITION_SCHEMA_SQL).await?;
         Ok(())
     }
 
@@ -959,6 +1042,108 @@ RETURNING processed_at IS NOT NULL
         }
         tx.commit().await?;
         Ok(processed)
+    }
+
+    /// One communication's state for its cognition's rebuild (§6.2): every row it wrote, as the
+    /// envelopes it wrote them, and the scopes its scope instances name, in `COGNITION_STATE_ORDER`
+    /// and then by id.
+    async fn cognition_state(
+        &self,
+        thread_id: &str,
+        agent_ilk: &str,
+    ) -> Result<Vec<(CognitionDurableEntity, String, Value)>, StorageError> {
+        let mut state = Vec::new();
+        for (entity, table, id_column) in [
+            (
+                CognitionDurableEntity::Thread,
+                "cognition_threads",
+                "communication_id",
+            ),
+            (
+                CognitionDurableEntity::Context,
+                "cognition_contexts",
+                "context_id",
+            ),
+            (
+                CognitionDurableEntity::Reason,
+                "cognition_reasons",
+                "reason_id",
+            ),
+            (
+                CognitionDurableEntity::Cooccurrence,
+                "cognition_cooccurrences",
+                "cooccurrence_id",
+            ),
+            (
+                CognitionDurableEntity::ScopeInstance,
+                "cognition_scope_instances",
+                "scope_instance_id",
+            ),
+            (
+                CognitionDurableEntity::Memory,
+                "cognition_memories",
+                "memory_id",
+            ),
+            (
+                CognitionDurableEntity::Episode,
+                "cognition_episodes",
+                "episode_id",
+            ),
+        ] {
+            let sql = format!(
+                "SELECT {id_column} AS entity_id, entity_version, writer, source_ts, source_turn, payload \
+                 FROM {table} WHERE thread_id = $1 AND agent_ilk = $2 ORDER BY {id_column}"
+            );
+            for row in self
+                .client
+                .query(sql.as_str(), &[&thread_id, &agent_ilk])
+                .await?
+            {
+                let entity_id: String = row.get("entity_id");
+                let envelope = serde_json::json!({
+                    "schema_version": COGNITION_DURABLE_SCHEMA_VERSION,
+                    "entity_version": row.get::<_, i32>("entity_version"),
+                    "entity": entity,
+                    "op": "upsert",
+                    "entity_id": entity_id,
+                    "thread_id": thread_id,
+                    "agent_ilk": agent_ilk,
+                    "turn": row.get::<_, i64>("source_turn").max(0),
+                    "hive": "",
+                    "writer": row.get::<_, String>("writer"),
+                    "ts": row.get::<_, String>("source_ts"),
+                    "data": row.get::<_, Value>("payload"),
+                });
+                state.push((entity, entity_id, envelope));
+            }
+        }
+        for row in self
+            .client
+            .query(
+                "SELECT scope_id, entity_version, writer, source_ts, payload FROM cognition_scopes \
+                 WHERE scope_id IN (SELECT scope_id FROM cognition_scope_instances \
+                                    WHERE thread_id = $1 AND agent_ilk = $2) \
+                 ORDER BY scope_id",
+                &[&thread_id, &agent_ilk],
+            )
+            .await?
+        {
+            let scope_id: String = row.get("scope_id");
+            let envelope = serde_json::json!({
+                "schema_version": COGNITION_DURABLE_SCHEMA_VERSION,
+                "entity_version": row.get::<_, i32>("entity_version"),
+                "entity": CognitionDurableEntity::Scope,
+                "op": "upsert",
+                "entity_id": scope_id,
+                "hive": "",
+                "writer": row.get::<_, String>("writer"),
+                "ts": row.get::<_, String>("source_ts"),
+                "data": row.get::<_, Value>("payload"),
+            });
+            state.push((CognitionDurableEntity::Scope, scope_id, envelope));
+        }
+        state.sort_by(|a, b| (entity_rank(a.0), &a.1).cmp(&(entity_rank(b.0), &b.1)));
+        Ok(state)
     }
 
     async fn migration_applied(&self, name: &str) -> Result<bool, StorageError> {
@@ -1512,6 +1697,7 @@ WHERE event_id = $2
         Ok(())
     }
 
+    /// A communication's thread row, keyed by the communication (`entity_id`).
     async fn persist_cognition_thread<C>(
         &self,
         db: &C,
@@ -1522,25 +1708,28 @@ WHERE event_id = $2
     {
         if matches!(envelope.op, CognitionDurableOp::Delete) {
             db.execute(
-                "DELETE FROM cognition_threads WHERE thread_id = $1",
+                "DELETE FROM cognition_threads WHERE communication_id = $1",
                 &[&envelope.entity_id],
             )
             .await?;
             return Ok(());
         }
+        let (agent_ilk, source_turn) = envelope_communication(envelope)?;
         let payload = json_value(&envelope.data)?;
         db.execute(
             r#"
 INSERT INTO cognition_threads (
-    thread_id, entity_version, writer, source_ts, latest_thread_seq,
+    communication_id, thread_id, agent_ilk, source_turn, entity_version, writer, source_ts,
     src_ilk, dst_ilk, ich, status, first_seen_at, last_seen_at, turn_count, payload
 )
-VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
-ON CONFLICT (thread_id) DO UPDATE SET
+VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)
+ON CONFLICT (communication_id) DO UPDATE SET
+    thread_id = EXCLUDED.thread_id,
+    agent_ilk = EXCLUDED.agent_ilk,
+    source_turn = EXCLUDED.source_turn,
     entity_version = EXCLUDED.entity_version,
     writer = EXCLUDED.writer,
     source_ts = EXCLUDED.source_ts,
-    latest_thread_seq = EXCLUDED.latest_thread_seq,
     src_ilk = EXCLUDED.src_ilk,
     dst_ilk = EXCLUDED.dst_ilk,
     ich = EXCLUDED.ich,
@@ -1550,13 +1739,19 @@ ON CONFLICT (thread_id) DO UPDATE SET
     turn_count = EXCLUDED.turn_count,
     payload = EXCLUDED.payload,
     updated_at = now()
+WHERE cognition_threads.source_turn <= EXCLUDED.source_turn
 "#,
             &[
                 &envelope.entity_id,
+                envelope
+                    .thread_id
+                    .as_ref()
+                    .ok_or_else(|| missing_field("thread_id"))?,
+                &agent_ilk,
+                &source_turn,
                 &(envelope.entity_version as i32),
                 &envelope.writer,
                 &envelope.ts,
-                &opt_i64(envelope.data.latest_thread_seq),
                 &envelope.data.src_ilk,
                 &envelope.data.dst_ilk,
                 &envelope.data.ich,
@@ -1587,6 +1782,7 @@ ON CONFLICT (thread_id) DO UPDATE SET
             .await?;
             return Ok(());
         }
+        let (agent_ilk, source_turn) = envelope_communication(envelope)?;
         let payload = json_value(&envelope.data)?;
         let ilk_weights = json_value(&envelope.data.ilk_weights)?;
         let ilk_profile = json_value(&envelope.data.ilk_profile)?;
@@ -1595,9 +1791,9 @@ ON CONFLICT (thread_id) DO UPDATE SET
 INSERT INTO cognition_contexts (
     context_id, thread_id, scope_id, entity_version, writer, source_ts,
     label, status, score, weight, weight_avg_cumulative, weight_avg_ema,
-    weight_samples, tags, ilk_weights, ilk_profile, opened_at, last_seen_at, closed_at, payload
+    weight_samples, tags, ilk_weights, ilk_profile, opened_at, last_seen_at, closed_at, payload, agent_ilk, source_turn
 )
-VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20)
+VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22)
 ON CONFLICT (context_id) DO UPDATE SET
     thread_id = EXCLUDED.thread_id,
     scope_id = EXCLUDED.scope_id,
@@ -1618,7 +1814,10 @@ ON CONFLICT (context_id) DO UPDATE SET
     last_seen_at = EXCLUDED.last_seen_at,
     closed_at = EXCLUDED.closed_at,
     payload = EXCLUDED.payload,
+    agent_ilk = EXCLUDED.agent_ilk,
+    source_turn = EXCLUDED.source_turn,
     updated_at = now()
+WHERE cognition_contexts.source_turn <= EXCLUDED.source_turn
 "#,
             &[
                 &envelope.entity_id,
@@ -1644,6 +1843,8 @@ ON CONFLICT (context_id) DO UPDATE SET
                 &envelope.data.last_seen_at,
                 &envelope.data.closed_at,
                 &payload,
+                &agent_ilk,
+                &source_turn,
             ],
         )
         .await?;
@@ -1666,6 +1867,7 @@ ON CONFLICT (context_id) DO UPDATE SET
             .await?;
             return Ok(());
         }
+        let (agent_ilk, source_turn) = envelope_communication(envelope)?;
         let payload = json_value(&envelope.data)?;
         let ilk_weights = json_value(&envelope.data.ilk_weights)?;
         let ilk_profile = json_value(&envelope.data.ilk_profile)?;
@@ -1675,9 +1877,9 @@ INSERT INTO cognition_reasons (
     reason_id, thread_id, scope_id, entity_version, writer, source_ts,
     label, status, score, weight, weight_avg_cumulative, weight_avg_ema,
     weight_samples, signals_canonical, signals_extra, ilk_weights, ilk_profile,
-    opened_at, last_seen_at, closed_at, payload
+    opened_at, last_seen_at, closed_at, payload, agent_ilk, source_turn
 )
-VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21)
+VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23)
 ON CONFLICT (reason_id) DO UPDATE SET
     thread_id = EXCLUDED.thread_id,
     scope_id = EXCLUDED.scope_id,
@@ -1699,7 +1901,10 @@ ON CONFLICT (reason_id) DO UPDATE SET
     last_seen_at = EXCLUDED.last_seen_at,
     closed_at = EXCLUDED.closed_at,
     payload = EXCLUDED.payload,
+    agent_ilk = EXCLUDED.agent_ilk,
+    source_turn = EXCLUDED.source_turn,
     updated_at = now()
+WHERE cognition_reasons.source_turn <= EXCLUDED.source_turn
 "#,
             &[
                 &envelope.entity_id,
@@ -1726,6 +1931,8 @@ ON CONFLICT (reason_id) DO UPDATE SET
                 &envelope.data.last_seen_at,
                 &envelope.data.closed_at,
                 &payload,
+                &agent_ilk,
+                &source_turn,
             ],
         )
         .await?;
@@ -1748,6 +1955,7 @@ ON CONFLICT (reason_id) DO UPDATE SET
             .await?;
             return Ok(());
         }
+        let (agent_ilk, source_turn) = envelope_communication(envelope)?;
         let payload = json_value(&envelope.data)?;
         db.execute(
             r#"
@@ -1755,9 +1963,9 @@ INSERT INTO cognition_cooccurrences (
     cooccurrence_id, thread_id, context_id, context_label, reason_id, reason_label,
     entity_version, writer, source_ts, status, score, weight,
     weight_avg_cumulative, weight_avg_ema, weight_samples, occurrences,
-    opened_at, last_seen_at, closed_at, payload
+    opened_at, last_seen_at, closed_at, payload, agent_ilk, source_turn
 )
-VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20)
+VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22)
 ON CONFLICT (cooccurrence_id) DO UPDATE SET
     thread_id = EXCLUDED.thread_id,
     context_id = EXCLUDED.context_id,
@@ -1778,7 +1986,10 @@ ON CONFLICT (cooccurrence_id) DO UPDATE SET
     last_seen_at = EXCLUDED.last_seen_at,
     closed_at = EXCLUDED.closed_at,
     payload = EXCLUDED.payload,
+    agent_ilk = EXCLUDED.agent_ilk,
+    source_turn = EXCLUDED.source_turn,
     updated_at = now()
+WHERE cognition_cooccurrences.source_turn <= EXCLUDED.source_turn
 "#,
             &[
                 &envelope.entity_id,
@@ -1804,6 +2015,8 @@ ON CONFLICT (cooccurrence_id) DO UPDATE SET
                 &envelope.data.last_seen_at,
                 &envelope.data.closed_at,
                 &payload,
+                &agent_ilk,
+                &source_turn,
             ],
         )
         .await?;
@@ -1826,15 +2039,18 @@ ON CONFLICT (cooccurrence_id) DO UPDATE SET
             .await?;
             return Ok(());
         }
+        // A scope has no communication of its own, but its envelopes carry the turn of the one
+        // that wrote them: a late retry cannot reopen a closed scope.
+        let source_turn = i64::try_from(envelope.turn.unwrap_or(0)).unwrap_or(i64::MAX);
         let payload = json_value(&envelope.data)?;
         db.execute(
             r#"
 INSERT INTO cognition_scopes (
     scope_id, entity_version, writer, source_ts, label, status,
     dominant_context_id, dominant_reason_id, binding_energy_ema,
-    opened_at, last_seen_at, closed_at, payload
+    opened_at, last_seen_at, closed_at, payload, source_turn
 )
-VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
+VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)
 ON CONFLICT (scope_id) DO UPDATE SET
     entity_version = EXCLUDED.entity_version,
     writer = EXCLUDED.writer,
@@ -1848,7 +2064,9 @@ ON CONFLICT (scope_id) DO UPDATE SET
     last_seen_at = EXCLUDED.last_seen_at,
     closed_at = EXCLUDED.closed_at,
     payload = EXCLUDED.payload,
+    source_turn = EXCLUDED.source_turn,
     updated_at = now()
+WHERE cognition_scopes.source_turn <= EXCLUDED.source_turn
 "#,
             &[
                 &envelope.entity_id,
@@ -1864,6 +2082,7 @@ ON CONFLICT (scope_id) DO UPDATE SET
                 &envelope.data.last_seen_at,
                 &envelope.data.closed_at,
                 &payload,
+                &source_turn,
             ],
         )
         .await?;
@@ -1886,15 +2105,16 @@ ON CONFLICT (scope_id) DO UPDATE SET
             .await?;
             return Ok(());
         }
+        let (agent_ilk, source_turn) = envelope_communication(envelope)?;
         let payload = json_value(&envelope.data)?;
         db.execute(
             r#"
 INSERT INTO cognition_scope_instances (
     scope_instance_id, thread_id, scope_id, entity_version, writer, source_ts,
-    dominant_context_id, dominant_reason_id, start_thread_seq, end_thread_seq,
-    opened_at, closed_at, payload
+    dominant_context_id, dominant_reason_id, start_turn, end_turn,
+    opened_at, closed_at, payload, agent_ilk, source_turn
 )
-VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
+VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)
 ON CONFLICT (scope_instance_id) DO UPDATE SET
     thread_id = EXCLUDED.thread_id,
     scope_id = EXCLUDED.scope_id,
@@ -1903,12 +2123,15 @@ ON CONFLICT (scope_instance_id) DO UPDATE SET
     source_ts = EXCLUDED.source_ts,
     dominant_context_id = EXCLUDED.dominant_context_id,
     dominant_reason_id = EXCLUDED.dominant_reason_id,
-    start_thread_seq = EXCLUDED.start_thread_seq,
-    end_thread_seq = EXCLUDED.end_thread_seq,
+    start_turn = EXCLUDED.start_turn,
+    end_turn = EXCLUDED.end_turn,
     opened_at = EXCLUDED.opened_at,
     closed_at = EXCLUDED.closed_at,
     payload = EXCLUDED.payload,
+    agent_ilk = EXCLUDED.agent_ilk,
+    source_turn = EXCLUDED.source_turn,
     updated_at = now()
+WHERE cognition_scope_instances.source_turn <= EXCLUDED.source_turn
 "#,
             &[
                 &envelope.entity_id,
@@ -1922,11 +2145,13 @@ ON CONFLICT (scope_instance_id) DO UPDATE SET
                 &envelope.ts,
                 &envelope.data.dominant_context_id,
                 &envelope.data.dominant_reason_id,
-                &opt_i64(envelope.data.start_thread_seq),
-                &opt_i64(envelope.data.end_thread_seq),
+                &opt_i64(envelope.data.start_turn),
+                &opt_i64(envelope.data.end_turn),
                 &envelope.data.opened_at,
                 &envelope.data.closed_at,
                 &payload,
+                &agent_ilk,
+                &source_turn,
             ],
         )
         .await?;
@@ -1949,6 +2174,7 @@ ON CONFLICT (scope_instance_id) DO UPDATE SET
             .await?;
             return Ok(());
         }
+        let (agent_ilk, source_turn) = envelope_communication(envelope)?;
         let payload = json_value(&envelope.data)?;
         let ilk_weights = json_value(&envelope.data.ilk_weights)?;
         db.execute(
@@ -1956,9 +2182,9 @@ ON CONFLICT (scope_instance_id) DO UPDATE SET
 INSERT INTO cognition_memories (
     memory_id, thread_id, scope_id, entity_version, writer, source_ts,
     summary, weight, occurrences, dominant_context_id, dominant_reason_id,
-    ilk_weights, created_at, last_seen_at, payload
+    ilk_weights, created_at, last_seen_at, payload, agent_ilk, source_turn
 )
-VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)
+VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17)
 ON CONFLICT (memory_id) DO UPDATE SET
     thread_id = EXCLUDED.thread_id,
     scope_id = EXCLUDED.scope_id,
@@ -1974,7 +2200,10 @@ ON CONFLICT (memory_id) DO UPDATE SET
     created_at = EXCLUDED.created_at,
     last_seen_at = EXCLUDED.last_seen_at,
     payload = EXCLUDED.payload,
+    agent_ilk = EXCLUDED.agent_ilk,
+    source_turn = EXCLUDED.source_turn,
     updated_at = now()
+WHERE cognition_memories.source_turn <= EXCLUDED.source_turn
 "#,
             &[
                 &envelope.entity_id,
@@ -1995,6 +2224,8 @@ ON CONFLICT (memory_id) DO UPDATE SET
                 &envelope.data.created_at,
                 &envelope.data.last_seen_at,
                 &payload,
+                &agent_ilk,
+                &source_turn,
             ],
         )
         .await?;
@@ -2017,6 +2248,7 @@ ON CONFLICT (memory_id) DO UPDATE SET
             .await?;
             return Ok(());
         }
+        let (agent_ilk, source_turn) = envelope_communication(envelope)?;
         let payload = json_value(&envelope.data)?;
         db.execute(
             r#"
@@ -2024,9 +2256,9 @@ INSERT INTO cognition_episodes (
     episode_id, thread_id, scope_id, entity_version, writer, source_ts,
     affect_id, title, summary, base_intensity, evidence_strength,
     evidence_context_ids, evidence_reason_ids, evidence_signals,
-    intensity, reason, created_at, payload
+    intensity, reason, created_at, payload, agent_ilk, source_turn
 )
-VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18)
+VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20)
 ON CONFLICT (episode_id) DO UPDATE SET
     thread_id = EXCLUDED.thread_id,
     scope_id = EXCLUDED.scope_id,
@@ -2045,7 +2277,10 @@ ON CONFLICT (episode_id) DO UPDATE SET
     reason = EXCLUDED.reason,
     created_at = EXCLUDED.created_at,
     payload = EXCLUDED.payload,
+    agent_ilk = EXCLUDED.agent_ilk,
+    source_turn = EXCLUDED.source_turn,
     updated_at = now()
+WHERE cognition_episodes.source_turn <= EXCLUDED.source_turn
 "#,
             &[
                 &envelope.entity_id,
@@ -2069,6 +2304,8 @@ ON CONFLICT (episode_id) DO UPDATE SET
                 &envelope.data.reason,
                 &envelope.data.created_at,
                 &payload,
+                &agent_ilk,
+                &source_turn,
             ],
         )
         .await?;
@@ -2395,6 +2632,109 @@ async fn backfill_turns(storage: &Storage) -> bool {
     }
 }
 
+fn entity_rank(entity: CognitionDurableEntity) -> usize {
+    COGNITION_STATE_ORDER
+        .iter()
+        .position(|candidate| *candidate == entity)
+        .unwrap_or(COGNITION_STATE_ORDER.len())
+}
+
+/// One page of a communication's state: the envelopes after `after`, up to
+/// `COGNITION_STATE_PAGE_BYTES` (always at least one), and where the next page starts.
+fn page_cognition_state(
+    state: Vec<(CognitionDurableEntity, String, Value)>,
+    after: Option<&(String, String)>,
+) -> CognitionStateResponse {
+    let after = after.and_then(|(entity, id)| {
+        let entity: CognitionDurableEntity =
+            serde_json::from_value(Value::String(entity.clone())).ok()?;
+        Some((entity_rank(entity), id.clone()))
+    });
+    let mut response = CognitionStateResponse {
+        ok: true,
+        ..CognitionStateResponse::default()
+    };
+    let mut bytes = 0usize;
+    let mut last: Option<(CognitionDurableEntity, String)> = None;
+    let mut remaining = false;
+    for (entity, entity_id, envelope) in state {
+        if after
+            .as_ref()
+            .is_some_and(|(rank, id)| (entity_rank(entity), &entity_id) <= (*rank, id))
+        {
+            continue;
+        }
+        let size = serde_json::to_vec(&envelope).map(|v| v.len()).unwrap_or(0);
+        if !response.envelopes.is_empty() && bytes + size > COGNITION_STATE_PAGE_BYTES {
+            remaining = true;
+            break;
+        }
+        bytes += size;
+        response.envelopes.push(envelope);
+        last = Some((entity, entity_id));
+    }
+    if remaining {
+        response.next = last.map(|(entity, id)| {
+            let entity = serde_json::to_value(entity)
+                .ok()
+                .and_then(|value| value.as_str().map(str::to_string))
+                .unwrap_or_default();
+            (entity, id)
+        });
+    }
+    response
+}
+
+/// `COGNITION_STATE_GET` (§6.2): the state of one communication, for its cognition's rebuild. Only
+/// to an SY.cognition, as its router stamped it.
+async fn answer_cognition_state(
+    storage: Arc<Storage>,
+    dispatcher: Arc<RouterDispatcher>,
+    msg: Message,
+) {
+    let from = msg.routing.src_l2_name.as_deref().unwrap_or("");
+    let is_cognition = from
+        .get(..13)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("SY.cognition@"));
+    let response = if !is_cognition {
+        tracing::warn!(
+            from,
+            "sy.storage refused a COGNITION_STATE_GET not from SY.cognition"
+        );
+        CognitionStateResponse {
+            error: Some("only SY.cognition may read a communication's state".to_string()),
+            ..CognitionStateResponse::default()
+        }
+    } else {
+        match serde_json::from_value::<CognitionStateGet>(msg.payload.clone()) {
+            Err(err) => CognitionStateResponse {
+                error: Some(format!("invalid COGNITION_STATE_GET: {err}")),
+                ..CognitionStateResponse::default()
+            },
+            Ok(request) => match storage
+                .cognition_state(&request.thread_id, &request.agent_ilk)
+                .await
+            {
+                Ok(state) => page_cognition_state(state, request.after.as_ref()),
+                Err(err) => CognitionStateResponse {
+                    error: Some(err.to_string()),
+                    ..CognitionStateResponse::default()
+                },
+            },
+        }
+    };
+    let sender = dispatcher.sender_snapshot();
+    let reply = build_system_reply(
+        &sender,
+        &msg,
+        MSG_COGNITION_STATE_RESPONSE,
+        serde_json::to_value(response).unwrap_or(Value::Null),
+    );
+    if let Err(err) = sender.send(reply).await {
+        tracing::warn!(error = %err, "sy.storage could not answer a COGNITION_STATE_GET");
+    }
+}
+
 /// One record of a stream batch, ready for the inbox.
 struct StreamRow {
     dedupe_key: String,
@@ -2408,17 +2748,15 @@ struct StreamRow {
 /// (usage, until stage 3); a record whose producer is not a node of the stream's hive (a router
 /// copies and takes only what its own nodes send); a cognition record not from that hive's
 /// SY.cognition; a turn whose message names another sender than its producer (Archi shows that
-/// name). A resent record lands on the same key: the same subject and payload, the same row.
+/// name). SY.cognition's packed envelopes (`storage.cognition.batch`) become one row each, as if
+/// each had come alone. A resent record lands on the same keys: the same subject and payload, the
+/// same row.
 fn stream_rows(batch: &StreamBatch, from: &str) -> Result<(Vec<StreamRow>, usize), StorageError> {
     let hive = stream_hive(from).unwrap_or_default();
     let cognition_producer = format!("SY.cognition@{hive}");
     let mut rows = Vec::with_capacity(batch.records.len());
     let mut dropped = 0usize;
     for record in &batch.records {
-        let Some(kind) = handler_kind_for_subject(&record.subject) else {
-            dropped += 1;
-            continue;
-        };
         let producer_hive = record.producer.rsplit_once('@').map(|(_, hive)| hive);
         if producer_hive != Some(hive) {
             dropped += 1;
@@ -2430,6 +2768,43 @@ fn stream_rows(batch: &StreamBatch, from: &str) -> Result<(Vec<StreamRow>, usize
             dropped += 1;
             continue;
         }
+        if record.subject == SUBJECT_STORAGE_COGNITION_BATCH {
+            let source_ts = std::time::UNIX_EPOCH + Duration::from_millis(record.ts_ms);
+            let Ok(packed) =
+                serde_json::from_value::<CognitionEnvelopeBatch>(record.payload.clone())
+            else {
+                dropped += 1;
+                continue;
+            };
+            for envelope in packed.envelopes {
+                let subject = envelope
+                    .get("entity")
+                    .cloned()
+                    .and_then(|entity| {
+                        serde_json::from_value::<CognitionDurableEntity>(entity).ok()
+                    })
+                    .map(CognitionDurableEntity::subject);
+                let Some((subject, kind)) =
+                    subject.and_then(|subject| Some((subject, handler_kind_for_subject(subject)?)))
+                else {
+                    dropped += 1;
+                    continue;
+                };
+                let payload = serde_json::to_vec(&envelope)?;
+                rows.push(StreamRow {
+                    dedupe_key: message_dedupe_key(subject, &payload),
+                    subject: subject.to_string(),
+                    kind,
+                    payload,
+                    source_ts,
+                });
+            }
+            continue;
+        }
+        let Some(kind) = handler_kind_for_subject(&record.subject) else {
+            dropped += 1;
+            continue;
+        };
         if record.subject == SUBJECT_STORAGE_TURNS
             && record.payload["routing"]["src_l2_name"].as_str() != Some(record.producer.as_str())
         {
@@ -2533,6 +2908,20 @@ async fn ingest_stream_batch(
         .filter(|(_, processed)| !processed)
         .map(|(row, _)| row)
         .collect())
+}
+
+/// The communication an envelope belongs to: its agent and the turn it was written at (§6.2).
+fn envelope_communication<T>(
+    envelope: &CognitionDurableEnvelope<T>,
+) -> Result<(String, i64), StorageError> {
+    let agent_ilk = envelope
+        .agent_ilk
+        .as_deref()
+        .map(str::trim)
+        .filter(|agent| !agent.is_empty())
+        .ok_or_else(|| missing_field("agent_ilk"))?;
+    let turn = i64::try_from(envelope.turn.unwrap_or(0)).unwrap_or(i64::MAX);
+    Ok((agent_ilk.to_string(), turn))
 }
 
 fn truncate_error(input: &str, max_len: usize) -> String {
@@ -3240,6 +3629,13 @@ where
     T: DeserializeOwned,
 {
     let envelope: CognitionDurableEnvelope<T> = serde_json::from_slice(payload)?;
+    if envelope.schema_version != COGNITION_DURABLE_SCHEMA_VERSION {
+        return Err(format!(
+            "invalid payload: cognition schema {} (this SY.storage takes {})",
+            envelope.schema_version, COGNITION_DURABLE_SCHEMA_VERSION
+        )
+        .into());
+    }
     if envelope.entity != expected {
         return Err(format!(
             "invalid payload: cognition entity mismatch (expected {:?}, got {:?})",
@@ -3984,6 +4380,7 @@ mod tests {
         let turn = copied_turn("trace-1", "IO.slack.T1@worker1", "hola");
         let batch = StreamBatch {
             stream: "RT.gateway.stream@worker1".to_string(),
+            epoch: 1,
             records: vec![record(
                 7,
                 SUBJECT_STORAGE_TURNS,
@@ -4018,6 +4415,7 @@ mod tests {
         let subject = "storage.cognition.threads";
         let batch = StreamBatch {
             stream: "RT.gateway.stream@worker1".to_string(),
+            epoch: 1,
             records: vec![
                 record(
                     1,
@@ -4058,6 +4456,7 @@ mod tests {
         let stream = "RT.gateway.stream@ingress1";
         let batch = StreamBatch {
             stream: stream.to_string(),
+            epoch: 1,
             records: vec![
                 record(
                     1,
@@ -4091,6 +4490,129 @@ mod tests {
         assert_eq!(dropped, 3);
         let kept: Value = serde_json::from_slice(&rows[0].payload).unwrap();
         assert_eq!(kept["routing"]["trace_id"], "t1");
+    }
+
+    fn cognition_envelope(entity: &str, id: &str) -> Value {
+        serde_json::json!({
+            "schema_version": COGNITION_DURABLE_SCHEMA_VERSION,
+            "entity_version": 1,
+            "entity": entity,
+            "op": "upsert",
+            "entity_id": id,
+            "thread_id": "thread:t",
+            "agent_ilk": "ilk:agent",
+            "turn": 3,
+            "hive": "worker1",
+            "writer": "SY.cognition@worker1",
+            "ts": "2026-10-17T00:00:00Z",
+            "data": {"label": id, "status": "open"},
+        })
+    }
+
+    #[test]
+    fn a_packed_cognition_batch_becomes_one_row_per_envelope() {
+        let packed = |producer: &str| StreamBatch {
+            stream: "RT.gateway.stream@worker1".to_string(),
+            epoch: 1,
+            records: vec![record(
+                1,
+                SUBJECT_STORAGE_COGNITION_BATCH,
+                producer,
+                serde_json::to_value(CognitionEnvelopeBatch {
+                    envelopes: vec![
+                        cognition_envelope("context", "context:a"),
+                        cognition_envelope("thread", "thread:x"),
+                        cognition_envelope("nonsense", "x"),
+                    ],
+                })
+                .unwrap(),
+            )],
+        };
+        let (rows, dropped) =
+            stream_rows(&packed("SY.cognition@worker1"), "RT.gateway.stream@worker1").unwrap();
+        assert_eq!(dropped, 1, "an envelope of no known entity");
+        assert_eq!(
+            rows.iter()
+                .map(|row| row.subject.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                SUBJECT_STORAGE_COGNITION_CONTEXTS,
+                SUBJECT_STORAGE_COGNITION_THREADS
+            ]
+        );
+        assert!(matches!(rows[0].kind, HandlerKind::CognitionContexts));
+        assert_eq!(
+            rows[0].dedupe_key,
+            message_dedupe_key(SUBJECT_STORAGE_COGNITION_CONTEXTS, &rows[0].payload)
+        );
+        let (rows, dropped) =
+            stream_rows(&packed("AI.sales@worker1"), "RT.gateway.stream@worker1").unwrap();
+        assert!(rows.is_empty());
+        assert_eq!(
+            dropped, 1,
+            "cognition's records come from SY.cognition only"
+        );
+    }
+
+    #[test]
+    fn a_communications_state_is_paged_in_order() {
+        let big = "x".repeat(COGNITION_STATE_PAGE_BYTES / 3);
+        let mut state = Vec::new();
+        for (entity, id) in [
+            (CognitionDurableEntity::Memory, "memory:1"),
+            (CognitionDurableEntity::Thread, "thread:1"),
+            (CognitionDurableEntity::Context, "context:2"),
+            (CognitionDurableEntity::Context, "context:1"),
+        ] {
+            let mut envelope = cognition_envelope("context", id);
+            envelope["data"]["pad"] = Value::String(big.clone());
+            state.push((entity, id.to_string(), envelope));
+        }
+        state.sort_by(|a, b| (entity_rank(a.0), &a.1).cmp(&(entity_rank(b.0), &b.1)));
+        let first = page_cognition_state(state.clone(), None);
+        assert!(first.ok);
+        let ids = |page: &CognitionStateResponse| {
+            page.envelopes
+                .iter()
+                .map(|e| e["entity_id"].as_str().unwrap().to_string())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(ids(&first), vec!["thread:1", "context:1"]);
+        assert_eq!(
+            first.next,
+            Some(("context".to_string(), "context:1".to_string()))
+        );
+        let second = page_cognition_state(state, first.next.as_ref());
+        assert_eq!(ids(&second), vec!["context:2", "memory:1"]);
+        assert_eq!(second.next, None);
+    }
+
+    #[test]
+    fn cognition_rows_belong_to_a_communication() {
+        for table in [
+            "cognition_threads",
+            "cognition_contexts",
+            "cognition_reasons",
+            "cognition_cooccurrences",
+            "cognition_scope_instances",
+            "cognition_memories",
+            "cognition_episodes",
+        ] {
+            let ddl_start = COGNITION_SCHEMA_SQL
+                .find(&format!("CREATE TABLE IF NOT EXISTS {table} ("))
+                .unwrap();
+            let ddl = &COGNITION_SCHEMA_SQL[ddl_start..];
+            let ddl = &ddl[..ddl.find(");").unwrap()];
+            assert!(ddl.contains("agent_ilk        TEXT NOT NULL"), "{table}");
+            assert!(ddl.contains("source_turn      BIGINT NOT NULL"), "{table}");
+            assert!(COGNITION_SCHEMA_SQL.contains(&format!(
+                "idx_{table}_communication ON {table}(thread_id, agent_ilk)"
+            )));
+        }
+        assert!(COGNITION_SCHEMA_SQL.contains("communication_id TEXT PRIMARY KEY"));
+        assert!(!COGNITION_SCHEMA_SQL.contains("thread_seq"));
+        assert!(COGNITION_RESET_SQL.contains("name = 'cognition_reset_v1'"));
+        assert!(COGNITION_RESET_SQL.contains("cognition_episodes;"));
     }
 
     #[test]

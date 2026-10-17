@@ -8,6 +8,10 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use crate::protocol::{Destination, Message, Meta, Routing, SYSTEM_KIND};
+use crate::split::NodeSender;
+use crate::NodeError;
+
 /// A node to its own router: append `payload` under `subject`. The router consumes it and routes
 /// it to no node.
 pub const MSG_STREAM_APPEND: &str = "STREAM_APPEND";
@@ -23,6 +27,12 @@ pub const MSG_STREAM_STATUS_RESPONSE: &str = "STREAM_STATUS_RESPONSE";
 pub const SUBJECT_STORAGE_TURNS: &str = "storage.turns";
 /// What SY.cognition derives from turns (`storage.cognition.<entity>`).
 pub const SUBJECT_STORAGE_COGNITION_PREFIX: &str = "storage.cognition.";
+/// SY.cognition's envelopes of one turn, packed (`CognitionEnvelopeBatch`); SY.storage expands
+/// them into one row per envelope (docs/router-stream-v1.md §6.2).
+pub const SUBJECT_STORAGE_COGNITION_BATCH: &str = "storage.cognition.batch";
+/// The agent's router's copy of a message its local agent sent or received, for its local
+/// SY.cognition only (§6.2). The record's producer is that agent node.
+pub const SUBJECT_COGNITION_TURNS: &str = "cognition.turns";
 /// LLM usage records (stage 3).
 pub const SUBJECT_STORAGE_USAGE: &str = "storage.usage";
 
@@ -49,6 +59,10 @@ pub struct StreamRecord {
 pub struct StreamBatch {
     /// The stream that sent it, `RT.<router>.stream@<hive>`.
     pub stream: String,
+    /// Drawn again whenever the stream's seq may restart (its state lost, or kept in memory only):
+    /// a sink that skips repeats keys its last seq by stream and epoch (§6.2).
+    #[serde(default)]
+    pub epoch: u64,
     pub records: Vec<StreamRecord>,
 }
 
@@ -56,6 +70,32 @@ pub struct StreamBatch {
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub struct StreamAck {
     pub up_to_seq: u64,
+}
+
+/// A node's `STREAM_APPEND` to its own router: fire and forget, no reply. The router takes it before
+/// routing, whatever the destination, and appends it only if this node may append that subject
+/// (§2.2).
+pub async fn append(sender: &NodeSender, subject: &str, payload: Value) -> Result<(), NodeError> {
+    let msg = Message {
+        routing: Routing {
+            src: sender.uuid().to_string(),
+            src_l2_name: None,
+            dst: Destination::Resolve,
+            ttl: 1,
+            trace_id: uuid::Uuid::new_v4().to_string(),
+        },
+        meta: Meta {
+            msg_type: SYSTEM_KIND.to_string(),
+            msg: Some(MSG_STREAM_APPEND.to_string()),
+            ..Meta::default()
+        },
+        payload: serde_json::to_value(StreamAppend {
+            subject: subject.to_string(),
+            payload,
+        })
+        .unwrap_or(Value::Null),
+    };
+    sender.send(msg).await
 }
 
 /// The stream node of a router: `RT.gateway@worker1` → `RT.gateway.stream@worker1`. A router name
@@ -139,6 +179,7 @@ mod tests {
     fn a_batch_round_trips() {
         let batch = StreamBatch {
             stream: "RT.gateway.stream@worker1".to_string(),
+            epoch: 42,
             records: vec![StreamRecord {
                 seq: 7,
                 ts_ms: 1_700_000_000_000,

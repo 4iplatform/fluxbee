@@ -8,8 +8,10 @@
 > entre hives, buffers de días) nunca existió así: el broker es propio, local a cada hive, y solo
 > el tráfico del motherbee llega a la base. NATS muere: lo reemplaza el stream de cada router,
 > `docs/router-stream-v1.md`. Desde 0.1.76 los turns llegan a SY.storage por el stream de cada
-> router, de todos los hives, y `turns` es el log de mensajes (§7.3); lo que deriva cognition
-> sigue por NATS hasta la etapa 2, cuando se reescribe este doc.
+> router, de todos los hives, y `turns` es el log de mensajes (§7.3). Desde 0.1.77 lo que deriva
+> cognition también llega por el stream (`storage.cognition.batch`), por comunicación (hilo y
+> agente), y cognition reconstruye su estado pidiéndoselo a SY.storage (`COGNITION_STATE_GET`).
+> Este doc se reescribe cuando NATS se borre (etapa 2b).
 
 ---
 

@@ -2,8 +2,14 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
-pub const COGNITION_DURABLE_SCHEMA_VERSION: u16 = 1;
+/// v2 (A-70 stage 2): a communication is `(thread_id, agent ILK)`, and every envelope carries the
+/// communication's turn number, which orders it (docs/router-stream-v1.md §6.2).
+pub const COGNITION_DURABLE_SCHEMA_VERSION: u16 = 2;
 pub const COGNITION_DURABLE_ENTITY_VERSION_V1: u16 = 1;
+
+/// SY.cognition to `SY.storage@motherbee`: the state of one communication, for its rebuild.
+pub const MSG_COGNITION_STATE_GET: &str = "COGNITION_STATE_GET";
+pub const MSG_COGNITION_STATE_RESPONSE: &str = "COGNITION_STATE_RESPONSE";
 
 pub const SUBJECT_STORAGE_COGNITION_THREADS: &str = "storage.cognition.threads";
 pub const SUBJECT_STORAGE_COGNITION_CONTEXTS: &str = "storage.cognition.contexts";
@@ -72,18 +78,34 @@ pub struct CognitionDurableEnvelope<T> {
     pub entity_id: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub thread_id: Option<String>,
+    /// The agent that owns the communication: with `thread_id`, the communication's identity.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub agent_ilk: Option<String>,
+    /// The communication's turn number when this was written: a stored row is replaced only by an
+    /// envelope of an equal or later turn.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub turn: Option<u64>,
     pub hive: String,
     pub writer: String,
     pub ts: String,
     pub data: T,
 }
 
+/// The communication an envelope belongs to: `None` for a scope, which is shared by its instances.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CognitionCommunicationRef {
+    pub thread_id: String,
+    pub agent_ilk: String,
+    pub turn: u64,
+}
+
 impl<T> CognitionDurableEnvelope<T> {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         entity: CognitionDurableEntity,
         op: CognitionDurableOp,
         entity_id: impl Into<String>,
-        thread_id: Option<String>,
+        communication: Option<&CognitionCommunicationRef>,
         hive: impl Into<String>,
         writer: impl Into<String>,
         ts: impl Into<String>,
@@ -95,13 +117,45 @@ impl<T> CognitionDurableEnvelope<T> {
             entity,
             op,
             entity_id: entity_id.into(),
-            thread_id,
+            thread_id: communication.map(|c| c.thread_id.clone()),
+            agent_ilk: communication.map(|c| c.agent_ilk.clone()),
+            turn: communication.map(|c| c.turn),
             hive: hive.into(),
             writer: writer.into(),
             ts: ts.into(),
             data,
         }
     }
+}
+
+/// The payload of a `storage.cognition.batch` record: envelopes of one turn, packed.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+pub struct CognitionEnvelopeBatch {
+    pub envelopes: Vec<serde_json::Value>,
+}
+
+/// The payload of `COGNITION_STATE_GET`: one page of a communication's state. `after` is the last
+/// `(entity, entity_id)` of the previous page.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CognitionStateGet {
+    pub thread_id: String,
+    pub agent_ilk: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub after: Option<(String, String)>,
+}
+
+/// The payload of `COGNITION_STATE_RESPONSE`: envelopes in the shape SY.cognition writes them.
+/// `next` is set when more pages follow. An empty first page means the communication has no
+/// state.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+pub struct CognitionStateResponse {
+    pub ok: bool,
+    #[serde(default)]
+    pub envelopes: Vec<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next: Option<(String, String)>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -114,8 +168,6 @@ pub struct CognitionIlkProfile {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 pub struct CognitionThreadData {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub latest_thread_seq: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub src_ilk: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -247,10 +299,11 @@ pub struct CognitionScopeInstanceData {
     pub dominant_context_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub dominant_reason_id: Option<String>,
+    /// The communication's turn numbers it spans (the turn replaced `thread_seq`, §6.2).
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub start_thread_seq: Option<u64>,
+    pub start_turn: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub end_thread_seq: Option<u64>,
+    pub end_turn: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub opened_at: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -331,7 +384,11 @@ mod tests {
             CognitionDurableEntity::Context,
             CognitionDurableOp::Upsert,
             "context:123",
-            Some("thread:sha256:abc".to_string()),
+            Some(&CognitionCommunicationRef {
+                thread_id: "thread:sha256:abc".to_string(),
+                agent_ilk: "ilk:agent".to_string(),
+                turn: 7,
+            }),
             "motherbee",
             "SY.cognition@motherbee",
             "2026-03-31T12:34:56Z",
@@ -345,10 +402,6 @@ mod tests {
 
         let encoded = serde_json::to_value(&envelope).expect("serialize");
         assert_eq!(
-            encoded.get("schema_version").and_then(|v| v.as_u64()),
-            Some(1)
-        );
-        assert_eq!(
             encoded.get("entity").and_then(|v| v.as_str()),
             Some("context")
         );
@@ -356,6 +409,15 @@ mod tests {
         assert_eq!(
             encoded.get("thread_id").and_then(|v| v.as_str()),
             Some("thread:sha256:abc")
+        );
+        assert_eq!(
+            encoded.get("agent_ilk").and_then(|v| v.as_str()),
+            Some("ilk:agent")
+        );
+        assert_eq!(encoded.get("turn").and_then(|v| v.as_u64()), Some(7));
+        assert_eq!(
+            encoded.get("schema_version").and_then(|v| v.as_u64()),
+            Some(2)
         );
         assert_eq!(
             encoded

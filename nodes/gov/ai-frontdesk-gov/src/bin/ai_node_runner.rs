@@ -2619,7 +2619,7 @@ async fn run_unconfigured_bootstrap(
     let gov_identity_bridge = Some(Arc::new(GovIdentityBridge::new(dispatcher.clone())));
     let ai_node = GenericAiNode {
         node_name: node_name.clone(),
-        self_ilk_id,
+        self_ilk_id: self_ilk_id.clone(),
         behavior: Arc::new(RwLock::new(behavior)),
         thread_state_store,
         immediate_memory_store,
@@ -2634,7 +2634,14 @@ async fn run_unconfigured_bootstrap(
     // Unconfigured (degraded — the deterministic handoff still works).
     ai_node.boot_self_configure().await;
     let runtime = NodeRuntime::new(dispatcher, ai_node);
-    runtime.run_with_config(RuntimeConfig::default()).await?;
+    // Its replies carry its own ILK (docs/router-stream-v1.md §6.2); a SY unit has no
+    // FLUXBEE_NODE_ILK_ID, so the default would leave them without one.
+    runtime
+        .run_with_config(RuntimeConfig {
+            self_ilk_id: self_ilk_id.clone(),
+            ..RuntimeConfig::default()
+        })
+        .await?;
     Ok(())
 }
 

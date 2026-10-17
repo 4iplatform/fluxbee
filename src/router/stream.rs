@@ -23,8 +23,8 @@ use fluxbee_sdk::rpc::{
 };
 use fluxbee_sdk::stream::{
     stream_node_name, StreamAck, StreamBatch, StreamRecord, MSG_STREAM_ACK, MSG_STREAM_BATCH,
-    MSG_STREAM_STATUS, MSG_STREAM_STATUS_RESPONSE, SUBJECT_STORAGE_COGNITION_PREFIX,
-    SUBJECT_STORAGE_TURNS, SUBJECT_STORAGE_USAGE,
+    MSG_STREAM_STATUS, MSG_STREAM_STATUS_RESPONSE, SUBJECT_COGNITION_TURNS,
+    SUBJECT_STORAGE_COGNITION_PREFIX, SUBJECT_STORAGE_TURNS, SUBJECT_STORAGE_USAGE,
 };
 use serde_json::{json, Value};
 use tokio::sync::Notify;
@@ -92,9 +92,10 @@ impl Source {
     }
 }
 
-/// Which producer may append which subject (§2.2). Turns only come from the router itself.
+/// Which producer may append which subject (§2.2). Turns, and their copies for cognition, only
+/// come from the router itself.
 pub fn subject_allowed(subject: &str, producer: &str, hive_id: &str) -> bool {
-    if subject == SUBJECT_STORAGE_TURNS {
+    if subject == SUBJECT_STORAGE_TURNS || subject == SUBJECT_COGNITION_TURNS {
         return false;
     }
     if subject.starts_with(SUBJECT_STORAGE_COGNITION_PREFIX) {
@@ -103,15 +104,30 @@ pub fn subject_allowed(subject: &str, producer: &str, hive_id: &str) -> bool {
     subject == SUBJECT_STORAGE_USAGE
 }
 
-/// The sinks of a subject on a hive of this role (§2.3). Stage 1b: SY.storage takes every subject
-/// from every hive; SY.cognition and SY.policy join `storage.turns` on their hive in stage 2.
-pub fn sinks_for(subject: &str, _role: &str, _hive_id: &str) -> Vec<String> {
-    let storage = format!("SY.storage@{PRIMARY_HIVE_ID}");
+/// Whether SY.cognition runs on a hive of this role: next to the agents (§6.1, D16).
+fn role_runs_cognition(role: &str) -> bool {
+    matches!(
+        role.trim().to_ascii_lowercase().as_str(),
+        "motherbee" | "worker"
+    )
+}
+
+/// The sinks of a subject on a hive of this role (§2.3, §6.2): SY.storage takes the log and
+/// everything derived, from every hive; the hive's own SY.cognition takes the copies its router made
+/// of its agents' communications.
+pub fn sinks_for(subject: &str, role: &str, hive_id: &str) -> Vec<String> {
+    if subject == SUBJECT_COGNITION_TURNS {
+        return if role_runs_cognition(role) {
+            vec![format!("SY.cognition@{hive_id}")]
+        } else {
+            Vec::new()
+        };
+    }
     if subject == SUBJECT_STORAGE_TURNS
         || subject == SUBJECT_STORAGE_USAGE
         || subject.starts_with(SUBJECT_STORAGE_COGNITION_PREFIX)
     {
-        return vec![storage];
+        return vec![format!("SY.storage@{PRIMARY_HIVE_ID}")];
     }
     Vec::new()
 }
@@ -123,6 +139,7 @@ fn all_sinks(role: &str, hive_id: &str) -> Vec<String> {
         SUBJECT_STORAGE_TURNS,
         SUBJECT_STORAGE_USAGE,
         "storage.cognition.threads",
+        SUBJECT_COGNITION_TURNS,
     ] {
         for sink in sinks_for(subject, role, hive_id) {
             if !sinks.contains(&sink) {
@@ -320,6 +337,12 @@ impl StreamHandle {
     /// The router's copy of a turn: the message as it routed it, with the sender's real name.
     pub fn append_turn(&self, producer: &str, payload: Vec<u8>) {
         self.append(Source::Turns, SUBJECT_STORAGE_TURNS, producer, payload);
+    }
+
+    /// The router's copy, for its hive's SY.cognition, of a message a local agent sent or received;
+    /// the producer is that agent's node (§6.2).
+    pub fn append_cognition_turn(&self, agent_node: &str, payload: Vec<u8>) {
+        self.append(Source::Turns, SUBJECT_COGNITION_TURNS, agent_node, payload);
     }
 
     /// A node's `STREAM_APPEND`, already checked with `subject_allowed`.
@@ -577,7 +600,7 @@ fn accept_ack(
     }
 }
 
-fn batch_payload(stream: &str, records: &[Record]) -> Value {
+fn batch_payload(stream: &str, epoch: u64, records: &[Record]) -> Value {
     let records: Vec<StreamRecord> = records
         .iter()
         .map(|record| StreamRecord {
@@ -592,9 +615,16 @@ fn batch_payload(stream: &str, records: &[Record]) -> Value {
         .collect();
     serde_json::to_value(StreamBatch {
         stream: stream.to_string(),
+        epoch,
         records,
     })
     .unwrap_or(Value::Null)
+}
+
+/// A new epoch: a sink keys its last seq by stream and epoch, so a stream whose seq restarts is
+/// never mistaken for a repeat (§6.2).
+fn new_epoch() -> u64 {
+    uuid::Uuid::new_v4().as_u64_pair().0.max(1)
 }
 
 // ---- The disk ----
@@ -689,9 +719,15 @@ impl Disk {
         }
     }
 
-    fn save_state(&self, next_seq: u64, cursors: &HashMap<String, u64>) -> io::Result<()> {
-        let body = serde_json::to_vec(&json!({"next_seq": next_seq, "cursors": cursors}))
-            .map_err(io::Error::other)?;
+    fn save_state(
+        &self,
+        epoch: u64,
+        next_seq: u64,
+        cursors: &HashMap<String, u64>,
+    ) -> io::Result<()> {
+        let body =
+            serde_json::to_vec(&json!({"epoch": epoch, "next_seq": next_seq, "cursors": cursors}))
+                .map_err(io::Error::other)?;
         let tmp = self.dir.join(format!("{STATE_FILE}.tmp"));
         fs::write(&tmp, body)?;
         fs::rename(tmp, self.dir.join(STATE_FILE))
@@ -704,6 +740,8 @@ struct Recovered {
     records: Vec<Record>,
     next_seq: u64,
     cursors: HashMap<String, u64>,
+    /// The saved epoch, or a new one when `state.json` is missing or unreadable.
+    epoch: u64,
 }
 
 /// What is on disk. The records past the window are dropped (and counted) by the first trim.
@@ -742,6 +780,11 @@ fn recover(dir: &Path, sinks: &[String]) -> io::Result<Recovered> {
         .and_then(|bytes| serde_json::from_slice(&bytes).ok())
         .unwrap_or(Value::Null);
     let saved_next = state.get("next_seq").and_then(Value::as_u64).unwrap_or(1);
+    let epoch = state
+        .get("epoch")
+        .and_then(Value::as_u64)
+        .filter(|epoch| *epoch > 0)
+        .unwrap_or_else(new_epoch);
     let next_seq = saved_next.max(last_on_disk + 1).max(1);
     let mut cursors = HashMap::new();
     if let Some(saved) = state.get("cursors").and_then(Value::as_object) {
@@ -772,6 +815,7 @@ fn recover(dir: &Path, sinks: &[String]) -> io::Result<Recovered> {
         records,
         next_seq,
         cursors,
+        epoch,
     })
 }
 
@@ -784,6 +828,7 @@ pub struct StreamRuntime {
     counters: Arc<Counters>,
     sinks: Vec<String>,
     node: NodeConfig,
+    epoch: u64,
 }
 
 /// Opens the stream of this router: recovers its log and starts its disk thread. The returned
@@ -807,8 +852,10 @@ pub fn open(
             records: Vec::new(),
             next_seq: 1,
             cursors: HashMap::new(),
+            epoch: new_epoch(),
         }
     });
+    let epoch = recovered.epoch;
     let mut shared = Shared {
         records: VecDeque::new(),
         turn_bytes: 0,
@@ -870,6 +917,7 @@ pub fn open(
                 thread_counters,
                 queues,
                 stream_name,
+                epoch,
             )
         });
     if let Err(err) = spawned {
@@ -896,6 +944,7 @@ pub fn open(
             counters,
             sinks,
             node,
+            epoch,
         },
     )
 }
@@ -915,6 +964,7 @@ fn run_disk(
     counters: Arc<Counters>,
     queues: QueueCounts,
     stream_name: String,
+    epoch: u64,
 ) {
     let fsync_every = Duration::from_millis(STREAM_FSYNC_INTERVAL_MS);
     let housekeeping_every = Duration::from_millis(STREAM_HOUSEKEEPING_INTERVAL_MS);
@@ -981,7 +1031,7 @@ fn run_disk(
                 let state_now = (next_seq, cursors);
                 let saved = if last_saved.as_ref() == Some(&state_now) {
                     true
-                } else if disk.save_state(state_now.0, &state_now.1).is_ok() {
+                } else if disk.save_state(epoch, state_now.0, &state_now.1).is_ok() {
                     last_saved = Some(state_now);
                     true
                 } else {
@@ -1161,6 +1211,7 @@ pub async fn run_node(runtime: StreamRuntime) {
         std::mem::drop(tokio::spawn(run_sink(
             sink.clone(),
             stream_name.clone(),
+            runtime.epoch,
             Arc::clone(&runtime.shared),
             Arc::clone(&runtime.notify),
             Arc::clone(&dispatcher),
@@ -1203,6 +1254,7 @@ pub async fn run_node(runtime: StreamRuntime) {
 async fn run_sink(
     sink: String,
     stream_name: String,
+    epoch: u64,
     shared: Arc<StdMutex<Shared>>,
     notify: Arc<Notify>,
     dispatcher: Arc<RouterDispatcher>,
@@ -1228,7 +1280,7 @@ async fn run_sink(
                 scanned_up_to,
             } => (records, last_seq, scanned_up_to),
         };
-        let payload = batch_payload(&stream_name, &records);
+        let payload = batch_payload(&stream_name, epoch, &records);
         let result = dispatcher
             .send_system_rpc(SystemRpcRequest {
                 target: &sink,
@@ -1613,7 +1665,7 @@ mod tests {
             let mut cursors = HashMap::new();
             cursors.insert("SY.storage@motherbee".to_string(), 9);
             cursors.insert("SY.gone@motherbee".to_string(), 2);
-            disk.save_state(4, &cursors).unwrap();
+            disk.save_state(77, 4, &cursors).unwrap();
         }
         let recovered = recover(&dir, &sinks).unwrap();
         assert_eq!(recovered.records.len(), 3);
@@ -1634,7 +1686,7 @@ mod tests {
         disk.trim(100, false);
         assert_eq!(disk.segments.len(), 1, "the newest segment stays");
         let path = disk.segments[0].path.clone();
-        disk.save_state(2, &HashMap::new()).unwrap();
+        disk.save_state(77, 2, &HashMap::new()).unwrap();
         disk.trim(100, true);
         assert!(
             disk.segments.is_empty() && !path.exists(),
@@ -1666,6 +1718,42 @@ mod tests {
             handle.counters.dropped_queue_turns.load(Ordering::Relaxed),
             1
         );
+    }
+
+    #[test]
+    fn cognition_copies_go_to_the_hives_own_cognition_only() {
+        assert_eq!(
+            sinks_for(SUBJECT_COGNITION_TURNS, "worker", "worker1"),
+            vec!["SY.cognition@worker1".to_string()]
+        );
+        assert_eq!(
+            sinks_for(SUBJECT_COGNITION_TURNS, "motherbee", "motherbee"),
+            vec!["SY.cognition@motherbee".to_string()]
+        );
+        assert!(sinks_for(SUBJECT_COGNITION_TURNS, "ingress", "ingress1").is_empty());
+        assert!(all_sinks("worker", "worker1").contains(&"SY.cognition@worker1".to_string()));
+        assert!(!subject_allowed(
+            SUBJECT_COGNITION_TURNS,
+            "SY.cognition@worker1",
+            "worker1"
+        ));
+        assert!(subject_allowed(
+            fluxbee_sdk::stream::SUBJECT_STORAGE_COGNITION_BATCH,
+            "SY.cognition@worker1",
+            "worker1"
+        ));
+    }
+
+    #[test]
+    fn the_epoch_survives_a_restart_and_changes_when_the_state_is_lost() {
+        let dir = std::env::temp_dir().join(format!("fluxbee-stream-{}", uuid::Uuid::new_v4()));
+        let first = recover(&dir, &[]).unwrap();
+        let disk = first.disk.unwrap();
+        disk.save_state(first.epoch, 1, &HashMap::new()).unwrap();
+        assert_eq!(recover(&dir, &[]).unwrap().epoch, first.epoch);
+        fs::remove_file(dir.join(STATE_FILE)).unwrap();
+        assert_ne!(recover(&dir, &[]).unwrap().epoch, first.epoch);
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
