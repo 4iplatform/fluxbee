@@ -995,7 +995,7 @@ Visto al arreglar los e2e de A-37, leyendo `src/router/mod.rs` y `src/shm/mod.rs
   binario generaría uno como root); si no, el `myID` del Syncthing en marcha. Nunca `config.xml`.
 - **Estado:** construido; lo ejercita el próximo join (el de A-48).
 
-### A-70 🟡 ETAPAS 1a, 1b Y 2a VALIDADAS EN 8.x (0.1.75, 0.1.76 y 0.1.77, 2026-10-16/17); 2b Y 3 PENDIENTES — El "NATS" de los registros vive dentro del router, pierde datos y solo guarda lo del motherbee
+### A-70 🟡 ETAPAS 1 Y 2 VALIDADAS EN 8.x (0.1.75 a 0.1.78, 2026-10-16/17): NATS BORRADO; ETAPA 3 (TOKENS) PENDIENTE — El "NATS" de los registros vive dentro del router, pierde datos y solo guarda lo del motherbee
 
 - **Cómo salió:** diseñando la etapa 5 (tokens), el registro iba a viajar por NATS. El operador
   pidió revisar NATS en general y entre hives. Diseño: `docs/router-stream-v1.md`.
@@ -1158,12 +1158,38 @@ Visto al arreglar los e2e de A-37, leyendo `src/router/mod.rs` y `src/shm/mod.rs
   - **SY.policy** no corre en ningún hive; NATS no recibió nada; health limpio.
 
   Detalle en `lab/DEPLOYMENTS.md`.
+- **Etapa 2b, el código:** NATS borrado, unas 9.000 líneas: el broker, el cliente del SDK, los
+  diags, ocho scripts, SY.policy y `thread_seq`. Las métricas de SY.storage y la espera del
+  orquestador por la base pasan a la malla (`STORAGE_METRICS_GET`), y hay transiciones únicas al
+  arrancar. Una revisión del código con dos miradas, sin HIGH:
+  - **MEDIUM:** en el motherbee, el router viejo volvía a escribir el estado del broker después de
+    la limpieza, al pararse durante el arranque. La limpieza ahora corre después de que el router
+    corre el binario nuevo;
+  - **LOW, todos arreglados:**
+    - los nodos retirados quedan afuera para todo el que lee una sección de roles;
+    - los comandos del admin, que quedaban en cola durante el arranque, reciben
+      `ORCHESTRATOR_BOOTING`;
+    - un escaneo de métricas a la vez;
+    - restos de SY.policy en un motherbee instalado con `install.sh`;
+    - comentarios viejos;
+    - el chequeo de paridad del catálogo del admin, roto desde 1b y A-68.
+- **La etapa 2b, validada en 8.x (0.1.78):**
+  - **en ningún hive queda nada de NATS ni de SY.policy:** nada en 4222, ni directorio, ni
+    sección, ni unit, ni binario;
+  - **el ingress registró sus 597 turnos pendientes** antes de borrar el broker;
+  - **las métricas y la espera de la base funcionan por la malla;**
+  - **con SY.storage retenido,** el admin contestó `ORCHESTRATOR_BOOTING` en 0,01 s durante el
+    arranque, en vez de colgarse;
+  - **la regresión de cognition pasa;**
+  - **health limpio.**
+
+  Detalle en `lab/DEPLOYMENTS.md`.
 - **Etapas:**
   1. **1a:** los bugs vivos ✅;
   2. **1b:** el stream con SY.storage ✅;
   3. **2a:** cognition por comunicación, SY.policy retirado ✅;
-  4. **2b:** NATS borrado, y SY.policy fuera del todo;
-  5. **3:** los tokens.
+  4. **2b:** NATS borrado, y SY.policy fuera del todo ✅;
+  5. **3:** los tokens. Se conversa con el operador (*"cuando termine etapa 2 hablamos de 3"*).
 
 ### A-69 ✅ VALIDADO EN 8.x (0.1.73 y 0.1.74, 2026-10-16) — SY.cognition fallaba en cada turno con los dos proveedores: mandaba `temperature`
 

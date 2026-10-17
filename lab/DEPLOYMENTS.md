@@ -21,7 +21,8 @@
 
 | Versión | Fecha (ART) | Commit | Alcance | Estado | Rollback |
 |---|---|---|---|---|---|
-| **0.1.77** | 2026-10-17 | `377945a` | motherbee + spokes (core) | ✅ live | snap `pre-stream2a-0-1-77` (las 4 VMs); `apt` solo no alcanza (ver la entrada) |
+| **0.1.78** | 2026-10-17 | `104fa65` | motherbee + spokes (core) | ✅ live | snap `pre-stream2b-0-1-78` (las 4 VMs) · `apt install fluxbee=0.1.77` + core-update de los spokes |
+| **0.1.77** | 2026-10-17 | `377945a` | motherbee + spokes (core) | ✅ reemplazado por 0.1.78 | snap `pre-stream2a-0-1-77` (las 4 VMs); `apt` solo no alcanza (ver la entrada) |
 | **0.1.76** | 2026-10-16 | `e24e7d3` | motherbee + spokes (core) | ✅ reemplazado por 0.1.77 | snap `pre-stream1b-0-1-76` (las 4 VMs); `apt install fluxbee=0.1.75` pierde la inbox purgada (ver la entrada) |
 | **0.1.75** | 2026-10-16 | `1c00389` | motherbee + spokes (core) | ✅ reemplazado por 0.1.76 | snap `pre-stream1a-0-1-75` (las 4 VMs); `apt` solo no alcanza (ver la entrada) |
 | **0.1.74** | 2026-10-16 | `0d69329` | motherbee + spokes (core) | ✅ reemplazado por 0.1.75 | snap `pre-sdk-0-1-74` (las 4 VMs) · `apt install fluxbee=0.1.73` |
@@ -86,6 +87,90 @@
 > (`dpkg-scanpackages -m`) para rollback, pero su detalle vive en la bitácora, no acá.
 
 ---
+
+## 0.1.78 — NATS borrado y SY.policy fuera (A-70, etapa 2b)
+
+- **Fecha:** 2026-10-17 (ART) · **Versión anterior:** 0.1.77 · **Commit:** `104fa65`.
+  - Diseño: `docs/router-stream-v1.md` §6.3, y cómo quedó construido en §6.9.
+  - Una revisión del código con dos miradas (el camino del upgrade, lo que dejó la remoción):
+    ningún HIGH. El MEDIUM y los LOW se arreglaron antes del build.
+- **Alcance:** motherbee + los tres spokes (core-update).
+- **Qué cambió:**
+  - **NATS borrado:** se fueron unas 9.000 líneas:
+    - el broker del router, el cliente del SDK y `ClientConfig`;
+    - los dos diags y ocho scripts;
+    - SY.policy;
+    - `meta.thread_seq`;
+    - la ingesta de `storage.events`, `storage.items` y `storage.reactivation`, que nunca
+      tuvieron productor (sus tablas quedan).
+  - **SY.storage** no lee nada de NATS:
+    - contesta `STORAGE_METRICS_GET` por la malla, un escaneo de la inbox a la vez;
+    - `GET /config/storage/metrics` del admin pregunta ahí, con la misma respuesta de antes.
+  - **SY.orchestrator:**
+    - se une a su router y después espera la base de SY.storage por la malla;
+    - mientras tanto los comandos del admin reciben `ORCHESTRATOR_BOOTING`, así nadie queda
+      esperando a un hive que no está listo (antes fallaban porque el orquestador no estaba en el
+      router todavía).
+  - **Transiciones únicas al arrancar, en el log:**
+    - los mensajes pendientes del broker por subject;
+    - después, `/var/lib/fluxbee/nats` y la sección `nats:` de `hive.yaml`. Esto corre después de
+      que el router corre el binario nuevo, porque el viejo, al pararse, vuelca su broker a disco;
+    - SY.policy sale de todas las secciones de `hive.yaml`, y se borran su unit y su binario
+      donde quedaron.
+  - **Los joins** escriben `hive.yaml` sin `nats:`, y nadie crea el directorio `nats`.
+  - **SY.cognition** registra de dónde sacó su clave de IA una vez que la buscó.
+  - **El chequeo de paridad del catálogo del admin** reconoce `list_streams` y el argumento nuevo
+    del deploy de WF. Estaba rojo desde 1b y A-68.
+- **Deploy:**
+  - build de `104fa65` en 23 min, publish en 13 s, deploy en 241 s;
+  - snapshots `pre-stream2b-0-1-78` en las 4 VMs (se borró `pre-stream1a-0-1-75`);
+  - 0.1.78 en los 4, health `failed=0 streamlost=0`.
+- **Gate:**
+  - **Nada de NATS ni de SY.policy en ningún hive:**
+    - nada escucha en 4222;
+    - no hay `/var/lib/fluxbee/nats`, ni sección `nats:` (tampoco su comentario) ni SY.policy en
+      `hive.yaml`;
+    - no quedan la unit ni el binario de SY.policy; su unit da `not-found`.
+  - **Lo que registró cada orquestador:**
+    - **ingress:** "pending={storage.turns: 597}", los turnos del edge que nadie consumía, y
+      después borró el directorio;
+    - **worker1:** borró la unit y el binario de SY.policy;
+    - **motherbee:** sacó SY.policy de su sección `worker` (dos líneas);
+    - **los cuatro:** quitaron la sección `nats:`.
+  - **Por la malla:**
+    - `GET /config/storage/metrics` contesta `ok` (0 pendientes);
+    - en el upgrade, el orquestador del motherbee confirmó la base en 10,6 s (18 intentos) y
+      después pasó a "hive ready". La espera fue el arranque de SY.storage: el vault le resolvió
+      la URL, recibió el broadcast del vault y salió para reconectar (el rescate de siempre).
+  - **La ventana de arranque**, con SY.storage retenido 40 s y el orquestador del motherbee
+    reiniciado:
+    - `GET /hives` contestó `502 TRANSPORT_ERROR` hasta que el orquestador se unió al router;
+    - después contestó `ORCHESTRATOR_BOOTING` en 0,01 s;
+    - pasó a `ok` 4 s después de liberar SY.storage;
+    - nadie quedó colgado.
+  - **Regresión de cognition** (un agente en el motherbee, dos turnos desde worker1):
+    - la cognition del motherbee procesó los 4 turnos, ninguno sin ILK de agente;
+    - una comunicación en la base (turno 4), con el ILK del agente;
+    - la región tiene su entrada y los streams entregaron todo.
+  - **SY.cognition** registra "looked up its AI key ai_secret_source=vault".
+  - **Health:** `failed=0 denials=0 srcdrops=0 streamlost=0` en los 4.
+  - **No se probó en vivo:** un join nuevo de un worker con `hive.yaml` sin `nats:`. Necesita una
+    VM nueva; el cambio son las tres plantillas, y la revisión lo cubrió.
+  - **Limpieza:**
+    - el nodo de prueba purgado con su identidad (identity volvió a 28 ILKs);
+    - el tenant borrado y purgado;
+    - la región vaciada;
+    - se borraron 4 turnos, sus 4 filas de inbox, 75 sobres y todas las filas de cognition
+      (no queda ninguna);
+    - ninguna máscara quedó.
+- **Pendiente:** las transiciones (NATS y SY.policy) se borran del código cuando todos los hives
+  hayan arrancado 0.1.78, en la pasada de limpieza.
+- **Rollback:** snapshot `pre-stream2b-0-1-78`, o `apt install fluxbee=0.1.77` más el
+  core-update de los spokes:
+  - 0.1.77 arranca sin la sección `nats:`, con los valores por defecto y un broker vacío;
+  - SY.policy ya no corría en 0.1.77;
+  - lo que no vuelve son los 597 turnos que el broker del ingress tenía sin consumir. Se
+    descartaron a propósito (decisión del operador).
 
 ## 0.1.77 — Cognition por comunicación: el router del agente le pasa los dos sentidos a su cognition local (A-70, etapa 2a)
 

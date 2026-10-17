@@ -1,8 +1,8 @@
 # Router stream — v1
 
 Status: design reviewed once (2026-10-16); stages 1a and 1b validated on 8.x (0.1.75, 0.1.76);
-stage 2 designed with the operator and reviewed (2026-10-17, §6), 2a validated on 8.x (0.1.77,
-§6.8), 2b built for 0.1.78 (§6.9); stage 3 pending. Finding A-70 (`lab/logbook/FINDINGS.md`).
+stage 2 designed with the operator and reviewed (2026-10-17, §6), validated on 8.x (2a in 0.1.77,
+§6.8; 2b in 0.1.78, §6.9: NATS is gone); stage 3 pending. Finding A-70 (`lab/logbook/FINDINGS.md`).
 
 The router gets a small stream of its own. It replaces the embedded NATS broker, and carries three
 kinds of data to SY.storage:
@@ -825,3 +825,9 @@ reader of a role section; admin commands queued during the boot → `ORCHESTRATO
 scans could stack → one at a time; leftover unit and binary on a motherbee installed by
 `scripts/install.sh`; stale comments; the admin catalog parity check had missed `list_streams`
 (1b) and the WF deploy's new argument (A-68).
+
+On 8.x (0.1.78, 2026-10-17): nothing of NATS or SY.policy is left on any hive; the ingress logged
+its 597 unread turns before its broker went; storage metrics and the orchestrator's database wait
+work over the mesh; with SY.storage held, admin commands got `ORCHESTRATOR_BOOTING` within 0.01 s
+during the boot; a cognition conversation still works; health clean. Details in
+`lab/DEPLOYMENTS.md`.
