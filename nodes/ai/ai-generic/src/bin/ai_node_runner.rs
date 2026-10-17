@@ -1782,7 +1782,7 @@ impl GenericAiNode {
                         "allowed": ["echo", "ai_chat"]
                     },
                     "config.behavior.model": {
-                        "examples": ["gpt-5.5", "claude-sonnet-4-5"]
+                        "examples": ["gpt-5.5", "claude-sonnet-5-5"]
                     }
                 },
                 "optional_fields": [
@@ -5506,13 +5506,6 @@ fn inject_memory_package_into_input_parts(
     enriched
 }
 
-#[allow(dead_code)]
-fn require_src_ilk(ctx: &BehaviorContext) -> fluxbee_ai_sdk::Result<&str> {
-    ctx.src_ilk
-        .as_deref()
-        .ok_or_else(|| fluxbee_ai_sdk::errors::AiSdkError::Protocol("missing_src_ilk".to_string()))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -6422,17 +6415,6 @@ mod tests {
     fn extract_thread_id_does_not_read_legacy_meta_context() {
         let msg = sample_user_request_with_context(json!({ "thread_id": "legacy-thread-1" }), None);
         assert_eq!(extract_thread_id(&msg), None);
-    }
-
-    #[test]
-    fn require_src_ilk_returns_missing_src_ilk_error() {
-        let ctx = BehaviorContext {
-            thread_id: None,
-            src_ilk: None,
-            trace_id: None,
-        };
-        let err = require_src_ilk(&ctx).expect_err("missing src_ilk should fail");
-        assert!(err.to_string().contains("missing_src_ilk"));
     }
 
     #[test]

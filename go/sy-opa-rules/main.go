@@ -1308,11 +1308,6 @@ func (s *Service) sendSDK(msg fluxbeesdk.Message) {
 	}
 }
 
-func mustJSON(v any) []byte {
-	data, _ := json.Marshal(v)
-	return data
-}
-
 func compileRego(rego string, entrypoint string) ([]byte, string, int64, error) {
 	tmpDir, err := os.MkdirTemp("", "opa-compile")
 	if err != nil {

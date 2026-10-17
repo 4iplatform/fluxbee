@@ -60,8 +60,8 @@ const INBOX_MAINTENANCE_INTERVAL_SECS: u64 = 60;
 const INBOX_MAX_ATTEMPTS: i32 = 10;
 /// A row younger than this is left to its live handler, so a retry never races it.
 const INBOX_RETRY_MIN_AGE_SECS: i32 = 60;
-/// Processed rows are kept this long, then purged: once `turns` holds the whole message (the
-/// one-time backfill below), the inbox only absorbs redeliveries and restarts.
+/// Processed rows are kept this long, then purged: `turns` holds the whole message, so the inbox
+/// only absorbs redeliveries and restarts.
 const STORAGE_INBOX_RETENTION_HOURS: i32 = 24;
 /// The most processed rows one purge deletes, so a purge is never one huge transaction.
 const INBOX_PURGE_BATCH: i64 = 10_000;
@@ -88,9 +88,6 @@ const COGNITION_STATE_ORDER: [CognitionDurableEntity; 8] = [
 /// The most bytes of records or groups one `USAGE_QUERY_RESPONSE` carries: with its cursor (a time
 /// and a field of at most `USAGE_FIELD_MAX_CHARS` characters) the answer stays under 64 KiB.
 const USAGE_QUERY_PAGE_BYTES: usize = 62 * 1024;
-/// The one-time copy of the old turns' whole messages from the inbox into `turns` (A-70, Q7).
-const TURNS_BACKFILL_MIGRATION: &str = "turns_backfill_from_inbox_v1";
-const TURNS_BACKFILL_PAGE: i64 = 500;
 
 /// `turns` is keyed by the record's inbox key (A-70). It was keyed by `(ctx, seq)`, which come from
 /// the `trace_id` when the message has no `meta.ctx`; a reply reuses its request's `trace_id`, so
@@ -353,21 +350,6 @@ CREATE INDEX IF NOT EXISTS idx_cognition_memories_communication ON cognition_mem
 CREATE INDEX IF NOT EXISTS idx_cognition_episodes_communication ON cognition_episodes(thread_id, agent_ilk);
 "#;
 
-/// The tables of the per-thread model (before 0.1.77) are dropped once, marked
-/// `cognition_reset_v1`: their data were tests, and their rows had no agent (operator, 2026-10-17,
-/// D19).
-const COGNITION_RESET_SQL: &str = r#"
-DO $$
-BEGIN
-    IF NOT EXISTS (SELECT 1 FROM storage_migrations WHERE name = 'cognition_reset_v1') THEN
-        DROP TABLE IF EXISTS cognition_threads, cognition_contexts, cognition_reasons,
-            cognition_cooccurrences, cognition_scopes, cognition_scope_instances,
-            cognition_memories, cognition_episodes;
-        INSERT INTO storage_migrations (name, detail)
-        VALUES ('cognition_reset_v1', 'cognition tables of the per-thread model dropped');
-    END IF;
-END $$;
-"#;
 /// LLM usage records (A-70 stage 3, docs/router-stream-v1.md §7.5), one row per model call:
 /// `claimed_tenant_id` is the tenant the record named, `tenant_id` the one SY.storage charged, and
 /// `verified` is false when identity never answered. A response lands once (`record_id`, and the
@@ -822,34 +804,6 @@ CREATE TABLE IF NOT EXISTS turns (
     tags        TEXT[]
 );
 
-CREATE TABLE IF NOT EXISTS events (
-    event_id        BIGSERIAL PRIMARY KEY,
-    ctx             TEXT NOT NULL,
-    start_seq       BIGINT NOT NULL,
-    end_seq         BIGINT NOT NULL,
-    boundary_reason TEXT NOT NULL,
-    cues_agg        TEXT[] NOT NULL,
-    outcome_status  TEXT,
-    outcome_duration_ms BIGINT,
-    activation_strength REAL DEFAULT 0.5,
-    context_inhibition  REAL DEFAULT 0.0,
-    use_count       INT DEFAULT 0,
-    success_count   INT DEFAULT 0,
-    last_used_at    TIMESTAMPTZ,
-    created_at      TIMESTAMPTZ DEFAULT now()
-);
-
-CREATE TABLE IF NOT EXISTS memory_items (
-    memory_id       TEXT PRIMARY KEY,
-    event_id        BIGINT REFERENCES events(event_id),
-    item_type       TEXT NOT NULL,
-    content         JSONB NOT NULL,
-    confidence      REAL NOT NULL,
-    cues_signature  TEXT[] NOT NULL,
-    activation_strength REAL DEFAULT 0.5,
-    created_at      TIMESTAMPTZ DEFAULT now()
-);
-
 CREATE TABLE IF NOT EXISTS storage_inbox (
     dedupe_key  TEXT PRIMARY KEY,
     subject     TEXT NOT NULL,
@@ -860,19 +814,6 @@ CREATE TABLE IF NOT EXISTS storage_inbox (
     last_error  TEXT
 );
 
-CREATE TABLE IF NOT EXISTS storage_reactivation_applied (
-    dedupe_key  TEXT NOT NULL,
-    event_id    BIGINT NOT NULL,
-    used        BOOLEAN NOT NULL,
-    outcome_ok  BOOLEAN NOT NULL,
-    created_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
-    PRIMARY KEY (dedupe_key, event_id)
-);
-
-CREATE INDEX IF NOT EXISTS idx_events_cues ON events USING GIN(cues_agg);
-CREATE INDEX IF NOT EXISTS idx_events_activation ON events(activation_strength DESC);
-CREATE INDEX IF NOT EXISTS idx_events_natural_key ON events(ctx, start_seq, end_seq, boundary_reason);
-CREATE INDEX IF NOT EXISTS idx_items_cues ON memory_items USING GIN(cues_signature);
 CREATE INDEX IF NOT EXISTS idx_storage_inbox_pending ON storage_inbox(processed_at, received_at);
 
 	"#,
@@ -880,7 +821,6 @@ CREATE INDEX IF NOT EXISTS idx_storage_inbox_pending ON storage_inbox(processed_
             .await?;
         self.client.batch_execute(TURNS_KEY_MIGRATION_SQL).await?;
         self.client.batch_execute(MESSAGE_LOG_MIGRATION_SQL).await?;
-        self.client.batch_execute(COGNITION_RESET_SQL).await?;
         self.client.batch_execute(COGNITION_SCHEMA_SQL).await?;
         self.client.batch_execute(USAGE_SCHEMA_SQL).await?;
         Ok(())
@@ -1122,129 +1062,6 @@ RETURNING processed_at IS NOT NULL, attempts
         }
         state.sort_by(|a, b| (entity_rank(a.0), &a.1).cmp(&(entity_rank(b.0), &b.1)));
         Ok(state)
-    }
-
-    async fn migration_applied(&self, name: &str) -> Result<bool, StorageError> {
-        Ok(self
-            .client
-            .query_opt("SELECT 1 FROM storage_migrations WHERE name = $1", &[&name])
-            .await?
-            .is_some())
-    }
-
-    /// Once: `turns` gets the whole message of every turn the inbox still holds (A-70, Q7). A row
-    /// of 0.1.75 (already under its inbox key) gets the message; a row of before 0.1.75
-    /// (`legacy:<ctx>:<seq>`) is matched by (ctx, seq, from_ilk) and takes its inbox key and
-    /// message; a turn `turns` had dropped (an AI reply, same trace_id as its request) is inserted
-    /// with its arrival time. Until it ran, the inbox is not purged.
-    async fn backfill_turns_from_inbox(&self) -> Result<(), StorageError> {
-        if self.migration_applied(TURNS_BACKFILL_MIGRATION).await? {
-            return Ok(());
-        }
-        let (mut completed, mut relinked, mut inserted, mut present, mut unreadable) =
-            (0u64, 0u64, 0u64, 0u64, 0u64);
-        let mut after: Option<(std::time::SystemTime, String)> = None;
-        loop {
-            let after_ts = after.as_ref().map(|(ts, _)| *ts);
-            let after_key = after.as_ref().map(|(_, key)| key.clone());
-            let rows = self
-                .client
-                .query(
-                    r#"
-SELECT dedupe_key, payload, received_at
-FROM storage_inbox
-WHERE subject = $1 AND processed_at IS NOT NULL
-  AND ($2::timestamptz IS NULL OR (received_at, dedupe_key) > ($2::timestamptz, $3::text))
-ORDER BY received_at ASC, dedupe_key ASC
-LIMIT $4
-"#,
-                    &[
-                        &SUBJECT_STORAGE_TURNS,
-                        &after_ts,
-                        &after_key,
-                        &TURNS_BACKFILL_PAGE,
-                    ],
-                )
-                .await?;
-            if rows.is_empty() {
-                break;
-            }
-            for row in &rows {
-                let dedupe_key: String = row.get(0);
-                let payload: Vec<u8> = row.get(1);
-                let received_at: std::time::SystemTime = row.get(2);
-                after = Some((received_at, dedupe_key.clone()));
-                let Ok(turn) = serde_json::from_slice::<Value>(&payload)
-                    .map_err(StorageError::from)
-                    .and_then(parse_turn)
-                else {
-                    unreadable += 1;
-                    continue;
-                };
-                let filled = self
-                    .client
-                    .execute(
-                        r#"
-UPDATE turns SET thread_id = $2, trace_id = $3, message = $4
-WHERE dedupe_key = $1 AND message IS NULL
-"#,
-                        &[&dedupe_key, &turn.thread_id, &turn.trace_id, &turn.message],
-                    )
-                    .await?;
-                if filled > 0 {
-                    completed += 1;
-                    continue;
-                }
-                let exists = self
-                    .client
-                    .query_opt("SELECT 1 FROM turns WHERE dedupe_key = $1", &[&dedupe_key])
-                    .await?
-                    .is_some();
-                if exists {
-                    present += 1;
-                    continue;
-                }
-                let updated = self
-                    .client
-                    .execute(
-                        r#"
-UPDATE turns SET dedupe_key = $1, thread_id = $2, trace_id = $3, message = $4
-WHERE dedupe_key LIKE 'legacy:%' AND ctx = $5 AND seq = $6 AND from_ilk = $7
-"#,
-                        &[
-                            &dedupe_key,
-                            &turn.thread_id,
-                            &turn.trace_id,
-                            &turn.message,
-                            &turn.ctx,
-                            &turn.seq,
-                            &turn.from_ilk,
-                        ],
-                    )
-                    .await?;
-                if updated > 0 {
-                    relinked += 1;
-                    continue;
-                }
-                self.persist_turn(&self.client, &dedupe_key, &turn, Some(received_at))
-                    .await?;
-                inserted += 1;
-            }
-            if (rows.len() as i64) < TURNS_BACKFILL_PAGE {
-                break;
-            }
-        }
-        let detail = format!(
-            "completed {completed}, relinked {relinked}, inserted {inserted}, already present {present}, unreadable {unreadable}"
-        );
-        self.client
-            .execute(
-                "INSERT INTO storage_migrations (name, detail) VALUES ($1, $2) ON CONFLICT (name) DO NOTHING",
-                &[&TURNS_BACKFILL_MIGRATION, &detail],
-            )
-            .await?;
-        tracing::info!(%detail, "turns backfilled from the storage inbox (once)");
-        Ok(())
     }
 
     /// Deletes processed rows older than `retention_hours`, at most `INBOX_PURGE_BATCH` per call.
@@ -2220,18 +2037,13 @@ fn message_dedupe_key(subject: &str, payload: &[u8]) -> String {
 
 /// Every `INBOX_MAINTENANCE_INTERVAL_SECS`, retries the rows that failed and purges the processed
 /// ones past `STORAGE_INBOX_RETENTION_HOURS` (A-70). The startup replay already ran, so the first
-/// round waits one interval. The one-time turns backfill runs here first, off the startup path:
-/// SY.storage takes the streams' batches meanwhile. Until it ran, the inbox is not purged.
+/// round waits one interval.
 async fn run_inbox_maintenance_loop(storage: Arc<Storage>) {
-    let mut backfilled = backfill_turns(&storage).await;
     let mut ticker = time::interval(Duration::from_secs(INBOX_MAINTENANCE_INTERVAL_SECS));
     ticker.set_missed_tick_behavior(time::MissedTickBehavior::Delay);
     ticker.tick().await;
     loop {
         ticker.tick().await;
-        if !backfilled {
-            backfilled = backfill_turns(&storage).await;
-        }
         match storage
             .replay_pending_messages(
                 INBOX_REPLAY_BATCH_SIZE,
@@ -2244,26 +2056,13 @@ async fn run_inbox_maintenance_loop(storage: Arc<Storage>) {
             Ok(count) => tracing::info!(count, "retried failed storage inbox messages"),
             Err(err) => tracing::warn!(error = %err, "storage inbox retry failed"),
         }
-        // Until the backfill ran, the old replies exist only in the inbox: no purge before.
-        if backfilled {
-            match storage
-                .purge_processed_inbox(STORAGE_INBOX_RETENTION_HOURS)
-                .await
-            {
-                Ok(0) => {}
-                Ok(count) => tracing::info!(count, "purged processed storage inbox messages"),
-                Err(err) => tracing::warn!(error = %err, "storage inbox purge failed"),
-            }
-        }
-    }
-}
-
-async fn backfill_turns(storage: &Storage) -> bool {
-    match storage.backfill_turns_from_inbox().await {
-        Ok(()) => true,
-        Err(err) => {
-            tracing::warn!(error = %err, "turns backfill from the inbox failed; it runs again next round");
-            false
+        match storage
+            .purge_processed_inbox(STORAGE_INBOX_RETENTION_HOURS)
+            .await
+        {
+            Ok(0) => {}
+            Ok(count) => tracing::info!(count, "purged processed storage inbox messages"),
+            Err(err) => tracing::warn!(error = %err, "storage inbox purge failed"),
         }
     }
 }
@@ -4389,14 +4188,11 @@ mod tests {
         }
         assert!(COGNITION_SCHEMA_SQL.contains("communication_id TEXT PRIMARY KEY"));
         assert!(!COGNITION_SCHEMA_SQL.contains("thread_seq"));
-        assert!(COGNITION_RESET_SQL.contains("name = 'cognition_reset_v1'"));
-        assert!(COGNITION_RESET_SQL.contains("cognition_episodes;"));
     }
 
     #[test]
     fn the_message_log_migration_runs_once() {
-        // Every column is added only when missing; the backfill and the purge depend on its
-        // marker table.
+        // Every column is added only when missing.
         for column in ["'source_ts'", "'message'", "'stored_at'"] {
             assert!(MESSAGE_LOG_MIGRATION_SQL.contains(&format!("column_name = {column}")));
         }

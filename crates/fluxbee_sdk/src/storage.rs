@@ -1,6 +1,5 @@
 //! SY.storage's inbox metrics over the mesh (A-70 stage 2b, docs/router-stream-v1.md §6.3).
-//! SY.admin and SY.orchestrator ask `SY.storage@<primary hive>` with a system message; until the
-//! embedded NATS broker went, they asked on `storage.metrics.get`.
+//! SY.admin and SY.orchestrator ask `SY.storage@<primary hive>` with a system message.
 
 use serde::{Deserialize, Serialize};
 

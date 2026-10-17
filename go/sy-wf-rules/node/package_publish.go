@@ -9,7 +9,6 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
-	"time"
 
 	fluxbeesdk "github.com/4iplatform/json-router/fluxbee-go-sdk"
 )
@@ -98,34 +97,6 @@ func buildWorkflowPackageFiles(hiveID, workflowName string, meta WfRulesMetadata
 		"package.json":               string(packageBytes),
 		"flow/definition.json":       string(definitionBytes),
 		"config/default-config.json": string(defaultConfigBytes),
-	}, nil
-}
-
-func (s *Service) publishWorkflowPackageLocal(workflowName string, meta WfRulesMetadata, definitionBytes []byte) (*PackagePublishResult, error) {
-	runtimeName := workflowRuntimeName(workflowName)
-	version := workflowRuntimeVersion(meta.Version)
-	packageFiles, err := buildWorkflowPackageFiles(s.cfg.HiveID, workflowName, meta, definitionBytes)
-	if err != nil {
-		return nil, err
-	}
-	packageDir := filepath.Join(s.cfg.DistRuntimeRoot, runtimeName, version)
-	for relPath, contents := range packageFiles {
-		targetPath := filepath.Join(packageDir, filepath.FromSlash(relPath))
-		parentDir := filepath.Dir(targetPath)
-		if err := os.MkdirAll(parentDir, 0o755); err != nil {
-			return nil, err
-		}
-		if err := writeFileAtomic(targetPath, []byte(contents), 0o644); err != nil {
-			return nil, err
-		}
-	}
-	if err := s.updateRuntimeManifest(runtimeName, version); err != nil {
-		return nil, err
-	}
-	return &PackagePublishResult{
-		RuntimeName: runtimeName,
-		Version:     version,
-		PackagePath: packageDir,
 	}, nil
 }
 
@@ -234,35 +205,6 @@ func (s *Service) removeRuntimeVersionOnPrimary(ctx context.Context, runtimeName
 	return nil
 }
 
-func (s *Service) updateRuntimeManifest(runtimeName, version string) error {
-	manifestPath := filepath.Join(s.cfg.DistRuntimeRoot, "manifest.json")
-	manifest, err := loadRuntimeManifest(manifestPath)
-	if err != nil {
-		return err
-	}
-	entry := manifest.Runtimes[runtimeName]
-	entry.PackageType = "workflow"
-	entry.RuntimeBase = workflowRuntimeBase
-	entry.Current = version
-	entry.Available = appendIfMissing(entry.Available, version)
-	sort.Strings(entry.Available)
-	manifest.Runtimes[runtimeName] = entry
-	manifest.SchemaVersion = 2
-	manifest.Version = nextManifestVersion(manifest.Version, uint64(time.Now().UTC().UnixMilli()))
-	manifest.UpdatedAt = time.Now().UTC().Format(timeRFC3339)
-	manifest.Hash = nil
-	return writeRuntimeManifest(manifestPath, manifest)
-}
-
-func writeRuntimeManifest(path string, manifest *runtimeManifest) error {
-	data, err := json.MarshalIndent(manifest, "", "  ")
-	if err != nil {
-		return err
-	}
-	data = append(data, '\n')
-	return writeFileAtomic(path, data, 0o644)
-}
-
 func loadRuntimeManifest(path string) (*runtimeManifest, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
@@ -288,43 +230,6 @@ func loadRuntimeManifest(path string) (*runtimeManifest, error) {
 	return &manifest, nil
 }
 
-func appendIfMissing(values []string, target string) []string {
-	for _, value := range values {
-		if value == target {
-			return values
-		}
-	}
-	return append(values, target)
-}
-
-func chooseManifestCurrent(available []string, preferredCurrent string, fallbackCurrent string) string {
-	if preferredCurrent != "" {
-		for _, version := range available {
-			if version == preferredCurrent {
-				return preferredCurrent
-			}
-		}
-	}
-	if fallbackCurrent != "" {
-		for _, version := range available {
-			if version == fallbackCurrent {
-				return fallbackCurrent
-			}
-		}
-	}
-	if len(available) == 0 {
-		return ""
-	}
-	return available[len(available)-1]
-}
-
 func workflowRuntimeName(workflowName string) string {
 	return "wf." + workflowName
-}
-
-func nextManifestVersion(current, now uint64) uint64 {
-	if now > current {
-		return now
-	}
-	return current + 1
 }

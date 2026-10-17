@@ -186,24 +186,24 @@ func (s *timerScheduler) fireTimerByUUID(ctx context.Context, timerUUID string, 
 	actual := time.Now().UTC()
 	if err := s.emitTimerFired(*row, actual); err != nil {
 		logEvent("timer_fire_emit_failed", map[string]any{
-			"timer_uuid":      row.UUID,
-			"owner_l2_name":   row.OwnerL2Name,
-			"target_l2_name":  row.TargetL2Name,
-			"kind":            row.Kind,
-			"scheduled_fire":  row.FireAtUTC,
-			"actual_fire":     actual.UTC().UnixMilli(),
-			"error":           err.Error(),
+			"timer_uuid":     row.UUID,
+			"owner_l2_name":  row.OwnerL2Name,
+			"target_l2_name": row.TargetL2Name,
+			"kind":           row.Kind,
+			"scheduled_fire": row.FireAtUTC,
+			"actual_fire":    actual.UTC().UnixMilli(),
+			"error":          err.Error(),
 		})
 		log.Printf("emit TIMER_FIRED failed for %s: %v", row.UUID, err)
 	}
 	logEvent("timer_fired", map[string]any{
-		"timer_uuid":      row.UUID,
-		"owner_l2_name":   row.OwnerL2Name,
-		"target_l2_name":  row.TargetL2Name,
-		"kind":            row.Kind,
-		"scheduled_fire":  row.FireAtUTC,
-		"actual_fire":     actual.UTC().UnixMilli(),
-		"fire_count":      row.FireCount + 1,
+		"timer_uuid":     row.UUID,
+		"owner_l2_name":  row.OwnerL2Name,
+		"target_l2_name": row.TargetL2Name,
+		"kind":           row.Kind,
+		"scheduled_fire": row.FireAtUTC,
+		"actual_fire":    actual.UTC().UnixMilli(),
+		"fire_count":     row.FireCount + 1,
 	})
 	if row.Kind == "recurring" {
 		row.FireCount++
@@ -282,24 +282,24 @@ func (s *timerScheduler) handleMissedTimer(ctx context.Context, row timerRow, no
 		}
 		if now.UTC().UnixMilli()-row.FireAtUTC <= row.MissedWithinMS.Int64 {
 			logEvent("timer_missed_policy_applied", map[string]any{
-				"timer_uuid":        row.UUID,
-				"policy":            row.MissedPolicy,
-				"scheduled_fire":    row.FireAtUTC,
-				"now_utc_ms":        now.UTC().UnixMilli(),
-				"missed_within_ms":  row.MissedWithinMS.Int64,
-				"outcome":           "fire",
+				"timer_uuid":       row.UUID,
+				"policy":           row.MissedPolicy,
+				"scheduled_fire":   row.FireAtUTC,
+				"now_utc_ms":       now.UTC().UnixMilli(),
+				"missed_within_ms": row.MissedWithinMS.Int64,
+				"outcome":          "fire",
 			})
 			s.fireTimerByUUID(ctx, row.UUID, now)
 			return nil
 		}
 		row.Status = "canceled"
 		logEvent("timer_missed_policy_applied", map[string]any{
-			"timer_uuid":        row.UUID,
-			"policy":            row.MissedPolicy,
-			"scheduled_fire":    row.FireAtUTC,
-			"now_utc_ms":        now.UTC().UnixMilli(),
-			"missed_within_ms":  row.MissedWithinMS.Int64,
-			"outcome":           "drop_outside_window",
+			"timer_uuid":       row.UUID,
+			"policy":           row.MissedPolicy,
+			"scheduled_fire":   row.FireAtUTC,
+			"now_utc_ms":       now.UTC().UnixMilli(),
+			"missed_within_ms": row.MissedWithinMS.Int64,
+			"outcome":          "drop_outside_window",
 		})
 		return updateTimer(ctx, s.service.db, row)
 	default:

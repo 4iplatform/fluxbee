@@ -397,12 +397,6 @@ func (s *Service) setLastError(detail string) {
 	s.statusMu.Unlock()
 }
 
-func (s *Service) getLastError() string {
-	s.statusMu.Lock()
-	defer s.statusMu.Unlock()
-	return s.syncStatus.lastError
-}
-
 // noteWaiting records that the published policy (version, hash) cannot be installed yet. The log
 // says so once, when it has been waiting longer than policyStuckAfter.
 func (s *Service) noteWaiting(version uint64, hash, reason string) {

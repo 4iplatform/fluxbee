@@ -16,16 +16,16 @@ type TimerError struct {
 }
 
 type TimerResponse struct {
-	OK           bool           `json:"ok"`
-	Verb         string         `json:"verb,omitempty"`
-	TimerUUID    *string        `json:"timer_uuid,omitempty"`
-	FireAtUTCMS  *int64         `json:"fire_at_utc_ms,omitempty"`
-	Status       *string        `json:"status,omitempty"`
-	DeletedCount *int64         `json:"deleted_count,omitempty"`
-	AlreadyExisted *bool        `json:"already_existed,omitempty"`
-	Found        *bool          `json:"found,omitempty"`
-	Error        *TimerError    `json:"error,omitempty"`
-	Extra        map[string]any `json:"-"`
+	OK             bool           `json:"ok"`
+	Verb           string         `json:"verb,omitempty"`
+	TimerUUID      *string        `json:"timer_uuid,omitempty"`
+	FireAtUTCMS    *int64         `json:"fire_at_utc_ms,omitempty"`
+	Status         *string        `json:"status,omitempty"`
+	DeletedCount   *int64         `json:"deleted_count,omitempty"`
+	AlreadyExisted *bool          `json:"already_existed,omitempty"`
+	Found          *bool          `json:"found,omitempty"`
+	Error          *TimerError    `json:"error,omitempty"`
+	Extra          map[string]any `json:"-"`
 }
 
 func (r *TimerResponse) ResponseError() *SystemResponseError {

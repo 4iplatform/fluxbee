@@ -27,7 +27,7 @@ func TestExecuteActionsFailFastPolicy(t *testing.T) {
 	if err := inst.executeActions(context.Background(), actions, msgWithName("GO"), actx, &emitted); err != nil {
 		t.Fatalf("on_error=continue must not be fatal, got %v", err)
 	}
-	actions[0].OnError = "" // back to default fail
+	actions[0].OnError = ""                                                                         // back to default fail
 	inst.executeActionsBestEffort(context.Background(), actions, msgWithName("GO"), actx, &emitted) // must not be fatal
 }
 

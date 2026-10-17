@@ -13,13 +13,9 @@ use nix::unistd::{unlinkat, UnlinkatFlags};
 
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
-use serde_json::json;
 use sha2::{Digest, Sha256};
 
 use crate::payload::{PayloadError, TextV1Payload, TEXT_V1_DEFAULT_MESSAGE_MAX_BYTES};
-use crate::protocol::{
-    Destination, Message, Meta, Routing, MSG_TTL_EXCEEDED, MSG_UNREACHABLE, SYSTEM_KIND,
-};
 
 pub mod safe_fs;
 
@@ -37,17 +33,13 @@ pub mod constants {
     pub const BLOB_DEFAULT_MAX_BYTES: u64 = 100 * 1024 * 1024;
     pub const BLOB_MAX_EXT_CHARS: usize = 10;
     pub const TEXT_V1_DEFAULT_OVERHEAD_BYTES: usize = 2_048;
-    pub const BLOB_SYNC_HINT_DEFAULT_TIMEOUT_MS: u64 = 30_000;
-    pub const BLOB_SYNC_HINT_MAX_TIMEOUT_MS: u64 = 300_000;
-    pub const BLOB_SYNC_HINT_RETRY_INTERVAL_MS: u64 = 500;
 }
 
 pub use constants::{
     BLOB_ACTIVE_RETAIN_DAYS, BLOB_DEFAULT_MAX_BYTES, BLOB_HASH_LEN, BLOB_MAX_EXT_CHARS,
     BLOB_NAME_ALLOWED, BLOB_NAME_MAX_CHARS, BLOB_PREFIX_LEN, BLOB_RETRY_BACKOFF,
     BLOB_RETRY_INITIAL_MS, BLOB_RETRY_MAX_MS, BLOB_STAGING_TTL_HOURS,
-    BLOB_SYNC_HINT_DEFAULT_TIMEOUT_MS, BLOB_SYNC_HINT_MAX_TIMEOUT_MS,
-    BLOB_SYNC_HINT_RETRY_INTERVAL_MS, TEXT_V1_DEFAULT_OVERHEAD_BYTES,
+    TEXT_V1_DEFAULT_OVERHEAD_BYTES,
 };
 
 #[derive(Debug, Clone)]
@@ -183,48 +175,6 @@ pub struct BlobMetricsSnapshot {
     pub blob_errors_total: u64,
 }
 
-#[derive(Debug, Clone)]
-pub struct PublishBlobRequest<'a> {
-    pub data: &'a [u8],
-    pub filename_original: &'a str,
-    pub mime: &'a str,
-    pub targets: Vec<String>,
-    pub wait_for_idle: bool,
-    pub timeout_ms: u64,
-}
-
-impl<'a> PublishBlobRequest<'a> {
-    pub fn new(
-        data: &'a [u8],
-        filename_original: &'a str,
-        mime: &'a str,
-        targets: Vec<String>,
-    ) -> Self {
-        Self {
-            data,
-            filename_original,
-            mime,
-            targets,
-            wait_for_idle: true,
-            timeout_ms: BLOB_SYNC_HINT_DEFAULT_TIMEOUT_MS,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct SyncHintTargetResult {
-    pub target: String,
-    pub status: String,
-    pub elapsed_ms: u64,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct PublishBlobResult {
-    pub blob_ref: BlobRef,
-    pub timeout_ms: u64,
-    pub targets: Vec<SyncHintTargetResult>,
-}
-
 #[derive(Debug, thiserror::Error)]
 pub enum BlobError {
     #[error("BLOB_NOT_FOUND: {0}")]
@@ -240,12 +190,6 @@ pub enum BlobError {
     /// What is stored under a blob's name is not the blob its BlobRef describes (FINDINGS A-56).
     #[error("BLOB_INTEGRITY: {0}")]
     Integrity(String),
-    #[error("BLOB_SYNC_HINT_TIMEOUT: target={target} timeout_ms={timeout_ms}")]
-    SyncHintTimeout { target: String, timeout_ms: u64 },
-    #[error("BLOB_SYNC_HINT_FAILED: target={target} detail={detail}")]
-    SyncHintFailed { target: String, detail: String },
-    #[error("BLOB_SYNC_HINT_TRANSPORT: target={target} detail={detail}")]
-    SyncHintTransport { target: String, detail: String },
     #[error("BLOB_NOT_IMPLEMENTED")]
     NotImplemented,
 }
@@ -362,177 +306,6 @@ impl BlobToolkit {
                 Err(err)
             }
         }
-    }
-
-    /// Publica un blob local y confirma convergencia por target usando
-    /// `SYSTEM_SYNC_HINT` sobre el `RouterDispatcher` canónico. Variante
-    /// recomendada — multiplexa por `trace_id` sobre el dispatcher canónico.
-    pub async fn publish_blob_and_confirm_via_dispatcher(
-        &self,
-        dispatcher: std::sync::Arc<crate::rpc::RouterDispatcher>,
-        request: PublishBlobRequest<'_>,
-    ) -> Result<PublishBlobResult, BlobError> {
-        if request.targets.is_empty() {
-            return Err(BlobError::InvalidRef(
-                "publish_blob_and_confirm requires at least one target".to_string(),
-            ));
-        }
-
-        let timeout_ms = request.timeout_ms.max(1).min(BLOB_SYNC_HINT_MAX_TIMEOUT_MS);
-        let blob_ref = self.put_bytes(request.data, request.filename_original, request.mime)?;
-        self.promote(&blob_ref)?;
-
-        let mut target_results = Vec::with_capacity(request.targets.len());
-        for raw_target in request.targets {
-            let target = normalize_orchestrator_target(&raw_target)?;
-            let started = Instant::now();
-            let deadline = started + Duration::from_millis(timeout_ms);
-
-            loop {
-                let now = Instant::now();
-                if now >= deadline {
-                    return Err(BlobError::SyncHintTimeout { target, timeout_ms });
-                }
-                let remaining = deadline - now;
-                let remaining_ms = remaining.as_millis().min(u128::from(u64::MAX)) as u64;
-                let attempt_timeout_ms = remaining_ms.max(1).min(BLOB_SYNC_HINT_MAX_TIMEOUT_MS);
-
-                let payload = json!({
-                    "channel": "blob",
-                    "folder_id": "fluxbee-blob",
-                    "wait_for_idle": request.wait_for_idle,
-                    "timeout_ms": attempt_timeout_ms,
-                });
-                let message = Message {
-                    routing: Routing {
-                        src: String::new(),
-                        src_l2_name: None,
-                        dst: Destination::Unicast(target.clone()),
-                        ttl: 16,
-                        trace_id: String::new(),
-                    },
-                    meta: Meta {
-                        msg_type: SYSTEM_KIND.to_string(),
-                        msg: Some("SYSTEM_SYNC_HINT".to_string()),
-                        target: Some(target.clone()),
-                        ..Meta::default()
-                    },
-                    payload,
-                };
-
-                let matcher = crate::rpc::PendingMatcher::new(
-                    vec![crate::rpc::RouteMatch::exact(
-                        SYSTEM_KIND,
-                        "SYSTEM_SYNC_HINT_RESPONSE",
-                    )],
-                    vec![
-                        crate::rpc::RouteMatch::exact(SYSTEM_KIND, MSG_UNREACHABLE),
-                        crate::rpc::RouteMatch::exact(SYSTEM_KIND, MSG_TTL_EXCEEDED),
-                    ],
-                    vec![crate::rpc::RouteMatch::any_msg_type(SYSTEM_KIND)],
-                );
-                let labels = crate::rpc::RpcRequestLabels::new(
-                    &target,
-                    "SYSTEM_SYNC_HINT",
-                    "SYSTEM_SYNC_HINT_RESPONSE",
-                );
-
-                let response = match dispatcher
-                    .send_with_matcher(
-                        message,
-                        matcher,
-                        labels,
-                        Duration::from_millis(attempt_timeout_ms),
-                    )
-                    .await
-                {
-                    Ok(msg) => msg,
-                    Err(crate::rpc::RpcError::Timeout { .. }) => {
-                        return Err(BlobError::SyncHintTimeout { target, timeout_ms });
-                    }
-                    Err(err) => {
-                        return Err(BlobError::SyncHintTransport {
-                            target,
-                            detail: format!("send SYSTEM_SYNC_HINT via dispatcher failed: {err}"),
-                        });
-                    }
-                };
-
-                if response.meta.msg.as_deref() == Some(MSG_UNREACHABLE) {
-                    let reason = response
-                        .payload
-                        .get("reason")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("unknown");
-                    let original_dst = response
-                        .payload
-                        .get("original_dst")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("-");
-                    return Err(BlobError::SyncHintFailed {
-                        target,
-                        detail: format!(
-                            "router unreachable: reason={reason} original_dst={original_dst}"
-                        ),
-                    });
-                }
-                if response.meta.msg.as_deref() == Some(MSG_TTL_EXCEEDED) {
-                    let original_dst = response
-                        .payload
-                        .get("original_dst")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("-");
-                    let last_hop = response
-                        .payload
-                        .get("last_hop")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("-");
-                    return Err(BlobError::SyncHintFailed {
-                        target,
-                        detail: format!(
-                            "router ttl exceeded: original_dst={original_dst} last_hop={last_hop}"
-                        ),
-                    });
-                }
-
-                let parsed =
-                    parse_sync_hint_response_payload(&response.payload).map_err(|detail| {
-                        BlobError::SyncHintFailed {
-                            target: target.clone(),
-                            detail,
-                        }
-                    })?;
-
-                if parsed.status == "ok" {
-                    target_results.push(SyncHintTargetResult {
-                        target,
-                        status: parsed.status,
-                        elapsed_ms: started.elapsed().as_millis() as u64,
-                    });
-                    break;
-                }
-                if parsed.status == "sync_pending" {
-                    if Instant::now() >= deadline {
-                        return Err(BlobError::SyncHintTimeout { target, timeout_ms });
-                    }
-                    tokio::time::sleep(Duration::from_millis(BLOB_SYNC_HINT_RETRY_INTERVAL_MS))
-                        .await;
-                    continue;
-                }
-                let detail = parsed
-                    .error_code
-                    .map(|code| format!("error_code={code}"))
-                    .or(parsed.message)
-                    .unwrap_or_else(|| "sync hint returned error".to_string());
-                return Err(BlobError::SyncHintFailed { target, detail });
-            }
-        }
-
-        Ok(PublishBlobResult {
-            blob_ref,
-            timeout_ms,
-            targets: target_results,
-        })
     }
 
     pub fn promote(&self, blob_ref: &BlobRef) -> Result<(), BlobError> {
@@ -1444,52 +1217,6 @@ fn remove_dir_if_empty(path: &Path, errors: &mut Vec<String>) {
     }
 }
 
-#[derive(Debug, Clone)]
-struct SyncHintResponse {
-    status: String,
-    error_code: Option<String>,
-    message: Option<String>,
-}
-
-fn normalize_orchestrator_target(raw_target: &str) -> Result<String, BlobError> {
-    let trimmed = raw_target.trim();
-    if trimmed.is_empty() {
-        return Err(BlobError::InvalidRef(
-            "sync hint target cannot be empty".to_string(),
-        ));
-    }
-    if trimmed.contains('@') {
-        Ok(trimmed.to_string())
-    } else {
-        Ok(format!("SY.orchestrator@{trimmed}"))
-    }
-}
-
-fn parse_sync_hint_response_payload(
-    payload: &serde_json::Value,
-) -> Result<SyncHintResponse, String> {
-    let status = payload
-        .get("status")
-        .and_then(|v| v.as_str())
-        .unwrap_or("")
-        .trim()
-        .to_string();
-    if status.is_empty() {
-        return Err("missing payload.status in SYSTEM_SYNC_HINT_RESPONSE".to_string());
-    }
-    Ok(SyncHintResponse {
-        status,
-        error_code: payload
-            .get("error_code")
-            .and_then(|v| v.as_str())
-            .map(|v| v.to_string()),
-        message: payload
-            .get("message")
-            .and_then(|v| v.as_str())
-            .map(|v| v.to_string()),
-    })
-}
-
 /// The lowercase hex SHA-256 of `data`.
 pub fn sha256_hex(data: &[u8]) -> String {
     let hash = Sha256::digest(data);
@@ -1762,20 +1489,6 @@ mod tests {
         assert!(BlobToolkit::validate_blob_name("factura_0123456789abcde.png").is_err());
         assert!(BlobToolkit::validate_blob_name("factura_0123456789abcdef.PNG").is_err());
         assert!(BlobToolkit::validate_blob_name("../x_0123456789abcdef.png").is_err());
-    }
-
-    #[test]
-    fn normalize_orchestrator_target_rules() {
-        assert_eq!(
-            normalize_orchestrator_target("worker-220").expect("normalize hive id"),
-            "SY.orchestrator@worker-220"
-        );
-        assert_eq!(
-            normalize_orchestrator_target("SY.orchestrator@worker-220")
-                .expect("normalize full target"),
-            "SY.orchestrator@worker-220"
-        );
-        assert!(normalize_orchestrator_target("  ").is_err());
     }
 
     #[test]

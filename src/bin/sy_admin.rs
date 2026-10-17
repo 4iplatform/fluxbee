@@ -6455,8 +6455,7 @@ struct OpaQueryEntry {
 
 const STORAGE_METRICS_TIMEOUT_SECS: u64 = 8;
 
-/// SY.storage's inbox metrics, asked over the mesh (A-70 stage 2b; until then on the embedded NATS
-/// broker's `storage.metrics.get`).
+/// SY.storage's inbox metrics, asked over the mesh (A-70 stage 2b).
 async fn handle_storage_metrics_http(ctx: &AdminContext) -> (u16, String) {
     let action = "get_storage_metrics";
     let error = |status: u16, error_code: &str, detail: String| {
@@ -11615,7 +11614,7 @@ fn admin_action_example_scmd(action: &str) -> Option<String> {
             r#"curl -X POST /hives/motherbee/nodes/WF.invoice@motherbee/control/config-get -d '{"requested_by":"archi"}'"#
         }
         "node_control_config_set" => {
-            r#"current="$(curl -sS -X POST /hives/motherbee/nodes/AI.sales@motherbee/control/config-get -d '{"requested_by":"archi"}' | jq -r '.payload.response.config_version')"; next="$((current + 1))"; curl -X POST /hives/motherbee/nodes/AI.sales@motherbee/control/config-set -d "{\"node_name\":\"AI.sales@motherbee\",\"subsystem\":\"ai_node\",\"schema_version\":1,\"config_version\":${next},\"apply_mode\":\"replace\",\"config\":{\"behavior\":{\"kind\":\"ai_chat\",\"vault_key\":\"ai/sales\",\"model\":\"gpt-5.5\"}}}""#
+            r#"current="$(curl -sS -X POST /hives/motherbee/nodes/AI.sales@motherbee/control/config-get -d '{"requested_by":"archi"}' | jq -r '.payload.response.config_version')"; next="$((current + 1))"; curl -X POST /hives/motherbee/nodes/AI.sales@motherbee/control/config-set -d "{\"node_name\":\"AI.sales@motherbee\",\"subsystem\":\"ai_node\",\"schema_version\":1,\"config_version\":${next},\"apply_mode\":\"replace\",\"config\":{\"behavior\":{\"kind\":\"ai_chat\",\"model\":\"gpt-5.5\"}}}""#
         }
         "list_ilks" => "curl -X GET /hives/motherbee/identity/ilks",
         "get_ilk" => {

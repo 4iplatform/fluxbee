@@ -1,7 +1,6 @@
 package node
 
 import (
-	"encoding/json"
 	"fmt"
 	"regexp"
 
@@ -58,9 +57,4 @@ func (e WfRulesError) Error() string {
 		return e.Code
 	}
 	return fmt.Sprintf("%s: %s", e.Code, e.Detail)
-}
-
-func mustMarshalJSON(value any) json.RawMessage {
-	raw, _ := json.Marshal(value)
-	return raw
 }

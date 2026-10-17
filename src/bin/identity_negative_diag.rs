@@ -399,8 +399,19 @@ async fn main() -> Result<(), DynError> {
     Ok(())
 }
 
-/// The connection under `node_name`, one per name for the whole run. The UUID is persisted per
-/// name, and the router refuses a second connection with a UUID that is still connected (A-44).
+/// A per-run test name gets a fresh UUID, so a run leaves no `.uuid` on the hive; an `SY.*` name
+/// stands in for a real node (the frontdesk) and keeps the UUID persisted for it.
+fn uuid_mode_for(name: &str) -> fluxbee_sdk::NodeUuidMode {
+    if name.starts_with("SY.") {
+        fluxbee_sdk::NodeUuidMode::Persistent
+    } else {
+        fluxbee_sdk::NodeUuidMode::Ephemeral
+    }
+}
+
+/// The connection under `node_name`, one per name for the whole run: an `SY.*` name reuses its
+/// persisted UUID, and the router refuses a second connection with a UUID that is still connected
+/// (A-44).
 async fn connection(node_name: &str) -> Result<Arc<RouterDispatcher>, DynError> {
     static CONNECTIONS: OnceLock<Mutex<HashMap<String, Arc<RouterDispatcher>>>> = OnceLock::new();
     let mut connections = CONNECTIONS.get_or_init(Default::default).lock().await;
@@ -411,7 +422,7 @@ async fn connection(node_name: &str) -> Result<Arc<RouterDispatcher>, DynError> 
         name: node_name.to_string(),
         router_socket: json_router::paths::router_socket_dir(),
         uuid_persistence_dir: json_router::paths::state_dir().join("nodes"),
-        uuid_mode: fluxbee_sdk::NodeUuidMode::Persistent,
+        uuid_mode: uuid_mode_for(node_name),
         config_dir: json_router::paths::config_dir(),
         version: "0.0.1".to_string(),
     };

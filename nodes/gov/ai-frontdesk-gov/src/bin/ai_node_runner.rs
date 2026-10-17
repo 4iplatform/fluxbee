@@ -3705,13 +3705,6 @@ fn incoming_sender_kind(msg: &Message) -> Option<String> {
         .map(ToString::to_string)
 }
 
-#[allow(dead_code)]
-fn require_src_ilk(ctx: &BehaviorContext) -> fluxbee_ai_sdk::Result<&str> {
-    ctx.src_ilk
-        .as_deref()
-        .ok_or_else(|| fluxbee_ai_sdk::errors::AiSdkError::Protocol("missing_src_ilk".to_string()))
-}
-
 #[cfg(test)]
 mod tests {
     /// The contract the IO producers send (io_common::frontdesk_gate::frontdesk_response_contract).
@@ -4315,17 +4308,6 @@ mod tests {
             None,
         );
         assert_eq!(extract_thread_id(&msg), None);
-    }
-
-    #[test]
-    fn require_src_ilk_returns_missing_src_ilk_error() {
-        let ctx = BehaviorContext {
-            thread_id: None,
-            src_ilk: None,
-            trace_id: None,
-        };
-        let err = require_src_ilk(&ctx).expect_err("missing src_ilk should fail");
-        assert!(err.to_string().contains("missing_src_ilk"));
     }
 
     #[test]

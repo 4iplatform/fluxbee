@@ -597,11 +597,3 @@ func intValueFromMap(values map[string]any, key string) int {
 		return 0
 	}
 }
-
-func stringValueFromMapMap(values map[string]any, outerKey, innerKey string) string {
-	raw, _ := values[outerKey].(map[string]any)
-	if raw == nil {
-		return ""
-	}
-	return stringValueFromMap(raw, innerKey)
-}

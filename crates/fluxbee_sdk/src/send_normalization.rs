@@ -42,9 +42,6 @@ fn payload_error_code(error: &PayloadError) -> &'static str {
             crate::blob::BlobError::InvalidRef(_) => "BLOB_INVALID_REF",
             crate::blob::BlobError::TooLarge { .. } => "BLOB_TOO_LARGE",
             crate::blob::BlobError::Integrity(_) => "BLOB_INTEGRITY",
-            crate::blob::BlobError::SyncHintTimeout { .. } => "BLOB_SYNC_HINT_TIMEOUT",
-            crate::blob::BlobError::SyncHintFailed { .. } => "BLOB_SYNC_HINT_FAILED",
-            crate::blob::BlobError::SyncHintTransport { .. } => "BLOB_SYNC_HINT_TRANSPORT",
             crate::blob::BlobError::NotImplemented => "BLOB_NOT_IMPLEMENTED",
         },
     }

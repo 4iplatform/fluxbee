@@ -23,8 +23,8 @@ import (
 const (
 	version             = "1.1"
 	defaultNodeBaseName = "SY.timer"
-	configDir     = "/etc/fluxbee"
-	routerSockDir = "/var/run/fluxbee/routers"
+	configDir           = "/etc/fluxbee"
+	routerSockDir       = "/var/run/fluxbee/routers"
 )
 
 var uuidPersistenceDir = "/var/lib/fluxbee/state/nodes"
@@ -484,15 +484,15 @@ func (s *Service) respondTimerSchedule(incoming fluxbeesdk.Message) error {
 	}
 	s.enqueueTimer(timerID, fireAtUTCMS)
 	logEvent("timer_scheduled", map[string]any{
-		"timer_uuid":      timerID,
-		"owner_l2_name":   ownerL2,
-		"target_l2_name":  targetL2,
-		"kind":            "oneshot",
-		"fire_at_utc_ms":  fireAtUTCMS,
-		"trace_id":        incoming.Routing.TraceID,
-		"missed_policy":   missedPolicy,
-		"has_client_ref":  row.ClientRef.Valid,
-		"has_metadata":    row.Metadata.Valid,
+		"timer_uuid":     timerID,
+		"owner_l2_name":  ownerL2,
+		"target_l2_name": targetL2,
+		"kind":           "oneshot",
+		"fire_at_utc_ms": fireAtUTCMS,
+		"trace_id":       incoming.Routing.TraceID,
+		"missed_policy":  missedPolicy,
+		"has_client_ref": row.ClientRef.Valid,
+		"has_metadata":   row.Metadata.Valid,
 	})
 	return s.sendTimerResponse(incoming, map[string]any{
 		"ok":              true,
@@ -590,16 +590,16 @@ func (s *Service) respondTimerScheduleRecurring(incoming fluxbeesdk.Message) err
 	}
 	s.enqueueTimer(timerID, fireAtUTCMS)
 	logEvent("timer_scheduled", map[string]any{
-		"timer_uuid":      timerID,
-		"owner_l2_name":   ownerL2,
-		"target_l2_name":  targetL2,
-		"kind":            "recurring",
-		"fire_at_utc_ms":  fireAtUTCMS,
-		"cron_tz":         cronTZ,
-		"trace_id":        incoming.Routing.TraceID,
-		"missed_policy":   missedPolicy,
-		"has_client_ref":  row.ClientRef.Valid,
-		"has_metadata":    row.Metadata.Valid,
+		"timer_uuid":     timerID,
+		"owner_l2_name":  ownerL2,
+		"target_l2_name": targetL2,
+		"kind":           "recurring",
+		"fire_at_utc_ms": fireAtUTCMS,
+		"cron_tz":        cronTZ,
+		"trace_id":       incoming.Routing.TraceID,
+		"missed_policy":  missedPolicy,
+		"has_client_ref": row.ClientRef.Valid,
+		"has_metadata":   row.Metadata.Valid,
 	})
 	return s.sendTimerResponse(incoming, map[string]any{
 		"ok":              true,
@@ -757,11 +757,11 @@ func (s *Service) respondTimerReschedule(incoming fluxbeesdk.Message) error {
 	}
 	s.enqueueTimer(row.UUID, fireAtUTCMS)
 	logEvent("timer_rescheduled", map[string]any{
-		"timer_uuid":      row.UUID,
-		"owner_l2_name":   row.OwnerL2Name,
-		"target_l2_name":  row.TargetL2Name,
-		"fire_at_utc_ms":  fireAtUTCMS,
-		"trace_id":        incoming.Routing.TraceID,
+		"timer_uuid":     row.UUID,
+		"owner_l2_name":  row.OwnerL2Name,
+		"target_l2_name": row.TargetL2Name,
+		"fire_at_utc_ms": fireAtUTCMS,
+		"trace_id":       incoming.Routing.TraceID,
 	})
 	return s.sendTimerResponse(incoming, map[string]any{
 		"ok":             true,
@@ -795,10 +795,10 @@ func (s *Service) respondTimerPurgeOwner(incoming fluxbeesdk.Message) error {
 	}
 	s.signalScheduler()
 	logEvent("timer_owner_purged", map[string]any{
-		"owner_l2_name":  ownerL2Name,
-		"deleted_count":  deletedCount,
-		"requester_l2":   requesterL2,
-		"trace_id":       incoming.Routing.TraceID,
+		"owner_l2_name": ownerL2Name,
+		"deleted_count": deletedCount,
+		"requester_l2":  requesterL2,
+		"trace_id":      incoming.Routing.TraceID,
 	})
 	return s.sendTimerResponse(incoming, map[string]any{
 		"ok":            true,

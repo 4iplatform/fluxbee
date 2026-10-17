@@ -277,27 +277,18 @@ fn parse_args(args: &[String]) -> Result<Subcommand, String> {
         return Err("missing subcommand".to_string());
     }
 
-    let i = 1usize;
-    // skip the program name, find the subcommand
-    while i < args.len() {
-        match args[i].as_str() {
-            "--help" | "-h" => return Err("__help__".to_string()),
-            "new" => return parse_new_args(&args[i + 1..]).map(Subcommand::New),
-            "pack" => return parse_pack_args(&args[i + 1..]).map(Subcommand::Pack),
-            t if t.starts_with('-') => {
-                // top-level flags that look like new's flags — treat as implicit "new"
-                return parse_new_args(&args[i..]).map(Subcommand::New);
-            }
-            _ => {
-                return Err(format!(
-                    "unknown subcommand: '{}' (use 'new' or 'pack')",
-                    args[i]
-                ))
-            }
-        }
+    // skip the program name; the first argument is the subcommand
+    match args.get(1).map(String::as_str) {
+        None => Err("missing subcommand".to_string()),
+        Some("--help" | "-h") => Err("__help__".to_string()),
+        Some("new") => parse_new_args(&args[2..]).map(Subcommand::New),
+        Some("pack") => parse_pack_args(&args[2..]).map(Subcommand::Pack),
+        // top-level flags that look like new's flags — treat as implicit "new"
+        Some(flag) if flag.starts_with('-') => parse_new_args(&args[1..]).map(Subcommand::New),
+        Some(other) => Err(format!(
+            "unknown subcommand: '{other}' (use 'new' or 'pack')"
+        )),
     }
-
-    Err("missing subcommand".to_string())
 }
 
 // ── new ──────────────────────────────────────────────────────────────────────
@@ -317,57 +308,93 @@ fn scaffold_full_runtime(pkg_dir: &Path) -> Result<Vec<PathBuf>, String> {
     fs::set_permissions(&start_sh, perms).map_err(|e| format!("chmod bin/start.sh: {e}"))?;
     created.push(start_sh);
 
-    let prompt = pkg_dir.join("assets/prompts/system.txt");
-    write_file(
-        &prompt,
-        "# System prompt\nReplace with your system prompt.\n",
-    )?;
-    created.push(prompt);
-
+    // The runtime's own settings: the orchestrator merges the spawn's config over them.
     let config = pkg_dir.join("config/default-config.json");
-    write_file(
-        &config,
-        "{\n  \"model\": \"gpt-4o\",\n  \"temperature\": 0.7,\n  \"max_tokens\": 4096\n}\n",
-    )?;
+    write_file(&config, "{}\n")?;
     created.push(config);
 
     Ok(created)
 }
 
-fn scaffold_config_only(pkg_dir: &Path) -> Result<Vec<PathBuf>, String> {
+/// An agent on `ai.generic`: its behavior (`kind` and `model` are required; the model is one of
+/// the hive's AI provider, no `temperature`). What the agent is told comes from its ILK: the role,
+/// skills and handbooks of its definition.
+const AI_GENERIC_DEFAULT_CONFIG: &str = r#"{
+  "behavior": {
+    "kind": "ai_chat",
+    "model": "gpt-5.5"
+  }
+}
+"#;
+
+fn scaffold_config_only(
+    pkg_dir: &Path,
+    runtime_base: Option<&str>,
+) -> Result<Vec<PathBuf>, String> {
     let mut created = Vec::new();
 
-    let system_prompt = pkg_dir.join("assets/prompts/system.txt");
-    write_file(
-        &system_prompt,
-        "# System prompt\nReplace with your agent's system prompt.\n",
-    )?;
-    created.push(system_prompt);
-
     let config = pkg_dir.join("config/default-config.json");
-    write_file(
-        &config,
-        "{\n  \"model\": \"gpt-4o\",\n  \"temperature\": 0.7,\n  \"max_tokens\": 4096\n}\n",
-    )?;
+    let template = match runtime_base {
+        Some("ai.generic") => AI_GENERIC_DEFAULT_CONFIG,
+        _ => "{}\n",
+    };
+    write_file(&config, template)?;
     created.push(config);
 
     Ok(created)
 }
 
-fn scaffold_workflow(pkg_dir: &Path) -> Result<Vec<PathBuf>, String> {
+/// The smallest definition `wf.engine` accepts: it waits for one message and finishes.
+fn workflow_definition_template(name: &str) -> String {
+    let workflow_type = name.strip_prefix("wf.").unwrap_or(name);
+    format!(
+        r#"{{
+  "wf_schema_version": "1",
+  "workflow_type": "{workflow_type}",
+  "description": "Replace with what this workflow does.",
+  "input_schema": {{ "type": "object", "properties": {{}} }},
+  "initial_state": "waiting",
+  "terminal_states": ["done"],
+  "states": [
+    {{
+      "name": "waiting",
+      "description": "Waits for the message that finishes the workflow.",
+      "entry_actions": [],
+      "exit_actions": [],
+      "transitions": [
+        {{
+          "event_match": {{ "msg": "WF_DONE" }},
+          "guard": "true",
+          "target_state": "done",
+          "actions": []
+        }}
+      ]
+    }},
+    {{
+      "name": "done",
+      "description": "Finished.",
+      "entry_actions": [],
+      "exit_actions": [],
+      "transitions": []
+    }}
+  ]
+}}
+"#
+    )
+}
+
+fn scaffold_workflow(pkg_dir: &Path, name: &str) -> Result<Vec<PathBuf>, String> {
     let mut created = Vec::new();
 
     let flow_def = pkg_dir.join("flow/definition.json");
-    write_file(
-        &flow_def,
-        "{\n  \"steps\": [],\n  \"timeout_secs\": 300,\n  \"on_timeout\": \"escalate\"\n}\n",
-    )?;
+    write_file(&flow_def, &workflow_definition_template(name))?;
     created.push(flow_def);
 
+    // What wf.engine reads besides its hive's SY.timer: how long finished instances are kept.
     let config = pkg_dir.join("config/default-config.json");
     write_file(
         &config,
-        "{\n  \"triggers\": [],\n  \"escalation_target\": null\n}\n",
+        "{\n  \"gc_retention_days\": 7,\n  \"gc_interval_seconds\": 3600\n}\n",
     )?;
     created.push(config);
 
@@ -385,10 +412,7 @@ fn build_package_json(args: &ScaffoldArgs) -> String {
         _ => "",
     };
 
-    let config_template_field = match args.package_type {
-        PackageType::Workflow => "",
-        _ => "\n  \"config_template\": \"config/default-config.json\",",
-    };
+    let config_template_field = "\n  \"config_template\": \"config/default-config.json\",";
 
     format!(
         "{{\n  \"name\": \"{name}\",\n  \"version\": \"{version}\",\n  \"type\": \"{pkg_type}\",\n  \"description\": \"\",{entry}{config}\n{base}\n}}\n",
@@ -432,8 +456,8 @@ fn run_new(args: ScaffoldArgs) -> Result<(), CliError> {
 
     let type_files = match args.package_type {
         PackageType::FullRuntime => scaffold_full_runtime(&pkg_dir),
-        PackageType::ConfigOnly => scaffold_config_only(&pkg_dir),
-        PackageType::Workflow => scaffold_workflow(&pkg_dir),
+        PackageType::ConfigOnly => scaffold_config_only(&pkg_dir, args.runtime_base.as_deref()),
+        PackageType::Workflow => scaffold_workflow(&pkg_dir, &args.name),
     }
     .map_err(|e| -> CliError { e.into() })?;
 
@@ -800,7 +824,6 @@ mod tests {
         let pkg = out.join("sy.scaffold.test");
         assert!(pkg.join("package.json").exists());
         assert!(pkg.join("bin/start.sh").exists());
-        assert!(pkg.join("assets/prompts/system.txt").exists());
         assert!(pkg.join("config/default-config.json").exists());
 
         let mode = fs::metadata(pkg.join("bin/start.sh"))
@@ -887,7 +910,7 @@ mod tests {
             .collect();
         assert!(names.iter().any(|n| n == "package.json"), "names={names:?}");
         assert!(
-            names.iter().any(|n| n.contains("system.txt")),
+            names.iter().any(|n| n == "config/default-config.json"),
             "names={names:?}"
         );
 

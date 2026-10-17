@@ -58,15 +58,6 @@ pub struct Meta {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub thread_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    /// Legacy/historical field from the pre-thread cognition model.
-    pub ctx: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    /// Legacy/historical field from the pre-thread cognition model.
-    pub ctx_seq: Option<u64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    /// Legacy/historical field from the pre-thread cognition model.
-    pub ctx_window: Option<Vec<CtxTurn>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub memory_package: Option<MemoryPackage>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub scope: Option<String>,
@@ -158,16 +149,6 @@ pub struct MemoryPackageTruncated {
     pub dropped_reasons: u32,
     pub dropped_memories: u32,
     pub dropped_episodes: u32,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct CtxTurn {
-    pub seq: u64,
-    pub ts: String,
-    pub from: String,
-    #[serde(rename = "type")]
-    pub turn_type: String,
-    pub text: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -614,9 +595,6 @@ pub fn build_system_message(
             dst_ilk: None,
             ich: None,
             thread_id: None,
-            ctx: None,
-            ctx_seq: None,
-            ctx_window: None,
             memory_package: None,
             scope: None,
             target: None,

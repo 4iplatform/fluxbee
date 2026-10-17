@@ -841,8 +841,6 @@ async fn main() -> Result<(), OrchestratorError> {
     let blob_runtime = blob_runtime_from_hive(&hive);
     let dist_runtime = dist_runtime_from_hive(&hive);
     let storage_path = storage_path_from_hive(&hive);
-    // A retired node runs nowhere, even while this hive's hive.yaml still names it.
-    retire_system_nodes(&config_dir);
     let system_nodes = system_nodes_for_role(&hive, role)?;
     let ai = hive
         .ai
@@ -1469,8 +1467,6 @@ async fn bootstrap_local(
     tracing::info!("starting rt-gateway");
     start_core_service("rt-gateway", &replaced, &mut upgrade_restart)?;
     wait_for_router_ready(state, socket_dir, Duration::from_secs(30)).await?;
-    // Only now: an upgraded hive's old router, stopping above, flushed its broker to disk.
-    retire_nats_state(&state.config_dir);
     ensure_core_firewall_local(state);
     if let Err(err) = reconcile_egress(state) {
         if state.role == HiveRole::Egress {
@@ -1703,8 +1699,7 @@ fn boot_upgrade_restart_record(
 }
 
 /// Waits until SY.storage answers its inbox metrics, which it does once it reads its database:
-/// `STORAGE_METRICS_GET` over the mesh (A-70 stage 2b; it was `storage.metrics.get` on the embedded
-/// NATS broker).
+/// `STORAGE_METRICS_GET` over the mesh (A-70 stage 2b).
 async fn wait_for_storage_db_ready(
     rpc: &RouterDispatcher,
     target: &str,
@@ -5049,249 +5044,6 @@ fn load_hive(config_dir: &Path) -> Result<HiveFile, OrchestratorError> {
     Ok(serde_yaml::from_str(&data)?)
 }
 
-/// System nodes that no longer run, with their units (A-70 stage 2, docs/router-stream-v1.md
-/// §6.2): SY.policy only counted turns. Retired over two releases, because a hive whose
-/// orchestrator is older rejects a core manifest without a component its hive.yaml lists: 0.1.77
-/// stopped it and took it out of each hive's own section; since 0.1.78 no package ships it, and it
-/// leaves every section, the motherbee's templates for the spokes too. This list and its clean-up
-/// go once every hive booted 0.1.78.
-const RETIRED_SYSTEM_NODES: &[(&str, &str)] = &[("SY.policy", "sy-policy")];
-
-fn without_retired_nodes(mut section: RoleSystemNodes) -> RoleSystemNodes {
-    let retired = |name: &String| RETIRED_SYSTEM_NODES.iter().any(|(node, _)| node == name);
-    section.nodes.retain(|name| !retired(name));
-    section.wait_for.retain(|name| !retired(name));
-    section
-}
-
-/// At boot, before the node list is read: each retired node leaves every role section of
-/// hive.yaml (`nodes` and `wait_for`), this hive's own and, on the motherbee, its templates for the
-/// spokes; its unit is stopped and disabled; its unit file and binary go where they are left (a
-/// spoke's, a motherbee installed by scripts/install.sh; a package's are gone with the package).
-/// Once and logged. The file is edited by lines, so its comments stay. Best effort: a failure is
-/// logged and the boot goes on (`system_nodes_for_role` leaves the node out anyway).
-fn retire_system_nodes(config_dir: &Path) {
-    let path = config_dir.join("hive.yaml");
-    let retired: Vec<&str> = RETIRED_SYSTEM_NODES.iter().map(|(node, _)| *node).collect();
-    match fs::read_to_string(&path) {
-        Ok(text) => {
-            let mut edited = text;
-            let mut removed = Vec::new();
-            for section in ["motherbee", "worker", "ingress", "egress"] {
-                let (next, dropped) = drop_retired_from_role_section(&edited, section, &retired);
-                edited = next;
-                removed.extend(dropped.into_iter().map(|node| format!("{section}: {node}")));
-            }
-            if !removed.is_empty() {
-                match write_file_atomic(&path, edited.as_bytes()) {
-                    Ok(()) => tracing::info!(
-                        removed = ?removed,
-                        "retired system nodes left the node lists in hive.yaml"
-                    ),
-                    Err(err) => {
-                        tracing::warn!(error = %err, "could not rewrite hive.yaml to drop retired system nodes")
-                    }
-                }
-            }
-        }
-        Err(err) => {
-            tracing::warn!(error = %err, "could not read hive.yaml to drop retired system nodes")
-        }
-    }
-    for (node, service) in RETIRED_SYSTEM_NODES {
-        let is = |what: &str| {
-            Command::new("systemctl")
-                .args([what, "--quiet", service])
-                .status()
-                .is_ok_and(|status| status.success())
-        };
-        if is("is-active") || is("is-enabled") {
-            let _ = Command::new("systemctl")
-                .args(["disable", "--now", service])
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .status();
-            tracing::info!(node, service, "retired system node stopped and disabled");
-        }
-        let unit = PathBuf::from(format!("/etc/systemd/system/{service}.service"));
-        let binary = PathBuf::from(service_to_exec(service));
-        let mut gone = Vec::new();
-        for file in [&unit, &binary] {
-            if !file.exists() {
-                continue;
-            }
-            match fs::remove_file(file) {
-                Ok(()) => gone.push(file.display().to_string()),
-                Err(err) => tracing::warn!(
-                    file = %file.display(),
-                    error = %err,
-                    "could not remove a retired system node's file"
-                ),
-            }
-        }
-        if gone.is_empty() {
-            continue;
-        }
-        if gone.contains(&unit.display().to_string()) {
-            let _ = Command::new("systemctl")
-                .arg("daemon-reload")
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .status();
-        }
-        tracing::info!(node, files = ?gone, "retired system node's unit and binary removed");
-    }
-}
-
-/// The embedded NATS broker is gone (A-70 stage 2b). Once at boot, and logged: what its state
-/// file still held (messages nobody reads any more; on the ingress, the edge's old turns), then
-/// its directory, and the `nats:` section of hive.yaml with the comment above it. Best effort.
-/// This clean-up goes once every hive booted 0.1.78.
-fn retire_nats_state(config_dir: &Path) {
-    let dir = json_router::paths::storage_root_dir().join("nats");
-    if dir.is_dir() {
-        for entry in fs::read_dir(&dir).into_iter().flatten().flatten() {
-            let path = entry.path();
-            let name = entry.file_name();
-            let name = name.to_string_lossy();
-            if !name.starts_with("embedded-js-") || !name.ends_with(".json") {
-                continue;
-            }
-            let pending = fs::read(&path)
-                .ok()
-                .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
-                .map(|state| nats_pending_by_subject(&state))
-                .unwrap_or_default();
-            tracing::info!(
-                file = %path.display(),
-                pending = ?pending,
-                "the embedded NATS broker's messages go with it"
-            );
-        }
-        match fs::remove_dir_all(&dir) {
-            Ok(()) => {
-                tracing::info!(dir = %dir.display(), "removed the embedded NATS broker's directory")
-            }
-            Err(err) => tracing::warn!(
-                dir = %dir.display(),
-                error = %err,
-                "could not remove the embedded NATS broker's directory"
-            ),
-        }
-    }
-    let path = config_dir.join("hive.yaml");
-    let Ok(text) = fs::read_to_string(&path) else {
-        return;
-    };
-    if let Some(edited) = drop_top_level_section(&text, "nats") {
-        match write_file_atomic(&path, edited.as_bytes()) {
-            Ok(()) => tracing::info!("removed the nats section from hive.yaml"),
-            Err(err) => {
-                tracing::warn!(error = %err, "could not remove the nats section from hive.yaml")
-            }
-        }
-    }
-}
-
-/// Messages per subject in the broker's state file (`streams.<subject>.messages`), the empty
-/// subjects left out.
-fn nats_pending_by_subject(state: &serde_json::Value) -> BTreeMap<String, usize> {
-    let Some(streams) = state.get("streams").and_then(|streams| streams.as_object()) else {
-        return BTreeMap::new();
-    };
-    streams
-        .iter()
-        .filter_map(|(subject, stream)| {
-            let messages = stream
-                .get("messages")
-                .and_then(|messages| messages.as_array())
-                .map_or(0, Vec::len);
-            (messages > 0).then(|| (subject.clone(), messages))
-        })
-        .collect()
-}
-
-/// hive.yaml without a top-level section: its key line, the lines indented under it, and the
-/// comment lines right above it that name it; `None` when there is no such section.
-fn drop_top_level_section(text: &str, key: &str) -> Option<String> {
-    let lines: Vec<&str> = text.lines().collect();
-    let header = format!("{key}:");
-    let start = lines.iter().position(|line| {
-        line.strip_prefix(header.as_str())
-            .is_some_and(|rest| rest.is_empty() || rest.starts_with(' '))
-    })?;
-    let mut first = start;
-    while first > 0
-        && lines[first - 1].starts_with('#')
-        && lines[first - 1].to_ascii_lowercase().contains(key)
-    {
-        first -= 1;
-    }
-    let mut end = start + 1;
-    while end < lines.len() && (lines[end].starts_with(' ') || lines[end].starts_with('\t')) {
-        end += 1;
-    }
-    // One blank line is enough between the sections around it.
-    if end < lines.len()
-        && lines[end].trim().is_empty()
-        && (first == 0 || lines[first - 1].trim().is_empty())
-    {
-        end += 1;
-    }
-    let mut out = lines[..first].to_vec();
-    out.extend_from_slice(&lines[end..]);
-    let mut edited = out.join("\n");
-    if text.ends_with('\n') {
-        edited.push('\n');
-    }
-    Some(edited)
-}
-
-/// hive.yaml without the retired nodes in `system_nodes.<role>`, by lines; and what it removed.
-fn drop_retired_from_role_section(
-    text: &str,
-    role: &str,
-    retired: &[&str],
-) -> (String, Vec<String>) {
-    let role_key = format!("{role}:");
-    let mut out = Vec::new();
-    let mut removed = Vec::new();
-    let mut system_nodes_indent: Option<usize> = None;
-    let mut role_indent: Option<usize> = None;
-    for line in text.lines() {
-        let trimmed = line.trim_start();
-        let indent = line.len() - trimmed.len();
-        if !trimmed.is_empty() && !trimmed.starts_with('#') {
-            if role_indent.is_some_and(|role_indent| indent <= role_indent) {
-                role_indent = None;
-            }
-            if system_nodes_indent.is_some_and(|nodes_indent| indent <= nodes_indent) {
-                system_nodes_indent = None;
-            }
-            if trimmed.starts_with("system_nodes:") {
-                system_nodes_indent = Some(indent);
-            } else if system_nodes_indent.is_some() && role_indent.is_none() && trimmed == role_key
-            {
-                role_indent = Some(indent);
-            } else if role_indent.is_some() {
-                if let Some(item) = trimmed.strip_prefix("- ") {
-                    let item = item.trim().trim_matches(|c| c == '"' || c == '\'');
-                    if retired.contains(&item) {
-                        removed.push(item.to_string());
-                        continue;
-                    }
-                }
-            }
-        }
-        out.push(line);
-    }
-    let mut edited = out.join("\n");
-    if text.ends_with('\n') {
-        edited.push('\n');
-    }
-    (edited, removed)
-}
-
 fn system_nodes_for_role(
     hive: &HiveFile,
     role: HiveRole,
@@ -5312,11 +5064,8 @@ fn system_nodes_for_role(
             role.as_str()
         )
     })?;
-    // A retired node is left out for every reader: the boot, the core components a spoke
-    // installs, the templates of a join; even where the hive.yaml rewrite failed.
-    let role_section = without_retired_nodes(role_section.clone());
-    validate_system_nodes(&role_section, role)?;
-    Ok(role_section)
+    validate_system_nodes(role_section, role)?;
+    Ok(role_section.clone())
 }
 
 fn validate_system_nodes(
@@ -27163,82 +26912,6 @@ fn is_ingress_role(role: Option<&str>) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// A-70 stage 2: a retired node leaves one role section at a time, by lines, comments kept;
-    /// the other sections stay as they are (the boot drops it from each section in turn).
-    #[test]
-    fn a_retired_node_leaves_one_role_section_at_a_time() {
-        let text = r#"hive_id: worker1
-system_nodes:
-  motherbee:
-    nodes:
-      - SY.config.routes
-      - SY.policy
-  worker:
-    # the worker's own nodes
-    nodes:
-      - SY.config.routes
-      - "SY.policy"
-      - SY.cognition
-    wait_for:
-      - SY.policy
-wan:
-  gateway_name: RT.gateway
-"#;
-        let (edited, removed) = drop_retired_from_role_section(text, "worker", &["SY.policy"]);
-        assert_eq!(
-            removed,
-            vec!["SY.policy".to_string(), "SY.policy".to_string()]
-        );
-        assert!(edited
-            .contains("  motherbee:\n    nodes:\n      - SY.config.routes\n      - SY.policy\n"));
-        assert!(edited.contains("    # the worker's own nodes\n"));
-        assert!(edited.contains("      - SY.config.routes\n      - SY.cognition\n    wait_for:\n"));
-        assert!(edited.ends_with("gateway_name: RT.gateway\n"));
-        let (again, removed) = drop_retired_from_role_section(&edited, "worker", &["SY.policy"]);
-        assert!(removed.is_empty());
-        assert_eq!(again, edited);
-        let section = without_retired_nodes(RoleSystemNodes {
-            nodes: vec!["SY.config.routes".to_string(), "SY.policy".to_string()],
-            wait_for: vec!["SY.policy".to_string()],
-        });
-        assert_eq!(section.nodes, vec!["SY.config.routes".to_string()]);
-        assert!(section.wait_for.is_empty());
-    }
-
-    /// A-70 stage 2b: the `nats:` section leaves hive.yaml with the comment that names it, and a
-    /// spoke's rendered file (no comment) loses it too; a file without it is left alone.
-    #[test]
-    fn the_nats_section_leaves_hive_yaml() {
-        let packaged = "hive_id: motherbee\nrole: motherbee\n\n# Local NATS broker for control/data plane.\nnats:\n  mode: embedded\n  port: 4222\n\n# Local admin HTTP API.\nadmin:\n  listen: \"127.0.0.1:8080\"\n";
-        assert_eq!(
-            drop_top_level_section(packaged, "nats").as_deref(),
-            Some("hive_id: motherbee\nrole: motherbee\n\n# Local admin HTTP API.\nadmin:\n  listen: \"127.0.0.1:8080\"\n")
-        );
-        let rendered = "hive_id: worker1\nrole: worker\nwan:\n  gateway_name: RT.gateway\nnats:\n  mode: embedded\n  port: 4222\nstorage:\n  path: \"/var/lib/fluxbee\"\n";
-        assert_eq!(
-            drop_top_level_section(rendered, "nats").as_deref(),
-            Some("hive_id: worker1\nrole: worker\nwan:\n  gateway_name: RT.gateway\nstorage:\n  path: \"/var/lib/fluxbee\"\n")
-        );
-        assert!(
-            drop_top_level_section("hive_id: x\nnatsy: 1\nstorage:\n  nats: 1\n", "nats").is_none()
-        );
-    }
-
-    #[test]
-    fn the_brokers_pending_messages_are_counted_by_subject() {
-        let state = serde_json::json!({
-            "streams": {
-                "storage.turns": {"messages": [{"seq": 1}, {"seq": 2}], "last_seq": 2},
-                "storage.cognition.threads": {"messages": [], "last_seq": 52}
-            },
-            "consumers": {}
-        });
-        let pending = nats_pending_by_subject(&state);
-        assert_eq!(pending.len(), 1);
-        assert_eq!(pending.get("storage.turns"), Some(&2));
-        assert!(nats_pending_by_subject(&serde_json::json!({})).is_empty());
-    }
 
     #[test]
     fn teardown_deletes_each_secret_in_its_own_tenant() {

@@ -48,18 +48,6 @@ else
   echo "  warning: fluxbee_stop.sh not found at $SCRIPT_DIR; assuming services already stopped"
 fi
 
-# Remove pre-runtime IO install artifacts from older development installs.
-# The canonical IO path is now runtime publication through install.sh +
-# orchestrator-managed fluxbee-node-* instances.
-step "Removing deprecated IO direct-install artifacts..."
-for legacy_unit in fluxbee-io-api fluxbee-io-slack fluxbee-io-sim; do
-  $SUDO systemctl disable --now "$legacy_unit.service" >/dev/null 2>&1 || true
-  $SUDO rm -f "/etc/systemd/system/$legacy_unit.service" 2>/dev/null || true
-done
-$SUDO rm -f /usr/bin/io-api /usr/bin/io-slack /usr/bin/io-sim 2>/dev/null || true
-$SUDO rm -f "$CONFIG_DIR/io-api.env" "$CONFIG_DIR/io-slack.env" "$CONFIG_DIR/io-sim.env" 2>/dev/null || true
-$SUDO systemctl daemon-reload >/dev/null 2>&1 || true
-
 # ── 2. Resolve Postgres URL BEFORE we wipe configs/node secrets ──────────────
 read_json_secret_value() {
   local path="$1"

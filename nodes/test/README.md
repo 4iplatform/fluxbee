@@ -10,23 +10,6 @@ Incluye dos runtimes mí­nimos:
   y enví­a un mensaje `Resolve`.
 - `AI.test.gov`: actúa como frontdesk simple, recibe el mensaje ruteado por el
   router y responde con un ack.
-- `IO.test.cognition`: emisor disposable para E2E de cognition por router con
-  `thread_id` canónico.
-- `AI.test.cognition`: receptor disposable que captura
-  `trace_id/ich/thread_id/context/memory_package` y responde con observaciones.
-
-### E2E cognition por router: qué valida hoy
-
-El par `IO.test.cognition` + `AI.test.cognition` valida el carrier real por
-router. El chequeo actual cubre:
-
-- preservación de `trace_id`
-- preservación de `ich`
-- entrega al receptor esperado
-- `msg_type=user`
-- preservación de `thread_id`
-- presencia de `meta.context.probe_id/probe_step`
-- enrichment posterior con `memory_package`
 
 ## Objetivo
 
@@ -43,9 +26,7 @@ Mostrar, con nodos reales y legibles:
 ```text
 nodes/test/
 ├── ai-test-gov/
-├── ai-test-cognition/
-├── io-test/
-└── io-test-cognition/
+└── io-test/
 ```
 
 ## Build
@@ -55,8 +36,6 @@ Desde raí­z del repo:
 ```bash
 cargo check -p io-test
 cargo check -p ai-test-gov
-cargo check -p io-test-cognition
-cargo check -p ai-test-cognition
 ```
 
 ## Probar auto-routing de ILK temporal
@@ -239,49 +218,3 @@ Ese script valida:
 4. restart de `sy-orchestrator`
 5. relaunch automático desde `config.json`
 6. probe real posterior con `IO.test`
-
-## E2E cognition por router
-
-Estos nodos existen para validar cognition v2 sin tocar AI nodes productivos y
-sin bypass por `storage.turns`.
-
-Terminal 1:
-
-```bash
-cargo run -p ai-test-cognition
-```
-
-Terminal 2:
-
-```bash
-cargo run -p io-test-cognition
-```
-
-Comportamiento esperado:
-
-1. `IO.test.cognition` calcula un `thread_id` canónico y enví­a un primer turn
-   unicast a `AI.test.cognition@<hive>`.
-2. El router entrega al nodo receptor.
-3. `AI.test.cognition` devuelve en el reply su observación del mensaje recibido:
-   - `thread_id`
-   - presencia/ausencia de `memory_package`
-4. `IO.test.cognition` enví­a turns adicionales sobre el mismo thread hasta
-   observar `memory_package` o agotar el máximo configurado.
-
-Variables útiles:
-
-- `IO_TEST_COGNITION_TARGET`
-- `IO_TEST_COGNITION_PROBE_ID`
-- `IO_TEST_COGNITION_THREAD_ID`
-- `IO_TEST_COGNITION_MAX_STEPS`
-- `IO_TEST_COGNITION_TURN_DELAY_MS`
-- `IO_TEST_COGNITION_REQUIRE_MEMORY_PACKAGE`
-- `AI_TEST_COGNITION_CAPTURE_PATH`
-
-Salida útil del emisor:
-
-- `THREAD_ID`
-- `MEMORY_PACKAGE_PRESENT`
-- `DOMINANT_CONTEXT`
-- `DOMINANT_REASON`
-- `FINAL_OBSERVATION`

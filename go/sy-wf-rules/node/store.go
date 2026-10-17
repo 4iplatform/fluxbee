@@ -82,14 +82,6 @@ func (s *Store) ReadCurrentDefinition(workflowName string) ([]byte, error) {
 	return s.ReadDefinitionBytes(workflowName, "current")
 }
 
-func (s *Store) ReadStagedDefinition(workflowName string) ([]byte, error) {
-	return s.ReadDefinitionBytes(workflowName, "staged")
-}
-
-func (s *Store) ReadBackupDefinition(workflowName string) ([]byte, error) {
-	return s.ReadDefinitionBytes(workflowName, "backup")
-}
-
 func (s *Store) ReadMetadata(workflowName, slot string) (*WfRulesMetadata, error) {
 	data, err := os.ReadFile(s.metadataPath(workflowName, slot))
 	if err != nil {

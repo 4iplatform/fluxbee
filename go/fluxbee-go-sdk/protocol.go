@@ -104,9 +104,6 @@ type Meta struct {
 	DstIlk           *string         `json:"dst_ilk,omitempty"`
 	Ich              *string         `json:"ich,omitempty"`
 	ThreadID         *string         `json:"thread_id,omitempty"`
-	Ctx              *string         `json:"ctx,omitempty"`
-	CtxSeq           *uint64         `json:"ctx_seq,omitempty"`
-	CtxWindow        []CtxTurn       `json:"ctx_window,omitempty"`
 	MemoryPackage    *MemoryPackage  `json:"memory_package,omitempty"`
 	Scope            *string         `json:"scope,omitempty"`
 	Target           *string         `json:"target,omitempty"`
@@ -163,14 +160,6 @@ type MemoryPackageTruncated struct {
 	DroppedReasons  uint32 `json:"dropped_reasons"`
 	DroppedMemories uint32 `json:"dropped_memories"`
 	DroppedEpisodes uint32 `json:"dropped_episodes"`
-}
-
-type CtxTurn struct {
-	Seq      uint64 `json:"seq"`
-	TS       string `json:"ts"`
-	From     string `json:"from"`
-	TurnType string `json:"type"`
-	Text     string `json:"text"`
 }
 
 type NodeHelloPayload struct {

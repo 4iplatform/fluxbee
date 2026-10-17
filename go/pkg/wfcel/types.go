@@ -80,8 +80,8 @@ type ActionDefinition struct {
 	FireAt         string      `json:"fire_at,omitempty"`
 	MissedPolicy   string      `json:"missed_policy,omitempty"`
 	MissedWithinMS *int64      `json:"missed_within_ms,omitempty"`
-	Name  string `json:"name,omitempty"`
-	Value any    `json:"value,omitempty"`
+	Name           string      `json:"name,omitempty"`
+	Value          any         `json:"value,omitempty"`
 	// OnError is the failure policy for this action (gap-2): "continue" logs the error and proceeds
 	// (legacy behavior), "fail" halts the transition and routes the instance to a loud terminal
 	// failure. Empty = the per-type default: send_message and set_variable default to "fail" (a lost

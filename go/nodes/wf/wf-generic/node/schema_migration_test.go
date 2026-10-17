@@ -173,14 +173,14 @@ VALUES (?, ?, 'running', 'start', '{}', '{}', '', ?, ?);`,
 // restart.
 //
 // We simulate the crash by:
-//   1. Persisting the store to a file path (not `:memory:`)
-//   2. Picking the event with `GetNextInternalEvent` (no DB write)
-//   3. Computing the next instance row + planned mutation in-memory
-//   4. NOT calling `CommitInstanceMutation` — closing the store as if the
-//      process died
-//   5. Reopening the store and asserting the pre-commit invariants
-//   6. Retrying the commit with the same mutation and verifying it succeeds
-//      exactly once.
+//  1. Persisting the store to a file path (not `:memory:`)
+//  2. Picking the event with `GetNextInternalEvent` (no DB write)
+//  3. Computing the next instance row + planned mutation in-memory
+//  4. NOT calling `CommitInstanceMutation` — closing the store as if the
+//     process died
+//  5. Reopening the store and asserting the pre-commit invariants
+//  6. Retrying the commit with the same mutation and verifying it succeeds
+//     exactly once.
 func TestCrashDuringConsumptionTransitionLeavesQueueAndInstanceInPreCommitState(t *testing.T) {
 	dbPath := filepath.Join(t.TempDir(), "wf-crash.db")
 

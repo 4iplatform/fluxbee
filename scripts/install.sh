@@ -10,11 +10,7 @@ INSTALL_OWNER="${INSTALL_OWNER:-${SUDO_USER:-$USER}}"
 RESTART_ORCHESTRATOR_AFTER_INSTALL="${RESTART_ORCHESTRATOR_AFTER_INSTALL:-1}"
 CLEAN_RUNTIME_VOLATILE_ON_INSTALL="${CLEAN_RUNTIME_VOLATILE_ON_INSTALL:-1}"
 FLUXBEE_DB_BOOTSTRAP_ON_INSTALL="${FLUXBEE_DB_BOOTSTRAP_ON_INSTALL:-1}"
-SEED_RUNTIME_FIXTURE="${SEED_RUNTIME_FIXTURE:-0}"
 RESEED_SYNCTHING_CONFIG_ON_INSTALL="${RESEED_SYNCTHING_CONFIG_ON_INSTALL:-0}"
-RUNTIME_FIXTURE_NAME="${RUNTIME_FIXTURE_NAME:-wf.orch.diag}"
-RUNTIME_FIXTURE_VERSION="${RUNTIME_FIXTURE_VERSION:-0.0.1}"
-RUNTIME_FIXTURE_SLEEP_SECS="${RUNTIME_FIXTURE_SLEEP_SECS:-3600}"
 AI_GENERIC_RUNTIME_NAME="${AI_GENERIC_RUNTIME_NAME:-ai.generic}"
 AI_GENERIC_RUNTIME_VERSION="${AI_GENERIC_RUNTIME_VERSION:-1.0.0}"
 WF_ENGINE_RUNTIME_NAME="${WF_ENGINE_RUNTIME_NAME:-wf.engine}"
@@ -989,82 +985,6 @@ bash "$ROOT_DIR/scripts/publish-runtime.sh" \
   --dist-root "$STATE_DIR/dist" \
   --set-current \
   --sudo
-
-if [[ "$SEED_RUNTIME_FIXTURE" == "1" ]]; then
-  echo "Seeding runtime fixture in $STATE_DIR/dist/runtimes: $RUNTIME_FIXTURE_NAME@$RUNTIME_FIXTURE_VERSION"
-  runtime_fixture_dir="$STATE_DIR/dist/runtimes/$RUNTIME_FIXTURE_NAME/$RUNTIME_FIXTURE_VERSION"
-  runtime_fixture_start="$runtime_fixture_dir/bin/start.sh"
-  sudo install -d "$runtime_fixture_dir/bin"
-  cat <<EOF | sudo tee "$runtime_fixture_start" >/dev/null
-#!/usr/bin/env bash
-set -euo pipefail
-exec /bin/sleep "$RUNTIME_FIXTURE_SLEEP_SECS"
-EOF
-  sudo chmod 0755 "$runtime_fixture_start"
-
-  if command -v python3 >/dev/null 2>&1; then
-    runtime_manifest_tmp="$(mktemp)"
-    cat <<EOF | python3 - "$STATE_DIR/dist/runtimes/manifest.json" "$RUNTIME_FIXTURE_NAME" "$RUNTIME_FIXTURE_VERSION" >"$runtime_manifest_tmp"
-import json
-import pathlib
-import sys
-import time
-
-manifest_path = pathlib.Path(sys.argv[1])
-runtime_name = sys.argv[2]
-runtime_version = sys.argv[3]
-
-doc = {
-    "schema_version": 1,
-    "version": 0,
-    "updated_at": None,
-    "runtimes": {},
-}
-
-if manifest_path.exists():
-    try:
-        loaded = json.loads(manifest_path.read_text(encoding="utf-8"))
-        if isinstance(loaded, dict):
-            doc.update(loaded)
-    except Exception:
-        pass
-
-schema_version = doc.get("schema_version")
-if not isinstance(schema_version, int) or schema_version < 1:
-    schema_version = 1
-doc["schema_version"] = schema_version
-doc["version"] = int(time.time() * 1000)
-doc["updated_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
-
-runtimes = doc.get("runtimes")
-if not isinstance(runtimes, dict):
-    runtimes = {}
-doc["runtimes"] = runtimes
-
-entry = runtimes.get(runtime_name)
-if not isinstance(entry, dict):
-    entry = {}
-
-available = entry.get("available")
-if not isinstance(available, list):
-    available = []
-available = [str(v) for v in available if str(v).strip()]
-if runtime_version not in available:
-    available.append(runtime_version)
-
-entry["available"] = sorted(set(available))
-entry["current"] = runtime_version
-runtimes[runtime_name] = entry
-
-print(json.dumps(doc, indent=2, sort_keys=True))
-EOF
-    sudo install -m 0644 "$runtime_manifest_tmp" "$STATE_DIR/dist/runtimes/manifest.json"
-    rm -f "$runtime_manifest_tmp"
-    echo "Updated runtime manifest at $STATE_DIR/dist/runtimes/manifest.json (seeded $RUNTIME_FIXTURE_NAME@$RUNTIME_FIXTURE_VERSION)"
-  else
-    echo "Warning: python3 not found; skipping runtime manifest seed in $STATE_DIR/dist/runtimes/manifest.json" >&2
-  fi
-fi
 
 if [[ -f "$ROOT_DIR/config/hive.yaml" ]]; then
   sudo install -m 0644 "$ROOT_DIR/config/hive.yaml" "$CONFIG_DIR/hive.yaml"

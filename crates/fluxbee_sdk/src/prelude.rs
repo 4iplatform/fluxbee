@@ -1,7 +1,6 @@
 pub use crate::blob::{
     constants as blob_constants, BlobConfig, BlobError, BlobGcOptions, BlobGcPassReport,
-    BlobGcReport, BlobMetricsSnapshot, BlobRef, BlobStat, BlobToolkit, PublishBlobRequest,
-    PublishBlobResult, ResolveRetryConfig, SyncHintTargetResult,
+    BlobGcReport, BlobMetricsSnapshot, BlobRef, BlobStat, BlobToolkit, ResolveRetryConfig,
 };
 pub use crate::cognition::{
     CognitionContextData, CognitionCooccurrenceData, CognitionDurableEntity,
@@ -13,8 +12,6 @@ pub use crate::cognition::{
     SUBJECT_STORAGE_COGNITION_REASONS, SUBJECT_STORAGE_COGNITION_SCOPES,
     SUBJECT_STORAGE_COGNITION_SCOPE_INSTANCES, SUBJECT_STORAGE_COGNITION_THREADS,
 };
-pub use crate::comm::protocol;
-pub use crate::comm::{NodeConfig, NodeError, NodeSender, NodeUuidMode};
 pub use crate::identity::{
     identity_shm_name_for_hive, load_hive_id, read_self_ilk_from_env, read_self_tenant_from_env,
     resolve_ilk_from_hive_config, resolve_ilk_from_hive_id, resolve_ilk_from_shm_name,
@@ -49,6 +46,7 @@ pub use crate::node_secret::{
     NODE_SECRET_SCHEMA_VERSION,
 };
 pub use crate::payload::{PayloadError, TextV1Payload, TEXT_V1_DEFAULT_MESSAGE_MAX_BYTES};
+pub use crate::protocol;
 pub use crate::rpc::{
     AdminCommandRequest, AdminCommandResult, OperationalRouteProfile, RouterDispatcher, RpcError,
     SystemRpcRequest, ADMIN_KIND, MSG_ADMIN_COMMAND, MSG_ADMIN_COMMAND_RESPONSE,
@@ -85,3 +83,4 @@ pub use crate::vault::{
     MSG_VAULT_LIST_RESPONSE, MSG_VAULT_PUT, MSG_VAULT_PUT_RESPONSE, MSG_VAULT_ROLLBACK,
     MSG_VAULT_ROLLBACK_RESPONSE, MSG_VAULT_ROTATE, MSG_VAULT_ROTATE_RESPONSE, VAULT_REF_PREFIX,
 };
+pub use crate::{NodeConfig, NodeError, NodeSender, NodeUuidMode};

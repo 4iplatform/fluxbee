@@ -47,14 +47,7 @@ impl AiSdkError {
                 NodeError::MessageTooLarge { .. } => false,
             },
             AiSdkError::Http(err) => err.is_timeout() || err.is_connect() || err.is_request(),
-            AiSdkError::Blob(err) => matches!(
-                err,
-                BlobError::NotFound(_)
-                    | BlobError::Io(_)
-                    | BlobError::SyncHintTimeout { .. }
-                    | BlobError::SyncHintFailed { .. }
-                    | BlobError::SyncHintTransport { .. }
-            ),
+            AiSdkError::Blob(err) => matches!(err, BlobError::NotFound(_) | BlobError::Io(_)),
             AiSdkError::Timeout(_) => true,
             AiSdkError::RecoverableExhausted(_) => true,
             AiSdkError::Payload(_) => false,

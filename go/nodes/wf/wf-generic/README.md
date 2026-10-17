@@ -28,7 +28,7 @@ Config de ejemplo usando el workflow canónico:
 ```bash
 cat >/tmp/wf.invoice.config.json <<'EOF'
 {
-  "workflow_definition_path": "/home/administrator/fluxbee/go/nodes/wf/examples/wf.invoice.json",
+  "workflow_definition_path": "/home/administrator/fluxbee/go/nodes/wf/examples/packages/wf.invoice/flow/definition.json",
   "db_path": "/tmp/wf.invoice.db",
   "sy_timer_l2_name": "SY.timer@motherbee",
   "_system": {

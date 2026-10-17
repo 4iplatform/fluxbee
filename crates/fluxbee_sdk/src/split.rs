@@ -98,7 +98,7 @@ impl ConnectionInfo {
         self.vpn_id.load(Ordering::SeqCst)
     }
 
-    #[allow(dead_code)]
+    #[cfg(test)]
     fn router_name(&self) -> Arc<str> {
         self.router_name
             .read()

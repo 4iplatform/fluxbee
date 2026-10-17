@@ -255,12 +255,22 @@ fn metric_alias_count(payload: &Value) -> Option<u64> {
         .and_then(|v| v.as_u64())
 }
 
+/// A per-run test name gets a fresh UUID, so a run leaves no `.uuid` on the hive; an `SY.*` name
+/// stands in for a real node (the frontdesk) and keeps the UUID persisted for it.
+fn uuid_mode_for(name: &str) -> fluxbee_sdk::NodeUuidMode {
+    if name.starts_with("SY.") {
+        fluxbee_sdk::NodeUuidMode::Persistent
+    } else {
+        fluxbee_sdk::NodeUuidMode::Ephemeral
+    }
+}
+
 fn connect_config(name: String) -> NodeConfig {
     NodeConfig {
+        uuid_mode: uuid_mode_for(&name),
         name,
         router_socket: json_router::paths::router_socket_dir(),
         uuid_persistence_dir: json_router::paths::state_dir().join("nodes"),
-        uuid_mode: fluxbee_sdk::NodeUuidMode::Persistent,
         config_dir: json_router::paths::config_dir(),
         version: "0.0.1".to_string(),
     }

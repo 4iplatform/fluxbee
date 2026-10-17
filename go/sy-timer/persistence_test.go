@@ -160,17 +160,17 @@ func TestScheduleIdempotencyAllowsReuseAfterFire(t *testing.T) {
 
 	// Insert a fired timer with a known client_ref.
 	if err := insertTimer(ctx, db, timerRow{
-		UUID:         "timer-fired",
-		OwnerL2Name:  "WF.demo@motherbee",
-		TargetL2Name: "WF.demo@motherbee",
-		ClientRef:    sql.NullString{String: "wf:demo::fired-key", Valid: true},
-		Kind:         "oneshot",
-		FireAtUTC:    now - 60_000,
-		MissedPolicy: "fire",
-		Payload:      `{}`,
-		Status:       "fired",
-		CreatedAtUTC: now - 120_000,
-		FireCount:    1,
+		UUID:           "timer-fired",
+		OwnerL2Name:    "WF.demo@motherbee",
+		TargetL2Name:   "WF.demo@motherbee",
+		ClientRef:      sql.NullString{String: "wf:demo::fired-key", Valid: true},
+		Kind:           "oneshot",
+		FireAtUTC:      now - 60_000,
+		MissedPolicy:   "fire",
+		Payload:        `{}`,
+		Status:         "fired",
+		CreatedAtUTC:   now - 120_000,
+		FireCount:      1,
 		LastFiredAtUTC: sql.NullInt64{Int64: now - 60_000, Valid: true},
 	}); err != nil {
 		t.Fatalf("insert fired timer: %v", err)

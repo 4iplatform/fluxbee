@@ -9,7 +9,7 @@ ai:
     openai:
       model: "gpt-5.5"
     # anthropic:
-    #   model: "claude-sonnet-4-5"
+    #   model: "claude-sonnet-5-5"
 
 # WAN / inter-hive gateway.
 wan:

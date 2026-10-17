@@ -6,8 +6,10 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestPublishWorkflowPackageWritesDefaultConfigTemplate(t *testing.T) {
@@ -314,4 +316,50 @@ func TestPurgeRemovesTheCurrentVersionLastEvenWithALaggingManifest(t *testing.T)
 	if got := strings.Join(admin.removedVersions, ","); got != want {
 		t.Fatalf("removals = %s, want %s", got, want)
 	}
+}
+
+// The manifest writes of the test fake: the real publish goes through SY.admin.
+func (s *Service) updateRuntimeManifest(runtimeName, version string) error {
+	manifestPath := filepath.Join(s.cfg.DistRuntimeRoot, "manifest.json")
+	manifest, err := loadRuntimeManifest(manifestPath)
+	if err != nil {
+		return err
+	}
+	entry := manifest.Runtimes[runtimeName]
+	entry.PackageType = "workflow"
+	entry.RuntimeBase = workflowRuntimeBase
+	entry.Current = version
+	entry.Available = appendIfMissing(entry.Available, version)
+	sort.Strings(entry.Available)
+	manifest.Runtimes[runtimeName] = entry
+	manifest.SchemaVersion = 2
+	manifest.Version = nextManifestVersion(manifest.Version, uint64(time.Now().UTC().UnixMilli()))
+	manifest.UpdatedAt = time.Now().UTC().Format(timeRFC3339)
+	manifest.Hash = nil
+	return writeRuntimeManifest(manifestPath, manifest)
+}
+
+func writeRuntimeManifest(path string, manifest *runtimeManifest) error {
+	data, err := json.MarshalIndent(manifest, "", "  ")
+	if err != nil {
+		return err
+	}
+	data = append(data, '\n')
+	return writeFileAtomic(path, data, 0o644)
+}
+
+func appendIfMissing(values []string, target string) []string {
+	for _, value := range values {
+		if value == target {
+			return values
+		}
+	}
+	return append(values, target)
+}
+
+func nextManifestVersion(current, now uint64) uint64 {
+	if now > current {
+		return now
+	}
+	return current + 1
 }
