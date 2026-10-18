@@ -1,72 +1,72 @@
-# DEPLOYMENTS — registro de versiones desplegadas en PROD (auditoría)
+# DEPLOYMENTS — record of the versions deployed to PROD (audit)
 
-> Ledger **append-only** de cada versión que TOCA producción (`pve` @ `192.168.8.207`). Es el
-> registro de auditoría: **qué** versión, **cuándo**, **qué commit**, **qué cambió**, **cómo se
-> verificó** y **cómo se revierte**. Una fila en la tabla + una entrada detallada por versión.
+> **Append-only** ledger of every version that TOUCHES production (`pve` @ `192.168.8.207`). It is the
+> audit record: **which** version, **when**, **which commit**, **what changed**, **how it was
+> verified** and **how it is rolled back**. One row in the table + one detailed entry per version.
 >
-> **Regla (HANDBOOK §12): ningún `apt install` en prod — ni core-update a un spoke — sin una
-> entrada acá.** Sin entrada, el deploy no está hecho.
+> **Rule (HANDBOOK §12): no `apt install` in prod — and no core-update to a spoke — without an
+> entry here.** Without an entry, the deploy is not done.
 >
-> **Snapshots: nunca más de 3 por VM (HANDBOOK §12, desde 2026-09-25).** El rollback "por snapshot"
-> de las entradas viejas puede ya no existir: el 2026-09-25 se borraron los de 0.1.19 a 0.1.29.
-> El camino que siempre queda es `apt install fluxbee=<anterior>`, porque el repo conserva todas
-> las versiones.
+> **Snapshots: never more than 3 per VM (HANDBOOK §12, since 2026-09-25).** The "by snapshot" rollback
+> of the old entries may no longer exist: on 2026-09-25 the ones from 0.1.19 to 0.1.29 were deleted.
+> The path that always remains is `apt install fluxbee=<previous>`, because the repo keeps every
+> version.
 >
-> Hermanos: [`logbook/HANDBOOK.md`](logbook/HANDBOOK.md) (recetas de deploy), [`logbook/METHOD.md`](logbook/METHOD.md)
-> (cómo se opera la infra), `logbook/YYYY-MM-DD.md` (bitácora narrativa), [`logbook/FINDINGS.md`](logbook/FINDINGS.md)
-> (hallazgos/bugs). Este doc es SÓLO el ledger de versiones en prod. Fechas en **ART (−03)**;
-> el journal del host prod va en EDT (ver METHOD §1).
+> Siblings: [`logbook/HANDBOOK.md`](logbook/HANDBOOK.md) (deploy recipes), [`logbook/METHOD.md`](logbook/METHOD.md)
+> (how the infra is operated), `logbook/YYYY-MM-DD.md` (narrative logbook), [`logbook/FINDINGS.md`](logbook/FINDINGS.md)
+> (findings/bugs). This doc is ONLY the ledger of the versions in prod. Dates in **ART (−03)**;
+> the prod host's journal is in EDT (see METHOD §1).
 
-## Tabla rápida (auditoría)
+## Quick table (audit)
 
-| Versión | Fecha (ART) | Commit | Alcance | Estado | Rollback |
+| Version | Date (ART) | Commit | Scope | Status | Rollback |
 |---|---|---|---|---|---|
-| **0.1.79** | 2026-10-17 | `0bc85e3` | motherbee + spokes (core) | ✅ live | snap `pre-stream3-0-1-79` (las 4 VMs) · `apt install fluxbee=0.1.78` + core-update de los spokes |
-| **0.1.78** | 2026-10-17 | `104fa65` | motherbee + spokes (core) | ✅ reemplazado por 0.1.79 | snap `pre-stream2b-0-1-78` (las 4 VMs) · `apt install fluxbee=0.1.77` + core-update de los spokes |
-| **0.1.77** | 2026-10-17 | `377945a` | motherbee + spokes (core) | ✅ reemplazado por 0.1.78 | snap `pre-stream2a-0-1-77` (las 4 VMs); `apt` solo no alcanza (ver la entrada) |
-| **0.1.76** | 2026-10-16 | `e24e7d3` | motherbee + spokes (core) | ✅ reemplazado por 0.1.77 | snap `pre-stream1b-0-1-76` (las 4 VMs); `apt install fluxbee=0.1.75` pierde la inbox purgada (ver la entrada) |
-| **0.1.75** | 2026-10-16 | `1c00389` | motherbee + spokes (core) | ✅ reemplazado por 0.1.76 | snap `pre-stream1a-0-1-75` (las 4 VMs); `apt` solo no alcanza (ver la entrada) |
-| **0.1.74** | 2026-10-16 | `0d69329` | motherbee + spokes (core) | ✅ reemplazado por 0.1.75 | snap `pre-sdk-0-1-74` (las 4 VMs) · `apt install fluxbee=0.1.73` |
-| **0.1.73** | 2026-10-16 | `822f237` | motherbee + spokes (core) + `hive.yaml` (IA: Claude) | ✅ reemplazado por 0.1.74 | snap `pre-cognition-0-1-73` (las 4 VMs) · `apt install fluxbee=0.1.72` · `hive.yaml.pre-claude-0-1-72` |
-| **0.1.72** | 2026-10-16 | `17e1edd` | motherbee + spokes (core) | ✅ reemplazado por 0.1.73 | snap `pre-sync-0-1-72` (las 4 VMs) · `apt install fluxbee=0.1.71` |
-| **0.1.71** | 2026-10-16 | `73f7132` | motherbee + spokes (core) | ✅ reemplazado por 0.1.72 | snap `pre-gate-0-1-71` (las 4 VMs) · `apt install fluxbee=0.1.70` |
-| **0.1.70** | 2026-10-16 | `c289bb3` | motherbee + spokes (core) | ✅ reemplazado por 0.1.71 | snap `pre-wf-0-1-70` (las 4 VMs) · `apt install fluxbee=0.1.69` |
-| **0.1.69** | 2026-10-15 | `6f03310` | motherbee + spokes (core) | ✅ reemplazado por 0.1.70 | snap `pre-teardown-0-1-69` (las 4 VMs) · `apt install fluxbee=0.1.68` |
-| **0.1.68** | 2026-10-15 | `1b47c3e` | motherbee + spokes (core) | ✅ reemplazado por 0.1.69 | snap `pre-cloud-0-1-68` (las 4 VMs) · `apt install fluxbee=0.1.67` |
-| **0.1.67** | 2026-10-15 | `e85041d` | motherbee + spokes (core) | ✅ live | snap `pre-tenant-0-1-67` (las 4 VMs) · `apt install fluxbee=0.1.66` (la migración v4 no se deshace; ver la entrada) |
-| **0.1.66** | 2026-10-14 | `96c8d77` | motherbee + spokes (core) | ✅ live | snap `pre-secrets-0-1-66` (las 4 VMs) · `apt install fluxbee=0.1.65` |
-| **0.1.65** | 2026-10-14 | `8b3e951` | motherbee + spokes (core) | ✅ live | snap `pre-scope-0-1-65` (las 4 VMs) · `apt install fluxbee=0.1.64` (la migración v3 no se deshace; ver la entrada) |
-| **0.1.64** | 2026-10-13 | `f8c73c5` | motherbee + spokes (core) | ✅ live | snap `pre-cloud-0-1-64` (las 4 VMs) · `apt install fluxbee=0.1.63` |
-| **0.1.63** | 2026-10-06 | `aab0e3e` | motherbee + spokes (core) | ✅ live | snap `pre-a58-0-1-63` (las 4 VMs) · `apt install fluxbee=0.1.62` (HANDBOOK, rollback bajo 0.1.63) |
-| **0.1.62** | 2026-10-06 | `b4868e8` | motherbee + spokes (core) | ✅ live | snap `pre-identity-0-1-62` (las 4 VMs) · `apt install fluxbee=0.1.61` (spokes primero) |
-| **0.1.61** | 2026-10-06 | `e0f2d04` | motherbee + spokes (core) | ✅ live | snap `pre-ssh-0-1-61` (las 4 VMs) · `apt install fluxbee=0.1.60` |
-| **0.1.60** | 2026-10-06 | `0af5469` | motherbee + spokes (core) | ✅ live | snap `pre-hardening-0-1-60` (las 4 VMs) · `apt install fluxbee=0.1.59` |
-| **0.1.59** | 2026-10-06 | `f60eb92` | motherbee + spokes (core) | ✅ live | snap `pre-stage3-0-1-59` (las 4 VMs) · `apt install fluxbee=0.1.58` |
-| **0.1.58** | 2026-10-06 | `9d9391b` | motherbee + spokes (core) | ✅ live | snap `pre-stage2-0-1-58` (las 4 VMs) · `apt install fluxbee=0.1.57` |
-| **0.1.57** | 2026-10-06 | `a703b89` | motherbee + spokes (core) | ✅ live | snap `pre-posture-0-1-57` (las 4 VMs) · `apt install fluxbee=0.1.56` |
-| **0.1.56** | 2026-10-03 | `715143a` | motherbee + spokes (core) | ✅ live | snap `pre-root-io-0-1-56` (las 4 VMs) · `apt install fluxbee=0.1.55` |
-| **0.1.55** | 2026-10-02 | `975fd34` | motherbee + spokes (core) | ✅ live | snap `pre-root-tenant-0-1-55` (las 4 VMs) · `apt install fluxbee=0.1.54` |
-| **0.1.54** | 2026-10-02 | `6aa4ee4` | motherbee + spokes (core) | ✅ live | snap `pre-gov-0-1-54` (las 4 VMs) · `apt install fluxbee=0.1.53` |
-| **0.1.53** | 2026-10-02 | `26edcd5` | motherbee + spokes (core) | ✅ live | snap `pre-ai-generic-0-1-53` (las 4 VMs) · `apt install fluxbee=0.1.52` |
-| **0.1.52** | 2026-10-02 | `0670184` | motherbee + spokes (core) | ✅ live | snap `pre-cleanup-0-1-52` (las 4 VMs) · `apt install fluxbee=0.1.51` |
-| **0.1.51** | 2026-10-01 | `f7c2520` | motherbee + spokes (core) | ✅ live | snap `pre-query-decode-0-1-51` (las 4 VMs) · `apt install fluxbee=0.1.50` |
-| **0.1.50** | 2026-10-01 | `aa206ac` | motherbee + spokes (core) | ✅ live | snap `pre-config-routes-0-1-50` (las 4 VMs) · `apt install fluxbee=0.1.49` |
-| **0.1.49** | 2026-10-01 | `c921d1a` | motherbee + spokes (core) | ✅ live | snap `pre-architect-fixes-0-1-49` (las 4 VMs) · `apt install fluxbee=0.1.48` |
-| **0.1.48** | 2026-10-01 | `1486807` | motherbee + spokes (core) | ✅ live | snap `pre-architect-opa-0-1-48` (las 4 VMs) · `apt install fluxbee=0.1.47` |
-| **0.1.47** | 2026-10-01 | `652a9c9` | motherbee + spokes (core) | ✅ live | snap `pre-opa-blockB-0-1-47` (las 4 VMs) · `apt install fluxbee=0.1.46` |
-| **0.1.46** | 2026-10-01 | `7371ca1` | motherbee + spokes (core) | ✅ live | snap `pre-opa-blockA-0-1-46` (las 4 VMs) · `apt install fluxbee=0.1.45` |
-| **0.1.45** | 2026-10-01 | `d6505ff` | motherbee + spokes (core) | ✅ live | snap `pre-rule3-0-1-45` (las 4 VMs) · `apt install fluxbee=0.1.44` |
-| **0.1.44** | 2026-10-01 | `005d0ad` | motherbee + spokes (core) | ✅ live | snap `pre-src-binding-0-1-44` (las 4 VMs) · `apt install fluxbee=0.1.43` |
-| **0.1.43** | 2026-09-30 | `2b3abb2` | motherbee + spokes (core) | ✅ live | snap `pre-sync-hint-0-1-43` (las 4 VMs) · `apt install fluxbee=0.1.42` |
-| **0.1.42** | 2026-09-30 | `ac301d9` | motherbee + spokes (core) | ⚠️ superada (escaneo rechazado: 0.1.43) | snap `pre-opa-fixes-0-1-42` (las 4 VMs) · `apt install fluxbee=0.1.41` |
-| **0.1.41** | 2026-09-30 | `72891be` | motherbee + spokes (core) + `hive.yaml` | ✅ live | snap `pre-opa-global-0-1-41` (las 4 VMs) · `apt install fluxbee=0.1.40` + `hive.yaml.pre-opa-0-1-41` |
-| **0.1.40** | 2026-09-30 | `43dd174` | motherbee + spokes (core) | ✅ live | snap `pre-purge-order-0-1-40` (las 4 VMs) · `apt install fluxbee=0.1.39` |
-| **0.1.39** | 2026-09-30 | `85c3244` | motherbee + spokes (core) | ✅ live | snap `pre-identity-baseline-0-1-39` (las 4 VMs) · `apt install fluxbee=0.1.38` |
-| **0.1.38** | 2026-09-30 | `20baec3` | motherbee + spokes (core) | ✅ live | snap `pre-wf-mirror-0-1-38` (las 4 VMs) · `apt install fluxbee=0.1.37` |
-| **0.1.37** | 2026-09-30 | `c09f9af` | motherbee + spokes (core) | ✅ live | snap `pre-followups-0-1-37` (las 4 VMs) · `apt install fluxbee=0.1.36` |
-| **0.1.36** | 2026-09-30 | `d24e3aa` | motherbee + spokes (core) | ✅ live | snap `pre-config-scope-0-1-36` (las 4 VMs) · `apt install fluxbee=0.1.35` |
+| **0.1.79** | 2026-10-17 | `0bc85e3` | motherbee + spokes (core) | ✅ live | snap `pre-stream3-0-1-79` (all 4 VMs) · `apt install fluxbee=0.1.78` + core-update of the spokes |
+| **0.1.78** | 2026-10-17 | `104fa65` | motherbee + spokes (core) | ✅ replaced by 0.1.79 | snap `pre-stream2b-0-1-78` (all 4 VMs) · `apt install fluxbee=0.1.77` + core-update of the spokes |
+| **0.1.77** | 2026-10-17 | `377945a` | motherbee + spokes (core) | ✅ replaced by 0.1.78 | snap `pre-stream2a-0-1-77` (all 4 VMs); `apt` alone is not enough (see the entry) |
+| **0.1.76** | 2026-10-16 | `e24e7d3` | motherbee + spokes (core) | ✅ replaced by 0.1.77 | snap `pre-stream1b-0-1-76` (all 4 VMs); `apt install fluxbee=0.1.75` loses the purged inbox (see the entry) |
+| **0.1.75** | 2026-10-16 | `1c00389` | motherbee + spokes (core) | ✅ replaced by 0.1.76 | snap `pre-stream1a-0-1-75` (all 4 VMs); `apt` alone is not enough (see the entry) |
+| **0.1.74** | 2026-10-16 | `0d69329` | motherbee + spokes (core) | ✅ replaced by 0.1.75 | snap `pre-sdk-0-1-74` (all 4 VMs) · `apt install fluxbee=0.1.73` |
+| **0.1.73** | 2026-10-16 | `822f237` | motherbee + spokes (core) + `hive.yaml` (AI: Claude) | ✅ replaced by 0.1.74 | snap `pre-cognition-0-1-73` (all 4 VMs) · `apt install fluxbee=0.1.72` · `hive.yaml.pre-claude-0-1-72` |
+| **0.1.72** | 2026-10-16 | `17e1edd` | motherbee + spokes (core) | ✅ replaced by 0.1.73 | snap `pre-sync-0-1-72` (all 4 VMs) · `apt install fluxbee=0.1.71` |
+| **0.1.71** | 2026-10-16 | `73f7132` | motherbee + spokes (core) | ✅ replaced by 0.1.72 | snap `pre-gate-0-1-71` (all 4 VMs) · `apt install fluxbee=0.1.70` |
+| **0.1.70** | 2026-10-16 | `c289bb3` | motherbee + spokes (core) | ✅ replaced by 0.1.71 | snap `pre-wf-0-1-70` (all 4 VMs) · `apt install fluxbee=0.1.69` |
+| **0.1.69** | 2026-10-15 | `6f03310` | motherbee + spokes (core) | ✅ replaced by 0.1.70 | snap `pre-teardown-0-1-69` (all 4 VMs) · `apt install fluxbee=0.1.68` |
+| **0.1.68** | 2026-10-15 | `1b47c3e` | motherbee + spokes (core) | ✅ replaced by 0.1.69 | snap `pre-cloud-0-1-68` (all 4 VMs) · `apt install fluxbee=0.1.67` |
+| **0.1.67** | 2026-10-15 | `e85041d` | motherbee + spokes (core) | ✅ live | snap `pre-tenant-0-1-67` (all 4 VMs) · `apt install fluxbee=0.1.66` (the v4 migration is not undone; see the entry) |
+| **0.1.66** | 2026-10-14 | `96c8d77` | motherbee + spokes (core) | ✅ live | snap `pre-secrets-0-1-66` (all 4 VMs) · `apt install fluxbee=0.1.65` |
+| **0.1.65** | 2026-10-14 | `8b3e951` | motherbee + spokes (core) | ✅ live | snap `pre-scope-0-1-65` (all 4 VMs) · `apt install fluxbee=0.1.64` (the v3 migration is not undone; see the entry) |
+| **0.1.64** | 2026-10-13 | `f8c73c5` | motherbee + spokes (core) | ✅ live | snap `pre-cloud-0-1-64` (all 4 VMs) · `apt install fluxbee=0.1.63` |
+| **0.1.63** | 2026-10-06 | `aab0e3e` | motherbee + spokes (core) | ✅ live | snap `pre-a58-0-1-63` (all 4 VMs) · `apt install fluxbee=0.1.62` (HANDBOOK, rollback under 0.1.63) |
+| **0.1.62** | 2026-10-06 | `b4868e8` | motherbee + spokes (core) | ✅ live | snap `pre-identity-0-1-62` (all 4 VMs) · `apt install fluxbee=0.1.61` (spokes first) |
+| **0.1.61** | 2026-10-06 | `e0f2d04` | motherbee + spokes (core) | ✅ live | snap `pre-ssh-0-1-61` (all 4 VMs) · `apt install fluxbee=0.1.60` |
+| **0.1.60** | 2026-10-06 | `0af5469` | motherbee + spokes (core) | ✅ live | snap `pre-hardening-0-1-60` (all 4 VMs) · `apt install fluxbee=0.1.59` |
+| **0.1.59** | 2026-10-06 | `f60eb92` | motherbee + spokes (core) | ✅ live | snap `pre-stage3-0-1-59` (all 4 VMs) · `apt install fluxbee=0.1.58` |
+| **0.1.58** | 2026-10-06 | `9d9391b` | motherbee + spokes (core) | ✅ live | snap `pre-stage2-0-1-58` (all 4 VMs) · `apt install fluxbee=0.1.57` |
+| **0.1.57** | 2026-10-06 | `a703b89` | motherbee + spokes (core) | ✅ live | snap `pre-posture-0-1-57` (all 4 VMs) · `apt install fluxbee=0.1.56` |
+| **0.1.56** | 2026-10-03 | `715143a` | motherbee + spokes (core) | ✅ live | snap `pre-root-io-0-1-56` (all 4 VMs) · `apt install fluxbee=0.1.55` |
+| **0.1.55** | 2026-10-02 | `975fd34` | motherbee + spokes (core) | ✅ live | snap `pre-root-tenant-0-1-55` (all 4 VMs) · `apt install fluxbee=0.1.54` |
+| **0.1.54** | 2026-10-02 | `6aa4ee4` | motherbee + spokes (core) | ✅ live | snap `pre-gov-0-1-54` (all 4 VMs) · `apt install fluxbee=0.1.53` |
+| **0.1.53** | 2026-10-02 | `26edcd5` | motherbee + spokes (core) | ✅ live | snap `pre-ai-generic-0-1-53` (all 4 VMs) · `apt install fluxbee=0.1.52` |
+| **0.1.52** | 2026-10-02 | `0670184` | motherbee + spokes (core) | ✅ live | snap `pre-cleanup-0-1-52` (all 4 VMs) · `apt install fluxbee=0.1.51` |
+| **0.1.51** | 2026-10-01 | `f7c2520` | motherbee + spokes (core) | ✅ live | snap `pre-query-decode-0-1-51` (all 4 VMs) · `apt install fluxbee=0.1.50` |
+| **0.1.50** | 2026-10-01 | `aa206ac` | motherbee + spokes (core) | ✅ live | snap `pre-config-routes-0-1-50` (all 4 VMs) · `apt install fluxbee=0.1.49` |
+| **0.1.49** | 2026-10-01 | `c921d1a` | motherbee + spokes (core) | ✅ live | snap `pre-architect-fixes-0-1-49` (all 4 VMs) · `apt install fluxbee=0.1.48` |
+| **0.1.48** | 2026-10-01 | `1486807` | motherbee + spokes (core) | ✅ live | snap `pre-architect-opa-0-1-48` (all 4 VMs) · `apt install fluxbee=0.1.47` |
+| **0.1.47** | 2026-10-01 | `652a9c9` | motherbee + spokes (core) | ✅ live | snap `pre-opa-blockB-0-1-47` (all 4 VMs) · `apt install fluxbee=0.1.46` |
+| **0.1.46** | 2026-10-01 | `7371ca1` | motherbee + spokes (core) | ✅ live | snap `pre-opa-blockA-0-1-46` (all 4 VMs) · `apt install fluxbee=0.1.45` |
+| **0.1.45** | 2026-10-01 | `d6505ff` | motherbee + spokes (core) | ✅ live | snap `pre-rule3-0-1-45` (all 4 VMs) · `apt install fluxbee=0.1.44` |
+| **0.1.44** | 2026-10-01 | `005d0ad` | motherbee + spokes (core) | ✅ live | snap `pre-src-binding-0-1-44` (all 4 VMs) · `apt install fluxbee=0.1.43` |
+| **0.1.43** | 2026-09-30 | `2b3abb2` | motherbee + spokes (core) | ✅ live | snap `pre-sync-hint-0-1-43` (all 4 VMs) · `apt install fluxbee=0.1.42` |
+| **0.1.42** | 2026-09-30 | `ac301d9` | motherbee + spokes (core) | ⚠️ superseded (scan rejected: 0.1.43) | snap `pre-opa-fixes-0-1-42` (all 4 VMs) · `apt install fluxbee=0.1.41` |
+| **0.1.41** | 2026-09-30 | `72891be` | motherbee + spokes (core) + `hive.yaml` | ✅ live | snap `pre-opa-global-0-1-41` (all 4 VMs) · `apt install fluxbee=0.1.40` + `hive.yaml.pre-opa-0-1-41` |
+| **0.1.40** | 2026-09-30 | `43dd174` | motherbee + spokes (core) | ✅ live | snap `pre-purge-order-0-1-40` (all 4 VMs) · `apt install fluxbee=0.1.39` |
+| **0.1.39** | 2026-09-30 | `85c3244` | motherbee + spokes (core) | ✅ live | snap `pre-identity-baseline-0-1-39` (all 4 VMs) · `apt install fluxbee=0.1.38` |
+| **0.1.38** | 2026-09-30 | `20baec3` | motherbee + spokes (core) | ✅ live | snap `pre-wf-mirror-0-1-38` (all 4 VMs) · `apt install fluxbee=0.1.37` |
+| **0.1.37** | 2026-09-30 | `c09f9af` | motherbee + spokes (core) | ✅ live | snap `pre-followups-0-1-37` (all 4 VMs) · `apt install fluxbee=0.1.36` |
+| **0.1.36** | 2026-09-30 | `d24e3aa` | motherbee + spokes (core) | ✅ live | snap `pre-config-scope-0-1-36` (all 4 VMs) · `apt install fluxbee=0.1.35` |
 | **0.1.35** | 2026-09-28 | `5f1cd71` | motherbee | ✅ live | snap `pre-teardown-fix-0-1-35` · `apt install fluxbee=0.1.34` |
-| **0.1.34** | 2026-09-28 | `60331c5` | motherbee + spokes (core) | ⚠️ superada (regresión teardown) | snap `pre-lifecycle-0-1-34` (las 4 VMs) · `apt install fluxbee=0.1.33` |
+| **0.1.34** | 2026-09-28 | `60331c5` | motherbee + spokes (core) | ⚠️ superseded (teardown regression) | snap `pre-lifecycle-0-1-34` (all 4 VMs) · `apt install fluxbee=0.1.33` |
 | **0.1.33** | 2026-08-28 | `01b6266` | motherbee | ✅ live | `apt install fluxbee=0.1.32` |
 | **0.1.32** | 2026-08-27 | `90fd64a` | motherbee | ✅ live | `apt install fluxbee=0.1.31` |
 | **0.1.31** | 2026-08-26 | `862c5e4` | motherbee | ✅ live | snap `pre-rpc-poison-fix-0-1-31` · `apt install fluxbee=0.1.30` |
@@ -81,2320 +81,2320 @@
 | **0.1.22** | 2026-08-20 | `15fc77f` | motherbee | ✅ live | snap `pre-frontdesk-0-1-22` · `apt install fluxbee=0.1.21` |
 | **0.1.21** | 2026-08-20 | `2f60403` | motherbee | ✅ live | snap `pre-register-human-0-1-21` · `apt install fluxbee=0.1.20` |
 | **0.1.20** | 2026-08-20 | `1297ba7` | motherbee | ✅ live | snap `pre-router-0-1-20` · `apt install fluxbee=0.1.19` |
-| ≤ 0.1.19 | (pre-ledger) | — | motherbee | histórico, sin registrar | repo apt conserva 0.1.0 … 0.1.19 |
+| ≤ 0.1.19 | (pre-ledger) | — | motherbee | historical, not recorded | the apt repo keeps 0.1.0 … 0.1.19 |
 
-> Este ledger arranca en **0.1.20** (primera vez que se registra formalmente). Las versiones
-> anteriores (0.1.0–0.1.19) se desplegaron sin ledger; el repo apt en fb-build las conserva
-> (`dpkg-scanpackages -m`) para rollback, pero su detalle vive en la bitácora, no acá.
+> This ledger starts at **0.1.20** (the first version formally recorded). The earlier
+> versions (0.1.0–0.1.19) were deployed without a ledger; the apt repo on fb-build keeps them
+> (`dpkg-scanpackages -m`) for rollback, but their detail lives in the logbook, not here.
 
 ---
 
-## 0.1.79 — Registro de uso de LLM: cada llamada a un modelo, cobrada a un tenant (A-70, etapa 3)
+## 0.1.79 — LLM usage records: every call to a model, charged to a tenant (A-70, stage 3)
 
-- **Fecha:** 2026-10-17 (ART) · **Versión anterior:** 0.1.78 · **Commit:** `0bc85e3`.
-  - Diseño: `docs/router-stream-v1.md` §7, conversado con el operador y revisado una vez; cómo
-    quedó construido en §7.2–§7.6.
-  - Una revisión del código con dos miradas (la contabilidad; confianza, almacenamiento y
-    lecturas), §7.9. El HIGH, el MEDIUM y tres LOW se arreglaron antes del build; uno queda con
+- **Date:** 2026-10-17 (ART) · **Previous version:** 0.1.78 · **Commit:** `0bc85e3`.
+  - Design: `docs/router-stream-v1.md` §7, discussed with the operator and reviewed once; how
+    it was built is in §7.2–§7.6.
+  - One code review with two angles (the accounting; trust, storage and
+    reads), §7.9. The HIGH, the MEDIUM and three LOWs were fixed before the build; one stays with
     A-62.
-- **Alcance:** motherbee + los tres spokes (core-update).
-- **Qué cambió:**
-  - **Cada llamada a un modelo deja un registro** en la tabla `llm_usage` de SY.storage, cobrado
-    a un tenant:
-    - ai.generic paga su tenant (`node`);
-    - SY.frontdesk.gov, el del caso (`case`);
-    - SY.cognition, el del agente de la comunicación (`agent`);
-    - Archi y el ejecutor del admin, el raíz (`root`). En `work` va la sesión, la corrida del
-      pipeline, la solución y la etapa, o la ejecución y quién llamó.
-  - **Qué se registra:**
-    - una respuesta 2xx, antes de cualquier chequeo, con los conteos normalizados entre OpenAI y
+- **Scope:** motherbee + the three spokes (core-update).
+- **What changed:**
+  - **Every call to a model leaves a record** in SY.storage's `llm_usage` table, charged
+    to a tenant:
+    - ai.generic: its own tenant pays (`node`);
+    - SY.frontdesk.gov: the case's tenant (`case`);
+    - SY.cognition: the tenant of the communication's agent (`agent`);
+    - Archi and the admin's executor: the root (`root`). `work` holds the session, the pipeline
+      run, the solution and the stage, or the execution and who called.
+  - **What is recorded:**
+    - a 2xx response, before any check, with the counts normalized across OpenAI and
       Anthropic;
-    - una llamada que su llamador abandona, como `abandoned` y sin tokens.
-  - **El AI SDK:**
-    - las dos fábricas de clientes piden un `AiAccount`;
-    - un recorder por proceso anota los registros en el stream del router (`storage.usage`);
-    - los clientes de proveedor quedan privados al SDK, y `ai_local_probe` se borró.
-  - **El router:**
-    - una reserva del stream para los registros de uso (1 MB y 128 lugares de la cola), con sus
-      pérdidas aparte (`usagelost`);
-    - los nombres `SY.*` que cobran a otros tenants, solo en los hives donde corren y sin
-      distinguir mayúsculas;
-    - `stream::append` espera a que el nodo esté conectado con su router.
+    - a call that its caller abandons, as `abandoned` and without tokens.
+  - **The AI SDK:**
+    - the two client factories require an `AiAccount`;
+    - one recorder per process writes the records to the router stream (`storage.usage`);
+    - the provider clients are now private to the SDK, and `ai_local_probe` was deleted.
+  - **The router:**
+    - a stream reserve for the usage records (1 MB and 128 queue slots), with their
+      losses counted separately (`usagelost`);
+    - the `SY.*` names that charge other tenants, only on the hives where they run, and
+      case-insensitive;
+    - `stream::append` waits until the node is connected to its router.
   - **SY.storage:**
-    - chequea cada registro;
-    - para un nodo y para el agente de cognition, toma el tenant de identity;
-    - reintenta por la inbox, y el último intento se guarda sin verificar;
-    - cada 30 s, una línea WARN con lo rechazado, lo desajustado y lo no verificado (`usagerej`).
-  - **`USAGE_QUERY`,** solo desde SY.admin:
-    - de a una consulta, en su propia conexión, con 15 s de límite;
-    - un período de hasta 92 días, o un cursor `since`;
-    - agrupaciones de una lista cerrada, y errores con código.
-  - **Lecturas:**
-    - `get_llm_usage` del admin (`GET /hives/motherbee/usage`), para el operador y Archi;
-    - la op de Cloud `get_usage`, con el tenant de io.cloud y nunca el raíz
+    - checks every record;
+    - for a node and for the cognition agent, takes the tenant from identity;
+    - retries through the inbox, and the last attempt is stored unverified;
+    - every 30 s, a WARN line with what was rejected, mismatched and unverified (`usagerej`).
+  - **`USAGE_QUERY`,** only from SY.admin:
+    - one query at a time, on its own connection, with a 15 s limit;
+    - a period of up to 92 days, or a `since` cursor;
+    - groupings from a closed list, and errors with a code.
+  - **Reads:**
+    - the admin's `get_llm_usage` (`GET /hives/motherbee/usage`), for the operator and Archi;
+    - the Cloud op `get_usage`, with io.cloud's tenant and never the root
       (`docs/io-cloud-api.md` §5.5);
-    - Archi la lee con `fluxbee_system_get`.
-  - **`ops.py health`** suma `usagelost` y `usagerej`.
+    - Archi reads it with `fluxbee_system_get`.
+  - **`ops.py health`** adds `usagelost` and `usagerej`.
 - **Deploy:**
-  - build de `0bc85e3` en 23 min, publish en 14 s, deploy en 245 s;
-  - snapshots `pre-stream3-0-1-79` en las 4 VMs (se borró `pre-stream1b-0-1-76`);
-  - 0.1.79 en los 4, health limpio (`usagelost=0 usagerej=0`).
-- **Gate (§7.7),** con un agente `AI.gate79@motherbee` en el tenant `pruebas`, con las claves de
-  prueba del operador:
-  - **la tabla nació vacía,** con la clave primaria y los seis índices, incluido el de la
-    sincronización por tenant.
-  - **El agente:**
-    - sin rol contestó el JSON de "unconfigured". Igual son llamadas reales: 2 registros;
-    - con un rol y una skill de `agent-assets` en la definición de su ILK, contestó en serio;
-    - sus 5 registros son de `pruebas` como `node`, con el ILK del humano como contraparte.
+  - build of `0bc85e3` in 23 min, publish in 14 s, deploy in 245 s;
+  - snapshots `pre-stream3-0-1-79` on all 4 VMs (`pre-stream1b-0-1-76` was deleted);
+  - 0.1.79 on all 4, clean health (`usagelost=0 usagerej=0`).
+- **Gate (§7.7),** with an agent `AI.gate79@motherbee` in the tenant `pruebas`, with the operator's
+  test keys:
+  - **the table was born empty,** with the primary key and the six indexes, including the one for
+    the per-tenant sync.
+  - **The agent:**
+    - without a role it answered with the "unconfigured" JSON. Those are still real calls: 2 records;
+    - with a role and a skill from `agent-assets` in its ILK's definition, it answered for real;
+    - its 5 records belong to `pruebas` as `node`, with the human's ILK as the counterparty.
   - **Cognition:**
-    - 4 llamadas por intercambio: el etiquetador y el resumidor, en cada sentido;
-    - 18 registros de `pruebas` como `agent`, con el ILK del agente como contraparte.
-  - **El frontdesk:**
-    - un caso con un ILK de `pruebas` cobró a `pruebas` (`case`);
-    - un caso con un ILK desconocido cobró al raíz (`fallback_root`).
+    - 4 calls per exchange: the tagger and the summarizer, in each direction;
+    - 18 records of `pruebas` as `agent`, with the agent's ILK as the counterparty.
+  - **The frontdesk:**
+    - a case with an ILK from `pruebas` charged `pruebas` (`case`);
+    - a case with an unknown ILK charged the root (`fallback_root`).
   - **Archi:**
-    - un turno de chat cobró al raíz con la sesión y la etapa `chat` en `work`;
-    - contestó la pregunta de uso por la ruta nueva, con totales que cuadran.
-  - **Ids del proveedor:** todos los `ok` tienen uno, ninguno repetido.
-  - **Las sondas:**
-    - un registro con el nombre de un nodo de `pruebas` que reclamaba el raíz se guardó con
-      `pruebas`, contado como desajuste;
-    - `SY.gate79` fue rechazado (`foreign_sy`);
-    - `sy.frontdesk.gov` en minúsculas desde worker1 lo rechazó el router (el HIGH de la
-      revisión), y contó en el `streamlost` de worker1;
-    - un nodo sin ILK: la inbox reintentó 10 minutos y el registro quedó con el tenant que
-      decía, `verified=false`, contado como no verificado.
-  - **`abandoned`:** con el timeout de cognition en 50 ms, el etiquetador cortó en cada sentido
-    y saltó el turno. Quedaron 2 registros `abandoned`, sin tokens ni id. El timeout volvió a
+    - a chat turn charged the root, with the session and the `chat` stage in `work`;
+    - it answered the usage question through the new route, with totals that add up.
+  - **Provider ids:** every `ok` has one, none repeated.
+  - **The probes:**
+    - a record with the name of a `pruebas` node that claimed the root was stored with
+      `pruebas`, counted as a mismatch;
+    - `SY.gate79` was rejected (`foreign_sy`);
+    - a lowercase `sy.frontdesk.gov` from worker1 was rejected by the router (the review's
+      HIGH), and counted in worker1's `streamlost`;
+    - a node without an ILK: the inbox retried for 10 minutes and the record kept the tenant it
+      stated, `verified=false`, counted as unverified.
+  - **`abandoned`:** with the cognition timeout at 50 ms, the tagger cut off in each direction
+    and skipped the turn. 2 `abandoned` records remained, without tokens or id. The timeout went back to
     8000.
-  - **El operador (`GET /hives/motherbee/usage`):**
-    - por día, modelo, nodo y tenant;
-    - los 26 registros de `pruebas`, de a dos, en 13 páginas;
-    - la sincronización por `since` trajo los 26 y terminó con `next` nulo;
-    - cinco preguntas malas dieron 400 `INVALID_REQUEST`. Las dos de cursores vienen con el
-      código de SY.storage.
-  - **Cloud, por la puerta pública:**
-    - ve solo `pruebas`: 26 registros, de `agent`, `case` y `node`;
-    - el raíz da `TENANT_ROOT_PROTECTED`;
-    - `all_tenants` u otro tenant en `params` dan `INVALID_REQUEST`.
-  - **Health del gate:**
-    - `usagelost=0` en los 4;
-    - `usagerej=3` en el motherbee y `streamlost=1` en worker1, exactamente las sondas;
-    - después, todo en 0.
-  - **Visto al probar:** la metadata de una clave de un tenant que no es el raíz da `UNAUTHORIZED`
-    por la ruta HTTP del admin (esa ruta no pasa `tenant_id`). El borrado sí lo pasa.
-- **Limpieza:**
-  - los dos nodos de prueba con su identidad: identity volvió a 28 ILKs;
-  - la región de memoria del motherbee y la sesión de Archi del gate;
-  - las filas del gate: 14 turnos con su inbox, 288 sobres, todas las filas de cognition, y los 31
-    registros de `llm_usage` con su inbox. La tabla había nacido vacía y quedó vacía;
-  - las dos claves de `pruebas` y el tenant, borrado y purgado (pedido del operador);
-  - ninguna máscara quedó.
-- **Rollback:** snapshot `pre-stream3-0-1-79`, o `apt install fluxbee=0.1.78` más el core-update
-  de los spokes. La tabla `llm_usage` queda: 0.1.78 no la usa.
+  - **The operator (`GET /hives/motherbee/usage`):**
+    - by day, model, node and tenant;
+    - the 26 records of `pruebas`, two at a time, in 13 pages;
+    - the sync by `since` brought the 26 and ended with a null `next`;
+    - five bad queries gave 400 `INVALID_REQUEST`. The two about cursors come with
+      SY.storage's code.
+  - **Cloud, through the public door:**
+    - sees only `pruebas`: 26 records, of `agent`, `case` and `node`;
+    - the root gives `TENANT_ROOT_PROTECTED`;
+    - `all_tenants` or another tenant in `params` give `INVALID_REQUEST`.
+  - **Gate health:**
+    - `usagelost=0` on all 4;
+    - `usagerej=3` on the motherbee and `streamlost=1` on worker1, exactly the probes;
+    - afterwards, everything at 0.
+  - **Seen while testing:** the metadata of a key of a non-root tenant gives `UNAUTHORIZED`
+    through the admin's HTTP route (that route does not pass `tenant_id`). The delete does pass it.
+- **Cleanup:**
+  - the two test nodes with their identity: identity went back to 28 ILKs;
+  - the motherbee's memory region and the gate's Archi session;
+  - the gate's rows: 14 turns with their inbox, 288 envelopes, all the cognition rows, and the 31
+    `llm_usage` records with their inbox. The table was born empty and was left empty;
+  - the two keys of `pruebas` and the tenant, deleted and purged (the operator's request);
+  - no mask was left.
+- **Rollback:** snapshot `pre-stream3-0-1-79`, or `apt install fluxbee=0.1.78` plus the core-update
+  of the spokes. The `llm_usage` table stays: 0.1.78 does not use it.
 
-## 0.1.78 — NATS borrado y SY.policy fuera (A-70, etapa 2b)
+## 0.1.78 — NATS deleted and SY.policy gone (A-70, stage 2b)
 
-- **Fecha:** 2026-10-17 (ART) · **Versión anterior:** 0.1.77 · **Commit:** `104fa65`.
-  - Diseño: `docs/router-stream-v1.md` §6.3, y cómo quedó construido en §6.9.
-  - Una revisión del código con dos miradas (el camino del upgrade, lo que dejó la remoción):
-    ningún HIGH. El MEDIUM y los LOW se arreglaron antes del build.
-- **Alcance:** motherbee + los tres spokes (core-update).
-- **Qué cambió:**
-  - **NATS borrado:** se fueron unas 9.000 líneas:
-    - el broker del router, el cliente del SDK y `ClientConfig`;
-    - los dos diags y ocho scripts;
+- **Date:** 2026-10-17 (ART) · **Previous version:** 0.1.77 · **Commit:** `104fa65`.
+  - Design: `docs/router-stream-v1.md` §6.3, and how it was built in §6.9.
+  - One code review with two angles (the upgrade path, what the removal left behind):
+    no HIGH. The MEDIUM and the LOWs were fixed before the build.
+- **Scope:** motherbee + the three spokes (core-update).
+- **What changed:**
+  - **NATS deleted:** about 9,000 lines went away:
+    - the router's broker, the SDK client and `ClientConfig`;
+    - the two diags and eight scripts;
     - SY.policy;
     - `meta.thread_seq`;
-    - la ingesta de `storage.events`, `storage.items` y `storage.reactivation`, que nunca
-      tuvieron productor (sus tablas quedan).
-  - **SY.storage** no lee nada de NATS:
-    - contesta `STORAGE_METRICS_GET` por la malla, un escaneo de la inbox a la vez;
-    - `GET /config/storage/metrics` del admin pregunta ahí, con la misma respuesta de antes.
+    - the ingestion of `storage.events`, `storage.items` and `storage.reactivation`, which never
+      had a producer (their tables stay).
+  - **SY.storage** reads nothing from NATS:
+    - it answers `STORAGE_METRICS_GET` over the mesh, one inbox scan at a time;
+    - the admin's `GET /config/storage/metrics` asks there, with the same answer as before.
   - **SY.orchestrator:**
-    - se une a su router y después espera la base de SY.storage por la malla;
-    - mientras tanto los comandos del admin reciben `ORCHESTRATOR_BOOTING`, así nadie queda
-      esperando a un hive que no está listo (antes fallaban porque el orquestador no estaba en el
-      router todavía).
-  - **Transiciones únicas al arrancar, en el log:**
-    - los mensajes pendientes del broker por subject;
-    - después, `/var/lib/fluxbee/nats` y la sección `nats:` de `hive.yaml`. Esto corre después de
-      que el router corre el binario nuevo, porque el viejo, al pararse, vuelca su broker a disco;
-    - SY.policy sale de todas las secciones de `hive.yaml`, y se borran su unit y su binario
-      donde quedaron.
-  - **Los joins** escriben `hive.yaml` sin `nats:`, y nadie crea el directorio `nats`.
-  - **SY.cognition** registra de dónde sacó su clave de IA una vez que la buscó.
-  - **El chequeo de paridad del catálogo del admin** reconoce `list_streams` y el argumento nuevo
-    del deploy de WF. Estaba rojo desde 1b y A-68.
+    - joins its router and then waits for SY.storage's database over the mesh;
+    - meanwhile the admin's commands get `ORCHESTRATOR_BOOTING`, so nobody is left
+      waiting on a hive that is not ready (before, they failed because the orchestrator was not on the
+      router yet).
+  - **One-time transitions at startup, in the log:**
+    - the broker's pending messages per subject;
+    - then, `/var/lib/fluxbee/nats` and the `nats:` section of `hive.yaml`. This runs after
+      the router runs the new binary, because the old one dumps its broker to disk when it stops;
+    - SY.policy leaves every section of `hive.yaml`, and its unit and its binary are deleted
+      wherever they remained.
+  - **The joins** write `hive.yaml` without `nats:`, and nobody creates the `nats` directory.
+  - **SY.cognition** logs where it got its AI key once it has looked it up.
+  - **The admin's catalog parity check** recognizes `list_streams` and the new argument
+    of the WF deploy. It had been red since 1b and A-68.
 - **Deploy:**
-  - build de `104fa65` en 23 min, publish en 13 s, deploy en 241 s;
-  - snapshots `pre-stream2b-0-1-78` en las 4 VMs (se borró `pre-stream1a-0-1-75`);
-  - 0.1.78 en los 4, health `failed=0 streamlost=0`.
+  - build of `104fa65` in 23 min, publish in 13 s, deploy in 241 s;
+  - snapshots `pre-stream2b-0-1-78` on all 4 VMs (`pre-stream1a-0-1-75` was deleted);
+  - 0.1.78 on all 4, health `failed=0 streamlost=0`.
 - **Gate:**
-  - **Nada de NATS ni de SY.policy en ningún hive:**
-    - nada escucha en 4222;
-    - no hay `/var/lib/fluxbee/nats`, ni sección `nats:` (tampoco su comentario) ni SY.policy en
+  - **No NATS and no SY.policy on any hive:**
+    - nothing listens on 4222;
+    - there is no `/var/lib/fluxbee/nats`, no `nats:` section (not even its comment) and no SY.policy in
       `hive.yaml`;
-    - no quedan la unit ni el binario de SY.policy; su unit da `not-found`.
-  - **Lo que registró cada orquestador:**
-    - **ingress:** "pending={storage.turns: 597}", los turnos del edge que nadie consumía, y
-      después borró el directorio;
-    - **worker1:** borró la unit y el binario de SY.policy;
-    - **motherbee:** sacó SY.policy de su sección `worker` (dos líneas);
-    - **los cuatro:** quitaron la sección `nats:`.
-  - **Por la malla:**
-    - `GET /config/storage/metrics` contesta `ok` (0 pendientes);
-    - en el upgrade, el orquestador del motherbee confirmó la base en 10,6 s (18 intentos) y
-      después pasó a "hive ready". La espera fue el arranque de SY.storage: el vault le resolvió
-      la URL, recibió el broadcast del vault y salió para reconectar (el rescate de siempre).
-  - **La ventana de arranque**, con SY.storage retenido 40 s y el orquestador del motherbee
-    reiniciado:
-    - `GET /hives` contestó `502 TRANSPORT_ERROR` hasta que el orquestador se unió al router;
-    - después contestó `ORCHESTRATOR_BOOTING` en 0,01 s;
-    - pasó a `ok` 4 s después de liberar SY.storage;
-    - nadie quedó colgado.
-  - **Regresión de cognition** (un agente en el motherbee, dos turnos desde worker1):
-    - la cognition del motherbee procesó los 4 turnos, ninguno sin ILK de agente;
-    - una comunicación en la base (turno 4), con el ILK del agente;
-    - la región tiene su entrada y los streams entregaron todo.
-  - **SY.cognition** registra "looked up its AI key ai_secret_source=vault".
-  - **Health:** `failed=0 denials=0 srcdrops=0 streamlost=0` en los 4.
-  - **No se probó en vivo:** un join nuevo de un worker con `hive.yaml` sin `nats:`. Necesita una
-    VM nueva; el cambio son las tres plantillas, y la revisión lo cubrió.
-  - **Limpieza:**
-    - el nodo de prueba purgado con su identidad (identity volvió a 28 ILKs);
-    - el tenant borrado y purgado;
-    - la región vaciada;
-    - se borraron 4 turnos, sus 4 filas de inbox, 75 sobres y todas las filas de cognition
-      (no queda ninguna);
-    - ninguna máscara quedó.
-- **Pendiente:** las transiciones (NATS y SY.policy) se borran del código cuando todos los hives
-  hayan arrancado 0.1.78, en la pasada de limpieza.
-- **Rollback:** snapshot `pre-stream2b-0-1-78`, o `apt install fluxbee=0.1.77` más el
-  core-update de los spokes:
-  - 0.1.77 arranca sin la sección `nats:`, con los valores por defecto y un broker vacío;
-  - SY.policy ya no corría en 0.1.77;
-  - lo que no vuelve son los 597 turnos que el broker del ingress tenía sin consumir. Se
-    descartaron a propósito (decisión del operador).
+    - neither SY.policy's unit nor its binary remains; its unit gives `not-found`.
+  - **What each orchestrator logged:**
+    - **ingress:** "pending={storage.turns: 597}", the edge's turns that nobody consumed, and
+      then it deleted the directory;
+    - **worker1:** deleted SY.policy's unit and binary;
+    - **motherbee:** removed SY.policy from its `worker` section (two lines);
+    - **all four:** removed the `nats:` section.
+  - **Over the mesh:**
+    - `GET /config/storage/metrics` answers `ok` (0 pending);
+    - in the upgrade, the motherbee's orchestrator confirmed the database in 10.6 s (18 attempts) and
+      then moved to "hive ready". The wait was SY.storage's startup: the vault resolved its
+      URL, it received the vault's broadcast and exited to reconnect (the usual rescue).
+  - **The startup window**, with SY.storage held back for 40 s and the motherbee's orchestrator
+    restarted:
+    - `GET /hives` answered `502 TRANSPORT_ERROR` until the orchestrator joined the router;
+    - then it answered `ORCHESTRATOR_BOOTING` in 0.01 s;
+    - it moved to `ok` 4 s after SY.storage was released;
+    - nobody was left hanging.
+  - **Cognition regression check** (an agent on the motherbee, two turns from worker1):
+    - the motherbee's cognition processed the 4 turns, none without an agent ILK;
+    - one communication in the database (turn 4), with the agent's ILK;
+    - the region has its entry and the streams delivered everything.
+  - **SY.cognition** logs "looked up its AI key ai_secret_source=vault".
+  - **Health:** `failed=0 denials=0 srcdrops=0 streamlost=0` on all 4.
+  - **Not tested live:** a new join of a worker with a `hive.yaml` without `nats:`. It needs a
+    new VM; the change is the three templates, and the review covered it.
+  - **Cleanup:**
+    - the test node purged with its identity (identity went back to 28 ILKs);
+    - the tenant deleted and purged;
+    - the region emptied;
+    - 4 turns were deleted, with their 4 inbox rows, 75 envelopes and all the cognition rows
+      (none remain);
+    - no mask was left.
+- **Pending:** the transitions (NATS and SY.policy) are deleted from the code once every hive
+  has started 0.1.78, in the cleanup pass.
+- **Rollback:** snapshot `pre-stream2b-0-1-78`, or `apt install fluxbee=0.1.77` plus the
+  core-update of the spokes:
+  - 0.1.77 starts without the `nats:` section, with the default values and an empty broker;
+  - SY.policy was no longer running in 0.1.77;
+  - what does not come back are the 597 turns that the ingress broker held unconsumed. They were
+    discarded on purpose (the operator's decision).
 
-## 0.1.77 — Cognition por comunicación: el router del agente le pasa los dos sentidos a su cognition local (A-70, etapa 2a)
+## 0.1.77 — Cognition per communication: the agent's router passes both directions to its local cognition (A-70, stage 2a)
 
-- **Fecha:** 2026-10-17 (ART) · **Versión anterior:** 0.1.76 · **Commit:** `377945a`.
-  - Diseño: `docs/router-stream-v1.md` §6, conversado con el operador y revisado una vez.
-  - Una revisión del código: ningún HIGH. El MEDIUM (una comunicación cargada se quedaba vieja si
-    su agente se iba y volvía) y los LOW, arreglados antes del build.
-- **Alcance:** motherbee + los tres spokes (core-update).
-- **Qué cambió:**
-  - **El modelo (decisión del operador):** la memoria es de la comunicación entre ILKs, nunca de
-    un hive o un nodo. Una comunicación es `(thread_id, ILK del agente)`, y su dueño es el agente
-    que la atiende. El número de turno la ordena; el router ya no asigna `thread_seq`.
+- **Date:** 2026-10-17 (ART) · **Previous version:** 0.1.76 · **Commit:** `377945a`.
+  - Design: `docs/router-stream-v1.md` §6, discussed with the operator and reviewed once.
+  - One code review: no HIGH. The MEDIUM (a loaded communication went stale if
+    its agent left and came back) and the LOWs, fixed before the build.
+- **Scope:** motherbee + the three spokes (core-update).
+- **What changed:**
+  - **The model (the operator's decision):** memory belongs to the communication between ILKs, never to
+    a hive or a node. A communication is `(thread_id, agent ILK)`, and its owner is the agent
+    that serves it. The turn number orders it; the router no longer assigns `thread_seq`.
   - **Router:**
-    - ya no copia turnos a NATS;
-    - copia a `cognition.turns` cada turno con `thread_id` que manda un nodo `AI.*` local, o que
-      le entrega a uno (local, después de la WAN, después de IRP; nunca copias de tap ni
-      broadcasts). El destino es `SY.cognition@<su hive>`, en el motherbee y los workers;
-    - adjunta el paquete de memoria por destino, solo a los `AI.*`, el de `(thread_id, nodo
-      agente)`; el que trae el emisor se descarta;
-    - los lotes del stream llevan una época (`state.json`), para distinguir un log reiniciado de
-      repetidos.
+    - no longer copies turns to NATS;
+    - copies to `cognition.turns` every turn with a `thread_id` that a local `AI.*` node sends, or that
+      it delivers to one (local, after the WAN, after IRP; never tap copies or
+      broadcasts). The destination is `SY.cognition@<its hive>`, on the motherbee and the workers;
+    - attaches the memory package per destination, only to the `AI.*` nodes: the one for `(thread_id, agent
+      node)`; the one the sender brings is discarded;
+    - the stream batches carry an epoch (`state.json`), to tell a restarted log apart from
+      repeats.
   - **SY.cognition:**
-    - lee `cognition.turns` del stream de su router; el ILK del agente sale de identity por
-      `handler_node` (en caché 60 s);
-    - sus sobres (esquema v2, con `agent_ilk` y `turn`) salen como un registro
-      `storage.cognition.batch` por turno, por el stream;
-    - al arrancar recarga desde SY.storage, por la malla, las comunicaciones que tiene la región
-      de memoria (`COGNITION_STATE_GET`, paginado);
-    - una comunicación cargada que estuvo 5 min sin turnos se vuelve a pedir antes del próximo, y
-      gana el estado guardado si va más adelante;
-    - ya no usa NATS ni postgres.
+    - reads `cognition.turns` from its router's stream; the agent's ILK comes from identity by
+      `handler_node` (cached for 60 s);
+    - its envelopes (schema v2, with `agent_ilk` and `turn`) go out as one
+      `storage.cognition.batch` record per turn, over the stream;
+    - at startup it reloads from SY.storage, over the mesh, the communications that the memory region
+      holds (`COGNITION_STATE_GET`, paginated);
+    - a loaded communication that went 5 min without turns is requested again before the next one, and
+      the stored state wins if it is further ahead;
+    - no longer uses NATS or postgres.
   - **SY.storage:**
-    - las tablas de cognition se rearman una vez (marca `cognition_reset_v1`; los datos de prueba
-      se tiran, decisión del operador), con la comunicación como clave: `agent_ilk` y
+    - the cognition tables are rebuilt once (marker `cognition_reset_v1`; the test data
+      is thrown away, the operator's decision), with the communication as the key: `agent_ilk` and
       `source_turn`;
-    - una fila solo la reemplaza un turno igual o posterior, también los scopes;
-    - expande `storage.cognition.batch` a una fila de inbox por sobre, después de verificar el
-      productor;
-    - contesta `COGNITION_STATE_GET`, solo a `SY.cognition@*`, en páginas de 64 KB.
-  - **SDK de IA:** la respuesta lleva el ILK del agente como `src_ilk` y al interlocutor como
-    `dst_ilk`. ai.generic y SY.frontdesk.gov pasan el suyo.
-  - **SY.policy se retira (primera de dos versiones):**
-    - inactivo y deshabilitado;
-    - fuera de la sección propia de cada `hive.yaml` (escritura atómica);
-    - el motherbee lo deja en su sección `worker` hasta 2b, porque si no los orquestadores viejos
-      de los workers rechazan el core-update.
-  - **El broker** borra al arrancar, y rechaza después, los consumidores de turnos de SY.storage,
-    SY.cognition y SY.policy.
+    - a row is only replaced by an equal or later turn, the scopes too;
+    - expands `storage.cognition.batch` into one inbox row per envelope, after verifying the
+      producer;
+    - answers `COGNITION_STATE_GET`, only to `SY.cognition@*`, in 64 KB pages.
+  - **AI SDK:** the response carries the agent's ILK as `src_ilk` and the interlocutor as
+    `dst_ilk`. ai.generic and SY.frontdesk.gov pass their own.
+  - **SY.policy is retired (first of two versions):**
+    - inactive and disabled;
+    - out of each `hive.yaml`'s own section (atomic write);
+    - the motherbee keeps it in its `worker` section until 2b, because otherwise the workers' old
+      orchestrators reject the core-update.
+  - **The broker** deletes at startup, and rejects afterwards, the turn consumers of SY.storage,
+    SY.cognition and SY.policy.
 - **Deploy:**
-  - build de `377945a` en 25 min, publish en 14 s, deploy en 230 s;
-  - snapshots `pre-stream2a-0-1-77` en las 4 VMs (se borró `pre-sdk-0-1-74`);
-  - 0.1.77 en los 4, health `failed=0 streamlost=0`.
+  - build of `377945a` in 25 min, publish in 14 s, deploy in 230 s;
+  - snapshots `pre-stream2a-0-1-77` on all 4 VMs (`pre-sdk-0-1-74` was deleted);
+  - 0.1.77 on all 4, health `failed=0 streamlost=0`.
 - **Gate:**
-  - **El upgrade:**
-    - SY.policy inactivo y deshabilitado en el motherbee y worker1. El `hive.yaml` del
-      motherbee lo nombra solo en la sección `worker`; el de worker1, en ninguna;
-    - ningún broker tiene consumidores de `storage.turns`. Los 597 turnos del ingress siguen ahí
-      hasta 2b;
-    - los streams del motherbee y worker1 suman `SY.cognition@<hive>` como destino; el ingress y
-      el egress no;
-    - las tablas de cognition quedaron en v2 y vacías;
-    - las dos cognitions recargaron por la malla ("ok loaded 0"). La de worker1 antes fallaba
-      por no tener base.
-  - **Una conversación con el agente en el motherbee** (`AI.gate77@motherbee`, ai.generic 0.1.77,
-    en un tenant de prueba) desde un interlocutor de prueba en worker1 (un probe por socket),
-    3 turnos:
-    - las respuestas salen con el ILK del agente como `src_ilk` y el del interlocutor como
+  - **The upgrade:**
+    - SY.policy inactive and disabled on the motherbee and worker1. The motherbee's `hive.yaml`
+      names it only in the `worker` section; worker1's, in none;
+    - no broker has consumers of `storage.turns`. The ingress's 597 turns stay there
+      until 2b;
+    - the streams of the motherbee and worker1 add `SY.cognition@<hive>` as a destination; the ingress and
+      the egress do not;
+    - the cognition tables ended up at v2 and empty;
+    - both cognitions reloaded over the mesh ("ok loaded 0"). Worker1's used to fail
+      because it had no database.
+  - **A conversation with the agent on the motherbee** (`AI.gate77@motherbee`, ai.generic 0.1.77,
+    in a test tenant) from a test interlocutor on worker1 (a socket probe),
+    3 turns:
+    - the responses go out with the agent's ILK as `src_ilk` and the interlocutor's as
       `dst_ilk`;
-    - la cognition del motherbee procesó 6 turnos (3 de ida, 3 de vuelta), ninguno sin ILK de
-      agente, con 6 + 6 llamados al modelo (etiquetador y resumidor) y 119 entidades, sin
-      errores. La de worker1 no recibió nada;
-    - una sola comunicación en la base: la del agente, turno 6, escrita por
-      `SY.cognition@motherbee`; todas sus filas llevan el ILK del agente;
-    - `turns` tiene las 6 filas, en los dos sentidos;
-    - la región de memoria tiene la entrada con el nodo y el ILK del agente;
-    - el agente no tenía clave en su tenant (desde 0.1.66 no hay caída a la clave raíz), así que
-      contestó con el error `missing_ai_api_key`. Cognition evaluó esas respuestas con la clave
-      del core. El gate no depende de lo que contesta el agente, y no se copió la clave del
-      operador a un tenant de prueba.
-  - **El paquete:** con el nodo real detenido, un probe por socket tomó su nombre, y el
-    interlocutor le mandó un turno con un paquete falso. El probe recibió el paquete real de su
-    comunicación (contextos, una memoria, razones) y no el falso.
-  - **La recarga:**
-    - `sy-cognition` del motherbee reiniciado: recargó por la malla en 0,3 s ("loaded 1, without
-      state 0, failed 0") y la entrada de la región quedó;
-    - el turno siguiente siguió en los turnos 9 y 10, sobre las mismas filas.
-  - **El refetch por inactividad:**
-    - un turno dentro de los 5 min no pidió nada;
-    - después de 5,5 min sin turnos, el siguiente pidió el estado una vez y siguió en el turno 14.
-  - **Un agente en worker1** (`AI.gate77w@worker1`), con 2 turnos desde el motherbee:
-    - la cognition de worker1 procesó 4 y sus 80 entidades llegaron a postgres, escritas por
-      `SY.cognition@worker1` con el ILK de ese agente;
-    - la del motherbee no las tocó;
-    - cada región tiene solo la comunicación de su propio agente.
-  - **Los streams** entregaron todo una vez (cursores iguales, nada perdido). NATS no se tocó: el
-    `last_seq` de `storage.turns` siguió en 974 y 310.
-  - **Health:** `failed=0 denials=0 srcdrops=0 streamlost=0` en los 4.
-  - **Limpieza:**
-    - los dos nodos purgados con su identidad (identity volvió a 28 ILKs);
-    - el tenant borrado y purgado;
-    - las regiones de memoria vaciadas (cognition detenida con `mask --runtime`; no quedó ninguna
-      máscara);
-    - de la base se borraron 18 turnos, sus 18 filas de inbox, 415 sobres de cognition de la
-      inbox y todas las filas de cognition (no queda ninguna).
-  - **Para probar:**
-    - `kill_node` seguido de `remove_node_instance` falla (`NODE_INSTANCE_RUNNING`): la baja
-      completa es `kill_node` con `purge_instance: true`, que además libera la identidad;
-    - `state_fetches_total` sale en el STATUS de SY.cognition (un mensaje de sistema `STATUS`),
-      no en CONFIG_GET.
-- **Pendiente para 2b:**
-  - la línea "sy.cognition started" dice `ai_secret_source=missing`, porque la clave ahora se
-    resuelve después, en la tarea de turnos. Es cosmético;
-  - el ejemplo de `config-set` del admin todavía nombra `vault_key`, rechazado desde 0.1.53. Va
-    a la pasada de limpieza.
-- **Rollback:** snapshot `pre-stream2a-0-1-77`. `apt install fluxbee=0.1.76` sola no alcanza:
-  - las tablas de cognition quedaron en v2, y el SY.storage de 0.1.76 no puede escribirlas;
-  - SY.policy salió de la sección propia de cada `hive.yaml`.
+    - the motherbee's cognition processed 6 turns (3 out, 3 back), none without an agent
+      ILK, with 6 + 6 calls to the model (tagger and summarizer) and 119 entities, without
+      errors. Worker1's received nothing;
+    - a single communication in the database: the agent's, turn 6, written by
+      `SY.cognition@motherbee`; all its rows carry the agent's ILK;
+    - `turns` has the 6 rows, in both directions;
+    - the memory region has the entry with the agent's node and ILK;
+    - the agent had no key in its tenant (since 0.1.66 there is no fallback to the root key), so
+      it answered with the error `missing_ai_api_key`. Cognition evaluated those responses with the
+      core's key. The gate does not depend on what the agent answers, and the operator's key was not
+      copied to a test tenant.
+  - **The package:** with the real node stopped, a socket probe took its name, and the
+    interlocutor sent it a turn with a fake package. The probe received the real package of its
+    communication (contexts, a memory, reasons) and not the fake one.
+  - **The reload:**
+    - the motherbee's `sy-cognition` restarted: it reloaded over the mesh in 0.3 s ("loaded 1, without
+      state 0, failed 0") and the region's entry stayed;
+    - the next turn continued at turns 9 and 10, on the same rows.
+  - **The refetch on inactivity:**
+    - a turn within the 5 min requested nothing;
+    - after 5.5 min without turns, the next one requested the state once and continued at turn 14.
+  - **An agent on worker1** (`AI.gate77w@worker1`), with 2 turns from the motherbee:
+    - worker1's cognition processed 4 and its 80 entities reached postgres, written by
+      `SY.cognition@worker1` with that agent's ILK;
+    - the motherbee's did not touch them;
+    - each region has only its own agent's communication.
+  - **The streams** delivered everything once (equal cursors, nothing lost). NATS was not touched: the
+    `last_seq` of `storage.turns` stayed at 974 and 310.
+  - **Health:** `failed=0 denials=0 srcdrops=0 streamlost=0` on all 4.
+  - **Cleanup:**
+    - the two nodes purged with their identity (identity went back to 28 ILKs);
+    - the tenant deleted and purged;
+    - the memory regions emptied (cognition stopped with `mask --runtime`; no
+      mask was left);
+    - from the database, 18 turns were deleted, with their 18 inbox rows, 415 cognition envelopes from the
+      inbox and all the cognition rows (none remain).
+  - **For testing:**
+    - `kill_node` followed by `remove_node_instance` fails (`NODE_INSTANCE_RUNNING`): the complete
+      removal is `kill_node` with `purge_instance: true`, which also frees the identity;
+    - `state_fetches_total` shows up in SY.cognition's STATUS (a `STATUS` system message),
+      not in CONFIG_GET.
+- **Pending for 2b:**
+  - the "sy.cognition started" line says `ai_secret_source=missing`, because the key is now
+    resolved later, in the turns task. It is cosmetic;
+  - the admin's `config-set` example still names `vault_key`, rejected since 0.1.53. It goes
+    to the cleanup pass.
+- **Rollback:** snapshot `pre-stream2a-0-1-77`. `apt install fluxbee=0.1.76` alone is not enough:
+  - the cognition tables ended up at v2, and 0.1.76's SY.storage cannot write them;
+  - SY.policy left each `hive.yaml`'s own section.
 
-## 0.1.76 — El stream del router lleva los turnos de todos los hives a SY.storage (A-70, etapa 1b)
+## 0.1.76 — The router's stream carries the turns of every hive to SY.storage (A-70, stage 1b)
 
-- **Fecha:** 2026-10-16 (ART) · **Versión anterior:** 0.1.75 · **Commit:** `e24e7d3`.
-  - Diseño: `docs/router-stream-v1.md`. Una revisión del código: ningún HIGH, los dos MEDIUM y los
-    LOW arreglados antes del build.
-- **Alcance:** motherbee + los tres spokes (core-update).
-- **Qué cambió:**
-  - **Router:** cada router tiene su stream, un nodo propio `RT.<router>.stream@<hive>`:
-    - copia cada turno y toma los `STREAM_APPEND` de sus nodos;
-    - los guarda en disco una ventana de 120 s y 32 MB, y los entrega en lotes con ack a
+- **Date:** 2026-10-16 (ART) · **Previous version:** 0.1.75 · **Commit:** `e24e7d3`.
+  - Design: `docs/router-stream-v1.md`. One code review: no HIGH, the two MEDIUMs and the
+    LOWs fixed before the build.
+- **Scope:** motherbee + the three spokes (core-update).
+- **What changed:**
+  - **Router:** each router has its stream, a node of its own, `RT.<router>.stream@<hive>`:
+    - copies every turn and takes the `STREAM_APPEND` from its nodes;
+    - keeps them on disk for a window of 120 s and 32 MB, and delivers them in batches with ack to
       `SY.storage@motherbee`;
-    - el router nunca espera: una cola acotada por cantidad y por bytes, y el disco en su propio
-      hilo;
-    - lo que se pierde (vencido, demasiado grande, cola o tope llenos) se cuenta una vez y sale en
-      una línea de alarma cada 30 s;
-    - un registro queda en disco solo hasta que lo tomaron;
-    - los turnos van a NATS solo en el motherbee y los workers, donde todavía los leen cognition y
-      policy (etapa 2);
-    - el broker borra el consumidor viejo `durable.sy-storage.turns` al arrancar y lo rechaza
-      después.
+    - the router never waits: a queue bounded by count and by bytes, and the disk in its own
+      thread;
+    - what is lost (expired, too big, queue or cap full) is counted once and shows up in
+      an alarm line every 30 s;
+    - a record stays on disk only until it has been taken;
+    - turns go to NATS only on the motherbee and the workers, where cognition and
+      policy still read them (stage 2);
+    - the broker deletes the old consumer `durable.sy-storage.turns` at startup and rejects it
+      afterwards.
   - **SY.storage:**
-    - toma los lotes del stream con su propia conexión: una transacción a la inbox, el ack y
-      después el procesamiento, en otra tarea; ya no lee turnos de NATS;
-    - cada registro tiene que venir de un nodo del hive del stream, y un turno tiene que nombrar a
-      su productor como remitente;
-    - `turns` es el log de mensajes: guarda el mensaje entero, `thread_id`, `trace_id`, `ts` (la
-      hora del router) y `stored_at`;
-    - un backfill único copia los mensajes de la inbox a `turns` (marca en `storage_migrations`);
-    - después, la inbox borra lo procesado de más de 24 h.
-  - **Archi:** la página Messages lee `turns`. La lista va por `ts`, el tail en vivo por
-    `stored_at`, y el detalle muestra el mensaje entero.
+    - takes the stream's batches with its own connection: one transaction to the inbox, the ack and
+      then the processing, in another task; it no longer reads turns from NATS;
+    - each record has to come from a node of the stream's hive, and a turn has to name
+      its producer as the sender;
+    - `turns` is the message log: it stores the whole message, `thread_id`, `trace_id`, `ts` (the
+      router's time) and `stored_at`;
+    - a one-time backfill copies the messages from the inbox to `turns` (marker in `storage_migrations`);
+    - afterwards, the inbox deletes what was processed more than 24 h ago.
+  - **Archi:** the Messages page reads `turns`. The list goes by `ts`, the live tail by
+    `stored_at`, and the detail shows the whole message.
   - **SY.admin:** `list_streams`, `GET /hives/{hive}/streams`.
-  - **`ops.py health`:** suma `streamlost`, lo que las alarmas de los streams dicen perdido.
+  - **`ops.py health`:** adds `streamlost`, what the streams' alarms report as lost.
 - **Deploy:**
-  - build de `e24e7d3` en 23 min, publish en 12 s, deploy en 224 s;
-  - snapshots `pre-stream1b-0-1-76` en las 4 VMs (se borró `pre-cognition-0-1-73`);
-  - 0.1.76 en los 4, health `failed=0 streamlost=0`.
-- **Gate (con un nodo de prueba por socket, `AI.gate76probe`, que se manda turnos a sí mismo sin
-  `thread_id`, así cognition no gasta):**
-  - **La migración:**
-    - el backfill completó 5 filas de 0.1.75, re-enlazó las 542 `legacy:` e insertó 35 respuestas
-      que `turns` había descartado; 0 ilegibles;
-    - `turns` quedó con 582 filas, todas con su mensaje;
-    - la inbox borró 435 filas procesadas de más de 24 h;
-    - el broker del motherbee ya no tiene `durable.sy-storage.turns`, y su `storage.turns` quedó
-      en 0 mensajes.
-  - **Los cuatro hives llegan a la base,** 20 de 20 cada uno, con el remitente real y una demora
-    de 0,2 s. Antes solo llegaba lo del motherbee.
-  - **Archi** lista, abre el detalle (también de la fila más vieja del backfill) y el tail en vivo
-    mostró tres turnos de worker1 a 0,15 s.
-  - **SY.storage ausente 71 s** mientras worker1 y el ingress mandaban 40 turnos cada uno:
-    - el backlog se vio (31 registros en cada stream);
-    - al volver se entregó todo, 40 de 40, una sola vez, con la hora original.
-  - **SY.storage ausente más de 3 min:**
-    - los 10 turnos de worker1 vencieron, contados una vez (`expired=10`), con la línea de alarma;
-    - el ruteo siguió;
-    - en la base no hay nada de ellos.
-  - **El router de worker1 reiniciado con 10 pendientes:** los recuperó del disco y los entregó
-    cuando volvió SY.storage.
-  - **El router y SY.storage del motherbee reiniciados** mientras worker1 mandaba 120 turnos en
-    60 s: llegaron los 120, una vez.
+  - build of `e24e7d3` in 23 min, publish in 12 s, deploy in 224 s;
+  - snapshots `pre-stream1b-0-1-76` on all 4 VMs (`pre-cognition-0-1-73` was deleted);
+  - 0.1.76 on all 4, health `failed=0 streamlost=0`.
+- **Gate (with a socket test node, `AI.gate76probe`, that sends turns to itself without a
+  `thread_id`, so cognition does not spend):**
+  - **The migration:**
+    - the backfill completed 5 rows from 0.1.75, re-linked the 542 `legacy:` ones and inserted 35 responses
+      that `turns` had dropped; 0 unreadable;
+    - `turns` ended up with 582 rows, all with their message;
+    - the inbox deleted 435 processed rows older than 24 h;
+    - the motherbee's broker no longer has `durable.sy-storage.turns`, and its `storage.turns` ended up
+      at 0 messages.
+  - **The four hives reach the database,** 20 out of 20 each, with the real sender and a delay
+    of 0.2 s. Before, only the motherbee's arrived.
+  - **Archi** lists, opens the detail (also of the oldest backfill row), and the live tail
+    showed three turns from worker1 at 0.15 s.
+  - **SY.storage absent for 71 s** while worker1 and the ingress sent 40 turns each:
+    - the backlog was visible (31 records in each stream);
+    - when it came back everything was delivered, 40 out of 40, exactly once, with the original time.
+  - **SY.storage absent for more than 3 min:**
+    - worker1's 10 turns expired, counted once (`expired=10`), with the alarm line;
+    - the routing went on;
+    - there is nothing of them in the database.
+  - **Worker1's router restarted with 10 pending:** it recovered them from disk and delivered them
+    when SY.storage came back.
+  - **The motherbee's router and SY.storage restarted** while worker1 sent 120 turns in
+    60 s: all 120 arrived, once.
   - **Health:**
-    - `streamlost=10` solo en worker1, en la ventana del vencimiento inducido;
-    - limpio después.
-  - **Para la prueba:** el watchdog de SY.orchestrator levanta un `sy-storage` detenido en 2 s, así
-    que la ausencia se hizo con `systemctl mask --runtime` y `unmask`. No quedó ninguna máscara.
-  - **Limpieza:** se borraron de `turns` y de la inbox las 373 filas de prueba. No quedan nodos de
-    prueba.
-- **Rollback:** snapshot `pre-stream1b-0-1-76`. `apt install fluxbee=0.1.75` anda, pero no
-  devuelve todo:
-  - las columnas nuevas de `turns` no molestan, y el SY.storage viejo vuelve a crear su
-    consumidor de NATS;
-  - los turnos de los spokes dejan de llegar a la base;
-  - el Archi viejo lee la inbox, que ya no tiene lo procesado de más de 24 h. La historia
-    completa vuelve solo con el snapshot.
+    - `streamlost=10` only on worker1, in the window of the induced expiry;
+    - clean afterwards.
+  - **For the test:** SY.orchestrator's watchdog brings a stopped `sy-storage` back up in 2 s, so
+    the absence was done with `systemctl mask --runtime` and `unmask`. No mask was left.
+  - **Cleanup:** the 373 test rows were deleted from `turns` and from the inbox. No test nodes
+    remain.
+- **Rollback:** snapshot `pre-stream1b-0-1-76`. `apt install fluxbee=0.1.75` works, but it does not
+  bring everything back:
+  - the new columns of `turns` do not get in the way, and the old SY.storage creates its
+    NATS consumer again;
+  - the spokes' turns stop reaching the database;
+  - the old Archi reads the inbox, which no longer has what was processed more than 24 h ago. The full
+    history comes back only with the snapshot.
 
-## 0.1.75 — Los bugs vivos bajo el plano del log (A-70, etapa 1a)
+## 0.1.75 — The live bugs under the log plane (A-70, stage 1a)
 
-- **Fecha:** 2026-10-16 (ART) · **Versión anterior:** 0.1.74 · **Commit:** `1c00389`.
-  - Sale de la revisión del diseño del stream del router (`docs/router-stream-v1.md`): bugs que
-    ya estaban en PROD, arreglados sobre el NATS de hoy.
-  - Una revisión del código, arreglada antes del build.
-- **Alcance:** motherbee + los tres spokes (core-update).
-- **Qué cambió:**
+- **Date:** 2026-10-16 (ART) · **Previous version:** 0.1.74 · **Commit:** `1c00389`.
+  - It comes out of the design review of the router's stream (`docs/router-stream-v1.md`): bugs that
+    were already in PROD, fixed on top of today's NATS.
+  - One code review, fixed before the build.
+- **Scope:** motherbee + the three spokes (core-update).
+- **What changed:**
   - **Router:**
-    - un frame de más de 128 KB se salta y se cuenta, y el enlace sigue;
-    - un mensaje de otro hive a un nodo de un router que no es el gateway ya no se descarta;
-    - `RT.` reservado: un HELLO con ese prefijo solo se acepta del propio proceso del router.
+    - a frame over 128 KB is skipped and counted, and the link goes on;
+    - a message from another hive to a node of a router that is not the gateway is no longer dropped;
+    - `RT.` reserved: a HELLO with that prefix is only accepted from the router's own process.
   - **SY.storage:**
-    - `turns` usa la clave de la inbox, así que la respuesta de la IA ya no se pierde. La
-      migración corre una vez; las filas viejas quedan como `legacy:<ctx>:<seq>`;
-    - sale si no puede usar su base, al arrancar o después, y systemd reintenta;
-    - reintenta la inbox cada 60 s, en orden y contando intentos;
-    - la inbox no se purga (Q7 del doc).
-  - **SY.cognition:** confirma cada turno al encolarlo y lo procesa en su propia tarea; si esa
-    tarea muere, sale.
-  - **SY.orchestrator:** ningún nodo administrado usa `RT.*`, y el prompt de Archi lo dice.
+    - `turns` uses the inbox key, so the AI's response is no longer lost. The
+      migration runs once; the old rows stay as `legacy:<ctx>:<seq>`;
+    - exits if it cannot use its database, at startup or later, and systemd retries;
+    - retries the inbox every 60 s, in order and counting attempts;
+    - the inbox is not purged (Q7 of the doc).
+  - **SY.cognition:** confirms each turn when it queues it and processes it in its own task; if that
+    task dies, it exits.
+  - **SY.orchestrator:** no managed node uses `RT.*`, and Archi's prompt says so.
 - **Deploy:**
-  - antes: ningún hive tenía nodos `RT.*` persistidos;
-  - build de `1c00389` en 17 min, publish en 16 s, deploy en 218 s;
-  - snapshots `pre-stream1a-0-1-75` en las 4 VMs (se borró `pre-sync-0-1-72`);
-  - 0.1.75 con el mismo manifest (`6a07db01`) en los 4, health `failed=0`.
+  - before: no hive had persisted `RT.*` nodes;
+  - build of `1c00389` in 17 min, publish in 16 s, deploy in 218 s;
+  - snapshots `pre-stream1a-0-1-75` on all 4 VMs (`pre-sync-0-1-72` was deleted);
+  - 0.1.75 with the same manifest (`6a07db01`) on all 4, health `failed=0`.
 - **Gate:**
-  - **La migración de `turns`:** índice único por `dedupe_key`, sin la clave primaria vieja, 542
-    filas `legacy:`.
-  - **Un pedido y su respuesta con el mismo `trace_id`:** dos filas en `turns`. Se probó con un
-    workflow de prueba cuyo mensaje reusa el `trace_id` del evento.
-  - **Cognition:** un turno de prueba costó un llamado al etiquetador. En 0.1.74 costaba 3 o 4.
-  - **SY.storage:** con su conexión a postgres cortada, salió, y systemd lo levantó con base en 7 s.
-  - **`RT.`:** un proceso que no es el router no puede hacer HELLO con un nombre `RT.`. Se rechaza,
-    con su PID en el log.
-  - **Lo que PROD no puede producir** (un router por hive, el SDK no manda frames de más): el salto
-    de frames grandes y la entrega por IRP quedan probados por tests unitarios.
-  - **Limpieza:** el tenant de prueba se purgó; PROD quedó como antes.
-- **Rollback:** snapshot `pre-stream1a-0-1-75`. `apt install fluxbee=0.1.74` solo no alcanza: la
-  migración de `turns` no se deshace, y el código viejo inserta con `ON CONFLICT (ctx, seq)`, que
-  ya no tiene índice único, así que los turnos fallarían.
+  - **The `turns` migration:** unique index on `dedupe_key`, without the old primary key, 542
+    `legacy:` rows.
+  - **A request and its response with the same `trace_id`:** two rows in `turns`. It was tested with a
+    test workflow whose message reuses the event's `trace_id`.
+  - **Cognition:** a test turn cost one call to the tagger. In 0.1.74 it cost 3 or 4.
+  - **SY.storage:** with its postgres connection cut, it exited, and systemd brought it back up with its database in 7 s.
+  - **`RT.`:** a process that is not the router cannot do a HELLO with an `RT.` name. It is rejected,
+    with its PID in the log.
+  - **What PROD cannot produce** (one router per hive; the SDK does not send oversized frames): the skipping
+    of big frames and the delivery over IRP are proven by unit tests.
+  - **Cleanup:** the test tenant was purged; PROD was left as before.
+- **Rollback:** snapshot `pre-stream1a-0-1-75`. `apt install fluxbee=0.1.74` alone is not enough: the
+  `turns` migration is not undone, and the old code inserts with `ON CONFLICT (ctx, seq)`, which
+  no longer has a unique index, so the turns would fail.
 
-## 0.1.74 — El SDK de IA lee la respuesta de OpenAI de su ítem `message` (A-69)
+## 0.1.74 — The AI SDK reads OpenAI's response from its `message` item (A-69)
 
-- **Fecha:** 2026-10-16 (ART) · **Versión anterior:** 0.1.73 · **Commit:** `0d69329`. Sale de lo
-  que encontró el gate de 0.1.73.
-- **Alcance:** motherbee + los tres spokes (core-update). Los `hive.yaml` siguen en Claude.
-- **Qué cambió:** el camino sin herramientas del SDK leía el texto de `output[0]`; con un modelo que
-  razona (gpt-5.5) ese es el ítem de razonamiento. Ahora un solo lector para los dos caminos:
-  `output_text` si viene, si no el primer ítem `message`.
-- **Deploy:** build de `0d69329` en 19 min (el SDK de IA recompila a todos sus consumidores),
-  publish en 14 s, deploy en 251 s. Snapshots `pre-sdk-0-1-74` en las 4 VMs (se borró
-  `pre-gate-0-1-71`). 0.1.74 con el mismo manifest (`b9d64985`) en los 4, health `failed=0`.
+- **Date:** 2026-10-16 (ART) · **Previous version:** 0.1.73 · **Commit:** `0d69329`. It comes out of what
+  the 0.1.73 gate found.
+- **Scope:** motherbee + the three spokes (core-update). The `hive.yaml` files stay on Claude.
+- **What changed:** the SDK's no-tools path read the text from `output[0]`; with a reasoning
+  model (gpt-5.5) that is the reasoning item. Now there is one reader for both paths:
+  `output_text` if it comes, otherwise the first `message` item.
+- **Deploy:** build of `0d69329` in 19 min (the AI SDK recompiles all its consumers),
+  publish in 14 s, deploy in 251 s. Snapshots `pre-sdk-0-1-74` on all 4 VMs (`pre-gate-0-1-71`
+  was deleted). 0.1.74 with the same manifest (`b9d64985`) on all 4, health `failed=0`.
 - **Gate:**
-  - **Cognition con OpenAI** (solo el del motherbee, un rato): etiquetador y resumidor anduvieron
-    (4 y 4 llamados, sin fallas).
-  - **De vuelta en Claude:**
-    - el etiquetador anduvo;
-    - de 3 resúmenes, uno pasó el timeout de 8 s de cognition (`semantic_tagger.timeout_ms`):
-      Opus 5.5 es más lento. Ese turno se queda sin síntesis de memoria, sin más daño. Queda para
-      el operador: subir ese timeout o usar Sonnet 5.5.
-  - **Archi con Claude:** sigue usando sus herramientas (6 s).
-  - **Los cuatro consumidores** en Claude, con cognition listo en los dos hives; health `failed=0`.
-- **Rollback:** snapshot `pre-sdk-0-1-74`, o `apt install fluxbee=0.1.73`.
-- **Después, sobre 0.1.74 (decisión del operador, 2026-10-16):** la infra pasa a
-  `claude-sonnet-5-5` (*"vamos por Sonnet 5.5"*).
-  - Se cambió el modelo en los dos `hive.yaml` y se reiniciaron los mismos servicios.
-  - Archi usa sus herramientas en 3 s (con Opus, 4 a 6 s).
-  - Cognition: 3 de 3 etiquetados y 3 de 3 resúmenes, sin timeouts.
+  - **Cognition with OpenAI** (only the motherbee's, for a while): tagger and summarizer worked
+    (4 and 4 calls, no failures).
+  - **Back on Claude:**
+    - the tagger worked;
+    - out of 3 summaries, one went over cognition's 8 s timeout (`semantic_tagger.timeout_ms`):
+      Opus 5.5 is slower. That turn is left without a memory synthesis, with no further harm. Left for
+      the operator: raise that timeout or use Sonnet 5.5.
+  - **Archi with Claude:** still uses its tools (6 s).
+  - **The four consumers** on Claude, with cognition ready on both hives; health `failed=0`.
+- **Rollback:** snapshot `pre-sdk-0-1-74`, or `apt install fluxbee=0.1.73`.
+- **Afterwards, on top of 0.1.74 (the operator's decision, 2026-10-16):** the infra moves to
+  `claude-sonnet-5-5` (*"vamos por Sonnet 5.5"* ("let's go with Sonnet 5.5")).
+  - The model was changed in both `hive.yaml` files and the same services were restarted.
+  - Archi uses its tools in 3 s (with Opus, 4 to 6 s).
+  - Cognition: 3 of 3 taggings and 3 of 3 summaries, no timeouts.
 
-## 0.1.73 — La infra de IA pasa a Claude; SY.cognition deja de mandar `temperature` (A-69)
+## 0.1.73 — The AI infra moves to Claude; SY.cognition stops sending `temperature` (A-69)
 
-- **Fecha:** 2026-10-16 (ART) · **Versión anterior:** 0.1.72 · **Commit:** `822f237`. Pedido del
-  operador: probar su key de Anthropic en toda la infra y, si no anda, volver a OpenAI.
-- **Alcance:** motherbee + los tres spokes (core-update). Además, sobre 0.1.72 y antes del build,
-  el `hive.yaml` del motherbee y de worker1 (los únicos con sección `ai`; ingress y egress no corren
-  IA):
-  - `default_provider: anthropic`, con `claude-opus-5-5`;
-  - la entrada de OpenAI (`gpt-5.5`) sigue declarada: volver es cambiar una línea y reiniciar
-    `sy-admin`, `sy-architect`, `sy-cognition` y `sy-frontdesk-gov` (en worker1, `sy-cognition`);
-  - backup `hive.yaml.pre-claude-0-1-72` en los dos.
-- **La prueba sobre 0.1.72, consumidor por consumidor:**
-  - **Archi:** contesta con Claude (2 s) y usa sus herramientas: listó los nodos de worker1 con
+- **Date:** 2026-10-16 (ART) · **Previous version:** 0.1.72 · **Commit:** `822f237`. Requested by the
+  operator: try their Anthropic key across the whole infra and, if it does not work, go back to OpenAI.
+- **Scope:** motherbee + the three spokes (core-update). Also, on top of 0.1.72 and before the build,
+  the `hive.yaml` of the motherbee and of worker1 (the only ones with an `ai` section; ingress and egress do not run
+  AI):
+  - `default_provider: anthropic`, with `claude-opus-5-5`;
+  - the OpenAI entry (`gpt-5.5`) stays declared: going back means changing one line and restarting
+    `sy-admin`, `sy-architect`, `sy-cognition` and `sy-frontdesk-gov` (on worker1, `sy-cognition`);
+  - backup `hive.yaml.pre-claude-0-1-72` on both.
+- **The test on top of 0.1.72, consumer by consumer:**
+  - **Archi:** answers with Claude (2 s) and uses its tools: it listed worker1's nodes with
     `fluxbee_system_get` (4 s).
-  - **El admin y SY.frontdesk.gov:** resuelven la key de Anthropic (`CONFIGURED`). No mandan
+  - **The admin and SY.frontdesk.gov:** resolve the Anthropic key (`CONFIGURED`). They do not send
     `temperature`.
-  - **SY.cognition:** con Opus 5.5 y con Sonnet 5.5, su etiquetador falló en un turno de prueba:
-    "`temperature` is deprecated for this model". De vuelta en OpenAI falló igual ("not
-    supported"): cognition estaba roto con los dos proveedores (A-69). Se volvió a Claude, que anda
-    en todo lo que anda OpenAI, y se arregló cognition.
-- **Qué cambió (`822f237`):** cognition sin `temperature`, topes de salida de 1024 tokens, y la key
-  de IA resuelta al arrancar (antes decía `degraded_no_ai_provider` hasta su primer turno).
-- **Deploy:** build de `822f237` en 7 min, publish en 12 s, deploy en 229 s. Snapshots
-  `pre-cognition-0-1-73` en las 4 VMs (se borró `pre-wf-0-1-70`). 0.1.73 con el mismo manifest
-  (`13af35fc`) en los 4, health `failed=0`.
+  - **SY.cognition:** with Opus 5.5 and with Sonnet 5.5, its tagger failed on a test turn:
+    "`temperature` is deprecated for this model". Back on OpenAI it failed the same way ("not
+    supported"): cognition was broken with both providers (A-69). The infra went back to Claude, which works
+    everywhere OpenAI works, and cognition was fixed.
+- **What changed (`822f237`):** cognition without `temperature`, output caps of 1024 tokens, and the AI key
+  resolved at startup (before, it said `degraded_no_ai_provider` until its first turn).
+- **Deploy:** build of `822f237` in 7 min, publish in 12 s, deploy in 229 s. Snapshots
+  `pre-cognition-0-1-73` on all 4 VMs (`pre-wf-0-1-70` was deleted). 0.1.73 with the same manifest
+  (`13af35fc`) on all 4, health `failed=0`.
 - **Gate:**
-  - **Cognition en los dos hives:** `ready_semantic_ai` con Claude apenas arrancó, también en
-    worker1 recién actualizado.
-  - **Un turno de prueba en el motherbee:**
-    - el etiquetador devolvió tags reales (`billing`, `duplicate charge`, `october invoice`…);
-    - el resumidor narrativo corrió con `claude-opus-5-5`;
-    - ninguna falla.
-  - **Encontrado, arreglado para 0.1.74:** con OpenAI el etiquetador ya no falla por
-    `temperature`, pero el SDK no encuentra el texto de la respuesta ("missing text output"). Un
-    modelo que razona pone primero un ítem de razonamiento, y el SDK leía el primer ítem.
-  - **Datos de prueba:** los turnos de prueba quedaron en el log de mensajes y en la memoria de
-    cognition, con hilos `claude-probe-20261016*` y `openai-probe-20261016*`.
-- **Rollback:** snapshot `pre-cognition-0-1-73`, o `apt install fluxbee=0.1.72`. Para volver a
-  OpenAI, `default_provider: openai` en los dos `hive.yaml` y reiniciar esos servicios.
+  - **Cognition on both hives:** `ready_semantic_ai` with Claude as soon as it started, also on
+    the freshly updated worker1.
+  - **A test turn on the motherbee:**
+    - the tagger returned real tags (`billing`, `duplicate charge`, `october invoice`…);
+    - the narrative summarizer ran with `claude-opus-5-5`;
+    - no failures.
+  - **Found, fixed for 0.1.74:** with OpenAI the tagger no longer fails because of
+    `temperature`, but the SDK does not find the response text ("missing text output"). A
+    reasoning model puts a reasoning item first, and the SDK read the first item.
+  - **Test data:** the test turns stayed in the message log and in cognition's
+    memory, with threads `claude-probe-20261016*` and `openai-probe-20261016*`.
+- **Rollback:** snapshot `pre-cognition-0-1-73`, or `apt install fluxbee=0.1.72`. To go back to
+  OpenAI, `default_provider: openai` in both `hive.yaml` files and restart those services.
 
-## 0.1.72 — Un deploy de WF en un worker hace que el motherbee anuncie su paquete (A-68, gate de 0.1.71)
+## 0.1.72 — A WF deploy on a worker makes the motherbee announce its package (A-68, gate of 0.1.71)
 
-- **Fecha:** 2026-10-16 (ART) · **Versión anterior:** 0.1.71 · **Commits:** `a053102` y `17e1edd`.
-  Sale de lo que encontró el gate de 0.1.71.
-  - `a053102` pedía escanear también en el worker y esperar a que su carpeta quedara quieta.
-  - Leído contra Syncthing 2.0.14 antes de publicarlo, no servía: el worker trae apenas el
-    motherbee anuncia, y un escaneo en el worker no trae nada.
-  - Se corrigió en `17e1edd`. El paquete armado con `a053102` no se publicó.
-- **Alcance:** motherbee + los tres spokes (core-update).
-- **Qué cambió:**
-  - **En un worker, después de publicar,** SY.wf-rules le pide al admin un `sync_hint` sobre el
-    `fluxbee-dist-runtimes` del motherbee. El motherbee escanea ya y anuncia el paquete.
-  - **Mientras el paquete no esté,** pide el mismo escaneo antes de cada reintento.
-- **Deploy:** build de `17e1edd` en 6 min, publish en 9 s, deploy en 176 s. Snapshots
-  `pre-sync-0-1-72` en las 4 VMs (se borró `pre-teardown-0-1-69`). 0.1.72 con el mismo manifest
-  (`acbb2efd`) en los 4, health `failed=0`.
-- **Gate, en el peor caso:** recién hecho el core-update, y el E2E de worker1 justo después del
-  borrado del E2E del motherbee (lo que falló en 0.1.71).
-  - **El E2E del ciclo de vida en el motherbee:** 35/35.
-  - **El E2E en worker1:** 35/35.
-    - El primer deploy tardó 4 s: el paquete llegó 1 s después de publicado, en el mismo pull que
-      el borrado del workflow anterior.
-    - La v2 llegó en 2 s.
-    - El borrado después del rollback no dejó paquetes (el arreglo de 0.1.71).
-  - **Por Archi:**
-    - el deploy y el borrado tardan 1 s cada uno;
-    - el nodo arranca `HEALTHY` con `launched_by: archi`;
-    - una clave de `_system` que no conoce queda en el archivo, y sigue `HEALTHY`.
-  - **Un anuncio le gana a la espera de Syncthing:** un pull del manifest falló y Syncthing anotó
-    que reintentaba en 1 min; con el anuncio siguiente lo trajo al segundo.
-  - **Limpieza:** el tenant de prueba (`wf-gate-0170`) se borró y se purgó. PROD quedó como antes:
-    solo el tenant raíz, los 28 ILK del core, ningún nodo WF y solo `wf.engine` entre los
-    runtimes `wf.*`.
-- **Rollback:** snapshot `pre-sync-0-1-72`, o `apt install fluxbee=0.1.71`.
+- **Date:** 2026-10-16 (ART) · **Previous version:** 0.1.71 · **Commits:** `a053102` and `17e1edd`.
+  It comes out of what the 0.1.71 gate found.
+  - `a053102` also asked to scan on the worker and to wait until its folder was still.
+  - Read against Syncthing 2.0.14 before publishing it, it did not work: the worker pulls as soon as the
+    motherbee announces, and a scan on the worker pulls nothing.
+  - It was corrected in `17e1edd`. The package built with `a053102` was not published.
+- **Scope:** motherbee + the three spokes (core-update).
+- **What changed:**
+  - **On a worker, after publishing,** SY.wf-rules asks the admin for a `sync_hint` on the
+    motherbee's `fluxbee-dist-runtimes`. The motherbee scans right away and announces the package.
+  - **While the package is not there,** it requests the same scan before each retry.
+- **Deploy:** build of `17e1edd` in 6 min, publish in 9 s, deploy in 176 s. Snapshots
+  `pre-sync-0-1-72` on all 4 VMs (`pre-teardown-0-1-69` was deleted). 0.1.72 with the same manifest
+  (`acbb2efd`) on all 4, health `failed=0`.
+- **Gate, in the worst case:** right after the core-update, and worker1's E2E right after the
+  deletion of the motherbee's E2E (what failed in 0.1.71).
+  - **The lifecycle E2E on the motherbee:** 35/35.
+  - **The E2E on worker1:** 35/35.
+    - The first deploy took 4 s: the package arrived 1 s after being published, in the same pull as
+      the deletion of the previous workflow.
+    - The v2 arrived in 2 s.
+    - The deletion after the rollback left no packages (the 0.1.71 fix).
+  - **Through Archi:**
+    - the deploy and the deletion take 1 s each;
+    - the node starts `HEALTHY` with `launched_by: archi`;
+    - a `_system` key it does not know stays in the file, and it stays `HEALTHY`.
+  - **An announcement beats Syncthing's wait:** a pull of the manifest failed and Syncthing noted
+    that it would retry in 1 min; with the next announcement it pulled it within a second.
+  - **Cleanup:** the test tenant (`wf-gate-0170`) was deleted and purged. PROD was left as before:
+    only the root tenant, the core's 28 ILKs, no WF node and only `wf.engine` among the
+    `wf.*` runtimes.
+- **Rollback:** snapshot `pre-sync-0-1-72`, or `apt install fluxbee=0.1.71`.
 
-## 0.1.71 — Un deploy de WF en un worker espera su paquete; el borrado deja la versión vigente para el final (A-68, gate de 0.1.70)
+## 0.1.71 — A WF deploy on a worker waits for its package; the deletion leaves the current version for last (A-68, gate of 0.1.70)
 
-- **Fecha:** 2026-10-16 (ART) · **Versión anterior:** 0.1.70 · **Commit:** `73f7132`. Sale de lo
-  que encontró el gate de 0.1.70.
-- **Alcance:** motherbee + los tres spokes (core-update).
-- **Qué cambió:**
-  - **SY.wf-rules** espera el paquete de un workflow hasta 45 s, con un plazo de 60 s por pedido;
-    el admin lo espera 75 s y Archi 90 s.
-  - **Al borrar un workflow,** una versión que el admin rechaza como vigente
-    (`RUNTIME_CURRENT_CONFLICT`) se reintenta cuando las demás ya no están.
-- **Deploy:** build de `73f7132` en 12 min, publish en 14 s, deploy en 186 s. Snapshots
-  `pre-gate-0-1-71` en las 4 VMs (se borró `pre-cloud-0-1-68`). 0.1.71 con el mismo manifest
-  (`94ae3776`) en los 4, health `failed=0`.
+- **Date:** 2026-10-16 (ART) · **Previous version:** 0.1.70 · **Commit:** `73f7132`. It comes out of what
+  the 0.1.70 gate found.
+- **Scope:** motherbee + the three spokes (core-update).
+- **What changed:**
+  - **SY.wf-rules** waits up to 45 s for a workflow's package, with a 60 s deadline per request;
+    the admin waits 75 s for it and Archi 90 s.
+  - **When a workflow is deleted,** a version that the admin rejects as current
+    (`RUNTIME_CURRENT_CONFLICT`) is retried once the others are gone.
+- **Deploy:** build of `73f7132` in 12 min, publish in 14 s, deploy in 186 s. Snapshots
+  `pre-gate-0-1-71` on all 4 VMs (`pre-cloud-0-1-68` was deleted). 0.1.71 with the same manifest
+  (`94ae3776`) on all 4, health `failed=0`.
 - **Gate:**
-  - **El E2E del ciclo de vida en el motherbee:** 35/35.
-  - **Encontrado en worker1, arreglado en 0.1.72:** el primer deploy esperó 45 s y el paquete no
-    llegó (`RUNTIME_NOT_PRESENT`).
-    - El manifest llegó a los 12 s y los archivos del paquete a los 62 s.
-    - El watcher del motherbee agrupa los cambios mientras la carpeta de runtimes está agitada, y
-      la del worker espera para reintentar después de fallar al borrar directorios.
-    - La limpieza del E2E borró el workflow y no dejó paquetes.
-- **Rollback:** snapshot `pre-gate-0-1-71`, o `apt install fluxbee=0.1.70`.
+  - **The lifecycle E2E on the motherbee:** 35/35.
+  - **Found on worker1, fixed in 0.1.72:** the first deploy waited 45 s and the package did not
+    arrive (`RUNTIME_NOT_PRESENT`).
+    - The manifest arrived at 12 s and the package files at 62 s.
+    - The motherbee's watcher batches the changes while the runtimes folder is churning, and
+      the worker's folder waits before retrying after failing to delete directories.
+    - The E2E cleanup deleted the workflow and left no packages.
+- **Rollback:** snapshot `pre-gate-0-1-71`, or `apt install fluxbee=0.1.70`.
 
-## 0.1.70 — Los nodos WF por el camino estándar: SY.wf-rules por el admin, el plano de control en el SDK de Go (A-68)
+## 0.1.70 — The WF nodes on the standard path: SY.wf-rules through the admin, the control plane in the Go SDK (A-68)
 
-- **Fecha:** 2026-10-16 (ART) · **Versión anterior:** 0.1.69 · **Commit:** `c289bb3`. Diseño en
-  `docs/wf-standard-path-v1.md`, aprobado por el operador el 2026-10-15. Una revisión (1
-  bloqueante, 7 a arreglar), arreglada antes del build.
-- **Alcance:** motherbee + los tres spokes (core-update).
-- **Qué cambió:**
-  - **SY.admin** atiende cada comando de la malla en su propia tarea, y un lock serializa los
-    cambios del manifest de runtimes. El deploy de un workflow desde Archi vuelve a andar.
-  - **SY.wf-rules** lanza, reinicia, configura y borra sus nodos WF por el admin, que lo deja
-    actuar solo sobre los `WF.*` de su hive. Acepta operaciones solo del admin.
-  - **`launched_by`** es quien pidió el deploy: `operator` por HTTP, `archi` desde Archi.
-  - **La política de sistema:** la regla (4) queda solo para SY.admin, sin SY.wf-rules ni
+- **Date:** 2026-10-16 (ART) · **Previous version:** 0.1.69 · **Commit:** `c289bb3`. Design in
+  `docs/wf-standard-path-v1.md`, approved by the operator on 2026-10-15. One review (1
+  blocker, 7 to fix), fixed before the build.
+- **Scope:** motherbee + the three spokes (core-update).
+- **What changed:**
+  - **SY.admin** handles each mesh command in its own task, and a lock serializes the
+    changes to the runtimes manifest. Deploying a workflow from Archi works again.
+  - **SY.wf-rules** launches, restarts, configures and deletes its WF nodes through the admin, which lets it
+    act only on the `WF.*` nodes of its hive. It accepts operations only from the admin.
+  - **`launched_by`** is whoever requested the deploy: `operator` over HTTP, `archi` from Archi.
+  - **The system policy:** rule (4) is left for SY.admin only, without SY.wf-rules or
     `WF.orch.diag`.
-  - **El SDK de Go** tiene el plano de control de los nodos administrados y el nodo WF lo usa: con
-    una config que no puede usar queda arriba, en FAILED_CONFIG y con el motivo.
-  - **El orquestador** no arranca un paquete de workflow sin su `flow/definition.json`
+  - **The Go SDK** has the control plane of the managed nodes and the WF node uses it: with
+    a config it cannot use, it stays up, in FAILED_CONFIG and with the reason.
+  - **The orchestrator** does not start a workflow package without its `flow/definition.json`
     (`RUNTIME_NOT_PRESENT`).
-- **Deploy:** build de `c289bb3` en 25 min, publish en 14 s, deploy en 221 s. Snapshots
-  `pre-wf-0-1-70` en las 4 VMs (se borró `pre-tenant-0-1-67`). 0.1.70 con el mismo manifest
-  (`e3986977`) en los 4, health `failed=0`.
-- **Gate, con un tenant de prueba, por el HTTP del operador y por Archi:**
-  - **El E2E del ciclo de vida en el motherbee** (`scripts/wf_rules_lifecycle_e2e.sh`): 35/35.
-    - Compile, apply con spawn, estado, update, rollback y delete, todo por el admin.
-    - El nodo queda con `launched_by: operator`.
-    - Con un error en su config queda `RUNNING` y `DEGRADED` con `invalid_config`, sin
-      reinicios; con la config arreglada y un reinicio vuelve a `HEALTHY`.
-  - **Por Archi** (SCMD por la malla):
-    - el deploy tarda 1,3 s y el nodo arranca `HEALTHY` con `launched_by: archi`;
-    - una clave de `_system` que el nodo no conoce queda en el archivo y el nodo sigue `HEALTHY`;
-    - el borrado tarda 1,3 s y el nodo desaparece.
-  - **Encontrado en worker1, arreglado en 0.1.71:**
-    - la actualización no esperó lo suficiente al paquete nuevo (`restart_failed`);
-    - el borrado dejó los paquetes en el motherbee (`RUNTIME_CURRENT_CONFLICT`). Se borraron por
-      el admin.
-- **Rollback:** snapshot `pre-wf-0-1-70`, o `apt install fluxbee=0.1.69`. En PROD no hay nodos WF.
+- **Deploy:** build of `c289bb3` in 25 min, publish in 14 s, deploy in 221 s. Snapshots
+  `pre-wf-0-1-70` on all 4 VMs (`pre-tenant-0-1-67` was deleted). 0.1.70 with the same manifest
+  (`e3986977`) on all 4, health `failed=0`.
+- **Gate, with a test tenant, through the operator's HTTP and through Archi:**
+  - **The lifecycle E2E on the motherbee** (`scripts/wf_rules_lifecycle_e2e.sh`): 35/35.
+    - Compile, apply with spawn, status, update, rollback and delete, all through the admin.
+    - The node ends up with `launched_by: operator`.
+    - With an error in its config it stays `RUNNING` and `DEGRADED` with `invalid_config`, without
+      restarts; with the config fixed and a restart it goes back to `HEALTHY`.
+  - **Through Archi** (SCMD over the mesh):
+    - the deploy takes 1.3 s and the node starts `HEALTHY` with `launched_by: archi`;
+    - a `_system` key the node does not know stays in the file and the node stays `HEALTHY`;
+    - the deletion takes 1.3 s and the node disappears.
+  - **Found on worker1, fixed in 0.1.71:**
+    - the update did not wait long enough for the new package (`restart_failed`);
+    - the deletion left the packages on the motherbee (`RUNTIME_CURRENT_CONFLICT`). They were deleted through
+      the admin.
+- **Rollback:** snapshot `pre-wf-0-1-70`, or `apt install fluxbee=0.1.69`. There are no WF nodes in PROD.
 
-## 0.1.69 — Cloud borra sus nodos sin trabar al admin; un SY de otro hive reintenta mientras identity arranca (A-67)
+## 0.1.69 — Cloud deletes its nodes without locking up the admin; an SY from another hive retries while identity starts (A-67)
 
-- **Fecha:** 2026-10-15 (ART) · **Versión anterior:** 0.1.68 · **Commit:** `6f03310`. Sale de lo
-  que encontró el gate de 0.1.68.
-- **Alcance:** motherbee + los tres spokes (core-update).
-- **Qué cambió:**
-  - **SY.admin:** los comandos que llegan por la malla y hacen que el orquestador lo vuelva a
-    llamar (kill y remove de nodos con purga) corren en su propia tarea. Antes el `delete_node` de
-    Cloud se trababa: el admin esperaba al orquestador y el orquestador al admin.
-  - **IO.cloud:** espera 25 s para `stop_node` y `delete_node`.
-  - **SY.vault:** a un SY de otro hive que la SHM todavía no tiene le contesta
-    `IDENTITY_UNAVAILABLE`, que se reintenta, en vez de `UNAUTHORIZED`. No entrega nada de más.
-- **Deploy:** build de `6f03310` en 9 min, publish en 16 s, deploy en 237 s. Snapshots
-  `pre-teardown-0-1-69` en las 4 VMs (se borró `pre-secrets-0-1-66`). 0.1.69 con el mismo manifest
-  (`baf673f4`) en los 4, health `failed=0`.
+- **Date:** 2026-10-15 (ART) · **Previous version:** 0.1.68 · **Commit:** `6f03310`. It comes out of what
+  the 0.1.68 gate found.
+- **Scope:** motherbee + the three spokes (core-update).
+- **What changed:**
+  - **SY.admin:** the commands that arrive over the mesh and make the orchestrator call it
+    back (kill and remove of nodes with purge) run in their own task. Before, Cloud's `delete_node`
+    locked up: the admin waited for the orchestrator and the orchestrator for the admin.
+  - **IO.cloud:** waits 25 s for `stop_node` and `delete_node`.
+  - **SY.vault:** to an SY from another hive that the SHM does not have yet, it answers
+    `IDENTITY_UNAVAILABLE`, which is retried, instead of `UNAUTHORIZED`. It hands out nothing extra.
+- **Deploy:** build of `6f03310` in 9 min, publish in 16 s, deploy in 237 s. Snapshots
+  `pre-teardown-0-1-69` on all 4 VMs (`pre-secrets-0-1-66` was deleted). 0.1.69 with the same manifest
+  (`baf673f4`) on all 4, health `failed=0`.
 - **Gate:**
-  - **El reinicio:** `SY.cognition@worker1` volvió a leer una clave del génesis en el hueco en que
-    identity arrancaba, y esta vez recibió `IDENTITY_UNAVAILABLE`; después leyó bien. Ningún
-    `UNAUTHORIZED` de un SY.
-  - **`delete_node` por la puerta pública:** contesta ok; la clave que el nodo tenía como propia se
-    borra y la asignada queda; el nombre queda libre (se volvió a crear y a borrar).
-  - **Limpieza:** PROD quedó como antes (solo el tenant raíz y los 28 ILK del core).
-- **Rollback:** snapshot `pre-teardown-0-1-69`, o `apt install fluxbee=0.1.68`.
+  - **The restart:** `SY.cognition@worker1` read a genesis key again in the gap while
+    identity was starting, and this time it got `IDENTITY_UNAVAILABLE`; afterwards it read fine. No
+    `UNAUTHORIZED` from an SY.
+  - **`delete_node` through the public door:** answers ok; the key the node had as its own is
+    deleted and the assigned one stays; the name is freed (it was created and deleted again).
+  - **Cleanup:** PROD was left as before (only the root tenant and the core's 28 ILKs).
+- **Rollback:** snapshot `pre-teardown-0-1-69`, or `apt install fluxbee=0.1.68`.
 
-## 0.1.68 — Cloud maneja sus tenants y los nodos IO que lanzó; parar un nodo dura (A-67, etapa 4)
+## 0.1.68 — Cloud manages its tenants and the IO nodes it launched; stopping a node sticks (A-67, stage 4)
 
-- **Fecha:** 2026-10-15 (ART) · **Versión anterior:** 0.1.67 · **Commits:** `a5f1b2a` (el código del
-  rechazo de `set_ilk_tenant`), `b26de82` (etapa 4) y `1b47c3e` (la revisión). Diseño en
-  `docs/ilk-tenant-model-v1.md` §2.4 y D14, decidido con el operador el 2026-10-15. Una revisión (3
-  mayores, 4 menores), arreglada antes del build; el build que traía el primer mayor se frenó.
-- **Alcance:** motherbee + los tres spokes (core-update).
-- **Qué cambió:**
-  - **Tenants por Cloud:** `update_tenant` con estado (`active`, `suspended`), settings y sponsor;
-    `get_tenant` completo por el admin; `list_tenants` sin el génesis.
-  - **Nodos por Cloud:** `list_nodes`, `get_node_status`, y `start_node`, `stop_node` y
-    `delete_node` solo para los nodos IO que lanzó en su tenant (el admin anota quién lanzó cada
-    nodo; el hive del nodo, o el motherbee si el hive es de una versión anterior, chequea la
-    condición).
-  - **Parar dura, para todos.**
-  - **El nodo WF en Go** conoce `launched_by`.
-- **Deploy:** build de `1b47c3e` en 8 min, publish en 15 s, deploy en 216 s. Snapshots
-  `pre-cloud-0-1-68` (se borró `pre-scope-0-1-65`). 0.1.68 en los 4 (`a41a6af7`), health
+- **Date:** 2026-10-15 (ART) · **Previous version:** 0.1.67 · **Commits:** `a5f1b2a` (the code for the
+  `set_ilk_tenant` rejection), `b26de82` (stage 4) and `1b47c3e` (the review). Design in
+  `docs/ilk-tenant-model-v1.md` §2.4 and D14, decided with the operator on 2026-10-15. One review (3
+  major, 4 minor), fixed before the build; the build that carried the first major was stopped.
+- **Scope:** motherbee + the three spokes (core-update).
+- **What changed:**
+  - **Tenants through Cloud:** `update_tenant` with status (`active`, `suspended`), settings and sponsor;
+    full `get_tenant` through the admin; `list_tenants` without the genesis.
+  - **Nodes through Cloud:** `list_nodes`, `get_node_status`, and `start_node`, `stop_node` and
+    `delete_node` only for the IO nodes it launched in its tenant (the admin records who launched each
+    node; the node's hive, or the motherbee if the hive runs an earlier version, checks the
+    condition).
+  - **Stopping sticks, for everyone.**
+  - **The WF node in Go** knows `launched_by`.
+- **Deploy:** build of `1b47c3e` in 8 min, publish in 15 s, deploy in 216 s. Snapshots
+  `pre-cloud-0-1-68` (`pre-scope-0-1-65` was deleted). 0.1.68 on all 4 (`a41a6af7`), health
   `failed=0`, OPA `in_sync` 4/4.
-- **Gate, por la puerta pública con el bearer de Cloud y del lado del operador:**
-  - **El catálogo** lista 24 operaciones, con las 7 nuevas.
+- **Gate, through the public door with Cloud's bearer and from the operator's side:**
+  - **The catalog** lists 24 operations, with the 7 new ones.
   - **Tenants:**
-    - settings y sponsor editados y leídos de vuelta con `get_tenant`;
-    - `pending` rechazado (`INVALID_REQUEST`) y el génesis rechazado (`TENANT_ROOT_PROTECTED`);
-    - `list_tenants` sin el génesis.
-  - **Nodos:**
-    - s1, lanzado por Cloud y configurado al lanzarlo, aparece en `list_nodes` con
-      `launched_by: cloud` y solo su estado;
-    - un nodo de otro tenant da `NODE_NOT_FOUND`;
-    - o1, lanzado por el operador en el mismo tenant, le da `NODE_NOT_FOUND` a Cloud para arrancar,
-      parar y borrar;
-    - un nodo que no es IO da `INVALID_REQUEST`.
-  - **Parar dura:** Cloud paró s1 y siguió abajo más de una pasada del relanzamiento; arrancado,
-    volvió con la marca de relanzar.
-  - **Suspender por Cloud:** un nodo nuevo, `TENANT_NOT_ACTIVE`; el vault le niega la clave a s1;
-    reactivado, la vuelve a leer.
-  - **`a5f1b2a`:** mover un temporal de un tenant que no está borrado contesta
-    `INVALID_TENANT_TRANSITION` solo, con el detalle aparte.
-  - **Un workflow de prueba:** su nodo WF arrancó limpio (0 reinicios, `launched_by: system`).
-  - **Encontrado, arreglado en 0.1.69:** `delete_node` desde Cloud se trababa (timeout, la
-    identidad marcada sin purgar), y un SY de otro hive recibió un `UNAUTHORIZED` transitorio
-    mientras identity arrancaba.
-  - **Limpieza:** la identidad trabada purgada, o1 matado, personas, claves y tenants borrados por
-    Cloud y purgados. PROD quedó como antes.
-- **Rollback:** snapshot `pre-cloud-0-1-68`, o `apt install fluxbee=0.1.67`. Un nodo parado con 0.1.68
-  queda con `relaunch_on_boot: false`; con 0.1.67 tampoco se relanza solo.
+    - settings and sponsor edited and read back with `get_tenant`;
+    - `pending` rejected (`INVALID_REQUEST`) and the genesis rejected (`TENANT_ROOT_PROTECTED`);
+    - `list_tenants` without the genesis.
+  - **Nodes:**
+    - s1, launched by Cloud and configured at launch, shows up in `list_nodes` with
+      `launched_by: cloud` and only its status;
+    - a node from another tenant gives `NODE_NOT_FOUND`;
+    - o1, launched by the operator in the same tenant, gives Cloud `NODE_NOT_FOUND` for start,
+      stop and delete;
+    - a node that is not IO gives `INVALID_REQUEST`.
+  - **Stopping sticks:** Cloud stopped s1 and it stayed down for more than one relaunch pass; once started,
+    it came back with the relaunch flag.
+  - **Suspending through Cloud:** a new node, `TENANT_NOT_ACTIVE`; the vault denies s1 its key;
+    reactivated, it reads it again.
+  - **`a5f1b2a`:** moving a temporary out of a tenant that is not deleted answers
+    `INVALID_TENANT_TRANSITION` alone, with the detail separate.
+  - **A test workflow:** its WF node started clean (0 restarts, `launched_by: system`).
+  - **Found, fixed in 0.1.69:** `delete_node` from Cloud locked up (timeout, the
+    identity marked but not purged), and an SY from another hive got a transient `UNAUTHORIZED`
+    while identity was starting.
+  - **Cleanup:** the stuck identity purged, o1 killed, people, keys and tenants deleted by
+    Cloud and purged. PROD was left as before.
+- **Rollback:** snapshot `pre-cloud-0-1-68`, or `apt install fluxbee=0.1.67`. A node stopped with 0.1.68
+  keeps `relaunch_on_boot: false`; with 0.1.67 it does not relaunch on its own either.
 
-## 0.1.67 — Un tenant que no está activo no arranca nodos y borrarlo no marca a nadie (A-66, etapa 3); el vault ata el ILK al nodo que manda (A-65)
+## 0.1.67 — A tenant that is not active does not start nodes and deleting it marks nobody (A-66, stage 3); the vault binds the ILK to the node that sends (A-65)
 
-- **Fecha:** 2026-10-15 (ART) · **Versión anterior:** 0.1.66 · **Commits:** `fbca8e7` y `81d2fab`
-  (A-65), `11aead9` (etapa 3) y `e85041d` (la revisión). Diseño en `docs/ilk-tenant-model-v1.md`
-  §2.3, decidido con el operador. Una revisión de A-65 (alcance parcial, comparación exacta) y una
-  de la etapa 3 (2 mayores, 2 menores, 4 detalles), arregladas antes del build.
-- **Alcance:** motherbee + los tres spokes (core-update).
-- **Qué cambió:**
-  - **SY.vault (A-65):** el ILK de quien pide tiene que ser el del nodo que el router dice que
-    mandó: derivado del nombre para un SY, el registrado para su nombre para cualquier otro. Entre
-    hives está cerrado; en el mismo hive el nombre sigue siendo el del HELLO (P-1).
-  - **Orquestador:** `run_node`, start y restart contestan `TENANT_NOT_ACTIVE` para un tenant
-    pendiente o suspendido, y los relanzamientos lo saltean. Un nodo que ya corre no se mata.
+- **Date:** 2026-10-15 (ART) · **Previous version:** 0.1.66 · **Commits:** `fbca8e7` and `81d2fab`
+  (A-65), `11aead9` (stage 3) and `e85041d` (the review). Design in `docs/ilk-tenant-model-v1.md`
+  §2.3, decided with the operator. One review of A-65 (partial scope, exact comparison) and one
+  of stage 3 (2 major, 2 minor, 4 details), fixed before the build.
+- **Scope:** motherbee + the three spokes (core-update).
+- **What changed:**
+  - **SY.vault (A-65):** the requester's ILK has to be that of the node the router says
+    sent the request: derived from the name for an SY, the one registered for its name for anyone else. Across
+    hives this is closed; within the same hive the name is still the one from the HELLO (P-1).
+  - **Orchestrator:** `run_node`, start and restart answer `TENANT_NOT_ACTIVE` for a pending or
+    suspended tenant, and the relaunches skip it. A node that is already running is not killed.
   - **SY.identity:**
-    - borrar un tenant marca solo al tenant;
-    - purgarlo se rechaza con personas cargadas (`TENANT_HAS_PEOPLE`);
-    - `set_ilk_tenant` mueve temporales desde un tenant borrado;
-    - `restore_ilk` devuelve a una persona con su tenant borrado;
-    - la migración v4 desmarca a quien marcó una cascada vieja.
-  - **io.api `by_ilk`:** personas cargadas al tenant o con un canal en su espacio (D12).
-  - **Admin y Cloud:** los códigos nuevos son 409; textos y catálogo.
+    - deleting a tenant marks only the tenant;
+    - purging it is rejected while people are charged to it (`TENANT_HAS_PEOPLE`);
+    - `set_ilk_tenant` moves temporaries out of a deleted tenant;
+    - `restore_ilk` brings back a person whose tenant is deleted;
+    - the v4 migration unmarks whoever an old cascade marked.
+  - **io.api `by_ilk`:** people charged to the tenant or with a channel in its space (D12).
+  - **Admin and Cloud:** the new codes are 409; texts and catalog.
 - **Deploy:**
-  - **Build:** `e85041d` en 20,5 min. Antes se lanzaron por error dos builds del mismo commit a la
-    vez (`11aead9`); se pararon a los segundos y quedó uno solo.
-  - **Publish y deploy:** publish en 19 s, deploy en 293 s.
-  - **Snapshots:** `pre-tenant-0-1-67` en las 4 VMs (se borró `pre-cloud-0-1-64`).
-  - **Estado:** 0.1.67 con el mismo manifest (`637ed35d`) en los 4, health `failed=0`, OPA `in_sync`
-    4/4. Identity: *"migrations through v4"*, sin nada que desmarcar (PROD no tenía marcas de
-    cascada).
-  - **Antes del deploy:** el SQL de la v4 se probó sobre el esquema de PROD dentro de una
-    transacción que se deshizo: desmarcó al libre y a uno de dos con el mismo email; dejó marcados al
-    del email tomado, al otro y a un nodo; no tocó una marca directa.
+  - **Build:** `e85041d` in 20.5 min. Before that, two builds of the same commit were launched by mistake at
+    the same time (`11aead9`); they were stopped within seconds and only one was left.
+  - **Publish and deploy:** publish in 19 s, deploy in 293 s.
+  - **Snapshots:** `pre-tenant-0-1-67` on all 4 VMs (`pre-cloud-0-1-64` was deleted).
+  - **Status:** 0.1.67 with the same manifest (`637ed35d`) on all 4, health `failed=0`, OPA `in_sync`
+    4/4. Identity: *"migrations through v4"*, with nothing to unmark (PROD had no cascade
+    marks).
+  - **Before the deploy:** the v4 SQL was tested on PROD's schema inside a
+    transaction that was rolled back: it unmarked the free one and one of two with the same email; it left
+    marked the one whose email was taken, the other one and a node; it did not touch a direct mark.
 - **Gate:**
   - **A-65:**
-    - después del reinicio, todos los SY leyeron sus claves sin un rechazo, también los de otros
+    - after the restart, every SY read its keys without a rejection, also those of other
       hives (`SY.cognition@worker1`, `SY.edge@ingress1`);
-    - `send_node_message` del admin al vault con el ILK de IO.cloud: `UNAUTHORIZED`, auditado; con
-      el suyo: pasa;
-    - el nodo IO.slack del gate lee su clave con su propio ILK.
-  - **Etapa 3, por la puerta pública con el bearer de Cloud y del lado del operador:**
-    - **Armado:** tenants T y U; un nodo IO.slack s1 en T con la clave de T general; Ana y Bob
-      (cuentas) y un alta sin nombre, que queda pendiente (un temporal); Bob borrado.
-    - **T suspendida:**
-      - el restart de s1 da `409 TENANT_NOT_ACTIVE` y s1 sigue corriendo;
-      - un nodo nuevo en T da `TENANT_NOT_ACTIVE`;
-      - el vault le niega la clave a s1 (7 `UNAUTHORIZED`);
-      - con la unidad de s1 parada, dos pasadas seguidas lo saltean (*"not relaunched: its tenant
+    - the admin's `send_node_message` to the vault with IO.cloud's ILK: `UNAUTHORIZED`, audited; with
+      its own: passes;
+    - the gate's IO.slack node reads its key with its own ILK.
+  - **Stage 3, through the public door with Cloud's bearer and from the operator's side:**
+    - **Setup:** tenants T and U; an IO.slack node s1 in T with T's general key; Ana and Bob
+      (accounts) and a sign-up without a name, which stays pending (a temporary); Bob deleted.
+    - **T suspended:**
+      - s1's restart gives `409 TENANT_NOT_ACTIVE` and s1 keeps running;
+      - a new node in T gives `TENANT_NOT_ACTIVE`;
+      - the vault denies s1 its key (7 `UNAUTHORIZED`);
+      - with s1's unit stopped, two passes in a row skip it (*"not relaunched: its tenant
         is not active"*);
-      - mover el temporal fuera de T, que no está borrada, se rechaza.
-    - **T reactivada:** la pasada siguiente (52 s después) relanzó s1, que volvió a leer.
-    - **Borrar:**
-      - con s1 vivo, `TENANT_HAS_NODES`;
-      - con s1 purgado, ok y `people_charged: 2`;
-      - Ana y el temporal no se marcan y siguen cargados a T, y la cuenta de Ana contesta por email;
-      - Bob vuelve con T borrada;
-      - restaurar T da `people_charged: 3`.
-    - **Purgar:** `TENANT_HAS_SECRETS`; sin la clave, `TENANT_HAS_PEOPLE` con los tres; los tres a U
-      (el temporal desde T borrada); purga ok sin llevarse a nadie; los tres siguen en U y el
-      temporal sigue pendiente.
-    - **Limpieza:** las tres personas borradas por Cloud, U borrada y purgada (se fueron las tres
-      marcadas). PROD quedó como antes: solo el tenant raíz y los 28 ILK del core.
-  - **Encontrado en el gate:** el rechazo de mover un temporal contestaba
-    `INVALID_TENANT_TRANSITION|<detalle>` como `error_code`. Arreglado en `a5f1b2a`; sale con el
-    próximo release.
-  - **Lo que no se probó en vivo:** io.api `by_ilk` (D12), cubierto por tests; la v4 sobre datos
-    reales, porque PROD no tenía (cubierta por la prueba en transacción).
+      - moving the temporary out of T, which is not deleted, is rejected.
+    - **T reactivated:** the next pass (52 s later) relaunched s1, which read again.
+    - **Delete:**
+      - with s1 alive, `TENANT_HAS_NODES`;
+      - with s1 purged, ok and `people_charged: 2`;
+      - Ana and the temporary are not marked and stay charged to T, and Ana's account answers by email;
+      - Bob comes back with T deleted;
+      - restoring T gives `people_charged: 3`.
+    - **Purge:** `TENANT_HAS_SECRETS`; without the key, `TENANT_HAS_PEOPLE` with the three; the three to U
+      (the temporary out of the deleted T); purge ok without taking anyone along; the three stay in U and the
+      temporary stays pending.
+    - **Cleanup:** the three people deleted by Cloud, U deleted and purged (the three marked
+      ones went with it). PROD was left as before: only the root tenant and the core's 28 ILKs.
+  - **Found in the gate:** the rejection of moving a temporary answered
+    `INVALID_TENANT_TRANSITION|<detail>` as `error_code`. Fixed in `a5f1b2a`; it ships with the
+    next release.
+  - **What was not tested live:** io.api `by_ilk` (D12), covered by tests; the v4 on real
+    data, because PROD had none (covered by the transaction test).
 - **Rollback:**
   - snapshot `pre-tenant-0-1-67`;
-  - o `apt install fluxbee=0.1.66`. La v4 no se deshace: a quien desmarcó, 0.1.66 lo ve activo, y
-    un tenant borrado sin cascada queda con su gente activa (0.1.66 no la marca de vuelta).
+  - or `apt install fluxbee=0.1.66`. The v4 is not undone: whoever it unmarked, 0.1.66 sees as active, and
+    a tenant deleted without the cascade keeps its people active (0.1.66 does not mark them back).
 
-## 0.1.66 — Un secreto lo usa su dueño, sus nodos asignados o, si es general, los nodos de su tenant; en el génesis nace solo el core (A-64, etapa 2)
+## 0.1.66 — A secret is used by its owner, its assigned nodes or, if it is general, its tenant's nodes; in the genesis only the core is born (A-64, stage 2)
 
-- **Fecha:** 2026-10-14 (ART) · **Versión anterior:** 0.1.65 · **Commits:** `80b479c` (altas
-  pendientes, D11) y `96c8d77` (etapa 2). Diseño en `docs/ilk-tenant-model-v1.md` §2.2, decidido con
-  el operador. Una revisión del código (1 mayor, 9 menores), arreglada antes del build.
-- **Alcance:** motherbee + los tres spokes (core-update).
-- **Qué cambió:**
+- **Date:** 2026-10-14 (ART) · **Previous version:** 0.1.65 · **Commits:** `80b479c` (pending
+  sign-ups, D11) and `96c8d77` (stage 2). Design in `docs/ilk-tenant-model-v1.md` §2.2, decided with
+  the operator. One code review (1 major, 9 minor), fixed before the build.
+- **Scope:** motherbee + the three spokes (core-update).
+- **What changed:**
   - **SY.vault:**
-    - nodos asignados en el secreto y `VAULT_ASSIGN`, que los cambia sin tocar el valor;
-    - el valor sale solo con el tenant del secreto activo;
-    - un valor nuevo conserva quién lo usa;
-    - el aviso de cambio llega a quien lo tenía y a quien lo tiene.
-  - **SDK:** la resolución busca primero uno propio, después uno asignado, después el general del
-    tenant; nunca el del raíz.
-  - **SY.admin:** `vault_assign` y nodos asignados en `vault_put`, siempre del tenant del secreto y
-    nunca personas.
-  - **IO.cloud:** `nodes` en `put_token`, la operación `assign_token` y `pending_signup` en las
-    lecturas.
-  - **Orquestador:** en el génesis nace solo el core.
-  - **SY.identity:** el tenant de un nodo no cambia, y las altas pendientes se leen como tales.
+    - assigned nodes in the secret, and `VAULT_ASSIGN`, which changes them without touching the value;
+    - the value goes out only when the secret's tenant is active;
+    - a new value keeps who uses it;
+    - the change notice reaches whoever had it and whoever has it.
+  - **SDK:** the resolution looks first for one of its own, then an assigned one, then the tenant's
+    general one; never the root's.
+  - **SY.admin:** `vault_assign` and assigned nodes in `vault_put`, always from the secret's tenant and
+    never people.
+  - **IO.cloud:** `nodes` in `put_token`, the `assign_token` operation and `pending_signup` in the
+    reads.
+  - **Orchestrator:** in the genesis only the core is born.
+  - **SY.identity:** a node's tenant does not change, and pending sign-ups are read as such.
 - **Deploy:**
-  - **Primer build:** murió por memoria. La VM de build (4 CPU, 8 GB, sin swap) mató un `rustc`;
-    0.1.64 y 0.1.65 habían pasado justo. Se le sumó un swapfile de 8 GB (persistente).
-  - **Segundo build:** `96c8d77` en 18 min.
-  - **Publish y deploy:** publish en 13 s, deploy en 216 s.
-  - **Snapshots:** `pre-secrets-0-1-66` en las 4 VMs (se borró `pre-a58-0-1-63`).
-  - **Estado:** 0.1.66 con el mismo manifest (`648d8493`) en los 4, health `failed=0`, OPA `in_sync`
+  - **First build:** died of memory. The build VM (4 CPU, 8 GB, no swap) killed a `rustc`;
+    0.1.64 and 0.1.65 had barely made it. An 8 GB swapfile (persistent) was added to it.
+  - **Second build:** `96c8d77` in 18 min.
+  - **Publish and deploy:** publish in 13 s, deploy in 216 s.
+  - **Snapshots:** `pre-secrets-0-1-66` on all 4 VMs (`pre-a58-0-1-63` was deleted).
+  - **Status:** 0.1.66 with the same manifest (`648d8493`) on all 4, health `failed=0`, OPA `in_sync`
     4/4.
-  - **Antes del deploy:** se verificó que en el génesis de PROD corre solo el core, así que la regla
-    nueva no dejaba nada afuera.
-- **Gate (medido con la auditoría del vault, que registra cada lectura de cada nodo):**
-  - **Después del reinicio:** el core leyó todas sus claves (SY.\* las del génesis, SY.edge las
-    suyas), sin un rechazo.
-  - **Por la puerta pública, con el bearer de Cloud: 22 controles, todos PASS.**
-    - Dos empresas A y B. Cuatro nodos IO.slack: tres en A y uno en B, todos configurados con la
-      clave de A, con tokens falsos.
-    - Una persona en A.
-    - `put_token` asignado a dos nodos; `list_tokens` los muestra.
-    - Asignar un nodo de B, o una persona, da `INVALID_REQUEST`; asignar desde B la clave de A da
+  - **Before the deploy:** it was verified that only the core runs in PROD's genesis, so the new
+    rule left nothing out.
+- **Gate (measured with the vault's audit, which records every read by every node):**
+  - **After the restart:** the core read all its keys (SY.\* the genesis ones, SY.edge its
+    own), without a rejection.
+  - **Through the public door, with Cloud's bearer: 22 checks, all PASS.**
+    - Two companies A and B. Four IO.slack nodes: three in A and one in B, all configured with
+      A's key, with fake tokens.
+    - One person in A.
+    - `put_token` assigned to two nodes; `list_tokens` shows them.
+    - Assigning a node from B, or a person, gives `INVALID_REQUEST`; assigning A's key from B gives
       `KEY_NOT_FOUND`.
-    - Las lecturas de identidades traen `pending_signup`.
-  - **Lo que leyó cada nodo:**
-    - **Asignada a g1 y g2:** leen g1 y g2; g3 (de A, no asignado) y b1 (de B) reciben
+    - The identity reads bring `pending_signup`.
+  - **What each node read:**
+    - **Assigned to g1 and g2:** g1 and g2 read; g3 (from A, not assigned) and b1 (from B) get
       `UNAUTHORIZED`.
-    - **Asignada solo a g1:** g2 quedó afuera apenas llegó el aviso y soltó la credencial.
-    - **General para A:** leen g1, g2 y g3; b1 no.
-    - **A suspendida:** los tres de A, rechazados con *"the secret's tenant … is not active
-      (suspended)"*. **Reactivada:** vuelven a leer.
-    - **El secreto de una persona** (dueña Juan, asignado a g4): g4 lo lee, y lo sigue leyendo
-      después de cambiar a Juan a la empresa B.
-  - **Del lado del operador:** un nodo AI en el génesis da `TENANT_ROOT_NOT_ALLOWED`, y
-    `?pending_signup=true` contesta (0 pendientes).
-  - **Lo que no se probó en vivo:** el cambio de tenant de un nodo, que no tiene camino de API para
-    intentarlo. Está cubierto por tests.
-- **Limpieza:** los cinco nodos purgados (al purgarlos no se borró ningún secreto, porque no eran
-  dueños de ninguno), las claves y la persona borradas por Cloud, los dos tenants purgados. Identity
-  y el vault quedaron como antes.
-- **Arreglado después, sale con el próximo release:** el admin HTTP devolvía 500 para
-  `TENANT_ROOT_NOT_ALLOWED`; ahora 403.
+    - **Assigned only to g1:** g2 was left out as soon as the notice arrived, and it dropped the credential.
+    - **General for A:** g1, g2 and g3 read; b1 does not.
+    - **A suspended:** the three from A, rejected with *"the secret's tenant … is not active
+      (suspended)"*. **Reactivated:** they read again.
+    - **A person's secret** (owner Juan, assigned to g4): g4 reads it, and keeps reading it
+      after Juan is moved to company B.
+  - **From the operator's side:** an AI node in the genesis gives `TENANT_ROOT_NOT_ALLOWED`, and
+    `?pending_signup=true` answers (0 pending).
+  - **What was not tested live:** changing a node's tenant, which has no API path to
+    attempt it. It is covered by tests.
+- **Cleanup:** the five nodes purged (purging them deleted no secret, because they did not
+  own any), the keys and the person deleted by Cloud, the two tenants purged. Identity
+  and the vault were left as before.
+- **Fixed afterwards, ships with the next release:** the admin HTTP returned 500 for
+  `TENANT_ROOT_NOT_ALLOWED`; now 403.
 - **Rollback:**
   - snapshot `pre-secrets-0-1-66`;
-  - o `apt install fluxbee=0.1.65`. No hay migración: los secretos que 0.1.66 escribe con nodos
-    asignados, 0.1.65 los ve generales.
+  - or `apt install fluxbee=0.1.65`. There is no migration: the secrets that 0.1.66 writes with assigned
+    nodes, 0.1.65 sees as general.
 
-## 0.1.65 — Un ILK por actor: el ámbito de cada canal, una cuenta de Cloud por email y `set_ilk_tenant` (A-63, etapa 1)
+## 0.1.65 — One ILK per actor: each channel's scope, one Cloud account per email and `set_ilk_tenant` (A-63, stage 1)
 
-- **Fecha:** 2026-10-14 (ART) · **Versión anterior:** 0.1.64 · **Commit:** `8b3e951` (FINDINGS A-63;
-  diseño en `docs/ilk-tenant-model-v1.md`, etapa 1). Una revisión del diseño (7 mayores, 5 menores)
-  y una del código (1 mayor, 8 menores), todo arreglado antes del build.
-- **Alcance:** motherbee + los tres spokes (core-update).
-- **Qué cambió:**
+- **Date:** 2026-10-14 (ART) · **Previous version:** 0.1.64 · **Commit:** `8b3e951` (FINDINGS A-63;
+  design in `docs/ilk-tenant-model-v1.md`, stage 1). One design review (7 major, 5 minor)
+  and one code review (1 major, 8 minor), all fixed before the build.
+- **Scope:** motherbee + the three spokes (core-update).
+- **What changed:**
   - **SY.identity:**
-    - cada canal guarda su ámbito (`scope`) y toda clave sale de él: memoria, base, SHM y el camino
-      rápido. Reasignar un ILK no mueve ninguna clave;
-    - una cuenta de Cloud por email, en el ámbito de la instalación, que solo escribe IO.cloud (por
-      provision, add, update, fusión y push de réplica);
-    - `ILK_SET_TENANT`, con historial en la misma transacción (`identity_ilk_tenant_history`);
-    - el registro ya no cambia el tenant de una persona, y las fusiones quedan dentro de un tenant;
-    - borrar un tenant con cuentas cargadas da `TENANT_HAS_ACCOUNTS`, y un alta sin terminar ni
-      traba ni se marca (`pending_signups`);
-    - purgar un tenant se lleva los canales que otros ILKs tenían en su ámbito
+    - each channel stores its scope (`scope`) and every key comes from it: memory, database, SHM and the fast
+      path. Reassigning an ILK moves no key;
+    - one Cloud account per email, in the installation's scope, which only IO.cloud writes (through
+      provision, add, update, merge and replica push);
+    - `ILK_SET_TENANT`, with history in the same transaction (`identity_ilk_tenant_history`);
+    - registration no longer changes a person's tenant, and merges stay within a tenant;
+    - deleting a tenant with accounts charged to it gives `TENANT_HAS_ACCOUNTS`, and an unfinished sign-up
+      neither blocks nor gets marked (`pending_signups`);
+    - purging a tenant takes along the channels that other ILKs had in its scope
       (`dropped_channels`);
-    - la migración v3 corre en cada arranque del primario, antes de cargar la memoria: mueve las
-      cuentas no ambiguas y reporta el resto por log.
-  - **SY.admin:** `set_ilk_tenant` (HTTP `PUT .../identity/ilks/{ilk}/tenant` y relay de Cloud),
-    con el "para quién" sellado por el admin; Cloud borra y restaura solo personas.
-  - **IO.cloud:** `register_human` devuelve la cuenta existente (`existing: true`); `set_ilk_tenant`;
-    `get_ilk`, `get_ilk_details`, `delete_ilk` y `restore_ilk` sin tenant.
-  - **Contrato:** `docs/io-cloud-api.md` (§9, 0.1.65).
+    - the v3 migration runs on every startup of the primary, before loading memory: it moves the
+      unambiguous accounts and reports the rest in the log.
+  - **SY.admin:** `set_ilk_tenant` (HTTP `PUT .../identity/ilks/{ilk}/tenant` and Cloud relay),
+    with the "for whom" stamped by the admin; Cloud deletes and restores only people.
+  - **IO.cloud:** `register_human` returns the existing account (`existing: true`); `set_ilk_tenant`;
+    `get_ilk`, `get_ilk_details`, `delete_ilk` and `restore_ilk` without a tenant.
+  - **Contract:** `docs/io-cloud-api.md` (§9, 0.1.65).
 - **Deploy:**
-  - build `8b3e951` en 23 min;
-  - publish en 15 s;
-  - deploy en 230 s;
-  - snapshots `pre-scope-0-1-65` en las 4 VMs (se borró `pre-identity-0-1-62`);
-  - versiones 0.1.65 con el mismo manifest (`7515c798`) en los 4, health `failed=0`, OPA `in_sync`
+  - build `8b3e951` in 23 min;
+  - publish in 15 s;
+  - deploy in 230 s;
+  - snapshots `pre-scope-0-1-65` on all 4 VMs (`pre-identity-0-1-62` was deleted);
+  - versions 0.1.65 with the same manifest (`7515c798`) on all 4, health `failed=0`, OPA `in_sync`
     4/4.
-- **Antes del deploy, datos viejos a propósito (en 0.1.64, por la puerta de Cloud):**
-  - el mismo email registrado desde dos tenants (dos personas);
-  - un email único;
-  - una persona borrada.
+- **Before the deploy, old data on purpose (on 0.1.64, through Cloud's door):**
+  - the same email registered from two tenants (two people);
+  - a unique email;
+  - a deleted person.
 - **Gate:**
-  - **La migración, en el arranque:**
-    - v3 registrada;
-    - el email único pasó al ámbito de la instalación;
-    - el email duplicado quedó donde estaba, reportado por log (`ambiguous_emails=1` con los dos
+  - **The migration, at startup:**
+    - v3 recorded;
+    - the unique email moved to the installation's scope;
+    - the duplicate email stayed where it was, reported in the log (`ambiguous_emails=1` with the two
       ILKs);
-    - la persona borrada no se tocó.
-  - **Por la puerta pública, con el bearer de Cloud: 30 controles, todos PASS.**
-    - El email duplicado da `ACCOUNT_AMBIGUOUS`.
-    - El único, pedido desde otro tenant, devuelve su cuenta (`existing: true`, sigue en su tenant).
-    - Una cuenta nueva desde dos tenants es un solo ILK.
-    - `set_ilk_tenant` la mueve (y la segunda vez `changed: false`); el raíz está protegido.
-    - El restore de la persona borrada antes del upgrade la deja en el ámbito de la instalación,
-      donde `register_human` la encuentra.
-    - Lectura por id entre tenants; `delete_ilk` de un nodo da `ILK_TYPE_MISMATCH`; borrar un
-      tenant con una cuenta cargada da `TENANT_HAS_ACCOUNTS`.
-  - **Del lado del operador:**
-    - la fila de historial dice `SY.admin@motherbee for IO.cloud@motherbee`;
-    - la SHM de la réplica en worker1 muestra el tenant nuevo y el canal en el ámbito de la
-      instalación;
-    - purgar el tenant del que se fue una persona funcionó (`dropped_channels=1`; era el MAJOR de
-      la revisión del código);
-    - reiniciar sy-identity: las claves sobrevivieron la recarga de la base, el reporte quedó
-      limpio y el email que había quedado único pasó al ámbito de la instalación;
-    - health `failed=0` en los 4 después del reinicio.
-- **Limpieza:** las cinco personas borradas por Cloud, los tres tenants purgados por el operador,
-  el nodo de prueba purgado. Identity quedó como antes (solo el tenant raíz, sin personas, sin
-  historial) y el vault en sus claves de infraestructura más `anthropic_root_pool`.
-- **Arreglado después, sale con el próximo release:**
-  - el admin HTTP mapeaba `TENANT_NOT_FOUND` a 500: ahora 404, y los rechazos del ciclo de vida de
-    identity (`TENANT_HAS_NODES`, `TENANT_NOT_DELETED`, `ILK_KEY_CONFLICT`, …) dan 409;
-  - el log del esquema decía "baseline v1" con la v3 aplicada.
+    - the deleted person was not touched.
+  - **Through the public door, with Cloud's bearer: 30 checks, all PASS.**
+    - The duplicate email gives `ACCOUNT_AMBIGUOUS`.
+    - The unique one, requested from another tenant, returns its account (`existing: true`, it stays in its tenant).
+    - A new account from two tenants is a single ILK.
+    - `set_ilk_tenant` moves it (and the second time `changed: false`); the root is protected.
+    - The restore of the person deleted before the upgrade leaves them in the installation's scope,
+      where `register_human` finds them.
+    - Read by id across tenants; `delete_ilk` of a node gives `ILK_TYPE_MISMATCH`; deleting a
+      tenant with an account charged to it gives `TENANT_HAS_ACCOUNTS`.
+  - **From the operator's side:**
+    - the history row says `SY.admin@motherbee for IO.cloud@motherbee`;
+    - the replica's SHM on worker1 shows the new tenant and the channel in the installation's
+      scope;
+    - purging the tenant a person had left worked (`dropped_channels=1`; it was the MAJOR from
+      the code review);
+    - restarting sy-identity: the keys survived the reload from the database, the report came out
+      clean and the email that had become unique moved to the installation's scope;
+    - health `failed=0` on all 4 after the restart.
+- **Cleanup:** the five people deleted by Cloud, the three tenants purged by the operator,
+  the test node purged. Identity was left as before (only the root tenant, no people, no
+  history) and the vault with its infrastructure keys plus `anthropic_root_pool`.
+- **Fixed afterwards, ships with the next release:**
+  - the admin HTTP mapped `TENANT_NOT_FOUND` to 500: now 404, and identity's lifecycle rejections
+    (`TENANT_HAS_NODES`, `TENANT_NOT_DELETED`, `ILK_KEY_CONFLICT`, …) give 409;
+  - the schema log said "baseline v1" with v3 applied.
 - **Rollback:**
   - snapshot `pre-scope-0-1-65`;
-  - o `apt install fluxbee=0.1.64`. La migración v3 no se deshace, pero 0.1.64 vuelve a calcular
-    las claves desde el tenant del ILK y reescribe el ámbito de cada canal en su próxima escritura.
-    La tabla de historial queda, sin uso.
+  - or `apt install fluxbee=0.1.64`. The v3 migration is not undone, but 0.1.64 recomputes
+    the keys from the ILK's tenant and rewrites each channel's scope on its next write.
+    The history table stays, unused.
 
-## 0.1.64 — Cloud gestiona las credenciales y el nombre de su empresa; toda escritura al vault nombra su tenant (A-61)
+## 0.1.64 — Cloud manages its company's credentials and name; every write to the vault names its tenant (A-61)
 
-- **Fecha:** 2026-10-13 (ART) · **Versión anterior:** 0.1.63 · **Commit:** `f8c73c5` (FINDINGS
-  A-61, A-62). Una sola revisión adversarial: un MAJOR (el factory reset) y seis menores, todos
-  arreglados antes del build.
-- **Alcance:** motherbee + los tres spokes (core-update).
-- **Qué cambió:**
-  - **SY.vault, para todos los llamadores:**
-    - un put de una clave de otro tenant es `KEY_TAKEN` y nunca la mueve;
-    - borrar, rotar y volver atrás llevan `tenant_id`, y una clave de otro tenant contesta
-      `KEY_NOT_FOUND`, con el mismo texto que una inexistente;
-    - el admin pone el raíz si no viene, acepta `?tenant_id=` por HTTP y tiene el campo en los planes
-      de Archi;
-    - el orquestador y el factory reset borran cada clave en su tenant.
+- **Date:** 2026-10-13 (ART) · **Previous version:** 0.1.63 · **Commit:** `f8c73c5` (FINDINGS
+  A-61, A-62). A single adversarial review: one MAJOR (the factory reset) and six minor, all
+  fixed before the build.
+- **Scope:** motherbee + the three spokes (core-update).
+- **What changed:**
+  - **SY.vault, for every caller:**
+    - a put of a key from another tenant is `KEY_TAKEN` and never moves it;
+    - delete, rotate and roll back carry `tenant_id`, and a key from another tenant answers
+      `KEY_NOT_FOUND`, with the same text as a nonexistent one;
+    - the admin sets the root if none comes, accepts `?tenant_id=` over HTTP and has the field in Archi's
+      plans;
+    - the orchestrator and the factory reset delete each key in its tenant.
   - **SY.identity:**
-    - ILK_GET con tenant;
-    - `update_tenant` rechaza el raíz y un nombre o dominio de otro tenant, y valida todo antes de
-      cambiar nada.
+    - ILK_GET with tenant;
+    - `update_tenant` rejects the root and a name or domain from another tenant, and validates everything
+      before changing anything.
   - **IO.cloud:**
-    - la regla 3: el tenant va solo en la raíz del sobre, nunca es el raíz, y todo es de ese tenant;
-    - `list_tokens`, `delete_token` y `update_tenant`;
-    - todo error con `error_code`.
+    - rule 3: the tenant goes only in the envelope's root, it is never the root tenant, and everything belongs to that tenant;
+    - `list_tokens`, `delete_token` and `update_tenant`;
+    - every error with `error_code`.
 
-    SY.admin lo vuelve a exigir del lado del servidor. Archi y la limpieza de un nodo conservan sus
-    acciones por la malla.
-  - **Contrato:** `docs/io-cloud-api.md` reescrito.
+    SY.admin enforces it again on the server side. Archi and a node's cleanup keep their
+    actions over the mesh.
+  - **Contract:** `docs/io-cloud-api.md` rewritten.
 - **Deploy:**
-  - build `f8c73c5` en 28,5 min (tocó el SDK);
-  - publish en 12 s;
-  - deploy en 233 s;
-  - snapshots `pre-cloud-0-1-64` en las 4 VMs (se borró `pre-ssh-0-1-61`);
-  - versiones 0.1.64 con el mismo manifest en los 4, health `failed=0`, OPA `in_sync` 4/4.
-- **Antes del deploy:** en 30 días PROD no tuvo tráfico real de Cloud, solo los e2e del 2026-09-28
-  y sondas. El cambio de contrato (el tenant de las lecturas pasa a la raíz del sobre) no rompió a
-  nadie en PROD. El hive de DEV del equipo de Cloud tiene que coordinarse antes de pasar a 0.1.64.
+  - build `f8c73c5` in 28.5 min (it touched the SDK);
+  - publish in 12 s;
+  - deploy in 233 s;
+  - snapshots `pre-cloud-0-1-64` on all 4 VMs (`pre-ssh-0-1-61` was deleted);
+  - versions 0.1.64 with the same manifest on all 4, health `failed=0`, OPA `in_sync` 4/4.
+- **Before the deploy:** in 30 days PROD had no real Cloud traffic, only the e2e runs of 2026-09-28
+  and probes. The contract change (the reads' tenant moves to the envelope's root) broke
+  nobody in PROD. The Cloud team's DEV hive has to coordinate before moving to 0.1.64.
 - **Gate:**
-  - **Por la puerta pública real, desde afuera, con el bearer de Cloud:** 53 controles, todos PASS.
-    - El catálogo ofrece 16 operaciones.
-    - Regla 3: el tenant en `params`, el raíz y una grafía en mayúsculas son rechazados; sin tenant
-      hay error con código.
-    - Credenciales: put de A; la misma clave desde B es `KEY_TAKEN`, también con el mismo valor.
-    - Claves reservadas: rechazadas al escribir y al borrar.
-    - `list_tokens`: A ve su clave con la metadata y sin el valor, y B no ve nada.
-    - Borrar desde B la clave de A da `KEY_NOT_FOUND`, con el mismo texto que una inexistente; el
-      borrado propio funciona.
-    - `update_tenant`: el renombre funciona; el nombre y el dominio de B están tomados; el status es
-      del operador; vaciar el dominio funciona; el raíz está protegido.
-    - Una persona en A: B no la ve ni por id ni por email; el primer login por email la encuentra en
+  - **Through the real public door, from outside, with Cloud's bearer:** 53 checks, all PASS.
+    - The catalog offers 16 operations.
+    - Rule 3: the tenant in `params`, the root and an uppercase spelling are rejected; without a tenant
+      there is an error with a code.
+    - Credentials: put from A; the same key from B is `KEY_TAKEN`, also with the same value.
+    - Reserved keys: rejected on write and on delete.
+    - `list_tokens`: A sees its key with the metadata and without the value, and B sees nothing.
+    - Deleting A's key from B gives `KEY_NOT_FOUND`, with the same text as a nonexistent one; its
+      own deletion works.
+    - `update_tenant`: the rename works; B's name and domain are taken; the status belongs
+      to the operator; emptying the domain works; the root is protected.
+    - A person in A: B does not see them by id or by email; the first login by email finds them in
       A.
-    - `delete_ilk` desde B da `ILK_TENANT_MISMATCH`.
-    - Nodos: `provision_node` en el raíz está protegido; un nodo en A con un token propio funciona.
-  - **Del lado del operador:**
-    - matar el nodo con purga borró su secreto del tenant A;
-    - `DELETE` por HTTP sin tenant da 404 para una clave de A, y con `?tenant_id=` la borra;
-    - la misma clave del raíz desde A da 409 `KEY_TAKEN`;
-    - Archi corrió por la malla `vault_list` y `get_ilk`. Antes de esta versión, `get_ilk` le
-      quedaba rechazado.
-- **Limpieza:** los dos tenants marcados por Cloud y purgados por el operador (con la persona), el
-  nodo purgado, las dos sesiones de Archi borradas. El vault quedó en sus 4 claves de
-  infraestructura.
-- **Visto de paso (menor, sin arreglar):** `GET` de un tenant purgado contesta 500
-  `TENANT_NOT_FOUND`; el código no está en el mapa de 404 del admin HTTP.
+    - `delete_ilk` from B gives `ILK_TENANT_MISMATCH`.
+    - Nodes: `provision_node` in the root is protected; a node in A with its own token works.
+  - **From the operator's side:**
+    - killing the node with purge deleted its secret from tenant A;
+    - `DELETE` over HTTP without a tenant gives 404 for a key of A, and with `?tenant_id=` it deletes it;
+    - the same root key from A gives 409 `KEY_TAKEN`;
+    - Archi ran `vault_list` and `get_ilk` over the mesh. Before this version, `get_ilk` was
+      rejected for it.
+- **Cleanup:** the two tenants marked by Cloud and purged by the operator (with the person), the
+  node purged, the two Archi sessions deleted. The vault was left with its 4 infrastructure
+  keys.
+- **Seen in passing (minor, not fixed):** `GET` of a purged tenant answers 500
+  `TENANT_NOT_FOUND`; the code is not in the admin HTTP's 404 map.
 - **Rollback:**
-  - snapshot `pre-cloud-0-1-64`, o `apt install fluxbee=0.1.63`;
-  - no hay migración de datos: los registros del vault no cambiaron de forma.
+  - snapshot `pre-cloud-0-1-64`, or `apt install fluxbee=0.1.63`;
+  - there is no data migration: the vault's records did not change shape.
 
-## 0.1.63 — Syncthing corre como `fluxbee` en todos los hosts (A-58); los blobs se escriben y se leen por descriptor y toman el dueño de su carpeta (A-56)
+## 0.1.63 — Syncthing runs as `fluxbee` on every host (A-58); blobs are written and read by descriptor and take the owner of their folder (A-56)
 
-- **Fecha:** 2026-10-06 (ART) · **Versión anterior:** 0.1.62 · **Commits:** `02f7fdb`, `506151c`,
+- **Date:** 2026-10-06 (ART) · **Previous version:** 0.1.62 · **Commits:** `02f7fdb`, `506151c`,
   `aab0e3e` (FINDINGS A-56, A-58, A-60).
-- **Revisión:** dos revisiones adversariales (SDK/io.blob y orquestador), dos rondas cada una. Los
-  números de los arneses están en A-56.
-- **Alcance:** motherbee + los tres spokes (core-update).
-- **Qué cambió:**
-  - **Syncthing como `fluxbee`:**
-    - el orquestador crea el usuario `fluxbee` en cada host, y Syncthing corre siempre con él;
-    - en worker1 y egress1 el cambio es un paso único y visible: para, traspasa sus árboles y
-      arranca.
-  - **Dueños de `blob/`:**
-    - `blob/` es root:fluxbee;
-    - staging y `agent-assets` son de root;
-    - `active/` y `public/` son de `fluxbee`.
-  - **SDK e io.blob:** escriben por descriptor y le entregan cada blob al dueño de su carpeta. Los
-    lectores usan `read_blob`, que verifica tamaño y hash. ai.generic verifica el hash de cada asset.
-  - **Postinst:** se fue el `chown -R`, que tapaba el problema.
+- **Review:** two adversarial reviews (SDK/io.blob and orchestrator), two rounds each. The
+  harness numbers are in A-56.
+- **Scope:** motherbee + the three spokes (core-update).
+- **What changed:**
+  - **Syncthing as `fluxbee`:**
+    - the orchestrator creates the `fluxbee` user on each host, and Syncthing always runs as it;
+    - on worker1 and egress1 the change is a one-time, visible step: it stops, hands over its trees and
+      starts.
+  - **Owners of `blob/`:**
+    - `blob/` is root:fluxbee;
+    - staging and `agent-assets` belong to root;
+    - `active/` and `public/` belong to `fluxbee`.
+  - **SDK and io.blob:** write by descriptor and hand each blob over to the owner of its folder. The
+    readers use `read_blob`, which verifies size and hash. ai.generic verifies the hash of each asset.
+  - **Postinst:** the `chown -R`, which hid the problem, is gone.
 - **Deploy:**
-  - build `aab0e3e` en 21 min, publish 10 s, deploy 193 s;
-  - snapshots `pre-a58-0-1-63` en las 4 VMs (se borró `pre-hardening-0-1-60`);
-  - versiones 0.1.63 en los 4, health `failed=0`, OPA `in_sync` 4/4.
+  - build `aab0e3e` in 21 min, publish 10 s, deploy 193 s;
+  - snapshots `pre-a58-0-1-63` on all 4 VMs (`pre-hardening-0-1-60` was deleted);
+  - versions 0.1.63 on all 4, health `failed=0`, OPA `in_sync` 4/4.
 - **Gate A-58:**
-  - worker1 y egress1 crearon el usuario `fluxbee`;
-  - su Syncthing quedó con unit y proceso `fluxbee` desde las 01:29:27 y 01:29:22, y la alerta
-    `syncthing_user_switched` salió recién con el servicio sano;
-  - home, `active/` (worker1) y dist pasaron a `fluxbee`;
-  - el motherbee y el ingress no se reiniciaron (Syncthing arriba desde antes del deploy);
-  - todas las carpetas de los 4 hosts quedaron `idle` y sin errores.
+  - worker1 and egress1 created the `fluxbee` user;
+  - their Syncthing ended up with a `fluxbee` unit and process since 01:29:27 and 01:29:22, and the
+    `syncthing_user_switched` alert came out only once the service was healthy;
+  - home, `active/` (worker1) and dist moved to `fluxbee`;
+  - the motherbee and the ingress were not restarted (Syncthing up since before the deploy);
+  - every folder on the 4 hosts ended up `idle` and without errors.
 - **Gate A-56:**
   - Motherbee:
-    - `blob/` pasó a root:fluxbee 0750;
-    - staging (10 entradas) y `agent-assets` (5) pasaron a root;
-    - `active/` y `public/` sin entradas ajenas.
-  - Ingress: el traspaso del arranque pasó el `.stfolder` de root, con la alerta
-    `blob_entries_handed_over:public` (1 entrada).
-  - Prueba concreta con `blob_sync_diag` compilado del mismo commit:
-    - un blob escrito como root con el SDK nuevo quedó `fluxbee:fluxbee 0640` (prefijo 0750),
-      tanto en worker1 como en el motherbee;
-    - llegó al otro lado en ~12 s y ~10 s, con el mismo hash;
-    - con 0.1.62, el del motherbee habría quedado ilegible para su Syncthing hasta la próxima
-      instalación;
-    - después se borraron los dos blobs (el borrado llegó a worker1 en ~12 s) y el binario.
+    - `blob/` moved to root:fluxbee 0750;
+    - staging (10 entries) and `agent-assets` (5) moved to root;
+    - `active/` and `public/` without foreign entries.
+  - Ingress: the startup handover transferred root's `.stfolder`, with the alert
+    `blob_entries_handed_over:public` (1 entry).
+  - A concrete test with `blob_sync_diag` built from the same commit:
+    - a blob written as root with the new SDK ended up `fluxbee:fluxbee 0640` (prefix 0750),
+      both on worker1 and on the motherbee;
+    - it reached the other side in ~12 s and ~10 s, with the same hash;
+    - with 0.1.62, the motherbee's would have stayed unreadable for its Syncthing until the next
+      install;
+    - afterwards the two blobs (the deletion reached worker1 in ~12 s) and the binary were deleted.
 - **Rollback:**
-  - snapshot `pre-a58-0-1-63`, o `apt install fluxbee=0.1.62`;
-  - en un worker que produzca blobs, volver Syncthing a root como dice el HANDBOOK ("El
+  - snapshot `pre-a58-0-1-63`, or `apt install fluxbee=0.1.62`;
+  - on a worker that produces blobs, move Syncthing back to root as the HANDBOOK says ("The
     rollback").
 
-## 0.1.62 — La réplica de identity ya no cuelga detrás de un firewall (P7-1, A-59); Syncthing vuelve a su binario nuevo (A-57); seguimiento de D32
+## 0.1.62 — The identity replica no longer hangs behind a firewall (P7-1, A-59); Syncthing comes back on its new binary (A-57); D32 follow-up
 
-- **Fecha:** 2026-10-06 (ART) · **Versión anterior:** 0.1.61 · **Commits:** `b6435cf`, `c7c7d6d`,
-  `b4868e8` (FINDINGS A-59, A-57, A-54). Tres revisiones adversariales (identity, orquestador, docs),
-  más una segunda sobre el arreglo de la carrera de identity.
-- **Alcance:** motherbee + los tres spokes (core-update).
-- **Qué cambió:**
+- **Date:** 2026-10-06 (ART) · **Previous version:** 0.1.61 · **Commits:** `b6435cf`, `c7c7d6d`,
+  `b4868e8` (FINDINGS A-59, A-57, A-54). Three adversarial reviews (identity, orchestrator, docs),
+  plus a second one on the fix for the identity race.
+- **Scope:** motherbee + the three spokes (core-update).
+- **What changed:**
   - **sy-identity:**
-    - el primario manda un latido en la suscripción cada 20 s sin tráfico;
-    - la réplica corta y se vuelve a suscribir tras 60 s sin oír nada;
-    - el suscriptor se registra antes de contestar y antes de cada snapshot, así un delta ya no se
-      pierde entre el snapshot y el stream;
-    - las suscripciones muertas se limpian al registrar una nueva.
-  - **Orquestador:**
-    - Syncthing se reinicia si cambió su binario o su unit, o si su proceso corre un binario borrado;
-    - el update de vendor responde lo que hizo de verdad;
-    - el join emite el leaf antes del primer SSH;
-    - el revoke borra la llave vieja de recuperación solo por su comentario;
-    - el test de guardia de SSH es más estricto;
-    - un worker sin vendor falla el join, como ya pasaba en egress e ingress.
-  - **Docs:** deriva corregida.
-- **Deploy:** build `b4868e8` en 8 min, publish 9 s, deploy 201 s. Snapshots `pre-identity-0-1-62` en
-  las 4 VMs (se borró `pre-stage3-0-1-59`). Versiones 0.1.62 en los 4, health `failed=0`.
+    - the primary sends a heartbeat on the subscription every 20 s without traffic;
+    - the replica cuts and resubscribes after 60 s without hearing anything;
+    - the subscriber is registered before answering and before each snapshot, so a delta is no longer
+      lost between the snapshot and the stream;
+    - dead subscriptions are cleaned up when a new one is registered.
+  - **Orchestrator:**
+    - Syncthing restarts if its binary or its unit changed, or if its process runs a deleted binary;
+    - the vendor update answers what it really did;
+    - the join issues the leaf before the first SSH;
+    - the revoke deletes the old recovery key only by its comment;
+    - the SSH guard test is stricter;
+    - a worker without vendor fails the join, as already happened on egress and ingress.
+  - **Docs:** drift corrected.
+- **Deploy:** build `b4868e8` in 8 min, publish 9 s, deploy 201 s. Snapshots `pre-identity-0-1-62` on
+  all 4 VMs (`pre-stage3-0-1-59` was deleted). Versions 0.1.62 on all 4, health `failed=0`.
 - **Gate A-59 (P7-1):**
-  - Antes (0.1.61), en worker1: la suscripción llevaba 15.929 s sin un paquete en ninguna dirección.
-  - Después: tres muestras de `lastrcv` en la suscripción dieron 8 s, 3 s y 18,5 s, con `lastsnd`
-    creciendo porque no envía. El canal de publicación sigue su ciclo de 30 s.
-  - Corte de 100 s en worker1, con una tabla nft de prueba que descarta lo que llega de
-    10.10.10.10:9100 y un temporizador que la borra igual:
-    - 60 s después del último latido, la réplica dijo "no frame from the primary for 60s
+  - Before (0.1.61), on worker1: the subscription had gone 15,929 s without a packet in either direction.
+  - After: three samples of `lastrcv` on the subscription gave 8 s, 3 s and 18.5 s, with `lastsnd`
+    growing because it does not send. The publishing channel keeps its 30 s cycle.
+  - A 100 s cut on worker1, with a test nft table that drops what comes from
+    10.10.10.10:9100 and a timer that deletes it anyway:
+    - 60 s after the last heartbeat, the replica said "no frame from the primary for 60s
       (heartbeats stopped); resubscribing";
-    - 5 s después de levantar el corte, "identity full sync applied (delta stream subscribed)";
-    - la tabla quedó borrada.
+    - 5 s after lifting the cut, "identity full sync applied (delta stream subscribed)";
+    - the table ended up deleted.
 - **Gate A-57:**
-  - Ningún host corría un Syncthing con el binario borrado, y ninguno lo reinició al arrancar el
-    orquestador nuevo.
-  - `update category=vendor` a worker1, con el mismo binario 2.0.14, respondió `unchanged: [syncthing]`
-    y `restarted: []`. Antes decía `restarted` sin haber reiniciado.
-  - El camino con binario nuevo lo ejercita el próximo vendor que cambie.
-  - **El reinicio, con una prueba concreta en worker1:**
-    - Se instaló una copia idéntica del binario con otro inode. El Syncthing en marcha (pid 2507959,
-      arriba desde las 10:21) pasó a correr un archivo `(deleted)` con los mismos bytes: es el caso
-      del reinicio perdido de la revisión.
-    - El primer `update category=vendor` respondió `unchanged: [syncthing]` y
-      `restarted: [fluxbee-syncthing]`. El log dice "restarting syncthing onto its installed binary
-      and unit (A-57)": pid nuevo y sano 4 s después.
-    - El segundo respondió `restarted: []`, sin bucle.
-- **Gate del join (la VM 104 re-clonada):**
-  - Se borró y se clonó del template. `add_hive worker2` se lanzó a las 22:50:38, con la caja todavía
-    en `starting`.
-  - El join esperó en `waiting_for_host` de 22:51:09 a 22:59:35 (cloud-final) y terminó
-    `connected` a las 23:01:39.
-  - Resultado: `harden_ssh_applied`, `restrict_ssh` `from_only`, `ssh_bootstrap_revoked`, WAN,
-    orquestador y dist listos, y el peer de Syncthing enlazado. Ese join ejercitó el leaf emitido
-    antes del primer SSH y el envío de vendor que ahora es fatal.
-  - En la caja:
-    - password apagado;
-    - en `authorized_keys` solo quedó la llave descartable del operador;
-    - el sudoers del orquestador se borró;
-    - estaba el material TLS;
-    - en el journal de sshd, las sesiones desde 10.10.10.10 caen solo dentro del join (22:50:44 a
+  - No host was running a Syncthing with the deleted binary, and none restarted it when the new
+    orchestrator started.
+  - `update category=vendor` to worker1, with the same binary 2.0.14, answered `unchanged: [syncthing]`
+    and `restarted: []`. Before, it said `restarted` without having restarted.
+  - The path with a new binary will be exercised by the next vendor that changes.
+  - **The restart, with a concrete test on worker1:**
+    - An identical copy of the binary was installed with another inode. The running Syncthing (pid 2507959,
+      up since 10:21) went on to run a `(deleted)` file with the same bytes: this is the review's case
+      of the missed restart.
+    - The first `update category=vendor` answered `unchanged: [syncthing]` and
+      `restarted: [fluxbee-syncthing]`. The log says "restarting syncthing onto its installed binary
+      and unit (A-57)": a new, healthy pid 4 s later.
+    - The second answered `restarted: []`, with no loop.
+- **Join gate (VM 104 re-cloned):**
+  - It was deleted and cloned from the template. `add_hive worker2` was launched at 22:50:38, with the box still
+    in `starting`.
+  - The join waited in `waiting_for_host` from 22:51:09 to 22:59:35 (cloud-final) and ended
+    `connected` at 23:01:39.
+  - Result: `harden_ssh_applied`, `restrict_ssh` `from_only`, `ssh_bootstrap_revoked`, WAN,
+    orchestrator and dist ready, and the Syncthing peer linked. That join exercised the leaf issued
+    before the first SSH and the vendor push that is now fatal.
+  - On the box:
+    - password off;
+    - only the operator's throwaway key was left in `authorized_keys`;
+    - the orchestrator's sudoers was deleted;
+    - the TLS material was there;
+    - in sshd's journal, the sessions from 10.10.10.10 fall only within the join (22:50:44 to
       23:01:27);
-    - la suscripción de identity recibía latidos (`lastrcv` 14,8 s);
-    - todos los componentes en 0.1.62.
-  - Limpieza: llave descartable borrada, `DELETE /hives/worker2` ok por socket, VM 104 apagada.
-  - Visto de paso: Syncthing corre como root también en este worker nuevo (A-58, va en 0.1.63).
-- **Cierre:** `ops.py health` en `failed=0` desde el deploy, y OPA `in_sync` 4/4.
+    - the identity subscription was getting heartbeats (`lastrcv` 14.8 s);
+    - every component on 0.1.62.
+  - Cleanup: throwaway key deleted, `DELETE /hives/worker2` ok over the socket, VM 104 powered off.
+  - Seen in passing: Syncthing runs as root on this new worker too (A-58, goes in 0.1.63).
+- **Closure:** `ops.py health` at `failed=0` since the deploy, and OPA `in_sync` 4/4.
 - **Rollback:**
-  - Snapshot `pre-identity-0-1-62`, o `apt install fluxbee=0.1.61`.
-  - **Primero los spokes** (`core_rollback` o update al core viejo), después el motherbee: un worker
-    de 0.1.62 frente a un motherbee viejo se re-suscribe cada 60 s (HANDBOOK, "El rollback").
+  - Snapshot `pre-identity-0-1-62`, or `apt install fluxbee=0.1.61`.
+  - **The spokes first** (`core_rollback` or update to the old core), then the motherbee: a worker
+    on 0.1.62 facing an old motherbee resubscribes every 60 s (HANDBOOK, "The rollback").
 
-## 0.1.61 — SSH solo dentro de `add_hive` (D32, A-54)
+## 0.1.61 — SSH only inside `add_hive` (D32, A-54)
 
-- **Fecha:** 2026-10-06 (ART) · **Versión anterior:** 0.1.60 · **Commits:** `31dd105`, `3ae2929`
-  (FINDINGS A-54; dos revisiones adversariales).
-- **Alcance:** motherbee + los tres spokes (core-update).
-- **Qué cambió:** se borraron la reconciliación de TLS por SSH al arrancar y el modo
-  `key_only_persist`; un pedido con `ssh_access` se rechaza; el envío del leaf es fatal para el join
-  (`TLS_PUSH_FAILED`); el revoke borra una llave de recuperación vieja; un test de guardia recorre el
-  código desde cada uso de SSH hasta `accept_add_hive`.
-- **Deploy:** build `e0f2d04`, publish 9 s, deploy 198 s; snapshots `pre-ssh-0-1-61` en las 4 VMs
-  (se borró `pre-stage2-0-1-58`). Versiones 0.1.61 en los 4, health `failed=0`.
-- **Gate D32:** en el journal de sshd de los tres spokes, desde el deploy de 0.1.60 hasta el de 0.1.61,
-  3 intentos de SSH desde 10.10.10.10 por spoke (uno por arranque del orquestador del motherbee, todos
-  fallidos en la autenticación); desde el deploy de 0.1.61, **cero**.
-- **Gate A-52 + D32 con un clon nuevo:** la VM 104 se borró y se clonó otra vez del template;
-  `add_hive worker2` se lanzó apenas respondió el guest agent (17:28:37, systemd `starting`).
-  - El join entró en `waiting_for_host` a las 17:29:43 con cloud-final `activating` (el dist-upgrade
-    del primer arranque) y esperó 8 min; a las 17:37:38 la caja quedó `running` y el join siguió.
-  - Terminó `connected` a las 17:39:42: `harden_ssh_applied`, `restrict_ssh`,
-    `ssh_bootstrap_revoked`, WAN, orquestador y dist listos; sin `ssh_access` ni
-    `spoke_key_vault_ref` en el resultado.
-  - Syncthing: dirección estática del motherbee a los 70 s (17:40:38) y opciones de la etapa 3; el
-    `posture-check --stage 3` de worker2 da ok (el chequeo "un join da `Static`", movido desde la
-    etapa 2, queda hecho).
-  - Limpieza: llave descartable borrada (password auth `no`), `DELETE /hives/worker2` ok por socket,
-    VM 104 apagada.
+- **Date:** 2026-10-06 (ART) · **Previous version:** 0.1.60 · **Commits:** `31dd105`, `3ae2929`
+  (FINDINGS A-54; two adversarial reviews).
+- **Scope:** motherbee + the three spokes (core-update).
+- **What changed:** the TLS reconciliation over SSH at startup and the
+  `key_only_persist` mode were deleted; a request with `ssh_access` is rejected; the leaf push is fatal for the join
+  (`TLS_PUSH_FAILED`); the revoke deletes an old recovery key; a guard test walks the
+  code from each use of SSH up to `accept_add_hive`.
+- **Deploy:** build `e0f2d04`, publish 9 s, deploy 198 s; snapshots `pre-ssh-0-1-61` on all 4 VMs
+  (`pre-stage2-0-1-58` was deleted). Versions 0.1.61 on all 4, health `failed=0`.
+- **Gate D32:** in sshd's journal on the three spokes, from the 0.1.60 deploy to the 0.1.61 one,
+  3 SSH attempts from 10.10.10.10 per spoke (one per start of the motherbee's orchestrator, all
+  failed at authentication); since the 0.1.61 deploy, **zero**.
+- **Gate A-52 + D32 with a new clone:** VM 104 was deleted and cloned again from the template;
+  `add_hive worker2` was launched as soon as the guest agent answered (17:28:37, systemd `starting`).
+  - The join entered `waiting_for_host` at 17:29:43 with cloud-final `activating` (the dist-upgrade
+    of the first boot) and waited 8 min; at 17:37:38 the box went `running` and the join went on.
+  - It ended `connected` at 17:39:42: `harden_ssh_applied`, `restrict_ssh`,
+    `ssh_bootstrap_revoked`, WAN, orchestrator and dist ready; without `ssh_access` or
+    `spoke_key_vault_ref` in the result.
+  - Syncthing: the motherbee's static address at 70 s (17:40:38) and the stage 3 options; worker2's
+    `posture-check --stage 3` gives ok (the check "a join gives `Static`", moved from
+    stage 2, is done).
+  - Cleanup: throwaway key deleted (password auth `no`), `DELETE /hives/worker2` ok over the socket,
+    VM 104 powered off.
 
-## 0.1.60 — Escrituras de root en árboles de `fluxbee`; el join espera a que la caja se asiente (A-51, A-52)
+## 0.1.60 — Root writes in `fluxbee` trees; the join waits for the box to settle (A-51, A-52)
 
-- **Fecha:** 2026-10-06 (ART) · **Versión anterior:** 0.1.59 · **Commits:** `d3710c4`..`05ac354`,
-  merge `0af5469` (FINDINGS A-51, A-52; tres revisiones adversariales).
-- **Alcance:** motherbee + los tres spokes (core-update).
-- **Qué cambió:**
-  - **El `dist/` del motherbee es de root** y Syncthing solo lo lee (`root:fluxbee`, 0750,
-    `g+rX,go-w`); los links adentro se borran. Lo hacen el preinst (antes del unpack) y el orquestador
-    en cada arranque. `blob/`, el home de Syncthing y el `dist/` de los spokes no cambian.
-  - Escrituras de root: temporal `O_EXCL` con token por ejecución y prefijo `.syncthing.`, modo sobre
-    el descriptor; directorios administrados abiertos `O_NOFOLLOW` (lo que no es un directorio se deja
-    y se reporta, sin tumbar el arranque); el marcador `.stfolder` nunca sigue un symlink.
-  - Los joins esperan, antes del sudoers, a que systemd termine de arrancar y a que no corra una etapa
-    de cloud-init ni un job diario de apt (hasta 15 min; fase `waiting_for_host`; `HOST_NOT_SETTLED`).
+- **Date:** 2026-10-06 (ART) · **Previous version:** 0.1.59 · **Commits:** `d3710c4`..`05ac354`,
+  merge `0af5469` (FINDINGS A-51, A-52; three adversarial reviews).
+- **Scope:** motherbee + the three spokes (core-update).
+- **What changed:**
+  - **The motherbee's `dist/` belongs to root** and Syncthing only reads it (`root:fluxbee`, 0750,
+    `g+rX,go-w`); the links inside are deleted. The preinst (before the unpack) and the orchestrator
+    (on every startup) do it. `blob/`, Syncthing's home and the spokes' `dist/` do not change.
+  - Root writes: an `O_EXCL` temporary with a per-run token and a `.syncthing.` prefix, mode set on
+    the descriptor; managed directories opened `O_NOFOLLOW` (what is not a directory is left alone
+    and reported, without bringing down the startup); the `.stfolder` marker never follows a symlink.
+  - The joins wait, before the sudoers, for systemd to finish starting and for no cloud-init stage
+    or daily apt job to be running (up to 15 min; phase `waiting_for_host`; `HOST_NOT_SETTLED`).
 - **Deploy:** build 8 min (`0af5469`), publish 12 s, deploy 192 s; snapshots `pre-hardening-0-1-60`
-  en las 4 VMs (se borró `pre-posture-0-1-57`). Los spokes recibieron el core por Syncthing desde el
-  `dist/` ya de root: la distribución funciona.
+  on all 4 VMs (`pre-posture-0-1-57` was deleted). The spokes received the core through Syncthing from the
+  `dist/` that already belonged to root: the distribution works.
 - **Gate:**
-  - Motherbee: `dist/` `root:fluxbee 750`, las 107 entradas `root:fluxbee`, 0 links, 0 temporales;
-    `blob/*` y `syncthing/` de `fluxbee`; sin errores de Syncthing ni del orquestador.
-  - Spokes sin cambios de dueño; `posture-check --stage 3` ok en los 4; OPA in_sync 4/4; versiones
-    0.1.60 en los 4; health `failed=0`.
-  - A-52 validado con el join de 0.1.61 (clon nuevo, ver arriba).
-- **Incidente durante la verificación (mío, resuelto):** un script de verificación corrió
-  `sy-orchestrator --version` y `rt-gateway --version` en el motherbee; esos binarios no tienen
-  `--version` y arrancaron como segundas instancias.
-  - El orquestador de más (~11 min) fue rechazado por el router (UUID ya conectado) y pisó el PID.
-  - El router de más (~84 s) recreó los archivos de socket; al matarlo, los paths quedaron muertos
-    (los nodos conectados siguieron; uno que se reiniciara no habría podido volver).
-  - Arreglo: matar solo esos procesos y reiniciar `rt-gateway` y `sy-orchestrator`. Después: sockets
-    ok, PID ok, health `failed=0` en los 4, 15 nodos activos, OPA 4/4, `--stage 3` ok.
-  - Regla: una verificación nunca ejecuta binarios del producto; las versiones salen de `/versions` o
+  - Motherbee: `dist/` `root:fluxbee 750`, the 107 entries `root:fluxbee`, 0 links, 0 temporaries;
+    `blob/*` and `syncthing/` owned by `fluxbee`; no errors from Syncthing or the orchestrator.
+  - Spokes without owner changes; `posture-check --stage 3` ok on all 4; OPA in_sync 4/4; versions
+    0.1.60 on all 4; health `failed=0`.
+  - A-52 validated with the 0.1.61 join (new clone, see above).
+- **Incident during the verification (mine, resolved):** a verification script ran
+  `sy-orchestrator --version` and `rt-gateway --version` on the motherbee; those binaries have no
+  `--version` and started as second instances.
+  - The extra orchestrator (~11 min) was rejected by the router (UUID already connected) and overwrote the PID.
+  - The extra router (~84 s) recreated the socket files; when it was killed, the paths were left dead
+    (the connected nodes went on; one that restarted would not have been able to come back).
+  - Fix: kill only those processes and restart `rt-gateway` and `sy-orchestrator`. Afterwards: sockets
+    ok, PID ok, health `failed=0` on all 4, 15 active nodes, OPA 4/4, `--stage 3` ok.
+  - Rule: a verification never runs product binaries; the versions come from `/versions` or
     `dpkg-query`.
-- **Visto:** en worker1 y egress1 no existe el usuario `fluxbee`: Syncthing corre como root (A-58).
+- **Seen:** on worker1 and egress1 the `fluxbee` user does not exist: Syncthing runs as root (A-58).
 
-## 0.1.59 — Syncthing sin infraestructura pública (etapa 3 de la postura)
+## 0.1.59 — Syncthing without public infrastructure (stage 3 of the posture)
 
-- **Fecha:** 2026-10-06 (ART) · **Versión anterior:** 0.1.58 · **Commits:** `d55ab73`..`f60eb92`
-  (FINDINGS A-47; bitácora `2026-10-06`; diseño `docs/host-posture-and-exposure-spec-v1.md` §3.5,
+- **Date:** 2026-10-06 (ART) · **Previous version:** 0.1.58 · **Commits:** `d55ab73`..`f60eb92`
+  (FINDINGS A-47; logbook `2026-10-06`; design `docs/host-posture-and-exposure-spec-v1.md` §3.5,
   "Options (stage 3) — as built").
-- **Alcance:** motherbee + los tres spokes (core-update); `worker2` (VM 104) saltó de 0.1.57 a
-  0.1.59 en la prueba del gate.
-- **Qué cambió:**
-  - **El orquestador es dueño de las opciones de Syncthing:** sin announce global ni local, sin
-    relays, NAT, STUN, reportes de uso ni de crashes, sin auto-upgrade; reconexión cada 10 s; un
-    solo listen (el motherbee `tcp://:22000`, los spokes `tcp://127.0.0.1:22000`). Con eso
-    Syncthing no abre ningún socket UDP.
-  - **El cambio es de una sola vía y ordenado en el código:** cada spoke cambia cuando tiene al
-    motherbee en dirección fija y alcanzable (hechos persistidos en
-    `/var/lib/fluxbee/orchestrator/syncthing-posture.json` y publicados en `/versions`); el
-    motherbee, cuando todos los spokes registrados lo reportan, y mientras tanto nombra a quién
-    espera.
-  - **Joins protegidos:** mientras corre un `ADD_HIVE_FINALIZE`, el spoke no reinicia Syncthing, y
-    el sondeo de convergencia aguanta un reinicio.
-  - Dos revisiones adversariales del código antes del release.
-- **Build:** 6,5 min (commit `f60eb92`). **CI:** `rust-tests`, `posture-guards` y
-  `router-dispatcher-guards` en verde. **Publish:** 9 s, 59 paquetes. **Deploy:** 198 s con
-  `ops deploy`; snapshots `pre-stage3-0-1-59` en las 4 VMs (se borró antes `pre-root-io-0-1-56`).
-- **Verificación en vivo (gate de la etapa 3):**
-  - **Spokes de PROD:** cambiaron solos a los ~3 min del deploy (ingress1 10:21:19, egress1
-    10:21:26, worker1 10:21:30 UTC), con un reinicio de Syncthing cada uno.
-  - **El motherbee esperó a `worker2`**, nombrándolo en su journal ("no answer: … not reachable
-    in LSA"), con discovery prendido.
-  - **Salteo de versiones:** `worker2`, apagada desde 0.1.57 con `dynamic` de los dos lados,
-    arrancó, se conectó por discovery, recibió el core nuevo y se actualizó de 0.1.57 a 0.1.59 de
-    una (10:24:40). Su primer round puso al motherbee en dirección fija y cambió las opciones. El
-    motherbee registró el cambio en su siguiente sondeo (10:24:54) y el watchdog escribió sus
-    opciones y reinició Syncthing una vez (10:25:52).
-  - **`lab/posture-check.py -- --stage 3`:** `verdict ok` en los 5 hives: opciones exactas,
-    discovery apagado, ningún socket UDP de Syncthing, el motherbee escuchando en `*:22000`, los
-    spokes en `127.0.0.1:22000`, todos conectados al motherbee por `tcp://10.10.10.10:22000`,
+- **Scope:** motherbee + the three spokes (core-update); `worker2` (VM 104) jumped from 0.1.57 to
+  0.1.59 in the gate test.
+- **What changed:**
+  - **The orchestrator owns Syncthing's options:** no global or local announce, no
+    relays, NAT, STUN, usage or crash reports, no auto-upgrade; reconnection every 10 s; a
+    single listen (the motherbee `tcp://:22000`, the spokes `tcp://127.0.0.1:22000`). With that,
+    Syncthing opens no UDP socket.
+  - **The change is one-way and ordered in the code:** each spoke switches when it has the
+    motherbee at a fixed, reachable address (facts persisted in
+    `/var/lib/fluxbee/orchestrator/syncthing-posture.json` and published in `/versions`); the
+    motherbee, when every registered spoke reports it, and meanwhile it names whom it is
+    waiting for.
+  - **Protected joins:** while an `ADD_HIVE_FINALIZE` runs, the spoke does not restart Syncthing, and
+    the convergence poll tolerates a restart.
+  - Two adversarial code reviews before the release.
+- **Build:** 6.5 min (commit `f60eb92`). **CI:** `rust-tests`, `posture-guards` and
+  `router-dispatcher-guards` green. **Publish:** 9 s, 59 packages. **Deploy:** 198 s with
+  `ops deploy`; snapshots `pre-stage3-0-1-59` on all 4 VMs (`pre-root-io-0-1-56` was deleted first).
+- **Live verification (stage 3 gate):**
+  - **PROD spokes:** switched on their own ~3 min after the deploy (ingress1 10:21:19, egress1
+    10:21:26, worker1 10:21:30 UTC), with one Syncthing restart each.
+  - **The motherbee waited for `worker2`**, naming it in its journal ("no answer: … not reachable
+    in LSA"), with discovery on.
+  - **Version skipping:** `worker2`, powered off since 0.1.57 with `dynamic` on both sides,
+    started, connected through discovery, received the new core and updated from 0.1.57 to 0.1.59 in
+    one go (10:24:40). Its first round put the motherbee at a fixed address and changed the options. The
+    motherbee registered the change on its next poll (10:24:54) and the watchdog wrote its
+    options and restarted Syncthing once (10:25:52).
+  - **`lab/posture-check.py -- --stage 3`:** `verdict ok` on the 5 hives: exact options,
+    discovery off, no Syncthing UDP socket, the motherbee listening on `*:22000`, the
+    spokes on `127.0.0.1:22000`, all connected to the motherbee via `tcp://10.10.10.10:22000`,
     completion 100%.
-  - **Reconexión:** tras reiniciar el Syncthing del motherbee, los 4 spokes volvieron en 10,5 s.
-  - **Publicación de dist:** un archivo de prueba en `dist/vendor` llegó a los 4 spokes en ~1 s
-    después del scan, y su borrado en ~3 s.
-  - **OPA** `in_sync` 4/4; **health** desde las 10:18 UTC: 0 unidades caídas, 0 denegaciones, 0
-    descartes de origen; `ops versions`: los 5 en 0.1.59, manifest `d0803b54ab5caf58`.
-  - **Sin loop de reinicios:** el uptime de Syncthing crece en tres muestras cada ~130 s en los 5
-    (motherbee 69 → 203 → 331 s; worker2 218 → 348 → 480 s; el resto igual).
-- **Rollback:** `apt install fluxbee=0.1.58` en el motherbee + core-update de los spokes, o el
-  snapshot `pre-stage3-0-1-59`. Volver a 0.1.58 no revierte las opciones (nadie las toca) y los
-  links siguen funcionando: los spokes discan fijo.
+  - **Reconnection:** after restarting the motherbee's Syncthing, the 4 spokes came back in 10.5 s.
+  - **Dist publishing:** a test file in `dist/vendor` reached the 4 spokes in ~1 s
+    after the scan, and its deletion in ~3 s.
+  - **OPA** `in_sync` 4/4; **health** since 10:18 UTC: 0 units down, 0 denials, 0
+    origin drops; `ops versions`: all 5 on 0.1.59, manifest `d0803b54ab5caf58`.
+  - **No restart loop:** Syncthing's uptime grows across three samples every ~130 s on all 5
+    (motherbee 69 → 203 → 331 s; worker2 218 → 348 → 480 s; the rest the same).
+- **Rollback:** `apt install fluxbee=0.1.58` on the motherbee + core-update of the spokes, or the
+  snapshot `pre-stage3-0-1-59`. Going back to 0.1.58 does not revert the options (nobody touches them) and the
+  links keep working: the spokes dial a fixed address.
 
-## 0.1.58 — Syncthing: los spokes discan al motherbee y el motherbee solo acepta (etapa 2 de la postura); `blob/active` solo para workers
+## 0.1.58 — Syncthing: the spokes dial the motherbee and the motherbee only accepts (stage 2 of the posture); `blob/active` only for workers
 
-- **Fecha:** 2026-10-06 (ART) · **Versión anterior:** 0.1.57 · **Commits:** `0a35329`..`9d9391b`
-  (FINDINGS A-47, A-50, A-51, A-52, A-53; bitácora `2026-10-06`; diseño
-  `docs/host-posture-and-exposure-spec-v1.md`, revisión 8, §3.5 "as built").
-- **Alcance:** motherbee + los tres spokes (core-update). `worker2` (VM 104), unida hoy en 0.1.57
-  para la prueba de salteo de versiones de la etapa 3, quedó **apagada y afuera del deploy** a
-  propósito.
-- **Qué cambió:**
-  - **Direcciones (A-47, etapa 2):** el watchdog reconcilia cada ~60 s. En cada spoke, el device
-    del motherbee pasa a `tcp://<IP del uplink>:22000`. En el motherbee, los devices de los hives
-    quedan `dynamic` (solo acepta), y su device se identifica por el ID que registra cada entrada.
-    El ID del egress, que nunca se había registrado, se completa por nombre.
-  - **A-50:** el motherbee le compartía `blob/active` al egress. El join solo lo comparte con
-    workers, y la reconciliación saca a cada spoke de las carpetas que su rol no debe tener (regla
-    por rol, nunca por flags). Las carpetas nuevas nacen sin miembros.
-  - **Escritor único de `config.xml`**, endurecido contra el directorio del usuario de Syncthing
-    (sin seguir symlinks, temporal `O_EXCL`, dueño y modo por descriptor). Guard de CI.
-  - **A-53:** el ID local sale de `syncthing device-id` (v2 no tiene `--device-id`).
-  - Huérfanos: se borran solo con el registro completo y todos los hives en reposo y registrados.
-  - Un join de ingress espera 90 s a que el spoke disque.
-  - Cuatro revisiones adversariales del código antes del release.
-- **Build:** 7 min (commit `9d9391b`). **CI:** `rust-tests`, `posture-guards` y
-  `router-dispatcher-guards` en verde. **Publish:** 10 s, 58 paquetes. **Deploy:** 202 s con
-  `ops deploy`; snapshots `pre-stage2-0-1-58` en las 4 VMs (se borró antes `pre-root-tenant-0-1-55`).
-- **Verificación en vivo (gate de la etapa 2):**
-  - **Primer round, como se predijo:** en el motherbee (08:51:10 UTC) ingress1 pasó a `dynamic`,
-    egress1 salió de `fluxbee-blob`, su device ID quedó registrado y Syncthing se reinició **una**
-    vez; en worker1 (08:51:47) el motherbee pasó a `tcp://10.10.10.10:22000`, con un reinicio.
-    ingress1 y egress1 no cambiaron (Syncthing con 461 k segundos arriba).
-  - **`lab/posture-check.py -- --offline worker2`:** `verdict ok` en los 4. Completion 100% en el
-    motherbee para los tres spokes de PROD; la oferta pendiente de `blob/active` desapareció del
-    egress; las 4 entradas del registro tienen device ID.
-  - **Listen:** `default` en los 4, sin cambios. **OPA:** `in_sync` 4/4. **Avisos:** cero líneas
-    WARN de Syncthing en los 4 orquestadores desde el deploy.
-  - **Sin loop de reinicios:** el uptime de Syncthing crece en tres muestras cada ~130 s
-    (motherbee 99 → 228 → 359 s; worker1 64 → 194 → 326 s; ingress1 y egress1 sin reiniciarse).
-  - **Health** desde las 08:48 UTC: 0 unidades caídas, 0 denegaciones, 0 descartes de origen en
-    los 4. `ops versions`: los 4 en 0.1.58, manifest `043d3d6ac6f51896`.
-- **Rollback:** `apt install fluxbee=0.1.57` en el motherbee + core-update de los spokes, o el
-  snapshot `pre-stage2-0-1-58`. Los cambios en `config.xml` (direcciones, membresía del egress) no
-  rompen 0.1.57: no los revierte nadie y siguen siendo correctos.
+- **Date:** 2026-10-06 (ART) · **Previous version:** 0.1.57 · **Commits:** `0a35329`..`9d9391b`
+  (FINDINGS A-47, A-50, A-51, A-52, A-53; logbook `2026-10-06`; design
+  `docs/host-posture-and-exposure-spec-v1.md`, revision 8, §3.5 "as built").
+- **Scope:** motherbee + the three spokes (core-update). `worker2` (VM 104), joined today on 0.1.57
+  for stage 3's version-skipping test, was left **powered off and out of the deploy** on
+  purpose.
+- **What changed:**
+  - **Addresses (A-47, stage 2):** the watchdog reconciles every ~60 s. On each spoke, the motherbee's
+    device moves to `tcp://<uplink IP>:22000`. On the motherbee, the hives' devices
+    stay `dynamic` (it only accepts), and its device is identified by the ID that each entry records.
+    The egress's ID, which had never been registered, is filled in by name.
+  - **A-50:** the motherbee was sharing `blob/active` with the egress. The join only shares it with
+    workers, and the reconciliation removes each spoke from the folders its role must not have (a rule
+    by role, never by flags). New folders are born without members.
+  - **A single writer of `config.xml`**, hardened against the Syncthing user's directory
+    (without following symlinks, `O_EXCL` temporary, owner and mode by descriptor). CI guard.
+  - **A-53:** the local ID comes from `syncthing device-id` (v2 has no `--device-id`).
+  - Orphans: deleted only with the complete registry and every hive at rest and registered.
+  - An ingress join waits 90 s for the spoke to dial.
+  - Four adversarial code reviews before the release.
+- **Build:** 7 min (commit `9d9391b`). **CI:** `rust-tests`, `posture-guards` and
+  `router-dispatcher-guards` green. **Publish:** 10 s, 58 packages. **Deploy:** 202 s with
+  `ops deploy`; snapshots `pre-stage2-0-1-58` on all 4 VMs (`pre-root-tenant-0-1-55` was deleted first).
+- **Live verification (stage 2 gate):**
+  - **First round, as predicted:** on the motherbee (08:51:10 UTC) ingress1 moved to `dynamic`,
+    egress1 left `fluxbee-blob`, its device ID was registered and Syncthing restarted **once**;
+    on worker1 (08:51:47) the motherbee moved to `tcp://10.10.10.10:22000`, with one restart.
+    ingress1 and egress1 did not change (Syncthing up for 461 k seconds).
+  - **`lab/posture-check.py -- --offline worker2`:** `verdict ok` on all 4. Completion 100% on the
+    motherbee for the three PROD spokes; the pending offer of `blob/active` disappeared from the
+    egress; the 4 registry entries have a device ID.
+  - **Listen:** `default` on all 4, unchanged. **OPA:** `in_sync` 4/4. **Warnings:** zero Syncthing WARN
+    lines in the 4 orchestrators since the deploy.
+  - **No restart loop:** Syncthing's uptime grows across three samples every ~130 s
+    (motherbee 99 → 228 → 359 s; worker1 64 → 194 → 326 s; ingress1 and egress1 not restarted).
+  - **Health** since 08:48 UTC: 0 units down, 0 denials, 0 origin drops on
+    all 4. `ops versions`: all 4 on 0.1.58, manifest `043d3d6ac6f51896`.
+- **Rollback:** `apt install fluxbee=0.1.57` on the motherbee + core-update of the spokes, or the
+  snapshot `pre-stage2-0-1-58`. The changes in `config.xml` (addresses, the egress's membership) do not
+  break 0.1.57: nobody reverts them and they are still correct.
 
-## 0.1.57 — Archi y el admin solo en loopback (etapa 1 de la postura), sin botón de apagado en el motherbee, logs sin colores
+## 0.1.57 — Archi and the admin only on loopback (stage 1 of the posture), no off button on the motherbee, logs without colors
 
-- **Fecha:** 2026-10-06 (ART) · **Versión anterior:** 0.1.56 · **Commits:** `d0c957d`..`a703b89`
-  (FINDINGS A-31, A-45, A-46, A-48; bitácora `2026-10-06`; diseño
-  `docs/host-posture-and-exposure-spec-v1.md`, revisión 5).
-- **Alcance:** motherbee + los tres spokes (core-update).
-- **Qué cambió:**
-  - **Etapa 1 de la postura (A-46):**
-    - `architect.listen` pasa a `127.0.0.1:3000` en el example y en el config de dev;
-    - el postinst corre `fluxbee-migrate-config`, que mueve a loopback el `0.0.0.0:3000` que
-      traían los `hive.yaml` instalados;
-    - el orchestrator chequea cada ~60 s si Archi o el admin escuchan fuera de loopback, y deja
-      una alerta de drift `posture` por proceso;
-    - docs y firstboot apuntan a loopback más túnel SSH;
-    - guard de CI en cada push.
-  - **El motherbee rechaza `ADD_HIVE_FINALIZE` y `REMOVE_HIVE_CLEANUP`** (`FORBIDDEN`): eran un
-    botón de apagado que cualquier orquestador, incluido el del ingress, podía apretar (A-48,
-    adelantado; DTAP ronda 3).
-  - **A-31:** colores ANSI en los logs solo con terminal.
-  - **io.web en la lista de IO del core** (tenant raíz).
-  - **Se borró el laboratorio Docker** (no se usaba) y su quickstart del sitio. El sitio cambia
-    recién con el merge a `main`.
-- **Build:** 20 min (commit `a703b89`). **Publish:** 10 s, 57 paquetes. **Deploy:** 218 s con
-  `ops deploy`; snapshots `pre-posture-0-1-57` en las 4 VMs (se borró antes `pre-gov-0-1-54`).
-- **Verificación en vivo (validación de la etapa 1):**
-  - **Migración:** el `hive.yaml` del motherbee quedó en `listen: "127.0.0.1:3000"`, y el postinst
-    dejó su línea en el log de apt.
-  - **Listeners:** `ss` en el motherbee muestra 3000 (sy-architect) y 8080 (sy-admin) solo en
+- **Date:** 2026-10-06 (ART) · **Previous version:** 0.1.56 · **Commits:** `d0c957d`..`a703b89`
+  (FINDINGS A-31, A-45, A-46, A-48; logbook `2026-10-06`; design
+  `docs/host-posture-and-exposure-spec-v1.md`, revision 5).
+- **Scope:** motherbee + the three spokes (core-update).
+- **What changed:**
+  - **Stage 1 of the posture (A-46):**
+    - `architect.listen` moves to `127.0.0.1:3000` in the example and in the dev config;
+    - the postinst runs `fluxbee-migrate-config`, which moves to loopback the `0.0.0.0:3000` that
+      the installed `hive.yaml` files carried;
+    - the orchestrator checks every ~60 s whether Archi or the admin listen outside loopback, and leaves
+      a `posture` drift alert per process;
+    - docs and firstboot point to loopback plus an SSH tunnel;
+    - CI guard on every push.
+  - **The motherbee rejects `ADD_HIVE_FINALIZE` and `REMOVE_HIVE_CLEANUP`** (`FORBIDDEN`): they were an
+    off button that any orchestrator, including the ingress's, could press (A-48,
+    brought forward; DTAP round 3).
+  - **A-31:** ANSI colors in the logs only with a terminal.
+  - **io.web in the core's IO list** (root tenant).
+  - **The Docker lab was deleted** (it was not used), and so was its quickstart on the site. The site changes
+    only with the merge to `main`.
+- **Build:** 20 min (commit `a703b89`). **Publish:** 10 s, 57 packages. **Deploy:** 218 s with
+  `ops deploy`; snapshots `pre-posture-0-1-57` on all 4 VMs (`pre-gov-0-1-54` was deleted first).
+- **Live verification (stage 1 validation):**
+  - **Migration:** the motherbee's `hive.yaml` ended up at `listen: "127.0.0.1:3000"`, and the postinst
+    left its line in the apt log.
+  - **Listeners:** `ss` on the motherbee shows 3000 (sy-architect) and 8080 (sy-admin) only on
     `127.0.0.1`.
-  - **Puertos:** `lab/posture-probe.sh 10.10.10.10 3000 8080 9000` desde worker1, ingress,
-    egress y fb-build dio `refused`, `refused`, `open` en los 4. En 0.1.56 era `open`, `refused`,
-    `open`: **el ingress ya no llega a Archi**.
-  - **Local:** en el motherbee, `curl 127.0.0.1:3000/` y `curl 127.0.0.1:8080/hives` dan 200.
-  - **Control positivo:** un listener falso llamado `sy-admin` en `10.10.10.10:39555` levantó la
-    alerta `loopback_service_exposed_sy-admin` a los 33 s. Es la única alerta `posture`: Archi
-    no dio ninguna después del deploy.
-  - **A-45 medido por primera vez.** Caída de cada servicio del motherbee en el upgrade:
+  - **Ports:** `lab/posture-probe.sh 10.10.10.10 3000 8080 9000` from worker1, ingress,
+    egress and fb-build gave `refused`, `refused`, `open` on all 4. In 0.1.56 it was `open`, `refused`,
+    `open`: **the ingress no longer reaches Archi**.
+  - **Local:** on the motherbee, `curl 127.0.0.1:3000/` and `curl 127.0.0.1:8080/hives` give 200.
+  - **Positive control:** a fake listener called `sy-admin` on `10.10.10.10:39555` raised the
+    `loopback_service_exposed_sy-admin` alert after 33 s. It is the only `posture` alert: Archi
+    raised none after the deploy.
+  - **A-45 measured for the first time.** Downtime of each motherbee service during the upgrade:
 
-    | Servicio | 0.1.55 | 0.1.57 |
+    | Service | 0.1.55 | 0.1.57 |
     |---|---|---|
     | rt-gateway | 70 s | 0 s |
     | sy-vault | 78 s | 1 s |
     | sy-storage | 84 s | 5 s |
     | sy-identity | 86 s | 5 s |
-    | resto | — | 0 s |
+    | the rest | — | 0 s |
 
-    Solo paran los que escriben el manifest: el orchestrator estuvo 44 s caído, y el admin hasta
-    el reinicio ordenado.
-  - **A-31:** cero códigos ANSI en los procesos nuevos de los 4 hosts. Antes del upgrade había
-    cientos por servicio en el motherbee. Las únicas líneas con color son los "SIGTERM received"
-    de los procesos viejos.
-  - **Los 4 hives en 0.1.57** (hash `9e13e6bf…`): el motherbee por dist, los spokes por hash
-    instalado. Health con 0 fallas, 0 denials y 0 srcdrops.
-  - **CI:** `rust-tests`, `posture-guards` (primera corrida) y `router-dispatcher-guards` en verde
-    en `a703b89`.
-- **Sin probar en vivo:** el rechazo de las acciones solo-spoke en el motherbee. Lo cubre su test
-  unitario: no hay forma limpia de mandarlas como si fuera el orquestador del ingress.
+    Only the ones that write the manifest stop: the orchestrator was down for 44 s, and the admin until
+    the ordered restart.
+  - **A-31:** zero ANSI codes in the new processes on the 4 hosts. Before the upgrade there were
+    hundreds per service on the motherbee. The only lines with color are the "SIGTERM received"
+    of the old processes.
+  - **The 4 hives on 0.1.57** (hash `9e13e6bf…`): the motherbee by dist, the spokes by installed
+    hash. Health with 0 failures, 0 denials and 0 srcdrops.
+  - **CI:** `rust-tests`, `posture-guards` (first run) and `router-dispatcher-guards` green
+    on `a703b89`.
+- **Not tested live:** the rejection of the spoke-only actions on the motherbee. Its unit test
+  covers it: there is no clean way to send them as if it were the ingress's orchestrator.
 
-## 0.1.56 — una conexión por UUID, upgrades sin apagar el core, solo io.cloud e io.blob en el tenant raíz
+## 0.1.56 — one connection per UUID, upgrades without shutting down the core, only io.cloud and io.blob in the root tenant
 
-- **Fecha:** 2026-10-03 (ART) · **Versión anterior:** 0.1.55 · **Commits:** `068014d`..`715143a`
-  (FINDINGS A-16, A-43, A-44, A-45, B-16; bitácora `2026-10-03`).
-- **Alcance:** motherbee + los tres spokes (core-update).
-- **Antes del deploy, a mano en PROD (el operador, porque el clasificador de permisos se lo
-  bloqueó a la sesión):** se purgaron `IO.api@motherbee` e `IO.wapp.default@motherbee`, con sus
-  ILKs y sus archivos UUID. Sus configs quedaron guardadas fuera del repo; solo tenían `_system` y
+- **Date:** 2026-10-03 (ART) · **Previous version:** 0.1.55 · **Commits:** `068014d`..`715143a`
+  (FINDINGS A-16, A-43, A-44, A-45, B-16; logbook `2026-10-03`).
+- **Scope:** motherbee + the three spokes (core-update).
+- **Before the deploy, by hand in PROD (the operator, because the permission classifier blocked it
+  for the session):** `IO.api@motherbee` and `IO.wapp.default@motherbee` were purged, with their
+  ILKs and their UUID files. Their configs were saved outside the repo; they only had `_system` and
   `tenant_id`.
-- **Qué cambió:**
+- **What changed:**
   - **A-44:**
-    - el router acepta una sola conexión viva por UUID, con 1 s de espera para los duplicados
-      pasajeros;
-    - toda conexión que termina se limpia, incluso por error (antes quedaba registrada y sin
-      lectura).
-  - **A-45:** un upgrade solo para a los que escriben el manifest de runtimes. El orchestrator
-    nuevo reinicia en orden lo que corre binarios reemplazados, y needrestart deja el core al
+    - the router accepts a single live connection per UUID, with a 1 s wait for transient
+      duplicates;
+    - every connection that ends is cleaned up, even on error (before, it stayed registered with
+      nobody reading it).
+  - **A-45:** an upgrade only stops the ones that write the runtimes manifest. The new orchestrator
+    restarts in order what runs replaced binaries, and needrestart leaves the core to the
     orchestrator.
-  - **A-43:** solo io.cloud e io.blob corren en el tenant raíz y arrancan por defecto
+  - **A-43:** only io.cloud and io.blob run in the root tenant and start by default
     (`TENANT_ROOT_NOT_ALLOWED`).
-  - **A-16:** el watchdog revierte los cambios locales de las carpetas receive-only.
-- **Build:** 20,5 min. **Publish:** 11 s, 56 paquetes. **Deploy:** 214 s con `ops deploy`;
-  snapshots `pre-root-io-0-1-56` en las 4 VMs (se borró antes `pre-ai-generic-0-1-53`).
-- **Incidente del deploy (B-16):**
-  - Los core updates salieron antes de que el router del motherbee tuviera de vuelta a los spokes.
-    Los tres dieron `TRANSPORT_ERROR` y no llegaron.
-  - Igual `ops.py` los dio por actualizados: juzgaba por el hash de dist, no por el instalado.
-  - El chequeo de binarios lo mostró. El update se volvió a mandar a mano a las 06:39:52 UTC y
-    `ops.py` quedó corregido.
-- **Verificación en vivo:**
-  - **U-8b validado:** los tres spokes contestaron `status=ok phase=restarting` (9, 5 y 4
-    componentes) y terminaron en `core.last_update` `done ok`. worker1 reinició los servicios en
-    orden y después se reinició a sí mismo.
-  - Los 4 hives en 0.1.56: el motherbee por dist y los spokes por hash instalado (`3260c886…`).
-    Ningún binario `(deleted)` y 0 líneas ERROR, en los 4.
-  - **A-39 sigue bien:** IO.blob e IO.cloud arrancaron una sola vez, en 0.1.56, con cero
-    `203/EXEC`. Son los únicos nodos administrados que quedan en el motherbee.
-  - **A-44:** 0 HELLO rechazados, 0 conexiones terminadas por error y 0 handshakes fallidos en el
-    tráfico normal de los 4 hives. Los nodos Go arrancaron bien con su doble HELLO.
-  - **A-43:** un `run_node` de `IO.api.a43probe@motherbee` en el tenant raíz dio
-    `TENANT_ROOT_NOT_ALLOWED`, sin dejar nada creado (ni ILK, ni archivo UUID, ni unit).
+  - **A-16:** the watchdog reverts the local changes of the receive-only folders.
+- **Build:** 20.5 min. **Publish:** 11 s, 56 packages. **Deploy:** 214 s with `ops deploy`;
+  snapshots `pre-root-io-0-1-56` on all 4 VMs (`pre-ai-generic-0-1-53` was deleted first).
+- **Deploy incident (B-16):**
+  - The core updates went out before the motherbee's router had the spokes back.
+    All three gave `TRANSPORT_ERROR` and did not arrive.
+  - Even so, `ops.py` counted them as updated: it judged by the dist hash, not by the installed one.
+  - The binaries check showed it. The update was sent again by hand at 06:39:52 UTC and
+    `ops.py` was corrected.
+- **Live verification:**
+  - **U-8b validated:** the three spokes answered `status=ok phase=restarting` (9, 5 and 4
+    components) and ended at `core.last_update` `done ok`. worker1 restarted the services in
+    order and then restarted itself.
+  - The 4 hives on 0.1.56: the motherbee by dist and the spokes by installed hash (`3260c886…`).
+    No `(deleted)` binary and 0 ERROR lines, on all 4.
+  - **A-39 still fine:** IO.blob and IO.cloud started only once, on 0.1.56, with zero
+    `203/EXEC`. They are the only managed nodes left on the motherbee.
+  - **A-44:** 0 rejected HELLOs, 0 connections ended by error and 0 failed handshakes in the
+    normal traffic of the 4 hives. The Go nodes started fine with their double HELLO.
+  - **A-43:** a `run_node` of `IO.api.a43probe@motherbee` in the root tenant gave
+    `TENANT_ROOT_NOT_ALLOWED`, leaving nothing created (no ILK, no UUID file, no unit).
   - **A-45:**
-    - el `prerm` nuevo y la conf de needrestart quedaron instalados;
-    - este upgrade todavía paró todo el core, entre 06:33:26 y 06:34:58, porque corre el `prerm`
-      de 0.1.55;
-    - se mide en el próximo upgrade.
-  - **A-16, validado después del deploy con el OK del operador:** un archivo de prueba en
-    `dist/vendor` de worker1 se revirtió en 16 s, con su WARN.
-  - **Identity y frontdesk:** 0 errores. La réplica de worker1 hizo el full sync después de su
-    reinicio.
-  - **CI:** `rust-tests`, `admin-catalog-guard` y `router-dispatcher-guards` en verde en `715143a`.
-- **Error propio, sin consecuencias:**
-  - Para leer la versión corrí `/usr/bin/sy-orchestrator --version` en worker1. El binario no
-    tiene ese flag y arrancó como orchestrator.
-  - Murió antes de conectarse al router: no hubo registro nuevo en el router de worker1 y el
-    orchestrator real siguió accesible.
-  - No hay que correr binarios del core para consultar versiones; se usa `/versions`.
-- **Rollback:** snapshot `pre-root-io-0-1-56` o `apt install fluxbee=0.1.55` (los spokes, por core
-  update o `core_rollback`).
+    - the new `prerm` and the needrestart conf were installed;
+    - this upgrade still stopped the whole core, between 06:33:26 and 06:34:58, because it runs
+      0.1.55's `prerm`;
+    - it is measured in the next upgrade.
+  - **A-16, validated after the deploy with the operator's OK:** a test file in
+    worker1's `dist/vendor` was reverted in 16 s, with its WARN.
+  - **Identity and frontdesk:** 0 errors. Worker1's replica did the full sync after its
+    restart.
+  - **CI:** `rust-tests`, `admin-catalog-guard` and `router-dispatcher-guards` green on `715143a`.
+- **My own error, without consequences:**
+  - To read the version I ran `/usr/bin/sy-orchestrator --version` on worker1. The binary does not
+    have that flag and started as orchestrator.
+  - It died before connecting to the router: there was no new registration in worker1's router and the
+    real orchestrator stayed reachable.
+  - Core binaries must not be run to check versions; `/versions` is used.
+- **Rollback:** snapshot `pre-root-io-0-1-56` or `apt install fluxbee=0.1.55` (the spokes, by core
+  update or `core_rollback`).
 
-## 0.1.55 — nadie se registra en el tenant raíz, U-8b, io.slack sin instancia de base
+## 0.1.55 — nobody registers in the root tenant, U-8b, io.slack without a base instance
 
-- **Fecha:** 2026-10-02 (ART) · **Versión anterior:** 0.1.54 · **Commits:** `a8c6349`..`975fd34`
-  (FINDINGS A-37, A-40, A-43, A-44, A-45; PENDING-BUGS U-8b; bitácora `2026-10-02`).
-- **Alcance:** motherbee + los tres spokes (core-update).
-- **Antes del deploy, a mano en PROD (pedido del operador):** se borró `IO.slack.default@motherbee`
-  con purga; corría en el tenant raíz y no tenía su ILK (A-40). Su config quedó guardada fuera del
+- **Date:** 2026-10-02 (ART) · **Previous version:** 0.1.54 · **Commits:** `a8c6349`..`975fd34`
+  (FINDINGS A-37, A-40, A-43, A-44, A-45; PENDING-BUGS U-8b; logbook `2026-10-02`).
+- **Scope:** motherbee + the three spokes (core-update).
+- **Before the deploy, by hand in PROD (the operator's request):** `IO.slack.default@motherbee` was deleted
+  with purge; it ran in the root tenant and did not have its ILK (A-40). Its config was saved outside the
   repo.
-- **Qué cambió:**
-  - **Tenant raíz:** nadie se registra ahí. SY.identity lo rechaza para cualquier llamador
-    (`TENANT_ROOT_NOT_REGISTRABLE`), el frontdesk responde `TENANT_NOT_REGISTRABLE` sin LLM y
-    `register_human` lo rechaza antes de provisionar.
-  - **U-8b:** el core update de un spoke contesta `phase: restarting` antes de reiniciar, y deja el
-    resultado en `/versions` como `core.last_update`.
-  - **io.slack:** sin instancia de arranque; cada binding lo lanza su tenant.
-  - **Gate de frontdesk de io.slack/io.wapp:** el handoff va como mensaje `user`; como `data`, el
-    frontdesk lo ignoraba.
-  - **SHM del router (A-44):** un nodo que se registra de nuevo conserva su slot, y el lector ya no
-    pierde el último nodo cuando hay un hueco.
-  - **Lab:** los e2e de identity crean sus tenants por SY.admin.
-- **Build:** 17,5 min. **Publish:** 10 s, 55 paquetes. **Deploy:** 233 s con `ops deploy`;
-  snapshots `pre-root-tenant-0-1-55` en las 4 VMs (se borró antes `pre-cleanup-0-1-52`).
-- **Verificación en vivo:**
-  - Los 4 hives en 0.1.55 con el mismo manifest (`852a21cd…`). Ningún binario `(deleted)` y 0
-    líneas ERROR desde el install, en los 4.
-  - **A-39 sigue bien:** IO.api, IO.blob, IO.cloud e IO.wapp.default arrancaron una sola vez, en
-    0.1.55, con cero `203/EXEC`; el orchestrator los reapuntó.
-  - **Identity y frontdesk:** 0 errores. La réplica de worker1 hizo el full sync y se suscribió a
-    los deltas.
-  - **U-8b, todavía no:** los spokes recibieron el update con el orchestrator 0.1.54, así que
-    ingress1 y egress1 dieron `TIMEOUT` como antes (worker1 contestó a tiempo).
-    `core.last_update` está en `/versions`, en `null`. La respuesta antes del reinicio se ve en el
-    próximo release.
-  - **No probado en vivo:** el bloqueo del tenant raíz, que necesitaría registrar a alguien en PROD.
-    Lo cubren los tests y el e2e `identity_negative`.
-  - **Visto al verificar (A-45, preexistente):** el upgrade del motherbee deja todo el core caído
-    70–86 s, porque el `prerm` para los servicios antes de desempaquetar. Las réplicas lo muestran
-    como ~2 avisos de reconexión por segundo.
-  - **CI:** `rust-tests` y `router-dispatcher-guards` en verde en `975fd34`.
-- **Rollback:** snapshot `pre-root-tenant-0-1-55` o `apt install fluxbee=0.1.54`.
+- **What changed:**
+  - **Root tenant:** nobody registers there. SY.identity rejects it for any caller
+    (`TENANT_ROOT_NOT_REGISTRABLE`), the frontdesk answers `TENANT_NOT_REGISTRABLE` without an LLM and
+    `register_human` rejects it before provisioning.
+  - **U-8b:** a spoke's core update answers `phase: restarting` before restarting, and leaves the
+    result in `/versions` as `core.last_update`.
+  - **io.slack:** no startup instance; each binding is launched by its tenant.
+  - **io.slack/io.wapp frontdesk gate:** the handoff goes as a `user` message; as `data`, the
+    frontdesk ignored it.
+  - **Router SHM (A-44):** a node that registers again keeps its slot, and the reader no longer
+    loses the last node when there is a gap.
+  - **Lab:** the identity e2e tests create their tenants through SY.admin.
+- **Build:** 17.5 min. **Publish:** 10 s, 55 packages. **Deploy:** 233 s with `ops deploy`;
+  snapshots `pre-root-tenant-0-1-55` on all 4 VMs (`pre-cleanup-0-1-52` was deleted first).
+- **Live verification:**
+  - The 4 hives on 0.1.55 with the same manifest (`852a21cd…`). No `(deleted)` binary and 0
+    ERROR lines since the install, on all 4.
+  - **A-39 still fine:** IO.api, IO.blob, IO.cloud and IO.wapp.default started only once, on
+    0.1.55, with zero `203/EXEC`; the orchestrator repointed them.
+  - **Identity and frontdesk:** 0 errors. Worker1's replica did the full sync and subscribed to
+    the deltas.
+  - **U-8b, not yet:** the spokes received the update with the 0.1.54 orchestrator, so
+    ingress1 and egress1 gave `TIMEOUT` as before (worker1 answered in time).
+    `core.last_update` is in `/versions`, at `null`. The answer before the restart shows up in the
+    next release.
+  - **Not tested live:** the root tenant block, which would require registering someone in PROD.
+    The tests and the `identity_negative` e2e cover it.
+  - **Seen while verifying (A-45, pre-existing):** the motherbee's upgrade leaves the whole core down for
+    70–86 s, because the `prerm` stops the services before unpacking. The replicas show it
+    as ~2 reconnection warnings per second.
+  - **CI:** `rust-tests` and `router-dispatcher-guards` green on `975fd34`.
+- **Rollback:** snapshot `pre-root-tenant-0-1-55` or `apt install fluxbee=0.1.54`.
 
-## 0.1.54 — upgrades sin caída de los nodos administrados, el camino .gov cerrado, cognition A-38
+## 0.1.54 — upgrades without downtime for the managed nodes, the .gov path closed, cognition A-38
 
-- **Fecha:** 2026-10-02 (ART) · **Versión anterior:** 0.1.53 · **Commits:** `7c9f781`..`6aa4ee4`
-  (FINDINGS A-37, A-38, A-39, A-41; bitácora `2026-10-02`).
-- **Alcance:** motherbee + los tres spokes (core-update).
-- **Antes del deploy, a mano en PROD (pedido del operador):**
-  - se borró `AI.chat@motherbee` con purga (instancia e ILK);
-  - se le quitó a IO.slack.default su `io.dst_node`, que apuntaba a AI.chat (config v4);
-  - se borraron 12 archivos `.uuid` de nodos ya borrados.
-- **Qué cambió:**
-  - **A-39:** el arranque del orchestrator relanza en la versión nueva a los nodos que siguen a
-    `current`, y `needrestart` ya no reinicia las units `fluxbee-node-*`.
-  - **A-41:** la purga de un nodo borra su UUID.
+- **Date:** 2026-10-02 (ART) · **Previous version:** 0.1.53 · **Commits:** `7c9f781`..`6aa4ee4`
+  (FINDINGS A-37, A-38, A-39, A-41; logbook `2026-10-02`).
+- **Scope:** motherbee + the three spokes (core-update).
+- **Before the deploy, by hand in PROD (the operator's request):**
+  - `AI.chat@motherbee` was deleted with purge (instance and ILK);
+  - IO.slack.default had its `io.dst_node` removed, which pointed to AI.chat (config v4);
+  - 12 `.uuid` files of already-deleted nodes were deleted.
+- **What changed:**
+  - **A-39:** the orchestrator's startup relaunches on the new version the nodes that follow
+    `current`, and `needrestart` no longer restarts the `fluxbee-node-*` units.
+  - **A-41:** a node's purge deletes its UUID.
   - **A-37, .gov:**
-    - el registro va al tenant del caso y el frontdesk no crea tenants;
-    - merge por email: completa solo campos vacíos y mueve los canales;
+    - registration goes to the case's tenant and the frontdesk does not create tenants;
+    - merge by email: fills in only empty fields and moves the channels;
     - `TENANT_SUSPENDED`;
-    - `register_human` informa el ILK final.
-  - **A-38, cognition:** `context_close`/`reason_close` y lo reciente primero en la región de memoria.
-- **Build:** 13,5 min. **Publish:** 11 s, 54 paquetes. **Deploy:** 231 s con `ops deploy`; snapshots
-  `pre-gov-0-1-54` en las 4 VMs (se borró antes `pre-query-decode-0-1-51`).
-- **Verificación en vivo:**
-  - Los 4 hives en 0.1.54 con el mismo manifest (`7b87d5c1…`). Ningún binario `(deleted)`, 0 líneas
-    ERROR desde el install y 0 rechazos del gate y descartes por `routing.src`.
-  - **A-39 validado:**
-    - los cinco nodos administrados arrancaron una sola vez, en 0.1.54, con cero `203/EXEC`;
-    - el orchestrator los reapuntó ("running node follows 'current' and the pointer moved");
-    - `/etc/needrestart/conf.d/fluxbee.conf` quedó instalado.
-  - **Cognition:** rechazó los umbrales viejos de su config persistida (warning) y aplica los
-    defaults; CONFIG_GET informa `context_close`/`reason_close` 0,25, el mismo efecto que antes.
-  - **Identity y frontdesk:** 0 errores desde el install.
-  - **CI:** `rust-tests` y los guardianes en verde en `6aa4ee4`.
-- **Rollback:** snapshot `pre-gov-0-1-54` o `apt install fluxbee=0.1.53`.
+    - `register_human` reports the final ILK.
+  - **A-38, cognition:** `context_close`/`reason_close` and the most recent first in the memory region.
+- **Build:** 13.5 min. **Publish:** 11 s, 54 packages. **Deploy:** 231 s with `ops deploy`; snapshots
+  `pre-gov-0-1-54` on all 4 VMs (`pre-query-decode-0-1-51` was deleted first).
+- **Live verification:**
+  - The 4 hives on 0.1.54 with the same manifest (`7b87d5c1…`). No `(deleted)` binary, 0 ERROR
+    lines since the install and 0 gate rejections and drops by `routing.src`.
+  - **A-39 validated:**
+    - the five managed nodes started only once, on 0.1.54, with zero `203/EXEC`;
+    - the orchestrator repointed them ("running node follows 'current' and the pointer moved");
+    - `/etc/needrestart/conf.d/fluxbee.conf` was installed.
+  - **Cognition:** rejected the old thresholds of its persisted config (warning) and applies the
+    defaults; CONFIG_GET reports `context_close`/`reason_close` 0.25, the same effect as before.
+  - **Identity and frontdesk:** 0 errors since the install.
+  - **CI:** `rust-tests` and the guards green on `6aa4ee4`.
+- **Rollback:** snapshot `pre-gov-0-1-54` or `apt install fluxbee=0.1.53`.
 
-## 0.1.53 — limpieza de código muerto: la clave general de IA, sin instancia AI de base, privacidad y cognition
+## 0.1.53 — dead code cleanup: the general AI key, no base AI instance, privacy and cognition
 
-- **Fecha:** 2026-10-02 (ART) · **Versión anterior:** 0.1.52 · **Commits:** `8c8c0fa`..`26edcd5` (ocho,
-  uno por tema; bitácora `2026-10-02`, FINDINGS A-32 a A-38).
-- **Alcance:** motherbee + los tres spokes (core-update).
-- **Qué cambió:**
-  - **ai.generic** toma la clave general del proveedor del hive en SY.vault (decisión D4 del
-    operador). `behavior.vault_key` se rechaza (A-35). Sale el modo gov que quedó del split de
-    frontdesk.
-  - **La instalación base** ya no levanta `AI.chat@motherbee`. Todo apunta a `ai.generic`: admin,
-    Archi, semillas del cookbook y docs (A-36).
-  - **SY.frontdesk.gov** sin datos personales en los logs (A-32). Los rechazos de identity conservan
-    su código y solo lo transitorio es reintentable (A-33).
-  - **SY.identity:** no loguea la dirección en `ILK_PROVISION` ni devuelve el DETAIL de Postgres (A-32).
-  - **SY.cognition:** el arranque en frío corre después de esperar al vault y reconstruye con las
-    claves del camino en vivo; el estado queda acotado y los scopes se cortan (A-34).
-  - **Orchestrator:** 9 funciones muertas menos. Warnings del workspace: 0.
-  - **CI:** las actions sobre Node 24.
-- **Build:** 14 min. **Publish:** 10 s, 53 paquetes. **Deploy:** 223 s con `ops deploy`; snapshots
-  `pre-ai-generic-0-1-53` en las 4 VMs (se borró antes `pre-config-routes-0-1-50`).
-- **Verificación en vivo:**
-  - Los 4 hives en 0.1.53 con el mismo manifest (`dc605aa6…`). Ningún binario `(deleted)`, 0 líneas
-    ERROR desde el install y 0 rechazos del gate y descartes por `routing.src`.
-  - **Cognition:** el rebuild de arranque corrió por primera vez (`trigger="startup"`, después de
-    esperar al vault; 0 hilos, PROD no tiene datos). CONFIG_GET informa `storage.db_configured: true`.
-  - **AI.chat:** arranca en FAILED_CONFIG con *"config.json rejected… send a valid CONFIG_SET"*,
-    porque su config tiene `vault_key`. Es lo esperado (A-36).
-  - **SY.frontdesk.gov:** arranca y queda degradado (Unconfigured): el vault de PROD no tiene clave
-    de IA. El handoff estructurado funciona sin ella.
-  - **CI:** `rust-tests`, `go-tests` y los dos guardianes en verde en `26edcd5`.
-- **Visto al validar (A-39, preexistente):** los seis nodos administrados de motherbee quedaron
-  entre 20 y 80 s en loop `203/EXEC` durante el update, porque el directorio de su versión vieja se
-  borró antes de que la unit apuntara a la nueva.
-- **Rollback:** snapshot `pre-ai-generic-0-1-53` o `apt install fluxbee=0.1.52`.
+- **Date:** 2026-10-02 (ART) · **Previous version:** 0.1.52 · **Commits:** `8c8c0fa`..`26edcd5` (eight,
+  one per topic; logbook `2026-10-02`, FINDINGS A-32 to A-38).
+- **Scope:** motherbee + the three spokes (core-update).
+- **What changed:**
+  - **ai.generic** takes the general key of the hive's provider from SY.vault (the operator's
+    decision D4). `behavior.vault_key` is rejected (A-35). The gov mode left over from the frontdesk
+    split goes away.
+  - **The base installation** no longer brings up `AI.chat@motherbee`. Everything points to `ai.generic`: admin,
+    Archi, cookbook seeds and docs (A-36).
+  - **SY.frontdesk.gov** without personal data in the logs (A-32). The identity rejections keep
+    their code and only the transient ones are retryable (A-33).
+  - **SY.identity:** does not log the address in `ILK_PROVISION` nor return Postgres's DETAIL (A-32).
+  - **SY.cognition:** the cold start runs after waiting for the vault and rebuilds with the
+    keys of the live path; the state stays bounded and the scopes are trimmed (A-34).
+  - **Orchestrator:** 9 fewer dead functions. Workspace warnings: 0.
+  - **CI:** the actions on Node 24.
+- **Build:** 14 min. **Publish:** 10 s, 53 packages. **Deploy:** 223 s with `ops deploy`; snapshots
+  `pre-ai-generic-0-1-53` on all 4 VMs (`pre-config-routes-0-1-50` was deleted first).
+- **Live verification:**
+  - The 4 hives on 0.1.53 with the same manifest (`dc605aa6…`). No `(deleted)` binary, 0 ERROR
+    lines since the install and 0 gate rejections and drops by `routing.src`.
+  - **Cognition:** the startup rebuild ran for the first time (`trigger="startup"`, after
+    waiting for the vault; 0 threads, PROD has no data). CONFIG_GET reports `storage.db_configured: true`.
+  - **AI.chat:** starts in FAILED_CONFIG with *"config.json rejected… send a valid CONFIG_SET"*,
+    because its config has `vault_key`. That is expected (A-36).
+  - **SY.frontdesk.gov:** starts and stays degraded (Unconfigured): PROD's vault has no AI
+    key. The structured handoff works without it.
+  - **CI:** `rust-tests`, `go-tests` and the two guards green on `26edcd5`.
+- **Seen while validating (A-39, pre-existing):** the motherbee's six managed nodes stayed
+  between 20 and 80 s in a `203/EXEC` loop during the update, because the directory of their old version was
+  deleted before the unit pointed to the new one.
+- **Rollback:** snapshot `pre-ai-generic-0-1-53` or `apt install fluxbee=0.1.52`.
 
-## 0.1.52 — limpieza de warnings sin cambio de comportamiento; primer deploy con `lab/ops.py`
+## 0.1.52 — warning cleanup with no behavior change; first deploy with `lab/ops.py`
 
-- **Fecha:** 2026-10-02 (ART) · **Versión anterior:** 0.1.51 · **Commit:** `0670184` (el código
-  es `e1f0323`; el resto son herramientas y documentos del lote de temas chicos, bitácora
+- **Date:** 2026-10-02 (ART) · **Previous version:** 0.1.51 · **Commit:** `0670184` (the code
+  is `e1f0323`; the rest are tools and documents from the batch of small topics, logbook
   `2026-10-02`).
-- **Alcance:** motherbee + los tres spokes (core-update).
-- **Qué cambió:**
-  - Nada de comportamiento: fuera campos que nadie leía, accesores de SHM sin uso e imports; tres
-    costuras de test pasan a `cfg(test)`. Warnings del workspace raíz: 64 → 31 (lo que queda es
-    código muerto que espera la aprobación del operador). El layout de la región de identity da el
-    mismo `total_len` en el SDK y en el router.
-  - Fuera del `.deb`: `lab/ops.py` (build, publish, deploy) y el publish incremental (`fcb5af6`).
-- **Build:** 21 min con `ops build 0.1.52 --wait`. **Publish:** 9 s, 52 paquetes.
+- **Scope:** motherbee + the three spokes (core-update).
+- **What changed:**
+  - No behavior change: removed fields nobody read, unused SHM accessors and imports; three
+    test seams move to `cfg(test)`. Root workspace warnings: 64 → 31 (what remains is
+    dead code awaiting the operator's approval). The identity region's layout gives the
+    same `total_len` in the SDK and in the router.
+  - Outside the `.deb`: `lab/ops.py` (build, publish, deploy) and the incremental publish (`fcb5af6`).
+- **Build:** 21 min with `ops build 0.1.52 --wait`. **Publish:** 9 s, 52 packages.
 - **Deploy:** `ops deploy 0.1.52 --snapshot pre-cleanup-0-1-52 --drop pre-architect-fixes-0-1-49`,
-  226 s de punta a punta: snapshots en las 4 VMs, install en motherbee a las 10:24 UTC, spokes en
-  paralelo, health.
-- **Verificación en vivo:**
-  - Los 4 hives en 0.1.52 con el mismo manifest (`250e0aca…`). Ninguna unit corre un binario
-    `(deleted)` y todas reiniciaron después del install, salvo `fluxbee-syncthing` (el core-update
-    no la toca).
-  - 0 líneas ERROR en los journals de las 4 VMs desde el install. Los WARN son de los reinicios
-    (RPC y WAN que reconectan) y los ya conocidos (io_slack sin credenciales,
+  226 s end to end: snapshots on all 4 VMs, install on the motherbee at 10:24 UTC, spokes in
+  parallel, health.
+- **Live verification:**
+  - The 4 hives on 0.1.52 with the same manifest (`250e0aca…`). No unit runs a
+    `(deleted)` binary and all restarted after the install, except `fluxbee-syncthing` (the core-update
+    does not touch it).
+  - 0 ERROR lines in the journals of the 4 VMs since the install. The WARNs are from the restarts
+    (RPC and WAN reconnecting) and the already known ones (io_slack without credentials,
     `EGRESS_MOTHERBEE_BYPASS`).
-  - Identity: la réplica de worker1 reintentó mientras el identity de motherbee reiniciaba
-    (10:25:21–10:27:03 UTC). Después aplicó el full sync, se suscribió al delta stream y resolvió
-    su ILK.
-  - OPA: los 4 hives `in_sync` y los routers `ok` (sin policy de usuario cargada). La policy de
-    sistema autorizó los core-updates.
-  - 0 rechazos del gate y 0 descartes por `routing.src`.
-  - CI: `rust-tests`, `admin-catalog-guard` y `router-dispatcher-guards` en verde en `0670184`.
-- **Rollback:** snapshot `pre-cleanup-0-1-52` o `apt install fluxbee=0.1.51`.
+  - Identity: worker1's replica retried while the motherbee's identity was restarting
+    (10:25:21–10:27:03 UTC). Then it applied the full sync, subscribed to the delta stream and resolved
+    its ILK.
+  - OPA: the 4 hives `in_sync` and the routers `ok` (no user policy loaded). The system
+    policy authorized the core-updates.
+  - 0 gate rejections and 0 drops by `routing.src`.
+  - CI: `rust-tests`, `admin-catalog-guard` and `router-dispatcher-guards` green on `0670184`.
+- **Rollback:** snapshot `pre-cleanup-0-1-52` or `apt install fluxbee=0.1.51`.
 
-## 0.1.51 — el admin decodifica la query; SQLite espera el lock en todas las conexiones
+## 0.1.51 — the admin decodes the query; SQLite waits for the lock on every connection
 
-- **Fecha:** 2026-10-01 (ART) · **Versión anterior:** 0.1.50 · **Commits:** `9f9982a` (admin) y
-  `f7c2520` (sy-timer, wf-generic) (FINDINGS A-30, A-29). La primera build de 0.1.51 (solo con el
-  admin) se rehízo antes de publicarla para sumar el arreglo de SQLite.
-- **Alcance:** motherbee + los tres spokes (core-update); wf-generic llega como runtime
+- **Date:** 2026-10-01 (ART) · **Previous version:** 0.1.50 · **Commits:** `9f9982a` (admin) and
+  `f7c2520` (sy-timer, wf-generic) (FINDINGS A-30, A-29). The first build of 0.1.51 (with only the
+  admin) was redone before publishing it, to add the SQLite fix.
+- **Scope:** motherbee + the three spokes (core-update); wf-generic arrives as the runtime
   `wf.engine/0.1.51`.
-- **Qué cambió:**
-  - El admin decodifica `%xx` en la query (`+` queda literal).
-  - sy-timer y wf-generic aplican sus pragmas de SQLite en cada conexión (en el DSN), no solo en la
-    primera del pool.
-- **Build:** 6 min. **Publish:** 51 paquetes. Snapshots `pre-query-decode-0-1-51` en las 4 VMs (se
-  borró antes `pre-architect-opa-0-1-48`).
-- **Install:** motherbee 00:48 UTC del 02/10; spokes a continuación.
-- **Verificación en vivo:**
-  - Los 4 hives con los mismos binarios; 0 `failed`.
-  - Tap creado y borrado con `match_src=IO.pct-a%40motherbee...` → `ok`, el tap ya no está (en
-    0.1.50 respondía `NOT_FOUND`).
-  - sy-timer activo en motherbee y worker1; `TIMER_LIST` por el admin responde; 0 errores,
-    `locked` o `busy` en sus logs.
-  - WF de prueba en worker1: creado, el nodo arranca desde `wf.engine/0.1.51` en ~10 s, abre su
-    base y recupera 0 instancias sin errores; borrado y el nodo desaparece.
-  - 0 rechazos del gate y 0 descartes por `routing.src`.
-  - CI: `go-tests` (con la suite de sy-timer), `rust-tests`, `admin-catalog-guard` y
-    `router-dispatcher-guards` en verde en los commits de esta versión.
-- **Rollback:** snapshot `pre-query-decode-0-1-51` o `apt install fluxbee=0.1.50`.
+- **What changed:**
+  - The admin decodes `%xx` in the query (`+` stays literal).
+  - sy-timer and wf-generic apply their SQLite pragmas on every connection (in the DSN), not only on the
+    pool's first one.
+- **Build:** 6 min. **Publish:** 51 packages. Snapshots `pre-query-decode-0-1-51` on all 4 VMs
+  (`pre-architect-opa-0-1-48` was deleted first).
+- **Install:** motherbee 00:48 UTC on 02/10; spokes right after.
+- **Live verification:**
+  - The 4 hives with the same binaries; 0 `failed`.
+  - Tap created and deleted with `match_src=IO.pct-a%40motherbee...` → `ok`, the tap is gone (in
+    0.1.50 it answered `NOT_FOUND`).
+  - sy-timer active on the motherbee and worker1; `TIMER_LIST` through the admin answers; 0 errors,
+    `locked` or `busy` in its logs.
+  - Test WF on worker1: created, the node starts from `wf.engine/0.1.51` in ~10 s, opens its
+    database and recovers 0 instances without errors; deleted, and the node disappears.
+  - 0 gate rejections and 0 drops by `routing.src`.
+  - CI: `go-tests` (with the sy-timer suite), `rust-tests`, `admin-catalog-guard` and
+    `router-dispatcher-guards` green on this version's commits.
+- **Rollback:** snapshot `pre-query-decode-0-1-51` or `apt install fluxbee=0.1.50`.
 
-## 0.1.50 — config-routes cerrado (VPN por hive) y lo que quedaba de OPA
+## 0.1.50 — config-routes closed (VPN per hive) and what was left of OPA
 
-- **Fecha:** 2026-10-01 (ART) · **Versión anterior:** 0.1.49 · **Commit:** `aa206ac` (FINDINGS
-  A-18, A-21; panel DTAP D-12). Cambian el router (`rt-gateway`), el admin y la policy de sistema.
-- **Alcance:** motherbee + los tres spokes (core-update).
-- **Qué cambió:**
-  - Una sola superficie para rutas, VPN y taps: `/hives/{h}/routes|vpns|taps`. Se borraron
-    `/routes`, `/vpns` y `/taps` con `?hive=`.
-  - La regla 5 de `system.rego` ya no nombra `SY.config-routes`; `system.wasm` y
-    `system_route.wasm` recompiladas.
-  - El router relee la config de ruteo en cada latido, con control de versión (D-12).
-  - Un router sin policy de usuario reporta `ok`, como después de un clear (A-21).
-  - `OPA_RELOAD` ya no se reenvía a todos los nodos locales: solo lo usan los routers.
-- **Build:** 23 min (cambió la librería del router: se recompila todo). **Publish:** 50 paquetes.
-  Snapshots `pre-config-routes-0-1-50` en las 4 VMs (se borró antes `pre-opa-blockB-0-1-47`).
-- **Install:** motherbee 00:04 UTC del 02/10; spokes 00:05–00:07.
-- **Verificación en vivo:**
-  - Los 4 hives con los mismos binarios; 0 `failed`.
-  - Recién arrancados y sin policy, los 4 routers reportan `load=0 ok` (antes `load=1 error`).
-  - `/routes`, `/vpns` y `/taps` → `UNKNOWN_ROUTE`; `/hives/{h}/...` responde.
-  - Ruta de prueba en worker1 y tap de prueba en el motherbee por las rutas por hive: se listan, y
-    cada una aparece en el LSA del otro hive. Borradas al terminar.
-  - Apply y clear globales: 4,9 s y 5,0 s, los 4 hives. `OPA_RELOAD` aplicado en cada router y
-    ningún "forwarded to local nodes". El refresco en el latido solo registra cuando la config
-    cambia (motherbee: 4 actualizaciones en la ventana; logs a ritmo normal).
-  - 0 rechazos del gate y 0 descartes por `routing.src`.
-  - Visto de paso: un DELETE de tap con `@` codificado como `%40` no encontraba el tap (el admin no
-    decodificaba la query). Arreglado en 0.1.51.
-- **Rollback:** snapshot `pre-config-routes-0-1-50` o `apt install fluxbee=0.1.49`.
+- **Date:** 2026-10-01 (ART) · **Previous version:** 0.1.49 · **Commit:** `aa206ac` (FINDINGS
+  A-18, A-21; DTAP panel D-12). The router (`rt-gateway`), the admin and the system policy change.
+- **Scope:** motherbee + the three spokes (core-update).
+- **What changed:**
+  - A single surface for routes, VPNs and taps: `/hives/{h}/routes|vpns|taps`. `/routes`, `/vpns`
+    and `/taps` with `?hive=` were deleted.
+  - Rule 5 of `system.rego` no longer names `SY.config-routes`; `system.wasm` and
+    `system_route.wasm` recompiled.
+  - The router rereads the routing config on every heartbeat, with version control (D-12).
+  - A router without a user policy reports `ok`, as after a clear (A-21).
+  - `OPA_RELOAD` is no longer forwarded to every local node: only the routers use it.
+- **Build:** 23 min (the router's library changed: everything recompiles). **Publish:** 50 packages.
+  Snapshots `pre-config-routes-0-1-50` on all 4 VMs (`pre-opa-blockB-0-1-47` was deleted first).
+- **Install:** motherbee 00:04 UTC on 02/10; spokes 00:05–00:07.
+- **Live verification:**
+  - The 4 hives with the same binaries; 0 `failed`.
+  - Freshly started and without a policy, the 4 routers report `load=0 ok` (before, `load=1 error`).
+  - `/routes`, `/vpns` and `/taps` → `UNKNOWN_ROUTE`; `/hives/{h}/...` answers.
+  - A test route on worker1 and a test tap on the motherbee through the per-hive routes: they are listed, and
+    each one shows up in the other hive's LSA. Deleted at the end.
+  - Global apply and clear: 4.9 s and 5.0 s, the 4 hives. `OPA_RELOAD` applied on each router and
+    no "forwarded to local nodes". The heartbeat refresh only logs when the config
+    changes (motherbee: 4 updates in the window; logs at a normal rate).
+  - 0 gate rejections and 0 drops by `routing.src`.
+  - Seen in passing: a tap DELETE with `@` encoded as `%40` did not find the tap (the admin did not
+    decode the query). Fixed in 0.1.51.
+- **Rollback:** snapshot `pre-config-routes-0-1-50` or `apt install fluxbee=0.1.49`.
 
-## 0.1.49 — arquitecto: un solo admin, el handbook en el `.deb`, el vault esperado al arrancar
+## 0.1.49 — architect: a single admin, the handbook in the `.deb`, the vault awaited at startup
 
-- **Fecha:** 2026-10-01 (ART) · **Versión anterior:** 0.1.48 · **Commit:** `c921d1a`
-  (FINDINGS A-24, A-25, A-26). Cambian `sy-architect` y `build-deb.sh`.
-- **Alcance:** motherbee + los tres spokes (core-update).
-- **Qué cambió:**
-  - El snapshot y la consulta `query_hive` del plan compiler le preguntan a `SY.admin@motherbee`
-    con el hive como destino (antes, a `SY.admin@<hive>`, que solo existe en el motherbee).
-  - El `.deb` instala `/etc/fluxbee/handbook_fluxbee.md`, como `install.sh`.
-  - Al arrancar, el arquitecto reintenta leer su clave de IA y la URL de su base de mensajes hasta
-    que el vault conteste (como SY.storage y SY.identity), las dos a la vez.
-- **Build:** 10 min. **Publish:** 49 paquetes (la espera de `pve.py` cortó por conexión; el repo
-  quedó con 0.1.49). Snapshots `pre-architect-fixes-0-1-49` en las 4 VMs (se borró antes
-  `pre-opa-blockA-0-1-46`).
+- **Date:** 2026-10-01 (ART) · **Previous version:** 0.1.48 · **Commit:** `c921d1a`
+  (FINDINGS A-24, A-25, A-26). `sy-architect` and `build-deb.sh` change.
+- **Scope:** motherbee + the three spokes (core-update).
+- **What changed:**
+  - The snapshot and the plan compiler's `query_hive` query ask `SY.admin@motherbee`
+    with the hive as destination (before, `SY.admin@<hive>`, which only exists on the motherbee).
+  - The `.deb` installs `/etc/fluxbee/handbook_fluxbee.md`, like `install.sh`.
+  - At startup, the architect retries reading its AI key and the URL of its message database until
+    the vault answers (like SY.storage and SY.identity), both at once.
+- **Build:** 10 min. **Publish:** 49 packages (the wait in `pve.py` dropped on a connection error; the repo
+  ended up with 0.1.49). Snapshots `pre-architect-fixes-0-1-49` on all 4 VMs (`pre-opa-blockA-0-1-46`
+  was deleted first).
 - **Install:** motherbee 21:59 UTC; spokes 21:59–22:01.
-- **Verificación en vivo:**
-  - Los 4 hives con los mismos binarios; 0 `failed`.
-  - Handbook en `/etc/fluxbee/handbook_fluxbee.md` (30940 bytes).
-  - Arranque del arquitecto: las dos lecturas del vault dieron `vault not reachable yet; retrying` y
-    1,2 s después escuchaba con `messages_db_configured=true` (en 0.1.48 arrancaba en `false` y lo
-    rescataba el aviso del vault). `ai_configured=false`: el vault de 8.x no tiene clave de IA.
-  - El admin del motherbee contesta las cinco lecturas del snapshot para worker1. En ingress1 y
-    egress1 fallan `runtimes` y `wf-rules` (por rol): queda anotado en A-24.
-  - Apply y clear globales: 5,1 s y 5,3 s, los 4 hives. 0 rechazos del gate y 0 descartes por
-    `routing.src`; sin policy de usuario al terminar.
-- **Rollback:** snapshot `pre-architect-fixes-0-1-49` o `apt install fluxbee=0.1.48`.
+- **Live verification:**
+  - The 4 hives with the same binaries; 0 `failed`.
+  - Handbook at `/etc/fluxbee/handbook_fluxbee.md` (30940 bytes).
+  - The architect's startup: both vault reads gave `vault not reachable yet; retrying` and
+    1.2 s later it was listening with `messages_db_configured=true` (in 0.1.48 it started at `false` and
+    the vault's notice rescued it). `ai_configured=false`: the 8.x vault has no AI key.
+  - The motherbee's admin answers the five snapshot reads for worker1. On ingress1 and
+    egress1, `runtimes` and `wf-rules` fail (by role): noted in A-24.
+  - Global apply and clear: 5.1 s and 5.3 s, the 4 hives. 0 gate rejections and 0 drops by
+    `routing.src`; no user policy at the end.
+- **Rollback:** snapshot `pre-architect-fixes-0-1-49` or `apt install fluxbee=0.1.48`.
 
-## 0.1.48 — el arquitecto declara la policy OPA global (una por sistema, gana la última)
+## 0.1.48 — the architect declares the global OPA policy (one per system, the last one wins)
 
-- **Fecha:** 2026-10-01 (ART) · **Versión anterior:** 0.1.47 · **Commit:** `1486807`
-  (FINDINGS A-23). Solo cambia `sy-architect`.
-- **Alcance:** motherbee + los tres spokes (core-update; el arquitecto corre solo en el motherbee).
-- **Qué cambió:**
-  - Una solución declara `desired_state.opa` (una policy, sin hive) en lugar de `opa_deployments`
-    por hive. Una policy con `hive` no pasa la validación.
-  - El snapshot lee la policy que corre una sola vez, del motherbee. Si el rego es el mismo, no hay
-    cambio.
-  - Un solo `opa_compile_apply`. `OPA_REMOVE` ahora es `opa_clear`.
-  - Si dos soluciones declaran OPA, gana la última. El dueño de la policy que corre es la solución
-    cuyo manifest guardado la declaró más recientemente. Una solución solo hace clear si la policy
-    sigue siendo suya, y el plan (`user_policy` en la confirmación) dice de quién es la que
-    reemplaza.
-  - El plan compiler recibe el rego declarado y los pasos OPA del plan quedan fijados a él (rego y
-    entrypoint exactos, sin hive).
-- **Build:** 12 min. **Publish:** 48 paquetes. Snapshots `pre-architect-opa-0-1-48` en las 4 VMs
-  (se borró antes `pre-rule3-0-1-45`).
+- **Date:** 2026-10-01 (ART) · **Previous version:** 0.1.47 · **Commit:** `1486807`
+  (FINDINGS A-23). Only `sy-architect` changes.
+- **Scope:** motherbee + the three spokes (core-update; the architect runs only on the motherbee).
+- **What changed:**
+  - A solution declares `desired_state.opa` (one policy, no hive) instead of per-hive
+    `opa_deployments`. A policy with `hive` does not pass validation.
+  - The snapshot reads the running policy once, from the motherbee. If the rego is the same, there is no
+    change.
+  - A single `opa_compile_apply`. `OPA_REMOVE` is now `opa_clear`.
+  - If two solutions declare OPA, the last one wins. The owner of the running policy is the solution
+    whose stored manifest declared it most recently. A solution only does a clear if the policy
+    is still its own, and the plan (`user_policy` in the confirmation) says whose policy it
+    replaces.
+  - The plan compiler receives the declared rego and the plan's OPA steps are pinned to it (exact rego and
+    entrypoint, no hive).
+- **Build:** 12 min. **Publish:** 48 packages. Snapshots `pre-architect-opa-0-1-48` on all 4 VMs
+  (`pre-rule3-0-1-45` was deleted first).
 - **Install:** motherbee 21:19 UTC; spokes 21:19–21:21.
-- **Verificación en vivo:**
-  - Los 4 hives con los mismos binarios; 0 `failed`; el arquitecto activo y `/api/status` ok.
-  - La respuesta real de `opa_get_policy` del motherbee, con y sin policy, se capturó y quedó como
-    test del parser del snapshot.
-  - Apply y clear globales: 6,2 s y 4,9 s, los 4 hives. 0 rechazos del gate y 0 descartes por
-    `routing.src`; sin policy de usuario al terminar.
-  - **No probado en vivo:** el pipeline completo (el diseñador y el plan compiler son IA, y el
-    arquitecto arrancó sin IA: A-26). Cubierto por tests: validación, snapshot, reglas de dueño,
-    fijado de pasos y confirmación.
-- **Rollback:** snapshot `pre-architect-opa-0-1-48` o `apt install fluxbee=0.1.47`.
+- **Live verification:**
+  - The 4 hives with the same binaries; 0 `failed`; the architect active and `/api/status` ok.
+  - The real response of the motherbee's `opa_get_policy`, with and without a policy, was captured and kept as a
+    test for the snapshot parser.
+  - Global apply and clear: 6.2 s and 4.9 s, the 4 hives. 0 gate rejections and 0 drops by
+    `routing.src`; no user policy at the end.
+  - **Not tested live:** the full pipeline (the designer and the plan compiler are AI, and the
+    architect started without AI: A-26). Covered by tests: validation, snapshot, owner rules,
+    step pinning and confirmation.
+- **Rollback:** snapshot `pre-architect-opa-0-1-48` or `apt install fluxbee=0.1.47`.
 
-## 0.1.47 — OPA, bloque B del panel DTAP: un hive trabado dice por qué, se reparan instalaciones a medias, sin carrera en el estado, sin rego viejo
+## 0.1.47 — OPA, block B of the DTAP panel: a stuck hive says why, half-done installs are repaired, no race in the state, no old rego
 
-- **Fecha:** 2026-10-01 (ART) · **Versión anterior:** 0.1.46 · **Commit:** `652a9c9` (panel DTAP
-  2026-10-01: P-6, P-7, P-13, P-15, D-9, D-10). Solo cambia `sy-opa-rules` (Go).
-- **Alcance:** motherbee + los tres spokes (core-update).
-- **Qué cambió:**
-  - `get_status` de SY.opa.rules dice qué corre el hive, qué le llegó publicado
-    (`published_version`/`published_hash`), qué tiene cargado el router (`region_hash`), si está
-    `in_sync`, y si espera algo: `waiting {version, hash, since, reason}`. Al minuto de estar
-    trabado lo loguea una vez.
-  - Cada chequeo de 5 s (motherbee incluido) reescribe la región del router si no tiene la policy
-    instalada (instalación cortada a mitad de camino).
-  - El estado tiene su propio lock (antes, `lastError` sin lock entre dos goroutines).
-  - Instalar sin rego borra el `policy.rego` que había dejado una policy anterior.
-  - Los archivos publicados quedan con el dueño de `dist/policy`, no con un `fluxbee` fijo.
-- **Build:** 7 min. **Publish:** 47 paquetes. Snapshots `pre-opa-blockB-0-1-47` en las 4 VMs (se
-  borró antes `pre-src-binding-0-1-44`).
+- **Date:** 2026-10-01 (ART) · **Previous version:** 0.1.46 · **Commit:** `652a9c9` (DTAP panel
+  2026-10-01: P-6, P-7, P-13, P-15, D-9, D-10). Only `sy-opa-rules` (Go) changes.
+- **Scope:** motherbee + the three spokes (core-update).
+- **What changed:**
+  - SY.opa.rules's `get_status` says what the hive runs, what it got published
+    (`published_version`/`published_hash`), what the router has loaded (`region_hash`), whether it is
+    `in_sync`, and whether it is waiting for something: `waiting {version, hash, since, reason}`. After a minute
+    stuck, it logs it once.
+  - Each 5 s check (motherbee included) rewrites the router's region if it does not have the policy
+    installed (an install cut off halfway).
+  - The state has its own lock (before, `lastError` without a lock between two goroutines).
+  - Installing without a rego deletes the `policy.rego` that a previous policy had left.
+  - The published files keep the owner of `dist/policy`, not a fixed `fluxbee`.
+- **Build:** 7 min. **Publish:** 47 packages. Snapshots `pre-opa-blockB-0-1-47` on all 4 VMs
+  (`pre-src-binding-0-1-44` was deleted first).
 - **Install:** motherbee 19:55 UTC; spokes 19:56–19:57.
-- **Verificación en vivo:**
-  - Los 4 hives con los mismos binarios; 0 `failed`.
-  - Sin policy: los 4 con `in_sync: true` y la región en ceros. Apply global: 4,7 s, los 4 con
-    `in_sync: true` y la región igual al hash publicado.
-  - En el motherbee, `dist/policy/opa/*` es `fluxbee:fluxbee` y solo queda el wasm vigente. Las
-    réplicas no tienen `policy.rego`.
-  - Hive trabado, forzado en egress1: Syncthing cortado (nft en :22000), apply de la v18 (12 s,
-    `pending: [egress1]`, `unreachable: []`) y el manifest del motherbee copiado a mano en la copia
-    local (llega el manifest y no el wasm). Estado: `in_sync: false`,
-    `waiting {version: 18, reason: "the wasm the manifest names has not arrived"}`; el log a
-    1m0s; al desbloquear, Syncthing reconectó en ~1:40 y egress1 instaló solo
-    (`installed after waiting 2m51s`). Revert de la carpeta (`/rest/db/revert`) →
+- **Live verification:**
+  - The 4 hives with the same binaries; 0 `failed`.
+  - Without a policy: all 4 with `in_sync: true` and the region zeroed. Global apply: 4.7 s, all 4 with
+    `in_sync: true` and the region equal to the published hash.
+  - On the motherbee, `dist/policy/opa/*` is `fluxbee:fluxbee` and only the current wasm remains. The
+    replicas have no `policy.rego`.
+  - Stuck hive, forced on egress1: Syncthing cut (nft on :22000), apply of v18 (12 s,
+    `pending: [egress1]`, `unreachable: []`) and the motherbee's manifest copied by hand into the local
+    copy (the manifest arrives and the wasm does not). Status: `in_sync: false`,
+    `waiting {version: 18, reason: "the wasm the manifest names has not arrived"}`; the log at
+    1m0s; on unblocking, Syncthing reconnected in ~1:40 and egress1 installed on its own
+    (`installed after waiting 2m51s`). Revert of the folder (`/rest/db/revert`) →
     `receiveOnlyTotalItems: 0`.
-  - Con el sync cortado del todo (sin la copia a mano), egress1 se ve `in_sync: true`: compara con
-    lo que le llegó. Lo que dice que está atrasado es el `pending` del reporte del admin.
-  - Clear final: 5,3 s, los 4 sin policy. 0 rechazos del gate y 0 descartes por `routing.src` (los
-    únicos "matches" del journal eran el log del guest-agent con el propio comando de conteo).
-  - No probado en vivo (cubierto por tests): la reparación de la región a medias y la carrera
+  - With the sync cut entirely (without the hand copy), egress1 shows `in_sync: true`: it compares against
+    what it got. What says it is behind is the `pending` in the admin's report.
+  - Final clear: 5.3 s, all 4 without a policy. 0 gate rejections and 0 drops by `routing.src` (the
+    only "matches" in the journal were the guest-agent's log with the counting command itself).
+  - Not tested live (covered by tests): the repair of the half-written region and the race
     (`-race`).
-- **Rollback:** snapshot `pre-opa-blockB-0-1-47` o `apt install fluxbee=0.1.46`.
+- **Rollback:** snapshot `pre-opa-blockB-0-1-47` or `apt install fluxbee=0.1.46`.
 
-## 0.1.46 — OPA, bloque A del panel DTAP: arquitecto, reporte honesto, esperas acotadas, re-publicación, una sola vía de escritura
+## 0.1.46 — OPA, block A of the DTAP panel: architect, honest report, bounded waits, re-publishing, a single write path
 
-- **Fecha:** 2026-10-01 (ART) · **Versión anterior:** 0.1.45 · **Commit:** `7371ca1` (panel DTAP
+- **Date:** 2026-10-01 (ART) · **Previous version:** 0.1.45 · **Commit:** `7371ca1` (DTAP panel
   2026-10-01: D-1…D-8, P-4, P-5, P-12, P-14, A-1…A-3, T-5, T-11, T-13)
-- **Alcance:** motherbee + los tres spokes (core-update).
-- **Qué cambió:**
-  - El arquitecto traduce las escrituras OPA globales (`/opa/policy*`, incluido clear) y les da 80 s.
-  - El admin espera 10 s las respuestas de los hives (antes 30) y como mucho 5 s el escaneo; si el
-    motherbee no contesta el paso que cambia la policy, responde `TIMEOUT` (antes `200 ok`).
-  - El reporte espera a todos los hives `connected` del registro (alcanzables o no), marca
-    `unreachable` y solo cuenta la respuesta de `SY.opa.rules@<hive>` con el hash anunciado.
-  - El motherbee re-publica si el manifest no nombra la policy que corre.
-  - `CONFIG_SET` sobre SY.opa.rules es de solo lectura.
-- **Build:** 11 min. **Publish:** 46 paquetes. Snapshots `pre-opa-blockA-0-1-46` en las 4 VMs (se
-  borró antes `pre-sync-hint-0-1-43`).
+- **Scope:** motherbee + the three spokes (core-update).
+- **What changed:**
+  - The architect translates the global OPA writes (`/opa/policy*`, including clear) and gives them 80 s.
+  - The admin waits 10 s for the hives' answers (before, 30) and at most 5 s for the scan; if the
+    motherbee does not answer the step that changes the policy, it answers `TIMEOUT` (before, `200 ok`).
+  - The report waits for every `connected` hive in the registry (reachable or not), marks
+    `unreachable` and only counts the answer from `SY.opa.rules@<hive>` with the announced hash.
+  - The motherbee re-publishes if the manifest does not name the running policy.
+  - `CONFIG_SET` on SY.opa.rules is read-only.
+- **Build:** 11 min. **Publish:** 46 packages. Snapshots `pre-opa-blockA-0-1-46` on all 4 VMs
+  (`pre-sync-hint-0-1-43` was deleted first).
 - **Install:** motherbee 18:47 UTC; spokes 18:48–18:52.
-- **Verificación en vivo:**
-  - Los 4 hives con los mismos binarios; 0 `failed`.
-  - `CONFIG_SET` con `compile_apply` → `UNSUPPORTED_OPERATION`; la policy no cambió.
-  - Apply y clear globales: ~5 s, los 4 hives del registro en `running_hives`, `unreachable` vacío.
-  - Con Syncthing de egress1 cortado (nft en :22000): la escritura volvió en 13,6 s (antes ≥32 s)
-    con `pending: [egress1]` y `unreachable: []`; al desbloquear, egress1 se puso al día en 7 s.
-  - Manifest del motherbee alterado a mano (hash falso): re-publicado en 5,0 s.
-  - 0 rechazos del gate y 0 descartes por `routing.src` en los 4 routers; sin policy de usuario al
-    terminar.
-  - No probado en vivo (cubierto por tests): la traducción del arquitecto, el `TIMEOUT` del paso de
-    cambio y la respuesta `PUBLISH_FAILED`.
-- **Rollback:** snapshot `pre-opa-blockA-0-1-46` o `apt install fluxbee=0.1.45`.
+- **Live verification:**
+  - The 4 hives with the same binaries; 0 `failed`.
+  - `CONFIG_SET` with `compile_apply` → `UNSUPPORTED_OPERATION`; the policy did not change.
+  - Global apply and clear: ~5 s, the registry's 4 hives in `running_hives`, `unreachable` empty.
+  - With egress1's Syncthing cut (nft on :22000): the write came back in 13.6 s (before, ≥32 s)
+    with `pending: [egress1]` and `unreachable: []`; on unblocking, egress1 caught up in 7 s.
+  - The motherbee's manifest altered by hand (fake hash): re-published in 5.0 s.
+  - 0 gate rejections and 0 drops by `routing.src` on the 4 routers; no user policy at the
+    end.
+  - Not tested live (covered by tests): the architect's translation, the change step's `TIMEOUT`
+    and the `PUBLISH_FAILED` answer.
+- **Rollback:** snapshot `pre-opa-blockA-0-1-46` or `apt install fluxbee=0.1.45`.
 
-## 0.1.45 — el orquestador solo puede mandar lo que reenvía; fuera las señales de config muertas
+## 0.1.45 — the orchestrator can only send what it forwards; the dead config signals are gone
 
-- **Fecha:** 2026-10-01 (ART) · **Versión anterior:** 0.1.44 · **Commit:** `d6505ff` (FINDINGS A-20)
-- **Alcance:** motherbee + los tres spokes (core-update).
-- **Qué cambió:**
-  - Regla 3 de la policy de sistema: un `SY.orchestrator` solo puede mandar las 16 acciones que de
-    verdad reenvía a otro hive (antes, todas las protegidas salvo edge). Fuera quedan `CONFIG_SET`,
-    `CONFIG_GET`, `CONFIG_CHANGED`, `SYSTEM_UPDATE`, `SYSTEM_SYNC_HINT` e `INVENTORY_REQUEST`.
-  - Borrado lo que nadie usaba: el `CONFIG_CHANGED {node_config}` del orquestador y el flag
-    `notify`; el `CONFIG_RESPONSE` extra después de `set_storage`; el handler de CONFIG_CHANGED de
-    sy-wf-rules (aplicaba workflows sin chequear origen); la rama de io-slack. CONFIG_CHANGED queda
-    con un emisor (SY.admin) y un receptor (SY.opa.rules).
-- **Build:** 17 min. **Publish:** 45 paquetes. Snapshots `pre-rule3-0-1-45` en las 4 VMs (se borró
-  antes `pre-opa-fixes-0-1-42`).
+- **Date:** 2026-10-01 (ART) · **Previous version:** 0.1.44 · **Commit:** `d6505ff` (FINDINGS A-20)
+- **Scope:** motherbee + the three spokes (core-update).
+- **What changed:**
+  - Rule 3 of the system policy: an `SY.orchestrator` can only send the 16 actions that it
+    really forwards to another hive (before, all the protected ones except edge). Left out are `CONFIG_SET`,
+    `CONFIG_GET`, `CONFIG_CHANGED`, `SYSTEM_UPDATE`, `SYSTEM_SYNC_HINT` and `INVENTORY_REQUEST`.
+  - Deleted what nobody used: the orchestrator's `CONFIG_CHANGED {node_config}` and the
+    `notify` flag; the extra `CONFIG_RESPONSE` after `set_storage`; sy-wf-rules's CONFIG_CHANGED handler
+    (it applied workflows without checking origin); the io-slack branch. CONFIG_CHANGED is left
+    with one sender (SY.admin) and one receiver (SY.opa.rules).
+- **Build:** 17 min. **Publish:** 45 packages. Snapshots `pre-rule3-0-1-45` on all 4 VMs
+  (`pre-opa-fixes-0-1-42` was deleted first).
 - **Install:** motherbee 15:22 UTC; spokes 15:25–15:28.
-- **Verificación en vivo:**
-  - Los 4 hives con los mismos binarios; 0 `failed`.
-  - WF en worker1 (lo que más reenvíos entre orquestadores ejercita): creado en 15 s, nodo HEALTHY;
-    borrado limpio en motherbee y worker1 (sin directorio, sin entrada en el manifest, sin unit).
-  - Lecturas entre hives (`nodes`, `versions`) en worker1, ingress1 y egress1: OK.
-  - **0 rechazos del gate y 0 descartes por `routing.src`** en los 4 routers desde el deploy.
-  - OPA: apply, apply y clear `converged` (10 / 6 / 4 s).
-- **Rollback:** snapshot `pre-rule3-0-1-45` o `apt install fluxbee=0.1.44`.
+- **Live verification:**
+  - The 4 hives with the same binaries; 0 `failed`.
+  - WF on worker1 (what exercises the most forwarding between orchestrators): created in 15 s, node HEALTHY;
+    clean deletion on the motherbee and worker1 (no directory, no entry in the manifest, no unit).
+  - Reads across hives (`nodes`, `versions`) on worker1, ingress1 and egress1: OK.
+  - **0 gate rejections and 0 drops by `routing.src`** on the 4 routers since the deploy.
+  - OPA: apply, apply and clear `converged` (10 / 6 / 4 s).
+- **Rollback:** snapshot `pre-rule3-0-1-45` or `apt install fluxbee=0.1.44`.
 
-## 0.1.44 — un nodo solo manda como sí mismo; fuera el aviso de rutas; OPA más rápido
+## 0.1.44 — a node only sends as itself; the routes notice is gone; faster OPA
 
-- **Fecha:** 2026-10-01 (ART) · **Versión anterior:** 0.1.43 · **Commit:** `005d0ad` (FINDINGS A-22,
-  A-18; bitácora 2026-09-30)
-- **Alcance:** motherbee + los tres spokes (core-update).
-- **Qué cambió:**
-  - Seguridad: el router descarta un frame cuyo `routing.src` no es el UUID con el que ese socket
-    hizo HELLO. Antes un nodo que conociera el UUID de otro podía mandar como él (A-22).
-  - Se borró el CONFIG_CHANGED que el admin mandaba después de cada alta/baja de ruta, VPN o tap
-    (no lo usaba nadie) y el trato especial del router a CONFIG_CHANGED.
-  - Después de un aviso de OPA, cada hive re-chequea su copia cada 1 s durante 30 s.
-- **Build:** 17 min. **Publish:** ~6 min (44 paquetes). Snapshots `pre-src-binding-0-1-44` en las 4
-  VMs (se borró antes `pre-opa-global-0-1-41`).
+- **Date:** 2026-10-01 (ART) · **Previous version:** 0.1.43 · **Commit:** `005d0ad` (FINDINGS A-22,
+  A-18; logbook 2026-09-30)
+- **Scope:** motherbee + the three spokes (core-update).
+- **What changed:**
+  - Security: the router drops a frame whose `routing.src` is not the UUID that socket
+    did its HELLO with. Before, a node that knew another's UUID could send as it (A-22).
+  - The CONFIG_CHANGED that the admin sent after each add/remove of a route, VPN or tap was deleted
+    (nobody used it), and so was the router's special handling of CONFIG_CHANGED.
+  - After an OPA notice, each hive rechecks its copy every 1 s for 30 s.
+- **Build:** 17 min. **Publish:** ~6 min (44 packages). Snapshots `pre-src-binding-0-1-44` on all 4
+  VMs (`pre-opa-global-0-1-41` was deleted first).
 - **Install:** motherbee 03:03 UTC; spokes 03:05–03:08.
-- **Verificación en vivo:**
-  - Los 4 hives con los mismos binarios; 0 `failed`; 0 nodos caídos.
-  - Probe de suplantación en el motherbee: con el UUID del admin, ahora el router lo descarta
-    (`routing.src is not the sending node`) y SY.config.routes no responde nada; con 0.1.43 respondía.
-    Ningún descarte de tráfico legítimo en los 4 hives.
-  - OPA: apply A, apply B, rollback y clear en ~5 s cada uno (antes 8–10 s), todos `converged`.
-  - Rutas sin el aviso: una del motherbee aparece en la región LSA de worker1 a los ~11 s y se va a
-    los ~7 s; una de worker1 llega al LSA del motherbee a los ~6 s, sin tocar la config del
-    motherbee.
-  - Estado final: sin policy de usuario ni rutas de prueba.
-- **Rollback:** snapshot `pre-src-binding-0-1-44` o `apt install fluxbee=0.1.43`.
+- **Live verification:**
+  - The 4 hives with the same binaries; 0 `failed`; 0 nodes down.
+  - Impersonation probe on the motherbee: with the admin's UUID, the router now drops it
+    (`routing.src is not the sending node`) and SY.config.routes answers nothing; with 0.1.43 it answered.
+    No drops of legitimate traffic on the 4 hives.
+  - OPA: apply A, apply B, rollback and clear in ~5 s each (before, 8–10 s), all `converged`.
+  - Routes without the notice: one from the motherbee shows up in worker1's LSA region after ~11 s and goes away after
+    ~7 s; one from worker1 reaches the motherbee's LSA after ~6 s, without touching the motherbee's
+    config.
+  - Final state: no user policy and no test routes.
+- **Rollback:** snapshot `pre-src-binding-0-1-44` or `apt install fluxbee=0.1.43`.
 
-## 0.1.43 — el sync hint acepta una carpeta dist puntual (cierra el escaneo de la policy)
+## 0.1.43 — the sync hint accepts a specific dist folder (closes the policy scan)
 
-- **Fecha:** 2026-09-30 (ART) · **Versión anterior:** 0.1.42 · **Commit:** `2b3abb2` (FINDINGS A-19)
-- **Alcance:** motherbee + los tres spokes (core-update).
-- **Qué cambió:** el canal `dist` del sync hint acepta cualquier `fluxbee-dist*`; así anda el
-  escaneo de `fluxbee-dist-policy` que pide el admin justo después de publicar una policy.
-- **Build:** 9 min. **Publish:** ~6 min (43 paquetes). Snapshots `pre-sync-hint-0-1-43` en las 4 VMs
-  (se borró antes `pre-purge-order-0-1-40`).
-- **Install:** motherbee 01:43 UTC; esta vez se esperó a que el admin respondiera antes de los
+- **Date:** 2026-09-30 (ART) · **Previous version:** 0.1.42 · **Commit:** `2b3abb2` (FINDINGS A-19)
+- **Scope:** motherbee + the three spokes (core-update).
+- **What changed:** the sync hint's `dist` channel accepts any `fluxbee-dist*`; that way the
+  scan of `fluxbee-dist-policy` that the admin requests right after publishing a policy works.
+- **Build:** 9 min. **Publish:** ~6 min (43 packages). Snapshots `pre-sync-hint-0-1-43` on all 4 VMs
+  (`pre-purge-order-0-1-40` was deleted first).
+- **Install:** motherbee 01:43 UTC; this time it waited for the admin to answer before the
   spokes (01:45–01:48).
-- **Verificación en vivo:**
-  - Los 4 hives con los mismos binarios; 0 `failed`.
-  - apply A (v9) 8,4 s · apply B (v10) 10,5 s · rollback (vuelve a A) 8,4 s · clear 8,3 s: los
-    cuatro `converged: true`, con la policy correcta en los 4 hives y sus routers. El motherbee
-    escanea ~0,5 s después de aplicar; el resto es la transferencia y el chequeo de 5 s de cada hive.
-  - config-routes: alta y baja de una ruta en worker1 (v12, v13) con el motherbee intacto (v8); el
-    router de worker1 toma el cambio de su SHM al instante.
-  - Estado final: ningún hive con policy de usuario.
-- **Rollback:** snapshot `pre-sync-hint-0-1-43` o `apt install fluxbee=0.1.42`.
+- **Live verification:**
+  - The 4 hives with the same binaries; 0 `failed`.
+  - apply A (v9) 8.4 s · apply B (v10) 10.5 s · rollback (back to A) 8.4 s · clear 8.3 s: all
+    four `converged: true`, with the right policy on the 4 hives and their routers. The motherbee
+    scans ~0.5 s after applying; the rest is the transfer and each hive's 5 s check.
+  - config-routes: add and remove of a route on worker1 (v12, v13) with the motherbee untouched (v8); worker1's
+    router picks up the change from its SHM instantly.
+  - Final state: no hive with a user policy.
+- **Rollback:** snapshot `pre-sync-hint-0-1-43` or `apt install fluxbee=0.1.42`.
 
-## 0.1.42 — OPA: escanear al publicar; solo el admin primario escribe
+## 0.1.42 — OPA: scan on publish; only the primary admin writes
 
-- **Fecha:** 2026-09-30 (ART) · **Versión anterior:** 0.1.41 · **Commit:** `ac301d9` (FINDINGS
+- **Date:** 2026-09-30 (ART) · **Previous version:** 0.1.41 · **Commit:** `ac301d9` (FINDINGS
   A-19, A-20)
-- **Alcance:** motherbee + los tres spokes (core-update).
-- **Qué cambió:** el admin le pide al orquestador del motherbee que escanee `fluxbee-dist-policy`
-  antes del aviso; SY.opa.rules toma CONFIG_CHANGED solo de `SY.admin@motherbee`;
-  SY.config.routes ya no aplica listas que lleguen por CONFIG_CHANGED; la respuesta de
-  `POST /opa/policy` dice `compile_apply`.
-- **Build:** 8 min. **Publish:** ~9 min (42 paquetes). Snapshots `pre-opa-fixes-0-1-42` en las 4 VMs
-  (se borró antes `pre-identity-baseline-0-1-39`).
-- **Install:** motherbee 01:16 UTC; spokes 01:18–01:21. Un primer core-update salió sin hash porque
-  el admin todavía arrancaba: lo rechazaron, sin efecto.
-- **Verificación en vivo:** binarios iguales en los 4 hives, 0 `failed`. **El escaneo no anduvo:** el
-  orquestador rechaza `folder_id: fluxbee-dist-policy` (`INVALID_REQUEST`, solo acepta
-  `fluxbee-dist`) y sin escaneo el watcher retuvo también el apply: a los 33 s solo el motherbee
-  corría la v8, y el clear siguiente se fusionó con él en un único escaneo a los 64 s → se arregla
-  en 0.1.43.
-- **Rollback:** snapshot `pre-opa-fixes-0-1-42` o `apt install fluxbee=0.1.41`.
+- **Scope:** motherbee + the three spokes (core-update).
+- **What changed:** the admin asks the motherbee's orchestrator to scan `fluxbee-dist-policy`
+  before the notice; SY.opa.rules takes CONFIG_CHANGED only from `SY.admin@motherbee`;
+  SY.config.routes no longer applies lists that arrive through CONFIG_CHANGED; the answer of
+  `POST /opa/policy` says `compile_apply`.
+- **Build:** 8 min. **Publish:** ~9 min (42 packages). Snapshots `pre-opa-fixes-0-1-42` on all 4 VMs
+  (`pre-identity-baseline-0-1-39` was deleted first).
+- **Install:** motherbee 01:16 UTC; spokes 01:18–01:21. A first core-update went out without a hash because
+  the admin was still starting: they rejected it, with no effect.
+- **Live verification:** identical binaries on the 4 hives, 0 `failed`. **The scan did not work:** the
+  orchestrator rejects `folder_id: fluxbee-dist-policy` (`INVALID_REQUEST`, it only accepts
+  `fluxbee-dist`) and without a scan the watcher also held back the apply: after 33 s only the motherbee
+  was running v8, and the following clear merged with it into a single scan at 64 s → fixed
+  in 0.1.43.
+- **Rollback:** snapshot `pre-opa-fixes-0-1-42` or `apt install fluxbee=0.1.41`.
 
-## 0.1.41 — una sola policy OPA de usuario en todos los hives, distribuida por Syncthing
+## 0.1.41 — a single user OPA policy on every hive, distributed by Syncthing
 
-- **Fecha:** 2026-09-30 (ART) · **Versión anterior:** 0.1.40 · **Commit:** `72891be` (FINDINGS A-7;
-  bitácora 2026-09-30; [`docs/opa-distribution.md`](../docs/opa-distribution.md))
-- **Alcance:** motherbee + los tres spokes (core-update) + `hive.yaml` de motherbee, ingress1 y
-  egress1 (SY.opa.rules en ingress/egress; receta en HANDBOOK §12).
-- **Qué cambió:**
-  - SY.opa.rules corre en los 4 hives. Solo el motherbee compila: aplica y publica el wasm en la
-    carpeta Syncthing `fluxbee-dist-policy`; los demás hives lo instalan si el sha256 coincide.
-  - Las escrituras OPA son globales (`/opa/policy*`); las de un hive puntual se rechazan. La
-    respuesta dice qué hives ya la corren y cuáles siguen pendientes.
-  - CONFIG_CHANGED viaja por el ruteo normal y cruza hives; se eliminaron
-    `PUT /config/routes|vpns|taps`.
-- **Build:** 17 min. **Publish:** ~9 min (`dpkg-scanpackages` sobre 41 paquetes). Snapshots
-  `pre-opa-global-0-1-41` en las 4 VMs (se borró antes `pre-wf-mirror-0-1-38`).
-- **Migración (00:25–00:39 UTC):** `hive.yaml` del motherbee editado antes del `apt install` (backup
-  `hive.yaml.pre-opa-0-1-41`); el orquestador armó `dist/core/ingress` con 5 componentes y
-  `dist/core/egress` con 4, y el binario llegó a ingress1/egress1 en menos de un minuto; después
-  `hive.yaml` de esos dos spokes y core-update a los tres (TIMEOUT como siempre; los binarios
-  quedaron con el mismo hash que en el motherbee).
-- **Verificación en vivo:**
-  - SY.opa.rules `running` en los 4 hives (en ingress1/egress1 la unit la creó el orquestador al
-    arrancar). Carpeta `fluxbee-dist-policy`: `sendonly` con 4 devices en el motherbee (heredados
-    de vendor) y `receiveonly` con 2 en cada spoke. 0 servicios `failed`.
-  - `POST /opa/policy` (v6): `converged: true` en 16 s; los 4 routers con v6 cargada.
-  - Ponerse al día: con Syncthing de egress1 cortado (nft temporal en :22000), la v7 respondió
-    `pending: [egress1]` y egress1 siguió con su v6; al desbloquear instaló la v7 solo, en 27 s.
-  - Clear: el motherbee limpió al instante, pero los spokes tardaron ~63 s (el watcher de Syncthing
-    retiene 60 s un cambio hecho solo de renames y borrados) y la respuesta salió con los tres
-    pendientes → se arregla en 0.1.42.
-  - Escritura para un hive puntual → 400; ruta vieja `/hives/{h}/opa/policy/clear` → 404. En
+- **Date:** 2026-09-30 (ART) · **Previous version:** 0.1.40 · **Commit:** `72891be` (FINDINGS A-7;
+  logbook 2026-09-30; [`docs/opa-distribution.md`](../docs/opa-distribution.md))
+- **Scope:** motherbee + the three spokes (core-update) + `hive.yaml` of the motherbee, ingress1 and
+  egress1 (SY.opa.rules on ingress/egress; recipe in HANDBOOK §12).
+- **What changed:**
+  - SY.opa.rules runs on the 4 hives. Only the motherbee compiles: it applies and publishes the wasm in the
+    Syncthing folder `fluxbee-dist-policy`; the other hives install it if the sha256 matches.
+  - The OPA writes are global (`/opa/policy*`); those for a specific hive are rejected. The
+    answer says which hives already run it and which are still pending.
+  - CONFIG_CHANGED travels through normal routing and crosses hives;
+    `PUT /config/routes|vpns|taps` were removed.
+- **Build:** 17 min. **Publish:** ~9 min (`dpkg-scanpackages` over 41 packages). Snapshots
+  `pre-opa-global-0-1-41` on all 4 VMs (`pre-wf-mirror-0-1-38` was deleted first).
+- **Migration (00:25–00:39 UTC):** the motherbee's `hive.yaml` edited before the `apt install` (backup
+  `hive.yaml.pre-opa-0-1-41`); the orchestrator built `dist/core/ingress` with 5 components and
+  `dist/core/egress` with 4, and the binary reached ingress1/egress1 in under a minute; then
+  the `hive.yaml` of those two spokes and a core-update to the three (TIMEOUT as always; the binaries
+  ended up with the same hash as on the motherbee).
+- **Live verification:**
+  - SY.opa.rules `running` on the 4 hives (on ingress1/egress1 the unit was created by the orchestrator at
+    startup). Folder `fluxbee-dist-policy`: `sendonly` with 4 devices on the motherbee (inherited
+    from vendor) and `receiveonly` with 2 on each spoke. 0 `failed` services.
+  - `POST /opa/policy` (v6): `converged: true` in 16 s; the 4 routers with v6 loaded.
+  - Catching up: with egress1's Syncthing cut (temporary nft on :22000), v7 answered
+    `pending: [egress1]` and egress1 stayed on its v6; on unblocking it installed v7 on its own, in 27 s.
+  - Clear: the motherbee cleared instantly, but the spokes took ~63 s (Syncthing's watcher
+    holds a change made only of renames and deletions for 60 s) and the answer went out with all three
+    pending → fixed in 0.1.42.
+  - Write for a specific hive → 400; old route `/hives/{h}/opa/policy/clear` → 404. On
     ingress1/egress1: `/var/lib/fluxbee/opa` `700`, SHM `600`.
-  - Factory reset en dry-run: ahora lista la policy de los 4 hives.
-- **Rollback:** snapshot `pre-opa-global-0-1-41`, o `apt install fluxbee=0.1.40` + restaurar
-  `hive.yaml.pre-opa-0-1-41` en motherbee, ingress1 y egress1.
-  - **Nota (2026-10-01, panel DTAP P-9):** antes del `apt install`, `POST /opa/policy/clear` y
-    esperar `converged: true`; si no, la última policy global queda aplicada en los workers y en
-    memoria en los routers de ingress/egress. Ver HANDBOOK §12, "El rollback".
+  - Factory reset in dry-run: it now lists the policy of the 4 hives.
+- **Rollback:** snapshot `pre-opa-global-0-1-41`, or `apt install fluxbee=0.1.40` + restore
+  `hive.yaml.pre-opa-0-1-41` on the motherbee, ingress1 and egress1.
+  - **Note (2026-10-01, DTAP panel P-9):** before the `apt install`, `POST /opa/policy/clear` and
+    wait for `converged: true`; otherwise, the last global policy stays applied on the workers and in
+    memory in the ingress/egress routers. See HANDBOOK §12, "The rollback".
 
-## 0.1.40 — purga de WF en el motherbee en orden y tolerante a "ya no existe"
+## 0.1.40 — WF purge on the motherbee in order and tolerant of "no longer exists"
 
-- **Fecha:** 2026-09-30 (ART) · **Versión anterior:** 0.1.39 · **Commit:** `43dd174` (FINDINGS A-15)
-- **Qué cambió:** en un worker, wf-rules purga en el motherbee dejando la versión current al final
-  (el admin no deja borrarla mientras haya otras) y toma `RUNTIME_NOT_FOUND` /
-  `RUNTIME_VERSION_NOT_FOUND` como hecho.
-- **Build:** 7 min. **Install:** motherbee 23:03 UTC; spokes 23:05 (solo cambió wf-rules).
-- **Verificación en vivo — ciclo completo de un WF en worker1:**
-  - crear → nodo HEALTHY en 0.0.1 (18 s: publica, espera la sync, spawnea);
-  - re-aplicar con cambio → HEALTHY en 0.0.2 (18 s);
-  - borrar → OK; el motherbee queda sin versiones ni entrada en el manifest; el espejo de worker1
-    con 0 cambios locales (19/19).
-  - Limpieza: `AI.vaultprobe@worker1` borrado con su ILK purgado (el primario vuelve a 24 ILKs,
-    como al empezar el día); sin nodos ni scripts de prueba en las VMs.
-- **Rollback:** snapshot `pre-purge-order-0-1-40` o `apt install fluxbee=0.1.39`.
+- **Date:** 2026-09-30 (ART) · **Previous version:** 0.1.39 · **Commit:** `43dd174` (FINDINGS A-15)
+- **What changed:** on a worker, wf-rules purges on the motherbee leaving the current version for last
+  (the admin does not let it be deleted while there are others) and treats `RUNTIME_NOT_FOUND` /
+  `RUNTIME_VERSION_NOT_FOUND` as done.
+- **Build:** 7 min. **Install:** motherbee 23:03 UTC; spokes 23:05 (only wf-rules changed).
+- **Live verification — full cycle of a WF on worker1:**
+  - create → node HEALTHY on 0.0.1 (18 s: publishes, waits for the sync, spawns);
+  - re-apply with a change → HEALTHY on 0.0.2 (18 s);
+  - delete → OK; the motherbee is left without versions or a manifest entry; worker1's mirror
+    with 0 local changes (19/19).
+  - Cleanup: `AI.vaultprobe@worker1` deleted with its ILK purged (the primary goes back to 24 ILKs,
+    as at the start of the day); no test nodes or scripts on the VMs.
+- **Rollback:** snapshot `pre-purge-order-0-1-40` or `apt install fluxbee=0.1.39`.
 
-## 0.1.39 — identity no borra los ILK de un hive que arrancó sin primario; purga de WF dirigida
+## 0.1.39 — identity does not delete the ILKs of a hive that started without a primary; targeted WF purge
 
-- **Fecha:** 2026-09-30 (ART) · **Versión anterior:** 0.1.38 · **Commits:** `2248612`, `85c3244`
-  (FINDINGS A-15, A-17). Un primer build de 0.1.39 sin `85c3244` se rehízo antes de publicarse.
-- **Qué cambió:** la réplica de identity no publica su conjunto de ILK propios hasta tener una base
-  del primario; wf-rules dirige `remove_runtime_version` al motherbee (`target`).
-- **Install:** motherbee 22:38 UTC; spokes 22:41 (solo se reiniciaron identity y wf-rules, que eran
-  los binarios cambiados).
-- **Verificación en vivo:**
-  - Réplica de worker1 arrancada con el primario bloqueado (nft temporal): logueó
-    `holding its self-owned snapshot` mientras estuvo sin base; al volver, snapshot de 25 ILKs. El
-    primario **siguió en 25, con el ILK de `AI.vaultprobe@worker1`** (con 0.1.38 había pasado de
-    25 a 24).
-  - Workflow en worker1: creado en 3 s, nodo HEALTHY. Delete: el motherbee borró la 0.0.1 y la
-    sync limpió worker1 sin cambios locales, pero la purga cortó en la 0.0.2 (`RUNTIME_NOT_FOUND`:
-    directorio huérfano) → se arregla en 0.1.40.
-- **Rollback:** snapshot `pre-identity-baseline-0-1-39` o `apt install fluxbee=0.1.38`.
+- **Date:** 2026-09-30 (ART) · **Previous version:** 0.1.38 · **Commits:** `2248612`, `85c3244`
+  (FINDINGS A-15, A-17). A first build of 0.1.39 without `85c3244` was redone before being published.
+- **What changed:** the identity replica does not publish its set of self-owned ILKs until it has a baseline
+  from the primary; wf-rules targets `remove_runtime_version` at the motherbee (`target`).
+- **Install:** motherbee 22:38 UTC; spokes 22:41 (only identity and wf-rules were restarted, which were
+  the changed binaries).
+- **Live verification:**
+  - Worker1's replica started with the primary blocked (temporary nft): it logged
+    `holding its self-owned snapshot` while it had no baseline; when it came back, a snapshot of 25 ILKs. The
+    primary **stayed at 25, with the ILK of `AI.vaultprobe@worker1`** (with 0.1.38 it had gone from
+    25 to 24).
+  - Workflow on worker1: created in 3 s, node HEALTHY. Delete: the motherbee deleted 0.0.1 and the
+    sync cleaned worker1 without local changes, but the purge stopped at 0.0.2 (`RUNTIME_NOT_FOUND`:
+    orphan directory) → fixed in 0.1.40.
+- **Rollback:** snapshot `pre-identity-baseline-0-1-39` or `apt install fluxbee=0.1.38`.
 
-## 0.1.38 — wf-rules no toca el espejo `dist/` de un worker; el orquestador no spawnea sin archivos
+## 0.1.38 — wf-rules does not touch a worker's `dist/` mirror; the orchestrator does not spawn without files
 
-- **Fecha:** 2026-09-30 (ART) · **Versión anterior:** 0.1.37 · **Commits:** `676732d`, `20baec3`
+- **Date:** 2026-09-30 (ART) · **Previous version:** 0.1.37 · **Commits:** `676732d`, `20baec3`
   (FINDINGS A-15)
-- **Qué cambió:** en un hive que no es el motherbee, wf-rules purga pidiéndole
-  `remove_runtime_version` al admin en vez de borrar su espejo; el orquestador responde
-  `RUNTIME_NOT_PRESENT` hasta que el `package.json` del paquete está en el hive.
+- **What changed:** on a hive that is not the motherbee, wf-rules purges by asking the admin for
+  `remove_runtime_version` instead of deleting its mirror; the orchestrator answers
+  `RUNTIME_NOT_PRESENT` until the package's `package.json` is on the hive.
 - **Build:** 4 min (incremental). **Install:** motherbee 22:07 UTC; spokes 22:10–22:12.
-- **Reparación puntual:** espejo `dist-runtimes` de worker1 restaurado con `POST /rest/db/revert`
-  de Syncthing (15 → 0 cambios locales). Después `WF.w1probe@worker1` quedó HEALTHY: **el primer WF
-  corriendo en un worker**.
-- **Verificación en vivo:** el delete dejó el espejo limpio (0 cambios locales), pero el pedido al
-  admin salía sin `target` (`INVALID_REQUEST`) → se arregla en 0.1.39.
-- **Rollback:** snapshot `pre-wf-mirror-0-1-38` o `apt install fluxbee=0.1.37`.
+- **One-off repair:** worker1's `dist-runtimes` mirror restored with Syncthing's `POST /rest/db/revert`
+  (15 → 0 local changes). Afterwards `WF.w1probe@worker1` was HEALTHY: **the first WF
+  running on a worker**.
+- **Live verification:** the delete left the mirror clean (0 local changes), but the request to the
+  admin went out without `target` (`INVALID_REQUEST`) → fixed in 0.1.39.
+- **Rollback:** snapshot `pre-wf-mirror-0-1-38` or `apt install fluxbee=0.1.37`.
 
-## 0.1.37 — lo que salió de validar 0.1.36: spawn de WF en workers, veredicto del vault, permisos de OPA
+## 0.1.37 — what came out of validating 0.1.36: WF spawn on workers, the vault's verdict, OPA permissions
 
-- **Fecha:** 2026-09-30 (ART) · **Versión anterior:** 0.1.36 · **Commits:** `3055a40`, `6c708a6`,
-  `c09f9af` (FINDINGS A-12 a A-14)
-- **Alcance:** motherbee + los tres spokes (core-update).
-- **Qué cambió:**
-  - wf-rules espera (hasta 20 s) a que el paquete recién publicado llegue al hive antes de spawnear.
-  - SDK: `VaultClient::get`/`list` conservan el veredicto del vault (`KEY_NOT_FOUND` ya no llega
-    como error JSON).
-  - SY.opa.rules: SHM `0600` (era `0666`), policy `0600`, dirs `0700`.
-- **Build:** VM110 `build-deb.sh 0.1.37` (22 min) → publish (37 paquetes). Snapshots
-  `pre-followups-0-1-37` en las 4 VMs (se borró antes el más viejo de cada una).
-- **Install:** motherbee 21:37 UTC; spokes 21:40–21:42 (TIMEOUT como siempre; `rt-gateway` con el
-  mismo hash en los 4 hives).
-- **Verificación en vivo:**
-  - `/dev/shm/jsr-opa-motherbee` y `…-worker1` → `rw-------`; `/var/lib/fluxbee/opa` → `700`.
-  - Workflow en worker1: `RUNTIME_NOT_AVAILABLE` a las 21:43:39/40/42/46 y spawn OK a las 21:43:51,
-    cuando llegó el manifest. **El nodo quedó en crash-loop** por archivos del paquete faltantes:
-    wf-rules los había borrado del espejo local (A-15) → se arregla en 0.1.38.
-- **Rollback:** snapshot `pre-followups-0-1-37` o `apt install fluxbee=0.1.36` + core-update.
+- **Date:** 2026-09-30 (ART) · **Previous version:** 0.1.36 · **Commits:** `3055a40`, `6c708a6`,
+  `c09f9af` (FINDINGS A-12 to A-14)
+- **Scope:** motherbee + the three spokes (core-update).
+- **What changed:**
+  - wf-rules waits (up to 20 s) for the freshly published package to reach the hive before spawning.
+  - SDK: `VaultClient::get`/`list` keep the vault's verdict (`KEY_NOT_FOUND` no longer arrives
+    as a JSON error).
+  - SY.opa.rules: SHM `0600` (it was `0666`), policy `0600`, dirs `0700`.
+- **Build:** VM110 `build-deb.sh 0.1.37` (22 min) → publish (37 packages). Snapshots
+  `pre-followups-0-1-37` on all 4 VMs (the oldest one on each was deleted first).
+- **Install:** motherbee 21:37 UTC; spokes 21:40–21:42 (TIMEOUT as always; `rt-gateway` with the
+  same hash on the 4 hives).
+- **Live verification:**
+  - `/dev/shm/jsr-opa-motherbee` and `…-worker1` → `rw-------`; `/var/lib/fluxbee/opa` → `700`.
+  - Workflow on worker1: `RUNTIME_NOT_AVAILABLE` at 21:43:39/40/42/46 and spawn OK at 21:43:51,
+    when the manifest arrived. **The node ended up in a crash-loop** because of missing package files:
+    wf-rules had deleted them from the local mirror (A-15) → fixed in 0.1.38.
+- **Rollback:** snapshot `pre-followups-0-1-37` or `apt install fluxbee=0.1.36` + core-update.
 
-## 0.1.36 — config con alcance de hive, control de origen, vault/admin desde workers, identity se pone al día
+## 0.1.36 — config with hive scope, origin control, vault/admin from workers, identity catches up
 
-- **Fecha:** 2026-09-30 (ART) · **Versión anterior:** 0.1.35 · **Commits:** `ad48ecb`, `15d53cc`,
+- **Date:** 2026-09-30 (ART) · **Previous version:** 0.1.35 · **Commits:** `ad48ecb`, `15d53cc`,
   `d24e3aa`
-- **Alcance:** **motherbee + los tres spokes** (core-update a worker1, ingress1 y egress1: cambian
-  el router, SY.config.routes, identity, cognition y los nodos Go).
-- **Qué cambió** (bitácora 2026-09-30; FINDINGS A-8 a A-11). Los cuatro bugs se confirmaron en
-  vivo con 0.1.35 antes de tocar nada:
-  - `ConfigChangedPayload.hive`: un `add_route` en worker1 ya no pisa las rutas del motherbee, y
-    una operación OPA dirigida a worker1 ya no se ejecuta en el motherbee.
-  - CONFIG_CHANGED pasa a ser acción protegida (gate en el router). SY.config.routes y
-    SY.opa.rules solo aceptan mutaciones y comandos de `SY.admin@motherbee`.
-  - `VaultClient::for_primary` y wf-rules → `SY.admin@motherbee`: AI, cognition, IO y WF en un
-    worker llegan al vault y al admin.
-  - La réplica de identity se resincroniza con un snapshot en cada suscripción.
-- **Build:** VM110 `build-deb.sh 0.1.36` (22 min: cambió el SDK) → publish (36 paquetes).
-  Snapshots `pre-config-scope-0-1-36` en las 4 VMs (la más vieja de VM100 se borró antes).
-- **Install:** motherbee 20:42→20:43 UTC; core-update de los spokes → `TIMEOUT` como siempre, pero
-  aplicado: `rt-gateway` con el mismo hash en los 4 hives y servicios reiniciados 20:44–20:46.
-- **Verificación en vivo** (los mismos pasos que confirmaron cada bug):
-  - Dos altas en worker1 → el motherbee sigue en 0 rutas; su SY.config.routes loguea
+- **Scope:** **motherbee + the three spokes** (core-update to worker1, ingress1 and egress1: the
+  router, SY.config.routes, identity, cognition and the Go nodes change).
+- **What changed** (logbook 2026-09-30; FINDINGS A-8 to A-11). The four bugs were confirmed
+  live on 0.1.35 before touching anything:
+  - `ConfigChangedPayload.hive`: an `add_route` on worker1 no longer overwrites the motherbee's routes, and
+    an OPA operation targeted at worker1 no longer runs on the motherbee.
+  - CONFIG_CHANGED becomes a protected action (gate in the router). SY.config.routes and
+    SY.opa.rules only accept mutations and commands from `SY.admin@motherbee`.
+  - `VaultClient::for_primary` and wf-rules → `SY.admin@motherbee`: AI, cognition, IO and WF on a
+    worker reach the vault and the admin.
+  - The identity replica resyncs with a snapshot on every subscription.
+- **Build:** VM110 `build-deb.sh 0.1.36` (22 min: the SDK changed) → publish (36 packages).
+  Snapshots `pre-config-scope-0-1-36` on all 4 VMs (the oldest one on VM100 was deleted first).
+- **Install:** motherbee 20:42→20:43 UTC; core-update of the spokes → `TIMEOUT` as always, but
+  applied: `rt-gateway` with the same hash on the 4 hives and services restarted 20:44–20:46.
+- **Live verification** (the same steps that confirmed each bug):
+  - Two additions on worker1 → the motherbee stays at 0 routes; its SY.config.routes logs
     `config changed addressed to another hive; ignoring`.
-  - Nodo falso: CONFIG_CHANGED → `router dropped CONFIG_CHANGED from unauthorized origin`;
-    `add_route` directo → `FORBIDDEN`; `rollback_policy` → `UNAUTHORIZED`. Rutas intactas.
-  - `node_config` legítimo del orquestador en worker1 → pasa el gate.
-  - AI y cognition en worker1 consultan `SY.vault@motherbee` (antes `NODE_NOT_FOUND` contra
+  - Fake node: CONFIG_CHANGED → `router dropped CONFIG_CHANGED from unauthorized origin`;
+    direct `add_route` → `FORBIDDEN`; `rollback_policy` → `UNAUTHORIZED`. Routes intact.
+  - The orchestrator's legitimate `node_config` on worker1 → passes the gate.
+  - AI and cognition on worker1 query `SY.vault@motherbee` (before, `NODE_NOT_FOUND` against
     `SY.vault@worker1`).
-  - Workflow en worker1 → **publica** (antes `PACKAGE_PUBLISH_FAILED: UNREACHABLE`). El primer
-    spawn todavía choca con la sincronización de Syncthing (~11 s): se arregla en 0.1.37.
-  - Réplica de worker1 arrancada con el primario inalcanzable (regla nft temporal) → DEGRADED →
-    al volver la conexión, `identity full sync applied (delta stream subscribed)` sola.
-  - Clear de OPA dirigido a worker1 → el motherbee lo ignora; el admin informa `pending worker1`
-    (que llegue a los spokes es el diseño pendiente, A-7).
-- **Rollback:** snapshot `pre-config-scope-0-1-36` (las 4 VMs) o `apt install fluxbee=0.1.35` +
-  core-update de los spokes.
+  - Workflow on worker1 → **publishes** (before, `PACKAGE_PUBLISH_FAILED: UNREACHABLE`). The first
+    spawn still collides with Syncthing's sync (~11 s): fixed in 0.1.37.
+  - Worker1's replica started with the primary unreachable (temporary nft rule) → DEGRADED →
+    when the connection came back, `identity full sync applied (delta stream subscribed)` on its own.
+  - OPA clear targeted at worker1 → the motherbee ignores it; the admin reports `pending worker1`
+    (reaching the spokes is the pending design, A-7).
+- **Rollback:** snapshot `pre-config-scope-0-1-36` (all 4 VMs) or `apt install fluxbee=0.1.35` +
+  core-update of the spokes.
 
-## 0.1.35 — admin: los orquestadores vuelven a poder marcar el ILK de un nodo (fix de 0.1.34)
+## 0.1.35 — admin: the orchestrators can mark a node's ILK again (fix for 0.1.34)
 
-- **Fecha:** 2026-09-28 (ART) · **Versión anterior:** 0.1.34 · **Commit:** `5f1cd71`
-- **Alcance:** **motherbee** (VM100). Solo cambian SY.admin y el script de reset; los spokes siguen
-  con el core de 0.1.34 (el admin no corre en ellos).
-- **Qué cambió:** la **regresión de 0.1.34**. Al sumar `delete_ilk` a la superficie de Cloud, el
-  gate de relay (EDGE-06) empezó a rechazar el teardown del **orquestador**. El kill con
-  `purge_instance` respondía ok pero dejaba el ILK del nodo **activo y huérfano**. Fix: cualquier
-  `SY.orchestrator@*` puede usar `delete_ilk` (y solo eso), siguiendo la regla hermana de
-  `vault_put`. Además, el reset verifica OPA por resultado, hive por hive.
-- **Build:** VM110 `build-deb.sh 0.1.35` (7 min) → publish (35 paquetes).
-- **Verificación en vivo:**
-  - e2e 27/31. Los 4 FAIL son hallazgos previos y explicados: la réplica rechaza el listado del
-    admin y la escritura de OPA no llega a los spokes.
-  - Se verificó el kill+purge: el ILK del nodo queda purgado y el nombre libre.
-  - **Reset instalado por el `.deb`** con datos reales: 1 nodo, 2 ILKs, 2 secretos, **8 tenants**
-    y la política OPA v5, con RC=0 y 0 problemas. El segundo dry-run da vacío.
-  - Puerta de Cloud en 200, con 13 acciones.
-- **Rollback:** snapshot `pre-teardown-fix-0-1-35` (VM100) o `apt install fluxbee=0.1.34`, que
-  re-introduce la regresión.
+- **Date:** 2026-09-28 (ART) · **Previous version:** 0.1.34 · **Commit:** `5f1cd71`
+- **Scope:** **motherbee** (VM100). Only SY.admin and the reset script change; the spokes stay
+  on the 0.1.34 core (the admin does not run on them).
+- **What changed:** the **0.1.34 regression**. When `delete_ilk` was added to Cloud's surface, the
+  relay gate (EDGE-06) started rejecting the **orchestrator's** teardown. The kill with
+  `purge_instance` answered ok but left the node's ILK **active and orphaned**. Fix: any
+  `SY.orchestrator@*` can use `delete_ilk` (and only that), following the sibling rule of
+  `vault_put`. Also, the reset verifies OPA by result, hive by hive.
+- **Build:** VM110 `build-deb.sh 0.1.35` (7 min) → publish (35 packages).
+- **Live verification:**
+  - e2e 27/31. The 4 FAILs are earlier, explained findings: the replica rejects the admin's
+    listing and the OPA write does not reach the spokes.
+  - The kill+purge was verified: the node's ILK ends up purged and the name free.
+  - **Reset installed by the `.deb`** with real data: 1 node, 2 ILKs, 2 secrets, **8 tenants**
+    and OPA policy v5, with RC=0 and 0 problems. The second dry-run comes out empty.
+  - Cloud's door at 200, with 13 actions.
+- **Rollback:** snapshot `pre-teardown-fix-0-1-35` (VM100) or `apt install fluxbee=0.1.34`, which
+  reintroduces the regression.
 
-## 0.1.34 — identity: marcar / restaurar / purgar · `opa_clear` · reset a fábrica completo
+## 0.1.34 — identity: mark / restore / purge · `opa_clear` · full factory reset
 
-- **Fecha:** 2026-09-28 (ART) · **Versión anterior:** 0.1.33 · **Commits:** `13f426f`, `60331c5`
-  (más `f47dcb2` y `c1fee0d` del reset).
-- **Alcance:** **motherbee + los 3 spokes**, con core update, porque cambian el router,
-  SY.identity y SY.opa.rules, que también corren en los spokes.
-- **Qué cambió:**
-  - **Identity:** borrar un ILK o un tenant solo **marca**. La marca es reversible, oculta el
-    registro y deja sus claves reservadas; la **purga** es física y exige la marca. El tenant
-    marca en cascada a sus ILKs.
-  - **Migración de DB v2.**
-  - **Cloud:** marca y restaura, siempre acotado al tenant que reclama; **no puede purgar**.
-  - **`opa_clear`:** los routers descargan la política de usuario (antes la ignoraban hasta
-    reiniciarse).
-  - **`fluxbee-factory-reset`:** viaja en el `.deb`.
-- **Build:** VM110 `build-deb.sh 0.1.34` (24 min) → publish (34 paquetes). Snapshots
-  `pre-lifecycle-0-1-34` en las 4 VMs.
-- **Verificación en vivo:**
-  - la migración v2 se aplicó;
-  - los spokes hicieron el core update (hash `e67a8815…`) y sus servicios reiniciaron;
-  - e2e 26/30 por la puerta pública real: marcar, ocultar, reservar, scope por tenant, cascada,
-    restaurar y purgar;
-  - el router descargó la política OPA (visto en su log).
-- **Regresión encontrada en el e2e:** el teardown del orquestador quedó bloqueado. Se corrigió en
+- **Date:** 2026-09-28 (ART) · **Previous version:** 0.1.33 · **Commits:** `13f426f`, `60331c5`
+  (plus `f47dcb2` and `c1fee0d` for the reset).
+- **Scope:** **motherbee + the 3 spokes**, with core update, because the router,
+  SY.identity and SY.opa.rules change, and they also run on the spokes.
+- **What changed:**
+  - **Identity:** deleting an ILK or a tenant only **marks** it. The mark is reversible, hides the
+    record and keeps its keys reserved; the **purge** is physical and requires the mark. The tenant
+    marks its ILKs in cascade.
+  - **DB migration v2.**
+  - **Cloud:** marks and restores, always scoped to the tenant that claims; it **cannot purge**.
+  - **`opa_clear`:** the routers unload the user policy (before, they ignored it until
+    restarted).
+  - **`fluxbee-factory-reset`:** ships in the `.deb`.
+- **Build:** VM110 `build-deb.sh 0.1.34` (24 min) → publish (34 packages). Snapshots
+  `pre-lifecycle-0-1-34` on all 4 VMs.
+- **Live verification:**
+  - the v2 migration was applied;
+  - the spokes did the core update (hash `e67a8815…`) and their services restarted;
+  - e2e 26/30 through the real public door: mark, hide, reserve, scope by tenant, cascade,
+    restore and purge;
+  - the router unloaded the OPA policy (seen in its log).
+- **Regression found in the e2e:** the orchestrator's teardown got blocked. It was fixed in
   0.1.35.
-- **Rollback:** snapshot `pre-lifecycle-0-1-34` (las 4 VMs) o `apt install fluxbee=0.1.33`. Ojo:
-  la migración v2 solo **agrega** columnas, así que 0.1.33 las ignora sin problema.
+- **Rollback:** snapshot `pre-lifecycle-0-1-34` (all 4 VMs) or `apt install fluxbee=0.1.33`. Note:
+  the v2 migration only **adds** columns, so 0.1.33 ignores them without a problem.
 
-## 0.1.33 — io.cloud: get_ilk email-SOLO (cross-tenant) — el login del website
+## 0.1.33 — io.cloud: email-ONLY get_ilk (cross-tenant) — the website login
 
-- **Fecha:** 2026-08-28 (ART) · **Versión anterior:** 0.1.32 · **Commit:** `01b6266`
-- **Alcance:** **motherbee** (VM100). io.cloud + fluxbee_sdk (warn seqlock en el reader de listado) + docs.
-- **Qué cambió:** el website (OAuth Google) tiene SOLO el email en el primer login; `params.tenant_id` ahora es
-  OPCIONAL con `params.email`. Con tenant: probe O(1) 0.1.32 sin cambios. SIN tenant: scan cross-tenant de los
-  canales `cloud` (`list_ich_options_from_hive_id`, propaga errores) → `{exists, ilk: solo si match único,
-  matches:[UN subset POR tenant donde existe el email — cada uno con su tenant_id]}`. De `matches` el website
-  saca el tenant; 0 matches → create_tenant+register_human; N matches → selector de empresa.
-- **Hardening de la review (2 MEDIUM pre-ship):** (1) `tenant_id` PRESENTE pero malformado (número, vacío,
-  formato inválido) = error fuerte — nunca ensancha silenciosamente un probe con tenant a scan global (branch
-  por presencia de key, no por parse); (2) `matches` garantiza uno-por-tenant: estados transitorios de identity
-  (ventana de merge-alias, address takeover) pueden dejar 2 ilks activos en un mismo (cloud,email,tenant) — los
-  tenants ambiguos se re-prueban con el resolver O(1) autoritativo (misma respuesta que el probe con tenant).
-  + LOW: warn en seqlock-timeout del reader de listado (outages de first-login diagnósticables).
-- **Semántica aceptada (documentada):** canales disabled matchean (register_human los crea enabled:false — un
-  filtro estricto rompería el first-login); el scan es O(hive) por request (aceptado al tamaño actual; list_ilks
-  ya escanea igual). Oráculo email→tenants expuesto SOLO a la clase de caller ya confiada (bearer del edge,
-  default-deny sin edge configurado).
-- **Build:** VM110 `build-deb.sh 0.1.33` → publish repo :8900 (33 paquetes).
-- **Verificación E2E (7/7 desde internet):** login 1-empresa (`ilk` poblado con tenant), register en 2ª empresa,
-  login 2-empresas (`ilk:null, matches:[2]` uno por tenant), email desconocido (`exists:false`), `tenant_id:42`
-  → error fuerte (no scan), y regresiones email+tenant / ilk_id intactas.
-- **Rollback:** `apt install fluxbee=0.1.32` (aditivo; los selectores 0.1.32 no cambiaron).
+- **Date:** 2026-08-28 (ART) · **Previous version:** 0.1.32 · **Commit:** `01b6266`
+- **Scope:** **motherbee** (VM100). io.cloud + fluxbee_sdk (seqlock warn in the listing reader) + docs.
+- **What changed:** the website (Google OAuth) has ONLY the email at first login; `params.tenant_id` is now
+  OPTIONAL with `params.email`. With a tenant: the 0.1.32 O(1) probe, unchanged. WITHOUT a tenant: cross-tenant scan of the
+  `cloud` channels (`list_ich_options_from_hive_id`, propagates errors) → `{exists, ilk: only if unique match,
+  matches:[ONE subset PER tenant where the email exists — each one with its tenant_id]}`. From `matches` the website
+  gets the tenant; 0 matches → create_tenant+register_human; N matches → company selector.
+- **Review hardening (2 MEDIUM pre-ship):** (1) `tenant_id` PRESENT but malformed (number, empty,
+  invalid format) = hard error — it never silently widens a probe with a tenant into a global scan (branch
+  on key presence, not on parse); (2) `matches` guarantees one-per-tenant: transient identity states
+  (merge-alias window, address takeover) can leave 2 active ilks in the same (cloud,email,tenant) — the
+  ambiguous tenants are re-tested with the authoritative O(1) resolver (same answer as the probe with a tenant).
+  + LOW: warn on the listing reader's seqlock-timeout (first-login outages diagnosable).
+- **Accepted semantics (documented):** disabled channels match (register_human creates them enabled:false — a
+  strict filter would break the first-login); the scan is O(hive) per request (accepted at the current size; list_ilks
+  already scans the same way). Email→tenants oracle exposed ONLY to the already trusted caller class (the edge's bearer,
+  default-deny with no edge configured).
+- **Build:** VM110 `build-deb.sh 0.1.33` → publish to the :8900 repo (33 packages).
+- **E2E verification (7/7 from the internet):** 1-company login (`ilk` populated with the tenant), register in a 2nd company,
+  2-company login (`ilk:null, matches:[2]` one per tenant), unknown email (`exists:false`), `tenant_id:42`
+  → hard error (no scan), and email+tenant / ilk_id regressions intact.
+- **Rollback:** `apt install fluxbee=0.1.32` (additive; the 0.1.32 selectors did not change).
 
-## 0.1.32 — io.cloud: selector por EMAIL en get_ilk / get_ilk_details
+## 0.1.32 — io.cloud: selector by EMAIL in get_ilk / get_ilk_details
 
-- **Fecha:** 2026-08-27 (ART) · **Versión anterior:** 0.1.31 · **Commit:** `90fd64a` (branch `daily_onworking_coa`)
-- **Alcance:** **motherbee** (VM100). Toca `io.cloud` + `fluxbee_sdk` (identity readers + catálogo cloud) + docs.
-- **Qué cambió:** el Cloud tiene el email del humano (login Google) pero no el `ilk_id`; ambos reads aceptan
-  `params.email` + `params.tenant_id` como selector alternativo a `params.ilk_id` (exactly-one, en ambos ops).
-  El email ES la dirección del canal `cloud` del ilk (register_human lo provisiona así) → el `get_ilk` local
-  resuelve con un probe O(1) del índice SHM `(canal, dirección, tenant)` — patrón io.api inbound; más barato que
-  el propio path por id (O(n)). `get_ilk_details` pre-resuelve email→ilk_id local y relaya el `get_ilk` de admin
-  sin cambios (admin/identity no ganan selector email; `ILK_NOT_FOUND` sin tocar admin si no matchea).
-  `tenant_id` OBLIGATORIO con email (unicidad por `(canal, dirección, tenant)` — el mismo email puede ser dos
-  ilks en dos empresas) y validado canónico `tnt:<uuid>` fail-loud. SDK: variantes
-  `resolve_identity_option_*_strict` (SHM ilegible = `Err`, nunca miss silencioso — el laundering F-09 es para
-  el degrade de io.api, no para un read API autoritativo).
-- **Review adversarial (2 lentes) pre-ship:** ambos MEDIUM corregidos ANTES del deploy (semántica strict de SHM;
-  exactly-one en el op con PII); oráculo cross-tenant descartado (el tenant integra la key del índice); el LOW de
-  request_id era falso positivo (el wrapper del run_loop lo inyecta). Tests: SDK 6/6+6/6, io-cloud 9/9, admin 3/3.
-- **Build:** fb-build (VM110), `build-deb.sh 0.1.32` → 245 MB · publish repo :8900 (32 paquetes).
-- **Deploy:** reboot (qga caído, patrón conocido) → `apt install fluxbee=0.1.32` → el restart manual de io.cloud
-  llegó antes de que el unit existiera, y **el liveness-reconcile de 0.1.30 lo respawneó solo con el binario
-  nuevo** (~60s) — el fix anterior auto-desplegó este feature.
-- **Verificación E2E (10/10 desde internet):** hit por email (`exists:true` + subset), case-insensitive, miss,
-  tenant equivocado → `exists:false` (aislamiento), exactly-one en ambos ops, email-sin-tenant error claro,
-  details por email → ficha completa, `ILK_NOT_FOUND` con request_id, y regresión por `ilk_id` OK.
-- **Rollback:** `apt install fluxbee=0.1.31` (feature aditivo; el selector por id no cambió).
+- **Date:** 2026-08-27 (ART) · **Previous version:** 0.1.31 · **Commit:** `90fd64a` (branch `daily_onworking_coa`)
+- **Scope:** **motherbee** (VM100). Touches `io.cloud` + `fluxbee_sdk` (identity readers + cloud catalog) + docs.
+- **What changed:** Cloud has the human's email (Google login) but not the `ilk_id`; both reads accept
+  `params.email` + `params.tenant_id` as an alternative selector to `params.ilk_id` (exactly-one, in both ops).
+  The email IS the address of the ilk's `cloud` channel (register_human provisions it that way) → the local `get_ilk`
+  resolves with an O(1) probe of the SHM index `(channel, address, tenant)` — io.api inbound pattern; cheaper than
+  the by-id path itself (O(n)). `get_ilk_details` pre-resolves email→ilk_id locally and relays the admin's `get_ilk`
+  unchanged (admin/identity do not gain an email selector; `ILK_NOT_FOUND` without touching the admin if it does not match).
+  `tenant_id` REQUIRED with email (uniqueness by `(channel, address, tenant)` — the same email can be two
+  ilks in two companies) and validated as canonical `tnt:<uuid>`, fail-loud. SDK: variants
+  `resolve_identity_option_*_strict` (unreadable SHM = `Err`, never a silent miss — the F-09 laundering is for
+  io.api's degrade, not for an authoritative read API).
+- **Adversarial review (2 lenses) pre-ship:** both MEDIUMs fixed BEFORE the deploy (strict SHM semantics;
+  exactly-one in the op with PII); cross-tenant oracle ruled out (the tenant is part of the index key); the request_id
+  LOW was a false positive (the run_loop wrapper injects it). Tests: SDK 6/6+6/6, io-cloud 9/9, admin 3/3.
+- **Build:** fb-build (VM110), `build-deb.sh 0.1.32` → 245 MB · publish to the :8900 repo (32 packages).
+- **Deploy:** reboot (qga down, known pattern) → `apt install fluxbee=0.1.32` → the manual restart of io.cloud
+  came before the unit existed, and **0.1.30's liveness-reconcile respawned it on its own with the new
+  binary** (~60s) — the previous fix auto-deployed this feature.
+- **E2E verification (10/10 from the internet):** hit by email (`exists:true` + subset), case-insensitive, miss,
+  wrong tenant → `exists:false` (isolation), exactly-one in both ops, email-without-tenant clear error,
+  details by email → full record, `ILK_NOT_FOUND` with request_id, and the regression by `ilk_id` OK.
+- **Rollback:** `apt install fluxbee=0.1.31` (additive feature; the by-id selector did not change).
 
-## 0.1.31 — SDK/rpc: fix del veneno del edge (response_only familia-completa) — el bug real de crearPersona
+## 0.1.31 — SDK/rpc: fix for the edge poison (family-wide response_only) — the real crearPersona bug
 
-- **Fecha:** 2026-08-26 (ART) · **Versión anterior:** 0.1.30 · **Commit:** `862c5e4` (branch `daily_onworking_coa`)
-- **Alcance:** **motherbee** (VM100). Toca `crates/fluxbee_sdk/src/rpc.rs` — linkeado estático en TODOS los binarios (rebuild integral del .deb; hicieron falta reboot para respawnear los runtimes con el SDK nuevo).
-- **El bug (prod, determinístico):** `register_human` en io.cloud espera el veredicto del frontdesk con
-  `send_with_matcher(frontdesk_reply_matcher())` cuyo success matcher es `any_msg_type(user)` (inevitable: el
-  veredicto es un frame `user` con `meta.msg=None`). `send_with_matcher` registraba los success shapes en el
-  registro **PERMANENTE** `response_only` (solo-insert, se arma AL ENVIAR). `classify` consulta ese registro por
-  FORMA (sin trace) ANTES del catch-all `Any→Command` de io.cloud → tras UN `register_human` (éxito O timeout),
-  TODO frame user-kind entrante (todos los Cloud requests del edge) se descartaba como "orphaned response" en
-  silencio (debug-level) → edge 504 → Cloud "crearPersona falló (FRONTDESK_REJECTED)". Solo un restart curaba.
-  **Probado por 3 vías:** código, panel de 4 mappers, y experimento controlado en prod (baseline 200×3 →
-  1 register SUCCESS → probe 6s después timeout permanente). Refuta el framing "presence decay ~6min":
-  monitor 12min solo-lists = 36/36 OK; VM100 sana en pleno fallo (cpu 0%, mem 15%) — NO era Proxmox/memoria.
-- **El fix:** `register_response_only` saltea `AnyMsgOfType` (misma razón que el skip de `Any`: global drops).
-  Exact/OneOf siguen registrándose — protecciones AF-P2b del orquestador intactas. Late replies familia-completa
-  quedan cubiertas por pending (trace) + stale table (30s TTL) + gates propios de cada nodo (io.cloud ignora
-  src≠edge fail-closed). **Desactiva 3 bombas: io.cloud (detonada), io.api (handoff idéntico) y
-  `sy_admin::send_admin_request` (`any_msg_type(admin)`).** Helper muerto removido; test venenoso invertido en
-  regresión `family_wide_success_matcher_never_poisons_command_traffic`; doc RPC multiplexing actualizado.
-- **Review:** 39/39 tests SDK verdes · adversarial 3 lentes (blast-radius de todos los callers, ventanas de
-  protección, coherencia de tests): **0 HIGH / 0 MEDIUM**, solo LOW de corrimiento de métricas/logs.
+- **Date:** 2026-08-26 (ART) · **Previous version:** 0.1.30 · **Commit:** `862c5e4` (branch `daily_onworking_coa`)
+- **Scope:** **motherbee** (VM100). Touches `crates/fluxbee_sdk/src/rpc.rs` — statically linked into ALL the binaries (full rebuild of the .deb; reboots were needed to respawn the runtimes with the new SDK).
+- **The bug (prod, deterministic):** `register_human` in io.cloud waits for the frontdesk's verdict with
+  `send_with_matcher(frontdesk_reply_matcher())` whose success matcher is `any_msg_type(user)` (unavoidable: the
+  verdict is a `user` frame with `meta.msg=None`). `send_with_matcher` registered the success shapes in the
+  **PERMANENT** `response_only` registry (insert-only, filled in WHEN SENDING). `classify` checks that registry by
+  SHAPE (no trace) BEFORE io.cloud's `Any→Command` catch-all → after ONE `register_human` (success OR timeout),
+  EVERY incoming user-kind frame (all of the edge's Cloud requests) was dropped as an "orphaned response"
+  silently (debug-level) → edge 504 → Cloud "crearPersona falló (FRONTDESK_REJECTED)" ("crearPersona failed (FRONTDESK_REJECTED)"). Only a restart cured it.
+  **Proven 3 ways:** code, a panel of 4 mappers, and a controlled experiment in prod (baseline 200×3 →
+  1 register SUCCESS → probe 6s later, permanent timeout). Refutes the "presence decay ~6min" framing:
+  12min lists-only monitor = 36/36 OK; VM100 healthy in the middle of the failure (cpu 0%, mem 15%) — it was NOT Proxmox/memory.
+- **The fix:** `register_response_only` skips `AnyMsgOfType` (same reason as the `Any` skip: global drops).
+  Exact/OneOf are still registered — the orchestrator's AF-P2b protections intact. Family-wide late replies
+  stay covered by pending (trace) + stale table (30s TTL) + each node's own gates (io.cloud ignores
+  src≠edge, fail-closed). **Defuses 3 bombs: io.cloud (detonated), io.api (identical handoff) and
+  `sy_admin::send_admin_request` (`any_msg_type(admin)`).** Dead helper removed; poisonous test inverted into the
+  regression `family_wide_success_matcher_never_poisons_command_traffic`; RPC multiplexing doc updated.
+- **Review:** 39/39 SDK tests green · adversarial, 3 lenses (blast radius of every caller, protection
+  windows, test coherence): **0 HIGH / 0 MEDIUM**, only LOW about metrics/logs drift.
 - **Build:** fb-build (VM110), `build-deb.sh 0.1.31` → 234 MB. **Publish:** `apt-repo-publish.sh` → repo :8900
-  (ojo: el server `:8900` es un unit transient `systemd-run` que NO sobrevive reboots de VM110 — hubo que relevantarlo).
-- **Verificación en vivo (E2E desde internet, post-reboot):** **4 `register_human` consecutivos** (3 frescos +
-  1 repetido idempotente, incluido el flujo real del operador) todos `status=ok success=True reg=complete`, con
-  `list_cloud_actions` 200 intercalado tras CADA uno + estabilidad 200×3 — con 0.1.30 el primer register mataba
-  todo el tráfico posterior del edge.
-- **Rollback:** snapshot `pre-rpc-poison-fix-0-1-31` (VM100) o `apt install fluxbee=0.1.30` + reboot (re-introduce el veneno).
+  (note: the `:8900` server is a transient `systemd-run` unit that does NOT survive VM110 reboots — it had to be brought back up).
+- **Live verification (E2E from the internet, post-reboot):** **4 consecutive `register_human`** (3 fresh +
+  1 idempotent repeat, including the operator's real flow) all `status=ok success=True reg=complete`, with
+  `list_cloud_actions` 200 interleaved after EACH one + 200×3 stability — with 0.1.30 the first register killed
+  all the later edge traffic.
+- **Rollback:** snapshot `pre-rpc-poison-fix-0-1-31` (VM100) or `apt install fluxbee=0.1.30` + reboot (reintroduces the poison).
 
-## 0.1.30 — orquestador: self-heal de runtimes managed muertos + adiós `is_packaged_singleton`
+## 0.1.30 — orchestrator: self-heal of dead managed runtimes + goodbye `is_packaged_singleton`
 
-- **Fecha:** 2026-08-26 (ART) · **Versión anterior:** 0.1.29 · **Commit:** `af1166a` (branch `daily_onworking_coa`)
+- **Date:** 2026-08-26 (ART) · **Previous version:** 0.1.29 · **Commit:** `af1166a` (branch `daily_onworking_coa`)
   (+ `9e81687` reword docs "singleton"→"managed runtime").
-- **Alcance:** **motherbee** (VM100). Toca `sy_orchestrator` + `fluxbee_sdk::managed_node`.
-- **El bug (prod):** `IO.cloud@motherbee` fue hallado MUERTO (unit transient inactive) con la MB 19.8 días up y
-  nada lo resucitaba: los runtimes managed corren con `systemd-run --property Restart=always`, pero si agotan el
-  start-limit nadie los recrea — `reconcile_persisted_custom_nodes` corría SOLO en el bootstrap, y el watchdog de
-  5s solo los LOGUEABA ("node disconnected") mientras SÍ reinicia SY.*/rt-gateway → edge 504 hasta el próximo boot.
-- **El fix:** `run_managed_runtime_reconcile_loop` — task PROPIA de 60s (NO el hot-path del watchdog de 5s: un
-  systemctl lento jamás frena el self-heal de SY.*) que re-corre el reconcile persistido; el reconcile ahora hace
-  `try_lock_node` (SO-04) por nodo — si un admin-op tiene el lock, saltea y reintenta el ciclo siguiente. Solo
-  revive nodos `relaunch_on_boot=true`. **Nota operativa:** `kill_node` sin purge de un nodo boot ahora revive en
-  ≤60s (consistente con SY.*; bajar durable = purge). Además: borrado el mecanismo muerto
-  `is_packaged_singleton`/`PACKAGED_SINGLETON_NODES` (lista vacía; el guard de doble-dueño lo sostiene `kind=="SY"`/RT.gateway).
-- **Review:** adversarial 3 lentes — el hallazgo mayor (reconcile inline bloqueaba el watchdog) se corrigió
-  ANTES del deploy (task propia + try_lock).
+- **Scope:** **motherbee** (VM100). Touches `sy_orchestrator` + `fluxbee_sdk::managed_node`.
+- **The bug (prod):** `IO.cloud@motherbee` was found DEAD (transient unit inactive) with the MB up for 19.8 days, and
+  nothing brought it back: the managed runtimes run with `systemd-run --property Restart=always`, but if they exhaust the
+  start-limit nobody recreates them — `reconcile_persisted_custom_nodes` ran ONLY at bootstrap, and the 5s watchdog
+  only LOGGED them ("node disconnected") while it DOES restart SY.*/rt-gateway → edge 504 until the next boot.
+- **The fix:** `run_managed_runtime_reconcile_loop` — its OWN 60s task (NOT the 5s watchdog's hot path: a
+  slow systemctl never holds back the self-heal of SY.*) that re-runs the persisted reconcile; the reconcile now does
+  `try_lock_node` (SO-04) per node — if an admin-op holds the lock, it skips and retries on the next cycle. It only
+  revives `relaunch_on_boot=true` nodes. **Operational note:** `kill_node` without purge of a boot node now revives in
+  ≤60s (consistent with SY.*; a durable take-down = purge). Also: deleted the dead mechanism
+  `is_packaged_singleton`/`PACKAGED_SINGLETON_NODES` (empty list; the double-owner guard is held by `kind=="SY"`/RT.gateway).
+- **Review:** adversarial, 3 lenses — the major finding (the inline reconcile blocked the watchdog) was fixed
+  BEFORE the deploy (own task + try_lock).
 - **Build:** fb-build (VM110), `build-deb.sh 0.1.30` → 234 MB. **Publish:** repo :8900.
-- **Verificación en vivo:** boot-reconcile relanzó los 9 runtimes (`started=9 skipped=0 failed=0`); el loop
-  periódico corre cada 60s exacto (`reconcile completed started=0 skipped=9`); endpoint Cloud 200 post-boot.
-- **Rollback:** snapshot `pre-liveness-fix-0-1-30` (VM100) o `apt install fluxbee=0.1.29`.
+- **Live verification:** boot-reconcile relaunched the 9 runtimes (`started=9 skipped=0 failed=0`); the periodic
+  loop runs exactly every 60s (`reconcile completed started=0 skipped=9`); Cloud endpoint 200 post-boot.
+- **Rollback:** snapshot `pre-liveness-fix-0-1-30` (VM100) or `apt install fluxbee=0.1.29`.
 
-## 0.1.29 — io.cloud: camino de LECTURA de Cloud (fase 2) — reads rápidos SHM + get_ilk_details relay
+## 0.1.29 — io.cloud: Cloud's READ path (phase 2) — fast SHM reads + get_ilk_details relay
 
-- **Fecha:** 2026-08-25 (ART) · **Versión anterior:** 0.1.28 · **Commit:** `a0bc25d` (branch `daily_onworking_coa`)
-- **Alcance:** **motherbee** (VM100). Toca `fluxbee_sdk::cloud` + el nodo runtime `IO.cloud` + el nodo core `SY.admin`.
-- **Qué cambió:** le da a Fluxbee Cloud una forma de **leer** lo que creó (patrón io.api: existencia/subset desde la
-  SHM local sin round-trip; data completa por relay a admin).
-  - **SDK (single source):** `CLOUD_LOCAL_OPS += get_ilk/get_tenant/list_ilks` (reads SHM que io.cloud sirve solo);
-    `CLOUD_OP_ACTIONS += get_ilk_details → get_ilk` (relay). `CLOUD_EXPOSED_ACTIONS` gana `get_ilk` → admin
-    `authorize_cloud_relay` + el catálogo Cloud lo auto-permiten/publican (advertised==enforced). `cloud_action_catalog` documenta las 4.
-  - **io.cloud:** `handle_shm_read` lee la SHM de identidad vía `fluxbee_sdk::identity` (`list_ilks_from_hive_id`/
-    `tenant_exists_in_hive_id`, por `config.hive_id`) — los mismos readers de io.api, **sin round-trip**. Subset
-    `{ilk_id, ilk_type, registration_status, tenant_id, display_name}`. `get_ilk_details` → admin `get_ilk` (identification PII + canales + tenant).
+- **Date:** 2026-08-25 (ART) · **Previous version:** 0.1.28 · **Commit:** `a0bc25d` (branch `daily_onworking_coa`)
+- **Scope:** **motherbee** (VM100). Touches `fluxbee_sdk::cloud` + the runtime node `IO.cloud` + the core node `SY.admin`.
+- **What changed:** gives Fluxbee Cloud a way to **read** what it created (io.api pattern: existence/subset from the
+  local SHM without a round-trip; full data by relay to the admin).
+  - **SDK (single source):** `CLOUD_LOCAL_OPS += get_ilk/get_tenant/list_ilks` (SHM reads that io.cloud serves alone);
+    `CLOUD_OP_ACTIONS += get_ilk_details → get_ilk` (relay). `CLOUD_EXPOSED_ACTIONS` gains `get_ilk` → the admin's
+    `authorize_cloud_relay` + the Cloud catalog auto-allow/publish it (advertised==enforced). `cloud_action_catalog` documents the 4.
+  - **io.cloud:** `handle_shm_read` reads the identity SHM via `fluxbee_sdk::identity` (`list_ilks_from_hive_id`/
+    `tenant_exists_in_hive_id`, by `config.hive_id`) — the same readers as io.api, **without a round-trip**. Subset
+    `{ilk_id, ilk_type, registration_status, tenant_id, display_name}`. `get_ilk_details` → the admin's `get_ilk` (identification PII + channels + tenant).
 - **Build:** fb-build (VM110), `build-deb.sh 0.1.29` → 245 MB. **Publish:** `apt-repo-publish.sh` → repo :8900.
-- **Verificación en vivo (E2E desde ingress):** las **4 ops OK** — `get_ilk` `{exists,ilk:subset}`; `get_tenant`
-  `{exists,ilk_count:4}`; `list_ilks` `{count:4, ilks:[…pepito…]}`; `get_ilk_details` registro completo
+- **Live verification (E2E from ingress):** the **4 ops OK** — `get_ilk` `{exists,ilk:subset}`; `get_tenant`
+  `{exists,ilk_count:4}`; `list_ilks` `{count:4, ilks:[…pepito…]}`; `get_ilk_details` full record
   (`identification{email,phone,company,attributes}` + `channels` + `tenant{pepito}`). SDK 5/0 · io.cloud 9/0 ·
-  admin catalog test actualizado. **0 units failed**, io.cloud `NRestarts=0` (un 502 transitorio inicial por el ICH
-  re-registrándose tras el restart). **Contrato para Cloud dev en `docs/io-cloud-api.md` §4.6–4.9.**
-- **Nota (owner-deferred):** ownership de tenant sigue MVP-trusted — un holder del bearer puede leer cualquier id
-  que nombre (misma postura que las escrituras).
-- **Rollback:** snapshot VM100 `pre-cloud-readpath-0-1-29`, o `apt-get install -y --allow-downgrades fluxbee=0.1.28`.
+  admin catalog test updated. **0 units failed**, io.cloud `NRestarts=0` (an initial transient 502 because of the ICH
+  re-registering after the restart). **Contract for Cloud dev in `docs/io-cloud-api.md` §4.6–4.9.**
+- **Note (owner-deferred):** tenant ownership is still MVP-trusted — a holder of the bearer can read any id
+  it names (same posture as the writes).
+- **Rollback:** VM100 snapshot `pre-cloud-readpath-0-1-29`, or `apt-get install -y --allow-downgrades fluxbee=0.1.28`.
 
 ---
 
-## 0.1.28 — frontdesk: reconciliar CONFIG_GET/CONFIG_SET con el modelo autónomo (Model D', como architect)
+## 0.1.28 — frontdesk: reconcile CONFIG_GET/CONFIG_SET with the autonomous model (Model D', like architect)
 
-- **Fecha:** 2026-08-25 (ART) · **Versión anterior:** 0.1.27 · **Commit:** `1438737` (branch `daily_onworking_coa`)
-- **Alcance:** **motherbee** (VM100). Toca el nodo core `SY.frontdesk.gov` (`ai_node_runner`).
-- **Qué cambió:** un panel de 4 agentes confirmó que architect Y el executor de admin son autónomos **y
-  MANTIENEN** un CONFIG_GET/CONFIG_SET reconciliado — así que conformar = **reconciliar, no borrar** el plano.
-  - **`refresh_ai_gate()`**: el seam único de resolve-token-y-setear-gate (análogo a `refresh_architect_ai_runtime`),
-    ahora usado por `boot_self_configure`, `handle_vault_secret_changed` **y** CONFIG_SET.
-  - **CONFIG_SET (Fork B, owner-confirmado):** era inyector de config; ahora modelo architect — **rechaza TODO**
-    campo config/secret/behavior (`frontdesk_rejected_config_field`) y es un **disparador de re-resolve del token
-    del vault**; no persiste nada.
-  - **CONFIG_GET reconciliado:** `ok` ahora refleja el gate del token (Configured), no la presencia de config;
-    `required_fields`/`optional_fields` → `[]`; agrega `config.ai {default_provider, model}` (hive-wide); renombra
-    `secrets[]` → `resources[]` (+required) espejando architect; notas autónomas.
-  - Removidas las 5 huérfanas de inyección (`ok_response`, `persist_dynamic_config`, `write_json_atomic`,
-    `first_secret_bearing_config_field`, `parse_effective_config_doc`; su test re-apuntado). 27/0 tests.
+- **Date:** 2026-08-25 (ART) · **Previous version:** 0.1.27 · **Commit:** `1438737` (branch `daily_onworking_coa`)
+- **Scope:** **motherbee** (VM100). Touches the core node `SY.frontdesk.gov` (`ai_node_runner`).
+- **What changed:** a panel of 4 agents confirmed that architect AND the admin's executor are autonomous **and
+  KEEP** a reconciled CONFIG_GET/CONFIG_SET — so conforming = **reconcile, not delete** the plane.
+  - **`refresh_ai_gate()`**: the single resolve-token-and-set-gate seam (analogous to `refresh_architect_ai_runtime`),
+    now used by `boot_self_configure`, `handle_vault_secret_changed` **and** CONFIG_SET.
+  - **CONFIG_SET (Fork B, owner-confirmed):** it was a config injector; now the architect model — **rejects EVERY**
+    config/secret/behavior field (`frontdesk_rejected_config_field`) and is a **trigger to re-resolve the vault
+    token**; it persists nothing.
+  - **CONFIG_GET reconciled:** `ok` now reflects the token gate (Configured), not the presence of config;
+    `required_fields`/`optional_fields` → `[]`; adds `config.ai {default_provider, model}` (hive-wide); renames
+    `secrets[]` → `resources[]` (+required) mirroring architect; autonomous notes.
+  - Removed the 5 injection orphans (`ok_response`, `persist_dynamic_config`, `write_json_atomic`,
+    `first_secret_bearing_config_field`, `parse_effective_config_doc`; their test repointed). 27/0 tests.
 - **Build:** fb-build (VM110), `build-deb.sh 0.1.28` → 245 MB. **Publish:** `apt-repo-publish.sh` → repo :8900.
-- **Verificación en vivo:** `0.1.28`; **boot autónomo sigue OK** (degraded → VAULT_SECRET_CHANGED → Configured);
-  **regresión handoff determinista** → HTTP 200 `success:true complete`; **0 units failed**. (Nota: la ruta operador
-  `GET /nodes/.../config` da `NODE_CONFIG_NOT_FOUND` porque lee un ARCHIVO de config persistido que el nodo autónomo
-  ya no tiene — igual que architect; el CONFIG_GET vivo se sirve por el canal mesh, verificado en código + tests.)
-- **DIFERIDO (pasada de limpieza catalogada, marcado por el panel):** la ruta `--config`/`run_one_config` (YAML,
-  MUERTA en prod — el unit systemd no pasa `--config`) + sus helpers + los tipos de input YAML + los pre-existentes
+- **Live verification:** `0.1.28`; **autonomous boot still OK** (degraded → VAULT_SECRET_CHANGED → Configured);
+  **deterministic handoff regression** → HTTP 200 `success:true complete`; **0 units failed**. (Note: the operator route
+  `GET /nodes/.../config` gives `NODE_CONFIG_NOT_FOUND` because it reads a persisted config FILE that the autonomous node
+  no longer has — same as architect; the live CONFIG_GET is served over the mesh channel, verified in code + tests.)
+- **DEFERRED (catalogued cleanup pass, flagged by the panel):** the `--config`/`run_one_config` route (YAML,
+  DEAD in prod — the systemd unit does not pass `--config`) + its helpers + the YAML input types + the pre-existing
   `with_jitter`/`parse`.
-- **Rollback:** snapshot VM100 `pre-frontdesk-configplane-0-1-28`, o `apt-get install -y --allow-downgrades fluxbee=0.1.27`.
+- **Rollback:** VM100 snapshot `pre-frontdesk-configplane-0-1-28`, or `apt-get install -y --allow-downgrades fluxbee=0.1.27`.
 
 ---
 
-## 0.1.27 — frontdesk: bootstrap AUTÓNOMO (resuelve el token del vault al boot + actúa en el broadcast)
+## 0.1.27 — frontdesk: AUTONOMOUS bootstrap (resolves the vault token at boot + acts on the broadcast)
 
-- **Fecha:** 2026-08-25 (ART) · **Versión anterior:** 0.1.26 · **Commit:** `000de90` (branch `daily_onworking_coa`)
-- **Alcance:** **motherbee** (VM100). Toca el nodo core `SY.frontdesk.gov` (`ai_node_runner`).
-- **Qué cambió:** el frontdesk se conforma al patrón canónico de nodo system SY.* (verificado con un panel contra
-  `SY.architect` `build_architect_ai_runtime`/`refresh_architect_ai_runtime` y el executor de `SY.admin` — mismo
-  mecanismo, mismo seam). Es un nodo **autónomo**: su runtime AI es **baked** (siempre ai_chat — prompt
-  `frontdesk_default_instructions` + engine `load_hive_ai_engine` hive.yaml/fallback), y el **único input externo
-  es el token del vault**.
-  - **Boot:** arma el behavior baked, `boot_self_configure` resuelve el token (`resolve_ai_api_key`, Model D' root)
-    → `Configured` si está, sino `Unconfigured` (degradado — el handoff determinista igual anda). Build baked
-    falla (hive.yaml roto) → `FAILED_CONFIG`.
-  - **Broadcast:** `handle_vault_secret_changed` era un no-op probe+log (EL bug — nunca cambiaba estado); ahora
-    **actúa** como `refresh_architect_ai_runtime` — re-resuelve y setea `Configured`/`Unconfigured` en vivo.
-  - Reusa solo seams existentes (sin builder ni vault-path nuevos). 27/0 tests.
+- **Date:** 2026-08-25 (ART) · **Previous version:** 0.1.26 · **Commit:** `000de90` (branch `daily_onworking_coa`)
+- **Scope:** **motherbee** (VM100). Touches the core node `SY.frontdesk.gov` (`ai_node_runner`).
+- **What changed:** the frontdesk conforms to the canonical SY.* system node pattern (verified with a panel against
+  `SY.architect` `build_architect_ai_runtime`/`refresh_architect_ai_runtime` and the `SY.admin` executor — same
+  mechanism, same seam). It is an **autonomous** node: its AI runtime is **baked** (always ai_chat — prompt
+  `frontdesk_default_instructions` + engine `load_hive_ai_engine` hive.yaml/fallback), and the **only external input
+  is the vault token**.
+  - **Boot:** builds the baked behavior, `boot_self_configure` resolves the token (`resolve_ai_api_key`, Model D' root)
+    → `Configured` if it is there, otherwise `Unconfigured` (degraded — the deterministic handoff still works). Baked build
+    fails (broken hive.yaml) → `FAILED_CONFIG`.
+  - **Broadcast:** `handle_vault_secret_changed` was a no-op probe+log (THE bug — it never changed state); now it
+    **acts** like `refresh_architect_ai_runtime` — re-resolves and sets `Configured`/`Unconfigured` live.
+  - Reuses only existing seams (no new builder or vault path). 27/0 tests.
 - **Build:** fb-build (VM110), `build-deb.sh 0.1.27` → 245 MB. **Publish:** `apt-repo-publish.sh` → repo :8900.
-- **Verificación en vivo:** `0.1.27` instalado; **el frontdesk pasó a `Configured` desde el token del vault** en el
-  arranque (boot degradado 00:52:19 → `VAULT_SECRET_CHANGED` op=put openai_api_key 00:52:20 → **Configured, LLM
-  path live**) — sin CONFIG_SET. **Regresión handoff determinista OK** (register_human desde ingress → HTTP 200
-  `success:true registration_status:complete`; un 502 transitorio inicial por io.cloud re-registrando su ICH tras
-  el restart). frontdesk + io.cloud `active`, `NRestarts=0`, **0 units failed**.
-- **DIFERIDO (EDIT 3, owner-confirmado, a pasada de limpieza catalogada):** sacar el plano CONFIG_SET/spawn
-  (`apply_config_set` + `load_persisted_dynamic_config` en AMBAS rutas de boot + ~6 helpers) — cascada enredada;
-  por la regla "no borrar a ciegas" queda para una pasada dedicada. `apply_config_set` sigue funcional (nadie le
-  manda CONFIG_SET al frontdesk en la práctica). Warnings pre-existentes `with_jitter`/`parse` también a esa pasada.
-- **Rollback:** snapshot VM100 `pre-frontdesk-autonomous-0-1-27`, o `apt-get install -y --allow-downgrades fluxbee=0.1.26`.
+- **Live verification:** `0.1.27` installed; **the frontdesk moved to `Configured` from the vault token** at
+  startup (degraded boot 00:52:19 → `VAULT_SECRET_CHANGED` op=put openai_api_key 00:52:20 → **Configured, LLM
+  path live**) — without CONFIG_SET. **Deterministic handoff regression OK** (register_human from ingress → HTTP 200
+  `success:true registration_status:complete`; an initial transient 502 because io.cloud was re-registering its ICH after
+  the restart). frontdesk + io.cloud `active`, `NRestarts=0`, **0 units failed**.
+- **DEFERRED (EDIT 3, owner-confirmed, to a catalogued cleanup pass):** remove the CONFIG_SET/spawn plane
+  (`apply_config_set` + `load_persisted_dynamic_config` in BOTH boot routes + ~6 helpers) — a tangled cascade;
+  under the "no borrar a ciegas" ("do not delete blindly") rule it is left for a dedicated pass. `apply_config_set` still works (nobody
+  sends CONFIG_SET to the frontdesk in practice). Pre-existing warnings `with_jitter`/`parse` also go to that pass.
+- **Rollback:** VM100 snapshot `pre-frontdesk-autonomous-0-1-27`, or `apt-get install -y --allow-downgrades fluxbee=0.1.26`.
 
 ---
 
-## 0.1.26 — frontdesk: el handoff determinista (JSON) corre sin el gate de Configured/LLM (fix register_human)
+## 0.1.26 — frontdesk: the deterministic handoff (JSON) runs without the Configured/LLM gate (register_human fix)
 
-- **Fecha:** 2026-08-24 (ART) · **Versión anterior:** 0.1.25 · **Commit:** `cb2d192` (branch `daily_onworking_coa`)
-- **Alcance:** **motherbee** (VM100). Toca el nodo core `SY.frontdesk.gov` (`ai_node_runner`).
-- **Root cause (hallado con la observabilidad de 0.1.25):** `register_human` nunca completaba porque el frontdesk
-  **está UNCONFIGURED en todos los boots** (nunca fue seedeado ni recibió CONFIG_SET) y `on_message` rechazaba
-  **TODO** mensaje `user` con `node_not_configured` **antes** de mirar el payload → io.cloud lo veía como
-  `FRONTDESK_REJECTED` → el ilk quedaba `temporary`. (Confirmado por la línea `Cloud op completed error_code=FRONTDESK_REJECTED` + el frontdesk sin logs de handoff.)
-- **Qué cambió:** el alta de humano tiene DOS métodos distinguidos por el **método**, no por ser humano: **auto**
-  (llega un JSON `frontdesk_handoff` → determinista, ILK_REGISTER, sin LLM) y **conversacional** (el humano charla
-  y el LLM junta los datos). El método determinista se maneja **antes** del gate de Configured → `register_human`
-  registra aunque el frontdesk no tenga LLM. El path conversacional/LLM sigue requiriendo Configured.
-  `handle_frontdesk_handoff` es config-independiente. Test nuevo `frontdesk_handoff_runs_deterministically_even_when_unconfigured`.
+- **Date:** 2026-08-24 (ART) · **Previous version:** 0.1.25 · **Commit:** `cb2d192` (branch `daily_onworking_coa`)
+- **Scope:** **motherbee** (VM100). Touches the core node `SY.frontdesk.gov` (`ai_node_runner`).
+- **Root cause (found with 0.1.25's observability):** `register_human` never completed because the frontdesk
+  **is UNCONFIGURED on every boot** (it was never seeded nor received CONFIG_SET) and `on_message` rejected
+  **EVERY** `user` message with `node_not_configured` **before** looking at the payload → io.cloud saw it as
+  `FRONTDESK_REJECTED` → the ilk stayed `temporary`. (Confirmed by the line `Cloud op completed error_code=FRONTDESK_REJECTED` + the frontdesk without handoff logs.)
+- **What changed:** human sign-up has TWO methods, distinguished by the **method**, not by being human: **auto**
+  (a `frontdesk_handoff` JSON arrives → deterministic, ILK_REGISTER, no LLM) and **conversational** (the human chats
+  and the LLM gathers the data). The deterministic method is handled **before** the Configured gate → `register_human`
+  registers even if the frontdesk has no LLM. The conversational/LLM path still requires Configured.
+  `handle_frontdesk_handoff` is config-independent. New test `frontdesk_handoff_runs_deterministically_even_when_unconfigured`.
 - **Build:** fb-build (VM110), `build-deb.sh 0.1.26` → 245 MB. **Publish:** `apt-repo-publish.sh` → repo :8900.
-- **Verificación en vivo:** `fluxbee 0.1.26` instalado; **frontdesk reinició (18:40) + `active`**, io.cloud `active`
-  `NRestarts=0`, **0 units `failed`**. Pre-deploy: sy-frontdesk-gov 27/0 tests verdes. **Pendiente:** E2E del
-  register_human desde la pantalla (debería registrar ahora → ilk `complete`).
-- **Tema 2 (separado):** el secret openai NO se perdió; el frontdesk está UNCONFIGURED sólo porque nunca fue
-  configurado (peer AI.chat tiene config v2). El path conversacional/LLM necesita configurar el frontdesk — aparte.
-- **Rollback:** snapshot VM100 `pre-frontdesk-handoff-0-1-26`, o `apt-get install -y --allow-downgrades fluxbee=0.1.25`.
+- **Live verification:** `fluxbee 0.1.26` installed; **frontdesk restarted (18:40) + `active`**, io.cloud `active`
+  `NRestarts=0`, **0 units `failed`**. Pre-deploy: sy-frontdesk-gov 27/0 tests green. **Pending:** E2E of
+  register_human from the screen (it should register now → ilk `complete`).
+- **Topic 2 (separate):** the openai secret was NOT lost; the frontdesk is UNCONFIGURED only because it was never
+  configured (peer AI.chat has config v2). The conversational/LLM path needs the frontdesk configured — a separate matter.
+- **Rollback:** VM100 snapshot `pre-frontdesk-handoff-0-1-26`, or `apt-get install -y --allow-downgrades fluxbee=0.1.25`.
 
 ---
 
-## 0.1.25 — observabilidad: outcome de cada op de Cloud + veredicto del frontdesk (fase 1 consolidación tenant/ILK)
+## 0.1.25 — observability: outcome of every Cloud op + the frontdesk's verdict (phase 1 of the tenant/ILK consolidation)
 
-- **Fecha:** 2026-08-24 (ART) · **Versión anterior:** 0.1.24 · **Commit:** `69b1c46` (branch `daily_onworking_coa`)
-- **Alcance:** **motherbee** (VM100). Toca el nodo runtime `IO.cloud` + el nodo core `SY.frontdesk.gov` (`ai_node_runner`). **Solo logging, cero cambio de comportamiento.**
-- **Qué cambió (impacto operativo):** hacer visible el round-trip para diagnosticar por qué un `register_human` no completa (hoy el frontdesk procesa+responde pero no logea nada a INFO → el veredicto es invisible).
-  - **io.cloud:** la línea de **egreso/outcome** que faltaba — cada op de Cloud logea `{status, error_code, registration_status, ilk_id, tenant_id, elapsed_ms}` a INFO, con el **mismo `trace_id`** que el ingreso → el round-trip completo edge→io.cloud→admin/identity/frontdesk queda greppable por `trace_id`. (Detalle: dentro de los macros `tracing::*` un `Value` pelado resuelve a `tracing::Value`, así que las lecturas serde usan closures.)
-  - **frontdesk (Gov):** promover a INFO/WARN la **decisión del handoff** en cada salida: parseó-como-handoff vs cayó-a-conversacional (**WARN** cuando un payload con forma de handoff NO parsea — la falla silenciosa que estamos cazando), operación no soportada, incompleto→needs_input (ilk NO registrado), REGISTERED (complete), o register FAILED.
+- **Date:** 2026-08-24 (ART) · **Previous version:** 0.1.24 · **Commit:** `69b1c46` (branch `daily_onworking_coa`)
+- **Scope:** **motherbee** (VM100). Touches the runtime node `IO.cloud` + the core node `SY.frontdesk.gov` (`ai_node_runner`). **Logging only, zero behavior change.**
+- **What changed (operational impact):** make the round-trip visible to diagnose why a `register_human` does not complete (today the frontdesk processes+answers but logs nothing at INFO → the verdict is invisible).
+  - **io.cloud:** the missing **egress/outcome** line — every Cloud op logs `{status, error_code, registration_status, ilk_id, tenant_id, elapsed_ms}` at INFO, with the **same `trace_id`** as the ingress → the full round-trip edge→io.cloud→admin/identity/frontdesk becomes greppable by `trace_id`. (Detail: inside the `tracing::*` macros a bare `Value` resolves to `tracing::Value`, so the serde reads use closures.)
+  - **frontdesk (Gov):** promote to INFO/WARN the **handoff decision** at each exit: parsed-as-handoff vs fell-to-conversational (**WARN** when a handoff-shaped payload does NOT parse — the silent failure we are hunting), unsupported operation, incomplete→needs_input (ilk NOT registered), REGISTERED (complete), or register FAILED.
 - **Build:** fb-build (VM110), `build-deb.sh 0.1.25` → 245 MB. **Publish:** `apt-repo-publish.sh` → repo :8900.
-- **Verificación en vivo:** `fluxbee 0.1.25` instalado; **io.cloud + sy-frontdesk-gov + sy-admin + sy-identity `active`**, io.cloud `NRestarts=0`, **0 units `failed`**. Pre-deploy: io-cloud 8/0 + sy-frontdesk-gov 26/0 tests verdes.
-- **Siguiente:** reproducir `register_human` desde la pantalla de Cloud → los nuevos logs muestran EN VIVO por qué no completa (parseo del handoff o campos faltantes) → fix al source. Después, fase 2 = lecturas (SHM E/!E + `get_ilk_details` relay).
-- **Rollback:** snapshot VM100 `pre-observability-0-1-25`, o `apt-get install -y --allow-downgrades fluxbee=0.1.24`.
+- **Live verification:** `fluxbee 0.1.25` installed; **io.cloud + sy-frontdesk-gov + sy-admin + sy-identity `active`**, io.cloud `NRestarts=0`, **0 units `failed`**. Pre-deploy: io-cloud 8/0 + sy-frontdesk-gov 26/0 tests green.
+- **Next:** reproduce `register_human` from the Cloud screen → the new logs show LIVE why it does not complete (handoff parsing or missing fields) → fix at the source. Then, phase 2 = reads (SHM E/!E + `get_ilk_details` relay).
+- **Rollback:** VM100 snapshot `pre-observability-0-1-25`, or `apt-get install -y --allow-downgrades fluxbee=0.1.24`.
 
 ---
 
-## 0.1.24 — seguridad: reservar los namespaces de infra del vault frente al relay `put_token` de Cloud
+## 0.1.24 — security: reserve the vault's infra namespaces against Cloud's `put_token` relay
 
-- **Fecha:** 2026-08-23 (ART) · **Versión anterior:** 0.1.23 · **Commit:** `35349ef` (branch `daily_onworking_coa`)
-- **Alcance:** **motherbee** (VM100). Toca `fluxbee_sdk::vault` + el nodo core `SY.admin` (systemd) + el nodo runtime `IO.cloud`.
-- **Qué cambió (impacto operativo):** cierra el **MEDIUM** de la auditoría de superficie externa de io.cloud.
-  `put_token`→`vault_put` no tenía guarda de namespace de key: un relay de Cloud semi-confiable (o comprometido)
-  podía **sobrescribir cualquier key** del vault por charset — incluido `edge_channel_secret:<ich>` (el bearer
-  que protege un endpoint externalizado, el suyo propio incluido), `edge_tls`, o `ssh:<hive_id>` (la recovery key
-  del spoke). Eso es una superficie de **DoS/takeover**, no "guardar un token de provider".
-  - Fix single-source + defense-in-depth: `fluxbee_sdk::vault::CLOUD_RESERVED_VAULT_KEY_PREFIXES`
-    (`edge_channel_secret:`, `edge_tls`, `ssh:`) + `is_cloud_reserved_vault_key`. Las keys de peer-auth
-    (mesh-HMAC / WAN-mTLS) viven en el **filesystem**, no en el vault, así que ya estaban fuera de alcance.
-  - Enforce **server-side autoritativo** en `SY.admin::enforce_cloud_relay_content` (sólo origen `IO.cloud@hive`,
-    justo tras `authorize_cloud_relay`, sin bypass) + espejo en `io.cloud::translate_cloud_op` (error temprano
-    limpio). Sólo se ata el origen del relay Cloud; los internos SY.* siguen escribiendo esas keys normal.
+- **Date:** 2026-08-23 (ART) · **Previous version:** 0.1.23 · **Commit:** `35349ef` (branch `daily_onworking_coa`)
+- **Scope:** **motherbee** (VM100). Touches `fluxbee_sdk::vault` + the core node `SY.admin` (systemd) + the runtime node `IO.cloud`.
+- **What changed (operational impact):** closes the **MEDIUM** from the audit of io.cloud's external surface.
+  `put_token`→`vault_put` had no key namespace guard: a semi-trusted (or compromised) Cloud relay
+  could **overwrite any key** in the vault by charset — including `edge_channel_secret:<ich>` (the bearer
+  that protects an externalized endpoint, its own included), `edge_tls`, or `ssh:<hive_id>` (the spoke's
+  recovery key). That is a **DoS/takeover** surface, not "storing a provider token".
+  - Single-source + defense-in-depth fix: `fluxbee_sdk::vault::CLOUD_RESERVED_VAULT_KEY_PREFIXES`
+    (`edge_channel_secret:`, `edge_tls`, `ssh:`) + `is_cloud_reserved_vault_key`. The peer-auth keys
+    (mesh-HMAC / WAN-mTLS) live in the **filesystem**, not in the vault, so they were already out of reach.
+  - **Authoritative server-side** enforcement in `SY.admin::enforce_cloud_relay_content` (only `IO.cloud@hive` origin,
+    right after `authorize_cloud_relay`, no bypass) + mirror in `io.cloud::translate_cloud_op` (clean early
+    error). Only the Cloud relay origin is bound; the internal SY.* nodes keep writing those keys as usual.
 - **Build:** fb-build (VM110), `build-deb.sh 0.1.24` → 245 MB. **Publish:** `apt-repo-publish.sh` → repo :8900.
-- **Verificación en vivo:** `fluxbee 0.1.24` instalado; **io.cloud + sy-admin + sy-identity + sy-vault `active`**,
-  io.cloud `NRestarts=0`, **0 units `failed`**. Pre-deploy: tests en las 3 capas verdes (SDK vault, io.cloud
-  translate, admin enforce) + verificación de wiring (enforce corre siempre tras authorize, sin bypass).
-- **Pendiente (no de este deploy):** el diagnóstico del error de `create_tenant` desde Cloud (se ve **mañana con
-  el dev** — el alta funciona backend-side; el error está en el round-trip de respuesta cross-hive edge↔io.cloud).
-- **Rollback:** snapshot VM100 `pre-vault-guard-0-1-24`, o `apt-get install -y --allow-downgrades fluxbee=0.1.23`.
+- **Live verification:** `fluxbee 0.1.24` installed; **io.cloud + sy-admin + sy-identity + sy-vault `active`**,
+  io.cloud `NRestarts=0`, **0 units `failed`**. Pre-deploy: tests green in all 3 layers (SDK vault, io.cloud
+  translate, admin enforce) + wiring verification (enforce always runs after authorize, no bypass).
+- **Pending (not from this deploy):** diagnosing the `create_tenant` error from Cloud (to be looked at **tomorrow with
+  the dev** — the sign-up works on the backend side; the error is in the cross-hive edge↔io.cloud response round-trip).
+- **Rollback:** VM100 snapshot `pre-vault-guard-0-1-24`, or `apt-get install -y --allow-downgrades fluxbee=0.1.23`.
 
 ---
 
-## 0.1.23 — io.cloud: framework de acciones Cloud de primera clase (relay + local) + `register_human` con tenant en la raíz
+## 0.1.23 — io.cloud: first-class Cloud actions framework (relay + local) + `register_human` with the tenant at the root
 
-- **Fecha:** 2026-08-21 (ART) · **Versión anterior:** 0.1.22 · **Commit:** `4abad1b` (branch `daily_onworking_coa`)
-- **Alcance:** **motherbee** (VM100). Toca `fluxbee_sdk::cloud` (el vocabulario Cloud compartido) + el nodo runtime `IO.cloud`.
-- **Qué cambió (impacto operativo):**
-  - `register_human` deja de ser una rama ad-hoc (`op == "register_human"`) y pasa a ser una **acción Cloud
-    de primera clase**, despachada por el **set declarado** en el SDK (`CLOUD_LOCAL_OPS`), no por string mágico.
-    Dos categorías: **relay** (las 3 de siempre → `SY.admin`) y **local** (`register_human`, `list_cloud_actions`
-    → las resuelve io.cloud, **nunca** tocan admin), disjuntas por diseño (un test lo fija — un op local no
-    puede filtrarse al gate `authorize_cloud_relay`).
-  - **Nueva acción `list_cloud_actions`** (local): devuelve el catálogo de acciones (relay + local) con help,
-    para que Fluxbee Cloud **descubra la superficie** sin depender del doc. Cierra el "no discovery API".
-  - **Sobre de `register_human` alineado:** el `tenant_id` ahora va en la **raíz** del sobre (como
-    put_token/provision_node), ya no en `params`; io.cloud lo inyecta al `frontdesk_handoff` para el frontdesk.
-    Es **breaking** vs 0.1.22, pero Cloud aún no tiene nada firme construido y se adapta.
+- **Date:** 2026-08-21 (ART) · **Previous version:** 0.1.22 · **Commit:** `4abad1b` (branch `daily_onworking_coa`)
+- **Scope:** **motherbee** (VM100). Touches `fluxbee_sdk::cloud` (the shared Cloud vocabulary) + the runtime node `IO.cloud`.
+- **What changed (operational impact):**
+  - `register_human` stops being an ad-hoc branch (`op == "register_human"`) and becomes a **first-class Cloud
+    action**, dispatched by the **declared set** in the SDK (`CLOUD_LOCAL_OPS`), not by a magic string.
+    Two categories: **relay** (the usual 3 → `SY.admin`) and **local** (`register_human`, `list_cloud_actions`
+    → io.cloud resolves them, they **never** touch the admin), disjoint by design (a test pins it — a local op cannot
+    leak into the `authorize_cloud_relay` gate).
+  - **New action `list_cloud_actions`** (local): returns the action catalog (relay + local) with help,
+    so that Fluxbee Cloud **discovers the surface** without depending on the doc. Closes the "no discovery API".
+  - **`register_human` envelope aligned:** the `tenant_id` now goes at the **root** of the envelope (like
+    put_token/provision_node), no longer in `params`; io.cloud injects it into the `frontdesk_handoff` for the frontdesk.
+    It is **breaking** vs 0.1.22, but Cloud has nothing firm built yet and adapts.
 - **Build:** fb-build (VM110), `build-deb.sh 0.1.23` → 245 MB. **Publish:** `apt-repo-publish.sh` → repo :8900.
-- **Verificación en vivo:** `fluxbee 0.1.23` instalado; **io.cloud `active/running`, `NRestarts=0`, `ExecMainStatus=0`**
-  (conectó al router, ilk propio, ICH `ich:14b66389…` habilitado — sin FAILED_CONFIG); `sy-admin` +
-  `sy-orchestrator` + `sy-frontdesk-gov` + los 13 `sy-*` + `rt-gateway` `active/running`; los 9 `fluxbee-node-*`
-  `active/running`; **0 units `failed`**. Pre-deploy: SDK cloud tests + workspace io verdes; revisión adversarial
-  (2 lentes + verify) → **0 defectos confirmados** (+ 1 hardening de drift del catálogo aplicado).
-- **Pendiente:** **E2E funcional** de `register_human` desde Fluxbee Cloud dev (mañana) — no ejecutable en vivo
-  desde acá (sin bearer). Contrato final para Cloud en `docs/io-cloud-api.md` §4.4 (`register_human`) / §4.5
+- **Live verification:** `fluxbee 0.1.23` installed; **io.cloud `active/running`, `NRestarts=0`, `ExecMainStatus=0`**
+  (connected to the router, own ilk, ICH `ich:14b66389…` enabled — no FAILED_CONFIG); `sy-admin` +
+  `sy-orchestrator` + `sy-frontdesk-gov` + the 13 `sy-*` + `rt-gateway` `active/running`; the 9 `fluxbee-node-*`
+  `active/running`; **0 units `failed`**. Pre-deploy: SDK cloud tests + io workspace green; adversarial review
+  (2 lenses + verify) → **0 confirmed defects** (+ 1 catalog drift hardening applied).
+- **Pending:** **functional E2E** of `register_human` from Fluxbee Cloud dev (tomorrow) — not runnable live
+  from here (no bearer). Final contract for Cloud in `docs/io-cloud-api.md` §4.4 (`register_human`) / §4.5
   (`list_cloud_actions`).
-- **Rollback:** snapshot VM100 `pre-cloud-actions-0-1-23`, o `apt-get install -y --allow-downgrades fluxbee=0.1.22`.
+- **Rollback:** VM100 snapshot `pre-cloud-actions-0-1-23`, or `apt-get install -y --allow-downgrades fluxbee=0.1.22`.
 
 ---
 
-## 0.1.22 — frontdesk: fix del bug conversacional + extensión de datos del ilk humano
+## 0.1.22 — frontdesk: fix for the conversational bug + extension of the human ilk's data
 
-- **Fecha:** 2026-08-20 (ART) · **Versión anterior:** 0.1.21 · **Commit:** `15fc77f` (branch `daily_onworking_coa`)
-- **Alcance:** **motherbee** (VM100). Toca el nodo core `sy-frontdesk-gov` (systemd) + `io_common` (comentario).
-- **Qué cambió (impacto operativo):**
-  - **BUG arreglado:** el camino conversacional del frontdesk (alcanzable — el force rule 0.1.20 manda el
-    mensaje plano de un humano de primer contacto al frontdesk) reportaba `REGISTERED`/`complete`
-    **sin haber registrado** cuando el turno del LLM no escribía `thread_state` (turno de charla, o
-    registro-y-borrado, ambiguos). Ahora: `None` → `needs_input`/`IN_CONVERSATION` (no falso REGISTERED),
-    y el prompt persiste `status=completed` en el éxito (en vez de borrar) para desambiguar. El camino
-    determinista (io.cloud `register_human`) **no se toca** (devuelve el resultado del registro directo).
-  - **Schema del ilk humano extendido (aditivo, CERO cambio en identity — `identification` es JSONB
-    libre guardado verbatim):** `company_name` (typed) + `attributes` (libre) fluyen end-to-end a
-    `ILK_REGISTER` por la tool compartida → sirve a los dos caminos. `handle_frontdesk_handoff` antes
-    **tiraba** `company_name`; ahora lo reenvía + mergea `attributes` multi-turno (simétrico con company_name).
-- **Build:** fb-build (VM110), `build-deb.sh 0.1.22` → 245 MB, 118 entradas.
-- **Publish:** `apt-repo-publish.sh` → repo :8900 (22 versiones).
-- **Verificación en vivo:** `fluxbee 0.1.22` instalado; **`sy-frontdesk-gov` reiniciado + `running`**
-  (02:31 UTC, con el fix+schema); rt-gateway + los 13 `sy-*` `active`; io.cloud `active`; **0 nodos `failed`**.
-  Pre-deploy: `sy-frontdesk-gov` tests verdes (26/0, incluye el test que codificaba el bug, corregido) +
-  revisión adversarial (bug-fix limpio; 1 LOW de simetría de `attributes` multi-turno, arreglado).
-- **Rollback:** snapshot VM100 `pre-frontdesk-0-1-22`, o `apt-get install -y fluxbee=0.1.21`.
-- **Pendiente / known:** el camino conversacional depende de que el LLM siga el prompt (misma
-  confiabilidad que todo el flujo); un `attributes` libre sin cota de tamaño podría meter blobs grandes
-  en el JSONB (validación de tamaño = mejora futura si hace falta). Cierra los dos follow-ups del 0.1.21.
+- **Date:** 2026-08-20 (ART) · **Previous version:** 0.1.21 · **Commit:** `15fc77f` (branch `daily_onworking_coa`)
+- **Scope:** **motherbee** (VM100). Touches the core node `sy-frontdesk-gov` (systemd) + `io_common` (comment).
+- **What changed (operational impact):**
+  - **BUG fixed:** the frontdesk's conversational path (reachable — the 0.1.20 force rule sends the
+    plain message of a first-contact human to the frontdesk) reported `REGISTERED`/`complete`
+    **without having registered** when the LLM's turn did not write `thread_state` (a chat turn, or
+    register-and-delete, ambiguous). Now: `None` → `needs_input`/`IN_CONVERSATION` (no false REGISTERED),
+    and the prompt persists `status=completed` on success (instead of deleting) to disambiguate. The
+    deterministic path (io.cloud `register_human`) **is not touched** (it returns the direct registration result).
+  - **Human ilk schema extended (additive, ZERO change in identity — `identification` is free JSONB
+    stored verbatim):** `company_name` (typed) + `attributes` (free) flow end-to-end to
+    `ILK_REGISTER` through the shared tool → it serves both paths. `handle_frontdesk_handoff` used to
+    **drop** `company_name`; now it forwards it + merges multi-turn `attributes` (symmetric with company_name).
+- **Build:** fb-build (VM110), `build-deb.sh 0.1.22` → 245 MB, 118 entries.
+- **Publish:** `apt-repo-publish.sh` → repo :8900 (22 versions).
+- **Live verification:** `fluxbee 0.1.22` installed; **`sy-frontdesk-gov` restarted + `running`**
+  (02:31 UTC, with the fix+schema); rt-gateway + the 13 `sy-*` `active`; io.cloud `active`; **0 `failed` nodes**.
+  Pre-deploy: `sy-frontdesk-gov` tests green (26/0, including the test that encoded the bug, corrected) +
+  adversarial review (clean bug-fix; 1 LOW about multi-turn `attributes` symmetry, fixed).
+- **Rollback:** VM100 snapshot `pre-frontdesk-0-1-22`, or `apt-get install -y fluxbee=0.1.21`.
+- **Pending / known:** the conversational path depends on the LLM following the prompt (same
+  reliability as the whole flow); a free `attributes` without a size bound could put large blobs
+  into the JSONB (size validation = future improvement if needed). Closes the two follow-ups from 0.1.21.
 
-## 0.1.21 — io.cloud `register_human`: registro automático de humanos Cloud→frontdesk
+## 0.1.21 — io.cloud `register_human`: automatic registration of humans, Cloud→frontdesk
 
-- **Fecha:** 2026-08-20 (ART) · **Versión anterior:** 0.1.20 · **Commit:** `2f60403` (branch `daily_onworking_coa`)
-- **Alcance:** **motherbee** (VM100). io.cloud es un runtime managed motherbee-only; los spokes no lo corren.
-- **Qué cambió (impacto operativo):**
-  - Nuevo op inbound `register_human` en io.cloud (NO es relay a SY.admin): Fluxbee Cloud manda la data
-    del humano como `frontdesk_handoff` JSON; io.cloud **provisiona** un ilk temporary humano (mismo
-    `strict_provision_ilk` que io.api) y **Unicastea** el handoff **verbatim** al frontdesk configurado
-    (`government.identity_frontdesk`). El frontdesk (path determinista) registra (temporary→complete) y
-    responde; io.cloud **relaya el veredicto estructurado** a Cloud, estampado con el `ilk_id` que minteó.
-  - **Unicast, no el force rule del router**: un handoff explícito llega al frontdesk con CUALQUIER estado
-    del ilk, así que un re-registro de un humano ya `complete` igual aterriza (`ILK_REGISTER` idempotente).
-    io.cloud no elige target (usa el frontdesk de config); el force 0.1.20 queda como red de contención de
-    emisores implícitos (io.slack/io.wapp).
-  - Gate estricto (type + schema_version + operation + tenant `tnt:<uuid>` canónico + email real) y
-    `response_envelope` (para que el frontdesk emita el veredicto estructurado, no texto plano).
-  - De-diverge: `frontdesk_response_contract` compartido en io_common; io.api de-divergido.
-- **Build:** fb-build (VM110), `build-deb.sh 0.1.21` → 245 MB, 118 entradas.
-- **Publish:** `apt-repo-publish.sh` → repo :8900 (21 versiones indexadas).
-- **Verificación en vivo:** `fluxbee 0.1.21` instalado; runtime **io.cloud movido 0.1.20→0.1.21 + reiniciado
-  + sano** (conectado al router como `IO.cloud@motherbee`, self-ilk, ICH habilitado); rt-gateway ruteando;
-  13 `sy-*` + rt-gateway `active`; **0 nodos `failed`**. Pre-deploy: io workspace verde (rust 1.92) +
-  **doble revisión adversarial** (10 hallazgos 1ra pasada, todos arreglados en la fuente; re-review limpia).
-- **Rollback:** snapshot VM100 `pre-register-human-0-1-21`, o `apt-get install -y fluxbee=0.1.20`.
-- **Pendiente / known:** (a) **test E2E funcional** de `register_human` (que Cloud lo llame de verdad) —
-  el binario corre sano, falta el disparo desde Fluxbee Cloud. (b) 🔖 bug del path conversacional del
-  frontdesk (reporta REGISTERED sin registrar). (c) 🔖 `company_name`/`attributes` que el determinista tira
-  hoy (extensión del schema del ilk humano). (b)+(c) son el próximo paso.
+- **Date:** 2026-08-20 (ART) · **Previous version:** 0.1.20 · **Commit:** `2f60403` (branch `daily_onworking_coa`)
+- **Scope:** **motherbee** (VM100). io.cloud is a motherbee-only managed runtime; the spokes do not run it.
+- **What changed (operational impact):**
+  - New inbound op `register_human` in io.cloud (it is NOT a relay to SY.admin): Fluxbee Cloud sends the human's
+    data as `frontdesk_handoff` JSON; io.cloud **provisions** a temporary human ilk (same
+    `strict_provision_ilk` as io.api) and **Unicasts** the handoff **verbatim** to the configured frontdesk
+    (`government.identity_frontdesk`). The frontdesk (deterministic path) registers (temporary→complete) and
+    answers; io.cloud **relays the structured verdict** to Cloud, stamped with the `ilk_id` it minted.
+  - **Unicast, not the router's force rule**: an explicit handoff reaches the frontdesk with ANY state
+    of the ilk, so a re-registration of an already `complete` human still lands (`ILK_REGISTER` idempotent).
+    io.cloud does not choose the target (it uses the frontdesk from the config); the 0.1.20 force stays as a containment net for
+    implicit senders (io.slack/io.wapp).
+  - Strict gate (type + schema_version + operation + canonical tenant `tnt:<uuid>` + real email) and
+    `response_envelope` (so that the frontdesk emits the structured verdict, not plain text).
+  - De-diverge: `frontdesk_response_contract` shared in io_common; io.api de-diverged.
+- **Build:** fb-build (VM110), `build-deb.sh 0.1.21` → 245 MB, 118 entries.
+- **Publish:** `apt-repo-publish.sh` → repo :8900 (21 versions indexed).
+- **Live verification:** `fluxbee 0.1.21` installed; runtime **io.cloud moved 0.1.20→0.1.21 + restarted
+  + healthy** (connected to the router as `IO.cloud@motherbee`, self-ilk, ICH enabled); rt-gateway routing;
+  13 `sy-*` + rt-gateway `active`; **0 `failed` nodes**. Pre-deploy: io workspace green (rust 1.92) +
+  **double adversarial review** (10 findings in the 1st pass, all fixed at the source; clean re-review).
+- **Rollback:** VM100 snapshot `pre-register-human-0-1-21`, or `apt-get install -y fluxbee=0.1.20`.
+- **Pending / known:** (a) **functional E2E test** of `register_human` (Cloud really calling it) —
+  the binary runs healthy; the trigger from Fluxbee Cloud is missing. (b) 🔖 bug in the frontdesk's conversational
+  path (it reports REGISTERED without registering). (c) 🔖 `company_name`/`attributes` that the deterministic path drops
+  today (extension of the human ilk's schema). (b)+(c) are the next step.
 
-## 0.1.20 — router: ruteo al frontdesk como política OPA (sin fallback Rust)
+## 0.1.20 — router: routing to the frontdesk as an OPA policy (no Rust fallback)
 
-- **Fecha:** 2026-08-20 (ART) · **Versión anterior:** 0.1.19 · **Commit:** `1297ba7` (branch `daily_onworking_coa`)
-- **Alcance:** **motherbee** (VM100) únicamente. Los spokes (worker1/ingress/egress) siguen en
-  **0.1.19** — el `.deb` sólo actualiza motherbee y el core-update a spokes es opcional (misma wasm
-  de autoridad ⇒ decisiones idénticas; el ruteo al frontdesk ocurre en motherbee, donde vive la identidad).
-- **Qué cambió (impacto operativo):**
-  - El ruteo "emisor sin identificar → frontdesk" dejó de ser un `if` hardcodeado en el router
-    (`apply_identity_pre_resolve`) y pasó a ser una regla **visible** en `policy/system.rego`
-    (nuevo entrypoint `fluxbee/system/frontdesk_route`). Ahora caen al frontdesk **tanto** los ilk
-    `temporary` **como** los mensajes **sin ilk** (antes el sin-ilk se perdía en `OpaError::NotLoaded`).
-  - Se **eliminó** el fallback Rust `authority()` (duplicaba la política de autoridad SYSTEM):
-    **fuente única = el rego**, y el router **falla-cerrado al arrancar** si un `.wasm` horneado no
-    carga (`ensure_system_policy_loaded` → `RouterError::Startup`).
-  - El re-check `SO-05` del orchestrator ahora usa `authorize_system` (misma política, no un gemelo Rust).
+- **Date:** 2026-08-20 (ART) · **Previous version:** 0.1.19 · **Commit:** `1297ba7` (branch `daily_onworking_coa`)
+- **Scope:** **motherbee** (VM100) only. The spokes (worker1/ingress/egress) stay on
+  **0.1.19** — the `.deb` only updates the motherbee and the core-update to spokes is optional (same authority
+  wasm ⇒ identical decisions; the routing to the frontdesk happens on the motherbee, where identity lives).
+- **What changed (operational impact):**
+  - The "unidentified sender → frontdesk" routing stopped being a hardcoded `if` in the router
+    (`apply_identity_pre_resolve`) and became a **visible** rule in `policy/system.rego`
+    (new entrypoint `fluxbee/system/frontdesk_route`). Now **both** the `temporary` ilks **and** the
+    messages **without an ilk** fall to the frontdesk (before, the no-ilk case was lost in `OpaError::NotLoaded`).
+  - The Rust `authority()` fallback was **removed** (it duplicated the SYSTEM authority policy):
+    **single source = the rego**, and the router **fails closed at startup** if a baked `.wasm` does not
+    load (`ensure_system_policy_loaded` → `RouterError::Startup`).
+  - The orchestrator's `SO-05` re-check now uses `authorize_system` (same policy, not a Rust twin).
 - **Build:** fb-build (VM110), `packaging/build-deb.sh 0.1.20` → `fluxbee_0.1.20_amd64.deb`, 245 MB,
-  118 entradas; los `.wasm` van **horneados dentro de `rt-gateway`** (`include_bytes!`), no como archivos.
-- **Publish:** `scripts/apt-repo-publish.sh --deb …0.1.20….deb` → `/var/lib/fluxbee-apt` servido en
-  `10.10.10.50:8900` (con `-m`, conserva versiones para rollback).
-- **Verificación en vivo (post-`apt install`):**
-  - `rt-gateway.service` `active (running)` — **arrancó fail-closed OK** (`ensure_system_policy_loaded`
-    pasó: los dos wasm horneados cargaron) y **rutea tráfico real** (ADMIN_COMMAND / INVENTORY / VAULT_GET).
-  - 13 `sy-*` + `rt-gateway` `running`; **0 nodos `failed`**.
-  - Router `/status` **sin user-OPA catchall** ⇒ None→frontdesk es mejora estricta (no redirige tráfico existente).
-  - Pre-deploy: tests lib+bins verdes (rust **1.92.0**) + **revisión adversarial** (4 lentes + verificación): **0 defectos confirmados**.
-- **Rollback:** snapshot VM100 `pre-router-0-1-20`, o `apt-get install -y fluxbee=0.1.19`.
-- **Pendiente / known:** el frontdesk aún **no puede MINTear** un ilk para un emisor totalmente
-  sin-ilk (`ILK_PROVISION` es IO-only; `ILK_REGISTER` sólo COMPLETA un temporary existente) — el
-  sin-ilk llega al frontdesk pero todavía no se onboardea. Fast-follow separado.
+  118 entries; the `.wasm` files go **baked inside `rt-gateway`** (`include_bytes!`), not as files.
+- **Publish:** `scripts/apt-repo-publish.sh --deb …0.1.20….deb` → `/var/lib/fluxbee-apt` served at
+  `10.10.10.50:8900` (with `-m`, keeps versions for rollback).
+- **Live verification (post-`apt install`):**
+  - `rt-gateway.service` `active (running)` — **started fail-closed OK** (`ensure_system_policy_loaded`
+    passed: both baked wasm files loaded) and **routes real traffic** (ADMIN_COMMAND / INVENTORY / VAULT_GET).
+  - 13 `sy-*` + `rt-gateway` `running`; **0 `failed` nodes**.
+  - Router `/status` **without a user-OPA catchall** ⇒ None→frontdesk is a strict improvement (it does not redirect existing traffic).
+  - Pre-deploy: lib+bins tests green (rust **1.92.0**) + **adversarial review** (4 lenses + verification): **0 confirmed defects**.
+- **Rollback:** VM100 snapshot `pre-router-0-1-20`, or `apt-get install -y fluxbee=0.1.19`.
+- **Pending / known:** the frontdesk still **cannot MINT** an ilk for a fully
+  ilk-less sender (`ILK_PROVISION` is IO-only; `ILK_REGISTER` only COMPLETES an existing temporary) — the
+  ilk-less sender reaches the frontdesk but is not onboarded yet. Separate fast-follow.
 
 ---
 
-<!-- PLANTILLA para la próxima entrada (copiar arriba de esta línea, más reciente primero):
+<!-- TEMPLATE for the next entry (copy above this line, most recent first):
 
-## 0.1.N — <título corto del cambio>
+## 0.1.N — <short title of the change>
 
-- **Fecha:** YYYY-MM-DD (ART) · **Versión anterior:** 0.1.N-1 · **Commit:** `<sha>` (branch `<rama>`)
-- **Alcance:** motherbee | + spokes (worker1/ingress/egress)
-- **Qué cambió (impacto operativo):** <1-3 bullets, en términos de qué hace distinto el sistema>
-- **Build:** fb-build (VM110), `build-deb.sh 0.1.N` → tamaño / entradas / preflight OK
+- **Date:** YYYY-MM-DD (ART) · **Previous version:** 0.1.N-1 · **Commit:** `<sha>` (branch `<branch>`)
+- **Scope:** motherbee | + spokes (worker1/ingress/egress)
+- **What changed (operational impact):** <1-3 bullets, in terms of what the system does differently>
+- **Build:** fb-build (VM110), `build-deb.sh 0.1.N` → size / entries / preflight OK
 - **Publish:** `apt-repo-publish.sh` → repo :8900
-- **Verificación en vivo:** <servicios `running`, 0 `failed`, chequeo funcional específico del cambio>
-- **Rollback:** snapshot `pre-<algo>` · `apt install fluxbee=0.1.N-1`
-- **Pendiente / known:** <lo que queda>
+- **Live verification:** <services `running`, 0 `failed`, functional check specific to the change>
+- **Rollback:** snapshot `pre-<something>` · `apt install fluxbee=0.1.N-1`
+- **Pending / known:** <what is left>
 
 -->

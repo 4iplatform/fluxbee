@@ -1,10 +1,10 @@
-# Template: Nuevo nodo `.gov`
+# Template: a new `.gov` node
 
-Usar este template para crear un nuevo runtime de dominio `.gov` dentro de `nodes/gov/`.
+Use this template to create a new `.gov` domain runtime under `nodes/gov/`.
 
-## 1) Crear crate
+## 1) Create the crate
 
-Ejemplo para `AI.compliance.gov`:
+Example for `AI.compliance.gov`:
 
 ```text
 nodes/gov/ai-compliance-gov/
@@ -12,7 +12,7 @@ nodes/gov/ai-compliance-gov/
 └── src/main.rs
 ```
 
-`Cargo.toml` mínimo:
+Minimal `Cargo.toml`:
 
 ```toml
 [package]
@@ -28,9 +28,9 @@ fluxbee-sdk = { path = "../../../crates/fluxbee_sdk" }
 gov-common = { path = "../common" }
 ```
 
-## 2) Registrar en workspace
+## 2) Register it in the workspace
 
-Agregar en `Cargo.toml` raíz:
+Add it to the root `Cargo.toml`:
 
 ```toml
 [workspace]
@@ -45,21 +45,22 @@ members = [
 - L2: `AI.compliance.gov@<hive>`
 - Runtime: `ai.compliance.gov`
 
-## 4) Config de ruteo (si aplica)
+## 4) Routing config (if it applies)
 
-Para frontdesk de identity:
+For the identity frontdesk:
 
 ```yaml
 government:
   identity_frontdesk: "SY.frontdesk.gov@motherbee"
 ```
 
-## 5) Validación mínima
+## 5) Minimal validation
 
 ```bash
 cargo check -p ai-compliance-gov
 ```
 
-Si interactúa con identity:
-- usar helpers `fluxbee_sdk::identity::*`,
-- cubrir flujo en scripts E2E existentes o agregar wrapper especí­fico en `scripts/`.
+If it talks to identity:
+
+- use the `fluxbee_sdk::identity::*` helpers;
+- cover the flow in the existing E2E scripts, or add a specific wrapper in `scripts/`.

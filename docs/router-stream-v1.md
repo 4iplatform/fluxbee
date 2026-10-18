@@ -1000,8 +1000,8 @@ values is §7.5: for `node` and `agent` it takes the tenant from identity itself
   - **SY.architect and SY.admin** (motherbee only): the root tenant only;
   - `fallback_root` means the root tenant; any other `SY.*` producer is refused.
 
-  The identity snapshot is read once per batch of rows, so a node name reused by another tenant is
-  never charged from a stale cache.
+  As built, the identity SHM is read for each record (`identity_tenant` in `sy_storage.rs`), so a
+  node name reused by another tenant is never charged from a stale cache.
 - **When identity never answers** (still unresolved on the last retry: a deleted node, a degraded
   SY.identity): the record is stored with the tenant it claims, `verified = false`, and counted.
   Spend is never dropped for a lookup.

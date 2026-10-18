@@ -991,7 +991,7 @@ if [[ -f "$ROOT_DIR/config/hive.yaml" ]]; then
 fi
 
 # Install SY.architect handbook (always overwrite — static doc, not runtime data).
-handbook_src="$ROOT_DIR/docs/onworking COA/archi/handbook_fluxbee.md"
+handbook_src="$ROOT_DIR/docs/archi/handbook_fluxbee.md"
 if [[ -f "$handbook_src" ]]; then
   sudo install -m 0644 "$handbook_src" "$CONFIG_DIR/handbook_fluxbee.md"
   echo "Installed architect handbook to $CONFIG_DIR/handbook_fluxbee.md"

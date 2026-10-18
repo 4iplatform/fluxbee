@@ -189,7 +189,7 @@ limit.
   protected actions.
 - Both wasm artifacts are recompiled from the rego, and the policy truth-table tests follow.
 - The observability-only frozen markers in `sy_config_routes` mirror the new rule.
-- `docs/04-routing.md`'s authority table is corrected.
+- `docs/history/04-routing.md`'s authority table is corrected.
 
 The diag tools that relied on WF.orch.diag's authority stop working:
 - `orch_system_diag` and the `orchestrator_*_e2e.sh` scripts that drive it;

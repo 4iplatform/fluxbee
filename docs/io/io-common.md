@@ -1,4 +1,4 @@
-﻿# io-common - Especificación técnica
+﻿# io-common - Technical specification
 > Adaptation note for `json-router`:
 > In this repo, identity flow follows Router-driven onboarding (v1.16+):
 > IO performs `lookup -> provision_on_miss -> forward`.
@@ -11,305 +11,305 @@
 
 
 
-## Control Plane unificado (IO Nodes ↔ AI Nodes)
+## Unified Control Plane (IO Nodes ↔ AI Nodes)
 
-✅ **NORMATIVO**:
-- IO Nodes adoptan el mismo patrón de Control Plane que AI Nodes:
-  - `PING/STATUS` para observabilidad mínima,
-  - `CONFIG_GET/CONFIG_SET/CONFIG_RESPONSE` para gestión de configuración en caliente.
-- Los mensajes de Control Plane se distinguen por `meta.type in {"system","admin"}` + `meta.msg`.
+✅ **NORMATIVE**:
+- IO Nodes adopt the same Control Plane pattern as AI Nodes:
+  - `PING/STATUS` for minimal observability,
+  - `CONFIG_GET/CONFIG_SET/CONFIG_RESPONSE` for hot configuration management.
+- Control Plane messages are identified by `meta.type in {"system","admin"}` + `meta.msg`.
 
-🧩 **A ESPECIFICAR**:
-- Catálogo global de comandos system/admin (cuando Fluxbee lo formalice en protocolo/base).
-
-
-
-## Adaptación temporal al core/SDK (campos L3 e identidad)
-
-> ✅ **Canónico (protocolo Fluxbee):** existen carriers dedicados para identidad y continuidad conversacional. En el repo actual, `src_ilk` y `thread_id` forman parte del camino canónico activo, mientras que `ich` debe interpretarse como **canal local/sistémico** del nodo IO.  
-> ⚠️ **Estado actual (core/SDK):** el SDK no expone todos los campos L3 dedicados, pero `src_ilk` sí se transporta canónicamente en `meta.src_ilk`. `meta.context` queda para metadata adicional.
-
-✅ **NORMATIVO (HOY, implementación compatible):**
-- IO Nodes **MUST** usar `meta.src_ilk` como carrier canónico de identidad de origen.
-- IO Nodes **MUST** tratar `meta.ich` como identificador del canal/asset local operado por la instancia IO cuando ese campo aplique al path.
-- La metadata específica del canal (Slack/WhatsApp/Email) debe vivir bajo `meta.context.io.*`.
-- Mientras dure la transición, campos L3 no tipados (por ejemplo `dst_ilk`) pueden transportarse en `meta.context`.
-
-⚠️ **ADVERTENCIA:**
-- El uso de `meta.context` como carrier es temporal para campos no tipados. `meta.src_ilk` ya es canónico y no debe duplicarse en `meta.context`.
-- `meta.ich` no debe usarse para representar al interlocutor externo ni su handle remoto.
-
-🧩 **Estado actual del core:**
-- `ctx_seq/ctx_window` no forman parte del happy path canónico del repo.
-- si aparecen en payloads viejos, deben tratarse como metadata legacy/opaca.
+🧩 **TO BE SPECIFIED**:
+- Global catalog of system/admin commands (when Fluxbee formalizes it in the protocol/base).
 
 
 
-## 0. Objetivo
+## Temporary adaptation to the core/SDK (L3 fields and identity)
 
-`io-common` es una librería (o conjunto de librerías por lenguaje) que encapsula la
-lógica **crítica y repetible** de los Nodos IO.
+> ✅ **Canonical (Fluxbee protocol):** there are dedicated carriers for identity and conversational continuity. In the current repo, `src_ilk` and `thread_id` are part of the active canonical path, while `ich` must be read as the IO node's **local/systemic channel**.  
+> ⚠️ **Current state (core/SDK):** the SDK does not expose all the dedicated L3 fields, but `src_ilk` is carried canonically in `meta.src_ilk`. `meta.context` is left for additional metadata.
 
-Su objetivo es:
-- evitar duplicación de lógica entre IOs,
-- reducir errores en deduplicación, retries e idempotencia,
-- estandarizar operación, observabilidad y lifecycle,
-- permitir evolucionar de un MVP single-instance a una arquitectura escalable.
+✅ **NORMATIVE (TODAY, compatible implementation):**
+- IO Nodes **MUST** use `meta.src_ilk` as the canonical carrier of the source identity.
+- IO Nodes **MUST** treat `meta.ich` as the identifier of the local channel/asset operated by the IO instance, when that field applies to the path.
+- Channel-specific metadata (Slack/WhatsApp/Email) must live under `meta.context.io.*`.
+- While the transition lasts, untyped L3 fields (for example `dst_ilk`) may be carried in `meta.context`.
 
-`io-common` **no** es consciente del canal (Slack, WhatsApp, email, etc.).
-Los detalles específicos quedan en cada Nodo IO.
+⚠️ **WARNING:**
+- Using `meta.context` as a carrier is temporary, for untyped fields. `meta.src_ilk` is already canonical and must not be duplicated in `meta.context`.
+- `meta.ich` must not be used to represent the external interlocutor or its remote handle.
 
----
+🧩 **Current state of the core:**
+- `ctx_seq/ctx_window` are not part of the repo's canonical happy path.
+- if they show up in old payloads, they must be treated as legacy/opaque metadata.
 
-## 1. Principios de diseño
 
-- **Agnóstico de canal**: no conoce APIs externas.
-- **Sin persistencia local**: `io-common` **NO** asume DB/Redis dentro de los IO. Todo estado técnico es **en memoria**.
-- **Best-effort por proceso**: deduplicación, sessionización y reintentos funcionan mientras el proceso está vivo; tras restart pueden perderse.
-- **Compatible con el protocolo**: no asume campos fuera de `routing/meta/payload`.
-- **Acotado y observable**: todo buffer/caché debe tener TTL, límites y métricas para evitar crecimiento sin control.
-- **Evolutivo**: el diseño deja ganchos para incorporar persistencia (DB/Redis) fuera del IO si el sistema lo habilita en el futuro.
+
+## 0. Goal
+
+`io-common` is a library (or a set of libraries, one per language) that encapsulates the
+**critical and repeatable** logic of the IO Nodes.
+
+Its goal is to:
+- avoid duplicating logic across IOs,
+- reduce errors in deduplication, retries and idempotency,
+- standardize operation, observability and lifecycle,
+- allow evolving from a single-instance MVP to a scalable architecture.
+
+`io-common` is **not** channel-aware (Slack, WhatsApp, email, etc.).
+The specific details stay in each IO Node.
 
 ---
 
-## 2. Responsabilidades de io-common
+## 1. Design principles
+
+- **Channel-agnostic**: it does not know external APIs.
+- **No local persistence**: `io-common` does **NOT** assume DB/Redis inside the IOs. All technical state is **in memory**.
+- **Best-effort per process**: deduplication, sessionization and retries work while the process is alive; after a restart they may be lost.
+- **Protocol-compatible**: it assumes no fields outside `routing/meta/payload`.
+- **Bounded and observable**: every buffer/cache must have a TTL, limits and metrics to avoid unbounded growth.
+- **Evolvable**: the design leaves hooks to add persistence (DB/Redis) outside the IO if the system enables it in the future.
+
+---
+
+## 2. Responsibilities of io-common
 
 ### 2.1 Inbound reliability
-- Deduplicación inbound **en memoria** con TTL y límites (cap por entries/bytes).
-- Helpers para patrón "ACK rápido":
-  - el ACK al proveedor **no** espera respuesta del router,
-  - el procesamiento downstream ocurre asincrónicamente.
-- Cola/buffer **acotado** de mensajes "pendientes" (p.ej. esperando identidad) con timeouts.
+- **In-memory** inbound deduplication with a TTL and limits (cap by entries/bytes).
+- Helpers for the "fast ACK" pattern:
+  - the ACK to the provider does **not** wait for the router's response,
+  - downstream processing happens asynchronously.
+- A **bounded** queue/buffer of "pending" messages (e.g. waiting for identity) with timeouts.
 
-### 2.1.1 Normalización `text/v1` + offload a blob (canónico IO)
-- El punto de enforcement de offload `text/v1` (inline -> `content_ref`) está en `fluxbee_sdk::NodeSender::send`.
-- `io-common` **DEBE** delegar esa decisión al SDK y **NO** duplicar lógica de offload por tamaño.
-- Los adapters IO **NO** deben reimplementar la decisión `content` vs `content_ref`; solo deben mapear evento externo -> payload base + adjuntos.
-- Las validaciones comunes de `text/v1` (shape, límites, conteo, resolución de blobs) viven en `io-common`.
-- La policy efectiva de MIME aceptados debe ser definida por cada adapter IO según sus capacidades y el canal externo, y `io-common` debe aplicarla de forma uniforme.
-- Un default de `io-common` puede servir como baseline técnico, pero no debe reemplazar una decisión explícita del adapter cuando el canal soporta más o menos tipos.
+### 2.1.1 `text/v1` normalization + offload to blob (IO canonical)
+- The enforcement point of the `text/v1` offload (inline -> `content_ref`) is in `fluxbee_sdk::NodeSender::send`.
+- `io-common` **MUST** delegate that decision to the SDK and **NOT** duplicate size-based offload logic.
+- IO adapters must **NOT** reimplement the `content` vs `content_ref` decision; they must only map external event -> base payload + attachments.
+- The common `text/v1` validations (shape, limits, count, blob resolution) live in `io-common`.
+- The effective policy of accepted MIME types must be defined by each IO adapter according to its capabilities and the external channel, and `io-common` must apply it uniformly.
+- An `io-common` default can serve as a technical baseline, but it must not replace an explicit adapter decision when the channel supports more or fewer types.
 
-Regla operativa para MIME:
-- si Fluxbee puede transportar un attachment y el canal/adapter tiene capacidad razonable de aceptarlo, el adapter debería incluir ese MIME en su policy efectiva
-- si un MIME queda afuera, debe ser por limitación concreta del canal/adaptation o por decisión explícita documentada, no por un default implícito accidental
+Operational rule for MIME:
+- if Fluxbee can carry an attachment and the channel/adapter can reasonably accept it, the adapter should include that MIME type in its effective policy
+- if a MIME type is left out, it must be because of a concrete limitation of the channel/adaptation or an explicit documented decision, not an accidental implicit default
 
-Regla corta de adopcion para futuros `IO.*`:
-- si el adapter produce mensajes de usuario textuales hacia el router, debe usar el contrato canonico `text/v1`
-- esos mensajes deben enviarse al router por `fluxbee_sdk::NodeSender::send`
-- el adapter no debe reimplementar por su cuenta la decision `content` vs `content_ref`
-- si el adapter necesita otro tipo de payload que no sea `text/v1`, no hereda automaticamente el auto-offload y debe definirse explicitamente su contrato/tamano antes de asumir comportamiento equivalente
+Short adoption rule for future `IO.*`:
+- if the adapter produces textual user messages toward the router, it must use the canonical `text/v1` contract
+- those messages must be sent to the router through `fluxbee_sdk::NodeSender::send`
+- the adapter must not reimplement the `content` vs `content_ref` decision on its own
+- if the adapter needs a payload type other than `text/v1`, it does not inherit the auto-offload automatically; its contract/size must be defined explicitly before assuming equivalent behavior
 
-Configuración operativa actual del enforcement en SDK:
-- La normalización en `NodeSender::send` usa defaults internos del SDK.
-- No depende de variables de entorno para decidir offload en esta etapa.
+Current operational configuration of the enforcement in the SDK:
+- The normalization in `NodeSender::send` uses the SDK's internal defaults.
+- At this stage it does not depend on environment variables to decide the offload.
 
-Logging operativo (bajo ruido):
-- `debug`: decisión de normalización (`offload_to_blob`, bytes estimados, límite, adjuntos).
-- `info` solo cuando hubo offload a blob.
-- `warn` en error de normalización con código canónico.
-- Nunca loggear contenido de usuario ni bytes de blobs.
+Operational logging (low noise):
+- `debug`: normalization decision (`offload_to_blob`, estimated bytes, limit, attachments).
+- `info` only when there was an offload to blob.
+- `warn` on a normalization error, with the canonical code.
+- Never log user content or blob bytes.
 
-Validación recomendada:
-- Prueba determinística de payloads grandes (`>64KB` default) con `io-sim`.
-- En `io-slack`, usar pruebas de integración de adapter y contrato, considerando límites propios del canal.
+Recommended validation:
+- Deterministic test of large payloads (`>64KB` default) with `io-sim`.
+- In `io-slack`, use adapter and contract integration tests, taking the channel's own limits into account.
 
 ### 2.2 Outbound reliability
-- Outbox **en memoria** (best-effort) con:
-  - cola acotada,
-  - reintentos con backoff,
-  - timeouts y estados mínimos (`PENDING/SENDING/SENT/FAILED/DEAD`) solo para operación interna.
-- Idempotencia outbound **por proceso** mediante claves internas en memoria (si se requiere).
-- Worker/dispatcher en memoria para procesar el outbox.
-- **Nota**: al no haber persistencia, tras restart puede perderse el outbox y, por ende, mensajes outbound que no hayan sido enviados todavía.
+- **In-memory** outbox (best-effort) with:
+  - a bounded queue,
+  - retries with backoff,
+  - timeouts and minimal states (`PENDING/SENDING/SENT/FAILED/DEAD`) for internal operation only.
+- Outbound idempotency **per process** through internal in-memory keys (if required).
+- An in-memory worker/dispatcher to process the outbox.
+- **Note**: since there is no persistence, the outbox may be lost after a restart, and with it any outbound messages not sent yet.
 
-### 2.2.2 Política de salida a canal externo (contenido grande)
+### 2.2.2 Output policy toward the external channel (large content)
 
-✅ **NORMATIVO (baseline IO):**
-- Los adapters IO **DEBEN** respetar límites del canal externo destino.
-- Los adapters IO **NO DEBEN** truncar contenido de forma silenciosa.
-- Frente a límite de canal, el adapter **DEBE** usar una estrategia explícita de entrega alternativa (por ejemplo archivo/adjunto/chunking), y dejar trazabilidad en logs/métricas.
+✅ **NORMATIVE (IO baseline):**
+- IO adapters **MUST** respect the limits of the destination external channel.
+- IO adapters **MUST NOT** truncate content silently.
+- When it hits a channel limit, the adapter **MUST** use an explicit alternative delivery strategy (for example file/attachment/chunking) and leave a trace in logs/metrics.
 
-🧩 **TBD por canal:**
-- Cada canal define estrategia concreta de fallback para payloads largos:
-  - `text` directo,
-  - archivo/adjunto,
-  - chunking en múltiples mensajes,
-  - híbrido (resumen + adjunto).
+🧩 **TBD per channel:**
+- Each channel defines a concrete fallback strategy for long payloads:
+  - direct `text`,
+  - file/attachment,
+  - chunking into multiple messages,
+  - hybrid (summary + attachment).
 
-✅ **NORMATIVO UX (multilenguaje):**
-- No usar notices hardcodeados en un idioma fijo.
-- Si se envía mensaje de aviso por fallback, debe ser configurable/localizable por nodo.
-- Default recomendado cuando no hay localización: entregar contenido completo sin texto de aviso fijo.
+✅ **NORMATIVE UX (multilingual):**
+- Do not use notices hardcoded in a fixed language.
+- If a notice message is sent because of a fallback, it must be configurable/localizable per node.
+- Recommended default when there is no localization: deliver the full content with no fixed notice text.
 
 ### 2.2.1 Identity Resolution Client (SY.identity)
 
-`io-common` **DEBE** proveer identidad como pipeline compartido para todos los IO:
+`io-common` **MUST** provide identity as a shared pipeline for all IOs:
 
-1. `lookup(channel, external_id)` sobre SHM de identidad (`jsr-identity-<island>`).
-2. Si lookup da miss/error y `provision_on_miss=true`, llamar `ILK_PROVISION` contra `SY.identity`.
-3. Si provision devuelve ILK, forward con `meta.src_ilk=<ilk>`.
-4. Si provision falla o timeout, forward con `meta.src_ilk=null` (degraded fallback).
+1. `lookup(channel, external_id)` on the identity SHM (`jsr-identity-<island>`).
+2. If the lookup gives a miss/error and `provision_on_miss=true`, call `ILK_PROVISION` against `SY.identity`.
+3. If the provision returns an ILK, forward with `meta.src_ilk=<ilk>`.
+4. If the provision fails or times out, forward with `meta.src_ilk=null` (degraded fallback).
 
-Configuración operativa:
+Operational configuration:
 - `ISLAND_ID`
 - `IDENTITY_TARGET` (default `SY.identity@<ISLAND_ID>`)
 - `IDENTITY_TIMEOUT_MS`
 
-Propiedades requeridas:
-- no bloquea ACK al proveedor externo
-- no mantiene sesiones sin límite esperando identidad
-- logs/counters para hit/miss/error/provision/fallback
+Required properties:
+- it does not block the ACK to the external provider
+- it does not keep unbounded sessions waiting for identity
+- logs/counters for hit/miss/error/provision/fallback
 
-### 2.3 Relay / sessionización inbound común
-- El relay inbound vive en `io-common`; no debe existir un sessionizer privado por adapter.
-- Su función es consolidar múltiples fragmentos inbound del mismo turno físico en un único `text/v1` antes de llamar al pipeline común de inbound.
-- La identidad sigue resolviéndose al flush del relay; no durante la acumulación.
-- El adapter define la clave de relay y los hints del canal; `io-common` solo administra buffer, límites, deadlines, flush y ensamblado.
-- `relay_window_ms = 0` implica passthrough inmediato.
-- `relay_window_ms > 0` implica consolidación dentro de una ventana corta.
-- La configuración formal recomendada para adapters IO queda bajo `config.io.relay.*`.
-- La primera implementación activa usa store `memory`; durable queda como evolución posterior sin cambiar el contrato del adapter.
-- El relay deja trazabilidad en `meta.context.io.relay.*`.
+### 2.3 Common inbound relay / sessionization
+- The inbound relay lives in `io-common`; there must be no private sessionizer per adapter.
+- Its job is to consolidate several inbound fragments of the same physical turn into a single `text/v1` before calling the common inbound pipeline.
+- Identity is still resolved at the relay flush, not during accumulation.
+- The adapter defines the relay key and the channel hints; `io-common` only manages the buffer, limits, deadlines, flush and assembly.
+- `relay_window_ms = 0` means immediate passthrough.
+- `relay_window_ms > 0` means consolidation within a short window.
+- The recommended formal configuration for IO adapters lives under `config.io.relay.*`.
+- The first active implementation uses the `memory` store; durable is left as a later evolution, without changing the adapter contract.
+- The relay leaves a trace in `meta.context.io.relay.*`.
 
 ### 2.3.1 Response contracts hop-by-hop
 
-`io-common` expone además helpers comunes para contratos de respuesta estructurada entre hops.
+`io-common` also exposes common helpers for structured response contracts between hops.
 
-Carriers vigentes:
+Current carriers:
 
 - `meta.context.response_envelope`
 - `meta.context.final_response_contract`
 
-Reglas:
+Rules:
 
-- `response_envelope` define el shape esperado para la respuesta del hop actual;
-- `final_response_contract` preserva, cuando hace falta, el shape esperado para la respuesta final de una operación compuesta;
-- `response_envelope` no se propaga automáticamente a hops intermedios;
-- `final_response_contract` no debe imponerse al hop siguiente como obligación de formato;
-- copiar `meta.context` completo sin filtrar esos campos se considera incorrecto.
+- `response_envelope` defines the expected shape of the current hop's response;
+- `final_response_contract` keeps, when needed, the expected shape of the final response of a composite operation;
+- `response_envelope` is not propagated automatically to intermediate hops;
+- `final_response_contract` must not be imposed on the next hop as a format obligation;
+- copying the whole `meta.context` without filtering those fields is considered incorrect.
 
 Shape v1:
 
 - `kind = "json_object_v1"`
-- objeto top-level flat
-- tipos permitidos por propiedad:
+- flat top-level object
+- allowed types per property:
   - `string`
   - `boolean`
   - `integer`
   - `number`
-- `enum` solo para `string`
-- `required` define campos obligatorios
-- un campo presente en `properties` pero ausente de `required` es opcional
+- `enum` only for `string`
+- `required` defines the mandatory fields
+- a field present in `properties` but absent from `required` is optional
 
-Regla importante de semántica:
+Important semantics rule:
 
-- en v1, opcional significa "puede no estar";
-- opcional no significa "puede venir como `null`";
-- si un campo existe en la respuesta, debe respetar el tipo declarado en el contract.
+- in v1, optional means "may be absent";
+- optional does not mean "may come as `null`";
+- if a field exists in the response, it must match the type declared in the contract.
 
-Responsabilidades comunes de `io-common` en este punto:
+Common responsibilities of `io-common` here:
 
-- set/get de `response_envelope` y `final_response_contract`;
-- validación mínima del contract;
-- parseo y validación de respuestas estructuradas canónicas sobre payload `text`;
-- errores canónicos para:
-  - contract inválido
-  - `meta.context` inválido
-  - respuesta estructurada inválida
+- set/get of `response_envelope` and `final_response_contract`;
+- minimal validation of the contract;
+- parsing and validation of canonical structured responses over a `text` payload;
+- canonical errors for:
+  - invalid contract
+  - invalid `meta.context`
+  - invalid structured response
 
-### 2.4 Retry y errores
-- Clasificación de errores (retryable / non-retryable / rate_limited).
-- Circuit breaker opcional.
-- Políticas configurables por IO.
+### 2.4 Retry and errors
+- Error classification (retryable / non-retryable / rate_limited).
+- Optional circuit breaker.
+- Policies configurable per IO.
 
 ### 2.5 Lifecycle
-- Estados: STARTING / READY / DRAINING / STOPPED.
-- Manejo de SIGTERM.
-- Flush de outbox en shutdown.
+- States: STARTING / READY / DRAINING / STOPPED.
+- SIGTERM handling.
+- Outbox flush on shutdown.
 
-### 2.6 Observabilidad
-- Logs estructurados comunes.
-- Métricas estándar.
-- Propagación de `trace_id`.
-- Para el relay, la política inicial de logging es event-driven:
-  - sin logs periódicos,
-  - `debug` para apertura/buffer/flush/dedup,
-  - `info` para hitos de inicialización o drain,
-  - `warn` para capacidad, expiración, drops y fallbacks.
+### 2.6 Observability
+- Common structured logs.
+- Standard metrics.
+- `trace_id` propagation.
+- For the relay, the initial logging policy is event-driven:
+  - no periodic logs,
+  - `debug` for open/buffer/flush/dedup,
+  - `info` for initialization or drain milestones,
+  - `warn` for capacity, expiry, drops and fallbacks.
 
 ---
 
-## 3. Capa 3: Identidad (IdentityResolver)
+## 3. Layer 3: Identity (IdentityResolver)
 
-Para garantizar coherencia entre adaptadores IO, `io-common` expone un contrato
-de identidad centrado en inbound:
-- resolver `src_ilk` por `(channel, external_id)` cuando sea posible,
-- provisionar en miss si está habilitado,
-- degradar a `src_ilk=null` cuando no se logra resolver.
+To keep IO adapters consistent, `io-common` exposes an
+inbound-centered identity contract:
+- resolve `src_ilk` by `(channel, external_id)` when possible,
+- provision on a miss if enabled,
+- degrade to `src_ilk=null` when it cannot be resolved.
 
-### 3.1 Interfaz del Resolver (Contrato)
-El contrato operativo en runtime está compuesto por:
+### 3.1 Resolver interface (Contract)
+The operational contract at runtime is made of:
 
 - `IdentityResolver::lookup(channel, external_id) -> Option<src_ilk>`
 - `IdentityProvisioner::provision(input) -> Option<src_ilk>`
-- `InboundProcessor` como orquestador del flujo (lookup/provision/fallback)
+- `InboundProcessor` as the orchestrator of the flow (lookup/provision/fallback)
 
-### 3.2 Flujo Inbound (Canal -> Router)
-Cada vez que el Nodo IO recibe un mensaje o evento desde el exterior:
-1. **Extracción:** El Nodo IO extrae el ID del proveedor (ej: `U12345`).
+### 3.2 Inbound flow (Channel -> Router)
+Every time the IO Node receives a message or event from outside:
+1. **Extraction:** The IO Node extracts the provider ID (e.g. `U12345`).
 2. **Lookup:** `lookup(channel, external_id)`.
-3. **Provision on miss (opcional por config):** si hay miss/error, intentar `ILK_PROVISION`.
-4. **Forward al Router:** con `meta.src_ilk=<ilk>` si hubo éxito, o `null` en fallback.
+3. **Provision on miss (optional, by config):** on a miss/error, try `ILK_PROVISION`.
+4. **Forward to the Router:** with `meta.src_ilk=<ilk>` on success, or `null` on fallback.
 
-Importante:
-- el `external_id` usado para identidad externa es un dato distinto del `ICH` local;
-- el `ICH` local identifica el asset/canal operado por la instancia IO;
-- el handle remoto del interlocutor externo no debe reinterpretarse como `ICH`.
+Important:
+- the `external_id` used for the external identity is a different datum from the local `ICH`;
+- the local `ICH` identifies the asset/channel operated by the IO instance;
+- the remote handle of the external interlocutor must not be reinterpreted as an `ICH`.
 
 ### 3.3 Outbound
-La resolución de destino outbound es por `meta.context.io.reply_target` (contrato IO Context).
-No depende de un resolver de identidad adicional en `io-common`.
+The outbound destination is resolved through `meta.context.io.reply_target` (IO Context contract).
+It does not depend on an additional identity resolver in `io-common`.
 
-Para el caso hoy implementado de `IO.api`:
+For the case implemented today, `IO.api`:
 
 - `reply_target.kind = "webhook_post"`
 - `reply_target.address = integration_id`
-- `reply_target.params` mínimos:
+- minimal `reply_target.params`:
   - `integration_id`
   - `tenant_id`
   - `request_id`
   - `trace_id`
   - `reply_mode = "final_only"`
 
-Reglas:
+Rules:
 
-- `reply_target` no debe transportar `webhook.url`;
-- `reply_target` no debe transportar secretos ni headers firmados;
-- el nodo emisor outbound real resuelve esos datos al momento de entregar.
-
----
-
-## Fuera de alcance de io-common
-
-- Validación de firmas de proveedores.
-- Autenticación OAuth.
-- Extracción de IDs específicos de canal.
-- Decisiones de routing u OPA.
-- Gestión de secretos.
+- `reply_target` must not carry `webhook.url`;
+- `reply_target` must not carry secrets or signed headers;
+- the real outbound sending node resolves that data at delivery time.
 
 ---
 
-## 4. Arquitectura interna
+## Out of scope for io-common
 
-### 4.1 Interfaces principales
+- Validation of provider signatures.
+- OAuth authentication.
+- Extraction of channel-specific IDs.
+- Routing or OPA decisions.
+- Secret management.
 
-**InboundAdapter (por canal)**
+---
+
+## 4. Internal architecture
+
+### 4.1 Main interfaces
+
+**InboundAdapter (per channel)**
 - parse_event(raw) -> InboundEvent
 - dedup_key(event) -> DedupKey
 - relay_key(event) -> RelayKey
 - to_relay_fragment(event) -> RelayFragment
 
-**OutboundAdapter (por canal)**
+**OutboundAdapter (per channel)**
 - build_outbound(message) -> OutboxItem
 - send(outbox_item) -> SendResult
 
@@ -321,9 +321,9 @@ Reglas:
 - outbox_store
 - relay_store
 
-### 4.2 Relay común (`io-common`)
+### 4.2 Common relay (`io-common`)
 
-Contrato mínimo vigente:
+Current minimal contract:
 
 - `RelayPolicy`
 - `RelayStore`
@@ -335,37 +335,37 @@ Contrato mínimo vigente:
 - `FlushReason`
 - `RelayBuffer`
 
-Flujo normativo:
+Normative flow:
 
-1. el adapter parsea el evento externo;
-2. construye `RelayFragment` con `relay_key`, `fragment_id`, `io_context` e `identity_input`;
-3. `RelayBuffer` decide `Hold`, `FlushNow`, `DropDuplicate`, `RejectCapacity` o `DropExpired`;
-4. cuando hay `FlushNow`, `InboundProcessor` resuelve identidad y construye el mensaje final al router.
-
----
+1. the adapter parses the external event;
+2. it builds a `RelayFragment` with `relay_key`, `fragment_id`, `io_context` and `identity_input`;
+3. `RelayBuffer` decides `Hold`, `FlushNow`, `DropDuplicate`, `RejectCapacity` or `DropExpired`;
+4. on `FlushNow`, `InboundProcessor` resolves the identity and builds the final message to the router.
 
 ---
 
-## 4.X Contrato de metadata IO (meta.context.io (TENTATIVO))
+---
 
-`io-common` **DEBE** proveer utilidades para construir y validar el bloque estandarizado
-`meta.context.io (TENTATIVO)` (ver también la spec de Nodos IO). El objetivo es que todos los IO produzcan/consuman
-una metadata homogénea, minimizando excepciones por canal.
+## 4.X IO metadata contract (meta.context.io (TENTATIVE))
 
-Elementos clave:
-- `entrypoint`: identidad/cuenta del negocio (p.ej. número A vs B).
-- `reply_target`: parámetros mínimos para responder (contrato clave).
-- `message.id`: ID externo para dedup best-effort.
-- `conversation`: identificador externo (y thread si aplica).
+`io-common` **MUST** provide utilities to build and validate the standardized block
+`meta.context.io (TENTATIVE)` (see also the IO Nodes spec). The goal is that all IOs produce/consume
+homogeneous metadata, minimizing per-channel exceptions.
 
-`io-common` **PUEDE** proveer helpers tipo:
+Key elements:
+- `entrypoint`: the business identity/account (e.g. number A vs B).
+- `reply_target`: minimal parameters to reply (key contract).
+- `message.id`: external ID for best-effort dedup.
+- `conversation`: external identifier (and thread, if it applies).
+
+`io-common` **MAY** provide helpers such as:
 - `build_io_context_inbound(...)`
 - `extract_reply_target(outbound_message)`
 - `propagate_io_context(inbound -> outbound)`
 
-> Nota: el contenido exacto por canal se modela vía `reply_target.kind` y `reply_target.params`.
+> Note: the exact per-channel content is modeled through `reply_target.kind` and `reply_target.params`.
 
-Caso hoy implementado en el repo:
+Case implemented in the repo today:
 
 - `webhook_post`
   - `address = integration_id`
@@ -375,130 +375,130 @@ Caso hoy implementado en el repo:
   - `params.trace_id`
   - `params.reply_mode = "final_only"`
 
-Semántica:
+Semantics:
 
-- `reply_target` identifica el canal de entrega y la correlación mínima;
-- no reemplaza la configuración real del canal;
-- no debe copiar secretos ni configuración sensible al data plane del mensaje.
+- `reply_target` identifies the delivery channel and the minimal correlation;
+- it does not replace the channel's real configuration;
+- it must not copy secrets or sensitive configuration into the message's data plane.
 
 
-## 5. Estado y almacenamiento (dentro del IO)
+## 5. State and storage (inside the IO)
 
-Bajo las directivas actuales, los Nodos IO **NO** manejan base de datos ni Redis.
-Por lo tanto, `io-common` implementa almacenamiento **en memoria** para:
+Under the current directives, IO Nodes do **NOT** handle a database or Redis.
+Therefore `io-common` implements **in-memory** storage for:
 
 - `dedup_cache` (TTL + cap)
-- `relay_store` / `relay_buffer` (ventanas + caps)
-- `outbox_queue` (cola + caps)
+- `relay_store` / `relay_buffer` (windows + caps)
+- `outbox_queue` (queue + caps)
 
-### 5.1 Reglas obligatorias de acotamiento
+### 5.1 Mandatory bounding rules
 
-`io-common` **DEBE** exponer configuración para limitar memoria y evitar crecimiento sin control:
+`io-common` **MUST** expose configuration to limit memory and avoid unbounded growth:
 
 - `dedup.ttl_ms`, `dedup.max_entries`, `dedup.max_bytes`
 - `relay.window_ms`, `relay.max_open_sessions`, `relay.max_fragments_per_session`, `relay.max_bytes_per_session`
 - `outbox.max_pending`, `outbox.max_inflight`, `outbox.max_age_ms`
-- políticas de expulsión (eviction) y flush forzado
+- eviction policies and forced flush
 
-`io-common` **DEBE** exponer métricas por:
+`io-common` **MUST** expose metrics for:
 - evictions,
-- drops (por límites),
-- size actual de caches/colas,
+- drops (because of limits),
+- current size of caches/queues,
 - timeouts.
 
 ---
 
-## 6. Opciones futuras: persistencia y aceleración fuera del IO
+## 6. Future options: persistence and acceleration outside the IO
 
-Si en el futuro el sistema permite persistencia para IO, hay dos caminos típicos:
+If the system allows persistence for IO in the future, there are two typical paths:
 
-- **Postgres** (fuente de verdad) para dedup/outbox/mapeos (idempotencia) con auditoría.
-- **Redis** como acelerador (cache TTL, buffers temporales, rate limiting).
+- **Postgres** (source of truth) for dedup/outbox/mappings (idempotency) with auditing.
+- **Redis** as an accelerator (TTL cache, temporary buffers, rate limiting).
 
-Estas opciones **NO** están habilitadas dentro del IO bajo las directivas actuales, pero el diseño
-de `io-common` debe mantener puntos de extensión para incorporarlas (por ejemplo, una interfaz `StorageBackend`).
+These options are **NOT** enabled inside the IO under the current directives, but the design
+of `io-common` must keep extension points to add them (for example, a `StorageBackend` interface).
  (post-MVP)
 
-### 6.1 Usos recomendados
-- Cache de dedup (SETNX + TTL).
-- Buffer temporal de sessionización.
-- Rate limiting distribuido.
+### 6.1 Recommended uses
+- Dedup cache (SETNX + TTL).
+- Temporary sessionization buffer.
+- Distributed rate limiting.
 
-### 6.2 No recomendado como fuente de verdad
-- Outbox durable.
-- Auditoría final.
+### 6.2 Not recommended as a source of truth
+- Durable outbox.
+- Final audit.
 
-### 6.3 Modelo híbrido
+### 6.3 Hybrid model
 - Redis fast-path + Postgres truth.
-- Fallback a Postgres ante misses.
+- Fallback to Postgres on misses.
 
 ---
 
-## 7. Decisiones abiertas
+## 7. Open decisions
 
-### 7.1 DB por IO vs schema por IO
-- DB por IO: más aislamiento, más ops.
-- Schema por IO: menos ops, menos aislamiento.
+### 7.1 DB per IO vs schema per IO
+- DB per IO: more isolation, more ops.
+- Schema per IO: fewer ops, less isolation.
 
-### 7.2 Backend durable del relay
-- Mantener `memory` como baseline simple y predecible.
-- Definir `durable` sin convertir el relay en backlog histórico.
+### 7.2 Durable backend for the relay
+- Keep `memory` as a simple, predictable baseline.
+- Define `durable` without turning the relay into a historical backlog.
 
-### 7.3 Estrategia de claiming del outbox
+### 7.3 Outbox claiming strategy
 - SELECT FOR UPDATE SKIP LOCKED.
-- Leases con lock_until.
-- Broker externo.
+- Leases with lock_until.
+- External broker.
 
-### 7.4 Idempotencia outbound
-- Clave interna.
-- Soporte nativo del canal (si existe).
+### 7.4 Outbound idempotency
+- Internal key.
+- Native channel support (if it exists).
 
 ---
 
-## 8. Si no se usa io-common
+## 8. If io-common is not used
 
-Cada Nodo IO debe implementar:
-- deduplicación durable,
-- outbox y retries,
+Each IO Node must implement:
+- durable deduplication,
+- outbox and retries,
 - backoff,
-- lifecycle y draining,
-- métricas y logging,
-- relay/sessionización inbound (si aplica).
+- lifecycle and draining,
+- metrics and logging,
+- inbound relay/sessionization (if it applies).
 
-Riesgos:
-- inconsistencia entre canales,
-- bugs de duplicación,
-- alta deuda técnica.
+Risks:
+- inconsistency across channels,
+- duplication bugs,
+- high technical debt.
 
-Mitigación mínima:
-- checklist de conformidad + tests de contrato.
-
----
-
-## 9. Entregables de io-common
-
-- Migraciones SQL versionadas.
-- API pública estable.
-- Métricas estándar.
-- Documentación de integración.
-
+Minimal mitigation:
+- conformance checklist + contract tests.
 
 ---
 
-## Anexo A - Esquema sugerido si se habilita Postgres (post-MVP)
+## 9. io-common deliverables
 
-> Este anexo es **informativo** y **no aplica** mientras los IO no puedan usar DB/Redis.
+- Versioned SQL migrations.
+- Stable public API.
+- Standard metrics.
+- Integration documentation.
 
-### A.1 Tabla `io_dedup` (inbound)
+
+---
+
+## Annex A - Suggested schema if Postgres is enabled (post-MVP)
+
+> This annex is **informative** and **does not apply** while the IOs cannot use DB/Redis.
+
+### A.1 Table `io_dedup` (inbound)
 
 - `dedup_key TEXT PRIMARY KEY`
 - `first_seen_at TIMESTAMPTZ NOT NULL DEFAULT now()`
 - `expires_at TIMESTAMPTZ NOT NULL`
 - `meta JSONB NULL`
 
-Operación: `INSERT ... ON CONFLICT DO NOTHING` (conflict => DUPLICATE).
+Operation: `INSERT ... ON CONFLICT DO NOTHING` (conflict => DUPLICATE).
 
-### A.2 Tabla `io_outbox` (outbound)
+### A.2 Table `io_outbox` (outbound)
 
 - `id UUID PRIMARY KEY`
 - `state TEXT NOT NULL` (`PENDING/SENDING/SENT/FAILED/DEAD`)
@@ -514,9 +514,9 @@ Operación: `INSERT ... ON CONFLICT DO NOTHING` (conflict => DUPLICATE).
 - `created_at TIMESTAMPTZ NOT NULL DEFAULT now()`
 - `updated_at TIMESTAMPTZ NOT NULL DEFAULT now()`
 
-Índices: `(state, next_attempt_at)`, `(lock_until)`.
+Indexes: `(state, next_attempt_at)`, `(lock_until)`.
 
-### A.3 Tabla `io_session_buffer` (sessionización)
+### A.3 Table `io_session_buffer` (sessionization)
 
 - `session_key TEXT PRIMARY KEY`
 - `buffer JSONB NOT NULL`
@@ -524,43 +524,43 @@ Operación: `INSERT ... ON CONFLICT DO NOTHING` (conflict => DUPLICATE).
 - `updated_at TIMESTAMPTZ NOT NULL`
 
 
-> **Outbox (aclaración):** El outbox de los nodos IO **no es durable**. Su estado vive únicamente en memoria y puede perderse ante reinicios. Sin embargo, **se mantiene el mecanismo ya establecido de TTL, retries y ventana de vida máxima**, tras la cual los mensajes pendientes se descartan.
+> **Outbox (clarification):** The outbox of the IO nodes **is not durable**. Its state lives only in memory and can be lost on restarts. However, **the established mechanism of TTL, retries and maximum lifetime window is kept**; after that window, pending messages are dropped.
 
 ---
 
-## Aclaraciones v1.16+ - Alineacion con Fluxbee
+## Clarifications v1.16+ - Alignment with Fluxbee
 
-### Identidad L3
+### L3 identity
 
-El Nodo IO no debe bloquear ACK inbound esperando identidad.
+The IO Node must not block the inbound ACK while waiting for identity.
 
-Pipeline normativo:
-1. lookup en SHM (`jsr-identity-<island>`)
-2. si hay miss/error: `ILK_PROVISION` contra `SY.identity` (provision_on_miss)
-3. si provision falla/timeout: forward degradado con `meta.src_ilk = null`
+Normative pipeline:
+1. lookup in SHM (`jsr-identity-<island>`)
+2. on a miss/error: `ILK_PROVISION` against `SY.identity` (provision_on_miss)
+3. if the provision fails/times out: degraded forward with `meta.src_ilk = null`
 
-`src_ilk` debe ir en `meta.src_ilk`; `meta.context` queda para metadata adicional (incluyendo `meta.context.io.*`).
-`thread_id` debe ir en `meta.thread_id` (carrier canónico v2).
-`meta.context.thread_id` fue removido del pipeline IO y no debe usarse.
-
----
-
-### Contexto (`ctx_window`)
-
-`ctx_window` lo inyecta Router. IO puede recibirlo, pero no debe reenviarlo al canal externo.
+`src_ilk` must go in `meta.src_ilk`; `meta.context` is left for additional metadata (including `meta.context.io.*`).
+`thread_id` must go in `meta.thread_id` (canonical v2 carrier).
+`meta.context.thread_id` was removed from the IO pipeline and must not be used.
 
 ---
 
-### Protocolo (`meta.ctx` vs `meta.context`)
+### Context (`ctx_window`)
 
-- `meta.ctx`: contexto conversacional
-- `meta.context`: metadata adicional (OPA + carrier temporal para campos no tipados)
-- IO metadata de canal bajo `meta.context.io.*`
-- `thread_id`: solo en `meta.thread_id` (no en `meta.context.thread_id`)
+`ctx_window` is injected by the Router. IO may receive it, but must not forward it to the external channel.
 
 ---
 
-### Persistencia en el Nodo IO
+### Protocol (`meta.ctx` vs `meta.context`)
 
-El MVP usa memoria para estado tecnico local (dedup/sessions/outbox).
-IO no es source of truth; la persistencia canonica permanece en core (Router/Storage/Identity).
+- `meta.ctx`: conversational context
+- `meta.context`: additional metadata (OPA + temporary carrier for untyped fields)
+- IO channel metadata under `meta.context.io.*`
+- `thread_id`: only in `meta.thread_id` (not in `meta.context.thread_id`)
+
+---
+
+### Persistence in the IO Node
+
+The MVP uses memory for local technical state (dedup/sessions/outbox).
+IO is not the source of truth; canonical persistence stays in the core (Router/Storage/Identity).

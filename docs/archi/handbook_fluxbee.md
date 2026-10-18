@@ -680,11 +680,11 @@ When `fluxbee_start_pipeline` reports `blocked_run_pending`, the actionable tool
 
 This handbook is the concise operational layer for Archi. Broader platform detail lives in:
 
-- [01-arquitectura.md](/Users/cagostino/Documents/GitHub/fluxbee/docs/01-arquitectura.md)
-- [04-routing.md](/Users/cagostino/Documents/GitHub/fluxbee/docs/04-routing.md)
-- [10-identity-layer3.md](/Users/cagostino/Documents/GitHub/fluxbee/docs/10-identity-layer3.md)
-- [SY_nodes_spec.md](/Users/cagostino/Documents/GitHub/fluxbee/docs/SY_nodes_spec.md)
-- [executor_manifest_pilot_spec.md](/Users/cagostino/Documents/GitHub/fluxbee/docs/executor_manifest_pilot_spec.md)
-- [io-blob-spec-v1.md](../../io-blob-spec-v1.md)
+- [reference/architecture.md](../reference/architecture.md)
+- [reference/routing-and-policy.md](../reference/routing-and-policy.md)
+- [reference/identity.md](../reference/identity.md)
+- [nodes/](../nodes/): one page per system node; [nodes/sy-admin.md](../nodes/sy-admin.md) lists every
+  admin action
+- [io-blob-spec-v1.md](../io-blob-spec-v1.md)
 
 If this handbook conflicts with live action contracts, the live action contracts from `get_admin_action_help(...)` win for request shape, and this handbook wins for high-level planning intent.

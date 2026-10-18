@@ -1,0 +1,339 @@
+# SY.orchestrator
+
+SY.orchestrator is the supervisor of one hive. It runs on every hive, whatever the role. It
+starts the hive's core in order and keeps it running, launches and relaunches the managed nodes
+(`AI.*`, `IO.*`, `WF.*`), applies updates that arrive through Syncthing, runs Syncthing itself,
+and owns the host posture pieces that exist today. On the motherbee it also joins and removes the
+other hives (`add_hive`, `remove_hive`). It is the only unit the `.deb` enables: it brings up the
+rest.
+
+Source: `src/bin/sy_orchestrator.rs`. Packaging: `packaging/build-deb.sh`, `packaging/deb-postinst`.
+
+| | |
+| --- | --- |
+| Binary | `/usr/bin/sy-orchestrator` (`RUST_BINS` entry `sy-orchestrator:sy_orchestrator`) |
+| Node name | `SY.orchestrator@<hive>` |
+| Role | every role: motherbee, worker, ingress, egress |
+| systemd unit | `sy-orchestrator.service`, `Restart=always`, `RestartSec=5`, `TimeoutStopSec=15`; the only unit `deb-postinst` enables |
+| Listens on | nothing: it connects to the local router socket; no TCP port |
+| State | `/var/lib/fluxbee/orchestrator/`, `/var/lib/fluxbee/hives/`, `/var/lib/fluxbee/nodes/`, `/var/lib/fluxbee/state/orchestrator/`, PID in `/var/run/fluxbee/orchestrator.pid` |
+
+## Where it runs
+
+- `main` accepts `role` motherbee, worker, egress or ingress. Any other value logs
+  `SY.orchestrator supports only role=motherbee|worker|egress|ingress; exiting` and exits 0.
+- `role: motherbee` requires `hive_id: motherbee` (`PRIMARY_HIVE_ID`); any other role may not use
+  that id. Both are errors.
+- On the motherbee the unit is the packaged one (`gen_unit`, `After=network.target`). On a spoke
+  the orchestrator writes its own units (`core_service_unit_contents`), where `sy-orchestrator`
+  and `sy-edge` get `After=network.target rt-gateway.service` and `Wants=rt-gateway.service`.
+
+## How it starts
+
+`main`, in order:
+
+1. Reads `/etc/fluxbee/hive.yaml`; a missing or invalid file, an invalid `system_nodes` section or
+   an invalid `ai` section ends the process with an error. Creates its directories
+   (`ensure_dirs`) and writes the PID file.
+2. **`bootstrap_local`**, before joining the router:
+   1. checks the sha256 of every core binary of its role against `dist/core/manifest.json`
+      (`validate_core_manifest_for_bins`; fatal);
+   2. on a spoke, rewrites the core unit files if their template changed (`regen_local_core_units`);
+   3. on the motherbee, makes sure the SSH join key and the mesh CA and TLS exist
+      (`ensure_motherbee_ssh_key`, `ensure_motherbee_mesh_tls`), refreshes the per-role core
+      trees spokes sync from (`materialize_role_core_trees`) and clears interrupted joins;
+   4. starts `rt-gateway` and waits up to 30 s for it and its SHM (`wait_for_router_ready`; fatal);
+   5. opens the core firewall ports and reconciles egress (fatal only on the egress role);
+   6. starts Syncthing if blob or dist sync is enabled (a failure only warns);
+   7. starts each `system_nodes.<role>.nodes` service in list order (`start_core_service`), using
+      `restart` instead of `start` for a service whose binary a package upgrade replaced (its
+      `/proc/<pid>/exe` link ends in "(deleted)", `exe_link_is_replaced`, FINDINGS A-45); a
+      failure only warns;
+   8. waits up to 60 s for those nodes to appear in the router (`wait_for_lifecycle_nodes`); a
+      timeout only warns.
+3. Joins the router as `SY.orchestrator` (`RouterDispatcher::connect_with_retry`, every 1 s).
+4. Starts the admin worker and the system worker (`run_admin_worker`, `run_system_worker`). Each
+   handles its messages one at a time, in arrival order.
+5. Starts the managed-node reconcile loop (every 60 s) and, on the motherbee, the loop that takes
+   Syncthing off public infrastructure once every spoke reports a reachable motherbee
+   (`run_syncthing_options_switch_loop`).
+6. **`finish_bootstrap`**: on the motherbee, waits for `sy-storage` to be active (30 s) and for its
+   database to answer `STORAGE_METRICS_GET` over the mesh (30 s, `wait_for_storage_db_ready`);
+   then, on every role, relaunches the persisted managed nodes
+   (`reconcile_persisted_custom_nodes`, mode `Rebind`) and hands the blob folders over.
+7. Sets `booted`, logs `hive ready`, and starts the watchdog (every 5 s).
+
+### ORCHESTRATOR_BOOTING
+
+From step 4 to step 7 the orchestrator is on its router but not ready. `run_admin_worker` answers
+every admin command with `ORCHESTRATOR_BOOTING`, "the orchestrator is still booting; retry
+shortly", until `booted` is set. System messages are handled during that time. SY.admin passes
+the code through to its caller (over HTTP it arrives as a 500).
+
+## System nodes per role
+
+There are no defaults in the code: `system_nodes_for_role` requires a
+`system_nodes.<role>` section in hive.yaml with a `nodes` list (start order) and an optional
+`wait_for` list. The packaged template (`packaging/hive.yaml.example`):
+
+| Role | `nodes`, in start order |
+| --- | --- |
+| motherbee | SY.config.routes, SY.identity, SY.opa.rules, SY.admin, SY.architect, SY.storage, SY.cognition, SY.timer, SY.wf-rules, SY.frontdesk.gov, SY.vault |
+| worker | SY.config.routes, SY.identity, SY.opa.rules, SY.cognition, SY.timer, SY.wf-rules |
+| egress | SY.config.routes, SY.opa.rules |
+| ingress | SY.config.routes, SY.opa.rules, SY.edge |
+
+`add_hive` copies the motherbee's section for the new hive's role into that hive's hive.yaml
+(`render_system_nodes_yaml`).
+
+`validate_system_nodes` refuses a list that:
+
+- is empty, or does not start with `SY.config.routes` (the writer of the routing SHM);
+- on the motherbee, lacks `SY.vault`, or lists one of its consumers (`SY.admin`, `SY.architect`,
+  `SY.storage`, `SY.identity`, `SY.cognition`, `SY.frontdesk.gov`) after it. SY.vault announces
+  its secrets when it starts, and a router broadcast reaches only nodes already registered;
+- on any other role, contains `SY.vault`;
+- has a non-`SY.*` name (the allowlist of other names is empty), duplicates, or a `wait_for`
+  entry that is not in `nodes`.
+
+A node name maps to its unit by `name_to_service`: drop `SY.`, lowercase, dots to dashes, prefix
+`sy-` (`SY.frontdesk.gov` → `sy-frontdesk-gov`).
+
+## Managed nodes
+
+`run_node` (from SY.admin) ends in `run_node_flow`:
+
+1. Names are `<local>@<hive>`; `SY.*` and `RT.*` names are refused
+   (`managed_spawn_disallowed_reason`).
+2. A node may not run in the root tenant unless it is core: `SY.*`, `RT.*`, or an `IO.*` node on
+   `io.cloud`, `io.blob` or `io.web` (`is_core_node`, `genesis_refusal`:
+   `TENANT_ROOT_NOT_ALLOWED`). A tenant that is not active is refused (`TENANT_NOT_ACTIVE`).
+3. A node for another hive is forwarded to that hive's orchestrator as `SPAWN_NODE`.
+4. The runtime comes from `/var/lib/fluxbee/dist/runtimes/manifest.json`; the entry point is
+   `/var/lib/fluxbee/dist/runtimes/<runtime>/<version>/bin/start.sh` (`runtime_start_script`).
+   A node whose config already exists is refused (`NODE_ALREADY_EXISTS`).
+5. The node gets an ILK: `ILK_REGISTER` to `SY.identity@motherbee` with `ilk_type: "agent"` and
+   the node's tenant (`ensure_node_identity_registered`).
+6. Its config is written to `/var/lib/fluxbee/nodes/<KIND>/<name@hive>/config.json`
+   (`node_instance_dir`, `write_json_atomic`): the runtime's config template, the request's
+   `config`, `tenant_id`, and a `_system` block.
+7. It starts as a transient unit:
+   `systemd-run --unit fluxbee-node-<name> --setenv=FLUXBEE_NODE_NAME=... [--setenv=FLUXBEE_NODE_ILK_ID=...] [--setenv=FLUXBEE_NODE_TENANT_ID=...] --collect --property Restart=always --property RestartSec=5 <start.sh>`
+   (`build_managed_node_run_command`; `unit_from_node_name` turns characters outside
+   `[A-Za-z0-9._-]` into `-`).
+
+`_system` (`build_node_system_block`): `managed_by: "SY.orchestrator"`, `node_name`, `hive_id`,
+`relaunch_on_boot`, `config_version`, `created_at_ms`, `updated_at_ms`,
+`requested_runtime_version` (default `current`), `launched_by`, and when known `runtime`,
+`runtime_version`, `runtime_base`, `package_path`, `ilk_id`, `tenant_id`.
+
+- **`relaunch_on_boot`** is `true` at spawn. `kill_node` sets it `false`; `start_node` and
+  `restart_node` set it `true` (`set_node_relaunch_on_boot`). A crash does not change it.
+- **`launched_by`** is the request's `launched_by` (up to 128 characters of `[A-Za-z0-9._-@]`),
+  else `system` (`launched_by_from_payload`). SY.admin always stamps it: `cloud`, `archi`,
+  `operator`, or the caller's name. For Cloud's node actions SY.admin also sends
+  `require_tenant_id` / `require_launched_by`, and a node that does not match answers
+  `NODE_NOT_FOUND`.
+- **Relaunch.** At boot and every 60 s (`run_managed_runtime_reconcile_loop`),
+  `reconcile_persisted_custom_nodes` relaunches each persisted node with a runtime and
+  `relaunch_on_boot: true` whose unit is not active and that the router does not see. At boot
+  (`Rebind`) a running node that follows `current` is also moved to the version the pointer now
+  names (FINDINGS A-39).
+- **Stop and removal.** `kill_node` runs `systemctl stop` and `reset-failed` on the unit. With
+  `purge_instance`, and in `remove_node_instance` (refused while the node runs), it also removes
+  the instance directory and asks SY.admin to delete the node's ILK and the secrets it owns.
+
+## Hives: add_hive and remove_hive
+
+Both are motherbee-only ("add_hive/remove_hive are motherbee-only").
+
+`add_hive` (`accept_add_hive`) checks the request, writes
+`/var/lib/fluxbee/hives/<hive>/info.yaml` with status `joining`, and answers `accepted` with a
+`join_id` and `poll: GET /hives/<hive>`. The join runs in the background (`run_background_join`).
+A join already running answers `JOIN_IN_PROGRESS`; a connected hive, `HIVE_EXISTS`. `role` is
+`worker` (default), `egress` or `ingress`; `ssh_access` is refused ("SSH exists only inside
+add_hive and is always revoked at its end (D32)").
+
+The worker join (`add_hive_flow`), in order:
+
+1. If the spoke's orchestrator is already on the mesh, finish over the mesh without SSH.
+2. Issue the hive's mesh TLS leaf (`issue_hive_tls`), before any SSH.
+3. SSH in with `/var/lib/fluxbee/ssh/motherbee.key`, seeding it with the request's `ssh_key` or
+   `ssh_password` if needed; wait for the box to settle (cloud-init, apt jobs; up to 900 s,
+   `wait_for_host_to_settle`; `HOST_NOT_SETTLED` is retryable); install a temporary sudoers
+   grant (`/etc/sudoers.d/fluxbee-orchestrator`).
+4. Copy the role's core binaries and manifest, and the vendored Syncthing
+   (`sync_core_to_worker`, `sync_vendor_to_worker`); write the spoke's hive.yaml with the
+   motherbee as WAN uplink; push the TLS material (`push_hive_tls`) and, for a worker, the
+   identity sync key.
+5. Write and start the units, wait for the spoke's orchestrator on the mesh, send
+   `ADD_HIVE_FINALIZE`, link Syncthing, apply `restrict_ssh` / `harden_ssh` if asked.
+6. Mark the hive `connected`, then revoke the SSH access: remove the sudoers file and the
+   motherbee key from `authorized_keys` (`revoke_bootstrap_ssh_access`). A failed join revokes
+   too (`best_effort_revoke_bootstrap`), except after a transient failure, where the key stays so
+   a retry can enter.
+
+The unit test `ssh_happens_only_inside_add_hive` fails the build if SSH is used anywhere else in
+the file (D32, FINDINGS A-54). Egress and ingress joins have their own flows
+(`add_egress_hive_flow`, `add_ingress_hive_flow`).
+
+`remove_hive` (`remove_hive_flow`) refuses the local hive, sends `REMOVE_HIVE_CLEANUP` to the
+spoke's orchestrator (8 s; the spoke stops its units and clears its node state), unlinks the
+spoke from Syncthing and deletes `/var/lib/fluxbee/hives/<hive>/`. There is no SSH fallback: an
+offline spoke is cleaned up locally only. `ADD_HIVE_FINALIZE` and `REMOVE_HIVE_CLEANUP` are
+refused on the motherbee (`spoke_only_action_refusal`).
+
+## Updates
+
+SY.admin's `update` sends `SYSTEM_UPDATE` to `SY.orchestrator@<hive>` with a `category`
+(`runtime`, `core` or `vendor`) and the `manifest_hash` the hive should have
+(`handle_system_update_message`). If the local manifest does not match yet, the answer is
+`sync_pending` (Syncthing has not delivered it).
+
+- **runtime**: verifies the runtime artifacts (missing ones also give `sync_pending`) and
+  applies retention.
+- **vendor**: brings the running Syncthing in line with the vendored one
+  (`ensure_blob_sync_runtime`), when sync is enabled.
+- **core** (`apply_core_update_replying_first`): backs up each binary to replace under
+  `/var/lib/fluxbee/orchestrator/core-bin.prev.local/update-<ms>/` with a `generation.json`,
+  swaps the binaries, rewrites the units, and **answers first** (`phase: restarting`). Two
+  seconds later it restarts `rt-gateway` and the system nodes, each behind a 30 s health gate
+  (`restart_local_core_services_with_health_gate`), skipping itself. A failed gate restores the
+  old binaries (`status: rollback`). If its own binary changed it schedules its own restart
+  (`schedule_orchestrator_self_restart`, `systemd-run --on-active=2s`). It keeps 3 generations
+  (`CORE_BACKUP_GENERATIONS_KEPT`) and records the outcome in
+  `/var/lib/fluxbee/orchestrator/core-update-last.json` and `core-installed.json`.
+- **core_rollback** restores a stamped generation (`core_rollback_local`).
+
+`SYSTEM_SYNC_HINT` (SY.admin's `sync_hint`) asks Syncthing to rescan a folder (`blob` or `dist`)
+and waits until it is idle: default 30 s, at most 300 s.
+
+## Syncthing
+
+The orchestrator runs Syncthing as `fluxbee-syncthing.service` (`syncthing_unit_contents`):
+user `fluxbee`, `UMask=0027`, `/var/lib/fluxbee/vendor/bin/syncthing` with the GUI and API on
+`127.0.0.1:<api_port>` (default 8384) and its home in `/var/lib/fluxbee/syncthing`. It opens
+22000/tcp, 22000/udp and 21027/udp (`syncthing_firewall_rules`).
+
+| Folder | Holds | Who gets it |
+| --- | --- | --- |
+| `fluxbee-dist-core-<role>` | the core binaries for one role | each spoke its own role's (`folder_forbidden_for_role`) |
+| `fluxbee-dist-vendor` | Syncthing | every spoke |
+| `fluxbee-dist-policy` | the compiled user OPA policy | every spoke |
+| `fluxbee-dist-runtimes` | runtime packages | workers only |
+| `fluxbee-blob` | `blob/active` | workers only, when blob sync is on (`peer_shares_active_blob`) |
+| `fluxbee-blob-public` | `blob/public` | the ingress only (`peer_shares_public_blob`) |
+
+Dist folders and `fluxbee-blob-public` are `sendonly` on the motherbee and `receiveonly` on the
+spokes (`dist_syncthing_folder_type`, `blob_public_syncthing_folder_type`), so a spoke never
+writes them. `fluxbee-blob` is `sendreceive`.
+
+## Host posture
+
+What the code does today:
+
+- **Firewall ports** (`ensure_core_firewall_local`): the `wan.listen` port, and on the motherbee
+  the identity sync port (9100). Rules go through `ufw allow` and `firewall-cmd` when present
+  (`open_firewall_rules_local`); with neither, it only warns. FINDINGS A-46 notes ufw is inactive
+  on the hives, so these rules have no effect there. The egress role skips this.
+- **Loopback check** (`watchdog_listener_check`): about once a minute it runs `ss -H -tlnp` and,
+  if `sy-admin` or `sy-architect` listens off loopback, logs a warning and records a `posture`
+  drift alert. It changes nothing.
+- **Egress** (`reconcile_egress`): on the egress role an nftables table `inet fluxbee_egress`
+  (forward only LAN→WAN, IPv6 dropped, masquerade; input accepted), sysctls, and
+  `fluxbee-egress-nft.service` to load it at boot. A worker gets its default route via the
+  egress `gateway_ip`. The motherbee is only checked (`EGRESS_MOTHERBEE_BYPASS`).
+
+## Watchdog
+
+Every 5 s (`watchdog_tick`) the orchestrator checks `rt-gateway` and every service of its
+`system_nodes` list with `systemctl is-active`, and runs `systemctl start` on any that is not
+active. A stopped core unit comes back within seconds. The same tick logs managed nodes that left
+the router, verifies runtimes, runs blob GC when enabled, checks Syncthing and its peers, re-applies
+egress, and runs the loopback check.
+
+To keep a core unit stopped, for a test or a repair, mask it for this boot and stop it:
+`systemctl mask --runtime <unit>` (the lab notes in `lab/DEPLOYMENTS.md` and
+`lab/logbook/2026-10-16.md` do this). The watchdog has no mask check: its `systemctl start` fails
+and it logs `service restart failed` every 5 s until `systemctl unmask`.
+
+## Messages
+
+**Admin commands** (`msg_type: admin`, sent by SY.admin), handled by `handle_admin`: hive_status,
+get_storage, set_storage, list_nodes, list_tenant_nodes, list_versions, get_versions,
+list_runtimes, get_runtime, run_node, start_node, restart_node, kill_node, remove_node_instance,
+get_node_config, set_node_config, get_node_state, get_node_status, list_deployments,
+get_deployments, list_drift_alerts, get_drift_alerts, list_hives, get_hive, add_hive, remove_hive,
+core_rollback. Anything else answers `NOT_IMPLEMENTED`. Mutating actions are accepted only from
+`SY.admin@<this hive>` (`admin_action_requires_origin`, `is_allowed_admin_source_name`), else
+`FORBIDDEN`.
+
+**System messages** (`handle_system_message`), mostly between orchestrators: `SYSTEM_UPDATE`,
+`SYSTEM_CORE_ROLLBACK`, `SYSTEM_SYNC_HINT`, `SPAWN_NODE`, `KILL_NODE`, `START_NODE`,
+`RESTART_NODE`, `REMOVE_NODE_INSTANCE`, `NODE_CONFIG_SET`, `NODE_CONFIG_GET`, `NODE_STATE_GET`,
+`NODE_STATUS_GET`, `GET_VERSIONS`, `GET_RUNTIMES`, `GET_RUNTIME`, `LIST_NODES`,
+`INVENTORY_REQUEST`, `ADD_HIVE_FINALIZE`, `REMOVE_HIVE_CLEANUP`. `RUNTIME_UPDATE` is refused.
+The router delivers these protected actions only from allowed origins (`policy/system.rego`: any
+`SY.orchestrator@<hive>` for the node and handshake actions, rule (3); `SY.admin@motherbee` for
+`SYSTEM_UPDATE` and `SYSTEM_SYNC_HINT`, rule (2)).
+
+## Config
+
+`/etc/fluxbee/hive.yaml` (`HiveFile`): `hive_id`, `role`, `wan` (`gateway_name`, default
+`RT.gateway`; `listen`; `authorized_hives`; `uplinks`), `storage.path`, `blob` (`enabled`, default
+true; `path`, default `/var/lib/fluxbee/blob`; `sync`, default off, tool `syncthing`, `api_port`
+8384, `data_dir`; `gc`), `dist` (`path`, default `/var/lib/fluxbee/dist`; sync on by default),
+`identity.sync.port` (default 9100), `government`, `system_nodes`, `egress`, `ai`.
+
+Environment: `JSR_LOG_LEVEL`; `ORCH_DEFAULT_TENANT_ID` (tenant for a spawn that names none);
+`JSR_ORCH_SYSTEM_FORWARD_TIMEOUT_SECS` and `JSR_ORCH_CORE_ROLLBACK_FORWARD_TIMEOUT_SECS`
+(forward timeouts); `FLUXBEE_ADD_HIVE_REQUIRE_DIST_SYNC` / `JSR_ADD_HIVE_REQUIRE_DIST_SYNC` and
+`FLUXBEE_ADD_HIVE_DIST_SYNC_TIMEOUT_SECS` / `JSR_ADD_HIVE_DIST_SYNC_TIMEOUT_SECS` (join checks).
+
+## State on disk
+
+| Path | What |
+| --- | --- |
+| `/var/lib/fluxbee/hives/<hive>/info.yaml` | the hive registry (motherbee): role, address, status, join phase, Syncthing device |
+| `/var/lib/fluxbee/nodes/<KIND>/<name@hive>/config.json` | managed node config with `_system` |
+| `/var/lib/fluxbee/state/orchestrator/identity-node-ilk-map.json` | node → ILK and tenant, used on relaunch |
+| `/var/lib/fluxbee/orchestrator/` | `core-bin.prev.local/`, `core-installed.json`, `core-update-last.json`, `deployments-history.jsonl`, `drift-alerts.jsonl`, `syncthing-posture.json` |
+| `/var/lib/fluxbee/dist/` | core, vendor, runtimes and policy trees |
+| `/var/lib/fluxbee/tls/` | mesh CA (motherbee) and the hive's TLS leaf |
+| `/var/lib/fluxbee/ssh/motherbee.key` | the join key (motherbee) |
+| `/var/lib/fluxbee/syncthing/` | the Syncthing home |
+
+## Failure behavior
+
+- **No router.** `wait_for_router_ready` gives up after 30 s and `main` exits with an error;
+  systemd restarts it 5 s later.
+- **No database (motherbee).** If `sy-storage` is not active, or its database does not answer
+  within 30 s, `finish_bootstrap` fails and the process exits; until then admin callers get
+  `ORCHESTRATOR_BOOTING`.
+- **A system node fails to start.** Logged; the watchdog keeps trying every 5 s.
+- **SIGTERM or SIGINT.** It exits at once and leaves every service running ("managed services
+  keep running"); the next boot takes them over.
+- **A core update fails its health gate.** The old binaries come back (`status: rollback`).
+
+## Health
+
+- `systemctl status sy-orchestrator`; `journalctl -u sy-orchestrator` shows `hive ready` when the
+  boot ended.
+- `curl -s http://127.0.0.1:8080/hive/status` on the motherbee: `hive_id`, `pid`, `uptime_ms`
+  of the motherbee's orchestrator.
+- `GET /hives`, `GET /hives/{hive}` (join status), `GET /versions` (core, runtime and vendor per
+  hive, with the last core update), `GET /drift-alerts` on SY.admin.
+
+## Links
+
+- [SY.admin](sy-admin.md): sends every admin command and the updates.
+- [SY.edge](sy-edge.md): the ingress role's door.
+- [SY.vault](sy-vault.md): why it starts last.
+- [The router](rt-gateway.md), [SY.identity](sy-identity.md),
+  [SY.config.routes](sy-config-routes.md): what it starts first.
+- [Operations](../reference/operations.md) and [07-operaciones](../history/07-operaciones.md): install,
+  `add_hive` fields, upgrades.
+- [Host posture spec](../host-posture-and-exposure-spec-v1.md): the posture stages.
+- [Software distribution spec](../history/software-distribution-spec.md) and
+  [runtime lifecycle spec](../history/runtime-lifecycle-spec.md): dist and runtimes.
+- `lab/logbook/FINDINGS.md`: A-39, A-45, A-46, A-54; D32 in the join comments.

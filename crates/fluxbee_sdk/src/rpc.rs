@@ -6,7 +6,7 @@
 //! operational traffic that is not a pending response according to a
 //! profile-declared, ordered rule table over `(meta.msg_type, meta.msg)`.
 //!
-//! Design contract (see `docs/onworking COA/orchestrator_internal_rpc_multiplexing_tasks.md`,
+//! Design contract (see `docs/history/onworking-coa/orchestrator_internal_rpc_multiplexing_tasks.md`,
 //! sections "Decisions taken 2026-05-23" and "Target design v2"):
 //!
 //! - The router recv loop runs in a dedicated `tokio::spawn` and **never**

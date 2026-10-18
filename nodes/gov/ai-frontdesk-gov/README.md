@@ -1,54 +1,54 @@
 # SY.frontdesk.gov
 
-El frontdesk de identidad: completa el registro de una persona que llegó con un ILK temporal y la
-registra en SY.identity (`ILK_REGISTER`).
+The identity frontdesk: it completes the registration of a person who arrived with a temporary ILK and
+registers them in SY.identity (`ILK_REGISTER`).
 
-## Qué es
+## What it is
 
-- Un **nodo de sistema** del core, en motherbee: `sy-frontdesk-gov.service`, binario
-  `/usr/bin/sy-frontdesk-gov`, arrancado sin argumentos. **No** es un runtime ni una instancia de
-  `ai.generic`, y se actualiza con el `.deb`.
-- **Autónomo:**
-  - trae su prompt embebido;
-  - el proveedor y el modelo salen de la sección `ai` de `hive.yaml`;
-  - la clave sale de SY.vault por `resource_type` (tenant raíz).
-  - `CONFIG_SET` no acepta campos de config: solo vuelve a leer la clave del vault.
-- **Dos entradas:**
-  - `frontdesk_handoff`: datos ya estructurados, por ejemplo `register_human` de io.cloud. Funciona
-    sin LLM, aunque falte la clave.
-  - conversacional: el LLM junta los datos y llama a la tool `ilk_register`.
-- **Tenant:** el registro va al tenant del caso, el que SY.identity tiene para el ILK temporal (el
-  frontdesk lo lee del SHM de identity). El `tenant_id` de un handoff solo tiene que coincidir. El
-  frontdesk nunca crea tenants, ni toma uno de la persona o del LLM; sin tenant responde
-  `TENANT_UNRESOLVED` y no registra nada.
-- **Tenant raíz:** nadie se registra ahí. Si el caso es del tenant raíz, responde
-  `TENANT_NOT_REGISTRABLE` (`error_code` `TENANT_ROOT_NOT_REGISTRABLE`) sin llamar a SY.identity
-  ni al LLM, y la persona sigue temporal. SY.identity rechaza lo mismo para cualquier llamador.
-  En el tenant raíz solo corren io.cloud e io.blob, y ninguno provisiona personas ahí (decisión
-  del operador 2026-10-02): esta respuesta queda como defensa en profundidad.
-- **Email ya registrado:** si el email ya es de otra persona del tenant, SY.identity hace el merge
-  (el canal pasa a ese ILK y se completan solo los datos que le faltaban) y el frontdesk responde
+- A core **system node**, on the motherbee: `sy-frontdesk-gov.service`, binary
+  `/usr/bin/sy-frontdesk-gov`, started with no arguments. It is **not** a runtime or an instance of
+  `ai.generic`, and it is updated with the `.deb`.
+- **Autonomous:**
+  - it carries its prompt embedded;
+  - the provider and the model come from the `ai` section of `hive.yaml`;
+  - the key comes from SY.vault by `resource_type` (root tenant).
+  - `CONFIG_SET` accepts no config fields: it only re-reads the key from the vault.
+- **Two inputs:**
+  - `frontdesk_handoff`: data that is already structured, for example `register_human` from io.cloud. It works
+    without an LLM, even when the key is missing.
+  - conversational: the LLM gathers the data and calls the `ilk_register` tool.
+- **Tenant:** the registration goes to the tenant of the case, the one SY.identity holds for the temporary ILK (the
+  frontdesk reads it from the identity SHM). The `tenant_id` of a handoff only has to match. The
+  frontdesk never creates tenants, and never takes one from the person or from the LLM; with no tenant it answers
+  `TENANT_UNRESOLVED` and registers nothing.
+- **Root tenant:** nobody registers there. If the case belongs to the root tenant, it answers
+  `TENANT_NOT_REGISTRABLE` (`error_code` `TENANT_ROOT_NOT_REGISTRABLE`) without calling SY.identity
+  or the LLM, and the person stays temporary. SY.identity rejects the same for any caller.
+  Only io.cloud and io.blob run in the root tenant, and neither of them provisions people there (operator
+  decision 2026-10-02): this answer stays as defense in depth.
+- **Email already registered:** if the email already belongs to another person of the tenant, SY.identity does the merge
+  (the channel moves to that ILK and only the data it was missing is filled in) and the frontdesk answers
   `MERGED`.
-- Lo compartido con otros componentes `.gov` vive en `nodes/gov/common` (`gov-common`).
-- Los logs no llevan datos personales: del registro se loguea `ilk_id`, `tenant_id` y qué campos
-  vinieron, nunca sus valores.
+- What is shared with other `.gov` components lives in `nodes/gov/common` (`gov-common`).
+- The logs carry no personal data: from a registration it logs `ilk_id`, `tenant_id` and which fields
+  came in, never their values.
 
-## Compilar y probar
+## Build and test
 
-Desde la raíz del repo:
+From the repo root:
 
 ```bash
 cargo test -p sy-frontdesk-gov -p gov-common
 cargo build --release -p sy-frontdesk-gov --bin sy-frontdesk-gov
 ```
 
-Para correrlo hace falta un router y un `hive.yaml` (de ahí toma su nombre,
+To run it you need a router and a `hive.yaml` (it takes its name from there,
 `SY.frontdesk.gov@<hive>`).
 
-## Pendiente
+## Pending
 
-- Probar que la persona es dueña del email (por ejemplo un código de un solo uso) antes del merge:
-  hoy quien escribe el email de otro asocia su canal al ILK de esa persona.
-- Los contadores de la spec (§12) y los reintentos conversacionales.
+- Prove that the person owns the email (for example with a one-time code) before the merge:
+  today whoever types someone else's email links their own channel to that person's ILK.
+- The spec counters (§12) and the conversational retries.
 
-El contrato completo está en `docs/ai-frontdesk-gov-spec.md`.
+The full contract is in `docs/ai-frontdesk-gov-spec.md`.

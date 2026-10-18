@@ -229,7 +229,7 @@ gen_unit sy-edge "network.target rt-gateway.service" \
 install -m0644 packaging/hive.yaml.example "$DEST/etc/fluxbee/hive.yaml.example"
 # SY.architect adds this handbook to its prompts, from where install.sh puts it. A static doc,
 # not config: replaced on every upgrade, so it is not a conffile.
-install -m0644 "docs/onworking COA/archi/handbook_fluxbee.md" "$DEST/etc/fluxbee/handbook_fluxbee.md"
+install -m0644 "docs/archi/handbook_fluxbee.md" "$DEST/etc/fluxbee/handbook_fluxbee.md"
 # needrestart (Ubuntu) must not restart managed node units after an apt upgrade: the old runtime
 # directory is gone by then, and the orchestrator rebinds them itself (FINDINGS A-39).
 install -d "$DEST/etc/needrestart/conf.d"

@@ -4,11 +4,17 @@ This folder contains the active IO contracts used by this repository.
 
 ## Files
 
-- `nodos_io_spec.md`
-- `io-common.md`
-- `io-api-node-spec.md`
-- `io-slack.md`
-- `io-slack-tasks.md`
+- [io-nodes-spec.md](io-nodes-spec.md): the IO node model
+- [io-common.md](io-common.md): what every IO node shares
+- [io-api-node-spec.md](io-api-node-spec.md): IO.api, the HTTP channel for API partners
+- [io-slack.md](io-slack.md), [io-slack-deploy-runbook.md](io-slack-deploy-runbook.md),
+  [io-slack-tasks.md](io-slack-tasks.md): IO.slack
+- [io-linked-helper-adapter-specs.md](io-linked-helper-adapter-specs.md),
+  [io-linked-helper-contracts.md](io-linked-helper-contracts.md),
+  [io-linked-helper-protocol.md](io-linked-helper-protocol.md),
+  [io-linked-helper-responsibilities.md](io-linked-helper-responsibilities.md): IO.linkedhelper
+- [io-nodes-ich-monitoring.md](io-nodes-ich-monitoring.md): channel (ICH) monitoring
+- [io-nodes-examples-annex.md](io-nodes-examples-annex.md): examples
 
 ## Current adapters covered here
 

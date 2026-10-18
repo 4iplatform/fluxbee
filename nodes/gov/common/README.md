@@ -1,17 +1,17 @@
 # gov-common
 
-Librerí­a compartida para runtimes de la familia `gov`.
+Shared library for the runtimes of the `gov` family.
 
-Objetivo:
-- concentrar helpers y contratos reutilizables de `sy.frontdesk.gov`,
-- evitar que frontdesk dependa de `nodes/ai/common`,
-- sostener la separación de ownership entre familia `AI` y familia `gov`.
+Goal:
+- gather the reusable helpers and contracts of `sy.frontdesk.gov`,
+- keep frontdesk from depending on `nodes/ai/common`,
+- keep the ownership split between the `AI` family and the `gov` family.
 
-Estado actual:
-- helpers base de env/config de nodo gov,
-- contrato compartido para configuración de bridge de identidad gov,
-- normalización común de error payload para tools de identidad.
+Current state:
+- base env/config helpers for a gov node,
+- a shared contract for the configuration of the gov identity bridge,
+- common normalization of the error payload for identity tools.
 
-Dirección:
-- mover gradualmente lógica reusable de `nodes/gov/ai-frontdesk-gov` a este crate,
-- mantener `ai.common` y `sy.frontdesk.gov` sin dependencia cruzada.
+Direction:
+- gradually move reusable logic from `nodes/gov/ai-frontdesk-gov` into this crate,
+- keep `ai.common` and `sy.frontdesk.gov` without a cross-dependency.

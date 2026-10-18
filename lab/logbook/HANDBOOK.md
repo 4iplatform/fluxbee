@@ -1,151 +1,155 @@
-# HANDBOOK — desplegar fluxbee desde cero
+# HANDBOOK — deploying fluxbee from scratch
 
-> **Qué es esto.** Las recetas que **funcionaron end-to-end** en el primer despliegue de fluxbee en
-> producción (Proxmox `192.168.8.207`, 2026-07-28 → 07-30). Cada paso de acá se ejecutó de verdad y
-> se verificó; lo que no se validó está marcado como tal.
+> **What this is.** The recipes that **worked end-to-end** in the first deployment of fluxbee to
+> production (Proxmox `192.168.8.207`, 2026-07-28 → 07-30). Every step here was actually run and
+> verified; anything that was not validated is marked as such.
 >
-> **Documentos hermanos:** [`METHOD.md`](METHOD.md) (cómo se trabaja) · [`FINDINGS.md`](FINDINGS.md)
-> (qué se descubrió, con evidencia) · [`PENDING-BUGS.md`](PENDING-BUGS.md) (qué hay que arreglar) ·
-> las bitácoras diarias (`2026-07-*.md`) tienen el detalle crudo de cada paso.
+> **Sibling documents:** [`METHOD.md`](METHOD.md) (how we work) · [`FINDINGS.md`](FINDINGS.md)
+> (what was discovered, with evidence) · [`PENDING-BUGS.md`](PENDING-BUGS.md) (what needs fixing) ·
+> the daily logbooks (`2026-07-*.md`) have the raw detail of every step.
 >
-> **Regla de portabilidad** (`METHOD.md` §3 regla 0c): el próximo prod puede ser bare-metal u otro
-> hipervisor. Cada receta marca qué es **específico de Proxmox** y qué es **del producto**. Las
-> secciones §1–§3 son del hipervisor; **de §4 en adelante es fluxbee puro** y sirve igual en un
-> servidor físico.
+> **Portability rule** (`METHOD.md` §3 rule 0c): the next prod may be bare-metal or another
+> hypervisor. Each recipe marks what is **Proxmox-specific** and what belongs to **the product**.
+> Sections §1–§3 are about the hypervisor; **from §4 on it is pure fluxbee** and works the same on
+> a physical server.
 
 ---
 
-## 0. El modelo mental, en una frase
+## 0. The mental model, in one sentence
 
-**Solo motherbee se instala con el `.deb`.** Los demás nodos son **máquinas Linux limpias** a las que
-`add_hive` toma por SSH, bootstrapea, configura y **cierra**. No se instala fluxbee en un spoke a
-mano: si te encontrás haciéndolo, estás peleando contra el diseño.
+**Only motherbee is installed with the `.deb`.** The other nodes are **clean Linux machines** that
+`add_hive` takes over through SSH, bootstraps, configures and **locks down**. You do not install
+fluxbee on a spoke by hand: if you find yourself doing it, you are fighting the design.
 
 ```
-   [ motherbee ]  <- .deb + fluxbee-firstboot        el unico con Postgres y con el vault
+   [ motherbee ]  <- .deb + fluxbee-firstboot        the only one with Postgres and the vault
         │
-        │  add_hive  (SSH: entra abierta, sale cerrada)
-        ├──────────► [ worker  ]   trabajo generico
-        ├──────────► [ ingress ]   puerta publica, TLS 443     (2 placas)
-        └──────────► [ egress  ]   NAT de salida a internet    (2 placas)
+        │  add_hive  (SSH: goes in open, comes out locked)
+        ├──────────► [ worker  ]   generic work
+        ├──────────► [ ingress ]   public door, TLS 443            (2 NICs)
+        └──────────► [ egress  ]   outbound NAT to the internet    (2 NICs)
 ```
 
 ---
 
-## 1. Decisiones que hay que tomar ANTES de tocar nada
+## 1. Decisions to make BEFORE touching anything
 
-No son opcionales: la mitad no se puede cambiar cómodamente después.
+They are not optional: half of them cannot be changed comfortably later.
 
-| Decisión | Lo que elegimos | Por qué |
+| Decision | What we chose | Why |
 |---|---|---|
-| Red interna del mesh | `10.10.10.0/24`, sin gateway | Directamente conectada. Deja lugar a `10.10.11.x` etc. |
-| ¿Quién da internet? | El **egress**, con NAT | Es su rol. Ver §7 sobre la trampa del gateway. |
-| IP del ingress | Pública, propia | Ahí apunta el DNS. **No** puede estar detrás del NAT del egress. |
-| Default route de cada nodo | Por su **pata externa** si la tiene | Una VM tiene **un solo** default gateway. La interna queda sin `gw`. |
-| Hostname público | `hive-<hash>.dominio` | Ver §8: opaco a propósito. |
-| Credencial de bootstrap | Un usuario con `NOPASSWD:ALL` | Requisito duro de `add_hive`. Se revoca sola al final. |
+| Internal mesh network | `10.10.10.0/24`, no gateway | Directly connected. Leaves room for `10.10.11.x` etc. |
+| Who provides internet? | The **egress**, with NAT | That is its role. See §7 on the gateway trap. |
+| Ingress IP | Public, its own | The DNS points there. It **cannot** sit behind the egress NAT. |
+| Default route of each node | Through its **external leg**, if it has one | A VM has **only one** default gateway. The internal one gets no `gw`. |
+| Public hostname | `hive-<hash>.domain` | See §8: opaque on purpose. |
+| Bootstrap credential | A user with `NOPASSWD:ALL` | A hard requirement of `add_hive`. It is revoked automatically at the end. |
 
-**Direccionamiento que usamos** (referencia concreta):
+**The addressing we used** (a concrete reference):
 
-| VM | RAM/cores/disco | interna | segunda placa |
+| VM | RAM/cores/disk | internal | second NIC |
 |---|---|---|---|
 | `fb-mb` | 10G / 4 / 60G | `10.10.10.10` | — |
 | `fb-worker1` | 4G / 2 / 30G | `10.10.10.20` | — |
-| `fb-ingress` | 2G / 2 / 20G | `10.10.10.30` | pública `x.x.x.80/24` |
+| `fb-ingress` | 2G / 2 / 20G | `10.10.10.30` | public `x.x.x.80/24` |
 | `fb-egress` | 2G / 2 / 20G | `10.10.10.40` | admin `192.168.8.240/24` |
-| `fb-build` | 8G / 4 / 80G | `10.10.10.50` | admin `192.168.8.180/24` (DHCP, repo para los devs) *(fuera del cluster)* |
+| `fb-build` | 8G / 4 / 80G | `10.10.10.50` | admin `192.168.8.180/24` (DHCP, the repo for the devs) *(outside the cluster)* |
 
-> **La VM de build va FUERA del cluster, a propósito.** El plan ante una falla de integración es
-> *borrar el cluster y empezar de nuevo*. Si el `.deb` y el repo apt viven adentro, cada wipe cuesta
-> una hora de compilación. Afuera, sobrevive.
+> **The build VM goes OUTSIDE the cluster, on purpose.** The plan for an integration failure is
+> *delete the cluster and start over*. If the `.deb` and the apt repo live inside it, every wipe
+> costs an hour of compiling. Outside, it survives.
 
-> **Sumá la RAM antes, no después.** Planifiqué 18 G para el cluster y después agregué la build de
-> 8 G sin re-sumar: 27.9 G asignados sobre 23 G físicos. KVM asigna a demanda y no dolió, pero es
-> riesgo latente. ~~Política: la build queda apagada salvo cuando compila.~~
+> **Add up the RAM before, not after.** I planned 18 G for the cluster and then added the 8 G build
+> VM without adding it all up again: 27.9 G allocated on 23 G physical. KVM allocates on demand and
+> it did not hurt, but it is a latent risk. ~~Policy: the build VM stays off except while it
+> compiles.~~
 >
-> **Política desde 2026-09-25 (decisión del operador): fb-build queda SIEMPRE ENCENDIDA** — sirve
-> el repo apt a los devs (`192.168.8.180:8900`). Holgura medida ese día: host 15.9/29.4 GB usados.
+> **Policy since 2026-09-25 (operator's decision): fb-build stays ALWAYS ON** — it serves the apt
+> repo to the devs (`192.168.8.180:8900`). Headroom measured that day: host 15.9/29.4 GB used.
 >
-> **Su IP 8.x es DHCP, atada a la MAC** (`net1 = BC:24:11:EF:96:80`): el router mantiene la
-> asignación mientras la MAC no cambie (decisión del operador; no se reserva ni se fija). **No
-> recrees `net1`** — una placa nueva trae otra MAC, otra IP, y rompe el `sources.list` de cada dev.
+> **Its 8.x IP is DHCP, tied to the MAC** (`net1 = BC:24:11:EF:96:80`): the router keeps the lease
+> as long as the MAC does not change (operator's decision; it is neither reserved nor pinned).
+> **Do not recreate `net1`** — a new NIC brings another MAC and another IP, and breaks every dev's
+> `sources.list`.
 
 ---
 
-## 2. Red del hipervisor · *específico de Proxmox*
+## 2. Hypervisor network · *Proxmox-specific*
 
-Tres redes, y la interna es la única que fluxbee necesita:
+Three networks, and the internal one is the only one fluxbee needs:
 
 ```text
-vmbr0   nic0   192.168.8.0/24     administracion (compartida; su router .1 SI sale a internet)
-fbint    —     10.10.10.0/24      INTERNA fluxbee — SDN zona simple + SNAT
-vmbr1   nic1   x.x.x.0/24         PUBLICA (el host NO tiene IP en ella)
+vmbr0   nic0   192.168.8.0/24     administration (shared; its router .1 DOES reach the internet)
+fbint    —     10.10.10.0/24      fluxbee INTERNAL — SDN simple zone + SNAT
+vmbr1   nic1   x.x.x.0/24         PUBLIC (the host has NO IP on it)
 ```
 
-**La interna se hace con SDN**, no con un bridge suelto:
+**The internal one is built with SDN**, not with a standalone bridge:
 
 ```
-Datacenter > SDN > Zones  -> tipo "Simple", ID: fluxint
-Datacenter > SDN > VNets  -> ID: fbint, zona: fluxint
-  subnet: 10.10.10.0/24, gateway: 10.10.10.1, SNAT: SI
+Datacenter > SDN > Zones  -> type "Simple", ID: fluxint
+Datacenter > SDN > VNets  -> ID: fbint, zone: fluxint
+  subnet: 10.10.10.0/24, gateway: 10.10.10.1, SNAT: YES
 Datacenter > SDN         -> Apply
 ```
 
-Con `SNAT: sí`, el host rutea y enmascara: **las VMs internas salen a internet por la IP del host**
-sin tocar nada más. Eso es lo que permite construir el template y compilar antes de que exista el
-egress.
+With `SNAT: yes`, the host routes and masquerades: **the internal VMs reach the internet through
+the host's IP** without touching anything else. That is what makes it possible to build the
+template and compile before the egress exists.
 
-⚠️ **Una zona "Simple" es local al nodo.** No cruza hosts de un cluster Proxmox. Para multi-host hace
-falta VXLAN o EVPN.
+⚠️ **A "Simple" zone is local to the node.** It does not span the hosts of a Proxmox cluster.
+Multi-host needs VXLAN or EVPN.
 
-### 🔥 La trampa más cara de todas — Proxmox anidado sobre VMware
+### 🔥 The most expensive trap of all — Proxmox nested on VMware
 
-Si el Proxmox corre como VM de ESXi/vSphere, **el port group tiene que permitir**:
+If Proxmox runs as an ESXi/vSphere VM, **the port group has to allow**:
 
 ```
 Promiscuous mode  : Accept
 MAC address changes: Accept
-Forged transmits  : Accept      <-- este es el que rompe todo
+Forged transmits  : Accept      <-- this is the one that breaks everything
 ```
 
-Con `Forged transmits: Reject`, vSphere descarta cualquier frame cuyo MAC origen no sea el de la VM
-Proxmox. Las VMs anidadas **no pueden ni siquiera hacer ARP**. El síntoma es desconcertante porque
-**la red interna funciona perfecto** (sale por el SNAT del host, con el MAC del host) mientras
-cualquier placa bridgeada está muerta.
+With `Forged transmits: Reject`, vSphere drops any frame whose source MAC is not the Proxmox VM's.
+The nested VMs **cannot even do ARP**. The symptom is baffling because **the internal network
+works perfectly** (it goes out through the host's SNAT, with the host's MAC) while every bridged
+NIC is dead.
 
-**Y hay que aplicarlo a CADA port group**, uno por placa física. Nosotros lo aplicamos al de `nic0`,
-el egress arrancó a andar, y el ingress siguió roto exactamente igual — faltaba el de `nic1`.
+**And it has to be applied to EVERY port group**, one per physical NIC. We applied it to the one
+for `nic0`, the egress started working, and the ingress stayed broken exactly the same — the one
+for `nic1` was missing.
 
-> **Cómo se diagnostica** (sirve para cualquier "la red anda a medias"): buscá la **asimetría**. Si
-> el tráfico que sale ruteado funciona y el bridgeado no, el problema no es de la VM ni del bridge:
-> es **filtrado por MAC aguas arriba**.
+> **How to diagnose it** (works for any "the network half works"): look for the **asymmetry**. If
+> routed outbound traffic works and bridged traffic does not, the problem is not the VM or the
+> bridge: it is **MAC filtering upstream**.
 
 ---
 
-## 3. Template base · *específico de Proxmox, pero el concepto es universal*
+## 3. Base template · *Proxmox-specific, but the concept is universal*
 
-Objetivo: una imagen Linux limpia, con guest-agent y SSH, que se clone en máquinas **independientes**.
+Goal: a clean Linux image, with guest-agent and SSH, that gets cloned into **independent**
+machines.
 
-### 3.1 La imagen
+### 3.1 The image
 
 ```bash
 POST /nodes/pve/storage/local/download-url
      content=import
-     filename=noble-server-cloudimg-amd64.qcow2      # <-- .qcow2, NO .img
+     filename=noble-server-cloudimg-amd64.qcow2      # <-- .qcow2, NOT .img
      url=https://cloud-images.ubuntu.com/noble/current/noble-server-cloudimg-amd64.img
 ```
 
-⚠️ La imagen de Ubuntu **es qcow2 aunque se publique con extensión `.img`**. Con `.img` el endpoint
-la rechaza (`invalid filename or wrong extension`). Renombrala al descargar.
+⚠️ The Ubuntu image **is qcow2 even though it is published with a `.img` extension**. With `.img`
+the endpoint rejects it (`invalid filename or wrong extension`). Rename it when you download it.
 
-### 3.2 El snippet de cloud-init — **lo tiene que escribir un humano**
+### 3.2 The cloud-init snippet — **a human has to write it**
 
-La cloud image **no trae `qemu-guest-agent`**, y el guest-agent es el canal de acceso. Hay que
-inyectarlo en el primer boot vía user-data… y **la API de Proxmox no permite depositar snippets**:
-`upload` y `download-url` aceptan `iso, vztmpl, import` — `snippets` no está en la enumeración,
-aunque el storage sí acepte el tipo.
+The cloud image **does not include `qemu-guest-agent`**, and the guest-agent is the access
+channel. It has to be injected on first boot via user-data… and **the Proxmox API does not allow
+placing snippets**: `upload` and `download-url` accept `iso, vztmpl, import` — `snippets` is not
+in the enumeration, even though the storage does accept the type.
 
-El operador lo escribe **una vez** en el shell del host, y queda para siempre:
+The operator writes it **once** in the host shell, and it stays there for good:
 
 ```yaml
 # /var/lib/vz/snippets/tpl-userdata.yaml
@@ -156,11 +160,11 @@ runcmd:
   - systemctl enable --now qemu-guest-agent
 ```
 
-> **Nota de método.** Esto es un límite real, y **la respuesta correcta no es pedir SSH al
-> hipervisor**. Un archivo puntual escrito por el operador es más barato que un shell root fuera del
-> registro de tasks. Ver `METHOD.md` §2.
+> **Method note.** This is a real limit, and **the right answer is not to ask for SSH to the
+> hypervisor**. A one-off file written by the operator is cheaper than a root shell outside the
+> task log. See `METHOD.md` §2.
 
-### 3.3 Crear, generalizar, convertir
+### 3.3 Create, generalize, convert
 
 ```bash
 POST /nodes/pve/qemu
@@ -171,714 +175,727 @@ POST /nodes/pve/qemu
      ipconfig0=ip=10.10.10.9/24,gw=10.10.10.1  nameserver=1.1.1.1
      ciuser=fluxops  cicustom=user=local:snippets/tpl-userdata.yaml
      serial0=socket vga=serial0
-# esperar a que la task TERMINE, despues:
+# wait for the task to FINISH, then:
 PUT  .../resize  disk=scsi0 size=20G
 POST .../status/start
 ```
 
-⚠️ **Encadená por estado de task, nunca por `sleep`.** El `create` importa 624 MB y sostiene el lock
-del VM todo ese tiempo; `resize` y `start` lanzados detrás fallan con
-`can't lock file '/var/lock/qemu-server/lock-9000.conf'`. Poleá `/tasks/<UPID>/status` hasta
+⚠️ **Chain on task status, never on `sleep`.** The `create` imports 624 MB and holds the VM lock
+the whole time; a `resize` and a `start` launched right after it fail with
+`can't lock file '/var/lock/qemu-server/lock-9000.conf'`. Poll `/tasks/<UPID>/status` until
 `stopped OK`.
 
-**Generalizar** (adentro de la VM, antes de convertir) — **esto es lo que hace que los clones sean
-máquinas distintas**:
+**Generalize** (inside the VM, before converting) — **this is what makes the clones distinct
+machines**:
 
 ```bash
-cloud-init clean --logs --seed          # cada clon re-ejecuta cloud-init con SU config
-truncate -s 0 /etc/machine-id           # si no, todos los clones piden el MISMO lease DHCP
+cloud-init clean --logs --seed          # each clone re-runs cloud-init with ITS OWN config
+truncate -s 0 /etc/machine-id           # otherwise every clone asks for the SAME DHCP lease
 ln -sf /etc/machine-id /var/lib/dbus/machine-id
-rm -f /etc/ssh/ssh_host_*               # si no, comparten identidad SSH
+rm -f /etc/ssh/ssh_host_*               # otherwise they share the SSH identity
 apt-get clean; rm -rf /var/lib/apt/lists/*
 journalctl --rotate; journalctl --vacuum-time=1s
 ```
 
-**Verificá antes de convertir:** `machine-id` en 0 bytes · 0 host keys · cloud-init `not started`.
+**Verify before converting:** `machine-id` at 0 bytes · 0 host keys · cloud-init `not started`.
 
 ```bash
-POST .../config  delete=cicustom,ipconfig0     # <-- ver la trampa de abajo
-POST .../status/shutdown                        # limpio, no stop
+POST .../config  delete=cicustom,ipconfig0     # <-- see the trap below
+POST .../status/shutdown                        # clean, not stop
 POST .../qemu/9000/template
 ```
 
-### ⚠️ `cicustom` y `ciuser` no conviven
+### ⚠️ `cicustom` and `ciuser` do not mix
 
-Con `cicustom=user=...`, Proxmox usa **ese archivo EN LUGAR del user-data que genera** — y ese es
-justo el que crea el usuario. `ciuser`/`cipassword` quedan **sin efecto** y el usuario nunca existe.
+With `cicustom=user=...`, Proxmox uses **that file INSTEAD OF the user-data it generates** — and
+that is exactly the one that creates the user. `ciuser`/`cipassword` have **no effect**, and the
+user never exists.
 
-**Por eso se borra `cicustom` del template**: el snippet solo hacía falta una vez, para hornear el
-agente en la imagen. Ya con el agente adentro, los clones usan el cloud-init estándar y cada uno crea
-su usuario normalmente. **Los clones no dependen del snippet.**
+**That is why `cicustom` is deleted from the template**: the snippet was only needed once, to bake
+the agent into the image. With the agent already inside, the clones use the standard cloud-init
+and each one creates its user normally. **The clones do not depend on the snippet.**
 
-### 3.4 Validar el template con el primer clon
+### 3.4 Validate the template with the first clone
 
-No des el template por bueno sin esto:
+Do not consider the template good without this:
 
-| Chequeo | Esperado |
+| Check | Expected |
 |---|---|
-| `machine-id` | **distinto** del template |
-| host keys SSH | **3, regeneradas** |
+| `machine-id` | **different** from the template |
+| SSH host keys | **3, regenerated** |
 | `qemu-guest-agent` | `active` |
-| usuario de bootstrap | existe, con `NOPASSWD:ALL` |
-| `PasswordAuthentication` | efectivo **`yes`** |
+| bootstrap user | exists, with `NOPASSWD:ALL` |
+| `PasswordAuthentication` | effectively **`yes`** |
 
-Sobre el último: en Ubuntu 24.04 conviven `50-cloud-init.conf` (`yes`) y `60-cloudimg-settings.conf`
-(`no`). **Gana el primero por orden lexicográfico.** Verificalo de verdad, no de la lectura:
+About the last one: on Ubuntu 24.04, `50-cloud-init.conf` (`yes`) and `60-cloudimg-settings.conf`
+(`no`) coexist. **The first one wins by lexicographic order.** Verify it for real, not by reading
+the config:
 
 ```bash
 ssh -o BatchMode=yes -o PreferredAuthentications=password -o PubkeyAuthentication=no \
     fluxops@127.0.0.1 true
-# "Permission denied (publickey,password)" => el servidor OFRECE password. Correcto.
+# "Permission denied (publickey,password)" => the server OFFERS password. Correct.
 ```
 
-### ⚠️ Un clon recién booteado NO está listo
+### ⚠️ A freshly booted clone is NOT ready
 
-La cloud image de Ubuntu dispara `unattended-upgrades` en el primer boot: baja ~15 MB, escribe
-~2.5 GB, **reinicia sola**, y el guest-agent puede no volver (se está actualizando a sí mismo).
-Observado en cada clon. Variante vista el 2026-09-25 (clon del template 250 en DEV): cloud-init
-actualizó paquetes, kernel incluido, y dejó `reboot-required` **sin reiniciarse**. La receta de
-abajo cubre los dos casos.
+The Ubuntu cloud image triggers `unattended-upgrades` on first boot: it downloads ~15 MB, writes
+~2.5 GB, **reboots on its own**, and the guest-agent may not come back (it is updating itself).
+Seen on every clone. A variant seen on 2026-09-25 (a clone of template 250 in DEV): cloud-init
+updated packages, the kernel included, and left `reboot-required` **without rebooting**. The
+recipe below covers both cases.
 
-**Receta:** después de clonar, esperá a que termine el ciclo y **reiniciá la VM** antes de
-considerarla operativa. Confirmá con: cloud-init `done`, agente `active`, `dpkg --audit` limpio, sin
+**Recipe:** after cloning, wait for the cycle to finish and **reboot the VM** before considering
+it operational. Confirm with: cloud-init `done`, agent `active`, `dpkg --audit` clean, no
 `/var/run/reboot-required`.
 
-Esto importa **directamente** para `add_hive`, que tiene un timeout de 180 s.
+This matters **directly** for `add_hive`, which has a 180 s timeout.
 
-### 3.5 Operar por guest-agent — lo que hay que saber antes, no después
+### 3.5 Operating through the guest-agent — what you need to know before, not after
 
-Si trabajás contra las VMs por la API de Proxmox (`agent/exec`), esto te va a pasar:
+If you work against the VMs through the Proxmox API (`agent/exec`), this will happen to you:
 
-**Un carácter "ancho" en el comando traba el agente** → [B-11](FINDINGS.md). Un solo carácter por
-encima de U+00FF (`—`, `→`, `✓`) en los argumentos de `agent/exec`, y el `qemu-guest-agent` queda
-trabado: la API contesta `QEMU guest agent is not running` con la VM **perfectamente viva**, y no
-vuelve hasta que el agente se reinicia. Los acentos Latin-1 (`é`, `ñ`, `¿`) pasan.
+**A "wide" character in the command wedges the agent** → [B-11](FINDINGS.md). A single character
+above U+00FF (`—`, `→`, `✓`) in the arguments of `agent/exec`, and `qemu-guest-agent` is wedged:
+the API answers `QEMU guest agent is not running` with the VM **perfectly alive**, and it does not
+come back until the agent restarts. Latin-1 accents (`é`, `ñ`, `¿`) get through.
 
-> **No es la carga.** Durante agosto esto se diagnosticó como "el agente se muere bajo carga de
-> I/O" y costó reboots de VMs de prod. Se probó A/B (2026-09-25): con la VM ociosa, `—` lo traba y
-> `é` no. Los comandos que lo trababan tenían `—`/`→`/`✓` en sus `echo`.
+> **It is not the load.** During August this was diagnosed as "the agent dies under I/O load",
+> and it cost reboots of prod VMs. It was A/B tested (2026-09-25): with the VM idle, `—` wedges it
+> and `é` does not. The commands that wedged it had `—`/`→`/`✓` in their `echo`.
 
-`lab/pve.py` ya se protege (el argv no-ASCII viaja en base64). **Si le hablás a la API por otro
-lado (curl, otro script): argumentos solo ASCII, o codificados.**
+`lab/pve.py` already guards against it (non-ASCII argv travels in base64). **If you talk to the
+API some other way (curl, another script): ASCII-only arguments, or encoded ones.**
 
-Si igual te pasa:
+If it happens to you anyway:
 
 ```bash
-# 1. antes de asustarte, confirmá que la VM esta viva DESDE OTRA VM tuya
-#    (misma red interna; no hace falta el agente)
+# 1. before you panic, confirm that the VM is alive FROM ANOTHER VM of yours
+#    (same internal network; the agent is not needed)
 ping -c2 10.10.10.10
 for p in 9000 9100; do timeout 3 bash -c "echo > /dev/tcp/10.10.10.10/$p" && echo "$p ok"; done
 
-# 2. recuperar el agente: reboot ACPI primero (no usa el agente)
+# 2. recover the agent: ACPI reboot first (it does not use the agent)
 POST /nodes/pve/qemu/<id>/status/reboot
-# vuelve en ~70s. Si el primer exec que mandes tiene otra vez un caracter ancho, se vuelve a trabar.
-# 3. si el reboot ACPI no toma: reset duro.
+# it comes back in ~70s. If the first exec you send has a wide character again, it wedges again.
+# 3. if the ACPI reboot does not take: hard reset.
 POST /nodes/pve/qemu/<id>/status/reset
 ```
 
-Si se traba con un comando **solo ASCII**, es otra cosa: no la tapes con un reset, anotala como
-hallazgo.
+If it wedges with an **ASCII-only** command, it is something else: do not cover it up with a
+reset; record it as a finding.
 
-> Un reboot/reset de motherbee **no es gratis pero tampoco es grave**: los 4 hives vuelven solos.
-> Es, de hecho, la prueba más dura del arranque en frío. Pero decidilo a propósito, no por pánico.
+> A motherbee reboot/reset **is not free, but it is not serious either**: the 4 hives come back on
+> their own. It is, in fact, the hardest cold-start test. But decide on it on purpose, not out of
+> panic.
 
-**Todo lo que dure más de unos segundos va con `setsid nohup` a un log.** Si la llamada vence o se
-corta a mitad, el comando sobrevive y leés el log después. Sin esto, perdés el trabajo Y no sabés si corrió:
-
-```bash
-setsid nohup /root/loquesea.sh > /root/loquesea.log 2>&1 < /dev/null &
-```
-
-Corolario que aprendí a la mala: si el agente muere durante la llamada que **crea** el script, el
-script nunca existió. Antes de asumir que corrió y quedó a mitad, mirá si el log está.
-
-**Secretos por stdin, nunca por argv.** `agent/exec` acepta `input-data` (base64). Todo lo que pase
-por `command=` queda en el **log de tasks de Proxmox**:
+**Anything that takes more than a few seconds runs under `setsid nohup`, into a log.** If the call
+times out or is cut off midway, the command survives and you read the log afterwards. Without
+this, you lose the work AND you do not know whether it ran:
 
 ```bash
-# lab/qga_stdin.sh — pasa el payload por stdin, no por la linea de comandos
-POST agent/exec  command=/bin/bash  command=-lc  command="<script que lee stdin>"  input-data=<b64>
+setsid nohup /root/whatever.sh > /root/whatever.log 2>&1 < /dev/null &
 ```
 
-### ⚠️ Después de generalizar, el primer `apt` necesita `update` COMPLETO
+A corollary I learned the hard way: if the agent dies during the call that **creates** the
+script, the script never existed. Before assuming it ran and stopped halfway, check whether the
+log is there.
 
-La generalización borra `/var/lib/apt/lists/*`. Si hacés un `apt update` filtrado a un solo repo (por
-ejemplo el de fluxbee), las listas de Ubuntu no están y la instalación falla con
-`Depends: postgresql but it is not installable`. **Un `apt-get update` completo** (≈39 MB) lo
-resuelve.
+**Secrets go through stdin, never through argv.** `agent/exec` accepts `input-data` (base64).
+Everything passed through `command=` ends up in the **Proxmox task log**:
+
+```bash
+# lab/qga_stdin.sh — passes the payload through stdin, not on the command line
+POST agent/exec  command=/bin/bash  command=-lc  command="<script that reads stdin>"  input-data=<b64>
+```
+
+### ⚠️ After generalizing, the first `apt` needs a FULL `update`
+
+Generalizing deletes `/var/lib/apt/lists/*`. If you run an `apt update` filtered to a single repo
+(for example the fluxbee one), the Ubuntu lists are not there and the install fails with
+`Depends: postgresql but it is not installable`. **A full `apt-get update`** (≈39 MB) solves it.
 
 ---
 
-## 4. Construir el `.deb` — *fluxbee puro*
+## 4. Building the `.deb` — *pure fluxbee*
 
-En una VM aparte, con el toolchain que fija el repo:
+On a separate VM, with the toolchain that the repo pins:
 
 ```bash
-# rustc/cargo (la version EXACTA del repo), go, protobuf-compiler,
+# rustc/cargo (the EXACT version of the repo), go, protobuf-compiler,
 # build-essential, pkg-config, libssl-dev, git, dpkg-dev, apt-utils
 git clone git@github.com:<org>/fluxbee.git /opt/fluxbee
 bash packaging/build-deb.sh 0.1.0
 ```
 
-**Rendimiento medido:** Rust release **~55 min** con 4 vCPU en un Xeon E5-2620 @2.0 GHz. Ciclo
-completo con Rust cacheado: ~27 min. **Corrélo con `nohup`**: sobrevive a que se caiga tu sesión.
+**Measured performance:** Rust release **~55 min** with 4 vCPU on a Xeon E5-2620 @2.0 GHz. A full
+cycle with Rust cached: ~27 min. **Run it with `nohup`**: it survives your session dropping.
 
-### ⚠️ Cloná y compilá con el MISMO usuario
+### ⚠️ Clone and compile as the SAME user
 
-Si clonás como un usuario y compilás como `root`, git marca *dubious ownership* y el paso de Go muere
-con `error obtaining VCS status: exit status 128` — **después de que Rust ya compiló 55 minutos**.
+If you clone as one user and compile as `root`, git flags *dubious ownership* and the Go step dies
+with `error obtaining VCS status: exit status 128` — **after Rust has already compiled for 55
+minutes**.
 
 ```bash
-# idempotente: correrlo N veces deja UNA sola entrada (y limpia duplicados viejos).
-# Con --add suma una linea por corrida: en fb-build llegaron a haber 23 copias (2026-09-25).
+# idempotent: running it N times leaves ONE single entry (and cleans up old duplicates).
+# With --add it adds one line per run: fb-build ended up with 23 copies (2026-09-25).
 git config --global --replace-all safe.directory /opt/fluxbee '^/opt/fluxbee$'
 ```
 
-> El propio error sugiere `-buildvcs=false`. **No lo uses**: apaga el estampado de versión en los
-> binarios para tapar un problema de permisos. Arreglá la causa.
+> The error itself suggests `-buildvcs=false`. **Do not use it**: it turns off version stamping
+> in the binaries to cover up a permissions problem. Fix the cause.
 
-### El toolchain vive en el `HOME` de quien compila
+### The toolchain lives in the `HOME` of whoever compiles
 
-`rustup` busca su metadata en `$HOME/.rustup`. Si ejecutás por guest-agent con un `HOME` que no es
-el del dueño del toolchain, te dice **"no installed toolchains"** con el directorio de la toolchain
-ahí mismo, presente y completo:
+`rustup` looks for its metadata in `$HOME/.rustup`. If you run through the guest-agent with a
+`HOME` that is not the toolchain owner's, it tells you **"no installed toolchains"** with the
+toolchain directory right there, present and complete:
 
 ```
 error: rustup could not choose a version of cargo to run, because one wasn't
        specified explicitly, and no default is configured
 ```
 
-No es que falte Rust: es que estás mirando el `.rustup` equivocado. En `fb-build` el toolchain es de
-`root`, así que el script de build empieza con `export HOME=/root` — y el `git fetch`, en cambio, va
-como `fluxops`, que es quien tiene la deploy key. Los dos usuarios son necesarios, cada uno en su
-paso.
+Rust is not missing: you are looking at the wrong `.rustup`. On `fb-build` the toolchain belongs
+to `root`, so the build script starts with `export HOME=/root` — while the `git fetch` runs as
+`fluxops`, the user that holds the deploy key. Both users are needed, each in its own step.
 
-> Y si ya corriste git como `root` por error, devolvé los objetos antes de seguir, o el próximo
-> fetch como `fluxops` muere con `insufficient permission`:
+> And if you already ran git as `root` by mistake, give the objects back before going on, or the
+> next fetch as `fluxops` dies with `insufficient permission`:
 > `find /opt/fluxbee/.git -user root -exec chown fluxops:fluxops {} +`
 
-### Verificá el `.deb` antes de confiar en él
+### Verify the `.deb` before trusting it
 
 ```bash
-ls -la dist/fluxbee_*.deb              # ~240 MB. Si pesa 2 KB, salio truncado.
-dpkg-deb -c dist/fluxbee_*.deb | wc -l # ~111 entradas
+ls -la dist/fluxbee_*.deb              # ~240 MB. If it weighs 2 KB, it came out truncated.
+dpkg-deb -c dist/fluxbee_*.deb | wc -l # ~111 entries
 dpkg-deb -c dist/fluxbee_*.deb | grep -E "ai_node_runner|wf-generic|io-"
 ```
 
-### Publicarlo como repo apt
+### Publishing it as an apt repo
 
 ```bash
-scripts/apt-repo-publish.sh --serve     # sirve en :8900 (unit PERSISTENTE fluxbee-apt: sobrevive reboots)
+scripts/apt-repo-publish.sh --serve     # serves on :8900 (PERSISTENT fluxbee-apt unit: survives reboots)
 ```
 
-**Instalá siempre por `apt`, nunca con `dpkg -i`** — el paquete depende de `postgresql` y `apt` es el
-camino documentado que resuelve dependencias.
+**Always install through `apt`, never with `dpkg -i`** — the package depends on `postgresql`, and
+`apt` is the documented path that resolves dependencies.
 
-#### ⚠️ Usá el script. No rehagas el índice a mano.
+#### ⚠️ Use the script. Do not rebuild the index by hand.
 
-El script rehace los tres archivos del índice, y los tres importan (en archivos temporales que
-después renombra, así un `apt-get update` en curso nunca ve un índice a medias):
+The script rebuilds the three index files, and all three matter (it writes them to temporary
+files that it then renames, so an `apt-get update` in progress never sees a half-written index):
 
 ```bash
 apt-ftparchive --db "$CACHE" packages . > Packages  &&  gzip -c Packages > Packages.gz  &&  apt-ftparchive release . > Release
 ```
 
-Copiar un `.deb` nuevo a la carpeta **no alcanza**. Si lo hacés a mano, hay dos maneras de que
-salga mal y ninguna avisa:
+Copying a new `.deb` into the folder **is not enough**. If you do it by hand, there are two ways
+for it to go wrong, and neither one warns you:
 
-| omisión | síntoma | por qué engaña |
+| omission | symptom | why it misleads |
 |---|---|---|
-| no regenerar `Release` | `apt` dice **`fluxbee is already the newest version`** con el paquete nuevo ahí | `apt` ve `Hit:` en `Release` y ni mira `Packages` |
-| un índice con **una sola** versión (por ejemplo `dpkg-scanpackages` sin `-m`) | `apt` ofrece solo la más nueva | te quedás **sin rollback por apt**; `apt-ftparchive packages` lista todas |
+| not regenerating `Release` | `apt` says **`fluxbee is already the newest version`** with the new package right there | `apt` sees `Hit:` on `Release` and does not even look at `Packages` |
+| an index with **only one** version (for example `dpkg-scanpackages` without `-m`) | `apt` offers only the newest one | you are left **without rollback through apt**; `apt-ftparchive packages` lists them all |
 
-La segunda es la peligrosa: no rompe nada hoy, te saca el camino de vuelta. Se nota comparando el
-tamaño de `Packages` — 13 versiones son ~13 KB, una sola son ~1 KB.
+The second one is the dangerous one: it breaks nothing today; it takes away your way back. You
+can spot it by comparing the size of `Packages` — 13 versions are ~13 KB, a single one is ~1 KB.
 
-> Esto está escrito porque lo pisé: hice el índice a mano, me comí las dos, y perdí dos ciclos.
-> El script existía desde el principio.
+> This is written down because I stepped on it: I built the index by hand, ran into both, and
+> lost two cycles. The script existed from the start.
 
-#### ⚠️ `dpkg-deb` parece colgado y no lo está
+#### ⚠️ `dpkg-deb` looks hung, and it is not
 
-El último paso comprime con `xz`. Durante **varios minutos** el `.deb` se queda en ~3 KB, y si lo
-mirás en ese momento `dpkg-deb -c` te dice `unexpected end of file in archive member header`.
+The last step compresses with `xz`. For **several minutes** the `.deb` stays at ~3 KB, and if you
+look at it at that moment, `dpkg-deb -c` tells you `unexpected end of file in archive member
+header`.
 
-No está truncado: está comprimiendo. Confirmalo antes de alarmarte:
+It is not truncated: it is compressing. Confirm that before you get alarmed:
 
 ```bash
-ps aux | grep dpkg-deb        # 300-400% de CPU = está trabajando
+ps aux | grep dpkg-deb        # 300-400% CPU = it is working
 ```
 
-El paquete terminado pesa **~240 MB**. La línea `=== BUILD END rc=0 ===` es la única señal de que
-terminó; el tamaño del archivo a mitad de camino no dice nada.
+The finished package weighs **~240 MB**. The line `=== BUILD END rc=0 ===` is the only sign that
+it finished; the file size halfway through says nothing.
 
 ---
 
 ## 5. Motherbee
 
 ```bash
-# en la VM de motherbee
+# on the motherbee VM
 echo "deb [trusted=yes] http://10.10.10.50:8900 ./" > /etc/apt/sources.list.d/fluxbee.list
-apt-get update            # COMPLETO (ver 3.4)
+apt-get update            # FULL (see 3.4)
 apt-get install -y fluxbee
 fluxbee-firstboot
 ```
 
-**Devs de la infra interna** (8.x directo, o 4.x por la VPN interna) — misma receta, otra IP:
+**Devs on the internal infra** (8.x directly, or 4.x through the internal VPN) — same recipe,
+different IP:
 
 ```bash
 echo "deb [trusted=yes] http://192.168.8.180:8900 ./" | sudo tee /etc/apt/sources.list.d/fluxbee.list
-sudo apt-get update && sudo apt-get install -y fluxbee    # o fluxbee=<versión>
+sudo apt-get update && sudo apt-get install -y fluxbee    # or fluxbee=<version>
 ```
 
-- **Requisito:** Ubuntu **24.04+ amd64** — el `.deb` declara `libc6 (>= 2.39)`; en una distro más
-  vieja apt lo rechaza con error claro. `postgresql` y demás Depends salen del archive de Ubuntu.
-- **`[trusted=yes]` es obligatorio** mientras el repo no esté firmado (apt rechaza repos sin firma).
-- Instala un **backend completo** (motherbee): después va `hive.yaml` + `fluxbee-firstboot`.
-- **Validado 2026-09-25:** `apt-get install -s fluxbee` desde un Ubuntu 24.04 limpio en la 8.x
-  (resuelve 13 paquetes) y descarga desde una máquina por VPN (origen `10.100.0.2`). La pata 8.x
-  del box responde a clientes de **cualquier** subred por policy routing (tabla 108, ver bitácora).
-- **Validado de punta a punta en DEV (2026-09-25):**
-  - Punto de partida: una VM limpia en la LAN 4.x (VM 270 `fbdev-mb`, PC-004-156). **Llega al repo
-    sin VPN**, vía 192.168.4.1.
-  - `apt install` 0.1.33: el `.deb` de 245 MB tarda ~3 min por el enlace 4.x ↔ 8.x.
-  - `fluxbee-firstboot`: rc=0 en 28 s, sin editar el `hive.yaml`.
-  - Resultado: `motherbee alive`, 21 units, 0 failed, y los nodos base en `UNCONFIGURED`.
-  - Archi, `http://<ip>:3000`, respondía desde la VPN. **Desde 0.1.57 escucha solo en loopback**
-    (A-46): se usa en el motherbee o con un túnel SSH (`ssh -L 3000:127.0.0.1:3000 ...`).
+- **Requirement:** Ubuntu **24.04+ amd64** — the `.deb` declares `libc6 (>= 2.39)`; on an older
+  distro apt rejects it with a clear error. `postgresql` and the other Depends come from the
+  Ubuntu archive.
+- **`[trusted=yes]` is mandatory** while the repo is not signed (apt rejects unsigned repos).
+- It installs a **full backend** (motherbee): next come `hive.yaml` + `fluxbee-firstboot`.
+- **Validated 2026-09-25:** `apt-get install -s fluxbee` from a clean Ubuntu 24.04 on the 8.x
+  (it resolves 13 packages), and a download from a machine over VPN (source `10.100.0.2`). The
+  box's 8.x leg answers clients from **any** subnet through policy routing (table 108, see the
+  logbook).
+- **Validated end to end in DEV (2026-09-25):**
+  - Starting point: a clean VM on the 4.x LAN (VM 270 `fbdev-mb`, PC-004-156). **It reaches the
+    repo without VPN**, via 192.168.4.1.
+  - `apt install` 0.1.33: the 245 MB `.deb` takes ~3 min over the 4.x ↔ 8.x link.
+  - `fluxbee-firstboot`: rc=0 in 28 s, without editing `hive.yaml`.
+  - Result: `motherbee alive`, 21 units, 0 failed, and the base nodes in `UNCONFIGURED`.
+  - Archi, `http://<ip>:3000`, answered from the VPN. **Since 0.1.57 it listens only on loopback**
+    (A-46): use it on the motherbee or through an SSH tunnel (`ssh -L 3000:127.0.0.1:3000 ...`).
 
-`fluxbee-firstboot` es **idempotente-ish pero irreversible en la práctica**: bootstrapea el hive.
-Su log cuenta exactamente qué hace:
+`fluxbee-firstboot` is **idempotent-ish but irreversible in practice**: it bootstraps the hive.
+Its log tells exactly what it does:
 
 ```text
 [1/5] postgresql + DB bootstrap
-[2/5] start orchestrator          (crash-loopea hasta que aterriza el secreto — es normal)
+[2/5] start orchestrator          (crash-loops until the secret lands — this is normal)
 [3/5] wait admin + vault_put postgres secret
 [4/5] reconnect DB consumers
 [5/6] wait hive ready + start motherbee singleton nodes
-[6/6] spawn base node instances   (arrancan degradados, sin configurar)
+[6/6] spawn base node instances   (they start degraded, unconfigured)
 ```
 
-**Aceptación:**
+**Acceptance:**
 
 ```bash
 curl -s http://127.0.0.1:8080/hives                      # motherbee: alive
 systemctl list-units 'sy-*' 'fluxbee*' 'rt-*' --all      # 19 units active running
-systemctl --failed                                        # vacio
-curl -s http://127.0.0.1:8080/hives/motherbee/commands   # el audit log ya registra
+systemctl --failed                                        # empty
+curl -s http://127.0.0.1:8080/hives/motherbee/commands   # the audit log is already recording
 ```
 
-Los nodos base (`IO.cloud`, `IO.blob`) arrancan en `UNCONFIGURED`.
-**Eso es correcto**, no es una falla: el arranque degradado es de diseño.
+The base nodes (`IO.cloud`, `IO.blob`) start in `UNCONFIGURED`.
+**That is correct**, not a failure: the degraded start is by design.
 
-> **`wan.authorized_hives` vacío = permite todo.** No está en el `hive.yaml` que genera el postinst y
-> parece que falta. No falta: `add_hive` solo aplica el allowlist si **no** está vacío, y el propio
-> mensaje de error del código sugiere *"leave authorized_hives empty"*. Sin acción.
+> **An empty `wan.authorized_hives` = allow everything.** It is not in the `hive.yaml` that the
+> postinst generates, and it looks missing. It is not missing: `add_hive` only applies the
+> allowlist if it is **not** empty, and the code's own error message suggests
+> *"leave authorized_hives empty"*. No action needed.
 
 ---
 
-## 6. Los spokes — `add_hive`
+## 6. The spokes — `add_hive`
 
-**Un comando contra una máquina Linux vacía.** Entra abierta, sale cerrada.
+**One command against an empty Linux machine.** It goes in open and comes out locked.
 
 ```jsonc
-POST /hives                          // accion: add_hive  (NO /hives/<hive>/hives)
+POST /hives                          // action: add_hive  (NOT /hives/<hive>/hives)
 {
   "hive_id": "worker1",
   "role": "worker",                  // worker | ingress | egress
   "address": "10.10.10.20",
   "ssh_user": "fluxops",
-  "ssh_password": "<credencial del template>",   // o ssh_key
-  "harden_ssh": true                 // <-- NO ES EL DEFAULT. Ponelo siempre.
+  "ssh_password": "<template credential>",   // or ssh_key
+  "harden_ssh": true                 // <-- NOT THE DEFAULT. Always set it.
 }
 ```
 
-### ⚠️ `harden_ssh` viene en `false`
+### ⚠️ `harden_ssh` comes as `false`
 
-El endurecimiento funciona perfecto cuando se lo pide (lo verificamos nodo por nodo). Pero hay que
-**acordarse**. Un default inseguro en el camino feliz → [PB-6](PENDING-BUGS.md#pb-6).
+The hardening works perfectly when it is requested (we verified it node by node). But you have to
+**remember it**. An insecure default on the happy path → [PB-6](PENDING-BUGS.md#pb-6).
 
-### Qué verificar después de cada join — **no te quedes con lo que reporta**
+### What to verify after each join — **do not settle for what it reports**
 
 ```bash
 sshd -T | grep -i passwordauth        # no
-wc -l < ~fluxops/.ssh/authorized_keys # 0  (la clave de MB se revoco)
-ls /etc/sudoers.d/                    # sin fluxbee-orchestrator
-systemctl list-units 'fluxbee*' 'rt-*' --no-legend | wc -l   # 9 servicios
+wc -l < ~fluxops/.ssh/authorized_keys # 0  (the MB key was revoked)
+ls /etc/sudoers.d/                    # no fluxbee-orchestrator
+systemctl list-units 'fluxbee*' 'rt-*' --no-legend | wc -l   # 9 services
 ```
 
-### egress — necesita más
+### egress — it needs more
 
 ```jsonc
 { "role": "egress", "lan_cidr": "10.10.10.0/24",
   "lan_iface": "eth0", "wan_iface": "eth1" }
 ```
 
-**`nftables` tiene que estar instalado antes** — `add_hive` egress **falla cerrado** sin él.
+**`nftables` has to be installed beforehand** — `add_hive` egress **fails closed** without it.
 
-Verificá el NAT **en la caja**, no en la respuesta:
+Verify the NAT **on the box**, not in the response:
 
 ```bash
 nft list ruleset | grep -E "masquerade|10.10.10"
 sysctl net.ipv4.ip_forward                       # 1
-journalctl -u <unidad del egress> | grep nat_applied
+journalctl -u <egress unit> | grep nat_applied
 ```
 
-> **`internet_reachable` no llega a motherbee.** Se verifica solo en el host egress y no se transmite
-> (v1, T-VER-1): la respuesta de `add_hive` lo devuelve `null`. Mirá el journal del egress.
+> **`internet_reachable` does not reach motherbee.** It is checked only on the egress host and is
+> not passed on (v1, T-VER-1): the `add_hive` response returns it as `null`. Look at the egress
+> journal.
 
-### ingress — el certificado va ANTES del join
+### ingress — the certificate goes BEFORE the join
 
-**Sembrá el TLS en el vault primero**, o el edge levanta sin HTTPS:
+**Seed the TLS into the vault first**, or the edge comes up without HTTPS:
 
 ```jsonc
 POST /hives/motherbee/vault/secrets
-{ "key": "edge_tls_<dominio>",
-  "value": { "cert": "<PEM: leaf + intermedios>", "key": "<PEM privada>" },
+{ "key": "edge_tls_<domain>",
+  "value": { "cert": "<PEM: leaf + intermediates>", "key": "<private PEM>" },
   "metadata": { "resource_type": "tls", "owner_node": "SY.edge@ingress1" } }
 ```
 
-Después:
+Then:
 
 ```jsonc
 { "role": "ingress", "ingress": { "listen": "0.0.0.0:443" } }
 ```
 
-`allow_plaintext` está **prohibido** en 443. El edge es *fail-closed*: si el TLS no se puede armar,
-**no** cae a texto plano — no levanta el frontend público.
+`allow_plaintext` is **forbidden** on 443. The edge is *fail-closed*: if the TLS cannot be set
+up, it does **not** fall back to plaintext — it does not bring up the public frontend.
 
-### ⚠️ Las placas secundarias las configurás vos
+### ⚠️ You configure the secondary NICs yourself
 
-`add_hive` **no tiene comandos para configurar placas de red secundarias**, pero los roles `ingress`
-y `egress` **requieren** una segunda placa por definición. Hay que dejarlas configuradas antes y
-pasarle los nombres de interfaz. Rompe la promesa de "una máquina vacía" justo en los dos roles que
-más la necesitan → [PB-5](PENDING-BUGS.md#pb-5).
+`add_hive` **has no commands to configure secondary network NICs**, but the `ingress` and `egress`
+roles **require** a second NIC by definition. You have to leave them configured beforehand and
+pass it the interface names. It breaks the promise of "an empty machine" exactly in the two
+roles that need it most → [PB-5](PENDING-BUGS.md#pb-5).
 
-### ⚠️ DNS: no le pongas el mismo nameserver a todos
+### ⚠️ DNS: do not give every node the same nameserver
 
-Puse `nameserver=192.168.8.1` (la red de admin) a las cuatro VMs por igual. El **ingress no tiene
-ruta a esa red** → se quedó sin DNS. **Los nodos con pata pública necesitan un DNS público**
+I set `nameserver=192.168.8.1` (the admin network) on all four VMs alike. The **ingress has no
+route to that network** → it was left without DNS. **Nodes with a public leg need a public DNS**
 (`1.1.1.1`).
 
 ---
 
-## 7. La trampa del gateway — `egress.gateway_ip`
+## 7. The gateway trap — `egress.gateway_ip`
 
-El egress hace NAT, pero **los nodos tienen que usarlo como gateway** para que sirva de algo. Eso se
-declara en el `hive.yaml`.
+The egress does NAT, but **the nodes have to use it as their gateway** for it to be of any use.
+That is declared in `hive.yaml`.
 
-⚠️ **El campo es, por diseño, la ruta de los WORKERS.** Motherbee **no entra en el modelo de
-egress** — y no es un olvido: Fluxbee nunca reescribe la ruta por defecto del propio plano de
-control (hacerlo desde un campo de yaml, en cada boot y cada tick de watchdog, sin rollback, en la
-caja que provisiona el egress, es un lockout). → [PB-8](PENDING-BUGS.md#pb-8).
+⚠️ **The field is, by design, the WORKERS' route.** Motherbee **is not part of the egress model**
+— and that is not an oversight: Fluxbee never rewrites the default route of the control plane
+itself (doing it from a yaml field, on every boot and every watchdog tick, without rollback, on
+the box that provisions the egress, is a lockout). → [PB-8](PENDING-BUGS.md#pb-8).
 
-Pero motherbee **es** donde corren los nodos que llaman a internet (`IO.slack.*`, `IO.wapp.*`,
-`AI.*`), así que el orchestrator **verifica** su ruta contra `gateway_ip` y loguea
-`EGRESS_MOTHERBEE_BYPASS` cuando no coinciden. Es observación, no corrección: si querés a motherbee
-sobre el egress, ponelo a nivel SO/red.
+But motherbee **is** where the nodes that call the internet run (`IO.slack.*`, `IO.wapp.*`,
+`AI.*`), so the orchestrator **checks** its route against `gateway_ip` and logs
+`EGRESS_MOTHERBEE_BYPASS` when they do not match. It is observation, not correction: if you want
+motherbee behind the egress, set it up at the OS/network level.
 
-⚠️ **Y la trampa más inmediata: hoy puede no rutear NADIE por el egress.** La inyección solo alcanza
-a los workers provisionados **después** de declarar el campo — un worker que se unió antes sigue con
-su gateway original.
+⚠️ **And the more immediate trap: today it may be that NOBODY routes through the egress.** The
+injection only reaches the workers provisioned **after** the field is declared — a worker that
+joined before keeps its original gateway.
 
-**No des por hecho que tu motherbee sale por el egress** sin comprobarlo:
+**Do not take for granted that your motherbee goes out through the egress** without checking it:
 
 ```bash
-curl -s https://ifconfig.me      # desde motherbee: sale por la IP del egress?
+curl -s https://ifconfig.me      # from motherbee: does it go out through the egress IP?
 ip route get 1.1.1.1
 ```
 
 ---
 
-## 8. DNS y certificado
+## 8. DNS and certificate
 
-**Registro A**: `hive-<hash>.<dominio>` → IP pública del ingress.
+**A record**: `hive-<hash>.<domain>` → the public IP of the ingress.
 
-Elegimos un **hash opaco de un solo label** (`hive-k3m9x7q2`), no `ingress1` ni el nombre del
-cliente, por tres razones:
+We chose an **opaque single-label hash** (`hive-k3m9x7q2`), not `ingress1` or the customer's
+name, for three reasons:
 
-1. El wildcard `*.dominio` **solo cubre un label** — `a.b.dominio` no entra.
-2. Ese hostname **va a terminar escrito en configuraciones ajenas** (webhooks de Meta, Slack…).
-   Cuanto menos diga, mejor.
-3. No filtra ni el cliente ni cuántos backends hay.
+1. The `*.domain` wildcard **only covers one label** — `a.b.domain` is not covered.
+2. That hostname **will end up written into other parties' configurations** (Meta webhooks,
+   Slack…). The less it says, the better.
+3. It leaks neither the customer nor how many backends there are.
 
-Es **deliberadamente distinto del `hive_id` interno**: la puerta externa pertenece al edge, no al
-hive (decisión D7).
+It is **deliberately different from the internal `hive_id`**: the external door belongs to the
+edge, not to the hive (decision D7).
 
-### El certificado: mandá la cadena completa
+### The certificate: send the full chain
 
-**Verificá el archivo antes de cargarlo** — el nuestro venía con el `-----END CERTIFICATE-----` del
-leaf pegado al `-----BEGIN` del intermedio en el mismo renglón, y así **openssl lee cero
-certificados**:
+**Verify the file before loading it** — ours came with the leaf's `-----END CERTIFICATE-----`
+stuck to the intermediate's `-----BEGIN` on the same line, and that way **openssl reads zero
+certificates**:
 
 ```bash
-grep -c "BEGIN CERTIFICATE" cadena.crt
-openssl crl2pkcs7 -nocrl -certfile cadena.crt | openssl pkcs7 -print_certs -noout
-openssl verify -untrusted intermedios.pem leaf.pem
-# la key coincide?
-diff <(openssl x509 -in leaf.pem -noout -modulus) <(openssl rsa -in privada.key -noout -modulus)
+grep -c "BEGIN CERTIFICATE" chain.crt
+openssl crl2pkcs7 -nocrl -certfile chain.crt | openssl pkcs7 -print_certs -noout
+openssl verify -untrusted intermediates.pem leaf.pem
+# does the key match?
+diff <(openssl x509 -in leaf.pem -noout -modulus) <(openssl rsa -in private.key -noout -modulus)
 ```
 
-Serví **leaf + intermedios**, sin la raíz self-signed (ya está en los trust stores; solo suma bytes
-por handshake).
+Serve **leaf + intermediates**, without the self-signed root (it is already in the trust stores;
+it only adds bytes per handshake).
 
-> **Por qué importa mandar la cadena.** Sin el intermedio, un navegador o `curl` con la CA cacheada
-> **igual da OK** (lo busca por AIA). Un cliente estricto —Go, Python, los webhooks de Meta y
-> Slack— falla. **Se ve bien justo donde no importa.**
+> **Why sending the chain matters.** Without the intermediate, a browser or a `curl` with the CA
+> cached **still says OK** (it fetches the intermediate through AIA). A strict client —Go, Python,
+> the Meta and Slack webhooks— fails. **It looks fine exactly where it does not matter.**
 
-**Probalo con un cliente que NO haga fetch AIA:**
+**Test it with a client that does NOT do AIA fetching:**
 
 ```python
 import ssl, socket
 c = ssl.create_default_context()
-with socket.create_connection(("hive-xxx.dominio", 443), timeout=20) as s:
-    with c.wrap_socket(s, server_hostname="hive-xxx.dominio") as t:
+with socket.create_connection(("hive-xxx.domain", 443), timeout=20) as s:
+    with c.wrap_socket(s, server_hostname="hive-xxx.domain") as t:
         print(t.version(), t.getpeercert()['notAfter'])
 ```
 
-### ⚠️ Rotar el cert exige reiniciar `sy-edge`
+### ⚠️ Rotating the cert requires restarting `sy-edge`
 
-El material TLS se lee **una sola vez al boot**. Cargarlo en el vault **no** alcanza: hay que
-reiniciar el servicio. Mitigado en el código (el edge ahora sale con `exit(0)` y systemd lo
-reinicia), pero **verificá que tu binario lo tenga** → [PB-1](PENDING-BUGS.md#pb-1).
+The TLS material is read **only once, at boot**. Loading it into the vault is **not** enough: you
+have to restart the service. Mitigated in the code (the edge now exits with `exit(0)` and systemd
+restarts it), but **check that your binary has it** → [PB-1](PENDING-BUGS.md#pb-1).
 
 ---
 
-## 9. Aceptación final
+## 9. Final acceptance
 
 ```bash
-# 1. topologia completa
+# 1. full topology
 curl -s http://127.0.0.1:8080/hives
 #    motherbee alive · worker1/ingress1/egress1 connected
 
-# 2. HTTPS publico, desde AFUERA del datacenter
-curl -sS -o /dev/null -w "%{http_code} verify=%{ssl_verify_result}\n" https://hive-xxx.dominio/
-#    404 verify=0   <-- el 404 es CORRECTO: SY.edge solo sirve /e/<ich>
+# 2. public HTTPS, from OUTSIDE the datacenter
+curl -sS -o /dev/null -w "%{http_code} verify=%{ssl_verify_result}\n" https://hive-xxx.domain/
+#    404 verify=0   <-- the 404 is CORRECT: SY.edge only serves /e/<ich>
 
-# 3. cadena completa
-echo | openssl s_client -connect hive-xxx.dominio:443 -servername hive-xxx.dominio -showcerts 2>/dev/null \
+# 3. full chain
+echo | openssl s_client -connect hive-xxx.domain:443 -servername hive-xxx.domain -showcerts 2>/dev/null \
   | grep -c "BEGIN CERTIFICATE"      # >= 2
 
-# 4. el egress rutea de verdad
-#    (desde un worker) curl -s https://ifconfig.me  -> IP del egress
+# 4. the egress really routes
+#    (from a worker) curl -s https://ifconfig.me  -> egress IP
 ```
 
-**Reboot del hipervisor:** validado **el rearmado del mesh**: con las 4 VMs arrancadas en frío a la
-vez, **se rearmó solo**, sin intervención. Pero las VMs **no arrancan solas** si no tienen
-`onboot=1`: el 30/07 hubo que arrancarlas a mano → [B-13](FINDINGS.md). Advertencias:
+**Hypervisor reboot:** validated **the mesh re-forming**: with the 4 VMs cold-started at the same
+time, **it re-formed on its own**, without intervention. But the VMs **do not start on their own**
+unless they have `onboot=1`: on July 30 they had to be started by hand → [B-13](FINDINGS.md).
+Warnings:
 
-- **Esperá la convergencia antes de diagnosticar.** Mientras arranca vas a ver servicios inactivos y
-  `NODE_NOT_FOUND`. No es una falla: es el arranque, y es **lento** ([B-14](FINDINGS.md)). Medido
-  en un reboot de motherbee (2026-09-25): el agente vuelve a los ~2,5 min, los 9 runtimes a los
-  ~3 min 20 s, y el endpoint público puede dar **502** unos segundos mientras levanta `io.cloud`.
-  Los spokes no necesitan nada: aguantan la caída del hub sin reiniciar.
-- `sy-edge` puede llegar a `restart counter is at 9` antes de estabilizar → [PB-4](PENDING-BUGS.md#pb-4).
+- **Wait for convergence before diagnosing.** While it boots you will see inactive services and
+  `NODE_NOT_FOUND`. It is not a failure: it is the boot, and it is **slow** ([B-14](FINDINGS.md)).
+  Measured on a motherbee reboot (2026-09-25): the agent comes back at ~2.5 min, the 9 runtimes at
+  ~3 min 20 s, and the public endpoint can return **502** for a few seconds while `io.cloud` comes
+  up. The spokes need nothing: they ride out the hub going down without restarting.
+- `sy-edge` can reach `restart counter is at 9` before it stabilizes → [PB-4](PENDING-BUGS.md#pb-4).
 
 ---
 
-## 10. Tabla de trampas — el resumen que conviene leer antes de empezar
+## 10. Trap table — the summary worth reading before you start
 
-| # | Trampa | Síntoma | Solución |
+| # | Trap | Symptom | Solution |
 |---|---|---|---|
-| 1 | Port security de VMware | Las VMs anidadas **no hacen ni ARP**; la interna anda igual | `Forged transmits: Accept` **en cada** port group |
-| 2 | Lock de VM en Proxmox | `can't lock file ... got timeout` | Encadenar por estado de task, no por `sleep` |
-| 3 | Cloud image `.img` | `invalid filename or wrong extension` | Renombrar a `.qcow2` |
-| 4 | API sin snippets | `snippets` no está en la enumeración | Lo escribe el operador, una vez |
-| 5 | `cicustom` vs `ciuser` | El usuario nunca se crea | O uno o el otro; borrar `cicustom` del template |
-| 6 | Clon recién booteado | Reinicia solo, el agente desaparece | Esperar el ciclo + **reiniciar** |
-| 7 | `apt update` filtrado | `Depends: postgresql but it is not installable` | `apt-get update` **completo** |
-| 8 | Clonar y compilar con usuarios distintos | `VCS status: exit status 128` tras 55 min | `git config --global --replace-all safe.directory /opt/fluxbee '^/opt/fluxbee$'` |
-| 9 | `.deb` truncado | `dpkg-deb` sale 0 con 2 KB de paquete | Verificar tamaño y entradas (ya hay preflight) |
-| 10 | `harden_ssh` en `false` | La caja queda abierta | Pasarlo `true` explícito |
-| 11 | `nftables` ausente | `add_hive` egress falla cerrado | Instalarlo antes |
-| 12 | DNS uniforme | El ingress se queda sin resolución | DNS público en los nodos con pata pública |
-| 13 | Cadena TLS incompleta | Anda en el navegador, falla en los webhooks | Servir leaf + intermedios; probar sin AIA |
-| 14 | Cert rotado en el vault | El edge sigue sirviendo el viejo | Reiniciar `sy-edge` (ver PB-1) |
-| 15 | Placas secundarias | `add_hive` no las configura | Dejarlas listas antes del join |
-| 16 | Repo apt hecho a mano | `apt` dice *already the newest version* con el `.deb` nuevo ahí | Usar `scripts/apt-repo-publish.sh`: regenera **`Release`**, no sólo `Packages` |
-| 17 | Índice rehecho a mano con `dpkg-scanpackages` sin `-m` | Queda con una sola versión · **te quedás sin rollback** | Usar el script (`apt-ftparchive packages` lista todas). No lo rehagas a mano |
-| 18 | `dpkg-deb` "colgado" | El `.deb` sigue en 3 KB y `dpkg-deb -c` dice *unexpected end of file* | Está comprimiendo con `xz`. Esperá el `BUILD END`; termina en ~240 MB |
-| 19 | Toolchain y `$HOME` | `rustup` dice *no installed toolchains* con la toolchain ahí | `rustup` lee `$HOME/.rustup`: en `fb-build` compilá con `HOME=/root` |
-| 20 | Carácter > U+00FF en un `exec` (`—` `→` `✓`) | `QEMU guest agent is not running` con la VM viva — **no es la carga** (B-11) | `lab/pve.py` (codifica el argv); si ya pasó: reboot y si no, `reset` |
-| 21 | Comando largo por agente | La llamada vence a mitad y perdés el trabajo | `setsid nohup ... > log` y leer el log |
-| 22 | Puerto/unit equivocados | "se cayó el edge / el router / el admin" | `SY.edge` va en **:443**; en un spoke no hay `sy-router`; el admin es **loopback** |
-| 23 | `payload` de la API | Un `while` que gira sobre una operación exitosa | El `status` de arriba es el del sobre; lo real está bajo `payload.` |
-| 24 | `verify=19` en TLS local | "la cadena está rota" | Es falta de SNI. Probá con `--resolve` y un host que matchee el wildcard |
-| 25 | Runtime hot-publicado | El `.deb` sube y ese nodo queda en la versión vieja, **sin aviso** | El seed respeta tu `current` a propósito. Promovelo con `publish-runtime.sh --set-current` |
-| 26 | `systemctl stop` a un nodo managed (`fluxbee-node-*`) | La unit **desaparece** (es transitoria, de `systemd-run`); el `systemctl start` no encuentra nada y el nodo vuelve recién cuando lo relanza el reconcile (~60 s) | Usá el orquestador: `kill_node` **sin** `purge_instance` para frenarlo (conserva config e ILK) y `POST /hives/<h>/nodes/<n>/start`. Desde 0.1.68 ese stop **dura**: le saca la marca de relanzar (`relaunch_on_boot`) y el start se la vuelve a poner (A-67); antes el reconcile lo volvía a levantar |
+| 1 | VMware port security | The nested VMs **do not even do ARP**; the internal network works anyway | `Forged transmits: Accept` **on every** port group |
+| 2 | VM lock in Proxmox | `can't lock file ... got timeout` | Chain on task status, not on `sleep` |
+| 3 | Cloud image `.img` | `invalid filename or wrong extension` | Rename to `.qcow2` |
+| 4 | API without snippets | `snippets` is not in the enumeration | The operator writes it, once |
+| 5 | `cicustom` vs `ciuser` | The user is never created | One or the other; delete `cicustom` from the template |
+| 6 | Freshly booted clone | It reboots on its own, the agent disappears | Wait for the cycle + **reboot** |
+| 7 | Filtered `apt update` | `Depends: postgresql but it is not installable` | A **full** `apt-get update` |
+| 8 | Cloning and compiling as different users | `VCS status: exit status 128` after 55 min | `git config --global --replace-all safe.directory /opt/fluxbee '^/opt/fluxbee$'` |
+| 9 | Truncated `.deb` | `dpkg-deb` exits 0 with a 2 KB package | Check the size and the entries (there is a preflight now) |
+| 10 | `harden_ssh` at `false` | The box stays open | Pass it `true` explicitly |
+| 11 | `nftables` missing | `add_hive` egress fails closed | Install it beforehand |
+| 12 | Uniform DNS | The ingress is left without name resolution | A public DNS on the nodes with a public leg |
+| 13 | Incomplete TLS chain | It works in the browser, fails in the webhooks | Serve leaf + intermediates; test without AIA |
+| 14 | Cert rotated in the vault | The edge keeps serving the old one | Restart `sy-edge` (see PB-1) |
+| 15 | Secondary NICs | `add_hive` does not configure them | Have them ready before the join |
+| 16 | apt repo made by hand | `apt` says *already the newest version* with the new `.deb` right there | Use `scripts/apt-repo-publish.sh`: it regenerates **`Release`**, not just `Packages` |
+| 17 | Index rebuilt by hand with `dpkg-scanpackages` without `-m` | It ends up with a single version · **you are left without rollback** | Use the script (`apt-ftparchive packages` lists them all). Do not rebuild it by hand |
+| 18 | `dpkg-deb` "hung" | The `.deb` stays at 3 KB and `dpkg-deb -c` says *unexpected end of file* | It is compressing with `xz`. Wait for the `BUILD END`; it ends at ~240 MB |
+| 19 | Toolchain and `$HOME` | `rustup` says *no installed toolchains* with the toolchain right there | `rustup` reads `$HOME/.rustup`: on `fb-build` compile with `HOME=/root` |
+| 20 | Character > U+00FF in an `exec` (`—` `→` `✓`) | `QEMU guest agent is not running` with the VM alive — **it is not the load** (B-11) | `lab/pve.py` (it encodes the argv); if it already happened: reboot, and failing that, `reset` |
+| 21 | Long command through the agent | The call times out midway and you lose the work | `setsid nohup ... > log` and read the log |
+| 22 | Wrong port/unit | "the edge / the router / the admin went down" | `SY.edge` is on **:443**; on a spoke there is no `sy-router`; the admin is **loopback** |
+| 23 | The API `payload` | A `while` that spins on a successful operation | The top-level `status` is the envelope's; the real result is under `payload.` |
+| 24 | `verify=19` on local TLS | "the chain is broken" | It is missing SNI. Test with `--resolve` and a host that matches the wildcard |
+| 25 | Hot-published runtime | The `.deb` goes up and that node stays on the old version, **without warning** | The seed respects your `current` on purpose. Promote it with `publish-runtime.sh --set-current` |
+| 26 | `systemctl stop` on a managed node (`fluxbee-node-*`) | The unit **disappears** (it is transient, from `systemd-run`); `systemctl start` finds nothing, and the node only comes back when the reconcile relaunches it (~60 s) | Use the orchestrator: `kill_node` **without** `purge_instance` to stop it (it keeps the config and the ILK) and `POST /hives/<h>/nodes/<n>/start`. Since 0.1.68 that stop **lasts**: it removes the relaunch mark (`relaunch_on_boot`) and the start puts it back (A-67); before that, the reconcile brought the node back up |
 
 ---
 
-## 11. Qué es portable y qué no
+## 11. What is portable and what is not
 
-**Del producto — sirve igual en bare-metal:** §4 (build del `.deb`), §5 (motherbee), §6 (`add_hive`),
-§7 (gateway), §8 (DNS/cert), §9 (aceptación). Trampas 8–15.
+**Product — works the same on bare-metal:** §4 (`.deb` build), §5 (motherbee), §6 (`add_hive`),
+§7 (gateway), §8 (DNS/cert), §9 (acceptance). Traps 8–15.
 
-**Específico de Proxmox/VMware:** §2 (SDN, port groups), §3 (template, cloud-init, guest-agent).
-Trampas 1–7.
+**Proxmox/VMware-specific:** §2 (SDN, port groups), §3 (template, cloud-init, guest-agent).
+Traps 1–7.
 
-**En bare-metal, §2 y §3 se reemplazan por:** cablear/VLANear las tres redes, e instalar Ubuntu Server
-en cada máquina con un usuario `NOPASSWD:ALL` y SSH por password habilitado. **`add_hive` no cambia
-en absoluto** — su contrato es "una máquina Linux limpia y alcanzable por SSH", y de dónde salió esa
-máquina le da igual.
+**On bare-metal, §2 and §3 are replaced by:** cabling/VLANing the three networks, and installing
+Ubuntu Server on each machine with a `NOPASSWD:ALL` user and SSH password login enabled.
+**`add_hive` does not change at all** — its contract is "a clean Linux machine reachable over
+SSH", and it does not care where that machine came from.
 
 ---
 
-## 12. Actualizar un despliegue existente
+## 12. Updating an existing deployment
 
-**Validado el 2026-07-30** con cinco upgrades encadenados en producción. Los tres bloqueantes que
-la auditoría previa había encontrado están cerrados; detalle en [`PENDING-BUGS.md`](PENDING-BUGS.md).
+**Validated on 2026-07-30** with five chained upgrades in production. The three blockers that the
+previous audit had found are closed; details in [`PENDING-BUGS.md`](PENDING-BUGS.md).
 
-### El ciclo
+### The cycle
 
 ```bash
-# 1. en la build box
+# 1. on the build box
 git pull && bash packaging/build-deb.sh 0.1.N
-bash scripts/apt-repo-publish.sh --serve      # publica y CONSERVA las anteriores
+bash scripts/apt-repo-publish.sh --serve      # publishes and KEEPS the previous ones
 
-# 2. en motherbee
-apt-get update && apt-get install -y fluxbee  # nunca dpkg -i
+# 2. on motherbee
+apt-get update && apt-get install -y fluxbee  # never dpkg -i
 
-# 3. a cada spoke (opcional; el .deb solo actualiza motherbee)
-POST /hives/{spoke}/update  {"category":"core","manifest_version":0,"manifest_hash":"<el de motherbee>"}
-#    el hash sale de: GET /hives/motherbee/versions  ->  payload.hive.core.manifest_hash
+# 3. to each spoke (optional; the .deb only updates motherbee)
+POST /hives/{spoke}/update  {"category":"core","manifest_version":0,"manifest_hash":"<motherbee's>"}
+#    the hash comes from: GET /hives/motherbee/versions  ->  payload.hive.core.manifest_hash
 ```
 
-**Tiempo real:** de 6 a 23 min de build según la caché, ~9 s el publish (desde 0.1.51 el índice
-hashea solo el `.deb` nuevo; antes eran 8,6 min), ~1 min el `apt install`, y el sistema se acomoda
-solo en ~25 s.
+**Real time:** 6 to 23 min of build depending on the cache, ~9 s for the publish (since 0.1.51
+the index hashes only the new `.deb`; before, it took 8.6 min), ~1 min for the `apt install`, and
+the system settles on its own in ~25 s.
 
-### El mismo ciclo en un comando: `lab/ops.py` (desde 2026-10-02)
+### The same cycle in one command: `lab/ops.py` (since 2026-10-02)
 
-`lab/ops.py` hace el ciclo de arriba por guest-agent, sobre `lab/pve.py`, con el inventario de PROD
-(motherbee=100, worker1=101, ingress1=102, egress1=103, build 110; se cambia con `FLUXBEE_HIVES` y
-`FLUXBEE_BUILD_VM`):
+`lab/ops.py` runs the cycle above through the guest-agent, on top of `lab/pve.py`, with the PROD
+inventory (motherbee=100, worker1=101, ingress1=102, egress1=103, build 110; change it with
+`FLUXBEE_HIVES` and `FLUXBEE_BUILD_VM`):
 
 ```bash
 ops() { python3 lab/ops.py --env scratchpad/pve.env --pve-host 192.168.8.207 "$@"; }
-ops build 0.1.N --wait          # git pull + build-deb.sh en la build box (log /root/build-0.1.N.log)
+ops build 0.1.N --wait          # git pull + build-deb.sh on the build box (log /root/build-0.1.N.log)
 ops publish 0.1.N               # apt-repo-publish.sh (log /root/publish-0.1.N.log)
-ops deploy 0.1.N --snapshot pre-<algo>-0-1-N --drop <el-más-viejo>
-ops versions                    # versión y hash del core por hive: el instalado si lo hay, si no el de dist
-ops opa-status                  # política OPA de usuario por hive
-ops health [--since HH:MM]      # por VM: units caídas, denegaciones del gate, drops de routing.src (UTC)
-ops admin GET '/hives/motherbee/routes?x=1&y=2'   # sin shell: el & y el JSON pasan intactos
-ops run 100 script.sh [args]    # un script local (bash o .py) en una VM
+ops deploy 0.1.N --snapshot pre-<something>-0-1-N --drop <the-oldest>
+ops versions                    # core version and hash per hive: the installed one if there is one, otherwise dist's
+ops opa-status                  # user OPA policy per hive
+ops health [--since HH:MM]      # per VM: units down, gate denials, routing.src drops (UTC)
+ops admin GET '/hives/motherbee/routes?x=1&y=2'   # no shell: the & and the JSON pass through intact
+ops run 100 script.sh [args]    # a local script (bash or .py) on a VM
 ```
 
-`deploy` hace, en orden:
+`deploy` does, in order:
 
-1. Snapshot de todas las VMs.
-2. `apt install` en motherbee.
-3. Espera a que el admin reporte la versión nueva.
-4. Espera a que el orchestrator de cada spoke conteste: el admin del motherbee responde antes de que
-   su router tenga de vuelta a los spokes, y un update mandado en ese momento falla con
-   `TRANSPORT_ERROR` (0.1.56).
-5. core-update de los spokes en paralelo; reintenta, hasta 3 veces, uno que no llegó. Desde 0.1.55
-   cada spoke contesta `status=ok phase=restarting`.
-6. Espera a que cada spoke tenga **instalado** el hash del motherbee (`core.installed`). En un spoke
-   `core.manifest_hash` y las versiones de los componentes son lo que trajo dist, que Syncthing
-   actualiza antes de cualquier update: en 0.1.56 dieron por actualizados a spokes que seguían en la
-   versión anterior.
-7. `health` desde el arranque del deploy.
+1. A snapshot of every VM.
+2. `apt install` on motherbee.
+3. Waits for the admin to report the new version.
+4. Waits for each spoke's orchestrator to answer: the motherbee's admin answers before its router
+   has the spokes back, and an update sent at that moment fails with `TRANSPORT_ERROR` (0.1.56).
+5. core-update of the spokes in parallel; it retries one that did not get through, up to 3 times.
+   Since 0.1.55 each spoke answers `status=ok phase=restarting`.
+6. Waits for each spoke to have the motherbee's hash **installed** (`core.installed`). On a spoke,
+   `core.manifest_hash` and the component versions are what dist brought, which Syncthing
+   updates before any update: in 0.1.56 they made spokes that were still on the previous version
+   count as updated.
+7. `health` since the start of the deploy.
 
-La regla de los 3 snapshots se respeta así: si una VM ya tiene 3, `deploy` no arranca hasta que
-nombres el más viejo con `--drop`, y borra ese y ningún otro. El registro en el ledger sigue siendo
-a mano.
+The 3-snapshot rule is respected this way: if a VM already has 3, `deploy` does not start until
+you name the oldest with `--drop`, and it deletes that one and no other. The ledger record is
+still made by hand.
 
-### Registrá el deploy — SIEMPRE (auditoría) · regla del operador (2026-08-20)
+### Record the deploy — ALWAYS (audit) · operator's rule (2026-08-20)
 
-**Cada versión que toca PROD se registra en [`../DEPLOYMENTS.md`](../DEPLOYMENTS.md)** — el ledger de
-auditoría. Aplica al `apt install` en motherbee **y** a cada core-update de un spoke. **Sin entrada,
-el deploy no está hecho.** Flujo:
+**Every version that touches PROD is recorded in [`../DEPLOYMENTS.md`](../DEPLOYMENTS.md)** — the
+audit ledger. It applies to the `apt install` on motherbee **and** to each core-update of a spoke.
+**Without an entry, the deploy is not done.** Flow:
 
 ```bash
-# ANTES del apt install: snapshoteá motherbee (el nombre va en la fila del ledger).
-# Nunca más de 3 por VM (ver abajo): si ya hay 3, borrá el más viejo primero.
-python3 lab/pve.py snapshots 100                       # el más viejo sale primero
-python3 lab/pve.py delsnapshot 100 <el-más-viejo>      # solo si ya hay 3
-python3 lab/pve.py snapshot 100 pre-<algo>-<version>
+# BEFORE the apt install: snapshot motherbee (the name goes in the ledger row).
+# Never more than 3 per VM (see below): if there are already 3, delete the oldest first.
+python3 lab/pve.py snapshots 100                       # the oldest comes first
+python3 lab/pve.py delsnapshot 100 <the-oldest>        # only if there are already 3
+python3 lab/pve.py snapshot 100 pre-<something>-<version>
 # ... build + publish + apt install ...
-# DESPUÉS: agregá al ledger una fila en la tabla + una entrada con:
-#   versión · versión anterior · COMMIT · alcance (motherbee/spokes) · qué cambió (impacto) ·
-#   verificación (evidencia real, no "status ok") · rollback (snapshot + apt install fluxbee=<anterior>)
+# AFTER: add to the ledger a row in the table + an entry with:
+#   version · previous version · COMMIT · scope (motherbee/spokes) · what changed (impact) ·
+#   verification (real evidence, not "status ok") · rollback (snapshot + apt install fluxbee=<previous>)
 ```
 
-La entrada de auditoría **no** reemplaza a la bitácora (`YYYY-MM-DD.md`, el viaje) ni a
-`FINDINGS.md` (los bugs): el ledger es sólo "qué versión quedó en prod y por qué se puede confiar
-en ella". Hay una plantilla lista al final de `DEPLOYMENTS.md`.
+The audit entry does **not** replace the logbook (`YYYY-MM-DD.md`, the journey) or `FINDINGS.md`
+(the bugs): the ledger is only "which version ended up in prod and why it can be trusted". There
+is a ready-made template at the end of `DEPLOYMENTS.md`.
 
-### Snapshots: nunca más de 3 por VM · regla del operador (2026-09-25)
+### Snapshots: never more than 3 per VM · operator's rule (2026-09-25)
 
-**Ninguna VM tiene más de 3 snapshots, nunca.** Antes de tomar uno nuevo, si ya hay 3, se borra
-el más viejo. `lab/pve.py snapshot` **se niega** a crear el cuarto y te dice cuál borrar. El
-borrado queda como paso explícito (`delsnapshot`) porque es irreversible.
+**No VM has more than 3 snapshots, ever.** Before taking a new one, if there are already 3, the
+oldest is deleted. `lab/pve.py snapshot` **refuses** to create the fourth and tells you which one
+to delete. The deletion stays an explicit step (`delsnapshot`) because it is irreversible.
 
-- **Por qué:** en LVM-thin cada snapshot retiene todos los bloques que la VM cambió desde que se
-  tomó, y crece con el uso dentro del pool que comparten **todas** las VMs. Si el pool se llena,
-  se congelan todas. El 2026-09-25 fb-mb tenía 14, uno por release desde 0.1.19, y el primero con
-  RAM. Borrar 11 liberó **19 GiB** (el pool pasó de 64 % a 54 %).
-- **El snapshot es para volver atrás lo inmediato,** no para archivar versiones. Para bajar a una
-  versión vieja, el camino es el repo apt, que conserva todas: `apt install fluxbee=<anterior>`.
-  Por eso los rollbacks "por snapshot" de las entradas viejas de `DEPLOYMENTS.md` ya no existen.
-- **Borrar es irreversible:** se borra el más viejo, nombrado explícitamente, nunca en lote a ciegas.
+- **Why:** on LVM-thin each snapshot retains every block that the VM changed since it was taken,
+  and it grows with use inside the pool that **all** the VMs share. If the pool fills up, they all
+  freeze. On 2026-09-25 fb-mb had 14, one per release since 0.1.19, and the first one with RAM.
+  Deleting 11 freed **19 GiB** (the pool went from 64% to 54%).
+- **The snapshot is for undoing the immediate past,** not for archiving versions. To go down to an
+  old version, the path is the apt repo, which keeps them all: `apt install fluxbee=<previous>`.
+  That is why the "by snapshot" rollbacks in the old entries of `DEPLOYMENTS.md` no longer exist.
+- **Deleting is irreversible:** you delete the oldest one, named explicitly, never in a blind
+  batch.
 
 ```bash
-python3 lab/pve.py snapshots <id>                  # por fecha, el más viejo primero
-python3 lab/pve.py delsnapshot <id> <el-más-viejo>
+python3 lab/pve.py snapshots <id>                  # by date, the oldest first
+python3 lab/pve.py delsnapshot <id> <the-oldest>
 ```
 
-### Commits y versiones · regla del operador (2026-09-25)
+### Commits and versions · operator's rule (2026-09-25)
 
-Para seguir los cambios **por versión**:
+To track the changes **by version**:
 
-1. **Todo commit referencia la versión ACTUAL de fluxbee** en el asunto:
-   `[<versión>] <tipo>(<alcance>): <qué cambió>`. La versión actual es la última **en producción**
-   según [`../DEPLOYMENTS.md`](../DEPLOYMENTS.md) (la fila ✅ live más nueva) — no la que se está por
-   construir. Ejemplo: `[0.1.33] fix(apt-repo): persistent server unit + atomic index swap`.
-2. **El cuerpo referencia los cambios:** qué cambió y por qué, más las referencias que correspondan
-   (hallazgo `FINDINGS B-n`, bitácora `YYYY-MM-DD`, entrada del ledger).
-3. **Todo install en PROD cambia la versión** — mayor o menor, nunca se re-instala el mismo número.
-   En la etapa alfa se sube el último componente (`0.1.N → 0.1.N+1`) con `build-deb.sh <nueva>`,
-   y se registra en el ledger (sección anterior).
+1. **Every commit references the CURRENT fluxbee version** in its subject:
+   `[<version>] <type>(<scope>): <what changed>`. The current version is the latest one **in
+   production** according to [`../DEPLOYMENTS.md`](../DEPLOYMENTS.md) (the newest ✅ live row) —
+   not the one about to be built. Example:
+   `[0.1.33] fix(apt-repo): persistent server unit + atomic index swap`.
+2. **The body references the changes:** what changed and why, plus whatever references apply
+   (finding `FINDINGS B-n`, logbook `YYYY-MM-DD`, ledger entry).
+3. **Every install in PROD changes the version** — major or minor; the same number is never
+   re-installed. In the alpha stage the last component is bumped (`0.1.N → 0.1.N+1`) with
+   `build-deb.sh <new>`, and it is recorded in the ledger (previous section).
 
-Consecuencia útil: todo lo commiteado desde el último install lleva la versión base, así que el
-**delta que entra en la próxima versión** sale solo:
+A useful consequence: everything committed since the last install carries the base version, so
+the **delta that goes into the next version** comes out by itself:
 
 ```bash
-git log --oneline --grep='^\[0\.1\.33\]'     # lo que va a entrar en 0.1.34
+git log --oneline --grep='^\[0\.1\.33\]'     # what will go into 0.1.34
 ```
 
-El commit que registra un install en el ledger ya lleva la versión **nueva** (porque en ese momento
-es la que está en producción): `[0.1.34] docs(lab): ledger entry for 0.1.34 (…)`.
+The commit that records an install in the ledger already carries the **new** version (because at
+that moment it is the one in production): `[0.1.34] docs(lab): ledger entry for 0.1.34 (…)`.
 
-### Cómo saber si el update fue REAL y no fantasma
+### How to tell whether the update was REAL and not a phantom
 
-No alcanza con el `status: ok`. El chequeo que distingue un update genuino de uno que no hizo nada:
+`status: ok` is not enough. The check that tells a genuine update from one that did nothing:
 
 ```bash
 p=$(systemctl show -p MainPID --value sy-orchestrator)
-readlink /proc/$p/exe        # si dice "(deleted)" -> corre el binario VIEJO
-systemctl show -p ActiveEnterTimestamp --value sy-orchestrator   # debe ser POSTERIOR al update
-sha256sum /usr/bin/sy-orchestrator /var/lib/fluxbee/dist/core/bin/sy-orchestrator   # deben coincidir
+readlink /proc/$p/exe        # if it says "(deleted)" -> it is running the OLD binary
+systemctl show -p ActiveEnterTimestamp --value sy-orchestrator   # must be LATER than the update
+sha256sum /usr/bin/sy-orchestrator /var/lib/fluxbee/dist/core/bin/sy-orchestrator   # must match
 ```
 
-### ⚠️ Un runtime publicado en caliente NO avanza con el `.deb`
+### ⚠️ A hot-published runtime does NOT move forward with the `.deb`
 
-El seed del paquete mueve `current` de cada runtime base a la versión nueva… **salvo el de un
-runtime que vos hayas publicado en caliente y cuyo directorio siga en disco**. Ahí lo respeta y
-publica la del paquete como *available* nada más:
+The package seed moves the `current` of each base runtime to the new version… **except for a
+runtime that you hot-published and whose directory is still on disk**. There it respects yours,
+and publishes the package's version only as *available*:
 
 ```text
 NOTE: base runtime io.api     'current' moved 0.1.13 -> 0.1.15 (package authority)
 NOTE: base runtime ai.generic 'current' moved 0.1.13 -> 0.1.15 (package authority)
-   ...y io.slack NO aparece en la lista
+   ...and io.slack does NOT appear in the list
 ```
 
-Es deliberado y correcto: si pisara tu `current`, cada upgrade te desharía el despliegue en
-silencio. Pero el efecto colateral es igual de silencioso al revés — **ese nodo se queda atrás y
-nada te avisa**. El paquete sube, todo lo demás avanza, y ese runtime sigue en la versión vieja.
+It is deliberate and correct: if it overwrote your `current`, every upgrade would silently undo
+your deployment. But the side effect is just as silent the other way round — **that node falls
+behind and nothing warns you**. The package goes up, everything else moves forward, and that
+runtime stays on the old version.
 
-Verificá siempre después de un upgrade:
+Always check after an upgrade:
 
 ```bash
 python3 -c "
@@ -886,8 +903,8 @@ import json; m=json.load(open('/var/lib/fluxbee/dist/runtimes/manifest.json'))
 for k,v in m['runtimes'].items(): print(k, v['current'], v['available'])"
 ```
 
-Para aceptar la del paquete, promovela con la misma herramienta que usa el seed, y reiniciá el
-nodo **por admin**:
+To accept the package's version, promote it with the same tool that the seed uses, and restart
+the node **through admin**:
 
 ```bash
 sudo /usr/share/fluxbee/publish-runtime.sh --runtime io.slack --version 0.1.15 \
@@ -896,258 +913,263 @@ sudo /usr/share/fluxbee/publish-runtime.sh --runtime io.slack --version 0.1.15 \
 curl -sS -X POST "$ADMIN/hives/$HIVE/nodes/$NODE_ENC/restart" -d '{"confirm":true}'
 ```
 
-> El `restart` por admin **sí** te lleva a `current` — pero recién desde 0.1.15. Antes resolvía la
-> última versión concreta guardada en vez de la intención (`requested_runtime_version: "current"`),
-> y encima reiniciaba la unit sin regenerarla: reportaba la versión nueva **corriendo el binario
-> viejo**.
+> The `restart` through admin **does** take you to `current` — but only since 0.1.15. Before that,
+> it resolved the latest concrete version stored instead of the intent
+> (`requested_runtime_version: "current"`), and on top of that it restarted the unit without
+> regenerating it: it reported the new version **while running the old binary**.
 
-### ⚠️ Cómo NO leer una falla donde no la hay
+### ⚠️ How NOT to read a failure where there is none
 
-Tres veces en una jornada leí un sistema sano como roto. Las tres son de sondeo, no de producto —
-y las tres se evitan sabiendo dónde mira cada cosa:
+Three times in one working day I read a healthy system as broken. All three were probing
+mistakes, not product problems — and all three are avoided by knowing where each thing looks:
 
-| lo que probé | lo que vi | lo que pasaba de verdad |
+| what I tried | what I saw | what was really going on |
 |---|---|---|
-| `curl https://127.0.0.1:8443/` en el ingress | conexión rechazada, "el edge se cayó" | **`SY.edge` escucha en `:443`.** El `8443` es de otra época |
-| `systemctl is-active sy-router` en un worker | `inactive`, "el worker perdió el router" | **En un spoke esa unit no existe.** Listá con `systemctl list-units "sy-*"` antes de preguntar por una |
-| `curl :8080/hives` desde el worker | sin respuesta, "el admin murió" | **La API de admin escucha en loopback.** Se consulta desde motherbee, no desde un spoke |
+| `curl https://127.0.0.1:8443/` on the ingress | connection refused, "the edge went down" | **`SY.edge` listens on `:443`.** The `8443` is from another era |
+| `systemctl is-active sy-router` on a worker | `inactive`, "the worker lost the router" | **On a spoke that unit does not exist.** List them with `systemctl list-units "sy-*"` before asking about one |
+| `curl :8080/hives` from the worker | no answer, "the admin died" | **The admin API listens on loopback.** You query it from motherbee, not from a spoke |
 
-Y una cuarta, de TLS: contra `127.0.0.1` vas a ver `ssl_verify_result=19`
-(*self-signed in chain*) aunque la cadena esté perfecta — es que no hay SNI ni hostname que
-validar. Verificá con un nombre concreto que matchee el wildcard del cert:
+And a fourth one, about TLS: against `127.0.0.1` you will see `ssl_verify_result=19`
+(*self-signed in chain*) even when the chain is perfect — the reason is that there is no SNI or
+hostname to validate. Verify with a concrete name that matches the cert's wildcard:
 
 ```bash
-# el CN es *.fluxbee.ai — un literal "*.fluxbee.ai" NO sirve como host
+# the CN is *.fluxbee.ai — a literal "*.fluxbee.ai" does NOT work as a host
 H=hive-test.fluxbee.ai
 curl -s -o /dev/null -w "http=%{http_code} verify=%{ssl_verify_result} certs=%{num_certs}\n" \
      "https://$H/" --resolve "$H:443:127.0.0.1"
-# esperado: http=404 verify=0 certs=4
+# expected: http=404 verify=0 certs=4
 ```
 
-### ⚠️ La respuesta de la API vive bajo `payload`
+### ⚠️ The API response lives under `payload`
 
-Todo lo que devuelve la API de admin viene envuelto:
+Everything the admin API returns comes wrapped:
 
 ```json
-{"action":"...", "status":"...", "error_code":null, "payload":{ ...lo que te importa... }}
+{"action":"...", "status":"...", "error_code":null, "payload":{ ...what you care about... }}
 ```
 
-El `status` de arriba es el del **sobre**, y dice `ok` aunque la operación de adentro haya fallado.
-Rutas reales que hacen falta seguido:
+The top-level `status` belongs to the **envelope**, and it says `ok` even if the operation inside
+failed. Real paths that are often needed:
 
 ```text
-GET /hives                     ->  payload.hives[]           (NO payload.hives[].status para el join: es payload.hives[].join.phase)
+GET /hives                     ->  payload.hives[]           (NOT payload.hives[].status for the join: it is payload.hives[].join.phase)
 GET /hives/<h>/versions        ->  payload.hive.core.manifest_hash
-GET /versions                  ->  payload.comparison.verdict   y   payload.comparison.hives[]
+GET /versions                  ->  payload.comparison.verdict   and   payload.comparison.hives[]
 ```
 
-> Esto ya causó un bug real: cuatro loops de e2e leían `payload.status` —siempre `"ok"`— y habrían
-> girado 600 s sobre un join **exitoso**. Si estás por escribir un `while` sobre una respuesta de
-> esta API, chequeá primero en qué campo estás mirando.
+> This already caused a real bug: four e2e loops read `payload.status` —always `"ok"`— and would
+> have spun for 600 s on a **successful** join. If you are about to write a `while` over a
+> response from this API, first check which field you are looking at.
 
-### `update category=core` responde antes de reiniciar (desde 0.1.55)
+### `update category=core` answers before restarting (since 0.1.55)
 
-**La respuesta llega cuando el destino ya tiene los binarios y las units nuevos**, con
-`phase: "restarting"`. Los reinicios corren después, en segundo plano: el health gate, y el rollback
-si el gate falla.
+**The response arrives when the target already has the new binaries and units**, with
+`phase: "restarting"`. The restarts run afterwards, in the background: the health gate, and the
+rollback if the gate fails.
 
-- **Cómo se sabe cómo terminó:** en `GET /hives/{hive}/versions`, `core.last_update` (`phase`
+- **How to know how it ended:** in `GET /hives/{hive}/versions`, `core.last_update` (`phase`
   `restarting|done`, `status` `ok|rollback`, `errors`).
-- **Antes de 0.1.55** respondía TIMEOUT aunque funcionara (U-8b). La respuesta salía por el router
-  que el propio update acababa de reiniciar y se perdía. Validado en vivo con 0.1.56: los tres
-  spokes contestaron `phase=restarting` y terminaron en `done ok`.
-- **No reintentes ciegamente:** verificá con el chequeo de arriba, o con `core.last_update`.
+- **Before 0.1.55** it answered TIMEOUT even when it worked (U-8b). The response went out through
+  the router that the update itself had just restarted, and it got lost. Validated live with
+  0.1.56: the three spokes answered `phase=restarting` and ended in `done ok`.
+- **Do not retry blindly:** verify with the check above, or with `core.last_update`.
 
-### ⚠️ Los nodos runtime y el orden de recuperación
+### ⚠️ Runtime nodes and the recovery order
 
-Un upgrade reemplaza `dist/runtimes/<rt>/<version>/` y borra la anterior. Los nodos que siguen a
-`current` se **rebindean y reinician solos** al arrancar el orquestador nuevo (buscá
-`runtime 'current' pointer moved` en el journal). Si alguno queda colgado, la recuperación manual
-tiene un **orden obligatorio**:
+An upgrade replaces `dist/runtimes/<rt>/<version>/` and deletes the previous one. The nodes that
+follow `current` **rebind and restart on their own** when the new orchestrator starts (look for
+`runtime 'current' pointer moved` in the journal). If one is left hanging, the manual recovery
+has a **mandatory order**:
 
 ```bash
-# UNA sola llamada: baja el nodo Y borra su directorio persistido.
+# ONE single call: stops the node AND deletes its persisted directory.
 DELETE /hives/{h}/nodes/{n}@{h}   -d '{"purge_instance":true}'
 
-POST   /hives/{h}/nodes                 # run_node — tenant_id es OBLIGATORIO: el que tenía el nodo
+POST   /hives/{h}/nodes                 # run_node — tenant_id is MANDATORY: the one the node had
   {"node_name":"IO.api.acme","runtime":"io.api","runtime_version":"current",
-   "tenant_id":"tnt:<tenant del nodo>"}
-# El tenant raíz (tnt:00000000-0000-0000-0000-000000000001) solo vale para IO.cloud e IO.blob:
-# cualquier otro nodo IO ahí da TENANT_ROOT_NOT_ALLOWED (A-43).
+   "tenant_id":"tnt:<the node's tenant>"}
+# The root tenant (tnt:00000000-0000-0000-0000-000000000001) is only valid for IO.cloud and IO.blob:
+# any other IO node there gets TENANT_ROOT_NOT_ALLOWED (A-43).
 ```
 
-⚠️ **Usá `purge_instance`, no dos llamadas.** Encadenar `kill_node` y después
-`remove_node_instance` es una **carrera**: el kill responde `ok` antes de que systemd baje la unit
-y el remove falla con `NODE_INSTANCE_RUNNING`. Y si eso pasa sin que nadie mire la respuesta, el
-config **queda** y el nodo **reaparece solo** en el próximo arranque, porque la reconciliación lo
-relanza desde el config persistido. El nombre va **calificado** (`<node>@<hive>`).
+⚠️ **Use `purge_instance`, not two calls.** Chaining `kill_node` and then `remove_node_instance`
+is a **race**: the kill answers `ok` before systemd brings the unit down, and the remove fails
+with `NODE_INSTANCE_RUNNING`. And if that happens without anyone looking at the response, the
+config **stays** and the node **reappears on its own** at the next start, because the
+reconciliation relaunches it from the persisted config. The name goes **qualified**
+(`<node>@<hive>`).
 
-⚠️ **Esta recuperación pierde la configuración del nodo.** Con nodos `UNCONFIGURED` no cuesta nada;
-con tokens cargados es una pérdida real.
+⚠️ **This recovery loses the node's configuration.** With `UNCONFIGURED` nodes it costs nothing;
+with tokens loaded it is a real loss.
 
-### Workflows: el deploy pasa por el admin, y un nodo WF roto queda arriba (desde 0.1.70)
+### Workflows: the deploy goes through the admin, and a broken WF node stays up (since 0.1.70)
 
-- **Cómo se despliega:**
-  - Un workflow se despliega con `POST /hives/<hive>/wf-rules` (o `…/compile`, `…/apply`,
-    `…/rollback`, `…/delete`) o desde Archi.
-  - SY.wf-rules lanza, reinicia y borra el nodo `WF.<nombre>@<hive>` **a través de SY.admin**,
-    como cualquier otro, y solo para los `WF.*` de su hive.
-  - El nodo queda con `launched_by` = quien pidió el deploy (`operator` por HTTP, `archi` desde
-    Archi): `get_node_status` lo muestra.
-  - Desde Archi el deploy funciona desde 0.1.70. Antes se trababa en el loop del admin y
-    respondía `PACKAGE_PUBLISH_FAILED` (A-68).
-  - En un worker, el deploy primero hace que el motherbee anuncie el paquete: le pide que
-    Syncthing escanee ya (`sync_hint` sobre `fluxbee-dist-runtimes`). Después espera el paquete
-    entero hasta 45 s, y repite el escaneo antes de cada reintento.
-    - Sin ese escaneo, el paquete llegó a tardar 62 s: el watcher del motherbee agrupa los cambios
-      y tarda en anunciarlos. El worker trae el paquete apenas llega el anuncio; un escaneo en el
-      worker no lo hace traer nada.
-- **Un nodo WF con config o definición rota no se cae:**
-  - queda corriendo en `FAILED_CONFIG`;
-  - `get_node_status` muestra `health_state: DEGRADED` y `last_error` (`invalid_config`, o
-    `invalid_definition` si el `flow/definition.json` del paquete falta o no valida);
-  - se arregla redesplegando el workflow, o corrigiendo la config (`set_node_config`) y
-    reiniciándolo (`restart_node`).
-  - Antes se caía y systemd lo relanzaba cada 5 s, y el motivo solo quedaba en journald.
+- **How it is deployed:**
+  - A workflow is deployed with `POST /hives/<hive>/wf-rules` (or `…/compile`, `…/apply`,
+    `…/rollback`, `…/delete`) or from Archi.
+  - SY.wf-rules launches, restarts and deletes the `WF.<name>@<hive>` node **through SY.admin**,
+    like any other node, and only for the `WF.*` nodes of its own hive.
+  - The node is left with `launched_by` = whoever asked for the deploy (`operator` over HTTP,
+    `archi` from Archi): `get_node_status` shows it.
+  - Deploying from Archi works since 0.1.70. Before that, it got stuck in the admin's loop and
+    answered `PACKAGE_PUBLISH_FAILED` (A-68).
+  - On a worker, the deploy first has the motherbee announce the package: it asks the motherbee
+    to have Syncthing scan right away (`sync_hint` on `fluxbee-dist-runtimes`). Then it waits up
+    to 45 s for the whole package, and repeats the scan before each retry.
+    - Without that scan, the package once took 62 s: the motherbee's watcher batches the changes
+      and is slow to announce them. The worker pulls the package as soon as the announcement
+      arrives; a scan on the worker does not make it pull anything.
+- **A WF node with a broken config or definition does not go down:**
+  - it keeps running in `FAILED_CONFIG`;
+  - `get_node_status` shows `health_state: DEGRADED` and `last_error` (`invalid_config`, or
+    `invalid_definition` if the package's `flow/definition.json` is missing or does not validate);
+  - you fix it by redeploying the workflow, or by correcting the config (`set_node_config`) and
+    restarting it (`restart_node`).
+  - Before, it went down and systemd relaunched it every 5 s, and the reason was only left in
+    journald.
 
-### Un nodo de sistema nuevo en un rol, con hives ya unidos (0.1.41: SY.opa.rules en ingress/egress)
+### A new system node in a role, with hives already joined (0.1.41: SY.opa.rules on ingress/egress)
 
-El `hive.yaml` de un spoke se escribe una sola vez, en el join, y no se re-emite. El spoke arranca los nodos de **su** `system_nodes.<rol>` y los valida
-contra el manifest core que le manda el motherbee. Por eso el orden importa:
+A spoke's `hive.yaml` is written only once, at the join, and it is not re-issued. The spoke starts the nodes of **its own** `system_nodes.<role>` and validates them
+against the core manifest that the motherbee sends it. That is why the order matters:
 
-1. **Motherbee, antes del `apt install`:** agregar el nodo a `system_nodes.<rol>.nodes` de
-   `/etc/fluxbee/hive.yaml` (el `.deb` no pisa tus cambios: su payload trae solo `hive.yaml.example`;
-   el postinst crea `hive.yaml` solo si falta y solo corrige `architect.listen` en `0.0.0.0`, A-46).
-   Al reiniciar, el orquestador arma
-   `dist/core/<rol>` con el binario nuevo y Syncthing lo lleva al spoke.
-2. **Esperar que el binario llegue al spoke:** `dist/core/bin/<binario>` presente y con el sha256
-   que dice `dist/core/manifest.json`. Si el `hive.yaml` del spoke lo nombra antes, el orquestador
-   del spoke no arranca: valida cada binario de su rol contra el manifest y ese falta.
-3. **Spoke:** agregar el nodo a `system_nodes.<rol>.nodes` de su `/etc/fluxbee/hive.yaml`.
-4. **`update category=core` al spoke:** instala el binario; el orquestador nuevo regenera las units
-   (crea la del nodo) y lo arranca.
+1. **Motherbee, before the `apt install`:** add the node to `system_nodes.<role>.nodes` in
+   `/etc/fluxbee/hive.yaml` (the `.deb` does not overwrite your changes: its payload ships only
+   `hive.yaml.example`; the postinst creates `hive.yaml` only if it is missing, and only fixes an
+   `architect.listen` set to `0.0.0.0`, A-46). On restart, the orchestrator builds
+   `dist/core/<role>` with the new binary, and Syncthing carries it to the spoke.
+2. **Wait for the binary to reach the spoke:** `dist/core/bin/<binary>` present, with the sha256
+   that `dist/core/manifest.json` states. If the spoke's `hive.yaml` names the node before that,
+   the spoke's orchestrator does not start: it validates every binary of its role against the
+   manifest, and that one is missing.
+3. **Spoke:** add the node to `system_nodes.<role>.nodes` in its `/etc/fluxbee/hive.yaml`.
+4. **`update category=core` to the spoke:** it installs the binary; the new orchestrator
+   regenerates the units (it creates the node's unit) and starts it.
 
-Un hive que se une después no necesita nada de esto: el join copia el `system_nodes.<rol>` del
-motherbee. La carpeta `fluxbee-dist-policy` tampoco: hereda los peers de `fluxbee-dist-vendor` en
-el próximo arranque del orquestador de cada lado. **Solo esa:** el orquestador lo hace con su
-nombre fijo; una carpeta nueva de todos los roles necesita el mismo código (o generalizarlo).
+A hive that joins later needs none of this: the join copies the motherbee's
+`system_nodes.<role>`. Neither does the `fluxbee-dist-policy` folder: it inherits the peers of
+`fluxbee-dist-vendor` at the next start of the orchestrator on each side. **Only that one:** the
+orchestrator does it by its fixed name; a new folder for all roles needs the same code (or
+generalizing it).
 
-### El rollback
+### The rollback
 
-Tres caminos:
+Three paths:
 
-1. **`core_rollback`** ([U-5](PENDING-BUGS.md#u-5)): `POST /hives/{hive}/core/rollback` devuelve
-   un **spoke** a la generación que reemplazó su último `update category=core` (cada binario sellado
-   con su sha256), con gate de salud (la unit activa). Necesita un update previo que haya cambiado
-   binarios. El motherbee no tiene generaciones (su core lo instala dpkg): para él, igual que para un
-   hive cuyo orquestador es lo que está roto, los dos siguientes. Si restaura `sy-orchestrator`, la
-   respuesta puede ser `FORWARD_UNKNOWN`: verificá `core.installed.source = core_rollback` en
+1. **`core_rollback`** ([U-5](PENDING-BUGS.md#u-5)): `POST /hives/{hive}/core/rollback` returns
+   a **spoke** to the generation that its last `update category=core` replaced (each binary
+   sealed with its sha256), with a health gate (the unit active). It needs a previous update that
+   changed binaries. The motherbee has no generations (dpkg installs its core): for it, as for a
+   hive whose orchestrator is what is broken, use the next two. If it restores `sy-orchestrator`,
+   the response may be `FORWARD_UNKNOWN`: check `core.installed.source = core_rollback` in
    `/versions`.
-2. **Snapshot en frío de las VMs** — ver §1 sobre por qué en frío. Con el máximo de 3 por VM
-   (§12), cubre solo lo reciente.
-3. **Conservar el `.deb` anterior publicado** en el repo apt y bajar de versión con `apt`. Es el
-   camino para cualquier versión vieja.
+2. **Cold snapshot of the VMs** — see §1 on why cold. With the maximum of 3 per VM (§12), it
+   covers only the recent past.
+3. **Keep the previous `.deb` published** in the apt repo and downgrade with `apt`. It is the path
+   for any old version.
 
-**Bajar de 0.1.63 o más a una anterior:** Syncthing queda corriendo como `fluxbee` (0.1.62 usa el
-usuario si existe), pero los nodos de 0.1.62 escriben blobs de root que no puede leer. Si un worker
-produce blobs, volverlo a root: `systemctl stop fluxbee-syncthing`, `userdel fluxbee` y
-`systemctl restart sy-orchestrator`. En el motherbee no hace falta, porque el postinst de 0.1.62
-vuelve a hacer `chown -R`.
+**Downgrading from 0.1.63 or later to an earlier version:** Syncthing keeps running as `fluxbee`
+(0.1.62 uses that user if it exists), but the 0.1.62 nodes write root-owned blobs that it cannot
+read. If a worker produces blobs, switch it back to root: `systemctl stop fluxbee-syncthing`,
+`userdel fluxbee` and `systemctl restart sy-orchestrator`. On the motherbee this is not needed,
+because the 0.1.62 postinst runs `chown -R` again.
 
-**Bajar de 0.1.62 o más a una anterior:** primero los spokes (`core_rollback` o `update` al core
-viejo), después el motherbee. Un worker de 0.1.62 frente a un motherbee viejo no recibe latidos en su
-suscripción de identity: la corta cada 60 s y pide un snapshot completo, y el motherbee viejo solo
-limpia esas suscripciones muertas cuando difunde un cambio.
+**Downgrading from 0.1.62 or later to an earlier version:** first the spokes (`core_rollback` or
+an `update` to the old core), then the motherbee. A 0.1.62 worker facing an old motherbee gets no
+heartbeats on its identity subscription: it drops the subscription every 60 s and asks for a full
+snapshot, and the old motherbee only cleans up those dead subscriptions when it broadcasts a
+change.
 
-**Bajar de 0.1.41 o más a una anterior** (antes de la policy OPA global): primero
-`POST /opa/policy/clear` y esperar `converged: true`. Si no, los workers siguen aplicando la última
-policy global (la versión vieja carga `current/` al arrancar y sus escrituras por hive no llegan a
-los spokes) y los routers de ingress/egress la mantienen en memoria hasta un reboot. Después de
-bajar, sacar la carpeta `fluxbee-dist-policy` de Syncthing y restaurar el `hive.yaml` previo
-(`hive.yaml.pre-opa-0-1-41`).
+**Downgrading from 0.1.41 or later to an earlier version** (before the global OPA policy): first
+`POST /opa/policy/clear` and wait for `converged: true`. Otherwise, the workers keep applying the
+last global policy (the old version loads `current/` at startup, and its per-hive writes do not
+reach the spokes), and the ingress/egress routers keep it in memory until a reboot. After the
+downgrade, remove the `fluxbee-dist-policy` folder from Syncthing and restore the previous
+`hive.yaml` (`hive.yaml.pre-opa-0-1-41`).
 
-### Identidades: marcar, restaurar, purgar (desde 0.1.34)
+### Identities: mark, restore, purge (since 0.1.34)
 
-Decisión del operador (2026-09-28): los ILKs y tenants son datos únicos, así que **borrar solo
-marca** y **purgar** es un paso aparte y deliberado. Desde 0.1.67 (etapa 3, `docs/ilk-tenant-model-v1.md`
-§2.3): lo que le pasa a un tenant nunca marca ni borra a una persona.
+Operator's decision (2026-09-28): ILKs and tenants are unique data, so **deleting only marks**,
+and **purging** is a separate, deliberate step. Since 0.1.67 (stage 3,
+`docs/ilk-tenant-model-v1.md` §2.3): what happens to a tenant never marks or deletes a person.
 
 ```bash
 A=127.0.0.1:8080; H=motherbee
-curl -X DELETE $A/hives/$H/identity/ilks/<ilk_id>                # marcar (reversible, idempotente)
-curl -X POST   $A/hives/$H/identity/ilks/<ilk_id>/restore        # deshacer la marca
-curl -X POST   $A/hives/$H/identity/ilks/<ilk_id>/purge          # físico: exige la marca previa
-curl -X DELETE $A/hives/$H/identity/tenants/<tenant_id>          # marca solo el tenant (lo deshabilita)
-curl -X POST   $A/hives/$H/identity/tenants/<tenant_id>/restore  # lo devuelve tal cual
-curl -X POST   $A/hives/$H/identity/tenants/<tenant_id>/purge    # físico: sin personas cargadas
-curl -X PUT    $A/hives/$H/identity/ilks/<ilk_id>/tenant -d '{"tenant_id":"tnt:…"}'  # cargar a otro tenant
-curl "$A/hives/$H/identity/ilks?include_deleted=true"            # los marcados solo aparecen así
+curl -X DELETE $A/hives/$H/identity/ilks/<ilk_id>                # mark (reversible, idempotent)
+curl -X POST   $A/hives/$H/identity/ilks/<ilk_id>/restore        # undo the mark
+curl -X POST   $A/hives/$H/identity/ilks/<ilk_id>/purge          # physical: requires the prior mark
+curl -X DELETE $A/hives/$H/identity/tenants/<tenant_id>          # marks only the tenant (disables it)
+curl -X POST   $A/hives/$H/identity/tenants/<tenant_id>/restore  # brings it back as it was
+curl -X POST   $A/hives/$H/identity/tenants/<tenant_id>/purge    # physical: with no people charged to it
+curl -X PUT    $A/hives/$H/identity/ilks/<ilk_id>/tenant -d '{"tenant_id":"tnt:…"}'  # charge to another tenant
+curl "$A/hives/$H/identity/ilks?include_deleted=true"            # marked ones only show up this way
 ```
 
-- **Marcado = oculto pero reservado.** No resuelve (ni en la SHM, ni en los routers, ni en el
-  `get_ilk` de Cloud). Su email, sus canales y su `node_name`, o el nombre y dominio del tenant,
-  **quedan tomados** hasta la purga: reusarlos da `ILK_DELETED` o `TENANT_DELETED`.
-- **Borrar un tenant no marca a nadie.** Su gente sigue usable y se carga a otro tenant con
-  `set_ilk_tenant` (un temporal, solo si su tenant está borrado). Restaurar el tenant lo devuelve
-  tal cual.
-- **Purgar un tenant** se rechaza mientras tenga personas cargadas (`TENANT_HAS_PEOPLE`): primero
-  se las carga a otro. Las que se borraron solas se van con él.
-- **Un tenant pendiente o suspendido no arranca nodos** (`TENANT_NOT_ACTIVE`); los que ya corren no
-  se matan, pero no reciben secretos.
-- **Protecciones:**
-  - no se toca el tenant raíz ni los ILKs de sistema;
-  - un tenant con identidades de nodo (`TENANT_HAS_NODES`) o con tenants apadrinados
-    (`TENANT_HAS_CHILDREN`) no se marca ni se purga;
-  - purgar un tenant que todavía tiene secretos en el vault da `TENANT_HAS_SECRETS`.
-- **Fluxbee Cloud** puede marcar y restaurar, siempre acotado al tenant que reclama. **Purgar es
-  solo del operador**, y Archi tampoco puede.
-- **El kill con `purge_instance`** marca y purga el ILK del nodo, para que el nombre del nodo
-  quede libre.
+- **Marked = hidden but reserved.** It does not resolve (not in the SHM, not in the routers, not in
+  Cloud's `get_ilk`). Its email, its channels and its `node_name`, or the tenant's name and
+  domain, **stay taken** until the purge: reusing them gives `ILK_DELETED` or `TENANT_DELETED`.
+- **Deleting a tenant marks nobody.** Its people stay usable and are charged to another tenant
+  with `set_ilk_tenant` (a temporary only if its tenant is deleted). Restoring the tenant brings
+  it back as it was.
+- **Purging a tenant** is rejected while people are charged to it (`TENANT_HAS_PEOPLE`): first
+  they are charged to another one. The ones that were deleted on their own go with it.
+- **A pending or suspended tenant does not start nodes** (`TENANT_NOT_ACTIVE`); the ones already
+  running are not killed, but they do not receive secrets.
+- **Protections:**
+  - the root tenant and the system ILKs are not touched;
+  - a tenant with node identities (`TENANT_HAS_NODES`) or with sponsored tenants
+    (`TENANT_HAS_CHILDREN`) is neither marked nor purged;
+  - purging a tenant that still has secrets in the vault gives `TENANT_HAS_SECRETS`.
+- **Fluxbee Cloud** can mark and restore, always scoped to the tenant it claims. **Purging is for
+  the operator only**, and Archi cannot do it either.
+- **The kill with `purge_instance`** marks and purges the node's ILK, so that the node's name is
+  freed.
 
-### Reset a fábrica — `fluxbee-factory-reset` (2026-09-28)
+### Factory reset — `fluxbee-factory-reset` (2026-09-28)
 
-Borra **lo que crearon los usuarios** y deja el hive como lo dejó `fluxbee-firstboot`, sin
-reinstalar. Pensado sobre todo para DEV y pruebas; en PROD, solo a propósito y con snapshot previo.
-Viene en el `.deb` y se corre **en el motherbee**; cubre **todo el hive**.
+It deletes **what the users created** and leaves the hive as `fluxbee-firstboot` left it, without
+reinstalling. It is meant mainly for DEV and tests; in PROD, only on purpose and with a snapshot
+first. It ships in the `.deb` and runs **on the motherbee**; it covers **the whole hive**.
 
 ```bash
-sudo fluxbee-factory-reset                                  # DRY-RUN: lista lo que borraría (default)
-sudo fluxbee-factory-reset --yes                            # ejecuta; pide escribir el hive_id
-sudo fluxbee-factory-reset --yes --confirm-hive motherbee   # ejecuta sin preguntar
+sudo fluxbee-factory-reset                                  # DRY-RUN: lists what it would delete (default)
+sudo fluxbee-factory-reset --yes                            # runs it; asks you to type the hive_id
+sudo fluxbee-factory-reset --yes --confirm-hive motherbee   # runs it without asking
 ```
 
-| Se borra | Se conserva |
+| Deleted | Kept |
 |---|---|
-| Nodos lanzados por usuarios, en todos los hives (kill + purge: se van con su ILK, sus secretos y sus timers) | La instalación: paquete, `/etc/fluxbee`, master key del vault, TLS, mesh y spokes |
-| ILKs de usuario (humanos, agentes y temporales creados por mensajes o por Cloud), **purgados**, incluidos los que un borrado previo solo marcó, y **todos los tenants salvo el raíz** | Lo que arranca como sistema: nodos `SY.*` y sus ILKs, y los nodos base de `base-nodes.json` con su ILK, ICH y config (la puerta de Cloud sigue publicada) |
-| El log de mensajes: todas las tablas de `fluxbee_storage`, la caché de SY.cognition, el estado de conversación (`thread-state/`, `immediate-memory/`) y las sesiones de Archi | Rutas, VPNs y taps |
-| Todos los secretos del vault salvo los de infraestructura (`storage_postgres_url`, `edge_tls*`, `edge_channel_secret:*`). Desde D32 se borran también las viejas claves de recuperación `ssh:*`. **Incluye las claves de IA**: el AI queda degradado hasta recargarlas | El historial operativo: audit log de admin, historial de deploys y audit del vault |
+| Nodes launched by users, on every hive (kill + purge: they go with their ILK, their secrets and their timers) | The installation: package, `/etc/fluxbee`, vault master key, TLS, mesh and spokes |
+| User ILKs (humans, agents, and temporaries created by messages or by Cloud), **purged**, including those that an earlier delete only marked, and **every tenant except the root one** | What starts as system: `SY.*` nodes and their ILKs, and the base nodes from `base-nodes.json` with their ILK, ICH and config (the Cloud door stays published) |
+| The message log: every table of `fluxbee_storage`, the SY.cognition cache, the conversation state (`thread-state/`, `immediate-memory/`) and the Archi sessions | Routes, VPNs and taps |
+| Every vault secret except the infrastructure ones (`storage_postgres_url`, `edge_tls*`, `edge_channel_secret:*`). Since D32 the old `ssh:*` recovery keys are deleted too. **This includes the AI keys**: the AI stays degraded until they are loaded again | The operational history: the admin audit log, the deploy history and the vault audit |
 
-- **Workflows:** se borran por su propio camino. En cada hive con SY.wf-rules (motherbee y
-  workers) se llama a `wf_rules_delete` con `force`, que borra la regla, el nodo `WF.*`, su estado
-  y sus paquetes, incluidas las instancias en curso. Un nodo `WF.*` huérfano, sin workflow, se mata
-  como cualquier nodo de usuario.
-- **Identity:** desde 0.1.34, borrar un ILK o un tenant solo lo **marca**. La marca es
-  reversible, lo oculta y deja sus claves reservadas. La **purga** es física y exige la marca
-  previa. El reset hace las dos cosas: marca y purga. Los tenants van después del vault, porque
-  purgar uno que tiene secretos se rechaza, y en pasadas: primero los hijos y después sus sponsors.
-- **No toca todavía:** la política OPA de usuario (falta la acción `opa_clear` y que el router la
-  descargue) y los blobs.
-- **Usa la API del producto** para todo, salvo el log de mensajes, que no tiene API: sus tablas se
-  truncan con los consumidores frenados.
-- **Es seguro re-correrlo** si algo falla a mitad: cada paso borra solo lo que todavía está. Deja
-  una línea en `/var/lib/fluxbee/state/factory-reset.log`.
-- No es `scripts/fluxbee_cleanall.sh`: ese es el borrado **nuclear** del flujo viejo de
-  instalación desde fuentes, que se lleva también la instalación.
+- **Workflows:** they are deleted through their own path. On each hive with SY.wf-rules
+  (motherbee and workers) it calls `wf_rules_delete` with `force`, which deletes the rule, the
+  `WF.*` node, its state and its packages, including the instances in progress. An orphan `WF.*`
+  node, with no workflow, is killed like any user node.
+- **Identity:** since 0.1.34, deleting an ILK or a tenant only **marks** it. The mark is
+  reversible, hides it and leaves its keys reserved. The **purge** is physical and requires the
+  prior mark. The reset does both: mark and purge. The tenants go after the vault, because purging
+  one that has secrets is rejected, and in passes: first the children and then their sponsors.
+- **It does not touch yet:** the user OPA policy (the `opa_clear` action is missing, and so is the
+  router unloading the policy) and the blobs.
+- **It uses the product API** for everything, except the message log, which has no API: its
+  tables are truncated with the consumers stopped.
+- **It is safe to re-run** if something fails midway: each step deletes only what is still there.
+  It leaves a line in `/var/lib/fluxbee/state/factory-reset.log`.
+- It is not `scripts/fluxbee_cleanall.sh`: that is the **nuclear** wipe from the old
+  install-from-source flow, which takes the installation away too.
 
 ---
 
-## 13. Lo que este handbook todavía NO cubre
+## 13. What this handbook does NOT cover yet
 
-Honestidad sobre el alcance — nada de esto se probó:
-- **Publicar y actualizar paquetes de nodo en caliente** (`publish_runtime_package`), distinto del
-  `.deb`. Solo se probó el camino del `.deb`.
-- Segundo hive de trabajo, o multi-hive sobre WAN en esta infraestructura.
-- Backup y restore de motherbee (Postgres + vault).
-- Renovación de certificado end-to-end.
-- Recuperación ante la pérdida de motherbee.
+Honesty about the scope — none of this was tested:
+- **Hot-publishing and updating node packages** (`publish_runtime_package`), as distinct from the
+  `.deb`. Only the `.deb` path was tested.
+- A second work hive, or multi-hive over WAN on this infrastructure.
+- Motherbee backup and restore (Postgres + vault).
+- End-to-end certificate renewal.
+- Recovery from the loss of motherbee.

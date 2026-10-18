@@ -1,27 +1,27 @@
 # Test Nodes Workspace
 
-Este directorio contiene nodos de ejemplo orientados a validar transporte/routing
-real con el SDK, pero escritos para que también sirvan como referencia a equipos
-externos.
+This directory holds example nodes meant to validate real transport/routing
+with the SDK, but written so that they also serve as a reference for external
+teams.
 
-Incluye dos runtimes mí­nimos:
+It includes two minimal runtimes:
 
-- `IO.test`: conecta al router, obtiene/provisiona un ILK temporal opcionalmente
-  y enví­a un mensaje `Resolve`.
-- `AI.test.gov`: actúa como frontdesk simple, recibe el mensaje ruteado por el
-  router y responde con un ack.
+- `IO.test`: connects to the router, optionally gets/provisions a temporary ILK
+  and sends a `Resolve` message.
+- `AI.test.gov`: acts as a simple frontdesk, receives the message routed by the
+  router and answers with an ack.
 
-## Objetivo
+## Goal
 
-Mostrar, con nodos reales y legibles:
+Show, with real and readable nodes:
 
-- cómo construir `NodeConfig` y conectar con `fluxbee_sdk::connect`
-- cómo emitir un mensaje `Resolve`
-- cómo adjuntar `src_ilk` en `meta.src_ilk`
-- cómo responder `NODE_STATUS_GET` con el handler default del SDK
-- cómo observar el auto-routing hacia el frontdesk configurado en `hive.yaml`
+- how to build `NodeConfig` and connect with `fluxbee_sdk::connect`
+- how to emit a `Resolve` message
+- how to attach `src_ilk` in `meta.src_ilk`
+- how to answer `NODE_STATUS_GET` with the SDK's default handler
+- how to observe the auto-routing toward the frontdesk configured in `hive.yaml`
 
-## Estructura
+## Structure
 
 ```text
 nodes/test/
@@ -31,23 +31,23 @@ nodes/test/
 
 ## Build
 
-Desde raí­z del repo:
+From the repo root:
 
 ```bash
 cargo check -p io-test
 cargo check -p ai-test-gov
 ```
 
-## Probar auto-routing de ILK temporal
+## Test the temporary ILK auto-routing
 
-En `/etc/fluxbee/hive.yaml` del hive local:
+In `/etc/fluxbee/hive.yaml` of the local hive:
 
 ```yaml
 government:
   identity_frontdesk: "AI.test.gov@motherbee"
 ```
 
-Reiniciar el router si cambió esa config.
+Restart the router if that config changed.
 
 Terminal 1:
 
@@ -63,61 +63,61 @@ IO_TEST_IDENTITY_TARGET="SY.identity@motherbee" \
 cargo run -p io-test
 ```
 
-Comportamiento esperado:
+Expected behavior:
 
-1. `IO.test` provisiona un ILK temporal si no recibe uno por env.
-2. `IO.test` enví­a un mensaje `Resolve` con `meta.src_ilk`.
-3. El router detecta `registration_status=temporary` y fuerza destino a
-   `AI.test.gov@motherbee` sin entrar a OPA.
-4. `AI.test.gov` registra el mensaje recibido y devuelve un reply simple a
+1. `IO.test` provisions a temporary ILK if it does not get one through env.
+2. `IO.test` sends a `Resolve` message with `meta.src_ilk`.
+3. The router detects `registration_status=temporary` and forces the destination to
+   `AI.test.gov@motherbee` without going through OPA.
+4. `AI.test.gov` logs the received message and sends a simple reply back to
    `IO.test`.
 
-## Nota importante sobre `src_ilk`
+## Important note about `src_ilk`
 
-El contrato canónico ahora es `meta.src_ilk`.
+The canonical contract is now `meta.src_ilk`.
 
-## Contrato de nombre para nodos gestionados
+## Name contract for managed nodes
 
-Para nodos gestionados spawneados por `SY.orchestrator`, el contrato de bootstrap
-de nombre para v1 es:
+For managed nodes spawned by `SY.orchestrator`, the name bootstrap contract
+for v1 is:
 
-- `SY.orchestrator` inyecta `FLUXBEE_NODE_NAME=<node_name@hive>` al proceso
-- el runtime usa ese nombre como identidad canónica al arrancar
-- el `config.json` de la instancia se deriva desde ese nombre con el layout:
+- `SY.orchestrator` injects `FLUXBEE_NODE_NAME=<node_name@hive>` into the process
+- the runtime uses that name as its canonical identity at startup
+- the instance's `config.json` is derived from that name with the layout:
   - `/var/lib/fluxbee/nodes/<KIND>/<node_name@hive>/config.json`
 
-Esto aplica tanto al spawn normal como al relaunch de reboot/reconcile.
+This applies both to the normal spawn and to the reboot/reconcile relaunch.
 
-Ejemplo:
+Example:
 
 ```bash
 FLUXBEE_NODE_NAME="SY.frontdesk.gov@motherbee"
 ```
 
-Para ese caso, el path de instancia esperado es:
+For that case, the expected instance path is:
 
 ```text
 /var/lib/fluxbee/nodes/SY/SY.frontdesk.gov@motherbee/config.json
 ```
 
-### Por qué este contrato
+### Why this contract
 
-- evita duplicar `NODE_NAME` y `NODE_CONFIG` como dos referencias que podrí­an divergir
-- evita depender de argumentos en todos los `start.sh`
-- concentra el cambio en `SY.orchestrator` usando `systemd-run --setenv=...`
-- sirve igual para singleton e instanciado
+- it avoids duplicating `NODE_NAME` and `NODE_CONFIG` as two references that could diverge
+- it avoids depending on arguments in every `start.sh`
+- it concentrates the change in `SY.orchestrator`, using `systemd-run --setenv=...`
+- it works the same for singleton and instanced nodes
 
-### Helper del SDK
+### SDK helper
 
-El SDK ya trae helpers para este contrato:
+The SDK already ships helpers for this contract:
 
 - `fluxbee_sdk::managed_node_name(...)`
-  - toma `FLUXBEE_NODE_NAME` como fuente principal
-  - puede caer a env vars legacy del runtime si hace falta compatibilidad
+  - takes `FLUXBEE_NODE_NAME` as the main source
+  - can fall back to the runtime's legacy env vars if compatibility is needed
 - `fluxbee_sdk::managed_node_config_path(...)`
-  - deriva el `config.json` canónico a partir del `node_name`
+  - derives the canonical `config.json` from the `node_name`
 
-Patrón recomendado en un runtime:
+Recommended pattern in a runtime:
 
 ```rust
 let cfg = NodeConfig {
@@ -130,43 +130,43 @@ let cfg = NodeConfig {
 };
 ```
 
-Notas prácticas:
+Practical notes:
 
-- si el proceso arranca bajo orchestrator, `FLUXBEE_NODE_NAME` deberí­a ganar siempre
-- las env vars legacy (`AI_TEST_NODE_NAME`, `IO_TEST_NODE_NAME`, `GOV_NODE_NAME`) quedan sólo como compatibilidad o uso manual
-- `_system.node_name` dentro de `config.json` sigue siendo la fuente de verdad persistida
+- if the process starts under the orchestrator, `FLUXBEE_NODE_NAME` should always win
+- the legacy env vars (`AI_TEST_NODE_NAME`, `IO_TEST_NODE_NAME`, `GOV_NODE_NAME`) remain only for compatibility or manual use
+- `_system.node_name` inside `config.json` is still the persisted source of truth
 
-## Nota sobre prefijos de nodo y lifecycle
+## Note about node prefixes and lifecycle
 
-Los prefijos funcionales del nombre (`AI.*`, `IO.*`, `WF.*`, `SY.*`, `RT.*`) no
-son lo mismo que la clasificación de lifecycle (`core` vs runtime gestionado).
+The functional prefixes of the name (`AI.*`, `IO.*`, `WF.*`, `SY.*`, `RT.*`) are not
+the same as the lifecycle classification (`core` vs managed runtime).
 
-Ejemplos:
+Examples:
 
-- `AI.*`, `IO.*` y `WF.*` suelen correr como runtimes gestionados publicados
-  en `dist`
-- un nodo `AI.*` puede cumplir un rol muy importante en la arquitectura y aun así­
-  seguir estando en el modelo de runtime gestionado
-- `SY.*` identifica control-plane/core del sistema
-- `RT.gateway` identifica infraestructura base del hive
+- `AI.*`, `IO.*` and `WF.*` usually run as managed runtimes published
+  in `dist`
+- an `AI.*` node can play a very important role in the architecture and still
+  stay in the managed runtime model
+- `SY.*` identifies the system's control-plane/core
+- `RT.gateway` identifies the hive's base infrastructure
 
-Entonces, para v1, la regla operativa no es "AI/IO/WF sí­, resto no".
+So, for v1, the operational rule is not "AI/IO/WF yes, the rest no".
 
-La regla real es:
+The real rule is:
 
-- `SY.*` no entra por spawn gestionado
-- `RT.gateway` no entra por spawn gestionado
-- `AI.*`, `IO.*`, `WF.*` y `RT.<otro>` pueden entrar por el modelo de runtime gestionado publicado
+- `SY.*` does not come in through managed spawn
+- `RT.gateway` does not come in through managed spawn
+- `AI.*`, `IO.*`, `WF.*` and `RT.<other>` can come in through the published managed runtime model
 
-Eso evita mezclar:
+That avoids mixing:
 
-- familia funcional del nodo
-- origen/lifecycle del componente
+- the node's functional family
+- the component's origin/lifecycle
 
-## Probar publish/install completo con CLI
+## Test the full publish/install with the CLI
 
-También hay un E2E operator-style que usa `fluxbee-publish` de punta a punta
-con estos dos nodos:
+There is also an operator-style E2E that uses `fluxbee-publish` end to end
+with these two nodes:
 
 ```bash
 BASE="http://127.0.0.1:8080" \
@@ -176,31 +176,31 @@ TENANT_ID="tnt:<uuid-v4>" \
 bash scripts/identity_test_nodes_publish_e2e.sh
 ```
 
-Ese script:
+That script:
 
-1. compila `fluxbee-publish`, `ai-test-gov` e `io-test`
-2. arma packages `full_runtime` temporales
-3. publica ambos con `--deploy`
-4. espera readiness en `/versions`
-5. spawnea `AI.test.gov` como frontdesk gestionado
-6. spawnea `IO.test` como probe one-shot
-7. valida que el reply vuelva con `HANDLED_BY=AI.test.gov@<hive>`
+1. builds `fluxbee-publish`, `ai-test-gov` and `io-test`
+2. assembles temporary `full_runtime` packages
+3. publishes both with `--deploy`
+4. waits for readiness in `/versions`
+5. spawns `AI.test.gov` as a managed frontdesk
+6. spawns `IO.test` as a one-shot probe
+7. checks that the reply comes back with `HANDLED_BY=AI.test.gov@<hive>`
 
-Nota:
+Note:
 
-- este E2E requiere `TENANT_ID`, porque el frontdesk configurado en `hive.yaml`
-  se spawnea como nodo gestionado y el orchestrator hoy exige `tenant_id` para
-  ese camino de registro identity-aware
+- this E2E requires `TENANT_ID`, because the frontdesk configured in `hive.yaml`
+  is spawned as a managed node and the orchestrator today requires `tenant_id` for
+  that identity-aware registration path
 
-Sirve para verificar el ciclo completo de software:
+It serves to verify the full software cycle:
 
 - package layout
-- install en `dist`
+- install in `dist`
 - update/sync
-- spawn administrado
-- ejecución real del binario publicado
+- managed spawn
+- real execution of the published binary
 
-También quedó validado un E2E para reboot/reconcile de nodos custom gestionados:
+An E2E for reboot/reconcile of managed custom nodes was also validated:
 
 ```bash
 BASE="http://127.0.0.1:8080" \
@@ -210,11 +210,11 @@ TENANT_ID="tnt:<uuid-v4>" \
 bash scripts/custom_node_reboot_reconcile_e2e.sh
 ```
 
-Ese script valida:
+That script validates:
 
-1. publish de runtimes temporales
-2. spawn del frontdesk gestionado usando por default el `government.identity_frontdesk` configurado en `hive.yaml`
+1. publish of temporary runtimes
+2. spawn of the managed frontdesk, using by default the `government.identity_frontdesk` configured in `hive.yaml`
 3. `kill_node`
-4. restart de `sy-orchestrator`
-5. relaunch automático desde `config.json`
-6. probe real posterior con `IO.test`
+4. restart of `sy-orchestrator`
+5. automatic relaunch from `config.json`
+6. a real follow-up probe with `IO.test`

@@ -1,103 +1,103 @@
-# Lab Proxmox — cómo usarlo (operación diaria)
+# Proxmox lab — how to use it (daily operation)
 
-Guía operativa del lab de VMs. Complementa (no duplica):
+Operating guide for the VM lab. It complements (does not duplicate):
 
-- [`docs/packaging-and-build.md`](../docs/packaging-and-build.md) — §3 **agregar un nodo al install**
-  (una línea en `base-nodes.json`), §4 build box / `.deb` / repo apt, §4.4 layout de los 3 servers.
-- [`docs/14-runtime-rollout-motherbee.md`](../docs/14-runtime-rollout-motherbee.md) — **EL runbook**
-  para publicar/actualizar/spawnear un runtime en un backend YA instalado (publish → manifest →
-  `/update` → `/nodes`). No inventar rutas alternativas: es este.
-- [`lab/logbook/METHOD.md`](logbook/METHOD.md) — **método de trabajo sobre infra + PROD**
-  (capacidades del agente, reglas, clasificación de cambios, protocolo de bitácora).
-  **Si el trabajo toca producción, ese doc manda**; la bitácora del día va en `lab/logbook/YYYY-MM-DD.md`.
+- [`docs/packaging-and-build.md`](../docs/packaging-and-build.md) — §3 **adding a node to the install**
+  (one line in `base-nodes.json`), §4 build box / `.deb` / apt repo, §4.4 layout of the 3 servers.
+- [`docs/history/14-runtime-rollout-motherbee.md`](../docs/history/14-runtime-rollout-motherbee.md) — **THE runbook**
+  to publish/update/spawn a runtime on an ALREADY installed backend (publish → manifest →
+  `/update` → `/nodes`). Do not invent alternative routes: it is this one.
+- [`lab/logbook/METHOD.md`](logbook/METHOD.md) — **the working method for infra + PROD**
+  (agent capabilities, rules, change classification, logbook protocol).
+  **If the work touches production, that doc rules**; the day's logbook goes in `lab/logbook/YYYY-MM-DD.md`.
 
-## Mapa (quién es quién)
+## Map (who is who)
 
-| VM | Host Proxmox | Nombre | Rol |
+| VM | Proxmox host | Name | Role |
 |----|--------------|--------|-----|
-| 210 | PC-004-165 | fb-build | **Máquina de COMPILAR** + repo apt `:8900`. Repo en `/opt/fluxbee`. |
-| 240 | PC-004-157 | fbi-mb | Motherbee del hive integrado (admin API `:8080` local). |
-| 241 | PC-004-157 | fbi-worker | Worker (caja limpia, bootstrapeada por MB — sin .deb, sin DB). |
+| 210 | PC-004-165 | fb-build | **The machine for COMPILING** + apt repo `:8900`. Repo in `/opt/fluxbee`. |
+| 240 | PC-004-157 | fbi-mb | Motherbee of the integrated hive (admin API `:8080` local). |
+| 241 | PC-004-157 | fbi-worker | Worker (clean box, bootstrapped by the MB — no .deb, no DB). |
 | 242 | PC-004-157 | fbi-ingress | Ingress (DMZ). |
 | 243 | PC-004-157 | fbi-egress | Egress. |
-| 250/9000 | — | templates | No tocar (clonar, no arrancar). |
-| 271 | PC-004-156 | fbdev-edge | Caja Linux limpia (template 250) para el EDGE de dev: `ingress1` por `add_hive`, `192.168.4.85`. **Join pendiente** (ver bitácora 2026-09-25). |
-| 270 | PC-004-156 | fbdev-mb | Motherbee **instalado con `apt install`** desde el repo de PROD (`192.168.8.180:8900`), `192.168.4.84`. Snapshot `pre-apt-install-20260925` = base limpia para repetir la prueba. |
+| 250/9000 | — | templates | Do not touch (clone, do not start). |
+| 271 | PC-004-156 | fbdev-edge | Clean Linux box (template 250) for the dev EDGE: `ingress1` via `add_hive`, `192.168.4.85`. **Join pending** (see logbook 2026-09-25). |
+| 270 | PC-004-156 | fbdev-mb | Motherbee **installed with `apt install`** from the PROD repo (`192.168.8.180:8900`), `192.168.4.84`. Snapshot `pre-apt-install-20260925` = clean base to repeat the test. |
 
-Los 3 hosts (`PC-004-165/156/157`) forman un cluster: cualquier `PVE_HOST` responde por todos,
-pero **`PVE_NODE` es obligatorio** para operar VMs (indica en qué host vive la VM).
+The 3 hosts (`PC-004-165/156/157`) form a cluster: any `PVE_HOST` answers for all of them,
+but **`PVE_NODE` is mandatory** to operate VMs (it says which host the VM lives on).
 
-## Acceso: `lab/pve.py` (guest-agent, sin SSH)
+## Access: `lab/pve.py` (guest-agent, no SSH)
 
-Todo se opera por la API de Proxmox + qemu-guest-agent (exec/push/pull **como root** dentro de la
-VM). No hay SSH a las VMs para operación de lab.
+Everything is operated through the Proxmox API + qemu-guest-agent (exec/push/pull **as root** inside the
+VM). There is no SSH to the VMs for lab operation.
 
 ```bash
-export PVE_HOST=192.168.4.165          # cualquier host del cluster
-export PVE_TOKEN='<user>@pve!<tokenid>=<secret>'   # token API (pedirlo al operador; NUNCA commitearlo)
+export PVE_HOST=192.168.4.165          # any host in the cluster
+export PVE_TOKEN='<user>@pve!<tokenid>=<secret>'   # API token (ask the operator for it; NEVER commit it)
 
-# VMs de un host
+# VMs of a host
 PVE_NODE=PC-004-157 python3 lab/pve.py list
 
-# Ejecutar dentro de una VM (root)
+# Run inside a VM (root)
 PVE_NODE=PC-004-157 python3 lab/pve.py exec 240 -- 'systemctl is-active sy-orchestrator'
 
-# Copiar archivos local <-> VM
-PVE_NODE=PC-004-165 python3 lab/pve.py pull 210 /ruta/en/vm ./local
-PVE_NODE=PC-004-157 python3 lab/pve.py push 240 ./local /ruta/en/vm
+# Copy files local <-> VM
+PVE_NODE=PC-004-165 python3 lab/pve.py pull 210 /path/in/vm ./local
+PVE_NODE=PC-004-157 python3 lab/pve.py push 240 ./local /path/in/vm
 
-# Snapshot / rollback (antes de algo destructivo)
-PVE_NODE=PC-004-157 python3 lab/pve.py snapshot 240 antes-de-X
-PVE_NODE=PC-004-157 python3 lab/pve.py rollback 240 antes-de-X
+# Snapshot / rollback (before something destructive)
+PVE_NODE=PC-004-157 python3 lab/pve.py snapshot 240 before-X
+PVE_NODE=PC-004-157 python3 lab/pve.py rollback 240 before-X
 ```
 
-Más comandos: docstring de [`lab/pve.py`](pve.py). Gotcha conocida: un carácter por encima de
-U+00FF en un `exec` (`—`, `→`, `✓`) **traba el guest-agent** hasta que se reinicia. No es la
-carga, como se creía ([FINDINGS B-11](logbook/FINDINGS.md)). `pve.py` ya codifica el argv.
+More commands: the docstring of [`lab/pve.py`](pve.py). Known gotcha: a character above
+U+00FF in an `exec` (`—`, `→`, `✓`) **wedges the guest-agent** until it is restarted. It is not the
+load, as was believed ([FINDINGS B-11](logbook/FINDINGS.md)). `pve.py` already encodes the argv.
 
-## Compilar: SIEMPRE en fb-build (VM210)
+## Compiling: ALWAYS on fb-build (VM210)
 
-Acá **no se compila en la Mac ni en el MB**: el build box documentado es fb-build
-(toolchain completo, `source /etc/profile.d/fluxbee-toolchain.sh`, repo en `/opt/fluxbee`).
+Here **nothing is compiled on the Mac or on the MB**: the documented build box is fb-build
+(full toolchain, `source /etc/profile.d/fluxbee-toolchain.sh`, repo in `/opt/fluxbee`).
 
 ```bash
-# Actualizar el repo del build box a la rama pusheada
+# Update the build box's repo to the pushed branch
 PVE_NODE=PC-004-165 python3 lab/pve.py exec 210 -- \
-  'cd /opt/fluxbee && git fetch origin <rama> && git checkout <rama> && git reset --hard origin/<rama>'
+  'cd /opt/fluxbee && git fetch origin <branch> && git checkout <branch> && git reset --hard origin/<branch>'
 
-# Un binario suelto (ej. un runtime IO; el workspace io es aparte)
+# A single binary (e.g. an IO runtime; the io workspace is separate)
 PVE_NODE=PC-004-165 python3 lab/pve.py exec 210 -- \
   'source /etc/profile.d/fluxbee-toolchain.sh; cd /opt/fluxbee && cargo build --release --manifest-path nodes/io/Cargo.toml -p <crate>'
 
-# El .deb completo (lee base-nodes.json; ver docs/packaging-and-build.md §4.2-4.3)
-PVE_NODE=PC-004-165 python3 lab/pve.py exec 210 -- 'bash /root/build2.sh'   # o scripts/make-deb.sh
+# The full .deb (reads base-nodes.json; see docs/packaging-and-build.md §4.2-4.3)
+PVE_NODE=PC-004-165 python3 lab/pve.py exec 210 -- 'bash /root/build2.sh'   # or scripts/make-deb.sh
 ```
 
-## Llevar un runtime nuevo al hive 240 (SIN .deb nuevo)
+## Bringing a new runtime to hive 240 (WITHOUT a new .deb)
 
-Camino canónico = [`docs/14-runtime-rollout-motherbee.md`](../docs/14-runtime-rollout-motherbee.md).
-Resumen para el caso target = el propio motherbee (VM240):
+Canonical path = [`docs/history/14-runtime-rollout-motherbee.md`](../docs/history/14-runtime-rollout-motherbee.md).
+Summary for the case where the target is the motherbee itself (VM240):
 
 ```bash
-# 1. binario: fb-build -> VM240 (pull a local, push a la VM)
+# 1. binary: fb-build -> VM240 (pull to local, push to the VM)
 PVE_NODE=PC-004-165 python3 lab/pve.py pull 210 /opt/fluxbee/nodes/io/target/release/<bin> /tmp/<bin>
 PVE_NODE=PC-004-157 python3 lab/pve.py push 240 /tmp/<bin> /tmp/<bin>
 
-# 2. publish + manifest en el MB (runbook §2-3) — publish-runtime.sh es genérico (--runtime/--binary)
+# 2. publish + manifest on the MB (runbook §2-3) — publish-runtime.sh is generic (--runtime/--binary)
 # 3. POST /hives/motherbee/update category=runtime (runbook §6)
 # 4. POST /hives/motherbee/nodes  {"node_name":"...","runtime":"...","runtime_version":"current","tenant_id":...}  (runbook §7)
-# 5. verificar: unit activa + CONFIG_GET (UNCONFIGURED hasta cargar el secreto en SY.vault)
+# 5. verify: active unit + CONFIG_GET (UNCONFIGURED until the secret is loaded in SY.vault)
 ```
 
-Un nodo del **set base** (`packaging/base-nodes.json`) entra al `.deb` automáticamente
-(`build-deb.sh` lee el manifest — **no se toca el script de build**) y `fluxbee-firstboot` lo
-spawnea en un install desde cero. El canal de runtimes de arriba es para sumarlo a un backend
-que ya está corriendo.
+A node in the **base set** (`packaging/base-nodes.json`) goes into the `.deb` automatically
+(`build-deb.sh` reads the manifest — **the build script is not touched**) and `fluxbee-firstboot`
+spawns it on an install from scratch. The runtimes channel above is for adding it to a backend
+that is already running.
 
-## Reglas
+## Rules
 
-- **Buscar la doc antes de operar** (este archivo + los dos runbooks de arriba). El camino de
-  integrar/publicar nodos YA EXISTE; no crear scripts/rutas accesorias por nodo.
-- Secretos (tokens PVE, keys) van por env/vault — jamás en el repo ni en logs.
-- Solo el MB (240) tiene .deb/DB; workers/ingress/egress son cajas limpias bootstrapeadas por el
-  MB (`add_hive`) — instalar postgres o el .deb en un worker es un bug, no un fix.
+- **Look for the doc before operating** (this file + the two runbooks above). The path to
+  integrate/publish nodes ALREADY EXISTS; do not create side scripts/routes per node.
+- Secrets (PVE tokens, keys) go through env/vault — never in the repo or in logs.
+- Only the MB (240) has the .deb/DB; workers/ingress/egress are clean boxes bootstrapped by the
+  MB (`add_hive`) — installing postgres or the .deb on a worker is a bug, not a fix.

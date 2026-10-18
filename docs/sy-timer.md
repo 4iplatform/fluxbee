@@ -1,55 +1,55 @@
-# SY.timer — Nodo del Sistema
+# SY.timer — System Node
 
-**Estado:** v1.1 implemented / aligned with current runtime
-**Fecha:** 2026-04-13
-**Audiencia:** Desarrolladores de nodos, autores de workflows, ops/SRE
-
----
-
-## 1. Resumen y Posicionamiento
-
-`SY.timer` es un nodo del sistema Fluxbee que provee dos capacidades al resto del hive:
-
-1. **Timers persistentes** — one-shot y recurrentes, con disparo por evento L2 hacia un nodo target.
-2. **Fuente autoritativa de tiempo y timezone** — `now`, conversiones, parse/format, resolución server-side de timezones IANA.
-
-Forma parte de la familia de nodos del sistema, junto con `SY.storage`, `SY.admin`, `SY.architect`, `SY.orchestrator`, `SY.config.routes`, `SY.identity`, `SY.cognition`, `SY.opa.rules`. Se lanza siempre al iniciar el hive, es mantenido por systemd a través del orchestrator, y no requiere configuración por parte del operador más allá de su existencia.
-
-**Uno por hive.** Existe una instancia en motherbee y una en cada worker. Cada instancia es autónoma, no se comunica con otras instancias de `SY.timer`, y delega la sincronización horaria al sistema operativo (NTP/chrony/systemd-timesyncd). La consistencia temporal entre hives es responsabilidad del operador a nivel de host, no de Fluxbee.
-
-**No es un sistema de tiempo real.** `SY.timer` está diseñado para workflows, cognición, agentes y automatización. La granularidad mínima de un timer es **60 segundos**, la precisión de disparo es *best-effort* con tolerancia del orden de segundos, y la carga esperada es de hasta ~10.000 timers concurrentes por hive.
-
-**Ownership estricto por nombre L2 para mutaciones.** Cada nodo puede crear, cancelar y reschedulear sus propios timers. La lectura (`TIMER_GET`, `TIMER_LIST`) es abierta dentro del hive. La única excepción de mutación administrativa es `SY.orchestrator`, que puede invocar `TIMER_PURGE_OWNER` como parte del teardown de un nodo. La identidad efectiva del requester se toma de `routing.src_l2_name`, estampado autoritativamente por el router al entregar el mensaje. `SY.timer` no resuelve ownership por SHM ni por archivos `.uuid`.
+**Status:** v1.1 implemented / aligned with current runtime
+**Date:** 2026-04-13
+**Audience:** Node developers, workflow authors, ops/SRE
 
 ---
 
-## 2. Principios de Diseño
+## 1. Summary and Positioning
 
-- **Autonomía por hive.** Un `SY.timer` por hive, sin sincronización cruzada. Si un host cae, solo se ven afectados los timers locales a ese hive.
-- **Delegación del tiempo al SO.** `SY.timer` no implementa NTP ni sincronización externa. Lee el reloj del SO y confía en que el operador lo mantiene sincronizado.
-- **Fuente única de verdad temporal.** Cualquier nodo que necesite `now()` consistente a nivel hive lo pide a `SY.timer`. No hay cache local, no hay offsets locales: roundtrip por cada llamada, con reintento acotado en el SDK.
-- **Mutación con ownership estricto.** Crear/cancelar/reschedulear mantiene aislamiento por owner L2. La lectura es deliberadamente abierta para observabilidad del hive.
-- **Excepción única y explícita.** `SY.orchestrator` puede purgar todos los timers de un owner al borrar un nodo. Es la única vía por la que un timer puede ser tocado por alguien que no sea su creador.
-- **JSON descriptivo y extensible.** Los nombres de campos son auto-explicativos, los enums son strings legibles, los errores devuelven mensajes humanos además de códigos. Todos los requests aceptan un campo `metadata` libre que `SY.timer` persiste sin interpretar, pensado para que clientes LLM puedan anotar contexto extra (razones, correlaciones, recordatorios humanos) sin romper el schema.
-- **SDK como frontera de abstracción.** Los autores de nodos cliente nunca arman JSON a mano ni resuelven nombres L2. Llaman funciones tipadas del SDK y reciben tipos nativos (`time.Time`, structs). Si cambia el wire format, cambia el SDK, no los nodos.
-- **Determinismo y replayability.** `now()` inyectado vía `SY.timer` permite que nodos como `WF` puedan hacer replay determinístico de su ejecución inyectando respuestas fake en tests. Por eso es crítico que los nodos no usen `time.Now()` del lenguaje para lógica de negocio, sino `SY.timer.Now()`.
+`SY.timer` is a Fluxbee system node that provides two capabilities to the rest of the hive:
+
+1. **Persistent timers** — one-shot and recurring, fired as an L2 event toward a target node.
+2. **Authoritative source of time and timezone** — `now`, conversions, parse/format, server-side resolution of IANA timezones.
+
+It is part of the family of system nodes, together with `SY.storage`, `SY.admin`, `SY.architect`, `SY.orchestrator`, `SY.config.routes`, `SY.identity`, `SY.cognition`, `SY.opa.rules`. It is always launched when the hive starts, it is kept up by systemd through the orchestrator, and it needs no configuration from the operator beyond its existence.
+
+**One per hive.** There is one instance on the motherbee and one on each worker. Each instance is autonomous, does not talk to other `SY.timer` instances, and delegates clock synchronization to the operating system (NTP/chrony/systemd-timesyncd). Time consistency between hives is the operator's responsibility at the host level, not Fluxbee's.
+
+**It is not a real-time system.** `SY.timer` is designed for workflows, cognition, agents and automation. The minimum granularity of a timer is **60 seconds**, the firing precision is *best-effort* with a tolerance in the order of seconds, and the expected load is up to ~10,000 concurrent timers per hive.
+
+**Strict ownership by L2 name for mutations.** Each node can create, cancel and reschedule its own timers. Reading (`TIMER_GET`, `TIMER_LIST`) is open within the hive. The only exception for administrative mutation is `SY.orchestrator`, which can invoke `TIMER_PURGE_OWNER` as part of the teardown of a node. The effective identity of the requester is taken from `routing.src_l2_name`, stamped authoritatively by the router when it delivers the message. `SY.timer` does not resolve ownership through SHM or through `.uuid` files.
 
 ---
 
-## 3. Principio del Sistema: Self-Description (`HELP`)
+## 2. Design Principles
 
-Fluxbee adopta como principio de diseño que **todo nodo debe poder describir sus propias capacidades de forma autodescriptiva**, accesible mediante una operación `HELP` estándar.
+- **Autonomy per hive.** One `SY.timer` per hive, with no cross synchronization. If a host goes down, only the timers local to that hive are affected.
+- **Time delegated to the OS.** `SY.timer` does not implement NTP or external synchronization. It reads the OS clock and trusts that the operator keeps it synchronized.
+- **Single temporal source of truth.** Any node that needs a consistent hive-wide `now()` asks `SY.timer` for it. There is no local cache, there are no local offsets: one roundtrip per call, with bounded retry in the SDK.
+- **Mutation with strict ownership.** Create/cancel/reschedule keeps isolation by L2 owner. Reading is deliberately open for hive observability.
+- **A single, explicit exception.** `SY.orchestrator` can purge all the timers of an owner when it deletes a node. It is the only way a timer can be touched by someone other than its creator.
+- **Descriptive and extensible JSON.** Field names are self-explanatory, enums are readable strings, errors return human messages as well as codes. All requests accept a free `metadata` field that `SY.timer` persists without interpreting it, meant so that LLM clients can annotate extra context (reasons, correlations, human reminders) without breaking the schema.
+- **SDK as the abstraction boundary.** Client node authors never build JSON by hand nor resolve L2 names. They call typed SDK functions and get native types (`time.Time`, structs). If the wire format changes, the SDK changes, not the nodes.
+- **Determinism and replayability.** `now()` injected through `SY.timer` lets nodes like `WF` do a deterministic replay of their execution by injecting fake responses in tests. That is why it is critical that nodes do not use the language's `time.Now()` for business logic, but `SY.timer.Now()`.
 
-El propósito es doble:
+---
 
-1. **Descubrimiento por LLM.** Un agente cognitivo puede preguntarle a un nodo "¿qué sabés hacer?" sin depender de documentación externa.
-2. **Introspección humana.** Un desarrollador o operador puede interrogar un nodo en vivo para ver qué operaciones expone, qué formato de request aceptan, y qué errores pueden devolver.
+## 3. System Principle: Self-Description (`HELP`)
 
-`SY.timer` es el **primer nodo en implementar este principio** de forma puntual, dado que es el primer nodo del sistema con interacción directa desde otros nodos sin pasar por `SY.admin`. La operación se llama `TIMER_HELP` por consistencia con el resto de su familia de verbos, pero cumple el contrato general de `HELP`.
+Fluxbee adopts as a design principle that **every node must be able to describe its own capabilities in a self-describing way**, reachable through a standard `HELP` operation.
 
-### 1.1 Visibilidad mínima vía `SY.admin` en v1
+The purpose is twofold:
 
-En v1, `SY.admin` expone solo una superficie **read-only** y de introspección para `SY.timer`:
+1. **Discovery by LLM.** A cognitive agent can ask a node "what can you do?" without depending on external documentation.
+2. **Human introspection.** A developer or operator can query a live node to see which operations it exposes, which request format they accept, and which errors they can return.
+
+`SY.timer` is the **first node to implement this principle**, in a one-off way, given that it is the first system node with direct interaction from other nodes without going through `SY.admin`. The operation is called `TIMER_HELP` for consistency with the rest of its family of verbs, but it meets the general `HELP` contract.
+
+### 1.1 Minimal visibility through `SY.admin` in v1
+
+In v1, `SY.admin` exposes only a **read-only** and introspection surface for `SY.timer`:
 
 - `timer_help`
 - `timer_get`
@@ -60,31 +60,31 @@ En v1, `SY.admin` expone solo una superficie **read-only** y de introspección p
 - `timer_parse`
 - `timer_format`
 
-Las operaciones owner-bound de mutación siguen fuera de `SY.admin` y se mantienen como uso directo vía SDK:
+The owner-bound mutation operations stay outside `SY.admin` and remain as direct use through the SDK:
 
 - `TIMER_SCHEDULE`
 - `TIMER_SCHEDULE_RECURRING`
 - `TIMER_CANCEL`
 - `TIMER_RESCHEDULE`
 
-`TIMER_GET` y `TIMER_LIST` sí pueden exponerse por `SY.admin` porque la lectura es abierta en v1. La razón para mantener scheduling y mutaciones fuera de admin es arquitectónica: `SY.timer` autoriza esas operaciones por identidad efectiva del requester (`routing.src_l2_name`, estampado por router), y `SY.admin` no actúa como proxy transparente de ownership.
+`TIMER_GET` and `TIMER_LIST` can indeed be exposed through `SY.admin` because reading is open in v1. The reason to keep scheduling and mutations outside admin is architectural: `SY.timer` authorizes those operations by the effective identity of the requester (`routing.src_l2_name`, stamped by the router), and `SY.admin` does not act as a transparent ownership proxy.
 
-Nodos futuros con interacción directa (por ejemplo `WF.*`, capabilities invocables) deben implementar su propia operación `HELP` equivalente. La generalización del protocolo, los campos comunes y el naming se formalizarán en un documento aparte cuando aparezca el segundo o tercer caso.
+Future nodes with direct interaction (for example `WF.*`, invocable capabilities) must implement their own equivalent `HELP` operation. The generalization of the protocol, the common fields and the naming will be formalized in a separate document when the second or third case shows up.
 
 ---
 
-## 4. Arquitectura Interna
+## 4. Internal Architecture
 
 ### 4.1 Stack
 
-- **Lenguaje:** Go
-- **Persistencia:** SQLite embebido (`modernc.org/sqlite` o `mattn/go-sqlite3`)
-- **Timezone data:** `time/tzdata` embebido en binario, con fallback a `/usr/share/zoneinfo` del SO
-- **Cron parser:** `github.com/robfig/cron/v3` (spec estándar, conocida por LLMs)
-- **Scheduler interno:** heap binario ordenado por `fire_at_utc`, protegido por mutex
-- **Runtime:** SDK Go estándar de Fluxbee (`fluxbee-go-sdk`), mismo loop de lectura de socket que el resto de nodos `SY.*`
+- **Language:** Go
+- **Persistence:** embedded SQLite (`modernc.org/sqlite` or `mattn/go-sqlite3`)
+- **Timezone data:** `time/tzdata` embedded in the binary, with a fallback to the OS `/usr/share/zoneinfo`
+- **Cron parser:** `github.com/robfig/cron/v3` (standard spec, known by LLMs)
+- **Internal scheduler:** binary heap ordered by `fire_at_utc`, protected by a mutex
+- **Runtime:** standard Fluxbee Go SDK (`fluxbee-go-sdk`), the same socket read loop as the rest of the `SY.*` nodes
 
-### 4.2 Componentes
+### 4.2 Components
 
 ```
 ┌─────────────────────────────────────────────────────────┐
@@ -93,43 +93,43 @@ Nodos futuros con interacción directa (por ejemplo `WF.*`, capabilities invocab
 │  ┌───────────────┐   ┌────────────────────────────┐   │
 │  │ L2 Dispatcher │   │      Timer Scheduler       │   │
 │  │               │   │                            │   │
-│  │ - recibe msgs │   │  ┌──────────────────────┐ │   │
-│  │ - routea por  │   │  │ Heap in-memory       │ │   │
-│  │   meta.msg    │◄──┤  │ ordenado por fire_at │ │   │
-│  │ - invoca      │   │  └──────────────────────┘ │   │
+│  │ - gets msgs   │   │  ┌──────────────────────┐ │   │
+│  │ - routes by   │   │  │ Heap in-memory       │ │   │
+│  │   meta.msg    │◄──┤  │ sorted by fire_at    │ │   │
+│  │ - invokes     │   │  └──────────────────────┘ │   │
 │  │   handler     │   │                            │   │
 │  └───────┬───────┘   │  ┌──────────────────────┐ │   │
 │          │           │  │ Tick loop            │ │   │
-│          │           │  │ - sleep hasta next   │ │   │
+│          │           │  │ - sleep until next   │ │   │
 │          │           │  │ - fire → publish L2  │ │   │
-│          │           │  │ - lock por timer     │ │   │
+│          │           │  │ - lock per timer     │ │   │
 │          │           │  └──────────────────────┘ │   │
 │          │           └────────────┬───────────────┘   │
 │          │                        │                    │
 │          ▼                        ▼                    │
 │  ┌─────────────────────────────────────────────────┐  │
 │  │              SQLite (timers.db)                 │  │
-│  │  tabla: timers                                  │  │
-│  │  índices: owner, fire_at_utc, status            │  │
+│  │  table: timers                                  │  │
+│  │  indexes: owner, fire_at_utc, status            │  │
 │  └─────────────────────────────────────────────────┘  │
 │                                                         │
 └─────────────────────────────────────────────────────────┘
 ```
 
-### 4.3 Loop de scheduling
+### 4.3 Scheduling loop
 
 ```
-1. Al bootear:
-   - Abrir SQLite en /var/lib/fluxbee/nodes/SY/SY.timer@<hive>/timers.db
-   - Leer TODOS los timers con status = 'pending'
-   - Para cada uno:
-       * Si fire_at_utc < now():
-           - Aplicar missed_policy (fire | drop | fire_if_within)
-       * Si fire_at_utc >= now():
-           - Insertar en heap in-memory
-   - Recomputar próxima instancia de timers recurrentes desde now()
+1. On boot:
+   - Open SQLite at /var/lib/fluxbee/nodes/SY/SY.timer@<hive>/timers.db
+   - Read ALL the timers with status = 'pending'
+   - For each one:
+       * If fire_at_utc < now():
+           - Apply missed_policy (fire | drop | fire_if_within)
+       * If fire_at_utc >= now():
+           - Insert into the in-memory heap
+   - Recompute the next instance of recurring timers from now()
 
-2. Loop de tick:
+2. Tick loop:
    loop {
        next = heap.peek()
        if next == nil:
@@ -139,7 +139,7 @@ Nodos futuros con interacción directa (por ejemplo `WF.*`, capabilities invocab
        for timer in heap.pop_all_due(now()):
            with lock(timer.uuid):
                if timer.status != 'pending':
-                   continue  // cancelado o reprogramado
+                   continue  // canceled or rescheduled
                publish TIMER_FIRED to timer.target
                if timer.is_recurring:
                    compute next fire_at from cron_spec
@@ -149,23 +149,23 @@ Nodos futuros con interacción directa (por ejemplo `WF.*`, capabilities invocab
    }
 ```
 
-### 4.4 Concurrencia
+### 4.4 Concurrency
 
-- Un mutex global por la estructura del heap.
-- Un mutex por timer (sharded map de mutexes por uuid) para serializar el corner case de "reschedule llegando mientras el disparo está en vuelo".
-- Operaciones de SQLite serializadas por el driver (SQLite en modo WAL permite múltiples readers + un writer).
+- One global mutex for the heap structure.
+- One mutex per timer (sharded map of mutexes by uuid) to serialize the corner case of "a reschedule arriving while the fire is in flight".
+- SQLite operations serialized by the driver (SQLite in WAL mode allows multiple readers + one writer).
 
 ---
 
-## 5. Modelo de Datos
+## 5. Data Model
 
-### 5.1 Path del archivo
+### 5.1 File path
 
 ```
 /var/lib/fluxbee/nodes/SY/SY.timer@<hive>/timers.db
 ```
 
-Junto con el resto del estado persistente del nodo (`config.json`, `status_version`, etc.), siguiendo la convención canónica de directorios por nodo del sistema.
+Together with the rest of the node's persistent state (`config.json`, `status_version`, etc.), following the canonical per-node directory convention of the system.
 
 ### 5.2 Schema
 
@@ -177,22 +177,22 @@ CREATE TABLE timers (
     client_ref          TEXT,
     kind                TEXT NOT NULL CHECK(kind IN ('oneshot','recurring')),
 
-    fire_at_utc         INTEGER NOT NULL,  -- unix ms, próximo disparo
-    cron_spec           TEXT,              -- solo si kind='recurring'
-    cron_tz             TEXT,              -- timezone IANA del cron recurrente
+    fire_at_utc         INTEGER NOT NULL,  -- unix ms, next fire
+    cron_spec           TEXT,              -- only if kind='recurring'
+    cron_tz             TEXT,              -- IANA timezone of the recurring cron
 
     missed_policy       TEXT NOT NULL DEFAULT 'fire'
                         CHECK(missed_policy IN ('fire','drop','fire_if_within')),
-    missed_within_ms    INTEGER,           -- solo si missed_policy='fire_if_within'
+    missed_within_ms    INTEGER,           -- only if missed_policy='fire_if_within'
 
-    payload             TEXT NOT NULL,     -- JSON blob, opaco para SY.timer
-    metadata            TEXT,              -- JSON blob libre, opaco
+    payload             TEXT NOT NULL,     -- JSON blob, opaque to SY.timer
+    metadata            TEXT,              -- free JSON blob, opaque
 
     status              TEXT NOT NULL DEFAULT 'pending'
                         CHECK(status IN ('pending','fired','canceled')),
 
-    created_at_utc      INTEGER NOT NULL,  -- unix ms, del reloj del SO; preservado aun si se reschedulea
-    last_fired_at_utc   INTEGER,           -- último disparo (recurrentes)
+    created_at_utc      INTEGER NOT NULL,  -- unix ms, from the OS clock; kept even if rescheduled
+    last_fired_at_utc   INTEGER,           -- last fire (recurring)
     fire_count          INTEGER NOT NULL DEFAULT 0
 );
 
@@ -204,23 +204,23 @@ ON timers(owner_l2_name, client_ref)
 WHERE client_ref IS NOT NULL AND status='pending';
 ```
 
-**Notas:**
-- `created_at_utc` se preserva para siempre, incluso tras reschedules. Sirve para trazabilidad y para decisiones de `fire_if_within` basadas en antigüedad del timer original.
-- `cron_tz` se persiste explícitamente para que el próximo disparo recurrente pueda recomputarse sin perder la timezone de origen.
-- Los timers `fired` (one-shot completados) pueden ser purgados por un GC periódico tras N días (configurable, default 7 días) para evitar que la base crezca indefinidamente.
+**Notes:**
+- `created_at_utc` is kept forever, even after reschedules. It serves traceability and `fire_if_within` decisions based on the age of the original timer.
+- `cron_tz` is persisted explicitly so that the next recurring fire can be recomputed without losing the source timezone.
+- `fired` timers (completed one-shots) can be purged by a periodic GC after N days (configurable, default 7 days) to keep the database from growing indefinitely.
 
 ---
 
-## 6. Transporte
+## 6. Transport
 
 ### 6.1 Envelope
 
-Todos los mensajes siguen el envelope estándar de Fluxbee:
+All messages follow the standard Fluxbee envelope:
 
 ```json
 {
   "routing": {
-    "src": "<uuid-del-nodo-cliente>",
+    "src": "<client-node-uuid>",
     "dst": "SY.timer@<hive>",
     "ttl": 16,
     "trace_id": "<uuid>"
@@ -233,38 +233,38 @@ Todos los mensajes siguen el envelope estándar de Fluxbee:
 }
 ```
 
-- Destino: siempre L2 unicast a `SY.timer@<hive-local>`. El SDK resuelve el nombre automáticamente.
-- `meta.msg_type`: siempre `"system"`.
-- `meta.msg`: uno de los verbos definidos en la sección 7.
-- Respuesta: siempre `meta.msg = "TIMER_RESPONSE"`, con el mismo `trace_id` del request.
+- Destination: always L2 unicast to `SY.timer@<hive-local>`. The SDK resolves the name automatically.
+- `meta.msg_type`: always `"system"`.
+- `meta.msg`: one of the verbs defined in section 7.
+- Response: always `meta.msg = "TIMER_RESPONSE"`, with the same `trace_id` as the request.
 
-### 6.2 Verbos
+### 6.2 Verbs
 
-| Verbo | Propósito |
+| Verb | Purpose |
 |---|---|
-| `TIMER_SCHEDULE` | Crear timer one-shot |
-| `TIMER_SCHEDULE_RECURRING` | Crear timer recurrente (cron) |
-| `TIMER_CANCEL` | Cancelar timer propio por `timer_uuid` o `client_ref` |
-| `TIMER_RESCHEDULE` | Modificar `fire_at` de timer propio pendiente por `timer_uuid` o `client_ref` |
-| `TIMER_GET` | Obtener un timer por `timer_uuid`, o el timer activo propio por `client_ref` |
-| `TIMER_LIST` | Listar timers del hive, opcionalmente filtrados por owner |
-| `TIMER_NOW` | Obtener instante actual en UTC |
-| `TIMER_NOW_IN` | Obtener instante actual en timezone especificada |
-| `TIMER_CONVERT` | Convertir instante entre timezones |
-| `TIMER_PARSE` | Parsear string a instante con timezone |
-| `TIMER_FORMAT` | Formatear instante a string con timezone |
-| `TIMER_PURGE_OWNER` | **Solo SY.orchestrator.** Borrar todos los timers de un owner |
-| `TIMER_HELP` | Introspección de capabilities |
-| `TIMER_RESPONSE` | Respuesta genérica a todos los requests |
-| `TIMER_FIRED` | Evento emitido por `SY.timer` al target cuando vence un timer |
+| `TIMER_SCHEDULE` | Create a one-shot timer |
+| `TIMER_SCHEDULE_RECURRING` | Create a recurring timer (cron) |
+| `TIMER_CANCEL` | Cancel one of the requester's own timers by `timer_uuid` or `client_ref` |
+| `TIMER_RESCHEDULE` | Change the `fire_at` of one of the requester's own pending timers by `timer_uuid` or `client_ref` |
+| `TIMER_GET` | Get a timer by `timer_uuid`, or the requester's own active timer by `client_ref` |
+| `TIMER_LIST` | List the timers of the hive, optionally filtered by owner |
+| `TIMER_NOW` | Get the current instant in UTC |
+| `TIMER_NOW_IN` | Get the current instant in a given timezone |
+| `TIMER_CONVERT` | Convert an instant between timezones |
+| `TIMER_PARSE` | Parse a string into an instant with a timezone |
+| `TIMER_FORMAT` | Format an instant into a string with a timezone |
+| `TIMER_PURGE_OWNER` | **SY.orchestrator only.** Delete all the timers of an owner |
+| `TIMER_HELP` | Introspection of capabilities |
+| `TIMER_RESPONSE` | Generic response to all requests |
+| `TIMER_FIRED` | Event emitted by `SY.timer` to the target when a timer is due |
 
 ---
 
-## 7. Operaciones de Timers
+## 7. Timer Operations
 
 ### 7.1 `TIMER_SCHEDULE`
 
-Crea un timer one-shot. Si llega con `client_ref` y ya existe un timer activo del mismo owner con esa referencia, la operación es idempotente y devuelve el timer existente.
+Creates a one-shot timer. If it comes with a `client_ref` and an active timer of the same owner with that reference already exists, the operation is idempotent and returns the existing timer.
 
 **Request:**
 
@@ -289,26 +289,26 @@ Crea un timer one-shot. Si llega con `client_ref` y ya existe un timer activo de
 }
 ```
 
-**Campos:**
+**Fields:**
 
-| Campo | Obligatorio | Descripción |
+| Field | Required | Description |
 |---|---|---|
-| `fire_at_utc_ms` | sí* | Instante absoluto UTC en ms. Alternativa a `fire_in_ms`. |
-| `fire_in_ms` | sí* | Duración relativa desde `now()`. Alternativa a `fire_at_utc_ms`. |
-| `target_l2_name` | no | Nombre L2 del nodo a notificar. Default: el propio requester, derivado desde `routing.src_l2_name`. |
-| `client_ref` | no | Identificador opcional definido por el cliente. Si se reusa sobre un timer activo del mismo owner, `TIMER_SCHEDULE` devuelve el timer existente en vez de crear otro. |
-| `payload` | no | JSON arbitrario que se incluirá en `TIMER_FIRED.payload.user_payload`. |
-| `missed_policy` | no | `"fire"` (default), `"drop"`, o `"fire_if_within"`. |
-| `missed_within_ms` | condicional | Obligatorio si `missed_policy="fire_if_within"`. |
-| `metadata` | no | JSON libre, opaco para `SY.timer`. |
+| `fire_at_utc_ms` | yes* | Absolute UTC instant in ms. Alternative to `fire_in_ms`. |
+| `fire_in_ms` | yes* | Relative duration from `now()`. Alternative to `fire_at_utc_ms`. |
+| `target_l2_name` | no | L2 name of the node to notify. Default: the requester itself, derived from `routing.src_l2_name`. |
+| `client_ref` | no | Optional identifier defined by the client. If it is reused on an active timer of the same owner, `TIMER_SCHEDULE` returns the existing timer instead of creating another one. |
+| `payload` | no | Arbitrary JSON that will be included in `TIMER_FIRED.payload.user_payload`. |
+| `missed_policy` | no | `"fire"` (default), `"drop"`, or `"fire_if_within"`. |
+| `missed_within_ms` | conditional | Required if `missed_policy="fire_if_within"`. |
+| `metadata` | no | Free JSON, opaque to `SY.timer`. |
 
-*Exactamente uno de `fire_at_utc_ms` / `fire_in_ms`.
+*Exactly one of `fire_at_utc_ms` / `fire_in_ms`.
 
-**Validación:**
+**Validation:**
 
-- `fire_in_ms >= 60000` o equivalentemente `fire_at_utc_ms - now() >= 60000`. Si falla: error `TIMER_BELOW_MINIMUM`.
-- `target_l2_name` debe ser un nombre L2 sintácticamente válido.
-- `cron_spec` no debe aparecer (es `TIMER_SCHEDULE_RECURRING`).
+- `fire_in_ms >= 60000` or, equivalently, `fire_at_utc_ms - now() >= 60000`. If it fails: error `TIMER_BELOW_MINIMUM`.
+- `target_l2_name` must be a syntactically valid L2 name.
+- `cron_spec` must not appear (that is `TIMER_SCHEDULE_RECURRING`).
 
 **Response OK:**
 
@@ -327,7 +327,7 @@ Crea un timer one-shot. Si llega con `client_ref` y ya existe un timer activo de
 
 ### 7.2 `TIMER_SCHEDULE_RECURRING`
 
-Crea un timer recurrente con sintaxis cron estándar.
+Creates a recurring timer with standard cron syntax.
 
 **Request:**
 
@@ -346,19 +346,19 @@ Crea un timer recurrente con sintaxis cron estándar.
 }
 ```
 
-**Campos adicionales:**
+**Additional fields:**
 
-| Campo | Obligatorio | Descripción |
+| Field | Required | Description |
 |---|---|---|
-| `cron_spec` | sí | Expresión cron estándar (5 campos: min hr dom mon dow). |
-| `cron_tz` | no | Timezone IANA para interpretar el cron. Default: `UTC`. |
+| `cron_spec` | yes | Standard cron expression (5 fields: min hr dom mon dow). |
+| `cron_tz` | no | IANA timezone to interpret the cron. Default: `UTC`. |
 
-**Validación:**
-- `cron_spec` debe parsear correctamente. Error `TIMER_INVALID_CRON`.
-- Intervalo entre disparos debe ser `>= 60s`. Error `TIMER_BELOW_MINIMUM`.
-- `cron_tz` debe ser una zona IANA válida. Error `TIMER_INVALID_TIMEZONE`.
+**Validation:**
+- `cron_spec` must parse correctly. Error `TIMER_INVALID_CRON`.
+- The interval between fires must be `>= 60s`. Error `TIMER_BELOW_MINIMUM`.
+- `cron_tz` must be a valid IANA zone. Error `TIMER_INVALID_TIMEZONE`.
 
-**Response OK:** igual que `TIMER_SCHEDULE`, con el `fire_at_utc_ms` del **próximo** disparo computado y `already_existed` indicando si el timer activo ya existía para ese `client_ref`.
+**Response OK:** same as `TIMER_SCHEDULE`, with the `fire_at_utc_ms` of the computed **next** fire and `already_existed` saying whether the active timer already existed for that `client_ref`.
 
 ### 7.3 `TIMER_CANCEL`
 
@@ -369,7 +369,7 @@ Crea un timer recurrente con sintaxis cron estándar.
 }
 ```
 
-También puede invocarse con:
+It can also be invoked with:
 
 ```json
 {
@@ -378,13 +378,13 @@ También puede invocarse con:
 }
 ```
 
-Si vienen ambos campos, `timer_uuid` gana.
+If both fields come, `timer_uuid` wins.
 
-Validación: el `owner_l2_name` del timer debe coincidir con `routing.src_l2_name` para verbos de mutación. Si no: `TIMER_NOT_OWNER`.
+Validation: the `owner_l2_name` of the timer must match `routing.src_l2_name` for mutation verbs. If not: `TIMER_NOT_OWNER`.
 
-Si el timer ya fue disparado (`status = 'fired'`): `TIMER_ALREADY_FIRED`.
-- Por `timer_uuid`, si no existe: `TIMER_NOT_FOUND`.
-- Por `client_ref`, si no existe un timer activo del requester: respuesta `ok=true, found=false`.
+If the timer has already fired (`status = 'fired'`): `TIMER_ALREADY_FIRED`.
+- By `timer_uuid`, if it does not exist: `TIMER_NOT_FOUND`.
+- By `client_ref`, if there is no active timer of the requester: response `ok=true, found=false`.
 
 **Response OK:**
 ```json
@@ -401,7 +401,7 @@ Si el timer ya fue disparado (`status = 'fired'`): `TIMER_ALREADY_FIRED`.
 
 ### 7.4 `TIMER_RESCHEDULE`
 
-Modifica el `fire_at` de un timer one-shot pendiente.
+Changes the `fire_at` of a pending one-shot timer.
 
 ```json
 {
@@ -413,9 +413,9 @@ Modifica el `fire_at` de un timer one-shot pendiente.
 }
 ```
 
-Alternativamente, `new_fire_in_ms` relativo a `now()`.
+Alternatively, `new_fire_in_ms` relative to `now()`.
 
-También puede identificar el timer por `client_ref` del owner activo:
+It can also identify the timer by the `client_ref` of the active owner:
 
 ```json
 {
@@ -427,9 +427,9 @@ También puede identificar el timer por `client_ref` del owner activo:
 }
 ```
 
-Validación: mismo ownership check. Solo aplica a timers en `status='pending'`. Para timers recurrentes no se permite reschedule en v1 (cancelar y recrear). Error `TIMER_RECURRING_NOT_RESCHEDULABLE`.
+Validation: the same ownership check. It only applies to timers in `status='pending'`. For recurring timers, reschedule is not allowed in v1 (cancel and recreate). Error `TIMER_RECURRING_NOT_RESCHEDULABLE`.
 
-El mínimo de 60s se aplica al `new_fire_at` también.
+The 60s minimum applies to the `new_fire_at` too.
 
 ### 7.5 `TIMER_GET`
 
@@ -440,7 +440,7 @@ El mínimo de 60s se aplica al `new_fire_at` también.
 }
 ```
 
-También puede consultarse el timer activo propio por `client_ref`:
+The requester's own active timer can also be queried by `client_ref`:
 
 ```json
 {
@@ -477,13 +477,13 @@ También puede consultarse el timer activo propio por `client_ref`:
 }
 ```
 
-Lectura por `timer_uuid`: abierta dentro del hive. No requiere ownership del requester.
+Read by `timer_uuid`: open within the hive. It does not require ownership by the requester.
 
-Lectura por `client_ref`: owner-scoped. `SY.timer` busca solo dentro de `(routing.src_l2_name, client_ref)` y devuelve `TIMER_NOT_FOUND` si no existe un timer activo del requester con esa referencia.
+Read by `client_ref`: owner-scoped. `SY.timer` searches only within `(routing.src_l2_name, client_ref)` and returns `TIMER_NOT_FOUND` if there is no active timer of the requester with that reference.
 
 ### 7.6 `TIMER_LIST`
 
-Lista timers del hive local. Sin parámetros = todos los `pending`. Puede filtrarse por `owner_l2_name`.
+Lists the timers of the local hive. No parameters = all the `pending` ones. It can be filtered by `owner_l2_name`.
 
 ```json
 {
@@ -496,11 +496,11 @@ Lista timers del hive local. Sin parámetros = todos los `pending`. Puede filtra
 }
 ```
 
-| Campo | Descripción |
+| Field | Description |
 |---|---|
-| `owner_l2_name` | Filtro opcional por owner canónico L2. |
-| `status_filter` | `"pending"`, `"fired"`, `"canceled"`, o `"all"` (default `"pending"`). |
-| `limit` | Máximo de resultados. Default 100, máximo 1000. |
+| `owner_l2_name` | Optional filter by canonical L2 owner. |
+| `status_filter` | `"pending"`, `"fired"`, `"canceled"`, or `"all"` (default `"pending"`). |
+| `limit` | Maximum number of results. Default 100, maximum 1000. |
 
 **Response:**
 ```json
@@ -514,11 +514,11 @@ Lista timers del hive local. Sin parámetros = todos los `pending`. Puede filtra
 }
 ```
 
-`owner_l2_name` es opcional. Si se omite, `SY.timer` lista el conjunto completo del hive sujeto a `status_filter` y `limit`.
+`owner_l2_name` is optional. If it is omitted, `SY.timer` lists the full set of the hive, subject to `status_filter` and `limit`.
 
-### 7.7 `TIMER_PURGE_OWNER` (uso exclusivo de `SY.orchestrator`)
+### 7.7 `TIMER_PURGE_OWNER` (exclusive use of `SY.orchestrator`)
 
-Borra **todos los timers** de un `owner_l2_name` dado.
+Deletes **all the timers** of a given `owner_l2_name`.
 
 ```json
 {
@@ -529,12 +529,12 @@ Borra **todos los timers** de un `owner_l2_name` dado.
 }
 ```
 
-**Autorización:** `SY.timer` valida que `routing.src` corresponda al nombre L2 `SY.orchestrator@<hive-local>`. Cualquier otro origen: error `TIMER_FORBIDDEN`.
+**Authorization:** `SY.timer` checks that `routing.src` corresponds to the L2 name `SY.orchestrator@<hive-local>`. Any other origin: error `TIMER_FORBIDDEN`.
 
-**Semántica:**
-- Borrado idempotente: si no hay timers, responde `ok` con `deleted_count: 0`.
-- Borra tanto `pending` como históricos (`fired`, `canceled`) — consistente con el espíritu de "el nodo ya no existe".
-- Silenciosa: no emite `TIMER_FIRED` para los timers pendientes borrados, se consideran cancelados.
+**Semantics:**
+- Idempotent deletion: if there are no timers, it answers `ok` with `deleted_count: 0`.
+- It deletes both `pending` and historical timers (`fired`, `canceled`) — consistent with the spirit of "the node no longer exists".
+- Silent: it does not emit `TIMER_FIRED` for the deleted pending timers; they are considered canceled.
 
 **Response:**
 ```json
@@ -548,9 +548,9 @@ Borra **todos los timers** de un `owner_l2_name` dado.
 }
 ```
 
-### 7.8 Evento `TIMER_FIRED`
+### 7.8 `TIMER_FIRED` event
 
-Emitido por `SY.timer` hacia el `target_l2_name` cuando un timer vence.
+Emitted by `SY.timer` toward the `target_l2_name` when a timer is due.
 
 ```json
 {
@@ -558,7 +558,7 @@ Emitido por `SY.timer` hacia el `target_l2_name` cuando un timer vence.
     "src": "SY.timer@<hive>",
     "dst": "WF.onboarding.step2@motherbee",
     "ttl": 16,
-    "trace_id": "<nuevo-uuid>"
+    "trace_id": "<new-uuid>"
   },
   "meta": {
     "msg_type": "system",
@@ -584,20 +584,20 @@ Emitido por `SY.timer` hacia el `target_l2_name` cuando un timer vence.
 }
 ```
 
-**Notas de diseño:**
-- `trace_id` es nuevo, no reutiliza el del `TIMER_SCHEDULE` original. Esto permite trazar el disparo como un evento independiente.
-- `scheduled_fire_at_utc_ms` vs `actual_fire_at_utc_ms` permite al consumidor medir el jitter real.
-- En v1, `actual_fire_at_utc_ms` se captura inmediatamente antes del intento de envío del evento, no después de confirmar una escritura exitosa del socket.
-- `is_last_fire` para recurrentes que tienen algún criterio de terminación (v1 siempre `false` para recurrentes; reservado para v2).
-- `user_payload` es exactamente lo que el cliente pasó en el `TIMER_SCHEDULE.payload.payload`, sin modificar.
-- `metadata` también se devuelve tal cual, para que el consumidor pueda tener el contexto que el creador dejó.
-- El target NO debe responder con `TIMER_RESPONSE`. `TIMER_FIRED` es fire-and-forget; si el target está caído, el evento se pierde. Si hace falta retry, es responsabilidad del creador del timer diseñar esa semántica en su lógica de aplicación.
-- `SY.timer` considera el disparo intentado cuando entrega el mensaje al router local; no espera ack aplicativo ni confirmación del target.
-- En v1 no existe dead-letter queue ni retry automático de `TIMER_FIRED`. La durabilidad sigue viviendo en la fila del timer y en los logs del nodo.
+**Design notes:**
+- `trace_id` is new; it does not reuse the one of the original `TIMER_SCHEDULE`. This lets the fire be traced as an independent event.
+- `scheduled_fire_at_utc_ms` vs `actual_fire_at_utc_ms` lets the consumer measure the real jitter.
+- In v1, `actual_fire_at_utc_ms` is captured right before the attempt to send the event, not after confirming a successful socket write.
+- `is_last_fire` is for recurring timers that have some termination criterion (in v1 always `false` for recurring timers; reserved for v2).
+- `user_payload` is exactly what the client passed in `TIMER_SCHEDULE.payload.payload`, unmodified.
+- `metadata` is also returned as is, so that the consumer can have the context the creator left.
+- The target must NOT answer with `TIMER_RESPONSE`. `TIMER_FIRED` is fire-and-forget; if the target is down, the event is lost. If a retry is needed, it is the timer creator's responsibility to design that semantics in its application logic.
+- `SY.timer` considers the fire attempted when it hands the message to the local router; it does not wait for an application ack or for confirmation from the target.
+- In v1 there is no dead-letter queue nor automatic retry of `TIMER_FIRED`. Durability still lives in the timer row and in the node logs.
 
 ---
 
-## 8. Operaciones de Tiempo
+## 8. Time Operations
 
 ### 8.1 `TIMER_NOW`
 
@@ -643,7 +643,7 @@ Emitido por `SY.timer` hacia el `target_l2_name` cuando un timer vence.
 
 ### 8.3 `TIMER_CONVERT`
 
-Convierte un instante a la representación local de un timezone.
+Converts an instant into the local representation of a timezone.
 
 ```json
 {
@@ -682,7 +682,7 @@ Convierte un instante a la representación local de un timezone.
 }
 ```
 
-Usa el formato de layout de Go (`2006-01-02 15:04:05`). El SDK puede proveer helpers con layouts conocidos (ISO8601, RFC3339).
+It uses the Go layout format (`2006-01-02 15:04:05`). The SDK can provide helpers with known layouts (ISO8601, RFC3339).
 
 **Response:**
 ```json
@@ -720,15 +720,15 @@ Usa el formato de layout de Go (`2006-01-02 15:04:05`). El SDK puede proveer hel
 }
 ```
 
-### 8.6 Nota sobre costo de roundtrip
+### 8.6 Note on the roundtrip cost
 
-Todas las operaciones de tiempo hacen roundtrip L2 a `SY.timer`. El SDK implementa reintento con backoff (3 intentos, 100ms/300ms/1s) y falla ruidosamente si no obtiene respuesta. **No hay cache local ni sincronización de offset.** Si un nodo necesita medir duraciones finas, debe usar el reloj monotónico local del proceso, no `TIMER_NOW`. La regla: *tiempo del mundo real autoritativo vía `SY.timer`, mediciones monotónicas locales con el reloj del proceso*.
+All time operations do an L2 roundtrip to `SY.timer`. The SDK implements retry with backoff (3 attempts, 100ms/300ms/1s) and fails loudly if it gets no response. **There is no local cache nor offset synchronization.** If a node needs to measure fine durations, it must use the process's local monotonic clock, not `TIMER_NOW`. The rule: *authoritative real-world time through `SY.timer`, local monotonic measurements with the process clock*.
 
 ---
 
 ## 9. `TIMER_HELP`
 
-Devuelve un descriptor completo de las capabilities del nodo, pensado para consumo tanto humano como LLM.
+Returns a complete descriptor of the node's capabilities, meant for both human and LLM consumption.
 
 ```json
 { "meta": { "msg": "TIMER_HELP" }, "payload": {} }
@@ -764,82 +764,82 @@ Devuelve un descriptor completo de las capabilities del nodo, pensado para consu
 }
 ```
 
-El contenido completo del `TIMER_HELP` se genera a partir de los descriptores internos del nodo y se mantiene sincronizado con la implementación real (no hay riesgo de documentación desfasada).
+The full content of `TIMER_HELP` is generated from the node's internal descriptors and is kept in sync with the real implementation (there is no risk of stale documentation).
 
 ---
 
-## 10. Semántica de Missed Policies
+## 10. Missed Policies Semantics
 
-Cuando `SY.timer` arranca tras un downtime, evalúa cada timer pendiente contra `now()`:
+When `SY.timer` starts after a downtime, it evaluates each pending timer against `now()`:
 
-| Política | Timer vencido | Timer vigente |
+| Policy | Overdue timer | Not yet due timer |
 |---|---|---|
-| `fire` | Se dispara inmediatamente en orden. | Se reprograma con `fire_at` original. |
-| `drop` | Se descarta, loggeo a nivel `warn`. | Se reprograma normalmente. |
-| `fire_if_within` | Si `now() - fire_at_utc <= missed_within_ms`, se dispara. Si no, se descarta. | Se reprograma normalmente. |
+| `fire` | It fires immediately, in order. | It is rescheduled with the original `fire_at`. |
+| `drop` | It is discarded, logged at `warn` level. | It is rescheduled normally. |
+| `fire_if_within` | If `now() - fire_at_utc <= missed_within_ms`, it fires. If not, it is discarded. | It is rescheduled normally. |
 
-Para **timers recurrentes**, el comportamiento al restart es:
-- Se computa la **próxima instancia** desde `now()` hacia adelante según `cron_spec`.
-- Las instancias que deberían haberse disparado durante el downtime **no se disparan retroactivamente**, independientemente de la `missed_policy`. Esto evita tormentas de disparos al volver de downtimes largos.
-- La `missed_policy` para recurrentes se interpreta solo sobre la **instancia actual** (la que estaba próxima a dispararse al momento del bajón).
+For **recurring timers**, the behavior on restart is:
+- The **next instance** is computed from `now()` onward according to `cron_spec`.
+- The instances that should have fired during the downtime **do not fire retroactively**, regardless of the `missed_policy`. This avoids firing storms when coming back from long downtimes.
+- The `missed_policy` for recurring timers is interpreted only on the **current instance** (the one that was about to fire at the moment of the outage).
 
 ---
 
-## 11. Semántica de Restart — Detalle
+## 11. Restart Semantics — Detail
 
-Al arranque del nodo:
+At node startup:
 
-1. Abrir `timers.db`. Si no existe, crear schema.
+1. Open `timers.db`. If it does not exist, create the schema.
 2. `now = time.Now().UTC().UnixMilli()`.
 3. `SELECT * FROM timers WHERE status='pending' ORDER BY fire_at_utc ASC`.
-4. Para cada timer:
-   - Si `fire_at_utc <= now`:
-     - Aplicar `missed_policy`.
-     - Si se dispara: publicar `TIMER_FIRED`, actualizar `status` y `fire_count` en DB, y si es recurrente computar próxima instancia.
-     - Si se descarta: loggear, actualizar `status='canceled'` con razón `missed_dropped` en logs (no es un campo del schema).
-   - Si `fire_at_utc > now`:
-     - Insertar en heap in-memory con el mismo `fire_at_utc`. **No se modifica el `fire_at_utc`** — ya es el instante absoluto objetivo, y el heap lo dispara cuando el reloj del SO llegue a ese valor.
-5. Para timers recurrentes, recomputar `fire_at_utc` desde `now()` con `cron_spec` y `cron_tz`, update DB, push a heap.
-6. Ejecutar GC opcional: `DELETE FROM timers WHERE status IN ('fired','canceled') AND last_fired_at_utc < now - retention_ms`.
-7. Iniciar loop de tick.
+4. For each timer:
+   - If `fire_at_utc <= now`:
+     - Apply `missed_policy`.
+     - If it fires: publish `TIMER_FIRED`, update `status` and `fire_count` in the DB, and if it is recurring, compute the next instance.
+     - If it is discarded: log it, update `status='canceled'` with the reason `missed_dropped` in the logs (it is not a schema field).
+   - If `fire_at_utc > now`:
+     - Insert it into the in-memory heap with the same `fire_at_utc`. **The `fire_at_utc` is not modified** — it is already the absolute target instant, and the heap fires it when the OS clock reaches that value.
+5. For recurring timers, recompute `fire_at_utc` from `now()` with `cron_spec` and `cron_tz`, update the DB, push to the heap.
+6. Run the optional GC: `DELETE FROM timers WHERE status IN ('fired','canceled') AND last_fired_at_utc < now - retention_ms`.
+7. Start the tick loop.
 
-**Garantía:** un timer creado con `fire_at_utc = T` disparará a tiempo `T` del reloj del SO, sujeto a disponibilidad del nodo y a su `missed_policy`. No hay drift acumulado.
+**Guarantee:** a timer created with `fire_at_utc = T` will fire at time `T` of the OS clock, subject to the node's availability and to its `missed_policy`. There is no accumulated drift.
 
 ---
 
-## 12. Autorización y Ownership
+## 12. Authorization and Ownership
 
-### 12.1 Regla general
+### 12.1 General rule
 
-Para `TIMER_CANCEL`, `TIMER_RESCHEDULE`:
+For `TIMER_CANCEL`, `TIMER_RESCHEDULE`:
 ```
 if timer.owner_l2_name != sender_l2_name(routing.src):
     return error TIMER_NOT_OWNER
 ```
 
-Para `TIMER_GET`:
+For `TIMER_GET`:
 ```
 read timer by uuid without ownership restriction
 ```
 
-Para `TIMER_LIST`:
+For `TIMER_LIST`:
 ```
 query: optional WHERE owner_l2_name = <owner_l2_name>
 ```
 
-### 12.2 Excepción única
+### 12.2 The single exception
 
-Para `TIMER_PURGE_OWNER`:
+For `TIMER_PURGE_OWNER`:
 ```
 if sender_l2_name(routing.src) != "SY.orchestrator@<local-hive>":
     return error TIMER_FORBIDDEN
 ```
 
-La validación se hace por nombre L2 del sender, resolviendo `routing.src` (UUID L1) a través del runtime/SDK Go y confiando en la capa L2 del router para la integridad de esa identidad. Esto es consistente con el modelo de autorización del resto de nodos del sistema.
+The check is done by the L2 name of the sender, resolving `routing.src` (L1 UUID) through the Go runtime/SDK and trusting the router's L2 layer for the integrity of that identity. This is consistent with the authorization model of the rest of the system nodes.
 
-En v1 actual, esa resolución en Go toma el `router_name` recibido en el `ANNOUNCE`, lee `state/<router_l2_name>/identity.yaml` para ubicar el `shm.name`, abre esa router SHM en modo read-only y resuelve `uuid -> L2` desde la tabla viva de nodos conectados a ese router.
+In the current v1, that resolution in Go takes the `router_name` received in the `ANNOUNCE`, reads `state/<router_l2_name>/identity.yaml` to locate the `shm.name`, opens that router SHM in read-only mode and resolves `uuid -> L2` from the live table of nodes connected to that router.
 
-### 12.3 Flujo de borrado de nodo
+### 12.3 Node deletion flow
 
 ```
 SY.admin (HTTP request)
@@ -849,18 +849,18 @@ SY.admin (HTTP request)
     │       ├─► SY.timer: TIMER_PURGE_OWNER { owner_l2_name: "WF.foo@hive" }
     │       │       └─► TIMER_RESPONSE { ok: true, deleted_count: N }
     │       │
-    │       ├─► kill process del nodo
-    │       ├─► cleanup de /var/lib/fluxbee/nodes/.../
-    │       └─► unregister de identity
+    │       ├─► kill the node's process
+    │       ├─► cleanup of /var/lib/fluxbee/nodes/.../
+    │       └─► unregister from identity
     │
-    └─◄ respuesta HTTP
+    └─◄ HTTP response
 ```
 
-El orchestrator debe llamar a `TIMER_PURGE_OWNER` **antes** de matar el proceso del nodo, para evitar la condición de carrera donde el nodo recibe un `TIMER_FIRED` justo mientras está siendo terminado. Si `SY.timer` está caído en ese momento, el orchestrator debe proceder con el borrado igualmente y loggear el fallo; los timers huérfanos serán descartados naturalmente cuando sus eventos `TIMER_FIRED` no encuentren target (y eventualmente podrán ser limpiados manualmente).
+The orchestrator must call `TIMER_PURGE_OWNER` **before** it kills the node's process, to avoid the race condition where the node gets a `TIMER_FIRED` right while it is being terminated. If `SY.timer` is down at that moment, the orchestrator must go ahead with the deletion anyway and log the failure; the orphaned timers will be discarded naturally when their `TIMER_FIRED` events find no target (and eventually they can be cleaned up manually).
 
-### 12.4 Migración de schema v1.0 → v1.1
+### 12.4 Schema migration v1.0 → v1.1
 
-La extensión v1.1 es **completamente backward compatible**. No se eliminan ni modifican columnas ni verbos existentes. El único cambio de schema es la adición de un índice único parcial:
+The v1.1 extension is **fully backward compatible**. No existing columns or verbs are removed or modified. The only schema change is the addition of a partial unique index:
 
 ```sql
 CREATE UNIQUE INDEX idx_timers_owner_clientref_pending
@@ -868,9 +868,9 @@ ON timers(owner_l2_name, client_ref)
 WHERE client_ref IS NOT NULL AND status = 'pending';
 ```
 
-Este índice se crea automáticamente en el arranque si `PRAGMA user_version` es menor a 2. Los clientes v1.0 que no pasen `client_ref` siguen funcionando sin ningún cambio.
+This index is created automatically at startup if `PRAGMA user_version` is lower than 2. v1.0 clients that do not pass `client_ref` keep working without any change.
 
-**Check previo recomendado antes de deployar v1.1 sobre una DB existente:**
+**Recommended pre-check before deploying v1.1 on an existing DB:**
 
 ```sql
 SELECT owner_l2_name, client_ref, COUNT(*)
@@ -880,57 +880,57 @@ GROUP BY owner_l2_name, client_ref
 HAVING COUNT(*) > 1;
 ```
 
-Si esta query no devuelve filas, la migración procede sin fricción. Si devuelve filas, hay duplicados de `client_ref` activos que no deberían existir en un uso normal de v1.0 (donde `client_ref` era solo metadata decorativa); revisarlos manualmente antes de continuar. El nodo falla con error explícito si el índice no puede crearse.
+If this query returns no rows, the migration proceeds without friction. If it returns rows, there are active `client_ref` duplicates that should not exist in normal v1.0 use (where `client_ref` was only decorative metadata); review them manually before continuing. The node fails with an explicit error if the index cannot be created.
 
 ---
 
-## 13. Sintaxis Cron Soportada
+## 13. Supported Cron Syntax
 
-`SY.timer` usa cron estándar de 5 campos: `minuto hora dia-del-mes mes dia-de-semana`.
+`SY.timer` uses standard 5-field cron: `minute hour day-of-month month day-of-week`.
 
-| Campo | Rango | Especiales |
+| Field | Range | Special |
 |---|---|---|
-| minuto | 0-59 | `*`, `,`, `-`, `/` |
-| hora | 0-23 | idem |
-| dia del mes | 1-31 | idem, `?` |
-| mes | 1-12 o JAN-DEC | idem |
-| dia de semana | 0-6 o SUN-SAT | idem |
+| minute | 0-59 | `*`, `,`, `-`, `/` |
+| hour | 0-23 | same |
+| day of month | 1-31 | same, `?` |
+| month | 1-12 or JAN-DEC | same |
+| day of week | 0-6 or SUN-SAT | same |
 
-**Ejemplos comunes:**
+**Common examples:**
 
-| Cron | Significado |
+| Cron | Meaning |
 |---|---|
-| `*/5 * * * *` | Cada 5 minutos |
-| `0 * * * *` | Cada hora en punto |
-| `0 9 * * MON` | Lunes a las 9:00 |
-| `0 0 1 * *` | Primer día del mes a medianoche |
-| `30 14 * * 1-5` | Lunes a viernes a las 14:30 |
+| `*/5 * * * *` | Every 5 minutes |
+| `0 * * * *` | Every hour on the hour |
+| `0 9 * * MON` | Mondays at 9:00 |
+| `0 0 1 * *` | First day of the month at midnight |
+| `30 14 * * 1-5` | Monday to Friday at 14:30 |
 
-**No soportado en v1:**
-- Campos de segundos (cron de 6 campos)
-- Descriptores especiales tipo `@reboot`, `@yearly`
-- Expresiones de intervalo tipo `every 5m` (reservado para v2 si aparece demanda)
+**Not supported in v1:**
+- Seconds fields (6-field cron)
+- Special descriptors like `@reboot`, `@yearly`
+- Interval expressions like `every 5m` (reserved for v2 if demand shows up)
 
 ---
 
-## 14. SDK Go
+## 14. Go SDK
 
-El SDK Go de Fluxbee expone un módulo `timer` que encapsula toda la interacción con `SY.timer`. El autor del nodo cliente nunca ve JSON.
+The Fluxbee Go SDK exposes a `timer` module that wraps all the interaction with `SY.timer`. The author of the client node never sees JSON.
 
-### 14.1 Patrón recomendado de uso directo
+### 14.1 Recommended direct-use pattern
 
-Para nodos `WF.*`, `AI.*`, `IO.*` y futuros nodos Go, el patrón recomendado es:
+For `WF.*`, `AI.*`, `IO.*` nodes and future Go nodes, the recommended pattern is:
 
-1. conectarse al router con `fluxbee-go-sdk`
-2. construir un `TimerClient` sobre el `NodeSender`
-3. usar métodos tipados del cliente para tiempo, scheduling y lectura
-4. procesar `TIMER_FIRED` como mensaje `system` normal en el handler del nodo
+1. connect to the router with `fluxbee-go-sdk`
+2. build a `TimerClient` on top of the `NodeSender`
+3. use the client's typed methods for time, scheduling and reading
+4. process `TIMER_FIRED` as a normal `system` message in the node's handler
 
-En v1 este es el camino primario de integración. `SY.admin` aporta visibilidad read-only y utilidades de tiempo, pero la semántica owner-bound de scheduling y mutaciones sigue siendo de uso directo por SDK.
+In v1 this is the primary integration path. `SY.admin` adds read-only visibility and time utilities, but the owner-bound semantics of scheduling and mutations remain direct SDK use.
 
-**Nota de transporte:** el `fluxbee-go-sdk` emite estas requests directas como `system` unicast local con TTL default `1`, porque el destino esperado es siempre el `SY.timer@<hive-local>` del mismo hive. Los ejemplos de envelope en esta spec son ilustrativos del shape; el contrato canónico para clientes SDK queda fijado además por los golden tests del SDK.
+**Transport note:** the `fluxbee-go-sdk` emits these direct requests as local unicast `system` with a default TTL of `1`, because the expected destination is always the `SY.timer@<hive-local>` of the same hive. The envelope examples in this spec illustrate the shape; the canonical contract for SDK clients is also fixed by the SDK's golden tests.
 
-Ejemplo mínimo:
+Minimal example:
 
 ```go
 sender, receiver, err := sdk.Connect(sdk.NodeConfig{
@@ -964,35 +964,35 @@ _ = timerID
 _ = receiver
 ```
 
-### 14.2 Firmas principales
+### 14.2 Main signatures
 
 ```go
 package timer
 
-// Constantes del SDK
+// SDK constants
 const MinDuration = 60 * time.Second
 
-// --- Tiempo ---
+// --- Time ---
 func Now(ctx context.Context) (time.Time, error)
 func NowIn(ctx context.Context, tz string) (time.Time, error)
 func Convert(ctx context.Context, instant time.Time, toTz string) (time.Time, error)
 func Parse(ctx context.Context, input, layout, tz string) (time.Time, error)
 func Format(ctx context.Context, instant time.Time, layout, tz string) (string, error)
 
-// --- Timers one-shot ---
+// --- One-shot timers ---
 type ScheduleOptions struct {
-    Target       string          // opcional, default: self
-    ClientRef    string          // opcional
-    Payload      any             // opcional, serializable a JSON
+    Target       string          // optional, default: self
+    ClientRef    string          // optional
+    Payload      any             // optional, serializable to JSON
     MissedPolicy MissedPolicy    // default: Fire
-    MissedWithin time.Duration   // obligatorio si MissedPolicy == FireIfWithin
-    Metadata     map[string]any  // opcional
+    MissedWithin time.Duration   // required if MissedPolicy == FireIfWithin
+    Metadata     map[string]any  // optional
 }
 
 func Schedule(ctx context.Context, fireAt time.Time, opts ScheduleOptions) (TimerID, error)
 func ScheduleIn(ctx context.Context, d time.Duration, opts ScheduleOptions) (TimerID, error)
 
-// --- Timers recurrentes ---
+// --- Recurring timers ---
 type RecurringOptions struct {
     CronSpec     string
     CronTZ       string          // default: "UTC"
@@ -1006,53 +1006,53 @@ type RecurringOptions struct {
 
 func ScheduleRecurring(ctx context.Context, opts RecurringOptions) (TimerID, error)
 
-### 14.3 Estado del SDK Rust
+### 14.3 Rust SDK status
 
-En el estado actual del runtime:
+In the current state of the runtime:
 
-- la superficie rica y tipada de `SY.timer` está implementada en `fluxbee-go-sdk`
-- `fluxbee_sdk` (Rust) todavía **no** expone un módulo `timer` equivalente
+- the rich, typed surface of `SY.timer` is implemented in `fluxbee-go-sdk`
+- `fluxbee_sdk` (Rust) does **not** yet expose an equivalent `timer` module
 
-Eso no es un accidente de diseño ni una decisión de largo plazo: es una deuda explícita de paridad de SDK.
+That is not a design accident nor a long-term decision: it is an explicit SDK parity debt.
 
-El objetivo correcto para el SDK Rust es replicar:
+The right goal for the Rust SDK is to replicate:
 
-- helpers tipados de tiempo (`now`, `now_in`, `convert`, `parse`, `format`, `help`)
-- cliente tipado de scheduling (`schedule`, `schedule_in`, `schedule_recurring`, `get`, `list`, `cancel`, `reschedule`, `purge_owner`)
-- parseo de `TIMER_RESPONSE`
-- parseo de `TIMER_FIRED`
-- errores y validación client-side comparables al SDK Go
+- typed time helpers (`now`, `now_in`, `convert`, `parse`, `format`, `help`)
+- a typed scheduling client (`schedule`, `schedule_in`, `schedule_recurring`, `get`, `list`, `cancel`, `reschedule`, `purge_owner`)
+- parsing of `TIMER_RESPONSE`
+- parsing of `TIMER_FIRED`
+- errors and client-side validation comparable to the Go SDK
 
-El backlog formal de ese trabajo queda en [sdk_tasks.md](/Users/cagostino/Documents/GitHub/fluxbee/docs/onworking%20COA/sdk_tasks.md) bajo la sección `RUST-TIMER-SDK`.
+The formal backlog of that work is in [sdk_tasks.md](history/onworking-coa/sdk_tasks.md) under the `RUST-TIMER-SDK` section.
 
-**Decisión de alcance:** esta paridad del SDK Rust no implica que `SY.orchestrator` deba usar `SY.timer` para su funcionamiento base en v1. El trabajo es primero de capacidad del SDK y de soporte a nuevos consumidores Rust, no de re-arquitectura del control-plane.
+**Scope decision:** this Rust SDK parity does not imply that `SY.orchestrator` must use `SY.timer` for its base operation in v1. The work is first about SDK capability and support for new Rust consumers, not about re-architecting the control-plane.
 
-// --- Gestión ---
+// --- Management ---
 func Cancel(ctx context.Context, id TimerID) error
 func Reschedule(ctx context.Context, id TimerID, newFireAt time.Time) error
 func Get(ctx context.Context, id TimerID) (*TimerInfo, error)
 func ListMine(ctx context.Context, filter ListFilter) ([]TimerInfo, error)
 
-// --- Introspección ---
+// --- Introspection ---
 func Help(ctx context.Context) (*HelpDescriptor, error)
 ```
 
-### 14.3 Validación client-side
+### 14.3 Client-side validation
 
 ```go
 func ScheduleIn(ctx context.Context, d time.Duration, opts ScheduleOptions) (TimerID, error) {
     if d < MinDuration {
         return "", ErrBelowMinimum
     }
-    // ... resuelve nombre L2 de SY.timer en hive local
-    // ... arma TIMER_SCHEDULE
-    // ... envía y parsea response
+    // ... resolves the L2 name of SY.timer in the local hive
+    // ... builds TIMER_SCHEDULE
+    // ... sends and parses the response
 }
 ```
 
-El mínimo de 60s se valida **client-side** antes de mandar el request, evitando roundtrip. También se valida server-side como defensa en profundidad.
+The 60s minimum is validated **client-side** before sending the request, which avoids a roundtrip. It is also validated server-side as defense in depth.
 
-### 14.4 Reintento de operaciones de tiempo
+### 14.4 Retry of time operations
 
 ```go
 func Now(ctx context.Context) (time.Time, error) {
@@ -1069,9 +1069,9 @@ func Now(ctx context.Context) (time.Time, error) {
 }
 ```
 
-### 14.5 Manejo de `TIMER_FIRED` en el nodo cliente
+### 14.5 Handling `TIMER_FIRED` in the client node
 
-El SDK expone un handler tipado:
+The SDK exposes a typed handler:
 
 ```go
 type FiredEvent struct {
@@ -1085,37 +1085,37 @@ type FiredEvent struct {
     Metadata     map[string]any
 }
 
-// En el runtime del nodo cliente:
+// In the runtime of the client node:
 node.OnSystemMessage("TIMER_FIRED", func(msg Message) error {
     evt, err := timer.ParseFiredEvent(msg)
     if err != nil {
         return err
     }
-    // lógica de aplicación
+    // application logic
     return nil
 })
 ```
 
 ---
 
-## 15. Códigos de Error
+## 15. Error Codes
 
-| Código | Descripción |
+| Code | Description |
 |---|---|
-| `TIMER_BELOW_MINIMUM` | Duración solicitada menor a 60 segundos. |
-| `TIMER_INVALID_CRON` | `cron_spec` no parsea correctamente. |
-| `TIMER_INVALID_TIMEZONE` | `tz` / `cron_tz` no es una zona IANA válida. |
-| `TIMER_INVALID_PAYLOAD` | `payload` del request no es JSON válido o faltan campos obligatorios. |
-| `TIMER_NOT_FOUND` | `timer_uuid` no existe. |
-| `TIMER_NOT_OWNER` | El requester no es dueño del timer para verbos de mutación (`TIMER_CANCEL`, `TIMER_RESCHEDULE`). |
-| `TIMER_ALREADY_FIRED` | Timer ya disparado, no se puede cancelar/reprogramar. |
-| `TIMER_RECURRING_NOT_RESCHEDULABLE` | No se permite reschedule sobre recurrentes en v1. |
-| `TIMER_FORBIDDEN` | Operación restringida (ej. `TIMER_PURGE_OWNER` desde nodo no-orchestrator). |
-| `TIMER_STORAGE_ERROR` | Error interno de SQLite. |
-| `TIMER_INTERNAL` | Error interno no clasificado. |
-| `TIMER_UNREACHABLE` | (Client-side) `SY.timer` no responde tras reintentos. |
+| `TIMER_BELOW_MINIMUM` | Requested duration lower than 60 seconds. |
+| `TIMER_INVALID_CRON` | `cron_spec` does not parse correctly. |
+| `TIMER_INVALID_TIMEZONE` | `tz` / `cron_tz` is not a valid IANA zone. |
+| `TIMER_INVALID_PAYLOAD` | The request `payload` is not valid JSON or required fields are missing. |
+| `TIMER_NOT_FOUND` | `timer_uuid` does not exist. |
+| `TIMER_NOT_OWNER` | The requester is not the owner of the timer, for mutation verbs (`TIMER_CANCEL`, `TIMER_RESCHEDULE`). |
+| `TIMER_ALREADY_FIRED` | Timer already fired; it cannot be canceled/rescheduled. |
+| `TIMER_RECURRING_NOT_RESCHEDULABLE` | Reschedule is not allowed on recurring timers in v1. |
+| `TIMER_FORBIDDEN` | Restricted operation (e.g. `TIMER_PURGE_OWNER` from a non-orchestrator node). |
+| `TIMER_STORAGE_ERROR` | Internal SQLite error. |
+| `TIMER_INTERNAL` | Unclassified internal error. |
+| `TIMER_UNREACHABLE` | (Client-side) `SY.timer` does not answer after retries. |
 
-Formato de response de error:
+Format of an error response:
 
 ```json
 {
@@ -1133,48 +1133,48 @@ Formato de response de error:
 
 ---
 
-## 16. Operación
+## 16. Operation
 
 ### 16.1 Systemd
 
-`SY.timer` es un singleton core por hive, lanzado y mantenido por `SY.orchestrator` a través del mismo modelo operativo que el resto de los nodos `SY.*` del sistema. Tiene binario core instalado, copia en `dist/core/bin`, unit file de systemd y supervisión/restart por orchestrator.
+`SY.timer` is a core singleton per hive, launched and kept up by `SY.orchestrator` through the same operational model as the rest of the system's `SY.*` nodes. It has an installed core binary, a copy in `dist/core/bin`, a systemd unit file and supervision/restart by the orchestrator.
 
-Binario: `/usr/bin/sy-timer` (instalado por `install.sh`).
-Copia de distribución: `/var/lib/fluxbee/dist/core/bin/sy-timer`.
+Binary: `/usr/bin/sy-timer` (installed by `install.sh`).
+Distribution copy: `/var/lib/fluxbee/dist/core/bin/sy-timer`.
 Unit: `/etc/systemd/system/sy-timer.service`.
 
-### 16.2 Paths de runtime
+### 16.2 Runtime paths
 
-| Path | Propósito |
+| Path | Purpose |
 |---|---|
-| `/var/lib/fluxbee/nodes/SY/SY.timer@<hive>/timers.db` | SQLite con timers persistidos |
-| `/var/lib/fluxbee/nodes/SY/SY.timer@<hive>/config.json` | Config managed por orchestrator |
-| `/var/lib/fluxbee/nodes/SY/SY.timer@<hive>/state.json` | Estado opcional del nodo |
-| `/var/run/fluxbee/routers/` | Socket para comunicación con router local |
+| `/var/lib/fluxbee/nodes/SY/SY.timer@<hive>/timers.db` | SQLite with the persisted timers |
+| `/var/lib/fluxbee/nodes/SY/SY.timer@<hive>/config.json` | Config managed by the orchestrator |
+| `/var/lib/fluxbee/nodes/SY/SY.timer@<hive>/state.json` | Optional node state |
+| `/var/run/fluxbee/routers/` | Socket for communication with the local router |
 
 ### 16.3 Backup
 
-La base `timers.db` debería incluirse en los snapshots de backup del directorio `/var/lib/fluxbee/nodes/`. SQLite soporta backup en caliente con `.backup` o con `VACUUM INTO`. Para v1 no se provee herramienta específica: backup del directorio con `SY.timer` detenido o con SQLite en modo WAL funciona.
+The `timers.db` database should be included in the backup snapshots of the `/var/lib/fluxbee/nodes/` directory. SQLite supports hot backup with `.backup` or with `VACUUM INTO`. For v1 no specific tool is provided: a backup of the directory with `SY.timer` stopped, or with SQLite in WAL mode, works.
 
 ### 16.4 Logs
 
-`SY.timer` emite logs estructurados por stdout (capturados por systemd / orchestrator):
+`SY.timer` emits structured logs on stdout (captured by systemd / orchestrator):
 
-- `INFO`: arranque, cantidad de timers cargados, GC, disparos (opcional: verboso).
-- `WARN`: timers descartados por `missed_policy`, targets inalcanzables.
-- `ERROR`: errores de SQLite, crons inválidos en DB, violaciones de integridad.
+- `INFO`: startup, number of timers loaded, GC, fires (optional: verbose).
+- `WARN`: timers discarded by `missed_policy`, unreachable targets.
+- `ERROR`: SQLite errors, invalid crons in the DB, integrity violations.
 
-### 16.5 Métricas (futuro)
+### 16.5 Metrics (future)
 
-Reservado para v2. Candidatos: `timers_pending_gauge`, `timers_fired_counter`, `timer_fire_latency_histogram`, `timer_requests_counter` por verbo.
+Reserved for v2. Candidates: `timers_pending_gauge`, `timers_fired_counter`, `timer_fire_latency_histogram`, `timer_requests_counter` per verb.
 
 ---
 
-## 17. Casos de Uso Previstos
+## 17. Expected Use Cases
 
 ### 17.1 WF — Step timeout
 
-Un workflow programa un timer al entrar a un estado que espera respuesta externa:
+A workflow schedules a timer when it enters a state that waits for an external response:
 
 ```go
 timerID, _ := timer.ScheduleIn(ctx, 30*time.Minute, timer.ScheduleOptions{
@@ -1184,11 +1184,11 @@ timerID, _ := timer.ScheduleIn(ctx, 30*time.Minute, timer.ScheduleOptions{
 })
 ```
 
-Cuando el WF recibe la respuesta esperada, cancela el timer. Si no, recibe `TIMER_FIRED` y transiciona a un estado de escalation.
+When the WF gets the expected response, it cancels the timer. If not, it gets `TIMER_FIRED` and transitions to an escalation state.
 
-### 17.2 Cognition — Reconsideración diferida
+### 17.2 Cognition — Deferred reconsideration
 
-Un nodo cognitivo puede programar un recordatorio para revisar una conclusión con datos frescos:
+A cognitive node can schedule a reminder to review a conclusion with fresh data:
 
 ```go
 timer.ScheduleIn(ctx, 24*time.Hour, timer.ScheduleOptions{
@@ -1201,7 +1201,7 @@ timer.ScheduleIn(ctx, 24*time.Hour, timer.ScheduleOptions{
 })
 ```
 
-### 17.3 Reportes recurrentes
+### 17.3 Recurring reports
 
 ```go
 timer.ScheduleRecurring(ctx, timer.RecurringOptions{
@@ -1213,14 +1213,14 @@ timer.ScheduleRecurring(ctx, timer.RecurringOptions{
 })
 ```
 
-### 17.4 Tiempo autoritativo para AI nodes
+### 17.4 Authoritative time for AI nodes
 
 ```go
 now, _ := timer.Now(ctx)
 prompt := fmt.Sprintf("Current date and time: %s\nUser query: %s", now.Format(time.RFC3339), userQuery)
 ```
 
-### 17.5 Formateo de tiempo por timezone de usuario
+### 17.5 Time formatting by user timezone
 
 ```go
 formatted, _ := timer.Format(ctx, eventTime, "02/01/2006 15:04", userTimezone)
@@ -1229,69 +1229,69 @@ responseToUser := fmt.Sprintf("El evento es el %s", formatted)
 
 ---
 
-## 18. Decisiones de Diseño
+## 18. Design Decisions
 
-| Decisión | Razón |
+| Decision | Reason |
 |---|---|
-| Uno por hive, autónomo | Simplicidad, sin sincronización distribuida, delega al SO |
-| Sin sincronización NTP propia | El SO lo resuelve mejor y ya está instalado |
-| Tiempo server-side con roundtrip siempre | Sin resincronización local complicada, consistencia garantizada |
-| Mínimo 60 segundos | Elimina casos de uso reactivos finos, alinea con granularidad cron |
-| SQLite embebido | Consistencia con otros nodos, simple, transacional, backup trivial |
-| Ownership estricto por L2 name | Aislamiento entre nodos, sin admin override, sin complicaciones |
-| `TIMER_PURGE_OWNER` solo para orchestrator | Excepción única y trazable para teardown de nodos |
-| Sintaxis cron estándar | Conocida por LLMs sin aprendizaje adicional |
-| Respuesta genérica `TIMER_RESPONSE` | Consistencia con `CONFIG_RESPONSE` y resto del control plane |
-| `TIMER_FIRED` no espera ack | Fire-and-forget, simplicidad; retry es responsabilidad del creador |
-| `metadata` como campo libre | Extensibilidad sin romper schema, útil para clientes LLM |
-| `client_ref` como campo de primer nivel | Uso suficientemente común (debug, display, búsqueda) para promover |
-| UUIDs generados por `SY.timer` | Evita colisiones, simplifica cliente, autoritativo |
-| Recurrentes: no disparo retroactivo | Evita tormentas al volver de downtime largo |
-| `TIMER_HELP` embebido | Cumple principio de self-description del sistema |
-| No reschedule de recurrentes en v1 | Caso borde raro, cancelar+recrear funciona |
-| `time/tzdata` embebido | Nodo autocontenido, no depende de `tzdata` del SO (más simple) |
+| One per hive, autonomous | Simplicity, no distributed synchronization, delegates to the OS |
+| No NTP synchronization of its own | The OS solves it better and it is already installed |
+| Server-side time, always with a roundtrip | No complicated local resynchronization, guaranteed consistency |
+| 60-second minimum | Removes fine reactive use cases, aligns with cron granularity |
+| Embedded SQLite | Consistency with other nodes, simple, transactional, trivial backup |
+| Strict ownership by L2 name | Isolation between nodes, no admin override, no complications |
+| `TIMER_PURGE_OWNER` only for the orchestrator | A single, traceable exception for node teardown |
+| Standard cron syntax | Known by LLMs with no extra learning |
+| Generic `TIMER_RESPONSE` response | Consistency with `CONFIG_RESPONSE` and the rest of the control plane |
+| `TIMER_FIRED` does not wait for an ack | Fire-and-forget, simplicity; retry is the creator's responsibility |
+| `metadata` as a free field | Extensibility without breaking the schema, useful for LLM clients |
+| `client_ref` as a top-level field | Common enough use (debug, display, search) to promote it |
+| UUIDs generated by `SY.timer` | Avoids collisions, simplifies the client, authoritative |
+| Recurring: no retroactive fire | Avoids storms when coming back from a long downtime |
+| Embedded `TIMER_HELP` | Meets the system's self-description principle |
+| No reschedule of recurring timers in v1 | Rare edge case; cancel+recreate works |
+| Embedded `time/tzdata` | Self-contained node, does not depend on the OS `tzdata` (simpler) |
 
 ---
 
-## 19. Límites del Sistema
+## 19. System Limits
 
-| Límite | Valor | Notas |
+| Limit | Value | Notes |
 |---|---|---|
-| Mínimo de duración | 60 s | Constante, no configurable |
-| Máximo de timers pendientes | ~10.000 | Por hive, soft limit |
-| Máximo de `TIMER_LIST` | 1000 resultados | Por request |
-| Retención de timers fired/canceled | 7 días | Configurable en v2 |
-| Precisión de disparo | ±5 s | Best-effort, sujeta a carga |
-| Tamaño máximo de `payload` | 64 KB | Alineado con mensajes L2 inline |
-| Tamaño máximo de `metadata` | 16 KB | Recomendado, no enforced en v1 |
-| Timeout de reintento `TIMER_NOW` | ~1.4 s total | 3 intentos con backoff |
+| Minimum duration | 60 s | Constant, not configurable |
+| Maximum pending timers | ~10,000 | Per hive, soft limit |
+| `TIMER_LIST` maximum | 1000 results | Per request |
+| Retention of fired/canceled timers | 7 days | Configurable in v2 |
+| Firing precision | ±5 s | Best-effort, subject to load |
+| Maximum `payload` size | 64 KB | Aligned with inline L2 messages |
+| Maximum `metadata` size | 16 KB | Recommended, not enforced in v1 |
+| `TIMER_NOW` retry timeout | ~1.4 s total | 3 attempts with backoff |
 
 ---
 
-## 20. Pendientes / v2
+## 20. Pending / v2
 
-- Métricas estructuradas (Prometheus-compatible).
-- HA del nodo (replicación de `timers.db` a instancia standby).
-- Backup/restore administrativo vía capability.
-- Reschedule de recurrentes.
-- Disparo retroactivo opcional de recurrentes (para casos donde los "perdidos" sí importan).
-- Descriptores cron extendidos (`@hourly`, `@daily`, `@weekly`).
-- Retención configurable por owner.
-- Dead-letter para `TIMER_FIRED` no entregados.
+- Structured metrics (Prometheus-compatible).
+- Node HA (replication of `timers.db` to a standby instance).
+- Administrative backup/restore through a capability.
+- Reschedule of recurring timers.
+- Optional retroactive firing of recurring timers (for cases where the "missed" ones do matter).
+- Extended cron descriptors (`@hourly`, `@daily`, `@weekly`).
+- Configurable retention per owner.
+- Dead-letter for undelivered `TIMER_FIRED`.
 
 ---
 
-## 21. Referencias Cruzadas
+## 21. Cross References
 
-| Tema | Documento |
+| Topic | Document |
 |---|---|
-| Arquitectura general Fluxbee | `01-arquitectura.md` |
-| Protocolo L2 y mensajes | `02-protocolo.md` |
-| Shared memory (para contexto de otros nodos SY) | `03-shm.md` |
-| Routing y nombres L2 | `04-routing.md` |
-| Conectividad intra/inter-isla | `05-conectividad.md` |
+| General Fluxbee architecture | `01-arquitectura.md` |
+| L2 protocol and messages | `02-protocolo.md` |
+| Shared memory (for context on other SY nodes) | `03-shm.md` |
+| Routing and L2 names | `04-routing.md` |
+| Intra/inter-island connectivity | `05-conectividad.md` |
 | Config control plane | `node-config-control-plane-spec.md` |
-| Runtime rollout de nodos | `14-runtime-rollout-motherbee.md` |
-| Glosario y decisiones globales | `08-apendices.md` |
-| (Futuro) Nodos WF | `wf-spec.md` — pendiente |
-| (Futuro) Self-description protocol general | pendiente |
+| Node runtime rollout | `14-runtime-rollout-motherbee.md` |
+| Glossary and global decisions | `08-apendices.md` |
+| (Future) WF nodes | `wf-spec.md` — pending |
+| (Future) General self-description protocol | pending |

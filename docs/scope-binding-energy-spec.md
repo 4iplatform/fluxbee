@@ -1,22 +1,22 @@
-# Scope Detection por Energía de Binding
+# Scope Detection by Binding Energy
 
-**Para:** Programador de cognitive-lab  
-**Objetivo:** Implementar detección automática de cambio de scope basada en la cohesión entre contextos activos  
-**Dependencia:** Requiere CTX con tags pesados por ILK (emisor/receptor)
-
----
-
-## 1. Concepto en una frase
-
-El scope es estable mientras los contextos activos estén "ligados" entre sí (comparten temas y participantes). Cuando los contextos divergen lo suficiente y se sostiene, el scope cambió.
+**For:** cognitive-lab programmer  
+**Goal:** Implement automatic detection of scope change based on the cohesion between active contexts  
+**Dependency:** Requires CTX with tags weighted by ILK (sender/receiver)
 
 ---
 
-## 2. Estructuras de datos
+## 1. The concept in one sentence
 
-### 2.1 Tag (salida del tagger, modificada)
+The scope is stable while the active contexts are "bound" to each other (they share topics and participants). When the contexts diverge enough and it holds, the scope changed.
 
-Cada tag ahora lleva metadata del mensaje que lo generó:
+---
+
+## 2. Data structures
+
+### 2.1 Tag (tagger output, modified)
+
+Each tag now carries metadata of the message that generated it:
 
 ```json
 {
@@ -26,9 +26,9 @@ Cada tag ahora lleva metadata del mensaje que lo generó:
 }
 ```
 
-### 2.2 CTX (contexto semántico)
+### 2.2 CTX (semantic context)
 
-Cada contexto acumula tags y perfiles de participación:
+Each context accumulates tags and participation profiles:
 
 ```json
 {
@@ -45,9 +45,9 @@ Cada contexto acumula tags y perfiles de participación:
 }
 ```
 
-`ilk_profile` se actualiza con cada mensaje que toca este CTX:
-- Si el mensaje viene de `ilk_sender=X` → `ilk_profile[X].as_sender += 1`
-- Si el mensaje va a `ilk_receiver=Y` → `ilk_profile[Y].as_receiver += 1`
+`ilk_profile` is updated with each message that touches this CTX:
+- If the message comes from `ilk_sender=X` → `ilk_profile[X].as_sender += 1`
+- If the message goes to `ilk_receiver=Y` → `ilk_profile[Y].as_receiver += 1`
 
 ### 2.3 Scope
 
@@ -64,21 +64,21 @@ Cada contexto acumula tags y perfiles de participación:
 
 ---
 
-## 3. Algoritmo paso a paso
+## 3. Step-by-step algorithm
 
-Se ejecuta después de actualizar los CTX en cada mensaje.
+It runs after the CTX are updated on each message.
 
-### Paso 1: Filtrar CTX activos
+### Step 1: Filter the active CTX
 
-Solo los que tienen `ema > 0` (vivos):
+Only those with `ema > 0` (alive):
 
 ```typescript
 const active = contexts.filter(c => c.ema > 0);
 ```
 
-### Paso 2: Calcular similitud temática entre cada par
+### Step 2: Compute the topic similarity between each pair
 
-Para cada par `(i, j)`:
+For each pair `(i, j)`:
 
 ```typescript
 function tagSimilarity(ctx_i, ctx_j): number {
@@ -91,19 +91,19 @@ function tagSimilarity(ctx_i, ctx_j): number {
 }
 ```
 
-### Paso 3: Calcular similitud de participantes entre cada par
+### Step 3: Compute the participant similarity between each pair
 
-Convertir `ilk_profile` a vector numérico y calcular coseno:
+Convert `ilk_profile` into a numeric vector and compute the cosine:
 
 ```typescript
 function ilkSimilarity(ctx_i, ctx_j): number {
-  // Unión de todos los ILKs presentes en ambos CTX
+  // Union of all the ILKs present in both CTX
   const allIlks = new Set([
     ...Object.keys(ctx_i.ilk_profile),
     ...Object.keys(ctx_j.ilk_profile)
   ]);
 
-  // Construir vectores: por cada ILK, sumar as_sender + as_receiver
+  // Build vectors: for each ILK, add as_sender + as_receiver
   let dotProduct = 0;
   let normI = 0;
   let normJ = 0;
@@ -120,11 +120,11 @@ function ilkSimilarity(ctx_i, ctx_j): number {
 
   const denom = Math.sqrt(normI) * Math.sqrt(normJ);
   if (denom === 0) return 0;
-  return dotProduct / denom;  // Coseno: 0..1
+  return dotProduct / denom;  // Cosine: 0..1
 }
 ```
 
-### Paso 4: Calcular acoplamiento J entre cada par
+### Step 4: Compute the coupling J between each pair
 
 ```typescript
 function coupling(ctx_i, ctx_j): number {
@@ -132,9 +132,9 @@ function coupling(ctx_i, ctx_j): number {
 }
 ```
 
-Rango: `0..1`. Cero = nada en común. Uno = mismos tags y mismos participantes.
+Range: `0..1`. Zero = nothing in common. One = same tags and same participants.
 
-### Paso 5: Calcular energía total del scope
+### Step 5: Compute the total energy of the scope
 
 ```typescript
 function scopeEnergy(active: CTX[]): number {
@@ -144,14 +144,14 @@ function scopeEnergy(active: CTX[]): number {
       const J_ij = coupling(active[i], active[j]);
       const m_i = active[i].ema;
       const m_j = active[j].ema;
-      energy += -J_ij * m_i * m_j;  // negativo = ligado
+      energy += -J_ij * m_i * m_j;  // negative = bound
     }
   }
   return energy;
 }
 ```
 
-### Paso 6: Normalizar
+### Step 6: Normalize
 
 ```typescript
 function normalizedEnergy(active: CTX[]): number {
@@ -162,59 +162,59 @@ function normalizedEnergy(active: CTX[]): number {
 }
 ```
 
-Rango aproximado: `-1..0`
-- `-1` = todos los CTX fuertemente acoplados (scope muy estable)
-- `0` = CTX desacoplados (scope sin cohesión)
+Approximate range: `-1..0`
+- `-1` = all the CTX strongly coupled (very stable scope)
+- `0` = decoupled CTX (scope without cohesion)
 
-### Paso 7: Suavizar con EMA
+### Step 7: Smooth with EMA
 
 ```typescript
 const ALPHA = 0.25;
 
 function updateEnergyEma(scope: Scope, currentEnergy: number): number {
   if (scope.energy_ema === undefined || scope.energy_ema === null) {
-    return currentEnergy;  // primer cálculo
+    return currentEnergy;  // first calculation
   }
   return scope.energy_ema + ALPHA * (currentEnergy - scope.energy_ema);
 }
 ```
 
-### Paso 8: Evaluar cambio de scope
+### Step 8: Evaluate the scope change
 
 ```typescript
-const UNBIND_THRESHOLD = -0.10;  // a calibrar
+const UNBIND_THRESHOLD = -0.10;  // to be calibrated
 
 function shouldChangeScope(scope: Scope): boolean {
   return scope.energy_ema > UNBIND_THRESHOLD;
 }
 ```
 
-Si `energy_ema > -0.10` → el scope perdió cohesión → crear scope nuevo.
+If `energy_ema > -0.10` → the scope lost cohesion → create a new scope.
 
 ---
 
-## 4. Caso especial: un solo CTX activo
+## 4. Special case: a single active CTX
 
-Con un solo CTX no hay pares, la energía es 0 y normalizada es 0. Esto no significa "cambio de scope" — significa que el scope recién empieza o que solo queda un tema.
+With a single CTX there are no pairs, the energy is 0 and the normalized energy is 0. This does not mean "scope change" — it means that the scope is just starting or that only one topic is left.
 
-Regla: no evaluar cambio de scope si `active.length < 2`. Con un solo CTX, el scope se mantiene.
+Rule: do not evaluate a scope change if `active.length < 2`. With a single CTX, the scope is kept.
 
 ---
 
-## 5. Qué pasa cuando el scope cambia
+## 5. What happens when the scope changes
 
 ```typescript
 if (active.length >= 2 && shouldChangeScope(scope)) {
-  // 1. Cerrar scope actual
+  // 1. Close the current scope
   scope.closed_at = now;
   scope.close_reason = "energy_unbind";
   scope.final_energy = scope.energy_ema;
 
-  // 2. Crear scope nuevo con los CTX activos actuales
+  // 2. Create a new scope with the current active CTX
   const newScope = {
     scope_id: generateId(),
     created_at: now,
-    energy_ema: null,  // se calculará en siguiente mensaje
+    energy_ema: null,  // will be computed on the next message
     contexts: active.map(c => c.context_id),
     participants: extractParticipants(active)
   };
@@ -223,9 +223,9 @@ if (active.length >= 2 && shouldChangeScope(scope)) {
 
 ---
 
-## 6. Ejemplo completo paso a paso
+## 6. Full step-by-step example
 
-### Estado inicial: dos CTX ligados
+### Initial state: two bound CTX
 
 ```json
 {
@@ -269,7 +269,7 @@ norm_002 = sqrt(36+36) = 8.49
 S_ilk = 120 / (14.14 * 8.49) = 120 / 120.03 = 1.00
 ```
 
-**Coupling y energía:**
+**Coupling and energy:**
 ```
 J = 0.20 * 1.00 = 0.20
 E = -(0.20) * 5.0 * 3.0 = -3.00
@@ -277,11 +277,11 @@ M = 5.0 + 3.0 = 8.0
 Ê = -3.00 / 64 = -0.047
 ```
 
-**Scope:** cohesión débil pero existente (Ê = -0.047, por debajo de -0.10 → scope estable).
+**Scope:** weak but existing cohesion (Ê = -0.047, below -0.10 → stable scope).
 
 ---
 
-### Mensaje nuevo: entra CTX "fútbol" con participante distinto
+### New message: the CTX "fútbol" comes in with a different participant
 
 ```json
 {
@@ -297,12 +297,12 @@ M = 5.0 + 3.0 = 8.0
 }
 ```
 
-**Pares a calcular:** (001,002), (001,003), (002,003)
+**Pairs to compute:** (001,002), (001,003), (002,003)
 
 **(001, 003):**
 ```
 S_tema: intersection={} → 0/6 = 0.00
-J = 0 (no importa S_ilk, el producto es 0)
+J = 0 (S_ilk does not matter, the product is 0)
 E_13 = 0
 ```
 
@@ -313,7 +313,7 @@ J = 0
 E_23 = 0
 ```
 
-**(001, 002):** igual que antes = -3.00
+**(001, 002):** same as before = -3.00
 
 **Total:**
 ```
@@ -330,23 +330,23 @@ energy_ema = -0.047 + 0.25 * (-0.030 - (-0.047))
            = -0.043
 ```
 
-**Evaluación:** -0.043 > -0.10 → todavía estable. Pero la energía subió (de -0.047 a -0.043). Si "fútbol" sigue creciendo y "facturación"/"pagos" decaen, la energía seguirá subiendo hacia 0.
+**Evaluation:** -0.043 > -0.10 → still stable. But the energy went up (from -0.047 to -0.043). If "fútbol" keeps growing and "facturación"/"pagos" decay, the energy will keep rising toward 0.
 
 ---
 
-### Después de varios mensajes: fútbol domina
+### After several messages: fútbol dominates
 
 ```
-ctx_001 (facturación): ema = 1.0  (decayó)
-ctx_002 (pagos):       ema = 0.5  (decayó)
-ctx_003 (fútbol):      ema = 6.0  (creció)
+ctx_001 (facturación): ema = 1.0  (decayed)
+ctx_002 (pagos):       ema = 0.5  (decayed)
+ctx_003 (fútbol):      ema = 6.0  (grew)
 ```
 
-**Energía:**
+**Energy:**
 ```
 E_12 = -(0.20) * 1.0 * 0.5 = -0.10
-E_13 = 0  (sin tags comunes)
-E_23 = 0  (sin tags comunes)
+E_13 = 0  (no common tags)
+E_23 = 0  (no common tags)
 E_total = -0.10
 M = 1.0 + 0.5 + 6.0 = 7.5
 Ê = -0.10 / 56.25 = -0.002
@@ -360,37 +360,37 @@ energy_ema = -0.043 + 0.25 * (-0.002 - (-0.043))
            = -0.033
 ```
 
-Sigue subiendo. Después de unos mensajes más con la misma tendencia, `energy_ema` cruza -0.10 → **scope cambió**.
+It keeps rising. After a few more messages with the same trend, `energy_ema` crosses -0.10 → **the scope changed**.
 
 ---
 
-## 7. Constantes (valores iniciales para calibración)
+## 7. Constants (initial values for calibration)
 
-| Constante | Valor | Qué controla |
+| Constant | Value | What it controls |
 |-----------|-------|-------------|
-| `ALPHA` | `0.25` | Suavizado de energía EMA (más bajo = más inercia) |
-| `UNBIND_THRESHOLD` | `-0.10` | Umbral de cambio de scope (más cercano a 0 = más sensible) |
-| `MIN_CTX_FOR_EVAL` | `2` | Mínimo de CTX activos para evaluar scope |
+| `ALPHA` | `0.25` | Smoothing of the energy EMA (lower = more inertia) |
+| `UNBIND_THRESHOLD` | `-0.10` | Scope change threshold (closer to 0 = more sensitive) |
+| `MIN_CTX_FOR_EVAL` | `2` | Minimum number of active CTX to evaluate the scope |
 
-Estos valores se calibran con datos reales del lab. Empezar con estos y ajustar según resultados observados.
+These values are calibrated with real lab data. Start with these and adjust according to the observed results.
 
 ---
 
-## 8. Integración en el pipeline actual
+## 8. Integration in the current pipeline
 
 ```
-Mensaje entra
-  → Tagger (tags + ilk_sender + ilk_receiver)      // MODIFICADO: agregar ILKs
-  → Evaluator (CTX actualizados con peso)            // EXISTENTE
-  → Actualizar ilk_profile en cada CTX tocado         // NUEVO
-  → Calcular energía normalizada del scope            // NUEVO
-  → Actualizar energy_ema del scope                   // NUEVO
-  → Si energy_ema > UNBIND_THRESHOLD → nuevo scope   // NUEVO
-  → Memorias y episodios (sin cambios)
+Message comes in
+  → Tagger (tags + ilk_sender + ilk_receiver)      // MODIFIED: add ILKs
+  → Evaluator (CTX updated with weight)              // EXISTING
+  → Update ilk_profile in each touched CTX            // NEW
+  → Compute the normalized energy of the scope        // NEW
+  → Update the energy_ema of the scope                // NEW
+  → If energy_ema > UNBIND_THRESHOLD → new scope     // NEW
+  → Memories and episodes (no changes)
 ```
 
-Cambios al código existente:
-1. **Tagger:** agregar `ilk_sender` e `ilk_receiver` a cada tag
-2. **CTX:** agregar campo `ilk_profile` y actualizarlo en `processMessage`
-3. **Scope:** nueva entidad con `energy_ema`, calculada post-CTX
-4. **Nuevo módulo:** `src/scope/binding.ts` con las funciones de este doc
+Changes to the existing code:
+1. **Tagger:** add `ilk_sender` and `ilk_receiver` to each tag
+2. **CTX:** add the `ilk_profile` field and update it in `processMessage`
+3. **Scope:** a new entity with `energy_ema`, computed post-CTX
+4. **New module:** `src/scope/binding.ts` with the functions of this doc

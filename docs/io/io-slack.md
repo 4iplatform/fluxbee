@@ -1,227 +1,227 @@
-﻿# Nodo IO - Slack (Especificación MVP)
+﻿# IO Node - Slack (MVP Specification)
 > Adaptation note for `json-router`:
 > This spec is imported and kept as functional baseline.
 > If a section conflicts with router v1.16+ docs in this repo, follow `docs/io/README.md` precedence.
 
-## 1. Objetivo
+## 1. Goal
 
-El **Nodo IO Slack** es el adaptador entre Slack y el sistema interno (router + nodos).
-Para el MVP, su objetivo es:
+The **Slack IO Node** is the adapter between Slack and the internal system (router + nodes).
+For the MVP, its goal is:
 
-- **Inbound:** recibir mensajes únicamente a través de **menciones al bot** (`app_mention`).
-- **Outbound:** enviar mensajes a Slack usando la **Slack Web API** (`chat.postMessage`).
+- **Inbound:** receive messages only through **mentions of the bot** (`app_mention`).
+- **Outbound:** send messages to Slack using the **Slack Web API** (`chat.postMessage`).
 
-Este documento **extiende** la especificación base de Nodos IO y define únicamente
-las decisiones y necesidades **específicas de Slack**.
+This document **extends** the base IO Nodes specification and defines only
+the **Slack-specific** decisions and needs.
 
 ---
 
-## 2. Supuestos del MVP
+## 2. MVP assumptions
 
-- Existe **una sola instancia lógica activa** del Nodo IO Slack por binding `workspace_id + conversation_id`.
-- Se acepta downtime si el nodo cae.
-- Los Nodos IO **NO** manejan base de datos ni Redis; por lo tanto:
-  - deduplicación y sessionización son **en memoria** (*best-effort*),
-  - retries/outbox outbound son **en memoria** (*best-effort*),
-  - tras reinicio se pierde el estado técnico.
+- There is **a single active logical instance** of the Slack IO Node per `workspace_id + conversation_id` binding.
+- Downtime is accepted if the node goes down.
+- IO Nodes do **NOT** handle a database or Redis; therefore:
+  - deduplication and sessionization are **in memory** (*best-effort*),
+  - outbound retries/outbox are **in memory** (*best-effort*),
+  - the technical state is lost after a restart.
 
-> Nota: para evitar inconsistencias con necesidades futuras de durabilidad, la lógica interna del IO debería usar una **interfaz de persistencia** (MVP: InMemory) tal como se define en `io-common.md`.
+> Note: to avoid inconsistencies with future durability needs, the IO's internal logic should use a **persistence interface** (MVP: InMemory), as defined in `io-common.md`.
 
-### 2.1 ICH local y operatividad mínima
+### 2.1 Local ICH and minimal operability
 
-Para `IO.slack`, el `ICH` debe interpretarse como el binding local operado por la instancia para `workspace_id + conversation_id`, no como el usuario remoto de Slack ni como el workspace en abstracto.
+For `IO.slack`, the `ICH` must be read as the local binding operated by the instance for `workspace_id + conversation_id`, not as the remote Slack user and not as the workspace in the abstract.
 
-Regla operativa mínima:
-- el nodo puede permanecer vivo para `PING/STATUS/CONFIG_*`;
-- si no tiene material suficiente para operar su canal local (por ejemplo credenciales válidas o configuración efectiva mínima), no debe procesar tráfico operativo real de Slack;
-- en el estado actual del repo, esa no-operatividad se expresa mediante `UNCONFIGURED` o `FAILED_CONFIG`, no mediante un estado separado específico de `ICH`.
+Minimal operational rule:
+- the node can stay alive for `PING/STATUS/CONFIG_*`;
+- if it does not have enough material to operate its local channel (for example valid credentials or a minimal effective configuration), it must not process real operational Slack traffic;
+- in the current state of the repo, that non-operability is expressed through `UNCONFIGURED` or `FAILED_CONFIG`, not through a separate `ICH`-specific state.
 
-### 2.2 Estado actual del runtime respecto a ILK interno e ICH
+### 2.2 Current state of the runtime regarding the internal ILK and ICH
 
-Lectura ajustada al estado real actual del repo:
+Reading adjusted to the real current state of the repo:
 
-- `IO.slack` ya lee `self_ilk_id` y `self_tenant_id` desde env al boot;
-- a diferencia de otros nodos IO, hoy esos valores sí se usan operacionalmente para resolver credenciales `slack` en `SY.vault` y para el loop de refresh;
-- además, ahora se usan para asegurar el alta del `ICH` propio del binding `workspace_id + conversation_id` cuando entra tráfico Slack;
-- `IoContext.entrypoint` ya no representa el workspace en abstracto, sino el binding local `workspace_id + conversation_id`;
-- el cálculo actual de `thread_id` ya usa material local del canal:
-  - `NativeThread(channel_type=\"slack\", entrypoint_id=workspace_id, native_thread_id=thread_ts)` cuando existe thread nativo;
-  - `PersistentChannel(channel_type=\"slack\", entrypoint_id=workspace_id, conversation_id=conversation_id)` cuando no existe `thread_ts`.
+- `IO.slack` already reads `self_ilk_id` and `self_tenant_id` from env at boot;
+- unlike other IO nodes, today those values are used operationally to resolve `slack` credentials in `SY.vault` and for the refresh loop;
+- in addition, they are now used to ensure that the `ICH` owned by the `workspace_id + conversation_id` binding is registered when Slack traffic comes in;
+- `IoContext.entrypoint` no longer represents the workspace in the abstract, but the local `workspace_id + conversation_id` binding;
+- the current `thread_id` calculation already uses local channel material:
+  - `NativeThread(channel_type=\"slack\", entrypoint_id=workspace_id, native_thread_id=thread_ts)` when there is a native thread;
+  - `PersistentChannel(channel_type=\"slack\", entrypoint_id=workspace_id, conversation_id=conversation_id)` when there is no `thread_ts`.
 
-Conclusión práctica:
+Practical conclusion:
 
-- la continuidad conversacional ya incorpora correctamente material local del binding `workspace_id + conversation_id`;
-- el runtime ya usa `self_ilk_id/self_tenant_id` de forma efectiva para su operación;
-- `meta.ich` ya se alinea al binding local;
-- el `ICH` propio del binding ya se intenta registrar explícitamente contra identity usando `self_ilk_id + (workspace_id + conversation_id)`.
+- conversational continuity already correctly includes local material from the `workspace_id + conversation_id` binding;
+- the runtime already uses `self_ilk_id/self_tenant_id` effectively for its operation;
+- `meta.ich` is already aligned with the local binding;
+- an explicit registration of the binding's own `ICH` against identity is already attempted, using `self_ilk_id + (workspace_id + conversation_id)`.
 
-### 2.3 Estado actual del alta de ICH propio
+### 2.3 Current state of the registration of the own ICH
 
-El camino operativo actual para `IO.slack` es:
+The current operational path for `IO.slack` is:
 
-- usar `self_ilk_id` y `self_tenant_id` inyectados al boot;
-- requerir `config.io.workspace_id` y `config.io.conversation_id` como configuración mínima operativa;
-- calcular un `ich_id` estable a partir de `channel_type + address + tenant`;
-- solicitar `ILK_ADD_CHANNEL` a `SY.identity` con:
+- use the `self_ilk_id` and `self_tenant_id` injected at boot;
+- require `config.io.workspace_id` and `config.io.conversation_id` as the minimal operational configuration;
+- compute a stable `ich_id` from `channel_type + address + tenant`;
+- request `ILK_ADD_CHANNEL` from `SY.identity` with:
   - `channel_type = "slack_binding"`
   - `address = "<workspace_id>:<conversation_id>"`
   - `ilk_id = self_ilk_id`
 
-Si el alta falla:
+If the registration fails:
 
-- el nodo no procesa ese evento inbound;
-- registra `warn` con el binding configurado;
-- y espera al próximo evento para reintentar.
+- the node does not process that inbound event;
+- it logs a `warn` with the configured binding;
+- and it waits for the next event to retry.
 
-Además, el runtime actual ya intenta asegurar el `ICH` propio:
+In addition, the current runtime already tries to ensure its own `ICH`:
 
-- al boot, si hay `effective_config` válida;
-- y en cada `CONFIG_SET` exitoso antes de dejar el nodo en `Configured`.
+- at boot, if there is a valid `effective_config`;
+- and on each successful `CONFIG_SET`, before leaving the node in `Configured`.
 
-Gap residual:
+Residual gap:
 
-- la validación local de `SY.identity` queda condicionada al entorno de build disponible;
-- la resolución homogénea para otros nodos IO sigue pendiente.
-
----
-
-## 3. Inbound: recepción de mensajes desde Slack
-
-### 3.1 Mecanismo de recepción
-
-El Nodo IO Slack **DEBE** soportar uno de los siguientes modos:
-
-#### Opción A - Socket Mode (recomendado para MVP)
-- Conexión WebSocket usando **App-Level Token** (`xapp-...`).
-- Scope requerido: `connections:write`.
-- No requiere endpoint HTTP público.
-
-#### Opción B - Events API (HTTP)
-- Endpoint HTTPS público.
-- Soporte de `url_verification` (responder el `challenge` en plaintext).
-- Validación de firma usando el **Signing Secret** de Slack.
-
-La elección del modo **NO afecta** el contrato interno del IO.
+- the local validation of `SY.identity` depends on the available build environment;
+- the homogeneous resolution for other IO nodes is still pending.
 
 ---
 
-### 3.2 Evento soportado: `app_mention`
+## 3. Inbound: receiving messages from Slack
 
-El Nodo IO Slack **SOLO** procesa eventos:
+### 3.1 Reception mechanism
+
+The Slack IO Node **MUST** support one of the following modes:
+
+#### Option A - Socket Mode (recommended for the MVP)
+- WebSocket connection using the **App-Level Token** (`xapp-...`).
+- Required scope: `connections:write`.
+- It does not need a public HTTP endpoint.
+
+#### Option B - Events API (HTTP)
+- Public HTTPS endpoint.
+- Support for `url_verification` (respond to the `challenge` in plaintext).
+- Signature validation using Slack's **Signing Secret**.
+
+The choice of mode does **NOT affect** the IO's internal contract.
+
+---
+
+### 3.2 Supported event: `app_mention`
+
+The Slack IO Node **ONLY** processes events:
 - `type = "app_mention"`
 
-Campos relevantes del evento Slack:
-- `user`: ID del usuario que menciona al bot.
-- `channel`: ID del canal donde ocurrió la mención.
-- `text`: contenido del mensaje.
-- `ts`: timestamp del mensaje.
-- `thread_ts`: timestamp del hilo (si aplica).
-- `event_id` / `event_ts`: identificadores del evento.
+Relevant fields of the Slack event:
+- `user`: ID of the user who mentions the bot.
+- `channel`: ID of the channel where the mention happened.
+- `text`: message content.
+- `ts`: message timestamp.
+- `thread_ts`: thread timestamp (if it applies).
+- `event_id` / `event_ts`: event identifiers.
 
-Otros eventos **DEBEN** ser ignorados.
-
----
-
-## 4. Deduplicación inbound (Slack)
-
-Slack puede reenviar eventos si:
-- no recibe ACK,
-- el ACK es lento,
-- o hay errores transitorios.
-
-### Clave de deduplicación recomendada (en orden de preferencia)
-1. `event_id` (si está presente)
-2. `(workspace_id, conversation_id, ts)` como surrogate estable
-
-### Implementación (sin DB/Redis)
-- Caché en memoria con TTL.
-- Límite por tamaño: `max_entries`/`max_bytes`.
-- Eviction (TTL-LRU o drop-oldest).
-- Métricas: dedup_hits, dedup_misses, evictions.
-
-### Regla operativa
-- El ACK a Slack **DEBE** enviarse lo antes posible, sin esperar respuesta del router ni de identidad.
-
-> Nota: tras restart del nodo, se pierde el dedup y pueden ocurrir duplicados hacia el router.
+Other events **MUST** be ignored.
 
 ---
 
-## 5. Relay inbound (Slack)
+## 4. Inbound deduplication (Slack)
 
-### Objetivo
-Agrupar múltiples fragmentos inbound del mismo usuario en el mismo canal/hilo
-en un único turno lógico antes de enviarlo al router.
+Slack may resend events if:
+- it receives no ACK,
+- the ACK is slow,
+- or there are transient errors.
 
-### Reglas MVP
-- Slack ya no mantiene un `SlackSessionizer` privado.
-- El mecanismo de relay/sessionización vive en `io-common` y `IO.slack` solo aporta la semántica del canal.
-- Clave sugerida:
+### Recommended deduplication key (in order of preference)
+1. `event_id` (if present)
+2. `(workspace_id, conversation_id, ts)` as a stable surrogate
+
+### Implementation (no DB/Redis)
+- In-memory cache with a TTL.
+- Size limit: `max_entries`/`max_bytes`.
+- Eviction (TTL-LRU or drop-oldest).
+- Metrics: dedup_hits, dedup_misses, evictions.
+
+### Operational rule
+- The ACK to Slack **MUST** be sent as soon as possible, without waiting for a response from the router or from identity.
+
+> Note: after a node restart, the dedup state is lost and duplicates may reach the router.
+
+---
+
+## 5. Inbound relay (Slack)
+
+### Goal
+Group several inbound fragments from the same user in the same channel/thread
+into a single logical turn before sending it to the router.
+
+### MVP rules
+- Slack no longer keeps a private `SlackSessionizer`.
+- The relay/sessionization mechanism lives in `io-common`, and `IO.slack` only provides the channel semantics.
+- Suggested key:
 ```
 (channel, user, thread_ts || channel)
 ```
-- Derivación implementada hoy:
+- Derivation implemented today:
 ```
 slack:<workspace_id>:<conversation_id>:<thread_ts||conversation_id>:<user>
 ```
-- Ventana de tiempo configurable.
-- `relay_window_ms = 0` implica passthrough inmediato.
-- `relay_window_ms > 0` implica consolidación dentro de la ventana configurada.
-- La superficie formal de configuración del relay es `config.io.relay.*`.
-- `IO.slack` toma esa config desde spawn config/bootstrap y la puede actualizar en caliente por `CONFIG_SET`.
-- Si el nodo se reinicia durante la ventana, el modo `memory` puede perder agrupamiento y emitir mensajes separados.
-- El flush del relay produce un único `text/v1` y recién ahí corre el pipeline común de identidad/forward.
+- Configurable time window.
+- `relay_window_ms = 0` means immediate passthrough.
+- `relay_window_ms > 0` means consolidation within the configured window.
+- The formal configuration surface of the relay is `config.io.relay.*`.
+- `IO.slack` takes that config from the spawn config/bootstrap and can update it hot through `CONFIG_SET`.
+- If the node restarts during the window, the `memory` mode may lose the grouping and emit separate messages.
+- The relay flush produces a single `text/v1`, and only then does the common identity/forward pipeline run.
 
 ---
 
-## 6. Identidad (L3) y despacho al router
+## 6. Identity (L3) and dispatch to the router
 
-### 6.1 Requisito
-El Nodo IO Slack **DEBE** usar el flujo compartido de `io-common` para identidad:
+### 6.1 Requirement
+The Slack IO Node **MUST** use the shared `io-common` flow for identity:
 
-1. `lookup` por SHM (`jsr-identity-*`)
-2. si hay miss/error: `provision_on_miss` via `SY.identity` (`ILK_PROVISION`)
-3. si provision falla o timeout: forward con `meta.src_ilk = null`
+1. `lookup` through SHM (`jsr-identity-*`)
+2. on a miss/error: `provision_on_miss` via `SY.identity` (`ILK_PROVISION`)
+3. if the provision fails or times out: forward with `meta.src_ilk = null`
 
-- Si hay hit: incluir `meta.src_ilk`.
-- Si hay miss y provision exitoso: incluir `meta.src_ilk` provisionado.
-- Si hay miss y provision no exitoso: **enviar igualmente** con `meta.src_ilk = null`.
+- On a hit: include `meta.src_ilk`.
+- On a miss with a successful provision: include the provisioned `meta.src_ilk`.
+- On a miss with an unsuccessful provision: **send anyway** with `meta.src_ilk = null`.
 
-Esto implementa la estrategia recomendada de L3: **Desvío a Onboarding (Reprocesamiento)**.
+This implements the recommended L3 strategy: **Diversion to Onboarding (Reprocessing)**.
 
-### 6.2 Integración con identidad (ACK no bloqueante)
-El Nodo IO Slack usa `io-common::FluxbeeIdentityProvisioner` para el paso de provision.
-Regla operativa:
+### 6.2 Integration with identity (non-blocking ACK)
+The Slack IO Node uses `io-common::FluxbeeIdentityProvisioner` for the provision step.
+Operational rule:
 
-- **SIEMPRE** debe ACKear a Slack primero.
-- Después del ACK puede ejecutar lookup/provision en el flujo inbound.
-- No hay espera de una “sesión de identidad”; si no hay `src_ilk`, forward con `null`.
+- It must **ALWAYS** ACK Slack first.
+- After the ACK it may run lookup/provision in the inbound flow.
+- There is no waiting for an “identity session”; if there is no `src_ilk`, forward with `null`.
 
-El control de flujo (espera/reinyección) es responsabilidad de `WF.onboarding` y del Router.
+Flow control (wait/reinjection) is the responsibility of `WF.onboarding` and the Router.
 
 ---
 
-## 7. Normalización hacia el router
+## 7. Normalization toward the router
 
-Además de `meta.src_ilk` (o `null`), el IO Slack **DEBE** adjuntar el bloque estandarizado `meta.context.io` (contrato IO Context), incluyendo `entrypoint` (binding `workspace_id + conversation_id`), `conversation` (channel/thread) y `reply_target` (thread Slack dentro del `conversation_id` propio del nodo).
+Besides `meta.src_ilk` (or `null`), the Slack IO **MUST** attach the standardized `meta.context.io` block (IO Context contract), including `entrypoint` (the `workspace_id + conversation_id` binding), `conversation` (channel/thread) and `reply_target` (the Slack thread inside the node's own `conversation_id`).
 
-Si el mensaje pasó por relay, también **DEBE** adjuntar `meta.context.io.relay.*` con metadata de trazabilidad del ensamblado.
+If the message went through the relay, it **MUST** also attach `meta.context.io.relay.*` with traceability metadata of the assembly.
 
-Por cada evento válido (`app_mention`), el Nodo IO Slack **DEBE** construir un
-`Message` del protocolo interno con:
+For each valid event (`app_mention`), the Slack IO Node **MUST** build an
+internal-protocol `Message` with:
 
 ### routing
 - `routing.dst = null`
-- `routing.ttl`: valor estándar del sistema
-- `routing.trace_id`: nuevo o propagado
+- `routing.ttl`: the system's standard value
+- `routing.trace_id`: new or propagated
 
-Interpretación operativa:
-- `routing.dst = null` implica `resolve` en el router (baseline de producción).
-- Un destino unicast fijo solo debe usarse como override de pruebas/controladas.
+Operational interpretation:
+- `routing.dst = null` means `resolve` in the router (production baseline).
+- A fixed unicast destination must only be used as an override for tests/controlled cases.
 
 ### meta
 - `meta.type = "user"`
-- `meta.src_ilk`: ILK representando al usuario de Slack (humano externo) **o null**
-- `meta.thread_id`: thread canónico v2 para router/cognition
+- `meta.src_ilk`: ILK representing the Slack user (external human) **or null**
+- `meta.thread_id`: canonical v2 thread for router/cognition
 - `meta.context.io`:
 ```json
 {
@@ -229,12 +229,12 @@ Interpretación operativa:
     "channel": "slack",
     "entrypoint": { "kind": "slack_workspace", "id": "<team_id>" },
     "sender": { "kind": "slack_user", "id": "<user>" },
-    "conversation": { "kind": "slack_channel", "id": "<channel>", "thread_id": "<thread_ts si existe>" },
+    "conversation": { "kind": "slack_channel", "id": "<channel>", "thread_id": "<thread_ts if present>" },
     "message": { "id": "<event_id|ts>" },
     "reply_target": {
       "kind": "slack_post",
       "address": "<channel>",
-      "params": { "thread_ts": "<thread_ts si existe>", "workspace_id": "<team_id>" }
+      "params": { "thread_ts": "<thread_ts if present>", "workspace_id": "<team_id>" }
     },
     "relay": {
       "applied": true,
@@ -246,32 +246,32 @@ Interpretación operativa:
 }
 ```
 
-> Nota: si el Router inyecta `meta.ctx_window`, el IO Slack **DEBE** aceptarlo pero **NUNCA** debe serializarlo/reenviarlo a Slack (es información interna).
+> Note: if the Router injects `meta.ctx_window`, the Slack IO **MUST** accept it but must **NEVER** serialize/forward it to Slack (it is internal information).
 
 ### payload
 ```json
 {
   "type": "text",
-  "content": "<texto del mensaje sin la mención al bot>",
+  "content": "<message text without the bot mention>",
   "raw": { "slack_event": "..." }
 }
 ```
 
-### 7.1 Regla de offload por tamaño (delegada a SDK `send`)
-- `IO.slack` construye payload `text/v1` base (`content` + `attachments` cuando corresponda).
-- La decisión de dejar inline o convertir a `content_ref` por límite de tamaño **la toma `fluxbee_sdk::NodeSender::send`**.
-- Configuración relevante del enforcement SDK:
-  - defaults internos del SDK (`max_message_bytes=64KB`, `message_overhead_bytes=2048`).
-- Objetivo: evitar divergencias entre adapters IO y mantener un comportamiento único para `text/v1`.
+### 7.1 Size-based offload rule (delegated to the SDK `send`)
+- `IO.slack` builds the base `text/v1` payload (`content` + `attachments` when applicable).
+- The decision to keep it inline or convert it to `content_ref` because of the size limit **is made by `fluxbee_sdk::NodeSender::send`**.
+- Relevant configuration of the SDK enforcement:
+  - the SDK's internal defaults (`max_message_bytes=64KB`, `message_overhead_bytes=2048`).
+- Goal: avoid divergence between IO adapters and keep a single behavior for `text/v1`.
 
-Nota operativa:
-- `io.blob.*` en control-plane del nodo puede seguir siendo útil para validaciones/políticas del adapter, pero no gobierna por sí solo el auto-offload en `NodeSender::send`.
+Operational note:
+- `io.blob.*` in the node's control-plane can still be useful for adapter validations/policies, but on its own it does not govern the auto-offload in `NodeSender::send`.
 
-### 7.1.b Estado actual de attachments inbound aceptados
+### 7.1.b Current state of accepted inbound attachments
 
-En el camino actual `IO.slack` -> `io-common` -> router, los adjuntos inbound solo se normalizan a `attachments[]` cuando su MIME entra en la allowlist vigente de `io-common`.
+In the current `IO.slack` -> `io-common` -> router path, inbound attachments are only normalized to `attachments[]` when their MIME type is in the current `io-common` allowlist.
 
-Allowlist efectiva actual de `IO.slack`:
+Current effective allowlist of `IO.slack`:
 
 - `image/jpeg`
 - `image/png`
@@ -289,214 +289,214 @@ Allowlist efectiva actual de `IO.slack`:
 - `application/vnd.openxmlformats-officedocument.spreadsheetml.sheet`
 - `application/vnd.openxmlformats-officedocument.presentationml.presentation`
 
-Diseño aplicado:
+Applied design:
 
-- `io-common` mantiene la validación y enforcement común de `text/v1`
-- `IO.slack` define su policy efectiva de MIME aceptados
-- el override `IO_SLACK_ALLOWED_MIMES` / `io.blob.allowed_mimes_csv` sigue teniendo precedencia si se quiere ajustar el set en deploy
+- `io-common` keeps the common `text/v1` validation and enforcement
+- `IO.slack` defines its effective policy of accepted MIME types
+- the `IO_SLACK_ALLOWED_MIMES` / `io.blob.allowed_mimes_csv` override still takes precedence to adjust the set at deploy time
 
-Alcance exacto de esta lista:
+Exact scope of this list:
 
-- esta lista describe lo que `IO.slack` acepta hoy en este repo
-- no implica que `IO.slack` acepte todos los formatos de archivo que Slack pueda transportar
-- cualquier MIME fuera de esta lista sigue siendo rechazado por el adapter hasta que se agregue explicitamente y se valide su comportamiento E2E
+- this list describes what `IO.slack` accepts today in this repo
+- it does not imply that `IO.slack` accepts every file format Slack can carry
+- any MIME type outside this list is still rejected by the adapter until it is added explicitly and its E2E behavior is validated
 
-Consecuencia operativa actual:
+Current operational consequence:
 
-- si un attachment queda fuera de esta lista efectiva, se descarta inbound con `unsupported_attachment_mime`
-- esos archivos no llegan al router ni a `AI.*`
-- por lo tanto, si un tipo de archivo esta soportado del lado `AI` pero no entra en esta policy efectiva, el limite real E2E sigue estando en `IO.slack`
+- if an attachment is outside this effective list, it is dropped inbound with `unsupported_attachment_mime`
+- those files do not reach the router or `AI.*`
+- so if a file type is supported on the `AI` side but is not in this effective policy, the real E2E limit is still `IO.slack`
 
-Estado actual:
+Current state:
 
-- `png/jpg/webp/gif`: llegan como attachments
-- `pdf`: llega como attachment
-- `text/plain`, `text/markdown`, `application/json`: llegan como attachments
-- `csv`, `doc/docx`, `xls/xlsx`, `ppt/pptx`: quedan admitidos por la policy efectiva actual de `IO.slack`
+- `png/jpg/webp/gif`: arrive as attachments
+- `pdf`: arrives as an attachment
+- `text/plain`, `text/markdown`, `application/json`: arrive as attachments
+- `csv`, `doc/docx`, `xls/xlsx`, `ppt/pptx`: accepted by the current effective policy of `IO.slack`
 
-Lo que falta dejar cerrado por tipo:
+What is still to settle per type:
 
-- no hay garantia documental de que `IO.slack` acepte todos los formatos que hoy acepte Slack
-- faltan pruebas E2E asentadas por familias adicionales de MIME, por ejemplo audio y otros binarios fuera de office/PDF
-- si se decide sumar mas tipos, el criterio vigente es: agregarlos a la policy efectiva del adapter y validarlos de punta a punta
+- there is no documented guarantee that `IO.slack` accepts every format Slack accepts today
+- recorded E2E tests are missing for additional MIME families, for example audio and other binaries outside office/PDF
+- if more types are to be added, the current criterion is: add them to the adapter's effective policy and validate them end to end
 
-### 7.2 Estado de validación y límite del canal Slack
-- El mecanismo canónico de offload (`content` -> `content_ref` al superar límite) se valida de forma determinística con `io-sim`, porque no depende de límites del proveedor externo.
-- En `IO.slack` se valida integración end-to-end del adapter (ingreso/salida, adjuntos, contrato `text/v1`), pero no es un canal confiable para probar payloads de texto extremos.
-- Referencia oficial Slack (`chat.postMessage`): Slack recomienda textos cortos y **trunca mensajes por encima de 40.000 caracteres**.
-  - Fuente: https://docs.slack.dev/reference/methods/chat.postMessage/ (sección "Truncating content").
+### 7.2 Validation state and the Slack channel limit
+- The canonical offload mechanism (`content` -> `content_ref` when over the limit) is validated deterministically with `io-sim`, because it does not depend on the external provider's limits.
+- In `IO.slack`, the adapter's end-to-end integration is validated (input/output, attachments, `text/v1` contract), but it is not a reliable channel to test extreme text payloads.
+- Official Slack reference (`chat.postMessage`): Slack recommends short texts and **truncates messages above 40,000 characters**.
+  - Source: https://docs.slack.dev/reference/methods/chat.postMessage/ (section "Truncating content").
 
 ---
 
-## 8. Outbound: envío de mensajes a Slack
+## 8. Outbound: sending messages to Slack
 
-### 8.1 API utilizada
+### 8.1 API used
 - Slack Web API: `chat.postMessage`
-- Token requerido: **Bot Token** (`xoxb-...`)
-- Scope mínimo: `chat:write`
+- Required token: **Bot Token** (`xoxb-...`)
+- Minimal scope: `chat:write`
 
-### 8.2 Resolución de destino
+### 8.2 Destination resolution
 
-El Nodo IO Slack **DEBE**:
-- Enviar el mensaje al `channel` indicado.
-- Si `thread_ts` está presente, responder en el mismo hilo.
-- Caso contrario, publicar en el canal.
+The Slack IO Node **MUST**:
+- Send the message to the indicated `channel`.
+- If `thread_ts` is present, reply in the same thread.
+- Otherwise, post in the channel.
 
-### 8.3 Política de contenido largo (estado actual)
+### 8.3 Long content policy (current state)
 
-✅ **Implementado hoy:**
-- Si el payload inbound a `io-slack` trae `content_ref` de texto, `io-slack` resuelve el blob y lo envía como texto por `chat.postMessage`.
-- Los `attachments[]` del payload se envían como archivos usando el flujo externo de Slack files API.
+✅ **Implemented today:**
+- If the inbound payload to `io-slack` carries a text `content_ref`, `io-slack` resolves the blob and sends it as text through `chat.postMessage`.
+- The payload's `attachments[]` are sent as files using the external Slack files API flow.
 
-⚠️ **Limitación conocida (hoy):**
-- Para texto muy largo, este comportamiento puede chocar con el límite de `chat.postMessage` (Slack trunca por encima de 40.000 caracteres).
-- En consecuencia, si un nodo upstream (por ejemplo AI) devuelve texto muy grande via `content_ref`, hoy `io-slack` puede terminar publicando texto truncado si no viene además como attachment explícito.
+⚠️ **Known limitation (today):**
+- For very long text, this behavior can hit the `chat.postMessage` limit (Slack truncates above 40,000 characters).
+- As a result, if an upstream node (for example AI) returns very large text via `content_ref`, today `io-slack` may end up posting truncated text unless it also comes as an explicit attachment.
 
-🧩 **TBD / a normar para Slack:**
-- Definir fallback canónico cuando `resolved.text` excede límite de Slack:
-  - subir texto completo como archivo/snippet y no truncar,
-  - opcionalmente agregar notice configurable/localizable,
-  - o chunking controlado si se adopta esa estrategia.
+🧩 **TBD / to be standardized for Slack:**
+- Define the canonical fallback when `resolved.text` exceeds Slack's limit:
+  - upload the full text as a file/snippet and do not truncate,
+  - optionally add a configurable/localizable notice,
+  - or controlled chunking if that strategy is adopted.
 
-Referencia oficial de límite:
+Official limit reference:
 - https://docs.slack.dev/reference/methods/chat.postMessage/ ("Truncating content").
 
 ---
 
-## 9. Outbox e idempotencia outbound
+## 9. Outbox and outbound idempotency
 
-### Modelo MVP (sin DB/Redis)
-- Outbox/cola en memoria con estados:
+### MVP model (no DB/Redis)
+- In-memory outbox/queue with states:
   - `PENDING`, `SENDING`, `SENT`, `FAILED`, `DEAD`
-- Reintentos con backoff y límite configurable.
-- Límites obligatorios: `max_pending`, `max_inflight`, `max_age_ms`.
+- Retries with backoff and a configurable limit.
+- Mandatory limits: `max_pending`, `max_inflight`, `max_age_ms`.
 
-### Idempotencia (Slack)
-Para el MVP:
-- La idempotencia outbound se garantiza por tracking en memoria del outbox.
-- No se debe reenviar un mensaje marcado como `SENT` mientras el proceso esté vivo.
-- En caso de duda (timeout sin respuesta), se reintenta respetando backoff.
+### Idempotency (Slack)
+For the MVP:
+- Outbound idempotency is guaranteed by in-memory tracking of the outbox.
+- A message marked as `SENT` must not be resent while the process is alive.
+- When in doubt (timeout without a response), retry respecting the backoff.
 
-> Nota: tras restart, se pierde el outbox y puede haber pérdida de outbound no enviado aún.
+> Note: after a restart, the outbox is lost, and outbound messages not sent yet may be lost.
 
 ---
 
-## 10. Manejo de errores específicos de Slack
+## 10. Handling Slack-specific errors
 
-Errores comunes a manejar:
+Common errors to handle:
 - `rate_limited`
 - `channel_not_found`
 - `not_in_channel`
 - `invalid_auth` / `token_revoked`
 
-Reglas:
-- Errores de rate limit -> retry con backoff.
-- Errores de permisos/configuración -> `DEAD` + auditoría.
+Rules:
+- Rate limit errors -> retry with backoff.
+- Permission/configuration errors -> `DEAD` + audit.
 
 ---
 
-## 11. Configuración mínima requerida
+## 11. Minimal required configuration
 
 - `SLACK_APP_TOKEN` (xapp)
 - `SLACK_BOT_TOKEN` (xoxb)
-- `SLACK_SIGNING_SECRET` (si se usa Events API)
+- `SLACK_SIGNING_SECRET` (if the Events API is used)
 
-Modo spawn/orchestrator (compliance path):
-- El nodo puede leer configuración desde `config.json` de spawn:
-  - ruta canónica: `/var/lib/fluxbee/nodes/IO/<node_name>/config.json`
-- Tokens soportados en config:
+Spawn/orchestrator mode (compliance path):
+- The node can read configuration from the spawn `config.json`:
+  - canonical path: `/var/lib/fluxbee/nodes/IO/<node_name>/config.json`
+- Tokens supported in config:
   - `slack.app_token`, `slack.bot_token`
   - `slack.app_token_ref`, `slack.bot_token_ref` (`env:VAR`)
-- Precedencia:
-  - env explícito (`SLACK_APP_TOKEN`/`SLACK_BOT_TOKEN`) sobre config de spawn.
-- Contrato de spawn activo:
-  - requiere `FLUXBEE_NODE_NAME` inyectado por orchestrator
-  - sin fallback legacy de `NODE_NAME`/`ISLAND_ID`
-  - sin path override legacy de config de spawn
+- Precedence:
+  - explicit env (`SLACK_APP_TOKEN`/`SLACK_BOT_TOKEN`) over the spawn config.
+- Active spawn contract:
+  - requires `FLUXBEE_NODE_NAME` injected by the orchestrator
+  - no legacy `NODE_NAME`/`ISLAND_ID` fallback
+  - no legacy path override for the spawn config
 
-## 12. Gaps conocidos (estado actual)
+## 12. Known gaps (current state)
 
-- Frontera core vs node control-plane:
-  - `PUT .../config` (core) mantiene `config.json` administrado por orchestrator.
-  - hot reload runtime/business de `IO.slack` se aplica por `CONFIG_SET` (control-plane del nodo).
-  - `CONFIG_CHANGED` se trata como señal informativa de infraestructura; no reemplaza `CONFIG_SET` en v1.
+- Boundary between core and the node control-plane:
+  - `PUT .../config` (core) maintains the `config.json` managed by the orchestrator.
+  - the runtime/business hot reload of `IO.slack` is applied through `CONFIG_SET` (the node's control-plane).
+  - `CONFIG_CHANGED` is treated as an informational infrastructure signal; it does not replace `CONFIG_SET` in v1.
 
-- Fallback de configuración y resiliencia de proceso:
-  - hoy, si faltan credenciales (`slack.app_token`/`slack.bot_token`) el proceso termina con `exit 1`.
-  - comportamiento esperado (pendiente): no crash; reportar estado/config error y seguir atendiendo control-plane.
+- Configuration fallback and process resilience:
+  - today, if credentials are missing (`slack.app_token`/`slack.bot_token`), the process ends with `exit 1`.
+  - expected behavior (pending): no crash; report the state/config error and keep serving the control-plane.
 
-- Bloqueante operativo (prioridad alta):
-  - hoy el runtime trata falta de config/secrets como fatal de arranque (`exit 1`), lo que provoca restart loop en systemd.
-  - responsabilidad de `IO.slack`: este caso debe pasar a modo degradado/no-ready, sin terminar proceso.
-  - estado esperado (pendiente): levantar el runtime, publicar estado de error de config y permanecer controlable por orchestrator/admin.
-
-
-
-### Aclaración - Identidad L3 (v1.16+)
-
-El Nodo IO Slack no implementa un protocolo de sesión con Identity.
-Usa lookup por SHM + provision on miss en el pipeline compartido de `io-common`.
-
-La resolución primaria es por SHM (`jsr-identity-*`).
-Cuando hay miss/error, el provisioner puede enviar `ILK_PROVISION` a `SY.identity`.
-
-Si no se obtiene `src_ilk` (fallo/timeout), el IO **DEBE** enviar al Router con
-`meta.src_ilk = null` para degradación controlada/onboarding.
-
-Esta definición reemplaza cualquier modo legacy o lógica de identidad ad-hoc en el nodo Slack.
+- Operational blocker (high priority):
+  - today the runtime treats missing config/secrets as a fatal startup error (`exit 1`), which causes a restart loop in systemd.
+  - `IO.slack` responsibility: this case must move to a degraded/not-ready mode, without ending the process.
+  - expected state (pending): bring up the runtime, publish a config error state and stay controllable by the orchestrator/admin.
 
 
 
-### Aclaración - meta.ctx vs meta.context
+### Clarification - L3 identity (v1.16+)
 
-Según la especificación del Router v1.16:
+The Slack IO Node does not implement a session protocol with Identity.
+It uses lookup through SHM + provision on miss in the shared `io-common` pipeline.
 
-- `meta.ctx` representa el **Contexto Conversacional (CTX)**
-- `meta.context` se reserva exclusivamente para **datos adicionales evaluados por OPA**
+The primary resolution is through SHM (`jsr-identity-*`).
+On a miss/error, the provisioner may send `ILK_PROVISION` to `SY.identity`.
 
-`meta.context` **NO** debe usarse para almacenar historia, turns ni contexto conversacional.
-`meta.context.thread_id` fue removido del pipeline IO; el carrier válido es `meta.thread_id`.
+If no `src_ilk` is obtained (failure/timeout), the IO **MUST** send to the Router with
+`meta.src_ilk = null` for controlled degradation/onboarding.
 
-
-
-## Retries y deduplicación
-
-✅ **NORMATIVO (HOY, Socket Mode)**:
-- La deduplicación general sigue usando un `message_id` estable (preferentemente `event_id`; fallback `ts`).
-- Además, el relay común hace deduplicación best-effort por `fragment_id` dentro de cada sesión abierta.
-- No se depende de headers `X-Slack-Retry-*` (propios de HTTP Events API), dado que el modo activo es Socket Mode.
-
-🧩 **A ESPECIFICAR**:
-- Si a futuro se habilita ingestión por HTTP Events API, se deberá incorporar manejo explícito de `X-Slack-Retry-*` y una política de dedupe consistente.
+This definition replaces any legacy mode or ad-hoc identity logic in the Slack node.
 
 
 
-## Configuración en caliente (sin reinicio)
+### Clarification - meta.ctx vs meta.context
 
-✅ **NORMATIVO**:
-- El nodo Slack **debe** poder actualizar credenciales/config sin depender de un restart del orchestrator, usando Control Plane (`CONFIG_SET`).
-- Precedencia sugerida:
-  1) Override en memoria recibido por `CONFIG_SET` (si existe)
-  2) Config local (YAML/env)
-- En reinicio, el override en memoria se pierde; si no hay config local, el nodo puede quedar `FAILED_CONFIG (missing_secret)` hasta recibir `CONFIG_SET` nuevamente.
+According to the Router v1.16 specification:
 
-Superficie vigente de relay en `CONFIG_SET` / config efectiva:
+- `meta.ctx` represents the **Conversational Context (CTX)**
+- `meta.context` is reserved exclusively for **additional data evaluated by OPA**
+
+`meta.context` must **NOT** be used to store history, turns or conversational context.
+`meta.context.thread_id` was removed from the IO pipeline; the valid carrier is `meta.thread_id`.
+
+
+
+## Retries and deduplication
+
+✅ **NORMATIVE (TODAY, Socket Mode)**:
+- General deduplication still uses a stable `message_id` (preferably `event_id`; fallback `ts`).
+- In addition, the common relay does best-effort deduplication by `fragment_id` within each open session.
+- There is no dependency on `X-Slack-Retry-*` headers (specific to the HTTP Events API), since the active mode is Socket Mode.
+
+🧩 **TO BE SPECIFIED**:
+- If ingestion through the HTTP Events API is enabled in the future, explicit handling of `X-Slack-Retry-*` and a consistent dedupe policy will have to be added.
+
+
+
+## Hot configuration (no restart)
+
+✅ **NORMATIVE**:
+- The Slack node **must** be able to update credentials/config without depending on an orchestrator restart, using the Control Plane (`CONFIG_SET`).
+- Suggested precedence:
+  1) In-memory override received through `CONFIG_SET` (if any)
+  2) Local config (YAML/env)
+- On restart, the in-memory override is lost; if there is no local config, the node may stay `FAILED_CONFIG (missing_secret)` until it receives `CONFIG_SET` again.
+
+Current relay surface in `CONFIG_SET` / effective config:
 
 - `config.io.relay.window_ms`
 - `config.io.relay.max_open_sessions`
 - `config.io.relay.max_fragments_per_session`
 - `config.io.relay.max_bytes_per_session`
 
-## Logging operativo del relay
+## Operational logging of the relay
 
-Política vigente:
+Current policy:
 
-- no usar logs periódicos ni snapshots constantes;
-- usar logs por evento relevante del relay;
-- `debug` para apertura de sesión, buffering, flush y dedup;
-- `warn` para capacidad, expiración, drops o fallback fail-open;
-- `info` para la inicialización de política del relay al arranque.
+- do not use periodic logs or constant snapshots;
+- use logs per relevant relay event;
+- `debug` for session open, buffering, flush and dedup;
+- `warn` for capacity, expiry, drops or fail-open fallback;
+- `info` for the relay policy initialization at startup.
 
-Observación de deploy:
+Deploy note:
 
-- el `start.sh` publicado deja `RUST_LOG` incluyendo `io_common=debug`, por lo que los logs del relay deberían verse en `journalctl`.
+- the published `start.sh` sets `RUST_LOG` including `io_common=debug`, so the relay logs should show up in `journalctl`.

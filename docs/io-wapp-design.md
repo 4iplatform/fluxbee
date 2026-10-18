@@ -282,7 +282,7 @@ Mirror io.slack: inbound → fetch media via Graph media URL (bearer) → `BlobT
    `IO.wapp.<label>` node its tenant launches with `run_node`.
 6. **Live validation** — deploy to the dev hive; boots UNCONFIGURED; then a real webhook round-trip
    once a WABA + token are available. ✅ **Degraded-boot half DONE (2026-07-25, hive 240):** rolled out
-   via the canonical runtime channel (docs/14-runtime-rollout-motherbee.md: build on fb-build →
+   via the canonical runtime channel (docs/history/14-runtime-rollout-motherbee.md: build on fb-build →
    publish-runtime.sh io.wapp@0.1.0 → `/update` ok → `/nodes` spawn). `IO.wapp.default@motherbee` unit
    active, connected to the router, logs "no wapp.auth.key … running degraded", and live CONFIG_GET
    (`/control/config-get`) reports **`state: UNCONFIGURED`** (boilerplate-only seed → Unconfigured, the

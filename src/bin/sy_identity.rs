@@ -6405,7 +6405,7 @@ async fn send_delta_ack(
 // ===========================================================================
 // Upstream push (replica → primary): bidirectional ilk sync. A replica publishes
 // its own `@hive` ilks so the primary (motherbee) converges to the additive
-// union of the whole mesh. See docs/onworking COA/ilk-bidirectional-sync.md.
+// union of the whole mesh. See docs/history/onworking-coa/ilk-bidirectional-sync.md.
 // ===========================================================================
 
 /// A frame the replica's main loop hands to its publish task: an incremental

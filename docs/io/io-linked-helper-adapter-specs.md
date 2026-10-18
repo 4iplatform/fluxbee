@@ -1,400 +1,400 @@
-# Especificación técnica v0 — Adapter `Linked Helper`
-## Definiciones básicas para MVP
+# Technical specification v0 — `Linked Helper` adapter
+## Basic definitions for the MVP
 
-> Documento de trabajo para establecer la primera especificación técnica del adapter de Linked Helper.
+> Working document to set the first technical specification of the Linked Helper adapter.
 >
-> Estado: v0 / definiciones básicas.
+> Status: v0 / basic definitions.
 >
-> Objetivo: fijar el alcance, responsabilidades, supuestos y decisiones base del adapter para poder avanzar sobre diseño detallado e implementación.
-> 2026-05-15: Nota importante. Esta documentación se preparó antes de los cambios del monitor de LH. Antes de avanzar con este documento (ya sea para re-definir o implementarlo) es **OBLIGATORIO** revisar si todos los conceptos aquí establecidos siguen siendo vigentes
+> Goal: fix the scope, responsibilities, assumptions and base decisions of the adapter, so that detailed design and implementation can move forward.
+> 2026-05-15: Important note. This documentation was prepared before the changes to the LH monitor. Before moving forward with this document (whether to redefine it or implement it) it is **MANDATORY** to check whether all the concepts set here are still current
 
 ---
 
-# 1. Alcance
+# 1. Scope
 
-Este documento define el adapter de Linked Helper como un componente que:
+This document defines the Linked Helper adapter as a component that:
 
-- corre en la misma PC donde está instalado y funcionando Linked Helper;
-- observa estructuras técnicas locales de Linked Helper;
-- detecta instancias, profiles y conversaciones relevantes;
-- persiste estado local en SQLite embebido;
-- se comunica con el nodo `IO.linkedhelper` por HTTP/HTTPS;
-- envía eventos hacia Fluxbee a través del nodo;
-- recibe resultados/cambios por beacon;
-- y ejecuta en Linked Helper las acciones que correspondan.
+- runs on the same PC where Linked Helper is installed and running;
+- observes Linked Helper's local technical structures;
+- detects relevant instances, profiles and conversations;
+- persists local state in embedded SQLite;
+- communicates with the `IO.linkedhelper` node over HTTP/HTTPS;
+- sends events to Fluxbee through the node;
+- receives results/changes through the beacon;
+- and executes the corresponding actions in Linked Helper.
 
-Este documento **no** cierra todavía:
+This document does **not** settle yet:
 
-- el schema exacto de SQLite;
-- el contrato JSON final de cada payload;
-- la estrategia fina de concurrencia en Rust;
-- la taxonomía completa de alertas;
-- el soporte de adjuntos;
-- el soporte de edición/borrado de mensajes ya enviados;
-- ni el mecanismo exacto de acceso a Linked Helper.
-
----
-
-# 2. Tecnología base
-
-## 2.1. Lenguaje
-El adapter se implementará en **Rust**.
-
-## 2.2. Persistencia local
-El adapter utilizará **SQLite embebido** como base de datos local.
-
-## 2.3. Rol de SQLite
-SQLite se usará para:
-
-- persistir estado local durable;
-- sostener la identidad local del adapter y su configuración operativa;
-- registrar entities observadas desde Linked Helper;
-- registrar eventos salientes;
-- registrar resultados/acciones entrantes;
-- permitir reconstrucción del estado tras reinicio;
-- y sostener idempotencia básica del adapter.
+- the exact SQLite schema;
+- the final JSON contract of each payload;
+- the fine-grained concurrency strategy in Rust;
+- the full alert taxonomy;
+- attachment support;
+- support for editing/deleting messages already sent;
+- or the exact mechanism to access Linked Helper.
 
 ---
 
-# 3. Principio rector
+# 2. Base technology
 
-El adapter:
+## 2.1. Language
+The adapter will be implemented in **Rust**.
 
-- **interpreta la estructura técnica** de Linked Helper;
-- **transporta eventos canónicos** hacia el nodo;
-- pero **no resuelve identidad canónica de negocio**, tenant final, capacidades, prompting ni decisiones funcionales del sistema.
+## 2.2. Local persistence
+The adapter will use **embedded SQLite** as its local database.
 
-En otras palabras:
+## 2.3. Role of SQLite
+SQLite will be used to:
 
-- entiende **cómo leer y actuar** sobre Linked Helper;
-- no decide **qué significa** eso a nivel de negocio dentro de Fluxbee.
+- persist durable local state;
+- hold the adapter's local identity and its operational configuration;
+- record entities observed from Linked Helper;
+- record outgoing events;
+- record incoming results/actions;
+- allow rebuilding the state after a restart;
+- and support the adapter's basic idempotency.
 
 ---
 
-# 4. Responsabilidades del adapter
+# 3. Guiding principle
 
-## 4.1. Descubrimiento local
-Debe poder:
+The adapter:
 
-- detectar instancias relevantes de Linked Helper;
-- detectar profiles disponibles;
-- detectar conversaciones/mensajes relevantes;
-- y mantener actualizado ese estado localmente.
+- **interprets the technical structure** of Linked Helper;
+- **carries canonical events** to the node;
+- but **does not resolve the canonical business identity**, the final tenant, capabilities, prompting or functional decisions of the system.
 
-## 4.2. Construcción de ids externos canónicos
-Debe construir los ids externos canónicos necesarios para el canal, en especial:
+In other words:
+
+- it understands **how to read and act** on Linked Helper;
+- it does not decide **what that means** at the business level inside Fluxbee.
+
+---
+
+# 4. Responsibilities of the adapter
+
+## 4.1. Local discovery
+It must be able to:
+
+- detect relevant Linked Helper instances;
+- detect available profiles;
+- detect relevant conversations/messages;
+- and keep that state up to date locally.
+
+## 4.2. Building canonical external ids
+It must build the canonical external ids the channel needs, in particular:
 
 - `external_profile_id`
-- ids canónicos de contacto, cuando aplique
+- canonical contact ids, when applicable
 
-Estos ids deben llegar al nodo ya listos para usar.
+These ids must reach the node ready to use.
 
-## 4.3. Persistencia local
-Debe persistir el estado mínimo necesario para:
+## 4.3. Local persistence
+It must persist the minimal state needed to:
 
-- no reenviar eventos ya enviados;
-- no perder seguimiento al reiniciar;
-- reconstruir colas locales;
-- y sostener idempotencia de eventos y acciones.
+- not resend events already sent;
+- not lose track on restart;
+- rebuild local queues;
+- and support idempotency of events and actions.
 
-## 4.4. Consolidación de mensajes
-Debe consolidar localmente los mensajes conversacionales antes de emitir `conversation_message`.
+## 4.4. Message consolidation
+It must consolidate conversational messages locally before emitting `conversation_message`.
 
-La consolidación pertenece al adapter porque:
+Consolidation belongs to the adapter because:
 
-- Linked Helper ya persiste los mensajes de manera apta para consolidarlos;
-- el adapter conoce la estructura real de datos de LH;
-- y el nodo no debería absorber lógica específica del almacenamiento interno de LH.
+- Linked Helper already persists the messages in a way suited to consolidating them;
+- the adapter knows LH's real data structure;
+- and the node should not absorb logic specific to LH's internal storage.
 
-## 4.5. Comunicación con el nodo
-Debe:
+## 4.5. Communication with the node
+It must:
 
-- iniciar siempre la comunicación con el nodo;
-- enviar eventos;
-- hacer polling/beacon periódico;
-- recibir `ack`, `result` y `heartbeat`;
-- y actualizar su estado local en función de esas respuestas.
+- always start the communication with the node;
+- send events;
+- do periodic polling/beacon;
+- receive `ack`, `result` and `heartbeat`;
+- and update its local state based on those responses.
 
-## 4.6. Ejecución de acciones en LH
-Debe ejecutar en Linked Helper las acciones que el sistema le devuelva por el canal, dentro del alcance del MVP.
+## 4.6. Executing actions in LH
+It must execute in Linked Helper the actions the system returns to it through the channel, within the MVP scope.
 
-## 4.7. Monitoreo operativo
-Debe detectar y registrar fallas operativas propias o del acceso a LH, pudiendo emitir alertas cuando corresponda.
-
----
-
-# 5. Qué NO hace el adapter
-
-El adapter no debe:
-
-- definir la identidad definitiva del profile;
-- decidir el tenant representado;
-- resolver capacidades, prompting o rol del profile;
-- exponer la fuente de verdad del estado de ICH;
-- ser responsable de la administración global de ILKs/ICHs;
-- ni convertirse en un backend de negocio paralelo.
-
-Eso pertenece al nodo y/o a core según corresponda.
+## 4.7. Operational monitoring
+It must detect and record operational failures, its own or in the access to LH, and may emit alerts when appropriate.
 
 ---
 
-# 6. Relación con el nodo `IO.linkedhelper`
+# 5. What the adapter does NOT do
 
-El adapter se relaciona con el nodo bajo estos principios:
+The adapter must not:
 
-- el nodo es el punto de traducción hacia Fluxbee;
-- el adapter no consume ILKs provisorios;
-- el adapter no automatiza para un profile hasta recibir su estado listo/utilizable;
-- la automatización se gobierna por el ICH del canal;
-- el adapter reacciona a `automation_enabled` / `automation_disabled`;
-- y el nodo sigue siendo quien observa la promoción del ILK y los cambios de sus ICHs propios.
+- define the profile's final identity;
+- decide the represented tenant;
+- resolve the profile's capabilities, prompting or role;
+- expose the source of truth of the ICH state;
+- be responsible for the global administration of ILKs/ICHs;
+- or become a parallel business backend.
 
-Esto es consistente con la base documental actual del nodo. fileciteturn37file0turn37file1turn37file2turn37file3
-
----
-
-# 7. Modelo básico de operación
-
-## 7.1. Observación
-El adapter observa el estado local de Linked Helper.
-
-## 7.2. Normalización
-Transforma lo observado en eventos canónicos del canal.
-
-## 7.3. Persistencia
-Persiste esos eventos y su estado local en SQLite.
-
-## 7.4. Envío
-Envía los eventos al nodo en el siguiente ciclo de polling/beacon.
-
-## 7.5. Recepción
-Recibe respuestas/resultados/cambios del nodo.
-
-## 7.6. Aplicación
-Aplica localmente las acciones necesarias en LH.
-
-## 7.7. Confirmación local
-Persiste el resultado de aplicación, éxito o error.
+That belongs to the node and/or to core, as appropriate.
 
 ---
 
-# 8. Consolidación de mensajes
+# 6. Relationship with the `IO.linkedhelper` node
 
-## 8.1. Decisión
-Para el MVP, la consolidación ocurre en el adapter.
+The adapter relates to the node under these principles:
 
-## 8.2. Motivo
-La fuente real de mensajes es Linked Helper y el adapter conoce cómo se almacenan.
+- the node is the translation point toward Fluxbee;
+- the adapter does not consume provisional ILKs;
+- the adapter does not automate for a profile until it receives its ready/usable state;
+- automation is governed by the channel's ICH;
+- the adapter reacts to `automation_enabled` / `automation_disabled`;
+- and the node is still the one that observes the ILK promotion and the changes to its own ICHs.
 
-## 8.3. Tipo de consolidación
-La consolidación será inicialmente:
-
-- mecánica;
-- determinista;
-- basada en la estructura técnica observada en LH;
-- no “inteligente” ni semántica de negocio.
-
-## 8.4. Resultado esperado
-El adapter emite un `conversation_message` consolidado como unidad conversacional usable por el nodo.
+This is consistent with the node's current documentation base. fileciteturn37file0turn37file1turn37file2turn37file3
 
 ---
 
-# 9. Idempotencia y deduplicación local
+# 7. Basic operating model
 
-## 9.1. Principio
-La deduplicación que importa en el adapter no es la deduplicación de datos crudos de LH, sino la de:
+## 7.1. Observation
+The adapter observes Linked Helper's local state.
 
-- eventos salientes;
-- acciones/resultado entrantes.
+## 7.2. Normalization
+It turns what it observes into canonical channel events.
 
-## 9.2. Reglas mínimas
-El adapter debe evitar:
+## 7.3. Persistence
+It persists those events and their local state in SQLite.
 
-- enviar dos veces el mismo `profile_create`;
-- enviar dos veces el mismo bloque consolidado de `conversation_message`;
-- ejecutar dos veces la misma acción lógica recibida del nodo.
+## 7.4. Sending
+It sends the events to the node in the next polling/beacon cycle.
 
-## 9.3. Consecuencia
-La persistencia local debe permitir saber:
+## 7.5. Reception
+It receives responses/results/changes from the node.
 
-- qué evento ya fue emitido;
-- qué evento fue reconocido;
-- qué acción ya fue aplicada;
-- y qué quedó pendiente.
+## 7.6. Application
+It applies the needed actions in LH locally.
 
----
-
-# 10. Cambios y borrados de mensajes
-
-## 10.1. Alcance MVP
-El MVP del adapter contempla **detección de nuevos mensajes**, no edición/borrado de mensajes ya enviados.
-
-## 10.2. Motivo
-No hay todavía suficiente certeza técnica sobre:
-
-- soporte real y consistente de LinkedIn para edición/borrado post-envío;
-- visibilidad confiable de esos cambios desde Linked Helper;
-- ni valor suficiente para cargar esa complejidad en la primera versión.
-
-## 10.3. Futuro
-Queda como posible extensión posterior si se verifica que LH lo expone de forma consistente y útil.
+## 7.7. Local confirmation
+It persists the result of the application, success or error.
 
 ---
 
-# 11. Alertas propias del adapter
+# 8. Message consolidation
 
-## 11.1. Principio
-El adapter puede emitir alertas propias, pero de forma acotada.
+## 8.1. Decision
+For the MVP, consolidation happens in the adapter.
 
-## 11.2. Tipo de alertas esperables
-Ejemplos:
+## 8.2. Reason
+The real source of messages is Linked Helper, and the adapter knows how they are stored.
 
-- imposibilidad de acceder a estructuras necesarias de LH;
-- inconsistencia fuerte en datos observados;
-- imposibilidad de persistir en SQLite;
-- imposibilidad prolongada de comunicación con el nodo;
-- imposibilidad de ejecutar una acción local en LH;
-- otros fallos técnicos del propio adapter.
+## 8.3. Type of consolidation
+Consolidation will initially be:
 
-## 11.3. Límite
-El adapter no debe convertirse en un sistema de monitoreo complejo ni emitir alertas arbitrarias.
+- mechanical;
+- deterministic;
+- based on the technical structure observed in LH;
+- not “intelligent”, and not business semantics.
 
----
-
-# 12. Profiles y automatización
-
-## 12.1. Profiles nuevos
-Cuando el adapter detecta un profile nuevo:
-
-- lo reporta;
-- pero no inicia automatización para ese profile;
-- y no usa ningún ILK provisorio.
-
-## 12.2. Activación
-Solo comienza a automatizar cuando recibe por el canal que el profile quedó listo y su automatización está habilitada.
-
-## 12.3. Desactivación
-Cuando recibe `automation_disabled`:
-
-- deja de buscar/reportar mensajes para automatización de ese profile;
-- aunque puede seguir observando y reportando estados/alertas no conversacionales si corresponde.
+## 8.4. Expected result
+The adapter emits a consolidated `conversation_message` as a conversational unit the node can use.
 
 ---
 
-# 13. Persistencia local en SQLite
+# 9. Idempotency and local deduplication
 
-## 13.1. Decisión
-SQLite embebido será la persistencia local oficial del adapter.
+## 9.1. Principle
+The deduplication that matters in the adapter is not the deduplication of LH's raw data, but that of:
 
-## 13.2. Funciones mínimas que debe cubrir
-Debe poder sostener:
+- outgoing events;
+- incoming actions/results.
 
-- configuración local del adapter;
-- estado de instancias detectadas;
-- estado de profiles detectados;
-- mapping de ids externos;
-- eventos salientes;
-- resultados/acciones entrantes;
-- ejecución local de acciones;
-- errores/reintentos básicos;
-- y marcas de idempotencia.
+## 9.2. Minimal rules
+The adapter must avoid:
 
-## 13.3. Estado
-El modelo exacto de tablas/entidades queda pendiente de definición detallada en la próxima iteración.
+- sending the same `profile_create` twice;
+- sending the same consolidated `conversation_message` block twice;
+- executing the same logical action received from the node twice.
 
----
+## 9.3. Consequence
+Local persistence must make it possible to know:
 
-# 14. Polling y beacon
-
-## 14.1. Principio
-El adapter inicia siempre la comunicación con el nodo.
-
-## 14.2. Comportamiento
-En cada ciclo:
-
-- si tiene eventos, los envía;
-- si no tiene eventos, envía heartbeat;
-- y en ambos casos recibe resultados/cambios pendientes del nodo.
-
-## 14.3. Estado
-La frecuencia, tamaño de lote y prioridades quedan para el diseño detallado.
+- which event was already emitted;
+- which event was acknowledged;
+- which action was already applied;
+- and what is still pending.
 
 ---
 
-# 15. Acciones mínimas del MVP
+# 10. Message edits and deletions
 
-Para el MVP, el adapter debe estar pensado para soportar al menos:
+## 10.1. MVP scope
+The adapter MVP covers **detection of new messages**, not editing/deleting messages already sent.
 
-- detección de profiles;
-- envío de `profile_create`;
-- consolidación y envío de `conversation_message`;
-- recepción de `profile_ready`;
-- recepción de `automation_enabled` / `automation_disabled`;
-- ejecución básica de envío de mensajes en LH;
-- persistencia local del resultado de esas acciones;
-- y manejo básico de errores.
+## 10.2. Reason
+There is not yet enough technical certainty about:
 
----
+- real and consistent LinkedIn support for post-send editing/deleting;
+- reliable visibility of those changes from Linked Helper;
+- or enough value to take on that complexity in the first version.
 
-# 16. Seguridad local
-
-## 16.1. Estado actual
-La seguridad local queda como tema a detallar más adelante.
-
-## 16.2. Base mínima
-Debe contemplarse al menos:
-
-- ubicación segura de installation key;
-- ubicación y permisos de la SQLite;
-- ubicación y permisos de logs;
-- y comportamiento básico ante copia o reinstalación del adapter.
+## 10.3. Future
+It is left as a possible later extension, if it is verified that LH exposes it in a consistent and useful way.
 
 ---
 
-# 17. Observabilidad mínima
+# 11. The adapter's own alerts
 
-El adapter debería ofrecer, como mínimo:
+## 11.1. Principle
+The adapter may emit its own alerts, but in a limited way.
 
-- logs estructurados;
-- visibilidad del estado del polling;
-- visibilidad del backlog local;
-- visibilidad de errores de ejecución;
-- y última comunicación exitosa/fallida con el nodo.
+## 11.2. Kinds of expected alerts
+Examples:
 
-El mecanismo concreto queda para el diseño detallado.
+- inability to access needed LH structures;
+- strong inconsistency in observed data;
+- inability to persist to SQLite;
+- prolonged inability to communicate with the node;
+- inability to execute a local action in LH;
+- other technical failures of the adapter itself.
 
----
-
-# 18. Temas que quedan para la siguiente iteración
-
-1. modelo de datos SQLite
-2. pipeline interno exacto del adapter
-3. frecuencia y política de polling/lotes
-4. ejecución concreta de acciones sobre LH
-5. categorías de error y retries
-6. concurrencia interna en Rust
-7. mecanismo exacto de acceso a LH
-8. taxonomía mínima de `system_alert`
-9. observabilidad concreta
-10. seguridad local detallada
+## 11.3. Limit
+The adapter must not become a complex monitoring system or emit arbitrary alerts.
 
 ---
 
-# 19. Síntesis
+# 12. Profiles and automation
 
-El adapter de Linked Helper, en esta v0, queda definido como un componente en Rust con SQLite embebido que:
+## 12.1. New profiles
+When the adapter detects a new profile:
 
-- observa Linked Helper localmente;
-- interpreta su estructura técnica;
-- consolida mensajes conversacionales;
-- construye ids externos canónicos;
-- persiste estado local durable;
-- emite eventos al nodo `IO.linkedhelper`;
-- recibe resultados/cambios por beacon;
-- ejecuta acciones locales en LH;
-- y mantiene idempotencia y manejo básico de errores.
+- it reports it;
+- but it does not start automation for that profile;
+- and it does not use any provisional ILK.
 
-Esta base ya es suficiente para avanzar a una especificación más detallada centrada en:
-- modelo de datos SQLite,
-- pipeline interno,
-- y ejecución de acciones.
+## 12.2. Activation
+It only starts automating when it receives, through the channel, that the profile is ready and its automation is enabled.
+
+## 12.3. Deactivation
+When it receives `automation_disabled`:
+
+- it stops looking for/reporting messages for that profile's automation;
+- although it may keep observing and reporting non-conversational states/alerts, if appropriate.
+
+---
+
+# 13. Local persistence in SQLite
+
+## 13.1. Decision
+Embedded SQLite will be the adapter's official local persistence.
+
+## 13.2. Minimal functions it must cover
+It must be able to hold:
+
+- the adapter's local configuration;
+- the state of detected instances;
+- the state of detected profiles;
+- the mapping of external ids;
+- outgoing events;
+- incoming results/actions;
+- local execution of actions;
+- basic errors/retries;
+- and idempotency marks.
+
+## 13.3. Status
+The exact table/entity model is pending a detailed definition in the next iteration.
+
+---
+
+# 14. Polling and beacon
+
+## 14.1. Principle
+The adapter always starts the communication with the node.
+
+## 14.2. Behavior
+In each cycle:
+
+- if it has events, it sends them;
+- if it has no events, it sends a heartbeat;
+- and in both cases it receives pending results/changes from the node.
+
+## 14.3. Status
+The frequency, batch size and priorities are left for the detailed design.
+
+---
+
+# 15. Minimal MVP actions
+
+For the MVP, the adapter must be designed to support at least:
+
+- profile detection;
+- sending `profile_create`;
+- consolidating and sending `conversation_message`;
+- receiving `profile_ready`;
+- receiving `automation_enabled` / `automation_disabled`;
+- basic execution of message sending in LH;
+- local persistence of the result of those actions;
+- and basic error handling.
+
+---
+
+# 16. Local security
+
+## 16.1. Current status
+Local security is left as a topic to detail later.
+
+## 16.2. Minimal baseline
+At least the following must be covered:
+
+- a secure location for the installation key;
+- location and permissions of the SQLite database;
+- location and permissions of the logs;
+- and basic behavior when the adapter is copied or reinstalled.
+
+---
+
+# 17. Minimal observability
+
+The adapter should offer, at a minimum:
+
+- structured logs;
+- visibility of the polling state;
+- visibility of the local backlog;
+- visibility of execution errors;
+- and the last successful/failed communication with the node.
+
+The concrete mechanism is left for the detailed design.
+
+---
+
+# 18. Topics left for the next iteration
+
+1. SQLite data model
+2. the adapter's exact internal pipeline
+3. polling/batch frequency and policy
+4. concrete execution of actions on LH
+5. error categories and retries
+6. internal concurrency in Rust
+7. exact mechanism to access LH
+8. minimal `system_alert` taxonomy
+9. concrete observability
+10. detailed local security
+
+---
+
+# 19. Summary
+
+The Linked Helper adapter, in this v0, is defined as a Rust component with embedded SQLite that:
+
+- observes Linked Helper locally;
+- interprets its technical structure;
+- consolidates conversational messages;
+- builds canonical external ids;
+- persists durable local state;
+- emits events to the `IO.linkedhelper` node;
+- receives results/changes through the beacon;
+- executes local actions in LH;
+- and keeps idempotency and basic error handling.
+
+This base is already enough to move on to a more detailed specification focused on:
+- the SQLite data model,
+- the internal pipeline,
+- and the execution of actions.

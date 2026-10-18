@@ -381,7 +381,7 @@ that is, wrote to its WhatsApp, its Slack or its API. The channel, each company'
 - **OPA:** `data.identity[ilk].tenant_id` stays, documented as the cost center. Installed user
   policies must not use it as a permission (PROD has no user policy).
 - **The root tenant** is the installation's own cost center: system nodes.
-- **Docs:** "every ILK belongs to exactly one tenant" became "is charged to" (`docs/10-identity-v2.md`).
+- **Docs:** "every ILK belongs to exactly one tenant" became "is charged to" (`docs/history/10-identity-v2.md`).
 
 ### 2.4 Cloud (stage 4)
 
@@ -524,5 +524,5 @@ Every stage goes through:
 ## 5. Related
 
 FINDINGS A-61 (0.1.64, the tenant on every vault write), A-62 (any mesh node may call any admin
-action: parked); `docs/io-cloud-api.md`; `docs/10-identity-v2.md` (the identity model, to update);
+action: parked); `docs/io-cloud-api.md`; `docs/history/10-identity-v2.md` (the identity model, to update);
 the 2026-09-28 delete model (mark and purge).

@@ -1,422 +1,422 @@
-# Auditoria sy.identity - operatividad y seguridad
+# sy.identity audit - operability and security
 
-Fecha: 2026-06-30  
-Repositorio: `fluxbee`  
-Branch auditada: `daily_onworking_coa`  
-Commit auditado: `25e883e`  
-Foco: `src/bin/sy_identity.rs`, contrato SDK de identidad, documentacion operativa y puntos de integracion con SHM, router, vault y replicacion.
+Date: 2026-06-30  
+Repository: `fluxbee`  
+Branch audited: `daily_onworking_coa`  
+Commit audited: `25e883e`  
+Focus: `src/bin/sy_identity.rs`, the SDK identity contract, operational documentation, and integration points with SHM, router, vault and replication.
 
-## Resumen ejecutivo
+## Executive summary
 
-`sy.identity` tiene una base funcional amplia y tests unitarios locales pasando, pero la superficie nueva de replicacion y algunos flujos administrativos tienen riesgos importantes antes de considerarlos aptos para operacion segura.
+`sy.identity` has a broad functional base, and its local unit tests pass. But the new replication surface and some administrative flows carry significant risks that must be addressed before they can be considered fit for safe operation.
 
-Los hallazgos mas relevantes son:
+The most relevant findings are:
 
-- El puerto TCP de sync de identidad queda autenticacion opcional por defecto, escucha en `0.0.0.0:9100` y permite full-sync, subscribe y publish sin HMAC si no se configura explicitamente `identity.sync.auth = required`.
-- El manejo de conexiones de sync bloquea el loop principal durante el handshake y especialmente durante full-sync, lo que expone a `sy.identity` a DoS por clientes lentos o colgados.
-- `VAULT_SECRET_CHANGED` se procesa antes del control de autorizacion normal y puede terminar el proceso primario con `exit(0)`.
-- `TNT_CREATE` puede borrar de memoria un tenant existente si el request era idempotente pero falla la escritura a DB.
-- Una replica puede quedar viva con estado incompleto, y ante gaps de delta solo reconecta sin forzar full-sync.
-- Los ILKs publicados por replicas al primario parecen ser estado live, no durable: se aplican a memoria/SHM pero no se persisten en PostgreSQL.
-- La autorizacion por prefijos L2 es demasiado amplia para acciones sensibles, y `ILK_REGISTER` permite crear `ilk_type = system` desde registradores que no deberian tener ese poder.
+- The identity sync TCP port is left with optional authentication by default. It listens on `0.0.0.0:9100` and allows full-sync, subscribe and publish without HMAC unless `identity.sync.auth = required` is set explicitly.
+- Sync connection handling blocks the main loop during the handshake, and especially during full-sync. This exposes `sy.identity` to DoS from slow or hung clients.
+- `VAULT_SECRET_CHANGED` is processed before the normal authorization check and can terminate the primary process with `exit(0)`.
+- `TNT_CREATE` can delete an existing tenant from memory if the request was idempotent but the DB write fails.
+- A replica can stay alive with incomplete state, and on delta gaps it only reconnects, without forcing a full-sync.
+- ILKs published by replicas to the primary appear to be live state, not durable state: they are applied to memory/SHM but not persisted in PostgreSQL.
+- Authorization by L2 prefixes is too broad for sensitive actions, and `ILK_REGISTER` allows creating `ilk_type = system` from registrars that should not have that power.
 
-## Alcance y metodologia
+## Scope and methodology
 
-Revision estatica de:
+Static review of:
 
 - `src/bin/sy_identity.rs`
 - `crates/fluxbee_sdk/src/identity.rs`
 - `crates/fluxbee_sdk/src/protocol.rs`
 - `src/shm/mod.rs`
-- integraciones relevantes en `src/bin/sy_vault.rs` y `nodes/io/common/src/inbound.rs`
-- documentacion existente en `docs/`, incluyendo auditoria previa y planes `onworking COA`
+- relevant integrations in `src/bin/sy_vault.rs` and `nodes/io/common/src/inbound.rs`
+- existing documentation in `docs/`, including the previous audit and the `onworking COA` plans
 
-Checks ejecutados:
+Checks run:
 
 ```bash
 cargo test -p fluxbee-sdk identity
 cargo test --bin sy_identity
 ```
 
-Resultado:
+Result:
 
-- `cargo test -p fluxbee-sdk identity`: OK, 6 tests pasados.
-- `cargo test --bin sy_identity`: OK, 33 tests pasados.
+- `cargo test -p fluxbee-sdk identity`: OK, 6 tests passed.
+- `cargo test --bin sy_identity`: OK, 33 tests passed.
 
-Limitaciones:
+Limitations:
 
-- No se corrio E2E real con PostgreSQL, router, multiples hives y sockets TCP expuestos.
-- No se hizo fuzzing de payloads ni prueba de carga sobre sync `9100`.
-- No se auditaron exhaustivamente todos los consumidores de SHM; solo los puntos necesarios para evaluar impacto.
+- No real E2E was run with PostgreSQL, router, multiple hives and exposed TCP sockets.
+- No payload fuzzing or load testing was done on sync `9100`.
+- Not all SHM consumers were audited exhaustively; only the points needed to assess impact.
 
-## Hallazgos
+## Findings
 
-### F-01 - Critico - Sync TCP queda sin autenticacion por defecto y permite exfiltracion/poisoning
+### F-01 - Critical - TCP sync is left without authentication by default and allows exfiltration/poisoning
 
-Evidencia:
+Evidence:
 
-- `identity_sync_auth_required` solo exige HMAC si la config es exactamente `required`; cualquier valor ausente o typo deja auth desactivada: `src/bin/sy_identity.rs:3176`.
-- El primario escucha en todas las interfaces: `0.0.0.0:{sync_port}` en `src/bin/sy_identity.rs:2896`.
-- `handle_sync_connection` solo hace challenge HMAC cuando `auth_required` es true: `src/bin/sy_identity.rs:3939`.
-- Sin auth, un peer puede pedir `IDENTITY_FULL_SYNC_REQUEST` y recibir chunks completos: `src/bin/sy_identity.rs:3951`.
-- Sin auth, un peer puede subscribirse a deltas: `src/bin/sy_identity.rs:3961`.
-- Sin auth, un peer puede publicar `IDENTITY_DELTA_PUBLISH` con `hive_id` arbitrario; el chequeo `authed_hive` solo aplica si hubo auth: `src/bin/sy_identity.rs:4020`.
-- La autoridad de delta es principalmente por contenido: `delta_authorized_for_hive` permite `IlkUpsert` si el ILK parece pertenecer al `publisher_hive`: `src/bin/sy_identity.rs:1613`.
+- `identity_sync_auth_required` only requires HMAC if the config is exactly `required`; any missing value or typo leaves auth disabled: `src/bin/sy_identity.rs:3176`.
+- The primary listens on all interfaces: `0.0.0.0:{sync_port}` in `src/bin/sy_identity.rs:2896`.
+- `handle_sync_connection` only runs the HMAC challenge when `auth_required` is true: `src/bin/sy_identity.rs:3939`.
+- Without auth, a peer can request `IDENTITY_FULL_SYNC_REQUEST` and receive complete chunks: `src/bin/sy_identity.rs:3951`.
+- Without auth, a peer can subscribe to deltas: `src/bin/sy_identity.rs:3961`.
+- Without auth, a peer can publish `IDENTITY_DELTA_PUBLISH` with an arbitrary `hive_id`; the `authed_hive` check only applies if auth took place: `src/bin/sy_identity.rs:4020`.
+- Delta authority is mainly content-based: `delta_authorized_for_hive` allows `IlkUpsert` if the ILK appears to belong to the `publisher_hive`: `src/bin/sy_identity.rs:1613`.
 
-Impacto:
+Impact:
 
-- Cualquier peer que llegue al puerto de sync puede exfiltrar el estado de identidad completo si auth no esta configurada.
-- Puede inyectar ILKs live para hives no primarios eligiendo un `node_name` con sufijo `@publisher_hive`.
-- Aunque ese poisoning no se persista en DB, si llega a SHM puede afectar routing, autorizacion y consumidores de identidad hasta reinicio o reconciliacion.
-- Un typo en config desactiva auth silenciosamente.
+- Any peer that reaches the sync port can exfiltrate the full identity state if auth is not configured.
+- It can inject live ILKs for non-primary hives by choosing a `node_name` with the suffix `@publisher_hive`.
+- Even if that poisoning is not persisted in the DB, if it reaches SHM it can affect routing, authorization and identity consumers until a restart or a reconciliation.
+- A typo in the config silently disables auth.
 
-Recomendacion:
+Recommendation:
 
-- Hacer auth requerida por defecto en primario.
-- Fallar startup ante valores desconocidos de `identity.sync.auth`.
-- Si se necesita modo local sin auth, bindear solo a loopback y exigir opt-in explicito.
-- En publish, exigir siempre que `publisher_hive` este autenticado y, preferentemente, en allowlist de replicas esperadas.
-- Agregar tests negativos para full-sync, subscribe y publish sin auth.
+- Make auth required by default on the primary.
+- Fail startup on unknown values of `identity.sync.auth`.
+- If a local mode without auth is needed, bind only to loopback and require an explicit opt-in.
+- On publish, always require `publisher_hive` to be authenticated and, preferably, in an allowlist of expected replicas.
+- Add negative tests for full-sync, subscribe and publish without auth.
 
-### F-02 - Alto - Una conexion de sync puede bloquear el loop principal
+### F-02 - High - A sync connection can block the main loop
 
-Evidencia:
+Evidence:
 
-- El branch `listener.accept()` del `tokio::select!` espera inline a `handle_sync_connection(...)`: `src/bin/sy_identity.rs:3101`.
-- En full-sync se hacen `write_all` y `flush` de todos los chunks sin spawn ni timeout de escritura: `src/bin/sy_identity.rs:3951`.
-- Subscribe y publish terminan spawneando tareas, pero recien despues de que el loop principal hizo handshake y parseo inicial.
+- The `listener.accept()` branch of the `tokio::select!` waits inline on `handle_sync_connection(...)`: `src/bin/sy_identity.rs:3101`.
+- In full-sync, `write_all` and `flush` run for all the chunks with no spawn and no write timeout: `src/bin/sy_identity.rs:3951`.
+- Subscribe and publish do end up spawning tasks, but only after the main loop has done the handshake and the initial parsing.
 
-Impacto:
+Impact:
 
-- Un cliente lento o que deja de leer durante full-sync puede dejar ocupado el loop principal.
-- Mientras tanto se demoran heartbeats, GC de aliases, mensajes de sistema, ingest de replicas, aplicacion de deltas, status y config.
-- Combinado con F-01, es un DoS remoto sobre `9100`.
+- A slow client, or one that stops reading during full-sync, can keep the main loop busy.
+- Meanwhile, heartbeats, alias GC, system messages, replica ingest, delta application, status and config are delayed.
+- Combined with F-01, it is a remote DoS on `9100`.
 
-Recomendacion:
+Recommendation:
 
-- Spawnear una task por conexion aceptada inmediatamente, o usar un pool acotado.
-- Agregar timeouts de lectura y escritura a todas las operaciones de socket.
-- Mantener el loop principal solo para mutaciones de estado y eventos internos.
+- Spawn a task for each accepted connection immediately, or use a bounded pool.
+- Add read and write timeouts to all socket operations.
+- Keep the main loop only for state mutations and internal events.
 
-### F-03 - Alto - `VAULT_SECRET_CHANGED` puede reiniciar el primario antes de autorizacion
+### F-03 - High - `VAULT_SECRET_CHANGED` can restart the primary before authorization
 
-Evidencia:
+Evidence:
 
-- `process_system_message` procesa `MSG_VAULT_SECRET_CHANGED` antes de llamar a `is_authorized`: `src/bin/sy_identity.rs:1788`.
-- El handler del primario termina el proceso con `std::process::exit(0)` si el payload matchea el interes local: `src/bin/sy_identity.rs:6084`.
-- El interes local es amplio: `resource_type = postgres`, root tenant, self ILK y `system_caller`: `src/bin/sy_identity.rs:6106`.
-- `matches_interest` valida tipo de recurso y tenant/ilk, pero no autentica origen ni `source`: `crates/fluxbee_sdk/src/protocol.rs:351`.
+- `process_system_message` processes `MSG_VAULT_SECRET_CHANGED` before calling `is_authorized`: `src/bin/sy_identity.rs:1788`.
+- The primary's handler terminates the process with `std::process::exit(0)` if the payload matches the local interest: `src/bin/sy_identity.rs:6084`.
+- The local interest is broad: `resource_type = postgres`, root tenant, self ILK and `system_caller`: `src/bin/sy_identity.rs:6106`.
+- `matches_interest` validates the resource type and tenant/ilk, but does not authenticate the origin or `source`: `crates/fluxbee_sdk/src/protocol.rs:351`.
 
-Impacto:
+Impact:
 
-- Cualquier nodo que pueda rutear un system message con payload compatible hacia `SY.identity@motherbee` puede forzar restart del primario.
-- Si el evento se repite, puede producir loop de disponibilidad.
-- El diseno documentado de broadcasts abiertos para vault asume bajo impacto porque solo dispara re-resolve; aca el efecto real es salida del proceso.
+- Any node that can route a system message with a compatible payload to `SY.identity@motherbee` can force a restart of the primary.
+- If the event repeats, it can produce an availability loop.
+- The documented design of open broadcasts for vault assumes low impact because they only trigger a re-resolve; here the real effect is the process exiting.
 
-Recomendacion:
+Recommendation:
 
-- Aceptar este mensaje solo desde `SY.vault@<hive-local>` o desde una ruta autenticada equivalente.
-- Validar `payload.hive_id == hive_id` y origen antes de salir.
-- Considerar re-resolver primero y reiniciar solo si cambio efectivamente el secreto/version.
-- Agregar rate limit y test de origen no autorizado.
+- Accept this message only from `SY.vault@<hive-local>` or from an equivalent authenticated route.
+- Validate `payload.hive_id == hive_id` and the origin before exiting.
+- Consider re-resolving first and restarting only if the secret/version actually changed.
+- Add a rate limit and a test for an unauthorized origin.
 
-### F-04 - Alto - `TNT_CREATE` puede borrar un tenant existente de memoria ante falla de DB
+### F-04 - High - `TNT_CREATE` can delete an existing tenant from memory on a DB failure
 
-Evidencia:
+Evidence:
 
-- `create_tenant` devuelve un tenant existente cuando el nombre o domain ya existe, con `created = false`, sin mutar el store: `src/bin/sy_identity.rs:1162`.
-- El handler, ante error de DB, ejecuta siempre `self.store.tenants.remove(&tenant_id)`: `src/bin/sy_identity.rs:2351`.
+- `create_tenant` returns an existing tenant when the name or domain already exists, with `created = false`, without mutating the store: `src/bin/sy_identity.rs:1162`.
+- On a DB error, the handler always runs `self.store.tenants.remove(&tenant_id)`: `src/bin/sy_identity.rs:2351`.
 
-Impacto:
+Impact:
 
-- Si se envia un `TNT_CREATE` idempotente para un tenant existente y falla la persistencia, se borra de memoria ese tenant.
-- El caso puede afectar incluso al root tenant si el request matchea su nombre/domain.
-- Como la respuesta es error, no necesariamente se reconstruye SHM ni se emite delta, dejando memoria, SHM y DB divergentes hasta restart.
+- If an idempotent `TNT_CREATE` is sent for an existing tenant and persistence fails, that tenant is deleted from memory.
+- The case can even affect the root tenant if the request matches its name/domain.
+- Since the response is an error, SHM is not necessarily rebuilt and a delta is not necessarily emitted. This leaves memory, SHM and DB divergent until a restart.
 
-Recomendacion:
+Recommendation:
 
-- Hacer rollback por snapshot como en otros caminos mutantes, o remover solo cuando `created == true`.
-- Agregar test: tenant existente + falla DB inyectada conserva el store intacto.
+- Roll back via a snapshot as in other mutating paths, or remove only when `created == true`.
+- Add a test: existing tenant + injected DB failure keeps the store intact.
 
-### F-05 - Alto - Replicas pueden quedar vivas con estado incompleto y gaps de delta no fuerzan full-sync
+### F-05 - High - Replicas can stay alive with incomplete state, and delta gaps do not force a full-sync
 
-Evidencia:
+Evidence:
 
-- En worker, si falla el full-sync inicial se loguea warning y el nodo sigue con estado local: `src/bin/sy_identity.rs:2904`.
-- `run_delta_subscription_loop` reconecta ante errores del stream: `src/bin/sy_identity.rs:4233`.
-- `stream_deltas_from_primary` detecta gaps/out-of-order y retorna error: `src/bin/sy_identity.rs:4296`.
-- El caller no fuerza full-sync despues del gap; vuelve a subscribirse.
-- `STATUS` reporta role/state/database, pero no salud de upstream, secuencia de delta, ultimo full-sync ni lag: `src/bin/sy_identity.rs:1831`.
+- On a worker, if the initial full-sync fails, a warning is logged and the node continues with its local state: `src/bin/sy_identity.rs:2904`.
+- `run_delta_subscription_loop` reconnects on stream errors: `src/bin/sy_identity.rs:4233`.
+- `stream_deltas_from_primary` detects gaps/out-of-order and returns an error: `src/bin/sy_identity.rs:4296`.
+- The caller does not force a full-sync after the gap; it subscribes again.
+- `STATUS` reports role/state/database, but not upstream health, delta sequence, last full-sync or lag: `src/bin/sy_identity.rs:1831`.
 
-Impacto:
+Impact:
 
-- Una replica puede publicar SHM incompleto y parecer operativa.
-- Si se pierden deltas, la reconexion puede continuar desde un estado inconsistente sin recuperar el faltante.
-- Otros nodos pueden tomar decisiones de identidad con datos parciales.
+- A replica can publish incomplete SHM and appear operational.
+- If deltas are lost, the reconnection can continue from an inconsistent state without recovering what is missing.
+- Other nodes can make identity decisions with partial data.
 
-Recomendacion:
+Recommendation:
 
-- Si falla full-sync inicial, marcar la replica como degraded/not-ready y exponerlo en `STATUS`.
-- Ante gap de delta, limpiar o marcar estado y ejecutar full-sync antes de resubscribir.
-- Agregar campos de salud: `upstream_connected`, `last_full_sync_at`, `last_delta_seq`, `delta_lag`, `reconnects`, `last_sync_error`.
+- If the initial full-sync fails, mark the replica as degraded/not-ready and expose it in `STATUS`.
+- On a delta gap, clear or mark the state and run a full-sync before resubscribing.
+- Add health fields: `upstream_connected`, `last_full_sync_at`, `last_delta_seq`, `delta_lag`, `reconnects`, `last_sync_error`.
 
-### F-06 - Medio - ILKs publicados por replicas no se persisten en PostgreSQL
+### F-06 - Medium - ILKs published by replicas are not persisted in PostgreSQL
 
-Evidencia:
+Evidence:
 
-- El primario persiste sus ILKs de sistema propios durante bootstrap: `src/bin/sy_identity.rs:2928`.
-- Las replicas envian periodicamente `self_owned_ilks`: `src/bin/sy_identity.rs:2991`.
-- El primario ingesta deltas de replicas, actualiza memoria/SHM y rebroadcast, pero no persiste esos ILKs en DB en ese camino: `src/bin/sy_identity.rs:3020`.
+- The primary persists its own system ILKs during bootstrap: `src/bin/sy_identity.rs:2928`.
+- Replicas periodically send `self_owned_ilks`: `src/bin/sy_identity.rs:2991`.
+- The primary ingests deltas from replicas, updates memory/SHM and rebroadcasts, but does not persist those ILKs in the DB on that path: `src/bin/sy_identity.rs:3020`.
 
-Impacto:
+Impact:
 
-- Los ILKs de hives worker quedan como estado live/cache en el primario.
-- Tras restart del primario, el estado global pierde ILKs remotos hasta que cada worker este online y republique.
-- Si un worker esta caido durante el restart, sus ILKs pueden desaparecer de la vista global.
+- ILKs of worker hives remain as live/cache state on the primary.
+- After a restart of the primary, the global state loses remote ILKs until each worker is online and republishes.
+- If a worker is down during the restart, its ILKs can disappear from the global view.
 
-Recomendacion:
+Recommendation:
 
-- Definir explicitamente si los ILKs de replica son fuente durable o cache live.
-- Si son durables, persistir `IlkUpsert`/delete aceptados por delta en la DB primaria.
-- Si son cache live, documentarlo y exponer estado/edad de cada hive remoto.
+- Define explicitly whether replica ILKs are a durable source or a live cache.
+- If they are durable, persist the `IlkUpsert`/delete accepted via delta in the primary DB.
+- If they are a live cache, document it and expose the state/age of each remote hive.
 
-### F-07 - Medio/Alto - Autorizacion por prefijos L2 es demasiado amplia
+### F-07 - Medium/High - Authorization by L2 prefixes is too broad
 
-Evidencia:
+Evidence:
 
-- Varias acciones sensibles aceptan prefijos como `SY.admin@`, `SY.architect@`, `SY.frontdesk.gov@`, `SY.orchestrator@` e `IO.`: `src/bin/sy_identity.rs:1675`.
-- `is_authorized` acepta exact matches o `starts_with(prefix)`: `src/bin/sy_identity.rs:2666`.
-- Hay tests para fuente faltante y frontdesk configurado, pero no para rechazo cross-hive de un prefijo privilegiado.
+- Several sensitive actions accept prefixes such as `SY.admin@`, `SY.architect@`, `SY.frontdesk.gov@`, `SY.orchestrator@` and `IO.`: `src/bin/sy_identity.rs:1675`.
+- `is_authorized` accepts exact matches or `starts_with(prefix)`: `src/bin/sy_identity.rs:2666`.
+- There are tests for a missing source and a configured frontdesk, but not for the cross-hive rejection of a privileged prefix.
 
-Impacto:
+Impact:
 
-- Un L2 privilegiado de otro hive podria ejecutar acciones administrativas si el router permite llegar.
-- Un registro con nombre que empieza por un prefijo sensible recibe permisos de esa familia.
-- Acciones como `CONFIG_SET`, tenant create/update/sponsor, `ILK_DELETE` y set de definicion quedan demasiado expuestas.
+- A privileged L2 from another hive could run administrative actions if the router lets it through.
+- A registration with a name that starts with a sensitive prefix receives the permissions of that family.
+- Actions such as `CONFIG_SET`, tenant create/update/sponsor, `ILK_DELETE` and definition set are too exposed.
 
-Recomendacion:
+Recommendation:
 
-- Para acciones de alto riesgo, usar allowlist exacta y local: `SY.admin@<hive>`, `SY.architect@<hive>`, frontdesk exacto configurado y orchestrator exacto donde aplique.
-- Hacer excepciones cross-hive explicitas por accion.
-- Agregar tests negativos para `SY.admin@foreign`, frontdesk no configurado y nombres con prefijo reservado.
+- For high-risk actions, use an exact, local allowlist: `SY.admin@<hive>`, `SY.architect@<hive>`, the exact configured frontdesk, and the exact orchestrator where applicable.
+- Make cross-hive exceptions explicit per action.
+- Add negative tests for `SY.admin@foreign`, an unconfigured frontdesk, and names with a reserved prefix.
 
-### F-08 - Medio/Alto - `ILK_REGISTER` permite crear ILKs `system` desde registradores amplios
+### F-08 - Medium/High - `ILK_REGISTER` allows creating `system` ILKs from broad registrars
 
-Evidencia:
+Evidence:
 
-- `validate_ilk_type` acepta `human`, `agent` y `system`: `src/bin/sy_identity.rs:4829`.
-- `register_ilk` escribe directamente el `ilk_type` solicitado: `src/bin/sy_identity.rs:885`.
-- `ILK_REGISTER` esta autorizado para `SY.frontdesk.gov@` y `SY.orchestrator@`: `src/bin/sy_identity.rs:1681`.
-- `ILK_PROVISION` si tiene un validador separado que rechaza `system`: `src/bin/sy_identity.rs:4836`.
-- En vault, un caller con ILK tipo `system` tiene fallback de lectura de pool root: `src/bin/sy_vault.rs:1392`.
+- `validate_ilk_type` accepts `human`, `agent` and `system`: `src/bin/sy_identity.rs:4829`.
+- `register_ilk` writes the requested `ilk_type` directly: `src/bin/sy_identity.rs:885`.
+- `ILK_REGISTER` is authorized for `SY.frontdesk.gov@` and `SY.orchestrator@`: `src/bin/sy_identity.rs:1681`.
+- `ILK_PROVISION` does have a separate validator that rejects `system`: `src/bin/sy_identity.rs:4836`.
+- In vault, a caller with an ILK of type `system` has a fallback read of the root pool: `src/bin/sy_vault.rs:1392`.
 
-Impacto:
+Impact:
 
-- Un frontdesk comprometido o bugueado puede registrar ILKs tipo `system` en tenants activos.
-- Dado que otros servicios confian en SHM para resolver tipo de ILK, esto puede ampliar privilegios downstream.
+- A compromised or buggy frontdesk can register ILKs of type `system` in active tenants.
+- Since other services trust SHM to resolve the ILK type, this can widen privileges downstream.
 
-Recomendacion:
+Recommendation:
 
-- Separar permisos por tipo: frontdesk solo deberia registrar `human`/`agent`.
-- Reservar `system` para bootstrap, definiciones deterministicas de `hive.yaml` o un flujo administrativo mas restringido.
-- Agregar test: `SY.frontdesk.gov` + `ilk_type = system` debe rechazarse.
+- Separate permissions by type: frontdesk should only register `human`/`agent`.
+- Reserve `system` for bootstrap, deterministic definitions from `hive.yaml`, or a more restricted administrative flow.
+- Add a test: `SY.frontdesk.gov` + `ilk_type = system` must be rejected.
 
-### F-09 - Medio - Permisos SHM `0600` y fallback silencioso a miss degradan operacion
+### F-09 - Medium - SHM permissions `0600` and a silent fallback to miss degrade operation
 
-Evidencia:
+Evidence:
 
-- La region SHM se crea con modo `0o600`: `src/shm/mod.rs:2553`.
-- El SDK convierte `EACCES`/`EPERM` en `Ok(None)` o `false`: `crates/fluxbee_sdk/src/identity.rs:452`, `crates/fluxbee_sdk/src/identity.rs:505`, `crates/fluxbee_sdk/src/identity.rs:936`.
-- IO common loguea el error y trata el resultado como miss/provisioning path: `nodes/io/common/src/inbound.rs:185`.
-- La documentacion de IO ya menciona el sintoma `EACCES` y que los runtimes deben tener read access.
+- The SHM region is created with mode `0o600`: `src/shm/mod.rs:2553`.
+- The SDK converts `EACCES`/`EPERM` into `Ok(None)` or `false`: `crates/fluxbee_sdk/src/identity.rs:452`, `crates/fluxbee_sdk/src/identity.rs:505`, `crates/fluxbee_sdk/src/identity.rs:936`.
+- IO common logs the error and treats the result as a miss/provisioning path: `nodes/io/common/src/inbound.rs:185`.
+- The IO documentation already mentions the `EACCES` symptom and that runtimes must have read access.
 
-Impacto:
+Impact:
 
-- Si consumidores y `sy.identity` no corren con el mismo usuario/grupo, el sistema degrada a RPC/provisioning sin fallar fuerte.
-- Se ocultan problemas de instalacion y se incrementa carga sobre `sy.identity`/frontdesk.
+- If consumers and `sy.identity` do not run with the same user/group, the system degrades to RPC/provisioning without failing hard.
+- Installation problems are hidden, and the load on `sy.identity`/frontdesk increases.
 
-Recomendacion:
+Recommendation:
 
-- Estandarizar usuario/grupo/ACL para SHM en instalacion.
-- Exponer `EACCES` como metrica/health issue aunque el fallback siga funcionando.
-- Agregar guard operativo que valide acceso de lectura desde cada runtime.
+- Standardize the user/group/ACL for SHM at install time.
+- Expose `EACCES` as a metric/health issue even if the fallback keeps working.
+- Add an operational guard that validates read access from each runtime.
 
-### F-10 - Bajo/Medio - Migraciones de schema siguen siendo ad hoc
+### F-10 - Low/Medium - Schema migrations are still ad hoc
 
-Evidencia:
+Evidence:
 
-- `ensure_primary_schema` usa `CREATE TABLE IF NOT EXISTS` y `ALTER TABLE ... ADD COLUMN IF NOT EXISTS`, sin tabla de versionado ni migraciones ordenadas: `src/bin/sy_identity.rs:5058`.
+- `ensure_primary_schema` uses `CREATE TABLE IF NOT EXISTS` and `ALTER TABLE ... ADD COLUMN IF NOT EXISTS`, with no versioning table and no ordered migrations: `src/bin/sy_identity.rs:5058`.
 
-Impacto:
+Impact:
 
-- Puede ser aceptable para alpha/testing, pero es fragil para upgrades de produccion.
-- No hay forma clara de auditar partial migrations, rollback o drift entre ambientes.
+- It may be acceptable for alpha/testing, but it is fragile for production upgrades.
+- There is no clear way to audit partial migrations, rollback or drift between environments.
 
-Recomendacion:
+Recommendation:
 
-- Agregar tabla `identity_schema_migrations`.
-- Convertir cambios de schema en migraciones versionadas e idempotentes.
-- Registrar version esperada en `STATUS`.
+- Add an `identity_schema_migrations` table.
+- Turn schema changes into versioned, idempotent migrations.
+- Record the expected version in `STATUS`.
 
-## Orden sugerido de remediacion
+## Suggested remediation order
 
-1. Cerrar F-01 y F-02 juntos: auth requerida por defecto, fail-closed de config y manejo concurrente/timeouts de sync.
-2. Corregir F-03 para evitar restart remoto no autorizado.
-3. Corregir F-04 porque puede corromper estado en memoria con un flujo comun/idempotente.
-4. Endurecer replicacion: F-05 y decision de durabilidad F-06.
-5. Reducir privilegios: F-07 y F-08.
-6. Mejorar operabilidad: F-09 y F-10.
+1. Close F-01 and F-02 together: auth required by default, fail-closed config, and concurrent handling/timeouts for sync.
+2. Fix F-03 to prevent an unauthorized remote restart.
+3. Fix F-04 because it can corrupt in-memory state with a common/idempotent flow.
+4. Harden replication: F-05 and the durability decision for F-06.
+5. Reduce privileges: F-07 and F-08.
+6. Improve operability: F-09 and F-10.
 
-## Gaps de cobertura recomendados
+## Recommended coverage gaps
 
-- Tests de sync con auth ausente, requerida, typo de config y publish con hive no autenticado.
-- Test de cliente full-sync lento para verificar que no bloquea heartbeats/status.
-- Test de `VAULT_SECRET_CHANGED` desde origen no vault.
-- Test de rollback `TNT_CREATE` contra tenant existente con error de persistencia.
-- Test de replica con gap de delta que debe forzar full-sync.
-- Tests cross-hive para autorizacion por `src_l2_name`.
-- Tests de `ILK_REGISTER` rechazando `system` desde frontdesk.
+- Sync tests with auth absent, auth required, a config typo, and publish with an unauthenticated hive.
+- A slow full-sync client test to verify that it does not block heartbeats/status.
+- A test of `VAULT_SECRET_CHANGED` from a non-vault origin.
+- A `TNT_CREATE` rollback test against an existing tenant with a persistence error.
+- A test of a replica with a delta gap, which must force a full-sync.
+- Cross-hive tests for authorization by `src_l2_name`.
+- Tests of `ILK_REGISTER` rejecting `system` from frontdesk.
 
 ## Conclusion
 
-`sy.identity` esta avanzado funcionalmente, pero hoy la combinacion de sync abierto por defecto, DoS por loop bloqueable y algunos bypasses/privilegios amplios lo deja en una posicion riesgosa para despliegues donde el puerto de sync o el router no esten estrictamente aislados.
+`sy.identity` is functionally advanced. But today the combination of sync open by default, DoS through a blockable loop, and some bypasses/broad privileges leaves it in a risky position for deployments where the sync port or the router are not strictly isolated.
 
-La recomendacion es tratar F-01, F-02, F-03 y F-04 como bloqueantes antes de exponerlo fuera de un entorno de desarrollo controlado.
+The recommendation is to treat F-01, F-02, F-03 and F-04 as blockers before exposing it outside a controlled development environment.
 
 ---
 
-## Estado de resolucion (2026-07-02)
+## Resolution status (2026-07-02)
 
-Revision-de-la-auditoria (verificacion adversarial de cada hallazgo contra el
-codigo actual + caza de gaps por 6 lentes) y remediacion. El commit auditado
-(`25e883e`) es identico al HEAD actual para `sy_identity.rs` (sin cambios entre
-medias), asi que **los 10 hallazgos aplican al codigo vigente**.
+Audit review (adversarial verification of each finding against the current
+code + a gap hunt through 6 lenses) and remediation. The audited commit
+(`25e883e`) is identical to the current HEAD for `sy_identity.rs` (no changes in
+between), so **all 10 findings apply to the current code**.
 
-### Calidad de la auditoria
+### Audit quality
 
-Alta. De los 10 hallazgos: **8 CONFIRMADOS** tal cual, **2 CONFIRMADOS-PARCIAL**
-(matiz, no refutacion):
+High. Of the 10 findings: **8 CONFIRMED** as is, **2 CONFIRMED-PARTIAL**
+(a nuance, not a refutation):
 
-- **F-02** parcial: los *reads* del canal ya tienen timeout (`auth_read_line`),
-  asi que el vector "stall antes de mandar el request" ya estaba cerrado; lo que
-  quedaba abierto era el *write* del full-sync inline en el loop principal.
-- **F-07** parcial: el sufijo `@` ancla el prefijo, asi que la sub-rama
-  "nombre adyacente" (`SY.administrator@`) no aplica; el riesgo real es el prefijo
-  **hive-agnostico** (`SY.admin@<otro-hive>`), no `starts_with` en si.
+- **F-02** partial: the channel's *reads* already have a timeout (`auth_read_line`),
+  so the "stall before sending the request" vector was already closed; what
+  remained open was the inline full-sync *write* in the main loop.
+- **F-07** partial: the `@` suffix anchors the prefix, so the "adjacent name"
+  sub-branch (`SY.administrator@`) does not apply; the real risk is the
+  **hive-agnostic** prefix (`SY.admin@<other-hive>`), not `starts_with` itself.
 
-Ninguno refutado. `src_l2_name` es router-autoritativo (F4/F15 del audit de
-orchestrator), lo que acota F-03/F-07 pero no los elimina.
+None refuted. `src_l2_name` is router-authoritative (F4/F15 of the orchestrator
+audit), which narrows F-03/F-07 but does not eliminate them.
 
-### Gaps que la auditoria NO cubrio (hallados en la revision)
+### Gaps the audit did NOT cover (found in the review)
 
-- **G-1 [CRITICO]** — El path de sync **cross-hive** acepta `ilk_type=system`
-  arbitrario desde una replica (distinto de F-08, que es solo el `ILK_REGISTER`
-  local): `delta_authorized_for_hive`/`apply_delta` chequeaban ownership pero
-  nunca `ilk_type`. Una replica comprometida etiqueta su propio ilk como `system`
-  → `sy_vault::authorize_read` le da lectura de **todos los secretos del pool
-  root** (creds de infra) en toda la malla.
-- **G-2 [ALTO]** — `AliasUpsert` cross-hive solo validaba ownership del
-  `canonical_ilk_id`, no del `old_ilk_id` (la clave que la resolucion redirige):
-  una replica podia secuestrar la resolucion de **cualquier** ilk (incl.
-  `SY.vault@motherbee`, incl. system ilks) apuntandolo a un ilk propio. Hallado
-  por 2 lentes independientes.
-- **G-3 [ALTO]** — Defaults fail-**open**: un `ilk_type` desconocido mapeaba a
-  `system` tanto en identity (`parse_ilk_type_for_shm`) como en el router
-  (`inject_identity_data`). Corrupcion/sync parcial → privilegio en vez de deny.
-- **G-4 [ALTO]** — `read_line` sin cap de tamano ni timeout en el canal :9100
+- **G-1 [CRITICAL]** — The **cross-hive** sync path accepts an arbitrary
+  `ilk_type=system` from a replica (different from F-08, which is only the local
+  `ILK_REGISTER`): `delta_authorized_for_hive`/`apply_delta` checked ownership but
+  never `ilk_type`. A compromised replica labels its own ilk as `system`
+  → `sy_vault::authorize_read` gives it read access to **all the secrets of the
+  root pool** (infra creds) across the whole mesh.
+- **G-2 [HIGH]** — Cross-hive `AliasUpsert` only validated ownership of the
+  `canonical_ilk_id`, not of the `old_ilk_id` (the key that resolution redirects):
+  a replica could hijack the resolution of **any** ilk (incl.
+  `SY.vault@motherbee`, incl. system ilks) by pointing it at an ilk of its own. Found
+  by 2 independent lenses.
+- **G-3 [HIGH]** — Fail-**open** defaults: an unknown `ilk_type` mapped to
+  `system` both in identity (`parse_ilk_type_for_shm`) and in the router
+  (`inject_identity_data`). Corruption/partial sync → privilege instead of deny.
+- **G-4 [HIGH]** — `read_line` with no size cap and no timeout on the :9100 channel
   (`run_publish_reader`, `auth_read_line`, `fetch_full_sync`, `stream_deltas`) →
-  OOM remoto con un frame sin newline. Hallado por 2 lentes.
-- **G-5 [ALTO]** — Canal por-subscriber `unbounded` + lista de subscribers sin
-  cap → agotamiento de memoria del primario via un subscriber lento.
-- **G-6 [ALTO]** — Alias GC muta memoria antes que DB sin rollback; ante error de
-  DB los deltas se pierden → divergencia SHM/replica permanente.
-- **G-7 [MEDIO]** — `total_chunks` (u32) sin cota → `Vec::resize` de ~400GB →
-  abort del proceso al bootear la replica. Hallado por 2 lentes.
-- **G-8 [MEDIO]** — Error de SHM tras el commit de DB propagaba `?` y suprimia el
-  broadcast a replicas **y** la respuesta al cliente → primario adelante de
+  remote OOM with a frame that has no newline. Found by 2 lenses.
+- **G-5 [HIGH]** — `unbounded` per-subscriber channel + subscriber list with no
+  cap → memory exhaustion of the primary via a slow subscriber.
+- **G-6 [HIGH]** — Alias GC mutates memory before the DB, with no rollback; on a DB
+  error the deltas are lost → permanent SHM/replica divergence.
+- **G-7 [MEDIUM]** — `total_chunks` (u32) with no bound → a `Vec::resize` of ~400GB →
+  process abort when the replica boots. Found by 2 lenses.
+- **G-8 [MEDIUM]** — An SHM error after the DB commit propagated via `?` and suppressed the
+  broadcast to replicas **and** the response to the client → primary ahead of
   replicas.
-- **G-9 [MEDIO]** — El store completo se clonaba+ordenaba en cada `accept()`,
-  pre-auth, en el loop principal (amplificacion). Overlap con F-02.
+- **G-9 [MEDIUM]** — The full store was cloned+sorted on every `accept()`,
+  pre-auth, in the main loop (amplification). Overlap with F-02.
 
-### Resolucion por hallazgo (codigo)
+### Resolution per finding (code)
 
-Todo en `src/bin/sy_identity.rs` salvo donde se indique.
+Everything is in `src/bin/sy_identity.rs` unless noted otherwise.
 
-| ID | Estado | Fix |
+| ID | Status | Fix |
 | --- | --- | --- |
-| **F-01** | Resuelto | `identity_sync_auth_required`/`auth_mode_required` **fail-closed**: ausente/typo/empty ⇒ `required`; opt-out solo con `disabled`/`off`/`none` (con warning). `config/hive.yaml` + `packaging/hive.yaml.example` con `auth: required` explicito. |
-| **F-02** | Resuelto | `handle_sync_connection` se **spawnea** por conexion (fuera del loop); `Semaphore` (`MAX_CONCURRENT_SYNC_CONNS`); subscriber devuelto via canal; `write_timed`/`flush_timed` en full-sync + handshake + subscribe. |
-| **F-03** | Resuelto | `handle_vault_secret_changed` exige origen `SY.vault@<hive-propio>` (router-stamped `src_l2_name`) antes de `exit(0)`. Mismo gate en `sy_storage.rs`. |
-| **F-04** | Resuelto | `TNT_CREATE` toma snapshot antes de mutar y restaura ante error de DB (patron de `TNT_UPDATE`), en vez del `remove()` ciego. |
-| **F-05** | Resuelto (via restart) | Gap de delta ⇒ log ERROR + `exit(0)` ⇒ systemd reinicia ⇒ re-bootstrap por full-sync limpio (recupera revocaciones perdidas). Fallo de boot full-sync ⇒ log ERROR "DEGRADED" (sin exit para no restart-stormear). |
-| **F-06** | Resuelto | El brazo de ingest **persiste** los ilks publicados por replicas en DB (`persist_ilk_state_in_db`/`delete_ilk_in_db`), best-effort convergente (re-push cada reconcile). |
-| **F-07** | Resuelto | `is_authorized` hace hive-scoping de `SY.admin@`/`SY.architect@`/`SY.frontdesk.gov@` a `self.hive_id`; `IO.` y `SY.orchestrator@` siguen cross-hive. |
-| **F-08** | Resuelto | `validate_ilk_type` (path de `ILK_REGISTER`) rechaza `system`; guard anti-downgrade de un system ilk existente (`SYSTEM_ILK_PROTECTED`). |
-| **F-09** | Resuelto (loud) | SDK: EACCES/EPERM del SHM ahora emite `tracing::error!` one-shot (misconfig de uid/gid visible); semantica de retorno sin cambios para no rippear a consumidores. |
-| **F-10** | Resuelto (baseline) | `ensure_primary_schema`: `pg_advisory_lock` + tabla `identity_schema_migrations`, el DDL idempotente actual queda sellado como baseline **v1**. |
-| **G-1** | Resuelto | `ingest_ilk_type_authorized`: una replica solo puede afirmar `ilk_type=system` para un system ilk **determinístico** (`SY.*@publisher`, `ilk_id == deterministic_system_ilk_id`); wired en `delta_authorized_for_hive` + ingest de snapshot. |
-| **G-2** | Resuelto | `AliasUpsert` exige que `old_ilk_id` **y** `canonical_ilk_id` sean del publisher, y prohibe aliasar un well-known system ilk. |
-| **G-3** | Resuelto | Default fail-safe: `parse_ilk_type_for_shm` ⇒ `human`; `router/mod.rs inject_identity_data` ⇒ `"unknown"`. |
-| **G-4** | Resuelto | `read_capped_line`/`read_sync_line` (cap `MAX_SYNC_LINE_BYTES` + timeout) en todos los reads del :9100. |
-| **G-5** | Resuelto | Canal por-subscriber **bounded** + `broadcast_deltas` con `try_send` (drop-on-full) + `MAX_DELTA_SUBSCRIBERS`. |
-| **G-6** | Resuelto | `run_alias_gc` snapshotea antes de mutar y restaura ante error de DB. |
-| **G-7** | Resuelto | Cota `MAX_FULL_SYNC_CHUNKS` antes del `resize`. |
-| **G-8** | Resuelto | El error de SHM tras commit ya **no** propaga: se loguea y se sigue con broadcast + respuesta. |
-| **G-9** | Resuelto | Chunks del full-sync se construyen **on-demand** (via canal oneshot al loop) solo para un FULL_SYNC autenticado, no pre-auth por conexion. |
+| **F-01** | Resolved | `identity_sync_auth_required`/`auth_mode_required` **fail-closed**: absent/typo/empty ⇒ `required`; opt-out only with `disabled`/`off`/`none` (with a warning). `config/hive.yaml` + `packaging/hive.yaml.example` with an explicit `auth: required`. |
+| **F-02** | Resolved | `handle_sync_connection` is **spawned** per connection (outside the loop); `Semaphore` (`MAX_CONCURRENT_SYNC_CONNS`); subscriber returned via a channel; `write_timed`/`flush_timed` in full-sync + handshake + subscribe. |
+| **F-03** | Resolved | `handle_vault_secret_changed` requires the origin `SY.vault@<own-hive>` (router-stamped `src_l2_name`) before `exit(0)`. Same gate in `sy_storage.rs`. |
+| **F-04** | Resolved | `TNT_CREATE` takes a snapshot before mutating and restores it on a DB error (the `TNT_UPDATE` pattern), instead of the blind `remove()`. |
+| **F-05** | Resolved (via restart) | Delta gap ⇒ log ERROR + `exit(0)` ⇒ systemd restarts it ⇒ re-bootstrap via a clean full-sync (recovers lost revocations). Boot full-sync failure ⇒ log ERROR "DEGRADED" (no exit, to avoid a restart storm). |
+| **F-06** | Resolved | The ingest arm **persists** the ilks published by replicas in the DB (`persist_ilk_state_in_db`/`delete_ilk_in_db`), convergent best-effort (re-push on every reconcile). |
+| **F-07** | Resolved | `is_authorized` hive-scopes `SY.admin@`/`SY.architect@`/`SY.frontdesk.gov@` to `self.hive_id`; `IO.` and `SY.orchestrator@` stay cross-hive. |
+| **F-08** | Resolved | `validate_ilk_type` (the `ILK_REGISTER` path) rejects `system`; anti-downgrade guard for an existing system ilk (`SYSTEM_ILK_PROTECTED`). |
+| **F-09** | Resolved (loud) | SDK: EACCES/EPERM from SHM now emits a one-shot `tracing::error!` (the uid/gid misconfig becomes visible); return semantics unchanged so as not to ripple into consumers. |
+| **F-10** | Resolved (baseline) | `ensure_primary_schema`: `pg_advisory_lock` + an `identity_schema_migrations` table; the current idempotent DDL is sealed as baseline **v1**. |
+| **G-1** | Resolved | `ingest_ilk_type_authorized`: a replica can only assert `ilk_type=system` for a **deterministic** system ilk (`SY.*@publisher`, `ilk_id == deterministic_system_ilk_id`); wired into `delta_authorized_for_hive` + snapshot ingest. |
+| **G-2** | Resolved | `AliasUpsert` requires both `old_ilk_id` **and** `canonical_ilk_id` to belong to the publisher, and forbids aliasing a well-known system ilk. |
+| **G-3** | Resolved | Fail-safe default: `parse_ilk_type_for_shm` ⇒ `human`; `router/mod.rs inject_identity_data` ⇒ `"unknown"`. |
+| **G-4** | Resolved | `read_capped_line`/`read_sync_line` (cap `MAX_SYNC_LINE_BYTES` + timeout) on all reads of :9100. |
+| **G-5** | Resolved | **Bounded** per-subscriber channel + `broadcast_deltas` with `try_send` (drop-on-full) + `MAX_DELTA_SUBSCRIBERS`. |
+| **G-6** | Resolved | `run_alias_gc` takes a snapshot before mutating and restores it on a DB error. |
+| **G-7** | Resolved | `MAX_FULL_SYNC_CHUNKS` bound before the `resize`. |
+| **G-8** | Resolved | The SHM error after the commit **no** longer propagates: it is logged, and the flow continues with broadcast + response. |
+| **G-9** | Resolved | Full-sync chunks are built **on-demand** (via a oneshot channel to the loop) only for an authenticated FULL_SYNC, not pre-auth per connection. |
 
-### Cobertura de tests
+### Test coverage
 
-Unit tests nuevos en `sy_identity.rs` (`cargo test --bin sy_identity`: **40 pass**):
+New unit tests in `sy_identity.rs` (`cargo test --bin sy_identity`: **40 pass**):
 `auth_mode_required_is_fail_closed` (F-01), `parse_ilk_type_for_shm_fails_safe_to_human`
 (G-3), `ingest_system_ilk_type_bound_to_deterministic_shape` +
 `delta_authority_rejects_forged_system_ilk_type` (G-1),
 `alias_upsert_authority_requires_both_endpoints_owned` (G-2),
 `is_authorized_scopes_privileged_sy_roles_to_own_hive` (F-07),
-`register_ilk_type_rejects_system` (F-08). Workspace build limpio;
+`register_ilk_type_rejects_system` (F-08). Clean workspace build;
 `fluxbee-sdk` 147 pass, `json-router` lib 67 pass.
 
-Pendiente de cobertura wire-level (requiere lab): handshake HMAC required-por-defecto
-end-to-end, DoS de full-sync con reader lento, gap→restart de replica,
-persistencia F-06 con restart. Ver plan de lab abajo.
+Pending wire-level coverage (requires the lab): the required-by-default HMAC handshake
+end-to-end, full-sync DoS with a slow reader, replica gap→restart,
+F-06 persistence with restart. See the lab plan below.
 
-### Validacion en el lab Proxmox (2026-07-02) — HECHA
+### Validation in the Proxmox lab (2026-07-02) — DONE
 
-Build `.deb` del arbol completo actual (identity + orchestrator cerrado,
-`0.1.0-syid`) en `fxbuild`, from-scratch 2-VM sobre Proxmox VE (motherbee
-`192.168.103.150` + worker `192.168.103.151`, clone del template ubuntu-24.04,
-install `.deb` + `fluxbee-firstboot` + `add_hive` real).
+`.deb` build of the full current tree (identity + closed orchestrator,
+`0.1.0-syid`) on `fxbuild`, from-scratch 2-VM on Proxmox VE (motherbee
+`192.168.103.150` + worker `192.168.103.151`, clone of the ubuntu-24.04 template,
+`.deb` install + `fluxbee-firstboot` + a real `add_hive`).
 
-- **F-01 (riesgo #1 de compat) — VALIDADO.** motherbee arranca con
+- **F-01 (compat risk #1) — VALIDATED.** motherbee starts with
   `identity sync auth: required (per-hive HMAC) role="primary"` + listener :9100
-  **por defecto**. `add_hive worker1` distribuye `worker1.key` (0600) a motherbee
-  **y** worker; el worker (replica, `auth: required`) completa el handshake HMAC y
+  **by default**. `add_hive worker1` distributes `worker1.key` (0600) to motherbee
+  **and** worker; the worker (replica, `auth: required`) completes the HMAC handshake and
   `identity full sync bootstrap applied upstream=192.168.103.150:9100`
-  (ilk_count 12). **El default fail-closed NO rompe el join.**
-- **F-01 en el wire — VALIDADO.** 3 probes SIN handshake (full-sync request,
-  delta subscribe, garbage) → **RECHAZADAS** (0 bytes, conexion cerrada). Cero
-  fuga de estado a un peer no autenticado.
-- **F-02 — EJERCITADO.** El full-sync se sirvio via handler spawneado + chunks
-  on-demand (oneshot al loop) + write-timeouts; el worker bootstrapeo 12 ilks sin
-  romper el framing (caps G-4/G-7 OK).
-- **G-1 (no sobre-bloquea) — VALIDADO.** Los 7 system-ilks legitimos y
-  determinísticos del worker (`SY.*@worker1`) fluyeron a motherbee (sync
-  bidireccional 12→19); un guard demasiado estricto los habria bloqueado.
-- **F-06 — VALIDADO (definitivo).** Los 7 ilks de worker1 quedan **persistidos**
-  en la DB de motherbee (`identity_ilks`, `ilk_type=system`). Test de durabilidad:
-  se paro el worker y se reinicio el sy-identity del primario → `loaded identity
-  store from primary db ... ilk_count:19` (sobreviven). Antes de F-06 se perdian
-  (volvian a 12).
-- **F-10 — VALIDADO.** `identity primary schema ensured (baseline v1)` + tabla
-  `identity_schema_migrations` con fila `1|baseline`; advisory-lock idempotente en
+  (ilk_count 12). **The fail-closed default does NOT break the join.**
+- **F-01 on the wire — VALIDATED.** 3 probes WITHOUT a handshake (full-sync request,
+  delta subscribe, garbage) → **REJECTED** (0 bytes, connection closed). Zero
+  state leak to an unauthenticated peer.
+- **F-02 — EXERCISED.** The full-sync was served via a spawned handler + on-demand
+  chunks (oneshot to the loop) + write-timeouts; the worker bootstrapped 12 ilks without
+  breaking the framing (G-4/G-7 caps OK).
+- **G-1 (does not over-block) — VALIDATED.** The worker's 7 legitimate and
+  deterministic system-ilks (`SY.*@worker1`) flowed to motherbee (bidirectional
+  sync 12→19); an overly strict guard would have blocked them.
+- **F-06 — VALIDATED (definitive).** The 7 ilks of worker1 are **persisted**
+  in motherbee's DB (`identity_ilks`, `ilk_type=system`). Durability test:
+  the worker was stopped and the primary's sy-identity was restarted → `loaded identity
+  store from primary db ... ilk_count:19` (they survive). Before F-06 they were lost
+  (they went back to 12).
+- **F-10 — VALIDATED.** `identity primary schema ensured (baseline v1)` + the
+  `identity_schema_migrations` table with the row `1|baseline`; idempotent advisory-lock on
   restart.
-- **Recuperacion — VALIDADO.** Tras reiniciar el worker, re-join limpio via
+- **Recovery — VALIDATED.** After restarting the worker, a clean re-join via
   full-sync re-bootstrap (ilk_count 19).
 
-G-1(rechazo)/G-2/G-3 y F-03/F-04/F-05(gap)/F-07/F-08/F-09/G-5/G-6/G-8/G-9 quedan
-cubiertos por los unit tests dedicados (40 pass) + revision de codigo; su ruta
-runtime es la misma que la ejercitada en el lab. Probes de wire para G-1/G-2
-(publish forjado sobre un handshake HMAC valido) no se corrieron por costo/beneficio
-frente a los unit tests.
+G-1(rejection)/G-2/G-3 and F-03/F-04/F-05(gap)/F-07/F-08/F-09/G-5/G-6/G-8/G-9 are
+covered by the dedicated unit tests (40 pass) + code review; their runtime
+path is the same as the one exercised in the lab. Wire probes for G-1/G-2
+(a forged publish over a valid HMAC handshake) were not run, on cost/benefit grounds
+versus the unit tests.
 
-Estado final del lab: motherbee (201) + worker (202) running, malla sana, 19 ilks
-consistentes en ambos lados.
+Final lab status: motherbee (201) + worker (202) running, healthy mesh, 19 ilks
+consistent on both sides.

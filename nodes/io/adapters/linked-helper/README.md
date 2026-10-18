@@ -53,7 +53,7 @@ cd adapters/linked-helper/adapter-rs
 cargo run -- start \
   --cloud http://localhost:3002 \
   --token <ENROLLMENT_TOKEN> \
-  --partitions-root "/Users/developmentapx/Documents/test/Partitions"
+  --partitions-root "$HOME/Documents/test/Partitions"
 ```
 
 Behavior:
@@ -142,7 +142,7 @@ cd adapters/linked-helper/adapter-rs
 cargo run -- start \
   --cloud http://localhost:3002 \
   --token <ENROLLMENT_TOKEN> \
-  --partitions-root "/Users/developmentapx/Documents/test/Partitions" \
+  --partitions-root "$HOME/Documents/test/Partitions" \
   --once
 ```
 

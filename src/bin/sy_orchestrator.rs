@@ -99,7 +99,7 @@ const SYNCTHING_FOLDER_BLOB_PUBLIC_ID: &str = "fluxbee-blob-public";
 /// never re-point it, because `ensure_syncthing_folder_in_config_xml` rewrites a matching id's
 /// path in place, and a receive-only spoke then applies remote deletes — this repo already has
 /// an incident of syncthing deleting `runtimes/ai.common/0.1.2/**` through exactly that path
-/// (`docs/onworking NOE/CORE_DIAG_runtime_deletion_by_fluxbee_syncthing.md`).
+/// (`docs/history/onworking-noe/CORE_DIAG_runtime_deletion_by_fluxbee_syncthing.md`).
 const SYNCTHING_FOLDER_DIST_LEGACY_ID: &str = "fluxbee-dist";
 /// Per-role core binaries: `fluxbee-dist-core-<role>`. Motherbee serves
 /// `dist/core/<role>` (materialized by `materialize_role_core_trees`); the spoke receives it
@@ -25092,7 +25092,7 @@ fn ssh_bootstrap_error_payload(error: &str) -> serde_json::Value {
             "auth rejected. On a stock Ubuntu cloud image PasswordAuthentication is 'no' \
              (/etc/ssh/sshd_config.d/50-cloud-init.conf, first-match — a 99- drop-in will NOT \
              override it). Use ssh_key (the cloud-init-injected key) instead of ssh_password, or \
-             add a 00-*.conf drop-in with PasswordAuthentication yes. See docs/07-operaciones.md §8.0/§8.1."
+             add a 00-*.conf drop-in with PasswordAuthentication yes. See docs/reference/operations.md (Join a hive)."
         );
     }
     payload

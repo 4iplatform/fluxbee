@@ -1,244 +1,244 @@
-# Auditoria sy.orchestrator - vision fresca
+# sy.orchestrator audit - fresh look
 
-Fecha: 2026-06-30
-Repositorio: `/Users/cagostino/code/fluxbee`
+Date: 2026-06-30
+Repository: this one (`fluxbee`)
 Branch: `daily_onworking_coa`
-Commit revisado: `25e883e`
-Foco: `src/bin/sy_orchestrator.rs` y fronteras inmediatas de router/policy/identity que condicionan seguridad u operatividad.
+Commit reviewed: `25e883e`
+Focus: `src/bin/sy_orchestrator.rs` and the immediate router/policy/identity boundaries that affect security or operability.
 
-## Resumen ejecutivo
+## Executive summary
 
-`sy.orchestrator` mejoro claramente respecto de la auditoria del 2026-06-23: hay gate de origen para acciones admin mutantes, `hive_id` se valida antes de tocar paths destructivos, `add_hive/remove_hive` dejaron de usar SSH como fallback operativo cuando el worker ya debe responder por socket, `write_remote_file` ya no interpola contenidos en shell remoto, y egress valida nombres de interfaces antes de llegar a YAML/nft/shell.
+`sy.orchestrator` improved clearly compared with the 2026-06-23 audit: there is an origin gate for mutating admin actions; `hive_id` is validated before destructive paths are touched; `add_hive/remove_hive` stopped using SSH as an operational fallback when the worker should already answer over the socket; `write_remote_file` no longer interpolates contents into a remote shell; and egress validates interface names before they reach YAML/nft/shell.
 
-La nueva superficie de codigo introduce, sin embargo, riesgos relevantes en lifecycle de nodos dinamicos y bootstrap de hives:
+The new code surface, however, introduces significant risks in the lifecycle of dynamic nodes and in hive bootstrap:
 
-- El campo `unit` no esta atado al ownership de un nodo gestionado. `KILL_NODE` puede parar unidades arbitrarias de systemd y `SPAWN_NODE` puede registrar/configurar nodos contra una unidad elegida por el caller.
-- `add_hive` deja acceso SSH de bootstrap con capacidad root por defecto, y tambien durante fallos parciales previos al paso de hardening.
-- `run_node` muta `SY.identity` y el mapping local antes de comprobar si ya existe config local y antes de confirmar que `systemd-run` funciono, dejando estados parciales dificiles de reconciliar.
-- No hay lock por nodo para serializar `run_node/start/restart/kill/remove/config_set`; el archivo de config atomico no alcanza para proteger los efectos en identity, systemd y timers.
-- La autoridad `SYSTEM` esta centralizada en router, pero `sy.orchestrator` no mantiene un guard defensivo local para acciones protegidas si una ruta de entrega futura/bypass/test evita ese filtro.
+- The `unit` field is not tied to the ownership of a managed node. `KILL_NODE` can stop arbitrary systemd units, and `SPAWN_NODE` can register/configure nodes against a unit chosen by the caller.
+- `add_hive` leaves bootstrap SSH access with root capability in place by default, and also during partial failures that happen before the hardening step.
+- `run_node` mutates `SY.identity` and the local mapping before checking whether a local config already exists and before confirming that `systemd-run` worked. This leaves partial states that are hard to reconcile.
+- There is no per-node lock to serialize `run_node/start/restart/kill/remove/config_set`; the atomic config file is not enough to protect the effects on identity, systemd and timers.
+- `SYSTEM` authority is centralized in the router, but `sy.orchestrator` keeps no local defensive guard for protected actions in case a future/bypass/test delivery path avoids that filter.
 
-Validacion local ejecutada:
+Local validation run:
 
-- `cargo test --bin sy_orchestrator`: OK, 106 tests passed, 0 failed. El build emitio warnings preexistentes de `dead_code`/`unused`, sin fallos.
+- `cargo test --bin sy_orchestrator`: OK, 106 tests passed, 0 failed. The build emitted pre-existing `dead_code`/`unused` warnings, with no failures.
 
-## Hallazgos
+## Findings
 
-### SO-2026-06-30-01 - Alta - `unit` permite controlar unidades systemd fuera del nodo gestionado
+### SO-2026-06-30-01 - High - `unit` allows controlling systemd units outside the managed node
 
-Estado: Abierto
+Status: Open
 
-Evidencia:
+Evidence:
 
-- `run_node_flow` acepta `payload.unit`, lo sanitiza pero lo usa como unidad final si esta presente (`src/bin/sy_orchestrator.rs:12518-12523`).
-- El comando de spawn usa ese valor en `systemd-run --unit ...` (`src/bin/sy_orchestrator.rs:14157-14189`).
-- `kill_node_flow` permite omitir `node_name` y usar `payload.unit`; tambien solo sanitiza caracteres (`src/bin/sy_orchestrator.rs:13197-13244`).
-- Luego ejecuta `systemctl kill/stop/reset-failed {unit}` (`src/bin/sy_orchestrator.rs:13264-13270`, `src/bin/sy_orchestrator.rs:13339-13340`).
-- `KILL_NODE` y `SPAWN_NODE` estan en la tabla de acciones `SYSTEM` protegidas (`src/router/system_policy.rs:25-43`), pero una vez autorizado el caller, no hay validacion de que la unidad pertenezca al nodo.
+- `run_node_flow` accepts `payload.unit`, sanitizes it, but uses it as the final unit if it is present (`src/bin/sy_orchestrator.rs:12518-12523`).
+- The spawn command uses that value in `systemd-run --unit ...` (`src/bin/sy_orchestrator.rs:14157-14189`).
+- `kill_node_flow` allows omitting `node_name` and using `payload.unit`; it too only sanitizes characters (`src/bin/sy_orchestrator.rs:13197-13244`).
+- It then runs `systemctl kill/stop/reset-failed {unit}` (`src/bin/sy_orchestrator.rs:13264-13270`, `src/bin/sy_orchestrator.rs:13339-13340`).
+- `KILL_NODE` and `SPAWN_NODE` are in the table of protected `SYSTEM` actions (`src/router/system_policy.rs:25-43`), but once the caller is authorized, nothing validates that the unit belongs to the node.
 
-Impacto:
+Impact:
 
-Un caller autorizado para lifecycle de nodos podria parar servicios core del host (`sy-orchestrator`, `sy-identity`, `rt-gateway`, `ssh`, `postgresql`, etc.) enviando `KILL_NODE` con `unit` directo. Esto saltea los invariantes de lifecycle administrado y puede producir DoS local o cross-hive, porque `SY.orchestrator@<any hive>` esta autorizado para acciones protegidas (`src/router/system_policy.rs:69-87`).
+A caller authorized for node lifecycle could stop the host's core services (`sy-orchestrator`, `sy-identity`, `rt-gateway`, `ssh`, `postgresql`, etc.) by sending `KILL_NODE` with a direct `unit`. This bypasses the managed-lifecycle invariants and can cause a local or cross-hive DoS, because `SY.orchestrator@<any hive>` is authorized for protected actions (`src/router/system_policy.rs:69-87`).
 
-Recomendacion:
+Recommendation:
 
-- Para la API publica/admin/system, exigir `node_name` y derivar siempre `unit` con `unit_from_node_name`.
-- Si se conserva `unit`, permitir solo `fluxbee-node-*` y comprobar que corresponde a un config gestionado existente antes de operar.
-- Separar control de servicios core en una accion explicita con allowlist reducida, sin autoridad cross-hive generica.
-- Agregar tests para `KILL_NODE { unit: "sy-orchestrator" }`, `KILL_NODE` sin `node_name`, y `SPAWN_NODE` con `unit` colisionante.
+- For the public/admin/system API, require `node_name` and always derive `unit` with `unit_from_node_name`.
+- If `unit` is kept, allow only `fluxbee-node-*` and check that it matches an existing managed config before acting.
+- Split control of core services into an explicit action with a reduced allowlist and no generic cross-hive authority.
+- Add tests for `KILL_NODE { unit: "sy-orchestrator" }`, `KILL_NODE` without `node_name`, and `SPAWN_NODE` with a colliding `unit`.
 
-### SO-2026-06-30-02 - Alta - Bootstrap SSH queda abierto por defecto y en fallos parciales
+### SO-2026-06-30-02 - High - Bootstrap SSH stays open by default and on partial failures
 
-Estado: Abierto
+Status: Open
 
-Evidencia:
+Evidence:
 
-- `harden_ssh` default es `false` (`src/bin/sy_orchestrator.rs:17040-17045`).
-- `restrict_ssh` default tambien queda `false` si `harden_ssh` no esta activo (`src/bin/sy_orchestrator.rs:17129-17142`).
-- El bootstrap seedea la key por password como entrada sin `from=` ni forced command (`src/bin/sy_orchestrator.rs:15784-15823`, `src/bin/sy_orchestrator.rs:17579-17604`).
-- El sudoers remoto concede `NOPASSWD` a varias herramientas root, incluyendo `/bin/bash` y `/usr/bin/bash` (`src/bin/sy_orchestrator.rs:17607-17611`).
-- Los controles de SSH se aplican recien despues del finalize (`src/bin/sy_orchestrator.rs:16385-16420`, `src/bin/sy_orchestrator.rs:16854-16888`).
-- Hay retornos tempranos luego de key/sudoers y antes del cierre: timeouts WAN/orchestrator/finalize en worker (`src/bin/sy_orchestrator.rs:16239-16311`) y egress (`src/bin/sy_orchestrator.rs:16818-16847`).
-- Si `restrict_ssh` no fue solicitado, el codigo registra que deja la bootstrap key sin restriccion (`src/bin/sy_orchestrator.rs:17367-17371`).
+- The `harden_ssh` default is `false` (`src/bin/sy_orchestrator.rs:17040-17045`).
+- The `restrict_ssh` default also ends up `false` if `harden_ssh` is not active (`src/bin/sy_orchestrator.rs:17129-17142`).
+- The bootstrap seeds the key via password as an entry without `from=` or a forced command (`src/bin/sy_orchestrator.rs:15784-15823`, `src/bin/sy_orchestrator.rs:17579-17604`).
+- The remote sudoers grants `NOPASSWD` to several root tools, including `/bin/bash` and `/usr/bin/bash` (`src/bin/sy_orchestrator.rs:17607-17611`).
+- The SSH controls are applied only after the finalize (`src/bin/sy_orchestrator.rs:16385-16420`, `src/bin/sy_orchestrator.rs:16854-16888`).
+- There are early returns after key/sudoers and before the closing step: WAN/orchestrator/finalize timeouts on worker (`src/bin/sy_orchestrator.rs:16239-16311`) and egress (`src/bin/sy_orchestrator.rs:16818-16847`).
+- If `restrict_ssh` was not requested, the code logs that it leaves the bootstrap key unrestricted (`src/bin/sy_orchestrator.rs:17367-17371`).
 
-Impacto:
+Impact:
 
-En un `add_hive` exitoso con defaults, la key de motherbee queda con acceso SSH al worker/egress y escalacion root via sudoers. En un fallo parcial posterior a la siembra de clave/sudoers, el host puede quedar parcialmente gestionado con el mismo acceso abierto. En egress esto es especialmente sensible porque es un host de borde.
+On a successful `add_hive` with defaults, the motherbee key keeps SSH access to the worker/egress and root escalation via sudoers. On a partial failure after the key/sudoers seeding, the host can be left partly managed with the same access open. On egress this is especially sensitive because it is a border host.
 
-Recomendacion:
+Recommendation:
 
-- Cambiar default a `harden_ssh=true` y `restrict_ssh=true`, o exigir opt-out explicito y auditado.
-- Mejor aun: remover key y sudoers de bootstrap al finalizar correctamente si el contrato v2 dice que SSH es solo bootstrap.
-- Si se necesita break-glass, instalar una entrada `authorized_keys` con `from=`, sin pty/forwarding, y forced command de allowlist pequena.
-- En cada retorno posterior a key/sudoers, intentar cleanup best-effort o marcar estado pendiente con un flag visible tipo `ssh_bootstrap_open=true`.
+- Change the defaults to `harden_ssh=true` and `restrict_ssh=true`, or require an explicit, audited opt-out.
+- Better still: remove the bootstrap key and sudoers on a successful finish if the v2 contract says SSH is bootstrap-only.
+- If break-glass is needed, install an `authorized_keys` entry with `from=`, no pty/forwarding, and a forced command with a small allowlist.
+- On every return after key/sudoers, attempt a best-effort cleanup or mark a pending state with a visible flag such as `ssh_bootstrap_open=true`.
 
-### SO-2026-06-30-03 - Alta/Media - `run_node` muta identity antes de saber si el nodo puede crearse
+### SO-2026-06-30-03 - High/Medium - `run_node` mutates identity before knowing whether the node can be created
 
-Estado: Abierto
+Status: Open
 
-Evidencia:
+Evidence:
 
-- `run_node_flow` registra identidad antes de calcular/comprobar `config_path` (`src/bin/sy_orchestrator.rs:12627-12648`).
-- Despues aplica update de identity si hay cambios (`src/bin/sy_orchestrator.rs:12655-12689`).
-- Recien luego revisa si el config local ya existe y puede devolver `NODE_ALREADY_EXISTS` con identity ya mutada (`src/bin/sy_orchestrator.rs:12697-12724`).
-- La funcion de registro llama a `SY.identity` y persiste el mapping local (`src/bin/sy_orchestrator.rs:11246-11308`).
-- `SY.identity` actualiza/crea el ILK canonico por `identification.node_name` (`src/bin/sy_identity.rs:885-944`).
-- Si la escritura de config o `systemd-run` falla, la respuesta vuelve error pero los efectos previos quedan (`src/bin/sy_orchestrator.rs:12730-12752`, `src/bin/sy_orchestrator.rs:12794-12817`).
+- `run_node_flow` registers the identity before computing/checking `config_path` (`src/bin/sy_orchestrator.rs:12627-12648`).
+- It then applies an identity update if there are changes (`src/bin/sy_orchestrator.rs:12655-12689`).
+- Only after that does it check whether the local config already exists, and it can return `NODE_ALREADY_EXISTS` with identity already mutated (`src/bin/sy_orchestrator.rs:12697-12724`).
+- The registration function calls `SY.identity` and persists the local mapping (`src/bin/sy_orchestrator.rs:11246-11308`).
+- `SY.identity` updates/creates the canonical ILK by `identification.node_name` (`src/bin/sy_identity.rs:885-944`).
+- If the config write or `systemd-run` fails, the response returns an error but the earlier effects remain (`src/bin/sy_orchestrator.rs:12730-12752`, `src/bin/sy_orchestrator.rs:12794-12817`).
 
-Impacto:
+Impact:
 
-Una repeticion de `run_node` contra un nodo existente puede modificar identity/mapping y terminar en `NODE_ALREADY_EXISTS`. Un fallo de `systemd-run` puede dejar config + ILK + mapping persistidos sin proceso corriendo; el retry posterior choca con el config existente y no reanuda de forma limpia.
+A repeated `run_node` against an existing node can modify identity/mapping and end in `NODE_ALREADY_EXISTS`. A `systemd-run` failure can leave config + ILK + mapping persisted with no process running; the later retry collides with the existing config and does not resume cleanly.
 
-Recomendacion:
+Recommendation:
 
-- Hacer la comprobacion de `config_path.exists()` antes de cualquier mutacion en `SY.identity`.
-- Convertir spawn en una transaccion o workflow reanudable: preparar config temporal, registrar identity, ejecutar `systemd-run`, y hacer commit final; si falla, rollback de config/mapping/ILK o estado `pending_spawn` con retry explicito.
-- Agregar tests que verifiquen que `NODE_ALREADY_EXISTS` no dispara RPC a identity y que un `systemd-run` fallido no deja un estado que bloquee reintentos.
+- Do the `config_path.exists()` check before any mutation in `SY.identity`.
+- Turn spawn into a transaction or a resumable workflow: prepare a temporary config, register identity, run `systemd-run`, and do a final commit; if it fails, roll back config/mapping/ILK, or use a `pending_spawn` state with an explicit retry.
+- Add tests that verify that `NODE_ALREADY_EXISTS` does not trigger an RPC to identity and that a failed `systemd-run` does not leave a state that blocks retries.
 
-### SO-2026-06-30-04 - Media - Falta lock por nodo para lifecycle y config
+### SO-2026-06-30-04 - Medium - Missing per-node lock for lifecycle and config
 
-Estado: Abierto
+Status: Open
 
-Evidencia:
+Evidence:
 
-- `OrchestratorState` tiene locks para runtime y topologia de hives, pero no un lock por nodo gestionado (`src/bin/sy_orchestrator.rs:466-498`).
-- El lock por hive se aplica a add/remove hive (`src/bin/sy_orchestrator.rs:513-525`, `src/bin/sy_orchestrator.rs:15434-15437`, `src/bin/sy_orchestrator.rs:8022-8024`).
-- La creacion de config de nodo hace check `path.exists()` y luego `write_json_atomic`, pero sin guard compartido con identity/systemd/kill/remove (`src/bin/sy_orchestrator.rs:9499-9520`).
-- `run_node_flow` ejecuta identity, config y systemd dentro de una ventana larga sin lock de nodo (`src/bin/sy_orchestrator.rs:12627-12817`).
+- `OrchestratorState` has locks for runtime and hive topology, but no lock per managed node (`src/bin/sy_orchestrator.rs:466-498`).
+- The per-hive lock applies to add/remove hive (`src/bin/sy_orchestrator.rs:513-525`, `src/bin/sy_orchestrator.rs:15434-15437`, `src/bin/sy_orchestrator.rs:8022-8024`).
+- Node config creation does a `path.exists()` check and then `write_json_atomic`, but without a guard shared with identity/systemd/kill/remove (`src/bin/sy_orchestrator.rs:9499-9520`).
+- `run_node_flow` runs identity, config and systemd inside a long window with no node lock (`src/bin/sy_orchestrator.rs:12627-12817`).
 
-Impacto:
+Impact:
 
-Dos `run_node` simultaneos para el mismo nodo pueden registrar/updatear identity en ambos caminos y competir por el config. Un `kill_node purge_instance` o `remove_node_instance` puede borrar estado mientras `run_node` esta creando config o arrancando unidad. El resultado probable es drift entre identity, config local, timers y systemd.
+Two simultaneous `run_node` calls for the same node can register/update identity on both paths and race for the config. A `kill_node purge_instance` or `remove_node_instance` can delete state while `run_node` is creating the config or starting the unit. The likely result is drift between identity, local config, timers and systemd.
 
-Recomendacion:
+Recommendation:
 
-- Agregar un registry de locks por `node_name` normalizado, similar a `hive_topology_locks`.
-- Mantener el lock durante `run_node`, `start_node`, `restart_node`, `kill_node`, `remove_node_instance` y `NODE_CONFIG_SET` para el nodo local.
-- Cubrir con tests concurrentes para `run_node/run_node` y `run_node/kill_node purge_instance`.
+- Add a registry of locks keyed by normalized `node_name`, similar to `hive_topology_locks`.
+- Hold the lock during `run_node`, `start_node`, `restart_node`, `kill_node`, `remove_node_instance` and `NODE_CONFIG_SET` for the local node.
+- Cover this with concurrent tests for `run_node/run_node` and `run_node/kill_node purge_instance`.
 
-### SO-2026-06-30-05 - Media - `SYSTEM` depende solo del router para acciones protegidas
+### SO-2026-06-30-05 - Medium - `SYSTEM` relies only on the router for protected actions
 
-Estado: Abierto
+Status: Open
 
-Evidencia:
+Evidence:
 
-- El perfil RPC entrega cualquier `SYSTEM` post-pending al command channel del orchestrator (`src/bin/sy_orchestrator.rs:528-546`).
-- `handle_system_message` declara que no revalida origen porque router lo filtra centralmente (`src/bin/sy_orchestrator.rs:2091-2099`).
-- Si un mensaje llega a ese handler, ejecuta acciones protegidas como `SPAWN_NODE`, `KILL_NODE`, `NODE_CONFIG_SET`, `ADD_HIVE_FINALIZE` y `REMOVE_HIVE_CLEANUP` (`src/bin/sy_orchestrator.rs:2119-2207`).
-- El router filtra actualmente antes de entrega local (`src/router/mod.rs:5628-5643`).
+- The RPC profile delivers any post-pending `SYSTEM` to the orchestrator's command channel (`src/bin/sy_orchestrator.rs:528-546`).
+- `handle_system_message` states that it does not re-validate the origin because the router filters it centrally (`src/bin/sy_orchestrator.rs:2091-2099`).
+- If a message reaches that handler, it runs protected actions such as `SPAWN_NODE`, `KILL_NODE`, `NODE_CONFIG_SET`, `ADD_HIVE_FINALIZE` and `REMOVE_HIVE_CLEANUP` (`src/bin/sy_orchestrator.rs:2119-2207`).
+- The router currently filters before local delivery (`src/router/mod.rs:5628-5643`).
 
-Impacto:
+Impact:
 
-El diseno centralizado es razonable en ruta normal, pero el receptor queda sin defensa local frente a un bypass de test, una version vieja de router, una ruta alternativa futura, o una regresion en `serialize_for_local_delivery`. Si esa frontera falla, el impacto es total porque el handler ejecuta mutaciones criticas.
+The centralized design is reasonable on the normal path, but the receiver is left with no local defense against a test bypass, an old router version, a future alternative path, or a regression in `serialize_for_local_delivery`. If that boundary fails, the impact is total, because the handler runs critical mutations.
 
-Recomendacion:
+Recommendation:
 
-- Mantener router como fuente de verdad, pero agregar un guard defensivo en `sy.orchestrator` para acciones `SYSTEM` protegidas usando la misma politica compartida o un helper expuesto.
-- Como minimo, rechazar acciones protegidas si `msg.routing.src_l2_name` es `None` y registrar alerta.
-- Agregar test que invoque `handle_system_message` con una accion protegida y origen no autorizado, sin pasar por router.
+- Keep the router as the source of truth, but add a defensive guard in `sy.orchestrator` for protected `SYSTEM` actions, using the same shared policy or an exposed helper.
+- At a minimum, reject protected actions if `msg.routing.src_l2_name` is `None`, and log an alert.
+- Add a test that invokes `handle_system_message` with a protected action and an unauthorized origin, without going through the router.
 
-### SO-2026-06-30-06 - Media/Baja - Campos de `hive.yaml` entran crudos en unit file de syncthing
+### SO-2026-06-30-06 - Medium/Low - `hive.yaml` fields go raw into the syncthing unit file
 
-Estado: Abierto
+Status: Open
 
-Evidencia:
+Evidence:
 
-- `blob_runtime_from_hive` copia `blob.path`, `blob.sync.data_dir` y `blob.sync.service_user` desde YAML con trim, pero sin validacion de caracteres/control chars ni normalizacion de paths (`src/bin/sy_orchestrator.rs:3287-3335`).
-- `resolve_syncthing_service_user` verifica que el usuario exista o cae a root si se habilito fallback, pero no valida el valor para uso en unit files (`src/bin/sy_orchestrator.rs:3730-3748`).
-- `syncthing_unit_contents` interpola `User=`, `Group=`, `WorkingDirectory=`, `Environment=HOME=` y `ExecStart --home=` con strings crudos (`src/bin/sy_orchestrator.rs:4774-4785`).
-- Luego escribe `/etc/systemd/system/fluxbee-syncthing.service` como root (`src/bin/sy_orchestrator.rs:4789-4801`).
+- `blob_runtime_from_hive` copies `blob.path`, `blob.sync.data_dir` and `blob.sync.service_user` from YAML with a trim, but with no character/control-char validation and no path normalization (`src/bin/sy_orchestrator.rs:3287-3335`).
+- `resolve_syncthing_service_user` checks that the user exists, or falls back to root if fallback was enabled, but does not validate the value for use in unit files (`src/bin/sy_orchestrator.rs:3730-3748`).
+- `syncthing_unit_contents` interpolates `User=`, `Group=`, `WorkingDirectory=`, `Environment=HOME=` and `ExecStart --home=` with raw strings (`src/bin/sy_orchestrator.rs:4774-4785`).
+- It then writes `/etc/systemd/system/fluxbee-syncthing.service` as root (`src/bin/sy_orchestrator.rs:4789-4801`).
 
-Impacto:
+Impact:
 
-No es shell injection directa, pero un path con newline, `%`/specifier raro o caracteres no esperados puede generar un unit file invalido o inyectar directivas systemd si alguien controla `hive.yaml`. En el caso normal el config es operator-owned, por eso la severidad es menor; como hardening de operatividad conviene cerrar la clase.
+It is not direct shell injection, but a path with a newline, an odd `%`/specifier or unexpected characters can produce an invalid unit file or inject systemd directives if someone controls `hive.yaml`. In the normal case the config is operator-owned, so the severity is lower; as operability hardening, it is worth closing the class.
 
-Recomendacion:
+Recommendation:
 
-- Rechazar control chars/newlines y exigir paths absolutos normalizados para `blob.path`, `dist.path` y `blob.sync.data_dir`.
-- Usar escaping correcto para systemd (`systemd-escape`/reglas equivalentes) o escribir unit fields via una representacion validada.
-- Agregar tests con `sync.data_dir` que contiene newline, espacios y `%` para confirmar rechazo o escape estable.
+- Reject control chars/newlines and require normalized absolute paths for `blob.path`, `dist.path` and `blob.sync.data_dir`.
+- Use correct escaping for systemd (`systemd-escape`/equivalent rules) or write unit fields through a validated representation.
+- Add tests with a `sync.data_dir` that contains a newline, spaces and `%` to confirm rejection or stable escaping.
 
-### SO-2026-06-30-07 - Media/Baja - `write_secret_file_0600` no repara permisos de archivos existentes
+### SO-2026-06-30-07 - Medium/Low - `write_secret_file_0600` does not repair the permissions of existing files
 
-Estado: Abierto
+Status: Open
 
-Evidencia:
+Evidence:
 
-- `write_secret_file_0600` abre con `.create(true).truncate(true).mode(0o600)` y escribe, pero no hace `set_permissions` despues (`src/bin/sy_orchestrator.rs:800-813`).
-- `.mode(0o600)` solo aplica si el archivo se crea. Si el archivo existia con permisos amplios, el truncate conserva el modo anterior.
-- Se usa para la key TLS local del hive (`src/bin/sy_orchestrator.rs:873-884`).
+- `write_secret_file_0600` opens with `.create(true).truncate(true).mode(0o600)` and writes, but does not call `set_permissions` afterwards (`src/bin/sy_orchestrator.rs:800-813`).
+- `.mode(0o600)` only applies if the file is created. If the file already existed with broad permissions, the truncate keeps the previous mode.
+- It is used for the hive's local TLS key (`src/bin/sy_orchestrator.rs:873-884`).
 
-Impacto:
+Impact:
 
-Si `cert.key` quedo alguna vez con `0644` u otro modo amplio, una reescritura/rotacion posterior no corrige el permiso y mantiene la exposicion local.
+If `cert.key` was ever left with `0644` or another broad mode, a later rewrite/rotation does not fix the permission and keeps the local exposure.
 
-Recomendacion:
+Recommendation:
 
-- Hacer `fs::set_permissions(path, 0o600)` despues de escribir, o escribir a temp 0600 y renombrar atomicamente.
-- Agregar test con archivo preexistente `0644`.
+- Call `fs::set_permissions(path, 0o600)` after writing, or write to a 0600 temp file and rename it atomically.
+- Add a test with a pre-existing `0644` file.
 
-### SO-2026-06-30-08 - Baja/Media - Egress reporta sysctl como OK sin readback y tiene ventana delete-then-apply en nft
+### SO-2026-06-30-08 - Low/Medium - Egress reports sysctl as OK without readback and has a delete-then-apply window in nft
 
-Estado: Abierto
+Status: Open
 
-Evidencia:
+Evidence:
 
-- `reconcile_egress_nat` corre `apply_sysctl_system()` y marca `ipv4_forwarding=true` e `ipv6_blocked=true` sin leer de vuelta los valores reales del kernel (`src/bin/sy_orchestrator.rs:4562-4569`).
-- En nftables borra la tabla existente y luego aplica el archivo nuevo (`src/bin/sy_orchestrator.rs:4584-4595`).
-- Conntrack si tiene readback/estado real (`src/bin/sy_orchestrator.rs:4580-4582`), lo cual muestra el patron que falta para sysctl.
+- `reconcile_egress_nat` runs `apply_sysctl_system()` and marks `ipv4_forwarding=true` and `ipv6_blocked=true` without reading back the real values from the kernel (`src/bin/sy_orchestrator.rs:4562-4569`).
+- In nftables it deletes the existing table and then applies the new file (`src/bin/sy_orchestrator.rs:4584-4595`).
+- Conntrack does have readback/real state (`src/bin/sy_orchestrator.rs:4580-4582`), which shows the pattern that is missing for sysctl.
 
-Impacto:
+Impact:
 
-La verificacion puede reportar un egress sano aunque otro proceso/politica haya rechazado o revertido sysctl. Durante una reconciliacion hay una ventana corta sin la tabla `fluxbee_egress`; con forwarding activo, el plano de borde queda temporalmente sin esa politica.
+The verification can report a healthy egress even if another process/policy has rejected or reverted sysctl. During a reconciliation there is a short window without the `fluxbee_egress` table; with forwarding active, the border plane is temporarily left without that policy.
 
-Recomendacion:
+Recommendation:
 
-- Leer de vuelta `net.ipv4.ip_forward` y los sysctl IPv6 relevantes despues de aplicar.
-- Evitar delete-then-apply: usar una transaccion nft que reemplace/flush los objetos dentro de `nft -f` sin dejar gap observable, o staging table + swap equivalente.
-- Agregar test unitario del verificador de sysctl y, si es posible, un test de integracion en namespace de red.
+- Read back `net.ipv4.ip_forward` and the relevant IPv6 sysctls after applying.
+- Avoid delete-then-apply: use an nft transaction that replaces/flushes the objects inside `nft -f` without leaving an observable gap, or an equivalent staging table + swap.
+- Add a unit test for the sysctl verifier and, if possible, an integration test in a network namespace.
 
-## No regresiones observadas de la auditoria anterior
+## No regressions observed from the previous audit
 
-Esta pasada no encontro regresion en los arreglos mas criticos del documento del 2026-06-23:
+This pass found no regression in the most critical fixes from the 2026-06-23 document:
 
-- Admin mutante exige origen `SY.admin@<hive local>` (`src/bin/sy_orchestrator.rs:1789-1811`, `src/bin/sy_orchestrator.rs:2221-2253`).
-- `hive_id` se valida temprano y hay guard lexical para paths de hive (`src/bin/sy_orchestrator.rs:16987-17004`, `src/bin/sy_orchestrator.rs:15417-15437`).
-- `remove_hive` usa socket o local-only, sin fallback SSH operativo (`src/bin/sy_orchestrator.rs:8062-8111`).
-- `write_remote_file` transmite contenidos por stdin a `sudo tee`, sin heredoc/interpolacion de payload (`src/bin/sy_orchestrator.rs:17937-18005`).
-- Egress valida nombres de interfaz con allowlist antes de sinks shell/nft/YAML (`src/bin/sy_orchestrator.rs:4161-4215`).
+- Mutating admin requires the origin `SY.admin@<hive local>` (`src/bin/sy_orchestrator.rs:1789-1811`, `src/bin/sy_orchestrator.rs:2221-2253`).
+- `hive_id` is validated early, and there is a lexical guard for hive paths (`src/bin/sy_orchestrator.rs:16987-17004`, `src/bin/sy_orchestrator.rs:15417-15437`).
+- `remove_hive` uses the socket or local-only, with no operational SSH fallback (`src/bin/sy_orchestrator.rs:8062-8111`).
+- `write_remote_file` streams contents over stdin to `sudo tee`, with no heredoc/payload interpolation (`src/bin/sy_orchestrator.rs:17937-18005`).
+- Egress validates interface names with an allowlist before the shell/nft/YAML sinks (`src/bin/sy_orchestrator.rs:4161-4215`).
 
-## Gaps de la auditoria
+## Audit gaps
 
-- No se ejecuto E2E con hives reales, egress real, ni pruebas de red/iptables/nft en namespace.
-- No se ejercito una topologia multi-hive viva con routers de versiones mixtas.
-- No se hizo fuzzing de payloads admin/system.
-- La revision fue estatica + unit tests locales; los findings de concurrencia deben confirmarse con pruebas dirigidas, pero la ausencia de lock por nodo y el orden de side effects son visibles en codigo.
+- No E2E was run with real hives or a real egress, and no network/iptables/nft tests were run in a namespace.
+- A live multi-hive topology with mixed router versions was not exercised.
+- No fuzzing of admin/system payloads was done.
+- The review was static + local unit tests. The concurrency findings must be confirmed with targeted tests, but the absence of a per-node lock and the order of side effects are visible in the code.
 
-## Orden sugerido de remediacion
+## Suggested remediation order
 
-1. Cerrar ownership de `unit` en `run_node`/`kill_node` y cubrir con tests negativos.
-2. Cambiar defaults/semantica de SSH bootstrap: cerrar o remover key/sudoers al final, y limpiar en fallos parciales.
-3. Reordenar `run_node` para evitar side effects de identity antes del preflight local y definir rollback/retry para spawn fallido.
-4. Agregar lock por nodo para lifecycle/config.
-5. Agregar guard defensivo local para acciones `SYSTEM` protegidas.
-6. Endurecer unit file de syncthing, permisos de secrets y readback/atomicidad de egress.
+1. Close `unit` ownership in `run_node`/`kill_node` and cover it with negative tests.
+2. Change the SSH bootstrap defaults/semantics: close or remove key/sudoers at the end, and clean up on partial failures.
+3. Reorder `run_node` to avoid identity side effects before the local preflight, and define rollback/retry for a failed spawn.
+4. Add a per-node lock for lifecycle/config.
+5. Add a local defensive guard for protected `SYSTEM` actions.
+6. Harden the syncthing unit file, the secrets' permissions and egress readback/atomicity.
 
-## Estado de remediacion (2026-07-01)
+## Remediation status (2026-07-01)
 
-Verificacion previa: los 8 findings fueron confirmados contra el codigo actual (ninguno stale/falso); ademas se hallaron 3 temas nuevos (B-1/B-2/B-3, abajo).
+Prior verification: the 8 findings were confirmed against the current code (none stale/false); in addition, 3 new issues were found (B-1/B-2/B-3, below).
 
-| ID | Severidad | Estado | Commit |
+| ID | Severity | Status | Commit |
 | --- | --- | --- | --- |
-| SO-2026-06-30-01 | Alta | **Resuelto** — `unit` siempre derivado de `node_name` (`fluxbee-node-*`); KILL_NODE exige `node_name`. No puede tocar units del host. | `0f0400a` |
-| SO-2026-06-30-02 | Alta | **Resuelto** — revoke del acceso SSH de bootstrap (key + sudoers) al finalizar un add_hive exitoso; validado 2-VM en lab (sudoers GONE, 0 entries en authorized_keys, motherbee SSH→worker denied, worker operativo por socket). | `cc76814` |
-| SO-2026-06-30-03 | Alta/Media | **Resuelto** — preflight de config antes de mutar identity; rollback best-effort del config en `SPAWN_FAILED`. | `0f0400a` |
-| SO-2026-06-30-04 | Media | **Resuelto** — lock async por `node_name` en run/kill/start/restart/remove/config_set. | `57b9e71` |
-| SO-2026-06-30-05 | Media | **Resuelto** — guard defensivo local en `handle_system_message` con la misma `system_policy` (ahora `pub`). | `0f0400a` |
-| SO-2026-06-30-06 | Media/Baja | **Resuelto** — validacion de control-chars/path-absoluto antes de escribir el unit de syncthing. | `cec4195` |
-| SO-2026-06-30-07 | Media/Baja | **Resuelto** — `write_secret_file_0600` re-asegura 0600 post-write. | `0f0400a` |
-| SO-2026-06-30-08 | Baja/Media | **Resuelto** — readback real de sysctl; nft add+flush+define atomico (sin delete-then-apply). | `cec4195` |
-| B-1 (nuevo) | Baja | **Resuelto** — `ssh_user` validado por charset antes de tocar shell/ssh. | `cec4195` |
-| B-2 (nuevo) | Baja | **Resuelto** — best-effort revoke de la bootstrap key en add_hive fallido (worker/egress) + flag `ssh_bootstrap_open` en el resultado de error. | `d37d29a` |
-| B-3 (nuevo) | Info | **Resuelto** — `validate_yaml_scalar` sobre los valores interpolados en el worker/egress `hive.yaml` (rechaza quote/backslash/control-char). | `d37d29a` |
+| SO-2026-06-30-01 | High | **Resolved** — `unit` is always derived from `node_name` (`fluxbee-node-*`); KILL_NODE requires `node_name`. It cannot touch host units. | `0f0400a` |
+| SO-2026-06-30-02 | High | **Resolved** — revoke of the bootstrap SSH access (key + sudoers) when a successful add_hive finishes; validated on 2 VMs in the lab (sudoers GONE, 0 entries in authorized_keys, motherbee SSH→worker denied, worker operational over the socket). | `cc76814` |
+| SO-2026-06-30-03 | High/Medium | **Resolved** — config preflight before mutating identity; best-effort rollback of the config on `SPAWN_FAILED`. | `0f0400a` |
+| SO-2026-06-30-04 | Medium | **Resolved** — async lock per `node_name` in run/kill/start/restart/remove/config_set. | `57b9e71` |
+| SO-2026-06-30-05 | Medium | **Resolved** — local defensive guard in `handle_system_message` with the same `system_policy` (now `pub`). | `0f0400a` |
+| SO-2026-06-30-06 | Medium/Low | **Resolved** — control-chars/absolute-path validation before writing the syncthing unit. | `cec4195` |
+| SO-2026-06-30-07 | Medium/Low | **Resolved** — `write_secret_file_0600` re-ensures 0600 post-write. | `0f0400a` |
+| SO-2026-06-30-08 | Low/Medium | **Resolved** — real sysctl readback; atomic nft add+flush+define (no delete-then-apply). | `cec4195` |
+| B-1 (new) | Low | **Resolved** — `ssh_user` validated by charset before touching shell/ssh. | `cec4195` |
+| B-2 (new) | Low | **Resolved** — best-effort revoke of the bootstrap key on a failed add_hive (worker/egress) + `ssh_bootstrap_open` flag in the error result. | `d37d29a` |
+| B-3 (new) | Info | **Resolved** — `validate_yaml_scalar` on the values interpolated into the worker/egress `hive.yaml` (rejects quote/backslash/control-char). | `d37d29a` |
 
-Resueltos: **11/11** — los 8 findings originales de la auditoria (SO-01..08) + los 3 nuevos (B-1/B-2/B-3). SO-02 (revoke SSH bootstrap) se cerro con re-validacion 2-VM en el lab Proxmox. Ningun pendiente. Tests: `cargo test --bin sy_orchestrator` 109 passed / 0 failed. Commits: `0f0400a` (SO-01/03/05/07), `cec4195` (SO-06/08/B-1), `57b9e71` (SO-04), `cc76814` (SO-02), `d37d29a` (B-2/B-3).
+Resolved: **11/11** — the audit's 8 original findings (SO-01..08) + the 3 new ones (B-1/B-2/B-3). SO-02 (SSH bootstrap revoke) was closed with a 2-VM re-validation in the Proxmox lab. None pending. Tests: `cargo test --bin sy_orchestrator` 109 passed / 0 failed. Commits: `0f0400a` (SO-01/03/05/07), `cec4195` (SO-06/08/B-1), `57b9e71` (SO-04), `cc76814` (SO-02), `d37d29a` (B-2/B-3).

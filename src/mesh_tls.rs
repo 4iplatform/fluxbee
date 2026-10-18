@@ -3,7 +3,7 @@
 //! (CN + SAN = hive_id); the WAN handshake is mutual TLS verifying the peer cert
 //! is CA-signed, and the application binds the TLS identity (cert hive_id) to the
 //! hive_id claimed in the WAN HELLO. The CA key is NOT derived from the SSH key
-//! (isolation). See `docs/onworking COA/wan-mtls-peer-auth.md`.
+//! (isolation). See `docs/history/onworking-coa/wan-mtls-peer-auth.md`.
 
 use std::io::BufReader;
 use std::sync::Arc;

@@ -2,7 +2,7 @@
 
 **Status:** BUILT + tested + committed (`65a3ff0`, 2026-07-20); the OPA vouch follow-step is closed (`101f2c3`).
 **Closes:** EDGE-H4 (ingress→worker single WAN hop) for the star topology.
-**Related:** `edge-ingress-spec-v6.md` (H4), `docs/onworking COA/opa-dual.md`, `src/router/system_policy.rs`, `policy/system.rego`.
+**Related:** `edge-ingress-spec-v6.md` (H4), `docs/history/onworking-coa/opa-dual.md`, `src/router/system_policy.rs`, `policy/system.rego`.
 
 ## 1. Problem
 

@@ -271,7 +271,7 @@ development: APIs and docs still change. This section describes version 0.1.79.
 - Let's Encrypt certificates for the edge. Today the operator loads the TLS certificate into
   SY.vault.
 - Archi and `io.web` reachable through Fluxbee Cloud. `io.web` is a design today
-  ([docs/io-web-spec-beta-v1.md](docs/io-web-spec-beta-v1.md)).
+  ([docs/history/io-web-spec-beta-v1.md](docs/history/io-web-spec-beta-v1.md)).
 
 ### Known limits
 
@@ -508,7 +508,7 @@ curl -sS "$ADMIN/hives/motherbee/usage?tenant_id=$TENANT" | jq .
   `bin/start.sh` and zips the package. Publish the zip from Archi.
 
 The package contract (all three types, sources, errors) is in
-[docs/runtime-packaging-cli-spec.md](docs/runtime-packaging-cli-spec.md).
+[docs/history/runtime-packaging-cli-spec.md](docs/history/runtime-packaging-cli-spec.md).
 
 ---
 
@@ -567,12 +567,12 @@ calls use `/hives/motherbee/...`.
 | IO.cloud, the API for Fluxbee Cloud | [docs/io-cloud-api.md](docs/io-cloud-api.md) |
 | SY.edge, the public door | [docs/edge-ingress-spec-v6.md](docs/edge-ingress-spec-v6.md) |
 | Host posture and exposure | [docs/host-posture-and-exposure-spec-v1.md](docs/host-posture-and-exposure-spec-v1.md) |
-| Secrets | [docs/sy-vault-spec.md](docs/sy-vault-spec.md) |
-| Package format and publishing | [docs/runtime-packaging-cli-spec.md](docs/runtime-packaging-cli-spec.md) |
+| Secrets | [docs/history/sy-vault-spec.md](docs/history/sy-vault-spec.md) |
+| Package format and publishing | [docs/history/runtime-packaging-cli-spec.md](docs/history/runtime-packaging-cli-spec.md) |
 | Packaging, build and install (Spanish) | [docs/packaging-and-build.md](docs/packaging-and-build.md) |
-| Operations: hive.yaml, add_hive, upgrades (Spanish) | [docs/07-operaciones.md](docs/07-operaciones.md) |
+| Operations: hive.yaml, add_hive, upgrades (Spanish) | [docs/history/07-operaciones.md](docs/history/07-operaciones.md) |
 | Workflows with SY.wf-rules (Spanish) | [docs/wf-rules-quickstart.md](docs/wf-rules-quickstart.md) |
-| Original architecture, protocol, shared memory and routing specs (Spanish, older) | [docs/01-arquitectura.md](docs/01-arquitectura.md) to [docs/05-conectividad.md](docs/05-conectividad.md) |
+| Original architecture, protocol, shared memory and routing specs (Spanish, older) | [docs/history/01-arquitectura.md](docs/history/01-arquitectura.md) to [docs/history/05-conectividad.md](docs/history/05-conectividad.md) |
 | Rust SDK | [crates/fluxbee_sdk/README.md](crates/fluxbee_sdk/README.md) |
 | AI SDK (Rust) | [crates/fluxbee_ai_sdk/README.md](crates/fluxbee_ai_sdk/README.md) |
 | Go SDK | [go/fluxbee-go-sdk/README.md](go/fluxbee-go-sdk/README.md) |

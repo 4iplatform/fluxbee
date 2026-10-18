@@ -24,7 +24,7 @@ It freezes the action/message surface that is expected to remain stable for the 
 ## 2) `SY.config.routes`
 
 Current implementation reference:
-- [sy_config_routes.rs](/Users/cagostino/Documents/GitHub/fluxbee/src/bin/sy_config_routes.rs)
+- [sy_config_routes.rs](../../src/bin/sy_config_routes.rs)
 
 ### 2.1 Node role
 
@@ -176,8 +176,8 @@ Interpretation rule:
 ## 3) `SY.opa.rules`
 
 Current implementation reference:
-- [main.go](/Users/cagostino/Documents/GitHub/fluxbee/sy-opa-rules/main.go)
-- [fluxbee-go-sdk](/Users/cagostino/Documents/GitHub/fluxbee/fluxbee-go-sdk)
+- [main.go](../../go/sy-opa-rules/main.go)
+- [fluxbee-go-sdk](../../go/fluxbee-go-sdk)
 
 ### 3.1 Node role
 
@@ -289,8 +289,8 @@ Interpretation rule:
 ## 4) `SY.timer`
 
 Current implementation reference:
-- [main.go](/Users/cagostino/Documents/GitHub/fluxbee/sy-timer/main.go)
-- [sy-timer.md](/Users/cagostino/Documents/GitHub/fluxbee/docs/sy-timer.md)
+- [main.go](../../go/sy-timer/main.go)
+- [sy-timer.md](../sy-timer.md)
 
 ### 4.1 Node role
 

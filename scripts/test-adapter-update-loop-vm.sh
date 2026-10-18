@@ -9,7 +9,7 @@
 # VM, snapshots a pristine baseline, then runs each scenario from that baseline
 # and rolls back between runs so every scenario starts from an identical state.
 #
-# Prerequisites (see docs/onworking NOE/adapter_update_loop_validation_runbook.md):
+# Prerequisites (see docs/history/onworking-noe/adapter_update_loop_validation_runbook.md):
 #   - PVE_HOST + PVE_TOKEN exported (see the proxmox-test-env memory).
 #   - VMID is a clean Ubuntu 24.04 clone in the `dev` pool with the guest agent.
 #   - The VM has outbound internet (for rustup + crate deps).

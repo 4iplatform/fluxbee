@@ -1,29 +1,29 @@
 # SY.wf-rules — Quick Start Guide
 
-Guía práctica para definir, desplegar y operar workflows en Fluxbee.
+A practical guide to define, deploy and operate workflows in Fluxbee.
 
-**Prerequisito:** el runtime base `wf.engine` debe estar publicado en el hive.
+**Prerequisite:** the `wf.engine` base runtime must be published on the hive.
 
 ```bash
-# publicar wf.engine (una sola vez por instalación)
+# publish wf.engine (only once per install)
 bash scripts/publish-wf-runtime.sh --version 0.1.0 --set-current --sudo
 ```
 
 ---
 
-## Variables de entorno
+## Environment variables
 
 ```bash
 export BASE="http://127.0.0.1:8080"
 export HIVE="motherbee"
-export TENANT_ID="tnt:REEMPLAZAR"
+export TENANT_ID="tnt:REPLACE_ME"
 ```
 
-Todos los endpoints usan el prefijo `$BASE/hives/$HIVE/wf-rules`.
+All endpoints use the prefix `$BASE/hives/$HIVE/wf-rules`.
 
-`TENANT_ID` se usa en el **first deploy** cuando `auto_spawn: true` y el nodo `WF.<workflow_name>@<hive>` todavía no existe. No se propaga por variable de entorno del servicio `sy.wf-rules`; debe viajar en el request.
+`TENANT_ID` is used on the **first deploy** when `auto_spawn: true` and the node `WF.<workflow_name>@<hive>` does not exist yet. It is not propagated through an environment variable of the `sy.wf-rules` service; it must travel in the request.
 
-Si operás vía `SY.admin`/Archi, la superficie se descubre con:
+If you operate through `SY.admin`/Archi, the surface is discovered with:
 
 ```bash
 curl -sS "$BASE/admin/actions/wf_rules_compile_apply"
@@ -31,15 +31,15 @@ curl -sS "$BASE/admin/actions/wf_rules_get_status"
 curl -sS "$BASE/admin/actions/wf_rules_list_workflows"
 ```
 
-Eso expone el `request_contract`, el ejemplo canónico y el `example_scmd` que debería usar Archi.
+That exposes the `request_contract`, the canonical example and the `example_scmd` that Archi should use.
 
 ---
 
-## 1. Escribir la definición del workflow
+## 1. Write the workflow definition
 
-Un workflow es un JSON con estados, transiciones, guardas CEL y acciones. El sistema valida todo al recibirlo — no hace falta compilar localmente.
+A workflow is a JSON with states, transitions, CEL guards and actions. The system validates everything when it receives it — there is no need to compile locally.
 
-### Ejemplo completo: `WF.invoice`
+### Full example: `WF.invoice`
 
 ```json
 {
@@ -284,15 +284,15 @@ Un workflow es un JSON con estados, transiciones, guardas CEL y acciones. El sis
 }
 ```
 
-Guardar como `invoice-workflow.json` para los ejemplos de abajo.
+Save it as `invoice-workflow.json` for the examples below.
 
 ---
 
-## 2. Operaciones
+## 2. Operations
 
-### 2.1 Compile (validar sin desplegar)
+### 2.1 Compile (validate without deploying)
 
-Valida la definición, compila los guards CEL, guarda en staged. No despliega nada.
+Validates the definition, compiles the CEL guards, saves it to staged. It deploys nothing.
 
 ```bash
 curl -sS -X POST "$BASE/hives/$HIVE/wf-rules/compile" \
@@ -301,7 +301,7 @@ curl -sS -X POST "$BASE/hives/$HIVE/wf-rules/compile" \
     '{workflow_name: $wf, definition: $def[0]}')" | jq .
 ```
 
-Respuesta esperada:
+Expected response:
 ```json
 {
   "ok": true,
@@ -317,7 +317,7 @@ Respuesta esperada:
 }
 ```
 
-Si hay errores de validación (guard CEL inválido, estado referenciado que no existe, etc.), el sistema devuelve el error con la ubicación exacta:
+If there are validation errors (an invalid CEL guard, a referenced state that does not exist, etc.), the system returns the error with the exact location:
 
 ```json
 {
@@ -329,9 +329,9 @@ Si hay errores de validación (guard CEL inválido, estado referenciado que no e
 }
 ```
 
-### 2.2 Apply (promover staged y desplegar)
+### 2.2 Apply (promote staged and deploy)
 
-Promueve la definición validada de staged a current, genera el package, y spawna/reinicia el nodo WF.
+Promotes the validated definition from staged to current, generates the package, and spawns/restarts the WF node.
 
 ```bash
 curl -sS -X POST "$BASE/hives/$HIVE/wf-rules/apply" \
@@ -339,9 +339,9 @@ curl -sS -X POST "$BASE/hives/$HIVE/wf-rules/apply" \
   -d "{\"workflow_name\":\"invoice\",\"tenant_id\":\"$TENANT_ID\",\"auto_spawn\":true}" | jq .
 ```
 
-`auto_spawn: true` hace que el nodo `WF.invoice@motherbee` se cree automáticamente si no existe. Si ya existe, se reinicia con la nueva versión. En el primer caso, `tenant_id` es obligatorio.
+`auto_spawn: true` makes the node `WF.invoice@motherbee` be created automatically if it does not exist. If it already exists, it is restarted with the new version. In the first case, `tenant_id` is required.
 
-Respuesta esperada:
+Expected response:
 ```json
 {
   "ok": true,
@@ -359,9 +359,9 @@ Respuesta esperada:
 }
 ```
 
-### 2.3 Compile + Apply en un solo paso
+### 2.3 Compile + Apply in a single step
 
-Para iteración rápida: valida y despliega de una sola vez.
+For fast iteration: it validates and deploys in one go.
 
 ```bash
 curl -sS -X POST "$BASE/hives/$HIVE/wf-rules" \
@@ -371,23 +371,23 @@ curl -sS -X POST "$BASE/hives/$HIVE/wf-rules" \
     '{workflow_name: $wf, definition: $def[0], auto_spawn: true, tenant_id: $tenant_id}')" | jq .
 ```
 
-Este es el comando más usado durante desarrollo. Equivale a `compile` + `apply` en secuencia.
+This is the most used command during development. It is equivalent to `compile` + `apply` in sequence.
 
-### 2.4 Consultar estado
+### 2.4 Query the state
 
-**Ver la definición actual de un workflow:**
+**See the current definition of a workflow:**
 
 ```bash
 curl -sS "$BASE/hives/$HIVE/wf-rules?workflow_name=invoice" | jq .
 ```
 
-**Ver el estado del workflow y su nodo:**
+**See the state of the workflow and its node:**
 
 ```bash
 curl -sS "$BASE/hives/$HIVE/wf-rules/status?workflow_name=invoice" | jq .
 ```
 
-Respuesta:
+Response:
 ```json
 {
   "status": "ok",
@@ -402,7 +402,7 @@ Respuesta:
 }
 ```
 
-**Listar todos los workflows del hive:**
+**List all the workflows of the hive:**
 
 ```bash
 curl -sS "$BASE/hives/$HIVE/wf-rules" | jq .
@@ -410,7 +410,7 @@ curl -sS "$BASE/hives/$HIVE/wf-rules" | jq .
 
 ### 2.5 Rollback
 
-Restaura la versión anterior (backup → current) y reinicia el nodo.
+Restores the previous version (backup → current) and restarts the node.
 
 ```bash
 curl -sS -X POST "$BASE/hives/$HIVE/wf-rules/rollback" \
@@ -418,11 +418,11 @@ curl -sS -X POST "$BASE/hives/$HIVE/wf-rules/rollback" \
   -d '{"workflow_name": "invoice"}' | jq .
 ```
 
-El rollback solo tiene un nivel de profundidad (current ↔ backup). Si se necesita volver a una versión más vieja, hay que reenviar la definición con `compile_apply`.
+The rollback is only one level deep (current ↔ backup). If you need to go back to an older version, you have to resend the definition with `compile_apply`.
 
-### 2.6 Eliminar un workflow
+### 2.6 Delete a workflow
 
-**Eliminación segura (falla si hay instancias activas):**
+**Safe deletion (fails if there are active instances):**
 
 ```bash
 curl -sS -X POST "$BASE/hives/$HIVE/wf-rules/delete" \
@@ -430,7 +430,7 @@ curl -sS -X POST "$BASE/hives/$HIVE/wf-rules/delete" \
   -d '{"workflow_name": "invoice", "force": false}' | jq .
 ```
 
-**Eliminación forzada (mata el nodo y borra todo, incluyendo instancias en vuelo):**
+**Forced deletion (kills the node and deletes everything, including in-flight instances):**
 
 ```bash
 curl -sS -X POST "$BASE/hives/$HIVE/wf-rules/delete" \
@@ -440,62 +440,62 @@ curl -sS -X POST "$BASE/hives/$HIVE/wf-rules/delete" \
 
 ---
 
-## 3. Referencia rápida de CEL guards
+## 3. CEL guards quick reference
 
-Los guards son expresiones [CEL](https://github.com/google/cel-go) que deciden si una transición se toma. Se evalúan contra tres variables:
+Guards are [CEL](https://github.com/google/cel-go) expressions that decide whether a transition is taken. They are evaluated against three variables:
 
-| Variable | Contenido |
+| Variable | Content |
 |---|---|
-| `input` | El payload del evento que creó la instancia (inmutable) |
-| `state` | Variables del workflow, modificadas por `set_variable` |
-| `event` | El mensaje que llegó ahora y disparó la evaluación |
+| `input` | The payload of the event that created the instance (immutable) |
+| `state` | Workflow variables, modified by `set_variable` |
+| `event` | The message that just arrived and triggered the evaluation |
 
-Función built-in: `now()` retorna timestamp UTC en milisegundos (tiempo local del proceso).
+Built-in function: `now()` returns a UTC timestamp in milliseconds (the process's local time).
 
-### Patrones comunes
+### Common patterns
 
-**Chequear un campo booleano en la respuesta:**
+**Check a boolean field in the response:**
 ```
 event.payload.ok == true
 ```
 
-**Chequear que un campo existe:**
+**Check that a field exists:**
 ```
 has(event.payload.missing_data)
 ```
 
-**Matchear un timer específico:**
+**Match a specific timer:**
 ```
 event.user_payload.timer_key == 'validation_timeout'
 ```
 
-**Comparar strings:**
+**Compare strings:**
 ```
 event.payload.status == 'approved'
 ```
 
-**Chequear un valor numérico:**
+**Check a numeric value:**
 ```
 state.retry_count < 3
 ```
 
-**Combinar condiciones:**
+**Combine conditions:**
 ```
 event.payload.ok == true && state.retry_count < 5
 ```
 
-**Chequear pertenencia:**
+**Check membership:**
 ```
 event.payload.status in ['approved', 'auto_approved']
 ```
 
 ---
 
-## 4. Referencia rápida de acciones
+## 4. Actions quick reference
 
-Las acciones son los efectos que el workflow ejecuta. Vocabulario fijo en v1:
+Actions are the effects the workflow executes. Fixed vocabulary in v1:
 
-### `send_message` — enviar mensaje a otro nodo
+### `send_message` — send a message to another node
 
 ```json
 {
@@ -510,9 +510,9 @@ Las acciones son los efectos que el workflow ejecuta. Vocabulario fijo en v1:
 }
 ```
 
-Los valores `{"$ref": "..."}` se resuelven al momento de ejecución. Las tres raíces válidas son `input`, `state`, `event`. Todo lo demás es literal.
+The `{"$ref": "..."}` values are resolved at execution time. The three valid roots are `input`, `state`, `event`. Everything else is literal.
 
-### `schedule_timer` — programar un timer vía SY.timer
+### `schedule_timer` — schedule a timer through SY.timer
 
 ```json
 {
@@ -523,124 +523,124 @@ Los valores `{"$ref": "..."}` se resuelven al momento de ejecución. Las tres ra
 }
 ```
 
-Duración mínima: 60 segundos. Opciones de `missed_policy`: `fire` (dispara al recuperarse), `drop` (ignora), `fire_if_within` (dispara si el retraso está dentro de un margen).
+Minimum duration: 60 seconds. `missed_policy` options: `fire` (fires on recovery), `drop` (ignores it), `fire_if_within` (fires if the delay is within a margin).
 
-### `cancel_timer` — cancelar un timer pendiente
+### `cancel_timer` — cancel a pending timer
 
 ```json
 { "type": "cancel_timer", "timer_key": "customer_timeout" }
 ```
 
-### `reschedule_timer` — reprogramar un timer existente
+### `reschedule_timer` — reschedule an existing timer
 
 ```json
 { "type": "reschedule_timer", "timer_key": "sla_check", "fire_in": "30m" }
 ```
 
-### `set_variable` — guardar un valor en el estado de la instancia
+### `set_variable` — save a value in the instance state
 
 ```json
 { "type": "set_variable", "name": "invoice_id", "value": "event.payload.invoice_id" }
 ```
 
-El `value` es una expresión CEL. Ejemplos: `"now()"`, `"'pending'"`, `"state.retry_count + 1"`, `"event.payload.result"`.
+The `value` is a CEL expression. Examples: `"now()"`, `"'pending'"`, `"state.retry_count + 1"`, `"event.payload.result"`.
 
 ---
 
-## 5. Estructura de un workflow
+## 5. Structure of a workflow
 
 ```
 workflow
 ├── wf_schema_version    "1"
-├── workflow_type         nombre del workflow
-├── description           texto libre
-├── input_schema          JSON Schema del evento que crea instancias
-├── initial_state         nombre del estado donde empiezan las instancias
-├── terminal_states       lista de estados que terminan la instancia
+├── workflow_type         workflow name
+├── description           free text
+├── input_schema          JSON Schema of the event that creates instances
+├── initial_state         name of the state where instances start
+├── terminal_states       list of states that end the instance
 └── states[]
-    ├── name              nombre único del estado
-    ├── description       texto libre
-    ├── entry_actions[]   acciones al ENTRAR al estado
-    ├── exit_actions[]    acciones al SALIR del estado
-    └── transitions[]     reglas de transición
-        ├── event_match   { "msg": "NOMBRE_DEL_MENSAJE" }
-        ├── guard         expresión CEL → true/false
-        ├── target_state  nombre del estado destino
-        └── actions[]     acciones al tomar esta transición
+    ├── name              unique state name
+    ├── description       free text
+    ├── entry_actions[]   actions on ENTERING the state
+    ├── exit_actions[]    actions on LEAVING the state
+    └── transitions[]     transition rules
+        ├── event_match   { "msg": "MESSAGE_NAME" }
+        ├── guard         CEL expression → true/false
+        ├── target_state  name of the target state
+        └── actions[]     actions when taking this transition
 ```
 
-Orden de ejecución en una transición:
+Execution order in a transition:
 ```
-exit_actions del estado actual
-  → actions de la transición
-    → entry_actions del estado destino
+exit_actions of the current state
+  → actions of the transition
+    → entry_actions of the target state
 ```
 
-Las transiciones se evalúan en orden de declaración. La primera cuyo `event_match` coincida y cuyo `guard` devuelva `true` es la que se toma.
+Transitions are evaluated in declaration order. The first one whose `event_match` matches and whose `guard` returns `true` is the one taken.
 
 ---
 
-## 6. Ciclo de desarrollo típico
+## 6. Typical development cycle
 
 ```
-1. Escribir/editar el JSON del workflow
+1. Write/edit the workflow JSON
 
-2. Validar:
+2. Validate:
    curl -X POST .../wf-rules/compile -d '{workflow_name, definition}'
-   → corregir errores de CEL o de estructura
+   → fix CEL or structure errors
 
-3. Desplegar:
+3. Deploy:
    curl -X POST .../wf-rules/apply -d '{workflow_name, tenant_id, auto_spawn: true}'
-   → el nodo WF arranca
+   → the WF node starts
 
-4. Probar enviando mensajes al nodo WF
+4. Test by sending messages to the WF node
 
-5. Iterar: editar JSON → compile_apply (paso 2+3 juntos)
+5. Iterate: edit JSON → compile_apply (steps 2+3 together)
    curl -X POST .../wf-rules -d '{workflow_name, definition, tenant_id, auto_spawn: true}'
 
-6. Si algo sale mal: rollback
+6. If something goes wrong: rollback
    curl -X POST .../wf-rules/rollback -d '{workflow_name}'
 
-7. Cuando termines de testear: delete
+7. When you finish testing: delete
    curl -X POST .../wf-rules/delete -d '{workflow_name, force: true}'
 ```
 
 ---
 
-## 7. Endpoints (resumen)
+## 7. Endpoints (summary)
 
-| Método | Path | Acción |
+| Method | Path | Action |
 |---|---|---|
-| `POST` | `/hives/{hive}/wf-rules/compile` | Validar y stage |
-| `POST` | `/hives/{hive}/wf-rules/apply` | Promover staged → current, restart/spawn |
-| `POST` | `/hives/{hive}/wf-rules` | Compile + apply en un paso |
-| `POST` | `/hives/{hive}/wf-rules/rollback` | Restaurar versión anterior |
-| `POST` | `/hives/{hive}/wf-rules/delete` | Eliminar workflow |
-| `GET` | `/hives/{hive}/wf-rules?workflow_name=X` | Ver definición actual |
-| `GET` | `/hives/{hive}/wf-rules/status?workflow_name=X` | Ver estado + info del nodo |
-| `GET` | `/hives/{hive}/wf-rules` | Listar todos los workflows |
+| `POST` | `/hives/{hive}/wf-rules/compile` | Validate and stage |
+| `POST` | `/hives/{hive}/wf-rules/apply` | Promote staged → current, restart/spawn |
+| `POST` | `/hives/{hive}/wf-rules` | Compile + apply in one step |
+| `POST` | `/hives/{hive}/wf-rules/rollback` | Restore the previous version |
+| `POST` | `/hives/{hive}/wf-rules/delete` | Delete a workflow |
+| `GET` | `/hives/{hive}/wf-rules?workflow_name=X` | See the current definition |
+| `GET` | `/hives/{hive}/wf-rules/status?workflow_name=X` | See the state + node info |
+| `GET` | `/hives/{hive}/wf-rules` | List all workflows |
 
 ---
 
-## 8. Notas operativas
+## 8. Operational notes
 
-**Instancias en vuelo al actualizar:** cuando se aplica una nueva versión, las instancias que ya estaban corriendo siguen usando la definición con la que nacieron. Solo las instancias nuevas usan la definición actualizada. Esto es transparente — no hay que hacer nada especial.
+**In-flight instances on update:** when a new version is applied, the instances that were already running keep using the definition they were born with. Only new instances use the updated definition. This is transparent — nothing special needs to be done.
 
-**Timers:** todos los timers del workflow pasan por `SY.timer`. Duración mínima 60 segundos. Si el nodo WF reinicia, recupera sus timers pendientes automáticamente.
+**Timers:** all the workflow's timers go through `SY.timer`. Minimum duration 60 seconds. If the WF node restarts, it recovers its pending timers automatically.
 
-**Idempotencia downstream:** los nodos que reciben mensajes de un WF (AI, IO) deben ser idempotentes respecto a `meta.trace_id`. En caso de crash y recovery del WF, las acciones pueden re-ejecutarse.
+**Downstream idempotency:** the nodes that receive messages from a WF (AI, IO) must be idempotent with respect to `meta.trace_id`. In case of a WF crash and recovery, the actions can run again.
 
-**Correlación de respuestas:** cuando el WF envía un `send_message`, pone `meta.thread_id = instance_id`. Los nodos que responden deben copiar ese `thread_id` en su respuesta para que el WF la correlacione con la instancia correcta.
+**Response correlation:** when the WF sends a `send_message`, it sets `meta.thread_id = instance_id`. The nodes that answer must copy that `thread_id` into their response so the WF correlates it with the right instance.
 
-**Cancelar una instancia en vuelo:** se hace directamente al nodo WF, no a sy.wf-rules:
+**Cancel an in-flight instance:** it is done directly on the WF node, not on sy.wf-rules:
 ```bash
-# enviar WF_CANCEL_INSTANCE al nodo WF directamente vía admin
+# send WF_CANCEL_INSTANCE to the WF node directly via admin
 curl -sS -X POST "$BASE/hives/$HIVE/nodes/WF.invoice@$HIVE/command" \
   -H "Content-Type: application/json" \
   -d '{"action": "cancel_instance", "instance_id": "wfi:..."}'
 ```
 
-**Ver instancias activas:**
+**See active instances:**
 ```bash
 curl -sS "$BASE/hives/$HIVE/wf-rules/status?workflow_name=invoice" | jq .wf_node
 ```

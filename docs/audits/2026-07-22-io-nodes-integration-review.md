@@ -85,49 +85,49 @@ One candidate was refuted on verification (the code already handles it) — not 
 
 ---
 
-## Resolución — MEDIUMs (2026-07-22)
+## Resolution — MEDIUMs (2026-07-22)
 
-FIX-1 (HIGH) cerrado en commit 375cddc. Los 5 MEDIUM implementados + testeados (sy_admin 86 /
-sy_edge 16 / sy_orchestrator 133 verdes) + revisión adversarial:
+FIX-1 (HIGH) closed in commit 375cddc. The 5 MEDIUMs were implemented + tested (sy_admin 86 /
+sy_edge 16 / sy_orchestrator 133 green) + adversarial review:
 
-| Fix | Qué se hizo | Dónde |
+| Fix | What was done | Where |
 |-----|-------------|-------|
-| **FIX-2** | `enforce_cloud_relay_content` server-side tras `authorize_cloud_relay`: para el origen `IO.cloud@hive`, `run_node`→IO.* y `vault_put` sin `metadata.ilk/owner_ilk/owner_l2` + `owner_node` IO.* (translate es bypassable) | sy_admin.rs + test |
-| **FIX-4** | **DEFERIDO** (revisión adversarial: mi intento era un no-op). El edge YA tiene grace-window para la rotación viva (el caso común — verificado a pedido del user). El residual (restart + edge row-loss → re-mint) NO se puede cerrar del lado admin: `edge_channel_secret:{ich}` es dedicated owned-by-`SY.edge` y `authorize_read` tiene "No admin bypass" por diseño (sy_vault.rs:1391) → admin no puede leer ni reusar el token. Cerrarlo = **decisión de diseño** (token co-owned admin/edge, o read-back scoped) — no un downgrade silencioso. Documentado en el código | sy_admin.rs |
-| **FIX-3** | arm `MSG_VAULT_SECRET_CHANGED` en el loop del edge que re-corre `resolve_secrets` (antes se dropeaba) → boot con vault degradado ya no deja `/e/<ich>` en 401 permanente. Origin-check fail-closed contra `SY.vault@<config.vault_hive>` (**corregido en review**: era `<own_hive>` del edge → inerte en la topología DMZ multi-hive real, porque el vault vive en motherbee, no en el ingress) | sy_edge.rs |
-| **FIX-5** | (a) fallo de persist node→ilk escala a error + `identity_persist_failed` en la respuesta de run_node; (b) reconcile recupera identidad de SY.identity (`find_ilk_by_handler_node_from_hive_id`) + re-persiste cuando el mapa on-disk está vacío → io.api no arranca sin identidad tras reboot | sy_orchestrator.rs |
-| **FIX-6** | `load_public_registry` dropea filas con `expires_at <= now` (antes re-residentaba expirados en cada restart). **Follow-up (parte 2):** reaper activo que borre los bytes de `public/` + prune del ledger vía unpublish/MSG_BLOB_RELEASE | sy_edge.rs |
+| **FIX-2** | `enforce_cloud_relay_content` server-side after `authorize_cloud_relay`: for the `IO.cloud@hive` origin, `run_node`→IO.* and `vault_put` without `metadata.ilk/owner_ilk/owner_l2` + an IO.* `owner_node` (translate is bypassable) | sy_admin.rs + test |
+| **FIX-4** | **DEFERRED** (adversarial review: my attempt was a no-op). The edge ALREADY has a grace-window for live rotation (the common case — verified at the user's request). The residual (restart + edge row-loss → re-mint) can NOT be closed on the admin side: `edge_channel_secret:{ich}` is dedicated owned-by-`SY.edge` and `authorize_read` has "No admin bypass" by design (sy_vault.rs:1391) → admin can neither read nor reuse the token. Closing it = a **design decision** (token co-owned by admin/edge, or a scoped read-back) — not a silent downgrade. Documented in the code | sy_admin.rs |
+| **FIX-3** | `MSG_VAULT_SECRET_CHANGED` arm in the edge loop that re-runs `resolve_secrets` (before, it was dropped) → a boot with a degraded vault no longer leaves `/e/<ich>` on a permanent 401. Fail-closed origin check against `SY.vault@<config.vault_hive>` (**corrected in review**: it was the edge's `<own_hive>` → inert in the real multi-hive DMZ topology, because the vault lives on the motherbee, not on the ingress) | sy_edge.rs |
+| **FIX-5** | (a) a node→ilk persist failure escalates to an error + `identity_persist_failed` in the run_node response; (b) reconcile recovers the identity from SY.identity (`find_ilk_by_handler_node_from_hive_id`) + re-persists it when the on-disk map is empty → io.api does not start without an identity after a reboot | sy_orchestrator.rs |
+| **FIX-6** | `load_public_registry` drops rows with `expires_at <= now` (before, it made expired rows resident again on every restart). **Follow-up (part 2):** an active reaper that deletes the bytes from `public/` + prunes the ledger via unpublish/MSG_BLOB_RELEASE | sy_edge.rs |
 
-**Pendiente (consensuado):** FIX-7..16 (LOW + decisiones de diseño de io.blob) — se encaran después.
+**Pending (agreed):** FIX-7..16 (LOW + io.blob design decisions) — to be tackled later.
 
 ---
 
-## Resolución — LOW closeout (2026-07-23)
+## Resolution — LOW closeout (2026-07-23)
 
-Cerrados + commiteados (batch 1 `8715e7d`, reaper `a047b40`):
-- **FIX-4** — documentado como residual aceptado (vault no tiene no-clobber put; "No admin bypass"
-  es invariante deliberado → admin no puede reusar el token del edge; el grace-window cubre la
-  rotación viva). Cerrarlo = decisión de diseño (token co-owned admin/edge).
-- **FIX-6 parte 2** — reaper activo en el edge (sweep periódico + persist del ledger podado).
-- **FIX-7** — bearer constant-time compare en el frontier DMZ.
-- **FIX-14** — TimeoutStopSec=15 en los units io-cloud/io-blob de install.sh.
-- **FIX-15** — DX del envelope inbound de io.api (errores autodescriptivos + hoist attachments).
-- **FIX-16** — family-gate en el inbound de io.cloud.
+Closed + committed (batch 1 `8715e7d`, reaper `a047b40`):
+- **FIX-4** — documented as an accepted residual (the vault has no no-clobber put; "No admin bypass"
+  is a deliberate invariant → admin cannot reuse the edge's token; the grace-window covers live
+  rotation). Closing it = a design decision (token co-owned by admin/edge).
+- **FIX-6 part 2** — active reaper in the edge (periodic sweep + persist of the pruned ledger).
+- **FIX-7** — constant-time bearer compare at the DMZ frontier.
+- **FIX-14** — TimeoutStopSec=15 in install.sh's io-cloud/io-blob units.
+- **FIX-15** — DX of io.api's inbound envelope (self-describing errors + hoist attachments).
+- **FIX-16** — family-gate on io.cloud's inbound.
 
-**Diferidos con razón (todos LOW/hardening, NINGUNO es bug activo — apurarlos arriesga regresión en
-código compartido/load-bearing):**
-- **FIX-8/9/10 (io.blob)** — content-type desde bytes / binding tenant↔blob / GC refcount-aware.
-  Cambios de modelo de datos en el subsistema blob (parte en el crate compartido `fluxbee_sdk/blob`).
-  Exploit acotado (read-only + hash-addressed + nosniff + sandbox-on-html). Merecen un pase enfocado.
-- **FIX-11 (io.blob B1)** — B1 YA se sostiene (el add-only de `reconcile_syncthing_peer_xml` con
-  `public_only` nunca comparte `active/`/`dist` con el ingress; validado end-to-end). El self-enforce
-  (prune de defs sueltas) NO va en `reconcile_syncthing_peer_xml` (ahí prunear rompería a la motherbee,
-  que necesita su `fluxbee-blob`) — va en el build del config del lado ingress. DiD; requiere cuidado.
-- **FIX-12 (io.cloud)** — colapsar los 3 vocabularios a `io-common`. Refactor que toca el const de
-  seguridad `IO_CLOUD_EXPOSED_ACTIONS` (recién endurecido en FIX-1/2). Los 3 vocabularios HOY coinciden;
-  es prevención de drift, no bug. Mejor como refactor dedicado.
-- **FIX-13 (install.sh)** — que parsee base-nodes.json. install.sh es el path dev-checkout (el `.deb`
-  vía build-deb.sh YA lee el manifest); divergencia acotada. Refactor de shell, dev-only.
+**Deferred, with reasons (all LOW/hardening; NONE is an active bug — rushing them risks a regression
+in shared/load-bearing code):**
+- **FIX-8/9/10 (io.blob)** — content-type from the bytes / tenant↔blob binding / refcount-aware GC.
+  Data-model changes in the blob subsystem (partly in the shared crate `fluxbee_sdk/blob`).
+  Bounded exploit (read-only + hash-addressed + nosniff + sandbox-on-html). They deserve a focused pass.
+- **FIX-11 (io.blob B1)** — B1 ALREADY holds (the add-only logic of `reconcile_syncthing_peer_xml` with
+  `public_only` never shares `active/`/`dist` with the ingress; validated end-to-end). The self-enforcement
+  (pruning stray defs) does NOT go in `reconcile_syncthing_peer_xml` (pruning there would break the
+  motherbee, which needs its `fluxbee-blob`) — it goes in the config build on the ingress side. DiD; needs care.
+- **FIX-12 (io.cloud)** — collapse the 3 vocabularies into `io-common`. A refactor that touches the security
+  const `IO_CLOUD_EXPOSED_ACTIONS` (just hardened in FIX-1/2). TODAY the 3 vocabularies match; this is
+  drift prevention, not a bug. Better as a dedicated refactor.
+- **FIX-13 (install.sh)** — make it parse base-nodes.json. install.sh is the dev-checkout path (the `.deb`
+  via build-deb.sh ALREADY reads the manifest); the divergence is bounded. A shell refactor, dev-only.
 
-Recomendación: los diferidos son un pase enfocado y revisado, no un edit apurado al final de una
-sesión larga. Ninguno bloquea el uso de los 3 nodos.
+Recommendation: the deferred items are a focused, reviewed pass, not a rushed edit at the end of a
+long session. None of them blocks the use of the 3 nodes.

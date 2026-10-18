@@ -1,27 +1,27 @@
 ﻿# IO Slack Deploy Runbook (Fluxbee-compliant path)
 
-## 1) Objetivo
+## 1) Goal
 
-Este runbook describe cómo desplegar y operar `IO.slack` por el camino canónico de Fluxbee:
+This runbook describes how to deploy and operate `IO.slack` through the canonical Fluxbee path:
 
-1. publicar runtime en `dist/`
-2. ejecutar `SYSTEM_UPDATE` en el hive destino
-3. `SPAWN_NODE` (o restart controlado del nodo)
-4. configurar runtime del nodo por control-plane (`CONFIG_GET` / `CONFIG_SET`)
+1. publish the runtime in `dist/`
+2. run `SYSTEM_UPDATE` on the target hive
+3. `SPAWN_NODE` (or a controlled restart of the node)
+4. configure the node's runtime through the control-plane (`CONFIG_GET` / `CONFIG_SET`)
 
-No existe un camino local directo para `IO.slack`: el deploy soportado es runtime
-publicado + instancia gestionada por orchestrator.
+There is no direct local path for `IO.slack`: the supported deploy is a published
+runtime + an instance managed by the orchestrator.
 
 ---
 
-## 2) Prerrequisitos
+## 2) Prerequisites
 
-- `sy-orchestrator`, `sy-admin`, `rt-gateway` activos en el hive.
-- API admin disponible (`BASE`, por ejemplo `http://127.0.0.1:8080`).
-- Binario `io-slack` compilado o compilable.
-- `scripts/publish-io-runtime.sh` disponible.
+- `sy-orchestrator`, `sy-admin`, `rt-gateway` active on the hive.
+- Admin API available (`BASE`, for example `http://127.0.0.1:8080`).
+- `io-slack` binary built or buildable.
+- `scripts/publish-io-runtime.sh` available.
 
-Variables sugeridas:
+Suggested variables:
 
 ```bash
 BASE="http://127.0.0.1:8080"
@@ -31,28 +31,28 @@ VERSION="0.1.0"
 NODE_NAME="IO.slack.T123@$HIVE_ID"
 ```
 
-Contrato de spawn vigente en `io-slack`:
+Current spawn contract in `io-slack`:
 
-- requiere `FLUXBEE_NODE_NAME` provisto por la plataforma
-- usa ruta managed canónica para `config.json`
-- no usa fallback/env legacy de spawn
+- requires `FLUXBEE_NODE_NAME`, provided by the platform
+- uses the canonical managed path for `config.json`
+- does not use a legacy spawn fallback/env
 
 ---
 
-## 3) Deploy inicial (compliant)
+## 3) Initial deploy (compliant)
 
-### Paso 1: publish runtime
+### Step 1: publish runtime
 
 ```bash
 bash scripts/publish-io-runtime.sh --kind slack --version "$VERSION" --set-current --sudo
 ```
 
-Guardar salida:
+Save the output:
 
 - `manifest_version=<...>`
 - `manifest_hash=<...>`
 
-### Paso 2: (opcional recomendado) sync-hint dist
+### Step 2: (optional, recommended) sync-hint dist
 
 ```bash
 curl -sS -X POST "$BASE/hives/$HIVE_ID/sync-hint" \
@@ -60,7 +60,7 @@ curl -sS -X POST "$BASE/hives/$HIVE_ID/sync-hint" \
   -d '{"channel":"dist","wait_for_idle":true,"timeout_ms":30000}'
 ```
 
-### Paso 3: SYSTEM_UPDATE runtime
+### Step 3: SYSTEM_UPDATE runtime
 
 ```bash
 curl -sS -X POST "$BASE/hives/$HIVE_ID/update" \
@@ -72,11 +72,11 @@ curl -sS -X POST "$BASE/hives/$HIVE_ID/update" \
   }"
 ```
 
-Debe responder `status=ok` para continuar.
+It must respond `status=ok` to continue.
 
-### Paso 4: SPAWN_NODE de IO.slack
+### Step 4: SPAWN_NODE of IO.slack
 
-Ejemplo mínimo con bootstrap básico:
+Minimal example with a basic bootstrap:
 
 ```bash
 curl -sS -X POST "$BASE/hives/$HIVE_ID/nodes" \
@@ -92,32 +92,32 @@ curl -sS -X POST "$BASE/hives/$HIVE_ID/nodes" \
   }"
 ```
 
-Notas:
+Notes:
 
-- En hives con registro de identidad obligatorio en spawn, `tenant_id` es requerido.
-- El nodo puede arrancar sin tokens/prompt funcionales y quedar no operativo (`FAILED_CONFIG` o equivalente) hasta `CONFIG_SET` válido.
+- On hives with mandatory identity registration at spawn, `tenant_id` is required.
+- The node can start without working tokens/prompt and stay non-operational (`FAILED_CONFIG` or equivalent) until a valid `CONFIG_SET`.
 
 ---
 
-## 4) Actualizar código (nuevo build)
+## 4) Update code (new build)
 
-Para cambios de código, el flujo correcto no es pisar `/usr/bin` manualmente.
+For code changes, the right flow is not to overwrite `/usr/bin` by hand.
 
-### Secuencia recomendada
+### Recommended sequence
 
-1. Publicar nueva versión runtime:
+1. Publish a new runtime version:
 
 ```bash
 NEW_VERSION="0.1.1"
 bash scripts/publish-io-runtime.sh --kind slack --version "$NEW_VERSION" --set-current --sudo
 ```
 
-2. Ejecutar `SYSTEM_UPDATE` con el nuevo `manifest_version/hash`.
-3. Reiniciar proceso del nodo para que tome el runtime nuevo:
-   - opción A: `KILL_NODE` + `SPAWN_NODE` (recomendado, explícito)
-   - opción B: si tu capa admin expone restart directo, usar restart del nodo
+2. Run `SYSTEM_UPDATE` with the new `manifest_version/hash`.
+3. Restart the node's process so it picks up the new runtime:
+   - option A: `KILL_NODE` + `SPAWN_NODE` (recommended, explicit)
+   - option B: if your admin layer exposes a direct restart, use the node restart
 
-Atajo automatizado (recomendado):
+Automated shortcut (recommended):
 
 ```bash
 bash scripts/deploy-io-slack.sh \
@@ -130,24 +130,24 @@ bash scripts/deploy-io-slack.sh \
   --sudo
 ```
 
-`--update-existing` hace:
+`--update-existing` does:
 
-- publish runtime nuevo
-- update runtime con retries en `sync_pending`
-- GET config actual del nodo
-- kill-first + spawn reutilizando esa config
+- publish the new runtime
+- update the runtime, with retries on `sync_pending`
+- GET the node's current config
+- kill-first + spawn reusing that config
 
 ---
 
-## 5) Actualizar solo configuración (sin cambio de binario)
+## 5) Update only the configuration (no binary change)
 
-Para hot reload de configuración funcional de `IO.slack`, el camino canónico es control-plane del nodo:
+For a hot reload of the functional configuration of `IO.slack`, the canonical path is the node's control-plane:
 
-1. `CONFIG_GET` para ver estado/config efectiva redacted.
-2. `CONFIG_SET` con `config_version` monotónica y `apply_mode=replace`.
-3. verificar `CONFIG_RESPONSE` (`ok/error`) y campos `apply`.
+1. `CONFIG_GET` to see the state/effective config, redacted.
+2. `CONFIG_SET` with a monotonic `config_version` and `apply_mode=replace`.
+3. check `CONFIG_RESPONSE` (`ok/error`) and the `apply` fields.
 
-Ejemplo `CONFIG_GET`:
+`CONFIG_GET` example:
 
 ```bash
 curl -sS -X POST \
@@ -156,7 +156,7 @@ curl -sS -X POST \
   -d '{"requested_by":"archi"}'
 ```
 
-Ejemplo `CONFIG_SET`:
+`CONFIG_SET` example:
 
 ```bash
 curl -sS -X POST \
@@ -181,73 +181,73 @@ curl -sS -X POST \
   }'
 ```
 
-Interpretación de `apply` en `CONFIG_RESPONSE`:
+How to read `apply` in `CONFIG_RESPONSE`:
 
-- `hot_applied`: cambios aplicados en caliente (sin reinicio de proceso)
-- `reinit_performed`: reinicialización interna del adapter realizada
-- `restart_required`: cambios que requieren restart de proceso para efecto completo
+- `hot_applied`: changes applied hot (no process restart)
+- `reinit_performed`: internal reinitialization of the adapter performed
+- `restart_required`: changes that need a process restart to take full effect
 
-Importante:
+Important:
 
-- `PUT /hives/{hive}/nodes/{node}/config` (core) persiste `config.json` administrada, pero no reemplaza `CONFIG_SET` como contrato de hot reload runtime en IO.
-- `CONFIG_CHANGED` se trata como señal informativa en IO v1.
-
----
-
-## 6) Recuperación desde `FAILED_CONFIG`
-
-Caso típico: nodo arrancó con bootstrap mínimo o config inválida y quedó en estado no operativo.
-
-Secuencia de recuperación:
-
-1. enviar `CONFIG_GET` y confirmar estado + último error.
-2. corregir payload y enviar `CONFIG_SET` con versión mayor.
-3. validar `CONFIG_RESPONSE status=ok` y transición de estado.
-4. ejecutar prueba funcional real (inbound/outbound).
-
-Si `CONFIG_SET` responde error:
-
-- `invalid_config`: revisar shape y campos obligatorios del adapter Slack.
-- `stale_config_version`: reenviar con `config_version` mayor a la última aplicada.
-- `config_persist_error`: revisar permisos/path de persistencia del state dinámico.
+- `PUT /hives/{hive}/nodes/{node}/config` (core) persists the managed `config.json`, but it does not replace `CONFIG_SET` as the runtime hot-reload contract in IO.
+- `CONFIG_CHANGED` is treated as an informational signal in IO v1.
 
 ---
 
-## 7) Validación post-deploy
+## 6) Recovery from `FAILED_CONFIG`
 
-Mínimo:
+Typical case: the node started with a minimal bootstrap or an invalid config and was left in a non-operational state.
 
-- `status` del nodo en API admin
-- logs del runtime en el hive
-- prueba real de inbound `app_mention` y outbound `chat.postMessage`
+Recovery sequence:
 
-Opcional:
+1. send `CONFIG_GET` and confirm the state + last error.
+2. fix the payload and send `CONFIG_SET` with a higher version.
+3. validate `CONFIG_RESPONSE status=ok` and the state transition.
+4. run a real functional test (inbound/outbound).
 
-- `CONFIG_GET` y revisar `metrics.control_plane`
-- `GET /hives/{id}/versions` y revisar readiness de `IO.slack` en versión actual
+If `CONFIG_SET` responds with an error:
 
-### Logs del relay
+- `invalid_config`: check the shape and the mandatory fields of the Slack adapter.
+- `stale_config_version`: resend with a `config_version` higher than the last one applied.
+- `config_persist_error`: check the permissions/path for persisting the dynamic state.
 
-El relay inbound de `IO.slack` vive en `io-common` y su logging actual es event-driven.
+---
 
-Qué esperar:
+## 7) Post-deploy validation
+
+Minimum:
+
+- the node's `status` in the admin API
+- the runtime logs on the hive
+- a real test of inbound `app_mention` and outbound `chat.postMessage`
+
+Optional:
+
+- `CONFIG_GET` and check `metrics.control_plane`
+- `GET /hives/{id}/versions` and check the readiness of `IO.slack` at the current version
+
+### Relay logs
+
+The inbound relay of `IO.slack` lives in `io-common`, and its current logging is event-driven.
+
+What to expect:
 
 - `info`: `io-slack relay policy initialized`
 - `debug`: `relay session opened`, `relay fragment buffered`, `relay session flushed`, `relay duplicate fragment dropped`, `relay passthrough immediate`
-- `warn`: `relay capacity rejected`, drops por expiración/límites y fallback fail-open
+- `warn`: `relay capacity rejected`, drops because of expiry/limits, and fail-open fallback
 
-Cómo verlo en runtime canónico:
+How to see it in the canonical runtime:
 
-- el runtime publicado por `scripts/publish-io-runtime.sh` ya incluye `RUST_LOG` default con `io_common=debug`
-- por eso, en deploy canónico, esos eventos deberían aparecer en `journalctl`
+- the runtime published by `scripts/publish-io-runtime.sh` already includes a default `RUST_LOG` with `io_common=debug`
+- so, in a canonical deploy, those events should show up in `journalctl`
 
-## 8) Script automatizado (publish + update + spawn opcional)
+## 8) Automated script (publish + update + optional spawn)
 
-Se agregó:
+Added:
 
 - `scripts/deploy-io-slack.sh`
 
-Ejemplo (deploy + spawn):
+Example (deploy + spawn):
 
 ```bash
 bash scripts/deploy-io-slack.sh \
@@ -265,62 +265,62 @@ bash scripts/deploy-io-slack.sh \
   --sudo
 ```
 
-El script:
+The script:
 
-- parsea `manifest_version`/`manifest_hash` desde publish,
-- reintenta `update` si recibe `sync_pending`,
-- loguea cada paso en archivo (`/tmp/deploy-io-slack-<ts>.log` por defecto),
-- soporta `--update-existing` para actualizar código de nodo existente reutilizando su config.
-- opcionalmente permite continuar aun con `sync_pending` vía `--allow-sync-pending` (solo para entornos de prueba con manifest global inconsistente).
+- parses `manifest_version`/`manifest_hash` from publish,
+- retries `update` if it receives `sync_pending`,
+- logs each step to a file (`/tmp/deploy-io-slack-<ts>.log` by default),
+- supports `--update-existing` to update the code of an existing node, reusing its config.
+- optionally allows continuing even with `sync_pending` through `--allow-sync-pending` (only for test environments with an inconsistent global manifest).
 
-### Nota sobre `sync_pending` permanente
+### Note on a permanent `sync_pending`
 
-Si `update` queda en `sync_pending` por faltantes de otros runtimes del manifest (por ejemplo `wf.node.status.*.diag`), el deploy de `IO.slack` puede bloquearse aunque `IO.slack` se haya publicado correctamente.
+If `update` stays in `sync_pending` because other runtimes of the manifest are missing (for example `wf.node.status.*.diag`), the `IO.slack` deploy can get blocked even though `IO.slack` was published correctly.
 
-En entornos de prueba podés usar:
+In test environments you can use:
 
 ```bash
 bash scripts/deploy-io-slack.sh ... --allow-sync-pending
 ```
 
-Esto permite continuar a `spawn`, pero no corrige el problema de fondo del manifest global.
+This lets you continue to `spawn`, but it does not fix the underlying problem of the global manifest.
 
 ---
 
-## 10) Nota de contrato `text/v1` (offload > limite)
+## 10) `text/v1` contract note (offload > limit)
 
-En estado actual, la regla de offload por tamano para `text/v1` esta centralizada en `fluxbee_sdk::NodeSender::send`:
+In the current state, the size-based offload rule for `text/v1` is centralized in `fluxbee_sdk::NodeSender::send`:
 
-- `io-slack` arma payload base (`content` + `attachments`).
-- `NodeSender::send` decide inline vs `content_ref` usando defaults internos del SDK (`max_message_bytes=64KB`, `message_overhead_bytes=2048`).
+- `io-slack` builds the base payload (`content` + `attachments`).
+- `NodeSender::send` decides inline vs `content_ref` using the SDK's internal defaults (`max_message_bytes=64KB`, `message_overhead_bytes=2048`).
 
-Logs esperados:
+Expected logs:
 
 - `sdk send text/v1 normalized` (debug)
-- `sdk send text/v1 processed as blob` (info, solo cuando hubo offload)
+- `sdk send text/v1 processed as blob` (info, only when there was an offload)
 
-Esto evita divergencias entre adapters IO y mantiene comportamiento uniforme de `text/v1`.
+This avoids divergence between IO adapters and keeps `text/v1` behavior uniform.
 
-Importante:
-- `io.blob.*` configurado por control-plane del nodo no aplica automaticamente al enforcement de `NodeSender::send` en esta etapa.
+Important:
+- `io.blob.*` configured through the node's control-plane does not apply automatically to the `NodeSender::send` enforcement at this stage.
 
-Nota de alcance de pruebas:
+Note on test scope:
 
-- Para validar de forma determinística payloads de texto muy grandes (ejemplo `>64KB`), usar `io-sim`.
-- En Slack real, `chat.postMessage` tiene límites propios del canal y trunca texto por encima de 40.000 caracteres, por lo que no es un canal confiable para probar umbrales internos extremos.
-  - Fuente: https://docs.slack.dev/reference/methods/chat.postMessage/ ("Truncating content").
+- To validate very large text payloads deterministically (for example `>64KB`), use `io-sim`.
+- In real Slack, `chat.postMessage` has the channel's own limits and truncates text above 40,000 characters, so it is not a reliable channel to test extreme internal thresholds.
+  - Source: https://docs.slack.dev/reference/methods/chat.postMessage/ ("Truncating content").
 
-Estado actual outbound a considerar en pruebas:
+Current outbound state to keep in mind in tests:
 
-- Si `io-slack` recibe texto largo via `content_ref`, hoy lo resuelve y lo publica como texto por `chat.postMessage`.
-- Por lo tanto, textos muy largos pueden quedar truncados por el límite de Slack.
-- Validación de fallback canónico (archivo/snippet/chunking) queda pendiente de norma específica del canal.
+- If `io-slack` receives long text through `content_ref`, today it resolves it and posts it as text through `chat.postMessage`.
+- So very long texts can end up truncated by Slack's limit.
+- Validation of the canonical fallback (file/snippet/chunking) is pending a channel-specific rule.
 
-## 11) Nota operativa sobre attachments inbound
+## 11) Operational note on inbound attachments
 
-En estado actual, `IO.slack` no acepta cualquier archivo que Slack entregue.
+In the current state, `IO.slack` does not accept just any file Slack delivers.
 
-La normalizacion inbound a `text/v1.attachments[]` pasa por la validacion comun de `io-common`, pero la allowlist efectiva la define `IO.slack`. En estado actual, `IO.slack` acepta:
+The inbound normalization to `text/v1.attachments[]` goes through the common `io-common` validation, but the effective allowlist is defined by `IO.slack`. In the current state, `IO.slack` accepts:
 
 - `image/jpeg`
 - `image/png`
@@ -338,19 +338,19 @@ La normalizacion inbound a `text/v1.attachments[]` pasa por la validacion comun 
 - `application/vnd.openxmlformats-officedocument.spreadsheetml.sheet`
 - `application/vnd.openxmlformats-officedocument.presentationml.presentation`
 
-Consecuencia:
+Consequence:
 
-- `xlsx`, `docx`, `csv` y office comunes equivalentes deberían llegar al router y a nodos `AI.*` si Slack los entrega con esos MIME esperados
-- si un archivo queda afuera de la allowlist efectiva, se descarta inbound con `unsupported_attachment_mime`
-- por lo tanto, el limite E2E real queda en la policy efectiva de `IO.slack`, no en `AI`, para cualquier tipo que todavia no este admitido por el adapter
+- `xlsx`, `docx`, `csv` and equivalent common office files should reach the router and `AI.*` nodes if Slack delivers them with those expected MIME types
+- if a file is outside the effective allowlist, it is dropped inbound with `unsupported_attachment_mime`
+- so the real E2E limit is the effective policy of `IO.slack`, not `AI`, for any type the adapter does not accept yet
 
-Alcance de esta nota:
+Scope of this note:
 
-- esto no significa que `IO.slack` acepte todos los formatos que Slack pueda transportar
-- solo deja asentado el set explicitamente admitido hoy por el adapter en este repo
-- cualquier nuevo tipo requiere incorporacion explicita en la policy efectiva y validacion E2E
+- this does not mean that `IO.slack` accepts every format Slack can carry
+- it only records the set the adapter explicitly accepts today in this repo
+- any new type needs to be added explicitly to the effective policy and validated E2E
 
-Si se quiere ajustar el set admitido en deploy, `IO.slack` soporta override por:
+To adjust the accepted set at deploy time, `IO.slack` supports an override through:
 
 - `IO_SLACK_ALLOWED_MIMES`
 - `io.blob.allowed_mimes_csv`

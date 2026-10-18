@@ -315,7 +315,7 @@ const HANDBOOK_CANDIDATE_PATHS: &[&str] = &[
     // Production path — installed by install.sh to /etc/fluxbee/
     "/etc/fluxbee/handbook_fluxbee.md",
     // Dev paths — relative to repo root (used when CWD = repo)
-    "docs/onworking COA/archi/handbook_fluxbee.md",
+    "docs/archi/handbook_fluxbee.md",
 ];
 
 struct ArchitectState {
@@ -2815,7 +2815,7 @@ enum DesignerRunOutcome {
 /// The order is the canonical dependency order: lower layers (smaller index)
 /// must be satisfied before higher layers reference them. The designer MUST
 /// call `assess_layer` exactly once per layer, in this order, before
-/// `submit_solution_manifest`. See `docs/onworking COA/archi/layered_designer_design.md`.
+/// `submit_solution_manifest`. See `docs/history/onworking-coa/archi/layered_designer_design.md`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 enum DesignerLayer {
@@ -4032,7 +4032,7 @@ fn design_feedback_from_blocked_layers(blocked: &[&LayerAssessmentRecord]) -> St
 /// last iteration. The pipeline emits the manifest (so the operator sees the
 /// shape), but downstream plan compile refuses to advance while any layer is
 /// flagged blocked — matching the B+C decision recorded in
-/// `docs/onworking COA/archi/layered_designer_design.md`.
+/// `docs/history/onworking-coa/archi/layered_designer_design.md`.
 fn inject_blocked_layer_findings_into_verdict(
     verdict: &mut DesignAuditVerdict,
     blocked: &[&LayerAssessmentRecord],

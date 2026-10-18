@@ -3,14 +3,14 @@
 **Status:** planning / pre-implementation  
 **Date:** 2026-04-05  
 **Source docs reviewed:**
-- [`fluxbee_identity_claims_normative_model.md`](/Users/cagostino/Documents/GitHub/fluxbee/docs/TODO/fluxbee_identity_claims_normative_model.md)
-- [`sy-policy-beta.md`](/Users/cagostino/Documents/GitHub/fluxbee/docs/TODO/sy-policy-beta.md)
-- [`solution-manifest-spec_1.md`](/Users/cagostino/Documents/GitHub/fluxbee/docs/TODO/solution-manifest-spec_1.md)
+- [`fluxbee_identity_claims_normative_model.md`](fluxbee_identity_claims_normative_model.md)
+- [`sy-policy-beta.md`](../history/sy-policy-beta.md)
+- [`solution-manifest-spec_1.md`](../solution-manifest-spec_1.md)
 
 **Canonical direction confirmed (2026-04-05):**
 - `SY.policy` replaces `SY.claims` completely.
-- The manifest spec to use for this initiative is [`solution-manifest-spec_1.md`](/Users/cagostino/Documents/GitHub/fluxbee/docs/TODO/solution-manifest-spec_1.md).
-- [`docs/legacy/solution-manifest-spec.md`](/Users/cagostino/Documents/GitHub/fluxbee/docs/legacy/solution-manifest-spec.md) must be treated as historical only.
+- The manifest spec to use for this initiative is [`solution-manifest-spec_1.md`](../solution-manifest-spec_1.md).
+- [`docs/history/legacy/solution-manifest-spec.md`](../history/legacy/solution-manifest-spec.md) must be treated as historical only.
 
 **Important scope decision:**
 - Do **not** do the large Identity v3 migration now.
@@ -47,8 +47,8 @@
 
 ### 1.3 Spec friction that must be fixed first
 
-- [`docs/legacy/solution-manifest-spec.md`](/Users/cagostino/Documents/GitHub/fluxbee/docs/legacy/solution-manifest-spec.md) still speaks in old `SY.claims` language.
-- [`solution-manifest-spec_1.md`](/Users/cagostino/Documents/GitHub/fluxbee/docs/TODO/solution-manifest-spec_1.md) already moved to `SY.policy` + `policy_matrix`.
+- [`docs/history/legacy/solution-manifest-spec.md`](../history/legacy/solution-manifest-spec.md) still speaks in old `SY.claims` language.
+- [`solution-manifest-spec_1.md`](../solution-manifest-spec_1.md) already moved to `SY.policy` + `policy_matrix`.
 - For this initiative, the canonical manifest direction is already chosen: use `solution-manifest-spec_1.md` and treat the legacy file as historical.
 
 ### 1.4 Biggest implementation gap
@@ -87,8 +87,8 @@ Evolve identity toward the richer claims model:
   - `SY.policy` replaces `SY.claims`
   - `policy_matrix` replaces old claims-rule wording
 - [x] POL-S0-T2. Canonicalize manifest direction:
-  - [`solution-manifest-spec_1.md`](/Users/cagostino/Documents/GitHub/fluxbee/docs/TODO/solution-manifest-spec_1.md) is the manifest spec to use for this initiative
-  - [`docs/legacy/solution-manifest-spec.md`](/Users/cagostino/Documents/GitHub/fluxbee/docs/legacy/solution-manifest-spec.md) remains historical and must not drive new implementation
+  - [`solution-manifest-spec_1.md`](../solution-manifest-spec_1.md) is the manifest spec to use for this initiative
+  - [`docs/history/legacy/solution-manifest-spec.md`](../history/legacy/solution-manifest-spec.md) remains historical and must not drive new implementation
 - [x] POL-S0-T3. Add explicit compatibility note:
   - `SY.policy` v1 runs on Identity v2 flat metadata
   - Identity v3 claims are deferred

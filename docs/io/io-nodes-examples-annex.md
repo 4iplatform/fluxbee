@@ -1,32 +1,32 @@
-# IO Nodes — Anexo de Ejemplos (v1)
+# IO Nodes — Examples Annex (v1)
 
-> ✅ **Objetivo**: ejemplos claros y completos para implementación/QA del ciclo de vida y configuración de **IO Nodes** (común + Slack).  
-> Este anexo asume el patrón unificado con AI Nodes:
-> - spawn por orchestrator,
-> - estados `UNCONFIGURED/CONFIGURED/FAILED_CONFIG`,
+> ✅ **Goal**: clear, complete examples for implementation/QA of the lifecycle and configuration of **IO Nodes** (common + Slack).  
+> This annex assumes the pattern unified with AI Nodes:
+> - spawn by the orchestrator,
+> - states `UNCONFIGURED/CONFIGURED/FAILED_CONFIG`,
 > - Control Plane `CONFIG_SET/GET`, `CONFIG_RESPONSE`, `STATUS/PING`.
 
 ---
 
-## 0) Convenciones rápidas
+## 0) Quick conventions
 
-- **Replace**: `apply_mode="replace"` y `payload.config` contiene una config completa.
-- **Secrets**: HOY pueden viajar inline (MVP). **No** se persisten en claro en `${STATE_DIR}`.
-- **Precedencia de credenciales** (Slack):
-  1) override en memoria por `CONFIG_SET` (si existe),
-  2) config local (YAML/env).
-  Tras restart, el override en memoria se pierde.
+- **Replace**: `apply_mode="replace"` and `payload.config` contains a full config.
+- **Secrets**: TODAY they may travel inline (MVP). They are **not** persisted in clear text in `${STATE_DIR}`.
+- **Credential precedence** (Slack):
+  1) in-memory override from `CONFIG_SET` (if any),
+  2) local config (YAML/env).
+  After a restart, the in-memory override is lost.
 
 ---
 
-## 1) Ejemplo YAML por nodo (Slack IO)
+## 1) YAML example per node (Slack IO)
 
-> 1 instancia runtime-managed ↔ 1 config de nodo.
-> Ejemplo: `IO.slack.support@motherbee` corre como `fluxbee-node-IO.slack.support-motherbee.service`.
+> 1 runtime-managed instance ↔ 1 node config.
+> Example: `IO.slack.support@motherbee` runs as `fluxbee-node-IO.slack.support-motherbee.service`.
 
 ```yaml
 # /etc/fluxbee/io-nodes/IO.slack.support.yaml
-# schema_version es opcional en YAML (si falta, se asume 1)
+# schema_version is optional in YAML (if missing, 1 is assumed)
 
 schema_version: 1
 
@@ -35,7 +35,7 @@ node:
   router_socket: "/var/run/fluxbee/routers"
   config_dir: "/etc/fluxbee"
 
-# runtime es OPCIONAL: si se omite, el runner aplica defaults comunes.
+# runtime is OPTIONAL: if omitted, the runner applies common defaults.
 # runtime:
 #   handler_timeout_ms: 60000
 #   worker_pool_size: 4
@@ -44,51 +44,51 @@ node:
 adapter:
   kind: "slack_socket_mode"
 
-  # Config funcional (no secreta)
+  # Functional config (not secret)
   params:
-    # Opcional: restringir a workspace/teams si aplica
+    # Optional: restrict to workspace/teams if applicable
     # allowed_team_ids: ["T01234567"]
-    # Opcional: canal de soporte default
+    # Optional: default support channel
     # default_channel_id: "C01234567"
 
-    # Qué eventos procesa este nodo
+    # Which events this node processes
     event_filter:
-      # Socket mode: normalmente nos interesa app_mention
+      # Socket mode: normally we care about app_mention
       allowed_event_types: ["app_mention"]
 
-# --- Secrets (HOY vs FUTURO) ---
+# --- Secrets (TODAY vs FUTURE) ---
 #
-# HOY (camino real sin depender de un secret manager):
-# - se permite guardar tokens inline en YAML (quedan en disco).
+# TODAY (real path without depending on a secret manager):
+# - storing tokens inline in YAML is allowed (they stay on disk).
 #
-# FUTURO (recomendado):
-# - usar refs (env/file/vault/kms) y un gestor de secretos.
+# FUTURE (recommended):
+# - use refs (env/file/vault/kms) and a secret manager.
 #
-# IMPORTANTE: no usar ambas variantes al mismo tiempo.
+# IMPORTANT: do not use both variants at the same time.
 #
-# (A) HOY: secreto inline en YAML (MVP)
+# (A) TODAY: inline secret in YAML (MVP)
 secrets:
   slack:
     app_token: "xapp-REDACTED-IN-YAML"
     bot_token: "xoxb-REDACTED-IN-YAML"
 
-# (B) FUTURO: referencias a secretos (NO usar junto con (A))
+# (B) FUTURE: references to secrets (do NOT use together with (A))
 # secrets:
 #   slack:
 #     app_token_ref: "env:SLACK_APP_TOKEN"
 #     bot_token_ref: "env:SLACK_BOT_TOKEN"
 ```
 
-### Comentarios
-- En Socket Mode **no aplica** `url_verification/challenge` (eso es Events API por HTTP).
-- Si omitís `secrets.slack.*` en YAML, el nodo puede arrancar igual pero quedará `FAILED_CONFIG (missing_secret)` hasta recibir un `CONFIG_SET` con credenciales inline.
+### Comments
+- In Socket Mode, `url_verification/challenge` does **not apply** (that is the Events API over HTTP).
+- If you omit `secrets.slack.*` in YAML, the node can still start, but it will stay `FAILED_CONFIG (missing_secret)` until it receives a `CONFIG_SET` with inline credentials.
 
 ---
 
-## 2) Ejemplo: CONFIG_SET (replace) completo para Slack (rotación de credenciales)
+## 2) Example: full CONFIG_SET (replace) for Slack (credential rotation)
 
-> ✅ Este ejemplo muestra un **replace completo** (no merge).  
-> Caso típico: se rotó el `bot_token` y queremos actualizarlo sin reiniciar.
+> ✅ This example shows a **full replace** (not a merge).  
+> Typical case: the `bot_token` was rotated and we want to update it without restarting.
 
 ```json
 {
@@ -137,15 +137,15 @@ secrets:
 }
 ```
 
-### Comentarios del ejemplo
-- `apply_mode="replace"` implica que `payload.config` trae una config completa para el nodo.
-- `config_version` debe ser monotónico. Orchestrator, si no la conoce, consulta primero con `CONFIG_GET`.
-- Los secretos inline **no se persisten en claro** en `${STATE_DIR}`. Se retienen en memoria para operar.
-- Si el nodo ya tenía tokens en YAML, este `CONFIG_SET` puede actuar como override en memoria (mientras el proceso esté vivo).
+### Comments on the example
+- `apply_mode="replace"` means that `payload.config` carries a full config for the node.
+- `config_version` must be monotonic. If the orchestrator does not know it, it asks first with `CONFIG_GET`.
+- Inline secrets are **not persisted in clear text** in `${STATE_DIR}`. They are kept in memory to operate.
+- If the node already had tokens in YAML, this `CONFIG_SET` can act as an in-memory override (while the process is alive).
 
 ---
 
-## 3) Ejemplo: CONFIG_RESPONSE (ok) para Slack
+## 3) Example: CONFIG_RESPONSE (ok) for Slack
 
 ```json
 {
@@ -192,9 +192,9 @@ secrets:
 
 ---
 
-## 4) Ejemplo: CONFIG_RESPONSE (error) — config inválida
+## 4) Example: CONFIG_RESPONSE (error) — invalid config
 
-Caso típico: falta `secrets.slack.app_token` (required para socket mode).
+Typical case: `secrets.slack.app_token` is missing (required for socket mode).
 
 ```json
 {
@@ -226,26 +226,26 @@ Caso típico: falta `secrets.slack.app_token` (required para socket mode).
 }
 ```
 
-### Nota
-- Si el nodo estaba `CONFIGURED`, debe **mantener** la config anterior y no degradarse por un CONFIG_SET inválido.
-- Si estaba `UNCONFIGURED` o `FAILED_CONFIG`, permanece en ese estado hasta recibir config válida.
+### Note
+- If the node was `CONFIGURED`, it must **keep** the previous config and not degrade because of an invalid CONFIG_SET.
+- If it was `UNCONFIGURED` or `FAILED_CONFIG`, it stays in that state until it receives a valid config.
 
 ---
 
-## 5) Ejemplo: recibir CONFIG_SET cuando el nodo está UNCONFIGURED o FAILED_CONFIG
+## 5) Example: receiving CONFIG_SET when the node is UNCONFIGURED or FAILED_CONFIG
 
 ### 5.1 UNCONFIGURED → CONFIGURED
-- El nodo arranca sin tokens (YAML sin secrets).
-- Orchestrator manda `CONFIG_SET` replace con tokens inline.
-- Responde `CONFIG_RESPONSE status=ok` y pasa a `CONFIGURED`.
+- The node starts without tokens (YAML without secrets).
+- The orchestrator sends a `CONFIG_SET` replace with inline tokens.
+- It responds `CONFIG_RESPONSE status=ok` and moves to `CONFIGURED`.
 
 ### 5.2 FAILED_CONFIG (missing_secret) → CONFIGURED
-- El nodo reinicia y pierde override en memoria.
-- Si no hay tokens en YAML/env, queda `FAILED_CONFIG (missing_secret)`.
-- Orchestrator reenvía `CONFIG_SET` con **la misma** `config_version` (idempotente) incluyendo tokens.
-- El nodo vuelve a `CONFIGURED` sin incrementar versión.
+- The node restarts and loses the in-memory override.
+- If there are no tokens in YAML/env, it stays `FAILED_CONFIG (missing_secret)`.
+- The orchestrator resends `CONFIG_SET` with **the same** `config_version` (idempotent), including tokens.
+- The node goes back to `CONFIGURED` without incrementing the version.
 
-Ejemplo mínimo de respuesta esperada:
+Minimal example of the expected response:
 
 ```json
 {

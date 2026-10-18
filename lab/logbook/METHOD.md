@@ -1,200 +1,200 @@
-# METHOD — cómo se trabaja la infraestructura Fluxbee
+# METHOD — how the Fluxbee infrastructure is worked on
 
-> Documento de método. Define **cómo** se opera la infra (lab y prod), **qué puede hacer el agente**,
-> y **cómo se registra cada cambio**.
+> Method document. It defines **how** the infra is operated (lab and prod), **what the agent can do**,
+> and **how each change is recorded**.
 >
-> Documentos hermanos en este directorio:
-> - `YYYY-MM-DD.md` — **la bitácora**: el viaje, cambio por cambio, con fecha/hora/evidencia.
-> - `FINDINGS.md` — **los hallazgos acumulados** del despliegue integrado; de ahí sale el
->   **plan de cambios de código** al terminar. Durante el despliegue se **agregan**, no se arreglan.
-> - `HANDBOOK.md` — **las recetas validadas** (portables, listas para el próximo prod). Una receta
->   se escribe **recién después** de haberla ejecutado con éxito acá.
-> - [`../DEPLOYMENTS.md`](../DEPLOYMENTS.md) — **el ledger de auditoría** de versiones en PROD: qué
->   versión quedó instalada, cuándo, qué commit, qué cambió y cómo se verificó. Se escribe en CADA
->   deploy a prod (regla en HANDBOOK §12) — sin entrada, el deploy no está hecho.
+> Sibling documents in this directory:
+> - `YYYY-MM-DD.md` — **the logbook**: the journey, change by change, with date/time/evidence.
+> - `FINDINGS.md` — **the accumulated findings** of the integrated deployment; the
+>   **code change plan** comes out of it at the end. During the deployment they are **added**, not fixed.
+> - `HANDBOOK.md` — **the validated recipes** (portable, ready for the next prod). A recipe
+>   is written **only after** it has been run successfully here.
+> - [`../DEPLOYMENTS.md`](../DEPLOYMENTS.md) — **the audit ledger** of versions in PROD: which
+>   version was left installed, when, which commit, what changed and how it was verified. It is written on EVERY
+>   deploy to prod (rule in HANDBOOK §12) — with no entry, the deploy is not done.
 >
-> Complementa —no reemplaza— a [`lab/PROXMOX.md`](../PROXMOX.md) (operación diaria del lab) y
-> `docs/packaging-and-build.md` (build/paquetes). Este doc es el que manda cuando hay prod de por medio.
+> It complements —does not replace— [`lab/PROXMOX.md`](../PROXMOX.md) (daily lab operation) and
+> `docs/packaging-and-build.md` (build/packages). This doc is the one that rules when prod is involved.
 
 ---
 
-## 1. Entornos
+## 1. Environments
 
 | | **LAB** | **PROD** |
 |---|---|---|
-| Proxmox | `192.168.4.165` (PC-004-165), `192.168.4.157` (PC-004-157) | **`192.168.8.207`** (nodo `pve`) |
-| Uso | experimentar, romper, validar | servicio real |
-| Build box | fb-build VM210 @165 · repo apt `192.168.4.200:8900` | fb-build VM110 (fuera del cluster) · `10.10.10.50` (fbint) + `192.168.8.180` (vmbr0, DHCP) · repo apt `:8900` — devs: `http://192.168.8.180:8900` |
-| Hives | 240–243 @157 | *(a construir)* |
-| Red | 192.168.4.0/24 | 192.168.8.0/24, gw `192.168.8.1`, bridge `vmbr0` |
-| Timezone del host | — | `America/New_York` (**el journal del host va en EDT, la bitácora en ART −03**) |
+| Proxmox | `192.168.4.165` (PC-004-165), `192.168.4.157` (PC-004-157) | **`192.168.8.207`** (node `pve`) |
+| Use | experiment, break, validate | real service |
+| Build box | fb-build VM210 @165 · apt repo `192.168.4.200:8900` | fb-build VM110 (outside the cluster) · `10.10.10.50` (fbint) + `192.168.8.180` (vmbr0, DHCP) · apt repo `:8900` — devs: `http://192.168.8.180:8900` |
+| Hives | 240–243 @157 | *(to be built)* |
+| Network | 192.168.4.0/24 | 192.168.8.0/24, gw `192.168.8.1`, bridge `vmbr0` |
+| Host timezone | — | `America/New_York` (**the host journal is in EDT, the logbook in ART −03**) |
 
-**Las dos redes no se ven entre sí.** El puente es la máquina del operador/agente, que alcanza ambas:
-para llevar un `.deb` o un binario de lab→prod se baja del build box y se sube a prod. No se conectan las redes.
+**The two networks cannot see each other.** The bridge is the operator/agent machine, which reaches both:
+to take a `.deb` or a binary from lab→prod, it is downloaded from the build box and uploaded to prod. The networks are not connected.
 
 ---
 
-## 2. Capacidades del agente (verificado empíricamente, no asumido)
+## 2. Agent capabilities (verified empirically, not assumed)
 
-Token prod `ai-agent@pve!vscode` → ACL `/ = Administrator, propagate=1`, `privsep=0`.
-**Es admin total del datacenter.** En concreto:
+Prod token `ai-agent@pve!vscode` → ACL `/ = Administrator, propagate=1`, `privsep=0`.
+**It is full admin of the datacenter.** Concretely:
 
-### Nivel 1 — Datacenter vía API REST: **SÍ, todo**
-- **VMs**: crear, clonar, arrancar/parar/destruir, snapshots, rollback, migrar.
-- **Templates**: crear (VM + `template=1`) y clonar desde ellos.
-- **Storage**: crear/modificar/borrar pools, subir ISOs/cloud-images, descargar por URL
+### Level 1 — Datacenter via the REST API: **YES, everything**
+- **VMs**: create, clone, start/stop/destroy, snapshots, rollback, migrate.
+- **Templates**: create (VM + `template=1`) and clone from them.
+- **Storage**: create/modify/delete pools, upload ISOs/cloud-images, download by URL
   (`/nodes/{n}/storage/{s}/download-url`).
-- **Red**: bridges, bonds, VLANs (`/nodes/{n}/network` + apply). **SDN**: zonas, vnets, subnets.
-- **Firewall** (datacenter/nodo/VM), **usuarios/tokens/realms/ACL**, **apt del host**,
-  **servicios del host**, **power del host** (reboot/shutdown), **syslog**.
+- **Network**: bridges, bonds, VLANs (`/nodes/{n}/network` + apply). **SDN**: zones, vnets, subnets.
+- **Firewall** (datacenter/node/VM), **users/tokens/realms/ACL**, **host apt**,
+  **host services**, **host power** (reboot/shutdown), **syslog**.
 
-### Nivel 2 — Dentro de las VMs: **SÍ, total**
-`VM.GuestAgent.Unrestricted` + FileRead/FileWrite → ejecución de comandos como root, push/pull de
-archivos, **sin SSH ni túneles**. Es el mecanismo estándar (`lab/pve.py exec|push|pull`).
+### Level 2 — Inside the VMs: **YES, full**
+`VM.GuestAgent.Unrestricted` + FileRead/FileWrite → command execution as root, file push/pull,
+**with no SSH or tunnels**. It is the standard mechanism (`lab/pve.py exec|push|pull`).
 
-### Nivel 3 — Shell arbitrario *sobre el host Proxmox*: **NO directo** ← el único límite real
-La API REST no expone "ejecutá este comando en el host". Existen `vncshell`/`termproxy` (websocket
-interactivo, privilegio disponible) pero no son cómodos de scriptear.
+### Level 3 — Arbitrary shell *on the Proxmox host*: **NOT direct** ← the only real limit
+The REST API does not expose "run this command on the host". There are `vncshell`/`termproxy` (an interactive
+websocket, the privilege is available), but they are not convenient to script.
 
-**En la práctica casi no molesta**: red, storage, servicios, apt, firewall y power **tienen endpoint API**.
-Lo que quedaría afuera es algo muy puntual (editar un archivo suelto en `/etc` del host, correr un
-script ad-hoc). Si aparece esa necesidad **se plantea y se decide juntos** — no se improvisa un
-mecanismo de acceso.
+**In practice it hardly gets in the way**: network, storage, services, apt, firewall and power **have an API endpoint**.
+What would be left out is something very specific (editing a single file in the host's `/etc`, running an
+ad-hoc script). If that need comes up, **it is raised and decided together** — an access
+mechanism is not improvised.
 
 ---
 
-## 3. Reglas de oro
+## 3. Golden rules
 
 ### Prod
-0. **ALCANCE DE ACCESO (regla del operador, 2026-07-28):** el agente opera **únicamente sobre las
-   máquinas que él mismo creó**, más el host Proxmox que administra. La red de administración
-   `192.168.8.0/24` es **compartida y plana**: hay equipos de terceros ahí. **No se escanea la red,
-   no se accede a ninguna IP que no corresponda a una VM propia.** Ante una IP desconocida: no se toca.
-0b. **CÓDIGO: SE ARREGLAN LOS BUGS, BIEN** (regla del operador, actualizada 2026-07-29): el agente
-   **sí resuelve los bugs que encuentra**, con la condición de que se resuelvan **correctamente** —
-   nunca un parche para "que ande". La versión original de esta regla (2026-07-28) prohibía tocar
-   código; el operador la amplió tras el hallazgo **A-6**.
-   En la práctica: (a) **diagnosticar la causa raíz**, no el síntoma; (b) **chequear los pares** —una
-   divergencia respecto de un script/nodo hermano suele *ser* el bug, y el hermano correcto es la
-   referencia; (c) **rechazar el atajo** aunque el error lo sugiera (ej.: `-buildvcs=false`);
-   (d) **registrar** el arreglo en `FINDINGS.md` con su evidencia; (e) ante un cambio **de diseño**
-   (no un bug), sigue rigiendo: **se charla antes**.
-0d. **NINGÚN HALLAZGO SE REPORTA SIN UN INTENTO DE REFUTARLO** (regla del operador, 2026-08-04).
-   Nace de un error concreto: se reportó U-12 proponiendo construir una operación atómica de
-   "bajar nodo + purgar su directorio" que **ya existía** (`kill_node` con `purge_instance`, con
-   ejemplo en la autodocumentación) — y la secuencia inferior había quedado escrita en el
-   `HANDBOOK` como *la* receta. El operador no puede verificar cada detalle; **el adversario tiene
-   que ser el agente**.
+0. **ACCESS SCOPE (the operator's rule, 2026-07-28):** the agent operates **only on the
+   machines it created itself**, plus the Proxmox host it administers. The administration network
+   `192.168.8.0/24` is **shared and flat**: there is third-party equipment on it. **The network is not scanned,
+   and no IP that does not belong to one of our own VMs is accessed.** Faced with an unknown IP: it is not touched.
+0b. **CODE: BUGS GET FIXED, PROPERLY** (the operator's rule, updated 2026-07-29): the agent
+   **does fix the bugs it finds**, on the condition that they are fixed **correctly** —
+   never a patch "to make it work". The original version of this rule (2026-07-28) forbade touching
+   code; the operator broadened it after finding **A-6**.
+   In practice: (a) **diagnose the root cause**, not the symptom; (b) **check the peers** —a
+   divergence from a sibling script/node often *is* the bug, and the correct sibling is the
+   reference; (c) **reject the shortcut** even if the error suggests it (e.g.: `-buildvcs=false`);
+   (d) **record** the fix in `FINDINGS.md` with its evidence; (e) for a **design** change
+   (not a bug), it still applies: **it is discussed first**.
+0d. **NO FINDING IS REPORTED WITHOUT AN ATTEMPT TO REFUTE IT** (the operator's rule, 2026-08-04).
+   It comes from a concrete mistake: U-12 was reported proposing to build an atomic
+   "take the node down + purge its directory" operation that **already existed** (`kill_node` with `purge_instance`, with an
+   example in the self-documentation) — and the inferior sequence had been written in the
+   `HANDBOOK` as *the* recipe. The operator cannot verify every detail; **the adversary has
+   to be the agent**.
 
-   El patrón del fallo, medido sobre los errores de esa sesión: **los hallazgos producidos en
-   solitario no tuvieron refutador; los que pasaron por revisión adversarial fueron corregidos a
-   tiempo.** No es cuestión de leer más rápido, es de tener un contradictor.
+   The failure pattern, measured over that session's mistakes: **the findings produced
+   alone had no refuter; the ones that went through adversarial review were corrected in
+   time.** It is not a matter of reading faster, it is a matter of having a contradictor.
 
-   Antes de escribir "falta X" / "hay que construir Y", **es obligatorio**:
-   1. **Preguntarle al sistema.** `GET /admin/actions` y `GET /admin/actions/<accion>` exponen
-      rutas, esquema completo y ejemplos — incluidos **parámetros opcionales que no se ven leyendo
-      la firma de la función**. Ahí estaba `purge_instance`.
-   2. **Buscar con otros nombres.** El repo usa sinónimos: purge/remove/delete/kill,
+   Before writing "X is missing" / "Y must be built", **it is mandatory**:
+   1. **Ask the system.** `GET /admin/actions` and `GET /admin/actions/<action>` expose
+      routes, the full schema and examples — including **optional parameters that are not visible by reading
+      the function's signature**. That is where `purge_instance` was.
+   2. **Search with other names.** The repo uses synonyms: purge/remove/delete/kill,
       ref/reference/key, glob/family/fanout, hot/reload/refresh/reconcile.
-   3. **Comparar con los hermanos.** Si los tres nodos de la familia hacen lo mismo, **no es un bug
-      de uno: es el contrato de la familia**, y llamarlo bug es el error. (Pasó con `configured`.)
-   4. **Revisar tests y `docs/`.** Hay capacidades que solo están ejercitadas ahí.
+   3. **Compare with the siblings.** If the three nodes of the family do the same thing, **it is not one node's
+      bug: it is the family's contract**, and calling it a bug is the mistake. (It happened with `configured`.)
+   4. **Review the tests and `docs/`.** There are capabilities that are only exercised there.
 
-   Y al reportar, **separar lo verificado de lo inferido**: qué se leyó en el código (con
-   `file:line`), qué se probó en vivo, y qué es suposición. Un hallazgo sin esa distinción no está
-   terminado.
+   And when reporting, **separate what was verified from what was inferred**: what was read in the code (with
+   `file:line`), what was tested live, and what is an assumption. A finding without that distinction is not
+   finished.
 
-   **Corolario para el HANDBOOK:** una receta escrita ahí se va a seguir sin cuestionar. Nada entra
-   al handbook sin haberse ejecutado, y si se corrige un hallazgo hay que **revisar si contaminó
-   una receta**.
+   **Corollary for the HANDBOOK:** a recipe written there is going to be followed without question. Nothing goes
+   into the handbook without having been run, and if a finding is corrected, one has to **check whether it contaminated
+   a recipe**.
 
-0c. **No inventar mecanismos paralelos a los que el producto ya provee.** Si `add_hive` (o cualquier
-   flujo de fluxbee) resuelve algo, se usa **ese** camino, aunque exista un atajo desde la posición
-   privilegiada del agente. Motivo: las recetas deben ser **portables** (el próximo prod puede ser
-   bare-metal, sin Proxmox ni guest-agent) y deben ejercitar **el camino que está testeado**.
-1. **Snapshot antes de todo cambio destructivo o dudoso.** Nombre: `pre-<accion>-YYYYMMDD`.
-   **Nunca más de 3 por VM:** si ya hay 3, se borra el más viejo antes. `lab/pve.py` lo hace
-   cumplir (HANDBOOK §12).
-2. **Un cambio por vez**, verificado antes del siguiente. Nada de lotes a ciegas.
-3. **Todo cambio va a la bitácora** del día (§5), incluido el que sale mal.
-4. **Lo irreversible se pregunta primero** (§4). Aunque el token pueda hacerlo.
-5. **Verificar con evidencia**, no con suposición: si se levantó un servicio, se muestra su estado.
-6. **Nada de credenciales de lab en prod** — ver §6.
-7. Ante duda entre "probar en prod" y "probar en lab": **se prueba en lab**.
+0c. **Do not invent mechanisms parallel to the ones the product already provides.** If `add_hive` (or any
+   fluxbee flow) solves something, **that** path is used, even if there is a shortcut from the agent's
+   privileged position. Reason: the recipes must be **portable** (the next prod may be
+   bare-metal, with no Proxmox or guest-agent) and must exercise **the path that is tested**.
+1. **Snapshot before every destructive or doubtful change.** Name: `pre-<action>-YYYYMMDD`.
+   **Never more than 3 per VM:** if there are already 3, the oldest is deleted first. `lab/pve.py` enforces
+   it (HANDBOOK §12).
+2. **One change at a time**, verified before the next one. No blind batches.
+3. **Every change goes into the day's logbook** (§5), including the one that goes wrong.
+4. **What is irreversible is asked first** (§4). Even if the token can do it.
+5. **Verify with evidence**, not with assumption: if a service was brought up, its state is shown.
+6. **No lab credentials in prod** — see §6.
+7. When in doubt between "test in prod" and "test in lab": **test in lab**.
 
 ### Lab
-Se puede romper. Igual se registra lo que sirve de aprendizaje (los hallazgos son el producto).
+It can be broken. Even so, whatever is useful as learning is recorded (the findings are the product).
 
 ---
 
-## 4. Clasificación de cambios
+## 4. Change classification
 
-| Tipo | Ejemplos | Requiere aprobación | Snapshot |
+| Type | Examples | Requires approval | Snapshot |
 |---|---|---|---|
-| **Lectura** | inventario, `config-get`, logs, permisos | no | no |
-| **Reversible** | crear VM, snapshot, arrancar/parar nodo, `config-set` | no (avisar) | recomendado |
-| **Irreversible** | destruir VM, borrar storage pool, cambiar red del host, borrar datos | **SÍ** | **SÍ** |
-| **Destructivo de estado** | `cleanall`, dropear DB, reinstalar hive | **SÍ** | **SÍ** |
+| **Read** | inventory, `config-get`, logs, permissions | no | no |
+| **Reversible** | create VM, snapshot, start/stop node, `config-set` | no (give notice) | recommended |
+| **Irreversible** | destroy VM, delete storage pool, change host network, delete data | **YES** | **YES** |
+| **State-destructive** | `cleanall`, drop DB, reinstall hive | **YES** | **YES** |
 
-Regla: *poder hacerlo* (permiso) no es *deber hacerlo*. El token es Administrator; el criterio lo pone el método.
+Rule: *can do it* (permission) is not *should do it*. The token is Administrator; the method sets the criteria.
 
 ---
 
-## 5. Protocolo de bitácora
+## 5. Logbook protocol
 
-Un archivo por día: `lab/logbook/YYYY-MM-DD.md`. Cada cambio, una entrada:
+One file per day: `lab/logbook/YYYY-MM-DD.md`. Each change, one entry:
 
 ```markdown
-## HH:MM — <título corto del cambio>
-- **Entorno:** prod (192.168.8.207) | lab (…)
-- **Tipo:** lectura | reversible | irreversible | destructivo
-- **Objetivo:** por qué se hace (una línea)
-- **Ejecutado:** el comando/endpoint EXACTO (reproducible)
-- **Resultado:** salida relevante / evidencia
-- **Estado:** OK | FALLÓ | REVERTIDO
-- **Rollback:** cómo se deshace (o "N/A")
+## HH:MM — <short title of the change>
+- **Environment:** prod (192.168.8.207) | lab (…)
+- **Type:** read | reversible | irreversible | destructive
+- **Goal:** why it is done (one line)
+- **Executed:** the EXACT command/endpoint (reproducible)
+- **Result:** relevant output / evidence
+- **Status:** OK | FAILED | REVERTED
+- **Rollback:** how it is undone (or "N/A")
 ```
 
-**Por qué así:** la bitácora tiene que permitir **reconstruir** el entorno y **auditar** qué pasó.
-Es el mismo principio del *command audit log* de SY.admin (`list_recent_commands`): registrar la
-mutación con datos suficientes para replicarla. Los secretos **nunca** van en la bitácora — se
-registra el *nombre* de la key y su `resource_type`, jamás el valor.
+**Why this way:** the logbook has to make it possible to **rebuild** the environment and **audit** what happened.
+It is the same principle as SY.admin's *command audit log* (`list_recent_commands`): record the
+mutation with enough data to replicate it. Secrets **never** go in the logbook — the key's
+*name* and its `resource_type` are recorded, never the value.
 
-Al final del día: un bloque **Estado al cierre** (qué quedó vivo) y **Pendientes**.
-
----
-
-## 6. Seguridad operativa
-
-- **Secretos**: van a SY.vault (o al gestor que corresponda). En bitácora/commits/logs solo el
-  *nombre* de la key. Los archivos temporales con credenciales se borran (local y remoto) apenas se usan.
-- ⚠️ **`lab/template-prep.sh` hornea el usuario `administrator` con password `magicAI`** (default de
-  los scripts de `add_hive`). **Está bien para el lab; en prod hay que cambiarlo.** El propio script lo
-  advierte. → Para prod: variante con credencial propia y `harden_ssh: true`; la recuperación es por
-  consola y un join nuevo (D32: Fluxbee usa SSH solo dentro de `add_hive`; `key_only_persist` se
-  eliminó en 0.1.61).
-- **Tokens de Proxmox**: no se pegan en comandos que queden en logs; van por variable de entorno.
+At the end of the day: a **State at close** block (what was left alive) and **Pending**.
 
 ---
 
-## 7. Verificación (definición de "listo")
+## 6. Operational security
 
-Un cambio no está hecho hasta que hay **evidencia**:
-- VM creada → aparece en `list` y el guest-agent responde (`wait-agent`).
-- Servicio levantado → `systemctl is-active` lo confirma.
-- Nodo fluxbee spawneado → unit activa **y** `CONFIG_GET` devuelve estado esperado
-  (`UNCONFIGURED` es correcto hasta cargar el secreto).
-- Cambio de red → aplicado **y** conectividad probada (no solo escrito en `interfaces.new`).
-
-Si algo falla: se registra el fallo, se diagnostica, y **el diagnóstico también va a la bitácora**
-(los hallazgos son la parte valiosa).
+- **Secrets**: they go to SY.vault (or to the appropriate manager). In the logbook/commits/logs, only the key's
+  *name*. Temporary files with credentials are deleted (local and remote) as soon as they are used.
+- ⚠️ **`lab/template-prep.sh` bakes in the `administrator` user with password `magicAI`** (the default of
+  the `add_hive` scripts). **It is fine for the lab; in prod it has to be changed.** The script itself
+  warns about it. → For prod: a variant with its own credential and `harden_ssh: true`; recovery is through the
+  console and a new join (D32: Fluxbee uses SSH only inside `add_hive`; `key_only_persist` was
+  removed in 0.1.61).
+- **Proxmox tokens**: they are not pasted into commands that end up in logs; they go through an environment variable.
 
 ---
 
-## 8. Modelo de deploy Fluxbee (recordatorio, no re-decidir)
+## 7. Verification (definition of "done")
 
-- **Solo motherbee se instala por `.deb`.** Worker / ingress / egress son **Linux limpios** que
-  motherbee bootstrapea vía `add_hive`. Instalar postgres en un worker = bug.
-- **Se compila SIEMPRE en el build box** (fb-build), nunca en un hive ni en prod.
-- **Crecer no requiere `.deb` nuevo**: se publica el runtime/paquete y se hace `update`.
-- **`base-nodes.json` es la fuente única** de qué entra en el `.deb` (lo leen `build-deb.sh` e `install.sh`).
+A change is not done until there is **evidence**:
+- VM created → it appears in `list` and the guest-agent responds (`wait-agent`).
+- Service brought up → `systemctl is-active` confirms it.
+- Fluxbee node spawned → active unit **and** `CONFIG_GET` returns the expected state
+  (`UNCONFIGURED` is correct until the secret is loaded).
+- Network change → applied **and** connectivity tested (not just written to `interfaces.new`).
+
+If something fails: the failure is recorded, it is diagnosed, and **the diagnosis also goes into the logbook**
+(the findings are the valuable part).
+
+---
+
+## 8. Fluxbee deploy model (a reminder, do not re-decide)
+
+- **Only the motherbee is installed by `.deb`.** Worker / ingress / egress are **clean Linux boxes** that the
+  motherbee bootstraps via `add_hive`. Installing postgres on a worker = bug.
+- **Compiling is ALWAYS done on the build box** (fb-build), never on a hive or in prod.
+- **Growing does not require a new `.deb`**: the runtime/package is published and an `update` is run.
+- **`base-nodes.json` is the single source** of what goes into the `.deb` (`build-deb.sh` and `install.sh` read it).

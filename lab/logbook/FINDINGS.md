@@ -1,2492 +1,2665 @@
-# FINDINGS — hallazgos del despliegue integrado en PROD alpha
+# FINDINGS — findings from the integrated deployment in PROD alpha
 
-> **Qué es esto.** El registro acumulado de lo que la prueba integrada en producción va sacando a la
-> luz. La bitácora diaria (`YYYY-MM-DD.md`) cuenta *el viaje*; este documento junta *los hallazgos*
-> para que después salga un **plan de cambios de código** fundamentado.
+> **What this is.** The cumulative record of what the integrated test in production brings to
+> light. The daily logbook (`YYYY-MM-DD.md`) tells *the journey*; this document gathers *the
+> findings* so that a well-founded **code-change plan** can come out of them later.
 >
-> **Regla que lo gobierna** (`METHOD.md` §3, reglas 0b/0c): durante el despliegue **no se toca código
-> y no se parchea para que ande**. Un fallo es **dato**, no obstáculo. Todo lo que aparezca acá se
-> discute con el operador **antes** de convertirse en un cambio.
+> **The rule that governs it** (`METHOD.md` §3, rules 0b/0c): during the deployment **no code is
+> touched and nothing is patched to make it work**. A failure is **data**, not an obstacle.
+> Everything that shows up here is discussed with the operator **before** it becomes a change.
 
-**Estados:** 🔴 confirmado en código · 🟡 observado (falta confirmar causa) · 🟢 resuelto/no requiere cambio
+**States:** 🔴 confirmed in code · 🟡 observed (cause still to be confirmed) · 🟢 resolved/no change required
 
 ---
 
-## A. Producto fluxbee — candidatos a cambio de código
+## A. The fluxbee product — candidates for a code change
 
-### A-1 🟡 REENCUADRADO (→ PB-5) — El orchestrator no configura placas de red secundarias
+### A-1 🟡 REFRAMED (→ PB-5) — The orchestrator does not configure secondary network cards
 
-> **Reencuadrado en la auditoría del 2026-08-03 ([PB-5](PENDING-BUGS.md#pb-5)):** direccionar las
-> placas es del operador por contrato, en todos los roles. Queda abierto que el egress reporta
-> `nat_applied: true` sin verificar su pata LAN.
+> **Reframed in the 2026-08-03 audit ([PB-5](PENDING-BUGS.md#pb-5)):** addressing the cards is the
+> operator's job by contract, in every role. What stays open is that the egress reports
+> `nat_applied: true` without checking its LAN leg.
 
-- **Qué pasa:** `add_hive role=ingress|egress` **exige** los nombres de interfaz (`wan_iface`,
-  `lan_iface`) y asume que **ya existen y están direccionadas**. No hay una sola línea en el
-  orquestador que asigne IPs a interfaces.
-- **Evidencia:** `src/bin/sy_orchestrator.rs` — `resolve_add_hive_egress_section` valida
-  `lan_cidr`/`wan_iface`/`lan_iface`; `reconcile_egress_nat` aplica nftables **sobre interfaces que
-  supone configuradas**. Cero manejo de direcciones.
-- **Impacto:** todo despliegue con ingress/egress necesita configuración de red **manual o externa**
-  (en este caso, cloud-init). En bare-metal sin cloud-init, alguien la hace a mano → paso no
-  reproducible, fuera de la receta.
-- **Detectado por:** el operador lo anticipó; confirmado leyendo el código.
-- **Estado:** hueco real del producto. **A discutir:** ¿el orchestrator debería aceptar la
-  configuración de las patas secundarias en el payload de `add_hive` y aplicarla?
+- **What happens:** `add_hive role=ingress|egress` **requires** the interface names (`wan_iface`,
+  `lan_iface`) and assumes they **already exist and are addressed**. Not a single line in the
+  orchestrator assigns IPs to interfaces.
+- **Evidence:** `src/bin/sy_orchestrator.rs` — `resolve_add_hive_egress_section` validates
+  `lan_cidr`/`wan_iface`/`lan_iface`; `reconcile_egress_nat` applies nftables **on interfaces it
+  assumes are configured**. Zero address handling.
+- **Impact:** every deployment with ingress/egress needs **manual or external** network
+  configuration (in this case, cloud-init). On bare metal without cloud-init, someone does it by
+  hand → a non-reproducible step, outside the recipe.
+- **Detected by:** the operator anticipated it; confirmed by reading the code.
+- **Status:** a real product gap. **To discuss:** should the orchestrator accept the configuration
+  of the secondary legs in the `add_hive` payload and apply it?
 
-### A-2 🟡 ABIERTO (→ PB-6) — `harden_ssh` viene en `false` por defecto
+### A-2 🟡 OPEN (→ PB-6) — `harden_ssh` defaults to `false`
 
-> **Reescrito en la auditoría del 2026-08-03 ([PB-6](PENDING-BUGS.md#pb-6)):** invertir el default
-> dejaría cajas sin ninguna vía de acceso. Lo abierto es que el canal `ssh_password` no se cierra
-> solo.
+> **Rewritten in the 2026-08-03 audit ([PB-6](PENDING-BUGS.md#pb-6)):** flipping the default
+> would leave boxes with no way in at all. What stays open is that the `ssh_password` channel does
+> not close by itself.
 
-- **Qué pasa:** con bootstrap por `ssh_password`, si no se pasa `harden_ssh:true` explícitamente,
-  al terminar el join `add_hive` **saca su clave y su sudoers pero deja `PasswordAuthentication yes`**.
-  La máquina queda con password abierto.
-- **Evidencia:** `resolve_add_hive_harden_ssh` → default `false`. El endurecimiento
-  (`disable_remote_password_auth_with_access` + verificación) solo corre si está en `true`.
-- **Impacto:** el modelo mental correcto es *"la caja se abre unos segundos y `add_hive` la cierra"*.
-  Con el default actual **eso no se cumple** salvo que el operador se acuerde del flag.
-- **Estado:** **a discutir.** Opciones: invertir el default, o hacerlo ruidoso (advertir en la
-  respuesta cuando se bootstrapeó con password y no se endureció).
+- **What happens:** with an `ssh_password` bootstrap, if `harden_ssh:true` is not passed
+  explicitly, when the join ends `add_hive` **removes its key and its sudoers entry but leaves
+  `PasswordAuthentication yes`**. The machine is left with password login open.
+- **Evidence:** `resolve_add_hive_harden_ssh` → default `false`. The hardening
+  (`disable_remote_password_auth_with_access` + verification) only runs if it is `true`.
+- **Impact:** the correct mental model is *"the box opens for a few seconds and `add_hive` closes
+  it"*. With the current default **that does not hold** unless the operator remembers the flag.
+- **Status:** **to discuss.** Options: flip the default, or make it loud (warn in the response
+  when the bootstrap used a password and no hardening ran).
 
-### A-3 ✅ CERRADO (→ PB-7, `9f86c12`) — El timeout del admin (180 s) puede quedar corto para `add_hive`
+### A-3 ✅ CLOSED (→ PB-7, `9f86c12`) — The admin timeout (180 s) can fall short for `add_hive`
 
-> **Cerrado con [PB-7](PENDING-BUGS.md#pb-7):** `add_hive` responde `202` enseguida y el join corre en
-> segundo plano, con su fase en `info.yaml`. Validado en vivo el 2026-08-05.
+> **Closed with [PB-7](PENDING-BUGS.md#pb-7):** `add_hive` answers `202` right away and the join
+> runs in the background, with its phase in `info.yaml`. Validated live on 2026-08-05.
 
-- **Qué pasa:** `JSR_ADMIN_ADD_HIVE_TIMEOUT_SECS` default **180 s**, pero las esperas internas del
-  flujo pueden sumar más (30 s salud + 60 s WAN + 60 s LSA + finalize).
-- **Evidencia:** `src/bin/sy_admin.rs` (timeout) vs. los gates de `add_hive_flow` en
+- **What happens:** `JSR_ADMIN_ADD_HIVE_TIMEOUT_SECS` defaults to **180 s**, but the flow's
+  internal waits can add up to more (30 s health + 60 s WAN + 60 s LSA + finalize).
+- **Evidence:** `src/bin/sy_admin.rs` (timeout) vs. the gates of `add_hive_flow` in
   `sy_orchestrator.rs`.
-- **Mitigación existente:** el hive queda en `status: pending` y **reintentar es idempotente**.
-- **Impacto:** en cajas lentas el cliente ve *timeout* aunque el join siga y termine bien →
-  confunde y puede inducir a "arreglar" algo que estaba andando.
-- **Estado:** **a discutir.** ¿Subir el default, o que la respuesta indique explícitamente
-  "en progreso, reintentá para ver el estado"?
+- **Existing mitigation:** the hive stays in `status: pending` and **retrying is idempotent**.
+- **Impact:** on slow boxes the client sees a *timeout* even though the join carries on and ends
+  well → it confuses, and it can lead someone to "fix" something that was working.
+- **Status:** **to discuss.** Raise the default, or have the response say explicitly
+  "in progress, retry to see the status"?
 
-### A-4 ✅ CERRADO (→ PB-8) — `egress.gateway_ip` se propaga a los workers, pero **no a motherbee**
+### A-4 ✅ CLOSED (→ PB-8) — `egress.gateway_ip` propagates to the workers, but **not to motherbee**
 
-> **Cerrado con [PB-8](PENDING-BUGS.md#pb-8):** no era un olvido. `egress.gateway_ip` es, por
-> contrato, la salida de los workers, y propagarlo al motherbee lo dejaría sin plano de control. El
-> motherbee lo reporta con `EGRESS_MOTHERBEE_BYPASS` y no toca su ruta. Validado en vivo.
+> **Closed with [PB-8](PENDING-BUGS.md#pb-8):** it was not an oversight. `egress.gateway_ip` is, by
+> contract, the workers' way out, and propagating it to the motherbee would leave it without a
+> control plane. The motherbee reports it with `EGRESS_MOTHERBEE_BYPASS` and does not touch its
+> route. Validated live.
 
-- **Qué pasa:** cuando MB declara `egress.gateway_ip`, **cada worker** rutea su default por el egress
-  (`reconcile_worker_egress` → `ip route replace default via <gw>`). **MB no está en esa lista.**
-- **Impacto:** el tráfico saliente de **motherbee** —que es justamente quien llama a las APIs
-  externas (OpenAI, Slack, Meta)— **no sale por el nodo egress**, sino por su propia ruta por
-  defecto. En este despliegue eso significa que saldría por la red de administración, que es
-  justo lo que el diseño quiere evitar.
-- **Estado:** **observado en el código, sin confirmar en vivo todavía.** Es de los puntos a mirar
-  cuando el egress esté funcionando. **A discutir:** ¿es intencional (MB debe tener su propia
-  salida) o es un hueco?
+- **What happens:** when MB declares `egress.gateway_ip`, **each worker** routes its default
+  through the egress (`reconcile_worker_egress` → `ip route replace default via <gw>`). **MB is not
+  on that list.**
+- **Impact:** the outbound traffic of **motherbee** —which is precisely the one that calls the
+  external APIs (OpenAI, Slack, Meta)— **does not go out through the egress node**, but through its
+  own default route. In this deployment that means it would go out through the management network,
+  which is exactly what the design wants to avoid.
+- **Status:** **observed in the code, not yet confirmed live.** It is one of the points to look at
+  once the egress is working. **To discuss:** is it intentional (MB must have its own way out) or
+  is it a gap?
 
-### A-5 🟡 Un clon recién booteado **no está listo** para `add_hive`
+### A-5 🟡 A freshly booted clone **is not ready** for `add_hive`
 
-- **Qué pasa:** el primer arranque de una VM clonada de la imagen cloud dispara actualizaciones
-  automáticas (`unattended-upgrades`), **reinicia sola**, y durante ese rato el `qemu-guest-agent`
-  (y potencialmente sshd) quedan intermitentes.
-- **Medido:** `netin` 37 MB → 52 MB, `diskwrite` 2.5 GB, reinicio espontáneo, agente caído varios
-  minutos.
-- **Impacto:** correr `add_hive` "apenas bootea la VM" puede pegarle a una caja en pleno upgrade →
-  falla intermitente, difícil de diagnosticar, y encima combinado con **A-3** (timeout).
-- **Estado:** observado en este despliegue. **A discutir:** ¿`add_hive` debería tener un *readiness
-  gate* explícito (esperar a que la caja esté quieta) o alcanza con documentarlo en la receta?
+- **What happens:** the first boot of a VM cloned from the cloud image triggers automatic updates
+  (`unattended-upgrades`), **reboots by itself**, and during that time the `qemu-guest-agent`
+  (and potentially sshd) become intermittent.
+- **Measured:** `netin` 37 MB → 52 MB, `diskwrite` 2.5 GB, a spontaneous reboot, the agent down for
+  several minutes.
+- **Impact:** running `add_hive` "as soon as the VM boots" can hit a box in the middle of an
+  upgrade → an intermittent failure, hard to diagnose, and on top of that combined with **A-3**
+  (timeout).
+- **Status:** observed in this deployment. **To discuss:** should `add_hive` have an explicit
+  *readiness gate* (wait until the box is quiet), or is documenting it in the recipe enough?
 
-### A-6 ✅ RESUELTO — `build-deb.sh` **nunca compilaba `ai_node_runner`** (divergencia con `install.sh`)
+### A-6 ✅ RESOLVED — `build-deb.sh` **never compiled `ai_node_runner`** (divergence from `install.sh`)
 
-- **Qué pasa:** el paso `[1/5] build rust` de `packaging/build-deb.sh` hace:
+- **What happens:** the `[1/5] build rust` step of `packaging/build-deb.sh` does:
   ```bash
   cargo build --release --bins
   cargo build --release -p sy-frontdesk-gov --bin sy-frontdesk-gov
   cargo build --release --manifest-path nodes/io/Cargo.toml -p <io crates>
   ```
-  y un comentario afirma: *"ai.generic (nodes/ai) is a root workspace member already built by
-  `--bins`"*. **Eso es falso.**
-- **Por qué:** el `Cargo.toml` raíz tiene **`[package]` (json-router) Y `[workspace]`**. Con un
-  paquete raíz presente, `cargo build --bins` **sin `--workspace`** compila **solo los bins del
-  paquete raíz**. `nodes/ai/ai-generic` (paquete `fluxbee-ai-nodes`, bin `ai_node_runner`) es un
-  **miembro** → **nunca se compila**. Nótese que `sy-frontdesk-gov` —otro miembro— **sí** tiene su
-  línea explícita: el patrón correcto ya está aplicado ahí, a `ai-generic` se le pasó.
-- **Síntoma:** el build llega a `[3/5] stage files` y aborta:
-  `Error: binary does not exist: target/release/ai_node_runner` → **no se produce `.deb`**.
-- **Por qué nunca se notó:** en el build box del **lab** el binario ya existía en `target/release/`
-  porque un `build2.sh` manual previo **sí** lo compila explícitamente
-  (`cargo build --release -p fluxbee-ai-nodes --bin ai_node_runner`). `build-deb.sh` lo encontraba
-  y seguía. **En una caja limpia —como prod— falla.**
-- **Impacto:** el camino de build **canónico** no es autosuficiente. Cualquier build box nuevo
-  (o un `cargo clean`) rompe la construcción del `.deb`.
-- **Arreglo propuesto (una línea, a aprobar):** agregar junto a la de `sy-frontdesk-gov`:
+  and a comment claims: *"ai.generic (nodes/ai) is a root workspace member already built by
+  `--bins`"*. **That is false.**
+- **Why:** the root `Cargo.toml` has **`[package]` (json-router) AND `[workspace]`**. With a root
+  package present, `cargo build --bins` **without `--workspace`** compiles **only the root
+  package's bins**. `nodes/ai/ai-generic` (package `fluxbee-ai-nodes`, bin `ai_node_runner`) is a
+  **member** → **it is never compiled**. Note that `sy-frontdesk-gov` —another member— **does** have
+  its explicit line: the correct pattern is already applied there; `ai-generic` was missed.
+- **Symptom:** the build reaches `[3/5] stage files` and aborts:
+  `Error: binary does not exist: target/release/ai_node_runner` → **no `.deb` is produced**.
+- **Why it was never noticed:** on the **lab** build box the binary already existed in
+  `target/release/` because an earlier manual `build2.sh` **does** compile it explicitly
+  (`cargo build --release -p fluxbee-ai-nodes --bin ai_node_runner`). `build-deb.sh` found it and
+  carried on. **On a clean box —like prod— it fails.**
+- **Impact:** the **canonical** build path is not self-sufficient. Any new build box (or a
+  `cargo clean`) breaks the `.deb` build.
+- **Proposed fix (one line, pending approval):** add it next to the `sy-frontdesk-gov` one:
   ```bash
   cargo build --release -p fluxbee-ai-nodes --bin ai_node_runner
   ```
-- **Lo que lo convierte en divergencia (no en decisión de diseño):** **`scripts/install.sh` línea 246
-  SÍ tiene** `cargo build --release -p fluxbee-ai-nodes --bin ai_node_runner`. Y `base-nodes.json`
-  declara explícitamente que es *"the single source of truth read by BOTH packaging/build-deb.sh and
-  scripts/install.sh (**they must not diverge**)"*. O sea: `install.sh` estaba bien y `build-deb.sh`
-  era el outlier → **de-divergir, no inventar**.
-- **✅ RESUELTO** (aprobado por el operador): se agregó a `build-deb.sh` la **misma línea** que ya
-  tenía `install.sh`, y se **corrigieron los dos comentarios falsos** que afirmaban que `--bins` lo
-  construía (esos comentarios son la razón por la que el bug sobrevivió). **Los dos scripts quedaron
-  con paridad exacta** en los tres builds explícitos.
-- **Atajo rechazado:** el propio error sugiere `-buildvcs=false` para B-8 y aquí habría bastado
-  compilar el binario a mano — ambas cosas habrían hecho pasar el build **ocultando el problema** y
-  dejando la próxima caja limpia rota igual.
+- **What makes it a divergence (not a design decision):** **`scripts/install.sh` line 246 DOES
+  have** `cargo build --release -p fluxbee-ai-nodes --bin ai_node_runner`. And `base-nodes.json`
+  states explicitly that it is *"the single source of truth read by BOTH packaging/build-deb.sh and
+  scripts/install.sh (**they must not diverge**)"*. In other words: `install.sh` was right and
+  `build-deb.sh` was the outlier → **de-diverge, don't invent**.
+- **✅ RESOLVED** (approved by the operator): `build-deb.sh` got the **same line** that
+  `install.sh` already had, and **the two false comments were corrected**, the ones that claimed
+  `--bins` built it (those comments are the reason the bug survived). **The two scripts ended up in
+  exact parity** on the three explicit builds.
+- **Shortcut rejected:** the error itself suggests `-buildvcs=false` for B-8, and here compiling
+  the binary by hand would have been enough — both would have made the build pass **while hiding
+  the problem**, leaving the next clean box just as broken.
 
-### A-7 ✅ RESUELTO (0.1.41–0.1.42) — OPA de usuario no llegaba a los spokes (CONFIG_CHANGED nunca salía del motherbee)
+### A-7 ✅ RESOLVED (0.1.41–0.1.42) — User OPA did not reach the spokes (CONFIG_CHANGED never left the motherbee)
 
-- **Qué pasa:** el admin manda las escrituras OPA como CONFIG_CHANGED; el router lo intercepta
-  antes de rutear, ignora el destino y solo lo reparte dentro del host. Un clear dirigido a worker1
-  lo ejecutó el motherbee (2026-09-28). Ningún spoke tiene de dónde sacar la policy; ingress y
-  egress ni siquiera corren SY.opa.rules. Y el wasm compilado (140–155 KB) no entra en un mensaje
-  (tope de 128 KiB).
-- **Arreglo (diseño del operador, bitácora 2026-09-30; `docs/opa-distribution.md`):** SY.opa.rules
-  en todos los hives; solo el motherbee compila y publica el wasm en la carpeta Syncthing
-  `fluxbee-dist-policy`; un CONFIG_CHANGED `{opa, sync}` avisa; cada hive lo instala si el sha256
-  coincide; una sola policy global; convergencia eventual; sin cifrado. CONFIG_CHANGED pasa a
-  viajar por el ruteo normal (cruza hives).
-- **Validado en 8.x:** apply en los 4 hives en 16 s; un hive cortado de Syncthing se puso al día
-  solo, 27 s después de reconectar; clear global (lento hasta 0.1.43: A-19).
+- **What happens:** the admin sends OPA writes as CONFIG_CHANGED; the router intercepts it before
+  routing, ignores the destination and only distributes it inside the host. A clear aimed at
+  worker1 was run by the motherbee (2026-09-28). No spoke has anywhere to get the policy from;
+  ingress and egress do not even run SY.opa.rules. And the compiled wasm (140–155 KB) does not fit
+  in a message (128 KiB cap).
+- **Fix (the operator's design, logbook 2026-09-30; `docs/opa-distribution.md`):** SY.opa.rules on
+  every hive; only the motherbee compiles and publishes the wasm in the Syncthing folder
+  `fluxbee-dist-policy`; a CONFIG_CHANGED `{opa, sync}` announces it; each hive installs it if the
+  sha256 matches; one single global policy; eventual convergence; no encryption. CONFIG_CHANGED now
+  travels over normal routing (it crosses hives).
+- **Validated on 8.x:** apply on the 4 hives in 16 s; a hive cut off from Syncthing caught up by
+  itself, 27 s after reconnecting; global clear (slow until 0.1.43: A-19).
 
-### A-8 ✅ RESUELTO (0.1.36) — Config de un hive aplicada en otro: `add_route` en un spoke pisaba las rutas del motherbee
+### A-8 ✅ RESOLVED (0.1.36) — One hive's config applied on another: `add_route` on a spoke overwrote the motherbee's routes
 
-- **Confirmado en vivo** en 8.x (bitácora 2026-09-30): dos altas en worker1 y el motherbee quedó
-  con esas rutas. El broadcast posterior a cada alta/baja llevaba la lista del spoke, y el contador
-  del admin iba uno adelante del de SY.config.routes.
-- **Arreglo:** `ConfigChangedPayload.hive`; el admin lo completa y SY.config.routes / SY.opa.rules
-  ignoran la config de otro hive.
+- **Confirmed live** on 8.x (logbook 2026-09-30): two adds on worker1, and the motherbee ended up
+  with those routes. The broadcast after each add/remove carried the spoke's list, and the admin's
+  counter ran one ahead of SY.config.routes'.
+- **Fix:** `ConfigChangedPayload.hive`; the admin fills it in, and SY.config.routes / SY.opa.rules
+  ignore another hive's config.
 
-### A-9 ✅ RESUELTO (0.1.36) — Cualquier nodo podía reescribir rutas, taps u OPA de su hive
+### A-9 ✅ RESOLVED (0.1.36) — Any node could rewrite its hive's routes, taps or OPA
 
-- **Qué pasaba:** CONFIG_CHANGED no era acción protegida y el intercept del router lo repartía sin
-  mirar el origen; SY.config.routes aceptaba `add_route`/`add_tap` de cualquiera (el tipo `admin`
-  no pasa por el gate del router); SY.opa.rules aceptaba `compile/apply/rollback_policy` de
-  cualquiera. Un nodo de usuario podía, por ejemplo, agregarse un tap y espejar tráfico.
-- **Arreglo:** CONFIG_CHANGED protegido (router + `system.rego`, reglas vigentes, sin recompilar);
-  mutaciones de SY.config.routes y comandos de SY.opa.rules solo desde `SY.admin@motherbee`.
+- **What happened:** CONFIG_CHANGED was not a protected action, and the router's intercept
+  distributed it without looking at the origin; SY.config.routes accepted `add_route`/`add_tap`
+  from anyone (the `admin` type does not go through the router's gate); SY.opa.rules accepted
+  `compile/apply/rollback_policy` from anyone. A user node could, for example, add itself a tap and
+  mirror traffic.
+- **Fix:** CONFIG_CHANGED protected (router + `system.rego`, current rules, no recompilation);
+  SY.config.routes mutations and SY.opa.rules commands only from `SY.admin@motherbee`.
 
-### A-10 ✅ RESUELTO (0.1.36) — Nodos fuera del motherbee apuntaban a `SY.vault@<su hive>` / `SY.admin@<su hive>`
+### A-10 ✅ RESOLVED (0.1.36) — Nodes outside the motherbee pointed at `SY.vault@<their hive>` / `SY.admin@<their hive>`
 
-- **Qué pasaba:** vault y admin corren solo en el motherbee. Cognition, los runners AI y los IO
-  derivaban el destino del vault de su propio hive; SY.wf-rules publicaba vía `SY.admin@<su hive>`.
-  En un worker, nada de eso existe. SY.edge ya lo había resuelto con `vault_hive`.
-- **Arreglo:** `VaultClient::for_primary` y `PRIMARY_HIVE_ID` en el SDK (el router la re-exporta);
-  `PrimaryAdminNode` en el Go SDK para SY.wf-rules.
+- **What happened:** vault and admin run only on the motherbee. Cognition, the AI runners and the
+  IO nodes derived the vault's destination from their own hive; SY.wf-rules published via
+  `SY.admin@<their hive>`. On a worker, none of that exists. SY.edge had already solved it with
+  `vault_hive`.
+- **Fix:** `VaultClient::for_primary` and `PRIMARY_HIVE_ID` in the SDK (the router re-exports it);
+  `PrimaryAdminNode` in the Go SDK for SY.wf-rules.
 
-### A-11 ✅ RESUELTO (0.1.36) — La réplica de identity no se ponía al día al reconectar
+### A-11 ✅ RESOLVED (0.1.36) — The identity replica did not catch up on reconnect
 
-- **Qué pasaba:** el full sync corría solo al arrancar. Si el stream de deltas se cortaba, o el
-  worker arrancaba con el motherbee caído, la réplica quedaba con datos viejos (o solo los ILK de
-  sistema) hasta el próximo reinicio, aunque el log decía que iba a converger al reconectar.
-- **Arreglo:** cada suscripción empieza con un snapshot completo; un gap de secuencia reconecta y
-  resincroniza en vez de `exit(0)`.
+- **What happened:** the full sync ran only at startup. If the delta stream was cut, or the worker
+  started with the motherbee down, the replica kept old data (or only the system ILKs) until the
+  next restart, even though the log said it would converge on reconnect.
+- **Fix:** each subscription starts with a full snapshot; a sequence gap reconnects and resyncs
+  instead of `exit(0)`.
 
-### A-12 ✅ RESUELTO (0.1.37) — El primer spawn de un WF en un worker corría antes que Syncthing
+### A-12 ✅ RESOLVED (0.1.37) — A WF's first spawn on a worker ran before Syncthing
 
-- **Qué pasaba:** con el publish arreglado (A-10), el deploy llegaba al spawn antes de que el
-  paquete sincronizara a worker1 (~11 s medidos) → `RUNTIME_NOT_AVAILABLE`, un solo intento.
-- **Arreglo:** wf-rules reintenta (backoff 1→4 s, hasta 20 s) mientras el orquestador conteste
+- **What happened:** with the publish fixed (A-10), the deploy reached the spawn before the package
+  had synced to worker1 (~11 s measured) → `RUNTIME_NOT_AVAILABLE`, a single attempt.
+- **Fix:** wf-rules retries (backoff 1→4 s, up to 20 s) while the orchestrator answers
   `RUNTIME_NOT_AVAILABLE` / `RUNTIME_NOT_PRESENT` / `BASE_RUNTIME_NOT_AVAILABLE`.
 
-### A-13 ✅ RESUELTO (0.1.37) — El SDK tapaba el veredicto del vault
+### A-13 ✅ RESOLVED (0.1.37) — The SDK masked the vault's verdict
 
-- **Qué pasaba:** `VaultClient::get`/`list` parseaban la respuesta como éxito antes de mirar el
-  `status`; un `KEY_NOT_FOUND` llegaba como `json error: missing field key` y las ramas
-  `KEY_NOT_FOUND` de io-slack e io-wapp nunca corrían.
-- **Arreglo:** leer el veredicto del JSON crudo antes de parsear.
+- **What happened:** `VaultClient::get`/`list` parsed the response as a success before looking at
+  the `status`; a `KEY_NOT_FOUND` arrived as `json error: missing field key`, and the
+  `KEY_NOT_FOUND` branches of io-slack and io-wapp never ran.
+- **Fix:** read the verdict from the raw JSON before parsing.
 
-### A-14 ✅ RESUELTO (0.1.37) — La SHM de OPA era `0666`
+### A-14 ✅ RESOLVED (0.1.37) — OPA's SHM was `0666`
 
-- **Qué pasaba:** SY.opa.rules creaba `/dev/shm/jsr-opa-<hive>` `rw-rw-rw-` (y la volvía a poner
-  así si existía): cualquier proceso podía leer la policy o escribir una para el router. Sus pares
-  Rust usan `0600`. Archivos de policy `0644` en dirs `0755`.
-- **Arreglo:** región `0600` (se corrige al arrancar), archivos `0600`, dirs `0700`.
+- **What happened:** SY.opa.rules created `/dev/shm/jsr-opa-<hive>` `rw-rw-rw-` (and set it back to
+  that if it existed): any process could read the policy or write one for the router. Its Rust
+  peers use `0600`. Policy files `0644` in `0755` dirs.
+- **Fix:** region `0600` (corrected at startup), files `0600`, dirs `0700`.
 
-### A-15 ✅ RESUELTO (0.1.38–0.1.40) — wf-rules borraba paquetes del espejo `dist/` de un worker
+### A-15 ✅ RESOLVED (0.1.38–0.1.40) — wf-rules deleted packages from a worker's `dist/` mirror
 
-- **Qué pasaba:** tras apply/rollback/delete, wf-rules purgaba versiones y reescribía el manifest
-  en su `dist/runtimes` **local**. En un worker eso es un espejo Syncthing receive-only: el borrado
-  local no se restaura nunca. En worker1 quedaron 15 cambios locales (13 borrados); el paquete
-  `wf.w1probe` desapareció del espejo y el nodo WF entró en crash-loop por
-  `flow/definition.json` faltante. Además el orquestador aceptaba el spawn con el manifest ya
-  sincronizado pero sin los archivos del paquete.
-- **Arreglo:** en un hive que no es el motherbee, la purga pide `remove_runtime_version` al admin
-  (se borra en el origen y la sync lo lleva); el orquestador responde `RUNTIME_NOT_PRESENT` hasta
-  que el `package.json` del paquete esté en el hive. En 0.1.38 el pedido salía sin `target`
-  (`INVALID_REQUEST: missing target`); 0.1.39 lo dirige al motherbee; 0.1.40 purga dejando la
-  versión current al final y toma `RUNTIME_NOT_FOUND`/`RUNTIME_VERSION_NOT_FOUND` como hecho.
-- **Validado (0.1.40):** crear → re-aplicar → borrar un WF en worker1: nodo HEALTHY en 0.0.1 y
-  0.0.2 (18 s cada uno), delete OK, motherbee sin versiones ni entrada en el manifest, espejo de
-  worker1 con 0 cambios locales.
-- **Reparación puntual:** el espejo de worker1 se restauró con `POST /rest/db/revert` de Syncthing
-  (15 → 0 cambios locales); después de eso `WF.w1probe@worker1` quedó HEALTHY: el primer WF
-  corriendo en un worker.
+- **What happened:** after apply/rollback/delete, wf-rules purged versions and rewrote the manifest
+  in its **local** `dist/runtimes`. On a worker that is a receive-only Syncthing mirror: the local
+  deletion is never restored. worker1 was left with 15 local changes (13 deletions); the
+  `wf.w1probe` package disappeared from the mirror and the WF node went into a crash-loop because
+  `flow/definition.json` was missing. On top of that, the orchestrator accepted the spawn with the
+  manifest already synced but without the package's files.
+- **Fix:** on a hive that is not the motherbee, the purge asks the admin for
+  `remove_runtime_version` (it is deleted at the origin and the sync carries that over); the
+  orchestrator answers `RUNTIME_NOT_PRESENT` until the package's `package.json` is on the hive. In
+  0.1.38 the request went out without a `target` (`INVALID_REQUEST: missing target`); 0.1.39 aims
+  it at the motherbee; 0.1.40 purges leaving the current version for last and takes
+  `RUNTIME_NOT_FOUND`/`RUNTIME_VERSION_NOT_FOUND` as done.
+- **Validated (0.1.40):** create → re-apply → delete a WF on worker1: node HEALTHY on 0.0.1 and
+  0.0.2 (18 s each), delete OK, motherbee with no versions and no manifest entry, worker1's mirror
+  with 0 local changes.
+- **One-off repair:** worker1's mirror was restored with Syncthing's `POST /rest/db/revert`
+  (15 → 0 local changes); after that `WF.w1probe@worker1` became HEALTHY: the first WF running on
+  a worker.
 
-### A-22 🟡 PARCIAL (0.1.44) · resto POSTERGADO — Un nodo local podía mandar mensajes como otro nodo
+### A-22 🟡 PARTIAL (0.1.44) · rest DEFERRED — A local node could send messages as another node
 
-- **Qué pasaba:** el router buscaba al emisor de un frame por el `routing.src` que el frame declaraba
-  y estampaba desde ahí su nombre L2, que es con lo que el gate decide las acciones protegidas.
-  Confirmado en vivo en 8.x: un nodo de prueba en el motherbee mandó `NODE_STATUS_GET` (protegida)
-  con el UUID de SY.admin y SY.config.routes le respondió al admin; con su propio UUID, el gate lo
-  descartó. Los UUID viajan en todos los mensajes (un nodo de tenant ve el de su orquestador en cada
-  señal `node_config`), así que cualquier nodo local podía actuar como el admin del motherbee o como
-  el orquestador de su hive, que por la regla 3 puede todas las acciones protegidas en cualquier hive.
-- **Arreglo:** el router descarta el frame si `routing.src` no es el UUID con el que ese socket hizo
-  HELLO, que es lo que `02-protocolo.md` ya exigía ("el router estampa `src_l2_name` desde la sesión
-  autenticada"). Revisados los emisores Rust, Go e IO: todos usan su propio UUID.
-- **Validado:** el mismo probe ahora cae (`routing.src is not the sending node`); ningún descarte de
-  tráfico legítimo en los 4 hives.
-- **Lo que sigue abierto (panel DTAP 2026-10-01, P-1):** 0.1.44 cerró que un nodo use el UUID de otro
-  dentro de su conexión, pero el **nombre** lo declara el propio proceso en el HELLO y el router lo
-  acepta: socket `0666`, sin nombres reservados, sin rechazo de duplicados ni de un `@hive` ajeno.
-  Cualquier proceso local puede conectarse con un UUID nuevo como `SY.admin` y escribir la policy
-  global, o como `SY.orchestrator` en un spoke.
-- **Decisión del operador (2026-10-01): POSTERGAR** el paquete de seguridad (hoy cuesta más de lo
-  que rinde). Incluye: autenticar el nombre en el HELLO (P-1), dirección de la regla 3 (A-20 / D-2),
-  firma del manifest publicado (P-8), `get_policy` que expone el rego (P-16) y el cifrado de la copia
-  sincronizada (ya postergado en el diseño).
+- **What happened:** the router looked up a frame's sender by the `routing.src` the frame declared,
+  and from there stamped its L2 name, which is what the gate uses to decide protected actions.
+  Confirmed live on 8.x: a test node on the motherbee sent `NODE_STATUS_GET` (protected) with
+  SY.admin's UUID, and SY.config.routes answered the admin; with its own UUID, the gate dropped it.
+  UUIDs travel in every message (a tenant node sees its orchestrator's in every `node_config`
+  signal), so any local node could act as the motherbee's admin or as its hive's orchestrator,
+  which under rule 3 can perform every protected action on any hive.
+- **Fix:** the router drops the frame if `routing.src` is not the UUID that socket used in its
+  HELLO, which is what `02-protocolo.md` already required ("the router stamps `src_l2_name` from
+  the authenticated session"). The Rust, Go and IO senders were reviewed: all use their own UUID.
+- **Validated:** the same probe is now dropped (`routing.src is not the sending node`); no
+  legitimate traffic dropped on the 4 hives.
+- **What stays open (DTAP panel 2026-10-01, P-1):** 0.1.44 closed the case of a node using
+  another's UUID inside its own connection, but the **name** is declared by the process itself in
+  the HELLO and the router accepts it: socket `0666`, no reserved names, no rejection of duplicates
+  or of a foreign `@hive`. Any local process can connect with a new UUID as `SY.admin` and write
+  the global policy, or as `SY.orchestrator` on a spoke.
+- **The operator's decision (2026-10-01): DEFER** the security package (today it costs more than it
+  yields). It includes: authenticating the name in the HELLO (P-1), the direction of rule 3
+  (A-20 / D-2), signing the published manifest (P-8), `get_policy` exposing the rego (P-16), and
+  encrypting the synced copy (already deferred in the design).
 
-### A-23 🟡 RESUELTO (0.1.48) · varias soluciones SIMPLIFICADO, revisar — El arquitecto modelaba OPA por hive; hay una sola policy global
+### A-23 🟡 RESOLVED (0.1.48) · multiple solutions SIMPLIFIED, to review — The architect modeled OPA per hive; there is one single global policy
 
-- **Qué pasa (visto en código, 2026-10-01):** una solución declara `opa_deployments` por hive
-  (`hive`, `policy_id`, `rego_source`) y el plan emite un `opa_compile_apply` por cada uno.
-  - Si el hive no es el motherbee, el admin lo rechaza con 400.
-  - Si es el motherbee, la policy pasa a ser la de todos los hives. Dos despliegues se pisan.
-  - El snapshot busca `policy_id`/`rego_hash` en el estado, que no los tiene: el reconciliador
-    nunca ve la policy que corre y la re-aplica en cada corrida.
-  - Quitarla está bloqueado (no hay acción de remove).
-  - El plan compiler (IA) recibe solo el `delta_report`: nadie le pasa el rego declarado.
-- **Decisión del operador (2026-10-01):**
-  1. La solución declara una sola policy global, sin hive.
-  2. Se compara con el rego que corre en el motherbee; si es igual, no se hace nada.
-  3. Se aplica con un solo `opa_compile_apply`; un hive `pending` no es una falla.
-  4. Cuando la solución dueña deja de declararla, `opa_clear`.
+- **What happens (seen in code, 2026-10-01):** a solution declares `opa_deployments` per hive
+  (`hive`, `policy_id`, `rego_source`) and the plan emits one `opa_compile_apply` for each.
+  - If the hive is not the motherbee, the admin rejects it with 400.
+  - If it is the motherbee, the policy becomes the one for every hive. Two deployments overwrite
+    each other.
+  - The snapshot looks for `policy_id`/`rego_hash` in the state, which does not have them: the
+    reconciler never sees the policy that is running and re-applies it on every run.
+  - Removing it is blocked (there is no remove action).
+  - The plan compiler (AI) receives only the `delta_report`: nobody passes it the declared rego.
+- **The operator's decision (2026-10-01):**
+  1. The solution declares one single global policy, with no hive.
+  2. It is compared with the rego running on the motherbee; if they are the same, nothing is done.
+  3. It is applied with one single `opa_compile_apply`; a `pending` hive is not a failure.
+  4. When the owning solution stops declaring it, `opa_clear`.
 
-  Si dos soluciones declaran OPA, **gana la última**. "Dueño" es la solución cuya policy corre
-  ahora; se reconoce comparando el rego con los manifests guardados. Una solución solo hace clear
-  si la policy que corre es la suya, y el plan dice de quién es la policy que reemplaza.
-- **Arreglo (0.1.48, `1486807`):** `desired_state.opa` (una policy, sin hive); el snapshot lee la
-  policy del motherbee con `opa_get_policy` y el dueño de los manifests guardados; un solo
-  `opa_compile_apply`, y `OPA_REMOVE` = `opa_clear`; el plan compiler recibe el rego y los pasos OPA
-  del plan quedan fijados a él; la confirmación dice de quién es la policy que se reemplaza.
-- **Validado:** tests (177 del arquitecto, incluida la respuesta real del admin de 8.x). El
-  pipeline completo no se corrió en vivo: necesita la IA del arquitecto (A-26).
-- **Pendiente de revisar (simplificación consciente, como el paquete de seguridad):** componer las
-  reglas de varias soluciones en una sola policy, en vez de que gane la última; y un dueño
-  registrado junto con la policy, en vez de deducirlo comparando el rego.
+  If two solutions declare OPA, **the last one wins**. The "owner" is the solution whose policy is
+  running now; it is recognized by comparing the rego with the stored manifests. A solution only
+  does a clear if the running policy is its own, and the plan says whose policy it replaces.
+- **Fix (0.1.48, `1486807`):** `desired_state.opa` (one policy, no hive); the snapshot reads the
+  motherbee's policy with `opa_get_policy`, and the owner from the stored manifests; one single
+  `opa_compile_apply`, and `OPA_REMOVE` = `opa_clear`; the plan compiler receives the rego, and the
+  plan's OPA steps are pinned to it; the confirmation says whose policy is being replaced.
+- **Validated:** tests (177 of the architect's, including the real response from the 8.x admin).
+  The full pipeline was not run live: it needs the architect's AI (A-26).
+- **Pending review (a deliberate simplification, like the security package):** composing the rules
+  of several solutions into one single policy, instead of the last one winning; and an owner
+  registered together with the policy, instead of deducing it by comparing the rego.
 
-### A-24 🟡 RESUELTO (0.1.49) · WF pendiente — El snapshot del arquitecto le pedía el estado de cada hive a un admin que no existe
+### A-24 🟡 RESOLVED (0.1.49) · WF pending — The architect's snapshot asked an admin that does not exist for each hive's state
 
-- **Qué pasa (visto en código, 2026-10-01; no reproducido en vivo):** `build_actual_state_snapshot`
-  manda cada lectura a `SY.admin@<hive>`. Solo el motherbee tiene admin (en worker1,
-  `sy-admin` está inactivo), así que en una solución con más de un hive esas lecturas fallan, el
-  snapshot queda incompleto y el reconciliador bloquea toda la corrida.
-- **Arreglo (0.1.49):** el snapshot y la consulta `query_hive` del plan compiler le preguntan a
-  `SY.admin@motherbee`, con el hive como destino (el admin está y va a estar solo en el motherbee;
-  operador, 2026-10-01). Un test del código fuente impide volver a nombrar un admin por hive.
-- **Sigue abierto:**
-  - El plan compiler tampoco recibe la definición de los workflows declarados
-    (`wf_deployments`): el mismo hueco que A-23 tenía con el rego.
-  - En ingress y egress, `list_runtimes` responde `RUNTIME_MANIFEST_MISSING` y no hay SY.wf-rules
-    (es así por rol). Una solución que nombra un hive DMZ igual queda con el snapshot incompleto,
-    y eso bloquea la corrida. En worker1 las cinco lecturas dan ok.
+- **What happens (seen in code, 2026-10-01; not reproduced live):** `build_actual_state_snapshot`
+  sends each read to `SY.admin@<hive>`. Only the motherbee has an admin (on worker1, `sy-admin` is
+  inactive), so in a solution with more than one hive those reads fail, the snapshot is left
+  incomplete and the reconciler blocks the whole run.
+- **Fix (0.1.49):** the snapshot and the plan compiler's `query_hive` query ask
+  `SY.admin@motherbee`, with the hive as the target (the admin is, and will be, only on the
+  motherbee; operator, 2026-10-01). A source-code test prevents naming a per-hive admin again.
+- **Still open:**
+  - The plan compiler does not receive the definition of the declared workflows
+    (`wf_deployments`) either: the same gap A-23 had with the rego.
+  - On ingress and egress, `list_runtimes` answers `RUNTIME_MANIFEST_MISSING` and there is no
+    SY.wf-rules (that is how it is, by role). A solution that names a DMZ hive still ends up with
+    an incomplete snapshot, and that blocks the run. On worker1 the five reads come back ok.
 
-### A-25 🟡 RESUELTO (0.1.49) — El `.deb` no instalaba el handbook del arquitecto (`install.sh` sí)
+### A-25 🟡 RESOLVED (0.1.49) — The `.deb` did not install the architect's handbook (`install.sh` did)
 
-- **Qué pasa (2026-10-01):** el arquitecto agrega a sus prompts `/etc/fluxbee/handbook_fluxbee.md`
-  si existe. `install.sh` lo copia, `build-deb.sh` no: en el motherbee de 8.x no está, así que el
-  arquitecto de PROD trabaja sin handbook. Misma clase de divergencia que A-6.
-- **Arreglo (0.1.49):** `build-deb.sh` lo instala en el mismo lugar (documento estático: se
-  reemplaza en cada upgrade, no es conffile).
+- **What happens (2026-10-01):** the architect appends `/etc/fluxbee/handbook_fluxbee.md` to its
+  prompts if it exists. `install.sh` copies it, `build-deb.sh` does not: it is not on the 8.x
+  motherbee, so the PROD architect works without a handbook. The same class of divergence as A-6.
+- **Fix (0.1.49):** `build-deb.sh` installs it in the same place (a static document: it is
+  replaced on every upgrade, it is not a conffile).
 
-### A-26 🟡 RESUELTO (0.1.49) — El arquitecto leía sus secretos del vault una sola vez al arrancar
+### A-26 🟡 RESOLVED (0.1.49) — The architect read its secrets from the vault only once, at startup
 
-- **Qué se vio (2026-10-01, al instalar 0.1.47 y 0.1.48):** al arrancar, el arquitecto no pudo leer
-  su clave de IA ni la URL de su base de mensajes (`vault unreachable`): en un upgrade se reinicia
-  todo el hive y el vault todavía no contestaba. Quedó escuchando con `ai_configured=false` y
-  `messages_db_configured=false`.
-- **Corrección del diagnóstico:** el aviso de arranque del vault (`VAULT_SECRET_CHANGED`, uno por
-  secreto) **sí** llegó: la base de mensajes se reconectó 0,4 s después. La IA sigue apagada porque
-  el vault de 8.x no tiene clave de IA (tiene 3 secretos: edge, TLS y postgres). Aun así, ese aviso
-  sale una sola vez, y el SDK documenta que un nodo que no lo escucha a tiempo queda degradado
-  (así le pasó a SY.storage).
-- **Arreglo:** como SY.storage y SY.identity, las dos lecturas de arranque reintentan hasta que el
-  vault conteste (`resolve_resource_awaiting_vault`, hasta `VAULT_BOOT_WAIT`, las dos a la vez).
-  Las relecturas por aviso o por `CONFIG_SET` siguen siendo de una vez.
+- **What was seen (2026-10-01, when installing 0.1.47 and 0.1.48):** at startup, the architect
+  could not read its AI key or the URL of its message database (`vault unreachable`): during an
+  upgrade the whole hive restarts, and the vault was not answering yet. It stayed listening with
+  `ai_configured=false` and `messages_db_configured=false`.
+- **Correction of the diagnosis:** the vault's startup notice (`VAULT_SECRET_CHANGED`, one per
+  secret) **did** arrive: the message database reconnected 0.4 s later. The AI stays off because
+  the 8.x vault has no AI key (it has 3 secrets: edge, TLS and postgres). Even so, that notice goes
+  out only once, and the SDK documents that a node that does not hear it in time stays degraded
+  (that is what happened to SY.storage).
+- **Fix:** like SY.storage and SY.identity, the two startup reads retry until the vault answers
+  (`resolve_resource_awaiting_vault`, up to `VAULT_BOOT_WAIT`, both at once). Re-reads on a notice
+  or on `CONFIG_SET` are still one-shot.
 
-### A-27 ✅ RESUELTO (`802faf5`) — El guardián de paridad del catálogo del admin (CI) estaba en rojo desde antes
+### A-27 ✅ RESOLVED (`802faf5`) — The parity guard of the admin's catalog (CI) had already been red before
 
-- **Qué pasa (2026-10-01):** `scripts/admin_action_catalog_parity_check.sh` corre en GitHub Actions
-  en cada push que toca `sy_admin.rs` y falla: sus expresiones no reconocen cómo se despachan
-  hoy 20 acciones que sí tienen ruta HTTP o son solo internas: `get_runtime`,
-  `list_cloud_actions`, `publish_artifact`, `publish_cloud_endpoint`, `unpublish_artifact`, los 8
-  `timer_*` y los 8 `wf_rules_*`. Cada push del tramo OPA que tocó el admin lo disparó en rojo.
-- **Arreglo:** el script sigue también `handle_admin_query_with_payload`, las RPC de timer, el
-  despacho interno genérico, los handlers de wf-rules y el de cloud endpoint, y declara las
-  excepciones a propósito: acciones que solo llegan por la malla (`publish_artifact`,
-  `list_cloud_actions`) y acciones con brazo dedicado (`externalize`, `unexternalize`,
-  `list_externalized`); las dos listas fallan si quedan viejas. En CI pasa desde `802faf5`.
+- **What happens (2026-10-01):** `scripts/admin_action_catalog_parity_check.sh` runs on GitHub
+  Actions on every push that touches `sy_admin.rs`, and it fails: its expressions do not recognize
+  how 20 actions that do have an HTTP route, or are internal-only, are dispatched today:
+  `get_runtime`, `list_cloud_actions`, `publish_artifact`, `publish_cloud_endpoint`,
+  `unpublish_artifact`, the 8 `timer_*` and the 8 `wf_rules_*`. Every push in the OPA stretch that
+  touched the admin set it off red.
+- **Fix:** the script also follows `handle_admin_query_with_payload`, the timer RPCs, the generic
+  internal dispatch, the wf-rules handlers and the cloud endpoint one, and it declares the
+  exceptions on purpose: actions that only arrive over the mesh (`publish_artifact`,
+  `list_cloud_actions`) and actions with a dedicated arm (`externalize`, `unexternalize`,
+  `list_externalized`); both lists fail if they go stale. In CI it passes since `802faf5`.
 
-### A-28 ✅ RESUELTO (`3eeadf2`) — Tres binarios compilados de Go estaban versionados en git
+### A-28 ✅ RESOLVED (`3eeadf2`) — Three compiled Go binaries were versioned in git
 
-- `go/sy-opa-rules/sy-opa-rules`, `go/sy-timer/sy-timer` y `go/nodes/wf/wf-generic/wf-generic`.
-  Ensuciaban cada `git status` después de un build local y quedaban a un `git add -A` de un commit.
-- **Fix:** salen del índice (los archivos quedan en disco) y `.gitignore` ignora los cuatro que
-  escribe el build (también `sy-wf-rules`). Aprobado por el operador en el lote de temas chicos
+- `go/sy-opa-rules/sy-opa-rules`, `go/sy-timer/sy-timer` and `go/nodes/wf/wf-generic/wf-generic`.
+  They dirtied every `git status` after a local build and were one `git add -A` away from a commit.
+- **Fix:** they leave the index (the files stay on disk) and `.gitignore` ignores the four that the
+  build writes (also `sy-wf-rules`). Approved by the operator in the small-topics batch
   (2026-10-02).
 
-### A-29 ✅ RESUELTO (0.1.51) — sy-timer y wf-generic: SQLite esperaba el lock en una sola conexión
+### A-29 ✅ RESOLVED (0.1.51) — sy-timer and wf-generic: SQLite waited for the lock on only one connection
 
-- **Qué pasaba:** el primer CI de Go mostró un test de sy-timer inestable (20 `TIMER_SCHEDULE`
-  concurrentes con el mismo `client_ref`): fallaba 10 de 15 veces en fb-build con
-  `TIMER_STORAGE_ERROR: database is locked (SQLITE_BUSY)`. La causa era del producto:
-  `busy_timeout` (y `synchronous` en wf-generic) es un pragma **por conexión**, y se aplicaba con
-  `db.Exec` sobre el pool de `database/sql`. Solo una conexión esperaba el lock; las demás fallaban
-  al instante. En sy-timer el scheduler escribe mientras se atienden pedidos, así que un agendado o
-  un disparo podía fallar de forma intermitente en producción.
-- **Arreglo:** los pragmas van en el DSN (`ruta?_pragma=...`), que modernc.org/sqlite aplica a
-  cada conexión que abre. Tests nuevos verifican tres conexiones a la vez; la suite de sy-timer
-  pasó 15 veces seguidas con `-race`.
+- **What happened:** the first Go CI showed a flaky sy-timer test (20 concurrent `TIMER_SCHEDULE`
+  with the same `client_ref`): it failed 10 out of 15 times on fb-build with
+  `TIMER_STORAGE_ERROR: database is locked (SQLITE_BUSY)`. The cause was in the product:
+  `busy_timeout` (and `synchronous` in wf-generic) is a **per-connection** pragma, and it was
+  applied with `db.Exec` on the `database/sql` pool. Only one connection waited for the lock; the
+  others failed instantly. In sy-timer the scheduler writes while requests are being served, so a
+  scheduling or a firing could fail intermittently in production.
+- **Fix:** the pragmas go in the DSN (`path?_pragma=...`), which modernc.org/sqlite applies to
+  every connection it opens. New tests check three connections at once; the sy-timer suite passed
+  15 times in a row with `-race`.
 
-### A-30 ✅ RESUELTO (0.1.51) — El admin no decodificaba los `%xx` de la query
+### A-30 ✅ RESOLVED (0.1.51) — The admin did not decode the query's `%xx`
 
-- **Qué pasaba (al validar 0.1.50):** un `DELETE /hives/{h}/taps` con `@` enviado como `%40` (como
-  lo manda `urlencode` de Python) respondía `NOT_FOUND`: el admin comparaba el valor sin decodificar.
-- **Arreglo:** claves y valores de la query se decodifican; `+` queda literal (aquí son más comunes
-  los `+` crudos, como `Etc/GMT+3`) y un `%` suelto se conserva.
+- **What happened (while validating 0.1.50):** a `DELETE /hives/{h}/taps` with `@` sent as `%40`
+  (the way Python's `urlencode` sends it) answered `NOT_FOUND`: the admin compared the value
+  without decoding it.
+- **Fix:** query keys and values are decoded; `+` stays literal (raw `+` signs are more common
+  here, like `Etc/GMT+3`) and a stray `%` is kept.
 
-### A-31 ✅ RESUELTO (0.1.57) — Los servicios escriben códigos de color ANSI en el journal
+### A-31 ✅ RESOLVED (0.1.57) — The services write ANSI color codes into the journal
 
-- **Qué pasa:** los niveles salen como `\x1b[33m WARN\x1b[0m` en `journalctl`. Un `grep ' WARN '`
-  no encuentra nada, y al validar 0.1.52 un conteo de errores dio 0 en falso hasta limpiar los
-  códigos con `sed 's/\x1b\[[0-9;]*m//g'`.
-- **Por qué:** cada binario arma su `tracing_subscriber` por su cuenta (36 archivos) y ninguno
-  apaga el color cuando la salida no es una terminal.
-- **Arreglo propuesto:** un init de tracing en el SDK con `with_ansi` solo si la salida es una
-  terminal, usado por todos los binarios. Es un cambio mecánico en 36 archivos: va con la pasada
-  de formato masivo (ítem 8 del lote), a decisión del operador.
-- **Arreglo:**
-  - `fluxbee_sdk::logging::fmt()` y `ansi()` solo ponen color cuando stdout es una terminal.
-  - Los 36 arranques de tracing pasan por ahí: los binarios del core, los nodos IO/AI/gov/test, los
-    diags y la capa de SY.edge.
-  - El formateo masivo queda aparte; es decisión del operador.
-- **Verificado:** un diag con la salida a un pipe pasó de 48 secuencias ESC a 0, y sus niveles salen
-  como ` WARN `.
-- **Validado en vivo (0.1.57, 2026-10-06):** cero códigos ANSI en los procesos nuevos de los 4
-  hosts. Antes del upgrade había cientos por servicio en el motherbee (rt-gateway: 564).
+- **What happens:** levels come out as `\x1b[33m WARN\x1b[0m` in `journalctl`. A `grep ' WARN '`
+  finds nothing, and while validating 0.1.52 an error count gave a false 0 until the codes were
+  stripped with `sed 's/\x1b\[[0-9;]*m//g'`.
+- **Why:** each binary builds its own `tracing_subscriber` (36 files), and none turns color off
+  when the output is not a terminal.
+- **Proposed fix:** a tracing init in the SDK with `with_ansi` only if the output is a terminal,
+  used by every binary. It is a mechanical change in 36 files: it goes with the mass-formatting
+  pass (item 8 of the batch), at the operator's decision.
+- **Fix:**
+  - `fluxbee_sdk::logging::fmt()` and `ansi()` only add color when stdout is a terminal.
+  - The 36 tracing startups go through there: the core binaries, the IO/AI/gov/test nodes, the
+    diags and the SY.edge layer.
+  - The mass formatting stays separate; it is the operator's decision.
+- **Verified:** a diag with its output to a pipe went from 48 ESC sequences to 0, and its levels
+  come out as ` WARN `.
+- **Validated live (0.1.57, 2026-10-06):** zero ANSI codes in the new processes on the 4 hosts.
+  Before the upgrade there were hundreds per service on the motherbee (rt-gateway: 564).
 
 
-### A-32 ✅ RESUELTO (0.1.53) — Datos personales en logs y respuestas (frontdesk e identity)
+### A-32 ✅ RESOLVED (0.1.53) — Personal data in logs and responses (frontdesk and identity)
 
-- **Qué pasaba:**
-  - SY.frontdesk.gov escribía en el log, a nivel INFO, el payload de `ILK_REGISTER` (nombre, email,
-    teléfono, empresa), el nombre de empresa que tipeó la persona (`TNT_CREATE`), los primeros 240
-    caracteres de cada mensaje y el id del remitente (en WhatsApp, su teléfono).
-  - Los errores de SY.identity viajaban con su texto libre. Para un email duplicado ese texto trae el
-    DETAIL de Postgres con el email.
-  - SY.identity logueaba el payload de `ILK_PROVISION` (la dirección de la persona) y devolvía el
-    DETAIL de Postgres a quien llamaba.
-- **Arreglo:**
-  - De un registro se loguea `ilk_id`, `tenant_id` y qué campos vinieron, nunca sus valores.
-  - De un error de identity, solo su código.
-  - SY.identity loguea `ich_id` y `channel_type`, y responde el mensaje de Postgres sin el DETAIL.
-  - Tres tests capturan los logs de las tres entradas del frontdesk; con los campos viejos fallan.
+- **What happened:**
+  - SY.frontdesk.gov wrote to the log, at INFO level, the `ILK_REGISTER` payload (name, email,
+    phone, company), the company name the person typed (`TNT_CREATE`), the first 240 characters of
+    each message and the sender's id (on WhatsApp, their phone number).
+  - SY.identity's errors traveled with their free text. For a duplicate email that text carries the
+    Postgres DETAIL with the email.
+  - SY.identity logged the `ILK_PROVISION` payload (the person's address) and returned the Postgres
+    DETAIL to the caller.
+- **Fix:**
+  - For a registration, it logs `ilk_id`, `tenant_id` and which fields came in, never their values.
+  - For an identity error, only its code.
+  - SY.identity logs `ich_id` and `channel_type`, and answers with the Postgres message without the
+    DETAIL.
+  - Three tests capture the logs of the frontdesk's three entry points; with the old fields they
+    fail.
 
-### A-33 ✅ RESUELTO (0.1.53) — SY.frontdesk.gov: rechazos definitivos de identity reportados como reintentables
+### A-33 ✅ RESOLVED (0.1.53) — SY.frontdesk.gov: definitive rejections from identity reported as retryable
 
-- **Qué pasaba:** los errores se clasificaban buscando texto. TENANT_PENDING, ILK_DELETED,
-  SYSTEM_ILK_PROTECTED, DUPLICATE_* y otros terminaban como `IDENTITY_UNAVAILABLE` con
+- **What happened:** errors were classified by searching their text. TENANT_PENDING, ILK_DELETED,
+  SYSTEM_ILK_PROTECTED, DUPLICATE_* and others ended up as `IDENTITY_UNAVAILABLE` with
   `retryable: true`.
-  - **Además:** la respuesta del target de fallback no se revisaba. Un `status:"error"` salía como
-    `registered: true`, un REGISTERED falso. Solo podía pasar con `GOV_IDENTITY_FALLBACK_TARGET`
-    configurado.
-- **Arreglo:**
-  - El bridge devuelve el `IdentityError` del SDK, igual que el orchestrator, y el código de
-    SY.identity se conserva tal cual.
-  - Solo es reintentable lo transitorio: sin respuesta, NOT_PRIMARY, DB_NOT_READY y DB_WRITE_FAILED.
-  - Las dos respuestas pasan por el mismo chequeo de estado.
+  - **Also:** the fallback target's response was not checked. A `status:"error"` came out as
+    `registered: true`, a false REGISTERED. It could only happen with
+    `GOV_IDENTITY_FALLBACK_TARGET` configured.
+- **Fix:**
+  - The bridge returns the SDK's `IdentityError`, just like the orchestrator, and SY.identity's
+    code is kept as is.
+  - Only transient errors are retryable: no response, NOT_PRIMARY, DB_NOT_READY and
+    DB_WRITE_FAILED.
+  - Both responses go through the same status check.
 
-### A-34 ✅ RESUELTO (0.1.53) — Cognition: el arranque en frío nunca corría y reconstruía mal
+### A-34 ✅ RESOLVED (0.1.53) — Cognition: the cold start never ran, and it rebuilt wrongly
 
-- **Qué pasaba (visto en PROD y en una revisión del código):**
-  - **El rebuild nunca corría.** La credencial de Postgres llega del vault después del arranque y el
-    rebuild solo se intentaba al iniciar.
-  - **Reconstruía con otras claves.** Indexaba por id de entidad mientras el camino en vivo indexa
-    por etiqueta. Después de un reinicio, el siguiente turno duplicaba contextos, razones y memorias
-    con el mismo id.
-  - **El estado en vivo no se podaba nunca.**
-  - **Un scope no se cortaba jamás:** un cambio de tema sostenido lo renombraba en vez de cortarlo.
-  - **`storage.enabled: true` estaba fijo** en CONFIG_GET.
-  - **El texto determinístico de los episodios nunca se enviaba.**
-- **Arreglo:**
+- **What happened (seen in PROD and in a code review):**
+  - **The rebuild never ran.** The Postgres credential arrives from the vault after startup, and
+    the rebuild was only attempted at startup.
+  - **It rebuilt with other keys.** It indexed by entity id while the live path indexes by label.
+    After a restart, the next turn duplicated contexts, reasons and memories with the same id.
+  - **The live state was never pruned.**
+  - **A scope was never cut:** a sustained topic change renamed it instead of cutting it.
+  - **`storage.enabled: true` was hardcoded** in CONFIG_GET.
+  - **The deterministic text of the episodes was never sent.**
+- **Fix:**
   - **Rebuild:**
-    - Espera al vault al arrancar (el patrón de A-26, hasta 60 s).
-    - Si igual no carga, lo reintenta el primer turno, una sola vez y dentro de la tarea de turnos.
-    - Arma el estado con las mismas claves que el camino en vivo y solo se instala sobre un estado
-      vacío.
-    - Los episodios recuperan su instancia real.
-  - **Poda:** el estado en vivo se recorta al mismo conjunto que entra en la SHM `jsr-memory`.
-  - **Scopes:** un cambio de tema sostenido corta el scope; uno que todavía liga es deriva y lo
-    reetiqueta. El dominante se elige de forma determinística.
-  - **CONFIG_GET:** informa `storage.db_configured` real.
-  - **Episodios:** su texto es el del resumidor de IA.
-  - Tests nuevos para cada caso; cada uno se verificó fallando sin su arreglo.
+    - It waits for the vault at startup (the A-26 pattern, up to 60 s).
+    - If it still does not load, the first turn retries it, only once and inside the turn task.
+    - It builds the state with the same keys as the live path, and it only installs over an empty
+      state.
+    - Episodes get their real instance back.
+  - **Pruning:** the live state is trimmed to the same set that goes into the `jsr-memory` SHM.
+  - **Scopes:** a sustained topic change cuts the scope; one that still binds is drift, and it
+    relabels the scope. The dominant one is chosen deterministically.
+  - **CONFIG_GET:** reports the real `storage.db_configured`.
+  - **Episodes:** their text is the AI summarizer's.
+  - New tests for each case; each one was verified to fail without its fix.
 
-### A-35 ✅ RESUELTO (0.1.53) — ai.generic pedía la clave de IA por nombre
+### A-35 ✅ RESOLVED (0.1.53) — ai.generic asked for the AI key by name
 
-- **Qué pasaba:** desde julio (`ai-engine-selection.md` D2/D3), un nodo `AI.*` tenía que nombrar su
-  clave (`behavior.vault_key`). Sin esa clave, su config se rechazaba.
-- **Decisión del operador (2026-10-02, D4):** *"La clave de IA la debería tomar del vault con la
-  clave general (sin asignación de nombre)."*
-- **Arreglo:**
-  - El proveedor es el del hive (`hive.yaml` `ai`) y la clave es la general de ese proveedor en
-    SY.vault: la del tenant del nodo y, si no hay, la del raíz. Es lo mismo que hacen los SY.* y el
-    frontdesk.
-  - `behavior.vault_key` se rechaza con un mensaje que lo nombra.
+- **What happened:** since July (`ai-engine-selection.md` D2/D3), an `AI.*` node had to name its
+  key (`behavior.vault_key`). Without that key, its config was rejected.
+- **The operator's decision (2026-10-02, D4):** *"La clave de IA la debería tomar del vault con la
+  clave general (sin asignación de nombre)."* ("It should take the AI key from the vault, with the
+  general key (no name assignment).")
+- **Fix:**
+  - The provider is the hive's (`hive.yaml` `ai`), and the key is that provider's general key in
+    SY.vault: the one of the node's tenant and, if there is none, the root's. It is the same thing
+    the SY.* nodes and the frontdesk do.
+  - `behavior.vault_key` is rejected with a message that names it.
 
-### A-36 ✅ RESUELTO (0.1.53) — La instalación base levantaba una instancia de prueba y Archi conocía runtimes inexistentes
+### A-36 ✅ RESOLVED (0.1.53) — The base install brought up a test instance, and Archi knew of runtimes that do not exist
 
-- **Qué pasaba:**
-  - `AI.chat@motherbee`, el nodo de ejemplo de marzo, arrancaba con cada instalación como si fuera
+- **What happened:**
+  - `AI.chat@motherbee`, the example node from March, started with every install as if it were
     base.
-  - Las semillas del cookbook le decían a Archi que los paquetes `config_only` usaran
-    `runtime_base: "AI.common"`, que no existe.
-  - El handbook que carga Archi decía que `ai.chat` es un runtime.
-  - Un ejemplo del architect lanzaba un nodo sin runtime, que se habría derivado a `ai.chat`.
-  - Una ayuda del architect tenía UTF-8 codificado dos veces ("catÃ¡logo").
-- **Arreglo:**
-  - `ai.generic` queda horneado y sin instancia de arranque. Las instancias se crean para algo
-    concreto; las de prueba son efímeras (operador, 2026-10-02).
-  - Todo apunta a `ai.generic`: admin, architect, handbook, semillas, docs y scripts.
-  - Se borraron `install-ia.sh` y `ai-nodectl.sh` (el modelo de unit systemd por nodo de marzo) y
-    los flags deprecados de los scripts de publicación.
-- **PROD:** la instancia `AI.chat@motherbee` que ya existe queda en FAILED_CONFIG, porque su config
-  tiene `vault_key`. Se borra o se reconfigura a pedido del operador.
+  - The cookbook seeds told Archi that `config_only` packages should use
+    `runtime_base: "AI.common"`, which does not exist.
+  - The handbook that Archi loads said that `ai.chat` is a runtime.
+  - An architect example launched a node with no runtime, which would have been derived to
+    `ai.chat`.
+  - An architect help text had double-encoded UTF-8 ("catÃ¡logo").
+- **Fix:**
+  - `ai.generic` stays baked in, with no startup instance. Instances are created for something
+    concrete; test ones are ephemeral (operator, 2026-10-02).
+  - Everything points to `ai.generic`: admin, architect, handbook, seeds, docs and scripts.
+  - `install-ia.sh` and `ai-nodectl.sh` (March's per-node systemd unit model) were deleted, along
+    with the deprecated flags of the publishing scripts.
+- **PROD:** the `AI.chat@motherbee` instance that already exists stays in FAILED_CONFIG, because its
+  config has `vault_key`. It gets deleted or reconfigured when the operator asks.
 
-### A-37 ✅ RESUELTO (0.1.54 + 0.1.55) — SY.frontdesk.gov: el camino de tenants y el merge por email
+### A-37 ✅ RESOLVED (0.1.54 + 0.1.55) — SY.frontdesk.gov: the tenant path and the merge by email
 
-**Decisiones del operador (2026-10-02):**
+**The operator's decisions (2026-10-02):**
 
-- Sobre tenants: *"no da para crear un tenant por un mensaje que llegue de un humano que no esté
-  registrado; ahora el tenant se crea desde el cloud y tiene un proceso"*.
-- Sobre el merge: *"haría merge sobre datos que no están… si no coinciden los datos y mandan un update
-  queda lo último"*.
+- On tenants: *"no da para crear un tenant por un mensaje que llegue de un humano que no esté
+  registrado; ahora el tenant se crea desde el cloud y tiene un proceso"* ("it makes no sense to
+  create a tenant because of a message from a human who is not registered; now the tenant is
+  created from the cloud and it has a process").
+- On the merge: *"haría merge sobre datos que no están… si no coinciden los datos y mandan un update
+  queda lo último"* ("I would merge over data that is missing… if the data doesn't match and they
+  send an update, the latest stays").
 
-**Tenant del caso:**
+**The case's tenant:**
 
-- Es el del ILK temporal, que SY.identity registró al provisionarlo bajo el tenant del nodo IO. El
-  frontdesk lo lee del SHM de identity.
-- El `tenant_id` de un handoff solo tiene que coincidir; si no, `INVALID_REQUEST`.
-- Sin tenant legible responde `TENANT_UNRESOLVED` y no registra.
-- El frontdesk ya no crea tenants: SY.identity le quitó el permiso de `TNT_CREATE`, `TNT_UPDATE` y
-  `TNT_SET_SPONSOR`.
-- Ni la persona ni el LLM eligen el tenant.
+- It is the temporary ILK's, which SY.identity registered when it provisioned it under the IO
+  node's tenant. The frontdesk reads it from identity's SHM.
+- A handoff's `tenant_id` only has to match; if it does not, `INVALID_REQUEST`.
+- With no readable tenant it answers `TENANT_UNRESOLVED` and does not register.
+- The frontdesk no longer creates tenants: SY.identity took away its permission for `TNT_CREATE`,
+  `TNT_UPDATE` and `TNT_SET_SPONSOR`.
+- Neither the person nor the LLM chooses the tenant.
 
-**Estado del tenant:** `ILK_REGISTER` en un tenant suspendido ahora se rechaza (`TENANT_SUSPENDED`),
-igual que en uno pendiente.
+**The tenant's state:** `ILK_REGISTER` on a suspended tenant is now rejected (`TENANT_SUSPENDED`),
+just like on a pending one.
 
-**Merge por email**, dentro de `ILK_REGISTER` de SY.identity:
+**Merge by email**, inside SY.identity's `ILK_REGISTER`:
 
-- **Cuándo:** el email ya es de otro humano activo del mismo tenant y el que se registra es un
-  temporal de ese tenant.
-- **Qué hace:** los canales se mueven (antes se copiaban, un bug) y el temporal queda como alias.
-- **Los datos:** solo se completan los campos vacíos; nunca se pisa un valor.
-- **La respuesta:** `merged:true`; el frontdesk responde `MERGED`.
-- **Gana lo último:** un `ILK_REGISTER` del propio ILK, por ejemplo un `register_human` repetido,
-  reemplaza la identificación.
-- **io.cloud:** `register_human` informa el ILK final, `merged` y el temporal de origen.
+- **When:** the email already belongs to another active human of the same tenant, and the one
+  registering is a temporary of that tenant.
+- **What it does:** the channels are moved (before, they were copied: a bug) and the temporary
+  stays as an alias.
+- **The data:** only empty fields are filled in; a value is never overwritten.
+- **The response:** `merged:true`; the frontdesk answers `MERGED`.
+- **The latest wins:** an `ILK_REGISTER` from the ILK itself, for example a repeated
+  `register_human`, replaces the identification.
+- **io.cloud:** `register_human` reports the final ILK, `merged` and the source temporary.
 
-**Además:**
+**Also:**
 
-- Las búsquedas por email son por tenant, como el índice de la base.
-- Un handoff fallido conserva el tenant del caso (G7).
-- Los tests de logs sin datos personales eran inestables; quedaron estables.
+- Email lookups are per tenant, like the database index.
+- A failed handoff keeps the case's tenant (G7).
+- The tests of logs without personal data were flaky; they became stable.
 
-**Cerrado en 0.1.55:**
+**Closed in 0.1.55:**
 
-- **Tenant raíz:** nadie se registra ahí. Decisión del operador (2026-10-02): *"nadie se puede
-  registrar en tenant raíz"*.
-  - SY.identity rechaza el `ILK_REGISTER` de una persona en el tenant raíz con
-    `TENANT_ROOT_NOT_REGISTRABLE`, venga de quien venga. Los ILKs de nodos (`agent`) se siguen
-    registrando ahí.
-  - El frontdesk corta antes, sin LLM ni SY.identity, y responde `TENANT_NOT_REGISTRABLE`. La
-    persona queda temporal.
-  - Los nodos IO lanzados desde el tenant raíz quedan como A-43.
-- **El gate de frontdesk de io.slack e io.wapp** (`io-common`) armaba el handoff como mensaje
-  `data`, pero el frontdesk solo toma handoffs de mensajes `user`. El handoff nunca llegaba a su
-  camino determinístico. Ahora va como `user`, igual que el de io.cloud.
-- **Los e2e de laboratorio de identity:** cuatro diags creaban sus tenants con el nombre del
-  frontdesk y recibían `UNAUTHORIZED_REGISTRAR`. Eran `identity_merge`, `identity_negative`,
-  `identity_provision_complete` e `identity_replica_sync`.
-  - Ahora el script crea los tenants por SY.admin, se los pasa al diag y los purga al final. Lo común
-    quedó en `scripts/lib/identity_e2e.sh`.
-  - El de réplica además comprueba por SY.admin que el tenant y el ILK llegan a la réplica.
-  - El wrapper `gov_frontdesk_identity_e2e.sh` ya no trae hives viejos (`sandbox`, `worker-220`).
-- **Los diags se hacen pasar por el frontdesk:** se conectan con su nombre y con el UUID que el
-  frontdesk persistió.
-  - Mientras corren, el router les entrega el tráfico del frontdesk.
-  - Cuando se van, el frontdesk real queda conectado pero sin ruta hasta que reconecta (A-44).
-  - Los scripts ahora paran `sy-frontdesk-gov` mientras corre el diag y lo vuelven a arrancar.
+- **Root tenant:** nobody registers there. The operator's decision (2026-10-02): *"nadie se puede
+  registrar en tenant raíz"* ("nobody can register in the root tenant").
+  - SY.identity rejects a person's `ILK_REGISTER` in the root tenant with
+    `TENANT_ROOT_NOT_REGISTRABLE`, no matter who it comes from. Node ILKs (`agent`) are still
+    registered there.
+  - The frontdesk cuts it off earlier, with no LLM and no SY.identity, and answers
+    `TENANT_NOT_REGISTRABLE`. The person stays temporary.
+  - IO nodes launched from the root tenant remain as A-43.
+- **The frontdesk gate of io.slack and io.wapp** (`io-common`) built the handoff as a `data`
+  message, but the frontdesk only takes handoffs from `user` messages. The handoff never reached
+  its deterministic path. Now it goes as `user`, like io.cloud's.
+- **The identity lab e2e tests:** four diags created their tenants with the frontdesk's name and
+  got `UNAUTHORIZED_REGISTRAR`. They were `identity_merge`, `identity_negative`,
+  `identity_provision_complete` and `identity_replica_sync`.
+  - Now the script creates the tenants through SY.admin, passes them to the diag and purges them at
+    the end. The shared parts went into `scripts/lib/identity_e2e.sh`.
+  - The replica one also checks through SY.admin that the tenant and the ILK reach the replica.
+  - The `gov_frontdesk_identity_e2e.sh` wrapper no longer brings old hives (`sandbox`,
+    `worker-220`).
+- **The diags impersonate the frontdesk:** they connect with its name and with the UUID the
+  frontdesk persisted.
+  - While they run, the router delivers the frontdesk's traffic to them.
+  - When they leave, the real frontdesk stays connected but with no route until it reconnects
+    (A-44).
+  - The scripts now stop `sy-frontdesk-gov` while the diag runs, and start it again afterwards.
 
-**Quedan abiertos:**
+**Still open:**
 
-- 🔴 **Seguridad:** no hay prueba de que el email sea de quien lo escribe (A-42, postergado).
-- **G6 y G8:** los contadores de §12 y los reintentos conversacionales.
+- 🔴 **Security:** there is no proof that the email belongs to whoever writes it (A-42, deferred).
+- **G6 and G8:** the §12 counters and the conversational retries.
 
-### A-38 ✅ RESUELTO (0.1.54) — Cognition: preguntas de diseño
+### A-38 ✅ RESOLVED (0.1.54) — Cognition: design questions
 
-Respuesta del operador (2026-10-02): *"sí a todo"*.
+The operator's answer (2026-10-02): *"sí a todo"* ("yes to everything").
 
-- **Umbrales:** `context_open`/`reason_open` pasan a llamarse por lo que hacen,
-  `config.thresholds.context_close` / `reason_close`, con default 0,25 (el mismo efecto que antes).
-  CONFIG_SET rechaza las claves viejas por nombre y cualquier otra clave desconocida. La config
-  persistida de PROD con las viejas arranca con los defaults, que dan el mismo comportamiento, y
-  deja un warning.
-- **Región llena:** gana lo reciente. El hilo del turno actual nunca se descarta y después va el
-  visto más recientemente.
-- **Corte de scope:** se mantiene en el 6.º mensaje divergente sostenido (5.º si el scope tiene un
-  turno, 7.º si está muy reforzado), escrito en la spec §8.3 y fijado por test.
-- **Sigue sin ensamblar** (capítulo aparte): memoria entre hilos, LanceDB, que lo de los workers
-  llegue al motherbee, y lectores de las tablas.
+- **Thresholds:** `context_open`/`reason_open` are renamed after what they do,
+  `config.thresholds.context_close` / `reason_close`, with a default of 0.25 (the same effect as
+  before). CONFIG_SET rejects the old keys by name, and any other unknown key. The persisted PROD
+  config with the old ones starts with the defaults, which give the same behavior, and leaves a
+  warning.
+- **Full region:** the recent wins. The current turn's thread is never dropped, and after it comes
+  the most recently seen.
+- **Scope cut:** it stays at the 6th sustained divergent message (5th if the scope has one turn,
+  7th if it is heavily reinforced), written in the spec §8.3 and pinned by a test.
+- **Still not assembled** (a separate chapter): cross-thread memory, LanceDB, getting what is on
+  the workers to reach the motherbee, and readers of the tables.
 
-### A-39 ✅ RESUELTO (0.1.54, a validar en el deploy) — En cada release, los nodos administrados de motherbee caían entre 20 y 80 s (`203/EXEC`)
+### A-39 ✅ RESOLVED (0.1.54, to be validated in the deploy) — On every release, the motherbee's managed nodes went down for 20 to 80 s (`203/EXEC`)
 
-- **Qué pasa (visto al validar 0.1.53, y preexistente: AI.chat sumó 104 fallas en 30 días):**
-  1. Al desempaquetar la versión nueva, dpkg borra los archivos del paquete viejo, y los directorios
-     `dist/runtimes/<rt>/<versión vieja>` venían en ese paquete.
-  2. Durante el update las units de los nodos administrados se reinician con el `ExecStart` viejo,
-     que apunta a un directorio que ya no existe: loop de `status=203/EXEC`.
-  3. Recién cuando arranca el orchestrator nuevo, ve que `current` se movió y las reapunta.
-- **Evidencia 0.1.53:**
-  - AI.chat, IO.api, IO.blob, IO.cloud e IO.slack.default: 5 fallas entre 20:32:10 y 20:32:31.
-    Reapuntadas a las 20:32:34 ("runtime 'current' pointer moved; rebinding node").
-  - IO.wapp.default: 17 fallas, hasta las 20:33:33; el reconcile la había salteado como "visible".
-- **Impacto:** IO.api e IO.cloud, lo que da la cara al público, quedan sin servicio en cada upgrade.
-- **Quién los reiniciaba:** `needrestart`, el hook de apt de Ubuntu. Después de dpkg reinicia los
-  servicios que corren binarios borrados, y su `ExecStart` viejo apunta al directorio que ya no
-  existe.
-- **El otro lado del bug:** el reconcile de arranque salteaba los nodos que estaban corriendo.
-  Uno que nadie reiniciaba quedaba en el binario viejo indefinidamente; los reparaba solo porque
-  `needrestart` los había hecho caer.
-- **Arreglo (`779df4c`):**
-  - El reconcile de arranque, que corre después de cada upgrade y cada core-update, relanza en la
-    versión nueva al nodo que sigue a `current` cuando el puntero se movió: un reinicio controlado.
-    El loop de 60 s no lo hace, así que una publicación en caliente se comporta como antes.
-  - El paquete instala `/etc/needrestart/conf.d/fluxbee.conf`, que deja las units `fluxbee-node-*`
-    al orchestrator (verificado contra el código de `needrestart`).
-
-
-### A-40 ✅ RESUELTO (0.1.55) — IO.slack.default no tenía su ILK en identity (PROD)
-
-- **Qué pasaba:** su config apuntaba a `ilk:9cd1bb44…`, pero SY.identity respondía `NOT_FOUND`, así
-  que cada `CONFIG_SET` fallaba al registrar su propio canal y el nodo quedaba en FAILED_CONFIG.
-  Probablemente lo borró la primera corrida del factory reset del 28/09.
-- **Decisión del operador (2026-10-02):** *"io.slack es parte del sistema pero funciona
-  instanciándose, no corre solo… corre con su propio tenant que lo lanza"*.
-- **Cómo se cerró:**
-  - `io.slack` queda horneado y sin instancia de arranque en `base-nodes.json`;
-  - cada binding lo lanza su tenant;
-  - la instancia de PROD, que corría en el tenant raíz, se borró con purga. Su config quedó guardada
-    fuera del repo para recrear el binding desde un tenant.
-
-### A-41 ✅ RESUELTO (0.1.54) — Purgar un nodo dejaba su UUID persistido
-
-- **Qué pasaba:** `purge_instance` borraba el directorio, el ILK y el mapeo, pero no
-  `state/nodes/<nombre>.uuid`. En PROD había 12, de nodos ya borrados: AI.chat, los de prueba del
-  factory reset y bindings viejos de Slack. Un nodo nuevo con el mismo nombre heredaba el UUID viejo.
-- **Arreglo (`7c9f781`):** las dos rutas de purga lo borran y lo informan (`uuid_file_removed`). Se
-  borraron los 12 de PROD.
+- **What happens (seen while validating 0.1.53, and pre-existing: AI.chat racked up 104 failures
+  in 30 days):**
+  1. When unpacking the new version, dpkg deletes the old package's files, and the
+     `dist/runtimes/<rt>/<old version>` directories came in that package.
+  2. During the update, the managed nodes' units restart with the old `ExecStart`, which points to
+     a directory that no longer exists: a `status=203/EXEC` loop.
+  3. Only when the new orchestrator starts does it see that `current` moved, and it repoints them.
+- **Evidence 0.1.53:**
+  - AI.chat, IO.api, IO.blob, IO.cloud and IO.slack.default: 5 failures between 20:32:10 and
+    20:32:31. Repointed at 20:32:34 ("runtime 'current' pointer moved; rebinding node").
+  - IO.wapp.default: 17 failures, until 20:33:33; the reconcile had skipped it as "visible".
+- **Impact:** IO.api and IO.cloud, the public-facing ones, are left without service on every
+  upgrade.
+- **Who restarted them:** `needrestart`, Ubuntu's apt hook. After dpkg, it restarts the services
+  that run deleted binaries, and their old `ExecStart` points to the directory that no longer
+  exists.
+- **The other side of the bug:** the startup reconcile skipped the nodes that were running. One
+  that nobody restarted stayed on the old binary indefinitely; it repaired them only because
+  `needrestart` had knocked them down.
+- **Fix (`779df4c`):**
+  - The startup reconcile, which runs after every upgrade and every core-update, relaunches on the
+    new version a node that follows `current` when the pointer moved: a controlled restart. The
+    60 s loop does not do it, so a hot publish behaves as before.
+  - The package installs `/etc/needrestart/conf.d/fluxbee.conf`, which leaves the
+    `fluxbee-node-*` units to the orchestrator (verified against `needrestart`'s code).
 
 
-### A-42 🔴 POSTERGADO (paquete de seguridad) — El merge por email no verifica que el email sea de quien lo escribe
+### A-40 ✅ RESOLVED (0.1.55) — IO.slack.default did not have its ILK in identity (PROD)
 
-- **Qué pasa (desde 0.1.54, A-37):** si alguien escribe el email de otra persona del mismo tenant,
-  SY.identity hace el merge y su canal queda asociado al ILK de esa persona. Lo enrutan como si fuera
-  ella y puede completar los campos que estén vacíos.
-- **Decisión del operador (2026-10-02):** *"levántalo y dejamos para después"*. Va con el paquete de
-  seguridad (A-22).
-- **Arreglo previsto:** una prueba de pertenencia antes del merge, por ejemplo un código de un solo
-  uso al email.
+- **What happened:** its config pointed to `ilk:9cd1bb44…`, but SY.identity answered `NOT_FOUND`,
+  so every `CONFIG_SET` failed when registering its own channel, and the node stayed in
+  FAILED_CONFIG. It was probably deleted by the first run of the factory reset on 28/09.
+- **The operator's decision (2026-10-02):** *"io.slack es parte del sistema pero funciona
+  instanciándose, no corre solo… corre con su propio tenant que lo lanza"* ("io.slack is part of
+  the system, but it works by being instantiated, it doesn't run on its own… it runs with its own
+  tenant, which launches it").
+- **How it was closed:**
+  - `io.slack` stays baked in, with no startup instance in `base-nodes.json`;
+  - each binding is launched by its tenant;
+  - the PROD instance, which ran in the root tenant, was deleted with a purge. Its config was saved
+    outside the repo, to recreate the binding from a tenant.
 
-### A-43 ✅ RESUELTO (0.1.56) — Nodos IO lanzados desde el tenant raíz
+### A-41 ✅ RESOLVED (0.1.54) — Purging a node left its UUID persisted
 
-- **Qué pasaba:** la instalación base levantaba nodos IO de canal en el tenant raíz
-  (`IO.api@motherbee`, `IO.wapp.default@motherbee`). Una persona que llegaba por uno de ellos quedaba
-  temporal, porque desde 0.1.55 nadie se registra en el tenant raíz.
-- **Decisión del operador (2026-10-02):** *"algunos nodos IO tienen que correr con el tenant raíz,
-  ej io.cloud io.blob los demás no"*; *"todos quedan para poder usarlos pero no corriendo default.
-  Solo io.cloud y io.blob por ahora"*.
-- **Arreglo (`4a9249f`):**
-  - El SDK define `ROOT_TENANT_IO_RUNTIMES` (io.cloud, io.blob).
-  - El orchestrator rechaza cualquier otro nodo IO en el tenant raíz con `TENANT_ROOT_NOT_ALLOWED`
-    en los tres lugares donde lanza un nodo:
-    - `run_node`, que cubre admin, Cloud, Archi, firstboot y los reenvíos;
+- **What happened:** `purge_instance` deleted the directory, the ILK and the mapping, but not
+  `state/nodes/<name>.uuid`. In PROD there were 12, from nodes already deleted: AI.chat, the
+  factory reset test ones and old Slack bindings. A new node with the same name inherited the old
+  UUID.
+- **Fix (`7c9f781`):** both purge paths delete it and report it (`uuid_file_removed`). The 12 in
+  PROD were deleted.
+
+
+### A-42 🔴 DEFERRED (security package) — The merge by email does not verify that the email belongs to whoever writes it
+
+- **What happens (since 0.1.54, A-37):** if someone writes the email of another person in the same
+  tenant, SY.identity does the merge, and their channel becomes associated with that person's ILK.
+  They are routed as if they were that person, and they can fill in the fields that are empty.
+- **The operator's decision (2026-10-02):** *"levántalo y dejamos para después"* ("raise it and
+  we'll leave it for later"). It goes with the security package (A-22).
+- **Planned fix:** a proof of ownership before the merge, for example a one-time code sent to the
+  email.
+
+### A-43 ✅ RESOLVED (0.1.56) — IO nodes launched from the root tenant
+
+- **What happened:** the base install brought up channel IO nodes in the root tenant
+  (`IO.api@motherbee`, `IO.wapp.default@motherbee`). A person who arrived through one of them
+  stayed temporary, because since 0.1.55 nobody registers in the root tenant.
+- **The operator's decision (2026-10-02):** *"algunos nodos IO tienen que correr con el tenant raíz,
+  ej io.cloud io.blob los demás no"* ("some IO nodes have to run with the root tenant, e.g.
+  io.cloud io.blob, the rest don't"); *"todos quedan para poder usarlos pero no corriendo default.
+  Solo io.cloud y io.blob por ahora"* ("they all stay so they can be used, but not running by
+  default. Only io.cloud and io.blob for now").
+- **Fix (`4a9249f`):**
+  - The SDK defines `ROOT_TENANT_IO_RUNTIMES` (io.cloud, io.blob).
+  - The orchestrator rejects any other IO node in the root tenant with `TENANT_ROOT_NOT_ALLOWED`
+    in the three places where it launches a node:
+    - `run_node`, which covers admin, Cloud, Archi, firstboot and the forwards;
     - start/restart;
-    - el relanzamiento al arrancar. Si un nodo ya corre, lo deja corriendo.
-  - io.api e io.wapp quedan horneados y sin instancia de base; firstboot solo levanta IO.cloud e
+    - the relaunch at startup. If a node is already running, it leaves it running.
+  - io.api and io.wapp stay baked in, with no base instance; firstboot only brings up IO.cloud and
     IO.blob.
-  - Archi nunca elige el tenant raíz para un nodo IO.
+  - Archi never picks the root tenant for an IO node.
   - Docs: `715143a`.
-- **PROD:** el operador purgó `IO.api@motherbee` e `IO.wapp.default@motherbee` antes del deploy de
-  0.1.56; desde la sesión lo bloqueaba el clasificador de permisos. En 30 días no habían tenido uso y
-  sus configs quedaron guardadas fuera del repo.
-- **Validado en vivo (0.1.56):** un `run_node` de io.api en el tenant raíz da
-  `TENANT_ROOT_NOT_ALLOWED` y no deja nada creado.
-- **io.web (operador, 2026-10-03):** *"io.web también va en el core, la idea es que los IO que se
-  requieren como recursos compartidos y no porque una solución lo requiera, corren en el core"*.
-  - Quedó en `ROOT_TENANT_IO_RUNTIMES`, aunque todavía no existe: hay solo una spec.
-  - Su spec lo declara en `system_nodes`; cuando se construya, va como IO.blob e IO.cloud (runtime
-    managed `boot=true`).
-- **El runbook de LinkedHelper de Noelia** lanza el nodo en el tenant raíz. Lo ve el operador.
+- **PROD:** the operator purged `IO.api@motherbee` and `IO.wapp.default@motherbee` before the
+  0.1.56 deploy; from the session, the permissions classifier blocked it. In 30 days they had not
+  been used, and their configs were saved outside the repo.
+- **Validated live (0.1.56):** a `run_node` of io.api in the root tenant gives
+  `TENANT_ROOT_NOT_ALLOWED` and leaves nothing created.
+- **io.web (operator, 2026-10-03):** *"io.web también va en el core, la idea es que los IO que se
+  requieren como recursos compartidos y no porque una solución lo requiera, corren en el core"*
+  ("io.web also goes in the core; the idea is that the IO nodes that are required as shared
+  resources, and not because a solution requires them, run in the core").
+  - It went into `ROOT_TENANT_IO_RUNTIMES`, even though it does not exist yet: there is only a
+    spec.
+  - Its spec declares it in `system_nodes`; when it is built, it goes like IO.blob and IO.cloud
+    (managed runtime, `boot=true`).
+- **Noelia's LinkedHelper runbook** launches the node in the root tenant. The operator is looking
+  into it.
 
-### A-44 ✅ RESUELTO (0.1.55 + 0.1.56) — Dos conexiones con un mismo UUID: la segunda se queda con la ruta
+### A-44 ✅ RESOLVED (0.1.55 + 0.1.56) — Two connections with the same UUID: the second one takes the route
 
-Visto al arreglar los e2e de A-37, leyendo `src/router/mod.rs` y `src/shm/mod.rs`.
+Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/mod.rs`.
 
-- **Qué pasaba en el router:**
-  - Un HELLO con un UUID que ya tenía una conexión viva reemplazaba su entrada en la tabla de
-    nodos.
-  - Cuando la nueva se cerraba, la vieja quedaba conectada pero sin ruta.
-- **Decisión del operador (2026-10-02):** *"rechazar la nueva, no veo porque deba aparecer una en el
-  esquema normal"*.
-- **Lo que mostró verificarlo antes:**
-  - **Bug preexistente:** si una conexión terminaba por error (de lectura, un OPA_RELOAD
-    inválido, un reenvío a pares, `handle_message`), el router no la limpiaba. La entrada quedaba en
-    la tabla y el socket abierto: un nodo vivo seguía conectado sin que nadie leyera sus mensajes.
-    Con "rechazar la nueva" eso se volvía un bloqueo permanente.
-  - **Duplicados pasajeros en el esquema normal:**
-    - todo nodo Go manda dos HELLO al arrancar;
-    - un nodo puede reconectar antes de que el router procese el cierre de la conexión anterior.
-- **Arreglo (`068014d`, 0.1.56):**
-  - Toda conexión termina limpiando su entrada; un mensaje que no se puede procesar se loguea y se
-    saltea.
-  - Un HELLO con un UUID ocupado espera hasta 1 s a que la conexión anterior se vaya; si sigue viva,
-    se rechaza sin ANNOUNCE y con WARN. El chequeo y la inserción van bajo un mismo lock.
-  - El SDK loguea el handshake rechazado.
-  - El diag negativo de identity usa una conexión por nombre.
-  - Los e2e de identity corren con `timeout`: sus reintentos esperaban un error que ningún binario
-    imprime.
-  - Tres de los cuatro tests nuevos fallan con el código anterior.
-- **SHM del router (0.1.55):**
-  - `register_node` duplicaba a un nodo que se registraba de nuevo.
-  - El lector perdía el último nodo cuando había un hueco.
-- **Quedan anotados:**
-  - el doble HELLO del SDK de Go: lo absorbe la espera, pero el SDK podría reusar la primera
-    conexión;
-  - el SDK de Rust no tiene timeout de handshake: un router que acepta y no contesta lo deja
-    colgado.
+- **What happened in the router:**
+  - A HELLO with a UUID that already had a live connection replaced its entry in the node
+    table.
+  - When the new one closed, the old one stayed connected but with no route.
+- **The operator's decision (2026-10-02):** *"rechazar la nueva, no veo porque deba aparecer una en el
+  esquema normal"* ("reject the new one, I don't see why one should show up in the normal
+  scheme").
+- **What checking it first showed:**
+  - **A pre-existing bug:** if a connection ended with an error (a read error, an invalid
+    OPA_RELOAD, a forward to peers, `handle_message`), the router did not clean it up. The entry
+    stayed in the table and the socket open: a live node stayed connected with nobody reading its
+    messages. With "rechazar la nueva" ("reject the new one") that turned into a permanent block.
+  - **Transient duplicates in the normal scheme:**
+    - every Go node sends two HELLOs at startup;
+    - a node can reconnect before the router processes the close of the previous connection.
+- **Fix (`068014d`, 0.1.56):**
+  - Every connection ends by cleaning up its entry; a message that cannot be processed is logged
+    and skipped.
+  - A HELLO with a UUID in use waits up to 1 s for the previous connection to go away; if it is
+    still alive, it is rejected with no ANNOUNCE and with a WARN. The check and the insert run
+    under the same lock.
+  - The SDK logs the rejected handshake.
+  - The negative identity diag uses one connection per name.
+  - The identity e2e tests run with `timeout`: their retries waited for an error that no binary
+    prints.
+  - Three of the four new tests fail with the previous code.
+- **The router's SHM (0.1.55):**
+  - `register_node` duplicated a node that registered again.
+  - The reader lost the last node when there was a gap.
+- **Noted for later:**
+  - the Go SDK's double HELLO: the wait absorbs it, but the SDK could reuse the first
+    connection;
+  - the Rust SDK has no handshake timeout: a router that accepts and does not answer leaves it
+    hanging.
 
-### A-45 ✅ RESUELTO Y MEDIDO (0.1.57) — Cada upgrade del motherbee apaga todo el core antes de desempaquetar
+### A-45 ✅ RESOLVED AND MEASURED (0.1.57) — Every motherbee upgrade shuts down the whole core before unpacking
 
-- **Qué pasa (medido en el deploy de 0.1.55):**
-  - El `prerm` del paquete (`packaging/deb-prerm`) para todos los servicios del core antes de
-    desempaquetar, también en un upgrade.
-  - El `postinst` arranca solo el orchestrator, que después levanta el resto.
-- **Caída medida:** rt-gateway 70 s, sy-admin 76 s, sy-vault 78 s, sy-storage 84 s, sy-identity
+- **What happens (measured in the 0.1.55 deploy):**
+  - The package's `prerm` (`packaging/deb-prerm`) stops every core service before unpacking, also
+    on an upgrade.
+  - The `postinst` starts only the orchestrator, which then brings up the rest.
+- **Measured outage:** rt-gateway 70 s, sy-admin 76 s, sy-vault 78 s, sy-storage 84 s, sy-identity
   86 s.
-- **Impacto:** mientras tanto el motherbee no tiene router, identity ni admin.
-  - IO.api e IO.cloud no atienden: el público ve 502.
-  - Las réplicas de identity reintentan cada segundo (~2 avisos por segundo).
-  - No se puede provisionar a nadie.
-- **Por qué está así:** el `prerm` dice "stop + disable services before removal", pero corre igual
-  en un upgrade.
-- **Propuesta:** que el `prerm` pare los servicios solo al desinstalar, y que en un upgrade el
-  `postinst` los reinicie después de desempaquetar. Linux mantiene corriendo el binario viejo
-  hasta el reinicio, así que la caída quedaría en lo que tarda cada reinicio.
-- **A decidir:** el orden de los reinicios, y si los hace el `postinst` o el orchestrator.
-- **Operador (2026-10-02):** *"no me parece mal"*.
-- **Arreglo (`1a10cab`):**
-  - En un upgrade el `prerm` para solo a los que escriben el manifest de runtimes:
-    sy-orchestrator, sy-admin y sy-wf-rules. El `postinst` cuenta con eso al registrar los runtimes.
-  - El resto sigue sirviendo con los binarios viejos.
-  - El boot del orchestrator nuevo reinicia cada servicio que corre un binario reemplazado, en su
-    orden de arranque: rt-gateway primero y SY.vault último. Así ordenar los reinicios lo resuelve el
-    orchestrator, no un script.
-  - El resultado queda en `/versions` como `core.last_update`, con `via: package`.
-  - needrestart deja también rt-gateway y sy-* al orchestrator.
-  - dpkg corre el `prerm` del paquete viejo: el upgrade a 0.1.56 todavía para todo, y la mejora se
-    ve desde 0.1.57.
-- **Medido en el upgrade a 0.1.57 (2026-10-06):**
+- **Impact:** meanwhile the motherbee has no router, identity or admin.
+  - IO.api and IO.cloud do not serve: the public sees 502.
+  - The identity replicas retry every second (~2 warnings per second).
+  - Nobody can be provisioned.
+- **Why it is like this:** the `prerm` says "stop + disable services before removal", but it runs
+  on an upgrade anyway.
+- **Proposal:** have the `prerm` stop the services only on uninstall, and on an upgrade have the
+  `postinst` restart them after unpacking. Linux keeps the old binary running until the restart,
+  so the outage would shrink to what each restart takes.
+- **To decide:** the order of the restarts, and whether the `postinst` or the orchestrator does
+  them.
+- **Operator (2026-10-02):** *"no me parece mal"* ("that seems fine to me").
+- **Fix (`1a10cab`):**
+  - On an upgrade the `prerm` stops only the ones that write the runtimes manifest:
+    sy-orchestrator, sy-admin and sy-wf-rules. The `postinst` counts on that when it registers the
+    runtimes.
+  - The rest keep serving with the old binaries.
+  - The new orchestrator's boot restarts each service that runs a replaced binary, in its startup
+    order: rt-gateway first and SY.vault last. That way, ordering the restarts is handled by the
+    orchestrator, not by a script.
+  - The result is recorded in `/versions` as `core.last_update`, with `via: package`.
+  - needrestart also leaves rt-gateway and sy-* to the orchestrator.
+  - dpkg runs the old package's `prerm`: the upgrade to 0.1.56 still stops everything, and the
+    improvement shows from 0.1.57 on.
+- **Measured on the upgrade to 0.1.57 (2026-10-06):**
 
-  | Servicio | 0.1.55 | 0.1.57 |
+  | Service | 0.1.55 | 0.1.57 |
   |---|---|---|
-  | rt-gateway | 70 s | 0 s (reinicio) |
+  | rt-gateway | 70 s | 0 s (restart) |
   | sy-vault | 78 s | 1 s |
   | sy-storage | 84 s | 5 s |
   | sy-identity | 86 s | 5 s |
-  | resto | — | 0 s |
+  | rest | — | 0 s |
 
-  Solo paran los que escriben el manifest: el orchestrator estuvo 44 s caído.
+  Only the ones that write the manifest stop: the orchestrator was down for 44 s.
 
-### A-46 🟡 ETAPA 1 HECHA (0.1.57): el ingress ya no llega a Archi; el resto de la postura, en diseño — La API HTTP de Archi no tiene autenticación y se alcanza desde el ingress
+### A-46 🟡 STAGE 1 DONE (0.1.57): the ingress no longer reaches Archi; the rest of the posture, in design — Archi's HTTP API has no authentication and is reachable from the ingress
 
-- **Qué pasa (verificado el 2026-10-03, en el relevamiento de nodos):**
-  - El router axum de SY.architect (`sy_architect.rs`, `Router::new()`) no tiene ninguna capa de
-    autenticación. Abiertas: `/api/chat`, `/api/executor/plan`, `/api/package/publish`,
+- **What happens (verified on 2026-10-03, in the node survey):**
+  - SY.architect's axum router (`sy_architect.rs`, `Router::new()`) has no authentication layer at
+    all. Open: `/api/chat`, `/api/executor/plan`, `/api/package/publish`,
     `/api/software/upload|publish`, `/api/agent-assets`, `/api/messages`, `/api/sessions`.
-  - En PROD escucha en `0.0.0.0:3000`. El default del código es `127.0.0.1:3000`, pero el
-    `hive.yaml.example` empaquetado usa `0.0.0.0`.
-  - El firewall del motherbee está inactivo (`ufw status`: inactive).
-  - Desde `fb-ingress`, que tiene interfaz pública (`eth1`), el puerto `10.10.10.10:3000` está
-    abierto. El 8080 del admin no.
-- **Impacto:** quien comprometa el ingress puede pedirle planes al executor de Archi y publicar
-  paquetes o software. La identidad de Archi puede además escribir en el vault. Es un camino desde
-  la DMZ al plano de control.
-- **Opciones:**
-  - Inmediata: que Archi escuche en `127.0.0.1` (y se use por túnel), o un firewall que deje pasar
-    el 3000 solo desde la red del operador.
-  - De fondo: autenticación en la API, con el paquete de seguridad (A-22).
-- **Ampliación (2026-10-05): por qué el 3000 se alcanzaba.** No es solo Archi:
-  - **Ningún hive filtra tráfico entrante.** `ufw` está inactivo en los 4. El input de la tabla
-    nft del egress está en `policy accept` ("hardening futuro").
-  - **Las reglas del orquestador son inertes.** `ensure_core_firewall_local` y la de Syncthing
-    hacen `ufw allow` (9000, 9100, 22000, 21027, desde cualquier origen) sobre un ufw apagado:
-    quedan guardadas sin efecto.
-    - Es una trampa: si alguien prende ufw, quedan bloqueados el SSH de todos los hosts y el 443
-      del ingress.
-    - Las reglas de core nunca se cierran.
-  - **Escuchan en interfaces externas:** el SSH y el Syncthing del ingress, también por `eth1`
-    (pública), y los del egress por la red de la oficina.
-  - **El admin también acepta cualquier dirección** (`admin.listen` / `JSR_ADMIN_LISTEN`) y
-    tampoco tiene auth HTTP.
-  - **Corregir el example no alcanza.** El postinst solo lo copia si `hive.yaml` no existe, así
-    que no arregla PROD ni DEV.
-- **Decidido con el operador (2026-10-05):**
-  - la postura del host (firewall nft por rol, binds, Syncthing) la declara, aplica y verifica el
-    orquestador;
-  - Archi y el admin, solo en loopback;
-  - lo único público es el 443 del ingress;
-  - desde afuera, Archi se usa vía Cloud → IO.cloud → IO.web, con una URL que entrega Cloud.
-- **Diseño y plan por etapas:** `docs/host-posture-and-exposure-spec-v1.md`. Etapa 1 = binds.
-- **Panel DTAP (2026-10-05):**
-  - Reprobó la revisión 1 en las 4 lentes: 75 findings, ninguno refutado (registro en
+  - In PROD it listens on `0.0.0.0:3000`. The code's default is `127.0.0.1:3000`, but the packaged
+    `hive.yaml.example` uses `0.0.0.0`.
+  - The motherbee's firewall is inactive (`ufw status`: inactive).
+  - From `fb-ingress`, which has a public interface (`eth1`), port `10.10.10.10:3000` is open. The
+    admin's 8080 is not.
+- **Impact:** whoever compromises the ingress can ask Archi's executor for plans and publish
+  packages or software. Archi's identity can also write to the vault. It is a path from the DMZ to
+  the control plane.
+- **Options:**
+  - Immediate: have Archi listen on `127.0.0.1` (and be used through a tunnel), or a firewall that
+    lets 3000 through only from the operator's network.
+  - Long-term: authentication on the API, with the security package (A-22).
+- **Extension (2026-10-05): why 3000 was reachable.** It is not just Archi:
+  - **No hive filters inbound traffic.** `ufw` is inactive on all 4. The input of the egress's nft
+    table is at `policy accept` ("future hardening").
+  - **The orchestrator's rules are inert.** `ensure_core_firewall_local` and the Syncthing one run
+    `ufw allow` (9000, 9100, 22000, 21027, from any source) on a ufw that is off: they stay stored,
+    with no effect.
+    - It is a trap: if someone turns ufw on, SSH on every host and the ingress's 443 get blocked.
+    - The core rules are never closed.
+  - **They listen on external interfaces:** the ingress's SSH and Syncthing, also on `eth1`
+    (public), and the egress's on the office network.
+  - **The admin also accepts any address** (`admin.listen` / `JSR_ADMIN_LISTEN`), and it has no
+    HTTP auth either.
+  - **Fixing the example is not enough.** The postinst only copies it if `hive.yaml` does not
+    exist, so it does not fix PROD or DEV.
+- **Decided with the operator (2026-10-05):**
+  - the host posture (nft firewall per role, binds, Syncthing) is declared, applied and verified by
+    the orchestrator;
+  - Archi and the admin, on loopback only;
+  - the only public thing is the ingress's 443;
+  - from outside, Archi is used via Cloud → IO.cloud → IO.web, with a URL that Cloud hands out.
+- **Design and staged plan:** `docs/host-posture-and-exposure-spec-v1.md`. Stage 1 = binds.
+- **DTAP panel (2026-10-05):**
+  - It failed revision 1 on all 4 lenses: 75 findings, none refuted (record in
     `docs/audits/2026-10-05-host-posture-dtap-panel.md`).
-  - La revisión 2 suma todo lo técnico.
-  - Quedan decisiones del operador: O1–O4 antes de las etapas 1–5, O5–O8 antes de la 6–7.
-  - O1–O4 respondidas el mismo día (D16–D19 de la revisión 3):
-    - SSH sin configurar nada: abierto a todos menos a los hives;
-    - Archi a loopback solo por config;
-    - io.linkedhelper por el edge, al final;
-    - del ingress, solo lo que resuelven `add_hive` y el orquestador.
-  - Orden de trabajo (D20): core → conexión con Cloud → nodos de implementación.
-  - Ronda 2 del panel (sobre la Parte A, revisión 3): reprobó otra vez, 84 findings. La causa
-    fue el filtrado por IP de cada hive y todo lo que lo rodeaba.
-  - La revisión 4 simplifica: reglas por puerto e interfaz según el rol, modo automático (observa
-    24 h y después bloquea), sin configuración y sin probes.
-- **Lo que queda abierto aunque se cierren las etapas 1–5:**
-  - la malla de control: cualquier orquestador, el ingress incluido, puede mandar SPAWN, KILL,
-    etc. (A-20, A-22);
-  - la etapa 7 reabre un camino a Archi con sesión: un ingress comprometido puede emitir y usar la
-    sesión (O5).
-- **Etapa 1 (0.1.57, 2026-10-06), validada en PROD:**
-  - Archi y el admin escuchan solo en `127.0.0.1`. El `hive.yaml` del motherbee se migró solo en
-    el upgrade (`fluxbee-migrate-config`).
-  - Desde worker1, ingress, egress y fb-build, el 3000 del motherbee pasó de `open` a `refused`.
-  - El orchestrator avisa si alguno vuelve a escuchar afuera. Lo probó un control positivo:
-    alerta a los 33 s.
-- **Estado:**
-  - Ronda 3 del panel hecha.
-  - El firewall (etapas 4–5) y Syncthing (etapas 2–3) siguen en diseño: revisión 6 y ronda 4
-    antes de construirlos (§8 del doc).
-  - El acceso desde Cloud (etapa 7) es de la fase Cloud.
+  - Revision 2 adds everything technical.
+  - Operator decisions remain: O1–O4 before stages 1–5, O5–O8 before 6–7.
+  - O1–O4 answered the same day (D16–D19 of revision 3):
+    - SSH with nothing configured: open to everyone except the hives;
+    - Archi on loopback only through config;
+    - io.linkedhelper through the edge, at the end;
+    - for the ingress, only what `add_hive` and the orchestrator handle.
+  - Work order (D20): core → connection with Cloud → implementation nodes.
+  - Panel round 2 (on Part A, revision 3): failed again, 84 findings. The cause was the per-hive
+    IP filtering and everything around it.
+  - Revision 4 simplifies: rules per port and interface according to the role, an automatic mode
+    (observe for 24 h and then block), no configuration and no probes.
+- **What stays open even if stages 1–5 are closed:**
+  - the control mesh: any orchestrator, the ingress's included, can send SPAWN, KILL, etc.
+    (A-20, A-22);
+  - stage 7 reopens a path to Archi with a session: a compromised ingress can issue and use the
+    session (O5).
+- **Stage 1 (0.1.57, 2026-10-06), validated in PROD:**
+  - Archi and the admin listen only on `127.0.0.1`. The motherbee's `hive.yaml` was migrated by
+    itself during the upgrade (`fluxbee-migrate-config`).
+  - From worker1, ingress, egress and fb-build, the motherbee's 3000 went from `open` to `refused`.
+  - The orchestrator warns if any of them listens outside again. A positive control proved it: an
+    alert at 33 s.
+- **Status:**
+  - Panel round 3 done.
+  - The firewall (stages 4–5) and Syncthing (stages 2–3) are still in design: revision 6 and
+    round 4 before building them (§8 of the doc).
+  - Access from Cloud (stage 7) belongs to the Cloud phase.
 
-### A-47 ✅ RESUELTO (0.1.59, validado en 8.x) — Syncthing usaba la infraestructura pública y worker1 dependía del discovery
+### A-47 ✅ RESOLVED (0.1.59, validated on 8.x) — Syncthing used the public infrastructure, and worker1 depended on discovery
 
-- **Qué pasa (verificado el 2026-10-05 en los 4 hosts de PROD):**
-  - Están prendidos `globalAnnounce`, `localAnnounce`, `relays`, `nat` y `crashReporting`, y el
-    orquestador nunca los configura.
-  - Cada hive anuncia su device ID y sus IPs a los servidores públicos de discovery, puede pasar
-    por relays públicos, intenta UPnP/NAT-PMP y manda crash reports.
-  - El discovery local sale por todas las interfaces: en el ingress por la pública, en el egress
-    por la red de la oficina.
-  - Escucha en todas las interfaces.
-- **La trampa:** motherbee ↔ worker1 están como `dynamic` de los dos lados, así que hoy
-  sincronizan solo porque el discovery los encuentra. Ingress y egress tienen fija la dirección
-  del motherbee.
-  - Causa: `add_hive` toma `syncthing_peer_address` como opcional, y sin dirección se escribe
+- **What happens (verified on 2026-10-05 on the 4 PROD hosts):**
+  - `globalAnnounce`, `localAnnounce`, `relays`, `nat` and `crashReporting` are on, and the
+    orchestrator never configures them.
+  - Each hive announces its device ID and its IPs to the public discovery servers, can go through
+    public relays, tries UPnP/NAT-PMP and sends crash reports.
+  - Local discovery goes out on every interface: on the ingress through the public one, on the
+    egress through the office network.
+  - It listens on every interface.
+- **The trap:** motherbee ↔ worker1 are set as `dynamic` on both sides, so today they sync only
+  because discovery finds them. Ingress and egress have the motherbee's address fixed.
+  - Cause: `add_hive` takes `syncthing_peer_address` as optional, and with no address it writes
     `dynamic` (`sy_orchestrator.rs:7340`).
-  - Apagar el discovery sin arreglar esto corta dist, blob y policy a worker1.
-- **Decidido:**
-  - nada de infraestructura pública;
-  - escucha solo en la IP interna;
-  - el lado que disca siempre con dirección fija (los spokes discan al motherbee, como WAN e
+  - Turning discovery off without fixing this cuts dist, blob and policy to worker1.
+- **Decided:**
+  - no public infrastructure at all;
+  - listen only on the internal IP;
+  - the side that dials always uses a fixed address (the spokes dial the motherbee, like WAN and
     identity);
-  - `add_hive` no crea peers sin dirección;
-  - el cambio va en dos pasos: primero las direcciones, verificando conexiones, y recién después
-    apagar el discovery.
-- **Diseño:** `docs/host-posture-and-exposure-spec-v1.md` §1.4 y §3.5 (etapas 2 y 3).
-  - El orden se hace cumplir en el código, así que saltear versiones no corta a nadie (panel T-1).
-  - Las direcciones se reconcilian en cada arranque, no solo en el join.
-  - El orquestador es el único dueño de las opciones.
-- **También encontrado:** `vendor/syncthing/config.xml` ya trae lo público apagado, pero solo lo
-  usa el camino de instalación dev. El `.deb` y los spokes corren los defaults de Syncthing.
-- **Estado:**
-  - **Etapa 2 (direcciones y carpetas) validada en 0.1.58** (2026-10-06), después de cuatro
-    revisiones adversariales del código (`docs/host-posture-and-exposure-spec-v1.md` §3.5, "as built"). Los
-    spokes quedan con el motherbee en dirección fija y el motherbee solo acepta; además saca a cada
-    spoke de las carpetas que su rol no debe tener (A-50) y borra los devices que ningún hive
-    reclama.
-  - Antes del deploy se unió `worker2` (VM 104) con 0.1.57 y quedó apagada, para la prueba de
-    salteo de versiones de la etapa 3 (T5-1).
-  - **Etapa 3 (opciones de Syncthing: sin discovery, relays, NAT, STUN ni reportes; listen solo
-    donde hace falta) validada en 0.1.59** (2026-10-06), después de dos revisiones adversariales.
-    Cada spoke cambió solo; el motherbee esperó a `worker2`, que saltó de 0.1.57 a 0.1.59 y cambió,
-    y recién ahí cambió el motherbee. Cero sockets UDP de Syncthing en los 5 hives.
+  - `add_hive` does not create peers without an address;
+  - the change goes in two steps: first the addresses, checking the connections, and only after
+    that turn discovery off.
+- **Design:** `docs/host-posture-and-exposure-spec-v1.md` §1.4 and §3.5 (stages 2 and 3).
+  - The order is enforced in the code, so skipping versions cuts no one off (panel T-1).
+  - The addresses are reconciled on every startup, not only at the join.
+  - The orchestrator is the sole owner of the options.
+- **Also found:** `vendor/syncthing/config.xml` already ships with the public parts off, but only
+  the dev install path uses it. The `.deb` and the spokes run Syncthing's defaults.
+- **Status:**
+  - **Stage 2 (addresses and folders) validated in 0.1.58** (2026-10-06), after four adversarial
+    code reviews (`docs/host-posture-and-exposure-spec-v1.md` §3.5, "as built"). The spokes end up
+    with the motherbee at a fixed address, and the motherbee only accepts; it also removes each
+    spoke from the folders its role must not have (A-50) and deletes the devices that no hive
+    claims.
+  - Before the deploy, `worker2` (VM 104) joined with 0.1.57 and was left powered off, for stage
+    3's version-skipping test (T5-1).
+  - **Stage 3 (Syncthing options: no discovery, relays, NAT, STUN or reports; listen only where
+    needed) validated in 0.1.59** (2026-10-06), after two adversarial reviews. Each spoke switched
+    on its own; the motherbee waited for `worker2`, which jumped from 0.1.57 to 0.1.59 and
+    switched, and only then did the motherbee switch. Zero Syncthing UDP sockets on the 5 hives.
 
-### A-48 🟡 PARA ARREGLAR — `remove_hive` no revoca nada: el hive sacado sigue siendo un par válido
+### A-48 🟡 TO FIX — `remove_hive` revokes nothing: the removed hive is still a valid peer
 
-- **Qué pasa (panel DTAP 2026-10-05, D-1, verificado):**
-  - `remove_hive_flow` (`sy_orchestrator.rs:10635`) borra `hives/<id>`.
-  - Desvincula el device de Syncthing solo si `info.yaml` tiene `syncthing_device_id`, y el del
-    egress nunca lo tiene (`:20989-20996`).
-  - No borra la clave HMAC de identity, que queda en `/var/lib/fluxbee/identity/keys`
+- **What happens (DTAP panel 2026-10-05, D-1, verified):**
+  - `remove_hive_flow` (`sy_orchestrator.rs:10635`) deletes `hives/<id>`.
+  - It unlinks the Syncthing device only if `info.yaml` has `syncthing_device_id`, and the egress's
+    never has it (`:20989-20996`).
+  - It does not delete the identity HMAC key, which stays in `/var/lib/fluxbee/identity/keys`
     (`src/mesh_hmac.rs:33`).
-  - No revoca el certificado de la malla: no hay CRL, y con `wan.authorized_hives` vacío el router
-    acepta a cualquier hive con certificado válido de la CA (`src/router/mod.rs:2853`).
-- **Impacto:** un hive sacado (o su disco) puede volver a conectarse a la malla y a identity. Hoy
-  el único freno sería el firewall, que no existe.
-- **Arreglo propuesto:** que `remove_hive`:
-  - revoque (o mantenga `authorized_hives` con los hives vivos);
-  - borre la clave HMAC;
-  - desvincule Syncthing en todos los roles.
+  - It does not revoke the mesh certificate: there is no CRL, and with `wan.authorized_hives` empty
+    the router accepts any hive with a valid certificate from the CA (`src/router/mod.rs:2853`).
+- **Impact:** a removed hive (or its disk) can reconnect to the mesh and to identity. Today the
+  only brake would be the firewall, which does not exist.
+- **Proposed fix:** have `remove_hive`:
+  - revoke (or keep `authorized_hives` with the live hives);
+  - delete the HMAC key;
+  - unlink Syncthing in every role.
 
-  Va como pista aparte del diseño de postura (§6 del doc).
-- **Lo mismo, del lado del motherbee (DTAP ronda 3, D3-3/P3-3):**
-  - `REMOVE_HIVE_CLEANUP` y `ADD_HIVE_FINALIZE` mandados al motherbee eran un botón de apagado.
-  - La policy deja a cualquier orquestador mandarlos, incluido el del ingress.
-  - El primero para y deshabilita todo el core; el segundo reinicia el core y vincula a Syncthing
-    un dispositivo que elige quien lo manda.
-- **Estado:**
-  - **0.1.57: el motherbee rechaza las dos acciones** (`FORBIDDEN`, con el origen en el log;
-    cubierto por test unitario).
-  - El resto de A-48 (pin del certificado, vista del router, claves HMAC, host keys SSH) sigue en
-    diseño: la ronda 3 encontró que, tal como estaba escrito, cortaba a todos los hives
-    existentes (§8 del doc).
+  It goes as a track separate from the posture design (§6 of the doc).
+- **The same, on the motherbee's side (DTAP round 3, D3-3/P3-3):**
+  - `REMOVE_HIVE_CLEANUP` and `ADD_HIVE_FINALIZE` sent to the motherbee were an off switch.
+  - The policy lets any orchestrator send them, the ingress's included.
+  - The first stops and disables the whole core; the second restarts the core and links to
+    Syncthing a device chosen by whoever sends it.
+- **Status:**
+  - **0.1.57: the motherbee rejects both actions** (`FORBIDDEN`, with the origin in the log;
+    covered by a unit test).
+  - The rest of A-48 (certificate pinning, the router's view, HMAC keys, SSH host keys) is still
+    in design: round 3 found that, as it was written, it cut off every existing hive (§8 of the
+    doc).
 
-### A-49 🟡 PARA ARREGLAR — El repo apt no está firmado (`[trusted=yes]`): quien se haga pasar por él es root en el motherbee
+### A-49 🟡 TO FIX — The apt repo is not signed (`[trusted=yes]`): whoever impersonates it is root on the motherbee
 
-- **Qué pasa (panel DTAP 2026-10-05, P-14, verificado):**
-  - El motherbee instala de `http://10.10.10.50:8900` con `[trusted=yes]`, porque el repo no está
-    firmado (HANDBOOK:419, :434; `docs/packaging-and-build.md:157`).
-  - La red 10.10.10.0/24 es plana: el ingress (DMZ) comparte segmento con el motherbee y con
-    fb-build.
-- **Impacto:** un ingress comprometido que se haga pasar por 10.10.10.50 sirve un `.deb` propio, y
-  el siguiente upgrade lo instala como root en el motherbee.
-- **Arreglo propuesto:**
-  - firmar el `Release` (`InRelease`) y sacar `[trusted=yes]` (el `.deb` no cambia);
-  - aislar el ingress a nivel de red queda para después del core: necesita config de infra (D19).
-- **Estado:** registrado. No se tocó nada.
+- **What happens (DTAP panel 2026-10-05, P-14, verified):**
+  - The motherbee installs from `http://10.10.10.50:8900` with `[trusted=yes]`, because the repo
+    is not signed (HANDBOOK:419, :434; `docs/packaging-and-build.md:157`).
+  - The 10.10.10.0/24 network is flat: the ingress (DMZ) shares a segment with the motherbee and
+    with fb-build.
+- **Impact:** a compromised ingress that impersonates 10.10.10.50 serves its own `.deb`, and the
+  next upgrade installs it as root on the motherbee.
+- **Proposed fix:**
+  - sign the `Release` (`InRelease`) and remove `[trusted=yes]` (the `.deb` does not change);
+  - isolating the ingress at the network level waits until after the core: it needs infra config
+    (D19).
+- **Status:** recorded. Nothing was touched.
 
-### A-50 ✅ RESUELTO (0.1.58, validado en 8.x) — El motherbee le compartía `blob/active` al egress
+### A-50 ✅ RESOLVED (0.1.58, validated on 8.x) — The motherbee shared `blob/active` with the egress
 
-- **Qué pasa (verificado el 2026-10-06 en PROD, solo lectura, con `lab/posture-check.py`):**
-  - En el motherbee, la carpeta `fluxbee-blob` (`/var/lib/fluxbee/blob/active`, sendreceive: los
-    blobs vivos de todos los tenants) está compartida con worker1 **y con egress1**.
-  - El egress nunca la aceptó: su `hive.yaml` dice `blob: enabled: false` y la tiene como carpeta
-    pendiente ofrecida por el motherbee. No viajó ningún dato.
-  - Pero la autorización existe del lado del motherbee: quien tenga root en el egress (un host con
-    dirección en la red de la oficina) puede aceptar la carpeta por la API de su Syncthing y recibir
-    todos los blobs activos.
-  - Efecto lateral: el motherbee ve `fluxbee-blob` al 0% para egress1 para siempre.
-- **Causa:** `d73687f` (2026-07-30, U-2) metió al egress en la malla de Syncthing para que reciba el
-  core, y el gate de blob quedó en `public_only = spoke_role == HiveRole::Ingress`. Desde ahí el
-  motherbee comparte `blob/active` con todo spoke que no sea ingress, y el egress no corre nodos (no
-  recibe `runtimes`) ni declara blob.
-- **Arreglo (etapa 2):**
-  - El join comparte `blob/active` solo con workers.
-  - La reconciliación del motherbee saca a cada spoke de toda carpeta que su rol nunca debe tener
-    (`blob/active` y `runtimes` fuera de los workers, `blob/public` fuera del ingress, el core de
-    otro rol). La regla es el rol solo, nunca los flags de `hive.yaml`: la segunda revisión
-    adversarial encontró que derivarla de los flags dejaba a todos los spokes sin carpetas para
-    siempre si alguien apagaba un sync un rato.
-  - Un test fija que el join nunca agrega una de esas carpetas, con cualquier combinación de flags.
-- **Segunda vía, encontrada en la tercera revisión:** crear una carpeta que falta clonaba otra con
-  sus miembros (crear `blob/active` después de que los spokes se unieron la compartía con todos los
-  peers de la primera carpeta), y la carpeta "aislada" se sembraba con el primer `<device id=>` de
-  `config.xml`, que puede ser un peer. Ahora toda carpeta nueva nace sin miembros (Syncthing agrega
-  el device local al cargar la config).
-- **Límite conocido:** una carpeta creada después de que los spokes se unieron (prender el sync de
-  blob o el público más tarde) queda vacía hasta volver a correr `add_hive` para ellos. El arreglo
-  propuesto es un backfill por rol, como el de policy desde vendor. Hoy no aplica en PROD: blob está
-  prendido desde la instalación.
-- **Estado:** validado en 0.1.58 (2026-10-06): el primer round sacó a egress1 de `fluxbee-blob`, y
-  la oferta pendiente desapareció del egress.
+- **What happens (verified on 2026-10-06 in PROD, read-only, with `lab/posture-check.py`):**
+  - On the motherbee, the `fluxbee-blob` folder (`/var/lib/fluxbee/blob/active`, sendreceive: the
+    live blobs of every tenant) is shared with worker1 **and with egress1**.
+  - The egress never accepted it: its `hive.yaml` says `blob: enabled: false`, and it has it as a
+    pending folder offered by the motherbee. No data traveled.
+  - But the authorization exists on the motherbee's side: whoever has root on the egress (a host
+    with an address on the office network) can accept the folder through its Syncthing's API and
+    receive every active blob.
+  - Side effect: the motherbee sees `fluxbee-blob` at 0% for egress1 forever.
+- **Cause:** `d73687f` (2026-07-30, U-2) put the egress in the Syncthing mesh so it would receive
+  the core, and the blob gate stayed at `public_only = spoke_role == HiveRole::Ingress`. From then
+  on the motherbee shares `blob/active` with every spoke that is not an ingress, and the egress
+  neither runs nodes (it does not receive `runtimes`) nor declares blob.
+- **Fix (stage 2):**
+  - The join shares `blob/active` only with workers.
+  - The motherbee's reconciliation removes each spoke from every folder its role must never have
+    (`blob/active` and `runtimes` outside the workers, `blob/public` outside the ingress, another
+    role's core). The rule is the role alone, never the `hive.yaml` flags: the second adversarial
+    review found that deriving it from the flags left every spoke without folders forever if
+    someone turned a sync off for a while.
+  - A test pins that the join never adds one of those folders, with any combination of flags.
+- **A second way in, found in the third review:** creating a missing folder cloned another one
+  with its members (creating `blob/active` after the spokes had joined shared it with every peer
+  of the first folder), and the "isolated" folder was seeded with the first `<device id=>` of
+  `config.xml`, which can be a peer. Now every new folder is born with no members (Syncthing adds
+  the local device when it loads the config).
+- **Known limit:** a folder created after the spokes joined (turning on the blob sync or the
+  public one later) stays empty until `add_hive` is run again for them. The proposed fix is a
+  backfill per role, like the policy one from vendor. Today it does not apply in PROD: blob has
+  been on since the install.
+- **Status:** validated in 0.1.58 (2026-10-06): the first round removed egress1 from
+  `fluxbee-blob`, and the pending offer disappeared from the egress.
 
-### A-51 🟡 ARREGLADO EN 0.1.60 EN EL MOTHERBEE (en los spokes, abierto hasta un manifiesto firmado) — root escribía en directorios del usuario `fluxbee` siguiendo nombres que ese usuario controla
+### A-51 🟡 FIXED IN 0.1.60 ON THE MOTHERBEE (on the spokes, open until a signed manifest) — root wrote into the `fluxbee` user's directories following names that user controls
 
-- **Qué pasa (revisión adversarial de la etapa 2, 2026-10-06):**
-  - `ensure_owned_tree` deja todo `/var/lib/fluxbee/dist` del usuario de Syncthing (`fluxbee`), y
-    `sync_data_dir` también.
-  - `write_file_atomic` escribe ahí (el core materializado por rol, el manifest, el binario de
-    Syncthing en vendor) con un temporal de nombre fijo (`.<nombre>.tmp`) y `fs::write`, que sigue
+- **What happens (adversarial review of stage 2, 2026-10-06):**
+  - `ensure_owned_tree` leaves all of `/var/lib/fluxbee/dist` owned by the Syncthing user
+    (`fluxbee`), and `sync_data_dir` too.
+  - `write_file_atomic` writes there (the core materialized per role, the manifest, the Syncthing
+    binary in vendor) with a fixed-name temporary (`.<name>.tmp`) and `fs::write`, which follows
     symlinks.
-  - `copy_exec_file` hace `chmod` por ruta después del rename, y `ensure_owned_file` hace
-    `chown fluxbee:…` por ruta, que también sigue symlinks.
-- **Impacto:** quien tenga el usuario `fluxbee` (Syncthing escucha en la red) puede plantar un
-  symlink y hacer que root escriba en un archivo de root, o cambiar de dueño uno (`chown` de
-  `/etc/sudoers` o similar → root). Requiere comprometer antes al usuario `fluxbee`; es defensa en
-  profundidad. Existe desde antes de la postura.
-- **Arreglo propuesto:** la misma primitiva que ya usa el escritor de `config.xml` (temporal
-  `O_EXCL` con nombre aleatorio, dueño y modo por descriptor, rename, fsync del directorio) para
-  `write_file_atomic`, `copy_exec_file` y `ensure_owned_file`. Se hace en un paso propio, con su
-  revisión, porque toca el camino de la actualización del core.
-- **Arreglo (0.1.60, cuatro revisiones adversariales):**
-  - **Escritura:** temporal `O_EXCL` con un token por ejecución y prefijo `.syncthing.` (Syncthing
-    nunca lo envía), modo puesto sobre el descriptor, fsync del directorio con `O_NOFOLLOW`. Los
-    temporales de otra ejecución se barren al toque; los de esta, nunca.
-  - **Directorios administrados:** se abren `O_DIRECTORY|O_NOFOLLOW` y se les hace chmod/chown sobre
-    el descriptor. Lo que no es un directorio (un symlink o un archivo plantado) se deja como está y
-    se reporta como alerta de postura, sin tumbar el arranque.
-  - **`.stfolder`:** se crea exclusivo; un symlink en su lugar se reemplaza; una carpeta que es un
-    symlink no recibe marcador. El join del ingress ya no hace chmod de los directorios de blob.
-  - **Se borró** la copia (muerta) del Syncthing instalado hacia `dist/vendor`.
-  - **El `dist/` del motherbee es de root** (`root:<grupo de Syncthing>`, 0750, `g+rX,go-w`). Los
-    links adentro se borran sin seguirlos, en el preinst y en cada arranque; Syncthing solo lo lee
-    (en el motherbee es de solo envío). El operador: *"Si root PERO!!! cuidado que hay muchas
-    carpetas de syncthing, no todas pueden ser root"*: solo `dist/`; `blob/active` (envío y
-    recepción), `blob/public`, el home de Syncthing y el `dist/` de los spokes siguen de `fluxbee`.
-- **Lo que queda abierto:**
-  - **Los spokes instalan y corren lo que les entrega Syncthing** (core, vendor, runtimes). Quien
-    tenga el usuario de Syncthing del motherbee (su `key.pem`) llega a root en todos los spokes. El
-    arreglo es un manifiesto firmado con una llave de root que verifica el root de cada spoke.
-  - **Root escribe por ruta en el `blob/` del usuario de Syncthing** del motherbee: A-56.
-  - **Un re-join** instala con `install -m` dentro del `dist/` del spoke por nombre (una carrera en
-    una caja usada); misma clase que el primer punto.
-- **Estado:** en 0.1.60.
+  - `copy_exec_file` does a `chmod` by path after the rename, and `ensure_owned_file` does a
+    `chown fluxbee:…` by path, which also follows symlinks.
+- **Impact:** whoever holds the `fluxbee` user (Syncthing listens on the network) can plant a
+  symlink and make root write to a root file, or change a file's owner (`chown` of
+  `/etc/sudoers` or similar → root). It requires compromising the `fluxbee` user first; it is
+  defense in depth. It has existed since before the posture work.
+- **Proposed fix:** the same primitive the `config.xml` writer already uses (an `O_EXCL` temporary
+  with a random name, owner and mode set by descriptor, rename, fsync of the directory) for
+  `write_file_atomic`, `copy_exec_file` and `ensure_owned_file`. It is done in its own step, with
+  its own review, because it touches the core update path.
+- **Fix (0.1.60, four adversarial reviews):**
+  - **Writing:** an `O_EXCL` temporary with a per-run token and the `.syncthing.` prefix (Syncthing
+    never sends it), the mode set on the descriptor, fsync of the directory with `O_NOFOLLOW`.
+    Temporaries from another run are swept right away; this run's, never.
+  - **Managed directories:** they are opened `O_DIRECTORY|O_NOFOLLOW`, and the chmod/chown is done
+    on the descriptor. Whatever is not a directory (a symlink or a planted file) is left as it is
+    and reported as a posture alert, without bringing down the startup.
+  - **`.stfolder`:** it is created exclusively; a symlink in its place is replaced; a folder that
+    is a symlink gets no marker. The ingress join no longer chmods the blob directories.
+  - The (dead) copy of the installed Syncthing into `dist/vendor` **was deleted**.
+  - **The motherbee's `dist/` belongs to root** (`root:<Syncthing group>`, 0750, `g+rX,go-w`).
+    Links inside it are deleted without following them, in the preinst and on every startup;
+    Syncthing only reads it (on the motherbee it is send-only). The operator: *"Si root PERO!!!
+    cuidado que hay muchas carpetas de syncthing, no todas pueden ser root"* ("Yes, root, BUT!!!
+    careful, there are many syncthing folders, not all of them can be root"): only `dist/`;
+    `blob/active` (send and receive), `blob/public`, Syncthing's home and the spokes' `dist/` stay
+    `fluxbee`'s.
+- **What stays open:**
+  - **The spokes install and run whatever Syncthing delivers to them** (core, vendor, runtimes).
+    Whoever holds the motherbee's Syncthing user (its `key.pem`) gets root on every spoke. The fix
+    is a signed manifest, with a root key that the root of each spoke verifies.
+  - **Root writes by path in the Syncthing user's `blob/`** on the motherbee: A-56.
+  - **A re-join** installs with `install -m` inside the spoke's `dist/` by name (a race on a used
+    box); the same class as the first point.
+- **Status:** in 0.1.60.
 
-### A-52 ✅ RESUELTO (0.1.60, validado en 8.x) — `add_hive` sobre un clon recién creado choca con el `dist-upgrade` de cloud-init
+### A-52 ✅ RESOLVED (0.1.60, validated on 8.x) — `add_hive` on a freshly created clone collides with cloud-init's `dist-upgrade`
 
-- **Qué pasó (2026-10-06, join de `worker2` en 8.x):** el primer join falló con `CONFIG_FAILED`
-  ("identity HMAC key distribution failed … port 22: Connection refused").
-  - cloud-init, en el primer arranque del clon, corre un `apt-get dist-upgrade`. Al actualizar
-    `openssh-server` detiene `ssh.service` y cierra `ssh.socket`, en pleno join.
-  - Después de que cloud-init terminó y la VM se reinició (kernel nuevo), el join reanudado salió
-    bien.
-  - El HANDBOOK §3.4 ya lo documenta ("Un clon recién booteado NO está listo": esperar el ciclo y
-    reiniciar antes de unirlo). Esta vez no se siguió; el error fue de operación, no del HANDBOOK.
-- **También visto:** la VM descartable (10.10.10.60) tiene salida a internet (bajó paquetes de
-  `archive.ubuntu.com`). La bitácora del 2026-07-29 dice que las máquinas de 8.x no deberían tenerla;
-  es configuración de red del operador.
-- **Arreglo propuesto:** que el bootstrap del join se proteja solo y espere a cloud-init
-  (`cloud-init status --wait`, acotado) y al lock de dpkg antes de empezar: el orquestador es el
-  dueño del entorno del host. Mientras tanto vale la receta del HANDBOOK §3.4.
-- **Arreglo (0.1.60):** apenas verifica la llave sembrada, y antes de instalar el sudoers, el join
-  espera mientras systemd no terminó de arrancar (`is-system-running` en `starting`,
-  `initializing` o `stopping`; cubre el hueco entre dos etapas de cloud-init) o mientras una etapa
-  de cloud-init o un job diario de apt (unattended-upgrades) está `activating`. No usa
-  `cloud-init status`, que dice "error" mientras siguen etapas y "not started" para siempre si
-  cloud-init no corre. Hasta 15 min en total, reintentando si la caja se reinicia; el join muestra
-  la fase `waiting_for_host`. Si sigue ocupada: `HOST_NOT_SETTLED` (reintentable, la llave queda,
-  503); si el chequeo mismo falla: `HOST_SETTLE_CHECK_FAILED` (502).
-- **Validado (2026-10-06):** un clon nuevo de la VM 104 unido apenas arrancó esperó 8 min en
-  `waiting_for_host` mientras corría cloud-final y después completó el join (ledger 0.1.61).
+- **What happened (2026-10-06, join of `worker2` on 8.x):** the first join failed with
+  `CONFIG_FAILED` ("identity HMAC key distribution failed … port 22: Connection refused").
+  - cloud-init, on the clone's first boot, runs an `apt-get dist-upgrade`. When it upgrades
+    `openssh-server`, it stops `ssh.service` and closes `ssh.socket`, in the middle of the join.
+  - After cloud-init finished and the VM rebooted (new kernel), the resumed join went fine.
+  - HANDBOOK §3.4 already documents it ("A freshly booted clone is NOT ready": wait for the cycle
+    and reboot before joining it). This time it was not followed; the error was an operational
+    one, not the HANDBOOK's.
+- **Also seen:** the throwaway VM (10.10.10.60) has internet access (it downloaded packages from
+  `archive.ubuntu.com`). The 2026-07-29 logbook says the 8.x machines should not have it; it is the
+  operator's network configuration.
+- **Proposed fix:** have the join's bootstrap protect itself and wait for cloud-init
+  (`cloud-init status --wait`, bounded) and for the dpkg lock before starting: the orchestrator
+  owns the host's environment. Meanwhile, the HANDBOOK §3.4 recipe holds.
+- **Fix (0.1.60):** as soon as it verifies the seeded key, and before installing the sudoers entry,
+  the join waits while systemd has not finished booting (`is-system-running` in `starting`,
+  `initializing` or `stopping`; it covers the gap between two cloud-init stages) or while a
+  cloud-init stage or a daily apt job (unattended-upgrades) is `activating`. It does not use
+  `cloud-init status`, which says "error" while stages are still running and "not started" forever
+  if cloud-init does not run. Up to 15 min in total, retrying if the box reboots; the join shows
+  the `waiting_for_host` phase. If it is still busy: `HOST_NOT_SETTLED` (retryable, the key stays,
+  503); if the check itself fails: `HOST_SETTLE_CHECK_FAILED` (502).
+- **Validated (2026-10-06):** a new clone of VM 104, joined as soon as it booted, waited 8 min in
+  `waiting_for_host` while cloud-final ran, and then completed the join (ledger 0.1.61).
 
-### A-53 🟡 ARREGLADO EN 0.1.58 (lo ejercita el próximo join) — `local_syncthing_device_id` siempre fallaba con Syncthing v2 y caía al primer device de `config.xml`
+### A-53 🟡 FIXED IN 0.1.58 (the next join exercises it) — `local_syncthing_device_id` always failed with Syncthing v2 and fell back to the first device in `config.xml`
 
-- **Qué pasa (verificado el 2026-10-06 en el motherbee de PROD, solo lectura):**
-  - El orquestador pedía el ID con `syncthing --home … --device-id`; el binario v2.0.14 responde
-    `unknown flag --device-id` (en v2 es el subcomando `device-id`).
-  - Entonces caía siempre a "el primer `<device id=>` de `config.xml`". El journal desde septiembre
-    muestra el fallback 2 veces.
-  - Ese primer device puede ser un peer: Syncthing ordena los miembros de las carpetas por ID. Un
-    join le habría pasado a un spoke el ID equivocado como "motherbee".
-- **En PROD no hubo daño:** el ID del motherbee (`BBJBKBB…`) es el menor, así que el fallback dio
-  justo el local; los 4 spokes tienen bien el device del motherbee.
-- **Arreglo (etapa 2):** el subcomando `device-id`, solo si existe `cert.pem` (sin certificado el
-  binario generaría uno como root); si no, el `myID` del Syncthing en marcha. Nunca `config.xml`.
-- **Estado:** construido; lo ejercita el próximo join (el de A-48).
+- **What happens (verified on 2026-10-06 on the PROD motherbee, read-only):**
+  - The orchestrator asked for the ID with `syncthing --home … --device-id`; the v2.0.14 binary
+    answers `unknown flag --device-id` (in v2 it is the `device-id` subcommand).
+  - So it always fell back to "the first `<device id=>` of `config.xml`". The journal since
+    September shows the fallback 2 times.
+  - That first device can be a peer: Syncthing sorts the folder members by ID. A join would have
+    handed a spoke the wrong ID as "motherbee".
+- **In PROD there was no damage:** the motherbee's ID (`BBJBKBB…`) is the lowest, so the fallback
+  happened to give the local one; the 4 spokes have the motherbee's device right.
+- **Fix (stage 2):** the `device-id` subcommand, only if `cert.pem` exists (without a certificate
+  the binary would generate one as root); otherwise, the running Syncthing's `myID`. Never
+  `config.xml`.
+- **Status:** built; the next join exercises it (the A-48 one).
 
-### A-72 🔴 CONFIRMADO EN CÓDIGO (2026-10-17) — El rol de un agente no llega a los workers: `blob/agent-assets` no se replica
+### A-76 🔴 CONFIRMED IN CODE (2026-10-17) — Smaller defects found while rewriting the docs from the code
 
-- **Qué pasa:**
-  - El rol, las skills, los handbooks y la personalidad de un agente son assets JSON en
-    `blob/agent-assets/` del motherbee; los escribe Archi. El ILK del agente guarda sus hashes.
-  - ai.generic los lee del disco local, `<blob_root>/agent-assets/<hash>.json`
+Found by the docs rewrite of 2026-10-17 (the reference set and the node pages read every path they
+describe). None was tried live. To be sorted with the operator; most belong to the IO-family and
+router reviews.
+
+- **Routers:**
+  - in a hive with several routers, the gateway's nodes receive a broadcast twice;
+  - a restarted router keeps entries for nodes that never reconnect;
+  - an UNREACHABLE coming back over the WAN reaches only nodes on the gateway router;
+  - lowering the identity limits leaves readers on the old SHM offsets.
+
+  PROD runs one router per hive, so only the last one can show there.
+- **SY.admin:**
+  - the catalog lists `GET /hives/{hive}/inventory/summary` and `/inventory/hive`, but neither has a
+    handler (405);
+  - `GET /hives/{hive}/status` looks broken;
+  - `get_node_status` looks for `fluxbee-node-*` units, so it misreports `SY.*` nodes;
+  - the HTTP vault metadata route passes no `tenant_id`, so a non-root secret answers
+    `UNAUTHORIZED`;
+  - `/hives/worker1/vault/...` goes nowhere: SY.vault runs only on the motherbee;
+  - the allowlists of SY.admin and Archi name `SY.config-routes`; the node is `SY.config.routes`,
+    so that entry never matches.
+- **SY.orchestrator:**
+  - `remove_hive` revokes neither the spoke's identity key nor its TLS certificate;
+  - `syncthing_firewall_rules` still opens 22000/udp and 21027/udp, though Syncthing uses TCP only
+    since host-posture stage 3.
+- **AI nodes:**
+  - `behavior.instructions` does nothing for a managed agent: its ILK definition, or the
+    "unconfigured" prompt, replaces it (the scaffold no longer writes it);
+  - an OpenAI tool turn does not check for a truncated answer (its usage record says `truncated`);
+  - ai.generic launched by the orchestrator ignores the `runtime.*` timeout, pool and queue
+    settings, and reads `instructions.source` file/env as literal text;
+  - `scripts/deploy-ia-node.sh --update-existing` restarts with a local `systemctl` (old binary,
+    same host only), and `--kill-first` does not purge (the re-spawn hits
+    `NODE_ALREADY_EXISTS`);
+  - SY.frontdesk.gov's `NODE_STATUS_GET` always answers HEALTHY.
+- **Comments and leftovers:** SY.identity's comment on sync auth says the default is "disabled"
+  (the code defaults to required); the `IlkGetRequest` comment says Cloud reads are tenant-scoped
+  (they are not); SY.storage still creates `storage_migrations`, which nothing writes since the
+  cleanup.
+
+### A-75 🔴 CONFIRMED IN CODE (2026-10-17) — The Go SDK still has the reply-matcher bug Rust fixed after the 2026-08-26 outage
+
+- **What happens (go/fluxbee-go-sdk, found while writing docs/reference/protocol.md):**
+  - Go registers any-message-of-a-kind matchers as reply shapes, the family-wide drop the Rust SDK
+    fixed in 0.1.31 (the `any_msg_type` matcher).
+  - `SendSystemRPC` defaults to TTL 1, so a system request cannot leave its router.
+  - A send over the frame limit drops the whole connection.
+- **Impact:** every Go node (SY.timer, SY.wf-rules, SY.opa.rules, the WF engine) carries them. No
+  incident is known.
+- **Proposal:** align the Go SDK with Rust (matchers, TTL, an oversize send refused without dropping
+  the link). To decide with the operator.
+
+### A-74 🔴 CONFIRMED IN CODE (2026-10-17) — One invalid route, VPN or tap blocks every later change in SY.config.routes
+
+- **What happens:** SY.config.routes gets no reply for an invalid route, VPN or tap, and later
+  changes stay blocked until that entry is deleted or the node restarts
+  (src/bin/sy_config_routes.rs; found while writing docs/reference/routing-and-policy.md).
+- **Impact:** one bad rule from the operator, Archi or a plan stops all routing changes on that
+  hive, silently.
+- **Proposal:** answer the invalid entry with an error and keep applying the rest. To decide with
+  the operator; not tried live.
+
+### A-73 🔴 CONFIRMED IN CODE (2026-10-17) — Archi's read tool can change the system without the operator's confirmation
+
+- **What happens:**
+  - `fluxbee_system_get` is Archi's read tool. It accepts GET and POST, translates the path with
+    `translate_scmd` and runs the action (`ArchitectSystemGetTool::call` in
+    src/bin/sy_architect.rs).
+  - It never checks whether the action changes something. `POST /hives` is `add_hive`, and
+    `POST /hives/{hive}/nodes` is `run_node`. Both run at once, without the plan compiler and
+    without the operator's CONFIRM.
+  - The only guard is the prompt ("never call admin mutation endpoints directly").
+  - The operator's own SCMD, a pasted plan and `POST /api/executor/plan` also run without CONFIRM,
+    but those come from the operator.
+- **Impact:** a model mistake, or text Archi reads (a message in `turns`, a node's output), can make
+  it change the installation. Found while writing docs/nodes/sy-architect.md; not tried live.
+- **Proposal:** make the read tool refuse every action that is not a read (an allowlist of read
+  actions, plus the safe POST checks: the OPA policy check and a node's live CONFIG_GET). Small.
+  To decide with the operator.
+
+### A-72 🔴 CONFIRMED IN CODE (2026-10-17) — An agent's role does not reach the workers: `blob/agent-assets` is not replicated
+
+- **What happens:**
+  - An agent's role, skills, handbooks and personality are JSON assets in the motherbee's
+    `blob/agent-assets/`; Archi writes them. The agent's ILK stores their hashes.
+  - ai.generic reads them from the local disk, `<blob_root>/agent-assets/<hash>.json`
     (`load_cognitive_asset`, `nodes/ai/ai-generic/src/bin/ai_node_runner.rs`).
-  - Syncthing replica a los workers solo `blob/active`. `agent-assets` no está en ninguna carpeta
-    (`src/bin/sy_orchestrator.rs`, `peer_shares_active_blob` y los permisos de `agent-assets`).
-- **Impacto:**
-  - Un agente en un worker no encuentra sus assets: queda sin definición y contesta el JSON fijo
-    de "unconfigured".
-  - Hoy un agente con rol solo funciona en el motherbee. Sin embargo, la cognition por
-    interlocutor (A-70) quedó en los workers para que los agentes corran ahí.
-- **Cómo apareció:** en la revisión de los docs de desarrollo (2026-10-17). No se probó en vivo:
-  los agentes de los gates corrieron en el motherbee.
-- **Propuesta:** compartir `agent-assets` con los workers, solo lectura como `blob/active`, o
-  servirlos por la malla. A decidir con el operador.
+  - Syncthing replicates only `blob/active` to the workers. `agent-assets` is in no folder
+    (`src/bin/sy_orchestrator.rs`, `peer_shares_active_blob` and the `agent-assets` permissions).
+- **Impact:**
+  - An agent on a worker does not find its assets: it is left without a definition and answers the
+    fixed "unconfigured" JSON.
+  - Today an agent with a role only works on the motherbee. However, per-interlocutor cognition
+    (A-70) stayed on the workers so that the agents would run there.
+- **How it showed up:** in the review of the developer docs (2026-10-17). It was not tested live:
+  the gates' agents ran on the motherbee.
+- **Proposal:** share `agent-assets` with the workers, read-only like `blob/active`, or serve them
+  over the mesh. To be decided with the operator.
 
-### A-71 🔴 CONFIRMADO EN CÓDIGO (2026-10-17) — ai.generic corta a 1.200 caracteres el mensaje del usuario junto con su memoria
+### A-71 🔴 CONFIRMED IN CODE (2026-10-17) — ai.generic truncates the user's message, together with its memory, to 1,200 characters
 
-- **Qué pasa:**
-  - Con `capabilities.multimodal: false`, ai.generic antepone al texto del usuario el bloque de
-    memoria de la comunicación: `Conversation memory: … Current user message: …`
+- **What happens:**
+  - With `capabilities.multimodal: false`, ai.generic prepends the communication's memory block to
+    the user's text: `Conversation memory: … Current user message: …`
     (`inject_memory_package_into_text_input`, `ai_node_runner.rs`).
-  - El runner del AI SDK recorta ese texto entero a 1.200 caracteres
+  - The AI SDK runner trims that whole text to 1,200 characters
     (`DEFAULT_INTERACTION_MAX_CHARS`, `crates/fluxbee_ai_sdk/src/function_calling.rs`).
-- **Impacto:**
-  - Con una memoria de más de unos 1.100 caracteres, el modelo no ve el mensaje actual: contesta
-    sin saber qué le dijeron.
-  - Un mensaje largo, por ejemplo un mail, también llega cortado.
-  - Los gates no lo mostraron: sus conversaciones eran cortas.
-- **Cómo apareció:** en la revisión de los docs de desarrollo (2026-10-17).
-- **Propuesta:** no recortar el mensaje actual (el límite queda para la historia inmediata), o
-  acotar la memoria por su lado. A decidir con el operador.
+- **Impact:**
+  - With a memory of more than about 1,100 characters, the model does not see the current message:
+    it answers without knowing what it was told.
+  - A long message, for example an email, also arrives cut off.
+  - The gates did not show it: their conversations were short.
+- **How it showed up:** in the review of the developer docs (2026-10-17).
+- **Proposal:** do not trim the current message (the limit stays for the immediate history), or
+  bound the memory on its own. To be decided with the operator.
 
-### A-70 ✅ VALIDADO EN 8.x (0.1.75 a 0.1.79, 2026-10-16/17): NATS BORRADO Y USO DE LLM REGISTRADO — El "NATS" de los registros vivía dentro del router, perdía datos y solo guardaba lo del motherbee
+### A-70 ✅ VALIDATED ON 8.x (0.1.75 to 0.1.79, 2026-10-16/17): NATS DELETED AND LLM USAGE RECORDED — The records' "NATS" lived inside the router, lost data and only stored the motherbee's
 
-- **Cómo salió:** diseñando la etapa 5 (tokens), el registro iba a viajar por NATS. El operador
-  pidió revisar NATS en general y entre hives. Diseño: `docs/router-stream-v1.md`.
-- **Qué pasa (verificado en el código de 0.1.74 y medido en PROD el 2026-10-16):**
-  - **No es NATS:** es un broker propio que habla parte del protocolo de texto de NATS y corre
-    adentro del proceso del router, uno por hive, sin enlace entre hives.
-  - **Los mensajes no viajan por ahí.** El router publica una copia de cada mensaje de usuario
-    como turno, con una conexión TCP nueva por cada publicación.
-  - **Su durabilidad es débil:**
-    - cada tema es una cola en memoria de hasta 50.000 mensajes, que pasado el tope borra los más
-      viejos aunque nadie los haya leído, en silencio;
-    - un mensaje en vuelo por consumidor;
-    - el disco es un único JSON que se reescribe entero cada 500 ms.
-  - **Solo llega a la base lo del motherbee,** porque SY.storage corre solo ahí:
-    - worker1 tenía 67 turnos que nunca se guardaron;
-    - el ingress (DMZ) guardaba en disco 597 turnos del tráfico del edge que nadie consume, e iban
-      a crecer hasta 50.000.
+- **How it came up:** while designing stage 5 (tokens), the record was going to travel over NATS.
+  The operator asked to review NATS in general and between hives. Design:
+  `docs/router-stream-v1.md`.
+- **What happens (verified in the 0.1.74 code and measured in PROD on 2026-10-16):**
+  - **It is not NATS:** it is an in-house broker that speaks part of the NATS text protocol and
+    runs inside the router process, one per hive, with no link between hives.
+  - **Messages do not travel through it.** The router publishes a copy of each user message as a
+    turn, with a new TCP connection for each publish.
+  - **Its durability is weak:**
+    - each topic is an in-memory queue of up to 50,000 messages which, past the cap, deletes the
+      oldest ones even if nobody has read them, silently;
+    - one in-flight message per consumer;
+    - the disk is a single JSON file that is rewritten whole every 500 ms.
+  - **Only the motherbee's data reaches the database,** because SY.storage runs only there:
+    - worker1 had 67 turns that were never stored;
+    - the ingress (DMZ) kept on disk 597 turns of edge traffic that nobody consumes, and they were
+      going to grow up to 50,000.
 
-    Es el hueco que A-38 dejó anotado ("que lo de los workers llegue al motherbee"), y abarca todos
-    los hives menos el motherbee.
-  - **Tres temas sin productor** (`storage.events`, `storage.items`, `storage.reactivation`):
-    solo los usa un script E2E.
-  - **El plano del log vive en el camino rápido del router.** El operador: *"todo lo que va a DB es
+    It is the gap A-38 left noted ("getting what is on the workers to reach the motherbee"), and it
+    covers every hive except the motherbee.
+  - **Three topics with no producer** (`storage.events`, `storage.items`, `storage.reactivation`):
+    only an E2E script uses them.
+  - **The log plane lives in the router's fast path.** The operator: *"todo lo que va a DB es
     de log, alta cantidad de datos, tiempos largos... eso choca contra la dinámica de fluxbee
-    principalmente en los routers, que es alta velocidad"*.
-- **Decisiones del operador (2026-10-16, en el doc §0):**
-  - NATS muere (*"quedó como algo inicial viejo"*).
-  - El router gana un stream simple, uno por router, `RT.<router>.stream@<hive>`. La tubería es
-    el socket de Fluxbee.
-  - Mejor esfuerzo para todos.
-  - Ventana chica: 2 minutos y 32 MB por router, en constantes visibles. Al acumularse: alarma y
-    log reducido.
-  - El router nunca espera.
-  - Orden:
-    1. el stream con SY.storage;
-    2. cognition y policy, y NATS borrado;
-    3. los tokens.
-- **Revisión (una ronda, tres miradas: el router, el camino de los datos, los tokens):** todo
-  incorporado al doc.
-  - **Bugs vivos que encontró** (se arreglan en la etapa 1a, sobre el NATS de hoy):
-    - **las respuestas de la IA no se guardan en `turns`:** la clave `(ctx, seq)` sale del
-      `trace_id` y la respuesta reusa el del pedido, así que `ON CONFLICT DO NOTHING` la tira;
-    - **SY.cognition procesa varias veces cada turno:** confirma recién al terminar y el broker
-      reenvía cada 2 s. Un turno de prueba costó 3 o 4 llamados al modelo;
-    - **un frame de más de 128 KB mata un enlace para siempre** en los escritores de nodo, WAN e
-      IRP;
-    - **se descarta un mensaje de otro hive a un nodo de un router que no es el gateway;**
-    - **SY.storage no se reconecta a postgres;**
-    - **`storage_inbox` no se purga nunca,** y su reintento corre solo al arrancar.
-  - **Del diseño:**
-    - `RT.` reservado, con la verificación del PID del router;
-    - el disco del stream en su propio hilo;
-    - las colas separadas para turnos y para nodos;
-    - los acks autenticados;
-    - el cursor y la secuencia a prueba de recortes y reinicios;
-    - un ack al recibir para cognition y policy, sin reprocesar lo repetido;
-    - una conexión propia de SY.storage para lo que llega en lotes.
-  - **Para el operador:** seis preguntas (Q1 a Q6 del doc). Ninguna frena la etapa 1.
-- **Etapa 1a, el código (2026-10-16):** los bugs vivos arreglados sobre el NATS de hoy. Una
-  revisión del código (dos miradas) encontró, y se arregló antes del build:
-  - **La purga de `storage_inbox` habría borrado historia:** la página de mensajes de Archi lee la
-    inbox como el log de mensajes, y las respuestas que `turns` descartaba existen solo ahí. Sin
-    purga; dónde vive el log lo decide el operador (Q7 del doc);
-  - **el reintento de la inbox no contaba intentos** y reintentaba siempre las mismas filas: ahora
-    suma un intento por falla y avanza con un cursor;
-  - **SY.storage seguía sin base si postgres no estaba al arrancar:** ahora sale y systemd
-    reintenta;
-  - **el origen remoto del router** sale solo del LSA, con el nombre canónico (EDGE-01), y no del
-    frame. El respaldo por la tabla de alcance era código muerto fuera del gateway;
-  - **el daño del frame grande era menor que lo escrito:** nodo e IRP se reconectaban perdiendo lo
-    del medio; solo el enlace WAN quedaba muerto en un sentido.
-- **La etapa 1a, validada en 8.x (0.1.75):**
-  - un pedido y su respuesta quedan los dos en `turns`;
-  - un turno cuesta un llamado al etiquetador, contra 3 o 4 antes;
-  - SY.storage vuelve solo cuando se le corta la base;
-  - `RT.` queda reservado.
+    principalmente en los routers, que es alta velocidad"* ("everything that goes to the DB is log:
+    a high volume of data, long times... that clashes with fluxbee's dynamics, mainly in the
+    routers, which is high speed").
+- **The operator's decisions (2026-10-16, in the doc §0):**
+  - NATS dies (*"quedó como algo inicial viejo"* ("it was left over as an old, early thing")).
+  - The router gains a simple stream, one per router, `RT.<router>.stream@<hive>`. The pipe is
+    the Fluxbee socket.
+  - Best effort for everyone.
+  - A small window: 2 minutes and 32 MB per router, in visible constants. When it piles up: an
+    alarm and a reduced log.
+  - The router never waits.
+  - Order:
+    1. the stream with SY.storage;
+    2. cognition and policy, and NATS deleted;
+    3. the tokens.
+- **Review (one round, three views: the router, the data path, the tokens):** everything
+  incorporated into the doc.
+  - **Live bugs it found** (fixed in stage 1a, on today's NATS):
+    - **the AI's responses are not stored in `turns`:** the `(ctx, seq)` key comes from the
+      `trace_id` and the response reuses the request's, so `ON CONFLICT DO NOTHING` throws it away;
+    - **SY.cognition processes each turn several times:** it only confirms when it finishes, and
+      the broker redelivers every 2 s. A test turn cost 3 or 4 calls to the model;
+    - **a frame over 128 KB kills a link forever** in the node, WAN and IRP writers;
+    - **a message from another hive to a node on a router that is not the gateway is dropped;**
+    - **SY.storage does not reconnect to postgres;**
+    - **`storage_inbox` is never purged,** and its retry runs only at startup.
+  - **From the design:**
+    - `RT.` reserved, with verification of the router's PID;
+    - the stream's disk in its own thread;
+    - separate queues for turns and for nodes;
+    - authenticated acks;
+    - the cursor and the sequence made safe against trims and restarts;
+    - an ack on receipt for cognition and policy, without reprocessing repeats;
+    - a dedicated SY.storage connection for what arrives in batches.
+  - **For the operator:** six questions (Q1 to Q6 of the doc). None of them holds up stage 1.
+- **Stage 1a, the code (2026-10-16):** the live bugs fixed on today's NATS. A code review (two
+  views) found the following, and it was fixed before the build:
+  - **The `storage_inbox` purge would have deleted history:** Archi's messages page reads the
+    inbox as the message log, and the responses that `turns` discarded exist only there. No purge;
+    where the log lives is up to the operator (Q7 of the doc);
+  - **the inbox retry did not count attempts** and always retried the same rows: now it adds one
+    attempt per failure and moves forward with a cursor;
+  - **SY.storage stayed without a database if postgres was not there at startup:** now it exits
+    and systemd retries;
+  - **the router's remote origin** comes only from the LSA, with the canonical name (EDGE-01), and
+    not from the frame. The fallback through the reachability table was dead code outside the
+    gateway;
+  - **the damage from the big frame was smaller than written:** node and IRP reconnected, losing
+    what was in between; only the WAN link stayed dead in one direction.
+- **Stage 1a, validated on 8.x (0.1.75):**
+  - a request and its response both end up in `turns`;
+  - a turn costs one call to the labeler, versus 3 or 4 before;
+  - SY.storage comes back on its own when its database is cut;
+  - `RT.` stays reserved.
 
-  Detalle en `lab/DEPLOYMENTS.md`.
-- **Q7, decidida por el operador (2026-10-16):** Archi lee `turns` (*"que lea turn es integrado
-  mas que lo otro, si es asi hacerlo"*). `turns` pasa a ser el log de mensajes, y la inbox se
-  purga.
-- **Etapa 1b, el código:** el stream en cada router, con SY.storage como destino. Comprende:
-  - `turns` como log de mensajes, con backfill único y purga de la inbox;
-  - Archi sobre `turns`;
-  - `list_streams` en el admin;
-  - `streamlost` en `ops.py health`.
+  Detail in `lab/DEPLOYMENTS.md`.
+- **Q7, decided by the operator (2026-10-16):** Archi reads `turns` (*"que lea turn es integrado
+  mas que lo otro, si es asi hacerlo"* ("having it read turn is more integrated than the other
+  thing; if so, do it")). `turns` becomes the message log, and the inbox gets purged.
+- **Stage 1b, the code:** the stream on each router, with SY.storage as the destination. It
+  includes:
+  - `turns` as the message log, with a one-time backfill and a purge of the inbox;
+  - Archi on `turns`;
+  - `list_streams` in the admin;
+  - `streamlost` in `ops.py health`.
 
-  Una revisión del código (una ronda) no encontró ningún HIGH. Se arregló todo antes del build:
-  - **los contadores de pérdida mentían en las dos direcciones:**
-    - el recorte sacaba lo vencido sin contarlo;
-    - cada reintento de un lote volvía a contar lo salteado.
+  A code review (one round) found no HIGH. Everything was fixed before the build:
+  - **the loss counters lied in both directions:**
+    - the trim removed what had expired without counting it;
+    - each retry of a batch counted the skipped items again.
 
-    Ahora se cuenta una vez: cuando el cursor lo pasa, o cuando sale del log sin que el destino lo
-    haya tomado. Lo que está en un lote en vuelo espera su ack;
-  - **el orden del upgrade revivía el consumidor viejo:** el router nuevo arranca antes que el
-    SY.storage viejo, que volvía a suscribirse. Habría retenido `storage.turns` y guardado cada
-    turno dos veces mientras tanto. Ahora el broker rechaza ese consumidor;
-  - **menores:**
-    - el disco se escribe fuera del lock que usan los hilos del router;
-    - una escritura fallida abre un segmento nuevo en vez de cortar el que estaba;
-    - la cola tiene tope en bytes;
-    - el último segmento se borra cuando no queda nada por entregar;
-    - el procesamiento de SY.storage sale del camino del ack;
-    - cada registro tiene que venir de un nodo del hive de su stream;
-    - Archi lee el cursor del tail antes que la lista.
-- **La etapa 1b, validada en 8.x (0.1.76):**
-  - **los cuatro hives llegan a la base:** worker1, el ingress y el egress por primera vez;
-  - **el backfill dejó las 582 filas de `turns` con su mensaje,** y la inbox borró 435 filas
-    viejas;
-  - **Archi muestra `turns`,** con el tail en vivo;
-  - **SY.storage ausente 71 s:** el backlog se vio y se entregó todo una vez;
-  - **ausente más de 3 min:** 10 vencidos contados una vez, con la alarma, y el ruteo siguió;
-  - **un router reiniciado con pendientes** los recuperó del disco;
-  - **el motherbee reiniciado bajo tráfico** no perdió nada;
-  - **health limpio** fuera del vencimiento inducido.
+    Now each one is counted once: when the cursor passes it, or when it leaves the log without the
+    destination having taken it. What is in an in-flight batch waits for its ack;
+  - **the upgrade order revived the old consumer:** the new router starts before the old
+    SY.storage, which subscribed again. It would have held on to `storage.turns` and stored every
+    turn twice in the meantime. Now the broker rejects that consumer;
+  - **minor:**
+    - the disk is written outside the lock that the router's threads use;
+    - a failed write opens a new segment instead of cutting the one that was there;
+    - the queue has a cap in bytes;
+    - the last segment is deleted when there is nothing left to deliver;
+    - SY.storage's processing moves out of the ack path;
+    - each record has to come from a node in its stream's hive;
+    - Archi reads the tail cursor before the list.
+- **Stage 1b, validated on 8.x (0.1.76):**
+  - **the four hives reach the database:** worker1, the ingress and the egress for the first time;
+  - **the backfill left the 582 rows of `turns` with their message,** and the inbox deleted 435 old
+    rows;
+  - **Archi shows `turns`,** with the live tail;
+  - **SY.storage absent for 71 s:** the backlog was seen, and everything was delivered once;
+  - **absent for more than 3 min:** 10 expired, counted once, with the alarm, and routing carried
+    on;
+  - **a router restarted with pending items** recovered them from disk;
+  - **the motherbee restarted under traffic** lost nothing;
+  - **clean health** apart from the induced expiry.
 
-  Para probarlo hubo que enmascarar `sy-storage`: el watchdog de SY.orchestrator lo levanta a los 2
-  s de un `stop`. Detalle en `lab/DEPLOYMENTS.md`.
-- **Etapa 2, conversada con el operador (2026-10-17, doc §6.1):**
-  - **la cognición es de los interlocutores** (*"la parte cognitiva es de los interlocutores no
-    de que hive está o que nodo es... los nodos son mecanismos, igual que el router"*): memoria y
-    referencias por comunicación entre ILKs, nunca por hive o nodo;
-  - **el dueño del turno es el dueño de la comunicación:** el agente que la atiende;
-  - **cognition sigue junto a los agentes** (motherbee y workers), para que lean su memoria por
-    SHM local (*"no quiero cambiar eso"*). El router del agente le pasa los dos sentidos a su
-    cognition local;
-  - SY.policy se va (*"si no hace nada sacalo. molesta"*); NATS se borra entero, sin legado; los
-    597 turnos del ingress se tiran; los datos de prueba se pueden borrar;
-  - el costo de LLM queda como está; lo transversal entre hives es para después.
+  To test it, `sy-storage` had to be masked: SY.orchestrator's watchdog brings it up 2 s after a
+  `stop`. Detail in `lab/DEPLOYMENTS.md`.
+- **Stage 2, discussed with the operator (2026-10-17, doc §6.1):**
+  - **cognition belongs to the interlocutors** (*"la parte cognitiva es de los interlocutores no
+    de que hive está o que nodo es... los nodos son mecanismos, igual que el router"* ("the
+    cognitive part belongs to the interlocutors, not to which hive it is on or which node it is...
+    the nodes are mechanisms, just like the router")): memory and references per communication
+    between ILKs, never per hive or node;
+  - **the owner of the turn is the owner of the communication:** the agent serving it;
+  - **cognition stays next to the agents** (motherbee and workers), so they read their memory
+    through local SHM (*"no quiero cambiar eso"* ("I don't want to change that")). The agent's
+    router passes both directions to its local cognition;
+  - SY.policy goes away (*"si no hace nada sacalo. molesta"* ("if it does nothing, take it out.
+    it's in the way")); NATS is deleted entirely, with no legacy; the ingress's 597 turns are thrown
+    away; test data can be deleted;
+  - the LLM cost stays as it is; what cuts across hives is for later.
 
-  Una revisión del diseño (una ronda) encontró un HIGH: sacar SY.policy en una sola versión
-  bloqueaba el core-update de todos los workers. Va en dos versiones. Los MEDIUM se incorporaron:
-  una comunicación es `(thread_id, ILK del agente)`, el número de turno reemplaza a `thread_seq`,
-  la época del stream, los sobres empaquetados, la región que sobrevive reinicios, la recarga por
-  la malla y pesos iguales para los dos ILKs.
-- **Etapa 2a, el código:** cognition por comunicación, SY.policy retirado (primera versión) y el
-  router sin NATS para turnos. Una revisión del código (una ronda), sin HIGH. Se arregló antes del
-  build:
-  - **MEDIUM:** una comunicación cargada se quedaba vieja si su agente se iba a otro hive y
-    volvía, y la otra cognition la había seguido. Ahora, después de 5 min sin turnos, se vuelve a
-    pedir a SY.storage, y gana la que va más adelante;
+  A design review (one round) found one HIGH: removing SY.policy in a single version blocked the
+  core-update of every worker. It goes in two versions. The MEDIUMs were incorporated: a
+  communication is `(thread_id, agent ILK)`, the turn number replaces `thread_seq`, the stream's
+  epoch, the packed envelopes, the region that survives restarts, the reload over the mesh, and
+  equal weights for the two ILKs.
+- **Stage 2a, the code:** cognition per communication, SY.policy retired (first version) and the
+  router without NATS for turns. A code review (one round), no HIGH. Fixed before the build:
+  - **MEDIUM:** a loaded communication went stale if its agent went to another hive and came back,
+    and the other cognition had continued it. Now, after 5 min without turns, it is requested
+    again from SY.storage, and the one that is further ahead wins;
   - **LOW:**
-    - el nodo del agente se fija apenas se trae el estado;
-    - la recarga conserva lo que SY.storage todavía no tiene, y corre fuera del loop principal;
-    - sin hilo no se lee la región de memoria;
-    - el `hive.yaml` se escribe atómico;
-    - los scopes también los protege el número de turno;
-    - SY.frontdesk.gov contesta con su ILK;
-    - comentarios y pasajes del doc viejos.
-- **La etapa 2a, validada en 8.x (0.1.77):**
-  - **dos hives, una comunicación:** un interlocutor en worker1 y el agente en el motherbee. La
-    cognition del motherbee recibió los dos sentidos, la de worker1 nada; una sola comunicación
-    en la base, escrita por una cognition, con el ILK del agente;
-  - **las respuestas salen con el ILK del agente;**
-  - **el agente recibe el paquete de su comunicación,** y el que manda el emisor se descarta;
-  - **un reinicio de cognition** recarga por la malla y la memoria queda; la numeración sigue;
-  - **el refetch por inactividad** pide el estado una vez, después de 5 min sin turnos;
-  - **un agente en worker1:** la cognition de worker1 escribe en postgres por el stream. Antes no
-    tenía base;
-  - **SY.policy** no corre en ningún hive; NATS no recibió nada; health limpio.
+    - the agent's node is pinned as soon as the state is fetched;
+    - the reload keeps what SY.storage does not have yet, and it runs outside the main loop;
+    - without a thread, the memory region is not read;
+    - the `hive.yaml` is written atomically;
+    - scopes are also protected by the turn number;
+    - SY.frontdesk.gov answers with its ILK;
+    - old comments and doc passages.
+- **Stage 2a, validated on 8.x (0.1.77):**
+  - **two hives, one communication:** an interlocutor on worker1 and the agent on the motherbee.
+    The motherbee's cognition received both directions, worker1's nothing; one single
+    communication in the database, written by one cognition, with the agent's ILK;
+  - **the responses go out with the agent's ILK;**
+  - **the agent receives its communication's package,** and the one the sender sends is dropped;
+  - **a cognition restart** reloads over the mesh and the memory stays; the numbering continues;
+  - **the inactivity refetch** asks for the state once, after 5 min without turns;
+  - **an agent on worker1:** worker1's cognition writes to postgres through the stream. Before, it
+    had no database;
+  - **SY.policy** runs on no hive; NATS received nothing; clean health.
 
-  Detalle en `lab/DEPLOYMENTS.md`.
-- **Etapa 2b, el código:** NATS borrado, unas 9.000 líneas: el broker, el cliente del SDK, los
-  diags, ocho scripts, SY.policy y `thread_seq`. Las métricas de SY.storage y la espera del
-  orquestador por la base pasan a la malla (`STORAGE_METRICS_GET`), y hay transiciones únicas al
-  arrancar. Una revisión del código con dos miradas, sin HIGH:
-  - **MEDIUM:** en el motherbee, el router viejo volvía a escribir el estado del broker después de
-    la limpieza, al pararse durante el arranque. La limpieza ahora corre después de que el router
-    corre el binario nuevo;
-  - **LOW, todos arreglados:**
-    - los nodos retirados quedan afuera para todo el que lee una sección de roles;
-    - los comandos del admin, que quedaban en cola durante el arranque, reciben
-      `ORCHESTRATOR_BOOTING`;
-    - un escaneo de métricas a la vez;
-    - restos de SY.policy en un motherbee instalado con `install.sh`;
-    - comentarios viejos;
-    - el chequeo de paridad del catálogo del admin, roto desde 1b y A-68.
-- **La etapa 2b, validada en 8.x (0.1.78):**
-  - **en ningún hive queda nada de NATS ni de SY.policy:** nada en 4222, ni directorio, ni
-    sección, ni unit, ni binario;
-  - **el ingress registró sus 597 turnos pendientes** antes de borrar el broker;
-  - **las métricas y la espera de la base funcionan por la malla;**
-  - **con SY.storage retenido,** el admin contestó `ORCHESTRATOR_BOOTING` en 0,01 s durante el
-    arranque, en vez de colgarse;
-  - **la regresión de cognition pasa;**
-  - **health limpio.**
+  Detail in `lab/DEPLOYMENTS.md`.
+- **Stage 2b, the code:** NATS deleted, some 9,000 lines: the broker, the SDK client, the diags,
+  eight scripts, SY.policy and `thread_seq`. SY.storage's metrics and the orchestrator's wait for
+  the database move to the mesh (`STORAGE_METRICS_GET`), and there are one-time transitions at
+  startup. A code review with two views, no HIGH:
+  - **MEDIUM:** on the motherbee, the old router wrote the broker's state again after the cleanup,
+    when it stopped during startup. The cleanup now runs after the router runs the new binary;
+  - **LOW, all fixed:**
+    - retired nodes stay out for everyone who reads a roles section;
+    - the admin's commands, which stayed queued during startup, get `ORCHESTRATOR_BOOTING`;
+    - one metrics scan at a time;
+    - SY.policy leftovers on a motherbee installed with `install.sh`;
+    - old comments;
+    - the admin catalog's parity check, broken since 1b and A-68.
+- **Stage 2b, validated on 8.x (0.1.78):**
+  - **nothing of NATS or SY.policy is left on any hive:** nothing on 4222, no directory, no
+    section, no unit, no binary;
+  - **the ingress recorded its 597 pending turns** before the broker was deleted;
+  - **the metrics and the database wait work over the mesh;**
+  - **with SY.storage held back,** the admin answered `ORCHESTRATOR_BOOTING` in 0.01 s during
+    startup, instead of hanging;
+  - **the cognition regression passes;**
+  - **clean health.**
 
-  Detalle en `lab/DEPLOYMENTS.md`.
-- **Etapa 3, conversada con el operador (2026-10-17, doc §7.1):**
-  - el nodo de un tenant paga su tenant; cognition, el del agente de la comunicación; el
-    frontdesk, el del caso (*"OK todo"*);
-  - una llamada que su llamador abandona queda `abandoned`, sin tokens (*"después vemos qué
-    cambiamos si no sirve así"*);
-  - Archi y el ejecutor del admin pagan con el raíz (*"cobranza será a raíz"*). Cada registro
-    guarda a qué trabajo de Archi pertenece: sesión, corrida del pipeline y solución. Ese es el
-    lugar para el tenant del cliente, más adelante;
-  - no se borra nada por ahora; una política general de la base por fechas, después;
-  - `ai_local_probe` se borra;
-  - las lecturas para Cloud, aprobadas (*"en todo caso evolucionará después"*).
-- **Etapa 3, el código:**
-  - **qué hace:**
-    - cada llamada a un modelo deja un registro, cobrado a un tenant, en `llm_usage`;
-    - el AI SDK lo anota en el stream del router;
-    - SY.storage lo chequea contra identity;
-    - el admin, Archi y Cloud lo leen.
-  - **La revisión del código,** con dos miradas:
-    - **HIGH:** el router comparaba con mayúsculas los nombres `SY.*` que cobran a otros tenants,
-      y SY.storage sin ellas. Un proceso con `sy.frontdesk.gov` desde cualquier hive podía cobrarle
-      a cualquier tenant;
-    - **MEDIUM:** un registro anotado mientras el router del nodo reiniciaba se perdía sin
-      contarse. Ahora la anotación espera a que el nodo esté conectado;
-    - **LOW, arreglados:** el clasificador de fallas de Archi sin sesión, un pipeline terminado
-      nombrado en el trabajo de turnos posteriores, y el índice de la sincronización por tenant;
-    - **LOW, queda con A-62:** el ejecutor deja leer el uso de todos los tenants a cualquier nodo
-      de la malla, como cualquier otra acción.
-- **La etapa 3, validada en 8.x (0.1.79),** con un agente en el tenant de prueba `pruebas`:
-  - **cada nodo cobra a quien debe:**
-    - el agente, a `pruebas`;
-    - cognition, a `pruebas` por el agente;
-    - el frontdesk, al tenant del caso, o al raíz como respaldo;
-    - Archi, al raíz con su sesión.
-  - **Las sondas:**
-    - un tenant ajeno reclamado quedó como desajuste;
-    - un `SY.*` ajeno fue rechazado;
-    - `sy.frontdesk.gov` en minúsculas desde worker1 lo rechazó el router;
-    - un nodo sin identidad quedó sin verificar a los 10 minutos.
-  - **`abandoned`:** cognition con 50 ms dejó registros `abandoned` sin tokens.
-  - **Lecturas:** el operador, Archi y Cloud las leyeron. Cloud ve solo su tenant, y el raíz le
-    da `TENANT_ROOT_PROTECTED`.
-  - **Health:** `usagelost` en 0. Lo único rechazado fueron las sondas.
-  - **Limpieza:** todo lo de prueba quedó borrado, también las claves y el tenant `pruebas`.
+  Detail in `lab/DEPLOYMENTS.md`.
+- **Stage 3, discussed with the operator (2026-10-17, doc §7.1):**
+  - a tenant's node is paid for by its tenant; cognition, by the tenant of the communication's
+    agent; the frontdesk, by the case's (*"OK todo"* ("OK, all of it"));
+  - a call that its caller abandons stays `abandoned`, with no tokens (*"después vemos qué
+    cambiamos si no sirve así"* ("later we'll see what we change if it doesn't work like this"));
+  - Archi and the admin's executor pay with the root (*"cobranza será a raíz"* ("billing will go
+    to root")). Each record stores which Archi work it belongs to: session, pipeline run and
+    solution. That is the place for the customer's tenant, later on;
+  - nothing is deleted for now; a general date-based policy for the database, later;
+  - `ai_local_probe` is deleted;
+  - the reads for Cloud, approved (*"en todo caso evolucionará después"* ("in any case it will
+    evolve later")).
+- **Stage 3, the code:**
+  - **what it does:**
+    - every call to a model leaves a record, charged to a tenant, in `llm_usage`;
+    - the AI SDK writes it to the router's stream;
+    - SY.storage checks it against identity;
+    - the admin, Archi and Cloud read it.
+  - **The code review,** with two views:
+    - **HIGH:** the router compared the names of the `SY.*` nodes that charge other tenants
+      case-sensitively, and SY.storage case-insensitively. A process with `sy.frontdesk.gov` from
+      any hive could charge any tenant;
+    - **MEDIUM:** a record written while the node's router was restarting was lost without being
+      counted. Now the write waits until the node is connected;
+    - **LOW, fixed:** Archi's failure classifier without a session, a finished pipeline named in
+      the work of later turns, and the index of the per-tenant sync;
+    - **LOW, stays with A-62:** the executor lets any node of the mesh read every tenant's usage,
+      like any other action.
+- **Stage 3, validated on 8.x (0.1.79),** with an agent in the test tenant `pruebas`:
+  - **each node charges whoever it should:**
+    - the agent, to `pruebas`;
+    - cognition, to `pruebas` through the agent;
+    - the frontdesk, to the case's tenant, or to the root as a fallback;
+    - Archi, to the root with its session.
+  - **The probes:**
+    - a foreign tenant that was claimed ended up as a mismatch;
+    - a foreign `SY.*` was rejected;
+    - `sy.frontdesk.gov` in lowercase from worker1 was rejected by the router;
+    - a node with no identity stayed unverified at 10 minutes.
+  - **`abandoned`:** cognition with 50 ms left `abandoned` records with no tokens.
+  - **Reads:** the operator, Archi and Cloud read them. Cloud sees only its tenant, and the root
+    gives it `TENANT_ROOT_PROTECTED`.
+  - **Health:** `usagelost` at 0. The only things rejected were the probes.
+  - **Cleanup:** everything from the test was deleted, including the keys and the `pruebas`
+    tenant.
 
-  Detalle en `lab/DEPLOYMENTS.md`.
-- **Etapas:**
-  1. **1a:** los bugs vivos ✅;
-  2. **1b:** el stream con SY.storage ✅;
-  3. **2a:** cognition por comunicación, SY.policy retirado ✅;
-  4. **2b:** NATS borrado, y SY.policy fuera del todo ✅;
-  5. **3:** el uso de LLM, registrado por llamada y cobrado a un tenant ✅.
+  Detail in `lab/DEPLOYMENTS.md`.
+- **Stages:**
+  1. **1a:** the live bugs ✅;
+  2. **1b:** the stream with SY.storage ✅;
+  3. **2a:** cognition per communication, SY.policy retired ✅;
+  4. **2b:** NATS deleted, and SY.policy gone completely ✅;
+  5. **3:** LLM usage, recorded per call and charged to a tenant ✅.
 
-### A-69 ✅ VALIDADO EN 8.x (0.1.73 y 0.1.74, 2026-10-16) — SY.cognition fallaba en cada turno con los dos proveedores: mandaba `temperature`
+### A-69 ✅ VALIDATED ON 8.x (0.1.73 and 0.1.74, 2026-10-16) — SY.cognition failed on every turn with both providers: it sent `temperature`
 
-- **Cómo salió:** el operador pidió probar su key de Anthropic en toda la infra (2026-10-16).
-  - Archi, el admin y el frontdesk anduvieron con Claude: Archi contesta y usa sus herramientas.
-  - SY.cognition falló al etiquetar un turno de prueba, con Opus 5.5 y con Sonnet 5.5.
-  - De vuelta en OpenAI, falló igual.
-- **Qué pasaba:**
-  - **`temperature`:** el etiquetador semántico y el resumidor narrativo lo mandaban (0,1 y 0,2).
-    Los modelos actuales de los dos proveedores lo rechazan:
+- **How it came up:** the operator asked to test their Anthropic key across the whole infra
+  (2026-10-16).
+  - Archi, the admin and the frontdesk worked with Claude: Archi answers and uses its tools.
+  - SY.cognition failed when labeling a test turn, with Opus 5.5 and with Sonnet 5.5.
+  - Back on OpenAI, it failed the same way.
+- **What happened:**
+  - **`temperature`:** the semantic labeler and the narrative summarizer sent it (0.1 and 0.2).
+    The current models of both providers reject it:
     - Claude 5: "`temperature` is deprecated for this model";
     - gpt-5.5: "Unsupported parameter: 'temperature' is not supported with this model".
 
-    Cada turno se quedaba sin derivación semántica. Solo se veía un WARN y el contador
-    `semantic_tagger_invalid_outputs_total`, porque el SDK informa el 400 del proveedor como error
-    de protocolo.
-  - **Los topes de salida** (256 y 220 tokens) quedaban justos para un modelo que razona antes de
-    contestar.
-  - **El estado mentía después de cada arranque:** decía `degraded_no_ai_provider` hasta su primer
-    turno o un cambio de la key, aunque la key estuviera. No la resolvía al arrancar, a diferencia
-    de Archi y el frontdesk. En worker1 se veía después de cada core-update.
-- **Arreglo:**
-  - sin `temperature`, como sus pares (Archi, el admin, ai.generic);
-  - topes de 1024 tokens: el tope solo acota una respuesta desbocada, no cambia lo que se gasta;
-  - la key se resuelve al arrancar, esperando al vault como la reconstrucción desde la base;
-  - el log del cambio de secreto decía "openai" fijo; ahora nombra el tipo de la key.
-- **El gate de 0.1.73 (con Claude) pasó:**
-  - cognition arrancó listo en los dos hives, también en worker1 recién actualizado;
-  - un turno de prueba salió etiquetado (`billing`, `duplicate charge`, `october invoice`…) y
-    resumido.
-- **El mismo turno con OpenAI encontró un segundo bug, en el SDK:**
-  - Su camino sin herramientas leía el texto de `output[0]`. Un modelo que razona (gpt-5.5) pone
-    primero un ítem `reasoning`, y el mensaje viene después: "missing text output".
-  - Archi no lo veía porque su camino con herramientas recorre todos los ítems.
-  - Arreglo para 0.1.74: un solo lector para los dos caminos. Toma `output_text` si el servidor lo
-    manda; si no, el primer ítem `message`.
-- **El gate de 0.1.74:** cognition anduvo con OpenAI (etiquetador y resumidor) y con Claude. Con
-  Opus 5.5, uno de tres resúmenes pasó el timeout de 8 s (`semantic_tagger.timeout_ms`): ese turno
-  queda sin síntesis de memoria. Subirlo o usar Sonnet 5.5 lo decide el operador.
-- **Lo que no entra (anotado):**
-  - el SDK informa un error HTTP del proveedor como error de protocolo, y eso mezcla dos contadores
-    de cognition. Va con la revisión del SDK de IA;
-  - `config-get` sobre SY.admin contesta su rechazo de origen (`CONFIG_GET_RESPONSE`) a una consulta
-    del propio admin. Sin investigar.
-  - **SY.cognition en un worker no llega a la base:** cada hive tiene su NATS embebido y
-    SY.storage corre solo en el motherbee. Lo que publica un nodo de worker1 (sus turnos, lo que
-    escribe su cognition) se queda en el NATS de worker1, y su reconstrucción falla ("error
-    connecting to server"). Es anterior a esto; importa para la etapa 5 (dónde se registra el
-    consumo de un nodo de un worker).
+    Each turn was left without semantic derivation. Only a WARN and the
+    `semantic_tagger_invalid_outputs_total` counter showed it, because the SDK reports the
+    provider's 400 as a protocol error.
+  - **The output caps** (256 and 220 tokens) were tight for a model that reasons before
+    answering.
+  - **The status lied after every startup:** it said `degraded_no_ai_provider` until its first
+    turn or a key change, even though the key was there. It did not resolve it at startup, unlike
+    Archi and the frontdesk. On worker1 it showed after every core-update.
+- **Fix:**
+  - no `temperature`, like its peers (Archi, the admin, ai.generic);
+  - caps of 1024 tokens: the cap only bounds a runaway response, it does not change what is spent;
+  - the key is resolved at startup, waiting for the vault like the rebuild from the database;
+  - the secret-change log said "openai" hardcoded; now it names the key's type.
+- **The 0.1.73 gate (with Claude) passed:**
+  - cognition started ready on both hives, also on the freshly updated worker1;
+  - a test turn came out labeled (`billing`, `duplicate charge`, `october invoice`…) and
+    summarized.
+- **The same turn with OpenAI found a second bug, in the SDK:**
+  - Its tool-less path read the text from `output[0]`. A reasoning model (gpt-5.5) puts a
+    `reasoning` item first, and the message comes after it: "missing text output".
+  - Archi did not see it because its path with tools walks through all the items.
+  - Fix for 0.1.74: one single reader for both paths. It takes `output_text` if the server sends
+    it; if not, the first `message` item.
+- **The 0.1.74 gate:** cognition worked with OpenAI (labeler and summarizer) and with Claude. With
+  Opus 5.5, one summary out of three went past the 8 s timeout (`semantic_tagger.timeout_ms`): that
+  turn is left without memory synthesis. Raising it or using Sonnet 5.5 is the operator's call.
+- **What is left out (noted):**
+  - the SDK reports a provider HTTP error as a protocol error, and that mixes two cognition
+    counters. It goes with the AI SDK review;
+  - `config-get` on SY.admin answers with its origin rejection (`CONFIG_GET_RESPONSE`) to a query
+    from the admin itself. Not investigated.
+  - **SY.cognition on a worker does not reach the database:** each hive has its embedded NATS, and
+    SY.storage runs only on the motherbee. What a worker1 node publishes (its turns, what its
+    cognition writes) stays in worker1's NATS, and its rebuild fails ("error connecting to
+    server"). It predates this; it matters for stage 5 (where a worker node's consumption gets
+    recorded).
 
-### A-68 ✅ VALIDADO EN 8.x (0.1.70 a 0.1.72, 2026-10-16) — Los nodos WF quedaban fuera del estándar: SY.wf-rules los manejaba directo con el orquestador, y el nodo Go tenía su propio plano de control
+### A-68 ✅ VALIDATED ON 8.x (0.1.70 to 0.1.72, 2026-10-16) — WF nodes were outside the standard: SY.wf-rules handled them directly with the orchestrator, and the Go node had its own control plane
 
-- **Cómo salió:** el operador preguntó si el nodo WF arranca como los demás (2026-10-15). El
-  orquestador lo arranca igual: `systemd-run`, `config.json` con `_system`, el reconcile de 60 s.
-  Lo distinto estaba alrededor. Diseño: `docs/wf-standard-path-v1.md`.
-- **Qué pasaba:**
-  - **Quién lo lanza.**
-    - SY.wf-rules mandaba SPAWN, RESTART, KILL y NODE_CONFIG_GET/SET directo a
-      `SY.orchestrator@<hive>`, y NODE_STATUS_GET al nodo, con la autoridad de la regla (4) de
-      la política de sistema.
-    - Rompía "todas las acciones pasan por el admin".
-    - Todo nodo WF quedaba con `launched_by: system`.
-  - **El nodo Go.**
-    - Leía `_system` en estricto y lo reescribía desde su struct: una clave nueva del
-      orquestador lo tiraba (pasó con `launched_by` en la etapa 4).
-    - Con una config o una definición rota salía, systemd lo relanzaba cada 5 s, y el motivo
-      quedaba solo en journald.
-    - Siempre contestaba HEALTHY.
-    - Sus errores de CONFIG_SET traían `detail`, que el admin no lee.
-    - Escribía un `config_version` de más en la raíz, sin escritura atómica y con 0644.
-  - **El deploy desde Archi estaba roto.**
-    - El admin atendía de a uno los pedidos de la malla, y el `wf_rules_*` de Archi esperaba a
+- **How it came up:** the operator asked whether the WF node starts like the others (2026-10-15).
+  The orchestrator starts it the same way: `systemd-run`, `config.json` with `_system`, the 60 s
+  reconcile. What was different was around it. Design: `docs/wf-standard-path-v1.md`.
+- **What happened:**
+  - **Who launches it.**
+    - SY.wf-rules sent SPAWN, RESTART, KILL and NODE_CONFIG_GET/SET directly to
+      `SY.orchestrator@<hive>`, and NODE_STATUS_GET to the node, with the authority of rule (4) of
+      the system policy.
+    - It broke "every action goes through the admin".
+    - Every WF node ended up with `launched_by: system`.
+  - **The Go node.**
+    - It read `_system` strictly and rewrote it from its struct: a new key from the orchestrator
+      brought it down (it happened with `launched_by` in stage 4).
+    - With a broken config or definition it exited, systemd relaunched it every 5 s, and the
+      reason stayed only in journald.
+    - It always answered HEALTHY.
+    - Its CONFIG_SET errors carried `detail`, which the admin does not read.
+    - It wrote an extra `config_version` at the root, with no atomic write and with 0644.
+  - **The deploy from Archi was broken.**
+    - The admin served the mesh's requests one at a time, and Archi's `wf_rules_*` waited for
       SY.wf-rules.
-    - SY.wf-rules llamaba al admin para publicar el paquete y ese pedido quedaba en cola: a los
-      5 s `PACKAGE_PUBLISH_FAILED`, con `current` ya rotado.
-    - Borrar fallaba igual, y los planes del executor también corrían en ese loop.
-    - Solo andaba el HTTP del operador, que atiende cada conexión en su propia tarea.
+    - SY.wf-rules called the admin to publish the package, and that request stayed in the queue:
+      at 5 s `PACKAGE_PUBLISH_FAILED`, with `current` already rotated.
+    - Deleting failed the same way, and the executor's plans also ran in that loop.
+    - Only the operator's HTTP worked, which serves each connection in its own task.
   - **`WF.orch.diag`.**
-    - La regla (4) le daba autoridad casi de admin a ese nombre de las pruebas E2E.
-    - Un workflow llamado `orch.diag` se habría desplegado con ese nombre, y un workflow puede
-      mandar mensajes de sistema.
-- **Arreglo:**
-  - **El admin atiende cada comando de la malla en su propia tarea,** como el HTTP. Se va la
-    clase entera de deadlock: el de 0.1.69, el de Archi y el de los planes.
-  - **SY.wf-rules maneja sus nodos por el admin.**
-    - Usa `get_node_config`, `set_node_config`, `run_node`, `restart_node`, `kill_node` y
+    - Rule (4) gave almost-admin authority to that name from the E2E tests.
+    - A workflow called `orch.diag` would have been deployed with that name, and a workflow can
+      send system messages.
+- **Fix:**
+  - **The admin serves each mesh command in its own task,** like the HTTP. The whole class of
+    deadlock goes away: the 0.1.69 one, Archi's and the plans'.
+  - **SY.wf-rules handles its nodes through the admin.**
+    - It uses `get_node_config`, `set_node_config`, `run_node`, `restart_node`, `kill_node` and
       `get_node_status`.
-    - El admin lo deja actuar solo sobre los `WF.*` de su hive.
-    - Lo único que le pregunta directo al nodo son sus instancias en curso (WF_LIST_INSTANCES),
-      que es una lectura.
-  - **`launched_by`:** el admin anota quién pidió el deploy (`operator` por HTTP, `archi`) y
-    SY.wf-rules lo lleva al `run_node`.
-  - **La política:**
-    - la regla (4) queda solo para SY.admin, con los dos wasm recompilados;
-    - los marcadores de autoridad de config-routes y la tabla de `docs/04-routing.md` quedan al
-      día.
-  - **El SDK de Go tiene el plano de control de los nodos administrados,** un port del de Rust:
-    - `_system` intocable;
-    - FAILED_CONFIG con su motivo;
-    - escritura atómica que conserva el modo del archivo;
-    - salud según el estado de la config.
-  - **El nodo WF lo usa,** y valida la definición del workflow como parte de la config
-    (`invalid_definition`). Con una config que no puede usar queda arriba, contesta lo de control
-    y descarta el tráfico de workflow hasta que un reinicio aplique una config buena.
-  - **Una consulta `wf_rules_*` por la malla sin hive** contesta un error en vez de nada.
-- **Revisión (una ronda): 1 bloqueante y 7 a arreglar, todo arreglado antes del build.**
-  - **Bloqueante: un paquete de workflow a medio sincronizar.**
-    - Syncthing puede traer el manifest y el `package.json` antes que el `flow/definition.json`.
-      Antes el nodo WF caía en bucle hasta que llegaba, y se arreglaba solo; con el cambio
-      esperaba en FAILED_CONFIG y nadie lo reintentaba.
-    - Ahora el orquestador contesta `RUNTIME_NOT_PRESENT` para un paquete de workflow sin su
-      definición: en `run_node`, en cada arranque y reinicio (el reconcile incluido) y antes de que
-      `set_node_config` vincule la versión. SY.wf-rules reintenta mientras se sincroniza.
-  - **El manifest de runtimes.**
-    - Con el admin atendiendo en paralelo, publicar y borrar versiones podían pisarse; un lock los
-      serializa.
-    - SY.wf-rules ya no escribe el dist del motherbee: borra las versiones viejas por el admin en
-      todos los hives.
-  - **Los tiempos.**
-    - SY.wf-rules le da a cada pedido un plazo de 35 s; el admin lo espera 45 s y Archi 60 s.
-    - Antes Archi y el admin esperaban lo mismo, 30 s, y una respuesta cerca del límite se perdía.
-  - **Quién le pide a SY.wf-rules.**
-    - Acepta operaciones solo del admin; antes cualquier nodo podía pedirle desplegar o borrar.
-    - El admin le acepta `launched_by` solo `operator` o `archi`. Nunca `cloud`, que le daría a
-      Cloud el manejo del nodo.
-  - **El contenido:** el admin le exige el runtime `wf.<x>` del propio nodo, la base `wf.engine` y
-    un `package_path` de ese paquete.
-  - **El re-vinculado manda solo el binding** (el orquestador mezcla), en vez de copiar la config
-    del nodo, que arrastraba claves escritas por nodos viejos.
-  - **SY.wf-rules lee bien la negativa de un nodo WF** (`node_not_configured`) y deja de tomarla
-    como un timeout.
-  - **Menores:**
-    - un comando de la malla que falla antes de responder contesta `INTERNAL_ERROR`;
-    - la respuesta del CONFIG_SET del nodo WF trae su estado real, sin cambiar hasta el reinicio,
-      y `pending_restart`;
-    - el SDK no escribe sobre un `config.json` que no puede leer.
-- **El gate de 0.1.70 en 8.x encontró dos cosas, arregladas para 0.1.71:**
-  - **Una actualización en worker1 no esperó lo suficiente.**
-    - El paquete nuevo llegó más de 20 s después de publicado.
-    - La causa: justo antes se había borrado otro workflow. Syncthing de worker1 falló al borrar
-      sus directorios ("not empty", padre antes que hijos), marcó la carpeta de runtimes como
-      fallida y la reintentó.
-    - Ahora SY.wf-rules espera el paquete hasta 45 s, con un plazo de 60 s por pedido; el admin
-      espera 75 s y Archi 90 s.
-  - **Un borrado en worker1 dejó sus paquetes en el motherbee.**
-    - SY.wf-rules borra la versión vigente al final según su copia del manifest, que después de
-      un rollback iba atrasada. El admin la rechazó (`RUNTIME_CURRENT_CONFLICT`) y la purga cortó
-      ahí.
-    - Ahora una versión rechazada como vigente se reintenta cuando las demás ya no están.
-    - Los paquetes huérfanos de la prueba se borraron a mano.
-- **El gate de 0.1.71 encontró que esperar más no alcanzaba, arreglado para 0.1.72.**
-  - **Un primer deploy en worker1 esperó 45 s y el paquete no llegó.**
-    - Del motherbee al worker: el manifest llegó a los 12 s y los archivos del paquete a los
+    - The admin lets it act only on the `WF.*` nodes of its hive.
+    - The only thing it asks the node directly is its running instances (WF_LIST_INSTANCES),
+      which is a read.
+  - **`launched_by`:** the admin records who asked for the deploy (`operator` over HTTP, `archi`)
+    and SY.wf-rules carries it to the `run_node`.
+  - **The policy:**
+    - rule (4) stays only for SY.admin, with both wasm recompiled;
+    - config-routes' authority markers and the table in `docs/history/04-routing.md` are brought up to
+      date.
+  - **The Go SDK has the managed nodes' control plane,** a port of the Rust one:
+    - `_system` untouchable;
+    - FAILED_CONFIG with its reason;
+    - an atomic write that keeps the file's mode;
+    - health according to the config's state.
+  - **The WF node uses it,** and it validates the workflow definition as part of the config
+    (`invalid_definition`). With a config it cannot use, it stays up, answers the control messages
+    and drops workflow traffic until a restart applies a good config.
+  - **A `wf_rules_*` query over the mesh without a hive** answers with an error instead of nothing.
+- **Review (one round): 1 blocker and 7 to fix, all fixed before the build.**
+  - **Blocker: a half-synced workflow package.**
+    - Syncthing can bring the manifest and the `package.json` before the `flow/definition.json`.
+      Before, the WF node crash-looped until it arrived, and it fixed itself; with the change it
+      waited in FAILED_CONFIG and nobody retried it.
+    - Now the orchestrator answers `RUNTIME_NOT_PRESENT` for a workflow package without its
+      definition: in `run_node`, on every start and restart (the reconcile included) and before
+      `set_node_config` binds the version. SY.wf-rules retries while it syncs.
+  - **The runtimes manifest.**
+    - With the admin serving in parallel, publishing and deleting versions could overwrite each
+      other; a lock serializes them.
+    - SY.wf-rules no longer writes the motherbee's dist: it deletes the old versions through the
+      admin on every hive.
+  - **The timings.**
+    - SY.wf-rules gives each request a 35 s deadline; the admin waits 45 s for it, and Archi 60 s.
+    - Before, Archi and the admin waited the same, 30 s, and a response close to the limit got
+      lost.
+  - **Who asks SY.wf-rules.**
+    - It accepts operations only from the admin; before, any node could ask it to deploy or
+      delete.
+    - The admin accepts only `operator` or `archi` as its `launched_by`. Never `cloud`, which would
+      give Cloud the management of the node.
+  - **The content:** the admin requires the node's own `wf.<x>` runtime, the `wf.engine` base and
+    a `package_path` of that package.
+  - **The re-binding sends only the binding** (the orchestrator merges), instead of copying the
+    node's config, which dragged along keys written by old nodes.
+  - **SY.wf-rules reads a WF node's refusal correctly** (`node_not_configured`) and stops taking
+    it as a timeout.
+  - **Minor:**
+    - a mesh command that fails before responding answers `INTERNAL_ERROR`;
+    - the WF node's CONFIG_SET response carries its real state, unchanged until the restart, and
+      `pending_restart`;
+    - the SDK does not write over a `config.json` it cannot read.
+- **The 0.1.70 gate on 8.x found two things, fixed for 0.1.71:**
+  - **An update on worker1 did not wait long enough.**
+    - The new package arrived more than 20 s after it was published.
+    - The cause: just before, another workflow had been deleted. worker1's Syncthing failed to
+      delete its directories ("not empty", parent before children), marked the runtimes folder as
+      failed and retried it.
+    - Now SY.wf-rules waits for the package up to 45 s, with a 60 s deadline per request; the
+      admin waits 75 s and Archi 90 s.
+  - **A deletion on worker1 left its packages on the motherbee.**
+    - SY.wf-rules deletes the current version last, according to its copy of the manifest, which
+      after a rollback was out of date. The admin rejected it (`RUNTIME_CURRENT_CONFLICT`) and the
+      purge stopped there.
+    - Now a version rejected as current is retried once the others are gone.
+    - The test's orphaned packages were deleted by hand.
+- **The 0.1.71 gate found that waiting longer was not enough, fixed for 0.1.72.**
+  - **A first deploy on worker1 waited 45 s, and the package did not arrive.**
+    - From the motherbee to the worker: the manifest arrived at 12 s and the package's files at
       62 s.
-    - El watcher del motherbee agrupa los cambios. Con la carpeta de runtimes agitada (el
-      core-update recién hecho, los borrados del E2E anterior), tarda en anunciarlos.
-    - El borrado de un workflow (y la limpieza de versiones de un core-update) hace además que la
-      carpeta del worker falle una vez ("not empty") y espere antes de reintentar.
-  - **Arreglo:** en un worker, después de publicar, SY.wf-rules le pide al admin un `sync_hint`
-    sobre el `fluxbee-dist-runtimes` del motherbee.
-    - El motherbee escanea ya y anuncia el paquete. El worker lo trae apenas llega el anuncio,
-      aunque esté esperando para reintentar un pull fallido.
-    - Mientras el paquete no esté, pide el mismo escaneo antes de cada reintento.
-    - Escanear en el worker no sirve: Syncthing 2.0 hace un pull después de un escaneo solo si
-      encontró cambios locales. La primera versión del arreglo (`a053102`) hacía eso y además
-      esperaba hasta 20 s a que la carpeta del worker quedara quieta, cosa que después de un
-      borrado fallido no pasa. Se corrigió antes de publicarla.
-    - Es un paso explícito y acotado del deploy.
-- **El gate de 0.1.72 pasó todo,** en el peor caso: recién hecho el core-update, y el E2E de
-  worker1 justo después del borrado del E2E del motherbee.
-  - **El motherbee y worker1:** 35/35 cada uno.
-    - En worker1 el primer deploy tardó 4 s: el paquete llegó 1 s después de publicado.
-    - La v2 llegó en 2 s, y el borrado no dejó paquetes.
-  - **Por Archi:** deploy y borrado en 1 s; `launched_by: archi`; una clave de `_system`
-    desconocida queda en el archivo y el nodo sigue `HEALTHY`.
-  - **No quedó nada de la prueba,** y el tenant de prueba se purgó.
-- **Lo que no entra (anotado):**
-  - **La superficie del admin por la malla** sigue abierta a cualquier nodo para casi todas las
-    acciones: solo IO.cloud y SY.wf-rules tienen compuerta. Un workflow no llega: el motor rechaza
-    todo destino `SY.*` o `RT.*` al enviar. Es A-62, estacionado junto con A-60.
-  - **Todas las acciones de nodos pasan por el worker serial del orquestador del motherbee.** Un
-    rollback largo o un hive que no contesta demoran a las demás, también un deploy de WF.
-  - **Configs de WF escritas antes de 0.1.70** con `config_version` en la raíz (un CONFIG_SET
-    directo) quedan en FAILED_CONFIG con el motivo. Se arreglan con `set_node_config?replace=true`
-    y un reinicio. En PROD no hay nodos WF.
-  - **El contador de versiones de OPA** tampoco tiene lock. Solo lo tocan acciones del operador.
-  - **La salud de los nodos IO** ignora el estado de la config, y io.slack no contesta
-    NODE_STATUS_GET. Va a la revisión de la familia IO.
-  - **En el nodo WF** siguen siendo fatales abrir la base y la recuperación.
-  - **Las herramientas de diagnóstico que usaban la autoridad de `WF.orch.diag`** la pierden y van
-    al catálogo de limpieza:
-    - `orch_system_diag` y los `scripts/orchestrator_*_e2e.sh` que la usan;
-    - `blob_sync_diag`, cuyo SYSTEM_SYNC_HINT ya estaba negado.
+    - The motherbee's watcher batches changes. With the runtimes folder churning (the core-update
+      just done, the previous E2E's deletions), it takes a while to announce them.
+    - Deleting a workflow (and the version cleanup of a core-update) also makes the worker's
+      folder fail once ("not empty") and wait before retrying.
+  - **Fix:** on a worker, after publishing, SY.wf-rules asks the admin for a `sync_hint` on the
+    motherbee's `fluxbee-dist-runtimes`.
+    - The motherbee scans right away and announces the package. The worker pulls it as soon as
+      the announcement arrives, even if it is waiting to retry a failed pull.
+    - While the package is not there, it asks for the same scan before each retry.
+    - Scanning on the worker does not help: Syncthing 2.0 does a pull after a scan only if it
+      found local changes. The first version of the fix (`a053102`) did that, and it also waited
+      up to 20 s for the worker's folder to settle, which does not happen after a failed delete.
+      It was corrected before it was published.
+    - It is an explicit, bounded step of the deploy.
+- **The 0.1.72 gate passed everything,** in the worst case: right after the core-update, and
+  worker1's E2E right after the deletion of the motherbee's E2E.
+  - **The motherbee and worker1:** 35/35 each.
+    - On worker1 the first deploy took 4 s: the package arrived 1 s after it was published.
+    - The v2 arrived in 2 s, and the deletion left no packages.
+  - **Through Archi:** deploy and deletion in 1 s; `launched_by: archi`; an unknown `_system` key
+    stays in the file, and the node stays `HEALTHY`.
+  - **Nothing from the test was left,** and the test tenant was purged.
+- **What is left out (noted):**
+  - **The admin's surface over the mesh** is still open to any node for almost every action: only
+    IO.cloud and SY.wf-rules have a gate. A workflow does not reach it: the engine rejects every
+    `SY.*` or `RT.*` destination when sending. It is A-62, parked along with A-60.
+  - **All node actions go through the motherbee orchestrator's serial worker.** A long rollback or
+    a hive that does not answer delays the others, a WF deploy too.
+  - **WF configs written before 0.1.70** with `config_version` at the root (a direct CONFIG_SET)
+    stay in FAILED_CONFIG with the reason. They are fixed with `set_node_config?replace=true` and a
+    restart. In PROD there are no WF nodes.
+  - **The OPA version counter** has no lock either. Only operator actions touch it.
+  - **The health of IO nodes** ignores the config's state, and io.slack does not answer
+    NODE_STATUS_GET. It goes to the IO family review.
+  - **In the WF node,** opening the database and the recovery are still fatal.
+  - **The diagnostic tools that used `WF.orch.diag`'s authority** lose it and go to the cleanup
+    catalog:
+    - `orch_system_diag` and the `scripts/orchestrator_*_e2e.sh` that use it;
+    - `blob_sync_diag`, whose SYSTEM_SYNC_HINT was already denied.
 
-### A-67 ✅ VALIDADO EN 8.x (0.1.68 y 0.1.69, 2026-10-15) — Cloud no podía ver ni manejar sus nodos, ni suspender un tenant, y un nodo parado volvía solo
+### A-67 ✅ VALIDATED ON 8.x (0.1.68 and 0.1.69, 2026-10-15) — Cloud could not see or manage its nodes, nor suspend a tenant, and a stopped node came back by itself
 
-- **El marco:** `docs/ilk-tenant-model-v1.md` §2.4 y D14, la etapa 4, decidida con el operador el
+- **The frame:** `docs/ilk-tenant-model-v1.md` §2.4 and D14, stage 4, decided with the operator on
   2026-10-15.
-  - Cloud es la capa de negocio: asocia empresas con tenants y usuarios con ILK de personas, y
-    maneja credenciales.
-  - Los nodos IO los lanza solo para tener dónde cargar el token: *"el nodo lo lanza porque sino el
-    token no se puede cargar"*.
-  - La infraestructura es del operador, por Archi.
-  - Todo pasa por el admin.
-- **Qué pasaba:**
-  - **Nodos:** Cloud creaba nodos y no los podía ver, parar ni borrar. El runbook de linkedhelper
-    consultaba el estado por el admin directo, que Cloud ya no tiene.
-  - **Tenants:** Cloud no podía suspender ni reactivar un tenant, ni editar su sponsor o sus
-    settings. `get_tenant` solo decía si existía.
-  - **Parar no duraba:** un kill sin purga paraba el proceso y el relanzamiento de cada 60 s lo
-    volvía a levantar. Le pasaba también al operador.
-  - **Quién lanzó un nodo** no quedaba registrado.
-- **Arreglo:**
+  - Cloud is the business layer: it associates companies with tenants and users with people's
+    ILKs, and it manages credentials.
+  - It launches IO nodes only to have somewhere to load the token: *"el nodo lo lanza porque sino el
+    token no se puede cargar"* ("it launches the node because otherwise the token can't be
+    loaded").
+  - The infrastructure belongs to the operator, through Archi.
+  - Everything goes through the admin.
+- **What happened:**
+  - **Nodes:** Cloud created nodes and could not see, stop or delete them. The linkedhelper runbook
+    queried the status through the admin directly, which Cloud no longer has.
+  - **Tenants:** Cloud could not suspend or reactivate a tenant, nor edit its sponsor or its
+    settings. `get_tenant` only said whether it existed.
+  - **Stopping did not last:** a kill without a purge stopped the process, and the relaunch every
+    60 s brought it up again. It also happened to the operator.
+  - **Who launched a node** was not recorded.
+- **Fix:**
   - **Tenants:**
-    - `update_tenant` acepta `status` (`active` o `suspended`), `settings` y `sponsor_tenant_id`;
-    - `get_tenant` lee el registro completo por el admin, con `people_count` y `node_count`;
-    - `list_tenants` trae todos menos el génesis, con los borrados marcados.
-  - **Nodos:**
-    - el admin anota quién lanzó cada nodo (`_system.launched_by`: `cloud`, `archi`, `operator`);
-    - Cloud arranca, para y borra solo los nodos IO que lanzó en su tenant. El admin le pone esa
-      condición al pedido y el hive del nodo la chequea; cualquier otro contesta `NODE_NOT_FOUND`;
-    - `list_nodes` junta los nodos del tenant de todos los hives en paralelo, y `get_node_status`
-      da el de uno;
-    - Cloud ve el estado, no cómo corre el nodo: sin proceso, unidad ni rutas.
-  - **Parar dura, para todos:** parar saca la marca de relanzar y arrancar la vuelve a poner. Un
-    nodo que se cae solo se sigue relanzando.
-  - **La palabra:** el contrato de Cloud dice tenant, nunca empresa (85 lugares).
-  - **`a5f1b2a`** sale en este release: el rechazo de `set_ilk_tenant` contesta el código solo.
-- **Revisión (una ronda): 3 mayores, 4 menores y detalles, arreglados antes del build.**
-  - **Mayor 1:** todo nodo WF lanzado con esta versión caía en bucle. El nodo WF en Go lee el
-    bloque `_system` en estricto y no conocía `launched_by`. Lo aprendió, y un test en Rust fija
-    las claves del bloque contra el de Go. El build en curso se frenó.
-  - **Mayor 2:** con un spoke de core viejo, Cloud podía parar o borrar nodos de otros, y
-    `list_nodes` le pasaba todo el inventario del router de ese spoke. Ahora el motherbee chequea
-    la condición antes de reenviar, leyendo la config del nodo allá, y `list_nodes` filtra por
-    tenant y marca el hive como desactualizado.
-  - **Mayor 3:** parar un nodo en bucle de caídas (esperando el próximo reinicio de systemd)
-    contestaba "parado" sin pararlo. Ahora ese camino también para la unidad.
-  - **Menores:**
-    - el relanzamiento vuelve a leer la marca después de tomar el lock del nodo;
-    - las respuestas de arrancar, parar y borrar ya no muestran unidad ni rutas;
-    - el estado de un nodo trae `launched_by` y `relaunch_on_boot`;
-    - las acciones que Cloud comparte siguen abiertas a los otros llamadores de la malla (los
-      nodos de diagnóstico del laboratorio se habían quedado afuera);
-    - el script de reinicio del laboratorio baja el nodo como un reinicio, no con un stop.
-  - **Documentados:** los nodos lanzados antes de 0.1.68 no los maneja Cloud; `launched_by` de un
-    pedido directo al orquestador se toma como viene (A-22).
-- **Encontrado en el gate de 0.1.68 (8.x, 2026-10-16), arreglado para 0.1.69:**
-  - **`delete_node` desde Cloud se trababa.** El admin atiende de a uno los comandos que llegan
-    por la malla. El kill con purga que pide Cloud espera al orquestador, y el orquestador, para
-    limpiar, le pide al admin borrar la identidad y las claves del nodo; ese pedido queda en cola
-    detrás. Resultado: timeout para Cloud (`ADMIN_UNAVAILABLE`), la identidad marcada sin purgar
-    (el nombre reservado) y la clave propia borrada recién cuando el admin se liberó. Al operador
-    no le pasaba: lo suyo llega por HTTP, en su propia tarea. Ahora el admin corre en su propia
-    tarea los comandos que lo vuelven a llamar (kill y remove de nodos), y IO.cloud le da 25 s a
-    `delete_node`.
-  - **Un SY de otro hive leyendo una clave del génesis mientras identity se reinicia** (el deploy)
-    recibía `UNAUTHORIZED` una vez: el vault solo conoce de memoria a los SY de su hive y a los
-    otros por la SHM. Ahora contesta `IDENTITY_UNAVAILABLE`, que se reintenta, sin dar nada de más.
-    Venía de antes; en este deploy le tocó a `SY.cognition@worker1`, que leyó bien 42 s después.
-- **Validado en 8.x:**
-  - **0.1.68:** tenants por Cloud (settings, sponsor, lecturas, `pending` y génesis rechazados);
-    sus nodos (`list_nodes` con solo el estado, `NODE_NOT_FOUND` para un nodo de otro tenant y para
-    uno que lanzó el operador en el mismo tenant); parar dura más de una pasada del relanzamiento;
-    suspender por Cloud corta nodos nuevos y credenciales; `a5f1b2a` contesta el código solo; un
-    workflow de prueba arranca limpio.
-  - **0.1.69:** `delete_node` contesta ok, se va la clave propia, queda la asignada y el nombre
-    queda libre; en el reinicio, el SY de otro hive recibió `IDENTITY_UNAVAILABLE` en vez de
-    `UNAUTHORIZED`.
+    - `update_tenant` accepts `status` (`active` or `suspended`), `settings` and
+      `sponsor_tenant_id`;
+    - `get_tenant` reads the full record through the admin, with `people_count` and `node_count`;
+    - `list_tenants` brings all of them except the genesis, with the deleted ones marked.
+  - **Nodes:**
+    - the admin records who launched each node (`_system.launched_by`: `cloud`, `archi`,
+      `operator`);
+    - Cloud starts, stops and deletes only the IO nodes it launched in its tenant. The admin puts
+      that condition on the request and the node's hive checks it; for anything else the answer is
+      `NODE_NOT_FOUND`;
+    - `list_nodes` gathers the tenant's nodes from every hive in parallel, and `get_node_status`
+      gives the status of one;
+    - Cloud sees the status, not how the node runs: no process, unit or paths.
+  - **Stopping lasts, for everyone:** stopping removes the relaunch mark, and starting puts it back.
+    A node that crashes on its own keeps being relaunched.
+  - **The word:** Cloud's contract says tenant, never company (85 places).
+  - **`a5f1b2a`** goes out in this release: the `set_ilk_tenant` rejection answers with the code
+    only.
+- **Review (one round): 3 major, 4 minor and details, fixed before the build.**
+  - **Major 1:** every WF node launched with this version crash-looped. The Go WF node reads the
+    `_system` block strictly and did not know `launched_by`. It learned it, and a Rust test pins
+    the block's keys against the Go one. The build in progress was stopped.
+  - **Major 2:** with a spoke on an old core, Cloud could stop or delete other people's nodes, and
+    `list_nodes` handed it the whole router inventory of that spoke. Now the motherbee checks the
+    condition before forwarding, reading the node's config there, and `list_nodes` filters by
+    tenant and marks the hive as outdated.
+  - **Major 3:** stopping a node in a crash loop (waiting for systemd's next restart) answered
+    "stopped" without stopping it. Now that path also stops the unit.
+  - **Minor:**
+    - the relaunch re-reads the mark after taking the node's lock;
+    - the start, stop and delete responses no longer show the unit or paths;
+    - a node's status carries `launched_by` and `relaunch_on_boot`;
+    - the actions that Cloud shares stay open to the other callers on the mesh (the lab's
+      diagnostic nodes had been left out);
+    - the lab's restart script brings the node down like a restart, not with a stop.
+  - **Documented:** nodes launched before 0.1.68 are not managed by Cloud; the `launched_by` of a
+    direct request to the orchestrator is taken as it comes (A-22).
+- **Found in the 0.1.68 gate (8.x, 2026-10-16), fixed for 0.1.69:**
+  - **`delete_node` from Cloud got stuck.** The admin serves the commands arriving over the mesh
+    one at a time. The kill with purge that Cloud asks for waits for the orchestrator, and the
+    orchestrator, to clean up, asks the admin to delete the node's identity and keys; that request
+    stays queued behind it. Result: a timeout for Cloud (`ADMIN_UNAVAILABLE`), the identity marked
+    without being purged (the name reserved) and the node's own key deleted only when the admin
+    freed up. It did not happen to the operator: their requests arrive over HTTP, each in its own
+    task. Now the admin runs the commands that call it back (node kill and remove) in their own
+    task, and IO.cloud gives `delete_node` 25 s.
+  - **An SY from another hive reading a genesis key while identity restarts** (the deploy) got
+    `UNAUTHORIZED` once: the vault only knows the SYs of its own hive by heart, and the others
+    through the SHM. Now it answers `IDENTITY_UNAVAILABLE`, which is retried, without giving away
+    anything extra. It predates this; in this deploy it hit `SY.cognition@worker1`, which read
+    fine 42 s later.
+- **Validated on 8.x:**
+  - **0.1.68:** tenants through Cloud (settings, sponsor, reads, `pending` and genesis rejected);
+    its nodes (`list_nodes` with only the status, `NODE_NOT_FOUND` for a node of another tenant
+    and for one the operator launched in the same tenant); stopping lasts longer than one relaunch
+    pass; suspending through Cloud cuts off new nodes and credentials; `a5f1b2a` answers with the
+    code only; a test workflow starts clean.
+  - **0.1.69:** `delete_node` answers ok, the node's own key goes away, the assigned one stays and
+    the name is freed; on the restart, the SY from another hive got `IDENTITY_UNAVAILABLE` instead
+    of `UNAUTHORIZED`.
 
-  Detalle en `lab/DEPLOYMENTS.md`.
+  Detail in `lab/DEPLOYMENTS.md`.
 
-### A-66 ✅ VALIDADO EN 8.x (0.1.67, 2026-10-15) — Un tenant suspendido seguía arrancando nodos, y borrar un tenant marcaba a su gente
+### A-66 ✅ VALIDATED ON 8.x (0.1.67, 2026-10-15) — A suspended tenant kept starting nodes, and deleting a tenant marked its people
 
-- **El marco:** `docs/ilk-tenant-model-v1.md` §2.3, la etapa 3. Decisiones del operador del
-  2026-10-14: *"no quiero borrar ni desaparecer ilk de humanos"*; *"sobre nodos y recursos sí vale la
-  pena actuar"*; restituir es reactivar el tenant.
-- **Qué pasaba:**
-  - **Nodos:** el orquestador arrancaba y relanzaba nodos de un tenant suspendido o pendiente.
-    Desde la etapa 2 no recibían secretos, pero corrían.
-  - **Borrar un tenant** marcaba en cascada a la gente que le escribió por un canal (2026-09-28), y
-    se rechazaba si tenía cuentas de Cloud (`TENANT_HAS_ACCOUNTS`, etapa 1). Una persona borrada por
-    su lado no volvía mientras su tenant estuviera borrado.
-  - **Purgar un tenant** borraba a todas las personas cargadas a él.
-  - **`set_ilk_tenant`** movía solo cuentas completas: los contactos de una empresa no se podían
-    sacar de ahí.
-  - **io.api `by_ilk`:** la API de una empresa actuaba solo por personas cargadas a esa empresa. Una
-    persona que le escribió pero estaba cargada a otra no se podía usar.
-- **Arreglo:**
-  - **Orquestador:**
-    - `run_node`, start y restart contestan `TENANT_NOT_ACTIVE` si el tenant del nodo está
-      pendiente o suspendido;
-    - el relanzamiento al arrancar y el periódico lo saltean, sin relanzarlo ni pasarlo a otra
-      versión, hasta que el tenant vuelva a estar activo;
-    - un nodo que ya corre no se mata;
-    - si el hive no sabe el estado (identity todavía arrancando), sigue como antes y lo dice en el
-      log.
+- **The frame:** `docs/ilk-tenant-model-v1.md` §2.3, stage 3. The operator's decisions of
+  2026-10-14: *"no quiero borrar ni desaparecer ilk de humanos"* ("I don't want to delete human
+  ILKs or make them disappear"); *"sobre nodos y recursos sí vale la pena actuar"* ("on nodes and
+  resources it is worth acting"); restoring means reactivating the tenant.
+- **What happened:**
+  - **Nodes:** the orchestrator started and relaunched nodes of a suspended or pending tenant.
+    Since stage 2 they got no secrets, but they ran.
+  - **Deleting a tenant** cascade-marked the people who had written to it through a channel
+    (2026-09-28), and it was rejected if it had Cloud accounts (`TENANT_HAS_ACCOUNTS`, stage 1). A
+    person deleted on their own did not come back while their tenant was deleted.
+  - **Purging a tenant** deleted every person charged to it.
+  - **`set_ilk_tenant`** moved only complete accounts: a company's contacts could not be taken out
+    of there.
+  - **io.api `by_ilk`:** a company's API acted only on people charged to that company. A person
+    who wrote to it but was charged to another one could not be used.
+- **Fix:**
+  - **Orchestrator:**
+    - `run_node`, start and restart answer `TENANT_NOT_ACTIVE` if the node's tenant is pending or
+      suspended;
+    - the relaunch at startup and the periodic one skip it, without relaunching it or moving it to
+      another version, until the tenant is active again;
+    - a node that is already running is not killed;
+    - if the hive does not know the state (identity still starting), it carries on as before and
+      says so in the log.
   - **SY.identity:**
-    - borrar un tenant lo marca solo a él, sin cascada, y contesta `people_charged`; se rechaza si
-      tiene nodos o patrocina tenants;
-    - restaurarlo lo devuelve tal cual;
-    - purgarlo se rechaza mientras tenga personas cargadas (`TENANT_HAS_PEOPLE`); las marcadas por
-      su lado se van con él;
-    - `set_ilk_tenant` mueve también temporales, pero solo desde un tenant borrado: el frontdesk
-      registra a un temporal en el caso del tenant al que le escribió;
-    - `restore_ilk` devuelve a una persona aunque su tenant esté borrado;
-    - la migración v4 desmarca, en cada arranque, a quien marcó una cascada vieja (su id queda en
-      el log).
-  - **io.api `by_ilk` (D12):** personas cargadas al tenant o con un canal en su espacio.
-  - **Admin y Cloud:** `TENANT_HAS_PEOPLE` y `TENANT_NOT_ACTIVE` son 409; los textos de las
-    acciones y el catálogo de Cloud.
-- **Revisión (una ronda): 2 mayores, 2 menores, 4 detalles.**
-  - **Mayor 1:** las personas que una cascada vieja había marcado (hasta 0.1.66) se iban con la
-    purga como si se hubieran borrado solas, y restaurar su tenant ya no las traía. Arreglado con la
-    migración v4. En PROD no había ninguna.
-  - **Mayor 2:** mover un temporal de un tenant activo cortaba su registro: el frontdesk rechaza el
-    caso si el tenant de la persona no es el del IO que la atiende (`tenant_mismatch`). Ahora un
-    temporal se mueve solo desde un tenant borrado.
-  - **Arreglados también:**
-    - el relanzamiento lee el tenant de la config si falta en el mapa, como start y restart;
-    - `start_node` de un nodo que ya corre contesta `already_running`;
-    - un temporal fusionado en otro ILK no cuenta como persona del tenant;
-    - los textos del HANDBOOK y de io.cloud que describían la cascada;
-    - un test que fija el orden: el chequeo va antes de registrar, reenviar, parar o arrancar.
-- **Sin código, documentado:**
-  - el router no corta el tráfico de un tenant suspendido: sería una búsqueda en cada mensaje, en
-    el camino más cargado, y suma poco a lo anterior;
-  - un workflow desplegado sobre un tenant suspendido: wf-rules escribe la versión nueva en la
-    config, el reinicio se rechaza y wf-rules reporta `restart_failed`. Al reactivar nada lo
-    reinicia, así que sigue con el paquete viejo hasta un reinicio;
-  - un nodo que corre en un tenant suspendido durante un upgrade sigue en la versión vieja. Si se
-    cae, systemd no lo puede relanzar (su directorio ya no está), y el relanzamiento periódico lo
-    levanta en la nueva cuando el tenant vuelve a estar activo.
-- **Abierto (D13):** unir un contacto a una cuenta, por ejemplo un cliente de A que pasa a ser
-  dueño de B, necesita un paso explícito (la persona prueba el canal desde su cuenta). No está
-  diseñado.
-- **Validado en 8.x (0.1.67):**
-  - **suspendido:** el restart de su nodo da `TENANT_NOT_ACTIVE` y el nodo sigue corriendo sin
-    secretos; parado, dos pasadas no lo relanzan; reactivado, la pasada siguiente lo relanza;
-  - **borrado:** nadie se marca, la gente sigue resolviendo, una persona borrada vuelve con el tenant
-    borrado, y restaurarlo lo deja como estaba;
-  - **purga:** se rechaza con la clave y después con las personas, y pasa cuando se las mueve (un
-    temporal incluido, desde el tenant borrado);
-  - **encontrado:** el rechazo de mover un temporal llegaba como `CODE|detalle` en `error_code`;
-    arreglado en `a5f1b2a`, sale con el próximo release.
+    - deleting a tenant marks only the tenant itself, with no cascade, and answers
+      `people_charged`; it is rejected if the tenant has nodes or sponsors tenants;
+    - restoring it brings it back as it was;
+    - purging it is rejected while it has people charged to it (`TENANT_HAS_PEOPLE`); the ones
+      marked on their own go with it;
+    - `set_ilk_tenant` also moves temporaries, but only out of a deleted tenant: the frontdesk
+      registers a temporary in the case of the tenant it wrote to;
+    - `restore_ilk` brings a person back even if their tenant is deleted;
+    - the v4 migration unmarks, on every startup, whoever an old cascade marked (their id stays in
+      the log).
+  - **io.api `by_ilk` (D12):** people charged to the tenant or with a channel in its space.
+  - **Admin and Cloud:** `TENANT_HAS_PEOPLE` and `TENANT_NOT_ACTIVE` are 409; the texts of the
+    actions and Cloud's catalog.
+- **Review (one round): 2 major, 2 minor, 4 details.**
+  - **Major 1:** the people an old cascade had marked (up to 0.1.66) went away with the purge as if
+    they had been deleted on their own, and restoring their tenant no longer brought them back.
+    Fixed with the v4 migration. In PROD there were none.
+  - **Major 2:** moving a temporary out of an active tenant cut off its registration: the frontdesk
+    rejects the case if the person's tenant is not the one of the IO serving them
+    (`tenant_mismatch`). Now a temporary is moved only out of a deleted tenant.
+  - **Also fixed:**
+    - the relaunch reads the tenant from the config if it is missing from the map, like start and
+      restart;
+    - `start_node` of a node that is already running answers `already_running`;
+    - a temporary merged into another ILK does not count as a person of the tenant;
+    - the HANDBOOK and io.cloud texts that described the cascade;
+    - a test that pins the order: the check comes before registering, forwarding, stopping or
+      starting.
+- **No code, documented:**
+  - the router does not cut off a suspended tenant's traffic: it would be a lookup on every
+    message, on the busiest path, and it adds little to the above;
+  - a workflow deployed on a suspended tenant: wf-rules writes the new version into the config,
+    the restart is rejected and wf-rules reports `restart_failed`. On reactivation nothing restarts
+    it, so it carries on with the old package until a restart;
+  - a node running in a suspended tenant during an upgrade stays on the old version. If it
+    crashes, systemd cannot relaunch it (its directory is gone), and the periodic relaunch brings
+    it up on the new one once the tenant is active again.
+- **Open (D13):** joining a contact to an account, for example a customer of A who becomes the
+  owner of B, needs an explicit step (the person proves the channel from their account). It is not
+  designed.
+- **Validated on 8.x (0.1.67):**
+  - **suspended:** the restart of its node gives `TENANT_NOT_ACTIVE` and the node keeps running
+    without secrets; stopped, two passes do not relaunch it; reactivated, the next pass relaunches
+    it;
+  - **deleted:** nobody gets marked, people still resolve, a deleted person comes back with the
+    tenant still deleted, and restoring it leaves it as it was;
+  - **purge:** it is rejected first because of the key and then because of the people, and it
+    goes through once they are moved (a temporary included, out of the deleted tenant);
+  - **found:** the rejection of moving a temporary arrived as `CODE|detail` in `error_code`; fixed
+    in `a5f1b2a`, it goes out with the next release.
 
-  Detalle en `lab/DEPLOYMENTS.md`.
+  Detail in `lab/DEPLOYMENTS.md`.
 
-### A-65 🟡 PARCIAL, VALIDADO EN 8.x (0.1.67, 2026-10-15) · el resto es P-1, postergado — El vault creía el ILK que el propio nodo declaraba
+### A-65 🟡 PARTIAL, VALIDATED ON 8.x (0.1.67, 2026-10-15) · the rest is P-1, deferred — The vault believed the ILK the node itself declared
 
-- **Qué pasaba:** SY.vault autorizaba por `meta.src_ilk`, que pone el propio nodo. El router no lo
-  ataba a quien mandaba. Un nodo comprometido podía:
-  - reclamar el ILK de otro nodo y leer sus secretos, propios o asignados;
-  - reclamar el de SY.admin y escribir o borrar cualquier secreto.
+- **What happened:** SY.vault authorized by `meta.src_ilk`, which the node itself sets. The router
+  did not bind it to the sender. A compromised node could:
+  - claim another node's ILK and read its secrets, own or assigned;
+  - claim SY.admin's and write or delete any secret.
 
-  Estaba anotado como fase 0 de io.web (`docs/io-web-spec-beta-v1.md` §21).
-- **Decisión del operador (2026-10-14):** arreglarlo ya.
-- **Arreglo:** el vault ata el ILK al nombre del emisor que estampa el router
-  (`routing.src_l2_name`). Lo compara exacto: sin pasar a minúsculas ni recortar espacios.
-  - **Un nodo de sistema** prueba el ILK derivado de su nombre, sin la SHM, así el core lee sus
-    claves al arrancar.
-  - **Cualquier otro nodo:** tiene que ser el ILK que identity registró para su nombre.
-  - **El ILK de otro, o una request sin nombre estampado:** `UNAUTHORIZED`.
-  - **Un ILK que la SHM no tiene:** error que se reintenta (`IDENTITY_UNAVAILABLE`), porque un
-    arranque degradado de identity escribe solo los del sistema.
+  It was noted as phase 0 of io.web (`docs/history/io-web-spec-beta-v1.md` §21).
+- **The operator's decision (2026-10-14):** fix it now.
+- **Fix:** the vault binds the ILK to the sender name that the router stamps
+  (`routing.src_l2_name`). It compares them exactly: no lowercasing, no trimming of spaces.
+  - **A system node** proves the ILK derived from its name, without the SHM, so the core reads its
+    keys at startup.
+  - **Any other node:** it has to be the ILK that identity registered for its name.
+  - **Someone else's ILK, or a request with no stamped name:** `UNAUTHORIZED`.
+  - **An ILK the SHM does not have:** an error that gets retried (`IDENTITY_UNAVAILABLE`), because
+    a degraded identity startup writes only the system ones.
 
-  La refusal se contesta y se audita, nunca se descarta.
-- **Qué cierra:**
-  - poner otro ILK en `meta.src_ilk` ya no alcanza, y un subject que io.api reenvía no lee
-    secretos;
-  - entre hives, el nombre está atado al certificado del hive (EDGE-01): un nodo de otro hive no
-    puede ser `SY.admin@motherbee`.
-- **Qué no cierra:** en el mismo hive, el nombre lo declara el proceso en su HELLO y el router lo
-  acepta (P-1, ver A-22). Un proceso local puede abrir su propia conexión con el nombre de otro nodo
-  de ese hive y usar su ILK; en el motherbee, el de SY.admin. Es el agujero que P-1 ya deja para
-  todo lo demás, no uno nuevo, y los nodos corren como root (A-60).
-- **Revisado y no construido:** dos chequeos baratos en el router, que quedan para P-1:
-  - rechazar un HELLO local con un `@hive` ajeno: suma poco mientras se pueda elegir cualquier
-    nombre del propio hive;
-  - rechazar un nombre que ya tiene una conexión viva: puede trabar el reinicio de un nodo cuyo
-    socket viejo todavía no cerró.
-- **El router no lo necesita:** en un mensaje de usuario `src_ilk` es la persona, no el nodo.
-- **Antes del cambio:** se revisaron en PROD todos los pares (nodo, ILK) que la auditoría del vault
-  vio alguna vez. Todos los SY pasan con su ILK derivado; los IO/AI que aparecen eran nodos de
-  prueba ya purgados.
-- **Validado en 8.x (0.1.67):** después del deploy todos los SY leyeron sus claves sin un rechazo,
-  también los de otros hives; el admin pidiendo con el ILK de IO.cloud recibió `UNAUTHORIZED`
-  (auditado) y con el suyo pasó; un nodo IO.slack leyó con su propio ILK.
+  The refusal is answered and audited, never dropped.
+- **What it closes:**
+  - putting another ILK in `meta.src_ilk` is no longer enough, and a subject that io.api forwards
+    does not read secrets;
+  - between hives, the name is bound to the hive's certificate (EDGE-01): a node from another hive
+    cannot be `SY.admin@motherbee`.
+- **What it does not close:** within the same hive, the name is declared by the process in its
+  HELLO, and the router accepts it (P-1, see A-22). A local process can open its own connection
+  with the name of another node of that hive and use its ILK; on the motherbee, SY.admin's. It is
+  the hole P-1 already leaves for everything else, not a new one, and the nodes run as root
+  (A-60).
+- **Reviewed and not built:** two cheap checks in the router, which remain for P-1:
+  - rejecting a local HELLO with a foreign `@hive`: it adds little while any name of one's own
+    hive can be chosen;
+  - rejecting a name that already has a live connection: it can block the restart of a node whose
+    old socket has not closed yet.
+- **The router does not need it:** in a user message, `src_ilk` is the person, not the node.
+- **Before the change:** every (node, ILK) pair that the vault's audit had ever seen was reviewed
+  in PROD. All the SYs pass with their derived ILK; the IO/AI ones that show up were test nodes
+  already purged.
+- **Validated on 8.x (0.1.67):** after the deploy, all the SYs read their keys without a single
+  rejection, also those of other hives; the admin requesting with IO.cloud's ILK got
+  `UNAUTHORIZED` (audited), and with its own it passed; an IO.slack node read with its own ILK.
 
-### A-64 ✅ VALIDADO EN 8.x (0.1.66, 2026-10-14) — Los secretos se compartían solo por tenant, un tenant suspendido seguía entregándolos y en el génesis podía nacer cualquier nodo
+### A-64 ✅ VALIDATED ON 8.x (0.1.66, 2026-10-14) — Secrets were shared only per tenant, a suspended tenant kept handing them out, and any node could be born in the genesis
 
-- **El marco:** `docs/ilk-tenant-model-v1.md` §2.2, la etapa 2. La decidió el operador el 2026-10-14:
+- **The frame:** `docs/ilk-tenant-model-v1.md` §2.2, stage 2. The operator decided it on 2026-10-14:
   *"tenant no es identidad ni seguridad ... el secret se guarda con el tenant para filtrar el uso del
-  que paga"*.
-  - El tenant de un secreto es quién paga, y lo único que el vault chequea es que esté activo.
-  - Quién lo usa:
-    - su dueño (un nodo, o una persona);
-    - los nodos asignados;
-    - o, si no tiene ni uno ni otros, todos los nodos de su tenant: el secreto general.
-  - Un nodo nace y muere en su tenant.
-  - En el génesis nace solo el core.
-- **Qué pasaba:**
-  - **Compartir:** un secreto era de un nodo o de todo el tenant; compartirlo entre algunos no se
-    podía.
-  - **Estado del tenant:** no se miraba. Un tenant suspendido o borrado seguía entregando sus
-    secretos.
-  - **El raíz como respaldo:** A-35 prometía que un nodo de IA de una empresa caía en la clave del
-    raíz. El vault nunca lo dejó (solo los SY la leen). La promesa vivía en el SDK, en ai.generic, en
-    el handbook de Archi, en una nota del admin y en el banner de firstboot.
-  - **El génesis:** el orquestador rechazaba ahí solo nodos IO. Un AI, un WF o un `RT.*` con
-    cualquier runtime se podía lanzar en el génesis, y desde ahí leer la URL de Postgres.
-  - **El tenant de un nodo:** un temporal todavía podía tomar otro tenant al registrarse, y una
-    réplica podía empujar el cambio.
-  - **Altas sin terminar:** una de Cloud no se distinguía de alguien que escribió por un canal
-    (D11, ya resuelto en `80b479c`).
-- **Arreglo:**
+  que paga"* ("tenant is not identity or security ... the secret is stored with the tenant to filter
+  the usage of whoever pays").
+  - A secret's tenant is who pays, and the only thing the vault checks is that it is active.
+  - Who uses it:
+    - its owner (a node, or a person);
+    - the assigned nodes;
+    - or, if it has neither, every node of its tenant: the general secret.
+  - A node is born and dies in its tenant.
+  - Only the core is born in the genesis.
+- **What happened:**
+  - **Sharing:** a secret belonged to one node or to the whole tenant; sharing it among some was
+    not possible.
+  - **Tenant state:** it was not checked. A suspended or deleted tenant kept handing out its
+    secrets.
+  - **The root as a fallback:** A-35 promised that a company's AI node fell back to the root's key.
+    The vault never allowed it (only the SYs read it). The promise lived in the SDK, in ai.generic,
+    in Archi's handbook, in an admin note and in the firstboot banner.
+  - **The genesis:** the orchestrator rejected only IO nodes there. An AI, a WF or an `RT.*` with
+    any runtime could be launched in the genesis, and from there read the Postgres URL.
+  - **A node's tenant:** a temporary could still take another tenant when registering, and a
+    replica could push the change.
+  - **Unfinished sign-ups:** one from Cloud could not be told apart from someone who wrote through a
+    channel (D11, already resolved in `80b479c`).
+- **Fix:**
   - **SY.vault:**
-    - lista de nodos asignados en el secreto (`assigned_ilks`);
-    - `VAULT_ASSIGN`, que cambia esa lista sin tocar el valor;
-    - el chequeo del tenant activo;
-    - el aviso de cambio llega a quien tenía el secreto y a quien lo tiene ahora (también al dueño
-      anterior), y a todo el tenant si es o era general.
-  - **SDK:** la resolución busca primero uno propio, después uno asignado, después el general del
-    tenant; nunca el del raíz.
+    - a list of assigned nodes in the secret (`assigned_ilks`);
+    - `VAULT_ASSIGN`, which changes that list without touching the value;
+    - the active-tenant check;
+    - the change notice reaches whoever had the secret and whoever has it now (the previous owner
+      too), and the whole tenant if it is or was general.
+  - **SDK:** the resolution looks first for an own one, then an assigned one, then the tenant's
+    general one; never the root's.
   - **SY.admin:**
-    - `vault_assign` (por HTTP y por la malla);
-    - los nodos de `vault_put` y `vault_assign`, que tienen que estar cargados al tenant del secreto
-      y nunca ser una persona.
-  - **IO.cloud:** `nodes` en `put_token` y `assign_token`.
-  - **Orquestador:** la definición del core (SY.\*, RT.\* con runtime `rt.*`, IO del core), con la que
-    rechaza todo lo demás en el génesis.
-  - **SY.identity:** el tenant de un nodo no cambia, ni por registro ni por réplica.
-- **Revisión (una ronda):** 1 mayor y 9 menores.
-  - **El mayor:** refrescar el valor de un secreto sin nombrar nodos lo volvía general y se lo daba a
-    todo el tenant. Pasaba con cada refresco de token desde Cloud. Ahora un valor nuevo conserva quién
-    lo usa.
-  - **Arreglados:**
-    - un tenant que la SHM no tiene se contesta con un error que se reintenta, así una caída de
-      identity no deja a los nodos sin credenciales;
-    - un id de tenant inválido se rechaza;
-    - el dueño anterior recibe el aviso;
-    - `RT.*` solo pasa en el génesis con runtime `rt.*`;
-    - el edge ya no reinicia su puerta pública por un `assign` de su clave TLS;
-    - `nodes: null` ya no desasigna todo;
-    - los textos que prometían el raíz;
-    - tests de la validación de nodos asignados y de la decisión sobre el tenant.
-  - **Documentados, sin código:**
-    - un nodo borrado queda en las listas, porque sacarlo podría volver general un secreto por sí
-      solo;
-    - io.linkedhelper relee su credencial solo al arrancar y en CONFIG_SET;
-    - el vault confiaba en el `src_ilk` que declaraba el propio nodo: A-65 (0.1.67) lo cierra
-      entre hives y para el header; en el mismo hive queda P-1.
-- **Validado en 8.x (0.1.66):** la auditoría del vault muestra qué lee cada nodo. Con cuatro nodos
-  IO.slack de dos empresas:
-  - con la clave asignada a dos nodos, la leen solo esos dos;
-  - al quitarle un nodo, ese queda afuera en el momento;
-  - como general, la leen todos los de la empresa y ninguno de la otra;
-  - con la empresa suspendida, nadie; reactivada, vuelven;
-  - el secreto de una persona lo lee su nodo asignado aun después de cambiar a la persona de
-    empresa;
-  - el génesis rechaza un nodo AI;
-  - el core leyó sus claves después del reinicio.
+    - `vault_assign` (over HTTP and over the mesh);
+    - the nodes of `vault_put` and `vault_assign`, which have to be charged to the secret's tenant
+      and never be a person.
+  - **IO.cloud:** `nodes` in `put_token` and `assign_token`.
+  - **Orchestrator:** the definition of the core (SY.\*, RT.\* with an `rt.*` runtime, the core's
+    IO), with which it rejects everything else in the genesis.
+  - **SY.identity:** a node's tenant does not change, neither through registration nor through a
+    replica.
+- **Review (one round):** 1 major and 9 minor.
+  - **The major:** refreshing a secret's value without naming nodes made it general and gave it to
+    the whole tenant. It happened with every token refresh from Cloud. Now a new value keeps who
+    uses it.
+  - **Fixed:**
+    - a tenant the SHM does not have is answered with an error that gets retried, so an identity
+      outage does not leave the nodes without credentials;
+    - an invalid tenant id is rejected;
+    - the previous owner gets the notice;
+    - `RT.*` only passes in the genesis with an `rt.*` runtime;
+    - the edge no longer restarts its public door because of an `assign` of its TLS key;
+    - `nodes: null` no longer unassigns everything;
+    - the texts that promised the root;
+    - tests of the validation of assigned nodes and of the decision about the tenant.
+  - **Documented, no code:**
+    - a deleted node stays on the lists, because removing it could make a secret general on its
+      own;
+    - io.linkedhelper re-reads its credential only at startup and on CONFIG_SET;
+    - the vault trusted the `src_ilk` that the node itself declared: A-65 (0.1.67) closes it
+      between hives and for the header; within the same hive, P-1 remains.
+- **Validated on 8.x (0.1.66):** the vault's audit shows what each node reads. With four IO.slack
+  nodes from two companies:
+  - with the key assigned to two nodes, only those two read it;
+  - when a node is taken off it, that one is out at once;
+  - as general, all of the company's nodes read it and none of the other's;
+  - with the company suspended, nobody; reactivated, they come back;
+  - a person's secret is read by its assigned node even after the person is moved to another
+    company;
+  - the genesis rejects an AI node;
+  - the core read its keys after the restart.
 
-  Detalle en `lab/DEPLOYMENTS.md`.
+  Detail in `lab/DEPLOYMENTS.md`.
 
-### A-63 ✅ VALIDADO EN 8.x (0.1.65, 2026-10-14) — La identidad dependía del tenant: personas duplicadas, claves que se corrían y fusiones entre tenants
+### A-63 ✅ VALIDATED ON 8.x (0.1.65, 2026-10-14) — Identity depended on the tenant: duplicated people, keys that drifted and merges across tenants
 
-- **El marco:** `docs/ilk-tenant-model-v1.md`. Lo decidieron el operador, Claude y Astra el
-  2026-10-14: el ILK es el actor y nunca se duplica, el tenant es un centro de costo y los permisos
-  son explícitos.
-- **Qué pasaba:**
-  - La clave de un canal era `(canal, dirección, tenant del ILK)`, recalculada siempre desde el
-    tenant actual del ILK. Así:
-    - la misma persona en dos empresas eran dos ILKs;
-    - re-registrar un temporal en otro tenant dejaba la búsqueda del primario desactualizada hasta
-      reiniciar;
-    - una fusión guardaba los canales movidos con un tenant en memoria y otro en la base.
-  - `merge_from_ilk_id` no chequeaba tenant.
-  - `delete_ilk` de Cloud podía marcar ILKs de nodos.
-  - Borrar un tenant marcaba a toda persona cargada a él.
-- **Arreglo (etapa 1):**
-  - **El ámbito del canal:**
-    - cada canal guarda su `scope`, fijo al crearlo;
-    - todas las claves lo usan: memoria, base, SHM y el camino rápido;
-    - el `IlkEntry` de la SHM lleva el centro de costo;
-    - no hay cambio de layout.
-  - **Una cuenta de Cloud por email:**
-    - el canal `cloud` vive en el ámbito de la instalación, y solo IO.cloud lo escribe;
-    - `register_human` devuelve la cuenta existente (`existing: true`);
-    - un temporal abandonado se recarga al tenant que pide, con historial;
-    - `ACCOUNT_AMBIGUOUS` y `ACCOUNT_IN_ROOT_TENANT` cubren los datos viejos.
+- **The frame:** `docs/ilk-tenant-model-v1.md`. The operator, Claude and Astra decided it on
+  2026-10-14: the ILK is the actor and is never duplicated, the tenant is a cost center and
+  permissions are explicit.
+- **What happened:**
+  - A channel's key was `(channel, address, ILK's tenant)`, always recalculated from the ILK's
+    current tenant. So:
+    - the same person in two companies was two ILKs;
+    - re-registering a temporary in another tenant left the primary's lookup out of date until a
+      restart;
+    - a merge stored the moved channels with one tenant in memory and another one in the database.
+  - `merge_from_ilk_id` did not check the tenant.
+  - Cloud's `delete_ilk` could mark node ILKs.
+  - Deleting a tenant marked every person charged to it.
+- **Fix (stage 1):**
+  - **The channel's scope:**
+    - each channel stores its `scope`, fixed when it is created;
+    - every key uses it: memory, database, SHM and the fast path;
+    - the SHM's `IlkEntry` carries the cost center;
+    - there is no layout change.
+  - **One Cloud account per email:**
+    - the `cloud` channel lives in the installation's scope, and only IO.cloud writes it;
+    - `register_human` returns the existing account (`existing: true`);
+    - an abandoned temporary is recharged to the tenant that asks, with history;
+    - `ACCOUNT_AMBIGUOUS` and `ACCOUNT_IN_ROOT_TENANT` cover the old data.
   - **`ILK_SET_TENANT`:**
-    - solo personas completas, con historial en la misma transacción;
-    - el admin estampa para quién es el cambio;
-    - el registro ya no cambia el tenant de una persona.
-  - **Fusiones** dentro de un mismo tenant.
-  - **Cloud** borra y restaura solo personas, y lee por id sin filtro de tenant.
-  - **Borrar un tenant** con cuentas cargadas da `TENANT_HAS_ACCOUNTS`; el resto sigue en cascada.
-  - **Migración v3 en el esquema:** antes de cargar la memoria, mueve las cuentas no ambiguas y
-    reporta el resto por log.
-- **Revisión del diseño (una ronda):** 7 hallazgos mayores y 5 menores, todos incorporados al diseño
-  antes de escribir el código.
-- **Revisión del código (una ronda):** 1 mayor y 8 menores.
-  - **El mayor:** purgar un tenant del que se había ido una persona fallaba siempre. La FK de sus
-    canales al tenant seguía viva. Ahora la purga se lleva los canales que quedan en ese ámbito
-    (`dropped_channels`).
-  - **Arreglados:**
-    - **Push de una réplica rechazado:** ya no se toma como una baja.
-    - **El canal `cloud` y el ámbito de la instalación**, cerrados también por la réplica (snapshot
-      y delta), por `ILK_UPDATE` y por la fusión desde un nodo IO del tenant.
-    - **La recarga de un temporal:** solo con IO.cloud y en el ámbito compartido.
-    - **El canal propio de un nodo** no responde un alta de persona.
-    - **Un `ich_id` ajeno se rechaza** (`ICH_ID_CONFLICT`).
-    - **Un email ambiguo:** también lo es si otro ILK lo tiene en el ámbito de la instalación.
-      Se chequea antes de buscar.
-    - **El restore de una cuenta vieja** vuelve al ámbito de la instalación si la clave está libre.
-    - **Un alta sin terminar no traba ni se marca** al borrar su tenant (`pending_signups`).
-    - **Tests:** el sello de `on_behalf_of` del admin, más 9 en identity.
-  - **Queda documentado, sin código:** el desfase de versiones entre el core e io.cloud durante el
-    upgrade. Un core viejo rechaza `scope`, y un admin nuevo rechaza un `delete_ilk` viejo sin
-    `ilk_type`. Son los segundos del rebind de A-39. El SQL de v3 se valida en 8.x con datos hechos
-    en 0.1.64.
-- **Validado en 8.x (0.1.65):** datos viejos hechos con 0.1.64 por la puerta de Cloud. La migración
-  movió lo único y reportó lo ambiguo. Por la puerta pública pasaron 30 controles. Del lado del
-  operador:
-  - el historial;
-  - la SHM de worker1;
-  - la purga del tenant que dejó una persona (`dropped_channels=1`);
-  - un reinicio de sy-identity, que resolvió en vivo el email ambiguo.
+    - only complete people, with history in the same transaction;
+    - the admin stamps whom the change is for;
+    - registration no longer changes a person's tenant.
+  - **Merges** within the same tenant.
+  - **Cloud** deletes and restores only people, and reads by id with no tenant filter.
+  - **Deleting a tenant** with accounts charged to it gives `TENANT_HAS_ACCOUNTS`; the rest still
+    cascades.
+  - **v3 migration in the schema:** before loading the memory, it moves the unambiguous accounts and
+    reports the rest in the log.
+- **Design review (one round):** 7 major findings and 5 minor, all incorporated into the design
+  before writing the code.
+- **Code review (one round):** 1 major and 8 minor.
+  - **The major:** purging a tenant that a person had left always failed. The FK from their
+    channels to the tenant was still alive. Now the purge takes along the channels left in that
+    scope (`dropped_channels`).
+  - **Fixed:**
+    - **A rejected replica push:** it is no longer taken as a removal.
+    - **The `cloud` channel and the installation's scope**, also closed through the replica
+      (snapshot and delta), through `ILK_UPDATE` and through the merge from an IO node of the
+      tenant.
+    - **Recharging a temporary:** only with IO.cloud and in the shared scope.
+    - **A node's own channel** does not answer a person sign-up.
+    - **A foreign `ich_id` is rejected** (`ICH_ID_CONFLICT`).
+    - **An ambiguous email:** it is also ambiguous if another ILK has it in the installation's
+      scope. It is checked before searching.
+    - **The restore of an old account** goes back to the installation's scope if the key is free.
+    - **An unfinished sign-up neither blocks nor gets marked** when its tenant is deleted
+      (`pending_signups`).
+    - **Tests:** the admin's `on_behalf_of` stamp, plus 9 in identity.
+  - **Documented, no code:** the version skew between the core and io.cloud during the upgrade. An
+    old core rejects `scope`, and a new admin rejects an old `delete_ilk` without `ilk_type`. They
+    are the seconds of the A-39 rebind. The v3 SQL is validated on 8.x with data made in 0.1.64.
+- **Validated on 8.x (0.1.65):** old data made with 0.1.64 through Cloud's door. The migration
+  moved what was unambiguous and reported what was ambiguous. 30 checks went through the public
+  door. On the operator's side:
+  - the history;
+  - worker1's SHM;
+  - the purge of the tenant a person had left (`dropped_channels=1`);
+  - a restart of sy-identity, which resolved the ambiguous email live.
 
-  Detalle en `lab/DEPLOYMENTS.md`.
-- **Pendiente para las etapas siguientes:** reasignar nodos (con los permisos del vault, etapa 2),
-  y el estado del tenant como compuerta y el resto de D8 (etapa 3).
+  Detail in `lab/DEPLOYMENTS.md`.
+- **Pending for the next stages:** reassigning nodes (with the vault's permissions, stage 2), and
+  the tenant's state as a gate and the rest of D8 (stage 3).
 
-### A-62 🟡 ESTACIONADO (costo/beneficio, 2026-10-13) — Cualquier nodo de la malla puede pedirle cualquier acción al admin
+### A-62 🟡 PARKED (cost/benefit, 2026-10-13) — Any node on the mesh can ask the admin for any action
 
-- **Qué pasa (visto en el código el 2026-10-07):** el gateway interno del admin (`ADMIN_COMMAND`)
-  no mira quién llama, salvo para unas pocas acciones con compuerta propia: el relay de Cloud
-  (`authorize_cloud_relay`), `externalize` y `publish_artifact`. El resto (`add_hive`, `vault_get`,
-  `kill_node`, `opa_*`, `publish_cloud_endpoint`, que emite un bearer de Cloud nuevo y lo devuelve)
-  lo ejecuta para cualquier nodo conectado al router. Es así por diseño desde el gateway interno
-  (`docs/02-protocolo.md` §7.10: llamadores AI/WF/IO).
-- **Por qué no es urgente:** la lógica de los tenants no llega. Un WF no puede apuntar a `SY.*`
-  (`go/nodes/wf/wf-generic/node/actions.go`), y ai.generic solo manda `publish_artifact`, con la
-  acción fija. Hace falta un proceso de nodo comprometido, y los nodos ya corren como root (A-60):
-  quien lo compromete ya es root en el host.
-- **Cuándo mirarlo:** junto con A-60 (nodos sin root). Ahí sí pasa a importar quién puede pedir qué.
-  Forma probable: una lista por prefijo de rol, con lo de sistema solo para `SY.*`.
-- **Desde 0.1.79 (A-70, etapa 3):** por la malla, `get_llm_usage` solo lo piden Archi e IO.cloud,
-  pero el ejecutor (`executor_execute_plan`) corre cualquier plan como el operador para cualquier
-  nodo. Un plan de un paso lee el uso de LLM de todos los tenants. Lo encontró la revisión del código
-  de la etapa 3 y queda acá: leer el uso no cambia nada de lo que el ejecutor ya permite.
+- **What happens (seen in the code on 2026-10-07):** the admin's internal gateway (`ADMIN_COMMAND`)
+  does not look at who is calling, except for a few actions with their own gate: Cloud's relay
+  (`authorize_cloud_relay`), `externalize` and `publish_artifact`. The rest (`add_hive`,
+  `vault_get`, `kill_node`, `opa_*`, `publish_cloud_endpoint`, which issues a new Cloud bearer and
+  returns it) it runs for any node connected to the router. It has been like that by design since
+  the internal gateway (`docs/history/02-protocolo.md` §7.10: AI/WF/IO callers).
+- **Why it is not urgent:** the tenants' logic does not reach it. A WF cannot target `SY.*`
+  (`go/nodes/wf/wf-generic/node/actions.go`), and ai.generic only sends `publish_artifact`, with
+  the action fixed. It takes a compromised node process, and the nodes already run as root (A-60):
+  whoever compromises one is already root on the host.
+- **When to look at it:** together with A-60 (nodes without root). That is when who can ask for
+  what starts to matter. Likely form: a list per role prefix, with the system actions only for
+  `SY.*`.
+- **Since 0.1.79 (A-70, stage 3):** over the mesh, `get_llm_usage` is requested only by Archi and
+  IO.cloud, but the executor (`executor_execute_plan`) runs any plan as the operator for any node.
+  A one-step plan reads the LLM usage of every tenant. The stage 3 code review found it, and it
+  stays here: reading usage changes nothing about what the executor already allows.
 
-### A-61 ✅ RESUELTO (0.1.64, validado en 8.x) — Cloud podía pisar claves de otro tenant y leer identidades de cualquier tenant
+### A-61 ✅ RESOLVED (0.1.64, validated on 8.x) — Cloud could overwrite another tenant's keys and read identities of any tenant
 
-- **Qué pasaba (revisión de las fichas del equipo de Cloud, 2026-10-07):**
-  - `put_token` pisaba una clave existente de **cualquier** tenant, también de infraestructura (la
-    clave del proveedor de AI): SY.vault no miraba el tenant al escribir. Con el tenant raíz hasta
-    era "la suya".
-  - `get_ilk_details` por id leía el ILK de cualquier tenant, y las lecturas rápidas tomaban el
-    tenant de `params`.
-  - `edge_fanout_verify:<ich>` no estaba entre las claves reservadas.
-- **Arreglo (aprobado por el operador, 2026-10-13: *"primero io.cloud"*):**
-  - **SY.vault, para todos los llamadores:** un put de una clave de otro tenant es `KEY_TAKEN`
-    (aunque el valor sea el mismo) y nunca la mueve. Borrar, rotar y volver atrás llevan
-    `tenant_id` obligatorio, y una clave de otro tenant contesta `KEY_NOT_FOUND`. El admin pone el
-    raíz si no viene, igual que en el put; el orquestador pasa el tenant de cada clave al limpiar los
-    secretos de un nodo; los planes de Archi tienen el campo.
-  - **SY.identity:** ILK_GET acepta `tenant_id` y contesta `NOT_FOUND` para un ILK de otro tenant.
-    `update_tenant` rechaza el raíz (`TENANT_ROOT_PROTECTED`, se reescribe en cada arranque) y un
-    nombre o dominio de otro tenant (`TENANT_NAME_TAKEN` / `TENANT_DOMAIN_TAKEN`), y valida todo
-    antes de cambiar nada (antes un `status` malo dejaba el nombre nuevo puesto).
-  - **IO.cloud (regla 3):** el tenant va solo en la raíz del sobre (uno en `params` se rechaza),
-    nunca es el raíz, y todo lo que la op toca es de ese tenant. Operaciones nuevas `list_tokens`,
-    `delete_token` y `update_tenant`. Todo error lleva `error_code`.
-  - **SY.admin:** vuelve a exigir todo eso del lado del servidor para `IO.cloud`
+- **What happened (review of the Cloud team's cards, 2026-10-07):**
+  - `put_token` overwrote an existing key of **any** tenant, infrastructure ones too (the AI
+    provider's key): SY.vault did not look at the tenant when writing. With the root tenant it was
+    even "its own".
+  - `get_ilk_details` by id read the ILK of any tenant, and the fast reads took the tenant from
+    `params`.
+  - `edge_fanout_verify:<ich>` was not among the reserved keys.
+- **Fix (approved by the operator, 2026-10-13: *"primero io.cloud"* ("io.cloud first")):**
+  - **SY.vault, for every caller:** a put of a key that belongs to another tenant is `KEY_TAKEN`
+    (even if the value is the same), and it never moves it. Delete, rotate and roll back require
+    `tenant_id`, and another tenant's key answers `KEY_NOT_FOUND`. The admin sets the root if none
+    comes, just like in the put; the orchestrator passes each key's tenant when it cleans up a
+    node's secrets; Archi's plans have the field.
+  - **SY.identity:** ILK_GET accepts `tenant_id` and answers `NOT_FOUND` for an ILK of another
+    tenant. `update_tenant` rejects the root (`TENANT_ROOT_PROTECTED`; it is rewritten on every
+    startup) and a name or domain of another tenant (`TENANT_NAME_TAKEN` /
+    `TENANT_DOMAIN_TAKEN`), and it validates everything before changing anything (before, a bad
+    `status` left the new name set).
+  - **IO.cloud (rule 3):** the tenant goes only in the root of the envelope (one in `params` is
+    rejected), it is never the root, and everything the op touches belongs to that tenant. New
+    operations `list_tokens`, `delete_token` and `update_tenant`. Every error carries
+    `error_code`.
+  - **SY.admin:** it enforces all of that again on the server side for `IO.cloud`
     (`enforce_cloud_relay_content`).
-- **Lo que casi se rompe:** agregar acciones a la superficie de Cloud hace que, por la malla, solo
-  io.cloud pueda pedirlas (ya pasó con `delete_ilk` el 2026-09-28). Se dejaron puntualmente
-  `delete_ilk`, `vault_list` y `vault_delete` al orquestador (limpieza de un nodo) y toda la
-  superficie a `SY.architect@motherbee`. A Archi ya le rechazaban por la malla `run_node`, `get_ilk`
-  y `delete_ilk` de sus comandos.
-- **Revisión adversarial (una ronda, 2026-10-13):** un MAJOR: el factory reset del .deb borraba
-  los secretos sin nombrar el tenant, así que con la regla nueva dejaba los de los tenants y después
-  no podía purgarlos (TENANT_HAS_SECRETS). Ahora borra cada clave en su tenant. Seis menores
-  arreglados:
-  - una clave de otro tenant se lee igual que una inexistente (mismo código y mismo texto; solo la
-    auditoría dice "denied");
-  - el tenant de Cloud se acepta solo en su forma canónica (las otras grafías del UUID del raíz
-    pasaban el chequeo exacto);
-  - el emulador de Cloud ya no usa el raíz por defecto y su prueba borra su clave;
-  - `KEY_TAKEN` y los `*_TAKEN` de tenant contestan 409, `TENANT_ROOT_PROTECTED` 403;
-  - dos bloques de doc corridos de lugar;
-  - una frase de la doc.
-- **Fuera de esto (decisión del operador):** una persona en varias empresas y los tenants
-  padre/hijo van a la charla de identity. Restringir `delete_ilk`/`restore_ilk` de Cloud a ILKs
-  humanos quedó en pregunta: el operador dudó, porque los tokens se asignan al ILK del nodo. Eso
-  último no cambia el ILK, solo la metadata del secreto.
-- **Contrato:** `docs/io-cloud-api.md`, reescrito al estado real (estaba en 3 operaciones y
-  configuración por `.env`).
-- **Validado en 8.x (0.1.64, 2026-10-13):** 53 controles por la puerta pública real con el bearer
-  de Cloud y los del lado del operador (la purga del nodo borró su secreto en su tenant, el `DELETE`
-  HTTP con y sin tenant, Archi por la malla), todos PASS (ledger 0.1.64). Pendiente menor: el admin
-  HTTP mapea `TENANT_NOT_FOUND` a 500.
+- **What almost broke:** adding actions to Cloud's surface means that, over the mesh, only io.cloud
+  can request them (it already happened with `delete_ilk` on 2026-09-28). `delete_ilk`,
+  `vault_list` and `vault_delete` were specifically left open to the orchestrator (cleanup of a
+  node), and the whole surface to `SY.architect@motherbee`. Over the mesh, Archi was already
+  getting its `run_node`, `get_ilk` and `delete_ilk` commands rejected.
+- **Adversarial review (one round, 2026-10-13):** one MAJOR: the .deb's factory reset deleted the
+  secrets without naming the tenant, so with the new rule it left the tenants' secrets behind and
+  then could not purge them (TENANT_HAS_SECRETS). Now it deletes each key in its tenant. Six minor
+  ones fixed:
+  - a key of another tenant reads the same as a nonexistent one (same code and same text; only the
+    audit says "denied");
+  - Cloud's tenant is accepted only in its canonical form (the other spellings of the root's UUID
+    passed the exact check);
+  - the Cloud emulator no longer uses the root by default, and its test deletes its key;
+  - `KEY_TAKEN` and the tenant `*_TAKEN` codes answer 409, `TENANT_ROOT_PROTECTED` 403;
+  - two doc blocks that were out of place;
+  - a sentence in the doc.
+- **Out of scope (the operator's decision):** a person in several companies and parent/child
+  tenants go to the identity talk. Restricting Cloud's `delete_ilk`/`restore_ilk` to human ILKs
+  was left as a question: the operator hesitated, because tokens are assigned to the node's ILK.
+  That last part does not change the ILK, only the secret's metadata.
+- **Contract:** `docs/io-cloud-api.md`, rewritten to the real state (it was at 3 operations and
+  configuration through `.env`).
+- **Validated on 8.x (0.1.64, 2026-10-13):** 53 checks through the real public door with Cloud's
+  bearer, plus the ones on the operator's side (the node purge deleted its secret in its tenant,
+  the HTTP `DELETE` with and without a tenant, Archi over the mesh), all PASS (ledger 0.1.64).
+  Minor pending item: the admin's HTTP maps `TENANT_NOT_FOUND` to 500.
 
-### A-60 🔵 PARA EVALUAR (pedido del operador, 2026-10-06) — Los nodos administrados corren como root
+### A-60 🔵 TO EVALUATE (operator's request, 2026-10-06) — The managed nodes run as root
 
-- **Qué pasa:** el orquestador lanza los nodos (IO, AI, WF) con `systemd-run` sin `User=`, así que
-  corren como root en todos los hosts. Visto en PROD el 2026-10-06 (solo lectura): `io-blob`,
-  `io-cloud` y `sy-wf-rules` corren como root. Un nodo comprometido es root en su host, y todo lo
-  que escribe queda de root (por eso A-56).
-- **Lo que 0.1.63 hace (el paso mínimo, aprobado):** los nodos siguen como root, pero el SDK le
-  entrega cada blob al dueño de la carpeta donde lo deja, y se va el `chown -R` del postinst.
-- **Lo que hay que evaluar (operador: *"deja documentado el tema de evaluar correr los nodos como
-  fluxbee de usuario"*):** correrlos como `fluxbee`, o con un usuario por nodo. Antes hay que ver qué
-  usan hoy que solo root alcanza. En el motherbee, el 2026-10-06:
-  - las regiones SHM (`/dev/shm/jsr-*`: router, config, identity, lsa, memory, opa) son
-    `root:root 0600`, y el SDK las lee para las búsquedas de ILK, la config y la policy;
-  - el socket del router es `0666`, pero el `irp-*.sock` es `root:root 0600`;
-  - `state/nodes/` es `root:root 0755`, con los `.uuid` de cada nodo de root;
-  - `dist/runtimes` es `root:fluxbee 0755` (legible).
-  Hay que medir también qué hace cada nodo base (io.api, io.blob, io.cloud, io.slack, io.wapp,
-  ai.generic, wf.engine, io.linkedhelper) con el filesystem y la red.
-- **Estado:** para evaluar después de 0.1.63; no tiene diseño todavía.
+- **What happens:** the orchestrator launches the nodes (IO, AI, WF) with `systemd-run` without
+  `User=`, so they run as root on every host. Seen in PROD on 2026-10-06 (read-only): `io-blob`,
+  `io-cloud` and `sy-wf-rules` run as root. A compromised node is root on its host, and everything
+  it writes ends up owned by root (hence A-56).
+- **What 0.1.63 does (the minimal step, approved):** the nodes stay as root, but the SDK hands each
+  blob over to the owner of the folder where it leaves it, and the postinst's `chown -R` goes away.
+- **What has to be evaluated (operator: *"deja documentado el tema de evaluar correr los nodos como
+  fluxbee de usuario"* ("leave the topic of evaluating running the nodes as the fluxbee user
+  documented")):** running them as `fluxbee`, or with one user per node. First we have to see
+  what they use today that only root can reach. On the motherbee, on 2026-10-06:
+  - the SHM regions (`/dev/shm/jsr-*`: router, config, identity, lsa, memory, opa) are
+    `root:root 0600`, and the SDK reads them for the ILK lookups, the config and the policy;
+  - the router's socket is `0666`, but the `irp-*.sock` is `root:root 0600`;
+  - `state/nodes/` is `root:root 0755`, with each node's `.uuid` owned by root;
+  - `dist/runtimes` is `root:fluxbee 0755` (readable).
+  We also have to measure what each base node (io.api, io.blob, io.cloud, io.slack, io.wapp,
+  ai.generic, wf.engine, io.linkedhelper) does with the filesystem and the network.
+- **Status:** to evaluate after 0.1.63; it has no design yet.
 
-### A-59 ✅ RESUELTO (0.1.62, validado en 8.x) — La réplica de identity esperaba para siempre en una suscripción cortada sin FIN
+### A-59 ✅ RESOLVED (0.1.62, validated on 8.x) — The identity replica waited forever on a subscription cut without a FIN
 
-- **Qué pasaba (panel DTAP ronda 7, P7-1, confirmado en el código):** la suscripción de deltas de
-  una réplica es un long-poll. La réplica solo escribe para confirmar un delta, leía sin timeout y el
-  socket no tiene keepalive. Si un firewall con estado deja de seguir la conexión, descarta los
-  deltas siguientes y también el FIN, y la réplica no se entera nunca. Pasa con una tabla cargada
-  después de abrir la conexión (el primer apply de la etapa 4, o un join donde sy-identity arranca
-  antes que la postura) o tras 5 días sin tráfico (el timeout de conntrack). Altas, bajas y
-  revocaciones dejan de llegar a ese hive hasta que se reinicie su sy-identity.
-- **Arreglo:** el primario escribe un latido (`IDENTITY_SYNC_HEARTBEAT`, sin seq ni ack) cuando
-  pasan 20 s sin enviar nada. La réplica corta la suscripción tras 60 s sin oír nada, lo dice en el
-  log ("no frame from the primary for 60s (heartbeats stopped)") y se vuelve a suscribir desde un
-  snapshot completo. Es el mismo patrón de los pares: el WAN manda un LSA cada 10 s y la publicación
-  de identity reconcilia cada 30 s.
-- **Pruebas:** tres tests con sockets reales: el primario late y sigue entregando deltas; la réplica
-  corta un stream mudo; y los dos juntos se mantienen suscritos. Sin el latido fallan dos, y sin el
-  timeout falla uno.
-- **De la revisión adversarial (dos arreglos más, existían antes):**
-  - un delta podía perderse en silencio al abrir una suscripción: el primario podía armar el
-    snapshot antes de registrar al suscriptor, y un delta difundido en el medio no estaba en
-    ninguno de los dos. Ahora el handler encola la registración antes de responder y el lazo
-    principal registra lo encolado antes de armar cada snapshot. Con P7-1 las re-suscripciones son
-    más frecuentes, por eso importa;
-  - las suscripciones muertas se limpiaban solo al difundir un cambio; ahora también al registrar
-    una nueva, así el tope de 256 cuenta solo las vivas.
-  - Bajar el motherbee de 0.1.62 dejando los spokes arriba hace que el worker se re-suscriba cada
-    60 s: el HANDBOOK ("El rollback") pide bajar primero los spokes.
-- **Visto en PROD antes del arreglo (0.1.61):** la suscripción de worker1 llevaba 15.929 s sin un
-  paquete en ninguna dirección; el canal de publicación, cada 30 s.
-- **Validado (2026-10-06, ledger 0.1.62):**
-  - En worker1, la suscripción pasó de 15.929 s sin un paquete a `lastrcv` de 8, 3 y 18,5 s.
-  - Un corte de 100 s de lo que llega de :9100: la réplica lo dijo a los 60 s del último latido, y se
-    re-suscribió 5 s después de levantarlo.
-  - Un worker unido de cero (worker2) también recibe latidos.
+- **What happened (DTAP panel round 7, P7-1, confirmed in the code):** a replica's delta
+  subscription is a long-poll. The replica only writes to confirm a delta, it read with no timeout
+  and the socket has no keepalive. If a stateful firewall stops tracking the connection, it drops
+  the following deltas and also the FIN, and the replica never finds out. It happens with a table
+  loaded after the connection is opened (the first apply of stage 4, or a join where sy-identity
+  starts before the posture) or after 5 days without traffic (the conntrack timeout). Additions,
+  removals and revocations stop reaching that hive until its sy-identity is restarted.
+- **Fix:** the primary writes a heartbeat (`IDENTITY_SYNC_HEARTBEAT`, with no seq and no ack) when
+  20 s go by without sending anything. The replica cuts the subscription after 60 s without
+  hearing anything, says so in the log ("no frame from the primary for 60s (heartbeats stopped)")
+  and subscribes again from a full snapshot. It is the same pattern as the peers: the WAN sends an
+  LSA every 10 s and the identity publication reconciles every 30 s.
+- **Tests:** three tests with real sockets: the primary beats and keeps delivering deltas; the
+  replica cuts a silent stream; and the two together stay subscribed. Without the heartbeat two
+  fail, and without the timeout one fails.
+- **From the adversarial review (two more fixes; they predated this):**
+  - a delta could be lost silently when a subscription was opened: the primary could build the
+    snapshot before registering the subscriber, and a delta broadcast in between was in neither of
+    the two. Now the handler queues the registration before responding, and the main loop
+    registers what is queued before building each snapshot. With P7-1, re-subscriptions are more
+    frequent, which is why it matters;
+  - dead subscriptions were cleaned up only when a change was broadcast; now also when a new one is
+    registered, so the cap of 256 counts only the live ones.
+  - Rolling the motherbee back from 0.1.62 while leaving the spokes up makes the worker
+    re-subscribe every 60 s: the HANDBOOK ("The rollback") asks to roll back the spokes first.
+- **Seen in PROD before the fix (0.1.61):** worker1's subscription had gone 15,929 s without a
+  packet in either direction; the publication channel, every 30 s.
+- **Validated (2026-10-06, ledger 0.1.62):**
+  - On worker1, the subscription went from 15,929 s without a packet to a `lastrcv` of 8, 3 and
+    18.5 s.
+  - A 100 s cut of what arrives from :9100: the replica reported it 60 s after the last heartbeat,
+    and it re-subscribed 5 s after the cut was lifted.
+  - A worker joined from scratch (worker2) also receives heartbeats.
 
-### A-58 ✅ RESUELTO (0.1.63, validado en 8.x) — En los workers y el egress Syncthing corría como root
+### A-58 ✅ RESOLVED (0.1.63, validated on 8.x) — On the workers and the egress, Syncthing ran as root
 
-- **Qué pasa (visto el 2026-10-06 en PROD, solo lectura):** worker1 y egress1 no tienen el usuario
-  `fluxbee`, así que `resolve_syncthing_service_user` cae al respaldo root: Syncthing y todo su
-  `dist/` son de root. El bootstrap del ingress crea el usuario (`useradd`), el de worker y egress no
-  (`worker_remote_base_dirs_command`).
-- **Impacto:** un Syncthing comprometido en esos hosts ya es root. Desde la etapa 3 escucha solo en
-  loopback y su único par es el motherbee, así que hace falta comprometer antes al motherbee.
-- **Arreglo (aprobado por el operador, 0.1.63):**
-  - El orquestador crea el usuario `fluxbee` al arrancar, en cualquier rol. Syncthing corre siempre
-    como `fluxbee`: se fueron el respaldo a root y las opciones `blob.sync.service_user` y
-    `blob.sync.allow_root_fallback`.
-  - En un spoke que hoy lo corre como root, el cambio es un paso visible, una sola vez: el log dice
-    "Syncthing moves to its own user (A-58)", Syncthing se para, su home, sus carpetas de blob y el
-    `dist/` del spoke pasan a `fluxbee` (`chown -R` con el servicio parado, para que no siga creando
-    archivos de root), se escribe la unit nueva y arranca.
-  - El home pasa a ser de `fluxbee` siempre que Syncthing corre; antes el egress (que solo sincroniza
-    dist) nunca lo tenía.
-  - Lo que agregó la revisión adversarial:
-    - el binario se instala antes de parar nada: un vendor que no se puede instalar deja corriendo al
-      Syncthing que lo trae;
-    - el cambio se decide por la unit, por los archivos del home y por el usuario del proceso, así
-      que un cambio que quedó a medias corre de nuevo;
-    - deja una alerta `syncthing_user_switched`, recién cuando Syncthing quedó sano como `fluxbee`;
-    - `useradd` usa un grupo `fluxbee` que ya exista;
-    - segunda ronda:
-      - el uid del proceso cuenta solo cuando `/proc/<pid>/comm` es `syncthing`, porque mientras
-        systemd lo arranca el proceso todavía corre como root;
-      - `daemon-reload` en el cambio, para que no levante la definición vieja de la unit.
-  - Volver una caja a 0.1.62 deja Syncthing como `fluxbee`, porque el usuario ya existe. Pero los
-    nodos de 0.1.62 escriben blobs de root que ese Syncthing no lee. Para devolverlo a root: parar
-    `fluxbee-syncthing`, `userdel fluxbee` y reiniciar `sy-orchestrator` (HANDBOOK, "El rollback").
-- **Queda:** el bootstrap del ingress todavía crea el usuario y hace su `chown`. Sobra, pero no se
-  toca hasta validar un join de ingress (la rama de ingreso del gate de A-48).
-- **Validado (2026-10-06, ledger 0.1.63):**
-  - worker1 y egress1 crearon `fluxbee` y cambiaron una vez (alerta `syncthing_user_switched` con el
-    servicio sano);
-  - sus carpetas quedaron `idle` sin errores;
-  - un blob escrito en worker1 llegó al motherbee en ~12 s, y uno del motherbee llegó a worker1 en
-    ~10 s;
-  - el motherbee y el ingress no se tocaron.
+- **What happens (seen on 2026-10-06 in PROD, read-only):** worker1 and egress1 do not have the
+  `fluxbee` user, so `resolve_syncthing_service_user` falls back to root: Syncthing and its whole
+  `dist/` belong to root. The ingress bootstrap creates the user (`useradd`); the worker and egress
+  ones do not (`worker_remote_base_dirs_command`).
+- **Impact:** a compromised Syncthing on those hosts is already root. Since stage 3 it listens only
+  on loopback and its only peer is the motherbee, so the motherbee would have to be compromised
+  first.
+- **Fix (approved by the operator, 0.1.63):**
+  - The orchestrator creates the `fluxbee` user at startup, in any role. Syncthing always runs as
+    `fluxbee`: the root fallback and the `blob.sync.service_user` and
+    `blob.sync.allow_root_fallback` options are gone.
+  - On a spoke that runs it as root today, the change is a visible, one-time step: the log says
+    "Syncthing moves to its own user (A-58)", Syncthing stops, its home, its blob folders and the
+    spoke's `dist/` go to `fluxbee` (`chown -R` with the service stopped, so it does not keep
+    creating root files), the new unit is written and it starts.
+  - The home becomes `fluxbee`'s whenever Syncthing runs; before, the egress (which only syncs
+    dist) never had it.
+  - What the adversarial review added:
+    - the binary is installed before anything is stopped: a vendor that cannot be installed leaves
+      the Syncthing that delivers it running;
+    - the change is decided by the unit, by the home's files and by the process's user, so a
+      change left half done runs again;
+    - it leaves a `syncthing_user_switched` alert, only once Syncthing is healthy as `fluxbee`;
+    - `useradd` uses a `fluxbee` group that already exists;
+    - second round:
+      - the process's uid only counts when `/proc/<pid>/comm` is `syncthing`, because while
+        systemd is starting it the process still runs as root;
+      - `daemon-reload` on the change, so it does not bring up the old unit definition.
+  - Rolling a box back to 0.1.62 leaves Syncthing as `fluxbee`, because the user already exists.
+    But the 0.1.62 nodes write root blobs that this Syncthing cannot read. To bring it back to
+    root: stop `fluxbee-syncthing`, `userdel fluxbee` and restart `sy-orchestrator` (HANDBOOK,
+    "The rollback").
+- **Remaining:** the ingress bootstrap still creates the user and does its `chown`. It is
+  redundant, but it is not touched until an ingress join is validated (the ingress branch of the
+  A-48 gate).
+- **Validated (2026-10-06, ledger 0.1.63):**
+  - worker1 and egress1 created `fluxbee` and switched once (`syncthing_user_switched` alert with
+    the service healthy);
+  - their folders stayed `idle` with no errors;
+  - a blob written on worker1 reached the motherbee in ~12 s, and one from the motherbee reached
+    worker1 in ~10 s;
+  - the motherbee and the ingress were not touched.
 
-### A-56 ✅ RESUELTO (0.1.63, validado en 8.x) — Root escribía por ruta en el `blob/` del usuario de Syncthing
+### A-56 ✅ RESOLVED (0.1.63, validated on 8.x) — Root wrote by path in the Syncthing user's `blob/`
 
-- **Qué pasa (tercera revisión adversarial de A-51, 2026-10-06; verificado paso a paso en el código,
-  no ejecutado de punta a punta):** en el motherbee, `blob/` y `blob/staging` son del usuario de
-  Syncthing, y procesos root escriben ahí por ruta: el SDK de blobs (`fs::write`, chmod por ruta,
-  `ensure_dir_mode_0750`) desde io.blob, los nodos IO y AI y sy_architect.
-  - El nombre en staging es predecible (`staging/<hash16[..2]>/<nombre>_<hash16>.<ext>`). Ese usuario
-    puede plantar un symlink ahí y root escribe bytes de un tercero (por ejemplo, un adjunto
-    entrante) donde apunte.
-  - io.blob hace chmod 0750 de un `blob/public` plantado en cada arranque.
-- **Lo que además tapaba (visto el 2026-10-06):** los nodos corren como root (A-60) y el SDK dejaba
-  cada blob `root:root 0640`. En el motherbee Syncthing corre como `fluxbee`, así que un blob nuevo
-  no podía leerse ni sincronizarse. Nadie se enteraba porque el postinst hacía
-  `chown -R fluxbee blob/` en cada instalación.
-- **Arreglo (aprobado por el operador, 0.1.63):**
-  - Dueños: `blob/` es `root:fluxbee 0750`; `staging/` es solo de root, todo el árbol, sin links
-    adentro; `active/` y `public/` son de `fluxbee`. El orquestador lo deja así en cada arranque.
-  - SDK (`blob::safe_fs`): staging se escribe con un temporal exclusivo y un rename por descriptor.
-    `promote` abre `active/<prefijo>` sin seguir links, le entrega el blob al dueño de `active/` con
-    `fchown` sobre el descriptor y hace `renameat`.
-  - io.blob: la copia pública se escribe igual dentro de `blob/public`, con el dueño de la carpeta,
-    temporal exclusivo y `linkat`. Ya no hace chmod por ruta, ni le cambia el modo a la carpeta al
-    arrancar.
-  - Se borró el `chown -R` del postinst y los de `blob` en `install.sh`.
-- **Lo que agregaron las dos revisiones adversariales (mismo paso):**
-  - **Lectura, venía de antes:** `resolve` entregaba una ruta que io.slack, el SDK de AI, el
-    arquitecto e `io_common` leían con `fs::read`. Syncthing replica symlinks, así que un worker
-    comprometido podía hacer que el motherbee leyera un archivo de root y lo mandara a Slack o a un
-    LLM. Ahora:
-    - `open_blob` abre toda la cadena sin seguir links y solo acepta un archivo regular del tamaño
-      del `BlobRef`;
-    - `read_blob` además verifica que el SHA-256 empiece con el hash del nombre;
-    - los cuatro lectores y el curador de io.blob usan esto;
-    - `resolve` queda solo para saber dónde vive el blob.
+- **What happens (third adversarial review of A-51, 2026-10-06; verified step by step in the code,
+  not run end to end):** on the motherbee, `blob/` and `blob/staging` belong to the Syncthing user,
+  and root processes write there by path: the blob SDK (`fs::write`, chmod by path,
+  `ensure_dir_mode_0750`) from io.blob, the IO and AI nodes and sy_architect.
+  - The name in staging is predictable (`staging/<hash16[..2]>/<name>_<hash16>.<ext>`). That user
+    can plant a symlink there, and root writes a third party's bytes (for example, an incoming
+    attachment) wherever it points.
+  - io.blob does a chmod 0750 of a planted `blob/public` on every startup.
+- **What it also hid (seen on 2026-10-06):** the nodes run as root (A-60) and the SDK left each
+  blob `root:root 0640`. On the motherbee, Syncthing runs as `fluxbee`, so a new blob could not be
+  read or synced. Nobody noticed because the postinst did `chown -R fluxbee blob/` on every
+  install.
+- **Fix (approved by the operator, 0.1.63):**
+  - Owners: `blob/` is `root:fluxbee 0750`; `staging/` belongs only to root, the whole tree, with
+    no links inside; `active/` and `public/` belong to `fluxbee`. The orchestrator leaves it like
+    that on every startup.
+  - SDK (`blob::safe_fs`): staging is written with an exclusive temporary and a rename by
+    descriptor. `promote` opens `active/<prefix>` without following links, hands the blob over to
+    the owner of `active/` with `fchown` on the descriptor and does a `renameat`.
+  - io.blob: the public copy is written the same way inside `blob/public`, with the folder's owner,
+    an exclusive temporary and `linkat`. It no longer does a chmod by path, nor does it change the
+    folder's mode at startup.
+  - The postinst's `chown -R` and the `blob` ones in `install.sh` were deleted.
+- **What the two adversarial reviews added (same step):**
+  - **Reading, which predated this:** `resolve` handed out a path that io.slack, the AI SDK, the
+    architect and `io_common` read with `fs::read`. Syncthing replicates symlinks, so a
+    compromised worker could make the motherbee read a root file and send it to Slack or to an
+    LLM. Now:
+    - `open_blob` opens the whole chain without following links and only accepts a regular file of
+      the `BlobRef`'s size;
+    - `read_blob` also verifies that the SHA-256 starts with the name's hash;
+    - the four readers and io.blob's curator use this;
+    - `resolve` stays only to know where the blob lives.
   - **`promote`:**
-    - solo da por promovido un archivo regular; un link plantado con el nombre se reemplaza, nunca
-      se sigue;
-    - el blob en staging tiene que ser un archivo regular con un solo link, de este proceso;
-    - abrir no se bloquea ante un FIFO;
-    - después de mover se verifica el inodo que llegó: un `put` concurrente podía cambiar el
-      archivo entre el traspaso y el `renameat`, y se dejaba un blob de root.
-  - **Temporales:**
-    - el GC de staging borra los que dejó un crash;
-    - io.blob borra al arrancar los `.curate-*` que quedaron en `public/`.
-  - **`blob/agent-assets`:** pasa a ser solo de root. Quedó del usuario de Syncthing por el viejo
-    `chown -R`, y el arquitecto y ai.generic escriben y leen ahí por ruta: ese usuario podía cambiar
-    el prompt de sistema de un agente.
-  - **Lo que root ya dejó en `active/` y `public/`:**
-    - cada arranque, después del rebind, se pasa al usuario de Syncthing (`chown -R`, que recorre por
-      descriptor) y una alerta dice cuántas entradas eran. Solo corre con
+    - it only considers a regular file promoted; a link planted with the name is replaced, never
+      followed;
+    - the blob in staging has to be a regular file with a single link, from this process;
+    - opening does not block on a FIFO;
+    - after the move, the inode that arrived is verified: a concurrent `put` could change the file
+      between the handover and the `renameat`, and a root blob was left behind.
+  - **Temporaries:**
+    - the staging GC deletes the ones a crash left;
+    - io.blob deletes at startup the `.curate-*` files left in `public/`.
+  - **`blob/agent-assets`:** it becomes root-only. It had stayed owned by the Syncthing user
+    because of the old `chown -R`, and the architect and ai.generic write and read there by path:
+    that user could change an agent's system prompt.
+  - **What root already left in `active/` and `public/`:**
+    - on every startup, after the rebind, it is handed over to the Syncthing user (`chown -R`,
+      which walks by descriptor), and an alert says how many entries there were. It only runs with
       `fs.protected_hardlinks=1`;
-    - además, el watchdog alerta cuando Syncthing reporta errores por archivo en las carpetas de
-      blobs. Un archivo que no puede leer nunca vuelve "no sana" a la carpeta.
-  - **Marcadores:** los `.stfolder` toman el dueño de su carpeta.
-- **Segunda ronda de las revisiones (mismo paso):**
-  - **Concurrencia del mismo blob:** un `put` + `promote` concurrentes del mismo blob ya no dan un
-    falso error de integridad. Se acepta un archivo de staging que otro `put` reemplazó (sin links)
-    o que otro `promote` ya entregó, y si otro `promote` ya lo movió, es Ok. Hay un test con 4 hilos.
-  - **Lectura acotada:** `read_blob` lee como máximo el tamaño del `BlobRef` más un byte, aunque el
-    archivo crezca mientras se lee.
-  - **Async:** las lecturas corren en el pool de bloqueo (`read_blob_async`) para los que llaman
-    desde código async.
-  - **ai.generic:** verifica que cada asset de `agent-assets` tenga el SHA-256 de su nombre. Si
-    alguien lo editó antes del primer arranque de 0.1.63, no se carga.
-  - **El traspaso del arranque:** tolera carreras (`-ignore_readdir_race`, `-execdir chown -h`). Lo
-    juzga un recuento, y alerta por carpeta con lo que quedó.
-  - **`protected_hardlinks`:** el pase que devuelve staging y `agent-assets` a root también exige
-    `fs.protected_hardlinks=1`.
+    - in addition, the watchdog alerts when Syncthing reports per-file errors in the blob folders.
+      A file it cannot read never makes the folder "unhealthy".
+  - **Markers:** the `.stfolder` files take their folder's owner.
+- **Second round of the reviews (same step):**
+  - **Concurrency on the same blob:** a concurrent `put` + `promote` of the same blob no longer
+    gives a false integrity error. A staging file that another `put` replaced (with no links) or
+    that another `promote` already handed over is accepted, and if another `promote` already moved
+    it, it is Ok. There is a test with 4 threads.
+  - **Bounded read:** `read_blob` reads at most the `BlobRef`'s size plus one byte, even if the
+    file grows while it is being read.
+  - **Async:** the reads run in the blocking pool (`read_blob_async`) for callers from async code.
+  - **ai.generic:** it verifies that each asset in `agent-assets` has the SHA-256 of its name. If
+    someone edited it before the first startup of 0.1.63, it is not loaded.
+  - **The startup handover:** it tolerates races (`-ignore_readdir_race`, `-execdir chown -h`). A
+    recount judges it, and it alerts per folder with what was left.
+  - **`protected_hardlinks`:** the pass that returns staging and `agent-assets` to root also
+    requires `fs.protected_hardlinks=1`.
 - **Tests:**
-  - ningún link plantado se sigue, ni en staging, ni en `active/<prefijo>`, ni en `public/`;
-  - `read_blob` rechaza un link, otro tamaño, otros bytes y un FIFO, sin colgarse;
-  - el blob toma el grupo de `active/` (un grupo secundario del usuario de test, así se ve sin
-    root);
-  - el GC borra temporales;
-  - io.blob limpia `.curate-*`.
-- **Contra el código anterior:** según la revisión, fallaban los tests de link en staging y en el
-  prefijo de `active/`, y el del grupo. El de `public/` también fallaba, pero solo por el temporal
-  que dejaba.
-- **Validado (2026-10-06, ledger 0.1.63):**
-  - los dueños nuevos están en los 4 hosts, con 0 entradas ajenas;
-  - el ingress traspasó su `.stfolder`;
-  - un blob escrito como root con el SDK nuevo quedó `fluxbee:fluxbee 0640` y cruzó entre worker1 y
-    el motherbee en los dos sentidos.
-- **Residuo:** el GC de `active/` todavía lista, mide y borra por ruta. Si alguien cambia una carpeta
-  de prefijo por un link entre el listado y el borrado, root podría borrar afuera nombres con forma
-  de blob. Viene apagado por defecto (`gc.enabled` y `gc.apply` en `false`); se pasa a descriptores
-  antes de prenderlo.
+  - no planted link is followed, not in staging, not in `active/<prefix>`, not in `public/`;
+  - `read_blob` rejects a link, a different size, different bytes and a FIFO, without hanging;
+  - the blob takes the group of `active/` (a secondary group of the test user, so it can be seen
+    without root);
+  - the GC deletes temporaries;
+  - io.blob cleans up `.curate-*`.
+- **Against the previous code:** according to the review, the link tests in staging and in the
+  `active/` prefix failed, and so did the group one. The `public/` one also failed, but only
+  because of the temporary it left.
+- **Validated (2026-10-06, ledger 0.1.63):**
+  - the new owners are in place on the 4 hosts, with 0 foreign entries;
+  - the ingress handed over its `.stfolder`;
+  - a blob written as root with the new SDK ended up `fluxbee:fluxbee 0640` and crossed between
+    worker1 and the motherbee in both directions.
+- **Residue:** the `active/` GC still lists, measures and deletes by path. If someone swaps a
+  prefix folder for a link between the listing and the deletion, root could delete blob-shaped
+  names outside. It ships off by default (`gc.enabled` and `gc.apply` at `false`); it moves to
+  descriptors before it is turned on.
 
-### A-57 ✅ RESUELTO (0.1.62, validado en 8.x) — `update category=vendor` instalaba el Syncthing nuevo pero no lo reiniciaba, y respondía que sí
+### A-57 ✅ RESOLVED (0.1.62, validated on 8.x) — `update category=vendor` installed the new Syncthing but did not restart it, and answered that it had
 
-- **Qué pasaba (verificado en el código el 2026-10-06):** el update de vendor llamaba a
-  `ensure_blob_sync_runtime`, que reinstalaba el binario si cambió el hash y después hacía
-  `systemctl start`, que no hace nada si el servicio ya corre. El Syncthing en marcha seguía con el
-  binario viejo hasta el próximo reinicio, y la respuesta decía
-  `restarted: [fluxbee-syncthing]` igual.
-- **Arreglo:** instalar el binario y escribir la unit ahora dicen si cambiaron algo (la unit tenía
-  el mismo problema: `daemon-reload` sin reinicio). Si el servicio corre y cambió cualquiera de los
-  dos, o si su proceso corre un binario borrado (`/proc/<pid>/exe` termina en `(deleted)`, el mismo
-  chequeo que usa el core), se reinicia en ese momento, antes de los chequeos de salud, que ya
-  usan el puerto y el home de la unit nueva. Leerlo del proceso hace que un reinicio que se perdió
-  por un error en el medio ocurra en la llamada siguiente (revisión adversarial, F1). La respuesta
-  dice lo que pasó: `updated: [syncthing]` solo con un binario nuevo, `restarted` solo si hubo
-  reinicio. Tests de la regla y de la respuesta.
-- **Validado (2026-10-06, ledger 0.1.62):**
-  - Sin binario nuevo, el update responde `unchanged` y sin reinicio, y ningún host reinició
-    Syncthing al arrancar el orquestador nuevo.
-  - Con el binario reemplazado bajo el proceso en marcha (una copia idéntica con otro inode), el
-    update reinició Syncthing y lo dijo (`restarted: [fluxbee-syncthing]`). El siguiente no
-    reinició.
-  - Falta solo el caso de un vendor con bytes nuevos, que sigue el mismo camino.
+- **What happened (verified in the code on 2026-10-06):** the vendor update called
+  `ensure_blob_sync_runtime`, which reinstalled the binary if the hash changed and then did
+  `systemctl start`, which does nothing if the service is already running. The running Syncthing
+  kept the old binary until the next restart, and the response said
+  `restarted: [fluxbee-syncthing]` anyway.
+- **Fix:** installing the binary and writing the unit now say whether they changed anything (the
+  unit had the same problem: `daemon-reload` without a restart). If the service is running and
+  either of the two changed, or if its process runs a deleted binary (`/proc/<pid>/exe` ends in
+  `(deleted)`, the same check the core uses), it is restarted at that moment, before the health
+  checks, which already use the new unit's port and home. Reading it from the process makes a
+  restart that was lost because of an error in between happen on the next call (adversarial
+  review, F1). The response says what happened: `updated: [syncthing]` only with a new binary,
+  `restarted` only if there was a restart. Tests of the rule and of the response.
+- **Validated (2026-10-06, ledger 0.1.62):**
+  - With no new binary, the update answers `unchanged` and with no restart, and no host restarted
+    Syncthing when the new orchestrator started.
+  - With the binary replaced under the running process (an identical copy with another inode), the
+    update restarted Syncthing and said so (`restarted: [fluxbee-syncthing]`). The next one did not
+    restart.
+  - Only the case of a vendor with new bytes is missing, and it follows the same path.
 
-### A-54 ✅ RESUELTO (0.1.61, validado en 8.x) — El motherbee usaba SSH fuera de `add_hive`
+### A-54 ✅ RESOLVED (0.1.61, validated on 8.x) — The motherbee used SSH outside `add_hive`
 
-- **Qué pasa (verificado en el código el 2026-10-06):** todo el SSH vive dentro de los tres flujos
-  de `add_hive`, con una excepción. En cada arranque del motherbee, `reconcile_hive_tls_material`
-  entra por SSH a cada spoke `connected` para ver si tiene su certificado de malla y, si falta, lo
-  reemite.
-  - En PROD los cuatro spokes se unieron en modo `revoke`: esos intentos fallan la autenticación y
-    se descartan a nivel debug. Es ruido en cada arranque.
-  - Con el modo opcional `ssh_access=key_only_persist` (deja una llave SSH por spoke en el vault
-    después del join) sí entra. P6-2 de la ronda 6 mostró el riesgo: solo un fallo de autenticación
-    corta el intento, así que una máquina que tome la IP del spoke y acepte cualquier llave recibe
-    un leaf y su clave privada nuevos.
-- **Decisión del operador (D32, 2026-10-06):** *"no deberíamos tener comunicaciones NUNCA por ssh a
-  no ser cuando se hace un add_hive y es totalmente temporal"*. Se borran la reconciliación al
-  arrancar y el modo `key_only_persist` (ningún spoke de PROD lo usa). Un spoke que pierde su
-  certificado se vuelve a unir (`remove_hive` + `add_hive`), como una máquina nueva.
-- **Arreglo (0.1.61, una revisión adversarial):** se borraron la reconciliación y el modo; un pedido
-  con `ssh_access` se rechaza (`INVALID_REQUEST`). El envío del leaf pasó a ser fatal para el join
-  (`TLS_PUSH_FAILED`, reintentable si fue un corte de SSH): ahora el join es el único que lo emite. El
-  revoke de cada join borra también una llave `fluxbee-spoke-recovery` que haya dejado el modo viejo,
-  y el factory reset ya no preserva secretos `ssh:*`. Un test de guardia recorre el código desde cada
-  uso de ssh/scp/sftp/rsync/sshpass/ssh-keyscan hasta `accept_add_hive` y falla con la cadena si
-  algo más llega (probado con sondas: desde el arranque, `sh -c "ssh …"`, `Command::new` sin
-  literal, relanzar el join desde `main`).
-- **Queda dicho:** un join que falla de forma reintentable deja la llave de bootstrap a propósito
-  (para que el reintento entre por llave); si el operador lo abandona, la llave y el sudoers quedan en
-  la caja hasta que lo complete o los saque por consola. Una caja unida alguna vez con
-  `key_only_persist` (solo DEV, julio) pierde su llave de recuperación en su próximo join; el secreto
-  `ssh:<hive>` del vault se borra con `vault_delete` o con un factory reset.
-- **Validado (2026-10-06):** cero intentos de SSH del motherbee a los spokes desde el deploy (antes,
-  uno por arranque); un join nuevo completó con el envío del leaf fatal y el revoke (ledger 0.1.61).
-- **Seguimiento (0.1.62, de la revisión de D32):**
-  - cada flujo emite el leaf antes de su primera sesión SSH: si la CA no puede, el join falla con
-    `TLS_ISSUE_FAILED` antes de instalar nada en la caja (el revoke del camino de falla igual
-    intenta entrar, como en cualquier falla no reintentable);
-  - el revoke borra la llave `fluxbee-spoke-recovery` solo si ese nombre es el comentario de la
-    línea (antes, cualquier línea que lo mencionara), con un test que corre el filtro con bash;
-  - el test de guardia también cubre ssh-copy-id y autossh, busca el programa en posición de comando
-    dentro de un shell (después de `sudo -n -u x`, `timeout 5`, `env A=b`, `bash -lc`, `su -c`,
-    `runuser`, `systemd-run`, `if`, `{`, con las comillas escapadas del fuente), rechaza
-    renombrar `Command` y código después de `mod tests`, y exige que `accept_add_hive` tenga un solo
-    llamador, `handle_admin`. Probado con siete sondas que lo hacen fallar y un control que no;
-  - de paso, el join de un worker falla con `VENDOR_SYNC_FAILED` si no le llega el vendor, como ya
-    hacían egress e ingress: sin vendor nunca recibe Syncthing y nada lo repara.
+- **What happens (verified in the code on 2026-10-06):** all the SSH lives inside the three
+  `add_hive` flows, with one exception. On every motherbee startup, `reconcile_hive_tls_material`
+  logs into each `connected` spoke over SSH to see whether it has its mesh certificate and, if it
+  is missing, reissues it.
+  - In PROD the four spokes joined in `revoke` mode: those attempts fail authentication and are
+    discarded at debug level. It is noise on every startup.
+  - With the optional `ssh_access=key_only_persist` mode (it leaves one SSH key per spoke in the
+    vault after the join) it does get in. P6-2 of round 6 showed the risk: only an authentication
+    failure cuts the attempt, so a machine that takes the spoke's IP and accepts any key receives a
+    new leaf and its private key.
+- **The operator's decision (D32, 2026-10-06):** *"no deberíamos tener comunicaciones NUNCA por ssh a
+  no ser cuando se hace un add_hive y es totalmente temporal"* ("we should NEVER have
+  communications over ssh, except when an add_hive is done, and it is completely temporary"). The
+  startup reconciliation and the `key_only_persist` mode are deleted (no PROD spoke uses it). A
+  spoke that loses its certificate joins again (`remove_hive` + `add_hive`), like a new machine.
+- **Fix (0.1.61, one adversarial review):** the reconciliation and the mode were deleted; a request
+  with `ssh_access` is rejected (`INVALID_REQUEST`). Sending the leaf became fatal for the join
+  (`TLS_PUSH_FAILED`, retryable if it was an SSH cut): now the join is the only one that issues it.
+  Each join's revoke also deletes a `fluxbee-spoke-recovery` key the old mode may have left, and
+  the factory reset no longer preserves `ssh:*` secrets. A guard test walks the code from every use
+  of ssh/scp/sftp/rsync/sshpass/ssh-keyscan up to `accept_add_hive` and fails with the chain if
+  anything else reaches it (tested with probes: from startup, `sh -c "ssh …"`, `Command::new`
+  without a literal, relaunching the join from `main`).
+- **On the record:** a join that fails in a retryable way leaves the bootstrap key on purpose (so
+  that the retry gets in by key); if the operator abandons it, the key and the sudoers entry stay
+  on the box until they complete it or remove them through the console. A box joined at some point
+  with `key_only_persist` (DEV only, July) loses its recovery key on its next join; the vault's
+  `ssh:<hive>` secret is deleted with `vault_delete` or with a factory reset.
+- **Validated (2026-10-06):** zero SSH attempts from the motherbee to the spokes since the deploy
+  (before, one per startup); a new join completed with the fatal leaf push and the revoke (ledger
+  0.1.61).
+- **Follow-up (0.1.62, from the D32 review):**
+  - each flow issues the leaf before its first SSH session: if the CA cannot, the join fails with
+    `TLS_ISSUE_FAILED` before installing anything on the box (the failure path's revoke still
+    tries to get in, as in any non-retryable failure);
+  - the revoke deletes the `fluxbee-spoke-recovery` key only if that name is the line's comment
+    (before, any line that mentioned it), with a test that runs the filter with bash;
+  - the guard test also covers ssh-copy-id and autossh, looks for the program in command position
+    inside a shell (after `sudo -n -u x`, `timeout 5`, `env A=b`, `bash -lc`, `su -c`,
+    `runuser`, `systemd-run`, `if`, `{`, with the source's escaped quotes), rejects renaming
+    `Command` and code after `mod tests`, and requires `accept_add_hive` to have a single caller,
+    `handle_admin`. Tested with seven probes that make it fail and one control that does not;
+  - along the way, a worker's join fails with `VENDOR_SYNC_FAILED` if the vendor does not reach
+    it, as egress and ingress already did: without vendor it never gets Syncthing, and nothing
+    repairs it.
 
-### A-55 🟡 ABIERTO POR DECISIÓN (D31) — La puerta SSH del egress
+### A-55 🟡 OPEN BY DECISION (D31) — The egress's SSH door
 
-- **Qué es:** el operador mantiene SSH (tcp 22) abierto en `egress.wan_iface` para operación y
-  mantenimiento durante este desarrollo. En PROD es 192.168.8.240, una red interna detrás de un
-  firewall (*"no es la NSA pero es red segura"*). Nada más entra por ahí.
-- **Riesgo:** el código no puede distinguir una red de oficina segura de internet. Si un cliente
-  conecta la WAN del egress directo a internet, esa puerta queda abierta a internet.
-- **Estado:** cerrarla antes de la primera instalación de un cliente (un cambio de código en un
-  release; el diseño la tiene en la declaración del rol egress, §3.2).
+- **What it is:** the operator keeps SSH (tcp 22) open on `egress.wan_iface` for operation and
+  maintenance during this development. In PROD it is 192.168.8.240, an internal network behind a
+  firewall (*"no es la NSA pero es red segura"* ("it's not the NSA, but it's a secure network")).
+  Nothing else gets in through there.
+- **Risk:** the code cannot tell a secure office network apart from the internet. If a customer
+  connects the egress's WAN directly to the internet, that door is left open to the internet.
+- **Status:** close it before a customer's first installation (a code change in a release; the
+  design has it in the declaration of the egress role, §3.2).
 
-### A-19 ✅ RESUELTO (0.1.43) — La policy publicada esperaba hasta 60 s al watcher de Syncthing
+### A-19 ✅ RESOLVED (0.1.43) — The published policy waited up to 60 s for the Syncthing watcher
 
-- **Qué pasaba:** con 0.1.41 el apply llegaba a los 4 hives en 16 s, pero el clear tardó 63 s y el
-  admin respondió con los tres spokes pendientes. Los eventos de Syncthing del motherbee lo
-  muestran: los dos applies se escanearon 10 s después de publicar (`fsWatcherDelayS`), el clear
-  60 s después. El watcher retiene hasta su timeout (6 × 10 s) los cambios que son renames y
-  borrados, y la publicación escribe por rename. Con 0.1.42 retuvo también un apply: a los 33 s
-  solo el motherbee corría la v8.
-- **Arreglo:** después de aplicar en el motherbee, el admin le manda al orquestador del motherbee
-  un sync hint de `fluxbee-dist-policy`, que escanea la carpeta en el momento (el mismo paso que el
-  publish de un runtime), y recién entonces el aviso (0.1.42). En 0.1.42 el orquestador lo rechazaba
-  (`folder_id` inválido para el canal `dist`: solo aceptaba `fluxbee-dist`, aunque el handler ya
-  sabía honrar una carpeta puntual) → 0.1.43 acepta cualquier `fluxbee-dist*`.
+- **What happened:** with 0.1.41 the apply reached the 4 hives in 16 s, but the clear took 63 s,
+  and the admin answered with the three spokes pending. The motherbee's Syncthing events show it:
+  the two applies were scanned 10 s after publishing (`fsWatcherDelayS`), the clear 60 s after.
+  The watcher holds back the changes that are renames and deletions until its timeout (6 × 10 s),
+  and the publication writes by rename. With 0.1.42 it also held back an apply: at 33 s only the
+  motherbee was running v8.
+- **Fix:** after applying on the motherbee, the admin sends the motherbee's orchestrator a sync
+  hint for `fluxbee-dist-policy`, which scans the folder right then (the same step as a runtime's
+  publish), and only then the notice (0.1.42). In 0.1.42 the orchestrator rejected it (invalid
+  `folder_id` for the `dist` channel: it only accepted `fluxbee-dist`, even though the handler
+  already knew how to honor a specific folder) → 0.1.43 accepts any `fluxbee-dist*`.
 
-### A-20 🟡 PARCIAL (0.1.42 + 0.1.45) · dirección POSTERGADA — Con CONFIG_CHANGED cruzando hives, sus receptores aplicaban cualquier origen que el router admitiera
+### A-20 🟡 PARTIAL (0.1.42 + 0.1.45) · direction DEFERRED — With CONFIG_CHANGED crossing hives, its receivers applied any origin the router admitted
 
-- **Qué pasaba:** el gate del router para CONFIG_CHANGED admite al admin primario **y a los
-  orquestadores** (regla 3 de la policy de sistema). SY.opa.rules aplicaba un compile/apply/clear de
-  cualquiera de ellos, y lo que se aplica en el motherbee ahora se publica a todos los hives.
-  SY.config.routes aplicaba la lista de rutas/VPN/taps de un CONFIG_CHANGED global, cuyo único
-  emisor era `PUT /config/*` (eliminado en 0.1.41): ahora llegaría a todos los hives y les pisaría
-  la config.
-- **No es capacidad nueva:** la regla 3 ya deja a un orquestador escribir la policy o las rutas de
-  cualquier hive por `CONFIG_SET`. El orquestador no lo usa: `CONFIG_SET`/`CONFIG_GET` los manda
-  solo SY.admin; el orquestador reenvía entre hives SPAWN/KILL/NODE_CONFIG_*/NODE_STATUS/LIST_NODES/
-  GET_*/ROLLBACK/ADD_HIVE_FINALIZE/REMOVE_HIVE_CLEANUP y manda CONFIG_CHANGED `node_config` solo a
-  nodos de su hive. **Decidido (operador, 2026-10-01): achicarla** → 0.1.45: la regla 3 es la
-  lista de las 16 acciones que el orquestador reenvía, y se borraron las señales de config que nadie
-  usaba (`node_config` + `notify`, el `CONFIG_RESPONSE` de storage, el handler de sy-wf-rules, la
-  rama de io-slack). Validado: ciclo de WF en worker1 y lecturas entre hives sin un solo rechazo del
-  gate.
-- **Lo que NO cierra (panel DTAP, D-2):** la lista no tiene dirección. El orquestador de cualquier
-  hive, incluido el del ingress, todavía puede mandarle a otro hive las mutaciones de la lista
-  (`NODE_CONFIG_SET`, `SPAWN`/`KILL`/`RESTART`/`REMOVE`, `SYSTEM_CORE_ROLLBACK`, finalize/cleanup). Y
-  mientras el nombre del HELLO no se autentique (A-22), cualquier proceso local puede presentarse
-  como orquestador. Postergado con el paquete de seguridad (A-22).
-- **Arreglo:** SY.opa.rules toma CONFIG_CHANGED solo de `SY.admin@motherbee`, igual que su camino de
-  comandos y que el protocolo; SY.config.routes ya no aplica listas que lleguen por CONFIG_CHANGED.
+- **What happened:** the router's gate for CONFIG_CHANGED admits the primary admin **and the
+  orchestrators** (rule 3 of the system policy). SY.opa.rules applied a compile/apply/clear from
+  any of them, and what is applied on the motherbee is now published to every hive.
+  SY.config.routes applied the routes/VPN/taps list of a global CONFIG_CHANGED, whose only sender
+  was `PUT /config/*` (removed in 0.1.41): now it would reach every hive and overwrite their
+  config.
+- **It is not a new capability:** rule 3 already lets an orchestrator write the policy or the
+  routes of any hive through `CONFIG_SET`. The orchestrator does not use it: `CONFIG_SET`/
+  `CONFIG_GET` are sent only by SY.admin; the orchestrator forwards between hives
+  SPAWN/KILL/NODE_CONFIG_*/NODE_STATUS/LIST_NODES/GET_*/ROLLBACK/ADD_HIVE_FINALIZE/
+  REMOVE_HIVE_CLEANUP and sends CONFIG_CHANGED `node_config` only to nodes of its hive.
+  **Decided (operator, 2026-10-01): shrink it** → 0.1.45: rule 3 is the list of the 16 actions
+  the orchestrator forwards, and the config signals that nobody used were deleted (`node_config` +
+  `notify`, storage's `CONFIG_RESPONSE`, sy-wf-rules' handler, io-slack's branch). Validated: a WF
+  cycle on worker1 and reads across hives without a single gate rejection.
+- **What it does NOT close (DTAP panel, D-2):** the list has no direction. The orchestrator of any
+  hive, the ingress's included, can still send another hive the list's mutations
+  (`NODE_CONFIG_SET`, `SPAWN`/`KILL`/`RESTART`/`REMOVE`, `SYSTEM_CORE_ROLLBACK`, finalize/cleanup).
+  And as long as the HELLO name is not authenticated (A-22), any local process can present itself
+  as an orchestrator. Deferred with the security package (A-22).
+- **Fix:** SY.opa.rules takes CONFIG_CHANGED only from `SY.admin@motherbee`, just like its command
+  path and the protocol; SY.config.routes no longer applies lists that arrive through
+  CONFIG_CHANGED.
 
-### A-21 ✅ RESUELTO (0.1.50) — Estado del router sin policy de usuario: `error` al arrancar, `ok` después de un clear
+### A-21 ✅ RESOLVED (0.1.50) — Router status without a user policy: `error` at startup, `ok` after a clear
 
-- **Qué se ve:** en `/hives/{h}/opa/status`, un router que arrancó sin policy reporta
-  `load_status=1, error`; después de un clear, `load_status=0, ok`. En los dos casos no hay policy
-  y el ruteo es el mismo (un mensaje sin destino que no va al frontdesk sale `OPA_ERROR`).
-- **Causa:** el resolver nace en `OPA_STATUS_ERROR` y `unload()` lo deja en `OPA_STATUS_OK`. Es solo
-  informativo.
-- **Arreglo (0.1.50):** el resolver nace en el mismo estado que deja un clear (`ok`, sin policy).
+- **What is seen:** in `/hives/{h}/opa/status`, a router that started without a policy reports
+  `load_status=1, error`; after a clear, `load_status=0, ok`. In both cases there is no policy and
+  the routing is the same (a message with no destination that does not go to the frontdesk comes
+  out as `OPA_ERROR`).
+- **Cause:** the resolver is born in `OPA_STATUS_ERROR`, and `unload()` leaves it in
+  `OPA_STATUS_OK`. It is only informational.
+- **Fix (0.1.50):** the resolver is born in the same state a clear leaves (`ok`, no policy).
 
-### A-17 ✅ RESUELTO (0.1.39) — Una réplica de identity que arranca sin primario borra los ILK de su hive
+### A-17 ✅ RESOLVED (0.1.39) — An identity replica that starts without a primary deletes its hive's ILKs
 
-- **Qué pasaba:** la réplica re-publica cada 30 s su conjunto de ILK propios y el primario lo toma
-  como autoritativo (borra los ILK del hive que no vienen). Si el worker arranca con el primario
-  inalcanzable, en memoria solo tiene sus ILK de sistema: al volver la conexión publicaba eso y el
-  primario **borraba los ILK de los nodos del hive**. Visto en 8.x: el primario pasó de 25 a 24
-  ILKs y `AI.vaultprobe@worker1` quedó sin identidad (`ILK_NOT_FOUND` al matarlo). Es el caso de
-  un reboot completo en el que un worker levanta antes que el motherbee.
-- **Arreglo:** el conjunto propio no se publica hasta tener una base del primario (full sync de
-  arranque o el primer snapshot de la suscripción). Los deltas locales sueltos siguen saliendo.
-- **Validado:** mismo arranque degradado → la réplica loguea `holding its self-owned snapshot`; el
-  primario sigue en 25 ILKs, con el del probe.
+- **What happened:** the replica re-publishes its set of own ILKs every 30 s, and the primary takes
+  it as authoritative (it deletes the hive's ILKs that do not come in it). If the worker starts
+  with the primary unreachable, in memory it only has its system ILKs: when the connection came
+  back it published that, and the primary **deleted the ILKs of the hive's nodes**. Seen on 8.x:
+  the primary went from 25 to 24 ILKs, and `AI.vaultprobe@worker1` was left without an identity
+  (`ILK_NOT_FOUND` when killing it). It is the case of a full reboot in which a worker comes up
+  before the motherbee.
+- **Fix:** the own set is not published until it has a base from the primary (the startup full
+  sync or the subscription's first snapshot). Loose local deltas still go out.
+- **Validated:** the same degraded startup → the replica logs `holding its self-owned snapshot`;
+  the primary stays at 25 ILKs, with the probe's.
 
-### A-18 ✅ CERRADO (0.1.50) — config-routes: rutas estáticas, VPN y taps
+### A-18 ✅ CLOSED (0.1.50) — config-routes: static routes, VPN and taps
 
-- **La necesidad (operador, 2026-09-30):** las rutas estáticas se usan poco y pueden quedar
-  locales. La VPN va a usarse de forma global (separar tenants, seguridad: un nodo de worker1
-  habla con uno de worker2). Los taps son la herramienta más usada (echo a otros nodos) y tienen
-  que ser globales. Decidido no meterlas en OPA: se arreglan en config-routes.
-- **Cómo está hoy (verificado en código, 2026-10-01):**
+- **The need (operator, 2026-09-30):** static routes are rarely used and can stay local. The VPN
+  is going to be used globally (separating tenants, security: a worker1 node talks to a worker2
+  one). Taps are the most used tool (echo to other nodes) and have to be global. Decided not to put
+  them in OPA: they are fixed in config-routes.
+- **How it is today (verified in code, 2026-10-01):**
 
-  | Herramienta | Se carga | Llega al resto | ¿Global? |
+  | Tool | Loaded | Reaches the rest | Global? |
   |---|---|---|---|
-  | Rutas estáticas | en un hive | LSA → FIB de todos los routers | sí |
-  | Taps | en un hive | LSA; el router de origen aplica los locales y los de LSA, una sola vez | sí |
-  | VPN | en un hive | LSA las transporta, pero `assign_vpn` usa solo la config local | **no** |
+  | Static routes | on one hive | LSA → FIB of every router | yes |
+  | Taps | on one hive | LSA; the origin router applies the local ones and the LSA ones, only once | yes |
+  | VPN | on one hive | LSA carries them, but `assign_vpn` uses only the local config | **no** |
 
-- **Decisión del operador (2026-10-01): la VPN queda por hive.** Cada router la asigna con las
-  reglas de su hive; para una VPN entre hives se carga la misma regla en cada uno (documentado en
-  `06-regiones.md` §5.1). Con eso no queda nada abierto; *"resolvé los detalles por
-  costo/beneficio... prefiero empezar lo próximo con estos temas cerrados"*.
-- **Cerrado en 0.1.50 (`aa206ac`):**
-  - Una sola superficie: `/hives/{h}/routes|vpns|taps`. Se borraron `/routes`, `/vpns` y `/taps`
-    con `?hive=` (nadie los usaba).
-  - La regla 5 de `system.rego` ya no nombra `SY.config-routes`.
-  - El router relee la config de ruteo en cada latido, con control de versión (panel D-12): un
-    router sin nodos locales ya no queda con config vieja. Hoy no aplicaba (un router por hive).
-- **Aceptado:**
-  - Si el hive donde se cargó una ruta o un tap queda cortado, deja de aplicarse en los demás
-    durante el corte.
-  - Los taps matchean por nombre exacto (v1).
-  - En un host con varios routers, el router par no hace el fanout de taps (mismo caso que D-12).
-- **Ya resuelto:**
+- **The operator's decision (2026-10-01): the VPN stays per hive.** Each router assigns it with its
+  hive's rules; for a VPN between hives, the same rule is loaded on each one (documented in
+  `06-regiones.md` §5.1). With that, nothing is left open; *"resolvé los detalles por
+  costo/beneficio... prefiero empezar lo próximo con estos temas cerrados"* ("resolve the details
+  by cost/benefit... I'd rather start the next thing with these topics closed").
+- **Closed in 0.1.50 (`aa206ac`):**
+  - One single surface: `/hives/{h}/routes|vpns|taps`. `/routes`, `/vpns` and `/taps` with
+    `?hive=` were deleted (nobody used them).
+  - Rule 5 of `system.rego` no longer names `SY.config-routes`.
+  - The router re-reads the routing config on every heartbeat, with version control (panel D-12):
+    a router with no local nodes is no longer left with an old config. Today it did not apply (one
+    router per hive).
+- **Accepted:**
+  - If the hive where a route or a tap was loaded gets cut off, it stops being applied on the
+    others during the cut.
+  - Taps match by exact name (v1).
+  - On a host with several routers, the peer router does not do the taps fanout (same case as
+    D-12).
+- **Already resolved:**
   - `PUT /config/*`: 0.1.40–0.1.41.
-  - Broadcast posterior a cada alta y trato especial del router a CONFIG_CHANGED: 0.1.44.
-  - Broadcast de storage: 0.1.41; su CONFIG_RESPONSE: 0.1.45.
-  - Config con alcance de hive y control de origen: 0.1.36 (A-8, A-9).
-  - Taps cross-hive con destino por UUID: julio (`18c4dd8`).
-- **Aceptado:** si se borra o se reconstruye un hive, se pierden sus rutas, taps y VPN (nadie
-  guarda copia).
+  - The broadcast after each add, and the router's special treatment of CONFIG_CHANGED: 0.1.44.
+  - Storage's broadcast: 0.1.41; its CONFIG_RESPONSE: 0.1.45.
+  - Hive-scoped config and origin control: 0.1.36 (A-8, A-9).
+  - Cross-hive taps with a destination by UUID: July (`18c4dd8`).
+- **Accepted:** if a hive is deleted or rebuilt, its routes, taps and VPN are lost (nobody keeps a
+  copy).
 
-### A-16 ✅ RESUELTO (0.1.56) — Los espejos receive-only acumulan cambios locales en silencio
+### A-16 ✅ RESOLVED (0.1.56) — The receive-only mirrors pile up local changes silently
 
-- **Qué pasa:** en una carpeta receive-only, Syncthing no propaga ni revierte los cambios locales.
-  Si algo toca el espejo en un spoke, diverge del motherbee para siempre y nadie se entera. El
-  orquestador administra Syncthing pero no mira ni revierte estos cambios.
-- **A discutir:** que el orquestador revierta (`/rest/db/revert`) los cambios locales de las
-  carpetas receive-only y lo loguee, para que el espejo converja solo al origen.
-- **Arreglo (`10c97b1`):**
-  - El watchdog, que ya leía el estado de cada carpeta en cada vuelta, lee también
+- **What happens:** in a receive-only folder, Syncthing neither propagates nor reverts local
+  changes. If something touches the mirror on a spoke, it diverges from the motherbee forever and
+  nobody finds out. The orchestrator manages Syncthing but does not look at or revert these
+  changes.
+- **To discuss:** have the orchestrator revert (`/rest/db/revert`) the local changes of the
+  receive-only folders and log it, so that the mirror converges to the origin by itself.
+- **Fix (`10c97b1`):**
+  - The watchdog, which already read each folder's state on every round, also reads
     `receiveOnlyTotalItems`.
-  - Si una carpeta receive-only tiene cambios locales, deja un WARN y la revierte.
-  - Cubre los espejos de `dist/` de los spokes y el `public/` de blob del ingress.
-  - El 2026-10-02 las 12 carpetas receive-only de PROD estaban en 0.
-- **Validado en vivo (0.1.56, 2026-10-03, con el OK del operador):**
-  - Un archivo de prueba en `dist/vendor` de worker1 subió `receiveOnlyTotalItems` a 1 a los 11 s.
-  - El watchdog dejó el WARN y revirtió la carpeta.
-  - A los 16 s el archivo ya no estaba y el contador volvió a 0.
+  - If a receive-only folder has local changes, it leaves a WARN and reverts it.
+  - It covers the spokes' `dist/` mirrors and the ingress's blob `public/`.
+  - On 2026-10-02, the 12 receive-only folders in PROD were at 0.
+- **Validated live (0.1.56, 2026-10-03, with the operator's OK):**
+  - A test file in worker1's `dist/vendor` raised `receiveOnlyTotalItems` to 1 at 11 s.
+  - The watchdog left the WARN and reverted the folder.
+  - At 16 s the file was gone, and the counter was back at 0.
 
 ---
 
-## B. Infraestructura y herramientas — no requieren cambio de código del producto
+## B. Infrastructure and tooling — no product code change required
 
-### B-1 🔴 La API de Proxmox no permite escribir *snippets* de cloud-init
+### B-1 🔴 The Proxmox API does not allow writing cloud-init *snippets*
 
-- Ni `POST /nodes/{n}/storage/{s}/upload` ni `download-url` aceptan `content=snippets`
-  (enum: `iso, vztmpl, import`), aunque el storage **sí** admite el tipo.
-- **Impacto:** **no se puede construir un template 100 % por API**; hace falta que el operador
-  deposite el archivo una vez. Es el límite Nivel-3 de `METHOD.md` §2 en acción.
-- **Mitigación aplicada:** el operador lo escribió una sola vez; el template quedó con el agente
-  horneado y **los clones ya no dependen del snippet**.
+- Neither `POST /nodes/{n}/storage/{s}/upload` nor `download-url` accepts `content=snippets`
+  (enum: `iso, vztmpl, import`), even though the storage **does** support the type.
+- **Impact:** **a template cannot be built 100% through the API**; the operator has to drop the
+  file in place once. It is the Level-3 limit of `METHOD.md` §2 in action.
+- **Mitigation applied:** the operator wrote it just once; the template ended up with the agent
+  baked in, and **the clones no longer depend on the snippet**.
 
-### B-2 🔴 `cicustom` reemplaza el user-data de Proxmox (anula `ciuser`/`cipassword`)
+### B-2 🔴 `cicustom` replaces Proxmox's user-data (it overrides `ciuser`/`cipassword`)
 
-- Al usar `cicustom=user=...`, Proxmox usa ese archivo **en lugar** del user-data que genera, que es
-  el que crea el usuario. Resultado: el usuario **no se crea** y el bootstrap de `add_hive` no tendría
-  con quién entrar.
-- **Regla para el handbook:** *o* `cicustom` *o* `ciuser`/`cipassword`; **no conviven**.
+- When `cicustom=user=...` is used, Proxmox uses that file **instead of** the user-data it
+  generates, which is the one that creates the user. Result: the user **is not created**, and
+  `add_hive`'s bootstrap would have no one to log in as.
+- **Rule for the handbook:** *either* `cicustom` *or* `ciuser`/`cipassword`; **they do not
+  coexist**.
 
-### B-3 🟢 La imagen cloud de Ubuntu es qcow2 aunque se publique como `.img`
+### B-3 🟢 The Ubuntu cloud image is qcow2 even though it is published as `.img`
 
-- `download-url` rechaza `filename=*.img` (`invalid filename or wrong extension`). Se descarga
-  renombrando a `.qcow2`.
+- `download-url` rejects `filename=*.img` (`invalid filename or wrong extension`). It is downloaded
+  by renaming it to `.qcow2`.
 
-### B-4 🟢 Ubuntu 24.04 usa **activación por socket** para sshd
+### B-4 🟢 Ubuntu 24.04 uses **socket activation** for sshd
 
-- `ssh.socket` activo escuchando en `:22`, `ssh.service` inactivo. **Es normal** y no afecta a
-  `add_hive` (que solo necesita el puerto 22 respondiendo). Anotado para no diagnosticar mal.
+- `ssh.socket` active, listening on `:22`, `ssh.service` inactive. **It is normal** and does not
+  affect `add_hive` (which only needs port 22 answering). Noted so it is not misdiagnosed.
 
-### B-5 🟢 Las operaciones de VM en Proxmox se serializan por *lock*
+### B-5 🟢 VM operations in Proxmox are serialized by a *lock*
 
-- Lanzar `resize`/`start` inmediatamente después de un `qmcreate` que importa una imagen grande
-  falla con `can't lock file … got timeout`. **Error propio cometido y corregido.**
-- **Regla:** encadenar operaciones por **estado de task** (`/tasks/<UPID>/status` → `stopped OK`),
-  nunca por `sleep`.
+- Launching `resize`/`start` right after a `qmcreate` that imports a large image fails with
+  `can't lock file … got timeout`. **Our own mistake, made and corrected.**
+- **Rule:** chain operations by **task state** (`/tasks/<UPID>/status` → `stopped OK`), never by
+  `sleep`.
 
-### B-7 🟢 El guest-agent de Proxmox ejecuta **sin `HOME`** definido
+### B-7 🟢 The Proxmox guest-agent runs **without `HOME`** defined
 
-- **Qué pasa:** `agent/exec` corre el comando sin `HOME` en el entorno. Con `bash -lc`, eso hace que
-  `/root/.profile` evalúe `. "$HOME/.cargo/env"` como `. "/.cargo/env"` → error en **cada** comando.
-- **Impacto real (no cosmético):** ese ruido en `stderr` **contaminó la salida de todos los comandos**
-  y **rompió dos pollers propios** que extraían números de la salida (el mensaje contiene `line 10`).
-  Dos falsos positivos: el problema **no era la VM, era el helper**.
-- **Solución:** invocar `/usr/bin/env HOME=/root /bin/bash -lc '<cmd>'` en el helper de guest-agent.
-- **Regla para el handbook:** el canal guest-agent **no es una shell de login normal** — definí
-  `HOME` explícitamente, y **nunca parsees números de una salida que puede traer stderr**.
+- **What happens:** `agent/exec` runs the command without `HOME` in the environment. With
+  `bash -lc`, that makes `/root/.profile` evaluate `. "$HOME/.cargo/env"` as `. "/.cargo/env"` →
+  an error on **every** command.
+- **Real impact (not cosmetic):** that noise on `stderr` **polluted the output of every command**
+  and **broke two of our own pollers** that extracted numbers from the output (the message contains
+  `line 10`). Two false positives: the problem **was not the VM, it was the helper**.
+- **Solution:** invoke `/usr/bin/env HOME=/root /bin/bash -lc '<cmd>'` in the guest-agent helper.
+- **Rule for the handbook:** the guest-agent channel **is not a normal login shell** — define
+  `HOME` explicitly, and **never parse numbers from an output that can carry stderr**.
 
-### B-8 🟢 Clonar como un usuario y compilar como otro rompe el build de Go (`buildvcs`)
+### B-8 🟢 Cloning as one user and building as another breaks the Go build (`buildvcs`)
 
-- **Qué pasó:** el repo se clonó como `fluxops` (para usar la deploy key) pero `build-deb.sh` corre
-  como `root`. Git rechaza el repo ajeno (`fatal: detected dubious ownership in repository`) y el paso
-  Go falla al estampar la información de VCS:
+- **What happened:** the repo was cloned as `fluxops` (to use the deploy key), but `build-deb.sh`
+  runs as `root`. Git rejects the foreign repo (`fatal: detected dubious ownership in repository`)
+  and the Go step fails when stamping the VCS information:
   ```
   error obtaining VCS status: exit status 128
       Use -buildvcs=false to disable VCS stamping.
   ```
-  El build llegó hasta `[2/5] build go` y salió con `rc=1` **sin producir `.deb`** — después de ~55 min
-  de compilación Rust ya exitosa.
-- **Causa:** error propio de setup (dos usuarios distintos para clonar y compilar), **no** un problema
-  de fluxbee.
-- **Solución aplicada (la estándar de git, no un atajo):**
-  `git config --global --add safe.directory /opt/fluxbee` para root.
-  *(La alternativa `-buildvcs=false` habría ocultado el problema y perdido el estampado de versión en
-  los binarios Go: se descartó.)*
-- **Regla para el handbook:** **el mismo usuario que clona debe compilar**, o declarar el repo como
-  `safe.directory`. Verificarlo **antes** de lanzar un build largo.
+  The build got as far as `[2/5] build go` and exited with `rc=1` **without producing a `.deb`** —
+  after ~55 min of an already successful Rust compilation.
+- **Cause:** our own setup mistake (two different users to clone and to build), **not** a fluxbee
+  problem.
+- **Solution applied (git's standard one, not a shortcut):**
+  `git config --global --add safe.directory /opt/fluxbee` for root.
+  *(The `-buildvcs=false` alternative would have hidden the problem and lost the version stamping
+  in the Go binaries: it was discarded.)*
+- **Rule for the handbook:** **the same user who clones must build**, or declare the repo as
+  `safe.directory`. Check it **before** launching a long build.
 
-### B-9 🟢 Proxmox sobre VMware: **la seguridad del portgroup rompe TODA red bridgeada de las VMs anidadas**
+### B-9 🟢 Proxmox on VMware: **the portgroup security breaks ALL bridged networking of the nested VMs**
 
-- **Síntoma:** las VMs con placa en `vmbr0`/`vmbr1` **no podían ni hacer ARP** a su gateway
-  (`ARP INCOMPLETE`, 100 % packet loss), aunque el **host** Proxmox funcionaba perfecto en el
-  **mismo bridge**, con IP/ruteo/carrier correctos del lado de la VM.
-- **Causa:** el Proxmox es una VM de VMware. Los portgroups traen por defecto
-  **`Forged transmits: Reject`** (+ `MAC address changes: Reject`, `Promiscuous mode: Reject`), lo que
-  **descarta toda trama cuya MAC origen no sea la asignada a la vNIC del Proxmox**. Las VMs anidadas
-  emiten con **su propia** MAC (`BC:24:11:…`) → VMware las tira.
-- **Lo que hizo el diagnóstico concluyente** (y descartó fluxbee, firewall y configuración):
+- **Symptom:** the VMs with a card on `vmbr0`/`vmbr1` **could not even ARP** their gateway
+  (`ARP INCOMPLETE`, 100% packet loss), even though the Proxmox **host** worked perfectly on the
+  **same bridge**, with correct IP/routing/carrier on the VM's side.
+- **Cause:** the Proxmox is a VMware VM. The portgroups come by default with
+  **`Forged transmits: Reject`** (+ `MAC address changes: Reject`, `Promiscuous mode: Reject`),
+  which **drops every frame whose source MAC is not the one assigned to the Proxmox's vNIC**. The
+  nested VMs transmit with **their own** MAC (`BC:24:11:…`) → VMware throws them away.
+- **What made the diagnosis conclusive** (and ruled out fluxbee, the firewall and the
+  configuration):
 
-  | Observación | Explicación |
+  | Observation | Explanation |
   |---|---|
-  | ✅ el host Proxmox anda | usa **su** MAC asignada |
-  | ✅ el worker sale a internet por `fbint`+SNAT | tráfico **ruteado** → sale con la **MAC del host** |
-  | ❌ una VM en `vmbr0` no hace ni ARP | tráfico **bridgeado** → **MAC de la VM** → descartado |
+  | ✅ the Proxmox host works | it uses **its** assigned MAC |
+  | ✅ the worker goes out to the internet through `fbint`+SNAT | **routed** traffic → goes out with the **host's MAC** |
+  | ❌ a VM on `vmbr0` cannot even ARP | **bridged** traffic → **the VM's MAC** → dropped |
 
-  Es decir: **la red SDN interna funcionaba justamente porque es routing con NAT, no bridging.**
-  Esa asimetría fue la pista que cerró el caso.
-- **Solución (operador, en ESXi, en caliente y por portgroup):**
-  `Promiscuous mode: Accept` · `MAC address changes: Accept` · **`Forged transmits: Accept`** ← la que
-  habilita **enviar**.
-- **Detalle operativo caro:** hay **un portgroup por placa física**. Al aplicarlo solo al de `nic0`,
-  `vmbr0` empezó a andar y `vmbr1` **siguió roto** — mismo síntoma, otra placa. **Hay que aplicarlo a
-  TODOS los portgroups** de las NICs del hipervisor anidado.
-- **Verificado después del cambio:** ingress con **IP pública propia `71.182.182.80` visible desde
-  internet** + pata interna al mesh, simultáneas. Egress con salida por su pata WAN.
-- **Para el handbook:** en cualquier prod sobre VMware, **esto se configura ANTES de desplegar**; si no,
-  se pierden horas diagnosticando una red que del lado del guest está impecable.
+  That is: **the internal SDN network worked precisely because it is routing with NAT, not
+  bridging.** That asymmetry was the clue that closed the case.
+- **Solution (operator, in ESXi, live and per portgroup):**
+  `Promiscuous mode: Accept` · `MAC address changes: Accept` · **`Forged transmits: Accept`** ← the
+  one that enables **sending**.
+- **Costly operational detail:** there is **one portgroup per physical card**. When it was applied
+  only to `nic0`'s, `vmbr0` started working and `vmbr1` **was still broken** — same symptom,
+  another card. **It has to be applied to ALL the portgroups** of the nested hypervisor's NICs.
+- **Verified after the change:** ingress with **its own public IP `71.182.182.80`, visible from
+  the internet** + an internal leg to the mesh, at the same time. Egress going out through its WAN
+  leg.
+- **For the handbook:** on any prod on VMware, **this is configured BEFORE deploying**; otherwise
+  hours are lost diagnosing a network that is flawless on the guest's side.
 
-### B-6 🟢 `build-deb.sh` podía producir un `.deb` truncado sin fallar
+### B-6 🟢 `build-deb.sh` could produce a truncated `.deb` without failing
 
-- Con el disco lleno, `dpkg-deb` salía con código 0 pero escribía un paquete de ~1.8 KB sin
-  `data.tar`. **Ya corregido** (commit `01db2cc`): preflight de espacio + verificación de integridad
-  del `.deb` con fallo ruidoso.
+- With the disk full, `dpkg-deb` exited with code 0 but wrote a ~1.8 KB package without
+  `data.tar`. **Already fixed** (commit `01db2cc`): a space preflight + an integrity check of the
+  `.deb` with a loud failure.
 
-### B-10 🟢 El repo apt moría con cada reboot y se veía vacío durante cada publish
+### B-10 🟢 The apt repo died with every reboot and looked empty during every publish
 
-- **Qué pasaba (dos defectos en `scripts/apt-repo-publish.sh`):**
-  1. `--serve` levantaba el server con `systemd-run` → unit **transitoria**: moría con cada reboot
-     del build box, y sus errores se tragaban (`>/dev/null 2>&1 || true`), así que un re-run podía
-     dejar el repo caído **sin avisar** (pasó en agosto, tras un reboot de VM110).
-  2. El índice se regeneraba *in place* (`dpkg-scanpackages > Packages`): durante el re-hash de
-     todos los `.deb` (~5,5 min con 33 × ~240 MB) el repo servía **0 paquetes** — un cliente que
-     hiciera `apt-get update` en esa ventana veía el repo vacío.
-- **Evidencia:** `FragmentPath=/run/systemd/transient/fluxbee-apt.service`; polls durante un publish:
-  0 paquetes de 14:47 a 14:52 (bitácora 2026-09-25).
-- **Solución:** `--serve` escribe una unit **persistente y habilitada** (idempotente, reemplaza una
-  transitoria vieja, falla ruidoso si no arranca); el índice se arma en `.new` y entra por renames
-  atómicos (`Release` último); el `.deb` se copia como `.partial` + `mv`. El one-liner imprime
-  todas las IPs del box.
-- **Validado en prod:** reboot de VM110 → repo arriba solo; publish real con 32 muestras desde un
-  cliente → mínimo 33 paquetes.
+- **What happened (two defects in `scripts/apt-repo-publish.sh`):**
+  1. `--serve` brought up the server with `systemd-run` → a **transient** unit: it died with every
+     reboot of the build box, and its errors were swallowed (`>/dev/null 2>&1 || true`), so a
+     re-run could leave the repo down **without warning** (it happened in August, after a VM110
+     reboot).
+  2. The index was regenerated *in place* (`dpkg-scanpackages > Packages`): during the re-hash of
+     every `.deb` (~5.5 min with 33 × ~240 MB) the repo served **0 packages** — a client that ran
+     `apt-get update` in that window saw the repo empty.
+- **Evidence:** `FragmentPath=/run/systemd/transient/fluxbee-apt.service`; polls during a publish:
+  0 packages from 14:47 to 14:52 (logbook 2026-09-25).
+- **Solution:** `--serve` writes a **persistent, enabled** unit (idempotent; it replaces an old
+  transient one and fails loudly if it does not start); the index is built in `.new` and goes in
+  through atomic renames (`Release` last); the `.deb` is copied as `.partial` + `mv`. The
+  one-liner prints all the box's IPs.
+- **Validated in prod:** VM110 reboot → repo up on its own; a real publish with 32 samples from a
+  client → minimum 33 packages.
 
-### B-11 🟢 Un carácter por encima de U+00FF en `agent/exec` traba el guest-agent — era la "flakiness bajo carga"
+### B-11 🟢 A character above U+00FF in `agent/exec` jams the guest-agent — it was the "flakiness under load"
 
-- **Qué pasa:** la API de Proxmox (Perl) no codifica los argumentos de `guest-exec` con caracteres
-  anchos: un solo `—` (U+2014), `→` o `✓` en el comando deja al **qemu-guest-agent trabado** —
-  hasta `guest-ping` da timeout ("QEMU guest agent is not running") hasta que el agente se
-  reinicia. Los caracteres Latin-1 (`é`, `ñ`, `¿`) pasan. `agent/file-write` con `encode=1` falla
-  por lo mismo (`Wide character in subroutine entry`, sin trabar nada). Además, la salida vuelve
-  con mojibake (bytes UTF-8 leídos como Latin-1: `—` → `â€”`).
-- **Evidencia (A/B controlado, VM110):** con el agente sano, `exec echo acento-é` → OK y el agente
-  sigue vivo; `exec echo guion—largo` → `guest-exec failed - got timeout` y el `ping` siguiente
-  muere. Se descartaron carga (host cpu 0 %), disco (34 %) y kernel (6.8.0-142 ejecuta bien).
-- **Impacto:** explica los episodios de "qga flaky" de toda la campaña de agosto (los comandos del
-  agente llevaban `—`, `→`, `✓` en los `echo`) — **la causa no era la carga**. Cada uno costó
-  reboots/resets de VMs de prod.
-- **Solución (en `lab/pve.py`):** argv no-ASCII viaja en base64 y un bootstrap ASCII lo decodifica
-  y ejecuta el argv original exacto; `push` codifica los bytes localmente (`encode=0`, también
-  sirve para binarios); la salida se des-mojibakea. De paso se aplicó la solución de **B-7**
-  (`env HOME=/root`), que no estaba en el helper. Validado en vivo: acentos/`—`/`✓`, exit codes
-  propagados, el agente sobrevive.
+- **What happens:** the Proxmox API (Perl) does not encode the `guest-exec` arguments with wide
+  characters: a single `—` (U+2014), `→` or `✓` in the command leaves the **qemu-guest-agent
+  jammed** — even `guest-ping` times out ("QEMU guest agent is not running") until the agent is
+  restarted. Latin-1 characters (`é`, `ñ`, `¿`) go through. `agent/file-write` with `encode=1`
+  fails for the same reason (`Wide character in subroutine entry`, without jamming anything). In
+  addition, the output comes back with mojibake (UTF-8 bytes read as Latin-1: `—` → `â€”`).
+- **Evidence (controlled A/B, VM110):** with the agent healthy, `exec echo acento-é` → OK and the
+  agent stays alive; `exec echo guion—largo` → `guest-exec failed - got timeout`, and the next
+  `ping` dies. Load (host cpu 0%), disk (34%) and kernel (6.8.0-142 runs fine) were ruled out.
+- **Impact:** it explains the "flaky qga" episodes of the whole August campaign (the agent's
+  commands carried `—`, `→`, `✓` in the `echo`s) — **the cause was not the load**. Each one cost
+  reboots/resets of prod VMs.
+- **Solution (in `lab/pve.py`):** a non-ASCII argv travels in base64, and an ASCII bootstrap
+  decodes it and runs the exact original argv; `push` encodes the bytes locally (`encode=0`, which
+  also works for binaries); the output is de-mojibaked. Along the way, the **B-7** solution
+  (`env HOME=/root`), which was not in the helper, was applied. Validated live: accents/`—`/`✓`,
+  exit codes propagated, the agent survives.
 
-### B-12 🟢 Todas las VMs de PROD tenían reboot pendiente por kernel + libc6 — aplicado
+### B-12 🟢 All the PROD VMs had a pending reboot for kernel + libc6 — applied
 
-- **Qué se observó:** `unattended-upgrades` instaló kernels 6.8.0-137…142 y libc6 en las VMs; hasta
-  que reinician siguen con el kernel viejo (fb-egress: corre 6.8.0-136, `reboot-required`). El
-  reboot de VM110 de hoy activó **6.8.0-142** sin problemas (guest-agent, red y repo OK).
-- **Resolución (2026-09-25; el operador delegó la infra: "hacé lo que creas conveniente"):**
-  - Reboot de a una VM, con snapshot previo `pre-kernel-reboot-20260925`, en el orden egress →
-    worker1 → ingress → mb.
-  - Las 4 quedaron en **6.8.0-142**, sin `reboot-required`, con IPs y rutas idénticas y 0 units
-    `failed`. Mesh 4/4, 9/9 runtimes, público 200.
-  - Los spokes aguantaron la caída del hub sin reiniciar nada.
-  - Quedó validada en PROD la carga al boot del NAT del egress (F17): el ruleset volvió idéntico.
-  - Detalle en la bitácora 2026-09-25.
+- **What was observed:** `unattended-upgrades` installed kernels 6.8.0-137…142 and libc6 on the
+  VMs; until they reboot, they stay on the old kernel (fb-egress: runs 6.8.0-136,
+  `reboot-required`). Today's VM110 reboot activated **6.8.0-142** without problems (guest-agent,
+  network and repo OK).
+- **Resolution (2026-09-25; the operator delegated the infra: "hacé lo que creas conveniente" ("do
+  whatever you think is best")):**
+  - Reboot one VM at a time, with a prior snapshot `pre-kernel-reboot-20260925`, in the order
+    egress → worker1 → ingress → mb.
+  - All 4 ended up on **6.8.0-142**, without `reboot-required`, with identical IPs and routes and
+    0 `failed` units. Mesh 4/4, 9/9 runtimes, public 200.
+  - The spokes withstood the hub going down without restarting anything.
+  - The boot-time load of the egress's NAT (F17) was validated in PROD: the ruleset came back
+    identical.
+  - Detail in the 2026-09-25 logbook.
 
-### B-13 ✅ RESUELTO (2026-10-02) — Las VMs de PROD no arrancaban solas después de un reboot del host (`onboot` sin definir)
+### B-13 ✅ RESOLVED (2026-10-02) — The PROD VMs did not start on their own after a host reboot (`onboot` not defined)
 
-- **Qué pasa:** `onboot` no está definido en fb-mb, fb-worker1, fb-ingress, fb-egress ni fb-build.
-  Si el host reinicia (corte de luz, actualización), **PROD queda apagado** hasta que alguien
-  arranque las VMs a mano.
-- **Evidencia:** pasó el 2026-07-30 ("las 4 VMs quedaron apagadas. Arranqué las 4 VMs"). El HANDBOOK
-  lo registró como "reboot del hipervisor: validado", pero lo validado fue que el mesh se rearma,
-  no que las VMs arranquen solas.
-- **Solución propuesta:** `onboot=1` en 100, 101, 102, 103 y 110 (fb-build, por la decisión de
-  dejarla siempre encendida). Sin orden de arranque, porque el arranque simultáneo de las 4 es lo
-  que se validó el 30/07. `PUT /nodes/pve/qemu/<id>/config onboot=1`, o en la GUI: VM → Options →
-  *Start at boot*.
-- **Estado:** resuelto. El operador puso `onboot=1` en 100, 101, 102, 103 y 110; verificado por la
-  API el 2026-10-02. Queda por ver en vivo con el próximo reinicio del host.
+- **What happens:** `onboot` is not defined on fb-mb, fb-worker1, fb-ingress, fb-egress or
+  fb-build. If the host reboots (power cut, update), **PROD stays powered off** until someone
+  starts the VMs by hand.
+- **Evidence:** it happened on 2026-07-30 ("the 4 VMs were left powered off. I started the 4 VMs").
+  The HANDBOOK recorded it as "hypervisor reboot: validated", but what was validated was that the
+  mesh re-forms, not that the VMs start on their own.
+- **Proposed solution:** `onboot=1` on 100, 101, 102, 103 and 110 (fb-build, because of the
+  decision to keep it always on). No start order, because the simultaneous start of the 4 is what
+  was validated on 30/07. `PUT /nodes/pve/qemu/<id>/config onboot=1`, or in the GUI: VM → Options
+  → *Start at boot*.
+- **Status:** resolved. The operator set `onboot=1` on 100, 101, 102, 103 and 110; verified
+  through the API on 2026-10-02. It remains to be seen live on the next host reboot.
 
-### B-14 🟡 Arranque lento de las VMs de PROD (userspace de 53 s a 1 min 48 s)
+### B-14 🟡 Slow boot of the PROD VMs (userspace from 53 s to 1 min 48 s)
 
-- **Qué se observó (reboots del 2026-09-25):** userspace de ingress 53 s, egress 60 s, worker1
+- **What was observed (reboots of 2026-09-25):** userspace of ingress 53 s, egress 60 s, worker1
   89 s, mb 108 s (fb-build: 31 s).
-- **Qué no es:**
-  - No es el flush del journal, aunque `systemd-analyze blame` pone arriba a
-    `systemd-journal-flush.service` (mb 74 s, worker1 58 s): journald reporta que el flush en sí
-    tardó ~1 s (mb: 1,4 s para 752 entradas).
-  - Tampoco el tamaño del journal: mb 1,8 G; egress 109 M y tardó 27 s; fb-build 112 M y 0,6 s.
-- **Pista:** en el log de mb, jobs sin relación entre sí (flush, apparmor, binfmt) terminan en el
-  mismo instante (94,6 s). Algo común los retiene.
-- **Impacto:** suma de 1 a 1,5 min a cada recuperación. Con mb son ~3 min 20 s desde el reboot hasta
-  los 9 runtimes; no diagnosticar antes de eso.
-- **Candidato no probado:** la consola serie (`console=ttyS0` con `serial0=socket` y
+- **What it is not:**
+  - It is not the journal flush, even though `systemd-analyze blame` puts
+    `systemd-journal-flush.service` at the top (mb 74 s, worker1 58 s): journald reports that the
+    flush itself took ~1 s (mb: 1.4 s for 752 entries).
+  - Nor is it the size of the journal: mb 1.8 G; egress 109 M and it took 27 s; fb-build 112 M and
+    0.6 s.
+- **Clue:** in mb's log, unrelated jobs (flush, apparmor, binfmt) finish at the same instant
+  (94.6 s). Something common holds them back.
+- **Impact:** it adds 1 to 1.5 min to every recovery. With mb it is ~3 min 20 s from the reboot to
+  the 9 runtimes; do not diagnose before that.
+- **Untested candidate:** the serial console (`console=ttyS0` with `serial0=socket` and
   `vga=serial0`).
-- **Pendiente:** diagnóstico (`systemd-analyze plot`, qué retiene esos jobs) antes de tocar nada.
+- **Pending:** a diagnosis (`systemd-analyze plot`, what holds those jobs back) before touching
+  anything.
 
-### B-15 ✅ RESUELTO (2026-10-02) — Margen de memoria del host de PROD con fb-build siempre encendida
+### B-15 ✅ RESOLVED (2026-10-02) — Memory headroom of the PROD host with fb-build always on
 
-- **Qué se observó:** 26,0 G configurados en las VMs encendidas sobre 27,4 G físicos, sin
-  ballooning. Uso real estable en ~22 G (pico de 81 % en la semana, 0 swap). mb llega a 5,8 G de
-  sus 10 G; fb-build, a 7,6 G de 8 G.
-- **Riesgo:** si mb llegara a usar sus 10 G mientras fb-build compila, el host se queda sin margen,
-  y lo primero que cae es un proceso QEMU.
-- **Opciones (decisión del operador):**
-  - Ballooning con mínimo en fb-build (p. ej. `balloon=2048`): Proxmox le recupera memoria cuando
-    el host pasa del 80 %.
-  - Bajarle la RAM fuera de los builds.
-- **Estado:** resuelto. El operador activó ballooning en fb-build con mínimo 2 GiB (`balloon=2048`);
-  verificado por la API el 2026-10-02. Para darle más RAM al host hay que apagarlo, porque es una VM
-  de VMware.
+- **What was observed:** 26.0 G configured in the powered-on VMs over 27.4 G physical, with no
+  ballooning. Real usage stable at ~22 G (a peak of 81% during the week, 0 swap). mb reaches 5.8 G
+  of its 10 G; fb-build, 7.6 G of 8 G.
+- **Risk:** if mb were to use its 10 G while fb-build compiles, the host runs out of headroom, and
+  the first thing to go down is a QEMU process.
+- **Options (the operator's decision):**
+  - Ballooning with a minimum on fb-build (e.g. `balloon=2048`): Proxmox reclaims memory from it
+    when the host goes over 80%.
+  - Lowering its RAM outside of builds.
+- **Status:** resolved. The operator enabled ballooning on fb-build with a 2 GiB minimum
+  (`balloon=2048`); verified through the API on 2026-10-02. To give the host more RAM it has to be
+  shut down, because it is a VMware VM.
 
-### B-16 ✅ RESUELTO (2026-10-03) — `ops.py deploy` dio por actualizados a spokes que no lo estaban
+### B-16 ✅ RESOLVED (2026-10-03) — `ops.py deploy` reported spokes as updated when they were not
 
-- **Qué pasó (deploy de 0.1.56):**
-  - El core update se disparó unos segundos después de que el admin del motherbee volvió, antes de
-    que su router tuviera de vuelta a los spokes. Los tres pedidos fallaron con `TRANSPORT_ERROR` y
-    ninguno llegó: ningún servicio de los spokes se reinició.
-  - Igual el deploy dijo "worker1 on 0.1.56". `ops.py` juzgaba por `core.manifest_hash` y las
-    versiones de los componentes de `/versions`, que en un spoke son lo que trajo dist. Syncthing
-    los actualiza antes de cualquier update. Lo instalado está en `core.installed`, y seguía en el
-    hash de 0.1.55.
-- **Cómo se vio:** el chequeo de binarios después del deploy mostró `not_restarted` en todas las
-  units de los spokes.
-- **Arreglo (`lab/ops.py`):**
-  - `core_of` usa el hash instalado cuando el hive lo reporta, igual que la comparación de
-    `/versions` (X1). `ops versions` dice de dónde sale cada hash.
-  - `deploy` espera a que el orchestrator de cada spoke conteste antes del update, y reintenta hasta
-    3 veces un pedido que no llegó.
-  - El update se volvió a mandar a mano y los tres spokes terminaron bien (U-8b validado).
-- **Para considerar:** en `/versions` de un spoke, `core.manifest_hash` y las versiones de los
-  componentes describen lo que está disponible, no lo que corre. La comparación de la flota ya lo
-  resuelve, pero leído suelto confunde.
+- **What happened (0.1.56 deploy):**
+  - The core update fired a few seconds after the motherbee's admin came back, before its router
+    had the spokes back. The three requests failed with `TRANSPORT_ERROR` and none arrived: no
+    spoke service was restarted.
+  - Even so, the deploy said "worker1 on 0.1.56". `ops.py` judged by `core.manifest_hash` and the
+    component versions in `/versions`, which on a spoke are what dist brought. Syncthing updates
+    them before any update. What is installed is in `core.installed`, and it was still on the
+    0.1.55 hash.
+- **How it was seen:** the binaries check after the deploy showed `not_restarted` on every unit of
+  the spokes.
+- **Fix (`lab/ops.py`):**
+  - `core_of` uses the installed hash when the hive reports it, just like the `/versions`
+    comparison (X1). `ops versions` says where each hash comes from.
+  - `deploy` waits for each spoke's orchestrator to answer before the update, and retries a
+    request that did not arrive up to 3 times.
+  - The update was sent again by hand, and the three spokes finished fine (U-8b validated).
+- **To consider:** in a spoke's `/versions`, `core.manifest_hash` and the component versions
+  describe what is available, not what is running. The fleet comparison already solves it, but
+  read on its own it is confusing.
 
 ---
 
-## Cómo se usa este documento
+## How this document is used
 
-1. Durante el despliegue: **se agregan hallazgos, no se arreglan**.
-2. Al terminar: se revisa la sección **A** con el operador y sale el **plan de cambios de código**
-   (qué se cambia, por qué, en qué orden, y qué queda como decisión de diseño). Ese plan se lleva a
-   [`PENDING-BUGS.md`](PENDING-BUGS.md), que es donde se sigue el estado de cada tarea.
-3. La sección **B** alimenta el `HANDBOOK.md` (recetas) y, donde corresponda, los scripts de infra.
+1. During the deployment: **findings are added, not fixed**.
+2. At the end: section **A** is reviewed with the operator, and the **code-change plan** comes out
+   of it (what changes, why, in what order, and what stays as a design decision). That plan goes
+   to [`PENDING-BUGS.md`](PENDING-BUGS.md), which is where the state of each task is tracked.
+3. Section **B** feeds `HANDBOOK.md` (recipes) and, where it applies, the infra scripts.

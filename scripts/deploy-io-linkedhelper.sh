@@ -6,7 +6,7 @@ set -euo pipefail
 # the resulting manifest_version+hash (retrying while sync_pending), then optionally
 # spawn/restart the node via the Admin API.
 #
-# IMPORTANT precondition (see docs/onworking NOE/linked_helper/fluxbee_cloud_node_provision_runbook.md):
+# IMPORTANT precondition (see docs/history/onworking-noe/linked_helper/fluxbee_cloud_node_provision_runbook.md):
 #   The adapter secret MUST already be stored in SY.vault at adapter.auth.key
 #   (vault_put) BEFORE spawning — this node uses adapter.auth.type=vault_ref and
 #   resolves the secret from Vault at boot / on config.set. This script does NOT

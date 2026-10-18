@@ -8,7 +8,7 @@ import (
 	"testing"
 )
 
-// WF-BUILD-3 — the package-native contract (docs/onworking COA/wf_v1_tasks.md §15):
+// WF-BUILD-3 — the package-native contract (docs/history/onworking-coa/wf_v1_tasks.md §15):
 //  1. In managed package mode the definition is `_system.package_path/flow/definition.json`.
 //  2. CONFIG_SET in managed package mode refuses to point workflow_definition_path elsewhere.
 //  3. CONFIG_GET in managed package mode shows the package-native binding.

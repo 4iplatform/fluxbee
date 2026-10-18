@@ -5,7 +5,7 @@
 **Audience:** SY.architect developers, orchestrator, admin API
 **Parent specs:** `node-spawn-config-spec.md`, `runtime-packaging-cli-spec.md`, `sy-architect-spec.md`, `sy-policy-beta.md`
 
-> Direction note (2026-04-05): this is the solution-manifest spec to use for the `SY.policy` initiative. The old `SY.claims`-oriented manifest under `docs/legacy/solution-manifest-spec.md` is historical only and must not drive new implementation.
+> Direction note (2026-04-05): this is the solution-manifest spec to use for the `SY.policy` initiative. The old `SY.claims`-oriented manifest under `docs/history/legacy/solution-manifest-spec.md` is historical only and must not drive new implementation.
 >
 > Policy composition note (2026-04-06): the manifest carries only solution-level policy rules. System axioms are shipped separately with Fluxbee core as an immutable policy pack, installed into the `SY.architect` environment, and composed with the manifest policy at apply time.
 >

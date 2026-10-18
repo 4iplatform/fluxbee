@@ -241,7 +241,7 @@ How it is applied:
 - **Default and overrides.** The code default is `127.0.0.1:3000` (`src/bin/sy_architect.rs:84`).
   `JSR_ARCHITECT_LISTEN` or `architect.listen` overrides it (`:5975-5984`).
 - **Where `0.0.0.0` ships:** `packaging/hive.yaml.example:45`, `config/hive.yaml:33`,
-  `docs/07-operaciones.md:150`.
+  `docs/history/07-operaciones.md:150`.
 - **Docs that point at the open port:** `packaging/fluxbee-firstboot:156`,
   `docs/packaging-and-build.md:232`, `lab/logbook/HANDBOOK.md:445`.
 - **The example does not reach installed hosts.** The postinst copies it only when

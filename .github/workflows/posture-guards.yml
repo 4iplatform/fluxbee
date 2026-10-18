@@ -29,3 +29,6 @@ jobs:
 
       - name: Syncthing config.xml has a single writer (stage 2)
         run: bash scripts/check_syncthing_single_writer.sh
+
+      - name: The live docs link only to files that exist, never to a developer's disk
+        run: python3 scripts/check_doc_links.py

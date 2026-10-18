@@ -1,68 +1,68 @@
 # IO.blob / public artifacts - Specification v1
 
-**Estado:** contrato alpha implementado y validado en Linux/Proxmox el 2026-07-17: curator,
-autoridad admin, instalacion limpia de ingress, replica publica, serving `/public` y teardown estan
-operativos. Resta el smoke de producto con un AI/IO real recorriendo publish/expiry/unpublish.
+**Status:** alpha contract implemented and validated on Linux/Proxmox on 2026-07-17: curator,
+admin authority, clean ingress install, public replica, `/public` serving and teardown are
+operational. What remains is the product smoke with a real AI/IO going through publish/expiry/unpublish.
 
-Leer junto con `edge-ingress-spec-v6.md` y `blob-annex-spec.md`. Esta spec define la publicacion
-READ-ONLY de archivos generados dentro de Fluxbee, incluidos HTML interactivos autocontenidos, como
-URLs `/public/<key>` servidas por `SY.edge`.
+Read together with `edge-ingress-spec-v6.md` and `blob-annex-spec.md`. This spec defines the
+READ-ONLY publication of files generated inside Fluxbee, including self-contained interactive HTML, as
+`/public/<key>` URLs served by `SY.edge`.
 
-## 1. Decisiones cerradas
+## 1. Closed decisions
 
-- **`SY.admin` es la autoridad.** El nodo productor llama a admin directamente. Admin conserva el
-  `src_l2_name` estampado por el router, resuelve su ILK/tenant en Identity y decide si publica.
-- **`IO.blob` es un worker, no una autoridad ni un relay.** Recibe un comando ya autorizado de
-  `SY.admin`, cura los bytes y mantiene el ledger/refcount local. No decide tenant, acceso ni URL.
-- **Ownership v1 = ownership de la publicacion.** El blob store `active/` actual es compartido y el
-  `BlobRef` no contiene ownership. V1 NO afirma que puede probar criptograficamente que el publisher
-  creo esos bytes; afirma que admin sabe que tenant creo y controla la publicacion.
-- **Primer modo de lectura = link-capability.** No hay listing ni login en edge. Cualquiera que reciba
-  el link puede verlo hasta `expires_at` o `unpublish`. La verificacion de sesion/tenant por acceso es
-  la siguiente etapa, no una propiedad ficticia del primer release.
-- **HTML autocontenido con JavaScript, sin red.** JS corre en el navegador, nunca en edge/IO.blob.
-  Se permite interaccion local (graficos, filtros, tablas, calculos) dentro de un sandbox con
-  `connect-src 'none'`. Consultar APIs o ejecutar acciones queda fuera de v1.
-- **Data plane separado.** Los bytes no viajan por frames de la malla. Solo el control y metadata
-  viajan por RPC; una carpeta `public/` dedicada replica bytes one-way al ingress.
+- **`SY.admin` is the authority.** The producer node calls admin directly. Admin keeps the
+  `src_l2_name` stamped by the router, resolves its ILK/tenant in Identity and decides whether it publishes.
+- **`IO.blob` is a worker, not an authority nor a relay.** It receives an already authorized command from
+  `SY.admin`, curates the bytes and keeps the local ledger/refcount. It does not decide tenant, access or URL.
+- **Ownership v1 = ownership of the publication.** The current `active/` blob store is shared and the
+  `BlobRef` contains no ownership. V1 does NOT claim that it can cryptographically prove that the publisher
+  created those bytes; it claims that admin knows which tenant created and controls the publication.
+- **First read mode = link-capability.** There is no listing or login at the edge. Anyone who receives
+  the link can see it until `expires_at` or `unpublish`. Per-access session/tenant verification is
+  the next stage, not a fictitious property of the first release.
+- **Self-contained HTML with JavaScript, no network.** JS runs in the browser, never in edge/IO.blob.
+  Local interaction (charts, filters, tables, calculations) is allowed inside a sandbox with
+  `connect-src 'none'`. Querying APIs or running actions is out of v1.
+- **Separate data plane.** The bytes do not travel in mesh frames. Only control and metadata
+  travel over RPC; a dedicated `public/` folder replicates bytes one-way to the ingress.
 
-## 2. Estado real del codigo al inicio
+## 2. Actual state of the code at the start
 
-- `BlobToolkit::put_bytes/promote` escribe en `blob.path/{staging,active}` y retorna un `BlobRef`
-  anonimo (`blob_name`, size, mime, filename, spool_day).
-- `active/` es un store compartido, content-addressed con `hash16`; no tiene tenant/owner y hoy puede
-  replicarse `sendreceive` entre hives.
-- Los managed nodes reciben ILK/tenant por env, pero el router solo estampa de forma autoritativa el
-  `src_l2_name` del proceso conectado.
-- `SY.edge` ya sirve `/e/<ich>` por forward a un IO node. `/b/:ich` es un stub 501 y no hay static
+- `BlobToolkit::put_bytes/promote` writes into `blob.path/{staging,active}` and returns an anonymous
+  `BlobRef` (`blob_name`, size, mime, filename, spool_day).
+- `active/` is a shared store, content-addressed with `hash16`; it has no tenant/owner and today it can
+  be replicated `sendreceive` between hives.
+- Managed nodes get ILK/tenant through env, but the router only authoritatively stamps the
+  `src_l2_name` of the connected process.
+- `SY.edge` already serves `/e/<ich>` by forwarding to an IO node. `/b/:ich` is a 501 stub and there is no static
   serving.
-- El ingress se provisiona con blob/syncthing deshabilitado.
+- The ingress is provisioned with blob/syncthing disabled.
 
-Por lo tanto, esta spec agrega un circuito nuevo y acotado; no renombra como terminado algo que ya
-existia.
+Therefore, this spec adds a new, bounded circuit; it does not rename as finished something that already
+existed.
 
-## 3. Invariantes
+## 3. Invariants
 
-- **P1 - Producer identity survives.** El primer command mutante es `producer -> SY.admin`; no pasa
-  antes por `IO.blob`. El request no acepta `tenant_id` ni `publisher_l2_name` como autoridad.
-- **P2 - Admin owns policy.** Admin resuelve `src_l2_name -> ILK -> tenant`, crea `publication_id`,
-  define expiracion/content policy y es la unica autoridad que puede ordenar curate/release.
-- **P3 - IO.blob accepts one caller.** Solo acepta control SYSTEM desde `SY.admin@<mismo-hive>`.
-- **P4 - Public folder is curated.** `IO.blob` es el unico writer normal de `blob.path/public`.
-  Presence en esa carpeta no autoriza una URL.
-- **P5 - DMZ never receives `active/`.** El ingress recibe solo `public/`, mediante un folder distinto
+- **P1 - Producer identity survives.** The first mutating command is `producer -> SY.admin`; it does not go
+  through `IO.blob` first. The request does not accept `tenant_id` or `publisher_l2_name` as authority.
+- **P2 - Admin owns policy.** Admin resolves `src_l2_name -> ILK -> tenant`, creates `publication_id`,
+  defines the expiration/content policy and is the only authority that can order curate/release.
+- **P3 - IO.blob accepts one caller.** It only accepts SYSTEM control from `SY.admin@<same-hive>`.
+- **P4 - Public folder is curated.** `IO.blob` is the only normal writer of `blob.path/public`.
+  Presence in that folder does not authorize a URL.
+- **P5 - DMZ never receives `active/`.** The ingress receives only `public/`, through a separate folder
   `fluxbee-blob-public`: motherbee `sendonly`, ingress `receiveonly`.
-- **P6 - Allowlist before bytes.** Edge sirve solo una `BlobRow` empujada/ACKeada por admin. Unknown,
-  expired o unpublished key devuelve 404.
-- **P7 - Two identifiers.** URL key = random 256-bit capability. Filename publico = SHA-256 completo
-  lowercase de los bytes. La URL nunca contiene el hash del contenido.
-- **P8 - Data ready before URL ready.** Admin no devuelve success hasta que edge confirma row valida,
-  archivo local presente, regular y con SHA-256 esperado.
-- **P9 - Dedup needs refcount.** Varias publicaciones pueden apuntar al mismo SHA. Release borra el
-  archivo solo cuando no queda ninguna publicacion en el ledger.
-- **P10 - Read-only.** No hay upload, PUT, DELETE ni API externa de escritura.
+- **P6 - Allowlist before bytes.** Edge serves only a `BlobRow` pushed/ACKed by admin. An unknown,
+  expired or unpublished key returns 404.
+- **P7 - Two identifiers.** URL key = random 256-bit capability. Public filename = full lowercase
+  SHA-256 of the bytes. The URL never contains the hash of the content.
+- **P8 - Data ready before URL ready.** Admin does not return success until edge confirms a valid row,
+  and a local file that is present, regular and has the expected SHA-256.
+- **P9 - Dedup needs refcount.** Several publications can point to the same SHA. Release deletes the
+  file only when no publication is left in the ledger.
+- **P10 - Read-only.** There is no upload, PUT, DELETE or external write API.
 
-## 4. Flujo v1
+## 4. v1 flow
 
 ```text
 AI/IO/WF producer (tenant T)
@@ -109,27 +109,27 @@ Producer request:
 }
 ```
 
-Prohibido en params: `tenant_id`, `publisher_l2_name`, path, public key, sha256 filename, CSP crudo,
-headers crudos o edge row. Admin deriva/minta todo eso.
+Forbidden in params: `tenant_id`, `publisher_l2_name`, path, public key, sha256 filename, raw CSP,
+raw headers or edge row. Admin derives/mints all of that.
 
-**Superficie del productor AI (D1):** publicar es una **acción invocada por el modelo**, no un hook
-automático — no todo HTML generado termina publicado. `ai.generic` expone la tool
-`publish_html_page {filename, content}` (registrada sólo cuando el nodo tiene identidad resuelta):
-valida el HTML con el mismo gate que `generate_html_artifact`, escribe el blob (`put_bytes` +
-`promote`) y ejecuta `publish_artifact` contra `SY.admin` por el socket de malla, devolviendo la URL
-capability al modelo para que la entregue en su respuesta. Un IO/WF productor haría lo análogo con su
-propio disparador; el contrato admin es idéntico.
+**AI producer surface (D1):** publishing is an **action invoked by the model**, not an automatic
+hook — not every generated HTML ends up published. `ai.generic` exposes the tool
+`publish_html_page {filename, content}` (registered only when the node has a resolved identity):
+it validates the HTML with the same gate as `generate_html_artifact`, writes the blob (`put_bytes` +
+`promote`) and runs `publish_artifact` against `SY.admin` over the mesh socket, returning the capability
+URL to the model so that it delivers it in its answer. An IO/WF producer would do the analogous thing with its
+own trigger; the admin contract is identical.
 
 ### 4.2 Admin -> IO.blob worker RPC
 
-Commands SYSTEM:
+SYSTEM commands:
 
 - `BLOB_CURATE` -> `BLOB_CURATE_RESPONSE`
 - `BLOB_RELEASE` -> `BLOB_RELEASE_RESPONSE`
 - `BLOB_STATUS_GET` -> `BLOB_STATUS_GET_RESPONSE`
 
-`BLOB_CURATE` lleva facts ya resueltos por admin. `IO.blob` valida al caller exacto pero no redecide
-la autorizacion. Respuesta exitosa:
+`BLOB_CURATE` carries facts already resolved by admin. `IO.blob` validates the exact caller but does not
+re-decide the authorization. Successful response:
 
 ```json
 {
@@ -143,12 +143,12 @@ la autorizacion. Respuesta exitosa:
 }
 ```
 
-Idempotencia: repetir el mismo `publication_id` con los mismos facts devuelve success sin incrementar
-refcount. Repetirlo con facts distintos devuelve conflict.
+Idempotency: repeating the same `publication_id` with the same facts returns success without incrementing
+the refcount. Repeating it with different facts returns conflict.
 
 ### 4.3 Admin -> edge row
 
-`EDGE_PUBLISH_BLOB` contiene solo facts normalizados:
+`EDGE_PUBLISH_BLOB` contains only normalized facts:
 
 ```json
 {
@@ -164,36 +164,36 @@ refcount. Repetirlo con facts distintos devuelve conflict.
 }
 ```
 
-Edge guarda esta row en un registry distinto del mapa ICH. El key nunca se concatena como path; el
-lookup produce el `public_name` validado.
+Edge stores this row in a registry separate from the ICH map. The key is never concatenated as a path; the
+lookup produces the validated `public_name`.
 
-## 5. Access v1 y siguiente etapa tenant
+## 5. Access v1 and the next tenant stage
 
 ### 5.1 V1: link-capability
 
-`GET /public/<key>` no exige un segundo bearer. El key random es la capability. Propiedades:
+`GET /public/<key>` does not require a second bearer. The random key is the capability. Properties:
 
-- 256 bits random, exact lookup, sin listing;
-- revocable por unpublish;
-- `expires_at` aplicado por edge;
+- 256 random bits, exact lookup, no listing;
+- revocable by unpublish;
+- `expires_at` applied by edge;
 - `X-Robots-Tag: noindex, nofollow, noarchive`;
 - `Referrer-Policy: no-referrer`;
-- no prueba que el viewer pertenezca al tenant.
+- it does not prove that the viewer belongs to the tenant.
 
-Cloud debe entregar el link solo al tenant correcto, pero quien lo reenvia comparte acceso. Esta es
-una decision de producto explicita para el primer release.
+Cloud must deliver the link only to the right tenant, but whoever forwards it shares access. This is
+an explicit product decision for the first release.
 
-### 5.2 Siguiente etapa: tenant-gated access
+### 5.2 Next stage: tenant-gated access
 
-Cloud valida su sesion OAuth/tenant y solicita a admin una capability corta para una publicacion. El
-edge valida firma/expiracion, sin aprender OAuth ni aceptar un tenant libre del browser. Esto agrega
-un `mint_artifact_access` separado; no cambia ownership ni el data plane. Hasta implementarlo, la
-spec no llama "tenant-private" a un link.
+Cloud validates its OAuth/tenant session and asks admin for a short capability for a publication. The
+edge validates signature/expiration, without learning OAuth or accepting a free tenant from the browser. This adds
+a separate `mint_artifact_access`; it does not change ownership or the data plane. Until it is implemented, the
+spec does not call a link "tenant-private".
 
-## 6. HTML interactivo autocontenido
+## 6. Self-contained interactive HTML
 
-El HTML generado por AI es codigo no confiable. Edge/IO.blob no lo ejecutan; lo ejecuta el browser.
-V1 permite JavaScript local con una policy fija, no controlable por el publisher:
+The HTML generated by AI is untrusted code. Edge/IO.blob do not run it; the browser runs it.
+V1 allows local JavaScript with a fixed policy, which the publisher cannot control:
 
 ```text
 Content-Security-Policy:
@@ -209,131 +209,131 @@ Content-Security-Policy:
   base-uri 'none'
 ```
 
-Ademas:
+Also:
 
 - `X-Content-Type-Options: nosniff`;
-- content host sin cookies y separado del origen Cloud/API;
-- Cloud lo embebe con `iframe sandbox="allow-scripts"` cuando forma parte de su UI;
-- no forms, popups, parent navigation, service workers ni requests de red;
-- HTML/CSS/JS/data autocontenidos en un solo archivo para v1.
+- a content host without cookies and separate from the Cloud/API origin;
+- Cloud embeds it with `iframe sandbox="allow-scripts"` when it is part of its UI;
+- no forms, popups, parent navigation, service workers or network requests;
+- self-contained HTML/CSS/JS/data in a single file for v1.
 
-Para reporting se prefiere un renderer JS versionado y confiable que consume JSON generado por AI.
-HTML+JS arbitrario sigue permitido dentro del sandbox; no obtiene APIs Fluxbee.
+For reporting, a versioned and trusted JS renderer that consumes JSON generated by AI is preferred.
+Arbitrary HTML+JS is still allowed inside the sandbox; it gets no Fluxbee APIs.
 
 ## 7. IO.blob worker
 
-`IO.blob` es un runtime managed motherbee-only y no externaliza ICH. Config:
+`IO.blob` is a motherbee-only managed runtime and does not externalize ICH. Config:
 
 - `IO_BLOB_NODE_NAME` default `IO.blob`;
-- `IO_BLOB_ADMIN_HIVE` default hive local;
+- `IO_BLOB_ADMIN_HIVE` default local hive;
 - `IO_BLOB_BLOB_ROOT` default `/var/lib/fluxbee/blob`;
 - `IO_BLOB_PUBLIC_ROOT` default `<blob_root>/public`;
 - `IO_BLOB_LEDGER_PATH` default `/var/lib/fluxbee/state/io-blob/publications.json`;
-- `IO_BLOB_MAX_BYTES` default al limite canonico de Blob SDK.
+- `IO_BLOB_MAX_BYTES` default to the canonical Blob SDK limit.
 
-Forma parte de `system_nodes.motherbee` como nodo empaquetado de lifecycle: Orchestrator inicia,
-espera y supervisa `io-blob.service` junto con la topologia base. Esta inclusion no cambia su
-frontera de identidad: sigue siendo un worker `IO.*` visible en el inventario de nodos administrados
-y `SY.identity` no le crea una ILK deterministica de tipo `system`. `SY.vault` tambien excluye
-entradas no `SY.*` al construir su allowlist local de autoridades conocidas, por lo que estar en
-este lifecycle no otorga acceso al pool de secretos del tenant raiz.
+It is part of `system_nodes.motherbee` as a packaged lifecycle node: the Orchestrator starts,
+waits for and supervises `io-blob.service` together with the base topology. This inclusion does not change its
+identity boundary: it is still an `IO.*` worker, visible in the inventory of managed nodes,
+and `SY.identity` does not create a deterministic ILK of type `system` for it. `SY.vault` also excludes
+non-`SY.*` entries when it builds its local allowlist of known authorities, so being in
+this lifecycle does not grant access to the secret pool of the root tenant.
 
-Responsabilidades:
+Responsibilities:
 
-- caller gate exacto `SY.admin@<hive>`;
-- validar schema/BlobRef/publication facts;
-- resolver solo mediante `BlobToolkit`, nunca aceptar paths;
-- rechazar symlink/no-regular y size mismatch;
-- SHA-256 completo calculado por streaming;
-- escritura atómica por descriptor dentro de `blob/public` (temporal exclusivo y `linkat`), con el
-  dueño de esa carpeta y permisos `0640` (FINDINGS A-56);
-- ledger atomico, idempotencia y refcount;
-- release seguro y status operacional;
+- exact caller gate `SY.admin@<hive>`;
+- validate schema/BlobRef/publication facts;
+- resolve only through `BlobToolkit`, never accept paths;
+- reject symlink/non-regular and size mismatch;
+- full SHA-256 computed by streaming;
+- atomic write by descriptor inside `blob/public` (exclusive temporary file and `linkat`), with the
+  owner of that folder and `0640` permissions (FINDINGS A-56);
+- atomic ledger, idempotency and refcount;
+- safe release and operational status;
 - no Identity SHM, no tenant decision, no edge call, no public HTTP.
 
 ## 8. Edge static serving
 
-`SY.edge` agrega un data path local acotado para `/public/:key`, reemplazando el stub `/b/`. Es una
-excepcion deliberada al principio "edge solo forwardea": bytes grandes no caben en el envelope y no
-deben volver a la malla.
+`SY.edge` adds a bounded local data path for `/public/:key`, replacing the `/b/` stub. It is a
+deliberate exception to the principle "edge only forwards": large bytes do not fit in the envelope and must
+not go back into the mesh.
 
-Requisitos:
+Requirements:
 
-- registry tipado separado del ICH registry;
-- solo `GET` y `HEAD`; `Range`/conditional GET recomendado para PDF/media;
-- semaphore separado del RPC `/e/`, con permit vivo durante todo el stream;
-- key -> row -> `public_name`; nunca key -> path;
-- `public_name` exactamente 64 hex lowercase;
-- open no-follow, regular file, canonical root y size/hash readiness al publish;
-- headers derivados de policy fija, nunca headers arbitrarios del producer;
+- typed registry separate from the ICH registry;
+- only `GET` and `HEAD`; `Range`/conditional GET recommended for PDF/media;
+- semaphore separate from the `/e/` RPC, with the permit held during the whole stream;
+- key -> row -> `public_name`; never key -> path;
+- `public_name` exactly 64 lowercase hex;
+- open no-follow, regular file, canonical root and size/hash readiness at publish;
+- headers derived from a fixed policy, never arbitrary headers from the producer;
 - unknown/expired/missing/unready -> 404 fail-closed.
 
-Configuracion del edge generada por `add_ingress`:
+Edge configuration generated by `add_ingress`:
 
 - `edge.publications_path`: `/var/lib/fluxbee/state/sy-edge/publications.json`;
 - `edge.blob_public_root`: `<blob.path>/public`;
 - `edge.public_max_inflight`: default `128`;
 - `edge.public_ready_timeout_ms`: default `60000`.
 
-`GET`/`HEAD` soportan ETag y un unico byte range. El permit del semaphore vive durante todo el
-stream. HTML recibe la CSP fija de la seccion 6; ningun header viene del producer.
+`GET`/`HEAD` support ETag and a single byte range. The semaphore permit lives during the whole
+stream. HTML gets the fixed CSP of section 6; no header comes from the producer.
 
 ## 9. Data replication
 
-- Folder id nuevo: `fluxbee-blob-public`.
+- New folder id: `fluxbee-blob-public`.
 - Source: motherbee `<blob.path>/public`, `sendonly`.
-- Destination: ingress `edge.blob_public_root`, `receiveonly`. Si la replica tiene cambios locales,
-  el watchdog del orchestrator del ingress los loguea y los revierte (`/rest/db/revert`): la carpeta
-  vuelve a la copia de la motherbee (A-16).
-- Peer point-to-point; no discovery/relay/NAT traversal automatico.
-- Nunca agregar ingress como device del folder `fluxbee-blob` (`active/`).
-- Un publish no termina hasta que edge puede abrir/verificar el archivo.
-- Unpublish: retirar row primero; release/refcount despues; delete replica en background.
-- `add_ingress` copia el vendor Syncthing, ejecuta `ADD_HIVE_FINALIZE`, intercambia device IDs y
-  persiste el ID del ingress para que `remove_hive` desenganche el peer.
-- El perfil de peer publico es exclusivo: al enlazar un ingress no agrega ese device a
-  `fluxbee-blob` ni a `fluxbee-dist`.
-- El cambio aplica automaticamente a altas nuevas. Un ingress creado con el perfil anterior, sin
-  `blob.sync.public_enabled`, debe reprovisionarse mediante remove/add; esta version no reescribe
-  silenciosamente el `hive.yaml` de un ingress existente.
+- Destination: ingress `edge.blob_public_root`, `receiveonly`. If the replica has local changes,
+  the ingress orchestrator's watchdog logs them and reverts them (`/rest/db/revert`): the folder
+  goes back to the motherbee's copy (A-16).
+- Point-to-point peer; no automatic discovery/relay/NAT traversal.
+- Never add the ingress as a device of the `fluxbee-blob` folder (`active/`).
+- A publish does not finish until edge can open/verify the file.
+- Unpublish: remove the row first; release/refcount after that; delete the replica in the background.
+- `add_ingress` copies the Syncthing vendor, runs `ADD_HIVE_FINALIZE`, exchanges device IDs and
+  persists the ingress ID so that `remove_hive` unhooks the peer.
+- The public peer profile is exclusive: when it links an ingress, it does not add that device to
+  `fluxbee-blob` or to `fluxbee-dist`.
+- The change applies automatically to new additions. An ingress created with the previous profile, without
+  `blob.sync.public_enabled`, must be reprovisioned through remove/add; this version does not silently
+  rewrite the `hive.yaml` of an existing ingress.
 
-## 10. Threat boundaries honestos
+## 10. Honest threat boundaries
 
-- Un link capability filtrado permite lectura hasta expiry/unpublish.
-- `active/` no tiene ownership fuerte. Un publisher que conoce un BlobRef puede pedir publicar esos
-  bytes; admin controla quien crea la publicacion, no quien creo el contenido.
-- Managed nodes corren hoy sin aislamiento Linux por tenant. Ownership fuerte de bytes requiere un
-  writer mediado y workloads no-root/per-tenant; queda fuera de esta vertical.
-- El DMZ contiene plaintext de los artefactos publicados. Comprometer el edge permite leer ese set,
-  pero no el corpus `active/`.
-- JavaScript arbitrario sigue siendo contenido hostil; sandbox + no-network es parte obligatoria del
-  contrato, no una opcion del publisher.
+- A leaked capability link allows reading until expiry/unpublish.
+- `active/` has no strong ownership. A publisher that knows a BlobRef can ask to publish those
+  bytes; admin controls who creates the publication, not who created the content.
+- Managed nodes run today without Linux isolation per tenant. Strong ownership of bytes requires a
+  mediated writer and non-root/per-tenant workloads; it is out of this vertical.
+- The DMZ contains the plaintext of the published artifacts. Compromising the edge allows reading that set,
+  but not the `active/` corpus.
+- Arbitrary JavaScript is still hostile content; sandbox + no-network is a mandatory part of the
+  contract, not an option of the publisher.
 
-## 11. Orden de implementacion
+## 11. Implementation order
 
-1. **[IMPLEMENTADO LOCAL]** `IO.blob` curator worker: RPC admin-only, full SHA-256, atomic public copy,
-   ledger/refcount, y packaging como runtime managed.
-2. **[IMPLEMENTADO LOCAL]** `SY.admin publish_artifact/unpublish_artifact`: direct producer gate,
-   Identity tenant resolve, command a IO.blob, durable publication ledger y help mesh-only en el
-   catalogo Admin (fuera del executor HTTP).
-3. **[IMPLEMENTADO LOCAL]** Syncthing `fluxbee-blob-public` one-way en motherbee/ingress.
-4. **[IMPLEMENTADO LOCAL]** `SY.edge /public/:key` + BlobRow + readiness/hash ACK + headers/sandbox.
-5. **[VALIDADO LAB]** Infra E2E: `add_ingress` limpio, peer TCP conectado, replica one-way de HTML
-   interactivo, reinicio, `GET`/`HEAD`/range/ETag/CSP y `remove_hive` sin drift de Syncthing.
-6. **[IMPLEMENTADO]** Superficie productor + ciclo de vida completo (código compila, smoke en vivo
-   pendiente): tool `publish_html_page` en `ai.generic` (§4.1); GC de expiración admin-side
-   `run_publication_expiry_sweep` (cada 600s: `MSG_EDGE_UNPUBLISH_BLOB` + `MSG_BLOB_RELEASE`,
-   ledger→`expired`, idempotente); ruta operador `POST /artifacts/unpublish` (revoca cualquier
-   tenant, D2); y auditoría durable de `publish_artifact`/`unpublish_artifact` en el command-log.
-7. **[PENDIENTE SMOKE PRODUCTOR]** AI/IO real genera HTML y recorre `publish_artifact`, expiry y
-   `unpublish_artifact` sobre la malla instalada. Runbook: `lab/blob-public-smoke.md`.
-8. **[FUTURO]** `mint_artifact_access` para validacion tenant por acceso mediante Cloud.
+1. **[IMPLEMENTED LOCALLY]** `IO.blob` curator worker: admin-only RPC, full SHA-256, atomic public copy,
+   ledger/refcount, and packaging as a managed runtime.
+2. **[IMPLEMENTED LOCALLY]** `SY.admin publish_artifact/unpublish_artifact`: direct producer gate,
+   Identity tenant resolve, command to IO.blob, durable publication ledger and mesh-only help in the
+   Admin catalog (outside the HTTP executor).
+3. **[IMPLEMENTED LOCALLY]** One-way Syncthing `fluxbee-blob-public` on motherbee/ingress.
+4. **[IMPLEMENTED LOCALLY]** `SY.edge /public/:key` + BlobRow + readiness/hash ACK + headers/sandbox.
+5. **[VALIDATED IN LAB]** Infra E2E: clean `add_ingress`, TCP peer connected, one-way replica of
+   interactive HTML, restart, `GET`/`HEAD`/range/ETag/CSP and `remove_hive` with no Syncthing drift.
+6. **[IMPLEMENTED]** Producer surface + full lifecycle (the code compiles, live smoke
+   pending): tool `publish_html_page` in `ai.generic` (§4.1); admin-side expiration GC
+   `run_publication_expiry_sweep` (every 600s: `MSG_EDGE_UNPUBLISH_BLOB` + `MSG_BLOB_RELEASE`,
+   ledger→`expired`, idempotent); operator route `POST /artifacts/unpublish` (revokes any
+   tenant, D2); and durable audit of `publish_artifact`/`unpublish_artifact` in the command-log.
+7. **[PENDING PRODUCER SMOKE]** A real AI/IO generates HTML and goes through `publish_artifact`, expiry and
+   `unpublish_artifact` over the installed mesh. Runbook: `lab/blob-public-smoke.md`.
+8. **[FUTURE]** `mint_artifact_access` for per-access tenant validation through Cloud.
 
-## 12. Fuera de v1
+## 12. Out of v1
 
-- Upload o escritura desde internet.
-- API calls desde HTML publicado.
-- Sitios multiarchivo, service workers o aplicaciones completas.
-- Listing/directorio publico.
-- Ownership fuerte de bytes previo a publication.
-- Sesion OAuth/cookie interpretada directamente por edge.
+- Upload or writes from the internet.
+- API calls from published HTML.
+- Multi-file sites, service workers or full applications.
+- Public listing/directory.
+- Strong ownership of bytes prior to publication.
+- OAuth/cookie session interpreted directly by edge.

@@ -12,7 +12,7 @@ report() { echo "A-46 guard: $*"; fail=1; }
 
 # A renamed or missing input must fail the guard, not pass it silently.
 for f in packaging/hive.yaml.example config/hive.yaml packaging/fluxbee-firstboot \
-         docs/packaging-and-build.md docs/07-operaciones.md; do
+         docs/packaging-and-build.md docs/reference/operations.md; do
   [ -f "$f" ] || report "$f is missing: update the guard's file list"
 done
 
@@ -31,7 +31,7 @@ for f in packaging/hive.yaml.example config/hive.yaml; do
 done
 
 # 2. Operator-facing text: no URL that opens 3000/8080 on a non-loopback host, no 0.0.0.0 listen.
-for f in packaging/fluxbee-firstboot docs/packaging-and-build.md docs/07-operaciones.md; do
+for f in packaging/fluxbee-firstboot docs/packaging-and-build.md docs/reference/operations.md; do
   [ -f "$f" ] || continue
   while IFS= read -r hit; do
     [ -n "$hit" ] && report "$f:$hit"

@@ -1,875 +1,878 @@
-# PENDING-BUGS — tareas de código abiertas por el test integrado en PROD alpha
+# PENDING-BUGS — open code tasks from the integrated test in PROD alpha
 
-**Qué es esto.** [FINDINGS.md](FINDINGS.md) es el registro de *hallazgos* — qué se observó y con
-qué evidencia. Este documento es la otra mitad: la lista de **tareas de código pendientes** que
-salen de esos hallazgos, con el arreglo propuesto y si bloquea o no.
+**What this is.** [FINDINGS.md](FINDINGS.md) is the record of *findings* — what was observed and with
+what evidence. This document is the other half: the list of **pending code tasks** that come out of
+those findings, with the proposed fix and whether it blocks or not.
 
-Regla de entrada: acá solo entra lo que **requiere tocar el producto**. Los hallazgos de
-infraestructura (serie `B-*` de FINDINGS) no entran salvo que impliquen un cambio en fluxbee.
+Entry rule: only what **requires touching the product** goes here. Infrastructure findings (the
+`B-*` series in FINDINGS) do not go here unless they imply a change in fluxbee.
 
-**Estados:** 🔴 abierto · 🟡 mitigado (anda, pero el arreglo correcto está pendiente) · ✅ cerrado
+**States:** 🔴 open · 🟡 mitigated (it works, but the correct fix is pending) · ✅ closed
 
-> **⚠️ Auditoría adversarial del 2026-08-03**
+> **⚠️ Adversarial audit of 2026-08-03**
 >
-> Los 12 hallazgos abiertos se sometieron a un intento sistemático de **refutación** (regla 0d de
-> [METHOD.md](METHOD.md)). Resultado: **solo 2 sobrevivieron intactos** (U-3, U-9); los otros 10
-> tenían algo cierto adentro pero el **encuadre, la causa o el arreglo mal** — y **tres de los
-> arreglos propuestos eran peligrosos de implementar** (PB-6, PB-8, U-4).
+> The 12 open findings went through a systematic attempt at **refutation** (rule 0d of
+> [METHOD.md](METHOD.md)). Result: **only 2 survived intact** (U-3, U-9); the other 10 had
+> something true inside, but the **framing, the cause or the fix was wrong** — and **three of the
+> proposed fixes were dangerous to implement** (PB-6, PB-8, U-4).
 >
-> Patrón: *en 6 de 12, el bug real estaba en el mismo archivo, a pocas líneas — y no se vio porque
-> ya estaba la hipótesis escrita.* Las entradas de abajo son las **reescritas**; cada una dice qué
-> se borró y por qué.
+> Pattern: *in 6 of 12, the real bug was in the same file, a few lines away — and it was not seen
+> because the hypothesis was already written.* The entries below are the **rewritten** ones; each
+> one says what was deleted and why.
 
-| id | estado | tema | bloquea |
+| id | state | topic | blocks |
 |---|---|---|---|
-| [PB-1](#pb-1) | 🟡 mitigado | SY.edge no recarga el cert TLS al rotar en el vault | no |
-| [PB-2](#pb-2) | ✅ **cerrado y VALIDADO en vivo** | Completitud de la cadena TLS · `chain_len=4` servido, `verify=0` desde internet | — |
-| [PB-3](#pb-3) | 🟢 cosmético | El enum `ResourceType` derivó · **sin impacto funcional** | no |
-| [PB-4](#pb-4) | ✅ **CERRADO** | El arranque en frío **se veía** como falla: el edge culpaba al vault sin motivo | — |
-| [PB-5](#pb-5) | 🟡 reescrito | El egress reporta `nat_applied: true` sin verificar su pata LAN | no |
-| [PB-6](#pb-6) | 🟡 reescrito | `ssh_password` no se cierra solo · **⛔ invertir el default deja cajas sin acceso** | no |
-| [PB-6b](#pb-6b) | ✅ **CERRADO** | `harden_ssh_applied` era un eco del request: reportaba `false` con el password auth ya apagado | — |
-| [PB-7](#pb-7) | ✅ **CERRADO** | `add_hive` (>6 min) desborda la ventana del admin (180 s) **y bloquea el canal** | no |
-| [PB-8](#pb-8) | ✅ **cerrado y VALIDADO en vivo** | Egress para motherbee · **sólo reporta**, no toca la ruta (`EGRESS_MOTHERBEE_BYPASS`) | — |
-| [PB-9](#pb-9) | ✅ **CERRADO** | Todo restart de `sy-vault` recicla un edge sano → bache en el HTTPS público | no |
+| [PB-1](#pb-1) | 🟡 mitigated | SY.edge does not reload the TLS cert when it rotates in the vault | no |
+| [PB-2](#pb-2) | ✅ **closed and VALIDATED live** | Completeness of the TLS chain · `chain_len=4` served, `verify=0` from the internet | — |
+| [PB-3](#pb-3) | 🟢 cosmetic | The `ResourceType` enum drifted · **no functional impact** | no |
+| [PB-4](#pb-4) | ✅ **CLOSED** | The cold start **looked** like a failure: the edge blamed the vault for no reason | — |
+| [PB-5](#pb-5) | 🟡 rewritten | The egress reports `nat_applied: true` without verifying its LAN leg | no |
+| [PB-6](#pb-6) | 🟡 rewritten | `ssh_password` does not close by itself · **⛔ inverting the default leaves boxes without access** | no |
+| [PB-6b](#pb-6b) | ✅ **CLOSED** | `harden_ssh_applied` was an echo of the request: it reported `false` with password auth already off | — |
+| [PB-7](#pb-7) | ✅ **CLOSED** | `add_hive` (>6 min) overflows the admin's window (180 s) **and blocks the channel** | no |
+| [PB-8](#pb-8) | ✅ **closed and VALIDATED live** | Egress for motherbee · **only reports**, does not touch the route (`EGRESS_MOTHERBEE_BYPASS`) | — |
+| [PB-9](#pb-9) | ✅ **CLOSED** | Every restart of `sy-vault` recycles a healthy edge → blip in the public HTTPS | no |
 
-### Serie U — el sistema de update (auditado 2026-07-30, antes de usarlo)
+### Series U — the update system (audited 2026-07-30, before using it)
 
-| id | estado | tema | bloquea |
+| id | state | topic | blocks |
 |---|---|---|---|
-| [U-1](#u-1) | ✅ **cerrado y VALIDADO en vivo** | El update del core reportaba éxito sin reiniciar nada | — |
-| [U-2](#u-2) | ✅ **cerrado** | Ingress y egress no tenían canal de core · resuelto partiendo `dist` por contenido + core por rol | — |
-| [U-3](#u-3) | ✅ **cerrado y VALIDADO en vivo** | El `.deb` pisaba `dist/runtimes/manifest.json` · snapshot en `preinst` + seed que restaura | — |
-| [U-4a](#u-4a) | ✅ **cerrado y VALIDADO en vivo** | El veredicto de `/versions` funciona, con `runtimes: n/a` en ingress y egress | — |
-| [U-4b](#u-4b) | ✅ **cerrado y VALIDADO en vivo** | Las drift-alerts no se escribían nunca · ahora hay escritor, y la síntesis se borró | — |
-| [U-5](#u-5) | ✅ **cerrado y VALIDADO en vivo** | `core_rollback` con generaciones selladas, gate de salud y forward cross-hive | — |
-| [U-5b](#u-5b) | ✅ **CERRADO** | Los backups de core se acumulaban sin GC **y se creaban vacíos en cada no-op** | — |
-| [U-6](#u-6) | 🟡 mitigado | La carrera era **el orquestador contra sí mismo**: escritura no atómica de 35 MB | — |
-| [U-7](#u-7) | ✅ **cerrado** | El watchdog reiniciaba syncthing cada ~7 s por una carpeta inexistente | — |
-| [U-8a](#u-8a) | ✅ **cerrado y VALIDADO en vivo** (`9f86c12`, con PB-7) | La API de admin no tenía contrato para operaciones largas | — |
-| [U-8b](#u-8b) | ✅ **cerrado** (0.1.55) | `update category=core` daba TIMEOUT: ahora responde antes de reiniciar | — |
-| [U-8c](#u-8c) | ✅ **CERRADO** | El `timeout_unknown` del architect estaba **muerto** por un substring imposible | — |
-| [U-9](#u-9) | ✅ **CERRADO** | El catch-all rompía el envelope **y daba 404 donde correspondía 405** | — |
-| [U-10](#u-10) | ✅ **cerrado y VALIDADO en vivo** | Un upgrade del `.deb` dejaba huérfano a todo nodo runtime | — |
-| [U-11](#u-11) | ✅ **cerrado y VALIDADO en vivo** | IO.cloud no podía auto-publicar su canal | — |
-| [U-12](#u-12) | 🟡 corregido | La carrera existe, pero **hay una llamada atómica que la evita** y yo no la encontré | no |
-| [U-13](#u-13) | ✅ **cerrado y VALIDADO en vivo** | `sy-storage` perdía la carrera de arranque contra el vault y **no reintentaba** | — |
+| [U-1](#u-1) | ✅ **closed and VALIDATED live** | The core update reported success without restarting anything | — |
+| [U-2](#u-2) | ✅ **closed** | Ingress and egress had no core channel · solved by splitting `dist` by content + core by role | — |
+| [U-3](#u-3) | ✅ **closed and VALIDATED live** | The `.deb` overwrote `dist/runtimes/manifest.json` · snapshot in `preinst` + a seed that restores it | — |
+| [U-4a](#u-4a) | ✅ **closed and VALIDATED live** | The `/versions` verdict works, with `runtimes: n/a` on ingress and egress | — |
+| [U-4b](#u-4b) | ✅ **closed and VALIDATED live** | The drift-alerts were never written · now there is a writer, and the synthesis was deleted | — |
+| [U-5](#u-5) | ✅ **closed and VALIDATED live** | `core_rollback` with sealed generations, a health gate and a cross-hive forward | — |
+| [U-5b](#u-5b) | ✅ **CLOSED** | Core backups piled up without GC **and were created empty on every no-op** | — |
+| [U-6](#u-6) | 🟡 mitigated | The race was **the orchestrator against itself**: a non-atomic 35 MB write | — |
+| [U-7](#u-7) | ✅ **closed** | The watchdog restarted syncthing every ~7 s because of a nonexistent folder | — |
+| [U-8a](#u-8a) | ✅ **closed and VALIDATED live** (`9f86c12`, with PB-7) | The admin API had no contract for long operations | — |
+| [U-8b](#u-8b) | ✅ **closed** (0.1.55) | `update category=core` returned TIMEOUT: now it replies before restarting | — |
+| [U-8c](#u-8c) | ✅ **CLOSED** | The architect's `timeout_unknown` was **dead** because of an impossible substring | — |
+| [U-9](#u-9) | ✅ **CLOSED** | The catch-all broke the envelope **and returned 404 where 405 was due** | — |
+| [U-10](#u-10) | ✅ **closed and VALIDATED live** | A `.deb` upgrade left every runtime node orphaned | — |
+| [U-11](#u-11) | ✅ **closed and VALIDATED live** | IO.cloud could not self-publish its channel | — |
+| [U-12](#u-12) | 🟡 corrected | The race exists, but **there is an atomic call that avoids it** and I did not find it | no |
+| [U-13](#u-13) | ✅ **closed and VALIDATED live** | `sy-storage` lost the startup race against the vault and **did not retry** | — |
 
 ---
 
 <a id="pb-1"></a>
-## PB-1 🟡 — `SY.edge` no recarga el certificado TLS cuando rota en el vault
+## PB-1 🟡 — `SY.edge` does not reload the TLS certificate when it rotates in the vault
 
-**Estado:** mitigado con el patrón de la casa. El arreglo correcto (hot-reload) sigue pendiente
-y es una **decisión ya tomada por el operador**: sale así ahora porque no es bloqueante.
+**State:** mitigated with the house pattern. The correct fix (hot-reload) is still pending,
+and it is a **decision already taken by the operator**: it ships like this now because it is not blocking.
 
-### Qué pasa
+### What happens
 
-El material TLS se lee **una sola vez al boot** ([sy_edge.rs:271-290](../../src/bin/sy_edge.rs#L271-L290))
-y queda en un `Arc<rustls::ServerConfig>` inmutable ya movido adentro del listener. El handler de
-`VAULT_SECRET_CHANGED` existía y funcionaba, pero solo llamaba a `resolve_secrets()`, que refresca
-los **secretos de canal** — el TLS no lo tocaba nadie.
+The TLS material is read **only once, at boot** ([sy_edge.rs:271-290](../../src/bin/sy_edge.rs#L271-L290))
+and stays in an immutable `Arc<rustls::ServerConfig>` already moved into the listener. The
+`VAULT_SECRET_CHANGED` handler existed and worked, but it only called `resolve_secrets()`, which
+refreshes the **channel secrets** — nobody touched the TLS.
 
-No faltaba el broadcast ni el handler: faltaba que el handler hiciera algo cuando la key que
-cambió era la del TLS.
+Neither the broadcast nor the handler was missing: what was missing was for the handler to do
+something when the key that changed was the TLS one.
 
-### Evidencia en producción (2026-07-30)
+### Evidence in production (2026-07-30)
 
-Reproducido en vivo con el cert real:
+Reproduced live with the real cert:
 
 ```text
-vault_put edge_tls_fluxbee_ai  ->  status: ok, version: 2, changed: true   (cadena de 3 certs)
-broadcast VAULT_SECRET_CHANGED emitido
-openssl s_client contra el edge  ->  certs servidos: 1                     (la version 1, vieja)
+vault_put edge_tls_fluxbee_ai  ->  status: ok, version: 2, changed: true   (chain of 3 certs)
+broadcast VAULT_SECRET_CHANGED emitted
+openssl s_client against the edge  ->  certs served: 1                     (version 1, the old one)
 systemctl restart sy-edge
-openssl s_client contra el edge  ->  certs servidos: 3                     (la version 2)
+openssl s_client against the edge  ->  certs served: 3                     (version 2)
 ```
 
-Peor aún: el síntoma es **silencioso y engañoso**. Un cliente indulgente (navegador, curl con la
-CA cacheada) completa el handshake igual buscando el intermedio por AIA, así que
-`tls_verify=0` y "anda todo bien" — mientras un cliente estricto (webhooks de Meta/Slack, Go,
-Python) falla. Se ve bien justo donde no importa.
+Worse still: the symptom is **silent and misleading**. A lenient client (a browser, curl with the
+CA cached) completes the handshake anyway by fetching the intermediate via AIA, so
+`tls_verify=0` and "everything works fine" — while a strict client (Meta/Slack webhooks, Go,
+Python) fails. It looks fine exactly where it does not matter.
 
-### Qué se hizo
+### What was done
 
-Se aplicó el **contrato que ya usa la casa** para material de vault que solo se puede consumir al
-arranque: `exit(0)` y que systemd reinicie. Es literalmente lo que hacen `sy.identity` y
-`sy.storage` para el secreto de postgres, y está documentado como Model D' VA-J'-13:
+The **contract the house already uses** was applied, for vault material that can only be consumed
+at startup: `exit(0)` and let systemd restart. It is literally what `sy.identity` and
+`sy.storage` do for the postgres secret, and it is documented as Model D' VA-J'-13:
 
 > *"The reaction is `exit(0)` so systemd reboots the node and identity re-resolves vault with the
 > secret cleanly."*
 
-Detalles del arreglo:
+Details of the fix:
 
-- Reusa el chequeo de origen *fail-closed* que `sy_edge` **ya tenía** (solo el `SY.vault@<vault_hive>`
-  que este edge usa puede disparar el restart; si no, cualquier nodo forjando el broadcast lo
-  reinicia en loop).
-- **Matchea por key**, apartándose a propósito de la guía `(resource_type, tenant_id, ilk)` que
-  documenta `VaultSecretChangedPayload`. Esa guía es para consumidores que resuelven *por interés*;
-  el edge está configurado con **un `tls_vault_key` explícito** y busca por esa key exacta, así que
-  la igualdad de key es justo la condición que invalida lo que cargó.
-- **Un `delete` NO reinicia.** Reiniciar sin cert es *fail-closed* → el edge se queda sin frontend
-  HTTPS. Convertiría una llamada equivocada al vault en una caída pública. Sigue sirviendo el cert
-  que ya tiene y grita por log.
-- La decisión se extrajo a `tls_secret_change_action()`, una función pura, para que sea testeable
-  (con `process::exit` inline no lo era). 4 tests de regresión.
+- It reuses the *fail-closed* origin check that `sy_edge` **already had** (only the `SY.vault@<vault_hive>`
+  this edge uses can trigger the restart; otherwise any node forging the broadcast restarts it
+  in a loop).
+- **It matches by key**, deliberately departing from the `(resource_type, tenant_id, ilk)` guidance that
+  `VaultSecretChangedPayload` documents. That guidance is for consumers that resolve *by interest*;
+  the edge is configured with **an explicit `tls_vault_key`** and looks up that exact key, so
+  key equality is exactly the condition that invalidates what it loaded.
+- **A `delete` does NOT restart.** Restarting without a cert is *fail-closed* → the edge is left without
+  an HTTPS frontend. It would turn a mistaken call to the vault into a public outage. It keeps serving
+  the cert it already has and shouts in the log.
+- The decision was extracted into `tls_secret_change_action()`, a pure function, so that it is testable
+  (with `process::exit` inline it was not). 4 regression tests.
 
-### Lo que falta (el arreglo correcto)
+### What is missing (the correct fix)
 
-Hot-reload real: `ResolvesServerCert` de rustls leyendo de un `ArcSwap`, de modo que el broadcast
-swapee el cert **sin tocar el socket**. Cero caída. Es el mecanismo idiomático de rustls, no un
-invento. El edge es la puerta pública: es el único nodo donde el `exit(0)` de la casa tiene un
-costo visible desde afuera.
+Real hot-reload: rustls's `ResolvesServerCert` reading from an `ArcSwap`, so that the broadcast
+swaps the cert **without touching the socket**. Zero downtime. It is the idiomatic rustls mechanism,
+not an invention. The edge is the public door: it is the only node where the house `exit(0)` has
+a cost that is visible from outside.
 
-**Por qué no se hizo ahora:** decisión del operador — tiene que salir andando, y el patrón de la
-casa no bloquea. La rotación del cert es anual (Sectigo), así que el reinicio breve se tolera.
+**Why it was not done now:** the operator's decision — it has to ship working, and the house pattern
+does not block. The cert rotation is yearly (Sectigo), so the brief restart is tolerated.
 
 ---
 
 <a id="pb-2"></a>
-## PB-2 ✅ CERRADO y VALIDADO en vivo — Nadie verifica la **completitud** de la cadena TLS: una cadena truncada entra al vault y el edge la sirve sin quejarse
+## PB-2 ✅ CLOSED and VALIDATED live — Nobody verifies the **completeness** of the TLS chain: a truncated chain goes into the vault and the edge serves it without complaint
 
-> **Reescrito el 2026-08-03 tras auditoría adversarial.** El hallazgo original (*"`vault_put` acepta
-> material TLS sin validarlo"*) proponía un validador que **no habría atajado el archivo roto del
-> operador**. Se verificó ejecutando el caso real.
+> **Rewritten on 2026-08-03 after the adversarial audit.** The original finding (*"`vault_put` accepts
+> TLS material without validating it"*) proposed a validator that **would not have caught the
+> operator's broken file**. This was verified by running the real case.
 
-**Cómo apareció.** El `.crt` de cadena completa que entregó el operador venía **mal formado**: el
-`END CERTIFICATE` del leaf y el `BEGIN CERTIFICATE` del intermedio estaban **pegados en el mismo
-renglón**, más CRLF mezclado. `openssl` lee **cero** certificados de ese archivo.
+**How it showed up.** The full-chain `.crt` that the operator delivered was **malformed**: the
+leaf's `END CERTIFICATE` and the intermediate's `BEGIN CERTIFICATE` were **stuck together on the same
+line**, plus mixed CRLF. `openssl` reads **zero** certificates from that file.
 
-**Lo que es cierto.** `vault_put` no inspecciona `value` (`sy_vault.rs:752-798`).
+**What is true.** `vault_put` does not inspect `value` (`sy_vault.rs:752-798`).
 
-**Lo que era falso y se borró:**
+**What was false and was deleted:**
 
-- *"El material TLS no se valida."* Sí se valida, al resolver: cadena no vacía, key parseable y
-  coincidencia key/cert por SPKI, vía `CertifiedKey::from_der` (`sy_edge.rs:1642-1652`). La familia
-  entera valida **al resolver, no al escribir** — es el contrato deliberado del vault (*"The vault
-  does not interpret it"*, `docs/sy-vault-spec.md:177`).
-- *"El fallo aparece mucho después."* Post-PB-1 el `put` dispara `exit(0)` y el material se valida a
-  los segundos (`sy_edge.rs:461-475`).
-- *"El síntoma no menciona al vault."* `sy_edge.rs:276/288` lo nombran.
-- *"A `postgres` también le falta validador."* Existe (`sy_storage.rs:2463-2467`).
+- *"The TLS material is not validated."* It is validated, on resolve: a non-empty chain, a parseable key and
+  a key/cert match by SPKI, via `CertifiedKey::from_der` (`sy_edge.rs:1642-1652`). The whole
+  family validates **on resolve, not on write** — it is the vault's deliberate contract (*"The vault
+  does not interpret it"*, `docs/history/sy-vault-spec.md:177`).
+- *"The failure shows up much later."* Post-PB-1 the `put` triggers `exit(0)` and the material is validated
+  within seconds (`sy_edge.rs:461-475`).
+- *"The symptom does not mention the vault."* `sy_edge.rs:276/288` name it.
+- *"`postgres` also lacks a validator."* It exists (`sy_storage.rs:2463-2467`).
 
-**Por qué el arreglo propuesto no servía — probado, no razonado.** Con `END`/`BEGIN` pegados,
-`rustls_pemfile::certs` devuelve **`Ok` con 1 certificado y sin error** (openssl: 0). O sea "cadena
-no vacía + key parsea + modulus coincide" da **OK sobre el archivo roto**, y el edge levanta HTTPS
-sirviendo **solo el leaf**. No es la puerta caída: es una falla **silenciosa** que rompe a los
-clientes estrictos.
+**Why the proposed fix did not work — tested, not reasoned.** With `END`/`BEGIN` stuck together,
+`rustls_pemfile::certs` returns **`Ok` with 1 certificate and no error** (openssl: 0). So "non-empty
+chain + key parses + modulus matches" gives **OK on the broken file**, and the edge brings HTTPS up
+serving **only the leaf**. It is not the door going down: it is a **silent** failure that breaks
+strict clients.
 
-**El arreglo que sí vale:**
+**The fix that does work:**
 
-- **(a)** En `sy_edge.rs::tls_config_from_pem`: contar los marcadores `BEGIN CERTIFICATE` del PEM y
-  compararlos con los certificados que devolvió el parser. Si no coinciden → fallar fuerte (el PEM
-  se truncó en silencio). Si la cadena tiene un solo cert → WARN explícito *"leaf sin intermedios:
-  los clientes estrictos van a fallar"*. Ataja el caso real, y vale tanto para el vault como para el
-  disco.
-- **(b)** *Opcional, decisión del operador* — el mismo chequeo como pre-flight del `put`, o mejor un
-  seam en el SDK que llamen los dos para que no puedan divergir. **Rompe la opacidad declarada del
-  vault**, por eso no se hace sin OK.
-- **(c)** Anotar la **asimetría fail-closed**: un `delete` está deliberadamente protegido de tirar la
-  puerta pública (`sy_edge.rs:476-481`), pero un `put` inválido **sí la tira**, y post-PB-1 de
-  inmediato: `exit(0)` → boot → `Err` en main → crash loop. O el boot degrada como el `delete`
-  (conservar el último material bueno), o se documenta que la recuperación es `vault_rollback`.
+- **(a)** In `sy_edge.rs::tls_config_from_pem`: count the PEM's `BEGIN CERTIFICATE` markers and
+  compare them with the certificates the parser returned. If they do not match → fail hard (the PEM
+  was silently truncated). If the chain has a single cert → an explicit WARN *"leaf without intermediates:
+  strict clients are going to fail"*. It catches the real case, and it holds both for the vault and for
+  disk.
+- **(b)** *Optional, the operator's decision* — the same check as a pre-flight of the `put`, or better a
+  seam in the SDK that both call so that they cannot diverge. **It breaks the vault's declared opacity**,
+  which is why it is not done without an OK.
+- **(c)** Note the **fail-closed asymmetry**: a `delete` is deliberately protected from bringing down the
+  public door (`sy_edge.rs:476-481`), but an invalid `put` **does bring it down**, and post-PB-1 immediately:
+  `exit(0)` → boot → `Err` in main → crash loop. Either the boot degrades like the `delete`
+  (keep the last good material), or it is documented that the recovery is `vault_rollback`.
 
 ---
 
 <a id="pb-3"></a>
-## PB-3 🟢 — El enum `ResourceType` derivó respecto de lo que el propio producto escribe
+## PB-3 🟢 — The `ResourceType` enum drifted from what the product itself writes
 
-> **Degradado de 🔴 a cosmético/documental el 2026-08-03.** No tiene impacto funcional.
+> **Downgraded from 🔴 to cosmetic/documentation on 2026-08-03.** It has no functional impact.
 
-**Hecho.** Al menos cuatro tipos que produce o consume el propio producto no están en `ResourceType`
-(`crates/fluxbee_sdk/src/vault.rs:40-87`) ni en la ayuda de `vault_put`: `tls`, `ssh`
-(`sy_orchestrator.rs:20649`), `whatsapp` (`io-wapp/src/main.rs:62`) y `linkedhelper_adapter`. La
-ayuda los llama *"escape hatch"* mientras la casa los usa como camino normal.
+**Fact.** At least four types that the product itself produces or consumes are not in `ResourceType`
+(`crates/fluxbee_sdk/src/vault.rs:40-87`) nor in the `vault_put` help: `tls`, `ssh`
+(`sy_orchestrator.rs:20649`), `whatsapp` (`io-wapp/src/main.rs:62`) and `linkedhelper_adapter`. The
+help calls them an *"escape hatch"* while the house uses them as the normal path.
 
-**Lo que NO es.** No hay impacto funcional: `known_wire_values()` **no tiene llamadores**, el vault
-filtra por igualdad de string normalizado (`sy_vault.rs:1102-1110`), y un `Custom` se comporta
-idéntico a una variante nombrada. En particular **`tls` no lo consume nadie**: SY.edge se enlaza por
-`tls_vault_key` y matchea **por key**, no por `resource_type` — la decisión deliberada que ya
-documenta PB-1.
+**What it is NOT.** There is no functional impact: `known_wire_values()` **has no callers**, the vault
+filters by equality of the normalized string (`sy_vault.rs:1102-1110`), and a `Custom` behaves
+identically to a named variant. In particular, **nobody consumes `tls`**: SY.edge binds by
+`tls_vault_key` and matches **by key**, not by `resource_type` — the deliberate decision that PB-1
+already documents.
 
-**Se borró el link a PB-2:** el validador de PB-2 cuelga del string normalizado y se puede
-implementar hoy con `Custom("tls")`. Que `tls` no esté en el enum **no bloquea nada**.
+**The link to PB-2 was deleted:** PB-2's validator hangs off the normalized string and can be
+implemented today with `Custom("tls")`. That `tls` is not in the enum **blocks nothing**.
 
-**Arreglo (elegir uno).** (a) Promover las cuatro a variantes y que `known_wire_values()` deje de ser
-código muerto — p.ej. WARN cuando admin cae en `Custom`; o (b) reescribir la ayuda para que "custom
-normalizado" sea un camino de primera clase y documentar la *value-shape* de cada tipo (a `tls` le
-falta la fila `{cert, key}`).
+**Fix (pick one).** (a) Promote the four to variants and make `known_wire_values()` stop being
+dead code — e.g. a WARN when admin falls into `Custom`; or (b) rewrite the help so that "normalized
+custom" is a first-class path, and document the *value-shape* of each type (`tls` is missing
+the `{cert, key}` row).
 
 ---
 
 <a id="pb-4"></a>
-## PB-4 ✅ CERRADO — El arranque en frío del ingress **se ve** como una falla: el edge dice "arreglá el vault" cuando no hay nada que arreglar
+## PB-4 ✅ CLOSED — The ingress cold start **looks** like a failure: the edge says "fix the vault" when there is nothing to fix
 
-> **Reescrito el 2026-08-03.** Se le sacó el título causal: lo que el hallazgo pedía revisar **ya
-> existe y es deliberado**.
+> **Rewritten on 2026-08-03.** The causal title was removed: what the finding asked to review **already
+> exists and is deliberate**.
 
-**Observado** tras el reboot del host del 2026-07-30: `restart counter is at 9`, y terminó levantando
-solo, sin intervención.
+**Observed** after the host reboot of 2026-07-30: `restart counter is at 9`, and it ended up coming up
+by itself, without intervention.
 
-**Lo que NO es.** No falta esperar al vault: la espera **es** el reintento. `Restart=always` +
-`RestartSec=5` se eligió porque el hive ingress no tiene `sy-vault` local y systemd no puede ordenar
-una dependencia cross-hive (`docs/edge-ingress-spec-v6.md:381-386`). Tampoco falta backoff:
-`RestartSec=5` es justo lo que mantiene la unit **bajo el rate-limit** de systemd (5 arranques/10 s),
-por eso 9 reinicios se curan solos y nunca latchean en `failed`. Ventana total ~45 s.
+**What it is NOT.** Waiting for the vault is not missing: the wait **is** the retry. `Restart=always` +
+`RestartSec=5` was chosen because the ingress hive has no local `sy-vault` and systemd cannot order
+a cross-hive dependency (`docs/edge-ingress-spec-v6.md:381-386`). Backoff is not missing either:
+`RestartSec=5` is exactly what keeps the unit **under systemd's rate limit** (5 starts/10 s),
+which is why 9 restarts heal by themselves and never latch into `failed`. Total window ~45 s.
 
-**El defecto real, chico y concreto.** `sy_edge.rs:304-307` imprime la misma frase — *"Fix the vault
-secret / cert files and restart."* — tanto cuando el vault todavía no es alcanzable (transitorio, se
-cura solo) como cuando el cert está roto de verdad (hace falta el operador). En el arranque en frío
-esa instrucción **es falsa**, y es la única fuente del ruido.
+**The real defect, small and concrete.** `sy_edge.rs:304-307` prints the same sentence — *"Fix the vault
+secret / cert files and restart."* — both when the vault is not reachable yet (transient, it heals
+by itself) and when the cert is really broken (the operator is needed). On a cold start that instruction
+**is false**, and it is the only source of the noise.
 
-**✅ Arreglado (2026-08-03).** `fetch_tls_config_from_vault` ya no aplana el error a string en el punto
-donde todavía conoce el tipo: devuelve `TlsFetchFailure`, que parte el fallo en **`VaultUnavailable`**
-(`VaultError::Node` / `ActionTimeout` — no llegó respuesta, systemd reintenta) y
-**`MaterialInvalid`** (el vault contestó, o el PEM no sirve — hace falta un humano). El arranque loguea
-`warn!` con *"vault no alcanzable todavía; systemd reintenta en ~5 s (normal en arranque en frío)"* en
-el primer caso, y el `error!` con la instrucción al operador solo en el segundo. El mensaje
-fail-closed final se bifurca igual. 23/23 tests de `sy_edge` verdes.
+**✅ Fixed (2026-08-03).** `fetch_tls_config_from_vault` no longer flattens the error to a string at the point
+where it still knows the type: it returns `TlsFetchFailure`, which splits the failure into **`VaultUnavailable`**
+(`VaultError::Node` / `ActionTimeout` — no reply arrived, systemd retries) and
+**`MaterialInvalid`** (the vault answered, or the PEM is no good — a human is needed). Startup logs
+a `warn!` with *"vault not reachable yet; systemd retries in ~5 s (normal on cold boot)"* in
+the first case, and the `error!` with the instruction to the operator only in the second. The final
+fail-closed message forks the same way. 23/23 `sy_edge` tests green.
 
-**No hecho, opcional:** reintentar in-process ~15 s antes del primer `exit`, copiando el patrón de
-`sy_identity.rs:6626-6651` — bajaría 9 reinicios a 1-2. Es cosmética sobre un camino que ya se cura
-solo; no la hice para no tocar el contrato de arranque sin necesidad.
+**Not done, optional:** retry in-process for ~15 s before the first `exit`, copying the pattern of
+`sy_identity.rs:6626-6651` — it would bring 9 restarts down to 1-2. It is cosmetic on a path that already heals
+by itself; I did not do it, so as not to touch the startup contract without need.
 
-**Lo que el hallazgo no vio (y es peor).** Después de 98adab7 el contador de restarts **mezcla
-`exit(0)` con `exit(1)`**. `sy_vault` emite `VAULT_SECRET_CHANGED op=put` por **cada** secreto en su
-propio arranque (`sy_vault.rs:246-260`) y `tls_secret_change_action` no mira `action="bootstrap"`
-(`sy_edge.rs:1690-1715`): **todo restart de `sy-vault` reinicia un edge sano** → bache de ~5 s en el
-HTTPS público. → ver **PB-9**.
+**What the finding did not see (and it is worse).** After 98adab7 the restart counter **mixes
+`exit(0)` with `exit(1)`**. `sy_vault` emits `VAULT_SECRET_CHANGED op=put` for **every** secret on its
+own startup (`sy_vault.rs:246-260`) and `tls_secret_change_action` does not look at `action="bootstrap"`
+(`sy_edge.rs:1690-1715`): **every restart of `sy-vault` restarts a healthy edge** → a ~5 s blip in the
+public HTTPS. → see **PB-9**.
 
-**Rigor.** La causa *"esperando al vault"* se **infirió del código**, no de una línea de journal del
-edge, y se propagó como hecho a `HANDBOOK.md:515`. La inferencia se sostiene, pero la próxima vez hay
-que capturar el `journalctl -u sy-edge` del arranque en frío antes de escribirla como hecho.
+**Rigor.** The cause *"waiting for the vault"* was **inferred from the code**, not from a line of the
+edge's journal, and it was propagated as fact to `HANDBOOK.md:515`. The inference holds, but next time
+the cold-start `journalctl -u sy-edge` must be captured before writing it down as fact.
 
 ---
 
 <a id="pb-5"></a>
-## PB-5 🟡 — El egress reporta `nat_applied: true` sin verificar su pata LAN
+## PB-5 🟡 — The egress reports `nat_applied: true` without verifying its LAN leg
 
-> **Reescrito el 2026-08-03.** El título anterior (*"el orchestrator no configura placas
-> secundarias"*) pedía algo que es **contra-contrato explícito**.
+> **Rewritten on 2026-08-03.** The previous title (*"the orchestrator does not configure secondary
+> NICs"*) asked for something that is **explicitly against the contract**.
 
-**Alcance corregido: solo `role=egress`.** Ingress sale del hallazgo — `add_hive` no le pide ni le
-puede pedir nombres de interfaz (`IngressSection:210-221`); sus dos placas son una decisión de
-topología del spec v6, no un hueco. *(Corregir también `HANDBOOK.md:403-408`, que hoy dice "pasarle
-los nombres de interfaz" para ingress y es falso.)*
+**Corrected scope: only `role=egress`.** Ingress leaves the finding — `add_hive` does not ask it, and
+cannot ask it, for interface names (`IngressSection:210-221`); its two NICs are a topology decision
+of the v6 spec, not a gap. *(Also correct `HANDBOOK.md:403-408`, which today says "pass it
+the interface names" for ingress, and that is false.)*
 
-**Se sacó el encuadre "rompe la promesa de la máquina vacía":** el contrato del *clean box*
-(`07-operaciones.md:435-447`) ya pone la red del lado del operador **para todos los roles**, y el
-producto tampoco direcciona la placa primaria de nadie. No hay divergencia entre hermanos: hay un
-prerequisito uniforme.
+**The "breaks the empty-machine promise" framing was removed:** the *clean box* contract
+(`07-operaciones.md:435-447`) already puts the network on the operator's side **for all roles**, and the
+product does not address anyone's primary NIC either. There is no divergence between siblings: there is a
+uniform prerequisite.
 
-**No se pide "que el orchestrator configure las placas".** Es contra-contrato
-(`edge-egress-nat-spec.md:378` decide **no** escribir netplan/NM) y desde adentro del guest no se
-puede crear una vNIC. Si el operador igual lo quiere, es una **feature nueva a discutir**.
+**"Have the orchestrator configure the NICs" is not requested.** It is against the contract
+(`edge-egress-nat-spec.md:378` decides **not** to write netplan/NM) and a vNIC cannot be created from
+inside the guest. If the operator wants it anyway, it is a **new feature to discuss**.
 
-**El bug real (fail-loud, chico, estilo de la casa).** `reconcile_egress_nat` debe hacer preflight
-antes de dar por bueno el NAT: que `lan_iface` y `wan_iface` **existan**, y que `cfg.edge_ip` esté
-efectivamente asignada a `lan_iface`. Si no → error fatal en el bootstrap con mensaje accionable, y
-WARN persistente en cada drift tick, igual que se hace con `internet_reachable`. Agregar `lan_leg_ok`
-a `EgressVerification` y **dejar de emitir `egress_nat_applied: true` sin él** — hoy el comentario en
-`:19194-19199` declara ese campo *"trustworthy"* y no lo es.
+**The real bug (fail-loud, small, house style).** `reconcile_egress_nat` must run a preflight
+before accepting the NAT as good: that `lan_iface` and `wan_iface` **exist**, and that `cfg.edge_ip` is
+actually assigned to `lan_iface`. If not → a fatal error in the bootstrap with an actionable message, and
+a persistent WARN on every drift tick, the same as is done with `internet_reachable`. Add `lan_leg_ok`
+to `EgressVerification` and **stop emitting `egress_nat_applied: true` without it** — today the comment at
+`:19194-19199` declares that field *"trustworthy"* and it is not.
 
-**Por qué el fallo es silencioso (dato técnico que faltaba):** `iifname`/`oifname` matchean por
-nombre **en runtime**, así que la ausencia de la placa **no** hace fallar el `nft -f` — a diferencia
-de `iif`/`oif`.
+**Why the failure is silent (a missing technical detail):** `iifname`/`oifname` match by
+name **at runtime**, so the absence of the NIC does **not** make `nft -f` fail — unlike
+`iif`/`oif`.
 
 ---
 
 <a id="pb-6"></a>
-## PB-6 🟡 — El canal de bootstrap por `ssh_password` no se cierra solo — y `harden_ssh` a secas **no** es la respuesta
+## PB-6 🟡 — The `ssh_password` bootstrap channel does not close by itself — and plain `harden_ssh` is **not** the answer
 
-> **Reescrito el 2026-08-03.** La remediación original (*"invertir el default"*) **dejaría cajas sin
-> ninguna vía de acceso**. Duplicado parcial de SO-2026-06-30-02.
+> **Rewritten on 2026-08-03.** The original remediation (*"invert the default"*) **would leave boxes without
+> any access path**. Partial duplicate of SO-2026-06-30-02.
 
-**Lo que es cierto.** `resolve_add_hive_harden_ssh` default `false` (`sy_orchestrator.rs:20113-20118`),
-sin fallback por env, igual en los tres flujos (worker/egress/ingress) — o sea **contrato de familia,
-no divergencia**. Con canal `ssh_password`, al terminar el join la caja conserva
+**What is true.** `resolve_add_hive_harden_ssh` defaults to `false` (`sy_orchestrator.rs:20113-20118`),
+with no env fallback, the same in the three flows (worker/egress/ingress) — that is, **a family contract,
+not a divergence**. With the `ssh_password` channel, when the join finishes the box keeps
 `PasswordAuthentication yes`.
 
-**La evidencia original estaba mal.** El hardening tiene **dos** callers:
-`apply_add_hive_ssh_controls_after_finalize` (gated por `harden_ssh`, `:20820`) y
-`finalize_spoke_key_persist` (**incondicional**, rama `ssh_access=key_only_persist`, `:20711`).
+**The original evidence was wrong.** The hardening has **two** callers:
+`apply_add_hive_ssh_controls_after_finalize` (gated by `harden_ssh`, `:20820`) and
+`finalize_spoke_key_persist` (**unconditional**, `ssh_access=key_only_persist` branch, `:20711`).
 
-**Impacto reencuadrado.** `add_hive` **nunca enciende** password auth; el canal previo al join es
-prerequisito del operador. En el camino recomendado (`ssh_key` sobre imagen cloud) el server ya viene
-con password OFF y el default `false` no deja nada abierto. El agujero solo aparece cuando el
-operador abrió password a mano — el caso que la doc ya cubre pasando `harden_ssh:true`.
+**Impact reframed.** `add_hive` **never turns on** password auth; the channel before the join is the
+operator's prerequisite. On the recommended path (`ssh_key` on a cloud image) the server already comes
+with password OFF and the default `false` leaves nothing open. The hole only appears when the
+operator opened password by hand — the case the doc already covers by passing `harden_ssh:true`.
 
-**Se retiró "invertir el default".** `harden_ssh=true` + el default `ssh_access=revoke` = caja **sin
-password, sin key de MB y sin sudoers** → recuperable solo por consola del hipervisor. Choca de
-frente con el invariante que el propio código declara: *"verify-before-revoke that never strands a
+**"Invert the default" was withdrawn.** `harden_ssh=true` + the default `ssh_access=revoke` = a box **with no
+password, no MB key and no sudoers** → recoverable only through the hypervisor console. It collides
+head-on with the invariant the code itself declares: *"verify-before-revoke that never strands a
 spoke"* (`:20121-20132`).
 
-**Dos opciones sanas, a decidir por el operador:**
+**Two sound options, for the operator to decide:**
 
-- **(a)** Que `ssh_password` implique `ssh_access=key_only_persist` — hardena **y** deja llave
-  per-spoke verificada en el vault. Cierra el agujero **sin riesgo de lockout**, y no inventa nada:
-  es maquinaria que ya existe.
-- **(b)** Devolver `warnings: ["bootstrapped via ssh_password and PasswordAuthentication left
-  enabled"]`. El estado **ya es consultable**; lo que falta es el warning.
+- **(a)** Make `ssh_password` imply `ssh_access=key_only_persist` — it hardens **and** leaves a verified
+  per-spoke key in the vault. It closes the hole **with no lockout risk**, and it invents nothing:
+  it is machinery that already exists.
+- **(b)** Return `warnings: ["bootstrapped via ssh_password and PasswordAuthentication left
+  enabled"]`. The state **can already be queried**; what is missing is the warning.
 
-**Corregir el HANDBOOK:** el slogan *"Entra abierta, sale cerrada"* (`:524`) y la trampa 10 (`:532`)
-**inducen el error** — en combinación con el revoke por default es justo lo que dejó las cajas del
-despliegue del 2026-07-29 sin ninguna vía SSH.
+**Correct the HANDBOOK:** the slogan *"Goes in open, comes out locked"* (`:524`) and trap 10 (`:532`)
+**lead to the error** — combined with the default revoke, it is exactly what left the boxes of the
+2026-07-29 deployment without any SSH path.
 
 <a id="pb-6b"></a>
-### PB-6b ✅ **CERRADO** — `harden_ssh_applied` era un eco del request, no un hecho medido
+### PB-6b ✅ **CLOSED** — `harden_ssh_applied` was an echo of the request, not a measured fact
 
-Defecto real **en la dirección opuesta** al hallazgo, encontrado al refutarlo. Los tres flujos
-(`worker`/`egress`/`ingress`) devolvían literalmente `"harden_ssh_applied": harden_ssh` — el flag
-pedido, no lo ocurrido. Con `ssh_access=key_only_persist`, que **hardena incondicionalmente**, un join
-con `harden_ssh:false` dejaba la caja **con password auth apagado y verificado** mientras le informaba
-al operador que seguía encendido. Un dato de seguridad, mal.
+A real defect **in the opposite direction** to the finding, found while refuting it. The three flows
+(`worker`/`egress`/`ingress`) literally returned `"harden_ssh_applied": harden_ssh` — the requested
+flag, not what happened. With `ssh_access=key_only_persist`, which **hardens unconditionally**, a join
+with `harden_ssh:false` left the box **with password auth off and verified** while telling
+the operator that it was still on. A security fact, wrong.
 
-**Arreglado:** `harden_ssh_applied` es ahora un campo medido que viaja en
-`AddHiveSshControlsResult` / `SpokeKeyPersistResult` desde donde el trabajo efectivamente ocurre — en
-la rama gated, tras propagar con `?` el `disable` + `verify`; en la rama persist, `true` en **los dos**
-caminos de retorno, porque el harden ya sucedió antes del punto de decisión del verify-before-revoke.
-*(El camino `socket_only` sigue reportando `false`, que ahí es lo correcto: no toca SSH.)*
+**Fixed:** `harden_ssh_applied` is now a measured field that travels in
+`AddHiveSshControlsResult` / `SpokeKeyPersistResult` from where the work actually happens — in
+the gated branch, after propagating the `disable` + `verify` with `?`; in the persist branch, `true` on **both**
+return paths, because the harden already happened before the verify-before-revoke decision point.
+*(The `socket_only` path still reports `false`, which is correct there: it does not touch SSH.)*
 
-**Falta la comprobación en vivo:** confirmarlo de punta a punta exige un `add_hive` nuevo. Compila y
-el cambio es local al reporte, pero **todavía no lo vi contra una caja real.**
+**The live check is missing:** confirming it end to end requires a new `add_hive`. It compiles and
+the change is local to the report, but **I have not seen it against a real box yet.**
 
 ---
 
 <a id="pb-7"></a>
-## PB-7 ✅ **CERRADO** — El `add_hive` real dura más que la ventana de respuesta del admin (180 s) — y en ese rato el plano de control del hive queda **bloqueado**
+## PB-7 ✅ **CLOSED** — The real `add_hive` lasts longer than the admin's response window (180 s) — and during that time the hive's control plane is **blocked**
 
-**Qué pasa.** `JSR_ADMIN_ADD_HIVE_TIMEOUT_SECS` default 180 s (`sy_admin.rs:13648-13653`) contra un
-`add_hive` **medido en >6 min**. El cliente recibe `{"error_code":"TIMEOUT"}` sobre una operación que
-sigue corriendo y suele terminar bien.
+**What happens.** `JSR_ADMIN_ADD_HIVE_TIMEOUT_SECS` defaults to 180 s (`sy_admin.rs:13648-13653`) against an
+`add_hive` **measured at >6 min**. The client receives `{"error_code":"TIMEOUT"}` on an operation that
+keeps running and usually finishes well.
 
-**Dónde se va el tiempo (corregido).** **No** en los gates: topean en ~150 s en cualquier camino de
-falla, porque el gate de LSA solo corre si el WAN salió bien. El costo dominante es la **fase SSH
-previa**: `sync_core_to_worker` + `sync_vendor_to_worker` (~35 MB) + decenas de `ssh` con
-`ConnectTimeout=10` pero **sin timeout total** y con reintentos. **Esa fase no tiene techo.**
+**Where the time goes (corrected).** **Not** in the gates: they cap at ~150 s on any failure
+path, because the LSA gate only runs if the WAN one passed. The dominant cost is the **earlier SSH
+phase**: `sync_core_to_worker` + `sync_vendor_to_worker` (~35 MB) + dozens of `ssh` calls with
+`ConnectTimeout=10` but **no total timeout** and with retries. **That phase has no ceiling.**
 
-**Lo que NO es.** No es divergencia ni olvido: el 180 es deliberado, es la ventana **más larga** de la
-familia (update 60 / sync_hint 45 / genérico 30). Es un contrato que la realidad desbordó.
+**What it is NOT.** It is neither a divergence nor an oversight: the 180 is deliberate, it is the **longest** window in the
+family (update 60 / sync_hint 45 / generic 30). It is a contract that reality overflowed.
 
-**La mitigación que estaba escrita es falsa a medias.** *"Queda pending y el reintento es
-idempotente"* vale **solo** si el corte cae después de `write_hive_info` (`:18362`). Durante la fase
-SSH **no hay `info.yaml`**: el reintento **borra el directorio y re-bootstrapea de cero**.
+**The mitigation that was written down is half false.** *"It stays pending and the retry is
+idempotent"* holds **only** if the cut falls after `write_hive_info` (`:18362`). During the SSH
+phase **there is no `info.yaml`**: the retry **deletes the directory and re-bootstraps from zero**.
 
-**Y "reintentá para ver el estado" es imposible durante el join.** Todo `ADMIN_COMMAND` va a un
-**único canal serial** que `add_hive` ocupa entero, además **bloqueando el thread con
-`std::thread::sleep` en código async** (`:21726`). `get_hive`/`list_hives`/`hive_status` se encolan,
-vencen a los 30 s del lado del cliente, y **después se ejecutan tarde**.
+**And "retry to see the state" is impossible during the join.** Every `ADMIN_COMMAND` goes to a
+**single serial channel** that `add_hive` occupies entirely, also **blocking the thread with
+`std::thread::sleep` in async code** (`:21726`). `get_hive`/`list_hives`/`hive_status` queue up,
+expire after 30 s on the client side, and **then run late**.
 
-**Opciones (ninguna es "subir el default a 240"):**
+**Options (none of them is "raise the default to 240"):**
 
-1. Subir el default es **placebo**: para cubrir el caso medido harían falta ~600 s de ventana HTTP.
-2. **Lo correcto:** partir `add_hive` en **aceptación + trabajo en background** — responder `202` con
-   el hive en estado `joining`, correr el flujo en una tarea propia (lo que además saca el
-   `std::thread::sleep` del executor) y **dejar el canal admin libre**. Cierra PB-7 y U-8a juntos:
-   son el mismo hueco visto por dos puntas.
-3. **Barato y honesto mientras tanto:** escribir `info.yaml` con `status: joining` **al principio**
-   del flujo, y que el TIMEOUT devuelva un cuerpo que lo diga. Sin (2) igual no se puede consultar
-   hasta que el worker se libere — decirlo explícito.
-4. Documentar en el HANDBOOK que **un TIMEOUT de `add_hive` no significa fracaso**.
+1. Raising the default is a **placebo**: covering the measured case would need a ~600 s HTTP window.
+2. **The right thing:** split `add_hive` into **acceptance + background work** — reply `202` with
+   the hive in `joining` state, run the flow in its own task (which also takes the
+   `std::thread::sleep` off the executor) and **leave the admin channel free**. It closes PB-7 and U-8a together:
+   they are the same gap seen from two ends.
+3. **Cheap and honest in the meantime:** write `info.yaml` with `status: joining` **at the start**
+   of the flow, and have the TIMEOUT return a body that says so. Without (2) it still cannot be queried
+   until the worker frees up — say so explicitly.
+4. Document in the HANDBOOK that **an `add_hive` TIMEOUT does not mean failure**.
 
 ---
 
 <a id="pb-8"></a>
-## PB-8 ✅ CERRADO y VALIDADO en vivo (solo reporta) — El modelo de egress **no tiene historia para motherbee** — y motherbee es donde corren los nodos que llaman a internet
+## PB-8 ✅ CLOSED and VALIDATED live (only reports) — The egress model **has no story for motherbee** — and motherbee is where the nodes that call the internet run
 
-> **Reescrito el 2026-08-03.** El arreglo que sugería el título anterior (*"propagar `gateway_ip` a
-> MB"*) **es un lockout del plano de control**.
+> **Rewritten on 2026-08-03.** The fix the previous title suggested (*"propagate `gateway_ip` to
+> MB"*) **is a control-plane lockout**.
 
-**Qué es (no lo que decía).** `egress.gateway_ip` en el hive.yaml de MB significa, por contrato
-explícito y documentado, *"por dónde salen los **workers**"* (`sy_orchestrator.rs:181-184`). No es un
-valor que "no se propaga": **nunca fue para MB**. La exclusión es un brazo explícito junto a Ingress
-(`:5604`), no un olvido.
+**What it is (not what it said).** `egress.gateway_ip` in MB's hive.yaml means, by explicit
+and documented contract, *"where the **workers** go out"* (`sy_orchestrator.rs:181-184`). It is not a
+value that "does not propagate": **it was never for MB**. The exclusion is an explicit arm next to Ingress
+(`:5604`), not an oversight.
 
-**El hueco real.** `base-nodes.json` bootea `IO.slack.default@motherbee`, `IO.wapp.default@motherbee`
-y `AI.chat@motherbee`. O sea: el único hive que el modelo de egress **no** rutea es justo el que
-hostea a todos los que llaman a OpenAI/Slack/Meta. *(Y `handbook:156` dice "internal hives can reach
-the internet through it" cuando el código solo cubre workers → corregir a "workers".)*
+**The real gap.** `base-nodes.json` boots `IO.slack.default@motherbee`, `IO.wapp.default@motherbee`
+and `AI.chat@motherbee`. That is: the only hive the egress model does **not** route is exactly the one that
+hosts everyone who calls OpenAI/Slack/Meta. *(And `handbook:156` says "internal hives can reach
+the internet through it" when the code only covers workers → correct it to "workers".)*
 
-**Consecuencia correcta** (reemplaza a *"saldría por la red de admin"*): MB sale hoy por el SNAT del
-hipervisor, **una excepción temporal marcada para cerrarse**. Cuando se cierre, MB pierde internet y
-no hay mecanismo gestionado para devolvérsela. La red de admin está en **los dos** caminos — la pata
-WAN del propio egress es `192.168.8.240` — así que el problema no es "sale por admin", es **"sale por
-fuera del chokepoint gestionado"**, donde el spec §11 reserva allow-list y logging.
+**Correct consequence** (it replaces *"it would go out through the admin network"*): MB goes out today through the
+hypervisor's SNAT, **a temporary exception marked to be closed**. When it is closed, MB loses internet and
+there is no managed mechanism to give it back. The admin network is on **both** paths — the egress's own
+WAN leg is `192.168.8.240` — so the problem is not "it goes out through admin", it is **"it goes out
+outside the managed chokepoint"**, where spec §11 reserves an allow-list and logging.
 
-**⛔ Arreglo prohibido:** agregar `HiveRole::Motherbee` al brazo `Worker` de `reconcile_egress`.
-Pondría al **plano de control** a reescribirse su default route en cada boot y cada tick de watchdog,
-desde un campo de yaml, sin rollback, en la caja que provisiona el egress. Para un worker el fallo es
-no-fatal **por diseño**; en MB es **lockout**.
+**⛔ Forbidden fix:** adding `HiveRole::Motherbee` to the `Worker` arm of `reconcile_egress`.
+It would set the **control plane** to rewrite its own default route on every boot and every watchdog tick,
+from a yaml field, with no rollback, on the box that provisions the egress. For a worker the failure is
+non-fatal **by design**; on MB it is a **lockout**.
 
-**Opciones (ninguna se implementa sin OK):** (a) la ruta de MB la configura el operador a nivel
-SO/netplan y Fluxbee solo la **verifica** y grita si no coincide (read-only, sin riesgo); (b) campo
-separado y explícito `egress.motherbee_route: true` (opt-in, **nunca** por herencia del campo de
-workers), con gate de alcanzabilidad y sin re-aplicación en watchdog; (c) mover los nodos que llaman
-a internet a un worker — la única opción que ya funciona hoy.
+**Options (none is implemented without an OK):** (a) the operator configures MB's route at the
+OS/netplan level and Fluxbee only **verifies** it and shouts if it does not match (read-only, no risk); (b) a
+separate, explicit field `egress.motherbee_route: true` (opt-in, **never** inherited from the workers'
+field), with a reachability gate and no re-application in the watchdog; (c) move the nodes that call
+the internet to a worker — the only option that already works today.
 
-**La trampa más inmediata, que faltaba:** hoy **no rutea nadie** por el egress — MB aún no declara la
-sección y worker1 se unió antes, y la inyección solo alcanza a workers provisionados **después**.
-Y `packaging/hive.yaml.example` **ni siquiera tiene la sección `egress:`** de nivel raíz, así que
-declararla es una edición a mano no documentada.
+**The most immediate trap, which was missing:** today **nobody routes** through the egress — MB does not
+declare the section yet, worker1 joined before, and the injection only reaches workers provisioned **afterwards**.
+And `packaging/hive.yaml.example` **does not even have the root-level `egress:` section**, so
+declaring it is an undocumented hand edit.
 
 ---
 
 <a id="pb-9"></a>
-## PB-9 ✅ **CERRADO** — Todo restart de `sy-vault` reinicia un `SY.edge` **sano** → bache en el HTTPS público
+## PB-9 ✅ **CLOSED** — Every restart of `sy-vault` restarts a **healthy** `SY.edge` → blip in the public HTTPS
 
-> Descubierto por la auditoría adversarial del 2026-08-03, mientras se refutaba PB-4. No estaba en
-> ningún hallazgo.
+> Discovered by the adversarial audit of 2026-08-03, while PB-4 was being refuted. It was not in
+> any finding.
 
-`sy_vault` emite `VAULT_SECRET_CHANGED op=put` por **cada secreto que tiene** durante su propio
-arranque (`sy_vault.rs:246-260`, `530-596`) — es su bootstrap, no un cambio real. Y
-`tls_secret_change_action` (`sy_edge.rs:1690-1715`) **no mira `action="bootstrap"`**: si la key
-coincide con `tls_vault_key`, dispara el `exit(0)` de recarga.
+`sy_vault` emits `VAULT_SECRET_CHANGED op=put` for **every secret it holds** during its own
+startup (`sy_vault.rs:246-260`, `530-596`) — it is its bootstrap, not a real change. And
+`tls_secret_change_action` (`sy_edge.rs:1690-1715`) **does not look at `action="bootstrap"`**: if the key
+matches `tls_vault_key`, it triggers the reload `exit(0)`.
 
-**Consecuencia:** cada vez que `sy-vault` reinicia (upgrade del `.deb`, reboot, restart manual), el
-edge — que estaba perfecto — se recicla. En el HTTPS público eso es un bache de ~5 s.
+**Consequence:** every time `sy-vault` restarts (`.deb` upgrade, reboot, manual restart), the
+edge — which was perfectly fine — gets recycled. In the public HTTPS that is a ~5 s blip.
 
-**Arreglo:** que `tls_secret_change_action` devuelva `NoAction` cuando el evento viene marcado como
-bootstrap, o que `sy_vault` no emita `op=put` por secretos preexistentes en su arranque. Lo primero
-es más chico y local; lo segundo arregla también a cualquier otro suscriptor. Hay que mirar quién más
-reacciona a `VAULT_SECRET_CHANGED` (io.slack lo hace) antes de elegir.
+**Fix:** have `tls_secret_change_action` return `NoAction` when the event comes marked as
+bootstrap, or have `sy_vault` not emit `op=put` for pre-existing secrets on its startup. The first one
+is smaller and local; the second one also fixes any other subscriber. Who else reacts to
+`VAULT_SECRET_CHANGED` (io.slack does) must be checked before choosing.
 
 
 ---
 ---
 
-# Serie U — el sistema de update
+# Series U — the update system
 
-> Auditado el **2026-07-30**, antes de usarlo, con verificación adversarial y comprobación en las
-> máquinas de producción. El disparador fue la decisión del operador: *"para resolver los problemas en
-> prod sería mejor tener el update andando bien, y después ir por los bugs"*.
+> Audited on **2026-07-30**, before using it, with adversarial verification and checks on the
+> production machines. The trigger was the operator's decision: *"para resolver los problemas en
+> prod sería mejor tener el update andando bien, y después ir por los bugs"* (to solve the problems
+> in prod, it would be better to have the update working well, and then go after the bugs).
 >
-> **Lo que hay construido funciona más de lo que uno esperaría** — hay manifest con sha256, copia
-> atómica con `rename()`, backup de los binarios previos, rollback local ante fallo, gate de
-> staleness por hash, y para *runtimes* hasta fanout con `sync_to`/`update_to`. El problema no es que
-> falte maquinaria: son **dos defectos puntuales que la vuelven inoperable**, y ambos son silenciosos.
+> **What is built works better than one would expect** — there is a manifest with sha256, an atomic
+> copy with `rename()`, a backup of the previous binaries, a local rollback on failure, a staleness
+> gate by hash, and for *runtimes* even a fanout with `sync_to`/`update_to`. The problem is not missing
+> machinery: it is **two specific defects that make it inoperable**, and both are silent.
 
 <a id="u-1"></a>
-## U-1 ✅ CERRADO — El update del core reportaba éxito **sin reiniciar nada**
+## U-1 ✅ CLOSED — The core update reported success **without restarting anything**
 
-La función que corre después de intercambiar los binarios se llama
-`restart_local_core_services_with_health_gate`… y llama a **`systemctl start`**:
+The function that runs after swapping the binaries is called
+`restart_local_core_services_with_health_gate`… and it calls **`systemctl start`**:
 
 ```rust
 // src/bin/sy_orchestrator.rs:3248
 systemd_start(&service)?;          // fn systemd_start -> Command::new("systemctl").arg("start")
 wait_for_service_active(&service, …).await?;
-restarted.push(service);           // <-- y lo reporta como "restarted"
+restarted.push(service);           // <-- and reports it as "restarted"
 ```
 
-`systemctl start` sobre un servicio **que ya está corriendo** es un no-op: systemd devuelve éxito y no
-hace nada. El proceso sigue ejecutando el binario viejo (el inode anterior, todavía mapeado). Pero el
-nombre se apila en `restarted` y la API responde `status: ok` con la lista completa.
+`systemctl start` on a service **that is already running** is a no-op: systemd returns success and does
+nothing. The process keeps executing the old binary (the previous inode, still mapped). But the
+name is pushed onto `restarted` and the API replies `status: ok` with the full list.
 
-**No existe ningún `systemd_restart` en el archivo.** Las rutas remotas (por SSH, líneas 6361/6512/6678
-y 16168) sí usan `systemctl restart` — o sea que **la ruta local es la divergente**, que por la regla
-de mirar a los pares es justo la señal de dónde está el bug.
+**There is no `systemd_restart` anywhere in the file.** The remote paths (over SSH, lines 6361/6512/6678
+and 16168) do use `systemctl restart` — so **the local path is the divergent one**, which, by the rule
+of looking at the peers, is exactly the signal of where the bug is.
 
-**Por qué es el peor tipo de fallo:** los binarios *sí* quedan cambiados en `/usr/bin`. El update
-entonces "funciona"… en el próximo reboot. Alguien puede correr el update, ver `ok`, reiniciar la
-máquina por otra razón días después, y concluir que el mecanismo anda bien.
+**Why it is the worst kind of failure:** the binaries *are* left swapped in `/usr/bin`. So the update
+"works"… on the next reboot. Someone can run the update, see `ok`, reboot the
+machine for some other reason days later, and conclude that the mechanism works fine.
 
-### Se descartó la explicación inocente
+### The innocent explanation was ruled out
 
-Antes de tocar nada verifiqué si el flujo **detenía** los servicios antes de intercambiar los
-binarios — en ese caso `start` habría sido correcto. **No los detiene:** los binarios se cambian en
-caliente y el propio comentario del código dice la intención,
+Before touching anything I checked whether the flow **stopped** the services before swapping the
+binaries — in that case `start` would have been correct. **It does not stop them:** the binaries are swapped
+hot, and the code's own comment states the intent,
 *"re-render units and daemon-reload BEFORE the restart, so the new binaries start under the new
-units"*. Además el camino de rollback vuelve a llamar la misma función esperando que los servicios
-levanten con el binario restaurado — que con `start` tampoco ocurriría.
+units"*. Also, the rollback path calls the same function again, expecting the services to
+come up with the restored binary — which would not happen with `start` either.
 
-### Arreglo aplicado
+### Fix applied
 
-`systemd_start` → `systemd_restart` (función nueva, alineada con la ruta remota). `systemd_start`
-**se conserva** porque sigue siendo correcto en los 5 lugares donde se arranca algo que no está
-corriendo.
+`systemd_start` → `systemd_restart` (a new function, aligned with the remote path). `systemd_start`
+**is kept** because it is still correct in the 5 places where something that is not running
+gets started.
 
-### ✅ VALIDADO EN VIVO — `update category=core` contra el worker de producción
+### ✅ VALIDATED LIVE — `update category=core` against the production worker
 
-Escenario ideal, y se dio solo: el worker corría `sy-orchestrator` del join original (17:11)
-mientras syncthing ya le había entregado el binario nuevo en `dist/core/bin`. O sea, exactamente
-el estado que U-1 dejaba congelado.
+An ideal scenario, and it came about by itself: the worker was running the `sy-orchestrator` from the original join (17:11)
+while syncthing had already delivered the new binary to it in `dist/core/bin`. That is, exactly
+the state that U-1 left frozen.
 
 ```text
-ANTES   pid=4027   desde 17:11:10   /usr/bin/sy-orchestrator = 0716f1f1…
-        dist/core/bin/sy-orchestrator = 1e2726ed…            <- delta real
+BEFORE  pid=4027   since 17:11:10   /usr/bin/sy-orchestrator = 0716f1f1…
+        dist/core/bin/sy-orchestrator = 1e2726ed…            <- real delta
 
-DESPUES pid=54775  desde 22:25:27   exe=/usr/bin/sy-orchestrator   (SIN "(deleted)")
-        /usr/bin = 1e2726ed… = dist                          <- promovido
+AFTER   pid=54775  since 22:25:27   exe=/usr/bin/sy-orchestrator   (NO "(deleted)")
+        /usr/bin = 1e2726ed… = dist                          <- promoted
 ```
 
-**El assert de `/proc/PID/exe` pasa en los tres servicios probados.** Antes del arreglo, el update
-habría contestado `ok` con los servicios intactos y `exe` apuntando a un inode borrado.
+**The `/proc/PID/exe` assert passes on the three services tested.** Before the fix, the update
+would have answered `ok` with the services untouched and `exe` pointing to a deleted inode.
 
-El worker quedó con 10 servicios corriendo, 0 fallidas, y `connected` en el mesh.
+The worker ended up with 10 services running, 0 failed, and `connected` in the mesh.
 
-**Lo que el mismo test destapó**: la llamada devolvió `TIMEOUT` a los 60 s aunque la operación
-**sí se completó**. Es esperable —el update reinicia al propio `sy-orchestrator` del destino, que
-es quien debía responder— pero le da al operador un `error` sobre una operación exitosa. Se suma a
+**What the same test uncovered**: the call returned `TIMEOUT` after 60 s even though the operation
+**did complete**. It is to be expected —the update restarts the target's own `sy-orchestrator`, which
+is the one that had to reply— but it gives the operator an `error` on a successful operation. It is added to
 [U-8](#u-8).
 
-**Test que falta** (hoy tiene que fallar, y esa es la prueba):
+**Missing test** (today it has to fail, and that is the proof):
 
 ```bash
 p=$(systemctl show -p MainPID --value sy-config-routes)
-readlink /proc/$p/exe        # si dice "(deleted)" -> corre el binario viejo
-systemctl show -p ActiveEnterTimestamp --value sy-config-routes   # anterior al update
+readlink /proc/$p/exe        # if it says "(deleted)" -> it runs the old binary
+systemctl show -p ActiveEnterTimestamp --value sy-config-routes   # earlier than the update
 ```
 
 ---
 
 <a id="u-2"></a>
-## U-2 ✅ CERRADO — Ingress y egress no tenían canal de core
+## U-2 ✅ CLOSED — Ingress and egress had no core channel
 
-El `hive.yaml` que motherbee escribe para esos dos roles trae el canal **apagado a mano**, sin
-parámetro:
+The `hive.yaml` that motherbee writes for those two roles comes with the channel **turned off by hand**, with no
+parameter:
 
 ```
 src/bin/sy_orchestrator.rs:18211  (egress)   dist:\n  path: "…"\n  sync:\n    enabled: false
 src/bin/sy_orchestrator.rs:18839  (ingress)  dist:\n  path: "…"\n  sync:\n    enabled: false
 ```
 
-El **worker** lo tiene parametrizado (línea 17440) y en prod está en `true`. **Verificado en las
-máquinas de producción:**
+The **worker** has it parameterized (line 17440) and in prod it is `true`. **Verified on the
+production machines:**
 
 ```text
 ingress1  dist.sync.enabled: false      worker1  dist.sync.enabled: true
 ```
 
-`POST /hives/ingress1/update {category:"core"}` se queda en `202 sync_pending` para siempre, y el
-mensaje no dice que el canal **no existe**.
+`POST /hives/ingress1/update {category:"core"}` stays at `202 sync_pending` forever, and the
+message does not say that the channel **does not exist**.
 
-### La maquinaria ya está ahí — falta compartir la carpeta
+### The machinery is already there — what is missing is sharing the folder
 
-**El canal de software de fluxbee es syncthing, no SSH.** SSH existe solo para el bootstrap del
-`add_hive`; que se revoque al cerrar el join es el comportamiento correcto y deseado, no un segundo
-problema. Verificado en las máquinas de producción:
+**fluxbee's software channel is syncthing, not SSH.** SSH exists only for the `add_hive`
+bootstrap; that it gets revoked when the join closes is the correct and desired behavior, not a second
+problem. Verified on the production machines:
 
-| carpeta syncthing | worker1 | ingress1 |
+| syncthing folder | worker1 | ingress1 |
 |---|---|---|
-| `fluxbee-blob` → `blob/active` | `sendreceive` | **ausente** ← correcto, invariante P5 |
+| `fluxbee-blob` → `blob/active` | `sendreceive` | **absent** ← correct, invariant P5 |
 | `fluxbee-blob-public` → `blob/public` | — | `receiveonly` |
-| **`fluxbee-dist` → `dist/`** | **`receiveonly`** | **AUSENTE** ← *esto* es el bug |
-| devices emparejados | 8 | 6 |
+| **`fluxbee-dist` → `dist/`** | **`receiveonly`** | **ABSENT** ← *this* is the bug |
+| paired devices | 8 | 6 |
 
-O sea: **syncthing ya corre en el ingress, ya está emparejado con motherbee, y ya recibe una carpeta
-en receive-only.** No hay que montar infraestructura nueva ni reabrir ningún canal: falta compartirle
-`fluxbee-dist`, con exactamente la misma postura `receiveonly` que ya tiene el worker.
+That is: **syncthing already runs on the ingress, is already paired with motherbee, and already receives a folder
+in receive-only.** There is no need to set up new infrastructure or reopen any channel: what is missing is sharing
+`fluxbee-dist` with it, with exactly the same `receiveonly` posture the worker already has.
 
-**Y no choca con la invariante del DMZ.** `docs/io-blob-spec-v1.md:53` (P5) y la línea 278 son
-específicas de **blob**: *"DMZ never receives `active/`… nunca agregar ingress como device del folder
-`fluxbee-blob`"*. `fluxbee-dist` es distribución de software, no contenido de blobs; la invariante no
-lo alcanza. (Una auditoría automática de este hallazgo confundió las dos carpetas y puso una salvedad
-que no aplica — queda anotado para que no se propague.)
+**And it does not clash with the DMZ invariant.** `docs/io-blob-spec-v1.md:53` (P5) and line 278 are
+specific to **blob**: *"DMZ never receives `active/`… never add ingress as a device of the
+`fluxbee-blob` folder"*. `fluxbee-dist` is software distribution, not blob content; the invariant does not
+reach it. (An automated audit of this finding confused the two folders and added a caveat
+that does not apply — it is noted here so that it does not spread.)
 
-### La causa raíz real: `public_only` hace dos trabajos
+### The real root cause: `public_only` does two jobs
 
-El `hive.yaml` era la mitad visible. La compuerta de verdad está en `reconcile_syncthing_peer_xml`:
+The `hive.yaml` was the visible half. The real gate is in `reconcile_syncthing_peer_xml`:
 
 ```rust
 if !public_only && dist.sync_enabled && dist_sync_tool_is_syncthing(dist) {
-    // crea fluxbee-dist + agrega el device
+    // creates fluxbee-dist + adds the device
 }
 ```
 
-Para el ingress `public_only = true`, así que **la carpeta se saltea sin importar `sync_enabled`**, y
-hay un test que fija ese comportamiento en la punta de motherbee
+For the ingress `public_only = true`, so **the folder is skipped regardless of `sync_enabled`**, and
+there is a test that pins that behavior on the motherbee end
 (`ingress_public_peer_profile_never_attaches_private_folders`).
 
-O sea que la bandera agrupa dos cosas: **(1)** no compartir `blob/active` — invariante P5, correcto —
-y **(2)** no compartir `dist/`, que es lo que deja al ingress sin camino de update. La invariante
-solo exige la primera.
+So the flag bundles two things: **(1)** not sharing `blob/active` — invariant P5, correct —
+and **(2)** not sharing `dist/`, which is what leaves the ingress with no update path. The invariant
+only requires the first one.
 
-### Por qué no alcanza con quitar el gate
+### Why removing the gate is not enough
 
-`dist/` no son solo los binarios del core: contiene `core/` (389 M), **`runtimes/` (64 M)** y
-`vendor/` (35 M). `runtimes/` es donde `SY.wf-rules` publica los paquetes de workflow — o sea,
-potencialmente contenido de clientes. Compartir `dist/` entero con una caja del DMZ le deja copia de
-**todos** los runtimes, incluidos los que ese nodo nunca va a ejecutar.
+`dist/` is not just the core binaries: it contains `core/` (389 M), **`runtimes/` (64 M)** and
+`vendor/` (35 M). `runtimes/` is where `SY.wf-rules` publishes the workflow packages — that is,
+potentially customer content. Sharing the whole `dist/` with a DMZ box leaves it a copy of
+**all** the runtimes, including those that node is never going to execute.
 
-### Diseño acordado con el operador (2026-07-30): **carpeta de dist por rol**
+### Design agreed with the operator (2026-07-30): **a dist folder per role**
 
 > *"me parece perfecto que sea carpeta dedicada por role de hive… así se sincroniza solo esa carpeta
-> según el role y minimizamos el tema de seguridad"*
+> según el role y minimizamos el tema de seguridad"* (it seems perfect to me for it to be a dedicated
+> folder per hive role… that way only that folder is synced, according to the role, and we minimize
+> the security issue)
 
-Cada rol recibe **solo lo que ese rol ejecuta**. Se apoya en dos cosas que **ya existen**:
+Each role receives **only what that role executes**. It relies on two things that **already exist**:
 
-1. **`core_component_names_for_role(&manifest, role)`** ya calcula el set de binarios por rol, desde
-   `system_nodes.<role>` del `hive.yaml`.
-2. **El bootstrap por SSH ya hace exactamente esto:** `sync_core_to_worker` usa ese mismo set en modo
-   `worker-bootstrap-minimal`. ⇒ **el scoping por rol ya está implementado en un camino y falta en el
-   otro** — otra vez la divergencia entre pares señalando la respuesta.
+1. **`core_component_names_for_role(&manifest, role)`** already computes the set of binaries per role, from
+   `system_nodes.<role>` in the `hive.yaml`.
+2. **The SSH bootstrap already does exactly this:** `sync_core_to_worker` uses that same set in
+   `worker-bootstrap-minimal` mode. ⇒ **scoping by role is already implemented on one path and missing on the
+   other** — once again the divergence between peers pointing to the answer.
 
-Y el patrón de carpeta acotada también existe: `fluxbee-blob` (privada, completa) vs
-`fluxbee-blob-public` (one-way, acotada a un subdirectorio).
+And the scoped-folder pattern also exists: `fluxbee-blob` (private, complete) vs
+`fluxbee-blob-public` (one-way, scoped to a subdirectory).
 
-**Forma propuesta:**
+**Proposed shape:**
 
 ```text
 MOTHERBEE                                   SPOKE
-dist/roles/<role>/core/bin/<set del rol>  ->  dist/core/bin/...     (mismo folder id,
-dist/roles/<role>/core/manifest.json      ->  dist/core/manifest.json  path distinto por device)
-dist/roles/worker/runtimes/               ->  dist/runtimes/        (solo roles que spawnean)
+dist/roles/<role>/core/bin/<role's set>   ->  dist/core/bin/...     (same folder id,
+dist/roles/<role>/core/manifest.json      ->  dist/core/manifest.json  different path per device)
+dist/roles/worker/runtimes/               ->  dist/runtimes/        (only roles that spawn)
 ```
 
-**Lo verificado que hace esto barato:** `local_core_bin_source_path` es fijo y
-`validate_core_manifest_for_bins` valida **solo los binarios que se le pasan** (los del rol), no
-exige que todo el manifest exista en disco. ⇒ si a cada spoke le llega su carpeta montada en `dist/`,
-ve `dist/core/bin/…` como siempre y **el camino de aplicación del update no se toca**.
+**What was verified that makes this cheap:** `local_core_bin_source_path` is fixed and
+`validate_core_manifest_for_bins` validates **only the binaries passed to it** (the role's), it does not
+require the whole manifest to exist on disk. ⇒ if each spoke gets its folder mounted at `dist/`,
+it sees `dist/core/bin/…` as always and **the update's apply path is not touched**.
 
-### Implementado — la forma final, y por qué difiere de la primera idea
+### Implemented — the final shape, and why it differs from the first idea
 
-Antes de escribir código se mapeó toda la superficie y se atacó el diseño de forma adversarial.
-**Tres objeciones resultaron correctas y fatales para el diseño tal como estaba enunciado**, cada
-una verificada a mano en el código:
+Before writing code, the whole surface was mapped and the design was attacked adversarially.
+**Three objections turned out to be correct and fatal to the design as it was stated**, each
+one verified by hand in the code:
 
-1. **Scopear "solo los binarios del rol" rompía al worker.** No existe `sync_runtime_to_worker`:
-   `runtimes/` viaja **únicamente** por syncthing, y es el único camino de entrega de paquetes
-   publicados. Un árbol con solo `core/bin` dejaba `publish --sync_to worker` roto para siempre.
-2. **Sacar `vendor/` congelaba syncthing en todos lados.** `update category=vendor` saca el hash
-   del binario de syncthing de ahí; sin eso, `MANIFEST_INVALID` permanente.
-3. **Un manifest recortado por rol rompía el gate de staleness.** El gate compara el sha256 del
-   `manifest.json` entre motherbee y el destino; un manifest por rol difiere por construcción, así
-   que **todo update quedaría rechazado como stale para siempre.**
+1. **Scoping "only the role's binaries" broke the worker.** There is no `sync_runtime_to_worker`:
+   `runtimes/` travels **only** over syncthing, and it is the only delivery path for published
+   packages. A tree with only `core/bin` left `publish --sync_to worker` broken forever.
+2. **Removing `vendor/` froze syncthing everywhere.** `update category=vendor` takes the hash
+   of the syncthing binary from there; without it, a permanent `MANIFEST_INVALID`.
+3. **A manifest trimmed per role broke the staleness gate.** The gate compares the sha256 of the
+   `manifest.json` between motherbee and the target; a per-role manifest differs by construction, so
+   **every update would be rejected as stale forever.**
 
-**La forma final** parte `dist` por **contenido** (los tres subdirectorios ya existían en disco y son
-hermanos, sin anidamiento) y scopea **por rol solo los binarios**:
+**The final shape** splits `dist` by **content** (the three subdirectories already existed on disk and are
+siblings, with no nesting) and scopes **only the binaries by role**:
 
-| folder | motherbee | spoke | quién |
+| folder | motherbee | spoke | who |
 |---|---|---|---|
-| `fluxbee-dist-core-<rol>` | `dist/core/<rol>` | `dist/core` | los hives de ese rol |
-| `fluxbee-dist-vendor` | `dist/vendor` | `dist/vendor` | todo hive con syncthing |
-| `fluxbee-dist-runtimes` | `dist/runtimes` | `dist/runtimes` | **solo worker** |
+| `fluxbee-dist-core-<role>` | `dist/core/<role>` | `dist/core` | the hives of that role |
+| `fluxbee-dist-vendor` | `dist/vendor` | `dist/vendor` | every hive with syncthing |
+| `fluxbee-dist-runtimes` | `dist/runtimes` | `dist/runtimes` | **worker only** |
 
-**El manifest viaja completo**, byte a byte igual al de motherbee, para que el gate de hash siga
-funcionando. Es metadata (nombres, versiones, hashes) — no ejecutables — así que la caja del DMZ
-sigue teniendo en disco **solo los binarios que corre**: el ingress recibe 4 en vez de 17, sin los
-181 MB de `sy_architect`, que es exclusivo de motherbee.
+**The manifest travels whole**, byte for byte the same as motherbee's, so that the hash gate keeps
+working. It is metadata (names, versions, hashes) — not executables — so the DMZ box
+still has on disk **only the binaries it runs**: the ingress receives 4 instead of 17, without the
+181 MB of `sy_architect`, which is exclusive to motherbee.
 
-**La asimetría de rutas es lo que evita tocar nada del lado del spoke:** motherbee sirve
-`dist/core/<rol>` y el spoke lo recibe como su propio `dist/core`, así que sigue leyendo
-`dist/core/bin/…` y `dist/core/manifest.json` con las mismas constantes de siempre.
+**The path asymmetry is what avoids touching anything on the spoke side:** motherbee serves
+`dist/core/<role>` and the spoke receives it as its own `dist/core`, so it keeps reading
+`dist/core/bin/…` and `dist/core/manifest.json` with the same constants as always.
 
-### Detalles que salieron del análisis y quedaron en el código
+### Details that came out of the analysis and stayed in the code
 
-- **El folder legado `fluxbee-dist` se REMUEVE, nunca se re-apunta.** `ensure_syncthing_folder_in_config_xml`
-  reescribe la ruta de un id que coincide, y un spoke `receiveonly` aplica los borrados remotos —
-  el mecanismo exacto del incidente ya registrado en este repo
-  (`CORE_DIAG_runtime_deletion_by_fluxbee_syncthing.md`, syncthing borró `runtimes/ai.common/0.1.2/**`).
-  Hubo que **escribir la primitiva de borrado de folder, que no existía**: todo el reconcile era aditivo.
-- **Carpetas creadas en modo aislado** (`ensure_isolated_...`), para que una carpeta nueva no herede
-  la lista de peers de otra y termine compartiéndose con hives que no corresponden.
-- **Copias, nunca hardlinks:** `build-deb.sh` e `install.sh` escriben con `install -m0755`, que hace
-  unlink+create — un hardlink quedaría apuntando al inode viejo mientras el manifest anuncia el nuevo.
-- **Escritura atómica** (temp + rename) del manifest y de cada binario: un lector no puede observar
-  un archivo a medio escribir.
-- **Poda:** un rol que deja de correr un servicio deja de recibir su binario.
-- **Pre-flight en motherbee:** si un rol reclama un componente que el build no trae, falla ahí, fuerte
-  y visible, en vez de producir un árbol corto que en el spoke sería un crash-loop.
-- **El `sync-hint` lo resuelve el hive destino.** El que pide nombra el *canal*, no el layout;
-  motherbee y los scripts e2e siguen mandando `folder_id: "fluxbee-dist"` sin cambios y el destino lo
-  expande a las carpetas que su rol realmente tiene, esperando **todas** (un canal parcialmente
-  convergido no está convergido).
-- **El egress entra a la malla.** Tenía syncthing apagado por rol en dos lugares duros; ahora lo
-  decide la config como todos. Fundamento del operador, correcto: syncthing no es un puerto plano —
-  el device ID **es** el hash del certificado TLS del peer y solo conectan devices explícitamente
-  emparejados.
+- **The legacy `fluxbee-dist` folder is REMOVED, never re-pointed.** `ensure_syncthing_folder_in_config_xml`
+  rewrites the path of an id that matches, and a `receiveonly` spoke applies remote deletions —
+  the exact mechanism of the incident already recorded in this repo
+  (`CORE_DIAG_runtime_deletion_by_fluxbee_syncthing.md`, syncthing deleted `runtimes/ai.common/0.1.2/**`).
+  The **folder-deletion primitive had to be written, since it did not exist**: the whole reconcile was additive.
+- **Folders created in isolated mode** (`ensure_isolated_...`), so that a new folder does not inherit
+  another one's peer list and end up shared with hives it does not belong to.
+- **Copies, never hardlinks:** `build-deb.sh` and `install.sh` write with `install -m0755`, which does
+  unlink+create — a hardlink would be left pointing to the old inode while the manifest announces the new one.
+- **Atomic write** (temp + rename) of the manifest and of each binary: a reader cannot observe
+  a half-written file.
+- **Pruning:** a role that stops running a service stops receiving its binary.
+- **Pre-flight on motherbee:** if a role claims a component that the build does not bring, it fails there, loud
+  and visible, instead of producing a short tree that on the spoke would be a crash-loop.
+- **The `sync-hint` is resolved by the target hive.** The requester names the *channel*, not the layout;
+  motherbee and the e2e scripts keep sending `folder_id: "fluxbee-dist"` unchanged and the target
+  expands it to the folders its role actually has, waiting for **all** of them (a partially
+  converged channel is not converged).
+- **The egress joins the mesh.** It had syncthing turned off by role in two hard-coded places; now the
+  config decides, as for everyone else. The operator's rationale, correct: syncthing is not a flat port —
+  the device ID **is** the hash of the peer's TLS certificate, and only explicitly paired devices
+  connect.
 
-**Tests:** 8 nuevos, incluida la reescritura del guardián de la invariante del DMZ, que ahora afirma
-algo más filoso: el ingress sigue **fuera** de `blob/active` (P5) pero **dentro** de su core y de
-vendor, y **fuera** de runtimes. Más uno que prueba que ninguna carpeta de dist se superpone en disco
-con otra. **140/140 en verde.**
+**Tests:** 8 new ones, including the rewrite of the DMZ invariant's guard, which now asserts
+something sharper: the ingress stays **out** of `blob/active` (P5) but **in** its core and
+vendor, and **out** of runtimes. Plus one that proves that no dist folder overlaps another one on disk.
+**140/140 green.**
 
-### Residual conocido
+### Known residual
 
-Motherbee materializa el set desde su `system_nodes.<rol>`, y el spoke valida contra la copia que
-motherbee le escribió en el join. Coinciden por construcción salvo que se edite el `hive.yaml` de
-motherbee **después** del join — que es [U-6](#u-4) (el `hive.yaml` nunca se re-emite a los spokes).
-Antes ese drift era inofensivo porque el árbol traía todo; ahora sería un crash-loop al boot del
-spoke. Bajo el modelo del operador ese cambio es un **major** (reinstalar desde cero), así que queda
-acotado — pero es la razón por la que U-6 sube de prioridad.
+Motherbee materializes the set from its `system_nodes.<role>`, and the spoke validates against the copy that
+motherbee wrote to it at join time. They match by construction unless motherbee's `hive.yaml` is edited
+**after** the join — which is [U-6](#u-4) (the `hive.yaml` is never re-emitted to the spokes).
+Before, that drift was harmless because the tree brought everything; now it would be a crash-loop at the
+spoke's boot. Under the operator's model that change is a **major** (reinstall from scratch), so it stays
+bounded — but it is the reason U-6 goes up in priority.
 
 ---
 
 <a id="u-3"></a>
-## U-3 ✅ **CERRADO** — El upgrade del `.deb` borra los runtimes publicados en caliente · **SOBREVIVE (y es peor)**
+## U-3 ✅ **CLOSED** — The `.deb` upgrade deletes the hot-published runtimes · **IT SURVIVES (and it is worse)**
 
-> **Sobrevivió la auditoría intacto en su núcleo**, pero estaba **mal calibrado en tres cosas y
-> subestimaba el daño en dos.** Reescrito el 2026-08-03.
+> **It survived the audit with its core intact**, but it was **miscalibrated in three things and
+> underestimated the damage in two.** Rewritten on 2026-08-03.
 
-`dist/runtimes/manifest.json` es un **archivo del paquete** (`dpkg -L fluxbee` lo lista **desde
-23c4175 / 2026-07-22**; los `.deb` anteriores no traen `dist/runtimes` en absoluto), y el único
-`conffile` declarado es `/etc/fluxbee/hive.yaml.example`. Un upgrade **lo pisa**.
+`dist/runtimes/manifest.json` is a **package file** (`dpkg -L fluxbee` lists it **since
+23c4175 / 2026-07-22**; earlier `.deb`s do not ship `dist/runtimes` at all), and the only
+declared `conffile` is `/etc/fluxbee/hive.yaml.example`. An upgrade **overwrites it**.
 
-**Corrección 1 — el GC no espera a nadie.** El texto decía *"el siguiente `update category=runtime`
-los recolecta"*. **No hace falta ninguna acción del operador:** la retención corre sola en el watchdog
-cada 300 s (`RUNTIME_VERIFY_INTERVAL_SECS`), y como el `postinst` reinicia `sy-orchestrator`, la
-pasada ocurre **a los pocos minutos del upgrade**.
+**Correction 1 — the GC waits for nobody.** The text said *"the next `update category=runtime`
+collects them"*. **No operator action is needed:** the retention runs by itself in the watchdog
+every 300 s (`RUNTIME_VERIFY_INTERVAL_SECS`), and since the `postinst` restarts `sy-orchestrator`, the
+pass happens **a few minutes after the upgrade**.
 
-**Corrección 2 — el borrado se parte en dos casos.** La retención también conserva lo que referencian
-los configs persistidos (`persisted_runtime_keep_versions_with_root`):
+**Correction 2 — the deletion splits into two cases.** The retention also keeps what the persisted
+configs reference (`persisted_runtime_keep_versions_with_root`):
 
-- **con instancia persistida** → el directorio sobrevive al GC y el proceso sigue corriendo, pero
-  queda **inarrancable**: cualquier `restart_node`/`run_node`/reboot da `RUNTIME_NOT_AVAILABLE`;
-- **sin instancia** (paquete de workflow recién publicado, runtime precargado) → **se borra el
-  directorio entero**.
+- **with a persisted instance** → the directory survives the GC and the process keeps running, but
+  it becomes **unstartable**: any `restart_node`/`run_node`/reboot gives `RUNTIME_NOT_AVAILABLE`;
+- **without an instance** (a freshly published workflow package, a preloaded runtime) → **the whole
+  directory is deleted**.
 
-En los dos casos el manifest miente.
+In both cases the manifest lies.
 
-**Corrección 3 — y esta es la grave: el arreglo de [U-10](#u-10) NO cubre esto.**
-`reconcile_persisted_custom_nodes` resuelve primero la **clave** del runtime contra el manifest y
-recién después la versión. Con la clave borrada, el *"que `current` signifique current"* **nunca
-llega a correr** y el nodo queda abandonado. O sea: tras el upgrade, **todo nodo montado sobre un
-runtime publicado en caliente queda huérfano igual que en U-10, y sin self-heal**.
+**Correction 3 — and this is the serious one: the [U-10](#u-10) fix does NOT cover this.**
+`reconcile_persisted_custom_nodes` resolves the runtime's **key** against the manifest first, and
+only then the version. With the key deleted, the *"that `current` means current"* **never gets to run**
+and the node is abandoned. That is: after the upgrade, **every node mounted on a
+hot-published runtime is left orphaned just as in U-10, and with no self-heal**.
 
-**Eso lo sube de "no bloquea (hoy)" a "bloquea el día que exista el primer runtime publicado en
-caliente" — y ese día ya llegó en el lab (`wf.router 0.0.4` en la hive 240).**
+**That raises it from "does not block (today)" to "blocks the day the first hot-published runtime
+exists" — and that day has already come in the lab (`wf.router 0.0.4` on hive 240).**
 
-**Corrección 4 — el merge NO hay que construirlo, ya existe.** `scripts/publish-runtime.sh` mergea
-(lee el manifest previo) y el instalador hermano ya lo usa así contra el root vivo
-(`install.sh:895-960`, `--dist-root /var/lib/fluxbee/dist`). **La divergencia es que el `.deb` lo
-ejecuta en BUILD-time contra el árbol staged en vez de en INSTALL-time contra el árbol vivo.** El
-encuadre correcto es *"de-divergir los dos instaladores llamando al merger que ya existe desde el
-postinst"*, no *"tres opciones abiertas"*. **Se descarta el camino `conffile`:** en un JSON generado
-deja `.dpkg-dist`/prompts y no mergea nada.
+**Correction 4 — the merge does NOT need to be built, it already exists.** `scripts/publish-runtime.sh` merges
+(it reads the previous manifest) and the sibling installer already uses it that way against the live root
+(`install.sh:895-960`, `--dist-root /var/lib/fluxbee/dist`). **The divergence is that the `.deb` runs it
+at BUILD time against the staged tree instead of at INSTALL time against the live tree.** The
+correct framing is *"de-diverge the two installers by calling the merger that already exists from the
+postinst"*, not *"three open options"*. **The `conffile` path is discarded:** on a generated JSON it
+leaves `.dpkg-dist`/prompts and merges nothing.
 
-**→ Toca packaging. A charlar con el operador antes de tocarlo.**
+**→ It touches packaging. To discuss with the operator before touching it.**
 
 ---
 
 <a id="u-4"></a>
-## U-4 — Verificación de compatibilidad entre motherbee y spokes · **partido en dos**
+## U-4 — Compatibility verification between motherbee and spokes · **split in two**
 
-> **El absoluto "cero verificación" es falso** y la remediación obvia (rechazar el peer por versión)
-> **se auto-cerca la malla**. Reescrito el 2026-08-03.
+> **The absolute "zero verification" is false** and the obvious remediation (rejecting the peer by version)
+> **self-fences the mesh**. Rewritten on 2026-08-03.
 
-**Lo que SÍ existe, y el hallazgo original negaba:** el spoke rechaza el `SYSTEM_UPDATE` con
-`VERSION_MISMATCH`/`sync_pending` (ejercitado en `orchestrator_system_update_stale_e2e.sh`);
-motherbee verifica el sha del manifest y de cada binario tras el push; y el runtime manifest tiene un
-contrato de compatibilidad cross-hive real, con rango soportado `1..=2` y gate de escritura
+**What DOES exist, and the original finding denied:** the spoke rejects the `SYSTEM_UPDATE` with
+`VERSION_MISMATCH`/`sync_pending` (exercised in `orchestrator_system_update_stale_e2e.sh`);
+motherbee verifies the sha of the manifest and of each binary after the push; and the runtime manifest has a
+real cross-hive compatibility contract, with the supported range `1..=2` and the write gate
 `FLUXBEE_RUNTIME_MANIFEST_WRITE_V2`.
 
-**Y la consecuencia estaba mal:** una rotura **dura** de protocolo **no es silenciosa** — el peer
-queda `stale` y toda acción hacia ese hive falla con *"target hive not reachable in LSA"*. Lo que sí
-degrada callado es un cambio **semántico**, porque serde tolera campos default/desconocidos. La
-mitigación (payload sin cambios de protocolo, ventana corta) sigue siendo la correcta, pero **por ese
-motivo**, no por "no hay ninguna red".
+**And the consequence was wrong:** a **hard** protocol break **is not silent** — the peer
+becomes `stale` and every action toward that hive fails with *"target hive not reachable in LSA"*. What does
+degrade quietly is a **semantic** change, because serde tolerates default/unknown fields. The
+mitigation (a payload with no protocol changes, a short window) is still the correct one, but **for that
+reason**, not because "there is no safety net at all".
 
-**Contrato de la casa, para que no se relea como omisión:** en fluxbee **el hash es la compuerta y la
-versión es telemetría**. Se ve igual en el reload de OPA: versión distinta → warn, hash distinto →
-rechazo.
+**The house contract, so that it is not reread as an omission:** in fluxbee **the hash is the gate and the
+version is telemetry**. It looks the same in the OPA reload: different version → warn, different hash →
+reject.
 
 <a id="u-4a"></a>
-### U-4a ✅ CERRADO y VALIDADO en vivo — El HELLO lleva versión de protocolo y nadie la mira
+### U-4a ✅ CLOSED and VALIDATED live — The HELLO carries a protocol version and nobody looks at it
 
-`WanHelloPayload` transporta `protocol: "fluxbee/1.16"` y existe `WanRejectPayload` (se usa para
-`HIVE_NOT_AUTHORIZED`), pero **`peer_hello.protocol` no se compara nunca**, y el
-`negotiated.protocol` que se devuelve es la constante local reescrita. Igual en los hermanos
-(`NodeHelloPayload.version`, `RouterHelloPayload.version`). **El campo existe y está muerto.**
+`WanHelloPayload` carries `protocol: "fluxbee/1.16"` and `WanRejectPayload` exists (it is used for
+`HIVE_NOT_AUTHORIZED`), but **`peer_hello.protocol` is never compared**, and the
+`negotiated.protocol` that is returned is the local constant, rewritten. The same in the siblings
+(`NodeHelloPayload.version`, `RouterHelloPayload.version`). **The field exists and is dead.**
 
-**⛔ Ojo con el arreglo obvio:** rechazar el peer sería **self-fencing** — el `SYSTEM_UPDATE`
-cross-hive viaja por la malla y exige visibilidad LSA del target, así que **cortar el peer viejo corta
-el único canal capaz de arreglarlo**. Corresponde (a) usar el campo solo para **reportar skew**, o
-(b) **borrarlo del contrato** para que no simule una garantía que no da. **Decisión de diseño → hablarlo.**
+**⛔ Watch out for the obvious fix:** rejecting the peer would be **self-fencing** — the cross-hive
+`SYSTEM_UPDATE` travels over the mesh and requires LSA visibility of the target, so **cutting off the old peer cuts
+the only channel able to fix it**. The right move is (a) to use the field only to **report skew**, or
+(b) to **delete it from the contract** so that it does not simulate a guarantee it does not give. **Design decision → talk it over.**
 
 <a id="u-4b"></a>
-### U-4b ✅ CERRADO y VALIDADO en vivo — Las drift-alerts **no se escriben nunca**
+### U-4b ✅ CLOSED and VALIDATED live — The drift-alerts **are never written**
 
-No son "informativas": `drift_alerts_path()` (→ `orchestrator/drift-alerts.jsonl`) **solo aparece en
-la ruta de lectura**. No hay un solo escritor en todo el repo — lo verifiqué por nombre de función y
-por nombre de archivo.
+They are not "informational": `drift_alerts_path()` (→ `orchestrator/drift-alerts.jsonl`) **only appears on
+the read path**. There is not a single writer in the whole repo — I verified it by function name and
+by file name.
 
-Lo que devuelve `GET /drift-alerts` son **entradas sintéticas** (`local_current_state`,
-`severity=info`) que `enrich_drift_alert_history_entries` fabrica **a partir del snapshot actual**
-cuando el hive local no tiene entradas en el archivo — o sea, **siempre**. El endpoint que el README
-documenta como *"Historical drift alert entries"* devuelve, en la práctica, **siempre** ese
+What `GET /drift-alerts` returns are **synthetic entries** (`local_current_state`,
+`severity=info`) that `enrich_drift_alert_history_entries` fabricates **from the current snapshot**
+when the local hive has no entries in the file — that is, **always**. The endpoint that the README
+documents as *"Historical drift alert entries"* returns, in practice, **always** that
 snapshot.
 
-> **Corrección mía (2026-08-05).** Acá había escrito *"un snapshot vivo disfrazado de historial,
-> peor que devolver vacío"*. **Es injusto con el código y lo retiro.** Las filas sintéticas dicen
-> literalmente *"No historical drift alert entry was recorded for this category"*, y viajan con
-> `severity: info`, `kind: local_current_state` y `synthetic: true` — un marcador documentado en
-> `README.md:1002`. No engañan: avisan. Además la síntesis **solo dispara si el hive local no
-> tiene filas reales**, así que se retira sola en cuanto exista un escritor.
+> **My own correction (2026-08-05).** Here I had written *"a live snapshot disguised as history,
+> worse than returning empty"*. **It is unfair to the code and I withdraw it.** The synthetic rows
+> literally say *"No historical drift alert entry was recorded for this category"*, and they travel with
+> `severity: info`, `kind: local_current_state` and `synthetic: true` — a marker documented in
+> `README.md:1002`. They do not deceive: they warn. Also, the synthesis **only fires if the local hive
+> has no real rows**, so it retires by itself as soon as a writer exists.
 >
-> O sea: la síntesis **no se toca**, no hay cambio de esquema y no hay decisión de producto
-> pendiente. El bug es **solo** el escritor que falta.
+> That is: the synthesis **is not touched**, there is no schema change and there is no pending product
+> decision. The bug is **only** the missing writer.
 
-Es el bug real detrás de U-4, **y es independiente de versiones**. Falta además: `GET /versions`
-agrega snapshots **sin emitir veredicto** (debería marcar qué hives difieren del de motherbee), y los
-contadores de reject del WAN son un `HashMap` privado sin superficie de consulta.
+It is the real bug behind U-4, **and it is independent of versions**. Also missing: `GET /versions`
+aggregates snapshots **without issuing a verdict** (it should flag which hives differ from motherbee's), and the
+WAN reject counters are a private `HashMap` with no query surface.
 
-**→ Escribir el emisor es diseño** (cuándo se emite, con qué severidad, cómo se deduplica, retención).
-**A charlar.** Lo que sí se puede cerrar solo es la mentira: o el endpoint declara que lo que devuelve
-es un snapshot, o deja de sintetizar.
+**→ Writing the emitter is design** (when it emits, with what severity, how it deduplicates, retention).
+**To discuss.** What can be closed on its own is the lie: either the endpoint declares that what it returns
+is a snapshot, or it stops synthesizing.
 
 ---
 
 <a id="u-5"></a>
-## U-5 ✅ CERRADO y VALIDADO en vivo — No hay rollback de core como comando · **gap, no bug**
+## U-5 ✅ CLOSED and VALIDATED live — There is no core rollback as a command · **gap, not bug**
 
-> Bajado de 🔴 el 2026-08-03: **"automático-solo" es el contrato de la familia** — vendor tampoco
-> tiene comando, y runtime no lo necesita porque está versionado.
+> Downgraded from 🔴 on 2026-08-03: **"automatic-only" is the family contract** — vendor does not
+> have a command either, and runtime does not need one because it is versioned.
 
-> **Cómo quedó:** existe `core_rollback` (`POST /hives/{hive}/core/rollback`): devuelve un spoke a la
-> generación sellada que reemplazó su último `update category=core`, con gate de salud y forward por
-> la malla; el motherbee no tiene generaciones (su core lo instala dpkg). Receta en el HANDBOOK,
-> "El rollback". Lo que sigue es el problema original.
+> **How it ended up:** `core_rollback` exists (`POST /hives/{hive}/core/rollback`): it returns a spoke to the
+> sealed generation that its last `update category=core` replaced, with a health gate and a forward over
+> the mesh; the motherbee has no generations (dpkg installs its core). Recipe in the HANDBOOK,
+> "The rollback". What follows is the original problem.
 
-Existe rollback **automático** (local, ante fallo detectado) y hay backup de los binarios previos en
-`/var/lib/fluxbee/orchestrator/core-bin.prev.local/update-<ms>/` *(ruta corregida)*. No hay acción de
-rollback de core: las únicas `*_rollback` son de vault, opa y wf_rules.
+There is an **automatic** rollback (local, on a detected failure) and there is a backup of the previous binaries in
+`/var/lib/fluxbee/orchestrator/core-bin.prev.local/update-<ms>/` *(corrected path)*. There is no core
+rollback action: the only `*_rollback` ones are for vault, opa and wf_rules.
 
-**Se borró la frase sobre U-1** (está cerrado). Lo que sí se sostiene: el rollback automático se
-dispara **solo si la unit no queda `active` en 30 s** — no detecta una regresión **funcional** (mesh
-roto, incompatibilidad con spokes) — **y además excluye a `sy-orchestrator`**, que se auto-reinicia
-sin verificación: si el binario nuevo del orchestrator crash-loopea, **no hay gate ni rollback**.
+**The sentence about U-1 was deleted** (it is closed). What does hold: the automatic rollback
+fires **only if the unit is not `active` within 30 s** — it does not detect a **functional** regression (a broken
+mesh, incompatibility with spokes) — **and it also excludes `sy-orchestrator`**, which restarts itself
+with no verification: if the orchestrator's new binary crash-loops, **there is no gate and no rollback**.
 
-**Ya existe media máquina:** `rollback_remote_core_to_prev` restaura la generación previa completa por
-SSH. Si se construye el comando, se construye **sobre eso** para spokes, no de cero.
+**Half the machinery already exists:** `rollback_remote_core_to_prev` restores the full previous generation over
+SSH. If the command is built, it is built **on top of that** for spokes, not from zero.
 
-**Y el downgrade de spokes ya es un flujo soportado:** `.deb` anterior en motherbee → dist →
-`update category=core`, porque el camino core es **por hash** y no tiene gate de monotonía. Lo único
-externo es conservar el `.deb`.
+**And downgrading spokes is already a supported flow:** the previous `.deb` on motherbee → dist →
+`update category=core`, because the core path is **by hash** and has no monotonicity gate. The only
+external part is keeping the `.deb`.
 
-**⛔ Advertencia obligatoria contra el arreglo obvio.** Un `core_rollback` que *"restaure el backup más
-reciente"* es **inseguro con el store actual**: (a) los directorios se crean **aunque no haya
-cambios**, así que el más reciente suele estar **vacío**; (b) `rollback_local_core_binaries` devuelve
-`Ok()` cuando **no encuentra** el backup — o sea, el comando contestaría `ok` sin restaurar nada,
-**exactamente el modo de falla de U-1**; (c) los directorios no llevan `manifest_hash` ni versión, así
-que *"rollback a la versión X"* **ni siquiera es expresable**.
-*Prerrequisitos:* etiquetar el backup con el `manifest_hash` que reemplazó · no crear directorio en el
-no-op · fallar fuerte si el backup no tiene los binarios · retención (reusar el patrón de runtimes).
+**⛔ Mandatory warning against the obvious fix.** A `core_rollback` that *"restores the most
+recent backup"* is **unsafe with the current store**: (a) the directories are created **even when there are no
+changes**, so the most recent one is usually **empty**; (b) `rollback_local_core_binaries` returns
+`Ok()` when it **does not find** the backup — that is, the command would answer `ok` without restoring anything,
+**exactly U-1's failure mode**; (c) the directories carry no `manifest_hash` or version, so
+*"rollback to version X"* **is not even expressible**.
+*Prerequisites:* tag the backup with the `manifest_hash` it replaced · do not create a directory on the
+no-op · fail hard if the backup does not have the binaries · retention (reuse the runtimes pattern).
 
-**Límite estructural, no carencia:** una acción in-band se enruta a `SY.orchestrator@{hive}`; **no
-puede rescatar al hive cuyo orchestrator es el componente roto.** Para ese caso el camino externo
-(snapshot / downgrade por apt) **es la respuesta correcta**.
+**A structural limit, not a shortcoming:** an in-band action is routed to `SY.orchestrator@{hive}`; **it
+cannot rescue the hive whose orchestrator is the broken component.** For that case the external path
+(snapshot / downgrade via apt) **is the correct answer**.
 
 <a id="u-5b"></a>
-### U-5b ✅ **CERRADO** — Los backups de core se acumulaban sin GC, y se creaban vacíos
+### U-5b ✅ **CLOSED** — Core backups piled up without GC, and were created empty
 
-Dos defectos, los dos prerrequisitos de cualquier `core_rollback` futuro:
+Two defects, both prerequisites of any future `core_rollback`:
 
-1. **Se creaba el directorio antes de saber si había algo que respaldar** — `fs::create_dir_all` corría
-   incondicionalmente, así que **cada update no-op dejaba un `update-<ms>/` vacío**. Justamente por eso
-   *"restaurar el backup más reciente"* habría restaurado **nada**. Ahora la creación es **perezosa**:
-   ocurre recién ante el primer binario que efectivamente se copia.
-2. **Nunca se limpiaba.** Ahora hay retención (`CORE_BACKUP_GENERATIONS_KEPT = 3`), aplicada **solo en
-   el camino de éxito** — un rollback todavía necesita su generación en disco. Es *best-effort*: si
-   falla la limpieza, loguea `warn!` y no convierte un update bueno en un fallo reportado.
+1. **The directory was created before knowing whether there was anything to back up** — `fs::create_dir_all` ran
+   unconditionally, so **every no-op update left an empty `update-<ms>/`**. That is precisely why
+   *"restore the most recent backup"* would have restored **nothing**. Now the creation is **lazy**:
+   it happens only at the first binary that is actually copied.
+2. **It was never cleaned up.** Now there is retention (`CORE_BACKUP_GENERATIONS_KEPT = 3`), applied **only on
+   the success path** — a rollback still needs its generation on disk. It is *best-effort*: if
+   the cleanup fails, it logs `warn!` and does not turn a good update into a reported failure.
 
-`prune_core_backup_generations_in(root, keep)` toma el root por parámetro para ser testeable sin tocar
-el state dir real. Dos tests: que conserva las más nuevas y respeta lo que no es una generación, y que
-**nunca vacía el store** (por debajo del umbral no toca nada, y un root inexistente no es error).
+`prune_core_backup_generations_in(root, keep)` takes the root as a parameter so that it is testable without touching
+the real state dir. Two tests: that it keeps the newest ones and respects what is not a generation, and that it
+**never empties the store** (below the threshold it touches nothing, and a nonexistent root is not an error).
 
 
 ---
 
 <a id="u-6"></a>
-## U-6 🟡 MITIGADO — `add_hive` corre una carrera entre el push de vendor por SSH y la carpeta de syncthing
+## U-6 🟡 MITIGATED — `add_hive` runs a race between the vendor push over SSH and the syncthing folder
 
-**Encontrado en vivo** al reconstruir prod (2026-07-30), en el primer `add_hive role=ingress`:
+**Found live** while rebuilding prod (2026-07-30), on the first `add_hive role=ingress`:
 
 ```text
 status: error
@@ -877,32 +880,32 @@ SYNC_SETUP_FAILED  motherbee public Syncthing setup failed:
   vendor manifest size mismatch for syncthing: expected=35806960 actual=22364160
 ```
 
-**22364160 / 35806960 = 62 %** — un archivo a mitad de escritura.
+**22364160 / 35806960 = 62 %** — a half-written file.
 
-**Causa, y es consecuencia de [U-2](#u-2):** hasta ahora el ingress no tenía canal de dist, así que
-`sync_vendor_to_worker` (push por SSH) era el **único escritor** de `dist/vendor` en el hive que se
-unía. Con la carpeta `fluxbee-dist-vendor` agregada, **syncthing escribe el mismo archivo al mismo
-tiempo**, y la validación de tamaño —que es fail-closed, y está bien que lo sea— cae sobre el estado
-intermedio.
+**Cause, and it is a consequence of [U-2](#u-2):** until now the ingress had no dist channel, so
+`sync_vendor_to_worker` (push over SSH) was the **only writer** of `dist/vendor` on the hive that was
+joining. With the `fluxbee-dist-vendor` folder added, **syncthing writes the same file at the same
+time**, and the size validation —which is fail-closed, and rightly so— lands on the intermediate
+state.
 
-**Verificado que era transitorio:** al inspeccionar después, motherbee y el ingress tenían ambos
-`35806960` exacto, y el reintento del join pasó sin tocar nada. Pero **el primer intento falla**, y
-eso no es aceptable en un `add_hive`.
+**Verified that it was transient:** on inspecting afterwards, motherbee and the ingress both had
+exactly `35806960`, and the retry of the join passed without touching anything. But **the first attempt fails**, and
+that is not acceptable in an `add_hive`.
 
-**Arreglo propuesto (ordenar, no reintentar):** sembrar vendor por SSH **y recién después** agregar
-el device a `fluxbee-dist-vendor`. El orden importa además por una razón de fondo: syncthing necesita
-su propio binario para arrancar, así que el push por SSH tiene que venir primero de todos modos —
-hoy simplemente no se espera a que termine antes de habilitar la carpeta.
+**Proposed fix (order, do not retry):** seed vendor over SSH **and only afterwards** add
+the device to `fluxbee-dist-vendor`. The order also matters for a deeper reason: syncthing needs
+its own binary to start, so the SSH push has to come first anyway —
+today it is simply not awaited before the folder is enabled.
 
-**A charlar:** si además conviene que la validación distinga "todavía convergiendo" de "corrupto",
-igual que hace el gate de staleness del update.
+**To discuss:** whether the validation should also tell "still converging" apart from "corrupt",
+the same as the update's staleness gate does.
 
 ---
 
 <a id="u-7"></a>
-## U-7 ✅ **CERRADO** — El watchdog busca una carpeta que nunca se declara
+## U-7 ✅ **CLOSED** — The watchdog looks for a folder that is never declared
 
-En motherbee, cada 5 segundos:
+On motherbee, every 5 seconds:
 
 ```text
 WARN failed to verify syncthing folder health; scheduling runtime reconcile
@@ -910,164 +913,164 @@ WARN failed to verify syncthing folder health; scheduling runtime reconcile
      error=syncthing db status ... 404
 ```
 
-**Bug mío, introducido con [U-2](#u-2).** El watchdog llama
-`dist_sync_folders_for_role(dist, state.role, is_motherbee)` con el rol **propio**; en motherbee eso
-produce `fluxbee-dist-core-motherbee`. Pero motherbee **no declara esa carpeta** — declara las de
-worker/ingress/egress (`ROLE_CORE_DIST_ROLES`), porque no se sincroniza consigo misma.
+**My bug, introduced with [U-2](#u-2).** The watchdog calls
+`dist_sync_folders_for_role(dist, state.role, is_motherbee)` with its **own** role; on motherbee that
+produces `fluxbee-dist-core-motherbee`. But motherbee **does not declare that folder** — it declares the
+worker/ingress/egress ones (`ROLE_CORE_DIST_ROLES`), because it does not sync with itself.
 
-**Daño real medido antes de alarmarse: ninguno.** `NRestarts=0`; `ensure_blob_sync_runtime` solo
-reinicia ante un cambio real de config, así que es un warn ruidoso, no un loop destructivo. Pero
-**enmascara problemas reales** — que es exactamente lo que un warn cada 5 s hace.
+**Real damage, measured before getting alarmed: none.** `NRestarts=0`; `ensure_blob_sync_runtime` only
+restarts on a real config change, so it is a noisy warn, not a destructive loop. But it
+**masks real problems** — which is exactly what a warn every 5 s does.
 
-**Arreglo:** que el watchdog use el mismo criterio que la declaración — si es motherbee, iterar
-`ROLE_CORE_DIST_ROLES`; si no, su propio rol.
+**Fix:** have the watchdog use the same criterion as the declaration — if it is motherbee, iterate
+`ROLE_CORE_DIST_ROLES`; if not, its own role.
 
 ---
 
 <a id="u-8"></a>
-## U-8 — Operaciones largas sin progreso consultable · **partido en tres**
+## U-8 — Long operations with no queryable progress · **split in three**
 
-> Reescrito el 2026-08-03. El diagnóstico de U-8b señalaba una causa **falsa**, y la auditoría
-> destapó en U-8c el mejor hallazgo del lote: **la maquinaria que U-8 pedía construir ya existe y
-> está muerta por un bug de una línea.**
+> Rewritten on 2026-08-03. U-8b's diagnosis pointed to a **false** cause, and in U-8c the audit
+> uncovered the best finding of the batch: **the machinery U-8 asked to build already exists and
+> is dead because of a one-line bug.**
 
 <a id="u-8a"></a>
-### U-8a ✅ CERRADO (`9f86c12`, con PB-7) — La API de admin no tiene contrato para operaciones largas
+### U-8a ✅ CLOSED (`9f86c12`, with PB-7) — The admin API has no contract for long operations
 
-> **Cerrado junto con [PB-7](#pb-7):** `add_hive` responde `202`, el join corre en segundo plano y
-> su fase queda en `info.yaml` (`GET /hives` la muestra). Validado en vivo el 2026-08-05: el plano
-> de control contestó en ~100 ms durante un join.
+> **Closed together with [PB-7](#pb-7):** `add_hive` replies `202`, the join runs in the background and
+> its phase is kept in `info.yaml` (`GET /hives` shows it). Validated live on 2026-08-05: the control
+> plane answered in ~100 ms during a join.
 
-Un `add_hive` tarda **más de 6 minutos** y no hay manera de preguntarle en qué paso está: el audit log
-se escribe **al terminar**, no hay acción de estado-de-operación en el registro, y el `info.yaml` del
-hive nuevo (`status: pending`) se escribe **recién tras los gates de 60 s + 60 s**, así que durante la
-ventana `GET /hives` no muestra nada.
+An `add_hive` takes **more than 6 minutes** and there is no way to ask it which step it is on: the audit log
+is written **at the end**, there is no operation-status action in the registry, and the new hive's
+`info.yaml` (`status: pending`) is written **only after the 60 s + 60 s gates**, so during the
+window `GET /hives` shows nothing.
 
-**Mitigaciones que YA existen y hay que documentar en el HANDBOOK antes de codear nada:** (i) los
-timeouts son perillas — `JSR_ADMIN_ADD_HIVE_TIMEOUT_SECS` / `JSR_ADMIN_UPDATE_TIMEOUT_SECS`, **no
-seteadas en `packaging/`**; (ii) el hive queda `pending` y reintentar `add_hive` es idempotente
-*(con el matiz de [PB-7](#pb-7): solo vale si el corte cayó después de `write_hive_info`)*.
+**Mitigations that ALREADY exist and must be documented in the HANDBOOK before coding anything:** (i) the
+timeouts are knobs — `JSR_ADMIN_ADD_HIVE_TIMEOUT_SECS` / `JSR_ADMIN_UPDATE_TIMEOUT_SECS`, **not
+set in `packaging/`**; (ii) the hive stays `pending` and retrying `add_hive` is idempotent
+*(with the [PB-7](#pb-7) caveat: it only holds if the cut fell after `write_hive_info`)*.
 
-Se cierra junto con [PB-7](#pb-7) opción 2 — son el mismo hueco visto por dos puntas.
+It closes together with [PB-7](#pb-7) option 2 — they are the same gap seen from two ends.
 
 <a id="u-8b"></a>
-### U-8b ✅ CERRADO (0.1.55) — `update category=core` daba TIMEOUT a los 60 s sobre una operación exitosa
+### U-8b ✅ CLOSED (0.1.55) — `update category=core` returned TIMEOUT after 60 s on a successful operation
 
-> **Decisión del operador (2026-10-02): camino 1.** Con `SYSTEM_UPDATE category=core`, el destino
-> responde cuando los binarios y las units nuevos están en su lugar (`phase: "restarting"`). Los
-> reinicios, con el health gate, el rollback y el auto-reinicio del orchestrator, corren después en
-> una tarea que retiene el lock de ciclo de vida desde la preparación, así que ningún otro update se
-> intercala. Arrancan 2 s después, para que la respuesta salga antes de que se caiga el router. El
-> resultado queda en `core-update-last.json` y `/versions` lo muestra en `core.last_update`. El
-> finalize de `add_hive` sigue sincrónico (`prepare_core_update` + `restart_core_after_update`).
+> **The operator's decision (2026-10-02): path 1.** With `SYSTEM_UPDATE category=core`, the target
+> replies when the new binaries and units are in place (`phase: "restarting"`). The
+> restarts, with the health gate, the rollback and the orchestrator's self-restart, run afterwards in
+> a task that holds the lifecycle lock from the preparation on, so no other update
+> interleaves. They start 2 s later, so that the reply goes out before the router goes down. The
+> result is kept in `core-update-last.json` and `/versions` shows it in `core.last_update`. The
+> `add_hive` finalize stays synchronous (`prepare_core_update` + `restart_core_after_update`).
 >
-> **Validado en vivo con 0.1.56 (2026-10-03):** los tres spokes contestaron `status=ok
-> phase=restarting` y terminaron con `core.last_update` en `done ok`. El primer envío del deploy no
-> había llegado (`TRANSPORT_ERROR`, B-16) y se repitió a mano.
+> **Validated live with 0.1.56 (2026-10-03):** the three spokes answered `status=ok
+> phase=restarting` and finished with `core.last_update` at `done ok`. The deploy's first send had
+> not arrived (`TRANSPORT_ERROR`, B-16) and it was repeated by hand.
 
-**La causa que estaba escrita es falsa.** *No* es que el orquestador del destino se reinicie a sí
-mismo: el código **lo evita explícitamente** — se auto-excluye y **difiere su restart a un timer de
-2 s justamente para no matar su propia respuesta**.
+**The cause that was written down is false.** It is *not* that the target's orchestrator restarts
+itself: the code **explicitly avoids it** — it excludes itself and **defers its restart to a 2 s
+timer precisely so as not to kill its own reply**.
 
-**Actualización 2026-10-02 (medido en el deploy de 0.1.53, worker1):**
+**Update 2026-10-02 (measured in the 0.1.53 deploy, worker1):**
 
-- **La causa 2 no aplica:** el update completo, con los reinicios, tardó ~2 s.
-- **Lo que pasa:** la respuesta (922 bytes) se escribe por la conexión vieja al router recién
-  reiniciado (`tx_loop write_frame failed: Broken pipe`) y el SDK reconecta un milisegundo después.
-- **Por qué el SDK no se entera antes:** el `rx_loop` no lee el EOF mientras el orchestrator procesa
-  el update, porque no consume lo recibido y la cola llega al tope.
-- **No es un bug del SDK:** el protocolo (§10.6) define que al reconectar la cola TX se vacía y que
-  reenviar es responsabilidad del nodo.
-- **Caminos:**
-  1. responder después de aplicar binarios y units, y antes de reiniciar; los reinicios, con su
-     health gate y rollback, corren después y su resultado queda registrado para `/versions`;
-  2. mantener la respuesta sincrónica, esperando la reconexión sin bloquear la recepción.
-- **Recomendado:** 1, el mismo patrón que ya usa el orchestrator para su propio reinicio. Es decisión
-  del operador, porque cambia lo que significa el `ok` de la respuesta.
+- **Cause 2 does not apply:** the full update, with the restarts, took ~2 s.
+- **What happens:** the reply (922 bytes) is written over the old connection to the just-restarted
+  router (`tx_loop write_frame failed: Broken pipe`) and the SDK reconnects a millisecond later.
+- **Why the SDK does not find out earlier:** the `rx_loop` does not read the EOF while the orchestrator processes
+  the update, because it does not consume what it receives and the queue fills up.
+- **It is not an SDK bug:** the protocol (§10.6) defines that on reconnect the TX queue is emptied and that
+  resending is the node's responsibility.
+- **Paths:**
+  1. reply after applying binaries and units, and before restarting; the restarts, with their
+     health gate and rollback, run afterwards and their result is recorded for `/versions`;
+  2. keep the reply synchronous, waiting for the reconnection without blocking reception.
+- **Recommended:** 1, the same pattern the orchestrator already uses for its own restart. It is the
+  operator's decision, because it changes what the reply's `ok` means.
 
-**El análisis de antes:** (1) el destino reinicia **primero** su propio bus
-`rt-gateway`, que es por donde la respuesta debe volver, **y el fallo de envío se traga** (`let _ =`);
-(2) el restart **en serie** con health-gate de 30 s por servicio sobre 8 servicios puede exceder los
-60 s por sí solo. *(Aparte: si el target es motherbee, el que se reinicia a mitad del request es
+**The earlier analysis:** (1) the target restarts its own `rt-gateway` bus **first**,
+which is the way the reply must come back, **and the send failure is swallowed** (`let _ =`);
+(2) the **serial** restart with a 30 s health gate per service over 8 services can exceed
+60 s on its own. *(Aside: if the target is motherbee, the one that restarts in the middle of the request is
 `sy-admin`.)*
 
 <a id="u-8c"></a>
-### U-8c ✅ **CERRADO** — El `timeout_unknown` del architect estaba muerto por un substring imposible
+### U-8c ✅ **CLOSED** — The architect's `timeout_unknown` was dead because of an impossible substring
 
-> **El hallazgo de mayor valor del lote, y no estaba en ningún findings.** Lo destapó el intento de
-> refutar U-8.
+> **The most valuable finding of the batch, and it was not in any findings.** The attempt to
+> refute U-8 uncovered it.
 
-La semántica de *"en progreso / puede haber terminado bien / andá a verificar"* **ya existía** en
-SY.architect: estado `timeout_unknown`, y `reconcile_timeout_unknown_operation`, que para `add_hive`
-consulta `get_hive` y marca `succeeded_after_timeout`.
+The semantics of *"in progress / it may have finished fine / go and verify"* **already existed** in
+SY.architect: the `timeout_unknown` state, and `reconcile_timeout_unknown_operation`, which for `add_hive`
+queries `get_hive` and marks `succeeded_after_timeout`.
 
-**Estaba muerta.** El clasificador matcheaba el substring `"timeout waiting ADMIN_COMMAND_RESPONSE"`
-contra un `Display` que **desde d04cce8** dice:
+**It was dead.** The classifier matched the substring `"timeout waiting ADMIN_COMMAND_RESPONSE"`
+against a `Display` that **since d04cce8** says:
 
 ```text
 timeout waiting response trace_id=… target=… request_msg=… response_msg=ADMIN_COMMAND_RESPONSE …
 ```
 
-Las palabras `waiting` y `ADMIN_COMMAND_RESPONSE` **nunca son adyacentes**. El predicado era
-**permanentemente falso**: toda operación vencida se persistía como `failed` (terminal), la
-reconciliación **jamás corría**, y el operador veía un `error` sobre una operación probablemente
-exitosa — **exactamente el daño que U-8 describe**.
+The words `waiting` and `ADMIN_COMMAND_RESPONSE` **are never adjacent**. The predicate was
+**permanently false**: every expired operation was persisted as `failed` (terminal), the
+reconciliation **never ran**, and the operator saw an `error` on a probably
+successful operation — **exactly the damage U-8 describes**.
 
-**Arreglado:** `RpcError::is_timeout()` / `timeout_response_msg()` en el SDK, y el architect matchea
-la **variante tipada** vía `downcast_ref` recorriendo la cadena de `source()`, en vez de olfatear
-strings. Tres tests nuevos, incluido el que faltaba: **uno que afirma que el `Display` real no
-contiene el substring viejo**, para que no pueda volver a pasar en silencio.
+**Fixed:** `RpcError::is_timeout()` / `timeout_response_msg()` in the SDK, and the architect matches
+the **typed variant** via `downcast_ref` walking the `source()` chain, instead of sniffing
+strings. Three new tests, including the one that was missing: **one that asserts that the real `Display` does not
+contain the old substring**, so that it cannot happen silently again.
 
-**Nota de método:** el hermano de `sy_orchestrator` **ya lo tenía bien** —comentario que documenta la
-forma del `Display`, el substring correcto y un test—. El architect era el outlier. Otra vez la regla
-*"revisá los hermanos"*.
+**Method note:** the `sy_orchestrator` sibling **already had it right** —a comment documenting the
+shape of the `Display`, the correct substring and a test—. The architect was the outlier. Once again the rule
+*"check the siblings"*.
 
 ---
 
 <a id="u-9"></a>
-## U-9 ✅ **CERRADO** — Las rutas desconocidas devolvían un `not_found` pelado
+## U-9 ✅ **CLOSED** — Unknown routes returned a bare `not_found`
 
-`POST /hives/motherbee/hives` (mi error: la ruta correcta es `POST /hives`) devolvía exactamente
+`POST /hives/motherbee/hives` (my mistake: the correct route is `POST /hives`) returned exactly
 `{"error":"not_found"}`.
 
-**El defecto primario era de ENVELOPE, no de amabilidad.** Toda otra respuesta del admin es
-`{status, action, payload, error_code, error_detail}`; el catch-all emitía `{"error": …}`, **la única
-clave así en toda la superficie** — un cliente que lee `error_code` recibía `null`.
+**The primary defect was one of ENVELOPE, not of friendliness.** Every other admin reply is
+`{status, action, payload, error_code, error_detail}`; the catch-all emitted `{"error": …}`, **the only
+key like that on the whole surface** — a client reading `error_code` got `null`.
 
-**Y el caso peor, que el hallazgo no vio:** el mismo catch-all se tragaba **el método equivocado sobre
-una ruta que SÍ existe** (`PUT /hives`), devolviendo *"no existe"* sobre algo que existe. Más dañino
-que la falta de pistas.
+**And the worse case, which the finding did not see:** the same catch-all swallowed **the wrong method on
+a route that DOES exist** (`PUT /hives`), returning *"does not exist"* for something that exists. More harmful
+than the lack of hints.
 
-**Arreglado, como reuso y no como sistema nuevo:**
+**Fixed, as reuse and not as a new system:**
 
-- envelope de la familia + `error_code: UNKNOWN_ROUTE`;
-- **405 `METHOD_NOT_ALLOWED`** con `allowed_methods` cuando la ruta existe con otro verbo, derivando
-  la tabla de `admin_action_path_patterns` sobre `INTERNAL_ACTION_REGISTRY` para que no pueda
-  divergir del catálogo;
-- puntero `see: "GET /admin/actions"` — **un puntero, no un volcado**: el bind default es loopback
-  pero es overrideable y hay reverse-proxy público documentado, y ese endpoint ya tiene su propia
-  decisión de exposición;
-- el path ecoado se **trunca a 256 y se limpia de caracteres de control** (viene del cliente).
+- the family envelope + `error_code: UNKNOWN_ROUTE`;
+- **405 `METHOD_NOT_ALLOWED`** with `allowed_methods` when the route exists with another verb, deriving
+  the table from `admin_action_path_patterns` over `INTERNAL_ACTION_REGISTRY` so that it cannot
+  diverge from the catalog;
+- a `see: "GET /admin/actions"` pointer — **a pointer, not a dump**: the default bind is loopback,
+  but it can be overridden and there is a documented public reverse proxy, and that endpoint already has its own
+  exposure decision;
+- the echoed path is **truncated to 256 and stripped of control characters** (it comes from the client).
 
-Alcance exacto: el catch-all de SY.admin. **No** incluye `/modules/*`, `sy_edge` ni `io.api`, que ya
-responden tipado. **El gemelo de SY.architect se dejó como está a propósito:** ahí `{"error": …}` es
-lo que usan sus vecinos, así que **no es el outlier** — de-divergirlo sería romper su propia familia.
+Exact scope: SY.admin's catch-all. It does **not** include `/modules/*`, `sy_edge` or `io.api`, which already
+reply typed. **SY.architect's twin was left as it is on purpose:** there `{"error": …}` is
+what its neighbors use, so **it is not the outlier** — de-diverging it would break its own family.
 
-**Residual anotado, no arreglado:** `externalize` / `unexternalize` / `list_externalized` tienen rutas
-REST reales pero **no están en `INTERNAL_ACTION_REGISTRY`**, así que `GET /admin/actions` no las
-lista y el puntero miente para la familia `/channels/*`. Se las incluyó a mano en la tabla de
-diagnóstico (`ADMIN_ROUTES_OUTSIDE_ACTION_REGISTRY`) para que el 405 funcione, pero **meterlas en el
-registry toca dispatch y authz → decisión del operador.**
+**Residual noted, not fixed:** `externalize` / `unexternalize` / `list_externalized` have real REST
+routes but **are not in `INTERNAL_ACTION_REGISTRY`**, so `GET /admin/actions` does not
+list them and the pointer lies for the `/channels/*` family. They were added by hand to the diagnostic
+table (`ADMIN_ROUTES_OUTSIDE_ACTION_REGISTRY`) so that the 405 works, but **putting them in the
+registry touches dispatch and authz → the operator's decision.**
 
 ---
 
 <a id="u-10"></a>
-## U-10 ✅ **CERRADO** — Un upgrade del `.deb` deja huérfano a todo nodo runtime · BLOQUEANTE
+## U-10 ✅ **CLOSED** — A `.deb` upgrade leaves every runtime node orphaned · BLOCKING
 
-**Reproducido en producción el 2026-07-30**, en el primer upgrade real (`0.1.1 → 0.1.2`), que era
-justamente el camino que este test venía a validar. El `.deb` se instaló limpio
-(`Unpacking fluxbee (0.1.2) over (0.1.1)`, 0 unidades fallidas)… y **los cuatro nodos runtime
-quedaron en crash-loop**:
+**Reproduced in production on 2026-07-30**, on the first real upgrade (`0.1.1 → 0.1.2`), which was
+precisely the path this test came to validate. The `.deb` installed cleanly
+(`Unpacking fluxbee (0.1.2) over (0.1.1)`, 0 failed units)… and **the four runtime nodes
+ended up in a crash-loop**:
 
 ```text
 fluxbee-node-IO.api-motherbee.service  activating auto-restart
@@ -1075,132 +1078,132 @@ fluxbee-node-IO.api-motherbee.service  activating auto-restart
   Main process exited, code=exited, status=203/EXEC
 ```
 
-### La secuencia exacta
+### The exact sequence
 
-1. Los directorios de runtime están versionados por la versión del paquete. El upgrade
-   **instala `0.1.2` y borra `0.1.1`** — en disco solo queda `0.1.2`, y el manifest dice
+1. The runtime directories are versioned by the package version. The upgrade
+   **installs `0.1.2` and deletes `0.1.1`** — only `0.1.2` is left on disk, and the manifest says
    `current=0.1.2`.
-2. Pero la **unit de systemd** guarda la **ruta absoluta con la versión vieja**, y nadie la
-   regenera. `203/EXEC`: el ejecutable ya no existe.
-3. **`restart_node` no recupera:** `RUNTIME_NOT_AVAILABLE: version '0.1.1' not available for
-   runtime 'io.api'`. La config persistida del nodo también quedó fijada.
-4. **`PUT /nodes/{n}/config {"runtime_version":"0.1.2"}` devuelve `ok`** (`config_version: 2`)
-   **pero NO rebindea** — lo guarda como una clave de config cualquiera. El `restart_node`
-   siguiente falla idéntico. Esto es [U-8 del análisis previo], confirmado: **el `ok` es mentiroso**,
-   y eso es peor que rechazar.
+2. But the **systemd unit** stores the **absolute path with the old version**, and nobody
+   regenerates it. `203/EXEC`: the executable no longer exists.
+3. **`restart_node` does not recover:** `RUNTIME_NOT_AVAILABLE: version '0.1.1' not available for
+   runtime 'io.api'`. The node's persisted config was also left pinned.
+4. **`PUT /nodes/{n}/config {"runtime_version":"0.1.2"}` returns `ok`** (`config_version: 2`)
+   **but does NOT rebind** — it stores it as just another config key. The next
+   `restart_node` fails identically. This is [U-8 of the previous analysis], confirmed: **the `ok` is a lie**,
+   and that is worse than rejecting.
 
-⇒ **Por HTTP no hay ninguna forma de recuperar un nodo runtime después de un upgrade.**
+⇒ **Over HTTP there is no way at all to recover a runtime node after an upgrade.**
 
-### El detalle que lo vuelve más grave
+### The detail that makes it more serious
 
-`fluxbee-firstboot` spawnea los nodos con **`"runtime_version":"current"`** — es decir, el operador
-pide explícitamente *"seguí al puntero actual"*. El sistema **resuelve `current` una sola vez** y
-hornea la versión concreta en la ruta de la unit. No es que el operador haya pinneado: **pidió
-seguimiento y recibió un pin silencioso.**
+`fluxbee-firstboot` spawns the nodes with **`"runtime_version":"current"`** — that is, the operator
+explicitly asks *"follow the current pointer"*. The system **resolves `current` only once** and
+bakes the concrete version into the unit's path. It is not that the operator pinned: **they
+asked for tracking and got a silent pin.**
 
-### Recuperación que sí funciona (para el HANDBOOK, mientras no se arregle)
+### Recovery that does work (for the HANDBOOK, until it is fixed)
 
 ```bash
-DELETE /hives/{h}/nodes/{n}            # kill_node — mata el proceso
-DELETE /hives/{h}/nodes/{n}/instance   # remove_node_instance — sin esto: NODE_ALREADY_EXISTS
+DELETE /hives/{h}/nodes/{n}            # kill_node — kills the process
+DELETE /hives/{h}/nodes/{n}/instance   # remove_node_instance — without this: NODE_ALREADY_EXISTS
 POST   /hives/{h}/nodes                # run_node
   {"node_name":"IO.api","runtime":"io.api",
    "runtime_version":"current",
    "tenant_id":"tnt:00000000-0000-0000-0000-000000000001"}
 ```
 
-Dos trampas encontradas por el camino: el orden `kill` → `remove_instance` es obligatorio, y
-**`tenant_id` es obligatorio** aunque el error no lo diga hasta que falla
-(`IDENTITY_REGISTER_FAILED: tenant_id is missing`). **Y esta recuperación pierde la configuración
-del nodo**, lo cual en prod (nodos `UNCONFIGURED`) no costó nada, pero en un despliegue con tokens
-cargados sería una pérdida real.
+Two traps found along the way: the order `kill` → `remove_instance` is mandatory, and
+**`tenant_id` is mandatory** even though the error does not say so until it fails
+(`IDENTITY_REGISTER_FAILED: tenant_id is missing`). **And this recovery loses the node's
+configuration**, which in prod (`UNCONFIGURED` nodes) cost nothing, but in a deployment with loaded tokens
+it would be a real loss.
 
-### Arreglo aplicado — decisión del operador: **que `current` signifique current**
+### Fix applied — the operator's decision: **that `current` means current**
 
-*"Que siga al puntero"*: al arrancar tras un upgrade, el nodo se rebindea a la versión nueva y
-reinicia solo. Es lo que el operador pidió al spawnear, y es lo que hace que un *minor update*
-efectivamente llegue.
+*"Que siga al puntero"* (let it follow the pointer): when starting after an upgrade, the node rebinds to the new version and
+restarts by itself. It is what the operator asked for when spawning, and it is what makes a *minor update*
+actually arrive.
 
-Se apoya en un patrón que **ya existía para el core** — `regen_local_core_units`, con el comentario
-*"Spoke self-heal: re-render them from THIS binary's templates on every boot"*. Estaba aplicado a
-los servicios del core y no a los nodos.
+It relies on a pattern that **already existed for the core** — `regen_local_core_units`, with the comment
+*"Spoke self-heal: re-render them from THIS binary's templates on every boot"*. It was applied to
+the core services and not to the nodes.
 
-**Dos mitades:**
+**Two halves:**
 
-1. **Persistir la intención, no solo su resolución.** `build_node_system_block` ahora guarda
-   `requested_runtime_version` junto a `runtime_version`. (El campo ya existía como parcheable en el
-   código; lo que faltaba era que `run_node` lo escribiera.) Un config sin el campo —todos los
-   anteriores— se lee como `current`, que es correcto porque son justamente los que spawneó
-   `fluxbee-firstboot` pidiendo `current`.
-2. **Resolver por la intención al boot.** `reconcile_persisted_custom_nodes` resolvía contra
-   `node.runtime_version` —la respuesta vieja— y por eso moría con *"version not available"* y
-   abandonaba el nodo en pleno crash-loop. Ahora resuelve contra lo pedido: un nodo `current`
-   aterriza en la versión nueva y **ese mismo paso de boot lo repara**. Un pin explícito sigue
-   pinneado y **falla fuerte** si su versión desapareció, que es lo correcto para un pin deliberado.
+1. **Persist the intent, not just its resolution.** `build_node_system_block` now stores
+   `requested_runtime_version` next to `runtime_version`. (The field already existed as patchable in the
+   code; what was missing was for `run_node` to write it.) A config without the field —all the
+   earlier ones— is read as `current`, which is correct because they are precisely the ones that
+   `fluxbee-firstboot` spawned asking for `current`.
+2. **Resolve by the intent at boot.** `reconcile_persisted_custom_nodes` resolved against
+   `node.runtime_version` —the old answer— and that is why it died with *"version not available"* and
+   abandoned the node in the middle of a crash-loop. Now it resolves against what was requested: a `current` node
+   lands on the new version and **that same boot step repairs it**. An explicit pin stays
+   pinned and **fails hard** if its version disappeared, which is correct for a deliberate pin.
 
-Cuando el puntero se mueve se registra en claro (`runtime 'current' pointer moved; rebinding node
-from X to Y`) y se persiste la nueva resolución — así el config en disco refleja lo que corre.
+When the pointer moves, it is logged in plain terms (`runtime 'current' pointer moved; rebinding node
+from X to Y`) and the new resolution is persisted — so the config on disk reflects what runs.
 
-**4 tests de regresión**, incluido el del config viejo sin el campo. 147 en verde.
+**4 regression tests**, including the one for the old config without the field. 147 green.
 
-### ✅ VALIDADO EN VIVO — y hicieron falta tres vueltas
+### ✅ VALIDATED LIVE — and it took three rounds
 
-Se probó con upgrades reales encadenados en producción. **Cada intento falló distinto, y eso es lo
-que permitió llegar al fondo:**
+It was tested with real chained upgrades in production. **Each attempt failed differently, and that is
+what made it possible to get to the bottom of it:**
 
-| upgrade | resultado | lo que enseñó |
+| upgrade | result | what it taught |
 |---|---|---|
-| 0.1.2 → 0.1.3 | ❌ `failed=4` | La re-resolución por intención **sí funcionó** (`pointer moved from=0.1.2 to=0.1.3`), pero el relanzamiento murió: *"Unit … was already loaded or has a fragment file"*. Los nodos son units **transitorias** y systemd no reusa un nombre todavía cargado — y un nodo en crash-loop está en `auto-restart`: no activo, pero cargado, reteniendo su nombre con el `ExecStart` viejo. |
-| 0.1.3 → 0.1.4 | ❌ **error idéntico** | Esa identidad era la pista: si la limpieza hubiera corrido y fallado, el mensaje habría cambiado. `systemd_unit_exists()` **agrega `.service` al nombre**, y se le pasaba uno que ya lo tenía → preguntaba por `…service.service` → siempre "not-found" → el guard salía temprano y **no limpiaba nada**. |
-| 0.1.4 → 0.1.5 | ✅ **`started=4`** | Los cuatro nodos se repararon **solos, en ~25 s, sin ninguna intervención**. |
+| 0.1.2 → 0.1.3 | ❌ `failed=4` | The re-resolution by intent **did work** (`pointer moved from=0.1.2 to=0.1.3`), but the relaunch died: *"Unit … was already loaded or has a fragment file"*. The nodes are **transient** units and systemd does not reuse a name that is still loaded — and a node in a crash-loop is in `auto-restart`: not active, but loaded, holding on to its name with the old `ExecStart`. |
+| 0.1.3 → 0.1.4 | ❌ **identical error** | That sameness was the clue: if the cleanup had run and failed, the message would have changed. `systemd_unit_exists()` **appends `.service` to the name**, and it was being passed one that already had it → it asked for `…service.service` → always "not-found" → the guard exited early and **cleaned up nothing**. |
+| 0.1.4 → 0.1.5 | ✅ **`started=4`** | The four nodes repaired themselves **on their own, in ~25 s, with no intervention at all**. |
 
-La secuencia completa en el log del último:
+The full sequence in the log of the last one:
 
 ```text
-21:26:10  reconcile completed  started=0  skipped=0  failed=4      <- el upgrade anterior
+21:26:10  reconcile completed  started=0  skipped=0  failed=4      <- the previous upgrade
 21:43:28  runtime 'current' pointer moved   from=0.1.4  to=0.1.5
 21:43:28  freed stale transient unit name before relaunch
    (×4)
-21:43:30  reconcile completed  started=4  skipped=0  failed=0      <- TODOS
+21:43:30  reconcile completed  started=4  skipped=0  failed=0      <- ALL
 ```
 
-Units apuntando a `runtimes/<rt>/0.1.5`, configs con `rv=0.1.5 requested=current`.
+Units pointing to `runtimes/<rt>/0.1.5`, configs with `rv=0.1.5 requested=current`.
 
-**Lección de método:** un error que se repite **idéntico** tras un arreglo casi nunca significa "el
-arreglo no alcanzó" — significa que **el arreglo no corrió**. Si hubiera corrido y fallado, el
-mensaje sería otro.
+**Method lesson:** an error that repeats **identically** after a fix almost never means "the
+fix was not enough" — it means that **the fix did not run**. If it had run and failed, the
+message would be different.
 
-### Los residuales, resueltos
+### The residuals, resolved
 
-- ✅ **El rebind por HTTP ya no miente.** La ruta envolvía **todo el cuerpo** bajo `"config"`,
-  mientras `set_node_config` lee los cinco campos de binding en el **nivel superior** — así que
-  `{"runtime_version":"…"}` aterrizaba como una clave de config inerte y la llamada contestaba
-  `ok` sin rebindear. Ahora la ruta los levanta y lo registra.
-  **Y además valida**: probándolo en vivo aceptó `9.9.9`, una versión inexistente, con `ok` — el
-  mismo pecado con otra cara. Ahora un rebind a una versión no instalada devuelve
-  `RUNTIME_NOT_AVAILABLE` en el momento del pedido, no en el próximo restart.
-- ✅ **El ruido de SSH se calló** *(2026-10-06: obsoleto, la reconciliación de TLS por SSH se
-  borró con D32)*. El reconcile de TLS emitía
-  *"failed to distribute mesh TLS material … Permission denied (publickey)"* para cada spoke
-  endurecido, en cada pasada. Un hive unido con `ssh_access=revoke` **no tiene** canal SSH a
-  propósito: eso es el endurecimiento funcionando, y reportarlo como warn entrena a ignorar el log.
-  Ahora, cuando no hay clave de recuperación y el fallo es de autenticación, baja a `debug` con un
-  mensaje que dice por qué. **Verificado: 0 warns desde el arranque nuevo.**
-- ⚪ **`tenant_id`: descartado.** SÍ está documentado (`sy_admin.rs:10520`, *"AI.* and IO.* managed
-  nodes require root-level tenant_id on first spawn"*). Mi error fue no leerlo.
-- 🔴 **Queda uno**: el orden `kill` → `remove_instance` es obligatorio y no está dicho en ningún
-  lado (`NODE_ALREADY_EXISTS` si se saltea). Va al HANDBOOK.
+- ✅ **The rebind over HTTP no longer lies.** The route wrapped **the whole body** under `"config"`,
+  while `set_node_config` reads the five binding fields at the **top level** — so
+  `{"runtime_version":"…"}` landed as an inert config key and the call answered
+  `ok` without rebinding. Now the route lifts them and logs it.
+  **And it also validates**: testing it live, it accepted `9.9.9`, a nonexistent version, with `ok` — the
+  same sin with another face. Now a rebind to a version that is not installed returns
+  `RUNTIME_NOT_AVAILABLE` at request time, not at the next restart.
+- ✅ **The SSH noise went quiet** *(2026-10-06: obsolete, the TLS reconciliation over SSH was
+  deleted with D32)*. The TLS reconcile emitted
+  *"failed to distribute mesh TLS material … Permission denied (publickey)"* for every hardened
+  spoke, on every pass. A hive joined with `ssh_access=revoke` **has no** SSH channel on
+  purpose: that is the hardening working, and reporting it as a warn trains people to ignore the log.
+  Now, when there is no recovery key and the failure is an authentication one, it drops to `debug` with a
+  message that says why. **Verified: 0 warns since the new startup.**
+- ⚪ **`tenant_id`: discarded.** It IS documented (`sy_admin.rs:10520`, *"AI.* and IO.* managed
+  nodes require root-level tenant_id on first spawn"*). My mistake was not reading it.
+- 🔴 **One remains**: the order `kill` → `remove_instance` is mandatory and is not stated
+  anywhere (`NODE_ALREADY_EXISTS` if it is skipped). It goes to the HANDBOOK.
 
 
 ---
 
 <a id="u-11"></a>
-## U-11 ✅ CERRADO y VALIDADO en vivo — `IO.cloud` no puede auto-publicar su propio canal
+## U-11 ✅ CLOSED and VALIDATED live — `IO.cloud` cannot self-publish its own channel
 
-**Encontrado el 2026-07-30** al configurar IO.cloud en producción para conectar Fluxbee Cloud.
+**Found on 2026-07-30** while configuring IO.cloud in production to connect Fluxbee Cloud.
 
-Al arrancar con `IO_CLOUD_EDGE_NODE` seteado, el nodo crea su ICH y pide publicarlo. El hive lo
-rechaza:
+When starting with `IO_CLOUD_EDGE_NODE` set, the node creates its ICH and asks to publish it. The hive
+rejects it:
 
 ```text
 INFO  IO.cloud own ICH ensured  ich_id=ich:14b66389-…  owner=IO.cloud@motherbee  enabled=true
@@ -1209,65 +1212,65 @@ WARN  IO.cloud -> SY.admin externalize REJECTED  error_code=UNAUTHORIZED
       not 'externalize' (Fluxbee Cloud provisioning gate)
 ```
 
-### Es un choque entre dos controles que por separado están bien
+### It is a clash between two controls that are each fine on their own
 
-**`authorize_cloud_relay`** (`sy_admin.rs:5401`) es *default-deny* para `IO.cloud@<hive>`: solo
-puede relayar las tres acciones de `CLOUD_EXPOSED_ACTIONS`. Eso es FIX-1 y es deliberado — el
-comentario explica que existe para que un IO.cloud comprometido no se vuelva *confused deputy*.
-Correcto.
+**`authorize_cloud_relay`** (`sy_admin.rs:5401`) is *default-deny* for `IO.cloud@<hive>`: it can
+only relay the three actions in `CLOUD_EXPOSED_ACTIONS`. That is FIX-1 and it is deliberate — the
+comment explains that it exists so that a compromised IO.cloud does not become a *confused deputy*.
+Correct.
 
-**`authorize_channel_command`** (`sy_admin.rs:5374`) es el gate hecho **específicamente** para esto:
-solo nodos `IO.*`, y **solo sobre su propia channel** (`owner == caller`). Habría autorizado esta
-llamada sin problema: caller `IO.cloud@motherbee`, owner `IO.cloud@motherbee`.
+**`authorize_channel_command`** (`sy_admin.rs:5374`) is the gate made **specifically** for this:
+only `IO.*` nodes, and **only on their own channel** (`owner == caller`). It would have authorized this
+call with no problem: caller `IO.cloud@motherbee`, owner `IO.cloud@motherbee`.
 
-**El problema es que el primero se traga el caso antes de que el segundo pueda opinar.** El
-default-deny no distingue dos cosas distintas:
+**The problem is that the first one swallows the case before the second one can weigh in.** The
+default-deny does not tell apart two different things:
 
-- **relayar** — actuar *en nombre de Cloud*. Es lo que hay que contener, y las tres acciones
-  permitidas son exactamente eso.
-- **actuar sobre su propia channel** — el nodo actuando *por sí mismo*, sobre un recurso del que
-  es dueño. No es un relay, y ya tiene su gate con la restricción de propiedad.
+- **relaying** — acting *on behalf of Cloud*. That is what must be contained, and the three
+  allowed actions are exactly that.
+- **acting on its own channel** — the node acting *for itself*, on a resource it
+  owns. It is not a relay, and it already has its gate with the ownership restriction.
 
-El propio código de IO.cloud dice que esperaba lo segundo
+IO.cloud's own code says it expected the second one
 (`nodes/io/io-cloud/src/main.rs:118-123`): *"the same node→admin ADMIN_COMMAND path a real deploy
 uses; it is self-service (requester owns the ICH). SY.admin authorizes this by router-stamped IO.*
 origin plus `requester == ICH owner`"*.
 
-### Impacto
+### Impact
 
-`IO.cloud` **no es alcanzable desde internet** hasta que un operador publique el canal a mano. Y
-hay que repetirlo en cada reinstalación del hive. Documentado como paso obligatorio en
+`IO.cloud` **is not reachable from the internet** until an operator publishes the channel by hand. And
+it has to be repeated on every reinstall of the hive. Documented as a mandatory step in
 [`docs/io-cloud-api.md`](../../docs/io-cloud-api.md) §5.
 
-**Workaround verificado en producción** (`POST /channels/externalize` desde el admin, donde
-`caller=None` es camino interno confiable):
+**Workaround verified in production** (`POST /channels/externalize` from the admin, where
+`caller=None` is a trusted internal path):
 
 ```json
-{"ich":"<el del log>","edge_node":"SY.edge@ingress1","inbound_family":"user",
+{"ich":"<the one from the log>","edge_node":"SY.edge@ingress1","inbound_family":"user",
  "auth_mode":"shared-secret","secret":"<IO_CLOUD_SECRET>","methods":["POST"]}
 ```
 
-### Arreglo propuesto — a charlar
+### Proposed fix — to discuss
 
-Que `authorize_cloud_relay` **delegue los comandos de channel** a `authorize_channel_command` en vez
-de negarlos de plano. Mantiene intacto el default-deny para el relay (que es lo que contiene a un
-IO.cloud comprometido) y devuelve la decisión sobre canales propios al gate que ya la sabe tomar,
-con su restricción `owner == caller`.
+Have `authorize_cloud_relay` **delegate the channel commands** to `authorize_channel_command` instead
+of denying them outright. It keeps the default-deny for the relay intact (which is what contains a
+compromised IO.cloud) and returns the decision about its own channels to the gate that already knows how to make it,
+with its `owner == caller` restriction.
 
-### ✅ Arreglado y VALIDADO en vivo
+### ✅ Fixed and VALIDATED live
 
-Se aplicó la delegación: `authorize_cloud_relay` deja pasar `externalize`/`unexternalize`
-(`CHANNEL_SELF_SERVICE_ACTIONS`) hacia el handler, donde `authorize_channel_command` sigue
-exigiendo `owner == caller`. **No ensancha el relay**: un IO.cloud comprometido sigue sin poder
-tocar una channel ajena ni relayar nada fuera del allowlist.
+The delegation was applied: `authorize_cloud_relay` lets `externalize`/`unexternalize`
+(`CHANNEL_SELF_SERVICE_ACTIONS`) through to the handler, where `authorize_channel_command` still
+requires `owner == caller`. **It does not widen the relay**: a compromised IO.cloud still cannot
+touch someone else's channel or relay anything outside the allowlist.
 
-**Tests que fijan el límite, no el caso feliz:** los dos comandos de channel pasan; `add_hive`,
-`vault_get`, `publish_artifact` y `sync_hint` siguen denegados; y un comando de channel desde un
-caller **no-IO** pasa este gate —no tiene privilegio de relay que contener— para que lo rechace el
-de channel por la regla I1.
+**Tests that pin the boundary, not the happy path:** the two channel commands pass; `add_hive`,
+`vault_get`, `publish_artifact` and `sync_hint` are still denied; and a channel command from a
+**non-IO** caller passes this gate —it has no relay privilege to contain— so that the channel gate
+rejects it by rule I1.
 
-**Validación en producción** (0.1.6): se desexternalizó el canal a mano y se reinició el nodo, sin
-tocar nada más.
+**Validation in production** (0.1.6): the channel was unexternalized by hand and the node was restarted, without
+touching anything else.
 
 ```text
 INFO  IO.cloud own channel ICH enabled — ready to externalize on SY.edge
@@ -1275,74 +1278,74 @@ WARN  externalize rejected by a retryable edge condition; retrying        attemp
 INFO  externalize OK (authenticated Cloud URL published on the edge)      attempts=2
 ```
 
-Ya no hay `UNAUTHORIZED`. El primer intento pegó contra un edge momentáneamente no resoluble y **el
-reintento propio del nodo lo resolvió** — la lógica de retry funcionando como se diseñó. Después,
-desde internet: sin credencial `401`, con bearer un `create_tenant` completo con `tenant_id` nuevo.
+There is no more `UNAUTHORIZED`. The first attempt hit a momentarily unresolvable edge and **the
+node's own retry resolved it** — the retry logic working as designed. Then,
+from the internet: without a credential `401`, with a bearer a complete `create_tenant` with a new `tenant_id`.
 
-⇒ **El operador ya no tiene que publicar el canal a mano.** El paso 2 del checklist de
-[`docs/io-cloud-api.md`](../../docs/io-cloud-api.md) §5 queda obsoleto a partir de 0.1.6.
+⇒ **The operator no longer has to publish the channel by hand.** Step 2 of the checklist in
+[`docs/io-cloud-api.md`](../../docs/io-cloud-api.md) §5 is obsolete as of 0.1.6.
 
 ---
 
 <a id="u-12"></a>
-## U-12 🟡 — La carrera existe, pero la operación atómica YA ESTÁ HECHA
+## U-12 🟡 — The race exists, but the atomic operation IS ALREADY BUILT
 
-**Corregido el 2026-08-04, el mismo día que lo reporté.** Lo planteé mal.
+**Corrected on 2026-08-04, the same day I reported it.** I framed it wrong.
 
-### Lo que es cierto
+### What is true
 
-Encadenar `kill_node` y después `remove_node_instance` **sí** es una carrera: el kill responde
-`status: ok` **antes** de que systemd baje la unit, y el remove inmediato falla con
+Chaining `kill_node` and then `remove_node_instance` **is** a race: the kill replies
+`status: ok` **before** systemd takes the unit down, and the immediate remove fails with
 `NODE_INSTANCE_RUNNING`.
 
-Y la consecuencia también: `remove_node_instance` es lo único que borra
-`/var/lib/fluxbee/nodes/<KIND>/<node>/`, así que si falla y nadie mira la respuesta, el config
-queda y `reconcile_persisted_custom_nodes` **relanza el nodo** en el próximo arranque. Me pasó: di
-por limpios dos nodos de prueba y reaparecieron tras el upgrade siguiente.
+And so is the consequence: `remove_node_instance` is the only thing that deletes
+`/var/lib/fluxbee/nodes/<KIND>/<node>/`, so if it fails and nobody looks at the reply, the config
+stays and `reconcile_persisted_custom_nodes` **relaunches the node** on the next startup. It happened to me: I took
+two test nodes as cleaned up and they reappeared after the next upgrade.
 
-### Lo que estaba mal
+### What was wrong
 
-Propuse como arreglo *"un purge atómico que haga las dos"*. **Ya existe.** `kill_node` acepta
-`purge_instance`, y la propia autodocumentación lo dice:
+I proposed as the fix *"an atomic purge that does both"*. **It already exists.** `kill_node` accepts
+`purge_instance`, and the self-documentation itself says so:
 
 > *"Stop a node in a hive. Optional **purge_instance** also removes its persisted instance directory."*
 
-con el ejemplo incluido:
+with the example included:
 
 ```bash
 curl -X DELETE /hives/<hive>/nodes/<node>@<hive> -d '{"purge_instance":true}'
 ```
 
-**Probado en producción**, una sola llamada:
+**Tested in production**, a single call:
 
 ```text
-antes:    unit active    · config existe
+before:   unit active    · config exists
 DELETE {"purge_instance": true}  ->  status: ok
-después:  unit inactive  · config BORRADO
+after:    unit inactive  · config DELETED
 ```
 
-Sin carrera, sin segunda llamada, sin espera.
+No race, no second call, no wait.
 
-### Lo que queda como hallazgo real
+### What remains as a real finding
 
-1. **La secuencia de dos llamadas sigue siendo una trampa** para quien la use — y yo la había
-   escrito en el HANDBOOK como la receta de recuperación. **Corregido allí**: ahora usa
+1. **The two-call sequence is still a trap** for whoever uses it — and I had
+   written it in the HANDBOOK as the recovery recipe. **Corrected there**: it now uses
    `purge_instance`.
-2. **`instance_removed` vuelve `null`** aunque el borrado ocurra. El campo está en la respuesta y
-   no se completa, así que un cliente que lo chequee no puede confirmar el purgado.
+2. **`instance_removed` comes back `null`** even though the deletion happens. The field is in the reply and
+   is not filled in, so a client that checks it cannot confirm the purge.
 
-### La lección, que es la tercera vez en esta sesión
+### The lesson, which is the third time in this session
 
-Antes de proponer construir algo, **preguntarle al sistema si ya lo tiene**
-(`GET /admin/actions/<accion>`). Me habría ahorrado un hallazgo mal planteado y una receta
-equivocada en el handbook.
+Before proposing to build something, **ask the system whether it already has it**
+(`GET /admin/actions/<action>`). It would have saved me a badly framed finding and a wrong
+recipe in the handbook.
 
 ---
 
 <a id="u-13"></a>
-## U-13 ✅ **CERRADO** — `sy-storage` perdía la carrera de arranque contra el vault y no reintentaba
+## U-13 ✅ **CLOSED** — `sy-storage` lost the startup race against the vault and did not retry
 
-**Observado en producción**, seis veces en un mismo journal, en dos formas:
+**Observed in production**, six times in the same journal, in two forms:
 
 ```text
 SY.storage vault lookup for postgres_url_ref failed; starting degraded
@@ -1350,42 +1353,42 @@ SY.storage vault lookup for postgres_url_ref failed; starting degraded
   error="... node error: disconnected"
 ```
 
-Perder la carrera **no es raro**: es el resultado normal de que systemd reinicie todo junto en un
-upgrade del `.deb`. Y no era un veredicto del vault ("no tengo ese secreto") — era que `sy-vault`
-todavía no se había anunciado al router. Nadie contestó.
+Losing the race **is not unusual**: it is the normal result of systemd restarting everything together in a
+`.deb` upgrade. And it was not a verdict from the vault ("I do not have that secret") — it was that `sy-vault`
+had not announced itself to the router yet. Nobody answered.
 
-**Por qué el rescate existente no alcanzaba.** Es **push**: reaccionar a un `VAULT_SECRET_CHANGED`
-posterior. El broadcast de bootstrap del vault es un evento de **una sola vez**, y un storage que
-todavía no escuchaba no recibe un segundo aviso. Queda degradado hasta que una persona lo reinicia,
-con el plano de admin del hive caído atrás detrás de `STORAGE_NOT_READY`.
+**Why the existing rescue was not enough.** It is **push**: reacting to a later `VAULT_SECRET_CHANGED`.
+The vault's bootstrap broadcast is a **one-time** event, and a storage that
+was not listening yet does not get a second notice. It stays degraded until a person restarts it,
+with the hive's admin plane down in its wake, behind `STORAGE_NOT_READY`.
 
-Ordenar las units no lo arregla: `sy-storage` y `sy-vault` son las dos `Type=simple`, donde
-"arrancó" significa "se ejecutó el proceso", no "se anunció al bus". `After=` sería decoración.
+Ordering the units does not fix it: `sy-storage` and `sy-vault` are both `Type=simple`, where
+"started" means "the process was executed", not "it announced itself on the bus". `After=` would be decoration.
 
-**El arreglo: falta el pull.** Va en el SDK (`resolve_resource_awaiting_vault`), no en cada binario,
-porque `sy-identity` **ya reintentaba** — storage era el outlier. Una sola definición del corte:
-`Unreachable`/`TtlExceeded`/`Node`/`ActionTimeout` se reintentan; `Service`/`EmptyValue`/
-`InvalidVaultRef` no, porque el vault ya dio veredicto y lo va a repetir.
+**The fix: the pull is missing.** It goes in the SDK (`resolve_resource_awaiting_vault`), not in each binary,
+because `sy-identity` **already retried** — storage was the outlier. A single definition of the cut:
+`Unreachable`/`TtlExceeded`/`Node`/`ActionTimeout` are retried; `Service`/`EmptyValue`/
+`InvalidVaultRef` are not, because the vault already gave a verdict and it is going to repeat it.
 
-**Validado en vivo tres veces**, en el modo de falla exacto:
+**Validated live three times**, in the exact failure mode:
 
-| evento | error observado | desenlace |
+| event | observed error | outcome |
 |---|---|---|
-| upgrade 0.1.11→0.1.12 | `node error: disconnected` | reintentó, `storage_ready=true` en **1 s** |
-| reboot ACPI | `NODE_NOT_FOUND` ×3 | reintentó ~3 s → resolvió |
-| reset duro | `NODE_NOT_FOUND` ×2 | reintentó ~4 s → resolvió |
+| upgrade 0.1.11→0.1.12 | `node error: disconnected` | retried, `storage_ready=true` in **1 s** |
+| ACPI reboot | `NODE_NOT_FOUND` ×3 | retried ~3 s → resolved |
+| hard reset | `NODE_NOT_FOUND` ×2 | retried ~4 s → resolved |
 
-`STORAGE_NOT_READY` en el orquestador: **0** en ambos arranques. Antes: 70+.
+`STORAGE_NOT_READY` in the orchestrator: **0** in both startups. Before: 70+.
 
-### Residual anotado, no arreglado — para charlar
+### Residual noted, not fixed — to discuss
 
-El rescate por push dispara igual **aunque el consumidor ya haya resuelto por el pull**. El
-`exit(0)` es incondicional una vez que pasan origen e interés: no compara el secreto que llega
-contra el que ya está corriendo. Medido en el arranque en frío: storage e identity resuelven solos
-y ~7 s después se reinician cuando llega el broadcast.
+The push rescue fires anyway **even if the consumer has already resolved through the pull**. The
+`exit(0)` is unconditional once origin and interest pass: it does not compare the incoming secret
+against the one already running. Measured on the cold start: storage and identity resolve by themselves
+and ~7 s later they restart when the broadcast arrives.
 
-No es un bug que haya introducido este arreglo, y es **inofensivo** (`Restart=always`, vuelven en
-~5 s). Pero el comentario en `sy_vault.rs` decía que era idempotente "re-resolviendo el mismo valor
-y continuando", que no es lo que pasa — eso ya está corregido. Afinarlo de verdad (salir sólo si el
-secreto **cambió**) toca un mecanismo de seguridad que sigue siendo necesario para una rotación
-real, así que queda para decidir con el operador.
+It is not a bug that this fix introduced, and it is **harmless** (`Restart=always`, they come back in
+~5 s). But the comment in `sy_vault.rs` said it was idempotent "re-resolving the same value
+and continuing", which is not what happens — that is already corrected. Really refining it (exiting only if the
+secret **changed**) touches a safety mechanism that is still needed for a real
+rotation, so it is left to decide with the operator.

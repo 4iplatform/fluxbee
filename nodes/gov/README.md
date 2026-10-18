@@ -1,62 +1,62 @@
 # Gov Nodes Workspace
 
-Este directorio agrupa código de dominio `.gov` dentro de Fluxbee.
+This directory groups the `.gov` domain code inside Fluxbee.
 
-Objetivo:
-- mantener separación clara entre infraestructura core y lógica de dominio,
-- permitir que equipos externos desarrollen/iteren componentes `.gov` sin tocar `src/bin`,
-- compartir utilidades comunes de configuración y bootstrap cuando haga falta.
+Goal:
+- keep a clear split between core infrastructure and domain logic,
+- let external teams develop/iterate `.gov` components without touching `src/bin`,
+- share common configuration and bootstrap utilities when needed.
 
-## Estructura
+## Structure
 
 ```text
 nodes/gov/
-├── common/                  # utilidades compartidas para código gov
-└── ai-frontdesk-gov/        # SY.frontdesk.gov, nodo de sistema del core
+├── common/                  # shared utilities for gov code
+└── ai-frontdesk-gov/        # SY.frontdesk.gov, a core system node
 ```
 
-Alcance de esta fase:
-- el foco actual está en `ai-frontdesk-gov`;
-- no agregar otros componentes `.gov` hasta cerrar integración y E2E de frontdesk.
+Scope of this phase:
+- the current focus is on `ai-frontdesk-gov`;
+- do not add other `.gov` components until the frontdesk integration and E2E are closed.
 
-## Convenciones
+## Conventions
 
-- Nodo canónico actual: `SY.frontdesk.gov@<hive>`, un servicio del core (`sy-frontdesk-gov.service`),
-  no un runtime.
-- Configuración de ruteo de temporales:
+- Current canonical node: `SY.frontdesk.gov@<hive>`, a core service (`sy-frontdesk-gov.service`),
+  not a runtime.
+- Routing configuration for temporary ILKs:
   - `government.identity_frontdesk: "SY.frontdesk.gov@motherbee"`
 
-Control plane y secrets:
-- frontdesk no toma config por `CONFIG_SET`: su prompt va embebido y el proveedor/modelo salen de
+Control plane and secrets:
+- frontdesk takes no config through `CONFIG_SET`: its prompt is embedded and the provider/model come from
   `hive.yaml` (`ai`);
-- la key del proveedor se lee de `SY.vault` por `resource_type` (tenant raíz); `CONFIG_SET` solo
-  fuerza a releerla.
+- the provider key is read from `SY.vault` by `resource_type` (root tenant); `CONFIG_SET` only
+  forces a re-read of it.
 
 ## Build
 
-Desde raíz del repo:
+From the repo root:
 
 ```bash
 cargo check -p gov-common
 cargo check -p sy-frontdesk-gov --bin sy-frontdesk-gov
 ```
 
-## Integración Identity (frontdesk)
+## Identity integration (frontdesk)
 
-El nodo `SY.frontdesk.gov` debe usar helpers del SDK:
-- `identity_system_call_ok` para `ILK_REGISTER` y `ILK_ADD_CHANNEL`
-- fallback a primary (`SY.identity@<motherbee>`) cuando reciba `NOT_PRIMARY`
+The `SY.frontdesk.gov` node must use the SDK helpers:
+- `identity_system_call_ok` for `ILK_REGISTER` and `ILK_ADD_CHANNEL`
+- fallback to the primary (`SY.identity@<motherbee>`) when it gets `NOT_PRIMARY`
 
-Checklist operativo: `docs/onworking COA/identity_v2_tasks.md` sección `E2`.
+Operational checklist: `docs/history/onworking-coa/identity_v2_tasks.md` section `E2`.
 
-## Contrato de Status (FR7)
+## Status contract (FR7)
 
-Para cualquier componente `.gov`, el contrato operativo recomendado es:
-- responder `get_node_status` vía SDK (handler default o custom),
-- exponer `health_state` consistente (`HEALTHY|DEGRADED|ERROR|UNKNOWN`),
-- mantener `extensions` solo para métricas runtime-specific.
+For any `.gov` component, the recommended operational contract is:
+- answer `get_node_status` through the SDK (default or custom handler),
+- expose a consistent `health_state` (`HEALTHY|DEGRADED|ERROR|UNKNOWN`),
+- keep `extensions` only for runtime-specific metrics.
 
-Validación desde API admin:
+Validation from the admin API:
 
 ```bash
 BASE="http://127.0.0.1:8080"
@@ -65,6 +65,6 @@ NODE_NAME="SY.frontdesk.gov@$HIVE_ID"
 curl -sS "$BASE/hives/$HIVE_ID/nodes/$NODE_NAME/status" | jq .
 ```
 
-Referencia:
-- `docs/02-protocolo.md` (mensajes `NODE_STATUS_GET/_RESPONSE`)
-- `docs/07-operaciones.md` (runbook de status por nodo)
+Reference:
+- `docs/history/02-protocolo.md` (`NODE_STATUS_GET/_RESPONSE` messages)
+- `docs/history/07-operaciones.md` (per-node status runbook)

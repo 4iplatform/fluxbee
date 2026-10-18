@@ -1,700 +1,700 @@
-# Auditoria sy.orchestrator
+# sy.orchestrator audit
 
-Fecha: 2026-06-23
-Commit auditado: `78428c5`
+Date: 2026-06-23
+Commit audited: `78428c5`
 Branch: `daily_onworking_coa`
-Archivo principal: `src/bin/sy_orchestrator.rs` (20562 lineas)
+Main file: `src/bin/sy_orchestrator.rs` (20562 lines)
 
-## Estado de resolucion (actualizado 2026-06-26)
+## Resolution status (updated 2026-06-26)
 
-Reconciliacion del trabajo posterior a la auditoria. Prioridad acordada con el operador: **operativos primero, seguridad despues** Ã¢ÂÂ la red es interna con puertas definidas y SSH se usa solo para el bootstrap inicial. Por eso el lote operativo + SSH-only-bootstrap se resolvio primero; ahora se abrio el lote de seguridad arrancando por el #1 del orden sugerido (inyeccion de iface, F7/F12/F13).
+Reconciliation of the work done after the audit. Priority agreed with the operator: **operational first, security later** — the network is internal with defined entry points, and SSH is used only for the initial bootstrap. That is why the operational batch + SSH-only-bootstrap was resolved first; the security batch has now been opened, starting with #1 of the suggested order (iface injection, F7/F12/F13).
 
-**Resueltos (19 de 24):**
+**Resolved (19 of 24):**
 
-- **F5 + F6 + F16 + F17** lote egress (NAT) Ã¢ÂÂ **validado empÃÂ­ricamente en VM real (Ubuntu 24.04)**. **F16**: `conntrack_tuned` deja de ser `true` incondicional Ã¢ÂÂ `apply_conntrack_live()` devuelve bool verificando el read-back de `nf_conntrack_max` (prueba la key canÃÂ³nica **y** el alias); journal de la VM confirma `false`Ã¢ÂÂ`true` al cargarse el mÃÂ³dulo. **F17**: nuevo unit systemd `fluxbee-egress-nft.service` (oneshot, `Before=network-pre.target`) carga la tabla nft al boot Ã¢ÂÂ **probado concluyentemente**: con el orchestrator **deshabilitado**, tras reboot la tabla estÃÂ¡ presente (la cargÃÂ³ el boot unit, cerrando la ventana ip_forward-sin-tabla). **F6**: el watchdog re-aplica el reconcile idempotente cada ~60s (no solo si la tabla desapareciÃÂ³) Ã¢ÂÂ probado: flush de una chain (drift parcial, tabla presente) se corrige en <70s. **F5**: `internet_reachable=false` degrada Ã¢ÂÂ WARN `DEGRADED` continuo en el journal del egress + el response de `add_hive` reporta `egress_internet_reachable: null` (no implica ÃÂ©xito; transmisiÃÂ³n real = T-VER-1). *RevisiÃÂ³n adversarial (3 hallazgos corregidos: read-back del alias conntrack, churn de `systemctl enable`, `block_in_place` para el I/O bloqueante del watchdog) + 105 unit tests + validaciÃÂ³n empÃÂ­rica en VM (F16/F17/F6/F5).*
-- **F4 + F15** allowlist de origen `system` Ã¢ÂÂ **resuelto reubicando la autoridad de origen al ROUTER** (decisiÃÂ³n de diseÃÂ±o del operador: el router es el centro de routing/autoridad; no distribuir el chequeo entre nodos). El router resuelve el `src_l2_name` autoritativo (UUIDÃ¢ÂÂregistro) y gatea las 18 acciones SYSTEM protegidas en `serialize_for_local_delivery` (choke point ÃÂºnico): `SY.orchestrator@*` (cross-hive, forwards), `SY.admin`/`SY.wf-rules`/`WF.orch.diag` `@<same-hive>` (cierra F15: rechaza cross-hive admin), `SY.config-routes`/`SY.vault` `@<same-hive>` solo para `NODE_STATUS_GET` (probe read-only abierto por el architect). Reglas `SY.` hardcodeadas en el router + publicadas como rutas **frozen** visibles en SHM. El gate del orchestrator (`is_allowed_system_source_name`, no configurable por los prefijos hardcodeados Ã¢ÂÂ el problema de F4) **se eliminÃÂ³**; la configurabilidad futura va a la capa **OPA-system** (anotada). *Unit tests (router) + revisiÃÂ³n adversarial (GO) + validado en el lab de 2 hives (cross-hive live forwards + same-hive + router-only enforcement, 0 drops indebidos).*
-- **F18** TOCTOU lock Ã¢ÂÂ registro de locks por hive_id sostenido durante todo el flujo de `add_hive`/`remove_hive`. *Unit test + revisiÃÂ³n (GO).*
-- **F8** gate de origen en el canal ADMIN Ã¢ÂÂ cambio de 2 componentes: el relay `SY.admin` estampa su identidad `SY.admin@<hive>` y `handle_admin` gatea las acciones mutantes a `== SY.admin@<su-hive>`. *4 unit tests + revisiÃÂ³n adversarial (GO, sin regresiÃÂ³n: todo el trÃÂ¡fico admin rutea al orchestrator local). Residual: hop-1 sin gatear (finding aparte).*
-- **F11** teardown NAT en `remove_hive` egress Ã¢ÂÂ lee `role`, manda `egress_teardown`, el host removido limpia nft+ficheros+sysctl (idempotente, antepuesto al kill de servicios); respuesta seÃÂ±aliza el orphan offline. *Unit test + revisiÃÂ³n adversarial (race del cgroup + orphan offline corregidos). **Falta validaciÃÂ³n empÃÂ­rica en VM (Fase 2).***
-- **F3** traversal de `hive_id` Ã¢ÂÂ `valid_hive_id`/`valid_address` movidos al inicio de `add_hive_flow`/`add_egress_hive_flow` (antes de todo `join`/`remove_dir_all`/`create_dir_all`) + backstop lÃÂ©xico `hive_dir_is_direct_child` antes de cada op destructiva. *Unit test + revisiÃÂ³n adversarial (GO).*
-- **F7** RCE root via iface Ã¢ÂÂ `validate_iface_name` (allowlist `^[A-Za-z0-9._-]{1,15}$`, IFNAMSIZ, rechaza `.`/`..`) aplicado a `wan_iface`/`lan_iface` en `resolve_egress_nat_config` (el unico constructor de `EgressNatConfig`), antes de cualquier sink. Ademas `write_remote_file` reescrito: el contenido va por **stdin** a `sudo -n tee '<path>'`, sin interpolacion en shell. *Unit test (accept/reject exhaustivo) + revision adversarial multi-agente (GO, 0 defectos bloqueantes; reachability/charset/rewrite verificados).*
-- **F12** inyeccion nft Ã¢ÂÂ cerrado por el **mismo** allowlist: el iface se embebe solo en strings nft entre comillas dobles y el charset excluye `"` y `\`. *Cubierto por el fix y test de F7.*
-- **F13** inyeccion/corrupcion YAML Ã¢ÂÂ idem: el iface se embebe solo como escalar YAML entre comillas dobles desde `nat.*` (validado); el charset excluye `"`/`\` y los disparadores de coercion de escalar. *Cubierto por el fix y test de F7.*
+- **F5 + F6 + F16 + F17** egress (NAT) batch — **empirically validated on a real VM (Ubuntu 24.04)**. **F16**: `conntrack_tuned` is no longer an unconditional `true` — `apply_conntrack_live()` returns a bool by verifying the read-back of `nf_conntrack_max` (it tries the canonical key **and** the alias); the VM journal confirms `false`→`true` when the module loads. **F17**: a new systemd unit `fluxbee-egress-nft.service` (oneshot, `Before=network-pre.target`) loads the nft table at boot — **conclusively proven**: with the orchestrator **disabled**, the table is present after a reboot (the boot unit loaded it, closing the ip_forward-without-table window). **F6**: the watchdog re-applies the idempotent reconcile every ~60s (not only when the table disappeared) — tested: a flush of one chain (partial drift, table present) is corrected in <70s. **F5**: `internet_reachable=false` degrades → a continuous `DEGRADED` WARN in the egress journal + the `add_hive` response reports `egress_internet_reachable: null` (it does not imply success; real transmission = T-VER-1). *Adversarial review (3 findings fixed: read-back of the conntrack alias, `systemctl enable` churn, `block_in_place` for the watchdog's blocking I/O) + 105 unit tests + empirical validation on a VM (F16/F17/F6/F5).*
+- **F4 + F15** `system` origin allowlist — **resolved by moving origin authority to the ROUTER** (the operator's design decision: the router is the center of routing/authority; do not spread the check across nodes). The router resolves the authoritative `src_l2_name` (UUID→record) and gates the 18 protected SYSTEM actions in `serialize_for_local_delivery` (single choke point): `SY.orchestrator@*` (cross-hive, forwards), `SY.admin`/`SY.wf-rules`/`WF.orch.diag` `@<same-hive>` (closes F15: rejects cross-hive admin), `SY.config-routes`/`SY.vault` `@<same-hive>` only for `NODE_STATUS_GET` (read-only probe opened by the architect). `SY.` rules hardcoded in the router + published as **frozen** routes visible in SHM. The orchestrator's gate (`is_allowed_system_source_name`, not configurable because of the hardcoded prefixes — the F4 problem) **was removed**; future configurability goes to the **OPA-system** layer (noted). *Unit tests (router) + adversarial review (GO) + validated in the 2-hive lab (cross-hive live forwards + same-hive + router-only enforcement, 0 wrongful drops).*
+- **F18** TOCTOU lock — a per-hive_id lock registry held during the whole `add_hive`/`remove_hive` flow. *Unit test + review (GO).*
+- **F8** origin gate on the ADMIN channel — a 2-component change: the `SY.admin` relay stamps its identity `SY.admin@<hive>` and `handle_admin` gates the mutating actions to `== SY.admin@<its-hive>`. *4 unit tests + adversarial review (GO, no regression: all admin traffic routes to the local orchestrator). Residual: hop-1 not gated (separate finding).*
+- **F11** NAT teardown in egress `remove_hive` — it reads `role`, sends `egress_teardown`, and the removed host cleans up nft+files+sysctl (idempotent, placed before the service kill); the response signals the offline orphan. *Unit test + adversarial review (cgroup race + offline orphan fixed). **Empirical validation on a VM still missing (Phase 2).***
+- **F3** `hive_id` traversal — `valid_hive_id`/`valid_address` moved to the start of `add_hive_flow`/`add_egress_hive_flow` (before any `join`/`remove_dir_all`/`create_dir_all`) + a lexical backstop `hive_dir_is_direct_child` before each destructive op. *Unit test + adversarial review (GO).*
+- **F7** root RCE via iface — `validate_iface_name` (allowlist `^[A-Za-z0-9._-]{1,15}$`, IFNAMSIZ, rejects `.`/`..`) applied to `wan_iface`/`lan_iface` in `resolve_egress_nat_config` (the only constructor of `EgressNatConfig`), before any sink. Also, `write_remote_file` was rewritten: the content goes through **stdin** to `sudo -n tee '<path>'`, with no shell interpolation. *Unit test (exhaustive accept/reject) + multi-agent adversarial review (GO, 0 blocking defects; reachability/charset/rewrite verified).*
+- **F12** nft injection — closed by the **same** allowlist: the iface is embedded only in double-quoted nft strings, and the charset excludes `"` and `\`. *Covered by the F7 fix and test.*
+- **F13** YAML injection/corruption — likewise: the iface is embedded only as a double-quoted YAML scalar from `nat.*` (validated); the charset excludes `"`/`\` and the scalar-coercion triggers. *Covered by the F7 fix and test.*
 
-**Resueltos previamente (6):**
+**Previously resolved (6):**
 
-- **F1** remove_hive socket-only Ã¢ÂÂ SSH operativo eliminado; online -> `socket_ok/socket`, offline -> `local_only/local_only`, sin fallback SSH. *Validado empiricamente (lab, online + offline).*
-- **F2** add_hive sin fallback SSH Ã¢ÂÂ `WORKER_SOCKET_UNREACHABLE` retryable cuando el worker esta online; clasificador alineado a los strings reales de `RpcError`. *Validado empiricamente (lab).*
-- **F9** add_hive idempotente Ã¢ÂÂ reintento sobre `pending` resume via fast-path socket; `connected` sigue dando `HIVE_EXISTS`. *Validado empiricamente (lab) + unit test.*
-- **F10** egress hardening fatal Ã¢ÂÂ el `Err` arm retorna `SSH_HARDEN_FAILED`/`SSH_KEY_FAILED`; info.yaml queda `pending` (reanudable) en fallo. *Codigo + revision adversarial (SOUND); falta validacion empirica (necesita rol egress, Fase 2 del lab).*
-- **F14** watchdog panic-safe Ã¢ÂÂ `WatchdogRunGuard` (Drop) resetea el flag aun ante panic. *Unit test.*
-- **F20** clamp de slices SHM Ã¢ÂÂ `shm_name_to_string` centraliza y clampa los 7 sitios. *Unit test.*
+- **F1** remove_hive socket-only — operational SSH removed; online -> `socket_ok/socket`, offline -> `local_only/local_only`, no SSH fallback. *Empirically validated (lab, online + offline).*
+- **F2** add_hive without SSH fallback — `WORKER_SOCKET_UNREACHABLE` retryable when the worker is online; classifier aligned with the real `RpcError` strings. *Empirically validated (lab).*
+- **F9** add_hive idempotent — a retry on `pending` resumes via the socket fast-path; `connected` still returns `HIVE_EXISTS`. *Empirically validated (lab) + unit test.*
+- **F10** egress hardening fatal — the `Err` arm returns `SSH_HARDEN_FAILED`/`SSH_KEY_FAILED`; on failure, info.yaml stays `pending` (resumable). *Code + adversarial review (SOUND); empirical validation still missing (needs the egress role, lab Phase 2).*
+- **F14** watchdog panic-safe — `WatchdogRunGuard` (Drop) resets the flag even on panic. *Unit test.*
+- **F20** SHM slice clamp — `shm_name_to_string` centralizes and clamps the 7 sites. *Unit test.*
 
-Ademas (no era finding del audit; cambio de diseno del operador): **las credenciales SSH del bootstrap se movieron al payload de `add_hive`** (`ssh_user` requerido / `ssh_password` opcional, probe key-first), eliminando los `administrator`/`magicAI` hardcodeados; el secreto se redacta en SY.architect; el schema de admin se actualizo. *Validado empiricamente (lab: worker bootstrapeado con creds del payload).*
+Also (not an audit finding; a design change by the operator): **the bootstrap SSH credentials moved into the `add_hive` payload** (`ssh_user` required / `ssh_password` optional, key-first probe), removing the hardcoded `administrator`/`magicAI`; the secret is redacted in SY.architect; the admin schema was updated. *Empirically validated (lab: worker bootstrapped with the payload creds).*
 
-**Pendientes (5 de 24)** Ã¢ÂÂ por severidad:
+**Pending (5 of 24)** — by severity:
 
-- **Alta (0).**
-- **Media (0).** Lote egress (F5/F6/F16/F17) cerrado y validado en VM real.
-- **Baja (5):** F19, F21, F22, F23, F25.
+- **High (0).**
+- **Medium (0).** Egress batch (F5/F6/F16/F17) closed and validated on a real VM.
+- **Low (5):** F19, F21, F22, F23, F25.
 
-**Nota de seguridad:** **F7/F12/F13 cerrados** Ã¢ÂÂ eran el pendiente #1. Una sola allowlist de iface los cierra a los tres porque el charset aceptado (`[A-Za-z0-9._-]`) no comparte ningun metacarÃÂ¡cter con los tres sinks (shell / nft / YAML), y la validacion corre en el unico constructor de `EgressNatConfig` antes de todo sink (verificado: sin bypass, los paths de reconcile re-validan el `hive.yaml` deserializado). El siguiente pendiente de mayor prioridad pasa a ser **F8** (gate de origen en el canal ADMIN).
+**Security note:** **F7/F12/F13 closed** — they were pending item #1. A single iface allowlist closes all three, because the accepted charset (`[A-Za-z0-9._-]`) shares no metacharacter with the three sinks (shell / nft / YAML), and the validation runs in the only constructor of `EgressNatConfig` before any sink (verified: no bypass; the reconcile paths re-validate the deserialized `hive.yaml`). The next highest-priority pending item becomes **F8** (origin gate on the ADMIN channel).
 
-Estado de codigo: los fixes resueltos viven en `src/` (commit aparte del lab). Validacion: ver `lab/STATUS.md` (entorno containerizado donde F1/F2/F9 + creds se probaron sobre una malla real de 2 hives); F7/F12/F13 con unit tests + revision adversarial (sin rol egress aun en el lab Ã¢ÂÂ Fase 2/VM para validacion empirica de egress).
+Code status: the resolved fixes live in `src/` (in a commit separate from the lab's). Validation: see `lab/STATUS.md` (a containerized environment where F1/F2/F9 + creds were tested over a real 2-hive mesh); F7/F12/F13 with unit tests + adversarial review (no egress role in the lab yet — Phase 2/VM for the empirical egress validation).
 
-## Alcance
+## Scope
 
-Se reviso `sy.orchestrator` con foco en las funcionalidades recientes: contrato v2 socket-first, `add_hive`/`remove_hive`, hardening de origen para acciones `system`, y soporte `role=egress` / NAT. El diff completo contra `main` es amplio; esta auditoria prioriza el comportamiento de `src/bin/sy_orchestrator.rs` y los contratos documentados alrededor de ese binario.
+`sy.orchestrator` was reviewed with a focus on the recent features: the v2 socket-first contract, `add_hive`/`remove_hive`, origin hardening for `system` actions, and `role=egress` / NAT support. The full diff against `main` is broad; this audit prioritizes the behavior of `src/bin/sy_orchestrator.rs` and the contracts documented around that binary.
 
-Metodo: revision adversarial multi-agente. Cada finding existente fue verificado contra el codigo real (numeros de linea confirmados en el commit `78428c5`); ademas se hizo una caceria por lentes (add_hive worker/egress, remove_hive, transporte SSH, concurrencia, autorizacion de origen, egress NAT, conformidad de contrato) y cada candidato nuevo se verifico adversarialmente. Tres findings se reprodujeron empiricamente (path traversal de `hive_id`, inyeccion de comandos en `write_remote_file`, inyeccion de reglas nft).
+Method: multi-agent adversarial review. Each existing finding was verified against the real code (line numbers confirmed at commit `78428c5`); in addition, a hunt was run by lens (add_hive worker/egress, remove_hive, SSH transport, concurrency, origin authorization, egress NAT, contract conformance), and each new candidate was verified adversarially. Three findings were reproduced empirically (`hive_id` path traversal, command injection in `write_remote_file`, nft rule injection).
 
-Comandos ejecutados:
+Commands run:
 
 ```bash
 cargo test --bin sy_orchestrator
 bash scripts/router_dispatcher_guards/run_all.sh
 ```
 
-Resultado:
+Result:
 
 - `cargo test --bin sy_orchestrator`: OK, 100 tests passed.
 - `router_dispatcher_guards`: OK, 7/7 guards passed.
 
-Importante sobre la cobertura de esos comandos: **ninguno de los findings de abajo es ejercitado por la suite actual**. Todos viven en caminos remotos/operativos (hives reales, SSH, nftables, dos NICs) que los tests unitarios y los guards no cubren. La verificacion de cada finding es por lectura de codigo (y, en tres casos, reproduccion empirica del quoting/FS), no por ejecucion de la suite. No se ejecutaron E2E con infraestructura real.
+Important regarding the coverage of those commands: **none of the findings below is exercised by the current suite**. They all live in remote/operational paths (real hives, SSH, nftables, two NICs) that the unit tests and the guards do not cover. Each finding is verified by reading the code (and, in three cases, by empirical reproduction of the quoting/FS), not by running the suite. No E2E with real infrastructure was run.
 
-## Resumen ejecutivo
+## Executive summary
 
-El binario compila y sus tests unitarios pasan, pero hay defectos de seguridad y de contrato relevantes. Los dos mas graves no estaban en la primera version de esta auditoria:
+The binary compiles and its unit tests pass, but there are relevant security and contract defects. The two most serious were not in the first version of this audit:
 
-- **Inyeccion de comandos como root** en `write_remote_file` via `wan_iface`/`lan_iface` sin validar (F7, antes clasificado como "baja por comillas simples").
-- **El canal `ADMIN_COMMAND` no consulta ninguna allowlist de origen** para acciones mutantes destructivas (F8).
+- **Command injection as root** in `write_remote_file` via unvalidated `wan_iface`/`lan_iface` (F7, formerly classified as "low because of single quotes").
+- **The `ADMIN_COMMAND` channel checks no origin allowlist** for destructive mutating actions (F8).
 
-Ademas:
+In addition:
 
-- `remove_hive` y `add_hive` reintroducen/conservan SSH operativo contra el contrato v2 socket-first (F1, F2), contradiciendo items del backlog marcados como cerrados.
-- `add_hive` valida `hive_id` despues de borrar directorios (F3) y no toma ningun lock (F18 TOCTOU).
-- `add_hive` no es idempotente: un timeout deja el hive `pending` sin via de reintento (F9).
-- El boundary egress puede quedar con SSH sin endurecer pero reportar `ok` (F10), y `remove_hive` de un egress deja el NAT huerfano (F11).
-- La allowlist de origen `system` tiene prefijos hardcodeados que la vuelven no configurable (F4) y aceptan sufijo de hive arbitrario (F15).
-- La verificacion egress sobre-afirma estado (F5, F16) y la tabla nft no se carga al boot (F17).
+- `remove_hive` and `add_hive` reintroduce/keep operational SSH against the v2 socket-first contract (F1, F2), contradicting backlog items marked as closed.
+- `add_hive` validates `hive_id` after deleting directories (F3) and takes no lock (F18 TOCTOU).
+- `add_hive` is not idempotent: a timeout leaves the hive `pending` with no retry path (F9).
+- The egress boundary can be left with unhardened SSH yet report `ok` (F10), and `remove_hive` of an egress leaves the NAT orphaned (F11).
+- The `system` origin allowlist has hardcoded prefixes that make it non-configurable (F4) and accept an arbitrary hive suffix (F15).
+- The egress verification over-claims state (F5, F16), and the nft table is not loaded at boot (F17).
 
-Tambien hay tres bugs de las funcionalidades nuevas comparten una sola causa raiz: **ausencia de allowlist de nombre de interfaz** (`wan_iface`/`lan_iface`). Un unico fix cierra F7 (RCE), F12 (inyeccion nft) y F13 (corrupcion YAML).
+Also, three bugs in the new features share a single root cause: **the absence of an interface-name allowlist** (`wan_iface`/`lan_iface`). A single fix closes F7 (RCE), F12 (nft injection) and F13 (YAML corruption).
 
-## Tabla resumen
+## Summary table
 
-| ID | Sev | Area | Titulo | Verificacion | Backlog |
+| ID | Sev | Area | Title | Verification | Backlog |
 |----|-----|------|--------|--------------|---------|
-| F7  | Alta | ssh-transport | Ã¢ÂÂ RESUELTO Ã¢ÂÂ RCE como root en `write_remote_file` (iface sin validar) | empirica | nuevo (antes Baja) |
-| F8  | Alta | origin-auth | Ã¢ÂÂ RESUELTO Ã¢ÂÂ `ADMIN_COMMAND` sin gate de origen | lectura | nuevo |
-| F1  | Alta | remove_hive | SSH operativo en `remove_hive` | lectura+git | contradice `[x]` v2:21 |
-| F2  | Alta | add_hive | `add_hive` socket-only cae a bootstrap SSH | lectura | contradice `[x]` v2:22 |
-| F3  | Alta | add_hive | Ã¢ÂÂ RESUELTO Ã¢ÂÂ Borra dir antes de validar `hive_id` (traversal) | empirica | nuevo (antes Critica) |
-| F4  | Alta | origin-auth | ✅ RESUELTO (router-authority) — Allowlist `system` no configurable | lectura+test | parcial v2 |
-| F9  | Alta | add_hive | `add_hive` no idempotente (`pending` atascado) | lectura | nuevo |
-| F10 | Alta | add_hive | Hardening SSH egress no-fatal, reporta `ok` | lectura | nuevo |
-| F11 | Alta | remove_hive | Ã¢ÂÂ RESUELTO (cÃÂ³d.; falta VM) Ã¢ÂÂ `remove_hive` egress no des-aprovisiona NAT | lectura | nuevo |
-| F12 | Media | egress-nat | Ã¢ÂÂ RESUELTO Ã¢ÂÂ Inyeccion de reglas nft (iface sin validar) | empirica | nuevo |
-| F13 | Media | ssh-transport | Ã¢ÂÂ RESUELTO Ã¢ÂÂ Corrupcion/inyeccion YAML en `hive.yaml` remoto | empirica | nuevo |
-| F5  | Media | egress-nat | Egress reporta `ok` con verificacion incompleta | lectura | reescrito |
-| F6  | Media | egress-nat | Watchdog egress no corrige drift parcial | lectura | decision CR-5 |
-| F14 | Media | robustez | `watchdog_tick` no es panic-safe | lectura | nuevo |
-| F15 | Media | origin-auth | ✅ RESUELTO (router-authority) — Allowlist acepta sufijo de hive arbitrario (cross-hive) | lectura | nuevo (extiende F4) |
-| F16 | Media | egress-nat | `egress_conntrack_tuned=true` incondicional | lectura | nuevo |
-| F17 | Media | egress-nat | Tabla nft no se carga al boot | lectura | nuevo |
-| F18 | Media | concurrency | Ã¢ÂÂ RESUELTO Ã¢ÂÂ TOCTOU: `add_hive`/`remove_hive` sin lock | lectura | nuevo |
-| F19 | Baja | inventory | `list_hives` etiqueta egress como `worker` | lectura | nuevo |
-| F20 | Baja | robustez | Slices de nombre SHM sin clamp (`node_name`) | lectura | nuevo |
-| F21 | Baja | egress-nat | Host egress sin filtrado inbound | lectura | trade-off T-NET-4 |
-| F22 | Baja | add_hive | Egress sin fast-path socket (re-provision re-corre SSH) | lectura | nuevo |
-| F23 | Baja | egress-nat | `ipv4_forwarding`/`ipv6_blocked` sin read-back | lectura | nuevo |
-| F25 | Baja | egress-nat | nft delete-then-apply no atomico | lectura | nuevo |
+| F7  | High | ssh-transport | ✅ RESOLVED — RCE as root in `write_remote_file` (unvalidated iface) | empirical | new (formerly Low) |
+| F8  | High | origin-auth | ✅ RESOLVED — `ADMIN_COMMAND` without an origin gate | reading | new |
+| F1  | High | remove_hive | Operational SSH in `remove_hive` | reading+git | contradicts `[x]` v2:21 |
+| F2  | High | add_hive | Socket-only `add_hive` falls back to SSH bootstrap | reading | contradicts `[x]` v2:22 |
+| F3  | High | add_hive | ✅ RESOLVED — Deletes dir before validating `hive_id` (traversal) | empirical | new (formerly Critical) |
+| F4  | High | origin-auth | ✅ RESOLVED (router-authority) — `system` allowlist not configurable | reading+test | partial v2 |
+| F9  | High | add_hive | `add_hive` not idempotent (stuck `pending`) | reading | new |
+| F10 | High | add_hive | Egress SSH hardening non-fatal, reports `ok` | reading | new |
+| F11 | High | remove_hive | ✅ RESOLVED (code; no VM yet) — Egress `remove_hive` does not deprovision NAT | reading | new |
+| F12 | Medium | egress-nat | ✅ RESOLVED — nft rule injection (unvalidated iface) | empirical | new |
+| F13 | Medium | ssh-transport | ✅ RESOLVED — YAML corruption/injection in remote `hive.yaml` | empirical | new |
+| F5  | Medium | egress-nat | Egress reports `ok` with incomplete verification | reading | rewritten |
+| F6  | Medium | egress-nat | Egress watchdog does not correct partial drift | reading | decision CR-5 |
+| F14 | Medium | robustness | `watchdog_tick` is not panic-safe | reading | new |
+| F15 | Medium | origin-auth | ✅ RESOLVED (router-authority) — Allowlist accepts an arbitrary hive suffix (cross-hive) | reading | new (extends F4) |
+| F16 | Medium | egress-nat | Unconditional `egress_conntrack_tuned=true` | reading | new |
+| F17 | Medium | egress-nat | nft table not loaded at boot | reading | new |
+| F18 | Medium | concurrency | ✅ RESOLVED — TOCTOU: `add_hive`/`remove_hive` without a lock | reading | new |
+| F19 | Low | inventory | `list_hives` labels egress as `worker` | reading | new |
+| F20 | Low | robustness | SHM name slices without clamp (`node_name`) | reading | new |
+| F21 | Low | egress-nat | Egress host without inbound filtering | reading | trade-off T-NET-4 |
+| F22 | Low | add_hive | Egress without socket fast-path (re-provision re-runs SSH) | reading | new |
+| F23 | Low | egress-nat | `ipv4_forwarding`/`ipv6_blocked` without read-back | reading | new |
+| F25 | Low | egress-nat | nft delete-then-apply not atomic | reading | new |
 
-Severidades: 9 Alta, 9 Media, 6 Baja. (F24 quedo absorbido en F6; ver descartados al final para los falsos positivos.)
+Severities: 9 High, 9 Medium, 6 Low. (F24 was absorbed into F6; see the discarded items at the end for the false positives.)
 
-## Findings - Alta
+## Findings - High
 
-### F7 - Alta - Inyeccion de comandos como root en `write_remote_file`
+### F7 - High - Command injection as root in `write_remote_file`
 
-> **RESUELTO (2026-06-26).** `validate_iface_name` (allowlist `^[A-Za-z0-9._-]{1,15}$`, IFNAMSIZ, rechaza `.`/`..`) en `resolve_egress_nat_config` Ã¢ÂÂ unico constructor de `EgressNatConfig`, antes de todo sink. `write_remote_file` reescrito: contenido por **stdin** a `sudo -n tee '<path>'`, sin shell. Unit test + revision adversarial multi-agente (GO).
+> **RESOLVED (2026-06-26).** `validate_iface_name` (allowlist `^[A-Za-z0-9._-]{1,15}$`, IFNAMSIZ, rejects `.`/`..`) in `resolve_egress_nat_config` — the only constructor of `EgressNatConfig`, before any sink. `write_remote_file` rewritten: content through **stdin** to `sudo -n tee '<path>'`, no shell. Unit test + multi-agent adversarial review (GO).
 
-Verificacion: **empirica** (se reconstruyo la cadena de quoting exacta y se ejecuto contra bash real).
+Verification: **empirical** (the exact quoting chain was rebuilt and run against real bash).
 
-Reescrito desde la version anterior, que lo clasificaba como "Baja - puede alterar contenidos con comillas simples". La sospecha del propio finding anterior ("OJO IMPORTANTE") se confirmo: no es una cuestion de fidelidad byte, es ejecucion de comandos arbitrarios como root.
+Rewritten from the previous version, which classified it as "Low - can alter contents with single quotes". The suspicion raised in that earlier finding itself ("CAREFUL, IMPORTANT") was confirmed: it is not a matter of byte fidelity, it is arbitrary command execution as root.
 
-Evidencia:
+Evidence:
 
 - `write_remote_file` (`src/bin/sy_orchestrator.rs:16903-16906`):
   - `let escaped = contents.replace('\'', "'\"'\"'");`
   - `let cmd = format!("cat > {} <<'EOF'\n{}\nEOF", remote_path, escaped);`
   - `let sudo_cmd = sudo_wrap(&format!("bash -lc \"{}\"", cmd.replace('"', "\\\"")));`
-- `sudo_wrap` (`src/bin/sy_orchestrator.rs:17107`) genera `sudo -n bash -lc "..."` (root). El cuerpo del heredoc viaja dentro de unas dobles comillas que el login shell remoto expande **antes** de procesar el `<<'EOF'`. El unico escape de esa capa exterior es `replace('"', "\\\"")`; nunca se escapan `$`, backtick ni `\`.
-- Reproducido: con `contents` = `x=$(touch PWNED && echo INJECTED)` se crea el archivo `PWNED` en el host y el archivo escrito queda `x=INJECTED`. La variante con backticks (`y=` seguido de `touch PWNED2` entre acentos graves) tambien ejecuta. `z=$HOME` se expande.
-- Fuente sin validar: `wan_iface`/`lan_iface` llegan del payload de `add_hive` y `resolve_egress_nat_config` (`src/bin/sy_orchestrator.rs:3801-3802`) solo hace `require_field` (= `trim` + no-vacio, `:3773-3779`). No hay ninguna validacion de nombre de interfaz en el repo. Se interpolan en `hive_yaml` (`add_egress_hive_flow:15841-15851`) y se pasan a `write_remote_file(/etc/fluxbee/hive.yaml, hive_yaml)` (`:15853`).
-- Existe ya el primitivo correcto `shell_single_quote` (`src/bin/sy_orchestrator.rs:13598`), usado bien en otros sitios (p.ej. `:7378`); esta ruta lo ignora.
+- `sudo_wrap` (`src/bin/sy_orchestrator.rs:17107`) generates `sudo -n bash -lc "..."` (root). The heredoc body travels inside double quotes that the remote login shell expands **before** it processes the `<<'EOF'`. The only escape of that outer layer is `replace('"', "\\\"")`; `$`, backtick and `\` are never escaped.
+- Reproduced: with `contents` = `x=$(touch PWNED && echo INJECTED)`, the file `PWNED` is created on the host and the written file ends up as `x=INJECTED`. The backtick variant (`y=` followed by `touch PWNED2` between backticks) also executes. `z=$HOME` is expanded.
+- Unvalidated source: `wan_iface`/`lan_iface` come from the `add_hive` payload, and `resolve_egress_nat_config` (`src/bin/sy_orchestrator.rs:3801-3802`) only does `require_field` (= `trim` + non-empty, `:3773-3779`). There is no interface-name validation anywhere in the repo. They are interpolated into `hive_yaml` (`add_egress_hive_flow:15841-15851`) and passed to `write_remote_file(/etc/fluxbee/hive.yaml, hive_yaml)` (`:15853`).
+- The correct primitive, `shell_single_quote` (`src/bin/sy_orchestrator.rs:13598`), already exists and is used correctly in other places (e.g. `:7378`); this path ignores it.
 
-Impacto:
+Impact:
 
-Un `add_hive role=egress` (motherbee-only, autenticado por admin) con `egress.wan_iface = "eth0$(...)"` ejecuta codigo arbitrario como root en el host egress remoto. Es un cruce de limite de confianza string-de-config -> shell, no mera corrupcion de archivo.
+An `add_hive role=egress` (motherbee-only, authenticated by admin) with `egress.wan_iface = "eth0$(...)"` executes arbitrary code as root on the remote egress host. It is a config-string -> shell trust-boundary crossing, not mere file corruption.
 
-Mitigantes (por eso Alta y no Critica): `add_hive` es motherbee-only (`:1571`) y requiere un `ADMIN_COMMAND` autenticado; no es RCE no autenticado desde internet. El campo `egress.gateway_ip` si se valida como `Ipv4Addr` antes de interpolar (`render_worker_egress_yaml:3222-3224`), pero `wan_iface`/`lan_iface` (y otros strings libres como nombres de nodo identity, paths) no.
+Mitigating factors (hence High and not Critical): `add_hive` is motherbee-only (`:1571`) and requires an authenticated `ADMIN_COMMAND`; it is not unauthenticated RCE from the internet. The `egress.gateway_ip` field is indeed validated as `Ipv4Addr` before interpolation (`render_worker_egress_yaml:3222-3224`), but `wan_iface`/`lan_iface` (and other free-form strings such as identity node names, paths) are not.
 
-Recomendacion:
+Recommendation:
 
-1. Validar `wan_iface`/`lan_iface` contra el formato real de interfaz Linux (`^[A-Za-z0-9._-]{1,15}$`, IFNAMSIZ<=15) en `resolve_egress_nat_config`, antes de cualquier interpolacion.
-2. Reescribir `write_remote_file` para no construir shell por interpolacion: pasar `contents` por stdin a `ssh ... sudo tee <path>` (o `scp`, ya existe `scp_with_key:16855`), sin la capa envolvente `bash -lc "..."`.
+1. Validate `wan_iface`/`lan_iface` against the real Linux interface format (`^[A-Za-z0-9._-]{1,15}$`, IFNAMSIZ<=15) in `resolve_egress_nat_config`, before any interpolation.
+2. Rewrite `write_remote_file` so it does not build shell by interpolation: pass `contents` through stdin to `ssh ... sudo tee <path>` (or `scp`; `scp_with_key:16855` already exists), without the wrapping `bash -lc "..."` layer.
 
-### F8 - Alta - `ADMIN_COMMAND` no consulta allowlist de origen para acciones destructivas
+### F8 - High - `ADMIN_COMMAND` checks no origin allowlist for destructive actions
 
-> **RESUELTO (2026-06-26) Ã¢ÂÂ cambio de 2 componentes.** El diseÃÂ±o revelÃÂ³ que **todo** el trÃÂ¡fico admin legÃÂ­timo llegaba con `src_l2_name: None`, asÃÂ­ que el gate "obvio" habrÃÂ­a roto toda la API admin. Fix en dos partes: **(A)** `send_admin_request` (sy_admin.rs) ahora estampa la identidad del relay `SY.admin@<hive>` en vez de `None` (5 call-sites pasan `&admin_node_name(&ctx.hive_id)`; el SDK `send_admin_rpc` se dejÃÂ³ en `None` a propÃÂ³sito Ã¢ÂÂ architect/diag llegan vÃÂ­a el relay que re-estampa). **(B)** `handle_admin` gatea las acciones mutantes: `admin_action_requires_origin` (reusa `classify_admin_action` + `start_node`/`restart_node` explÃÂ­citos) `&&` `is_allowed_admin_source_name` (`== SY.admin@<su-propio-hive>`, exacto, same-hive). Todas las acciones admin rutean al orchestrator **local** (`action_routes_via_local_orchestrator`), asÃÂ­ que relay-hive == target-hive Ã¢ÂÂ sin regresiÃÂ³n cross-hive. 4 unit tests (predicado + e2e `None`Ã¢ÂÂFORBIDDEN + foreignÃ¢ÂÂFORBIDDEN). RevisiÃÂ³n adversarial multi-agente: **GO, 0 defectos bloqueantes** (regresiÃÂ³n / cobertura+bypass / correctitud verificados). **Residual conocido (finding aparte):** el hop-1 (caller Ã¢ÂÂ socket interno de SY.admin) sigue sin gatear; el gate es defensa-en-profundidad sobre nombre auto-afirmado, no barrera criptogrÃÂ¡fica (eso llega con la auth de transporte de F4/F15).
+> **RESOLVED (2026-06-26) — a 2-component change.** The design revealed that **all** legitimate admin traffic arrived with `src_l2_name: None`, so the "obvious" gate would have broken the whole admin API. Two-part fix: **(A)** `send_admin_request` (sy_admin.rs) now stamps the relay identity `SY.admin@<hive>` instead of `None` (5 call-sites pass `&admin_node_name(&ctx.hive_id)`; the SDK's `send_admin_rpc` was left at `None` on purpose — architect/diag arrive via the relay, which re-stamps). **(B)** `handle_admin` gates the mutating actions: `admin_action_requires_origin` (reuses `classify_admin_action` + explicit `start_node`/`restart_node`) `&&` `is_allowed_admin_source_name` (`== SY.admin@<its-own-hive>`, exact, same-hive). All admin actions route to the **local** orchestrator (`action_routes_via_local_orchestrator`), so relay-hive == target-hive → no cross-hive regression. 4 unit tests (predicate + e2e `None`→FORBIDDEN + foreign→FORBIDDEN). Multi-agent adversarial review: **GO, 0 blocking defects** (regression / coverage+bypass / correctness verified). **Known residual (separate finding):** hop-1 (caller → SY.admin's internal socket) is still not gated; the gate is defense-in-depth over a self-asserted name, not a cryptographic barrier (that comes with the F4/F15 transport auth).
 
-Verificacion: lectura.
+Verification: reading.
 
-Evidencia:
+Evidence:
 
-- `handle_admin` (`src/bin/sy_orchestrator.rs:1409`) entra directo de `msg.meta.action` al match de acciones. `kill_node` (`:1511`), `set_node_config` (`:1507`), `run_node` (`:1510`), `restart_node` (`:1509`), `remove_node_instance` (`:1499`) no tienen ninguna verificacion de origen. `add_hive` (`:1571`) y `remove_hive` (`:1546`) solo chequean `state.is_motherbee` (propiedad del nodo local, no del emisor).
-- El gate `is_allowed_system_source_name` solo se invoca en `handle_system_message` (`:1689`), nunca en `handle_admin` (grep confirma una sola aparicion).
-- El canal ADMIN es alcanzable desde la malla: `pre_pending_rule(RouteMatch::exact(ADMIN_KIND, MSG_ADMIN_COMMAND), RouteTarget::Command(RPC_CH_ADMIN))` (`:508-511`) -> `run_admin_worker` -> `handle_admin` sin filtro.
-- La misma `kill_node_flow` es alcanzable por dos caminos: `KILL_NODE` (system, gateado en `:1728`) y `kill_node` (admin, sin gatear en `:1511`).
-- Agravante: `run_node` por ADMIN reenvia `SPAWN_NODE` al hive destino; el `src_l2_name` del mensaje reenviado es el del orchestrator relay, que siempre matchea `is_allowed_system_source_name` por `starts_with("SY.orchestrator@")` (`:1850`). Una entrada no autorizada por el path admin se "lava" a traves del allowlist del path system del segundo hive.
+- `handle_admin` (`src/bin/sy_orchestrator.rs:1409`) goes straight from `msg.meta.action` into the action match. `kill_node` (`:1511`), `set_node_config` (`:1507`), `run_node` (`:1510`), `restart_node` (`:1509`), `remove_node_instance` (`:1499`) have no origin check at all. `add_hive` (`:1571`) and `remove_hive` (`:1546`) only check `state.is_motherbee` (a property of the local node, not of the sender).
+- The `is_allowed_system_source_name` gate is only invoked in `handle_system_message` (`:1689`), never in `handle_admin` (grep confirms a single occurrence).
+- The ADMIN channel is reachable from the mesh: `pre_pending_rule(RouteMatch::exact(ADMIN_KIND, MSG_ADMIN_COMMAND), RouteTarget::Command(RPC_CH_ADMIN))` (`:508-511`) -> `run_admin_worker` -> `handle_admin` with no filter.
+- The same `kill_node_flow` is reachable through two paths: `KILL_NODE` (system, gated at `:1728`) and `kill_node` (admin, not gated at `:1511`).
+- Aggravating factor: `run_node` over ADMIN forwards `SPAWN_NODE` to the target hive; the `src_l2_name` of the forwarded message is that of the relay orchestrator, which always matches `is_allowed_system_source_name` through `starts_with("SY.orchestrator@")` (`:1850`). An unauthorized entry through the admin path gets "laundered" through the system-path allowlist of the second hive.
 
-Contrato/documentacion:
+Contract/documentation:
 
-- `docs/onworking COA/sy_router_tasks.md:216`: el chequeo de origen en SY.orchestrator es "ademas de policy/router" (defensa en profundidad en el nodo, no solo en el router).
-- El guard `scripts/router_dispatcher_guards/origin_auth_gates_present.sh` exige `admin_origin_authorized`/`build_admin_forbidden_response` en SY.admin (gateway canonico de `ADMIN_COMMAND`). El orchestrator recibio el gate del lado SYSTEM pero no su equivalente del lado ADMIN.
+- `docs/history/onworking-coa/sy_router_tasks.md:216`: the origin check in SY.orchestrator is "in addition to policy/router" (defense in depth in the node, not only in the router).
+- The guard `scripts/router_dispatcher_guards/origin_auth_gates_present.sh` requires `admin_origin_authorized`/`build_admin_forbidden_response` in SY.admin (the canonical `ADMIN_COMMAND` gateway). The orchestrator received the gate on the SYSTEM side but not its equivalent on the ADMIN side.
 
-Impacto:
+Impact:
 
-Un nodo de la malla (o comprometido) que pueda direccionar `SY.orchestrator@<hive>` con un `ADMIN_COMMAND` mutante ejecuta la operacion sin pasar por allowlist. Distinto de F4: aqui el camino ADMIN ni siquiera invoca el allowlist. Mitigante: depende de cuan permisiva sea la policy OPA del router para `ADMIN_COMMAND`, y `add_hive`/`remove_hive` tienen el gate parcial `is_motherbee`.
+A mesh node (or a compromised one) that can address `SY.orchestrator@<hive>` with a mutating `ADMIN_COMMAND` runs the operation without going through any allowlist. Unlike F4: here the ADMIN path does not even invoke the allowlist. Mitigating factor: it depends on how permissive the router's OPA policy is for `ADMIN_COMMAND`, and `add_hive`/`remove_hive` have the partial `is_motherbee` gate.
 
-Recomendacion:
+Recommendation:
 
-Agregar en `handle_admin` un gate de origen para acciones admin protegidas (predicado de acciones + `admin_origin_authorized` + `build_admin_forbidden_response`), en paridad con SY.admin, antes del match de `:1416`. Tests: negativo (origen no permitido -> FORBIDDEN) y positivo (`SY.admin@<hive>`). Incluir al orchestrator en `origin_auth_gates_present.sh`.
+Add to `handle_admin` an origin gate for protected admin actions (action predicate + `admin_origin_authorized` + `build_admin_forbidden_response`), on par with SY.admin, before the match at `:1416`. Tests: negative (origin not allowed -> FORBIDDEN) and positive (`SY.admin@<hive>`). Include the orchestrator in `origin_auth_gates_present.sh`.
 
-### F1 - Alta - `remove_hive` usa SSH operativo contra el contrato v2
+### F1 - High - `remove_hive` uses operational SSH against the v2 contract
 
-Verificacion: lectura + git blame.
+Verification: reading + git blame.
 
-Evidencia:
+Evidence:
 
-- `remove_hive_cleanup_via_ssh` existe (`src/bin/sy_orchestrator.rs:7397`); unicas guardas son address vacio (`:7399`) y key inexistente (`:7403`). Usa `ssh_with_key(address, key, cleanup_cmd, BOOTSTRAP_SSH_USER)`.
-- Camino socket OK (`:7476-7499`): aunque `socket_cleanup_ok=true`, si `address` no esta vacio se llama igual `remove_hive_cleanup_via_ssh(&address)` (`:7479`) como "verificacion" -> `remote_cleanup=socket_ok_ssh_verified`, `remote_cleanup_via=socket+ssh` (`:7494-7495`).
-- Camino socket fallo/timeout (`:7500-7524`): fallback SSH -> `socket_timeout_ssh_ok`/`socket_failed_ssh_ok`, `remote_cleanup_via=ssh` (`:7518-7524`).
-- No hay early-return ni flag de config que apague el SSH. `address` se relee de `info.yaml` (`:7441-7449`), asi que para un hive normal con address valido y key presente (sembrada por `scripts/install.sh`), SSH se ejecuta en cada `remove_hive`.
+- `remove_hive_cleanup_via_ssh` exists (`src/bin/sy_orchestrator.rs:7397`); its only guards are an empty address (`:7399`) and a missing key (`:7403`). It uses `ssh_with_key(address, key, cleanup_cmd, BOOTSTRAP_SSH_USER)`.
+- Socket OK path (`:7476-7499`): even with `socket_cleanup_ok=true`, if `address` is not empty, `remove_hive_cleanup_via_ssh(&address)` is called anyway (`:7479`) as a "verification" -> `remote_cleanup=socket_ok_ssh_verified`, `remote_cleanup_via=socket+ssh` (`:7494-7495`).
+- Socket failure/timeout path (`:7500-7524`): SSH fallback -> `socket_timeout_ssh_ok`/`socket_failed_ssh_ok`, `remote_cleanup_via=ssh` (`:7518-7524`).
+- There is no early-return and no config flag that turns SSH off. `address` is re-read from `info.yaml` (`:7441-7449`), so for a normal hive with a valid address and a key present (seeded by `scripts/install.sh`), SSH runs on every `remove_hive`.
 
-Contrato/documentacion:
+Contract/documentation:
 
-- `docs/onworking COA/sy_orchestrator_v2_tasks.md:10-12`: SSH solo para bootstrap de `add_hive`; "sin fallback SSH operativo".
-- `:21`: `[x] remove_hive sin fallback SSH: online por socket o cleanup local` (marcado cerrado).
-- `:103-105`: E2E-3 offline -> `remote_cleanup in {socket_timeout,local_only}` y `remote_cleanup_via=local_only`.
-- El codigo **rompe el propio gate E2E-3**: `scripts/orchestrator_remove_hive_socket_e2e.sh:163-164` exige `socket_ok` exacto en online (recibe `socket_ok_ssh_verified`), y `:202-205` exige `local_only` en offline (puede recibir `ssh`). El script fuerza offline parando solo el orchestrator remoto (`:137`), sin inutilizar SSH, asi que el fallback prospera.
+- `docs/history/onworking-coa/sy_orchestrator_v2_tasks.md:10-12`: SSH only for the `add_hive` bootstrap; "no operational SSH fallback".
+- `:21`: `[x] remove_hive sin fallback SSH: online por socket o cleanup local` ("remove_hive without SSH fallback: online via socket or local cleanup") (marked closed).
+- `:103-105`: E2E-3 offline -> `remote_cleanup in {socket_timeout,local_only}` and `remote_cleanup_via=local_only`.
+- The code **breaks the E2E-3 gate itself**: `scripts/orchestrator_remove_hive_socket_e2e.sh:163-164` requires exactly `socket_ok` when online (it gets `socket_ok_ssh_verified`), and `:202-205` requires `local_only` when offline (it can get `ssh`). The script forces offline by stopping only the remote orchestrator (`:137`), without disabling SSH, so the fallback succeeds.
 
-Matiz ("reintroduce"): el git blame muestra que el commit `cd4967c` agrego la "verificacion" SSH del camino socket-OK (eso es reintroduccion genuina); el fallback SSH del camino offline (`:7500-7524`) ya preexistia. La conclusion (SSH operativo presente contra contrato) es correcta en ambos casos.
+Nuance ("reintroduces"): git blame shows that commit `cd4967c` added the SSH "verification" on the socket-OK path (that is a genuine reintroduction); the SSH fallback on the offline path (`:7500-7524`) already existed before. The conclusion (operational SSH present against the contract) is correct in both cases.
 
-Impacto:
+Impact:
 
-`remove_hive` muta el worker por SSH aunque la operacion v2 deberia ser socket-only o local-only, y rompe el contrato y su test de cierre. Mitigante: el resultado es idempotente (el cleanup ya ocurrio por socket; el directorio local se borra igual) y degrada con gracia si la key/SSH fallan.
+`remove_hive` mutates the worker over SSH even though the v2 operation should be socket-only or local-only, and it breaks the contract and its closing test. Mitigating factor: the result is idempotent (the cleanup already happened over the socket; the local directory is deleted anyway), and it degrades gracefully if the key/SSH fail.
 
-Recomendacion:
+Recommendation:
 
-Eliminar `remove_hive_cleanup_via_ssh` del flujo. Para online, reportar solo `socket_ok`/`socket`. Para timeout/fallo de socket, continuar con cleanup local y reportar `socket_timeout`/`local_only` con `remote_cleanup_via=local_only`. Tras eso los gates E2E-3 online y offline pasan sin tocar el script.
+Remove `remove_hive_cleanup_via_ssh` from the flow. For online, report only `socket_ok`/`socket`. For a socket timeout/failure, continue with local cleanup and report `socket_timeout`/`local_only` with `remote_cleanup_via=local_only`. After that, the online and offline E2E-3 gates pass without touching the script.
 
-### F2 - Alta - `add_hive` socket-only puede caer a bootstrap SSH
+### F2 - High - `add_hive` socket-only can fall back to the SSH bootstrap
 
-Verificacion: lectura.
+Verification: reading.
 
-Evidencia:
+Evidence:
 
-- Fast path detecta orchestrator remoto en LSA via `wait_for_remote_orchestrator_node` -> `socket_only_ready=true` (`src/bin/sy_orchestrator.rs:14821-14822`).
-- Tres caminos llegan a SSH bootstrap (`:14991`) aun con `socket_only_ready=true`:
-  1. Fallo de probe (`:14824`): el `else` se salta, solo hay `tracing::warn!`, y el control sale hasta `:14991`. **No pasa por `is_socket_only_unreachable_error`** Ã¢ÂÂ cualquier fallo de `GET_VERSIONS` (incluido payload non-ok) cae a SSH. Es la violacion mas cruda.
-  2. Finalize unreachable/timeout (`:14847-14856`): `is_socket_only_unreachable_error` (`:14586`, usada en `:14849`) matchea timeout/unreachable -> `finalize = None` -> el bloque finalize se salta -> SSH.
-  3. Finalize con error NO-unreachable (`:14857-14876`): retorna `FINALIZE_FAILED`. Unico branch que cumple el contrato.
+- The fast path detects the remote orchestrator in LSA via `wait_for_remote_orchestrator_node` -> `socket_only_ready=true` (`src/bin/sy_orchestrator.rs:14821-14822`).
+- Three paths reach the SSH bootstrap (`:14991`) even with `socket_only_ready=true`:
+  1. Probe failure (`:14824`): the `else` is skipped, there is only a `tracing::warn!`, and control falls through to `:14991`. **It does not go through `is_socket_only_unreachable_error`** — any `GET_VERSIONS` failure (including a non-ok payload) falls back to SSH. This is the crudest violation.
+  2. Finalize unreachable/timeout (`:14847-14856`): `is_socket_only_unreachable_error` (`:14586`, used at `:14849`) matches timeout/unreachable -> `finalize = None` -> the finalize block is skipped -> SSH.
+  3. Finalize with a NON-unreachable error (`:14857-14876`): returns `FINALIZE_FAILED`. The only branch that meets the contract.
 
-Contrato/documentacion:
+Contract/documentation:
 
-- `docs/onworking COA/sy_orchestrator_v2_tasks.md:10-12`: si el worker ya esta online por socket, no se usa SSH.
-- `:22`: `[x] add_hive socket-only no cae a bootstrap SSH si falla finalize (FINALIZE_FAILED)` Ã¢ÂÂ sin excepcion por timeout/unreachable.
-- `:101-102`: `[x] E2E-2` espera `bootstrap_mode=socket_only_existing_orchestrator`, cero pasos SSH. Ningun script referencia ese modo (grep vacio): el item esta marcado cerrado pero **ningun test lo guarda**.
+- `docs/history/onworking-coa/sy_orchestrator_v2_tasks.md:10-12`: if the worker is already online over the socket, SSH is not used.
+- `:22`: `[x] add_hive socket-only no cae a bootstrap SSH si falla finalize (FINALIZE_FAILED)` ("add_hive socket-only does not fall back to SSH bootstrap if finalize fails (FINALIZE_FAILED)") — with no exception for timeout/unreachable.
+- `:101-102`: `[x] E2E-2` expects `bootstrap_mode=socket_only_existing_orchestrator`, zero SSH steps. No script references that mode (empty grep): the item is marked closed, but **no test guards it**.
 
-Impacto:
+Impact:
 
-Un worker ya operativo puede ser reprovisionado por SSH (siembra de key/sudoers + `sync_core_to_worker:15120` que copia binarios core) por una falla transitoria de probe/finalize. Contradice el contrato y reescribe configuracion de un host que ya estaba arriba.
+An already-operational worker can be re-provisioned over SSH (key/sudoers seeding + `sync_core_to_worker:15120`, which copies the core binaries) because of a transient probe/finalize failure. It contradicts the contract and rewrites the configuration of a host that was already up.
 
-Recomendacion:
+Recommendation:
 
-Una vez `socket_only_ready=true`, bloquear todo fallback SSH en ambos puntos (probe y finalize-unreachable): devolver error explicito (`FINALIZE_FAILED` o codigo de probe), sin continuar a bootstrap. Agregar E2E-2 que asierte cero pasos SSH.
+Once `socket_only_ready=true`, block every SSH fallback at both points (probe and finalize-unreachable): return an explicit error (`FINALIZE_FAILED` or a probe code), without continuing to the bootstrap. Add an E2E-2 that asserts zero SSH steps.
 
-### F3 - Alta - `add_hive` borra directorios antes de validar `hive_id`
+### F3 - High - `add_hive` deletes directories before validating `hive_id`
 
-> **RESUELTO (2026-06-26).** `valid_hive_id`/`valid_address` movidos al **inicio** de `add_hive_flow` y `add_egress_hive_flow`, antes de todo `join`/`hive_exists`/`hive_partial_exists`/`remove_dir_all`/`create_dir_all`. Backstop lÃÂ©xico de defensa-en-profundidad `hive_dir_is_direct_child` (exige un ÃÂºnico componente `Normal` bajo `hives_root`, rechaza `..`) antes de cada `remove_dir_all` **y** `create_dir_all`. Unit test `f3_hive_id_traversal_is_rejected` + revisiÃÂ³n adversarial (GO; verificado que no quedan sinks destructivos sin gatear y sin regresiÃÂ³n de flujos legÃÂ­timos).
+> **RESOLVED (2026-06-26).** `valid_hive_id`/`valid_address` moved to the **start** of `add_hive_flow` and `add_egress_hive_flow`, before any `join`/`hive_exists`/`hive_partial_exists`/`remove_dir_all`/`create_dir_all`. A defense-in-depth lexical backstop, `hive_dir_is_direct_child` (requires a single `Normal` component under `hives_root`, rejects `..`), before each `remove_dir_all` **and** `create_dir_all`. Unit test `f3_hive_id_traversal_is_rejected` + adversarial review (GO; verified that no ungated destructive sinks remain and that legitimate flows do not regress).
 
-Verificacion: **empirica** (rustc confirmo que `Path::join` no normaliza `..` y `remove_dir_all` escapa el root).
+Verification: **empirical** (rustc confirmed that `Path::join` does not normalize `..` and that `remove_dir_all` escapes the root).
 
-Severidad bajada de Critica a Alta respecto de la version anterior (ver abajo).
+Severity lowered from Critical to High compared with the previous version (see below).
 
-Evidencia:
+Evidence:
 
-- Worker `add_hive_flow`: `hive_dir = root.join(hive_id)` (`:14743`, root = `hives_root()` en `:14742`); `hive_exists` (`:14744`); `hive_partial_exists` (`:14760`); `fs::remove_dir_all(&hive_dir)` (`:14765`); y recien `valid_hive_id` (`:14773`).
-- Egress `add_egress_hive_flow`: mismo orden Ã¢ÂÂ `:15677`, `:15681`, `:15682`, validacion en `:15686`.
-- `valid_hive_id` (`:16064`) rechaza vacio, `len>64`, y todo byte fuera de `[A-Za-z0-9_-]` (asi `/`, `.`, `..` quedan rechazados Ã¢ÂÂ pero tarde).
-- El dispatcher toma `hive_id` crudo de `msg.payload` sin sanitizar (`:1580-1584`); unica barrera previa es `is_motherbee` (`:1571`).
-- Reproducido: `root.join("../victim")` = `.../hives/../victim` (preserva `ParentDir`); `fs::remove_dir_all` sobre esa ruta borro recursivamente un directorio hermano fuera del arbol.
+- Worker `add_hive_flow`: `hive_dir = root.join(hive_id)` (`:14743`, root = `hives_root()` at `:14742`); `hive_exists` (`:14744`); `hive_partial_exists` (`:14760`); `fs::remove_dir_all(&hive_dir)` (`:14765`); and only then `valid_hive_id` (`:14773`).
+- Egress `add_egress_hive_flow`: same order — `:15677`, `:15681`, `:15682`, validation at `:15686`.
+- `valid_hive_id` (`:16064`) rejects empty, `len>64`, and any byte outside `[A-Za-z0-9_-]` (so `/`, `.`, `..` are rejected — but late).
+- The dispatcher takes the raw `hive_id` from `msg.payload` without sanitizing it (`:1580-1584`); the only earlier barrier is `is_motherbee` (`:1571`).
+- Reproduced: `root.join("../victim")` = `.../hives/../victim` (it keeps the `ParentDir`); `fs::remove_dir_all` on that path recursively deleted a sibling directory outside the tree.
 
-Preconditions (que la version anterior omitia): el target debe (a) existir ya como directorio y (b) carecer de `info.yaml` (si lo tiene, `hive_exists` cortocircuita con `HIVE_EXISTS` antes del borrado). Esto acota pero no elimina el impacto.
+Preconditions (which the previous version left out): the target must (a) already exist as a directory and (b) lack an `info.yaml` (if it has one, `hive_exists` short-circuits with `HIVE_EXISTS` before the deletion). This narrows the impact but does not eliminate it.
 
-Impacto:
+Impact:
 
-Un `add_hive(hive_id='../<dir-existente-sin-info.yaml>')` borra ese directorio fuera de `storage/hives`. Es destructivo. Mitigante (por eso Alta y no Critica): doble gate Ã¢ÂÂ `is_motherbee` + `ADMIN_COMMAND` autenticado. Es path traversal de operador privilegiado, no destruccion remota no autenticada. Contraste: `remove_hive_flow` valida primero (`valid_hive_id:7415`) y recien luego hace `root.join` Ã¢ÂÂ patron correcto del cual `add_hive`/`add_egress` se desvian.
+An `add_hive(hive_id='../<existing-dir-without-info.yaml>')` deletes that directory outside `storage/hives`. It is destructive. Mitigating factor (hence High and not Critical): a double gate — `is_motherbee` + an authenticated `ADMIN_COMMAND`. It is path traversal by a privileged operator, not unauthenticated remote destruction. Contrast: `remove_hive_flow` validates first (`valid_hive_id:7415`) and only then does `root.join` — the correct pattern that `add_hive`/`add_egress` deviate from.
 
-Recomendacion:
+Recommendation:
 
-Mover `valid_hive_id` (y `valid_address`) al inicio de ambos flujos, antes de cualquier `join`/`hive_exists`/`hive_partial_exists`/`remove_dir_all`, o sanitizar `hive_id` en el dispatcher (`:1580`). Adicionalmente, antes de borrar, canonicalizar y verificar que la ruta siga bajo `hives_root()`.
+Move `valid_hive_id` (and `valid_address`) to the start of both flows, before any `join`/`hive_exists`/`hive_partial_exists`/`remove_dir_all`, or sanitize `hive_id` in the dispatcher (`:1580`). In addition, before deleting, canonicalize the path and verify that it is still under `hives_root()`.
 
-### F4 - Alta - La allowlist de origen `system` no es realmente configurable
+### F4 - High - The `system` origin allowlist is not really configurable
 
-> **RESUELTO (2026-06-26) — router-authority.** En vez de hacer configurable el allowlist del orchestrator, se **movió la autoridad de origen SYSTEM al router** (centro de routing; no distribuir el chequeo). El gate del orchestrator (con sus 4 prefijos hardcodeados — la causa raíz de F4) **se eliminó**. El router gatea las 18 acciones protegidas en `serialize_for_local_delivery` sobre el `src_l2_name` autoritativo. La configurabilidad por operador va a la futura **capa OPA-system** (anotada). Ver el detalle en "Estado de resolución".
+> **RESOLVED (2026-06-26) — router-authority.** Instead of making the orchestrator's allowlist configurable, **SYSTEM origin authority was moved to the router** (the routing center; do not spread the check around). The orchestrator's gate (with its 4 hardcoded prefixes — the root cause of F4) **was removed**. The router gates the 18 protected actions in `serialize_for_local_delivery` on the authoritative `src_l2_name`. Operator configurability goes to the future **OPA-system layer** (noted). See the details in "Resolution status".
 
-Verificacion: lectura + test.
+Verification: reading + test.
 
-Evidencia:
+Evidence:
 
-- `load_system_allowed_origins` (`src/bin/sy_orchestrator.rs:2791-2805`) lee `ORCH_SYSTEM_ALLOWED_ORIGINS` (default `SY.admin,WF.orch.diag`) y expande entradas sin `@` a `@<hive_id>`.
-- `is_allowed_system_source_name` (`:1845-1854`): tras rechazar None/vacio, retorna true si `system_allowed_origins.contains(name)` **OR** `name.starts_with` de `SY.orchestrator@`, `SY.admin@`, `SY.wf-rules@` o `WF.orch.diag@`. Los 4 prefijos son incondicionales: no se desactivan por env var.
-- Test `system_source_with_allowed_src_l2_name_passes_auth` (`:18391`): inserta solo `SY.admin@motherbee` pero asierta que `WF.orch.diag@motherbee` pasa (`:18401-18404`) sin haberlo insertado Ã¢ÂÂ fija el bypass hardcodeado. El fix debe tocar este test.
+- `load_system_allowed_origins` (`src/bin/sy_orchestrator.rs:2791-2805`) reads `ORCH_SYSTEM_ALLOWED_ORIGINS` (default `SY.admin,WF.orch.diag`) and expands entries without `@` to `@<hive_id>`.
+- `is_allowed_system_source_name` (`:1845-1854`): after rejecting None/empty, it returns true if `system_allowed_origins.contains(name)` **OR** `name.starts_with` any of `SY.orchestrator@`, `SY.admin@`, `SY.wf-rules@` or `WF.orch.diag@`. The 4 prefixes are unconditional: no env var turns them off.
+- Test `system_source_with_allowed_src_l2_name_passes_auth` (`:18391`): it inserts only `SY.admin@motherbee` but asserts that `WF.orch.diag@motherbee` passes (`:18401-18404`) without having inserted it — it pins down the hardcoded bypass. The fix must touch this test.
 
-Contrato/documentacion:
+Contract/documentation:
 
-- `docs/onworking COA/sy_router_tasks.md:216,218`: hardening por allowlist explicita, configurable via `ORCH_SYSTEM_ALLOWED_ORIGINS`.
-- `:220`: recomendacion productiva `ORCH_SYSTEM_ALLOWED_ORIGINS=SY.admin`, dejando `WF.orch.diag` solo para pruebas controladas. **Esa recomendacion es inalcanzable**: `WF.orch.diag@` esta hardcodeado en `:1853`, asi que el tooling de diagnostico mantiene acceso a `SPAWN_NODE`/`KILL_NODE`/`SYSTEM_UPDATE` en produccion aunque el operador siga la guia.
-- `SY.orchestrator@` y `SY.wf-rules@` ni siquiera figuran en el contrato como origenes de sistema (el contrato solo menciona `SY.admin` y `WF.orch.diag`): 2 origenes hardcodeados ausentes de la spec.
+- `docs/history/onworking-coa/sy_router_tasks.md:216,218`: hardening by an explicit allowlist, configurable via `ORCH_SYSTEM_ALLOWED_ORIGINS`.
+- `:220`: production recommendation `ORCH_SYSTEM_ALLOWED_ORIGINS=SY.admin`, leaving `WF.orch.diag` only for controlled tests. **That recommendation is unattainable**: `WF.orch.diag@` is hardcoded at `:1853`, so the diagnostic tooling keeps access to `SPAWN_NODE`/`KILL_NODE`/`SYSTEM_UPDATE` in production even if the operator follows the guide.
+- `SY.orchestrator@` and `SY.wf-rules@` do not even appear in the contract as system origins (the contract only mentions `SY.admin` and `WF.orch.diag`): 2 hardcoded origins missing from the spec.
 
-Impacto:
+Impact:
 
-Un operador no puede sacar `WF.orch.diag@*` ni `SY.wf-rules@*` de los origenes aceptados. Cualquier nodo con uno de esos nombres L2 queda autorizado para acciones protegidas si logra rutear el mensaje. Mitigante: el chequeo es "ademas de policy/router" (`:216,291`), hay defensa en profundidad upstream.
+An operator cannot remove `WF.orch.diag@*` or `SY.wf-rules@*` from the accepted origins. Any node with one of those L2 names is authorized for protected actions if it manages to route the message. Mitigating factor: the check is "in addition to policy/router" (`:216,291`); there is defense in depth upstream.
 
-Recomendacion:
+Recommendation:
 
-Mover los 4 prefijos a defaults del allowlist configurable (que `load_system_allowed_origins` los siembre y `is_allowed_system_source_name` solo consulte el set), de modo que `ORCH_SYSTEM_ALLOWED_ORIGINS=SY.admin` realmente excluya `WF.orch.diag`. Si se quiere wildcard, que sea sintaxis explicita de config, no una excepcion silenciosa. Actualizar el test `:18391`.
+Move the 4 prefixes into defaults of the configurable allowlist (have `load_system_allowed_origins` seed them and `is_allowed_system_source_name` only check the set), so that `ORCH_SYSTEM_ALLOWED_ORIGINS=SY.admin` really excludes `WF.orch.diag`. If a wildcard is wanted, make it explicit config syntax, not a silent exception. Update the test at `:18391`.
 
-### F9 - Alta - `add_hive` no es idempotente: timeout deja el hive `pending` atascado
+### F9 - High - `add_hive` is not idempotent: a timeout leaves the hive stuck in `pending`
 
-Verificacion: lectura.
+Verification: reading.
 
-Evidencia:
+Evidence:
 
-- En bootstrap, tras los gates de conectividad, `add_hive_flow` escribe `info.yaml` **antes** de evaluar el resultado: `status = if wan_connected && orchestrator_connected { "connected" } else { "pending" }` (`:15426`) y `write_hive_info` incondicional (`:15428`). Recien despues retorna error: `WAN_TIMEOUT` (`:15436`), `WORKER_ORCHESTRATOR_TIMEOUT` (`:15453`).
-- `hive_exists` (`:16054`) solo comprueba que exista `info.yaml`, ignora `status`. `hive_partial_exists` (`:16059`) considera "parcial" solo cuando `info.yaml` **no** existe. Como el estado `pending` tiene `info.yaml`, un reintento entra por `hive_exists==true` y retorna `HIVE_EXISTS` inmediatamente, sin reintentar bootstrap ni finalize.
-- El finalize que el `pending` nunca ejecuta: `add_hive_finalize_via_socket` (`:15477`), `apply_add_hive_ssh_controls_after_finalize` (`:15582`), `status:connected` (`:15622`).
-- Ningun watchdog/reconciler lee `status=="pending"` para re-drivear finalize (grep: los unicos consumidores de `status` son listado/inventario).
-- Espejo en `add_egress_hive_flow`: escribe `pending` (`:15946-15953`), retorna `WAN_TIMEOUT`/`ORCHESTRATOR_TIMEOUT` (`:15960/15971`), aplica SSH controls recien en `:15989`.
+- In bootstrap, after the connectivity gates, `add_hive_flow` writes `info.yaml` **before** evaluating the result: `status = if wan_connected && orchestrator_connected { "connected" } else { "pending" }` (`:15426`) and an unconditional `write_hive_info` (`:15428`). Only afterwards does it return an error: `WAN_TIMEOUT` (`:15436`), `WORKER_ORCHESTRATOR_TIMEOUT` (`:15453`).
+- `hive_exists` (`:16054`) only checks that `info.yaml` exists; it ignores `status`. `hive_partial_exists` (`:16059`) counts it as "partial" only when `info.yaml` does **not** exist. Since the `pending` state has an `info.yaml`, a retry enters through `hive_exists==true` and returns `HIVE_EXISTS` immediately, without retrying the bootstrap or the finalize.
+- The finalize that the `pending` state never runs: `add_hive_finalize_via_socket` (`:15477`), `apply_add_hive_ssh_controls_after_finalize` (`:15582`), `status:connected` (`:15622`).
+- No watchdog/reconciler reads `status=="pending"` to re-drive the finalize (grep: the only consumers of `status` are listing/inventory).
+- Mirror in `add_egress_hive_flow`: it writes `pending` (`:15946-15953`), returns `WAN_TIMEOUT`/`ORCHESTRATOR_TIMEOUT` (`:15960/15971`), and applies the SSH controls only at `:15989`.
 
-Impacto:
+Impact:
 
-El worker arranca pero su WAN/orchestrator tarda mas de 60s en aparecer en LSA (red lenta, primer arranque, syncthing inicial). `add_hive` escribe `info.yaml=pending` y devuelve timeout. El worker queda operativo; el operador reintenta para completar el finalize (peer-link syncthing, `info=connected`, `restrict_ssh`) y recibe `HIVE_EXISTS`: el hive queda **sin syncthing peer-link ni controles SSH** permanentemente, sin via de recuperacion salvo `remove_hive` manual + re-add. Relevante de seguridad en el caso egress: escribe `pending` antes de aplicar los SSH controls.
+The worker starts, but its WAN/orchestrator takes more than 60s to appear in LSA (slow network, first start, initial syncthing). `add_hive` writes `info.yaml=pending` and returns a timeout. The worker stays operational; the operator retries to complete the finalize (syncthing peer-link, `info=connected`, `restrict_ssh`) and gets `HIVE_EXISTS`: the hive is left permanently **without a syncthing peer-link or SSH controls**, with no recovery path except a manual `remove_hive` + re-add. Security-relevant in the egress case: it writes `pending` before applying the SSH controls.
 
-Recomendacion:
+Recommendation:
 
-Hacer que el guard de entrada distinga `status=="pending"`/`"connected"` (o tratar `pending` como parcial), permitiendo que el reintento caiga en el fast-path socket-only idempotente y complete el finalize.
+Make the entry guard tell `status=="pending"`/`"connected"` apart (or treat `pending` as partial), so that the retry lands on the idempotent socket-only fast-path and completes the finalize.
 
-### F10 - Alta - Fallo de hardening SSH en egress es no-fatal y reporta `status:ok`
+### F10 - High - SSH hardening failure on egress is non-fatal and reports `status:ok`
 
-Verificacion: lectura.
+Verification: reading.
 
-Evidencia:
+Evidence:
 
-- `add_egress_hive_flow` (`src/bin/sy_orchestrator.rs:15989-16001`): el `Err` arm de `apply_add_hive_ssh_controls_after_finalize` solo hace `tracing::warn!("egress ssh hardening failed; continuing")` y setea `(restrict_ssh_applied=false, restrict_ssh_mode="error")`, cayendo al `status:ok` de `:16018-16035`.
-- El flujo worker trata el **mismo helper** como fatal (`:15582-15613`): retorna `SSH_HARDEN_FAILED`/`SSH_KEY_FAILED`.
-- El helper retorna `Err` tanto en fallo de restriccion `from-only` (`:16380-16385`) como en fallo de `disable_remote_password_auth`/verificacion (`:16394-16399`). `disable_remote_password_auth_with_access` reinicia sshd remoto (`:16457-16463`) Ã¢ÂÂ punto de fallo transitorio real.
-- `harden_ssh=true` implica `restrict_ssh=true` por default (`resolve_add_hive_restrict_ssh:16151-16164`).
-- El payload egress emite `harden_ssh: harden_ssh` (`:16028`, eco del request) y no tiene campo de estado dedicado para la mitad harden.
+- `add_egress_hive_flow` (`src/bin/sy_orchestrator.rs:15989-16001`): the `Err` arm of `apply_add_hive_ssh_controls_after_finalize` only does `tracing::warn!("egress ssh hardening failed; continuing")` and sets `(restrict_ssh_applied=false, restrict_ssh_mode="error")`, falling through to the `status:ok` at `:16018-16035`.
+- The worker flow treats the **same helper** as fatal (`:15582-15613`): it returns `SSH_HARDEN_FAILED`/`SSH_KEY_FAILED`.
+- The helper returns `Err` both on a `from-only` restriction failure (`:16380-16385`) and on a `disable_remote_password_auth`/verification failure (`:16394-16399`). `disable_remote_password_auth_with_access` restarts the remote sshd (`:16457-16463`) — a real transient failure point.
+- `harden_ssh=true` implies `restrict_ssh=true` by default (`resolve_add_hive_restrict_ssh:16151-16164`).
+- The egress payload emits `harden_ssh: harden_ssh` (`:16028`, an echo of the request) and has no dedicated status field for the harden half.
 
-Impacto:
+Impact:
 
-El host egress Ã¢ÂÂ el boundary expuesto a internet Ã¢ÂÂ puede quedar con `PasswordAuthentication` habilitado y/o bootstrap key sin `from=` mientras el operador ve `ok`. El flujo worker habria marcado la condicion identica como fallo duro. Mitigante: la mitad `restrict` si deja senal observable (`restrict_ssh_mode="error"`, `restrict_ssh=false`); una automatizacion atenta puede inferir el fallo.
+The egress host — the boundary exposed to the internet — can be left with `PasswordAuthentication` enabled and/or a bootstrap key without `from=` while the operator sees `ok`. The worker flow would have marked the identical condition as a hard failure. Mitigating factor: the `restrict` half does leave an observable signal (`restrict_ssh_mode="error"`, `restrict_ssh=false`); attentive automation can infer the failure.
 
-Recomendacion:
+Recommendation:
 
-Alinear `add_egress_hive_flow` con `add_hive_flow`: retornar `SSH_HARDEN_FAILED`/`SSH_KEY_FAILED` y no devolver `status:ok` cuando el helper falla en un boundary egress. Como minimo, agregar `harden_ssh_applied` real.
+Align `add_egress_hive_flow` with `add_hive_flow`: return `SSH_HARDEN_FAILED`/`SSH_KEY_FAILED` and do not return `status:ok` when the helper fails on an egress boundary. At a minimum, add a real `harden_ssh_applied`.
 
-### F11 - Alta - `remove_hive` de un egress no des-aprovisiona el estado NAT
+### F11 - High - `remove_hive` of an egress does not deprovision the NAT state
 
-> **RESUELTO en cÃÂ³digo (2026-06-26) Ã¢ÂÂ validaciÃÂ³n empÃÂ­rica pendiente (VM/Fase 2).** `remove_hive_flow` lee `role` de info.yaml (`is_egress_role`) y, si es egress, manda `egress_teardown=true` en el `REMOVE_HIVE_CLEANUP` reenviado; el host removido corre el teardown idempotente (`nft delete table inet fluxbee_egress` + `rm -f` los 4 ficheros `/etc` + `sysctl --system`). El teardown se **antepone** al loop de kill de servicios (el cleanup base hace `systemctl kill -s KILL sy-orchestrator` con `KillMode=control-group`, que matarÃÂ­a el propio bash diferido Ã¢ÂÂ el teardown debe correr antes). La respuesta ahora expone `role_egress` + `egress_teardown` (`not_applicable`/`applied_via_socket`/`not_confirmed_host_unreachable`) y advierte cuando se removiÃÂ³ un egress **offline** (orphan posible, teardown manual requerido). Unit test + revisiÃÂ³n adversarial (NO-GO inicial detectÃÂ³ el race del cgroup-kill y el orphan offline sin seÃÂ±al; ambos corregidos y re-verificados CLOSED).
+> **RESOLVED in code (2026-06-26) — empirical validation pending (VM/Phase 2).** `remove_hive_flow` reads `role` from info.yaml (`is_egress_role`) and, if it is egress, sends `egress_teardown=true` in the forwarded `REMOVE_HIVE_CLEANUP`; the removed host runs the idempotent teardown (`nft delete table inet fluxbee_egress` + `rm -f` of the 4 `/etc` files + `sysctl --system`). The teardown is placed **before** the service-kill loop (the base cleanup does `systemctl kill -s KILL sy-orchestrator` with `KillMode=control-group`, which would kill the deferred bash itself → the teardown must run first). The response now exposes `role_egress` + `egress_teardown` (`not_applicable`/`applied_via_socket`/`not_confirmed_host_unreachable`) and warns when an **offline** egress was removed (possible orphan, manual teardown required). Unit test + adversarial review (the initial NO-GO caught the cgroup-kill race and the offline orphan without a signal; both fixed and re-verified CLOSED).
 
-Verificacion: lectura.
+Verification: reading.
 
-Evidencia:
+Evidence:
 
-- El script de cleanup remoto (`src/bin/sy_orchestrator.rs:7366-7375`) solo hace stop/disable/kill de servicios fluxbee + `rm -rf /var/lib/fluxbee/nodes/*` y `/var/lib/fluxbee/state/nodes/*`. No borra ficheros de egress.
-- `remove_hive_flow` (`:7414-7603`) lee `address` y `syncthing_device_id` de `info.yaml` pero nunca lee `role` ni invoca teardown (grep de role/egress/nft/sysctl/reconcile en ese rango = 0 hits).
-- `delete_egress_nft_table_if_present` (`:3962`) tiene un unico callsite: dentro de `reconcile_egress_nat` (`:4037`); nunca en remove.
-- Ficheros persistentes que escribe `reconcile_egress_nat` con IPv4 forwarding ON + MASQUERADE: `/etc/sysctl.d/99-fluxbee-egress.conf` (`:3703`), `/etc/sysctl.d/99-fluxbee-conntrack.conf` (`:3704`), `/etc/modprobe.d/fluxbee-conntrack.conf` (`:3705`), `/etc/nftables.d/fluxbee-egress.nft` (`:3706`).
+- The remote cleanup script (`src/bin/sy_orchestrator.rs:7366-7375`) only does stop/disable/kill of the fluxbee services + `rm -rf /var/lib/fluxbee/nodes/*` and `/var/lib/fluxbee/state/nodes/*`. It does not delete egress files.
+- `remove_hive_flow` (`:7414-7603`) reads `address` and `syncthing_device_id` from `info.yaml` but never reads `role` or invokes a teardown (grep for role/egress/nft/sysctl/reconcile in that range = 0 hits).
+- `delete_egress_nft_table_if_present` (`:3962`) has a single callsite: inside `reconcile_egress_nat` (`:4037`); never in remove.
+- Persistent files that `reconcile_egress_nat` writes, with IPv4 forwarding ON + MASQUERADE: `/etc/sysctl.d/99-fluxbee-egress.conf` (`:3703`), `/etc/sysctl.d/99-fluxbee-conntrack.conf` (`:3704`), `/etc/modprobe.d/fluxbee-conntrack.conf` (`:3705`), `/etc/nftables.d/fluxbee-egress.nft` (`:3706`).
 
-Contrato/documentacion:
+Contract/documentation:
 
-- `docs/edge-egress-nat-spec.md` (L349/L371): los ficheros son "persistent across reboots by reapplication" y viven bajo `/etc/sysctl.d` y `/etc/nftables.d`.
-- El contrato de remove (`docs/onworking COA/edge_egress_nat_tasks.md`) no incluye teardown de egress; el E2E solo valida `remote_cleanup`, nunca estado egress.
+- `docs/edge-egress-nat-spec.md` (L349/L371): the files are "persistent across reboots by reapplication" and live under `/etc/sysctl.d` and `/etc/nftables.d`.
+- The remove contract (`docs/history/onworking-coa/edge_egress_nat_tasks.md`) does not include an egress teardown; the E2E only validates `remote_cleanup`, never the egress state.
 
-Impacto:
+Impact:
 
-Tras `remove_hive` de un egress, el host removido sobrevive al reboot con IPv4 forwarding habilitado y MASQUERADE LAN->WAN activos, sin orquestador que lo gobierne: router/NAT huerfano y persistente fuera de gobierno. Mitigante: el box ya salio de la flota y el re-armado solo ocurre al reboot.
+After `remove_hive` of an egress, the removed host survives a reboot with IPv4 forwarding enabled and LAN->WAN MASQUERADE active, with no orchestrator governing it: an orphaned, persistent router/NAT outside any governance. Mitigating factor: the box has already left the fleet, and the re-arming only happens at reboot.
 
-Recomendacion:
+Recommendation:
 
-En `remove_hive_flow`, leer `role` de `info.yaml` y, si es egress, extender el cleanup (script + via socket) para `nft delete table inet fluxbee_egress` (reusar `delete_egress_nft_table_if_present`) + `rm` de los 4 ficheros + `sysctl --system`. Alternativa: un `EGRESS_TEARDOWN` en el handler.
+In `remove_hive_flow`, read `role` from `info.yaml` and, if it is egress, extend the cleanup (script + via socket) with `nft delete table inet fluxbee_egress` (reuse `delete_egress_nft_table_if_present`) + `rm` of the 4 files + `sysctl --system`. Alternative: an `EGRESS_TEARDOWN` in the handler.
 
-## Findings - Media
+## Findings - Medium
 
-### F5 - Media - Egress reporta `ok` con verificacion incompleta
+### F5 - Medium - Egress reports `ok` with incomplete verification
 
-> **RESUELTO (2026-06-26) — validado en VM.** DecisiÃÂ³n: `internet_reachable=false` **degrada** donde vive el dato (el host egress). El watchdog re-chequea la reachability en cada tick de drift y emite un WARN `DEGRADED` continuo (no solo el warn ÃÂºnico de bootstrap). El response de `add_hive role=egress` deja de implicar ÃÂ©xito: reporta `egress_internet_reachable: null` ("no verificado por motherbee en v1") en vez de dejar que `status:ok` sugiera un uplink sano; el `note` lo explicita. La transmisiÃÂ³n real de los 4 campos a motherbee sigue siendo T-VER-1 (futuro), como el propio finding lo acota. *Validado en VM: inyectando un fluxbee.ai inalcanzable (RFC5737) el journal mostrÃÂ³ `egress NAT healthy but internet unreachable Ã¢ÂÂ DEGRADED`; al restaurar, recuperÃÂ³.*
+> **RESOLVED (2026-06-26) — validated on a VM.** Decision: `internet_reachable=false` **degrades** where the data lives (the egress host). The watchdog re-checks the reachability on every drift tick and emits a continuous `DEGRADED` WARN (not only the one-time bootstrap warn). The `add_hive role=egress` response no longer implies success: it reports `egress_internet_reachable: null` ("not verified by motherbee in v1") instead of letting `status:ok` suggest a healthy uplink; the `note` makes this explicit. The actual transmission of the 4 fields to motherbee is still T-VER-1 (future), as the finding itself scopes it. *Validated on a VM: injecting an unreachable fluxbee.ai (RFC5737), the journal showed `egress NAT healthy but internet unreachable — DEGRADED`; when restored, it recovered.*
 
-Verificacion: lectura. **Reescrito**: la version anterior fundaba el finding en `edge_ip`, premisa que resulto incorrecta. El problema real es otro.
+Verification: reading. **Rewritten**: the earlier version based the finding on `edge_ip`, a premise that turned out to be wrong. The real problem is a different one.
 
-Correccion de la premisa: el spec ÃÂ§8.2 (`docs/edge-egress-nat-spec.md:411-435`) nunca pide asignar `edge_ip` a `lan_iface`; `edge_ip` es config de host preexistente que el orchestrator usa para validar (`:3814-3819`), reportar y como gateway de la ruta de workers. Que `egress_nft_ruleset` (`:3891`) no use `edge_ip` es spec-compliant, no un defecto. Ese eje de la version anterior se descarta.
+Correction of the premise: spec §8.2 (`docs/edge-egress-nat-spec.md:411-435`) never asks to assign `edge_ip` to `lan_iface`; `edge_ip` is pre-existing host config that the orchestrator uses to validate (`:3814-3819`), to report, and as the gateway of the workers' route. That `egress_nft_ruleset` (`:3891`) does not use `edge_ip` is spec-compliant, not a defect. That axis of the earlier version is discarded.
 
-Lo que si es problema:
+What is indeed a problem:
 
-- `add_egress_hive_flow` responde `egress_nat_applied: true` (`:16027`) y **omite** los 4 campos del spec ÃÂ§9: `egress_ipv4_forwarding`, `egress_ipv6_blocked`, `egress_conntrack_tuned`, `egress_internet_reachable` (no existen como claves JSON en ningun lado; grep vacio). El payload remite a "ver journal del host egress".
-- La inferencia "orchestrator activo => NAT aplicado" es valida para `nat_applied`/`ipv4_forwarding`/`ipv6_blocked` porque `reconcile_egress` es fatal en bootstrap (`bootstrap_local:790-797`, CR-1). **Pero** `internet_reachable` (`reconcile_egress_nat:4046`) solo `warn`ea si es false (`:4047-4052`), no retorna `Err`. Un egress con WAN uplink caido queda `active`, registra en LSA y motherbee devuelve `status:ok egress_nat_applied:true`.
-- `check_internet_reachable` (`:3979`) prueba el uplink real, distinto de `wait_for_wan` (`:16909`) que solo verifica frescura del hive en la SHM LSA (plano de control overlay). Los gates de `add_egress_hive_flow` no consultan el uplink.
+- `add_egress_hive_flow` replies `egress_nat_applied: true` (`:16027`) and **omits** the 4 fields of spec §9: `egress_ipv4_forwarding`, `egress_ipv6_blocked`, `egress_conntrack_tuned`, `egress_internet_reachable` (they do not exist as JSON keys anywhere; empty grep). The payload points to "see the egress host journal".
+- The inference "orchestrator active => NAT applied" is valid for `nat_applied`/`ipv4_forwarding`/`ipv6_blocked` because `reconcile_egress` is fatal at bootstrap (`bootstrap_local:790-797`, CR-1). **But** `internet_reachable` (`reconcile_egress_nat:4046`) only `warn`s if it is false (`:4047-4052`); it does not return `Err`. An egress with its WAN uplink down stays `active`, registers in the LSA, and motherbee returns `status:ok egress_nat_applied:true`.
+- `check_internet_reachable` (`:3979`) tests the real uplink, unlike `wait_for_wan` (`:16909`), which only checks the hive's freshness in the LSA SHM (the overlay control plane). The gates of `add_egress_hive_flow` do not check the uplink.
 
-Contrato/documentacion:
+Contract/documentation:
 
-- `docs/edge-egress-nat-spec.md:471-488` (ÃÂ§9): exige los 4 campos y "No silent success". ÃÂ§3.5 (`:70-72`): "Fail loud, never silent".
-- `docs/onworking COA/edge_egress_nat_tasks.md:105` (T-VER-1): en v1 esos detalles quedan en el journal del egress y no viajan a motherbee. El tasks doc prima sobre el spec (`:25`), asi que la **no-transmision** de los campos es carve-out v1 documentado, no contradiccion.
+- `docs/edge-egress-nat-spec.md:471-488` (§9): requires the 4 fields and "No silent success". §3.5 (`:70-72`): "Fail loud, never silent".
+- `docs/history/onworking-coa/edge_egress_nat_tasks.md:105` (T-VER-1): in v1 those details stay in the egress journal and do not travel to motherbee. The tasks doc takes precedence over the spec (`:25`), so the **non-transmission** of the fields is a documented v1 carve-out, not a contradiction.
 
-Impacto:
+Impact:
 
-Un egress cuyo `wan_iface` resuelve pero no tiene ruta a internet (mal cableado) reporta `ok` mientras la funcion central del nodo (NATear a internet) no funciona; la unica evidencia es un `warn` en el journal remoto. La omision de los campos del payload es por diseno v1; el problema real es que `internet_reachable=false` no degrada el status.
+An egress whose `wan_iface` resolves but has no route to the internet (miswired) reports `ok` while the node's core function (NATing to the internet) does not work; the only evidence is a `warn` in the remote journal. The omission of the payload fields is by v1 design; the real problem is that `internet_reachable=false` does not degrade the status.
 
-Recomendacion:
+Recommendation:
 
-Decidir si `internet_reachable=false` debe degradar el status a `warn`/`pending` (coherente con ÃÂ§3.5) en vez de `ok`. A futuro (T-VER-1/T-VER-3), que `add_hive role=egress` recoja del host remoto los 4 campos reales y los incluya en el payload. Ver F16 para `conntrack_tuned`.
+Decide whether `internet_reachable=false` should degrade the status to `warn`/`pending` (consistent with §3.5) instead of `ok`. Going forward (T-VER-1/T-VER-3), have `add_hive role=egress` collect the 4 real fields from the remote host and include them in the payload. See F16 for `conntrack_tuned`.
 
-### F6 - Media - El watchdog egress no corrige drift parcial de reglas/sysctl
+### F6 - Medium - The egress watchdog does not fix partial drift of rules/sysctl
 
-> **RESUELTO (2026-06-26) — validado en VM.** El tick egress re-aplica el reconcile idempotente cada `EGRESS_RECONCILE_DRIFT_TICKS` (12 ticks Ã¢ÂÂ ~60s a 5s de cadencia), ademÃÂ¡s del fast-path `!nft_table_loaded()`. AsÃÂ­ el drift parcial que la mera presencia de la tabla no detecta (chain flusheada, regla editada, drift de sysctl/conntrack) se corrige en <~60s, no solo al reboot. En worker, el bloque IPv6 se re-asegura idempotente en el tick periÃÂ³dico. El reconcile (I/O bloqueante: ping+curl+nft) corre bajo `tokio::task::block_in_place` para no inanir el runtime. *Validado en VM: `nft flush chain ... forward` (drift parcial, tabla presente) Ã¢ÂÂ las 4 reglas volvieron en <70s.*
+> **RESOLVED (2026-06-26) — validated on a VM.** The egress tick re-applies the idempotent reconcile every `EGRESS_RECONCILE_DRIFT_TICKS` (12 ticks — ~60s at a 5s cadence), in addition to the `!nft_table_loaded()` fast-path. So the partial drift that the mere presence of the table does not detect (a flushed chain, an edited rule, sysctl/conntrack drift) is fixed in <~60s, not only at reboot. On a worker, the IPv6 block is idempotently re-ensured on the periodic tick. The reconcile (blocking I/O: ping+curl+nft) runs under `tokio::task::block_in_place` so it does not starve the runtime. *Validated on a VM: `nft flush chain ... forward` (partial drift, table present) → the 4 rules came back in <70s.*
 
-Verificacion: lectura.
+Verification: reading.
 
-Evidencia:
+Evidence:
 
-- `watchdog_egress_reconcile` rama Egress (`src/bin/sy_orchestrator.rs:1291-1297`): re-aplica NAT solo dentro de `if !nft_table_loaded()`.
-- `nft_table_loaded` (`:3939-3946`) solo corre `nft list table inet fluxbee_egress` y mira exit code: verifica **presencia** de la tabla, no contenido. Una tabla presente con reglas flusheadas/editadas pasa como sana -> no re-aplica.
-- `reconcile_egress_nat` es el unico lugar que aplica sysctl (`:4017`), conntrack (`:4030`) y reescribe reglas (`:4036-4040`); el watchdog solo lo invoca tras `!nft_table_loaded()`, asi que drift de sysctl/conntrack no se corrige mientras la tabla exista.
-- Rama Worker (`:1299-1323`): solo `default_route_via` + `ip route replace`. El bloque IPv6 del worker (`worker_ipv6_sysctl_content` + `apply_sysctl_system`) vive en `reconcile_worker_egress` (`:4095-4098`), que solo corre en bootstrap, nunca en el tick. (Esto absorbe lo que en el analisis figuraba como finding separado del IPv6 del worker.)
-- El watchdog es silencioso ante drift parcial: si alguien flushea una chain, no hay `warn` ni re-apply hasta el proximo reboot.
+- `watchdog_egress_reconcile`, Egress branch (`src/bin/sy_orchestrator.rs:1291-1297`): re-applies NAT only inside `if !nft_table_loaded()`.
+- `nft_table_loaded` (`:3939-3946`) only runs `nft list table inet fluxbee_egress` and looks at the exit code: it checks the table's **presence**, not its content. A present table with flushed/edited rules passes as healthy -> no re-apply.
+- `reconcile_egress_nat` is the only place that applies sysctl (`:4017`) and conntrack (`:4030`) and rewrites the rules (`:4036-4040`); the watchdog only invokes it after `!nft_table_loaded()`, so sysctl/conntrack drift is not fixed while the table exists.
+- Worker branch (`:1299-1323`): only `default_route_via` + `ip route replace`. The worker's IPv6 block (`worker_ipv6_sysctl_content` + `apply_sysctl_system`) lives in `reconcile_worker_egress` (`:4095-4098`), which only runs at bootstrap, never on the tick. (This absorbs what the analysis listed as a separate finding about the worker's IPv6.)
+- The watchdog is silent on partial drift: if someone flushes a chain, there is no `warn` and no re-apply until the next reboot.
 
-Contrato/documentacion:
+Contract/documentation:
 
-- `docs/edge-egress-nat-spec.md:343` (ÃÂ§6.5): "On startup and on reconcile ... apply the network configuration described in ÃÂ§8" (ÃÂ§8 = sysctl + conntrack + nftables) Ã¢ÂÂ tension real con el gap.
-- `docs/onworking COA/edge_egress_nat_tasks.md:145` (CR-5): describe **exactamente** este comportamiento y lo declara intencional ("egress re-aplica NAT solo si la tabla nft desaparecio"). Es decision de diseno documentada, no descuido. (La cita `:143`/CR-1 de la version anterior es imprecisa: trata de bootstrap-fatal, no del watchdog.)
+- `docs/edge-egress-nat-spec.md:343` (§6.5): "On startup and on reconcile ... apply the network configuration described in §8" (§8 = sysctl + conntrack + nftables) — a real tension with the gap.
+- `docs/history/onworking-coa/edge_egress_nat_tasks.md:145` (CR-5): describes **exactly** this behavior and declares it intentional ("egress re-applies NAT only if the nft table disappeared"). It is a documented design decision, not an oversight. (The `:143`/CR-1 citation in the earlier version is imprecise: it is about bootstrap-fatal, not about the watchdog.)
 
-Impacto:
+Impact:
 
-La reconciliacion detecta desaparicion total de la tabla, pero no drift parcial de reglas/sysctl/conntrack. Cambios manuales pueden quedar activos hasta el proximo reboot. Mitigante: nodo egress es infra dedicada; el reboot re-corre el reconcile completo.
+The reconciliation detects the complete disappearance of the table, but not partial drift of rules/sysctl/conntrack. Manual changes can stay active until the next reboot. Mitigating factor: the egress node is dedicated infra; a reboot re-runs the full reconcile.
 
-Recomendacion:
+Recommendation:
 
-En el tick egress, ademas de `nft_table_loaded()`, comparar contenido de la tabla con el ruleset esperado (o re-aplicar idempotente `write_file_if_changed` + sysctl + conntrack cada N ticks). En worker, re-aplicar el sysctl IPv6 idempotente. `reconcile_egress_nat` ya es idempotente, asi que correrlo periodicamente no rompe nada salvo la ventana de ms del delete+apply (ver F25).
+On the egress tick, besides `nft_table_loaded()`, compare the table's content with the expected ruleset (or idempotently re-apply `write_file_if_changed` + sysctl + conntrack every N ticks). On a worker, idempotently re-apply the IPv6 sysctl. `reconcile_egress_nat` is already idempotent, so running it periodically breaks nothing except the millisecond window of the delete+apply (see F25).
 
-### F12 - Media - Inyeccion de reglas nft via `wan_iface`/`lan_iface` sin validar
+### F12 - Medium - Injection of nft rules via unvalidated `wan_iface`/`lan_iface`
 
-> **RESUELTO (2026-06-26).** Cerrado por el mismo `validate_iface_name` de F7: el iface se embebe solo en strings nft entre comillas dobles y el charset aceptado excluye `"` y `\`.
+> **RESOLVED (2026-06-26).** Closed by the same `validate_iface_name` as F7: the iface is embedded only in double-quoted nft strings, and the accepted charset excludes `"` and `\`.
 
-Verificacion: **empirica** (PoC con serde_yaml 0.9 + simulacion del ruleset).
+Verification: **empirical** (PoC with serde_yaml 0.9 + a simulation of the ruleset).
 
-Causa raiz compartida con F7 y F13: ausencia de allowlist de nombre de interfaz.
+Root cause shared with F7 and F13: no allowlist for the interface name.
 
-Evidencia:
+Evidence:
 
-- `egress_nft_ruleset` (`src/bin/sy_orchestrator.rs:3905,3910`) interpola crudo `iifname "{lan_iface}"` / `oifname "{wan_iface}"` via `format!` (`:3915-3916`).
-- `reconcile_egress_nat` (`:4035-4040`) escribe el ruleset a `EGRESS_NFT_PATH` y lo ejecuta con `nft -f`.
-- En el host egress remoto, `add_egress_hive_flow` (`:15842-15852`) escribe `wan_iface`/`lan_iface` verbatim dentro del scalar YAML; el orquestador remoto carga `hive.yaml` con `serde_yaml::from_str` hacia `EgressSection` (sin validacion post-deserializacion) y lo pasa a `reconcile_egress_nat`.
-- PoC: un newline **literal** solo corrompe el YAML (DoS de provisioning), pero el laundering por escapes YAML (`eth0\"\n ip saddr 0.0.0.0/0 accept #`) produce un YAML valido que serde_yaml re-decodifica a comilla + newline reales -> rompe el quoting del nft y deja una regla inyectada en la chain forward que derrota el `policy drop`.
+- `egress_nft_ruleset` (`src/bin/sy_orchestrator.rs:3905,3910`) interpolates `iifname "{lan_iface}"` / `oifname "{wan_iface}"` raw via `format!` (`:3915-3916`).
+- `reconcile_egress_nat` (`:4035-4040`) writes the ruleset to `EGRESS_NFT_PATH` and runs it with `nft -f`.
+- On the remote egress host, `add_egress_hive_flow` (`:15842-15852`) writes `wan_iface`/`lan_iface` verbatim inside the YAML scalar; the remote orchestrator loads `hive.yaml` with `serde_yaml::from_str` into `EgressSection` (with no post-deserialization validation) and passes it to `reconcile_egress_nat`.
+- PoC: a **literal** newline only corrupts the YAML (a provisioning DoS), but laundering through YAML escapes (`eth0\"\n ip saddr 0.0.0.0/0 accept #`) produces valid YAML that serde_yaml decodes back into a real quote + newline -> it breaks the nft quoting and leaves an injected rule in the forward chain that defeats the `policy drop`.
 
-Impacto:
+Impact:
 
-Inyeccion de reglas de firewall ejecutadas como root via `nft -f` en el host egress, anulando la garantia de `forward policy drop` (spec ÃÂ§8.2). Mismo modelo de amenaza que F7 (motherbee/admin), no atacante remoto no autenticado.
+Injection of firewall rules executed as root via `nft -f` on the egress host, voiding the `forward policy drop` guarantee (spec §8.2). Same threat model as F7 (motherbee/admin), not an unauthenticated remote attacker.
 
-Recomendacion:
+Recommendation:
 
-El mismo fix de F7 (allowlist `^[A-Za-z0-9._-]{1,15}$` en `resolve_egress_nat_config`) cierra este vector.
+The same fix as F7 (allowlist `^[A-Za-z0-9._-]{1,15}$` in `resolve_egress_nat_config`) closes this vector.
 
-### F13 - Media - Corrupcion/inyeccion YAML en el `hive.yaml` remoto
+### F13 - Medium - YAML corruption/injection in the remote `hive.yaml`
 
-> **RESUELTO (2026-06-26).** Cerrado por el mismo `validate_iface_name` de F7: el iface se embebe solo como escalar YAML entre comillas dobles desde `nat.*` (validado); el charset excluye `"`/`\` y los disparadores de coercion de escalar.
+> **RESOLVED (2026-06-26).** Closed by the same `validate_iface_name` as F7: the iface is embedded only as a double-quoted YAML scalar from `nat.*` (validated); the charset excludes `"`/`\` and the scalar-coercion triggers.
 
-Verificacion: **empirica** (simulacion YAML). Causa raiz compartida con F7/F12.
+Verification: **empirical** (YAML simulation). Root cause shared with F7/F12.
 
-Evidencia:
+Evidence:
 
-- Plantilla `add_egress_hive_flow:15842`: `wan_iface: "{wan_iface}"` / `lan_iface: "{lan_iface}"` con interpolacion directa, sin escapado. `write_remote_file` usa heredoc `<<'EOF'` (sin expansion shell) pero preserva el `"` y los `\n` literales en `/etc/fluxbee/hive.yaml`.
-- El remoto parsea con `serde_yaml::from_str` -> `HiveFile` (`load_hive:3036-3039`) sin `deny_unknown_fields`.
-- Simulacion: `wan_iface = eth0"\n  enabled: false\n  injected_key: "pwned` produce `egress.enabled=false` + clave inyectada parseable; un dedent produce `ParserError` (hive.yaml corrupto -> falla de arranque remoto).
+- Template `add_egress_hive_flow:15842`: `wan_iface: "{wan_iface}"` / `lan_iface: "{lan_iface}"` with direct interpolation, no escaping. `write_remote_file` uses a `<<'EOF'` heredoc (no shell expansion) but preserves the literal `"` and `\n` in `/etc/fluxbee/hive.yaml`.
+- The remote parses with `serde_yaml::from_str` -> `HiveFile` (`load_hive:3036-3039`) without `deny_unknown_fields`.
+- Simulation: `wan_iface = eth0"\n  enabled: false\n  injected_key: "pwned` produces `egress.enabled=false` + a parseable injected key; a dedent produces `ParserError` (corrupt hive.yaml -> remote startup failure).
 
-Correccion respecto del analisis crudo: `storage_path` **no** es atacante-controlable (viene de `state.storage_path:15832`, config del operador, no del payload). Solo `wan_iface`/`lan_iface` son el input no confiable.
+Correction relative to the raw analysis: `storage_path` is **not** attacker-controllable (it comes from `state.storage_path:15832`, the operator's config, not from the payload). Only `wan_iface`/`lan_iface` are the untrusted input.
 
-Impacto:
+Impact:
 
-Un `add_hive role=egress` con `"`+newline en la interfaz corrompe el `hive.yaml` remoto (DoS de arranque del orchestrator remoto) o inyecta/sobrescribe claves del mapping egress. Es defensa-en-profundidad / validacion de input con DoS concreto del nodo egress.
+An `add_hive role=egress` with `"`+newline in the interface corrupts the remote `hive.yaml` (a startup DoS of the remote orchestrator) or injects/overwrites keys of the egress mapping. It is defense-in-depth / input validation, with a concrete DoS of the egress node.
 
-Recomendacion:
+Recommendation:
 
-Mismo fix de F7. Un solo allowlist de interfaz cierra F7 + F12 + F13.
+Same fix as F7. A single interface allowlist closes F7 + F12 + F13.
 
-### F14 - Media - `watchdog_tick` no es panic-safe
+### F14 - Medium - `watchdog_tick` is not panic-safe
 
-Verificacion: lectura.
+Verification: reading.
 
-Evidencia:
+Evidence:
 
-- `src/bin/sy_orchestrator.rs:715-728`: `compare_exchange(false,true)` sobre `watchdog_running` como gate; `tokio::spawn` detachado sin `catch_unwind`/`AssertUnwindSafe` ni Drop guard; el reset `watchdog_flag.store(false)` (`:727`) corre solo **despues** de que `watchdog_tick(&...).await` (`:726`) retorna. Los unicos escritores son `:720` (true) y `:727` (false); no hay recovery. El rechazo del gate solo loguea `tracing::debug!` (`:730`), por debajo del nivel default `info` (`:551`).
-- Vector de panic: `node_name` (`:7204-7205`) hace `&entry.name[..len]` con `name:[u8;256]` y `name_len:u16` hasta 65535 (`shm/mod.rs:150-151`); `read_router_snapshot` copia `NodeEntry` verbatim sin clamp (`shm/mod.rs:2827-2828`). Si `name_len>256` -> slice out-of-bounds -> panic, la tarea muere, `:727` nunca corre. Ver F20.
+- `src/bin/sy_orchestrator.rs:715-728`: `compare_exchange(false,true)` on `watchdog_running` as a gate; a detached `tokio::spawn` with no `catch_unwind`/`AssertUnwindSafe` and no Drop guard; the `watchdog_flag.store(false)` reset (`:727`) runs only **after** `watchdog_tick(&...).await` (`:726`) returns. The only writers are `:720` (true) and `:727` (false); there is no recovery. The gate's rejection only logs via `tracing::debug!` (`:730`), below the default `info` level (`:551`).
+- Panic vector: `node_name` (`:7204-7205`) does `&entry.name[..len]` with `name:[u8;256]` and `name_len:u16` up to 65535 (`shm/mod.rs:150-151`); `read_router_snapshot` copies `NodeEntry` verbatim with no clamp (`shm/mod.rs:2827-2828`). If `name_len>256` -> slice out-of-bounds -> panic, the task dies, `:727` never runs. See F20.
 
-Impacto:
+Impact:
 
-Un panic dentro de la tarea spawneada salta el `store(false)` y el flag queda en `true` para siempre; cada `compare_exchange` posterior falla -> se pierde restart de servicios, verify/retain de runtime, blob GC y reconcile egress, en silencio (solo `debug`). El self-healing se detiene mientras el orchestrator sigue reportandose sano. Mitigante: el writer normal clampa `name_len` a 256, asi que el disparo via `node_name` exige SHM corrupto/torn read; pero `watchdog_tick` hace mas trabajo propenso a panic.
+A panic inside the spawned task skips the `store(false)`, and the flag stays `true` forever; every later `compare_exchange` fails -> service restarts, runtime verify/retain, blob GC and the egress reconcile are lost, silently (only `debug`). Self-healing stops while the orchestrator keeps reporting itself healthy. Mitigating factor: the normal writer clamps `name_len` to 256, so triggering it via `node_name` requires a corrupt SHM/torn read; but `watchdog_tick` does more panic-prone work.
 
-Recomendacion:
+Recommendation:
 
-Mover el reset a un Drop guard (o `catch_unwind`/`AssertUnwindSafe` alrededor del cuerpo del tick), de modo que un panic no deshabilite el watchdog para siempre. Aplicar tambien el clamp de F20.
+Move the reset into a Drop guard (or `catch_unwind`/`AssertUnwindSafe` around the tick's body), so that a panic does not disable the watchdog forever. Also apply the F20 clamp.
 
-### F15 - Media - La allowlist acepta sufijo de hive arbitrario (bypass cross-hive)
+### F15 - Medium - The allowlist accepts an arbitrary hive suffix (cross-hive bypass)
 
-> **RESUELTO (2026-06-26) — router-authority.** El gate del router (`system_origin_allowed`) distingue explícitamente: `SY.orchestrator@<cualquier-hive>` (cross-hive legítimo, forwards) vs `SY.admin`/`SY.wf-rules`/`WF.orch.diag` `@<same-hive>` (match exacto same-hive). Un `SY.admin@<otro-hive>` se rechaza. Cierra el bypass cross-hive que F15 describe.
+> **RESOLVED (2026-06-26) — router-authority.** The router's gate (`system_origin_allowed`) explicitly distinguishes: `SY.orchestrator@<any-hive>` (legitimate cross-hive, forwards) vs `SY.admin`/`SY.wf-rules`/`WF.orch.diag` `@<same-hive>` (exact same-hive match). A `SY.admin@<other-hive>` is rejected. This closes the cross-hive bypass that F15 describes.
 
-Verificacion: lectura. Extiende F4 con el angulo cross-hive.
+Verification: reading. Extends F4 with the cross-hive angle.
 
-Evidencia:
+Evidence:
 
-- `is_allowed_system_source_name` (`src/bin/sy_orchestrator.rs:1849-1853`): el unico match exacto (`system_allowed_origins.contains(name)`) se confina al hive local (`load_system_allowed_origins:2797-2802` expande bare a `name@<hive_id>`), pero los 4 `starts_with(...@)` aceptan cualquier sufijo de hive.
-- `src_l2_name` es autoritativo (stampeado por el router, no spoofable por el sender; test `router_overwrites_spoofed_src_l2_name`). Pero `normalize_name` (`src/router/mod.rs:3712-3718`) conserva verbatim un nombre que ya trae `@<hive>`, sin validar que el sufijo sea el hive local ni proteger nombres reservados; un nodo puede registrarse como `SY.admin@<hive-ajeno>`.
-- `vpn_allows_between` (`src/router/mod.rs:4974-4976`) deja pasar SYSTEM hacia un system node (el orchestrator) cross-hive.
+- `is_allowed_system_source_name` (`src/bin/sy_orchestrator.rs:1849-1853`): the only exact match (`system_allowed_origins.contains(name)`) is confined to the local hive (`load_system_allowed_origins:2797-2802` expands a bare name to `name@<hive_id>`), but the 4 `starts_with(...@)` accept any hive suffix.
+- `src_l2_name` is authoritative (stamped by the router, not spoofable by the sender; test `router_overwrites_spoofed_src_l2_name`). But `normalize_name` (`src/router/mod.rs:3712-3718`) keeps verbatim a name that already carries `@<hive>`, without validating that the suffix is the local hive and without protecting reserved names; a node can register as `SY.admin@<foreign-hive>`.
+- `vpn_allows_between` (`src/router/mod.rs:4974-4976`) lets SYSTEM through to a system node (the orchestrator) cross-hive.
 
-Impacto:
+Impact:
 
-Un `SY.admin`/`WF.orch.diag` legitimo de otro hive, o un nodo que registre uno de esos prefijos con `@<sufijo arbitrario>`, pasa `is_allowed_system_source_name` y puede ejecutar `SPAWN_NODE`/`KILL_NODE`/`NODE_CONFIG_SET` en el orchestrator victima, anulando el confinamiento same-hive que el operador fijo via `ORCH_SYSTEM_ALLOWED_ORIGINS`.
+A legitimate `SY.admin`/`WF.orch.diag` from another hive, or a node that registers one of those prefixes with `@<arbitrary suffix>`, passes `is_allowed_system_source_name` and can run `SPAWN_NODE`/`KILL_NODE`/`NODE_CONFIG_SET` on the victim orchestrator, voiding the same-hive confinement that the operator set via `ORCH_SYSTEM_ALLOWED_ORIGINS`.
 
-Recomendacion:
+Recommendation:
 
-El allowlist debe ser match exacto de nombre completo `name@hive` sin los `starts_with` por prefijo; si se quiere permitir cualquier instancia local de `SY.admin`/etc., comparar contra `base@<hive_local>`. Complementariamente, `normalize_name`/registro deberia rechazar que un nodo se registre con prefijo reservado `SY.*`/`WF.orch.diag*` o con un `@<hive>` distinto al local. Tests existentes (`:18391`, `:18408`) fijan el comportamiento por prefijo y habria que actualizarlos.
+The allowlist must be an exact match on the full `name@hive` name, without the prefix `starts_with` checks; if any local instance of `SY.admin`/etc. should be allowed, compare against `base@<hive_local>`. In addition, `normalize_name`/registration should reject a node that registers with a reserved `SY.*`/`WF.orch.diag*` prefix or with an `@<hive>` other than the local one. Existing tests (`:18391`, `:18408`) pin the prefix behavior and would need to be updated.
 
-### F16 - Media - `egress_conntrack_tuned` se reporta `true` incondicionalmente
+### F16 - Medium - `egress_conntrack_tuned` is reported `true` unconditionally
 
-> **RESUELTO (2026-06-26) — validado en VM.** `apply_conntrack_live()` ahora devuelve `bool`: aplica `sysctl -w` y **verifica leyendo `nf_conntrack_max` de vuelta** (prueba la key canÃÂ³nica `net.netfilter.nf_conntrack_max` **y** el alias `net.nf_conntrack_max`, simÃÂ©trico con la escritura). `conntrack_tuned = apply_conntrack_live()` Ã¢ÂÂ `true` = live verificado, `false` = pending-reboot (el fichero persistido lo aplica al boot). *Validado en VM: el journal mostrÃÂ³ exactamente el escenario del finding Ã¢ÂÂ primer reconcile en bootstrap con el mÃÂ³dulo aÃÂºn sin cargar reportÃÂ³ `conntrack_tuned=false` (donde el cÃÂ³digo viejo mentÃÂ­a `true`), y el reconcile siguiente, ya cargado el mÃÂ³dulo, `true`.*
+> **RESOLVED (2026-06-26) — validated on a VM.** `apply_conntrack_live()` now returns `bool`: it applies `sysctl -w` and **verifies by reading `nf_conntrack_max` back** (it tries the canonical key `net.netfilter.nf_conntrack_max` **and** the alias `net.nf_conntrack_max`, symmetric with the write). `conntrack_tuned = apply_conntrack_live()` → `true` = verified live, `false` = pending-reboot (the persisted file applies it at boot). *Validated on a VM: the journal showed exactly the finding's scenario — the first reconcile at bootstrap, with the module not loaded yet, reported `conntrack_tuned=false` (where the old code falsely claimed `true`), and the next reconcile, with the module already loaded, `true`.*
 
-Verificacion: lectura.
+Verification: reading.
 
-Evidencia:
+Evidence:
 
-- `apply_conntrack_live()` (`src/bin/sy_orchestrator.rs:3929-3937`) retorna `()` y traga errores con `tracing::warn!` ("conntrack max not applied live"); el doc-comment (`:3927-3928`) reconoce que las keys solo existen una vez cargado el modulo `nf_conntrack`.
-- `reconcile_egress_nat` (`:4030-4031`): `apply_conntrack_live(); verification.conntrack_tuned = true;` incondicional Ã¢ÂÂ no hay nada que checkear porque la funcion devuelve `()`.
-- El hashsize se escribe solo a `/etc/modprobe.d/fluxbee-conntrack.conf` (`:4026-4029`) = reboot-only. No hay lectura de `nf_conntrack_count`/`nf_conntrack_max` para verificar.
+- `apply_conntrack_live()` (`src/bin/sy_orchestrator.rs:3929-3937`) returns `()` and swallows errors with `tracing::warn!` ("conntrack max not applied live"); the doc-comment (`:3927-3928`) acknowledges that the keys only exist once the `nf_conntrack` module is loaded.
+- `reconcile_egress_nat` (`:4030-4031`): `apply_conntrack_live(); verification.conntrack_tuned = true;` unconditionally — there is nothing to check because the function returns `()`.
+- The hashsize is only written to `/etc/modprobe.d/fluxbee-conntrack.conf` (`:4026-4029`) = reboot-only. There is no read of `nf_conntrack_count`/`nf_conntrack_max` to verify.
 
-Contrato/documentacion:
+Contract/documentation:
 
-- `docs/onworking COA/edge_egress_nat_tasks.md` (T-NET-5): exige reportar `egress_conntrack_tuned` distinguiendo "live" de "pending-reboot". El codigo implemento las escrituras pero no la distincion.
-- `docs/edge-egress-nat-spec.md:443` (ÃÂ§8.4): "the connection tracking table fills and packets are dropped silently".
+- `docs/history/onworking-coa/edge_egress_nat_tasks.md` (T-NET-5): requires reporting `egress_conntrack_tuned`, distinguishing "live" from "pending-reboot". The code implemented the writes but not the distinction.
+- `docs/edge-egress-nat-spec.md:443` (§8.4): "the connection tracking table fills and packets are dropped silently".
 
-Impacto:
+Impact:
 
-En el camino comun (modulo `nf_conntrack` aun no cargado al momento del reconcile -> `sysctl -w` falla -> `warn`), el campo igual queda `true`, sobre-afirmando el estado. Bajo carga sostenida pre-reboot es el escenario de silent-drop que ÃÂ§8.4 advierte. Es mas un misreport que un outage garantizado (el archivo persistido toma efecto en el next boot).
+On the common path (the `nf_conntrack` module is not loaded yet at reconcile time -> `sysctl -w` fails -> `warn`), the field still ends up `true`, overstating the state. Under sustained load before the reboot, this is the silent-drop scenario that §8.4 warns about. It is more a misreport than a guaranteed outage (the persisted file takes effect on the next boot).
 
-Recomendacion:
+Recommendation:
 
-Convertir `conntrack_tuned` a un enum/string (`"live"`|`"pending-reboot"`) o agregar `conntrack_live_applied` verificando lectura de `nf_conntrack_max` tras el `sysctl -w`, en vez del bool incondicional.
+Turn `conntrack_tuned` into an enum/string (`"live"`|`"pending-reboot"`) or add `conntrack_live_applied`, verified by reading `nf_conntrack_max` after the `sysctl -w`, instead of the unconditional bool.
 
-### F17 - Media - La tabla nft egress no se carga al boot
+### F17 - Medium - The egress nft table is not loaded at boot
 
-> **RESUELTO (2026-06-26) — validado en VM (prueba concluyente).** Nuevo unit systemd `fluxbee-egress-nft.service` (oneshot, `RemainAfterExit`, `DefaultDependencies=no` + `Before=network-pre.target` Ã¢ÂÂ carga la tabla **antes** de que se configure cualquier interfaz, asÃÂ­ ningÃÂºn paquete se forwardea sin la tabla). Lo instala+enable `ensure_egress_nft_boot_unit()` desde el reconcile (path absoluto de `nft` resuelto; `enable` solo al escribir el unit, no en cada tick; `ConditionPathExists` lo hace no-op si el `.nft` fue removido tras teardown). El teardown F11 ademÃÂ¡s lo disable+rm. *Validado en VM **deshabilitando el orchestrator** y rebooteando: con `sy-orchestrator inactive/disabled`, tras el reboot la tabla estaba PRESENTE (4 reglas forward + masquerade), `ip_forward=1`, `conntrack=262144` Ã¢ÂÂ la cargÃÂ³ el boot unit (`active/success`), no el orchestrator. Cierra la ventana ip_forward-sin-tabla.*
+> **RESOLVED (2026-06-26) — validated on a VM (conclusive test).** New systemd unit `fluxbee-egress-nft.service` (oneshot, `RemainAfterExit`, `DefaultDependencies=no` + `Before=network-pre.target` → it loads the table **before** any interface is configured, so no packet is forwarded without the table). `ensure_egress_nft_boot_unit()` installs+enables it from the reconcile (the absolute path of `nft` is resolved; `enable` only when the unit is written, not on every tick; `ConditionPathExists` makes it a no-op if the `.nft` was removed after a teardown). The F11 teardown also runs disable+rm on it. *Validated on a VM **by disabling the orchestrator** and rebooting: with `sy-orchestrator inactive/disabled`, after the reboot the table was PRESENT (4 forward rules + masquerade), `ip_forward=1`, `conntrack=262144` — the boot unit loaded it (`active/success`), not the orchestrator. This closes the ip_forward-without-table window.*
 
-Verificacion: lectura.
+Verification: reading.
 
-Evidencia:
+Evidence:
 
-- El sysctl `ip_forward=1` es persistente e independiente del orchestrator: vive en `/etc/sysctl.d/99-fluxbee-egress.conf` (`:3703`, contenido en `egress_sysctl_content:3848`) y lo aplica `systemd-sysctl` temprano en cada boot.
-- La tabla nft no: `EGRESS_NFT_PATH = /etc/nftables.d/fluxbee-egress.nft` (`:3706`); `reconcile_egress_nat` la escribe y aplica con `nft -f` (`:4036-4040`), pero nada en el repo habilita `nftables.service`, agrega un include, ni un unit que cargue ese fichero al boot (grep en `src/` `scripts/` `*.service` `*.sh` = 0 referencias salvo la const y su uso runtime).
-- Timing: `reconcile_egress` (para egress) corre en `bootstrap_local:790`, **despues** de `systemd_start("rt-gateway")` (`:782`) + `wait_for_router_ready` hasta 30s (`:783`) + `wait_for_nats_ready` hasta 20s (`:784`). El unit `sy-orchestrator` es `After=network.target rt-gateway.service` (`:15883`). Ventana = desde `systemd-sysctl` (boot temprano) hasta `:790` = segundos a ~30-50s, y se reabre en cada `Restart=always`.
+- The `ip_forward=1` sysctl is persistent and independent of the orchestrator: it lives in `/etc/sysctl.d/99-fluxbee-egress.conf` (`:3703`, content in `egress_sysctl_content:3848`), and `systemd-sysctl` applies it early on every boot.
+- The nft table is not: `EGRESS_NFT_PATH = /etc/nftables.d/fluxbee-egress.nft` (`:3706`); `reconcile_egress_nat` writes it and applies it with `nft -f` (`:4036-4040`), but nothing in the repo enables `nftables.service` or adds an include or a unit that loads that file at boot (grep in `src/` `scripts/` `*.service` `*.sh` = 0 references except the const and its runtime use).
+- Timing: `reconcile_egress` (for egress) runs in `bootstrap_local:790`, **after** `systemd_start("rt-gateway")` (`:782`) + `wait_for_router_ready` up to 30s (`:783`) + `wait_for_nats_ready` up to 20s (`:784`). The `sy-orchestrator` unit is `After=network.target rt-gateway.service` (`:15883`). Window = from `systemd-sysctl` (early boot) to `:790` = seconds to ~30-50s, and it reopens on every `Restart=always`.
 
-Impacto:
+Impact:
 
-Entre que `systemd-sysctl` aplica `ip_forward=1` y `sy-orchestrator` corre `reconcile_egress`, el host egress tiene IPv4 forwarding habilitado **sin** tabla `fluxbee_egress`: sin masquerade (paquetes con saddr privado salen al WAN, egress roto), sin `forward policy drop` y sin drop de forwarding IPv6. El boundary controlado esta ausente toda la ventana de arranque tras cada reboot. Mitigante: ventana transitoria, auto-cierra; los paquetes con saddr privado normalmente los descarta el upstream.
+Between `systemd-sysctl` applying `ip_forward=1` and `sy-orchestrator` running `reconcile_egress`, the egress host has IPv4 forwarding enabled **without** the `fluxbee_egress` table: no masquerade (packets with a private saddr go out to the WAN, egress broken), no `forward policy drop` and no IPv6 forwarding drop. The controlled boundary is absent for the whole startup window after every reboot. Mitigating factor: the window is transient and closes by itself; the upstream normally discards packets with a private saddr.
 
-Recomendacion:
+Recommendation:
 
-Persistir la carga de la tabla al boot (`enable nftables.service` + include de `/etc/nftables.d/fluxbee-egress.nft`, o un `ExecStartPre`), o invertir el orden para que `ip_forward` solo quede ON despues de aplicar la tabla Ã¢ÂÂ atando el forwarding al ciclo del orchestrator en vez de persistirlo independientemente.
+Persist the table load at boot (`enable nftables.service` + an include of `/etc/nftables.d/fluxbee-egress.nft`, or an `ExecStartPre`), or invert the order so that `ip_forward` is only ON after the table is applied — tying forwarding to the orchestrator's cycle instead of persisting it independently.
 
-### F18 - Media - TOCTOU: `add_hive`/`remove_hive` no toman ningun lock
+### F18 - Medium - TOCTOU: `add_hive`/`remove_hive` take no lock
 
-> **RESUELTO (2026-06-26).** `OrchestratorState` tiene un registro de locks **por hive_id** (`hive_topology_locks: Mutex<HashMap<String, Arc<Mutex<()>>>>`); `lock_hive_topology(hive_id)` devuelve un `OwnedMutexGuard` que `add_hive_flow`/`add_egress_hive_flow`/`remove_hive_flow` sostienen durante **todo** el flujo (tras la validaciÃÂ³n, antes del `exists`/`remove_dir_all`/`create_dir_all`/`write_hive_info`). Lock **por-hive** (no global) para no serializar bootstraps SSH de hives distintos. Cierra la ventana entre check-de-existencia, borrado y creaciÃÂ³n para el mismo hive_id. Unit test + revisiÃÂ³n (GO: sin deadlock/re-entrancy, cobertura completa de la ventana, RAII en todos los early-returns, sin otros writers de `storage/hives` fuera del lock).
+> **RESOLVED (2026-06-26).** `OrchestratorState` has a registry of locks **per hive_id** (`hive_topology_locks: Mutex<HashMap<String, Arc<Mutex<()>>>>`); `lock_hive_topology(hive_id)` returns an `OwnedMutexGuard` that `add_hive_flow`/`add_egress_hive_flow`/`remove_hive_flow` hold for the **whole** flow (after validation, before the `exists`/`remove_dir_all`/`create_dir_all`/`write_hive_info`). The lock is **per-hive** (not global) so that SSH bootstraps of different hives are not serialized. It closes the window between the existence check, the deletion and the creation for the same hive_id. Unit test + review (GO: no deadlock/re-entrancy, full coverage of the window, RAII on every early-return, no other writers of `storage/hives` outside the lock).
 
-Verificacion: lectura.
+Verification: reading.
 
-Evidencia:
+Evidence:
 
-- El dispatch de `add_hive` (`src/bin/sy_orchestrator.rs:1571`) y `remove_hive` (`:1546`) no toma ningun lock. Existe `runtime_lifecycle_lock` (`:481`) para updates, pero no se usa aca.
-- `add_hive_flow` ejecuta `hive_partial_exists` -> `remove_dir_all` -> `create_dir_all` (`:14760-14817`) sin serializacion.
+- The dispatch of `add_hive` (`src/bin/sy_orchestrator.rs:1571`) and `remove_hive` (`:1546`) takes no lock. `runtime_lifecycle_lock` (`:481`) exists for updates, but it is not used here.
+- `add_hive_flow` runs `hive_partial_exists` -> `remove_dir_all` -> `create_dir_all` (`:14760-14817`) with no serialization.
 
-Impacto:
+Impact:
 
-Un `remove_hive` concurrente sobre el mismo `hive_id`, o dos `add_hive` en paralelo, pueden corromper `storage/hives` (carrera entre el check de existencia, el borrado y la creacion). Combinado con F3 (borrado antes de validar), la ventana es explotable por timing. Mitigante: requiere comandos admin concurrentes sobre el mismo `hive_id`.
+A concurrent `remove_hive` on the same `hive_id`, or two `add_hive` in parallel, can corrupt `storage/hives` (a race between the existence check, the deletion and the creation). Combined with F3 (deletion before validation), the window is exploitable through timing. Mitigating factor: it requires concurrent admin commands on the same `hive_id`.
 
-Recomendacion:
+Recommendation:
 
-Serializar por `hive_id` (lock por-hive) o reusar `runtime_lifecycle_lock` para todo el lifecycle de `add_hive`/`remove_hive`.
+Serialize by `hive_id` (a per-hive lock) or reuse `runtime_lifecycle_lock` for the whole `add_hive`/`remove_hive` lifecycle.
 
-## Findings - Baja
+## Findings - Low
 
-### F19 - Baja - `list_hives` etiqueta un host egress como `role=worker` y omite `role` en workers
+### F19 - Low - `list_hives` labels an egress host as `role=worker` and omits `role` on workers
 
-Verificacion: lectura.
+Verification: reading.
 
-Evidencia:
+Evidence:
 
-- La entrada local sintetizada (`src/bin/sy_orchestrator.rs:7340-7351`) ramifica solo en `is_motherbee`: `let local_role = if state.is_motherbee { "motherbee" } else { "worker" };`. `OrchestratorState` tiene `role: HiveRole` (`:610`) con `as_str()` que ya devuelve `"egress"` (`:199-205`), pero no se usa. En un host egress `is_motherbee==false` -> se auto-reporta `worker`.
-- Esta rama se alcanza en hosts no-motherbee porque `write_hive_info` solo se invoca para el hive *target* (remoto), nunca para el hive local.
-- Los payloads `info.yaml` de workers omiten `role` (`:14946-14951`), mientras el egress incluye `role:"egress"` (`:15946-15952`); `list_hives` eco-devuelve sin normalizar -> una respuesta `GET /hives` mezcla workers sin `role` con egress con `role`.
+- The synthesized local entry (`src/bin/sy_orchestrator.rs:7340-7351`) branches only on `is_motherbee`: `let local_role = if state.is_motherbee { "motherbee" } else { "worker" };`. `OrchestratorState` has `role: HiveRole` (`:610`) with an `as_str()` that already returns `"egress"` (`:199-205`), but it is not used. On an egress host `is_motherbee==false` -> it reports itself as `worker`.
+- This branch is reached on non-motherbee hosts because `write_hive_info` is only invoked for the *target* (remote) hive, never for the local hive.
+- The workers' `info.yaml` payloads omit `role` (`:14946-14951`), while the egress one includes `role:"egress"` (`:15946-15952`); `list_hives` echoes them back without normalizing -> a `GET /hives` response mixes workers without `role` with an egress with `role`.
 
-Impacto:
+Impact:
 
-Inconsistencia de inventario: un consumidor (admin UI, filtros por role) ve un egress como `worker` y workers sin `role`. Solo metadata de display; ningun control de flujo/seguridad lee este campo (el orchestrator usa `state.role`/`state.is_motherbee` internamente).
+Inventory inconsistency: a consumer (admin UI, filters by role) sees an egress as `worker` and workers without `role`. Display metadata only; no flow/security control reads this field (the orchestrator uses `state.role`/`state.is_motherbee` internally).
 
-Recomendacion:
+Recommendation:
 
-Usar `state.role.as_str()` para la entrada local, y agregar `"role":"worker"` a los payloads `info.yaml` de worker (o defaultear `role` ausente a `"worker"` en `read_hive_info`).
+Use `state.role.as_str()` for the local entry, and add `"role":"worker"` to the worker `info.yaml` payloads (or default a missing `role` to `"worker"` in `read_hive_info`).
 
-### F20 - Baja - Slices de nombre SHM sin clamp (`node_name` y hermanos)
+### F20 - Low - Unclamped SHM name slices (`node_name` and siblings)
 
-Verificacion: lectura.
+Verification: reading.
 
-Evidencia:
+Evidence:
 
-- `src/bin/sy_orchestrator.rs:7204-7205`: `let len = entry.name_len as usize; let name_bytes = &entry.name[..len];` sin clamp. Hermanos identicos en `:5585-5586`, `:5690-5691`, `:10449-10450`, `:11061`. `name:[u8;256]`, `name_len:u16` (`shm/mod.rs:150-151`), asi que `name_len` puede valer hasta 65535 a nivel de tipo.
-- La ruta de lectura no clampa (`read_router_snapshot:2828`, `read_lsa_snapshot:2958` copian la entrada cruda). El patron correcto ya existe en 4 sitios (p.ej. `read_string:2855` usa `len.min(buf.len())`, `bytes_to_string` del router `:4944`).
+- `src/bin/sy_orchestrator.rs:7204-7205`: `let len = entry.name_len as usize; let name_bytes = &entry.name[..len];` with no clamp. Identical siblings at `:5585-5586`, `:5690-5691`, `:10449-10450`, `:11061`. `name:[u8;256]`, `name_len:u16` (`shm/mod.rs:150-151`), so `name_len` can be up to 65535 at the type level.
+- The read path does not clamp (`read_router_snapshot:2828` and `read_lsa_snapshot:2958` copy the raw entry). The correct pattern already exists in 4 places (e.g. `read_string:2855` uses `len.min(buf.len())`, the router's `bytes_to_string` `:4944`).
 
-Impacto:
+Impact:
 
-Bug latente de robustez, **no reproducible en operacion correcta**: el writer legitimo (router) clampa `name_len<=256` via `copy_bytes_with_len` (`shm/mod.rs:2288-2293`) y el seqlock cubre lecturas desgarradas. El disparo exige un escritor SHM buggy/comprometido/desincronizado. Es el gatillo de panic de F14.
+A latent robustness bug, **not reproducible in correct operation**: the legitimate writer (router) clamps `name_len<=256` via `copy_bytes_with_len` (`shm/mod.rs:2288-2293`), and the seqlock covers torn reads. Triggering it requires a buggy/compromised/desynchronized SHM writer. It is the panic trigger of F14.
 
-Recomendacion:
+Recommendation:
 
-Cambiar a `&entry.name[..(entry.name_len as usize).min(entry.name.len())]` o saltar entradas con `name_len>256`, idealmente centralizado en un helper reusando `bytes_to_string`/`read_string`.
+Change it to `&entry.name[..(entry.name_len as usize).min(entry.name.len())]` or skip entries with `name_len>256`, ideally centralized in a helper that reuses `bytes_to_string`/`read_string`.
 
-### F21 - Baja - Host egress sin filtrado inbound (input chain `policy accept`)
+### F21 - Low - Egress host without inbound filtering (input chain `policy accept`)
 
-Verificacion: lectura. **Trade-off documentado de v1** (no es un defecto sorpresa).
+Verification: reading. **Documented v1 trade-off** (not a surprise defect).
 
-Evidencia:
+Evidence:
 
-- `egress_nft_ruleset` (`src/bin/sy_orchestrator.rs:3896-3901`): `chain input { type filter hook input priority 0; policy accept; }` sin reglas allow.
-- `ensure_core_firewall_local` (`:3660-3666`): early-return en `role==Egress` ("skipping ufw"), no abre ningun puerto; worker/motherbee si arman reglas ufw (`:3667-3691`).
+- `egress_nft_ruleset` (`src/bin/sy_orchestrator.rs:3896-3901`): `chain input { type filter hook input priority 0; policy accept; }` with no allow rules.
+- `ensure_core_firewall_local` (`:3660-3666`): early-return on `role==Egress` ("skipping ufw"); it opens no port; worker/motherbee do set up ufw rules (`:3667-3691`).
 
-Contrato/documentacion:
+Contract/documentation:
 
-- `docs/edge-egress-nat-spec.md:64` (ÃÂ§3.3) y `:465` (ÃÂ§8.5) describen filtrado inbound (solo WAN + SSH de control desde motherbee) que la implementacion no cumple.
-- `docs/onworking COA/edge_egress_nat_tasks.md:78` (T-NET-4): el filtrado inbound real se difiere a ÃÂ§11 para no arriesgar lockout en la box de testing; en v1 `policy accept`.
+- `docs/edge-egress-nat-spec.md:64` (§3.3) and `:465` (§8.5) describe inbound filtering (only WAN + control SSH from motherbee) that the implementation does not meet.
+- `docs/history/onworking-coa/edge_egress_nat_tasks.md:78` (T-NET-4): real inbound filtering is deferred to §11 to avoid risking a lockout on the testing box; in v1, `policy accept`.
 
-Impacto:
+Impact:
 
-Divergencia spec-vs-codigo intencional y documentada. Exposicion latente acotada: el camino realmente expuesto (FORWARD/NAT hacia WAN) si esta filtrado (`policy drop` + solo ct established/related + LAN->WAN + ip6 drop, `:3902-3911`); el `input accept` es sobre un host en LAN interna.
+An intentional, documented spec-vs-code divergence. Bounded latent exposure: the path that is really exposed (FORWARD/NAT toward the WAN) is filtered (`policy drop` + only ct established/related + LAN->WAN + ip6 drop, `:3902-3911`); the `input accept` is on a host in an internal LAN.
 
-Recomendacion:
+Recommendation:
 
-Alinear ÃÂ§3.3/ÃÂ§8.5 con el estado v1 real (anotar que el filtrado inbound es non-v1) o agregar al input chain los allows minimos (WAN listen + SSH desde motherbee) con `policy drop` cuando se cierre el boundary.
+Align §3.3/§8.5 with the real v1 state (note that inbound filtering is non-v1), or add the minimal allows (WAN listen + SSH from motherbee) to the input chain with `policy drop` when the boundary is closed.
 
-### F22 - Baja - El flujo egress carece del fast-path socket-first del worker
+### F22 - Low - The egress flow lacks the worker's socket-first fast-path
 
-Verificacion: lectura. **No destructivo** (refutado el framing de "deshace restricciones").
+Verification: reading. **Not destructive** (the "undoes restrictions" framing was refuted).
 
-Evidencia:
+Evidence:
 
-- `add_hive_flow` worker tiene fast-path socket-first (`:14819-14988`); `add_egress_hive_flow` no, y corre el bootstrap SSH incondicional.
-- El re-seed de key solo ocurre via canal password (`:15729-15745`) y la restriccion/hardening se aplica recien en `:15989`, despues de `write_hive_info` y de los gates que retornan temprano. En el caso parcial (interrumpido antes de `info.yaml`) no hay restriccion previa que deshacer. Los pasos son idempotentes (sudoers reescrito desde template, authorized_keys deduplica, `systemctl restart`).
-- Ausencia documentada: `edge_egress_nat_tasks.md` T-ROLE-9 enumera los helpers que `add_egress_hive_flow` reusa, y los socket-first no estan en la lista.
+- The worker `add_hive_flow` has a socket-first fast-path (`:14819-14988`); `add_egress_hive_flow` does not, and runs the SSH bootstrap unconditionally.
+- The key re-seed only happens via the password channel (`:15729-15745`), and the restriction/hardening is applied only at `:15989`, after `write_hive_info` and after the gates that return early. In the partial case (interrupted before `info.yaml`) there is no earlier restriction to undo. The steps are idempotent (sudoers rewritten from a template, authorized_keys deduplicates, `systemctl restart`).
+- Documented absence: `edge_egress_nat_tasks.md` T-ROLE-9 lists the helpers that `add_egress_hive_flow` reuses, and the socket-first ones are not on the list.
 
-Impacto:
+Impact:
 
-Falta de paridad: re-provisionar un egress online reinicia `rt-gateway`/`sy-orchestrator` (restart, no wipe) en lugar de cortar via socket. El caso normal (con `info.yaml`) esta protegido por `HIVE_EXISTS`. Peor caso: restart de servicios en una ventana muy estrecha.
+Lack of parity: re-provisioning an online egress restarts `rt-gateway`/`sy-orchestrator` (restart, not wipe) instead of short-circuiting via the socket. The normal case (with `info.yaml`) is protected by `HIVE_EXISTS`. Worst case: a service restart in a very narrow window.
 
-Recomendacion:
+Recommendation:
 
-Agregar el fast-path socket-first al flujo egress, por paridad/idempotencia con el worker. Mejora, no bug de seguridad.
+Add the socket-first fast-path to the egress flow, for parity/idempotency with the worker. An improvement, not a security bug.
 
-### F23 - Baja - `ipv4_forwarding`/`ipv6_blocked` se fijan `true` sin read-back del kernel
+### F23 - Low - `ipv4_forwarding`/`ipv6_blocked` are set `true` without a kernel read-back
 
-Verificacion: lectura. Informativa.
+Verification: reading. Informational.
 
-Evidencia:
+Evidence:
 
-- `reconcile_egress_nat:4017-4019`: `apply_sysctl_system()?; verification.ipv4_forwarding = true; verification.ipv6_blocked = true;`. `apply_sysctl_system` (`:3921-3925`) solo corre `sysctl --system` y mira exit code; no lee `/proc/sys`. Mismo patron en `reconcile_worker_egress:4096-4098`.
-- Asimetria: `nat_applied` si se verifica con read-back real (`nft_table_loaded:4041-4044`).
+- `reconcile_egress_nat:4017-4019`: `apply_sysctl_system()?; verification.ipv4_forwarding = true; verification.ipv6_blocked = true;`. `apply_sysctl_system` (`:3921-3925`) only runs `sysctl --system` and looks at the exit code; it does not read `/proc/sys`. Same pattern in `reconcile_worker_egress:4096-4098`.
+- Asymmetry: `nat_applied` does get verified with a real read-back (`nft_table_loaded:4041-4044`).
 
-Impacto:
+Impact:
 
-`sysctl --system` exit 0 no garantiza el valor live (un fichero de mayor prioridad, key rechazada, `disable_ipv6` no honrado en ifaces ya up). Pero los flags no llegan al operador (solo al journal, no son superficie de contrato) y el control load-bearing del IPv6-leak en el host egress es la regla nft `meta nfproto ipv6 drop` (`:3906`), que si se verifica. Gap de precision de logging, no de seguridad.
+`sysctl --system` exit 0 does not guarantee the live value (a higher-priority file, a rejected key, `disable_ipv6` not honored on ifaces that are already up). But the flags do not reach the operator (only the journal; they are not contract surface), and the load-bearing control for the IPv6 leak on the egress host is the nft rule `meta nfproto ipv6 drop` (`:3906`), which is verified. A logging-precision gap, not a security one.
 
-Recomendacion:
+Recommendation:
 
-Hacer read-back de `net.ipv4.ip_forward` y `disable_ipv6` antes de fijar los flags, por consistencia con `nat_applied`. Opcional.
+Read back `net.ipv4.ip_forward` and `disable_ipv6` before setting the flags, for consistency with `nat_applied`. Optional.
 
-### F25 - Baja - El re-apply de nft hace delete-then-apply no atomico
+### F25 - Low - The nft re-apply does a non-atomic delete-then-apply
 
-Verificacion: lectura. El modo de fallo peligroso **no es alcanzable** (defensa en profundidad).
+Verification: reading. The dangerous failure mode **is not reachable** (defense in depth).
 
-Evidencia:
+Evidence:
 
-- `reconcile_egress_nat:4037` corre `delete_egress_nft_table_if_present()?` antes de `nft -f` (`:4039-4040`), y `egress_nft_ruleset` no incluye `delete table`/`flush` propio, asi que el pre-delete separado hace la operacion no transaccional.
-- Pero los unicos callers son bootstrap (`:790`, fatal/crash-loop loud en egress) y el watchdog (`:1294`). El watchdog solo invoca `reconcile_egress_nat` dentro de `if !nft_table_loaded()` (`:1292`): cuando la tabla ya esta ausente. En ese estado `delete_egress_nft_table_if_present` (`:3962-3965`) hace `if !nft_table_loaded() { return Ok(()) }` = no-op. Asi el watchdog nunca borra una tabla sana presente.
+- `reconcile_egress_nat:4037` runs `delete_egress_nft_table_if_present()?` before `nft -f` (`:4039-4040`), and `egress_nft_ruleset` includes no `delete table`/`flush` of its own, so the separate pre-delete makes the operation non-transactional.
+- But the only callers are bootstrap (`:790`, fatal/loud crash-loop on egress) and the watchdog (`:1294`). The watchdog only invokes `reconcile_egress_nat` inside `if !nft_table_loaded()` (`:1292`): when the table is already absent. In that state `delete_egress_nft_table_if_present` (`:3962-3965`) does `if !nft_table_loaded() { return Ok(()) }` = no-op. So the watchdog never deletes a healthy table that is present.
 
-Impacto:
+Impact:
 
-La no-atomicidad es real como observacion de calidad, pero el "silent partial en host vivo" no se materializa: en el watchdog el delete es no-op guardado y el ciclo recurrente reintenta; en bootstrap el fallo es loud. El unico estado peligroso requiere una carrera TOCTOU extrema entre `:1292` y `:3963`.
+The non-atomicity is real as a quality observation, but the "silent partial on a live host" does not materialize: in the watchdog the delete is a guarded no-op and the recurring cycle retries; at bootstrap the failure is loud. The only dangerous state requires an extreme TOCTOU race between `:1292` and `:3963`.
 
-Recomendacion:
+Recommendation:
 
-Prepender `delete table inet fluxbee_egress` dentro del propio fichero `-f` (transaccion implicita de nft) para volverlo atomico y eliminar el pre-delete separado. Mejora de robustez.
+Prepend `delete table inet fluxbee_egress` inside the `-f` file itself (nft's implicit transaction) to make it atomic, and remove the separate pre-delete. A robustness improvement.
 
-## Gaps de cobertura (no auditado en profundidad)
+## Coverage gaps (not audited in depth)
 
-- **Parsing del payload v2**: `resolve_add_hive_role`, `resolve_add_hive_egress_section`, `resolve_add_hive_dist_sync_probe_timeout_secs`, coercion de `address` (`unwrap_or_default`), rango/limites de `dist_sync_probe_timeout_secs`/`harden_ssh`/`restrict_ssh`. Solo se reviso `hive_id` (F3) y parcialmente las ifaces (F7/F12/F13).
-- **Persistencia/atomicidad de `info.yaml`**: `write_hive_info`/`read_hive_info`/`append_*_history` y si una escritura parcial puede dejar un `hive_partial` inconsistente (central para F3/F9).
-- **Senales/shutdown**: `shutdown_sequence` (`:1329`) duerme 10s fijos y no interactua con operaciones `add_hive`/`remove_hive` en curso; comportamiento ante SIGTERM a mitad de bootstrap SSH o `remove_dir_all`.
-- **Observabilidad**: `append_*_history` registra `ok` aunque haya SSH fallback (F1/F2). Conviene auditar que los caminos degradados queden trazables.
-- **Clasificacion de errores de red**: `is_socket_only_unreachable_error` (`:14586`) decide caer-a-bootstrap vs `FINALIZE_FAILED` (F2) por substring matching; merece test dedicado.
-- **Bootstrap egress por password**: `add_egress_hive_flow` usa `ssh_with_pass_any` como canal primario y siembra key con `apply_remote_unrestricted_authorized_key_with_pass`; ese camino password-first y su diferencia con el worker no se audito.
+- **v2 payload parsing**: `resolve_add_hive_role`, `resolve_add_hive_egress_section`, `resolve_add_hive_dist_sync_probe_timeout_secs`, `address` coercion (`unwrap_or_default`), range/limits of `dist_sync_probe_timeout_secs`/`harden_ssh`/`restrict_ssh`. Only `hive_id` (F3) was reviewed, and the ifaces partially (F7/F12/F13).
+- **`info.yaml` persistence/atomicity**: `write_hive_info`/`read_hive_info`/`append_*_history`, and whether a partial write can leave an inconsistent `hive_partial` (central to F3/F9).
+- **Signals/shutdown**: `shutdown_sequence` (`:1329`) sleeps a fixed 10s and does not interact with in-flight `add_hive`/`remove_hive` operations; behavior on SIGTERM midway through an SSH bootstrap or a `remove_dir_all`.
+- **Observability**: `append_*_history` records `ok` even when there is an SSH fallback (F1/F2). It is worth auditing that the degraded paths stay traceable.
+- **Network error classification**: `is_socket_only_unreachable_error` (`:14586`) decides fall-back-to-bootstrap vs `FINALIZE_FAILED` (F2) by substring matching; it deserves a dedicated test.
+- **Egress bootstrap by password**: `add_egress_hive_flow` uses `ssh_with_pass_any` as the primary channel and seeds the key with `apply_remote_unrestricted_authorized_key_with_pass`; that password-first path and how it differs from the worker were not audited.
 
-## Cobertura faltante de tests
+## Missing test coverage
 
-- Concurrencia: `add_hive`/`remove_hive` sobre el mismo `hive_id` (o dos `add_hive` paralelos) que detecte el TOCTOU `hive_partial_exists` -> `remove_dir_all` -> `create_dir_all` (F18).
-- Traversal: `hive_id` y `address` invalidos no deben disparar `hive_partial_exists`/`remove_dir_all`/`create_dir_all` (F3); cubrir worker **y** egress.
-- Inyeccion: `wan_iface`/`lan_iface` con metacaracteres de shell/nft/YAML deben ser rechazados en `resolve_egress_nat_config` (F7/F12/F13).
-- Allowlist (F4): con `ORCH_SYSTEM_ALLOWED_ORIGINS=SY.admin`, `WF.orch.diag@<hive>` y `SY.wf-rules@<hive>` deben ser rechazados. **Requiere modificar el test existente `:18391`** (que hoy asierta lo contrario), no solo agregar el caso negativo.
-- Cross-hive (F15): `SY.admin@<hive-ajeno>` debe ser rechazado.
-- Gate ADMIN (F8): `ADMIN_COMMAND` desde origen no permitido -> FORBIDDEN; positivo desde `SY.admin@<hive>`.
-- `add_hive` socket-only (F2): si `socket_only_ready=true`, cualquier fallo de probe/finalize termina sin tocar bootstrap SSH; test de `is_socket_only_unreachable_error`.
-- `remove_hive` (F1): unit que garantice que online responde `socket_ok`/`socket` exacto (sin SSH) y offline `local_only`; correr `orchestrator_remove_hive_socket_e2e.sh` en lab para cerrar el loop.
-- Idempotencia (F9): reintento sobre un hive `pending` debe completar el finalize, no devolver `HIVE_EXISTS`.
-- Egress (F5/F16): unit del shape del payload vs spec ÃÂ§9 (separado del E2E de reachability de dos NICs); `conntrack_tuned` debe distinguir live de pending-reboot.
-- Drift (F6): con `nft_table_loaded()=true` pero contenido alterado, el reconcile debe re-aplicar.
-- panic-safety (F14): un panic en `watchdog_tick` no debe dejar `watchdog_running=true` permanente.
+- Concurrency: `add_hive`/`remove_hive` on the same `hive_id` (or two parallel `add_hive`) that detects the TOCTOU `hive_partial_exists` -> `remove_dir_all` -> `create_dir_all` (F18).
+- Traversal: an invalid `hive_id` and `address` must not trigger `hive_partial_exists`/`remove_dir_all`/`create_dir_all` (F3); cover worker **and** egress.
+- Injection: `wan_iface`/`lan_iface` with shell/nft/YAML metacharacters must be rejected in `resolve_egress_nat_config` (F7/F12/F13).
+- Allowlist (F4): with `ORCH_SYSTEM_ALLOWED_ORIGINS=SY.admin`, `WF.orch.diag@<hive>` and `SY.wf-rules@<hive>` must be rejected. **Requires changing the existing test `:18391`** (which today asserts the opposite), not just adding the negative case.
+- Cross-hive (F15): `SY.admin@<foreign-hive>` must be rejected.
+- ADMIN gate (F8): `ADMIN_COMMAND` from a non-allowed origin -> FORBIDDEN; positive case from `SY.admin@<hive>`.
+- `add_hive` socket-only (F2): if `socket_only_ready=true`, any probe/finalize failure ends without touching the SSH bootstrap; a test of `is_socket_only_unreachable_error`.
+- `remove_hive` (F1): a unit test guaranteeing that online it replies exactly `socket_ok`/`socket` (no SSH) and offline `local_only`; run `orchestrator_remove_hive_socket_e2e.sh` in the lab to close the loop.
+- Idempotency (F9): a retry on a `pending` hive must complete the finalize, not return `HIVE_EXISTS`.
+- Egress (F5/F16): a unit test of the payload shape vs spec §9 (separate from the two-NIC reachability E2E); `conntrack_tuned` must distinguish live from pending-reboot.
+- Drift (F6): with `nft_table_loaded()=true` but altered content, the reconcile must re-apply.
+- panic-safety (F14): a panic in `watchdog_tick` must not leave `watchdog_running=true` permanently.
 
-## Orden sugerido de fixes
+## Suggested fix order
 
-1. **Validar `wan_iface`/`lan_iface`** en `resolve_egress_nat_config` (cierra F7 RCE + F12 nft + F13 YAML de un solo golpe) y reescribir `write_remote_file` para no construir shell por interpolacion.
-2. **Gate de origen en `ADMIN_COMMAND`** (F8).
-3. **Validar `hive_id` al inicio** de `add_hive`/`add_egress` + canonicalizar deletes (F3), y **lock por `hive_id`** (F18).
-4. **Quitar SSH de `remove_hive`** (F1) y **bloquear fallback SSH** una vez elegido socket-only en `add_hive` (F2).
-5. **Hacer `add_hive` idempotente** (F9): reintento sobre `pending` completa el finalize.
-6. **Hardening SSH egress fatal** (F10) y **teardown de NAT en `remove_hive` egress** (F11).
-7. **Allowlist efectiva y same-hive** (F4 + F15): sin prefijos hardcodeados, match exacto `name@hive`.
-8. **panic-safe watchdog** (F14) + **clamp de slices SHM** (F20).
-9. **Verificacion/persistencia egress** (F5 internet_reachable, F16 conntrack, F17 carga al boot, F6 drift).
-10. Bajas restantes (F19, F21, F22, F23, F25) segun capacidad.
+1. **Validate `wan_iface`/`lan_iface`** in `resolve_egress_nat_config` (closes F7 RCE + F12 nft + F13 YAML in one stroke) and rewrite `write_remote_file` so it does not build shell commands by interpolation.
+2. **Origin gate on `ADMIN_COMMAND`** (F8).
+3. **Validate `hive_id` at the start** of `add_hive`/`add_egress` + canonicalize deletes (F3), and **lock per `hive_id`** (F18).
+4. **Remove SSH from `remove_hive`** (F1) and **block the SSH fallback** once socket-only has been chosen in `add_hive` (F2).
+5. **Make `add_hive` idempotent** (F9): a retry on `pending` completes the finalize.
+6. **Fatal egress SSH hardening** (F10) and **NAT teardown in egress `remove_hive`** (F11).
+7. **Effective, same-hive allowlist** (F4 + F15): no hardcoded prefixes, exact `name@hive` match.
+8. **panic-safe watchdog** (F14) + **SHM slice clamp** (F20).
+9. **Egress verification/persistence** (F5 internet_reachable, F16 conntrack, F17 load at boot, F6 drift).
+10. Remaining Low findings (F19, F21, F22, F23, F25) as capacity allows.
 
-## Falsos positivos descartados
+## False positives discarded
 
-Verificados adversarialmente y descartados como no-bug (se documentan para que no reaparezcan):
+Adversarially verified and discarded as non-bugs (documented so they do not reappear):
 
-- **`remove_hive` local-only con worker offline devuelve `status:ok`**: es la degradacion local-only deliberada y documentada del contrato v2 (`sy_orchestrator_v2_tasks.md:21`, E2E-3), con gate E2E dedicado que exige justamente `status:ok` + `remote_cleanup_via=local_only` y senal explicita via `remote_cleanup`. La unica observacion legitima (UX: el `ok` top-level puede ocultar la degradacion; no hay reconciliacion de workers huerfanos) es materia de charla de diseno, no un bug de codigo.
-- **Fallo de syncthing peer-link/dist_sync tras finalize exitoso no revierte el finalize remoto**: no produce doble-provision ni inconsistencia. Tanto el finalize del worker (`compute_local_core_update_sets`) como el peer-link de la mother (`reconcile_syncthing_peer_xml`) son idempotentes; el reintento entra por el fast-path socket idempotente, no por bootstrap SSH; `hive_partial_exists`+`remove_dir_all` limpia el dir local vacio. Residuo real: observabilidad (no hay campo `worker_already_finalized`), cosmetico.
+- **`remove_hive` local-only with an offline worker returns `status:ok`**: this is the deliberate, documented local-only degradation of the v2 contract (`sy_orchestrator_v2_tasks.md:21`, E2E-3), with a dedicated E2E gate that requires exactly `status:ok` + `remote_cleanup_via=local_only` and an explicit signal via `remote_cleanup`. The only legitimate observation (UX: the top-level `ok` can hide the degradation; there is no reconciliation of orphaned workers) is a matter for a design discussion, not a code bug.
+- **A syncthing peer-link/dist_sync failure after a successful finalize does not roll back the remote finalize**: it causes no double provisioning and no inconsistency. Both the worker's finalize (`compute_local_core_update_sets`) and the mother's peer-link (`reconcile_syncthing_peer_xml`) are idempotent; the retry comes in through the idempotent socket fast-path, not through the SSH bootstrap; `hive_partial_exists`+`remove_dir_all` cleans up the empty local dir. Real residue: observability (there is no `worker_already_finalized` field), cosmetic.

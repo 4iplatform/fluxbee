@@ -505,12 +505,12 @@ async fn main() -> Result<(), AdminError> {
             "-h" | "--help" => {
                 println!(
                     "sy_admin — SY.admin daemon (motherbee-only; NOT an interactive CLI).\n\
-                     Serves the admin HTTP API (default 127.0.0.1:8080) and the admin.sock action set.\n\
+                     Serves the admin HTTP API (default 127.0.0.1:8080) and ADMIN_COMMAND over the mesh.\n\
                      Started by systemd (sy-admin.service); the operator uses the HTTP API, e.g.:\n  \
                        curl -sS http://127.0.0.1:8080/hives\n\n\
                      Env: JSR_ADMIN_LISTEN (HTTP listen addr), JSR_LOG_LEVEL (info|debug|...),\n     \
                      SY_ADMIN_PUBLIC_EDGE_NODE, SY_ADMIN_PUBLIC_BASE_URL.\n\
-                     See docs/07-operaciones.md."
+                     See docs/nodes/sy-admin.md."
                 );
                 return Ok(());
             }

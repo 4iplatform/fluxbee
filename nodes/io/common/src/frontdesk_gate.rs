@@ -4,7 +4,7 @@
 //!
 //! Cuando alguien escribe por primera vez desde un canal externo, el nodo IO le crea un ILK con
 //! `registration_status = "temporary"` e `identification: {}` — un handle vacio para "alguien que
-//! escribio y todavia no sabemos quien es". La spec (`docs/10-identity-v2.md`) dice que ese ILK lo
+//! escribio y todavia no sabemos quien es". La spec (`docs/history/10-identity-v2.md`) dice que ese ILK lo
 //! asciende **AI.frontdesk**, el unico autorizado junto a SY.orchestrator a emitir `ILK_REGISTER`.
 //!
 //! Pero nada llevaba al desconocido hasta alla, asi que el ILK quedaba `temporary` para siempre.
