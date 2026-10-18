@@ -1089,7 +1089,7 @@ router reviews.
 - **Proposal:** align the Go SDK with Rust (matchers, TTL, an oversize send refused without dropping
   the link). To decide with the operator.
 
-### A-74 🔴 CONFIRMED IN CODE (2026-10-17) — One invalid route, VPN or tap blocks every later change in SY.config.routes
+### A-74 ✅ VALIDATED ON 8.x (0.1.80, 2026-10-17) — One invalid route, VPN or tap blocked every later change in SY.config.routes
 
 - **What happens:** SY.config.routes gets no reply for an invalid route, VPN or tap, and later
   changes stay blocked until that entry is deleted or the node restarts
@@ -1098,8 +1098,13 @@ router reviews.
   hive, silently.
 - **Proposal:** answer the invalid entry with an error and keep applying the rest. To decide with
   the operator; not tried live.
+- **Fixed (0.1.80, `58db83a`):** a change is built on a copy and committed only when the config
+  region accepts it (`commit_config`); the region is put back after a failed write or save; the
+  file is saved through a rename; every refusal is answered (`INVALID_CONFIG`, `INVALID_REQUEST`,
+  `INVALID_CONFIG_SET`). Validated on 8.x: an invalid route answered `422 INVALID_CONFIG` in 0.01 s
+  and changed nothing; the next valid one committed.
 
-### A-73 🔴 CONFIRMED IN CODE (2026-10-17) — Archi's read tool can change the system without the operator's confirmation
+### A-73 ✅ VALIDATED ON 8.x (0.1.80, 2026-10-17) — Archi's read tool could change the system without the operator's confirmation
 
 - **What happens:**
   - `fluxbee_system_get` is Archi's read tool. It accepts GET and POST, translates the path with
@@ -1116,6 +1121,10 @@ router reviews.
 - **Proposal:** make the read tool refuse every action that is not a read (an allowlist of read
   actions, plus the safe POST checks: the OPA policy check and a node's live CONFIG_GET). Small.
   To decide with the operator.
+- **Fixed (0.1.80, `58db83a`):** the read tool runs a GET that names no change and the POSTs that
+  change nothing (a node's live CONFIG_GET, the timer's conversions); an OPA check is not one (it
+  stages the policy it checks, see A-76). Validated on 8.x: asked to start a node through the read
+  tool, Archi got the refusal and no node was created.
 
 ### A-72 🔴 CONFIRMED IN CODE (2026-10-17) — An agent's role does not reach the workers: `blob/agent-assets` is not replicated
 
@@ -1136,7 +1145,7 @@ router reviews.
 - **Proposal:** share `agent-assets` with the workers, read-only like `blob/active`, or serve them
   over the mesh. To be decided with the operator.
 
-### A-71 🔴 CONFIRMED IN CODE (2026-10-17) — ai.generic truncates the user's message, together with its memory, to 1,200 characters
+### A-71 ✅ VALIDATED ON 8.x (0.1.80, 2026-10-17) — ai.generic truncated the user's message, together with its memory, to 1,200 characters
 
 - **What happens:**
   - With `capabilities.multimodal: false`, ai.generic prepends the communication's memory block to
@@ -1152,6 +1161,12 @@ router reviews.
 - **How it showed up:** in the review of the developer docs (2026-10-17).
 - **Proposal:** do not trim the current message (the limit stays for the immediate history), or
   bound the memory on its own. To be decided with the operator.
+- **Fixed (0.1.80, `58db83a`):** the AI SDK no longer cuts the message being answered (the
+  1,200-character limit stays for the history around it); ai.generic keeps the person's own words,
+  without the memory block, in its immediate history. The cut also gave Archi's pipeline stages
+  (designer, auditor, programmer, plan compiler) cut inputs since March: they now get their whole
+  input, so expect more tokens per stage. Validated on 8.x: a ~3,000-character message to Archi
+  with the question at its end was answered correctly.
 
 ### A-70 ✅ VALIDATED ON 8.x (0.1.75 to 0.1.79, 2026-10-16/17): NATS DELETED AND LLM USAGE RECORDED — The records' "NATS" lived inside the router, lost data and only stored the motherbee's
 

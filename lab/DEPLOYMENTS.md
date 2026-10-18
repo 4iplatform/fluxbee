@@ -21,7 +21,8 @@
 
 | Version | Date (ART) | Commit | Scope | Status | Rollback |
 |---|---|---|---|---|---|
-| **0.1.79** | 2026-10-17 | `0bc85e3` | motherbee + spokes (core) | ✅ live | snap `pre-stream3-0-1-79` (all 4 VMs) · `apt install fluxbee=0.1.78` + core-update of the spokes |
+| **0.1.80** | 2026-10-17 | `58db83a` | motherbee + spokes (core) | ✅ live | snap `pre-batch-0-1-80` (all 4 VMs) · `apt install fluxbee=0.1.79` + core-update of the spokes |
+| **0.1.79** | 2026-10-17 | `0bc85e3` | motherbee + spokes (core) | ✅ replaced by 0.1.80 | snap `pre-stream3-0-1-79` (all 4 VMs) · `apt install fluxbee=0.1.78` + core-update of the spokes |
 | **0.1.78** | 2026-10-17 | `104fa65` | motherbee + spokes (core) | ✅ replaced by 0.1.79 | snap `pre-stream2b-0-1-78` (all 4 VMs) · `apt install fluxbee=0.1.77` + core-update of the spokes |
 | **0.1.77** | 2026-10-17 | `377945a` | motherbee + spokes (core) | ✅ replaced by 0.1.78 | snap `pre-stream2a-0-1-77` (all 4 VMs); `apt` alone is not enough (see the entry) |
 | **0.1.76** | 2026-10-16 | `e24e7d3` | motherbee + spokes (core) | ✅ replaced by 0.1.77 | snap `pre-stream1b-0-1-76` (all 4 VMs); `apt install fluxbee=0.1.75` loses the purged inbox (see the entry) |
@@ -88,6 +89,73 @@
 > (`dpkg-scanpackages -m`) for rollback, but their detail lives in the logbook, not here.
 
 ---
+
+## 0.1.80 — The repo cleanup, Archi's read tool reads only, a refused route changes nothing, the message being answered is never cut (A-73, A-74, A-71)
+
+- **Date:** 2026-10-17 (ART) · **Previous version:** 0.1.79 · **Commit:** `58db83a`, on top of the
+  cleanup pass (`41decbd`, `9b50b96`, `c70be7e`).
+- **Scope:** motherbee + the three spokes (core update).
+- **What changed:**
+  - **The cleanup pass** (the operator's catalog, approved by group):
+    - about 20,600 lines out;
+    - the one-time boot transitions of 0.1.75–0.1.78, the diags and scripts A-68 left broken,
+      40 old lab scripts, the cognition test nodes;
+    - dead tables, fields and functions, the SDK's blob confirm, stray files;
+    - the scaffold's templates now write what the runtimes accept.
+
+    The docs were rewritten from the code (docs/README.md is the index) and the repo is in
+    English.
+  - **A-73:** Archi's read tool (`fluxbee_system_get`) runs reads only. Every change goes through
+    the plan compiler and the operator's confirmation.
+  - **A-74:** SY.config.routes commits a change only when the config region accepts it. It
+    answers every refusal and saves the file through a rename.
+  - **A-71:** the AI SDK no longer cuts the message being answered at 1,200 characters. That cut
+    lost an agent's message behind its memory, and gave Archi's pipeline stages cut inputs since
+    March. ai.generic keeps the person's own words in its immediate history.
+- **Deploy:**
+  - build of `58db83a` in 30 min, publish in 12 s, deploy in 239 s;
+  - snapshots `pre-batch-0-1-80` on the 4 VMs (`pre-stream2a-0-1-77` was deleted);
+  - 0.1.80 on all 4, health clean.
+- **Gate:**
+  - **Boot without the transitions:**
+    - every unit active, none failed;
+    - SY.storage started with `storage_ready=true`, its schema in place;
+    - Archi's handbook installed from `docs/archi/` (32,671 bytes) and the message log connected.
+  - **A-74:**
+    - `POST /hives/motherbee/routes` with action `TELEPORT` answered `422 INVALID_CONFIG`
+      (*invalid action 'TELEPORT'*) in 0.01 s, and the route list stayed the same. Before, it
+      answered nothing and blocked every later change;
+    - a valid route then committed (config_version 19) and was deleted (20).
+  - **A-71:** a message of about 3,000 characters to Archi, with the question at its end ("how
+    much is 17 + 25? answer only with the number"), was answered `42`. Before, the cut lost the
+    question.
+  - **A-73:**
+    - asked to start a node through `fluxbee_system_get` with `POST /hives/motherbee/nodes`, Archi
+      got *"fluxbee_system_get only reads; run_node changes the system: stage it with
+      fluxbee_plan_compiler"*;
+    - no node was created.
+  - **The data path after the cleanup,** with an agent in a test tenant, without a key:
+    - its 4 turns reached `turns`;
+    - cognition built its communication (1 thread, 10 contexts);
+    - 6 cognition usage records were charged to the tenant (`agent`, verified, no duplicate
+      provider ids);
+    - `GET /hives/motherbee/usage` answered.
+  - **Health:** `failed=0 denials=0 srcdrops=0 streamlost=0 usagelost=0 usagerej=0` on all 4.
+  - **Not done:** the three empty dead tables (`events`, `memory_items`,
+    `storage_reactivation_applied`, 0 rows each) are still in the PROD database. The code no
+    longer creates them; dropping them was refused by the session's permission check and is left
+    to the operator.
+- **Cleanup:**
+  - the test node with its identity, the tenant (deleted and purged), the memory region;
+  - the gate's rows: 4 turns with their inbox rows, every cognition row, and the 6 usage records;
+  - the two Archi sessions of the tests.
+
+  Archi's three real calls during the tests stay as usage records of the root tenant.
+- **Upgrading an older hive:** the cleanup removed the one-time boot transitions of
+  0.1.75–0.1.78. A hive older than 0.1.78 (the Cloud team's DEV hive) upgrades through 0.1.79
+  first (`apt install fluxbee=0.1.79`, boot, then the latest).
+- **Rollback:** snapshot `pre-batch-0-1-80`, or `apt install fluxbee=0.1.79` plus the core update of
+  the spokes.
 
 ## 0.1.79 — LLM usage records: every call to a model, charged to a tenant (A-70, stage 3)
 
