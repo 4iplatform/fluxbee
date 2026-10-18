@@ -957,7 +957,7 @@ impl FunctionTool for ArchitectSystemGetTool {
             name: "fluxbee_system_get".to_string(),
             description: format!(
                 "Read live Fluxbee system state through SY.admin for hive {hive}. Read-only. \
-                Supports GET and safe POST checks (OPA policy check, node CONFIG_GET). \
+                Supports GET and the POST reads that change nothing: a node's live CONFIG_GET and the timer's conversions; every change goes through fluxbee_plan_compiler. \
                 Key paths: /inventory (all nodes), /versions, /hives/{{hive}}/runtimes, \
                 /hives/{{hive}}/nodes, /hives/{{hive}}/nodes/{{name}}/config (persisted), \
                 /hives/{{hive}}/identity/ilks, /hives/{{hive}}/identity/ilks/{{ilk_id}}, \
@@ -989,7 +989,7 @@ impl FunctionTool for ArchitectSystemGetTool {
                     },
                     "body": {
                         "type": "object",
-                        "description": "Optional JSON object for safe POST checks such as /opa/policy/check or /hives/{hive}/nodes/{node_name}/control/config-get"
+                        "description": "Optional JSON object for the POST reads: /hives/{hive}/nodes/{node_name}/control/config-get or /hives/{hive}/timer/now-in|convert|parse|format"
                     }
                 },
                 "required": ["path"]
@@ -1034,6 +1034,12 @@ impl FunctionTool for ArchitectSystemGetTool {
         let translation = translate_scmd(&self.context.hive_id, parsed).map_err(|err| {
             fluxbee_ai_sdk::AiSdkError::Protocol(format!("unsupported system get path: {err}"))
         })?;
+        if !system_get_may_run(&method, &translation.action) {
+            return Err(fluxbee_ai_sdk::AiSdkError::Protocol(format!(
+                "fluxbee_system_get only reads; {} changes the system: stage it with fluxbee_plan_compiler",
+                translation.action
+            )));
+        }
         let output =
             execute_admin_translation_with_context(&self.context, translation, "tool.read")
                 .await
@@ -11731,6 +11737,28 @@ fn chat_status_from_command_output(output: &Value) -> String {
         .filter(|value| !value.is_empty())
         .unwrap_or("ok")
         .to_string()
+}
+
+/// What `fluxbee_system_get` may run (FINDINGS A-73): a read. A GET is one unless it names a change;
+/// a POST only when it changes nothing: a node's live CONFIG_GET or a timer conversion (an OPA check
+/// is not one: it stages the policy it checks). Every change goes through
+/// the plan compiler and the operator's confirmation.
+fn system_get_may_run(method: &str, action: &str) -> bool {
+    if is_mutating_admin_action(action) {
+        return false;
+    }
+    match method {
+        "GET" => true,
+        "POST" => matches!(
+            action,
+            "node_control_config_get"
+                | "timer_now_in"
+                | "timer_convert"
+                | "timer_parse"
+                | "timer_format"
+        ),
+        _ => false,
+    }
 }
 
 fn is_mutating_admin_action(action: &str) -> bool {
@@ -26404,6 +26432,54 @@ mod tests {
         assert_eq!(translated.action, "list_taps");
         assert_eq!(translated.target_hive, "motherbee");
         assert_eq!(translated.params, json!({}));
+    }
+
+    /// FINDINGS A-73: the read tool runs reads only. Every POST route that changes something is
+    /// refused, whatever the action list says; the checks and conversions pass.
+    #[test]
+    fn the_read_tool_runs_reads_only() {
+        let refused = [
+            "curl -X POST /hives -d '{\"hive_id\":\"worker2\"}'",
+            "curl -X POST /hives/motherbee/nodes -d '{\"node_name\":\"AI.x@motherbee\"}'",
+            "curl -X POST /hives/motherbee/nodes/AI.x@motherbee/start -d '{}'",
+            "curl -X POST /hives/motherbee/nodes/AI.x@motherbee/restart -d '{}'",
+            "curl -X POST /hives/motherbee/identity/tenants/tnt:x/sponsor -d '{}'",
+            "curl -X POST /hives/motherbee/identity/ilks/ilk:x/definition -d '{}'",
+            "curl -X POST /hives/motherbee/routes -d '{}'",
+            "curl -X POST /hives/motherbee/vpns -d '{}'",
+            "curl -X POST /hives/motherbee/taps -d '{}'",
+            "curl -X POST /hives/motherbee/wf-rules -d '{}'",
+            "curl -X POST /hives/motherbee/update -d '{}'",
+            "curl -X POST /hives/motherbee/sync-hint -d '{}'",
+            "curl -X POST /hives/motherbee/nodes/AI.x@motherbee/messages -d '{}'",
+            "curl -X POST /hives/motherbee/nodes/AI.x@motherbee/control/config-set -d '{}'",
+            "curl -X POST /opa/policy -d '{}'",
+            // A check stages the policy it checks and bumps the version: not a read.
+            "curl -X POST /opa/policy/check -d '{}'",
+            "curl -X POST /admin/runtime-packages/publish -d '{}'",
+        ];
+        for raw in refused {
+            let translated = translate_scmd("motherbee", parse(raw)).expect(raw);
+            assert!(
+                !system_get_may_run("POST", &translated.action),
+                "{raw} -> {}",
+                translated.action
+            );
+        }
+        let allowed = [
+            "curl -X POST /hives/motherbee/nodes/AI.x@motherbee/control/config-get -d '{}'",
+            "curl -X POST /hives/motherbee/timer/now-in -d '{}'",
+        ];
+        for raw in allowed {
+            let translated = translate_scmd("motherbee", parse(raw)).expect(raw);
+            assert!(
+                system_get_may_run("POST", &translated.action),
+                "{raw} -> {}",
+                translated.action
+            );
+        }
+        assert!(system_get_may_run("GET", "inventory"));
+        assert!(!system_get_may_run("GET", "run_node"));
     }
 
     #[test]

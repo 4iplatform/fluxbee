@@ -355,9 +355,25 @@ async fn handle_node_config_set(
     };
 
     if next_config != *sy_config {
-        apply_config(writer, hive_id, &next_config)?;
-        write_config(config_dir, &next_config)?;
-        *sy_config = next_config;
+        if let Err(detail) = commit_config(writer, config_dir, hive_id, sy_config, next_config) {
+            send_node_config_control_response(
+                sender,
+                msg,
+                serde_json::json!({
+                    "ok": false,
+                    "node_name": node_name,
+                    "state": "error",
+                    "schema_version": request.schema_version,
+                    "config_version": sy_config.version,
+                    "error": {
+                        "code": "INVALID_CONFIG_SET",
+                        "detail": detail
+                    }
+                }),
+            )
+            .await?;
+            return Ok(());
+        }
     }
 
     send_node_config_control_response(
@@ -470,100 +486,98 @@ async fn handle_admin_action(
                 "vpns": sy_config.vpns.clone(),
             }),
         ),
-        "add_route" => {
-            let route: RouteConfig = serde_json::from_value(msg.payload.clone())?;
-            if sy_config.routes.iter().any(|r| r.prefix == route.prefix) {
+        "add_route" => match serde_json::from_value::<RouteConfig>(msg.payload.clone()) {
+            Err(err) => invalid_request(action, err),
+            Ok(route) if sy_config.routes.iter().any(|r| r.prefix == route.prefix) => {
                 admin_error_payload(
                     action,
                     "DUPLICATE_PREFIX",
                     format!("Route with prefix '{}' already exists", route.prefix),
                 )
-            } else {
-                sy_config.routes.push(route.clone());
-                sy_config.version = sy_config.version.saturating_add(1);
-                sy_config.updated_at = now_epoch_ms().to_string();
-                apply_config(writer, hive_id, sy_config)?;
-                write_config(config_dir, sy_config)?;
-                admin_success_payload(
+            }
+            Ok(route) => {
+                let mut next = sy_config.clone();
+                next.routes.push(route.clone());
+                commit_admin_change(
+                    writer,
+                    config_dir,
+                    hive_id,
+                    sy_config,
+                    next,
                     action,
-                    serde_json::json!({
-                        "config_version": sy_config.version,
-                        "route": route,
-                    }),
+                    |config| serde_json::json!({ "config_version": config.version, "route": route }),
                 )
             }
-        }
+        },
         "delete_route" => {
             let payload: serde_json::Value = msg.payload.clone();
             let prefix = payload.get("prefix").and_then(|v| v.as_str()).unwrap_or("");
-            let before = sy_config.routes.len();
-            sy_config.routes.retain(|r| r.prefix != prefix);
-            if sy_config.routes.len() == before {
+            let mut next = sy_config.clone();
+            next.routes.retain(|r| r.prefix != prefix);
+            if next.routes.len() == sy_config.routes.len() {
                 admin_error_payload(
                     action,
                     "NOT_FOUND",
                     format!("Route with prefix '{}' not found", prefix),
                 )
             } else {
-                sy_config.version = sy_config.version.saturating_add(1);
-                sy_config.updated_at = now_epoch_ms().to_string();
-                apply_config(writer, hive_id, sy_config)?;
-                write_config(config_dir, sy_config)?;
-                admin_success_payload(
+                commit_admin_change(
+                    writer,
+                    config_dir,
+                    hive_id,
+                    sy_config,
+                    next,
                     action,
-                    serde_json::json!({
-                        "config_version": sy_config.version,
-                    }),
+                    |config| serde_json::json!({ "config_version": config.version }),
                 )
             }
         }
-        "add_vpn" => {
-            let vpn: VpnConfig = serde_json::from_value(msg.payload.clone())?;
-            if sy_config.vpns.iter().any(|v| v.pattern == vpn.pattern) {
+        "add_vpn" => match serde_json::from_value::<VpnConfig>(msg.payload.clone()) {
+            Err(err) => invalid_request(action, err),
+            Ok(vpn) if sy_config.vpns.iter().any(|v| v.pattern == vpn.pattern) => {
                 admin_error_payload(
                     action,
                     "DUPLICATE_PATTERN",
                     format!("VPN with pattern '{}' already exists", vpn.pattern),
                 )
-            } else {
-                sy_config.vpns.push(vpn.clone());
-                sy_config.version = sy_config.version.saturating_add(1);
-                sy_config.updated_at = now_epoch_ms().to_string();
-                apply_config(writer, hive_id, sy_config)?;
-                write_config(config_dir, sy_config)?;
-                admin_success_payload(
+            }
+            Ok(vpn) => {
+                let mut next = sy_config.clone();
+                next.vpns.push(vpn.clone());
+                commit_admin_change(
+                    writer,
+                    config_dir,
+                    hive_id,
+                    sy_config,
+                    next,
                     action,
-                    serde_json::json!({
-                        "config_version": sy_config.version,
-                        "vpn": vpn,
-                    }),
+                    |config| serde_json::json!({ "config_version": config.version, "vpn": vpn }),
                 )
             }
-        }
+        },
         "delete_vpn" => {
             let payload: serde_json::Value = msg.payload.clone();
             let pattern = payload
                 .get("pattern")
                 .and_then(|v| v.as_str())
                 .unwrap_or("");
-            let before = sy_config.vpns.len();
-            sy_config.vpns.retain(|v| v.pattern != pattern);
-            if sy_config.vpns.len() == before {
+            let mut next = sy_config.clone();
+            next.vpns.retain(|v| v.pattern != pattern);
+            if next.vpns.len() == sy_config.vpns.len() {
                 admin_error_payload(
                     action,
                     "NOT_FOUND",
                     format!("VPN with pattern '{}' not found", pattern),
                 )
             } else {
-                sy_config.version = sy_config.version.saturating_add(1);
-                sy_config.updated_at = now_epoch_ms().to_string();
-                apply_config(writer, hive_id, sy_config)?;
-                write_config(config_dir, sy_config)?;
-                admin_success_payload(
+                commit_admin_change(
+                    writer,
+                    config_dir,
+                    hive_id,
+                    sy_config,
+                    next,
                     action,
-                    serde_json::json!({
-                        "config_version": sy_config.version,
-                    }),
+                    |config| serde_json::json!({ "config_version": config.version }),
                 )
             }
         }
@@ -574,16 +588,17 @@ async fn handle_admin_action(
                 "taps": sy_config.taps.clone(),
             }),
         ),
-        "add_tap" => {
-            let tap: TapConfig = serde_json::from_value(msg.payload.clone())?;
+        "add_tap" => match serde_json::from_value::<TapConfig>(msg.payload.clone()) {
+            Err(err) => invalid_request(action, err),
             // Natural key for taps is the (match_src, match_dst, target) triple.
             // Adding a duplicate triple is rejected so the operator notices.
-            let duplicate = sy_config.taps.iter().any(|t| {
-                t.match_src == tap.match_src
-                    && t.match_dst == tap.match_dst
-                    && t.target == tap.target
-            });
-            if duplicate {
+            Ok(tap)
+                if sy_config.taps.iter().any(|t| {
+                    t.match_src == tap.match_src
+                        && t.match_dst == tap.match_dst
+                        && t.target == tap.target
+                }) =>
+            {
                 admin_error_payload(
                     action,
                     "DUPLICATE_TAP",
@@ -592,21 +607,21 @@ async fn handle_admin_action(
                         tap.match_src, tap.match_dst, tap.target
                     ),
                 )
-            } else {
-                sy_config.taps.push(tap.clone());
-                sy_config.version = sy_config.version.saturating_add(1);
-                sy_config.updated_at = now_epoch_ms().to_string();
-                apply_config(writer, hive_id, sy_config)?;
-                write_config(config_dir, sy_config)?;
-                admin_success_payload(
+            }
+            Ok(tap) => {
+                let mut next = sy_config.clone();
+                next.taps.push(tap.clone());
+                commit_admin_change(
+                    writer,
+                    config_dir,
+                    hive_id,
+                    sy_config,
+                    next,
                     action,
-                    serde_json::json!({
-                        "config_version": sy_config.version,
-                        "tap": tap,
-                    }),
+                    |config| serde_json::json!({ "config_version": config.version, "tap": tap }),
                 )
             }
-        }
+        },
         "delete_tap" => {
             let payload: serde_json::Value = msg.payload.clone();
             let match_src = payload
@@ -618,11 +633,11 @@ async fn handle_admin_action(
                 .and_then(|v| v.as_str())
                 .unwrap_or("");
             let target = payload.get("target").and_then(|v| v.as_str()).unwrap_or("");
-            let before = sy_config.taps.len();
-            sy_config.taps.retain(|t| {
+            let mut next = sy_config.clone();
+            next.taps.retain(|t| {
                 !(t.match_src == match_src && t.match_dst == match_dst && t.target == target)
             });
-            if sy_config.taps.len() == before {
+            if next.taps.len() == sy_config.taps.len() {
                 admin_error_payload(
                     action,
                     "NOT_FOUND",
@@ -632,15 +647,14 @@ async fn handle_admin_action(
                     ),
                 )
             } else {
-                sy_config.version = sy_config.version.saturating_add(1);
-                sy_config.updated_at = now_epoch_ms().to_string();
-                apply_config(writer, hive_id, sy_config)?;
-                write_config(config_dir, sy_config)?;
-                admin_success_payload(
+                commit_admin_change(
+                    writer,
+                    config_dir,
+                    hive_id,
+                    sy_config,
+                    next,
                     action,
-                    serde_json::json!({
-                        "config_version": sy_config.version,
-                    }),
+                    |config| serde_json::json!({ "config_version": config.version }),
                 )
             }
         }
@@ -651,6 +665,62 @@ async fn handle_admin_action(
         ),
     };
     send_admin_reply(sender, msg, action, reply_payload).await
+}
+
+/// Makes `next` this hive's config: written to the config region, then saved. A config the region
+/// refuses (an invalid route, VPN or tap) changes nothing, and the caller answers with the reason
+/// (FINDINGS A-74: the invalid entry used to stay and block every later change, unanswered).
+fn commit_config(
+    writer: &mut ConfigRegionWriter,
+    config_dir: &Path,
+    hive_id: &str,
+    current: &mut SyConfigFile,
+    next: SyConfigFile,
+) -> Result<(), String> {
+    if let Err(err) = apply_config(writer, hive_id, &next) {
+        // Every entry is checked before the first write, but a write can still fail after an
+        // earlier one went through (a table past its capacity): put the current config back.
+        if let Err(restore) = apply_config(writer, hive_id, current) {
+            tracing::error!(error = %restore, "config region could not be restored after a failed apply");
+        }
+        return Err(err.to_string());
+    }
+    if let Err(err) = write_config(config_dir, &next) {
+        // The region has `next` already: put the current config back, so the region, the file
+        // and this process agree.
+        if let Err(restore) = apply_config(writer, hive_id, current) {
+            tracing::error!(error = %restore, "config region could not be restored after a failed save");
+        }
+        return Err(format!("the config could not be saved: {err}"));
+    }
+    *current = next;
+    Ok(())
+}
+
+/// An admin action's change: a new version of the config, committed, and its answer.
+fn commit_admin_change(
+    writer: &mut ConfigRegionWriter,
+    config_dir: &Path,
+    hive_id: &str,
+    current: &mut SyConfigFile,
+    mut next: SyConfigFile,
+    action: &str,
+    answer: impl FnOnce(&SyConfigFile) -> serde_json::Value,
+) -> serde_json::Value {
+    next.version = current.version.saturating_add(1);
+    next.updated_at = now_epoch_ms().to_string();
+    match commit_config(writer, config_dir, hive_id, current, next) {
+        Ok(()) => admin_success_payload(action, answer(current)),
+        Err(detail) => admin_error_payload(action, "INVALID_CONFIG", detail),
+    }
+}
+
+fn invalid_request(action: &str, err: serde_json::Error) -> serde_json::Value {
+    admin_error_payload(
+        action,
+        "INVALID_REQUEST",
+        format!("invalid {action} payload: {err}"),
+    )
 }
 
 fn admin_action_mutates(action: &str) -> bool {
@@ -769,9 +839,12 @@ fn write_config(
     config_dir: &Path,
     config: &SyConfigFile,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    // Written beside the file and renamed over it: a failed write never leaves a cut file.
     let path = config_dir.join("sy-config-routes.yaml");
+    let temp = config_dir.join("sy-config-routes.yaml.tmp");
     let data = serde_yaml::to_string(config)?;
-    fs::write(&path, data)?;
+    fs::write(&temp, data)?;
+    fs::rename(&temp, &path)?;
     Ok(())
 }
 
@@ -1125,6 +1198,54 @@ mod tests {
                 mode: "best_effort".to_string(),
                 enabled: true,
             }],
+        }
+    }
+
+    fn route(prefix: &str, action: &str) -> RouteConfig {
+        RouteConfig {
+            prefix: prefix.to_string(),
+            match_kind: Some("PREFIX".to_string()),
+            action: action.to_string(),
+            next_hop_hive: None,
+            metric: None,
+            priority: None,
+        }
+    }
+
+    /// FINDINGS A-74: a config the region refuses changes nothing, in memory, on disk or in the
+    /// region, and says why; the next good one is committed.
+    #[test]
+    fn an_invalid_entry_changes_nothing_and_the_next_good_one_is_committed() {
+        let name = format!("/jsc-cr-{}", &Uuid::new_v4().simple().to_string()[..8]);
+        let mut writer = ConfigRegionWriter::open_or_create(&name, Uuid::new_v4(), "motherbee")
+            .expect("config region");
+        let dir =
+            std::env::temp_dir().join(format!("sy-config-routes-{}", Uuid::new_v4().simple()));
+        fs::create_dir_all(&dir).expect("config dir");
+
+        let mut current = sample_config();
+        let mut bad = current.clone();
+        bad.routes.push(route("x/", "TELEPORT"));
+        let detail = commit_config(&mut writer, &dir, "motherbee", &mut current, bad)
+            .expect_err("an invalid route is refused");
+        assert!(detail.contains("TELEPORT"), "{detail}");
+        assert_eq!(current, sample_config());
+        assert!(!dir.join("sy-config-routes.yaml").exists());
+
+        let mut good = current.clone();
+        good.routes.push(route("x/", "DROP"));
+        commit_config(&mut writer, &dir, "motherbee", &mut current, good.clone())
+            .expect("a valid route is committed");
+        assert_eq!(current, good);
+        let saved: SyConfigFile = serde_yaml::from_str(
+            &fs::read_to_string(dir.join("sy-config-routes.yaml")).expect("saved config"),
+        )
+        .expect("saved yaml");
+        assert_eq!(saved, good);
+
+        let _ = fs::remove_dir_all(&dir);
+        if let Ok(cstr) = std::ffi::CString::new(name) {
+            let _ = nix::sys::mman::shm_unlink(cstr.as_c_str());
         }
     }
 

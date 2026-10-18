@@ -895,6 +895,8 @@ impl AiNode for GenericAiNode {
                 (extract_text(&msg.payload).unwrap_or_default(), None)
             };
         let cognition_block = render_memory_package_prompt_block(msg.meta.memory_package.as_ref());
+        // What the person wrote, without the memory block in front: what the history keeps.
+        let user_text = input.clone();
         let input = inject_memory_package_into_text_input(&input, cognition_block.as_deref());
         if msg.meta.msg_type.eq_ignore_ascii_case("user") {
             tracing::info!(
@@ -939,7 +941,7 @@ impl AiNode for GenericAiNode {
                     None
                 };
                 match self
-                    .run_ai_chat(ai, input, input_parts, &behavior_ctx, &msg.meta)
+                    .run_ai_chat(ai, input, input_parts, &user_text, &behavior_ctx, &msg.meta)
                     .await
                 {
                     Ok(output) => output,
@@ -1024,6 +1026,7 @@ impl GenericAiNode {
         ai: &AiChatRuntime,
         input: String,
         input_parts: Option<Vec<fluxbee_ai_sdk::ModelContentPart>>,
+        user_text: &str,
         ctx: &BehaviorContext,
         meta: &Meta,
     ) -> fluxbee_ai_sdk::Result<AiBehaviorOutput> {
@@ -1096,17 +1099,16 @@ impl GenericAiNode {
                     "tool run produced explicit final_output with user-facing artifacts"
                 );
                 let summary_text = summarize_behavior_output(&output);
-                self.persist_immediate_turn(ai, ctx, &input, &summary_text)
+                self.persist_immediate_turn(ai, ctx, user_text, &summary_text)
                     .await;
                 return Ok(output);
             }
             if let Some(text) = result.final_assistant_text {
-                self.persist_immediate_turn(ai, ctx, &input, &text).await;
+                self.persist_immediate_turn(ai, ctx, user_text, &text).await;
                 return Ok(AiBehaviorOutput::text(text));
             }
         }
 
-        let current_user_input = input.clone();
         let system = self.effective_ai_instructions(ai).await;
         let req = fluxbee_ai_sdk::llm::LlmRequest {
             model: ai.model.clone(),
@@ -1118,7 +1120,7 @@ impl GenericAiNode {
             model_settings: Some(ai.model_settings.clone()),
         };
         let response = fluxbee_ai_sdk::llm::LlmClient::generate(client.as_ref(), req).await?;
-        self.persist_immediate_turn(ai, ctx, &current_user_input, &response.content)
+        self.persist_immediate_turn(ai, ctx, user_text, &response.content)
             .await;
         Ok(AiBehaviorOutput::text(response.content))
     }

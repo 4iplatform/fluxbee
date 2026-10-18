@@ -1054,6 +1054,10 @@ router reviews.
   - `/hives/worker1/vault/...` goes nowhere: SY.vault runs only on the motherbee;
   - the allowlists of SY.admin and Archi name `SY.config-routes`; the node is `SY.config.routes`,
     so that entry never matches.
+- **OPA:** a policy check is not a read. SY.admin bumps the OPA version for it
+  (`next_opa_version`) and SY.opa.rules compiles it into `staged/`, so a check run between the
+  operator's `opa_compile` and `opa_apply` replaces what was staged (found by the 0.1.80 review;
+  Archi's read tool no longer runs checks).
 - **SY.orchestrator:**
   - `remove_hive` revokes neither the spoke's identity key nor its TLS certificate;
   - `syncthing_firewall_rules` still opens 22000/udp and 21027/udp, though Syncthing uses TCP only

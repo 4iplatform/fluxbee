@@ -253,8 +253,10 @@ fn build_initial_items(input: FunctionRunInput) -> Vec<FunctionLoopItem> {
     if let Some(parts) = input.current_user_parts.filter(|parts| !parts.is_empty()) {
         items.push(FunctionLoopItem::UserContentParts { content: parts });
     } else {
+        // The message being answered goes whole: the limit is for the history around it (FINDINGS
+        // A-71: a node that put its memory before the message lost the message itself).
         items.push(FunctionLoopItem::UserText {
-            content: trim_text(&input.current_user_message, DEFAULT_INTERACTION_MAX_CHARS),
+            content: input.current_user_message.trim().to_string(),
         });
     }
     items
@@ -530,6 +532,21 @@ mod tests {
     use tokio::sync::Mutex;
 
     use super::*;
+
+    #[test]
+    fn the_message_being_answered_is_never_cut() {
+        let memory = "Conversation memory: ".to_string() + &"x".repeat(3_000);
+        let message = format!("{memory}\n\nCurrent user message:\nwhat is my balance?");
+        let items = build_initial_items(FunctionRunInput {
+            current_user_message: message.clone(),
+            current_user_parts: None,
+            immediate_memory: None,
+        });
+        match items.last() {
+            Some(FunctionLoopItem::UserText { content }) => assert_eq!(content, &message),
+            other => panic!("expected the user's text last, got {other:?}"),
+        }
+    }
 
     #[derive(Clone, Default)]
     struct SequencedModel {
