@@ -24,7 +24,8 @@ use crate::shm::{
     OpaSnapshot, RemoteHiveEntry, RemoteNodeEntry, RemoteRouteEntry, RemoteTapEntry,
     RemoteVpnEntry, RouterRegionReader, RouterRegionWriter, TapEntry, VpnAssignment, ACTION_DROP,
     ACTION_FORWARD, FLAG_ACTIVE, FLAG_DELETED, FLAG_FROZEN, FLAG_STALE, HEARTBEAT_STALE_MS,
-    HIVE_FLAG_SELF, MATCH_EXACT, MATCH_GLOB, MATCH_PREFIX, OPA_STATUS_ERROR, OPA_STATUS_LOADING, OPA_STATUS_OK,
+    HIVE_FLAG_SELF, MATCH_EXACT, MATCH_GLOB, MATCH_PREFIX, OPA_STATUS_ERROR, OPA_STATUS_LOADING,
+    OPA_STATUS_OK,
 };
 use fluxbee_sdk::protocol::{
     build_announce, build_lsa, build_router_hello, build_ttl_exceeded, build_unreachable,
@@ -6277,11 +6278,9 @@ static REFUSED_APPEND_LAST_LOG_MS: AtomicU64 = AtomicU64::new(0);
 fn take_stream_append(stream: &stream::StreamHandle, msg: &Message, producer: &str, hive_id: &str) {
     let append: Option<fluxbee_sdk::stream::StreamAppend> =
         serde_json::from_value(msg.payload.clone()).ok();
-    let allowed = append
-        .as_ref()
-        .is_some_and(|append| {
-            stream::subject_allowed(&append.subject, producer, hive_id, stream.role())
-        });
+    let allowed = append.as_ref().is_some_and(|append| {
+        stream::subject_allowed(&append.subject, producer, hive_id, stream.role())
+    });
     match (append, allowed) {
         (Some(append), true) => match serde_json::to_vec(&append.payload) {
             Ok(payload) => stream.append_from_node(&append.subject, producer, payload),
@@ -7200,7 +7199,11 @@ mod tests {
         // still authorized for a protected action.
         let legit_orch = canonical_wan_src_name("SY.orchestrator@worker1", "worker1");
         assert_eq!(legit_orch, "SY.orchestrator@worker1");
-        assert!(authorize_system("SPAWN_NODE", Some(&legit_orch), receiving_hive));
+        assert!(authorize_system(
+            "SPAWN_NODE",
+            Some(&legit_orch),
+            receiving_hive
+        ));
     }
 
     #[test]

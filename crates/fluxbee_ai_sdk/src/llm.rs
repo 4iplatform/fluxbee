@@ -1355,8 +1355,7 @@ impl LlmClient for AnthropicMessagesClient {
         {
             Ok(value) => value,
             Err(err)
-                if request.output_schema.is_some()
-                    && anthropic_output_config_unsupported(&err) =>
+                if request.output_schema.is_some() && anthropic_output_config_unsupported(&err) =>
             {
                 let output_schema = request
                     .output_schema
@@ -1634,9 +1633,9 @@ fn build_anthropic_function_messages(
                 .and_then(Value::as_array)
                 .is_some_and(|blocks| {
                     !blocks.is_empty()
-                        && blocks.iter().all(|b| {
-                            b.get("type").and_then(Value::as_str) == Some("tool_result")
-                        })
+                        && blocks
+                            .iter()
+                            .all(|b| b.get("type").and_then(Value::as_str) == Some("tool_result"))
                 });
         if role == Some("assistant") || orphan_tool_result {
             messages.remove(0);
@@ -1795,13 +1794,19 @@ mod tests {
             scrub_secret_like("Incorrect API key provided: sk-abc...xyz please"),
             "Incorrect API key provided: sk-<redacted> please"
         );
-        assert_eq!(scrub_secret_like("token sk-live-REALKEY"), "token sk-<redacted>");
+        assert_eq!(
+            scrub_secret_like("token sk-live-REALKEY"),
+            "token sk-<redacted>"
+        );
         // "sk-" inside ordinary words must be preserved (task-id contains s,k,-).
         assert_eq!(
             scrub_secret_like("Invalid value for task-id parameter"),
             "Invalid value for task-id parameter"
         );
-        assert_eq!(scrub_secret_like("risk-averse disk-full"), "risk-averse disk-full");
+        assert_eq!(
+            scrub_secret_like("risk-averse disk-full"),
+            "risk-averse disk-full"
+        );
         // key=sk-... (preceded by '=') is a token boundary and IS redacted.
         assert_eq!(scrub_secret_like("key=sk-abc def"), "key=sk-<redacted> def");
     }
@@ -1814,9 +1819,7 @@ mod tests {
         )
         .is_err());
         assert!(openai_check_truncation(&json!({"status": "completed"})).is_ok());
-        assert!(
-            anthropic_check_truncation(&json!({"stop_reason": "max_tokens"})).is_err()
-        );
+        assert!(anthropic_check_truncation(&json!({"stop_reason": "max_tokens"})).is_err());
         assert!(anthropic_check_truncation(&json!({"stop_reason": "end_turn"})).is_ok());
         // A caller tells the cut apart from any other protocol error, on both providers.
         for err in [

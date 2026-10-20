@@ -2264,7 +2264,11 @@ mod tests {
             c.send_with_matcher(
                 make_outgoing("user", "FRONTDESK_HANDOFF"),
                 matcher,
-                RpcRequestLabels::new("SY.frontdesk.gov@hive", "FRONTDESK_HANDOFF", "FRONTDESK_REPLY"),
+                RpcRequestLabels::new(
+                    "SY.frontdesk.gov@hive",
+                    "FRONTDESK_HANDOFF",
+                    "FRONTDESK_REPLY",
+                ),
                 Duration::from_millis(50),
             )
             .await

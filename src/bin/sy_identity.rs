@@ -18,8 +18,8 @@ use tracing_subscriber::EnvFilter;
 use uuid::Uuid;
 
 use fluxbee_sdk::protocol::{
-    Destination, Message, Meta, Routing, VaultSecretChangedPayload, VaultSecretInterest,
-    is_system_kind, MSG_VAULT_SECRET_CHANGED, SYSTEM_KIND,
+    is_system_kind, Destination, Message, Meta, Routing, VaultSecretChangedPayload,
+    VaultSecretInterest, MSG_VAULT_SECRET_CHANGED, SYSTEM_KIND,
 };
 use fluxbee_sdk::{
     build_node_config_response_message, managed_node_config_path, try_handle_default_node_status,
@@ -598,13 +598,25 @@ struct IdentitySyncError {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 enum IdentityDelta {
-    TenantUpsert { tenant: TenantRecord },
+    TenantUpsert {
+        tenant: TenantRecord,
+    },
     /// Purge of a tenant (its ilks go as IlkDelete first). Primary-only.
-    TenantDelete { tenant_id: String },
-    IlkUpsert { ilk: IlkRecord },
-    IlkDelete { ilk_id: String },
-    AliasUpsert { alias: AliasSnapshotRecord },
-    AliasDelete { old_ilk_id: String },
+    TenantDelete {
+        tenant_id: String,
+    },
+    IlkUpsert {
+        ilk: IlkRecord,
+    },
+    IlkDelete {
+        ilk_id: String,
+    },
+    AliasUpsert {
+        alias: AliasSnapshotRecord,
+    },
+    AliasDelete {
+        old_ilk_id: String,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1964,8 +1976,7 @@ impl IdentityStore {
         for old_ilk_id in &removed_aliases {
             self.aliases.remove(old_ilk_id);
         }
-        self.ich_lookup
-            .retain(|_, mapped_ilk| mapped_ilk != ilk_id);
+        self.ich_lookup.retain(|_, mapped_ilk| mapped_ilk != ilk_id);
         self.ilks.remove(ilk_id);
         removed_aliases
     }
@@ -2011,7 +2022,10 @@ impl IdentityStore {
         if entry.ilk_type.trim() != "human" && self.tenant_is_deleted(&entry.tenant_id) {
             return Err(lifecycle_error(
                 "TENANT_DELETED",
-                &format!("tenant {} is marked deleted; restore the tenant", entry.tenant_id),
+                &format!(
+                    "tenant {} is marked deleted; restore the tenant",
+                    entry.tenant_id
+                ),
             ));
         }
         self.check_ilk_restorable(&req.ilk_id)?;
@@ -2191,7 +2205,10 @@ impl IdentityStore {
         if !children.is_empty() {
             return Err(lifecycle_error(
                 "TENANT_HAS_CHILDREN",
-                &format!("sponsors tenants (purge them first): {}", children.join(", ")),
+                &format!(
+                    "sponsors tenants (purge them first): {}",
+                    children.join(", ")
+                ),
             ));
         }
         let nodes = self.tenant_node_ilks(&req.tenant_id);
@@ -2228,7 +2245,12 @@ impl IdentityStore {
             .collect();
         ilk_ids.sort_unstable();
         for ilk_id in &ilk_ids {
-            if self.ilks.get(ilk_id).map(is_well_known_system_ilk).unwrap_or(false) {
+            if self
+                .ilks
+                .get(ilk_id)
+                .map(is_well_known_system_ilk)
+                .unwrap_or(false)
+            {
                 return Err("SYSTEM_ILK_PROTECTED".to_string());
             }
         }
@@ -3704,7 +3726,8 @@ impl IdentityRuntime {
                     Err(err) => error_payload("INVALID_REQUEST", &err.to_string()),
                 }
             }
-            MSG_ILK_DELETE => match serde_json::from_value::<IlkDeleteRequest>(msg.payload.clone()) {
+            MSG_ILK_DELETE => match serde_json::from_value::<IlkDeleteRequest>(msg.payload.clone())
+            {
                 Ok(req) => {
                     let now_ms = now_epoch_ms();
                     self.run_lifecycle_op(&mut deltas, "failed to delete ilk", |store| {
@@ -3714,52 +3737,62 @@ impl IdentityRuntime {
                 }
                 Err(err) => error_payload("INVALID_REQUEST", &err.to_string()),
             },
-            MSG_ILK_RESTORE => match serde_json::from_value::<IlkDeleteRequest>(msg.payload.clone()) {
-                Ok(req) => {
-                    self.run_lifecycle_op(&mut deltas, "failed to restore ilk", |store| {
-                        store.restore_ilk(req)
-                    })
-                    .await
+            MSG_ILK_RESTORE => {
+                match serde_json::from_value::<IlkDeleteRequest>(msg.payload.clone()) {
+                    Ok(req) => {
+                        self.run_lifecycle_op(&mut deltas, "failed to restore ilk", |store| {
+                            store.restore_ilk(req)
+                        })
+                        .await
+                    }
+                    Err(err) => error_payload("INVALID_REQUEST", &err.to_string()),
                 }
-                Err(err) => error_payload("INVALID_REQUEST", &err.to_string()),
-            },
-            MSG_ILK_PURGE => match serde_json::from_value::<IlkDeleteRequest>(msg.payload.clone()) {
-                Ok(req) => {
-                    self.run_lifecycle_op(&mut deltas, "failed to purge ilk", |store| {
-                        store.purge_ilk(req)
-                    })
-                    .await
+            }
+            MSG_ILK_PURGE => {
+                match serde_json::from_value::<IlkDeleteRequest>(msg.payload.clone()) {
+                    Ok(req) => {
+                        self.run_lifecycle_op(&mut deltas, "failed to purge ilk", |store| {
+                            store.purge_ilk(req)
+                        })
+                        .await
+                    }
+                    Err(err) => error_payload("INVALID_REQUEST", &err.to_string()),
                 }
-                Err(err) => error_payload("INVALID_REQUEST", &err.to_string()),
-            },
-            MSG_TNT_DELETE => match serde_json::from_value::<TntLifecycleRequest>(msg.payload.clone()) {
-                Ok(req) => {
-                    let now_ms = now_epoch_ms();
-                    self.run_lifecycle_op(&mut deltas, "failed to delete tenant", |store| {
-                        store.delete_tenant(req, now_ms)
-                    })
-                    .await
+            }
+            MSG_TNT_DELETE => {
+                match serde_json::from_value::<TntLifecycleRequest>(msg.payload.clone()) {
+                    Ok(req) => {
+                        let now_ms = now_epoch_ms();
+                        self.run_lifecycle_op(&mut deltas, "failed to delete tenant", |store| {
+                            store.delete_tenant(req, now_ms)
+                        })
+                        .await
+                    }
+                    Err(err) => error_payload("INVALID_REQUEST", &err.to_string()),
                 }
-                Err(err) => error_payload("INVALID_REQUEST", &err.to_string()),
-            },
-            MSG_TNT_RESTORE => match serde_json::from_value::<TntLifecycleRequest>(msg.payload.clone()) {
-                Ok(req) => {
-                    self.run_lifecycle_op(&mut deltas, "failed to restore tenant", |store| {
-                        store.restore_tenant(req)
-                    })
-                    .await
+            }
+            MSG_TNT_RESTORE => {
+                match serde_json::from_value::<TntLifecycleRequest>(msg.payload.clone()) {
+                    Ok(req) => {
+                        self.run_lifecycle_op(&mut deltas, "failed to restore tenant", |store| {
+                            store.restore_tenant(req)
+                        })
+                        .await
+                    }
+                    Err(err) => error_payload("INVALID_REQUEST", &err.to_string()),
                 }
-                Err(err) => error_payload("INVALID_REQUEST", &err.to_string()),
-            },
-            MSG_TNT_PURGE => match serde_json::from_value::<TntLifecycleRequest>(msg.payload.clone()) {
-                Ok(req) => {
-                    self.run_lifecycle_op(&mut deltas, "failed to purge tenant", |store| {
-                        store.purge_tenant(req)
-                    })
-                    .await
+            }
+            MSG_TNT_PURGE => {
+                match serde_json::from_value::<TntLifecycleRequest>(msg.payload.clone()) {
+                    Ok(req) => {
+                        self.run_lifecycle_op(&mut deltas, "failed to purge tenant", |store| {
+                            store.purge_tenant(req)
+                        })
+                        .await
+                    }
+                    Err(err) => error_payload("INVALID_REQUEST", &err.to_string()),
                 }
-                Err(err) => error_payload("INVALID_REQUEST", &err.to_string()),
-            },
+            }
             MSG_TNT_CREATE => match serde_json::from_value::<TntCreateRequest>(msg.payload.clone())
             {
                 Ok(req) => {
@@ -6412,7 +6445,10 @@ async fn read_delta_stream(
                         .into());
                     }
                 }
-                if sink.send(ReplicaSyncEvent::Delta(envelope.clone())).is_err() {
+                if sink
+                    .send(ReplicaSyncEvent::Delta(envelope.clone()))
+                    .is_err()
+                {
                     return Err("delta sink dropped".into());
                 }
                 last_seq = Some(envelope.seq);
@@ -8088,7 +8124,9 @@ async fn persist_lifecycle_in_db(
     let tx = client.transaction().await?;
     for tenant in &changes.tenants {
         let tenant_uuid = parse_prefixed_uuid(&tenant.tenant_id, "tnt")?.to_string();
-        let deleted_at_ms = tenant.deleted_at_ms.and_then(|value| i64::try_from(value).ok());
+        let deleted_at_ms = tenant
+            .deleted_at_ms
+            .and_then(|value| i64::try_from(value).ok());
         tx.execute(
             "UPDATE identity_tenants SET deleted_at = CASE WHEN $2::BIGINT IS NULL THEN NULL \
              ELSE to_timestamp(($2::DOUBLE PRECISION) / 1000.0) END, updated_at = NOW() \
@@ -8099,7 +8137,9 @@ async fn persist_lifecycle_in_db(
     }
     for ilk in &changes.ilks {
         let ilk_uuid = parse_prefixed_uuid(&ilk.ilk_id, "ilk")?.to_string();
-        let deleted_at_ms = ilk.deleted_at_ms.and_then(|value| i64::try_from(value).ok());
+        let deleted_at_ms = ilk
+            .deleted_at_ms
+            .and_then(|value| i64::try_from(value).ok());
         tx.execute(
             "UPDATE identity_ilks SET deleted_at = CASE WHEN $2::BIGINT IS NULL THEN NULL \
              ELSE to_timestamp(($2::DOUBLE PRECISION) / 1000.0) END, deleted_reason = $3, \
@@ -8385,7 +8425,9 @@ SET
                 &tenant.status,
                 &tenant.settings,
                 &sponsor_tenant_uuid,
-                &tenant.deleted_at_ms.and_then(|value| i64::try_from(value).ok()),
+                &tenant
+                    .deleted_at_ms
+                    .and_then(|value| i64::try_from(value).ok()),
             ],
         )
         .await?;
@@ -10166,7 +10208,10 @@ mod tests {
             )
             .expect("delete ok");
         assert_eq!(marked.get("state").and_then(Value::as_str), Some("deleted"));
-        assert_eq!(store.ilks.get(&ilk_id).and_then(|ilk| ilk.deleted_at_ms), Some(1_000));
+        assert_eq!(
+            store.ilks.get(&ilk_id).and_then(|ilk| ilk.deleted_at_ms),
+            Some(1_000)
+        );
         assert!(!store.ich_lookup.values().any(|mapped| mapped == &ilk_id));
         assert!(store.aliases.contains_key(&ilk_id));
 
@@ -10793,7 +10838,6 @@ mod tests {
         assert!(validate_ilk_type(" system ").is_err());
     }
 
-
     // ---- lifecycle: mark (reversible, keys reserved) / restore / purge ----
 
     const LC_TENANT: &str = "tnt:11111111-1111-1111-1111-111111111111";
@@ -10831,7 +10875,10 @@ mod tests {
             )
             .map(|(ok, _)| ok)
             .expect("provision");
-        out.get("ilk_id").and_then(Value::as_str).unwrap().to_string()
+        out.get("ilk_id")
+            .and_then(Value::as_str)
+            .unwrap()
+            .to_string()
     }
 
     fn lc_ilk(id: &str) -> IlkDeleteRequest {
@@ -10843,11 +10890,15 @@ mod tests {
     }
 
     fn lc_tenant(id: &str) -> TntLifecycleRequest {
-        TntLifecycleRequest { tenant_id: id.to_string() }
+        TntLifecycleRequest {
+            tenant_id: id.to_string(),
+        }
     }
 
     fn lc_code(err: String) -> String {
-        err.split_once('|').map(|(code, _)| code.to_string()).unwrap_or(err)
+        err.split_once('|')
+            .map(|(code, _)| code.to_string())
+            .unwrap_or(err)
     }
 
     #[test]
@@ -10884,7 +10935,10 @@ mod tests {
 
         // mark is idempotent
         let (again, changes) = store.delete_ilk(lc_ilk(&ilk), 9).expect("idempotent");
-        assert_eq!(again.get("already_deleted").and_then(Value::as_bool), Some(true));
+        assert_eq!(
+            again.get("already_deleted").and_then(Value::as_bool),
+            Some(true)
+        );
         assert!(changes.ilks.is_empty());
         assert_eq!(store.ilks[&ilk].deleted_at_ms, Some(5));
     }
@@ -10893,7 +10947,9 @@ mod tests {
     fn lifecycle_purge_requires_the_mark_and_restore_brings_the_lookup_back() {
         let mut store = lc_store_with_tenant();
         let ilk = lc_provision(&mut store, "bob@acme.com");
-        let err = store.purge_ilk(lc_ilk(&ilk)).expect_err("active cannot be purged");
+        let err = store
+            .purge_ilk(lc_ilk(&ilk))
+            .expect_err("active cannot be purged");
         assert_eq!(lc_code(err), "ILK_NOT_DELETED");
         assert_eq!(
             lc_code(store.restore_ilk(lc_ilk(&ilk)).expect_err("not marked")),
@@ -10902,7 +10958,10 @@ mod tests {
 
         store.delete_ilk(lc_ilk(&ilk), 5).expect("mark");
         let (restored, changes) = store.restore_ilk(lc_ilk(&ilk)).expect("restore");
-        assert_eq!(restored.get("state").and_then(Value::as_str), Some("active"));
+        assert_eq!(
+            restored.get("state").and_then(Value::as_str),
+            Some("active")
+        );
         assert_eq!(changes.ilks.len(), 1);
         assert_eq!(store.ilks[&ilk].deleted_at_ms, None);
         assert!(store.ich_lookup.values().any(|mapped| mapped == &ilk));
@@ -10947,7 +11006,9 @@ mod tests {
         let kept = lc_provision(&mut store, "kept@acme.com");
         store.delete_ilk(lc_ilk(&gone), 3).expect("direct mark");
 
-        let (out, changes) = store.delete_tenant(lc_tenant(LC_TENANT), 10).expect("tenant mark");
+        let (out, changes) = store
+            .delete_tenant(lc_tenant(LC_TENANT), 10)
+            .expect("tenant mark");
         assert_eq!(out["people_charged"], 1);
         assert!(changes.ilks.is_empty(), "no ILK is marked");
         assert_eq!(changes.tenants.len(), 1);
@@ -10980,7 +11041,11 @@ mod tests {
     fn lifecycle_tenant_guards_root_nodes_and_children() {
         let mut store = lc_store_with_tenant();
         assert_eq!(
-            lc_code(store.delete_tenant(lc_tenant(DEFAULT_ROOT_TENANT_ID), 1).expect_err("root")),
+            lc_code(
+                store
+                    .delete_tenant(lc_tenant(DEFAULT_ROOT_TENANT_ID), 1)
+                    .expect_err("root")
+            ),
             "TENANT_ROOT_PROTECTED"
         );
         let node = "ilk:44444444-4444-4444-4444-444444444444".to_string();
@@ -10998,8 +11063,13 @@ mod tests {
                 deleted_reason: None,
             },
         );
-        let err = store.delete_tenant(lc_tenant(LC_TENANT), 1).expect_err("has nodes");
-        assert!(err.starts_with("TENANT_HAS_NODES|") && err.contains("AI.acme@motherbee"), "{err}");
+        let err = store
+            .delete_tenant(lc_tenant(LC_TENANT), 1)
+            .expect_err("has nodes");
+        assert!(
+            err.starts_with("TENANT_HAS_NODES|") && err.contains("AI.acme@motherbee"),
+            "{err}"
+        );
         assert!(store.tenants[LC_TENANT].deleted_at_ms.is_none());
         store.ilks.remove(&node);
 
@@ -11017,7 +11087,11 @@ mod tests {
             },
         );
         assert_eq!(
-            lc_code(store.delete_tenant(lc_tenant(LC_TENANT), 1).expect_err("children")),
+            lc_code(
+                store
+                    .delete_tenant(lc_tenant(LC_TENANT), 1)
+                    .expect_err("children")
+            ),
             "TENANT_HAS_CHILDREN"
         );
     }
@@ -11029,7 +11103,11 @@ mod tests {
         let gone = lc_provision(&mut store, "gone@acme.com");
         store.delete_ilk(lc_ilk(&gone), 3).expect("direct mark");
         assert_eq!(
-            lc_code(store.purge_tenant(lc_tenant(LC_TENANT)).expect_err("not marked")),
+            lc_code(
+                store
+                    .purge_tenant(lc_tenant(LC_TENANT))
+                    .expect_err("not marked")
+            ),
             "TENANT_NOT_DELETED"
         );
         store.delete_tenant(lc_tenant(LC_TENANT), 10).expect("mark");
@@ -11080,7 +11158,10 @@ mod tests {
             tenant_id: Some("tnt:99999999-9999-9999-9999-999999999999".to_string()),
             ilk_type: None,
         };
-        assert_eq!(store.delete_ilk(foreign, 1).expect_err("other tenant"), "ILK_TENANT_MISMATCH");
+        assert_eq!(
+            store.delete_ilk(foreign, 1).expect_err("other tenant"),
+            "ILK_TENANT_MISMATCH"
+        );
         assert!(store.ilks[&ilk].deleted_at_ms.is_none());
         let own = IlkDeleteRequest {
             ilk_id: ilk.clone(),
@@ -11094,7 +11175,9 @@ mod tests {
     #[test]
     fn lifecycle_tenant_delete_delta_is_primary_only_and_applies_on_replicas() {
         let mut store = lc_store_with_tenant();
-        let delta = IdentityDelta::TenantDelete { tenant_id: LC_TENANT.to_string() };
+        let delta = IdentityDelta::TenantDelete {
+            tenant_id: LC_TENANT.to_string(),
+        };
         assert!(!delta_authorized_for_hive(&delta, "worker1", &store));
         store.apply_delta(delta);
         assert!(!store.tenants.contains_key(LC_TENANT));

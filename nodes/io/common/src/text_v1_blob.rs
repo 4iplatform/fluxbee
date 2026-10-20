@@ -310,7 +310,9 @@ pub async fn resolve_text_v1_for_outbound(
 
     let text = match (parsed.content.clone(), parsed.content_ref.clone()) {
         (Some(content), None) => content,
-        (None, Some(content_ref)) => resolve_content_ref_text(blob, &content_ref, use_retry).await?,
+        (None, Some(content_ref)) => {
+            resolve_content_ref_text(blob, &content_ref, use_retry).await?
+        }
         _ => {
             return Err(IoBlobContractError::InvalidTextPayload(
                 "invalid text/v1 payload (content/content_ref)".to_string(),

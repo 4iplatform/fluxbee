@@ -286,14 +286,23 @@ mod tests {
     #[test]
     fn extracts_text_message_with_binding_and_profile() {
         let msgs = extract_inbound_messages(&sample_envelope());
-        assert_eq!(msgs.len(), 1, "statuses-only change must not produce a message");
+        assert_eq!(
+            msgs.len(),
+            1,
+            "statuses-only change must not produce a message"
+        );
         let m = &msgs[0];
         assert_eq!(m.phone_number_id, "111");
         assert_eq!(m.waba_id, "WABA-1");
         assert_eq!(m.from_wa_id, "5491100000000");
         assert_eq!(m.profile_name.as_deref(), Some("Ada"));
         assert_eq!(m.message_id, "wamid.AAA==");
-        assert_eq!(m.kind, WappMessageKind::Text { body: "hola".into() });
+        assert_eq!(
+            m.kind,
+            WappMessageKind::Text {
+                body: "hola".into()
+            }
+        );
     }
 
     #[test]
@@ -320,7 +329,12 @@ mod tests {
                 mime_type: Some("image/jpeg".into()),
             }
         );
-        assert_eq!(msgs[1].kind, WappMessageKind::Other { message_type: "location".into() });
+        assert_eq!(
+            msgs[1].kind,
+            WappMessageKind::Other {
+                message_type: "location".into()
+            }
+        );
     }
 
     #[test]
@@ -363,14 +377,23 @@ mod tests {
     #[test]
     fn base64_decode_roundtrips_and_rejects_garbage() {
         // Vectors matching the edge's encoder (standard alphabet + '=' padding).
-        assert_eq!(base64_decode("aG9sYQ==").as_deref(), Some(b"hola".as_slice()));
-        assert_eq!(base64_decode("aG9sYXM=").as_deref(), Some(b"holas".as_slice()));
-        assert_eq!(base64_decode("aG9sYXMh").as_deref(), Some(b"holas!".as_slice()));
+        assert_eq!(
+            base64_decode("aG9sYQ==").as_deref(),
+            Some(b"hola".as_slice())
+        );
+        assert_eq!(
+            base64_decode("aG9sYXM=").as_deref(),
+            Some(b"holas".as_slice())
+        );
+        assert_eq!(
+            base64_decode("aG9sYXMh").as_deref(),
+            Some(b"holas!".as_slice())
+        );
         assert_eq!(base64_decode("").as_deref(), Some(b"".as_slice()));
         assert_eq!(base64_decode("abc"), None); // bad length
         assert_eq!(base64_decode("a$c="), None); // bad alphabet
         assert_eq!(base64_decode("aG==aG=="), None); // padding not final
-        // binary roundtrip
+                                                     // binary roundtrip
         let raw: Vec<u8> = (0u8..=255).collect();
         let enc = {
             // reuse the edge's algorithm inline to produce the fixture
@@ -383,8 +406,16 @@ mod tests {
                     | (*chunk.get(2).unwrap_or(&0) as u32);
                 out.push(ALPHABET[((n >> 18) & 63) as usize] as char);
                 out.push(ALPHABET[((n >> 12) & 63) as usize] as char);
-                out.push(if chunk.len() > 1 { ALPHABET[((n >> 6) & 63) as usize] as char } else { '=' });
-                out.push(if chunk.len() > 2 { ALPHABET[(n & 63) as usize] as char } else { '=' });
+                out.push(if chunk.len() > 1 {
+                    ALPHABET[((n >> 6) & 63) as usize] as char
+                } else {
+                    '='
+                });
+                out.push(if chunk.len() > 2 {
+                    ALPHABET[(n & 63) as usize] as char
+                } else {
+                    '='
+                });
             }
             out
         };

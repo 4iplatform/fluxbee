@@ -1316,7 +1316,11 @@ fn mime_is_active(mime: &str) -> bool {
 /// (png, pdf, docx=zip, ...) return `None` and keep their declared type.
 fn sniff_active_content(data: &[u8]) -> Option<&'static str> {
     // Skip a leading UTF-8 BOM and ASCII whitespace, then look only at a bounded window.
-    let start = if data.starts_with(&[0xEF, 0xBB, 0xBF]) { 3 } else { 0 };
+    let start = if data.starts_with(&[0xEF, 0xBB, 0xBF]) {
+        3
+    } else {
+        0
+    };
     let window = &data[start..data.len().min(start + 512)];
     let head: String = window
         .iter()
@@ -1337,7 +1341,10 @@ fn sniff_active_content(data: &[u8]) -> Option<&'static str> {
     ];
     // Start-anchored: only content whose first non-whitespace bytes ARE an active-markup tag is
     // reclassified, so incidental HTML fragments inside legitimate JSON/XML/text are left untouched.
-    if HTML_MARKERS.iter().any(|marker| trimmed.starts_with(marker)) {
+    if HTML_MARKERS
+        .iter()
+        .any(|marker| trimmed.starts_with(marker))
+    {
         return Some("text/html");
     }
     None

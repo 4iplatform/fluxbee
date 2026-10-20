@@ -69,7 +69,11 @@ impl IoAdapterConfigContract for IoLinkedHelperAdapterConfigContract {
         validate_port(listen)?;
 
         if let Some(http) = cfg.get("http").and_then(Value::as_object) {
-            validate_optional_positive_integer(http, "max_request_bytes", "http.max_request_bytes")?;
+            validate_optional_positive_integer(
+                http,
+                "max_request_bytes",
+                "http.max_request_bytes",
+            )?;
         }
 
         if let Some(identity) = cfg.get("identity").and_then(Value::as_object) {
@@ -78,7 +82,10 @@ impl IoAdapterConfigContract for IoLinkedHelperAdapterConfigContract {
         }
 
         if let Some(mode) = cfg.get("mode") {
-            let mode = mode.as_str().map(str::trim).filter(|value| !value.is_empty());
+            let mode = mode
+                .as_str()
+                .map(str::trim)
+                .filter(|value| !value.is_empty());
             if mode.is_none() {
                 return Err(IoAdapterConfigError::InvalidConfig(
                     "mode must be a non-empty string when present".to_string(),
@@ -98,7 +105,11 @@ impl IoAdapterConfigContract for IoLinkedHelperAdapterConfigContract {
                 IoAdapterConfigError::InvalidConfig("config.adapter must be an object".to_string())
             })?;
         require_non_empty_string(adapter, "adapter_id", "adapter.adapter_id")?;
-        validate_optional_non_empty_string(adapter, "local_instance_id", "adapter.local_instance_id")?;
+        validate_optional_non_empty_string(
+            adapter,
+            "local_instance_id",
+            "adapter.local_instance_id",
+        )?;
         validate_optional_non_empty_string(adapter, "label", "adapter.label")?;
         validate_optional_non_empty_string(adapter, "dst_node", "adapter.dst_node")?;
 

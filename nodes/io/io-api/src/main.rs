@@ -214,18 +214,19 @@ async fn main() -> Result<()> {
     let adapter_contract: Arc<dyn IoAdapterConfigContract> = Arc::new(IoApiAdapterConfigContract);
     // Single-config model: boot reads ONLY the node-dir config.json and validates it through the
     // adapter contract via the SDK — no state/io-nodes dynamic file to shadow a respawn (BUG-4).
-    let mut boot_state = bootstrap_io_control_plane_state(&config.node_name, adapter_contract.as_ref())
-        .unwrap_or_else(|err| IoControlPlaneState {
-            current_state: IoNodeLifecycleState::FailedConfig,
-            config_source: IoConfigSource::None,
-            schema_version: 1,
-            config_version: 0,
-            effective_config: None,
-            last_error: Some(IoControlPlaneErrorInfo {
-                code: "config_bootstrap_failed".to_string(),
-                message: err.to_string(),
-            }),
-        });
+    let mut boot_state =
+        bootstrap_io_control_plane_state(&config.node_name, adapter_contract.as_ref())
+            .unwrap_or_else(|err| IoControlPlaneState {
+                current_state: IoNodeLifecycleState::FailedConfig,
+                config_source: IoConfigSource::None,
+                schema_version: 1,
+                config_version: 0,
+                effective_config: None,
+                last_error: Some(IoControlPlaneErrorInfo {
+                    code: "config_bootstrap_failed".to_string(),
+                    message: err.to_string(),
+                }),
+            });
     validate_boot_effective_config(&mut boot_state, adapter_contract.as_ref());
 
     let self_ilk_id = fluxbee_sdk::read_self_ilk_from_env();

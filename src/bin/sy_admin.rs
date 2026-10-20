@@ -886,7 +886,11 @@ fn append_internal_dispatch_log(
                 .envelope
                 .get("status")
                 .and_then(|v| v.as_str())
-                .unwrap_or(if dispatch.http_status < 400 { "ok" } else { "error" })
+                .unwrap_or(if dispatch.http_status < 400 {
+                    "ok"
+                } else {
+                    "error"
+                })
                 .to_string();
             let error_code = dispatch
                 .envelope
@@ -968,11 +972,9 @@ fn read_recent_admin_commands(
                         None => true,
                     }
                 })
-                && query
-                    .since_ms
-                    .is_none_or(|since| {
-                        value.get("ts_ms").and_then(|v| v.as_u64()).unwrap_or(0) >= since
-                    });
+                && query.since_ms.is_none_or(|since| {
+                    value.get("ts_ms").and_then(|v| v.as_u64()).unwrap_or(0) >= since
+                });
             if matches {
                 out.push(value);
             }
@@ -2431,33 +2433,39 @@ async fn execute_admin_executor_step_fallback(
             );
         }
     };
-    let (_http_status, body) =
-        match handle_admin_command_with_origin(ctx, client, &step.action, params, target, "executor")
-            .await
-        {
-            Ok(values) => values,
-            Err(err) => {
-                let failure = failure_from_detail(err.to_string(), "admin_action_failure");
-                return (
-                    AdminExecutorStepEvent {
-                        execution_id: execution_id.to_string(),
-                        step_id: step.id.clone(),
-                        step_index,
-                        step_action: step.action.clone(),
-                        status: "failed".to_string(),
-                        timestamp,
-                        summary: format!("{} -> failed", step.action),
-                        tool_name: Some(step.action.clone()),
-                        tool_args_preview: Some(step.args.clone()),
-                        result_preview: None,
-                        error_code: Some(failure.code.clone()),
-                        error_source: Some(failure.source.clone()),
-                        error_message: Some(failure.detail.clone()),
-                    },
-                    Some(failure),
-                );
-            }
-        };
+    let (_http_status, body) = match handle_admin_command_with_origin(
+        ctx,
+        client,
+        &step.action,
+        params,
+        target,
+        "executor",
+    )
+    .await
+    {
+        Ok(values) => values,
+        Err(err) => {
+            let failure = failure_from_detail(err.to_string(), "admin_action_failure");
+            return (
+                AdminExecutorStepEvent {
+                    execution_id: execution_id.to_string(),
+                    step_id: step.id.clone(),
+                    step_index,
+                    step_action: step.action.clone(),
+                    status: "failed".to_string(),
+                    timestamp,
+                    summary: format!("{} -> failed", step.action),
+                    tool_name: Some(step.action.clone()),
+                    tool_args_preview: Some(step.args.clone()),
+                    result_preview: None,
+                    error_code: Some(failure.code.clone()),
+                    error_source: Some(failure.source.clone()),
+                    error_message: Some(failure.detail.clone()),
+                },
+                Some(failure),
+            );
+        }
+    };
     let internal = match serde_json::from_str::<serde_json::Value>(&body) {
         Ok(envelope) => envelope,
         Err(err) => {
@@ -4792,8 +4800,7 @@ async fn handle_publish_cloud_endpoint(
             .map(ToString::to_string)
     };
 
-    let cloud_node = get_str("cloud_node")
-        .unwrap_or_else(|| format!("IO.cloud@{}", ctx.hive_id));
+    let cloud_node = get_str("cloud_node").unwrap_or_else(|| format!("IO.cloud@{}", ctx.hive_id));
     let Some(edge_node) = get_str("edge_node") else {
         return Ok(internal_invalid_request(
             "publish_cloud_endpoint",
@@ -4805,9 +4812,7 @@ async fn handle_publish_cloud_endpoint(
     let ich = match fluxbee_sdk::identity::list_ich_options_from_hive_config(&ctx.config_dir) {
         Ok(options) => match resolve_ich_owned_by(options, &cloud_node) {
             Ok(value) => value,
-            Err(detail) => {
-                return Ok(internal_invalid_request("publish_cloud_endpoint", &detail))
-            }
+            Err(detail) => return Ok(internal_invalid_request("publish_cloud_endpoint", &detail)),
         },
         Err(err) => {
             return Ok(internal_invalid_request(
@@ -4846,8 +4851,7 @@ async fn handle_publish_cloud_endpoint(
     // edge_node"). io.cloud reads config.io.edge_node LIVE from its control plane, so this takes
     // effect with no restart and no token rotation. Only when the externalize actually succeeded:
     // there is nothing to trust otherwise. This replaces the old poison IO_CLOUD_EDGE_NODE env.
-    let externalized_ok =
-        externalize.envelope.get("status").and_then(|v| v.as_str()) == Some("ok");
+    let externalized_ok = externalize.envelope.get("status").and_then(|v| v.as_str()) == Some("ok");
     if externalized_ok {
         let record = handle_admin_command(
             ctx,
@@ -4964,7 +4968,9 @@ async fn handle_externalize(
         if status != 200 {
             return Ok(internal_invalid_request(
                 "externalize",
-                &format!("failed to store fanout verify-token in vault (owner {edge_node}): {body}"),
+                &format!(
+                    "failed to store fanout verify-token in vault (owner {edge_node}): {body}"
+                ),
             ));
         }
         let row = serde_json::json!({
@@ -5454,7 +5460,8 @@ async fn dispatch_internal_admin_command(
     }
     // FIX-2: server-side re-enforcement of io.cloud's translate content restrictions (do not trust
     // the bypassable relay to have sanitized its own payload).
-    if let Err(detail) = enforce_cloud_relay_content(caller_l2_name, action, &ctx.hive_id, &params) {
+    if let Err(detail) = enforce_cloud_relay_content(caller_l2_name, action, &ctx.hive_id, &params)
+    {
         return Ok(internal_unauthorized(action, &detail));
     }
     let params = stamp_relay_facts(action, params, caller_l2_name, &ctx.hive_id);
@@ -5469,7 +5476,14 @@ async fn dispatch_internal_admin_command(
             let logged_params = admin_command_log_params(&params);
             let started = Instant::now();
             let result = handle_publish_artifact(ctx, client, params, caller_l2_name).await;
-            append_internal_dispatch_log(ctx, action, caller_l2_name, logged_params, started, &result);
+            append_internal_dispatch_log(
+                ctx,
+                action,
+                caller_l2_name,
+                logged_params,
+                started,
+                &result,
+            );
             return result;
         }
         "unpublish_artifact" => {
@@ -5482,7 +5496,14 @@ async fn dispatch_internal_admin_command(
             let logged_params = admin_command_log_params(&params);
             let started = Instant::now();
             let result = handle_unpublish_artifact(ctx, client, params, caller_l2_name).await;
-            append_internal_dispatch_log(ctx, action, caller_l2_name, logged_params, started, &result);
+            append_internal_dispatch_log(
+                ctx,
+                action,
+                caller_l2_name,
+                logged_params,
+                started,
+                &result,
+            );
             return result;
         }
         "executor_validate_plan" => {
@@ -5526,7 +5547,14 @@ async fn dispatch_internal_admin_command(
             let logged_params = admin_command_log_params(&params);
             let started = Instant::now();
             let result = handle_externalize(ctx, client, params, caller_l2_name).await;
-            append_internal_dispatch_log(ctx, action, caller_l2_name, logged_params, started, &result);
+            append_internal_dispatch_log(
+                ctx,
+                action,
+                caller_l2_name,
+                logged_params,
+                started,
+                &result,
+            );
             return result;
         }
         // publish_cloud_endpoint — el bootstrap de la puerta publica de Fluxbee Cloud. Vive al lado
@@ -5537,14 +5565,28 @@ async fn dispatch_internal_admin_command(
             let logged_params = admin_command_log_params(&params);
             let started = Instant::now();
             let result = handle_publish_cloud_endpoint(ctx, client, params).await;
-            append_internal_dispatch_log(ctx, action, caller_l2_name, logged_params, started, &result);
+            append_internal_dispatch_log(
+                ctx,
+                action,
+                caller_l2_name,
+                logged_params,
+                started,
+                &result,
+            );
             return result;
         }
         "unexternalize" => {
             let logged_params = admin_command_log_params(&params);
             let started = Instant::now();
             let result = handle_unexternalize(ctx, client, params, caller_l2_name).await;
-            append_internal_dispatch_log(ctx, action, caller_l2_name, logged_params, started, &result);
+            append_internal_dispatch_log(
+                ctx,
+                action,
+                caller_l2_name,
+                logged_params,
+                started,
+                &result,
+            );
             return result;
         }
         "list_externalized" => {
@@ -6347,7 +6389,11 @@ fn enforce_cloud_relay_content(
         return Ok(());
     }
     let owner_node_ok = |v: Option<&serde_json::Value>| -> Result<(), String> {
-        if let Some(owner_node) = v.and_then(|x| x.as_str()).map(str::trim).filter(|s| !s.is_empty()) {
+        if let Some(owner_node) = v
+            .and_then(|x| x.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
             if !owner_node.starts_with("IO.") {
                 return Err("IO.cloud vault_put owner_node must be an IO.* node".to_string());
             }
@@ -6493,7 +6539,10 @@ fn enforce_cloud_relay_content(
         }
         "run_node" => {
             cloud_claimed_tenant(params.get("tenant_id"), action)?;
-            let node_name = params.get("node_name").and_then(|v| v.as_str()).unwrap_or("");
+            let node_name = params
+                .get("node_name")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
             if !node_name.starts_with("IO.") {
                 return Err(format!(
                     "IO.cloud may provision only IO.* nodes, not '{node_name}'"
@@ -7177,17 +7226,25 @@ async fn handle_http(
         // vault_put). MUST go through dispatch_internal_admin_command directly: handle_admin_command
         // would ship these to SY.config.routes (which does not implement them) and time out silently.
         ("POST", "/channels/externalize") => {
-            let payload: serde_json::Value =
-                if body.is_empty() { serde_json::json!({}) } else { serde_json::from_slice(&body)? };
+            let payload: serde_json::Value = if body.is_empty() {
+                serde_json::json!({})
+            } else {
+                serde_json::from_slice(&body)?
+            };
             let internal =
-                dispatch_internal_admin_command(ctx, client, "externalize", None, payload, None).await?;
+                dispatch_internal_admin_command(ctx, client, "externalize", None, payload, None)
+                    .await?;
             respond_json(stream, internal.http_status, &internal.envelope.to_string()).await?;
         }
         ("POST", "/channels/unexternalize") => {
-            let payload: serde_json::Value =
-                if body.is_empty() { serde_json::json!({}) } else { serde_json::from_slice(&body)? };
+            let payload: serde_json::Value = if body.is_empty() {
+                serde_json::json!({})
+            } else {
+                serde_json::from_slice(&body)?
+            };
             let internal =
-                dispatch_internal_admin_command(ctx, client, "unexternalize", None, payload, None).await?;
+                dispatch_internal_admin_command(ctx, client, "unexternalize", None, payload, None)
+                    .await?;
             respond_json(stream, internal.http_status, &internal.envelope.to_string()).await?;
         }
         // Operator revoke of a public artifact (D2). caller_l2_name = None routes to
@@ -7195,10 +7252,20 @@ async fn handle_http(
         // unpublish ANY tenant's publication (a retired/renamed producer can't be asked to).
         // Body: {"publication_id":"pub:<uuid>"}.
         ("POST", "/artifacts/unpublish") => {
-            let payload: serde_json::Value =
-                if body.is_empty() { serde_json::json!({}) } else { serde_json::from_slice(&body)? };
-            let internal =
-                dispatch_internal_admin_command(ctx, client, "unpublish_artifact", None, payload, None).await?;
+            let payload: serde_json::Value = if body.is_empty() {
+                serde_json::json!({})
+            } else {
+                serde_json::from_slice(&body)?
+            };
+            let internal = dispatch_internal_admin_command(
+                ctx,
+                client,
+                "unpublish_artifact",
+                None,
+                payload,
+                None,
+            )
+            .await?;
             respond_json(stream, internal.http_status, &internal.envelope.to_string()).await?;
         }
         ("GET", "/channels/externalized") => {
@@ -7207,8 +7274,15 @@ async fn handle_http(
                 Some(edge_node) => serde_json::json!({ "edge_node": edge_node }),
                 None => serde_json::json!({}),
             };
-            let internal =
-                dispatch_internal_admin_command(ctx, client, "list_externalized", None, payload, None).await?;
+            let internal = dispatch_internal_admin_command(
+                ctx,
+                client,
+                "list_externalized",
+                None,
+                payload,
+                None,
+            )
+            .await?;
             respond_json(stream, internal.http_status, &internal.envelope.to_string()).await?;
         }
         ("GET", path) if path.starts_with("/admin/actions/") => {
@@ -8269,7 +8343,14 @@ async fn handle_hive_paths(
             let logged_params = admin_command_log_params(&payload);
             let started = Instant::now();
             let result = handle_publish_cloud_endpoint(ctx, client, payload).await;
-            append_internal_dispatch_log(ctx, "publish_cloud_endpoint", None, logged_params, started, &result);
+            append_internal_dispatch_log(
+                ctx,
+                "publish_cloud_endpoint",
+                None,
+                logged_params,
+                started,
+                &result,
+            );
             let result = result?;
             Ok(Some((result.http_status, result.envelope.to_string())))
         }
@@ -14494,7 +14575,12 @@ async fn handle_identity_query(
 fn query_flag(query: &HashMap<String, String>, key: &str) -> bool {
     query
         .get(key)
-        .map(|value| matches!(value.trim().to_ascii_lowercase().as_str(), "true" | "1" | "yes"))
+        .map(|value| {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "true" | "1" | "yes"
+            )
+        })
         .unwrap_or(false)
 }
 
@@ -14577,9 +14663,7 @@ async fn handle_identity_command(
 ) -> Result<(u16, String), AdminError> {
     let target_hive = hive.unwrap_or_else(|| ctx.hive_id.clone());
     if action == "purge_tenant" {
-        if let Some(blocked) =
-            purge_tenant_vault_block(client, &target_hive, &payload).await
-        {
+        if let Some(blocked) = purge_tenant_vault_block(client, &target_hive, &payload).await {
             return Ok(blocked);
         }
     }
@@ -16396,7 +16480,10 @@ mod tests {
 
     #[test]
     fn placeholder_segments_match_and_do_not_over_match() {
-        assert!(admin_route_pattern_matches("/hives/{hive}", "/hives/motherbee"));
+        assert!(admin_route_pattern_matches(
+            "/hives/{hive}",
+            "/hives/motherbee"
+        ));
         assert!(!admin_route_pattern_matches("/hives/{hive}", "/hives"));
         assert!(!admin_route_pattern_matches(
             "/hives/{hive}",
@@ -17163,10 +17250,20 @@ mod tests {
         // Legit: clean metadata + IO.* owner_node + the claimed tenant is fine.
         assert!(check("vault_put", serde_json::json!({"key":"slack:auth:bot","metadata":{"resource_type":"openai","tenant_id":t,"owner_node":"IO.api.x@motherbee"}})).is_ok());
         // Not enforced for the operator path or other callers.
-        assert!(enforce_cloud_relay_content(None, "run_node", "motherbee",
-            &serde_json::json!({"node_name":"AI.worker@motherbee"})).is_ok());
-        assert!(enforce_cloud_relay_content(Some("SY.orchestrator@motherbee"), "vault_put", "motherbee",
-            &serde_json::json!({"metadata":{"ilk":"x"}})).is_ok());
+        assert!(enforce_cloud_relay_content(
+            None,
+            "run_node",
+            "motherbee",
+            &serde_json::json!({"node_name":"AI.worker@motherbee"})
+        )
+        .is_ok());
+        assert!(enforce_cloud_relay_content(
+            Some("SY.orchestrator@motherbee"),
+            "vault_put",
+            "motherbee",
+            &serde_json::json!({"metadata":{"ilk":"x"}})
+        )
+        .is_ok());
     }
 
     #[test]
@@ -19156,7 +19253,12 @@ mod tests {
         std::env::temp_dir().join(format!("sy-admin-cmdlog-{tag}-{nanos}"))
     }
 
-    fn command_log_entry(action: &str, hive: Option<&str>, status: &str, ts_ms: u64) -> AdminCommandLogEntry {
+    fn command_log_entry(
+        action: &str,
+        hive: Option<&str>,
+        status: &str,
+        ts_ms: u64,
+    ) -> AdminCommandLogEntry {
         AdminCommandLogEntry {
             ts_ms,
             ts: format!("t{ts_ms}"),
@@ -19175,11 +19277,17 @@ mod tests {
     fn command_log_appends_and_reads_newest_first() {
         let dir = command_log_test_state_dir("basic");
         for i in 0..5u64 {
-            append_admin_command_log_locked(&dir, &command_log_entry("run_node", Some("motherbee"), "ok", i));
+            append_admin_command_log_locked(
+                &dir,
+                &command_log_entry("run_node", Some("motherbee"), "ok", i),
+            );
         }
         let out = read_recent_admin_commands(
             &dir,
-            &AdminCommandLogQuery { limit: 3, ..Default::default() },
+            &AdminCommandLogQuery {
+                limit: 3,
+                ..Default::default()
+            },
         );
         assert_eq!(out.len(), 3);
         // newest first
@@ -19196,13 +19304,18 @@ mod tests {
             append_admin_command_log_locked(&dir, &command_log_entry("update", None, "ok", i));
         }
         // the active file rotated once: commands.jsonl.1 exists and the active file is small
-        assert!(admin_command_log_dir(&dir).join("commands.jsonl.1").exists());
+        assert!(admin_command_log_dir(&dir)
+            .join("commands.jsonl.1")
+            .exists());
         let active = fs::read_to_string(admin_command_log_path(&dir)).expect("active log");
         assert_eq!(active.lines().count(), 10);
         // reading spans the rotation: ask for more than the active file holds
         let out = read_recent_admin_commands(
             &dir,
-            &AdminCommandLogQuery { limit: 20, ..Default::default() },
+            &AdminCommandLogQuery {
+                limit: 20,
+                ..Default::default()
+            },
         );
         assert_eq!(out.len(), 20);
         assert_eq!(out[0]["ts_ms"], json!(total - 1));
@@ -19213,28 +19326,53 @@ mod tests {
     #[test]
     fn command_log_query_filters_by_action_status_hive_and_since() {
         let dir = command_log_test_state_dir("filters");
-        append_admin_command_log_locked(&dir, &command_log_entry("run_node", Some("motherbee"), "ok", 10));
-        append_admin_command_log_locked(&dir, &command_log_entry("run_node", Some("worker-220"), "error", 20));
-        append_admin_command_log_locked(&dir, &command_log_entry("vault_put", Some("motherbee"), "ok", 30));
+        append_admin_command_log_locked(
+            &dir,
+            &command_log_entry("run_node", Some("motherbee"), "ok", 10),
+        );
+        append_admin_command_log_locked(
+            &dir,
+            &command_log_entry("run_node", Some("worker-220"), "error", 20),
+        );
+        append_admin_command_log_locked(
+            &dir,
+            &command_log_entry("vault_put", Some("motherbee"), "ok", 30),
+        );
         let by_action = read_recent_admin_commands(
             &dir,
-            &AdminCommandLogQuery { limit: 10, action: Some("run_node".into()), ..Default::default() },
+            &AdminCommandLogQuery {
+                limit: 10,
+                action: Some("run_node".into()),
+                ..Default::default()
+            },
         );
         assert_eq!(by_action.len(), 2);
         let by_status = read_recent_admin_commands(
             &dir,
-            &AdminCommandLogQuery { limit: 10, status: Some("error".into()), ..Default::default() },
+            &AdminCommandLogQuery {
+                limit: 10,
+                status: Some("error".into()),
+                ..Default::default()
+            },
         );
         assert_eq!(by_status.len(), 1);
         assert_eq!(by_status[0]["action"], json!("run_node"));
         let by_hive = read_recent_admin_commands(
             &dir,
-            &AdminCommandLogQuery { limit: 10, hive: Some("motherbee".into()), ..Default::default() },
+            &AdminCommandLogQuery {
+                limit: 10,
+                hive: Some("motherbee".into()),
+                ..Default::default()
+            },
         );
         assert_eq!(by_hive.len(), 2);
         let by_since = read_recent_admin_commands(
             &dir,
-            &AdminCommandLogQuery { limit: 10, since_ms: Some(21), ..Default::default() },
+            &AdminCommandLogQuery {
+                limit: 10,
+                since_ms: Some(21),
+                ..Default::default()
+            },
         );
         assert_eq!(by_since.len(), 1);
         assert_eq!(by_since[0]["action"], json!("vault_put"));
@@ -19254,7 +19392,8 @@ mod tests {
         assert_eq!(redacted["value"], json!(NODE_SECRET_REDACTION_TOKEN));
         assert_eq!(redacted["key"], json!("infra:slack-tokens"));
         // a huge CONFIG_SET payload gets truncated to a preview, never stored whole
-        let huge = json!({ "config": { "blob": "x".repeat(3 * ADMIN_COMMAND_LOG_PARAMS_MAX_BYTES) } });
+        let huge =
+            json!({ "config": { "blob": "x".repeat(3 * ADMIN_COMMAND_LOG_PARAMS_MAX_BYTES) } });
         let capped = admin_command_log_params(&huge);
         assert_eq!(capped["_truncated"], json!(true));
         let preview = capped["preview"].as_str().expect("preview string");
@@ -19285,15 +19424,25 @@ mod tests {
     #[test]
     fn command_log_hive_filter_keeps_hive_less_commands_visible() {
         let dir = command_log_test_state_dir("hiveless");
-        append_admin_command_log_locked(&dir, &command_log_entry("run_node", Some("motherbee"), "ok", 10));
+        append_admin_command_log_locked(
+            &dir,
+            &command_log_entry("run_node", Some("motherbee"), "ok", 10),
+        );
         append_admin_command_log_locked(&dir, &command_log_entry("add_hive", None, "ok", 20));
         // querying a specific hive must STILL surface hive-less (global) commands like add_hive
         let out = read_recent_admin_commands(
             &dir,
-            &AdminCommandLogQuery { limit: 10, hive: Some("motherbee".into()), ..Default::default() },
+            &AdminCommandLogQuery {
+                limit: 10,
+                hive: Some("motherbee".into()),
+                ..Default::default()
+            },
         );
         let actions: Vec<&str> = out.iter().filter_map(|c| c["action"].as_str()).collect();
-        assert!(actions.contains(&"add_hive"), "hive-less add_hive must be visible: {actions:?}");
+        assert!(
+            actions.contains(&"add_hive"),
+            "hive-less add_hive must be visible: {actions:?}"
+        );
         assert!(actions.contains(&"run_node"));
         let _ = fs::remove_dir_all(&dir);
     }

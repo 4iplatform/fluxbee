@@ -60,7 +60,9 @@ impl IoAdapterConfigContract for IoSlackAdapterConfigContract {
 
         {
             let slack = cfg.get("slack").and_then(Value::as_object).ok_or_else(|| {
-                IoAdapterConfigError::Internal("slack object missing after normalization".to_string())
+                IoAdapterConfigError::Internal(
+                    "slack object missing after normalization".to_string(),
+                )
             })?;
             let auth = slack
                 .get("auth")
@@ -255,9 +257,13 @@ mod tests {
         let contract = IoSlackAdapterConfigContract;
         // missing auth
         let err = contract
-            .validate_and_materialize(&json!({"slack":{}, "io":{"workspace_id":"T1","conversation_id":"C1"}}))
+            .validate_and_materialize(
+                &json!({"slack":{}, "io":{"workspace_id":"T1","conversation_id":"C1"}}),
+            )
             .expect_err("must fail missing auth");
-        assert!(matches!(err, IoAdapterConfigError::InvalidConfig(m) if m.contains("slack.auth is required")));
+        assert!(
+            matches!(err, IoAdapterConfigError::InvalidConfig(m) if m.contains("slack.auth is required"))
+        );
 
         // wrong auth type
         let err = contract
@@ -268,7 +274,9 @@ mod tests {
             .expect_err("must reject non vault_ref");
         assert_eq!(
             err,
-            IoAdapterConfigError::InvalidConfig("slack.auth.type must be \"vault_ref\"".to_string())
+            IoAdapterConfigError::InvalidConfig(
+                "slack.auth.type must be \"vault_ref\"".to_string()
+            )
         );
 
         // valid, and NO dst_node is injected

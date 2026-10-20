@@ -146,7 +146,10 @@ pub enum StoredResponseItem {
 impl LinkedHelperDurableState {
     pub fn sync_adapters(&mut self, snapshots: &[AdapterSnapshot]) {
         let now_ms = now_epoch_ms();
-        let active_ids: HashSet<&str> = snapshots.iter().map(|snapshot| snapshot.adapter_id.as_str()).collect();
+        let active_ids: HashSet<&str> = snapshots
+            .iter()
+            .map(|snapshot| snapshot.adapter_id.as_str())
+            .collect();
 
         for snapshot in snapshots {
             let record = self

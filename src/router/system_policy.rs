@@ -190,7 +190,10 @@ pub fn ensure_system_policy_loaded() -> Result<(), String> {
 /// only (protected SYSTEM actions), and the policy is a tiny fixed program.
 pub fn authorize_system(action: &str, src_l2_name: Option<&str>, hive_id: &str) -> bool {
     let Ok(mut resolver) = system_policy_opa().lock() else {
-        tracing::error!(action, "system authority policy mutex poisoned; failing closed (deny)");
+        tracing::error!(
+            action,
+            "system authority policy mutex poisoned; failing closed (deny)"
+        );
         return false;
     };
     let input = serde_json::json!({
@@ -377,9 +380,17 @@ mod tests {
         let hive = "motherbee";
         let act = "SPAWN_NODE"; // a mutation, strict scope
                                 // SY.orchestrator: any hive (cross-hive forwards).
-        assert!(authorize_system(act, Some("SY.orchestrator@motherbee"), hive));
+        assert!(authorize_system(
+            act,
+            Some("SY.orchestrator@motherbee"),
+            hive
+        ));
         assert!(authorize_system(act, Some("SY.orchestrator@worker1"), hive));
-        assert!(authorize_system(act, Some("  SY.orchestrator@worker1  "), hive));
+        assert!(authorize_system(
+            act,
+            Some("  SY.orchestrator@worker1  "),
+            hive
+        ));
         // Exact role label (rejects relay/sub-name spoof) + non-empty hive.
         assert!(!authorize_system(
             act,
@@ -465,13 +476,21 @@ mod tests {
             "SYSTEM_UPDATE",
             "SYSTEM_SYNC_HINT",
         ] {
-            assert!(authorize_system(action, Some("SY.admin@motherbee"), "worker-220"));
+            assert!(authorize_system(
+                action,
+                Some("SY.admin@motherbee"),
+                "worker-220"
+            ));
             assert!(!authorize_system(
                 action,
                 Some("SY.admin@worker-220"),
                 "worker-220"
             ));
-            assert!(!authorize_system(action, Some("SY.admin@other"), "worker-220"));
+            assert!(!authorize_system(
+                action,
+                Some("SY.admin@other"),
+                "worker-220"
+            ));
         }
         assert!(!authorize_system(
             "SPAWN_NODE",
@@ -673,14 +692,26 @@ mod tests {
             "EDGE_PUBLISH_BLOB",
             "EDGE_UNPUBLISH_BLOB",
         ] {
-            assert!(authorize_system(action, Some("SY.admin@motherbee"), ingress_hive));
-            assert!(!authorize_system(action, Some("SY.admin@edge-1"), ingress_hive));
+            assert!(authorize_system(
+                action,
+                Some("SY.admin@motherbee"),
+                ingress_hive
+            ));
+            assert!(!authorize_system(
+                action,
+                Some("SY.admin@edge-1"),
+                ingress_hive
+            ));
             assert!(!authorize_system(
                 action,
                 Some("SY.orchestrator@motherbee"),
                 ingress_hive
             ));
-            assert!(!authorize_system(action, Some("IO.cloud@motherbee"), ingress_hive));
+            assert!(!authorize_system(
+                action,
+                Some("IO.cloud@motherbee"),
+                ingress_hive
+            ));
             assert!(!authorize_system(action, None, ingress_hive));
         }
     }

@@ -8082,10 +8082,7 @@ async fn handle_messages_list(state: &ArchitectState, query: &str) -> Response {
     };
 
     let filters = messages_db::MessagesFilters { since };
-    match client
-        .list_messages(cursor.as_ref(), &filters, limit)
-        .await
-    {
+    match client.list_messages(cursor.as_ref(), &filters, limit).await {
         Ok((items, next_cursor, tail_cursor)) => Json(json!({
             "items": items,
             "next_cursor": next_cursor.map(|c| json!({ "ts": c.at_iso, "dk": c.dedupe_key })),

@@ -47,10 +47,12 @@ impl ManagedNodeConfigContract for IoContractBridge<'_> {
         self.0.notes()
     }
     fn validate_and_materialize(&self, candidate: &Value) -> Result<Value, ContractError> {
-        self.0.validate_and_materialize(candidate).map_err(|e| match e {
-            IoAdapterConfigError::InvalidConfig(m) => ContractError::InvalidConfig(m),
-            IoAdapterConfigError::Internal(m) => ContractError::Internal(m),
-        })
+        self.0
+            .validate_and_materialize(candidate)
+            .map_err(|e| match e {
+                IoAdapterConfigError::InvalidConfig(m) => ContractError::InvalidConfig(m),
+                IoAdapterConfigError::Internal(m) => ContractError::Internal(m),
+            })
     }
     fn redact_effective_config(&self, effective: &Value) -> Value {
         self.0.redact_effective_config(effective)
@@ -127,7 +129,9 @@ mod tests {
             if c.get("io").and_then(|v| v.get("dst_node")).is_some() {
                 Ok(c.clone())
             } else {
-                Err(IoAdapterConfigError::InvalidConfig("missing io.dst_node".into()))
+                Err(IoAdapterConfigError::InvalidConfig(
+                    "missing io.dst_node".into(),
+                ))
             }
         }
     }
@@ -153,8 +157,9 @@ mod tests {
             "IO.fake@motherbee",
             &json!({"_system":{"config_version":3},"io":{"dst_node":"AI.x@motherbee"}}),
         );
-        let st = bootstrap_io_control_plane_state_with_root("IO.fake@motherbee", &FakeAdapter, &root)
-            .expect("boot");
+        let st =
+            bootstrap_io_control_plane_state_with_root("IO.fake@motherbee", &FakeAdapter, &root)
+                .expect("boot");
         assert_eq!(st.current_state, IoNodeLifecycleState::Configured);
         assert_eq!(st.config_version, 3);
         assert!(st.effective_config.is_some());
@@ -163,8 +168,9 @@ mod tests {
     #[test]
     fn boot_absent_config_is_unconfigured() {
         let root = temp_root("absent");
-        let st = bootstrap_io_control_plane_state_with_root("IO.fake@motherbee", &FakeAdapter, &root)
-            .expect("boot");
+        let st =
+            bootstrap_io_control_plane_state_with_root("IO.fake@motherbee", &FakeAdapter, &root)
+                .expect("boot");
         assert_eq!(st.current_state, IoNodeLifecycleState::Unconfigured);
     }
 
@@ -176,8 +182,9 @@ mod tests {
             "IO.fake@motherbee",
             &json!({"_system":{"config_version":4},"io":{"wrong":"x"}}),
         );
-        let st = bootstrap_io_control_plane_state_with_root("IO.fake@motherbee", &FakeAdapter, &root)
-            .expect("boot");
+        let st =
+            bootstrap_io_control_plane_state_with_root("IO.fake@motherbee", &FakeAdapter, &root)
+                .expect("boot");
         assert_eq!(st.current_state, IoNodeLifecycleState::FailedConfig);
         assert_eq!(st.config_version, 4);
         assert!(st.effective_config.is_none());

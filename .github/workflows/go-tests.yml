@@ -1,6 +1,6 @@
 name: go-tests
 
-# Vet and test every Go module (race detector on) on each push or pull request that touches Go
+# Check the format of, vet and test every Go module (race detector on) on each push or pull request that touches Go
 # code. The suites run as a normal user: they keep their state in temp dirs, and the one test that
 # needs root to chown skips itself.
 
@@ -43,6 +43,11 @@ jobs:
         with:
           go-version-file: go/${{ matrix.module }}/go.mod
           cache-dependency-path: go/${{ matrix.module }}/go.sum
+
+      - name: Format
+        run: |
+          unformatted="$(gofmt -l .)"
+          if [ -n "$unformatted" ]; then echo "gofmt needed:"; echo "$unformatted"; exit 1; fi
 
       - name: Vet
         run: go vet ./...

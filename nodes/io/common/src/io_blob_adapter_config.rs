@@ -157,7 +157,9 @@ mod tests {
     #[test]
     fn acepta_max_bytes_y_admin_hive_y_los_expone() {
         let out = IoBlobAdapterConfigContract
-            .validate_and_materialize(&json!({"io": {"max_bytes": 1048576, "admin_hive": " motherbee "}}))
+            .validate_and_materialize(
+                &json!({"io": {"max_bytes": 1048576, "admin_hive": " motherbee "}}),
+            )
             .expect("config valida");
         assert_eq!(configured_max_bytes(Some(&out)), Some(1_048_576));
         assert_eq!(

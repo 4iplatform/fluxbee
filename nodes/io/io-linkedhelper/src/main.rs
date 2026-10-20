@@ -23,6 +23,9 @@ use io_common::identity::{IdentityError, ResolveOrCreateInput};
 use io_common::io_adapter_config::{
     apply_adapter_config_replace, build_io_adapter_contract_payload, IoAdapterConfigContract,
 };
+use io_common::io_context::{
+    wrap_in_meta_context, ConversationRef, IoContext, MessageRef, PartyRef, ReplyTarget,
+};
 use io_common::io_control_plane::{
     build_io_config_get_response_payload, build_io_config_response_message,
     build_io_config_set_error_payload, build_io_config_set_ok_payload,
@@ -37,9 +40,6 @@ use io_common::io_control_plane_logging::{
 use io_common::io_control_plane_metrics::IoControlPlaneMetrics;
 use io_common::io_control_plane_store::persist_io_control_plane_state;
 use io_common::io_linkedhelper_adapter_config::IoLinkedHelperAdapterConfigContract;
-use io_common::io_context::{
-    wrap_in_meta_context, ConversationRef, IoContext, MessageRef, PartyRef, ReplyTarget,
-};
 use io_common::provision::{
     ensure_own_ich, strict_provision_ilk, EnsureOwnIchResult, IdentityProvisionConfig,
 };
@@ -88,8 +88,7 @@ impl Config {
                 env("CONFIG_DIR").unwrap_or_else(|| "/etc/fluxbee".to_string()),
             ),
             state_dir: PathBuf::from(
-                env("STATE_DIR")
-                    .unwrap_or_else(|| "/var/lib/fluxbee/state/io-nodes".to_string()),
+                env("STATE_DIR").unwrap_or_else(|| "/var/lib/fluxbee/state/io-nodes".to_string()),
             ),
         }
     }
@@ -267,15 +266,18 @@ impl PollControl {
         let (directive, retry_after_seconds) = match error_code {
             // The adapter secret no longer matches what the node resolved from
             // Vault (rotated/revoked) → recover credentials from Cloud.
-            "invalid_adapter_secret" => (poll_directive::REENROLL, Some(POLL_ADMIN_BACKOFF_SECONDS)),
+            "invalid_adapter_secret" => {
+                (poll_directive::REENROLL, Some(POLL_ADMIN_BACKOFF_SECONDS))
+            }
             // The adapter is targeting a node that isn't bound to it, or its
             // managed/local-instance mapping is stale → re-ask Cloud where this
             // instance must report.
             "adapter_not_allowed"
             | "managed_instance_id_mismatch"
-            | "local_instance_id_mismatch" => {
-                (poll_directive::REPROVISION, Some(POLL_ADMIN_BACKOFF_SECONDS))
-            }
+            | "local_instance_id_mismatch" => (
+                poll_directive::REPROVISION,
+                Some(POLL_ADMIN_BACKOFF_SECONDS),
+            ),
             // Transient node-side conditions → retry the runtime poll later.
             "node_not_ready"
             | "node_binding_unavailable"
@@ -534,14 +536,14 @@ async fn main() -> Result<()> {
     let mut boot_state =
         bootstrap_io_control_plane_state(&config.node_name, adapter_contract.as_ref())
             .unwrap_or_else(|err| {
-            tracing::warn!(
-                error = %err,
-                state_dir = %config.state_dir.display(),
-                node_name = %config.node_name,
-                "failed to bootstrap IO control-plane state; using UNCONFIGURED"
-            );
-            IoControlPlaneState::default()
-        });
+                tracing::warn!(
+                    error = %err,
+                    state_dir = %config.state_dir.display(),
+                    node_name = %config.node_name,
+                    "failed to bootstrap IO control-plane state; using UNCONFIGURED"
+                );
+                IoControlPlaneState::default()
+            });
 
     let boot_registry = load_runtime_registry(boot_state.effective_config.as_ref())
         .unwrap_or_else(|err| {
@@ -812,8 +814,7 @@ async fn run_router_control_loop(
 
 const RPC_CH_SYSTEM: &str = "system";
 
-fn build_io_linkedhelper_rpc_profile(
-) -> Result<OperationalRouteProfile, fluxbee_sdk::RpcError> {
+fn build_io_linkedhelper_rpc_profile() -> Result<OperationalRouteProfile, fluxbee_sdk::RpcError> {
     OperationalRouteProfile::builder()
         .command_channel(RPC_CH_SYSTEM)
         .post_pending_rule(
@@ -859,7 +860,10 @@ async fn handle_io_control_plane_message(
         let metrics = control_metrics.snapshot();
         let (adapter_count, own_ich_id) = {
             let registry = runtime_registry.read().await;
-            (usize::from(registry.binding.is_some()), registry.own_ich_id.clone())
+            (
+                usize::from(registry.binding.is_some()),
+                registry.own_ich_id.clone(),
+            )
         };
         let payload = serde_json::json!({
             "ok": true,
@@ -875,7 +879,12 @@ async fn handle_io_control_plane_message(
                 "own_ich_id": own_ich_id
             }
         });
-        return Some(build_system_reply(msg, control_src, "STATUS_RESPONSE", payload));
+        return Some(build_system_reply(
+            msg,
+            control_src,
+            "STATUS_RESPONSE",
+            payload,
+        ));
     }
 
     if !command.eq_ignore_ascii_case("CONFIG_GET") && !command.eq_ignore_ascii_case("CONFIG_SET") {
@@ -890,12 +899,18 @@ async fn handle_io_control_plane_message(
             let mut payload = build_io_config_get_response_payload(
                 node_name,
                 &redacted,
-                build_io_adapter_contract_payload(adapter_contract, state.effective_config.as_ref()),
+                build_io_adapter_contract_payload(
+                    adapter_contract,
+                    state.effective_config.as_ref(),
+                ),
             );
             if let Some(obj) = payload.as_object_mut() {
                 let (adapter_count, own_ich_id) = {
                     let registry = runtime_registry.read().await;
-                    (usize::from(registry.binding.is_some()), registry.own_ich_id.clone())
+                    (
+                        usize::from(registry.binding.is_some()),
+                        registry.own_ich_id.clone(),
+                    )
                 };
                 obj.insert(
                     "metrics".to_string(),
@@ -1394,7 +1409,11 @@ async fn resolve_runtime_registry_auth(
 }
 
 fn extract_adapter_secret_from_vault_value(value: &Value) -> Result<String> {
-    if let Some(secret) = value.as_str().map(str::trim).filter(|value| !value.is_empty()) {
+    if let Some(secret) = value
+        .as_str()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
         return Ok(secret.to_string());
     }
     let obj = value
@@ -1601,7 +1620,9 @@ async fn post_poll(
     // node and block normal event flow.
     let operational_state = OPERATIONAL_ENABLED;
 
-    let request_size = serde_json::to_vec(&request).map(|bytes| bytes.len()).unwrap_or(0);
+    let request_size = serde_json::to_vec(&request)
+        .map(|bytes| bytes.len())
+        .unwrap_or(0);
     if request_size > registry.max_request_bytes {
         return poll_reject(
             StatusCode::PAYLOAD_TOO_LARGE,
@@ -1653,7 +1674,13 @@ async fn post_poll(
         .as_deref()
         .map(str::trim)
         .filter(|value| !value.is_empty())
-        .unwrap_or_else(|| if request.items.is_empty() { "heartbeat" } else { "events" });
+        .unwrap_or_else(|| {
+            if request.items.is_empty() {
+                "heartbeat"
+            } else {
+                "events"
+            }
+        });
     // Serialize the read-clone-mutate-writeback of durable state so concurrent
     // polls can't clobber each other's changes (processed_events, deliveries,
     // profile/automation state). Held until the handler returns.
@@ -1902,7 +1929,8 @@ fn refresh_pending_profiles_for_adapter(
             &existing.tenant_id,
         ) {
             Ok(Some(resolved))
-                if normalize_registration_status(&resolved.ilk.registration_status).eq("complete") =>
+                if normalize_registration_status(&resolved.ilk.registration_status)
+                    .eq("complete") =>
             {
                 let was_complete = profile_is_usable(&existing.status);
                 durable_state.upsert_profile(
@@ -2495,23 +2523,24 @@ async fn process_conversation_message(
         }
     };
 
-    let thread_id = match linkedhelper_thread_id(&runtime.managed_instance_id, conversation_external_id) {
-        Ok(thread_id) => thread_id,
-        Err(err) => {
-            responses.push(ResponseItem::Result {
-                response_id: format!("resp:{request_id}:{event_id}:thread_error"),
-                adapter_id: runtime.adapter_id.clone(),
-                event_id: item.id.clone(),
-                status: "error".to_string(),
-                result_type: "validation_error".to_string(),
-                payload: None,
-                error_code: Some("invalid_conversation_external_id".to_string()),
-                error_message: Some(err),
-                retryable: Some(false),
-            });
-            return;
-        }
-    };
+    let thread_id =
+        match linkedhelper_thread_id(&runtime.managed_instance_id, conversation_external_id) {
+            Ok(thread_id) => thread_id,
+            Err(err) => {
+                responses.push(ResponseItem::Result {
+                    response_id: format!("resp:{request_id}:{event_id}:thread_error"),
+                    adapter_id: runtime.adapter_id.clone(),
+                    event_id: item.id.clone(),
+                    status: "error".to_string(),
+                    result_type: "validation_error".to_string(),
+                    payload: None,
+                    error_code: Some("invalid_conversation_external_id".to_string()),
+                    error_message: Some(err),
+                    retryable: Some(false),
+                });
+                return;
+            }
+        };
 
     let trace_id = new_trace_id();
     let profile_ilk_owned = profile_ilk.to_string();
@@ -2887,7 +2916,9 @@ mod tests {
         );
         // The reason always echoes the stable error code.
         assert_eq!(
-            PollControl::for_reject("invalid_mode", OPERATIONAL_ENABLED).reason.as_deref(),
+            PollControl::for_reject("invalid_mode", OPERATIONAL_ENABLED)
+                .reason
+                .as_deref(),
             Some("invalid_mode")
         );
     }

@@ -36,12 +36,12 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
+use fluxbee_sdk::cloud::{cloud_action_catalog, is_cloud_local_op};
 use fluxbee_sdk::protocol::{
     Destination, Message, Meta, Routing, MSG_TTL_EXCEEDED, MSG_UNREACHABLE, SYSTEM_KIND,
 };
-use fluxbee_sdk::cloud::{cloud_action_catalog, is_cloud_local_op};
-use fluxbee_sdk::vault::is_cloud_reserved_vault_key;
 use fluxbee_sdk::rpc::AdminCommandRequest;
+use fluxbee_sdk::vault::is_cloud_reserved_vault_key;
 use fluxbee_sdk::{
     managed_node_config_path, try_handle_default_node_status, NodeConfig, NodeSender, NodeUuidMode,
     OperationalRouteProfile, PendingMatcher, RouteMatch, RouteTarget, RouterDispatcher,
@@ -52,17 +52,16 @@ use io_common::frontdesk_gate::{
     frontdesk_response_contract, DEFAULT_FRONTDESK_TARGET, FRONTDESK_OPERATION_REGISTER,
 };
 use io_common::identity::ResolveOrCreateInput;
-use io_common::io_context::{parse_structured_response_payload, set_response_envelope};
-use io_common::router_message::{build_user_message, new_trace_id, DEFAULT_TTL};
 use io_common::io_adapter_config::{
     apply_adapter_config_replace, build_io_adapter_contract_payload, IoAdapterConfigContract,
 };
 use io_common::io_cloud_adapter_config::{trusted_edge_node, IoCloudAdapterConfigContract};
+use io_common::io_context::{parse_structured_response_payload, set_response_envelope};
 use io_common::io_control_plane::{
     build_io_config_get_response_payload, build_io_config_response_message,
-    build_io_config_set_error_payload, build_io_config_set_ok_payload, ensure_config_version_advances,
-    parse_and_validate_io_control_plane_request, IoConfigSource, IoControlPlaneErrorInfo,
-    IoControlPlaneRequest, IoControlPlaneState, IoNodeLifecycleState,
+    build_io_config_set_error_payload, build_io_config_set_ok_payload,
+    ensure_config_version_advances, parse_and_validate_io_control_plane_request, IoConfigSource,
+    IoControlPlaneErrorInfo, IoControlPlaneRequest, IoControlPlaneState, IoNodeLifecycleState,
 };
 use io_common::io_control_plane_bootstrap::bootstrap_io_control_plane_state;
 use io_common::io_control_plane_logging::{
@@ -75,6 +74,7 @@ use io_common::provision::{
     ensure_own_ich, provision_ilk_in_scope, strict_provision_ilk, IdentityProvisionConfig,
     ProvisionOutcome,
 };
+use io_common::router_message::{build_user_message, new_trace_id, DEFAULT_TTL};
 use serde_json::{json, Value};
 use tokio::sync::RwLock;
 use tokio::time::timeout;
@@ -386,7 +386,9 @@ async fn run_loop(
             // here — io.cloud does the work itself and NEVER touches SY.admin. The local-vs-relay
             // decision comes from the declared SDK set, not a magic string. Everything else is the
             // bounded SY.admin relay (dispatch_cloud_op, which also errors on an unknown op).
-            Ok(()) if is_cloud_local_op(&op) => handle_local_cloud_op(sender, state, &msg, &op).await,
+            Ok(()) if is_cloud_local_op(&op) => {
+                handle_local_cloud_op(sender, state, &msg, &op).await
+            }
             Ok(()) => {
                 dispatch_cloud_op(
                     &state.dispatcher,
@@ -532,7 +534,11 @@ async fn handle_control_message(state: &Arc<RuntimeState>, message: &Message) ->
 
 async fn build_config_get_payload(state: &RuntimeState, message: &Message) -> Value {
     let snapshot = state.control_plane.read().await.clone();
-    log_config_get_served(&message.routing.trace_id, &state.config.node_name, &snapshot);
+    log_config_get_served(
+        &message.routing.trace_id,
+        &state.config.node_name,
+        &snapshot,
+    );
     let mut payload = build_io_config_get_response_payload(
         &state.config.node_name,
         &snapshot,
@@ -1154,7 +1160,11 @@ fn translate_cloud_op(
                     "{op} requires params.ilk_id as a canonical ilk:<uuid>"
                 )));
             }
-            let action = if op == "delete_ilk" { "delete_ilk" } else { "restore_ilk" };
+            let action = if op == "delete_ilk" {
+                "delete_ilk"
+            } else {
+                "restore_ilk"
+            };
             Ok((action, json!({ "ilk_id": ilk_id, "ilk_type": "human" })))
         }
         // Charge a person to the claimed tenant, their cost center. It grants and revokes
@@ -1175,7 +1185,11 @@ fn translate_cloud_op(
         }
         "delete_tenant" | "restore_tenant" => {
             let tenant_id = claimed_tenant(tenant_id, op)?;
-            let action = if op == "delete_tenant" { "delete_tenant" } else { "restore_tenant" };
+            let action = if op == "delete_tenant" {
+                "delete_tenant"
+            } else {
+                "restore_tenant"
+            };
             Ok((action, json!({ "tenant_id": tenant_id })))
         }
         // The tenant's credentials: metadata, version and use, never the value. Always filtered by
@@ -1392,7 +1406,9 @@ async fn dispatch_cloud_op(
     if op == "get_ilk_details" {
         // Exactly-one selector, mirroring the local get_ilk arm: both present is ambiguous
         // (a stale ilk_id next to a fresh email would silently win) — fail loud instead.
-        if optional_trimmed(&params, "ilk_id").is_some() && optional_trimmed(&params, "email").is_some() {
+        if optional_trimmed(&params, "ilk_id").is_some()
+            && optional_trimmed(&params, "email").is_some()
+        {
             return cloud_error(
                 "get_ilk_details requires exactly one of params.ilk_id (ilk:<uuid>) or params.email",
             );
@@ -1511,7 +1527,13 @@ fn cloud_view(op: &str, payload: Value) -> Value {
             "identity": field("identity"),
             "config_version": node.pointer("/config/config_version").cloned().unwrap_or(Value::Null),
         });
-        for optional in ["launched_by", "relaunch_on_boot", "observed_at", "health_source", "last_error"] {
+        for optional in [
+            "launched_by",
+            "relaunch_on_boot",
+            "observed_at",
+            "health_source",
+            "last_error",
+        ] {
             if let Some(value) = node.get(optional) {
                 view[optional] = value.clone();
             }
@@ -1585,7 +1607,10 @@ async fn handle_local_cloud_op(
         }),
         // Unreachable while CLOUD_LOCAL_OPS and this match stay in lock-step; fail-closed if a new
         // local op is declared without a handler here.
-        other => cloud_error_code("INVALID_REQUEST", &format!("no handler for local op '{other}'")),
+        other => cloud_error_code(
+            "INVALID_REQUEST",
+            &format!("no handler for local op '{other}'"),
+        ),
     }
 }
 
@@ -1630,7 +1655,11 @@ fn pending_signups(
 /// behind the `get_ilk_details` relay.
 fn handle_shm_read(state: &Arc<RuntimeState>, msg: &Message, op: &str) -> Value {
     use fluxbee_sdk::identity::list_ilks_from_hive_id;
-    let params = msg.payload.get("params").cloned().unwrap_or_else(|| json!({}));
+    let params = msg
+        .payload
+        .get("params")
+        .cloned()
+        .unwrap_or_else(|| json!({}));
     // The envelope's tenant (rule 3); `tenant_in_params` already refused one inside params.
     let envelope_tenant = msg
         .payload
@@ -2038,7 +2067,11 @@ fn frontdesk_reply_matcher() -> PendingMatcher {
 ///      satisfies the frontdesk's user-message pre-gate (there is no conversation).
 /// io.cloud CONSTRUCTS no handoff — the JSON is a Cloud<->frontdesk contract; it reads only the tenant
 /// and email it provisions on, and stamps the verdict it relays with the ilk_id it minted.
-async fn handle_register_human(sender: &NodeSender, state: &Arc<RuntimeState>, msg: &Message) -> Value {
+async fn handle_register_human(
+    sender: &NodeSender,
+    state: &Arc<RuntimeState>,
+    msg: &Message,
+) -> Value {
     // Validate the request (fail -> JSON error straight back to Cloud, flow dies) and extract the
     // fields io.cloud needs. Cloud owns the format.
     let RegisterHumanRequest {
@@ -2095,7 +2128,10 @@ async fn handle_register_human(sender: &NodeSender, state: &Arc<RuntimeState>, m
     ) {
         Ok(ctx) => ctx,
         Err(err) => {
-            return cloud_error_code("INTERNAL", &format!("could not build response envelope: {err}"))
+            return cloud_error_code(
+                "INTERNAL",
+                &format!("could not build response envelope: {err}"),
+            )
         }
     };
     let message = build_user_message(
@@ -2113,7 +2149,11 @@ async fn handle_register_human(sender: &NodeSender, state: &Arc<RuntimeState>, m
         .send_with_matcher(
             message,
             frontdesk_reply_matcher(),
-            RpcRequestLabels::new(DEFAULT_FRONTDESK_TARGET, "FRONTDESK_HANDOFF", "FRONTDESK_REPLY"),
+            RpcRequestLabels::new(
+                DEFAULT_FRONTDESK_TARGET,
+                "FRONTDESK_HANDOFF",
+                "FRONTDESK_REPLY",
+            ),
             Duration::from_secs(20),
         )
         .await
@@ -2328,7 +2368,10 @@ mod tests {
                 .unwrap_or_else(|e| panic!("op {op} should translate: {e:?}"));
             assert_eq!(&action, expected_action, "op {op} action drift");
             assert_eq!(admin_action_for_cloud_op(op), Some(action));
-            assert!(cloud_exposed_actions().contains(&action), "action {action} not exposed");
+            assert!(
+                cloud_exposed_actions().contains(&action),
+                "action {action} not exposed"
+            );
         }
         // An op outside the vocabulary is rejected, not silently relayed.
         assert!(translate_cloud_op("kill_node", Some(tenant), &params).is_err());
@@ -2365,7 +2408,9 @@ mod tests {
 
         let merged = register_human_reply(
             temp,
-            &verdict(json!({"success": true, "human_message": "ok", "ilk_id": existing, "merged": true})),
+            &verdict(
+                json!({"success": true, "human_message": "ok", "ilk_id": existing, "merged": true}),
+            ),
         );
         assert_eq!(merged["ilk_id"], existing);
         assert_eq!(merged["merged"], true);
@@ -2373,7 +2418,9 @@ mod tests {
 
         let registered = register_human_reply(
             temp,
-            &verdict(json!({"success": true, "human_message": "ok", "ilk_id": temp, "merged": false})),
+            &verdict(
+                json!({"success": true, "human_message": "ok", "ilk_id": temp, "merged": false}),
+            ),
         );
         assert_eq!(registered["ilk_id"], temp);
         assert_eq!(registered["merged"], false);
@@ -2382,7 +2429,9 @@ mod tests {
         // A failure keeps the temporary: it is still the person's ILK.
         let failed = register_human_reply(
             temp,
-            &verdict(json!({"success": false, "human_message": "no", "error_code": "register_failed"})),
+            &verdict(
+                json!({"success": false, "human_message": "no", "error_code": "register_failed"}),
+            ),
         );
         assert_eq!(failed["ilk_id"], temp);
         assert_eq!(failed["registration_status"], "temporary");
@@ -2423,29 +2472,31 @@ mod tests {
             }
             Value::Object(p)
         };
-        let env = |tenant: Value, over: Value| {
-            json!({"op": "register_human", "tenant_id": tenant, "params": params(over)})
-        };
+        let env = |tenant: Value, over: Value| json!({"op": "register_human", "tenant_id": tenant, "params": params(over)});
 
         // Non-object params.
         assert!(
-            parse_register_human_request(&json!({"op": "register_human", "tenant_id": tnt})).is_err()
+            parse_register_human_request(&json!({"op": "register_human", "tenant_id": tnt}))
+                .is_err()
         );
         // Wrong type / schema_version / operation → rejected up front (frontdesk has no serde defaults).
         assert!(parse_register_human_request(&env(json!(tnt), json!({"type": "text"}))).is_err());
-        assert!(parse_register_human_request(&env(json!(tnt), json!({"schema_version": 2}))).is_err());
+        assert!(
+            parse_register_human_request(&env(json!(tnt), json!({"schema_version": 2}))).is_err()
+        );
         assert!(parse_register_human_request(&env(json!(tnt), json!({"operation": "x"}))).is_err());
         // tenant_id at the ROOT: missing or non-canonical is rejected before provisioning.
-        assert!(
-            parse_register_human_request(&json!({"op": "register_human", "params": params(json!({}))}))
-                .is_err()
-        );
+        assert!(parse_register_human_request(
+            &json!({"op": "register_human", "params": params(json!({}))})
+        )
+        .is_err());
         assert!(parse_register_human_request(&env(json!("tnt:acme"), json!({}))).is_err());
         // subject.email must be a real address.
-        assert!(
-            parse_register_human_request(&env(json!(tnt), json!({"subject": {"email": "demo"}})))
-                .is_err()
-        );
+        assert!(parse_register_human_request(&env(
+            json!(tnt),
+            json!({"subject": {"email": "demo"}})
+        ))
+        .is_err());
 
         // Well-formed: tenant from the root, extracted + INJECTED into the forwarded handoff.
         let ok = parse_register_human_request(&json!({
@@ -2460,7 +2511,10 @@ mod tests {
         assert_eq!(ok.email, "juan@acme.com"); // trimmed
         assert_eq!(ok.request_id.as_deref(), Some("req-1"));
         // The root tenant_id is injected into the handoff io.cloud forwards to the frontdesk.
-        assert_eq!(ok.handoff.get("tenant_id").and_then(Value::as_str), Some(tnt));
+        assert_eq!(
+            ok.handoff.get("tenant_id").and_then(Value::as_str),
+            Some(tnt)
+        );
         assert_eq!(
             ok.handoff.get("operation").and_then(Value::as_str),
             Some("complete_registration")

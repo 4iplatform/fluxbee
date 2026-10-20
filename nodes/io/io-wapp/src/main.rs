@@ -9,6 +9,8 @@
 mod webhook;
 
 use anyhow::Result;
+use fluxbee_sdk::blob::BlobToolkit;
+use fluxbee_sdk::payload::TextV1Payload;
 use fluxbee_sdk::protocol::{
     is_system_kind, Destination, Message as WireMessage, Meta, Routing, MSG_VAULT_SECRET_CHANGED,
     SYSTEM_KIND,
@@ -26,9 +28,6 @@ use io_common::io_adapter_config::{
     apply_adapter_config_replace, build_io_adapter_contract_payload, IoAdapterConfigContract,
 };
 use io_common::io_context::{extract_wapp_post_target, wapp_inbound_io_context};
-use io_common::provision::{FluxbeeIdentityProvisioner, IdentityProvisionConfig};
-use io_common::text_v1_blob::{resolve_text_v1_text_only_for_outbound, IoBlobRuntimeConfig};
-use fluxbee_sdk::blob::BlobToolkit;
 use io_common::io_control_plane::{
     build_io_config_get_response_payload, build_io_config_response_message,
     build_io_config_set_error_payload, build_io_config_set_ok_payload,
@@ -43,7 +42,8 @@ use io_common::io_control_plane_logging::{
 use io_common::io_control_plane_metrics::IoControlPlaneMetrics;
 use io_common::io_control_plane_store::persist_io_control_plane_state;
 use io_common::io_wapp_adapter_config::IoWappAdapterConfigContract;
-use fluxbee_sdk::payload::TextV1Payload;
+use io_common::provision::{FluxbeeIdentityProvisioner, IdentityProvisionConfig};
+use io_common::text_v1_blob::{resolve_text_v1_text_only_for_outbound, IoBlobRuntimeConfig};
 use serde_json::Value;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -102,8 +102,12 @@ impl Config {
                 env("UUID_PERSISTENCE_DIR")
                     .unwrap_or_else(|| "/var/lib/fluxbee/state/nodes".to_string()),
             ),
-            config_dir: PathBuf::from(env("CONFIG_DIR").unwrap_or_else(|| "/etc/fluxbee".to_string())),
-            ttl: env("IO_WAPP_TTL").and_then(|v| v.parse().ok()).unwrap_or(16),
+            config_dir: PathBuf::from(
+                env("CONFIG_DIR").unwrap_or_else(|| "/etc/fluxbee".to_string()),
+            ),
+            ttl: env("IO_WAPP_TTL")
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(16),
             dedup_ttl_ms: env("IO_WAPP_DEDUP_TTL_MS")
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(600_000),
@@ -273,7 +277,10 @@ impl WappClients {
         if !status.is_success() {
             // Surface Meta's error code + message (no secrets in Graph error bodies), never the request.
             let err = value.get("error");
-            let code = err.and_then(|e| e.get("code")).cloned().unwrap_or(Value::Null);
+            let code = err
+                .and_then(|e| e.get("code"))
+                .cloned()
+                .unwrap_or(Value::Null);
             let message = err
                 .and_then(|e| e.get("message"))
                 .and_then(|v| v.as_str())
@@ -363,7 +370,10 @@ fn extract_wapp_creds_from_vault_value(value: &Value) -> Option<WappCredentials>
     })
 }
 
-async fn resolve_wapp_credentials_from_vault(vault: &VaultClient, key: &str) -> WappVaultResolution {
+async fn resolve_wapp_credentials_from_vault(
+    vault: &VaultClient,
+    key: &str,
+) -> WappVaultResolution {
     match vault.get(key, Duration::from_secs(5)).await {
         Ok(response) => {
             let resource_type = response
@@ -486,7 +496,9 @@ async fn main() -> Result<()> {
                     "io-wapp vault credentials not ready; running degraded (refresh loop will retry)"
                 ),
             },
-            None => tracing::warn!(node_name = %config.node_name, "no wapp.auth.key in effective config; running degraded until configured"),
+            None => {
+                tracing::warn!(node_name = %config.node_name, "no wapp.auth.key in effective config; running degraded until configured")
+            }
         }
     } else {
         tracing::warn!(node_name = %config.node_name, "FLUXBEE_NODE_ILK_ID / hive suffix missing; vault lookup skipped");
@@ -730,8 +742,15 @@ fn attach_wapp_raw_stub(payload: &mut Value, msg: &WappInboundMessage) {
         "timestamp": msg.timestamp,
         "profile_name": msg.profile_name,
     });
-    if let (Some(wapp_obj), WappMessageKind::Media { media_type, media_id, mime_type, .. }) =
-        (wapp.as_object_mut(), &msg.kind)
+    if let (
+        Some(wapp_obj),
+        WappMessageKind::Media {
+            media_type,
+            media_id,
+            mime_type,
+            ..
+        },
+    ) = (wapp.as_object_mut(), &msg.kind)
     {
         wapp_obj.insert(
             "media".to_string(),
@@ -891,7 +910,10 @@ async fn run_wapp_inbound_loop(
                     Some(provisioner.as_ref()),
                     ResolveOrCreateInput {
                         channel: "whatsapp".to_string(),
-                        external_id: wapp_external_id(&wapp_msg.phone_number_id, &wapp_msg.from_wa_id),
+                        external_id: wapp_external_id(
+                            &wapp_msg.phone_number_id,
+                            &wapp_msg.from_wa_id,
+                        ),
                         src_ilk_override: None,
                         tenant_id: None,
                         tenant_hint: Some(wapp_msg.phone_number_id.clone()),
@@ -977,18 +999,19 @@ async fn run_wapp_outbound_loop(
         };
 
         // Resolve ONLY the text (media deferred; attachment blobs are counted, never resolved).
-        let resolved = match resolve_text_v1_text_only_for_outbound(blob_toolkit.as_ref(), &msg.payload, true)
-            .await
-        {
-            Ok(resolved) => resolved,
-            Err(err) => {
-                tracing::warn!(
-                    %trace_id, code = %err.canonical_code(),
-                    "outbound: failed to resolve text/v1 payload; dropping"
-                );
-                continue;
-            }
-        };
+        let resolved =
+            match resolve_text_v1_text_only_for_outbound(blob_toolkit.as_ref(), &msg.payload, true)
+                .await
+            {
+                Ok(resolved) => resolved,
+                Err(err) => {
+                    tracing::warn!(
+                        %trace_id, code = %err.canonical_code(),
+                        "outbound: failed to resolve text/v1 payload; dropping"
+                    );
+                    continue;
+                }
+            };
 
         if resolved.text.trim().is_empty() {
             if resolved.attachment_count > 0 {
@@ -1066,7 +1089,12 @@ async fn handle_io_control_plane_message(
                 "config_generation": clients.config_generation().await,
             }
         });
-        return Some(build_system_reply(msg, control_src, "STATUS_RESPONSE", payload));
+        return Some(build_system_reply(
+            msg,
+            control_src,
+            "STATUS_RESPONSE",
+            payload,
+        ));
     }
 
     if !command.eq_ignore_ascii_case("CONFIG_GET") && !command.eq_ignore_ascii_case("CONFIG_SET") {
@@ -1081,7 +1109,10 @@ async fn handle_io_control_plane_message(
             build_io_config_get_response_payload(
                 node_name,
                 &redacted,
-                build_io_adapter_contract_payload(adapter_contract, state.effective_config.as_ref()),
+                build_io_adapter_contract_payload(
+                    adapter_contract,
+                    state.effective_config.as_ref(),
+                ),
             )
         }
         Ok(IoControlPlaneRequest::Set(set_payload)) => {
@@ -1130,7 +1161,12 @@ async fn apply_wapp_config_set(
             "stale_config",
         );
         let redacted = redact_state(&state, adapter_contract);
-        return build_io_config_set_error_payload(node_name, &redacted, "stale_config", err.to_string());
+        return build_io_config_set_error_payload(
+            node_name,
+            &redacted,
+            "stale_config",
+            err.to_string(),
+        );
     }
 
     let candidate = match apply_adapter_config_replace(adapter_contract, &payload.config) {
@@ -1147,7 +1183,12 @@ async fn apply_wapp_config_set(
                 err.code(),
             );
             let redacted = redact_state(&state, adapter_contract);
-            return build_io_config_set_error_payload(node_name, &redacted, err.code(), err.to_string());
+            return build_io_config_set_error_payload(
+                node_name,
+                &redacted,
+                err.code(),
+                err.to_string(),
+            );
         }
     };
 
@@ -1166,8 +1207,17 @@ async fn apply_wapp_config_set(
             code: code.to_string(),
             message: message.clone(),
         });
-        log_config_set_persist_error(node_name, payload.schema_version, payload.config_version, &message);
-        control_metrics.record_config_set_error(state.current_state.as_str(), previous_version, code);
+        log_config_set_persist_error(
+            node_name,
+            payload.schema_version,
+            payload.config_version,
+            &message,
+        );
+        control_metrics.record_config_set_error(
+            state.current_state.as_str(),
+            previous_version,
+            code,
+        );
         let redacted = redact_state(&state, adapter_contract);
         return build_io_config_set_error_payload(node_name, &redacted, code, message);
     }
@@ -1175,7 +1225,14 @@ async fn apply_wapp_config_set(
     // A CONFIG_SET that changes wapp.auth.key is picked up by the refresh loop (reads the key from the
     // live control plane each tick); no explicit reload needed here.
     control_metrics.record_config_set_ok(state.current_state.as_str(), state.config_version);
-    log_config_set_applied(node_name, payload.schema_version, payload.config_version, &[], &[], &[]);
+    log_config_set_applied(
+        node_name,
+        payload.schema_version,
+        payload.config_version,
+        &[],
+        &[],
+        &[],
+    );
     let redacted = redact_state(&state, adapter_contract);
     build_io_config_set_ok_payload(node_name, &redacted)
 }
@@ -1264,9 +1321,15 @@ mod tests {
     #[test]
     fn wapp_vault_key_reads_auth_key() {
         let cfg = json!({"wapp":{"auth":{"type":"vault_ref","resource_type":"whatsapp","key":"wapp/IO.wapp@motherbee"}}});
-        assert_eq!(wapp_vault_key(Some(&cfg)).as_deref(), Some("wapp/IO.wapp@motherbee"));
+        assert_eq!(
+            wapp_vault_key(Some(&cfg)).as_deref(),
+            Some("wapp/IO.wapp@motherbee")
+        );
         assert_eq!(wapp_vault_key(None), None);
-        assert_eq!(wapp_vault_key(Some(&json!({"wapp":{"auth":{"key":"   "}}}))), None);
+        assert_eq!(
+            wapp_vault_key(Some(&json!({"wapp":{"auth":{"key":"   "}}}))),
+            None
+        );
     }
 
     #[test]
@@ -1279,16 +1342,24 @@ mod tests {
         assert_eq!(ok.app_secret, "S");
         assert_eq!(ok.verify_token, "V");
         // a missing field => None
-        assert!(extract_wapp_creds_from_vault_value(&json!({"access_token":"A","app_secret":"S"})).is_none());
+        assert!(
+            extract_wapp_creds_from_vault_value(&json!({"access_token":"A","app_secret":"S"}))
+                .is_none()
+        );
         // a blank field => None
-        assert!(extract_wapp_creds_from_vault_value(&json!({"access_token":"A","app_secret":"S","verify_token":"  "})).is_none());
+        assert!(extract_wapp_creds_from_vault_value(
+            &json!({"access_token":"A","app_secret":"S","verify_token":"  "})
+        )
+        .is_none());
         // bare string => None (ambiguous)
         assert!(extract_wapp_creds_from_vault_value(&json!("A")).is_none());
     }
 
     #[test]
     fn vault_change_is_wapp_matches_only_whatsapp() {
-        assert!(vault_change_is_wapp(&json!({"resource_type":"whatsapp","op":"put"})));
+        assert!(vault_change_is_wapp(
+            &json!({"resource_type":"whatsapp","op":"put"})
+        ));
         assert!(vault_change_is_wapp(&json!({"resource_type":"WhatsApp"})));
         assert!(!vault_change_is_wapp(&json!({"resource_type":"slack"})));
         assert!(!vault_change_is_wapp(&json!({"op":"put"})));
@@ -1299,7 +1370,11 @@ mod tests {
         let c = WappClients::new().expect("http client");
         assert_eq!(c.config_generation().await, 0);
         assert!(!c.credentials_configured().await);
-        let creds = WappCredentials { access_token: "A".into(), app_secret: "S".into(), verify_token: "V".into() };
+        let creds = WappCredentials {
+            access_token: "A".into(),
+            app_secret: "S".into(),
+            verify_token: "V".into(),
+        };
         c.reload_credentials(creds.clone()).await;
         assert_eq!(c.config_generation().await, 1);
         assert!(c.credentials_configured().await);
@@ -1307,7 +1382,12 @@ mod tests {
         c.reload_credentials(creds).await;
         assert_eq!(c.config_generation().await, 1);
         // rotation bumps
-        c.reload_credentials(WappCredentials { access_token: "A2".into(), app_secret: "S".into(), verify_token: "V".into() }).await;
+        c.reload_credentials(WappCredentials {
+            access_token: "A2".into(),
+            app_secret: "S".into(),
+            verify_token: "V".into(),
+        })
+        .await;
         assert_eq!(c.config_generation().await, 2);
         // clear drops + bumps; clearing again is a no-op
         c.clear_credentials().await;
@@ -1328,7 +1408,10 @@ mod tests {
         // absence / blank => None (router-resolve for dst_node; parks inbound for phone_number_id)
         assert_eq!(wapp_phone_number_id(None), None);
         assert_eq!(extract_runtime_dst_node(Some(&json!({"io":{}}))), None);
-        assert_eq!(wapp_phone_number_id(Some(&json!({"io":{"phone_number_id":"  "}}))), None);
+        assert_eq!(
+            wapp_phone_number_id(Some(&json!({"io":{"phone_number_id":"  "}}))),
+            None
+        );
     }
 
     #[test]
@@ -1344,7 +1427,9 @@ mod tests {
     #[test]
     fn message_to_content_never_drops_non_text() {
         assert_eq!(
-            wapp_message_to_content(&WappMessageKind::Text { body: "hola".into() }),
+            wapp_message_to_content(&WappMessageKind::Text {
+                body: "hola".into()
+            }),
             "hola"
         );
         // media with caption => caption + marker; without => marker only
@@ -1377,7 +1462,9 @@ mod tests {
             "[audio attachment]"
         );
         assert_eq!(
-            wapp_message_to_content(&WappMessageKind::Other { message_type: "location".into() }),
+            wapp_message_to_content(&WappMessageKind::Other {
+                message_type: "location".into()
+            }),
             "[unsupported message type: location]"
         );
     }
@@ -1391,7 +1478,9 @@ mod tests {
             profile_name: Some("Ada".into()),
             message_id: "wamid.X".into(),
             timestamp: Some("1700000000".into()),
-            kind: WappMessageKind::Text { body: "hola".into() },
+            kind: WappMessageKind::Text {
+                body: "hola".into(),
+            },
         };
         let payload = build_wapp_inbound_payload(&msg).expect("payload");
         // base text/v1 content preserved
@@ -1442,8 +1531,13 @@ mod tests {
             kind,
         };
         // empty / whitespace text => no relay (mirrors io.slack empty guard)
-        assert!(build_wapp_inbound_payload(&base(WappMessageKind::Text { body: "".into() })).is_none());
-        assert!(build_wapp_inbound_payload(&base(WappMessageKind::Text { body: "  ".into() })).is_none());
+        assert!(
+            build_wapp_inbound_payload(&base(WappMessageKind::Text { body: "".into() })).is_none()
+        );
+        assert!(
+            build_wapp_inbound_payload(&base(WappMessageKind::Text { body: "  ".into() }))
+                .is_none()
+        );
         // a non-text kind always renders a marker, so it is never dropped by the empty guard
         assert!(build_wapp_inbound_payload(&base(WappMessageKind::Other {
             message_type: "location".into()
@@ -1493,7 +1587,10 @@ mod tests {
         // clamp low (0) up to 1s
         assert_eq!(with("0"), Duration::from_secs(1));
         // garbage (HTTP-date form we don't parse) => 1s default
-        assert_eq!(with("Wed, 21 Oct 2026 07:28:00 GMT"), Duration::from_secs(1));
+        assert_eq!(
+            with("Wed, 21 Oct 2026 07:28:00 GMT"),
+            Duration::from_secs(1)
+        );
     }
 
     #[tokio::test]
@@ -1529,7 +1626,11 @@ mod tests {
             Some("stale_config"),
             "config_version 2 over 0 must not be stale: {resp}"
         );
-        assert_eq!(control_plane.read().await.config_version, 2, "version must advance to 2");
+        assert_eq!(
+            control_plane.read().await.config_version,
+            2,
+            "version must advance to 2"
+        );
     }
 
     #[tokio::test]

@@ -4,9 +4,10 @@
 //! `config.json`, preserving the orchestrator-owned `_system` block.
 
 use crate::io_control_plane::IoControlPlaneState;
-use fluxbee_sdk::managed_control_plane::{persist_effective_config_with_root, DEFAULT_MANAGED_NODES_ROOT};
+use fluxbee_sdk::managed_control_plane::{
+    persist_effective_config_with_root, DEFAULT_MANAGED_NODES_ROOT,
+};
 use std::path::Path;
-
 
 #[derive(Debug, thiserror::Error)]
 pub enum IoControlPlaneStoreError {
@@ -67,8 +68,10 @@ mod tests {
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(
             &path,
-            serde_json::to_string_pretty(&json!({"_system":{"config_version":1,"ilk_id":"ilk:x"},"io":{"dst_node":"a"}}))
-                .unwrap(),
+            serde_json::to_string_pretty(
+                &json!({"_system":{"config_version":1,"ilk_id":"ilk:x"},"io":{"dst_node":"a"}}),
+            )
+            .unwrap(),
         )
         .unwrap();
 
@@ -82,8 +85,7 @@ mod tests {
         };
         persist_io_control_plane_state_with_root(node, &state, &root).expect("persist");
 
-        let saved: Value =
-            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        let saved: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
         // _system preserved (ilk_id kept, version bumped); the new effective config written.
         assert_eq!(
             saved.get("_system").and_then(|s| s.get("ilk_id")),

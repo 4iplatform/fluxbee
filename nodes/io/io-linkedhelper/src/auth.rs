@@ -288,12 +288,7 @@ mod tests {
 
     #[test]
     fn local_instance_not_pinned_accepts_any() {
-        let v = AdapterAuthValidator::new(
-            "adp_123",
-            "lhmi_001",
-            None,
-            Some("s3cret".to_string()),
-        );
+        let v = AdapterAuthValidator::new("adp_123", "lhmi_001", None, Some("s3cret".to_string()));
         let mut req = good_request();
         req.body_local_instance_id = None;
         assert!(v.validate(&req).is_ok());

@@ -3233,7 +3233,10 @@ fn validate_frontdesk_response_envelope(contract: &Value) -> fluxbee_ai_sdk::Res
 /// The structured verdict, with the optional fields the caller's contract asks for: `ilk_id` is the
 /// ILK the person ended up on (after a merge, the one that already had the email, not the
 /// temporary), and `merged` says that happened.
-fn frontdesk_structured_response_payload(payload: &FrontdeskResultPayload, contract: &Value) -> Value {
+fn frontdesk_structured_response_payload(
+    payload: &FrontdeskResultPayload,
+    contract: &Value,
+) -> Value {
     let requested = |field: &str| {
         contract
             .get("properties")
@@ -3394,12 +3397,7 @@ fn build_frontdesk_result_from_register_response(
 fn parse_openai_status_error(message: &str) -> Option<(u16, String)> {
     let idx = message.find("error status=")?;
     let after = &message[idx + "error status=".len()..];
-    let status = after
-        .split([' ', ','])
-        .next()?
-        .trim()
-        .parse::<u16>()
-        .ok()?;
+    let status = after.split([' ', ',']).next()?.trim().parse::<u16>().ok()?;
     let detail = after
         .split_once("message=")
         .map(|(_, msg)| msg.trim().to_string())

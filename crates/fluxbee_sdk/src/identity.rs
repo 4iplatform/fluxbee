@@ -503,7 +503,13 @@ pub fn resolve_identity_option_from_shm_name(
     address: &str,
     tenant_id: &str,
 ) -> Result<Option<ResolvedIdentityOption>, IdentityShmError> {
-    resolve_identity_option_from_shm_name_impl(identity_shm_name, channel_type, address, tenant_id, true)
+    resolve_identity_option_from_shm_name_impl(
+        identity_shm_name,
+        channel_type,
+        address,
+        tenant_id,
+        true,
+    )
 }
 
 /// [`resolve_identity_option_from_shm_name`] with STRICT permission semantics: an unreadable
@@ -515,7 +521,13 @@ pub fn resolve_identity_option_from_shm_name_strict(
     address: &str,
     tenant_id: &str,
 ) -> Result<Option<ResolvedIdentityOption>, IdentityShmError> {
-    resolve_identity_option_from_shm_name_impl(identity_shm_name, channel_type, address, tenant_id, false)
+    resolve_identity_option_from_shm_name_impl(
+        identity_shm_name,
+        channel_type,
+        address,
+        tenant_id,
+        false,
+    )
 }
 
 fn resolve_identity_option_from_shm_name_impl(

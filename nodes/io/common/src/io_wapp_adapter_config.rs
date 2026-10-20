@@ -60,7 +60,9 @@ impl IoAdapterConfigContract for IoWappAdapterConfigContract {
 
         {
             let wapp = cfg.get("wapp").and_then(Value::as_object).ok_or_else(|| {
-                IoAdapterConfigError::Internal("wapp object missing after normalization".to_string())
+                IoAdapterConfigError::Internal(
+                    "wapp object missing after normalization".to_string(),
+                )
             })?;
             let auth = wapp.get("auth").and_then(Value::as_object).ok_or_else(|| {
                 IoAdapterConfigError::InvalidConfig(
@@ -185,9 +187,13 @@ mod tests {
         let contract = IoWappAdapterConfigContract;
         // missing auth
         let err = contract
-            .validate_and_materialize(&json!({"wapp":{}, "io":{"phone_number_id":"1","waba_id":"2"}}))
+            .validate_and_materialize(
+                &json!({"wapp":{}, "io":{"phone_number_id":"1","waba_id":"2"}}),
+            )
             .expect_err("must fail missing auth");
-        assert!(matches!(err, IoAdapterConfigError::InvalidConfig(m) if m.contains("wapp.auth is required")));
+        assert!(
+            matches!(err, IoAdapterConfigError::InvalidConfig(m) if m.contains("wapp.auth is required"))
+        );
 
         // wrong auth type
         let err = contract
@@ -205,7 +211,9 @@ mod tests {
         let err = contract
             .validate_and_materialize(&json!({"wapp":{"auth": valid_auth()}, "io":{"waba_id":"2"}}))
             .expect_err("must require phone_number_id");
-        assert!(matches!(err, IoAdapterConfigError::InvalidConfig(m) if m.contains("io.phone_number_id")));
+        assert!(
+            matches!(err, IoAdapterConfigError::InvalidConfig(m) if m.contains("io.phone_number_id"))
+        );
 
         // valid, and NO dst_node is injected
         let out = contract
@@ -248,6 +256,8 @@ mod tests {
                 "io":{"phone_number_id":"1","waba_id":"2","graph_api_version":"  "}
             }))
             .expect_err("must reject blank graph_api_version");
-        assert!(matches!(err, IoAdapterConfigError::InvalidConfig(m) if m.contains("io.graph_api_version")));
+        assert!(
+            matches!(err, IoAdapterConfigError::InvalidConfig(m) if m.contains("io.graph_api_version"))
+        );
     }
 }

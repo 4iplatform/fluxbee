@@ -2047,31 +2047,32 @@ async fn reconcile_persisted_custom_nodes(
         // FIX-5: if the on-disk node->ilk map is empty (a persist failed at spawn), do NOT relaunch
         // blind — recover the identity from SY.identity's SHM by handler node and re-persist, so
         // io.api comes up WITH its tenant/ilk instead of node_not_configured on every request.
-        let (persisted_ilk, persisted_tenant) =
-            if persisted_ilk.is_none() && persisted_tenant.is_none() {
-                match fluxbee_sdk::identity::find_ilk_by_handler_node_from_hive_id(
-                    &state.hive_id,
-                    &node.node_name,
-                ) {
-                    Ok(Some((_, ilk))) => {
-                        tracing::warn!(
-                            node_name = %node.node_name,
-                            ilk_id = %ilk.ilk_id,
-                            "reconcile: node->ilk map missing; recovered identity from SY.identity SHM and re-persisting"
-                        );
-                        let _ = persist_node_ilk_mapping(
-                            state,
-                            &node.node_name,
-                            &ilk.ilk_id,
-                            &ilk.tenant_id,
-                        );
-                        (Some(ilk.ilk_id), Some(ilk.tenant_id))
-                    }
-                    _ => (persisted_ilk, persisted_tenant),
+        let (persisted_ilk, persisted_tenant) = if persisted_ilk.is_none()
+            && persisted_tenant.is_none()
+        {
+            match fluxbee_sdk::identity::find_ilk_by_handler_node_from_hive_id(
+                &state.hive_id,
+                &node.node_name,
+            ) {
+                Ok(Some((_, ilk))) => {
+                    tracing::warn!(
+                        node_name = %node.node_name,
+                        ilk_id = %ilk.ilk_id,
+                        "reconcile: node->ilk map missing; recovered identity from SY.identity SHM and re-persisting"
+                    );
+                    let _ = persist_node_ilk_mapping(
+                        state,
+                        &node.node_name,
+                        &ilk.ilk_id,
+                        &ilk.tenant_id,
+                    );
+                    (Some(ilk.ilk_id), Some(ilk.tenant_id))
                 }
-            } else {
-                (persisted_ilk, persisted_tenant)
-            };
+                _ => (persisted_ilk, persisted_tenant),
+            }
+        } else {
+            (persisted_ilk, persisted_tenant)
+        };
         // The tenant as start and restart read it: the identity map, else the node's config.
         let node_tenant = persisted_tenant.clone().or_else(|| {
             load_node_effective_config(&node.config_path)
@@ -2128,9 +2129,7 @@ async fn reconcile_persisted_custom_nodes(
                 to = version,
                 "runtime 'current' pointer moved; rebinding node to the new version"
             );
-            if let Err(err) =
-                persist_node_runtime_version(&node.config_path, &version)
-            {
+            if let Err(err) = persist_node_runtime_version(&node.config_path, &version) {
                 tracing::warn!(
                     node_name = node.node_name,
                     error = %err,
@@ -3013,13 +3012,9 @@ async fn handle_system_message(
         }
         Some("SYSTEM_CORE_ROLLBACK") => {
             let result = core_rollback_local(state, &msg.payload).await;
-            let _ = send_system_action_response(
-                sender,
-                msg,
-                "SYSTEM_CORE_ROLLBACK_RESPONSE",
-                result,
-            )
-            .await;
+            let _ =
+                send_system_action_response(sender, msg, "SYSTEM_CORE_ROLLBACK_RESPONSE", result)
+                    .await;
         }
         Some("SYSTEM_SYNC_HINT") => {
             let result = handle_system_sync_hint_message(state, msg).await;
@@ -3594,7 +3589,6 @@ async fn handle_system_sync_hint_for_folder(
     state: &OrchestratorState,
     request: SystemSyncHintRequest,
 ) -> serde_json::Value {
-
     let desired_blob = current_blob_runtime_config(state);
     let desired_dist = current_dist_runtime_config(state);
     let desired_sync = effective_syncthing_runtime_config(&desired_blob, &desired_dist);
@@ -3947,7 +3941,10 @@ enum CoreRollbackSelector {
 }
 
 fn normalize_hash(value: &str) -> String {
-    value.trim().trim_start_matches("sha256:").to_ascii_lowercase()
+    value
+        .trim()
+        .trim_start_matches("sha256:")
+        .to_ascii_lowercase()
 }
 
 /// Pick and FULLY VERIFY a generation before anything in `/usr/bin` is touched.
@@ -4016,8 +4013,7 @@ fn select_core_backup_generation(
                 }
                 // NEVER silently pick one.
                 _ => {
-                    let names: Vec<_> =
-                        matches.iter().map(|(_, g)| g.generation.clone()).collect();
+                    let names: Vec<_> = matches.iter().map(|(_, g)| g.generation.clone()).collect();
                     return Err((
                         "NO_BACKUP",
                         format!(
@@ -4215,9 +4211,7 @@ async fn core_rollback_local(
     state: &OrchestratorState,
     payload: &serde_json::Value,
 ) -> serde_json::Value {
-    let err = |code: &str, message: String| {
-        serde_json::json!({ "status": "error", "error_code": code, "message": message })
-    };
+    let err = |code: &str, message: String| serde_json::json!({ "status": "error", "error_code": code, "message": message });
 
     let generation = payload.get("generation").and_then(|v| v.as_str());
     let to_hash = payload.get("to_manifest_hash").and_then(|v| v.as_str());
@@ -8706,7 +8700,11 @@ fn dist_sync_folders_for_role(
         dist.path.join("core")
     };
     out.push(DistSyncFolder {
-        id: format!("{}{}", SYNCTHING_FOLDER_DIST_CORE_PREFIX, spoke_role.as_str()),
+        id: format!(
+            "{}{}",
+            SYNCTHING_FOLDER_DIST_CORE_PREFIX,
+            spoke_role.as_str()
+        ),
         path: core_path,
         label: "Fluxbee Dist Core",
     });
@@ -12622,9 +12620,7 @@ fn versions_comparison(reference_hive: &str, hives: &[serde_json::Value]) -> ser
             if let Some(installed) = section_value.get("installed") {
                 if !installed.is_null() {
                     return match installed.get("manifest_hash").and_then(|h| h.as_str()) {
-                        Some(h) if !h.trim().is_empty() => {
-                            Ok(Some(h.trim().to_ascii_lowercase()))
-                        }
+                        Some(h) if !h.trim().is_empty() => Ok(Some(h.trim().to_ascii_lowercase())),
                         // Installed something it cannot name: off-manifest, unknown which way.
                         _ => Err(()),
                     };
@@ -13345,7 +13341,13 @@ fn enrich_drift_alert_history_entries(
     // (`sy_architect.rs`, `cognitive_prompts.md`), and that branch was unreachable — so the
     // self-declaration was never read. Now that a writer exists, the endpoint answers `[]`
     // until something real is detected, which is exactly what that prompt already promises.
-    let _ = (state, hive_filter, category_filter, severity_filter, kind_filter);
+    let _ = (
+        state,
+        hive_filter,
+        category_filter,
+        severity_filter,
+        kind_filter,
+    );
 
     if entries.len() > limit {
         entries.truncate(limit);
@@ -15362,7 +15364,11 @@ fn persist_node_runtime_version(
         .get_mut("_system")
         .and_then(|value| value.as_object_mut())
     else {
-        return Err(format!("node config '{}' has no _system block", config_path.display()).into());
+        return Err(format!(
+            "node config '{}' has no _system block",
+            config_path.display()
+        )
+        .into());
     };
     system.insert(
         "runtime_version".to_string(),
@@ -17485,19 +17491,20 @@ async fn ensure_node_identity_registered(
     // reconcile relaunches it from the on-disk map only, so it comes up with no tenant/ilk and every
     // request 404s node_not_configured. Escalate to error AND surface it in the ok-response so the
     // spawn caller can react (reconcile also has an identity-SHM fallback now, but re-persist here).
-    let identity_persist_failed =
-        if let Err(err) = persist_node_ilk_mapping(state, node_name, &resolved_ilk_id, &tenant_id) {
-            tracing::error!(
-                node_name = node_name,
-                ilk_id = resolved_ilk_id,
-                tenant_id = tenant_id,
-                error = %err,
-                "FAILED to persist node->ilk mapping — node loses its identity on reboot until re-spawned"
-            );
-            true
-        } else {
-            false
-        };
+    let identity_persist_failed = if let Err(err) =
+        persist_node_ilk_mapping(state, node_name, &resolved_ilk_id, &tenant_id)
+    {
+        tracing::error!(
+            node_name = node_name,
+            ilk_id = resolved_ilk_id,
+            tenant_id = tenant_id,
+            error = %err,
+            "FAILED to persist node->ilk mapping — node loses its identity on reboot until re-spawned"
+        );
+        true
+    } else {
+        false
+    };
 
     Ok(Some(serde_json::json!({
         "status": "ok",
@@ -21082,9 +21089,7 @@ fn scope_core_manifest_to_components(
 ///
 /// Idempotent: a component is re-copied only when its bytes differ from the source, and the
 /// scoped manifest is rewritten only on a real diff — so syncthing sees no spurious churn.
-fn materialize_role_core_trees(
-    manifest: &CoreManifest,
-) -> Result<Vec<String>, OrchestratorError> {
+fn materialize_role_core_trees(manifest: &CoreManifest) -> Result<Vec<String>, OrchestratorError> {
     let hive = load_hive(&json_router::paths::config_dir())?;
     let mut changed_roles = Vec::new();
 
@@ -21154,9 +21159,10 @@ fn materialize_role_core_trees(
         // sees identical hashes on both ends. Copied rather than re-serialized for exactly that
         // reason: a re-render could differ by key order or whitespace and silently wedge the gate.
         let manifest_path = root.join("manifest.json");
-        let rendered = fs::read_to_string(local_core_manifest_path().ok_or_else(|| {
-            format!("core manifest missing at '{DIST_CORE_MANIFEST_PATH}'")
-        })?)?;
+        let rendered = fs::read_to_string(
+            local_core_manifest_path()
+                .ok_or_else(|| format!("core manifest missing at '{DIST_CORE_MANIFEST_PATH}'"))?,
+        )?;
         let manifest_changed = match fs::read_to_string(&manifest_path) {
             Ok(existing) => existing != rendered,
             Err(_) => true,
@@ -27550,11 +27556,22 @@ mod tests {
             .expect_err("empty store must fail");
         assert_eq!(code, "NO_BACKUP");
 
-        stamp_generation(&root, "update-1700000000001", Some("hashA"), &[("sy-admin", "A")]);
-        stamp_generation(&root, "update-1700000000002", Some("hashB"), &[("sy-admin", "B")]);
+        stamp_generation(
+            &root,
+            "update-1700000000001",
+            Some("hashA"),
+            &[("sy-admin", "A")],
+        );
+        stamp_generation(
+            &root,
+            "update-1700000000002",
+            Some("hashB"),
+            &[("sy-admin", "B")],
+        );
 
         // Latest is chronological, which lexical order gives us for a fixed-width epoch.
-        let (_, g) = select_core_backup_generation(&root, &CoreRollbackSelector::Latest).expect("latest");
+        let (_, g) =
+            select_core_backup_generation(&root, &CoreRollbackSelector::Latest).expect("latest");
         assert_eq!(g.generation, "update-1700000000002");
         assert_eq!(g.replaced_manifest_hash.as_deref(), Some("hashB"));
 
@@ -27592,7 +27609,12 @@ mod tests {
         }
 
         // An AMBIGUOUS hash must never be resolved by picking one.
-        stamp_generation(&root, "update-1700000000003", Some("hashA"), &[("sy-admin", "C")]);
+        stamp_generation(
+            &root,
+            "update-1700000000003",
+            Some("hashA"),
+            &[("sy-admin", "C")],
+        );
         let (code, detail) = select_core_backup_generation(
             &root,
             &CoreRollbackSelector::ToManifestHash("hashA".into()),
@@ -27647,12 +27669,9 @@ mod tests {
         let backup_dir = std::env::temp_dir().join(format!("fluxbee-rb-empty-{}", Uuid::new_v4()));
         fs::create_dir_all(&backup_dir).expect("dir");
 
-        let err = rollback_local_core_binaries(
-            &["sy-admin".to_string()],
-            &backup_dir,
-            &HashSet::new(),
-        )
-        .expect_err("must refuse to claim a rollback it did not perform");
+        let err =
+            rollback_local_core_binaries(&["sy-admin".to_string()], &backup_dir, &HashSet::new())
+                .expect_err("must refuse to claim a rollback it did not perform");
         let text = err.to_string();
         assert!(text.contains("sy-admin"), "must name the component: {text}");
         assert!(text.contains("restored nothing"), "must say why: {text}");
@@ -27660,12 +27679,9 @@ mod tests {
         // A component the update CREATED has nothing to restore to; removing it is correct.
         let mut created = HashSet::new();
         created.insert("sy-admin".to_string());
-        assert!(rollback_local_core_binaries(
-            &["sy-admin".to_string()],
-            &backup_dir,
-            &created
-        )
-        .is_ok());
+        assert!(
+            rollback_local_core_binaries(&["sy-admin".to_string()], &backup_dir, &created).is_ok()
+        );
 
         let _ = fs::remove_dir_all(&backup_dir);
     }
@@ -27763,10 +27779,15 @@ mod tests {
         let src = include_str!("sy_orchestrator.rs");
         for (flow, next) in [
             ("async fn add_hive_flow", "async fn add_egress_hive_flow"),
-            ("async fn add_egress_hive_flow", "async fn add_ingress_hive_flow"),
+            (
+                "async fn add_egress_hive_flow",
+                "async fn add_ingress_hive_flow",
+            ),
             ("async fn add_ingress_hive_flow", "fn resolve_add_hive_role"),
         ] {
-            let start = src.find(flow).unwrap_or_else(|| panic!("no encontre {flow}"));
+            let start = src
+                .find(flow)
+                .unwrap_or_else(|| panic!("no encontre {flow}"));
             let end = src[start..]
                 .find(next)
                 .map(|o| start + o)
@@ -27930,7 +27951,11 @@ mod tests {
             "a different kind is a different alert"
         );
         assert!(
-            emit("post_sync_mismatch", "w1", base + DRIFT_ALERT_DEDUP_WINDOW_MS + 1),
+            emit(
+                "post_sync_mismatch",
+                "w1",
+                base + DRIFT_ALERT_DEDUP_WINDOW_MS + 1
+            ),
             "past the window it must record again"
         );
 
@@ -27976,7 +28001,10 @@ mod tests {
         let snap = |hive: &str, core: &str, vendor: &str, runtime: &str| {
             let mut o = serde_json::Map::new();
             o.insert("hive_id".into(), serde_json::json!(hive));
-            for (section, hash) in VERSION_COMPARISON_SECTIONS.iter().zip([core, vendor, runtime]) {
+            for (section, hash) in VERSION_COMPARISON_SECTIONS
+                .iter()
+                .zip([core, vendor, runtime])
+            {
                 o.insert(
                     (*section).to_string(),
                     serde_json::json!({ "manifest_hash": hash }),
@@ -27988,7 +28016,10 @@ mod tests {
         // Everything in step.
         let out = versions_comparison(
             "motherbee",
-            &[snap("motherbee", "aa", "bb", "cc"), snap("w1", "aa", "bb", "cc")],
+            &[
+                snap("motherbee", "aa", "bb", "cc"),
+                snap("w1", "aa", "bb", "cc"),
+            ],
         );
         assert_eq!(out["verdict"], "match");
         assert_eq!(out["hives"][0]["verdict"], "match");
@@ -27996,7 +28027,10 @@ mod tests {
         // One dimension drifted: the hive AND the fleet must say so.
         let out = versions_comparison(
             "motherbee",
-            &[snap("motherbee", "aa", "bb", "cc"), snap("w1", "ZZ", "bb", "cc")],
+            &[
+                snap("motherbee", "aa", "bb", "cc"),
+                snap("w1", "ZZ", "bb", "cc"),
+            ],
         );
         assert_eq!(out["verdict"], "differs");
         assert_eq!(out["hives"][0]["sections"]["core"], "differs");
@@ -28005,7 +28039,10 @@ mod tests {
         // Hash comparison is case/whitespace insensitive — a formatting difference is not drift.
         let out = versions_comparison(
             "motherbee",
-            &[snap("motherbee", "AA", "bb", "cc"), snap("w1", " aa ", "bb", "cc")],
+            &[
+                snap("motherbee", "AA", "bb", "cc"),
+                snap("w1", " aa ", "bb", "cc"),
+            ],
         );
         assert_eq!(out["verdict"], "match");
 
@@ -28052,7 +28089,10 @@ mod tests {
         let out = versions_comparison("motherbee", &[reference.clone(), ingress.clone()]);
         assert_eq!(out["hives"][0]["sections"]["runtimes"], "n/a");
         assert_eq!(out["hives"][0]["verdict"], "match");
-        assert_eq!(out["verdict"], "match", "a healthy four-role fleet must read match");
+        assert_eq!(
+            out["verdict"], "match",
+            "a healthy four-role fleet must read match"
+        );
 
         // ...but a WORKER missing its runtimes really is drift.
         ingress["role"] = serde_json::json!("worker");
@@ -28246,7 +28286,10 @@ mod tests {
         assert_eq!(parse_default_gateway("default dev tun0 scope link\n"), None);
         assert_eq!(parse_default_gateway(""), None);
         // Must not match a line that merely mentions the word.
-        assert_eq!(parse_default_gateway("10.0.0.0/8 via 10.0.0.1 dev eth0\n"), None);
+        assert_eq!(
+            parse_default_gateway("10.0.0.0/8 via 10.0.0.1 dev eth0\n"),
+            None
+        );
     }
 
     /// PB-8: motherbee is where the nodes that call the internet run, but the egress model
@@ -28325,7 +28368,12 @@ mod tests {
     #[test]
     fn core_backup_retention_never_empties_the_store() {
         let root = std::env::temp_dir().join(format!("fluxbee-core-backup-nb-{}", now_epoch_ms()));
-        stamp_generation(&root, "update-1700000000001", Some("h"), &[("sy-admin", "x")]);
+        stamp_generation(
+            &root,
+            "update-1700000000001",
+            Some("h"),
+            &[("sy-admin", "x")],
+        );
 
         // At or below the threshold nothing is touched — a rollback still needs its generation.
         prune_core_backup_generations_in(&root, CORE_BACKUP_GENERATIONS_KEPT);
@@ -28348,13 +28396,19 @@ mod tests {
         );
         assert_eq!(denied["error_code"], "SSH_AUTH_FAILED");
         assert!(
-            denied["hint"].as_str().unwrap_or("").contains("PasswordAuthentication"),
+            denied["hint"]
+                .as_str()
+                .unwrap_or("")
+                .contains("PasswordAuthentication"),
             "permission-denied auth failure must carry the cloud-init hint: {denied}"
         );
 
         let refused = ssh_bootstrap_error_payload("ssh: connect to host x: Connection refused");
         assert_eq!(refused["error_code"], "SSH_CONNECTION_REFUSED");
-        assert!(refused.get("hint").is_none(), "no hint on non-auth failures");
+        assert!(
+            refused.get("hint").is_none(),
+            "no hint on non-auth failures"
+        );
 
         let timeout = ssh_bootstrap_error_payload("ssh: connect to host x: Connection timed out");
         assert_eq!(timeout["error_code"], "SSH_TIMEOUT");
@@ -32857,7 +32911,9 @@ blob:
             "la intencion se calcula antes de resolver, no despues"
         );
         assert!(
-            !body.contains("resolve_runtime_version(&manifest, &runtime_key, &node.runtime_version)"),
+            !body.contains(
+                "resolve_runtime_version(&manifest, &runtime_key, &node.runtime_version)"
+            ),
             "resolver la version CONCRETA guardada re-pinnea un nodo que sigue a current"
         );
     }
@@ -32918,10 +32974,11 @@ blob:
         // A spoke carries only its own, and must NOT be handed its siblings' folders.
         let spoke = dist_sync_folders_for_hive(&dist, &blob_root, HiveRole::Ingress, false);
         let spoke_ids: Vec<&str> = spoke.iter().map(|f| f.id.as_str()).collect();
-        assert!(spoke_ids
-            .contains(&format!("{SYNCTHING_FOLDER_DIST_CORE_PREFIX}ingress").as_str()));
+        assert!(spoke_ids.contains(&format!("{SYNCTHING_FOLDER_DIST_CORE_PREFIX}ingress").as_str()));
         assert!(
-            !spoke_ids.iter().any(|id| id.ends_with("worker") || id.ends_with("egress")),
+            !spoke_ids
+                .iter()
+                .any(|id| id.ends_with("worker") || id.ends_with("egress")),
             "a spoke must not be asked to settle another role's folder: {spoke_ids:?}"
         );
     }
@@ -32941,7 +32998,10 @@ blob:
             on_mb[0].path,
             PathBuf::from("/var/lib/fluxbee/dist/core/ingress")
         );
-        assert_eq!(on_spoke[0].path, PathBuf::from("/var/lib/fluxbee/dist/core"));
+        assert_eq!(
+            on_spoke[0].path,
+            PathBuf::from("/var/lib/fluxbee/dist/core")
+        );
     }
 
     /// REGRESION (U-7): motherbee no se sincroniza consigo misma, asi que NUNCA declara
@@ -36033,8 +36093,8 @@ blob:
             "IO.api@motherbee",
             "motherbee",
             Some("io.api"),
-            Some("0.1.2"),     // a lo que resolvio
-            Some("current"),   // lo que se pidio
+            Some("0.1.2"),   // a lo que resolvio
+            Some("current"), // lo que se pidio
             None,
             None,
             None,

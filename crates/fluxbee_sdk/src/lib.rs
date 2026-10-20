@@ -3,8 +3,8 @@ pub mod cloud;
 pub mod cognition;
 pub mod identity;
 pub mod logging;
-pub mod managed_node;
 pub mod managed_control_plane;
+pub mod managed_node;
 pub mod node_client;
 pub mod node_config;
 pub mod node_secret;
@@ -53,9 +53,8 @@ pub use identity::{
 pub use managed_node::{
     is_allowed_non_sy_lifecycle_node, is_root_tenant, managed_node_config_path,
     managed_node_config_path_with_root, managed_node_instance_dir,
-    managed_node_instance_dir_with_root, managed_node_name,
-    ManagedNodeError, DEFAULT_MANAGED_NODE_ROOT, FLUXBEE_NODE_NAME_ENV,
-    HIVE_YAML_NON_SY_LIFECYCLE_NODES,
+    managed_node_instance_dir_with_root, managed_node_name, ManagedNodeError,
+    DEFAULT_MANAGED_NODE_ROOT, FLUXBEE_NODE_NAME_ENV, HIVE_YAML_NON_SY_LIFECYCLE_NODES,
 };
 pub use node_client::{NodeConfig, NodeError, NodeUuidMode};
 pub use node_config::{
@@ -120,14 +119,15 @@ pub use usage::{
     USAGE_RAW_MAX_BYTES,
 };
 pub use vault::{
-    normalize_resource_type, vault_failure_is_transport, vault_key_is_valid, ResourceType, VaultCaller, VaultCallerOwned, VaultClient,
-    VaultDeleteResponse, VaultError, VaultFilter, VaultGetMetadataRequest,
-    VaultGetMetadataResponse, VaultGetRequest, VaultGetResponse, VaultKeyRequest, VaultListRequest, VaultScopedKeyRequest,
-    VaultListResponse, VaultMetadata, VaultPutRequest, VaultPutResponse, VaultRetryPolicy,
-    VaultAssignRequest, VaultRollbackResponse, VaultRotateRequest, VaultRotateResponse, VaultSecretSummary,
-    VaultValueResponse, VAULT_BOOT_RETRY_INTERVAL, VAULT_BOOT_WAIT, MSG_VAULT_DELETE, MSG_VAULT_DELETE_RESPONSE, MSG_VAULT_GET,
-    MSG_VAULT_GET_METADATA, MSG_VAULT_GET_METADATA_RESPONSE, MSG_VAULT_GET_RESPONSE,
+    normalize_resource_type, vault_failure_is_transport, vault_key_is_valid, ResourceType,
+    VaultAssignRequest, VaultCaller, VaultCallerOwned, VaultClient, VaultDeleteResponse,
+    VaultError, VaultFilter, VaultGetMetadataRequest, VaultGetMetadataResponse, VaultGetRequest,
+    VaultGetResponse, VaultKeyRequest, VaultListRequest, VaultListResponse, VaultMetadata,
+    VaultPutRequest, VaultPutResponse, VaultRetryPolicy, VaultRollbackResponse, VaultRotateRequest,
+    VaultRotateResponse, VaultScopedKeyRequest, VaultSecretSummary, VaultValueResponse,
+    MSG_VAULT_ASSIGN, MSG_VAULT_ASSIGN_RESPONSE, MSG_VAULT_DELETE, MSG_VAULT_DELETE_RESPONSE,
+    MSG_VAULT_GET, MSG_VAULT_GET_METADATA, MSG_VAULT_GET_METADATA_RESPONSE, MSG_VAULT_GET_RESPONSE,
     MSG_VAULT_LIST, MSG_VAULT_LIST_RESPONSE, MSG_VAULT_PUT, MSG_VAULT_PUT_RESPONSE,
-    MSG_VAULT_ASSIGN, MSG_VAULT_ASSIGN_RESPONSE, MSG_VAULT_ROLLBACK, MSG_VAULT_ROLLBACK_RESPONSE,
-    MSG_VAULT_ROTATE, MSG_VAULT_ROTATE_RESPONSE,
+    MSG_VAULT_ROLLBACK, MSG_VAULT_ROLLBACK_RESPONSE, MSG_VAULT_ROTATE, MSG_VAULT_ROTATE_RESPONSE,
+    VAULT_BOOT_RETRY_INTERVAL, VAULT_BOOT_WAIT,
 };

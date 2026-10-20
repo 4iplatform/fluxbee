@@ -341,7 +341,9 @@ fn write_json_atomic(path: &Path, content: &str) -> Result<(), ControlPlaneError
     std::fs::create_dir_all(parent)?;
     let tmp: PathBuf = parent.join(format!(
         ".{}.tmp.{}",
-        path.file_name().and_then(|s| s.to_str()).unwrap_or("config"),
+        path.file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("config"),
         std::process::id()
     ));
     std::fs::write(&tmp, content)?;
@@ -478,7 +480,9 @@ mod tests {
                 .filter(|v| !v.trim().is_empty())
                 .is_some();
             if !has_model {
-                return Err(ContractError::InvalidConfig("missing behavior.model".into()));
+                return Err(ContractError::InvalidConfig(
+                    "missing behavior.model".into(),
+                ));
             }
             let mut materialized = candidate.clone();
             if let Some(obj) = materialized.as_object_mut() {
@@ -643,7 +647,9 @@ mod tests {
             Some(&json!("ilk:abc"))
         );
         assert_eq!(
-            root_val.get("_system").and_then(|s| s.get("config_version")),
+            root_val
+                .get("_system")
+                .and_then(|s| s.get("config_version")),
             Some(&json!(2))
         );
         let st =

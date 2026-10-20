@@ -15,11 +15,12 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::any;
 use axum::Router;
 use fluxbee_sdk::protocol::{
-    Destination, Message, Meta, Routing, MSG_EDGE_CLOSE_URL, MSG_EDGE_CLOSE_URL_RESPONSE,
-    MSG_EDGE_LIST_URLS, MSG_EDGE_LIST_URLS_RESPONSE, MSG_EDGE_OPEN_URL, MSG_EDGE_OPEN_URL_RESPONSE,
+    is_system_kind, Destination, Message, Meta, Routing, VaultSecretChangedPayload, VaultSecretOp,
+    MSG_EDGE_CLOSE_URL, MSG_EDGE_CLOSE_URL_RESPONSE, MSG_EDGE_LIST_URLS,
+    MSG_EDGE_LIST_URLS_RESPONSE, MSG_EDGE_OPEN_URL, MSG_EDGE_OPEN_URL_RESPONSE,
     MSG_EDGE_PUBLISH_BLOB, MSG_EDGE_PUBLISH_BLOB_RESPONSE, MSG_EDGE_UNPUBLISH_BLOB,
-    is_system_kind, MSG_EDGE_UNPUBLISH_BLOB_RESPONSE, MSG_TTL_EXCEEDED, MSG_UNREACHABLE,
-    MSG_VAULT_SECRET_CHANGED, SYSTEM_KIND, VaultSecretChangedPayload, VaultSecretOp,
+    MSG_EDGE_UNPUBLISH_BLOB_RESPONSE, MSG_TTL_EXCEEDED, MSG_UNREACHABLE, MSG_VAULT_SECRET_CHANGED,
+    SYSTEM_KIND,
 };
 use fluxbee_sdk::{
     build_node_config_response_message, is_node_config_get_message, is_node_config_set_message,
@@ -381,7 +382,10 @@ async fn main() -> Result<(), SyEdgeError> {
                     if guard.len() == before {
                         continue; // nothing expired
                     }
-                    tracing::info!(removed = before - guard.len(), "sy-edge reaper: dropped expired public artifacts");
+                    tracing::info!(
+                        removed = before - guard.len(),
+                        "sy-edge reaper: dropped expired public artifacts"
+                    );
                     guard.clone()
                 };
                 if let Err(err) = persist_public_registry(&reaper_path, &snapshot) {
@@ -541,11 +545,9 @@ async fn main() -> Result<(), SyEdgeError> {
                                                     detail = %failure.detail(),
                                                     "sy-edge: TLS reload probe could not reach the vault; retrying"
                                                 );
-                                                tokio::time::sleep(
-                                                    std::time::Duration::from_secs(
-                                                        TLS_RELOAD_PROBE_BACKOFF_SECS,
-                                                    ),
-                                                )
+                                                tokio::time::sleep(std::time::Duration::from_secs(
+                                                    TLS_RELOAD_PROBE_BACKOFF_SECS,
+                                                ))
                                                 .await;
                                             }
                                         }
@@ -2137,10 +2139,9 @@ async fn fetch_tls_config_from_vault(
     let value = resp.value.ok_or_else(|| {
         TlsFetchFailure::material("vault returned no value for the edge tls secret")
     })?;
-    let cert = value
-        .get("cert")
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| TlsFetchFailure::material("edge tls secret is missing a 'cert' PEM field"))?;
+    let cert = value.get("cert").and_then(|v| v.as_str()).ok_or_else(|| {
+        TlsFetchFailure::material("edge tls secret is missing a 'cert' PEM field")
+    })?;
     let key = value
         .get("key")
         .and_then(|v| v.as_str())
@@ -2560,7 +2561,10 @@ async fn invoke(state: Arc<FrontendState>, ich: String, extra: String, req: Requ
             let params = parse_query_params(query);
             if params.get("hub.mode").map(String::as_str) == Some("subscribe") {
                 let want = entry.verify_token.as_deref().unwrap_or("");
-                let got = params.get("hub.verify_token").map(String::as_str).unwrap_or("");
+                let got = params
+                    .get("hub.verify_token")
+                    .map(String::as_str)
+                    .unwrap_or("");
                 let challenge = params.get("hub.challenge").cloned().unwrap_or_default();
                 if !want.is_empty() && constant_time_eq(want.as_bytes(), got.as_bytes()) {
                     return (
@@ -2571,7 +2575,11 @@ async fn invoke(state: Arc<FrontendState>, ich: String, extra: String, req: Requ
                         .into_response();
                 }
                 tracing::warn!(ich = %ich, "fanout webhook verify-token mismatch; rejecting challenge");
-                return http_error(StatusCode::FORBIDDEN, "FORBIDDEN", "webhook verify token mismatch");
+                return http_error(
+                    StatusCode::FORBIDDEN,
+                    "FORBIDDEN",
+                    "webhook verify token mismatch",
+                );
             }
         }
         // A GET that is not a verification challenge falls through to the method allowlist.
@@ -3000,7 +3008,10 @@ mod tests {
             "hub.mode=subscribe&hub.verify_token=my%20token&hub.challenge=12345",
         );
         assert_eq!(m.get("hub.mode").map(String::as_str), Some("subscribe"));
-        assert_eq!(m.get("hub.verify_token").map(String::as_str), Some("my token"));
+        assert_eq!(
+            m.get("hub.verify_token").map(String::as_str),
+            Some("my token")
+        );
         assert_eq!(m.get("hub.challenge").map(String::as_str), Some("12345"));
     }
 
@@ -3027,7 +3038,10 @@ mod tests {
             tls_secret_change_action(
                 &vault_changed("edge_tls", "put", 2),
                 Some("edge_tls"),
-                LiveTlsMaterial::FromVault { version: Some(1), fingerprint: Some("fp1".into()) },
+                LiveTlsMaterial::FromVault {
+                    version: Some(1),
+                    fingerprint: Some("fp1".into())
+                },
                 false,
             ),
             TlsSecretChange::ReloadRequired {
@@ -3041,7 +3055,10 @@ mod tests {
                 tls_secret_change_action(
                     &vault_changed("edge_tls", op, 3),
                     Some("edge_tls"),
-                    LiveTlsMaterial::FromVault { version: Some(1), fingerprint: Some("fp1".into()) },
+                    LiveTlsMaterial::FromVault {
+                        version: Some(1),
+                        fingerprint: Some("fp1".into())
+                    },
                     false,
                 ),
                 TlsSecretChange::ReloadRequired { .. }
@@ -3074,7 +3091,10 @@ mod tests {
             tls_secret_change_action(
                 &vault_changed("edge_tls", "delete", 0),
                 Some("edge_tls"),
-                LiveTlsMaterial::FromVault { version: Some(1), fingerprint: Some("fp1".into()) },
+                LiveTlsMaterial::FromVault {
+                    version: Some(1),
+                    fingerprint: Some("fp1".into())
+                },
                 false,
             ),
             TlsSecretChange::DeletedKeepServing {
@@ -3091,7 +3111,10 @@ mod tests {
             tls_secret_change_action(
                 &vault_changed("pg_main", "put", 7),
                 Some("edge_tls"),
-                LiveTlsMaterial::FromVault { version: Some(1), fingerprint: Some("fp1".into()) },
+                LiveTlsMaterial::FromVault {
+                    version: Some(1),
+                    fingerprint: Some("fp1".into())
+                },
                 false,
             ),
             TlsSecretChange::Unrelated
@@ -3218,10 +3241,7 @@ mod tests {
             parsed: 1,
         };
         assert!(!leaf_only.truncated() && leaf_only.leaf_only());
-        assert!(leaf_only
-            .complaint()
-            .unwrap()
-            .contains("NO INTERMEDIATES"));
+        assert!(leaf_only.complaint().unwrap().contains("NO INTERMEDIATES"));
     }
 
     /// Pins the EMPIRICAL premise the whole PB-2 design rests on, with real certificates:
@@ -3238,7 +3258,10 @@ mod tests {
         let (_, diagnosis) =
             tls_config_from_pem(clean.as_bytes(), leaf.key_pem.as_bytes()).expect("clean loads");
         assert_eq!(diagnosis.markers, 2);
-        assert_eq!(diagnosis.parsed, 2, "a well-formed 2-cert chain parses fully");
+        assert_eq!(
+            diagnosis.parsed, 2,
+            "a well-formed 2-cert chain parses fully"
+        );
         assert!(!diagnosis.truncated());
 
         // The operator's actual file: END glued to the next BEGIN, no newline between.
@@ -3338,7 +3361,10 @@ mod tests {
             tls_secret_change_action(
                 &serde_json::json!({"op": "put"}),
                 Some("edge_tls"),
-                LiveTlsMaterial::FromVault { version: Some(1), fingerprint: Some("fp1".into()) },
+                LiveTlsMaterial::FromVault {
+                    version: Some(1),
+                    fingerprint: Some("fp1".into())
+                },
                 false,
             ),
             TlsSecretChange::Malformed { .. }

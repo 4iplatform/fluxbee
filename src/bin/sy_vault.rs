@@ -11,8 +11,8 @@ use aes_gcm::{Aes256Gcm, Nonce};
 use chrono::Utc;
 use fluxbee_sdk::identity::list_ilks_from_hive_config;
 use fluxbee_sdk::protocol::{
-    Destination, Message, Meta, Routing, VaultSecretChangedPayload, VaultSecretOp,
-    is_system_kind, MSG_VAULT_SECRET_CHANGED, SCOPE_GLOBAL, SYSTEM_KIND, VAULT_BOOTSTRAP_ACTION,
+    is_system_kind, Destination, Message, Meta, Routing, VaultSecretChangedPayload, VaultSecretOp,
+    MSG_VAULT_SECRET_CHANGED, SCOPE_GLOBAL, SYSTEM_KIND, VAULT_BOOTSTRAP_ACTION,
 };
 use fluxbee_sdk::{
     try_handle_default_node_status, NodeConfig, NodeSender, NodeUuidMode, OperationalRouteProfile,
@@ -2680,7 +2680,11 @@ mod tests {
     }
 
     fn admin_caller() -> Caller {
-        caller(Some("ilk:admin"), Some(fluxbee_sdk::DEFAULT_ROOT_TENANT_ID), Some("system"))
+        caller(
+            Some("ilk:admin"),
+            Some(fluxbee_sdk::DEFAULT_ROOT_TENANT_ID),
+            Some("system"),
+        )
     }
 
     #[test]
@@ -2695,21 +2699,24 @@ mod tests {
             assert!(validate_key(k).is_ok(), "{k} should be valid");
         }
         for bad in [
-            "",            // empty
-            "Key",         // uppercase prefix
-            ":leading",    // symbol prefix
-            "-leading",    // symbol prefix
-            "has space",   // space
-            "UPPER",       // uppercase
-            "slash/here",  // '/' not allowed (this is why ssh:<id> is used, not ssh/<id>)
-            "dot.here",    // '.' not allowed
+            "",           // empty
+            "Key",        // uppercase prefix
+            ":leading",   // symbol prefix
+            "-leading",   // symbol prefix
+            "has space",  // space
+            "UPPER",      // uppercase
+            "slash/here", // '/' not allowed (this is why ssh:<id> is used, not ssh/<id>)
+            "dot.here",   // '.' not allowed
         ] {
             assert!(
                 matches!(validate_key(bad), Err(VaultError::InvalidRequest(_))),
                 "{bad:?} should be rejected"
             );
         }
-        assert!(validate_key(&"a".repeat(257)).is_err(), "over-256 key rejected");
+        assert!(
+            validate_key(&"a".repeat(257)).is_err(),
+            "over-256 key rejected"
+        );
     }
 
     #[test]
@@ -2751,7 +2758,12 @@ mod tests {
         let c = admin_caller();
         let value = json!({"api_key":"sk-test"});
         let (version, changed) = store
-            .put("pg:root:pool", value.clone(), metadata("tnt:root", None), &c)
+            .put(
+                "pg:root:pool",
+                value.clone(),
+                metadata("tnt:root", None),
+                &c,
+            )
             .expect("put");
         assert_eq!(version, 1);
         assert!(changed, "first put is a change");
@@ -2774,7 +2786,12 @@ mod tests {
         let (mut store, dir) = open_test_store([3u8; 32]);
         let c = admin_caller();
         store
-            .put("pg:root:pool", json!({"v":1}), metadata("tnt:root", None), &c)
+            .put(
+                "pg:root:pool",
+                json!({"v":1}),
+                metadata("tnt:root", None),
+                &c,
+            )
             .expect("put v1");
         let res = store
             .rotate("pg:root:pool", json!({"v":2}), &c)
@@ -2790,7 +2807,9 @@ mod tests {
             "current is the rotated value"
         );
         let pn = rec.previous_nonce.expect("previous nonce retained");
-        let pc = rec.previous_ciphertext.expect("previous ciphertext retained");
+        let pc = rec
+            .previous_ciphertext
+            .expect("previous ciphertext retained");
         assert_eq!(
             store.decrypt_value(&pn, &pc).unwrap(),
             json!({"v":1}),
@@ -2804,7 +2823,12 @@ mod tests {
         let (mut store, dir) = open_test_store([4u8; 32]);
         let c = admin_caller();
         store
-            .put("pg:root:pool", json!({"v":1}), metadata("tnt:root", None), &c)
+            .put(
+                "pg:root:pool",
+                json!({"v":1}),
+                metadata("tnt:root", None),
+                &c,
+            )
             .expect("put v1");
         // No previous version yet -> rollback is rejected, not a silent no-op.
         assert!(matches!(
@@ -2815,7 +2839,10 @@ mod tests {
             .rotate("pg:root:pool", json!({"v":2}), &c)
             .expect("rotate to v2");
         let rb = store.rollback("pg:root:pool", &c).expect("rollback");
-        assert_eq!(rb.current_version, 1, "rollback restores the previous version number");
+        assert_eq!(
+            rb.current_version, 1,
+            "rollback restores the previous version number"
+        );
         let rec = store.get_record("pg:root:pool").unwrap().unwrap();
         assert_eq!(
             store
@@ -2900,7 +2927,12 @@ mod tests {
         let (mut store, dir) = open_test_store([5u8; 32]);
         let c = admin_caller();
         store
-            .put("pg:root:pool", json!({"v":1}), metadata("tnt:root", None), &c)
+            .put(
+                "pg:root:pool",
+                json!({"v":1}),
+                metadata("tnt:root", None),
+                &c,
+            )
             .expect("put");
         store
             .rotate("pg:root:pool", json!({"v":2}), &c)
@@ -2913,7 +2945,10 @@ mod tests {
                 |row| row.get(0),
             )
             .expect("count audit rows");
-        assert_eq!(success_rows, 2, "put + rotate each write a success audit row");
+        assert_eq!(
+            success_rows, 2,
+            "put + rotate each write a success audit row"
+        );
         let recorded_ilk: Option<String> = store
             .conn
             .query_row(
@@ -2933,13 +2968,24 @@ mod tests {
         let (mut store, dir) = open_test_store([8u8; 32]);
         // Force a write so the -wal/-shm sidecars exist and get tightened too.
         store
-            .put("pg:root:pool", json!({"v":1}), metadata("tnt:root", None), &admin_caller())
+            .put(
+                "pg:root:pool",
+                json!({"v":1}),
+                metadata("tnt:root", None),
+                &admin_caller(),
+            )
             .expect("put");
         for suffix in ["", "-wal", "-shm"] {
             let path = dir.join(format!("vault.db{suffix}"));
             if path.exists() {
                 let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
-                assert_eq!(mode, 0o600, "{} must be 0600, got {:o}", path.display(), mode);
+                assert_eq!(
+                    mode,
+                    0o600,
+                    "{} must be 0600, got {:o}",
+                    path.display(),
+                    mode
+                );
             }
         }
         cleanup(dir);
@@ -2978,15 +3024,35 @@ mod tests {
         };
 
         store
-            .put("pg:root:pool-a", json!({"which":"a"}), metadata("tnt:root", None), &c)
+            .put(
+                "pg:root:pool-a",
+                json!({"which":"a"}),
+                metadata("tnt:root", None),
+                &c,
+            )
             .expect("put a");
         store
-            .put("pg:root:pool-b", json!({"which":"b"}), metadata("tnt:root", None), &c)
+            .put(
+                "pg:root:pool-b",
+                json!({"which":"b"}),
+                metadata("tnt:root", None),
+                &c,
+            )
             .expect("put b");
         // pool-a created+written older, pool-b newer. pool-b is alphabetically AFTER pool-a,
         // so ORDER BY key would wrongly return pool-a.
-        set_times(&store, "pg:root:pool-a", "2020-01-01T00:00:00+00:00", "2020-01-01T00:00:00+00:00");
-        set_times(&store, "pg:root:pool-b", "2026-07-21T00:00:00+00:00", "2026-07-21T00:00:00+00:00");
+        set_times(
+            &store,
+            "pg:root:pool-a",
+            "2020-01-01T00:00:00+00:00",
+            "2020-01-01T00:00:00+00:00",
+        );
+        set_times(
+            &store,
+            "pg:root:pool-b",
+            "2026-07-21T00:00:00+00:00",
+            "2026-07-21T00:00:00+00:00",
+        );
         assert_eq!(
             first_key(&store).as_deref(),
             Some("pg:root:pool-b"),
@@ -2997,9 +3063,19 @@ mod tests {
         // Pin it explicitly to the newest time; most-recently-WRITTEN (pool-a) must now win even
         // though it was created FIRST — this is the created_at-vs-updated_at distinction.
         store
-            .put("pg:root:pool-a", json!({"which":"a2"}), metadata("tnt:root", None), &c)
+            .put(
+                "pg:root:pool-a",
+                json!({"which":"a2"}),
+                metadata("tnt:root", None),
+                &c,
+            )
             .expect("re-put a");
-        set_times(&store, "pg:root:pool-a", "2020-01-01T00:00:00+00:00", "2027-01-01T00:00:00+00:00");
+        set_times(
+            &store,
+            "pg:root:pool-a",
+            "2020-01-01T00:00:00+00:00",
+            "2027-01-01T00:00:00+00:00",
+        );
         assert_eq!(
             first_key(&store).as_deref(),
             Some("pg:root:pool-a"),

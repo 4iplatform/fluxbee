@@ -196,7 +196,9 @@ mod tests {
         }
         // Y si alguien manda uno igual, se descarta al materializar (no se propaga).
         let out = IoCloudAdapterConfigContract
-            .validate_and_materialize(&json!({"io": {"edge_node": "SY.edge@ingress1", "secret": "x"}}))
+            .validate_and_materialize(
+                &json!({"io": {"edge_node": "SY.edge@ingress1", "secret": "x"}}),
+            )
             .expect("valido");
         assert!(
             out.get("io").and_then(|io| io.get("secret")).is_none(),

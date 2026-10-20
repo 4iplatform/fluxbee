@@ -236,12 +236,8 @@ pub async fn gate_then_forward(
         // provisionarse, y eso ya se loguea en el camino de identidad.
         return;
     };
-    let status = sender_registration_status(
-        hive_id,
-        channel_type,
-        address,
-        tenant_id.unwrap_or(""),
-    );
+    let status =
+        sender_registration_status(hive_id, channel_type, address, tenant_id.unwrap_or(""));
     if !gate_required(status.as_deref()) {
         return;
     }
@@ -281,7 +277,10 @@ mod tests {
     #[test]
     fn la_compuerta_viene_apagada() {
         let cfg = FrontdeskGateConfig::default();
-        assert!(!cfg.enabled, "encenderla cambia un hive vivo: default = apagada");
+        assert!(
+            !cfg.enabled,
+            "encenderla cambia un hive vivo: default = apagada"
+        );
         assert_eq!(cfg.target, DEFAULT_FRONTDESK_TARGET);
 
         // Config sin la seccion => apagada.
@@ -317,7 +316,10 @@ mod tests {
         assert!(gate_required(Some("temporary")));
         assert!(gate_required(Some("partial")));
         assert!(!gate_required(Some("complete")));
-        assert!(!gate_required(Some("COMPLETE")), "el status es case-insensitive");
+        assert!(
+            !gate_required(Some("COMPLETE")),
+            "el status es case-insensitive"
+        );
 
         // No saber NO frena el canal.
         assert!(!gate_required(None));
@@ -353,7 +355,10 @@ mod tests {
         assert_eq!(parsed.operation, FRONTDESK_OPERATION_REGISTER);
         assert_eq!(parsed.tenant_id.as_deref(), Some("tnt:1111"));
         let attrs = parsed.subject.attributes.expect("attributes");
-        assert_eq!(attrs.get("channel_type").and_then(Value::as_str), Some("slack"));
+        assert_eq!(
+            attrs.get("channel_type").and_then(Value::as_str),
+            Some("slack")
+        );
         assert!(attrs
             .get("address")
             .and_then(Value::as_str)

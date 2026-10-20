@@ -3627,24 +3627,34 @@ impl FunctionTool for PublishHtmlTool {
         // Write bytes into the local blob store (staging -> active), mirroring
         // materialize_user_artifacts exactly so there is no divergence. Backend errors can carry
         // filesystem paths, so they are LOGGED, never handed to the model — it gets a coarse reason.
-        let blob = match fluxbee_sdk::blob::BlobToolkit::new(fluxbee_sdk::blob::BlobConfig::default())
-        {
+        let blob = match fluxbee_sdk::blob::BlobToolkit::new(
+            fluxbee_sdk::blob::BlobConfig::default(),
+        ) {
             Ok(blob) => blob,
             Err(err) => {
                 tracing::warn!(tool = "publish_html_page", error = %err, "blob store unavailable");
-                return Ok(publish_tool_error("could not open the local blob store", true));
+                return Ok(publish_tool_error(
+                    "could not open the local blob store",
+                    true,
+                ));
             }
         };
         let blob_ref = match blob.put_bytes(&artifact.bytes, &artifact.filename, &artifact.mime) {
             Ok(blob_ref) => blob_ref,
             Err(err) => {
                 tracing::warn!(tool = "publish_html_page", error = %err, "blob write failed");
-                return Ok(publish_tool_error("could not store the page for publishing", true));
+                return Ok(publish_tool_error(
+                    "could not store the page for publishing",
+                    true,
+                ));
             }
         };
         if let Err(err) = blob.promote(&blob_ref) {
             tracing::warn!(tool = "publish_html_page", error = %err, "blob promote failed");
-            return Ok(publish_tool_error("could not store the page for publishing", true));
+            return Ok(publish_tool_error(
+                "could not store the page for publishing",
+                true,
+            ));
         }
         // Publish via SY.admin over the mesh socket. Admin resolves THIS node's tenant from its
         // router-stamped identity (never asserted here), curates the bytes, and pushes the edge row.
@@ -3714,7 +3724,10 @@ impl FunctionTool for PublishHtmlTool {
             }
             Err(err) => {
                 tracing::warn!(tool = "publish_html_page", error = %err, target = %admin_target, "publish request failed");
-                Ok(publish_tool_error("could not reach the publishing service", true))
+                Ok(publish_tool_error(
+                    "could not reach the publishing service",
+                    true,
+                ))
             }
         }
     }
@@ -4274,16 +4287,20 @@ fn parse_runner_args() -> Result<BootstrapArgs, Box<dyn std::error::Error + Send
 fn bootstrap_node_from_args(
     args: &BootstrapArgs,
 ) -> Result<NodeSection, Box<dyn std::error::Error + Send + Sync>> {
-    let name = args.node_name.clone().or_else(|| {
-        let resolved = managed_node_name("", &["AI_NODE_NAME", "NODE_NAME"]);
-        if resolved.trim().is_empty() {
-            None
-        } else {
-            Some(resolved)
-        }
-    }).ok_or_else(|| {
-        "pass --node-name, or set FLUXBEE_NODE_NAME (or AI_NODE_NAME)".to_string()
-    })?;
+    let name = args
+        .node_name
+        .clone()
+        .or_else(|| {
+            let resolved = managed_node_name("", &["AI_NODE_NAME", "NODE_NAME"]);
+            if resolved.trim().is_empty() {
+                None
+            } else {
+                Some(resolved)
+            }
+        })
+        .ok_or_else(|| {
+            "pass --node-name, or set FLUXBEE_NODE_NAME (or AI_NODE_NAME)".to_string()
+        })?;
     Ok(NodeSection {
         name,
         version: args
@@ -4781,12 +4798,7 @@ fn ai_final_output_error_payload(err: &fluxbee_ai_sdk::errors::AiSdkError) -> Va
 fn parse_openai_status_error(message: &str) -> Option<(u16, String)> {
     let idx = message.find("error status=")?;
     let after = &message[idx + "error status=".len()..];
-    let status = after
-        .split([' ', ','])
-        .next()?
-        .trim()
-        .parse::<u16>()
-        .ok()?;
+    let status = after.split([' ', ',']).next()?.trim().parse::<u16>().ok()?;
     let detail = after
         .split_once("message=")
         .map(|(_, msg)| msg.trim().to_string())
@@ -5141,11 +5153,19 @@ mod tests {
         assert!(validate_managed_base_url(&Some("https://api.anthropic.com".into())).is_ok());
         assert!(validate_managed_base_url(&Some("http://api.openai.com".into())).is_err()); // not https
         assert!(validate_managed_base_url(&Some("https://attacker.example/v1".into())).is_err());
-        assert!(validate_managed_base_url(&Some("https://api.openai.com.evil.com".into())).is_err());
+        assert!(
+            validate_managed_base_url(&Some("https://api.openai.com.evil.com".into())).is_err()
+        );
         // userinfo bypass attempts (the real host is the attacker) MUST be rejected:
-        assert!(validate_managed_base_url(&Some("https://api.openai.com:x@evil.com/v1".into())).is_err());
-        assert!(validate_managed_base_url(&Some("https://api.openai.com@evil.com".into())).is_err());
-        assert!(validate_managed_base_url(&Some("https://api.openai.com:443".into())).is_ok()); // explicit port OK
+        assert!(
+            validate_managed_base_url(&Some("https://api.openai.com:x@evil.com/v1".into()))
+                .is_err()
+        );
+        assert!(
+            validate_managed_base_url(&Some("https://api.openai.com@evil.com".into())).is_err()
+        );
+        assert!(validate_managed_base_url(&Some("https://api.openai.com:443".into())).is_ok());
+        // explicit port OK
     }
 
     #[test]
@@ -5174,7 +5194,10 @@ mod tests {
         assert_eq!(param, "input[0].content[1].file_data");
         assert!(is_openai_attachment_param(&param));
         // Empty param -> None; no param field -> None.
-        assert!(extract_openai_error_param("openai error status=401 type=x param= message=nope").is_none());
+        assert!(
+            extract_openai_error_param("openai error status=401 type=x param= message=nope")
+                .is_none()
+        );
         assert!(extract_openai_error_param("anthropic error status=429 message=slow").is_none());
     }
     use tokio::sync::RwLock;

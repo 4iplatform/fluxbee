@@ -227,9 +227,15 @@ mod tests {
 
     #[test]
     fn op_lookup_matches_the_table() {
-        assert_eq!(admin_action_for_cloud_op("create_tenant"), Some("create_tenant"));
+        assert_eq!(
+            admin_action_for_cloud_op("create_tenant"),
+            Some("create_tenant")
+        );
         assert_eq!(admin_action_for_cloud_op("put_token"), Some("vault_put"));
-        assert_eq!(admin_action_for_cloud_op("provision_node"), Some("run_node"));
+        assert_eq!(
+            admin_action_for_cloud_op("provision_node"),
+            Some("run_node")
+        );
         assert_eq!(admin_action_for_cloud_op("list_tokens"), Some("vault_list"));
         assert_eq!(
             admin_action_for_cloud_op("delete_token"),
@@ -247,7 +253,10 @@ mod tests {
             admin_action_for_cloud_op("assign_token"),
             Some("vault_assign")
         );
-        assert_eq!(admin_action_for_cloud_op("list_nodes"), Some("list_tenant_nodes"));
+        assert_eq!(
+            admin_action_for_cloud_op("list_nodes"),
+            Some("list_tenant_nodes")
+        );
         assert_eq!(admin_action_for_cloud_op("stop_node"), Some("kill_node"));
         assert_eq!(admin_action_for_cloud_op("delete_node"), Some("kill_node"));
         assert_eq!(
@@ -273,7 +282,10 @@ mod tests {
             );
         }
         for (relay_op, _) in CLOUD_OP_ACTIONS {
-            assert!(!is_cloud_local_op(relay_op), "relay op {relay_op} must not be local");
+            assert!(
+                !is_cloud_local_op(relay_op),
+                "relay op {relay_op} must not be local"
+            );
         }
     }
 
@@ -287,10 +299,16 @@ mod tests {
             .map(|e| e.get("op").and_then(|v| v.as_str()).unwrap())
             .collect();
         for (relay_op, _) in CLOUD_OP_ACTIONS {
-            assert!(ops.contains(relay_op), "catalog missing relay op {relay_op}");
+            assert!(
+                ops.contains(relay_op),
+                "catalog missing relay op {relay_op}"
+            );
         }
         for local_op in CLOUD_LOCAL_OPS {
-            assert!(ops.contains(local_op), "catalog missing local op {local_op}");
+            assert!(
+                ops.contains(local_op),
+                "catalog missing local op {local_op}"
+            );
         }
         // Reverse (no drift / mis-category): every catalog row is a KNOWN op in exactly one set, and
         // its "category" matches that set. Catches a hand-edited catalog with a bogus/mis-tagged op.
@@ -299,7 +317,10 @@ mod tests {
             let category = entry.get("category").and_then(|v| v.as_str()).unwrap();
             let is_relay = admin_action_for_cloud_op(op).is_some();
             let is_local = is_cloud_local_op(op);
-            assert!(is_relay ^ is_local, "catalog op {op} must be exactly one of relay|local");
+            assert!(
+                is_relay ^ is_local,
+                "catalog op {op} must be exactly one of relay|local"
+            );
             assert_eq!(
                 category,
                 if is_local { "local" } else { "relay" },

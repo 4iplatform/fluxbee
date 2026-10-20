@@ -316,7 +316,11 @@ mod tests {
             payload: json!({}),
         };
         // gap-1: an error reply is distinguishable at the msg-name level.
-        let err_reply = build_reply_message(&request, "uuid", json!({"type":"error","error":{"code":"x"}}));
+        let err_reply = build_reply_message(
+            &request,
+            "uuid",
+            json!({"type":"error","error":{"code":"x"}}),
+        );
         assert_eq!(err_reply.meta.msg.as_deref(), Some("ask.error"));
         // a successful reply keeps the request msg-name so the WF's await still matches it.
         let ok_reply = build_reply_message(&request, "uuid", json!({"type":"text","text":"hi"}));

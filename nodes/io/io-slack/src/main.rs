@@ -34,9 +34,7 @@ use io_common::io_control_plane_logging::{
 use io_common::io_control_plane_metrics::IoControlPlaneMetrics;
 use io_common::io_control_plane_store::persist_io_control_plane_state;
 use io_common::io_slack_adapter_config::IoSlackAdapterConfigContract;
-use io_common::provision::{
-    ensure_own_ich, FluxbeeIdentityProvisioner, IdentityProvisionConfig,
-};
+use io_common::provision::{ensure_own_ich, FluxbeeIdentityProvisioner, IdentityProvisionConfig};
 use io_common::relay::{
     AssembledTurn, InMemoryRelayStore, RelayBuffer, RelayDecision, RelayFlushHints, RelayFragment,
     RelayPolicy,
@@ -140,19 +138,18 @@ async fn main() -> Result<()> {
     let boot_state =
         bootstrap_io_control_plane_state(&config.node_name, &IoSlackAdapterConfigContract)
             .unwrap_or_else(|err| {
-            tracing::warn!(
-                error = %err,
-                node_name = %config.node_name,
-                "failed to bootstrap IO control-plane state; using UNCONFIGURED"
-            );
-            IoControlPlaneState::default()
-        });
+                tracing::warn!(
+                    error = %err,
+                    node_name = %config.node_name,
+                    "failed to bootstrap IO control-plane state; using UNCONFIGURED"
+                );
+                IoControlPlaneState::default()
+            });
     // dst_node from the VALIDATED effective config (io-api pattern); absence -> None ->
     // Destination::Resolve. No "resolve" literal (a bogus unicast target).
-    inbound
-        .lock()
-        .await
-        .set_dst_node(extract_runtime_dst_node(boot_state.effective_config.as_ref()));
+    inbound.lock().await.set_dst_node(extract_runtime_dst_node(
+        boot_state.effective_config.as_ref(),
+    ));
 
     // Credentials live in SY.vault (family vault_ref pattern); config carries only slack.auth.key, so
     // Configured/FAILED_CONFIG is a pure function of config STRUCTURAL validity (already decided by the
@@ -176,9 +173,13 @@ async fn main() -> Result<()> {
                     slack.reload_credentials(app_token, bot_token).await;
                     tracing::info!(node_name = %config.node_name, vault_key = %key, "io-slack credentials loaded from vault");
                 }
-                SlackVaultResolution::Absent | SlackVaultResolution::Transient => tracing::warn!(node_name = %config.node_name, vault_key = %key, "io-slack vault credentials not ready; running degraded (refresh loop will retry)"),
+                SlackVaultResolution::Absent | SlackVaultResolution::Transient => {
+                    tracing::warn!(node_name = %config.node_name, vault_key = %key, "io-slack vault credentials not ready; running degraded (refresh loop will retry)")
+                }
             },
-            None => tracing::warn!(node_name = %config.node_name, "no slack.auth.key in effective config; running degraded until configured"),
+            None => {
+                tracing::warn!(node_name = %config.node_name, "no slack.auth.key in effective config; running degraded until configured")
+            }
         }
     } else {
         tracing::warn!(node_name = %config.node_name, "FLUXBEE_NODE_ILK_ID / hive suffix missing; vault lookup skipped");
@@ -399,11 +400,7 @@ impl Config {
         let workspace_id = env("IO_SLACK_WORKSPACE_ID").or_else(|| {
             json_get_string_opt(
                 spawn_doc,
-                &[
-                    "config.io.workspace_id",
-                    "io.workspace_id",
-                    "workspace_id",
-                ],
+                &["config.io.workspace_id", "io.workspace_id", "workspace_id"],
             )
         });
         let conversation_id = env("IO_SLACK_CONVERSATION_ID").or_else(|| {
@@ -739,9 +736,7 @@ async fn resolve_slack_credentials_from_vault(
                 .as_ref()
                 .and_then(extract_slack_tokens_from_vault_value)
             {
-                Some((app_token, bot_token)) => {
-                    SlackVaultResolution::Found(app_token, bot_token)
-                }
+                Some((app_token, bot_token)) => SlackVaultResolution::Found(app_token, bot_token),
                 None => {
                     tracing::warn!(
                         vault_key = %key,
@@ -816,7 +811,9 @@ fn classify_slack_inbound(
                 Some(_) => Ok(()),
                 // FAIL CLOSED. Relaying while we cannot tell our own messages apart is exactly the
                 // echo loop these guards exist to prevent.
-                None => Err("cannot resolve our own bot user id, so a self-post cannot be ruled out"),
+                None => {
+                    Err("cannot resolve our own bot user id, so a self-post cannot be ruled out")
+                }
             }
         }
         _ => Err("not a message or a mention"),
@@ -878,7 +875,8 @@ async fn run_slack_vault_refresh_loop(
     control_plane: Arc<RwLock<IoControlPlaneState>>,
     vault_change_notify: Arc<Notify>,
 ) {
-    let mut ticker = tokio::time::interval(Duration::from_secs(IO_SLACK_VAULT_REFRESH_INTERVAL_SECS));
+    let mut ticker =
+        tokio::time::interval(Duration::from_secs(IO_SLACK_VAULT_REFRESH_INTERVAL_SECS));
     ticker.tick().await; // skip first immediate tick
     loop {
         tokio::select! {
@@ -889,7 +887,8 @@ async fn run_slack_vault_refresh_loop(
         }
         // Read the CURRENT vault key from the live control plane, so a CONFIG_SET that changes
         // slack.auth.key is honored without a restart, and post-boot vault_put / rotations flow in.
-        let Some(key) = slack_vault_key(control_plane.read().await.effective_config.as_ref()) else {
+        let Some(key) = slack_vault_key(control_plane.read().await.effective_config.as_ref())
+        else {
             tracing::debug!(
                 node_name = %node_name,
                 "no slack.auth.key in effective config; vault refresh skipped"
@@ -1843,7 +1842,9 @@ async fn ensure_io_slack_binding_ich_registered(
     let self_tenant_id = self_tenant_id
         .map(str::trim)
         .filter(|value| !value.is_empty())
-        .ok_or_else(|| anyhow::anyhow!("missing self_tenant_id for IO.slack own ICH registration"))?;
+        .ok_or_else(|| {
+            anyhow::anyhow!("missing self_tenant_id for IO.slack own ICH registration")
+        })?;
     let result = ensure_own_ich(
         dispatcher,
         identity_provision_cfg,
@@ -2236,22 +2237,23 @@ async fn collect_slack_blob_attachments(
     }
 
     out
-
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
         build_system_reply, classify_slack_inbound, default_slack_allowed_mimes,
-        extract_slack_tokens_from_vault_value, is_control_plane_msg_type,
-        extract_runtime_relay_config, parse_retry_after, slack_relay_policy_from_config,
+        extract_runtime_relay_config, extract_slack_tokens_from_vault_value,
+        is_control_plane_msg_type, parse_retry_after, slack_relay_policy_from_config,
         slack_vault_key, vault_change_is_slack, SlackClients, SlackRelayConfig, SlackRuntimeState,
     };
     use std::time::Duration;
 
     #[test]
     fn vault_change_is_slack_matches_only_the_slack_resource() {
-        assert!(vault_change_is_slack(&json!({"resource_type":"slack","op":"put"})));
+        assert!(vault_change_is_slack(
+            &json!({"resource_type":"slack","op":"put"})
+        ));
         assert!(vault_change_is_slack(&json!({"resource_type":"Slack"}))); // case-insensitive
         assert!(!vault_change_is_slack(&json!({"resource_type":"openai"})));
         assert!(!vault_change_is_slack(&json!({"op":"put"}))); // no resource_type
@@ -2277,10 +2279,15 @@ mod tests {
 
     #[test]
     fn extract_slack_tokens_requires_object_with_both_fields() {
-        let ok = extract_slack_tokens_from_vault_value(&json!({"app_token":"xapp-1","bot_token":"xoxb-2"}));
+        let ok = extract_slack_tokens_from_vault_value(
+            &json!({"app_token":"xapp-1","bot_token":"xoxb-2"}),
+        );
         assert_eq!(ok, Some(("xapp-1".to_string(), "xoxb-2".to_string())));
         // bare strings are ambiguous -> rejected
-        assert_eq!(extract_slack_tokens_from_vault_value(&json!("xapp-1")), None);
+        assert_eq!(
+            extract_slack_tokens_from_vault_value(&json!("xapp-1")),
+            None
+        );
         // a missing / blank half is not usable
         assert_eq!(
             extract_slack_tokens_from_vault_value(&json!({"app_token":"xapp-1"})),
@@ -2307,7 +2314,10 @@ mod tests {
         assert_eq!(parse_retry_after(&h), Duration::from_secs(30));
         // garbage / HTTP-date form -> 1s floor (we only accept integer seconds)
         let mut h = HeaderMap::new();
-        h.insert(RETRY_AFTER, HeaderValue::from_static("Wed, 21 Oct 2015 07:28:00 GMT"));
+        h.insert(
+            RETRY_AFTER,
+            HeaderValue::from_static("Wed, 21 Oct 2015 07:28:00 GMT"),
+        );
         assert_eq!(parse_retry_after(&h), Duration::from_secs(1));
     }
 
@@ -2568,7 +2578,6 @@ mod tests {
         assert!(!is_control_plane_msg_type("data"));
     }
 
-
     /// Las guardas anti-eco. Es la parte que no puede estar mal: si el nodo relaya sus propios
     /// posts, lo que el mesh conteste se vuelve a postear, y eso es un bucle dentro del Slack de
     /// un cliente.
@@ -2602,7 +2611,6 @@ mod tests {
         let otro = serde_json::json!({"type":"reaction_added"});
         assert!(classify_slack_inbound(&otro, "reaction_added", Some(me)).is_err());
     }
-
 }
 
 fn attach_slack_raw_stub(
@@ -3174,10 +3182,18 @@ async fn apply_io_config_set(
             apply_hot.push("io.dst_node".to_string());
         }
     }
-    if section_changed(previous_effective.as_ref(), &effective, &["io", "workspace_id"]) {
+    if section_changed(
+        previous_effective.as_ref(),
+        &effective,
+        &["io", "workspace_id"],
+    ) {
         apply_hot.push("io.workspace_id".to_string());
     }
-    if section_changed(previous_effective.as_ref(), &effective, &["io", "conversation_id"]) {
+    if section_changed(
+        previous_effective.as_ref(),
+        &effective,
+        &["io", "conversation_id"],
+    ) {
         apply_hot.push("io.conversation_id".to_string());
     }
 

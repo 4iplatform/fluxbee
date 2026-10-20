@@ -823,12 +823,14 @@ mod tests {
         assert_eq!(global.hive, None);
         assert!(global.addressed_to("motherbee"));
         assert!(global.addressed_to("worker1"));
-        assert!(serde_json::to_value(&global).expect("encode").get("hive").is_none());
+        assert!(serde_json::to_value(&global)
+            .expect("encode")
+            .get("hive")
+            .is_none());
 
-        let scoped: ConfigChangedPayload = serde_json::from_value(
-            json!({"subsystem": "routes", "version": 3, "hive": "worker1"}),
-        )
-        .expect("parse");
+        let scoped: ConfigChangedPayload =
+            serde_json::from_value(json!({"subsystem": "routes", "version": 3, "hive": "worker1"}))
+                .expect("parse");
         assert!(scoped.addressed_to("worker1"));
         assert!(!scoped.addressed_to("motherbee"));
 

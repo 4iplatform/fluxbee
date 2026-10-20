@@ -322,8 +322,8 @@ async fn main() -> Result<(), DynError> {
     }
 
     // El tope inicial sale del plano de control vivo (default baked si no hay config).
-    let initial_max_bytes =
-        configured_max_bytes(boot_state.effective_config.as_ref()).unwrap_or(BLOB_DEFAULT_MAX_BYTES);
+    let initial_max_bytes = configured_max_bytes(boot_state.effective_config.as_ref())
+        .unwrap_or(BLOB_DEFAULT_MAX_BYTES);
     let curator = build_curator(initial_max_bytes)?;
 
     let control_metrics = IoControlPlaneMetrics::with_initial_state(
@@ -454,7 +454,11 @@ async fn current_expected_admin(state: &RuntimeState) -> String {
     format!("SY.admin@{hive}")
 }
 
-fn control_caller_authorized(state: &RuntimeState, message: &Message, expected_admin: &str) -> bool {
+fn control_caller_authorized(
+    state: &RuntimeState,
+    message: &Message,
+    expected_admin: &str,
+) -> bool {
     let caller = message.routing.src_l2_name.as_deref().map(str::trim);
     caller == Some(expected_admin) || caller == Some(state.config.orchestrator_target.as_str())
 }
@@ -503,7 +507,11 @@ async fn handle_control_message(state: &RuntimeState, message: &Message) -> Mess
 
 async fn build_config_get_payload(state: &RuntimeState, message: &Message) -> Value {
     let snapshot = state.control_plane.read().await.clone();
-    log_config_get_served(&message.routing.trace_id, &state.config.node_name, &snapshot);
+    log_config_get_served(
+        &message.routing.trace_id,
+        &state.config.node_name,
+        &snapshot,
+    );
     let mut payload = build_io_config_get_response_payload(
         &state.config.node_name,
         &snapshot,

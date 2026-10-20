@@ -62,7 +62,10 @@ pub fn wrap_in_meta_context(io: &IoContext) -> Value {
     serde_json::json!({ "io": io })
 }
 
-pub fn set_response_envelope(meta_context: Option<Value>, envelope: Value) -> Result<Value, IoResponseContractError> {
+pub fn set_response_envelope(
+    meta_context: Option<Value>,
+    envelope: Value,
+) -> Result<Value, IoResponseContractError> {
     set_context_contract_field(meta_context, RESPONSE_ENVELOPE_FIELD, envelope)
 }
 
@@ -96,40 +99,46 @@ pub fn extract_final_response_contract(
 }
 
 pub fn validate_response_contract(contract: &Value) -> Result<(), IoResponseContractError> {
-    let obj = contract
-        .as_object()
-        .ok_or_else(|| IoResponseContractError::InvalidResponseContract {
-            0: "response contract must be a JSON object".to_string(),
-        })?;
+    let obj =
+        contract
+            .as_object()
+            .ok_or_else(|| IoResponseContractError::InvalidResponseContract {
+                0: "response contract must be a JSON object".to_string(),
+            })?;
 
-    let kind = obj
-        .get("kind")
-        .and_then(Value::as_str)
-        .ok_or_else(|| IoResponseContractError::InvalidResponseContract {
+    let kind = obj.get("kind").and_then(Value::as_str).ok_or_else(|| {
+        IoResponseContractError::InvalidResponseContract {
             0: "response contract.kind is required".to_string(),
-        })?;
+        }
+    })?;
     if kind != "json_object_v1" {
         return Err(IoResponseContractError::InvalidResponseContract(format!(
             "unsupported response contract kind: {kind}"
         )));
     }
 
-    let required = obj.get("required").and_then(Value::as_array).ok_or_else(|| {
-        IoResponseContractError::InvalidResponseContract(
-            "response contract.required is required".to_string(),
-        )
-    })?;
+    let required = obj
+        .get("required")
+        .and_then(Value::as_array)
+        .ok_or_else(|| {
+            IoResponseContractError::InvalidResponseContract(
+                "response contract.required is required".to_string(),
+            )
+        })?;
     if required.is_empty() {
         return Err(IoResponseContractError::InvalidResponseContract(
             "response contract.required must not be empty".to_string(),
         ));
     }
 
-    let properties = obj.get("properties").and_then(Value::as_object).ok_or_else(|| {
-        IoResponseContractError::InvalidResponseContract(
-            "response contract.properties is required".to_string(),
-        )
-    })?;
+    let properties = obj
+        .get("properties")
+        .and_then(Value::as_object)
+        .ok_or_else(|| {
+            IoResponseContractError::InvalidResponseContract(
+                "response contract.properties is required".to_string(),
+            )
+        })?;
     if properties.is_empty() {
         return Err(IoResponseContractError::InvalidResponseContract(
             "response contract.properties must not be empty".to_string(),
@@ -373,7 +382,9 @@ fn extract_context_contract_field(
     field: &str,
 ) -> Result<Option<Value>, IoResponseContractError> {
     let context_obj = meta_context.as_object().ok_or_else(|| {
-        IoResponseContractError::InvalidMetaContext("meta.context must be a JSON object".to_string())
+        IoResponseContractError::InvalidMetaContext(
+            "meta.context must be a JSON object".to_string(),
+        )
     })?;
     match context_obj.get(field) {
         None => Ok(None),
@@ -384,7 +395,9 @@ fn extract_context_contract_field(
     }
 }
 
-fn into_context_object(meta_context: Option<Value>) -> Result<Map<String, Value>, IoResponseContractError> {
+fn into_context_object(
+    meta_context: Option<Value>,
+) -> Result<Map<String, Value>, IoResponseContractError> {
     match meta_context {
         None => Ok(Map::new()),
         Some(Value::Object(map)) => Ok(map),
@@ -476,7 +489,10 @@ fn validate_field_value(
                 "response field '{field_name}' must be a string to match enum"
             ))
         })?;
-        if !enum_items.iter().any(|candidate| candidate.as_str() == Some(field_str)) {
+        if !enum_items
+            .iter()
+            .any(|candidate| candidate.as_str() == Some(field_str))
+        {
             return Err(IoResponseContractError::InvalidStructuredResponse(format!(
                 "response field '{field_name}' contains unsupported enum value '{field_str}'"
             )));
@@ -610,7 +626,8 @@ mod tests {
 
     #[test]
     fn wapp_io_context_round_trips_reply_target_and_dedups_by_message() {
-        let ctx = wapp_inbound_io_context("111", "5491100000000", "wamid.AAA==", Some("1700000000"));
+        let ctx =
+            wapp_inbound_io_context("111", "5491100000000", "wamid.AAA==", Some("1700000000"));
         assert_eq!(ctx.channel, "whatsapp");
         assert_eq!(ctx.entrypoint.id, "111"); // meta.ich derives from channel + entrypoint.id
         assert_eq!(ctx.conversation.id, "5491100000000");
@@ -764,9 +781,12 @@ mod tests {
 
     #[test]
     fn set_and_extract_response_envelope_roundtrip() {
-        let context = set_response_envelope(Some(wrap_in_meta_context(&slack_inbound_io_context(
-            "T123", "U456", "C789", None, "EvABC",
-        ))), sample_response_contract())
+        let context = set_response_envelope(
+            Some(wrap_in_meta_context(&slack_inbound_io_context(
+                "T123", "U456", "C789", None, "EvABC",
+            ))),
+            sample_response_contract(),
+        )
         .expect("set envelope");
         let extracted = extract_response_envelope(&context)
             .expect("extract ok")
@@ -777,8 +797,8 @@ mod tests {
 
     #[test]
     fn set_final_response_contract_roundtrip() {
-        let context = set_final_response_contract(None, sample_response_contract())
-            .expect("set contract");
+        let context =
+            set_final_response_contract(None, sample_response_contract()).expect("set contract");
         let extracted = extract_final_response_contract(&context)
             .expect("extract ok")
             .expect("contract present");
@@ -789,7 +809,10 @@ mod tests {
     fn set_response_envelope_rejects_non_object_meta_context() {
         let err = set_response_envelope(Some(json!("bad")), sample_response_contract())
             .expect_err("should reject non-object context");
-        assert!(matches!(err, IoResponseContractError::InvalidMetaContext(_)));
+        assert!(matches!(
+            err,
+            IoResponseContractError::InvalidMetaContext(_)
+        ));
     }
 
     #[test]
@@ -801,7 +824,10 @@ mod tests {
             }
         }))
         .expect_err("should reject invalid contract");
-        assert!(matches!(err, IoResponseContractError::InvalidResponseContract(_)));
+        assert!(matches!(
+            err,
+            IoResponseContractError::InvalidResponseContract(_)
+        ));
     }
 
     #[test]
@@ -811,17 +837,21 @@ mod tests {
             &sample_response_contract(),
         )
         .expect("valid response");
-        assert_eq!(parsed.get("human_message").and_then(Value::as_str), Some("ok"));
+        assert_eq!(
+            parsed.get("human_message").and_then(Value::as_str),
+            Some("ok")
+        );
     }
 
     #[test]
     fn parse_structured_response_text_rejects_missing_required_field() {
-        let err = parse_structured_response_text(
-            r#"{"success":true}"#,
-            &sample_response_contract(),
-        )
-        .expect_err("missing required field");
-        assert!(matches!(err, IoResponseContractError::InvalidStructuredResponse(_)));
+        let err =
+            parse_structured_response_text(r#"{"success":true}"#, &sample_response_contract())
+                .expect_err("missing required field");
+        assert!(matches!(
+            err,
+            IoResponseContractError::InvalidStructuredResponse(_)
+        ));
     }
 
     #[test]
@@ -831,7 +861,10 @@ mod tests {
             &sample_response_contract(),
         )
         .expect_err("optional field present as null should fail");
-        assert!(matches!(err, IoResponseContractError::InvalidStructuredResponse(_)));
+        assert!(matches!(
+            err,
+            IoResponseContractError::InvalidStructuredResponse(_)
+        ));
     }
 
     #[test]
@@ -841,7 +874,10 @@ mod tests {
             &sample_response_contract(),
         )
         .expect_err("unexpected property should fail");
-        assert!(matches!(err, IoResponseContractError::InvalidStructuredResponse(_)));
+        assert!(matches!(
+            err,
+            IoResponseContractError::InvalidStructuredResponse(_)
+        ));
     }
 
     #[test]
