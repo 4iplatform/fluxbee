@@ -21,7 +21,8 @@
 
 | Version | Date (ART) | Commit | Scope | Status | Rollback |
 |---|---|---|---|---|---|
-| **0.1.80** | 2026-10-17 | `58db83a` | motherbee + spokes (core) | ✅ live | snap `pre-batch-0-1-80` (all 4 VMs) · `apt install fluxbee=0.1.79` + core-update of the spokes |
+| **0.1.81** | 2026-10-20 | `99b0d2a` | motherbee + spokes (core) + egress1 `hive.yaml` + DB | ✅ live | snap `pre-batch-0-1-81` (all 4 VMs) · `apt install fluxbee=0.1.80` + core-update of the spokes |
+| **0.1.80** | 2026-10-17 | `58db83a` | motherbee + spokes (core) | ✅ replaced by 0.1.81 | snap `pre-batch-0-1-80` (all 4 VMs) · `apt install fluxbee=0.1.79` + core-update of the spokes |
 | **0.1.79** | 2026-10-17 | `0bc85e3` | motherbee + spokes (core) | ✅ replaced by 0.1.80 | snap `pre-stream3-0-1-79` (all 4 VMs) · `apt install fluxbee=0.1.78` + core-update of the spokes |
 | **0.1.78** | 2026-10-17 | `104fa65` | motherbee + spokes (core) | ✅ replaced by 0.1.79 | snap `pre-stream2b-0-1-78` (all 4 VMs) · `apt install fluxbee=0.1.77` + core-update of the spokes |
 | **0.1.77** | 2026-10-17 | `377945a` | motherbee + spokes (core) | ✅ replaced by 0.1.78 | snap `pre-stream2a-0-1-77` (all 4 VMs); `apt` alone is not enough (see the entry) |
@@ -89,6 +90,100 @@
 > (`dpkg-scanpackages -m`) for rollback, but their detail lives in the logbook, not here.
 
 ---
+
+## 0.1.81 — The open findings closed: agent assets reach the workers, a removed hive is cut off, the Go SDK matches Rust, Archi reconciles what exists (A-72, A-48, A-75, A-24, A-76, A-1, A-2)
+
+- **Date:** 2026-10-20 (ART) · **Previous version:** 0.1.80 · **Commits:** `4e9f91e` (fixes and
+  cleanup) and `99b0d2a` (format only; CI now checks the Rust and Go format).
+- **Scope:** motherbee + the three spokes (core update), plus the one-time steps below.
+- **What changed** (each finding verified in the code first, one review round of seven reviewers):
+  - **A-72:** a worker-only Syncthing folder, `fluxbee-dist-agent-assets`, carries
+    `blob/agent-assets` from the motherbee (send-only) to every worker (receive-only); hives that
+    joined earlier get it with their core update. ai.generic reads an asset as a regular file only,
+    and a configured agent keeps its definition until a complete new one is readable.
+  - **A-48:** the hive registry is the one list. The motherbee's router rejects a hive it does not
+    list (`HIVE_NOT_REGISTERED`) and closes a removed hive's session within ~10 s; `remove_hive`
+    deletes the hive's identity key; a motherbee boot sweep deletes keys with no registry entry;
+    `wan.authorized_hives` is gone.
+  - **A-75:** the Go SDK matches Rust (no family-wide reply shapes, system RPCs with TTL 16, an
+    oversize frame refused without dropping the link); SY.timer no longer answers router notices.
+  - **A-76:** SY.admin's status and per-hive inventory routes, the vault refusal for a hive without
+    a vault, vault metadata, the OPA check as a pure read, node status of SY.* nodes, the router
+    and identity regions after a restart or a limit change, the AI nodes' dead config fields,
+    handler retries and call timeouts, the frontdesk's status. One router per hive is the supported
+    topology.
+  - **A-1 / A-2:** the egress join reads `edge_ip` from the host and the egress checks its LAN leg,
+    forwarding and IPv6 block; a join that leaves password logins on says so.
+  - **A-24 and what the review found in Archi:** its snapshot reads each producer's real answer,
+    workflows are owned and pinned like the OPA policy, routes and VPN rules are validated like
+    SY.config.routes, the executor waits for a hive's join (FINDINGS A-77).
+  - **Cleanup:** SY.storage's base schema (`turns.message` NOT NULL, no `storage_migrations`), the
+    one-time transitions and the dead tools and scripts removed, `scripts/install.sh` a wrapper of
+    the `.deb`.
+- **Before the deploy** (the operator's approval of 2026-10-20):
+  - **egress1:** `edge_ip` 10.10.10.1 → 10.10.10.40 in `/etc/fluxbee/hive.yaml` (backup
+    `hive.yaml.bak-pre-0181-edge-ip`) and in the motherbee's `hives/egress1/info.yaml` (backup
+    `/root/egress1-info.yaml.bak-pre-0181-edge-ip`). eth0 carries 10.10.10.40; .1 was add_hive's
+    guess ("first usable IP"), and 0.1.81 stops an egress whose `edge_ip` is not on its LAN leg.
+    Nothing routed by that value.
+  - **Database:** `ALTER TABLE turns ALTER COLUMN message SET NOT NULL;` (0 rows without one).
+  - **On 2026-10-19,** with the operator's approval: the three empty dead tables of the 0.1.80 entry
+    (`events`, `memory_items`, `storage_reactivation_applied`) were dropped.
+- **Deploy:**
+  - build of `99b0d2a` in 23 min, publish in 22 s, deploy in 240 s;
+  - snapshots `pre-batch-0-1-81` on the 4 VMs (`pre-stream2b-0-1-78` was deleted);
+  - 0.1.81 on all 4 (core hash `8157e8245c5de4a1`), health clean.
+- **After the deploy** (same approval): `DROP TABLE storage_migrations;`, and the stored ufw rules that
+  no longer apply deleted (22000/udp and 21027/udp on the 4 hosts, 22000/tcp on the spokes). ufw is
+  inactive on all four, so nothing changed live.
+- **Gate:**
+  - **A-48:**
+    - at boot the motherbee deleted `identity/keys/worker2.key` (worker2 was removed on 2026-10-06):
+      `deleted the identity key of a hive the registry does not have (A-48)`;
+    - VM 104 (fb-worker2), which kept its certificate and its key, was powered on. Its router dialed
+      the motherbee and got `wan peer rejected: hive not registered … reason=HIVE_NOT_REGISTERED`;
+      its identity sync got `auth: no key for hive 'worker2'`. It runs its old version, so it
+      retried every 5 s (a 0.1.81 spoke backs off to 60 s). VM 104 was powered off again.
+  - **A-72:**
+    - the motherbee declares `fluxbee-dist-agent-assets` (send-only, shared with worker1); worker1
+      got it with its core update (receive-only, owned by the Syncthing user) with the 4 existing
+      assets; ingress1 and egress1 do not have it;
+    - a role created through Archi (`POST /api/agent-assets`; mode 0644, no temp file left) reached
+      worker1 in ~14 s with its hash;
+    - an agent in a test tenant on worker1 (`AI.gate0181@worker1`, `claude-sonnet-5-5`) started with
+      `definition_state: empty` and read `composed`, role loaded, after `set_ilk_definition`.
+  - **AI config:** a `CONFIG_SET` with `behavior.instructions` answered `invalid_config` (*unknown
+    field `instructions`*); nothing changed.
+  - **A-1:** egress1 reconciles with `edge_ip=10.10.10.40 … lan_leg_ok=true ipv4_forwarding=true
+    ipv6_blocked=true`.
+  - **A-76, SY.admin and SY.vault:**
+    - `GET /hives/motherbee/status` answers ok (always 500 before);
+    - `GET /hives/worker1/inventory/summary` gives worker1's totals (8 nodes: RT 1, SY 7);
+    - `GET /hives/worker1/vault/secrets` answers `INVALID_REQUEST` (*SY.vault runs only on the
+      motherbee…*);
+    - the metadata of an ILK-bound secret answers ok (`UNAUTHORIZED` before);
+    - node status reads RUNNING/HEALTHY for SY.storage, RT.gateway, SY.frontdesk.gov, SY.architect
+      and SY.identity@worker1.
+  - **OPA check:** a valid policy answered ok (hash, 74 ms, 138,850-byte wasm, no version); an
+    invalid one `COMPILE_ERROR`; the 4 hives stayed at v0, in sync. Archi, asked to check a policy
+    with its read tool, answered that it compiles; nothing was staged.
+  - **Archi:** its 4 cookbooks were seeded (empty in PROD until now); the Messages API answers.
+  - **Storage:** usage records and turns keep landing (Archi's 2 calls; 33 new turns).
+  - **Health:** `failed=0 denials=0 srcdrops=0 streamlost=0 usagelost=0 usagerej=0` on all 4.
+  - **Covered by tests only:** the identity region recreate, the executor's wait for a join, A-2's
+    warning, the Go SDK's oversize refusal and SY.timer's notice guard, Archi's reconcile of nodes,
+    routes, VPN rules and workflows.
+- **Cleanup:** the gate node (killed with `purge_instance`), its tenant (deleted and purged), the
+  gate role (deleted through Archi; the deletion reached worker1), Archi's gate session.
+- **Upgrading another hive:**
+  - an ai.generic `config.json` written by 0.1.80 or earlier carries keys 0.1.81 refuses
+    (`behavior.instructions`, the old `runtime.*`): that node boots `FAILED_CONFIG` until it gets a
+    new `CONFIG_SET`, or is purged and created again (PROD had none);
+  - a database created before 0.1.81 needs the `ALTER` above, and the `DROP` after the upgrade;
+  - an egress whose `edge_ip` is not on its `lan_iface` stops at boot: fix `edge_ip` first;
+  - a hive older than 0.1.78 still upgrades through 0.1.79.
+- **Rollback:** snapshot `pre-batch-0-1-81`, or `apt install fluxbee=0.1.80` plus the core update of
+  the spokes (0.1.80 accepts the NOT NULL column and creates `storage_migrations` again).
 
 ## 0.1.80 — The repo cleanup, Archi's read tool reads only, a refused route changes nothing, the message being answered is never cut (A-73, A-74, A-71)
 

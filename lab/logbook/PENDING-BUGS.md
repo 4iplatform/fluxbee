@@ -244,7 +244,11 @@ the cold-start `journalctl -u sy-edge` must be captured before writing it down a
 ---
 
 <a id="pb-5"></a>
-## PB-5 🟡 — The egress reports `nat_applied: true` without verifying its LAN leg
+## PB-5 ✅ CLOSED (0.1.81, FINDINGS A-1) — The egress reports `nat_applied: true` without verifying its LAN leg
+
+> **Closed in 0.1.81 (2026-10-20).** The egress join reads `edge_ip` from `lan_iface` on the host
+> instead of guessing it; the LAN leg, IPv4 forwarding and the IPv6 block are checked at boot
+> (fatal), on every drift tick and by the join itself. Validated on egress1 (`lan_leg_ok=true`).
 
 > **Rewritten on 2026-08-03.** The previous title (*"the orchestrator does not configure secondary
 > NICs"*) asked for something that is **explicitly against the contract**.
@@ -277,7 +281,11 @@ name **at runtime**, so the absence of the NIC does **not** make `nft -f` fail �
 ---
 
 <a id="pb-6"></a>
-## PB-6 🟡 — The `ssh_password` bootstrap channel does not close by itself — and plain `harden_ssh` is **not** the answer
+## PB-6 🟡 PARTIAL (0.1.81: the join warns) — The `ssh_password` bootstrap channel does not close by itself — and plain `harden_ssh` is **not** the answer
+
+> **0.1.81 (2026-10-20), FINDINGS A-2:** option (b) shipped: when the join's password fallback ran
+> and the box was not hardened, the join answers a `warnings` entry saying password logins stay on
+> and how to close them. The channel itself still does not close by itself.
 
 > **Rewritten on 2026-08-03.** The original remediation (*"invert the default"*) **would leave boxes without
 > any access path**. Partial duplicate of SO-2026-06-30-02.

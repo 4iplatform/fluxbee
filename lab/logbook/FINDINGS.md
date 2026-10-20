@@ -16,7 +16,13 @@ no change required
 
 ## A. The fluxbee product — candidates for a code change
 
-### A-1 🟡 REFRAMED (→ PB-5) — The orchestrator does not configure secondary network cards
+### A-1 ✅ VALIDATED ON 8.x (0.1.81, 2026-10-20) — The orchestrator does not configure secondary network cards
+
+- **Fixed (0.1.81, `4e9f91e`):** the egress join reads `edge_ip` from `lan_iface` on the host
+  (an explicit one must be on it); the LAN leg, IPv4 forwarding and the IPv6 block are checked at
+  boot (fatal), on every drift tick (alert) and by the join on the box (`EGRESS_NAT_NOT_READY`,
+  `EGRESS_LAN_LEG_INVALID`). PROD's egress1 had `edge_ip` 10.10.10.1, add_hive's guess, on a leg
+  that is 10.10.10.40: corrected by hand before the upgrade. Validated: `lan_leg_ok=true`.
 
 > **Reframed in the 2026-08-03 audit ([PB-5](PENDING-BUGS.md#pb-5)):** addressing the cards is the
 > operator's job by contract, in every role. What stays open is that the egress reports
@@ -35,7 +41,11 @@ no change required
 - **Status:** a real product gap. **To discuss:** should the orchestrator accept the configuration
   of the secondary legs in the `add_hive` payload and apply it?
 
-### A-2 🟡 OPEN (→ PB-6) — `harden_ssh` defaults to `false`
+### A-2 ✅ RESOLVED (0.1.81: the join warns; PB-6 option b) — `harden_ssh` defaults to `false`
+
+- **Fixed (0.1.81, `4e9f91e`):** when the join's password fallback ran and the box was not hardened,
+  the join answers a `warnings` entry saying password logins stay on and how to close them (PB-6
+  option b; option a went with D32). Covered by tests; no join ran in the gate.
 
 > **Rewritten in the 2026-08-03 audit ([PB-6](PENDING-BUGS.md#pb-6)):** flipping the default
 > would leave boxes with no way in at all. What stays open is that the `ssh_password` channel does
@@ -287,7 +297,13 @@ no change required
   of several solutions into one single policy, instead of the last one winning; and an owner
   registered together with the policy, instead of deducing it by comparing the rego.
 
-### A-24 🟡 RESOLVED (0.1.49) · WF pending — The architect's snapshot asked an admin that does not exist for each hive's state
+### A-24 ✅ RESOLVED (0.1.49 + 0.1.81, the WF half) — The architect's snapshot asked an admin that does not exist for each hive's state
+
+- **The WF half (0.1.81, `4e9f91e`):** the snapshot reads wf-rules' real answer (`workflows`,
+  `current_hash` reproduced exactly); a DMZ hive is not asked for runtimes or workflows; workflow
+  ownership comes from executed manifests (external by default) and removal reaches every hive
+  the solution used; the plan compiler gets the declared definitions and the steps are pinned.
+  The review found more in the same reconciler: see A-77.
 
 - **What happens (seen in code, 2026-10-01; not reproduced live):** `build_actual_state_snapshot`
   sends each read to `SY.admin@<hive>`. Only the motherbee has an admin (on worker1, `sy-admin` is
@@ -876,7 +892,18 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
     on its own; the motherbee waited for `worker2`, which jumped from 0.1.57 to 0.1.59 and
     switched, and only then did the motherbee switch. Zero Syncthing UDP sockets on the 5 hives.
 
-### A-48 🟡 TO FIX — `remove_hive` revokes nothing: the removed hive is still a valid peer
+### A-48 ✅ VALIDATED ON 8.x (0.1.81, 2026-10-20) · leaf pinning PARKED — `remove_hive` revokes nothing: the removed hive is still a valid peer
+
+- **Fixed (0.1.81, `4e9f91e`):** the registry (`/var/lib/fluxbee/hives/<id>/`) is the one list. The
+  motherbee's router rejects a hive it does not list (`HIVE_NOT_REGISTERED`) and closes a removed
+  hive's session within ~10 s; a rejected uplink backs off to 60 s. `remove_hive` deletes the
+  hive's identity key (and restarts sy-identity when the box was not reached); a motherbee boot
+  sweep deletes keys with no registry entry and refuses on an empty registry; the spoke's cleanup
+  runs in its own transient unit, credentials first, and only from SY.orchestrator@motherbee.
+  `wan.authorized_hives` is gone. Validated: the sweep deleted PROD's stale `worker2.key`; VM 104
+  (worker2, which kept its certificate and key) was rejected on :9000 and :9100.
+- **Parked:** leaf pinning (host-posture spec §3.8, superseded). A removed box that kept its leaf
+  is admitted again if a hive with the same id is added later.
 
 - **What happens (DTAP panel 2026-10-05, D-1, verified):**
   - `remove_hive_flow` (`sy_orchestrator.rs:10635`) deletes `hives/<id>`.
@@ -1045,7 +1072,59 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   `config.xml`.
 - **Status:** built; the next join exercises it (the A-48 one).
 
-### A-76 🔴 CONFIRMED IN CODE (2026-10-17) — Smaller defects found while rewriting the docs from the code
+### A-77 ✅ RESOLVED (0.1.81, 2026-10-20) — What the closing pass and its review found besides A-72..A-76
+
+Found on 2026-10-19 while verifying the open findings and in the review round of 0.1.81; fixed in
+`4e9f91e`. Covered by tests; the ones marked *live* were seen on 8.x.
+
+- **Archi (SY.architect):**
+  - the reconcile never saw existing runtimes, nodes, routes or VPN rules (it read only a top-level
+    array, `items` or `responses`), so every declared node or route was a Create on every run;
+  - an AI node's config never converged (whole-value compare against the filled-in config);
+  - a solution could own, and then delete, a workflow it never applied (ownership counted unexecuted
+    manifests; the default was "solution", the docs said "external");
+  - a lowercase or unknown route action turned a working route into a failed replace;
+  - the VPN model (`{vpn_id: text, hive}`) could never match SY.config.routes' pattern → numeric id;
+  - its artifact auditor refused valid workflow definitions (it wanted a `steps` field);
+  - a hive the manifest adds blocked the snapshot; a WF on a DMZ hive or a declared WF./SY./RT. node
+    failed only after the operator confirmed;
+  - plans with `add_hive` timed out in Archi while the executor still ran them;
+  - its cookbook seeds were never shipped by the `.deb` (*live:* seeded now) and taught old shapes;
+  - the Messages view would fail on rows whose message has no sender name.
+- **SY.admin:** its plan executor counted an accepted `add_hive` as done; it now waits for the join.
+- **SY.orchestrator:**
+  - `remove_hive`'s cleanup ran inside sy-orchestrator's own unit, so everything after it stopped the
+    orchestrator never ran; it now runs in a transient unit;
+  - a join's record was lost on its own rewrites, so a restart mid-join never ended it.
+- **SY.timer:** answered every system message it did not handle, router notices included, so an
+  UNREACHABLE could bounce between it and the router forever (no storm was seen in PROD's logs).
+- **AI runtime:** a message over 60 s was retried up to 3 times, billing again and re-running tools,
+  then dropped without an answer; provider calls had no timeout at all.
+- **Documented, not built (operator's decision, 2026-10-19):** Archi never removes nodes, routes or
+  VPN rules a solution stops declaring (workflows and the OPA policy are removed); an extra one goes
+  through SY.admin's API.
+
+### A-76 ✅ CLOSED (0.1.81, 2026-10-20) · the several-routers items DOCUMENTED (unsupported topology) — Smaller defects found while rewriting the docs from the code
+
+- **Outcome (0.1.81, `4e9f91e`), item by item:**
+  - routers: a restarted router takes its region over (no stale nodes); the identity region is
+    recreated when its limits change, and SY.identity refuses to start if its store does not fit;
+    the two several-routers defects (broadcast copies, WAN UNREACHABLE) are documented as limits
+    of an unsupported topology (operator's decision, 2026-10-19);
+  - SY.admin: `/hives/{hive}/status` and the per-hive inventory summary answer, `/inventory/hive`
+    is gone, a vault call for a hive without a vault answers 400, vault metadata follows the list
+    rule, `get_node_status` reads SY.* and RT.gateway from their units, the CONFIG_* allowlists
+    follow the system policy;
+  - OPA: a check is a read again (its own `check_id`, a scratch compile, no version, nothing
+    staged), and back in Archi's read tool;
+  - SY.orchestrator: `remove_hive` (A-48); Syncthing's firewall rule is 22000/tcp on the
+    motherbee only;
+  - AI nodes: `behavior.instructions`, `instructions.source` and the unread `runtime.*` keys are
+    gone and refused; an OpenAI tool turn checks for a cut answer; ai.generic and the frontdesk
+    report their real state; `deploy-ia-node.sh` is deleted;
+  - comments and leftovers: corrected or removed.
+- **Left to the IO-family track:** the managed IO nodes still answer NODE_STATUS_GET with a fixed
+  HEALTHY (io.slack does not answer it); the SDK helper they can use exists.
 
 Found by the docs rewrite of 2026-10-17 (the reference set and the node pages read every path they
 describe). None was tried live. To be sorted with the operator; most belong to the IO-family and
@@ -1091,7 +1170,13 @@ router reviews.
   (they are not); SY.storage still creates `storage_migrations`, which nothing writes since the
   cleanup.
 
-### A-75 🔴 CONFIRMED IN CODE (2026-10-17) — The Go SDK still has the reply-matcher bug Rust fixed after the 2026-08-26 outage
+### A-75 ✅ RESOLVED (0.1.81, 2026-10-20) — The Go SDK still has the reply-matcher bug Rust fixed after the 2026-08-26 outage
+
+- **Fixed (0.1.81, `4e9f91e`):** family-wide success matchers are never reply shapes;
+  `SendSystemRPC` defaults to TTL 16; a frame over 128 KiB is refused with `MessageTooLargeError`
+  and the link stays up. SY.timer, SY.wf-rules and the WF engine answer a request whose reply is
+  too large with an error. Covered by tests (each failed on the old code); the Go nodes run 0.1.81
+  in PROD and the OPA check went through SY.opa.rules.
 
 - **What happens (go/fluxbee-go-sdk, found while writing docs/reference/protocol.md):**
   - Go registers any-message-of-a-kind matchers as reply shapes, the family-wide drop the Rust SDK
@@ -1140,7 +1225,14 @@ router reviews.
   stages the policy it checks, see A-76). Validated on 8.x: asked to start a node through the read
   tool, Archi got the refusal and no node was created.
 
-### A-72 🔴 CONFIRMED IN CODE (2026-10-17) — An agent's role does not reach the workers: `blob/agent-assets` is not replicated
+### A-72 ✅ VALIDATED ON 8.x (0.1.81, 2026-10-20) — An agent's role does not reach the workers: `blob/agent-assets` is not replicated
+
+- **Fixed (0.1.81, `4e9f91e`):** a worker-only Syncthing folder, `fluxbee-dist-agent-assets`
+  (motherbee send-only, workers receive-only), backfilled for hives that joined before. Archi
+  writes an asset outside the folder and renames it in (mode 0644); ai.generic reads only a
+  regular file, bounded, and keeps its definition until a complete new one is readable.
+  Validated: worker1 got the folder with its core update; a new role reached it in ~14 s; an
+  agent on worker1 composed its definition from it.
 
 - **What happens:**
   - An agent's role, skills, handbooks and personality are JSON assets in the motherbee's
