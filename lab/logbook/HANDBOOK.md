@@ -482,10 +482,13 @@ curl -s http://127.0.0.1:8080/hives/motherbee/commands   # the audit log is alre
 The base nodes (`IO.cloud`, `IO.blob`) start in `UNCONFIGURED`.
 **That is correct**, not a failure: the degraded start is by design.
 
-> **An empty `wan.authorized_hives` = allow everything.** It is not in the `hive.yaml` that the
-> postinst generates, and it looks missing. It is not missing: `add_hive` only applies the
-> allowlist if it is **not** empty, and the code's own error message suggests
-> *"leave authorized_hives empty"*. No action needed.
+> **The hive registry decides who may connect over the WAN.** The motherbee admits a hive only
+> while `/var/lib/fluxbee/hives/<hive_id>/` exists: `add_hive` creates it when it accepts the
+> join, `remove_hive` deletes it after the cleanup, and the link of a removed hive closes within
+> 10 s. There is no other allowlist. In `journalctl -u rt-gateway` on the motherbee:
+> `wan peer rejected: hive not registered peer_hive=<hive_id> … reason=HIVE_NOT_REGISTERED` (a
+> dial refused) and `wan peer session closed: hive no longer registered peer_hive=<hive_id> …
+> reason=HIVE_NOT_REGISTERED` (a live link cut).
 
 ---
 

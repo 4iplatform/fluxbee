@@ -67,7 +67,7 @@ func TestPublishedPolicyReachesAReplica(t *testing.T) {
 	// The motherbee compiles, applies and publishes.
 	var published PolicyManifest
 	on(primaryState, func() {
-		if ok, err := primary.handleOpaAction("admin", "compile_apply", 7, &OpaConfigPayload{Rego: testRego}, false, false); !ok || err != nil {
+		if ok, err := primary.handleOpaAction("admin", "compile_apply", 7, &OpaConfigPayload{Rego: testRego}, false); !ok || err != nil {
 			t.Fatalf("compile_apply: ok=%v err=%v", ok, err)
 		}
 		var err error
@@ -78,7 +78,7 @@ func TestPublishedPolicyReachesAReplica(t *testing.T) {
 
 	// A replica refuses to compile: one policy, compiled on the motherbee only.
 	on(replicaState, func() {
-		if ok, _ := replica.handleOpaAction("admin", "compile_apply", 8, &OpaConfigPayload{Rego: testRego}, false, false); ok {
+		if ok, _ := replica.handleOpaAction("admin", "compile_apply", 8, &OpaConfigPayload{Rego: testRego}, false); ok {
 			t.Fatal("a replica must not compile")
 		}
 	})
@@ -118,7 +118,7 @@ func TestPublishedPolicyReachesAReplica(t *testing.T) {
 
 	// A clear on the motherbee reaches the replica too.
 	on(primaryState, func() {
-		if ok, err := primary.handleOpaAction("admin", "clear", 0, nil, false, false); !ok || err != nil {
+		if ok, err := primary.handleOpaAction("admin", "clear", 0, nil, false); !ok || err != nil {
 			t.Fatalf("clear: ok=%v err=%v", ok, err)
 		}
 	})
@@ -238,7 +238,7 @@ func TestPrimaryRepublishesAfterAFailedPublish(t *testing.T) {
 		if err := ensureDirs(); err != nil {
 			t.Fatalf("dirs: %v", err)
 		}
-		if ok, err := primary.handleOpaAction("admin", "compile_apply", 4, &OpaConfigPayload{Rego: testRego}, false, true); ok || err == nil {
+		if ok, err := primary.handleOpaAction("admin", "compile_apply", 4, &OpaConfigPayload{Rego: testRego}, false); ok || err == nil {
 			t.Fatalf("the publish should have failed: ok=%v err=%v", ok, err)
 		}
 		current, _ := currentPolicy()
@@ -329,7 +329,7 @@ func publishOnPrimary(t *testing.T, version uint64, extra string) PolicyManifest
 		if err := ensureDirs(); err != nil {
 			t.Fatalf("dirs: %v", err)
 		}
-		if ok, err := primary.handleOpaAction("admin", "compile_apply", version, &OpaConfigPayload{Rego: testRego + extra}, false, false); !ok || err != nil {
+		if ok, err := primary.handleOpaAction("admin", "compile_apply", version, &OpaConfigPayload{Rego: testRego + extra}, false); !ok || err != nil {
 			t.Fatalf("compile_apply: ok=%v err=%v", ok, err)
 		}
 		var err error
@@ -574,7 +574,7 @@ func TestOnlyThePrimaryWritesAndThePublicationIsJustTheWasm(t *testing.T) {
 		for _, action := range []string{"compile", "compile_apply", "check", "apply", "rollback", "clear"} {
 			router.sent = nil
 			// As the admin's writes arrive: CONFIG_CHANGED, answered with CONFIG_RESPONSE.
-			ok, _ := replica.handleOpaAction("admin", action, 9, &OpaConfigPayload{Rego: testRego}, false, true)
+			ok, _ := replica.handleOpaAction("admin", action, 9, &OpaConfigPayload{Rego: testRego}, false)
 			if ok || !sentErrorCode(t, router, "NOT_PRIMARY") {
 				t.Fatalf("a replica must refuse %s with NOT_PRIMARY: ok=%v sent=%+v", action, ok, router.sent)
 			}

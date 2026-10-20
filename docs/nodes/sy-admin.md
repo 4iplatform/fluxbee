@@ -89,8 +89,12 @@ addressed to `SY.admin@motherbee`:
 `target` is the hive. For node actions a `node_name@hive` in `params` wins over it, and a
 `params.hive_id` is refused (`resolve_internal_action_hive`,
 `internal_admin_payload_contract_error`). Actions with `requires_target` in the registry answer
-`INVALID_REQUEST` without a hive. The reply is `ADMIN_COMMAND_RESPONSE`, sent back to the caller,
-with payload
+`INVALID_REQUEST` without a hive. `inventory` is narrowed to one hive by `params.filter_hive` or
+`params.hive` (the executor's argument) in any `scope`, and by `target` only with
+`scope: "hive"`: SY.architect targets its own hive on every hive-less read, the global summary
+included (`internal_inventory_payload`).
+
+The reply is `ADMIN_COMMAND_RESPONSE`, sent back to the caller, with payload
 `{status, action, payload, error_code, error_detail, request_id?}` (`send_admin_command_response`).
 A payload that does not parse, or one without `action`, is answered `INVALID_REQUEST`; a failure
 before any reply was built is answered `INTERNAL_ERROR` (`handle_internal_admin_command`).
@@ -132,9 +136,15 @@ gates above reserve.
 
 Other checks:
 
-- `CONFIG_GET`/`CONFIG_SET` addressed to SY.admin itself are accepted only from `SY.architect`,
-  `SY.config-routes` or `SY.vault` of the same hive (`admin_origin_authorized`), otherwise
-  `FORBIDDEN`. The list says `SY.config-routes`; the node is named `SY.config.routes`.
+- `CONFIG_GET`/`CONFIG_SET` addressed to SY.admin itself are accepted only from
+  `SY.admin@motherbee` (`admin_origin_authorized`), otherwise `FORBIDDEN`. The router delivers
+  them from no one else (rule (2) of `policy/system.rego`), so what reaches SY.admin is its own
+  `node_control_config_get`/`node_control_config_set` on `SY.admin@motherbee`, which reads and
+  sets the executor catalog.
+- Over the mesh only `SY.architect@motherbee` may have SY.admin send itself a `CONFIG_SET`:
+  `node_control_config_set`, or `send_node_message` with `msg: CONFIG_SET`, aimed at SY.admin by
+  name or by router UUID. Any other caller gets `UNAUTHORIZED` (`authorize_admin_config_set`).
+  The HTTP API and the executor have no caller and pass; `CONFIG_GET` stays open.
 - Fanout `externalize` (with `fanout_family`) is operator-only (`handle_externalize`).
 - The HTTP route `POST /artifacts/unpublish` may revoke any tenant's publication
   (`handle_unpublish_artifact` with no caller).
@@ -184,10 +194,12 @@ SY.admin stamps its own name, `SY.admin@motherbee`, as `src_l2_name` on what it 
 | --- | --- | --- |
 | node lifecycle, node config/state/status, hives, versions, runtimes, deployments, drift alerts, storage path, `core_rollback` (`action_routes_via_local_orchestrator`) | `SY.orchestrator@motherbee`, with `payload.target` = the hive; `node_name@hive` overrides `target` (`normalize_admin_payload`) | `msg_type: admin`, `meta.action` |
 | routes, VPNs, taps | `SY.config.routes@<hive>` | `msg_type: admin` (`build_admin_request`) |
+| `inventory` | `SY.orchestrator@motherbee` | `INVENTORY_REQUEST` (`handle_inventory_http`) |
 | identity actions | `SY.identity@<hive>` | `ILK_*`, `TNT_*` (`handle_identity_command`, `handle_identity_query`) |
-| vault actions | `SY.vault@<hive>` | `VAULT_*` (`handle_vault_command`) |
+| vault actions | `SY.vault@motherbee`; another hive is refused with `400 INVALID_REQUEST` ("SY.vault runs only on the motherbee") | `VAULT_*` (`handle_vault_command`) |
 | `update`, `sync_hint` | `SY.orchestrator@<hive>` | `SYSTEM_UPDATE` (`category` runtime, core or vendor; default runtime), `SYSTEM_SYNC_HINT` |
 | `opa_*` writes | `SY.opa.rules@motherbee`, then waits for every hive's answer | `CONFIG_CHANGED`, subsystem `opa` (`send_opa_config_changed`) |
+| `opa_check` | `SY.opa.rules@motherbee` only; nothing is announced | `CONFIG_CHANGED`, action `check`, `version: 0` (a check takes no number from the counter); the answer is matched on the `config.check_id` it echoes (`send_opa_check`) |
 | `wf_rules_*` | `SY.wf-rules@<hive>` | `command` / `query` messages (`send_l2_action_request`) |
 | `timer_*` | `SY.timer@<hive>` | `TIMER_*` → `TIMER_RESPONSE` (`handle_timer_rpc`) |
 | `list_streams` | every `RT.<router>.stream@<hive>` in the LSA | `STREAM_STATUS` (`handle_list_streams`) |
@@ -242,6 +254,15 @@ Plan shape (`AdminExecutorPlan`, unknown fields refused):
   tool, SY.admin runs the step directly (`execute_admin_executor_step_fallback`). Later steps can
   use earlier results with `$steps.<step_id>.<path>`. With `stop_on_error` the run stops at the
   first failure. `dry_run` validates only.
+- **add_hive**: the orchestrator answers `accepted` and joins in the background (PB-7), so before
+  the next step the executor follows the join (`follow_add_hive_join`). Every 5 s it reads the
+  hive as `GET /hives/{hive}` answers it, without an audit entry per read, until the entry's
+  `join.phase` is `done`; `status` alone is not enough, since the join flows rewrite the entry
+  without its join record while they run. `connected` ends the step; any other status fails it
+  with the join's `error_code` and `error_detail`, a removed entry with `NOT_FOUND`. After 30 min
+  the step fails with `JOIN_WAIT_TIMEOUT` and the join goes on. The bound covers up to 15 min
+  waiting for a fresh box to settle, a join measured at more than 6 min and the WAN and LSA
+  gates, with margin. The step's output stays the add_hive answer.
 - **Result**: `{status: done|failed, execution_id, events, summary}`; HTTP-style status 200 when
   done, 409 otherwise. A redacted copy is written to
   `/var/lib/fluxbee/state/admin-executor/<hive>/executions/<execution_id>.json`.
@@ -289,9 +310,14 @@ Plan shape (`AdminExecutorPlan`, unknown fields refused):
 | `ai` | executor provider and model |
 | `blob.path` | blob root, default `/var/lib/fluxbee/blob` |
 | `storage.path` | root of the `/modules` store, default `/var/lib/fluxbee` |
-| `wan.authorized_hives` | listed in the OPA rollout report (`expected_hive_sets`) |
 
 Environment: `JSR_LOG_LEVEL`, `JSR_ADMIN_LISTEN`, the timeout overrides above.
+
+The list of hives is not in hive.yaml: it is the hive registry, `/var/lib/fluxbee/hives/<hive>/`,
+which `add_hive` creates and `remove_hive` deletes (FINDINGS A-48). The hives a policy write
+waits for, and the ones an OPA read reports as expected (`expected_hives_policy`), are the
+motherbee plus every registry entry whose `info.yaml` says `status: connected`
+(`opa_rollout_hives`, `expected_hive_sets`).
 
 ## State on disk
 
@@ -406,13 +432,13 @@ sentence; `GET /admin/actions/{action}` has the full text, the fields and an exa
 | `update` | `POST /hives/{hive}/update` | Run hive update workflow. |
 | `publish_cloud_endpoint` | `POST /hives/{hive}/cloud/endpoint` | Open IO.cloud's public Fluxbee Cloud endpoint on an edge and return its bearer token ONCE (admin mints it, the vault stores it, the edge only ever gets a reference). |
 | `sync_hint` | `POST /hives/{hive}/sync-hint` | Trigger a sync hint workflow. |
-| `inventory` | `GET /inventory`<br>`GET /inventory/summary`<br>`GET /inventory/{hive}`<br>`GET /hives/{hive}/inventory/summary` (listed, not served)<br>`GET /hives/{hive}/inventory/hive` (listed, not served) | Read global or per-hive inventory, including system-wide node visibility. |
+| `inventory` | `GET /inventory`<br>`GET /inventory/summary`<br>`GET /inventory/{hive}`<br>`GET /hives/{hive}/inventory/summary`<br>`GET /hives/{hive}/status` | Read global or per-hive inventory, including system-wide node visibility. |
 | `opa_compile_apply` | `POST /opa/policy` | Compile the user OPA policy on the motherbee and apply it on every hive (one global policy). |
 | `opa_compile` | `POST /opa/policy/compile` | Compile OPA policy. |
 | `opa_apply` | `POST /opa/policy/apply` | Apply the staged user OPA policy on every hive. |
 | `opa_rollback` | `POST /opa/policy/rollback` | Roll every hive back to the previous user OPA policy. |
 | `opa_clear` | `POST /opa/policy/clear` | Remove the user OPA policy on every hive (current, staged, backup): back to a fresh install; routers unload it. |
-| `opa_check` | `POST /opa/policy/check` | Validate OPA policy text without applying it. |
+| `opa_check` | `POST /opa/policy/check` | Validate OPA policy text without staging or applying it. |
 | `opa_get_policy` | `GET /hives/{hive}/opa/policy` | Read the user OPA policy a hive runs: version and hash, and the rego on the motherbee only (the other hives receive just the wasm). |
 | `opa_get_status` | `GET /hives/{hive}/opa/status` | Read OPA status for a hive. |
 | `wf_rules_compile_apply` | `POST /hives/{hive}/wf-rules` | Compile and apply a workflow definition through SY.wf-rules. |
@@ -443,16 +469,11 @@ Served by `handle_http`, `handle_hive_paths` and `handle_modules_paths` but not 
 | `POST /channels/externalize`, `POST /channels/unexternalize`, `GET /channels/externalized?edge_node=` | Edge channels as the operator (`ADMIN_ROUTES_OUTSIDE_ACTION_REGISTRY`) |
 | `POST /artifacts/unpublish` | Revoke any publication, body `{"publication_id": "pub:<uuid>"}` |
 | `GET /config/storage/metrics` | SY.storage inbox metrics |
-| `GET /hives/{hive}/status` | Inventory of one hive (`inventory`, scope `hive`) |
 | `GET /inventory/nodes` | Global inventory, nodes |
 | `GET /versions?hive=`, `GET /deployments?hive=`, `GET /drift-alerts?hive=` | The per-hive form of the global route |
 | `GET /opa/policy?hive=`, `GET /opa/status?hive=` | Hive-less forms of the OPA reads |
 | `POST /wf-rules`, `POST /wf-rules/{compile,apply,rollback,delete}`, `GET /wf-rules`, `GET /wf-rules/status` | Hive-less forms of the wf-rules actions (hive from the body or query) |
 | `GET /modules`, `GET /modules/{name}`, `GET /modules/{name}/{version}`, `POST /modules/{name}/{version}` | The module store: list, versions, download (tar or file), upload a tar |
-
-`GET /hives/{hive}/inventory/summary` and `GET /hives/{hive}/inventory/hive` are listed for
-`inventory` but have no handler: they get `405 METHOD_NOT_ALLOWED` naming `GET` as allowed. Use
-`GET /hives/{hive}/status` or `GET /inventory/{hive}`.
 
 ## Links
 

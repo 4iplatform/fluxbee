@@ -26,15 +26,20 @@ envelope in [protocol.md](protocol.md).
   `"broadcast"` (Broadcast) or any other string (Unicast: a UUID or a name) (`deserialize_dst`).
 - **Routers.** A router is `RT.<name>@<hive>`. Its name comes from `JSR_ROUTER_NAME`, by default
   `wan.gateway_name` of `hive.yaml`, itself `RT.gateway` by default (`RouterConfig::load_from_env`,
-  `src/config/mod.rs`). A hive may run several routers. The one whose name before `@` equals
-  `wan.gateway_name` is the **gateway** (`is_gateway_name`): only it opens WAN links, writes the
-  LSA region and advertises the hive to the other hives.
+  `src/config/mod.rs`). The router whose name before `@` equals `wan.gateway_name` is the
+  **gateway** (`is_gateway_name`): only it opens WAN links, writes the LSA region and advertises
+  the hive to the other hives.
+- **One router per hive** is the supported topology, and that router is the gateway: the package
+  ships one `rt-gateway` unit, the orchestrator starts and watches only that one, and SY.admin
+  refuses `add_router` and `delete_router` ([architecture.md](architecture.md) §4.2). The code
+  still has a mode with several routers in a hive, which is not supported. What this page says
+  about sibling routers and IRP describes that mode; §10 lists its known defects.
 - **Links.**
   - Nodes connect to `/var/run/fluxbee/routers/<uuid>.sock` (0666; the router UUID, no dashes).
-  - Routers of one hive talk over IRP, `irp-<uuid>.sock` (0600) in the same directory. Every
-    5 s each router scans `/dev/shm` for router regions of its hive with a fresh heartbeat
-    (`peer_discovery_loop`, `discover_peer_regions`); the router with the lower UUID dials the other
-    (`should_initiate_peer`).
+  - In the several-routers mode, the routers of one hive talk over IRP, `irp-<uuid>.sock` (0600)
+    in the same directory. Every 5 s each router scans `/dev/shm` for router regions of its hive
+    with a fresh heartbeat (`peer_discovery_loop`, `discover_peer_regions`); the router with the
+    lower UUID dials the other (`should_initiate_peer`).
   - Gateways talk over TCP (`wan.listen`, `wan.uplinks`). A gateway sends its LSA every 10 s and
     marks a hive stale after 40 s without one (`DEFAULT_HELLO_INTERVAL_MS`,
     `DEFAULT_DEAD_INTERVAL_MS`; fixed, not read from `hive.yaml`).
@@ -68,8 +73,11 @@ wrote it, never as the sender wrote it.
     `permissive` with a TLS peer) that HELLO hive must equal the hive in the peer's certificate
     (`handle_wan_connection`). The loader's default for `wan.mtls` is `disabled`; then the bucket
     rests on the HELLO alone.
-  - A non-empty `wan.authorized_hives` rejects every other hive (`WAN_REJECT`,
-    `HIVE_NOT_AUTHORIZED`).
+  - The motherbee admits a hive that connects to it only while its hive registry lists it, the
+    directory `/var/lib/fluxbee/hives/<hive>/` that `add_hive` creates and `remove_hive` deletes
+    (FINDINGS A-48). Any other hive gets `WAN_REJECT` with `HIVE_NOT_REGISTERED`, and an admitted
+    session closes within 10 s of its directory going away (`wan_peer_admission`,
+    `hive_unregistered`). The other hives keep no registry, so this check does not apply to them.
 
 Tests: `router_overwrites_spoofed_src_l2_name`,
 `edge01_wan_canonicalization_defeats_cross_hive_name_forgery`.
@@ -423,7 +431,7 @@ target := "AI.support.vip@motherbee" if {
 | --- | --- |
 | `POST /opa/policy` `{rego, entrypoint?, version?}` | compile on the motherbee, apply there, publish, tell every hive |
 | `POST /opa/policy/compile` | compile and stage on the motherbee; nothing runs it yet |
-| `POST /opa/policy/check` | compile only, to validate; SY.opa.rules stages the result as for compile, never applies it |
+| `POST /opa/policy/check` | compile only, to validate: no version, SY.opa.rules stages nothing and applies nothing |
 | `POST /opa/policy/apply` `{version}` | apply the staged policy; `version` is required and must be the staged one |
 | `POST /opa/policy/rollback` | make the backup current again and publish it |
 | `POST /opa/policy/clear` | remove current, staged and backup on every hive; the routers unload it; there is no rollback of a clear |
@@ -435,8 +443,9 @@ target := "AI.support.vip@motherbee" if {
   `opa_apply`, `opa_rollback`, `opa_clear`, `opa_get_policy`, `opa_get_status`.
 - A write that names a hive other than `motherbee` gets 400 `INVALID_REQUEST`. Without `hive`, the
   GETs ask every hive.
-- Compile, compile + apply and check take the next number from `/var/lib/fluxbee/opa-version.txt`,
-  or a `version` you pass, which must be greater (`next_opa_version`).
+- Compile and compile + apply take the next number from `/var/lib/fluxbee/opa-version.txt`, or a
+  `version` you pass, which must be greater (`next_opa_version`). A check takes none: its answer
+  is matched on a `check_id` it echoes (`send_opa_check`).
 - A write that changed the policy reports the hives that run it and the ones still pending
   (`build_opa_rollout_response`).
 
@@ -573,12 +582,20 @@ also goes, as a copy, to `target` (`fanout_taps_for_unicast`).
 
 ## 10. Known limits
 
-- **Broadcast duplicates in a hive with several routers.** Frames that arrive over IRP are not
-  checked against the broadcast cache (`handle_peer_message`). A router that is not the gateway
-  sends a `ttl >= 3` broadcast to the gateway twice, once with all its siblings and once toward the
-  WAN (`handle_message`), so the gateway's nodes receive it twice.
+These are defects of the several-routers mode, which is not supported (§1); they are not being
+fixed. With one router per hive none of them applies.
+
+- **Broadcast duplicates.** A broadcast reaches the gateway's nodes once per sibling router plus
+  one, because copies that arrive over IRP are not checked against the broadcast cache
+  (`handle_peer_message`). With a `ttl` of 4 or more, a broadcast that enters at another router
+  reaches the gateway twice from that router, once with all its siblings and once toward the WAN
+  (`handle_message`), and once more from every other sibling, which sends its copy on toward the
+  WAN, that is to the gateway (`forward_broadcast_to_wan`). One that enters at the gateway, from
+  one of its nodes or from the WAN, comes back once from each sibling the same way.
 - **Errors from the WAN reach only the gateway's nodes.** An `UNREACHABLE` or `TTL_EXCEEDED` that
-  comes back over the WAN is delivered only to a node of the gateway router (`handle_wan_message`).
+  comes back over the WAN is delivered only to a node of the gateway router: `handle_wan_message`
+  looks its destination up only among the gateway's own nodes, so an error for a node of a sibling
+  router is dropped.
 - **Hub-vouched nodes need the gateway.** Only the gateway holds the reachability table, so a node
   vouched for by the hub cannot reach a node on a sibling router (`remote_source_from_gateway`
   comment), nor can a sibling resolve it.

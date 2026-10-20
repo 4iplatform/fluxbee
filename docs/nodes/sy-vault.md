@@ -27,9 +27,9 @@ Source: `src/bin/sy_vault.rs` (the node) and `crates/fluxbee_sdk/src/vault.rs` (
 - Every client addresses the motherbee's vault. `VaultClient::for_primary` targets
   `SY.vault@<PRIMARY_HIVE_ID>`, and `PRIMARY_HIVE_ID` is `"motherbee"`
   (`crates/fluxbee_sdk/src/protocol.rs`).
-- SY.admin sends vault actions to `SY.vault@<hive in the URL>` (`handle_vault_command` in
-  `src/bin/sy_admin.rs`), so the HTTP routes below must name the motherbee:
-  `/hives/motherbee/vault/...`.
+- SY.admin sends vault actions to `SY.vault@motherbee` (`handle_vault_command` in
+  `src/bin/sy_admin.rs`). A route that names another hive, `/hives/worker1/vault/...` for
+  example, is refused with `400 INVALID_REQUEST` before anything is sent.
 
 ## How it starts
 
@@ -120,7 +120,7 @@ FINDINGS A-65 in the code comment):
 - Any other claimed ILK must be in the identity SHM with `handler_node` equal to the stamped
   name. Another node's ILK is refused (`UNAUTHORIZED`); an ILK the SHM does not hold yet gets
   `IDENTITY_UNAVAILABLE` (retryable).
-- A request with no ILK goes on unresolved: it can list, but reads no value.
+- A request with no ILK goes on unresolved: it can list and read metadata, but reads no value.
 - Refusals are answered and written to the audit log, never dropped.
 
 The code comment states the limit of this check: across hives the stamped name is authenticated
@@ -128,7 +128,7 @@ by the WAN router; on one host it is the name the process declared when it conne
 
 ## Who may read a secret
 
-`authorize_read` decides `VAULT_GET` and `VAULT_GET_METADATA`, in this order:
+`authorize_read` decides who reads a secret's value (`VAULT_GET`), in this order:
 
 1. The caller owns the secret (`metadata.ilk` equals the caller's ILK).
 2. The caller is in `assigned_ilks`.
@@ -138,15 +138,20 @@ by the WAN router; on one host it is the name the process declared when it conne
      hold yet (for example a worker's SY node while the motherbee's identity restarts) gets
      `IDENTITY_UNAVAILABLE`, not a refusal;
    - or the caller's tenant (from the SHM) is the secret's tenant.
-4. Anything else is `UNAUTHORIZED`. There is no administrator bypass: SY.admin cannot read a
-   secret owned by or assigned to another node, nor a non-root tenant's general secret.
+4. Anything else is `UNAUTHORIZED`. There is no administrator bypass: SY.admin cannot read the
+   value of a secret owned by or assigned to another node, nor of a non-root tenant's general
+   secret.
 
 For `VAULT_GET` the value goes out only while the secret's tenant is active
 (`ensure_tenant_active`, `tenant_check`): the root tenant always counts as active; otherwise the
 tenant's status is read from the identity SHM. `active` passes; any other status is
 `UNAUTHORIZED` with the status in the message; a tenant absent from the SHM (deleted, or identity
-not loaded) is `IDENTITY_UNAVAILABLE`. `VAULT_GET_METADATA` skips this check and never returns
-the value. Each successful `VAULT_GET` bumps `access_count` and `last_accessed_at`.
+not loaded) is `IDENTITY_UNAVAILABLE`. Each successful `VAULT_GET` bumps `access_count` and
+`last_accessed_at`.
+
+`VAULT_GET_METADATA` follows the list rule instead (`handle_get`): whoever may list reads the
+metadata of any key, as `VAULT_LIST` already shows it. Neither rule above applies, and the answer
+never carries the value.
 
 Consumers use `VaultClient::resolve_resource(resource_type, my_tenant)`: an owned secret first,
 then one assigned to it, then its own tenant's general secret, never another tenant's. Each step
@@ -158,7 +163,7 @@ lists with `limit: 1` (newest `updated_at` first) and then gets that key.
 | --- | --- |
 | `VAULT_PUT`, `VAULT_ASSIGN` | SY.admin and SY.architect of this hive (`Caller::is_well_known_admin`) |
 | `VAULT_DELETE`, `VAULT_ROTATE`, `VAULT_ROLLBACK` | SY.admin, SY.architect, or the secret's owner |
-| `VAULT_LIST` | anyone; metadata only (comment "Model D': list is open" in `VaultStore::list`) |
+| `VAULT_LIST`, `VAULT_GET_METADATA` | anyone; metadata only (comment "Model D': list is open" in `VaultStore::list`; `handle_get`) |
 
 Operators and Fluxbee Cloud write through SY.admin, which adds its own gates in
 `src/bin/sy_admin.rs`: the IO.cloud relay may only put, list, assign and delete inside the
@@ -192,8 +197,8 @@ except `NODE_STATUS_GET`.
   `KEY_NOT_FOUND` and the same message as a missing key (`ensure_in_tenant`,
   `VaultError::KeyNotFoundInTenant`), so naming another tenant's key reveals nothing. Only the
   audit row differs: `denied` instead of `error` (`audit_result_for_error`).
-- Get and get-metadata take no tenant: the key is looked up hive-wide and the read rules above
-  decide.
+- Get and get-metadata take no tenant: the key is looked up hive-wide; the read rules above
+  decide the value, and get-metadata answers whoever may list.
 
 ### Error codes
 
@@ -298,13 +303,8 @@ Served by SY.admin on the motherbee (`127.0.0.1:8080`, route table in `src/bin/s
 The put metadata accepts `owner_node` (resolved to `ilk`) and `assigned_nodes` (resolved to
 `assigned_ilks`).
 
-Known gap (seen 2026-10-17): the metadata route, like the value route, forwards only `key`, with
-no `tenant_id`. SY.vault applies the read rules to `VAULT_GET_METADATA`, and SY.admin is
-neither the owner nor an assigned node of such secrets and belongs to the root tenant (doc
-comment of `DEFAULT_ROOT_TENANT_ID`), so for an owned, assigned or non-root-tenant secret this
-route answers `UNAUTHORIZED` (the comment above `edge_channel_secret` in `handle_externalize`
-says the same for edge tokens). Use the list route with `tenant_id` and `prefix` to see that
-metadata.
+The metadata route answers for every key, owned, assigned and other tenants' secrets included
+(the list rule above); the value route still follows the read rules.
 
 ## Links
 

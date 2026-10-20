@@ -17,8 +17,8 @@ STAGE="$(mktemp -d)"
 trap 'rm -rf "$STAGE"' EXIT
 
 # Declarative base-node set (packaging/base-nodes.json) — the single source of truth for which
-# IO/AI nodes ship in a from-scratch install, shared with scripts/install.sh. Adding a node is a
-# one-line edit there. mf <section> emits TSV rows; node_bin_src resolves a built binary path.
+# IO/AI nodes ship in a from-scratch install. Adding a node is a one-line edit there.
+# mf <section> emits TSV rows; node_bin_src resolves a built binary path.
 MANIFEST="$ROOT_DIR/packaging/base-nodes.json"
 mf() { # singletons -> node\tcrate\tbin\tworkspace\tunit\trole_gate ; runtimes -> runtime\tcrate\tbin\tworkspace\tlang\tboot\tinstance
   python3 - "$MANIFEST" "$1" <<'PY'
@@ -59,10 +59,9 @@ cargo build --release -p sy-frontdesk-gov --bin sy-frontdesk-gov
 # ai.generic: `cargo build --bins` does NOT build this. The root Cargo.toml has BOTH a [package]
 # (json-router) and a [workspace], and without --workspace `--bins` only builds the ROOT package's
 # bins — workspace MEMBERS are skipped. That is why sy-frontdesk-gov above (also a member) needs its
-# own line, and ai-generic needs one too. scripts/install.sh already builds it; this line closes the
-# divergence base-nodes.json requires ("read by BOTH ... they must not diverge").
-# Without it the .deb build dies at [3/5] with "binary does not exist: target/release/ai_node_runner"
-# on any clean box — it only ever "worked" where a previous manual build had left the binary behind.
+# own line, and ai-generic needs one too. Without it the .deb build dies at [3/5] with "binary does
+# not exist: target/release/ai_node_runner" on any clean box — it only ever "worked" where a
+# previous manual build had left the binary behind.
 cargo build --release -p fluxbee-ai-nodes --bin ai_node_runner
 # Build every nodes/io crate the base-node manifest references (singleton infra nodes +
 # io.* runtimes). wf-generic (go) is built in the go step below.
@@ -101,8 +100,7 @@ done < <(mf singletons)
 
 # Runtimes: seed each into dist/runtimes/<runtime>/<version>/ (instanced, orchestrator-spawned;
 # no unit and no /usr/bin copy — Orchestrator launches named instances from this synced tree).
-# Driven by the manifest, so adding an IO/AI runtime to the install is a one-line edit there;
-# both this .deb path and scripts/install.sh consume the same list (they must not diverge).
+# Driven by the manifest, so adding an IO/AI runtime to the install is a one-line edit there.
 while IFS=$'\t' read -r rt crate bin ws lang boot inst; do
   [ -n "${rt:-}" ] || continue
   bash scripts/publish-runtime.sh \
@@ -117,7 +115,7 @@ done < <(mf runtimes)
 # replace the live manifest, orphaning hot-published runtimes (and the U-10 fix does not rescue
 # them: reconcile resolves the runtime KEY before the version). The .deb ships only the artifact
 # tree above; packaging/fluxbee-seed-runtimes registers it into the LIVE manifest at install
-# time, via the same merger scripts/install.sh has always used.
+# time, through scripts/publish-runtime.sh, the merger every runtime publish uses.
 rm -f "$DEST/var/lib/fluxbee/dist/runtimes/manifest.json"
 
 # dist/core manifest with the staged binaries' real hashes (baked in).
@@ -171,17 +169,17 @@ PY
 elif [ "${FLUXBEE_ALLOW_NO_SYNCTHING:-0}" = "1" ]; then
   echo "WARN: no vendored syncthing under vendor/ (FLUXBEE_ALLOW_NO_SYNCTHING=1) — blob/dist sync will be non-operational; add_hive with require_dist_sync will FAIL far from this cause"
 else
-  # Fail-closed (mirrors scripts/install.sh): a .deb without syncthing ships an
-  # orchestrator whose blob/dist-sync is dead, and a later add_hive with
-  # require_dist_sync fails far from the cause. Opt out with FLUXBEE_ALLOW_NO_SYNCTHING=1.
+  # Fail-closed: a .deb without syncthing ships an orchestrator whose blob/dist-sync is
+  # dead, and a later add_hive with require_dist_sync fails far from the cause. Opt out
+  # with FLUXBEE_ALLOW_NO_SYNCTHING=1.
   echo "ERROR: no vendored syncthing under vendor/ (expected vendor/syncthing/syncthing or vendor/<bundle>/syncthing)." >&2
   echo "       Set FLUXBEE_ALLOW_NO_SYNCTHING=1 to build anyway (blob/dist sync will be non-operational)." >&2
   exit 1
 fi
 
-# systemd units (mirrors scripts/install.sh install_unit). Not enabled here; the
-# postinst enables only sy-orchestrator, which brings up the rest (its bootstrap
-# starts rt-gateway + the SY services in the Model D' order).
+# systemd units. Not enabled here; the postinst enables only sy-orchestrator, which
+# brings up the rest (its bootstrap starts rt-gateway + the SY services in the Model D'
+# order).
 gen_unit() { # <name> [after] [wants] [role_regex]
   local name="$1" after="${2:-network.target}" wants="${3:-}" role_regex="${4:-}"
   { echo "[Unit]"; echo "Description=Fluxbee $name"; echo "After=$after"
@@ -227,8 +225,8 @@ gen_unit sy-edge "network.target rt-gateway.service" \
 # fresh-motherbee config (no lab uplink; wan.mtls set) — distinct from the dev
 # config/hive.yaml the lab uses.
 install -m0644 packaging/hive.yaml.example "$DEST/etc/fluxbee/hive.yaml.example"
-# SY.architect adds this handbook to its prompts, from where install.sh puts it. A static doc,
-# not config: replaced on every upgrade, so it is not a conffile.
+# SY.architect adds this handbook to its prompts, from /etc/fluxbee. A static doc, not config:
+# replaced on every upgrade, so it is not a conffile.
 install -m0644 "docs/archi/handbook_fluxbee.md" "$DEST/etc/fluxbee/handbook_fluxbee.md"
 # needrestart (Ubuntu) must not restart managed node units after an apt upgrade: the old runtime
 # directory is gone by then, and the orchestrator rebinds them itself (FINDINGS A-39).
@@ -249,8 +247,6 @@ ln -sf ../share/fluxbee/fluxbee-factory-reset "$DEST/usr/bin/fluxbee-factory-res
 install -m0755 scripts/publish-runtime.sh "$DEST/usr/share/fluxbee/publish-runtime.sh"
 install -m0755 packaging/fluxbee-seed-runtimes "$DEST/usr/share/fluxbee/fluxbee-seed-runtimes"
 ln -sf ../share/fluxbee/fluxbee-seed-runtimes "$DEST/usr/bin/fluxbee-seed-runtimes"
-# The postinst runs it on every install to fix values older packages shipped wrong (A-46).
-install -m0755 packaging/fluxbee-migrate-config "$DEST/usr/share/fluxbee/fluxbee-migrate-config"
 printf '%s\n' "$VERSION" > "$DEST/usr/share/fluxbee/base-runtime-version"
 chmod 0644 "$DEST/usr/share/fluxbee/base-runtime-version"
 

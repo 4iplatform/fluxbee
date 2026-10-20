@@ -28,9 +28,10 @@ Source: `src/bin/sy_storage.rs`. Data model and table details: [docs/reference/s
   if it is missing (`STORAGE_DB_NAME`, `ensure_database_exists`).
 - Without a usable secret it starts without a database (`sy.storage started without active DB
   backend`): stream batches are not acknowledged, so the streams keep them and resend.
-- It creates its tables at every start: `turns`, `storage_inbox`, `storage_migrations`, the
-  `cognition_*` tables (threads, contexts, reasons, cooccurrences, scopes, scope_instances,
-  memories, episodes) and `llm_usage`.
+- It creates its missing tables and indexes at every start (`ensure_schema`): `turns`,
+  `storage_inbox`, the `cognition_*` tables (threads, contexts, reasons, cooccurrences, scopes,
+  scope_instances, memories, episodes) and `llm_usage`. It runs no migrations: an existing table
+  is left as it is.
 - The motherbee's orchestrator waits for it at boot: the unit active within 30 s, then a
   successful `STORAGE_METRICS_GET` over the mesh within 30 s (`finish_bootstrap`,
   `wait_for_storage_db_ready` in `src/bin/sy_orchestrator.rs`). Until then every admin action
@@ -64,8 +65,8 @@ attempts (`INBOX_MAX_ATTEMPTS`); processed rows are purged after 24 h
 
 ## Failure behavior
 
-- A usable URL whose database cannot be created, reached or migrated: the process exits with
-  status 1 and systemd restarts it.
+- A usable URL whose database cannot be created or reached, or whose schema cannot be created:
+  the process exits with status 1 and systemd restarts it.
 - One of its PostgreSQL connections closes later: it exits and is restarted with new
   connections (`connect_or_exit_on_close`).
 - Not reachable: the routers keep each record for 120 s (32 MiB) in their streams; past that it

@@ -1,8 +1,9 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::fs;
 use std::hash::{Hash, Hasher};
-use std::io::{Cursor, Write};
+use std::io::{Cursor, Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -17,12 +18,13 @@ use fluxbee_ai_sdk::{
     FunctionCallingConfig, FunctionCallingRunner, FunctionLoopItem, FunctionLoopRunResult,
     FunctionRunInput, FunctionTool, FunctionToolDefinition, FunctionToolProvider,
     FunctionToolRegistry, HiveAiConfig, ImmediateConversationMemory, LanceDbThreadStateStore,
-    Message, ModelInputOptions, ModelSettings, NodeRuntime, ResolvedModelInput, RetryPolicy,
-    RuntimeConfig, TenantSource, ThreadStateStore, ThreadStateToolsProvider, UsageRecorder,
+    Message, ModelInputOptions, ModelSettings, NodeRuntime, ResolvedModelInput, RuntimeConfig,
+    TenantSource, ThreadStateStore, ThreadStateToolsProvider, ToolRunWatch, UsageRecorder,
 };
 use fluxbee_sdk::identity::{find_ilk_by_handler_node_from_hive_config, IdentityIlkOption};
 use fluxbee_sdk::managed_control_plane::{
-    bootstrap_managed_control_plane, persist_effective_config_with_root, ContractError,
+    bootstrap_managed_control_plane, build_node_status_response_payload,
+    persist_effective_config_with_root, ContractError, ControlPlaneErrorInfo,
     ManagedControlPlaneState, ManagedNodeConfigContract, ManagedNodeLifecycleState,
     DEFAULT_MANAGED_NODES_ROOT,
 };
@@ -36,19 +38,18 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tokio::fs as tokio_fs;
 use tokio::sync::{Mutex, OwnedMutexGuard, RwLock};
-use tokio::task::JoinSet;
 use tracing_subscriber::EnvFilter;
 
 const MSG_NODE_STATUS_GET: &str = "NODE_STATUS_GET";
 const MSG_NODE_STATUS_GET_RESPONSE: &str = "NODE_STATUS_GET_RESPONSE";
-const NODE_STATUS_DEFAULT_HANDLER_ENABLED: &str = "NODE_STATUS_DEFAULT_HANDLER_ENABLED";
-const NODE_STATUS_DEFAULT_HEALTH_STATE: &str = "NODE_STATUS_DEFAULT_HEALTH_STATE";
 const IMMEDIATE_INTERACTION_MAX_CHARS: usize = 1_200;
 const AI_RUNTIME_KIND: &str = "ai.generic";
 const DEFAULT_AGENT_ASSET_BLOB_ROOT: &str = "/var/lib/fluxbee/blob";
 const AGENT_ASSET_MAX_BYTES: u64 = 256 * 1024;
 const COMPOSED_PROMPT_MAX_BYTES: usize = 64 * 1024;
 const DEFAULT_COGNITIVE_POLL_INTERVAL_SECS: u64 = 10;
+/// The prompt of an agent with no definition: its ILK has no hashes, none of its assets loaded, or
+/// the node has not found its agent ILK (yet). The model then only answers that it is unconfigured.
 const DEFAULT_UNCONFIGURED_AGENT_PROMPT: &str = r#"You are an AI agent that has not yet received its operational configuration.
 
 If you receive a message, respond with this exact structure:
@@ -75,86 +76,35 @@ impl AiApiKeySource {
     }
 }
 
-#[derive(Debug, Deserialize)]
-struct RunnerConfig {
-    node: NodeSection,
-    #[serde(default)]
-    runtime: RuntimeSection,
-    behavior: BehaviorSection,
-}
-
-#[derive(Debug, Deserialize)]
+/// Where the node runs: its name, router socket and directories, from the orchestrator's
+/// environment (or the bootstrap arguments of a manual run).
+#[derive(Debug)]
 struct NodeSection {
     name: String,
-    #[serde(default = "default_version")]
     version: String,
-    #[serde(default = "default_router_socket")]
     router_socket: String,
-    #[serde(default = "default_state_dir")]
     uuid_persistence_dir: String,
-    #[serde(default = "default_config_dir")]
     config_dir: String,
-    #[serde(default = "default_dynamic_config_dir")]
     dynamic_config_dir: String,
 }
 
-#[derive(Debug, Deserialize)]
-#[serde(default)]
-struct RuntimeSection {
-    read_timeout_ms: u64,
-    handler_timeout_ms: u64,
-    write_timeout_ms: u64,
-    queue_capacity: usize,
-    worker_pool_size: usize,
-    retry_max_attempts: usize,
-    retry_initial_backoff_ms: u64,
-    retry_max_backoff_ms: u64,
-    metrics_log_interval_ms: u64,
-    #[serde(default)]
-    immediate_memory: ImmediateMemorySection,
-    #[serde(default)]
-    cognitive_definition: CognitiveDefinitionSection,
-}
-
+/// `runtime.immediate_memory`: applied with each `CONFIG_SET`, like `behavior`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 struct ImmediateMemorySection {
     enabled: bool,
     recent_interactions_max: usize,
-    active_operations_max: usize,
     summary_max_chars: usize,
-    summary_refresh_every_turns: usize,
-    trim_noise_enabled: bool,
 }
 
+/// `runtime.cognitive_definition`: read when the node starts, so a change applies at the next
+/// start.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 struct CognitiveDefinitionSection {
-    enabled: bool,
     poll_interval_secs: u64,
     #[serde(default)]
     blob_root: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
-enum BehaviorSection {
-    Echo,
-    AiChat(AiChatSection),
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct AiChatSection {
-    model: String,
-    #[serde(default)]
-    instructions: Option<InstructionsSourceConfig>,
-    #[serde(default)]
-    model_settings: Option<RunnerModelSettings>,
-    #[serde(default)]
-    base_url: Option<String>,
-    #[serde(default)]
-    capabilities: Option<BehaviorCapabilities>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -172,39 +122,6 @@ struct RunnerModelSettings {
     #[serde(default)]
     max_output_tokens: Option<u32>,
 }
-
-#[derive(Debug, Deserialize)]
-#[serde(untagged)]
-enum InstructionsSourceConfig {
-    // Backward-compatible short form:
-    // instructions: "You are concise"
-    Inline(String),
-    // Structured strategy:
-    // instructions:
-    //   source: file|env|inline|none
-    //   value: /path/file.txt | ENV_VAR | inline text
-    //   trim: true|false (default true)
-    Strategy(InstructionsStrategy),
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct InstructionsStrategy {
-    source: InstructionsSourceKind,
-    #[serde(default)]
-    value: Option<String>,
-    #[serde(default = "default_trim_true")]
-    trim: bool,
-}
-
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-enum InstructionsSourceKind {
-    Inline,
-    File,
-    Env,
-    None,
-}
-
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 struct EffectiveConfigDocument {
@@ -242,10 +159,6 @@ struct EffectiveBehaviorSection {
     #[serde(default)]
     model: Option<String>,
     #[serde(default)]
-    params: Option<EffectiveBehaviorParams>,
-    #[serde(default)]
-    instructions: Option<Value>,
-    #[serde(default)]
     model_settings: Option<RunnerModelSettings>,
     #[serde(default)]
     base_url: Option<String>,
@@ -253,60 +166,15 @@ struct EffectiveBehaviorSection {
     capabilities: Option<BehaviorCapabilities>,
 }
 
+/// The `runtime` the node reads. Timeouts, worker pool and queue are the AI runtime's own
+/// (`RuntimeConfig::default()`), not config.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
-struct EffectiveBehaviorParams {
-    #[serde(default)]
-    system_prompt: Option<String>,
-    #[serde(default)]
-    temperature: Option<f32>,
-    #[serde(default)]
-    top_p: Option<f32>,
-    #[serde(default)]
-    max_output_tokens: Option<u32>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 struct EffectiveRuntimeSection {
-    #[serde(default)]
-    read_timeout_ms: Option<u64>,
-    #[serde(default)]
-    handler_timeout_ms: Option<u64>,
-    #[serde(default)]
-    write_timeout_ms: Option<u64>,
-    #[serde(default)]
-    queue_capacity: Option<usize>,
-    #[serde(default)]
-    worker_pool_size: Option<usize>,
-    #[serde(default)]
-    retry_max_attempts: Option<usize>,
-    #[serde(default)]
-    retry_initial_backoff_ms: Option<u64>,
-    #[serde(default)]
-    retry_max_backoff_ms: Option<u64>,
-    #[serde(default)]
-    metrics_log_interval_ms: Option<u64>,
     #[serde(default)]
     immediate_memory: Option<ImmediateMemorySection>,
     #[serde(default)]
     cognitive_definition: Option<CognitiveDefinitionSection>,
-}
-
-impl Default for RuntimeSection {
-    fn default() -> Self {
-        Self {
-            read_timeout_ms: 30_000,
-            handler_timeout_ms: 60_000,
-            write_timeout_ms: 10_000,
-            queue_capacity: 128,
-            worker_pool_size: 4,
-            retry_max_attempts: 3,
-            retry_initial_backoff_ms: 200,
-            retry_max_backoff_ms: 2_000,
-            metrics_log_interval_ms: 30_000,
-            immediate_memory: ImmediateMemorySection::default(),
-            cognitive_definition: CognitiveDefinitionSection::default(),
-        }
-    }
 }
 
 impl Default for ImmediateMemorySection {
@@ -314,10 +182,7 @@ impl Default for ImmediateMemorySection {
         Self {
             enabled: false,
             recent_interactions_max: 10,
-            active_operations_max: 8,
             summary_max_chars: 1_600,
-            summary_refresh_every_turns: 3,
-            trim_noise_enabled: true,
         }
     }
 }
@@ -325,7 +190,6 @@ impl Default for ImmediateMemorySection {
 impl Default for CognitiveDefinitionSection {
     fn default() -> Self {
         Self {
-            enabled: true,
             poll_interval_secs: DEFAULT_COGNITIVE_POLL_INTERVAL_SECS,
             blob_root: None,
         }
@@ -356,10 +220,6 @@ fn default_multimodal_for_runtime() -> bool {
     true
 }
 
-fn default_trim_true() -> bool {
-    true
-}
-
 #[derive(Debug, Clone)]
 enum NodeBehavior {
     Echo,
@@ -369,7 +229,6 @@ enum NodeBehavior {
 #[derive(Debug, Clone)]
 struct AiChatRuntime {
     model: String,
-    instructions: Option<String>,
     model_settings: ModelSettings,
     base_url: Option<String>,
     immediate_memory: ImmediateMemorySection,
@@ -457,11 +316,14 @@ struct GeneratePngArtifactTool;
 #[derive(Clone)]
 struct GenerateJpegArtifactTool;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Default)]
 struct BehaviorContext {
     thread_id: Option<String>,
     src_ilk: Option<String>,
     trace_id: Option<String>,
+    /// Whether a tool has run in this message's tool loop (`ToolRunWatch`): a failure after that
+    /// is never answered as retryable, since sending the message again would run the tool again.
+    tool_ran: AtomicBool,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -592,13 +454,6 @@ struct ImmediateMemoryStore {
 }
 
 impl ImmediateMemoryStore {
-    fn path_for_node(state_dir: &std::path::Path, node_name: &str) -> PathBuf {
-        state_dir
-            .join("ai-nodes")
-            .join(sanitize_storage_key(node_name))
-            .join("immediate-memory")
-    }
-
     fn new(root_dir: impl Into<PathBuf>) -> Self {
         Self {
             root_dir: root_dir.into(),
@@ -696,6 +551,9 @@ struct ControlPlaneState {
     effective_config: Option<Value>,
     schema_version: u32,
     config_version: u64,
+    /// Why the config is not in use: the rejection of the `config.json` it booted with
+    /// (FAILED_CONFIG). A valid `CONFIG_SET` clears it.
+    last_error: Option<ControlPlaneErrorInfo>,
 }
 
 impl Default for ControlPlaneState {
@@ -706,13 +564,13 @@ impl Default for ControlPlaneState {
             effective_config: None,
             schema_version: 0,
             config_version: 0,
+            last_error: None,
         }
     }
 }
 
 #[derive(Debug, Clone)]
 struct CognitiveDefinitionRuntimeConfig {
-    enabled: bool,
     poll_interval: Duration,
     blob_root: PathBuf,
 }
@@ -721,7 +579,6 @@ impl From<CognitiveDefinitionSection> for CognitiveDefinitionRuntimeConfig {
     fn from(value: CognitiveDefinitionSection) -> Self {
         let poll_secs = value.poll_interval_secs.max(1).min(300);
         Self {
-            enabled: value.enabled,
             poll_interval: Duration::from_secs(poll_secs),
             blob_root: value
                 .blob_root
@@ -757,7 +614,6 @@ struct CognitiveAssetFailure {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct CognitiveDefinitionRuntimeState {
-    enabled: bool,
     definition_state: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     ilk_id: Option<String>,
@@ -777,17 +633,24 @@ struct CognitiveDefinitionRuntimeState {
     last_recompose_at: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     last_identity_seq: Option<u64>,
+    /// Why the last poll learned nothing (the identity SHM or an asset could not be read). The
+    /// definition above is still the last one resolved; the next poll tries again.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    last_poll_error: Option<String>,
     #[serde(skip)]
     last_hashes: CognitiveDefinitionHashes,
+    /// The system prompt every model call runs with. There is always one: the composed definition,
+    /// or the fixed "unconfigured" prompt while the agent has none.
     #[serde(skip)]
-    active_prompt: Option<String>,
+    active_prompt: String,
 }
 
 impl CognitiveDefinitionRuntimeState {
-    fn disabled() -> Self {
+    /// The agent's ILK is not found (yet): not in the identity SHM, not an `agent` ILK, the SHM is
+    /// unreadable, or the first poll has not run. It runs the "unconfigured" prompt.
+    fn unresolved() -> Self {
         Self {
-            enabled: false,
-            definition_state: "disabled".to_string(),
+            definition_state: "unresolved".to_string(),
             ilk_id: None,
             role_hash_loaded: None,
             skill_hashes_loaded: Vec::new(),
@@ -795,24 +658,23 @@ impl CognitiveDefinitionRuntimeState {
             personality_hash_loaded: None,
             failed_hashes: Vec::new(),
             prompt_truncated: false,
-            active_prompt_chars: 0,
+            active_prompt_chars: DEFAULT_UNCONFIGURED_AGENT_PROMPT.chars().count(),
             last_recompose_at: None,
             last_identity_seq: None,
+            last_poll_error: None,
             last_hashes: CognitiveDefinitionHashes::default(),
-            active_prompt: None,
-        }
-    }
-
-    fn unresolved(enabled: bool) -> Self {
-        Self {
-            enabled,
-            definition_state: if enabled { "unresolved" } else { "disabled" }.to_string(),
-            ..Self::disabled()
+            active_prompt: DEFAULT_UNCONFIGURED_AGENT_PROMPT.to_string(),
         }
     }
 
     fn has_failures(&self) -> bool {
         !self.failed_hashes.is_empty()
+    }
+
+    /// Whether the agent has a definition from its ILK (`composed`, `partial`, `error` or
+    /// `empty`). From then on only a definite new answer replaces it (`apply_identity_lookup`).
+    fn is_resolved(&self) -> bool {
+        self.last_identity_seq.is_some()
     }
 }
 
@@ -821,11 +683,9 @@ fn should_reuse_cognitive_state(
     ilk_id: &str,
     hashes: &CognitiveDefinitionHashes,
 ) -> bool {
-    current.enabled
-        && current.last_identity_seq.is_some()
+    current.last_identity_seq.is_some()
         && current.ilk_id.as_deref() == Some(ilk_id)
         && current.last_hashes == *hashes
-        && current.active_prompt.is_some()
         && !current.has_failures()
 }
 
@@ -850,6 +710,7 @@ impl AiNode for GenericAiNode {
             thread_id: extract_thread_id(&msg),
             src_ilk: extract_src_ilk(&msg),
             trace_id: Some(msg.routing.trace_id.clone()),
+            tool_ran: AtomicBool::new(false),
         };
         if msg.meta.msg_type.eq_ignore_ascii_case("user") {
             let src_ilk_source = src_ilk_source(&msg);
@@ -997,7 +858,10 @@ impl AiNode for GenericAiNode {
                                 "AI runtime request failed; replying with provider error payload"
                             );
                         }
-                        let payload = ai_runtime_error_payload(&err);
+                        let payload = ai_chat_failure_payload(
+                            &err,
+                            behavior_ctx.tool_ran.load(Ordering::Relaxed),
+                        );
                         return Ok(Some(build_reply_message_runtime_src(&msg, payload)));
                     }
                 }
@@ -1060,21 +924,20 @@ impl GenericAiNode {
             "AI chat request prepared"
         );
         if !tool_registry.definitions().is_empty() {
-            let base_instructions = self.effective_ai_instructions(ai).await;
-            let system = match (&base_instructions, &output_schema) {
-                (Some(base), Some(schema)) => Some(format!(
-                    "{base}\n\n{}",
+            let prompt = self.agent_prompt().await;
+            let system = match &output_schema {
+                Some(schema) => format!(
+                    "{prompt}\n\n{}",
                     build_output_schema_fallback_instruction(schema)?
-                )),
-                (None, Some(schema)) => Some(build_output_schema_fallback_instruction(schema)?),
-                (base, None) => base.clone(),
+                ),
+                None => prompt,
             };
             let model = create_function_calling_model(
                 credential.provider,
                 credential.api_key.clone(),
                 ai.base_url.clone(),
                 ai.model.clone(),
-                system,
+                Some(system),
                 ai.model_settings.clone(),
                 account,
             );
@@ -1087,8 +950,9 @@ impl GenericAiNode {
                 ai,
                 immediate_memory,
             );
+            let watched = ToolRunWatch::new(model.as_ref(), &ctx.tool_ran);
             let result = runner
-                .run_with_input(model.as_ref(), &tool_registry, run_input)
+                .run_with_input(&watched, &tool_registry, run_input)
                 .await?;
             if let Some(output) = extract_final_output_from_tool_results(&result)? {
                 tracing::info!(
@@ -1109,10 +973,9 @@ impl GenericAiNode {
             }
         }
 
-        let system = self.effective_ai_instructions(ai).await;
         let req = fluxbee_ai_sdk::llm::LlmRequest {
             model: ai.model.clone(),
-            system,
+            system: Some(self.agent_prompt().await),
             input,
             input_parts,
             output_schema,
@@ -1140,12 +1003,10 @@ impl GenericAiNode {
         .with_thread(ctx.thread_id.clone())
     }
 
-    async fn effective_ai_instructions(&self, ai: &AiChatRuntime) -> Option<String> {
-        let state = self.cognitive_definition.read().await;
-        state
-            .active_prompt
-            .clone()
-            .or_else(|| ai.instructions.clone())
+    /// The agent's system prompt: its composed definition, or the fixed "unconfigured" prompt
+    /// while it has none. Never absent, so a model call never runs without one.
+    async fn agent_prompt(&self) -> String {
+        self.cognitive_definition.read().await.active_prompt.clone()
     }
 
     fn build_function_run_input(
@@ -1217,7 +1078,6 @@ impl GenericAiNode {
                 memory_hit = true,
                 recent_interactions = record.recent_interactions.len(),
                 recent_interactions_max = ai.immediate_memory.recent_interactions_max,
-                active_operations_max = ai.immediate_memory.active_operations_max,
                 summary_max_chars = ai.immediate_memory.summary_max_chars,
                 summary_refresh_status = "not_implemented_v1",
                 "immediate memory loaded"
@@ -1230,7 +1090,6 @@ impl GenericAiNode {
                 thread_id = ?ctx.thread_id,
                 memory_hit = false,
                 recent_interactions_max = ai.immediate_memory.recent_interactions_max,
-                active_operations_max = ai.immediate_memory.active_operations_max,
                 summary_max_chars = ai.immediate_memory.summary_max_chars,
                 summary_refresh_status = "not_implemented_v1",
                 "immediate memory loaded"
@@ -1407,9 +1266,6 @@ impl GenericAiNode {
         };
         let (response_msg, response_payload) = if command.eq_ignore_ascii_case(MSG_NODE_STATUS_GET)
         {
-            if !env_bool(NODE_STATUS_DEFAULT_HANDLER_ENABLED, true) {
-                return Ok(None);
-            }
             (
                 MSG_NODE_STATUS_GET_RESPONSE,
                 self.build_node_status_get_response().await,
@@ -1627,6 +1483,7 @@ impl GenericAiNode {
         let prev_effective = state.effective_config.clone();
         let prev_schema = state.schema_version;
         let prev_version = state.config_version;
+        let prev_error = state.last_error.take();
 
         state.current_state = NodeLifecycleState::Configured;
         state.config_source = "persisted";
@@ -1650,6 +1507,7 @@ impl GenericAiNode {
             state.effective_config = prev_effective;
             state.schema_version = prev_schema;
             state.config_version = prev_version;
+            state.last_error = prev_error;
             return self.error_response(
                 "config_persist_error",
                 format!("Failed to persist config: {err}"),
@@ -1788,10 +1646,11 @@ impl GenericAiNode {
                     }
                 },
                 "optional_fields": [
-                    "config.behavior.instructions",
                     "config.behavior.model_settings",
                     "config.behavior.base_url",
-                    "config.behavior.capabilities.multimodal"
+                    "config.behavior.capabilities.multimodal",
+                    "config.runtime.immediate_memory",
+                    "config.runtime.cognitive_definition"
                 ],
                 "resources": [
                     {
@@ -1808,7 +1667,9 @@ impl GenericAiNode {
                     "config.behavior.vault_key is not accepted: nodes do not name a Vault key.",
                     "CONFIG_SET rejects secret-bearing fields such as config.secrets.openai.api_key, config.behavior.openai.api_key, config.behavior.api_key, and config.behavior.api_key_env.",
                     "ai.generic defaults behavior.capabilities.multimodal=true unless explicitly overridden.",
-                    "Cognitive role/skill/handbook prompt definition is loaded from identity SHM and blob://agent-assets/<hash>.json."
+                    "Cognitive role/skill/handbook prompt definition is loaded from identity SHM and blob://agent-assets/<hash>.json.",
+                    "The prompt is the agent ILK's definition; while it has none (no hashes, no asset loaded, ILK not found) the model runs a fixed unconfigured prompt.",
+                    "config.runtime.immediate_memory (enabled, recent_interactions_max, summary_max_chars) applies with CONFIG_SET; config.runtime.cognitive_definition (poll_interval_secs, blob_root) applies at the next start."
                 ]
             },
             "effective_config": state.effective_config.as_ref().map(redact_secrets),
@@ -1845,33 +1706,16 @@ impl GenericAiNode {
             "config_source": state.config_source,
             "schema_version": state.schema_version,
             "config_version": state.config_version,
-            "last_error": Value::Null
+            "last_error": state.last_error
         })
     }
 
+    /// A node that is not CONFIGURED refuses every completion, so it is not healthy: the SDK's
+    /// managed answer reports DEGRADED with its `lifecycle_state`, and `last_error` for a rejected
+    /// config.
     async fn build_node_status_get_response(&self) -> Value {
-        let lifecycle = self.control_plane.read().await.current_state;
-        // A node that failed to load its config (FAILED_CONFIG) or was never configured refuses every
-        // completion — it is NOT healthy. Previously health_state was hardcoded to "HEALTHY", so a
-        // broken node reported healthy to the orchestrator while silently rejecting all work, which
-        // hid the real failure. Derive health from the lifecycle and surface lifecycle_state so the
-        // operator sees WHY. DEGRADED is a soft signal (does not trigger an orchestrator restart loop,
-        // which would not fix a bad config anyway). The env override only applies to a Configured node
-        // so it can never force a broken node back to HEALTHY.
-        let health_state = if lifecycle == NodeLifecycleState::Configured {
-            std::env::var(NODE_STATUS_DEFAULT_HEALTH_STATE)
-                .ok()
-                .as_deref()
-                .map(normalize_health_state)
-                .unwrap_or("HEALTHY")
-        } else {
-            "DEGRADED"
-        };
-        json!({
-            "status": "ok",
-            "health_state": health_state,
-            "lifecycle_state": lifecycle.as_str(),
-        })
+        let state = self.control_plane.read().await;
+        build_node_status_response_payload(state.current_state, state.last_error.as_ref())
     }
 }
 
@@ -2047,9 +1891,6 @@ async fn cognitive_definition_poll_loop(
     config: CognitiveDefinitionRuntimeConfig,
     state: Arc<RwLock<CognitiveDefinitionRuntimeState>>,
 ) {
-    if !config.enabled {
-        return;
-    }
     loop {
         if let Err(err) =
             refresh_cognitive_definition(&node_name, &config_dir, &config, &state).await
@@ -2064,15 +1905,12 @@ async fn cognitive_definition_poll_loop(
     }
 }
 
-fn spawn_cognitive_definition_poll_if_enabled(
+fn spawn_cognitive_definition_poll(
     node_name: String,
     config_dir: PathBuf,
     config: CognitiveDefinitionRuntimeConfig,
     state: Arc<RwLock<CognitiveDefinitionRuntimeState>>,
 ) {
-    if !config.enabled {
-        return;
-    }
     tokio::spawn(cognitive_definition_poll_loop(
         node_name, config_dir, config, state,
     ));
@@ -2084,16 +1922,39 @@ async fn refresh_cognitive_definition(
     config: &CognitiveDefinitionRuntimeConfig,
     state: &Arc<RwLock<CognitiveDefinitionRuntimeState>>,
 ) -> Result<(), String> {
-    let resolved = match find_ilk_by_handler_node_from_hive_config(config_dir, node_name) {
+    let lookup = find_ilk_by_handler_node_from_hive_config(config_dir, node_name)
+        .map_err(|err| format!("identity SHM unavailable: {err}"));
+    let assets = AssetsFolder {
+        blob_root: &config.blob_root,
+    };
+    apply_identity_lookup(node_name, &assets, lookup, state).await
+}
+
+/// One poll's answer about the agent's ILK. Once the agent has a definition, only a definite new
+/// one replaces it: the ILK is there, is an agent, and every asset it names was read (an asset
+/// that is on disk but invalid is left out of it). An ILK that is no longer an agent is definite
+/// too. Anything else keeps the definition, says why in `last_poll_error` and is returned for the
+/// next poll to retry: the identity SHM unreadable, the ILK absent from it (a degraded identity
+/// replica rewrites the region with only the system ILKs), an asset missing (on a worker, a new
+/// asset arrives some seconds after the ILK names it) or unreadable. Before the agent's first
+/// definition, a missing ILK or asset is composed as it is (the "unconfigured" prompt, or a
+/// `partial` definition), and an unreadable asset keeps the "unconfigured" prompt.
+async fn apply_identity_lookup(
+    node_name: &str,
+    assets: &dyn AssetSource,
+    lookup: Result<Option<(u64, IdentityIlkOption)>, String>,
+    state: &Arc<RwLock<CognitiveDefinitionRuntimeState>>,
+) -> Result<(), String> {
+    let resolved = match lookup {
         Ok(value) => value,
-        Err(err) => {
-            update_cognitive_unresolved(state, format!("identity SHM unavailable: {err}")).await;
-            return Ok(());
-        }
+        Err(err) => return keep_cognitive_definition(state, err).await,
     };
     let Some((seq, ilk)) = resolved else {
-        update_cognitive_unresolved(state, "agent ILK not found for handler_node".to_string())
-            .await;
+        let missing = "agent ILK not found for handler_node".to_string();
+        if state.read().await.is_resolved() {
+            return keep_cognitive_definition(state, missing).await;
+        }
+        update_cognitive_unresolved(state, missing).await;
         return Ok(());
     };
     if !ilk.ilk_type.eq_ignore_ascii_case("agent") {
@@ -2107,11 +1968,23 @@ async fn refresh_cognitive_definition(
         let mut current = state.write().await;
         if should_reuse_cognitive_state(&current, &ilk.ilk_id, &hashes) {
             current.last_identity_seq = Some(seq);
+            current.last_poll_error = None;
             return Ok(());
         }
     }
 
-    let next = compose_cognitive_state(&config.blob_root, seq, &ilk, hashes)?;
+    let composed = match compose_cognitive_state(assets, seq, &ilk, hashes) {
+        Ok(composed) => composed,
+        Err(err) => return keep_cognitive_definition(state, err).await,
+    };
+    if !composed.missing.is_empty() && state.read().await.is_resolved() {
+        let waiting = format!(
+            "assets not on this hive yet: {}",
+            composed.missing.join(", ")
+        );
+        return keep_cognitive_definition(state, waiting).await;
+    }
+    let next = composed.state;
     tracing::info!(
         node_name = %node_name,
         ilk_id = %ilk.ilk_id,
@@ -2129,19 +2002,30 @@ async fn refresh_cognitive_definition(
     Ok(())
 }
 
+/// A poll with no definite answer: the definition stays as it is, the reason shows in CONFIG_GET
+/// (`last_poll_error`), and the error goes back to the poll loop, which tries again.
+async fn keep_cognitive_definition(
+    state: &Arc<RwLock<CognitiveDefinitionRuntimeState>>,
+    error: String,
+) -> Result<(), String> {
+    state.write().await.last_poll_error = Some(error.clone());
+    Err(error)
+}
+
+/// The agent's ILK is not an agent (or, before its first definition, not there): whatever it was
+/// composed from no longer applies, so the agent runs the "unconfigured" prompt until a poll finds
+/// an agent ILK (and composes it anew, since the failure recorded here rules out reusing a state).
 async fn update_cognitive_unresolved(
     state: &Arc<RwLock<CognitiveDefinitionRuntimeState>>,
     message: String,
 ) {
-    let mut guard = state.write().await;
-    guard.definition_state = "unresolved".to_string();
-    guard.active_prompt = None;
-    guard.active_prompt_chars = 0;
-    guard.failed_hashes = vec![CognitiveAssetFailure {
+    let mut unresolved = CognitiveDefinitionRuntimeState::unresolved();
+    unresolved.failed_hashes = vec![CognitiveAssetFailure {
         hash: String::new(),
         asset_type: "identity".to_string(),
         error: message,
     }];
+    *state.write().await = unresolved;
 }
 
 fn hashes_from_identity_ilk(ilk: &IdentityIlkOption) -> CognitiveDefinitionHashes {
@@ -2153,15 +2037,23 @@ fn hashes_from_identity_ilk(ilk: &IdentityIlkOption) -> CognitiveDefinitionHashe
     }
 }
 
+/// A definition composed from what its assets are, and the assets it names that are not on disk
+/// (yet), which `apply_identity_lookup` decides on.
+struct ComposedDefinition {
+    state: CognitiveDefinitionRuntimeState,
+    missing: Vec<String>,
+}
+
+/// Composes the definition the ILK names. A missing asset is left out (and listed in `missing`), an
+/// invalid one is left out; an unreadable one gives the composition up for this poll (`Err`).
 fn compose_cognitive_state(
-    blob_root: &std::path::Path,
+    assets: &dyn AssetSource,
     seq: u64,
     ilk: &IdentityIlkOption,
     hashes: CognitiveDefinitionHashes,
-) -> Result<CognitiveDefinitionRuntimeState, String> {
+) -> Result<ComposedDefinition, String> {
     if hashes.is_empty() {
-        return Ok(CognitiveDefinitionRuntimeState {
-            enabled: true,
+        let state = CognitiveDefinitionRuntimeState {
             definition_state: "empty".to_string(),
             ilk_id: Some(ilk.ilk_id.clone()),
             role_hash_loaded: None,
@@ -2173,65 +2065,53 @@ fn compose_cognitive_state(
             active_prompt_chars: DEFAULT_UNCONFIGURED_AGENT_PROMPT.chars().count(),
             last_recompose_at: Some(chrono::Utc::now().to_rfc3339()),
             last_identity_seq: Some(seq),
+            last_poll_error: None,
             last_hashes: hashes,
-            active_prompt: Some(DEFAULT_UNCONFIGURED_AGENT_PROMPT.to_string()),
+            active_prompt: DEFAULT_UNCONFIGURED_AGENT_PROMPT.to_string(),
+        };
+        return Ok(ComposedDefinition {
+            state,
+            missing: Vec::new(),
         });
     }
 
-    let mut failures = Vec::new();
+    let mut outcomes = AssetOutcomes::default();
     let role = match hashes.role_hash.as_deref() {
-        Some(hash) => match load_role_asset(blob_root, hash) {
-            Ok(asset) => Some(asset),
-            Err(err) => {
-                failures.push(CognitiveAssetFailure {
-                    hash: hash.to_string(),
-                    asset_type: "role".to_string(),
-                    error: err,
-                });
-                None
-            }
-        },
+        Some(hash) => take_asset(load_role_asset(assets, hash), hash, "role", &mut outcomes)?,
         None => None,
     };
 
     let mut skills = Vec::new();
     for hash in &hashes.skill_hashes {
-        match load_skill_asset(blob_root, hash) {
-            Ok(asset) => skills.push(asset),
-            Err(err) => failures.push(CognitiveAssetFailure {
-                hash: hash.clone(),
-                asset_type: "skill".to_string(),
-                error: err,
-            }),
+        if let Some(asset) =
+            take_asset(load_skill_asset(assets, hash), hash, "skill", &mut outcomes)?
+        {
+            skills.push(asset);
         }
     }
 
     let mut handbooks = Vec::new();
     for hash in &hashes.handbook_hashes {
-        match load_handbook_asset(blob_root, hash) {
-            Ok(asset) => handbooks.push(asset),
-            Err(err) => failures.push(CognitiveAssetFailure {
-                hash: hash.clone(),
-                asset_type: "handbook".to_string(),
-                error: err,
-            }),
+        if let Some(asset) = take_asset(
+            load_handbook_asset(assets, hash),
+            hash,
+            "handbook",
+            &mut outcomes,
+        )? {
+            handbooks.push(asset);
         }
     }
 
     let personality = match hashes.personality_hash.as_deref() {
-        Some(hash) => match load_personality_asset(blob_root, hash) {
-            Ok(asset) => Some(asset),
-            Err(err) => {
-                failures.push(CognitiveAssetFailure {
-                    hash: hash.to_string(),
-                    asset_type: "personality".to_string(),
-                    error: err,
-                });
-                None
-            }
-        },
+        Some(hash) => take_asset(
+            load_personality_asset(assets, hash),
+            hash,
+            "personality",
+            &mut outcomes,
+        )?,
         None => None,
     };
+    let AssetOutcomes { failures, missing } = outcomes;
 
     let loaded = LoadedCognitiveDefinition {
         role,
@@ -2256,8 +2136,7 @@ fn compose_cognitive_state(
         "error"
     };
 
-    Ok(CognitiveDefinitionRuntimeState {
-        enabled: true,
+    let state = CognitiveDefinitionRuntimeState {
         definition_state: definition_state.to_string(),
         ilk_id: Some(ilk.ilk_id.clone()),
         role_hash_loaded: loaded.role.as_ref().map(|asset| asset.hash.clone()),
@@ -2277,16 +2156,91 @@ fn compose_cognitive_state(
         active_prompt_chars: prompt.chars().count(),
         last_recompose_at: Some(chrono::Utc::now().to_rfc3339()),
         last_identity_seq: Some(seq),
+        last_poll_error: None,
         last_hashes: hashes,
-        active_prompt: Some(prompt),
-    })
+        active_prompt: prompt,
+    };
+    Ok(ComposedDefinition { state, missing })
 }
 
-fn load_role_asset(blob_root: &std::path::Path, hash: &str) -> Result<LoadedRoleAsset, String> {
-    let doc = load_cognitive_asset(blob_root, hash, "role")?;
-    let name = required_asset_string(&doc.name, "role.name")?;
+/// Why an agent asset did not load.
+#[derive(Debug)]
+enum AssetLoadError {
+    /// Not on disk (yet): on a worker, a new asset arrives some seconds after the ILK names it.
+    Missing(String),
+    /// On disk but not a valid asset (not a regular file, too large, wrong hash, invalid JSON or
+    /// type, a required field empty): waiting does not change it.
+    Invalid(String),
+    /// It could not be read this time.
+    Unreadable(String),
+}
+
+/// What a composition's assets gave besides the loaded ones: every one left out (`failures`) and,
+/// among them, those not on disk yet (`missing`).
+#[derive(Default)]
+struct AssetOutcomes {
+    failures: Vec<CognitiveAssetFailure>,
+    missing: Vec<String>,
+}
+
+/// Sorts one asset's load: loaded, left out (missing or invalid), or the whole composition given
+/// up for this poll (unreadable).
+fn take_asset<T>(
+    loaded: Result<T, AssetLoadError>,
+    hash: &str,
+    asset_type: &str,
+    outcomes: &mut AssetOutcomes,
+) -> Result<Option<T>, String> {
+    let error = match loaded {
+        Ok(asset) => return Ok(Some(asset)),
+        Err(AssetLoadError::Unreadable(error)) => {
+            return Err(format!(
+                "{asset_type} asset {hash} could not be read: {error}"
+            ))
+        }
+        Err(AssetLoadError::Missing(error)) => {
+            outcomes.missing.push(format!("{asset_type} {hash}"));
+            error
+        }
+        Err(AssetLoadError::Invalid(error)) => error,
+    };
+    outcomes.failures.push(CognitiveAssetFailure {
+        hash: hash.to_string(),
+        asset_type: asset_type.to_string(),
+        error,
+    });
+    Ok(None)
+}
+
+/// Where an agent asset's bytes come from: the assets folder (`AssetsFolder`), or a test's
+/// stand-in that scripts what each read gives.
+trait AssetSource: Sync {
+    fn read(&self, hash: &str) -> Result<Vec<u8>, AssetLoadError>;
+}
+
+/// `<blob_root>/agent-assets/<hash>.json`, read by `read_agent_asset`.
+struct AssetsFolder<'a> {
+    blob_root: &'a Path,
+}
+
+impl AssetSource for AssetsFolder<'_> {
+    fn read(&self, hash: &str) -> Result<Vec<u8>, AssetLoadError> {
+        read_agent_asset(
+            &self.blob_root.join("agent-assets"),
+            &format!("{hash}.json"),
+        )
+    }
+}
+
+fn load_role_asset(
+    assets: &dyn AssetSource,
+    hash: &str,
+) -> Result<LoadedRoleAsset, AssetLoadError> {
+    let doc = load_cognitive_asset(assets, hash, "role")?;
+    let name = required_asset_string(&doc.name, "role.name").map_err(AssetLoadError::Invalid)?;
     let description =
-        required_asset_string(doc.description.as_deref().unwrap_or(""), "role.description")?;
+        required_asset_string(doc.description.as_deref().unwrap_or(""), "role.description")
+            .map_err(AssetLoadError::Invalid)?;
     Ok(LoadedRoleAsset {
         hash: hash.to_string(),
         name,
@@ -2296,12 +2250,17 @@ fn load_role_asset(blob_root: &std::path::Path, hash: &str) -> Result<LoadedRole
     })
 }
 
-fn load_skill_asset(blob_root: &std::path::Path, hash: &str) -> Result<LoadedSkillAsset, String> {
-    let doc = load_cognitive_asset(blob_root, hash, "skill")?;
-    let name = required_asset_string(&doc.name, "skill.name")?;
+fn load_skill_asset(
+    assets: &dyn AssetSource,
+    hash: &str,
+) -> Result<LoadedSkillAsset, AssetLoadError> {
+    let doc = load_cognitive_asset(assets, hash, "skill")?;
+    let name = required_asset_string(&doc.name, "skill.name").map_err(AssetLoadError::Invalid)?;
     let instructions = clean_string_vec(doc.instructions);
     if instructions.is_empty() {
-        return Err("skill.instructions must contain at least one item".to_string());
+        return Err(AssetLoadError::Invalid(
+            "skill.instructions must contain at least one item".to_string(),
+        ));
     }
     Ok(LoadedSkillAsset {
         hash: hash.to_string(),
@@ -2318,13 +2277,16 @@ fn load_skill_asset(blob_root: &std::path::Path, hash: &str) -> Result<LoadedSki
 }
 
 fn load_handbook_asset(
-    blob_root: &std::path::Path,
+    assets: &dyn AssetSource,
     hash: &str,
-) -> Result<LoadedHandbookAsset, String> {
-    let doc = load_cognitive_asset(blob_root, hash, "handbook")?;
-    let name = required_asset_string(&doc.name, "handbook.name")?;
+) -> Result<LoadedHandbookAsset, AssetLoadError> {
+    let doc = load_cognitive_asset(assets, hash, "handbook")?;
+    let name =
+        required_asset_string(&doc.name, "handbook.name").map_err(AssetLoadError::Invalid)?;
     if doc.sections.is_empty() {
-        return Err("handbook.sections must contain at least one item".to_string());
+        return Err(AssetLoadError::Invalid(
+            "handbook.sections must contain at least one item".to_string(),
+        ));
     }
     Ok(LoadedHandbookAsset {
         hash: hash.to_string(),
@@ -2334,22 +2296,28 @@ fn load_handbook_asset(
 }
 
 fn load_personality_asset(
-    blob_root: &std::path::Path,
+    assets: &dyn AssetSource,
     hash: &str,
-) -> Result<LoadedPersonalityAsset, String> {
-    let doc = load_cognitive_asset(blob_root, hash, "personality")?;
-    let name = required_asset_string(&doc.name, "personality.name")?;
+) -> Result<LoadedPersonalityAsset, AssetLoadError> {
+    let doc = load_cognitive_asset(assets, hash, "personality")?;
+    let invalid = |message: &str| AssetLoadError::Invalid(message.to_string());
+    let name =
+        required_asset_string(&doc.name, "personality.name").map_err(AssetLoadError::Invalid)?;
     let system_fields = doc
         .system_fields
-        .ok_or_else(|| "personality.system_fields is required".to_string())?;
+        .ok_or_else(|| invalid("personality.system_fields is required"))?;
     if system_fields.timezone.trim().is_empty() {
-        return Err("personality.system_fields.timezone is required".to_string());
+        return Err(invalid("personality.system_fields.timezone is required"));
     }
     if system_fields.country_code.trim().is_empty() {
-        return Err("personality.system_fields.country_code is required".to_string());
+        return Err(invalid(
+            "personality.system_fields.country_code is required",
+        ));
     }
     if system_fields.primary_language.trim().is_empty() {
-        return Err("personality.system_fields.primary_language is required".to_string());
+        return Err(invalid(
+            "personality.system_fields.primary_language is required",
+        ));
     }
     Ok(LoadedPersonalityAsset {
         hash: hash.to_string(),
@@ -2363,39 +2331,91 @@ fn load_personality_asset(
 }
 
 fn load_cognitive_asset(
-    blob_root: &std::path::Path,
+    assets: &dyn AssetSource,
     hash: &str,
     expected_type: &str,
-) -> Result<CognitiveAssetDocument, String> {
-    validate_hash64(hash)?;
-    let path = blob_root.join("agent-assets").join(format!("{hash}.json"));
-    let meta = fs::metadata(&path)
-        .map_err(|err| format!("asset not readable '{}': {err}", path.display()))?;
+) -> Result<CognitiveAssetDocument, AssetLoadError> {
+    validate_hash64(hash).map_err(AssetLoadError::Invalid)?;
+    let raw = assets.read(hash)?;
+    // The name is the SHA-256 of the bytes SY.architect wrote: anything else is not that asset.
+    if fluxbee_sdk::blob::sha256_hex(&raw) != hash.trim().to_ascii_lowercase() {
+        return Err(AssetLoadError::Invalid(format!(
+            "asset content does not match its hash {hash}"
+        )));
+    }
+    let doc: CognitiveAssetDocument = serde_json::from_slice(&raw)
+        .map_err(|err| AssetLoadError::Invalid(format!("asset JSON invalid: {err}")))?;
+    if doc.asset_type != expected_type {
+        return Err(AssetLoadError::Invalid(format!(
+            "asset_type mismatch: expected '{expected_type}', got '{}'",
+            doc.asset_type
+        )));
+    }
+    Ok(doc)
+}
+
+/// The bytes of `<assets_dir>/<name>`, read without trusting what is under that name: the
+/// Syncthing user writes the assets folder (A-72). The name is opened without following a link and
+/// without blocking (`O_NOFOLLOW | O_NONBLOCK`), what was opened must be a regular file of at most
+/// `AGENT_ASSET_MAX_BYTES`, and no more than that limit plus one byte is ever read. A symlink, a
+/// FIFO or a directory planted under the name is an invalid asset, never followed or waited on.
+fn read_agent_asset(assets_dir: &Path, name: &str) -> Result<Vec<u8>, AssetLoadError> {
+    let path = assets_dir.join(name);
+    let not_opened = |err: std::io::Error| classify_unopened_asset(&path, err);
+    let dir = std::os::fd::OwnedFd::from(fs::File::open(assets_dir).map_err(not_opened)?);
+    let file = fs::File::from(
+        fluxbee_sdk::blob::safe_fs::open_file_no_follow(&dir, name).map_err(not_opened)?,
+    );
+    let meta = file.metadata().map_err(|err| {
+        AssetLoadError::Unreadable(format!("cannot stat '{}': {err}", path.display()))
+    })?;
+    if !meta.file_type().is_file() {
+        return Err(AssetLoadError::Invalid(format!(
+            "'{}' is not a regular file",
+            path.display()
+        )));
+    }
     if meta.len() > AGENT_ASSET_MAX_BYTES {
-        return Err(format!(
+        return Err(AssetLoadError::Invalid(format!(
             "asset too large: {} bytes > {}",
             meta.len(),
             AGENT_ASSET_MAX_BYTES
-        ));
+        )));
     }
-    let raw =
-        fs::read(&path).map_err(|err| format!("asset read failed '{}': {err}", path.display()))?;
-    // The name is the SHA-256 of the bytes SY.architect wrote: anything else is not that asset.
-    if fluxbee_sdk::blob::sha256_hex(&raw) != hash.trim().to_ascii_lowercase() {
-        return Err(format!(
-            "asset content does not match its hash '{}'",
+    let mut raw = Vec::with_capacity(meta.len() as usize);
+    file.take(AGENT_ASSET_MAX_BYTES + 1)
+        .read_to_end(&mut raw)
+        .map_err(|err| {
+            AssetLoadError::Unreadable(format!("asset read failed '{}': {err}", path.display()))
+        })?;
+    if raw.len() as u64 > AGENT_ASSET_MAX_BYTES {
+        return Err(AssetLoadError::Invalid(format!(
+            "asset too large: more than {AGENT_ASSET_MAX_BYTES} bytes"
+        )));
+    }
+    Ok(raw)
+}
+
+/// Why an asset name could not be opened: missing, a symlink or something that is not a regular
+/// file (invalid), or a read error such as a denied permission (unreadable). Looking at the name
+/// again only sorts the error; nothing is opened through it.
+fn classify_unopened_asset(path: &Path, err: std::io::Error) -> AssetLoadError {
+    if err.kind() == std::io::ErrorKind::NotFound {
+        return AssetLoadError::Missing(format!("asset missing '{}'", path.display()));
+    }
+    match fs::symlink_metadata(path) {
+        Ok(meta) if meta.file_type().is_symlink() => AssetLoadError::Invalid(format!(
+            "'{}' is a symbolic link; an asset is never read through one",
             path.display()
-        ));
+        )),
+        Ok(meta) if !meta.file_type().is_file() => {
+            AssetLoadError::Invalid(format!("'{}' is not a regular file", path.display()))
+        }
+        Err(missing) if missing.kind() == std::io::ErrorKind::NotFound => {
+            AssetLoadError::Missing(format!("asset missing '{}'", path.display()))
+        }
+        _ => AssetLoadError::Unreadable(format!("asset not readable '{}': {err}", path.display())),
     }
-    let doc: CognitiveAssetDocument =
-        serde_json::from_slice(&raw).map_err(|err| format!("asset JSON invalid: {err}"))?;
-    if doc.asset_type != expected_type {
-        return Err(format!(
-            "asset_type mismatch: expected '{expected_type}', got '{}'",
-            doc.asset_type
-        ));
-    }
-    Ok(doc)
 }
 
 fn validate_hash64(hash: &str) -> Result<(), String> {
@@ -2710,16 +2730,6 @@ fn truncate_to_byte_budget(value: &mut String, max_bytes: usize) {
         end -= 1;
     }
     value.truncate(end);
-}
-
-fn normalize_health_state(raw: &str) -> &'static str {
-    match raw.trim().to_ascii_uppercase().as_str() {
-        "HEALTHY" => "HEALTHY",
-        "DEGRADED" => "DEGRADED",
-        "ERROR" => "ERROR",
-        "UNKNOWN" => "UNKNOWN",
-        _ => "HEALTHY",
-    }
 }
 
 fn extract_final_output_from_tool_results(
@@ -3335,17 +3345,6 @@ fn build_raster_bytes(
             ))
         })?;
     Ok(cursor.into_inner())
-}
-
-fn env_bool(key: &str, default: bool) -> bool {
-    std::env::var(key)
-        .ok()
-        .map(|raw| match raw.trim().to_ascii_lowercase().as_str() {
-            "1" | "true" | "yes" | "on" => true,
-            "0" | "false" | "no" | "off" => false,
-            _ => default,
-        })
-        .unwrap_or(default)
 }
 
 #[async_trait]
@@ -3991,164 +3990,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         )
         .init();
 
+    // SY.orchestrator launches the node with no arguments; its name comes from FLUXBEE_NODE_NAME
+    // and its config from the node-dir config.json (run_managed_node).
     let args = parse_runner_args()?;
-    let config_paths = args.config_paths;
-    let mut loaded = Vec::with_capacity(config_paths.len());
-    for path in &config_paths {
-        let raw = fs::read_to_string(path)?;
-        let cfg: RunnerConfig = serde_yaml::from_str(&raw)?;
-        loaded.push((path.clone(), cfg));
-    }
-
-    ensure_unique_node_names(&loaded)?;
-
-    if loaded.is_empty() {
-        let bootstrap_node = bootstrap_node_from_args(&args.bootstrap)?;
-        tracing::info!(
-            node_name = %bootstrap_node.name,
-            "starting ai_node_runner without YAML config (UNCONFIGURED mode)"
-        );
-        run_unconfigured_bootstrap(bootstrap_node).await?;
-        return Ok(());
-    }
-
-    let mut runners = JoinSet::new();
-    for (config_path, cfg) in loaded {
-        runners.spawn(async move { run_one_config(config_path, cfg).await });
-    }
-
-    while let Some(result) = runners.join_next().await {
-        match result {
-            Ok(Ok(())) => {}
-            Ok(Err(err)) => return Err(err),
-            Err(err) => return Err(format!("runner task join error: {err}").into()),
-        }
-    }
-    Ok(())
-}
-
-async fn run_one_config(
-    config_path: PathBuf,
-    cfg: RunnerConfig,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let startup_effective_doc = build_startup_effective_config_doc(&cfg);
-    let startup_effective_doc =
-        materialize_effective_defaults(&cfg.node.name, startup_effective_doc);
-    let startup_effective_config = serde_json::to_value(&startup_effective_doc)?;
-    let behavior = build_behavior(&cfg)?;
-    let node_config_dir = cfg.node.config_dir.clone();
-    let runner_node_name = cfg.node.name.clone();
-    let runner_router_socket = PathBuf::from(cfg.node.router_socket);
-    let runner_uuid_persistence_dir = PathBuf::from(cfg.node.uuid_persistence_dir);
-    let runner_version = cfg.node.version.clone();
-    let runner_node_config = NodeConfig {
-        name: runner_node_name.clone(),
-        router_socket: runner_router_socket.clone(),
-        uuid_persistence_dir: runner_uuid_persistence_dir.clone(),
-        uuid_mode: NodeUuidMode::Persistent,
-        config_dir: PathBuf::from(node_config_dir.clone()),
-        version: runner_version.clone(),
-    };
-
-    let runtime_config = RuntimeConfig {
-        read_timeout: Duration::from_millis(cfg.runtime.read_timeout_ms),
-        handler_timeout: Duration::from_millis(cfg.runtime.handler_timeout_ms),
-        write_timeout: Duration::from_millis(cfg.runtime.write_timeout_ms),
-        queue_capacity: cfg.runtime.queue_capacity,
-        worker_pool_size: cfg.runtime.worker_pool_size,
-        retry_policy: RetryPolicy {
-            max_attempts: cfg.runtime.retry_max_attempts,
-            initial_backoff: Duration::from_millis(cfg.runtime.retry_initial_backoff_ms),
-            max_backoff: Duration::from_millis(cfg.runtime.retry_max_backoff_ms),
-        },
-        metrics_log_interval: Duration::from_millis(cfg.runtime.metrics_log_interval_ms),
-        // The agent's ILK is the sender of its replies (docs/router-stream-v1.md §6.2).
-        self_ilk_id: fluxbee_sdk::read_self_ilk_from_env(),
-    };
-
-    tracing::info!(
-        config = %config_path.display(),
-        node_name = %runner_node_name,
-        "starting ai_node_runner node instance"
-    );
-
-    let node_name = runner_node_name.clone();
-    // Static/dev path: keep the per-node store layout under the YAML-configured dynamic dir.
-    let static_state_dir =
-        infer_state_dir_from_dynamic(&PathBuf::from(&cfg.node.dynamic_config_dir));
-    let thread_state_store = init_thread_state_store(
-        &node_name,
-        LanceDbThreadStateStore::path_for_node(&static_state_dir, &node_name),
-    )
-    .await;
-    let immediate_memory_store = init_immediate_memory_store(
-        &node_name,
-        ImmediateMemoryStore::path_for_node(&static_state_dir, &node_name),
-    )
-    .await;
-    let cognitive_definition_config =
-        CognitiveDefinitionRuntimeConfig::from(cfg.runtime.cognitive_definition.clone());
-    let cognitive_definition = Arc::new(RwLock::new(CognitiveDefinitionRuntimeState::unresolved(
-        cognitive_definition_config.enabled,
-    )));
-    let self_ilk_id = fluxbee_sdk::read_self_ilk_from_env();
-    let self_tenant_id = fluxbee_sdk::read_self_tenant_from_env();
-    match (&self_ilk_id, &self_tenant_id) {
-        (Some(ilk), Some(tenant)) => {
-            tracing::info!(
-                node_name = %node_name,
-                self_ilk_id = %ilk,
-                self_tenant_id = %tenant,
-                "AI node self identity loaded from FLUXBEE_NODE_ILK_ID / FLUXBEE_NODE_TENANT_ID"
-            );
-        }
-        _ => {
-            tracing::warn!(
-                node_name = %node_name,
-                has_ilk = self_ilk_id.is_some(),
-                has_tenant = self_tenant_id.is_some(),
-                "AI node missing FLUXBEE_NODE_ILK_ID and/or FLUXBEE_NODE_TENANT_ID; \
-                 outgoing identity-bearing calls (vault, identity) will fail until \
-                 the orchestrator re-spawns this node with the env vars."
-            );
-        }
-    }
-    let profile = build_ai_generic_rpc_profile()
-        .map_err(|err| format!("ai-generic rpc profile invalid: {err}"))?;
-    let dispatcher =
-        RouterDispatcher::connect_with_retry(runner_node_config, Duration::from_secs(1), profile)
-            .await?;
-    let vault = vault_client_for(dispatcher.clone(), &node_name, self_ilk_id.as_deref());
-    let usage = UsageRecorder::start(dispatcher.clone());
-    let node = GenericAiNode {
-        node_name,
-        self_ilk_id,
-        self_tenant_id,
-        behavior: Arc::new(RwLock::new(Some(behavior))),
-        config_dir: PathBuf::from(node_config_dir),
-        thread_state_store,
-        immediate_memory_store,
-        vault,
-        usage,
-        control_plane: Arc::new(RwLock::new(ControlPlaneState {
-            current_state: NodeLifecycleState::Configured,
-            config_source: "yaml",
-            effective_config: Some(startup_effective_config),
-            schema_version: 1,
-            config_version: 1,
-            ..ControlPlaneState::default()
-        })),
-        cognitive_definition: cognitive_definition.clone(),
-    };
-    spawn_cognitive_definition_poll_if_enabled(
-        node.node_name.clone(),
-        node.config_dir.clone(),
-        cognitive_definition_config,
-        cognitive_definition,
-    );
-    let runtime = NodeRuntime::new(dispatcher, node);
-    runtime.run_with_config(runtime_config).await?;
-    Ok(())
+    let node = bootstrap_node_from_args(&args)?;
+    tracing::info!(node_name = %node.name, "starting ai_node_runner");
+    run_managed_node(node).await
 }
 
 fn build_ai_generic_rpc_profile() -> Result<OperationalRouteProfile, fluxbee_sdk::RpcError> {
@@ -4195,10 +4042,10 @@ impl ManagedNodeConfigContract for AiGenericContract {
     }
     fn optional_fields(&self) -> &'static [&'static str] {
         &[
-            "behavior.instructions",
             "behavior.model_settings",
             "behavior.base_url",
             "behavior.capabilities",
+            "runtime.immediate_memory",
             "runtime.cognitive_definition",
         ]
     }
@@ -4240,26 +4087,23 @@ fn control_plane_state_from_managed(cp: ManagedControlPlaneState) -> ControlPlan
         effective_config: cp.effective_config,
         schema_version: cp.schema_version,
         config_version: cp.config_version,
+        last_error: cp.last_error,
     }
 }
 
-/// Resolve the effective `runtime.cognitive_definition` section for the managed bootstrap path from
-/// the config source that will actually provide the behavior: the persisted dynamic config (latest
-/// applied CONFIG_SET) if present, else the spawn config. Absent -> Default (enabled=true), so a node
-/// that never sets the field keeps the historical default. Extracted as a pure fn so the
-/// config-honoring contract (BUG-3) is unit-testable without a live filesystem/dispatcher.
+/// The `runtime.cognitive_definition` of the config the node boots with, or its defaults when the
+/// node has no config or the config leaves it out (BUG-3: the managed path honors it). It is read
+/// at start only.
 fn effective_cognitive_section(
-    persisted: Option<&EffectiveConfigDocument>,
-    spawn: Option<&EffectiveConfigDocument>,
+    config: Option<&EffectiveConfigDocument>,
 ) -> CognitiveDefinitionSection {
-    persisted
-        .or(spawn)
+    config
         .and_then(|cfg| cfg.runtime.as_ref())
         .and_then(|runtime| runtime.cognitive_definition.clone())
         .unwrap_or_default()
 }
 
-async fn run_unconfigured_bootstrap(
+async fn run_managed_node(
     node: NodeSection,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let node_name = node.name.clone();
@@ -4298,11 +4142,9 @@ async fn run_unconfigured_bootstrap(
         .effective_config
         .as_ref()
         .and_then(|v| serde_json::from_value(v.clone()).ok());
-    let cognitive_section = effective_cognitive_section(effective_doc.as_ref(), None);
+    let cognitive_section = effective_cognitive_section(effective_doc.as_ref());
     let cognitive_definition_config = CognitiveDefinitionRuntimeConfig::from(cognitive_section);
-    let cognitive_definition = Arc::new(RwLock::new(CognitiveDefinitionRuntimeState::unresolved(
-        cognitive_definition_config.enabled,
-    )));
+    let cognitive_definition = Arc::new(RwLock::new(CognitiveDefinitionRuntimeState::unresolved()));
     let behavior = effective_doc
         .as_ref()
         .and_then(|doc| build_behavior_from_effective_config(doc).ok());
@@ -4347,7 +4189,7 @@ async fn run_unconfigured_bootstrap(
         control_plane: Arc::new(RwLock::new(state)),
         cognitive_definition: cognitive_definition.clone(),
     };
-    spawn_cognitive_definition_poll_if_enabled(
+    spawn_cognitive_definition_poll(
         ai_node.node_name.clone(),
         ai_node.config_dir.clone(),
         cognitive_definition_config,
@@ -4368,44 +4210,31 @@ struct BootstrapArgs {
     dynamic_config_dir: Option<String>,
 }
 
-#[derive(Debug, Default)]
-struct RunnerArgs {
-    config_paths: Vec<PathBuf>,
-    bootstrap: BootstrapArgs,
-}
-
-fn parse_runner_args() -> Result<RunnerArgs, Box<dyn std::error::Error + Send + Sync>> {
+fn parse_runner_args() -> Result<BootstrapArgs, Box<dyn std::error::Error + Send + Sync>> {
     let args = std::env::args().skip(1).collect::<Vec<_>>();
-    let mut parsed = RunnerArgs::default();
+    let mut parsed = BootstrapArgs::default();
     let mut i = 0usize;
     while i < args.len() {
         match args[i].as_str() {
-            "--config" => {
-                let Some(path) = args.get(i + 1) else {
-                    return Err("missing path after --config".to_string().into());
-                };
-                parsed.config_paths.push(PathBuf::from(path));
-                i += 2;
-            }
             "--node-name" => {
                 let Some(value) = args.get(i + 1) else {
                     return Err("missing value after --node-name".to_string().into());
                 };
-                parsed.bootstrap.node_name = Some(value.clone());
+                parsed.node_name = Some(value.clone());
                 i += 2;
             }
             "--version" => {
                 let Some(value) = args.get(i + 1) else {
                     return Err("missing value after --version".to_string().into());
                 };
-                parsed.bootstrap.version = Some(value.clone());
+                parsed.version = Some(value.clone());
                 i += 2;
             }
             "--router-socket" => {
                 let Some(value) = args.get(i + 1) else {
                     return Err("missing value after --router-socket".to_string().into());
                 };
-                parsed.bootstrap.router_socket = Some(value.clone());
+                parsed.router_socket = Some(value.clone());
                 i += 2;
             }
             "--uuid-persistence-dir" => {
@@ -4414,14 +4243,14 @@ fn parse_runner_args() -> Result<RunnerArgs, Box<dyn std::error::Error + Send + 
                         .to_string()
                         .into());
                 };
-                parsed.bootstrap.uuid_persistence_dir = Some(value.clone());
+                parsed.uuid_persistence_dir = Some(value.clone());
                 i += 2;
             }
             "--config-dir" => {
                 let Some(value) = args.get(i + 1) else {
                     return Err("missing value after --config-dir".to_string().into());
                 };
-                parsed.bootstrap.config_dir = Some(value.clone());
+                parsed.config_dir = Some(value.clone());
                 i += 2;
             }
             "--dynamic-config-dir" => {
@@ -4430,7 +4259,7 @@ fn parse_runner_args() -> Result<RunnerArgs, Box<dyn std::error::Error + Send + 
                         .to_string()
                         .into());
                 };
-                parsed.bootstrap.dynamic_config_dir = Some(value.clone());
+                parsed.dynamic_config_dir = Some(value.clone());
                 i += 2;
             }
             other => {
@@ -4453,7 +4282,7 @@ fn bootstrap_node_from_args(
             Some(resolved)
         }
     }).ok_or_else(|| {
-        "when no --config is provided, pass --node-name (or FLUXBEE_NODE_NAME/AI_NODE_NAME env var)".to_string()
+        "pass --node-name, or set FLUXBEE_NODE_NAME (or AI_NODE_NAME)".to_string()
     })?;
     Ok(NodeSection {
         name,
@@ -4483,59 +4312,6 @@ fn bootstrap_node_from_args(
             .or_else(|| std::env::var("AI_DYNAMIC_CONFIG_DIR").ok())
             .unwrap_or_else(default_dynamic_config_dir),
     })
-}
-
-fn ensure_unique_node_names(
-    configs: &[(PathBuf, RunnerConfig)],
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let mut names = HashSet::new();
-    for (path, cfg) in configs {
-        if !names.insert(cfg.node.name.clone()) {
-            return Err(format!(
-                "duplicate node name '{}' found in config {}",
-                cfg.node.name,
-                path.display()
-            )
-            .into());
-        }
-    }
-    Ok(())
-}
-
-fn build_behavior(
-    cfg: &RunnerConfig,
-) -> Result<NodeBehavior, Box<dyn std::error::Error + Send + Sync>> {
-    let behavior = match &cfg.behavior {
-        BehaviorSection::Echo => NodeBehavior::Echo,
-        BehaviorSection::AiChat(ai) => {
-            require_nonempty("behavior.model", &ai.model)?;
-            validate_managed_base_url(&ai.base_url)?;
-            let instructions = resolve_instructions(&ai.instructions)?;
-            let model_settings = ai
-                .model_settings
-                .as_ref()
-                .map(|v| ModelSettings {
-                    temperature: v.temperature,
-                    top_p: v.top_p,
-                    max_output_tokens: v.max_output_tokens,
-                })
-                .unwrap_or_default();
-            let multimodal = ai
-                .capabilities
-                .as_ref()
-                .and_then(|caps| caps.multimodal)
-                .unwrap_or_else(default_multimodal_for_runtime);
-            NodeBehavior::AiChat(AiChatRuntime {
-                model: ai.model.clone(),
-                instructions,
-                model_settings,
-                base_url: ai.base_url.clone(),
-                immediate_memory: cfg.runtime.immediate_memory.clone(),
-                multimodal,
-            })
-        }
-    };
-    Ok(behavior)
 }
 
 fn require_nonempty(
@@ -4617,7 +4393,6 @@ fn build_behavior_from_effective_config(
                 .ok_or_else(|| "missing behavior.model for ai_chat".to_string())?;
             require_nonempty("behavior.model", &model)?;
 
-            let instructions = extract_instructions_from_effective_config(behavior);
             let model_settings = extract_model_settings_from_effective_config(behavior);
             let base_url = behavior.base_url.clone();
             validate_managed_base_url(&base_url)?;
@@ -4634,7 +4409,6 @@ fn build_behavior_from_effective_config(
 
             Ok(NodeBehavior::AiChat(AiChatRuntime {
                 model,
-                instructions,
                 model_settings,
                 base_url,
                 immediate_memory,
@@ -4642,125 +4416,6 @@ fn build_behavior_from_effective_config(
             }))
         }
         other => Err(format!("unsupported behavior.kind '{other}'").into()),
-    }
-}
-
-fn resolve_instructions(
-    cfg: &Option<InstructionsSourceConfig>,
-) -> Result<Option<String>, Box<dyn std::error::Error + Send + Sync>> {
-    let Some(cfg) = cfg else {
-        return Ok(None);
-    };
-
-    match cfg {
-        InstructionsSourceConfig::Inline(value) => Ok(Some(value.clone())),
-        InstructionsSourceConfig::Strategy(strategy) => match strategy.source {
-            InstructionsSourceKind::Inline => {
-                let Some(value) = strategy.value.clone() else {
-                    return Err("instructions.source=inline requires instructions.value".into());
-                };
-                Ok(Some(maybe_trim(value, strategy.trim)))
-            }
-            InstructionsSourceKind::File => {
-                let Some(path) = strategy.value.clone() else {
-                    return Err(
-                        "instructions.source=file requires instructions.value (path)".into(),
-                    );
-                };
-                let content = fs::read_to_string(path)?;
-                Ok(Some(maybe_trim(content, strategy.trim)))
-            }
-            InstructionsSourceKind::Env => {
-                let Some(env_name) = strategy.value.clone() else {
-                    return Err(
-                        "instructions.source=env requires instructions.value (env var)".into(),
-                    );
-                };
-                let value = std::env::var(&env_name).map_err(|_| {
-                    format!("missing env var for instructions source env: {}", env_name)
-                })?;
-                Ok(Some(maybe_trim(value, strategy.trim)))
-            }
-            InstructionsSourceKind::None => Ok(None),
-        },
-    }
-}
-
-fn maybe_trim(value: String, trim: bool) -> String {
-    if trim {
-        value.trim().to_string()
-    } else {
-        value
-    }
-}
-
-fn build_startup_effective_config_doc(cfg: &RunnerConfig) -> EffectiveConfigDocument {
-    let behavior = match &cfg.behavior {
-        BehaviorSection::Echo => EffectiveBehaviorSection {
-            kind: "echo".to_string(),
-            ..EffectiveBehaviorSection::default()
-        },
-        BehaviorSection::AiChat(ai) => EffectiveBehaviorSection {
-            kind: "ai_chat".to_string(),
-            model: Some(ai.model.clone()),
-            instructions: Some(format_instructions_snapshot(&ai.instructions)),
-            model_settings: ai.model_settings.clone(),
-            base_url: ai.base_url.clone(),
-            capabilities: Some(BehaviorCapabilities {
-                multimodal: Some(
-                    ai.capabilities
-                        .as_ref()
-                        .and_then(|caps| caps.multimodal)
-                        .unwrap_or_else(default_multimodal_for_runtime),
-                ),
-            }),
-            ..EffectiveBehaviorSection::default()
-        },
-    };
-
-    EffectiveConfigDocument {
-        tenant_id: None,
-        node: Some(EffectiveNodeSection {
-            name: Some(cfg.node.name.clone()),
-            version: Some(cfg.node.version.clone()),
-            router_socket: Some(cfg.node.router_socket.clone()),
-            uuid_persistence_dir: Some(cfg.node.uuid_persistence_dir.clone()),
-            config_dir: Some(cfg.node.config_dir.clone()),
-            dynamic_config_dir: Some(cfg.node.dynamic_config_dir.clone()),
-        }),
-        behavior,
-        runtime: Some(EffectiveRuntimeSection {
-            read_timeout_ms: Some(cfg.runtime.read_timeout_ms),
-            handler_timeout_ms: Some(cfg.runtime.handler_timeout_ms),
-            write_timeout_ms: Some(cfg.runtime.write_timeout_ms),
-            queue_capacity: Some(cfg.runtime.queue_capacity),
-            worker_pool_size: Some(cfg.runtime.worker_pool_size),
-            retry_max_attempts: Some(cfg.runtime.retry_max_attempts),
-            retry_initial_backoff_ms: Some(cfg.runtime.retry_initial_backoff_ms),
-            retry_max_backoff_ms: Some(cfg.runtime.retry_max_backoff_ms),
-            metrics_log_interval_ms: Some(cfg.runtime.metrics_log_interval_ms),
-            immediate_memory: Some(cfg.runtime.immediate_memory.clone()),
-            cognitive_definition: Some(cfg.runtime.cognitive_definition.clone()),
-        }),
-    }
-}
-
-fn format_instructions_snapshot(cfg: &Option<InstructionsSourceConfig>) -> Value {
-    match cfg {
-        None => Value::Null,
-        Some(InstructionsSourceConfig::Inline(value)) => {
-            json!({ "source": "inline", "value": value, "trim": true })
-        }
-        Some(InstructionsSourceConfig::Strategy(strategy)) => json!({
-            "source": match strategy.source {
-                InstructionsSourceKind::Inline => "inline",
-                InstructionsSourceKind::File => "file",
-                InstructionsSourceKind::Env => "env",
-                InstructionsSourceKind::None => "none"
-            },
-            "value": strategy.value,
-            "trim": strategy.trim
-        }),
     }
 }
 
@@ -4867,39 +4522,11 @@ fn materialize_effective_defaults(
 }
 
 fn materialize_runtime_defaults(runtime: &mut EffectiveRuntimeSection) {
-    let defaults = RuntimeSection::default();
-    if runtime.read_timeout_ms.is_none() {
-        runtime.read_timeout_ms = Some(defaults.read_timeout_ms);
-    }
-    if runtime.handler_timeout_ms.is_none() {
-        runtime.handler_timeout_ms = Some(defaults.handler_timeout_ms);
-    }
-    if runtime.write_timeout_ms.is_none() {
-        runtime.write_timeout_ms = Some(defaults.write_timeout_ms);
-    }
-    if runtime.queue_capacity.is_none() {
-        runtime.queue_capacity = Some(defaults.queue_capacity);
-    }
-    if runtime.worker_pool_size.is_none() {
-        runtime.worker_pool_size = Some(defaults.worker_pool_size);
-    }
-    if runtime.retry_max_attempts.is_none() {
-        runtime.retry_max_attempts = Some(defaults.retry_max_attempts);
-    }
-    if runtime.retry_initial_backoff_ms.is_none() {
-        runtime.retry_initial_backoff_ms = Some(defaults.retry_initial_backoff_ms);
-    }
-    if runtime.retry_max_backoff_ms.is_none() {
-        runtime.retry_max_backoff_ms = Some(defaults.retry_max_backoff_ms);
-    }
-    if runtime.metrics_log_interval_ms.is_none() {
-        runtime.metrics_log_interval_ms = Some(defaults.metrics_log_interval_ms);
-    }
     if runtime.immediate_memory.is_none() {
-        runtime.immediate_memory = Some(defaults.immediate_memory);
+        runtime.immediate_memory = Some(ImmediateMemorySection::default());
     }
     if runtime.cognitive_definition.is_none() {
-        runtime.cognitive_definition = Some(defaults.cognitive_definition);
+        runtime.cognitive_definition = Some(CognitiveDefinitionSection::default());
     }
 }
 
@@ -4944,44 +4571,18 @@ fn node_not_configured_payload(state: NodeLifecycleState) -> Value {
     })
 }
 
-fn extract_instructions_from_effective_config(
-    behavior: &EffectiveBehaviorSection,
-) -> Option<String> {
-    behavior
-        .instructions
-        .as_ref()
-        .and_then(|v| {
-            if let Some(inline) = v.as_str() {
-                return Some(inline.to_string());
-            }
-            v.get("value")
-                .and_then(Value::as_str)
-                .map(ToString::to_string)
-        })
-        .or_else(|| {
-            behavior
-                .params
-                .as_ref()
-                .and_then(|p| p.system_prompt.clone())
-        })
-}
-
 fn extract_model_settings_from_effective_config(
     behavior: &EffectiveBehaviorSection,
 ) -> ModelSettings {
-    let direct = behavior.model_settings.as_ref();
-    let params = behavior.params.as_ref();
-    ModelSettings {
-        temperature: direct
-            .and_then(|v| v.temperature)
-            .or_else(|| params.and_then(|v| v.temperature)),
-        top_p: direct
-            .and_then(|v| v.top_p)
-            .or_else(|| params.and_then(|v| v.top_p)),
-        max_output_tokens: direct
-            .and_then(|v| v.max_output_tokens)
-            .or_else(|| params.and_then(|v| v.max_output_tokens)),
-    }
+    behavior
+        .model_settings
+        .as_ref()
+        .map(|settings| ModelSettings {
+            temperature: settings.temperature,
+            top_p: settings.top_p,
+            max_output_tokens: settings.max_output_tokens,
+        })
+        .unwrap_or_default()
 }
 
 fn node_runtime_not_ready_payload() -> Value {
@@ -5027,6 +4628,17 @@ fn hive_ai_provider(config_dir: &Path) -> std::result::Result<AiProvider, String
     Ok(engine.provider)
 }
 
+/// What the sender gets for a failed AI run. Once a tool has run, no failure is `retryable`
+/// (`provider_timeout` on a later turn included): sending the same message again would run that
+/// tool again.
+fn ai_chat_failure_payload(err: &fluxbee_ai_sdk::errors::AiSdkError, tool_ran: bool) -> Value {
+    let mut payload = ai_runtime_error_payload(err);
+    if tool_ran {
+        payload["retryable"] = Value::Bool(false);
+    }
+    payload
+}
+
 fn ai_runtime_error_payload(err: &fluxbee_ai_sdk::errors::AiSdkError) -> Value {
     match err {
         fluxbee_ai_sdk::errors::AiSdkError::Http(http_err)
@@ -5045,6 +4657,13 @@ fn ai_runtime_error_payload(err: &fluxbee_ai_sdk::errors::AiSdkError) -> Value {
             "code": "provider_timeout",
             "message": "The AI provider did not respond in time. Please retry.",
             "retryable": true
+        }),
+        // Either provider: the answer was billed and cut, so the same request gets the same cut.
+        _ if err.is_truncated_answer() => json!({
+            "type": "error",
+            "code": "provider_output_truncated",
+            "message": "The AI's answer hit its token limit and was cut. Raise behavior.model_settings.max_output_tokens.",
+            "retryable": false
         }),
         fluxbee_ai_sdk::errors::AiSdkError::Protocol(msg) => {
             if let Some((status, detail)) = parse_openai_status_error(msg) {
@@ -5231,13 +4850,6 @@ fn is_openai_attachment_param(param: &str) -> bool {
         || param.contains(".file_url")
         || param.contains(".image_url")
         || param.contains(".content")
-}
-
-fn infer_state_dir_from_dynamic(dynamic_config_dir: &std::path::Path) -> PathBuf {
-    dynamic_config_dir
-        .parent()
-        .map(|p| p.to_path_buf())
-        .unwrap_or_else(|| PathBuf::from("/var/lib/fluxbee/state"))
 }
 
 fn sanitize_storage_key(value: &str) -> String {
@@ -5634,16 +5246,10 @@ mod tests {
             immediate_memory_store: None,
             vault: None,
             usage: UsageRecorder::disabled(),
-            control_plane: Arc::new(RwLock::new(ControlPlaneState {
-                current_state: NodeLifecycleState::Unconfigured,
-                config_source: "none",
-                effective_config: None,
-                schema_version: 0,
-                config_version: 0,
-            })),
-            cognitive_definition: Arc::new(
-                RwLock::new(CognitiveDefinitionRuntimeState::disabled()),
-            ),
+            control_plane: Arc::new(RwLock::new(ControlPlaneState::default())),
+            cognitive_definition: Arc::new(RwLock::new(
+                CognitiveDefinitionRuntimeState::unresolved(),
+            )),
         }
     }
 
@@ -5680,7 +5286,7 @@ mod tests {
             &root,
             json!({"asset_type": "role", "name": "Support role", "description": "Help."}),
         );
-        assert!(load_cognitive_asset(&root, &hash, "role").is_ok());
+        assert!(load_cognitive_asset(&AssetsFolder { blob_root: &root }, &hash, "role").is_ok());
         let path = root.join("agent-assets").join(format!("{hash}.json"));
         fs::write(
             &path,
@@ -5690,8 +5296,79 @@ mod tests {
             .expect("json"),
         )
         .expect("swap the asset");
-        let err = load_cognitive_asset(&root, &hash, "role").expect_err("a changed asset");
-        assert!(err.contains("does not match its hash"), "{err}");
+        let err = load_cognitive_asset(&AssetsFolder { blob_root: &root }, &hash, "role")
+            .expect_err("a changed asset");
+        assert!(
+            matches!(&err, AssetLoadError::Invalid(message) if message.contains("does not match its hash")),
+            "{err:?}"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// The assets folder is written by the Syncthing user (A-72), so a name there is never
+    /// followed or waited on: a symlink (even to the right bytes), a FIFO or a directory is an
+    /// invalid asset, and so is a file over the size limit.
+    #[cfg(unix)]
+    #[test]
+    fn an_agent_asset_is_read_only_from_a_regular_file_under_its_name() {
+        let root = cognitive_temp_root("asset-file-kinds");
+        let assets = root.join("agent-assets");
+        let folder = AssetsFolder { blob_root: &root };
+        let invalid = |result: Result<CognitiveAssetDocument, AssetLoadError>| match result {
+            Err(AssetLoadError::Invalid(message)) => message,
+            other => panic!("expected an invalid asset, got {other:?}"),
+        };
+
+        // Nothing under the name: missing, which a worker waits for.
+        assert!(matches!(
+            load_cognitive_asset(&folder, &"4".repeat(64), "role"),
+            Err(AssetLoadError::Missing(_))
+        ));
+
+        let hash = write_cognitive_asset(
+            &root,
+            json!({"asset_type": "role", "name": "Support role", "description": "Help."}),
+        );
+        let real = root.join(format!("{hash}.real"));
+        fs::rename(assets.join(format!("{hash}.json")), &real).expect("move the asset out");
+        std::os::unix::fs::symlink(&real, assets.join(format!("{hash}.json")))
+            .expect("plant a symlink");
+        let message = invalid(load_cognitive_asset(&folder, &hash, "role"));
+        assert!(message.contains("symbolic link"), "{message}");
+
+        let fifo_hash = "1".repeat(64);
+        let made = std::process::Command::new("mkfifo")
+            .arg(assets.join(format!("{fifo_hash}.json")))
+            .status()
+            .expect("run mkfifo");
+        assert!(made.success());
+        let (tx, rx) = std::sync::mpsc::channel();
+        let fifo_root = root.clone();
+        std::thread::spawn(move || {
+            let folder = AssetsFolder {
+                blob_root: &fifo_root,
+            };
+            let _ = tx.send(load_cognitive_asset(&folder, &fifo_hash, "role"));
+        });
+        let loaded = rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("a FIFO must not block the read");
+        let message = invalid(loaded);
+        assert!(message.contains("not a regular file"), "{message}");
+
+        let dir_hash = "2".repeat(64);
+        fs::create_dir(assets.join(format!("{dir_hash}.json"))).expect("plant a directory");
+        let message = invalid(load_cognitive_asset(&folder, &dir_hash, "role"));
+        assert!(message.contains("not a regular file"), "{message}");
+
+        let big_hash = "3".repeat(64);
+        fs::write(
+            assets.join(format!("{big_hash}.json")),
+            vec![b' '; AGENT_ASSET_MAX_BYTES as usize + 1],
+        )
+        .expect("write an oversized file");
+        let message = invalid(load_cognitive_asset(&folder, &big_hash, "role"));
+        assert!(message.contains("too large"), "{message}");
         let _ = fs::remove_dir_all(&root);
     }
 
@@ -5713,27 +5390,238 @@ mod tests {
     #[test]
     fn effective_cognitive_section_honors_config_and_defaults() {
         // BUG-3: the managed bootstrap must honor runtime.cognitive_definition (previously ignored).
-        let disabled = EffectiveConfigDocument {
-            runtime: Some(EffectiveRuntimeSection {
-                cognitive_definition: Some(CognitiveDefinitionSection {
-                    enabled: false,
-                    poll_interval_secs: 10,
-                    blob_root: None,
-                }),
-                ..Default::default()
-            }),
-            ..Default::default()
-        };
-        // Explicit enabled=false is honored, from the persisted source...
-        assert!(!effective_cognitive_section(Some(&disabled), None).enabled);
-        // ...and from the spawn source when there is no persisted config.
-        assert!(!effective_cognitive_section(None, Some(&disabled)).enabled);
-        // Persisted wins over spawn.
-        let enabled = EffectiveConfigDocument::default();
-        assert!(!effective_cognitive_section(Some(&disabled), Some(&enabled)).enabled);
-        // Absent field -> Default (enabled=true), so unset config keeps the historical default.
-        assert!(effective_cognitive_section(None, None).enabled);
-        assert!(effective_cognitive_section(Some(&EffectiveConfigDocument::default()), None).enabled);
+        let configured = parse_effective_config_doc(&json!({
+            "behavior": {"kind": "ai_chat", "model": "gpt-5.5"},
+            "runtime": {"cognitive_definition": {"poll_interval_secs": 30, "blob_root": "/srv/blob"}}
+        }))
+        .expect("config parses");
+        let section = effective_cognitive_section(Some(&configured));
+        assert_eq!(section.poll_interval_secs, 30);
+        assert_eq!(section.blob_root.as_deref(), Some("/srv/blob"));
+        // No config, or a config without it: the defaults.
+        for config in [None, Some(&EffectiveConfigDocument::default())] {
+            let section = effective_cognitive_section(config);
+            assert_eq!(
+                section.poll_interval_secs,
+                DEFAULT_COGNITIVE_POLL_INTERVAL_SECS
+            );
+            assert!(section.blob_root.is_none());
+        }
+    }
+
+    const AGENT_NODE: &str = "AI.support@motherbee";
+
+    /// Composes from the assets folder under `root`, as the node does.
+    fn compose_from_disk(
+        root: &Path,
+        seq: u64,
+        ilk: &IdentityIlkOption,
+        hashes: CognitiveDefinitionHashes,
+    ) -> CognitiveDefinitionRuntimeState {
+        compose_cognitive_state(&AssetsFolder { blob_root: root }, seq, ilk, hashes)
+            .expect("compose state")
+            .state
+    }
+
+    /// Scripts what each asset read gives: valid bytes, missing, or unreadable.
+    #[derive(Default)]
+    struct ScriptedAssets {
+        files: HashMap<String, Vec<u8>>,
+        unreadable: std::collections::HashSet<String>,
+    }
+
+    impl ScriptedAssets {
+        /// Adds an asset whose bytes hash to its name, and returns that hash.
+        fn add(&mut self, value: Value) -> String {
+            let bytes = serde_json::to_vec(&value).expect("serialize asset");
+            let hash = fluxbee_sdk::blob::sha256_hex(&bytes);
+            self.files.insert(hash.clone(), bytes);
+            hash
+        }
+    }
+
+    impl AssetSource for ScriptedAssets {
+        fn read(&self, hash: &str) -> Result<Vec<u8>, AssetLoadError> {
+            if self.unreadable.contains(hash) {
+                return Err(AssetLoadError::Unreadable(
+                    "Permission denied (os error 13)".to_string(),
+                ));
+            }
+            self.files
+                .get(hash)
+                .cloned()
+                .ok_or_else(|| AssetLoadError::Missing(format!("asset missing {hash}")))
+        }
+    }
+
+    fn role(description: &str) -> Value {
+        json!({"asset_type": "role", "name": "Support role", "description": description})
+    }
+
+    fn agent_with_role(hash: &str) -> IdentityIlkOption {
+        let mut ilk = sample_agent_ilk();
+        ilk.role_hash = Some(hash.to_string());
+        ilk
+    }
+
+    /// The poll had no definite answer: the agent still runs the prompt with `prompt_part`, and
+    /// `last_poll_error` says why.
+    async fn assert_definition_kept(
+        state: &Arc<RwLock<CognitiveDefinitionRuntimeState>>,
+        outcome: Result<(), String>,
+        prompt_part: &str,
+        reason: &str,
+    ) {
+        let error = outcome.expect_err("no definite answer");
+        assert!(error.contains(reason), "{error}");
+        let current = state.read().await;
+        assert!(current.active_prompt.contains(prompt_part));
+        assert_eq!(current.last_poll_error.as_deref(), Some(error.as_str()));
+    }
+
+    /// Before its first definition the agent has nothing to keep: a read that fails leaves the
+    /// "unconfigured" prompt, and a missing asset is composed as it is (here `partial`).
+    #[tokio::test]
+    async fn before_its_first_definition_an_agent_takes_what_a_poll_finds() {
+        let node = test_node();
+        let state = &node.cognitive_definition;
+        let mut assets = ScriptedAssets::default();
+
+        let shm_down = Err("identity SHM unavailable: busy".to_string());
+        assert!(apply_identity_lookup(AGENT_NODE, &assets, shm_down, state)
+            .await
+            .is_err());
+        apply_identity_lookup(AGENT_NODE, &assets, Ok(None), state)
+            .await
+            .expect("no ILK yet");
+        assert_eq!(state.read().await.definition_state, "unresolved");
+
+        let unreadable = assets.add(role("Help customers."));
+        assets.unreadable.insert(unreadable.clone());
+        let lookup = Ok(Some((1, agent_with_role(&unreadable))));
+        assert!(apply_identity_lookup(AGENT_NODE, &assets, lookup, state)
+            .await
+            .is_err());
+        assert_eq!(node.agent_prompt().await, DEFAULT_UNCONFIGURED_AGENT_PROMPT);
+
+        let mut ilk = agent_with_role(&"ab".repeat(32));
+        let skill = assets.add(json!({
+            "asset_type": "skill", "name": "triage", "instructions": ["Ask first."]
+        }));
+        ilk.skill_hashes = vec![skill];
+        apply_identity_lookup(AGENT_NODE, &assets, Ok(Some((2, ilk))), state)
+            .await
+            .expect("composed without the missing role");
+        let current = state.read().await.clone();
+        assert_eq!(current.definition_state, "partial");
+        assert!(current.active_prompt.contains("Ask first."));
+    }
+
+    /// Once the agent has a definition, a poll that settles nothing keeps it: the identity SHM
+    /// unreadable, the ILK absent (a degraded replica), a new asset not on this hive yet (on a
+    /// worker it arrives seconds after the ILK names it) or unreadable. The new definition replaces
+    /// it once every asset is read.
+    #[tokio::test]
+    async fn an_agent_keeps_its_definition_until_a_definite_new_one() {
+        let node = test_node();
+        let state = &node.cognitive_definition;
+        let mut assets = ScriptedAssets::default();
+        let first = assets.add(role("Help customers."));
+        let ilk = agent_with_role(&first);
+        apply_identity_lookup(AGENT_NODE, &assets, Ok(Some((1, ilk.clone()))), state)
+            .await
+            .expect("composed");
+
+        let shm_down = Err("identity SHM unavailable: busy".to_string());
+        let outcome = apply_identity_lookup(AGENT_NODE, &assets, shm_down, state).await;
+        assert_definition_kept(
+            state,
+            outcome,
+            "Help customers.",
+            "identity SHM unavailable",
+        )
+        .await;
+        let outcome = apply_identity_lookup(AGENT_NODE, &assets, Ok(None), state).await;
+        assert_definition_kept(state, outcome, "Help customers.", "agent ILK not found").await;
+
+        let sell = assets.add(role("Sell more."));
+        let in_flight = assets.files.remove(&sell).expect("the new role");
+        let lookup = Ok(Some((2, agent_with_role(&sell))));
+        let outcome = apply_identity_lookup(AGENT_NODE, &assets, lookup, state).await;
+        assert_definition_kept(state, outcome, "Help customers.", "not on this hive yet").await;
+
+        assets.files.insert(sell.clone(), in_flight);
+        assets.unreadable.insert(sell.clone());
+        let lookup = Ok(Some((3, agent_with_role(&sell))));
+        let outcome = apply_identity_lookup(AGENT_NODE, &assets, lookup, state).await;
+        assert_definition_kept(state, outcome, "Help customers.", "could not be read").await;
+
+        assets.unreadable.clear();
+        apply_identity_lookup(
+            AGENT_NODE,
+            &assets,
+            Ok(Some((4, agent_with_role(&sell)))),
+            state,
+        )
+        .await
+        .expect("the new definition");
+        let current = state.read().await.clone();
+        assert_eq!(current.definition_state, "composed");
+        assert!(current.active_prompt.contains("Sell more."));
+        assert!(current.last_poll_error.is_none());
+    }
+
+    /// A definite answer replaces a definition: an asset that is there but invalid (wrong hash,
+    /// wrong type) is left out, a cleared definition is `empty`, and an ILK that is no longer an
+    /// agent leaves the agent unresolved.
+    #[tokio::test]
+    async fn an_invalid_asset_a_cleared_definition_or_a_non_agent_ilk_is_definite() {
+        let node = test_node();
+        let state = &node.cognitive_definition;
+        let mut assets = ScriptedAssets::default();
+        let first = assets.add(role("Help customers."));
+        let ilk = agent_with_role(&first);
+        let resolve = |seq| Ok(Some((seq, agent_with_role(&first))));
+
+        let tampered = "cd".repeat(32);
+        let lie = serde_json::to_vec(&role("Lie.")).expect("json");
+        assets.files.insert(tampered.clone(), lie);
+        let skill_as_role = assets.add(json!({
+            "asset_type": "skill", "name": "triage", "instructions": ["Ask first."]
+        }));
+        for (seq, invalid) in [(2, &tampered), (4, &skill_as_role)] {
+            apply_identity_lookup(AGENT_NODE, &assets, resolve(seq - 1), state)
+                .await
+                .expect("composed");
+            let lookup = Ok(Some((seq, agent_with_role(invalid))));
+            apply_identity_lookup(AGENT_NODE, &assets, lookup, state)
+                .await
+                .expect("an invalid asset is an answer");
+            let current = state.read().await.clone();
+            assert_eq!(current.definition_state, "error");
+            assert_eq!(current.active_prompt, DEFAULT_UNCONFIGURED_AGENT_PROMPT);
+        }
+
+        apply_identity_lookup(AGENT_NODE, &assets, resolve(5), state)
+            .await
+            .expect("composed");
+        let cleared = sample_agent_ilk();
+        apply_identity_lookup(AGENT_NODE, &assets, Ok(Some((6, cleared))), state)
+            .await
+            .expect("a cleared definition");
+        assert_eq!(state.read().await.definition_state, "empty");
+
+        apply_identity_lookup(AGENT_NODE, &assets, resolve(7), state)
+            .await
+            .expect("composed");
+        let mut person = ilk.clone();
+        person.ilk_type = "human".to_string();
+        apply_identity_lookup(AGENT_NODE, &assets, Ok(Some((8, person))), state)
+            .await
+            .expect("no longer an agent");
+        let current = state.read().await.clone();
+        assert_eq!(current.definition_state, "unresolved");
+        assert_eq!(current.active_prompt, DEFAULT_UNCONFIGURED_AGENT_PROMPT);
     }
 
     #[test]
@@ -5742,15 +5630,12 @@ mod tests {
         let ilk = sample_agent_ilk();
         let hashes = CognitiveDefinitionHashes::default();
 
-        let state = compose_cognitive_state(&root, 7, &ilk, hashes).expect("compose state");
+        let state = compose_from_disk(&root, 7, &ilk, hashes);
 
         assert_eq!(state.definition_state, "empty");
         assert_eq!(state.ilk_id.as_deref(), Some(ilk.ilk_id.as_str()));
         assert_eq!(state.last_identity_seq, Some(7));
-        assert_eq!(
-            state.active_prompt.as_deref(),
-            Some(DEFAULT_UNCONFIGURED_AGENT_PROMPT)
-        );
+        assert_eq!(state.active_prompt, DEFAULT_UNCONFIGURED_AGENT_PROMPT);
         assert_eq!(
             state.active_prompt_chars,
             DEFAULT_UNCONFIGURED_AGENT_PROMPT.chars().count()
@@ -5772,8 +5657,7 @@ mod tests {
         let mut ilk = sample_agent_ilk();
         ilk.role_hash = Some(role_hash.to_string());
         let hashes = hashes_from_identity_ilk(&ilk);
-        let mut state =
-            compose_cognitive_state(&root, 8, &ilk, hashes.clone()).expect("compose state");
+        let mut state = compose_from_disk(&root, 8, &ilk, hashes.clone());
 
         assert!(should_reuse_cognitive_state(&state, &ilk.ilk_id, &hashes));
 
@@ -5842,8 +5726,8 @@ mod tests {
         ilk.handbook_hashes = vec![handbook_hash.to_string()];
         let hashes = hashes_from_identity_ilk(&ilk);
 
-        let state = compose_cognitive_state(&root, 8, &ilk, hashes).expect("compose state");
-        let prompt = state.active_prompt.as_deref().expect("active prompt");
+        let state = compose_from_disk(&root, 8, &ilk, hashes);
+        let prompt = state.active_prompt.as_str();
 
         assert_eq!(state.definition_state, "composed");
         assert_eq!(state.role_hash_loaded.as_deref(), Some(role_hash.as_str()));
@@ -5897,14 +5781,14 @@ mod tests {
         ilk.personality_hash = Some(personality_hash.to_string());
         let hashes = hashes_from_identity_ilk(&ilk);
 
-        let state = compose_cognitive_state(&root, 21, &ilk, hashes).expect("compose state");
+        let state = compose_from_disk(&root, 21, &ilk, hashes);
 
         assert_eq!(state.definition_state, "composed");
         assert_eq!(
             state.personality_hash_loaded.as_deref(),
             Some(personality_hash.as_str())
         );
-        let prompt = state.active_prompt.as_deref().expect("prompt");
+        let prompt = state.active_prompt.as_str();
         let personality_idx = prompt
             .find("[PERSONALITY:")
             .expect("personality block present");
@@ -5939,7 +5823,7 @@ mod tests {
         ilk.personality_hash = Some(missing_personality.to_string());
         let hashes = hashes_from_identity_ilk(&ilk);
 
-        let state = compose_cognitive_state(&root, 22, &ilk, hashes).expect("compose state");
+        let state = compose_from_disk(&root, 22, &ilk, hashes);
 
         assert_eq!(state.definition_state, "partial");
         assert_eq!(state.role_hash_loaded.as_deref(), Some(role_hash.as_str()));
@@ -5969,7 +5853,7 @@ mod tests {
         ilk.personality_hash = Some(personality_hash.to_string());
         let hashes = hashes_from_identity_ilk(&ilk);
 
-        let state = compose_cognitive_state(&root, 23, &ilk, hashes).expect("compose state");
+        let state = compose_from_disk(&root, 23, &ilk, hashes);
 
         assert_eq!(state.definition_state, "error");
         assert!(state.personality_hash_loaded.is_none());
@@ -6003,17 +5887,14 @@ mod tests {
         ilk.skill_hashes = vec![missing_skill_hash.to_string()];
         let hashes = hashes_from_identity_ilk(&ilk);
 
-        let state = compose_cognitive_state(&root, 9, &ilk, hashes).expect("compose state");
+        let state = compose_from_disk(&root, 9, &ilk, hashes);
 
         assert_eq!(state.definition_state, "partial");
         assert_eq!(state.role_hash_loaded.as_deref(), Some(role_hash.as_str()));
         assert_eq!(state.failed_hashes.len(), 1);
         assert_eq!(state.failed_hashes[0].asset_type, "skill");
         assert_eq!(state.failed_hashes[0].hash, missing_skill_hash);
-        assert!(state
-            .active_prompt
-            .as_deref()
-            .is_some_and(|prompt| prompt.contains("Answer with the loaded role.")));
+        assert!(state.active_prompt.contains("Answer with the loaded role."));
         let _ = fs::remove_dir_all(root);
     }
 
@@ -6031,17 +5912,14 @@ mod tests {
         ilk.role_hash = Some(role_hash.to_string());
         let hashes = hashes_from_identity_ilk(&ilk);
 
-        let state = compose_cognitive_state(&root, 11, &ilk, hashes).expect("compose state");
+        let state = compose_from_disk(&root, 11, &ilk, hashes);
 
         assert_eq!(state.definition_state, "error");
         assert!(state.role_hash_loaded.is_none());
         assert_eq!(state.failed_hashes.len(), 1);
         assert_eq!(state.failed_hashes[0].asset_type, "role");
         assert!(state.failed_hashes[0].error.contains("role.description"));
-        assert_eq!(
-            state.active_prompt.as_deref(),
-            Some(DEFAULT_UNCONFIGURED_AGENT_PROMPT)
-        );
+        assert_eq!(state.active_prompt, DEFAULT_UNCONFIGURED_AGENT_PROMPT);
         let _ = fs::remove_dir_all(root);
     }
 
@@ -6077,8 +5955,8 @@ mod tests {
         ilk.handbook_hashes = vec![handbook_hash.to_string()];
         let hashes = hashes_from_identity_ilk(&ilk);
 
-        let state = compose_cognitive_state(&root, 10, &ilk, hashes).expect("compose state");
-        let prompt = state.active_prompt.as_deref().expect("active prompt");
+        let state = compose_from_disk(&root, 10, &ilk, hashes);
+        let prompt = state.active_prompt.as_str();
 
         assert_eq!(state.definition_state, "composed");
         assert!(state.prompt_truncated);
@@ -6088,80 +5966,174 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn node_status_get_respects_handler_enabled_env_false() {
-        let _guard = env_lock().lock().expect("env lock");
-        std::env::set_var(NODE_STATUS_DEFAULT_HANDLER_ENABLED, "false");
-        std::env::remove_var(NODE_STATUS_DEFAULT_HEALTH_STATE);
+    async fn node_status_get_health_follows_the_config_state() {
+        // BUG-2: a node that is not CONFIGURED refuses every completion, so it is DEGRADED (never
+        // HEALTHY, never ERROR), with its lifecycle_state, and last_error for a rejected config.
         let node = test_node();
-        let req = sample_request();
-        let response = node
-            .handle_control_plane(req)
-            .await
-            .expect("control-plane should not fail");
-        assert!(response.is_none());
-        std::env::remove_var(NODE_STATUS_DEFAULT_HANDLER_ENABLED);
-    }
+        let status = |response: Option<Message>| response.expect("status response").payload;
 
-    #[tokio::test]
-    async fn node_status_get_health_reflects_lifecycle_and_env_override_only_when_configured() {
-        // BUG-2: health_state is derived from the config-plane lifecycle. A node that is not
-        // Configured (Unconfigured / FAILED_CONFIG) reports DEGRADED and the env override CANNOT force
-        // it back to HEALTHY (so a broken node can never masquerade as healthy). The override applies
-        // only to a genuinely Configured node.
-        let _guard = env_lock().lock().expect("env lock");
-        std::env::set_var(NODE_STATUS_DEFAULT_HANDLER_ENABLED, "true");
-        let node = test_node();
-        let req = sample_request();
-
-        // Unconfigured (default): DEGRADED even when the env asks for HEALTHY.
-        std::env::set_var(NODE_STATUS_DEFAULT_HEALTH_STATE, "HEALTHY");
-        let unconfigured = node
-            .handle_control_plane(req.clone())
-            .await
-            .expect("control-plane should not fail")
-            .expect("status response should exist");
-        assert_eq!(
-            unconfigured
-                .payload
-                .get("health_state")
-                .and_then(Value::as_str),
-            Some("DEGRADED")
+        let unconfigured = status(
+            node.handle_control_plane(sample_request())
+                .await
+                .expect("control plane"),
         );
+        assert_eq!(unconfigured["health_state"], json!("DEGRADED"));
+        assert_eq!(unconfigured["lifecycle_state"], json!("UNCONFIGURED"));
+        assert!(unconfigured.get("last_error").is_none());
 
-        // Configured: HEALTHY by default (no override).
+        {
+            let mut state = node.control_plane.write().await;
+            state.current_state = NodeLifecycleState::FailedConfig;
+            state.last_error = Some(ControlPlaneErrorInfo {
+                code: "invalid_config".to_string(),
+                message: "unknown field `instructions`".to_string(),
+            });
+        }
+        let failed = status(
+            node.handle_control_plane(sample_request())
+                .await
+                .expect("control plane"),
+        );
+        assert_eq!(failed["health_state"], json!("DEGRADED"));
+        assert_eq!(failed["lifecycle_state"], json!("FAILED_CONFIG"));
+        assert_eq!(failed["last_error"]["code"], json!("invalid_config"));
+
         {
             let mut state = node.control_plane.write().await;
             state.current_state = NodeLifecycleState::Configured;
             state.effective_config = Some(json!({}));
+            state.last_error = None;
         }
-        std::env::remove_var(NODE_STATUS_DEFAULT_HEALTH_STATE);
-        let healthy = node
-            .handle_control_plane(req.clone())
-            .await
-            .expect("control-plane should not fail")
-            .expect("status response should exist");
-        assert_eq!(
-            healthy.payload.get("health_state").and_then(Value::as_str),
-            Some("HEALTHY")
+        let healthy = status(
+            node.handle_control_plane(sample_request())
+                .await
+                .expect("control plane"),
         );
+        assert_eq!(healthy["health_state"], json!("HEALTHY"));
+        assert_eq!(healthy["lifecycle_state"], json!("CONFIGURED"));
+    }
 
-        // Configured + env override: the override applies.
-        std::env::set_var(NODE_STATUS_DEFAULT_HEALTH_STATE, "DEGRADED");
-        let overridden = node
-            .handle_control_plane(req)
-            .await
-            .expect("control-plane should not fail")
-            .expect("status response should exist");
+    fn config_set_request(config: Value) -> Message {
+        let mut msg = sample_request();
+        msg.meta.msg = Some("CONFIG_SET".to_string());
+        msg.payload = json!({
+            "subsystem": "ai_node",
+            "node_name": "AI.generic@motherbee",
+            "schema_version": 1,
+            "config_version": 2,
+            "apply_mode": "replace",
+            "config": config
+        });
+        msg
+    }
+
+    /// The prompt comes only from the agent ILK: `behavior.instructions`, the old
+    /// `behavior.params` alias and the runtime keys nothing reads are unknown fields, so CONFIG_SET
+    /// refuses them and nothing is applied or written.
+    #[tokio::test]
+    async fn config_set_refuses_instructions_and_unread_runtime_keys() {
+        let node = test_node();
+        let cases = [
+            (
+                json!({"behavior": {"kind": "ai_chat", "model": "gpt-5.5", "instructions": "Be brief."}}),
+                "instructions",
+            ),
+            (
+                json!({"behavior": {"kind": "ai_chat", "model": "gpt-5.5", "params": {"system_prompt": "Be brief."}}}),
+                "params",
+            ),
+            (
+                json!({"behavior": {"kind": "ai_chat", "model": "gpt-5.5"}, "runtime": {"handler_timeout_ms": 120000}}),
+                "handler_timeout_ms",
+            ),
+            (
+                json!({"behavior": {"kind": "ai_chat", "model": "gpt-5.5"}, "runtime": {"immediate_memory": {"enabled": true, "active_operations_max": 8}}}),
+                "active_operations_max",
+            ),
+            (
+                json!({"behavior": {"kind": "ai_chat", "model": "gpt-5.5"}, "runtime": {"cognitive_definition": {"enabled": false}}}),
+                "enabled",
+            ),
+        ];
+        for (config, field) in cases {
+            let response = node
+                .handle_control_plane(config_set_request(config))
+                .await
+                .expect("control plane")
+                .expect("CONFIG_RESPONSE");
+            assert_eq!(response.payload["ok"], json!(false), "{field}");
+            assert_eq!(
+                response.payload["error"]["code"],
+                json!("invalid_config"),
+                "{field}"
+            );
+            let message = response.payload["error"]["message"]
+                .as_str()
+                .expect("error message");
+            assert!(
+                message.contains(&format!("unknown field `{field}`")),
+                "{message}"
+            );
+        }
+        assert!(node.behavior.read().await.is_none());
         assert_eq!(
-            overridden
-                .payload
-                .get("health_state")
-                .and_then(Value::as_str),
-            Some("DEGRADED")
+            node.control_plane.read().await.current_state,
+            NodeLifecycleState::Unconfigured
         );
+    }
 
-        std::env::remove_var(NODE_STATUS_DEFAULT_HEALTH_STATE);
-        std::env::remove_var(NODE_STATUS_DEFAULT_HANDLER_ENABLED);
+    #[test]
+    fn the_effective_config_carries_only_the_runtime_keys_the_node_reads() {
+        let doc = materialize_effective_defaults(
+            "AI.sales@motherbee",
+            parse_effective_config_doc(
+                &json!({"behavior": {"kind": "ai_chat", "model": "gpt-5.5"}}),
+            )
+            .expect("config parses"),
+        );
+        let runtime = serde_json::to_value(&doc).expect("serialize")["runtime"].clone();
+        assert_eq!(
+            runtime,
+            json!({
+                "immediate_memory": {"enabled": false, "recent_interactions_max": 10, "summary_max_chars": 1600},
+                "cognitive_definition": {"poll_interval_secs": 10, "blob_root": null}
+            })
+        );
+        // What it writes reads back.
+        assert!(
+            parse_effective_config_doc(&serde_json::to_value(&doc).expect("serialize")).is_ok()
+        );
+    }
+
+    #[test]
+    fn a_cut_answer_has_its_own_error_code_on_both_providers() {
+        for message in [
+            "openai response truncated: hit max_output_tokens (raise model_settings.max_output_tokens)",
+            "anthropic response truncated: hit max_tokens (raise model_settings.max_output_tokens)",
+        ] {
+            let payload = ai_runtime_error_payload(&fluxbee_ai_sdk::errors::AiSdkError::Protocol(
+                message.to_string(),
+            ));
+            assert_eq!(payload["code"], json!("provider_output_truncated"), "{message}");
+            assert_eq!(payload["retryable"], json!(false));
+        }
+        let other = ai_runtime_error_payload(&fluxbee_ai_sdk::errors::AiSdkError::Protocol(
+            "anthropic response missing text content".to_string(),
+        ));
+        assert_eq!(other["code"], json!("provider_error"));
+    }
+
+    /// A model call that times out is retryable only while no tool has run: on a later turn of
+    /// the tool loop, a resend would run that tool again.
+    #[test]
+    fn a_failure_after_a_tool_ran_is_not_retryable() {
+        let timeout = fluxbee_ai_sdk::errors::AiSdkError::Timeout("model call".to_string());
+        let before = ai_chat_failure_payload(&timeout, false);
+        assert_eq!(before["code"], json!("provider_timeout"));
+        assert_eq!(before["retryable"], json!(true));
+        let after = ai_chat_failure_payload(&timeout, true);
+        assert_eq!(after["code"], json!("provider_timeout"));
+        assert_eq!(after["retryable"], json!(false));
     }
 
     #[tokio::test]
@@ -6177,7 +6149,6 @@ mod tests {
             let mut behavior = node.behavior.write().await;
             *behavior = Some(NodeBehavior::AiChat(AiChatRuntime {
                 model: "gpt-5.5".to_string(),
-                instructions: Some("Test instructions".to_string()),
                 model_settings: ModelSettings::default(),
                 base_url: None,
                 immediate_memory: ImmediateMemorySection::default(),
@@ -6311,11 +6282,7 @@ mod tests {
     fn default_mode_registry_does_not_expose_gov_tools() {
         let node = test_node();
         let registry = node
-            .build_tool_registry(&BehaviorContext {
-                thread_id: None,
-                src_ilk: None,
-                trace_id: None,
-            })
+            .build_tool_registry(&BehaviorContext::default())
             .expect("registry");
         let names = registry
             .definitions()
@@ -6344,7 +6311,7 @@ mod tests {
             .build_tool_registry(&BehaviorContext {
                 thread_id: Some("legacy-thread-1".to_string()),
                 src_ilk: Some("ilk:11111111-1111-4111-8111-111111111111".to_string()),
-                trace_id: None,
+                ..BehaviorContext::default()
             })
             .expect("registry");
 

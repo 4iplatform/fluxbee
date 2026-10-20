@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -89,6 +90,9 @@ pub struct FunctionLoopRunResult {
     pub tokens_used: u32,
 }
 
+/// Model turns a tool loop takes at most by default (`FunctionCallingConfig::default`).
+pub const DEFAULT_MAX_TURNS: usize = 8;
+
 #[derive(Debug, Clone)]
 pub struct FunctionCallingConfig {
     pub max_turns: usize,
@@ -96,7 +100,9 @@ pub struct FunctionCallingConfig {
 
 impl Default for FunctionCallingConfig {
     fn default() -> Self {
-        Self { max_turns: 8 }
+        Self {
+            max_turns: DEFAULT_MAX_TURNS,
+        }
     }
 }
 
@@ -223,6 +229,37 @@ impl FunctionCallingRunner {
             "function calling loop exceeded max_turns={}",
             self.config.max_turns
         )))
+    }
+}
+
+/// Wraps a tool-loop model to note when a tool has run: a turn whose input carries a tool's result
+/// comes after that tool ran. After a failed run, the caller knows from `tool_ran` whether sending
+/// the same request again would run a tool again, so whether the failure can be called retryable.
+pub struct ToolRunWatch<'a> {
+    model: &'a dyn FunctionCallingModel,
+    tool_ran: &'a AtomicBool,
+}
+
+impl<'a> ToolRunWatch<'a> {
+    pub fn new(model: &'a dyn FunctionCallingModel, tool_ran: &'a AtomicBool) -> Self {
+        Self { model, tool_ran }
+    }
+}
+
+#[async_trait]
+impl FunctionCallingModel for ToolRunWatch<'_> {
+    async fn run_turn(
+        &self,
+        request: FunctionModelTurnRequest,
+    ) -> Result<FunctionModelTurnResponse> {
+        if request
+            .items
+            .iter()
+            .any(|item| matches!(item, FunctionLoopItem::ToolResult { .. }))
+        {
+            self.tool_ran.store(true, Ordering::Relaxed);
+        }
+        self.model.run_turn(request).await
     }
 }
 
@@ -654,6 +691,64 @@ mod tests {
         assert_eq!(
             assistant_messages,
             vec!["The tool failed, so there is nothing to confirm."]
+        );
+    }
+
+    /// Fails the turn after the first: the first one asks for `demo_write`.
+    struct FailsAfterTheFirstTurn(SequencedModel);
+
+    #[async_trait]
+    impl FunctionCallingModel for FailsAfterTheFirstTurn {
+        async fn run_turn(
+            &self,
+            request: FunctionModelTurnRequest,
+        ) -> Result<FunctionModelTurnResponse> {
+            if *self.0.calls.lock().await > 0 {
+                return Err(AiSdkError::Timeout(
+                    "model call took longer than 300 s".into(),
+                ));
+            }
+            self.0.run_turn(request).await
+        }
+    }
+
+    struct FailsAtOnce;
+
+    #[async_trait]
+    impl FunctionCallingModel for FailsAtOnce {
+        async fn run_turn(
+            &self,
+            _request: FunctionModelTurnRequest,
+        ) -> Result<FunctionModelTurnResponse> {
+            Err(AiSdkError::Timeout(
+                "model call took longer than 300 s".into(),
+            ))
+        }
+    }
+
+    #[tokio::test]
+    async fn the_watch_tells_whether_a_tool_ran_before_a_failure() {
+        let runner = FunctionCallingRunner::new(FunctionCallingConfig::default());
+        let mut tools = FunctionToolRegistry::new();
+        tools
+            .register(Arc::new(DemoTool))
+            .expect("tool should register");
+
+        let tool_ran = AtomicBool::new(false);
+        let model = FailsAfterTheFirstTurn(SequencedModel::default());
+        let watched = ToolRunWatch::new(&model, &tool_ran);
+        assert!(runner.run(&watched, &tools, "write it").await.is_err());
+        assert!(
+            tool_ran.load(Ordering::Relaxed),
+            "the second turn came after demo_write"
+        );
+
+        let tool_ran = AtomicBool::new(false);
+        let watched = ToolRunWatch::new(&FailsAtOnce, &tool_ran);
+        assert!(runner.run(&watched, &tools, "write it").await.is_err());
+        assert!(
+            !tool_ran.load(Ordering::Relaxed),
+            "no tool ran before the first turn"
         );
     }
 

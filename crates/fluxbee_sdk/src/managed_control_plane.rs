@@ -412,12 +412,33 @@ pub fn build_config_set_error_payload(
 /// Health state derived from the config-plane lifecycle: a node that failed to load its config, or
 /// was never configured, refuses work and is NOT healthy. Fixes the class of bug where a node
 /// reported HEALTHY while silently rejecting every request. DEGRADED is a soft signal (it does not,
-/// by itself, drive an orchestrator restart — which would not fix a bad config anyway).
-pub fn managed_health_state(state: &ManagedControlPlaneState) -> &'static str {
-    match state.current_state {
+/// by itself, drive an orchestrator restart — which would not fix a bad config anyway), and a config
+/// problem is never ERROR.
+pub fn managed_health_state(state: ManagedNodeLifecycleState) -> &'static str {
+    match state {
         ManagedNodeLifecycleState::Configured => "HEALTHY",
         _ => "DEGRADED",
     }
+}
+
+/// `NODE_STATUS_GET_RESPONSE` payload of a managed node: the health its config state implies
+/// ([`managed_health_state`]), that state as `lifecycle_state`, and, when there is one, the reason
+/// the config is not in use as `last_error` (`{code, message}`). The orchestrator's
+/// `get_node_status` reports `health_state` (as `NODE_REPORTED`) and `last_error`. The Go SDK's
+/// `BuildManagedNodeStatusResponse` answers the same.
+pub fn build_node_status_response_payload(
+    current_state: ManagedNodeLifecycleState,
+    last_error: Option<&ControlPlaneErrorInfo>,
+) -> Value {
+    let mut payload = json!({
+        "status": "ok",
+        "health_state": managed_health_state(current_state),
+        "lifecycle_state": current_state.as_str(),
+    });
+    if let Some(last_error) = last_error {
+        payload["last_error"] = json!(last_error);
+    }
+    payload
 }
 
 /// Initialize tracing for a managed node so it actually logs to journald. Managed nodes are launched
@@ -507,7 +528,7 @@ mod tests {
             st.effective_config.as_ref().unwrap().get("_materialized"),
             Some(&json!(true))
         );
-        assert_eq!(managed_health_state(&st), "HEALTHY");
+        assert_eq!(managed_health_state(st.current_state), "HEALTHY");
     }
 
     #[test]
@@ -524,7 +545,7 @@ mod tests {
         assert_eq!(st.current_state, ManagedNodeLifecycleState::FailedConfig);
         assert_eq!(st.config_version, 9); // identifies which version was rejected
         assert!(st.effective_config.is_none()); // never surface a rejected (maybe secret-bearing) config
-        assert_eq!(managed_health_state(&st), "DEGRADED");
+        assert_eq!(managed_health_state(st.current_state), "DEGRADED");
     }
 
     #[test]
@@ -545,7 +566,7 @@ mod tests {
         assert!(st.effective_config.is_none());
         assert!(st.last_error.is_none()); // no scary "missing behavior.model" for an unconfigured node
         assert_eq!(st.config_version, 3); // preserved for CONFIG_SET staleness
-        assert_eq!(managed_health_state(&st), "DEGRADED");
+        assert_eq!(managed_health_state(st.current_state), "DEGRADED");
     }
 
     #[test]
@@ -562,6 +583,40 @@ mod tests {
                 .expect("boot");
         assert_eq!(st.current_state, ManagedNodeLifecycleState::Unconfigured);
         assert!(st.last_error.is_none());
+    }
+
+    #[test]
+    fn node_status_reports_the_config_state_and_why_it_is_not_in_use() {
+        let configured =
+            build_node_status_response_payload(ManagedNodeLifecycleState::Configured, None);
+        assert_eq!(
+            configured,
+            json!({"status": "ok", "health_state": "HEALTHY", "lifecycle_state": "CONFIGURED"})
+        );
+
+        let unconfigured =
+            build_node_status_response_payload(ManagedNodeLifecycleState::Unconfigured, None);
+        assert_eq!(unconfigured["health_state"], json!("DEGRADED"));
+        assert_eq!(unconfigured["lifecycle_state"], json!("UNCONFIGURED"));
+        assert!(unconfigured.get("last_error").is_none());
+
+        // A rejected config is DEGRADED, never ERROR, and says why.
+        let root = temp_root("status-failed");
+        write_config(
+            &root,
+            "AI.fake@motherbee",
+            &json!({"_system":{"config_version":4},"behavior":{"kind":"ai_chat"}}),
+        );
+        let st =
+            bootstrap_managed_control_plane_with_root("AI.fake@motherbee", &FakeContract, &root)
+                .expect("boot");
+        let failed = build_node_status_response_payload(st.current_state, st.last_error.as_ref());
+        assert_eq!(failed["health_state"], json!("DEGRADED"));
+        assert_eq!(failed["lifecycle_state"], json!("FAILED_CONFIG"));
+        assert_eq!(failed["last_error"]["code"], json!("invalid_config"));
+        assert!(failed["last_error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("missing behavior.model")));
     }
 
     #[test]

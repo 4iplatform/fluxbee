@@ -66,13 +66,18 @@ A Rust writer opens its region with `open_or_create_region(name, len, init)`:
 
 - a region of at least `len` bytes with a known magic and that magic's current version is
   **reused as it is**: `init` does not run, so the header keeps the values written when the region
-  was created (owner UUID and PID, hive, limits);
+  was created (owner UUID and PID, hive);
 - a smaller one, or one with a wrong magic or version, is unlinked and created again;
 - a new one is sized with `ftruncate`, zeroed and given its header.
 
 Then `normalize_seq_header` turns an odd `seq` left by a writer that died mid-write into the next
 even value and logs `recovered stale odd seqlock state on open`. SY.opa.rules does the same in Go
 (`openOrCreateOpaRegion`: reuse when magic and version match, `initHeader` only on creation).
+
+Two writers do more. SY.identity opens its region with `open_or_create_region_if`, which reuses it
+only when the header records the limits SY.identity starts with, and otherwise unlinks it and
+creates it again (§7). The router takes a reused region over: it empties the node table and writes
+its own header values (§3).
 
 Readers map read-only and refuse a region whose magic or version differs (`is_region_valid`,
 `is_opa_region_valid`). A layout change therefore means a version bump: an old reader refuses the
@@ -124,8 +129,10 @@ progress.
 
 | Header field | Meaning |
 | --- | --- |
-| `router_uuid`, `router_name`, `hive_id`, `is_gateway` | the router, set at creation |
-| `owner_pid`, `owner_start_time`, `created_at`, `generation` (1) | set at creation |
+| `router_uuid`, `router_name`, `hive_id`, `is_gateway` | the router, set at creation and at every start |
+| `owner_pid`, `owner_start_time` | the router process, set at creation and at every start |
+| `created_at` | set at creation |
+| `generation` | 1 at creation, plus 1 at every start that reuses the region |
 | `seq`, `heartbeat`, `updated_at` | §2.3, §2.4 |
 | `node_count`, `node_max` (1024) | active entries, capacity |
 | `opa_policy_version`, `opa_load_status` | the user policy this router holds: 0 ok, 1 error, 2 loading (`update_opa_status`) |
@@ -148,10 +155,12 @@ progress.
   - SY.opa.rules reads each header for `get_status` (`listRouterStatuses`, `readRouterStatus`),
     finding routers by their socket names in `/var/run/fluxbee/routers`. Its Go `RouterHeader`
     mirrors `ShmHeader`, with `routerVersion = 2`.
-- **Restart.** A restarted router keeps its UUID, so it reuses its region (§2.2). Nothing clears
-  the node table at start: an entry is rewritten when its node reconnects, and the entry of a node
-  that never comes back stays active. The router routes from its in-memory table, but the readers
-  above see that node until the region is recreated.
+- **Restart.** A restarted router keeps its UUID, so it reuses its region (§2.2), and takes it
+  over before it accepts a node, in one write (`RouterRegionWriter::open_or_create`, `take_over`):
+  every node entry is emptied and `node_count` set to 0, as the router's in-memory table starts
+  empty; the header gets the new process's PID and start time, the router's UUID, name, hive and
+  `is_gateway`; `generation` goes up by 1. Nodes come back into the table as they reconnect; one
+  that does not is gone for the readers above too.
 
 ---
 
@@ -294,9 +303,12 @@ Sections follow the header in this order, each on a 64-byte boundary (`layout_id
   `IdentityRegionLimits::default()`, which no production code uses.
 - **The header records the limits** (`max_*`), and readers build the layout from them
   (`open_read_only_auto`; SDK `open_identity_shm_reader`; Go reads `max_*` at fixed offsets).
-  Because a larger existing region is reused with its old header (§2.2), lowering the limits
-  leaves the header, which the readers follow, with the old ones while the writer lays the
-  sections out with the new ones.
+  Only creation writes them, so SY.identity reuses an existing region only when its header records
+  the limits SY.identity starts with (`identity_region_limits`); otherwise it logs both sets
+  (`identity shm region was laid out for other limits`), unlinks the region and creates it again
+  (§2.2). A change of the limits in `hive.yaml`, up or down, takes effect when SY.identity next
+  starts. New limits below what its store holds stop SY.identity's start instead and leave the
+  region as it is (`refuse_identity_limits_below_the_store`).
 - **Header counts:** `tenant_count`, `ilk_count`, `ich_count`, `ich_mapping_count`,
   `vocabulary_count`, `ilk_alias_count`; also `owner_uuid`, `owner_pid`, `is_primary`, `hive_id`.
 
@@ -348,7 +360,9 @@ Sections follow the header in this order, each on a 64-byte boundary (`layout_id
   `WaitForSelfSystemIlkID`. It hard-codes the struct sizes and field offsets.
 
 **Restart.** SY.identity rebuilds the whole region at start from its store: the database on the
-primary, the full sync on a replica. Until then readers read what the region holds.
+primary, the full sync on a replica. Until then readers read what the region holds: the previous
+content, or nothing when the region was created again for other limits. Every read opens the region
+afresh (§2.4), so readers find a region created again from their next read on.
 
 ---
 
@@ -377,8 +391,7 @@ primary, the full sync on a replica. Until then readers read what the region hol
   `CommunicationKey` in SY.cognition). `agent_node` is where that agent's router delivers.
 - **Lookup.** Delivering a turn with `meta.thread_id` to an `AI.*` node, the router takes the first
   entry whose `thread_id` equals it and whose `agent_node` equals the destination node's name
-  (`package_for`, `src/router/mod.rs`). An entry without `agent_ilk` and `agent_node`, written
-  before 0.1.77, matches nothing.
+  (`package_for`, `src/router/mod.rs`).
 - **Two versions.** `MEMORY_VERSION` (1) is the header layout; `schema_version` (2, written by
   SY.cognition) is inside the JSON and nobody checks it.
 - **Writer.** SY.cognition (`sync_memory_shm`), after each live turn and after its start-up reload.
@@ -391,7 +404,6 @@ primary, the full sync on a replica. Until then readers read what the region hol
     it (`read_memory_snapshot_for_delivery`). Without a readable region they deliver with no
     package.
   - SY.cognition itself (carried entries, start-up reload).
-  - `src/bin/cognition_shm_dump.rs` (`--hive <hive> [--thread-id <id>]`) prints it.
 - **Restart.** SY.cognition reuses the region, reloads from SY.storage the communications listed in
   it, and keeps the entries it has not reloaded (`reload_communications_from_shared_memory`).
 
@@ -413,17 +425,16 @@ primary, the full sync on a replica. Until then readers read what the region hol
 
 | Region | Writer restarts | Writer down |
 | --- | --- | --- |
-| Router | region and node table reused as they were (§3) | the router is gone too; siblings drop the region after 30 s |
+| Router | region reused; the node table emptied and the header rewritten at start (§3) | the router is gone too; siblings drop the region after 30 s |
 | Config | rewritten from the YAML, `config_version` bumped | routers keep the last content |
 | LSA | rewritten with the own hive only; others return with their LSAs | non-gateway routers keep the last content |
 | OPA | rewritten from `opa/current/`; repaired every 5 s | routers keep the loaded policy |
-| Identity | rebuilt from the store | readers keep the last content |
+| Identity | rebuilt from the store, in a region created again when the limits changed (§7) | readers keep the last content |
 | Memory | reused; reloaded entries refreshed, the rest kept | routers keep attaching the last packages |
 
 No service removes a region for good; a writer unlinks one only to create it again (§2.2).
-`scripts/install.sh` (`cleanup_volatile_runtime_artifacts`) and `scripts/fluxbee_cleanall.sh`
-delete every `jsr-*` region, the router ones through their `identity.yaml`;
-`packaging/fluxbee-factory-reset` deletes the memory region.
+`scripts/fluxbee_cleanall.sh` deletes every `jsr-*` region, the router ones through their
+`identity.yaml`; `packaging/fluxbee-factory-reset` deletes the memory region.
 
 ---
 

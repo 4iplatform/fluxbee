@@ -151,6 +151,9 @@ message was one.
   otherwise. `NODE_STATUS_DEFAULT_HANDLER_ENABLED=false` turns the handler off.
 - **What the operator sees:** with it, `GET /hives/{hive}/nodes/{name}/status` reports
   `health_source=NODE_REPORTED`.
+- **A managed node** answers instead with `build_node_status_response_payload(state, last_error)`
+  (`managed_control_plane`): `HEALTHY` when CONFIGURED, `DEGRADED` (never `ERROR`) otherwise, with
+  `lifecycle_state` and the reason in `last_error`. ai.generic and SY.frontdesk.gov use it.
 
 ## A node the orchestrator launches
 

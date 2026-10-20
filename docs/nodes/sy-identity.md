@@ -54,16 +54,17 @@ authentication: `src/mesh_hmac.rs`. Shared helpers and constants:
    `identity_schema_migrations`). Without the secret, or if the database cannot be set up, it
    starts without a database (`sy.identity started without active DB backend`): reads work from
    memory and writes answer `DB_NOT_READY`.
-5. Opens or creates the SHM region (next section). If it cannot, it logs
-   `identity shm unavailable` and goes on.
-6. **Replica only:** loads its HMAC key (below) and pulls a full copy from the primary
+5. **Replica only:** loads its HMAC key (below) and pulls a full copy from the primary
    (`fetch_full_sync_from_primary`). If that fails it logs `identity full sync bootstrap FAILED;
    replica is DEGRADED` and starts with what it has.
-7. Makes sure the root tenant `tnt:00000000-0000-0000-0000-000000000001` (name `fluxbee`)
+6. Makes sure the root tenant `tnt:00000000-0000-0000-0000-000000000001` (name `fluxbee`)
    exists and is active (`ensure_default_root_tenant`), and seeds one `system` ILK for every
    `SY.*` entry of `system_nodes.<role>.nodes` (`ensure_system_ilks_from_hive`). These ILKs are
    deterministic: `deterministic_system_ilk_id` hashes `fluxbee:identity:system-ilk:v1:` plus the
    node name, so SY.vault and other nodes compute the same id without asking.
+7. Opens or creates the SHM region and rebuilds it from the store (next section). Limits in
+   `hive.yaml` lowered below what the store holds stop the start here. If the region cannot be
+   opened, it logs `identity shm unavailable` and goes on.
 8. Runs its loops: the router message loop, the sync listener or the replica's sync tasks, the
    merge-alias GC every 30 s (`ALIAS_GC_INTERVAL_SECS`), and the SHM heartbeat every 5 s.
 
@@ -106,7 +107,14 @@ Identity is created in two steps:
   tenants and ILKs are left out.
 - Default limits: 8192 ILKs, 1024 tenants, 4096 vocabulary entries, aliases = the ILK limit
   (`DEFAULT_IDENTITY_SHM_MAX_*`, `identity_region_limits`); raise them with `identity.max_*`.
-  A write over a limit fails and is logged, and the region keeps its previous content.
+  A write over a limit fails and is logged, and the region keeps its previous content. Started
+  with limits other than those in the region's header, SY.identity creates the region again,
+  empty until the start-up rebuild, and logs both sets of limits
+  (`identity shm region was laid out for other limits`;
+  [shared-memory.md](../reference/shared-memory.md) §7). New limits below what the store holds
+  stop the start instead, with the counts in the error, and leave the region as it is
+  (`refuse_identity_limits_below_the_store`). The region is opened once the store is complete,
+  after a replica's full sync.
 - Readers include the router (frontdesk pre-resolve and policy data), SY.vault (caller binding
   and tenant status, `src/bin/sy_vault.rs`), SY.timer and SY.wf-rules at startup (their own
   ILK, `go/fluxbee-go-sdk/identity_shm.go`) and IO nodes resolving a channel to an ILK

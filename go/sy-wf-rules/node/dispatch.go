@@ -2,7 +2,9 @@ package node
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
+	"log"
 	"strings"
 
 	fluxbeesdk "github.com/4iplatform/json-router/fluxbee-go-sdk"
@@ -238,7 +240,10 @@ func (s *Service) handleNodeStatusGet(msg fluxbeesdk.Message) {
 	}
 	resp, err := fluxbeesdk.BuildDefaultNodeStatusResponse(&msg, s.sender.UUID(), "HEALTHY")
 	if err == nil {
-		_ = s.sender.Send(resp)
+		err = s.sender.Send(resp)
+	}
+	if err != nil {
+		log.Printf("%s not sent (trace_id=%s): %v", fluxbeesdk.MSGNodeStatusGetResponse, msg.Routing.TraceID, err)
 	}
 }
 
@@ -456,50 +461,78 @@ func (s *Service) handleNodeConfigSet(msg fluxbeesdk.Message) {
 }
 
 func (s *Service) sendNodeConfigResponse(request fluxbeesdk.Message, payload map[string]any) {
-	if s.sender == nil {
-		return
-	}
-	resp, err := fluxbeesdk.BuildNodeConfigResponseMessage(&request, s.sender.UUID(), payload)
-	if err == nil {
-		_ = s.sender.Send(resp)
-	}
+	s.sendReply(request, fluxbeesdk.MSGConfigResponse, payload, func(payload map[string]any) (fluxbeesdk.Message, error) {
+		return fluxbeesdk.BuildNodeConfigResponseMessage(&request, s.sender.UUID(), payload)
+	}, func(err error) map[string]any {
+		return map[string]any{
+			"ok":        false,
+			"node_name": s.nodeName(),
+			"state":     "error",
+			"error":     map[string]any{"code": "WFRULES_ERROR", "detail": err.Error()},
+		}
+	})
 }
 
 func (s *Service) sendCommandResponse(request fluxbeesdk.Message, action string, payload map[string]any) {
-	if s.sender == nil {
-		return
-	}
-	resp, err := fluxbeesdk.BuildMessageEnvelope(
-		s.sender.UUID(),
-		fluxbeesdk.UnicastDestination(request.Routing.Src),
-		16,
-		request.Routing.TraceID,
-		"command",
-		stringPtr(strings.ToUpper(action)+"_RESPONSE"),
-		stringPtr(action),
-		payload,
-	)
-	if err == nil {
-		_ = s.sender.Send(resp)
-	}
+	s.sendActionResponse(request, "command", action, payload)
 }
 
 func (s *Service) sendQueryResponse(request fluxbeesdk.Message, action string, payload map[string]any) {
+	s.sendActionResponse(request, "query", action, payload)
+}
+
+// sendActionResponse answers a command or a query with <ACTION>_RESPONSE.
+func (s *Service) sendActionResponse(request fluxbeesdk.Message, kind, action string, payload map[string]any) {
+	name := strings.ToUpper(action) + "_RESPONSE"
+	s.sendReply(request, name, payload, func(payload map[string]any) (fluxbeesdk.Message, error) {
+		return fluxbeesdk.BuildMessageEnvelope(
+			s.sender.UUID(),
+			fluxbeesdk.UnicastDestination(request.Routing.Src),
+			16,
+			request.Routing.TraceID,
+			kind,
+			stringPtr(name),
+			stringPtr(action),
+			payload,
+		)
+	}, commandErrorPayload)
+}
+
+// sendReply sends the reply that build makes of payload; a failure is logged. A reply that cannot
+// go (it does not build, or is over the frame limit) is answered with errorPayload instead, so the
+// requester does not wait out its timeout. Any other send failure (the send queue full during a
+// reconnect, say) gets no error reply: the work may be done, and the requester's timeout reads
+// "unknown, not failed".
+func (s *Service) sendReply(
+	request fluxbeesdk.Message,
+	name string,
+	payload map[string]any,
+	build func(map[string]any) (fluxbeesdk.Message, error),
+	errorPayload func(error) map[string]any,
+) {
 	if s.sender == nil {
 		return
 	}
-	resp, err := fluxbeesdk.BuildMessageEnvelope(
-		s.sender.UUID(),
-		fluxbeesdk.UnicastDestination(request.Routing.Src),
-		16,
-		request.Routing.TraceID,
-		"query",
-		stringPtr(strings.ToUpper(action)+"_RESPONSE"),
-		stringPtr(action),
-		payload,
-	)
+	// send reports refused when the reply itself cannot go: it does not build, or is too large.
+	send := func(payload map[string]any) (refused bool, err error) {
+		resp, err := build(payload)
+		if err != nil {
+			return true, err
+		}
+		err = s.sender.Send(resp)
+		var tooLarge *fluxbeesdk.MessageTooLargeError
+		return errors.As(err, &tooLarge), err
+	}
+	refused, err := send(payload)
 	if err == nil {
-		_ = s.sender.Send(resp)
+		return
+	}
+	log.Printf("%s not sent (trace_id=%s): %v", name, request.Routing.TraceID, err)
+	if !refused {
+		return
+	}
+	if _, err := send(errorPayload(fmt.Errorf("%s not sent: %w", name, err))); err != nil {
+		log.Printf("error %s not sent either (trace_id=%s): %v", name, request.Routing.TraceID, err)
 	}
 }
 

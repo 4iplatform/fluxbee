@@ -92,8 +92,8 @@ ones that have `boot: true`. **There is no need to touch the build script.**
 > **Invariant (U-3): `dist/runtimes/manifest.json` is OPERATOR STATE, never package
 > payload.** The `.deb` ships only the artifact tree (`dist/runtimes/<runtime>/<version>/`) and
 > **registers it at install time** with `fluxbee-seed-runtimes`, which **merges** against the
-> live manifest by calling the single merger (`scripts/publish-runtime.sh`) — the same path that
-> `scripts/install.sh` already used. Packaging it **replaced** it on every upgrade and left
+> live manifest by calling the single merger (`scripts/publish-runtime.sh`), the one every
+> runtime publish uses. Packaging it **replaced** it on every upgrade and left
 > every hot-published runtime orphaned. `build-deb.sh` has a post-build guard that
 > rejects the package if the manifest sneaks back into the payload.
 >
@@ -199,6 +199,10 @@ sudo apt-get install ./fluxbee_0.1.0_amd64.deb   # brings PostgreSQL (hard Depen
 sudo nano /etc/fluxbee/hive.yaml                 # copied from hive.yaml.example; edit hive_id/wan
 sudo fluxbee-firstboot
 ```
+
+On a development host, `scripts/install.sh [<version>]` replaces the first line: it builds the
+package from the local checkout with `packaging/build-deb.sh` and installs it with
+`apt-get install --reinstall`, so a rebuild at the installed version goes in too.
 
 `fluxbee-firstboot` (idempotent): boots PostgreSQL + creates the role/DBs, starts the orchestrator,
 does the `vault_put` of the postgres secret (the **DB connection is resolved on its own in the

@@ -1300,10 +1300,6 @@ fn build_memory_hot_set_snapshot(
     let selected_threads_total = selected_entries.len() as u64;
     let pruned_threads_total = threads.len().saturating_sub(selected_entries.len()) as u64;
     for entry in carried {
-        // An entry written before 0.1.77 has no agent and matches no delivery.
-        if entry.agent_ilk.is_empty() {
-            continue;
-        }
         let key = CommunicationKey {
             thread_id: entry.thread_id.clone(),
             agent_ilk: entry.agent_ilk.clone(),
@@ -1406,9 +1402,6 @@ async fn reload_communications_from_shared_memory(app_state: &Arc<CognitionAppSt
             .and_then(|region| region.read_snapshot().ok())
             .map(|snapshot| snapshot.threads)
             .unwrap_or_default()
-            .into_iter()
-            .filter(|entry| !entry.agent_ilk.is_empty())
-            .collect()
     };
     let results: Vec<_> = stream::iter(entries)
         .map(|entry| async move {
@@ -4655,8 +4648,7 @@ mod tests {
     }
 
     /// After a restart the region keeps the entries of communications not loaded yet, after the
-    /// ones in memory; an entry of a communication in memory is replaced, never doubled, and one
-    /// written before 0.1.77 (no agent) goes.
+    /// ones in memory; an entry of a communication in memory is replaced, never doubled.
     #[tokio::test]
     async fn the_region_keeps_what_it_has_not_loaded() {
         let mut threads = HashMap::new();
@@ -4673,7 +4665,6 @@ mod tests {
         let carried = vec![
             entry("thread:loaded", TEST_AGENT),
             entry("thread:not-loaded", TEST_AGENT),
-            entry("thread:old", ""),
         ];
         let hot_set = build_memory_hot_set_snapshot(&threads, None, carried).expect("hot set");
         let kept: Vec<(&str, &str)> = hot_set

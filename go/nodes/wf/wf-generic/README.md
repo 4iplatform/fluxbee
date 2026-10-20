@@ -84,11 +84,12 @@ For v1, `WF.*` exposes the standard `CONFIG_GET` / `CONFIG_SET` contract, but th
 
 ### 1. Publish the `wf.engine` base runtime
 
-Install the base binary:
+Install the package built from this checkout (it seeds `wf.engine`, `packaging/base-nodes.json`;
+`VERSION` defaults to the installed one):
 
 ```bash
 cd ~/fluxbee
-bash scripts/install.sh
+bash scripts/install.sh [VERSION]
 ```
 
 Publish the `wf.engine` base runtime to dist:
@@ -100,9 +101,15 @@ bash scripts/publish-wf-runtime.sh --version 0.1.0 --set-current --sudo
 
 ### 2. Publish the `wf.invoice` workflow package
 
+The package directory is `go/nodes/wf/examples/packages/wf.invoice`. `fluxbee-publish` installs it
+into the local `dist` and makes it `current` (the version comes from its `package.json`, or from
+`--version <v>`); `--deploy <hive>` then asks that hive to sync and update
+(`docs/reference/operations.md`, "Publish runtimes"). Run it on the motherbee:
+
 ```bash
 cd ~/fluxbee
-bash scripts/publish-wf-invoice-package.sh --version 0.1.0 --deploy motherbee
+cargo build --release --bin fluxbee-publish
+sudo ./target/release/fluxbee-publish go/nodes/wf/examples/packages/wf.invoice --deploy motherbee
 ```
 
 ### 3. Managed spawn through `SY.admin`/`SY.orchestrator`

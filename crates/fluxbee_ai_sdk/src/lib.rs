@@ -20,7 +20,7 @@ pub use function_calling::{
     dispatch_tool_calls, FunctionCallingConfig, FunctionCallingModel, FunctionCallingRunner,
     FunctionLoopItem, FunctionLoopRunResult, FunctionModelTurnRequest, FunctionModelTurnResponse,
     FunctionTool, FunctionToolCall, FunctionToolDefinition, FunctionToolProvider,
-    FunctionToolRegistry, FunctionToolResult,
+    FunctionToolRegistry, FunctionToolResult, ToolRunWatch, DEFAULT_MAX_TURNS,
 };
 pub use immediate_memory::{
     ConversationSummary, FunctionRunInput, ImmediateConversationMemory, ImmediateInteraction,
@@ -30,7 +30,7 @@ pub use llm::{
     build_output_schema_fallback_instruction, create_function_calling_model, create_llm_client,
     AiProvider, AiProviderConfigs, AiProviderModelConfig, EffectiveAiEngine, HiveAiConfig,
     LlmClient, LlmRequest, LlmResponse, LlmStreamEvent, MockLlmClient, ModelSettings,
-    OutputSchemaSpec, DEFAULT_HIVE_AI_PROVIDER, DEFAULT_HIVE_OPENAI_MODEL,
+    OutputSchemaSpec, DEFAULT_HIVE_AI_PROVIDER, DEFAULT_HIVE_OPENAI_MODEL, MODEL_CALL_TIMEOUT,
 };
 pub use message::{
     build_reply_message, build_reply_message_runtime_src,
@@ -45,7 +45,9 @@ pub use output::{
     build_ai_behavior_response_with_options, materialize_user_artifacts, AiBehaviorOutput,
     AiFinalOutput, AiUserArtifact,
 };
-pub use runtime::{NodeRuntime, RetryPolicy, RuntimeConfig, AI_RUNTIME_CHANNEL};
+pub use runtime::{
+    NodeRuntime, RetryPolicy, RuntimeConfig, AI_RUNTIME_CHANNEL, DEFAULT_HANDLER_TIMEOUT,
+};
 pub use summary_refresh::{
     refresh_conversation_summary, SummaryRefreshConfig, SummaryRefreshInput,
 };

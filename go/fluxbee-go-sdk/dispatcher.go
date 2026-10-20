@@ -277,6 +277,9 @@ const (
 	RpcErrInvalidResponse
 	RpcErrTerminalTransport
 	RpcErrUnknown
+	// RpcErrMessageTooLarge means the request's frame was over the limit:
+	// nothing was sent and the link is up. Cause is the *MessageTooLargeError.
+	RpcErrMessageTooLarge
 )
 
 func (e *RpcError) Error() string {
@@ -294,6 +297,8 @@ func (e *RpcError) Error() string {
 		return fmt.Sprintf("rpc terminal transport error: %s", e.Message)
 	case RpcErrInvalidRequest:
 		return fmt.Sprintf("rpc invalid request: %s", e.Message)
+	case RpcErrMessageTooLarge:
+		return fmt.Sprintf("rpc message too large: trace_id=%s target=%s verb=%s: %s", e.TraceID, e.Target, e.Verb, e.Message)
 	default:
 		if e.Cause != nil {
 			return fmt.Sprintf("rpc error: %s", e.Cause.Error())
@@ -327,6 +332,11 @@ const (
 	MsgAdminCommand         = "ADMIN_COMMAND"
 	MsgAdminCommandResponse = "ADMIN_COMMAND_RESPONSE"
 )
+
+// rpcRequestTTL is the ttl of SendAdminRPC requests and of SendSystemRPC
+// requests that set none, as in the Rust SDK: enough to reach a node on
+// another router or hive.
+const rpcRequestTTL uint8 = 16
 
 type AdminRpcRequest struct {
 	AdminTarget string
@@ -507,13 +517,18 @@ func (d *RouterDispatcher) SendSystemRPC(ctx context.Context, request SystemRpcR
 	if responseMsg == "" {
 		return Message{}, &RpcError{Kind: RpcErrInvalidRequest, Message: "response_msg must be non-empty"}
 	}
+	// BuildSystemRequest alone would send ttl 1, which never leaves the router.
+	options := request.Options
+	if options.TTL == 0 {
+		options.TTL = rpcRequestTTL
+	}
 	msg, err := BuildSystemRequest(
 		d.sender.UUID(),
 		target,
 		requestMsg,
 		request.Payload,
 		uuid.NewString(),
-		request.Options,
+		options,
 	)
 	if err != nil {
 		return Message{}, err
@@ -568,7 +583,7 @@ func (d *RouterDispatcher) SendAdminRPC(ctx context.Context, request AdminRpcReq
 		Routing: Routing{
 			Src:     d.sender.UUID(),
 			Dst:     UnicastDestination(adminTarget),
-			TTL:     16,
+			TTL:     rpcRequestTTL,
 			TraceID: uuid.NewString(),
 		},
 		Meta: Meta{
@@ -638,6 +653,18 @@ func (d *RouterDispatcher) SendWithMatcher(
 
 	if err := d.sender.Send(msg); err != nil {
 		d.removePending(traceID)
+		// Refused before queueing: nothing was sent and the link is up.
+		var tooLarge *MessageTooLargeError
+		if errors.As(err, &tooLarge) {
+			return Message{}, &RpcError{
+				Kind:    RpcErrMessageTooLarge,
+				TraceID: traceID,
+				Target:  labels.Target,
+				Verb:    labels.RequestMsg,
+				Message: fmt.Sprintf("%d bytes (max %d)", tooLarge.Size, tooLarge.Max),
+				Cause:   err,
+			}
+		}
 		return Message{}, &RpcError{Kind: RpcErrDisconnected, Cause: err}
 	}
 	d.registerResponseOnly(matcher)
@@ -849,11 +876,12 @@ func (d *RouterDispatcher) gcStaleLocked(now time.Time) {
 	}
 }
 
-// registerResponseOnly remembers the response shapes a SendWithMatcher
-// is expecting so the dispatcher can flag orphaned arrivals (responses
-// that match a registered shape but have no pending matcher and are not
-// stale). Unrolls `RouteOneOf` into `RouteExact` because Go slices are
-// not comparable and would otherwise be unusable as map keys.
+// registerResponseOnly remembers the exact response shapes a
+// SendWithMatcher is expecting so the dispatcher can flag orphaned
+// arrivals (responses that match a registered shape but have no pending
+// matcher and are not stale). Unrolls `RouteOneOf` into `RouteExact`
+// because Go slices are not comparable and would otherwise be unusable as
+// map keys.
 func (d *RouterDispatcher) registerResponseOnly(matcher PendingMatcher) {
 	d.staleMu.Lock()
 	defer d.staleMu.Unlock()
@@ -870,9 +898,10 @@ func (d *RouterDispatcher) registerResponseOnly(matcher PendingMatcher) {
 				}
 			}
 		case RouteAnyMsgOfType:
-			if !d.postPendingDeclaresObservationalFamily(r.MsgType) {
-				d.responseOnly[r] = struct{}{}
-			}
+			// Never registered: a whole family would drop every later
+			// message of that kind, the node's own commands included,
+			// until restart (the io.cloud outage of 2026-08-26). Late
+			// family replies still hit the pending map and stale table.
 		case RouteAny:
 			// Skip — registering RouteAny would drop everything as
 			// orphaned. Mirror of Rust behavior.
@@ -898,36 +927,18 @@ func (d *RouterDispatcher) classifyUnknownResponse(msg Message, msgName string) 
 // post_pending rule that matches (msgType, msg) AND routes to a
 // Broadcast target. Such a rule means the response shape is intentionally
 // observational (broadcast fan-out) and should NOT be registered as
-// response-only.
+// response-only. A catch-all (`RouteAny`) rule declares no shape, as in
+// Rust.
 func (d *RouterDispatcher) postPendingDeclaresObservationalExact(msgType, msg string) bool {
 	for _, rule := range d.profile.postPendingRules {
+		if _, ok := rule.match.(RouteAny); ok {
+			continue
+		}
 		if !rule.match.matches(msgType, msg) {
 			continue
 		}
 		if _, ok := rule.target.(RouteBroadcast); ok {
 			return true
-		}
-	}
-	return false
-}
-
-// postPendingDeclaresObservationalFamily returns true if any post_pending
-// rule for the same msgType routes to a Broadcast target.
-func (d *RouterDispatcher) postPendingDeclaresObservationalFamily(msgType string) bool {
-	for _, rule := range d.profile.postPendingRules {
-		switch r := rule.match.(type) {
-		case RouteAnyMsgOfType:
-			if r.MsgType == msgType {
-				if _, ok := rule.target.(RouteBroadcast); ok {
-					return true
-				}
-			}
-		case RouteExact:
-			if r.MsgType == msgType {
-				if _, ok := rule.target.(RouteBroadcast); ok {
-					return true
-				}
-			}
 		}
 	}
 	return false

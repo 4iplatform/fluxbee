@@ -3,7 +3,9 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use fluxbee_sdk::node_client::NodeError;
+use fluxbee_sdk::protocol::is_system_kind;
 use fluxbee_sdk::{NodeSender, RouterDispatcher, RpcCommandReceiver, RpcError};
+use serde_json::json;
 use tokio::sync::mpsc;
 use tokio::task::JoinSet;
 use tokio::time::sleep;
@@ -11,6 +13,9 @@ use tokio::time::timeout;
 
 use crate::errors::AiSdkError;
 use crate::errors::Result;
+use crate::function_calling::DEFAULT_MAX_TURNS;
+use crate::llm::MODEL_CALL_TIMEOUT;
+use crate::message::{build_reply_message_runtime_src, Message};
 use crate::node_trait::AiNode;
 
 /// Command channel the AI runtime drains. Binary callers must declare a
@@ -18,14 +23,30 @@ use crate::node_trait::AiNode;
 /// profile they hand to the runtime.
 pub const AI_RUNTIME_CHANNEL: &str = "incoming";
 
+/// Room for the tools a message's tool loop runs between its model turns: a `publish_html_page`
+/// waits up to 2 min on SY.admin.
+const TOOL_TIME_ALLOWANCE: Duration = Duration::from_secs(120);
+
+/// How long a message's handler may run by default: a whole tool loop, that is
+/// `DEFAULT_MAX_TURNS` model turns plus the plain call ai.generic and SY.frontdesk.gov make when the
+/// loop ends without text, each bounded by `MODEL_CALL_TIMEOUT`, and the tools between them. It is a
+/// backstop that never cuts a loop still making progress: a stuck model call fails on its own bound
+/// first, as a provider error the node answers.
+pub const DEFAULT_HANDLER_TIMEOUT: Duration = Duration::from_secs(
+    MODEL_CALL_TIMEOUT.as_secs() * (DEFAULT_MAX_TURNS as u64 + 1) + TOOL_TIME_ALLOWANCE.as_secs(),
+);
+
 #[derive(Debug, Clone)]
 pub struct RuntimeConfig {
     pub read_timeout: Duration,
+    /// How long one message's handler may run. The handler runs once: when it fails or runs out of
+    /// time, the sender gets an error and the message is never run again.
     pub handler_timeout: Duration,
     pub write_timeout: Duration,
     pub queue_capacity: usize,
     pub worker_pool_size: usize,
-    pub retry_policy: RetryPolicy,
+    /// Retries of the write of a reply, the only step the runtime retries.
+    pub write_retry: RetryPolicy,
     pub metrics_log_interval: Duration,
     /// The agent's own ILK, stamped as the sender of its replies (docs/router-stream-v1.md §6.2:
     /// cognition reads who says what). None leaves a reply without `src_ilk`, never the human's.
@@ -43,11 +64,11 @@ impl Default for RuntimeConfig {
     fn default() -> Self {
         Self {
             read_timeout: Duration::from_secs(30),
-            handler_timeout: Duration::from_secs(60),
+            handler_timeout: DEFAULT_HANDLER_TIMEOUT,
             write_timeout: Duration::from_secs(10),
             queue_capacity: 128,
             worker_pool_size: 4,
-            retry_policy: RetryPolicy::default(),
+            write_retry: RetryPolicy::default(),
             metrics_log_interval: Duration::from_secs(30),
             self_ilk_id: fluxbee_sdk::read_self_ilk_from_env(),
         }
@@ -78,6 +99,8 @@ struct RuntimeMetrics {
     enqueued_messages: AtomicU64,
     processed_messages: AtomicU64,
     responses_sent: AtomicU64,
+    handler_failures: AtomicU64,
+    handler_timeouts: AtomicU64,
     recoverable_exhausted: AtomicU64,
     fatal_errors: AtomicU64,
     retry_attempts: AtomicU64,
@@ -92,6 +115,8 @@ struct RuntimeMetricsSnapshot {
     enqueued_messages: u64,
     processed_messages: u64,
     responses_sent: u64,
+    handler_failures: u64,
+    handler_timeouts: u64,
     recoverable_exhausted: u64,
     fatal_errors: u64,
     retry_attempts: u64,
@@ -107,6 +132,8 @@ impl RuntimeMetrics {
             enqueued_messages: self.enqueued_messages.load(Ordering::Relaxed),
             processed_messages: self.processed_messages.load(Ordering::Relaxed),
             responses_sent: self.responses_sent.load(Ordering::Relaxed),
+            handler_failures: self.handler_failures.load(Ordering::Relaxed),
+            handler_timeouts: self.handler_timeouts.load(Ordering::Relaxed),
             recoverable_exhausted: self.recoverable_exhausted.load(Ordering::Relaxed),
             fatal_errors: self.fatal_errors.load(Ordering::Relaxed),
             retry_attempts: self.retry_attempts.load(Ordering::Relaxed),
@@ -141,9 +168,9 @@ impl<N: AiNode + 'static> NodeRuntime<N> {
             read_timeout_ms = config.read_timeout.as_millis() as u64,
             handler_timeout_ms = config.handler_timeout.as_millis() as u64,
             write_timeout_ms = config.write_timeout.as_millis() as u64,
-            retry_max_attempts = config.retry_policy.max_attempts,
-            retry_initial_backoff_ms = config.retry_policy.initial_backoff.as_millis() as u64,
-            retry_max_backoff_ms = config.retry_policy.max_backoff.as_millis() as u64,
+            write_retry_max_attempts = config.write_retry.max_attempts,
+            write_retry_initial_backoff_ms = config.write_retry.initial_backoff.as_millis() as u64,
+            write_retry_max_backoff_ms = config.write_retry.max_backoff.as_millis() as u64,
             metrics_log_interval_s = config.metrics_log_interval.as_secs(),
             "ai runtime started"
         );
@@ -276,6 +303,8 @@ impl<N: AiNode + 'static> NodeRuntime<N> {
             enqueued_messages = final_metrics.enqueued_messages,
             processed_messages = final_metrics.processed_messages,
             responses_sent = final_metrics.responses_sent,
+            handler_failures = final_metrics.handler_failures,
+            handler_timeouts = final_metrics.handler_timeouts,
             recoverable_exhausted = final_metrics.recoverable_exhausted,
             fatal_errors = final_metrics.fatal_errors,
             retry_attempts = final_metrics.retry_attempts,
@@ -289,7 +318,7 @@ impl<N: AiNode + 'static> NodeRuntime<N> {
 async fn reader_loop(
     mut reader: RpcCommandReceiver,
     dispatcher: Arc<RouterDispatcher>,
-    tx: mpsc::Sender<crate::message::Message>,
+    tx: mpsc::Sender<Message>,
     read_timeout: Duration,
     metrics: Arc<RuntimeMetrics>,
 ) -> Result<()> {
@@ -389,27 +418,19 @@ fn with_jitter(base: Duration) -> Duration {
 async fn process_one<N: AiNode>(
     node: Arc<N>,
     writer: NodeSender,
-    msg: crate::message::Message,
+    msg: Message,
     config: RuntimeConfig,
     metrics: Arc<RuntimeMetrics>,
 ) -> Result<()> {
-    let maybe_response = execute_with_retry(
-        || async {
-            timeout(config.handler_timeout, node.on_message(msg.clone()))
-                .await
-                .map_err(|_| AiSdkError::Timeout("node handler timeout".to_string()))?
-        },
-        &config.retry_policy,
-        "handler",
-        metrics.clone(),
-    )
-    .await?;
+    let maybe_response = run_handler(node.as_ref(), msg, config.handler_timeout, &metrics).await;
 
     if let Some(mut response) = maybe_response {
         response.routing.src = writer.uuid().to_string();
         if response.meta.src_ilk.is_none() {
             response.meta.src_ilk = config.self_ilk_id.clone();
         }
+        // Sending a reply again is safe: a send that timed out or was refused never queued it (the
+        // SDK's send is a cancel-safe channel send), so a reply cannot go out twice.
         execute_with_retry(
             || async {
                 timeout(config.write_timeout, writer.send(response.clone()))
@@ -417,7 +438,7 @@ async fn process_one<N: AiNode>(
                     .map_err(|_| AiSdkError::Timeout("router write timeout".to_string()))?
                     .map_err(AiSdkError::Node)
             },
-            &config.retry_policy,
+            &config.write_retry,
             "write",
             metrics.clone(),
         )
@@ -427,6 +448,72 @@ async fn process_one<N: AiNode>(
 
     metrics.processed_messages.fetch_add(1, Ordering::Relaxed);
     Ok(())
+}
+
+/// Runs a message's handler once. When it fails or runs out of time it may already have called a
+/// model (billed) or a tool that acts (`publish_html_page`), so it is never run again: the sender
+/// gets an error instead, and the runtime goes on with the next message.
+async fn run_handler<N: AiNode>(
+    node: &N,
+    msg: Message,
+    handler_timeout: Duration,
+    metrics: &RuntimeMetrics,
+) -> Option<Message> {
+    match timeout(handler_timeout, node.on_message(msg.clone())).await {
+        Ok(Ok(response)) => response,
+        Ok(Err(err)) => {
+            metrics.handler_failures.fetch_add(1, Ordering::Relaxed);
+            tracing::warn!(
+                trace_id = %msg.routing.trace_id,
+                msg_type = %msg.meta.msg_type,
+                error = %err,
+                "handler failed; the sender gets an error and the message is not run again"
+            );
+            handler_failure_reply(
+                &msg,
+                "ai_runtime_error",
+                "The AI runtime failed while processing this message.".to_string(),
+            )
+        }
+        Err(_) => {
+            metrics.handler_timeouts.fetch_add(1, Ordering::Relaxed);
+            tracing::warn!(
+                trace_id = %msg.routing.trace_id,
+                msg_type = %msg.meta.msg_type,
+                handler_timeout_ms = handler_timeout.as_millis() as u64,
+                "handler ran out of time; the sender gets an error and the message is not run again"
+            );
+            handler_failure_reply(
+                &msg,
+                "ai_runtime_timeout",
+                format!(
+                    "The AI runtime did not finish this message within {} s. It may have done part \
+                     of its work before it stopped.",
+                    handler_timeout.as_secs()
+                ),
+            )
+        }
+    }
+}
+
+/// The answer to a message whose handler failed or ran out of time, in the shape of every AI runtime
+/// error (`type`, `code`, `message`, `retryable`). It is not `retryable`: the handler may have acted
+/// before it stopped. A `system` or `admin` request gets none: its caller waits for a named answer
+/// and reports its own timeout, and answering a router notice (`UNREACHABLE`) could bounce.
+fn handler_failure_reply(msg: &Message, code: &str, message: String) -> Option<Message> {
+    let kind = msg.meta.msg_type.as_str();
+    if is_system_kind(kind) || kind.eq_ignore_ascii_case("admin") {
+        return None;
+    }
+    Some(build_reply_message_runtime_src(
+        msg,
+        json!({
+            "type": "error",
+            "code": code,
+            "message": message,
+            "retryable": false
+        }),
+    ))
 }
 
 async fn execute_with_retry<T, F, Fut>(
@@ -493,6 +580,8 @@ async fn metrics_loop(metrics: Arc<RuntimeMetrics>, interval: Duration) {
             enqueued_messages = snapshot.enqueued_messages,
             processed_messages = snapshot.processed_messages,
             responses_sent = snapshot.responses_sent,
+            handler_failures = snapshot.handler_failures,
+            handler_timeouts = snapshot.handler_timeouts,
             recoverable_exhausted = snapshot.recoverable_exhausted,
             fatal_errors = snapshot.fatal_errors,
             retry_attempts = snapshot.retry_attempts,
@@ -506,5 +595,154 @@ fn map_rpc_err(err: RpcError) -> AiSdkError {
         RpcError::Node(node) => AiSdkError::Node(node),
         RpcError::Disconnected => AiSdkError::Node(NodeError::Disconnected),
         other => AiSdkError::Protocol(format!("router dispatcher error: {other}")),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::AtomicUsize;
+
+    use async_trait::async_trait;
+    use fluxbee_sdk::protocol::{Destination, Meta, Routing};
+    use serde_json::Value;
+
+    use super::*;
+
+    enum Outcome {
+        TooSlow,
+        Fails,
+        Answers,
+    }
+
+    struct CountingNode {
+        outcome: Outcome,
+        calls: AtomicUsize,
+    }
+
+    impl CountingNode {
+        fn new(outcome: Outcome) -> Self {
+            Self {
+                outcome,
+                calls: AtomicUsize::new(0),
+            }
+        }
+
+        fn calls(&self) -> usize {
+            self.calls.load(Ordering::SeqCst)
+        }
+    }
+
+    #[async_trait]
+    impl AiNode for CountingNode {
+        async fn on_message(&self, msg: Message) -> Result<Option<Message>> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            match self.outcome {
+                Outcome::TooSlow => {
+                    sleep(Duration::from_secs(5)).await;
+                    Ok(None)
+                }
+                // Recoverable: the runtime used to run the message again for it.
+                Outcome::Fails => Err(AiSdkError::Node(NodeError::Disconnected)),
+                Outcome::Answers => Ok(Some(build_reply_message_runtime_src(
+                    &msg,
+                    json!({"type": "text", "content": "done"}),
+                ))),
+            }
+        }
+    }
+
+    fn message(msg_type: &str) -> Message {
+        Message {
+            routing: Routing {
+                src: "IO.slack.main@motherbee".to_string(),
+                src_l2_name: None,
+                dst: Destination::Unicast("AI.sales@motherbee".to_string()),
+                ttl: 16,
+                trace_id: "trace-1".to_string(),
+            },
+            meta: Meta {
+                msg_type: msg_type.to_string(),
+                thread_id: Some("thread-1".to_string()),
+                ..Meta::default()
+            },
+            payload: json!({"type": "text", "content": "publish my page"}),
+        }
+    }
+
+    const SHORT: Duration = Duration::from_millis(50);
+
+    #[tokio::test]
+    async fn a_handler_out_of_time_is_answered_with_an_error_and_never_run_again() {
+        let node = CountingNode::new(Outcome::TooSlow);
+        let metrics = RuntimeMetrics::default();
+
+        let reply = run_handler(&node, message("user"), SHORT, &metrics)
+            .await
+            .expect("the sender gets an answer");
+
+        assert_eq!(node.calls(), 1);
+        assert_eq!(metrics.handler_timeouts.load(Ordering::Relaxed), 1);
+        assert_eq!(reply.payload["type"], json!("error"));
+        assert_eq!(reply.payload["code"], json!("ai_runtime_timeout"));
+        assert_eq!(reply.payload["retryable"], json!(false));
+        assert!(matches!(
+            reply.routing.dst,
+            Destination::Unicast(ref dst) if dst == "IO.slack.main@motherbee"
+        ));
+        assert_eq!(reply.meta.thread_id.as_deref(), Some("thread-1"));
+    }
+
+    #[tokio::test]
+    async fn a_failed_handler_is_answered_once_even_for_a_recoverable_error() {
+        let node = CountingNode::new(Outcome::Fails);
+        let metrics = RuntimeMetrics::default();
+
+        let reply = run_handler(&node, message("user"), SHORT, &metrics)
+            .await
+            .expect("the sender gets an answer");
+
+        assert_eq!(node.calls(), 1);
+        assert_eq!(metrics.handler_failures.load(Ordering::Relaxed), 1);
+        assert_eq!(reply.payload["code"], json!("ai_runtime_error"));
+        assert_eq!(reply.payload["retryable"], json!(false));
+    }
+
+    #[tokio::test]
+    async fn a_control_request_whose_handler_fails_gets_no_error_answer() {
+        for kind in ["system", "admin"] {
+            let node = CountingNode::new(Outcome::TooSlow);
+            let metrics = RuntimeMetrics::default();
+            assert!(run_handler(&node, message(kind), SHORT, &metrics)
+                .await
+                .is_none());
+            assert_eq!(node.calls(), 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn a_handler_answer_goes_out_as_it_is() {
+        let node = CountingNode::new(Outcome::Answers);
+        let metrics = RuntimeMetrics::default();
+
+        let reply = run_handler(&node, message("user"), SHORT, &metrics)
+            .await
+            .expect("answer");
+
+        assert_eq!(reply.payload["content"], Value::from("done"));
+        assert_eq!(metrics.handler_failures.load(Ordering::Relaxed), 0);
+        assert_eq!(metrics.handler_timeouts.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn the_default_handler_timeout_fits_a_whole_tool_loop() {
+        let model_calls = DEFAULT_MAX_TURNS as u32 + 1;
+        assert!(DEFAULT_HANDLER_TIMEOUT >= MODEL_CALL_TIMEOUT * model_calls + TOOL_TIME_ALLOWANCE);
+        assert_eq!(
+            RuntimeConfig::default().handler_timeout,
+            DEFAULT_HANDLER_TIMEOUT
+        );
+        // The bounds the docs give: 5 min per model call, 47 min per message.
+        assert_eq!(MODEL_CALL_TIMEOUT, Duration::from_secs(5 * 60));
+        assert_eq!(DEFAULT_HANDLER_TIMEOUT, Duration::from_secs(47 * 60));
     }
 }

@@ -45,7 +45,7 @@ uses the same framing: node to router, router to sibling router, hive to hive.
 | Who has the big frame | What happens | Code |
 | --- | --- | --- |
 | A Rust node sending | `NodeSender::send` refuses it with `NodeError::MessageTooLarge` and logs `FRAME_TOO_LARGE`; nothing is queued. A `text` payload is offloaded to a blob before this check (§8). | `split.rs` |
-| A Go node sending | `Send` queues it; the writer's `WriteFrame` refuses it, the connection manager closes the connection and opens a new one. The frame is lost. | `connectionManager`, `client.go` |
+| A Go node sending | `NodeSender.Send` refuses it with `*MessageTooLargeError` and logs `FRAME_TOO_LARGE`; nothing is queued and the connection stays up. | `client.go` |
 | The router, reading from a node | The read fails; the router logs `FRAME_TOO_LARGE — node sent oversized frame; disconnecting`, ends the connection and unregisters the node. | `handle_node` |
 | The router, writing a frame it enlarged on the way (stamps, memory package) | The frame is skipped and counted, with at most one warning per link every 30 s; the link stays up. Neither side is told. | `write_link_frames` |
 
@@ -200,7 +200,8 @@ The chosen name is then routed like a named unicast.
   when `ttl` ≥ 2, else it answers TTL_EXCEEDED. Delivery to a node of the same router costs nothing.
 - The SDK uses 16 for requests and replies (`send_system_rpc`, `send_admin_rpc`, the status reply)
   and 1 for HELLO, ANNOUNCE, WITHDRAW and STREAM_APPEND, which never leave the router. Go's
-  `SendSystemRPC` is the exception (§11).
+  `SendSystemRPC` uses 16 too unless `Options.TTL` sets another; `BuildSystemRequest` alone turns a
+  0 `ttl` into 1.
 
 ### 3.5 meta
 
@@ -604,7 +605,8 @@ later one.
    dropped as stale (`RECENT_STALE_TTL`, at most 1,024 kept).
 4. The message has the exact shape of a reply this node has awaited before
    (`register_response_only`): dropped as orphaned. A shape that a `post_pending_rule` sends to a
-   broadcast channel is exempt, and `AnyMsgOfType` and `Any` success matchers are never registered.
+   broadcast channel is exempt (a catch-all `Any` rule does not count), and `AnyMsgOfType` and `Any`
+   success matchers are never registered.
 5. A `post_pending_rule` matches: its target.
 6. Otherwise dropped and counted (`metric_route_unmatched`).
 
@@ -622,8 +624,10 @@ A `PendingMatcher` holds three `RouteMatch` lists, tried in order: `success` del
 
 `send_with_matcher` fails at once with `RpcError::Disconnected` when the link is down, fills an
 empty `trace_id` (a new UUID) and `src`, and refuses a `trace_id` already pending
-(`InvalidRequest`). `send_system_rpc` sends `ttl` 16 to the unicast `target`, with `action_class`
-from `classify_system_message`.
+(`InvalidRequest`). A request over the frame limit fails at once with
+`RpcError::Node(NodeError::MessageTooLarge)` (Go `RpcErrMessageTooLarge`) and leaves nothing
+pending. `send_system_rpc` sends `ttl` 16 to the unicast `target`, with `action_class` from
+`classify_system_message`.
 
 ### 10.4 Timeouts and errors
 
@@ -632,7 +636,7 @@ A zero timeout means 5 s (`default_rpc_timeout`; Go `SendWithMatcher`).
 unknown, not failed: the peer may have done the work (`RpcError::is_timeout`). Transport errors are
 `RpcError::Unreachable {reason, original_dst}` and `RpcError::TtlExceeded {original_dst,
 last_hop}`. Go returns `*RpcError` with `Kind` `RpcErrTimeout`, `RpcErrTerminalTransport`,
-`RpcErrInvalidResponse`, `RpcErrDisconnected` or `RpcErrInvalidRequest`.
+`RpcErrInvalidResponse`, `RpcErrDisconnected`, `RpcErrInvalidRequest` or `RpcErrMessageTooLarge`.
 
 ### 10.5 Answering a request
 
@@ -642,7 +646,10 @@ requester's dispatcher matches on that. Builders: `try_handle_default_node_statu
 `BuildSystemResponse`, `BuildCommandResponse`, `BuildQueryResponse`. Send through
 `RouterDispatcher::sender_snapshot()` (Go `SenderSnapshot()`). Do not reuse a response name as a
 command name: once a node has awaited `X_RESPONSE` with an exact matcher, an unsolicited
-`X_RESPONSE` is dropped (step 4 of §10.2).
+`X_RESPONSE` is dropped (step 4 of §10.2). Answer requests only, never a reply or a notice. A
+message without `routing.src_l2_name` was made by the router (UNREACHABLE, TTL_EXCEEDED); its
+`routing.src` is the router's UUID, which no node has, so an answer comes back as another
+UNREACHABLE, and a node that answers every message bounces it forever.
 
 ---
 
@@ -651,11 +658,11 @@ command name: once a node has awaited `X_RESPONSE` with an exact matcher, an uns
 | Topic | Rust `crates/fluxbee_sdk` | Go `go/fluxbee-go-sdk` |
 | --- | --- | --- |
 | Reconnection | §2.5 | §2.5 |
-| A frame over 128 KiB | Refused before sending | Kills the connection, which reopens (§1.3) |
+| A frame over 128 KiB | Refused before sending (`NodeError::MessageTooLarge`) | Refused before sending (`*MessageTooLargeError`); the connection stays up |
 | Inbound queue full (256) | Backpressure on the socket | The message is dropped; the dispatcher fails every pending request on any receive error (`dispatchLoop`) |
 | Command channels | Unbounded, warning at depth 1,000 (`RPC_COMMAND_DEPTH_WARN_THRESHOLD`) | 64 messages; when full, dropped and counted (`CommandChannelDrops`) |
-| `AnyMsgOfType` success matcher | Never registered as a reply shape | Registered (`registerResponseOnly`): after awaiting a reply that way, every later unsolicited message of that kind is dropped, unless a post-pending rule sends the kind to a broadcast channel |
-| System request `ttl` | `send_system_rpc`: 16 | `SendSystemRPC` takes `Options.TTL` and turns 0 into 1 (`BuildSystemRequest`, `normalizeTTL`): set it (16) to reach another router or hive. It also sets `meta.action` to the verb |
+| `AnyMsgOfType` success matcher | Never registered as a reply shape | The same (`registerResponseOnly`) |
+| System request `ttl` | `send_system_rpc`: 16 | `SendSystemRPC`: 16 unless `Options.TTL` sets another; `BuildSystemRequest` alone turns 0 into 1. It also sets `meta.action` to the verb |
 | Admin request result | `AdminCommandResult` | The raw `Message` |
 | text/v1 blob offload | Automatic (§8) | None |
 | `compute_thread_id`, `stream::append`, vault client | Yes | No |

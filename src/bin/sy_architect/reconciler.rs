@@ -5,14 +5,16 @@
 // No AI calls, no network calls. The snapshot is built by build_actual_state_snapshot()
 // in sy_architect.rs and passed in. Same inputs → same outputs always.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
+
+use fluxbee_sdk::protocol::PRIMARY_HIVE_ID;
 use uuid::Uuid;
 
 use super::pipeline_types::{
     desired_state_unknown_sections, is_valid_ownership_label, restart_policy_for_node,
     ActualStateSnapshot, BuildTaskKnownContext, BuildTaskPacket, ChangeType, CompilerClass,
     DeltaOperation, DeltaReport, DeltaReportStatus, DeltaSummary, DesiredHive, DesiredNode,
-    DesiredOpaPolicy, DesiredRoute, DesiredRuntime, DesiredVpn, DesiredWfDeployment,
+    DesiredOpaPolicy, DesiredRoute, DesiredRuntime, DesiredVpn, DesiredWfDeployment, HiveResources,
     ReconcilerOutput, RestartPolicy, SolutionManifestV2, MAX_ARTIFACT_ATTEMPTS,
     UNSUPPORTED_DESIRED_STATE_SECTIONS,
 };
@@ -53,48 +55,91 @@ pub fn validate_manifest_sections(manifest: &SolutionManifestV2) -> Result<(), S
     Ok(())
 }
 
-fn snapshot_item_values(payload: Option<&serde_json::Value>) -> Vec<serde_json::Value> {
-    if let Some(arr) = payload.and_then(|v| v.as_array()) {
-        return arr.clone();
-    }
-    if let Some(arr) = payload
-        .and_then(|v| v.get("items"))
-        .and_then(|v| v.as_array())
-    {
-        return arr.clone();
-    }
-    if let Some(arr) = payload
-        .and_then(|v| v.get("responses"))
-        .and_then(|v| v.as_array())
-    {
-        return arr
-            .iter()
-            .filter_map(|entry| {
-                let mut payload = entry.get("payload")?.clone();
-                if let (Some(obj), Some(hive)) = (
-                    payload.as_object_mut(),
-                    entry.get("hive").and_then(|v| v.as_str()),
-                ) {
-                    obj.entry("hive".to_string())
-                        .or_insert_with(|| serde_json::json!(hive));
-                }
-                Some(payload)
-            })
-            .collect();
-    }
-    Vec::new()
+// ── Snapshot answers ──────────────────────────────────────────────────────────
+// Each answer is the producer's payload, which SY.admin hands over as is; each is read exactly in
+// the shape its producer sends.
+
+/// The list at `pointer` in an answer; none when the answer has no such list.
+fn listed<'a>(answer: Option<&'a serde_json::Value>, pointer: &str) -> &'a [serde_json::Value] {
+    answer
+        .and_then(|answer| answer.pointer(pointer))
+        .and_then(serde_json::Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or_default()
 }
 
-fn extract_snapshot_keys(payload: Option<&serde_json::Value>, key_field: &str) -> HashSet<String> {
-    let arr = snapshot_item_values(payload);
+/// `list_runtimes`, SY.orchestrator (`local_runtimes_snapshot`): `{status, hive_id,
+/// manifest_version, manifest_hash, runtimes: [{runtime, current, available, type, runtime_base,
+/// readiness, materialization_summary}]}`.
+fn listed_runtimes(answer: Option<&serde_json::Value>) -> &[serde_json::Value] {
+    listed(answer, "/runtimes")
+}
 
-    arr.iter()
-        .filter_map(|item| {
-            item.get(key_field)
-                .and_then(|v| v.as_str())
-                .map(|s| s.to_string())
-        })
-        .collect()
+/// `list_nodes` with `managed: true`, SY.orchestrator (`managed_node_inventory`): `{status, target,
+/// hive, inventory_source, node_count, nodes: [{node_name, managed, runtime: {name, version},
+/// config: {path, exists, valid, config_version}, ...}]}`.
+pub fn listed_nodes(answer: Option<&serde_json::Value>) -> &[serde_json::Value] {
+    listed(answer, "/nodes")
+}
+
+/// `list_routes`, SY.config.routes (`admin_success_payload`): `{status, action, payload:
+/// {config_version, routes: [{prefix, match_kind, action, next_hop_hive, metric, priority}]}}`.
+fn listed_routes(answer: Option<&serde_json::Value>) -> &[serde_json::Value] {
+    listed(answer, "/payload/routes")
+}
+
+/// `list_vpns`, SY.config.routes: `{status, action, payload: {config_version, vpns: [{pattern,
+/// match_kind, vpn_id, priority}]}}`; `vpn_id` is a number.
+fn listed_vpns(answer: Option<&serde_json::Value>) -> &[serde_json::Value] {
+    listed(answer, "/payload/vpns")
+}
+
+/// Whether a `list_nodes` entry is a node that exists: a managed instance while its config.json
+/// does (run_node refuses its name then, NODE_ALREADY_EXISTS), running or not; a core service
+/// always.
+pub fn node_exists(item: &serde_json::Value) -> bool {
+    match item.get("managed").and_then(serde_json::Value::as_bool) {
+        Some(true) => item
+            .pointer("/config/exists")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false),
+        Some(false) => true,
+        None => false,
+    }
+}
+
+/// Whether a node's stored config holds what the manifest declares for it: every declared key, at
+/// every level, with the declared value. `stored` is `get_node_config`'s answer (`{status, target,
+/// hive, node_name, path, config_version, config}`), the config.json the node runs, which the node
+/// fills in (ai.generic saves `behavior` with `model_settings`, `base_url` and `capabilities` the
+/// manifest may not declare) beside the runtime's defaults, `tenant_id` and the orchestrator's
+/// `_system`: a key only the stored config has is not compared. A config declares nothing when it
+/// is not a non-empty object.
+pub fn stored_config_holds(
+    declared: &serde_json::Value,
+    stored: Option<&serde_json::Value>,
+) -> bool {
+    if declared.as_object().is_none_or(serde_json::Map::is_empty) {
+        return true;
+    }
+    stored
+        .and_then(|answer| answer.get("config"))
+        .is_some_and(|config| declared_value_holds(declared, config))
+}
+
+/// A declared object holds when each of its keys holds in the stored object; any other declared
+/// value must equal the stored one.
+fn declared_value_holds(declared: &serde_json::Value, stored: &serde_json::Value) -> bool {
+    match (declared, stored) {
+        (serde_json::Value::Object(declared), serde_json::Value::Object(stored)) => {
+            declared.iter().all(|(key, value)| {
+                stored
+                    .get(key)
+                    .is_some_and(|stored| declared_value_holds(value, stored))
+            })
+        }
+        _ => declared == stored,
+    }
 }
 
 fn new_op_id() -> String {
@@ -154,64 +199,54 @@ pub fn reconcile_topology(
         })
         .unwrap_or_default();
 
-    let desired_vpn_ids: HashSet<String> = vpns.iter().map(|v| v.vpn_id.clone()).collect();
+    let desired_vpn_keys: HashSet<String> = vpns.iter().map(DesiredVpn::identity_key).collect();
 
-    for vpn in &vpns {
-        let hive_res = snapshot.resources.get(&vpn.hive_id);
-        let snapshot_vpns = extract_snapshot_keys(hive_res.and_then(|r| r.vpns.as_ref()), "vpn_id");
-        if !snapshot_vpns.contains(&vpn.vpn_id) {
-            ops.push(DeltaOperation {
-                op_id: new_op_id(),
-                resource_type: "vpn".to_string(),
-                resource_id: vpn.vpn_id.clone(),
-                change_type: ChangeType::Create,
-                ownership: if vpn.ownership.is_empty() {
-                    "solution".to_string()
-                } else {
-                    vpn.ownership.clone()
-                },
-                compiler_class: CompilerClass::VpnCreate,
-                desired_ref: Some(format!("desired_state.topology.vpns[{}]", vpn.vpn_id)),
-                actual_ref: None,
-                blocking: false,
-                payload_ref: None,
-                notes: vec![],
-            });
-        }
+    for (idx, vpn) in vpns.iter().enumerate() {
+        // SY.config.routes keeps one rule per pattern on a hive.
+        let rule = snapshot.resources.get(&vpn.hive).and_then(|hive_res| {
+            listed_vpns(hive_res.vpns.as_ref())
+                .iter()
+                .find(|rule| rule.get("pattern").and_then(|v| v.as_str()) == Some(&vpn.pattern))
+        });
+        let (change_type, compiler_class, notes) = match rule {
+            None => (ChangeType::Create, CompilerClass::VpnCreate, vec![]),
+            Some(rule) if !vpn.holds(rule) => (
+                ChangeType::Update,
+                CompilerClass::VpnReplace,
+                vec!["vpn_id, match_kind or priority changed — requires delete+add".to_string()],
+            ),
+            Some(_) => continue,
+        };
+        let key = vpn.identity_key();
+        ops.push(DeltaOperation {
+            op_id: new_op_id(),
+            resource_type: "vpn".to_string(),
+            actual_ref: rule.map(|_| format!("snapshot.vpns.{key}")),
+            resource_id: key,
+            change_type,
+            ownership: if vpn.ownership.is_empty() {
+                "solution".to_string()
+            } else {
+                vpn.ownership.clone()
+            },
+            compiler_class,
+            desired_ref: Some(format!("desired_state.topology.vpns[{idx}]")),
+            blocking: false,
+            payload_ref: None,
+            notes,
+        });
     }
 
-    // Emit VPN_DELETE for solution-owned VPNs in snapshot but absent in desired
+    // A rule the manifest does not declare is reported, never removed: SY.config.routes records no
+    // owner for it (it is removed through SY.admin).
     for (hive_id, hive_res) in &snapshot.resources {
-        for item in snapshot_item_values(hive_res.vpns.as_ref()) {
-            let vpn_id = item
-                .get("vpn_id")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string();
-            if vpn_id.is_empty() || desired_vpn_ids.contains(&vpn_id) {
+        for rule in listed_vpns(hive_res.vpns.as_ref()) {
+            let Some(pattern) = rule.get("pattern").and_then(|v| v.as_str()) else {
                 continue;
-            }
-            let ownership = item
-                .get("ownership")
-                .and_then(|v| v.as_str())
-                .unwrap_or("unknown");
-            if ownership == "solution" {
-                ops.push(DeltaOperation {
-                    op_id: new_op_id(),
-                    resource_type: "vpn".to_string(),
-                    resource_id: vpn_id.clone(),
-                    change_type: ChangeType::Delete,
-                    ownership: "solution".to_string(),
-                    compiler_class: CompilerClass::VpnDelete,
-                    desired_ref: None,
-                    actual_ref: Some(format!("snapshot.vpns.{hive_id}.{vpn_id}")),
-                    blocking: false,
-                    payload_ref: None,
-                    notes: vec!["solution-owned vpn absent from desired_state".to_string()],
-                });
-            } else {
+            };
+            if !desired_vpn_keys.contains(&format!("{hive_id}:{pattern}")) {
                 diagnostics.push(format!(
-                    "VPN '{vpn_id}' on hive '{hive_id}' not in desired_state but ownership is not confirmed as solution"
+                    "VPN rule '{pattern}' on hive '{hive_id}' is not in desired_state; the reconcile does not remove VPN rules"
                 ));
             }
         }
@@ -235,24 +270,20 @@ pub fn reconcile_runtimes(
         .filter_map(|item| serde_json::from_value::<DesiredRuntime>(item.clone()).ok())
         .collect();
 
-    // Collect all runtime names present in any hive snapshot
-    let mut snapshot_runtimes: HashMap<String, String> = HashMap::new(); // name -> version
-    for (_hive, hive_res) in &snapshot.resources {
-        for item in &snapshot_item_values(hive_res.runtimes.as_ref()) {
-            let name = item
-                .get("name")
-                .or_else(|| item.get("runtime"))
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string();
-            let version = item
-                .get("version")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string();
-            if !name.is_empty() {
-                snapshot_runtimes.entry(name).or_insert(version);
-            }
+    // Every runtime the snapshot's hives hold, with its current version. Runtimes are published on
+    // the primary hive and synced to the others: where hives differ, the primary's version counts.
+    let mut snapshot_runtimes: HashMap<String, String> = HashMap::new(); // name -> current
+    let mut hives: Vec<&String> = snapshot.resources.keys().collect();
+    hives.sort_by_key(|hive| (hive.as_str() != PRIMARY_HIVE_ID, hive.as_str()));
+    for hive in hives {
+        for item in listed_runtimes(snapshot.resources[hive].runtimes.as_ref()) {
+            let Some(name) = item.get("runtime").and_then(|v| v.as_str()) else {
+                continue;
+            };
+            let current = item.get("current").and_then(|v| v.as_str()).unwrap_or("");
+            snapshot_runtimes
+                .entry(name.to_string())
+                .or_insert_with(|| current.to_string());
         }
     }
 
@@ -348,6 +379,8 @@ pub fn reconcile_runtimes(
 }
 
 // ── TB-6 — Nodes ──────────────────────────────────────────────────────────────
+// A node the manifest stops declaring is not removed: SY.orchestrator records no owner for it (it
+// is removed through SY.admin).
 
 pub fn reconcile_nodes(
     desired_nodes: &[serde_json::Value],
@@ -360,23 +393,18 @@ pub fn reconcile_nodes(
         .filter_map(|item| serde_json::from_value::<DesiredNode>(item.clone()).ok())
         .collect();
 
-    // Build snapshot node map: node_name -> node_json
-    let mut snapshot_nodes: HashMap<String, serde_json::Value> = HashMap::new();
-    for (_hive, hive_res) in &snapshot.resources {
-        for item in snapshot_item_values(hive_res.nodes.as_ref()) {
-            let name = item
-                .get("node_name")
-                .or_else(|| item.get("name"))
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string();
-            if !name.is_empty() {
-                snapshot_nodes.insert(name, item);
+    // node_name -> (its hive's answers, its list_nodes entry), for every node that exists
+    let mut snapshot_nodes: HashMap<String, (&HiveResources, &serde_json::Value)> = HashMap::new();
+    for hive_res in snapshot.resources.values() {
+        for item in listed_nodes(hive_res.nodes.as_ref()) {
+            let Some(name) = item.get("node_name").and_then(|v| v.as_str()) else {
+                continue;
+            };
+            if node_exists(item) {
+                snapshot_nodes.insert(name.to_string(), (hive_res, item));
             }
         }
     }
-
-    let desired_node_names: HashSet<String> = desired.iter().map(|n| n.node_name.clone()).collect();
 
     for (idx, node) in desired.iter().enumerate() {
         match snapshot_nodes.get(&node.node_name) {
@@ -395,22 +423,21 @@ pub fn reconcile_nodes(
                     notes: vec![],
                 });
             }
-            Some(actual_node) => {
+            Some((hive_res, actual_node)) => {
                 let actual_runtime = actual_node
-                    .get("runtime")
+                    .pointer("/runtime/name")
                     .and_then(|v| v.as_str())
                     .unwrap_or("");
                 let runtime_changed = !node.runtime.is_empty() && actual_runtime != node.runtime;
 
-                // Check config drift
-                let desired_config = serde_json::to_string(&node.config).unwrap_or_default();
-                let actual_config = actual_node
-                    .get("config")
-                    .map(|c| serde_json::to_string(c).unwrap_or_default())
-                    .unwrap_or_default();
-                let config_changed = desired_config != actual_config
-                    && !node.config.is_null()
-                    && desired_config != "{}";
+                // Check config drift: a managed instance runs its config.json; a core service's
+                // config is not the node's to declare.
+                let managed = actual_node.get("managed").and_then(|v| v.as_bool()) == Some(true);
+                let config_changed = managed
+                    && !stored_config_holds(
+                        &node.config,
+                        hive_res.node_configs.get(&node.node_name),
+                    );
 
                 if runtime_changed || config_changed {
                     // Runtime change is always immutable — treated same as blocked field
@@ -452,35 +479,12 @@ pub fn reconcile_nodes(
         }
     }
 
-    // Emit NODE_KILL for solution-owned nodes in snapshot but absent in desired
-    for (node_name, actual_node) in &snapshot_nodes {
-        if !desired_node_names.contains(node_name) {
-            let ownership = actual_node
-                .get("ownership")
-                .and_then(|v| v.as_str())
-                .unwrap_or("unknown");
-            if ownership == "solution" {
-                ops.push(DeltaOperation {
-                    op_id: new_op_id(),
-                    resource_type: "node".to_string(),
-                    resource_id: node_name.clone(),
-                    change_type: ChangeType::Delete,
-                    ownership: "solution".to_string(),
-                    compiler_class: CompilerClass::NodeKill,
-                    desired_ref: None,
-                    actual_ref: Some(format!("snapshot.nodes.{node_name}")),
-                    blocking: false,
-                    payload_ref: None,
-                    notes: vec!["solution-owned node absent from desired_state".to_string()],
-                });
-            }
-        }
-    }
-
     ops
 }
 
 // ── TB-7 — Routes ─────────────────────────────────────────────────────────────
+// A route the manifest stops declaring is not removed: SY.config.routes records no owner for it
+// (it is removed through SY.admin).
 
 pub fn reconcile_routes(
     desired_routes: &[serde_json::Value],
@@ -493,18 +497,16 @@ pub fn reconcile_routes(
         .filter_map(|item| serde_json::from_value::<DesiredRoute>(item.clone()).ok())
         .collect();
 
-    // Build snapshot route map: identity_key -> full route json
-    let mut snapshot_routes: HashMap<String, serde_json::Value> = HashMap::new();
+    // Build snapshot route map: identity_key (hive:prefix) -> route
+    let mut snapshot_routes: HashMap<String, &serde_json::Value> = HashMap::new();
     for (hive_id, hive_res) in &snapshot.resources {
-        for item in snapshot_item_values(hive_res.routes.as_ref()) {
-            let prefix = item.get("prefix").and_then(|v| v.as_str()).unwrap_or("");
-            let action = item.get("action").and_then(|v| v.as_str()).unwrap_or("");
-            let key = format!("{hive_id}:{prefix}:{action}");
-            snapshot_routes.insert(key, item);
+        for item in listed_routes(hive_res.routes.as_ref()) {
+            let Some(prefix) = item.get("prefix").and_then(|v| v.as_str()) else {
+                continue;
+            };
+            snapshot_routes.insert(format!("{hive_id}:{prefix}"), item);
         }
     }
-
-    let desired_route_keys: HashSet<String> = desired.iter().map(|r| r.identity_key()).collect();
 
     for (idx, route) in desired.iter().enumerate() {
         let key = route.identity_key();
@@ -525,10 +527,11 @@ pub fn reconcile_routes(
                 });
             }
             Some(actual) => {
-                // Check if fields differ (e.g. next_hop_hive changed)
+                // The same prefix with another action or next hop is replaced.
+                let actual_action = actual.get("action").and_then(|v| v.as_str());
                 let actual_hop = actual.get("next_hop_hive").and_then(|v| v.as_str());
                 let desired_hop = route.next_hop_hive.as_deref();
-                if desired_hop != actual_hop {
+                if actual_action != Some(route.action.as_str()) || desired_hop != actual_hop {
                     ops.push(DeltaOperation {
                         op_id: new_op_id(),
                         resource_type: "route".to_string(),
@@ -540,35 +543,12 @@ pub fn reconcile_routes(
                         actual_ref: Some(format!("snapshot.routes.{}", route.prefix)),
                         blocking: false,
                         payload_ref: None,
-                        notes: vec!["next_hop_hive changed — requires delete+add".to_string()],
+                        notes: vec![
+                            "action or next_hop_hive changed — requires delete+add".to_string()
+                        ],
                     });
                 }
                 // else: noop
-            }
-        }
-    }
-
-    // Emit ROUTE_DELETE for solution-owned routes absent from desired
-    for (key, actual_route) in &snapshot_routes {
-        if !desired_route_keys.contains(key) {
-            let ownership = actual_route
-                .get("ownership")
-                .and_then(|v| v.as_str())
-                .unwrap_or("unknown");
-            if ownership == "solution" {
-                ops.push(DeltaOperation {
-                    op_id: new_op_id(),
-                    resource_type: "route".to_string(),
-                    resource_id: key.clone(),
-                    change_type: ChangeType::Delete,
-                    ownership: "solution".to_string(),
-                    compiler_class: CompilerClass::RouteDelete,
-                    desired_ref: None,
-                    actual_ref: Some(format!("snapshot.routes.{key}")),
-                    blocking: false,
-                    payload_ref: None,
-                    notes: vec!["solution-owned route absent from desired_state".to_string()],
-                });
             }
         }
     }
@@ -577,10 +557,29 @@ pub fn reconcile_routes(
 }
 
 // ── TB-8 — WF deployments ─────────────────────────────────────────────────────
+// Each hive's SY.wf-rules lists its workflows (`list_workflows`); a workflow runs the definition its
+// `current_hash` names, which `DesiredWfDeployment::definition_hash` computes the same way. wf-rules
+// records no owner: a running workflow is this solution's when its saved manifests declared exactly
+// that definition last (`HiveResources::wf_declared_by`), and only then is it removed once the
+// solution stops declaring it, as the user policy is (TB-9).
+
+/// The deployed workflows in one hive's `list_workflows` answer (`{status, hive, workflows: [...]}`),
+/// as (workflow_name, current_hash). A workflow with only a staged definition is not deployed.
+pub fn deployed_workflows(wf_state: Option<&serde_json::Value>) -> Vec<(String, String)> {
+    listed(wf_state, "/workflows")
+        .iter()
+        .filter_map(|item| {
+            let name = item.get("workflow_name")?.as_str()?.trim();
+            let hash = item.get("current_hash")?.as_str()?.trim();
+            (!name.is_empty() && !hash.is_empty()).then(|| (name.to_string(), hash.to_string()))
+        })
+        .collect()
+}
 
 pub fn reconcile_wf(
     desired_wf: &[serde_json::Value],
     snapshot: &ActualStateSnapshot,
+    solution_id: &str,
 ) -> Vec<DeltaOperation> {
     let mut ops = Vec::new();
 
@@ -589,23 +588,18 @@ pub fn reconcile_wf(
         .filter_map(|item| serde_json::from_value::<DesiredWfDeployment>(item.clone()).ok())
         .collect();
 
-    let mut snapshot_wf: HashMap<String, serde_json::Value> = HashMap::new();
+    // "<hive>:<workflow_name>" -> (current_hash, the solution that declared it)
+    let mut running: BTreeMap<String, (String, Option<&str>)> = BTreeMap::new();
     for (hive_id, hive_res) in &snapshot.resources {
-        for item in snapshot_item_values(hive_res.wf_state.as_ref()) {
-            let name = item
-                .get("workflow_name")
-                .or_else(|| item.get("name"))
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string();
-            let key = format!("{hive_id}:{name}");
-            snapshot_wf.insert(key, item);
+        for (name, hash) in deployed_workflows(hive_res.wf_state.as_ref()) {
+            let declared_by = hive_res.wf_declared_by.get(&name).map(String::as_str);
+            running.insert(format!("{hive_id}:{name}"), (hash, declared_by));
         }
     }
 
     for (idx, wf) in desired.iter().enumerate() {
         let key = format!("{}:{}", wf.hive, wf.workflow_name);
-        match snapshot_wf.get(&key) {
+        match running.get(&key) {
             None => {
                 ops.push(DeltaOperation {
                     op_id: new_op_id(),
@@ -621,24 +615,18 @@ pub fn reconcile_wf(
                     notes: vec![],
                 });
             }
-            Some(actual) => {
-                let actual_hash = actual
-                    .get("definition_hash")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("");
-                let desired_hash = wf.definition_hash();
-
-                if actual_hash != desired_hash {
+            Some((current_hash, _)) => {
+                if *current_hash != wf.definition_hash() {
                     // WF.* nodes require restart on definition change (CFZ-12)
                     ops.push(DeltaOperation {
                         op_id: new_op_id(),
                         resource_type: "wf_deployment".to_string(),
-                        resource_id: key,
+                        resource_id: key.clone(),
                         change_type: ChangeType::Update,
                         ownership: wf.ownership.clone(),
                         compiler_class: CompilerClass::WfDeployRestart,
                         desired_ref: Some(format!("desired_state.wf_deployments[{idx}]")),
-                        actual_ref: Some(format!("snapshot.wf.{}", wf.workflow_name)),
+                        actual_ref: Some(format!("snapshot.wf.{key}")),
                         blocking: false,
                         payload_ref: None,
                         notes: vec!["workflow definition changed".to_string()],
@@ -652,29 +640,25 @@ pub fn reconcile_wf(
         .iter()
         .map(|wf| format!("{}:{}", wf.hive, wf.workflow_name))
         .collect();
-    for (key, actual) in &snapshot_wf {
-        if desired_wf_keys.contains(key) {
+    for (key, (_, declared_by)) in &running {
+        if desired_wf_keys.contains(key) || *declared_by != Some(solution_id) {
             continue;
         }
-        let ownership = actual
-            .get("ownership")
-            .and_then(|v| v.as_str())
-            .unwrap_or("unknown");
-        if ownership == "solution" {
-            ops.push(DeltaOperation {
-                op_id: new_op_id(),
-                resource_type: "wf_deployment".to_string(),
-                resource_id: key.clone(),
-                change_type: ChangeType::Delete,
-                ownership: "solution".to_string(),
-                compiler_class: CompilerClass::WfRemove,
-                desired_ref: None,
-                actual_ref: Some(format!("snapshot.wf.{key}")),
-                blocking: true,
-                payload_ref: None,
-                notes: vec!["solution-owned workflow absent from desired_state; canonical remove action still unavailable".to_string()],
-            });
-        }
+        ops.push(DeltaOperation {
+            op_id: new_op_id(),
+            resource_type: "wf_deployment".to_string(),
+            resource_id: key.clone(),
+            change_type: ChangeType::Delete,
+            ownership: "solution".to_string(),
+            compiler_class: CompilerClass::WfRemove,
+            desired_ref: None,
+            actual_ref: Some(format!("snapshot.wf.{key}")),
+            blocking: false,
+            payload_ref: None,
+            notes: vec![
+                "this solution deployed this workflow and no longer declares it".to_string(),
+            ],
+        });
     }
 
     ops
@@ -831,11 +815,12 @@ pub fn run_reconciler(
         all_ops.extend(ops);
     }
 
-    // WF
-    if let Some(wf) = &ds.wf_deployments {
-        let ops = reconcile_wf(wf, snapshot);
-        all_ops.extend(ops);
-    }
+    // WF: also when the manifest declares none, so a workflow this solution deployed is removed.
+    all_ops.extend(reconcile_wf(
+        ds.wf_deployments.as_deref().unwrap_or_default(),
+        snapshot,
+        solution_id,
+    ));
 
     // OPA
     all_ops.extend(reconcile_opa(ds.opa.as_ref(), snapshot, solution_id));
@@ -948,6 +933,141 @@ mod tests {
         assert!(ops.is_empty(), "existing hive should produce no ops");
     }
 
+    // ── Snapshot answers, as their producers send them ──
+
+    const TENANT: &str = "tnt:43d576a3-d712-4d91-9245-5d5463dd693e";
+
+    /// SY.orchestrator's `list_runtimes` answer (`local_runtimes_snapshot`, `runtime_api_entry`).
+    fn runtimes_answer(hive: &str, runtimes: &[(&str, &str)]) -> serde_json::Value {
+        let entries: Vec<serde_json::Value> = runtimes
+            .iter()
+            .map(|(runtime, current)| {
+                let mut readiness = serde_json::Map::new();
+                readiness.insert(
+                    current.to_string(),
+                    json!({
+                        "runtime_present": true,
+                        "start_sh_executable": true,
+                        "base_runtime_ready": true
+                    }),
+                );
+                json!({
+                    "runtime": runtime,
+                    "current": current,
+                    "available": [current],
+                    "type": "full_runtime",
+                    "runtime_base": null,
+                    "readiness": readiness,
+                    "materialization_summary": {
+                        "known_versions": 1,
+                        "materialized_versions": 1,
+                        "current_version": current,
+                        "current_materialized": true,
+                        "current_blocking_reason": null
+                    }
+                })
+            })
+            .collect();
+        json!({
+            "status": "ok",
+            "hive_id": hive,
+            "manifest_version": 12,
+            "manifest_hash": "6c1f0e2a9b8d7c3e5f4a1b2c3d4e5f60718293a4b5c6d7e8f90123456789abcd",
+            "runtimes": entries
+        })
+    }
+
+    /// One entry of SY.orchestrator's `list_nodes` answer for the managed instances
+    /// (`managed_node_inventory_with_root`).
+    fn managed_node(node_name: &str, runtime: &str, config_exists: bool) -> serde_json::Value {
+        let kind = node_name.split('.').next().unwrap_or_default();
+        let hive = node_name
+            .rsplit_once('@')
+            .map(|(_, hive)| hive)
+            .unwrap_or_default();
+        let dir = format!("/var/lib/fluxbee/nodes/{kind}/{node_name}");
+        json!({
+            "name": node_name,
+            "node_name": node_name,
+            "hive": hive,
+            "kind": kind,
+            "managed": true,
+            "inventory_source": "managed_instance",
+            "status": "running",
+            "lifecycle_state": "RUNNING",
+            "health_state": "HEALTHY",
+            "visible_in_router": true,
+            "runtime": { "name": runtime, "version": "0.1.79" },
+            "config": {
+                "path": format!("{dir}/config.json"),
+                "exists": config_exists,
+                "valid": config_exists,
+                "config_version": if config_exists { json!(1) } else { json!(null) }
+            },
+            "state": { "path": format!("{dir}/state.json"), "exists": false },
+            "identity": { "ilk_id": "ilk:7c1e0a52-1f0b-4a5e-9d64-0b6a1f2d3c4e", "tenant_id": TENANT },
+            "launched_by": "archi",
+            "relaunch_on_boot": true
+        })
+    }
+
+    /// SY.orchestrator's `list_nodes` answer for the managed instances (`list_nodes_flow`).
+    fn nodes_answer(nodes: Vec<serde_json::Value>) -> serde_json::Value {
+        json!({
+            "status": "ok",
+            "target": "motherbee",
+            "hive": "motherbee",
+            "inventory_source": "managed_instances",
+            "node_count": nodes.len(),
+            "nodes": nodes
+        })
+    }
+
+    /// SY.orchestrator's `get_node_config` answer (`get_node_config_flow`): the node's config.json,
+    /// `operator` with the runtime's defaults under it, `tenant_id` and `_system`.
+    fn node_config_answer(node_name: &str, operator: serde_json::Value) -> serde_json::Value {
+        let mut config = json!({ "gc_retention_days": 7 });
+        for (key, value) in operator.as_object().cloned().unwrap_or_default() {
+            config[key] = value;
+        }
+        config["tenant_id"] = json!(TENANT);
+        config["_system"] = json!({
+            "runtime": "ai.generic",
+            "runtime_version": "0.1.79",
+            "ilk_id": "ilk:7c1e0a52-1f0b-4a5e-9d64-0b6a1f2d3c4e",
+            "tenant_id": TENANT,
+            "config_version": 1,
+            "launched_by": "archi"
+        });
+        json!({
+            "status": "ok",
+            "target": "motherbee",
+            "hive": "motherbee",
+            "node_name": node_name,
+            "path": format!("/var/lib/fluxbee/nodes/AI/{node_name}/config.json"),
+            "config_version": 1,
+            "config": config
+        })
+    }
+
+    /// SY.config.routes' `list_routes` answer (`admin_success_payload`), as SY.admin hands it over.
+    fn routes_answer(routes: serde_json::Value) -> serde_json::Value {
+        json!({
+            "status": "ok",
+            "action": "list_routes",
+            "payload": { "config_version": 4, "routes": routes }
+        })
+    }
+
+    /// SY.config.routes' `list_vpns` answer.
+    fn vpns_answer(vpns: serde_json::Value) -> serde_json::Value {
+        json!({
+            "status": "ok",
+            "action": "list_vpns",
+            "payload": { "config_version": 4, "vpns": vpns }
+        })
+    }
+
     // ── Runtimes ──
 
     #[test]
@@ -976,30 +1096,28 @@ mod tests {
     #[test]
     fn existing_runtime_same_version_emits_noop() {
         let desired = vec![json!({
-            "name": "AI.common",
+            "name": "ai.common",
             "version": "1.0.0",
             "package_source": "pre_published"
         })];
         let mut snapshot = empty_snapshot(&["motherbee"]);
-        snapshot.resources.get_mut("motherbee").unwrap().runtimes = Some(json!([
-            { "name": "AI.common", "version": "1.0.0" }
-        ]));
+        snapshot.resources.get_mut("motherbee").unwrap().runtimes =
+            Some(runtimes_answer("motherbee", &[("ai.common", "1.0.0")]));
         let (ops, packets) = reconcile_runtimes(&desired, &snapshot, false);
-        assert!(ops.is_empty(), "same version should be noop");
+        assert!(ops.is_empty(), "same version should be noop: {ops:?}");
         assert!(packets.is_empty());
     }
 
     #[test]
     fn runtime_version_drift_emits_publish_update() {
         let desired = vec![json!({
-            "name": "AI.common",
+            "name": "ai.common",
             "version": "1.1.0",
             "package_source": "pre_published"
         })];
         let mut snapshot = empty_snapshot(&["motherbee"]);
-        snapshot.resources.get_mut("motherbee").unwrap().runtimes = Some(json!([
-            { "name": "AI.common", "version": "1.0.0" }
-        ]));
+        snapshot.resources.get_mut("motherbee").unwrap().runtimes =
+            Some(runtimes_answer("motherbee", &[("ai.common", "1.0.0")]));
         let (ops, _) = reconcile_runtimes(&desired, &snapshot, false);
         assert_eq!(ops.len(), 1);
         assert_eq!(ops[0].change_type, ChangeType::Update);
@@ -1009,6 +1127,23 @@ mod tests {
         );
     }
 
+    #[test]
+    fn the_primary_hive_version_counts_where_hives_differ() {
+        let desired = vec![json!({
+            "name": "ai.common",
+            "version": "1.1.0",
+            "package_source": "pre_published"
+        })];
+        let mut snapshot = empty_snapshot(&["motherbee", "worker-220"]);
+        snapshot.resources.get_mut("motherbee").unwrap().runtimes =
+            Some(runtimes_answer("motherbee", &[("ai.common", "1.1.0")]));
+        // The worker has not synced the new version yet.
+        snapshot.resources.get_mut("worker-220").unwrap().runtimes =
+            Some(runtimes_answer("worker-220", &[("ai.common", "1.0.0")]));
+        let (ops, _) = reconcile_runtimes(&desired, &snapshot, true);
+        assert!(ops.is_empty(), "{ops:?}");
+    }
+
     // ── Nodes ──
 
     #[test]
@@ -1016,7 +1151,7 @@ mod tests {
         let desired = vec![json!({
             "node_name": "AI.coa@motherbee",
             "hive": "motherbee",
-            "runtime": "AI.common"
+            "runtime": "ai.generic"
         })];
         let snapshot = empty_snapshot(&["motherbee"]);
         let ops = reconcile_nodes(&desired, &snapshot);
@@ -1025,20 +1160,92 @@ mod tests {
         assert_eq!(ops[0].resource_id, "AI.coa@motherbee");
     }
 
+    fn snapshot_with_node(
+        node_name: &str,
+        runtime: &str,
+        stored: Option<serde_json::Value>,
+    ) -> ActualStateSnapshot {
+        let mut snapshot = empty_snapshot(&["motherbee"]);
+        let motherbee = snapshot.resources.get_mut("motherbee").unwrap();
+        motherbee.nodes = Some(nodes_answer(vec![managed_node(node_name, runtime, true)]));
+        if let Some(operator) = stored {
+            motherbee.node_configs.insert(
+                node_name.to_string(),
+                node_config_answer(node_name, operator),
+            );
+        }
+        snapshot
+    }
+
+    #[test]
+    fn an_existing_node_as_declared_is_left_alone() {
+        let desired = vec![json!({
+            "node_name": "AI.coa@motherbee",
+            "hive": "motherbee",
+            "runtime": "ai.generic",
+            "config": { "behavior": { "kind": "ai_chat", "model": "claude-sonnet-5-5" } }
+        })];
+        // What ai.generic saves: its behavior filled in with the fields it was not given.
+        let snapshot = snapshot_with_node(
+            "AI.coa@motherbee",
+            "ai.generic",
+            Some(json!({ "behavior": {
+                "kind": "ai_chat",
+                "model": "claude-sonnet-5-5",
+                "model_settings": null,
+                "base_url": null,
+                "capabilities": { "multimodal": true }
+            } })),
+        );
+        let ops = reconcile_nodes(&desired, &snapshot);
+        assert!(ops.is_empty(), "{ops:?}");
+
+        // A declared nested value that differs is still a change.
+        let desired = vec![json!({
+            "node_name": "AI.coa@motherbee",
+            "hive": "motherbee",
+            "runtime": "ai.generic",
+            "config": { "behavior": { "kind": "ai_chat", "capabilities": { "multimodal": false } } }
+        })];
+        let ops = reconcile_nodes(&desired, &snapshot);
+        assert_eq!(ops.len(), 1);
+        assert_eq!(ops[0].compiler_class, CompilerClass::NodeConfigApplyHot);
+    }
+
+    #[test]
+    fn a_stopped_instance_exists_and_a_directory_without_its_config_does_not() {
+        let desired = vec![
+            json!({ "node_name": "AI.a@motherbee", "hive": "motherbee", "runtime": "ai.generic" }),
+            json!({ "node_name": "AI.b@motherbee", "hive": "motherbee", "runtime": "ai.generic" }),
+        ];
+        let mut stopped = managed_node("AI.a@motherbee", "ai.generic", true);
+        stopped["status"] = json!("stopped");
+        stopped["lifecycle_state"] = json!("STOPPED");
+        stopped["visible_in_router"] = json!(false);
+        let mut snapshot = empty_snapshot(&["motherbee"]);
+        snapshot.resources.get_mut("motherbee").unwrap().nodes = Some(nodes_answer(vec![
+            stopped,
+            managed_node("AI.b@motherbee", "ai.generic", false),
+        ]));
+        let ops = reconcile_nodes(&desired, &snapshot);
+        assert_eq!(ops.len(), 1, "{ops:?}");
+        assert_eq!(ops[0].compiler_class, CompilerClass::NodeRunMissing);
+        assert_eq!(ops[0].resource_id, "AI.b@motherbee");
+    }
+
     #[test]
     fn ai_node_config_drift_emits_hot_apply() {
         let desired = vec![json!({
             "node_name": "AI.coa@motherbee",
             "hive": "motherbee",
-            "runtime": "AI.common",
-            "config": { "tenant_id": "tnt:acme-v2" }
+            "runtime": "ai.generic",
+            "config": { "behavior": { "kind": "ai_chat", "model": "claude-sonnet-5-5" } }
         })];
-        let mut snapshot = empty_snapshot(&["motherbee"]);
-        snapshot.resources.get_mut("motherbee").unwrap().nodes = Some(json!([{
-            "node_name": "AI.coa@motherbee",
-            "runtime": "AI.common",
-            "config": { "tenant_id": "tnt:acme-v1" }
-        }]));
+        let snapshot = snapshot_with_node(
+            "AI.coa@motherbee",
+            "ai.generic",
+            Some(json!({ "behavior": { "kind": "ai_chat", "model": "gpt-5.5" } })),
+        );
         let ops = reconcile_nodes(&desired, &snapshot);
         assert_eq!(ops.len(), 1);
         assert_eq!(
@@ -1053,15 +1260,14 @@ mod tests {
         let desired = vec![json!({
             "node_name": "WF.router@motherbee",
             "hive": "motherbee",
-            "runtime": "wf.engine",
-            "config": { "rules_version": "v2" }
+            "runtime": "wf.router",
+            "config": { "sy_timer_l2_name": "SY.timer@motherbee", "gc_retention_days": 14 }
         })];
-        let mut snapshot = empty_snapshot(&["motherbee"]);
-        snapshot.resources.get_mut("motherbee").unwrap().nodes = Some(json!([{
-            "node_name": "WF.router@motherbee",
-            "runtime": "wf.engine",
-            "config": { "rules_version": "v1" }
-        }]));
+        let snapshot = snapshot_with_node(
+            "WF.router@motherbee",
+            "wf.router",
+            Some(json!({ "sy_timer_l2_name": "SY.timer@motherbee" })),
+        );
         let ops = reconcile_nodes(&desired, &snapshot);
         assert_eq!(ops.len(), 1);
         assert_eq!(
@@ -1076,15 +1282,10 @@ mod tests {
         let desired = vec![json!({
             "node_name": "AI.coa@motherbee",
             "hive": "motherbee",
-            "runtime": "AI.coa.v2",
+            "runtime": "ai.coa.v2",
             "config": {}
         })];
-        let mut snapshot = empty_snapshot(&["motherbee"]);
-        snapshot.resources.get_mut("motherbee").unwrap().nodes = Some(json!([{
-            "node_name": "AI.coa@motherbee",
-            "runtime": "AI.coa.v1",
-            "config": {}
-        }]));
+        let snapshot = snapshot_with_node("AI.coa@motherbee", "ai.coa.v1", None);
         let ops = reconcile_nodes(&desired, &snapshot);
         assert_eq!(ops.len(), 1);
         assert_eq!(
@@ -1102,12 +1303,11 @@ mod tests {
             "runtime": "zz.experimental",
             "config": { "mode": "v2" }
         })];
-        let mut snapshot = empty_snapshot(&["motherbee"]);
-        snapshot.resources.get_mut("motherbee").unwrap().nodes = Some(json!([{
-            "node_name": "ZZ.experimental@motherbee",
-            "runtime": "zz.experimental",
-            "config": { "mode": "v1" }
-        }]));
+        let snapshot = snapshot_with_node(
+            "ZZ.experimental@motherbee",
+            "zz.experimental",
+            Some(json!({ "mode": "v1" })),
+        );
         let ops = reconcile_nodes(&desired, &snapshot);
         assert_eq!(ops.len(), 1);
         assert_eq!(ops[0].compiler_class, CompilerClass::BlockedImmutableChange);
@@ -1120,8 +1320,8 @@ mod tests {
     fn missing_route_emits_route_add() {
         let desired = vec![json!({
             "hive": "motherbee",
-            "prefix": "tenant.acme.",
-            "action": "next_hop_hive",
+            "prefix": "AI.specialist.",
+            "action": "FORWARD",
             "next_hop_hive": "worker-220"
         })];
         let snapshot = empty_snapshot(&["motherbee"]);
@@ -1130,70 +1330,207 @@ mod tests {
         assert_eq!(ops[0].compiler_class, CompilerClass::RouteAdd);
     }
 
+    fn snapshot_with_route(action: &str, next_hop_hive: &str) -> ActualStateSnapshot {
+        let mut snapshot = empty_snapshot(&["motherbee"]);
+        snapshot.resources.get_mut("motherbee").unwrap().routes = Some(routes_answer(json!([{
+            "prefix": "AI.specialist.",
+            "action": action,
+            "next_hop_hive": next_hop_hive,
+            "metric": null,
+            "priority": null
+        }])));
+        snapshot
+    }
+
+    #[test]
+    fn an_existing_route_as_declared_is_left_alone() {
+        let desired = vec![json!({
+            "hive": "motherbee",
+            "prefix": "AI.specialist.",
+            "action": "FORWARD",
+            "next_hop_hive": "worker-220"
+        })];
+        let ops = reconcile_routes(&desired, &snapshot_with_route("FORWARD", "worker-220"));
+        assert!(ops.is_empty(), "{ops:?}");
+    }
+
     #[test]
     fn route_field_change_emits_route_replace() {
         let desired = vec![json!({
             "hive": "motherbee",
-            "prefix": "tenant.acme.",
-            "action": "next_hop_hive",
+            "prefix": "AI.specialist.",
+            "action": "FORWARD",
             "next_hop_hive": "worker-221"
         })];
-        let mut snapshot = empty_snapshot(&["motherbee"]);
-        snapshot.resources.get_mut("motherbee").unwrap().routes = Some(json!([{
-            "prefix": "tenant.acme.",
-            "action": "next_hop_hive",
-            "next_hop_hive": "worker-220"
-        }]));
-        let ops = reconcile_routes(&desired, &snapshot);
-        assert_eq!(ops.len(), 1);
-        assert_eq!(ops[0].compiler_class, CompilerClass::RouteReplace);
+        // Another next hop, or another action on the same prefix (config.routes keeps one route per
+        // prefix: adding a second would be DUPLICATE_PREFIX).
+        for (action, next_hop_hive) in [("FORWARD", "worker-220"), ("DROP", "worker-221")] {
+            let ops = reconcile_routes(&desired, &snapshot_with_route(action, next_hop_hive));
+            assert_eq!(ops.len(), 1, "{action} {next_hop_hive}");
+            assert_eq!(ops[0].compiler_class, CompilerClass::RouteReplace);
+            assert_eq!(ops[0].resource_id, "motherbee:AI.specialist.");
+        }
+    }
+
+    #[test]
+    fn an_undeclared_route_or_node_is_not_removed() {
+        // SY.config.routes and SY.orchestrator record no owner: the reconcile never removes them.
+        let mut snapshot = snapshot_with_route("FORWARD", "worker-220");
+        snapshot.resources.get_mut("motherbee").unwrap().nodes =
+            Some(nodes_answer(vec![managed_node(
+                "AI.coa@motherbee",
+                "ai.generic",
+                true,
+            )]));
+        assert!(reconcile_routes(&[], &snapshot).is_empty());
+        assert!(reconcile_nodes(&[], &snapshot).is_empty());
     }
 
     // ── WF ──
 
-    #[test]
-    fn missing_wf_deployment_emits_wf_deploy_apply() {
-        let desired = vec![json!({
+    fn wf_definition(states: &[&str]) -> serde_json::Value {
+        json!({
+            "wf_schema_version": "1",
+            "workflow_type": "support",
+            "initial_state": states[0],
+            "terminal_states": [states[states.len() - 1]],
+            "states": states.iter().map(|name| json!({ "name": name })).collect::<Vec<_>>(),
+        })
+    }
+
+    fn desired_wf(definition: &serde_json::Value) -> serde_json::Value {
+        json!({
             "hive": "motherbee",
             "workflow_name": "support-router",
-            "definition": { "steps": [{ "id": "s1" }] }
-        })];
-        let snapshot = empty_snapshot(&["motherbee"]);
-        let ops = reconcile_wf(&desired, &snapshot);
-        assert_eq!(ops.len(), 1);
-        assert_eq!(ops[0].compiler_class, CompilerClass::WfDeployApply);
+            "definition": definition,
+            "ownership": "solution"
+        })
+    }
+
+    /// One workflow of SY.wf-rules' `list_workflows` answer (go/sy-wf-rules/node/dispatch.go),
+    /// deployed with `definition`.
+    fn listed_workflow(name: &str, definition: &serde_json::Value) -> serde_json::Value {
+        json!({
+            "workflow_name": name,
+            "current_version": 2,
+            "current_hash": wf_rules_definition_hash(definition),
+            "published_version": "0.0.2",
+            "deployed_version": "0.0.2",
+            "wf_node_running": true,
+            "wf_node_reachable": true,
+            "wf_node_health_state": "HEALTHY",
+            "active_instances": 0,
+            "wf_node_timeout": false,
+            "instances_error": ""
+        })
+    }
+
+    /// A workflow compiled but never applied: listed, with no current definition.
+    fn staged_only_workflow(name: &str) -> serde_json::Value {
+        json!({
+            "workflow_name": name,
+            "current_version": null,
+            "current_hash": "",
+            "published_version": null,
+            "deployed_version": "",
+            "wf_node_running": false,
+            "wf_node_reachable": false,
+            "wf_node_health_state": "",
+            "active_instances": null,
+            "wf_node_timeout": false,
+            "instances_error": ""
+        })
+    }
+
+    /// The motherbee's `list_workflows` answer as SY.admin hands it over: the query payload.
+    fn snapshot_with_workflows(workflows: Vec<serde_json::Value>) -> ActualStateSnapshot {
+        let mut snapshot = empty_snapshot(&["motherbee"]);
+        snapshot.resources.get_mut("motherbee").unwrap().wf_state = Some(json!({
+            "status": "ok",
+            "hive": "motherbee",
+            "workflows": workflows
+        }));
+        snapshot
+    }
+
+    #[test]
+    fn missing_wf_deployment_emits_wf_deploy_apply() {
+        let desired = vec![desired_wf(&wf_definition(&["start", "done"]))];
+        for workflows in [vec![], vec![staged_only_workflow("support-router")]] {
+            let ops = reconcile_wf(&desired, &snapshot_with_workflows(workflows), "sol-a");
+            assert_eq!(ops.len(), 1);
+            assert_eq!(ops[0].compiler_class, CompilerClass::WfDeployApply);
+            assert_eq!(ops[0].change_type, ChangeType::Create);
+            assert_eq!(ops[0].resource_id, "motherbee:support-router");
+        }
+    }
+
+    #[test]
+    fn a_workflow_deployed_with_the_declared_definition_is_left_alone() {
+        let definition = wf_definition(&["start", "done"]);
+        let snapshot =
+            snapshot_with_workflows(vec![listed_workflow("support-router", &definition)]);
+        let ops = reconcile_wf(&[desired_wf(&definition)], &snapshot, "sol-a");
+        assert!(ops.is_empty(), "{ops:?}");
     }
 
     #[test]
     fn wf_definition_change_emits_wf_deploy_restart() {
-        let desired = vec![json!({
-            "hive": "motherbee",
-            "workflow_name": "support-router",
-            "definition": { "steps": [{ "id": "s1" }, { "id": "s2" }] }
-        })];
-        let mut snapshot = empty_snapshot(&["motherbee"]);
-        snapshot.resources.get_mut("motherbee").unwrap().wf_state = Some(json!([{
-            "workflow_name": "support-router",
-            "definition_hash": "oldhashabcdef01"
-        }]));
-        let ops = reconcile_wf(&desired, &snapshot);
+        let running = wf_definition(&["start", "done"]);
+        let desired = vec![desired_wf(&wf_definition(&["start", "review", "done"]))];
+        let snapshot = snapshot_with_workflows(vec![listed_workflow("support-router", &running)]);
+        let ops = reconcile_wf(&desired, &snapshot, "sol-a");
         assert_eq!(ops.len(), 1);
         assert_eq!(ops[0].compiler_class, CompilerClass::WfDeployRestart);
+        assert_eq!(ops[0].change_type, ChangeType::Update);
     }
 
     #[test]
-    fn missing_desired_solution_owned_wf_emits_wf_remove_blocked() {
-        let desired: Vec<serde_json::Value> = vec![];
-        let mut snapshot = empty_snapshot(&["motherbee"]);
-        snapshot.resources.get_mut("motherbee").unwrap().wf_state = Some(json!([{
-            "workflow_name": "support-router",
-            "definition_hash": "oldhashabcdef01",
-            "ownership": "solution"
-        }]));
-        let ops = reconcile_wf(&desired, &snapshot);
-        assert_eq!(ops.len(), 1);
+    fn a_workflow_this_solution_deployed_and_no_longer_declares_is_removed() {
+        let mut snapshot = snapshot_with_workflows(vec![
+            listed_workflow("support-router", &wf_definition(&["start", "done"])),
+            listed_workflow("by-hand", &wf_definition(&["a", "b"])),
+            staged_only_workflow("draft"),
+        ]);
+        let motherbee = snapshot.resources.get_mut("motherbee").unwrap();
+        for name in ["support-router", "draft"] {
+            motherbee
+                .wf_declared_by
+                .insert(name.to_string(), "sol-a".to_string());
+        }
+
+        let ops = reconcile_wf(&[], &snapshot, "sol-a");
+        assert_eq!(ops.len(), 1, "{ops:?}");
         assert_eq!(ops[0].compiler_class, CompilerClass::WfRemove);
-        assert!(ops[0].blocking);
+        assert_eq!(ops[0].change_type, ChangeType::Delete);
+        assert_eq!(ops[0].resource_id, "motherbee:support-router");
+        assert!(!ops[0].blocking);
+
+        // Another solution's workflow, and one nobody declared ("by-hand"), are left alone.
+        assert!(reconcile_wf(&[], &snapshot, "sol-b").is_empty());
+
+        // A manifest that stops declaring workflows altogether still removes it.
+        let out = run_reconciler(
+            &manifest_with(json!({})),
+            &snapshot,
+            "manifest://sol-a/2",
+            "sol-a",
+        )
+        .expect("reconcile");
+        assert_eq!(out.delta_report.operations.len(), 1);
+        assert_eq!(out.delta_report.status, DeltaReportStatus::Ready);
+    }
+
+    #[test]
+    fn a_workflow_is_removed_with_wf_rules_delete() {
+        assert_eq!(
+            compiler_class_admin_steps(&CompilerClass::WfRemove),
+            Some(vec!["wf_rules_delete"])
+        );
+        assert_eq!(
+            compiler_class_risk(&CompilerClass::WfRemove),
+            RiskClass::Destructive
+        );
     }
 
     // ── OPA ──
@@ -1293,34 +1630,89 @@ mod tests {
         );
     }
 
-    #[test]
-    fn missing_desired_solution_owned_vpn_emits_vpn_delete() {
-        let topology = json!({ "vpns": [] });
+    /// One rule of SY.config.routes' `list_vpns` answer (`VpnConfig`; `match_kind` is left out when
+    /// the rule names none).
+    fn snapshot_with_vpn_rule(rule: serde_json::Value) -> ActualStateSnapshot {
         let mut snapshot = empty_snapshot(&["motherbee"]);
-        snapshot.resources.get_mut("motherbee").unwrap().vpns = Some(json!([
-            { "vpn_id": "worker-*", "ownership": "solution" }
-        ]));
-        let (ops, _) = reconcile_topology(&topology, &snapshot);
+        snapshot.resources.get_mut("motherbee").unwrap().vpns = Some(vpns_answer(json!([rule])));
+        snapshot
+    }
+
+    fn support_rule(vpn_id: u32) -> serde_json::Value {
+        json!({ "pattern": "AI.support.*", "match_kind": "GLOB", "vpn_id": vpn_id, "priority": null })
+    }
+
+    fn declared_vpn(vpn: serde_json::Value) -> serde_json::Value {
+        json!({ "vpns": [vpn] })
+    }
+
+    #[test]
+    fn an_existing_vpn_as_declared_is_left_alone() {
+        let topology = declared_vpn(json!({
+            "hive": "motherbee", "pattern": "AI.support.*", "match_kind": "GLOB", "vpn_id": 10
+        }));
+        let (ops, diagnostics) =
+            reconcile_topology(&topology, &snapshot_with_vpn_rule(support_rule(10)));
+        assert!(ops.is_empty(), "{ops:?}");
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+
+        // SY.config.routes' defaults: no match_kind is PREFIX, no priority is 100.
+        let topology =
+            declared_vpn(json!({ "hive": "motherbee", "pattern": "AI.billing", "vpn_id": 7 }));
+        let rule = json!({ "pattern": "AI.billing", "vpn_id": 7, "priority": 100 });
+        let (ops, _) = reconcile_topology(&topology, &snapshot_with_vpn_rule(rule));
+        assert!(ops.is_empty(), "{ops:?}");
+
+        let (ops, _) = reconcile_topology(&topology, &empty_snapshot(&["motherbee"]));
         assert_eq!(ops.len(), 1);
-        assert_eq!(ops[0].compiler_class, CompilerClass::VpnDelete);
-        assert_eq!(ops[0].change_type, ChangeType::Delete);
+        assert_eq!(ops[0].compiler_class, CompilerClass::VpnCreate);
+        assert_eq!(ops[0].resource_id, "motherbee:AI.billing");
+    }
+
+    #[test]
+    fn the_same_pattern_with_another_vpn_is_replaced() {
+        let topology = declared_vpn(json!({
+            "hive": "motherbee", "pattern": "AI.support.*", "match_kind": "GLOB", "vpn_id": 10
+        }));
+        let mut prefix_rule = support_rule(10);
+        prefix_rule["match_kind"] = json!("PREFIX");
+        for rule in [support_rule(11), prefix_rule] {
+            let (ops, _) = reconcile_topology(&topology, &snapshot_with_vpn_rule(rule.clone()));
+            assert_eq!(ops.len(), 1, "{rule}");
+            assert_eq!(ops[0].compiler_class, CompilerClass::VpnReplace);
+            assert_eq!(ops[0].change_type, ChangeType::Update);
+            assert_eq!(ops[0].resource_id, "motherbee:AI.support.*");
+        }
+        assert_eq!(
+            compiler_class_admin_steps(&CompilerClass::VpnReplace),
+            Some(vec!["delete_vpn", "add_vpn"])
+        );
+    }
+
+    #[test]
+    fn a_vpn_rule_the_manifest_does_not_declare_is_not_deleted() {
+        // SY.config.routes records no owner for a rule: it is reported, never deleted.
+        let topology = json!({ "vpns": [] });
+        let (ops, diagnostics) =
+            reconcile_topology(&topology, &snapshot_with_vpn_rule(support_rule(10)));
+        assert!(ops.is_empty(), "{ops:?}");
+        assert_eq!(diagnostics.len(), 1);
+        assert!(
+            diagnostics[0].contains("VPN rule 'AI.support.*' on hive 'motherbee'"),
+            "{diagnostics:?}"
+        );
     }
 
     // ── Ownership ──
 
     #[test]
-    fn external_owned_runtime_not_deleted() {
+    fn an_undeclared_runtime_is_not_touched() {
         let desired: Vec<serde_json::Value> = vec![];
         let mut snapshot = empty_snapshot(&["motherbee"]);
-        // runtime present in snapshot with external ownership should not be touched
-        snapshot.resources.get_mut("motherbee").unwrap().runtimes = Some(json!([
-            { "name": "AI.chat", "version": "1.0.0", "ownership": "system" }
-        ]));
+        snapshot.resources.get_mut("motherbee").unwrap().runtimes =
+            Some(runtimes_answer("motherbee", &[("ai.chat", "1.0.0")]));
         let (ops, _) = reconcile_runtimes(&desired, &snapshot, false);
-        assert!(
-            ops.is_empty(),
-            "system/external runtimes must not be deleted"
-        );
+        assert!(ops.is_empty(), "the reconciler never deletes a runtime");
     }
 
     // ── Idempotency ──

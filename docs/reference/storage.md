@@ -14,7 +14,11 @@ constant named without a path lives in the first one. The design and its decisio
 > since 0.1.77, what cognition derives; since 0.1.79, the LLM usage records (`storage.usage`, table
 > `llm_usage`). The 0.1.79 cleanup removed the `events`, `memory_items` and
 > `storage_reactivation_applied` tables, the one-time reset of the cognition tables and the one-time
-> backfill of `turns`.
+> backfill of `turns`. The cleanup after 0.1.80 folded the migrations of `turns` and
+> `storage_inbox` into their base schema and removed the `storage_migrations` table. A database
+> created before 0.1.81 needs, once, `ALTER TABLE turns ALTER COLUMN message SET NOT NULL;` and,
+> after the upgrade, `DROP TABLE storage_migrations;` (`CREATE TABLE IF NOT EXISTS` does not change
+> an existing table).
 
 ---
 
@@ -179,8 +183,8 @@ SY.cognition: there, `cognition.turns` has no sink.
   database is `fluxbee_storage` (`STORAGE_DB_NAME`); if it does not exist, SY.storage creates it
   (`ensure_database_exists`).
 - **The schema** is ensured at every boot (`ensure_schema`): it creates the missing tables and
-  indexes and runs idempotent migrations (`TURNS_KEY_MIGRATION_SQL`, `MESSAGE_LOG_MIGRATION_SQL`),
-  which only add a column if it is missing.
+  indexes (`TURNS_SCHEMA_SQL`, `INBOX_SCHEMA_SQL`, `COGNITION_SCHEMA_SQL`, `USAGE_SCHEMA_SQL`).
+  There are no migrations: an existing table is left as it is.
 - **Three connections** (`Storage`):
   - a shared one, for processing and reads;
   - one for ingest, one transaction per batch;
@@ -264,7 +268,7 @@ moment the router appended the record), `attempts`, `processed_at`, `last_error`
 
 - **The connection to PostgreSQL drops:** SY.storage exits with code 1 and systemd starts it again
   with new connections (`connect_or_exit_on_close`; the unit has `Restart=always` and
-  `RestartSec=5`, in `packaging/build-deb.sh` and `scripts/install.sh`). The client does not
+  `RestartSec=5`, in `packaging/build-deb.sh`). The client does not
   reconnect by itself.
 - **There is a URL but the database does not answer at boot:** it exits with code 1 and systemd
   retries (`exit_without_database`).
@@ -296,7 +300,8 @@ One row per copied message. Columns: `dedupe_key`, `ctx`, `seq`, `ts`, `stored_a
   - `message`, the whole message, as the router copied it.
 - **`ctx` and `seq`** come from `meta.ctx` and `meta.ctx_seq` if the message carries them. The
   protocol no longer has those fields (`Meta` in `crates/fluxbee_sdk/src/protocol.rs`), so today
-  they are `trace:<trace_id>` and a hash of the `trace_id`.
+  they are `trace:<trace_id>` and a hash of the `trace_id`. Nothing reads them.
+- **`message`** is required (`NOT NULL`), like `content`.
 - **`ts`** is when the router copied the message (the time of the stream record). **`stored_at`**
   is when SY.storage wrote it: it is the order that a live reader follows, because a batch can
   arrive late.
@@ -387,11 +392,6 @@ cut off before), and the nodes send them through `storage.usage`.
 - A record charged to a tenant other than the one it claimed counts as `mismatched`.
 - Every 30 s, a WARN line gives the rejected records by reason, the `mismatched` ones and the
   unverified ones (`report_usage_counts`). `ops.py health` shows them as `usagerej`.
-
-### 6.4 `storage_migrations`
-
-The message log migration creates it (`MESSAGE_LOG_MIGRATION_SQL`). Since the 0.1.79 cleanup,
-nothing writes to it.
 
 ---
 
@@ -539,10 +539,14 @@ INSERT INTO llm_usage ... ON CONFLICT DO NOTHING;
 
 ## 10. Several routers in one hive
 
-| Scenario | Works | Notes |
+One router per hive is the supported topology ([architecture.md](architecture.md) §4.2), so a hive
+has one stream. The code still has a mode with several routers in a hive, which is not supported
+([routing-and-policy.md](routing-and-policy.md) §1 and §10); in it the streams work as below.
+
+| Scenario | Supported | Notes |
 | --- | --- | --- |
 | One router per hive | Yes | One stream per hive |
-| N routers in one hive (gateway + switches) | Yes | One stream per router; each message is copied once, where it comes in |
+| N routers in one hive (gateway + switches) | No | One stream per router; each message is copied once, where it comes in |
 
 ```text
 RT.gateway.stream@worker1 ───┐

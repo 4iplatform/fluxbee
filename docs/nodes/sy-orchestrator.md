@@ -41,7 +41,9 @@ Source: `src/bin/sy_orchestrator.rs`. Packaging: `packaging/build-deb.sh`, `pack
    2. on a spoke, rewrites the core unit files if their template changed (`regen_local_core_units`);
    3. on the motherbee, makes sure the SSH join key and the mesh CA and TLS exist
       (`ensure_motherbee_ssh_key`, `ensure_motherbee_mesh_tls`), refreshes the per-role core
-      trees spokes sync from (`materialize_role_core_trees`) and clears interrupted joins;
+      trees spokes sync from (`materialize_role_core_trees`), clears interrupted joins, and
+      deletes the identity keys of hives the registry does not have
+      (`sweep_orphan_identity_keys`);
    4. starts `rt-gateway` and waits up to 30 s for it and its SHM (`wait_for_router_ready`; fatal);
    5. opens the core firewall ports and reconciles egress (fatal only on the egress role);
    6. starts Syncthing if blob or dist sync is enabled (a failure only warns);
@@ -98,6 +100,17 @@ There are no defaults in the code: `system_nodes_for_role` requires a
 
 A node name maps to its unit by `name_to_service`: drop `SY.`, lowercase, dots to dashes, prefix
 `sy-` (`SY.frontdesk.gov` → `sy-frontdesk-gov`).
+
+`get_node_status` reads an SY node from that unit, and the router (`RT.gateway` and its stream)
+from `rt-gateway` (`local_node_unit`): the lifecycle comes from the unit and the router's LSA,
+so a stopped or crashed one reads STOPPED or FAILED. The router's own name is no node of its LSA:
+it counts as seen while the LSA entry for its hive is fresh (`node_seen_by_router`). `config` and
+`state` read `{"managed": false}`; the health is still what the node answers to
+`NODE_STATUS_GET`. A core node this hive's role does not run (not in its `system_nodes`; the
+orchestrator runs everywhere) answers `NODE_NOT_FOUND`. The files some SY nodes keep under
+`/var/lib/fluxbee/nodes/SY/` play no part, and a status read writes nothing for a core node: its
+`status_version` is null. The managed listing (`list_nodes` with `managed`) shows those nodes the
+same way, with `managed: false`.
 
 ## Managed nodes
 
@@ -175,13 +188,40 @@ The worker join (`add_hive_flow`), in order:
 
 The unit test `ssh_happens_only_inside_add_hive` fails the build if SSH is used anywhere else in
 the file (D32, FINDINGS A-54). Egress and ingress joins have their own flows
-(`add_egress_hive_flow`, `add_ingress_hive_flow`).
+(`add_egress_hive_flow`, `add_ingress_hive_flow`). The egress join reads the box twice
+(`egress_host_report_command`, FINDINGS A-1). Before it installs anything it takes `edge_ip`
+from it (`egress_edge_ip_on_host`): an omitted one is the single address `lan_iface` carries
+inside `lan_cidr`, an explicit one must be on `lan_iface`; none or several addresses, or a missing
+interface, fail the join with `EGRESS_LAN_LEG_INVALID` (`EGRESS_LAN_LEG_NOT_VERIFIED` when the
+box cannot be read). Once the egress' orchestrator is on the mesh, before the SSH controls, it
+reads that the `inet fluxbee_egress` table is loaded, forwarding is on, IPv6 is disabled and the
+LAN leg is in place, and reports what it read (`egress_nat_applied`, `egress_ipv4_forwarding`,
+`egress_ipv6_blocked`, `egress_lan_leg_ok`); any of them missing fails the join with
+`EGRESS_NAT_NOT_READY` (`EGRESS_NAT_NOT_VERIFIED` when the box cannot be read).
+
+A successful join answers `warnings`. A join that logged in with `ssh_password` (its key-first
+probe failed and the password seeded the motherbee key) and did not harden SSH says there that
+password logins stay enabled on the box, and how to close them (`add_hive_ssh_warnings`, FINDINGS
+A-2): removing the motherbee key does not.
 
 `remove_hive` (`remove_hive_flow`) refuses the local hive, sends `REMOVE_HIVE_CLEANUP` to the
-spoke's orchestrator (8 s; the spoke stops its units and clears its node state), unlinks the
-spoke from Syncthing and deletes `/var/lib/fluxbee/hives/<hive>/`. There is no SSH fallback: an
-offline spoke is cleaned up locally only. `ADD_HIVE_FINALIZE` and `REMOVE_HIVE_CLEANUP` are
-refused on the motherbee (`spoke_only_action_refusal`).
+spoke's orchestrator (8 s), unlinks the spoke from Syncthing and deletes
+`/var/lib/fluxbee/hives/<hive>/`. The spoke answers once systemd has accepted the cleanup, which
+runs one second later (timer accuracy 100 ms) in a transient unit of its own
+(`remove_hive_cleanup_command`, `systemd-run` like the orchestrator's self-restart), so stopping
+sy-orchestrator does not cut it short: it deletes the spoke's TLS material and identity key first,
+then stops its core services, Syncthing and the managed nodes, and clears the node state. A spoke
+takes `REMOVE_HIVE_CLEANUP` only from `SY.orchestrator@motherbee`, as its router stamps the
+sender. There is no SSH fallback: an offline spoke is cleaned up locally only.
+`ADD_HIVE_FINALIZE` and `REMOVE_HIVE_CLEANUP` are refused on the motherbee
+(`spoke_only_action_refusal`).
+
+The registry is the authority on which hives exist (FINDINGS A-48). With the hive's directory,
+`remove_hive` deletes its identity HMAC key (`identity_key_cleanup`), so it can never authenticate
+to :9100 again; a deleted key ends no session already open, so when the cleanup did not reach the
+box it restarts the motherbee's `sy-identity` (`identity_restart`). At every boot the motherbee
+deletes the key of any hive with no directory under `hives/`, when both listings read completely
+(`sweep_orphan_identity_keys`).
 
 ## Updates
 
@@ -200,8 +240,8 @@ SY.admin's `update` sends `SYSTEM_UPDATE` to `SY.orchestrator@<hive>` with a `ca
   seconds later it restarts `rt-gateway` and the system nodes, each behind a 30 s health gate
   (`restart_local_core_services_with_health_gate`), skipping itself. A failed gate restores the
   old binaries (`status: rollback`). If its own binary changed it schedules its own restart
-  (`schedule_orchestrator_self_restart`, `systemd-run --on-active=2s`). It keeps 3 generations
-  (`CORE_BACKUP_GENERATIONS_KEPT`) and records the outcome in
+  (`schedule_orchestrator_self_restart`, `systemd-run --on-active=2s`, accurate to 100 ms). It
+  keeps 3 generations (`CORE_BACKUP_GENERATIONS_KEPT`) and records the outcome in
   `/var/lib/fluxbee/orchestrator/core-update-last.json` and `core-installed.json`.
 - **core_rollback** restores a stamped generation (`core_rollback_local`).
 
@@ -212,8 +252,9 @@ and waits until it is idle: default 30 s, at most 300 s.
 
 The orchestrator runs Syncthing as `fluxbee-syncthing.service` (`syncthing_unit_contents`):
 user `fluxbee`, `UMask=0027`, `/var/lib/fluxbee/vendor/bin/syncthing` with the GUI and API on
-`127.0.0.1:<api_port>` (default 8384) and its home in `/var/lib/fluxbee/syncthing`. It opens
-22000/tcp, 22000/udp and 21027/udp (`syncthing_firewall_rules`).
+`127.0.0.1:<api_port>` (default 8384) and its home in `/var/lib/fluxbee/syncthing`. Every link
+is TCP to the motherbee's static address, so only the motherbee opens a port, 22000/tcp; a spoke
+only dials and opens none (`syncthing_firewall_rules`).
 
 | Folder | Holds | Who gets it |
 | --- | --- | --- |
@@ -221,12 +262,21 @@ user `fluxbee`, `UMask=0027`, `/var/lib/fluxbee/vendor/bin/syncthing` with the G
 | `fluxbee-dist-vendor` | Syncthing | every spoke |
 | `fluxbee-dist-policy` | the compiled user OPA policy | every spoke |
 | `fluxbee-dist-runtimes` | runtime packages | workers only |
+| `fluxbee-dist-agent-assets` | `blob/agent-assets`: SY.architect's agent assets, which ai.generic reads from disk | workers only |
 | `fluxbee-blob` | `blob/active` | workers only, when blob sync is on (`peer_shares_active_blob`) |
 | `fluxbee-blob-public` | `blob/public` | the ingress only (`peer_shares_public_blob`) |
 
 Dist folders and `fluxbee-blob-public` are `sendonly` on the motherbee and `receiveonly` on the
 spokes (`dist_syncthing_folder_type`, `blob_public_syncthing_folder_type`), so a spoke never
 writes them. `fluxbee-blob` is `sendreceive`.
+
+A folder added by a later release reaches the hives that joined before it at their next local
+reconcile, without a re-join (`reconcile_syncthing_folders_xml`): `fluxbee-dist-policy` is shared
+with every member of `fluxbee-dist-vendor`, and `fluxbee-dist-agent-assets` with every member of
+`fluxbee-dist-runtimes`. The agent-assets tree is owned like a dist tree (`ensure_dirs`): root's on
+the motherbee, readable by the `fluxbee` group, and the `fluxbee` user's on a worker, where
+Syncthing writes what it receives (FINDINGS A-72). `blob/` itself is no folder, so a file written
+there and renamed into `blob/agent-assets` is never sent half-written.
 
 ## Host posture
 
@@ -241,8 +291,14 @@ What the code does today:
   drift alert. It changes nothing.
 - **Egress** (`reconcile_egress`): on the egress role an nftables table `inet fluxbee_egress`
   (forward only LAN→WAN, IPv6 dropped, masquerade; input accepted), sysctls, and
-  `fluxbee-egress-nft.service` to load it at boot. A worker gets its default route via the
-  egress `gateway_ip`. The motherbee is only checked (`EGRESS_MOTHERBEE_BYPASS`).
+  `fluxbee-egress-nft.service` to load it at boot. nftables matches interfaces by name, so the
+  table loads even when one is missing. After applying, it reads back what it set and checks the
+  LAN leg (`serving_problems`, FINDINGS A-1): forwarding on, IPv6 disabled, `wan_iface` and
+  `lan_iface` present, `edge_ip` (always in its hive.yaml, never guessed) on `lan_iface`. Any of
+  them missing fails the boot with what is missing; after boot the watchdog logs each on every
+  drift tick and records an `egress` drift alert (`lan_leg_missing`, `ipv4_forwarding_off`,
+  `ipv6_not_blocked`). A worker gets its default route via the egress `gateway_ip`. The motherbee
+  is only checked (`EGRESS_MOTHERBEE_BYPASS`).
 
 ## Watchdog
 
@@ -280,7 +336,7 @@ The router delivers these protected actions only from allowed origins (`policy/s
 ## Config
 
 `/etc/fluxbee/hive.yaml` (`HiveFile`): `hive_id`, `role`, `wan` (`gateway_name`, default
-`RT.gateway`; `listen`; `authorized_hives`; `uplinks`), `storage.path`, `blob` (`enabled`, default
+`RT.gateway`; `listen`; `uplinks`), `storage.path`, `blob` (`enabled`, default
 true; `path`, default `/var/lib/fluxbee/blob`; `sync`, default off, tool `syncthing`, `api_port`
 8384, `data_dir`; `gc`), `dist` (`path`, default `/var/lib/fluxbee/dist`; sync on by default),
 `identity.sync.port` (default 9100), `government`, `system_nodes`, `egress`, `ai`.

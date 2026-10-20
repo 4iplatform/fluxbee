@@ -223,8 +223,8 @@ Example:
         }
       },
       "optional_fields": [
-        "behavior.instructions",
-        "runtime.worker_pool_size"
+        "behavior.model_settings",
+        "runtime.immediate_memory"
     ],
     "resources": [
       {

@@ -18,16 +18,13 @@ This subtree hosts IO crates isolated from core routing/AI crates.
 
 ## Install for Linux runtime
 
-From repo root:
+The package seeds the IO runtimes of `packaging/base-nodes.json` (`io.api` and `io.slack` among
+them) into `/var/lib/fluxbee/dist/runtimes`. On a development host, build the package from the
+repo root and install it (`VERSION` defaults to the installed one):
 
 ```bash
-sudo bash scripts/install.sh
+bash scripts/install.sh [VERSION]
 ```
-
-This publishes the canonical IO runtimes into `/var/lib/fluxbee/dist/runtimes`:
-
-- `io.api`
-- `io.slack`
 
 IO node processes are not installed as fixed systemd services. They are spawned by
 the orchestrator as managed runtime instances, with units named
@@ -69,25 +66,11 @@ Expected output includes:
 Use those values with:
 - `POST /hives/{id}/update` (`category=runtime`)
 
-Deploy runbook:
+Then everything goes through SY.admin: `POST /hives/{hive}/nodes` launches a node, with its
+tenant and config; `POST /hives/{hive}/nodes/{node}/restart` moves a running one to the new
+`current`; `CONFIG_SET` changes its config; secrets go to SY.vault. Deploy runbooks:
 - `docs/io/io-slack-deploy-runbook.md`
-- `docs/io/io-api-node-spec.md`
-
-Deploy helper for `IO.api`:
-
-```bash
-bash scripts/deploy-io-api.sh \
-  --base http://127.0.0.1:8080 \
-  --hive-id motherbee \
-  --version 1.0.0 \
-  --node-name IO.api.orders@motherbee \
-  --tenant-id tnt:11111111-1111-4111-8111-111111111111 \
-  --edge-node SY.edge@ingress-1 \
-  --api-channel-id orders \
-  --dst-node AI.orders@motherbee \
-  --sync-hint \
-  --sudo
-```
+- `docs/io/io-api-node-spec.md` (§10)
 
 ## Run (linux target expected in production)
 
@@ -100,45 +83,45 @@ Managed runtime note:
 - It reads managed `config.json` under `/var/lib/fluxbee/nodes/IO/<node_name>/config.json`.
 - It can boot unconfigured and receive the canonical business config through `CONFIG_SET`.
 - `SY.admin externalize` mints and stores the Edge bearer. It is never accepted in node config or
-  persisted by IO.api; the deploy helper prints a newly issued token once without logging it.
+  persisted by IO.api; a successful `CONFIG_SET` response carries a newly issued token once
+  (`runtime.publication.entry_token`).
 - Public requests terminate at `SY.edge`; Edge validates the bearer and forwards one message over
   the internal router socket. Requests cannot choose their tenant, ICH or destination.
 - Publication state and URL are available through Admin's node `control/config-get` response under
   `runtime.publication`.
 
-Useful helpers:
+Useful helper:
 
 - `scripts/publish-io-api-runtime.sh`
-- `scripts/deploy-io-api.sh`
 
 ### IO.slack
 
-Required env vars:
+Managed runtime note:
 
-- `SLACK_APP_TOKEN`
-- `SLACK_BOT_TOKEN`
+- `io-slack` runs only as a managed instance: it requires `FLUXBEE_NODE_NAME`,
+  `FLUXBEE_NODE_ILK_ID` and `FLUXBEE_NODE_TENANT_ID` from Orchestrator and reads its managed
+  `config.json` under `/var/lib/fluxbee/nodes/IO/<node_name>/config.json`.
+- The Slack tokens are never in config or env: the config names a SY.vault key
+  (`nodes/io/common/src/io_slack_adapter_config.rs`).
+  - Required: `slack.auth` = `{"type":"vault_ref","resource_type":"slack","key":"<vault key>"}`
+    (any other `type` is refused), `io.workspace_id` and `io.conversation_id` (the Slack binding
+    behind the node's own ICH).
+  - Optional: `io.dst_node` (without it the router resolves the destination), `io.relay.*`,
+    `identity.target`, `identity.timeout_ms`, `io.blob.*`, `node.*`, `runtime.*`.
+- The vault secret behind that key is `{"app_token":"xapp-...","bot_token":"xoxb-..."}` with
+  `metadata.resource_type: slack`. The node reads it at start, on a `VAULT_SECRET_CHANGED` and
+  every 60 s, and runs degraded until it has it.
+- Launch, secret and config: `docs/io/io-slack-deploy-runbook.md` §3 (steps 4 and 5) and §5.
 
-Spawn/orchestrator mode note:
-- `io-slack` can also read tokens/config from spawn `config.json` under
-  `/var/lib/fluxbee/nodes/IO/<node_name>/config.json`
-  (or `NODE_CONFIG_PATH` override).
-- Supported token fields in config:
-  - `slack.app_token` / `slack.bot_token`
-  - `slack.app_token_ref` / `slack.bot_token_ref` with `env:VAR` indirection
-- Precedence: explicit env vars override spawn config values.
+Optional env vars (they override the managed config):
 
-Optional env vars:
-
-- `NODE_NAME` (default `IO.slack.T123`)
-- `NODE_VERSION` (default `0.1`)
-- `ROUTER_SOCKET` (default `/var/run/fluxbee/routers`)
-- `UUID_PERSISTENCE_DIR` (default `/var/lib/fluxbee/state/nodes`)
-- `CONFIG_DIR` (default `/etc/fluxbee`)
-- `ISLAND_ID` (used by identity shm path, default `local`)
-- `DEV_MODE` (`true|false`, default `false`)
-- `DEDUP_TTL_MS` (default `600000`)
-- `DEDUP_MAX_ENTRIES` (default `50000`)
-- `IO_SLACK_DST_NODE` (optional fixed unicast destination, e.g. `AI.chat@sandbox`; if omitted uses `resolve`; keep fixed dst for test/recovery only, not production baseline)
+- `NODE_VERSION`, `ROUTER_SOCKET` (default `/var/run/fluxbee/routers`), `UUID_PERSISTENCE_DIR`
+  (default `/var/lib/fluxbee/state/nodes`), `CONFIG_DIR` (default `/etc/fluxbee`)
+- `DEV_MODE` (`true|false`, default `false`), `DEDUP_TTL_MS` (default `600000`),
+  `DEDUP_MAX_ENTRIES` (default `50000`)
+- `IO_SLACK_WORKSPACE_ID`, `IO_SLACK_CONVERSATION_ID`, `IDENTITY_TARGET`, `IDENTITY_TIMEOUT_MS`
+- `IO_SLACK_DST_NODE` (fixed unicast destination, e.g. `AI.chat@sandbox`; for test/recovery only,
+  not the production baseline)
 
 Relay note:
 
@@ -174,16 +157,6 @@ When an IO node provisions a new ILK (lookup miss → `ILK_PROVISION`), it can d
 `SY.identity` rejects `"system"` from IO-originated provisioning; that label is reserved for SY-internal creation paths.
 
 The decision is **constructive of the IO node itself**: only the IO runtime knows the nature of its counterpart (by config, subdomain, header, token type, etc.). When in doubt, omit the field and let the server default to human; switch to `"agent"` only when the IO has a deterministic signal that the other side is a bot. The provisional ILK's type is overwritten when `register_ilk` later promotes it to `complete`, so a wrong default is recoverable but produces incorrect short-lived behavior in policy/routing decisions taken during the provisional window.
-
-Example:
-
-```bash
-SLACK_APP_TOKEN="xapp-..." \
-SLACK_BOT_TOKEN="xoxb-..." \
-NODE_NAME="IO.slack.T123" \
-ROUTER_SOCKET="/var/run/fluxbee/routers" \
-cargo run -p io-slack
-```
 
 ## io-sim quick test
 

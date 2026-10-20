@@ -53,8 +53,7 @@ Every role also runs `rt-gateway` (started first) and `sy-orchestrator`. The nod
    `python3`). The maintainer scripts (`packaging/deb-preinst`, `deb-postinst`):
    - create the `fluxbee` system user and the directories under `/var/lib/fluxbee`;
    - register the base runtimes into the live runtimes manifest (`fluxbee-seed-runtimes`, below);
-   - copy `/etc/fluxbee/hive.yaml.example` to `hive.yaml` if there is none, and run
-     `fluxbee-migrate-config` on it;
+   - copy `/etc/fluxbee/hive.yaml.example` to `hive.yaml` if there is none;
    - enable `sy-orchestrator`. A fresh install starts nothing; it prints
      `Edit /etc/fluxbee/hive.yaml, then run: sudo fluxbee-firstboot`.
 4. **Edit** `/etc/fluxbee/hive.yaml` (`hive_id: motherbee`, `role: motherbee`, the `ai` provider,
@@ -74,8 +73,9 @@ Every role also runs `rt-gateway` (started first) and `sy-orchestrator`. The nod
    6. prints what is still missing: the AI provider key for the core (`openai` or `anthropic`
       in the root tenant) and the per-tenant secrets of IO nodes.
 
-`scripts/install.sh` is the development path: it always builds from the source tree and installs
-on the local host; it shares `packaging/base-nodes.json` with the `.deb` build.
+On a development host, `scripts/install.sh [<version>]` does steps 1 and 3 from the local checkout:
+it builds the package with `packaging/build-deb.sh` and installs it with
+`apt-get install --reinstall`. Steps 4 and 5 stay the operator's.
 
 ## Ports and posture
 
@@ -85,15 +85,16 @@ on the local host; it shares `packaging/base-nodes.json` with the `.deb` build.
 | 3000/tcp | SY.architect UI/API | `127.0.0.1` (`architect.listen`) | `packaging/hive.yaml.example` |
 | 9000/tcp | WAN between hives (gateway router) | `wan.listen`; set on the motherbee only | [rt-gateway](../nodes/rt-gateway.md) |
 | 9100/tcp | identity sync | `0.0.0.0`, motherbee only | [SY.identity](../nodes/sy-identity.md) |
-| 22000/tcp+udp, 21027/udp | Syncthing sync and discovery | spokes dial the motherbee | `SYNCTHING_*_PORT_*` in `src/bin/sy_orchestrator.rs` |
+| 22000/tcp | Syncthing | the motherbee; spokes dial it and listen on `127.0.0.1` | `SYNCTHING_SYNC_PORT_TCP` in `src/bin/sy_orchestrator.rs` |
 | 8384/tcp | Syncthing REST | `127.0.0.1` | Syncthing unit written by the orchestrator |
 | 5432/tcp | PostgreSQL | the distribution's default; `fluxbee-firstboot` uses `127.0.0.1` | `packaging/fluxbee-firstboot` |
 | `edge.listen` (e.g. 443) | SY.edge, the public door | ingress hives only | `packaging/hive.yaml.example` |
 
 The orchestrator opens the WAN port, and on the motherbee the identity sync port, with `ufw` or
-`firewalld` when present (`ensure_core_firewall_local`); Syncthing's ports are opened when
-Syncthing is set up. On egress hives it opens nothing: nftables owns inbound there. Admin and
-Archi have no authentication and must stay on loopback; the orchestrator checks the bound
+`firewalld` when present (`ensure_core_firewall_local`); the motherbee's Syncthing port,
+22000/tcp, is opened when Syncthing is set up, and a spoke opens no Syncthing port
+(`syncthing_firewall_rules`). On egress hives it opens nothing: nftables owns inbound there.
+Admin and Archi have no authentication and must stay on loopback; the orchestrator checks the bound
 sockets about every minute and reports a service bound off loopback (report only). The full
 exposure model is in [docs/host-posture-and-exposure-spec-v1.md](../host-posture-and-exposure-spec-v1.md).
 
@@ -113,14 +114,18 @@ exposure model is in [docs/host-posture-and-exposure-spec-v1.md](../host-posture
 | `require_dist_sync`, `dist_sync_probe_timeout_secs` | fail the join if the dist folders do not sync (probe default 45 s) |
 
 Checks before anything starts: `INVALID_HIVE_ID`, `INVALID_ADDRESS`, `MISSING_WAN_LISTEN` (the
-motherbee needs `wan.listen`), `WAN_NOT_AUTHORIZED`, `JOIN_IN_PROGRESS`, `HIVE_EXISTS`. The old
-`ssh_access` field is refused: SSH exists only inside the join (`reject_removed_add_hive_fields`).
+motherbee needs `wan.listen`), `JOIN_IN_PROGRESS`, `HIVE_EXISTS`. The old `ssh_access` field is
+refused: SSH exists only inside the join (`reject_removed_add_hive_fields`). No list in hive.yaml
+says which hives may join: adding a hive is what registers it, and the motherbee's router admits
+only registered hives (FINDINGS A-48).
 
 The answer is `{"status": "accepted", "join_id", "poll": "GET /hives/<id>"}` (HTTP 202): the join
 runs in the background and its progress is in `/var/lib/fluxbee/hives/<id>/info.yaml`, read by
 `GET /hives/<id>` (`status` joining, connected, pending, failed or interrupted; a `join` block
-with phase and error). Posting the same request again resumes a pending, interrupted or failed
-join.
+with phase and error). The `join` block survives every rewrite of the entry until the join ends
+with `phase: done`; an orchestrator restart mid-join ends it at the next boot with
+`JOIN_INTERRUPTED`, keeping the status the join had reached (`joining` becomes `interrupted`).
+Posting the same request again resumes a pending, interrupted or failed join.
 
 What a worker join does (`add_hive_flow`):
 
@@ -144,12 +149,34 @@ What a worker join does (`add_hive_flow`):
 
 Egress and ingress joins (`add_egress_hive_flow`, `add_ingress_hive_flow`) follow the same steps
 without the identity key; an ingress join also needs `ingress.listen` and writes the `edge`
-section.
+section. An egress join reads the box before it installs anything: `edge_ip`, when the request
+omits it, is the single address `lan_iface` carries inside `lan_cidr` (none or several fail the
+join, asking for an explicit one), an explicit one must be on `lan_iface`, and both interfaces
+must exist (`EGRESS_LAN_LEG_INVALID`; `EGRESS_LAN_LEG_NOT_VERIFIED` when the box cannot be
+read). Once the egress' orchestrator is on the mesh it reads
+again that the `inet fluxbee_egress` table is loaded, forwarding is on, IPv6 is disabled and the
+LAN leg is in place, and reports it (`egress_nat_applied`, `egress_ipv4_forwarding`,
+`egress_ipv6_blocked`, `egress_lan_leg_ok`); any of them missing fails the join with
+`EGRESS_NAT_NOT_READY` (`EGRESS_NAT_NOT_VERIFIED` when the box cannot be read). The interfaces and their addresses are the operator's: the orchestrator
+never configures them, and the egress fails its own boot on any of these.
+
+A successful join's result (`join.result` in `GET /hives/<id>`) carries `warnings`. A join that
+logged in with `ssh_password` (its key-first probe failed and the password seeded the motherbee
+key) and did not harden SSH says there that password logins stay enabled on the box, and how to
+close them: `PasswordAuthentication no` in
+`/etc/ssh/sshd_config.d/00-fluxbee-hardening.conf` and a restart of ssh, which is what
+`harden_ssh: true` does.
 
 **Remove a hive:** `DELETE /hives/{hive}` (`remove_hive_flow`) sends `REMOVE_HIVE_CLEANUP` to the
-spoke over the mesh (8 s), which stops the Fluxbee services and deletes its node state; the
-motherbee then unpairs Syncthing and deletes `hives/<id>/`. The motherbee itself cannot be
-removed.
+spoke over the mesh (8 s). The spoke answers once its cleanup is scheduled as a transient unit of
+its own (`fluxbee-remove-hive-cleanup-<ms>`), which deletes its TLS material and identity key,
+stops the Fluxbee services and the managed nodes and deletes its node state, and runs to its end
+after the spoke's orchestrator has stopped. The motherbee then unpairs Syncthing, deletes
+`hives/<id>/` and the hive's identity key under `/var/lib/fluxbee/identity/keys/`
+(`identity_key_cleanup` in the answer). When the spoke did not answer, the motherbee restarts its
+`sy-identity` to close any session the removed hive still holds (`identity_restart`). The
+motherbee itself cannot be removed. The registry is the authority: at boot the motherbee deletes
+the identity key of every hive with no `hives/<id>/`.
 
 ## Publish runtimes
 
@@ -181,6 +208,7 @@ The orchestrator declares one Syncthing folder per kind of content (`dist_sync_f
 | `fluxbee-dist-vendor` | `dist/vendor` | `dist/vendor` | every spoke role |
 | `fluxbee-dist-policy` | `dist/policy` | `dist/policy` | every spoke role |
 | `fluxbee-dist-runtimes` | `dist/runtimes` | `dist/runtimes` | workers only |
+| `fluxbee-dist-agent-assets` | `blob/agent-assets` | `blob/agent-assets` | workers only |
 
 The motherbee rebuilds `dist/core/<role>` at every start of its orchestrator
 (`materialize_role_core_trees`). A spoke's receive-only copy is never edited locally: the
@@ -251,7 +279,7 @@ orchestrator). SY nodes and the router are not managed this way and cannot be la
 | stop | `DELETE /hives/{hive}/nodes/{name}` with `{"purge_instance": false}` | there is no separate stop action; the node is stopped and not relaunched at boot; its config, ILK, secrets and timers stay |
 | remove | `DELETE /hives/{hive}/nodes/{name}` with `{"purge_instance": true}` | full teardown, below |
 | remove a stopped instance | `DELETE /hives/{hive}/nodes/{name}/instance` | refused while running (`NODE_INSTANCE_RUNNING`) |
-| config, state, status | `GET`/`PUT /hives/{hive}/nodes/{name}/config`, `GET .../state`, `GET .../status` | |
+| config, state, status | `GET`/`PUT /hives/{hive}/nodes/{name}/config`, `GET .../state`, `GET .../status` | for an SY node or the router, `status` reads its packaged unit (`sy-<name>`, `rt-gateway`) and the router's LSA, with `config` and `state` not managed and no `status_version` (the read writes nothing); a core node this hive's role does not run answers `NODE_NOT_FOUND` |
 
 `run_node` refuses: `SY.*`/`RT.*` names; any node in the root tenant except the core IO runtimes
 `io.cloud`, `io.blob`, `io.web` (`TENANT_ROOT_NOT_ALLOWED`, `genesis_refusal`); a tenant that is
@@ -277,9 +305,11 @@ service that is not active (`watchdog_tick`).
 `bootstrap_local` then `finish_bootstrap` in `src/bin/sy_orchestrator.rs`:
 
 1. validates the core manifest and binaries; spokes re-render their units; the motherbee checks
-   its SSH key and mesh TLS and rebuilds the per-role core trees;
+   its SSH key and mesh TLS, rebuilds the per-role core trees and deletes the identity keys of
+   hives the registry does not have;
 2. starts `rt-gateway` and waits up to 30 s for it (`wait_for_router_ready`);
-3. firewall, egress NAT (fatal on an egress hive), Syncthing;
+3. firewall, egress NAT (fatal on an egress hive, as is a missing LAN leg, forwarding off or
+   IPv6 not disabled), Syncthing;
 4. starts `system_nodes.<role>.nodes` in order and waits up to 60 s for the `wait_for` list
    (`LIFECYCLE_NODES_BOOTSTRAP_TIMEOUT_SECS`; a timeout only warns);
 5. on the motherbee, waits for `sy-storage` (30 s) and for its database to answer

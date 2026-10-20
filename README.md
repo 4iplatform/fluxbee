@@ -384,8 +384,7 @@ type, `runtime_base: "ai.generic"`, `config_template`) and `ai.billing/config/de
 {
   "behavior": {
     "kind": "ai_chat",
-    "model": "gpt-5.5",
-    "instructions": "Replace with your agent's instructions."
+    "model": "gpt-5.5"
   }
 }
 ```
@@ -398,8 +397,8 @@ type, `runtime_base: "ai.generic"`, `config_template`) and `ai.billing/config/de
 - Leave out `temperature`: the current models reject it.
 - Put no keys in the config. `ai.generic` rejects `secrets`, `behavior.api_key` and
   `behavior.openai`.
-- `instructions` is only a fallback. Once the agent finds its ILK, its prompt comes from the ILK's
-  definition (step 6), or it is the fixed "unconfigured" one.
+- The prompt is not config: `ai.generic` rejects `behavior.instructions`. The agent's prompt is
+  its ILK's definition (step 6); until it has one, it is the fixed "unconfigured" one.
 
 At spawn, the orchestrator builds the node's config from this file, then the request's `config`
 (each top-level key replaces the file's), then a `_system` block it controls.

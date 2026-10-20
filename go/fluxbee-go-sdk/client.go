@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log"
 	"net"
 	"os"
 	"path/filepath"
@@ -154,10 +155,37 @@ func connect(cfg NodeConfig) (*NodeSender, *NodeReceiver, error) {
 	return sender, receiver, nil
 }
 
+// MessageTooLargeError is what Send returns for a message whose frame is
+// over the router's limit (maxFrameSize, 128 KiB). The message is not
+// queued and the connection stays up. Mirror of Rust
+// `NodeError::MessageTooLarge`.
+type MessageTooLargeError struct {
+	Size int
+	Max  int
+}
+
+func (e *MessageTooLargeError) Error() string {
+	if e == nil {
+		return ""
+	}
+	return fmt.Sprintf("message too large: %d bytes (max %d)", e.Size, e.Max)
+}
+
+// Send queues msg for the router. A message whose frame is over the limit
+// is refused with *MessageTooLargeError before it is queued: queued, it
+// would make the writer drop the connection. A full queue fails with
+// "sender queue full".
 func (s *NodeSender) Send(msg Message) error {
 	data, err := json.Marshal(msg)
 	if err != nil {
 		return err
+	}
+	if len(data) > maxFrameSize {
+		log.Printf(
+			"fluxbee-go-sdk: FRAME_TOO_LARGE, message refused before sending; fix the sending node: frame_len=%d max=%d msg_type=%q msg=%q trace_id=%s",
+			len(data), maxFrameSize, msg.Meta.MsgType, stringValue(msg.Meta.Msg), msg.Routing.TraceID,
+		)
+		return &MessageTooLargeError{Size: len(data), Max: maxFrameSize}
 	}
 	select {
 	case s.tx <- data:

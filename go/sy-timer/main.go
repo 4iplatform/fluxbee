@@ -6,6 +6,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"os"
@@ -227,6 +228,10 @@ func (s *Service) handleMessage(msg fluxbeesdk.Message) error {
 	if msg.Meta.MsgType != fluxbeesdk.SYSTEMKind {
 		return nil
 	}
+	if isInfrastructureMessage(msg) {
+		log.Printf("ignoring %s from %q (trace_id=%s): not a request", stringValue(msg.Meta.Msg), msg.SourceL2Name(), msg.Routing.TraceID)
+		return nil
+	}
 	switch stringValue(msg.Meta.Msg) {
 	case fluxbeesdk.MSGNodeStatusGet:
 		response, err := fluxbeesdk.BuildDefaultNodeStatusResponse(&msg, s.sender.UUID(), "HEALTHY")
@@ -263,6 +268,31 @@ func (s *Service) handleMessage(msg fluxbeesdk.Message) error {
 	default:
 		return s.sendTimerError(msg, stringValue(msg.Meta.Msg), "TIMER_INTERNAL", fmt.Sprintf("verb not implemented in current build: %s", stringValue(msg.Meta.Msg)))
 	}
+}
+
+// isInfrastructureMessage reports whether msg gets no answer: the router made it (it carries no
+// routing.src_l2_name, which the router stamps on everything a node sends), or it is a notice or a
+// reply, not a request. The rule of wf-generic's shouldIgnoreInfrastructureMessage, with every
+// *_RESPONSE (SY.timer awaits none). An answer to the router's UNREACHABLE would go to the router's
+// own UUID, which no node has: the router would answer UNREACHABLE again, and the two would bounce
+// it forever (a TIMER_FIRED for a node not connected yet starts it).
+func isInfrastructureMessage(msg fluxbeesdk.Message) bool {
+	if msg.SourceL2Name() == "" {
+		return true
+	}
+	name := stringValue(msg.Meta.Msg)
+	switch name {
+	case "",
+		fluxbeesdk.MSGHello,
+		fluxbeesdk.MSGAnnounce,
+		fluxbeesdk.MSGWithdraw,
+		fluxbeesdk.MSGEcho,
+		fluxbeesdk.MSGEchoReply,
+		fluxbeesdk.MSGUnreachable,
+		fluxbeesdk.MSGTTLExceeded:
+		return true
+	}
+	return strings.HasSuffix(name, "_RESPONSE")
 }
 
 func (s *Service) respondTimerNow(incoming fluxbeesdk.Message) error {
@@ -807,7 +837,30 @@ func (s *Service) respondTimerPurgeOwner(incoming fluxbeesdk.Message) error {
 	})
 }
 
+// sendTimerResponse answers incoming with TIMER_RESPONSE. A response that cannot go (it does not
+// build, or is over the frame limit, say a TIMER_LIST of many timers) is answered with a
+// TIMER_INTERNAL error instead, so the requester does not wait out its timeout. Any other send
+// failure (the send queue full during a reconnect, say) gets no error reply: the work may be done,
+// and the requester's timeout reads "unknown, not failed". Every failure is returned, for the run
+// loop to log.
 func (s *Service) sendTimerResponse(incoming fluxbeesdk.Message, payload any) error {
+	refused, err := s.sendTimerResponseOnce(incoming, payload)
+	if err == nil {
+		return nil
+	}
+	err = fmt.Errorf("%s not sent: %w", fluxbeesdk.MsgTimerResponse, err)
+	if !refused {
+		return err
+	}
+	if _, replyErr := s.sendTimerResponseOnce(incoming, timerErrorPayload(stringValue(incoming.Meta.Msg), "TIMER_INTERNAL", err.Error())); replyErr != nil {
+		return fmt.Errorf("%w (the error reply was not sent either: %v)", err, replyErr)
+	}
+	return err
+}
+
+// sendTimerResponseOnce sends one TIMER_RESPONSE; refused says the response itself cannot go: it
+// does not build, or is over the frame limit.
+func (s *Service) sendTimerResponseOnce(incoming fluxbeesdk.Message, payload any) (refused bool, err error) {
 	response, err := fluxbeesdk.BuildSystemResponse(
 		&incoming,
 		s.sender.UUID(),
@@ -816,20 +869,26 @@ func (s *Service) sendTimerResponse(incoming fluxbeesdk.Message, payload any) er
 		fluxbeesdk.SystemEnvelopeOptions{},
 	)
 	if err != nil {
-		return err
+		return true, err
 	}
-	return s.sender.Send(response)
+	err = s.sender.Send(response)
+	var tooLarge *fluxbeesdk.MessageTooLargeError
+	return errors.As(err, &tooLarge), err
 }
 
 func (s *Service) sendTimerError(incoming fluxbeesdk.Message, verb, code, message string) error {
-	return s.sendTimerResponse(incoming, map[string]any{
+	return s.sendTimerResponse(incoming, timerErrorPayload(verb, code, message))
+}
+
+func timerErrorPayload(verb, code, message string) map[string]any {
+	return map[string]any{
 		"ok":   false,
 		"verb": verb,
 		"error": map[string]any{
 			"code":    code,
 			"message": message,
 		},
-	})
+	}
 }
 
 func (s *Service) signalScheduler() {

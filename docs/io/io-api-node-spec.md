@@ -75,8 +75,8 @@ The public bearer is not part of `CONFIG_SET`, managed state or process argument
 
 IO.api keeps the returned token only in memory. A newly minted token is emitted once in the
 authorized successful `CONFIG_SET` response as `runtime.publication.entry_token`. It is never
-returned by `CONFIG_GET` and is not written to the managed config or state snapshot. The deploy
-helper deliberately avoids writing the response containing it to its log.
+returned by `CONFIG_GET` and is not written to the managed config or state snapshot. Whoever
+sends that `CONFIG_SET` keeps its response out of any log.
 
 ### 3.3 Externalize
 
@@ -327,12 +327,31 @@ The caller must retain it for the external client. Later `CONFIG_GET` calls expo
 
 ## 10. Operational flow
 
-The canonical helper is `scripts/deploy-io-api.sh`. It performs:
+An instance is deployed through SY.admin, like every managed node
+(`docs/reference/operations.md`). The package seeds `io.api`; only a build it does not carry is
+published first.
 
-1. publish `io.api` and update the runtime manifest;
-2. spawn/restart the managed instance through Admin/Orchestrator;
-3. send the typed `CONFIG_SET` and capture a newly issued one-time bearer, when present;
-4. poll `control/config-get` until `runtime.publication.status=published`.
+1. **Publish** (a new build only), on the motherbee:
+   `bash scripts/publish-io-api-runtime.sh --version <v> --set-current --sudo`. It prints
+   `manifest_version=<n>` and `manifest_hash=<sha256>`.
+2. **Update** the target hive with them: `POST /hives/{hive}/update` with
+   `{"category":"runtime","manifest_version":<n>,"manifest_hash":"<sha256>","runtime":"io.api","runtime_version":"<v>"}`,
+   repeated while it answers `sync_pending` (HTTP 202). The update restarts no node.
+3. **Launch** the instance in its tenant: `POST /hives/{hive}/nodes` with `node_name`,
+   `"runtime":"io.api"`, `"runtime_version":"current"`, `tenant_id` and the configuration of §4 as
+   `config`. An instance that already exists moves to the new `current` with
+   `POST /hives/{hive}/nodes/{node}/restart`; its configuration stays.
+4. **Configure** it with `POST /hives/{hive}/nodes/{node}/control/config-set` (`CONFIG_SET`,
+   `apply_mode: replace`, the next `config_version`). Its response carries a newly minted bearer
+   once (§3.2).
+5. **Wait** with `POST /hives/{hive}/nodes/{node}/control/config-get` until
+   `runtime.publication.status=published` (`disabled` with `edge.publish=false`). If
+   `credential_pending` is true there, the bearer was minted after the `CONFIG_SET` answered; the
+   next successful `CONFIG_SET` returns it.
+6. **Probe** the public path when it matters: `runtime.publication.status` is Admin's view and
+   never touches that path. `POST <edge base><runtime.publication.url>` with the bearer must get
+   an answer from IO.api itself, not a transport error; a 401 or 403 with the bearer is a
+   credential mismatch.
 
 No local `/schema` or HTTP port probe is valid for this runtime.
 
@@ -341,7 +360,9 @@ so ingress forwarding is no longer limited to one WAN hop. An IO.api instance ne
 its configured ingress Edge. Publishing a worker instance behind motherbee is valid and reachable —
 `POST /e/<ich>` returns HTTP 200 (was `HANDLER_UNREACHABLE`), the hub relaying via next-hop forwarding.
 
-Permanent removal is an ordered operation: apply `edge.publish=false`, stop the managed node with
-`DELETE /hives/{hive}/nodes/{node}`, wait until it is no longer router-visible, then call
-`DELETE /hives/{hive}/nodes/{node}/instance`. Killing a node alone intentionally preserves its
-instance and publication intent for restart recovery.
+Permanent removal is an ordered operation: apply `edge.publish=false` with a `CONFIG_SET` and wait
+until `runtime.publication.status=disabled`, so the instance closes its Edge route, then remove it
+with `DELETE /hives/{hive}/nodes/{node}` and the body `{"purge_instance":true}`, the full teardown
+(its directory, its ILK and the vault secrets it owns). A `DELETE` without `purge_instance` only
+stops the node: it intentionally preserves its instance and publication intent for restart
+recovery.

@@ -237,6 +237,7 @@ All messages follow the standard Fluxbee envelope:
 - `meta.msg_type`: always `"system"`.
 - `meta.msg`: one of the verbs defined in section 7.
 - Response: always `meta.msg = "TIMER_RESPONSE"`, with the same `trace_id` as the request.
+- Only requests are answered. A message the router made itself (it has no `routing.src_l2_name`: `UNREACHABLE`, `TTL_EXCEEDED`), `ECHO_REPLY` and any `*_RESPONSE` get no answer, so a `TIMER_FIRED` for a node that is not connected ends at the router's `UNREACHABLE`. An unknown verb from a node is answered `TIMER_INTERNAL`, and so is a request whose response does not fit in one frame (128 KiB).
 
 ### 6.2 Verbs
 
@@ -1139,9 +1140,11 @@ Format of an error response:
 
 `SY.timer` is a core singleton per hive, launched and kept up by `SY.orchestrator` through the same operational model as the rest of the system's `SY.*` nodes. It has an installed core binary, a copy in `dist/core/bin`, a systemd unit file and supervision/restart by the orchestrator.
 
-Binary: `/usr/bin/sy-timer` (installed by `install.sh`).
+Binary: `/usr/bin/sy-timer` (installed by the `.deb` on the motherbee; `add_hive` and the core
+update copy it to the spokes).
 Distribution copy: `/var/lib/fluxbee/dist/core/bin/sy-timer`.
-Unit: `/etc/systemd/system/sy-timer.service`.
+Unit: `/lib/systemd/system/sy-timer.service` on the motherbee (the `.deb`),
+`/etc/systemd/system/sy-timer.service` on a spoke (written by the orchestrator).
 
 ### 16.2 Runtime paths
 

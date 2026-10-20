@@ -97,7 +97,6 @@ curl -sS -X POST "$BASE/hives/$HIVE_ID/nodes/$NODE/control/config-set" \
     "behavior": {
       "kind": "ai_chat",
       "model": "gpt-5.5",
-      "instructions": "Fallback prompt: used only while the node cannot read its agent ILK.",
       "model_settings": { "max_output_tokens": 1024 }
     }
   }
@@ -110,15 +109,15 @@ EOF
 - **The config fields:**
   - `behavior.kind`: `ai_chat`, or `echo` (no model call; for tests);
   - `behavior.model`;
-  - `behavior.instructions`: a string, or `{"source": "inline", "value": "..."}`;
-  - `behavior.model_settings`: `max_output_tokens`;
+  - `behavior.model_settings`: `max_output_tokens`. An answer cut at that limit is a
+    `provider_output_truncated` error;
   - `behavior.base_url`;
   - `behavior.capabilities.multimodal`: `true` by default.
 
   Each field is described in `nodes/ai/ai-generic/README.md`.
 - **Leave `temperature` out:** current models reject it (gpt-5.5, Claude 5; FINDINGS A-69).
-- **`behavior.instructions` is a fallback.** Once the node reads its agent ILK, the ILK's definition
-  is the prompt (step 5).
+- **The prompt is not config.** It is the agent ILK's definition (step 5). Until the node has one, it
+  runs a fixed "unconfigured" prompt.
 - **There is one config:** `config.json` in the node's directory
   (`/var/lib/fluxbee/nodes/AI/<node@hive>/config.json`).
   - `CONFIG_SET` validates it, applies it without a restart, and writes it.
@@ -129,10 +128,19 @@ EOF
   - secrets: `config.secrets.*`, `behavior.api_key`, `behavior.api_key_env`, `behavior.openai`;
   - `behavior.vault_key`;
   - cognitive assets (`config.assets`), which go through `set_ilk_definition`;
-  - any unknown field under `behavior`.
-- **Of `runtime`, the node reads `runtime.immediate_memory`** (off by default) **and
-  `runtime.cognitive_definition`.** Timeouts, pool and queue sizes are not applied to a node the
-  orchestrator launched: it runs with 60 s per message, 4 workers and a queue of 128.
+  - any unknown field under `behavior` or `runtime`, `behavior.instructions` included.
+- **`runtime` has two parts:**
+  - `runtime.immediate_memory` (`enabled`, off by default; `recent_interactions_max`;
+    `summary_max_chars`) applies with the `CONFIG_SET`;
+  - `runtime.cognitive_definition` (`poll_interval_secs`, `blob_root`) applies at the next start.
+- **Timeouts, workers and queue are the AI runtime's, not config:**
+  - each model call has 5 min, its provider's own retries included;
+  - a message has 47 min: up to 8 model turns of a tool loop, one plain call after them, and 2 min
+    for its tools;
+  - 4 workers and a queue of 128.
+- **A message runs once.** When it fails or runs out of time, the sender gets an `ai_runtime_error` or
+  `ai_runtime_timeout` error and the message is not run again: it may already have called the model
+  or a tool such as `publish_html_page`.
 
 ---
 
@@ -160,67 +168,86 @@ EOF
 
 What the agent says:
 
-- **With no hashes, or when no asset loads,** the agent runs a fixed prompt and the model answers only
-  `{"status": "unconfigured", ...}`.
+- **With no hashes, when no asset loads, or while the node has not found its agent ILK,** the agent
+  runs a fixed prompt and the model answers only `{"status": "unconfigured", ...}`.
+- **Once the agent has a definition, only a definite new one replaces it:** its ILK is there, is an
+  agent, and every asset it names was read (an asset that is there but invalid, wrong hash or not a
+  regular file, is left out). A poll that cannot read the identity SHM, does not find the ILK in it
+  (a degraded identity replica) or misses an asset changes nothing: the agent keeps its definition,
+  and `CONFIG_GET` shows why in `definition.last_poll_error`.
 - **Assets are read on the node's own hive** (`/var/lib/fluxbee/blob/agent-assets/`). Archi writes
-  them on the motherbee, and Syncthing replicates `blob/active/` between hives but not
-  `agent-assets/`. An agent on worker1 finds its assets only if they are on worker1.
+  them on the motherbee, and the Syncthing folder `fluxbee-dist-agent-assets` (send-only on the
+  motherbee, receive-only on every worker) brings them to every worker, about 10 to 20 s after they
+  are written, while the ILK's new hashes arrive in about 1 s. Meanwhile an agent on a worker keeps
+  its previous definition and takes the new one at the next poll after the assets arrive (10 s by
+  default); one that starts before its assets arrive answers with the "unconfigured" prompt until
+  then.
 
 ---
 
 ## 6) Update `ai.generic` without a new `.deb` (development)
 
-`scripts/deploy-ia-node.sh` publishes a build of the runner and sends the `SYSTEM_UPDATE`. It uses
-`scripts/publish-ia-runtime.sh`, which builds `ai_node_runner` and publishes it with
-`scripts/publish-runtime.sh` into the local `/var/lib/fluxbee/dist`. Run it on the motherbee.
+The standard path: publish the runtime on the motherbee, update the node's hive, and restart the
+node through SY.admin.
 
-```bash
-bash scripts/deploy-ia-node.sh \
-  --base "$BASE" \
-  --hive-id "$HIVE_ID" \
-  --runtime "ai.generic" \
-  --version "0.1.99" \
-  --sudo
-```
-
-1. **Publish:** the new version becomes `current`.
-2. **Update:** `POST /hives/$HIVE_ID/update` with `category=runtime`, retried while it answers
-   `sync_pending` (`--update-retries`, default 8).
-   - `--update-scope targeted`, the default, sends `runtime` and `runtime_version`, so drift in other
-     runtimes does not block this one.
-   - `--update-scope global` is only for checking the hive's overall state.
-   - `--sync-hint` posts a `dist` sync hint to the hive before each attempt.
-3. **The update restarts no node.** A running node moves to the new version when SY.admin restarts it.
-   The restart recreates the node's unit at the version now `current`, for a node launched with
-   `runtime_version: current`; a node pinned to a version keeps it.
+1. **Build and publish**, on the motherbee, from the repo:
 
    ```bash
-   curl -sS -X POST "$BASE/hives/$HIVE_ID/nodes/$NODE/restart" -H 'content-type: application/json' \
-     -d '{"node_name":"'"$NODE"'"}'
+   bash scripts/publish-ia-runtime.sh --runtime ai.generic --version 0.1.99 --set-current --sudo
    ```
 
-Other modes of the script:
+   - It builds `ai_node_runner` (`--skip-build` publishes `target/release/ai_node_runner` as it is)
+     into `/var/lib/fluxbee/dist/runtimes/ai.generic/0.1.99/`.
+   - `--set-current` makes it the version `current` points at.
+   - It prints `manifest_version=` and `manifest_hash=`; the update takes both.
+2. **Update the node's hive** (`POST /hives/{hive}/update`):
 
-- **`--node-name` with `--update-existing`:** after the update, it restarts the node's unit with the
-  local `systemctl`.
-  - That relaunches the binary the unit was created with, not the new version, so restart the node
-    through SY.admin as above.
-  - It only finds units of the host it runs on. A node on worker1 is not restarted, and the script
-    fails.
-- **`--node-name` alone:** after the update it creates the node (`POST .../nodes`), with the config in
-  `--config-json <file>` and the tenant in `--tenant-id`.
-  - Without `--config-json` it spawns with `config={}`, and the node stays UNCONFIGURED.
-  - An existing node answers `NODE_ALREADY_EXISTS`. Removing it first takes
-    `DELETE .../nodes/<node>` with the body `{"purge_instance": true}`, the full teardown: its ILK goes
-    too, so the new node gets a new ILK and needs its definition again (step 5).
-- **Immediate memory:** these flags write `runtime.immediate_memory` into the spawn config. Without
-  them, the config is exactly the one in `--config-json`.
-  - `--immediate-memory-enabled <true|false>`
-  - `--immediate-memory-recent-max <n>`
-  - `--immediate-memory-active-max <n>`
-  - `--immediate-memory-summary-max-chars <n>`
-  - `--immediate-memory-refresh-every-turns <n>`
-  - `--immediate-memory-trim-noise <true|false>`
+   ```bash
+   curl -sS -X POST "$BASE/hives/$HIVE_ID/update" -H 'content-type: application/json' \
+     -d '{"category":"runtime","manifest_version":<n>,"manifest_hash":"<hash>","runtime":"ai.generic","runtime_version":"0.1.99"}'
+   ```
+
+   - `runtime` and `runtime_version` limit the check to this runtime, so drift in another one does
+     not block it.
+   - `sync_pending` (HTTP 202) means the hive does not have the new manifest or files yet: Syncthing
+     has not delivered them. Send the same request again.
+   - On a worker, a scan on the motherbee announces them at once (a scan on the worker pulls
+     nothing):
+
+     ```bash
+     curl -sS -X POST "$BASE/hives/motherbee/sync-hint" -H 'content-type: application/json' \
+       -d '{"channel":"dist","folder_id":"fluxbee-dist-runtimes"}'
+     ```
+
+3. **Restart the node through SY.admin** (`POST /hives/{hive}/nodes/{node}/restart`). The update
+   restarts no node.
+
+   ```bash
+   curl -sS -X POST "$BASE/hives/$HIVE_ID/nodes/$NODE/restart"
+   ```
+
+   - The restart recreates the node's unit at the version `current` now points at, for a node
+     launched with `runtime_version: current`; a node pinned to a version keeps it. The answer's
+     `version` is the one it runs.
+   - It works on any hive: SY.admin sends it to the motherbee's orchestrator, which passes it to
+     the node's hive.
+   - Do not restart the unit with a local `systemctl`: that relaunches the binary the unit was
+     created with.
+
+**A new node** with the new version is a `run_node` (step 3).
+
+**Removing a node** is a `kill_node` with `purge_instance`, the full teardown:
+
+```bash
+curl -sS -X DELETE "$BASE/hives/$HIVE_ID/nodes/$NODE" -H 'content-type: application/json' \
+  -d '{"purge_instance":true}'
+```
+
+- Its instance directory and its `config.json` go.
+- Its ILK goes too, so a new node with the same name gets a new ILK and needs its definition again
+  (step 5).
+- Without `purge_instance` the node only stops, and a `run_node` with its name answers
+  `NODE_ALREADY_EXISTS`.
 
 ---
 

@@ -6,7 +6,7 @@ use std::fs;
 use std::io;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -36,7 +36,7 @@ use fluxbee_sdk::protocol::{
     MSG_EDGE_LIST_URLS, MSG_EDGE_LIST_URLS_RESPONSE, MSG_EDGE_OPEN_URL, MSG_EDGE_OPEN_URL_RESPONSE,
     MSG_EDGE_PUBLISH_BLOB, MSG_EDGE_PUBLISH_BLOB_RESPONSE, MSG_EDGE_UNPUBLISH_BLOB,
     MSG_EDGE_UNPUBLISH_BLOB_RESPONSE, MSG_HELLO, MSG_LSA, MSG_OPA_RELOAD, MSG_TTL_EXCEEDED,
-    MSG_UNREACHABLE, MSG_WAN_REACHABILITY, MSG_WITHDRAW, SCOPE_GLOBAL, SYSTEM_KIND,
+    MSG_UNREACHABLE, MSG_WAN_REACHABILITY, MSG_WAN_REJECT, MSG_WITHDRAW, SCOPE_GLOBAL, SYSTEM_KIND,
 };
 use fluxbee_sdk::socket::connection::{read_frame, write_frame, MAX_FRAME_SIZE};
 use fluxbee_sdk::{classify_routed_message, MSG_VAULT_GET, MSG_VAULT_GET_RESPONSE};
@@ -91,7 +91,7 @@ pub struct Router {
 const LSA_REJECT_HIVE_MISMATCH: &str = "hive_mismatch";
 const LSA_REJECT_STALE_SEQ: &str = "stale_seq";
 const LSA_REJECT_PARSE_ERROR: &str = "parse_error";
-const LSA_REJECT_UNAUTHORIZED: &str = "unauthorized";
+const LSA_REJECT_NOT_REGISTERED: &str = "not_registered";
 impl Router {
     pub fn new(cfg: RouterConfig) -> Self {
         let shm = RouterRegionWriter::open_or_create(
@@ -463,7 +463,7 @@ impl Router {
                 identity_frontdesk_node_name: self.cfg.identity_frontdesk_node_name.clone(),
                 hello_interval_ms: self.cfg.hello_interval_ms,
                 dead_interval_ms: self.cfg.dead_interval_ms,
-                authorized_hives: self.cfg.wan_authorized_hives.clone(),
+                hive_registry: (self.cfg.hive_role == "motherbee").then(HiveRegistry::motherbee),
                 nodes: Arc::clone(&self.nodes),
                 peer_nodes: Arc::clone(&self.peer_nodes),
                 peer_routers: Arc::clone(&self.peer_routers),
@@ -2644,7 +2644,7 @@ async fn accept_wan_connection(stream: TcpStream, ctx: Arc<WanContext>) -> Resul
     match ctx.wan_mtls_mode.as_str() {
         "required" => {
             let (tls, hive) = tls_accept(stream, &ctx).await?;
-            handle_wan_connection(tls, hive, ctx, false).await
+            handle_wan_connection(tls, hive, ctx, false, None).await
         }
         "permissive" => {
             // Detect TLS vs plaintext without consuming: a TLS record starts with
@@ -2671,15 +2671,15 @@ async fn accept_wan_connection(stream: TcpStream, ctx: Arc<WanContext>) -> Resul
             }
             if n >= 1 && probe[0] == 0x16 {
                 let (tls, hive) = tls_accept(stream, &ctx).await?;
-                handle_wan_connection(tls, hive, ctx, false).await
+                handle_wan_connection(tls, hive, ctx, false, None).await
             } else {
                 tracing::warn!(
                     "wan.mtls=permissive: accepting an UNAUTHENTICATED plaintext peer (rollout incomplete; flip to 'required' once all peers present certs)"
                 );
-                handle_wan_connection(stream, None, ctx, false).await
+                handle_wan_connection(stream, None, ctx, false, None).await
             }
         }
-        _ => handle_wan_connection(stream, None, ctx, false).await,
+        _ => handle_wan_connection(stream, None, ctx, false, None).await,
     }
 }
 
@@ -2721,9 +2721,10 @@ async fn tls_accept(
 async fn connect_wan_connection(
     stream: TcpStream,
     ctx: &Arc<WanContext>,
+    established: &AtomicBool,
 ) -> Result<(), RouterError> {
     if ctx.wan_mtls_mode == "disabled" {
-        return handle_wan_connection(stream, None, Arc::clone(ctx), true).await;
+        return handle_wan_connection(stream, None, Arc::clone(ctx), true, Some(established)).await;
     }
     let connector = ctx
         .wan_tls
@@ -2746,66 +2747,152 @@ async fn connect_wan_connection(
             "wan server certificate has no extractable hive_id".to_string(),
         ));
     }
-    handle_wan_connection(tls, hive, Arc::clone(ctx), true).await
+    handle_wan_connection(tls, hive, Arc::clone(ctx), true, Some(established)).await
+}
+
+/// When an uplink dials again: 5 s after a link that got past WAN_ACCEPT, however it ended; after
+/// an attempt that did not (no connection, a TLS or handshake error, a WAN_REJECT), 5 s doubling
+/// up to 60 s.
+struct UplinkRetry {
+    failures: u64,
+    next_delay_secs: u64,
+}
+
+impl UplinkRetry {
+    const BASE_SECS: u64 = 5;
+    const MAX_SECS: u64 = 60;
+
+    fn new() -> Self {
+        Self {
+            failures: 0,
+            next_delay_secs: Self::BASE_SECS,
+        }
+    }
+
+    /// Records how an attempt ended and returns the wait before the next one.
+    fn after_attempt(&mut self, established: bool) -> Duration {
+        if established {
+            self.failures = 0;
+            self.next_delay_secs = Self::BASE_SECS;
+            return Duration::from_secs(Self::BASE_SECS);
+        }
+        self.failures = self.failures.saturating_add(1);
+        let delay_secs = self.next_delay_secs;
+        self.next_delay_secs = delay_secs.saturating_mul(2).min(Self::MAX_SECS);
+        Duration::from_secs(delay_secs)
+    }
 }
 
 async fn wan_connect_loop(address: String, ctx: Arc<WanContext>) {
-    const WAN_RETRY_BASE_SECS: u64 = 5;
-    const WAN_RETRY_MAX_SECS: u64 = 60;
     const WAN_WARN_EVERY_ATTEMPTS: u64 = 12;
 
-    let mut backoff_secs = WAN_RETRY_BASE_SECS;
-    let mut failures: u64 = 0;
+    let mut retry = UplinkRetry::new();
     loop {
-        match TcpStream::connect(&address).await {
+        let established = AtomicBool::new(false);
+        let connect_error = match TcpStream::connect(&address).await {
             Ok(stream) => {
-                if failures > 0 {
+                if retry.failures > 0 {
                     tracing::info!(
                         addr = %address,
-                        failures,
+                        failures = retry.failures,
                         "wan reconnect succeeded"
                     );
                 } else {
                     tracing::info!(addr = %address, "wan connected");
                 }
-                failures = 0;
-                backoff_secs = WAN_RETRY_BASE_SECS;
-                if let Err(err) = connect_wan_connection(stream, &ctx).await {
+                if let Err(err) = connect_wan_connection(stream, &ctx, &established).await {
                     tracing::warn!("wan uplink error: {err}");
-                    failures = failures.saturating_add(1);
                 }
+                None
             }
-            Err(err) => {
-                failures = failures.saturating_add(1);
-                if failures == 1 || failures % WAN_WARN_EVERY_ATTEMPTS == 0 {
-                    tracing::warn!(
-                        addr = %address,
-                        failures,
-                        retry_in_secs = backoff_secs,
-                        "wan connect failed: {err}"
-                    );
-                } else {
-                    tracing::debug!(
-                        addr = %address,
-                        failures,
-                        retry_in_secs = backoff_secs,
-                        "wan connect failed: {err}"
-                    );
-                }
+            Err(err) => Some(err),
+        };
+        let delay = retry.after_attempt(established.load(Ordering::Relaxed));
+        if let Some(err) = connect_error {
+            let failures = retry.failures;
+            if failures == 1 || failures.is_multiple_of(WAN_WARN_EVERY_ATTEMPTS) {
+                tracing::warn!(
+                    addr = %address,
+                    failures,
+                    retry_in_secs = delay.as_secs(),
+                    "wan connect failed: {err}"
+                );
+            } else {
+                tracing::debug!(
+                    addr = %address,
+                    failures,
+                    retry_in_secs = delay.as_secs(),
+                    "wan connect failed: {err}"
+                );
             }
         }
-        time::sleep(Duration::from_secs(backoff_secs)).await;
-        if failures > 0 {
-            backoff_secs = (backoff_secs.saturating_mul(2)).min(WAN_RETRY_MAX_SECS);
+        time::sleep(delay).await;
+    }
+}
+
+const WAN_REJECT_HIVE_NOT_REGISTERED: &str = "HIVE_NOT_REGISTERED";
+/// How often an admitted peer's session checks that its hive is still registered.
+const HIVE_REGISTRY_RECHECK: Duration = Duration::from_secs(10);
+/// How long a rejected peer's link stays open for the reject to be written.
+const WAN_REJECT_FLUSH_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// The hives the motherbee joined (A-48): SY.orchestrator creates `<root>/<hive_id>/` when it
+/// accepts a join and remove_hive deletes it after the hive's REMOVE_HIVE_CLEANUP. The motherbee
+/// admits a WAN peer only while its hive is listed here; no other hive keeps a registry.
+struct HiveRegistry {
+    root: PathBuf,
+    recheck_every: Duration,
+}
+
+impl HiveRegistry {
+    /// `/var/lib/fluxbee/hives`, SY.orchestrator's `hives_root`.
+    fn motherbee() -> Self {
+        Self {
+            root: crate::paths::storage_root_dir().join("hives"),
+            recheck_every: HIVE_REGISTRY_RECHECK,
+        }
+    }
+
+    fn lists(&self, hive_id: &str) -> bool {
+        // The hive id comes from the peer: one that is not a plain name (`..`, `/etc`) would look
+        // outside the registry.
+        crate::mesh_hmac::is_valid_hive_id(hive_id) && self.root.join(hive_id).is_dir()
+    }
+}
+
+/// Whether a peer hive may hold a WAN session here: with a registry, only a listed one; the
+/// `WAN_REJECT` reason otherwise.
+fn wan_peer_admission(registry: Option<&HiveRegistry>, hive_id: &str) -> Result<(), &'static str> {
+    match registry {
+        Some(registry) if !registry.lists(hive_id) => Err(WAN_REJECT_HIVE_NOT_REGISTERED),
+        _ => Ok(()),
+    }
+}
+
+/// Completes once the registry stops listing `hive_id`, checked every `recheck_every`. Without a
+/// registry it never completes.
+async fn hive_unregistered(registry: Option<&HiveRegistry>, hive_id: &str) {
+    let Some(registry) = registry else {
+        return std::future::pending().await;
+    };
+    let period = registry.recheck_every;
+    let mut ticker = time::interval_at(time::Instant::now() + period, period);
+    loop {
+        ticker.tick().await;
+        if !registry.lists(hive_id) {
+            return;
         }
     }
 }
 
+/// One WAN link, from the HELLO exchange to its end. `established` is set once the handshake got
+/// past WAN_ACCEPT, so an uplink can tell a link that ended from one that never came up.
 async fn handle_wan_connection<S>(
     stream: S,
     verified_peer_hive: Option<String>,
     ctx: Arc<WanContext>,
     initiator: bool,
+    established: Option<&AtomicBool>,
 ) -> Result<(), RouterError>
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
@@ -2839,32 +2926,28 @@ where
         .await?
         .ok_or_else(|| io::Error::new(io::ErrorKind::UnexpectedEof, "missing HELLO"))?;
     let msg: Message = serde_json::from_slice(&frame)?;
+    if initiator
+        && is_system_kind(&msg.meta.msg_type)
+        && msg.meta.msg.as_deref() == Some(MSG_WAN_REJECT)
+    {
+        // The uplink loop logs the reason; the link never got past WAN_ACCEPT, so the loop backs
+        // off (`UplinkRetry`).
+        writer_task.abort();
+        let reject: WanRejectPayload = serde_json::from_value(msg.payload)?;
+        return Err(io::Error::new(
+            io::ErrorKind::ConnectionRefused,
+            format!(
+                "wan peer rejected this hive: {}: {}",
+                reject.reason, reject.message
+            ),
+        )
+        .into());
+    }
     if !is_system_kind(&msg.meta.msg_type) || msg.meta.msg.as_deref() != Some(MSG_HELLO) {
         writer_task.abort();
         return Ok(());
     }
     let peer_hello: WanHelloPayload = serde_json::from_value(msg.payload)?;
-    if !ctx.authorized_hives.is_empty() && !ctx.authorized_hives.contains(&peer_hello.hive_id) {
-        let reject_count = bump_lsa_reject_counter(ctx.as_ref(), LSA_REJECT_UNAUTHORIZED).await;
-        let reject = build_wan_reject(
-            &ctx.router_uuid.to_string(),
-            &peer_hello.router_id,
-            &Uuid::new_v4().to_string(),
-            WanRejectPayload {
-                reason: "HIVE_NOT_AUTHORIZED".to_string(),
-                message: format!("Hive '{}' not authorized", peer_hello.hive_id),
-            },
-        );
-        let _ = tx.send(serde_json::to_vec(&reject)?);
-        tracing::warn!(
-            peer_hive = %peer_hello.hive_id,
-            peer_router_id = %peer_hello.router_id,
-            reject_count = reject_count,
-            "wan peer rejected: hive not authorized"
-        );
-        writer_task.abort();
-        return Ok(());
-    }
 
     // mTLS: bind the cryptographically-verified peer identity (its cert hive_id)
     // to the hive_id it claims in the HELLO. The TLS layer already proved the peer
@@ -2882,6 +2965,44 @@ where
         }
     }
     let _ = link_peer.set(peer_hello.hive_id.clone());
+
+    // A-48: the motherbee admits a hive, by the id just bound to its certificate, only while its
+    // registry lists it. Its own uplinks, if any, are not checked.
+    let registry = if initiator {
+        None
+    } else {
+        ctx.hive_registry.as_ref()
+    };
+    if let Err(reason) = wan_peer_admission(registry, &peer_hello.hive_id) {
+        let reject_count = bump_lsa_reject_counter(ctx.as_ref(), LSA_REJECT_NOT_REGISTERED).await;
+        let reject = build_wan_reject(
+            &ctx.router_uuid.to_string(),
+            &peer_hello.router_id,
+            &Uuid::new_v4().to_string(),
+            WanRejectPayload {
+                reason: reason.to_string(),
+                message: format!("Hive '{}' is not registered", peer_hello.hive_id),
+            },
+        );
+        let _ = tx.send(serde_json::to_vec(&reject)?);
+        tracing::warn!(
+            peer_hive = %peer_hello.hive_id,
+            peer_router_id = %peer_hello.router_id,
+            reason = %reason,
+            reject_count = reject_count,
+            "wan peer rejected: hive not registered"
+        );
+        // The writer sends the reject and stops once its channel closes.
+        drop(tx);
+        let writer_abort = writer_task.abort_handle();
+        if time::timeout(WAN_REJECT_FLUSH_TIMEOUT, writer_task)
+            .await
+            .is_err()
+        {
+            writer_abort.abort();
+        }
+        return Ok(());
+    }
 
     if !initiator {
         let hello = build_wan_hello(
@@ -2931,6 +3052,9 @@ where
             },
         },
     );
+    if let Some(established) = established {
+        established.store(true, Ordering::Relaxed);
+    }
     let _ = tx.send(serde_json::to_vec(&accept)?);
 
     {
@@ -2946,8 +3070,23 @@ where
 
     let _ = broadcast_lsa(&ctx, Some(&peer_hello.hive_id)).await;
 
+    // A hive removed while its link is up is cut off within one registry recheck.
+    let unregistered = hive_unregistered(registry, &peer_hello.hive_id);
+    tokio::pin!(unregistered);
     loop {
-        match read_frame(&mut reader).await? {
+        let frame = tokio::select! {
+            frame = read_frame(&mut reader) => frame?,
+            () = &mut unregistered => {
+                tracing::warn!(
+                    peer_hive = %peer_hello.hive_id,
+                    session_epoch = session_epoch,
+                    reason = %WAN_REJECT_HIVE_NOT_REGISTERED,
+                    "wan peer session closed: hive no longer registered"
+                );
+                break;
+            }
+        };
+        match frame {
             Some(frame) => match serde_json::from_slice::<Message>(&frame) {
                 Ok(msg) => {
                     handle_wan_message(
@@ -4504,7 +4643,8 @@ struct WanContext {
     identity_frontdesk_node_name: String,
     hello_interval_ms: u64,
     dead_interval_ms: u64,
-    authorized_hives: Vec<String>,
+    /// The hive registry the motherbee admits WAN peers against; `None` on every other hive.
+    hive_registry: Option<HiveRegistry>,
     nodes: Arc<Mutex<std::collections::HashMap<Uuid, NodeHandle>>>,
     peer_nodes: Arc<Mutex<std::collections::HashMap<Uuid, PeerNode>>>,
     peer_routers: Arc<Mutex<std::collections::HashMap<Uuid, PeerRouter>>>,
@@ -9250,5 +9390,294 @@ mod tests {
         );
 
         cleanup(&shm_name);
+    }
+
+    /// A hive registry in a temporary directory, listing `hives`, rechecked every 20 ms.
+    fn test_hive_registry(hives: &[&str]) -> HiveRegistry {
+        let root = std::env::temp_dir().join(format!("fluxbee-hives-{}", Uuid::new_v4()));
+        fs::create_dir_all(&root).expect("create registry");
+        for hive in hives {
+            fs::create_dir(root.join(hive)).expect("create registry entry");
+        }
+        HiveRegistry {
+            root,
+            recheck_every: Duration::from_millis(20),
+        }
+    }
+
+    /// The motherbee gateway's WAN context, with no nodes, peers or TLS.
+    fn test_wan_context(hive_registry: Option<HiveRegistry>) -> Arc<WanContext> {
+        Arc::new(WanContext {
+            router_uuid: Uuid::new_v4(),
+            router_name: "RT.gateway@motherbee".to_string(),
+            hive_id: "motherbee".to_string(),
+            identity_frontdesk_node_name: "SY.frontdesk.gov@motherbee".to_string(),
+            hello_interval_ms: 10_000,
+            dead_interval_ms: 40_000,
+            hive_registry,
+            nodes: Arc::new(Mutex::new(HashMap::new())),
+            peer_nodes: Arc::new(Mutex::new(HashMap::new())),
+            peer_routers: Arc::new(Mutex::new(HashMap::new())),
+            peers: Arc::new(Mutex::new(HashMap::new())),
+            wan_peers: Arc::new(Mutex::new(HashMap::new())),
+            lsa_state: Arc::new(Mutex::new(HashMap::new())),
+            reachability: Arc::new(Mutex::new(HashMap::new())),
+            lsa_writer: Arc::new(Mutex::new(None)),
+            lsa_snapshot: Arc::new(Mutex::new(None)),
+            static_routes: Arc::new(Mutex::new(Vec::new())),
+            vpn_rules: Arc::new(Mutex::new(Vec::new())),
+            tap_rules: Arc::new(Mutex::new(Vec::new())),
+            fib: Arc::new(Mutex::new(Vec::new())),
+            broadcast_cache: Arc::new(Mutex::new(BroadcastCache::new())),
+            lsa_seq: Arc::new(Mutex::new(0)),
+            log_stream: stream::StreamHandle::detached(),
+            memory_reader: Arc::new(Mutex::new(None)),
+            opa: Arc::new(Mutex::new(OpaResolver::new())),
+            wan_session_epochs: Arc::new(Mutex::new(HashMap::new())),
+            lsa_reject_counters: Arc::new(Mutex::new(HashMap::new())),
+            wan_mtls_mode: "disabled".to_string(),
+            wan_tls: None,
+        })
+    }
+
+    fn wan_hello_frame(hive_id: &str) -> Vec<u8> {
+        let router_id = Uuid::new_v4().to_string();
+        let hello = build_wan_hello(
+            &router_id,
+            &Uuid::new_v4().to_string(),
+            WanHelloPayload {
+                protocol: MESH_PROTOCOL_VERSION.to_string(),
+                router_id: router_id.clone(),
+                router_name: format!("RT.gateway@{hive_id}"),
+                hive_id: hive_id.to_string(),
+                capabilities: vec!["lsa".to_string(), "forwarding".to_string()],
+                timers: WanTimers {
+                    hello_interval_ms: 10_000,
+                    dead_interval_ms: 40_000,
+                },
+            },
+        );
+        serde_json::to_vec(&hello).expect("hello frame")
+    }
+
+    async fn read_system_message<R>(reader: &mut R) -> Message
+    where
+        R: tokio::io::AsyncRead + Unpin,
+    {
+        let frame = read_frame(reader)
+            .await
+            .expect("read frame")
+            .expect("a frame");
+        serde_json::from_slice(&frame).expect("a message")
+    }
+
+    /// The accepting side of a plaintext WAN link on `stream`.
+    fn spawn_accepted_link(
+        stream: tokio::io::DuplexStream,
+        ctx: &Arc<WanContext>,
+    ) -> tokio::task::JoinHandle<Result<(), RouterError>> {
+        tokio::spawn(handle_wan_connection(
+            stream,
+            None,
+            Arc::clone(ctx),
+            false,
+            None,
+        ))
+    }
+
+    /// An uplink on `stream`, and whether it got past WAN_ACCEPT.
+    fn spawn_uplink(
+        stream: tokio::io::DuplexStream,
+        ctx: &Arc<WanContext>,
+    ) -> (
+        tokio::task::JoinHandle<Result<(), RouterError>>,
+        Arc<AtomicBool>,
+    ) {
+        let established = Arc::new(AtomicBool::new(false));
+        let session = tokio::spawn({
+            let ctx = Arc::clone(ctx);
+            let established = Arc::clone(&established);
+            async move {
+                handle_wan_connection(stream, None, ctx, true, Some(established.as_ref())).await
+            }
+        });
+        (session, established)
+    }
+
+    #[test]
+    fn an_uplink_backs_off_until_a_link_gets_past_wan_accept() {
+        let mut retry = UplinkRetry::new();
+        // Attempts that fail, a WAN_REJECT among them: 5 s, doubling up to 60 s.
+        let waits: Vec<u64> = (0..6)
+            .map(|_| retry.after_attempt(false).as_secs())
+            .collect();
+        assert_eq!(waits, [5, 10, 20, 40, 60, 60]);
+        // A link that got past WAN_ACCEPT starts the retries over, however it ended.
+        assert_eq!(retry.after_attempt(true).as_secs(), 5);
+        assert_eq!(retry.failures, 0);
+        assert_eq!(retry.after_attempt(false).as_secs(), 5);
+        assert_eq!(retry.after_attempt(false).as_secs(), 10);
+    }
+
+    #[test]
+    fn the_motherbee_admits_only_the_hives_its_registry_lists() {
+        let registry = test_hive_registry(&["worker1"]);
+        assert_eq!(wan_peer_admission(Some(&registry), "worker1"), Ok(()));
+        assert_eq!(
+            wan_peer_admission(Some(&registry), "worker2"),
+            Err(WAN_REJECT_HIVE_NOT_REGISTERED)
+        );
+        // An id that is not a plain name never reaches a directory outside the registry.
+        for hive_id in ["", "..", ".", "/tmp", "worker1/..", "../worker1"] {
+            assert_eq!(
+                wan_peer_admission(Some(&registry), hive_id),
+                Err(WAN_REJECT_HIVE_NOT_REGISTERED),
+                "{hive_id:?}"
+            );
+        }
+        // Another hive keeps no registry and checks nothing.
+        assert_eq!(wan_peer_admission(None, "worker2"), Ok(()));
+        let _ = fs::remove_dir_all(&registry.root);
+    }
+
+    #[tokio::test]
+    async fn the_registry_recheck_completes_once_the_hive_is_removed() {
+        let registry = test_hive_registry(&["worker1"]);
+        let unregistered = hive_unregistered(Some(&registry), "worker1");
+        tokio::pin!(unregistered);
+        assert!(
+            time::timeout(Duration::from_millis(100), &mut unregistered)
+                .await
+                .is_err(),
+            "the hive is still registered"
+        );
+        fs::remove_dir_all(registry.root.join("worker1")).expect("remove registry entry");
+        time::timeout(Duration::from_secs(2), &mut unregistered)
+            .await
+            .expect("the recheck notices the removal");
+        // Without a registry there is nothing to recheck.
+        let never = time::timeout(
+            Duration::from_millis(100),
+            hive_unregistered(None, "worker1"),
+        );
+        assert!(never.await.is_err());
+        let _ = fs::remove_dir_all(&registry.root);
+    }
+
+    #[tokio::test]
+    async fn the_motherbee_rejects_a_hive_its_registry_does_not_list() {
+        let ctx = test_wan_context(Some(test_hive_registry(&[])));
+        let (server, mut client) = tokio::io::duplex(64 * 1024);
+        let session = spawn_accepted_link(server, &ctx);
+        write_frame(&mut client, &wan_hello_frame("worker1"))
+            .await
+            .expect("send hello");
+
+        let reject = read_system_message(&mut client).await;
+        assert_eq!(reject.meta.msg.as_deref(), Some(MSG_WAN_REJECT));
+        let payload: WanRejectPayload =
+            serde_json::from_value(reject.payload).expect("reject payload");
+        assert_eq!(payload.reason, WAN_REJECT_HIVE_NOT_REGISTERED);
+        assert!(
+            read_frame(&mut client).await.expect("read").is_none(),
+            "the link closes after the reject"
+        );
+        time::timeout(Duration::from_secs(2), session)
+            .await
+            .expect("the session ends")
+            .expect("session task")
+            .expect("session result");
+        assert!(ctx.wan_peers.lock().await.is_empty());
+        if let Some(registry) = ctx.hive_registry.as_ref() {
+            let _ = fs::remove_dir_all(&registry.root);
+        }
+    }
+
+    #[tokio::test]
+    async fn the_link_of_a_hive_removed_from_the_registry_closes() {
+        let ctx = test_wan_context(Some(test_hive_registry(&["worker1"])));
+        let (server, mut client) = tokio::io::duplex(64 * 1024);
+        let session = spawn_accepted_link(server, &ctx);
+        write_frame(&mut client, &wan_hello_frame("worker1"))
+            .await
+            .expect("send hello");
+        assert_eq!(
+            read_system_message(&mut client).await.meta.msg.as_deref(),
+            Some(MSG_HELLO)
+        );
+        assert_eq!(
+            read_system_message(&mut client).await.meta.msg.as_deref(),
+            Some(fluxbee_sdk::protocol::MSG_WAN_ACCEPT)
+        );
+        assert!(ctx.wan_peers.lock().await.contains_key("worker1"));
+
+        let registry_root = ctx.hive_registry.as_ref().expect("registry").root.clone();
+        fs::remove_dir_all(registry_root.join("worker1")).expect("remove registry entry");
+        time::timeout(Duration::from_secs(2), session)
+            .await
+            .expect("the session ends once the hive is removed")
+            .expect("session task")
+            .expect("session result");
+        assert!(ctx.wan_peers.lock().await.is_empty());
+        let _ = fs::remove_dir_all(&registry_root);
+    }
+
+    #[tokio::test]
+    async fn an_uplink_the_peer_rejects_fails_with_the_reason() {
+        let ctx = test_wan_context(None);
+        let (spoke, mut motherbee) = tokio::io::duplex(64 * 1024);
+        let (session, established) = spawn_uplink(spoke, &ctx);
+        let hello = read_system_message(&mut motherbee).await;
+        assert_eq!(hello.meta.msg.as_deref(), Some(MSG_HELLO));
+        let reject = build_wan_reject(
+            &Uuid::new_v4().to_string(),
+            &ctx.router_uuid.to_string(),
+            &Uuid::new_v4().to_string(),
+            WanRejectPayload {
+                reason: WAN_REJECT_HIVE_NOT_REGISTERED.to_string(),
+                message: "Hive 'motherbee' is not registered".to_string(),
+            },
+        );
+        let reject = serde_json::to_vec(&reject).expect("reject frame");
+        write_frame(&mut motherbee, &reject)
+            .await
+            .expect("send reject");
+        let err = time::timeout(Duration::from_secs(2), session)
+            .await
+            .expect("the session ends")
+            .expect("session task")
+            .expect_err("a rejected uplink is an error");
+        assert!(
+            err.to_string().contains(WAN_REJECT_HIVE_NOT_REGISTERED),
+            "{err}"
+        );
+        assert!(
+            !established.load(Ordering::Relaxed),
+            "a rejected link never got past WAN_ACCEPT"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_admitted_uplink_reports_that_it_got_past_wan_accept() {
+        let ctx = test_wan_context(None);
+        let (spoke, mut motherbee) = tokio::io::duplex(64 * 1024);
+        let (session, established) = spawn_uplink(spoke, &ctx);
+        let hello = read_system_message(&mut motherbee).await;
+        assert_eq!(hello.meta.msg.as_deref(), Some(MSG_HELLO));
+        write_frame(&mut motherbee, &wan_hello_frame("motherbee"))
+            .await
+            .expect("send hello");
+        let accept = read_system_message(&mut motherbee).await;
+        assert_eq!(
+            accept.meta.msg.as_deref(),
+            Some(fluxbee_sdk::protocol::MSG_WAN_ACCEPT)
+        );
+        drop(motherbee);
+        time::timeout(Duration::from_secs(2), session)
+            .await
+            .expect("the session ends")
+            .expect("session task")
+            .expect("session result");
+        assert!(established.load(Ordering::Relaxed));
     }
 }

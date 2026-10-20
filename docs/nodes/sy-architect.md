@@ -37,8 +37,9 @@ Source: `src/bin/sy_architect.rs`, with `src/bin/sy_architect/` (`pipeline_types
    Two command channels: `system` and `incoming` (`build_architect_rpc_profile`).
 4. Gets its AI key and the messages database URL from SY.vault, waiting up to 60 s for the vault
    to answer (`VaultWait::UntilReachable`, `VAULT_BOOT_WAIT`).
-5. Opens its LanceDB, seeds the cookbooks, and marks pipeline runs left `in_progress` as
-   `interrupted` (`mark_interrupted_pipeline_runs`).
+5. Opens its LanceDB, seeds each cookbook that is missing or empty from the seeds built into the
+   binary (`COOKBOOK_SEEDS`, the files of `seeds/cookbook/`; the `.deb` ships no seeds), and marks
+   pipeline runs left `in_progress` as `interrupted` (`mark_interrupted_pipeline_runs`).
 6. Starts the system and incoming workers and a status refresh every 60 s
    (`STATUS_REFRESH_INTERVAL_SECS`), then binds HTTP: `JSR_ARCHITECT_LISTEN`, else
    `architect.listen`, else `127.0.0.1:3000` (`DEFAULT_ARCHITECT_LISTEN`).
@@ -46,9 +47,8 @@ Source: `src/bin/sy_architect.rs`, with `src/bin/sy_architect/` (`pipeline_types
 ## HTTP API
 
 There is no authentication: the axum router has one layer, `DefaultBodyLimit` (FINDINGS A-46).
-Archi must stay on loopback. Packages up to 0.1.56 shipped `0.0.0.0:3000`;
-`packaging/fluxbee-migrate-config` moves that exact value to `127.0.0.1:3000` on install, and the
-orchestrator's watchdog reports a non-loopback bind as drift (`watchdog_listener_check`).
+Archi must stay on loopback: the orchestrator's watchdog reports a non-loopback bind as drift
+(`watchdog_listener_check`).
 
 | Route | What it does |
 | --- | --- |
@@ -108,14 +108,14 @@ An SCMD typed by the operator runs immediately; a mutating action is recorded in
 `operations` table (`handle_scmd`, `execute_tracked_admin_translation`).
 
 **`fluxbee_system_get`** is the LLM's read tool. It builds an SCMD from `{method, path, body}`
-and runs it through the same `translate_scmd` (`ArchitectSystemGetTool::call`). Its description
-says "Read-only" and Archi's prompt says "every state change eventually goes through
-`fluxbee_plan_compiler`" (`build_archi_prompt`). The code enforces less: the tool refuses methods
-other than GET and POST, and a body on GET, and nothing else. A POST path that maps to a mutating
-action (`POST /hives/{hive}/nodes` → `run_node`, `POST /hives` → `add_hive`) runs; the `purpose`
-argument passed down is only logged (`execute_admin_action_with_context`). PUT and DELETE forms
-cannot be reached through it. The sub-agents' `query_hive` tool does check: it accepts only the
-read actions in `PROGRAMMER_QUERY_ALLOWED_ACTIONS`.
+and runs it through the same `translate_scmd` (`ArchitectSystemGetTool::call`), and it runs reads
+only (`system_get_may_run`, FINDINGS A-73): a GET whose action changes nothing, and the POSTs that
+change nothing: a node's live `CONFIG_GET` (`node_control_config_get`), an OPA policy check
+(`POST /opa/policy/check` → `opa_check`: the motherbee's SY.opa.rules compiles the rego in a
+scratch directory and only answers, with no version and nothing staged) and the timer's
+conversions. Anything else is refused with "stage it with fluxbee_plan_compiler"; PUT and DELETE
+forms cannot be reached through it. The sub-agents' `query_hive` tool accepts only the read
+actions in `PROGRAMMER_QUERY_ALLOWED_ACTIONS`.
 
 **Mutations the intended way**: `fluxbee_plan_compiler` asks a plan-compiler agent for an
 `executor_plan`, pre-validates it with SY.admin (`executor_validate_plan`) and keeps it until the
@@ -135,14 +135,69 @@ one (`discard`, `restart_from_design`, `retry`). Stages (`PipelineStage` in
 - **design / design_audit**: a designer agent writes a solution manifest and an auditor agent
   checks it, up to 3 rounds (`MAX_DESIGN_ITERATIONS`). Manifests are saved under
   `/var/lib/fluxbee/state/manifests/<solution_id>/` and referenced as
-  `manifest://<solution_id>/current`.
+  `manifest://<solution_id>/current`. A manifest that puts a workflow on an ingress or egress
+  hive is refused (`refuse_workflows_on_dmz_hives`): by the role its topology gives a hive it adds,
+  and, for the designer's manifest, by the role in the motherbee's hive registry. So is one that
+  declares a `WF.*` node (SY.wf-rules creates it) or a core node (`SY.*`, `RT.*`), a runtime name
+  outside the naming rule (lowercase letters and digits in dot-separated parts), a workflow name
+  SY.wf-rules rejects, or a route SY.config.routes would not take as declared (action FORWARD
+  with a `next_hop_hive`, or DROP, case-sensitive; one route per prefix on a hive).
+  - Validation is strict when a manifest is saved and before a run reconciles. Reading one is not:
+    `get_manifest_current` returns a manifest saved before a rule changed with its
+    `validation_error`, so the designer can fix it, and a run made from it is blocked.
 - **reconcile**: the actual state is read through SY.admin and compared with the manifest by
   `reconciler.rs`, which is deterministic (no LLM). The result is a delta and build tasks.
+  - The snapshot (`build_actual_state_snapshot`) reads Archi's own hive and every hive the
+    manifest names (topology, nodes, routes, workflows), asking `SY.admin@motherbee` for each
+    one's runtimes, managed node instances (`list_nodes` with `managed: true`: running or not,
+    with their runtime), routes and VPNs, the stored config (`get_node_config`) of each declared
+    node with a declared config, and its workflows when workflows are in scope (the manifest
+    declares one, or an executed version of the solution did, whose hives are read too). The
+    motherbee's hive registry
+    (`list_hives`) says which hives exist: a hive it does not list is one the manifest adds, so it
+    is not read and holds nothing; the reconciler creates it (`HiveCreate`, the first operation, so
+    `add_hive` is the plan's first step) and then what is declared on it. An ingress or egress hive
+    is not asked for runtimes or workflows: it has no runtime manifest and no SY.wf-rules. A hive
+    whose role is not known is asked for everything, and without the registry's answer every hive
+    is read, a hive that does not answer blocking the snapshot.
+  - Each answer is read in the shape its producer sends: a runtime by its `current` version (the
+    motherbee's where hives differ); a node as existing while its config.json does (run_node
+    refuses the name then), its runtime from `runtime.name`, its config unchanged while the stored
+    config holds every declared key, at every level, with the declared value (keys only the node
+    stores, as ai.generic fills in its `behavior`, do not count); a route by its prefix
+    (SY.config.routes keeps one per prefix: another action or next hop is a replace); a VPN rule by
+    its hive and pattern (one rule per pattern: another `vpn_id`, match kind or priority is a
+    replace, `delete_vpn` then `add_vpn`).
+  - VPN rules are declared as SY.config.routes keeps them, in `desired_state.topology.vpns`:
+    `{hive, pattern, vpn_id, match_kind, priority, ownership}`, `vpn_id` a number (u32),
+    `match_kind` EXACT, PREFIX or GLOB (PREFIX when omitted), `priority` 100 when omitted. The
+    manifest is refused with an empty hive or pattern, a pattern over 256 bytes, another match
+    kind, a `vpn_id` that is not a u32, or a pattern repeated on a hive.
+  - The reconcile never removes a node, route or VPN rule a solution stops declaring: SY.orchestrator
+    and SY.config.routes record no owner for them. Workflows and the user policy are removed,
+    because Archi knows which solution deployed them. An extra node, route or VPN rule is removed
+    through SY.admin's API (`kill_node`, `delete_route`, `delete_vpn`).
+  - Workflows: SY.wf-rules lists each one with `current_hash`, the `sha256:` of the definition as
+    it stores it (Go's indented JSON of it); `wf_rules_definition_hash` computes the same hash of
+    the declared definition, and a difference is an update. wf-rules records no owner: a running
+    workflow belongs to the solution whose executed manifest declared exactly that definition last
+    as its own (`ownership: solution`; omitted is external), and only that solution removes it,
+    with `wf_rules_delete`, once it stops declaring it, as with the user policy. A manifest version
+    is executed once a plan made from it ran (`mark_manifest_executed`, a `<version>.executed` file
+    next to it); the versions the designer saves along the way own nothing.
 - **artifact_loop**: a programmer agent builds runtime packages, audited, up to 3 attempts
   (`MAX_ARTIFACT_ATTEMPTS`); files under `/var/lib/fluxbee/state/pipeline/<run_id>/`
   (`artifact_loop.rs`).
 - **plan_compile / plan_validation / confirm2 / execute / verify**: an executor plan, validated
-  by SY.admin, run after the operator's `CONFIRM`, then checked.
+  by SY.admin, run after the operator's `CONFIRM`, then checked. The plan compiler is given the
+  declared user policy, workflow definitions, routes and VPN rules, and the plan's steps are
+  pinned to the manifest afterwards (`pin_plan_steps`): `opa_compile_apply` carries exactly the
+  declared rego, `wf_rules_compile_apply` exactly the declared hive, name and definition (the plan
+  compiler adds only `auto_spawn` and `tenant_id`), the `restart_node` after it that workflow's
+  node, `wf_rules_delete` exactly the workflow its operation names, without `force`, `add_route`
+  and `add_vpn` exactly the declared route or VPN rule, and the `delete_route` / `delete_vpn` of a
+  replace exactly its prefix or pattern. A pinned step loses its `executor_fill`, so SY.admin's
+  executor cannot add a field back.
 - Failures are classified first by rules, then by an LLM if no rule matched
   (`failure_classifier.rs`), and either retried or escalated.
 
@@ -156,7 +211,10 @@ SY.storage writes. It only runs `SELECT`s. The connection URL is the root tenant
 secret in SY.vault, credentials and host only (a URL with a database name is refused); Archi adds
 `fluxbee_storage` itself (`ARCHITECT_MESSAGES_DB_NAME`). Without that secret the routes answer
 503 `messages_db_not_configured`. The list is newest first, default 200 rows, at most 500; the
-stream (`/api/messages/stream`) polls every second.
+stream (`/api/messages/stream`) polls every second. Every row keeps the whole message as the router
+copied it (`turns.message`): the sender, the size and the detail come from it. A message copied
+before routers stamped names (the rows backfilled at 0.1.76) shows the sender's ILK, and a
+resolved destination, which the message carries as null, the destination ILK.
 
 ## Agent assets
 
@@ -171,9 +229,11 @@ skills, handbooks and a personality.
 - Creating an asset does not touch identity. The reply carries the `definition_fragment`
   (`role_hash`, `skill_hashes`, `handbook_hashes`) to apply with `set_ilk_definition` through the
   plan compiler.
-- These files are written on the motherbee's blob root, outside `blob/active`, and Syncthing
-  shares only `blob/active` with workers (`blob_sync_folder_path` in
-  `src/bin/sy_orchestrator.rs`), so an agent on a worker does not get them (FINDINGS A-72).
+- These files are written on the motherbee's blob root, and SY.orchestrator shares
+  `blob/agent-assets/` with the workers, where the agents run (Syncthing folder
+  `fluxbee-dist-agent-assets`, sent by the motherbee only; FINDINGS A-72). An asset is written as
+  `.agent-asset-<sha256>.tmp` in the blob root itself, which is not shared, given mode 0644 and
+  renamed in, so Syncthing never sees a partial file.
 
 ## Package publishing
 
@@ -209,15 +269,20 @@ relative `docs/archi/handbook_fluxbee.md`) and `build_archi_prompt` appends it a
 
 ## Mesh messages
 
-- **System channel**: `NODE_STATUS_GET`, `CONFIG_GET` and `CONFIG_SET` are accepted from
-  `SY.admin`, `SY.config-routes` or `SY.vault` of the same hive, otherwise `FORBIDDEN`
-  (`same_hive_role_allowed`). The node is named `SY.config.routes`, so that entry never matches.
+- **System channel**: `NODE_STATUS_GET`, `CONFIG_GET` and `CONFIG_SET` are answered only to the
+  origins the router admits, checked again against the same system policy
+  (`architect_origin_authorized` → `authorize_system`, `policy/system.rego`): `NODE_STATUS_GET`
+  from SY.admin or SY.vault of the same hive and from SY.orchestrator of any hive, `CONFIG_GET`
+  and `CONFIG_SET` from `SY.admin@motherbee`. Anything else gets `FORBIDDEN`.
   `VAULT_SECRET_CHANGED` is not gated.
 - **Incoming channel**: `user`, `chat` and `text` messages, stored to an impersonation session.
 - **Sends**: `ADMIN_COMMAND` to `SY.admin@<hive>` (reads, SCMD, the executor, `inventory` for
   the status), vault reads, usage records, impersonation messages. Admin timeouts: 120 s for the
-  executor (`JSR_ADMIN_EXECUTOR_TIMEOUT_SECS`), 30 s default (`JSR_ADMIN_ORCH_TIMEOUT_SECS`)
-  (`architect_admin_action_timeout`).
+  executor (`JSR_ADMIN_EXECUTOR_TIMEOUT_SECS`), and 35 min more for each `add_hive` step of the
+  plan it runs, since SY.admin's executor follows each join to its end, for up to 30 min, before
+  the next step; 30 s default (`JSR_ADMIN_ORCH_TIMEOUT_SECS`) (`architect_admin_action_timeout`).
+  While a plan that joins hives runs, the chat's execution hint says so (`execution_hint` on the
+  pending confirmation).
 
 ## State on disk
 
@@ -253,4 +318,5 @@ relative `docs/archi/handbook_fluxbee.md`) and `build_archi_prompt` appends it a
 - [Archi spec](../history/onworking-coa/sy-architect-spec.md): the original design.
 - [Host posture spec](../host-posture-and-exposure-spec-v1.md): why Archi stays on loopback.
 - [Router stream](../router-stream-v1.md): usage records.
-- `lab/logbook/FINDINGS.md`: A-46 (no auth), A-72 (agent assets on workers).
+- `lab/logbook/FINDINGS.md`: A-24 (the snapshot), A-46 (no auth), A-72 (agent assets on
+  workers), A-73 (the read tool).

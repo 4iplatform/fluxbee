@@ -2,12 +2,16 @@
 
 ## 1) Goal
 
-This runbook describes how to deploy and operate `IO.slack` through the canonical Fluxbee path:
+This runbook describes how to deploy and operate `IO.slack` through SY.admin, the path every
+managed node takes (`docs/reference/operations.md`, "Publish runtimes" and "Node lifecycle"):
 
-1. publish the runtime in `dist/`
-2. run `SYSTEM_UPDATE` on the target hive
-3. `SPAWN_NODE` (or a controlled restart of the node)
-4. configure the node's runtime through the control-plane (`CONFIG_GET` / `CONFIG_SET`)
+1. publish the runtime in `dist/`, only for a build the package does not carry (the `.deb` seeds
+   `io.slack` from `packaging/base-nodes.json`)
+2. `POST /hives/{hive}/update` (`SYSTEM_UPDATE`, `category=runtime`) on the target hive
+3. `POST /hives/{hive}/nodes` (`run_node`), or `POST /hives/{hive}/nodes/{node}/restart` for a
+   node that already exists
+4. the Slack tokens in SY.vault, and the node's config through the control plane (`CONFIG_GET` /
+   `CONFIG_SET`)
 
 There is no direct local path for `IO.slack`: the supported deploy is a published
 runtime + an instance managed by the orchestrator.
@@ -18,8 +22,9 @@ runtime + an instance managed by the orchestrator.
 
 - `sy-orchestrator`, `sy-admin`, `rt-gateway` active on the hive.
 - Admin API available (`BASE`, for example `http://127.0.0.1:8080`).
-- `io-slack` binary built or buildable.
-- `scripts/publish-io-runtime.sh` available.
+- An active tenant for the binding: an IO.slack node never runs in the root tenant
+  (`TENANT_ROOT_NOT_ALLOWED`).
+- For a new build: `io-slack` buildable and `scripts/publish-io-runtime.sh`, run on the motherbee.
 
 Suggested variables:
 
@@ -29,6 +34,8 @@ HIVE_ID="motherbee"
 RUNTIME="io.slack"
 VERSION="0.1.0"
 NODE_NAME="IO.slack.T123@$HIVE_ID"
+TENANT_ID="tnt:<uuid>"                 # the tenant the binding works for
+VAULT_KEY="slack:io-slack-t123"        # SY.vault key: [a-z0-9:_-], first character [a-z0-9]
 ```
 
 Current spawn contract in `io-slack`:
@@ -41,6 +48,8 @@ Current spawn contract in `io-slack`:
 
 ## 3) Initial deploy (compliant)
 
+With the version the package seeded, skip steps 1 to 3.
+
 ### Step 1: publish runtime
 
 ```bash
@@ -49,15 +58,20 @@ bash scripts/publish-io-runtime.sh --kind slack --version "$VERSION" --set-curre
 
 Save the output:
 
-- `manifest_version=<...>`
-- `manifest_hash=<...>`
+```bash
+MANIFEST_VERSION=<manifest_version>
+MANIFEST_HASH=<manifest_hash>
+```
 
 ### Step 2: (optional, recommended) sync-hint dist
 
+A worker pulls the new package after the motherbee's Syncthing scans it; a scan on the worker
+pulls nothing. Scan on the motherbee:
+
 ```bash
-curl -sS -X POST "$BASE/hives/$HIVE_ID/sync-hint" \
+curl -sS -X POST "$BASE/hives/motherbee/sync-hint" \
   -H "Content-Type: application/json" \
-  -d '{"channel":"dist","wait_for_idle":true,"timeout_ms":30000}'
+  -d '{"channel":"dist","folder_id":"fluxbee-dist-runtimes","wait_for_idle":true}'
 ```
 
 ### Step 3: SYSTEM_UPDATE runtime
@@ -68,15 +82,19 @@ curl -sS -X POST "$BASE/hives/$HIVE_ID/update" \
   -d "{
     \"category\":\"runtime\",
     \"manifest_version\": $MANIFEST_VERSION,
-    \"manifest_hash\": \"$MANIFEST_HASH\"
+    \"manifest_hash\": \"$MANIFEST_HASH\",
+    \"runtime\": \"$RUNTIME\",
+    \"runtime_version\": \"$VERSION\"
   }"
 ```
 
-It must respond `status=ok` to continue.
+- Repeat while it answers `sync_pending` (HTTP 202); go on at `status=ok`.
+- With `runtime` and `runtime_version`, only this runtime's artifacts must be present on the hive.
+  Without them every runtime of the manifest must be, and one that is missing keeps the answer at
+  `sync_pending` even though `io.slack` itself is in place.
+- The update restarts no node.
 
-### Step 4: SPAWN_NODE of IO.slack
-
-Minimal example with a basic bootstrap:
+### Step 4: launch the node (`run_node`)
 
 ```bash
 curl -sS -X POST "$BASE/hives/$HIVE_ID/nodes" \
@@ -85,17 +103,40 @@ curl -sS -X POST "$BASE/hives/$HIVE_ID/nodes" \
     \"node_name\":\"$NODE_NAME\",
     \"runtime\":\"$RUNTIME\",
     \"runtime_version\":\"current\",
-    \"tenant_id\":\"<TENANT_ID>\",
+    \"tenant_id\":\"$TENANT_ID\",
     \"config\":{
-      \"tenant_id\":\"<TENANT_ID>\"
+      \"slack\":{\"auth\":{\"type\":\"vault_ref\",\"resource_type\":\"slack\",\"key\":\"$VAULT_KEY\"}},
+      \"io\":{\"workspace_id\":\"T123\",\"conversation_id\":\"C456\"}
     }
   }"
 ```
 
 Notes:
 
-- On hives with mandatory identity registration at spawn, `tenant_id` is required.
-- The node can start without working tokens/prompt and stay non-operational (`FAILED_CONFIG` or equivalent) until a valid `CONFIG_SET`.
+- `tenant_id` goes at the top level. The orchestrator registers the node's ILK and launches it.
+- `config` is the object `CONFIG_SET` takes (§5). `slack.auth` names the vault key, never the
+  tokens: inline tokens are refused. `io.workspace_id` and `io.conversation_id` are required;
+  `io.dst_node`, `io.relay.*`, `identity.target` and `identity.timeout_ms` are optional.
+- An existing node answers `NODE_ALREADY_EXISTS`: restart it instead (§4).
+
+### Step 5: the Slack tokens in SY.vault
+
+```bash
+curl -sS -X POST "$BASE/hives/motherbee/vault/secrets" \
+  -H "Content-Type: application/json" \
+  -d "{
+    \"key\":\"$VAULT_KEY\",
+    \"value\":{\"app_token\":\"xapp-...\",\"bot_token\":\"xoxb-...\"},
+    \"metadata\":{\"tenant_id\":\"$TENANT_ID\",\"resource_type\":\"slack\",\"owner_node\":\"$NODE_NAME\"}
+  }"
+```
+
+- SY.vault lives on the motherbee: the call goes to `/hives/motherbee/...` wherever the node runs.
+- `owner_node` makes the secret the node's own. SY.admin resolves it to the node's ILK, so the node
+  must exist first (step 4). Without `owner_node` the secret is general: every node of the tenant
+  can read it.
+- The node reads the key at start, on a `VAULT_SECRET_CHANGED` for it, and every 60 s; until it
+  has the tokens it runs degraded.
 
 ---
 
@@ -103,39 +144,27 @@ Notes:
 
 For code changes, the right flow is not to overwrite `/usr/bin` by hand.
 
-### Recommended sequence
+1. Publish the new version and update the hive (§3, steps 1 to 3, with the new version).
+2. Restart the node through SY.admin:
 
-1. Publish a new runtime version:
+   ```bash
+   curl -sS -X POST "$BASE/hives/$HIVE_ID/nodes/$NODE_NAME/restart"
+   ```
 
-```bash
-NEW_VERSION="0.1.1"
-bash scripts/publish-io-runtime.sh --kind slack --version "$NEW_VERSION" --set-current --sudo
-```
+   The restart recreates the node's unit at the version now `current`, for a node launched with
+   `runtime_version: current`; a node pinned to a version keeps it. Its config, ILK and vault
+   secret stay.
 
-2. Run `SYSTEM_UPDATE` with the new `manifest_version/hash`.
-3. Restart the node's process so it picks up the new runtime:
-   - option A: `KILL_NODE` + `SPAWN_NODE` (recommended, explicit)
-   - option B: if your admin layer exposes a direct restart, use the node restart
-
-Automated shortcut (recommended):
+To start over instead, remove the node:
 
 ```bash
-bash scripts/deploy-io-slack.sh \
-  --base "$BASE" \
-  --hive-id "$HIVE_ID" \
-  --version "$NEW_VERSION" \
-  --node-name "$NODE_NAME" \
-  --update-existing \
-  --sync-hint \
-  --sudo
+curl -sS -X DELETE "$BASE/hives/$HIVE_ID/nodes/$NODE_NAME" \
+  -H "Content-Type: application/json" -d '{"purge_instance":true}'
 ```
 
-`--update-existing` does:
-
-- publish the new runtime
-- update the runtime, with retries on `sync_pending`
-- GET the node's current config
-- kill-first + spawn reusing that config
+That is the full teardown: the node's directory, its ILK and the vault secrets it owns go too, so
+a new node needs §3 steps 4 and 5 again. Without `purge_instance` the `DELETE` only stops the node
+and keeps it down; `POST .../nodes/<node>/start` brings it back with the same config.
 
 ---
 
@@ -168,6 +197,8 @@ curl -sS -X POST \
     "apply_mode":"replace",
     "config":{
       "io":{
+        "workspace_id":"T123",
+        "conversation_id":"C456",
         "dst_node":"AI.chat@motherbee",
         "relay":{
           "window_ms":2500,
@@ -176,10 +207,13 @@ curl -sS -X POST \
           "max_bytes_per_session":262144
         }
       },
-      "slack":{"app_token_ref":"env:SLACK_APP_TOKEN","bot_token_ref":"env:SLACK_BOT_TOKEN"}
+      "slack":{"auth":{"type":"vault_ref","resource_type":"slack","key":"slack:io-slack-t123"}}
     }
   }'
 ```
+
+`replace` replaces the whole config, so the payload carries the required fields too
+(`slack.auth`, `io.workspace_id`, `io.conversation_id`).
 
 How to read `apply` in `CONFIG_RESPONSE`:
 
@@ -241,53 +275,9 @@ How to see it in the canonical runtime:
 - the runtime published by `scripts/publish-io-runtime.sh` already includes a default `RUST_LOG` with `io_common=debug`
 - so, in a canonical deploy, those events should show up in `journalctl`
 
-## 8) Automated script (publish + update + optional spawn)
-
-Added:
-
-- `scripts/deploy-io-slack.sh`
-
-Example (deploy + spawn):
-
-```bash
-bash scripts/deploy-io-slack.sh \
-  --base "$BASE" \
-  --hive-id "$HIVE_ID" \
-  --version "0.1.0" \
-  --node-name "IO.slack.T123@$HIVE_ID" \
-  --tenant-id "<TENANT_ID>" \
-  --app-token "xapp-REPLACE_ME" \
-  --bot-token "xoxb-REPLACE_ME" \
-  --identity-target "SY.identity@$HIVE_ID" \
-  --identity-timeout-ms 10000 \
-  --sync-hint \
-  --kill-first \
-  --sudo
-```
-
-The script:
-
-- parses `manifest_version`/`manifest_hash` from publish,
-- retries `update` if it receives `sync_pending`,
-- logs each step to a file (`/tmp/deploy-io-slack-<ts>.log` by default),
-- supports `--update-existing` to update the code of an existing node, reusing its config.
-- optionally allows continuing even with `sync_pending` through `--allow-sync-pending` (only for test environments with an inconsistent global manifest).
-
-### Note on a permanent `sync_pending`
-
-If `update` stays in `sync_pending` because other runtimes of the manifest are missing (for example `wf.node.status.*.diag`), the `IO.slack` deploy can get blocked even though `IO.slack` was published correctly.
-
-In test environments you can use:
-
-```bash
-bash scripts/deploy-io-slack.sh ... --allow-sync-pending
-```
-
-This lets you continue to `spawn`, but it does not fix the underlying problem of the global manifest.
-
 ---
 
-## 10) `text/v1` contract note (offload > limit)
+## 8) `text/v1` contract note (offload > limit)
 
 In the current state, the size-based offload rule for `text/v1` is centralized in `fluxbee_sdk::NodeSender::send`:
 
@@ -316,7 +306,7 @@ Current outbound state to keep in mind in tests:
 - So very long texts can end up truncated by Slack's limit.
 - Validation of the canonical fallback (file/snippet/chunking) is pending a channel-specific rule.
 
-## 11) Operational note on inbound attachments
+## 9) Operational note on inbound attachments
 
 In the current state, `IO.slack` does not accept just any file Slack delivers.
 

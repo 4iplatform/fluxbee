@@ -555,7 +555,10 @@ converges to the union of the mesh.
 - **Sizes** (`identity_region_limits`), from `hive.yaml` `identity`:
   - `max_ilks` 8192 (`DEFAULT_IDENTITY_SHM_MAX_ILKS`), `max_tenants` 1024, `max_vocabulary` 4096;
   - `max_ilk_aliases` defaults to `max_ilks`;
-  - channels are 4 × `max_ilks`, mappings 2 × channels (`IdentityRegionLimits`).
+  - channels are 4 × `max_ilks`, mappings 2 × channels (`IdentityRegionLimits`);
+  - when the limits change, SY.identity creates the region again at its next start, since readers
+    lay it out from the limits in its header; limits below what the store holds stop the start
+    instead ([shared-memory.md](shared-memory.md) §7).
 - **Updates:**
   - each write applies its deltas incrementally (`apply_identity_shm_deltas`); a lifecycle change
     rebuilds the whole region;

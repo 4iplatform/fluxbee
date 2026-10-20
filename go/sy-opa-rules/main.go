@@ -67,6 +67,8 @@ type OpaConfigPayload struct {
 	Entrypoint string `json:"entrypoint"`
 	// Hash of the published policy, on a "sync" notice ("" = cleared).
 	Hash string `json:"hash,omitempty"`
+	// CheckID names a check; every answer to it echoes the id (SY.admin matches on it).
+	CheckID string `json:"check_id,omitempty"`
 }
 
 type ConfigChangedPayload struct {
@@ -78,16 +80,6 @@ type ConfigChangedPayload struct {
 	// Hive the change is addressed to; empty = every hive. A change addressed to another
 	// hive must not run here.
 	Hive string `json:"hive,omitempty"`
-}
-
-type CompileRequest struct {
-	Rego       string `json:"rego"`
-	Entrypoint string `json:"entrypoint"`
-	Version    uint64 `json:"version"`
-}
-
-type VersionRequest struct {
-	Version uint64 `json:"version"`
 }
 
 type PolicyMetadata struct {
@@ -165,8 +157,6 @@ type Service struct {
 	nodeName           string
 	routerDispatcherMu sync.RWMutex
 	routerDispatcher   *fluxbeesdk.RouterDispatcher
-	lastPeerMu         sync.Mutex
-	lastPeer           string
 	opaRegion          *OpaRegion
 
 	// What get_status reports about this hive's sync. statusMu guards it and is never held across
@@ -672,10 +662,15 @@ func (s *Service) handleMessage(msg fluxbeesdk.Message) {
 			}
 			// Only the primary admin emits CONFIG_CHANGED (protocol), and a policy written here is
 			// published to every hive. The router's gate checks the same (system policy rule 2);
-			// this second check is the command path's rule.
+			// this is the node's own second check.
 			if origin := derefString(msg.Routing.SrcL2Name); origin != fluxbeesdk.PrimaryAdminNode {
 				log.Printf("opa config change from %q refused: accepted only from %s", origin, fluxbeesdk.PrimaryAdminNode)
-				if !strings.EqualFold(payload.Action, "sync") {
+				const detail = "opa config changes are accepted only from " + fluxbeesdk.PrimaryAdminNode
+				switch {
+				case strings.EqualFold(payload.Action, "sync"):
+				case strings.EqualFold(payload.Action, "check"):
+					s.sendCheckError(msg.Routing.Src, payload.Config, "UNAUTHORIZED", detail)
+				default:
 					s.sendSystemMessage(msg.Routing.Src, "CONFIG_RESPONSE", map[string]any{
 						"subsystem":    "opa",
 						"action":       payload.Action,
@@ -683,7 +678,7 @@ func (s *Service) handleMessage(msg fluxbeesdk.Message) {
 						"status":       "error",
 						"hive":         s.hiveID,
 						"error_code":   "UNAUTHORIZED",
-						"error_detail": "opa config changes are accepted only from " + fluxbeesdk.PrimaryAdminNode,
+						"error_detail": detail,
 					})
 				}
 				return
@@ -704,10 +699,8 @@ func (s *Service) handleMessage(msg fluxbeesdk.Message) {
 			if payload.AutoApply != nil {
 				autoApply = *payload.AutoApply
 			}
-			s.handleOpaAction(msg.Routing.Src, payload.Action, payload.Version, payload.Config, autoApply, true)
+			s.handleOpaAction(msg.Routing.Src, payload.Action, payload.Version, payload.Config, autoApply)
 		}
-	case "command":
-		s.handleCommand(msg)
 	case "query":
 		s.handleQuery(msg)
 	}
@@ -819,7 +812,7 @@ func (s *Service) handleNodeConfigSet(msg fluxbeesdk.Message) {
 	}
 	// One write path for the one global policy: SY.admin's /opa/policy*, which applies it on the
 	// motherbee, publishes it and tells every hive. CONFIG_SET here would change and publish the
-	// policy with none of that — and even a "check" stages a policy a later apply would install.
+	// policy with none of that.
 	s.sendNodeConfigResponse(msg, map[string]any{
 		"ok":             false,
 		"node_name":      s.nodeName,
@@ -866,64 +859,6 @@ func derefString(value *string) string {
 	return *value
 }
 
-func (s *Service) handleCommand(msg fluxbeesdk.Message) {
-	action := strings.ToLower(derefString(msg.Meta.Action))
-	// Policy commands change what every router on this hive enforces: only the primary
-	// SY.admin may issue them. src_l2_name is stamped by the router, never the sender.
-	if origin := derefString(msg.Routing.SrcL2Name); origin != fluxbeesdk.PrimaryAdminNode {
-		log.Printf("policy command %s refused from origin %q", action, origin)
-		s.sendCommandResponse(msg, action, map[string]any{
-			"status":       "error",
-			"error_code":   "UNAUTHORIZED",
-			"error_detail": "policy commands are accepted only from " + fluxbeesdk.PrimaryAdminNode,
-		})
-		return
-	}
-	switch action {
-	case "compile_policy":
-		var req CompileRequest
-		if err := json.Unmarshal(msg.Payload, &req); err != nil {
-			s.sendCommandResponse(msg, action, map[string]any{
-				"status":       "error",
-				"error_code":   "COMPILE_ERROR",
-				"error_detail": err.Error(),
-			})
-			return
-		}
-		_, err := s.handleOpaAction(msg.Routing.Src, "compile", req.Version, &OpaConfigPayload{
-			Rego:       req.Rego,
-			Entrypoint: req.Entrypoint,
-		}, false, false)
-		if err != nil {
-			return
-		}
-		s.sendCommandResponse(msg, action, map[string]any{
-			"status":  "ok",
-			"version": req.Version,
-			"staged":  true,
-		})
-	case "apply_policy":
-		var req VersionRequest
-		_ = json.Unmarshal(msg.Payload, &req)
-		_, err := s.handleOpaAction(msg.Routing.Src, "apply", req.Version, nil, false, false)
-		if err != nil {
-			return
-		}
-		s.sendCommandResponse(msg, action, map[string]any{
-			"status":  "ok",
-			"version": req.Version,
-		})
-	case "rollback_policy":
-		_, err := s.handleOpaAction(msg.Routing.Src, "rollback", 0, nil, false, false)
-		if err != nil {
-			return
-		}
-		s.sendCommandResponse(msg, action, map[string]any{
-			"status": "ok",
-		})
-	}
-}
-
 func (s *Service) handleQuery(msg fluxbeesdk.Message) {
 	action := strings.ToLower(derefString(msg.Meta.Action))
 	log.Printf("query received action=%s src=%s", action, msg.Routing.Src)
@@ -945,20 +880,26 @@ func (s *Service) handleQuery(msg fluxbeesdk.Message) {
 	}
 }
 
-func (s *Service) handleOpaAction(src string, action string, version uint64, cfg *OpaConfigPayload, autoApply bool, broadcast bool) (bool, error) {
+// notPrimaryDetail is why a hive other than the motherbee refuses a policy write or check.
+const notPrimaryDetail = "the user policy is compiled and published by " + fluxbeesdk.PrimaryHiveID + " only"
+
+func (s *Service) handleOpaAction(src string, action string, version uint64, cfg *OpaConfigPayload, autoApply bool) (bool, error) {
 	action = strings.ToLower(action)
+	if action == "check" {
+		// A read, not a write: it takes no version and records nothing (checkPolicy).
+		return s.checkPolicy(src, cfg)
+	}
 	// One user policy for every hive: the motherbee compiles, applies and publishes it; the other
 	// hives only install what it publishes (syncFromPublishedPolicy) and never compile.
 	if !s.isPrimary() {
-		return s.respondConfigError(src, action, version, "NOT_PRIMARY",
-			"the user policy is compiled and published by "+fluxbeesdk.PrimaryHiveID+" only", broadcast)
+		return s.respondConfigError(src, action, version, "NOT_PRIMARY", notPrimaryDetail)
 	}
 	s.policyMu.Lock()
 	defer s.policyMu.Unlock()
 	switch action {
-	case "compile", "compile_apply", "check":
+	case "compile", "compile_apply":
 		if cfg == nil || cfg.Rego == "" {
-			return s.respondConfigError(src, action, version, "COMPILE_ERROR", "rego missing", broadcast)
+			return s.respondConfigError(src, action, version, "COMPILE_ERROR", "rego missing")
 		}
 		entrypoint := cfg.Entrypoint
 		if entrypoint == "" {
@@ -966,7 +907,7 @@ func (s *Service) handleOpaAction(src string, action string, version uint64, cfg
 		}
 		wasm, hash, compileMs, err := compileRego(cfg.Rego, entrypoint)
 		if err != nil {
-			return s.respondConfigError(src, action, version, "COMPILE_ERROR", err.Error(), broadcast)
+			return s.respondConfigError(src, action, version, "COMPILE_ERROR", err.Error())
 		}
 		meta := PolicyMetadata{
 			Version:    version,
@@ -976,20 +917,18 @@ func (s *Service) handleOpaAction(src string, action string, version uint64, cfg
 			WasmSize:   len(wasm),
 		}
 		if err := writePolicyFiles(filepath.Join(stateDir, "staged"), wasm, meta, cfg.Rego); err != nil {
-			return s.respondConfigError(src, action, version, "SHM_ERROR", err.Error(), broadcast)
+			return s.respondConfigError(src, action, version, "SHM_ERROR", err.Error())
 		}
-		if action != "check" && (action == "compile_apply" || autoApply) {
+		if action == "compile_apply" || autoApply {
 			if err := s.applyPolicy(version); err != nil {
 				code, detail := classifyOpaError(err)
-				return s.respondConfigError(src, "apply", version, code, detail, broadcast)
+				return s.respondConfigError(src, "apply", version, code, detail)
 			}
 			if err := s.publishPolicy(); err != nil {
-				return s.respondConfigError(src, action, version, "PUBLISH_FAILED", publishFailedDetail(err), broadcast)
+				return s.respondConfigError(src, action, version, "PUBLISH_FAILED", publishFailedDetail(err))
 			}
 		}
-		if broadcast {
-			s.sendConfigResponse(src, action, version, "ok", meta, compileMs)
-		}
+		s.sendConfigResponse(src, action, version, "ok", meta, compileMs)
 		return true, nil
 	case "apply", "rollback", "clear":
 		var err error
@@ -1004,20 +943,73 @@ func (s *Service) handleOpaAction(src string, action string, version uint64, cfg
 		}
 		if err != nil {
 			code, detail := classifyOpaError(err)
-			return s.respondConfigError(src, action, version, code, detail, broadcast)
+			return s.respondConfigError(src, action, version, code, detail)
 		}
 		if err := s.publishPolicy(); err != nil {
-			return s.respondConfigError(src, action, version, "PUBLISH_FAILED", publishFailedDetail(err), broadcast)
+			return s.respondConfigError(src, action, version, "PUBLISH_FAILED", publishFailedDetail(err))
 		}
-		if broadcast {
-			// "version" echoes the request (the admin correlates on it); the hash names the
-			// policy now running ("" after a clear).
-			current, _ := currentPolicy()
-			s.sendConfigResponse(src, action, version, "ok", current, 0)
-		}
+		// "version" echoes the request (the admin correlates on it); the hash names the policy now
+		// running ("" after a clear).
+		current, _ := currentPolicy()
+		s.sendConfigResponse(src, action, version, "ok", current, 0)
 		return true, nil
 	}
 	return false, nil
+}
+
+// checkPolicy compiles cfg.Rego to validate it and answers at once. A check is a read: compileRego
+// works in a scratch directory it removes, and nothing else is touched (not staged/, not the
+// region, not last_error; no version), so a check between a compile and its apply leaves the
+// staged policy alone. Every answer echoes the check_id, which SY.admin matches on.
+func (s *Service) checkPolicy(src string, cfg *OpaConfigPayload) (bool, error) {
+	if !s.isPrimary() {
+		return s.sendCheckError(src, cfg, "NOT_PRIMARY", notPrimaryDetail)
+	}
+	if cfg == nil || cfg.Rego == "" {
+		return s.sendCheckError(src, cfg, "COMPILE_ERROR", "rego missing")
+	}
+	entrypoint := cfg.Entrypoint
+	if entrypoint == "" {
+		entrypoint = defaultEntrypoint
+	}
+	wasm, hash, compileMs, err := compileRego(cfg.Rego, entrypoint)
+	if err != nil {
+		return s.sendCheckError(src, cfg, "COMPILE_ERROR", err.Error())
+	}
+	s.sendCheckResponse(src, cfg, map[string]any{
+		"status":          "ok",
+		"compile_time_ms": compileMs,
+		"wasm_size_bytes": len(wasm),
+		"hash":            hash,
+	})
+	return true, nil
+}
+
+func (s *Service) sendCheckError(src string, cfg *OpaConfigPayload, code, detail string) (bool, error) {
+	s.sendCheckResponse(src, cfg, map[string]any{
+		"status":       "error",
+		"error_code":   code,
+		"error_detail": detail,
+	})
+	return false, errors.New(detail)
+}
+
+// sendCheckResponse answers a check: a CONFIG_RESPONSE that echoes its check_id and has no version.
+func (s *Service) sendCheckResponse(dst string, cfg *OpaConfigPayload, fields map[string]any) {
+	checkID := ""
+	if cfg != nil {
+		checkID = cfg.CheckID
+	}
+	payload := map[string]any{
+		"subsystem": "opa",
+		"action":    "check",
+		"check_id":  checkID,
+		"hive":      s.hiveID,
+	}
+	for key, value := range fields {
+		payload[key] = value
+	}
+	s.sendSystemMessage(dst, "CONFIG_RESPONSE", payload)
 }
 
 func (s *Service) applyPolicy(version uint64) error {
@@ -1107,22 +1099,17 @@ func (s *Service) rollbackPolicy() error {
 	return nil
 }
 
-func (s *Service) respondConfigError(src, action string, version uint64, code, detail string, broadcast bool) (bool, error) {
+func (s *Service) respondConfigError(src, action string, version uint64, code, detail string) (bool, error) {
 	s.setLastError(detail)
-	if broadcast {
-		payload := map[string]any{
-			"subsystem":    "opa",
-			"action":       action,
-			"version":      version,
-			"status":       "error",
-			"hive":         s.hiveID,
-			"error_code":   code,
-			"error_detail": detail,
-		}
-		s.sendSystemMessage(src, "CONFIG_RESPONSE", payload)
-	} else {
-		s.sendCommandError(action, version, code, detail)
-	}
+	s.sendSystemMessage(src, "CONFIG_RESPONSE", map[string]any{
+		"subsystem":    "opa",
+		"action":       action,
+		"version":      version,
+		"status":       "error",
+		"hive":         s.hiveID,
+		"error_code":   code,
+		"error_detail": detail,
+	})
 	return false, errors.New(detail)
 }
 
@@ -1139,34 +1126,6 @@ func (s *Service) sendConfigResponse(dst, action string, version uint64, status 
 	}
 	log.Printf("config response action=%s version=%d hash=%s", action, version, meta.Hash)
 	s.sendSystemMessage(dst, "CONFIG_RESPONSE", payload)
-}
-
-func (s *Service) sendCommandResponse(msg fluxbeesdk.Message, action string, payload map[string]any) {
-	resp, err := fluxbeesdk.BuildCommandResponse(s.nodeUUID.String(), msg.Routing.Src, uuid.New().String(), action, payload)
-	if err != nil {
-		log.Printf("failed to build command response: %v", err)
-		return
-	}
-	s.sendSDK(resp)
-}
-
-func (s *Service) sendCommandError(action string, version uint64, code, detail string) {
-	payload := map[string]any{
-		"status":       "error",
-		"error_code":   code,
-		"error_detail": detail,
-		"version":      version,
-	}
-	dst := s.lastRouterPeer()
-	if dst == "" {
-		return
-	}
-	resp, err := fluxbeesdk.BuildCommandResponse(s.nodeUUID.String(), dst, uuid.New().String(), action, payload)
-	if err != nil {
-		log.Printf("failed to build command error response: %v", err)
-		return
-	}
-	s.sendSDK(resp)
 }
 
 func (s *Service) sendQueryResponse(msg fluxbeesdk.Message, action string, payload map[string]any) {
@@ -1275,20 +1234,9 @@ func (s *Service) runRouter() {
 		log.Fatalf("take incoming receiver: %v", err)
 	}
 	for msg := range incoming {
-		if msg.Routing.Src != "" {
-			s.lastPeerMu.Lock()
-			s.lastPeer = msg.Routing.Src
-			s.lastPeerMu.Unlock()
-		}
 		s.handleMessage(msg)
 	}
 	log.Printf("sy-opa-rules incoming channel closed; exiting router loop")
-}
-
-func (s *Service) lastRouterPeer() string {
-	s.lastPeerMu.Lock()
-	defer s.lastPeerMu.Unlock()
-	return s.lastPeer
 }
 
 func (s *Service) sendSDK(msg fluxbeesdk.Message) {

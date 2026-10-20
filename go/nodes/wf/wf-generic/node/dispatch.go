@@ -3,6 +3,7 @@ package node
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 
@@ -311,30 +312,66 @@ func sendReply(ctx context.Context, orig sdk.Message, replyMsg string, payload a
 	if rt.ActCtx.Dispatcher == nil {
 		return nil
 	}
-	resp, err := sdk.BuildSystemResponse(&orig, rt.NodeUUID, replyMsg, payload, sdk.SystemEnvelopeOptions{})
-	if err != nil {
-		return err
-	}
-	return rt.ActCtx.Dispatcher.SendMsg(resp)
+	return replyOrError(rt, replyMsg, payload, func(payload any) (sdk.Message, error) {
+		return sdk.BuildSystemResponse(&orig, rt.NodeUUID, replyMsg, payload, sdk.SystemEnvelopeOptions{})
+	}, func(detail string) any {
+		return wfErrorPayload("INTERNAL_ERROR", detail)
+	})
 }
 
 func sendNodeConfigResponse(ctx context.Context, orig sdk.Message, payload any, rt *NodeRuntime) error {
 	if rt.ActCtx.Dispatcher == nil {
 		return nil
 	}
-	resp, err := sdk.BuildNodeConfigResponseMessage(&orig, rt.NodeUUID, payload)
-	if err != nil {
+	return replyOrError(rt, sdk.MSGConfigResponse, payload, func(payload any) (sdk.Message, error) {
+		return sdk.BuildNodeConfigResponseMessage(&orig, rt.NodeUUID, payload)
+	}, func(detail string) any {
+		return wfConfigErrorPayload(rt.NodeName, rt.Plane, sdk.ErrCodeInternal, detail)
+	})
+}
+
+// replyOrError sends the reply that build makes of payload. A reply that cannot go (it does not
+// build, or is over the frame limit, say a WF_GET_CODE of a large definition) is answered with the
+// error that errorPayload makes instead, so the requester does not wait out its timeout. Any other
+// send failure (the send queue full during a reconnect, say) gets no error reply: the work may be
+// done, and the requester's timeout reads "unknown, not failed". Every failure is returned, for
+// the receive loop to log.
+func replyOrError(rt *NodeRuntime, name string, payload any, build func(payload any) (sdk.Message, error), errorPayload func(detail string) any) error {
+	// send reports refused when the reply itself cannot go: it does not build, or is too large.
+	send := func(payload any) (refused bool, err error) {
+		resp, err := build(payload)
+		if err != nil {
+			return true, err
+		}
+		err = rt.ActCtx.Dispatcher.SendMsg(resp)
+		var tooLarge *sdk.MessageTooLargeError
+		return errors.As(err, &tooLarge), err
+	}
+	refused, err := send(payload)
+	if err == nil {
+		return nil
+	}
+	err = fmt.Errorf("%s not sent: %w", name, err)
+	if !refused {
 		return err
 	}
-	return rt.ActCtx.Dispatcher.SendMsg(resp)
+	if _, replyErr := send(errorPayload(err.Error())); replyErr != nil {
+		return fmt.Errorf("%w (the error reply was not sent either: %v)", err, replyErr)
+	}
+	return err
 }
 
 func sendErrorReply(ctx context.Context, orig sdk.Message, responseMsg, code, detail string, rt *NodeRuntime) error {
-	return sendReply(ctx, orig, responseMsg, map[string]any{
+	return sendReply(ctx, orig, responseMsg, wfErrorPayload(code, detail), rt)
+}
+
+// wfErrorPayload is how a WF_* control request fails: {ok: false, error: <code>, detail}.
+func wfErrorPayload(code, detail string) map[string]any {
+	return map[string]any{
 		"ok":     false,
 		"error":  code,
 		"detail": detail,
-	}, rt)
+	}
 }
 
 func errorString(err error, fallback string) string {

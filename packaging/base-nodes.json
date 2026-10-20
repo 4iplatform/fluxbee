@@ -2,8 +2,9 @@
   "schema_version": 1,
   "_doc": [
     "Declarative base-node set baked into the from-scratch Fluxbee install.",
-    "Single source of truth read by BOTH packaging/build-deb.sh and scripts/install.sh",
-    "(they must not diverge).",
+    "Single source of truth: packaging/build-deb.sh builds and seeds what it lists, and the",
+    "installed copy (/usr/share/fluxbee/base-nodes.json) is read by fluxbee-seed-runtimes,",
+    "fluxbee-firstboot and fluxbee-factory-reset.",
     "",
     "TO ADD A NODE TO THE INSTALL: add one entry below (and make sure its crate builds).",
     "",

@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -13,7 +14,10 @@ use fluxbee_ai_sdk::{
     FunctionToolDefinition, FunctionToolProvider, FunctionToolRegistry, HiveAiConfig,
     ImmediateConversationMemory, LanceDbThreadStateStore, Message, ModelInputOptions,
     ModelSettings, NodeRuntime, ResolvedModelInput, RuntimeConfig, TenantSource, ThreadStateStore,
-    ThreadStateToolsProvider, UsageRecorder,
+    ThreadStateToolsProvider, ToolRunWatch, UsageRecorder,
+};
+use fluxbee_sdk::managed_control_plane::{
+    build_node_status_response_payload, ControlPlaneErrorInfo, ManagedNodeLifecycleState,
 };
 use fluxbee_sdk::protocol::{
     Destination, Meta, Routing, VaultSecretChangedPayload, VaultSecretInterest, MSG_TTL_EXCEEDED,
@@ -42,8 +46,6 @@ use uuid::Uuid;
 
 const MSG_NODE_STATUS_GET: &str = "NODE_STATUS_GET";
 const MSG_NODE_STATUS_GET_RESPONSE: &str = "NODE_STATUS_GET_RESPONSE";
-const NODE_STATUS_DEFAULT_HANDLER_ENABLED: &str = "NODE_STATUS_DEFAULT_HANDLER_ENABLED";
-const NODE_STATUS_DEFAULT_HEALTH_STATE: &str = "NODE_STATUS_DEFAULT_HEALTH_STATE";
 const IMMEDIATE_INTERACTION_MAX_CHARS: usize = 1_200;
 const FRONTDESK_DEFAULT_SYSTEM_PROMPT: &str = r#"
 You are SY.frontdesk.gov.
@@ -172,30 +174,14 @@ struct NodeSection {
     dynamic_config_dir: String,
 }
 
-/// Runtime defaults materialized into the effective config (`materialize_runtime_defaults`).
-#[derive(Debug)]
-struct RuntimeSection {
-    read_timeout_ms: u64,
-    handler_timeout_ms: u64,
-    write_timeout_ms: u64,
-    queue_capacity: usize,
-    worker_pool_size: usize,
-    retry_max_attempts: usize,
-    retry_initial_backoff_ms: u64,
-    retry_max_backoff_ms: u64,
-    metrics_log_interval_ms: u64,
-    immediate_memory: ImmediateMemorySection,
-}
-
+/// `runtime.immediate_memory`, the only `runtime` part the frontdesk reads (off in its baked
+/// config). Timeouts, workers and queue are the AI runtime's (`RuntimeConfig::default()`).
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 struct ImmediateMemorySection {
     enabled: bool,
     recent_interactions_max: usize,
-    active_operations_max: usize,
     summary_max_chars: usize,
-    summary_refresh_every_turns: usize,
-    trim_noise_enabled: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -245,8 +231,8 @@ struct EffectiveNodeSection {
 struct EffectiveBehaviorSection {
     #[serde(default)]
     kind: String,
-    #[serde(default)]
-    params: Option<EffectiveBehaviorParams>,
+    /// The frontdesk's own prompt (`materialize_effective_defaults`). Nothing sets it from outside:
+    /// the config is baked, and CONFIG_SET refuses every field.
     #[serde(default)]
     instructions: Option<Value>,
     #[serde(default)]
@@ -258,56 +244,10 @@ struct EffectiveBehaviorSection {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
-struct EffectiveBehaviorParams {
-    #[serde(default)]
-    system_prompt: Option<String>,
-    #[serde(default)]
-    temperature: Option<f32>,
-    #[serde(default)]
-    top_p: Option<f32>,
-    #[serde(default)]
-    max_output_tokens: Option<u32>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 struct EffectiveRuntimeSection {
     #[serde(default)]
-    read_timeout_ms: Option<u64>,
-    #[serde(default)]
-    handler_timeout_ms: Option<u64>,
-    #[serde(default)]
-    write_timeout_ms: Option<u64>,
-    #[serde(default)]
-    queue_capacity: Option<usize>,
-    #[serde(default)]
-    worker_pool_size: Option<usize>,
-    #[serde(default)]
-    retry_max_attempts: Option<usize>,
-    #[serde(default)]
-    retry_initial_backoff_ms: Option<u64>,
-    #[serde(default)]
-    retry_max_backoff_ms: Option<u64>,
-    #[serde(default)]
-    metrics_log_interval_ms: Option<u64>,
-    #[serde(default)]
     immediate_memory: Option<ImmediateMemorySection>,
-}
-
-impl Default for RuntimeSection {
-    fn default() -> Self {
-        Self {
-            read_timeout_ms: 30_000,
-            handler_timeout_ms: 60_000,
-            write_timeout_ms: 10_000,
-            queue_capacity: 128,
-            worker_pool_size: 4,
-            retry_max_attempts: 3,
-            retry_initial_backoff_ms: 200,
-            retry_max_backoff_ms: 2_000,
-            metrics_log_interval_ms: 30_000,
-            immediate_memory: ImmediateMemorySection::default(),
-        }
-    }
 }
 
 impl Default for ImmediateMemorySection {
@@ -315,10 +255,7 @@ impl Default for ImmediateMemorySection {
         Self {
             enabled: false,
             recent_interactions_max: 10,
-            active_operations_max: 8,
             summary_max_chars: 1_600,
-            summary_refresh_every_turns: 3,
-            trim_noise_enabled: true,
         }
     }
 }
@@ -693,11 +630,14 @@ struct IlkRegisterTool {
     bridge: Option<Arc<GovIdentityBridge>>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Default)]
 struct BehaviorContext {
     thread_id: Option<String>,
     src_ilk: Option<String>,
     trace_id: Option<String>,
+    /// Whether a tool has run in this message's tool loop (`ToolRunWatch`): a failure after that
+    /// is never answered as retryable, since sending the message again would run the tool again.
+    tool_ran: AtomicBool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -847,22 +787,10 @@ impl ImmediateMemoryStore {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum NodeLifecycleState {
-    Unconfigured,
-    Configured,
-    FailedConfig,
-}
-
-impl NodeLifecycleState {
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::Unconfigured => "UNCONFIGURED",
-            Self::Configured => "CONFIGURED",
-            Self::FailedConfig => "FAILED_CONFIG",
-        }
-    }
-}
+/// The frontdesk's lifecycle is the SDK's managed one: CONFIGURED when its AI key resolves (the
+/// conversation runs), UNCONFIGURED without one, FAILED_CONFIG when its baked AI runtime cannot be
+/// built (a bad hive.yaml `ai` section). The deterministic handoff works in all three.
+type NodeLifecycleState = ManagedNodeLifecycleState;
 
 #[derive(Debug)]
 struct ControlPlaneState {
@@ -871,6 +799,9 @@ struct ControlPlaneState {
     effective_config: Option<Value>,
     schema_version: u32,
     config_version: u64,
+    /// Why the conversation is off: `missing_secret` (UNCONFIGURED) or `invalid_ai_config`
+    /// (FAILED_CONFIG). `None` while CONFIGURED.
+    last_error: Option<ControlPlaneErrorInfo>,
 }
 
 impl Default for ControlPlaneState {
@@ -881,7 +812,28 @@ impl Default for ControlPlaneState {
             effective_config: None,
             schema_version: 0,
             config_version: 0,
+            last_error: None,
         }
+    }
+}
+
+/// UNCONFIGURED: SY.vault has no usable key for the hive's provider.
+fn missing_secret_error(provider: AiProvider) -> ControlPlaneErrorInfo {
+    ControlPlaneErrorInfo {
+        code: "missing_secret".to_string(),
+        message: format!(
+            "AI key not resolved from SY.vault; degraded (the deterministic handoff still works). Load resource_type={provider} in SY.vault."
+        ),
+    }
+}
+
+/// FAILED_CONFIG: the baked AI runtime cannot be built from hive.yaml.
+fn invalid_ai_config_error(reason: &str) -> ControlPlaneErrorInfo {
+    ControlPlaneErrorInfo {
+        code: "invalid_ai_config".to_string(),
+        message: format!(
+            "the AI runtime cannot be built from hive.yaml (the deterministic handoff still works): {reason}"
+        ),
     }
 }
 
@@ -899,6 +851,7 @@ impl AiNode for GenericAiNode {
             thread_id: extract_thread_id(&msg),
             src_ilk: extract_src_ilk(&msg),
             trace_id: Some(msg.routing.trace_id.clone()),
+            tool_ran: AtomicBool::new(false),
         };
         // The human-registration flow has TWO methods, distinguished by the METHOD (not by being a
         // human): the "auto" method arrives as a structured JSON `frontdesk_handoff` and runs
@@ -1114,7 +1067,10 @@ impl AiNode for GenericAiNode {
                                 "AI runtime request failed; replying with provider error payload"
                             );
                         }
-                        let payload = ai_runtime_error_payload(&err);
+                        let payload = ai_chat_failure_payload(
+                            &err,
+                            behavior_ctx.tool_ran.load(Ordering::Relaxed),
+                        );
                         return Ok(Some(build_reply_message_runtime_src(&msg, payload)));
                     }
                 }
@@ -1181,8 +1137,9 @@ impl GenericAiNode {
                 openai,
                 immediate_memory,
             );
+            let watched = ToolRunWatch::new(model.as_ref(), &ctx.tool_ran);
             let result = runner
-                .run_with_input(model.as_ref(), &tool_registry, run_input)
+                .run_with_input(&watched, &tool_registry, run_input)
                 .await?;
             if let Some(text) = result.final_assistant_text {
                 self.persist_immediate_turn(openai, ctx, &input, &text)
@@ -1276,7 +1233,6 @@ impl GenericAiNode {
                 memory_hit = true,
                 recent_interactions = record.recent_interactions.len(),
                 recent_interactions_max = openai.immediate_memory.recent_interactions_max,
-                active_operations_max = openai.immediate_memory.active_operations_max,
                 summary_max_chars = openai.immediate_memory.summary_max_chars,
                 summary_refresh_status = "not_implemented_v1",
                 "immediate memory loaded"
@@ -1289,7 +1245,6 @@ impl GenericAiNode {
                 thread_id = ?ctx.thread_id,
                 memory_hit = false,
                 recent_interactions_max = openai.immediate_memory.recent_interactions_max,
-                active_operations_max = openai.immediate_memory.active_operations_max,
                 summary_max_chars = openai.immediate_memory.summary_max_chars,
                 summary_refresh_status = "not_implemented_v1",
                 "immediate memory loaded"
@@ -1885,11 +1840,14 @@ impl GenericAiNode {
         }
         let provider = self.configured_ai_provider().await;
         let resolved = self.resolve_ai_api_key(provider).await.is_some();
-        self.control_plane.write().await.current_state = if resolved {
-            NodeLifecycleState::Configured
+        let mut state = self.control_plane.write().await;
+        if resolved {
+            state.current_state = NodeLifecycleState::Configured;
+            state.last_error = None;
         } else {
-            NodeLifecycleState::Unconfigured
-        };
+            state.current_state = NodeLifecycleState::Unconfigured;
+            state.last_error = Some(missing_secret_error(provider));
+        }
         resolved
     }
 
@@ -1961,7 +1919,11 @@ impl GenericAiNode {
             return;
         }
         if matches!(payload.op, fluxbee_sdk::protocol::VaultSecretOp::Delete) {
-            self.control_plane.write().await.current_state = NodeLifecycleState::Unconfigured;
+            {
+                let mut state = self.control_plane.write().await;
+                state.current_state = NodeLifecycleState::Unconfigured;
+                state.last_error = Some(missing_secret_error(provider));
+            }
             tracing::warn!(
                 node_name = %self.node_name,
                 trace_id = %msg.routing.trace_id,
@@ -2001,9 +1963,6 @@ impl GenericAiNode {
         };
         let (response_msg, response_payload) = if command.eq_ignore_ascii_case(MSG_NODE_STATUS_GET)
         {
-            if !env_bool(NODE_STATUS_DEFAULT_HANDLER_ENABLED, true) {
-                return Ok(None);
-            }
             (
                 MSG_NODE_STATUS_GET_RESPONSE,
                 self.build_node_status_get_response().await,
@@ -2198,7 +2157,14 @@ impl GenericAiNode {
     }
 
     async fn build_config_get_response(&self) -> Value {
-        let (state_name, config_source, schema_version, config_version, effective_config) = {
+        let (
+            state_name,
+            config_source,
+            schema_version,
+            config_version,
+            effective_config,
+            last_error,
+        ) = {
             let state = self.control_plane.read().await;
             (
                 state.current_state.as_str().to_string(),
@@ -2206,6 +2172,7 @@ impl GenericAiNode {
                 state.schema_version,
                 state.config_version,
                 state.effective_config.clone(),
+                state.last_error.clone(),
             )
         };
         // `ok` reflects the LLM gate (token resolved), NOT config presence: effective_config is always
@@ -2219,10 +2186,11 @@ impl GenericAiNode {
             Some(NodeBehavior::OpenAiChat(rt)) => (rt.provider.to_string(), rt.model.clone()),
             _ => (provider.to_string(), String::new()),
         };
+        // The same reason NODE_STATUS_GET reports: missing_secret or invalid_ai_config.
         let error = if configured {
             Value::Null
         } else {
-            json!({"code":"missing_secret","message":"AI token not resolved from SY.vault; degraded (the deterministic handoff still works). Load resource_type=openai in SY.vault."})
+            json!(last_error)
         };
         json!({
             "subsystem": "ai_node",
@@ -2286,42 +2254,17 @@ impl GenericAiNode {
             "config_source": state.config_source,
             "schema_version": state.schema_version,
             "config_version": state.config_version,
-            "last_error": Value::Null
+            "last_error": state.last_error
         })
     }
 
+    /// The SDK's managed answer: HEALTHY when CONFIGURED; DEGRADED, never ERROR, when the
+    /// conversation is off (no key, or a bad hive.yaml `ai` section), with the reason in
+    /// `last_error`. The deterministic handoff works either way.
     async fn build_node_status_get_response(&self) -> Value {
-        let health_state = std::env::var(NODE_STATUS_DEFAULT_HEALTH_STATE)
-            .ok()
-            .as_deref()
-            .map(normalize_health_state)
-            .unwrap_or("HEALTHY");
-        json!({
-            "status": "ok",
-            "health_state": health_state
-        })
+        let state = self.control_plane.read().await;
+        build_node_status_response_payload(state.current_state, state.last_error.as_ref())
     }
-}
-
-fn normalize_health_state(raw: &str) -> &'static str {
-    match raw.trim().to_ascii_uppercase().as_str() {
-        "HEALTHY" => "HEALTHY",
-        "DEGRADED" => "DEGRADED",
-        "ERROR" => "ERROR",
-        "UNKNOWN" => "UNKNOWN",
-        _ => "HEALTHY",
-    }
-}
-
-fn env_bool(key: &str, default: bool) -> bool {
-    std::env::var(key)
-        .ok()
-        .map(|raw| match raw.trim().to_ascii_lowercase().as_str() {
-            "1" | "true" | "yes" | "on" => true,
-            "0" | "false" | "no" | "off" => false,
-            _ => default,
-        })
-        .unwrap_or(default)
 }
 
 #[async_trait]
@@ -2600,10 +2543,11 @@ async fn run_unconfigured_bootstrap(
             ..EffectiveConfigDocument::default()
         },
     );
-    let (behavior, boot_state) = match build_behavior_from_effective_config(&baked_doc) {
+    let (behavior, boot_state, last_error) = match build_behavior_from_effective_config(&baked_doc)
+    {
         // Behavior baked OK — boot Unconfigured; boot_self_configure flips to Configured when the vault
         // token is present, else stays Unconfigured (degraded: the deterministic handoff still works).
-        Ok(behavior) => (Some(behavior), NodeLifecycleState::Unconfigured),
+        Ok(behavior) => (Some(behavior), NodeLifecycleState::Unconfigured, None),
         // The baked behavior could not be built (e.g. hive.yaml missing/invalid) — a real
         // misconfiguration, so boot FAILED_CONFIG. The deterministic handoff still runs (it is gated
         // before the behavior); the LLM conversational path stays disabled.
@@ -2613,7 +2557,11 @@ async fn run_unconfigured_bootstrap(
                 error = %err,
                 "frontdesk-gov: baked ai_chat behavior could not be built (hive.yaml/engine?); booting FAILED_CONFIG (deterministic handoff still works, LLM path disabled)"
             );
-            (None, NodeLifecycleState::FailedConfig)
+            (
+                None,
+                NodeLifecycleState::FailedConfig,
+                Some(invalid_ai_config_error(&err.to_string())),
+            )
         }
     };
     let state = ControlPlaneState {
@@ -2622,6 +2570,7 @@ async fn run_unconfigured_bootstrap(
         effective_config: Some(serde_json::to_value(&baked_doc).unwrap_or(Value::Null)),
         schema_version: 0,
         config_version: 0,
+        last_error,
     };
 
     let runner_node_config = NodeConfig {
@@ -2907,19 +2856,28 @@ fn extract_openai_api_key_from_value(value: &Value) -> Option<String> {
 
 /// Model D' (cf. `reject_architect_secret_fields`): SY.frontdesk.gov accepts NO config on CONFIG_SET —
 /// its behavior is baked (ai_chat + the frontdesk prompt), its provider/model are hive-wide (hive.yaml),
-/// and its credential lives in SY.vault. Returns the first offending config field, if any.
-fn frontdesk_rejected_config_field(payload: &Value) -> Option<&'static str> {
-    let config = payload.get("config").unwrap_or(payload);
-    if config.get("ai").is_some() || config.get("ai_providers").is_some() {
-        return Some("config.ai / config.ai_providers");
+/// and its credential lives in SY.vault. Every field under `config` is refused (`behavior` with the
+/// prompt, `runtime`, any other); an empty `config` is the vault re-resolve trigger. Without the
+/// `config` wrapper, the known fields are looked for next to the request's own. Returns the first
+/// offending field, if any.
+fn frontdesk_rejected_config_field(payload: &Value) -> Option<String> {
+    match payload.get("config") {
+        Some(config) => config
+            .as_object()
+            .and_then(|config| config.keys().next())
+            .map(|key| format!("config.{key}")),
+        None => [
+            "ai",
+            "ai_providers",
+            "behavior",
+            "runtime",
+            "api_key",
+            "api_key_ref",
+        ]
+        .into_iter()
+        .find(|key| payload.get(*key).is_some())
+        .map(|key| format!("config.{key}")),
     }
-    if config.get("behavior").is_some() {
-        return Some("config.behavior");
-    }
-    if config.get("api_key").is_some() || config.get("api_key_ref").is_some() {
-        return Some("config.api_key");
-    }
-    None
 }
 
 fn materialize_effective_defaults(
@@ -2958,36 +2916,8 @@ fn materialize_effective_defaults(
 }
 
 fn materialize_runtime_defaults(runtime: &mut EffectiveRuntimeSection) {
-    let defaults = RuntimeSection::default();
-    if runtime.read_timeout_ms.is_none() {
-        runtime.read_timeout_ms = Some(defaults.read_timeout_ms);
-    }
-    if runtime.handler_timeout_ms.is_none() {
-        runtime.handler_timeout_ms = Some(defaults.handler_timeout_ms);
-    }
-    if runtime.write_timeout_ms.is_none() {
-        runtime.write_timeout_ms = Some(defaults.write_timeout_ms);
-    }
-    if runtime.queue_capacity.is_none() {
-        runtime.queue_capacity = Some(defaults.queue_capacity);
-    }
-    if runtime.worker_pool_size.is_none() {
-        runtime.worker_pool_size = Some(defaults.worker_pool_size);
-    }
-    if runtime.retry_max_attempts.is_none() {
-        runtime.retry_max_attempts = Some(defaults.retry_max_attempts);
-    }
-    if runtime.retry_initial_backoff_ms.is_none() {
-        runtime.retry_initial_backoff_ms = Some(defaults.retry_initial_backoff_ms);
-    }
-    if runtime.retry_max_backoff_ms.is_none() {
-        runtime.retry_max_backoff_ms = Some(defaults.retry_max_backoff_ms);
-    }
-    if runtime.metrics_log_interval_ms.is_none() {
-        runtime.metrics_log_interval_ms = Some(defaults.metrics_log_interval_ms);
-    }
     if runtime.immediate_memory.is_none() {
-        runtime.immediate_memory = Some(defaults.immediate_memory);
+        runtime.immediate_memory = Some(ImmediateMemorySection::default());
     }
 }
 
@@ -3040,41 +2970,28 @@ fn node_not_configured_payload(state: NodeLifecycleState) -> Value {
 fn extract_instructions_from_effective_config(
     behavior: &EffectiveBehaviorSection,
 ) -> Option<String> {
-    behavior
-        .instructions
-        .as_ref()
-        .and_then(|v| {
-            if let Some(inline) = v.as_str() {
-                return Some(inline.to_string());
-            }
-            v.get("value")
-                .and_then(Value::as_str)
-                .map(ToString::to_string)
-        })
-        .or_else(|| {
-            behavior
-                .params
-                .as_ref()
-                .and_then(|p| p.system_prompt.clone())
-        })
+    behavior.instructions.as_ref().and_then(|v| {
+        if let Some(inline) = v.as_str() {
+            return Some(inline.to_string());
+        }
+        v.get("value")
+            .and_then(Value::as_str)
+            .map(ToString::to_string)
+    })
 }
 
 fn extract_model_settings_from_effective_config(
     behavior: &EffectiveBehaviorSection,
 ) -> ModelSettings {
-    let direct = behavior.model_settings.as_ref();
-    let params = behavior.params.as_ref();
-    ModelSettings {
-        temperature: direct
-            .and_then(|v| v.temperature)
-            .or_else(|| params.and_then(|v| v.temperature)),
-        top_p: direct
-            .and_then(|v| v.top_p)
-            .or_else(|| params.and_then(|v| v.top_p)),
-        max_output_tokens: direct
-            .and_then(|v| v.max_output_tokens)
-            .or_else(|| params.and_then(|v| v.max_output_tokens)),
-    }
+    behavior
+        .model_settings
+        .as_ref()
+        .map(|settings| ModelSettings {
+            temperature: settings.temperature,
+            top_p: settings.top_p,
+            max_output_tokens: settings.max_output_tokens,
+        })
+        .unwrap_or_default()
 }
 
 fn node_runtime_not_ready_payload() -> Value {
@@ -3095,6 +3012,17 @@ fn missing_ai_api_key_payload(provider: AiProvider) -> Value {
     })
 }
 
+/// What the sender gets for a failed AI run. Once a tool has run, no failure is `retryable`
+/// (`provider_timeout` on a later turn included): sending the same message again would run that
+/// tool again.
+fn ai_chat_failure_payload(err: &fluxbee_ai_sdk::errors::AiSdkError, tool_ran: bool) -> Value {
+    let mut payload = ai_runtime_error_payload(err);
+    if tool_ran {
+        payload["retryable"] = Value::Bool(false);
+    }
+    payload
+}
+
 fn ai_runtime_error_payload(err: &fluxbee_ai_sdk::errors::AiSdkError) -> Value {
     match err {
         fluxbee_ai_sdk::errors::AiSdkError::Http(http_err)
@@ -3113,6 +3041,15 @@ fn ai_runtime_error_payload(err: &fluxbee_ai_sdk::errors::AiSdkError) -> Value {
             "code": "provider_timeout",
             "message": "The AI provider did not respond in time. Please retry.",
             "retryable": true
+        }),
+        // Either provider, with ai.generic's code: the answer was billed and cut, so the same
+        // request gets the same cut. The frontdesk's token limit is baked, so there is nothing to
+        // raise.
+        _ if err.is_truncated_answer() => json!({
+            "type": "error",
+            "code": "provider_output_truncated",
+            "message": "The AI's answer hit its token limit and was cut.",
+            "retryable": false
         }),
         fluxbee_ai_sdk::errors::AiSdkError::Protocol(msg) => {
             if let Some((status, detail)) = parse_openai_status_error(msg) {
@@ -3798,63 +3735,57 @@ mod tests {
             gov_identity_bridge: None,
             ilk_tenant: test_ilk_tenant(),
             vault: None,
-            control_plane: Arc::new(RwLock::new(ControlPlaneState {
-                current_state: NodeLifecycleState::Unconfigured,
-                config_source: "none",
-                effective_config: None,
-                schema_version: 0,
-                config_version: 0,
-            })),
+            control_plane: Arc::new(RwLock::new(ControlPlaneState::default())),
             usage: UsageRecorder::disabled(),
         }
     }
 
+    /// Health follows the AI gate: HEALTHY only when the conversation can run; DEGRADED, never
+    /// ERROR, without a key or with a bad hive.yaml `ai` section, and the reason in `last_error`.
     #[tokio::test]
-    async fn node_status_get_respects_handler_enabled_env_false() {
-        let _guard = env_lock().lock().expect("env lock");
-        std::env::set_var(NODE_STATUS_DEFAULT_HANDLER_ENABLED, "false");
-        std::env::remove_var(NODE_STATUS_DEFAULT_HEALTH_STATE);
+    async fn node_status_get_health_follows_the_ai_gate() {
         let node = test_node();
-        let req = sample_request();
-        let response = node
-            .handle_control_plane(req)
-            .await
-            .expect("control-plane should not fail");
-        assert!(response.is_none());
-        std::env::remove_var(NODE_STATUS_DEFAULT_HANDLER_ENABLED);
-    }
+        let status = |response: Option<Message>| response.expect("status response").payload;
 
-    #[tokio::test]
-    async fn node_status_get_uses_env_health_state_and_falls_back_to_healthy() {
-        let _guard = env_lock().lock().expect("env lock");
-        std::env::set_var(NODE_STATUS_DEFAULT_HANDLER_ENABLED, "true");
-        let node = test_node();
-        let req = sample_request();
-
-        std::env::set_var(NODE_STATUS_DEFAULT_HEALTH_STATE, "DEGRADED");
-        let degraded = node
-            .handle_control_plane(req.clone())
-            .await
-            .expect("control-plane should not fail")
-            .expect("status response should exist");
-        assert_eq!(
-            degraded.payload.get("health_state").and_then(Value::as_str),
-            Some("DEGRADED")
+        // No key in SY.vault: the gate stays closed (test_node has no vault client).
+        *node.behavior.write().await = Some(NodeBehavior::Echo);
+        assert!(!node.refresh_ai_gate().await);
+        let no_key = status(
+            node.handle_control_plane(sample_request())
+                .await
+                .expect("control plane"),
         );
+        assert_eq!(no_key["health_state"], json!("DEGRADED"));
+        assert_eq!(no_key["lifecycle_state"], json!("UNCONFIGURED"));
+        assert_eq!(no_key["last_error"]["code"], json!("missing_secret"));
 
-        std::env::set_var(NODE_STATUS_DEFAULT_HEALTH_STATE, "not-a-valid-state");
-        let fallback = node
-            .handle_control_plane(req)
-            .await
-            .expect("control-plane should not fail")
-            .expect("status response should exist");
-        assert_eq!(
-            fallback.payload.get("health_state").and_then(Value::as_str),
-            Some("HEALTHY")
+        {
+            let mut state = node.control_plane.write().await;
+            state.current_state = NodeLifecycleState::FailedConfig;
+            state.last_error = Some(invalid_ai_config_error("invalid ai section"));
+        }
+        let bad_hive = status(
+            node.handle_control_plane(sample_request())
+                .await
+                .expect("control plane"),
         );
+        assert_eq!(bad_hive["health_state"], json!("DEGRADED"));
+        assert_eq!(bad_hive["lifecycle_state"], json!("FAILED_CONFIG"));
+        assert_eq!(bad_hive["last_error"]["code"], json!("invalid_ai_config"));
 
-        std::env::remove_var(NODE_STATUS_DEFAULT_HEALTH_STATE);
-        std::env::remove_var(NODE_STATUS_DEFAULT_HANDLER_ENABLED);
+        {
+            let mut state = node.control_plane.write().await;
+            state.current_state = NodeLifecycleState::Configured;
+            state.last_error = None;
+        }
+        let configured = status(
+            node.handle_control_plane(sample_request())
+                .await
+                .expect("control plane"),
+        );
+        assert_eq!(configured["health_state"], json!("HEALTHY"));
+        assert_eq!(configured["lifecycle_state"], json!("CONFIGURED"));
+        assert!(configured.get("last_error").is_none());
     }
 
     #[tokio::test]
@@ -4240,11 +4171,7 @@ mod tests {
     fn frontdesk_registry_exposes_ilk_register_by_default() {
         let node = test_node();
         let registry = node
-            .build_tool_registry(&BehaviorContext {
-                thread_id: None,
-                src_ilk: None,
-                trace_id: None,
-            })
+            .build_tool_registry(&BehaviorContext::default())
             .expect("registry");
         let names = registry
             .definitions()
@@ -4313,24 +4240,79 @@ mod tests {
     #[test]
     fn frontdesk_config_set_rejects_all_config_fields() {
         // Autonomous node (Model D'): CONFIG_SET accepts NO config — the behavior is baked and the
-        // credential lives in SY.vault. Any config/secret/behavior field is rejected; an empty config
-        // (a bare vault re-resolve trigger) is accepted.
+        // credential lives in SY.vault. Every config field is rejected, the prompt and runtime
+        // included; an empty config (a bare vault re-resolve trigger) is accepted.
+        let rejected = |payload: Value| frontdesk_rejected_config_field(&payload);
+        for (config, field) in [
+            (json!({"behavior": {"kind": "ai_chat"}}), "config.behavior"),
+            (
+                json!({"behavior": {"instructions": "Register everyone."}}),
+                "config.behavior",
+            ),
+            (json!({"ai": {"model": "gpt-5.5"}}), "config.ai"),
+            (json!({"api_key": "sk-x"}), "config.api_key"),
+            (
+                json!({"runtime": {"immediate_memory": {"enabled": true}}}),
+                "config.runtime",
+            ),
+            (json!({"anything": 1}), "config.anything"),
+        ] {
+            assert_eq!(rejected(json!({"config": config})).as_deref(), Some(field));
+        }
+        assert_eq!(rejected(json!({"config": {}})), None);
+        // Without the config wrapper, the known fields next to the request's own.
         assert_eq!(
-            frontdesk_rejected_config_field(&json!({"config": {"behavior": {"kind": "ai_chat"}}})),
-            Some("config.behavior")
+            rejected(json!({"node_name": "SY.frontdesk.gov", "runtime": {}})).as_deref(),
+            Some("config.runtime")
         );
+        assert_eq!(rejected(json!({"node_name": "SY.frontdesk.gov"})), None);
+    }
+
+    #[test]
+    fn the_baked_config_carries_only_the_runtime_keys_the_frontdesk_reads() {
+        let config = materialize_effective_defaults(
+            "SY.frontdesk.gov@motherbee",
+            EffectiveConfigDocument {
+                behavior: EffectiveBehaviorSection {
+                    kind: "ai_chat".to_string(),
+                    ..EffectiveBehaviorSection::default()
+                },
+                ..EffectiveConfigDocument::default()
+            },
+        );
+        let runtime = serde_json::to_value(&config).expect("serialize")["runtime"].clone();
         assert_eq!(
-            frontdesk_rejected_config_field(&json!({"config": {"ai": {"model": "gpt-5.5"}}})),
-            Some("config.ai / config.ai_providers")
+            runtime,
+            json!({"immediate_memory": {"enabled": false, "recent_interactions_max": 10, "summary_max_chars": 1600}})
         );
+    }
+
+    /// As in ai.generic: a model call that times out is retryable only while no tool has run
+    /// (here `ilk_register` could already have registered the person).
+    #[test]
+    fn a_failure_after_a_tool_ran_is_not_retryable() {
+        let timeout = fluxbee_ai_sdk::errors::AiSdkError::Timeout("model call".to_string());
         assert_eq!(
-            frontdesk_rejected_config_field(&json!({"config": {"api_key": "sk-x"}})),
-            Some("config.api_key")
+            ai_chat_failure_payload(&timeout, false)["retryable"],
+            json!(true)
         );
-        assert_eq!(
-            frontdesk_rejected_config_field(&json!({"config": {}})),
-            None
-        );
+        let after = ai_chat_failure_payload(&timeout, true);
+        assert_eq!(after["code"], json!("provider_timeout"));
+        assert_eq!(after["retryable"], json!(false));
+    }
+
+    #[test]
+    fn a_cut_answer_has_the_same_error_code_as_in_ai_generic() {
+        for message in [
+            "openai response truncated: hit max_output_tokens (raise model_settings.max_output_tokens)",
+            "anthropic response truncated: hit max_tokens (raise model_settings.max_output_tokens)",
+        ] {
+            let payload = ai_runtime_error_payload(&fluxbee_ai_sdk::errors::AiSdkError::Protocol(
+                message.to_string(),
+            ));
+            assert_eq!(payload["code"], json!("provider_output_truncated"), "{message}");
+            assert_eq!(payload["retryable"], json!(false));
+        }
     }
 
     #[test]

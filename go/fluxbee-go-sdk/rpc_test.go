@@ -31,6 +31,25 @@ func TestBuildSystemRequestDefaultsActionToVerb(t *testing.T) {
 	}
 }
 
+// BuildSystemRequest turns a zero ttl into 1: the SY.timer requests stay on
+// the local router. SendSystemRPC sets its own default (16) before calling it.
+func TestBuildSystemRequestTurnsZeroTTLIntoOne(t *testing.T) {
+	msg, err := BuildSystemRequest(
+		"src-1",
+		"SY.timer@motherbee",
+		"TIMER_NOW",
+		map[string]any{},
+		"trace-1",
+		SystemEnvelopeOptions{},
+	)
+	if err != nil {
+		t.Fatalf("build system request: %v", err)
+	}
+	if msg.Routing.TTL != 1 {
+		t.Fatalf("ttl = %d, want 1", msg.Routing.TTL)
+	}
+}
+
 func TestBuildSystemResponseKeepsTraceAndRepliesToSource(t *testing.T) {
 	request, err := BuildSystemRequest(
 		"src-1",

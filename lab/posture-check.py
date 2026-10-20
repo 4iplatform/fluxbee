@@ -48,7 +48,7 @@ PRIMARY = "motherbee"
 # The folders the motherbee shares with each spoke role (an oracle, kept independent of the code).
 ROLE_FOLDERS = {
     "worker": {"fluxbee-blob", "fluxbee-dist-core-worker", "fluxbee-dist-vendor",
-               "fluxbee-dist-policy", "fluxbee-dist-runtimes"},
+               "fluxbee-dist-policy", "fluxbee-dist-runtimes", "fluxbee-dist-agent-assets"},
     "ingress": {"fluxbee-blob-public", "fluxbee-dist-core-ingress", "fluxbee-dist-vendor",
                 "fluxbee-dist-policy"},
     "egress": {"fluxbee-dist-core-egress", "fluxbee-dist-vendor", "fluxbee-dist-policy"},

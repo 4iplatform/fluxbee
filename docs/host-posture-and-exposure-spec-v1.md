@@ -871,6 +871,14 @@ says so.
 
 ### 3.8 A-48 — `remove_hive` revokes the hive
 
+> **Superseded (0.1.81, operator's decision of 2026-10-19).** What shipped is smaller: the hive
+> registry (`/var/lib/fluxbee/hives/<id>/`) is the one list; the motherbee's router rejects a hive
+> it does not list (`HIVE_NOT_REGISTERED`) and closes a removed hive's session within ~10 s;
+> `remove_hive` deletes the hive's identity key and a boot sweep deletes keys with no registry
+> entry; `wan.authorized_hives` is gone. Leaves are still not pinned: a removed box that kept its
+> leaf is admitted again if a hive with the same id is added later. The design below stays as the
+> record of the fuller option.
+
 **The router's view.** The motherbee orchestrator builds `/var/lib/fluxbee/state/router-hives.json`
 from the registry, under one global lock, and writes it atomically. It is a pure function of the
 registry, rendered deterministically (sorted, no timestamps), so it can be compared byte for byte.

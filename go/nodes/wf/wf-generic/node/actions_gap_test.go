@@ -3,6 +3,7 @@ package node
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"testing"
 
@@ -31,9 +32,11 @@ func TestExecuteActionsFailFastPolicy(t *testing.T) {
 	inst.executeActionsBestEffort(context.Background(), actions, msgWithName("GO"), actx, &emitted) // must not be fatal
 }
 
-// flakyDispatcher fails its first failFirst SendMsg calls (transient backpressure) then succeeds.
+// flakyDispatcher fails its first failFirst SendMsg calls (transient backpressure, or err when set)
+// then succeeds.
 type flakyDispatcher struct {
 	failFirst int
+	err       error
 	calls     int
 	sent      []sdk.Message
 }
@@ -41,6 +44,9 @@ type flakyDispatcher struct {
 func (m *flakyDispatcher) SendMsg(msg sdk.Message) error {
 	m.calls++
 	if m.calls <= m.failFirst {
+		if m.err != nil {
+			return m.err
+		}
 		return fmt.Errorf("sender queue full")
 	}
 	m.sent = append(m.sent, msg)
@@ -64,6 +70,24 @@ func TestSendMessageRetriesTransientQueueFull(t *testing.T) {
 	}
 	if disp.calls != sendMaxAttempts {
 		t.Fatalf("expected %d attempts, got %d", sendMaxAttempts, disp.calls)
+	}
+}
+
+// A-75: a message over the frame limit is refused the same way every time, so send_message fails
+// at once instead of retrying it.
+func TestSendMessageDoesNotRetryAnOversizeFrame(t *testing.T) {
+	disp := &flakyDispatcher{failFirst: sendMaxAttempts, err: &sdk.MessageTooLargeError{Size: 200 * 1024, Max: 128 * 1024}}
+	s := openTestStore(t)
+	actx := ActionContext{Store: s, Dispatcher: disp, Timer: &mockTimerSender{}, Clock: fixedClock}
+	inst := &WFInstance{InstanceID: "wfi:r3", Input: map[string]any{}, StateVars: map[string]any{}}
+	action := ActionDefinition{Type: "send_message", Target: "AI.host@motherbee", Meta: &ActionMeta{Msg: "ask", Type: "system"}, Payload: map[string]any{}}
+	err := execSendMessage(context.Background(), action, inst, msgWithName("GO"), actx)
+	var tooLarge *sdk.MessageTooLargeError
+	if !errors.As(err, &tooLarge) {
+		t.Fatalf("expected the oversize error, got %v", err)
+	}
+	if disp.calls != 1 {
+		t.Fatalf("expected 1 attempt, got %d", disp.calls)
 	}
 }
 

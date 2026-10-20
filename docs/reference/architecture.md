@@ -300,10 +300,15 @@ seqlock (`src/shm/mod.rs`).
 The router refreshes its region's heartbeat every 5 s. A sibling region whose heartbeat is older
 than 30 s is ignored (`HEARTBEAT_STALE_MS`).
 
-### 4.2 One router per hive, or several
+### 4.2 One router per hive
 
-In practice a hive runs one router, `RT.gateway@<hive>`: the package ships one `rt-gateway` unit and
-the orchestrator starts only that one. The code supports more routers on one host:
+One router per hive, `RT.gateway@<hive>`, is the supported topology. Nothing supported starts a
+second one: the package ships one `rt-gateway` unit (`UNITS` in `packaging/build-deb.sh`), the
+orchestrator starts and watches only that unit (`bootstrap_local`, `watchdog_tick`), and SY.admin
+refuses `add_router` and `delete_router` (`resolve_internal_action_spec`).
+
+The code still has a mode with several routers on one host. It is not supported, and its known
+defects are not being fixed ([routing-and-policy.md](routing-and-policy.md) §10). How it works:
 
 - `JSR_ROUTER_NAME` names a router; without it the name is `wan.gateway_name` (default
   `RT.gateway`), and the router with that name is the gateway (`is_gateway_name` in
@@ -338,8 +343,10 @@ What the stream carries is in §8.
 ### 5.1 WAN: 9000/tcp with mutual TLS
 
 The motherbee's gateway listens (`wan.listen: "0.0.0.0:9000"` in `packaging/hive.yaml.example`).
-Each spoke's gateway dials it (`wan.uplinks`, written by `add_hive`) and retries from 5 s up to 60 s
-(`wan_connect_loop`). The `hive.yaml` that `add_hive` writes has no `wan.listen`.
+Each spoke's gateway dials it (`wan.uplinks`, written by `add_hive`). After a link that got past
+`WAN_ACCEPT` ends it dials again in 5 s; an attempt that never got there, a rejected one included,
+is retried after 5 s doubling up to 60 s (`wan_connect_loop`, `UplinkRetry`). The `hive.yaml` that
+`add_hive` writes has no `wan.listen`.
 
 `wan.mtls` sets the transport (`src/config/mod.rs`; applied in `Router::run` and
 `accept_wan_connection`):
@@ -359,9 +366,14 @@ The motherbee's orchestrator keeps a dedicated mesh CA in `/var/lib/fluxbee/tls/
 The handshake (`handle_wan_connection`): under TLS, each side first checks that the other's
 certificate chains to the mesh CA. Both sides send `HELLO` (`protocol`, `router_id`, `router_name`,
 `hive_id`, timers). A `HELLO` whose `hive_id` differs from the hive in the peer's certificate is
-refused; when `wan.authorized_hives` is set, a hive missing from it gets `WAN_REJECT`
-(`HIVE_NOT_AUTHORIZED`). A different `protocol` (`MESH_PROTOCOL_VERSION`, `fluxbee/1.16`) is only
-logged. Then come `WAN_ACCEPT` and each side's LSA.
+refused. The motherbee then admits the hive only while its registry lists it, the directory
+`/var/lib/fluxbee/hives/<hive_id>/` that the orchestrator creates when it accepts a join and that
+`remove_hive` deletes after the hive's cleanup; any other gets `WAN_REJECT`
+(`HIVE_NOT_REGISTERED`). An admitted session looks again every 10 s and closes once the directory
+is gone, so a removed hive loses its link even with a valid certificate (`wan_peer_admission`,
+`hive_unregistered`; A-48). Spokes keep no registry. A different `protocol`
+(`MESH_PROTOCOL_VERSION`, `fluxbee/1.16`) is only logged. Then come `WAN_ACCEPT` and each side's
+LSA.
 
 A sender name learned from peer hive P is always rewritten to `<local name>@P`
 (`canonical_wan_src_name`), so a hive can only speak as its own nodes: no spoke can pose as
@@ -414,6 +426,7 @@ Each spoke pairs with the motherbee only. The folders (`reconcile_syncthing_peer
 | `fluxbee-dist-vendor` | `dist/vendor/` | motherbee send-only, spoke receive-only | every spoke |
 | `fluxbee-dist-policy` | `dist/policy/` | motherbee send-only, spoke receive-only | every spoke |
 | `fluxbee-dist-runtimes` | `dist/runtimes/` | motherbee send-only, spoke receive-only | workers |
+| `fluxbee-dist-agent-assets` | `blob/agent-assets/` | motherbee send-only, spoke receive-only | workers |
 | `fluxbee-blob` | `blob/active/` | both ways | workers |
 | `fluxbee-blob-public` | `blob/public/` | motherbee send-only, ingress receive-only | ingress |
 
@@ -565,14 +578,16 @@ only from SY.admin and SY.architect (`handle_put` and its siblings in `src/bin/s
 
 Nodes and routers inside a hive talk over Unix sockets and shared memory, never TCP. Where ufw or
 firewalld is installed, the orchestrator opens the WAN port, 9100/tcp on the motherbee
-(`ensure_core_firewall_local`), and 22000/tcp, 22000/udp and 21027/udp for Syncthing
-(`syncthing_firewall_rules`), though after the stage-3 switch Syncthing uses TCP only. On an egress
+(`ensure_core_firewall_local`), and 22000/tcp for Syncthing on the motherbee only
+(`syncthing_firewall_rules`): every Syncthing link is TCP and a spoke only dials. On an egress
 hive nftables owns inbound traffic instead (`inet fluxbee_egress`, `reconcile_egress_nat`).
 
 ## 10. Limits to know
 
 - The WAN accepts any leaf the mesh CA signed and binds it to the hive id it carries; there is no
-  revocation list and no pinning (`MeshTlsMaterial::server_config`, `tls_accept`).
+  revocation list and no pinning (`MeshTlsMaterial::server_config`, `tls_accept`). The motherbee's
+  hive registry (§5.1) stands in for revocation: a removed hive's leaf stays valid, but the hive is
+  no longer admitted.
 - Rule 3 of the system policy has no direction: any hive's orchestrator, the ingress's included, may
   send those actions to any hive (comment above `orchestrator_actions` in `policy/system.rego`).
 - Hub-vouched reachability exists only on a spoke's gateway router, so a frame relayed spoke to

@@ -130,8 +130,8 @@ Required sequence:
    the separately captured bearer to the operator.
 
 Do not generate `listen`, `auth.api_keys`, `integrations`, webhook, multipart or attachment config.
-Do not place tenant or `dst_node` in the public request. The full contract is
-`docs/io/io-api-node-spec.md`; the operational helper is `scripts/deploy-io-api.sh`.
+Do not place tenant or `dst_node` in the public request. The full contract and the operational
+flow are in `docs/io/io-api-node-spec.md` (§10).
 
 ---
 
@@ -169,8 +169,11 @@ Use when the work is conversational, interpretive, or agentic.
 Every AI node is an instance of the `ai.generic` runtime; there is no other AI runtime, and no AI
 node boots with the base install. To make one:
 - `run_node` with `runtime: ai.generic` and the node's tenant;
-- `CONFIG_SET` its behavior: `behavior.kind: ai_chat`, `model`, and instructions;
-- give it a role, skills and handbook with `set_ilk_definition` on its ILK.
+- `CONFIG_SET` its operational config: `behavior.kind: ai_chat` and `model`. It carries no prompt:
+  `CONFIG_SET` refuses `instructions`;
+- give it its behavior through its ILK definition: a role, skills, handbooks and optionally a
+  personality, created as agent assets and set with `set_ilk_definition` on its ILK (§8.1.2). The
+  ILK definition is the agent's only prompt source.
 
 The node does not name a Vault key: it uses the AI provider key SY.vault gives it (resource_type
 `openai` or `anthropic`): one it owns, one assigned to it, or its tenant's general one (no owner, no
@@ -181,9 +184,13 @@ assigned node). The root tenant's keys are the core's; a tenant's node never fal
 Use when the behavior is deterministic, step-based, branched, or must coordinate several nodes.
 
 Prefer:
-- `wf.engine` only as the base runtime for workflow packages, not as the `run_node` runtime for a `WF.*` node
-- concrete workflow runtimes such as `wf.invoice` or `wf.sales` for actual `WF.*` node instances
+- a workflow declared in `wf_deployments` (deployed with `wf_rules_compile_apply`): SY.wf-rules
+  packages it and creates and runs its `WF.<workflow_name>@<hive>` node; never declare that node in
+  `nodes` nor `run_node` it (a manifest that declares a `WF.*` node is refused)
 - `wf_deployments` / `wf_rules_compile_apply` when the operator is really asking for business choreography, fan-out, ordered delivery, retry semantics, or dispatch logic
+
+A workflow runs where SY.wf-rules runs: the motherbee or a worker, never an ingress or egress hive
+(a manifest that puts one there is refused).
 
 ### 4.3 IO nodes
 
@@ -343,7 +350,12 @@ Do not:
 Role: produce a `solution_manifest` v2 describing desired state.
 
 Valid `desired_state` sections:
-- `topology`
+- `topology`: `hives`, and `vpns`, each an SY.config.routes VPN rule `{hive, pattern, match_kind,
+  vpn_id, ownership}` (`vpn_id` a number, `match_kind` EXACT, PREFIX or GLOB, PREFIX when omitted;
+  optional `priority`, 100 when omitted), one rule per pattern on a hive. A rule puts the nodes of
+  its hive whose names match into that VPN, and nodes reach only nodes of their own VPN (system
+  nodes excepted): declare VPN rules only to isolate a group, with the same `vpn_id` for every
+  member on each hive where it runs
 - `runtimes`
 - `nodes`
 - `routing`
@@ -355,9 +367,21 @@ Not supported here:
 - `identity`
 
 Ownership rules:
-- `solution` means the pipeline may create/update/delete it
-- `external` means the reconciler must not delete it
+- `solution` means the pipeline creates and updates it
+- `external` means the reconciler must not touch it
 - omitted defaults to conservative external behavior
+- a manifest version owns what it declares only once a plan made from it has run
+
+A manifest is refused when it breaks what the system nodes accept:
+- routes: `action` FORWARD (with `next_hop_hive`) or DROP, case-sensitive; one route per prefix on
+  a hive
+- nodes: never `WF.*` (SY.wf-rules creates them) nor core nodes (`SY.*`, `RT.*`); runtime names
+  are lowercase letters and digits in dot-separated parts (`ai.generic`, `ai.support`)
+
+The reconcile never removes a node, route or VPN rule a solution stops declaring: SY.orchestrator
+and SY.config.routes record no owner for them. It removes a solution's workflows and user policy,
+because Archi knows which solution deployed them. Remove an extra node, route or VPN rule through
+SY.admin's API (`kill_node`, `delete_route`, `delete_vpn`).
 
 ### 6.2 RealProgrammer
 
@@ -383,6 +407,9 @@ Rules:
 - reads happen during plan generation via `query_hive`
 - call `get_admin_action_help` for each action used
 - do not invent actions outside compiler-class mappings
+- the args of `opa_compile_apply`, `wf_rules_compile_apply`, `wf_rules_delete`, `add_route`,
+  `add_vpn` and a replace's `delete_route` / `delete_vpn` are pinned to the manifest afterwards:
+  write them exactly as the declared resource
 
 ### 6.4 Archi
 
@@ -595,14 +622,17 @@ PlanCompiler should map delta operations like this:
 | `HIVE_CREATE` | `add_hive` |
 | `VPN_CREATE` | `add_vpn` |
 | `VPN_DELETE` | `delete_vpn` |
+| `VPN_REPLACE` | `delete_vpn` -> `add_vpn` |
 | `ROUTE_ADD` | `add_route` |
 | `ROUTE_DELETE` | `delete_route` |
 | `ROUTE_REPLACE` | `delete_route` -> `add_route` |
 | `WF_DEPLOY_APPLY` | `wf_rules_compile_apply` |
 | `WF_DEPLOY_RESTART` | `wf_rules_compile_apply` -> `restart_node` |
+| `WF_REMOVE` | `wf_rules_delete` |
 | `OPA_APPLY` | `opa_compile_apply` |
+| `OPA_REMOVE` | `opa_clear` |
 
-Blocked classes: do not emit executor steps for `NOOP`, `WF_REMOVE`, `OPA_REMOVE`, or `BLOCKED_*`.
+Blocked classes: do not emit executor steps for `NOOP`, `SCOPE_NOT_SUPPORTED`, or `BLOCKED_*`.
 
 ---
 

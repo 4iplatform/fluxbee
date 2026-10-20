@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tokio::sync::Mutex;
 
-use crate::errors::{AiSdkError, Result};
+use crate::errors::{AiSdkError, Result, TRUNCATED_ANSWER_MARKER};
 use crate::function_calling::{
     FunctionCallingModel, FunctionLoopItem, FunctionModelTurnRequest, FunctionModelTurnResponse,
     FunctionToolCall,
@@ -866,6 +866,9 @@ impl FunctionCallingModel for OpenAiFunctionCallingModel {
             // it carries type/param/message so the consumer can classify + scrub.
             return Err(openai_status_error(status.as_u16(), &value));
         }
+        // A turn cut at the token limit can end inside a tool call's arguments: it is an error,
+        // as on the plain path and on Anthropic's turns, never a turn to act on.
+        openai_check_truncation(&value)?;
 
         let response_id = value
             .get("id")
@@ -1250,12 +1253,20 @@ fn openai_check_truncation(body: &Value) -> Result<()> {
             .and_then(Value::as_str)
             == Some("max_output_tokens")
     {
-        return Err(AiSdkError::Protocol(
-            "openai response truncated: hit max_output_tokens (raise model_settings.max_output_tokens)"
-                .to_string(),
+        return Err(truncated_answer_error(
+            AiProvider::OpenAi,
+            "max_output_tokens",
         ));
     }
     Ok(())
+}
+
+/// The error of an answer cut at its token limit, the same on both providers so a caller can tell
+/// it apart (`AiSdkError::is_truncated_answer`).
+fn truncated_answer_error(provider: AiProvider, limit: &str) -> AiSdkError {
+    AiSdkError::Protocol(format!(
+        "{provider} {TRUNCATED_ANSWER_MARKER} {limit} (raise model_settings.max_output_tokens)"
+    ))
 }
 
 /// Heuristic: an Anthropic 400 that indicates the model does not support the `output_config`
@@ -1277,10 +1288,7 @@ fn anthropic_output_config_unsupported(err: &AiSdkError) -> bool {
 /// model_settings.max_output_tokens rather than parsing a truncated tool_use/structured output.
 fn anthropic_check_truncation(value: &Value) -> Result<()> {
     if value.get("stop_reason").and_then(Value::as_str) == Some("max_tokens") {
-        return Err(AiSdkError::Protocol(
-            "anthropic response truncated: hit max_tokens (raise model_settings.max_output_tokens)"
-                .to_string(),
-        ));
+        return Err(truncated_answer_error(AiProvider::Anthropic, "max_tokens"));
     }
     Ok(())
 }
@@ -1639,9 +1647,57 @@ fn build_anthropic_function_messages(
     Ok((system_parts.join("\n\n"), messages))
 }
 
+/// The longest one model call may take: one `generate` or one tool turn, the provider's own retries
+/// included (Anthropic's `send`). Past it the call fails with `AiSdkError::Timeout` and its usage
+/// record says `abandoned`, so a stuck connection costs one bounded call, never a worker. It is
+/// there for stuck connections, not slow answers: an Archi pipeline stage, or a reasoning model
+/// with no `max_output_tokens`, can rightly take minutes.
+pub const MODEL_CALL_TIMEOUT: Duration = Duration::from_secs(300);
+
+/// Bounds each call of the client it wraps; the factories wrap every client they hand out.
+struct WithCallTimeout<C> {
+    inner: C,
+    limit: Duration,
+}
+
+impl<C> WithCallTimeout<C> {
+    fn new(inner: C) -> Self {
+        Self {
+            inner,
+            limit: MODEL_CALL_TIMEOUT,
+        }
+    }
+
+    async fn bounded<T>(&self, call: impl std::future::Future<Output = Result<T>>) -> Result<T> {
+        tokio::time::timeout(self.limit, call).await.map_err(|_| {
+            AiSdkError::Timeout(format!(
+                "model call took longer than {} s",
+                self.limit.as_secs()
+            ))
+        })?
+    }
+}
+
+#[async_trait]
+impl<C: LlmClient> LlmClient for WithCallTimeout<C> {
+    async fn generate(&self, request: LlmRequest) -> Result<LlmResponse> {
+        self.bounded(self.inner.generate(request)).await
+    }
+}
+
+#[async_trait]
+impl<M: FunctionCallingModel> FunctionCallingModel for WithCallTimeout<M> {
+    async fn run_turn(
+        &self,
+        request: FunctionModelTurnRequest,
+    ) -> Result<FunctionModelTurnResponse> {
+        self.bounded(self.inner.run_turn(request)).await
+    }
+}
+
 /// The plain-path client. Every model call of the system goes through this or
 /// `create_function_calling_model`, with the account that says who spends and who pays (§7.2):
-/// each answer leaves one usage record.
+/// each answer leaves one usage record. Each call is bounded by `MODEL_CALL_TIMEOUT`.
 pub fn create_llm_client(
     provider: AiProvider,
     api_key: impl Into<String>,
@@ -1655,19 +1711,19 @@ pub fn create_llm_client(
             if let Some(base_url) = base_url {
                 client = client.with_base_url(base_url);
             }
-            Arc::new(client)
+            Arc::new(WithCallTimeout::new(client))
         }
         AiProvider::Anthropic => {
             let mut client = AnthropicMessagesClient::new(api_key, account);
             if let Some(base_url) = base_url {
                 client = client.with_base_url(base_url);
             }
-            Arc::new(client)
+            Arc::new(WithCallTimeout::new(client))
         }
     }
 }
 
-/// The tool-loop client; see `create_llm_client`.
+/// The tool-loop client, each turn bounded by `MODEL_CALL_TIMEOUT`; see `create_llm_client`.
 pub fn create_function_calling_model(
     provider: AiProvider,
     api_key: impl Into<String>,
@@ -1685,14 +1741,22 @@ pub fn create_function_calling_model(
             if let Some(base_url) = base_url {
                 client = client.with_base_url(base_url);
             }
-            Arc::new(client.function_model(model, system, model_settings))
+            Arc::new(WithCallTimeout::new(client.function_model(
+                model,
+                system,
+                model_settings,
+            )))
         }
         AiProvider::Anthropic => {
             let mut client = AnthropicMessagesClient::new(api_key, account);
             if let Some(base_url) = base_url {
                 client = client.with_base_url(base_url);
             }
-            Arc::new(client.function_model(model, system, model_settings))
+            Arc::new(WithCallTimeout::new(client.function_model(
+                model,
+                system,
+                model_settings,
+            )))
         }
     }
 }
@@ -1754,6 +1818,18 @@ mod tests {
             anthropic_check_truncation(&json!({"stop_reason": "max_tokens"})).is_err()
         );
         assert!(anthropic_check_truncation(&json!({"stop_reason": "end_turn"})).is_ok());
+        // A caller tells the cut apart from any other protocol error, on both providers.
+        for err in [
+            openai_check_truncation(&json!({
+                "status": "incomplete", "incomplete_details": {"reason": "max_output_tokens"}
+            }))
+            .expect_err("openai cut"),
+            anthropic_check_truncation(&json!({"stop_reason": "max_tokens"}))
+                .expect_err("anthropic cut"),
+        ] {
+            assert!(err.is_truncated_answer(), "{err}");
+        }
+        assert!(!openai_status_error(400, &json!({})).is_truncated_answer());
     }
 
     #[test]
@@ -2305,6 +2381,113 @@ mod tests {
             records.try_recv().is_err(),
             "a non-2xx answer leaves no record"
         );
+    }
+
+    /// A tool turn cut at the token limit can end inside a tool call's arguments: it is an error,
+    /// never a call to run, and its usage record still says `truncated`.
+    #[tokio::test]
+    async fn an_openai_tool_turn_cut_at_the_limit_is_an_error() {
+        let (recorder, mut records) = crate::usage::UsageRecorder::for_test();
+        let account = AiAccount::root(recorder, "AI.sales@motherbee");
+        let (base_url, _body_rx, handle) = spawn_single_response_server(json!({
+            "id": "resp_cut",
+            "status": "incomplete",
+            "incomplete_details": {"reason": "max_output_tokens"},
+            "output": [{
+                "type": "function_call",
+                "call_id": "call_1",
+                "name": "publish_html_page",
+                "arguments": "{\"filename\":\"page.html\",\"content\":\"<html><bo"
+            }],
+            "usage": {"input_tokens": 12, "output_tokens": 64}
+        }));
+        let model = OpenAiResponsesClient::new("test-key", account)
+            .with_base_url(base_url)
+            .function_model("gpt-5.5", None, ModelSettings::default());
+
+        let err = model
+            .run_turn(FunctionModelTurnRequest {
+                items: vec![FunctionLoopItem::UserText {
+                    content: "publish a page".to_string(),
+                }],
+                tools: Vec::new(),
+            })
+            .await
+            .expect_err("a cut turn is an error");
+        handle.join().expect("server thread");
+
+        assert!(err.is_truncated_answer(), "{err}");
+        let record = records.try_recv().expect("the cut answer still cost");
+        assert_eq!(record.kind, UsageKind::FunctionTurn);
+        assert_eq!(record.outcome, fluxbee_sdk::UsageOutcome::Truncated);
+    }
+
+    struct SlowModel(Duration);
+
+    #[async_trait]
+    impl LlmClient for SlowModel {
+        async fn generate(&self, _request: LlmRequest) -> Result<LlmResponse> {
+            tokio::time::sleep(self.0).await;
+            Ok(LlmResponse {
+                content: "late".to_string(),
+            })
+        }
+    }
+
+    #[async_trait]
+    impl FunctionCallingModel for SlowModel {
+        async fn run_turn(
+            &self,
+            _request: FunctionModelTurnRequest,
+        ) -> Result<FunctionModelTurnResponse> {
+            tokio::time::sleep(self.0).await;
+            Ok(FunctionModelTurnResponse {
+                assistant_text: Some("late".to_string()),
+                tool_calls: Vec::new(),
+                tokens_used: 0,
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn a_model_call_past_its_limit_is_a_timeout() {
+        let bounded = |delay| WithCallTimeout {
+            inner: SlowModel(delay),
+            limit: Duration::from_millis(50),
+        };
+        let request = || LlmRequest {
+            model: "gpt-5.5".to_string(),
+            system: None,
+            input: "hola".to_string(),
+            input_parts: None,
+            output_schema: None,
+            max_output_tokens: None,
+            model_settings: None,
+        };
+        let turn = || FunctionModelTurnRequest {
+            items: Vec::new(),
+            tools: Vec::new(),
+        };
+
+        let slow = bounded(Duration::from_secs(5));
+        assert!(matches!(
+            LlmClient::generate(&slow, request()).await,
+            Err(AiSdkError::Timeout(_))
+        ));
+        assert!(matches!(
+            slow.run_turn(turn()).await,
+            Err(AiSdkError::Timeout(_))
+        ));
+
+        let fast = bounded(Duration::from_millis(1));
+        assert_eq!(
+            LlmClient::generate(&fast, request())
+                .await
+                .expect("in time")
+                .content,
+            "late"
+        );
+        assert!(fast.run_turn(turn()).await.is_ok());
     }
 
     #[test]

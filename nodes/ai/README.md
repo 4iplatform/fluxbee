@@ -24,8 +24,8 @@ Three separate parts, each set in its own place:
 | What | Where it lives | How it is set |
 | --- | --- | --- |
 | The model provider and its key | the hive, and SY.vault | `ai:` in `/etc/fluxbee/hive.yaml` picks the provider (OpenAI when the section is absent). The node reads the key from SY.vault by `resource_type` (`openai` or `anthropic`) on every request: a key it owns, else one assigned to it, else its tenant's general key |
-| Its behavior | the node's `config.json` | `CONFIG_SET` with `config.behavior`: `kind` (`echo` or `ai_chat`), `model`, `instructions`, `model_settings`, `base_url`, `capabilities.multimodal` |
-| The agent: role, skills, handbooks, personality | the node's ILK | hashes set with `set_ilk_definition`, each naming a JSON asset in `blob://agent-assets/`. Without them the agent gives only a fixed "unconfigured" answer |
+| Its behavior | the node's `config.json` | `CONFIG_SET` with `config.behavior`: `kind` (`echo` or `ai_chat`), `model`, `model_settings`, `base_url`, `capabilities.multimodal` |
+| The agent: role, skills, handbooks, personality | the node's ILK | hashes set with `set_ilk_definition`, each naming a JSON asset in `blob://agent-assets/`. They make the prompt, which is never config. Without them the agent gives only a fixed "unconfigured" answer |
 
 A key is never config. `CONFIG_SET` refuses `config.secrets.*`, `config.behavior.api_key`,
 `config.behavior.api_key_env`, `config.behavior.openai` and `config.behavior.vault_key`, and an AI

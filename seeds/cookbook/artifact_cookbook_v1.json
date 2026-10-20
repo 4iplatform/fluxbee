@@ -2,7 +2,7 @@
   {
     "layer": "artifact",
     "pattern_key": "config_only_ai_runtime",
-    "trigger": "Build a config_only runtime package for an AI node — no custom binary, just a system prompt and default config.",
+    "trigger": "Build a config_only runtime package for an AI node — no custom binary, only package.json and ai.generic's default config.",
     "inputs_signature": {
       "artifact_kind": "runtime_package",
       "package_source": "inline_package",
@@ -13,22 +13,23 @@
       "artifact": {
         "files": {
           "package.json": "{\"name\":\"ai.example\",\"version\":\"0.1.0\",\"type\":\"config_only\",\"runtime_base\":\"ai.generic\"}",
-          "config/default-config.json": "{\"tenant_id\":\"tnt:example\",\"language\":\"es\"}",
-          "prompts/system.txt": "You are an AI assistant specialized in..."
+          "config/default-config.json": "{\"behavior\":{\"kind\":\"ai_chat\",\"model\":\"gpt-5.5\"}}"
         }
       }
     },
     "constraints": [
       "package.json must include: name (lowercase, dots/hyphens allowed), version (semver), type, runtime_base",
       "runtime_base must match one of the available runtimes in known_context.available_runtimes",
-      "config/default-config.json must be valid JSON",
+      "config/default-config.json must be valid JSON: ai.generic's config, behavior.kind ai_chat and model",
+      "the package carries no prompt: an agent's prompt is its ILK definition (role, skills, handbooks)",
       "name in package.json must be lowercase with no spaces"
     ],
     "do_not_repeat": [
       "do not use 'full_runtime' as type for config_only packages — use 'config_only'",
       "do not invent a runtime_base that is not in the known available runtimes",
       "do not omit package.json or config/default-config.json — both are required",
-      "do not include binary files or executables in inline_package artifacts"
+      "do not include binary files or executables in inline_package artifacts",
+      "do not add prompt files or instructions: ai.generic refuses instructions in its config"
     ],
     "failure_class": null,
     "recorded_from_run": null,
@@ -37,7 +38,7 @@
   {
     "layer": "artifact",
     "pattern_key": "workflow_definition",
-    "trigger": "Build a workflow definition artifact for a WF node deployment.",
+    "trigger": "Build the workflow definition a wf_deployment carries.",
     "inputs_signature": {
       "artifact_kind": "workflow_definition",
       "node_type_prefix": "WF"
@@ -45,35 +46,82 @@
     "successful_shape": {
       "artifact_kind": "workflow_definition",
       "artifact": {
-        "workflow_name": "invoice_approval",
-        "version": "0.1.0",
-        "description": "Invoice approval workflow with multi-step validation",
-        "steps": [
-          {
-            "id": "s1",
-            "type": "ai_call",
-            "node": "AI.validator@motherbee",
-            "input_mapping": { "document": "$.input.document" }
+        "workflow_name": "invoice",
+        "definition": {
+          "wf_schema_version": "1",
+          "workflow_type": "invoice",
+          "description": "Asks IO.quickbooks for an invoice and waits for the validated data.",
+          "input_schema": {
+            "type": "object",
+            "required": [
+              "customer_id"
+            ],
+            "properties": {
+              "customer_id": {
+                "type": "string"
+              }
+            }
           },
-          {
-            "id": "s2",
-            "type": "conditional",
-            "condition": "$.steps.s1.approved == true",
-            "on_true": "s3",
-            "on_false": "s4"
-          }
-        ]
+          "initial_state": "collecting_data",
+          "terminal_states": [
+            "completed"
+          ],
+          "states": [
+            {
+              "name": "collecting_data",
+              "description": "Asks for the invoice and waits for its data.",
+              "entry_actions": [
+                {
+                  "type": "send_message",
+                  "target": "IO.quickbooks@motherbee",
+                  "meta": {
+                    "msg": "INVOICE_CREATE_REQUEST"
+                  },
+                  "payload": {
+                    "customer_id": {
+                      "$ref": "input.customer_id"
+                    }
+                  }
+                }
+              ],
+              "exit_actions": [],
+              "transitions": [
+                {
+                  "event_match": {
+                    "msg": "DATA_VALIDATION_RESPONSE"
+                  },
+                  "guard": "event.payload.complete == true",
+                  "target_state": "completed",
+                  "actions": [
+                    {
+                      "type": "set_variable",
+                      "name": "validated_at",
+                      "value": "now()"
+                    }
+                  ]
+                }
+              ]
+            },
+            {
+              "name": "completed",
+              "description": "Done.",
+              "entry_actions": [],
+              "exit_actions": [],
+              "transitions": []
+            }
+          ]
+        }
       }
     },
     "constraints": [
-      "workflow_name must be unique per hive and match the wf_deployment in the manifest",
-      "steps array must be non-empty",
-      "each step must have a unique 'id' field"
+      "the artifact is what a wf_deployment carries: workflow_name and definition",
+      "workflow_name is lowercase letters, digits and '-' in dot-separated parts, each starting with a letter, and matches the wf_deployment in the manifest",
+      "the definition is a wf_schema_version 1 state machine: workflow_type, input_schema, initial_state, terminal_states, and states with entry_actions, exit_actions and transitions (CEL guards)"
     ],
     "do_not_repeat": [
-      "do not use numeric step ids — use string ids like 's1', 's2'",
-      "do not reference nodes that do not exist in the desired_state manifest",
-      "do not omit the 'type' field on each step"
+      "do not write a steps list: SY.wf-rules refuses any field its schema does not define",
+      "do not send messages to nodes that do not exist in the desired_state manifest or the system",
+      "do not leave a transition without event_match.msg, target_state and guard"
     ],
     "failure_class": null,
     "recorded_from_run": null,

@@ -12,7 +12,7 @@
       "desired_state": {
         "runtimes": [
           {
-            "name": "AI.example",
+            "name": "ai.example",
             "version": "0.1.0",
             "package_source": "inline_package",
             "ownership": "solution"
@@ -22,7 +22,7 @@
           {
             "node_name": "AI.example@motherbee",
             "hive": "motherbee",
-            "runtime": "AI.example",
+            "runtime": "ai.example",
             "config": {},
             "ownership": "solution"
           }
@@ -47,7 +47,7 @@
   {
     "layer": "design",
     "pattern_key": "multi_hive_with_route",
-    "trigger": "User wants a node on a worker hive and a routing rule so messages flow from motherbee to that worker.",
+    "trigger": "User wants a node on a worker hive and a routing rule so messages flow to it from a motherbee agent, the two isolated in their own VPN.",
     "inputs_signature": {
       "source_hive": "motherbee",
       "target_hive": "worker-*",
@@ -61,7 +61,8 @@
             { "hive_id": "worker-220", "role": "worker", "ownership": "solution" }
           ],
           "vpns": [
-            { "vpn_id": "vpn-motherbee-worker220", "hive_id": "worker-220", "ownership": "solution" }
+            { "hive": "motherbee", "pattern": "AI.frontline", "match_kind": "PREFIX", "vpn_id": 220, "ownership": "solution" },
+            { "hive": "worker-220", "pattern": "AI.specialist", "match_kind": "PREFIX", "vpn_id": 220, "ownership": "solution" }
           ]
         },
         "nodes": [
@@ -85,13 +86,14 @@
       }
     },
     "constraints": [
-      "always include the VPN entry when a new worker hive is added",
+      "a VPN rule is SY.config.routes' rule: hive, pattern, match_kind (EXACT, PREFIX or GLOB) and a numeric vpn_id; it puts the nodes of that hive whose names match into that VPN",
+      "nodes reach only nodes of their own VPN (system nodes excepted): give the specialist and the motherbee agent that calls it the same vpn_id",
       "route prefix must end with a dot (e.g., 'AI.specialist.' not 'AI.specialist')",
       "next_hop_hive in routing must match the hive_id of the target hive exactly"
     ],
     "do_not_repeat": [
       "do not add topology.hives for motherbee — it always exists",
-      "do not add a VPN for hives that already have one — check snapshot first",
+      "do not declare a VPN rule unless the request asks to isolate nodes: a node left out of it can no longer reach the nodes in it",
       "do not set next_hop_hive to a hive where the node does not live"
     ],
     "failure_class": null,
@@ -101,7 +103,7 @@
   {
     "layer": "design",
     "pattern_key": "wf_node_with_workflow",
-    "trigger": "User wants to deploy a workflow node with a workflow definition on an existing hive.",
+    "trigger": "User wants to deploy a workflow on an existing hive.",
     "inputs_signature": {
       "desired_node_type": "WF.*",
       "hive_already_exists": true,
@@ -109,29 +111,53 @@
     },
     "successful_shape": {
       "desired_state": {
-        "runtimes": [
-          {
-            "name": "wf.invoice",
-            "version": "0.1.0",
-            "package_source": "inline_package",
-            "ownership": "solution"
-          }
-        ],
-        "nodes": [
-          {
-            "node_name": "WF.invoice@motherbee",
-            "hive": "motherbee",
-            "runtime": "wf.invoice",
-            "config": {},
-            "ownership": "solution"
-          }
-        ],
         "wf_deployments": [
           {
             "hive": "motherbee",
-            "workflow_name": "invoice_approval",
+            "workflow_name": "invoice",
             "definition": {
-              "steps": []
+              "wf_schema_version": "1",
+              "workflow_type": "invoice",
+              "description": "Asks IO.quickbooks for an invoice and waits for the validated data.",
+              "input_schema": {
+                "type": "object",
+                "required": ["customer_id"],
+                "properties": { "customer_id": { "type": "string" } }
+              },
+              "initial_state": "collecting_data",
+              "terminal_states": ["completed"],
+              "states": [
+                {
+                  "name": "collecting_data",
+                  "description": "Asks for the invoice and waits for its data.",
+                  "entry_actions": [
+                    {
+                      "type": "send_message",
+                      "target": "IO.quickbooks@motherbee",
+                      "meta": { "msg": "INVOICE_CREATE_REQUEST" },
+                      "payload": { "customer_id": { "$ref": "input.customer_id" } }
+                    }
+                  ],
+                  "exit_actions": [],
+                  "transitions": [
+                    {
+                      "event_match": { "msg": "DATA_VALIDATION_RESPONSE" },
+                      "guard": "event.payload.complete == true",
+                      "target_state": "completed",
+                      "actions": [
+                        { "type": "set_variable", "name": "validated_at", "value": "now()" }
+                      ]
+                    }
+                  ]
+                },
+                {
+                  "name": "completed",
+                  "description": "Done.",
+                  "entry_actions": [],
+                  "exit_actions": [],
+                  "transitions": []
+                }
+              ]
             },
             "ownership": "solution"
           }
@@ -139,14 +165,14 @@
       }
     },
     "constraints": [
-      "WF nodes must use a WF.* or wf.* runtime",
-      "wf_deployments.workflow_name must be unique per hive",
-      "wf_deployments.definition must be a non-empty object with at least a 'steps' array"
+      "declare only the workflow: SY.wf-rules packages it and creates and runs its node, WF.<workflow_name>@<hive>",
+      "workflow_name is lowercase letters, digits and '-' in dot-separated parts, each starting with a letter, and unique per hive",
+      "the definition is a wf_schema_version 1 state machine: workflow_type, input_schema, initial_state, terminal_states, and states with entry_actions, exit_actions and transitions (CEL guards)"
     ],
     "do_not_repeat": [
-      "do not put the workflow definition content inside the node config — it goes in wf_deployments",
-      "do not use 'WF.engine' as a node name — it is a runtime base, not a node",
-      "do not omit the runtime when WF node needs a custom package"
+      "do not declare the WF node in nodes, nor a runtime for it: SY.wf-rules makes both",
+      "do not put the workflow definition content inside a node config — it goes in wf_deployments",
+      "do not deploy a workflow on an ingress or egress hive: it has no SY.wf-rules"
     ],
     "failure_class": null,
     "recorded_from_run": null,

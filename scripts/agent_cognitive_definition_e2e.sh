@@ -181,7 +181,7 @@ PY
 
 fail_missing_runtime_preflight() {
   echo "FAIL: runtime '$RUNTIME' is not ready for spawn on hive '$HIVE_ID'." >&2
-  echo "The core installer should publish ai.generic automatically. If this is a fresh host, re-run install.sh and check its ai.generic publish step." >&2
+  echo "The package seeds ai.generic (packaging/base-nodes.json). If it is missing, re-run the seed: sudo fluxbee-seed-runtimes && sudo systemctl restart sy-orchestrator." >&2
   echo "Manual repair command:" >&2
   echo "  PATH=\"\$PATH\" scripts/publish-ia-runtime.sh --runtime $RUNTIME --version 1.0.0 --set-current --sudo" >&2
   echo "If the runtime was just published, verify $DIST_RUNTIMES_ROOT/manifest.json and /hives/$HIVE_ID/versions." >&2

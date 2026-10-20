@@ -139,7 +139,7 @@ The `version` is an auto-incrementing integer managed by `SY.wf-rules`, not by t
 
 - L2 name: `SY.wf-rules@<hive>` (e.g. `SY.wf-rules@motherbee`)
 - Node base name: `SY.wf-rules`
-- Binary: `sy-wf-rules` (installed via install.sh, same pattern as sy-opa-rules)
+- Binary: `sy-wf-rules` (installed by the `.deb`, same pattern as sy-opa-rules)
 
 ### 5.2 Message handling (dispatch)
 
@@ -553,7 +553,7 @@ The operator sees a clear failure in the response and can decide next steps: inv
 
 ### 7.2 Dependency: wf.engine runtime base must be installed
 
-`SY.wf-rules` does NOT build or install the `wf.engine` base runtime (the `wf-generic` binary). That base runtime must already be available in `dist` as a pre-installed runtime (installed via `install.sh` or `publish-wf-runtime.sh`). `SY.wf-rules` only manages the workflow packages `wf.<workflow_name>` that run on top of that base runtime.
+`SY.wf-rules` does NOT build or install the `wf.engine` base runtime (the `wf-generic` binary). That base runtime must already be available in `dist` as a pre-installed runtime (seeded by the `.deb` from `packaging/base-nodes.json`, or published with `publish-wf-runtime.sh`). `SY.wf-rules` only manages the workflow packages `wf.<workflow_name>` that run on top of that base runtime.
 
 If the admin reports that `wf.engine` is not available when asked to spawn a `wf.<workflow_name>` package, `SY.wf-rules` returns error `RUNTIME_NOT_AVAILABLE`.
 
@@ -648,7 +648,7 @@ All endpoints use the standard admin authentication. The body for POST endpoints
 ### 11.2 Binary and installation
 
 - Binary name: `sy-wf-rules`
-- Installed by `scripts/install.sh` alongside other SY binaries
+- Installed by the `.deb` (`GO_BINS` in `packaging/build-deb.sh`) alongside the other SY binaries
 - State directory: `/var/lib/fluxbee/wf-rules/`
 - Lock path: `/var/run/fluxbee/sy-wf-rules.lock`
 - Node name pattern: `SY.wf-rules@<hive>`

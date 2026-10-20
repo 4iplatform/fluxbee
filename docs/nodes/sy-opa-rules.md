@@ -62,6 +62,9 @@ Each slot directory holds `policy.wasm`, `policy.rego` and `metadata.json` (`Pol
 
 - **compile**: Rego is compiled with the OPA Go compiler (`compileRego`), checked (valid wasm,
   `opa_eval` export, at most 4 MiB) and written to `staged/`.
+- **check**: compiled and checked the same way (`compileRego` works in a temporary directory it
+  removes) and answered. Nothing is written: not `staged/`, not the region, not `last_error`; no
+  version is involved.
 - **apply**: `current/` is copied to `backup/`, `staged/` becomes `current/`, the wasm goes
   into the region and an `OPA_RELOAD` broadcast is sent (`applyPolicy`). An explicit version
   must match the staged one (`VERSION_MISMATCH`); nothing staged is `NOTHING_STAGED`.
@@ -100,8 +103,9 @@ refused (`UNSUPPORTED_OPERATION`, `handleNodeConfigSet`). `handle_opa_http`:
 
 1. Refuses a write that names a hive other than the motherbee (`INVALID_REQUEST`: "there is one
    user policy for every hive").
-2. Picks the version: `next_opa_version` keeps a counter in `/var/lib/fluxbee/opa-version.txt`;
-   an explicit version must be greater than the current one. Apply requires `version`.
+2. Picks the version (a check takes none, see below): `next_opa_version` keeps a counter in
+   `/var/lib/fluxbee/opa-version.txt`; an explicit version must be greater than the current one.
+   Apply requires `version`.
 3. Sends `CONFIG_CHANGED` (`subsystem: opa`, the action, `rego`, `entrypoint`, `hive:
    motherbee`) to `SY.opa.rules@motherbee` and waits up to 30 s (`OPA_PRIMARY_WAIT_SECS`) for
    its `CONFIG_RESPONSE`. For compile + apply it sends `compile`, then `apply`.
@@ -114,13 +118,19 @@ refused (`UNSUPPORTED_OPERATION`, `handleNodeConfigSet`). `handle_opa_http`:
    reach, and `converged`. A pending hive is not a failure: it installs the policy when the
    file arrives.
 
+A check (`POST /opa/policy/check`, `opa_check`) is not a write, so a check run between a
+compile and its apply leaves the staged policy alone. SY.admin takes no version for it (the
+counter is not touched) and sends `CONFIG_CHANGED` with action `check`, `version: 0` and
+`config: {rego, entrypoint, check_id}`, a fresh id per check. Only the `CONFIG_RESPONSE` that
+echoes that `check_id` counts (`send_opa_check`); the answer reports no version, and nothing is
+scanned or announced.
+
 ## Messages
 
 | Message | Who may send | What it does |
 | --- | --- | --- |
-| `CONFIG_CHANGED` (`SYSTEM`, `subsystem: opa`) with `compile`, `compile_apply`, `check`, `apply`, `rollback`, `clear` | `SY.admin@motherbee` only | the operations above, on the motherbee; answered with `CONFIG_RESPONSE` |
+| `CONFIG_CHANGED` (`SYSTEM`, `subsystem: opa`) with `compile`, `compile_apply`, `check`, `apply`, `rollback`, `clear` | `SY.admin@motherbee` only | the operations above, on the motherbee; answered with `CONFIG_RESPONSE` (a check's answer echoes its `check_id`) |
 | `CONFIG_CHANGED` with action `sync` | `SY.admin@motherbee` only | "a new policy was published": answered when this hive runs that hash |
-| `command` `compile_policy`, `apply_policy`, `rollback_policy` | `SY.admin@motherbee` only | the same operations through the command path |
 | `query` `get_policy` | not checked | current version, Rego (empty on non-primary hives), hash, entrypoint |
 | `query` `get_status` | not checked | the status view below |
 | `CONFIG_GET` | router policy: `SY.admin@motherbee` | current/staged/backup metadata and the routers' load status; `contract.policy_writes` points to `/opa/policy*` |
@@ -128,7 +138,7 @@ refused (`UNSUPPORTED_OPERATION`, `handleNodeConfigSet`). `handle_opa_http`:
 | `NODE_STATUS_GET` | router policy | answered `HEALTHY` |
 
 The origin checks compare the router-stamped `routing.src_l2_name` with `PrimaryAdminNode`
-(`handleMessage`, `handleCommand`). A refused `CONFIG_CHANGED` is answered `UNAUTHORIZED`
+(`handleMessage`). A refused `CONFIG_CHANGED` is answered `UNAUTHORIZED`
 (except `sync`, which is only logged). `CONFIG_CHANGED`, `CONFIG_GET` and `CONFIG_SET` are also
 protected system actions: the router delivers them only from `SY.admin@motherbee` (rule 2 of
 `policy/system.rego`).
@@ -164,7 +174,7 @@ On the motherbee (`127.0.0.1:8080`):
 | --- | --- |
 | `POST /opa/policy` body `{rego, entrypoint?, version?}` | compile and apply (`opa_compile_apply`) |
 | `POST /opa/policy/compile` | compile only (`opa_compile`) |
-| `POST /opa/policy/check` | compile without applying (`opa_check`) |
+| `POST /opa/policy/check` body `{rego, entrypoint?}` | compile to validate: no version, nothing staged or applied (`opa_check`) |
 | `POST /opa/policy/apply` body `{version}` | apply the staged policy (`opa_apply`) |
 | `POST /opa/policy/rollback` | back to the previous policy (`opa_rollback`) |
 | `POST /opa/policy/clear` | remove the user policy everywhere (`opa_clear`) |

@@ -3,7 +3,9 @@
 // These types are contract-frozen — do not change without updating the spec and task list.
 
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use sha2::{Digest, Sha256};
+use std::collections::{HashMap, HashSet};
+use std::fmt::Write;
 
 // ── CFZ-6 / CFZ-7 — Loop policy constants ──────────────────────────────────
 
@@ -107,13 +109,31 @@ pub struct HiveSnapshotStatus {
     pub error: Option<String>,
 }
 
+/// One hive's answers, each as SY.admin hands it over (the producer's payload); the reconciler
+/// reads each shape exactly (`reconciler.rs`, "Snapshot answers").
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct HiveResources {
+    /// SY.orchestrator's `list_runtimes` answer.
     pub runtimes: Option<serde_json::Value>,
+    /// SY.orchestrator's `list_nodes` answer for the managed instances (`managed: true`).
     pub nodes: Option<serde_json::Value>,
+    /// SY.orchestrator's `get_node_config` answer for each declared node with a declared config
+    /// that the hive runs as a managed instance, by node name.
+    #[serde(default)]
+    pub node_configs: HashMap<String, serde_json::Value>,
+    /// SY.config.routes' `list_routes` answer.
     pub routes: Option<serde_json::Value>,
+    /// SY.config.routes' `list_vpns` answer.
     pub vpns: Option<serde_json::Value>,
+    /// SY.wf-rules' `list_workflows` answer: `{status, hive, workflows: [{workflow_name,
+    /// current_hash, ...}]}`.
     pub wf_state: Option<serde_json::Value>,
+    /// workflow_name -> the solution whose saved manifest most recently declared, as its own
+    /// (`ownership: solution`), exactly the definition this hive runs under that name. SY.wf-rules
+    /// records no owner, so this is what Archi knows it deployed, as for the user policy
+    /// (`ActualOpaPolicy::declared_by`). A workflow no solution declared is not listed.
+    #[serde(default)]
+    pub wf_declared_by: HashMap<String, String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -192,6 +212,8 @@ pub enum CompilerClass {
     HiveCreate,
     VpnCreate,
     VpnDelete,
+    /// The same pattern with another id, match kind or priority: delete and add.
+    VpnReplace,
     // Runtimes
     RuntimePublishOnly,
     RuntimePublishAndDistribute,
@@ -213,7 +235,7 @@ pub enum CompilerClass {
     // WF
     WfDeployApply,
     WfDeployRestart,
-    /// Blocked until canonical WF remove action is defined in admin surface.
+    /// Removes a workflow the solution deployed and no longer declares (`wf_rules_delete`).
     WfRemove,
     // OPA (one user policy for every hive)
     OpaApply,
@@ -259,6 +281,7 @@ pub fn compiler_class_risk(class: &CompilerClass) -> RiskClass {
         | CompilerClass::WfDeployRestart => RiskClass::Restarting,
 
         CompilerClass::VpnDelete
+        | CompilerClass::VpnReplace
         | CompilerClass::RuntimeDeleteVersion
         | CompilerClass::NodeKill
         | CompilerClass::NodeRecreate
@@ -282,6 +305,7 @@ pub fn compiler_class_admin_steps(class: &CompilerClass) -> Option<Vec<&'static 
         CompilerClass::HiveCreate => Some(vec!["add_hive"]),
         CompilerClass::VpnCreate => Some(vec!["add_vpn"]),
         CompilerClass::VpnDelete => Some(vec!["delete_vpn"]),
+        CompilerClass::VpnReplace => Some(vec!["delete_vpn", "add_vpn"]),
         CompilerClass::RuntimePublishOnly => Some(vec!["publish_runtime_package"]),
         // sync_to + update_to are encoded in step args, not separate steps
         CompilerClass::RuntimePublishAndDistribute => Some(vec!["publish_runtime_package"]),
@@ -299,10 +323,9 @@ pub fn compiler_class_admin_steps(class: &CompilerClass) -> Option<Vec<&'static 
         CompilerClass::RouteReplace => Some(vec!["delete_route", "add_route"]),
         CompilerClass::WfDeployApply => Some(vec!["wf_rules_compile_apply"]),
         CompilerClass::WfDeployRestart => Some(vec!["wf_rules_compile_apply", "restart_node"]),
+        CompilerClass::WfRemove => Some(vec!["wf_rules_delete"]),
         CompilerClass::OpaApply => Some(vec!["opa_compile_apply"]),
         CompilerClass::OpaRemove => Some(vec!["opa_clear"]),
-        // Blocked — no steps to emit until admin surface defines a remove action
-        CompilerClass::WfRemove => None,
         // Meta / blocked — no steps
         CompilerClass::Noop
         | CompilerClass::BlockedImmutableChange
@@ -488,12 +511,73 @@ pub struct DesiredHive {
     pub ownership: String,
 }
 
+/// A VPN rule as SY.config.routes keeps it (`list_vpns`, `add_vpn`): the nodes of `hive` whose names
+/// match `pattern` are in VPN `vpn_id`. Identified by its hive and pattern: config.routes keeps one
+/// rule per pattern on a hive (a second one is DUPLICATE_PATTERN).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DesiredVpn {
-    pub vpn_id: String,
-    pub hive_id: String,
+    pub hive: String,
+    pub pattern: String,
+    pub vpn_id: u32,
+    /// EXACT, PREFIX or GLOB (`VPN_MATCH_KINDS`); PREFIX when omitted, as in SY.config.routes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub match_kind: Option<String>,
+    /// 100 when omitted, as in SY.config.routes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub priority: Option<u16>,
     #[serde(default)]
     pub ownership: String,
+}
+
+/// The route actions SY.config.routes accepts (case-sensitive).
+pub const ROUTE_ACTIONS: [&str; 2] = ["FORWARD", "DROP"];
+
+/// The longest prefix SY.config.routes hands to the router whole (its shared-memory field).
+pub const ROUTE_PREFIX_MAX_BYTES: usize = 256;
+
+/// The longest next hop hive name SY.config.routes hands to the router whole.
+pub const ROUTE_NEXT_HOP_MAX_BYTES: usize = 32;
+
+/// The runtime naming rule (`runtime_name_regex` in src/runtime_package.rs,
+/// `^[a-z][a-z0-9]*(\.[a-z0-9]+)*$`): a package with another name is refused, and a name the
+/// manifest spells otherwise never matches the published one.
+pub fn valid_runtime_name(name: &str) -> bool {
+    let mut parts = name.split('.');
+    let first_ok = parts.next().is_some_and(|first| {
+        let mut chars = first.chars();
+        chars.next().is_some_and(|ch| ch.is_ascii_lowercase())
+            && chars.all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit())
+    });
+    first_ok
+        && parts.all(|part| {
+            !part.is_empty()
+                && part
+                    .chars()
+                    .all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit())
+        })
+}
+
+/// The match kinds SY.config.routes accepts for a VPN rule.
+pub const VPN_MATCH_KINDS: [&str; 3] = ["EXACT", "PREFIX", "GLOB"];
+
+/// The longest pattern SY.config.routes hands to the router whole (its shared-memory field).
+pub const VPN_PATTERN_MAX_BYTES: usize = 256;
+
+impl DesiredVpn {
+    /// Identity key for deduplication and delta comparison: `<hive>:<pattern>`.
+    pub fn identity_key(&self) -> String {
+        format!("{}:{}", self.hive, self.pattern)
+    }
+
+    /// Whether a `list_vpns` rule with this pattern is this VPN as declared: the same id, match
+    /// kind and priority, taking SY.config.routes' defaults (PREFIX, 100) where either names none.
+    pub fn holds(&self, rule: &serde_json::Value) -> bool {
+        let rule_kind = rule.get("match_kind").and_then(serde_json::Value::as_str);
+        let rule_priority = rule.get("priority").and_then(serde_json::Value::as_u64);
+        rule.get("vpn_id").and_then(serde_json::Value::as_u64) == Some(u64::from(self.vpn_id))
+            && rule_kind.unwrap_or("PREFIX") == self.match_kind.as_deref().unwrap_or("PREFIX")
+            && rule_priority.unwrap_or(100) == u64::from(self.priority.unwrap_or(100))
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -561,9 +645,10 @@ pub struct DesiredRoute {
 }
 
 impl DesiredRoute {
-    /// Identity key for deduplication and delta comparison.
+    /// Identity key for deduplication and delta comparison: SY.config.routes keeps one route per
+    /// prefix on a hive (a second one is DUPLICATE_PREFIX), whatever its action.
     pub fn identity_key(&self) -> String {
-        format!("{}:{}:{}", self.hive, self.prefix, self.action)
+        format!("{}:{}", self.hive, self.prefix)
     }
 }
 
@@ -572,19 +657,195 @@ pub struct DesiredWfDeployment {
     pub hive: String,
     pub workflow_name: String,
     pub definition: serde_json::Value,
-    #[serde(default = "default_solution_ownership")]
+    /// External when omitted, as the designer is told: only a workflow declared `solution` is the
+    /// solution's to remove.
+    #[serde(default = "default_external_ownership")]
     pub ownership: String,
 }
 
+fn default_external_ownership() -> String {
+    "external".to_string()
+}
+
 impl DesiredWfDeployment {
+    /// The `current_hash` SY.wf-rules reports once this definition is deployed.
     pub fn definition_hash(&self) -> String {
-        use std::collections::hash_map::DefaultHasher;
-        use std::hash::{Hash, Hasher};
-        let s = serde_json::to_string(&self.definition).unwrap_or_default();
-        let mut h = DefaultHasher::new();
-        s.hash(&mut h);
-        format!("{:016x}", h.finish())
+        wf_rules_definition_hash(&self.definition)
     }
+}
+
+/// SY.wf-rules' workflow name rule (`workflowNamePattern` in go/sy-wf-rules/node/types.go,
+/// `^[a-z][a-z0-9-]*(\.[a-z][a-z0-9-]*)*$`).
+pub fn valid_workflow_name(name: &str) -> bool {
+    name.split('.').all(|part| {
+        let mut chars = part.chars();
+        chars.next().is_some_and(|first| first.is_ascii_lowercase())
+            && chars.all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit() || ch == '-')
+    })
+}
+
+/// What is wrong with the shape of a workflow definition as SY.wf-rules checks it (`wfcel`
+/// `ValidateDefinition`): `wf_schema_version` "1", a `workflow_type`, an `input_schema`, states
+/// each with a name of its own, and an `initial_state` and `terminal_states` among them. None when
+/// the shape is right; its guards and actions are SY.wf-rules' to check.
+pub fn workflow_definition_shape_error(definition: &serde_json::Value) -> Option<String> {
+    use serde_json::Value;
+    let text = |key: &str| {
+        definition
+            .get(key)
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+    };
+    if !definition.is_object() {
+        return Some("the definition must be a JSON object".to_string());
+    }
+    if text("wf_schema_version") != "1" {
+        return Some("wf_schema_version must be \"1\"".to_string());
+    }
+    if text("workflow_type").trim().is_empty() {
+        return Some("workflow_type must not be empty".to_string());
+    }
+    if definition
+        .get("input_schema")
+        .and_then(Value::as_object)
+        .is_none_or(serde_json::Map::is_empty)
+    {
+        return Some("input_schema must not be empty".to_string());
+    }
+    let Some(states) = definition
+        .get("states")
+        .and_then(Value::as_array)
+        .filter(|states| !states.is_empty())
+    else {
+        return Some("states must contain at least one state".to_string());
+    };
+    let mut names = HashSet::new();
+    for (idx, state) in states.iter().enumerate() {
+        let name = state
+            .get("name")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        if name.trim().is_empty() || !names.insert(name) {
+            return Some(format!("states[{idx}] needs a name of its own"));
+        }
+    }
+    if !names.contains(text("initial_state")) {
+        return Some("initial_state must be one of the states".to_string());
+    }
+    let terminal = definition
+        .get("terminal_states")
+        .and_then(Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or_default();
+    if terminal
+        .iter()
+        .any(|name| !name.as_str().is_some_and(|name| names.contains(name)))
+    {
+        return Some("every terminal state must be one of the states".to_string());
+    }
+    None
+}
+
+/// The hash SY.wf-rules gives a workflow definition (`current_hash` in `list_workflows`):
+/// `sha256:` and the hex SHA-256 of the bytes it stores, which are Go's
+/// `json.MarshalIndent(definition, "", "  ")` and a newline, the definition decoded into `any`
+/// (`normalizeDefinitionBytes` and `HashDefinition` in go/sy-wf-rules/node/store.go).
+pub fn wf_rules_definition_hash(definition: &serde_json::Value) -> String {
+    let mut stored = String::new();
+    write_go_json(definition, 0, &mut stored);
+    stored.push('\n');
+    format!("sha256:{:x}", Sha256::digest(stored.as_bytes()))
+}
+
+/// `value` as Go's `json.MarshalIndent(value, "", "  ")` writes what it decoded into `any`: object
+/// keys sorted, every number a float64, strings with Go's escaping.
+fn write_go_json(value: &serde_json::Value, depth: usize, out: &mut String) {
+    use serde_json::Value;
+    match value {
+        Value::Null => out.push_str("null"),
+        Value::Bool(flag) => out.push_str(if *flag { "true" } else { "false" }),
+        Value::Number(number) => write_go_float(number.as_f64().unwrap_or_default(), out),
+        Value::String(text) => write_go_string(text, out),
+        Value::Array(items) if items.is_empty() => out.push_str("[]"),
+        Value::Array(items) => {
+            out.push('[');
+            for (index, item) in items.iter().enumerate() {
+                if index > 0 {
+                    out.push(',');
+                }
+                push_go_indent(depth + 1, out);
+                write_go_json(item, depth + 1, out);
+            }
+            push_go_indent(depth, out);
+            out.push(']');
+        }
+        Value::Object(map) if map.is_empty() => out.push_str("{}"),
+        Value::Object(map) => {
+            let mut keys: Vec<&String> = map.keys().collect();
+            keys.sort();
+            out.push('{');
+            for (index, key) in keys.into_iter().enumerate() {
+                if index > 0 {
+                    out.push(',');
+                }
+                push_go_indent(depth + 1, out);
+                write_go_string(key, out);
+                out.push_str(": ");
+                write_go_json(&map[key], depth + 1, out);
+            }
+            push_go_indent(depth, out);
+            out.push('}');
+        }
+    }
+}
+
+fn push_go_indent(depth: usize, out: &mut String) {
+    out.push('\n');
+    for _ in 0..depth {
+        out.push_str("  ");
+    }
+}
+
+/// A float64 as Go's encoding/json writes it: the shortest digits that read back as the same
+/// number, in exponent form below 1e-6 and from 1e21 (`1e-7`, `1e+21`), so `3.0` is `3`.
+fn write_go_float(number: f64, out: &mut String) {
+    let abs = number.abs();
+    if abs != 0.0 && !(1e-6..1e21).contains(&abs) {
+        let text = format!("{number:e}");
+        match text.split_once('e') {
+            Some((mantissa, exponent)) if !exponent.starts_with('-') => {
+                let _ = write!(out, "{mantissa}e+{exponent}");
+            }
+            _ => out.push_str(&text),
+        }
+    } else {
+        let _ = write!(out, "{number}");
+    }
+}
+
+/// A string as Go's encoding/json writes it: `json.Marshal` escapes `<`, `>`, `&`, U+2028 and
+/// U+2029 too.
+fn write_go_string(text: &str, out: &mut String) {
+    out.push('"');
+    for ch in text.chars() {
+        match ch {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            '\u{8}' => out.push_str("\\b"),
+            '\u{c}' => out.push_str("\\f"),
+            '<' | '>' | '&' | '\u{2028}' | '\u{2029}' => {
+                let _ = write!(out, "\\u{:04x}", u32::from(ch));
+            }
+            ch if u32::from(ch) < 0x20 => {
+                let _ = write!(out, "\\u{:04x}", u32::from(ch));
+            }
+            ch => out.push(ch),
+        }
+    }
+    out.push('"');
 }
 
 /// `desired_state.opa`: the solution's user OPA policy. There is one user policy for every hive
@@ -756,4 +1017,51 @@ pub struct RepairPacket {
 
 fn default_repair_packet_version() -> String {
     "0.1".to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    /// The expected values come from Go 1.25 running what SY.wf-rules runs on these definitions
+    /// (json.Unmarshal into `any`, normalizeDefinitionBytes, HashDefinition). The numbers are ones
+    /// serde_json and Go read as the same float64 (serde_json's default parser is off by one unit in
+    /// the last place on some, e.g. -3e25); in use, Go reads what serde_json wrote, the shortest
+    /// form of the float64 Archi holds, so it hashes that same number.
+    #[test]
+    fn the_definition_hash_is_the_one_wf_rules_reports() {
+        let simple = json!({ "b": 1.0, "a": [2, { "d": "<x>", "c": null }] });
+        let mut stored = String::new();
+        write_go_json(&simple, 0, &mut stored);
+        assert_eq!(
+            stored,
+            "{\n  \"a\": [\n    2,\n    {\n      \"c\": null,\n      \"d\": \"\\u003cx\\u003e\"\n    }\n  ],\n  \"b\": 1\n}"
+        );
+        assert_eq!(
+            wf_rules_definition_hash(&simple),
+            "sha256:c45d0346dcc816b7f54a73b1cd7e964dae7f502b27d8d148228601cc6633ca99"
+        );
+
+        // Key order, Go's number forms and Go's string escapes.
+        let tricky: serde_json::Value = serde_json::from_str(
+            r#"{"workflow_type":"demo","wf_schema_version":"1","initial_state":"start","states":[{"name":"start","entry_actions":[],"exit_actions":[{}],"transitions":[{"guard":"event.payload.n > 2 && a < b","target_state":"done","actions":[{"type":"set_variable","name":"x","value":"'<b>&amp;</b>'"}]}]},{"name":"done"}],"numbers":{"int":3,"float_int":1.0,"half":0.5,"neg":-7,"big":12345678901234567890,"tiny":1e-7,"small":0.000001,"huge":1e21,"just_under":1e20,"third":0.30000000000000004,"neg_zero":-0,"exp":2.5e-10,"neg_huge":-1e22},"text":{"quote":"say \"hi\"","backslash":"a\\b","newline":"l1\nl2","tab":"a\tb","cr":"a\rb","bs":"a\bb","ff":"a\fb","ctl":"a\u0001b\u001fc","del":"a\u007fb","seps":"x\u2028y\u2029z","accents":"Mendoza \u00e9 \u00f1 \u00fc","emoji":"\ud83d\udc1d","slash":"a/b"},"empty_obj":{},"empty_arr":[],"nested":[[],[{}],[1,[2,[3]]]],"flags":[true,false,null],"Zeta":1,"alpha":2,"Alpha":3,"_u":4,"10":5,"9":6}"#,
+        )
+        .expect("definition");
+        assert_eq!(
+            wf_rules_definition_hash(&tricky),
+            "sha256:419510afc7d42c75789add461314e76e661ab54ffdab2575c131378a13d98c1c"
+        );
+
+        let deployment: DesiredWfDeployment = serde_json::from_value(json!({
+            "hive": "motherbee",
+            "workflow_name": "invoice",
+            "definition": simple,
+        }))
+        .expect("deployment");
+        assert_eq!(
+            deployment.definition_hash(),
+            wf_rules_definition_hash(&simple)
+        );
+    }
 }

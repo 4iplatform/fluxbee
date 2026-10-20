@@ -10,8 +10,9 @@ use std::path::{Path, PathBuf};
 use uuid::Uuid;
 
 use super::pipeline_types::{
-    ArtifactAuditVerdict, ArtifactBundle, AuditFinding, AuditSeverity, AuditStatus,
-    BuildTaskPacket, FailureClass, RepairHint, RepairPacket,
+    valid_workflow_name, workflow_definition_shape_error, ArtifactAuditVerdict, ArtifactBundle,
+    AuditFinding, AuditSeverity, AuditStatus, BuildTaskPacket, FailureClass, RepairHint,
+    RepairPacket,
 };
 
 // ── TC-8: Artifact storage ────────────────────────────────────────────────
@@ -121,7 +122,7 @@ pub struct ApprovedArtifact {
 // SCOPE BOUNDARY (mandatory):
 // ArtifactAuditor validates structural and contract-level correctness only.
 // It does NOT validate:
-//   - semantic quality of prompts (system.txt content)
+//   - semantic quality of default configs
 //   - business correctness of configs or workflow logic
 //   - normative correctness of Rego logic
 //   - whether generated text is "good"
@@ -276,33 +277,47 @@ fn audit_runtime_package(
     }
 }
 
+/// A workflow artifact is what a wf_deployment carries: `{workflow_name, definition}`, the
+/// definition in the shape SY.wf-rules compiles.
 fn audit_workflow_definition(
     _packet: &BuildTaskPacket,
     bundle: &ArtifactBundle,
     findings: &mut Vec<AuditFinding>,
 ) {
-    let def = &bundle.artifact;
-
-    for field in &["workflow_name", "steps"] {
-        if def.get(*field).is_none() {
-            findings.push(AuditFinding {
-                code: "MISSING_WF_FIELD".to_string(),
-                field: Some(field.to_string()),
-                message: format!("workflow definition is missing required field '{field}'"),
-                severity: AuditSeverity::Error,
-            });
-        }
+    let artifact = &bundle.artifact;
+    match artifact.get("workflow_name").and_then(|v| v.as_str()) {
+        None => findings.push(AuditFinding {
+            code: "MISSING_WF_FIELD".to_string(),
+            field: Some("workflow_name".to_string()),
+            message: "workflow artifact is missing required field 'workflow_name'".to_string(),
+            severity: AuditSeverity::Error,
+        }),
+        Some(name) if !valid_workflow_name(name) => findings.push(AuditFinding {
+            code: "INVALID_WORKFLOW_NAME".to_string(),
+            field: Some("workflow_name".to_string()),
+            message: format!(
+                "workflow_name '{name}' is not one SY.wf-rules accepts: dot-separated parts of lowercase letters, digits and '-', each starting with a letter"
+            ),
+            severity: AuditSeverity::Error,
+        }),
+        Some(_) => {}
     }
-
-    // Check steps is a non-empty array
-    if let Some(steps) = def.get("steps").and_then(|v| v.as_array()) {
-        if steps.is_empty() {
-            findings.push(AuditFinding {
-                code: "EMPTY_STEPS".to_string(),
-                field: Some("steps".to_string()),
-                message: "workflow definition has an empty steps array".to_string(),
-                severity: AuditSeverity::Error,
-            });
+    match artifact.get("definition") {
+        None => findings.push(AuditFinding {
+            code: "MISSING_WF_FIELD".to_string(),
+            field: Some("definition".to_string()),
+            message: "workflow artifact is missing required field 'definition'".to_string(),
+            severity: AuditSeverity::Error,
+        }),
+        Some(definition) => {
+            if let Some(problem) = workflow_definition_shape_error(definition) {
+                findings.push(AuditFinding {
+                    code: "INVALID_WF_DEFINITION".to_string(),
+                    field: Some("definition".to_string()),
+                    message: problem,
+                    severity: AuditSeverity::Error,
+                });
+            }
         }
     }
 }
@@ -615,21 +630,61 @@ mod tests {
         assert!(verdict.blocking_issues.iter().any(|i| i == "INVALID_JSON"));
     }
 
+    /// The artifact seeds teach the programmer: each one passes this auditor.
     #[test]
-    fn workflow_missing_steps_returns_repairable() {
+    fn every_artifact_seed_passes_the_auditor() {
+        let seeds: Vec<CookbookEntryV2> = serde_json::from_str(include_str!(
+            "../../../seeds/cookbook/artifact_cookbook_v1.json"
+        ))
+        .expect("artifact seed");
+        for entry in seeds {
+            let kind = entry.successful_shape["artifact_kind"]
+                .as_str()
+                .expect("artifact_kind")
+                .to_string();
+            let packet = BuildTaskPacket {
+                artifact_kind: kind.clone(),
+                ..runtime_packet(vec!["ai.generic"])
+            };
+            let mut bundle = valid_runtime_bundle();
+            bundle.artifact_kind = kind;
+            bundle.artifact = entry.successful_shape["artifact"].clone();
+            let verdict = audit_artifact(&packet, &bundle);
+            assert_eq!(
+                verdict.status,
+                AuditStatus::Approved,
+                "{}: {:?}",
+                entry.pattern_key,
+                verdict.findings
+            );
+        }
+    }
+
+    #[test]
+    fn a_workflow_artifact_needs_a_definition_sy_wf_rules_accepts() {
         let packet = BuildTaskPacket {
             artifact_kind: "workflow_definition".to_string(),
             ..runtime_packet(vec![])
         };
         let mut bundle = valid_runtime_bundle();
         bundle.artifact_kind = "workflow_definition".to_string();
-        bundle.artifact = json!({ "workflow_name": "test-wf" }); // missing steps
-        let verdict = audit_artifact(&packet, &bundle);
-        assert_eq!(verdict.status, AuditStatus::Repairable);
-        assert!(verdict
-            .blocking_issues
-            .iter()
-            .any(|i| i == "MISSING_WF_FIELD"));
+        for (artifact, code) in [
+            (json!({ "workflow_name": "test-wf" }), "MISSING_WF_FIELD"),
+            (
+                json!({ "workflow_name": "test_wf", "definition": {} }),
+                "INVALID_WORKFLOW_NAME",
+            ),
+            // The made-up shape the seed used to show.
+            (
+                json!({ "workflow_name": "test-wf", "definition": { "steps": [{ "id": "s1" }] } }),
+                "INVALID_WF_DEFINITION",
+            ),
+        ] {
+            bundle.artifact = artifact;
+            let verdict = audit_artifact(&packet, &bundle);
+            assert_eq!(verdict.status, AuditStatus::Repairable);
+            assert!(verdict.blocking_issues.iter().any(|i| i == code), "{code}");
+        }
     }
 
     #[test]

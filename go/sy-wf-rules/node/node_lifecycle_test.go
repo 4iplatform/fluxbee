@@ -193,10 +193,22 @@ func TestAWFNodeThatIsNotRunningIsNotAskedForItsInstances(t *testing.T) {
 	}
 }
 
-// recordingSender captures what SY.wf-rules sends back.
-type recordingSender struct{ sent []fluxbeesdk.Message }
+// recordingSender captures what SY.wf-rules sends back. Its first refuse sends fail with err, or
+// the way the SDK refuses a frame over the limit when err is nil.
+type recordingSender struct {
+	sent   []fluxbeesdk.Message
+	refuse int
+	err    error
+}
 
 func (r *recordingSender) Send(msg fluxbeesdk.Message) error {
+	if r.refuse > 0 {
+		r.refuse--
+		if r.err != nil {
+			return r.err
+		}
+		return &fluxbeesdk.MessageTooLargeError{Size: 200 * 1024, Max: 128 * 1024}
+	}
 	r.sent = append(r.sent, msg)
 	return nil
 }

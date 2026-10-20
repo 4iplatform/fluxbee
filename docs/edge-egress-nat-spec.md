@@ -84,7 +84,7 @@ Consistent with Fluxbee's core principle: the egress hive opens outbound connect
 
 ### 3.4 Minimum configuration, sane defaults
 
-A single declared parameter (`lan_cidr`) drives derivation. The egress IP defaults to the first usable address of the CIDR but is overridable for dev environments where the internet-facing path is not `.1`.
+A single declared network parameter (`lan_cidr`) drives the NAT rules. The egress IP (`edge_ip`) is never guessed: it is the address the LAN interface carries, which the join reads on the host when `add_hive` omits it (FINDINGS A-1).
 
 ### 3.5 Fail loud, never silent
 
@@ -159,7 +159,7 @@ wan:
 egress:
   enabled: true
   lan_cidr: "192.168.8.0/24"          # the only required network parameter
-  edge_ip: "192.168.8.1"              # optional; default = first usable IP of lan_cidr
+  edge_ip: "192.168.8.1"              # the address lan_iface carries; add_hive reads it when omitted
   wan_iface: "eth0"                   # interface toward the internet
   lan_iface: "eth1"                   # interface toward the LAN
   ipv6: "blocked"                     # only "blocked" supported in v1
@@ -182,7 +182,7 @@ Field rules:
 |-------|----------|---------|-------|
 | `egress.enabled` | yes | — | Must be `true` for the orchestrator to apply NAT |
 | `egress.lan_cidr` | yes | — | IPv4 CIDR of the internal LAN |
-| `egress.edge_ip` | no | first usable IP of `lan_cidr` | The gateway's LAN address. Overridable for dev |
+| `egress.edge_ip` | no, in `add_hive` | the single address `lan_iface` carries inside `lan_cidr`, read on the host by the join | The gateway's LAN address, which the workers route through. An explicit one must be on `lan_iface`; none or several addresses fail the join. The egress' own hive.yaml always has it |
 | `egress.wan_iface` | yes | — | Internet-facing interface name |
 | `egress.lan_iface` | yes | — | LAN-facing interface name |
 | `egress.ipv6` | no | `"blocked"` | Only `"blocked"` accepted in v1 |
@@ -229,7 +229,7 @@ struct EgressSection {
     #[serde(default)]
     enabled: bool,
     lan_cidr: Option<String>,      // required when enabled
-    edge_ip: Option<String>,       // optional, derived if absent
+    edge_ip: Option<String>,       // optional in add_hive; the join reads it on the host
     wan_iface: Option<String>,     // required when enabled (egress hive)
     lan_iface: Option<String>,     // required when enabled (egress hive)
     #[serde(default = "default_ipv6_policy")]
@@ -320,7 +320,7 @@ All other call sites that pass `is_motherbee` into `system_nodes_for_role` / `va
 
 1. **Provisioning an egress hive** (`add_hive` with `role=egress`): emit a yaml with `role: egress`, the `egress` block (with `lan_cidr`, `edge_ip`, `wan_iface`, `lan_iface`, `ipv6`), and `system_nodes.egress`.
 
-   **Source of the egress params (added v1.0):** the host-specific NAT params (`lan_cidr`, `wan_iface`, `lan_iface`, optional `edge_ip`/`ipv6`) come from the **`add_hive` command payload**, under an `egress` object. They cannot come from motherbee's `hive.yaml`: interface names are host-specific and unknowable in advance. Motherbee validates them at request time (reusing `resolve_egress_nat_config`) and derives `edge_ip` when omitted. This contrasts with the worker-side `egress.gateway_ip`, which **is** declared once in motherbee's `hive.yaml` (§5.2) because it is global to the deployment. Example payload:
+   **Source of the egress params (added v1.0):** the host-specific NAT params (`lan_cidr`, `wan_iface`, `lan_iface`, optional `edge_ip`/`ipv6`) come from the **`add_hive` command payload**, under an `egress` object. They cannot come from motherbee's `hive.yaml`: interface names are host-specific and unknowable in advance. Motherbee validates them at request time (reusing `resolve_egress_nat_config`; an explicit `edge_ip` must be inside `lan_cidr`). Before it installs anything, the join reads the host over SSH (`egress_edge_ip_on_host`): an omitted `edge_ip` becomes the single address `lan_iface` carries inside `lan_cidr`, an explicit one must be on `lan_iface`, and both interfaces must exist; anything else fails the join with `EGRESS_LAN_LEG_INVALID`, asking for an explicit `edge_ip` when the addresses do not settle it (`EGRESS_LAN_LEG_NOT_VERIFIED` when the host cannot be read). Once the egress' orchestrator is up, the join reads the host again: the NAT table, forwarding, the IPv6 block and the LAN leg (`EGRESS_NAT_NOT_READY` when one is missing, `EGRESS_NAT_NOT_VERIFIED` when the host cannot be read). This contrasts with the worker-side `egress.gateway_ip`, which **is** declared once in motherbee's `hive.yaml` (§5.2) because it is global to the deployment. Example payload:
 
    ```json
    {
@@ -355,6 +355,8 @@ fn render_system_nodes_yaml(role: HiveRole, section: &RoleSystemNodes) -> String
 ### 6.5 Network reconciliation (the new work)
 
 This does not exist today and is the core of the egress feature. On startup and on reconcile, an egress hive's orchestrator must apply the network configuration described in §8. This runs only when `is_egress && egress.enabled`.
+
+After applying it, the orchestrator reads back what it set and checks the LAN leg (`serving_problems`, FINDINGS A-1): IPv4 forwarding on, IPv6 disabled, `wan_iface` and `lan_iface` present, `edge_ip` on `lan_iface`. nftables matches interfaces by name, so the table loads without them. Any of them missing fails the boot; after boot each one is a WARN and an `egress` drift alert on every drift tick.
 
 The orchestrator already has a firewall helper pattern (`open_firewall_rules_local` line 3331, `close_firewall_rules_local` line 3391, `ensure_core_firewall_local` line 3473). The egress NAT reconciliation should follow the same idempotent, marked-block approach but target **nftables** directly (§8), not the existing simple `ufw allow <port>` calls.
 
@@ -600,7 +602,7 @@ The v1 nftables `forward` chain (§8.2) is structured so the allow-list and logg
 ## 14. Open Questions for Implementation
 
 1. **Egress profile floor**: this spec sets the minimal profile to `SY.config.routes` only (plus `RT.gateway` and `SY.orchestrator` implicit in being a hive). Confirm during implementation that the local router boots cleanly with only `SY.config.routes`. If the router needs another SY node to register/initialize, add it and update §5.1.
-2. ~~**`edge_ip` derivation**~~ — **resolved**: "first usable IP" = `(network & mask) + 1`, computed with std `Ipv4Addr ↔ u32` bit-math; valid for any mask (no CIDR crate needed). `edge_ip` stays overridable, so config is unchanged either way.
+2. ~~**`edge_ip` derivation**~~ — **resolved (FINDINGS A-1)**: not derived. The first usable address of the CIDR was a guess that could name an address no interface carried, a gateway no worker reaches; the join reads the address `lan_iface` carries instead (§6.4).
 3. **nftables include mechanism**: dedicated `table inet fluxbee_egress` (self-contained, recommended) vs include file merged into the host's main ruleset. The dedicated table is cleaner for idempotent management; confirm no conflict with any existing host nftables policy.
 4. ~~**IP-echo endpoint for `egress_public_ip`**~~ — **resolved**: v1 verification is an ICMP ping to `fluxbee.ai` (`egress_internet_reachable`), confirming reachability only. Public-IP discovery via IP-echo is deferred to the fuller verification of the complete system.
 5. **conntrack defaults**: 262144 / hashsize 65536 are starting points. Tune to deployment scale.

@@ -68,8 +68,11 @@ pub fn create_function_calling_model(
   - leave `temperature` unset: current models reject it (gpt-5.5 and Claude 5, FINDINGS A-69);
   - Anthropic needs a token limit on every request, so the SDK sends 4,096 when
     `max_output_tokens` is unset; OpenAI uses the model's default;
-  - an answer cut at the limit is an error on the plain path of both providers and on Anthropic's
-    tool turns. An OpenAI tool turn does not check it yet; its usage record still says `truncated`.
+  - an answer cut at the limit is an error on both providers, plain path and tool turns alike
+    (`AiSdkError::is_truncated_answer`); its usage record says `truncated`.
+- **Every call has `MODEL_CALL_TIMEOUT` (5 min),** the provider's own retries included (Anthropic's
+  `send`). Past it the call fails with `AiSdkError::Timeout` and its usage record says `abandoned`.
+  The bound is for stuck connections: a long reasoning answer or an Archi stage fits in it.
 
 ### A tool loop
 
@@ -110,6 +113,9 @@ let answer = result.final_assistant_text;
 ```
 
 - A run that needs more than `max_turns` model turns ends in an error.
+- **After a failed run, whether a tool ran:** run the loop through
+  `ToolRunWatch::new(model.as_ref(), &tool_ran)` (an `AtomicBool`). Once a tool has run, a failure
+  is not retryable: sending the same request again would run that tool again.
 - `result.tokens_used` sums what the provider reported over the run.
 - The runner cuts a text input at 1,200 characters. A longer input has to go as
   `FunctionRunInput::current_user_parts`, which is sent as it is.
@@ -377,9 +383,15 @@ It does no advanced semantic compression; that belongs to cognition.
   - The runtime drains the dispatcher's `AI_RUNTIME_CHANNEL` (`"incoming"`). Declare that channel in
     the dispatcher's profile:
     `.command_channel(AI_RUNTIME_CHANNEL).post_pending_rule(RouteMatch::Any, RouteTarget::Command(AI_RUNTIME_CHANNEL))`.
-  - `RuntimeConfig::default()` gives 60 s per message, 4 workers and a queue of 128.
-  - A recoverable error, a handler timeout included, runs the message again, up to 3 attempts. A
-    slow model call can therefore cost up to three runs.
+  - `RuntimeConfig::default()` gives 4 workers, a queue of 128 and `DEFAULT_HANDLER_TIMEOUT`
+    (47 min) per message: a whole tool loop, `DEFAULT_MAX_TURNS` (8) model turns plus one plain
+    call, each bounded by `MODEL_CALL_TIMEOUT`, and 2 min for its tools.
+  - A handler runs once. When it returns an error or runs out of time it may already have called a
+    model (billed) or a tool that acts, so the runtime never runs it again: a conversational message
+    gets an error reply (`ai_runtime_error` or `ai_runtime_timeout`, `retryable: false`); a `system`
+    or `admin` request gets none, and its caller's own timeout reports it.
+  - Only the write of a reply is retried (`RuntimeConfig::write_retry`): a send that timed out or
+    was refused never queued it, so a reply cannot go out twice.
 - **A reply goes from the agent to whoever spoke:**
   - its `dst_ilk` is the incoming `src_ilk`;
   - its `src_ilk` is the agent's own ILK (`RuntimeConfig::self_ilk_id`, read from

@@ -15,8 +15,9 @@
           "args": {
             "hive": "motherbee",
             "node_name": "AI.example@motherbee",
-            "runtime": "AI.example",
-            "runtime_version": "current"
+            "runtime": "ai.example",
+            "runtime_version": "current",
+            "tenant_id": "tnt:43d576a3-d712-4d91-9245-5d5463dd693e"
           }
         }
       ]
@@ -25,7 +26,8 @@
       "runtime_version must be 'current' unless a specific version is required",
       "node_name must include the full @hive suffix",
       "runtime arg must NOT include @hive suffix — just the runtime name",
-      "hive must match the @hive suffix in node_name exactly"
+      "hive must match the @hive suffix in node_name exactly",
+      "an AI or IO node takes its client's tenant_id at the root of the args (tnt:<uuid>): SY.admin refuses its first spawn without one"
     ],
     "do_not_repeat": [
       "do not add publish_runtime_package before run_node if runtime is already materialized — check delta report payload_ref",
@@ -51,7 +53,7 @@
           "action": "publish_runtime_package",
           "args": {
             "hive": "motherbee",
-            "name": "AI.specialist",
+            "name": "ai.specialist",
             "version": "0.1.0",
             "source": {
               "kind": "inline_package",
@@ -78,11 +80,11 @@
   },
   {
     "layer": "plan_compile",
-    "pattern_key": "node_config_apply_restart",
-    "trigger": "Delta report contains NODE_CONFIG_APPLY_RESTART. WF or SY node with config drift that requires a restart to take effect.",
+    "pattern_key": "node_config_apply_hot",
+    "trigger": "Delta report contains NODE_CONFIG_APPLY_HOT: an AI or IO node whose stored config does not hold the config the manifest declares for it.",
     "inputs_signature": {
-      "compiler_class": "NODE_CONFIG_APPLY_RESTART",
-      "node_prefix": ["WF", "SY"]
+      "compiler_class": "NODE_CONFIG_APPLY_HOT",
+      "node_prefix": ["AI", "IO"]
     },
     "successful_shape": {
       "steps": [
@@ -91,31 +93,27 @@
           "action": "node_control_config_set",
           "args": {
             "hive": "motherbee",
-            "node_name": "WF.router@motherbee",
+            "node_name": "AI.support@motherbee",
+            "subsystem": "ai_node",
+            "schema_version": 1,
+            "config_version": 4,
+            "apply_mode": "replace",
             "config": {
-              "routing_table": "v2"
+              "behavior": { "kind": "ai_chat", "model": "gpt-5.5" }
             }
-          }
-        },
-        {
-          "id": "s2",
-          "action": "restart_node",
-          "args": {
-            "hive": "motherbee",
-            "node_name": "WF.router@motherbee"
           }
         }
       ]
     },
     "constraints": [
-      "node_control_config_set MUST come before restart_node — config is applied first, then node restarts to pick it up",
-      "both steps must reference the same hive and node_name",
-      "config in node_control_config_set must be the delta config (not the full config)"
+      "the config is the node's whole config (apply_mode replace): for ai.generic, behavior.kind ai_chat and model; it carries no prompt — the agent's prompt is its ILK definition",
+      "config_version is the node's current config_version plus one: read it with node_control_config_get while compiling the plan",
+      "subsystem is ai_node for an AI node"
     ],
     "do_not_repeat": [
-      "do not skip node_control_config_set and only restart — this leaves config unchanged",
-      "do not add restart_node for AI.* or IO.* nodes — those use NODE_CONFIG_APPLY_HOT with no restart",
-      "do not include unchanged config fields — only the fields that changed"
+      "do not put instructions in an ai.generic config — CONFIG_SET refuses them",
+      "do not add restart_node for AI.* or IO.* nodes — their config applies live",
+      "do not reuse an example config_version"
     ],
     "failure_class": null,
     "recorded_from_run": null,

@@ -32,7 +32,17 @@ pub enum AiSdkError {
 
 pub type Result<T> = std::result::Result<T, AiSdkError>;
 
+/// What the error of an answer cut at its token limit says, on either provider
+/// (`llm::truncated_answer_error`).
+pub(crate) const TRUNCATED_ANSWER_MARKER: &str = "response truncated: hit";
+
 impl AiSdkError {
+    /// The model's answer hit its token limit and was cut (`model_settings.max_output_tokens`).
+    /// The call was answered and billed; sending the same request again gets the same cut.
+    pub fn is_truncated_answer(&self) -> bool {
+        matches!(self, AiSdkError::Protocol(message) if message.contains(TRUNCATED_ANSWER_MARKER))
+    }
+
     pub fn is_recoverable(&self) -> bool {
         match self {
             AiSdkError::Node(node_err) => match node_err {

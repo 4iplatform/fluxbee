@@ -343,7 +343,7 @@ Parked consciously — the edge receives `ICH → owner_l2_name` either way.
   verified):** the unit does NOT order `sy-vault.service` — an ingress hive has no local `sy-vault`;
   the edge fetches its TLS cert from the **motherbee** `SY.vault` over the mesh at boot
   (`fetch_tls_config_from_vault`), fail-closed, with `Restart=always` retrying until the mesh is up.
-  `deb-prerm` stops it; `scripts/install.sh` has dev-path parity (identical unit ordering). Verified
+  `deb-prerm` stops it. Verified
   inside the built `.deb`: binary + unit + manifest entry present — the `MANIFEST_INVALID` gate now passes.
 - **H2 — ingress `system_nodes` template — DONE.** `config/hive.yaml` +
   `packaging/hive.yaml.example` ship `system_nodes.ingress = [SY.config.routes, SY.edge]`, so
@@ -442,5 +442,5 @@ not needed for the first proof.
   `EndpointRow`/`EndpointEntry` (485/500 — becomes `ICH → owner_l2_name`, drop `ilk`, add `meta.ich`
   stamp), fail-closed TLS (205–245), `filter_request_headers` (allowlist M2).
 - **add_ingress:** `sy_orchestrator.rs` `add_ingress_hive_flow` (17515), `IngressSection` (180),
-  manifest gate (17677); packaging `packaging/build-deb.sh`, `scripts/install.sh`; template
+  manifest gate (17677); packaging `packaging/build-deb.sh`; template
   `config/hive.yaml`, `packaging/hive.yaml.example`.

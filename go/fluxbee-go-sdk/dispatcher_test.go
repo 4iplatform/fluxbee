@@ -3,7 +3,9 @@ package sdk
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"strings"
 	"testing"
 	"time"
 )
@@ -363,5 +365,223 @@ func TestDispatcherCommandChannelDropWarnsOnceOnly(t *testing.T) {
 	dispatcher.dropMu.Unlock()
 	if !warned {
 		t.Fatalf("expected the one-shot warn flag to be set after drops")
+	}
+}
+
+// A-75 — a family-wide success matcher (RouteAnyMsgOfType) is never
+// registered as a reply shape: after awaiting a reply that way, a fresh
+// message of that kind is still the node's own traffic, on a catch-all
+// profile (io.cloud's, the 2026-08-26 outage) as on SY.timer's. A late
+// reply on the awaited trace is still dropped as stale. Mirror of Rust
+// `family_wide_success_matcher_never_poisons_command_traffic`.
+func TestDispatcherFamilySuccessMatcherNeverPoisonsCommandTraffic(t *testing.T) {
+	cases := []struct {
+		name     string
+		catchAll RouteMatch
+		kind     string
+		command  string
+	}{
+		{name: "catch-all profile", catchAll: RouteAny{}, kind: "user", command: "user"},
+		{name: "SY.timer profile", catchAll: RouteAnyMsgOfType{MsgType: SYSTEMKind}, kind: SYSTEMKind, command: "TIMER_SCHEDULE"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			dispatcher, tx, rx := newDispatcherTestHarness(t, NewOperationalRouteProfile().
+				CommandChannel("incoming").
+				PostPendingRule(tc.catchAll, RouteCommand{Channel: "incoming"}))
+			defer func() { _ = dispatcher.Close() }()
+			incoming, err := dispatcher.TakeCommandReceiver("incoming")
+			if err != nil {
+				t.Fatalf("take incoming: %v", err)
+			}
+
+			done := make(chan error, 1)
+			go func() {
+				_, err := dispatcher.SendWithMatcher(context.Background(), Message{
+					Routing: Routing{Dst: UnicastDestination("SY.peer@motherbee"), TTL: 16},
+					Meta:    Meta{MsgType: tc.kind, Msg: stringPtr("HANDOFF")},
+				}, PendingMatcher{Success: []RouteMatch{RouteAnyMsgOfType{MsgType: tc.kind}}},
+					RpcRequestLabels{Target: "SY.peer@motherbee", RequestMsg: "HANDOFF"}, 50*time.Millisecond)
+				done <- err
+			}()
+			request := decodeTestFrame(t, <-tx)
+			var rpcErr *RpcError
+			if err := <-done; !errors.As(err, &rpcErr) || rpcErr.Kind != RpcErrTimeout {
+				t.Fatalf("expected a timeout, got %v", err)
+			}
+			dispatcher.staleMu.Lock()
+			registered := len(dispatcher.responseOnly)
+			dispatcher.staleMu.Unlock()
+			if registered != 0 {
+				t.Fatalf("a family success matcher must not be registered as a reply shape (%d registered)", registered)
+			}
+
+			rx <- receivedMessage{msg: Message{
+				Routing: Routing{TraceID: request.Routing.TraceID},
+				Meta:    Meta{MsgType: tc.kind, Msg: stringPtr("LATE_REPLY")},
+			}}
+			rx <- receivedMessage{msg: Message{
+				Routing: Routing{TraceID: "fresh-trace"},
+				Meta:    Meta{MsgType: tc.kind, Msg: stringPtr(tc.command)},
+			}}
+			select {
+			case routed := <-incoming:
+				if routed.Routing.TraceID != "fresh-trace" {
+					t.Fatalf("the late reply leaked into 'incoming': %+v", routed)
+				}
+			case <-time.After(time.Second):
+				t.Fatalf("a fresh %q message was dropped", tc.kind)
+			}
+			if got := dispatcher.StaleResponseDrops(); got != 1 {
+				t.Fatalf("expected the late reply dropped as stale, got %d stale drops", got)
+			}
+			if got := dispatcher.UnknownResponseDrops(); got != 0 {
+				t.Fatalf("expected no unknown-response drops, got %d", got)
+			}
+		})
+	}
+}
+
+// A-75 — a family a post-pending rule sends to a broadcast channel keeps
+// fanning out after a request awaited a reply of that family. Mirror of
+// Rust `response_only_skips_profile_declared_observational_family`.
+func TestDispatcherObservationalFamilyKeepsFanningOut(t *testing.T) {
+	dispatcher, tx, rx := newDispatcherTestHarness(t, NewOperationalRouteProfile().
+		BroadcastChannel("query").
+		PostPendingRule(RouteAnyMsgOfType{MsgType: "query_response"}, RouteBroadcast{Channel: "query"}))
+	defer func() { _ = dispatcher.Close() }()
+	sub, err := dispatcher.Subscribe("query")
+	if err != nil {
+		t.Fatalf("subscribe: %v", err)
+	}
+
+	done := make(chan error, 1)
+	go func() {
+		_, err := dispatcher.SendWithMatcher(context.Background(), Message{
+			Routing: Routing{Dst: UnicastDestination("SY.target@motherbee"), TTL: 16},
+			Meta:    Meta{MsgType: "query", Msg: stringPtr("DO_QUERY")},
+		}, PendingMatcher{Success: []RouteMatch{RouteAnyMsgOfType{MsgType: "query_response"}}},
+			RpcRequestLabels{Target: "SY.target@motherbee", RequestMsg: "DO_QUERY"}, 50*time.Millisecond)
+		done <- err
+	}()
+	<-tx
+	if err := <-done; err == nil {
+		t.Fatalf("expected a timeout")
+	}
+
+	rx <- receivedMessage{msg: Message{
+		Routing: Routing{TraceID: "unrelated-trace"},
+		Meta:    Meta{MsgType: "query_response", Msg: stringPtr("ANY_RESPONSE_NAME")},
+	}}
+	select {
+	case routed := <-sub:
+		if routed.Meta.MsgType != "query_response" {
+			t.Fatalf("unexpected broadcast message: %+v", routed)
+		}
+	case <-time.After(time.Second):
+		t.Fatalf("the observational family stopped fanning out")
+	}
+	if got := dispatcher.UnknownResponseDrops(); got != 0 {
+		t.Fatalf("expected no unknown-response drops, got %d", got)
+	}
+}
+
+// A-75 — a catch-all (RouteAny) post-pending rule to a broadcast channel
+// declares no reply shape observational: exact reply shapes are still
+// registered, as in Rust (`post_pending_declares_observational_exact`).
+func TestDispatcherCatchAllBroadcastDoesNotExemptReplyShapes(t *testing.T) {
+	dispatcher, _, _ := newDispatcherTestHarness(t, NewOperationalRouteProfile().
+		BroadcastChannel("all").
+		PostPendingRule(RouteAny{}, RouteBroadcast{Channel: "all"}))
+	defer func() { _ = dispatcher.Close() }()
+
+	if _, err := dispatcher.SendSystemRPC(context.Background(), SystemRpcRequest{
+		Target:      "SY.target@motherbee",
+		RequestMsg:  "REQ",
+		ResponseMsg: "RESP",
+		Payload:     map[string]any{},
+		Timeout:     50 * time.Millisecond,
+	}); err == nil {
+		t.Fatalf("expected a timeout")
+	}
+	dispatcher.staleMu.Lock()
+	_, registered := dispatcher.responseOnly[RouteExact{MsgType: SYSTEMKind, Msg: "RESP"}]
+	dispatcher.staleMu.Unlock()
+	if !registered {
+		t.Fatalf("a catch-all broadcast rule must not exempt the exact reply shape")
+	}
+}
+
+// A-75 — SendSystemRPC sends ttl 16 unless Options.TTL says otherwise, like
+// SendAdminRPC and Rust `send_system_rpc`, so a request reaches a node on
+// another router or hive instead of dying with TTL_EXCEEDED.
+func TestSendSystemRPCDefaultsToRequestTTL(t *testing.T) {
+	cases := []struct {
+		name string
+		ttl  uint8
+		want uint8
+	}{
+		{name: "default", ttl: 0, want: 16},
+		{name: "explicit", ttl: 3, want: 3},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			dispatcher, tx, _ := newDispatcherTestHarness(t, NewOperationalRouteProfile())
+			defer func() { _ = dispatcher.Close() }()
+			done := make(chan struct{})
+			go func() {
+				defer close(done)
+				_, _ = dispatcher.SendSystemRPC(context.Background(), SystemRpcRequest{
+					Target:      "WF.demo@worker-1",
+					RequestMsg:  "WF_LIST_INSTANCES",
+					ResponseMsg: "WF_LIST_INSTANCES_RESPONSE",
+					Payload:     map[string]any{},
+					Timeout:     20 * time.Millisecond,
+					Options:     SystemEnvelopeOptions{TTL: tc.ttl},
+				})
+			}()
+			request := decodeTestFrame(t, <-tx)
+			<-done
+			if request.Routing.TTL != tc.want {
+				t.Fatalf("ttl = %d, want %d", request.Routing.TTL, tc.want)
+			}
+		})
+	}
+}
+
+// A-75 — an RPC whose request is over the frame limit fails at once with
+// RpcErrMessageTooLarge and leaves no pending request and no registered
+// reply shape. Mirror of Rust
+// `send_failure_does_not_register_response_only_shape`.
+func TestSendSystemRPCOversizeRequestLeavesNothingBehind(t *testing.T) {
+	dispatcher, tx, _ := newDispatcherTestHarness(t, NewOperationalRouteProfile())
+	defer func() { _ = dispatcher.Close() }()
+
+	_, err := dispatcher.SendSystemRPC(context.Background(), SystemRpcRequest{
+		Target:      "SY.target@motherbee",
+		RequestMsg:  "REQ",
+		ResponseMsg: "RESP",
+		Payload:     map[string]any{"blob": strings.Repeat("x", maxFrameSize)},
+		Timeout:     5 * time.Second,
+	})
+	var rpcErr *RpcError
+	if !errors.As(err, &rpcErr) || rpcErr.Kind != RpcErrMessageTooLarge {
+		t.Fatalf("expected RpcErrMessageTooLarge, got %v", err)
+	}
+	var tooLarge *MessageTooLargeError
+	if !errors.As(err, &tooLarge) || tooLarge.Max != maxFrameSize {
+		t.Fatalf("expected the *MessageTooLargeError cause, got %v", err)
+	}
+	if len(tx) != 0 {
+		t.Fatalf("the oversize request was queued")
+	}
+	dispatcher.pendingMu.Lock()
+	pending := len(dispatcher.pending)
+	dispatcher.pendingMu.Unlock()
+	dispatcher.staleMu.Lock()
+	registered := len(dispatcher.responseOnly)
+	dispatcher.staleMu.Unlock()
+	if pending != 0 || registered != 0 {
+		t.Fatalf("left behind: %d pending requests, %d reply shapes", pending, registered)
 	}
 }

@@ -1034,9 +1034,10 @@ fn handle_get(
     let key = request_key_required(&msg.payload)?;
     validate_key(&key)?;
     let record = store.get_record(&key)?.ok_or(VaultError::KeyNotFound)?;
-    authorize_read(caller, &record.metadata, well_known_system, include_value)?;
-    // Who reads it is settled; the value goes out only while its tenant is active.
+    // The value goes out under the read rules, and only while its tenant is active. The metadata
+    // follows the list rule: whoever may list sees it (`VaultStore::list`), and it carries no value.
     if include_value {
+        authorize_read(caller, &record.metadata, well_known_system)?;
         tenant_active(&record.metadata.tenant_id)?;
     }
     let mut payload = json!({
@@ -1653,8 +1654,8 @@ fn check_caller_binding(
     }
 }
 
-/// Model D' read authorization (vault_get plaintext + vault_get_metadata
-/// when `include_value=false`).
+/// Model D' read authorization of a secret's value (`VAULT_GET`). The metadata is not gated here:
+/// `VAULT_GET_METADATA` follows the list rule (`handle_get`).
 ///
 /// Rules:
 /// - Dedicated secret (`secret.ilk` set): only that ILK reads. **No admin
@@ -1672,7 +1673,6 @@ fn authorize_read(
     caller: &Caller,
     metadata: &VaultMetadata,
     well_known_system_ilks: &HashSet<String>,
-    _include_value: bool,
 ) -> VaultResult<()> {
     let secret_owner = secret_owner_ilk(metadata);
     let caller_ilk = caller.ilk_id.as_deref().filter(|v| !v.is_empty());
@@ -2096,7 +2096,7 @@ mod tests {
         let caller = caller(Some("ilk:owner"), None, None);
         let metadata = metadata("tnt:client", Some("ilk:owner"));
 
-        authorize_read(&caller, &metadata, &HashSet::new(), true).expect("owner reads own secret");
+        authorize_read(&caller, &metadata, &HashSet::new()).expect("owner reads own secret");
     }
 
     #[test]
@@ -2104,7 +2104,7 @@ mod tests {
         let caller = caller(Some("ilk:other"), Some("tnt:client"), Some("system"));
         let metadata = metadata("tnt:client", Some("ilk:owner"));
 
-        assert_unauthorized(authorize_read(&caller, &metadata, &HashSet::new(), true));
+        assert_unauthorized(authorize_read(&caller, &metadata, &HashSet::new()));
     }
 
     #[test]
@@ -2113,7 +2113,7 @@ mod tests {
         let metadata = metadata(fluxbee_sdk::DEFAULT_ROOT_TENANT_ID, None);
         let well_known_system_ilks = HashSet::from(["ilk:sy-storage".to_string()]);
 
-        authorize_read(&caller, &metadata, &well_known_system_ilks, true)
+        authorize_read(&caller, &metadata, &well_known_system_ilks)
             .expect("well-known system caller reads root pool");
     }
 
@@ -2157,7 +2157,7 @@ mod tests {
         let caller = caller(Some("ilk:unknown"), None, None);
         let metadata = metadata(fluxbee_sdk::DEFAULT_ROOT_TENANT_ID, None);
 
-        assert_unauthorized(authorize_read(&caller, &metadata, &HashSet::new(), true));
+        assert_unauthorized(authorize_read(&caller, &metadata, &HashSet::new()));
     }
 
     #[test]
@@ -2165,8 +2165,7 @@ mod tests {
         let caller = caller(Some("ilk:client-node"), Some("tnt:client"), Some("ai"));
         let metadata = metadata("tnt:client", None);
 
-        authorize_read(&caller, &metadata, &HashSet::new(), true)
-            .expect("same tenant reads tenant pool");
+        authorize_read(&caller, &metadata, &HashSet::new()).expect("same tenant reads tenant pool");
     }
 
     #[test]
@@ -2174,7 +2173,7 @@ mod tests {
         let caller = caller(Some("ilk:client-node"), Some("tnt:client-a"), Some("ai"));
         let metadata = metadata("tnt:client-b", None);
 
-        assert_unauthorized(authorize_read(&caller, &metadata, &HashSet::new(), true));
+        assert_unauthorized(authorize_read(&caller, &metadata, &HashSet::new()));
     }
 
     #[test]
@@ -2220,23 +2219,21 @@ mod tests {
         let node = |ilk: &str| caller(Some(ilk), Some("tnt:client-a"), Some("agent"));
         let mut slack = metadata("tnt:client-a", None);
         slack.assigned_ilks = vec!["ilk:sales".to_string(), "ilk:support".to_string()];
-        authorize_read(&node("ilk:sales"), &slack, &none, true).expect("assigned");
-        assert_unauthorized(authorize_read(&node("ilk:billing"), &slack, &none, true));
+        authorize_read(&node("ilk:sales"), &slack, &none).expect("assigned");
+        assert_unauthorized(authorize_read(&node("ilk:billing"), &slack, &none));
         // General (no owner, no assigned node): every node of its tenant, nobody else.
         slack.assigned_ilks.clear();
-        authorize_read(&node("ilk:billing"), &slack, &none, true).expect("general");
+        authorize_read(&node("ilk:billing"), &slack, &none).expect("general");
         assert_unauthorized(authorize_read(
             &caller(Some("ilk:x"), Some("tnt:client-b"), Some("agent")),
             &slack,
             &none,
-            true,
         ));
         // A person's secret: its assigned node reads it, the rest of the tenant does not.
         let mut erp = metadata("tnt:client-a", Some("ilk:person"));
         erp.assigned_ilks = vec!["ilk:agent".to_string()];
-        authorize_read(&node("ilk:agent"), &erp, &none, true)
-            .expect("assigned to a person's secret");
-        assert_unauthorized(authorize_read(&node("ilk:billing"), &erp, &none, true));
+        authorize_read(&node("ilk:agent"), &erp, &none).expect("assigned to a person's secret");
+        assert_unauthorized(authorize_read(&node("ilk:billing"), &erp, &none));
     }
 
     #[test]
@@ -2295,6 +2292,56 @@ mod tests {
         let err = ensure_tenant_active(nowhere, "tnt:11111111-1111-4111-8111-111111111111")
             .expect_err("no SHM");
         assert_eq!(err.code(), "IDENTITY_UNAVAILABLE");
+        cleanup(dir);
+    }
+
+    /// The metadata follows the list rule: SY.admin (root tenant, neither owner nor assigned)
+    /// reads the metadata of an owned, an assigned and another tenant's general secret, as
+    /// VAULT_LIST already shows it. The value still follows the read rules (FINDINGS A-76).
+    #[test]
+    fn metadata_follows_the_list_rule_and_the_value_the_read_rules() {
+        let (mut store, dir) = open_test_store([5u8; 32]);
+        let admin = admin_caller();
+        let owned = metadata("tnt:client-a", Some("ilk:owner"));
+        let mut assigned = metadata("tnt:client-a", None);
+        assigned.assigned_ilks = vec!["ilk:sales".to_string()];
+        let general = metadata("tnt:client-a", None);
+        for (key, meta) in [
+            ("edge-secret", owned),
+            ("slack:client-a:bot", assigned),
+            ("pg:client-a:pool", general),
+        ] {
+            store
+                .put(key, json!({"v": key}), meta, &admin)
+                .expect("put");
+        }
+        let active = |_: &str| -> VaultResult<()> { Ok(()) };
+        let wk = HashSet::from(["ilk:admin".to_string()]);
+        for key in ["edge-secret", "slack:client-a:bot", "pg:client-a:pool"] {
+            let request = vault_request(MSG_VAULT_GET_METADATA, json!({ "key": key }));
+            let got =
+                handle_get(&mut store, &request, &admin, &wk, false, &active).expect("metadata");
+            assert_eq!(got["key"], json!(key));
+            assert_eq!(got["metadata"]["tenant_id"], json!("tnt:client-a"));
+            assert!(
+                got.get("value").is_none(),
+                "metadata never carries the value"
+            );
+            let request = vault_request(MSG_VAULT_GET, json!({ "key": key }));
+            let err = handle_get(&mut store, &request, &admin, &wk, true, &active)
+                .expect_err("not its value");
+            assert_eq!(err.code(), "UNAUTHORIZED", "{key}");
+        }
+        // Who may read the value still reads it.
+        let owner = caller(Some("ilk:owner"), Some("tnt:client-a"), Some("agent"));
+        let request = vault_request(MSG_VAULT_GET, json!({"key": "edge-secret"}));
+        let got = handle_get(&mut store, &request, &owner, &wk, true, &active).expect("value");
+        assert_eq!(got["value"]["v"], json!("edge-secret"));
+        // A key that does not exist is still not found.
+        let request = vault_request(MSG_VAULT_GET_METADATA, json!({"key": "nothing-here"}));
+        let err =
+            handle_get(&mut store, &request, &admin, &wk, false, &active).expect_err("missing");
+        assert_eq!(err.code(), "KEY_NOT_FOUND");
         cleanup(dir);
     }
 
@@ -2504,21 +2551,21 @@ mod tests {
         };
         let genesis_pool = metadata(fluxbee_sdk::DEFAULT_ROOT_TENANT_ID, None);
         let local_system = HashSet::new();
-        let err = authorize_read(&remote, &genesis_pool, &local_system, true).unwrap_err();
+        let err = authorize_read(&remote, &genesis_pool, &local_system).unwrap_err();
         assert_eq!(err.code(), "IDENTITY_UNAVAILABLE");
         // Once the SHM holds it, it reads.
         let known = Caller {
             ilk_type: Some("system".to_string()),
             ..remote.clone()
         };
-        assert!(authorize_read(&known, &genesis_pool, &local_system, true).is_ok());
+        assert!(authorize_read(&known, &genesis_pool, &local_system).is_ok());
         // A name that is not a system node's, or an ILK that is not the one derived from it: refused.
         let impostor = Caller {
             l2_name: Some("IO.x@worker1".to_string()),
             ..remote.clone()
         };
         assert_eq!(
-            authorize_read(&impostor, &genesis_pool, &local_system, true)
+            authorize_read(&impostor, &genesis_pool, &local_system)
                 .unwrap_err()
                 .code(),
             "UNAUTHORIZED"
@@ -2528,7 +2575,7 @@ mod tests {
             ..remote
         };
         assert_eq!(
-            authorize_read(&wrong_ilk, &genesis_pool, &local_system, true)
+            authorize_read(&wrong_ilk, &genesis_pool, &local_system)
                 .unwrap_err()
                 .code(),
             "UNAUTHORIZED"

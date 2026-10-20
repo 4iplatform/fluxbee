@@ -3,6 +3,7 @@ package node
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -375,6 +376,55 @@ func TestANodeWithoutAConfigInUseAnswersControlAndDropsWorkflowTraffic(t *testin
 	}
 	if len(disp.sent) != sent {
 		t.Fatal("workflow traffic is dropped, not answered")
+	}
+}
+
+// A reply refused as over the frame limit is answered with the error its handler uses for other
+// failures, so the requester does not wait out its timeout. Any other send failure (the queue full
+// during a reconnect) gets no error reply: the work may be done, and the requester's timeout reads
+// "unknown, not failed". Either failure reaches the receive loop's log; the status reply has no
+// error form (A-75).
+func TestARefusedReplyIsAnsweredWithAnError(t *testing.T) {
+	plane := bootstrap(t, writeNodeConfig(t, spawnConfig(writeWorkflowPackage(t, validWorkflowJSON()))))
+	statusGet := sdk.MSGNodeStatusGet
+	tooLarge := &sdk.MessageTooLargeError{Size: 200 * 1024, Max: 128 * 1024}
+	queueFull := errors.New("sender queue full")
+	cases := []struct {
+		name    string
+		msg     sdk.Message
+		sendErr error  // how the first send fails
+		reply   string // the error reply's msg; empty when nothing replaces the failed reply
+		failed  string // the error code, as the error reply carries it
+	}{
+		{name: "WF_GET_CODE", msg: msgWithName(MsgWFGetCode), sendErr: tooLarge, reply: MsgWFGetCodeResponse, failed: `"error":"INTERNAL_ERROR"`},
+		{name: "CONFIG_GET", msg: configGet(t), sendErr: tooLarge, reply: sdk.MSGConfigResponse, failed: `"code":"` + sdk.ErrCodeInternal + `"`},
+		{name: "NODE_STATUS_GET", msg: sdk.Message{Routing: sdk.Routing{Src: "orchestrator-uuid", TraceID: "t-status"}, Meta: sdk.Meta{MsgType: "system", Msg: &statusGet}}, sendErr: tooLarge},
+		{name: "queue full", msg: msgWithName(MsgWFGetCode), sendErr: queueFull},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			rt, _ := newRuntime(t, plane, true)
+			disp := &flakyDispatcher{failFirst: 1, err: c.sendErr}
+			rt.ActCtx.Dispatcher = disp
+			if err := Dispatch(context.Background(), c.msg, rt); !errors.Is(err, c.sendErr) {
+				t.Fatalf("the failed reply must reach the receive loop's log, got %v", err)
+			}
+			if c.reply == "" {
+				if len(disp.sent) != 0 {
+					t.Fatalf("sent %d messages after the failed reply, want none", len(disp.sent))
+				}
+				return
+			}
+			if len(disp.sent) != 1 {
+				t.Fatalf("sent %d messages after the refused reply, want the error reply", len(disp.sent))
+			}
+			reply := disp.sent[0]
+			body := string(reply.Payload)
+			if derefString(reply.Meta.Msg) != c.reply || !strings.Contains(body, `"ok":false`) ||
+				!strings.Contains(body, c.failed) || !strings.Contains(body, "message too large") {
+				t.Fatalf("error reply %s: %s", derefString(reply.Meta.Msg), body)
+			}
+		})
 	}
 }
 

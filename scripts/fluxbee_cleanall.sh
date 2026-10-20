@@ -5,10 +5,10 @@
 # the host has no Fluxbee runtime state, no node configs, no secrets,
 # no databases, no vault DB/key, no SHM, no sockets — only your repo at ~/fluxbee.
 #
-# Then run scripts/install.sh from the repo to bring the system back as
-# if installed for the first time. After install you must:
-#   - Re-set the OpenAI API key for SY.architect (CONFIG_SET via chat).
-#   - Re-fill any IO node *.env files (Slack tokens, etc.).
+# To bring the system back as if installed for the first time, purge the package (the wipe
+# removed files it installed, and dpkg does not restore a removed conffile), install it again
+# (scripts/install.sh from the repo builds and installs it), edit /etc/fluxbee/hive.yaml and run
+# `sudo fluxbee-firstboot`. The script prints these steps when it ends.
 #
 # Postgres databases (fluxbee, fluxbee_identity, fluxbee_storage) are dropped only
 # when the configured database URL points at the local host. A remote URL
@@ -211,9 +211,9 @@ fi
 step "Cleanall complete. Host has no Fluxbee state."
 echo
 echo "Next steps:"
-echo "  1. cd ~/fluxbee   # or wherever your repo lives"
-echo "  2. sudo ./scripts/install.sh"
-echo "  3. After install completes, set the OpenAI API key for SY.architect"
-echo "     (CONFIG_SET via chat: POST /architect/control/config-set)."
-echo "  4. Create IO/AI/WF node instances through orchestrator/admin using the"
-echo "     runtimes published by install.sh."
+echo "  1. sudo apt-get purge -y fluxbee   # dpkg does not restore a removed conffile"
+echo "  2. cd ~/fluxbee && scripts/install.sh [VERSION]   # builds the .deb and installs it"
+echo "     (or: sudo apt-get install fluxbee, from the apt repository)"
+echo "  3. Edit /etc/fluxbee/hive.yaml, then: sudo fluxbee-firstboot"
+echo "  4. Load the AI provider key for the core into SY.vault (fluxbee-firstboot prints"
+echo "     what is missing), then launch the IO/AI/WF nodes again through SY.admin."

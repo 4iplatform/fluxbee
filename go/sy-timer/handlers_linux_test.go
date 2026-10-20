@@ -6,6 +6,8 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -14,13 +16,24 @@ import (
 	"github.com/google/uuid"
 )
 
+// stubSender queues what the service sends. Its first refuse sends fail with err, or the way the
+// SDK refuses a frame over the limit when err is nil.
 type stubSender struct {
 	uuid     string
 	fullName string
 	tx       chan []byte
+	refuse   int
+	err      error
 }
 
 func (s *stubSender) Send(msg fluxbeesdk.Message) error {
+	if s.refuse > 0 {
+		s.refuse--
+		if s.err != nil {
+			return s.err
+		}
+		return &fluxbeesdk.MessageTooLargeError{Size: 200 * 1024, Max: 128 * 1024}
+	}
 	data, err := json.Marshal(msg)
 	if err != nil {
 		return err
@@ -75,6 +88,96 @@ func TestRespondTimerSchedulePersistsOwnedTimer(t *testing.T) {
 	timerUUID, fireAtUTCMS := mustPeekScheduledTimer(t, service.scheduler)
 	if timerUUID != *response.TimerUUID || fireAtUTCMS != row.FireAtUTC {
 		t.Fatalf("unexpected scheduled heap entry: uuid=%s fire_at=%d row=%+v", timerUUID, fireAtUTCMS, row)
+	}
+}
+
+// A TIMER_RESPONSE refused as over the frame limit is answered with a TIMER_INTERNAL error, so the
+// requester does not wait out its timeout. Any other send failure (the queue full during a
+// reconnect) gets no error reply: the work may be done, and the requester's timeout reads
+// "unknown, not failed". Either failure still reaches the run loop's log (A-75).
+func TestRefusedTimerResponseIsAnsweredWithAnError(t *testing.T) {
+	queueFull := errors.New("sender queue full")
+	for _, tc := range []struct {
+		name       string
+		sendErr    error
+		errorReply bool
+	}{
+		{name: "over the frame limit", errorReply: true},
+		{name: "send queue full", sendErr: queueFull},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			service, tx := newTestService(t)
+			service.sender.(*stubSender).refuse = 1
+			service.sender.(*stubSender).err = tc.sendErr
+			msg := mustBuildSystemMessage(t, map[string]any{}, "TIMER_LIST")
+
+			err := service.respondTimerList(msg)
+			var tooLarge *fluxbeesdk.MessageTooLargeError
+			if !errors.As(err, &tooLarge) && !errors.Is(err, queueFull) {
+				t.Fatalf("the failed response must reach the run loop's log, got %v", err)
+			}
+			if !tc.errorReply {
+				if len(tx) != 0 {
+					t.Fatalf("sent an error reply for a response that was only not sent now")
+				}
+				return
+			}
+			response := mustReadTimerResponse(t, tx)
+			if response.OK || response.Verb != "TIMER_LIST" || response.Error == nil || response.Error.Code != "TIMER_INTERNAL" ||
+				!strings.Contains(response.Error.Message, "message too large") {
+				t.Fatalf("unexpected error reply: %+v (error %+v)", response, response.Error)
+			}
+		})
+	}
+}
+
+// SY.timer answers requests only. A message the router made (no src_l2_name), such as the
+// UNREACHABLE for a TIMER_FIRED whose target is not connected, and a reply from a node get no
+// answer: answering the router's UNREACHABLE would bounce between SY.timer and the router forever.
+// An unknown verb from a node is still answered TIMER_INTERNAL.
+func TestRouterNoticesAndRepliesGetNoAnswer(t *testing.T) {
+	notice := func(msgName, srcL2Name string) fluxbeesdk.Message {
+		msg, err := fluxbeesdk.BuildSystemMessage(
+			"33333333-3333-3333-3333-333333333333",
+			fluxbeesdk.UnicastDestination("timer-node-uuid"),
+			16,
+			uuid.NewString(),
+			msgName,
+			map[string]any{"original_dst": "WF.demo@motherbee", "reason": "NODE_NOT_FOUND"},
+		)
+		if err != nil {
+			t.Fatalf("build %s: %v", msgName, err)
+		}
+		if srcL2Name != "" {
+			msg.Routing.SrcL2Name = &srcL2Name
+		}
+		return msg
+	}
+	for _, tc := range []struct {
+		name     string
+		msg      fluxbeesdk.Message
+		answered bool
+	}{
+		{name: "UNREACHABLE from the router", msg: notice(fluxbeesdk.MSGUnreachable, "")},
+		{name: "TTL_EXCEEDED from the router", msg: notice(fluxbeesdk.MSGTTLExceeded, "")},
+		{name: "TIMER_RESPONSE from a node", msg: notice(fluxbeesdk.MsgTimerResponse, "SY.timer@worker1")},
+		{name: "unknown verb from a node", msg: notice("TIMER_UNKNOWN", "WF.demo@motherbee"), answered: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			service, tx := newTestService(t)
+			if err := service.handleMessage(tc.msg); err != nil {
+				t.Fatalf("handle: %v", err)
+			}
+			if !tc.answered {
+				if len(tx) != 0 {
+					t.Fatalf("answered a %s", stringValue(tc.msg.Meta.Msg))
+				}
+				return
+			}
+			if response := mustReadTimerResponse(t, tx); response.OK || response.Error == nil || response.Error.Code != "TIMER_INTERNAL" {
+				t.Fatalf("unexpected answer to an unknown verb: %+v", response)
+			}
+		})
 	}
 }
 

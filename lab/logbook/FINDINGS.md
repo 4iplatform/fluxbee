@@ -8,7 +8,9 @@
 > touched and nothing is patched to make it work**. A failure is **data**, not an obstacle.
 > Everything that shows up here is discussed with the operator **before** it becomes a change.
 
-**States:** 🔴 confirmed in code · 🟡 observed (cause still to be confirmed) · 🟢 resolved/no change required
+**States:** 🔴 confirmed in code, open · 🟡 partial, parked or observed (the heading says which) ·
+🔵 to evaluate · ✅ resolved (the heading names the version and how it was validated) · 🟢 lab note or
+no change required
 
 ---
 
@@ -82,7 +84,9 @@
   once the egress is working. **To discuss:** is it intentional (MB must have its own way out) or
   is it a gap?
 
-### A-5 🟡 A freshly booted clone **is not ready** for `add_hive`
+### A-5 ✅ RESOLVED (0.1.60 with A-52, validated 0.1.61) — A freshly booted clone **is not ready** for `add_hive`
+
+- **Status (2026-10-19 review):** `wait_for_host_to_settle` runs in the three join flows; a fresh clone waited 8 minutes (ledger 0.1.61) and joined again on 0.1.62.
 
 - **What happens:** the first boot of a VM cloned from the cloud image triggers automatic updates
   (`unattended-upgrades`), **reboots by itself**, and during that time the `qemu-guest-agent`
@@ -227,7 +231,7 @@
   (15 → 0 local changes); after that `WF.w1probe@worker1` became HEALTHY: the first WF running on
   a worker.
 
-### A-22 🟡 PARTIAL (0.1.44) · rest DEFERRED — A local node could send messages as another node
+### A-22 🟡 PARTIAL (0.1.44) · the rest (P-1) PARKED — A local node could send messages as another node
 
 - **What happened:** the router looked up a frame's sender by the `routing.src` the frame declared,
   and from there stamped its L2 name, which is what the gate uses to decide protected actions.
@@ -251,7 +255,9 @@
   (A-20 / D-2), signing the published manifest (P-8), `get_policy` exposing the rego (P-16), and
   encrypting the synced copy (already deferred in the design).
 
-### A-23 🟡 RESOLVED (0.1.48) · multiple solutions SIMPLIFIED, to review — The architect modeled OPA per hive; there is one single global policy
+### A-23 ✅ RESOLVED (0.1.48) · composing several solutions' policies and a registered owner PARKED — The architect modeled OPA per hive; there is one single global policy
+
+- **Status (2026-10-19 review):** what stayed "to review" is still not built: the last solution's policy wins and its owner is deduced, not stored. That was the operator's decision of 2026-10-01, not a defect.
 
 - **What happens (seen in code, 2026-10-01):** a solution declares `opa_deployments` per hive
   (`hive`, `policy_id`, `rego_source`) and the plan emits one `opa_compile_apply` for each.
@@ -297,7 +303,9 @@
     SY.wf-rules (that is how it is, by role). A solution that names a DMZ hive still ends up with
     an incomplete snapshot, and that blocks the run. On worker1 the five reads come back ok.
 
-### A-25 🟡 RESOLVED (0.1.49) — The `.deb` did not install the architect's handbook (`install.sh` did)
+### A-25 ✅ RESOLVED (0.1.49, the handbook found on the motherbee) — The `.deb` did not install the architect's handbook (`install.sh` did)
+
+- **Status (2026-10-19 review):** `packaging/build-deb.sh` installs `docs/archi/handbook_fluxbee.md`; the 0.1.49 gate found it on the motherbee.
 
 - **What happens (2026-10-01):** the architect appends `/etc/fluxbee/handbook_fluxbee.md` to its
   prompts if it exists. `install.sh` copies it, `build-deb.sh` does not: it is not on the 8.x
@@ -305,7 +313,9 @@
 - **Fix (0.1.49):** `build-deb.sh` installs it in the same place (a static document: it is
   replaced on every upgrade, it is not a conffile).
 
-### A-26 🟡 RESOLVED (0.1.49) — The architect read its secrets from the vault only once, at startup
+### A-26 ✅ RESOLVED (0.1.49, validated) — The architect read its secrets from the vault only once, at startup
+
+- **Status (2026-10-19 review):** `resolve_resource_awaiting_vault` waits for the vault at boot (`VAULT_BOOT_WAIT`); re-reads after a vault notice or a `CONFIG_SET` are still one-shot, as in the sibling nodes.
 
 - **What was seen (2026-10-01, when installing 0.1.47 and 0.1.48):** at startup, the architect
   could not read its AI key or the URL of its message database (`vault unreachable`): during an
@@ -621,7 +631,7 @@ The operator's answer (2026-10-02): *"sí a todo"* ("yes to everything").
   PROD were deleted.
 
 
-### A-42 🔴 DEFERRED (security package) — The merge by email does not verify that the email belongs to whoever writes it
+### A-42 🟡 PARKED (security package, 2026-10-02) — The merge by email does not verify that the email belongs to whoever writes it
 
 - **What happens (since 0.1.54, A-37):** if someone writes the email of another person in the same
   tenant, SY.identity does the merge, and their channel becomes associated with that person's ILK.
@@ -751,7 +761,9 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
 
   Only the ones that write the manifest stop: the orchestrator was down for 44 s.
 
-### A-46 🟡 STAGE 1 DONE (0.1.57): the ingress no longer reaches Archi; the rest of the posture, in design — Archi's HTTP API has no authentication and is reachable from the ingress
+### A-46 ✅ RESOLVED (0.1.57: the ingress no longer reaches Archi) · the stage-4 firewall and Archi's API auth PARKED — Archi's HTTP API has no authentication and is reachable from the ingress
+
+- **Status (2026-10-19 review):** stage 1 (loopback binds) shipped in 0.1.57 and stages 2-3 closed with A-47; the stage-4 firewall and authentication for Archi's API are parked in the posture table (2026-10-07).
 
 - **What happens (verified on 2026-10-03, in the node survey):**
   - SY.architect's axum router (`sy_architect.rs`, `Router::new()`) has no authentication layer at
@@ -894,7 +906,7 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
     in design: round 3 found that, as it was written, it cut off every existing hive (§8 of the
     doc).
 
-### A-49 🟡 TO FIX — The apt repo is not signed (`[trusted=yes]`): whoever impersonates it is root on the motherbee
+### A-49 🟡 PARKED (waits for O9) — The apt repo is not signed (`[trusted=yes]`): whoever impersonates it is root on the motherbee
 
 - **What happens (DTAP panel 2026-10-05, P-14, verified):**
   - The motherbee installs from `http://10.10.10.50:8900` with `[trusted=yes]`, because the repo
@@ -944,7 +956,7 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
 - **Status:** validated in 0.1.58 (2026-10-06): the first round removed egress1 from
   `fluxbee-blob`, and the pending offer disappeared from the egress.
 
-### A-51 🟡 FIXED IN 0.1.60 ON THE MOTHERBEE (on the spokes, open until a signed manifest) — root wrote into the `fluxbee` user's directories following names that user controls
+### A-51 🟡 FIXED ON THE MOTHERBEE (0.1.60) · the spokes PARKED with O9 (a signed manifest) — root wrote into the `fluxbee` user's directories following names that user controls
 
 - **What happens (adversarial review of stage 2, 2026-10-06):**
   - `ensure_owned_tree` leaves all of `/var/lib/fluxbee/dist` owned by the Syncthing user
@@ -1015,7 +1027,9 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
 - **Validated (2026-10-06):** a new clone of VM 104, joined as soon as it booted, waited 8 min in
   `waiting_for_host` while cloud-final ran, and then completed the join (ledger 0.1.61).
 
-### A-53 🟡 FIXED IN 0.1.58 (the next join exercises it) — `local_syncthing_device_id` always failed with Syncthing v2 and fell back to the first device in `config.xml`
+### A-53 ✅ RESOLVED (0.1.58; exercised by the joins of 0.1.61 and 0.1.62) — `local_syncthing_device_id` always failed with Syncthing v2 and fell back to the first device in `config.xml`
+
+- **Status (2026-10-19 review):** the code no longer reads `config.xml` for the local device id; the worker2 joins of 0.1.61 and 0.1.62 linked the peer. PROD's motherbee id sorts first, so a join cannot tell the old fallback from the fix: the code is the proof.
 
 - **What happens (verified on 2026-10-06 on the PROD motherbee, read-only):**
   - The orchestrator asked for the ID with `syncthing --home … --device-id`; the v2.0.14 binary
@@ -1776,7 +1790,7 @@ router reviews.
 
   Detail in `lab/DEPLOYMENTS.md`.
 
-### A-65 🟡 PARTIAL, VALIDATED ON 8.x (0.1.67, 2026-10-15) · the rest is P-1, deferred — The vault believed the ILK the node itself declared
+### A-65 ✅ VALIDATED ON 8.x (0.1.67, 2026-10-15) · the residual is P-1, tracked in A-22 — The vault believed the ILK the node itself declared
 
 - **What happened:** SY.vault authorized by `meta.src_ilk`, which the node itself sets. The router
   did not bind it to the sender. A compromised node could:
@@ -2041,7 +2055,7 @@ router reviews.
   the HTTP `DELETE` with and without a tenant, Archi over the mesh), all PASS (ledger 0.1.64).
   Minor pending item: the admin's HTTP maps `TENANT_NOT_FOUND` to 500.
 
-### A-60 🔵 TO EVALUATE (operator's request, 2026-10-06) — The managed nodes run as root
+### A-60 🟡 PARKED (to evaluate, 2026-10-07; no design yet) — The managed nodes run as root
 
 - **What happens:** the orchestrator launches the nodes (IO, AI, WF) with `systemd-run` without
   `User=`, so they run as root on every host. Seen in PROD on 2026-10-06 (read-only): `io-blob`,
@@ -2303,7 +2317,7 @@ router reviews.
     it, as egress and ingress already did: without vendor it never gets Syncthing, and nothing
     repairs it.
 
-### A-55 🟡 OPEN BY DECISION (D31) — The egress's SSH door
+### A-55 🟡 PARKED BY DECISION (D31) — The egress's SSH door
 
 - **What it is:** the operator keeps SSH (tcp 22) open on `egress.wan_iface` for operation and
   maintenance during this development. In PROD it is 192.168.8.240, an internal network behind a
@@ -2328,7 +2342,7 @@ router reviews.
   `folder_id` for the `dist` channel: it only accepted `fluxbee-dist`, even though the handler
   already knew how to honor a specific folder) → 0.1.43 accepts any `fluxbee-dist*`.
 
-### A-20 🟡 PARTIAL (0.1.42 + 0.1.45) · direction DEFERRED — With CONFIG_CHANGED crossing hives, its receivers applied any origin the router admitted
+### A-20 🟡 PARTIAL (0.1.42 + 0.1.45) · direction PARKED — With CONFIG_CHANGED crossing hives, its receivers applied any origin the router admitted
 
 - **What happened:** the router's gate for CONFIG_CHANGED admits the primary admin **and the
   orchestrators** (rule 3 of the system policy). SY.opa.rules applied a compile/apply/clear from
@@ -2442,7 +2456,7 @@ router reviews.
 
 ## B. Infrastructure and tooling — no product code change required
 
-### B-1 🔴 The Proxmox API does not allow writing cloud-init *snippets*
+### B-1 🟢 LAB NOTE — The Proxmox API does not allow writing cloud-init *snippets*
 
 - Neither `POST /nodes/{n}/storage/{s}/upload` nor `download-url` accepts `content=snippets`
   (enum: `iso, vztmpl, import`), even though the storage **does** support the type.
@@ -2451,7 +2465,7 @@ router reviews.
 - **Mitigation applied:** the operator wrote it just once; the template ended up with the agent
   baked in, and **the clones no longer depend on the snippet**.
 
-### B-2 🔴 `cicustom` replaces Proxmox's user-data (it overrides `ciuser`/`cipassword`)
+### B-2 🟢 LAB NOTE — `cicustom` replaces Proxmox's user-data (it overrides `ciuser`/`cipassword`)
 
 - When `cicustom=user=...` is used, Proxmox uses that file **instead of** the user-data it
   generates, which is the one that creates the user. Result: the user **is not created**, and
@@ -2617,7 +2631,7 @@ router reviews.
 - **Status:** resolved. The operator set `onboot=1` on 100, 101, 102, 103 and 110; verified
   through the API on 2026-10-02. It remains to be seen live on the next host reboot.
 
-### B-14 🟡 Slow boot of the PROD VMs (userspace from 53 s to 1 min 48 s)
+### B-14 🟡 LAB ONLY, OPEN — Slow boot of the PROD VMs (userspace from 53 s to 1 min 48 s)
 
 - **What was observed (reboots of 2026-09-25):** userspace of ingress 53 s, egress 60 s, worker1
   89 s, mb 108 s (fb-build: 31 s).

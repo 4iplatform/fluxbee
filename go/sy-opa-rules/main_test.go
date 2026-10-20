@@ -3,9 +3,13 @@
 package main
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"reflect"
+	"strings"
 	"testing"
 
 	fluxbeesdk "github.com/4iplatform/json-router/fluxbee-go-sdk"
@@ -14,15 +18,10 @@ import (
 
 type stubRouterTransport struct {
 	sent []fluxbeesdk.Message
-	last string
 }
 
 func (s *stubRouterTransport) SendSDK(msg fluxbeesdk.Message) {
 	s.sent = append(s.sent, msg)
-}
-
-func (s *stubRouterTransport) LastPeer() string {
-	return s.last
 }
 
 func TestHandleNodeConfigGetReturnsContractAndSnapshots(t *testing.T) {
@@ -283,79 +282,129 @@ func TestHandleQueryGetPolicyPreservesQueryResponseShape(t *testing.T) {
 	}
 }
 
-func TestHandleCommandCompilePolicyInvalidPayloadReturnsCommandResponseError(t *testing.T) {
-	router := &stubRouterTransport{}
-	service := &Service{
-		hiveID:   "motherbee",
-		nodeUUID: uuid.MustParse("11111111-1111-1111-1111-111111111111"),
-		nodeName: "SY.opa.rules@motherbee",
-		testSend: router.SendSDK,
+// A check is a read (A-76): CONFIG_CHANGED "check", as SY.admin sends it, compiles in a scratch
+// directory and is answered at once with a CONFIG_RESPONSE that echoes its check_id and has no
+// version. Nothing under the state dir changes, staged/ included (a check between a compile and
+// its apply), last_error stays as it was, and the SHM region is never touched: these services have
+// none.
+func TestACheckIsAReadThatEchoesItsCheckID(t *testing.T) {
+	oldStateDir := stateDir
+	stateDir = t.TempDir()
+	defer func() { stateDir = oldStateDir }()
+	staged := PolicyMetadata{Version: 5, Hash: "sha256:staged", Entrypoint: defaultEntrypoint}
+	if err := writePolicyFiles(filepath.Join(stateDir, "staged"), []byte("staged wasm"), staged, "package staged\n"); err != nil {
+		t.Fatalf("stage a policy: %v", err)
 	}
+	before := snapshotFiles(t, stateDir)
 
-	request, err := fluxbeesdk.BuildMessageEnvelope(
-		"22222222-2222-2222-2222-222222222222",
-		fluxbeesdk.UnicastDestination(service.nodeName),
-		16,
-		"trace-command",
-		"command",
-		nil,
-		func() *string {
-			value := "compile_policy"
-			return &value
-		}(),
-		map[string]any{
-			"rego": 17,
-		},
-	)
-	if err != nil {
-		t.Fatalf("build command request: %v", err)
+	const adminUUID = "33333333-3333-3333-3333-333333333333"
+	cases := []struct {
+		name   string
+		hiveID string
+		origin string
+		rego   string
+		status string
+		code   string
+	}{
+		{name: "valid rego", hiveID: fluxbeesdk.PrimaryHiveID, origin: fluxbeesdk.PrimaryAdminNode, rego: testRego, status: "ok"},
+		{name: "invalid rego", hiveID: fluxbeesdk.PrimaryHiveID, origin: fluxbeesdk.PrimaryAdminNode, rego: "package router\n\ndefault target =\n", status: "error", code: "COMPILE_ERROR"},
+		{name: "rego missing", hiveID: fluxbeesdk.PrimaryHiveID, origin: fluxbeesdk.PrimaryAdminNode, rego: "", status: "error", code: "COMPILE_ERROR"},
+		{name: "not the motherbee", hiveID: "worker1", origin: fluxbeesdk.PrimaryAdminNode, rego: testRego, status: "error", code: "NOT_PRIMARY"},
+		{name: "not the admin", hiveID: fluxbeesdk.PrimaryHiveID, origin: "AI.rogue@motherbee", rego: testRego, status: "error", code: "UNAUTHORIZED"},
 	}
-	// The router stamps the authenticated origin; only the primary admin may command policy.
-	admin := fluxbeesdk.PrimaryAdminNode
-	request.Routing.SrcL2Name = &admin
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			router := &stubRouterTransport{}
+			service := &Service{
+				hiveID:   tc.hiveID,
+				nodeUUID: uuid.New(),
+				nodeName: "SY.opa.rules@" + tc.hiveID,
+				testSend: router.SendSDK,
+			}
+			service.setLastError("an earlier failure")
+			checkID := uuid.NewString()
+			changed := "CONFIG_CHANGED"
+			request, err := fluxbeesdk.BuildMessageEnvelope(
+				adminUUID,
+				fluxbeesdk.UnicastDestination(service.nodeName),
+				16, uuid.NewString(), fluxbeesdk.SYSTEMKind, &changed, nil,
+				map[string]any{
+					"subsystem":  "opa",
+					"action":     "check",
+					"auto_apply": nil,
+					"version":    0,
+					"config":     map[string]any{"rego": tc.rego, "entrypoint": defaultEntrypoint, "check_id": checkID},
+					"hive":       tc.hiveID,
+				},
+			)
+			if err != nil {
+				t.Fatalf("build check: %v", err)
+			}
+			origin := tc.origin
+			request.Routing.SrcL2Name = &origin
 
-	service.handleCommand(request)
+			service.handleMessage(request)
 
-	if len(router.sent) != 1 {
-		t.Fatalf("expected 1 command response, got %d", len(router.sent))
-	}
-	resp := router.sent[0]
-	if resp.Meta.MsgType != "command_response" || derefString(resp.Meta.Action) != "compile_policy" {
-		t.Fatalf("unexpected command response envelope: %+v", resp.Meta)
-	}
-	var payload map[string]any
-	if err := json.Unmarshal(resp.Payload, &payload); err != nil {
-		t.Fatalf("decode command response payload: %v", err)
-	}
-	if payload["status"] != "error" || payload["error_code"] != "COMPILE_ERROR" {
-		t.Fatalf("unexpected command error payload: %+v", payload)
+			if len(router.sent) != 1 {
+				t.Fatalf("want 1 answer, got %d", len(router.sent))
+			}
+			answer := router.sent[0]
+			if derefString(answer.Meta.Msg) != "CONFIG_RESPONSE" || !answer.Routing.Dst.IsUnicast() || answer.Routing.Dst.Value() != adminUUID {
+				t.Fatalf("want CONFIG_RESPONSE to the requester, got %s to %+v", derefString(answer.Meta.Msg), answer.Routing.Dst)
+			}
+			var payload map[string]any
+			if err := json.Unmarshal(answer.Payload, &payload); err != nil {
+				t.Fatalf("decode answer: %v", err)
+			}
+			if payload["subsystem"] != "opa" || payload["action"] != "check" || payload["check_id"] != checkID ||
+				payload["status"] != tc.status || payload["hive"] != tc.hiveID {
+				t.Fatalf("answer: %v", payload)
+			}
+			if _, ok := payload["version"]; ok {
+				t.Fatalf("a check's answer carries no version: %v", payload)
+			}
+			if tc.status == "ok" {
+				if hash, _ := payload["hash"].(string); !strings.HasPrefix(hash, "sha256:") || payload["wasm_size_bytes"] == float64(0) || payload["compile_time_ms"] == nil {
+					t.Fatalf("ok answer without the compile result: %v", payload)
+				}
+			} else if payload["error_code"] != tc.code || payload["error_detail"] == "" {
+				t.Fatalf("want %s, got %v", tc.code, payload)
+			}
+			service.statusMu.Lock()
+			lastError := service.syncStatus.lastError
+			service.statusMu.Unlock()
+			if lastError != "an earlier failure" {
+				t.Fatalf("a check changed last_error to %q", lastError)
+			}
+			if after := snapshotFiles(t, stateDir); !reflect.DeepEqual(after, before) {
+				t.Fatalf("a check changed the state dir:\nbefore %v\nafter  %v", before, after)
+			}
+		})
 	}
 }
 
-func TestHandleCommandRefusesOriginsOtherThanThePrimaryAdmin(t *testing.T) {
-	for _, origin := range []string{"", "AI.rogue@motherbee", "SY.admin@worker1"} {
-		router := &stubRouterTransport{}
-		service := &Service{hiveID: "motherbee", nodeName: "SY.opa.rules@motherbee", testSend: router.SendSDK}
-		action := "rollback_policy"
-		request, err := fluxbeesdk.BuildMessageEnvelope(
-			"22222222-2222-2222-2222-222222222222",
-			fluxbeesdk.UnicastDestination(service.nodeName),
-			16, "trace-command", "command", nil, &action, map[string]any{},
-		)
+// snapshotFiles maps each file under root (relative path) to the sha256 of its content.
+func snapshotFiles(t *testing.T, root string) map[string]string {
+	t.Helper()
+	files := map[string]string{}
+	err := filepath.WalkDir(root, func(path string, entry os.DirEntry, err error) error {
+		if err != nil || entry.IsDir() {
+			return err
+		}
+		data, err := os.ReadFile(path)
 		if err != nil {
-			t.Fatalf("build command request: %v", err)
+			return err
 		}
-		if origin != "" {
-			request.Routing.SrcL2Name = &origin
+		rel, err := filepath.Rel(root, path)
+		if err != nil {
+			return err
 		}
-		service.handleCommand(request)
-		if len(router.sent) != 1 {
-			t.Fatalf("%q: expected 1 response, got %d", origin, len(router.sent))
-		}
-		var payload map[string]any
-		_ = json.Unmarshal(router.sent[0].Payload, &payload)
-		if payload["error_code"] != "UNAUTHORIZED" {
-			t.Fatalf("%q: want UNAUTHORIZED, got %+v", origin, payload)
-		}
+		sum := sha256.Sum256(data)
+		files[rel] = hex.EncodeToString(sum[:])
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("walk %s: %v", root, err)
 	}
+	return files
 }

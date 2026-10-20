@@ -7,10 +7,10 @@
 # (dist/runtimes/<runtime>/<version>/bin/) and REGISTERS it here, at install time, against the
 # live root — merging instead of replacing.
 #
-# It does not merge anything itself. It calls scripts/publish-runtime.sh, the merger that
-# already existed and that scripts/install.sh has always used this way; the .deb was the
-# outlier, running that same loop at BUILD time against the staged tree (where there is never
-# anything to merge with). There are already two mergers in this tree — do not write a third.
+# It does not merge anything itself. It calls scripts/publish-runtime.sh, the merger every
+# runtime publish uses; the .deb used to run that same loop at BUILD time against the staged
+# tree (where there is never anything to merge with). There are already two mergers in this
+# tree — do not write a third.
 #
 #   sudo fluxbee-seed-runtimes        # also the operator's repair/re-run surface
 #

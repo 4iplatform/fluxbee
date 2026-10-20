@@ -99,7 +99,8 @@ pub struct MessagesListItem {
     pub ts: String,
     pub stored_at: String,
     pub msg_type: String,
-    /// The sender's name as its router stamped it; the sender's ILK on rows of before 0.1.76.
+    /// The sender's name as its router stamped it; its ILK on a message copied before routers
+    /// stamped names (the rows backfilled at 0.1.76).
     pub from: String,
     /// The destination as routed (a node name, a UUID, `broadcast`), else the destination ILK.
     pub to: Option<String>,
@@ -123,9 +124,8 @@ pub struct MessagesDetail {
     pub trace_id: Option<String>,
     pub tags: Vec<String>,
     pub size_bytes: i64,
-    /// The whole message as the router copied it; None on rows of before 0.1.76, which keep only
-    /// the payload (`content`).
-    pub message: Option<Value>,
+    /// The whole message as the router copied it.
+    pub message: Value,
     pub content: Value,
 }
 
@@ -270,13 +270,25 @@ impl MessagesDb {
 }
 
 /// Microseconds in the cursors: a cursor rounded to the millisecond would skip the rows inside it.
+/// The sender's name is in the message only when its router stamped it (`src_l2_name`), and a
+/// resolved destination is serialized as null: both fall back to the ILKs (`sender_name`,
+/// `to_name`).
 const LIST_COLUMNS: &str = "dedupe_key, \
      to_char(ts AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') AS ts_iso, \
      to_char(stored_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') AS stored_at_iso, \
      msg_type, ich, thread_id, \
-     COALESCE(message->'routing'->>'src_l2_name', from_ilk) AS from_name, \
+     message->'routing'->>'src_l2_name' AS src_l2_name, from_ilk AS sender_ilk, \
      COALESCE(message->'routing'->>'dst', to_ilk) AS to_name, \
-     octet_length(COALESCE(message, content)::text)::bigint AS size_bytes";
+     octet_length(message::text)::bigint AS size_bytes";
+
+/// Who sent a stored message: the name its router stamped, else (a message copied before routers
+/// stamped names) its ILK; never a failed row.
+fn sender_name(src_l2_name: Option<String>, sender_ilk: Option<String>) -> String {
+    src_l2_name
+        .filter(|name| !name.trim().is_empty())
+        .or(sender_ilk)
+        .unwrap_or_default()
+}
 
 fn row_to_list_item(row: &Row) -> MessagesListItem {
     MessagesListItem {
@@ -284,7 +296,10 @@ fn row_to_list_item(row: &Row) -> MessagesListItem {
         ts: row.get("ts_iso"),
         stored_at: row.get("stored_at_iso"),
         msg_type: row.get("msg_type"),
-        from: row.get("from_name"),
+        from: sender_name(
+            row.try_get("src_l2_name").ok().flatten(),
+            row.try_get("sender_ilk").ok().flatten(),
+        ),
         to: row.get("to_name"),
         ich: known_ich(row.get("ich")),
         thread_id: row.get("thread_id"),
@@ -319,4 +334,39 @@ fn row_to_detail(row: &Row) -> MessagesDetail {
 fn known_ich(ich: String) -> Option<String> {
     let ich = ich.trim();
     (!ich.is_empty() && ich != "unknown").then(|| ich.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every row keeps the whole message (`turns.message` is NOT NULL): the list reads the sender,
+    /// the destination and the size from it.
+    #[test]
+    fn the_list_reads_the_stored_message() {
+        assert!(LIST_COLUMNS.contains("message->'routing'->>'src_l2_name' AS src_l2_name"));
+        assert!(LIST_COLUMNS.contains("COALESCE(message->'routing'->>'dst', to_ilk) AS to_name"));
+        assert!(LIST_COLUMNS.contains("octet_length(message::text)::bigint AS size_bytes"));
+        assert!(!LIST_COLUMNS.contains("content"));
+    }
+
+    /// A message copied before routers stamped names (the 582 rows backfilled at 0.1.76) has no
+    /// `routing.src_l2_name`: its row shows the sender's ILK instead of failing.
+    #[test]
+    fn a_row_whose_message_has_no_sender_name_shows_the_sender_ilk() {
+        let ilk = "ilk:7c1e0a52-1f0b-4a5e-9d64-0b6a1f2d3c4e";
+        assert_eq!(sender_name(None, Some(ilk.to_string())), ilk);
+        assert_eq!(
+            sender_name(Some(" ".to_string()), Some(ilk.to_string())),
+            ilk
+        );
+        assert_eq!(
+            sender_name(
+                Some("AI.support@motherbee".to_string()),
+                Some(ilk.to_string())
+            ),
+            "AI.support@motherbee"
+        );
+        assert_eq!(sender_name(None, None), "");
+    }
 }

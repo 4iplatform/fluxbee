@@ -89,67 +89,52 @@ const COGNITION_STATE_ORDER: [CognitionDurableEntity; 8] = [
 /// and a field of at most `USAGE_FIELD_MAX_CHARS` characters) the answer stays under 64 KiB.
 const USAGE_QUERY_PAGE_BYTES: usize = 62 * 1024;
 
-/// `turns` is keyed by the record's inbox key (A-70). It was keyed by `(ctx, seq)`, which come from
-/// the `trace_id` when the message has no `meta.ctx`; a reply reuses its request's `trace_id`, so
-/// `ON CONFLICT DO NOTHING` threw the reply away. Rows written before take `legacy:<ctx>:<seq>`.
-/// Runs at every start: the column check keeps it from rescanning the table once migrated.
-const TURNS_KEY_MIGRATION_SQL: &str = r#"
-DO $$
-BEGIN
-    IF NOT EXISTS (
-        SELECT 1 FROM information_schema.columns
-        WHERE table_schema = current_schema() AND table_name = 'turns'
-          AND column_name = 'dedupe_key' AND is_nullable = 'NO'
-    ) THEN
-        ALTER TABLE turns ADD COLUMN IF NOT EXISTS dedupe_key TEXT;
-        UPDATE turns SET dedupe_key = 'legacy:' || ctx || ':' || seq WHERE dedupe_key IS NULL;
-        ALTER TABLE turns ALTER COLUMN dedupe_key SET NOT NULL;
-    END IF;
-    IF EXISTS (
-        SELECT 1 FROM pg_constraint c JOIN pg_class t ON t.oid = c.conrelid
-        WHERE t.relname = 'turns' AND t.relnamespace = current_schema()::regnamespace
-          AND c.conname = 'turns_pkey' AND c.contype = 'p'
-    ) THEN
-        ALTER TABLE turns DROP CONSTRAINT turns_pkey;
-    END IF;
-END $$;
+/// The message log (A-70, Q7 of docs/router-stream-v1.md): one row per copied message, keyed by
+/// the record's inbox key (`idx_turns_dedupe_key`, unique). A reply shares its request's
+/// `trace_id`, and so its `ctx` and `seq`, and still gets a row of its own. Each row keeps the
+/// whole message, its thread and its trace, and the time the router copied it (`ts`); `stored_at`
+/// is when SY.storage wrote it, the order a live reader follows, since a stream's batch can arrive
+/// late.
+const TURNS_SCHEMA_SQL: &str = r#"
+CREATE TABLE IF NOT EXISTS turns (
+    dedupe_key  TEXT NOT NULL,
+    ctx         TEXT NOT NULL,
+    seq         BIGINT NOT NULL,
+    ts          TIMESTAMPTZ NOT NULL DEFAULT now(),
+    stored_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+    from_ilk    TEXT NOT NULL,
+    to_ilk      TEXT,
+    ich         TEXT NOT NULL,
+    msg_type    TEXT NOT NULL,
+    content     JSONB NOT NULL,
+    tags        TEXT[],
+    thread_id   TEXT,
+    trace_id    TEXT,
+    message     JSONB NOT NULL
+);
 CREATE UNIQUE INDEX IF NOT EXISTS idx_turns_dedupe_key ON turns (dedupe_key);
 CREATE INDEX IF NOT EXISTS idx_turns_ctx_seq ON turns (ctx, seq);
-DROP INDEX IF EXISTS idx_turns_ctx;
-"#;
-
-/// `turns` becomes the message log (A-70, Q7 of docs/router-stream-v1.md): each row keeps the whole
-/// message, its thread and its trace, and the time the router copied it (`ts`); `stored_at` is when
-/// SY.storage wrote it, the order a live reader follows, since a stream's batch can arrive late.
-/// The inbox keeps the router's time too. Columns are added only when missing, so a start never
-/// takes the tables' locks again.
-const MESSAGE_LOG_MIGRATION_SQL: &str = r#"
-DO $$
-BEGIN
-    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema = current_schema()
-                   AND table_name = 'storage_inbox' AND column_name = 'source_ts') THEN
-        ALTER TABLE storage_inbox ADD COLUMN source_ts TIMESTAMPTZ;
-    END IF;
-    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema = current_schema()
-                   AND table_name = 'turns' AND column_name = 'message') THEN
-        ALTER TABLE turns ADD COLUMN thread_id TEXT;
-        ALTER TABLE turns ADD COLUMN trace_id TEXT;
-        ALTER TABLE turns ADD COLUMN message JSONB;
-    END IF;
-    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema = current_schema()
-                   AND table_name = 'turns' AND column_name = 'stored_at') THEN
-        ALTER TABLE turns ADD COLUMN stored_at TIMESTAMPTZ NOT NULL DEFAULT now();
-    END IF;
-END $$;
 CREATE INDEX IF NOT EXISTS idx_turns_ts_key ON turns (ts DESC, dedupe_key DESC);
 CREATE INDEX IF NOT EXISTS idx_turns_stored_at ON turns (stored_at, dedupe_key);
 CREATE INDEX IF NOT EXISTS idx_turns_thread ON turns (thread_id);
-CREATE TABLE IF NOT EXISTS storage_migrations (
-    name        TEXT PRIMARY KEY,
-    applied_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
-    detail      TEXT
-);
 "#;
+
+/// Every record lands in the inbox first, keyed by `dedupe_key` (`message_dedupe_key`), so a
+/// resent batch lands on the same row. `source_ts` is when the router appended the record.
+const INBOX_SCHEMA_SQL: &str = r#"
+CREATE TABLE IF NOT EXISTS storage_inbox (
+    dedupe_key   TEXT PRIMARY KEY,
+    subject      TEXT NOT NULL,
+    payload      BYTEA NOT NULL,
+    received_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+    source_ts    TIMESTAMPTZ,
+    attempts     INT NOT NULL DEFAULT 0,
+    processed_at TIMESTAMPTZ,
+    last_error   TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_storage_inbox_pending ON storage_inbox(processed_at, received_at);
+"#;
+
 /// Cognition's tables, v2 (A-70 stage 2a, docs/router-stream-v1.md §6.2): a communication is
 /// `(thread_id, agent_ilk)`; every row of one carries both, and the turn it was written at
 /// (`source_turn`), which orders it. A thread row is keyed by its communication.
@@ -788,39 +773,8 @@ impl Storage {
     }
 
     async fn ensure_schema(&self) -> Result<(), StorageError> {
-        self.client
-            .batch_execute(
-                r#"
-CREATE TABLE IF NOT EXISTS turns (
-    dedupe_key  TEXT NOT NULL,
-    ctx         TEXT NOT NULL,
-    seq         BIGINT NOT NULL,
-    ts          TIMESTAMPTZ NOT NULL DEFAULT now(),
-    from_ilk    TEXT NOT NULL,
-    to_ilk      TEXT,
-    ich         TEXT NOT NULL,
-    msg_type    TEXT NOT NULL,
-    content     JSONB NOT NULL,
-    tags        TEXT[]
-);
-
-CREATE TABLE IF NOT EXISTS storage_inbox (
-    dedupe_key  TEXT PRIMARY KEY,
-    subject     TEXT NOT NULL,
-    payload     BYTEA NOT NULL,
-    received_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-    attempts    INT NOT NULL DEFAULT 0,
-    processed_at TIMESTAMPTZ,
-    last_error  TEXT
-);
-
-CREATE INDEX IF NOT EXISTS idx_storage_inbox_pending ON storage_inbox(processed_at, received_at);
-
-	"#,
-            )
-            .await?;
-        self.client.batch_execute(TURNS_KEY_MIGRATION_SQL).await?;
-        self.client.batch_execute(MESSAGE_LOG_MIGRATION_SQL).await?;
+        self.client.batch_execute(TURNS_SCHEMA_SQL).await?;
+        self.client.batch_execute(INBOX_SCHEMA_SQL).await?;
         self.client.batch_execute(COGNITION_SCHEMA_SQL).await?;
         self.client.batch_execute(USAGE_SCHEMA_SQL).await?;
         Ok(())
@@ -3925,14 +3879,32 @@ mod tests {
     }
 
     #[test]
-    fn turns_are_keyed_by_the_inbox_key() {
-        assert!(TURNS_KEY_MIGRATION_SQL.contains(
-            "CREATE UNIQUE INDEX IF NOT EXISTS idx_turns_dedupe_key ON turns (dedupe_key)"
-        ));
-        // The primary key goes only where it still exists, so a start never locks `turns` again.
-        assert!(TURNS_KEY_MIGRATION_SQL.contains("c.conname = 'turns_pkey' AND c.contype = 'p'"));
-        assert!(TURNS_KEY_MIGRATION_SQL.contains("ALTER TABLE turns DROP CONSTRAINT turns_pkey;"));
-        assert!(TURNS_KEY_MIGRATION_SQL.contains("'legacy:' || ctx || ':' || seq"));
+    fn the_message_log_is_created_whole() {
+        let start = TURNS_SCHEMA_SQL
+            .find("CREATE TABLE IF NOT EXISTS turns (")
+            .unwrap();
+        let turns = &TURNS_SCHEMA_SQL[start..];
+        let turns = &turns[..turns.find(");").unwrap()];
+        for column in [
+            "dedupe_key  TEXT NOT NULL,",
+            "stored_at   TIMESTAMPTZ NOT NULL DEFAULT now(),",
+            "thread_id   TEXT,",
+            "trace_id    TEXT,",
+            "message     JSONB NOT NULL",
+        ] {
+            assert!(turns.contains(column), "{column}");
+        }
+        // The key is a unique index: `persist_turn` inserts with `ON CONFLICT (dedupe_key)`.
+        assert!(!turns.contains("PRIMARY KEY"));
+        for index in [
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_turns_dedupe_key ON turns (dedupe_key);",
+            "CREATE INDEX IF NOT EXISTS idx_turns_ts_key ON turns (ts DESC, dedupe_key DESC);",
+            "CREATE INDEX IF NOT EXISTS idx_turns_stored_at ON turns (stored_at, dedupe_key);",
+            "CREATE INDEX IF NOT EXISTS idx_turns_thread ON turns (thread_id);",
+        ] {
+            assert!(TURNS_SCHEMA_SQL.contains(index), "{index}");
+        }
+        assert!(INBOX_SCHEMA_SQL.contains("source_ts    TIMESTAMPTZ,"));
     }
 
     fn record(seq: u64, subject: &str, producer: &str, payload: Value) -> StreamRecord {
@@ -4188,18 +4160,6 @@ mod tests {
         }
         assert!(COGNITION_SCHEMA_SQL.contains("communication_id TEXT PRIMARY KEY"));
         assert!(!COGNITION_SCHEMA_SQL.contains("thread_seq"));
-    }
-
-    #[test]
-    fn the_message_log_migration_runs_once() {
-        // Every column is added only when missing.
-        for column in ["'source_ts'", "'message'", "'stored_at'"] {
-            assert!(MESSAGE_LOG_MIGRATION_SQL.contains(&format!("column_name = {column}")));
-        }
-        assert!(MESSAGE_LOG_MIGRATION_SQL.contains("CREATE TABLE IF NOT EXISTS storage_migrations"));
-        assert!(MESSAGE_LOG_MIGRATION_SQL.contains(
-            "CREATE INDEX IF NOT EXISTS idx_turns_stored_at ON turns (stored_at, dedupe_key)"
-        ));
     }
 
     const TENANT: &str = "tnt:22222222-2222-4222-8222-222222222222";

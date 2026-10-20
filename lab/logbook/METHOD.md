@@ -197,4 +197,4 @@ If something fails: the failure is recorded, it is diagnosed, and **the diagnosi
   motherbee bootstraps via `add_hive`. Installing postgres on a worker = bug.
 - **Compiling is ALWAYS done on the build box** (fb-build), never on a hive or in prod.
 - **Growing does not require a new `.deb`**: the runtime/package is published and an `update` is run.
-- **`base-nodes.json` is the single source** of what goes into the `.deb` (`build-deb.sh` and `install.sh` read it).
+- **`base-nodes.json` is the single source** of what goes into the `.deb` (`build-deb.sh` reads it).

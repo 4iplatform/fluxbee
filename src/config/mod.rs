@@ -53,7 +53,6 @@ pub struct RouterConfig {
     pub heartbeat_stale_ms: u64,
     pub wan_listen: Option<String>,
     pub wan_uplinks: Vec<String>,
-    pub wan_authorized_hives: Vec<String>,
     /// WAN mTLS peer-auth mode: "disabled" | "permissive" | "required".
     pub wan_mtls_mode: String,
     /// Directory holding this hive's mesh TLS material (ca.crt, cert.crt,
@@ -89,7 +88,6 @@ struct GovernmentSection {
 struct WanSection {
     listen: Option<String>,
     uplinks: Option<Vec<WanUplink>>,
-    authorized_hives: Option<Vec<String>>,
     gateway_name: Option<String>,
     /// WAN mTLS peer-auth mode: "disabled" | "permissive" | "required".
     mtls: Option<String>,
@@ -143,7 +141,6 @@ impl RouterConfig {
         let heartbeat_stale_ms = DEFAULT_HEARTBEAT_STALE_MS;
         let mut wan_listen = None;
         let mut wan_uplinks = Vec::new();
-        let mut wan_authorized_hives = Vec::new();
         let mut wan_mtls_mode = "disabled".to_string();
         let mut hive_role = DEFAULT_HIVE_ROLE.to_string();
         let mut blob_enabled = DEFAULT_BLOB_ENABLED;
@@ -182,9 +179,6 @@ impl RouterConfig {
                 for uplink in uplinks {
                     wan_uplinks.push(uplink.address);
                 }
-            }
-            if let Some(hives) = wan.authorized_hives {
-                wan_authorized_hives = hives;
             }
             if let Some(name) = wan.gateway_name {
                 gateway_name = name;
@@ -277,7 +271,6 @@ impl RouterConfig {
             heartbeat_stale_ms,
             wan_listen,
             wan_uplinks,
-            wan_authorized_hives,
             wan_mtls_mode,
             tls_dir,
             hive_role,

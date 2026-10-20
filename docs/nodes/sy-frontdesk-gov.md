@@ -97,8 +97,10 @@ none), else `SY.frontdesk.gov@<hive>` (`src/config/mod.rs`).
   scoped to the sender's `src_ilk` (registered only when there is one), and `ilk_register`, whose
   description says the tenant "comes with the case: never ask for one".
 - Memory: the immediate memory is off (`ImmediateMemorySection::default`, `enabled: false`) and
-  CONFIG_SET takes no behavior change, so what the model keeps between turns is the thread state,
-  one JSON file per `src_ilk`.
+  CONFIG_SET changes nothing, so what the model keeps between turns is the thread state, one JSON
+  file per `src_ilk`. The baked config carries no other `runtime` setting: timeouts, workers and
+  queue are the AI runtime's.
+- An answer cut at the token limit is a `provider_output_truncated` error, as in ai.generic.
 - The reply to the person is the model's text. The result code comes from the thread state the
   model wrote (`build_frontdesk_result_for_conversation`): `completed` → `ALREADY_COMPLETE`,
   `completed_error` → `REGISTER_FAILED`, otherwise `MISSING_REQUIRED_FIELDS` or
@@ -197,9 +199,9 @@ There is nothing to configure. `handle_control_plane` answers:
 
 | Request | Reply |
 | --- | --- |
-| `NODE_STATUS_GET` | `{status: ok, health_state: HEALTHY}`, whatever the node's state (`build_node_status_get_response`; `NODE_STATUS_DEFAULT_HEALTH_STATE` overrides it) |
-| `CONFIG_GET` | `state`, `config_source: "baked"`, `api_key_source`, the provider and model |
-| `CONFIG_SET` | refuses `ai`, `ai_providers`, `behavior`, `api_key`, `api_key_ref` (`config_not_accepted`); otherwise re-reads the key from the vault and persists nothing |
+| `NODE_STATUS_GET` | the SDK's managed answer (`build_node_status_response_payload`): `health_state` `HEALTHY` when `CONFIGURED`, `DEGRADED` (never `ERROR`) when `UNCONFIGURED` or `FAILED_CONFIG`, with `lifecycle_state` and the reason in `last_error`: `missing_secret` (no key) or `invalid_ai_config` (the hive.yaml `ai` section) |
+| `CONFIG_GET` | `state`, `config_source: "baked"`, `api_key_source`, the provider and model; `error` is the same reason as `last_error` |
+| `CONFIG_SET` | refuses every field under `config` (`config_not_accepted`), the prompt (`behavior`) and `runtime` included; an empty `config` re-reads the key from the vault. Nothing is persisted |
 | `PING`, `STATUS` | `PONG`, `STATUS_RESPONSE` |
 
 The router delivers `CONFIG_GET` and `CONFIG_SET` only from `SY.admin@motherbee`
@@ -227,17 +229,21 @@ Environment: `RUST_LOG`; `GOV_IDENTITY_TARGET`, `GOV_IDENTITY_FALLBACK_TARGET`,
   conversation ends as `completed_error` (the prompt's no-loop rule).
 - **Identity SHM unreadable**: the case tenant is unknown, so registration answers that the tenant
   is unresolved and usage goes to `fallback_root`; the conversation itself continues.
-- **Handler errors**: each message runs under the AI runtime (`crates/fluxbee_ai_sdk/src/runtime.rs`:
-  60 s per handler, up to 3 attempts for recoverable errors). A fatal error ends the runtime and
-  the process; systemd restarts it after 5 s.
+- **Handler errors**: each message runs once under the AI runtime
+  (`crates/fluxbee_ai_sdk/src/runtime.rs`): up to 47 min per message, each model call bounded at
+  5 min. When the handler fails or runs out of time, a conversation or handoff gets an
+  `ai_runtime_error` or `ai_runtime_timeout` error and the message is not run again (it may already
+  have called the model or `ILK_REGISTER`); a `system` request gets no answer. The node keeps
+  running.
 
 ## Health
 
 - `systemctl status sy-frontdesk-gov`; `journalctl -u sy-frontdesk-gov`. Lines to look for:
   `frontdesk-gov connected to router`, `AI token resolved from vault → Configured`,
   `frontdesk handoff REGISTERED (ILK_REGISTER complete)`.
-- The real state is the `state` field of `CONFIG_GET` (through SY.admin's
-  `node_control_config_get`); `NODE_STATUS_GET` always says `HEALTHY`.
+- `NODE_STATUS_GET` says whether the conversation runs: `HEALTHY`, or `DEGRADED` with
+  `missing_secret` or `invalid_ai_config` in `last_error`. Handoffs work in every state. `CONFIG_GET`
+  (through SY.admin's `node_control_config_get`) shows the same state and reason.
 
 ## Links
 

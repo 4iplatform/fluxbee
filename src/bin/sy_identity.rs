@@ -28,9 +28,9 @@ use fluxbee_sdk::{
 };
 use json_router::shm::{
     copy_bytes_with_len, now_epoch_ms, sha256_hex_to_bytes, IchEntry, IdentityRegionLimits,
-    IdentityRegionWriter, IlkAliasEntry, IlkEntry, TenantEntry, VocabularyEntry, FLAG_ACTIVE,
-    ICH_ADDRESS_MAX_LEN, ICH_CHANNEL_TYPE_MAX_LEN, IDENTITY_DEFINITION_MAX_HANDBOOKS,
-    IDENTITY_DEFINITION_MAX_SKILLS,
+    IdentityRegionReader, IdentityRegionWriter, IlkAliasEntry, IlkEntry, TenantEntry,
+    VocabularyEntry, FLAG_ACTIVE, ICH_ADDRESS_MAX_LEN, ICH_CHANNEL_TYPE_MAX_LEN,
+    IDENTITY_DEFINITION_MAX_HANDBOOKS, IDENTITY_DEFINITION_MAX_SKILLS,
 };
 
 type IdentityError = Box<dyn std::error::Error + Send + Sync>;
@@ -261,9 +261,10 @@ struct IdentitySyncSection {
     port: Option<u16>,
     #[serde(default)]
     upstream: Option<String>,
-    /// Per-hive HMAC peer-auth on the :9100 channel: "disabled" (default) |
-    /// "required" (mutual challenge-response handshake at connect; reject peers
-    /// without the hive's key).
+    /// Per-hive HMAC peer-auth on the :9100 channel: "required" (the default, also when
+    /// absent, empty or unknown: mutual challenge-response handshake at connect; peers without
+    /// the hive's key are rejected) | "disabled" (also "off", "none"; logged as insecure,
+    /// isolated networks only).
     #[serde(default)]
     auth: Option<String>,
 }
@@ -293,9 +294,10 @@ struct IlkProvisionRequest {
 #[serde(deny_unknown_fields)]
 struct IlkGetRequest {
     ilk_id: String,
-    /// Optional scope: when present the ilk must belong to this tenant, and one of another tenant
-    /// answers NOT_FOUND, exactly like a missing one. SY.admin always sends it for Fluxbee Cloud, so
-    /// Cloud reads only its own identities and learns nothing about the others.
+    /// Optional scope: when present, an ILK charged to another tenant answers NOT_FOUND, like a
+    /// missing one. Reads by id are not tenant-scoped (a tenant is a cost center,
+    /// docs/ilk-tenant-model-v1.md §2.1): Fluxbee Cloud's get_ilk carries only ilk_id, so Cloud
+    /// can read any ILK it names.
     #[serde(default)]
     tenant_id: Option<String>,
 }
@@ -4335,25 +4337,6 @@ async fn main() -> Result<(), IdentityError> {
             }
         }
     }
-    let identity_shm_name = identity_shm_name(&hive.hive_id);
-    let identity_limits = identity_region_limits(&hive);
-    let mut identity_shm = match IdentityRegionWriter::open_or_create(
-        &identity_shm_name,
-        Uuid::new_v4(),
-        &hive.hive_id,
-        is_primary,
-        identity_limits,
-    ) {
-        Ok(writer) => Some(writer),
-        Err(err) => {
-            tracing::warn!(
-                shm = %identity_shm_name,
-                error = %err,
-                "identity shm unavailable; IO lookup via SHM will be degraded"
-            );
-            None
-        }
-    };
     let sync_port = identity_sync_port(&hive);
     let sync_upstream = identity_sync_upstream(&hive);
     let auth_required = identity_sync_auth_required(&hive);
@@ -4446,6 +4429,30 @@ async fn main() -> Result<(), IdentityError> {
             return Err(format!("failed to seed system ILKs from hive.yaml: {err}").into());
         }
     }
+    // Opened only now that the store is complete (a replica's full sync included), so the limits
+    // are checked against what the rebuild below writes.
+    let identity_shm_name = identity_shm_name(&hive.hive_id);
+    let identity_limits = identity_region_limits(&hive);
+    if let Ok(entries) = identity_shm_entries(&runtime.store) {
+        refuse_identity_limits_below_the_store(&identity_shm_name, identity_limits, &entries)?;
+    }
+    let mut identity_shm = match IdentityRegionWriter::open_or_create(
+        &identity_shm_name,
+        Uuid::new_v4(),
+        &hive.hive_id,
+        is_primary,
+        identity_limits,
+    ) {
+        Ok(writer) => Some(writer),
+        Err(err) => {
+            tracing::warn!(
+                shm = %identity_shm_name,
+                error = %err,
+                "identity shm unavailable; IO lookup via SHM will be degraded"
+            );
+            None
+        }
+    };
     if let Some(writer) = identity_shm.as_mut() {
         if let Err(err) = sync_identity_shm_mappings(writer, &runtime.store) {
             tracing::warn!(error = %err, "initial identity shm sync failed");
@@ -4862,6 +4869,33 @@ fn identity_region_limits(hive: &HiveFile) -> IdentityRegionLimits {
     }
 }
 
+/// Stops the start when hive.yaml lowered the limits below what the store holds. The region would
+/// be created again for them, empty, and the rebuild then refused, so every reader on this hive
+/// would find nothing; the region is left as it is instead.
+fn refuse_identity_limits_below_the_store(
+    shm_name: &str,
+    limits: IdentityRegionLimits,
+    entries: &IdentityShmEntries,
+) -> Result<(), IdentityError> {
+    let Ok(region) = IdentityRegionReader::open_read_only_auto(shm_name) else {
+        return Ok(());
+    };
+    let current = region.limits();
+    if current == limits || entries.fit(limits) {
+        return Ok(());
+    }
+    Err(format!(
+        "identity limits in hive.yaml ({limits}) are below what the store holds: {} tenants, {} \
+         ILKs, {} channels (room for 4 per ILK), {} aliases. {shm_name} keeps its limits \
+         ({current}); raise identity.max_* in hive.yaml",
+        entries.tenants.len(),
+        entries.ilks.len(),
+        entries.ichs.len(),
+        entries.aliases.len(),
+    )
+    .into())
+}
+
 fn parse_ilk_type_for_shm(value: &str) -> u8 {
     match value.trim() {
         "human" => SHM_ILK_TYPE_HUMAN,
@@ -4946,10 +4980,9 @@ fn identification_value_is_empty(value: &Value) -> bool {
     }
 }
 
-fn sync_identity_shm_mappings(
-    writer: &mut IdentityRegionWriter,
-    store: &IdentityStore,
-) -> Result<(), IdentityError> {
+/// The store as the identity region holds it: marked tenants and ILKs and expired aliases are left
+/// out.
+fn identity_shm_entries(store: &IdentityStore) -> Result<IdentityShmEntries, IdentityError> {
     let now_ms = now_epoch_ms();
     let mut tenant_entries: Vec<TenantEntry> = Vec::new();
     let mut ilk_entries: Vec<IlkEntry> = Vec::new();
@@ -5151,12 +5184,50 @@ fn sync_identity_shm_mappings(
         });
     }
 
+    Ok(IdentityShmEntries {
+        tenants: tenant_entries,
+        ilks: ilk_entries,
+        ichs: ich_entries,
+        aliases: alias_entries,
+        vocabulary: vocabulary_entries,
+        channel_to_ich,
+    })
+}
+
+/// What the full rebuild (`sync_identity_shm_mappings`) writes: the region's entries, and the
+/// channel each lookup key names, from which it fills the mapping table.
+struct IdentityShmEntries {
+    tenants: Vec<TenantEntry>,
+    ilks: Vec<IlkEntry>,
+    ichs: Vec<IchEntry>,
+    aliases: Vec<IlkAliasEntry>,
+    vocabulary: Vec<VocabularyEntry>,
+    channel_to_ich: HashMap<(String, String, String), [u8; 16]>,
+}
+
+impl IdentityShmEntries {
+    /// Whether a region with `limits` holds them; `write_snapshot_entries` refuses them otherwise.
+    fn fit(&self, limits: IdentityRegionLimits) -> bool {
+        self.tenants.len() <= limits.max_tenants as usize
+            && self.ilks.len() <= limits.max_ilks as usize
+            && self.ichs.len() <= limits.max_ichs() as usize
+            && self.aliases.len() <= limits.max_ilk_aliases as usize
+            && self.vocabulary.len() <= limits.max_vocabulary as usize
+    }
+}
+
+fn sync_identity_shm_mappings(
+    writer: &mut IdentityRegionWriter,
+    store: &IdentityStore,
+) -> Result<(), IdentityError> {
+    let entries = identity_shm_entries(store)?;
+    let channel_to_ich = &entries.channel_to_ich;
     writer.write_snapshot_entries(
-        &tenant_entries,
-        &ilk_entries,
-        &ich_entries,
-        &alias_entries,
-        &vocabulary_entries,
+        &entries.tenants,
+        &entries.ilks,
+        &entries.ichs,
+        &entries.aliases,
+        &entries.vocabulary,
     )?;
 
     let mut mapped_channels = 0u64;
@@ -5217,10 +5288,10 @@ fn sync_identity_shm_mappings(
     }
     tracing::debug!(
         mapped_channels,
-        tenant_count = tenant_entries.len(),
-        ilk_count = ilk_entries.len(),
-        ich_count = ich_entries.len(),
-        alias_count = alias_entries.len(),
+        tenant_count = entries.tenants.len(),
+        ilk_count = entries.ilks.len(),
+        ich_count = entries.ichs.len(),
+        alias_count = entries.aliases.len(),
         "identity shm snapshot sync applied"
     );
     Ok(())
@@ -8918,6 +8989,58 @@ mod tests {
     use super::*;
 
     const TEST_CLOUD_RELAY: &str = "IO.cloud@motherbee";
+
+    #[test]
+    fn identity_limits_lowered_below_the_store_stop_the_start() {
+        let suffix = &Uuid::new_v4().simple().to_string()[..8];
+        let name = format!("/jsid-fit-{suffix}");
+        let current = IdentityRegionLimits {
+            max_ilks: 4,
+            max_tenants: 4,
+            max_vocabulary: 1,
+            max_ilk_aliases: 4,
+        };
+        let writer =
+            IdentityRegionWriter::open_or_create(&name, Uuid::new_v4(), "sandbox", true, current)
+                .expect("identity region");
+        let mut store = IdentityStore::default();
+        for n in 1..=3 {
+            let tenant_id = format!("tnt:11111111-1111-1111-1111-11111111111{n}");
+            store.tenants.insert(
+                tenant_id.clone(),
+                TenantRecord {
+                    deleted_at_ms: None,
+                    tenant_id,
+                    name: format!("tenant-{n}"),
+                    domain: None,
+                    status: "active".to_string(),
+                    settings: json!({}),
+                    sponsor_tenant_id: None,
+                },
+            );
+        }
+        let entries = identity_shm_entries(&store).expect("region entries");
+        let with_tenants = |max_tenants| IdentityRegionLimits {
+            max_tenants,
+            ..current
+        };
+
+        let err = refuse_identity_limits_below_the_store(&name, with_tenants(2), &entries)
+            .expect_err("3 tenants do not fit in 2");
+        assert!(err.to_string().contains("3 tenants"), "{err}");
+        // Lower limits the store still fits in, the region's own limits, or no region at all.
+        assert!(refuse_identity_limits_below_the_store(&name, with_tenants(3), &entries).is_ok());
+        assert!(refuse_identity_limits_below_the_store(&name, current, &entries).is_ok());
+        let missing = format!("/jsid-none-{suffix}");
+        assert!(
+            refuse_identity_limits_below_the_store(&missing, with_tenants(2), &entries).is_ok()
+        );
+
+        drop(writer);
+        if let Ok(cstr) = std::ffi::CString::new(name) {
+            let _ = nix::sys::mman::shm_unlink(cstr.as_c_str());
+        }
+    }
 
     fn test_hive(identity_frontdesk: Option<&str>) -> HiveFile {
         HiveFile {

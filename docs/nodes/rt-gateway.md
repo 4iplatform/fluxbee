@@ -25,8 +25,9 @@ stream), `src/router/system_policy.rs` and `policy/system.rego` (system authorit
 ## Where it runs and how it starts
 
 - Every hive runs one: the packaged unit has no role gate, and `add_hive` writes an
-  `rt-gateway` unit on the spokes it provisions (`src/bin/sy_orchestrator.rs`). The orchestrator
-  starts it before any SY service and waits up to 30 s for it (`bootstrap_local`,
+  `rt-gateway` unit on the spokes it provisions (`src/bin/sy_orchestrator.rs`). One router per
+  hive is the supported topology ([architecture.md](../reference/architecture.md) §4.2). The
+  orchestrator starts it before any SY service and waits up to 30 s for it (`bootstrap_local`,
   `wait_for_router_ready`). On the motherbee it first makes sure the mesh CA and the hive's own
   certificate exist (`ensure_motherbee_mesh_tls`).
 - The router's name comes from `JSR_ROUTER_NAME`, else `wan.gateway_name`, else `RT.gateway`,
@@ -34,9 +35,13 @@ stream), `src/router/system_policy.rs` and `policy/system.rego` (system authorit
   equals `gateway_name`'s, so the packaged router is the gateway. Only the gateway loads TLS,
   runs the WAN and writes the LSA region.
 - At first start it creates `/var/lib/fluxbee/state/<router name>/identity.yaml` with its UUID
-  and SHM name; later starts reuse them.
+  and SHM name; later starts reuse them, and with them the SHM region the previous process left.
+  The router takes that region over before it accepts a node: it empties the node table and writes
+  its PID, start time, name and gateway flag (`RouterRegionWriter::open_or_create`). Nodes appear
+  in it again as they reconnect, so a node that does not come back is gone for the readers too
+  (SY.orchestrator, sibling routers).
 - Settings read from `/etc/fluxbee/hive.yaml`: `hive_id`, `role` (default `worker`),
-  `wan.listen`, `wan.uplinks[].address`, `wan.authorized_hives`, `wan.gateway_name`, `wan.mtls`,
+  `wan.listen`, `wan.uplinks[].address`, `wan.gateway_name`, `wan.mtls`,
   `government.identity_frontdesk`, `ai`. The environment: `JSR_LOG_LEVEL` (default `info`) and
   `JSR_ROUTER_NAME`. Timers are constants: HELLO 10 s, dead 40 s, heartbeat 5 s, stale 30 s
   (`DEFAULT_*` in `src/config/mod.rs`).
@@ -51,8 +56,9 @@ stream), `src/router/system_policy.rs` and `policy/system.rego` (system authorit
   `payload.uuid` equals `routing.src`. `RT.*` names are accepted only from the router's own
   process (`rt_name_allowed`, by the peer's PID).
 - **IRP socket** `irp-<uuid hex>.sock` in the same directory, mode 0600: the link between
-  routers of the same hive. Every 5 s a router looks in `/dev/shm` for live regions of other
-  routers of its hive and the one with the lower UUID connects.
+  routers of the same hive, which only the unsupported several-routers mode uses. Every 5 s a
+  router looks in `/dev/shm` for live regions of other routers of its hive and the one with the
+  lower UUID connects.
 - **WAN** (gateway only): TCP on `wan.listen` when set; there is no default address in code. The
   motherbee template sets `0.0.0.0:9000` (`packaging/hive.yaml.example`); spokes have no
   `wan.listen` and connect out to `wan.uplinks`. There is no HTTP or status port.
@@ -68,11 +74,23 @@ stream), `src/router/system_policy.rs` and `policy/system.rego` (system authorit
 - The WAN `HELLO` carries the protocol version `fluxbee/1.16` (`MESH_PROTOCOL_VERSION`); a
   mismatch is only logged, never rejected (comment on the constant in
   `crates/fluxbee_sdk/src/protocol.rs`).
-- If `wan.authorized_hives` is not empty, other hives get `WAN_REJECT` `HIVE_NOT_AUTHORIZED`.
+- **Admission on the motherbee (A-48).** The motherbee (`role: motherbee`) admits a hive only
+  while the hive registry lists it: the directory `/var/lib/fluxbee/hives/<hive_id>/`, which
+  SY.orchestrator creates when it accepts the join and `remove_hive` deletes after the hive's
+  cleanup. The hive is the one bound to the peer's certificate. Any other gets `WAN_REJECT`
+  `HIVE_NOT_REGISTERED` and the log line `wan peer rejected: hive not registered`. An admitted
+  session looks again every 10 s and closes when the directory is gone
+  (`wan peer session closed: hive no longer registered`), so the link of a removed hive ends by
+  itself (`wan_peer_admission`, `hive_unregistered`). Both lines carry
+  `reason=HIVE_NOT_REGISTERED`. The registry is the only list. Spokes keep none and listen on no
+  WAN port; a spoke that is rejected logs the reason (`wan uplink error`) and backs off like any
+  failed attempt.
 - Each gateway announces its nodes, routes, VPNs and taps to its peers in an LSA
   (`build_local_lsa_payload`). The name a WAN message claims is rewritten to `<role>@<the
   hive it came from>` (EDGE-01), so a hive cannot speak for another.
-- An uplink that fails is retried after 5 s, doubling up to 60 s.
+- An uplink dials again 5 s after a link that got past `WAN_ACCEPT` ends. An attempt that never
+  got there (no connection, a TLS or handshake error, a `WAN_REJECT`) is retried after 5 s,
+  doubling up to 60 s (`UplinkRetry`).
 - **Multi-hop:** a hub gateway with two or more peers sends `WAN_REACHABILITY`, so a spoke can
   reach another spoke through it. A spoke accepts this only from the motherbee's gateway (rule 6
   of `policy/system.rego`), and messages from hosts learned that way never get system authority
@@ -185,7 +203,10 @@ counted as zero.
   be created. The orchestrator's 5 s watchdog also restarts it when the unit is not active.
 - Missing shared regions (config, LSA, OPA, identity, memory) do not stop it: it reopens them
   when they appear or when their heartbeat is older than 30 s. Without the config region a hive
-  routes with no static routes, no taps and everything in VPN 0.
+  routes with no static routes, no taps and everything in VPN 0. The identity region is opened
+  afresh on every read (`read_identity_snapshot`), so the router follows a region SY.identity
+  created again (its limits changed in `hive.yaml`) at once; that region is empty until
+  SY.identity's start-up rebuild fills it.
 - A node frame over 128 KiB disconnects that node (`FRAME_TOO_LARGE`).
 - A peer with a bad certificate fails its handshake (`wan connection error` /
   `wan uplink error`); the router keeps running. A silent peer is marked stale after 40 s.

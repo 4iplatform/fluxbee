@@ -3,6 +3,7 @@ package node
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"strings"
@@ -219,7 +220,8 @@ func execSendMessage(ctx context.Context, action ActionDefinition, inst *WFInsta
 	// non-blocking channel send). With send_message defaulting to on_error=fail (gap-2), a single such
 	// blip would needlessly route a healthy instance to terminal failure. Retry a few times with a
 	// short, ctx-aware backoff so a momentarily full queue drains before the error is treated as fatal;
-	// a permanent condition (dead connection) still fails after the attempts.
+	// a permanent condition (dead connection) still fails after the attempts. A message over the
+	// frame limit is refused the same way every time, so it fails at once.
 	var sendErr error
 	for attempt := 0; attempt < sendMaxAttempts; attempt++ {
 		if attempt > 0 {
@@ -231,6 +233,10 @@ func execSendMessage(ctx context.Context, action ActionDefinition, inst *WFInsta
 		}
 		if sendErr = actx.Dispatcher.SendMsg(msg); sendErr == nil {
 			return nil
+		}
+		var tooLarge *sdk.MessageTooLargeError
+		if errors.As(sendErr, &tooLarge) {
+			return fmt.Errorf("send_message: %w", sendErr)
 		}
 	}
 	return fmt.Errorf("send_message: dispatch failed after %d attempts: %w", sendMaxAttempts, sendErr)

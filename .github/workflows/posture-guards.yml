@@ -21,9 +21,6 @@ jobs:
       - name: Archi and admin stay on loopback (FINDINGS A-46)
         run: bash scripts/check_loopback_binds.sh
 
-      - name: hive.yaml migration (packaging/fluxbee-migrate-config)
-        run: bash scripts/packaging_tests/migrate_config_test.sh
-
       - name: The .deb merges the base runtimes into the dist manifest (U-3)
         run: bash scripts/deb_seed_runtimes_e2e.sh
 

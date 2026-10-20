@@ -145,7 +145,6 @@ struct HiveFile {
     hive_id: String,
     role: Option<String>,
     admin: Option<AdminSection>,
-    wan: Option<WanSection>,
     blob: Option<BlobSection>,
     storage: Option<StorageSection>,
     ai: Option<HiveAiConfig>,
@@ -156,11 +155,6 @@ struct AdminSection {
     listen: Option<String>,
     public_edge_node: Option<String>,
     public_base_url: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-struct WanSection {
-    authorized_hives: Option<Vec<String>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -299,7 +293,6 @@ struct AdminContext {
     /// `meta.src_ilk` for outgoing vault/identity calls and any other path where
     /// L3 identity is required.
     self_ilk_id: String,
-    authorized_hives: Vec<String>,
     executor_runtime: Arc<Mutex<Option<AdminExecutorAiRuntime>>>,
     executor_configured: Arc<AtomicBool>,
     /// Canonical admin dispatcher — reused by the executor's Vault
@@ -537,11 +530,6 @@ async fn main() -> Result<(), AdminError> {
     let hive = load_hive(&config_dir)?;
     let hive_id = hive.hive_id.clone();
     let blob_root = configured_blob_root(&hive);
-    let authorized_hives = hive
-        .wan
-        .as_ref()
-        .and_then(|wan| wan.authorized_hives.clone())
-        .unwrap_or_default();
     if hive.hive_id == PRIMARY_HIVE_ID && !is_mother_role(hive.role.as_deref()) {
         return Err(format!(
             "invalid hive.yaml: hive_id='{}' is reserved for role=motherbee",
@@ -630,7 +618,6 @@ async fn main() -> Result<(), AdminError> {
         node_name,
         hive_id,
         self_ilk_id,
-        authorized_hives,
         executor_runtime,
         executor_configured,
         rpc: Arc::clone(&router_client),
@@ -1834,8 +1821,8 @@ fn executor_dispatch_target_and_params(
     Ok((target, serde_json::Value::Object(params)))
 }
 
-/// Hand a user-policy write to the motherbee's SY.opa.rules, the only one that compiles and applies
-/// (one global policy; the other hives install what it publishes).
+/// Hand a user-policy write, or a check, to the motherbee's SY.opa.rules, the only one that compiles
+/// and applies (one global policy; the other hives install what it publishes).
 async fn send_opa_config_changed(
     client: &RouterDispatcher,
     action: &str,
@@ -1873,7 +1860,7 @@ async fn send_opa_config_changed(
         })?,
     };
     sender.send(msg).await?;
-    tracing::info!(action, version, "opa write sent to the motherbee");
+    tracing::info!(action, version, "opa request sent to the motherbee");
     Ok(())
 }
 
@@ -2559,6 +2546,194 @@ async fn execute_admin_executor_step_fallback(
     }
 }
 
+/// How long the executor follows an add_hive the orchestrator accepted, and how often it looks. The
+/// join runs in the background (PB-7), and a later step on the new hive fails until it ends. The
+/// bound covers the slowest join the orchestrator allows, with margin: up to 15 min waiting for the
+/// box to settle (`FIRST_BOOT_WAIT_SECS`), the more than 6 min a real join was measured at, and
+/// about 150 s of WAN and LSA gates when they fail, some 24 min in all.
+const ADD_HIVE_JOIN_WAIT: Duration = Duration::from_secs(30 * 60);
+const ADD_HIVE_JOIN_POLL: Duration = Duration::from_secs(5);
+
+/// Where a joining hive stands, from its registry entry as `GET /hives/{hive}` answers it.
+#[derive(Debug)]
+enum HiveJoinState {
+    /// The join ended and the hive is connected: its entry.
+    Joined(serde_json::Value),
+    /// The join ended otherwise, or the entry is gone: the error to fail the step with.
+    Failed { code: String, detail: String },
+    /// Still running, or not readable right now: what was seen, for the timeout message.
+    Running(String),
+}
+
+/// Only an explicit `join.phase: done` ends a join. While the flows run they rewrite the entry
+/// without its join record, so a join about to fail can read `connected` until its tail records
+/// the outcome. SY.orchestrator's `hive_entry_at_rest` takes `connected` with no join record as at
+/// rest; its device-id backfill (`record_syncthing_device_id`) waits for the same explicit `done`.
+fn hive_join_state(answer: &serde_json::Value) -> HiveJoinState {
+    let text = |value: &serde_json::Value, key: &str| {
+        value
+            .get(key)
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string)
+    };
+    if text(answer, "status").as_deref() != Some("ok") {
+        let code = text(answer, "error_code").unwrap_or_else(|| "ADMIN_ACTION_FAILED".to_string());
+        let detail = text(answer, "error_detail").unwrap_or_else(|| answer.to_string());
+        // The accept wrote the entry before it answered: a missing one was removed mid-join.
+        if code == "NOT_FOUND" {
+            return HiveJoinState::Failed { code, detail };
+        }
+        // The orchestrator busy, booting or out of reach: look again.
+        return HiveJoinState::Running(format!("{code}: {detail}"));
+    }
+    let hive = answer
+        .get("payload")
+        .and_then(|payload| payload.get("hive"))
+        .cloned()
+        .unwrap_or(serde_json::Value::Null);
+    let status = text(&hive, "status").unwrap_or_default();
+    let join = hive.get("join").cloned().unwrap_or(serde_json::Value::Null);
+    let phase = text(&join, "phase").unwrap_or_default();
+    if phase != "done" {
+        return HiveJoinState::Running(format!("status '{status}', join phase '{phase}'"));
+    }
+    if status == "connected" {
+        return HiveJoinState::Joined(hive);
+    }
+    HiveJoinState::Failed {
+        code: text(&join, "error_code").unwrap_or_else(|| "JOIN_FAILED".to_string()),
+        detail: text(&join, "error_detail")
+            .unwrap_or_else(|| format!("the join ended with status '{status}'")),
+    }
+}
+
+/// Reads `hive_id` with `read_hive` every `poll_every` until its join ends, at most `bound`: the
+/// hive's entry once connected, the join's own error when it fails, `JOIN_WAIT_TIMEOUT` when it is
+/// still running at the bound (the join itself goes on).
+async fn wait_for_hive_join<F, Fut>(
+    hive_id: &str,
+    mut read_hive: F,
+    poll_every: Duration,
+    bound: Duration,
+) -> Result<serde_json::Value, (String, String)>
+where
+    F: FnMut() -> Fut,
+    Fut: future::Future<Output = serde_json::Value>,
+{
+    let deadline = time::Instant::now() + bound;
+    loop {
+        let seen = match hive_join_state(&read_hive().await) {
+            HiveJoinState::Joined(hive) => return Ok(hive),
+            HiveJoinState::Failed { code, detail } => return Err((code, detail)),
+            HiveJoinState::Running(seen) => seen,
+        };
+        if time::Instant::now() >= deadline {
+            return Err((
+                "JOIN_WAIT_TIMEOUT".to_string(),
+                format!(
+                    "hive '{hive_id}' had not finished joining after {} s ({seen}); the join goes on in the background: GET /hives/{hive_id}",
+                    bound.as_secs()
+                ),
+            ));
+        }
+        time::sleep(poll_every).await;
+    }
+}
+
+/// The hive as `GET /hives/{hive}` reads it, without the audit entry of an operator request: the
+/// wait reads it every few seconds for minutes and would push the real commands out of the log.
+async fn read_joining_hive(
+    ctx: &AdminContext,
+    client: &RouterDispatcher,
+    hive_id: &str,
+) -> serde_json::Value {
+    let payload = serde_json::json!({ "hive_id": hive_id });
+    let transport_error = |detail: String| {
+        serde_json::json!({
+            "status": "error",
+            "error_code": "TRANSPORT_ERROR",
+            "error_detail": detail,
+        })
+    };
+    match handle_admin_command_inner(ctx, client, "get_hive", payload, None).await {
+        Ok((_, body)) => serde_json::from_str(&body)
+            .unwrap_or_else(|err| transport_error(format!("invalid get_hive answer: {err}"))),
+        Err(err) => transport_error(err.to_string()),
+    }
+}
+
+/// An add_hive the orchestrator accepted joins in the background (PB-7): before the next step,
+/// follow the join to its end, so a step on the new hive does not run against a hive still
+/// joining. The step fails with the join's error.
+async fn follow_add_hive_join(
+    ctx: &AdminContext,
+    client: &Arc<RouterDispatcher>,
+    execution_id: &str,
+    step_index: usize,
+    step: &AdminExecutorPlanStep,
+    answer: &serde_json::Value,
+) -> (AdminExecutorStepEvent, Option<AdminExecutorFailure>) {
+    let hive_id = answer
+        .get("payload")
+        .and_then(|payload| payload.get("hive_id"))
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|hive_id| !hive_id.is_empty())
+        .map(str::to_string);
+    let outcome = match hive_id.as_deref() {
+        Some(hive_id) => {
+            wait_for_hive_join(
+                hive_id,
+                || read_joining_hive(ctx, client, hive_id),
+                ADD_HIVE_JOIN_POLL,
+                ADD_HIVE_JOIN_WAIT,
+            )
+            .await
+        }
+        None => Err((
+            "ADMIN_ACTION_FAILED".to_string(),
+            "add_hive was accepted without a hive_id: its join cannot be followed".to_string(),
+        )),
+    };
+    let hive_label = hive_id.clone().unwrap_or_default();
+    let mut event = AdminExecutorStepEvent {
+        execution_id: execution_id.to_string(),
+        step_id: step.id.clone(),
+        step_index,
+        step_action: step.action.clone(),
+        status: "done".to_string(),
+        timestamp: now_epoch_ms(),
+        summary: format!("{} -> join of '{hive_label}' done", step.action),
+        tool_name: Some("get_hive".to_string()),
+        tool_args_preview: Some(serde_json::json!({ "hive_id": hive_id })),
+        result_preview: None,
+        error_code: None,
+        error_source: None,
+        error_message: None,
+    };
+    match outcome {
+        Ok(hive) => {
+            event.result_preview = Some(hive);
+            (event, None)
+        }
+        Err((code, detail)) => {
+            let failure = AdminExecutorFailure {
+                code,
+                detail,
+                source: "admin_action_failure".to_string(),
+                step_id: Some(step.id.clone()),
+                step_action: Some(step.action.clone()),
+            };
+            event.status = "failed".to_string();
+            event.summary = format!("{} -> join of '{hive_label}' failed", step.action);
+            event.error_code = Some(failure.code.clone());
+            event.error_source = Some(failure.source.clone());
+            event.error_message = Some(failure.detail.clone());
+            (event, Some(failure))
+        }
+    }
+}
+
 async fn execute_admin_executor_plan(
     ctx: &AdminContext,
     client: &Arc<RouterDispatcher>,
@@ -2682,6 +2857,25 @@ async fn execute_admin_executor_plan(
             step_events.push(fallback_event);
             failure = fallback_failure;
         }
+        if failure.is_none() && resolved_step.action == "add_hive" {
+            if let Some(answer) =
+                successful_step_output(&step_events, "add_hive").filter(|answer| {
+                    answer.get("status").and_then(serde_json::Value::as_str) == Some("accepted")
+                })
+            {
+                let (join_event, join_failure) = follow_add_hive_join(
+                    ctx,
+                    client,
+                    &request.execution_id,
+                    index,
+                    &resolved_step,
+                    &answer,
+                )
+                .await;
+                step_events.push(join_event);
+                failure = join_failure;
+            }
+        }
         if failure.is_none() {
             if let Some(output) = successful_step_output(&step_events, &resolved_step.action) {
                 step_outputs.insert(resolved_step.id.clone(), output);
@@ -2787,14 +2981,14 @@ fn protected_admin_system_action_response(action: &str) -> Option<&'static str> 
     }
 }
 
+/// The router delivers CONFIG_GET/CONFIG_SET only from `SY.admin@motherbee` (rule 2 of
+/// `policy/system.rego`), so what reaches SY.admin is its own `node_control_config_get/set` on
+/// `SY.admin@motherbee`: how the operator reads and sets the executor catalog. The gate admits that
+/// origin and no other.
 fn admin_origin_authorized(hive_id: &str, src_l2_name: Option<&str>) -> bool {
     // Same-hive origin allowlist, via the shared system-policy seam (one source of truth
     // for the parse + same-hive rule; this subsystem only supplies its allowlist).
-    json_router::router::system_policy::same_hive_role_allowed(
-        hive_id,
-        src_l2_name,
-        &["SY.architect", "SY.config-routes", "SY.vault"],
-    )
+    json_router::router::system_policy::same_hive_role_allowed(hive_id, src_l2_name, &["SY.admin"])
 }
 
 fn build_admin_forbidden_response(
@@ -4883,8 +5077,8 @@ async fn handle_externalize(
         // FIX-4 residual (deferred): a re-externalize after io.api restart + edge ROW-LOSS mints a
         // fresh token here, stranding clients holding the old bearer. Admin CANNOT reuse the stored
         // token: edge_channel_secret:{ich} is a dedicated secret owned by SY.edge's ilk, and
-        // authorize_read has "No admin bypass" by design (sy_vault.rs:1391) — admin can neither read
-        // the value nor its metadata. Closing this needs a design call (admin/edge co-owned token,
+        // authorize_read has "No admin bypass" by design (sy_vault.rs) — admin reads its metadata,
+        // never its value. Closing this needs a design call (admin/edge co-owned token,
         // or a scoped admin read-back for edge_channel_secret:*), NOT a silent security downgrade.
         // The edge's grace-window (SHARED_SECRET_GRACE_MS) already covers LIVE rotation — the common
         // case; the row-loss residual is a rare reimage/vault-purge event.
@@ -5251,6 +5445,10 @@ async fn dispatch_internal_admin_command(
     if let Err(detail) = authorize_wf_rules_caller(caller_l2_name, action, target, &params) {
         return Ok(internal_unauthorized(action, &detail));
     }
+    let admin_uuid = client.sender_snapshot().uuid().to_string();
+    if let Err(detail) = authorize_admin_config_set(caller_l2_name, action, &params, &admin_uuid) {
+        return Ok(internal_unauthorized(action, &detail));
+    }
     if let Err(detail) = authorize_cloud_relay(caller_l2_name, action, &ctx.hive_id) {
         return Ok(internal_unauthorized(action, &detail));
     }
@@ -5475,7 +5673,10 @@ async fn dispatch_internal_admin_command(
             };
             handle_hive_sync_hint_command(ctx, client, hive_id, params).await?
         }
-        InternalActionRoute::Inventory => handle_inventory_http(ctx, client, params).await?,
+        InternalActionRoute::Inventory => {
+            let payload = internal_inventory_payload(target, params);
+            handle_inventory_http(ctx, client, payload).await?
+        }
         InternalActionRoute::OpaHttp(opa_action) => {
             let hive = resolve_internal_action_hive(action, target, &params);
             let req = parse_internal_opa_request(params, hive)
@@ -5606,6 +5807,46 @@ fn resolve_internal_action_hive(
         return Some(node_hive);
     }
     normalize_internal_target_hive(target)
+}
+
+/// The orchestrator's request for an internal `inventory` action. `scope` picks the view (global
+/// when absent) and the hive the caller names narrows it: `filter_hive`, or `hive` (the executor's
+/// argument), for any view; the command's `target` only for `scope: "hive"`, the view that needs a
+/// hive. A target cannot narrow the other views: SY.architect names its own hive as the target of
+/// every hive-less read, `GET /inventory/summary` included.
+fn internal_inventory_payload(
+    target: Option<&str>,
+    params: serde_json::Value,
+) -> serde_json::Value {
+    let mut payload = match params {
+        serde_json::Value::Object(map) => map,
+        _ => serde_json::Map::new(),
+    };
+    let named = payload
+        .remove("hive")
+        .and_then(|value| value.as_str().map(str::trim).map(str::to_string))
+        .filter(|value| !value.is_empty());
+    let filtered = payload
+        .get("filter_hive")
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|value| !value.trim().is_empty());
+    let hive_view = payload
+        .get("scope")
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|scope| scope.trim().eq_ignore_ascii_case("hive"));
+    if !filtered {
+        let hive = named.or_else(|| {
+            if hive_view {
+                normalize_internal_target_hive(target)
+            } else {
+                None
+            }
+        });
+        if let Some(hive) = hive {
+            payload.insert("filter_hive".to_string(), serde_json::Value::String(hive));
+        }
+    }
+    serde_json::Value::Object(payload)
 }
 
 fn resolve_internal_action_spec(action: &str) -> Result<&'static InternalActionSpec, &'static str> {
@@ -5886,6 +6127,47 @@ const WF_RULES_NODE_ACTIONS: &[&str] = &[
 ];
 
 const WF_RULES_ROLE_PREFIX: &str = "SY.wf-rules@";
+
+/// CONFIG_SET on SY.admin rewrites the executor's catalog. The router delivers it to SY.admin only
+/// from SY.admin itself (`admin_origin_authorized`), so the way in over the mesh is to have this
+/// admin relay one: `node_control_config_set`, or `send_node_message` with `msg: CONFIG_SET`, aimed
+/// at SY.admin by name or by router UUID. Of the mesh callers only SY.architect@motherbee may; the
+/// operator's HTTP API and the executor have no caller and pass. CONFIG_GET stays open.
+fn authorize_admin_config_set(
+    caller_l2_name: Option<&str>,
+    action: &str,
+    params: &serde_json::Value,
+    admin_uuid: &str,
+) -> Result<(), String> {
+    let Some(caller) = caller_l2_name.map(str::trim) else {
+        return Ok(());
+    };
+    let sets_config = match action {
+        "node_control_config_set" => true,
+        "send_node_message" => params
+            .get("msg")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|msg| msg.trim().eq_ignore_ascii_case(MSG_CONFIG_SET)),
+        _ => false,
+    };
+    let node_name = params
+        .get("node_name")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .unwrap_or_default();
+    let role = node_name
+        .split_once('@')
+        .map_or(node_name, |(role, _)| role)
+        .trim();
+    let targets_admin =
+        role.eq_ignore_ascii_case("SY.admin") || node_name.eq_ignore_ascii_case(admin_uuid);
+    if !sets_config || !targets_admin || caller == format!("SY.architect@{PRIMARY_HIVE_ID}") {
+        return Ok(());
+    }
+    Err(format!(
+        "only SY.architect@{PRIMARY_HIVE_ID} and the operator may change SY.admin's config; caller={caller}"
+    ))
+}
 
 /// SY.wf-rules goes through the admin like every other launcher, and the admin lets it act only on
 /// the `WF.*` nodes of its own hive: the node name and, when given, the target must both name the
@@ -6361,11 +6643,10 @@ impl WfRulesAction {
 
 impl OpaAction {
     /// The write the caller asked for, as reported back. as_str() is the step sent to
-    /// SY.opa.rules ("compile" for compile + apply and for check).
+    /// SY.opa.rules ("compile" for compile + apply).
     fn write_name(&self) -> &'static str {
         match self {
             OpaAction::CompileApply => "compile_apply",
-            OpaAction::Check => "check",
             other => other.as_str(),
         }
     }
@@ -6376,7 +6657,7 @@ impl OpaAction {
             OpaAction::CompileApply => "compile",
             OpaAction::Apply => "apply",
             OpaAction::Rollback => "rollback",
-            OpaAction::Check => "compile",
+            OpaAction::Check => "check",
             OpaAction::Clear => "clear",
         }
     }
@@ -6400,7 +6681,6 @@ impl OpaAction {
         match self {
             OpaAction::Compile => Some(false),
             OpaAction::CompileApply => Some(false),
-            OpaAction::Check => Some(false),
             _ => None,
         }
     }
@@ -6413,6 +6693,9 @@ struct ConfigResponsePayload {
     action: Option<String>,
     #[serde(default)]
     version: Option<u64>,
+    /// The id of the check this answers, echoed from `config.check_id` (`send_opa_check`).
+    #[serde(default)]
+    check_id: Option<String>,
     #[serde(default)]
     status: Option<String>,
     // The answering hive is taken from the router-stamped sender, never from the payload.
@@ -7182,8 +7465,15 @@ async fn handle_hive_paths(
                 "scope": "hive",
                 "filter_hive": hive,
             });
-            let (status, resp) =
-                handle_admin_command(ctx, client, "inventory", payload, None).await?;
+            let (status, resp) = handle_inventory_http(ctx, client, payload).await?;
+            Ok(Some((status, resp)))
+        }
+        ("GET", ["inventory", "summary"]) => {
+            let payload = serde_json::json!({
+                "scope": "summary",
+                "filter_hive": hive,
+            });
+            let (status, resp) = handle_inventory_http(ctx, client, payload).await?;
             Ok(Some((status, resp)))
         }
         ("GET", ["routes"]) => {
@@ -8534,7 +8824,6 @@ fn error_code_to_http_status(error_code: &str) -> u16 {
         | "MODULE_EXISTS"
         | "VERSION_MISMATCH"
         | "VERSION_CONFLICT"
-        | "WAN_NOT_AUTHORIZED"
         | "NODE_INSTANCE_RUNNING"
         | "NODE_NOT_CONFIGURED"
         | "NOTHING_STAGED"
@@ -8752,6 +9041,29 @@ async fn handle_opa_http(
         }
     }
     let primary = Some(PRIMARY_HIVE_ID.to_string());
+    let entrypoint = req
+        .entrypoint
+        .clone()
+        .unwrap_or_else(|| "router/target".to_string());
+
+    if action.needs_rego() && req.rego.as_deref().unwrap_or("").is_empty() {
+        let resp = serde_json::json!({
+            "status": "error",
+            "error_code": "COMPILE_ERROR",
+            "error_detail": "rego_missing"
+        });
+        return Ok((400, resp.to_string()));
+    }
+
+    // A check is a read: it takes no version, and the motherbee stages and applies nothing.
+    if action.check_only() {
+        let rego = req.rego.clone().unwrap_or_default();
+        let responses = send_opa_check(client, rego, entrypoint).await?;
+        return Ok(build_opa_http_response(
+            ctx, action, None, responses, primary,
+        ));
+    }
+
     let version = match action {
         OpaAction::Apply => {
             let Some(version) = req.version else {
@@ -8768,25 +9080,9 @@ async fn handle_opa_http(
         OpaAction::Clear => 0,
         _ => next_opa_version(req.version)?,
     };
-    let entrypoint = req
-        .entrypoint
-        .clone()
-        .unwrap_or_else(|| "router/target".to_string());
-
-    if action.needs_rego() && req.rego.as_deref().unwrap_or("").is_empty() {
-        let resp = serde_json::json!({
-            "status": "error",
-            "error_code": "COMPILE_ERROR",
-            "error_detail": "rego_missing"
-        });
-        return Ok((400, resp.to_string()));
-    }
 
     let mut responses = Vec::new();
-    if matches!(
-        action,
-        OpaAction::Compile | OpaAction::CompileApply | OpaAction::Check
-    ) {
+    if matches!(action, OpaAction::Compile | OpaAction::CompileApply) {
         responses = send_opa_action(
             ctx,
             client,
@@ -8800,7 +9096,11 @@ async fn handle_opa_http(
         let compiled = !responses.is_empty() && responses.iter().all(|r| r.status == "ok");
         if !compiled || !action.apply_after() {
             return Ok(build_opa_http_response(
-                ctx, action, version, responses, primary,
+                ctx,
+                action,
+                Some(version),
+                responses,
+                primary,
             ));
         }
     }
@@ -8837,7 +9137,11 @@ async fn handle_opa_http(
             return Ok((error_code_to_http_status("TIMEOUT"), body));
         }
         return Ok(build_opa_http_response(
-            ctx, action, version, responses, primary,
+            ctx,
+            action,
+            Some(version),
+            responses,
+            primary,
         ));
     };
 
@@ -8852,7 +9156,7 @@ async fn handle_opa_http(
     let synced = collect_opa_responses(
         &mut receiver,
         "sync",
-        version,
+        OpaAnswerTo::Version(version),
         Some(&hash),
         &expected,
         Duration::from_secs(OPA_SYNC_WAIT_SECS),
@@ -10026,7 +10330,7 @@ fn admin_action_summary(action: &str) -> &'static str {
         "timer_convert" => "Convert one UTC instant through SY.timer for a hive.",
         "timer_parse" => "Parse a date/time string through SY.timer for a hive.",
         "timer_format" => "Format a UTC instant through SY.timer for a hive.",
-        "opa_check" => "Validate OPA policy text without applying it.",
+        "opa_check" => "Validate OPA policy text without staging or applying it.",
         "run_node" => "Create and start a new managed node instance in a hive.",
         "start_node" => "Start an existing persisted managed node instance in a hive.",
         "restart_node" => "Restart an existing managed node instance in a hive.",
@@ -10226,7 +10530,7 @@ fn admin_action_path_patterns(action: &str) -> Vec<&'static str> {
             "GET /inventory/summary",
             "GET /inventory/{hive}",
             "GET /hives/{hive}/inventory/summary",
-            "GET /hives/{hive}/inventory/hive",
+            "GET /hives/{hive}/status",
         ],
         "list_versions" => vec!["GET /versions"],
         "get_versions" => vec!["GET /hives/{hive}/versions"],
@@ -10395,7 +10699,7 @@ fn admin_action_path_params(action: &str) -> Vec<serde_json::Value> {
             admin_action_path_param(
                 "scope",
                 "enum(summary|hive)",
-                "Inventory view encoded in the last path segment.",
+                "Inventory view: summary is GET /hives/{hive}/inventory/summary, hive is GET /hives/{hive}/status.",
             ),
         ],
         "get_node_status"
@@ -11143,7 +11447,7 @@ fn admin_action_body_optional_fields(action: &str) -> Vec<serde_json::Value> {
                 "Timeout while waiting for idle completion.",
             ),
         ],
-        "opa_compile_apply" | "opa_compile" | "opa_check" => vec![
+        "opa_compile_apply" | "opa_compile" => vec![
             admin_action_body_field(
                 "entrypoint",
                 "string",
@@ -11155,6 +11459,11 @@ fn admin_action_body_optional_fields(action: &str) -> Vec<serde_json::Value> {
                 "Optional explicit version. Otherwise a new version is assigned.",
             ),
         ],
+        "opa_check" => vec![admin_action_body_field(
+            "entrypoint",
+            "string",
+            "OPA entrypoint. Defaults to router/target.",
+        )],
         "wf_rules_compile_apply" => vec![
             admin_action_body_field(
                 "auto_spawn",
@@ -12038,7 +12347,7 @@ fn admin_action_request_notes(action: &str) -> Vec<&'static str> {
         "inventory" => vec![
             "Use GET /inventory for the full global inventory view.",
             "Use GET /inventory/summary for global counts only.",
-            "Use GET /inventory/{hive} or /hives/{hive}/inventory/hive for one hive.",
+            "Use GET /inventory/{hive} or GET /hives/{hive}/status for one hive, and GET /hives/{hive}/inventory/summary for its counts.",
         ],
         "list_versions" | "get_versions" => vec![
             "These endpoints report core component versions and runtime availability/current selections.",
@@ -12058,9 +12367,14 @@ fn admin_action_request_notes(action: &str) -> Vec<&'static str> {
         "sync_hint" => vec![
             "Defaults are channel=blob, wait_for_idle=true, timeout_ms=30000.",
         ],
-        "opa_compile_apply" | "opa_compile" | "opa_check" => vec![
-            "rego is required for compile/check flows.",
+        "opa_compile_apply" | "opa_compile" => vec![
+            "rego is required for compile flows.",
             "entrypoint defaults to router/target when omitted.",
+        ],
+        "opa_check" => vec![
+            "rego is required.",
+            "entrypoint defaults to router/target when omitted.",
+            "A check is a read: it takes no version and stages nothing, so a policy compiled and waiting for its apply stays as it is.",
         ],
         "opa_apply" => vec![
             "version is required for apply.",
@@ -14306,6 +14620,24 @@ async fn handle_vault_command(
     hive: Option<String>,
 ) -> Result<(u16, String), AdminError> {
     let target_hive = hive.unwrap_or_else(|| ctx.hive_id.clone());
+    // SY.vault runs only on the motherbee (`validate_system_nodes`): another hive has no vault to
+    // ask, and the request would only come back as a transport error.
+    if target_hive != ctx.hive_id {
+        return Ok((
+            400,
+            serde_json::json!({
+                "status": "error",
+                "action": action,
+                "payload": serde_json::Value::Null,
+                "error_code": "INVALID_REQUEST",
+                "error_detail": format!(
+                    "SY.vault runs only on the motherbee: use /hives/{}/vault/... (hive '{}' has no vault)",
+                    ctx.hive_id, target_hive
+                ),
+            })
+            .to_string(),
+        ));
+    }
     let target = format!("SY.vault@{}", target_hive);
     let (request_msg, response_msg) = match action {
         "vault_list" => (MSG_VAULT_LIST, MSG_VAULT_LIST_RESPONSE),
@@ -15497,9 +15829,39 @@ async fn send_opa_action(
     let responses = collect_opa_responses(
         &mut receiver,
         action,
-        version,
+        OpaAnswerTo::Version(version),
         None,
         &expected,
+        Duration::from_secs(OPA_PRIMARY_WAIT_SECS),
+    )
+    .await;
+    Ok(responses)
+}
+
+/// A check is a read: the motherbee's SY.opa.rules compiles `rego` in a scratch directory and only
+/// answers. It takes no version and writes nothing (no `staged/`, no region), so a check between a
+/// compile and its apply leaves the staged policy alone. A fresh `check_id`, echoed in the answer,
+/// ties the two together.
+async fn send_opa_check(
+    client: &RouterDispatcher,
+    rego: String,
+    entrypoint: String,
+) -> Result<Vec<OpaResponseEntry>, AdminError> {
+    let check_id = Uuid::new_v4().to_string();
+    let config = serde_json::json!({
+        "rego": rego,
+        "entrypoint": entrypoint,
+        "check_id": check_id,
+    });
+    let action = OpaAction::Check.as_str();
+    let mut receiver = client.subscribe(RPC_BC_CONFIG_RESPONSE)?;
+    send_opa_config_changed(client, action, None, 0, config).await?;
+    let responses = collect_opa_responses(
+        &mut receiver,
+        action,
+        OpaAnswerTo::Check(&check_id),
+        None,
+        &[PRIMARY_HIVE_ID.to_string()],
         Duration::from_secs(OPA_PRIMARY_WAIT_SECS),
     )
     .await;
@@ -15670,15 +16032,9 @@ fn expected_hive_sets(ctx: &AdminContext, target: Option<&str>) -> OpaExpectedHi
     }
 
     let topology = topology_hives_from_lsa(ctx);
-    let mut policy_set = HashSet::new();
-    policy_set.insert(ctx.hive_id.clone());
-    for hive in &ctx.authorized_hives {
-        if !hive.trim().is_empty() {
-            policy_set.insert(hive.clone());
-        }
-    }
-    let mut policy: Vec<String> = policy_set.into_iter().collect();
-    policy.sort();
+    // The hives that get the policy: the motherbee and the hives its registry lists as joined, the
+    // same list a policy write waits for (A-48: the registry is the one list of hives).
+    let policy = opa_rollout_hives(ctx);
 
     // Topology (LSA/SHM) is canonical for fanout expectations.
     // Policy list is kept for explicit observability in response payload.
@@ -15690,14 +16046,22 @@ fn expected_hive_sets(ctx: &AdminContext, target: Option<&str>) -> OpaExpectedHi
     }
 }
 
-/// Collects SY.opa.rules answers for `action`/`version` until every expected hive answered or
+/// What ties an SY.opa.rules answer to its request: the version of a write, or the id of a check
+/// (a check takes no version).
+#[derive(Clone, Copy)]
+enum OpaAnswerTo<'a> {
+    Version(u64),
+    Check(&'a str),
+}
+
+/// Collects SY.opa.rules answers for `action` and `answer_to` until every expected hive answered or
 /// `wait` passed. The hive is the one the router stamped on the sender (`SY.opa.rules@<hive>`),
 /// never the payload's own claim. With `hash`, only answers reporting that policy count — a late
 /// answer to an earlier notice of the same version (clear and rollback are both version 0) does not.
 async fn collect_opa_responses(
     receiver: &mut broadcast::Receiver<Message>,
     action: &str,
-    version: u64,
+    answer_to: OpaAnswerTo<'_>,
     hash: Option<&str>,
     expected: &[String],
     wait: Duration,
@@ -15734,7 +16098,11 @@ async fn collect_opa_responses(
         if payload.action.as_deref() != Some(action) {
             continue;
         }
-        if payload.version.unwrap_or(version) != version {
+        let answers_this = match answer_to {
+            OpaAnswerTo::Version(version) => payload.version.unwrap_or(version) == version,
+            OpaAnswerTo::Check(check_id) => payload.check_id.as_deref() == Some(check_id),
+        };
+        if !answers_this {
             continue;
         }
         let Some(hive) = msg
@@ -15754,7 +16122,11 @@ async fn collect_opa_responses(
         let entry = OpaResponseEntry {
             hive: hive.clone(),
             status: payload.status.unwrap_or_else(|| "error".to_string()),
-            version: payload.version,
+            // A check has no version to report.
+            version: match answer_to {
+                OpaAnswerTo::Version(_) => payload.version,
+                OpaAnswerTo::Check(_) => None,
+            },
             compile_time_ms: payload.compile_time_ms,
             wasm_size_bytes: payload.wasm_size_bytes,
             hash: payload.hash,
@@ -15818,10 +16190,11 @@ async fn collect_opa_query_responses(
     responses.into_values().collect()
 }
 
+/// `version` is the write's; a check has none, and its answer reports none.
 fn build_opa_http_response(
     ctx: &AdminContext,
     action: OpaAction,
-    version: u64,
+    version: Option<u64>,
     responses: Vec<OpaResponseEntry>,
     target: Option<String>,
 ) -> (u16, String) {
@@ -15879,9 +16252,8 @@ fn build_opa_http_response(
         200
     };
 
-    let body = serde_json::json!({
+    let mut body = serde_json::json!({
         "status": if status == 200 { "ok" } else { "error" },
-        "version": version,
         "action": action.write_name(),
         "check_only": action.check_only(),
         "responses": responses,
@@ -15892,9 +16264,11 @@ fn build_opa_http_response(
         "pending_hives_policy": pending_policy,
         "error_code": error_code,
         "error_detail": error_detail,
-    })
-    .to_string();
-    (status, body)
+    });
+    if let Some(version) = version {
+        body["version"] = serde_json::json!(version);
+    }
+    (status, body.to_string())
 }
 
 fn build_opa_query_response(
@@ -17530,7 +17904,7 @@ mod tests {
         let responses = collect_opa_responses(
             &mut rx,
             "compile",
-            7,
+            OpaAnswerTo::Version(7),
             None,
             &["motherbee".to_string()],
             Duration::from_secs(30),
@@ -17610,7 +17984,6 @@ mod tests {
             node_name: format!("SY.admin@{PRIMARY_HIVE_ID}"),
             hive_id: PRIMARY_HIVE_ID.to_string(),
             self_ilk_id: String::new(),
-            authorized_hives: Vec::new(),
             executor_runtime: Arc::new(Mutex::new(None)),
             executor_configured: Arc::new(AtomicBool::new(false)),
             rpc: client,
@@ -17775,6 +18148,362 @@ mod tests {
             .is_none());
     }
 
+    /// A check is a read (FINDINGS A-76): it takes no version, asks the motherbee to "check" (not
+    /// to compile into staged/), counts only the answer carrying its own check_id, and reports no
+    /// version.
+    #[tokio::test]
+    async fn an_opa_check_takes_no_version_and_counts_only_its_own_answer() {
+        let counter = json_router::paths::opa_version_path();
+        let counter_before = fs::read_to_string(&counter).ok();
+        let (ctx, mut harness) = opa_test_admin("opa-check");
+        let mut req = no_opa_request();
+        req.rego = Some("package router\n\ndefault target = null\n".to_string());
+        let check = handle_opa_http(&ctx, &ctx.rpc, req, OpaAction::Check);
+        let drive = async {
+            let sent = harness
+                .next_outgoing_within(Duration::from_secs(5))
+                .await
+                .expect("the check");
+            assert_eq!(sent.meta.msg.as_deref(), Some("CONFIG_CHANGED"));
+            assert_eq!(
+                dst_of(&sent),
+                json!(format!("SY.opa.rules@{PRIMARY_HIVE_ID}"))
+            );
+            assert_eq!(sent.payload["action"], json!("check"));
+            assert_eq!(sent.payload["version"], json!(0));
+            assert_eq!(sent.payload["config"]["entrypoint"], json!("router/target"));
+            let check_id = sent.payload["config"]["check_id"]
+                .as_str()
+                .expect("check_id")
+                .to_string();
+            // The answer to another check does not count.
+            let mut other = opa_rules_answer("check", 0, "ok", "sha256:other");
+            other.payload["check_id"] = json!("another-check");
+            harness.inject(other).await.unwrap();
+            // A version echoed in the answer is not reported.
+            let mut answer = opa_rules_answer("check", 0, "ok", "sha256:checked");
+            answer.payload["check_id"] = json!(check_id);
+            harness.inject(answer).await.unwrap();
+        };
+        let (result, ()) = tokio::join!(check, drive);
+        let (status, body) = result.expect("check");
+        let body: Value = serde_json::from_str(&body).expect("body");
+        assert_eq!(status, 200, "{body}");
+        assert_eq!(body["action"], json!("check"), "{body}");
+        assert_eq!(body["check_only"], json!(true), "{body}");
+        assert!(body.get("version").is_none(), "{body}");
+        assert_eq!(
+            body["responses"].as_array().map(Vec::len),
+            Some(1),
+            "{body}"
+        );
+        assert_eq!(
+            body["responses"][0]["hash"],
+            json!("sha256:checked"),
+            "{body}"
+        );
+        assert!(body["responses"][0].get("version").is_none(), "{body}");
+        assert!(
+            harness
+                .next_outgoing_within(Duration::from_millis(300))
+                .await
+                .is_none(),
+            "a check applies, scans and announces nothing"
+        );
+        assert_eq!(
+            fs::read_to_string(&counter).ok(),
+            counter_before,
+            "a check never touches the version counter"
+        );
+    }
+
+    /// SY.vault runs only on the motherbee: a vault route naming another hive is refused before
+    /// anything is sent, instead of coming back as a transport error (FINDINGS A-76).
+    #[tokio::test]
+    async fn a_vault_route_for_another_hive_is_refused_before_anything_is_sent() {
+        let (ctx, mut harness) = opa_test_admin("vault-other-hive");
+        let (status, body) = handle_hive_paths(
+            "GET",
+            "/hives/worker1/vault/secrets/pg:x/metadata",
+            &HashMap::new(),
+            &[],
+            &ctx,
+            &ctx.rpc,
+        )
+        .await
+        .expect("route")
+        .expect("served");
+        assert_eq!(status, 400, "{body}");
+        let body: Value = serde_json::from_str(&body).expect("body");
+        assert_eq!(body["error_code"], json!("INVALID_REQUEST"), "{body}");
+        assert!(
+            body["error_detail"]
+                .as_str()
+                .is_some_and(|detail| detail.contains("/hives/motherbee/vault/")),
+            "{body}"
+        );
+        assert!(harness
+            .next_outgoing_within(Duration::from_millis(200))
+            .await
+            .is_none());
+
+        // The motherbee's vault is asked as before.
+        let list = handle_vault_command(
+            &ctx,
+            &ctx.rpc,
+            "vault_list",
+            json!({}),
+            Some(PRIMARY_HIVE_ID.to_string()),
+        );
+        let drive = async {
+            let sent = harness
+                .next_outgoing_within(Duration::from_secs(5))
+                .await
+                .expect("the list");
+            assert_eq!(dst_of(&sent), json!(format!("SY.vault@{PRIMARY_HIVE_ID}")));
+            let done = reply_to(
+                &sent,
+                MSG_VAULT_LIST_RESPONSE,
+                json!({ "status": "ok", "count": 0, "secrets": [] }),
+            );
+            harness.inject(done).await.unwrap();
+        };
+        let (result, ()) = tokio::join!(list, drive);
+        let (status, body) = result.expect("list");
+        assert_eq!(status, 200, "{body}");
+    }
+
+    /// The per-hive inventory routes the catalog lists ask the orchestrator for that hive
+    /// (FINDINGS A-76): the summary answered 405 and the status 500 UNKNOWN_ACTION.
+    #[tokio::test]
+    async fn the_hive_inventory_routes_ask_the_orchestrator_for_that_hive() {
+        let hive_routes: Vec<&str> = admin_action_path_patterns("inventory")
+            .into_iter()
+            .filter(|pattern| pattern.starts_with("GET /hives/"))
+            .collect();
+        assert_eq!(
+            hive_routes,
+            vec![
+                "GET /hives/{hive}/inventory/summary",
+                "GET /hives/{hive}/status"
+            ]
+        );
+        let (ctx, mut harness) = opa_test_admin("inventory-hive-routes");
+        for (path, scope) in [
+            ("/hives/worker1/inventory/summary", "summary"),
+            ("/hives/worker1/status", "hive"),
+        ] {
+            let query = HashMap::new();
+            let route = handle_hive_paths("GET", path, &query, &[], &ctx, &ctx.rpc);
+            let drive = async {
+                let sent = harness
+                    .next_outgoing_within(Duration::from_secs(5))
+                    .await
+                    .expect("the inventory request");
+                assert_eq!(sent.meta.msg.as_deref(), Some("INVENTORY_REQUEST"));
+                assert_eq!(
+                    dst_of(&sent),
+                    json!(format!("SY.orchestrator@{PRIMARY_HIVE_ID}"))
+                );
+                assert_eq!(
+                    sent.payload,
+                    json!({ "scope": scope, "filter_hive": "worker1" })
+                );
+                let done = reply_to(
+                    &sent,
+                    "INVENTORY_RESPONSE",
+                    json!({ "status": "ok", "scope": scope }),
+                );
+                harness.inject(done).await.unwrap();
+            };
+            let (result, ()) = tokio::join!(route, drive);
+            let (status, body) = result.expect("route").expect("served");
+            assert_eq!(status, 200, "{path}: {body}");
+        }
+    }
+
+    /// An internal inventory action narrows the view to the hive it names (FINDINGS A-76): the
+    /// executor's `hive` for any view, the command's target for the hive view only (SY.architect
+    /// targets its own hive on every hive-less read, the global summary included).
+    #[test]
+    fn an_internal_inventory_action_honors_the_hive_it_names() {
+        assert_eq!(
+            internal_inventory_payload(None, json!({ "hive": "worker1", "scope": "summary" })),
+            json!({ "scope": "summary", "filter_hive": "worker1" })
+        );
+        assert_eq!(
+            internal_inventory_payload(None, json!({ "hive": "worker1", "scope": "hive" })),
+            json!({ "scope": "hive", "filter_hive": "worker1" })
+        );
+        assert_eq!(
+            internal_inventory_payload(Some("worker1"), json!({ "scope": "hive" })),
+            json!({ "scope": "hive", "filter_hive": "worker1" })
+        );
+        assert_eq!(
+            internal_inventory_payload(Some("motherbee"), json!({ "scope": "summary" })),
+            json!({ "scope": "summary" })
+        );
+        assert_eq!(
+            internal_inventory_payload(Some("motherbee"), json!({ "scope": "global" })),
+            json!({ "scope": "global" })
+        );
+        assert_eq!(
+            internal_inventory_payload(
+                Some("worker1"),
+                json!({ "scope": "hive", "filter_hive": "worker2" })
+            ),
+            json!({ "scope": "hive", "filter_hive": "worker2" })
+        );
+    }
+
+    /// `GET /hives/worker2` as the executor reads it during a join.
+    fn joining_hive_answer(
+        status: &str,
+        phase: Option<&str>,
+        error: Option<(&str, &str)>,
+    ) -> Value {
+        let mut hive = json!({ "hive_id": "worker2", "status": status });
+        if let Some(phase) = phase {
+            hive["join"] = json!({ "phase": phase });
+            if let Some((code, detail)) = error {
+                hive["join"]["error_code"] = json!(code);
+                hive["join"]["error_detail"] = json!(detail);
+            }
+        }
+        json!({
+            "status": "ok",
+            "action": "get_hive",
+            "payload": { "status": "ok", "hive": hive },
+        })
+    }
+
+    /// Follows worker2's join over `answers`, read in order; the last one repeats.
+    async fn follow_stubbed_join(answers: Vec<Value>) -> Result<Value, (String, String)> {
+        let answers = std::sync::Mutex::new(std::collections::VecDeque::from(answers));
+        wait_for_hive_join(
+            "worker2",
+            || {
+                let mut answers = answers.lock().unwrap();
+                let next = if answers.len() > 1 {
+                    answers.pop_front()
+                } else {
+                    answers.front().cloned()
+                };
+                future::ready(next.expect("an answer"))
+            },
+            Duration::from_millis(1),
+            Duration::from_millis(50),
+        )
+        .await
+    }
+
+    /// An add_hive the orchestrator accepted is followed until its join ends (PB-7): only an
+    /// explicit `join.phase: done` ends it, `connected` passes, the join's own error fails the
+    /// step, and a join still running at the bound fails it with JOIN_WAIT_TIMEOUT.
+    #[tokio::test]
+    async fn an_accepted_add_hive_is_followed_until_its_join_ends() {
+        let joined = follow_stubbed_join(vec![
+            joining_hive_answer("joining", Some("accepted"), None),
+            joining_hive_answer("joining", Some("running"), None),
+            // The orchestrator busy for a moment: look again.
+            json!({ "status": "error", "error_code": "TIMEOUT", "error_detail": "no answer" }),
+            // The flows rewrite the entry without its join record: not the end yet.
+            joining_hive_answer("connected", None, None),
+            joining_hive_answer("connected", Some("done"), None),
+        ])
+        .await
+        .expect("joined");
+        assert_eq!(joined["status"], json!("connected"));
+        assert_eq!(joined["join"]["phase"], json!("done"));
+
+        let (code, detail) = follow_stubbed_join(vec![
+            joining_hive_answer("joining", Some("running"), None),
+            joining_hive_answer("failed", Some("done"), Some(("WAN_TIMEOUT", "wan timeout"))),
+        ])
+        .await
+        .expect_err("the join failed");
+        assert_eq!(
+            (code.as_str(), detail.as_str()),
+            ("WAN_TIMEOUT", "wan timeout")
+        );
+
+        let (code, detail) =
+            follow_stubbed_join(vec![joining_hive_answer("joining", Some("running"), None)])
+                .await
+                .expect_err("never ends");
+        assert_eq!(code, "JOIN_WAIT_TIMEOUT");
+        assert!(detail.contains("GET /hives/worker2"), "{detail}");
+
+        // An entry removed mid-join ends the wait at once.
+        let (code, _) = follow_stubbed_join(vec![json!({
+            "status": "error",
+            "error_code": "NOT_FOUND",
+            "error_detail": "no such hive",
+        })])
+        .await
+        .expect_err("removed");
+        assert_eq!(code, "NOT_FOUND");
+    }
+
+    /// The executor reads the joining hive with get_hive through the orchestrator, as the
+    /// operator's `GET /hives/{hive}` does, and a failed join fails the add_hive step with the
+    /// join's own error.
+    #[tokio::test]
+    async fn a_failed_join_fails_the_add_hive_step_with_its_error() {
+        let (ctx, mut harness) = opa_test_admin("executor-add-hive-join");
+        let step = AdminExecutorPlanStep {
+            id: "s1".to_string(),
+            action: "add_hive".to_string(),
+            args: json!({ "hive_id": "worker2" }),
+            executor_fill: None,
+        };
+        let accepted = json!({
+            "status": "accepted",
+            "action": "add_hive",
+            "payload": { "status": "accepted", "hive_id": "worker2" },
+        });
+        let follow = follow_add_hive_join(&ctx, &ctx.rpc, "exec-1", 0, &step, &accepted);
+        let drive = async {
+            let sent = harness
+                .next_outgoing_within(Duration::from_secs(5))
+                .await
+                .expect("the read");
+            assert_eq!(sent.meta.msg_type, "admin");
+            assert_eq!(sent.meta.action.as_deref(), Some("get_hive"));
+            assert_eq!(
+                dst_of(&sent),
+                json!(format!("SY.orchestrator@{PRIMARY_HIVE_ID}"))
+            );
+            assert_eq!(sent.payload["hive_id"], json!("worker2"));
+            let mut answer = reply_to(
+                &sent,
+                "",
+                json!({
+                    "status": "ok",
+                    "hive": {
+                        "hive_id": "worker2",
+                        "status": "failed",
+                        "join": {
+                            "phase": "done",
+                            "error_code": "HOST_NOT_SETTLED",
+                            "error_detail": "the box is still busy",
+                        },
+                    },
+                }),
+            );
+            answer.meta.msg_type = "admin".to_string();
+            answer.meta.msg = None;
+            harness.inject(answer).await.unwrap();
+        };
+        let ((event, failure), ()) = tokio::join!(follow, drive);
+        let failure = failure.expect("the join failed");
+        assert_eq!(failure.code, "HOST_NOT_SETTLED");
+        assert_eq!(failure.detail, "the box is still busy");
+        assert_eq!(failure.step_id.as_deref(), Some("s1"));
+        assert_eq!(event.status, "failed");
+        assert_eq!(event.tool_name.as_deref(), Some("get_hive"));
+    }
+
     /// The rollout counts a hive only when SY.opa.rules of that hive (the name the router stamped)
     /// reports the announced policy: a node claiming another hive in its payload, or a late answer
     /// to an earlier version-0 notice (a clear right after a rollback), does not count.
@@ -17804,7 +18533,7 @@ mod tests {
         let responses = collect_opa_responses(
             &mut rx,
             "sync",
-            0,
+            OpaAnswerTo::Version(0),
             Some(""),
             &expected,
             Duration::from_millis(200),
@@ -17845,6 +18574,43 @@ mod tests {
             ]
         );
         let _ = fs::remove_dir_all(root);
+    }
+
+    /// The hives that get the policy are the registry's (A-48: hive.yaml has no list of its own):
+    /// the list a write waits for and the one an OPA read reports as expected are the same.
+    #[tokio::test]
+    async fn the_policy_hives_are_the_registry_hives() {
+        let (ctx, _harness) = opa_test_admin("opa-policy-hives");
+        let registry = hives_registry_root(&ctx);
+        for (dir, info) in [
+            (
+                "worker1",
+                "hive_id: worker1\nrole: worker\nstatus: connected\n",
+            ),
+            (
+                "half",
+                "hive_id: half\nrole: worker\nstatus: provisioning\n",
+            ),
+        ] {
+            fs::create_dir_all(registry.join(dir)).unwrap();
+            fs::write(registry.join(dir).join("info.yaml"), info).unwrap();
+        }
+        let expected = vec!["motherbee".to_string(), "worker1".to_string()];
+        assert_eq!(opa_rollout_hives(&ctx), expected);
+        assert_eq!(expected_hive_sets(&ctx, None).policy, expected);
+        let answered = OpaQueryEntry {
+            hive: "motherbee".to_string(),
+            status: "ok".to_string(),
+            payload: json!({ "status": "ok" }),
+        };
+        let (_, body) = build_opa_query_response(&ctx, "get_status", vec![answered], None);
+        let body: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(
+            body["expected_hives_policy"],
+            json!(["motherbee", "worker1"])
+        );
+        assert_eq!(body["pending_hives_policy"], json!(["worker1"]));
+        let _ = fs::remove_dir_all(registry.parent().unwrap());
     }
 
     /// One global policy, eventual convergence: the motherbee applied it, a hive still syncing is
@@ -19807,19 +20573,104 @@ mod tests {
         assert_eq!(protected_admin_system_action_response(""), None);
     }
 
+    /// Over the mesh only SY.architect@motherbee may have SY.admin send itself a CONFIG_SET, by name
+    /// or by UUID, through node_control_config_set or send_node_message; the operator and the
+    /// executor (no caller) may too, CONFIG_GET and other nodes stay open.
     #[test]
-    fn admin_origin_authorized_accepts_allowlist_in_same_hive() {
+    fn only_archi_and_the_operator_may_set_the_admins_own_config() {
+        let uuid = "11111111-2222-4333-8444-555555555555";
+        let set = |node: &str| json!({ "node_name": node, "config": {} });
+        let relay = |msg: &str| json!({ "node_name": "SY.admin@motherbee", "msg": msg });
+        let (io, ai) = (Some("IO.slack@motherbee"), Some("AI.support@motherbee"));
+        let (archi, remote_archi) = (Some("SY.architect@motherbee"), Some("SY.architect@worker1"));
+        let (config_set, config_get) = ("node_control_config_set", "node_control_config_get");
+        let message = "send_node_message";
+        let refused = [
+            (io, config_set, set("SY.admin@motherbee")),
+            (io, config_set, set("SY.admin")),
+            (io, config_set, set(" SY.admin@worker1 ")),
+            (io, config_set, set(uuid)),
+            (ai, message, relay("CONFIG_SET")),
+            (remote_archi, config_set, set("SY.admin@motherbee")),
+        ];
+        for (caller, action, params) in &refused {
+            assert!(
+                authorize_admin_config_set(*caller, action, params, uuid).is_err(),
+                "{caller:?} {action} {params}"
+            );
+        }
+        let allowed = [
+            (archi, config_set, set("SY.admin@motherbee")),
+            (archi, message, relay("CONFIG_SET")),
+            (None, config_set, set("SY.admin@motherbee")),
+            (io, config_get, set("SY.admin@motherbee")),
+            (io, message, relay("CONFIG_GET")),
+            (io, config_set, set("AI.support@motherbee")),
+        ];
+        for (caller, action, params) in &allowed {
+            assert!(
+                authorize_admin_config_set(*caller, action, params, uuid).is_ok(),
+                "{caller:?} {action} {params}"
+            );
+        }
+    }
+
+    /// The gate sits in the mesh dispatch: a refused caller gets UNAUTHORIZED and nothing is sent;
+    /// SY.architect@motherbee's CONFIG_SET goes out to SY.admin as before.
+    #[tokio::test]
+    async fn the_admins_own_config_set_is_refused_over_the_mesh_before_anything_is_sent() {
+        let (ctx, mut harness) = opa_test_admin("admin-self-config-set");
+        let params = json!({
+            "node_name": format!("SY.admin@{PRIMARY_HIVE_ID}"),
+            "config": { "catalog": { "mode": "subset", "actions": [] } },
+        });
+        let refused = dispatch_internal_admin_command(
+            &ctx,
+            &ctx.rpc,
+            "node_control_config_set",
+            Some(PRIMARY_HIVE_ID),
+            params.clone(),
+            Some("IO.slack@motherbee"),
+        )
+        .await
+        .expect("dispatch");
+        assert_eq!(refused.http_status, 403);
+        assert_eq!(refused.envelope["error_code"], json!("UNAUTHORIZED"));
+        assert!(harness
+            .next_outgoing_within(Duration::from_millis(200))
+            .await
+            .is_none());
+
+        let allowed = dispatch_internal_admin_command(
+            &ctx,
+            &ctx.rpc,
+            "node_control_config_set",
+            Some(PRIMARY_HIVE_ID),
+            params,
+            Some("SY.architect@motherbee"),
+        );
+        let drive = async {
+            let sent = harness
+                .next_outgoing_within(Duration::from_secs(5))
+                .await
+                .expect("the CONFIG_SET");
+            assert_eq!(sent.meta.msg.as_deref(), Some("CONFIG_SET"));
+            assert_eq!(dst_of(&sent), json!(format!("SY.admin@{PRIMARY_HIVE_ID}")));
+            let done = reply_to(&sent, "CONFIG_RESPONSE", json!({ "ok": true }));
+            harness.inject(done).await.unwrap();
+        };
+        let (result, ()) = tokio::join!(allowed, drive);
+        let result = result.expect("dispatch");
+        assert_eq!(result.http_status, 200, "{}", result.envelope);
+    }
+
+    /// The router delivers CONFIG_GET/CONFIG_SET only from SY.admin@motherbee (system.rego rule 2):
+    /// the admin's own node_control_config_get/set on itself.
+    #[test]
+    fn admin_origin_authorized_accepts_the_admin_itself() {
         assert!(admin_origin_authorized(
             "motherbee",
-            Some("SY.architect@motherbee")
-        ));
-        assert!(admin_origin_authorized(
-            "motherbee",
-            Some("SY.config-routes@motherbee")
-        ));
-        assert!(admin_origin_authorized(
-            "motherbee",
-            Some("SY.vault@motherbee")
+            Some("SY.admin@motherbee")
         ));
     }
 
@@ -19841,13 +20692,26 @@ mod tests {
             "motherbee",
             Some("SY.orchestrator@motherbee")
         ));
+        // The router never delivers these to SY.admin: the gate does not admit them either.
+        assert!(!admin_origin_authorized(
+            "motherbee",
+            Some("SY.architect@motherbee")
+        ));
+        assert!(!admin_origin_authorized(
+            "motherbee",
+            Some("SY.vault@motherbee")
+        ));
+        assert!(!admin_origin_authorized(
+            "motherbee",
+            Some("SY.config.routes@motherbee")
+        ));
     }
 
     #[test]
     fn admin_origin_authorized_rejects_cross_hive() {
         assert!(!admin_origin_authorized(
             "motherbee",
-            Some("SY.architect@workerbee")
+            Some("SY.admin@workerbee")
         ));
     }
 
@@ -19861,9 +20725,9 @@ mod tests {
     #[test]
     fn admin_origin_authorized_rejects_malformed_src_l2_name() {
         // No `@` separator.
-        assert!(!admin_origin_authorized("motherbee", Some("SY.architect")));
+        assert!(!admin_origin_authorized("motherbee", Some("SY.admin")));
         // Empty hive part.
-        assert!(!admin_origin_authorized("motherbee", Some("SY.architect@")));
+        assert!(!admin_origin_authorized("motherbee", Some("SY.admin@")));
     }
 
     #[test]

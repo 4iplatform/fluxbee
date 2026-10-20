@@ -377,13 +377,11 @@ pub struct MemoryShmSnapshot {
 
 /// One communication's memory package (docs/router-stream-v1.md §6.2): the communication is
 /// `(thread_id, agent_ilk)`; `agent_node` is where its router delivers, the key the router looks it
-/// up by. An entry written before 0.1.77 has neither and matches no delivery.
+/// up by.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MemoryShmThreadEntry {
     pub thread_id: String,
-    #[serde(default)]
     pub agent_ilk: String,
-    #[serde(default)]
     pub agent_node: String,
     pub package: MemoryPackage,
 }
@@ -600,12 +598,22 @@ struct RegionLayout {
     total_len: usize,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct IdentityRegionLimits {
     pub max_ilks: u32,
     pub max_tenants: u32,
     pub max_vocabulary: u32,
     pub max_ilk_aliases: u32,
+}
+
+impl std::fmt::Display for IdentityRegionLimits {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "max_ilks={} max_tenants={} max_vocabulary={} max_ilk_aliases={}",
+            self.max_ilks, self.max_tenants, self.max_vocabulary, self.max_ilk_aliases
+        )
+    }
 }
 
 impl Default for IdentityRegionLimits {
@@ -880,11 +888,49 @@ impl RouterRegionWriter {
     ) -> Result<Self, ShmError> {
         validate_name(name)?;
         let layout = layout_router();
+        let mut created = false;
         let mut mmap = open_or_create_region(name, layout.total_len, |mmap| {
             initialize_router_header(mmap, router_uuid, hive_id, router_name, is_gateway);
+            created = true;
         })?;
         normalize_seq_header::<ShmHeader>(&mut mmap, layout.header_offset, "router shm")?;
-        Ok(Self { mmap, layout })
+        let mut writer = Self { mmap, layout };
+        if !created {
+            writer.take_over(router_uuid, hive_id, router_name, is_gateway)?;
+        }
+        Ok(writer)
+    }
+
+    /// A restarted router finds its region as the previous process left it (the name is fixed in
+    /// identity.yaml). Its in-memory node table starts empty, so the region's does too: otherwise
+    /// sibling routers and SY.orchestrator would go on seeing nodes that never reconnect.
+    fn take_over(
+        &mut self,
+        router_uuid: Uuid,
+        hive_id: &str,
+        router_name: &str,
+        is_gateway: bool,
+    ) -> Result<(), ShmError> {
+        let (header, nodes): (&mut ShmHeader, &mut [NodeEntry]) =
+            router_header_and_nodes_mut(&mut self.mmap, &self.layout)
+                .ok_or(ShmError::InvalidHeader)?;
+        let _write_guard = SeqlockWriteGuard::new(&header.seq);
+        for entry in nodes.iter_mut() {
+            *entry = empty_node_entry();
+        }
+        header.node_count = 0;
+        header.router_uuid = *router_uuid.as_bytes();
+        header.owner_pid = std::process::id();
+        header.owner_start_time = now_epoch_ms();
+        header.generation = header.generation.saturating_add(1);
+        header.hive_id = [0; 64];
+        header.hive_id_len = copy_bytes_with_len(&mut header.hive_id, hive_id) as u16;
+        header.router_name = [0; 64];
+        header.router_name_len = copy_bytes_with_len(&mut header.router_name, router_name) as u16;
+        header.is_gateway = if is_gateway { 1 } else { 0 };
+        header.updated_at = header.owner_start_time;
+        header.heartbeat = header.updated_at;
+        Ok(())
     }
 
     pub fn read_snapshot(&self) -> Option<ShmSnapshot> {
@@ -1428,8 +1474,23 @@ impl IdentityRegionWriter {
     ) -> Result<Self, ShmError> {
         validate_name(name)?;
         let layout = layout_identity(limits);
-        let mut mmap = open_or_create_region(name, layout.total_len, |mmap| {
-            initialize_identity_header(mmap, owner_uuid, hive_id, is_primary, limits);
+        // Readers lay the sections out from the header's limits, which only creation writes: a
+        // region made for other limits (hive.yaml changed them) is created again, never reused.
+        let reusable = |region: &[u8]| {
+            let current = identity_region_limits(region);
+            if current == Some(limits) {
+                return true;
+            }
+            let current = current.map_or_else(|| "none".to_string(), |current| current.to_string());
+            tracing::warn!(
+                shm = name,
+                "identity shm region was laid out for other limits ({current}); creating it again, \
+                 empty, for {limits}"
+            );
+            false
+        };
+        let mut mmap = open_or_create_region_if(name, layout.total_len, reusable, |mmap| {
+            initialize_identity_header(mmap, owner_uuid, hive_id, is_primary, limits)
         })?;
         normalize_seq_header::<IdentityHeader>(&mut mmap, layout.header_offset, "identity shm")?;
         Ok(Self { mmap, layout })
@@ -1962,13 +2023,6 @@ impl IdentityRegionWriter {
 }
 
 impl IdentityRegionReader {
-    pub fn open_read_only(name: &str, limits: IdentityRegionLimits) -> Result<Self, ShmError> {
-        validate_name(name)?;
-        let layout = layout_identity(limits);
-        let mmap = open_read_only_region(name, layout.total_len)?;
-        Ok(Self { mmap, layout })
-    }
-
     /// Opens the identity region by discovering limits from the SHM header.
     /// Useful for IO readers that should not need static compile-time limits.
     pub fn open_read_only_auto(name: &str) -> Result<Self, ShmError> {
@@ -2007,6 +2061,11 @@ impl IdentityRegionReader {
             return Err(ShmError::InvalidHeader);
         }
         Ok(Self { mmap, layout })
+    }
+
+    /// The limits the region was laid out with.
+    pub fn limits(&self) -> IdentityRegionLimits {
+        self.layout.limits
     }
 
     pub fn read_snapshot(&self) -> Option<IdentitySnapshot> {
@@ -2435,6 +2494,21 @@ fn open_or_create_region<F>(name: &str, len: usize, init: F) -> Result<MmapMut, 
 where
     F: FnOnce(&mut MmapMut),
 {
+    open_or_create_region_if(name, len, |_| true, init)
+}
+
+/// Like `open_or_create_region`, but a valid region is reused only when `reusable` accepts it;
+/// otherwise it is unlinked and created again.
+fn open_or_create_region_if<R, F>(
+    name: &str,
+    len: usize,
+    reusable: R,
+    init: F,
+) -> Result<MmapMut, ShmError>
+where
+    R: Fn(&[u8]) -> bool,
+    F: FnOnce(&mut MmapMut),
+{
     let cstr = CString::new(name).map_err(|_| ShmError::NameTooLong)?;
     let name_cstr: &CStr = cstr.as_c_str();
     loop {
@@ -2445,7 +2519,7 @@ where
                     let _ = shm_unlink(name_cstr);
                 } else {
                     let mmap = unsafe { MmapOptions::new().len(len).map_mut(fd.as_raw_fd())? };
-                    if is_region_valid(mmap.as_ref()) {
+                    if is_region_valid(mmap.as_ref()) && reusable(mmap.as_ref()) {
                         return Ok(mmap);
                     }
                     let _ = shm_unlink(name_cstr);
@@ -2592,6 +2666,24 @@ fn is_opa_region_valid(mmap: &[u8]) -> bool {
         return false;
     }
     header_ref::<OpaHeader>(mmap, 0).is_some_and(|header| header.version == OPA_VERSION)
+}
+
+/// Whether `mmap` is an identity region whose header records `limits`, the ones its sections
+/// were laid out with.
+/// The limits an identity region's header records, the ones its sections were laid out with;
+/// `None` when `mmap` is not an identity region or its header is inconsistent.
+fn identity_region_limits(mmap: &[u8]) -> Option<IdentityRegionLimits> {
+    let header = header_ref::<IdentityHeader>(mmap, 0)?;
+    let limits = IdentityRegionLimits {
+        max_ilks: header.max_ilks,
+        max_tenants: header.max_tenants,
+        max_vocabulary: header.max_vocabulary,
+        max_ilk_aliases: header.max_ilk_aliases,
+    };
+    let consistent = header.magic == IDENTITY_MAGIC
+        && header.max_ichs == limits.max_ichs()
+        && header.max_ich_mappings == limits.max_ich_mappings();
+    consistent.then_some(limits)
 }
 
 fn initialize_router_header(
@@ -2747,24 +2839,23 @@ fn read_router_snapshot(
                 snapshot.push(*node);
             }
         }
+        // Inside the window too: a router taking its region over rewrites these.
+        let header_snapshot = ShmHeaderSnapshot {
+            router_uuid: Uuid::from_bytes(header.router_uuid),
+            router_name: read_string(&header.router_name, header.router_name_len as usize),
+            hive_id: read_string(&header.hive_id, header.hive_id_len as usize),
+            is_gateway: header.is_gateway != 0,
+            node_count: node_count as u32,
+            heartbeat: header.heartbeat,
+            generation: header.generation,
+            opa_policy_version: header.opa_policy_version,
+            opa_load_status: header.opa_load_status,
+        };
         atomic::fence(Ordering::Acquire);
         let s2 = header.seq.load(Ordering::Acquire);
         if s1 == s2 {
-            let router_uuid = Uuid::from_bytes(header.router_uuid);
-            let router_name = read_string(&header.router_name, header.router_name_len as usize);
-            let hive_id = read_string(&header.hive_id, header.hive_id_len as usize);
             return Some(ShmSnapshot {
-                header: ShmHeaderSnapshot {
-                    router_uuid,
-                    router_name,
-                    hive_id,
-                    is_gateway: header.is_gateway != 0,
-                    node_count: header.node_count,
-                    heartbeat: header.heartbeat,
-                    generation: header.generation,
-                    opa_policy_version: header.opa_policy_version,
-                    opa_load_status: header.opa_load_status,
-                },
+                header: header_snapshot,
                 nodes: snapshot,
             });
         }
@@ -4323,6 +4414,81 @@ mod tests {
     }
 
     #[test]
+    fn identity_writer_with_lower_limits_creates_the_region_again() {
+        let name = format!("/jsid-l-{}", &Uuid::new_v4().simple().to_string()[..8]);
+        cleanup_shm(&name);
+        let higher = IdentityRegionLimits {
+            max_ilks: 8,
+            max_tenants: 8,
+            max_vocabulary: 4,
+            max_ilk_aliases: 8,
+        };
+        let lower = IdentityRegionLimits {
+            max_ilks: 4,
+            max_tenants: 2,
+            max_vocabulary: 2,
+            max_ilk_aliases: 4,
+        };
+        let tenant_id = [3u8; 16];
+        let mut tenant = empty_tenant_entry();
+        tenant.tenant_id = tenant_id;
+        tenant.flags = FLAG_ACTIVE;
+        let ilk_entry = |ilk_id: [u8; 16]| {
+            let mut ilk = empty_ilk_entry();
+            ilk.ilk_id = ilk_id;
+            ilk.tenant_id = tenant_id;
+            ilk.flags = FLAG_ACTIVE;
+            ilk
+        };
+
+        let mut writer =
+            IdentityRegionWriter::open_or_create(&name, Uuid::new_v4(), "sandbox", true, higher)
+                .expect("open identity region");
+        writer
+            .write_snapshot_entries(&[tenant], &[ilk_entry([4u8; 16])], &[], &[], &[])
+            .expect("write with the higher limits");
+        drop(writer);
+
+        // SY.identity starts again with lower limits: the region is created again, empty.
+        let mut writer =
+            IdentityRegionWriter::open_or_create(&name, Uuid::new_v4(), "sandbox", true, lower)
+                .expect("reopen identity region");
+        assert_eq!(
+            writer
+                .try_read_snapshot()
+                .expect("snapshot")
+                .header
+                .ilk_count,
+            0
+        );
+        let ilk_id = [5u8; 16];
+        writer
+            .write_snapshot_entries(&[tenant], &[ilk_entry(ilk_id)], &[], &[], &[])
+            .expect("write with the lower limits");
+        writer
+            .upsert_ich_mapping("whatsapp", "+549111111", [6u8; 16], ilk_id, tenant_id)
+            .expect("upsert mapping");
+
+        // A reader lays the sections out from the header, so it finds them where the writer did.
+        let reader = IdentityRegionReader::open_read_only_auto(&name).expect("open auto reader");
+        let snapshot = reader.try_read_snapshot().expect("reader snapshot");
+        assert_eq!(snapshot.header.max_ilks, lower.max_ilks);
+        assert_eq!(snapshot.header.max_tenants, lower.max_tenants);
+        assert_eq!(snapshot.header.max_ichs, lower.max_ichs());
+        assert_eq!(snapshot.header.max_ich_mappings, lower.max_ich_mappings());
+        assert_eq!(snapshot.header.max_vocabulary, lower.max_vocabulary);
+        assert_eq!(snapshot.header.max_ilk_aliases, lower.max_ilk_aliases);
+        assert_eq!(snapshot.ilks.len(), 1);
+        assert_eq!(snapshot.ilks[0].ilk_id, ilk_id);
+        assert_eq!(
+            reader.resolve_ich_mapping("whatsapp", "+549111111", tenant_id),
+            Some(([6u8; 16], ilk_id))
+        );
+
+        cleanup_shm(&name);
+    }
+
+    #[test]
     fn identity_write_snapshot_entries_sets_counts_and_resets_mappings() {
         let name = format!("/jsid-s-{}", &Uuid::new_v4().simple().to_string()[..8]);
         cleanup_shm(&name);
@@ -4480,6 +4646,60 @@ mod tests {
     }
 
     #[test]
+    fn a_reopened_router_region_has_no_nodes_and_names_its_new_owner() {
+        let (name, mut writer) = router_region_for_test("jsr-reopen");
+        writer
+            .register_node(Uuid::new_v4(), "IO.a@sandbox", 0, 1)
+            .expect("register a");
+        writer
+            .register_node(Uuid::new_v4(), "IO.b@sandbox", 0, 2)
+            .expect("register b");
+        // The process that held the region before.
+        {
+            let header = writer.header_mut().expect("router header");
+            header.owner_pid = 1;
+            header.owner_start_time = 1;
+        }
+        let generation = writer
+            .read_snapshot()
+            .expect("router snapshot")
+            .header
+            .generation;
+        drop(writer);
+
+        let router_uuid = Uuid::new_v4();
+        let mut reopened = RouterRegionWriter::open_or_create(
+            &name,
+            router_uuid,
+            "sandbox",
+            "RT.switch@sandbox",
+            false,
+        )
+        .expect("reopen router region");
+
+        let reader = RouterRegionReader::open_read_only(&name).expect("open router reader");
+        let snapshot = reader.read_snapshot().expect("router snapshot");
+        assert!(snapshot.nodes.is_empty());
+        assert_eq!(snapshot.header.node_count, 0);
+        assert_eq!(snapshot.header.router_uuid, router_uuid);
+        assert_eq!(snapshot.header.router_name, "RT.switch@sandbox");
+        assert!(!snapshot.header.is_gateway);
+        assert_eq!(snapshot.header.generation, generation + 1);
+        {
+            let header = reopened.header_ref().expect("router header");
+            assert_eq!(header.owner_pid, std::process::id());
+            assert!(header.owner_start_time > 1);
+        }
+        // The old nodes' slots are empty, not only left out of the count.
+        reopened
+            .register_node(Uuid::new_v4(), "IO.c@sandbox", 0, 3)
+            .expect("register c");
+        assert_eq!(router_node_names(&reopened), ["IO.c@sandbox"]);
+
+        cleanup_shm(&name);
+    }
+
+    #[test]
     fn router_writer_recovers_stale_odd_seq_on_reopen() {
         let name = format!("/jsr-r-{}", &Uuid::new_v4().simple().to_string()[..8]);
         cleanup_shm(&name);
@@ -4507,13 +4727,14 @@ mod tests {
             true,
         )
         .expect("reopen router region");
+        // 11 is recovered to 12, then taking the region over is one write.
         assert_eq!(
             reopened
                 .header_ref()
                 .expect("router header")
                 .seq
                 .load(Ordering::Acquire),
-            12
+            14
         );
         assert!(reopened.read_snapshot().is_some());
 
