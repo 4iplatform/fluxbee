@@ -10,8 +10,8 @@
 //! It is deliberately isolated from the HTTP/axum layer (it takes plain
 //! `Option<&str>` inputs and returns a transport-agnostic decision) so the same
 //! validation can later move to the Edge without dragging node internals along,
-//! exactly as the contract mandates ("ubicación intermedia: IO.linkedhelper /
-//! ubicación final: Edge LinkedHelper").
+//! exactly as the contract mandates ("intermediate location: IO.linkedhelper /
+//! final location: Edge LinkedHelper").
 
 /// Transport-agnostic category of an auth rejection. The caller maps each
 /// variant to a concrete status (HTTP today, whatever the Edge uses later).

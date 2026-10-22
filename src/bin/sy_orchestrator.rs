@@ -2128,7 +2128,7 @@ async fn reconcile_persisted_custom_nodes(
         } else {
             node.runtime_version.as_str()
         };
-        let version = match resolve_runtime_version(&manifest, &runtime_key, &requested_version) {
+        let version = match resolve_runtime_version(&manifest, &runtime_key, requested_version) {
             Ok(value) => value,
             Err(err) => {
                 failed = failed.saturating_add(1);
@@ -2527,7 +2527,9 @@ async fn watchdog_tick(state: &OrchestratorState) {
 
     // Host posture stage 2: Syncthing peers (A-47, A-50), about once a minute. A condition that
     // lasts is logged once.
-    if SYNCTHING_ADDRESS_TICKS.fetch_add(1, Ordering::Relaxed) % SYNCTHING_ADDRESS_EVERY_TICKS == 0
+    if SYNCTHING_ADDRESS_TICKS
+        .fetch_add(1, Ordering::Relaxed)
+        .is_multiple_of(SYNCTHING_ADDRESS_EVERY_TICKS)
     {
         match reconcile_syncthing_peer_addresses(state).await {
             Ok(Some(notes)) => {
@@ -2589,7 +2591,7 @@ fn watchdog_egress_reconcile(state: &OrchestratorState) {
     // F6: periodic idempotent drift correction on top of the cheap table-missing
     // fast path. `tick % N == 0` fires on the first tick and then every N ticks.
     let tick = EGRESS_RECONCILE_TICKS.fetch_add(1, Ordering::Relaxed);
-    let periodic = tick % EGRESS_RECONCILE_DRIFT_TICKS == 0;
+    let periodic = tick.is_multiple_of(EGRESS_RECONCILE_DRIFT_TICKS);
     match state.role {
         HiveRole::Egress if eg.enabled => {
             let table_missing = !nft_table_loaded(EGRESS_NFT_TABLE);
@@ -4560,7 +4562,7 @@ fn prepare_core_update(state: &OrchestratorState) -> Result<CorePrepareOutcome, 
                 .and_then(|n| n.to_str())
                 .unwrap_or_default()
                 .to_string(),
-            created_at_ms: now_epoch_ms() as u64,
+            created_at_ms: now_epoch_ms(),
             hive_id: state.hive_id.clone(),
             role: format!("{:?}", state.role).to_lowercase(),
             replaced_manifest_hash: read_core_installed_record().and_then(|r| {
@@ -4902,7 +4904,7 @@ async fn handle_system_update_message(
     let expected_version = request.manifest_version;
     let expected_hash = request.manifest_hash.as_str();
 
-    let local = match local_system_manifest_state(&category) {
+    let local = match local_system_manifest_state(category) {
         Ok(value) => value,
         Err(err) => {
             return serde_json::json!({
@@ -4916,7 +4918,7 @@ async fn handle_system_update_message(
 
     let local_version = local.version.unwrap_or(0);
     let local_hash = local.hash.unwrap_or_default();
-    let expected_hash_norm = normalize_sha256(&expected_hash);
+    let expected_hash_norm = normalize_sha256(expected_hash);
     let local_hash_norm = normalize_sha256(&local_hash);
     if expected_version != 0 {
         if let Some(local_known_version) = local.version {
@@ -6971,8 +6973,9 @@ static HOST_RULES_TICKS: AtomicU64 = AtomicU64::new(0);
 /// docs/control-path-hardening-v1.md §6, about once a minute: the ingress re-applies its SSH table
 /// (at once when an applied table vanished), and every hive reports an active ufw or firewalld.
 fn watchdog_host_rules(state: &OrchestratorState) {
-    let periodic =
-        HOST_RULES_TICKS.fetch_add(1, Ordering::Relaxed) % EGRESS_RECONCILE_DRIFT_TICKS == 0;
+    let periodic = HOST_RULES_TICKS
+        .fetch_add(1, Ordering::Relaxed)
+        .is_multiple_of(EGRESS_RECONCILE_DRIFT_TICKS);
     if state.role == HiveRole::Ingress {
         let vanished = INGRESS_SSH_RULES_APPLIED.load(Ordering::Relaxed)
             && !nft_table_loaded(INGRESS_NFT_TABLE);
@@ -7183,7 +7186,7 @@ fn loopback_only_exposures(listeners: &[TcpListenerEntry]) -> Vec<(String, Strin
 /// the log and in the drift store (deduplicated there for an hour).
 fn watchdog_listener_check(state: &OrchestratorState) {
     let tick = LISTENER_CHECK_TICKS.fetch_add(1, Ordering::Relaxed);
-    if tick % LISTENER_CHECK_EVERY_TICKS != 0 {
+    if !tick.is_multiple_of(LISTENER_CHECK_EVERY_TICKS) {
         return;
     }
     let mut cmd = Command::new("ss");
@@ -7750,17 +7753,14 @@ fn resolve_executable_path(name: &str) -> Option<String> {
             return Some(path.to_string());
         }
     }
-    for candidate in [
+    [
         format!("/usr/sbin/{name}"),
         format!("/sbin/{name}"),
         format!("/usr/bin/{name}"),
         format!("/bin/{name}"),
-    ] {
-        if Path::new(&candidate).exists() {
-            return Some(candidate);
-        }
-    }
-    None
+    ]
+    .into_iter()
+    .find(|candidate| Path::new(candidate).exists())
 }
 
 fn nft_boot_unit_contents(files: &NftTableFiles, nft_path: &str) -> String {
@@ -7929,7 +7929,7 @@ fn verify_motherbee_egress(
                 "egress",
                 "health_check_failed",
                 "warning",
-                &verify_hive_id,
+                verify_hive_id,
                 format!(
                     "motherbee egresses via {observed}, not the declared gateway {gateway_ip}. \
                      The nodes that call the internet run here, so they are outside the managed \
@@ -9516,11 +9516,11 @@ struct DistSyncFolder {
 /// This is where "each hive gets only what it runs" is actually decided, and the split is by
 /// CONTENT, deliberately:
 ///   * core    — per role. The ingress runs 4 of the 17 core binaries; shipping it all of
-///               `dist/core` would hand the DMZ box the 181 MB motherbee-only `sy_architect`
-///               for nothing.
+///     `dist/core` would hand the DMZ box the 181 MB motherbee-only `sy_architect` for
+///     nothing.
 ///   * vendor  — everyone. Without it `update category=vendor` is permanently unsatisfiable.
 ///   * runtimes— worker only. Tenant workflow packages live here; this is the subtree that
-///               must never reach the DMZ.
+///     must never reach the DMZ.
 ///   * agent assets — worker only, where the agents run; `blob/agent-assets` (FINDINGS A-72).
 ///
 /// Paths are asymmetric by design: motherbee serves `dist/core/<role>`, the spoke receives it
@@ -10069,9 +10069,9 @@ fn fluxbee_folder_memberships(
     let mut out = BTreeMap::new();
     for caps in folder_re.captures_iter(config_xml) {
         let id = caps[1].to_string();
-        if !out.contains_key(&id) {
-            let members = syncthing_folder_device_ids(config_xml, &id)?;
-            out.insert(id, members);
+        if let std::collections::btree_map::Entry::Vacant(entry) = out.entry(id) {
+            let members = syncthing_folder_device_ids(config_xml, entry.key())?;
+            entry.insert(members);
         }
     }
     Ok(out)
@@ -10209,8 +10209,7 @@ fn motherbee_peer_plan(
             continue;
         };
         for (folder_id, members) in memberships {
-            if members.iter().any(|m| *m == device.id) && folder_forbidden_for_role(folder_id, role)
-            {
+            if members.contains(&device.id) && folder_forbidden_for_role(folder_id, role) {
                 plan.drop_memberships
                     .push((folder_id.clone(), device.id.clone()));
             }
@@ -14058,7 +14057,7 @@ fn write_drift_alert(mut entry: DriftAlertEntry) -> Result<bool, String> {
         .lock()
         .map_err(|_| "drift alert lock poisoned".to_string())?;
     let path = drift_alerts_path();
-    let now = now_epoch_ms() as u64;
+    let now = now_epoch_ms();
     entry.detected_at = now;
     entry.alert_id = format!("{}-{}-{}-{now}", entry.category, entry.kind, entry.hive_id);
     let existing = fs::read_to_string(&path).unwrap_or_default();
@@ -15734,7 +15733,7 @@ fn apply_runtime_retention_with_roots_and_protection(
             stats.removed_runtime_dirs += 1;
             continue;
         }
-        if keep_map.get(&runtime).is_none() && !protected_versions.is_empty() {
+        if !keep_map.contains_key(&runtime) && !protected_versions.is_empty() {
             stats.protected_runtime_dirs += 1;
             tracing::info!(
                 runtime = %runtime,
@@ -18998,8 +18997,8 @@ fn write_private_file_atomic(path: &Path, contents: &[u8]) -> Result<(), Orchest
     let tmp = path.with_extension(format!("tmp-{}", Uuid::new_v4()));
     fs::write(&tmp, contents)?;
     fs::set_permissions(&tmp, fs::Permissions::from_mode(0o600))?;
-    fs::rename(&tmp, &path)?;
-    fs::set_permissions(&path, fs::Permissions::from_mode(0o600))?;
+    fs::rename(&tmp, path)?;
+    fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
     Ok(())
 }
 
@@ -19838,40 +19837,37 @@ async fn set_node_config_flow(
             .filter(|value| !value.is_empty())
             .map(|value| value.to_string());
         if let Some(runtime_name) = effective_runtime {
-            match load_runtime_manifest_result() {
-                Ok(Some(manifest)) => {
-                    let resolved = resolve_runtime_key(&manifest, &runtime_name).and_then(|key| {
-                        resolve_runtime_version(&manifest, &key, &runtime_version)
-                            .map(|version| (key, version))
-                    });
-                    let (runtime_key, resolved_version) = match resolved {
-                        Ok(value) => value,
-                        Err(err) => {
-                            return serde_json::json!({
-                                "status": "error",
-                                "error_code": "RUNTIME_NOT_AVAILABLE",
-                                "message": err.to_string(),
-                                "target": target_hive,
-                                "node_name": node_name,
-                                "runtime": runtime_name,
-                                "runtime_version": runtime_version,
-                            });
-                        }
-                    };
-                    if let Err(payload) = node_package_files_preflight(
-                        &manifest,
-                        Path::new(DIST_RUNTIME_ROOT_DIR),
-                        &runtime_key,
-                        &resolved_version,
-                        &target_hive,
-                        &node_name,
-                    ) {
-                        return payload;
+            // With no manifest to check against (none, or unreadable), bind and let the spawn
+            // path be the gate, rather than blocking a legitimate rebind on a missing manifest.
+            if let Ok(Some(manifest)) = load_runtime_manifest_result() {
+                let resolved = resolve_runtime_key(&manifest, &runtime_name).and_then(|key| {
+                    resolve_runtime_version(&manifest, &key, &runtime_version)
+                        .map(|version| (key, version))
+                });
+                let (runtime_key, resolved_version) = match resolved {
+                    Ok(value) => value,
+                    Err(err) => {
+                        return serde_json::json!({
+                            "status": "error",
+                            "error_code": "RUNTIME_NOT_AVAILABLE",
+                            "message": err.to_string(),
+                            "target": target_hive,
+                            "node_name": node_name,
+                            "runtime": runtime_name,
+                            "runtime_version": runtime_version,
+                        });
                     }
+                };
+                if let Err(payload) = node_package_files_preflight(
+                    &manifest,
+                    Path::new(DIST_RUNTIME_ROOT_DIR),
+                    &runtime_key,
+                    &resolved_version,
+                    &target_hive,
+                    &node_name,
+                ) {
+                    return payload;
                 }
-                // No manifest to check against: bind and let the spawn path be the gate, rather
-                // than blocking a legitimate rebind on a missing manifest.
-                Ok(None) | Err(_) => {}
             }
         }
         system.insert(
@@ -20094,7 +20090,7 @@ async fn run_node_flow(
         }
     };
 
-    let version = match resolve_runtime_version(&manifest, &runtime_key, &requested_version) {
+    let version = match resolve_runtime_version(&manifest, &runtime_key, requested_version) {
         Ok(version) => version,
         Err(err) => {
             return serde_json::json!({
@@ -21910,7 +21906,8 @@ type TestTimerPurgeResult = Result<serde_json::Value, String>;
 /// teardown_node). Each slot is process-global state; without this guard
 /// concurrent `#[tokio::test]` invocations interleave set/take and corrupt one
 /// another's results. Each test calling a `set_test_*` seam should hold this
-/// guard from the set call until the helper invocation returns.
+/// guard from the set call until the helper invocation returns, across its
+/// awaits (hence those tests' `allow(clippy::await_holding_lock)`).
 #[cfg(test)]
 fn teardown_test_serial_guard() -> std::sync::MutexGuard<'static, ()> {
     static SERIAL: OnceLock<StdMutex<()>> = OnceLock::new();
@@ -28012,6 +28009,7 @@ static ASKPASS_SEQ: AtomicU64 = AtomicU64::new(0);
 /// - Emitted with `printf '%s\n'` inside single quotes (no `echo`), so a password
 ///   containing `$`, backtick, or a trailing backslash is reproduced verbatim and
 ///   cannot trigger command substitution or break the script's quoting.
+///
 /// The caller removes the file right after the ssh invocation returns.
 fn askpass_script(password: &str) -> Result<PathBuf, OrchestratorError> {
     let dir = std::env::temp_dir();
@@ -28975,10 +28973,10 @@ mod tests {
         let body = &src[start..end];
         let gate = body
             .find("ensure_dir_permissions_0750(&blob.sync_data_dir)")
-            .expect("la creacion del home de syncthing");
+            .expect("the creation of the syncthing home");
         // Walk back to the `if` that guards it and assert dist is part of the condition, following
         // a named condition to its definition.
-        let guard_start = body[..gate].rfind("if ").expect("su guard");
+        let guard_start = body[..gate].rfind("if ").expect("its guard");
         let mut guard = &body[guard_start..gate];
         if guard.contains("if syncthing_runs") {
             let def = body
@@ -28989,9 +28987,9 @@ mod tests {
         }
         assert!(
             guard.contains("dist.sync_enabled"),
-            "el home de syncthing debe crearse tambien cuando lo unico que lo necesita es el \
-             sync de DIST — si no, el egress arranca el servicio sin su WorkingDirectory. \
-             guard actual: {guard}"
+            "the syncthing home must be created also when DIST sync is the only thing that \
+             needs it; otherwise the egress starts the service without its WorkingDirectory. \
+             current guard: {guard}"
         );
     }
 
@@ -29016,7 +29014,7 @@ mod tests {
         ] {
             let start = src
                 .find(flow)
-                .unwrap_or_else(|| panic!("no encontre {flow}"));
+                .unwrap_or_else(|| panic!("did not find {flow}"));
             let end = src[start..]
                 .find(next)
                 .map(|o| start + o)
@@ -35114,17 +35112,17 @@ blob:
         let end = src[start..]
             .find("\n}")
             .map(|o| start + o)
-            .expect("su cierre");
+            .expect("its end");
         let body = &src[start..end];
 
         assert!(
             body.contains("dist_sync_folders_for_hive("),
-            "el hint tiene que resolver por el helper que sabe de motherbee"
+            "the hint has to resolve through the helper that knows about motherbee"
         );
         assert!(
             !body.contains("dist_sync_folders_for_role("),
-            "dist_sync_folders_for_role da fluxbee-dist-core-motherbee en motherbee: 404, y el \
-             primer no-ok hace fallar el hint entero"
+            "dist_sync_folders_for_role gives fluxbee-dist-core-motherbee on motherbee: a 404, and \
+             the first non-ok fails the whole hint"
         );
     }
 
@@ -35434,14 +35432,14 @@ blob:
         );
     }
 
-    /// Reiniciar tiene que RECREAR la unit cuando cambio la ruta del entrypoint.
+    /// A restart has to RECREATE the unit when the entrypoint's path changed.
     ///
-    /// `systemctl restart` re-ejecuta el ExecStart que ya tiene la unit, y esa ruta lleva la
-    /// version del runtime adentro. Asi que reiniciar despues de publicar una version nueva
-    /// relanzaba el binario VIEJO — mientras la respuesta le informaba al operador la version
-    /// nueva. Version prometida y no aplicada: la forma de U-1.
+    /// `systemctl restart` reruns the ExecStart the unit already has, and that path carries the
+    /// runtime's version inside. So restarting after publishing a new version relaunched the OLD
+    /// binary, while the reply told the operator the new version. A version promised and not
+    /// applied: the shape of U-1.
     ///
-    /// Medido en vivo: `restart_node` devolvio `version: 0.1.14` y el proceso siguio siendo
+    /// Measured live: `restart_node` returned `version: 0.1.14` and the process was still
     /// `/var/lib/fluxbee/dist/runtimes/io.slack/0.1.13/bin/io-slack`.
     #[test]
     fn reiniciar_recrea_la_unit_si_cambio_la_ruta_del_entrypoint() {
@@ -35473,29 +35471,29 @@ blob:
 
         assert!(
             cmd.contains("ExecStart") && cmd.contains("0.1.14/bin/start.sh"),
-            "tiene que comparar el ExecStart vivo contra la ruta planificada: {cmd}"
+            "it has to compare the live ExecStart against the planned path: {cmd}"
         );
         assert!(
             cmd.contains("systemctl stop") && cmd.contains("systemd-run"),
-            "si no coincide, tiene que bajar la unit y recrearla: {cmd}"
+            "when they differ, it has to stop the unit and recreate it: {cmd}"
         );
         assert!(
             cmd.contains("systemctl restart"),
-            "si ya coincide, alcanza con reiniciar en el lugar: {cmd}"
+            "when they already match, restarting in place is enough: {cmd}"
         );
     }
 
-    /// Arrancar/reiniciar un nodo tiene que resolver la INTENCION, no la respuesta guardada.
+    /// Starting/restarting a node has to resolve the INTENT, not the stored answer.
     ///
-    /// Es la misma regla que U-10 puso en el arranque del orquestador, y que este camino no
-    /// tenia: un nodo con `_system.requested_runtime_version = "current"` volvia a lanzarse sobre
-    /// su ultima version CONCRETA. Efecto real: publicar un runtime nuevo y reiniciar el nodo no
-    /// lo tomaba nunca — o sea que el modelo "crecer = publish + update, sin .deb nuevo" no
-    /// funcionaba para un nodo ya corriendo, y la respuesta encima devolvia la version vieja como
+    /// It is the same rule U-10 put in the orchestrator's boot, and that this path lacked: a node
+    /// with `_system.requested_runtime_version = "current"` was launched again on its last
+    /// CONCRETE version. Real effect: publishing a new runtime and restarting the node never
+    /// picked it up, so the "growth = publish + update, no new .deb" model did not work for a node
+    /// already running, and on top of that the reply returned the old version as
     /// `requested_version`.
     ///
-    /// Se fija leyendo la fuente porque la propiedad es de ORDEN: el calculo de la intencion tiene
-    /// que estar ANTES de la resolucion, y la resolucion tiene que usarlo a el.
+    /// It is pinned by reading the source because the property is one of ORDER: computing the
+    /// intent has to come BEFORE the resolution, and the resolution has to use it.
     #[test]
     fn arrancar_un_nodo_resuelve_la_intencion_no_la_version_guardada() {
         let src = include_str!("sy_orchestrator.rs");
@@ -35503,34 +35501,35 @@ blob:
             .find("fn managed_node_launch_plan(")
             .expect("managed_node_launch_plan");
         let body = &src[start..];
-        let end = body.find("\n}").expect("su cierre");
+        let end = body.find("\n}").expect("its end");
         let body = &body[..end];
 
         let intent = body
             .find("node.follows_current()")
-            .expect("tiene que consultar la INTENCION del nodo");
+            .expect("it has to consult the node's INTENT");
         let resolve = body
             .find("resolve_runtime_version(&manifest, &runtime_key, &requested_version)")
-            .expect("la resolucion tiene que usar la intencion, no node.runtime_version");
+            .expect("the resolution has to use the intent, not node.runtime_version");
         assert!(
             intent < resolve,
-            "la intencion se calcula antes de resolver, no despues"
+            "the intent is computed before resolving, not after"
         );
         assert!(
             !body.contains(
                 "resolve_runtime_version(&manifest, &runtime_key, &node.runtime_version)"
             ),
-            "resolver la version CONCRETA guardada re-pinnea un nodo que sigue a current"
+            "resolving the stored CONCRETE version re-pins a node that follows current"
         );
     }
 
-    /// IO.blob e IO.cloud son runtimes MANAGED, sin unit propia de systemd.
+    /// IO.blob and IO.cloud are MANAGED runtimes, with no systemd unit of their own.
     ///
-    /// Ya no tienen unit propia de systemd: el orquestador es su unico dueño (los instancia por
-    /// `run_node` y los relanza en `reconcile`), y se configuran por CONFIG_SET/GET. Por eso el
-    /// barrido de adopcion TIENE que relanzarlos — es su unico camino de arranque, como cualquier
-    /// runtime. El guard de doble-dueño (`managed_spawn_disallowed_reason`) bloquea SY.* y
-    /// RT.gateway; ningun runtime managed tiene unit de systemd que compita por el proceso.
+    /// They no longer have their own systemd unit: the orchestrator is their only owner (it
+    /// instantiates them through `run_node` and relaunches them in `reconcile`), and they are
+    /// configured by CONFIG_SET/GET. That is why the adoption sweep HAS to relaunch them: it is
+    /// their only way to start, as for any runtime. The double-owner guard
+    /// (`managed_spawn_disallowed_reason`) blocks SY.* and RT.gateway; no managed runtime has a
+    /// systemd unit competing for the process.
     #[test]
     fn io_blob_y_io_cloud_ahora_se_adoptan_como_runtimes_gestionados() {
         for nombre in [
@@ -35543,7 +35542,7 @@ blob:
         ] {
             assert!(
                 managed_spawn_disallowed_reason(nombre).is_none(),
-                "{nombre} es un runtime managed: el boot pass TIENE que relanzarlo"
+                "{nombre} is a managed runtime: the boot pass HAS to relaunch it"
             );
             assert!(managed_reconcile_candidate_allowed(nombre));
         }
@@ -35610,11 +35609,11 @@ blob:
         );
     }
 
-    /// REGRESION (U-7): motherbee no se sincroniza consigo misma, asi que NUNCA declara
-    /// `fluxbee-dist-core-motherbee`. El watchdog de salud lo consultaba igual —porque derivaba el
-    /// set con el rol propio en vez de con la misma regla que la declaracion— y tiraba un 404 cada
-    /// cinco segundos, para siempre. Declaracion, marcadores `.stfolder` y chequeo de salud deben
-    /// salir todos de `dist_sync_folders_for_hive`.
+    /// REGRESSION (U-7): motherbee does not sync to itself, so it NEVER declares
+    /// `fluxbee-dist-core-motherbee`. The health watchdog asked about it anyway (it derived the set
+    /// from its own role instead of from the same rule as the declaration) and got a 404 every five
+    /// seconds, forever. The declaration, the `.stfolder` markers and the health check must all
+    /// come from `dist_sync_folders_for_hive`.
     #[test]
     fn motherbee_never_polls_a_core_folder_for_itself() {
         let dist = sample_dist_config();
@@ -35626,9 +35625,9 @@ blob:
                 .collect();
         assert!(
             !ids.iter().any(|id| id.ends_with("motherbee")),
-            "motherbee no debe declarar ni consultar una carpeta de core propia; obtuvo {ids:?}"
+            "motherbee must neither declare nor query a core folder of its own; got {ids:?}"
         );
-        // Si sirve a los tres roles de spoke, mas vendor y runtimes.
+        // It does serve the three spoke roles, plus vendor and runtimes.
         for role in ["worker", "ingress", "egress"] {
             assert!(ids.contains(&format!("{SYNCTHING_FOLDER_DIST_CORE_PREFIX}{role}")));
         }
@@ -35637,7 +35636,7 @@ blob:
         assert!(ids.contains(&SYNCTHING_FOLDER_DIST_AGENT_ASSETS_ID.to_string()));
     }
 
-    /// El id compartido (vendor) se declara UNA vez aunque lo usen los tres roles.
+    /// The shared id (vendor) is declared ONCE even though all three roles use it.
     #[test]
     fn shared_dist_folders_are_declared_once() {
         let dist = sample_dist_config();
@@ -35650,10 +35649,10 @@ blob:
         let mut sorted = ids.clone();
         sorted.sort();
         sorted.dedup();
-        assert_eq!(sorted.len(), ids.len(), "ids duplicados en {ids:?}");
+        assert_eq!(sorted.len(), ids.len(), "duplicate ids in {ids:?}");
     }
 
-    /// Un spoke solo carga lo suyo: su core, vendor, y runtimes unicamente si es worker.
+    /// A spoke carries only its own: its core, vendor, and runtimes only if it is a worker.
     #[test]
     fn a_spoke_carries_only_its_own_dist_folders() {
         let dist = sample_dist_config();
@@ -35671,12 +35670,12 @@ blob:
                 "{SYNCTHING_FOLDER_DIST_CORE_PREFIX}{}",
                 role.as_str()
             )));
-            // y de ningun otro rol
+            // and no other role's
             for other in ["worker", "ingress", "egress"] {
                 if other != role.as_str() {
                     assert!(
                         !ids.contains(&format!("{SYNCTHING_FOLDER_DIST_CORE_PREFIX}{other}")),
-                        "{} no debe cargar la carpeta de {other}",
+                        "{} must not carry the folder of {other}",
                         role.as_str()
                     );
                 }
@@ -35684,7 +35683,7 @@ blob:
             assert_eq!(
                 ids.contains(&SYNCTHING_FOLDER_DIST_RUNTIMES_ID.to_string()),
                 wants_runtimes,
-                "runtimes para {}",
+                "runtimes for {}",
                 role.as_str()
             );
             assert_eq!(
@@ -36400,6 +36399,7 @@ blob:
     }
 
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
     async fn h3_timer_purge_uses_canonical_rpc_client_and_routes_collisions() {
         let _guard = teardown_test_serial_guard();
         let state = Arc::new(sample_orchestrator_state_for_tests());
@@ -37113,6 +37113,7 @@ blob:
     }
 
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
     async fn purge_owner_timers_before_teardown_returns_ok_payload_with_deleted_count() {
         let _guard = teardown_test_serial_guard();
         let state = sample_orchestrator_state_for_tests();
@@ -37140,6 +37141,7 @@ blob:
     }
 
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
     async fn purge_owner_timers_before_teardown_surfaces_rpc_error() {
         let _guard = teardown_test_serial_guard();
         let state = sample_orchestrator_state_for_tests();
@@ -38725,37 +38727,37 @@ blob:
         assert!(out.get("_system").is_none());
     }
 
-    /// REGRESION: `systemd_unit_exists` le agrega `.service` al nombre, asi que pasarle uno que
-    /// YA lo tiene pregunta por `<unit>.service.service` — siempre "not-found". Ese doble sufijo
-    /// hizo que `clear_stale_transient_unit` saliera por el guard sin limpiar nada, y el relanzamiento
-    /// siguio muriendo con "Unit ... was already loaded" en el upgrade 0.1.3 -> 0.1.4.
+    /// REGRESSION: `systemd_unit_exists` appends `.service` to the name, so passing it one that
+    /// ALREADY has it asks about `<unit>.service.service`, always "not-found". That double suffix
+    /// made `clear_stale_transient_unit` leave through the guard without cleaning anything, and the
+    /// relaunch kept dying with "Unit ... was already loaded" on the 0.1.3 -> 0.1.4 upgrade.
     #[test]
     fn unit_names_are_not_double_suffixed() {
-        // La forma que produce el codigo real, sin sufijo.
+        // The form the real code produces, with no suffix.
         let bare = unit_from_node_name("IO.api@motherbee");
         assert!(
             !bare.ends_with(".service"),
-            "unit_from_node_name debe devolver el nombre pelado, obtuvo {bare}"
+            "unit_from_node_name must return the bare name, got {bare}"
         );
-        // Y si alguien igual pasa la forma con sufijo, debe normalizarse a una sola.
+        // And if someone passes the suffixed form anyway, it must collapse to a single one.
         let suffixed = format!("{bare}.service");
         assert_eq!(suffixed.strip_suffix(".service").unwrap_or(&suffixed), bare);
     }
 
-    /// U-10: la INTENCION se persiste aparte de su resolucion.
+    /// U-10: the INTENT is persisted apart from its resolution.
     ///
-    /// `fluxbee-firstboot` spawnea todo nodo boot=true con `runtime_version: "current"`. Antes,
-    /// esa palabra se resolvia una vez y se tiraba: solo quedaba la version concreta, horneada
-    /// en la ruta de la unit. Cuando un upgrade del .deb reemplazaba el directorio del runtime,
-    /// la ruta quedaba colgada (203/EXEC) y `restart_node` respondia RUNTIME_NOT_AVAILABLE.
+    /// `fluxbee-firstboot` spawns every boot=true node with `runtime_version: "current"`. That word
+    /// used to be resolved once and thrown away: only the concrete version stayed, baked into the
+    /// unit's path. When a .deb upgrade replaced the runtime's directory, the path was left
+    /// dangling (203/EXEC) and `restart_node` answered RUNTIME_NOT_AVAILABLE.
     #[test]
     fn system_block_keeps_the_requested_version_apart_from_the_resolved_one() {
         let system = build_node_system_block(
             "IO.api@motherbee",
             "motherbee",
             Some("io.api"),
-            Some("0.1.2"),   // a lo que resolvio
-            Some("current"), // lo que se pidio
+            Some("0.1.2"),   // what it resolved to
+            Some("current"), // what was asked for
             None,
             None,
             None,
@@ -38766,11 +38768,11 @@ blob:
         assert_eq!(
             system["requested_runtime_version"],
             serde_json::json!("current"),
-            "la palabra del que pidio no se puede perder"
+            "the requester's word cannot be lost"
         );
     }
 
-    /// Quien no nombra version quiso la current — y es lo que hace firstboot.
+    /// Whoever names no version wanted the current one, and that is what firstboot does.
     #[test]
     fn an_unnamed_version_defaults_to_current() {
         let system = build_node_system_block(
@@ -38791,7 +38793,7 @@ blob:
         );
     }
 
-    /// Un pin explicito se respeta: ese nodo NO sigue al puntero.
+    /// An explicit pin is respected: that node does NOT follow the pointer.
     #[test]
     fn an_explicit_pin_does_not_follow_the_pointer() {
         let pinned = PersistedManagedNode {
@@ -38812,8 +38814,8 @@ blob:
         assert!(following.follows_current());
     }
 
-    /// Un config viejo (anterior a U-10) no trae el campo. Debe leerse como "current", porque
-    /// esos nodos son justamente los que spawneo firstboot pidiendo current.
+    /// An old config (from before U-10) does not carry the field. It must be read as "current",
+    /// because those nodes are precisely the ones firstboot spawned asking for current.
     #[test]
     fn a_config_without_the_field_is_read_as_following_current() {
         let config = serde_json::json!({
@@ -38835,7 +38837,7 @@ blob:
         assert_eq!(node.runtime_version, "0.1.1");
         assert!(
             node.follows_current(),
-            "un nodo pre-U-10 debe volver a seguir el puntero, no quedar clavado en una version borrada"
+            "a pre-U-10 node must follow the pointer again, not stay stuck on a deleted version"
         );
     }
 
@@ -39086,6 +39088,7 @@ blob:
     /// docs/control-path-hardening-v1.md §2: the teardown reports `teardown_node`'s steps in its
     /// cleanup fields, and the routing references beside them.
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
     async fn optional_teardown_cleanup_surfaces_ilk_and_vault_summaries() {
         let _guard = teardown_test_serial_guard();
         let state = sample_orchestrator_state_for_tests();
@@ -39141,6 +39144,7 @@ blob:
 
     /// A teardown on any hive asks the motherbee's SY.admin, once.
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
     async fn a_teardown_asks_the_motherbees_admin_once() {
         let _guard = teardown_test_serial_guard();
         let state = sample_orchestrator_state_for_tests();
@@ -39444,7 +39448,7 @@ blob:
         // SY.admin's store calls can each take up to 30 s: the teardown waits long enough, and a
         // spoke's purge is waited for longer still.
         assert_eq!(TEARDOWN_NODE_TIMEOUT_SECS, 120);
-        assert!(TEARDOWN_FORWARD_TIMEOUT_SECS > TEARDOWN_NODE_TIMEOUT_SECS + 3);
+        const { assert!(TEARDOWN_FORWARD_TIMEOUT_SECS > TEARDOWN_NODE_TIMEOUT_SECS + 3) };
         let src = include_str!("sy_orchestrator.rs");
         let body_of = |name: &str| {
             let start = src.find(name).expect(name);
@@ -39569,8 +39573,8 @@ blob:
         assert!(removed);
 
         let reloaded = load_identity_node_ilk_map(&path);
-        assert!(reloaded.nodes.get("AI.demo@motherbee").is_none());
-        assert!(reloaded.tenants.get("AI.demo@motherbee").is_none());
+        assert!(!reloaded.nodes.contains_key("AI.demo@motherbee"));
+        assert!(!reloaded.tenants.contains_key("AI.demo@motherbee"));
 
         let _ = fs::remove_dir_all(&dir);
     }

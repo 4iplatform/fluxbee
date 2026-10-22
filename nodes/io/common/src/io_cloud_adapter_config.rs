@@ -1,30 +1,30 @@
-//! Contrato de configuracion de `IO.cloud`.
+//! The configuration contract of `IO.cloud`.
 //!
-//! # Por que existe
+//! # Why it exists
 //!
-//! io.cloud era el unico nodo IO sin plano de control: se configuraba por variables de entorno, y
-//! por eso exigia que el operador inventara un token y lo dejara en el entorno del proceso o en un
-//! archivo en disco — teniendo el sistema un vault justamente para eso.
+//! io.cloud was the only IO node without a control plane: it was configured by environment
+//! variables, and so it required the operator to make up a token and leave it in the process
+//! environment or in a file on disk, while the system has a vault precisely for that.
 //!
-//! La regla del operador es: **todo lo que se setea en un nodo va por CONFIG_SET/GET, y nada ocurre
-//! sin el admin**. Esto es esa regla aplicada a io.cloud.
+//! The operator's rule is: **everything set on a node goes through CONFIG_SET/GET, and nothing
+//! happens without the admin**. This is that rule applied to io.cloud.
 //!
-//! # Que es config y que no
+//! # What is config and what is not
 //!
-//! Un solo campo es config de verdad: **`edge_node`**, el edge en el que io.cloud confia para el
-//! trafico entrante. Todo lo demas de lo que hoy sale del entorno es o bien derivable del propio
-//! hive (`admin_hive`, `identity_hive`), o bien identidad congelada del canal
-//! (`channel_type`, `channel_address`), o bien ruta fija de diseño del sistema.
+//! Only one field is real config: **`edge_node`**, the edge io.cloud trusts for inbound traffic.
+//! Everything else that comes from the environment today is either derivable from the hive itself
+//! (`admin_hive`, `identity_hive`), or the channel's frozen identity (`channel_type`,
+//! `channel_address`), or a fixed system design path.
 //!
-//! **No hay campo de secreto, a proposito.** El token del endpoint lo acuña `SY.admin` y lo guarda
-//! en el vault; ni el operador ni este nodo lo eligen ni lo ven. Aceptar un secreto aca seria
-//! reabrir la puerta que se acaba de cerrar.
+//! **There is no secret field, on purpose.** The endpoint token is minted by `SY.admin` and kept in
+//! the vault; neither the operator nor this node chooses it or sees it. Accepting a secret here
+//! would reopen the door that was just closed.
 //!
-//! # Quien lo escribe
+//! # Who writes it
 //!
-//! Normalmente **nadie a mano**: `publish_cloud_endpoint` publica el endpoint y, como parte de esa
-//! misma orden, deja asentado el `edge_node` que acaba de usar. El operador puede verlo con
-//! `CONFIG_GET` y cambiarlo con `CONFIG_SET` si hace falta, pero el camino feliz no se lo pide.
+//! Normally **nobody by hand**: `publish_cloud_endpoint` publishes the endpoint and, as part of
+//! that same order, records the `edge_node` it just used. The operator can see it with
+//! `CONFIG_GET` and change it with `CONFIG_SET` if needed, but the happy path does not ask for it.
 
 use serde_json::{json, Value};
 
@@ -32,7 +32,7 @@ use crate::io_adapter_config::{IoAdapterConfigContract, IoAdapterConfigError};
 
 pub struct IoCloudAdapterConfigContract;
 
-/// El unico campo que un operador elige.
+/// The only field an operator chooses.
 pub const FIELD_EDGE_NODE: &str = "config.io.edge_node";
 
 impl IoAdapterConfigContract for IoCloudAdapterConfigContract {
@@ -41,10 +41,10 @@ impl IoAdapterConfigContract for IoCloudAdapterConfigContract {
     }
 
     fn required_fields(&self) -> &'static [&'static str] {
-        // Ninguno. Un io.cloud sin `edge_node` es un nodo VALIDO que todavia no tiene puerta
-        // publica: atiende la malla y no confia en ningun edge. Exigirlo lo dejaria en
-        // FAILED_CONFIG en cada arranque limpio, que es exactamente el estado que confunde al
-        // operador y no aporta nada.
+        // None. An io.cloud without `edge_node` is a VALID node that has no public door yet: it
+        // serves the mesh and trusts no edge. Requiring it would leave the node in FAILED_CONFIG
+        // on every clean start, which is exactly the state that confuses the operator and adds
+        // nothing.
         &[]
     }
 
@@ -66,8 +66,8 @@ impl IoAdapterConfigContract for IoCloudAdapterConfigContract {
     fn validate_and_materialize(&self, candidate: &Value) -> Result<Value, IoAdapterConfigError> {
         let io = candidate.get("io");
 
-        // `edge_node`, si viene, tiene que ser un nombre L2 usable. Un valor en blanco no es
-        // "sin edge": es un error de tipeo que dejaria al nodo descartando todo en silencio.
+        // `edge_node`, when present, has to be a usable L2 name. A blank value is not "no edge":
+        // it is a typo that would leave the node silently dropping everything.
         let edge_node = match io.and_then(|io| io.get("edge_node")) {
             None | Some(Value::Null) => None,
             Some(Value::String(raw)) => {
@@ -121,7 +121,7 @@ impl IoAdapterConfigContract for IoCloudAdapterConfigContract {
     }
 }
 
-/// El edge en el que este nodo confia, leido de la config efectiva. `None` = todavia ninguno.
+/// The edge this node trusts, read from the effective config. `None` = none yet.
 pub fn trusted_edge_node(effective: Option<&Value>) -> Option<String> {
     effective
         .and_then(|c| c.get("io"))
@@ -138,11 +138,11 @@ mod tests {
 
     #[test]
     fn un_nodo_sin_edge_es_valido_no_un_error() {
-        // Sin puerta publica todavia: atiende la malla y no confia en nadie. Exigir el campo lo
-        // dejaria en FAILED_CONFIG en cada arranque limpio sin aportar nada.
+        // No public door yet: it serves the mesh and trusts nobody. Requiring the field would
+        // leave it in FAILED_CONFIG on every clean start, adding nothing.
         let out = IoCloudAdapterConfigContract
             .validate_and_materialize(&json!({}))
-            .expect("un io.cloud sin edge es valido");
+            .expect("an io.cloud without an edge is valid");
         assert!(trusted_edge_node(Some(&out)).is_none());
         assert!(IoCloudAdapterConfigContract.required_fields().is_empty());
     }
@@ -151,21 +151,21 @@ mod tests {
     fn acepta_un_edge_valido_y_lo_expone() {
         let out = IoCloudAdapterConfigContract
             .validate_and_materialize(&json!({"io": {"edge_node": " SY.edge@ingress1 "}}))
-            .expect("edge valido");
+            .expect("valid edge");
         assert_eq!(
             trusted_edge_node(Some(&out)).as_deref(),
             Some("SY.edge@ingress1"),
-            "se normaliza el espaciado"
+            "the whitespace is trimmed"
         );
     }
 
     #[test]
     fn un_edge_en_blanco_es_un_error_no_un_silencio() {
-        // Esto es lo que separa "todavia no tengo puerta" de "me equivoque al escribirlo". Sin este
-        // corte, un typo dejaria al nodo descartando TODO el trafico entrante sin decir por que.
+        // This is what separates "I have no door yet" from "I mistyped it". Without this check, a
+        // typo would leave the node dropping ALL inbound traffic without saying why.
         let err = IoCloudAdapterConfigContract
             .validate_and_materialize(&json!({"io": {"edge_node": "   "}}))
-            .expect_err("un edge en blanco tiene que fallar");
+            .expect_err("a blank edge has to fail");
         assert!(format!("{err}").contains("blank"), "{err}");
     }
 
@@ -173,12 +173,12 @@ mod tests {
     fn el_edge_tiene_que_ser_un_sy_edge() {
         let err = IoCloudAdapterConfigContract
             .validate_and_materialize(&json!({"io": {"edge_node": "IO.api@motherbee"}}))
-            .expect_err("solo un SY.edge puede ser la puerta");
+            .expect_err("only an SY.edge can be the door");
         assert!(format!("{err}").contains("SY.edge"), "{err}");
     }
 
-    /// El contrato NO acepta secretos. Aceptarlos reabriria la puerta que cerramos: el token lo
-    /// acuña SY.admin al vault y nadie mas lo elige.
+    /// The contract accepts NO secrets. Accepting them would reopen the door we closed: SY.admin
+    /// mints the token into the vault and nobody else chooses it.
     #[test]
     fn no_hay_campo_de_secreto_en_el_contrato() {
         let campos: Vec<&str> = IoCloudAdapterConfigContract
@@ -191,18 +191,18 @@ mod tests {
             let bajo = campo.to_ascii_lowercase();
             assert!(
                 !bajo.contains("secret") && !bajo.contains("token") && !bajo.contains("api_key"),
-                "el contrato de io.cloud no debe tener campos de secreto: {campo}"
+                "the io.cloud contract must not have secret fields: {campo}"
             );
         }
-        // Y si alguien manda uno igual, se descarta al materializar (no se propaga).
+        // And if someone sends one anyway, it is dropped on materialize (it does not propagate).
         let out = IoCloudAdapterConfigContract
             .validate_and_materialize(
                 &json!({"io": {"edge_node": "SY.edge@ingress1", "secret": "x"}}),
             )
-            .expect("valido");
+            .expect("valid");
         assert!(
             out.get("io").and_then(|io| io.get("secret")).is_none(),
-            "un secreto colado no puede sobrevivir a la materializacion"
+            "a smuggled secret cannot survive materialization"
         );
     }
 }

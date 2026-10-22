@@ -58,9 +58,9 @@ async fn main() -> Result<(), DynError> {
         "IDENTITY_REPLICA_TENANT_ID is required: an active tenant created through SY.admin \
          (scripts/identity_replica_sync_e2e.sh creates it)",
     )?;
-    if !tenant_id
+    if tenant_id
         .strip_prefix("tnt:")
-        .is_some_and(|raw| Uuid::parse_str(raw).is_ok())
+        .is_none_or(|raw| Uuid::parse_str(raw).is_err())
     {
         return Err(format!("IDENTITY_REPLICA_TENANT_ID '{tenant_id}' is not tnt:<uuid>").into());
     }

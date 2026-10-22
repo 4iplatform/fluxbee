@@ -99,17 +99,16 @@ pub fn extract_final_response_contract(
 }
 
 pub fn validate_response_contract(contract: &Value) -> Result<(), IoResponseContractError> {
-    let obj =
-        contract
-            .as_object()
-            .ok_or_else(|| IoResponseContractError::InvalidResponseContract {
-                0: "response contract must be a JSON object".to_string(),
-            })?;
+    let obj = contract.as_object().ok_or_else(|| {
+        IoResponseContractError::InvalidResponseContract(
+            "response contract must be a JSON object".to_string(),
+        )
+    })?;
 
     let kind = obj.get("kind").and_then(Value::as_str).ok_or_else(|| {
-        IoResponseContractError::InvalidResponseContract {
-            0: "response contract.kind is required".to_string(),
-        }
+        IoResponseContractError::InvalidResponseContract(
+            "response contract.kind is required".to_string(),
+        )
     })?;
     if kind != "json_object_v1" {
         return Err(IoResponseContractError::InvalidResponseContract(format!(

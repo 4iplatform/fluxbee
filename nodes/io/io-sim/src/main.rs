@@ -226,7 +226,7 @@ fn env(key: &str) -> Option<String> {
 }
 
 fn resolve_sim_thread_id(config: &Config) -> Option<String> {
-    if let Some(thread_id) = config.sim_thread_id.as_ref().map(String::as_str) {
+    if let Some(thread_id) = config.sim_thread_id.as_deref() {
         let trimmed = thread_id.trim();
         if !trimmed.is_empty() {
             return Some(trimmed.to_string());

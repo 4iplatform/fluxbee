@@ -136,7 +136,7 @@ pub fn save_node_secret_record(
 ) -> Result<PathBuf, NodeSecretError> {
     let path = node_secret_path(node_name)?;
     save_node_secret_record_to_path(path, record)?;
-    Ok(node_secret_path(node_name)?)
+    node_secret_path(node_name)
 }
 
 pub fn save_node_secret_record_with_root(

@@ -1,31 +1,32 @@
-//! Contrato de configuracion de `IO.blob`.
+//! The configuration contract of `IO.blob`.
 //!
-//! # Por que existe
+//! # Why it exists
 //!
-//! io.blob era, como io.cloud, un nodo systemd empaquetado que se configuraba por variables de entorno
-//! y no participaba del plano de control. La regla del operador es: **todo lo que se setea en un nodo
-//! va por CONFIG_SET/GET, y nada por ENV**. Esto es esa regla aplicada a io.blob, para que sea un
-//! ciudadano de primera como los demas nodos IO (io.api/io.slack/io.wapp).
+//! io.blob was, like io.cloud, a packaged systemd node configured by environment variables that
+//! took no part in the control plane. The operator's rule is: **everything set on a node goes
+//! through CONFIG_SET/GET, and nothing through ENV**. This is that rule applied to io.blob, so it
+//! is a first-class citizen like the other IO nodes (io.api/io.slack/io.wapp).
 //!
-//! # Que es config y que no
+//! # What is config and what is not
 //!
-//! io.blob es un CURADOR: recibe comandos ya autorizados de `SY.admin`, cura bytes a `public/` y
-//! mantiene un ledger/refcount local. La mayoria de lo que hoy sale del entorno NO es config de
-//! operador: los roots (`blob_root`, `public_root`, `ledger_path`) son **rutas fijas de diseño del
-//! sistema** (defaults del nodo, con los dirs creados al instalar), y `admin_hive` es **derivable del
-//! propio hive** (por defecto el local). Lo unico que un operador podria querer tunear:
+//! io.blob is a CURATOR: it takes already-authorized commands from `SY.admin`, curates bytes into
+//! `public/` and keeps a local ledger/refcount. Most of what comes from the environment today is
+//! NOT operator config: the roots (`blob_root`, `public_root`, `ledger_path`) are **fixed system
+//! design paths** (node defaults, with the dirs created at install), and `admin_hive` is
+//! **derivable from the hive itself** (the local one by default). The only things an operator might
+//! want to tune:
 //!
-//! - **`max_bytes`** — el tamaño maximo de un blob publicable (limite de politica).
-//! - **`admin_hive`** — override del hive de `SY.admin` en el que confia (por defecto el local).
+//! - **`max_bytes`**: the maximum size of a publishable blob (a policy limit).
+//! - **`admin_hive`**: an override of the `SY.admin` hive it trusts (the local one by default).
 //!
-//! **No hay campo de secreto, a proposito:** io.blob no acuña ni guarda tokens; el acceso a un
-//! artefacto publico lo gobierna la fila del edge (capability en la URL), no este nodo.
+//! **There is no secret field, on purpose:** io.blob mints and stores no tokens; access to a public
+//! artifact is governed by the edge's row (the capability in the URL), not by this node.
 //!
-//! # Quien lo escribe
+//! # Who writes it
 //!
-//! Normalmente **nadie a mano**: un io.blob sin config es un curador VALIDO con defaults (no
-//! `FAILED_CONFIG`). `CONFIG_SET` es el override cuando hace falta subir/bajar `max_bytes` o apuntar
-//! a otro `admin_hive`.
+//! Normally **nobody by hand**: an io.blob without config is a VALID curator with defaults (not
+//! `FAILED_CONFIG`). `CONFIG_SET` is the override when `max_bytes` has to go up or down, or to
+//! point at another `admin_hive`.
 
 use serde_json::{json, Value};
 
@@ -33,9 +34,9 @@ use crate::io_adapter_config::{IoAdapterConfigContract, IoAdapterConfigError};
 
 pub struct IoBlobAdapterConfigContract;
 
-/// Override del hive de `SY.admin` (por defecto el local). Rara vez se toca.
+/// An override of the `SY.admin` hive (the local one by default). Rarely touched.
 pub const FIELD_ADMIN_HIVE: &str = "config.io.admin_hive";
-/// Tamaño maximo de un blob publicable, en bytes.
+/// The maximum size of a publishable blob, in bytes.
 pub const FIELD_MAX_BYTES: &str = "config.io.max_bytes";
 
 impl IoAdapterConfigContract for IoBlobAdapterConfigContract {
@@ -44,9 +45,9 @@ impl IoAdapterConfigContract for IoBlobAdapterConfigContract {
     }
 
     fn required_fields(&self) -> &'static [&'static str] {
-        // Ninguno. Un io.blob sin config es un curador VALIDO con defaults (roots de diseño,
-        // admin_hive local, max_bytes por defecto). Exigir algo lo dejaria en FAILED_CONFIG en cada
-        // arranque limpio sin aportar nada.
+        // None. An io.blob without config is a VALID curator with defaults (design roots, local
+        // admin_hive, default max_bytes). Requiring anything would leave it in FAILED_CONFIG on
+        // every clean start, adding nothing.
         &[]
     }
 
@@ -68,8 +69,8 @@ impl IoAdapterConfigContract for IoBlobAdapterConfigContract {
     fn validate_and_materialize(&self, candidate: &Value) -> Result<Value, IoAdapterConfigError> {
         let io = candidate.get("io");
 
-        // `admin_hive`, si viene, tiene que ser un id de hive usable. Un valor en blanco es un typo,
-        // no "sin override".
+        // `admin_hive`, when present, has to be a usable hive id. A blank value is a typo, not
+        // "no override".
         let admin_hive = match io.and_then(|io| io.get("admin_hive")) {
             None | Some(Value::Null) => None,
             Some(Value::String(raw)) => {
@@ -89,8 +90,9 @@ impl IoAdapterConfigContract for IoBlobAdapterConfigContract {
             }
         };
 
-        // `max_bytes`, si viene, tiene que ser un entero positivo. 0 no es "sin limite": es un limite
-        // que rechaza TODO, casi siempre un error. Omitir el campo = usar el default del nodo.
+        // `max_bytes`, when present, has to be a positive integer. 0 is not "no limit": it is a
+        // limit that rejects EVERYTHING, almost always a mistake. Omitting the field = the node's
+        // default.
         let max_bytes = match io.and_then(|io| io.get("max_bytes")) {
             None | Some(Value::Null) => None,
             Some(value) => {
@@ -120,7 +122,7 @@ impl IoAdapterConfigContract for IoBlobAdapterConfigContract {
     }
 }
 
-/// El hive de `SY.admin` en el que confia, leido de la config efectiva. `None` = usar el local.
+/// The `SY.admin` hive it trusts, read from the effective config. `None` = use the local one.
 pub fn configured_admin_hive(effective: Option<&Value>) -> Option<String> {
     effective
         .and_then(|c| c.get("io"))
@@ -131,7 +133,7 @@ pub fn configured_admin_hive(effective: Option<&Value>) -> Option<String> {
         .map(ToString::to_string)
 }
 
-/// El tope de tamaño de blob configurado, leido de la config efectiva. `None` = usar el default.
+/// The configured blob size cap, read from the effective config. `None` = use the default.
 pub fn configured_max_bytes(effective: Option<&Value>) -> Option<u64> {
     effective
         .and_then(|c| c.get("io"))
@@ -148,7 +150,7 @@ mod tests {
     fn un_curador_sin_config_es_valido_no_un_error() {
         let out = IoBlobAdapterConfigContract
             .validate_and_materialize(&json!({}))
-            .expect("un io.blob sin config es valido");
+            .expect("an io.blob without config is valid");
         assert!(configured_admin_hive(Some(&out)).is_none());
         assert!(configured_max_bytes(Some(&out)).is_none());
         assert!(IoBlobAdapterConfigContract.required_fields().is_empty());
@@ -160,12 +162,12 @@ mod tests {
             .validate_and_materialize(
                 &json!({"io": {"max_bytes": 1048576, "admin_hive": " motherbee "}}),
             )
-            .expect("config valida");
+            .expect("valid config");
         assert_eq!(configured_max_bytes(Some(&out)), Some(1_048_576));
         assert_eq!(
             configured_admin_hive(Some(&out)).as_deref(),
             Some("motherbee"),
-            "se normaliza el espaciado"
+            "the whitespace is trimmed"
         );
     }
 
@@ -173,7 +175,7 @@ mod tests {
     fn max_bytes_cero_es_un_error_no_un_silencio() {
         let err = IoBlobAdapterConfigContract
             .validate_and_materialize(&json!({"io": {"max_bytes": 0}}))
-            .expect_err("un tope 0 rechazaria TODO publish");
+            .expect_err("a cap of 0 would reject EVERY publish");
         assert!(format!("{err}").contains("> 0"), "{err}");
     }
 
@@ -181,11 +183,11 @@ mod tests {
     fn admin_hive_en_blanco_es_un_error() {
         let err = IoBlobAdapterConfigContract
             .validate_and_materialize(&json!({"io": {"admin_hive": "   "}}))
-            .expect_err("un admin_hive en blanco tiene que fallar");
+            .expect_err("a blank admin_hive has to fail");
         assert!(format!("{err}").contains("blank"), "{err}");
     }
 
-    /// El contrato NO acepta secretos: io.blob no acuña ni guarda tokens.
+    /// The contract accepts NO secrets: io.blob mints and stores no tokens.
     #[test]
     fn no_hay_campo_de_secreto_en_el_contrato() {
         let campos: Vec<&str> = IoBlobAdapterConfigContract
@@ -198,15 +200,15 @@ mod tests {
             let bajo = campo.to_ascii_lowercase();
             assert!(
                 !bajo.contains("secret") && !bajo.contains("token") && !bajo.contains("api_key"),
-                "el contrato de io.blob no debe tener campos de secreto: {campo}"
+                "the io.blob contract must not have secret fields: {campo}"
             );
         }
         let out = IoBlobAdapterConfigContract
             .validate_and_materialize(&json!({"io": {"max_bytes": 1024, "secret": "x"}}))
-            .expect("valido");
+            .expect("valid");
         assert!(
             out.get("io").and_then(|io| io.get("secret")).is_none(),
-            "un secreto colado no puede sobrevivir a la materializacion"
+            "a smuggled secret cannot survive materialization"
         );
     }
 }

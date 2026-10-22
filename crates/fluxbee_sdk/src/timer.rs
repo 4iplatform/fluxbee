@@ -135,60 +135,40 @@ impl AsRef<str> for TimerId {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum TimerKind {
+    #[default]
     Oneshot,
     Recurring,
 }
 
-impl Default for TimerKind {
-    fn default() -> Self {
-        Self::Oneshot
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum TimerStatus {
+    #[default]
     Pending,
     Fired,
     Canceled,
 }
 
-impl Default for TimerStatus {
-    fn default() -> Self {
-        Self::Pending
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum TimerStatusFilter {
+    #[default]
     Pending,
     Fired,
     Canceled,
     All,
 }
 
-impl Default for TimerStatusFilter {
-    fn default() -> Self {
-        Self::Pending
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum MissedPolicy {
+    #[default]
     Fire,
     Drop,
     FireIfWithin,
-}
-
-impl Default for MissedPolicy {
-    fn default() -> Self {
-        Self::Fire
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]

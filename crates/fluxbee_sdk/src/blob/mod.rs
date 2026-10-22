@@ -1571,11 +1571,11 @@ mod tests {
             .expect_err("missing blob must fail");
 
         let after = BlobToolkit::metrics_snapshot();
-        assert!(after.blob_put_total >= before.blob_put_total + 1);
+        assert!(after.blob_put_total > before.blob_put_total);
         assert!(after.blob_put_bytes_total >= before.blob_put_bytes_total + 3);
         assert!(after.blob_resolve_total >= before.blob_resolve_total + 2);
-        assert!(after.blob_resolve_retry_total >= before.blob_resolve_retry_total + 1);
-        assert!(after.blob_errors_total >= before.blob_errors_total + 1);
+        assert!(after.blob_resolve_retry_total > before.blob_resolve_retry_total);
+        assert!(after.blob_errors_total > before.blob_errors_total);
     }
 
     #[test]

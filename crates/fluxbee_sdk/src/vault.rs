@@ -886,11 +886,6 @@ impl VaultClient {
         Ok(parsed)
     }
 
-    /// Model D' resource resolution, identical semantics to the legacy free
-    /// `resolve_resource`:
-    /// 1. Dedicated secret for the caller's ILK (skipped when no ILK).
-    /// 2. Pool secret for the caller's tenant.
-    /// 3. Root-tenant pool secret (skipped when caller is already root).
     /// [`Self::resolve_resource`], but waiting out a vault that is not up YET.
     ///
     /// Boot-time consumers (SY.storage, SY.identity) need a secret before they can serve

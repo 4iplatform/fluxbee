@@ -734,13 +734,12 @@ impl IdentityStore {
         let merged_aliases: Vec<Value> = self
             .aliases
             .iter()
-            .filter_map(|(old_ilk_id, entry)| {
-                (entry.canonical_ilk_id == canonical_ilk_id).then(|| {
-                    json!({
-                        "old_ilk_id": old_ilk_id,
-                        "canonical_ilk_id": entry.canonical_ilk_id,
-                        "expires_at_ms": entry.expires_at_ms,
-                    })
+            .filter(|&(_old_ilk_id, entry)| entry.canonical_ilk_id == canonical_ilk_id)
+            .map(|(old_ilk_id, entry)| {
+                json!({
+                    "old_ilk_id": old_ilk_id,
+                    "canonical_ilk_id": entry.canonical_ilk_id,
+                    "expires_at_ms": entry.expires_at_ms,
                 })
             })
             .collect();
@@ -1744,8 +1743,8 @@ impl IdentityStore {
 
     /// The people charged to `tenant_id` and not marked: accounts, temporaries and pending
     /// signups alike. Nothing that happens to their tenant marks or removes them; purging it waits
-    /// until they are charged elsewhere (operator, 2026-10-14: *"no quiero borrar ni desaparecer
-    /// ilk de humanos"*).
+    /// until they are charged elsewhere (operator, 2026-10-14: *"I don't want to delete or make
+    /// humans' ILKs disappear"*).
     /// A temporary merged into another ILK is not one: it is an alias of that ILK until the alias
     /// expires, and it goes with a purge.
     fn tenant_people(&self, tenant_id: &str) -> Vec<String> {
@@ -2008,10 +2007,8 @@ impl IdentityStore {
     fn alias_old_ids_referencing(&self, ilk_id: &str) -> Vec<String> {
         self.aliases
             .iter()
-            .filter_map(|(old_ilk_id, alias)| {
-                (old_ilk_id == ilk_id || alias.canonical_ilk_id == ilk_id)
-                    .then(|| old_ilk_id.clone())
-            })
+            .filter(|&(old_ilk_id, alias)| old_ilk_id == ilk_id || alias.canonical_ilk_id == ilk_id)
+            .map(|(old_ilk_id, _alias)| old_ilk_id.clone())
             .collect()
     }
 
@@ -2093,8 +2090,10 @@ impl IdentityStore {
                 "purge requires the ilk to be marked deleted first (ILK_DELETE)",
             ));
         }
-        let mut changes = LifecycleChanges::default();
-        changes.purged_aliases = self.remove_ilk_physically(&req.ilk_id);
+        let mut changes = LifecycleChanges {
+            purged_aliases: self.remove_ilk_physically(&req.ilk_id),
+            ..Default::default()
+        };
         changes.purged_ilks.push(req.ilk_id.clone());
         Ok((
             json!({
@@ -3201,7 +3200,6 @@ impl IdentityRuntime {
 
     /// Persist changed ilks (plus a merge's alias and a tenant change's history row) in one
     /// transaction, then queue their deltas; on a DB error the store goes back to `snapshot`.
-    #[allow(clippy::too_many_arguments)]
     async fn commit_ilk_changes_with_history(
         &mut self,
         deltas: &mut Vec<IdentityDeltaEnvelope>,

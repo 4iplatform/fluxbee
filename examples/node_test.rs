@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use fluxbee_sdk::protocol::{
     build_echo, build_echo_reply, build_time_sync, Destination, Message, Meta, Routing,
@@ -189,11 +189,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("sent HOLA {} (dst={:?})", seq, dst);
 
         let trace_id = Uuid::new_v4().to_string();
-        let echo = build_echo(
-            &sender.uuid().to_string(),
-            Destination::Broadcast,
-            &trace_id,
-        );
+        let echo = build_echo(sender.uuid(), Destination::Broadcast, &trace_id);
         if let Err(err) = sender.send(echo).await {
             eprintln!("send error: {err} (reconnecting)");
             tokio::time::sleep(std::time::Duration::from_secs(1)).await;
@@ -202,11 +198,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("sent ECHO (dst=Broadcast)");
 
         let trace_id = Uuid::new_v4().to_string();
-        let echo_reply = build_echo_reply(
-            &sender.uuid().to_string(),
-            Destination::Broadcast,
-            &trace_id,
-        );
+        let echo_reply = build_echo_reply(sender.uuid(), Destination::Broadcast, &trace_id);
         if let Err(err) = sender.send(echo_reply).await {
             eprintln!("send error: {err} (reconnecting)");
             tokio::time::sleep(std::time::Duration::from_secs(1)).await;
@@ -217,7 +209,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let trace_id = Uuid::new_v4().to_string();
         let now_ms = now_epoch_ms();
         let time_sync = build_time_sync(
-            &sender.uuid().to_string(),
+            sender.uuid(),
             Destination::Broadcast,
             &trace_id,
             TimeSyncPayload {
@@ -274,7 +266,7 @@ fn payload_summary(payload: &serde_json::Value) -> String {
     }
 }
 
-fn load_hive_id(config_dir: &PathBuf) -> Result<String, Box<dyn std::error::Error>> {
+fn load_hive_id(config_dir: &Path) -> Result<String, Box<dyn std::error::Error>> {
     let data = std::fs::read_to_string(config_dir.join("hive.yaml"))?;
     let value: serde_yaml::Value = serde_yaml::from_str(&data)?;
     let hive_id = value
@@ -301,7 +293,7 @@ fn ensure_l2_name(name: &str, hive_id: &str) -> String {
 }
 
 fn load_router_uuid(
-    state_dir: &PathBuf,
+    state_dir: &Path,
     router_l2_name: &str,
 ) -> Result<Uuid, Box<dyn std::error::Error>> {
     let data = std::fs::read_to_string(state_dir.join(router_l2_name).join("identity.yaml"))?;

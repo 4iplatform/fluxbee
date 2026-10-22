@@ -44,8 +44,8 @@ fn default_runtime_manifest_schema_version() -> u64 {
 }
 
 pub fn runtime_manifest_schema_supported(schema_version: u64) -> bool {
-    schema_version >= RUNTIME_MANIFEST_SCHEMA_VERSION_MIN
-        && schema_version <= RUNTIME_MANIFEST_SCHEMA_VERSION_MAX
+    (RUNTIME_MANIFEST_SCHEMA_VERSION_MIN..=RUNTIME_MANIFEST_SCHEMA_VERSION_MAX)
+        .contains(&schema_version)
 }
 
 pub fn parse_runtime_manifest_file(path: &Path, data: &str) -> Result<RuntimeManifest, String> {

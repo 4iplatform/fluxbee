@@ -653,9 +653,11 @@ mod tests {
 
     #[test]
     fn runtime_config_builds_toolkit() {
-        let mut runtime = IoBlobRuntimeConfig::default();
-        runtime.blob_root = std::env::temp_dir().join("io-common-runtime-blob-root");
-        runtime.max_blob_bytes = Some(50 * 1024 * 1024);
+        let runtime = IoBlobRuntimeConfig {
+            blob_root: std::env::temp_dir().join("io-common-runtime-blob-root"),
+            max_blob_bytes: Some(50 * 1024 * 1024),
+            ..Default::default()
+        };
         let toolkit = runtime.build_toolkit().expect("runtime must build toolkit");
         let _ = toolkit;
     }

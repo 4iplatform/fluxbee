@@ -680,17 +680,14 @@ async fn main() -> Result<()> {
         poll_lock: Arc::new(Mutex::new(())),
     });
 
-    let http_task = match try_bind_http_listener(
+    let http_task = try_bind_http_listener(
         &config.node_name,
         &config.listen_addr,
         control_plane.clone(),
         control_metrics.clone(),
     )
     .await
-    {
-        Some(listener) => Some(tokio::spawn(run_http_server(listener, http_state))),
-        None => None,
-    };
+    .map(|listener| tokio::spawn(run_http_server(listener, http_state)));
 
     let control_task = tokio::spawn(run_router_control_loop(
         dispatcher,
@@ -760,7 +757,6 @@ async fn try_bind_http_listener(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 async fn run_router_control_loop(
     dispatcher: Arc<RouterDispatcher>,
     node_name: String,
@@ -824,7 +820,6 @@ fn build_io_linkedhelper_rpc_profile() -> Result<OperationalRouteProfile, fluxbe
         .build()
 }
 
-#[allow(clippy::too_many_arguments)]
 async fn handle_io_control_plane_message(
     msg: &WireMessage,
     node_name: &str,
@@ -961,7 +956,6 @@ async fn handle_io_control_plane_message(
     Some(response)
 }
 
-#[allow(clippy::too_many_arguments)]
 async fn apply_linkedhelper_config_set(
     payload: &fluxbee_sdk::node_config::NodeConfigSetPayload,
     node_name: &str,
@@ -1674,7 +1668,7 @@ async fn post_poll(
         .as_deref()
         .map(str::trim)
         .filter(|value| !value.is_empty())
-        .unwrap_or_else(|| {
+        .unwrap_or({
             if request.items.is_empty() {
                 "heartbeat"
             } else {

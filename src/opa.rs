@@ -488,10 +488,7 @@ impl OpaWasm {
             .get_memory(&mut store, "memory")
             .or(imported_memory)
             .ok_or(OpaError::MissingExport("memory"))?;
-        if let Some(builtins) = instance
-            .get_typed_func::<(), i32>(&mut store, "builtins")
-            .ok()
-        {
+        if let Ok(builtins) = instance.get_typed_func::<(), i32>(&mut store, "builtins") {
             if let Ok(ptr) = builtins.call(&mut store, ()) {
                 let json = read_cstr_store(&memory, &mut store, ptr);
                 store.data_mut().builtin_names = parse_builtins(&json);
@@ -500,10 +497,7 @@ impl OpaWasm {
             tracing::warn!("opa wasm missing builtins export; builtin map unavailable");
         }
         let mut entrypoints = HashMap::new();
-        if let Some(entrypoints_fn) = instance
-            .get_typed_func::<(), i32>(&mut store, "entrypoints")
-            .ok()
-        {
+        if let Ok(entrypoints_fn) = instance.get_typed_func::<(), i32>(&mut store, "entrypoints") {
             if let Ok(ptr) = entrypoints_fn.call(&mut store, ()) {
                 let json = read_cstr_store(&memory, &mut store, ptr);
                 entrypoints = parse_entrypoints(&json);
@@ -760,7 +754,7 @@ fn eval_builtin(caller: &mut Caller<'_, OpaRuntimeState>, builtin_id: i32, args:
         return 0;
     };
     let result = match name.as_str() {
-        "regex.match" => match (values.get(0), values.get(1)) {
+        "regex.match" => match (values.first(), values.get(1)) {
             (Some(Value::String(pattern)), Some(Value::String(text))) => {
                 match regex::Regex::new(pattern) {
                     Ok(re) => Ok(Value::Bool(re.is_match(text))),
@@ -769,11 +763,11 @@ fn eval_builtin(caller: &mut Caller<'_, OpaRuntimeState>, builtin_id: i32, args:
             }
             _ => Err("regex.match expects (string, string)".to_string()),
         },
-        "regex.is_valid" => match values.get(0) {
+        "regex.is_valid" => match values.first() {
             Some(Value::String(pattern)) => Ok(Value::Bool(regex::Regex::new(pattern).is_ok())),
             _ => Err("regex.is_valid expects (string)".to_string()),
         },
-        "regex.find" => match (values.get(0), values.get(1)) {
+        "regex.find" => match (values.first(), values.get(1)) {
             (Some(Value::String(pattern)), Some(Value::String(text))) => {
                 match regex::Regex::new(pattern) {
                     Ok(re) => Ok(Value::String(
@@ -786,7 +780,7 @@ fn eval_builtin(caller: &mut Caller<'_, OpaRuntimeState>, builtin_id: i32, args:
             }
             _ => Err("regex.find expects (string,string)".to_string()),
         },
-        "regex.find_n" => match (values.get(0), values.get(1), values.get(2)) {
+        "regex.find_n" => match (values.first(), values.get(1), values.get(2)) {
             (Some(Value::String(pattern)), Some(Value::String(text)), Some(Value::Number(n))) => {
                 if let Some(n) = n.as_i64() {
                     match regex::Regex::new(pattern) {
@@ -806,7 +800,7 @@ fn eval_builtin(caller: &mut Caller<'_, OpaRuntimeState>, builtin_id: i32, args:
             }
             _ => Err("regex.find_n expects (string,string,number)".to_string()),
         },
-        "regex.replace" => match (values.get(0), values.get(1), values.get(2)) {
+        "regex.replace" => match (values.first(), values.get(1), values.get(2)) {
             (
                 Some(Value::String(pattern)),
                 Some(Value::String(text)),
@@ -819,32 +813,45 @@ fn eval_builtin(caller: &mut Caller<'_, OpaRuntimeState>, builtin_id: i32, args:
             },
             _ => Err("regex.replace expects (string,string,string)".to_string()),
         },
-        "regex.find_all_string_submatch_n" => match (values.get(0), values.get(1), values.get(2)) {
-            (Some(Value::String(pattern)), Some(Value::String(text)), Some(Value::Number(n))) => {
-                if let Some(n) = n.as_i64() {
-                    match regex::Regex::new(pattern) {
-                        Ok(re) => {
-                            let mut out = Vec::new();
-                            for caps in re.captures_iter(text).take(n.max(0) as usize) {
-                                let mut row = Vec::new();
-                                for idx in 0..caps.len() {
-                                    row.push(Value::String(
-                                        caps.get(idx).map(|m| m.as_str()).unwrap_or("").to_string(),
-                                    ));
+        "regex.find_all_string_submatch_n" => {
+            match (values.first(), values.get(1), values.get(2)) {
+                (
+                    Some(Value::String(pattern)),
+                    Some(Value::String(text)),
+                    Some(Value::Number(n)),
+                ) => {
+                    if let Some(n) = n.as_i64() {
+                        match regex::Regex::new(pattern) {
+                            Ok(re) => {
+                                let mut out = Vec::new();
+                                for caps in re.captures_iter(text).take(n.max(0) as usize) {
+                                    let mut row = Vec::new();
+                                    for idx in 0..caps.len() {
+                                        row.push(Value::String(
+                                            caps.get(idx)
+                                                .map(|m| m.as_str())
+                                                .unwrap_or("")
+                                                .to_string(),
+                                        ));
+                                    }
+                                    out.push(Value::Array(row));
                                 }
-                                out.push(Value::Array(row));
+                                Ok(Value::Array(out))
                             }
-                            Ok(Value::Array(out))
+                            Err(err) => {
+                                Err(format!("regex.find_all_string_submatch_n error: {err}"))
+                            }
                         }
-                        Err(err) => Err(format!("regex.find_all_string_submatch_n error: {err}")),
+                    } else {
+                        Err("regex.find_all_string_submatch_n expects integer n".to_string())
                     }
-                } else {
-                    Err("regex.find_all_string_submatch_n expects integer n".to_string())
                 }
+                _ => Err(
+                    "regex.find_all_string_submatch_n expects (string,string,number)".to_string(),
+                ),
             }
-            _ => Err("regex.find_all_string_submatch_n expects (string,string,number)".to_string()),
-        },
-        "regex.split" => match (values.get(0), values.get(1)) {
+        }
+        "regex.split" => match (values.first(), values.get(1)) {
             (Some(Value::String(pattern)), Some(Value::String(text))) => {
                 match regex::Regex::new(pattern) {
                     Ok(re) => {
@@ -859,7 +866,7 @@ fn eval_builtin(caller: &mut Caller<'_, OpaRuntimeState>, builtin_id: i32, args:
             }
             _ => Err("regex.split expects (string,string)".to_string()),
         },
-        "glob.match" => match (values.get(0), values.get(1), values.get(2)) {
+        "glob.match" => match (values.first(), values.get(1), values.get(2)) {
             (Some(Value::String(pattern)), Some(delims), Some(Value::String(text))) => {
                 let delims = match delims {
                     Value::Array(items) => items
@@ -878,11 +885,11 @@ fn eval_builtin(caller: &mut Caller<'_, OpaRuntimeState>, builtin_id: i32, args:
             }
             _ => Err("glob.match expects (string, array|string, string)".to_string()),
         },
-        "glob.quote_meta" => match values.get(0) {
+        "glob.quote_meta" => match values.first() {
             Some(Value::String(text)) => Ok(Value::String(glob_quote_meta(text))),
             _ => Err("glob.quote_meta expects (string)".to_string()),
         },
-        "contains" => match (values.get(0), values.get(1)) {
+        "contains" => match (values.first(), values.get(1)) {
             (Some(Value::String(hay)), Some(Value::String(needle))) => {
                 Ok(Value::Bool(hay.contains(needle)))
             }
@@ -891,7 +898,7 @@ fn eval_builtin(caller: &mut Caller<'_, OpaRuntimeState>, builtin_id: i32, args:
             }
             _ => Err("contains expects (string,string) or (array,any)".to_string()),
         },
-        "split" | "strings.split" => match (values.get(0), values.get(1)) {
+        "split" | "strings.split" => match (values.first(), values.get(1)) {
             (Some(Value::String(text)), Some(Value::String(sep))) => {
                 let parts = text
                     .split(sep)
@@ -901,7 +908,7 @@ fn eval_builtin(caller: &mut Caller<'_, OpaRuntimeState>, builtin_id: i32, args:
             }
             _ => Err("split expects (string,string)".to_string()),
         },
-        "concat" => match (values.get(0), values.get(1)) {
+        "concat" => match (values.first(), values.get(1)) {
             (Some(Value::String(sep)), Some(Value::Array(items))) => {
                 let mut out = Vec::new();
                 let mut valid = true;
@@ -922,39 +929,39 @@ fn eval_builtin(caller: &mut Caller<'_, OpaRuntimeState>, builtin_id: i32, args:
             }
             _ => Err("concat expects (string,array)".to_string()),
         },
-        "startswith" => match (values.get(0), values.get(1)) {
+        "startswith" => match (values.first(), values.get(1)) {
             (Some(Value::String(text)), Some(Value::String(prefix))) => {
                 Ok(Value::Bool(text.starts_with(prefix)))
             }
             _ => Err("startswith expects (string,string)".to_string()),
         },
-        "endswith" => match (values.get(0), values.get(1)) {
+        "endswith" => match (values.first(), values.get(1)) {
             (Some(Value::String(text)), Some(Value::String(suffix))) => {
                 Ok(Value::Bool(text.ends_with(suffix)))
             }
             _ => Err("endswith expects (string,string)".to_string()),
         },
-        "lower" => match values.get(0) {
+        "lower" => match values.first() {
             Some(Value::String(text)) => Ok(Value::String(text.to_lowercase())),
             _ => Err("lower expects (string)".to_string()),
         },
-        "upper" => match values.get(0) {
+        "upper" => match values.first() {
             Some(Value::String(text)) => Ok(Value::String(text.to_uppercase())),
             _ => Err("upper expects (string)".to_string()),
         },
-        "trim" => match values.get(0) {
+        "trim" => match values.first() {
             Some(Value::String(text)) => Ok(Value::String(text.trim().to_string())),
             _ => Err("trim expects (string)".to_string()),
         },
-        "trim_left" => match values.get(0) {
+        "trim_left" => match values.first() {
             Some(Value::String(text)) => Ok(Value::String(text.trim_start().to_string())),
             _ => Err("trim_left expects (string)".to_string()),
         },
-        "trim_right" => match values.get(0) {
+        "trim_right" => match values.first() {
             Some(Value::String(text)) => Ok(Value::String(text.trim_end().to_string())),
             _ => Err("trim_right expects (string)".to_string()),
         },
-        "replace" => match (values.get(0), values.get(1), values.get(2)) {
+        "replace" => match (values.first(), values.get(1), values.get(2)) {
             (Some(Value::String(text)), Some(Value::String(old)), Some(Value::String(new))) => {
                 Ok(Value::String(text.replace(old, new)))
             }
@@ -964,7 +971,7 @@ fn eval_builtin(caller: &mut Caller<'_, OpaRuntimeState>, builtin_id: i32, args:
             if values.len() < 2 {
                 Err("substring expects (string,number[,number])".to_string())
             } else {
-                match (values.get(0), values.get(1), values.get(2)) {
+                match (values.first(), values.get(1), values.get(2)) {
                     (
                         Some(Value::String(text)),
                         Some(Value::Number(start)),
@@ -991,21 +998,21 @@ fn eval_builtin(caller: &mut Caller<'_, OpaRuntimeState>, builtin_id: i32, args:
                 }
             }
         }
-        "indexof" => match (values.get(0), values.get(1)) {
+        "indexof" => match (values.first(), values.get(1)) {
             (Some(Value::String(text)), Some(Value::String(needle))) => Ok(Value::Number(
                 (text.find(needle).map(|idx| idx as i64).unwrap_or(-1)).into(),
             )),
             _ => Err("indexof expects (string,string)".to_string()),
         },
-        "array.length" => match values.get(0) {
+        "array.length" => match values.first() {
             Some(Value::Array(items)) => Ok(Value::Number((items.len() as i64).into())),
             _ => Err("array.length expects (array)".to_string()),
         },
-        "sprintf" => match (values.get(0), values.get(1)) {
+        "sprintf" => match (values.first(), values.get(1)) {
             (Some(Value::String(fmt)), Some(Value::Array(args))) => sprintf_simple(fmt, args),
             _ => Err("sprintf expects (string,array)".to_string()),
         },
-        "count" => match values.get(0) {
+        "count" => match values.first() {
             Some(Value::Array(items)) => Ok(Value::Number((items.len() as i64).into())),
             Some(Value::Object(map)) => Ok(Value::Number((map.len() as i64).into())),
             Some(Value::String(text)) => Ok(Value::Number((text.chars().count() as i64).into())),
@@ -1015,7 +1022,7 @@ fn eval_builtin(caller: &mut Caller<'_, OpaRuntimeState>, builtin_id: i32, args:
         "product" => product_numbers(&values, "product"),
         "max" => max_numbers(&values, "max"),
         "min" => min_numbers(&values, "min"),
-        "array.concat" => match (values.get(0), values.get(1)) {
+        "array.concat" => match (values.first(), values.get(1)) {
             (Some(Value::Array(a)), Some(Value::Array(b))) => {
                 let mut out = a.clone();
                 out.extend(b.iter().cloned());
@@ -1023,7 +1030,7 @@ fn eval_builtin(caller: &mut Caller<'_, OpaRuntimeState>, builtin_id: i32, args:
             }
             _ => Err("array.concat expects (array,array)".to_string()),
         },
-        "array.slice" => match (values.get(0), values.get(1), values.get(2)) {
+        "array.slice" => match (values.first(), values.get(1), values.get(2)) {
             (Some(Value::Array(items)), Some(Value::Number(start)), Some(Value::Number(end))) => {
                 match (start.as_i64(), end.as_i64()) {
                     (Some(start), Some(end)) => {
@@ -1043,7 +1050,7 @@ fn eval_builtin(caller: &mut Caller<'_, OpaRuntimeState>, builtin_id: i32, args:
             }
             _ => Err("array.slice expects (array,number,number)".to_string()),
         },
-        "array.reverse" => match values.get(0) {
+        "array.reverse" => match values.first() {
             Some(Value::Array(items)) => {
                 let mut out = items.clone();
                 out.reverse();
@@ -1051,7 +1058,7 @@ fn eval_builtin(caller: &mut Caller<'_, OpaRuntimeState>, builtin_id: i32, args:
             }
             _ => Err("array.reverse expects (array)".to_string()),
         },
-        "array.append" => match (values.get(0), values.get(1)) {
+        "array.append" => match (values.first(), values.get(1)) {
             (Some(Value::Array(items)), Some(value)) => {
                 let mut out = items.clone();
                 out.push(value.clone());
@@ -1059,13 +1066,13 @@ fn eval_builtin(caller: &mut Caller<'_, OpaRuntimeState>, builtin_id: i32, args:
             }
             _ => Err("array.append expects (array,any)".to_string()),
         },
-        "array.contains" => match (values.get(0), values.get(1)) {
+        "array.contains" => match (values.first(), values.get(1)) {
             (Some(Value::Array(items)), Some(value)) => {
                 Ok(Value::Bool(items.iter().any(|item| item == value)))
             }
             _ => Err("array.contains expects (array,any)".to_string()),
         },
-        "object.get" => match (values.get(0), values.get(1), values.get(2)) {
+        "object.get" => match (values.first(), values.get(1), values.get(2)) {
             (Some(Value::Object(map)), Some(Value::String(key)), Some(default)) => {
                 Ok(map.get(key).cloned().unwrap_or_else(|| default.clone()))
             }
@@ -1074,17 +1081,17 @@ fn eval_builtin(caller: &mut Caller<'_, OpaRuntimeState>, builtin_id: i32, args:
             }
             _ => Err("object.get expects (object,string,any?)".to_string()),
         },
-        "object.keys" => match values.get(0) {
+        "object.keys" => match values.first() {
             Some(Value::Object(map)) => Ok(Value::Array(
                 map.keys().cloned().map(Value::String).collect(),
             )),
             _ => Err("object.keys expects (object)".to_string()),
         },
-        "object.values" => match values.get(0) {
+        "object.values" => match values.first() {
             Some(Value::Object(map)) => Ok(Value::Array(map.values().cloned().collect())),
             _ => Err("object.values expects (object)".to_string()),
         },
-        "object.remove" => match (values.get(0), values.get(1)) {
+        "object.remove" => match (values.first(), values.get(1)) {
             (Some(Value::Object(map)), Some(Value::String(key))) => {
                 let mut out = map.clone();
                 out.remove(key);
@@ -1101,7 +1108,7 @@ fn eval_builtin(caller: &mut Caller<'_, OpaRuntimeState>, builtin_id: i32, args:
             }
             _ => Err("object.remove expects (object,string|array)".to_string()),
         },
-        "object.union" => match (values.get(0), values.get(1)) {
+        "object.union" => match (values.first(), values.get(1)) {
             (Some(Value::Object(a)), Some(Value::Object(b))) => {
                 let mut out = a.clone();
                 for (k, v) in b {
@@ -1111,39 +1118,39 @@ fn eval_builtin(caller: &mut Caller<'_, OpaRuntimeState>, builtin_id: i32, args:
             }
             _ => Err("object.union expects (object,object)".to_string()),
         },
-        "object.subset" => match (values.get(0), values.get(1)) {
+        "object.subset" => match (values.first(), values.get(1)) {
             (Some(Value::Object(a)), Some(Value::Object(b))) => {
                 Ok(Value::Bool(a.iter().all(|(k, v)| b.get(k) == Some(v))))
             }
             _ => Err("object.subset expects (object,object)".to_string()),
         },
-        "json.marshal" => match values.get(0) {
+        "json.marshal" => match values.first() {
             Some(value) => match serde_json::to_string(value) {
                 Ok(text) => Ok(Value::String(text)),
                 Err(err) => Err(format!("json.marshal error: {err}")),
             },
             _ => Err("json.marshal expects (any)".to_string()),
         },
-        "json.unmarshal" => match values.get(0) {
+        "json.unmarshal" => match values.first() {
             Some(Value::String(text)) => match serde_json::from_str(text) {
                 Ok(value) => Ok(value),
                 Err(err) => Err(format!("json.unmarshal error: {err}")),
             },
             _ => Err("json.unmarshal expects (string)".to_string()),
         },
-        "json.is_valid" => match values.get(0) {
+        "json.is_valid" => match values.first() {
             Some(Value::String(text)) => {
                 Ok(Value::Bool(serde_json::from_str::<Value>(text).is_ok()))
             }
             _ => Err("json.is_valid expects (string)".to_string()),
         },
-        "is_null" => Ok(Value::Bool(values.get(0).map_or(false, |v| v.is_null()))),
-        "is_boolean" => Ok(Value::Bool(values.get(0).map_or(false, |v| v.is_boolean()))),
-        "is_number" => Ok(Value::Bool(values.get(0).map_or(false, |v| v.is_number()))),
-        "is_string" => Ok(Value::Bool(values.get(0).map_or(false, |v| v.is_string()))),
-        "is_array" => Ok(Value::Bool(values.get(0).map_or(false, |v| v.is_array()))),
-        "is_object" => Ok(Value::Bool(values.get(0).map_or(false, |v| v.is_object()))),
-        "type_name" => match values.get(0) {
+        "is_null" => Ok(Value::Bool(values.first().is_some_and(|v| v.is_null()))),
+        "is_boolean" => Ok(Value::Bool(values.first().is_some_and(|v| v.is_boolean()))),
+        "is_number" => Ok(Value::Bool(values.first().is_some_and(|v| v.is_number()))),
+        "is_string" => Ok(Value::Bool(values.first().is_some_and(|v| v.is_string()))),
+        "is_array" => Ok(Value::Bool(values.first().is_some_and(|v| v.is_array()))),
+        "is_object" => Ok(Value::Bool(values.first().is_some_and(|v| v.is_object()))),
+        "type_name" => match values.first() {
             Some(Value::Null) => Ok(Value::String("null".to_string())),
             Some(Value::Bool(_)) => Ok(Value::String("boolean".to_string())),
             Some(Value::Number(_)) => Ok(Value::String("number".to_string())),
@@ -1283,7 +1290,7 @@ fn sprintf_simple(fmt: &str, args: &[Value]) -> Result<Value, String> {
 }
 
 fn sum_numbers(values: &[Value], name: &str) -> Result<Value, String> {
-    let list = match values.get(0) {
+    let list = match values.first() {
         Some(Value::Array(items)) => items,
         _ => return Err(format!("{name} expects (array)")),
     };
@@ -1299,7 +1306,7 @@ fn sum_numbers(values: &[Value], name: &str) -> Result<Value, String> {
 }
 
 fn product_numbers(values: &[Value], name: &str) -> Result<Value, String> {
-    let list = match values.get(0) {
+    let list = match values.first() {
         Some(Value::Array(items)) => items,
         _ => return Err(format!("{name} expects (array)")),
     };
@@ -1315,7 +1322,7 @@ fn product_numbers(values: &[Value], name: &str) -> Result<Value, String> {
 }
 
 fn max_numbers(values: &[Value], name: &str) -> Result<Value, String> {
-    let list = match values.get(0) {
+    let list = match values.first() {
         Some(Value::Array(items)) => items,
         _ => return Err(format!("{name} expects (array)")),
     };
@@ -1333,7 +1340,7 @@ fn max_numbers(values: &[Value], name: &str) -> Result<Value, String> {
 }
 
 fn min_numbers(values: &[Value], name: &str) -> Result<Value, String> {
-    let list = match values.get(0) {
+    let list = match values.first() {
         Some(Value::Array(items)) => items,
         _ => return Err(format!("{name} expects (array)")),
     };

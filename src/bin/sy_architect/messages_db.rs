@@ -41,7 +41,7 @@ impl fmt::Display for MessagesDbError {
 
 impl std::error::Error for MessagesDbError {}
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum TimeWindow {
     #[serde(alias = "15m")]
@@ -50,6 +50,7 @@ pub enum TimeWindow {
     OneHour,
     #[serde(alias = "24h")]
     TwentyFourHours,
+    #[default]
     All,
 }
 
@@ -77,12 +78,6 @@ impl TimeWindow {
 #[derive(Debug, Clone, Default)]
 pub struct MessagesFilters {
     pub since: TimeWindow,
-}
-
-impl Default for TimeWindow {
-    fn default() -> Self {
-        TimeWindow::All
-    }
 }
 
 /// A position in the log: `ts` orders the list (when the router copied the message), `stored_at`

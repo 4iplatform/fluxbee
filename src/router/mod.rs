@@ -115,15 +115,8 @@ impl Router {
         )
         .expect("shm init");
         let config_reader =
-            match ConfigRegionReader::open_read_only(&format!("/jsr-config-{}", cfg.hive_id)) {
-                Ok(reader) => Some(reader),
-                Err(_) => None,
-            };
-        let lsa_reader = match LsaRegionReader::open_read_only(&format!("/jsr-lsa-{}", cfg.hive_id))
-        {
-            Ok(reader) => Some(reader),
-            Err(_) => None,
-        };
+            ConfigRegionReader::open_read_only(&format!("/jsr-config-{}", cfg.hive_id)).ok();
+        let lsa_reader = LsaRegionReader::open_read_only(&format!("/jsr-lsa-{}", cfg.hive_id)).ok();
         let lsa_writer = if cfg.is_gateway {
             LsaRegionWriter::open_or_create(
                 &format!("/jsr-lsa-{}", cfg.hive_id),
@@ -743,7 +736,7 @@ async fn handle_node(
                 nodes.remove(&node_uuid);
             }
             writer_task.abort();
-            return Err(io::Error::new(io::ErrorKind::Other, err).into());
+            return Err(io::Error::other(err).into());
         }
     }
     tracing::info!(node = %node_uuid, "node registered in shm");
@@ -813,7 +806,6 @@ async fn handle_node(
             }
         };
         {
-            let frame = frame;
             if let Ok(msg) = serde_json::from_slice::<Message>(&frame) {
                 if !frame_is_from_connection(&msg, node_uuid) {
                     tracing::warn!(
@@ -918,7 +910,7 @@ async fn handle_node(
                     &broadcast_cache,
                     &memory_reader,
                     &log_stream,
-                    &hive_id,
+                    hive_id,
                     identity_frontdesk_node_name,
                     router_uuid,
                     is_gateway,
@@ -3819,7 +3811,6 @@ async fn peer_discovery_loop(
                     let lsa_snapshot = Arc::clone(&lsa_snapshot);
                     let reachability = Arc::clone(&reachability);
                     let log_stream = log_stream.clone();
-                    let is_gateway = is_gateway;
                     let socket_dir = socket_dir.clone();
                     let identity_frontdesk_node_name = identity_frontdesk_node_name.to_string();
                     tokio::spawn(async move {
@@ -3998,37 +3989,32 @@ async fn connect_to_peer(
     );
     let _ = tx.send(serde_json::to_vec(&hello)?);
 
-    loop {
-        match read_frame(&mut reader).await? {
-            Some(frame) => {
-                if let Ok(msg) = serde_json::from_slice::<Message>(&frame) {
-                    handle_peer_message(
-                        &msg,
-                        &peer_uuid,
-                        &peers,
-                        &peer_nodes,
-                        &peer_routers,
-                        &nodes,
-                        &wan_peers,
-                        &lsa_reader,
-                        &static_routes,
-                        &shm,
-                        &opa,
-                        &opa_reader,
-                        &memory_reader,
-                        hive_id,
-                        identity_frontdesk_node_name,
-                        &fib,
-                        self_uuid,
-                        is_gateway,
-                        &lsa_snapshot,
-                        &reachability,
-                        &log_stream,
-                    )
-                    .await?;
-                }
-            }
-            None => break,
+    while let Some(frame) = read_frame(&mut reader).await? {
+        if let Ok(msg) = serde_json::from_slice::<Message>(&frame) {
+            handle_peer_message(
+                &msg,
+                &peer_uuid,
+                &peers,
+                &peer_nodes,
+                &peer_routers,
+                &nodes,
+                &wan_peers,
+                &lsa_reader,
+                &static_routes,
+                &shm,
+                &opa,
+                &opa_reader,
+                &memory_reader,
+                hive_id,
+                identity_frontdesk_node_name,
+                &fib,
+                self_uuid,
+                is_gateway,
+                &lsa_snapshot,
+                &reachability,
+                &log_stream,
+            )
+            .await?;
         }
     }
     {
@@ -4085,37 +4071,32 @@ async fn handle_peer_incoming(
     let link_peer = Arc::new(std::sync::OnceLock::from(peer_uuid.to_string()));
     let writer_task = tokio::spawn(write_link_frames(writer, rx, "irp", link_peer));
 
-    loop {
-        match read_frame(&mut reader).await? {
-            Some(frame) => {
-                if let Ok(msg) = serde_json::from_slice::<Message>(&frame) {
-                    handle_peer_message(
-                        &msg,
-                        &peer_uuid,
-                        &peers,
-                        &peer_nodes,
-                        &peer_routers,
-                        &nodes,
-                        &wan_peers,
-                        &lsa_reader,
-                        &static_routes,
-                        &shm,
-                        &opa,
-                        &opa_reader,
-                        &memory_reader,
-                        &hive_id,
-                        &identity_frontdesk_node_name,
-                        &fib,
-                        router_uuid,
-                        is_gateway,
-                        &lsa_snapshot,
-                        &reachability,
-                        &log_stream,
-                    )
-                    .await?;
-                }
-            }
-            None => break,
+    while let Some(frame) = read_frame(&mut reader).await? {
+        if let Ok(msg) = serde_json::from_slice::<Message>(&frame) {
+            handle_peer_message(
+                &msg,
+                &peer_uuid,
+                &peers,
+                &peer_nodes,
+                &peer_routers,
+                &nodes,
+                &wan_peers,
+                &lsa_reader,
+                &static_routes,
+                &shm,
+                &opa,
+                &opa_reader,
+                &memory_reader,
+                &hive_id,
+                &identity_frontdesk_node_name,
+                &fib,
+                router_uuid,
+                is_gateway,
+                &lsa_snapshot,
+                &reachability,
+                &log_stream,
+            )
+            .await?;
         }
     }
     {
@@ -5109,10 +5090,7 @@ async fn refresh_config(
             HEARTBEAT_STALE_MS,
             force && attempt == 0,
         )
-        .await;
-        let Some(snapshot) = snapshot else {
-            return None;
-        };
+        .await?;
 
         let mut version_guard = config_version.lock().await;
         if force && attempt == 0 && snapshot.header.config_version == *version_guard {
@@ -5284,7 +5262,7 @@ fn parse_sha256_hash(value: &str) -> Option<[u8; 32]> {
     }
     let mut out = [0u8; 32];
     for (idx, chunk) in value.as_bytes().chunks(2).enumerate() {
-        let hi = (*chunk.get(0)? as char).to_digit(16)? as u8;
+        let hi = (*chunk.first()? as char).to_digit(16)? as u8;
         let lo = (*chunk.get(1)? as char).to_digit(16)? as u8;
         out[idx] = (hi << 4) | lo;
     }
@@ -9476,7 +9454,7 @@ mod tests {
             async move {
                 let uuid = Uuid::new_v4();
                 let (mut client, server) = UnixStream::pair().expect("socket pair");
-                let _ = spawn_node_connection_with_stream(server, shm, nodes, log_stream);
+                let _connection = spawn_node_connection_with_stream(server, shm, nodes, log_stream);
                 let hello = test_frame(
                     uuid,
                     SYSTEM_KIND,

@@ -291,7 +291,7 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
 
-    /// Un provisionador que recuerda con que tenant lo llamaron.
+    /// A provisioner that remembers which tenant it was called with.
     struct CapturaTenant(std::sync::Mutex<Option<Option<String>>>);
     #[async_trait::async_trait]
     impl IdentityProvisioner for CapturaTenant {
@@ -690,12 +690,12 @@ mod tests {
         assert_eq!(calls.load(Ordering::SeqCst), 0);
     }
 
-    /// El usuario externo pertenece al tenant que lanzo el nodo.
+    /// The external user belongs to the tenant that launched the node.
     ///
-    /// Un mensaje de un canal externo no trae tenant propio: un user id de Slack o un telefono
-    /// dicen quien escribio, no quien paga. Antes io.slack e io.wapp mandaban `tenant_id: None`
-    /// con un `tenant_hint` que nadie leia, asi que la semilla del ICH llegaba con tenant vacio,
-    /// identity la rechazaba, y TODO usuario externo entraba con src_ilk nulo.
+    /// A message from an external channel brings no tenant of its own: a Slack user id or a phone
+    /// number say who wrote, not who pays. io.slack and io.wapp used to send `tenant_id: None`
+    /// with a `tenant_hint` nobody read, so the ICH seed arrived with an empty tenant, identity
+    /// rejected it, and EVERY external user came in with a null src_ilk.
     #[tokio::test]
     async fn el_usuario_externo_hereda_el_tenant_del_nodo() {
         let captura = CapturaTenant(std::sync::Mutex::new(None));
@@ -730,11 +730,11 @@ mod tests {
         assert_eq!(
             visto,
             Some(Some("tnt:1111".to_string())),
-            "el provisioning tiene que recibir el tenant del nodo, no vacio"
+            "provisioning has to receive the node's tenant, not an empty one"
         );
     }
 
-    /// Un tenant explicito en el input GANA: io.api autentica un principal y sabe mejor.
+    /// An explicit tenant in the input WINS: io.api authenticates a principal and knows better.
     #[tokio::test]
     async fn un_tenant_explicito_le_gana_al_del_nodo() {
         let captura = CapturaTenant(std::sync::Mutex::new(None));

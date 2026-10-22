@@ -1,62 +1,63 @@
 //! First-contact gate: hand an unregistered sender to AI.frontdesk before relaying.
 //!
-//! # Por que existe
+//! # Why it exists
 //!
-//! Cuando alguien escribe por primera vez desde un canal externo, el nodo IO le crea un ILK con
-//! `registration_status = "temporary"` e `identification: {}` — un handle vacio para "alguien que
-//! escribio y todavia no sabemos quien es". La spec (`docs/history/10-identity-v2.md`) dice que ese ILK lo
-//! asciende **AI.frontdesk**, el unico autorizado junto a SY.orchestrator a emitir `ILK_REGISTER`.
+//! When someone writes for the first time from an external channel, the IO node creates an ILK for
+//! them with `registration_status = "temporary"` and `identification: {}`: an empty handle for
+//! "someone who wrote and we don't know yet who they are". The spec
+//! (`docs/history/10-identity-v2.md`) says that ILK is promoted by **AI.frontdesk**, the only one
+//! besides SY.orchestrator allowed to emit `ILK_REGISTER`.
 //!
-//! Pero nada llevaba al desconocido hasta alla, asi que el ILK quedaba `temporary` para siempre.
+//! But nothing took the stranger there, so the ILK stayed `temporary` forever.
 //!
-//! # Que hace, y que NO hace
+//! # What it does, and what it does NOT do
 //!
-//! Replica el patron de io.api (`requires_frontdesk_intermediate` en `io-api/src/main.rs`):
-//! **gate-then-forward**. Se le manda al frontdesk un payload ESTRUCTURADO —el camino determinista,
-//! el mismo que ya corre en produccion— y si eso sale bien, el mensaje original **sigue viaje a su
-//! destino real**. El mensaje del usuario no se pierde ni se lo obliga a reescribirlo.
+//! It follows io.api's pattern (`requires_frontdesk_intermediate` in `io-api/src/main.rs`):
+//! **gate-then-forward**. The frontdesk gets a STRUCTURED payload (the deterministic path, the same
+//! one already running in production), and if that goes well the original message **travels on to
+//! its real destination**. The user's message is not lost, and the user is not asked to rewrite it.
 //!
-//! Deliberadamente usa el camino ESTRUCTURADO (determinista) del frontdesk, no el conversacional
-//! por LLM. El conversacional NO esta muerto —es alcanzable cuando el router (force rule
-//! temporary/None->frontdesk, 0.1.20) desvia a un humano de primer contacto con su mensaje plano—;
-//! para ESTE gate el estructurado es el correcto porque los datos ya vienen estructurados. El bug
-//! historico del conversacional (respondia `REGISTERED`/`complete` sin haber llamado a
-//! `ILK_REGISTER`) fue arreglado 2026-08 (el exito persiste `status=completed`; `None` significa
-//! ahora "no hubo registro este turno" -> `needs_input`).
+//! It uses the frontdesk's STRUCTURED (deterministic) path on purpose, not the conversational LLM
+//! one. The conversational path is NOT dead (it is reachable when the router's force rule,
+//! temporary/None->frontdesk since 0.1.20, diverts a first-contact human with their plain
+//! message); for THIS gate the structured path is the right one because the data already comes
+//! structured. The conversational path's historic bug (it answered `REGISTERED`/`complete` without
+//! having called `ILK_REGISTER`) was fixed in 2026-08 (success persists `status=completed`; `None`
+//! now means "no registration this turn" -> `needs_input`).
 //!
-//! # Apagado por defecto
+//! # Off by default
 //!
-//! `FrontdeskGateConfig::default()` viene con `enabled: false`, y el nodo se comporta exactamente
-//! como antes. La maquinaria queda instalada y se enciende por CONFIG_SET cuando el lado del
-//! frontdesk este resuelto.
+//! `FrontdeskGateConfig::default()` comes with `enabled: false`, and the node behaves exactly as
+//! before. The machinery stays installed and is switched on by CONFIG_SET once the frontdesk side
+//! is settled.
 //!
-//! # Lo que este modulo NO resuelve, a proposito
+//! # What this module does NOT solve, on purpose
 //!
-//! El router YA tiene el desvio equivalente (`apply_identity_pre_resolve`: si el emisor es
-//! `temporary`, fuerza destino al frontdesk) y corta antes de OPA — no necesita politica Rego. Pero
-//! es inalcanzable para io.slack/io.wapp porque, al tener `dst_node` configurado, emiten
-//! `Destination::Unicast` y nunca pasan por el pre-resolve. Migrar a `Destination::Resolve` seria
-//! el diseño previsto, pero hoy NO hay ninguna politica OPA de usuario cargada: cualquier mensaje
-//! que el pre-resolve no atrape caeria en `OpaError::NotLoaded` y moriria. Por eso la compuerta va
-//! en el nodo, que es determinista y no depende de OPA.
+//! The router ALREADY has the equivalent detour (`apply_identity_pre_resolve`: if the sender is
+//! `temporary`, it forces the destination to the frontdesk) and it cuts in before OPA, with no Rego
+//! policy needed. But io.slack/io.wapp cannot reach it: with `dst_node` configured they emit
+//! `Destination::Unicast` and never go through the pre-resolve. Moving to `Destination::Resolve`
+//! would be the intended design, but today NO user OPA policy is loaded: any message the
+//! pre-resolve does not catch would fall into `OpaError::NotLoaded` and die. That is why the gate
+//! lives in the node, which is deterministic and does not depend on OPA.
 
 use fluxbee_sdk::protocol::{Destination, Message, Meta, Routing};
 use serde_json::{json, Value};
 
 use crate::frontdesk_contract::{FrontdeskHandoffPayload, FrontdeskHandoffSubject};
 
-/// Nombre por defecto del registrador. Es el mismo que usa io.api y el que el router lee de
+/// The registrar's default name. It is the same one io.api uses and the one the router reads from
 /// `government.identity_frontdesk`.
 pub const DEFAULT_FRONTDESK_TARGET: &str = "SY.frontdesk.gov@motherbee";
 
-/// El tipo y la operacion del payload estructurado, tal como los espera el frontdesk.
+/// The type and the operation of the structured payload, as the frontdesk expects them.
 pub const FRONTDESK_HANDOFF_TYPE: &str = "frontdesk_handoff";
 pub const FRONTDESK_OPERATION_REGISTER: &str = "complete_registration";
 
-/// El contrato de respuesta que un productor (io.api / io.cloud) pone en el `response_envelope`
-/// del mensaje para que el frontdesk emita su veredicto ESTRUCTURADO (`{success, human_message,
-/// error_code?}`) en vez de texto plano (`build_frontdesk_result_reply`). Fuente unica compartida
-/// por los productores — antes vivia privada en io.api.
+/// The reply contract a producer (io.api / io.cloud) puts in the message's `response_envelope` so
+/// the frontdesk emits its STRUCTURED verdict (`{success, human_message, error_code?}`) instead of
+/// plain text (`build_frontdesk_result_reply`). One source shared by the producers; it used to live
+/// privately in io.api.
 pub fn frontdesk_response_contract() -> serde_json::Value {
     serde_json::json!({
         "kind": "json_object_v1",
@@ -73,7 +74,7 @@ pub fn frontdesk_response_contract() -> serde_json::Value {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FrontdeskGateConfig {
-    /// APAGADA por defecto. Encenderla cambia el comportamiento de un hive vivo.
+    /// OFF by default. Switching it on changes the behavior of a live hive.
     pub enabled: bool,
     pub target: String,
 }
@@ -88,10 +89,10 @@ impl Default for FrontdeskGateConfig {
 }
 
 impl FrontdeskGateConfig {
-    /// Lee `io.frontdesk.{enabled,target}` de la config efectiva del nodo.
+    /// Reads `io.frontdesk.{enabled,target}` from the node's effective config.
     ///
-    /// Ausencia total => apagada. Un `target` vacio o en blanco NO enciende nada: cae al default,
-    /// porque una compuerta encendida apuntando a "" mandaria el primer contacto a la nada.
+    /// Nothing at all => off. An empty or blank `target` switches nothing on: it falls back to the
+    /// default, because a gate switched on and pointed at "" would send the first contact nowhere.
     pub fn from_effective_config(effective: Option<&Value>) -> Self {
         let node = effective
             .and_then(|c| c.get("io"))
@@ -111,11 +112,11 @@ impl FrontdeskGateConfig {
     }
 }
 
-/// True cuando el emisor todavia no esta registrado y hay que pasarlo por el frontdesk.
+/// True when the sender is not registered yet and has to go through the frontdesk.
 ///
-/// `None` (no pudimos leer el status) NO abre la compuerta: sin saber, se entrega como siempre. La
-/// alternativa —frenar todo lo que no podemos clasificar— convierte una lectura fallida de SHM en
-/// una caida del canal.
+/// `None` (we could not read the status) does NOT open the gate: not knowing, the message is
+/// delivered as always. The alternative (holding everything we cannot classify) turns a failed SHM
+/// read into a channel outage.
 pub fn gate_required(registration_status: Option<&str>) -> bool {
     registration_status
         .map(str::trim)
@@ -123,10 +124,10 @@ pub fn gate_required(registration_status: Option<&str>) -> bool {
         .is_some_and(|status| !status.eq_ignore_ascii_case("complete"))
 }
 
-/// Lee el `registration_status` del emisor desde el SHM de identidad.
+/// Reads the sender's `registration_status` from the identity SHM.
 ///
-/// Misma via que usa io.api (`resolve_identity_option_from_hive_id`). Devuelve `None` si no se
-/// puede resolver — y por `gate_required`, eso significa "entregar normal".
+/// The same route io.api uses (`resolve_identity_option_from_hive_id`). Returns `None` when it
+/// cannot be resolved, and by `gate_required` that means "deliver as usual".
 pub fn sender_registration_status(
     hive_id: &str,
     channel_type: &str,
@@ -148,18 +149,18 @@ pub fn sender_registration_status(
             tracing::debug!(
                 channel_type = %channel_type,
                 error = %err,
-                "no se pudo leer el registration_status del emisor; se entrega sin pasar por el frontdesk"
+                "could not read the sender's registration_status; delivering without the frontdesk"
             );
             None
         }
     }
 }
 
-/// Arma el mensaje de handoff estructurado para el frontdesk.
+/// Builds the structured handoff message for the frontdesk.
 ///
-/// Los campos de `FrontdeskHandoffSubject` son todos opcionales, asi que un canal que solo conoce
-/// un user id externo puede igual presentar al sujeto: va en `attributes`, y el frontdesk sabe que
-/// tiene que averiguar el resto.
+/// Every field of `FrontdeskHandoffSubject` is optional, so a channel that only knows an external
+/// user id can still introduce the subject: it goes in `attributes`, and the frontdesk knows it has
+/// to find out the rest.
 pub fn build_handoff_message(
     node_uuid: &str,
     cfg: &FrontdeskGateConfig,
@@ -208,16 +209,16 @@ pub fn build_handoff_message(
     }
 }
 
-/// Pasa al emisor por el frontdesk si corresponde, y despues deja seguir el mensaje original.
+/// Takes the sender through the frontdesk when needed, then lets the original message go on.
 ///
-/// Devuelve siempre `()`: es una COMPUERTA QUE NO FRENA. Si el handoff falla —frontdesk caido, sin
-/// ruta— se loguea a `error` y el mensaje del usuario **se entrega igual**.
+/// It always returns `()`: it is a GATE THAT DOES NOT HOLD. If the handoff fails (frontdesk down,
+/// no route), it is logged at `error` and the user's message **is delivered anyway**.
 ///
-/// Esa eleccion es deliberada y es la unica de este modulo que no es puramente tecnica: tirar el
-/// mensaje de un cliente porque un nodo interno no contesto es peor que entregarlo sin registrar.
-/// El precio es que el alta puede perderse en silencio salvo por ese log. Si se prefiere lo
-/// contrario (fail-closed: no entregar a desconocidos), es un cambio de una linea aca — pero es
-/// decision del operador, no del codigo.
+/// That choice is deliberate and it is the only one in this module that is not purely technical:
+/// dropping a customer's message because an internal node did not answer is worse than delivering
+/// it unregistered. The price is that the registration can be lost silently, except for that log.
+/// If the opposite is preferred (fail-closed: no delivery to strangers), it is a one-line change
+/// here, but it is the operator's decision, not the code's.
 pub async fn gate_then_forward(
     sender: &fluxbee_sdk::NodeSender,
     cfg: &FrontdeskGateConfig,
@@ -232,8 +233,8 @@ pub async fn gate_then_forward(
         return;
     }
     let Some(src_ilk) = src_ilk.map(str::trim).filter(|v| !v.is_empty()) else {
-        // Sin ILK no hay sujeto que presentar. No es un error: es un emisor que ni siquiera pudo
-        // provisionarse, y eso ya se loguea en el camino de identidad.
+        // Without an ILK there is no subject to introduce. It is not an error: it is a sender that
+        // could not even be provisioned, and the identity path already logs that.
         return;
     };
     let status =
@@ -256,7 +257,7 @@ pub async fn gate_then_forward(
         src_ilk = %src_ilk,
         registration_status = %status.as_deref().unwrap_or("?"),
         %trace_id,
-        "primer contacto: presentando el emisor al frontdesk antes de entregar"
+        "first contact: introducing the sender to the frontdesk before delivering"
     );
     if let Err(err) = sender.send(msg).await {
         tracing::error!(
@@ -264,8 +265,8 @@ pub async fn gate_then_forward(
             target_node = %cfg.target,
             src_ilk = %src_ilk,
             %trace_id,
-            "no se pudo presentar el emisor al frontdesk; el mensaje se entrega igual y el alta \
-             queda pendiente"
+            "could not introduce the sender to the frontdesk; the message is delivered anyway and \
+             the registration stays pending"
         );
     }
 }
@@ -279,14 +280,14 @@ mod tests {
         let cfg = FrontdeskGateConfig::default();
         assert!(
             !cfg.enabled,
-            "encenderla cambia un hive vivo: default = apagada"
+            "switching it on changes a live hive: default = off"
         );
         assert_eq!(cfg.target, DEFAULT_FRONTDESK_TARGET);
 
-        // Config sin la seccion => apagada.
+        // A config without the section => off.
         let vacia = FrontdeskGateConfig::from_effective_config(Some(&json!({"io":{}})));
         assert!(!vacia.enabled);
-        // Y sin config alguna, tambien.
+        // And with no config at all, too.
         assert!(!FrontdeskGateConfig::from_effective_config(None).enabled);
     }
 
@@ -307,7 +308,7 @@ mod tests {
         assert!(cfg.enabled);
         assert_eq!(
             cfg.target, DEFAULT_FRONTDESK_TARGET,
-            "un target en blanco cae al default, no a una cadena vacia"
+            "a blank target falls back to the default, not to an empty string"
         );
     }
 
@@ -318,10 +319,10 @@ mod tests {
         assert!(!gate_required(Some("complete")));
         assert!(
             !gate_required(Some("COMPLETE")),
-            "el status es case-insensitive"
+            "the status is case-insensitive"
         );
 
-        // No saber NO frena el canal.
+        // Not knowing does NOT hold the channel.
         assert!(!gate_required(None));
         assert!(!gate_required(Some("")));
         assert!(!gate_required(Some("   ")));
@@ -342,19 +343,19 @@ mod tests {
 
         match &msg.routing.dst {
             Destination::Unicast(dst) => assert_eq!(dst, &cfg.target),
-            other => panic!("el handoff va unicast al frontdesk, no {other:?}"),
+            other => panic!("the handoff goes unicast to the frontdesk, not {other:?}"),
         }
         assert_eq!(msg.meta.src_ilk.as_deref(), Some("ilk:abc"));
         assert_eq!(
             msg.meta.msg.as_deref(),
             Some(crate::frontdesk_contract::FRONTDESK_HANDOFF_MSG)
         );
-        // El frontdesk solo toma handoffs de mensajes `user` (como el de io.cloud).
+        // The frontdesk only takes handoffs from `user` messages (like io.cloud's).
         assert_eq!(msg.meta.msg_type, "user");
 
-        // Es el camino ESTRUCTURADO, no el conversacional: tiene que parsear como handoff.
+        // It is the STRUCTURED path, not the conversational one: it has to parse as a handoff.
         let parsed = crate::frontdesk_contract::parse_frontdesk_handoff_payload(&msg.payload)
-            .expect("el frontdesk tiene que poder parsearlo como handoff estructurado");
+            .expect("the frontdesk has to be able to parse it as a structured handoff");
         assert_eq!(parsed.operation, FRONTDESK_OPERATION_REGISTER);
         assert_eq!(parsed.tenant_id.as_deref(), Some("tnt:1111"));
         let attrs = parsed.subject.attributes.expect("attributes");

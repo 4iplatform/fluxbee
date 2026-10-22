@@ -435,7 +435,6 @@ fn compute_well_known_system_ilks(
     set
 }
 
-#[allow(clippy::too_many_arguments)]
 async fn handle_vault_message(
     sender: &NodeSender,
     store: &mut VaultStore,
@@ -528,7 +527,7 @@ async fn handle_vault_message(
     if let Some(payload) = outcome.broadcast {
         let edges = edge_nodes(hive_id, &hive_registry_root());
         match secret_changed_notices(
-            &sender.uuid().to_string(),
+            sender.uuid(),
             msg.meta.dst_ilk.as_deref(),
             false,
             &payload,

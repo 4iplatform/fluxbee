@@ -1087,7 +1087,7 @@ fn persist_public_registry(
 fn authorize_edge_service_command(msg: &Message, action: &str) -> Result<(), String> {
     match msg.routing.src_l2_name.as_deref().map(str::trim) {
         Some(src) if src == json_router::router::system_policy::EDGE_CONTROL_AUTHORITY => Ok(()),
-        Some(src) if src.is_empty() => Err(format!("{action} requires router-stamped source")),
+        Some("") => Err(format!("{action} requires router-stamped source")),
         Some(src) => Err(format!("{action} not authorized from {src}")),
         None => Err(format!("{action} requires router-stamped source")),
     }
@@ -3910,7 +3910,7 @@ fn normalize_extra_path(extra: &str) -> String {
 /// Minimal std-only base64 (standard alphabet, padded) for non-UTF-8 bodies.
 fn base64_encode(input: &[u8]) -> String {
     const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut out = String::with_capacity((input.len() + 2) / 3 * 4);
+    let mut out = String::with_capacity(input.len().div_ceil(3) * 4);
     for chunk in input.chunks(3) {
         let b0 = chunk[0] as u32;
         let b1 = *chunk.get(1).unwrap_or(&0) as u32;
@@ -4611,7 +4611,7 @@ mod tests {
         );
         drop(p1); // request completes -> slot frees -> next admitted
         assert!(Arc::clone(&sem).try_acquire_owned().is_ok());
-        assert!(DEFAULT_MAX_INFLIGHT > 0, "the default cap must be positive");
+        const { assert!(DEFAULT_MAX_INFLIGHT > 0, "the default cap must be positive") };
     }
 
     #[test]

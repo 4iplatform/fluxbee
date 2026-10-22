@@ -819,7 +819,7 @@ const ADMIN_COMMAND_LOG_MAX_LIMIT: usize = 500;
 #[derive(Debug, Serialize, Deserialize)]
 struct AdminCommandLogEntry {
     ts_ms: u64,
-    /// RFC3339 copy of ts_ms so the log reads on sight (auditoría humana).
+    /// RFC3339 copy of ts_ms so the log reads on sight (human audit).
     ts: String,
     action: String,
     /// Target hive of the command (`None` = hive-less action, e.g. add_hive/inventory).
@@ -5589,39 +5589,27 @@ async fn retire_expired_publication(
     Ok(true)
 }
 
-/// `externalize` — an IO node self-exposes one of its channels (`ICH`) as a public
-/// URL on the edge (v6 §7). Resolves `ICH -> owner_l2_name` from identity SHM (admin
-/// runs where identity lives) and OPENS the URL on the edge via the `EDGE_OPEN_URL`
-/// service command (§7.6, addressed + acked; NOT a config push), blocking on the ack.
+/// Opens Fluxbee Cloud's public door and returns the token ONCE.
 ///
-/// **Authz (v6 §11.1): CLOSED.** A node-originated externalize must come from an `IO.*`
-/// node (I1) and may only expose its OWN channel (I8: resolved owner == router-stamped
-/// caller); see `authorize_channel_command`. Trusted internal paths (operator/executor)
-/// bypass.
+/// `IO.cloud` is Fluxbee Cloud's provisioning relay: its endpoint exposes `create_tenant`,
+/// `vault_put` and `run_node`, protected by a single bearer. This action is the bootstrap of that
+/// door, and it is limited to that on purpose: it is not a generic externalize.
 ///
-/// Still deferred (v6 §12): the durable `ICH` "externalized" attribute in `SY.identity`
-/// for reconstruction after an Edge reimage. Shared-secret token minting and Edge-owned Vault
-/// persistence are implemented below.
-/// Abre la puerta publica de Fluxbee Cloud y devuelve el token UNA sola vez.
+/// # Why it returns the token instead of letting it be read later
 ///
-/// `IO.cloud` es el relay de aprovisionamiento de Fluxbee Cloud: su endpoint expone
-/// `create_tenant`, `vault_put` y `run_node`, protegidos por un unico bearer. Esta accion es el
-/// bootstrap de esa puerta, y esta acotada a eso a proposito — no es un externalize generico.
+/// The channel's secret is kept in the vault under `edge_channel_secret:{ich}`, DEDICATED to
+/// SY.edge's ILK, and `authorize_read` has no admin bypass: that is written that way on purpose and
+/// stays. So the operator does not READ the token: they MINT it and take it on the spot, which is
+/// the same path the code already blesses for any caller of the mint.
 ///
-/// # Por que devuelve el token en vez de dejarlo leer despues
+/// An accepted, explicit consequence: **the token is seen only once**. If it is lost, the endpoint
+/// is published again and the token rotates (the edge's grace window covers clients in flight). A
+/// secret that cannot be read again and can only be rotated is healthy, not a limitation.
 ///
-/// El secreto del canal se guarda en el vault bajo `edge_channel_secret:{ich}`, DEDICADO al ILK de
-/// SY.edge, y `authorize_read` no tiene bypass de admin: eso esta escrito a proposito y no se toca.
-/// Asi que el operador no LEE el token — lo ACUÑA y se lo lleva en el momento, que es el mismo
-/// camino que el codigo ya bendice para cualquier llamador del mint.
-///
-/// Consecuencia asumida y explicita: **el token se ve una sola vez**. Si se pierde, se vuelve a
-/// publicar y rota (la ventana de gracia del edge cubre a los clientes en vuelo). Que un secreto no
-/// se pueda releer y solo se pueda rotar es sano, no una limitacion.
-///
-/// No manda `secret`: dejar que admin lo acuñe es el camino por defecto, y el unico que garantiza
-/// que el valor nazca fuerte y viva solo en el vault. Pasar uno propio es el "explicit opt-out"
-/// documentado en `handle_externalize`, y esta accion deliberadamente no lo ofrece.
+/// It sends no `secret`: letting the admin mint it is the default path, and the only one that
+/// guarantees the value is born strong and lives only in the vault. Passing your own is the
+/// "explicit opt-out" documented in `handle_externalize`, and this action deliberately does not
+/// offer it.
 async fn handle_publish_cloud_endpoint(
     ctx: &AdminContext,
     client: &RouterDispatcher,
@@ -5644,7 +5632,7 @@ async fn handle_publish_cloud_endpoint(
         ));
     };
 
-    // El operador nombra el NODO; el ICH lo resolvemos nosotros.
+    // The operator names the NODE; we resolve the ICH.
     let ich = match fluxbee_sdk::identity::list_ich_options_from_hive_config(&ctx.config_dir) {
         Ok(options) => match resolve_ich_owned_by(options, &cloud_node) {
             Ok(value) => value,
@@ -5662,12 +5650,12 @@ async fn handle_publish_cloud_endpoint(
         cloud_node = %cloud_node,
         edge_node = %edge_node,
         ich = %ich,
-        "publish_cloud_endpoint: abriendo la puerta publica de Fluxbee Cloud"
+        "publish_cloud_endpoint: opening Fluxbee Cloud's public door"
     );
 
-    // Reusa el camino real (acuña -> guarda en vault -> manda solo el secret_ref al edge). El
-    // `caller_l2_name: None` es el camino interno confiable del servidor HTTP del operador, ya
-    // contemplado por authorize_channel_command.
+    // Reuses the real path (mint -> store in the vault -> send only the secret_ref to the edge).
+    // `caller_l2_name: None` is the trusted internal path of the operator's HTTP server, which
+    // authorize_channel_command already accounts for.
     let externalize = handle_externalize(
         ctx,
         client,
@@ -5683,7 +5671,7 @@ async fn handle_publish_cloud_endpoint(
     .await?;
 
     // Record the edge into IO.cloud's MANAGED config so the node trusts it for inbound traffic —
-    // the contract's happy path ("publish_cloud_endpoint publica el endpoint Y deja asentado el
+    // the contract's happy path ("publish_cloud_endpoint publishes the endpoint AND records the
     // edge_node"). io.cloud reads config.io.edge_node LIVE from its control plane, so this takes
     // effect with no restart and no token rotation. Only when the externalize actually succeeded:
     // there is nothing to trust otherwise. This replaces the old poison IO_CLOUD_EDGE_NODE env.
@@ -5705,7 +5693,7 @@ async fn handle_publish_cloud_endpoint(
                 tracing::info!(
                     cloud_node = %cloud_node,
                     edge_node = %edge_node,
-                    "publish_cloud_endpoint: edge_node asentado en el config de IO.cloud"
+                    "publish_cloud_endpoint: edge_node recorded in IO.cloud's config"
                 );
             }
             Ok((status, body)) => {
@@ -5733,6 +5721,19 @@ async fn handle_publish_cloud_endpoint(
     Ok(externalize)
 }
 
+/// `externalize` — an IO node self-exposes one of its channels (`ICH`) as a public
+/// URL on the edge (v6 §7). Resolves `ICH -> owner_l2_name` from identity SHM (admin
+/// runs where identity lives) and OPENS the URL on the edge via the `EDGE_OPEN_URL`
+/// service command (§7.6, addressed + acked; NOT a config push), blocking on the ack.
+///
+/// **Authz (v6 §11.1): CLOSED.** A node-originated externalize must come from an `IO.*`
+/// node (I1) and may only expose its OWN channel (I8: resolved owner == router-stamped
+/// caller); see `authorize_channel_command`. Trusted internal paths (operator/executor)
+/// bypass.
+///
+/// Still deferred (v6 §12): the durable `ICH` "externalized" attribute in `SY.identity`
+/// for reconstruction after an Edge reimage. Shared-secret token minting and Edge-owned Vault
+/// persistence are implemented below.
 async fn handle_externalize(
     ctx: &AdminContext,
     client: &RouterDispatcher,
@@ -6019,11 +6020,11 @@ async fn handle_externalize(
     }
 }
 
-/// El ICH que posee un nodo, buscando por dueño (el inverso de `resolve_externalize_owner`).
+/// The ICH a node owns, looked up by owner (the inverse of `resolve_externalize_owner`).
 ///
-/// Existe para `publish_cloud_endpoint`: el operador abre la puerta de Fluxbee Cloud nombrando el
-/// NODO, no un `ich:<uuid>` que no tiene por que conocer. Aplica el mismo requisito de canal
-/// habilitado, para que la puerta publica nunca se abra sobre un canal deshabilitado.
+/// It exists for `publish_cloud_endpoint`: the operator opens Fluxbee Cloud's door by naming the
+/// NODE, not an `ich:<uuid>` they have no reason to know. It applies the same enabled-channel
+/// requirement, so the public door never opens on a disabled channel.
 fn resolve_ich_owned_by(
     options: Vec<fluxbee_sdk::identity::IdentityIchOption>,
     owner_l2_name: &str,
@@ -6408,10 +6409,10 @@ async fn dispatch_internal_admin_command(
             append_internal_dispatch_log(ctx, action, origin, logged_params, started, &result);
             return result;
         }
-        // publish_cloud_endpoint — el bootstrap de la puerta publica de Fluxbee Cloud. Vive al lado
-        // de externalize porque lo reusa; acotado a IO.cloud y devuelve el token UNA vez. Se audita
-        // igual que sus hermanas bypass (el token minteado NO viaja en params, solo en la respuesta,
-        // y admin_command_log_params redacta igual campos secret-like).
+        // publish_cloud_endpoint — the bootstrap of Fluxbee Cloud's public door. It lives next to
+        // externalize because it reuses it; limited to IO.cloud, it returns the token ONCE. It is
+        // audited like its bypass siblings (the minted token does NOT travel in params, only in the
+        // reply, and admin_command_log_params redacts secret-like fields anyway).
         "publish_cloud_endpoint" => {
             let logged_params = admin_command_log_params(&params);
             let started = Instant::now();
@@ -9869,7 +9870,7 @@ async fn respond_json(
     let status_line = http_status_line(status);
     let response = format!(
         "{status_line}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
-        body.as_bytes().len(),
+        body.len(),
         body
     );
     stream.write_all(response.as_bytes()).await?;
@@ -17383,7 +17384,7 @@ async fn send_opa_sync_notice(
     hash: &str,
 ) -> Result<(), AdminError> {
     let sender = client.sender_snapshot();
-    let msg = opa_sync_notice(&sender.uuid().to_string(), version, hash)?;
+    let msg = opa_sync_notice(sender.uuid(), version, hash)?;
     sender.send(msg).await?;
     tracing::info!(version, hash, "opa sync notice sent to every hive");
     Ok(())
@@ -17715,7 +17716,6 @@ fn build_opa_http_response(
     let pending_topology: Vec<String> = expected
         .topology
         .iter()
-        .into_iter()
         .filter(|hive| !responses.iter().any(|r| r.hive == **hive))
         .cloned()
         .collect();
@@ -22968,7 +22968,7 @@ mod tests {
         assert_eq!(
             body["payload"]["registry_version"],
             json!(INTERNAL_ACTION_REGISTRY_VERSION),
-            "el help tiene que reportar la version viva del registry"
+            "the help has to report the registry's live version"
         );
         assert_eq!(
             body["payload"]["entry"]["request_contract"]["admin_rpc"]["action"],

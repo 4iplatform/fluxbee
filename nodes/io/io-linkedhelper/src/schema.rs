@@ -94,9 +94,11 @@ mod tests {
 
     #[test]
     fn configured_schema_advertises_plain_http_and_binding() {
-        let mut state = IoControlPlaneState::default();
-        state.current_state = IoNodeLifecycleState::Configured;
-        state.config_version = 7;
+        let state = IoControlPlaneState {
+            current_state: IoNodeLifecycleState::Configured,
+            config_version: 7,
+            ..Default::default()
+        };
         let effective = effective_config();
         let schema = build_configured_schema(
             "IO.linkedhelper.lhmi_test@motherbee",

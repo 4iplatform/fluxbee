@@ -278,9 +278,8 @@ impl RelayStore for InMemoryRelayStore {
         let expired_keys = self
             .sessions
             .iter()
-            .filter_map(|(relay_key, session)| {
-                (session.expires_at_ms < now_ms).then(|| relay_key.clone())
-            })
+            .filter(|&(_relay_key, session)| session.expires_at_ms < now_ms)
+            .map(|(relay_key, _session)| relay_key.clone())
             .collect::<Vec<_>>();
 
         expired_keys

@@ -67,15 +67,15 @@ type DynError = Box<dyn std::error::Error + Send + Sync>;
 
 const RPC_CH_CONTROL: &str = "control";
 const LEDGER_SCHEMA_VERSION: u32 = 1;
-// Rutas FIJAS de diseño del sistema: NO son config de operador ni ENV. Los dirs se crean al
-// instalar; el nodo solo usa estas rutas (con `ensure_dir` como red de seguridad en boot).
+// FIXED system design paths: NOT operator config and NOT ENV. The dirs are created at install;
+// the node only uses these paths (with `ensure_dir` as a safety net at boot).
 const DEFAULT_BLOB_ROOT: &str = "/var/lib/fluxbee/blob";
 const DEFAULT_PUBLIC_ROOT: &str = "/var/lib/fluxbee/blob/public";
 const DEFAULT_LEDGER_PATH: &str = "/var/lib/fluxbee/state/io-blob/publications.json";
 
-/// Infra de arranque leida del managed spawn (env inyectado por el runtime / `_system` de
-/// `config.json`), NO los tunables de operador. Los tunables (`max_bytes`, `admin_hive`) viven en el
-/// plano de control (`RuntimeState.control_plane`).
+/// Boot infra read from the managed spawn (env injected by the runtime / `_system` of
+/// `config.json`), NOT the operator tunables. The tunables (`max_bytes`, `admin_hive`) live in the
+/// control plane (`RuntimeState.control_plane`).
 #[derive(Debug, Clone)]
 struct Config {
     node_name: String,
@@ -87,10 +87,11 @@ struct Config {
 }
 
 impl Config {
-    /// Carga la infra al estilo io.api: env primero, luego el `node`/`_system` del spawn `config.json`,
-    /// luego el default. A diferencia de io.api, la lectura del spawn doc es TOLERANTE: un io.blob sin
-    /// `config.json` (o con uno ilegible) es un curador valido con defaults, no un arranque abortado —
-    /// el plano de control clasifica por separado una config corrupta como FAILED_CONFIG.
+    /// Loads the infra the io.api way: env first, then the `node`/`_system` of the spawn
+    /// `config.json`, then the default. Unlike io.api, reading the spawn doc is TOLERANT: an
+    /// io.blob without `config.json` (or with an unreadable one) is a valid curator with defaults,
+    /// not an aborted boot; the control plane classifies a corrupt config as FAILED_CONFIG on its
+    /// own.
     fn load() -> Result<Self, DynError> {
         let node_name = env(FLUXBEE_NODE_NAME_ENV).ok_or_else(|| {
             format!("missing required env {FLUXBEE_NODE_NAME_ENV} for managed spawn")
@@ -123,9 +124,9 @@ impl Config {
                     .or_else(|| json_get_string(&spawn_doc, "node.config_dir"))
                     .unwrap_or_else(|| "/etc/fluxbee".to_string()),
             ),
-            // El orchestrator es una segunda autoridad de CONFIG (ademas de SY.admin). No es un
-            // tunable de operador, asi que sale del spawn doc o del default del hive, nunca de un
-            // env IO_BLOB_*.
+            // The orchestrator is a second CONFIG authority (besides SY.admin). It is not an
+            // operator tunable, so it comes from the spawn doc or the hive's default, never from an
+            // IO_BLOB_* env.
             orchestrator_target: json_get_string(&spawn_doc, "node.orchestrator_target")
                 .unwrap_or_else(|| format!("SY.orchestrator@{hive_id}")),
         })
@@ -140,9 +141,8 @@ struct BlobCurator {
     max_bytes: u64,
 }
 
-/// Estado de runtime del nodo, al estilo `io.api::RuntimeState`. El curador vive detras de un `Mutex`
-/// porque un CONFIG_SET de `max_bytes` lo reconstruye en caliente (rutas fijas, sin reiniciar el
-/// proceso).
+/// The node's runtime state, in the style of `io.api::RuntimeState`. The curator lives behind a
+/// `Mutex` because a CONFIG_SET of `max_bytes` rebuilds it hot (fixed paths, no process restart).
 struct RuntimeState {
     config: Config,
     local_hive: String,
@@ -250,8 +250,9 @@ async fn main() -> Result<(), DynError> {
 
     let config = Config::load()?;
 
-    // Plano de control: boot lee SOLO el `config.json` del dir del nodo, validado por el contrato del
-    // adapter via el SDK (single-config, sin archivo dinamico que ensombrezca un respawn — BUG-4).
+    // Control plane: boot reads ONLY the `config.json` in the node's dir, validated by the
+    // adapter's contract through the SDK (single-config, no dynamic file shadowing a respawn:
+    // BUG-4).
     let adapter_contract: Arc<dyn IoAdapterConfigContract> = Arc::new(IoBlobAdapterConfigContract);
     let mut boot_state =
         bootstrap_io_control_plane_state(&config.node_name, adapter_contract.as_ref())
@@ -286,7 +287,7 @@ async fn main() -> Result<(), DynError> {
             RouteMatch::exact(SYSTEM_KIND, MSG_NODE_STATUS_GET),
             RouteTarget::Command(RPC_CH_CONTROL),
         )
-        // Plano de control managed: CONFIG_GET/SET entran por el mismo canal.
+        // Managed control plane: CONFIG_GET/SET come in through the same channel.
         .post_pending_rule(
             RouteMatch::one_of(SYSTEM_KIND, [MSG_CONFIG_GET, MSG_CONFIG_SET]),
             RouteTarget::Command(RPC_CH_CONTROL),
@@ -310,8 +311,8 @@ async fn main() -> Result<(), DynError> {
         .map(|(_, hive)| hive.to_string())
         .unwrap_or_else(|| "motherbee".to_string());
 
-    // Red de seguridad fail-closed: io.blob es SOLO-motherbee. Un runtime managed ya no tiene el
-    // ExecCondition de systemd que antes vetaba spokes, asi que el chequeo se hace aca.
+    // Fail-closed safety net: io.blob is motherbee-ONLY. A managed runtime no longer has the
+    // systemd ExecCondition that used to keep it off spokes, so the check happens here.
     if local_hive != "motherbee" {
         tracing::error!(
             node = %full_name,
@@ -321,7 +322,7 @@ async fn main() -> Result<(), DynError> {
         return Err(format!("IO.blob must run on motherbee, not '{local_hive}'").into());
     }
 
-    // El tope inicial sale del plano de control vivo (default baked si no hay config).
+    // The initial cap comes from the live control plane (the baked default without a config).
     let initial_max_bytes = configured_max_bytes(boot_state.effective_config.as_ref())
         .unwrap_or(BLOB_DEFAULT_MAX_BYTES);
     let curator = build_curator(initial_max_bytes)?;
@@ -360,8 +361,8 @@ async fn main() -> Result<(), DynError> {
             continue;
         }
 
-        // Plano de control ANTES de la compuerta de admin del curador: CONFIG_GET/SET los autoriza el
-        // admin O el orchestrator (no la compuerta `expected_admin` del curador).
+        // The control plane goes BEFORE the curator's admin gate: CONFIG_GET/SET are authorized by
+        // the admin OR the orchestrator (not by the curator's `expected_admin` gate).
         if is_config_command(&message) {
             let response = handle_control_message(&state, &message).await;
             sender.send(response).await?;
@@ -369,8 +370,8 @@ async fn main() -> Result<(), DynError> {
         }
 
         let response_msg = response_message_for(message.meta.msg.as_deref());
-        // `expected_admin` se lee del plano de control VIVO, asi que un CONFIG_SET de `admin_hive`
-        // tiene efecto sin reiniciar.
+        // `expected_admin` is read from the LIVE control plane, so a CONFIG_SET of `admin_hive`
+        // takes effect without a restart.
         let expected_admin = current_expected_admin(&state).await;
         let result = match authorize_admin_message(&message, &expected_admin) {
             Err(err) => Err(err),
@@ -445,8 +446,8 @@ fn is_config_command(message: &Message) -> bool {
         )
 }
 
-/// `SY.admin@{admin_hive}` derivado del plano de control VIVO (default = hive local). io.blob NO
-/// tiene un `admin_target` fijo como io.api: su autoridad de admin es config-driven (`admin_hive`).
+/// `SY.admin@{admin_hive}` derived from the LIVE control plane (default = the local hive). io.blob
+/// has NO fixed `admin_target` like io.api: its admin authority is config-driven (`admin_hive`).
 async fn current_expected_admin(state: &RuntimeState) -> String {
     let effective = state.control_plane.read().await;
     let hive = configured_admin_hive(effective.effective_config.as_ref())
@@ -588,7 +589,7 @@ async fn apply_config_set(
         );
     }
 
-    // Diferencias contra la config previa para decidir el hot-apply.
+    // Differences against the previous config, to decide the hot-apply.
     let old_max =
         configured_max_bytes(current.effective_config.as_ref()).unwrap_or(BLOB_DEFAULT_MAX_BYTES);
     let new_max = configured_max_bytes(Some(&effective)).unwrap_or(BLOB_DEFAULT_MAX_BYTES);
@@ -602,9 +603,9 @@ async fn apply_config_set(
 
     let mut hot_applied = Vec::new();
     if new_max != old_max {
-        // El curador guarda `max_bytes` por valor. Las rutas son FIJAS, asi que un cambio de tope se
-        // aplica en caliente reconstruyendo el curador en proceso (relee el ledger, barato) — nunca
-        // hace falta reiniciar el nodo.
+        // The curator keeps `max_bytes` by value. The paths are FIXED, so a cap change is applied
+        // hot by rebuilding the curator in process (it rereads the ledger, cheap); the node never
+        // needs a restart.
         match build_curator(new_max) {
             Ok(rebuilt) => {
                 *state.curator.lock().await = rebuilt;
@@ -619,7 +620,7 @@ async fn apply_config_set(
         }
     }
     if admin_hive_changed {
-        // `expected_admin` se lee del plano de control vivo en cada comando, asi que ya quedo aplicado.
+        // `expected_admin` is read from the live control plane on every command, so it is applied.
         hot_applied.push("io.admin_hive".to_string());
     }
     log_config_set_applied(
@@ -671,8 +672,8 @@ async fn inject_runtime_status(payload: &mut Value, state: &RuntimeState) {
     }
 }
 
-/// Construye un curador con las rutas FIJAS de diseño y el tope dado. Unico punto de creacion en
-/// produccion (boot + hot-apply de `max_bytes`).
+/// Builds a curator with the FIXED design paths and the given cap. The only place it is created in
+/// production (boot + the hot-apply of `max_bytes`).
 fn build_curator(max_bytes: u64) -> Result<BlobCurator, CuratorError> {
     BlobCurator::new(
         PathBuf::from(DEFAULT_BLOB_ROOT),
@@ -1259,8 +1260,9 @@ fn now_epoch_ms() -> u64 {
         .unwrap_or(0)
 }
 
-/// Lee (tolerante) el spawn `config.json` del dir del nodo para la infra de arranque. Un archivo
-/// ausente o ilegible NO aborta el boot: cae a env/defaults (io.blob sin config es valido).
+/// Reads (tolerantly) the spawn `config.json` in the node's dir for the boot infra. A missing or
+/// unreadable file does NOT abort the boot: it falls back to env/defaults (an io.blob without
+/// config is valid).
 fn load_spawn_doc(node_name: &str) -> Value {
     let Ok(path) = managed_node_config_path(node_name) else {
         return Value::Null;

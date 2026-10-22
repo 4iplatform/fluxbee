@@ -577,7 +577,7 @@ struct CognitiveDefinitionRuntimeConfig {
 
 impl From<CognitiveDefinitionSection> for CognitiveDefinitionRuntimeConfig {
     fn from(value: CognitiveDefinitionSection) -> Self {
-        let poll_secs = value.poll_interval_secs.max(1).min(300);
+        let poll_secs = value.poll_interval_secs.clamp(1, 300);
         Self {
             poll_interval: Duration::from_secs(poll_secs),
             blob_root: value
@@ -1918,7 +1918,7 @@ fn spawn_cognitive_definition_poll(
 
 async fn refresh_cognitive_definition(
     node_name: &str,
-    config_dir: &PathBuf,
+    config_dir: &Path,
     config: &CognitiveDefinitionRuntimeConfig,
     state: &Arc<RwLock<CognitiveDefinitionRuntimeState>>,
 ) -> Result<(), String> {
@@ -4684,20 +4684,19 @@ fn ai_runtime_error_payload(err: &fluxbee_ai_sdk::errors::AiSdkError) -> Value {
         }),
         fluxbee_ai_sdk::errors::AiSdkError::Protocol(msg) => {
             if let Some((status, detail)) = parse_openai_status_error(msg) {
-                if status == 400 || status == 404 || status == 422 {
-                    if extract_openai_error_param(msg)
+                if (status == 400 || status == 404 || status == 422)
+                    && extract_openai_error_param(msg)
                         .as_deref()
                         .is_some_and(is_openai_attachment_param)
-                    {
-                        return json!({
-                            "type": "error",
-                            "code": "provider_attachment_invalid_request",
-                            "message": "The AI provider rejected one or more attached files for the current model/provider.",
-                            "retryable": false,
-                            "provider_status": status,
-                            "provider_detail": trim_chars(&detail, 280)
-                        });
-                    }
+                {
+                    return json!({
+                        "type": "error",
+                        "code": "provider_attachment_invalid_request",
+                        "message": "The AI provider rejected one or more attached files for the current model/provider.",
+                        "retryable": false,
+                        "provider_status": status,
+                        "provider_detail": trim_chars(&detail, 280)
+                    });
                 }
                 let (code, retryable, message) = match status {
                     400 | 404 | 422 => (
@@ -6160,6 +6159,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // the env lock spans the whole test, awaits included
     async fn ai_chat_missing_api_key_returns_error_payload_instead_of_fatal() {
         let _guard = env_lock().lock().expect("env lock");
         std::env::remove_var("OPENAI_API_KEY_MISSING_FOR_TEST");

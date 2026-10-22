@@ -13,7 +13,7 @@
 //! it registers are synthetic and derived from the test id.
 
 use std::error::Error;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use fluxbee_sdk::protocol::{Destination, Message, Meta, Routing};
@@ -94,7 +94,7 @@ fn hive_from_node_name(name: &str) -> Option<&str> {
         .filter(|hive| !hive.is_empty())
 }
 
-fn load_hive_id(config_dir: &PathBuf) -> Result<String, DiagError> {
+fn load_hive_id(config_dir: &Path) -> Result<String, DiagError> {
     let data = std::fs::read_to_string(config_dir.join("hive.yaml"))?;
     let hive: HiveFile = serde_yaml::from_str(&data)?;
     Ok(hive.hive_id)

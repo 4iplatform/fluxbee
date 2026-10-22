@@ -2871,7 +2871,6 @@ fn extract_turn_text(payload: &Value) -> Option<String> {
 /// One turn of a communication (`thread_id`, the agent `agent_ilk` that owns it, §6.2): its state
 /// moves on, and the envelopes of what changed come back. The turn is numbered here; the number
 /// orders the communication and guards its rows in SY.storage.
-#[allow(clippy::too_many_arguments)]
 async fn update_thread_state_and_build_envelopes<S: NarrativeSummarizer>(
     hive_id: &str,
     writer: &str,

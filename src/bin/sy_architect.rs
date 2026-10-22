@@ -5672,11 +5672,11 @@ fn llm_readable_admin_action_help(action_name: &str, raw: &Value) -> Value {
     let contract = entry
         .get("request_contract")
         .cloned()
-        .unwrap_or_else(|| Value::Null);
+        .unwrap_or(Value::Null);
     let executor_contract = entry
         .get("executor_contract")
         .cloned()
-        .unwrap_or_else(|| Value::Null);
+        .unwrap_or(Value::Null);
     let example_scmd = entry
         .get("example_scmd")
         .or_else(|| contract.get("example_scmd"))
@@ -7042,8 +7042,10 @@ fn architect_blob_root_from_config_dir(config_dir: &Path) -> Result<PathBuf, Arc
 }
 
 fn architect_blob_toolkit(state: &ArchitectState) -> Result<BlobToolkit, ArchitectError> {
-    let mut cfg = BlobConfig::default();
-    cfg.blob_root = architect_blob_root(state)?;
+    let cfg = BlobConfig {
+        blob_root: architect_blob_root(state)?,
+        ..Default::default()
+    };
     BlobToolkit::new(cfg).map_err(|err| -> ArchitectError {
         format!("failed to initialize blob toolkit for archi attachments: {err}").into()
     })
@@ -13220,7 +13222,7 @@ async fn execute_tracked_admin_translation(
             operation.error_summary = err_text.clone();
             save_operation(state, &operation).await?;
             Ok(json!({
-                "status": if operation.status == "timeout_unknown" { "error" } else { "error" },
+                "status": "error",
                 "action": operation.action,
                 "error_code": if operation.status == "timeout_unknown" { "TIMEOUT_UNKNOWN" } else { "EXECUTION_FAILED" },
                 "error_detail": if operation.status == "timeout_unknown" {
@@ -14268,7 +14270,7 @@ async fn count_session_messages(
 ) -> Result<u64, ArchitectError> {
     let filter = session_filter(session_id);
     table
-        .count_rows(Some(filter.into()))
+        .count_rows(Some(filter))
         .await
         .map(|count| count as u64)
         .map_err(|err| -> ArchitectError { Box::new(err) })
@@ -20405,7 +20407,7 @@ async fn save_manifest_record_with_db(
     version: &str,
     path: &Path,
 ) -> Result<(), ArchitectError> {
-    let table = ensure_manifest_refs_table(&db).await?;
+    let table = ensure_manifest_refs_table(db).await?;
     let now = now_epoch_ms();
     let batch = RecordBatch::try_new(
         manifest_refs_schema(),
@@ -22456,8 +22458,10 @@ fn publish_runtime_bundle_blob(
     filename: &str,
     zip_bytes: &[u8],
 ) -> Result<(String, String), String> {
-    let mut cfg = BlobConfig::default();
-    cfg.blob_root = blob_root.to_path_buf();
+    let cfg = BlobConfig {
+        blob_root: blob_root.to_path_buf(),
+        ..Default::default()
+    };
     let toolkit = BlobToolkit::new(cfg)
         .map_err(|err| format!("failed to initialize blob toolkit for artifact bundle: {err}"))?;
     let blob_ref = toolkit
@@ -24487,7 +24491,7 @@ async fn handle_pipeline_confirm2(
                     &failure_class,
                     pipeline_run.current_loop as usize,
                     0,
-                    pipeline_run.current_attempt as u32,
+                    pipeline_run.current_attempt,
                 );
                 let _ = block_pipeline_run(
                     state,
@@ -24663,7 +24667,7 @@ async fn handle_pipeline_confirm2(
                 &failure_class,
                 pipeline_run.current_loop as usize,
                 0,
-                pipeline_run.current_attempt as u32,
+                pipeline_run.current_attempt,
             );
             let _ = block_pipeline_run(
                 state,
@@ -29517,7 +29521,7 @@ mod tests {
 
     #[test]
     fn blocked_layer_feedback_mentions_each_blocked_layer() {
-        let records = vec![
+        let records = [
             LayerAssessmentRecord {
                 layer: DesignerLayer::Nodes,
                 outcome: LayerOutcome::Blocked {
@@ -29553,7 +29557,7 @@ mod tests {
             summary: "all good".to_string(),
             produced_at_ms: 0,
         };
-        let records = vec![LayerAssessmentRecord {
+        let records = [LayerAssessmentRecord {
             layer: DesignerLayer::IdentitySecrets,
             outcome: LayerOutcome::Blocked {
                 blocked_code: "TENANT_AMBIGUOUS".to_string(),

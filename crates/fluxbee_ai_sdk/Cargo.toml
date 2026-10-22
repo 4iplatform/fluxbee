@@ -4,6 +4,9 @@ version = "0.1.0"
 edition = "2021"
 readme = "README.md"
 
+[lints]
+workspace = true
+
 [dependencies]
 async-trait = "0.1"
 fluxbee-sdk = { path = "../fluxbee_sdk" }

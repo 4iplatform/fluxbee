@@ -1666,7 +1666,7 @@ fn header_ref<T>(mmap: &[u8], offset: usize) -> Option<&T> {
         return None;
     }
     let ptr = mmap.as_ptr().wrapping_add(offset) as *const T;
-    if (ptr as usize) % std::mem::align_of::<T>() != 0 {
+    if !(ptr as usize).is_multiple_of(std::mem::align_of::<T>()) {
         return None;
     }
     Some(unsafe { &*ptr })
@@ -1679,7 +1679,7 @@ fn read_slice<T>(mmap: &[u8], offset: usize, len: usize) -> Option<&[T]> {
         return None;
     }
     let ptr = mmap.as_ptr().wrapping_add(offset) as *const T;
-    if (ptr as usize) % std::mem::align_of::<T>() != 0 {
+    if !(ptr as usize).is_multiple_of(std::mem::align_of::<T>()) {
         return None;
     }
     Some(unsafe { std::slice::from_raw_parts(ptr, len) })

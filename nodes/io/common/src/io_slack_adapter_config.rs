@@ -352,25 +352,25 @@ mod tests {
         );
     }
 
-    /// El ejemplo de key que usan los fixtures tiene que ser una key que SY.vault acepte.
+    /// The example key the fixtures use has to be a key SY.vault accepts.
     ///
-    /// Antes era `slack/IO.slack@motherbee` — cuatro caracteres ilegales (`/`, mayusculas, `.`,
-    /// `@`). Los tests pasaban igual porque nunca llaman al vault, asi que el ejemplo se veia
-    /// autoritativo y era imposible: copiarlo a un hive real devuelve
-    /// `INVALID_REQUEST: invalid key format`. Este test ata el fixture a la regla de verdad.
+    /// It used to be `slack/IO.slack@motherbee`: four illegal characters (`/`, uppercase, `.`,
+    /// `@`). The tests passed anyway because they never call the vault, so the example looked
+    /// authoritative and was impossible: copying it to a real hive returns
+    /// `INVALID_REQUEST: invalid key format`. This test ties the fixture to the real rule.
     #[test]
     fn el_ejemplo_de_vault_key_tiene_que_ser_aceptable_para_el_vault() {
         let auth = valid_auth();
         let key = auth
             .get("key")
             .and_then(|v| v.as_str())
-            .expect("el fixture declara una key");
+            .expect("the fixture declares a key");
         assert!(
             fluxbee_sdk::vault_key_is_valid(key),
-            "la key de ejemplo {key:?} seria rechazada por SY.vault (solo [a-z0-9:_-], \
-             primer caracter [a-z0-9])"
+            "the example key {key:?} would be rejected by SY.vault (only [a-z0-9:_-], \
+             first character [a-z0-9])"
         );
-        // Y la forma vieja tiene que seguir siendo invalida, para que el test no pase por casualidad.
+        // And the old form has to stay invalid, so the test does not pass by chance.
         assert!(!fluxbee_sdk::vault_key_is_valid("slack/IO.slack@motherbee"));
     }
 }

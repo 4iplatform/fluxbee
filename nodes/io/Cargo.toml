@@ -15,6 +15,14 @@ members = [
 edition = "2021"
 license = "UNLICENSED"
 
+# The same structural lints the root workspace allows (see its Cargo.toml); every member opts in
+# with `[lints] workspace = true`.
+[workspace.lints.clippy]
+too_many_arguments = "allow"
+type_complexity = "allow"
+large_enum_variant = "allow"
+result_large_err = "allow"
+
 [workspace.dependencies]
 anyhow = "1"
 async-trait = "0.1"

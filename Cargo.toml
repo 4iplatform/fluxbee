@@ -3,6 +3,9 @@ name = "json-router"
 version = "0.1.0"
 edition = "2021"
 
+[lints]
+workspace = true
+
 [workspace]
 members = [
     "crates/fluxbee_sdk",
@@ -13,6 +16,16 @@ members = [
     "nodes/test/io-test",
     "nodes/test/ai-test-gov",
 ]
+
+# CI runs clippy with warnings denied (.github/workflows/rust-tests.yml). These structural lints
+# are allowed: satisfying them means reshaping signatures, enums and error types, a design change
+# rather than a cleanup. Every member opts in with `[lints] workspace = true`; nodes/io keeps the
+# same table.
+[workspace.lints.clippy]
+too_many_arguments = "allow"
+type_complexity = "allow"
+large_enum_variant = "allow"
+result_large_err = "allow"
 
 [dependencies]
 async-trait = "0.1"

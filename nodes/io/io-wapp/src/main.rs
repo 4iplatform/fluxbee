@@ -644,7 +644,6 @@ fn extract_runtime_dst_node(effective: Option<&Value>) -> Option<String> {
         .map(ToString::to_string)
 }
 
-#[allow(clippy::too_many_arguments)]
 async fn run_router_control_loop(
     dispatcher: Arc<RouterDispatcher>,
     node_name: String,
@@ -820,8 +819,8 @@ async fn run_wapp_inbound_loop(
     identity: Arc<dyn IdentityResolver>,
     provisioner: Arc<dyn IdentityProvisioner>,
     inbound: Arc<Mutex<InboundProcessor>>,
-    // Para la compuerta de primer contacto (io_common::frontdesk_gate): el SHM de identidad se
-    // consulta por hive, y el tenant es el del nodo (el usuario externo pertenece a el).
+    // For the first-contact gate (io_common::frontdesk_gate): the identity SHM is looked up by
+    // hive, and the tenant is the node's (the external user belongs to it).
     hive_id: String,
     self_tenant_id: Option<String>,
 ) -> Result<()> {
@@ -929,9 +928,9 @@ async fn run_wapp_inbound_loop(
                     payload,
                 )
                 .await;
-            // Compuerta de primer contacto (APAGADA por defecto, patron gate-then-forward de
-            // io.api): si el emisor todavia no esta registrado, se lo presenta al frontdesk y el
-            // mensaje sigue igual a su destino. Ver io_common::frontdesk_gate.
+            // First-contact gate (OFF by default, io.api's gate-then-forward pattern): if the
+            // sender is not registered yet, it is introduced to the frontdesk and the message still
+            // goes on to its destination. See io_common::frontdesk_gate.
             if let InboundOutcome::SendNow(ref relayed) = outcome {
                 let gate = io_common::frontdesk_gate::FrontdeskGateConfig::from_effective_config(
                     control_plane.read().await.effective_config.as_ref(),
@@ -1050,7 +1049,6 @@ async fn run_wapp_outbound_loop(
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
 async fn handle_io_control_plane_message(
     msg: &WireMessage,
     node_name: &str,

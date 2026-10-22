@@ -2067,6 +2067,7 @@ fn frontdesk_reply_matcher() -> PendingMatcher {
 ///      senders (io.slack/io.wapp). The `response_envelope` makes the frontdesk emit its STRUCTURED
 ///      `{success, human_message, error_code}` verdict instead of plain text; a synthetic thread_id
 ///      satisfies the frontdesk's user-message pre-gate (there is no conversation).
+///
 /// io.cloud CONSTRUCTS no handoff — the JSON is a Cloud<->frontdesk contract; it reads only the tenant
 /// and email it provisions on, and stamps the verdict it relays with the ilk_id it minted.
 async fn handle_register_human(

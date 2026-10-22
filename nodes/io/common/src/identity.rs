@@ -168,9 +168,7 @@ impl ShmIdentityResolver {
             external_id.to_string(),
         );
         let mut guard = self.cache.lock().ok()?;
-        let Some(entry) = guard.get(&key) else {
-            return None;
-        };
+        let entry = guard.get(&key)?;
         if Instant::now() >= entry.expires_at {
             guard.remove(&key);
             return None;

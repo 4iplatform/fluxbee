@@ -3,6 +3,9 @@ name = "sy-frontdesk-gov"
 version = "0.1.0"
 edition = "2021"
 
+[lints]
+workspace = true
+
 [[bin]]
 name = "sy-frontdesk-gov"
 path = "src/bin/ai_node_runner.rs"

@@ -296,10 +296,10 @@ fn validate_optional_positive_integer(
     if !root.contains_key(field) {
         return Ok(());
     }
-    if !root
+    if root
         .get(field)
         .and_then(Value::as_u64)
-        .is_some_and(|value| value > 0)
+        .is_none_or(|value| value == 0)
     {
         return Err(IoAdapterConfigError::InvalidConfig(format!(
             "{label} must be a positive integer"

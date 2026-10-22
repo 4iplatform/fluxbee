@@ -42,13 +42,14 @@ pub fn managed_node_instance_dir_with_root(
     Ok(root.into().join(kind).join(node_name))
 }
 
-/// Los unicos nodos NO-`SY.*` que `hive.yaml` acepta en su lista de nodos de ciclo de vida.
+/// The only non-`SY.*` nodes `hive.yaml` accepts in its list of lifecycle nodes.
 ///
-/// **VACÍO a proposito.** Los runtimes managed (io.api, io.blob, io.cloud, io.slack, ...) NO se
-/// declaran en `hive.yaml` `system_nodes`: nacen por `run_node` y el orquestador los reconcilia.
+/// **EMPTY on purpose.** The managed runtimes (io.api, io.blob, io.cloud, io.slack, ...) are NOT
+/// declared in `hive.yaml` `system_nodes`: they are born through `run_node` and the orchestrator
+/// reconciles them.
 pub const HIVE_YAML_NON_SY_LIFECYCLE_NODES: &[&str] = &[];
 
-/// True cuando `hive.yaml` puede listarlo como nodo de ciclo de vida sin ser `SY.*`.
+/// True when `hive.yaml` may list it as a lifecycle node without it being `SY.*`.
 pub fn is_allowed_non_sy_lifecycle_node(node_name: &str) -> bool {
     node_matches(node_name, HIVE_YAML_NON_SY_LIFECYCLE_NODES)
 }

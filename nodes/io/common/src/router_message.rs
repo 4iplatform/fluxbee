@@ -92,6 +92,24 @@ fn extract_ich_from_context_obj(context_obj: &Map<String, Value>) -> Option<Stri
     Some(format!("{channel}://{entrypoint_id}"))
 }
 
+pub fn build_inbound_user_message_to_router(
+    src_node_uuid: &str,
+    src_ilk: String,
+    context: Value,
+    payload: Value,
+) -> Message {
+    build_user_message(
+        src_node_uuid,
+        None,
+        DEFAULT_TTL,
+        new_trace_id(),
+        Some(src_ilk),
+        None,
+        context,
+        payload,
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -184,22 +202,4 @@ mod tests {
             None
         );
     }
-}
-
-pub fn build_inbound_user_message_to_router(
-    src_node_uuid: &str,
-    src_ilk: String,
-    context: Value,
-    payload: Value,
-) -> Message {
-    build_user_message(
-        src_node_uuid,
-        None,
-        DEFAULT_TTL,
-        new_trace_id(),
-        Some(src_ilk),
-        None,
-        context,
-        payload,
-    )
 }

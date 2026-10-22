@@ -453,7 +453,7 @@ mod tests {
         }))
         .expect("contract should translate");
         assert_eq!(spec.name(), "final_output");
-        assert_eq!(spec.strict(), true);
+        assert!(spec.strict());
         assert_eq!(spec.json_schema()["type"], "object");
         assert_eq!(
             spec.json_schema()["required"],

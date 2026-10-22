@@ -390,8 +390,10 @@ fn blob_toolkit(
         .or_else(|| env_nonempty("FLUXBEE_BLOB_ROOT"))
         .or_else(|| env_nonempty("BLOB_ROOT"))
         .unwrap_or_else(|| "/var/lib/fluxbee/blob".to_string());
-    let mut cfg = BlobConfig::default();
-    cfg.blob_root = PathBuf::from(blob_root);
+    let cfg = BlobConfig {
+        blob_root: PathBuf::from(blob_root),
+        ..Default::default()
+    };
     BlobToolkit::new(cfg)
         .map_err(|err| ModelInputPayloadError::BlobToolkitUnavailable(err.to_string()))
 }

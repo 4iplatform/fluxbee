@@ -967,7 +967,7 @@ impl RouterRegionWriter {
         vpn_id: u32,
         connected_at: u64,
     ) -> Result<(), ShmError> {
-        if name.as_bytes().len() > 256 {
+        if name.len() > 256 {
             return Err(ShmError::ValueTooLong {
                 len: name.len(),
                 max: 256,
@@ -1081,6 +1081,8 @@ impl RouterRegionReader {
             nix::sys::stat::Mode::empty(),
         )?;
         let stat = fstat(fd.as_raw_fd())?;
+        // `mode_t` is u16 on macOS but already u32 on Linux, where clippy calls this useless.
+        #[allow(clippy::useless_conversion)]
         let mode = u32::from(stat.st_mode) & 0o777;
         if !region_owner_trusted(stat.st_uid, mode, owner_uid) {
             return Err(ShmError::Untrusted {
@@ -3411,7 +3413,6 @@ fn lsa_header_and_entries_mut<'a>(
     }
 }
 
-#[allow(clippy::type_complexity)]
 fn identity_header_and_entries_mut<'a>(
     mmap: &'a mut MmapMut,
     layout: &IdentityRegionLayout,

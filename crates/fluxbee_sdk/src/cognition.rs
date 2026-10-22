@@ -100,7 +100,6 @@ pub struct CognitionCommunicationRef {
 }
 
 impl<T> CognitionDurableEnvelope<T> {
-    #[allow(clippy::too_many_arguments)]
     pub fn new(
         entity: CognitionDurableEntity,
         op: CognitionDurableOp,

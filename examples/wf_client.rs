@@ -188,12 +188,7 @@ async fn connect_example_node() -> Result<Arc<RouterDispatcher>, NodeError> {
             RouteTarget::Command("system"),
         )
         .build()
-        .map_err(|err| {
-            NodeError::Io(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                err.to_string(),
-            ))
-        })?;
+        .map_err(|err| NodeError::Io(std::io::Error::other(err.to_string())))?;
     RouterDispatcher::connect_with_retry(node_config, StdDuration::from_secs(1), profile).await
 }
 

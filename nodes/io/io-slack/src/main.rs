@@ -1718,9 +1718,9 @@ async fn run_inbound_socket_mode(
                 )
                 .await;
 
-            // Compuerta de primer contacto (APAGADA por defecto, patron gate-then-forward de
-            // io.api): si el emisor todavia no esta registrado, se lo presenta al frontdesk y el
-            // mensaje sigue igual a su destino. Ver io_common::frontdesk_gate.
+            // First-contact gate (OFF by default, io.api's gate-then-forward pattern): if the
+            // sender is not registered yet, it is introduced to the frontdesk and the message still
+            // goes on to its destination. See io_common::frontdesk_gate.
             if let InboundOutcome::SendNow(ref relayed) = outcome {
                 let gate = io_common::frontdesk_gate::FrontdeskGateConfig::from_effective_config(
                     control_plane.read().await.effective_config.as_ref(),
@@ -2237,380 +2237,6 @@ async fn collect_slack_blob_attachments(
     }
 
     out
-}
-
-#[cfg(test)]
-mod tests {
-    use super::{
-        build_system_reply, classify_slack_inbound, default_slack_allowed_mimes,
-        extract_runtime_relay_config, extract_slack_tokens_from_vault_value,
-        is_control_plane_msg_type, parse_retry_after, slack_relay_policy_from_config,
-        slack_vault_key, vault_change_is_slack, SlackClients, SlackRelayConfig, SlackRuntimeState,
-    };
-    use std::time::Duration;
-
-    #[test]
-    fn vault_change_is_slack_matches_only_the_slack_resource() {
-        assert!(vault_change_is_slack(
-            &json!({"resource_type":"slack","op":"put"})
-        ));
-        assert!(vault_change_is_slack(&json!({"resource_type":"Slack"}))); // case-insensitive
-        assert!(!vault_change_is_slack(&json!({"resource_type":"openai"})));
-        assert!(!vault_change_is_slack(&json!({"op":"put"}))); // no resource_type
-    }
-    use fluxbee_sdk::protocol::{Destination, Message as WireMessage, Meta, Routing};
-    use serde_json::json;
-
-    #[test]
-    fn slack_vault_key_reads_auth_key_and_ignores_blanks() {
-        // Family vault_ref pattern: config carries only slack.auth.key (a vault reference).
-        let cfg = json!({"slack":{"auth":{"type":"vault_ref","resource_type":"slack","key":"slack:io-slack:motherbee"}}});
-        assert_eq!(
-            slack_vault_key(Some(&cfg)).as_deref(),
-            Some("slack:io-slack:motherbee")
-        );
-        assert_eq!(slack_vault_key(None), None);
-        assert_eq!(slack_vault_key(Some(&json!({"slack":{"auth":{}}}))), None);
-        assert_eq!(
-            slack_vault_key(Some(&json!({"slack":{"auth":{"key":"   "}}}))),
-            None
-        );
-    }
-
-    #[test]
-    fn extract_slack_tokens_requires_object_with_both_fields() {
-        let ok = extract_slack_tokens_from_vault_value(
-            &json!({"app_token":"xapp-1","bot_token":"xoxb-2"}),
-        );
-        assert_eq!(ok, Some(("xapp-1".to_string(), "xoxb-2".to_string())));
-        // bare strings are ambiguous -> rejected
-        assert_eq!(
-            extract_slack_tokens_from_vault_value(&json!("xapp-1")),
-            None
-        );
-        // a missing / blank half is not usable
-        assert_eq!(
-            extract_slack_tokens_from_vault_value(&json!({"app_token":"xapp-1"})),
-            None
-        );
-        assert_eq!(
-            extract_slack_tokens_from_vault_value(&json!({"app_token":"xapp-1","bot_token":"  "})),
-            None
-        );
-    }
-
-    #[test]
-    fn parse_retry_after_reads_header_and_clamps() {
-        use reqwest::header::{HeaderMap, HeaderValue, RETRY_AFTER};
-        // absent header -> 1s floor
-        assert_eq!(parse_retry_after(&HeaderMap::new()), Duration::from_secs(1));
-        // honored within range
-        let mut h = HeaderMap::new();
-        h.insert(RETRY_AFTER, HeaderValue::from_static("7"));
-        assert_eq!(parse_retry_after(&h), Duration::from_secs(7));
-        // clamped to 30s ceiling
-        let mut h = HeaderMap::new();
-        h.insert(RETRY_AFTER, HeaderValue::from_static("600"));
-        assert_eq!(parse_retry_after(&h), Duration::from_secs(30));
-        // garbage / HTTP-date form -> 1s floor (we only accept integer seconds)
-        let mut h = HeaderMap::new();
-        h.insert(
-            RETRY_AFTER,
-            HeaderValue::from_static("Wed, 21 Oct 2015 07:28:00 GMT"),
-        );
-        assert_eq!(parse_retry_after(&h), Duration::from_secs(1));
-    }
-
-    #[tokio::test]
-    async fn credential_generation_is_change_driven_and_delete_aware() {
-        let slack = SlackClients::new().expect("client");
-        assert_eq!(slack.config_generation().await, 0);
-
-        // First install bumps (0 -> 1).
-        slack
-            .reload_credentials("xapp-1".into(), "xoxb-1".into())
-            .await;
-        assert_eq!(slack.config_generation().await, 1);
-
-        // An identical reload (the periodic vault refresh on an UNCHANGED secret) must NOT churn the
-        // generation — otherwise the inbound WebSocket would needlessly reconnect every tick.
-        slack
-            .reload_credentials("xapp-1".into(), "xoxb-1".into())
-            .await;
-        assert_eq!(slack.config_generation().await, 1);
-
-        // A real rotation bumps (1 -> 2) so the socket reconnects with the new token.
-        slack
-            .reload_credentials("xapp-2".into(), "xoxb-1".into())
-            .await;
-        assert_eq!(slack.config_generation().await, 2);
-
-        // Vault delete: clear drops the live tokens and bumps so the socket stops using the stale one.
-        slack.clear_credentials().await;
-        assert_eq!(slack.config_generation().await, 3);
-        assert!(slack.slack_app_token().await.is_err());
-        assert!(slack.slack_bot_token().await.is_err());
-
-        // Clearing again is a no-op (already empty) — no generation churn.
-        slack.clear_credentials().await;
-        assert_eq!(slack.config_generation().await, 3);
-    }
-
-    #[test]
-    fn slack_runtime_state_debug_never_leaks_tokens() {
-        // A leaked xapp-/xoxb- token in a log line is a workspace compromise: Debug must redact.
-        let state = SlackRuntimeState {
-            slack_app_token: Some("xapp-super-secret".to_string()),
-            slack_bot_token: Some("xoxb-super-secret".to_string()),
-            config_generation: 3,
-            bot_user_id: Some("U0BOT".to_string()),
-        };
-        let rendered = format!("{state:?}");
-        assert!(!rendered.contains("xapp-super-secret"), "{rendered}");
-        assert!(!rendered.contains("xoxb-super-secret"), "{rendered}");
-        assert!(rendered.contains("<redacted>"), "{rendered}");
-        assert!(rendered.contains("config_generation: 3"), "{rendered}");
-        // absence renders as None, not <redacted>
-        let empty = SlackRuntimeState {
-            bot_user_id: None,
-            slack_app_token: None,
-            slack_bot_token: None,
-            config_generation: 0,
-        };
-        assert!(format!("{empty:?}").contains("None"));
-    }
-
-    #[test]
-    fn default_slack_allowed_mimes_include_office_common_types() {
-        let allowed = default_slack_allowed_mimes();
-
-        assert!(allowed.contains(
-            &"application/vnd.openxmlformats-officedocument.spreadsheetml.sheet".to_string()
-        ));
-        assert!(allowed.contains(
-            &"application/vnd.openxmlformats-officedocument.wordprocessingml.document".to_string()
-        ));
-        assert!(allowed.contains(
-            &"application/vnd.openxmlformats-officedocument.presentationml.presentation"
-                .to_string()
-        ));
-        assert!(allowed.contains(&"text/csv".to_string()));
-    }
-
-    #[test]
-    fn default_slack_allowed_mimes_preserve_existing_core_types() {
-        let allowed = default_slack_allowed_mimes();
-
-        assert!(allowed.contains(&"image/png".to_string()));
-        assert!(allowed.contains(&"image/jpeg".to_string()));
-        assert!(allowed.contains(&"application/pdf".to_string()));
-        assert!(allowed.contains(&"application/json".to_string()));
-    }
-
-    #[test]
-    fn extract_runtime_relay_config_uses_effective_config_values() {
-        let defaults = SlackRelayConfig::default();
-        let relay = extract_runtime_relay_config(
-            Some(&json!({
-                "io": {
-                    "relay": {
-                        "window_ms": 2500,
-                        "max_open_sessions": 2000,
-                        "max_fragments_per_session": 6,
-                        "max_bytes_per_session": 131072
-                    }
-                }
-            })),
-            &defaults,
-        )
-        .expect("relay config");
-
-        assert_eq!(relay.window_ms, 2500);
-        assert_eq!(relay.max_open_sessions, 2000);
-        assert_eq!(relay.max_fragments_per_session, 6);
-        assert_eq!(relay.max_bytes_per_session, 131072);
-    }
-
-    #[test]
-    fn extract_runtime_relay_config_falls_back_to_defaults_when_absent() {
-        let defaults = SlackRelayConfig {
-            window_ms: 1700,
-            max_open_sessions: 222,
-            max_fragments_per_session: 4,
-            max_bytes_per_session: 99_999,
-        };
-        let relay = extract_runtime_relay_config(Some(&json!({ "io": {} })), &defaults)
-            .expect("relay defaults");
-
-        assert_eq!(relay, defaults);
-    }
-
-    #[test]
-    fn slack_relay_policy_from_config_disables_passthrough_when_window_zero() {
-        let relay = SlackRelayConfig {
-            window_ms: 0,
-            ..SlackRelayConfig::default()
-        };
-
-        let policy = slack_relay_policy_from_config(&relay).expect("policy");
-
-        assert!(!policy.enabled);
-        assert_eq!(policy.relay_window_ms, 0);
-    }
-
-    #[test]
-    fn extract_runtime_relay_config_rejects_zero_limits() {
-        let err = extract_runtime_relay_config(
-            Some(&json!({
-                "io": {
-                    "relay": {
-                        "max_open_sessions": 0
-                    }
-                }
-            })),
-            &SlackRelayConfig::default(),
-        )
-        .expect_err("must reject zero");
-
-        assert_eq!(
-            err.to_string(),
-            "io.relay.max_open_sessions must be greater than zero"
-        );
-    }
-
-    #[test]
-    fn build_system_reply_preserves_canonical_conversation_carrier() {
-        let incoming = WireMessage {
-            routing: Routing {
-                src: "node-src".to_string(),
-                src_l2_name: None,
-                dst: Destination::Resolve,
-                ttl: 16,
-                trace_id: "trace-1".to_string(),
-            },
-            meta: Meta {
-                msg_type: "system".to_string(),
-                msg: Some("PING".to_string()),
-                src_ilk: Some("ilk:src".to_string()),
-                dst_ilk: Some("ilk:dst".to_string()),
-                ich: Some("slack://T123".to_string()),
-                thread_id: Some("thread:canonical-1".to_string()),
-                context: Some(json!({
-                    "io": {
-                        "reply_target": {
-                            "kind": "slack_post",
-                            "address": "C123",
-                            "params": { "thread_ts": "171234.567" }
-                        }
-                    }
-                })),
-                ..Meta::default()
-            },
-            payload: json!({}),
-        };
-
-        let reply = build_system_reply(
-            &incoming,
-            "IO.slack.test@motherbee",
-            "PONG",
-            json!({ "ok": true }),
-        );
-
-        assert_eq!(reply.meta.ich.as_deref(), Some("slack://T123"));
-        assert_eq!(reply.meta.thread_id.as_deref(), Some("thread:canonical-1"));
-        assert_eq!(
-            reply
-                .meta
-                .context
-                .as_ref()
-                .and_then(|ctx| ctx.get("io"))
-                .and_then(|io| io.get("reply_target"))
-                .and_then(|target| target.get("address"))
-                .and_then(|value| value.as_str()),
-            Some("C123")
-        );
-    }
-
-    /// El trafico de control del mesh nunca puede llegar al codigo que postea en Slack.
-    ///
-    /// Se fija leyendo la fuente porque la propiedad es de ORDEN: el guard tiene que estar entre
-    /// los handlers de control por nombre y el lookup de binding que abre el camino de salida. Un
-    /// test sobre `is_control_plane_msg_type` solo pasa igual de contento con el guard borrado —
-    /// que es como un rebote UNREACHABLE termino posteando "Error (invalid_text_payload)" en el
-    /// canal de un cliente.
-    ///
-    /// Los literales van partidos con `concat!`: si estuvieran enteros, este test se encontraria
-    /// A SI MISMO (el modulo de tests va antes en el archivo) y mediria su propio texto.
-    #[test]
-    fn el_trafico_de_control_nunca_llega_al_camino_de_salida_de_slack() {
-        let src = include_str!("main.rs");
-        let guard_if = concat!("if is_control_plane_msg_type(&msg.meta.", "msg_type) {");
-        let outbound = concat!("let binding = match extract_runtime_slack", "_binding(");
-        let unreachable_warn = concat!("inbound Slack message came back ", "UNREACHABLE");
-
-        let warn_at = src
-            .find(unreachable_warn)
-            .expect("el guard tiene que seguir avisando del rebote UNREACHABLE");
-
-        // El camino de SALIDA es el lookup de binding POSTERIOR al guard (hay otro antes, en el
-        // camino de entrada).
-        let outbound_at = warn_at
-            + src[warn_at..]
-                .find(outbound)
-                .expect("despues del guard tiene que venir el camino de salida");
-
-        // El corte por msg_type tiene que estar antes del warn, y su `continue` antes de la salida.
-        let guard_at = src[..warn_at]
-            .rfind(guard_if)
-            .expect("el corte por msg_type tiene que preceder al warn");
-        assert!(
-            guard_at < warn_at && warn_at < outbound_at,
-            "orden roto: guard={guard_at} warn={warn_at} salida={outbound_at}"
-        );
-        assert!(
-            src[guard_at..outbound_at].contains("continue;"),
-            "el guard tiene que CORTAR (continue) antes de llegar a postear en Slack"
-        );
-
-        assert!(is_control_plane_msg_type("system"));
-        assert!(is_control_plane_msg_type("SYSTEM"));
-        assert!(is_control_plane_msg_type("admin"));
-        assert!(!is_control_plane_msg_type("data"));
-    }
-
-    /// Las guardas anti-eco. Es la parte que no puede estar mal: si el nodo relaya sus propios
-    /// posts, lo que el mesh conteste se vuelve a postear, y eso es un bucle dentro del Slack de
-    /// un cliente.
-    #[test]
-    fn no_relayamos_nunca_nuestros_propios_mensajes() {
-        let me = "U0BOT";
-
-        let humano = serde_json::json!({"type":"message","user":"U0HUMANO","text":"hola"});
-        assert!(classify_slack_inbound(&humano, "message", Some(me)).is_ok());
-
-        let propio = serde_json::json!({"type":"message","user":me,"text":"respuesta del bot"});
-        assert!(classify_slack_inbound(&propio, "message", Some(me)).is_err());
-
-        let con_bot_id =
-            serde_json::json!({"type":"message","user":"U0OTRO","bot_id":"B123","text":"x"});
-        assert!(classify_slack_inbound(&con_bot_id, "message", Some(me)).is_err());
-
-        let con_subtype = serde_json::json!({"type":"message","subtype":"bot_message","text":"x"});
-        assert!(classify_slack_inbound(&con_subtype, "message", Some(me)).is_err());
-
-        // FALLA CERRADO: sin saber quienes somos, no se relaya nada.
-        assert!(
-            classify_slack_inbound(&humano, "message", None).is_err(),
-            "sin bot_user_id no se puede descartar un self-post: no se relaya"
-        );
-
-        let mencion =
-            serde_json::json!({"type":"app_mention","user":"U0HUMANO","text":"<@U0BOT> hola"});
-        assert!(classify_slack_inbound(&mencion, "app_mention", None).is_ok());
-
-        let otro = serde_json::json!({"type":"reaction_added"});
-        assert!(classify_slack_inbound(&otro, "reaction_added", Some(me)).is_err());
-    }
 }
 
 fn attach_slack_raw_stub(
@@ -3470,4 +3096,379 @@ fn truncate(s: &str, max_chars: usize) -> String {
     let mut out = s.chars().take(max_chars).collect::<String>();
     out.push('…');
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        build_system_reply, classify_slack_inbound, default_slack_allowed_mimes,
+        extract_runtime_relay_config, extract_slack_tokens_from_vault_value,
+        is_control_plane_msg_type, parse_retry_after, slack_relay_policy_from_config,
+        slack_vault_key, vault_change_is_slack, SlackClients, SlackRelayConfig, SlackRuntimeState,
+    };
+    use std::time::Duration;
+
+    #[test]
+    fn vault_change_is_slack_matches_only_the_slack_resource() {
+        assert!(vault_change_is_slack(
+            &json!({"resource_type":"slack","op":"put"})
+        ));
+        assert!(vault_change_is_slack(&json!({"resource_type":"Slack"}))); // case-insensitive
+        assert!(!vault_change_is_slack(&json!({"resource_type":"openai"})));
+        assert!(!vault_change_is_slack(&json!({"op":"put"}))); // no resource_type
+    }
+    use fluxbee_sdk::protocol::{Destination, Message as WireMessage, Meta, Routing};
+    use serde_json::json;
+
+    #[test]
+    fn slack_vault_key_reads_auth_key_and_ignores_blanks() {
+        // Family vault_ref pattern: config carries only slack.auth.key (a vault reference).
+        let cfg = json!({"slack":{"auth":{"type":"vault_ref","resource_type":"slack","key":"slack:io-slack:motherbee"}}});
+        assert_eq!(
+            slack_vault_key(Some(&cfg)).as_deref(),
+            Some("slack:io-slack:motherbee")
+        );
+        assert_eq!(slack_vault_key(None), None);
+        assert_eq!(slack_vault_key(Some(&json!({"slack":{"auth":{}}}))), None);
+        assert_eq!(
+            slack_vault_key(Some(&json!({"slack":{"auth":{"key":"   "}}}))),
+            None
+        );
+    }
+
+    #[test]
+    fn extract_slack_tokens_requires_object_with_both_fields() {
+        let ok = extract_slack_tokens_from_vault_value(
+            &json!({"app_token":"xapp-1","bot_token":"xoxb-2"}),
+        );
+        assert_eq!(ok, Some(("xapp-1".to_string(), "xoxb-2".to_string())));
+        // bare strings are ambiguous -> rejected
+        assert_eq!(
+            extract_slack_tokens_from_vault_value(&json!("xapp-1")),
+            None
+        );
+        // a missing / blank half is not usable
+        assert_eq!(
+            extract_slack_tokens_from_vault_value(&json!({"app_token":"xapp-1"})),
+            None
+        );
+        assert_eq!(
+            extract_slack_tokens_from_vault_value(&json!({"app_token":"xapp-1","bot_token":"  "})),
+            None
+        );
+    }
+
+    #[test]
+    fn parse_retry_after_reads_header_and_clamps() {
+        use reqwest::header::{HeaderMap, HeaderValue, RETRY_AFTER};
+        // absent header -> 1s floor
+        assert_eq!(parse_retry_after(&HeaderMap::new()), Duration::from_secs(1));
+        // honored within range
+        let mut h = HeaderMap::new();
+        h.insert(RETRY_AFTER, HeaderValue::from_static("7"));
+        assert_eq!(parse_retry_after(&h), Duration::from_secs(7));
+        // clamped to 30s ceiling
+        let mut h = HeaderMap::new();
+        h.insert(RETRY_AFTER, HeaderValue::from_static("600"));
+        assert_eq!(parse_retry_after(&h), Duration::from_secs(30));
+        // garbage / HTTP-date form -> 1s floor (we only accept integer seconds)
+        let mut h = HeaderMap::new();
+        h.insert(
+            RETRY_AFTER,
+            HeaderValue::from_static("Wed, 21 Oct 2015 07:28:00 GMT"),
+        );
+        assert_eq!(parse_retry_after(&h), Duration::from_secs(1));
+    }
+
+    #[tokio::test]
+    async fn credential_generation_is_change_driven_and_delete_aware() {
+        let slack = SlackClients::new().expect("client");
+        assert_eq!(slack.config_generation().await, 0);
+
+        // First install bumps (0 -> 1).
+        slack
+            .reload_credentials("xapp-1".into(), "xoxb-1".into())
+            .await;
+        assert_eq!(slack.config_generation().await, 1);
+
+        // An identical reload (the periodic vault refresh on an UNCHANGED secret) must NOT churn the
+        // generation — otherwise the inbound WebSocket would needlessly reconnect every tick.
+        slack
+            .reload_credentials("xapp-1".into(), "xoxb-1".into())
+            .await;
+        assert_eq!(slack.config_generation().await, 1);
+
+        // A real rotation bumps (1 -> 2) so the socket reconnects with the new token.
+        slack
+            .reload_credentials("xapp-2".into(), "xoxb-1".into())
+            .await;
+        assert_eq!(slack.config_generation().await, 2);
+
+        // Vault delete: clear drops the live tokens and bumps so the socket stops using the stale one.
+        slack.clear_credentials().await;
+        assert_eq!(slack.config_generation().await, 3);
+        assert!(slack.slack_app_token().await.is_err());
+        assert!(slack.slack_bot_token().await.is_err());
+
+        // Clearing again is a no-op (already empty) — no generation churn.
+        slack.clear_credentials().await;
+        assert_eq!(slack.config_generation().await, 3);
+    }
+
+    #[test]
+    fn slack_runtime_state_debug_never_leaks_tokens() {
+        // A leaked xapp-/xoxb- token in a log line is a workspace compromise: Debug must redact.
+        let state = SlackRuntimeState {
+            slack_app_token: Some("xapp-super-secret".to_string()),
+            slack_bot_token: Some("xoxb-super-secret".to_string()),
+            config_generation: 3,
+            bot_user_id: Some("U0BOT".to_string()),
+        };
+        let rendered = format!("{state:?}");
+        assert!(!rendered.contains("xapp-super-secret"), "{rendered}");
+        assert!(!rendered.contains("xoxb-super-secret"), "{rendered}");
+        assert!(rendered.contains("<redacted>"), "{rendered}");
+        assert!(rendered.contains("config_generation: 3"), "{rendered}");
+        // absence renders as None, not <redacted>
+        let empty = SlackRuntimeState {
+            bot_user_id: None,
+            slack_app_token: None,
+            slack_bot_token: None,
+            config_generation: 0,
+        };
+        assert!(format!("{empty:?}").contains("None"));
+    }
+
+    #[test]
+    fn default_slack_allowed_mimes_include_office_common_types() {
+        let allowed = default_slack_allowed_mimes();
+
+        assert!(allowed.contains(
+            &"application/vnd.openxmlformats-officedocument.spreadsheetml.sheet".to_string()
+        ));
+        assert!(allowed.contains(
+            &"application/vnd.openxmlformats-officedocument.wordprocessingml.document".to_string()
+        ));
+        assert!(allowed.contains(
+            &"application/vnd.openxmlformats-officedocument.presentationml.presentation"
+                .to_string()
+        ));
+        assert!(allowed.contains(&"text/csv".to_string()));
+    }
+
+    #[test]
+    fn default_slack_allowed_mimes_preserve_existing_core_types() {
+        let allowed = default_slack_allowed_mimes();
+
+        assert!(allowed.contains(&"image/png".to_string()));
+        assert!(allowed.contains(&"image/jpeg".to_string()));
+        assert!(allowed.contains(&"application/pdf".to_string()));
+        assert!(allowed.contains(&"application/json".to_string()));
+    }
+
+    #[test]
+    fn extract_runtime_relay_config_uses_effective_config_values() {
+        let defaults = SlackRelayConfig::default();
+        let relay = extract_runtime_relay_config(
+            Some(&json!({
+                "io": {
+                    "relay": {
+                        "window_ms": 2500,
+                        "max_open_sessions": 2000,
+                        "max_fragments_per_session": 6,
+                        "max_bytes_per_session": 131072
+                    }
+                }
+            })),
+            &defaults,
+        )
+        .expect("relay config");
+
+        assert_eq!(relay.window_ms, 2500);
+        assert_eq!(relay.max_open_sessions, 2000);
+        assert_eq!(relay.max_fragments_per_session, 6);
+        assert_eq!(relay.max_bytes_per_session, 131072);
+    }
+
+    #[test]
+    fn extract_runtime_relay_config_falls_back_to_defaults_when_absent() {
+        let defaults = SlackRelayConfig {
+            window_ms: 1700,
+            max_open_sessions: 222,
+            max_fragments_per_session: 4,
+            max_bytes_per_session: 99_999,
+        };
+        let relay = extract_runtime_relay_config(Some(&json!({ "io": {} })), &defaults)
+            .expect("relay defaults");
+
+        assert_eq!(relay, defaults);
+    }
+
+    #[test]
+    fn slack_relay_policy_from_config_disables_passthrough_when_window_zero() {
+        let relay = SlackRelayConfig {
+            window_ms: 0,
+            ..SlackRelayConfig::default()
+        };
+
+        let policy = slack_relay_policy_from_config(&relay).expect("policy");
+
+        assert!(!policy.enabled);
+        assert_eq!(policy.relay_window_ms, 0);
+    }
+
+    #[test]
+    fn extract_runtime_relay_config_rejects_zero_limits() {
+        let err = extract_runtime_relay_config(
+            Some(&json!({
+                "io": {
+                    "relay": {
+                        "max_open_sessions": 0
+                    }
+                }
+            })),
+            &SlackRelayConfig::default(),
+        )
+        .expect_err("must reject zero");
+
+        assert_eq!(
+            err.to_string(),
+            "io.relay.max_open_sessions must be greater than zero"
+        );
+    }
+
+    #[test]
+    fn build_system_reply_preserves_canonical_conversation_carrier() {
+        let incoming = WireMessage {
+            routing: Routing {
+                src: "node-src".to_string(),
+                src_l2_name: None,
+                dst: Destination::Resolve,
+                ttl: 16,
+                trace_id: "trace-1".to_string(),
+            },
+            meta: Meta {
+                msg_type: "system".to_string(),
+                msg: Some("PING".to_string()),
+                src_ilk: Some("ilk:src".to_string()),
+                dst_ilk: Some("ilk:dst".to_string()),
+                ich: Some("slack://T123".to_string()),
+                thread_id: Some("thread:canonical-1".to_string()),
+                context: Some(json!({
+                    "io": {
+                        "reply_target": {
+                            "kind": "slack_post",
+                            "address": "C123",
+                            "params": { "thread_ts": "171234.567" }
+                        }
+                    }
+                })),
+                ..Meta::default()
+            },
+            payload: json!({}),
+        };
+
+        let reply = build_system_reply(
+            &incoming,
+            "IO.slack.test@motherbee",
+            "PONG",
+            json!({ "ok": true }),
+        );
+
+        assert_eq!(reply.meta.ich.as_deref(), Some("slack://T123"));
+        assert_eq!(reply.meta.thread_id.as_deref(), Some("thread:canonical-1"));
+        assert_eq!(
+            reply
+                .meta
+                .context
+                .as_ref()
+                .and_then(|ctx| ctx.get("io"))
+                .and_then(|io| io.get("reply_target"))
+                .and_then(|target| target.get("address"))
+                .and_then(|value| value.as_str()),
+            Some("C123")
+        );
+    }
+
+    /// The mesh's control traffic can never reach the code that posts in Slack.
+    ///
+    /// It is pinned by reading the source because the property is one of ORDER: the guard has to
+    /// sit between the control handlers by name and the binding lookup that opens the outbound
+    /// path. A test on `is_control_plane_msg_type` alone passes just as happily with the guard
+    /// deleted, which is how an UNREACHABLE bounce ended up posting "Error (invalid_text_payload)"
+    /// in a customer's channel.
+    ///
+    /// The literals are split with `concat!`: if they were whole, this test could find ITSELF and
+    /// measure its own text.
+    #[test]
+    fn el_trafico_de_control_nunca_llega_al_camino_de_salida_de_slack() {
+        let src = include_str!("main.rs");
+        let guard_if = concat!("if is_control_plane_msg_type(&msg.meta.", "msg_type) {");
+        let outbound = concat!("let binding = match extract_runtime_slack", "_binding(");
+        let unreachable_warn = concat!("inbound Slack message came back ", "UNREACHABLE");
+
+        let warn_at = src
+            .find(unreachable_warn)
+            .expect("the guard has to keep warning about the UNREACHABLE bounce");
+
+        // The OUTBOUND path is the binding lookup AFTER the guard (there is another one before
+        // it, on the inbound path).
+        let outbound_at = warn_at
+            + src[warn_at..]
+                .find(outbound)
+                .expect("the outbound path has to come after the guard");
+
+        // The msg_type cut has to come before the warn, and its `continue` before the outbound
+        // path.
+        let guard_at = src[..warn_at]
+            .rfind(guard_if)
+            .expect("the msg_type cut has to precede the warn");
+        assert!(
+            guard_at < warn_at && warn_at < outbound_at,
+            "broken order: guard={guard_at} warn={warn_at} outbound={outbound_at}"
+        );
+        assert!(
+            src[guard_at..outbound_at].contains("continue;"),
+            "the guard has to CUT (continue) before it gets to post in Slack"
+        );
+
+        assert!(is_control_plane_msg_type("system"));
+        assert!(is_control_plane_msg_type("SYSTEM"));
+        assert!(is_control_plane_msg_type("admin"));
+        assert!(!is_control_plane_msg_type("data"));
+    }
+
+    /// The anti-echo guards. This is the part that cannot be wrong: if the node relays its own
+    /// posts, whatever the mesh answers is posted again, and that is a loop inside a customer's
+    /// Slack.
+    #[test]
+    fn no_relayamos_nunca_nuestros_propios_mensajes() {
+        let me = "U0BOT";
+
+        let humano = serde_json::json!({"type":"message","user":"U0HUMANO","text":"hola"});
+        assert!(classify_slack_inbound(&humano, "message", Some(me)).is_ok());
+
+        let propio = serde_json::json!({"type":"message","user":me,"text":"respuesta del bot"});
+        assert!(classify_slack_inbound(&propio, "message", Some(me)).is_err());
+
+        let con_bot_id =
+            serde_json::json!({"type":"message","user":"U0OTRO","bot_id":"B123","text":"x"});
+        assert!(classify_slack_inbound(&con_bot_id, "message", Some(me)).is_err());
+
+        let con_subtype = serde_json::json!({"type":"message","subtype":"bot_message","text":"x"});
+        assert!(classify_slack_inbound(&con_subtype, "message", Some(me)).is_err());
+
+        // FAILS CLOSED: without knowing who we are, nothing is relayed.
+        assert!(
+            classify_slack_inbound(&humano, "message", None).is_err(),
+            "without bot_user_id a self-post cannot be ruled out: nothing is relayed"
+        );
+
+        let mencion =
+            serde_json::json!({"type":"app_mention","user":"U0HUMANO","text":"<@U0BOT> hola"});
+        assert!(classify_slack_inbound(&mencion, "app_mention", None).is_ok());
+
+        let otro = serde_json::json!({"type":"reaction_added"});
+        assert!(classify_slack_inbound(&otro, "reaction_added", Some(me)).is_err());
+    }
 }

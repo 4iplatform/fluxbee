@@ -3099,9 +3099,7 @@ async fn initialize_storage_backend(
     database_url: Option<&str>,
     node_name: &str,
 ) -> Option<Arc<Storage>> {
-    let Some(database_url) = database_url.filter(|value| !value.trim().is_empty()) else {
-        return None;
-    };
+    let database_url = database_url.filter(|value| !value.trim().is_empty())?;
     let base_database_config = match database_config_from_url(database_url) {
         Ok(config) => config,
         Err(err) => {
@@ -3231,7 +3229,7 @@ where
         && envelope
             .thread_id
             .as_deref()
-            .map_or(true, |value| value.trim().is_empty())
+            .is_none_or(|value| value.trim().is_empty())
     {
         return Err(missing_field("thread_id"));
     }
